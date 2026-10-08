@@ -125,6 +125,23 @@ export class GenerationDesignGate {
       const criticals = (card.verification.checks || []).filter((c: any) => c.severity === 'critical' && !c.summary).map((c: any) => ({ id: c.id, area: c.area, title: c.title }));
       this.reject('critical', { criticals });
     }
+    // LOOP 9 (review BE-L9 I2): lo que Cursia no puede producir (p. ej. 2 videos por capítulo) es una excepción con motivo, no
+    // un crítico; pero sin el motivo de la institución no se genera — ni dentro ni fuera del flujo de propuesta (falla cerrada).
+    const capability = (card.verification.checks || []).filter((c: any) => c.capability && c.capability.requirementKey);
+    if (capability.length) {
+      let m: any;
+      try {
+        [m] = await this.dataSource.query(`select metadata -> 'requirementExceptionReasons' as r from public.courses where id = $1`, [courseId]);
+      } catch {
+        throw new ServiceUnavailableException({ code: 'GENERATION_VERIFICATION_UNAVAILABLE', message: 'GENERATION_VERIFICATION_UNAVAILABLE: no se pudo verificar el diseño en este momento; vuelve a intentarlo en unos segundos. No se generó nada.' });
+      }
+      const reasons = m && m.r ? (typeof m.r === 'string' ? JSON.parse(m.r) : m.r) : {};
+      const missing = capability.filter((c: any) => {
+        const saved = reasons[c.capability.requirementKey];
+        return !(saved && String(saved.reason || '').trim() && saved.requirementText === c.capability.requirementText);
+      });
+      if (missing.length) this.reject('critical', { criticals: missing.map((c: any) => ({ id: c.id, area: c.area, title: `${c.title} (falta el motivo de la institución)` })) });
+    }
     // (Al final: los cambios por aplicar y los críticos son lo primero que el docente debe ver.)
     // Re-review piloto P1: Verificación evaluó el perfil que muestra la tarjeta; debe ser el GUARDADO (el que congeló el
     // Blueprint). Si Cursia propone horas/enfoque/audiovisual sin guardar, se verificó otra cosa que la que se generaría.

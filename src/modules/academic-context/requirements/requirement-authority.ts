@@ -324,6 +324,8 @@ export interface RequirementDesignCheck {
   title: string;
   detail?: string;
   fix?: { kind: 'adjust' | 'editor'; action: string; label: string; value?: unknown; targets?: { chapterIds?: string[]; moduleIds?: string[] } };
+  /** LOOP 9: requisito que Cursia no puede producir (excepción que exige el motivo de la institución). */
+  capability?: { requirementKey: string; requirementText: string; produces: string };
 }
 
 const n1 = (n: number) => String(Math.round(n * 10) / 10).replace('.', ',');
@@ -409,6 +411,11 @@ export interface ConflictContext {
  *   lo decidió Cursia o la estructura y no se cumple → conflicto CRÍTICO con su causa · no se puede cumplir (p. ej. dos
  *   videos por capítulo) → crítico · no verificable (unidades, por resultado…) → info · recomendaciones → info.
  */
+/** LOOP 9: lo que Cursia sí produce cuando el documento pide más de lo que puede (texto para la propuesta). */
+export function capabilityProduces(r: DocumentRequirement): string {
+  return r.kind === 'videos' ? 'Cursia produce un video por capítulo' : r.kind === 'application_activities' ? 'Cursia produce una Actividad de Aplicación por capítulo' : 'Cursia produce lo que permite su motor';
+}
+
 export function requirementVerificationChecks(applicable: DocumentRequirement[], checks: RequirementCheck[], ctx: ConflictContext): RequirementDesignCheck[] {
   const out: RequirementDesignCheck[] = [];
   const byId = new Map(applicable.map((r) => [r.id, r]));
@@ -479,9 +486,17 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
       continue;
     }
     if (c.status === 'not_verifiable') {
-      const impossible = !!c.impossible;
-      out.push({ id, area: 'requirements', severity: impossible ? 'critical' : 'info',
-        title: impossible ? `Conflicto con un requisito del documento: ${asked}` : `Requisito del documento por revisar: ${asked}`,
+      // LOOP 9 (P0-2): lo que Cursia no puede producir (p. ej. 2 videos por capítulo) no puede quedar como un crítico sin
+      // salida (la propuesta nunca se podría preparar). Es una excepción EXPLÍCITA: se ve aquí, la propuesta exige el motivo
+      // de la institución antes de aprobarla y queda registrada en «Excepciones al documento». Nunca se calla.
+      if (c.impossible) {
+        out.push({ id, area: 'requirements', severity: 'warning', title: `Excepción al requisito del documento: ${asked}`,
+          detail: `${c.note || 'Cursia no puede producir lo que pide el documento.'} Queda como excepción: la propuesta pide el motivo de la institución antes de aprobarla.`,
+          // R68 la bloquea mientras no haya un motivo registrado (también fuera del flujo de propuesta: falla cerrada).
+          capability: { requirementKey: String(r.key), requirementText: asked, produces: capabilityProduces(r) } });
+        continue;
+      }
+      out.push({ id, area: 'requirements', severity: 'info', title: `Requisito del documento por revisar: ${asked}`,
         detail: c.note || 'Cursia todavía no puede comprobarlo en el diseño.' });
       continue;
     }

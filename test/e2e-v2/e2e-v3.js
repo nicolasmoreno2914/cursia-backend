@@ -2070,16 +2070,17 @@ function reservationBookkeeping(ev) {
       };
       const runsBase = (id, n) => `/courses/${id}/blueprints/${n}/manifest/runs`;
 
-      // A · Verificación con un crítico que el docente no puede resolver con su estructura: el documento pide dos videos por
-      // capítulo (Cursia produce uno). (Una estructura del docente distinta de la del documento es SU excepción, no un crítico.)
-      const cA = await mkCourse('[E2E R68 E18-A] Crítico', 'Cada capítulo tendrá 2 videos.');
+      // A · Verificación con un crítico que el docente no puede resolver con su estructura: el documento se contradice
+      // (2 y 3 evaluaciones parciales): Cursia no elige cuál manda. (LOOP 9: «2 videos por capítulo», que Cursia no puede
+      // producir, ya no es un crítico sin salida sino una excepción con motivo — lo prueba E20.)
+      const cA = await mkCourse('[E2E R68 E18-A] Crítico', 'El curso tendrá 2 evaluaciones parciales.\nSe realizarán 3 evaluaciones parciales.');
       await keepTeacherDesign(api, cA, 'E18-A', { allowCritical: true });
       const recA = await api('POST', `/courses/${cA}/design/recommendation`, {});
-      ok(recA.data.verification.blocking === true, 'E18-A: Verificación tiene un crítico (2 videos por capítulo)', recA.data.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+      ok(recA.data.verification.blocking === true, 'E18-A: Verificación tiene un crítico (el documento se contradice)', recA.data.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
       const nA = await lockAndManifest(cA);
       const rA = await api('POST', runsBase(cA, nA), ctx);
       expect409(rA, 'critical', 'POST runs (API directa) con un crítico');
-      ok(Array.isArray(rA.raw && rA.raw.criticals) && rA.raw.criticals.some((c) => /video/i.test(c.title)), 'E18-A: la respuesta lista el crítico', rA.raw && rA.raw.criticals);
+      ok(Array.isArray(rA.raw && rA.raw.criticals) && rA.raw.criticals.some((c) => /evaluaci/i.test(c.title)), 'E18-A: la respuesta lista el crítico', rA.raw && rA.raw.criticals);
       expect409(await api('POST', `${runsBase(cA, nA)}/estimate-preview`, ctx), 'critical', 'estimate-preview con un crítico');
       expect409(await api('POST', `${runsBase(cA, nA)}/approve-and-start`, { ...ctx, estimateHash: 'a'.repeat(64) }), 'critical', 'approve-and-start con un crítico');
 
@@ -2369,6 +2370,269 @@ function reservationBookkeeping(ev) {
       results.courses.E19 = { courseId, runId: runA };
     }, { fatal: false });
 
+    // ═══ LOOP 9 · E20 — PILOT READINESS: el caso del piloto de punta a punta por HTTP real (USD 0, proveedores FALSOS):
+    // microcurrículo (64 h · 4 × 5 · 2 videos por capítulo · 1 Actividad de Aplicación por módulo · 3 parciales + final) →
+    // «Lo que entendimos» (sin RA inventados; el valor de partida no es «decisión») → requisitos → Formato M (choca con el
+    // documento) → «Cursia recomienda» → Verificación (excepciones explícitas, incluida la que Cursia no puede producir) →
+    // propuesta → PDF → aprobación → CONTRATO: cada dato que cambia el producto invalida la aprobación, R68 bloquea, una versión
+    // nueva se aprueba y recién ahí se puede seguir → generación MOCK → Blueprint = propuesta → Manifest = Blueprint → empaque →
+    // Moodle (restore, permisos y notas) → permisos de otro usuario.
+    if (RUN_E5) await step('v3-E20-pilot-readiness', async () => {
+      const T = (label) => `E20: ${label}`;
+      const title = '[E2E Pilot E20] Seguridad y Salud en el Trabajo para Supervisores';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, T('curso dinámico creado'), { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // Pedido: lo que el usuario escribió; «¿Para quién?» y el nivel quedaron en su valor de partida (inferidos).
+      const brief = { nombre: 'Seguridad y Salud en el Trabajo para Supervisores', obj: 'Curso de seguridad y salud en el trabajo para supervisores de planta.', sector: 'Seguridad y Salud en el Trabajo', pais: 'Colombia',
+        contexto: 'Universitario — estudiantes de pregrado universitario, con rigor académico y pensamiento crítico', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro', inferidos: 'contexto,nivel,pais,tono' };
+      ok((await api('PUT', `/courses/${courseId}/brief`, brief)).status === 200, T('pedido guardado'));
+      const docText = [
+        'MICROCURRÍCULO', 'Asignatura: Seguridad y Salud en el Trabajo para Supervisores', 'Programa: Tecnología en Gestión de la Seguridad y Salud en el Trabajo', 'Modalidad: Virtual',
+        'Intensidad horaria total: 64 horas', '', '1. Descripción', 'La asignatura forma a supervisores de planta para identificar peligros, evaluar riesgos y liderar la prevención de accidentes.', '',
+        '2. Perfil del estudiante', 'Supervisores y líderes de turno de empresas manufactureras, con experiencia operativa y formación técnica básica en seguridad.', '',
+        'Conocimientos previos', '- Procesos productivos básicos', '- Uso de equipos de protección personal', '',
+        '3. Objetivo general', 'Desarrollar en los supervisores la capacidad de gestionar los riesgos laborales de su área y liderar una cultura preventiva.', '',
+        '4. Resultados de aprendizaje',
+        'RA1. Identificar los peligros presentes en un área de trabajo industrial y clasificarlos por tipo.',
+        'RA2. Evaluar los riesgos laborales con una matriz de valoración y priorizar controles.',
+        'RA3. Aplicar la jerarquía de controles para reducir la exposición a riesgos críticos.',
+        'RA4. Investigar incidentes y accidentes con un método de análisis de causas.',
+        'RA5. Liderar acciones de prevención y comunicación del riesgo con el equipo de trabajo.', '',
+        '5. Estructura del curso', 'El curso tendrá 4 módulos con 5 capítulos cada uno.', 'Cada capítulo debe incluir 2 videos.', 'Cada módulo incluye 1 Actividad de Aplicación.', '',
+        '6. Evaluación', 'El curso tendrá 3 evaluaciones parciales y 1 evaluación final.', '',
+        '7. Bibliografía', '- Organización Internacional del Trabajo (2019). Seguridad y salud en el centro del futuro del trabajo. OIT. Capítulo 3, páginas 45-60.', '- Decreto 1072 de 2015, artículo 2.2.4.6.8.', '',
+      ].join('\n');
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo-e20.txt', dataBase64: Buffer.from(docText, 'utf8').toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0, T('documento leído sin proveedores (USD 0)'), { s: ex.status, e: ex.error });
+      eq(ex.data.draft.outcomes.map((o) => o.id), ['RA1', 'RA2', 'RA3', 'RA4', 'RA5'], T('«Lo que entendimos»: 5 resultados; la sección «5. Estructura del curso» no se suma como RA6 (P1-1)'));
+      ok((await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 })).status === 201, T('contexto académico guardado'));
+      // Requisitos explícitos (con su cita), sin inventar: bibliografía, artículos y páginas no son requisitos.
+      const rv = (await api('GET', `/courses/${courseId}/academic-context/requirements`)).data;
+      const reqs = (rv && rv.items || []).filter((r) => r.applies && r.obligation === 'required');
+      const has = (kind, value, extra) => reqs.some((r) => r.kind === kind && r.value === value && Object.entries(extra || {}).every(([k, v]) => JSON.stringify(r[k]) === JSON.stringify(v)));
+      ok(has('target_hours', 64) && has('modules', 4) && has('chapters', 5) && has('videos', 2) && has('application_activities', 1) && has('evaluations', 3, { evaluationType: 'partial' }) && has('evaluations', 1, { evaluationType: 'final' }),
+        T('requisitos: 64 h, 4 módulos, 5 capítulos por módulo, 2 videos por capítulo, 1 Actividad de Aplicación por módulo («incluye», P1-3), 3 parciales + final'), reqs.map((r) => `${r.kind}=${r.value}${r.evaluationType ? ':' + r.evaluationType : ''}`));
+      ok(!reqs.some((r) => [3, 45, 60, 2015].includes(r.value) && r.kind === 'chapters'), T('capítulos de un libro, páginas y artículos NO son requisitos'), reqs.map((r) => `${r.kind}=${r.value}`));
+      // «Lo que entendimos»: el documento manda sin preguntar (el «Universitario» de partida no era una decisión) y el nivel
+      // de partida es de Cursia, no «tu pedido» (P1-2 / P1-4).
+      const facts = (await api('GET', `/courses/${courseId}/facts`)).data;
+      ok(facts.educationLevel.value === 'technical' && facts.educationLevel.source === 'document' && !facts.conflicts.some((c) => c.field === 'educationLevel'),
+        T('nivel educativo del documento, sin pregunta falsa («elegiste Universitario»)'), { lvl: facts.educationLevel, conflicts: facts.conflicts });
+      eq([facts.priorKnowledge.source, facts.documentPrerequisites], ['inferred', ['Procesos productivos básicos', 'Uso de equipos de protección personal']], T('conocimientos previos: el de partida es inferido; los del documento se ven'));
+
+      // Formato M (3 × 4, 40–44 h): decisión de la institución que choca con el documento (4 × 5, 64 h).
+      const fm = await api('PUT', `/courses/${courseId}/format`, { code: 'M' });
+      ok(fm.status === 200 && fm.data.format.code === 'M', T('Formato M elegido'));
+      // Estructura 3 × 4 (lo que la propuesta de estructura arma con el formato elegido, P1-6), con los resultados vinculados.
+      const TIT = [
+        ['Identificación de peligros', [['Peligros físicos y mecánicos', ['RA1']], ['Peligros químicos y biológicos', ['RA1']], ['Matriz de valoración de riesgos', ['RA2']], ['Priorización de controles', ['RA2']]]],
+        ['Control de riesgos', [['Jerarquía de controles', ['RA3']], ['Controles de ingeniería en planta', ['RA3']], ['Equipos de protección personal', ['RA3']], ['Investigación de incidentes', ['RA4']]]],
+        ['Liderazgo preventivo', [['Análisis de causas', ['RA4']], ['Comunicación del riesgo', ['RA5']], ['Cultura preventiva en el turno', ['RA5']], ['Plan de prevención del área', ['RA5']]]],
+      ];
+      let counter = 0;
+      for (const [mt, chs] of TIT) {
+        const m = await api('POST', `/courses/${courseId}/modules`, { title: mt, objective: `Aplicar ${mt.toLowerCase()} en planta`, examEnabled: true, expectedCounter: counter });
+        if (m.status !== 201) throw new Error(`E20 módulo: ${m.status} ${m.error}`);
+        counter = m.data.structureVersionCounter;
+        const auto = m.data.module.chapters || [];
+        for (let ci = 0; ci < chs.length; ci++) {
+          const body = { title: chs[ci][0], objective: `Aplicar ${chs[ci][0].toLowerCase()} en el área de trabajo`, videoEnabled: true, outcomeIds: chs[ci][1], expectedCounter: counter };
+          const c = ci === 0 && auto.length === 1 ? await api('PATCH', `/courses/${courseId}/modules/${m.data.module.id}/chapters/${auto[0].id}`, body) : await api('POST', `/courses/${courseId}/modules/${m.data.module.id}/chapters`, body);
+          if (![200, 201].includes(c.status)) throw new Error(`E20 capítulo: ${c.status} ${c.error}`);
+          counter = c.data.structureVersionCounter;
+        }
+      }
+      const AP = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...AP.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, T('perfil de evaluación'));
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, T('perfil de presentación'));
+      const useDesign = async (label) => {
+        for (let i = 0; i < 8; i++) {
+          const card = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+          const pending = Math.max((card.design.changes || []).length, card.design.modules.reduce((n, m) => n + m.chapters.filter((c) => c.proposed).length, 0));
+          const autoFix = card.verification.checks.some((c) => c.id === 'outcome_links');
+          if (!card.profileChanged && !pending && !autoFix) return card;
+          const st = await readStructure(courseId);
+          if (card.profileChanged) {
+            const pv = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+            const r = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv && !pv.isDefault ? Number(pv.version) : 0 });
+            if (r.status !== 201) throw new Error(`${label}: perfil ${r.status} ${r.error}`);
+          } else if (autoFix) {
+            const r = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+            if (r.status !== 200) throw new Error(`${label}: vínculos ${r.status} ${r.error}`);
+          } else {
+            const r = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+            if (![200, 201].includes(r.status)) throw new Error(`${label}: aplicar ${r.status} ${r.error}`);
+          }
+        }
+        throw new Error(`${label}: el diseño no quedó estable`);
+      };
+      const card = await useDesign('E20');
+      const sev = (kind, et) => {
+        const r = (card.requirements.items || []).find((x) => x.applies && x.kind === kind && (!et || x.evaluationType === et));
+        const c = r && card.verification.checks.find((k) => k.id === `requirement:${r.id}`);
+        return c ? `${c.severity}|${c.title}` : null;
+      };
+      ok(card.hours.target === 42 && !card.verification.blocking, T('«Cursia recomienda»: Formato M (meta 42 h) y Verificación sin críticos'), card.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+      ok(/^warning\|Excepción al requisito del documento/.test(sev('videos')), T('2 videos por capítulo (Cursia produce uno) → excepción explícita, no un crítico sin salida (P0-2)'), sev('videos'));
+      ok(/^warning\|Excepción/.test(sev('modules')) && /^warning\|Excepción/.test(sev('target_hours')), T('4 módulos y 64 h → excepciones (el Formato M es decisión de la institución)'), [sev('modules'), sev('target_hours')]);
+      ok(/^ok\|/.test(sev('evaluations', 'partial')) && /^ok\|/.test(sev('evaluations', 'final')), T('3 parciales + final: se cumplen (un parcial por módulo del Formato M y la final)'), [sev('evaluations', 'partial'), sev('evaluations', 'final')]);
+      ok(sev('application_activities') && !/^critical/.test(sev('application_activities')), T('1 Actividad de Aplicación por módulo («incluye»: lectura de confianza media): visible, sin crítico'), sev('application_activities'));
+
+      // Propuesta: no se prepara sin el motivo de CADA excepción (también la de lo que Cursia no puede producir).
+      let S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.status === 'draft', T('propuesta en borrador'));
+      const exKeys = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').map((b) => b.ref);
+      ok(exKeys.length >= 3 && exKeys.some((k) => /^videos/.test(k)), T('la propuesta pide el motivo de cada excepción, incluida la de los videos'), exKeys);
+      for (const k of exKeys) ok((await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: k, reason: 'La institución aprueba el Formato M con un video por capítulo para el piloto.' })).status === 200, T(`motivo guardado: ${k}`));
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${courseId}/prebrief/confirmations`, { confirmKey: b.ref });
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.draft.readiness.ready, T('propuesta lista para preparar'), S0.draft.readiness.blockers);
+      const learnerRows = JSON.stringify(S0.draft.document.sections.find((s) => s.id === 'audience'));
+      ok(/Técnico \/ tecnológico/.test(learnerRows) && /Procesos productivos básicos/.test(learnerRows) && !/"value":"(none|basic|intermediate|advanced|technical|university)"/.test(learnerRows) && !/rigor académico y pensamiento crítico/.test(learnerRows),
+        T('Público objetivo para personas: nivel y previos con rótulo y origen, previos del documento, sin códigos ni texto interno (P1-9)'), learnerRows.slice(0, 400));
+      const exDoc = S0.draft.model.exceptions.find((e) => /^videos/.test(e.requirementKey));
+      ok(exDoc && exDoc.reason && /Cursia produce un video por capítulo/.test(exDoc.appliedText), T('«Excepciones al documento»: la de los videos con su motivo y lo que Cursia produce'), exDoc);
+
+      const getPdfE20 = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, disp: r.headers.get('content-disposition'), buf: Buffer.from(await r.arrayBuffer()) }; };
+      const prepareApprove = async (label) => {
+        const s = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+        if (!s.draft.readiness.ready) throw new Error(`${label}: no está lista: ${JSON.stringify(s.draft.readiness.blockers)}`);
+        const p = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: s.draft.modelSha256 });
+        if (![200, 201].includes(p.status)) throw new Error(`${label}: preparar ${p.status} ${p.error}`);
+        const v = p.data.version;
+        await api('POST', `/courses/${courseId}/blueprints/${v.blueprintNumber}/manifest`);
+        const a = await api('POST', `/courses/${courseId}/prebrief/versions/${v.version}/approve`, { expectedModelSha: v.modelSha256, name: 'Coordinación Académica Demo', role: 'Directora académica', confirm: true });
+        if (a.status !== 200) throw new Error(`${label}: aprobar ${a.status} ${a.error}`);
+        return a.data.version;
+      };
+      let ver = await prepareApprove('E20 v1');
+      ok(ver.status === 'approved' && ver.version === 1, T('v1 preparada y APROBADA'));
+      ok((await api('GET', `/courses/${courseId}/prebrief`)).data.approvalFlow === true, T('preparar la propuesta deja el curso en el flujo (la generación exige la versión aprobada)'));
+      const fingerprints = [ver.modelSha256];
+      const pdf1 = await getPdfE20(`/courses/${courseId}/prebrief/versions/1/pdf?variant=approved`);
+      ok(pdf1.status === 200 && pdf1.buf.slice(0, 5).toString() === '%PDF-' && /v1_aprobado\.pdf/.test(pdf1.disp || ''), T('PDF de la v1 aprobada'), { s: pdf1.status, d: pdf1.disp });
+      const fingerprint1 = ver.modelSha256;
+
+      // ═══ CONTRATO: después de aprobar, cada dato que cambia el producto invalida la aprobación; R68 bloquea; una versión
+      // nueva se aprueba y recién ahí se puede seguir. Nunca se genera algo distinto de lo aprobado.
+      const runsBaseOf = (n) => `/courses/${courseId}/blueprints/${n}/manifest/runs`;
+      const ctxRun = { nombre: brief.nombre, sector: brief.sector, pais: brief.pais, contexto: brief.contexto, nivel: brief.nivel, tono: brief.tono, obj: brief.obj, scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const BLOCK = ['prebrief_stale', 'prebrief_not_approved', 'design_changed', 'structure_changed', 'pending_changes', 'stale_blueprint', 'blueprint_mismatch'];
+      const pedNow = async () => (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      const acNow = async () => (await api('GET', `/courses/${courseId}/profiles/academic`)).data;
+      const firstChapter = async () => { const st = await readStructure(courseId); const m = st.modules[0]; return { st, m, c: m.chapters.find((x) => x.kind !== 'practice') }; };
+      const MUT = [
+        ['tono', async () => { await api('PUT', `/courses/${courseId}/brief`, { ...brief, tono: 'formal y técnico' }); }, async () => { await api('PUT', `/courses/${courseId}/brief`, brief); }],
+        ['horas', async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, targetHours: 40 }, expectedVersion: Number(p.version) }); },
+          async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, targetHours: 42 }, expectedVersion: Number(p.version) }); }],
+        ['estructura (título de capítulo)', async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { title: `${c.title} (revisado)`, expectedCounter: st.structureVersionCounter }); },
+          async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { title: c.title.replace(/ \(revisado\)$/, ''), expectedCounter: st.structureVersionCounter }); }],
+        ['resultados', async () => { const a = await acNow(); await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: Number(a.version), outcomes: a.profile.outcomes.map((o, i) => ({ id: o.id, text: i === 0 ? `${o.text} Incluye zonas de carga.` : o.text })), accept: true }); },
+          async () => { const a = await acNow(); await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: Number(a.version), outcomes: a.profile.outcomes.map((o) => ({ id: o.id, text: o.text.replace(/ Incluye zonas de carga\.$/, '') })), accept: true }); }],
+        ['estudiante', async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, learner: { ...p.profile.learner, description: 'Supervisores de planta con más de cinco años de experiencia.' } }, expectedVersion: Number(p.version) }); },
+          null],
+        ['nivel', async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, learner: { ...p.profile.learner, educationLevel: 'professional' } }, expectedVersion: Number(p.version) }); }, null],
+        ['requisitos (motivo de una excepción)', async () => { await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: exKeys[0], reason: 'Otro motivo: la coordinación pide reducir la carga del piloto.' }); }, null],
+        ['formato S/M/L', async () => { await api('PUT', `/courses/${courseId}/format`, { code: 'L' }); }, async () => { await api('PUT', `/courses/${courseId}/format`, { code: 'M' }); }],
+        ['videos', async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { videoEnabled: !c.videoEnabled, expectedCounter: st.structureVersionCounter }); },
+          async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { videoEnabled: !c.videoEnabled, expectedCounter: st.structureVersionCounter }); }],
+        ['actividades', async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { activityEnabled: !c.activityEnabled, expectedCounter: st.structureVersionCounter }); },
+          async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { activityEnabled: !c.activityEnabled, expectedCounter: st.structureVersionCounter }); }],
+        ['sector', async () => { await api('PUT', `/courses/${courseId}/brief`, { ...brief, sector: 'Gestión industrial' }); }, async () => { await api('PUT', `/courses/${courseId}/brief`, brief); }],
+        ['tema (presentación)', async () => { const pr = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data; await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: null, themeVersion: 1 }, expectedVersion: Number(pr.version) }); },
+          async () => { const pr = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data; await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 }, expectedVersion: Number(pr.version) }); }],
+        ['evaluación final', async () => { const st = await readStructure(courseId); await api('PATCH', `/courses/${courseId}/structure-settings`, { finalExam: false, expectedCounter: st.structureVersionCounter }); },
+          async () => { const st = await readStructure(courseId); await api('PATCH', `/courses/${courseId}/structure-settings`, { finalExam: true, expectedCounter: st.structureVersionCounter }); }],
+        ['evaluación (nota mínima)', async () => { const a = (await api('GET', `/courses/${courseId}/profiles/assessment`)).data; await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...a.profile, passingGrade: 75 }, expectedVersion: Number(a.version) }); },
+          async () => { const a = (await api('GET', `/courses/${courseId}/profiles/assessment`)).data; await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...a.profile, passingGrade: 70 }, expectedVersion: Number(a.version) }); }],
+      ];
+      for (const [label, mutate, revert] of MUT) {
+        const before = (await api('GET', `/courses/${courseId}/prebrief`)).data.current;
+        await mutate();
+        const s1 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+        const latest = s1.versions[0];
+        const stale = latest.version === before.version && latest.status === 'invalidated' && latest.invalidationReason === 'design_changed' && (latest.invalidationDiff || []).length > 0;
+        // Un cambio de estructura que Cursia todavía no aplicó al diseño (p. ej. apagar el video de un capítulo en el editor)
+        // no cambia la propuesta hasta «Usar este diseño»; mientras tanto R68 NO deja generar (la estructura viva ≠ Blueprint).
+        const pendingOnly = !stale && latest.status === 'approved';
+        ok(stale || pendingOnly, T(`contrato · ${label}: ${stale ? `cambiar después de aprobar invalida la v${before.version} (con lo que cambió)` : 'cambio sin aplicar al diseño: la aprobación no cubre lo que se generaría'}`), { status: latest.status, reason: latest.invalidationReason, diff: latest.invalidationDiff });
+        const r = await api('POST', `${runsBaseOf(before.blueprintNumber)}/estimate-preview`, ctxRun);
+        const g = await api('POST', runsBaseOf(before.blueprintNumber), ctxRun);
+        ok(r.status === 409 && g.status === 409 && BLOCK.includes(g.raw && g.raw.reason), T(`contrato · ${label}: R68 bloquea el costo y la generación (409)`), { r: [r.status, r.raw && r.raw.reason], g: [g.status, g.raw && g.raw.reason, g.error] });
+        if (stale) ok((await api('POST', `/courses/${courseId}/prebrief/versions/${before.version}/approve`, { expectedModelSha: before.modelSha256, name: 'Coordinación Académica Demo', role: 'Directora académica', confirm: true })).status === 409, T(`contrato · ${label}: la versión invalidada ya no se puede aprobar`));
+        if (revert) await revert();
+        const sR = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+        if (!stale) {
+          // Deshacer el cambio sin aplicar: la estructura vuelve a ser la aprobada y la aprobación vigente sigue cubriéndola.
+          const r2 = await api('POST', `${runsBaseOf(before.blueprintNumber)}/estimate-preview`, ctxRun);
+          ok(sR.status === 'approved' && sR.current.version === before.version && r2.status === 200, T(`contrato · ${label}: deshecho, la versión aprobada vuelve a cubrir exactamente lo que se genera`), { st: sR.status, r2: [r2.status, r2.raw && r2.raw.reason] });
+          continue;
+        }
+        ok(sR.status === 'draft' && sR.versions[0].status === 'invalidated', T(`contrato · ${label}: deshacer el cambio NO revive la aprobación (hace falta una versión nueva)`));
+        if (label === 'formato S/M/L' || label === 'estructura (título de capítulo)' || label === 'videos' || label === 'actividades') await useDesign(`E20 ${label}`);
+        ver = await prepareApprove(`E20 ${label}`);
+        ok(ver.status === 'approved' && ver.version === before.version + 1, T(`contrato · ${label}: nueva versión v${ver.version} aprobada`));
+        fingerprints.push(ver.modelSha256);
+      }
+      const S1 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S1.versions.filter((v) => v.status === 'approved').length === 1 && S1.current.version === ver.version, T('una sola versión aprobada vigente; las anteriores invalidadas'), S1.versions.map((v) => `v${v.version}:${v.status}`));
+      ok(S1.current.modelSha256 === ver.modelSha256 && S1.draft.modelSha256 === ver.modelSha256 && fingerprints.length >= 8, T(`huella capturada en cada aprobación (${fingerprints.length}); la vigente = el borrador actual`), { fingerprints: fingerprints.length });
+      ok(fingerprint1 === fingerprints[0], T('la huella de la v1 es la que se aprobó'));
+
+      // Generación MOCK sobre la versión vigente: contexto, Blueprint y Manifest = lo aprobado.
+      const n = ver.blueprintNumber;
+      const runsBase = runsBaseOf(n);
+      const pvw = await api('POST', `${runsBase}/estimate-preview`, ctxRun);
+      ok(pvw.status === 200, T('con la versión aprobada vigente, el costo se muestra (200)'), { s: pvw.status, e: pvw.error });
+      const st = await readStructure(courseId);
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of st.modules) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      let start = await api('POST', runsBase, { ...ctxRun, tono: 'SUSURRADO', sector: 'Inventado' });
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E20: autorización (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', runsBase, { ...ctxRun, tono: 'SUSURRADO', sector: 'Inventado' });
+      }
+      ok(start.status === 201, T('run MOCK creado sobre la versión aprobada vigente'), { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E20: run no creado: ${start.status} ${start.error}`);
+      const runId = start.data.run.id;
+      const [ctxRow] = await q(`select context from public.generation_run_contexts where job_id = $1`, [runId]);
+      const approvedCtx = S1.current.model ? S1.current.model.generationContext : (await api('GET', `/courses/${courseId}/prebrief/versions/${ver.version}`)).data.model.generationContext;
+      eq(['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => ctxRow.context[k]), ['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => approvedCtx[k]), T('el run congeló el contexto APROBADO (el del navegador se ignora)'));
+      llm.st.tag = 'E20';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId }), 'E20 run', undefined, runId);
+      const items = await waitItemsDone(runId);
+      ok(stt.failed === 0 && !stt.fatalError && items.every((i) => i.status === 'completed'), T(`generación MOCK completa (${items.length} items, proveedores falsos, USD 0)`), items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 160)]));
+      const [manRow] = await q(`select m.id, m.blueprint_id, m.manifest, b.snapshot_sha256 from public.course_generation_manifests m join public.course_blueprints b on b.id = m.blueprint_id
+         join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [runId]);
+      const [vRow] = await q(`select blueprint_id, blueprint_sha256 from public.course_prebrief_versions where course_id = $1 and version = $2`, [courseId, ver.version]);
+      ok(manRow && Number(manRow.blueprint_id) === Number(vRow.blueprint_id) && manRow.snapshot_sha256 === vRow.blueprint_sha256, T('Blueprint generado = Blueprint de la propuesta aprobada'), { manRow: manRow && { b: manRow.blueprint_id, s: manRow.snapshot_sha256 }, vRow });
+      const M = typeof manRow.manifest === 'string' ? JSON.parse(manRow.manifest) : manRow.manifest;
+      const Mm = M.manifest || M;
+      const verModel = (await api('GET', `/courses/${courseId}/prebrief/versions/${ver.version}`)).data.model;
+      eq([Mm.modules.length, Mm.totals.videoCount, Mm.totals.applicationActivityCount], [verModel.structure.modules.length, verModel.structure.modules.reduce((a, m) => a + m.chapters.filter((c) => c.video).length, 0), verModel.structure.modules.reduce((a, m) => a + m.chapters.filter((c) => !!c.applicationMinutes).length, 0)],
+        T('Manifest = Blueprint = propuesta (módulos, videos, Actividades de Aplicación)'));
+      eq(items.map((i) => i.item_key).sort(), Mm.items.map((i) => i.key).sort(), T('items generados = items del Manifest'));
+      // Empaque + Moodle (restore, permisos y notas): lo hace el bloque Moodle de este E2E.
+      const P = await packageRun('E20', courseId, n, runId);
+      const apps = Mm.items.filter((i) => i.type === 'application_activity');
+      const reviewIds = ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      results.courses.E20 = { courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: Mm.modules, features: Mm.features, applications: apps.length, reviewCardsChapterIds: reviewIds,
+        modules: st.modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) })), blueprintNumber: n, runId, items: items.length, prebriefVersions: S1.versions.length };
+      // Permisos: otro usuario no ve ni aprueba la propuesta ni su PDF.
+      const OTHER = jwt.sign({ sub: crypto.randomUUID(), email: 'e2e-otro@example.com', role: 'authenticated', aud: 'authenticated' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+      const o1 = await api('GET', `/courses/${courseId}/prebrief`, undefined, OTHER);
+      const o2 = await api('POST', `/courses/${courseId}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Intruso', role: 'Nadie', confirm: true }, OTHER);
+      const o3 = await fetch(BASE + `/courses/${courseId}/prebrief/versions/${ver.version}/pdf`, { headers: { authorization: `Bearer ${OTHER}` } });
+      ok([403, 404].includes(o1.status) && [403, 404].includes(o2.status) && [403, 404].includes(o3.status), T('otro usuario: ni ver, ni aprobar, ni descargar el PDF (403/404)'), [o1.status, o2.status, o3.status]);
+    }, { fatal: false });
+
     // ═══ LOOP 8.5 · E17 — flujo DEFINITIVO de Cursia V2 por HTTP real, en el orden de la pantalla: pedido → microcurrículo →
     // «Lo que entendimos» (facts) → «Cursia recomienda» → Ajustar → «Usar este diseño» (perfil, horas, vínculos, aplicar) →
     // verificación → «Aprobar» (Blueprint) → Manifest = tarjeta → generación con proveedores FALSOS → Actividades de
@@ -2490,6 +2754,8 @@ function reservationBookkeeping(ev) {
     // LOOP 8.5 · E17: el flujo V2 definitivo y su re-empaque.
     if (results.mbz.E17 && results.courses.E17) MOODLE_JOBS.push(['E17', 'E17']);
     if (results.mbz['E17-regen'] && results.courses.E17regen) MOODLE_JOBS.push(['E17-regen', 'E17regen']);
+    // LOOP 9 · E20: el curso del piloto (propuesta aprobada tras el contrato) → restore, permisos y notas en Moodle.
+    if (results.mbz.E20 && results.courses.E20) MOODLE_JOBS.push(['E20', 'E20']);
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');

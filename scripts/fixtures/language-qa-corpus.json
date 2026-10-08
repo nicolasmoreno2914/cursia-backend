@@ -288,6 +288,41 @@
       "codes": [
         "REGIONAL"
       ]
+    },
+    {
+      "text": "Coge el autobús en la esquina.",
+      "codes": [
+        "REGIONAL"
+      ],
+      "fixed": "Coge el autobús en la esquina."
+    },
+    {
+      "text": "Revisalo con tu equipo antes de entregar.",
+      "codes": [
+        "VOSEO"
+      ],
+      "fixed": "Revísalo con tu equipo antes de entregar."
+    },
+    {
+      "text": "Crealo en la plantilla y guardalo.",
+      "codes": [
+        "VOSEO"
+      ],
+      "fixed": "Crealo en la plantilla y guardalo."
+    },
+    {
+      "text": "Decime qué riesgos encontraste.",
+      "codes": [
+        "VOSEO"
+      ],
+      "fixed": "Dime qué riesgos encontraste."
+    },
+    {
+      "text": "Completad la tabla y coged los datos del informe.",
+      "codes": [
+        "VOSOTROS"
+      ],
+      "fixed": "Completad la tabla y coged los datos del informe."
     }
   ],
   "negatives": [
@@ -343,7 +378,6 @@
     "Revisa el tiro de la chimenea.",
     "Estudia la figura del Che, su contexto y su época.",
     "No PO disponible para el pedido.",
-    "Coge el autobús en la esquina.",
     "Usa Adobe Animate para la animación.",
     "Llama a `element.animate()` en el script.",
     "Visita https://www.sos-children.org/sos/ayuda para más datos.",
@@ -351,6 +385,16 @@
     "Consulta [la guía](https://x.test/vos/podés) antes de empezar.",
     "<a href=\"/sos/podés\">Ver</a> la guía.",
     "```\nconst vos = podés();\n```\nRevisa el bloque.",
-    "## Bibliografía\n- Guía técnica del laburo seguro, Ministerio, 2020\n- Organización Mundial de la Salud. (2020). Laburo y salud."
+    "## Bibliografía\n- Guía técnica del laburo seguro, Ministerio, 2020\n- Organización Mundial de la Salud. (2020). Laburo y salud.",
+    "Agrega tomate a la receta del comedor.",
+    "El mandala es un ejemplo de simetría.",
+    "Si el operario comete un error, detén la máquina.",
+    "Haz clic en Create y luego en Evaluate.",
+    "Revísalo con tu equipo y guárdalo.",
+    "Créalo en la plantilla.",
+    "Dime qué riesgos encontraste.",
+    "Use la función Calculate del menú Datos.",
+    "Analiza los deciles de ingreso de la población.",
+    "El mandate del proyecto se firma en inglés: participate, elaborate y restate."
   ]
 }

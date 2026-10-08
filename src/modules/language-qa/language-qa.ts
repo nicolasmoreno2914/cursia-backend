@@ -80,6 +80,8 @@ export const LQA_VOS_PREPS = ['para', 'a', 'de', 'por', 'sin', 'hacia', 'sobre',
  * `hint` = alternativa neutra para el reintento dirigido.
  */
 export const LQA_REGIONAL = [
+  // LOOP 9 (P1-8): «coger» es habitual en España (y en parte de Colombia) pero vulgar en México y el Cono Sur.
+  { re: /(?:^|[^\p{L}])(coger|coge|coges|cogen|cogemos|cogió|cogieron|cogido|cogida|cogidos|cogidas|cogiendo)(?=$|[^\p{L}])/iu, term: 'coger', region: 'España', hint: 'tomar' },
   // Argentina / Uruguay
   // Solo como vocativo al inicio de la oración («Che, …»): «la figura del Che, …» no.
   { re: /(?:^|[.!?]\s+|[¡¿"«(]\s*)[Cc]he,/u, term: 'che', region: 'Argentina/Uruguay', hint: 'omítelo' },
@@ -143,7 +145,7 @@ export const LQA_REGIONAL = [
 ];
 
 /** «vosotros» y sus formas (España). */
-export const LQA_VOSOTROS_RE = /(?:^|[^\p{L}])(vosotr[oa]s|vuestr[oa]s?|os\s+(?:recomiendo|recomendamos|pido|pedimos|invito|invitamos|animo|animamos|propongo|proponemos|dejo|dejamos|explico|explicamos)|(?:sois|tenéis|podéis|sabéis|queréis|hacéis|estáis|habéis|debéis|necesitáis|vais|seáis|tengáis|podáis|revisad|haced|leed|abrid|escribid|completad|mirad|venid|prestad|tened|decid|poned|pensad|recordad|observad|analizad|responded|elegid|entregad))(?=$|[^\p{L}])/iu;
+export const LQA_VOSOTROS_RE = /(?:^|[^\p{L}])(vosotr[oa]s|vuestr[oa]s?|os\s+(?:recomiendo|recomendamos|pido|pedimos|invito|invitamos|animo|animamos|propongo|proponemos|dejo|dejamos|explico|explicamos)|(?:sois|tenéis|podéis|sabéis|queréis|hacéis|estáis|habéis|debéis|necesitáis|vais|seáis|tengáis|podáis|revisad|haced|leed|abrid|escribid|completad|mirad|venid|prestad|tened|decid|poned|pensad|recordad|observad|analizad|responded|elegid|entregad|coged|tomad|usad|buscad|preparad|practicad|repasad|guardad|cread|enviad|subid|aplicad|calculad|identificad|comparad|evaluad|consultad|seguid))(?=$|[^\p{L}])/iu;
 
 function _lqaCap(src, dst) {
   if (!dst) return dst;
@@ -156,6 +158,53 @@ export const LQA_REFERENCE_RE = /^\s*(?:[-*•]|\d{1,3}[.)])?\s*[A-ZÁÉÍÓÚÑ
 
 export const LQA_VOSEO_WORD_RE = new RegExp('(^|[^\\p{L}])(' + Object.keys(LQA_VOSEO_FIX).filter(function (k) { return LQA_VOSEO_FIX[k]; }).sort(function (a, b) { return b.length - a.length; }).join('|') + ')(?=$|[^\\p{L}])', 'giu');
  /** «el vos», «del vos», «un vos»: el pronombre nombrado como palabra, no usado. */
+// LOOP 9 (P1-8): imperativo del voseo con pronombre pegado («crealo», «guardalo», «revisalo», «decime»). En tuteo lleva tilde
+// («créalo», «guárdalo», «revísalo», «dime»). Se deriva SOLO de los imperativos de la tabla (terminados en á/é/í), así que no
+// toca palabras comunes; se detecta (el ejecutor pide un reintento dirigido), no se corrige solo.
+export const LQA_CLITICS = ['lo', 'la', 'los', 'las', 'le', 'les', 'me', 'nos', 'te', 'melo', 'mela', 'telo', 'tela', 'selo', 'sela'];
+function _lqaUnaccent(w) { return String(w).normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+function _lqaSyllableGroups(w) {
+  // Núcleos vocálicos: dos vocales fuertes seguidas son sílabas distintas («cre-a»); fuerte + débil, una («guar-da»).
+  var g = [];
+  var re = /[aeiouáéíóúü]+/gi;
+  var m;
+  while ((m = re.exec(w))) {
+    var v = m[0];
+    var parts = v.replace(/([aeoáéó])(?=[aeoáéó])/gi, '$1|').split('|');
+    for (var i = 0; i < parts.length; i++) g.push({ text: parts[i], index: m.index + v.indexOf(parts[i], i ? v.indexOf(parts[i - 1]) + parts[i - 1].length : 0) });
+  }
+  return g;
+}
+function _lqaTuteoWithClitic(tu, clitic) {
+  if (/[áéíóú]/.test(tu)) return tu + clitic;
+  var g = _lqaSyllableGroups(tu);
+  var total = g.length + _lqaSyllableGroups(clitic).length;
+  if (total < 3 || !g.length) return tu + clitic;
+  var t = g.length >= 2 ? g[g.length - 2] : g[0];
+  var strong = /[aeo]/i.exec(t.text);
+  var off = strong ? strong.index : t.text.length - 1;
+  var at = t.index + off;
+  var acc = { a: 'á', e: 'é', i: 'í', o: 'ó', u: 'ú' }[tu.charAt(at).toLowerCase()] || tu.charAt(at);
+  return tu.slice(0, at) + acc + tu.slice(at + 1) + clitic;
+}
+// Palabras reales que coinciden con una forma derivada (no se marcan): «tomate», «mandala», «comete un error», y voces inglesas
+// de textos técnicos («create», «evaluate», «iterate»).
+export const LQA_VOSEO_CLITIC_EXCLUDE = { tomate: 1, mandala: 1, comete: 1, create: 1, evaluate: 1, iterate: 1, cometela: 1,
+  // Review L9: voces inglesas de textos técnicos (menús, funciones) y «deciles» (estadística); «ándale» es mexicanismo, no voseo.
+  calculate: 1, participate: 1, elaborate: 1, considerate: 1, mandate: 1, definite: 1, restate: 1, explicate: 1, reformulate: 1, probate: 1,
+  decile: 1, deciles: 1, andale: 1 };
+export const LQA_VOSEO_CLITIC = (function () {
+  var map = {};
+  Object.keys(LQA_VOSEO_FIX).forEach(function (k) {
+    if (!/[áéí]$/.test(k) || !LQA_VOSEO_FIX[k]) return;
+    var base = _lqaUnaccent(k);
+    if (base.length < 3) return;
+    LQA_CLITICS.forEach(function (c) { if (!map[base + c] && !LQA_VOSEO_CLITIC_EXCLUDE[base + c]) map[base + c] = _lqaTuteoWithClitic(LQA_VOSEO_FIX[k], c); });
+  });
+  return map;
+})();
+export const LQA_VOSEO_CLITIC_RE = new RegExp('(^|[^\\p{L}])(' + Object.keys(LQA_VOSEO_CLITIC).sort(function (a, b) { return b.length - a.length; }).join('|') + ')(?=$|[^\\p{L}])', 'iu');
+
 export const LQA_VOS_NOUN_BEFORE_RE = /(?:^|[^\p{L}])(?:el|del|un|al)\s+$/iu;
 export const LQA_VOS_RE = /(^|[^\p{L}])(?:(con)\s+vos|(para|a|de|por|sin|hacia|sobre|contra|ante|desde|hasta)\s+vos|(vos))(?=$|[^\p{L}])/giu;
 
@@ -250,6 +299,18 @@ export function lqaSentenceFindings(sentence) {
     if (m[2] === m[2].toUpperCase() && m[2].length > 1) continue;
     out.push({ code: 'VOSEO', term: m[2], region: 'Argentina/Uruguay', hint: LQA_VOSEO_FIX[m[2].toLowerCase()] });
     break;
+  }
+  if (!out.length) {
+    // Todas las coincidencias (review BE-L9 m3): si la primera es un nombre, una posterior real igual se detecta.
+    var cre = new RegExp(LQA_VOSEO_CLITIC_RE.source, 'giu');
+    var cm;
+    while ((cm = cre.exec(s))) {
+      // Con mayúscula en medio de la oración es un nombre (menú, función, marca): «la función Calculate» no es voseo.
+      var midCap = /^[A-ZÁÉÍÓÚÑ]/.test(cm[2]) && /[^\s.!?¡¿"«:(\-—]\s*$/.test(s.slice(0, cm.index + cm[1].length));
+      if (midCap || (cm[2] === cm[2].toUpperCase() && cm[2].length > 1)) continue;
+      out.push({ code: 'VOSEO', term: cm[2], region: 'Argentina/Uruguay', hint: LQA_VOSEO_CLITIC[cm[2].toLowerCase()] });
+      break;
+    }
   }
   if (!out.length) {
     var vre = new RegExp(LQA_VOS_RE.source, 'giu');

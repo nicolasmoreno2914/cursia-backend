@@ -15,6 +15,7 @@
 //   PB11 textos del backend (mensajes, sugerencias, errores) en español neutro: Language QA = 0 en src/.
 //   PB12 CONSISTENCIA interfaz/PDF: el renderizador REAL del frontend (56-v2-prebrief.js) muestra exactamente los textos
 //        del documento (los mismos que PB8 encuentra en el PDF). Requiere CURSIA_FRONTEND_REPO.
+//   PB17 nivel y previos con rótulo y origen real; previos del documento. PB18 lo que Cursia no puede producir → excepción.
 //   PB16 todo UPDATE … RETURNING de versiones usa returningRows ([filas, cantidad] con TypeORM).
 //   PB15 el corte por fecha de creación usa el instante de Postgres (zona horaria del proceso irrelevante).
 //   PB14 sin tablas del Prebrief, guardar tema/evaluación no aborta la transacción (to_regclass).
@@ -363,6 +364,51 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
       const before = src.slice(Math.max(0, m.index - 120), m.index);
       assert(/returningRows\(await (this\.dataSource|qr)\.query\(\s*`?$/.test(before.trimEnd().replace(/`$/, '') + '`') || /returningRows\(await (this\.dataSource|qr)\.query\(/.test(before), `UPDATE sin returningRows: …${before.slice(-80)}`);
     }
+  });
+
+  await check('PB17 público objetivo para personas: nivel y conocimientos previos con rótulo y origen real (nunca un código ni un valor de partida como «decisión»)', () => {
+    const m = build(fixture({ doc4x5: true }));
+    const lvl = m.course.level;
+    eq([lvl.value, lvl.origin], ['Técnico / tecnológico', 'document'], 'nivel: rótulo y origen del documento');
+    eq([m.learner.priorKnowledge.value, m.learner.priorKnowledge.origin], ['Conoce lo esencial del tema', 'cursia'], 'previos: rótulo y origen Cursia (inferido)');
+    eq(m.learner.prerequisites && m.learner.prerequisites.value, 'Contabilidad básica; Manejo de hoja de cálculo', 'previos del documento');
+    const texts = D('modules/prebrief/prebrief-document.js').documentTexts(D('modules/prebrief/prebrief-document.js').buildPrebriefDocument(m));
+    assert(!texts.some((t) => /^(none|basic|intermediate|advanced|technical|university|secondary|professional)$/.test(t)), 'ningún código interno en el documento');
+    assert(texts.includes('Conocimientos previos que pide el documento'), 'fila de previos del documento');
+  });
+
+  await check('PB18 requisito que Cursia no puede producir (2 videos por capítulo) → excepción con motivo pendiente, no un crítico sin salida', () => {
+    const inp = fixture({ doc4x5: true });
+    const card = inp.card;
+    card.requirements.items.push({ id: 'RQV', key: 'videos@chapter', kind: 'videos', value: 2, mode: 'exact', scope: { level: 'chapter', each: true }, applies: true, obligation: 'required', confidence: 'high', source: { quote: 'Cada capítulo debe incluir 2 videos.', page: null } });
+    card.requirements.checks.push({ requirementId: 'RQV', status: 'not_verifiable', actual: {}, chosenBy: 'cursia', note: 'Cursia produce un video por capítulo: no puede cumplir más de uno por capítulo todavía.', impossible: true });
+    const RAx = D('modules/academic-context/requirements/requirement-authority.js');
+    const v = RAx.requirementVerificationChecks([card.requirements.items.find((r) => r.id === 'RQV')], [card.requirements.checks.find((c) => c.requirementId === 'RQV')], { status: 'within_tolerance', baseHours: 40, estimatedHours: 42, modules: 3, moduleExams: 3, exceptionFields: {} });
+    eq(v[0].severity, 'warning', 'advertencia (excepción), no crítico');
+    card.verification.checks.push(v[0]);
+    const m = M.buildPrebriefModel(inp, RA.actualText, RA.requirementText);
+    const ex = m.exceptions.find((e) => e.requirementKey === 'videos@chapter');
+    assert(ex, 'figura en «Excepciones al documento»');
+    eq([ex.reason, ex.appliedText], [null, 'Cursia produce un video por capítulo'], 'motivo pendiente; lo que Cursia produce');
+    const r = D('modules/prebrief/prebrief-readiness.js').prebriefReadiness(m, card, [], []);
+    assert(r.blockers.some((b) => b.code === 'exception_reason' && b.ref === 'videos@chapter'), 'la propuesta pide el motivo antes de prepararse');
+    assert(!r.blockers.some((b) => b.code === 'critical'), 'sin crítico');
+  });
+
+  await check('PB19 Language QA de la propuesta: una cita LITERAL del documento (no editable en Cursia) no bloquea; lo que redacta Cursia sí', () => {
+    const inp = fixture({ doc4x5: true });
+    const m = build(inp);
+    const doc = D('modules/prebrief/prebrief-document.js');
+    const verbatim = M.documentVerbatimTexts(m);
+    const o = m.goals.outcomes.find((x) => x.origin === 'document');
+    assert(o && M.isDocumentVerbatim(o.text, verbatim), 'un resultado del documento es literal');
+    assert(M.isDocumentVerbatim(`${o.text}`, verbatim) && !M.isDocumentVerbatim('Cursia recomienda el enfoque por competencias.', verbatim), 'lo de Cursia no');
+    // Un resultado del documento con «coger» no se marca; el mismo texto como observación de Cursia sí se revisaría.
+    const L = D('modules/language-qa/language-qa.js');
+    const t = 'Coger el casco antes de entrar a la planta.';
+    assert(L.lqaFindings(t, 3).length > 0, 'el detector lo ve');
+    assert(M.isDocumentVerbatim(t, verbatim.concat([t])), 'pero si es literal del documento, se omite');
+    assert(doc.documentTexts(doc.buildPrebriefDocument(m)).length > 0);
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);

@@ -17,7 +17,7 @@ import { readStructureOrigin } from '../course-structure/structure-authority';
 import { actualText, requirementText, structureEditedByTeacher } from '../academic-context/requirements/requirement-authority';
 import { lqaFindings, lqaHitLabel } from '../language-qa/language-qa';
 import { COURSE_FORMATS, COURSE_FORMAT_CODES, COURSE_FORMAT_CATALOG_VERSION, CourseFormatCode, formatDef, isCourseFormatCode, readCourseFormat, writeCourseFormat } from './course-formats';
-import { PrebriefModel, StoredExceptionReason, buildPrebriefModel, diffModels, prebriefModelSha } from './prebrief-model';
+import { PrebriefModel, StoredExceptionReason, buildPrebriefModel, diffModels, documentVerbatimTexts, isDocumentVerbatim, prebriefModelSha } from './prebrief-model';
 import { PrebriefDocument, PrebriefDocumentMeta, PrebriefStatus, approvalStateTexts, buildPrebriefDocument, documentSha, documentTexts } from './prebrief-document';
 import { PrebriefReadiness, prebriefReadiness } from './prebrief-readiness';
 import { DoubtfulItem, doubtfulItems } from './plausibility';
@@ -167,7 +167,8 @@ export class PrebriefService {
     }, confirmed);
     const document = buildPrebriefDocument(model);
     const language: string[] = [];
-    for (const t of documentTexts(document)) for (const h of lqaFindings(t, 3)) language.push(`${lqaHitLabel(h)} en «${t.slice(0, 80)}»`);
+    const verbatim = documentVerbatimTexts(model);
+    for (const t of documentTexts(document)) if (!isDocumentVerbatim(t, verbatim)) for (const h of lqaFindings(t, 3)) language.push(`${lqaHitLabel(h)} en «${t.slice(0, 80)}»`);
     const readiness = prebriefReadiness(model, card, doubts, language);
     const checks: any[] = (card && card.verification && card.verification.checks) || [];
     return {
