@@ -1,3 +1,4 @@
+import { adoptCourseTitleIfPlaceholder } from '../course-facts/course-facts-db';
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { parseProposedHours } from '../course-design/design-pins';
 import { returningRows } from '../../common/db/returning-rows';
@@ -317,6 +318,8 @@ export class CourseProfilesService {
       const derivedPedagogy = kind === 'academic'
         ? await this.derivePedagogyFromAcademic(qr, courseId, ownerId, profile as AcademicContextV1, currentVersion + 1, finalExam, [], previousContext)
         : undefined;
+      // LOOP 9.2 (QA): el nombre del documento llega al curso apenas se guarda el contexto (antes de cualquier Blueprint).
+      if (kind === 'academic') await adoptCourseTitleIfPlaceholder(qr, courseId);
       await qr.commitTransaction();
       return {
         created: true,

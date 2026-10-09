@@ -1357,6 +1357,29 @@ function reservationBookkeeping(ev) {
       const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
       ok(lock.status === 201, 'E8: lock → 201', { s: lock.status, e: lock.error });
       const snap = lock.data.blueprint.snapshot;
+      // LOOP 9.2 (QA): un nombre propio nunca se pisa al aplicar el diseño.
+      ok(!ap.data.adoptedTitle && snap.course.title === '[E2E Contexto E8] Contabilidad de Costos', 'E8: «Aplicar diseño» conserva el nombre propio del curso', { adopted: ap.data.adoptedTitle, t: snap.course.title });
+      {
+        // LOOP 9.2 (QA): un curso «Curso sin título» toma el nombre del documento al aplicar el diseño → Blueprint con nombre.
+        const cr2 = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: 'Curso sin título' });
+        const c2 = Number(cr2.data.id);
+        let s2 = await readStructure(c2);
+        if (!s2.modules.length) { await api('POST', `/courses/${c2}/modules`, { title: 'Módulo 1', examEnabled: true, expectedCounter: s2.structureVersionCounter }); s2 = await readStructure(c2); }
+        await api('POST', `/courses/${c2}/profiles/academic`, { data: draft, expectedVersion: 0 });
+        eq((await q(`select title from public.courses where id = $1`, [c2]))[0].title, 'Contabilidad de Costos', 'E8: guardar el contexto da nombre a un «Curso sin título» (antes de cualquier Blueprint)');
+        const d2 = (await api('POST', `/courses/${c2}/pedagogy/dry-run`, {})).data.distribution;
+        const a2 = await api('POST', `/courses/${c2}/modules/apply-distribution`, { expectedCounter: s2.structureVersionCounter, proposalSha256: d2.proposalSha256 });
+        s2 = await readStructure(c2);
+        const l2 = await api('POST', `/courses/${c2}/blueprints`, { expectedCounter: s2.structureVersionCounter });
+        eq([a2.status < 300, l2.status, l2.data && l2.data.blueprint.snapshot.course.title], [true, 201, 'Contabilidad de Costos'],
+          'E8: el Blueprint de un curso que empezó «Curso sin título» lleva el nombre del documento');
+        // Un curso anterior a este arreglo (contexto ya guardado, todavía sin nombre) lo toma al aplicar el diseño.
+        await q(`update public.courses set title = 'Curso sin título' where id = $1`, [c2]);
+        s2 = await readStructure(c2);
+        const d3 = (await api('POST', `/courses/${c2}/pedagogy/dry-run`, {})).data.distribution;
+        const a3 = await api('POST', `/courses/${c2}/modules/apply-distribution`, { expectedCounter: s2.structureVersionCounter, proposalSha256: d3.proposalSha256 });
+        eq([a3.status < 300, a3.data && a3.data.adoptedTitle], [true, 'Contabilidad de Costos'], 'E8: «Usar este diseño» también da nombre a un curso sin nombre propio');
+      }
       const ac = snap.course.academicContext;
       ok(ac && ac.outcomes.map((o) => o.id).join() === 'RA1,RA2,RA3,RA4,RA5,RA6' && ac.competencies.length === 2 && ac.contextSha256 === sv.data.profile.sha256, 'E8: Blueprint congela los resultados y competencias del contexto (con su huella)', ac && { o: ac.outcomes.length, sha: ac.contextSha256 });
       eq(snap.modules.flatMap((m) => m.chapters).filter((c) => c.outcomeIds).length, 18, 'E8: Blueprint con los vínculos de los 18 capítulos del documento');
