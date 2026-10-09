@@ -39,8 +39,18 @@ export async function adoptCourseTitleIfPlaceholder(q: Q, courseId: number): Pro
   if (!course || !isPlaceholderCourseTitle(course.title)) return null;
   const facts = await loadCourseFacts(q, courseId, course);
   const f = facts.title;
-  if (!f || typeof f.value !== 'string' || (f.source !== 'document' && f.source !== 'user')) return null;
-  const t = f.value.replace(/\s+/g, ' ').trim().slice(0, 255);
+  let v: string | null = f && typeof f.value === 'string' && (f.source === 'document' || f.source === 'user') ? f.value : null;
+  // QA staging: «Crear» rellena el nombre del pedido con el del documento y lo marca «inferido»; en ese caso vale el
+  // nombre que el documento trae (leído o confirmado, nunca uno propuesto por Cursia).
+  if (!v) {
+    const ac = await loadCurrentAcademicContext(q, courseId).catch(() => null);
+    const sn = ac && ac.context && ac.context.identity ? ac.context.identity.subjectName : null;
+    // Review: solo si el nombre «inferido» ES el del documento (si no, la propuesta mostraría uno y el Blueprint otro).
+    const norm = (x: unknown) => String(x ?? '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+    if (sn && (sn.status === 'found' || sn.status === 'provided') && typeof sn.value === 'string' && f && f.source === 'inferred' && norm(f.value) === norm(sn.value)) v = sn.value;
+  }
+  if (!v) return null;
+  const t = v.replace(/\s+/g, ' ').trim().slice(0, 255);
   if (!t || isPlaceholderCourseTitle(t)) return null;
   await q.query(`update public.courses set title = $2, updated_at = now() where id = $1`, [courseId, t]);
   return t;
