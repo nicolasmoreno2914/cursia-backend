@@ -226,6 +226,12 @@ export interface DesignForRequirements {
   /** counts.evaluations del distribuidor: evaluaciones de módulo + final. */
   evaluations: number;
   targetHours: number | null;
+  /**
+   * LOOP 9.2 (QA): horas estimadas del diseño y estado del distribuidor. Si el diseño quedó por encima de la tolerancia,
+   * las horas del documento se comparan con las del diseño (antes «8 horas: Cumple» con un diseño de 9,4 h).
+   */
+  estimatedHours?: number | null;
+  hoursStatus?: string | null;
   hoursSource: 'user' | 'adjusted' | 'document' | 'proposed';
   /** El docente cambió la estructura después de que Cursia la armó (o la armó él). */
   structureByTeacher: boolean;
@@ -357,7 +363,12 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
       }
       case 'target_hours':
         if (s.level === 'course') {
-          if (typeof d.targetHours !== 'number') nv(r, 'El diseño todavía no tiene horas.', hoursBy); else one(r, d.targetHours, hoursBy, true);
+          if (typeof d.targetHours !== 'number') nv(r, 'El diseño todavía no tiene horas.', hoursBy);
+          // Review QA I2/M2: solo cuando las horas no las eligió el docente (su meta sigue siendo SU decisión), y con el estado
+          // del distribuidor (no con el redondeo a un decimal): por encima de la tolerancia no cumple.
+          else if (d.hoursStatus === 'above_tolerance' && typeof d.estimatedHours === 'number' && hoursBy !== 'teacher') {
+            out.push({ requirementId: r.id, status: 'unmet', actual: { value: round1(d.estimatedHours) }, chosenBy: hoursBy });
+          } else one(r, d.targetHours, hoursBy, true);
         } else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];
           if (!m) missingModule(r, s.index, modulesBy);
