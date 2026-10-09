@@ -60,11 +60,39 @@ const ASSESSMENT_HINTS: ReadonlyArray<[AssessmentMethod, RegExp]> = [
 ];
 const APPROACH_HINTS: ReadonlyArray<[string, RegExp]> = [
   ['problemas', /aprendizaje basado en problemas|\babp\b|resolucion de problemas/],
-  ['competencias', /basad[oa] en competencias|enfoque por competencias|formacion por competencias/],
+  ['competencias', /basad[oa] en competencias|enfoque (por|de|basado en) competencias|formacion por competencias/],
   ['experiencial', /aprendizaje experiencial|aprender haciendo/],
   ['significativo', /aprendizaje significativo/],
   ['autodirigido', /aprendizaje autodirigido|autoaprendizaje|aprendizaje autonomo/],
 ];
+/**
+ * Review LOOP 9.2 (I7): enfoque NOMBRADO por la metodología («aprendizaje basado en problemas», «enfoque por
+ * competencias»…) frente a una práctica que solo lo sugiere («razonamiento sobre casos», «centrada en situaciones»).
+ * «autoaprendizaje» describe la modalidad, no el enfoque: no cuenta como enfoque nombrado.
+ */
+const APPROACH_STRONG: ReadonlyArray<[string, RegExp]> = [
+  ['problemas', /aprendizaje basado en problemas|\babp\b/],
+  ['competencias', /basad[oa] en competencias|enfoque (por|de|basado en) competencias|formacion por competencias/],
+  ['experiencial', /aprendizaje experiencial/],
+  ['significativo', /aprendizaje significativo/],
+  ['autodirigido', /aprendizaje autodirigido/],
+];
+const APPROACH_WEAK: ReadonlyArray<[string, RegExp]> = [
+  ['problemas', /resolucion de problemas|razonamiento sobre casos|basad[oa] en casos|centrad[oa] en (situaciones|casos)/],
+];
+
+/**
+ * LOOP 9.2 · Enfoque que indica la metodología del documento: el nombrado (el primero que aparece en el texto) con
+ * confianza alta; si no nombra ninguno, el que sugiere su práctica (casos → ABP) con confianza media; si no, null.
+ */
+export function approachFromMethodology(text: string | null | undefined): { id: string; strong: boolean } | null {
+  if (!text) return null;
+  const p = plain(text);
+  const strong = APPROACH_STRONG.map(([id, re]) => ({ id, at: p.search(re) })).filter((x) => x.at >= 0).sort((a, b) => a.at - b.at);
+  if (strong.length) return { id: strong[0].id, strong: true };
+  const weak = APPROACH_WEAK.find(([, re]) => re.test(p));
+  return weak ? { id: weak[0], strong: false } : null;
+}
 
 const plain = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, max - 1).replace(/\s+\S*$/, '')}…`);
@@ -274,6 +302,27 @@ export function proposeStructureFromContext(ctx: AcademicContextV1): ContextStru
     };
   });
 
+  // LOOP 9.2 · Ningún resultado del documento queda sin capítulo si algún capítulo comparte términos con él: se vincula
+  // al que mejor le encaja (inferido: el docente lo ve y lo cambia). Igual con un capítulo sin ningún resultado.
+  const allChapters = modules.flatMap((m) => m.chapters);
+  const textOf = (c: ContextChapterProposal) => [c.title, c.description || ''].join(' ');
+  const score = (a: string, b: string) => tokenContainment(a, b) + tokenJaccard(a, b);
+  const covering = () => new Set(allChapters.flatMap((c) => c.outcomeIds));
+  for (const o of raOnly) {
+    if (covering().has(o.id)) continue;
+    const best = allChapters.map((c, i) => ({ c, i, s: score(textOf(c), o.text) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s || a.i - b.i)[0];
+    if (best) { best.c.outcomeIds = [...best.c.outcomeIds, o.id].sort(cmpOutcome).slice(0, 8); best.c.linkStatus = 'inferred'; } // review M5
+  }
+  for (const c of allChapters) {
+    if (c.outcomeIds.length || !raOnly.length) continue;
+    const best = raOnly.map((o) => ({ o, s: score(textOf(c), o.text) })).filter((x) => x.s > 0).sort((a, b) => b.s - a.s)[0];
+    if (best) { c.outcomeIds = [best.o.id]; c.linkStatus = 'inferred'; }
+  }
+  for (const m of modules) {
+    m.outcomeIds = [...new Set([...m.outcomeIds, ...m.chapters.flatMap((c) => c.outcomeIds)])].sort(cmpOutcome);
+    const texts = m.outcomeIds.map((id) => outcomes.find((o) => o.id === id)).filter((o): o is { id: string; text: string } => !!o && o.id.startsWith('RA'));
+    if (texts.length) m.objective = clip(texts.map((o) => o.text.replace(/\.$/, '')).join('; ') + '.', 1000);
+  }
   const linked = modules.flatMap((m) => m.chapters).filter((c) => c.outcomeIds.length);
   const covered = new Set(linked.flatMap((c) => c.outcomeIds));
   const uncovered = ctx.outcomes.filter((o) => !covered.has(o.id));

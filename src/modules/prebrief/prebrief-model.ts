@@ -66,6 +66,8 @@ export interface PrebriefRequirement {
 }
 
 export interface PrebriefException {
+  /** LOOP 9.2: misma limitación que otra excepción (misma frase del documento): su motivo cubre esta. */
+  coveredBy?: string;
   requirementKey: string;
   requirementText: string;
   appliedText: string;
@@ -98,7 +100,8 @@ export interface PrebriefModel {
     description: OriginValue<string> | null;
     priorKnowledge: OriginValue<string> | null;
     /** LOOP 9: conocimientos previos que pide el documento (temas), tal cual. */
-    prerequisites?: OriginValue<string> | null;
+    /** kind (LOOP 9.2): el documento los exige, los recomienda o dice que no hace falta ninguno. */
+    prerequisites?: (OriginValue<string> & { kind?: 'required' | 'recommended' | 'none' }) | null;
   };
   goals: {
     generalObjective: (OriginValue<string> & { label: string }) | null;
@@ -320,7 +323,8 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
   const description = facts.learnerDescription.value ? { value: clean(facts.learnerDescription.value), origin: factOrigin(facts.learnerDescription.source) } : null;
   const prior = facts.priorKnowledge.value ? { value: PRIOR_KNOWLEDGE_LABEL[String(facts.priorKnowledge.value)] || clean(facts.priorKnowledge.value), origin: factOrigin(facts.priorKnowledge.source) } : null;
   const docPrereq = ((facts as any).documentPrerequisites || []).map((x: unknown) => clean(String(x))).filter(Boolean);
-  const prerequisites = docPrereq.length ? { value: docPrereq.join('; '), origin: 'document' as const } : null;
+  const prereqKind = (facts as any).documentPrerequisitesKind as 'required' | 'recommended' | 'none' | null | undefined;
+  const prerequisites = docPrereq.length ? { value: docPrereq.join('; '), origin: 'document' as const, ...(prereqKind ? { kind: prereqKind } : {}) } : null;
 
   // Objetivo: el general del documento; si no hay, el propósito que escribió la institución (nunca uno inventado).
   const go = academic && academic.identity.generalObjective;
@@ -417,12 +421,19 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       : status === 'not_verifiable' && c && c.note ? clean(c.note) : null;
     items.push({ key: String(r.key), text, status, raw: { mode: String(r.mode), value: typeof r.value === 'number' ? r.value : null, valueMax: typeof r.valueMax === 'number' ? r.valueMax : null, shape: Array.isArray(r.shape) ? r.shape.map(Number) : null, obligation: String(r.obligation) }, actual, detail, evidence: quote, ...(doubtful ? { doubtful: true as const } : {}) });
     if (status === 'exception') {
-      const saved = inp.exceptionReasons[String(r.key)];
-      const valid = saved && saved.requirementText === text && clean(saved.reason).length > 0;
+      // LOOP 9.2: una excepción de capacidad cubierta por otra de la misma frase toma su motivo (un solo motivo para las dos).
+      const cov = vcheck && vcheck.capability && vcheck.capability.coveredBy ? vcheck.capability.coveredBy : null;
+      const okReason = (sv: StoredExceptionReason | undefined, t: string) => !!(sv && sv.requirementText === t && clean(sv.reason).length > 0);
+      const ownSaved = inp.exceptionReasons[String(r.key)];
+      const covSaved = cov ? inp.exceptionReasons[String(cov.requirementKey)] : undefined;
+      // Review M9: el motivo de la excepción que la cubre; si no, uno guardado antes en la propia.
+      const saved = cov && okReason(covSaved, cov.requirementText) ? covSaved : ownSaved;
+      const valid = cov && okReason(covSaved, cov.requirementText) ? true : okReason(ownSaved, text);
       exceptions.push({
         // LOOP 9 (P0-2): un requisito que Cursia no puede producir muestra lo que SÍ produce (campo explícito del check).
         requirementKey: String(r.key), requirementText: text, appliedText: actual || (vcheck && vcheck.capability ? clean(vcheck.capability.produces) : '—'),
         reason: valid ? clean(saved.reason) : null, by: valid ? saved.by : null, at: valid ? saved.at : null,
+        ...(cov ? { coveredBy: String(cov.requirementKey) } : {}),
       });
     }
   }

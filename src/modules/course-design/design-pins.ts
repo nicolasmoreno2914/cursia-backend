@@ -7,7 +7,12 @@
 type Q = { query(sql: string, params?: any[]): Promise<any> };
 
 export const DESIGN_PINS_KEY = 'designPins';
-export type DesignPinsMap = Record<string, { video?: boolean; application?: number; noLinks?: boolean }>;
+/**
+ * LOOP 9.2 (review C1/I1/I2): `activity` = la actividad interactiva de un capítulo, cambiada a mano por el docente;
+ * `noPractice` (clave = id del MÓDULO) = el docente quitó la práctica de ese módulo: Cursia no la vuelve a proponer allí
+ * y la diferencia con el documento queda como su excepción. «Liberar» devuelve las dos a Cursia.
+ */
+export type DesignPinsMap = Record<string, { video?: boolean; application?: number; noLinks?: boolean; activity?: boolean; noPractice?: boolean }>;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function parseDesignPins(v: unknown): DesignPinsMap {
@@ -19,8 +24,11 @@ export function parseDesignPins(v: unknown): DesignPinsMap {
     const noLinks = (pin as { noLinks?: unknown }).noLinks === true;
     const app = (pin as { application?: unknown }).application;
     const application = typeof app === 'number' && Number.isInteger(app) && app >= 0 && app <= 240 ? app : undefined;
-    if (typeof video === 'boolean' || noLinks || application !== undefined) {
-      out[id] = { ...(typeof video === 'boolean' ? { video } : {}), ...(application !== undefined ? { application } : {}), ...(noLinks ? { noLinks: true } : {}) };
+    const activity = (pin as { activity?: unknown }).activity;
+    const noPractice = (pin as { noPractice?: unknown }).noPractice === true;
+    if (typeof video === 'boolean' || noLinks || application !== undefined || typeof activity === 'boolean' || noPractice) {
+      out[id] = { ...(typeof video === 'boolean' ? { video } : {}), ...(application !== undefined ? { application } : {}), ...(noLinks ? { noLinks: true } : {}),
+        ...(typeof activity === 'boolean' ? { activity } : {}), ...(noPractice ? { noPractice: true } : {}) };
     }
   }
   return out;
@@ -39,7 +47,7 @@ export async function loadDesignPins(q: Q, courseId: number): Promise<DesignPins
  *    decisión del docente solo cuando los quita; mandar null a un capítulo que ya no tenía no decide nada).
  * Las condiciones leen la fila tal como estaba ANTES de la sentencia (las CTE de Postgres ven la misma instantánea).
  */
-export interface PinOp { field: 'video' | 'noLinks' | 'application'; value: boolean | number | null; unlessPractice?: boolean; onlyIfLinked?: boolean }
+export interface PinOp { field: 'video' | 'noLinks' | 'application' | 'activity' | 'noPractice'; value: boolean | number | null; unlessPractice?: boolean; onlyIfLinked?: boolean }
 
 /**
  * Expresión SQL (jsonb) que aplica `ops` sobre la columna `col` de courses.metadata, con el id del capítulo en el

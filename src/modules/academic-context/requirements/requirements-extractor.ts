@@ -52,18 +52,19 @@ const WORD_NUMBERS: Record<string, number> = {
 const PF = '(?: parcial(?:es)?| final(?:es)?)?';
 const NOUN_SRC =
   '(actividad(?:es)? de aplicacion|actividad(?:es)?(?: interactivas?)?|modulos?|unidad(?:es)?(?: tematicas?| didacticas?| de aprendizaje)?|' +
-  'capitulos?(?: de practica)?|leccion(?:es)?|temas?|videos?|videoclases?|capsulas? de video|' +
+  'capitulos?(?: de practica| de contenido)?|leccion(?:es)?|temas?|videos?|videoclases?|capsulas? de video|' +
   `evaluaci(?:on|ones)${PF}|examen(?:es)?${PF}|parcial(?:es)?|pruebas?${PF}|horas?|hrs?|h)`;
 const NUMBER_SRC = '(\\d{1,4}(?:[.,]\\d{1,2})?)';
 const ARTICLE = '\u00b7';
 const STOP = new Set(['de', 'del', 'la', 'el', 'las', 'los', 'en', 'por', 'para', 'con', 'y', 'o', 'a', 'al', 'que', 'se', 'su', 'sus', 'cada']);
 
-function nounKind(noun: string): { kind: RequirementKind; evaluationType?: 'any' | 'partial' | 'final'; medium?: boolean; practice?: boolean } | null {
+function nounKind(noun: string): { kind: RequirementKind; evaluationType?: 'any' | 'partial' | 'final'; medium?: boolean; practice?: boolean; content?: boolean } | null {
   if (/^actividad(es)? de aplicacion/.test(noun)) return { kind: 'application_activities' };
   if (/^actividad/.test(noun)) return { kind: 'activities' };
   if (/^modulo/.test(noun)) return { kind: 'modules' };
   if (/^unidad/.test(noun)) return { kind: 'units' };
   if (/^capitulos? de practica/.test(noun)) return { kind: 'chapters', practice: true };
+  if (/^capitulos? de contenido/.test(noun)) return { kind: 'chapters', content: true };
   if (/^(capitulo|leccion)/.test(noun)) return { kind: 'chapters' };
   if (/^tema/.test(noun)) return { kind: 'chapters', medium: true };
   if (/^(video|capsula)/.test(noun)) return { kind: 'videos' };
@@ -125,6 +126,31 @@ interface Segment {
   block?: { level: 'module' | 'unit'; index: number };
   example: boolean;
   cells: boolean;
+  /** LOOP 9.2: dentro de una sección que el documento declara no prescriptiva. */
+  informative?: boolean;
+}
+
+/** LOOP 9.2 · Título de una sección que no exige nada («15. Información no prescriptiva», «Referencias de contexto»…). */
+const RE_NONPRESCRIPTIVE_HEAD = /(no prescriptiv\w*|informacion (de contexto|contextual|complementaria no obligatoria)|referencias? de contexto|no constituyen requisitos|solo (para )?contextualizar)/;
+/**
+ * ¿La línea abre una sección? Review I10: si el documento tiene títulos con estilo (Word/Markdown), solo esos; si no, un
+ * numerado que SIGUE la numeración de las secciones (15 → 16, no los ítems «1.», «2.» de una lista), un título en
+ * mayúsculas o un «Anexo …».
+ */
+function sectionHeadingDetector(lines: SourceLine[]): (l: SourceLine, raw: string) => boolean {
+  const styled = lines.some((l) => !!l.heading);
+  let last: number | null = null;
+  return (l, raw) => {
+    if (l.cells) return false;
+    const n = /^\s*(\d{1,2})[.)]\s+\S/.exec(raw);
+    const short = raw.length <= 90 && !/[.;:]$/.test(raw);
+    if (styled && l.heading) { if (n) last = Number(n[1]); return true; }
+    // Review 2.ª (M2): en un DOCX con algunos títulos con estilo, la numeración continua también abre sección.
+    if (n && short && (last === null || Number(n[1]) === last + 1)) { last = Number(n[1]); return true; }
+    if (short && /^(anexo|apendice)\b/i.test(raw)) return true;
+    const letters = raw.replace(/[^A-Za-zÁÉÍÓÚÑáéíóúñ]/g, '');
+    return short && letters.length >= 4 && letters === letters.toUpperCase() && raw.split(/\s+/).length <= 8;
+  };
 }
 
 const ROMAN: Record<string, number> = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9, x: 10 };
@@ -190,9 +216,13 @@ function segmentsOf(lines: SourceLine[]): Segment[] {
   const sizes = sizeTableBlocks(raws);
   const consumed = new Set<number>();
   for (const b of sizes.values()) for (const j of b.consumed) consumed.add(j);
+  let informative = false;
+  const isSectionHeading = sectionHeadingDetector(lines);
   lines.forEach((l, i) => {
     const raw = raws[i];
     if (!raw) return;
+    // LOOP 9.2: una sección «no prescriptiva» no aporta requisitos hasta el encabezado siguiente.
+    if (isSectionHeading(l, raw)) informative = RE_NONPRESCRIPTIVE_HEAD.test(strip(raw));
     const size = sizes.get(i);
     if (size) {
       out.push({ text: size.text, quote: size.quote, line: l.line, page: l.page, block, example: i <= exampleUntil, cells: true, option: size.label });
@@ -205,7 +235,7 @@ function segmentsOf(lines: SourceLine[]): Segment[] {
     // Zona de ejemplo: un rótulo «EJEMPLO» / «Ejemplo:» cubre las líneas que le siguen inmediatamente.
     if (/^(ejemplo\b|como ejemplo\b|por ejemplo\b)/.test(n) || /\bejemplo\s*[·:]/.test(n) || (raw === raw.toUpperCase() && /EJEMPLO/.test(raw))) exampleUntil = i + 6;
     const opt = RE_OPTION.exec(raw) || RE_OPTION_NAMED.exec(raw);
-    const seg: Segment = { text: raw, line: l.line, page: l.page, block, example: i <= exampleUntil, cells: !!(l.cells && l.cells.length) };
+    const seg: Segment = { text: raw, line: l.line, page: l.page, block, example: i <= exampleUntil, cells: !!(l.cells && l.cells.length), ...(informative ? { informative: true } : {}) };
     if (opt) {
       seg.option = opt[1].toUpperCase();
       seg.text = opt[2].trim();
@@ -245,6 +275,9 @@ const RE_QTY = new RegExp(
   'g',
 );
 
+/** Verbos que una negación gobierna sobre «más/menos de N» (review I9). */
+const NEG_VERB = '(?:tendra|tendran|habra|sera|seran|incluira|incluiran|contara con|contaran con|podra tener|podran tener|exigira|exigiran|realizara|realizaran|debera tener|deberan tener|tiene|tienen|incluye|incluyen)';
+
 function num(s: string): number {
   return Number(s.replace(ARTICLE, '').replace(',', '.'));
 }
@@ -252,7 +285,10 @@ function num(s: string): number {
 function scopeAfter(after: string, kind: RequirementKind): RequirementScope | null {
   if (kind !== 'modules' && /^\s*(por modulo|en cada modulo|de cada modulo|cada uno|por cada modulo)\b/.test(after)) return { level: 'module', each: true };
   if (kind !== 'chapters' && /^\s*(por capitulo|en cada capitulo|de cada capitulo|por cada capitulo)\b/.test(after)) {
-    return /^\s*\S+ (cada )?capitulo de practica/.test(after) || /capitulo de practica/.test(after.slice(0, 40)) ? { level: 'chapter', each: true, chapterKind: 'practice' } : { level: 'chapter', each: true };
+    if (/^\s*\S+ (cada )?capitulo de practica/.test(after) || /capitulo de practica/.test(after.slice(0, 40))) return { level: 'chapter', each: true, chapterKind: 'practice' };
+    // LOOP 9.2: «2 videos por cada capítulo de contenido» (no en los de práctica).
+    if (/capitulo de contenido/.test(after.slice(0, 40))) return { level: 'chapter', each: true, chapterKind: 'content' };
+    return { level: 'chapter', each: true };
   }
   if (/^\s*(por resultado|por cada resultado|en cada resultado|por resultado de aprendizaje)\b/.test(after)) return { level: 'outcome', each: true };
   if (kind !== 'units' && /^\s*(por unidad|en cada unidad|de cada unidad)\b/.test(after)) return { level: 'unit', each: true };
@@ -301,8 +337,20 @@ function mentionsOf(m: string, sentenceScope: RequirementScope | null, ignored: 
       valueMax = value;
       value = num(lo);
     } else if (/(aproximadamente|alrededor de|cerca de|aprox\.?|unas|unos)\s*$/.test(before)) mode = 'approx';
-    else if (/(minimo|minimo de|como minimo|como minimo de|al menos|por lo menos|no menos de|mas de)\s*$/.test(before)) mode = 'min';
-    else if (/(maximo|maximo de|como maximo|como maximo de|hasta|no mas de|a lo sumo|menos de)\s*$/.test(before)) mode = 'max';
+    // LOOP 9.2: la negación que gobierna el cuantificador («no tendrá menos de 5» = al menos 5; «no tendrá más de 5» =
+    // hasta 5; «sin más de 2» = hasta 2). Review I9: solo «no + verbo + más/menos de», nunca un «no» cualquiera antes.
+    else if (/\bno menos de\s*$/.test(before)) mode = 'min';
+    else if (/\bno mas de\s*$/.test(before)) mode = 'max';
+    else if (new RegExp(`\\b(?:no\\s+(?:se\\s+)?${NEG_VERB}\\s+|sin\\s+)menos de\\s*$`).test(before)) mode = 'min';
+    else if (new RegExp(`\\b(?:no\\s+(?:se\\s+)?${NEG_VERB}\\s+|sin\\s+)mas de\\s*$`).test(before)) mode = 'max';
+    else if (/(minimo|minimo de|como minimo|como minimo de|al menos|por lo menos|no menos de|mas de)\s*$/.test(before)) {
+      mode = 'min';
+      // LOOP 9.2: «más de 2 evaluaciones» = al menos 3 (no «al menos 2»). En horas (continuas) queda el mínimo.
+      if (/mas de\s*$/.test(before) && !/no mas de\s*$/.test(before) && k.kind !== 'target_hours') value += 1;
+    } else if (/(maximo|maximo de|como maximo|como maximo de|hasta|no mas de|a lo sumo|menos de)\s*$/.test(before)) {
+      mode = 'max';
+      if (/(^|[^o] )menos de\s*$/.test(before) && !/no menos de\s*$/.test(before) && k.kind !== 'target_hours') value = Math.max(0, value - 1);
+    }
     const explicitScope = scopeAfter(after, k.kind);
     // «una evaluación del grado de avance» es un artículo: «un/una» solo es 1 con alcance («en cada capítulo»,
     // «Cada módulo … una actividad») o con un calificador («mínimo una…»).
@@ -310,7 +358,13 @@ function mentionsOf(m: string, sentenceScope: RequirementScope | null, ignored: 
       continue;
     }
     let scope: RequirementScope = explicitScope ?? (k.kind !== 'modules' && sentenceScope ? sentenceScope : { level: 'course' });
-    if (k.practice) scope = { level: 'chapter', each: true, chapterKind: 'practice' };
+    // LOOP 9.2: «cada módulo tendrá 1 capítulo de práctica» = 1 práctica POR MÓDULO (antes: «1 capítulo por capítulo de
+    // práctica», un alcance sin sentido que Cursia no medía y la práctica desaparecía del diseño). Sin módulo: en el curso.
+    // Review I11: «… y cada módulo tendrá 1 capítulo de práctica» (el alcance justo antes del sustantivo, a mitad de oración).
+    const modBefore = /\b(cada modulo|por modulo|en cada modulo)\b[^.;:]{0,30}$/.test(before);
+    if (k.practice) scope = (scope.level === 'module' && 'each' in scope) || modBefore ? { level: 'module', each: true, chapterKind: 'practice' } : { level: 'course', chapterKind: 'practice' };
+    else if (k.content && scope.level === 'module' && 'each' in scope) scope = { level: 'module', each: true, chapterKind: 'content' };
+    else if (k.content && scope.level === 'course') scope = { level: 'course', chapterKind: 'content' };
     out.push({ kind: k.kind, value, valueMax, mode, evaluationType: k.evaluationType, scope, medium: k.medium, index: start, end: start + all.length, raw: all });
   }
   return out;
@@ -321,15 +375,19 @@ function mentionsOf(m: string, sentenceScope: RequirementScope | null, ignored: 
 function scopeKey(s: RequirementScope): string {
   switch (s.level) {
     case 'module':
-      return 'each' in s ? 'module·each' : `module:${s.index}`;
+      return 'each' in s ? `module·each${s.chapterKind ? `:${s.chapterKind}` : ''}` : `module:${s.index}`;
     case 'chapter':
       return `chapter·each${s.chapterKind ? `:${s.chapterKind}` : ''}`;
     case 'unit':
       return 'each' in s ? 'unit·each' : `unit:${s.index}`;
     case 'subject':
       return `subject:${strip(s.subject)}`;
+    case 'course':
+      return s.chapterKind ? `course:${s.chapterKind}` : 'course';
+    case 'structure':
+      return s.chapterKind ? `structure:${s.chapterKind}` : 'structure';
     default:
-      return s.level === 'outcome' ? 'outcome·each' : s.level;
+      return 'outcome·each';
   }
 }
 
@@ -401,6 +459,11 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       const n0 = strip(sentence);
       const quote = sentence;
       const ign = (reason: IgnoredReason, q: string) => ignored.push({ reason, quote: q.slice(0, 160), line: seg.line });
+      // LOOP 9.2: lo que el documento declara no prescriptivo («NO constituyen requisitos») no se convierte en requisito.
+      if (seg.informative) {
+        if (/\d/.test(n0)) ign('not_prescriptive', sentence);
+        continue;
+      }
       if (seg.example || RE_EXAMPLE.test(n0)) {
         if (/\d/.test(n0)) ign('example', sentence);
         continue;
@@ -431,7 +494,9 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       if (RE_RECOMMENDED.test(m)) {
         obligation = 'recommended';
         if (RE_PROPOSE.test(m)) medium = true;
-      } else if (RE_PERMITTED.test(m)) obligation = 'permitted';
+      } else if (RE_PERMITTED.test(m) && !/\bno (podra|podran|puede|pueden)\b/.test(m)) obligation = 'permitted';
+      // Review 2.ª (M4): «no podrá tener más de 4 módulos» es una prohibición: un máximo obligatorio.
+      else if (/\bno (podra|podran|puede|pueden)\b/.test(m)) obligation = 'required';
       else if (RE_REQUIRED.test(m)) obligation = 'required';
       else if (RE_PRESENT.test(m) || RE_PRESENT_INCLUDE.test(m)) {
         obligation = 'required';
@@ -462,9 +527,26 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         }
       }
       if (!mentions.length) mentions = mentionsOf(m, sentenceScope, ign);
+      // LOOP 9.2 · Cláusula de reparto tras el total: «2 Actividades de Aplicación: 1 por módulo, ubicadas en los capítulos
+      // de práctica», «4 actividades interactivas H5P: 1 por cada capítulo de contenido». El total Y el reparto (y dónde
+      // va) son requisitos: antes solo quedaba el total y el diseño podía poner las dos actividades en el mismo módulo.
+      const DIST_G = /:\s*(\d{1,3})\s+por\s+(?:cada\s+)?(modulo|capitulo(?: de (?:contenido|practica))?)\b/g;
+      let dm: RegExpExecArray | null;
+      while ((dm = DIST_G.exec(m))) {
+        const at = dm.index;
+        const total = [...mentions].filter((x) => x.index < at && x.scope.level === 'course' && x.mode === 'exact').sort((a, b) => b.index - a.index)[0];
+        if (!total || total.kind === 'modules' || total.kind === 'target_hours' || total.kind === 'evaluations') continue;
+        const unit = dm[2];
+        const inPractice = /\b(ubicad\w*|situad\w*|incluid\w*)?\s*en (el|los|cada) capitulos? de practica/.test(m.slice(at));
+        let scope: RequirementScope;
+        if (unit === 'modulo') scope = inPractice ? { level: 'module', each: true, chapterKind: 'practice' } : { level: 'module', each: true };
+        else scope = /de contenido/.test(unit) ? { level: 'chapter', each: true, chapterKind: 'content' } : /de practica/.test(unit) ? { level: 'chapter', each: true, chapterKind: 'practice' } : { level: 'chapter', each: true };
+        mentions.push({ kind: total.kind, value: Number(dm[1]), mode: 'exact', ...(total.evaluationType ? { evaluationType: total.evaluationType } : {}), scope, index: at, end: at + dm[0].length, raw: dm[0] });
+      }
       // «N módulos × M capítulos» / «N módulos de M capítulos» / «N módulos por M capítulos»: los M son de CADA módulo.
       const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de)\s*(\d{1,3})\s*capitulos?/.exec(m);
-      if (cross) for (const x of mentions) if (x.kind === 'chapters' && x.value === Number(cross[2]) && x.scope.level === 'course') x.scope = { level: 'module', each: true };
+      // Review 2.ª (I3): «2 módulos de 2 capítulos de contenido» conserva «de contenido».
+      if (cross) for (const x of mentions) if (x.kind === 'chapters' && x.value === Number(cross[2]) && x.scope.level === 'course') x.scope = (x.scope as { chapterKind?: string }).chapterKind === 'content' ? { level: 'module', each: true, chapterKind: 'content' } : { level: 'module', each: true };
 
       // Total de horas por rótulo (re-review final L86C: con decimales, «12,5 horas» → 12,5 y no 12) («Total Horas de Trabajo Académico del Estudiante (HAD+HTI) 192», «160 horas totales»).
       const tl = /(intensidad horaria total|horas totales|total de horas|total horas|numero total de horas|duracion total|trabajo academico del estudiante)([^0-9]{0,90}?)(\d{1,3}(?:\.\d{3})+(?!\d)|\d{1,4}(?:[,.]\d{1,2}(?!\d))?)(?![\d.,])/.exec(m);
@@ -561,12 +643,13 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
 
       // Compuestos de la oración.
       const mods = created.find((r) => r.kind === 'modules' && r.scope.level === 'course');
-      const chEach = created.find((r) => r.kind === 'chapters' && r.scope.level === 'module' && 'each' in r.scope);
+      const chEach = created.find((r) => r.kind === 'chapters' && r.scope.level === 'module' && 'each' in r.scope && !(r.scope.chapterKind === 'practice'));
       const chTotal = created.find((r) => r.kind === 'chapters' && r.scope.level === 'course');
       if (mods && (chEach || chTotal) && mods.mode === 'exact') {
         const ids = [mods.id, (chEach || chTotal)!.id];
         if (chEach && chEach.mode === 'exact' && mods.value) {
-          const st = push({ kind: 'structure', scope: { level: 'structure' }, mode: 'exact', value: null, shape: Array(mods.value).fill(chEach.value), obligation: mods.obligation, active: mods.active, status: 'found', confidence: mods.confidence, ...(mods.condition ? { condition: mods.condition } : {}), source: src(quote) });
+          const content = 'chapterKind' in chEach.scope && chEach.scope.chapterKind === 'content';
+          const st = push({ kind: 'structure', scope: content ? { level: 'structure', chapterKind: 'content' } : { level: 'structure' }, mode: 'exact', value: null, shape: Array(mods.value).fill(chEach.value), obligation: mods.obligation, active: mods.active, status: 'found', confidence: mods.confidence, ...(mods.condition ? { condition: mods.condition } : {}), source: src(quote) });
           created.push(st);
           ids.push(st.id);
         }
@@ -631,10 +714,12 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
   // Ficha con campos separados («Número de módulos: 4» y «Capítulos por módulo: 5»): también es un compuesto N × M.
   const lone = (k: RequirementKind, lvl: string) => kept.filter((r) => r.kind === k && r.scope.level === lvl && r.mode === 'exact' && r.active && r.obligation === 'required' && !r.groupId && !r.condition);
   const fm = lone('modules', 'course');
-  const fc = lone('chapters', 'module').filter((r) => 'each' in r.scope && !('chapterKind' in r.scope && r.scope.chapterKind));
+  const fc = lone('chapters', 'module').filter((r) => 'each' in r.scope && (r.scope as { chapterKind?: string }).chapterKind !== 'practice');
   if (fm.length === 1 && fc.length === 1 && fm[0].value && !kept.some((r) => r.kind === 'structure' && r.active)) {
     const [m0, c0] = [fm[0], fc[0]];
-    const st: DocumentRequirement = { id: `RQ${++seq}`, key: 'structure@structure', kind: 'structure', scope: { level: 'structure' }, mode: 'exact', value: null, shape: Array(m0.value!).fill(c0.value), obligation: 'required', active: true, status: 'found', confidence: m0.confidence === 'high' && c0.confidence === 'high' ? 'high' : 'medium', review: ['Compuesto de dos campos del documento (módulos y capítulos por módulo).'], source: m0.source };
+    // LOOP 9.2: con «capítulos de contenido», el N × M cuenta solo contenido (las prácticas van aparte).
+    const contentOnly = 'chapterKind' in c0.scope && c0.scope.chapterKind === 'content';
+    const st: DocumentRequirement = { id: `RQ${++seq}`, key: contentOnly ? 'structure@structure:content' : 'structure@structure', kind: 'structure', scope: contentOnly ? { level: 'structure', chapterKind: 'content' } : { level: 'structure' }, mode: 'exact', value: null, shape: Array(m0.value!).fill(c0.value), obligation: 'required', active: true, status: 'found', confidence: m0.confidence === 'high' && c0.confidence === 'high' ? 'high' : 'medium', review: ['Compuesto de dos campos del documento (módulos y capítulos por módulo).'], source: m0.source };
     kept.push(st);
     const g: RequirementGroup = { id: `G${finalGroups.length + 1}`, relation: 'all', label: `${m0.value} × ${c0.value}`, requirementIds: [m0.id, c0.id, st.id], source: m0.source };
     finalGroups.push(g);

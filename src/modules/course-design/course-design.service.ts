@@ -9,6 +9,7 @@ import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
+import { approachFromMethodology } from '../academic-context/context-design';
 import { clearDesignPins, loadDesignPins, loadProposedHours, setProposedHours } from './design-pins';
 import { ApproachSuggestion, proposeTargetHours, recommendApproachFromFacts } from './design-recommendation';
 import { verifyDesign } from './design-verification';
@@ -79,11 +80,19 @@ export class CourseDesignService {
     const outcomes = academic && academic.context.outcomes.length
       ? academic.context.outcomes.map((o) => o.text)
       : [...((base.learningOutcomes && base.learningOutcomes.know) || []), ...((base.learningOutcomes && base.learningOutcomes.do) || [])];
-    const suggestion: ApproachSuggestion | null = recommendApproachFromFacts({
+    const inferred: ApproachSuggestion | null = recommendApproachFromFacts({
       learner: base.learner || null,
       outcomes,
       competencies: academic ? academic.context.competencies.map((c) => c.text) : ((base.learningOutcomes && base.learningOutcomes.competencies) || []),
     });
+    // LOOP 9.2 · Autoridad del documento: si su metodología nombra un enfoque (p. ej. «razonamiento sobre casos»), ese es
+    // el que recomienda Cursia (antes se deducía solo de los verbos de los resultados y la metodología se ignoraba).
+    const meth = academic && academic.context.methodology && academic.context.methodology.status !== 'missing' ? String(academic.context.methodology.value || '') : '';
+    const fromDoc = approachFromMethodology(meth);
+    const docHint = fromDoc && registry.has(fromDoc.id) ? fromDoc : null;
+    const suggestion: ApproachSuggestion | null = docHint
+      ? { approach: docHint.id, label: registry.get(docHint.id)!.label, reasons: [`porque la metodología del documento ${docHint.strong ? 'lo indica' : 'se centra en casos y decisiones'}: «${meth.replace(/\s+/g, ' ').slice(0, 140)}${meth.length > 140 ? '…' : ''}»`], score: inferred && inferred.approach === docHint.id ? inferred.score : 1, confidence: docHint.strong ? 'alta' : 'media' }
+      : inferred;
     let approachSource: 'saved' | 'recommended' | 'adjusted' | 'none' = base.primaryApproach ? 'saved' : 'none';
     if (adjust.approach && adjust.approach !== 'recommended') {
       if (adjust.approach !== base.primaryApproach) { base.primaryApproach = adjust.approach; base.secondaryApproaches = (base.secondaryApproaches || []).filter((x: string) => x !== adjust.approach); approachSource = 'adjusted'; }
@@ -618,8 +627,9 @@ function designForRequirements(
   return {
     modules: dist.modules.map((m) => ({
       examEnabled: m.examEnabled,
+      ...(m.practiceRemovedByTeacher ? { practiceRemovedByTeacher: true } : {}),
       chapters: m.chapters.map((c) => ({
-        kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, activityEnabled: c.activityEnabled,
+        kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, activityEnabled: c.activityEnabled, activityPinned: !!c.activityPinned,
         applicationMinutes: c.applicationMinutes ?? null, applicationPinned: c.applicationPinned, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
       })),
     })),

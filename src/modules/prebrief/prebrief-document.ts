@@ -132,7 +132,10 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   const pubRows: { label: string; value: string; origin?: DocOrigin }[] = [];
   if (m.course.level) pubRows.push({ label: 'Nivel', value: m.course.level.value, origin: o(m.course.level.origin) });
   if (m.learner.priorKnowledge) pubRows.push({ label: 'Conocimientos previos', value: m.learner.priorKnowledge.value, origin: o(m.learner.priorKnowledge.origin) });
-  if (m.learner.prerequisites) pubRows.push({ label: 'Conocimientos previos que pide el documento', value: m.learner.prerequisites.value, origin: o(m.learner.prerequisites.origin) });
+  if (m.learner.prerequisites) {
+    const k = m.learner.prerequisites.kind;
+    pubRows.push({ label: k === 'recommended' ? 'Conocimientos previos que recomienda el documento' : k === 'none' ? 'Conocimientos previos según el documento' : 'Conocimientos previos que pide el documento', value: m.learner.prerequisites.value, origin: o(m.learner.prerequisites.origin) });
+  }
   if (pubRows.length) pub.push({ t: 'kv', rows: pubRows });
   sections.push({ id: 'audience', n: '2', title: 'Público objetivo', blocks: pub });
 

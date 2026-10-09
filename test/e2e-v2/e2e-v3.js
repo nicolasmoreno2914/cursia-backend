@@ -2419,7 +2419,8 @@ function reservationBookkeeping(ev) {
       const facts = (await api('GET', `/courses/${courseId}/facts`)).data;
       ok(facts.educationLevel.value === 'technical' && facts.educationLevel.source === 'document' && !facts.conflicts.some((c) => c.field === 'educationLevel'),
         T('nivel educativo del documento, sin pregunta falsa («elegiste Universitario»)'), { lvl: facts.educationLevel, conflicts: facts.conflicts });
-      eq([facts.priorKnowledge.source, facts.documentPrerequisites], ['inferred', ['Procesos productivos básicos', 'Uso de equipos de protección personal']], T('conocimientos previos: el de partida es inferido; los del documento se ven'));
+      // LOOP 9.2: con conocimientos previos en el documento (exigidos), el dato sale del documento (no el «sin conocimientos» de partida).
+      eq([facts.priorKnowledge.source, facts.priorKnowledge.value, facts.documentPrerequisites, facts.documentPrerequisitesKind], ['document', 'basic', ['Procesos productivos básicos', 'Uso de equipos de protección personal'], 'required'], T('conocimientos previos: los del documento mandan sobre el de partida (exigidos)'));
 
       // Formato M (3 × 4, 40–44 h): decisión de la institución que choca con el documento (4 × 5, 64 h).
       const fm = await api('PUT', `/courses/${courseId}/format`, { code: 'M' });

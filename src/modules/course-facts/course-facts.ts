@@ -225,6 +225,11 @@ export interface CourseFacts {
   priorKnowledge: Fact<string>;
   /** LOOP 9: conocimientos previos que lista el documento (temas), tal cual; vacío si no hay documento o no los trae. */
   documentPrerequisites: string[];
+  /**
+   * LOOP 9.2: qué dice el documento de esos conocimientos — los exige, los recomienda, dice que no hace falta ninguno —
+   * o null si el documento no habla de ellos.
+   */
+  documentPrerequisitesKind: PrerequisitesKind | null;
   learnerDescription: Fact<string>;
   /** origin (LOOP 8.2): de dónde salió CADA resultado — documento, propuesto por Cursia sin documento o escrito por el docente. */
   outcomes: Fact<{ id: string | null; text: string; domain: string | null; origin: OutcomeOrigin }[]>;
@@ -318,6 +323,53 @@ export function sectorFromAcademicContext(ctx: AcademicContextV1 | null | undefi
   return rest.charAt(0).toUpperCase() + rest.slice(1);
 }
 
+export type PrerequisitesKind = 'required' | 'recommended' | 'none';
+
+/**
+ * LOOP 9.2 · «Se recomienda contar con…» = recomendados (no «sin conocimientos previos»); «No se exige ningún
+ * prerrequisito» (sin nada recomendado) = ninguno; una lista sin esas marcas = exigidos.
+ */
+export function prerequisitesKindOf(items: string[]): PrerequisitesKind | null {
+  if (!items.length) return null;
+  const t = strip(items.join(' '));
+  if (/\b(se recomienda\w*|recomendable|recomendad[oa]s?|deseable|se sugiere|sugerid[oa]s?|preferiblemente|conviene)\b/.test(t)) return 'recommended';
+  // «No requiere conocimientos de X, pero sí manejo de Y» exige Y (review M7).
+  if (/\bpero si\b/.test(t)) return 'required';
+  if (/\b(no se (exige|requiere|necesita)n?|no requiere|no exige|sin (pre-?r?requisitos?|conocimientos previos|requisitos previos)|ninguno|no aplica|no tiene pre-?r?requisitos?)\b/.test(t)) return 'none';
+  return 'required';
+}
+
+/**
+ * LOOP 9.2 · Sector a partir de lo que el documento dice del curso (nombre, estudiantes, nivel), con evidencia: el
+ * área tiene que aparecer en el nombre o al menos dos veces en el resto. Inferido y editable; sin coincidencia, sin dato.
+ */
+const SECTOR_KEYWORDS: ReadonlyArray<[string, RegExp]> = [
+  ['Seguridad y Salud en el Trabajo', /\b(seguridad y salud en el trabajo|riesgos laborales|salud ocupacional|sg-?sst)\b/g],
+  ['Salud', /\b(salud|enfermer\w*|clinic[oa]s?|hospital\w*|medicina|farmac\w*|odontolog\w*)\b/g],
+  ['Educación', /\b(pedagog\w*|formacion docente|educacion (inicial|basica|media|superior)|didactica)\b/g],
+  ['Logística', /\b(logistic\w*|cadena de suministro|inventarios?|bodegas?|almacenamiento)\b/g],
+  ['Contabilidad y finanzas', /\b(contab\w*|financier\w*|finanzas|tributari\w*)\b/g],
+  ['Tecnología', /\b(software|programacion|desarrollo web|informatica|ciberseguridad|python|bases de datos)\b/g],
+  ['Gestión administrativa', /\b(auxiliares? administrativ\w*|asistentes? administrativ\w*|gestion documental|secretariado)\b/g],
+];
+/**
+ * Review LOOP 9.2 (I5): puntaje por sector (el nombre vale doble) y se elige el MAYOR; empate o menos de 2 puntos → sin
+ * dato (mejor sin sector que uno inventado). «seguridad y salud en el trabajo» no suma a «Salud».
+ */
+export function sectorFromKeywords(ctx: AcademicContextV1 | null | undefined): string | null {
+  if (!ctx || !ctx.identity) return null;
+  const val = (f: { status: string; value: unknown } | undefined) => (f && f.status !== 'missing' && f.value ? (typeof f.value === 'string' ? f.value : (f.value as any).text || '') : '');
+  const sst = /\bseguridad y salud en el trabajo\b/g;
+  const name = strip(String(val(ctx.identity.subjectName as any)));
+  const rest = strip([val(ctx.learner && (ctx.learner.profile as any)), val(ctx.identity.educationLevel as any), val(ctx.identity.description as any)].join(' '));
+  const scored = SECTOR_KEYWORDS.map(([sector, re]) => {
+    const clean = (t: string) => (sector === 'Salud' ? t.replace(sst, ' ') : t);
+    return { sector, score: 2 * (clean(name).match(re) || []).length + (clean(rest).match(re) || []).length };
+  }).sort((a, b) => b.score - a.score);
+  if (!scored.length || scored[0].score < 2 || (scored[1] && scored[1].score === scored[0].score)) return null;
+  return scored[0].sector;
+}
+
 export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const b = input.brief ? input.brief.fields : {};
   const inferredKeys = new Set(String(b.inferidos || '').split(',').map((s) => s.trim()).filter(Boolean));
@@ -328,6 +380,11 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const owners = pedagogyFieldOwners(ped, input.derivation, input.suggested, input.proposedHours ?? null);
   const withDocs = !!ctx && Array.isArray(ctx.documents) && ctx.documents.length > 0;
   const docSector = ctx && withDocs ? sectorFromAcademicContext(ctx) : null;
+  // LOOP 9.2: sin programa en el documento, el área que nombra el documento (inferida, editable).
+  const keywordSector = ctx && withDocs && !docSector ? sectorFromKeywords(ctx) : null;
+  const docPrereqs = ctx ? (found(ctx.learner.priorKnowledge) || []) : [];
+  // Review I6: el tipo y el dato «del documento» solo con un documento leído (no con lo que propuso la IA sin documento).
+  const prereqKind = withDocs ? prerequisitesKindOf(docPrereqs) : null;
   const ctxFact = <T>(f: { status: string; value: T | null } | undefined): Fact<T> =>
     f && f.status !== 'missing' ? fact<T>(f.value, ctxSource(f as any)) : { value: null, source: null };
   const conflicts: FactConflict[] = [];
@@ -389,8 +446,16 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     topic: first<string>(fact(b.obj, 'user'), ctx ? ctxFact(ctx.identity.generalObjective) : fact<string>(null, null)),
     educationLevel,
     // LOOP 9 (P1-2): el nivel de partida de «Crear» que nadie eligió es de Cursia («inferido»), no «tu pedido».
-    priorKnowledge: first<string>(fact(ped && ped.learner ? ped.learner.priorKnowledge : null, 'profile'), fact(priorKnowledgeFromBrief(b.nivel), briefSource('nivel'))),
-    documentPrerequisites: ctx ? (found(ctx.learner.priorKnowledge) || []) : [],
+    // LOOP 9.2: lo que dice el documento va antes del valor de partida de «Crear» (recomendados/exigidos = lo esencial).
+    // Review I6: lo que eligió el usuario en «Crear» manda sobre el documento; el documento, sobre el valor de partida.
+    priorKnowledge: first<string>(
+      fact(ped && ped.learner ? ped.learner.priorKnowledge : null, 'profile'),
+      fact(briefSource('nivel') === 'user' ? priorKnowledgeFromBrief(b.nivel) : null, 'user'),
+      fact(prereqKind === 'none' ? 'none' : prereqKind ? 'basic' : null, 'document'),
+      fact(priorKnowledgeFromBrief(b.nivel), briefSource('nivel')),
+    ),
+    documentPrerequisites: docPrereqs,
+    documentPrerequisitesKind: prereqKind,
     learnerDescription: owners.description === 'user'
       ? fact<string>(ped!.learner.description, 'profile')
       : first<string>(ctx ? ctxFact(ctx.learner.profile) : fact<string>(null, null), fact(ped && ped.learner ? ped.learner.description : null, 'profile')),
@@ -399,8 +464,8 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     targetHours,
     units: fact(withDocs && ctx ? ctx.units.length : null, 'document'),
     // LOOP 8.2.1: sin sector en el pedido, solo con evidencia del documento (el programa encontrado en él); si no, sin dato.
-    sector: first<string>(fact(b.sector, briefSource('sector')), fact(docSector, 'inferred')),
-    documentSector: docSector,
+    sector: first<string>(fact(b.sector, briefSource('sector')), fact(docSector, 'inferred'), fact(keywordSector, 'inferred')),
+    documentSector: docSector ?? keywordSector,
     country: fact(b.pais, briefSource('pais')),
     document: { present: withDocs, proposed: !withDocs && !!ctx && ctx.outcomes.some((o) => isProposed(o)), contextVersion: input.academic ? input.academic.version : null, names: ctx ? ctx.documents.map((d) => d.name) : [] },
     pedagogy: {
