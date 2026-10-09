@@ -482,8 +482,11 @@ export class PrebriefService {
     const text = String(reason || '').replace(/\s+/g, ' ').trim();
     if (text.length < REASON_MIN || text.length > REASON_MAX) throw new BadRequestException(`El motivo debe tener entre ${REASON_MIN} y ${REASON_MAX} caracteres.`);
     const d = await this.draft(courseId, ownerId);
-    const ex = d.model.exceptions.find((e) => e.requirementKey === requirementKey);
-    if (!ex) throw new BadRequestException('Ese requisito no tiene una excepción en el diseño actual.');
+    const asked = d.model.exceptions.find((e) => e.requirementKey === requirementKey);
+    if (!asked) throw new BadRequestException('Ese requisito no tiene una excepción en el diseño actual.');
+    // LOOP 9.2: una excepción cubierta por otra (misma limitación, misma frase) guarda el motivo en la que la cubre.
+    const ex = (asked.coveredBy && d.model.exceptions.find((e) => e.requirementKey === asked.coveredBy)) || asked;
+    requirementKey = ex.requirementKey;
     const entry: StoredExceptionReason = { reason: text, requirementText: ex.requirementText, by: user.email || user.id, at: new Date().toISOString() };
     await this.dataSource.query(
       `update public.courses set metadata = jsonb_set(jsonb_set(coalesce(metadata, '{}'::jsonb), '{${EXCEPTION_REASONS_KEY}}', coalesce(metadata -> '${EXCEPTION_REASONS_KEY}', '{}'::jsonb), true),

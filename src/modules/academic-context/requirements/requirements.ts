@@ -29,15 +29,19 @@ export type RequirementMode = 'exact' | 'min' | 'max' | 'range' | 'approx';
  */
 export type RequirementObligation = 'required' | 'recommended' | 'permitted' | 'informative';
 
+/**
+ * LOOP 9.2 · chapterKind en el alcance: «capítulos de contenido» / «capítulos de práctica» (por módulo o en el curso), o
+ * dónde va algo («1 Actividad de Aplicación por módulo, en el capítulo de práctica»). Sin chapterKind: todos los capítulos.
+ */
 export type RequirementScope =
-  | { level: 'course' }
-  | { level: 'module'; each: true }
+  | { level: 'course'; chapterKind?: 'practice' | 'content' }
+  | { level: 'module'; each: true; chapterKind?: 'practice' | 'content' }
   | { level: 'module'; index: number }
   | { level: 'chapter'; each: true; chapterKind?: 'practice' | 'content' }
   | { level: 'outcome'; each: true }
   | { level: 'unit'; each: true }
   | { level: 'unit'; index: number }
-  | { level: 'structure' }
+  | { level: 'structure'; chapterKind?: 'content' }
   | { level: 'subject'; subject: string };
 
 export interface RequirementCondition {
@@ -107,7 +111,8 @@ export type IgnoredReason =
   | 'component_hours' // horas de clase / acompañamiento / autónomas / semanales: no son el total del estudiante
   | 'no_trigger' // cifra sin verbo de obligación ni campo de ficha: no se convierte en requisito
   | 'condition_clause' // la cifra está dentro de la condición («si el curso tiene más de 5 unidades, …»)
-  | 'not_modeled'; // el objeto no es algo que Cursia diseñe (foros, webconferencias…)
+  | 'not_modeled' // el objeto no es algo que Cursia diseñe (foros, webconferencias…)
+  | 'not_prescriptive'; // LOOP 9.2: sección que el propio documento declara no prescriptiva («Información no prescriptiva»)
 
 export interface IgnoredNumber {
   reason: IgnoredReason;

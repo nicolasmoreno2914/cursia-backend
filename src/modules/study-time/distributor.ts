@@ -79,6 +79,8 @@ export interface ProposedChapter {
   videoPinned: boolean;
   /** Review L84-4: la Actividad de Aplicación la fijó el docente. */
   applicationPinned: boolean;
+  /** LOOP 9.2: la actividad interactiva la fijó el docente. */
+  activityPinned?: boolean;
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
   generableMinutes: number;
@@ -89,10 +91,12 @@ export interface ProposedModule {
   title: string;
   examEnabled: boolean;
   chapters: ProposedChapter[];
+  /** LOOP 9.2: el docente quitó la práctica de este módulo (Cursia no la vuelve a proponer). */
+  practiceRemovedByTeacher?: boolean;
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'role_changed' | 'set_video';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'role_changed' | 'set_video' | 'set_activity';
   /** LOOP 8.6C: el cambio lo pide un requisito del documento (id del requisito). */
   requirementId?: string;
   moduleId: string;
@@ -162,7 +166,7 @@ export type AudiovisualPriority = 'less' | 'recommended' | 'more';
 export const AUDIOVISUAL_PRIORITIES: readonly AudiovisualPriority[] = ['less', 'recommended', 'more'];
 /** Valores que el docente fijó a mano en el editor (por id de capítulo). El distribuidor los respeta siempre. */
 /** LOOP 8.3: video fijado a mano · review L84-4: Actividad de Aplicación fijada a mano (minutos; 0 = sin actividad). */
-export type DesignPins = Readonly<Record<string, { video?: boolean; application?: number }>>;
+export type DesignPins = Readonly<Record<string, { video?: boolean; application?: number; activity?: boolean; noPractice?: boolean }>>;
 export type ApplicationActivitiesMode = 'auto' | 'practice_only' | 'none';
 export const DESIGN_EMPHASES: readonly DesignEmphasis[] = ['application', 'balanced', 'depth'];
 export const APPLICATION_ACTIVITIES_MODES: readonly ApplicationActivitiesMode[] = ['auto', 'practice_only', 'none'];
@@ -265,6 +269,9 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const pins: DesignPins = input.pins ?? {};
   const pinnedVideo = (id: string): boolean | undefined => (pins[id] && typeof pins[id].video === 'boolean' ? pins[id].video : undefined);
   /** Minutos fijados por el docente (null = fijada SIN actividad); undefined = la decide Cursia. */
+  // LOOP 9.2 (review C1/I1/I2): actividad fijada por el docente y módulos de los que quitó la práctica.
+  const pinnedActivity = (id: string): boolean | undefined => (pins[id] && typeof pins[id].activity === 'boolean' ? pins[id].activity : undefined);
+  const noPracticeModule = (id: string): boolean => !!(pins[id] && pins[id].noPractice);
   const pinnedApp = (id: string): number | null | undefined => {
     const a = pins[id] && pins[id].application;
     return typeof a === 'number' && Number.isFinite(a) ? (a > 0 ? a : null) : undefined;
@@ -301,10 +308,12 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   if (design.some((m) => m.chapters.length === 0)) throw new DistributorError('cada módulo necesita al menos un capítulo');
   // Review L84-4: una Actividad de Aplicación fijada a mano por el docente se respeta siempre (como el video fijado).
   for (const m of design) for (const c of m.chapters) { const p = pinnedApp(c.id); if (p !== undefined) c.applicationMinutes = p; }
+  for (const m of design) for (const c of m.chapters) { const a = pinnedActivity(c.id); if (a !== undefined) c.activityEnabled = a; }
 
   // LOOP 8.3 · prioridad audiovisual sobre los capítulos de contenido existentes (antes de crecer: el video cambia las
   // horas y el resto del diseño compensa). Lo fijado por el docente manda; la práctica nunca lleva video.
   const initialVideo = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.videoEnabled] as const)));
+  const initialActivity = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.activityEnabled] as const)));
   const avFor = (contentIndex: number, contentCount: number, proposedDeepening: boolean): boolean => {
     if (av === 'more') return true;
     if (proposedDeepening) return false;
@@ -331,12 +340,42 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   }
   const minCh = rq?.chaptersPerModule?.min ?? 0;
   const maxCh = rq?.chaptersPerModule?.max ?? Infinity;
+  // LOOP 9.2 · Requisitos del documento por tipo de capítulo, lugar de las Actividades de Aplicación y total de actividades.
+  const contentMin = rq?.contentChaptersPerModule?.min ?? 0;
+  const contentMax = rq?.contentChaptersPerModule?.max ?? Infinity;
+  const practiceMin = rq?.practicePerModule?.min ?? 0;
+  const practiceMax = rq?.practicePerModule?.max ?? Infinity;
+  const appInPractice = !!rq?.applicationInPractice;
+  const practiceTotalMin = rq?.practiceTotal?.min ?? 0;
+  const practiceTotalMax = rq?.practiceTotal?.max ?? Infinity;
+  const practiceTotal = () => design.reduce((n, m) => n + m.chapters.filter((c) => c.kind === 'practice').length, 0);
+  const contentCount = (cs: WorkChapter[]) => cs.filter((c) => c.kind !== 'practice').length;
+  const practiceCount = (cs: WorkChapter[]) => cs.filter((c) => c.kind === 'practice').length;
   const appModuleMax = rq?.applicationPerModule?.max ?? Infinity;
   const appModuleMin = rq?.applicationPerModule?.min ?? 0;
   const appTotalMax = rq?.applicationTotal?.max ?? Infinity;
   const appTotalMin = rq?.applicationTotal?.min ?? 0;
   const appCount = (cs: WorkChapter[]) => cs.filter((c) => c.applicationMinutes).length;
   const appTotal = () => design.reduce((n, m) => n + appCount(m.chapters), 0);
+  const actMin = rq?.activitiesTotal?.min ?? 0;
+  const actMax = rq?.activitiesTotal?.max ?? Infinity;
+  const actTotal = () => design.reduce((n, m) => n + m.chapters.filter((c) => c.activityEnabled).length, 0);
+  const activitiesOk = () => actTotal() >= actMin && actTotal() <= actMax;
+  /**
+   * LOOP 9.2 · «Exactamente N actividades interactivas»: si sobran, se quitan primero de las prácticas (su Actividad de
+   * Aplicación se queda) y después de los últimos capítulos de contenido; si faltan, se agregan en el contenido.
+   */
+  const fitActivities = () => {
+    if (activitiesOk()) return;
+    // Review C1 / 3.ª I1: nunca una actividad que fijó el docente (Cursia ajusta las demás). Review 3.ª I2: con «1 por
+    // capítulo de contenido», solo se apagan las de práctica; si no alcanza, la diferencia la explica Verificación.
+    const order = design.flatMap((m) => m.chapters).filter((c) => pinnedActivity(c.id) === undefined).sort((a, b) => (a.kind === 'practice' ? 0 : 1) - (b.kind === 'practice' ? 0 : 1));
+    for (const c of order) { if (actTotal() <= actMax) break; if (c.activityEnabled && !(rq?.activitiesInEveryContent && c.kind !== 'practice')) c.activityEnabled = false; }
+    for (const c of [...order].reverse()) { if (actTotal() >= actMin) break; if (!c.activityEnabled && c.kind !== 'practice') c.activityEnabled = true; }
+    // Review M1: si con el contenido no alcanza, también las prácticas.
+    for (const c of order) { if (actTotal() >= actMin) break; if (!c.activityEnabled) c.activityEnabled = true; }
+    reEval();
+  };
 
   const toInput = (withApplication: boolean): StudyTimeCourseInput => ({
     frame: true,
@@ -388,8 +427,29 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     }
   };
   const result = (status: DistributionStatus, recs: string[]): DistributionResult => {
+    // LOOP 9.2: el total de actividades interactivas que exige el documento se cumple en cualquier salida.
+    fitActivities();
+    // Review 2.ª (I5): la prioridad audiovisual se aplica sobre la lista FINAL de capítulos de contenido (con los que se
+    // agregaron), igual que la verá la siguiente pasada: así aplicar el diseño es un punto fijo.
+    if (av) {
+      let changed = false;
+      for (const m of design) {
+        const content = m.chapters.filter((c) => c.kind === 'content');
+        content.forEach((c, i) => {
+          if (pinnedVideo(c.id) !== undefined) return;
+          // La profundización que propone Cursia sigue la regla de 8.3 (sin video con «Recomendado»).
+          const v = reqVideo !== null ? reqVideo : avFor(i, content.length, !!c.proposed);
+          if (c.videoEnabled !== v) { c.videoEnabled = v; changed = true; }
+        });
+      }
+      if (changed) reEval();
+    }
     pushRemovals();
     pushVideoChanges();
+    for (const m of design) for (const c of m.chapters) {
+      if (c.proposed || initialActivity.get(c.id) === c.activityEnabled) continue;
+      changes.push({ type: 'set_activity', moduleId: m.id, chapterId: c.id, detail: c.activityEnabled ? `«${c.title}» lleva actividad interactiva.` : `«${c.title}» queda sin actividad interactiva (el documento pide un total exacto de actividades interactivas).` });
+    }
     const generable = est; // Fase 2: las Actividades de Aplicación se generan
     // Re-revisión L3: los capítulos de práctica no tienen tope de aplicación; si el diseño queda por encima de la
     // proporción del enfoque, se dice explícitamente.
@@ -403,6 +463,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       id: m.id,
       title: m.title,
       examEnabled: m.examEnabled,
+      ...(noPracticeModule(m.id) ? { practiceRemovedByTeacher: true } : {}),
       chapters: m.chapters.map((c) => ({
         id: c.id,
         proposed: c.proposed,
@@ -413,6 +474,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         videoEnabled: c.kind === 'content' && c.videoEnabled,
         videoPinned: pinnedVideo(c.id) !== undefined,
         applicationPinned: pinnedApp(c.id) !== undefined,
+        activityPinned: pinnedActivity(c.id) !== undefined,
         activityEnabled: c.activityEnabled,
         review,
         applicationMinutes: c.applicationMinutes,
@@ -466,8 +528,10 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const hasExisting = design.some((m) => m.chapters.some((c) => c.applicationMinutes !== null));
   const respectsMode = design.every((m) => m.chapters.every((c) => c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice'))));
   // LOOP 8.6C: «ya cumple» también exige cumplir los requisitos del documento que el distribuidor maneja.
-  const meetsRequirements = () => design.every((m) => m.chapters.length >= minCh && m.chapters.length <= maxCh && appCount(m.chapters) >= appModuleMin && appCount(m.chapters) <= appModuleMax)
-    && appTotal() >= appTotalMin && appTotal() <= appTotalMax;
+  const meetsRequirements = () => design.every((m) => m.chapters.length >= minCh && m.chapters.length <= maxCh && appCount(m.chapters) >= appModuleMin && appCount(m.chapters) <= appModuleMax
+      && contentCount(m.chapters) >= contentMin && contentCount(m.chapters) <= contentMax && practiceCount(m.chapters) >= practiceMin && practiceCount(m.chapters) <= practiceMax
+      && (!appInPractice || m.chapters.every((c) => !c.applicationMinutes || c.kind === 'practice')))
+    && appTotal() >= appTotalMin && appTotal() <= appTotalMax && activitiesOk();
   if (hasExisting && respectsMode && Math.abs(minutes() - target) <= tol && meetsRequirements()) {
     priorityTrace.push('La estructura actual, con sus Actividades de Aplicación, ya cumple la carga horaria objetivo: no se propone ningún cambio.');
     // LOOP 7 (A2 A2): «Ajustar» el énfasis o el enfoque sobre un diseño que ya cumple no cambia nada; se dice (y por
@@ -485,6 +549,48 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   // capítulos PROPUESTOS (primero uno de práctica — D1: cuenta dentro de «X capítulos por módulo» —, después de
   // profundización). Es una propuesta como cualquier otra: el docente la ve y la aplica con «Usar este diseño».
   const filledPractice = new Set<string>();
+  // LOOP 9.2 · «N capítulos de práctica por módulo» y «N capítulos de contenido por módulo»: el documento los exige aunque
+  // las horas ya alcancen (antes la práctica se descartaba «porque no hacía falta para estas horas»).
+  if (practiceMin > 0 || contentMin > 0 || practiceTotalMin > 0) {
+    for (const m of design) {
+      let k = practiceCount(m.chapters);
+      // Review I1: sin pasar del máximo de capítulos por módulo del documento (D1: ahí la práctica cuenta).
+      while (k < practiceMin && m.chapters.length < maxCh && !noPracticeModule(m.id)) {
+        k++;
+        const pc: WorkChapter = { id: `proposed:practice:${m.id}:${k}`, proposed: true, kind: 'practice', title: proposedTitle(k === 1 ? 'Práctica integradora' : 'Práctica de casos', m.title),
+          objective: `Aplicar lo aprendido en «${m.title}» en una situación completa`, videoEnabled: false, activityEnabled: true, applicationMinutes: null };
+        m.chapters.push(pc);
+        filledPractice.add(pc.id);
+        changes.push({ type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id, detail: `Capítulo de práctica «${pc.title}» (el documento pide ${practiceMin} ${practiceMin === 1 ? 'capítulo de práctica' : 'capítulos de práctica'} por módulo).`, ...(rq?.sources.practice ? { requirementId: rq.sources.practice } : {}) });
+      }
+      let n = m.chapters.filter((c) => c.kind === 'content' && c.proposed).length;
+      while (contentCount(m.chapters) < contentMin) {
+        n++;
+        const cc: WorkChapter = { id: `proposed:content:${m.id}:${n}`, proposed: true, kind: 'content', title: proposedTitle(`Profundización ${n}`, m.title),
+          objective: `Analizar casos complejos de «${m.title}»`, videoEnabled: reqVideo !== null ? reqVideo : m.chapters.some((c) => c.kind === 'content' && c.videoEnabled), activityEnabled: true, applicationMinutes: null };
+        let last = -1;
+        m.chapters.forEach((c, i) => { if (c.kind === 'content') last = i; });
+        m.chapters.splice(last + 1, 0, cc);
+        changes.push({ type: 'add_content_chapter', moduleId: m.id, chapterId: cc.id, detail: `Capítulo de profundización «${cc.title}» (el documento pide ${contentMin} capítulos de contenido por módulo).`, ...(rq?.sources.chapters ? { requirementId: rq.sources.chapters } : {}) });
+      }
+    }
+    // Review I11: «N capítulos de práctica» en el curso: uno por módulo por turno (sin pasar de los máximos del documento).
+    for (let round = 0; practiceTotal() < practiceTotalMin && round < 4; round++) {
+      for (const m of design) {
+        if (practiceTotal() >= practiceTotalMin) break;
+        if (m.chapters.length >= maxCh || practiceCount(m.chapters) >= practiceMax || noPracticeModule(m.id)) continue;
+        const k = practiceCount(m.chapters) + 1;
+        const pc: WorkChapter = { id: `proposed:practice:${m.id}:${k}`, proposed: true, kind: 'practice', title: proposedTitle(k === 1 ? 'Práctica integradora' : 'Práctica de casos', m.title),
+          objective: `Aplicar lo aprendido en «${m.title}» en una situación completa`, videoEnabled: false, activityEnabled: true, applicationMinutes: null };
+        m.chapters.push(pc);
+        filledPractice.add(pc.id);
+        changes.push({ type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id, detail: `Capítulo de práctica «${pc.title}» (el documento pide ${practiceTotalMin} ${practiceTotalMin === 1 ? 'capítulo de práctica' : 'capítulos de práctica'} en el curso).`, ...(rq?.sources.practice ? { requirementId: rq.sources.practice } : {}) });
+      }
+    }
+    fitActivities();
+    reEval();
+    if (filledPractice.size || changes.some((x) => x.requirementId)) baseHours = r1(estimateCourseStudyTime(toInput(false)).courseEstimatedMinutes / 60);
+  }
   if (minCh > 0) {
     const reqId = rq?.sources.chapters;
     const why = ` (el documento pide ${minCh === maxCh ? minCh : `al menos ${minCh}`} capítulos por módulo)`;
@@ -515,6 +621,19 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
 
   // 1) No rellenar: la estructura mínima ya supera el objetivo → informar y proponer, nunca recortar sola.
   if (minutes() > target + tol) {
+    // LOOP 9.2: aun así, las Actividades de Aplicación que exige el documento (por módulo / en el curso) se ubican, con el
+    // nivel más corto, en la práctica (o donde el documento diga): un requisito no desaparece porque sobren horas.
+    const t0 = (STUDY_TIME_RULES.applicationActivityTiers as readonly number[])[0];
+    const place = (m: WorkModule) => {
+      const c = m.chapters.filter((x) => !x.applicationMinutes && pinnedApp(x.id) === undefined && (!appInPractice || x.kind === 'practice') && appMode !== 'none' && (appMode !== 'practice_only' || x.kind === 'practice'))
+        .sort((a, b) => (a.kind === 'practice' ? 0 : 1) - (b.kind === 'practice' ? 0 : 1))[0];
+      if (!c) return false;
+      c.applicationMinutes = t0;
+      return true;
+    };
+    if (appModuleMin > 0) for (const m of design) while (appCount(m.chapters) < appModuleMin && appCount(m.chapters) < appModuleMax && appTotal() < appTotalMax && place(m));
+    if (appTotalMin > 0) for (const m of design) { while (appTotal() < appTotalMin && appCount(m.chapters) < appModuleMax && place(m)); }
+    reEval();
     const chs = est.modules.flatMap((m) => m.chapters);
     const contentChapterAvg = avg(chs.map((c) => c.chapterEstimatedMinutes));
     const remove = Math.ceil((minutes() - target) / contentChapterAvg);
@@ -544,6 +663,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     if (tier !== null && tier > capOf(m, c)) return false;
     // «Ajustar»: sin Actividades de Aplicación, o solo en los capítulos de práctica.
     if (tier !== null && (appMode === 'none' || (appMode === 'practice_only' && c.kind !== 'practice'))) return false;
+    // LOOP 9.2: el documento las ubica en el capítulo de práctica.
+    if (tier !== null && appInPractice && c.kind !== 'practice') return false;
     // LOOP 8.6C: topes de Actividades de Aplicación del documento (por módulo y en el curso) para una actividad NUEVA.
     if (tier !== null && c.applicationMinutes === null && (appCount(m.chapters) >= appModuleMax || appTotal() >= appTotalMax)) return false;
     const prev = c.applicationMinutes;
@@ -585,6 +706,9 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         if (reached()) return true;
         const existing = m.chapters.filter((c) => c.kind === 'practice');
         if (existing.length < round && m.chapters.length >= maxCh) continue; // LOOP 8.6C: no pasar del máximo del documento
+        if (existing.length < round && existing.length >= practiceMax) continue; // LOOP 9.2: ni del máximo de prácticas
+        if (existing.length < round && practiceTotal() >= practiceTotalMax) continue; // ni del total de prácticas del curso
+        if (existing.length < round && noPracticeModule(m.id)) continue; // el docente quitó la práctica de este módulo
         if (existing.length >= round) {
           // LOOP 7 (A1): la práctica que YA existe en esta ronda recibe su Actividad igual que al crearla (mismo momento y
           // nivel de cierre). Antes, el rediseño la dejaba sin actividad y el diseño aplicado no era un punto fijo.
@@ -622,6 +746,7 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
         const content = m.chapters.filter((c) => c.kind === 'content');
         if (content.length >= DISTRIBUTOR_RULES.maxContentChaptersPerModule) continue;
         if (m.chapters.length >= maxCh) continue; // LOOP 8.6C: no pasar del máximo del documento
+        if (content.length >= contentMax) continue; // LOOP 9.2: ni del máximo de capítulos de contenido
         const n = content.filter((c) => c.proposed).length + 1;
         // Sin preferencia: como siempre (hereda el video del módulo). Con preferencia: solo «Más» pone video en la profundización.
         const usesVideo = reqVideo !== null ? reqVideo : av ? avFor(content.length, content.length + 1, true) : content.some((c) => c.videoEnabled);

@@ -69,6 +69,18 @@ export function implicitDecisions(savedPrefs: Record<string, unknown> | null | u
 export interface DistributorRequirementConstraints {
   /** Capítulos por módulo (D1: los de práctica cuentan). */
   chaptersPerModule?: { min?: number; max?: number };
+  /** LOOP 9.2: «N capítulos de contenido por módulo» (las prácticas aparte). */
+  contentChaptersPerModule?: { min?: number; max?: number };
+  /** LOOP 9.2: «N capítulos de práctica por módulo». */
+  practicePerModule?: { min?: number; max?: number };
+  /** LOOP 9.2 (review I11): «N capítulos de práctica» en todo el curso. */
+  practiceTotal?: { min?: number; max?: number };
+  /** LOOP 9.2: las Actividades de Aplicación van en el capítulo de práctica («1 por módulo, en la práctica»). */
+  applicationInPractice?: boolean;
+  /** LOOP 9.2: total de actividades interactivas del curso («exactamente 4 actividades interactivas H5P»). */
+  activitiesTotal?: { min?: number; max?: number };
+  /** LOOP 9.2 (review 3.ª I2): «1 actividad interactiva por cada capítulo de contenido»: nunca se apagan las de contenido. */
+  activitiesInEveryContent?: boolean;
   /**
    * «1 video por capítulo»: video en todos los capítulos de contenido (los fijados por el docente mandan). Con «2 o más
    * por capítulo» también (es lo más cercano que Cursia puede: un video por capítulo) y Verificación explica el resto.
@@ -80,7 +92,7 @@ export interface DistributorRequirementConstraints {
   applicationPerModule?: { min?: number; max?: number };
   applicationTotal?: { min?: number; max?: number };
   /** Requisito de origen de cada restricción (para explicar los cambios). */
-  sources: Partial<Record<'chapters' | 'videos' | 'applicationPerModule' | 'applicationTotal', string>>;
+  sources: Partial<Record<'chapters' | 'practice' | 'activities' | 'videos' | 'applicationPerModule' | 'applicationTotal', string>>;
 }
 
 function rowsOf(res: any): any[] {
@@ -177,11 +189,27 @@ export function constraintsFor(required: DocumentRequirement[], exceptions: Stor
   for (const r of required) {
     const s = r.scope;
     const b = bounds(r);
-    if (r.kind === 'chapters' && s.level === 'module' && 'each' in s && !('chapterKind' in s && s.chapterKind) && b) {
+    const ck = (s as { chapterKind?: 'practice' | 'content' }).chapterKind;
+    if (r.kind === 'chapters' && s.level === 'module' && 'each' in s && !ck && b) {
       c.chaptersPerModule = merge(c.chaptersPerModule, b);
       c.sources.chapters = c.sources.chapters || r.id;
+    } else if (r.kind === 'chapters' && s.level === 'module' && 'each' in s && ck === 'content' && b) {
+      c.contentChaptersPerModule = merge(c.contentChaptersPerModule, b);
+      c.sources.chapters = c.sources.chapters || r.id;
+    } else if (r.kind === 'chapters' && s.level === 'module' && 'each' in s && ck === 'practice' && b) {
+      c.practicePerModule = merge(c.practicePerModule, b);
+      c.sources.practice = c.sources.practice || r.id;
+    } else if (r.kind === 'chapters' && s.level === 'course' && ck === 'practice' && b) {
+      c.practiceTotal = merge(c.practiceTotal, b);
+      c.sources.practice = c.sources.practice || r.id;
+    } else if (r.kind === 'activities' && s.level === 'course' && b) {
+      c.activitiesTotal = merge(c.activitiesTotal, b);
+      c.sources.activities = c.sources.activities || r.id;
+    } else if (r.kind === 'activities' && s.level === 'chapter' && 'each' in s && ck !== 'practice' && b && (b.min ?? 0) >= 1) {
+      c.activitiesInEveryContent = true;
     } else if (r.kind === 'structure' && r.shape && r.shape.length && r.shape.every((n) => n === r.shape![0])) {
-      c.chaptersPerModule = merge(c.chaptersPerModule, { min: r.shape[0], max: r.shape[0] });
+      if (ck === 'content') c.contentChaptersPerModule = merge(c.contentChaptersPerModule, { min: r.shape[0], max: r.shape[0] });
+      else c.chaptersPerModule = merge(c.chaptersPerModule, { min: r.shape[0], max: r.shape[0] });
       c.sources.chapters = c.sources.chapters || r.id;
     } else if (r.kind === 'videos' && s.level === 'chapter' && 'each' in s && !('chapterKind' in s && s.chapterKind === 'practice') && !exceptions.audiovisual && b) {
       // Review L86C M2: de los límites — ninguno si el máximo es 0; uno en cada capítulo si el mínimo es 1 o más (con «2 o
@@ -196,6 +224,7 @@ export function constraintsFor(required: DocumentRequirement[], exceptions: Stor
       if (s.level === 'module' && 'each' in s) {
         c.applicationPerModule = merge(c.applicationPerModule, b);
         c.sources.applicationPerModule = c.sources.applicationPerModule || r.id;
+        if (ck === 'practice') c.applicationInPractice = true;
       } else if (s.level === 'course') {
         c.applicationTotal = merge(c.applicationTotal, b);
         c.sources.applicationTotal = c.sources.applicationTotal || r.id;
@@ -207,13 +236,27 @@ export function constraintsFor(required: DocumentRequirement[], exceptions: Stor
   // ni pasa del máximo; no restringe ese campo y Verificación muestra el choque en los dos.
   const crossed = (x?: { min?: number; max?: number }) => !!x && x.min !== undefined && x.max !== undefined && x.min > x.max;
   if (crossed(c.chaptersPerModule)) { delete c.chaptersPerModule; delete c.sources.chapters; }
+  if (crossed(c.contentChaptersPerModule)) { delete c.contentChaptersPerModule; if (c.sources.chapters && !c.chaptersPerModule) delete c.sources.chapters; }
+  if (crossed(c.practicePerModule)) { delete c.practicePerModule; delete c.sources.practice; }
+  if (crossed(c.practiceTotal)) { delete c.practiceTotal; }
+  if (crossed(c.activitiesTotal)) { delete c.activitiesTotal; delete c.sources.activities; }
+  // LOOP 9.2 · Review C2: con la estructura del docente, su decisión manda: Cursia no vuelve a proponer capítulos de
+  // contenido ni prácticas para llegar al mínimo (solo respeta el máximo) ni cambia sus actividades; la diferencia con el
+  // documento queda como «Excepción al requisito del documento».
+  const maxOnly = (x?: { min?: number; max?: number }) => (x && x.max !== undefined ? { max: x.max } : undefined);
+  // Review 2.ª (I1): la estructura del docente (o un formato elegido) no relaja la práctica ni las actividades: esas
+  // desviaciones se registran capítulo a capítulo (actividad fijada) o módulo a módulo (práctica quitada) en designPins.
+  if (opts.structureByTeacher) {
+    c.contentChaptersPerModule = maxOnly(c.contentChaptersPerModule);
+    if (!c.contentChaptersPerModule) delete c.contentChaptersPerModule;
+  }
   if (opts.structureByTeacher && c.chaptersPerModule) {
     if (c.chaptersPerModule.max === undefined) { delete c.chaptersPerModule; delete c.sources.chapters; }
     else c.chaptersPerModule = { max: c.chaptersPerModule.max };
   }
   if (crossed(c.applicationPerModule)) { delete c.applicationPerModule; delete c.sources.applicationPerModule; }
   if (crossed(c.applicationTotal)) { delete c.applicationTotal; delete c.sources.applicationTotal; }
-  const any = c.chaptersPerModule || c.videosAllContent || c.videosNone || c.applicationPerModule || c.applicationTotal;
+  const any = c.chaptersPerModule || c.contentChaptersPerModule || c.practicePerModule || c.practiceTotal || c.activitiesTotal || c.activitiesInEveryContent || c.videosAllContent || c.videosNone || c.applicationPerModule || c.applicationTotal;
   return any ? c : null;
 }
 
@@ -325,7 +368,11 @@ export interface RequirementDesignCheck {
   detail?: string;
   fix?: { kind: 'adjust' | 'editor'; action: string; label: string; value?: unknown; targets?: { chapterIds?: string[]; moduleIds?: string[] } };
   /** LOOP 9: requisito que Cursia no puede producir (excepción que exige el motivo de la institución). */
-  capability?: { requirementKey: string; requirementText: string; produces: string };
+  /**
+   * coveredBy (LOOP 9.2): la MISMA limitación ya es una excepción de otro requisito de la misma frase del documento
+   * («8 videos de contenido: 2 videos por cada capítulo de contenido»): su motivo cubre los dos (un solo motivo).
+   */
+  capability?: { requirementKey: string; requirementText: string; produces: string; coveredBy?: { requirementKey: string; requirementText: string } };
 }
 
 const n1 = (n: number) => String(Math.round(n * 10) / 10).replace('.', ',');
@@ -345,8 +392,10 @@ function nounOf(kind: string, n: number, et?: string): string {
 }
 function scopeText(r: DocumentRequirement): string {
   const s = r.scope;
-  if (s.level === 'module') return 'each' in s ? ' por módulo' : ` en el módulo ${s.index}`;
-  if (s.level === 'chapter') return 'chapterKind' in s && s.chapterKind === 'practice' ? ' por capítulo de práctica' : ' por capítulo';
+  const ck = (s as { chapterKind?: 'practice' | 'content' }).chapterKind;
+  // LOOP 9.2: «1 Actividad de Aplicación por módulo, en el capítulo de práctica» (dónde va, no solo cuántas).
+  if (s.level === 'module') return 'each' in s ? (ck === 'practice' && r.kind !== 'chapters' ? ' por módulo, en el capítulo de práctica' : ' por módulo') : ` en el módulo ${s.index}`;
+  if (s.level === 'chapter') return ck === 'practice' ? ' por capítulo de práctica' : ck === 'content' ? ' por capítulo de contenido' : ' por capítulo';
   if (s.level === 'outcome') return ' por resultado de aprendizaje';
   if (s.level === 'unit') return 'each' in s ? ' por unidad' : ` en la unidad ${s.index}`;
   return '';
@@ -356,10 +405,14 @@ export function requirementText(r: DocumentRequirement): string {
   if (r.kind === 'structure') {
     const sh = r.shape || [];
     const same = sh.length && sh.every((n) => n === sh[0]);
-    return `estructura ${same ? `${sh.length} × ${sh[0]}` : sh.join(', ')} (${sh.reduce((a, b) => a + b, 0)} capítulos)`;
+    const content = (r.scope as { chapterKind?: string }).chapterKind === 'content';
+    return `estructura ${same ? `${sh.length} × ${sh[0]}` : sh.join(', ')} (${sh.reduce((a, b) => a + b, 0)} ${content ? 'capítulos de contenido' : 'capítulos'})`;
   }
   const v = r.value as number;
-  const noun = nounOf(r.kind, r.mode === 'range' ? (r.valueMax ?? v) : v, r.evaluationType);
+  let noun = nounOf(r.kind, r.mode === 'range' ? (r.valueMax ?? v) : v, r.evaluationType);
+  // LOOP 9.2: «2 capítulos de contenido por módulo», «1 capítulo de práctica por módulo».
+  const ck = (r.scope as { chapterKind?: 'practice' | 'content' }).chapterKind;
+  if (r.kind === 'chapters' && ck && r.scope.level !== 'chapter') noun += ck === 'practice' ? ' de práctica' : ' de contenido';
   const q = r.mode === 'range' ? `${n1(v)}–${n1(r.valueMax ?? v)} ${noun}` : r.mode === 'min' ? `al menos ${n1(v)} ${noun}` : r.mode === 'max' ? `hasta ${n1(v)} ${noun}` : r.mode === 'approx' ? `aproximadamente ${n1(v)} ${noun}` : `${n1(v)} ${noun}`;
   return q + scopeText(r);
 }
@@ -385,13 +438,16 @@ export function actualText(r: DocumentRequirement, c: RequirementCheck): string 
   if (r.kind === 'structure') {
     return structureActualText(a.shape || [], a.practice);
   }
+  // Review M3: «3 capítulos de práctica», no «3 capítulos», cuando el requisito es de un tipo de capítulo.
+  const ck = (r.scope as { chapterKind?: 'practice' | 'content' }).chapterKind;
+  const noun = (n: number) => nounOf(r.kind, n, r.evaluationType) + (r.kind === 'chapters' && ck && r.scope.level !== 'chapter' ? (ck === 'practice' ? ' de práctica' : ' de contenido') : '');
   if (a.each) {
     const e = a.each;
     if (!e.length) return 'ninguno';
-    if (e.every((n) => n === e[0])) return `${n1(e[0])} ${nounOf(r.kind, e[0], r.evaluationType)}${r.scope.level === 'chapter' ? ' por capítulo' : ' por módulo'}`;
-    return `${r.scope.level === 'chapter' ? 'capítulos' : 'módulos'} con ${e.map(n1).join(', ')} ${nounOf(r.kind, 2, r.evaluationType)}`;
+    if (e.every((n) => n === e[0])) return `${n1(e[0])} ${noun(e[0])}${r.scope.level === 'chapter' ? ' por capítulo' : ' por módulo'}`;
+    return `${r.scope.level === 'chapter' ? 'capítulos' : 'módulos'} con ${e.map(n1).join(', ')} ${noun(2)}`;
   }
-  return typeof a.value === 'number' ? `${n1(a.value)} ${nounOf(r.kind, a.value, r.evaluationType)}` : '—';
+  return typeof a.value === 'number' ? `${n1(a.value)} ${noun(a.value)}` : '—';
 }
 
 export interface ConflictContext {
@@ -427,8 +483,12 @@ export interface ConflictContext {
  *   videos por capítulo) → crítico · no verificable (unidades, por resultado…) → info · recomendaciones → info.
  */
 /** LOOP 9: lo que Cursia sí produce cuando el documento pide más de lo que puede (texto para la propuesta). */
-export function capabilityProduces(r: DocumentRequirement): string {
-  return r.kind === 'videos' ? 'Cursia produce un video por capítulo' : r.kind === 'application_activities' ? 'Cursia produce una Actividad de Aplicación por capítulo' : 'Cursia produce lo que permite su motor';
+export function capabilityProduces(r: DocumentRequirement, c?: RequirementCheck): string {
+  // LOOP 9.2: un total que no cabe en la estructura exigida dice cuántos sí se producen.
+  if (r.kind === 'videos' && r.scope.level === 'course' && c && typeof c.actual.value === 'number') return `Cursia produce un video por capítulo de contenido: ${c.actual.value} ${c.actual.value === 1 ? 'video' : 'videos'} en este curso`;
+  return r.kind === 'videos' ? 'Cursia produce un video por capítulo'
+    : r.kind === 'application_activities' ? 'Cursia produce una Actividad de Aplicación por capítulo'
+      : r.kind === 'activities' ? 'Cursia produce una actividad interactiva por capítulo' : 'Cursia produce lo que permite su motor';
 }
 
 export function requirementVerificationChecks(applicable: DocumentRequirement[], checks: RequirementCheck[], ctx: ConflictContext): RequirementDesignCheck[] {
@@ -505,10 +565,15 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
       // salida (la propuesta nunca se podría preparar). Es una excepción EXPLÍCITA: se ve aquí, la propuesta exige el motivo
       // de la institución antes de aprobarla y queda registrada en «Excepciones al documento». Nunca se calla.
       if (c.impossible) {
+        // LOOP 9.2: otra excepción de capacidad del mismo tipo y de la misma frase (p. ej. «2 videos por capítulo de
+        // contenido» para «8 videos») → un solo motivo para las dos.
+        const twinCap = r.scope.level === 'course' ? checks.find((x) => x !== c && x.impossible && byId.get(x.requirementId) && byId.get(x.requirementId)!.kind === r.kind
+          && byId.get(x.requirementId)!.scope.level !== 'course' && byId.get(x.requirementId)!.source.line === r.source.line && byId.get(x.requirementId)!.source.documentId === r.source.documentId) : undefined;
+        const twinReq = twinCap ? byId.get(twinCap.requirementId)! : null;
         out.push({ id, area: 'requirements', severity: 'warning', title: `Excepción al requisito del documento: ${asked}`,
-          detail: `${c.note || 'Cursia no puede producir lo que pide el documento.'} Queda como excepción: la propuesta pide el motivo de la institución antes de aprobarla.`,
+          detail: `${c.note || 'Cursia no puede producir lo que pide el documento.'} Queda como excepción: la propuesta pide el motivo de la institución antes de aprobarla.${twinReq ? ` Es la misma limitación que «${requirementText(twinReq)}»: un solo motivo cubre las dos.` : ''}`,
           // R68 la bloquea mientras no haya un motivo registrado (también fuera del flujo de propuesta: falla cerrada).
-          capability: { requirementKey: String(r.key), requirementText: asked, produces: capabilityProduces(r) } });
+          capability: { requirementKey: String(r.key), requirementText: asked, produces: capabilityProduces(r, c), ...(twinReq ? { coveredBy: { requirementKey: String(twinReq.key), requirementText: requirementText(twinReq) } } : {}) } });
         continue;
       }
       out.push({ id, area: 'requirements', severity: 'info', title: `Requisito del documento por revisar: ${asked}`,

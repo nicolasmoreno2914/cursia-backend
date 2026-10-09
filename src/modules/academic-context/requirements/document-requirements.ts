@@ -219,7 +219,9 @@ export function buildRequirementsView(entries: StoredRequirementsEntry[], sel: S
 export interface DesignForRequirements {
   modules: {
     examEnabled: boolean;
-    chapters: { kind: string; proposed?: boolean; videoEnabled: boolean; videoPinned?: boolean; activityEnabled: boolean; applicationMinutes: number | null; applicationPinned?: boolean; hours: number }[];
+    /** LOOP 9.2: el docente quitó la práctica de este módulo (su decisión: las diferencias que causa son SU excepción). */
+    practiceRemovedByTeacher?: boolean;
+    chapters: { kind: string; proposed?: boolean; videoEnabled: boolean; videoPinned?: boolean; activityEnabled: boolean; activityPinned?: boolean; applicationMinutes: number | null; applicationPinned?: boolean; hours: number }[];
   }[];
   /** counts.evaluations del distribuidor: evaluaciones de módulo + final. */
   evaluations: number;
@@ -286,7 +288,12 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
   // si él armó la estructura, aunque el diseño agregue capítulos.
   const modulesBy: RequirementChooser = d.structureByTeacher ? 'teacher' : 'cursia';
   const videosBy: RequirementChooser = d.audiovisualByTeacher || chapters.some((c) => c.videoPinned) ? 'teacher' : 'cursia';
-  const appBy: RequirementChooser = d.applicationByTeacher || chapters.some((c) => c.applicationPinned) ? 'teacher' : 'cursia';
+  // LOOP 9.2 (review I2): sin la práctica que el docente quitó, la Actividad de Aplicación que iba allí es SU decisión.
+  const practiceBy: RequirementChooser = mods.some((m) => m.practiceRemovedByTeacher) ? 'teacher' : structureBy;
+  const appBy: RequirementChooser = d.applicationByTeacher || chapters.some((c) => c.applicationPinned) || mods.some((m) => m.practiceRemovedByTeacher) ? 'teacher' : 'cursia';
+  // Review C1 / 3.ª: Cursia ajusta las actividades que no fijó el docente; si aun así no se cumple, la causa es lo fijado
+  // por el docente o su estructura (más capítulos de contenido): su excepción.
+  const activityBy: RequirementChooser = chapters.some((c) => c.activityPinned) || d.structureByTeacher ? 'teacher' : 'cursia';
   const hoursBy: RequirementChooser = d.hoursSource === 'user' || d.hoursSource === 'adjusted' ? 'teacher' : d.hoursSource === 'document' ? 'document' : 'cursia';
   const modExams = mods.filter((m) => m.examEnabled).length;
   const finalExam = Math.max(0, d.evaluations - modExams);
@@ -301,15 +308,30 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
   const each = (r: DocumentRequirement, values: number[], chosenBy: RequirementChooser) =>
     out.push({ requirementId: r.id, status: values.length && values.every((a) => satisfies(r, a, false)) ? 'met' : 'unmet', actual: { each: values }, chosenBy });
 
+  // LOOP 9.2 · Capacidad de video con la estructura que EXIGE el documento: Cursia produce un video por capítulo de
+  // contenido (ver auditoría: `video:<capítulo>` es un ítem por capítulo en Blueprint, Manifest, generación y empaque).
+  // Si el documento fija módulos y capítulos de contenido y pide más videos de los que caben, es una limitación real del
+  // producto: excepción de capacidad con motivo obligatorio (nunca un crítico sin salida ni un cumplimiento falso).
+  const strictReq = applicable.filter((x) => x.obligation === 'required' && x.confidence === 'high' && x.active !== false);
+  const upper = (x: DocumentRequirement) => (x.mode === 'exact' || x.mode === 'max' ? x.value : x.mode === 'range' ? x.valueMax ?? x.value : null);
+  const modsMax = strictReq.filter((x) => x.kind === 'modules' && x.scope.level === 'course').map(upper).filter((v): v is number => typeof v === 'number');
+  const perModMax = [
+    ...strictReq.filter((x) => x.kind === 'chapters' && x.scope.level === 'module' && 'each' in x.scope && (x.scope as { chapterKind?: string }).chapterKind !== 'practice').map(upper),
+    ...strictReq.filter((x) => x.kind === 'structure' && x.shape && x.shape.length && x.shape.every((n) => n === x.shape![0])).map((x) => x.shape![0]),
+  ].filter((v): v is number => typeof v === 'number');
+  const videoCapacity = modsMax.length && perModMax.length ? Math.min(...modsMax) * Math.min(...perModMax) : null;
+
   for (const r of applicable) {
     const s = r.scope;
     if (r.kind === 'units') { nv(r, 'Las unidades del documento no equivalen automáticamente a módulos: revisa esta lectura.'); continue; }
     if (s.level === 'outcome' || s.level === 'unit' || s.level === 'subject') { nv(r, 'Cursia todavía no mide este alcance en el diseño.'); continue; }
     if (r.kind === 'structure') {
       const shape = mods.map((m) => m.chapters.length);
-      const ok = !!r.shape && r.shape.length === shape.length && r.shape.every((n, i) => n === shape[i]);
-      // LOOP 9.1 (A2): la comparación no cambia; se informa aparte cuántos son de práctica para mostrar el N×M de contenido.
+      // LOOP 9.1 (A2): se informa aparte cuántos son de práctica para mostrar el N×M de contenido.
       const practice = mods.map((m) => m.chapters.filter((c) => c.kind === 'practice').length);
+      // LOOP 9.2: «N × M capítulos de contenido» compara solo contenido (las prácticas van aparte); sin «de contenido», todos.
+      const compared = 'chapterKind' in s && s.chapterKind === 'content' ? shape.map((n, i) => n - practice[i]) : shape;
+      const ok = !!r.shape && r.shape.length === compared.length && r.shape.every((n, i) => n === compared[i]);
       out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { shape, practice }, chosenBy: structureBy });
       continue;
     }
@@ -320,14 +342,19 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
         if (s.level !== 'course') { nv(r, 'Cursia todavía no mide este alcance en el diseño.'); break; }
         one(r, mods.length, modulesBy);
         break;
-      case 'chapters':
-        if (s.level === 'course') one(r, chapters.length, structureBy);
-        else if (s.level === 'module' && isEach) each(r, mods.map((m) => m.chapters.length), structureBy);
+      case 'chapters': {
+        // LOOP 9.2: «capítulos de contenido» / «capítulos de práctica» cuentan solo los de ese tipo.
+        const ck = (s as { chapterKind?: 'practice' | 'content' }).chapterKind;
+        const ofKind = (cs: { kind: string }[]) => (ck ? cs.filter((c) => (ck === 'practice' ? c.kind === 'practice' : c.kind !== 'practice')).length : cs.length);
+        const by = ck === 'practice' ? practiceBy : structureBy;
+        if (s.level === 'course') one(r, ofKind(chapters), by);
+        else if (s.level === 'module' && isEach) each(r, mods.map((m) => ofKind(m.chapters)), by);
         else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];
           if (!m) missingModule(r, s.index, modulesBy); else one(r, m.chapters.length, structureBy);
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
+      }
       case 'target_hours':
         if (s.level === 'course') {
           if (typeof d.targetHours !== 'number') nv(r, 'El diseño todavía no tiene horas.', hoursBy); else one(r, d.targetHours, hoursBy, true);
@@ -341,7 +368,17 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
         break;
       case 'videos': {
         const vids = (cs: { videoEnabled: boolean }[]) => cs.filter((c) => c.videoEnabled).length;
-        if (s.level === 'course') one(r, vids(chapters), videosBy);
+        if (s.level === 'course') {
+          const need = r.mode === 'max' ? 0 : r.value;
+          // Review I8: es imposible solo si el diseño REAL no llega (y su estructura de contenido no pasa de la exigida); si el
+          // docente o un formato armó más capítulos y el diseño ya tiene los videos, se compara como siempre.
+          const designContent = chapters.filter((c) => c.kind !== 'practice').length;
+          // Review C2 (2.ª): imposible cuando el diseño, con un video por capítulo de contenido, no puede llegar.
+          if (videoCapacity !== null && need > videoCapacity && vids(chapters) < need && need > designContent) {
+            out.push({ requirementId: r.id, status: 'not_verifiable', actual: { value: designContent }, chosenBy: 'cursia', impossible: true,
+              note: `Cursia produce un video por capítulo de contenido: con la estructura que exige el documento (${videoCapacity} capítulos de contenido) el máximo es ${videoCapacity} videos.` });
+          } else one(r, vids(chapters), videosBy);
+        }
         else if (s.level === 'module' && isEach) each(r, mods.map((m) => vids(m.chapters)), videosBy);
         else if (s.level === 'chapter' && isEach) {
           // Cursia produce como mucho un video por capítulo.
@@ -355,7 +392,8 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
       case 'application_activities': {
         const aa = (cs: { applicationMinutes: number | null }[]) => cs.filter((c) => !!c.applicationMinutes).length;
         if (s.level === 'course') one(r, aa(chapters), appBy);
-        else if (s.level === 'module' && isEach) each(r, mods.map((m) => aa(m.chapters)), appBy);
+        // LOOP 9.2: «1 por módulo, en el capítulo de práctica»: cuenta solo las de los capítulos de práctica de cada módulo.
+        else if (s.level === 'module' && isEach) each(r, mods.map((m) => aa((s as { chapterKind?: string }).chapterKind === 'practice' ? m.chapters.filter((c) => c.kind === 'practice') : m.chapters)), appBy);
         else if (s.level === 'chapter' && isEach) {
           if (r.mode === 'max' || r.value <= 1) {
             // Las prácticas también llevan Actividad de Aplicación (a diferencia del video, que es de los capítulos de contenido).
@@ -367,9 +405,16 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
       }
       case 'activities': {
         const ac = (cs: { activityEnabled: boolean }[]) => cs.filter((c) => c.activityEnabled).length;
-        if (s.level === 'course') one(r, ac(chapters), 'cursia');
-        else if (s.level === 'module' && isEach) each(r, mods.map((m) => ac(m.chapters)), 'cursia');
-        else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
+        // Review C2: si el docente armó la estructura (activó o quitó actividades), la diferencia es SU excepción.
+        if (s.level === 'course') one(r, ac(chapters), activityBy);
+        else if (s.level === 'module' && isEach) each(r, mods.map((m) => ac(m.chapters)), activityBy);
+        else if (s.level === 'chapter' && isEach) {
+          // LOOP 9.2: «1 actividad interactiva por cada capítulo de contenido». Cursia produce una por capítulo.
+          if (r.mode === 'max' || r.value <= 1) {
+            const target = chapters.filter((c) => (s.chapterKind ? (s.chapterKind === 'practice' ? c.kind === 'practice' : c.kind !== 'practice') : true));
+            each(r, target.map((c) => (c.activityEnabled ? 1 : 0)), activityBy);
+          } else nv(r, 'Cursia produce una actividad interactiva por capítulo: no puede cumplir más de una por capítulo todavía.', 'cursia', true);
+        } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       }
       case 'evaluations':

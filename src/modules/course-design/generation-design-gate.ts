@@ -137,8 +137,10 @@ export class GenerationDesignGate {
       }
       const reasons = m && m.r ? (typeof m.r === 'string' ? JSON.parse(m.r) : m.r) : {};
       const missing = capability.filter((c: any) => {
-        const saved = reasons[c.capability.requirementKey];
-        return !(saved && String(saved.reason || '').trim() && saved.requirementText === c.capability.requirementText);
+        // LOOP 9.2: la misma limitación de otro requisito de la misma frase → su motivo la cubre (un solo motivo).
+        const ok = (ref: { requirementKey: string; requirementText: string }) => { const saved = reasons[ref.requirementKey]; return !!(saved && String(saved.reason || '').trim() && saved.requirementText === ref.requirementText); };
+        // Review M9: un motivo guardado antes en la propia excepción también vale.
+        return !(ok(c.capability) || (c.capability.coveredBy && c.capability.coveredBy.requirementKey && ok(c.capability.coveredBy)));
       });
       if (missing.length) this.reject('critical', { criticals: missing.map((c: any) => ({ id: c.id, area: c.area, title: `${c.title} (falta el motivo de la institución)` })) });
     }

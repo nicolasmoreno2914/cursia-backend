@@ -352,9 +352,11 @@ export class CourseStructureService implements OnModuleInit {
           } else {
             await queryRunner.query(
               // LOOP 8.3: también el video que decidió el diseño (prioridad audiovisual; lo fijado por el docente ya viene respetado).
-              `update public.course_chapters set position = $1, application_minutes = $2, video_enabled = case when $6::boolean is null then video_enabled else $6::boolean end, updated_at = now()
+              // LOOP 9.2: también la actividad interactiva que decidió el diseño (total exacto de actividades del documento).
+              `update public.course_chapters set position = $1, application_minutes = $2, video_enabled = case when $6::boolean is null then video_enabled else $6::boolean end,
+                      activity_enabled = $7::boolean, updated_at = now()
                 where id = $3 and module_id = $4 and course_id = $5`,
-              [ci, c.applicationMinutes, c.id, m.id, courseId, c.kind === 'content' ? c.videoEnabled : null],
+              [ci, c.applicationMinutes, c.id, m.id, courseId, c.kind === 'content' ? c.videoEnabled : null, c.activityEnabled],
             );
           }
         }
@@ -1371,6 +1373,8 @@ export class CourseStructureService implements OnModuleInit {
       // elegido por alguien ya no está fijado (igual que el video).
       const appPinned = dto.pinApplication === true && appMinutes !== undefined;
       if (appMinutes !== undefined) pinOps.push(appPinned ? { field: 'application', value: appMinutes ?? 0 } : { field: 'application', value: null });
+      // LOOP 9.2 (review C1): la actividad interactiva cambiada a mano queda fijada (Cursia no la revierte ni la vuelve a proponer).
+      if (dto.activityEnabled !== undefined) pinOps.push(dto.pinActivity === true ? { field: 'activity', value: !!dto.activityEnabled } : { field: 'activity', value: null });
       const found = await this.updateRowAndBump(
         queryRunner, 'course_chapters', sets, params, i, { id: chapterId, module_id: moduleId, course_id: courseId }, courseId,
         guardPracticeVideo ? `coalesce(to_jsonb(t) ->> 'chapter_kind', 'content') <> 'practice'` : undefined,
@@ -1423,7 +1427,7 @@ export class CourseStructureService implements OnModuleInit {
          d as (
            delete from public.course_chapters ch using n
             where n.n > 1 and ch.id = $3 and ch.module_id = $2 and ch.course_id = $1
-           returning ch.id
+           returning ch.id, coalesce(to_jsonb(ch) ->> 'chapter_kind', 'content') as kind
          ),
          c as (
            update public.courses co
@@ -1431,7 +1435,7 @@ export class CourseStructureService implements OnModuleInit {
             where co.id = $1 and exists (select 1 from d)
            returning co.structure_version_counter
          )
-         select n.n, (select count(*)::int from d) as deleted, (select structure_version_counter from c) as counter from n`,
+         select n.n, (select count(*)::int from d) as deleted, (select structure_version_counter from c) as counter, (select kind from d limit 1) as kind from n`,
         [courseId, moduleId, chapterId],
       );
       const r = rows[0];
@@ -1445,6 +1449,8 @@ export class CourseStructureService implements OnModuleInit {
       }
 
       const newCounter = this.counterOrThrow(r.counter, courseId);
+      // LOOP 9.2 (review I1/I2): el docente quitó la práctica de este módulo → Cursia no la vuelve a proponer allí.
+      if (r.kind === 'practice') await queryRunner.query(`update public.courses set metadata = ${pinsMetadataExpr('metadata', '$2', [{ field: 'noPractice', value: true }])} where id = $1`, [courseId, moduleId]);
       const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
       return { structureVersionCounter: newCounter, deletedChapterId: chapterId, moduleId, liveMatchesCurrentBlueprint };

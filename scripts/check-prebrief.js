@@ -524,6 +524,29 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     assert(ex.includes('Cursia produce un video por capítulo'), JSON.stringify(ex));
   });
 
+  await check('PB27 (LOOP 9.2) una limitación de la misma frase («8 videos» y «2 por capítulo de contenido»): un solo motivo cubre las dos excepciones', () => {
+    const inp = fixture({ doc4x5: true, shape: [5, 5, 5, 5] });
+    // «2 videos por capítulo» (la del fixture) pasa a ser excepción de capacidad; «8 videos» del curso queda cubierta por ella.
+    const vc = inp.card.verification.checks.find((x) => x.id === 'requirement:req-videos');
+    Object.assign(vc, { severity: 'warning', title: 'Excepción al requisito del documento: al menos 2 videos por capítulo', capability: { requirementKey: 'videos|chapter|each', requirementText: 'al menos 2 videos por capítulo', produces: 'Cursia produce un video por capítulo' } });
+    const tot = { id: 'req-vtot', key: 'videos@course', kind: 'videos', scope: { level: 'course' }, mode: 'exact', value: 40, obligation: 'required', applies: true, active: true, status: 'found', confidence: 'high', source: { documentId: 'doc-1', line: 22, page: 4, quote: 'Cada capítulo incluirá al menos 2 videos.' } };
+    inp.card.requirements.items.push(tot);
+    inp.card.requirements.checks.push({ requirementId: 'req-vtot', status: 'not_verifiable', actual: { value: 20 }, chosenBy: 'cursia', impossible: true, severity: 'warning' });
+    inp.card.verification.checks.push({ id: 'requirement:req-vtot', area: 'requirements', severity: 'warning', title: 'Excepción al requisito del documento: 40 videos',
+      capability: { requirementKey: 'videos@course', requirementText: '40 videos', produces: 'Cursia produce un video por capítulo de contenido: 20 videos en este curso', coveredBy: { requirementKey: 'videos|chapter|each', requirementText: 'al menos 2 videos por capítulo' } } });
+    const before = build(inp);
+    eq(before.exceptions.filter((e) => e.requirementKey !== 'structure|course').map((e) => [e.requirementKey, e.reason, e.coveredBy || null]), [['videos@course', null, 'videos|chapter|each'], ['videos|chapter|each', null, null]], 'sin motivo: las dos pendientes');
+    inp.exceptionReasons['videos|chapter|each'] = { reason: 'Un video por capítulo en el piloto.', requirementText: 'al menos 2 videos por capítulo', by: 'docente@demo.test', at: '2026-10-09T12:00:00.000Z' };
+    const after = build(inp);
+    eq(after.exceptions.filter((e) => e.requirementKey !== 'structure|course').map((e) => e.reason), ['Un video por capítulo en el piloto.', 'Un video por capítulo en el piloto.'], 'un motivo cubre las dos');
+    const rd = RD.prebriefReadiness(after, inp.card, [], []);
+    assert(!rd.blockers.some((b) => b.code === 'exception_reason' && /videos/.test(b.title)), JSON.stringify(rd.blockers));
+    // Review M9: un motivo guardado antes en la propia excepción («40 videos») sigue valiendo.
+    delete inp.exceptionReasons['videos|chapter|each'];
+    inp.exceptionReasons['videos@course'] = { reason: 'Motivo anterior del total.', requirementText: '40 videos', by: 'docente@demo.test', at: '2026-10-09T12:00:00.000Z' };
+    eq(build(inp).exceptions.find((e) => e.requirementKey === 'videos@course').reason, 'Motivo anterior del total.', 'motivo propio anterior');
+  });
+
   console.log(`\n${ok} OK · ${fail} fallas`);
   process.exit(fail ? 1 : 0);
 })();

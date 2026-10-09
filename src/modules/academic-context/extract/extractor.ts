@@ -74,7 +74,8 @@ const HEADINGS: ReadonlyArray<[SectionKey, RegExp]> = [
   ['level', /^(nivel( de formacion| academico| educativo)?|tipo de formacion)$/],
   ['semester', /^(semestre|periodo academico|ciclo|ubicacion en el plan de estudios)$/],
   ['learner', /^(perfil (del|de los|de las) (estudiantes?|participantes?|aprendices?)|poblacion objetivo|publico objetivo|dirigido a|perfil de ingreso|destinatarios)$/],
-  ['prior', /^(pre-?requisitos?|requisitos previos|conocimientos previos|co-?requisitos?|saberes previos)$/],
+  // LOOP 9.2: «Prerrequisitos» se escribe con doble r (antes solo se reconocía «prerequisitos»).
+  ['prior', /^(pre-?r?requisitos?|requisitos previos|conocimientos previos|co-?requisitos?|saberes previos)$/],
   ['generalObjective', /^(objetivo general|proposito( del curso| de formacion| de la asignatura)?|objetivo del curso)$/],
   ['specificObjectives', /^(objetivos especificos|objetivos de aprendizaje)$/],
   ['outcomes', /^(resultados de aprendizaje( esperados| del curso| de la asignatura| previstos)?|resultados esperados|logros de aprendizaje|logros esperados)$/],
@@ -89,8 +90,9 @@ const HEADINGS: ReadonlyArray<[SectionKey, RegExp]> = [
   ['hoursPractice', /^(horas practicas|horas de practica|trabajo practico)$/],
   ['hoursAutonomous', /^(horas (de trabajo )?(autonomo|independiente)|trabajo (autonomo|independiente)|horas autonomas|estudio independiente)$/],
   ['evaluation', /^(evaluacion( del aprendizaje| de los aprendizajes| del curso| de la asignatura)?|criterios de evaluacion|sistema de evaluacion|estrategias? de evaluacion|plan de evaluacion|evaluacion y calificacion|ponderacion)$/],
-  ['bibliography', /^(bibliografia( basica| complementaria| recomendada| obligatoria)?|referencias( bibliograficas)?|fuentes( de consulta)?|recursos bibliograficos|lecturas( recomendadas| obligatorias)?|webgrafia)$/],
-  ['methodology', /^(metodologia( de ensenanza| del curso| de la asignatura)?|estrategias? (metodologicas?|didacticas?|pedagogicas?)|metodologia y estrategias didacticas)$/],
+  ['bibliography', /^(bibliografia( basica| complementaria| recomendada| obligatoria)?|referencias( bibliograficas)?|fuentes( de consulta| consultadas)?|recursos bibliograficos|lecturas( recomendadas| obligatorias)?|webgrafia|referentes( normativos)?( y tecnicos)?)$/],
+  // LOOP 9.2: encabezados combinados («Enfoque pedagógico y metodología»): la metodología del documento no se pierde.
+  ['methodology', /^(metodologia( de ensenanza| del curso| de la asignatura)?|estrategias? (metodologicas?|didacticas?|pedagogicas?)|metodologia y estrategias didacticas|enfoque pedagogico( y metodologia| y didactico)?|enfoque metodologico|metodologia y enfoque( pedagogico)?|enfoque y metodologia)$/],
   ['constraints', /^(restricciones( institucionales)?|lineamientos( institucionales)?|condiciones( institucionales)?|requisitos institucionales|consideraciones institucionales)$/],
   ['description', /^(descripcion( del curso| de la asignatura| general)?|justificacion|presentacion( del curso| de la asignatura)?)$/],
   ['additional', /^(observaciones|informacion adicional|notas|modalidad|codigo( de la asignatura)?|area( de formacion)?|componente de formacion)$/],
@@ -188,7 +190,27 @@ interface Section {
   headingLine: SourceLine;
   inline: string | null;
   lines: SourceLine[];
+  /** LOOP 9.2: «Módulo 1 — título» con sus capítulos y temas, sin una sección «Contenidos» que los agrupe. */
+  moduleTree?: boolean;
 }
+
+/** LOOP 9.2: encabezado de módulo / unidad con título («8. Módulo 1 — Fundamentos, derechos y atención inicial»). */
+const MODULE_HEADING_RE = /^(?:\d{1,2}[.)]\s+)?(?:m[oó]dulo|unidad)\s+(\d{1,2}|[ivxlc]{1,6})\s*[—–:.-]\s*(\S.*)$/i;
+/**
+ * Review LOOP 9.2 (C1/I2): solo un ENCABEZADO de módulo abre el árbol — con estilo de título (Word/Markdown) o con la
+ * numeración de las secciones del documento («8. Módulo 1 — …») —, con un título de verdad (no «30 %», no una oración).
+ */
+function isModuleHeading(l: SourceLine): boolean {
+  const t = l.text.trim();
+  const m = MODULE_HEADING_RE.exec(t);
+  if (!m || l.cells || t.length > 160) return false;
+  const title = m[2].trim();
+  const words = title.split(/\s+/).filter((w) => /[a-záéíóúñ]{2,}/i.test(w));
+  if (words.length < 2 || words.length > 14 || /%|\d+\s*(h|horas?)\b/i.test(title) || /[.;]$/.test(title)) return false;
+  return !!l.heading || /^\d{1,2}[.)]\s+/.test(t);
+}
+/** Review LOOP 9.2 (I4): «Nombre» a secas solo es el nombre del curso en la ficha de identificación (no docente ni firmas). */
+const BARE_NAME_BLOCKERS = /(docente|profesor|tutor|elabor|revis|aprob|firma|autor|responsable|coordinador|estudiante|participante)/;
 
 interface Item { text: string; lines: SourceLine[] }
 
@@ -250,10 +272,22 @@ class DocExtraction {
     // de los encabezados del documento (4 → 5), es corto, sin punto final, y la sección actual no numera sus propios ítems.
     let lastHeadingNum: number | null = null;
     let curNumbered = false;
+    let seenSubject = false;
+    let context = ''; // último título y última línea (para «Nombre» a secas)
+    const bareNameOk = (l: SourceLine) => !seenSubject && l.line <= 40 && !BARE_NAME_BLOCKERS.test(stripAccents(context).toLowerCase());
     const headingNum = (t: string) => { const m = /^\s*(\d{1,2})[.)]\s+\S/.exec(t); return m ? Number(m[1]) : null; };
     for (const l of lines) {
       if (l.cells) {
+        const cells0 = (l.cells ?? []).map(collapse);
+        // «Nombre | Atención Integral…» en la ficha del curso (Review LOOP 9.2 I4: solo ahí).
+        if (cells0[0] && normKey(cells0[0]) === 'nombre' && cells0[1] && !keyOf(cells0[1])) {
+          if (bareNameOk(l)) { out.push({ key: 'subject', heading: cells0[0], headingLine: l, inline: cells0[1], lines: [] }); seenSubject = true; cur = null; }
+          else if (cur) cur.lines.push(l);
+          context = cells0.join(' ');
+          continue;
+        }
         const pairs = this.cellPairs(l);
+        if (pairs.some((p) => p.key === 'subject')) seenSubject = true;
         if (pairs.length) {
           for (const p of pairs) out.push({ key: p.key, heading: p.heading, headingLine: l, inline: p.value, lines: [] });
           // Una fila clave | valor de una sección de varias líneas abre esa sección para lo que sigue.
@@ -264,7 +298,38 @@ class DocExtraction {
         if (cur) cur.lines.push(l);
         continue;
       }
-      const h = headingOf(l);
+      // LOOP 9.2: «Módulo N — título» abre (o continúa) el árbol de contenidos del documento: módulos → capítulos → temas.
+      // Review C1/I2: nunca dentro de una sección «Contenidos» o «Evaluación» ya abierta (ahí sigue el lector de siempre).
+      if (isModuleHeading(l) && !(cur && !cur.moduleTree && (cur.key === 'contents' || cur.key === 'evaluation'))) {
+        if (!cur || !cur.moduleTree) {
+          cur = { key: 'contents', heading: 'Contenidos', headingLine: l, inline: null, lines: [], moduleTree: true };
+          out.push(cur);
+        }
+        cur.lines.push(l);
+        const mn = headingNum(l.text);
+        if (mn !== null) lastHeadingNum = mn;
+        curNumbered = false;
+        continue;
+      }
+      let h = headingOf(l);
+      // Dentro de un módulo, «Propósito: …» es el propósito del módulo (no el objetivo general del curso). Review I3: solo
+      // «Propósito» a secas; «Objetivo general» o «Propósito del curso» cierran el árbol como siempre.
+      if (h && cur && cur.moduleTree && h.key === 'generalObjective' && h.value && normKey(h.heading) === 'proposito') {
+        cur.lines.push(l);
+        continue;
+      }
+      // Review 2.ª (I4): «Propósito / Objetivo del módulo: …» también es del módulo.
+      if (cur && cur.moduleTree && /^(prop[oó]sito|objetivo) del m[oó]dulo\s*:/i.test(l.text.trim())) {
+        cur.lines.push(l);
+        continue;
+      }
+      // «Nombre: …» a secas (Review I4): solo en la ficha de identificación.
+      if (!h && !l.cells) {
+        const colon = l.text.indexOf(':');
+        if (colon > 0 && normKey(l.text.slice(0, colon)) === 'nombre' && l.text.slice(colon + 1).trim() && bareNameOk(l)) h = { key: 'subject', value: l.text.slice(colon + 1).trim(), heading: l.text.slice(0, colon).trim() };
+      }
+      if (h && h.key === 'subject') seenSubject = true;
+      if (l.heading || headingNum(l.text) !== null || l.text.length <= 40) context = l.text;
       if (h) {
         cur = { key: h.key, heading: h.heading, headingLine: l, inline: h.value, lines: [] };
         out.push(cur);
@@ -417,7 +482,8 @@ class DocExtraction {
    * un elemento). El valor en línea del encabezado cuenta como primer elemento.
    */
   private items(s: Section): Item[] {
-    const lines: SourceLine[] = [...(s.inline ? [{ ...s.headingLine, text: s.inline }] : []), ...s.lines];
+    // LOOP 9.2: el valor en línea de una fila «clave | valor» es solo el valor (sin la celda del rótulo).
+    const lines: SourceLine[] = [...(s.inline ? [{ ...s.headingLine, text: s.inline, cells: undefined }] : []), ...s.lines];
     const marked = (l: SourceLine) => !!l.cells || !!l.list || BULLET_RE.test(l.text) || OUTCOME_CODE_RE.test(l.text) || COMPETENCY_CODE_RE.test(l.text);
     const anyMarked = lines.some(marked);
     const out: Item[] = [];
@@ -467,6 +533,7 @@ class DocExtraction {
   // ── Contenidos (unidades + temas) ──
 
   private parseContents(s: Section): void {
+    if (s.moduleTree) return this.parseModuleTree(s);
     const UNIT_RE = /^(?:unidad|m[oó]dulo|tema|eje|bloque|cap[ií]tulo)(?:\s+tem[aá]tica)?\s*(?:n[°º.]?\s*)?([0-9]{1,2}|[ivxlc]{1,6})\b\s*[:.\-–—)]?\s*(.*)$/i;
     const SUB_RE = /^\s*([0-9]{1,2})\.([0-9]{1,2})\.?\s+(.*)$/;
     const TOP_RE = /^\s*([0-9]{1,2})[.)]\s+(.*)$/;
@@ -516,6 +583,66 @@ class DocExtraction {
       const sm = hasSub ? SUB_RE.exec(l.text) : null;
       pushContent(sm ? sm[3] : l.text, l);
     }
+    this.emitUnits(s, units, loose);
+  }
+
+  /**
+   * LOOP 9.2 · Árbol del documento: «Módulo N — título» → unidad; «Capítulo N. título» → un contenido con sus temas
+   * («título: tema; tema…»). La práctica integradora y las evaluaciones del módulo no son capítulos de contenido (las
+   * exigen los requisitos del documento, no los contenidos); el propósito del módulo tampoco.
+   */
+  private parseModuleTree(s: Section): void {
+    const MOD_RE = MODULE_HEADING_RE;
+    const CH_RE = /^(?:cap[ií]tulo|lecci[oó]n)\s+(\d{1,2}|[ivxlc]{1,6})\s*[.:—–)-]\s*(\S.*)$/i;
+    // Review C1: solo los bloques del módulo que no son capítulos de contenido (práctica integradora, evaluación parcial o
+    // final, propósito), y solo como encabezado corto; un tema que empieza con «Evaluación de riesgos…» sigue siendo tema.
+    const SKIP_RE = /^(pr[aá]ctica (integradora|final|del m[oó]dulo)|evaluaci[oó]n (parcial|final|del m[oó]dulo)|examen (parcial|final|del m[oó]dulo))\b/i;
+    const PURPOSE_RE = /^(prop[oó]sito|objetivo)( del m[oó]dulo)?\s*:/i;
+    const isBlockHeading = (l: SourceLine, t: string) => (!!l.heading || (t.split(/\s+/).length <= 8 && !/[.;:]$/.test(t))) && SKIP_RE.test(t);
+    const units: { title: string; hours: number | null; line: SourceLine; contents: Item[]; refs: string[] }[] = [];
+    const loose: Item[] = [];
+    let unit: (typeof units)[number] | null = null;
+    let chapter: { title: string; topics: string[]; lines: SourceLine[] } | null = null;
+    let skipping = false;
+    const flush = () => {
+      if (unit && chapter) {
+        const text = chapter.topics.length ? `${chapter.title}: ${chapter.topics.join('; ')}` : chapter.title;
+        unit.contents.push({ text, lines: chapter.lines });
+      }
+      chapter = null;
+    };
+    for (const l of s.lines) {
+      const text = collapse((l.cells ? l.cells.filter(Boolean).join(' — ') : l.text).replace(BULLET_RE, ''));
+      if (!text) continue;
+      const mm = MOD_RE.exec(text);
+      if (mm) {
+        flush();
+        skipping = false;
+        const r = refsOf(mm[2]);
+        const { text: title, hours } = takeHours(r.rest);
+        unit = { title: title || mm[2], hours, line: l, contents: [], refs: r.ids };
+        units.push(unit);
+        continue;
+      }
+      const cm = CH_RE.exec(text);
+      if (cm) {
+        flush();
+        skipping = false;
+        chapter = { title: collapse(cm[2]).replace(/[.:]$/, ''), topics: [], lines: [l] };
+        continue;
+      }
+      if (PURPOSE_RE.test(text)) continue; // propósito del módulo: no es un tema
+      if (isBlockHeading(l, text)) { flush(); skipping = true; continue; }
+      if (skipping) continue;
+      if (chapter) { chapter.topics.push(text.replace(/[.;]$/, '')); chapter.lines.push(l); continue; }
+      if (unit) unit.contents.push({ text, lines: [l] });
+      else loose.push({ text, lines: [l] });
+    }
+    flush();
+    this.emitUnits(s, units, loose);
+  }
+
+  private emitUnits(s: Section, units: { title: string; hours: number | null; line: SourceLine; contents: Item[]; refs: string[] }[], loose: Item[]): void {
     const section = SECTION_LABEL.contents;
     if (!units.length && loose.length) {
       units.push({ title: s.heading, hours: null, line: s.headingLine, contents: loose.splice(0), refs: [] });
