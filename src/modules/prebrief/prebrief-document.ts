@@ -110,7 +110,11 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   if (who) summaryParts.push(`Está dirigido a: ${who.replace(/\.$/, '')}.`);
   if (m.pedagogy.approach) summaryParts.push(`Enfoque pedagógico: ${m.pedagogy.approach.value.toLowerCase()}.`);
   glance.push({ t: 'paragraph', text: summaryParts.join(' ') });
-  if (m.exceptions.length) glance.push({ t: 'callout', tone: 'warn', text: `Requiere su atención: ${plural(m.exceptions.length, 'excepción', 'excepciones')} al documento institucional (sección 12).` });
+  // LOOP 9.2 (capacidades): lo que Cursia no cubre con su capacidad actual se dice aparte de las decisiones de la institución.
+  const capEx = m.exceptions.filter((e) => e.capability);
+  const ownEx = m.exceptions.length - capEx.length;
+  if (capEx.length) glance.push({ t: 'callout', tone: 'warn', text: `Requiere su atención: ${plural(capEx.length, 'requisito', 'requisitos')} del documento que Cursia no cubre con su capacidad actual${capEx.every((e) => e.reason) ? ', aceptados por la institución como excepción' : '; para aprobar, la institución debe aceptar la diferencia'} (sección 12).` });
+  if (ownEx) glance.push({ t: 'callout', tone: 'warn', text: `Requiere su atención: ${plural(ownEx, 'excepción', 'excepciones')} al documento institucional (sección 12).` });
   glance.push({ t: 'legend', title: 'Cómo leer el origen de cada dato', items: ORIGIN_LEGEND.map((x) => ({ key: x.key, label: ORIGIN_LABEL[x.key], text: x.text })) });
   sections.push({ id: 'glance', n: '', title: 'El curso en una mirada', blocks: glance });
 
@@ -229,7 +233,16 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
 
   // ── 10. Requisitos institucionales ──
   const STATUS: Record<string, string> = { met: 'Cumple', exception: 'Excepción', not_verifiable: 'No verificable', conflict: 'Conflicto' };
-  const statusLabelOf = (i: { status: string; doubtful?: true }) => (i.doubtful ? 'Por confirmar' : STATUS[i.status]);
+  const exOf = new Map(m.exceptions.map((e) => [e.requirementKey, e] as [string, (typeof m.exceptions)[number]]));
+  const statusLabelOf = (i: { key: string; status: string; doubtful?: true }) => {
+    if (i.doubtful) return 'Por confirmar';
+    const e = i.status === 'exception' ? exOf.get(i.key) : undefined;
+    if (e && e.capability) return e.reason ? 'Excepción aceptada' : 'No cubierto';
+    return STATUS[i.status];
+  };
+  const capReq = m.requirements.items.filter((i) => i.status === 'exception' && exOf.get(i.key)?.capability);
+  /** «Cursia contempla 1 video por capítulo…» → «1 video por capítulo…» (va bajo el rótulo «Propuesta de Cursia»). */
+  const proposalText = (t: string) => { const x = String(t || '').replace(/^Cursia (contempla|produce|diseña) /, ''); return x ? x.charAt(0).toUpperCase() + x.slice(1) : '—'; };
   const toConfirm = m.requirements.items.filter((i) => i.doubtful).length;
   // LOOP 9.1 QA: la decisión aplicada es la MISMA que en la sección 12 (p. ej. «Cursia produce un video por capítulo»).
   const appliedOf = new Map(m.exceptions.map((e) => [e.requirementKey, e.appliedText] as [string, string]));
@@ -238,10 +251,15 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   if (!m.requirements.hasDocument) rq.push({ t: 'paragraph', text: 'Este curso no tiene un documento institucional de referencia.', muted: true });
   else if (!m.requirements.items.length) rq.push({ t: 'paragraph', text: `El documento (${m.requirements.documentNames.join(', ')}) no establece requisitos de diseño que Cursia deba cumplir.`, muted: true });
   else {
-    rq.push({ t: 'paragraph', text: `${reqC.met} de ${reqC.total} requisitos del documento se cumplen${reqC.exceptions ? `; ${plural(reqC.exceptions, 'tiene', 'tienen')} una excepción decidida por la institución` : ''}${notVerif ? `; ${notVerif} no ${notVerif === 1 ? 'es verificable' : 'son verificables'} automáticamente` : ''}${toConfirm ? `; ${toConfirm} ${toConfirm === 1 ? 'queda' : 'quedan'} por confirmar` : ''}.` });
+    const ownExc = reqC.exceptions - capReq.length;
+    const capAccepted = capReq.filter((i) => exOf.get(i.key)!.reason).length;
+    const capText = capReq.length ? `; ${capReq.length} no ${capReq.length === 1 ? 'lo cubre' : 'los cubre'} Cursia con su capacidad actual${capAccepted === capReq.length ? ` (la institución ${capReq.length === 1 ? 'aceptó la diferencia' : 'aceptó las diferencias'})` : ' (la institución debe aceptar la diferencia para aprobar)'}` : '';
+    rq.push({ t: 'paragraph', text: `${reqC.met} de ${reqC.total} requisitos del documento se cumplen${capText}${ownExc ? `; ${plural(ownExc, 'tiene', 'tienen')} una excepción decidida por la institución` : ''}${notVerif ? `; ${notVerif} no ${notVerif === 1 ? 'es verificable' : 'son verificables'} automáticamente` : ''}${toConfirm ? `; ${toConfirm} ${toConfirm === 1 ? 'queda' : 'quedan'} por confirmar` : ''}.` });
     rq.push({ t: 'requirements', items: m.requirements.items.map((i) => ({
       status: i.status, statusLabel: statusLabelOf(i), text: reqDisplay(i.text),
-      note: i.status === 'exception' ? `Decisión aplicada: ${appliedOf.get(i.key) || i.actual || '—'} (ver sección 12).` : i.status === 'not_verifiable' ? (i.doubtful && i.detail ? i.detail : 'Cursia no puede comprobarlo automáticamente; se incorpora como orientación del diseño.') : i.status === 'conflict' ? `El diseño tiene ${i.actual || '—'}.` : undefined,
+      note: i.status === 'exception' && exOf.get(i.key)?.capability
+        ? `Propuesta de Cursia: ${proposalText(appliedOf.get(i.key) || '')}. ${exOf.get(i.key)!.reason ? 'La institución aceptó la diferencia (ver sección 12).' : 'Para aprobar, la institución debe aceptar la diferencia (ver sección 12).'}`
+        : i.status === 'exception' ? `Decisión aplicada: ${appliedOf.get(i.key) || i.actual || '—'} (ver sección 12).` : i.status === 'not_verifiable' ? (i.doubtful && i.detail ? i.detail : 'Cursia no puede comprobarlo automáticamente; se incorpora como orientación del diseño.') : i.status === 'conflict' ? `El diseño tiene ${i.actual || '—'}.` : undefined,
       evidence: i.evidence || undefined,
     })) });
   }
@@ -257,9 +275,9 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   sections.push({ id: 'exceptions', n: '12', title: 'Excepciones al documento', blocks: [m.exceptions.length
     ? { t: 'exceptions', items: m.exceptions.map((e) => ({ rows: [
       { label: 'Requisito original', value: reqDisplay(e.requirementText) },
-      { label: 'Decisión aplicada', value: e.appliedText },
-      { label: 'Tipo', value: 'Excepción al requisito del documento' },
-      { label: 'Motivo', value: e.reason || 'Motivo pendiente', strong: true },
+      { label: e.capability ? 'Propuesta de Cursia' : 'Decisión aplicada', value: e.capability ? proposalText(e.appliedText) : e.appliedText },
+      { label: 'Tipo', value: e.capability ? (e.reason ? 'Requisito no cubierto por Cursia · excepción aceptada' : 'Requisito no cubierto por Cursia (capacidad actual)') : 'Excepción al requisito del documento' },
+      { label: e.capability ? 'Aceptación de la institución' : 'Motivo', value: e.reason || (e.capability ? 'Pendiente: sin aceptación no se puede aprobar' : 'Motivo pendiente'), strong: true },
       { label: 'Responsable', value: e.by || '—' },
       { label: 'Fecha', value: e.at ? formatDateEs(e.at) : '—' },
     ] })) }

@@ -2507,7 +2507,7 @@ function reservationBookkeeping(ev) {
         return c ? `${c.severity}|${c.title}` : null;
       };
       ok(card.hours.target === 42 && !card.verification.blocking, T('«Cursia recomienda»: Formato M (meta 42 h) y Verificación sin críticos'), card.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
-      ok(/^warning\|Excepción al requisito del documento/.test(sev('videos')), T('2 videos por capítulo (Cursia produce uno) → excepción explícita, no un crítico sin salida (P0-2)'), sev('videos'));
+      ok(/^warning\|Requisito no cubierto por Cursia/.test(sev('videos')), T('2 videos por capítulo (Cursia produce uno) → requisito no cubierto, explícito; no un crítico sin salida (P0-2)'), sev('videos'));
       ok(/^warning\|Excepción/.test(sev('modules')) && /^warning\|Excepción/.test(sev('target_hours')), T('4 módulos y 64 h → excepciones (el Formato M es decisión de la institución)'), [sev('modules'), sev('target_hours')]);
       ok(/^ok\|/.test(sev('evaluations', 'partial')) && /^ok\|/.test(sev('evaluations', 'final')), T('3 parciales + final: se cumplen (un parcial por módulo del Formato M y la final)'), [sev('evaluations', 'partial'), sev('evaluations', 'final')]);
       ok(sev('application_activities') && !/^critical/.test(sev('application_activities')), T('1 Actividad de Aplicación por módulo («incluye»: lectura de confianza media): visible, sin crítico'), sev('application_activities'));
@@ -2526,7 +2526,7 @@ function reservationBookkeeping(ev) {
       ok(/Técnico \/ tecnológico/.test(learnerRows) && /Procesos productivos básicos/.test(learnerRows) && !/"value":"(none|basic|intermediate|advanced|technical|university)"/.test(learnerRows) && !/rigor académico y pensamiento crítico/.test(learnerRows),
         T('Público objetivo para personas: nivel y previos con rótulo y origen, previos del documento, sin códigos ni texto interno (P1-9)'), learnerRows.slice(0, 400));
       const exDoc = S0.draft.model.exceptions.find((e) => /^videos/.test(e.requirementKey));
-      ok(exDoc && exDoc.reason && /Cursia produce un video por capítulo/.test(exDoc.appliedText), T('«Excepciones al documento»: la de los videos con su motivo y lo que Cursia produce'), exDoc);
+      ok(exDoc && exDoc.reason && exDoc.capability === true && /^Cursia contempla 1 video por capítulo de contenido/.test(exDoc.appliedText), T('«Excepciones al documento»: la de los videos (no cubierta por Cursia) con la aceptación de la institución y lo que Cursia contempla'), exDoc);
 
       const getPdfE20 = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, disp: r.headers.get('content-disposition'), buf: Buffer.from(await r.arrayBuffer()) }; };
       const prepareApprove = async (label) => {

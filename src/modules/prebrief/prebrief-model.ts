@@ -68,6 +68,11 @@ export interface PrebriefRequirement {
 export interface PrebriefException {
   /** LOOP 9.2: misma limitación que otra excepción (misma frase del documento): su motivo cubre esta. */
   coveredBy?: string;
+  /**
+   * LOOP 9.2 (capacidades): requisito que Cursia NO cubre con su capacidad actual (no una decisión del docente). Sin la
+   * aceptación de la institución es «Requisito no cubierto»; con ella, «Excepción aceptada». Solo presente si es true.
+   */
+  capability?: true;
   requirementKey: string;
   requirementText: string;
   appliedText: string;
@@ -273,7 +278,8 @@ export function hashProjection(m: PrebriefModel): unknown {
   if (c.pedagogy.approach) { c.pedagogy.approach.summary = null; (c.pedagogy.approach as any).value = c.pedagogy.approach.id; }
   c.observations = c.observations.map((o) => ({ id: o.id, text: '' }));
   c.requirements.items = c.requirements.items.map((i) => ({ ...i, text: '', detail: null, actual: null }));
-  c.exceptions = c.exceptions.map((e) => ({ ...e, requirementText: '', appliedText: '' }));
+  // LOOP 9.2 (review I1): `capability` se deriva de Verificación (no cambia lo aprobado): fuera de la huella.
+  c.exceptions = c.exceptions.map((e) => { const { capability: _cap, ...rest } = e; return { ...rest, requirementText: '', appliedText: '' }; });
   c.decisions = c.decisions.map((d) => ({ ...d, label: '', value: '' })); // el código crudo (`code`) sí entra
   c.course.modality = { ...c.course.modality, value: '' };
   if (c.duration.format) c.duration.format = { ...c.duration.format, value: '' };
@@ -284,7 +290,7 @@ export function prebriefModelSha(m: PrebriefModel): string {
   return createHash('sha256').update(JSON.stringify(sortKeysDeep(hashProjection(m)))).digest('hex');
 }
 
-const EXCEPTION_TITLE_RE = /^Excepción al requisito del documento/;
+const EXCEPTION_TITLE_RE = /^(Excepción al requisito del documento|Requisito no cubierto por Cursia)/;
 
 /** Texto del requisito y lo que tiene el diseño, tal como los presenta Verificación. */
 function requirementTexts(card: any): Map<string, { text: string; actual: string | null; detail: string | null }> {
@@ -434,6 +440,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
         requirementKey: String(r.key), requirementText: text, appliedText: actual || (vcheck && vcheck.capability ? clean(vcheck.capability.produces) : '—'),
         reason: valid ? clean(saved.reason) : null, by: valid ? saved.by : null, at: valid ? saved.at : null,
         ...(cov ? { coveredBy: String(cov.requirementKey) } : {}),
+        ...(vcheck && vcheck.capability ? { capability: true as const } : {}),
       });
     }
   }

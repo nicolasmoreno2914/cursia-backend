@@ -390,7 +390,7 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     const m = M.buildPrebriefModel(inp, RA.actualText, RA.requirementText);
     const ex = m.exceptions.find((e) => e.requirementKey === 'videos@chapter');
     assert(ex, 'figura en «Excepciones al documento»');
-    eq([ex.reason, ex.appliedText], [null, 'Cursia produce un video por capítulo'], 'motivo pendiente; lo que Cursia produce');
+    eq([ex.reason, ex.appliedText, ex.capability], [null, 'Cursia contempla 1 video por capítulo de contenido', true], 'aceptación pendiente; lo que Cursia contempla');
     const r = D('modules/prebrief/prebrief-readiness.js').prebriefReadiness(m, card, [], []);
     assert(r.blockers.some((b) => b.code === 'exception_reason' && b.ref === 'videos@chapter'), 'la propuesta pide el motivo antes de prepararse');
     assert(!r.blockers.some((b) => b.code === 'critical'), 'sin crítico');
@@ -519,9 +519,16 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     inp.exceptionReasons['videos|chapter|each'] = { reason: 'Un video por capítulo en el piloto.', requirementText: 'al menos 2 videos por capítulo', by: 'docente@demo.test', at: '2026-10-08T12:00:00.000Z' };
     const d = DOC.buildPrebriefDocument(build(inp));
     const row = d.sections.find((x) => x.id === 'requirements').blocks.find((b) => b.t === 'requirements').items.find((i) => /videos/.test(i.text));
-    eq([row.statusLabel, row.note], ['Excepción', 'Decisión aplicada: Cursia produce un video por capítulo (ver sección 12).'], 'requisitos');
-    const ex = d.sections.find((x) => x.id === 'exceptions').blocks[0].items.map((e) => e.rows.find((r) => r.label === 'Decisión aplicada').value);
-    assert(ex.includes('Cursia produce un video por capítulo'), JSON.stringify(ex));
+    // LOOP 9.2 (capacidades): un requisito que Cursia no cubre, aceptado por la institución → «Excepción aceptada».
+    eq([row.statusLabel, row.note], ['Excepción aceptada', 'Propuesta de Cursia: Un video por capítulo. La institución aceptó la diferencia (ver sección 12).'], 'requisitos');
+    const ex = d.sections.find((x) => x.id === 'exceptions').blocks[0].items.find((e) => e.rows.some((r) => r.label === 'Propuesta de Cursia'));
+    eq(ex.rows.map((r) => [r.label, r.value]).slice(1, 4), [['Propuesta de Cursia', 'Un video por capítulo'], ['Tipo', 'Requisito no cubierto por Cursia · excepción aceptada'], ['Aceptación de la institución', 'Un video por capítulo en el piloto.']], 'excepciones');
+    // Sin la aceptación: «No cubierto» y la propuesta no se aprueba.
+    delete inp.exceptionReasons['videos|chapter|each'];
+    const d0 = DOC.buildPrebriefDocument(build(inp));
+    const row0 = d0.sections.find((x) => x.id === 'requirements').blocks.find((b) => b.t === 'requirements').items.find((i) => /videos/.test(i.text));
+    eq([row0.statusLabel, /Para aprobar, la institución debe aceptar la diferencia/.test(row0.note)], ['No cubierto', true], 'sin aceptación');
+    assert(/no lo cubre Cursia con su capacidad actual \(la institución debe aceptar la diferencia para aprobar\)/.test(d0.sections.find((x) => x.id === 'requirements').blocks[0].text), d0.sections.find((x) => x.id === 'requirements').blocks[0].text);
   });
 
   await check('PB27 (LOOP 9.2) una limitación de la misma frase («8 videos» y «2 por capítulo de contenido»): un solo motivo cubre las dos excepciones', () => {
@@ -538,7 +545,12 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     eq(before.exceptions.filter((e) => e.requirementKey !== 'structure|course').map((e) => [e.requirementKey, e.reason, e.coveredBy || null]), [['videos@course', null, 'videos|chapter|each'], ['videos|chapter|each', null, null]], 'sin motivo: las dos pendientes');
     // QA staging: la propuesta pide UN motivo (un solo campo), que dice que cubre también la otra excepción.
     const rd0 = RD.prebriefReadiness(before, inp.card, [], []).blockers.filter((b) => b.code === 'exception_reason' && /videos/.test(b.title));
-    eq(rd0.map((b) => [b.ref, b.title]), [['videos|chapter|each', 'Falta el motivo de la excepción: al menos 2 videos por capítulo (el mismo motivo cubre también «40 videos»).']], 'un solo motivo pendiente');
+    eq(rd0.map((b) => [b.ref, b.title, b.capability]), [['videos|chapter|each', 'Requisito no cubierto: al menos 2 videos por capítulo (también «40 videos»). Para continuar, la institución debe aceptar la diferencia.', true]], 'una sola aceptación pendiente');
+    eq(rd0[0].suggestion, 'Se acepta la propuesta de Cursia: un video por capítulo, en lugar de lo solicitado en el documento: al menos 2 videos por capítulo («40 videos»).', 'texto sugerido');
+    // Review I1: `capability` no entra en la huella del modelo (las propuestas ya aprobadas no quedan vencidas por este cambio).
+    const mCap = build(inp);
+    const mNoCap = JSON.parse(JSON.stringify(mCap)); mNoCap.exceptions.forEach((e) => { delete e.capability; });
+    assert(mCap.exceptions.some((e) => e.capability) && M.prebriefModelSha(mCap) === M.prebriefModelSha(mNoCap), 'huella sin el campo capability');
     inp.exceptionReasons['videos|chapter|each'] = { reason: 'Un video por capítulo en el piloto.', requirementText: 'al menos 2 videos por capítulo', by: 'docente@demo.test', at: '2026-10-09T12:00:00.000Z' };
     const after = build(inp);
     eq(after.exceptions.filter((e) => e.requirementKey !== 'structure|course').map((e) => e.reason), ['Un video por capítulo en el piloto.', 'Un video por capítulo en el piloto.'], 'un motivo cubre las dos');

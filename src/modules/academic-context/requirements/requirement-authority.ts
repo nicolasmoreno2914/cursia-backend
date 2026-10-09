@@ -231,6 +231,24 @@ export function constraintsFor(required: DocumentRequirement[], exceptions: Stor
       }
     }
   }
+  // LOOP 9.2 (capacidades): un total de videos que llega (o pasa) a los capítulos de contenido que fija el documento → video en
+  // TODOS ellos (lo máximo que Cursia produce); lo que falte lo informa Verificación como requisito no cubierto.
+  if (!exceptions.audiovisual && !c.videosNone) {
+    const vMin = required.filter((r) => r.kind === 'videos' && r.scope.level === 'course').map((r) => (bounds(r) || {}).min ?? 0);
+    const nMods = required.filter((r) => r.kind === 'modules' && r.scope.level === 'course' && (r.mode === 'exact' || r.mode === 'max')).map((r) => r.value as number)[0];
+    const perMod = c.contentChaptersPerModule?.max ?? c.chaptersPerModule?.max;
+    const vr = required.find((r) => r.kind === 'videos' && r.scope.level === 'course');
+    if (vMin.length && typeof nMods === 'number' && typeof perMod === 'number' && Math.max(...vMin) >= nMods * perMod && vr) {
+      c.videosAllContent = true;
+      c.sources.videos = c.sources.videos || vr.id;
+    }
+    // Lo mismo por módulo: «cada módulo tendrá N videos» con N ≥ capítulos de contenido por módulo → video en todos.
+    const vm = required.find((r) => r.kind === 'videos' && r.scope.level === 'module' && 'each' in r.scope && ((bounds(r) || {}).min ?? 0) >= 1);
+    if (vm && typeof perMod === 'number' && ((bounds(vm) || {}).min ?? 0) >= perMod) {
+      c.videosAllContent = true;
+      c.sources.videos = c.sources.videos || vm.id;
+    }
+  }
   if (c.videosAllContent && c.videosNone) { delete c.videosAllContent; delete c.videosNone; } // contradictorio: lo explica Verificación
   // Review L86C I4: requisitos del documento que se contradicen (mínimo por encima del máximo): Cursia no elige entre ellos
   // ni pasa del máximo; no restringe ese campo y Verificación muestra el choque en los dos.
@@ -401,6 +419,11 @@ function scopeText(r: DocumentRequirement): string {
   return '';
 }
 /** «3 módulos», «40–44 horas», «2 videos por capítulo», «4 × 5 (20 capítulos)». */
+/** LOOP 9.2 (review m6): «El documento pide 8 videos» / «El documento indica «sin evaluación final»». */
+export function docAsks(asked: string): string {
+  return /^sin /.test(asked) ? `El documento indica «${asked}»` : `El documento pide ${asked}`;
+}
+
 export function requirementText(r: DocumentRequirement): string {
   if (r.kind === 'structure') {
     const sh = r.shape || [];
@@ -413,6 +436,8 @@ export function requirementText(r: DocumentRequirement): string {
   // LOOP 9.2: «2 capítulos de contenido por módulo», «1 capítulo de práctica por módulo».
   const ck = (r.scope as { chapterKind?: 'practice' | 'content' }).chapterKind;
   if (r.kind === 'chapters' && ck && r.scope.level !== 'chapter') noun += ck === 'practice' ? ' de práctica' : ' de contenido';
+  // LOOP 9.2 (QA): «hasta 0 evaluaciones finales» → «sin evaluación final».
+  if (r.mode === 'max' && v === 0) return `sin ${nounOf(r.kind, r.kind === 'evaluations' && r.evaluationType === 'final' ? 1 : 2, r.evaluationType)}` + scopeText(r);
   const q = r.mode === 'range' ? `${n1(v)}–${n1(r.valueMax ?? v)} ${noun}` : r.mode === 'min' ? `al menos ${n1(v)} ${noun}` : r.mode === 'max' ? `hasta ${n1(v)} ${noun}` : r.mode === 'approx' ? `aproximadamente ${n1(v)} ${noun}` : `${n1(v)} ${noun}`;
   return q + scopeText(r);
 }
@@ -484,11 +509,18 @@ export interface ConflictContext {
  */
 /** LOOP 9: lo que Cursia sí produce cuando el documento pide más de lo que puede (texto para la propuesta). */
 export function capabilityProduces(r: DocumentRequirement, c?: RequirementCheck): string {
-  // LOOP 9.2: un total que no cabe en la estructura exigida dice cuántos sí se producen.
-  if (r.kind === 'videos' && r.scope.level === 'course' && c && typeof c.actual.value === 'number') return `Cursia produce un video por capítulo de contenido: ${c.actual.value} ${c.actual.value === 1 ? 'video' : 'videos'} en este curso`;
-  return r.kind === 'videos' ? 'Cursia produce un video por capítulo'
-    : r.kind === 'application_activities' ? 'Cursia produce una Actividad de Aplicación por capítulo'
-      : r.kind === 'activities' ? 'Cursia produce una actividad interactiva por capítulo' : 'Cursia produce lo que permite su motor';
+  // LOOP 9.2 (capacidades): lo que Cursia contempla con su capacidad ACTUAL y cuántos quedan previstos en este diseño.
+  const n = c && typeof c.actual.value === 'number' ? c.actual.value : null;
+  const tot = (one: string, many: string) => (n === null ? '' : ` (${n} ${n === 1 ? one : many} en total)`);
+  if (r.kind === 'videos') return `Cursia contempla 1 video por capítulo de contenido${tot('video previsto', 'videos previstos')}`;
+  if (r.kind === 'application_activities') return `Cursia contempla como máximo 1 Actividad de Aplicación por capítulo${tot('Actividad de Aplicación prevista', 'Actividades de Aplicación previstas')}`;
+  if (r.kind === 'activities') return `Cursia contempla 1 actividad interactiva por capítulo${tot('actividad interactiva prevista', 'actividades interactivas previstas')}`;
+  if (r.kind === 'evaluations') {
+    return r.evaluationType === 'final' ? 'Cursia contempla como máximo 1 evaluación final'
+      : `Cursia contempla 1 evaluación por módulo${r.evaluationType === 'partial' || r.scope.level === 'module' ? tot('evaluación parcial prevista', 'evaluaciones parciales previstas') : ' y 1 evaluación final' + tot('evaluación prevista', 'evaluaciones previstas')}`;
+  }
+  if (r.kind === 'target_hours') return 'Cursia diseña cursos de 1 a 500 horas de trabajo del estudiante';
+  return 'Cursia no lo contempla con su capacidad actual';
 }
 
 export function requirementVerificationChecks(applicable: DocumentRequirement[], checks: RequirementCheck[], ctx: ConflictContext): RequirementDesignCheck[] {
@@ -570,10 +602,14 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
         const twinCap = r.scope.level === 'course' ? checks.find((x) => x !== c && x.impossible && byId.get(x.requirementId) && byId.get(x.requirementId)!.kind === r.kind
           && byId.get(x.requirementId)!.scope.level !== 'course' && byId.get(x.requirementId)!.source.line === r.source.line && byId.get(x.requirementId)!.source.documentId === r.source.documentId) : undefined;
         const twinReq = twinCap ? byId.get(twinCap.requirementId)! : null;
-        out.push({ id, area: 'requirements', severity: 'warning', title: `Excepción al requisito del documento: ${asked}`,
-          detail: `${c.note || 'Cursia no puede producir lo que pide el documento.'} Queda como excepción: la propuesta pide el motivo de la institución antes de aprobarla.${twinReq ? ` Es la misma limitación que «${requirementText(twinReq)}»: un solo motivo cubre las dos.` : ''}`,
+        // LOOP 9.2 (capacidades): Cursia diseña dentro de lo que su pipeline produce hoy; lo que el documento pide por encima
+        // es un REQUISITO NO CUBIERTO (nunca se promete ni se da por cumplido). Solo se continúa si la institución acepta la
+        // diferencia en la propuesta (queda como excepción aceptada); si no la acepta, la propuesta no se aprueba.
+        const produces = capabilityProduces(r, c);
+        out.push({ id, area: 'requirements', severity: 'warning', title: `Requisito no cubierto por Cursia: ${asked}`,
+          detail: `El microcurrículo solicita ${asked}. Actualmente, ${produces}. No se puede presentar como cumplido: para continuar, la institución debe aceptar esta diferencia en la propuesta.${twinReq ? ` Es la misma limitación que «${requirementText(twinReq)}»: una sola aceptación cubre las dos.` : ''}`,
           // R68 la bloquea mientras no haya un motivo registrado (también fuera del flujo de propuesta: falla cerrada).
-          capability: { requirementKey: String(r.key), requirementText: asked, produces: capabilityProduces(r, c), ...(twinReq ? { coveredBy: { requirementKey: String(twinReq.key), requirementText: requirementText(twinReq) } } : {}) } });
+          capability: { requirementKey: String(r.key), requirementText: asked, produces, ...(twinReq ? { coveredBy: { requirementKey: String(twinReq.key), requirementText: requirementText(twinReq) } } : {}) } });
         continue;
       }
       out.push({ id, area: 'requirements', severity: 'info', title: `Requisito del documento por revisar: ${asked}`,
@@ -588,7 +624,7 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
           : r.kind === 'application_activities' && ctx.exceptionFields.applicationActivities ? { kind: 'adjust' as const, action: 'applicationActivities', value: 'requirement', label: 'Volver al requisito del documento' }
             : { kind: 'editor' as const, action: 'structure', label: 'Revisar en el editor' };
       out.push({ id, area: 'requirements', severity: 'warning', title: `Excepción al requisito del documento: ${asked}`,
-        detail: `Te estás apartando de un requisito del documento: el documento pide ${asked}; elegiste ${has2}. Cursia respeta tu decisión.`, fix });
+        detail: `Te estás apartando de un requisito del documento: ${docAsks(asked).replace(/^El/, 'el')}; elegiste ${has2}. Cursia respeta tu decisión.`, fix });
       continue;
     }
     // Review QA M1: el diseño se pasa de las horas del documento por una decisión del docente (estructura, fijados o
@@ -631,7 +667,7 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
       ? { kind: 'editor' as const, action: r.kind === 'evaluations' ? 'module_exams' : 'structure', label: 'Resolver en el editor' }
       : r.kind === 'target_hours' ? { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' } : undefined;
     out.push({ id, area: 'requirements', severity: 'critical', title: `Conflicto con un requisito del documento: ${asked}`,
-      detail: `El documento pide ${asked}; el diseño tiene ${has2}.${cause}`, ...(fix ? { fix } : {}) });
+      detail: `${docAsks(asked)}; el diseño tiene ${has2}.${cause}`, ...(fix ? { fix } : {}) });
   }
   return out;
 }

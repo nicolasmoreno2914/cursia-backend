@@ -275,13 +275,17 @@ export async function renderPrebriefPdf(document: PrebriefDocument, meta: Prebri
         break;
       }
       case 'requirements': {
-        const sw = 92;
+        // LOOP 9.2 (review I2): la columna del estado mide lo que ocupa el rótulo más largo («EXCEPCIÓN ACEPTADA»).
+        font(true, 7.5, C.soft);
+        const sw = Math.max(92, ...b.items.map((x) => pdf.widthOfString(T(x.statusLabel.toUpperCase()), { characterSpacing: 0.5 }) + 18));
         for (const it of b.items) {
           const h = hOf(it.text, W - sw, false, 10) + (it.note ? hOf(it.note, W - sw, false, 9) : 0) + (it.evidence ? originH({ evidence: it.evidence }, W - sw) : 0) + 10;
           ensure(h);
           const y = pdf.y;
-          const col = it.status === 'met' ? C.ok : it.status === 'exception' ? C.warn : it.status === 'conflict' ? C.crit : C.soft;
-          const bg = it.status === 'met' ? C.okSoft : it.status === 'exception' ? C.warnSoft : it.status === 'conflict' ? C.critSoft : C.fill;
+          // «No cubierto» (sin la aceptación de la institución) bloquea: se ve como un conflicto, no como una excepción.
+          const blocking = it.status === 'conflict' || it.statusLabel === 'No cubierto';
+          const col = it.status === 'met' ? C.ok : blocking ? C.crit : it.status === 'exception' ? C.warn : C.soft;
+          const bg = it.status === 'met' ? C.okSoft : blocking ? C.critSoft : it.status === 'exception' ? C.warnSoft : C.fill;
           font(true, 7.5, col);
           const pw = pdf.widthOfString(T(it.statusLabel.toUpperCase()), { characterSpacing: 0.5 }) + 10;
           pdf.roundedRect(PAGE.left, y, pw, 13, 6).fill(bg);
