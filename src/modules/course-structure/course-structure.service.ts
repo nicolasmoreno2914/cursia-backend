@@ -23,6 +23,7 @@ import { MoveChapterDto } from './dto/move-chapter.dto';
 import { UpdateStructureSettingsDto } from './dto/update-structure-settings.dto';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
+import { adoptCourseTitleIfPlaceholder } from '../course-facts/course-facts-db';
 import { CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import {
@@ -368,11 +369,16 @@ export class CourseStructureService implements OnModuleInit {
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
       // LOOP 8.0: el diseño de Cursia sobre una estructura que Cursia armó y nadie tocó sigue siendo «de Cursia».
       await advanceStructureOriginIfUntouched(queryRunner, courseId, lock.counter, newCounter, shapeBefore);
+      // LOOP 9.2 (QA): un curso sin nombre propio («Curso sin título») toma el nombre que ya conoce Cursia (el del pedido o
+      // el del documento): antes el Blueprint, el Manifest y el aula decían «Curso sin título» aunque la propuesta mostraba
+      // el nombre del documento. Después del cálculo (la huella de la propuesta no cambia); nunca pisa un nombre propio.
+      const adoptedTitle = await adoptCourseTitleIfPlaceholder(queryRunner, courseId);
       const liveMatchesCurrentBlueprint = await this.liveMatchesAfterMutation(queryRunner, courseId, ownerId, lock.hasBlueprint);
       await queryRunner.commitTransaction();
       return {
         structureVersionCounter: newCounter,
         liveMatchesCurrentBlueprint,
+        ...(adoptedTitle ? { adoptedTitle } : {}),
         addedChapters: added,
         applicationActivities: dist.counts.applicationActivities,
         estimatedHours: dist.estimatedHours,

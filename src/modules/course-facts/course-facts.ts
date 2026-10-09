@@ -270,6 +270,11 @@ export interface FactsInput {
 }
 
 const PLACEHOLDER_TITLES = ['Curso Virtual', 'Curso sin título', 'Tu curso', 'Nuevo curso'];
+/** LOOP 9.2 (QA): título de relleno (o vacío): el curso todavía no tiene nombre propio. */
+export function isPlaceholderCourseTitle(t: unknown): boolean {
+  const v = String(t ?? '').trim();
+  return !v || PLACEHOLDER_TITLES.includes(v);
+}
 const fact = <T>(value: T | null | undefined, source: FactSource | null): Fact<T> =>
   value === null || value === undefined || (typeof value === 'string' && !value.trim()) || (Array.isArray(value) && !value.length)
     ? { value: null, source: null }

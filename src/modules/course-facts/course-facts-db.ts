@@ -1,6 +1,6 @@
 import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
-import { BRIEF_KEY, CourseFacts, PEDAGOGY_DERIVATION_KEY, parseBrief, parsePedagogyDerivation, resolveCourseFacts } from './course-facts';
+import { BRIEF_KEY, CourseFacts, PEDAGOGY_DERIVATION_KEY, isPlaceholderCourseTitle, parseBrief, parsePedagogyDerivation, resolveCourseFacts } from './course-facts';
 import { suggestProfileFromContext } from '../academic-context/context-design';
 import { DESIGN_HOURS_KEY, parseProposedHours } from '../course-design/design-pins';
 
@@ -26,6 +26,24 @@ export async function loadCourseFacts(q: Q, courseId: number, courseRow?: any): 
     suggested: academic ? suggestProfileFromContext(academic.context, null).profile : null,
     proposedHours: parseProposedHours(meta[DESIGN_HOURS_KEY]),
   });
+}
+
+/**
+ * LOOP 9.2 (QA) · Un curso sin nombre propio («Curso sin título») toma el nombre que ya conoce Cursia: el del pedido o el
+ * del documento (leído, no inferido). Corre DENTRO de la transacción de quien lo llama, antes de que exista un Blueprint
+ * con ese nombre (guardar el contexto académico) o justo al aplicar el diseño. Nunca pisa un nombre propio.
+ * Devuelve el nombre adoptado (o null).
+ */
+export async function adoptCourseTitleIfPlaceholder(q: Q, courseId: number): Promise<string | null> {
+  const [course] = await q.query(`select id, title, institution_id, metadata from public.courses where id = $1`, [courseId]);
+  if (!course || !isPlaceholderCourseTitle(course.title)) return null;
+  const facts = await loadCourseFacts(q, courseId, course);
+  const f = facts.title;
+  if (!f || typeof f.value !== 'string' || (f.source !== 'document' && f.source !== 'user')) return null;
+  const t = f.value.replace(/\s+/g, ' ').trim().slice(0, 255);
+  if (!t || isPlaceholderCourseTitle(t)) return null;
+  await q.query(`update public.courses set title = $2, updated_at = now() where id = $1`, [courseId, t]);
+  return t;
 }
 
 /**
