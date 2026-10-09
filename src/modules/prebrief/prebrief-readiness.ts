@@ -59,8 +59,14 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
   for (const d of doubts) {
     b.push({ code: 'doubtful_data', title: `${DOUBT_KIND_TEXT[d.kind]} por confirmar: ${DOUBT_REASON_TEXT[d.reason]}.`, where: 'confirm', ref: d.confirmKey, text: d.text, detail: d.id });
   }
+  // LOOP 9.2 (QA): una excepción cubierta por otra de la misma limitación (p. ej. «8 videos» por «2 videos por capítulo»)
+  // no pide su propio motivo: el de la que la cubre vale para las dos (antes la propuesta mostraba dos campos).
+  const keys = new Set(model.exceptions.map((e) => e.requirementKey));
   for (const e of model.exceptions) {
-    if (!e.reason) b.push({ code: 'exception_reason', title: `Falta el motivo de la excepción: ${e.requirementText}.`, detail: `El documento pide ${e.requirementText}; el diseño tiene ${e.appliedText}.`, where: 'reason', ref: e.requirementKey });
+    if (e.reason || (e.coveredBy && keys.has(e.coveredBy))) continue;
+    const covered = model.exceptions.filter((o) => o.coveredBy === e.requirementKey).map((o) => `«${o.requirementText}»`);
+    b.push({ code: 'exception_reason', title: `Falta el motivo de la excepción: ${e.requirementText}${covered.length ? ` (el mismo motivo cubre también ${covered.join(' y ')})` : ''}.`,
+      detail: `El documento pide ${e.requirementText}; el diseño tiene ${e.appliedText}.`, where: 'reason', ref: e.requirementKey });
   }
   const missing = missingContextFields(model);
   if (missing.length) b.push({ code: 'context_incomplete', title: `Faltan datos del curso: ${missing.join(', ')}.`, where: 'understood' });
