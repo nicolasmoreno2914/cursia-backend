@@ -536,6 +536,9 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
       capability: { requirementKey: 'videos@course', requirementText: '40 videos', produces: 'Cursia produce un video por capítulo de contenido: 20 videos en este curso', coveredBy: { requirementKey: 'videos|chapter|each', requirementText: 'al menos 2 videos por capítulo' } } });
     const before = build(inp);
     eq(before.exceptions.filter((e) => e.requirementKey !== 'structure|course').map((e) => [e.requirementKey, e.reason, e.coveredBy || null]), [['videos@course', null, 'videos|chapter|each'], ['videos|chapter|each', null, null]], 'sin motivo: las dos pendientes');
+    // QA staging: la propuesta pide UN motivo (un solo campo), que dice que cubre también la otra excepción.
+    const rd0 = RD.prebriefReadiness(before, inp.card, [], []).blockers.filter((b) => b.code === 'exception_reason' && /videos/.test(b.title));
+    eq(rd0.map((b) => [b.ref, b.title]), [['videos|chapter|each', 'Falta el motivo de la excepción: al menos 2 videos por capítulo (el mismo motivo cubre también «40 videos»).']], 'un solo motivo pendiente');
     inp.exceptionReasons['videos|chapter|each'] = { reason: 'Un video por capítulo en el piloto.', requirementText: 'al menos 2 videos por capítulo', by: 'docente@demo.test', at: '2026-10-09T12:00:00.000Z' };
     const after = build(inp);
     eq(after.exceptions.filter((e) => e.requirementKey !== 'structure|course').map((e) => e.reason), ['Un video por capítulo en el piloto.', 'Un video por capítulo en el piloto.'], 'un motivo cubre las dos');

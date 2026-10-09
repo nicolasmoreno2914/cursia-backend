@@ -2208,7 +2208,9 @@ function reservationBookkeeping(ev) {
       ok(S0.status === 'draft' && S0.draft.readiness.ready === false, 'E19: borrador no preparable todavía', S0.draft.readiness);
       const exKeys = S0.draft.model.exceptions.map((e) => e.requirementKey);
       ok(exKeys.length >= 1 && S0.draft.model.exceptions.some((e) => /4 × 5/.test(e.requirementText)), 'E19: excepción «4 × 5» del documento frente al formato M', S0.draft.model.exceptions);
-      ok(S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').length === exKeys.length, 'E19: cada excepción pide su motivo');
+      // LOOP 9.2: una excepción cubierta por otra de la misma limitación no pide su propio motivo.
+      const ownKeys = S0.draft.model.exceptions.filter((e) => !(e.coveredBy && exKeys.includes(e.coveredBy))).map((e) => e.requirementKey);
+      ok(JSON.stringify(S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').map((b) => b.ref).sort()) === JSON.stringify(ownKeys.sort()), 'E19: cada excepción pide su motivo (una sola vez por limitación)');
       ok(S0.draft.model.duration.format && S0.draft.model.duration.format.code === 'M' && S0.draft.model.structure.origin === 'format', 'E19: «Formato M · Configuración seleccionada»');
       const prep0 = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
       ok(prep0.status === 409 && prep0.raw && prep0.raw.code === 'PREBRIEF_NOT_READY', 'E19: preparar sin motivos → 409 PREBRIEF_NOT_READY', { s: prep0.status, e: prep0.error });
