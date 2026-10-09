@@ -1379,6 +1379,12 @@ function reservationBookkeeping(ev) {
         const d3 = (await api('POST', `/courses/${c2}/pedagogy/dry-run`, {})).data.distribution;
         const a3 = await api('POST', `/courses/${c2}/modules/apply-distribution`, { expectedCounter: s2.structureVersionCounter, proposalSha256: d3.proposalSha256 });
         eq([a3.status < 300, a3.data && a3.data.adoptedTitle], [true, 'Contabilidad de Costos'], 'E8: «Usar este diseño» también da nombre a un curso sin nombre propio');
+        // QA staging: «Crear» rellenó el nombre del pedido con el del documento («inferido»): vale el nombre leído del documento.
+        await q(`update public.courses set title = 'Curso sin título', metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('brief', jsonb_build_object('briefVersion', 1, 'updatedAt', now()::text, 'fields', jsonb_build_object('nombre', 'Contabilidad de Costos', 'inferidos', 'nombre'))) where id = $1`, [c2]);
+        s2 = await readStructure(c2);
+        const d4 = (await api('POST', `/courses/${c2}/pedagogy/dry-run`, {})).data.distribution;
+        const a4 = await api('POST', `/courses/${c2}/modules/apply-distribution`, { expectedCounter: s2.structureVersionCounter, proposalSha256: d4.proposalSha256 });
+        eq([a4.status < 300, a4.data && a4.data.adoptedTitle], [true, 'Contabilidad de Costos'], 'E8: con el nombre del pedido rellenado desde el documento («inferido») se adopta el nombre leído del documento');
       }
       const ac = snap.course.academicContext;
       ok(ac && ac.outcomes.map((o) => o.id).join() === 'RA1,RA2,RA3,RA4,RA5,RA6' && ac.competencies.length === 2 && ac.contextSha256 === sv.data.profile.sha256, 'E8: Blueprint congela los resultados y competencias del contexto (con su huella)', ac && { o: ac.outcomes.length, sha: ac.contextSha256 });
