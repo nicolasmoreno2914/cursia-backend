@@ -13,6 +13,8 @@
  *        de contenido» y «8 videos» son excepciones de capacidad con UN solo motivo (coveredBy); ningún crítico
  *   MC7  la capacidad solo es «imposible» si el documento fija la estructura; si no, faltan videos y es un incumplimiento
  *   MC8  enfoque desde la metodología del documento (casos → ABP); la decisión del docente sigue siendo una excepción
+ *   MC14 (QA staging) las Actividades de Aplicación de las prácticas llevan el mismo nivel y el diseño queda cerca de las
+ *        horas del documento; si quedara por encima de la tolerancia, «8 horas» NO cumple (se compara con el diseño)
  *
  *   node scripts/check-loop92-microcurriculum.js   (requiere npm run build)
  */
@@ -278,6 +280,36 @@ const reqsOfText = (text) => X.requirementsFor(X.extractRequirements(T.readText(
     eq(reqsOfText('El curso tendrá 2 módulos de 2 capítulos de contenido.').map((r) => r.key), ['modules@course', 'chapters@module·each:content', 'structure@structure:content'], 'de contenido');
     const np = reqsOfText('El curso no podrá tener más de 4 módulos.')[0];
     eq([np.obligation, np.mode, np.value], ['required', 'max', 4], 'prohibición = máximo obligatorio');
+  });
+
+  await check('MC14 (QA staging) Actividades de Aplicación parejas en las prácticas; «8 horas» se compara con el diseño si se pasa', () => {
+    const app = dist.modules.map((m) => m.chapters.filter((c) => c.kind === 'practice').map((c) => c.applicationMinutes)[0]);
+    assert(app[0] !== null && app[0] === app[1], `mismo nivel en las dos prácticas (antes 120 y 30): ${JSON.stringify(app)}`);
+    assert(Math.abs(dist.estimatedHours - 8) <= 0.5 + 1e-9, `cerca de 8 h (antes 8,9–9,4 h): ${dist.estimatedHours}`);
+    // El requisito de horas frente a un diseño por encima de la tolerancia: no cumple y lo explica.
+    const over = { ...dist, status: 'above_tolerance', estimatedHours: 9.4 };
+    const hv = RA.requirementVerificationChecks(applicable, DR.compareRequirements(applicable, designOf(over, { estimatedHours: 9.4, hoursStatus: 'above_tolerance' })),
+      { status: 'above_tolerance', baseHours: 1, estimatedHours: 9.4, modules: 2, moduleExams: 2, exceptionFields: {} }).find((c) => /8 horas/.test(c.title));
+    assert(hv && hv.severity === 'critical' && /9,4 h/.test(hv.detail) && /por encima de la tolerancia/.test(hv.detail), JSON.stringify(hv));
+    // Dentro de la tolerancia sigue cumpliendo (la meta del documento).
+    const inTol = RA.requirementVerificationChecks(applicable, DR.compareRequirements(applicable, designOf(dist, { estimatedHours: dist.estimatedHours, hoursStatus: dist.status })),
+      { status: dist.status, baseHours: 1, estimatedHours: dist.estimatedHours, modules: 2, moduleExams: 2, exceptionFields: {} }).find((c) => /8 horas/.test(c.title));
+    eq(inTol.severity, 'ok', 'dentro de la tolerancia');
+    // Review QA I2: las horas elegidas por el docente siguen siendo SU meta (no se reemplazan por las estimadas).
+    const t = DR.compareRequirements(applicable, designOf(over, { estimatedHours: 9.4, hoursStatus: 'above_tolerance', hoursSource: 'user' })).find((c) => applicable.find((r) => r.id === c.requirementId).kind === 'target_hours');
+    eq([t.status, t.actual.value, t.chosenBy], ['met', 8, 'teacher'], 'meta del docente');
+    // Review QA M1: el exceso por una decisión del docente es SU excepción (no un conflicto que bloquea).
+    const tv = RA.requirementVerificationChecks(applicable, DR.compareRequirements(applicable, designOf(over, { estimatedHours: 9.4, hoursStatus: 'above_tolerance' })),
+      { status: 'above_tolerance', baseHours: 1, estimatedHours: 9.4, modules: 2, moduleExams: 2, structureByTeacher: true, exceptionFields: {} }).find((c) => /8 horas/.test(c.title));
+    eq(tv.severity, 'warning', 'excepción del docente');
+    // Review QA I1: una Actividad que agrega el mínimo del documento después del balance también queda pareja (3 × 2, 10 h).
+    const mods3 = [0, 1, 2].map((i) => ({ id: uuid(300 + i), position: i, title: 'Módulo ' + i, objective: null, description: null, exam_enabled: true }));
+    const chs3 = [];
+    mods3.forEach((m, mi) => [0, 1].forEach((ci) => chs3.push({ id: uuid(3000 + mi * 20 + ci), module_id: m.id, position: ci, title: `Capítulo ${mi}.${ci}`, objective: 'Aplicar', description: null, video_enabled: true, activity_enabled: true })));
+    const d3 = ST.distributeCourseHours({ snapshot: SNAP.buildBlueprintSnapshotV2(course, mods3, chs3), rules: null, targetHours: 10, preferences: { audiovisual: 'recommended' }, pins: null,
+      requirements: { contentChaptersPerModule: { min: 2, max: 2 }, practicePerModule: { min: 1, max: 1 }, applicationPerModule: { min: 1, max: 1 }, applicationInPractice: true, sources: {} } });
+    const apps3 = d3.modules.map((m) => m.chapters.filter((c) => c.kind === 'practice').map((c) => c.applicationMinutes)[0]);
+    assert(apps3.every((a) => a !== null && a === apps3[0]), `prácticas parejas tras los mínimos: ${JSON.stringify(apps3)} (${d3.status} ${d3.estimatedHours} h)`);
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);

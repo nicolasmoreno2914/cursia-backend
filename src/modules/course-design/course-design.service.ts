@@ -91,7 +91,7 @@ export class CourseDesignService {
     const fromDoc = approachFromMethodology(meth);
     const docHint = fromDoc && registry.has(fromDoc.id) ? fromDoc : null;
     const suggestion: ApproachSuggestion | null = docHint
-      ? { approach: docHint.id, label: registry.get(docHint.id)!.label, reasons: [`porque la metodología del documento ${docHint.strong ? 'lo indica' : 'se centra en casos y decisiones'}: «${meth.replace(/\s+/g, ' ').slice(0, 140)}${meth.length > 140 ? '…' : ''}»`], score: inferred && inferred.approach === docHint.id ? inferred.score : 1, confidence: docHint.strong ? 'alta' : 'media' }
+      ? { approach: docHint.id, label: registry.get(docHint.id)!.label, reasons: [`la metodología del documento ${docHint.strong ? 'lo indica' : 'se centra en casos y decisiones'}: «${meth.replace(/\s+/g, ' ').slice(0, 140)}${meth.length > 140 ? '…' : ''}»`], score: inferred && inferred.approach === docHint.id ? inferred.score : 1, confidence: docHint.strong ? 'alta' : 'media' }
       : inferred;
     let approachSource: 'saved' | 'recommended' | 'adjusted' | 'none' = base.primaryApproach ? 'saved' : 'none';
     if (adjust.approach && adjust.approach !== 'recommended') {
@@ -635,6 +635,8 @@ function designForRequirements(
     })),
     evaluations: dist.counts.evaluations,
     targetHours,
+    estimatedHours: dist.estimatedHours,
+    hoursStatus: dist.status,
     hoursSource,
     structureByTeacher,
     audiovisualByTeacher,

@@ -800,7 +800,10 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   seedLeftoverPractice();
   // Ajuste fino: si se pasó, bajar niveles de a uno (empezando por las aperturas) SOLO mientras el total siga
   // dentro de la tolerancia por abajo (nunca descarta un diseño válido).
-  for (const { c } of [...applicationOrder()].reverse()) {
+  // LOOP 9.2 (QA): las Actividades de los capítulos de práctica también se ajustan (al final). Antes solo se bajaban las de
+  // contenido: con «AA en el capítulo de práctica» el diseño quedaba 1,4 h por encima del objetivo (120 + 30 min).
+  const practiceApps = () => design.flatMap((m) => m.chapters.filter((c) => c.kind === 'practice').map((c) => ({ m, c })));
+  for (const { c } of [...[...applicationOrder()].reverse(), ...[...practiceApps()].reverse()]) {
     if (pinnedApp(c.id) !== undefined) continue; // review L84-5: lo fijado por el docente no se ajusta
     while (c.applicationMinutes !== null && minutes() > target + tol / 2) {
       const i = tiers.indexOf(c.applicationMinutes);
@@ -816,6 +819,28 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
       }
     }
   }
+  // LOOP 9.2 (QA): las prácticas del curso son la misma pieza en cada módulo; sus Actividades llevan el mismo nivel (antes
+  // 120 min en un módulo y 30 en otro). Se elige el nivel común más cercano al objetivo que respete topes y tolerancia;
+  // si ninguno cabe, queda como estaba. Lo fijado por el docente no se toca.
+  const balancePractice = () => {
+    const free = practiceApps().filter(({ c }) => c.applicationMinutes !== null && pinnedApp(c.id) === undefined);
+    if (free.length < 2 || free.every(({ c }) => c.applicationMinutes === free[0].c.applicationMinutes)) return;
+    const prev = free.map(({ c }) => c.applicationMinutes);
+    const restore = () => { free.forEach(({ c }, i) => { c.applicationMinutes = prev[i]; }); reEval(); };
+    let best: { t: number; dist: number } | null = null;
+    for (const t of tiers) {
+      if (free.some(({ m, c }) => t > capOf(m, c))) continue;
+      free.forEach(({ c }) => { c.applicationMinutes = t; });
+      reEval();
+      const ok = free.every(({ c }) => chapterMinutes(c.id) <= DISTRIBUTOR_RULES.maxChapterMinutes)
+        && Math.abs(minutes() - target) <= tol && applicationShare() <= policy.maxApplicationShare + 1e-9;
+      const dist = Math.abs(minutes() - target);
+      if (ok && (!best || dist < best.dist - 1e-9)) best = { t, dist };
+    }
+    restore();
+    if (best) { free.forEach(({ c }) => { c.applicationMinutes = best!.t; }); reEval(); }
+  };
+  balancePractice();
   // LOOP 8.6C · mínimos de Actividades de Aplicación del documento (por módulo y en el curso): en el capítulo que
   // integra el módulo (práctica, después cierre, después el resto), con el nivel más corto que quepa.
   const ensureApplication = (m: WorkModule): boolean => {
@@ -825,6 +850,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   };
   if (appModuleMin > 0) for (const m of design) while (appCount(m.chapters) < appModuleMin && ensureApplication(m));
   if (appTotalMin > 0) for (const m of design) { if (appTotal() >= appTotalMin) break; while (appTotal() < appTotalMin && ensureApplication(m)); }
+  // Review QA I1: los mínimos del documento pueden haber agregado Actividades en prácticas: se vuelven a emparejar.
+  balancePractice();
 
   for (const m of design) for (const c of m.chapters) {
     const had = initialMinutes.get(c.id) ?? null;

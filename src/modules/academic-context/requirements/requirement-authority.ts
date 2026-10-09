@@ -591,6 +591,15 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
         detail: `Te estás apartando de un requisito del documento: el documento pide ${asked}; elegiste ${has2}. Cursia respeta tu decisión.`, fix });
       continue;
     }
+    // Review QA M1: el diseño se pasa de las horas del documento por una decisión del docente (estructura, fijados o
+    // «Ajustar»): es SU excepción, no un conflicto del documento.
+    const efs = ctx.exceptionFields || {};
+    if (r.kind === 'target_hours' && ctx.status === 'above_tolerance' && (ctx.structureByTeacher || ctx.teacherPins || Object.keys(efs).length > 0)) {
+      out.push({ id, area: 'requirements', severity: 'warning', title: `Excepción al requisito del documento: ${asked}`,
+        detail: `Te estás apartando de un requisito del documento: con lo que decidiste en el diseño, el curso queda en ≈ ${n1(ctx.estimatedHours)} h (el documento pide ${asked}). Cursia respeta tu decisión.`,
+        fix: { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' } });
+      continue;
+    }
     // Conflicto: Cursia no lo resuelve sola. Se explica la causa cuando hay otro requisito que choca.
     let cause = '';
     const mods = has('modules');
@@ -604,6 +613,9 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
       cause = ` Entra en conflicto con «${requirementText(st)}»: esa estructura ya suma ≈ ${n1(ctx.baseHours)} h de trabajo del estudiante.`;
     } else if (r.kind === 'target_hours' && st && ctx.status === 'cannot_reach_target') {
       cause = ` Entra en conflicto con «${requirementText(st)}»: con esa estructura el curso llega a ≈ ${n1(ctx.estimatedHours)} h sin rellenar.`;
+    } else if (r.kind === 'target_hours' && ctx.status === 'above_tolerance') {
+      const why = has('structure') || has('chapters') || has('application_activities') || has('activities');
+      cause = ` Con ${why ? `lo que exige «${requirementText(why)}»` : 'la estructura y las actividades del diseño'} el curso queda en ≈ ${n1(ctx.estimatedHours)} h, por encima de la tolerancia. Cursia no quita capítulos ni actividades por su cuenta: decide si se ajustan las horas o la estructura.`;
     } else if (r.kind === 'evaluations' && r.evaluationType === 'partial' && mods && (mods.value as number) !== r.value) {
       cause = ` Entra en conflicto con «${requirementText(mods)}»: Cursia hace una evaluación por módulo; con ${n1(mods.value as number)} módulos no hay ${asked} sin que alguno quede sin evaluación (o con dos).`;
     } else if (c.note && /^El diseño no tiene módulo \d+/.test(c.note)) {
