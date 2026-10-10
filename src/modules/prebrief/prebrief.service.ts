@@ -14,6 +14,7 @@ import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
 import { readStructureOrigin } from '../course-structure/structure-authority';
+import { contentCoverage, readContentMap } from '../academic-context/content-coverage';
 import { actualText, requirementText, structureEditedByTeacher } from '../academic-context/requirements/requirement-authority';
 import { lqaFindings, lqaHitLabel } from '../language-qa/language-qa';
 import { COURSE_FORMATS, COURSE_FORMAT_CODES, COURSE_FORMAT_CATALOG_VERSION, CourseFormatCode, formatDef, isCourseFormatCode, readCourseFormat, writeCourseFormat } from './course-formats';
@@ -108,6 +109,16 @@ export class PrebriefService {
     return { ...(row && row.metadata ? parse(row.metadata) : {}), __createdAtMs: row && row.created_ms !== null ? Number(row.created_ms) : null };
   }
 
+  /** Fase 3: cobertura de los contenidos del documento contra la estructura viva (null sin mapa o de otra versión). */
+  private async contentCoverageOf(q: Q, courseId: number, academic: { version: number; context: any } | null): Promise<{ total: number; covered: number } | null> {
+    if (!academic) return null;
+    const map = await readContentMap(q as any, courseId);
+    if (!map) return null;
+    const live = await q.query(`select id from public.course_chapters where course_id = $1`, [courseId]);
+    const cov = contentCoverage(academic.context, academic.version, map, live.map((r: any) => String(r.id)));
+    return cov.available && !cov.stale ? { total: cov.total, covered: cov.covered } : null;
+  }
+
   // ── Borrador ────────────────────────────────────────────────────────────────────────────────────────────────
 
   /** El Prebrief que se prepararía AHORA (mismos datos que ven Entendimos y Diseño). Solo lectura, USD 0. */
@@ -151,6 +162,8 @@ export class PrebriefService {
       card,
       format,
       structureSource: byTeacher ? 'teacher' : origin && origin.source === 'academic_context' ? 'document' : 'cursia',
+      structureChoice: origin && origin.choice ? origin.choice : null,
+      contentCoverage: await this.contentCoverageOf(q, courseId, academic),
       exceptionReasons: (meta[EXCEPTION_REASONS_KEY] && typeof meta[EXCEPTION_REASONS_KEY] === 'object' ? meta[EXCEPTION_REASONS_KEY] : {}) as Record<string, StoredExceptionReason>,
       approachInfo: ap ? { summary: ap.summary || null, cycle } : null,
       alignContext: (ctx) => alignCourseContextWithSnapshot(ctx, learner).context,

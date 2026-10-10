@@ -591,7 +591,9 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         // Solo si el objeto de la negación es el sustantivo («No se requieren videos»), no algo en otra parte de la frase.
         const nn = new RegExp(`(?:no se requieren?|no (?:se )?(?:incluira|tendra|debera incluir|deben incluir|debe incluir|deben tener|debe tener))\\s+(?:[a-z]+\\s+)?${NOUN_SRC}\\b`).exec(m);
         const k = nn && nounKind(nn[1]);
-        if (k && k.kind !== 'target_hours') mentions = [{ kind: k.kind, value: 0, mode: 'max', scope: { level: 'course' }, index: 0, end: 0, raw: m }];
+        // LOOP 9.2 (QA): «no tendrá evaluación final» es «sin evaluación final», no «ninguna evaluación».
+        const et = k && k.kind === 'evaluations' && nn ? (/^\s*final/.test(m.slice(nn.index + nn[0].length)) ? 'final' as const : /^\s*parcial/.test(m.slice(nn.index + nn[0].length)) ? 'partial' as const : k.evaluationType) : undefined;
+        if (k && k.kind !== 'target_hours') mentions = [{ kind: k.kind, value: 0, mode: 'max', scope: { level: 'course' }, index: 0, end: 0, raw: m, ...(et ? { evaluationType: et } : {}) }];
       }
       if (inferred && !mentions.some((x) => x.kind === 'target_hours')) {
         mentions.push({ kind: 'target_hours', value: inferred, mode: 'exact', scope: { level: 'course' }, index: 0, end: 0, raw: 'inferred' });

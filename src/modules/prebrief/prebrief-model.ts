@@ -68,6 +68,11 @@ export interface PrebriefRequirement {
 export interface PrebriefException {
   /** LOOP 9.2: misma limitación que otra excepción (misma frase del documento): su motivo cubre esta. */
   coveredBy?: string;
+  /**
+   * LOOP 9.2 (capacidades): requisito que Cursia NO cubre con su capacidad actual (no una decisión del docente). Sin la
+   * aceptación de la institución es «Requisito no cubierto»; con ella, «Excepción aceptada». Solo presente si es true.
+   */
+  capability?: true;
   requirementKey: string;
   requirementText: string;
   appliedText: string;
@@ -122,6 +127,10 @@ export interface PrebriefModel {
   };
   structure: {
     origin: PrebriefOrigin;
+    /** Fase 2: cómo se eligió la forma en «¿Cómo quieres estructurar tu curso?» (solo si se eligió ahí). */
+    selected?: { choice: 'document' | 'cursia' | 'format' | 'custom'; label: string };
+    /** Fase 3: contenidos del documento que están en el diseño (solo si la estructura salió del documento). */
+    contents?: { total: number; covered: number };
     modules: PrebriefModule[];
     totals: { modules: number; chapters: number; contentChapters: number; practiceChapters: number; hours: number };
   };
@@ -185,6 +194,10 @@ export interface PrebriefInputs {
   format: StoredCourseFormat | null;
   /** Origen de la estructura (8.0): 'document' si la armó Cursia desde el documento. */
   structureSource: 'document' | 'cursia' | 'teacher';
+  /** Fase 2: elección del paso «Estructura» (null en cursos que no pasaron por él). */
+  structureChoice?: 'document' | 'cursia' | 'format' | 'custom' | null;
+  /** Fase 3: cobertura de los contenidos del documento (null sin mapa de trazabilidad). */
+  contentCoverage?: { total: number; covered: number } | null;
   exceptionReasons: Record<string, StoredExceptionReason>;
   /** Definición del enfoque (registro): resumen y directivas reales (texto). */
   approachInfo: { summary: string | null; cycle: string[] } | null;
@@ -267,16 +280,28 @@ export function canonicalModelJson(m: PrebriefModel): string {
  * del enfoque, texto de los requisitos, etiquetas de decisiones): mejorar un texto en un deploy no invalida aprobaciones.
  * Lo redactado queda archivado en el documento de cada versión.
  */
+/** Quién decidió la forma, en palabras del cliente. */
+export const STRUCTURE_CHOICE_LABEL: Record<'document' | 'cursia' | 'format' | 'custom', string> = {
+  document: 'Según el documento',
+  cursia: 'Recomendada por Cursia',
+  format: 'Formato elegido por la institución',
+  custom: 'Elegida por la institución',
+};
+
 export function hashProjection(m: PrebriefModel): unknown {
   const c = JSON.parse(JSON.stringify(m)) as PrebriefModel;
   c.pedagogy.cycle = [];
   if (c.pedagogy.approach) { c.pedagogy.approach.summary = null; (c.pedagogy.approach as any).value = c.pedagogy.approach.id; }
   c.observations = c.observations.map((o) => ({ id: o.id, text: '' }));
   c.requirements.items = c.requirements.items.map((i) => ({ ...i, text: '', detail: null, actual: null }));
-  c.exceptions = c.exceptions.map((e) => ({ ...e, requirementText: '', appliedText: '' }));
+  // LOOP 9.2 (review I1): `capability` se deriva de Verificación (no cambia lo aprobado): fuera de la huella.
+  c.exceptions = c.exceptions.map((e) => { const { capability: _cap, ...rest } = e; return { ...rest, requirementText: '', appliedText: '' }; });
   c.decisions = c.decisions.map((d) => ({ ...d, label: '', value: '' })); // el código crudo (`code`) sí entra
   c.course.modality = { ...c.course.modality, value: '' };
   if (c.duration.format) c.duration.format = { ...c.duration.format, value: '' };
+  // Fase 2/3: la elección (código) sí entra; la etiqueta y la cobertura (derivada de la estructura, ya en la huella) no.
+  if (c.structure.selected) c.structure.selected = { ...c.structure.selected, label: '' };
+  delete c.structure.contents;
   return c;
 }
 
@@ -284,7 +309,7 @@ export function prebriefModelSha(m: PrebriefModel): string {
   return createHash('sha256').update(JSON.stringify(sortKeysDeep(hashProjection(m)))).digest('hex');
 }
 
-const EXCEPTION_TITLE_RE = /^Excepción al requisito del documento/;
+const EXCEPTION_TITLE_RE = /^(Excepción al requisito del documento|Requisito no cubierto por Cursia)/;
 
 /** Texto del requisito y lo que tiene el diseño, tal como los presenta Verificación. */
 function requirementTexts(card: any): Map<string, { text: string; actual: string | null; detail: string | null }> {
@@ -434,6 +459,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
         requirementKey: String(r.key), requirementText: text, appliedText: actual || (vcheck && vcheck.capability ? clean(vcheck.capability.produces) : '—'),
         reason: valid ? clean(saved.reason) : null, by: valid ? saved.by : null, at: valid ? saved.at : null,
         ...(cov ? { coveredBy: String(cov.requirementKey) } : {}),
+        ...(vcheck && vcheck.capability ? { capability: true as const } : {}),
       });
     }
   }
@@ -545,7 +571,13 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       format: fdef ? { value: fdef.label, origin: 'format', code: fdef.code, modules: fdef.modules, chaptersPerModule: fdef.chaptersPerModule, hoursMin: fdef.hoursMin, hoursMax: fdef.hoursMax } : null,
       credits,
     },
-    structure: { origin: structureOrigin, modules, totals },
+    structure: {
+      origin: structureOrigin,
+      ...(inp.structureChoice ? { selected: { choice: inp.structureChoice, label: STRUCTURE_CHOICE_LABEL[inp.structureChoice] } } : {}),
+      ...(inp.contentCoverage && inp.contentCoverage.total > 0 ? { contents: { total: inp.contentCoverage.total, covered: inp.contentCoverage.covered } } : {}),
+      modules,
+      totals,
+    },
     evaluation,
     resources,
     requirements: {
@@ -589,6 +621,8 @@ export function diffModels(prev: PrebriefModel, next: PrebriefModel): string[] {
   } else if (!eq(prev.structure.modules, next.structure.modules)) {
     out.push('Estructura: cambiaron títulos, horas o recursos de algunos capítulos');
   }
+  const chosen = (m: PrebriefModel) => (m.structure.selected ? m.structure.selected.label : 'sin elegir');
+  if ((prev.structure.selected ? prev.structure.selected.choice : null) !== (next.structure.selected ? next.structure.selected.choice : null)) out.push(`Diseño seleccionado: ${chosen(prev)} → ${chosen(next)}`);
   if (!eq(prev.goals.outcomes.map((o) => o.text), next.goals.outcomes.map((o) => o.text))) out.push('Resultados de aprendizaje');
   if (!eq(prev.goals.competencies, next.goals.competencies)) out.push('Competencias');
   if (!eq(prev.goals.generalObjective, next.goals.generalObjective)) out.push('Objetivo general');

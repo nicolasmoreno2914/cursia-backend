@@ -31,6 +31,10 @@ export interface PrebriefBlocker {
   ref?: string;
   /** Texto del dato dudoso (para mostrarlo al confirmar). */
   text?: string;
+  /** LOOP 9.2 (capacidades): requisito que Cursia no cubre; se resuelve con la aceptación de la institución. */
+  capability?: true;
+  /** Texto sugerido para la aceptación (el docente lo revisa y lo guarda; nunca se guarda solo). */
+  suggestion?: string;
 }
 
 export interface PrebriefReadiness {
@@ -65,7 +69,12 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
   for (const e of model.exceptions) {
     if (e.reason || (e.coveredBy && keys.has(e.coveredBy))) continue;
     const covered = model.exceptions.filter((o) => o.coveredBy === e.requirementKey).map((o) => `«${o.requirementText}»`);
-    b.push({ code: 'exception_reason', title: `Falta el motivo de la excepción: ${e.requirementText}${covered.length ? ` (el mismo motivo cubre también ${covered.join(' y ')})` : ''}.`,
+    if (e.capability) {
+      // LOOP 9.2 (capacidades): requisito no cubierto → solo se continúa si la institución acepta la diferencia.
+      b.push({ code: 'exception_reason', capability: true, title: `Requisito no cubierto: ${e.requirementText}${covered.length ? ` (también ${covered.join(' y ')})` : ''}. Para continuar, la institución debe aceptar la diferencia.`,
+        detail: `El microcurrículo solicita ${e.requirementText}. Actualmente, ${e.appliedText}.`, where: 'reason', ref: e.requirementKey,
+        suggestion: `Se acepta la propuesta de Cursia: ${e.appliedText.replace(/^Cursia (contempla|produce|diseña) /, '')}, en lugar de lo solicitado en el documento: ${e.requirementText}${covered.length ? ` (${covered.join(' y ')})` : ''}.` });
+    } else b.push({ code: 'exception_reason', title: `Falta el motivo de la excepción: ${e.requirementText}${covered.length ? ` (el mismo motivo cubre también ${covered.join(' y ')})` : ''}.`,
       detail: `El documento pide ${e.requirementText}; el diseño tiene ${e.appliedText}.`, where: 'reason', ref: e.requirementKey });
   }
   const missing = missingContextFields(model);

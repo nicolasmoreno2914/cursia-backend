@@ -15,6 +15,9 @@
  *   MC8  enfoque desde la metodología del documento (casos → ABP); la decisión del docente sigue siendo una excepción
  *   MC16 (Fase 1 · «Pegar información») el MISMO microcurrículo pegado como texto (sin tablas ni estilos) da el mismo
  *        contexto y los mismos requisitos que el DOCX: nombre («Nombre» y valor en la línea siguiente), RA, unidades, horas
+ *   MC15 (capacidades) Cursia recomienda solo lo que produce hoy; lo que el documento pida por encima (2 videos / 2 H5P /
+ *        2 AA por capítulo, más videos de los que caben, más parciales que módulos, 2 finales, 2 evaluaciones por módulo,
+ *        más de 500 h) es «Requisito no cubierto por Cursia» con lo que SÍ queda previsto; «sin evaluación final» se lee bien
  *   MC14 (QA staging) las Actividades de Aplicación de las prácticas llevan el mismo nivel y el diseño queda cerca de las
  *        horas del documento; si quedara por encima de la tolerancia, «8 horas» NO cumple (se compara con el diseño)
  *
@@ -133,7 +136,9 @@ const reqsOfText = (text) => X.requirementsFor(X.extractRequirements(T.readText(
     eq(ex.map((c) => c.capability.requirementKey).sort(), ['videos@chapter·each:content', 'videos@course'], 'dos excepciones de capacidad');
     const total = ex.find((c) => c.capability.requirementKey === 'videos@course');
     eq(total.capability.coveredBy, { requirementKey: 'videos@chapter·each:content', requirementText: '2 videos por capítulo de contenido' }, 'un solo motivo');
-    assert(/4 videos en este curso/.test(total.capability.produces), total.capability.produces);
+    // LOOP 9.2 (capacidades): «solicita / contempla» con lo que SÍ queda previsto; título «Requisito no cubierto por Cursia».
+    eq(total.capability.produces, 'Cursia contempla 1 video por capítulo de contenido (4 videos previstos en total)', 'lo que Cursia contempla');
+    assert(/^Requisito no cubierto por Cursia: 8 videos$/.test(total.title) && /^El microcurrículo solicita 8 videos\. Actualmente, Cursia contempla 1 video por capítulo de contenido \(4 videos previstos en total\)\. No se puede presentar como cumplido/.test(total.detail), JSON.stringify([total.title, total.detail]));
     eq(v.filter((c) => c.severity === 'ok').length, 11, 'los otros 11 requisitos cumplen');
   });
 
@@ -330,6 +335,42 @@ const reqsOfText = (text) => X.requirementsFor(X.extractRequirements(T.readText(
     for (const a of [['Evaluación', 'Nombre', 'Porcentaje'], ['Bibliografía', 'Nombre', 'Autor'], ['Integrantes del grupo', 'Nombre', 'María López'], ['Datos de contacto', 'Nombre', 'Ana Ruiz']]) eq(await subj(a), null, a[0]);
     eq(await subj(['Datos de contacto', 'Nombre', 'Ana Ruiz', 'Asignatura: Contabilidad de costos']), 'Contabilidad de costos', 'la clave explícita gana');
     eq(await subj(['Ficha', 'Nombre: Ana Ruiz', 'Nombre del curso: Excel básico']), 'Excel básico', '«Nombre del curso» gana a «Nombre:»');
+  });
+
+  await check('MC15 (capacidades) nunca se recomienda lo que Cursia no produce; lo pedido por encima es «Requisito no cubierto por Cursia»', () => {
+    const base = ['El curso tendrá exactamente 2 módulos.', 'Cada módulo tendrá exactamente 2 capítulos de contenido.'];
+    const mods2 = [0, 1].map((i) => ({ id: uuid(700 + i), position: i, title: 'M' + i, objective: null, description: null, exam_enabled: true }));
+    const chs2 = [];
+    mods2.forEach((m, mi) => [0, 1].forEach((ci) => chs2.push({ id: uuid(7000 + mi * 20 + ci), module_id: m.id, position: ci, title: `C${mi}${ci}`, objective: 'Aplicar', description: null, video_enabled: true, activity_enabled: true })));
+    const run = (extra, hours = 'El curso tendrá 8 horas de trabajo del estudiante.') => {
+      const app = reqsOfText([...base, hours, ...extra].join('\n'));
+      const req = app.filter((r) => r.obligation === 'required' && r.confidence === 'high');
+      const d = ST.distributeCourseHours({ snapshot: SNAP.buildBlueprintSnapshotV2(course, mods2, chs2), rules: null, targetHours: 8, preferences: { audiovisual: 'recommended' }, pins: null, requirements: RA.constraintsFor(req, {}) });
+      const v = RA.requirementVerificationChecks(app, DR.compareRequirements(app, designOf(d, { estimatedHours: d.estimatedHours, hoursStatus: d.status })), { status: d.status, baseHours: 1, estimatedHours: d.estimatedHours, modules: 2, moduleExams: 2, exceptionFields: {} });
+      return { d, v, cap: v.filter((c) => c.capability).map((c) => [c.title, c.capability.produces]) };
+    };
+    const expectCap = (extra, title, produces, hours) => { const r = run(extra, hours); eq(r.cap, [[title, produces]], title); return r; };
+    expectCap(['Cada capítulo de contenido tendrá 2 actividades interactivas H5P.'], 'Requisito no cubierto por Cursia: 2 actividades interactivas por capítulo', 'Cursia contempla 1 actividad interactiva por capítulo (4 actividades interactivas previstas en total)');
+    const aa2 = run(['Cada capítulo tendrá 2 Actividades de Aplicación.']).cap;
+    assert(aa2.length === 1 && aa2[0][0] === 'Requisito no cubierto por Cursia: 2 Actividades de Aplicación por capítulo'
+      && /^Cursia contempla como máximo 1 Actividad de Aplicación por capítulo \(\d+ Actividades? de Aplicación previstas? en total\)$/.test(aa2[0][1]), JSON.stringify(aa2));
+    expectCap(['El curso tendrá 3 evaluaciones parciales.'], 'Requisito no cubierto por Cursia: 3 evaluaciones parciales', 'Cursia contempla 1 evaluación por módulo (2 evaluaciones parciales previstas en total)');
+    expectCap(['El curso tendrá 2 evaluaciones finales.'], 'Requisito no cubierto por Cursia: 2 evaluaciones finales', 'Cursia contempla como máximo 1 evaluación final');
+    expectCap(['Cada módulo tendrá 2 evaluaciones.'], 'Requisito no cubierto por Cursia: 2 evaluaciones por módulo', 'Cursia contempla 1 evaluación por módulo (2 evaluaciones parciales previstas en total)');
+    expectCap([], 'Requisito no cubierto por Cursia: 600 horas', 'Cursia diseña cursos de 1 a 500 horas de trabajo del estudiante', 'El curso tendrá 600 horas de trabajo del estudiante.');
+    // Más videos de los que caben: Cursia pone el máximo que produce (video en TODOS los capítulos de contenido), nunca menos.
+    const v5 = expectCap(['El curso tendrá 5 videos.'], 'Requisito no cubierto por Cursia: 5 videos', 'Cursia contempla 1 video por capítulo de contenido (4 videos previstos en total)');
+    eq(v5.d.counts.videoChapters, 4, 'el máximo que Cursia produce');
+    // Review I3: más videos por módulo que capítulos de contenido fija el documento; horas en rango por encima de 500.
+    expectCap(['Cada módulo tendrá 3 videos.'], 'Requisito no cubierto por Cursia: 3 videos por módulo', 'Cursia contempla 1 video por capítulo de contenido (4 videos previstos en total)');
+    expectCap([], 'Requisito no cubierto por Cursia: 600–700 horas', 'Cursia diseña cursos de 1 a 500 horas de trabajo del estudiante', 'El curso tendrá entre 600 y 700 horas de trabajo del estudiante.');
+    // Lo que Cursia sí produce no es «no cubierto»: 3 capítulos de práctica por módulo o 1 parcial por módulo se diseñan.
+    eq(run(['Cada módulo tendrá 3 capítulos de práctica.']).cap, [], 'práctica: dentro de la capacidad');
+    eq(run(['El curso tendrá 2 evaluaciones parciales y 1 evaluación final.']).cap, [], 'evaluaciones: dentro de la capacidad');
+    // «no tendrá evaluación final» → sin evaluación final (no «ninguna evaluación»).
+    const nf = reqsOfText('El curso no tendrá evaluación final.');
+    eq(nf.map((r) => [r.key, r.mode, r.value]), [['evaluations@course#final', 'max', 0]], 'sin evaluación final');
+    eq(RA.requirementText(nf[0]), 'sin evaluación final', 'texto');
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);

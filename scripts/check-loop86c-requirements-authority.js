@@ -183,8 +183,9 @@ const aaPerModule = (d) => d.modules.map((m) => m.chapters.filter((c) => c.appli
     eq(by('modules').severity, 'ok', 'módulos');
     // LOOP 9 (P0-2): lo que Cursia no puede producir es una excepción explícita (con motivo en la propuesta), no un crítico sin salida.
     eq(by('videos').severity, 'warning', '2 videos por capítulo: Cursia no puede → excepción');
-    assert(/^Excepción al requisito del documento/.test(by('videos').title), by('videos').title);
-    assert(/un video por capítulo/.test(by('videos').detail) && /motivo/.test(by('videos').detail), 'con la razón y el motivo pendiente');
+    // LOOP 9.2 (capacidades): «Requisito no cubierto por Cursia» con lo que Cursia contempla y la aceptación pendiente.
+    assert(/^Requisito no cubierto por Cursia/.test(by('videos').title), by('videos').title);
+    assert(/1 video por capítulo/.test(by('videos').detail) && /aceptar esta diferencia/.test(by('videos').detail), 'con lo que Cursia contempla y la aceptación pendiente');
     const partial = by('evaluations', 'partial');
     eq(partial.severity, 'critical', '3 parciales con 4 módulos');
     assert(/Entra en conflicto con «4 módulos»/.test(partial.detail) && /El documento pide 3 evaluaciones parciales; el diseño tiene 4 evaluaciones parciales/.test(partial.detail), partial.detail);

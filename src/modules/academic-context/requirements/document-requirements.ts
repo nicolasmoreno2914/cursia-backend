@@ -290,6 +290,9 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
   const chapters = mods.flatMap((m) => m.chapters);
   const proposedStructure = chapters.some((c) => c.proposed);
   const structureBy: RequirementChooser = d.structureByTeacher && !proposedStructure ? 'teacher' : 'cursia';
+  // Fase 2/4: para requisitos solo de CONTENIDO, una práctica propuesta por Cursia no cambia quién decidió (las prácticas
+  // no cuentan ahí): con la forma de la institución y sin capítulos de contenido propuestos, la decisión es de ella.
+  const contentBy: RequirementChooser = d.structureByTeacher && !chapters.some((c) => c.proposed && c.kind !== 'practice') ? 'teacher' : 'cursia';
   // Review L86C M8: los capítulos que propone Cursia no cambian cuántos módulos hay: la cantidad de módulos es del docente
   // si él armó la estructura, aunque el diseño agregue capítulos.
   const modulesBy: RequirementChooser = d.structureByTeacher ? 'teacher' : 'cursia';
@@ -306,6 +309,9 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
   const out: RequirementCheck[] = [];
   const nv = (r: DocumentRequirement, note: string, chosenBy: RequirementChooser = 'cursia', impossible = false) =>
     out.push({ requirementId: r.id, status: 'not_verifiable', actual: {}, chosenBy, note, ...(impossible ? { impossible: true as const } : {}) });
+  // LOOP 9.2 (capacidades): lo pedido está fuera de lo que Cursia produce hoy → no cubierto, con lo que SÍ queda previsto.
+  const cap = (r: DocumentRequirement, note: string, planned: number | null) =>
+    out.push({ requirementId: r.id, status: 'not_verifiable', actual: planned === null ? {} : { value: planned }, chosenBy: 'cursia', note, impossible: true });
   // Review L86C M5: un requisito de un módulo que el diseño no tiene NO se cumple (no es «no verificable»).
   const missingModule = (r: DocumentRequirement, n: number, chosenBy: RequirementChooser) =>
     out.push({ requirementId: r.id, status: 'unmet', actual: { value: 0 }, chosenBy, note: `El diseño no tiene módulo ${n}.` });
@@ -338,7 +344,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
       // LOOP 9.2: «N × M capítulos de contenido» compara solo contenido (las prácticas van aparte); sin «de contenido», todos.
       const compared = 'chapterKind' in s && s.chapterKind === 'content' ? shape.map((n, i) => n - practice[i]) : shape;
       const ok = !!r.shape && r.shape.length === compared.length && r.shape.every((n, i) => n === compared[i]);
-      out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { shape, practice }, chosenBy: structureBy });
+      out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { shape, practice }, chosenBy: 'chapterKind' in s && s.chapterKind === 'content' ? contentBy : structureBy });
       continue;
     }
     if (r.value === null || r.value === undefined) { nv(r, 'Sin cantidad.'); continue; }
@@ -352,7 +358,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
         // LOOP 9.2: «capítulos de contenido» / «capítulos de práctica» cuentan solo los de ese tipo.
         const ck = (s as { chapterKind?: 'practice' | 'content' }).chapterKind;
         const ofKind = (cs: { kind: string }[]) => (ck ? cs.filter((c) => (ck === 'practice' ? c.kind === 'practice' : c.kind !== 'practice')).length : cs.length);
-        const by = ck === 'practice' ? practiceBy : structureBy;
+        const by = ck === 'practice' ? practiceBy : ck === 'content' ? contentBy : structureBy;
         if (s.level === 'course') one(r, ofKind(chapters), by);
         else if (s.level === 'module' && isEach) each(r, mods.map((m) => ofKind(m.chapters)), by);
         else if (s.level === 'module' && 'index' in s) {
@@ -362,7 +368,10 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
         break;
       }
       case 'target_hours':
-        if (s.level === 'course') {
+        // LOOP 9.2 (capacidades): Cursia diseña cursos de 1 a 500 horas.
+        if (s.level === 'course' && typeof r.value === 'number' && (r.mode === 'exact' || r.mode === 'min' || r.mode === 'range') && r.value > 500) {
+          cap(r, 'Cursia diseña cursos de hasta 500 horas de trabajo del estudiante.', null);
+        } else if (s.level === 'course') {
           if (typeof d.targetHours !== 'number') nv(r, 'El diseño todavía no tiene horas.', hoursBy);
           // Review QA I2/M2: solo cuando las horas no las eligió el docente (su meta sigue siendo SU decisión), y con el estado
           // del distribuidor (no con el redondeo a un decimal): por encima de la tolerancia no cumple.
@@ -386,17 +395,22 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
           const designContent = chapters.filter((c) => c.kind !== 'practice').length;
           // Review C2 (2.ª): imposible cuando el diseño, con un video por capítulo de contenido, no puede llegar.
           if (videoCapacity !== null && need > videoCapacity && vids(chapters) < need && need > designContent) {
-            out.push({ requirementId: r.id, status: 'not_verifiable', actual: { value: designContent }, chosenBy: 'cursia', impossible: true,
-              note: `Cursia produce un video por capítulo de contenido: con la estructura que exige el documento (${videoCapacity} capítulos de contenido) el máximo es ${videoCapacity} videos.` });
+            cap(r, `Cursia produce un video por capítulo de contenido: con la estructura que exige el documento (${videoCapacity} capítulos de contenido) el máximo es ${videoCapacity} videos.`, vids(chapters.filter((ch) => ch.kind !== 'practice')));
           } else one(r, vids(chapters), videosBy);
         }
-        else if (s.level === 'module' && isEach) each(r, mods.map((m) => vids(m.chapters)), videosBy);
+        else if (s.level === 'module' && isEach) {
+          // LOOP 9.2 (review I3): más videos por módulo que capítulos de contenido fija el documento → no cubierto.
+          const perMod = perModMax.length ? Math.min(...perModMax) : null;
+          const needM = r.mode === 'max' ? 0 : r.value;
+          if (perMod !== null && needM > perMod && mods.some((m) => vids(m.chapters) < needM)) cap(r, `Cursia produce un video por capítulo de contenido: con los ${perMod} capítulos de contenido por módulo que exige el documento el máximo es ${perMod} por módulo.`, vids(chapters.filter((ch) => ch.kind !== 'practice')));
+          else each(r, mods.map((m) => vids(m.chapters)), videosBy);
+        }
         else if (s.level === 'chapter' && isEach) {
           // Cursia produce como mucho un video por capítulo.
           if (r.mode === 'max' || r.value <= 1) {
             const target = chapters.filter((c) => (s.chapterKind ? c.kind === s.chapterKind : c.kind !== 'practice'));
             each(r, target.map((c) => (c.videoEnabled ? 1 : 0)), videosBy);
-          } else nv(r, 'Cursia produce un video por capítulo: no puede cumplir más de uno por capítulo todavía.', 'cursia', true);
+          } else cap(r, 'Cursia produce un video por capítulo: no puede cumplir más de uno por capítulo todavía.', vids(chapters.filter((ch) => ch.kind !== 'practice')));
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       }
@@ -410,7 +424,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
             // Las prácticas también llevan Actividad de Aplicación (a diferencia del video, que es de los capítulos de contenido).
             const target = chapters.filter((c) => (s.chapterKind ? c.kind === s.chapterKind : true));
             each(r, target.map((c) => (c.applicationMinutes ? 1 : 0)), appBy);
-          } else nv(r, 'Cursia diseña como mucho una Actividad de Aplicación por capítulo.', 'cursia', true);
+          } else cap(r, 'Cursia diseña como mucho una Actividad de Aplicación por capítulo.', aa(chapters));
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       }
@@ -424,16 +438,29 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
           if (r.mode === 'max' || r.value <= 1) {
             const target = chapters.filter((c) => (s.chapterKind ? (s.chapterKind === 'practice' ? c.kind === 'practice' : c.kind !== 'practice') : true));
             each(r, target.map((c) => (c.activityEnabled ? 1 : 0)), activityBy);
-          } else nv(r, 'Cursia produce una actividad interactiva por capítulo: no puede cumplir más de una por capítulo todavía.', 'cursia', true);
+          } else cap(r, 'Cursia produce una actividad interactiva por capítulo: no puede cumplir más de una por capítulo todavía.', ac(chapters));
         } else nv(r, 'Cursia todavía no mide este alcance en el diseño.');
         break;
       }
-      case 'evaluations':
-        if (s.level !== 'course') nv(r, 'Cursia todavía no mide este alcance en el diseño.');
-        else if (r.evaluationType === 'partial') one(r, modExams, structureBy);
-        else if (r.evaluationType === 'final') one(r, finalExam, structureBy);
+      case 'evaluations': {
+        // LOOP 9.2 (capacidades): Cursia hace una evaluación por módulo y como máximo una final. Lo que el documento pida por
+        // encima (con los módulos que el propio documento fija) no está cubierto.
+        const need = r.mode === 'max' ? 0 : r.value;
+        const fixedMods = modsMax.length ? Math.min(...modsMax) : null;
+        if (s.level === 'module' && isEach) {
+          if (need > 1) cap(r, 'Cursia hace una evaluación por módulo: no puede hacer más de una por módulo.', modExams);
+          else each(r, mods.map((m) => (m.examEnabled ? 1 : 0)), structureBy);
+        } else if (s.level !== 'course') nv(r, 'Cursia todavía no mide este alcance en el diseño.');
+        else if (r.evaluationType === 'final') {
+          if (need > 1) cap(r, 'Cursia hace como máximo una evaluación final.', finalExam);
+          else one(r, finalExam, structureBy);
+        } else if (r.evaluationType === 'partial') {
+          if (fixedMods !== null && need > fixedMods && modExams < need) cap(r, `Cursia hace una evaluación por módulo: con los ${fixedMods} módulos que exige el documento el máximo es ${fixedMods}.`, modExams);
+          else one(r, modExams, structureBy);
+        } else if (fixedMods !== null && need > fixedMods + 1 && d.evaluations < need) cap(r, `Cursia hace una evaluación por módulo y una final: con los ${fixedMods} módulos que exige el documento el máximo es ${fixedMods + 1}.`, d.evaluations);
         else one(r, d.evaluations, structureBy);
         break;
+      }
       default:
         nv(r, 'Cursia todavía no mide este requisito en el diseño.');
     }
