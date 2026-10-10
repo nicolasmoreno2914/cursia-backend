@@ -79,6 +79,19 @@ export function priorKnowledgeFromBrief(nivel: string | undefined): 'none' | 'in
 // propone el documento cuenta como del documento (cursos anteriores a 8.1 que usaron «Usar en el perfil»).
 
 export const PEDAGOGY_DERIVATION_KEY = 'pedagogyDerivation';
+/** Lecturas del documento marcadas para revisar (🟡), en el orden de «Lo que entendimos». */
+function documentReviewOf(ctx: AcademicContextV1): CourseFacts['documentReview'] {
+  const out: CourseFacts['documentReview'] = [];
+  const f = (block: 'course' | 'learner' | 'outcomes', label: string, x: { status: string; value: unknown; review?: string }) => {
+    if (x.status !== 'missing' && typeof x.value === 'string' && x.review) out.push({ block, label, text: x.value, message: x.review });
+  };
+  f('course', 'Objetivo general', ctx.identity.generalObjective);
+  f('learner', 'Público', ctx.learner.profile);
+  for (const o of ctx.outcomes) if (o.review) out.push({ block: 'outcomes', label: o.id, text: o.text, message: o.review });
+  for (const c of ctx.competencies) if (c.review) out.push({ block: 'outcomes', label: c.id, text: c.text, message: c.review });
+  return out.slice(0, 40);
+}
+
 export const DERIVED_FIELDS = ['description', 'educationLevel', 'know', 'do', 'competencies', 'targetHours', 'assessmentMethods'] as const;
 export type DerivedField = (typeof DERIVED_FIELDS)[number];
 export type FieldOwner = 'document' | 'user' | 'empty';
@@ -235,6 +248,16 @@ export interface CourseFacts {
   outcomes: Fact<{ id: string | null; text: string; domain: string | null; origin: OutcomeOrigin }[]>;
   competencies: Fact<string[]>;
   targetHours: Fact<number>;
+  /**
+   * El documento da las horas como RANGO («40–44 horas»): se conserva (min, max). `targetHours` es la meta de diseño
+   * (el punto medio, salvo que el docente elija otra). null si el documento da un número o no habla de horas.
+   */
+  targetHoursRange: { min: number; max: number } | null;
+  /**
+   * Lecturas del documento con dudas (🟡): Cursia las usa, pero pide confirmarlas o completarlas (texto cortado en el
+   * documento, por ejemplo). Nunca bloquean; `block` dice en qué bloque de «Lo que entendimos» se corrigen.
+   */
+  documentReview: { block: 'course' | 'learner' | 'outcomes'; label: string; text: string; message: string }[];
   units: Fact<number>;
   /** LOOP 8.2.1 (review M2): sector deducido del documento vigente (programa encontrado), aunque el pedido tenga otro. */
   documentSector: string | null;
@@ -424,11 +447,14 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
       const docV = derivedFieldValue(input.suggested, f);
       // Métodos de evaluación: los del documento se SUMAN; solo hay conflicto si falta alguno del documento.
       const missingDocMethods = f === 'assessmentMethods' && (docV as string[]).some((x) => !((ped && ped.assessmentMethods) || []).includes(x as any));
-      const differs = f === 'assessmentMethods' ? missingDocMethods : fieldSha(docV) !== fieldSha(derivedFieldValue(ped, f));
+      // Horas en RANGO del documento: unas horas elegidas dentro del rango no se apartan del documento.
+      const range = f === 'targetHours' && ctx.hours.total.status !== 'missing' ? ctx.hours.total.range : undefined;
+      const inRange = !!range && typeof pedHours === 'number' && pedHours >= range.min && pedHours <= range.max;
+      const differs = f === 'assessmentMethods' ? missingDocMethods : inRange ? false : fieldSha(docV) !== fieldSha(derivedFieldValue(ped, f));
       if (owners[f] === 'user' && !isEmptyValue(docV) && differs) {
         differing.push(f);
         conflicts.push({ field: `pedagogy.${f}`, values: [{ source: 'document', value: docV }, { source: 'profile', value: derivedFieldValue(ped, f) }],
-          message: FIELD_CONFLICT_MESSAGE[f](docV, pedHours) });
+          message: FIELD_CONFLICT_MESSAGE[f](range ? `${String(range.min).replace('.', ',')}–${String(range.max).replace('.', ',')}` : docV, pedHours) });
       }
     }
   }
@@ -467,6 +493,8 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     outcomes: first(fact(docOutcomes, docOutcomesSource), fact(pedOutcomes, 'profile')),
     competencies: first<string[]>(fact(ctx ? ctx.competencies.map((c) => c.text) : null, ctx && ctx.competencies.length ? ctxSource(ctx.competencies[0]) : 'document'), fact(ped && ped.learningOutcomes ? ped.learningOutcomes.competencies : null, 'profile')),
     targetHours,
+    targetHoursRange: withDocs && ctx && ctx.hours.total.status !== 'missing' && ctx.hours.total.range ? { min: ctx.hours.total.range.min, max: ctx.hours.total.range.max } : null,
+    documentReview: withDocs && ctx ? documentReviewOf(ctx) : [],
     units: fact(withDocs && ctx ? ctx.units.length : null, 'document'),
     // LOOP 8.2.1: sin sector en el pedido, solo con evidencia del documento (el programa encontrado en él); si no, sin dato.
     sector: first<string>(fact(b.sector, briefSource('sector')), fact(docSector, 'inferred'), fact(keywordSector, 'inferred')),

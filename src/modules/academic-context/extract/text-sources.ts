@@ -20,6 +20,8 @@ export interface SourceLine {
   list?: boolean;
   /** Fila de una tabla: celdas en `cells`. */
   cells?: string[];
+  /** PDF: el texto llega al borde de la página (el documento lo muestra cortado): hay que confirmarlo. */
+  clipped?: boolean;
 }
 
 export interface ReadDocument {
@@ -123,24 +125,34 @@ export async function readPdf(buf: Buffer): Promise<ReadDocument> {
     throw new DocumentReadError('DOCUMENT_TOO_MANY_PAGES', `el PDF tiene ${total} páginas; Cursia lee hasta ${MAX_PDF_PAGES}. Sube solo las páginas del microcurrículo.`);
   }
   try {
-    const res = await parser.getText();
-    const lines: SourceLine[] = [];
-    let n = 0;
-    let characters = 0;
-    res.pages.forEach((p: { text: string; num?: number }, i: number) => {
-      for (const raw of String(p.text || '').split(/\r?\n/)) {
-        const text = collapse(raw);
-        if (!text) continue;
-        n++;
-        characters += text.length;
-        const cells = (text.match(/ \| /g) || []).length >= 2 ? text.split(' | ').map(collapse) : undefined;
-        lines.push({ text, page: typeof p.num === 'number' ? p.num : i + 1, line: n, ...(cells ? { cells } : {}) });
-      }
-    });
-    const kept = dropRepeatedPageFurniture(lines, res.pages.length);
+    let lines: SourceLine[];
+    let pages: number;
+    // Lectura por POSICIÓN (columnas de tablas, títulos por tamaño de letra, texto que sale de la página). Si pdf.js no
+    // entrega posiciones utilizables, la lectura de texto plana de siempre.
+    const positional = await readPdfPositional(parser, total).catch(() => null);
+    if (positional && positional.lines.length) {
+      lines = positional.lines;
+      pages = positional.pages;
+    } else {
+      const res = await parser.getText();
+      lines = [];
+      let n = 0;
+      res.pages.forEach((p: { text: string; num?: number }, i: number) => {
+        for (const raw of String(p.text || '').split(/\r?\n/)) {
+          const text = collapse(stripMarkupTags(raw));
+          if (!text) continue;
+          n++;
+          const cells = (text.match(/ \| /g) || []).length >= 2 ? text.split(' | ').map(collapse) : undefined;
+          lines.push({ text, page: typeof p.num === 'number' ? p.num : i + 1, line: n, ...(cells ? { cells } : {}) });
+        }
+      });
+      pages = res.pages.length;
+    }
+    const characters = lines.reduce((a, l) => a + l.text.length, 0);
+    const kept = dropRepeatedPageFurniture(lines, pages);
     const dropped = lines.length - kept.length;
     return {
-      mediaType: 'application/pdf', lines: kept, pages: res.pages.length, characters,
+      mediaType: 'application/pdf', lines: kept, pages, characters,
       ...(dropped ? { notes: [{ code: 'PAGE_FURNITURE_DROPPED', message: `Se descartaron ${dropped} línea(s) que parecen encabezados, pies o números de página del PDF.` }] } : {}),
     };
   } catch (err) {
@@ -148,6 +160,176 @@ export async function readPdf(buf: Buffer): Promise<ReadDocument> {
   } finally {
     await parser.destroy().catch(() => undefined);
   }
+}
+
+/**
+ * Etiquetas de marcado que algunos generadores dejan como texto literal («<b>Actividad…</b>»): no son contenido.
+ * Solo etiquetas de formato en línea conocidas (nunca «<» sueltos como «< 5 %»).
+ */
+export function stripMarkupTags(s: string): string {
+  return s.replace(/<\/?(?:b|i|u|em|strong|span|small|sup|sub|font|mark)\b[^<>]{0,80}>|<br\s*\/?>/gi, ' ');
+}
+
+interface PdfItem { str: string; x: number; y: number; w: number; size: number }
+
+/** Distancia horizontal (pt) entre dos textos de una misma línea a partir de la cual son celdas distintas. */
+const PDF_CELL_GAP = 8;
+
+/**
+ * Lectura de un PDF por posición del texto (pdf.js): reconstruye lo que la lectura plana pierde en documentos reales.
+ *   - Líneas: textos a la misma altura, de izquierda a derecha.
+ *   - Celdas: un hueco horizontal grande separa celdas («Capítulo | Contenido | Recursos»). Una celda que DESBORDA sobre
+ *     la columna siguiente (el PDF dibuja «…en salud2 videos») se parte en el borde de la columna, que se conoce porque
+ *     otras filas de la misma página empiezan exactamente ahí.
+ *   - Títulos: letra claramente más grande que la del cuerpo y línea corta.
+ *   - Texto cortado: si el texto llega al borde de la página, el documento lo muestra cortado (`clipped`).
+ */
+async function readPdfPositional(parser: any, total: number): Promise<{ lines: SourceLine[]; pages: number } | null> {
+  const doc = await parser.load();
+  const out: SourceLine[] = [];
+  let n = 0;
+  const pageItems: { items: PdfItem[]; width: number }[] = [];
+  for (let p = 1; p <= total; p++) {
+    const page = await doc.getPage(p);
+    const vp = page.getViewport({ scale: 1 });
+    const tc = await page.getTextContent();
+    const items: PdfItem[] = [];
+    for (const it of tc.items as any[]) {
+      if (!it || typeof it.str !== 'string' || !it.transform) continue;
+      const size = Math.hypot(it.transform[2], it.transform[3]) || it.height || 0;
+      items.push({ str: it.str, x: it.transform[4], y: it.transform[5], w: it.width || 0, size });
+    }
+    pageItems.push({ items, width: vp.width });
+    page.cleanup?.();
+  }
+  // Tamaño de letra del cuerpo: el más frecuente (ponderado por caracteres) en todo el documento.
+  const bySize = new Map<number, number>();
+  for (const pg of pageItems) for (const it of pg.items) if (it.str.trim()) bySize.set(Math.round(it.size * 2) / 2, (bySize.get(Math.round(it.size * 2) / 2) || 0) + it.str.trim().length);
+  const body = [...bySize.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || 0;
+
+  pageItems.forEach((pg, pi) => {
+    const rows = pdfRows(pg.items);
+    const rowCells = rows.map((r) => pdfCells(r));
+    // Bordes de columna POR TABLA (filas seguidas de ≥ 2 celdas): x donde empieza una celda que no es la primera,
+    // repetido en ≥ 2 filas de esa tabla. Una tabla nunca usa los bordes de otra (ni del pie de página).
+    const anchorsOf: number[][] = rowCells.map(() => []);
+    for (let i = 0; i < rowCells.length;) {
+      if (rowCells[i].length < 2) { i++; continue; }
+      let j = i;
+      while (j < rowCells.length && rowCells[j].length >= 2) j++;
+      const starts = new Map<number, number>();
+      for (let k = i; k < j; k++) {
+        for (const c of rowCells[k].slice(1)) starts.set(Math.round(c.x), (starts.get(Math.round(c.x)) || 0) + 1);
+      }
+      const anchors = [...starts.entries()].filter(([, c]) => c >= 2).map(([x]) => x).sort((a, b) => a - b);
+      for (let k = i; k < j; k++) anchorsOf[k] = anchors;
+      i = j;
+    }
+    // Celda partida en varias líneas: la línea siguiente de una fila de tabla, MÁS CERCA que el paso entre filas
+    // (< 1,7 × la letra), que empieza en una columna posterior a la primera y cuyas celdas caen en bordes de esa tabla,
+    // es la continuación de esa fila: su texto se suma a la celda de su columna.
+    for (let k = 1; k < rowCells.length; k++) {
+      const pr = k - 1;
+      if (rowCells[pr].length < 2 || !anchorsOf[pr].length || !rowCells[k].length) continue;
+      const prevY = Math.min(...rows[pr].map((it) => it.y));
+      const y = Math.max(...rows[k].map((it) => it.y));
+      const size = Math.max(...rows[pr].map((it) => it.size || 8));
+      const first = rowCells[pr][0].x;
+      const cont = rowCells[k];
+      const onAnchor = (x: number) => anchorsOf[pr].some((a) => Math.abs(a - x) <= 3);
+      if (prevY - y >= size * 1.7 || cont[0].x <= first + 4 || !cont.every((c) => onAnchor(c.x))) continue;
+      for (const c of cont) {
+        const target = [...rowCells[pr]].reverse().find((p) => p.x <= c.x + 4);
+        if (target) { target.text = `${target.text.replace(/\s+$/, '')} ${c.text.replace(/^\s+/, '')}`; target.end = Math.max(target.end, c.end); }
+      }
+      rows[pr].push(...rows[k]);
+      rows.splice(k, 1);
+      rowCells.splice(k, 1);
+      anchorsOf.splice(k, 1);
+      k--;
+    }
+    rowCells.forEach((cells0, ri) => {
+      const cells = cells0.length >= 2 ? splitOverflow(cells0, anchorsOf[ri]) : cells0;
+      const texts = cells.map((c) => collapse(stripMarkupTags(c.text))).filter(Boolean);
+      if (!texts.length) return;
+      const items = rows[ri].filter((it) => it.str.trim());
+      const clipped = items.some((it) => it.w > 0 && it.x + it.w > pg.width - 0.5);
+      const size = Math.max(...items.map((it) => it.size));
+      const text = texts.join(texts.length >= 2 ? ' | ' : ' ');
+      const words = text.split(/\s+/).length;
+      const heading = texts.length === 1 && body > 0 && size >= body * 1.18 && words <= 14 && !/[.;,]$/.test(text);
+      n++;
+      out.push({ text, page: pi + 1, line: n, ...(texts.length >= 2 ? { cells: texts } : {}), ...(heading ? { heading: true } : {}), ...(clipped ? { clipped: true } : {}) });
+    });
+  });
+  return { lines: out, pages: total };
+}
+
+/** Agrupa los textos de una página en filas (misma altura) de arriba hacia abajo, cada fila de izquierda a derecha. */
+function pdfRows(items: PdfItem[]): PdfItem[][] {
+  const sorted = items.filter((it) => it.str.length).sort((a, b) => b.y - a.y || a.x - b.x);
+  const rows: { y: number; tol: number; items: PdfItem[] }[] = [];
+  for (const it of sorted) {
+    const tol = Math.max(2, (it.size || 8) * 0.45);
+    const row = rows.find((r) => Math.abs(r.y - it.y) <= Math.max(tol, r.tol));
+    if (row && it.str.trim()) row.items.push(it);
+    else if (it.str.trim()) rows.push({ y: it.y, tol, items: [it] });
+  }
+  rows.sort((a, b) => b.y - a.y);
+  return rows.map((r) => r.items.sort((a, b) => a.x - b.x));
+}
+
+/** Celdas de una fila: un hueco horizontal ≥ PDF_CELL_GAP (o ≥ 1,2 × el tamaño de letra) abre una celda nueva. */
+function pdfCells(row: PdfItem[]): { x: number; end: number; text: string; items: PdfItem[] }[] {
+  const cells: { x: number; end: number; text: string; items: PdfItem[] }[] = [];
+  for (const it of row) {
+    const cur = cells[cells.length - 1];
+    const gap = cur ? it.x - cur.end : Infinity;
+    if (cur && gap < Math.max(PDF_CELL_GAP, (it.size || 8) * 1.2)) {
+      cur.text += (gap > (it.size || 8) * 0.12 && !/\s$/.test(cur.text) && !/^\s/.test(it.str) ? ' ' : '') + it.str;
+      cur.end = Math.max(cur.end, it.x + it.w);
+      cur.items.push(it);
+    } else {
+      cells.push({ x: it.x, end: it.x + it.w, text: it.str, items: [it] });
+    }
+  }
+  return cells;
+}
+
+/**
+ * Una celda que empieza antes de un borde de columna y lo cruza desbordó sobre la celda vecina: se parte en el carácter
+ * que cae en el borde (ancho medio por carácter), ajustado al cambio de palabra más cercano (espacio, letra→número,
+ * minúscula→mayúscula). Solo en filas de tabla (≥ 2 celdas); un párrafo nunca se parte.
+ */
+function splitOverflow(cells: { x: number; end: number; text: string; items: PdfItem[] }[], anchors: number[]) {
+  const out: typeof cells = [];
+  for (const c of cells) {
+    const a = anchors.find((x) => x > c.x + 4 && x < c.end - 4);
+    if (a === undefined || c.text.length < 4) { out.push(c); continue; }
+    const per = (c.end - c.x) / c.text.length;
+    const est = Math.round((a - c.x) / per);
+    // Primero un corte FUERTE (dos textos pegados: «salud2 videos», «saludRecursos») cerca de la estimación (el ancho por
+    // carácter de una letra proporcional varía); si no hay, el espacio más cercano.
+    const pick = (span: number, strong: boolean) => {
+      let at = -1;
+      let score = Infinity;
+      for (let i = Math.max(1, est - span); i <= Math.min(c.text.length - 1, est + span); i++) {
+        const prev = c.text[i - 1];
+        const ch = c.text[i];
+        const hit = strong
+          ? (/[a-záéíóúñ.)]/i.test(prev) && /\d/.test(ch)) || (/[a-záéíóúñ]/.test(prev) && /[A-ZÁÉÍÓÚÑ]/.test(ch))
+          : /\s/.test(prev) && /\S/.test(ch);
+        if (hit && Math.abs(i - est) < score) { at = i; score = Math.abs(i - est); }
+      }
+      return at;
+    };
+    let best = pick(Math.max(12, Math.round(c.text.length * 0.25)), true);
+    if (best < 0) best = pick(8, false);
+    if (best < 0) { out.push(c); continue; }
+    out.push({ x: c.x, end: a, text: c.text.slice(0, best), items: c.items });
+    out.push({ x: a, end: c.end, text: c.text.slice(best), items: c.items });
+  }
+  return out;
 }
 
 /**
@@ -176,10 +358,18 @@ export function dropRepeatedPageFurniture(lines: SourceLine[], pages: number): S
     const m = /^(?:p[aá]g(?:ina)?\.?\s*)?(\d{1,4})(?:\s*(?:de|\/)\s*\d{1,4})?$/i.exec(l.text);
     return !!m && firstLast.has(l) && Number(m[1]) === l.page;
   };
+  // El número de página cambia en cada página («Curso X · Página 3», «3 de 10»): se compara sin él. Solo el número que
+  // acompaña a «página» o a «de N», o el que cierra/abre la línea separado del resto (nunca cifras del cuerpo).
+  const furnitureKey = (t: string) =>
+    t.toLowerCase()
+      .replace(/\bp[aá]g(?:ina)?\.?\s*\d{1,4}(?:\s*(?:de|\/)\s*\d{1,4})?/g, 'página #')
+      .replace(/\b\d{1,4}\s*(?:de|\/)\s*\d{1,4}\b/g, '# de #')
+      .replace(/(?:^|\s[|·—–-]\s|\s{2,})\d{1,4}$/, ' #')
+      .replace(/^\d{1,4}(?:\s[|·—–-]\s|\s{2,})/, '# ');
   const pagesBy = new Map<string, Set<number>>();
   for (const l of lines) {
     if (!edge.has(l) || bullet.test(l.text) || l.text.length > 120) continue;
-    const k = l.text.toLowerCase();
+    const k = furnitureKey(l.text);
     if (!pagesBy.has(k)) pagesBy.set(k, new Set());
     pagesBy.get(k)!.add(l.page ?? 0);
   }
@@ -187,7 +377,7 @@ export function dropRepeatedPageFurniture(lines: SourceLine[], pages: number): S
   return lines.filter((l) => {
     if (pageNum(l)) return false;
     if (pages < 2 || !edge.has(l) || bullet.test(l.text)) return true;
-    const set = pagesBy.get(l.text.toLowerCase());
+    const set = pagesBy.get(furnitureKey(l.text));
     return !set || set.size < need;
   });
 }

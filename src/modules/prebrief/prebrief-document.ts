@@ -279,6 +279,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
     ? { t: 'exceptions', items: m.exceptions.map((e) => ({ rows: [
       { label: 'Requisito original', value: reqDisplay(e.requirementText) },
       { label: e.capability ? 'Propuesta de Cursia' : 'Decisión aplicada', value: e.capability ? proposalText(e.appliedText) : e.appliedText },
+      ...(e.capability && e.proposal ? [{ label: 'Alternativa que propone Cursia', value: e.proposal }] : []),
       { label: 'Tipo', value: e.capability ? (e.reason ? 'Requisito no cubierto por Cursia · excepción aceptada' : 'Requisito no cubierto por Cursia (capacidad actual)') : 'Excepción al requisito del documento' },
       { label: e.capability ? 'Aceptación de la institución' : 'Motivo', value: e.reason || (e.capability ? 'Pendiente: sin aceptación no se puede aprobar' : 'Motivo pendiente'), strong: true },
       { label: 'Responsable', value: e.by || '—' },

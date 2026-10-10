@@ -63,6 +63,10 @@ export interface Field<T> {
   sources: SourceRef[];
   /** Obligatorio con status `inferred`: la regla que produjo el valor. */
   basis?: string;
+  /** Lectura con dudas (🟡): qué debe confirmar o completar el docente. Nunca bloquea; solo se muestra. */
+  review?: string;
+  /** Solo `hours.total`: el documento da un RANGO («40–44 horas»); `value` es el punto medio (meta de diseño). */
+  range?: { min: number; max: number };
 }
 
 /** Elemento de una lista (resultado, contenido, referencia…): mismo contrato de estado y fuente que un Field. */
@@ -70,6 +74,8 @@ export interface Provenance {
   status: Exclude<FieldStatus, 'missing'>;
   sources: SourceRef[];
   basis?: string;
+  /** Lectura con dudas (🟡): qué debe confirmar o completar el docente (texto cortado, tabla reconstruida…). */
+  review?: string;
 }
 
 export interface AcademicDocument {
@@ -290,6 +296,7 @@ class Checker {
     const n = Array.isArray(v.sources) ? v.sources.length : 0;
     if (v.status === 'found' && n === 0) this.err(`${path}.sources`, 'FOUND_WITHOUT_SOURCE', `${path}: un dato encontrado necesita su fuente`);
     if ((v.status === 'missing' || v.status === 'provided') && n > 0) this.err(`${path}.sources`, 'UNEXPECTED_SOURCE', `${path}: un dato ${v.status} no lleva fuentes`);
+    if (v.review !== undefined) this.text(v.review, `${path}.review`, ACADEMIC_LIMITS.basis);
     if (v.status === 'inferred') {
       if (v.basis === undefined) this.err(`${path}.basis`, 'INFERRED_WITHOUT_BASIS', `${path}: un dato inferido necesita la regla que lo produjo (basis)`);
       else this.text(v.basis, `${path}.basis`, ACADEMIC_LIMITS.basis);
@@ -299,8 +306,14 @@ class Checker {
   }
   field(v: unknown, path: string, docIds: Set<string>, value: (x: unknown, p: string) => void): void {
     if (!isObj(v)) return this.err(path, 'INVALID_TYPE', `${path} debe ser un objeto {status, value, sources}`);
-    this.keys(v, path, ['status', 'value', 'sources'], ['basis']);
+    this.keys(v, path, ['status', 'value', 'sources'], path === 'hours.total' ? ['basis', 'review', 'range'] : ['basis', 'review']);
     this.provenance(v, path, docIds, true);
+    if (v.range !== undefined) {
+      const r = v.range as Record<string, unknown> | null;
+      if (!isObj(r) || typeof r.min !== 'number' || typeof r.max !== 'number' || !(r.min > 0) || !(r.max >= r.min) || r.max > 5000) {
+        this.err(`${path}.range`, 'INVALID_RANGE', `${path}.range debe ser {min, max} con 0 < min ≤ max`);
+      } else if (v.status === 'missing') this.err(`${path}.range`, 'MISSING_WITH_VALUE', `${path}: un dato faltante no lleva rango`);
+    }
     if (v.status === 'missing') {
       if (v.value !== null) this.err(`${path}.value`, 'MISSING_WITH_VALUE', `${path}: un dato faltante no lleva valor`);
     } else if (v.value === null) {
@@ -403,7 +416,7 @@ export function validateAcademicContextShape(input: unknown): AcademicSchemaErro
       c.err(p, 'INVALID_TYPE', `${p} debe ser un objeto`);
       return false;
     }
-    c.keys(x, p, [...required, 'status', 'sources'], [...optional, 'basis']);
+    c.keys(x, p, [...required, 'status', 'sources'], [...optional, 'basis', 'review']);
     c.provenance(x, p, docIds, false);
     return true;
   };
@@ -516,7 +529,10 @@ function normSource(s: SourceRef): SourceRef {
   return { documentId: s.documentId, section: s.section === null ? null : collapse(s.section), page: s.page, line: s.line, excerpt: collapse(s.excerpt) };
 }
 function normProv<T extends Provenance>(x: T): Provenance {
-  return { status: x.status, sources: x.sources.map(normSource), ...(x.status === 'inferred' ? { basis: collapse(x.basis as string) } : {}) };
+  return {
+    status: x.status, sources: x.sources.map(normSource), ...(x.status === 'inferred' ? { basis: collapse(x.basis as string) } : {}),
+    ...(typeof x.review === 'string' ? { review: collapse(x.review) } : {}),
+  };
 }
 function normField<T>(f: Field<T>, value: (v: T) => T): Field<T> {
   return {
@@ -524,6 +540,8 @@ function normField<T>(f: Field<T>, value: (v: T) => T): Field<T> {
     value: f.value === null ? null : value(f.value),
     sources: f.sources.map(normSource),
     ...(f.status === 'inferred' ? { basis: collapse(f.basis as string) } : {}),
+    ...(typeof f.review === 'string' ? { review: collapse(f.review) } : {}),
+    ...(f.range && f.status !== 'missing' ? { range: { min: f.range.min, max: f.range.max } } : {}),
   };
 }
 const txt = (v: string) => collapse(v);

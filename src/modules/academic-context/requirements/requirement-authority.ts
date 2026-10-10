@@ -346,6 +346,19 @@ export async function structureEditedByTeacher(q: Q, courseId: number): Promise<
   return !rows[0] || Number(rows[0].c) !== origin.counter;
 }
 
+/**
+ * Forma de contenidos que EXIGE el documento (capítulos de contenido por módulo), o null si no la exige entera:
+ * «estructura 3 × 4» o «3 módulos» + «4 capítulos de contenido por módulo».
+ */
+export function requiredContentShape(required: DocumentRequirement[]): number[] | null {
+  const high = required.filter((r) => r.obligation === 'required' && r.confidence === 'high');
+  const st = high.find((r) => r.kind === 'structure' && Array.isArray((r as any).shape) && (r as any).shape.length);
+  if (st) return ((st as any).shape as unknown[]).map(Number);
+  const mods = high.find((r) => r.kind === 'modules' && r.mode === 'exact' && r.scope.level === 'course' && typeof r.value === 'number');
+  const ch = high.find((r) => r.kind === 'chapters' && r.mode === 'exact' && r.scope.level === 'module' && 'each' in r.scope && typeof r.value === 'number');
+  return mods && ch ? Array.from({ length: mods.value as number }, () => ch.value as number) : null;
+}
+
 /** Decisiones del docente: implícitas (perfil guardado) + registradas + las de la vista previa, menos las que se devuelven. */
 export function teacherDecisions(a: Pick<RequirementAuthority, 'exceptions' | 'cursia'>, savedPrefs: Record<string, unknown> | null | undefined, o?: DecisionOverrides): StoredExceptions['fields'] {
   return effectiveDecisions({ ...implicitDecisions(savedPrefs, a.cursia), ...a.exceptions }, o);
@@ -430,7 +443,14 @@ export interface RequirementDesignCheck {
    * coveredBy (LOOP 9.2): la MISMA limitación ya es una excepción de otro requisito de la misma frase del documento
    * («8 videos de contenido: 2 videos por cada capítulo de contenido»): su motivo cubre los dos (un solo motivo).
    */
-  capability?: { requirementKey: string; requirementText: string; produces: string; coveredBy?: { requirementKey: string; requirementText: string } };
+  capability?: {
+    requirementKey: string; requirementText: string; produces: string; coveredBy?: { requirementKey: string; requirementText: string };
+    /**
+     * Alternativa que Cursia PROPONE con lo que ya produce (nunca una capacidad nueva). La institución decide: aceptarla,
+     * escribir otro motivo o cambiar el diseño. Texto para el cliente, sin nombres internos.
+     */
+    proposal?: string;
+  };
 }
 
 const n1 = (n: number) => String(Math.round(n * 10) / 10).replace('.', ',');
@@ -563,6 +583,21 @@ export function capabilityProduces(r: DocumentRequirement, c?: RequirementCheck)
   return 'Cursia no lo contempla con su capacidad actual';
 }
 
+/**
+ * Alternativa que Cursia propone cuando no puede cubrir un requisito, armada SOLO con lo que su pipeline ya produce en
+ * cada capítulo de contenido (video, presentación, audiolibro, actividad interactiva, Actividad de Aplicación). La
+ * institución la acepta o no: Cursia nunca la aplica por su cuenta ni la presenta como cumplimiento del requisito.
+ */
+export function capabilityProposal(r: DocumentRequirement, hours?: number | null): string | null {
+  if (r.kind === 'videos') {
+    return 'Proponemos 1 video educativo principal por capítulo de contenido y, como recurso complementario, la presentación del capítulo y su parte del audiolibro, que Cursia ya produce. No reemplaza al segundo video: la institución decide si lo acepta.';
+  }
+  if (r.kind === 'target_hours' && typeof hours === 'number') {
+    return `Proponemos mantener la estructura y los recursos del documento y declarar la carga real estimada: ≈ ${n1(hours)} horas de trabajo del estudiante. Si la institución necesita más horas, puede ampliar las Actividades de Aplicación o agregar capítulos de práctica (eso se aparta de las cantidades exactas del documento).`;
+  }
+  return null;
+}
+
 export function requirementVerificationChecks(applicable: DocumentRequirement[], checks: RequirementCheck[], ctx: ConflictContext): RequirementDesignCheck[] {
   const out: RequirementDesignCheck[] = [];
   const byId = new Map(applicable.map((r) => [r.id, r]));
@@ -610,6 +645,17 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
         detail: `Te estás apartando de un requisito del documento: con ${what}, el diseño ${over ? 'no puede bajar de' : 'no llega a'} ${asked} (≈ ${n1(over ? ctx.baseHours : ctx.estimatedHours)} h). Cursia respeta tu decisión.`, fix });
       continue;
     }
+    // El diseño NO LLEGA a las horas del documento con lo que el propio documento fija (estructura, actividades, Actividades
+    // de Aplicación) y sin decisiones del docente: es lo que la producción de Cursia equivale en horas de trabajo del
+    // estudiante (el modelo de tiempo), no una elección de nadie. Se dice como REQUISITO NO CUBIERTO, con las horas reales
+    // y una alternativa: la institución decide (nunca se rellena ni se da por cumplido; R68 exige su aceptación).
+    if (hoursClash && ctx.status === 'cannot_reach_target' && !ctx.clashWith) {
+      const produces = `con lo que fija el documento, el diseño de Cursia equivale a ≈ ${n1(ctx.estimatedHours)} horas de trabajo del estudiante (Cursia no rellena textos ni tiempos para llegar)`;
+      out.push({ id, area: 'requirements', severity: 'warning', title: `Requisito no cubierto por Cursia: ${asked}`,
+        detail: `El microcurrículo solicita ${asked}. Actualmente, ${produces}. No se puede presentar como cumplido: para continuar, la institución debe aceptar esta diferencia en la propuesta.`,
+        capability: { requirementKey: String(r.key), requirementText: asked, produces, proposal: capabilityProposal(r, ctx.estimatedHours) as string } });
+      continue;
+    }
     if (hoursClash) {
       const st0 = has('structure') || has('chapters') || has('modules');
       const over = ctx.status === 'minimum_exceeds_target';
@@ -649,7 +695,7 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
         out.push({ id, area: 'requirements', severity: 'warning', title: `Requisito no cubierto por Cursia: ${asked}`,
           detail: `El microcurrículo solicita ${asked}. Actualmente, ${produces}. No se puede presentar como cumplido: para continuar, la institución debe aceptar esta diferencia en la propuesta.${twinReq ? ` Es la misma limitación que «${requirementText(twinReq)}»: una sola aceptación cubre las dos.` : ''}`,
           // R68 la bloquea mientras no haya un motivo registrado (también fuera del flujo de propuesta: falla cerrada).
-          capability: { requirementKey: String(r.key), requirementText: asked, produces, ...(twinReq ? { coveredBy: { requirementKey: String(twinReq.key), requirementText: requirementText(twinReq) } } : {}) } });
+          capability: { requirementKey: String(r.key), requirementText: asked, produces, ...(twinReq ? { coveredBy: { requirementKey: String(twinReq.key), requirementText: requirementText(twinReq) } } : {}), ...(capabilityProposal(r) ? { proposal: capabilityProposal(r) as string } : {}) } });
         continue;
       }
       out.push({ id, area: 'requirements', severity: 'info', title: `Requisito del documento por revisar: ${asked}`,
