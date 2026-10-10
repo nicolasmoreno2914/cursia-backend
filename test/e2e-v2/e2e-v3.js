@@ -2678,6 +2678,487 @@ function reservationBookkeeping(ev) {
       ok([403, 404].includes(o1.status) && [403, 404].includes(o2.status) && [403, 404].includes(o3.status), T('otro usuario: ni ver, ni aprobar, ni descargar el PDF (403/404)'), [o1.status, o2.status, o3.status]);
     }, { fatal: false });
 
+    // ═══ Cierre · E22 — LOS 32 CASOS OBLIGATORIOS (Fase 9 del loop del nuevo flujo de creación), uno por uno, por HTTP real
+    // contra el backend con proveedores FALSOS (USD 0). Cada caso deja su fila (descripción, esperado, real, PASS/FAIL) en
+    // v3/casos32.json. El piloto «Atención a víctimas de violencia sexual» (DOCX real) recorre el flujo completo hasta la
+    // generación MOCK, el empaque, Moodle y R68.
+    if (RUN_E5) await step('v3-E22-casos32', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const { PDFParse } = require('pdf-parse');
+      const pdfTextOf = async (buf) => { const p = new PDFParse({ data: new Uint8Array(buf) }); try { return (await p.getText()).text.replace(/\s+/g, ' '); } finally { await p.destroy().catch(() => {}); } };
+      const getPdf = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, buf: Buffer.from(await r.arrayBuffer()) }; };
+      const CASES = [];
+      const caso = (n, desc, expected, pass, actual) => {
+        const real = typeof actual === 'string' ? actual : JSON.stringify(actual === undefined ? null : actual).slice(0, 400);
+        CASES.push({ caso: n, descripcion: desc, esperado: expected, real, resultado: pass ? 'PASS' : 'FAIL' });
+        ok(!!pass, `C${String(n).padStart(2, '0')} ${desc} — ${expected}`, actual);
+        results.cases32 = CASES;
+        fs.writeFileSync(path.join(V3OUT, 'casos32.json'), JSON.stringify(CASES, null, 2));
+      };
+      const tryCase = async (n, desc, expected, fn) => {
+        try { const r = await fn(); caso(n, desc, expected, r.pass, r.actual); } catch (e) { caso(n, desc, expected, false, `excepción: ${e && e.message}`); }
+      };
+      const brief = (nombre) => ({ nombre, obj: `Aprender ${nombre.toLowerCase()} en el trabajo`, sector: 'Educación', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro' });
+      const newCourse = async (title) => {
+        const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+        if (cr.status !== 201) throw new Error(`curso no creado: ${cr.status} ${cr.error}`);
+        const id = Number(cr.data.id);
+        await api('POST', `/courses/${id}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+        await api('PUT', `/courses/${id}/brief`, brief(title.replace(/^\[[^\]]+\]\s*/, '')));
+        const A = D('modules/course-profiles/course-profiles.js');
+        await api('POST', `/courses/${id}/profiles/assessment`, { data: { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } });
+        await api('POST', `/courses/${id}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } });
+        return id;
+      };
+      const importDoc = async (id, name, buf) => {
+        const ex = await api('POST', `/courses/${id}/academic-context/extract`, { files: [{ name, dataBase64: buf.toString('base64') }] });
+        if (ex.status !== 200) throw new Error(`extracción: ${ex.status} ${ex.error}`);
+        const sv = await api('POST', `/courses/${id}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+        if (sv.status !== 201) throw new Error(`contexto: ${sv.status} ${sv.error}`);
+        return { ex: ex.data, cv: sv.data.profile.version };
+      };
+      const opts = async (id) => (await api('GET', `/courses/${id}/design/structure-options`)).data;
+      const preview = async (id, m, c, format) => (await api('POST', `/courses/${id}/design/structure-preview`, { modules: m, chaptersPerModule: c, ...(format ? { format } : {}) })).data;
+      const apply = async (id, cv, choice, shape, extra = {}) => {
+        if (choice === 'format') { const fr = await api('PUT', `/courses/${id}/format`, { code: extra.format }); if (fr.status !== 200) throw new Error(`formato: ${fr.status} ${fr.error}`); }
+        else if (!extra.keepFormat && (await api('GET', `/courses/${id}/format`)).data.format) { const fr = await api('PUT', `/courses/${id}/format`, { code: null }); if (fr.status !== 200) throw new Error(`quitar formato: ${fr.status} ${fr.error}`); }
+        const st = await readStructure(id);
+        const r = await api('POST', `/courses/${id}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: cv, choice, ...(shape ? { shape } : {}), confirmReplace: true });
+        if (![200, 201].includes(r.status)) throw new Error(`apply ${choice}: ${r.status} ${r.error}`);
+        return r.data;
+      };
+      const contentShape = async (id) => (await readStructure(id)).modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length);
+      const rec = async (id) => (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      const check = (card, re) => card.verification.checks.find((c) => re.test(c.title));
+      const useDesign = async (id) => {
+        let card = await rec(id);
+        const pv = await api('GET', `/courses/${id}/profiles/pedagogy`);
+        if (card.profileChanged) await api('POST', `/courses/${id}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version });
+        await api('POST', `/courses/${id}/design/hours-origin`, { proposed: card.hours.source === 'proposed' ? card.hours.target : null });
+        if (card.verification.checks.some((c) => c.id === 'outcome_links')) { const st = await readStructure(id); await api('POST', `/courses/${id}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter }); }
+        card = await rec(id);
+        const st = await readStructure(id);
+        const ap = await api('POST', `/courses/${id}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+        if (![200, 201].includes(ap.status)) throw new Error(`apply-distribution: ${ap.status} ${ap.error}`);
+        return rec(id);
+      };
+      const pbState = async (id) => (await api('GET', `/courses/${id}/prebrief`)).data;
+      const settle = async (id, reason) => {
+        let S0 = await pbState(id);
+        for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'exception_reason')) await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: reason || 'La institución acepta esta diferencia para la validación de cierre.' });
+        S0 = await pbState(id);
+        for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${id}/prebrief/confirmations`, { confirmKey: b.ref });
+        return pbState(id);
+      };
+      const prepareApprove = async (id) => {
+        const S0 = await settle(id);
+        if (!S0.draft.readiness.ready) throw new Error(`propuesta no lista: ${JSON.stringify(S0.draft.readiness.blockers).slice(0, 300)}`);
+        const prep = await api('POST', `/courses/${id}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        if (![200, 201].includes(prep.status)) throw new Error(`preparar: ${prep.status} ${prep.error}`);
+        const ver = prep.data.version;
+        await api('POST', `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest`);
+        const apv = await api('POST', `/courses/${id}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Validación de cierre', role: 'Coordinación académica', confirm: true });
+        if (![200, 201].includes(apv.status)) throw new Error(`aprobar: ${apv.status} ${apv.error}`);
+        return ver;
+      };
+      const verStatus = async (id, v) => ((await pbState(id)).versions || []).find((x) => x.version === v);
+      const docText = (lines) => Buffer.from(lines.join('\n'), 'utf8');
+      const doc4x5 = () => {
+        const temas = ['Peligros', 'Riesgos', 'Controles', 'Incidentes'];
+        const l = ['MICROCURRÍCULO', 'Asignatura: Seguridad industrial', 'Modalidad: Virtual', 'Intensidad horaria total: 40 horas', '', '1. Descripción', 'La asignatura desarrolla la gestión de la seguridad en plantas industriales.', '',
+          '2. Resultados de aprendizaje', 'RA1. Identificar peligros del área de trabajo.', 'RA2. Aplicar controles de riesgo en planta.', '', '3. Estructura del curso',
+          'El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 5 capítulos de contenido.', '', '4. Contenidos', 'Unidad | Contenidos | Horas | RA'];
+        temas.forEach((t, i) => l.push(`Unidad ${i + 1}: ${t} en planta | ${[1, 2, 3, 4, 5].map((c) => `${t}: tema ${c}`).join('; ')} | 10 | RA${i < 2 ? 1 : 2}`));
+        return docText(l);
+      };
+      const doc3x3 = () => {
+        const temas = ['Inventarios', 'Compras', 'Despachos'];
+        const l = ['MICROCURRÍCULO', 'Asignatura: Logística de almacén', 'Modalidad: Virtual', 'Intensidad horaria total: 30 horas', '', '1. Descripción', 'La asignatura desarrolla la gestión de un almacén.', '',
+          '2. Resultados de aprendizaje', 'RA1. Controlar el inventario del almacén.', 'RA2. Organizar compras y despachos.', '', '3. Estructura del curso',
+          'El curso tendrá exactamente 3 módulos. Cada módulo tendrá exactamente 3 capítulos de contenido.', '', '4. Contenidos', 'Unidad | Contenidos | Horas | RA'];
+        temas.forEach((t, i) => l.push(`Unidad ${i + 1}: ${t} | ${[1, 2, 3].map((c) => `${t}: tema ${c}`).join('; ')} | 10 | RA${i === 0 ? 1 : 2}`));
+        return docText(l);
+      };
+      const PILOT_DOCX = fs.readFileSync(path.join(REPO, 'scripts/fixtures/microcurriculum/atencion-violencia-sexual-2x2.docx'));
+
+      // ── C01 Crear desde cero ──
+      await tryCase(1, 'Crear desde cero', 'Sin documento: Cursia no inventa requisitos ni excepciones; la estructura se arma y el diseño se calcula', async () => {
+        const id = await newCourse('[Cierre C01] Excel desde cero');
+        const o = await opts(id);
+        let st = await readStructure(id);
+        await api('POST', `/courses/${id}/modules/${st.modules[0].id}/chapters`, { title: 'Fórmulas básicas', expectedCounter: st.structureVersionCounter });
+        st = await readStructure(id);
+        await api('POST', `/courses/${id}/modules`, { title: 'Tablas y gráficos', expectedCounter: st.structureVersionCounter });
+        st = await readStructure(id);
+        await api('POST', `/courses/${id}/modules/${st.modules[1].id}/chapters`, { title: 'Tablas dinámicas', expectedCounter: st.structureVersionCounter });
+        const card = await rec(id);
+        const reqChecks = card.verification.checks.filter((c) => /^requirement:/.test(c.id));
+        const shape = await contentShape(id);
+        return { pass: o.hasDocumentContents === false && o.document === null && o.contextVersion === null && !!card.design && reqChecks.length === 0 && shape.length === 2,
+          actual: { hasDocumentContents: o.hasDocumentContents, contextVersion: o.contextVersion, requisitos: reqChecks.length, forma: shape, horasDiseño: card.design && card.design.estimatedHours } };
+      });
+
+      // ── C02 / C03 / C04 Importar DOCX, PDF y pegar texto: el mismo lector, el mismo resultado ──
+      const reads = {};
+      for (const [n, label, name, fmt] of [[2, 'Importar DOCX', 'microcurriculo.docx', 'docx'], [3, 'Importar PDF', 'microcurriculo.pdf', 'pdf'], [4, 'Pegar texto', 'informacion-pegada.txt', 'txt']]) {
+        await tryCase(n, label, 'El documento se lee sin proveedores: 5 unidades, 18 contenidos, 6 resultados, 64 horas', async () => {
+          const id = await newCourse(`[Cierre C0${n}] Contabilidad de Costos`);
+          const { ex } = await importDoc(id, name, await AF.fixture('consistent', fmt));
+          const o = await opts(id);
+          const r = { providers: ex.stats.providersCalled, unidades: o.document && o.document.modules, contenidos: o.contentsCount, forma: o.document && o.document.shape, horas: o.requirements.hours, resultados: (ex.draft.outcomes || []).length };
+          reads[fmt] = r;
+          return { pass: r.providers === 0 && r.unidades === 5 && r.contenidos === 18 && JSON.stringify(r.horas) === '["64 horas"]' && r.resultados === 6, actual: r };
+        });
+      }
+
+      // ── C05 Documento con estructura ──
+      let c45 = null;
+      await tryCase(5, 'Documento con estructura', 'Se detecta la estructura obligatoria (4 × 5) y «Cursia recomienda» es esa forma, con su motivo', async () => {
+        const id = await newCourse('[Cierre C05] Seguridad industrial 4 × 5');
+        const { cv } = await importDoc(id, 'seguridad.txt', doc4x5());
+        c45 = { id, cv };
+        const o = await opts(id);
+        return { pass: o.requirements.modules.length > 0 && o.requirements.chapters.length > 0 && o.recommended.modules === 4 && o.recommended.chaptersPerModule === 5 && o.recommended.reason === 'Es la estructura que exige el documento.',
+          actual: { requisitos: o.requirements, recomendada: o.recommended } };
+      });
+
+      // ── C06 Documento sin estructura ──
+      let costos = null;
+      await tryCase(6, 'Documento sin estructura', 'Ninguna forma elegida genera excepción de estructura (el documento no la exige)', async () => {
+        const id = await newCourse('[Cierre C06] Contabilidad de Costos sin estructura');
+        const { cv } = await importDoc(id, 'microcurriculo.docx', await AF.fixture('consistent', 'docx'));
+        costos = { id, cv };
+        const o = await opts(id);
+        const pv = await preview(id, 3, 4);
+        await apply(id, cv, 'custom', { modules: 3, chaptersPerModule: 4 });
+        const card = await rec(id);
+        const structExc = card.verification.checks.filter((c) => /^Excepción al requisito del documento: .*(módulo|capítulo|estructura)/.test(c.title));
+        return { pass: o.requirements.modules.length === 0 && o.requirements.chapters.length === 0 && o.requirements.structure.length === 0 && pv.differences.length === 0 && structExc.length === 0,
+          actual: { requisitosEstructura: [o.requirements.modules, o.requirements.chapters, o.requirements.structure], diferencias: pv.differences, excepcionesEstructura: structExc.map((c) => c.title) } };
+      });
+
+      // ── C07 Documento con horas ──
+      await tryCase(7, 'Documento con horas', 'Se leen las 64 h; un formato fuera de rango (S) avisa la diferencia antes de aplicar', async () => {
+        const o = await opts(costos.id);
+        const pvS = await preview(costos.id, 3, 3, 'S');
+        const pvM = await preview(costos.id, 3, 4, 'M');
+        return { pass: JSON.stringify(o.requirements.hours) === '["64 horas"]' && pvS.differences.some((d) => d.text === 'El documento establece 64 horas y el Formato S es de 20–22 horas.') && pvM.differences.some((d) => d.kind === 'hours'),
+          actual: { horas: o.requirements.hours, S: pvS.differences.map((d) => d.text), M: pvM.differences.map((d) => d.text) } };
+      });
+
+      // ── Piloto «Atención a víctimas de violencia sexual» (DOCX real) para C08–C12 y C27–C32 ──
+      const pilotId = await newCourse('[Cierre piloto] Atención Integral en Salud a Víctimas de Violencia Sexual');
+      const pilot = await importDoc(pilotId, 'microcurriculo_atencion_victimas_violencia_sexual_2x2.docx', PILOT_DOCX);
+      const pOpts = await opts(pilotId);
+      await apply(pilotId, pilot.cv, 'cursia', { modules: pOpts.recommended.modules, chaptersPerModule: pOpts.recommended.chaptersPerModule });
+      const pCard = await useDesign(pilotId);
+      const pShape = await contentShape(pilotId);
+      ok(pilot.ex.stats.providersCalled === 0, 'Piloto: DOCX leído sin proveedores', pilot.ex.stats);
+
+      // ── C08 Documento con módulos y capítulos ──
+      await tryCase(8, 'Documento con módulos y capítulos', 'Piloto: 2 módulos × 2 capítulos de contenido detectados, recomendados y aplicados (las prácticas aparte)', async () => {
+        const st = await readStructure(pilotId);
+        const practice = st.modules.map((m) => m.chapters.filter((c) => c.kind === 'practice').length);
+        const okReq = ['Requisito del documento: 2 módulos', 'Requisito del documento: 2 capítulos de contenido por módulo', 'Requisito del documento: 1 capítulo de práctica por módulo'].every((t) => pCard.verification.checks.some((c) => c.title === t && c.severity === 'ok'));
+        return { pass: JSON.stringify(pOpts.requirements.modules) === '["2 módulos"]' && pOpts.recommended.modules === 2 && pOpts.recommended.chaptersPerModule === 2 && JSON.stringify(pShape) === '[2,2]' && practice.every((n) => n === 1) && okReq,
+          actual: { requisitos: pOpts.requirements, recomendada: pOpts.recommended, contenido: pShape, practicas: practice } };
+      });
+
+      // ── C09 Documento con videos ──
+      await tryCase(9, 'Documento con videos', 'Piloto: «2 videos por capítulo» y «8 videos» quedan como «Requisito no cubierto por Cursia» (1 video por capítulo de contenido; nunca se promete 2)', async () => {
+        const nc = pCard.verification.checks.filter((c) => /^Requisito no cubierto por Cursia: /.test(c.title)).map((c) => c.title).sort();
+        const vids = pCard.design.modules.flatMap((m) => m.chapters).filter((c) => c.kind !== 'practice' && c.videoEnabled).length;
+        const met = pCard.verification.checks.some((c) => /video/.test(c.title) && c.severity === 'ok' && /^Requisito del documento/.test(c.title));
+        return { pass: JSON.stringify(nc) === JSON.stringify(['Requisito no cubierto por Cursia: 2 videos por capítulo de contenido', 'Requisito no cubierto por Cursia: 8 videos']) && vids === 4 && !met,
+          actual: { noCubiertos: nc, videosDelDiseño: vids, algunVideoComoCumplido: met } };
+      });
+
+      // ── C10 Documento con Actividades de Aplicación ──
+      await tryCase(10, 'Documento con Actividades de Aplicación', 'Piloto: 2 Actividades de Aplicación, 1 por módulo en el capítulo de práctica, cumplidas', async () => {
+        const t = ['Requisito del documento: 2 Actividades de Aplicación', 'Requisito del documento: 1 Actividad de Aplicación por módulo, en el capítulo de práctica'];
+        const st = await readStructure(pilotId);
+        const aa = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.kind));
+        return { pass: t.every((x) => pCard.verification.checks.some((c) => c.title === x && c.severity === 'ok')) && aa.every((k) => k.length === 1 && k[0] === 'practice'), actual: { checks: t.map((x) => !!check(pCard, new RegExp('^' + x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$'))), aaPorModulo: aa } };
+      });
+
+      // ── C11 Documento con evaluaciones ──
+      await tryCase(11, 'Documento con evaluaciones', 'Piloto: 2 evaluaciones parciales y 1 final, cumplidas', async () => {
+        const t = ['Requisito del documento: 2 evaluaciones parciales', 'Requisito del documento: 1 evaluación final'];
+        return { pass: t.every((x) => pCard.verification.checks.some((c) => c.title === x && c.severity === 'ok')) && pCard.design.counts.evaluations === 3, actual: { evaluaciones: pCard.design.counts.evaluations, checks: t.map((x) => (pCard.verification.checks.find((c) => c.title === x) || {}).severity) } };
+      });
+
+      // ── C12 Documento con requisitos imposibles para Cursia ──
+      await tryCase(12, 'Documento con requisitos imposibles para Cursia', 'La propuesta no se prepara hasta que la institución acepta la diferencia; queda registrada como «No cubierto / Excepción aceptada»', async () => {
+        const S0 = await pbState(pilotId);
+        const blocker = S0.draft.readiness.blockers.find((b) => b.code === 'exception_reason');
+        const prep0 = await api('POST', `/courses/${pilotId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        const S1 = await settle(pilotId, 'La institución acepta un video por capítulo de contenido para el piloto.');
+        const ex = S1.draft.model.exceptions.filter((e) => e.capability);
+        const texts = ex.map((e) => e.requirementText).sort();
+        return { pass: !!blocker && prep0.status === 409 && S1.draft.readiness.ready === true && JSON.stringify(texts) === JSON.stringify(['2 videos por capítulo de contenido', '8 videos']) && ex.every((e) => e.reason || e.coveredBy) && ex.every((e) => /1 video por capítulo de contenido/.test(e.appliedText)),
+          actual: { bloqueo: blocker && blocker.title, prepararSinAceptar: prep0.status, listaTrasAceptar: S1.draft.readiness.ready, excepciones: ex.map((e) => [e.requirementText, e.appliedText, !!e.reason, e.coveredBy || null]) } };
+      });
+
+      // ── C13 / C14 / C15 / C16 S, M, L y Personalizado (sobre el documento de 18 contenidos) ──
+      const costosHours0 = (await api('GET', `/courses/${costos.id}/profiles/pedagogy`)).data.profile.targetHours ?? null;
+      for (const [n, code, shape] of [[13, 'S', [3, 3]], [14, 'M', [3, 4]], [15, 'L', [4, 5]]]) {
+        await tryCase(n, code, `Formato ${code} → ${shape[0]} × ${shape[1]} capítulos de contenido; los 18 contenidos cubiertos sin duplicar; el formato queda guardado (uno solo)`, async () => {
+          await apply(costos.id, costos.cv, 'format', { modules: shape[0], chaptersPerModule: shape[1] }, { format: code });
+          const live = await contentShape(costos.id);
+          const card = await rec(costos.id);
+          const cov = check(card, /^Contenidos del documento: /);
+          const fmt = (await api('GET', `/courses/${costos.id}/format`)).data.format;
+          return { pass: JSON.stringify(live) === JSON.stringify(Array(shape[0]).fill(shape[1])) && cov && cov.title === 'Contenidos del documento: 18 de 18 en el diseño' && fmt && fmt.code === code,
+            actual: { forma: live, cobertura: cov && cov.title, formato: fmt && fmt.code } };
+        });
+      }
+      await tryCase(16, 'Personalizado', 'Personalizada 2 × 5: con un formato elegido el servidor exige quitarlo antes (409); quitarlo devuelve las horas que tenía el curso; forma exacta, 18 de 18, elección «personalizada»', async () => {
+        const pedBefore = (await api('GET', `/courses/${costos.id}/profiles/pedagogy`)).data.profile.targetHours;
+        let st0 = await readStructure(costos.id);
+        const still = await api('POST', `/courses/${costos.id}/modules/apply-academic-structure`, { expectedCounter: st0.structureVersionCounter, contextVersion: costos.cv, choice: 'custom', shape: { modules: 2, chaptersPerModule: 5 }, confirmReplace: true });
+        const clr = await api('PUT', `/courses/${costos.id}/format`, { code: null });
+        const pedAfter = (await api('GET', `/courses/${costos.id}/profiles/pedagogy`)).data.profile.targetHours;
+        await apply(costos.id, costos.cv, 'custom', { modules: 2, chaptersPerModule: 5 });
+        const hoursExc = (await rec(costos.id)).verification.checks.some((c) => /^Excepción al requisito del documento: 64 horas/.test(c.title) && /elegiste 63|elegiste 21|elegiste 42/.test(String(c.detail)));
+        if (!(still.status === 409 && /FORMAT_STILL_SET/.test(String(still.error)) && clr.status === 200 && pedBefore === 63 && (pedAfter ?? null) === costosHours0 && !hoursExc)) {
+          return { pass: false, actual: { sinQuitarFormato: [still.status, still.error], quitar: clr.status, horasConFormatoL: pedBefore, horasTrasQuitar: pedAfter, horasAntesDeLosFormatos: costosHours0, excepcionDeHorasDelFormato: hoursExc } };
+        }
+        const live = await contentShape(costos.id);
+        const card = await rec(costos.id);
+        const fmt = (await api('GET', `/courses/${costos.id}/format`)).data.format;
+        const o = await opts(costos.id);
+        return { pass: JSON.stringify(live) === '[5,5]' && check(card, /^Contenidos del documento: 18 de 18/) && !fmt && o.current.choice === 'custom',
+          actual: { forma: live, formato: fmt, eleccion: o.current.choice } };
+      });
+
+      // ── C17 Documento 4×5 → usuario 3×4 ──
+      await tryCase(17, 'Documento 4×5 → usuario 3×4', 'La diferencia se avisa antes; al aplicar: los 20 contenidos en 12 capítulos, excepción de la institución (no crítico)', async () => {
+        const pv = await preview(c45.id, 3, 4);
+        await apply(c45.id, c45.cv, 'custom', { modules: 3, chaptersPerModule: 4 });
+        const card = await rec(c45.id);
+        const exc = card.verification.checks.filter((c) => /^Excepción al requisito del documento/.test(c.title)).map((c) => c.title);
+        const crit = card.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title);
+        return { pass: pv.differences.some((d) => d.text === 'El documento establece 4 módulos y has seleccionado 3 módulos.') && pv.coverage.assigned === 20 && JSON.stringify(await contentShape(c45.id)) === '[4,4,4]'
+          && exc.some((t) => /4 módulos/.test(t)) && crit.length === 0 && check(card, /^Contenidos del documento: 20 de 20/),
+          actual: { diferencias: pv.differences.map((d) => d.text), excepciones: exc, criticos: crit } };
+      });
+
+      // ── C18 Documento 3×3 → usuario 4×3 ──
+      let c33 = null;
+      await tryCase(18, 'Documento 3×3 → usuario 4×3', 'Los 9 contenidos en 12 capítulos (3 de profundización, sin inventar contenido); excepción «3 módulos»', async () => {
+        const id = await newCourse('[Cierre C18] Logística 3 × 3');
+        const { cv } = await importDoc(id, 'logistica.txt', doc3x3());
+        c33 = { id, cv };
+        const pv = await preview(id, 4, 3);
+        await apply(id, cv, 'custom', { modules: 4, chaptersPerModule: 3 });
+        const card = await rec(id);
+        const st = await readStructure(id);
+        const prof = st.modules.flatMap((m) => m.chapters).filter((c) => /^Profundización/.test(c.title)).length;
+        return { pass: pv.coverage.total === 9 && pv.coverage.assigned === 9 && pv.coverage.duplicated === 0 && JSON.stringify(await contentShape(id)) === '[3,3,3,3]' && prof === 3
+          && card.verification.checks.some((c) => /^Excepción al requisito del documento: 3 módulos/.test(c.title)) && check(card, /^Contenidos del documento: 9 de 9/),
+          actual: { cobertura: pv.coverage, profundizacion: prof, excepciones: card.verification.checks.filter((c) => /^Excepción/.test(c.title)).map((c) => c.title) } };
+      });
+
+      // ── C19 Documento + excepción ──
+      await tryCase(19, 'Documento + excepción', 'La propuesta pide el motivo; con el motivo, queda lista y la excepción aparece con su motivo', async () => {
+        const S0 = await pbState(c45.id);
+        const need = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').map((b) => b.title);
+        const S1 = await settle(c45.id, 'La institución organiza el curso en 3 módulos por su calendario académico.');
+        const ex = S1.draft.model.exceptions.map((e) => [e.requirementText, !!(e.reason || e.coveredBy)]);
+        return { pass: need.some((t) => /4 módulos/.test(t)) && S1.draft.readiness.blockers.every((b) => b.code !== 'exception_reason') && ex.length > 0 && ex.every((e) => e[1]),
+          actual: { pedidos: need, excepciones: ex, lista: S1.draft.readiness.ready } };
+      });
+
+      // ── C20 Documento + contenido omitido: debe bloquearse ──
+      await tryCase(20, 'Documento + contenido omitido', 'Borrar un capítulo con contenidos → «Contenido no cubierto» crítico; preparar la propuesta → 409; «Incluirlos» lo resuelve', async () => {
+        let st = await readStructure(c33.id);
+        const victim = st.modules[0].chapters.find((c) => c.kind !== 'practice' && !/^Profundización/.test(c.title));
+        await api('DELETE', `/courses/${c33.id}/modules/${st.modules[0].id}/chapters/${victim.id}`, { expectedCounter: st.structureVersionCounter });
+        const card = await rec(c33.id);
+        const cc = card.verification.checks.find((c) => c.id === 'contents');
+        const S0 = await settle(c33.id, 'La institución organiza el curso en 4 módulos.');
+        const prep = await api('POST', `/courses/${c33.id}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        st = await readStructure(c33.id);
+        const fx = await api('POST', `/courses/${c33.id}/design/fix`, { action: 'cover_contents', expectedCounter: st.structureVersionCounter });
+        const after = (await rec(c33.id)).verification.checks.find((c) => c.id === 'contents');
+        return { pass: cc.severity === 'critical' && /^Contenido no cubierto/.test(cc.title) && card.verification.blocking === true && prep.status === 409 && fx.status === 200 && after.severity === 'ok',
+          actual: { verificacion: [cc.severity, cc.title], preparar: prep.status, incluir: fx.status, despues: [after.severity, after.title] } };
+      });
+
+      // ── C21 / C22 / C23 Cambios después de aprobar: invalidan (R68) ──
+      const r68 = await newCourse('[Cierre C21-23] Contabilidad de Costos R68');
+      const r68ctx = await importDoc(r68, 'microcurriculo.docx', await AF.fixture('consistent', 'docx'));
+      await apply(r68, r68ctx.cv, 'custom', { modules: 3, chaptersPerModule: 4 });
+      await useDesign(r68);
+      const runsOf = (id, n) => `/courses/${id}/blueprints/${n}/manifest/runs`;
+      const ctxRun = { nombre: 'Contabilidad de Costos', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro', obj: 'Calcular costos', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      await tryCase(21, 'Cambio de horas después de aprobar', 'La versión aprobada queda invalidada y producir se bloquea (409)', async () => {
+        const v = await prepareApprove(r68);
+        const pv = await api('GET', `/courses/${r68}/profiles/pedagogy`);
+        const sv = await api('POST', `/courses/${r68}/profiles/pedagogy`, { data: { ...pv.data.profile, targetHours: 50 }, expectedVersion: Number(pv.data.version) });
+        const vs = await verStatus(r68, v.version);
+        const run = await api('POST', runsOf(r68, v.blueprintNumber), ctxRun);
+        return { pass: sv.status === 201 && vs.status === 'invalidated' && run.status === 409, actual: { guardarHoras: [sv.status, sv.error], version: v.version, estado: vs.status, motivo: vs.invalidationReason, diferencias: vs.invalidationDiff, producir: [run.status, run.raw && run.raw.reason] } };
+      });
+      await tryCase(22, 'Cambio de estructura después de aprobar', 'Invalida la aprobación y el servidor bloquea producir (R68); deshacer el cambio no la revive', async () => {
+        await useDesign(r68);
+        const v = await prepareApprove(r68);
+        let st = await readStructure(r68);
+        const c0 = st.modules[0].chapters[0];
+        await api('PATCH', `/courses/${r68}/modules/${st.modules[0].id}/chapters/${c0.id}`, { title: `${c0.title} (cambio)`, expectedCounter: st.structureVersionCounter });
+        const vs = await verStatus(r68, v.version);
+        const run = await api('POST', runsOf(r68, v.blueprintNumber), ctxRun);
+        st = await readStructure(r68);
+        const undo = await api('PATCH', `/courses/${r68}/modules/${st.modules[0].id}/chapters/${c0.id}`, { title: c0.title, expectedCounter: st.structureVersionCounter });
+        const vs2 = await verStatus(r68, v.version);
+        const run2 = await api('POST', runsOf(r68, v.blueprintNumber), ctxRun);
+        return { pass: vs.status === 'invalidated' && run.status === 409 && undo.status === 200 && vs2.status === 'invalidated' && run2.status === 409, actual: { estado: vs.status, producir: [run.status, run.raw && run.raw.reason], deshacer: undo.status, trasDeshacer: vs2.status, producirTrasDeshacer: run2.status } };
+      });
+      await tryCase(23, 'Cambio de resultado', 'Cambiar un resultado de aprendizaje después de aprobar invalida la aprobación', async () => {
+        const v = await prepareApprove(r68);
+        const a = (await api('GET', `/courses/${r68}/profiles/academic`)).data;
+        const outs = (a.profile.outcomes || a.profile.learningOutcomes || []).map((o, i) => ({ id: o.id, text: i === 0 ? `${o.text} Incluye costos de servicios.` : o.text }));
+        const r = await api('PUT', `/courses/${r68}/academic-context/outcomes`, { expectedVersion: Number(a.version), outcomes: outs });
+        const vs = await verStatus(r68, v.version);
+        return { pass: [200, 201].includes(r.status) && vs.status === 'invalidated', actual: { guardar: r.status, estado: vs.status, diferencias: vs.invalidationDiff } };
+      });
+
+      // ── C24 Cambio de video fijado: debe respetarse ──
+      await tryCase(24, 'Cambio de video fijado', 'Un video que la institución fija (quita) en un capítulo se respeta en la recomendación y al usar el diseño', async () => {
+        let st = await readStructure(r68);
+        const m = st.modules[0];
+        const ch = m.chapters.find((x) => x.kind !== 'practice' && x.videoEnabled);
+        const pin = await api('PATCH', `/courses/${r68}/modules/${m.id}/chapters/${ch.id}`, { videoEnabled: false, pinVideo: true, expectedCounter: st.structureVersionCounter });
+        const card = await rec(r68);
+        const inCard = card.design.modules.flatMap((x) => x.chapters).find((x) => x.id === ch.id);
+        await useDesign(r68);
+        st = await readStructure(r68);
+        const live = st.modules.flatMap((x) => x.chapters).find((x) => x.id === ch.id);
+        return { pass: pin.status === 200 && inCard && inCard.videoEnabled === false && inCard.videoPinned === true && live.videoEnabled === false, actual: { fijar: pin.status, recomendacion: inCard && [inCard.videoEnabled, inCard.videoPinned], trasUsar: live.videoEnabled } };
+      });
+
+      // ── C25 Curso existente: no romperlo ──
+      await tryCase(25, 'Curso existente', 'Un curso armado antes de este paso (sin elección) sigue igual: opciones, diseño y propuesta funcionan; su propuesta no gana filas nuevas', async () => {
+        const id = await newCourse('[Cierre C25] Curso anterior al paso Estructura');
+        const { cv } = await importDoc(id, 'microcurriculo.docx', await AF.fixture('consistent', 'docx'));
+        const st = await readStructure(id);
+        const old = await api('POST', `/courses/${id}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: cv });
+        const o = await opts(id);
+        const card = await rec(id);
+        const S0 = await pbState(id);
+        const rows = S0.draft.document.sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows).map((r) => r.label);
+        return { pass: [200, 201].includes(old.status) && o.current.choice === null && !!card.design && !('selected' in S0.draft.model.structure) && rows.includes('Organización') && !rows.includes('Diseño seleccionado'),
+          actual: { aplicar: old.status, eleccion: o.current.choice, filas: rows } };
+      });
+
+      // ── C26 «Continuar con el curso»: reconstruir el estado ──
+      await tryCase(26, '«Continuar con el curso»', 'Al volver, el servidor devuelve la misma elección, forma y propuesta (el paso «Estructura» se reconstruye)', async () => {
+        const o = await opts(costos.id);
+        const S1 = await pbState(costos.id);
+        const S2 = await pbState(costos.id);
+        const live = await contentShape(costos.id);
+        return { pass: o.current.choice === 'custom' && JSON.stringify(o.current.shape) === JSON.stringify(live) && S1.draft.modelSha256 === S2.draft.modelSha256 && S1.draft.model.structure.selected.choice === 'custom',
+          actual: { eleccion: o.current, forma: live, huellaEstable: S1.draft.modelSha256 === S2.draft.modelSha256 } };
+      });
+
+      // ── Piloto: propuesta, PDF, aprobación, Blueprint, Manifest, generación MOCK ──
+      await tryCase(27, 'Prebrief', 'Piloto: «Diseño seleccionado», 4 de 4 contenidos, excepción de videos con su motivo; sin textos técnicos', async () => {
+        const S0 = await pbState(pilotId);
+        const rows = S0.draft.document.sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows);
+        const row = (l) => (rows.find((r) => r.label === l) || {}).value || '';
+        const strs = [];
+        const walk = (x, k) => { if (typeof x === 'string') { if (!/^(t|origin|id|n|kind|where|code|ref)$/.test(k || '')) strs.push(x); } else if (Array.isArray(x)) x.forEach((v) => walk(v, k)); else if (x && typeof x === 'object') for (const kk of Object.keys(x)) walk(x[kk], kk); };
+        walk(S0.draft.document);
+        const tech = strs.filter((s) => /\b(RQ\d+|none|null|undefined|sha256|contentMap|structureOrigin|requirement:)\b/.test(s));
+        const vidEx = S0.draft.model.exceptions.filter((e) => /video/.test(e.requirementText));
+        return { pass: /2 módulos × 2 capítulos de contenido.* · Exigida por el documento$/.test(row('Diseño seleccionado')) && vidEx.length === 2 && S0.draft.model.exceptions.length === 2 && row('Contenidos del documento') === 'Los 4 contenidos del documento están en el diseño, cada uno en un capítulo.' && tech.length === 0 && vidEx.length >= 1 && S0.draft.readiness.ready,
+          actual: { diseño: row('Diseño seleccionado'), contenidos: row('Contenidos del documento'), textosTecnicos: tech.slice(0, 3), excepcionesVideo: vidEx.map((e) => [e.requirementText, e.appliedText, !!(e.reason || e.coveredBy)]) } };
+      });
+      let pVer = null;
+      await tryCase(28, 'PDF', 'Piloto: el PDF (borrador, para aprobación y aprobado) sale de la misma propuesta: diseño seleccionado, no cubierto y quién aprobó', async () => {
+        const d = await getPdf(`/courses/${pilotId}/prebrief/draft.pdf`);
+        const dt = await pdfTextOf(d.buf);
+        pVer = await prepareApprove(pilotId);
+        const a = await getPdf(`/courses/${pilotId}/prebrief/versions/${pVer.version}/pdf?variant=approved`);
+        const at = await pdfTextOf(a.buf);
+        const need = ['Diseño seleccionado', 'Exigida por el documento', 'Los 4 contenidos del documento están en el diseño', '2 videos por capítulo de contenido', '8 videos', 'Requisito no cubierto por Cursia'];
+        const i = dt.indexOf('2 videos por capítulo de contenido');
+        return { pass: d.status === 200 && /BORRADOR/i.test(dt) && need.every((t) => dt.includes(t)) && /no cubiert|excepci[oó]n aceptada|Aceptación de la institución/i.test(dt) && a.status === 200 && /Aprobado por: Validación de cierre/.test(at) && need.every((t) => at.includes(t)),
+          actual: { borrador: [d.status, need.map((t) => dt.includes(t))], aprobado: [a.status, /Aprobado por: Validación de cierre/.test(at), need.map((t) => at.includes(t))], textoVideos: i >= 0 ? dt.slice(Math.max(0, i - 120), i + 220) : null } };
+      });
+      await tryCase(29, 'Blueprint', 'Piloto: el Blueprint congelado es lo aprobado: 2 × 2 de contenido + 1 práctica por módulo, 4 videos (1 por capítulo de contenido), misma huella que la versión aprobada', async () => {
+        const [bp] = await q(`select b.snapshot_json, b.snapshot_sha256, v.blueprint_sha256 from public.course_blueprints b join public.course_prebrief_versions v on v.blueprint_id = b.id where v.course_id = $1 and v.version = $2`, [pilotId, pVer.version]);
+        const snap = typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json;
+        const kindOf = (c) => (c.kind === 'practice' ? 'practice' : 'content');
+        const shape = snap.modules.map((m) => m.chapters.filter((c) => kindOf(c) === 'content').length);
+        const practice = snap.modules.map((m) => m.chapters.filter((c) => kindOf(c) === 'practice').length);
+        const videos = snap.modules.flatMap((m) => m.chapters).filter((c) => kindOf(c) === 'content' && (c.video_enabled === true || c.videoEnabled === true)).length;
+        return { pass: JSON.stringify(shape) === '[2,2]' && JSON.stringify(practice) === '[1,1]' && videos === 4 && bp.snapshot_sha256 === bp.blueprint_sha256, actual: { contenido: shape, practicas: practice, videos, huella: bp.snapshot_sha256 === bp.blueprint_sha256 } };
+      });
+      let pRun = null;
+      await tryCase(30, 'Manifest', 'Piloto: el Manifest = Blueprint (2 módulos, 4 videos, 2 Actividades de Aplicación); la generación MOCK produce exactamente sus items', async () => {
+        const runsBase = runsOf(pilotId, pVer.blueprintNumber);
+        const ctxP = { nombre: 'Atención Integral en Salud a Víctimas de Violencia Sexual', sector: 'Salud', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro', obj: 'Atención inicial segura', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+        const st = await readStructure(pilotId);
+        llm.st.courseId = pilotId;
+        llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+        for (const m of st.modules) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+        // El botón real del piloto: costo → «Autorizar y generar» (approve-and-start con la huella del estimado), sin atajos.
+        // Política de presupuesto del curso (la del piloto: USD 60); sin política, approve-and-start falla cerrado.
+        await q(`insert into public.cost_budget_policies (scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by)
+                 values ('course', $1, 1, $2::jsonb, true, 'BLOCK', 'e2e-cierre')`, [String(pilotId), JSON.stringify({ maxCostPerRun: 60, maxCostPerCourse: 60 })]);
+        const est = await api('POST', `${runsBase}/estimate-preview`, ctxP);
+        if (est.status !== 200) throw new Error(`estimado: ${est.status} ${est.error}`);
+        const start = await api('POST', `${runsBase}/approve-and-start`, { ...ctxP, estimateHash: est.data.estimateHash });
+        if (start.status !== 201) throw new Error(`approve-and-start: ${start.status} ${start.error}`);
+        pRun = start.data.run.id;
+        llm.st.tag = 'E22';
+        S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+        const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId: pilotId, blueprintNumber: pVer.blueprintNumber, runId: pRun }), 'E22 piloto', undefined, pRun);
+        const items = await waitItemsDone(pRun);
+        const [manRow] = await q(`select m.manifest_json as manifest from public.course_generation_manifests m join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [pRun]);
+        const Mf = typeof manRow.manifest === 'string' ? JSON.parse(manRow.manifest) : manRow.manifest;
+        const Mm = Mf.manifest || Mf;
+        const vids = Mm.items.filter((i) => /^video:/.test(i.key)).length;
+        const apps = Mm.items.filter((i) => i.type === 'application_activity').length;
+        const h5p = Mm.items.filter((i) => i.type === 'activity').length;
+        const P = await packageRun('E22', pilotId, pVer.blueprintNumber, pRun);
+        results.courses.E22 = { courseId: pilotId, spec: { passing: 70, engine: 'h5p' }, manifestModules: Mm.modules, features: Mm.features, applications: apps,
+          reviewCardsChapterIds: ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length)),
+          modules: st.modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) })), blueprintNumber: pVer.blueprintNumber, runId: pRun, items: items.length };
+        return { pass: stt.failed === 0 && !stt.fatalError && items.every((i) => i.status === 'completed') && Mm.modules.length === 2 && vids === 4 && apps === 2 && h5p === 4 && !!start.data.run
+          && JSON.stringify(items.map((i) => i.item_key).sort()) === JSON.stringify(Mm.items.map((i) => i.key).sort()),
+          actual: { aprobarYGenerar: start.status, items: items.length, fallidos: stt.failed, modulos: Mm.modules.length, videos: vids, actividadesH5P: h5p, actividadesAplicacion: apps } };
+      });
+      await tryCase(31, 'R68 vía API', 'Piloto: cambiar el motivo de la excepción de videos después de aprobar invalida la aprobación y la API bloquea producir y estimar', async () => {
+        const key = (await pbState(pilotId)).draft.model.exceptions.find((e) => e.capability && !e.coveredBy).requirementKey;
+        await api('PUT', `/courses/${pilotId}/prebrief/exception-reasons`, { requirementKey: key, reason: 'Otro motivo: la institución prefiere un solo video por capítulo de contenido.' });
+        const vs = await verStatus(pilotId, pVer.version);
+        const runsBase = runsOf(pilotId, pVer.blueprintNumber);
+        const r1 = await api('POST', runsBase, ctxRun);
+        const r2 = await api('POST', `${runsBase}/estimate-preview`, ctxRun);
+        return { pass: vs.status === 'invalidated' && r1.status === 409 && r2.status === 409, actual: { estado: vs.status, producir: [r1.status, r1.raw && r1.raw.reason], estimar: [r2.status, r2.raw && r2.raw.reason] } };
+      });
+      await tryCase(32, 'Intento de bypass del frontend', 'El servidor bloquea: approve-and-start sin aprobación vigente, aprobar con otra huella y otro usuario sobre el curso', async () => {
+        const runsBase = runsOf(pilotId, pVer.blueprintNumber);
+        const b1 = await api('POST', `${runsBase}/approve-and-start`, { ...ctxRun, estimateHash: 'a'.repeat(64) });
+        const S0 = await pbState(pilotId);
+        const prep = await api('POST', `/courses/${pilotId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        const b2 = await api('POST', `/courses/${pilotId}/prebrief/versions/${prep.data.version.version}/approve`, { expectedModelSha: 'f'.repeat(64), name: 'Intruso con otra huella', role: 'Coordinación académica', confirm: true });
+        const OTHER = jwt.sign({ sub: crypto.randomUUID(), email: 'e2e-cierre-otro@example.com', role: 'authenticated', aud: 'authenticated' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+        const b3 = await api('POST', `/courses/${pilotId}/prebrief/versions/${prep.data.version.version}/approve`, { expectedModelSha: prep.data.version.modelSha256, name: 'Intruso de otra cuenta', role: 'Coordinación académica', confirm: true }, OTHER);
+        const b4 = await api('POST', `/courses/${pilotId}/modules/apply-academic-structure`, { expectedCounter: 0, contextVersion: pilot.cv, choice: 'custom', shape: { modules: 9, chaptersPerModule: 9 } }, OTHER);
+        const b5 = await api('GET', `/courses/${pilotId}/design/structure-options`, undefined, OTHER);
+        return { pass: b1.status === 409 && b2.status === 409 && [403, 404].includes(b3.status) && [403, 404].includes(b4.status) && [403, 404].includes(b5.status),
+          actual: { approveAndStart: [b1.status, b1.raw && b1.raw.reason], otraHuella: b2.status, otroUsuarioAprobar: b3.status, otroUsuarioEstructura: b4.status, otroUsuarioOpciones: b5.status } };
+      });
+
+      const passN = CASES.filter((c) => c.resultado === 'PASS').length;
+      eq([CASES.length, passN], [32, 32], 'Fase 9: 32/32 casos obligatorios PASS');
+      // Sin proveedores reales: la red de la prueba solo habla con 127.0.0.1 (netguard) y el piloto usó proveedores falsos.
+      ok(pilot.ex.stats.providersCalled === 0, 'Cierre: lectura del piloto con 0 proveedores');
+    }, { fatal: false });
+
     // ═══ Fase 2/3 · E21 — «¿Cómo quieres estructurar tu curso?» + redistribución segura por HTTP real (USD 0, proveedores
     // FALSOS): documento de 5 unidades (18 contenidos) → forma personalizada 3 × 4 → cada contenido en un solo capítulo
     // (trazabilidad) → borrar un capítulo = «Contenido no cubierto» (crítico, bloquea) → «Incluirlos» → diseño → propuesta
@@ -3019,6 +3500,8 @@ function reservationBookkeeping(ev) {
     if (results.mbz.E20 && results.courses.E20) MOODLE_JOBS.push(['E20', 'E20']);
     // Fase 2/3 · E21: el curso con la estructura personalizada (contenidos redistribuidos) → restore, permisos y notas.
     if (results.mbz.E21 && results.courses.E21) MOODLE_JOBS.push(['E21', 'E21']);
+    // Cierre · E22: el piloto «Atención a víctimas de violencia sexual» (generación MOCK) → restore, permisos y notas.
+    if (results.mbz.E22 && results.courses.E22) MOODLE_JOBS.push(['E22', 'E22']);
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');

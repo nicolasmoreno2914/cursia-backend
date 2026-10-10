@@ -577,7 +577,9 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
     },
     structure: {
       origin: structureOrigin,
-      ...(inp.structureChoice ? { selected: { choice: inp.structureChoice, label: STRUCTURE_CHOICE_LABEL[inp.structureChoice] } } : {}),
+      // Cierre (review final m): la forma que exige el documento se presenta como tal aunque se haya elegido desde
+      // «Cursia recomienda» (que en ese caso propone exactamente la exigida).
+      ...(inp.structureChoice ? { selected: { choice: inp.structureChoice, label: structureOrigin === 'requirement' && (inp.structureChoice === 'cursia' || inp.structureChoice === 'document') ? 'Exigida por el documento' : STRUCTURE_CHOICE_LABEL[inp.structureChoice] } } : {}),
       ...(inp.contentCoverage && inp.contentCoverage.total > 0 ? { contents: { total: inp.contentCoverage.total, covered: inp.contentCoverage.covered } } : {}),
       modules,
       totals,

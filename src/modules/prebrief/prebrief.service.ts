@@ -467,17 +467,35 @@ export class PrebriefService {
     await this.loadCourse(courseId, ownerId);
     if (code !== null && !isCourseFormatCode(code)) throw new BadRequestException('El formato debe ser S, M, L o null.');
     const prev = await readCourseFormat(this.dataSource, courseId);
-    await writeCourseFormat(this.dataSource, courseId, code ? { code, catalogVersion: COURSE_FORMAT_CATALOG_VERSION, at: new Date().toISOString(), by: user.email || user.id } : null);
     const def = formatDef(code);
-    if (def) {
-      const cur = await this.profiles.getCurrent(courseId, ownerId, 'pedagogy');
-      // Sin perfil guardado: el perfil vacío VÁLIDO (con las horas del formato), nunca un objeto incompleto.
-      const data: any = cur && !cur.isDefault && cur.profile ? JSON.parse(JSON.stringify(cur.profile)) : emptyPedagogicalProfile();
-      delete data.designRules;
-      if (data.targetHours !== def.targetHours) {
-        data.targetHours = def.targetHours;
-        await this.profiles.append(courseId, ownerId, 'pedagogy', data, cur && !cur.isDefault ? Number(cur.version) : 0);
-      }
+    // Cierre (review final I1/I2): primero las horas, después el formato (si las horas fallan, nada cambió). Elegir un
+    // formato guarda qué horas puso y cuáles había; quitarlo (o cambiarlo) restaura las de antes si nadie las tocó, para
+    // que unas horas que la institución no eligió no queden como suyas («elegiste 42 h»).
+    const cur = await this.profiles.getCurrent(courseId, ownerId, 'pedagogy');
+    // Sin perfil guardado: el perfil vacío VÁLIDO, nunca un objeto incompleto.
+    const data: any = cur && !cur.isDefault && cur.profile ? JSON.parse(JSON.stringify(cur.profile)) : emptyPedagogicalProfile();
+    delete data.designRules;
+    const curHours: number | null = typeof data.targetHours === 'number' ? data.targetHours : null;
+    const prevSet = prev ? (prev.hoursSet !== undefined ? prev.hoursSet : (formatDef(prev.code) || { targetHours: null }).targetHours) : undefined;
+    const untouched = prev && prevSet !== undefined && prevSet !== null && curHours === prevSet;
+    const before: number | null = untouched ? (prev!.hoursBefore !== undefined ? prev!.hoursBefore : null) : curHours;
+    const wantHours: number | null = def ? def.targetHours : before;
+    const oldProfile = cur && !cur.isDefault && cur.profile ? JSON.parse(JSON.stringify(cur.profile)) : null;
+    let appended: number | null = null;
+    if (curHours !== wantHours) {
+      if (wantHours === null) delete data.targetHours; else data.targetHours = wantHours;
+      if (wantHours === null) delete data.targetHoursText;
+      const r = await this.profiles.append(courseId, ownerId, 'pedagogy', data, cur && !cur.isDefault ? Number(cur.version) : 0);
+      appended = Number(r.profile.version);
+    }
+    try {
+      await writeCourseFormat(this.dataSource, courseId, code
+        ? { code, catalogVersion: COURSE_FORMAT_CATALOG_VERSION, at: new Date().toISOString(), by: user.email || user.id, hoursSet: def!.targetHours, hoursBefore: before }
+        : null);
+    } catch (err) {
+      // Las horas se devuelven a como estaban: el formato no se guardó (nunca «no cambió nada» con las horas cambiadas).
+      if (appended !== null && oldProfile) { delete oldProfile.designRules; await this.profiles.append(courseId, ownerId, 'pedagogy', oldProfile, appended).catch(() => undefined); }
+      throw err;
     }
     await this.event(this.dataSource, courseId, null, 'format_selected', user.id, { from: prev ? prev.code : null, to: code });
     return { format: await readCourseFormat(this.dataSource, courseId) };
