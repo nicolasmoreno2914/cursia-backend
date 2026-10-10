@@ -583,6 +583,24 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     eq(['document', 'cursia', 'format'].map((c) => build({ ...inp, structureChoice: c }).structure.selected.label), ['Según el documento', 'Recomendada por Cursia', 'Formato elegido por la institución'], 'etiquetas para el cliente');
   });
 
+  await check('PB29 (QA Fase 2) excepción de horas con un diseño que no llega: «el diseño tiene 48,7 horas (estimadas)», nunca la meta', () => {
+    const mk = (status, est) => {
+      const inp = fixture({ format: 'M', doc4x5: true, reason: 'La institución prioriza una duración menor para el piloto.' });
+      const hr = { id: 'req-hours', key: 'target_hours|course', kind: 'target_hours', scope: { level: 'course' }, mode: 'exact', value: 64, obligation: 'required', applies: true, active: true, status: 'found', confidence: 'high', source: { documentId: 'doc-1', line: 8, page: 1, quote: 'Intensidad horaria total: 64 horas' } };
+      inp.card.requirements.items.push(hr);
+      inp.card.requirements.checks.push({ requirementId: hr.id, status: 'met', actual: { value: 64 }, chosenBy: 'teacher', severity: 'warning' });
+      inp.card.verification.checks.push({ id: 'requirement:req-hours', area: 'requirements', severity: 'warning', title: 'Excepción al requisito del documento: 64 horas', detail: 'x' });
+      if (status) { inp.card.design.status = status; inp.card.design.estimatedHours = est; }
+      return build(inp);
+    };
+    const exc = (m) => m.exceptions.find((e) => e.requirementKey === 'target_hours|course');
+    eq(exc(mk(null)).appliedText, '64 horas', 'dentro de la tolerancia: lo de siempre');
+    const m = mk('cannot_reach_target', 48.7);
+    eq(exc(m).appliedText, '48,7 horas (estimadas)', 'excepción: lo que tiene el diseño');
+    eq(m.requirements.items.find((i) => i.key === 'target_hours|course').actual, '48,7 horas (estimadas)', 'requisitos: misma fuente');
+    eq(M.prebriefModelSha(m), M.prebriefModelSha(mk('cannot_reach_target', 48.7)), 'huella estable');
+  });
+
   console.log(`\n${ok} OK · ${fail} fallas`);
   process.exit(fail ? 1 : 0);
 })();

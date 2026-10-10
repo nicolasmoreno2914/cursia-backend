@@ -436,7 +436,11 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
     else if (c && c.status === 'met' && (sev === 'ok' || !sev)) status = 'met';
     else if (c && c.status === 'met') status = 'met';
     else status = 'not_verifiable';
-    const actual = c && c.status !== 'not_verifiable' ? actualTextOf(r, c) : null;
+    // QA Fase 2: si el diseño no llega a las horas (o se pasa), lo que «tiene el diseño» son sus horas estimadas, no la meta
+    // («El documento pide 64 horas; el diseño tiene 64 horas» con un diseño de 48,7 h).
+    const hoursOff = r.kind === 'target_hours' && r.scope && r.scope.level === 'course' && design
+      && ['cannot_reach_target', 'minimum_exceeds_target', 'above_tolerance'].includes(String(design.status || ''));
+    const actual = c && c.status !== 'not_verifiable' ? (hoursOff ? `${String(totals.hours).replace('.', ',')} horas (estimadas)` : actualTextOf(r, c)) : null;
     const quote = r.source && clean(r.source.quote) ? { quote: clean(r.source.quote).slice(0, 160), page: typeof r.source.page === 'number' ? r.source.page : null } : null;
     // LOOP 9.1 (D): una lectura con dudas del documento no es «no verificable»: se dice que se usó como orientación y qué
     // tiene el diseño (así la institución ve la diferencia antes de aprobar).
