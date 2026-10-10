@@ -412,7 +412,7 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
   notes.push(`Los ${items.length} contenidos de las ${units.length} unidades del documento quedan en ${N} × ${M}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
   if (items.length > N * M) notes.push(`Hay más contenidos (${items.length}) que capítulos (${N * M}): algunos capítulos agrupan varios contenidos y los listan.`);
   if (extraChapters) notes.push(`${extraChapters === 1 ? 'Un capítulo no tiene' : `${extraChapters} capítulos no tienen`} contenido del documento (el documento trae ${items.length} contenidos para ${N * M} capítulos): quedan como profundización.`);
-  if (N !== units.length || docShape.some((n) => n !== M)) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${docShape.join(', ')} capítulos); la estructura elegida es ${N} × ${M}.`);
+  if (N !== units.length || docShape.some((n) => n !== M)) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${docShape.join(', ')} contenidos por unidad); la estructura elegida es ${N} × ${M}.`);
   return finishContextProposal(ctx, modules, notes);
 }
 
