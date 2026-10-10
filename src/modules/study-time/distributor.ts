@@ -904,8 +904,13 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const perModule = minutes() / design.length;
   const modulesNeeded = Math.ceil(gap / perModule);
   const chapterAvg = avg(est.modules.flatMap((m) => m.chapters).map((c) => c.chapterEstimatedMinutes));
+  // Con la forma FIJADA (la eligió la institución o la exige el documento) Cursia no recomienda agregar módulos ni
+  // capítulos: contradiría esa decisión. Se dice la diferencia y la decide la institución (Verificación la presenta).
+  const shapeFixed = noContentAdditions || rq?.contentChaptersPerModule?.max !== undefined || rq?.chaptersPerModule?.max !== undefined;
   return result('cannot_reach_target', [
     `No alcanza ${fmtH(input.targetHours)} h sin rellenar: el diseño llega a ${fmtH(minutes() / 60)} h y faltan ${fmtH(gap / 60)} h.`,
-    `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${fmtH(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`,
+    shapeFixed
+      ? `La estructura la fijan la institución o el documento: Cursia no agrega módulos ni capítulos por su cuenta ni rellena para llegar. La diferencia queda para que la institución la decida (ver «Verificación»).`
+      : `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${fmtH(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`,
   ]);
 }

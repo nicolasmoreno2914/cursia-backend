@@ -60,7 +60,7 @@ export interface VerificationInput {
    * Prebrief · formato S/M/L elegido (decisión de la institución): la forma de contenidos y el rango de horas. Apartarse
    * del propio formato es una advertencia (las excepciones son solo frente al documento). Ausente = sin formato.
    */
-  format?: { label: string; modules: number; chaptersPerModule: number; hoursMin: number; hoursMax: number; structureOk: boolean; hoursOk: boolean; contentShape: number[] } | null;
+  format?: { label: string; modules: number; chaptersPerModule: number; hoursMin: number; hoursMax: number; structureOk: boolean; hoursOk: boolean; contentShape: number[]; designHours?: number | null } | null;
   status: 'within_tolerance' | 'above_tolerance' | 'minimum_exceeds_target' | 'cannot_reach_target';
   targetHours: number;
   estimatedHours: number;
@@ -271,7 +271,8 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     if (f.structureOk && f.hoursOk) add({ id: 'format', area: 'structure', severity: 'ok', title: `${f.label}: ${f.modules} módulos × ${f.chaptersPerModule} capítulos, ${f.hoursMin}–${f.hoursMax} horas` });
     else add({ id: 'format', area: 'structure', severity: 'warning',
       title: !f.structureOk ? `La estructura no coincide con el ${f.label} (${f.modules} módulos × ${f.chaptersPerModule} capítulos de contenido)` : `Las horas están fuera del ${f.label} (${f.hoursMin}–${f.hoursMax} horas)`,
-      detail: !f.structureOk ? `Capítulos de contenido por módulo: ${f.contentShape.join(', ') || 'ninguno'}. Las prácticas y las Actividades de Aplicación no cuentan.` : undefined,
+      detail: !f.structureOk ? `Capítulos de contenido por módulo: ${f.contentShape.join(', ') || 'ninguno'}. Las prácticas y las Actividades de Aplicación no cuentan.`
+        : typeof f.designHours === 'number' ? `El diseño equivale a ≈ ${String(Math.round(f.designHours * 10) / 10).replace('.', ',')} horas de trabajo del estudiante; la estructura sí es la del ${f.label}.` : undefined,
       fix: !f.structureOk ? { kind: 'editor', action: 'structure', label: 'Ajustar la estructura' } : { kind: 'adjust', action: 'targetHours', label: 'Revisar las horas' } });
   }
   // Pedagogía.
