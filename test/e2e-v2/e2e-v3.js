@@ -3342,7 +3342,7 @@ function reservationBookkeeping(ev) {
       REP.pdf = { status: d.status, bytes: d.buf.length, contiene: Object.fromEntries(need.map((t) => [t, dt.includes(t)])) };
       fs.writeFileSync(path.join(V3OUT, 'formato-m-prebrief-borrador.pdf'), d.buf);
       rec23('P3', 'PDF del Prebrief: nombre, Formato M, requisitos, «Requisito no cubierto por Cursia», RA y rango de horas; sin textos técnicos',
-        d.status === 200 && need.every((t) => dt.includes(t)) && !/\b(RQ\d+|undefined|null|NaN|none)\b/.test(dt), REP.pdf);
+        d.status === 200 && need.every((t) => dt.includes(t)) && !/\b(RQ\d+|undefined|null|NaN|none)\b/.test(dt) && !/RA\d \| /.test(dt), REP.pdf);
 
       // 7. Aprobación de prueba → Blueprint → Manifest.
       const prep = await api('POST', `/courses/${id}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
