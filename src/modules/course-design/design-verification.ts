@@ -83,8 +83,13 @@ export interface VerificationInput {
   autoLink: { chapterIds: string[]; outcomeIds: string[]; preview: { chapter: string; outcomes: string[] }[] };
   /** Ids (del Manifest) de los capítulos que propone el diseño y todavía no existen (review L84 I3). */
   proposedChapterIds: string[];
-  /** Contenidos del microcurrículo que ningún capítulo trabaja (review L84 I5). */
+  /** Contenidos del microcurrículo que ningún capítulo trabaja (review L84 I5): por términos, sin trazabilidad. */
   uncoveredContents: string[];
+  /**
+   * Fase 3: cobertura EXACTA por trazabilidad (la estructura salió del documento y guarda de qué contenidos viene cada
+   * capítulo). Si está disponible y vigente, manda sobre la comparación por términos.
+   */
+  contentCoverage?: { available: boolean; stale: boolean; total: number; covered: number; omitted: { text: string; unit: string }[]; duplicated: { text: string; chapters: number }[] } | null;
   /** Instrumentos de evaluación que pide el microcurrículo. */
   requiredEvaluations: string[];
   /** Instrumentos del microcurrículo cuyos resultados el diseño no evalúa con el mismo tipo de evidencia (review L84-2 N6). */
@@ -192,9 +197,30 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
   // Estructura: hay módulos y capítulos, y cubre los contenidos del microcurrículo (review L84 I5).
   if (!(k.modules > 0 && k.chapters > 0)) add({ id: 'structure', area: 'structure', severity: 'critical', title: 'El curso no tiene módulos con capítulos', fix: { kind: 'editor', action: 'structure', label: 'Armar la estructura' } });
   else add({ id: 'structure', area: 'structure', severity: 'ok', title: `${plural(k.modules, 'módulo', 'módulos')} y ${plural(k.chapters, 'capítulo', 'capítulos')}` });
-  if (input.uncoveredContents.length) {
-    add({ id: 'contents', area: 'structure', severity: 'warning', title: `${plural(input.uncoveredContents.length, 'contenido del microcurrículo no aparece', 'contenidos del microcurrículo no aparecen')} en ningún capítulo`,
-      detail: list(input.uncoveredContents), fix: { kind: 'editor', action: 'add_chapter', label: 'Agregar en el editor' } });
+  const cov = input.contentCoverage;
+  if (cov && cov.available && !cov.stale && cov.total > 0) {
+    // Fase 3: nada del documento se pierde en silencio. Un contenido sin capítulo es crítico (la propuesta no se prepara).
+    if (cov.omitted.length) {
+      add({ id: 'contents', area: 'structure', severity: 'critical',
+        title: `Contenido no cubierto: ${plural(cov.omitted.length, 'contenido del documento no está', 'contenidos del documento no están')} en ningún capítulo`,
+        detail: `Falta: ${list(cov.omitted.map((o) => o.text), 4)}. Inclúyelos en un capítulo (Cursia los pone junto a los contenidos vecinos del documento) o agrégalos en el editor.`,
+        fix: { kind: 'auto', action: 'cover_contents', label: 'Incluirlos en un capítulo' } });
+    } else add({ id: 'contents', area: 'structure', severity: 'ok', title: `Contenidos del documento: ${cov.covered} de ${cov.total} en el diseño` });
+    if (cov.duplicated.length) {
+      add({ id: 'contents_duplicated', area: 'structure', severity: 'warning',
+        title: `${plural(cov.duplicated.length, 'contenido del documento aparece', 'contenidos del documento aparecen')} en más de un capítulo`,
+        detail: list(cov.duplicated.map((d) => d.text)), fix: { kind: 'editor', action: 'structure', label: 'Revisar en el editor' } });
+    }
+  } else {
+    if (cov && cov.available && cov.stale) {
+      add({ id: 'contents_stale', area: 'structure', severity: 'warning', title: 'La estructura se armó con una versión anterior del documento',
+        detail: 'El documento cambió después de armar la estructura: vuelve a elegirla en «Estructura» para que cada contenido quede en su capítulo.',
+        fix: { kind: 'editor', action: 'structure', label: 'Revisar la estructura' } });
+    }
+    if (input.uncoveredContents.length) {
+      add({ id: 'contents', area: 'structure', severity: 'warning', title: `${plural(input.uncoveredContents.length, 'contenido del microcurrículo no aparece', 'contenidos del microcurrículo no aparecen')} en ningún capítulo`,
+        detail: list(input.uncoveredContents), fix: { kind: 'editor', action: 'add_chapter', label: 'Agregar en el editor' } });
+    }
   }
   // Actividades interactivas.
   const noActivity = k.chapters - k.activities;

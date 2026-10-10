@@ -1,9 +1,9 @@
-import { Body, Controller, HttpCode, Param, ParseIntPipe, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Param, ParseIntPipe, Post, UseGuards } from '@nestjs/common';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { CourseDesignService } from './course-design.service';
-import { DesignFixDto, HoursOriginDto, RecommendDesignDto, RequirementDecisionsDto } from './dto/recommend.dto';
+import { DesignFixDto, HoursOriginDto, RecommendDesignDto, RequirementDecisionsDto, StructurePreviewDto } from './dto/recommend.dto';
 
 /** LOOP 8.3 · «Cursia recomienda» (controller V2: listado en features/dynamic-routes.ts). */
 @Controller('courses/:courseId/design')
@@ -31,6 +31,19 @@ export class CourseDesignController {
   @HttpCode(200)
   requirementDecisions(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: RequirementDecisionsDto, @CurrentUser() user: AuthUser) {
     return this.service.saveRequirementDecisions(courseId, user.id, dto || {});
+  }
+
+  // GET /api/v1/courses/:courseId/design/structure-options → «¿Cómo quieres estructurar tu curso?» (Fase 2)
+  @Get('structure-options')
+  structureOptions(@Param('courseId', ParseIntPipe) courseId: number, @CurrentUser() user: AuthUser) {
+    return this.service.structureOptions(courseId, user.id);
+  }
+
+  // POST /api/v1/courses/:courseId/design/structure-preview  body { modules, chaptersPerModule, format? } → vista previa (Fase 2/3)
+  @Post('structure-preview')
+  @HttpCode(200)
+  structurePreview(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: StructurePreviewDto, @CurrentUser() user: AuthUser) {
+    return this.service.structurePreview(courseId, user.id, { modules: dto.modules, chaptersPerModule: dto.chaptersPerModule }, dto.format ?? null);
   }
 
   // POST /api/v1/courses/:courseId/design/fix  body { action: 'link_outcomes', expectedCounter } → «Corregir» automático (LOOP 8.4)

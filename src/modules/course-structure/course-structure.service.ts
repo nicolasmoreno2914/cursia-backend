@@ -95,7 +95,8 @@ import {
   writeStructureOrigin,
   liveStructureShape,
 } from './structure-authority';
-import { proposeStructureFromContext } from '../academic-context/context-design';
+import { proposeShapedStructureFromContext, proposeStructureFromContext } from '../academic-context/context-design';
+import { writeContentMap } from '../academic-context/content-coverage';
 import { validateAcademicContext } from '../academic-context/validate';
 import { ApplyAcademicStructureDto, RecordStructureOriginDto } from './dto/apply-academic-structure.dto';
 import { activityTypeRulesForNextManifest, blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
@@ -424,7 +425,8 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'CONTEXT_HAS_ERRORS', message: 'CONTEXT_HAS_ERRORS: el contexto académico tiene errores; corrígelos antes de usar su estructura.' });
       }
-      const proposal = proposeStructureFromContext(academic.context);
+      // Fase 3: con una forma elegida, los contenidos del documento se reparten en ella (cada uno en un solo capítulo).
+      const proposal = dto.shape ? proposeShapedStructureFromContext(academic.context, dto.shape) : proposeStructureFromContext(academic.context);
       if (!proposal.available) {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_STRUCTURE_IN_CONTEXT', message: `NO_STRUCTURE_IN_CONTEXT: ${proposal.reason}` });
@@ -477,6 +479,8 @@ export class CourseStructureService implements OnModuleInit {
       const previousHadDesign = liveChs.some((c) => c.chapter_kind === 'practice' || c.application_minutes !== null);
       const chsOf = (moduleId: string) => liveChs.filter((c) => c.module_id === moduleId);
       const contentReset = `${hasKind ? ", chapter_kind = 'content'" : ''}${hasApp ? ', application_minutes = null' : ''}`;
+      // Fase 3: de qué contenidos del documento viene cada capítulo (trazabilidad para la cobertura).
+      const contentMap: Record<string, string[]> = {};
       for (const [mi, m] of proposal.modules.entries()) {
         const mt = normalizeTitleOrThrow('module', m.title);
         const mDesc = checkedDescription(mergeDescription(cleanDescription(m.description), mt.description));
@@ -519,20 +523,24 @@ export class CourseStructureService implements OnModuleInit {
           const ct = normalizeTitleOrThrow('chapter', c.title);
           const cDesc = checkedDescription(mergeDescription(cleanDescription(c.description), ct.description));
           const links = c.outcomeIds.length ? JSON.stringify(c.outcomeIds) : null;
+          let chapterId: string;
           if (keepChs[ci]) {
+            chapterId = keepChs[ci]!.id;
             await queryRunner.query(
               `update public.course_chapters set position = $2, title = $3, objective = $4, description = $5, video_enabled = $6,
                       activity_enabled = $7, outcome_ids = $8::jsonb${contentReset}, updated_at = now()
                 where id = $1 and course_id = $9`,
-              [keepChs[ci]!.id, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links, courseId],
+              [chapterId, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links, courseId],
             );
           } else {
-            await queryRunner.query(
+            const [ins] = returningRows(await queryRunner.query(
               `insert into public.course_chapters (course_id, module_id, position, title, objective, description, video_enabled, activity_enabled, outcome_ids)
-               values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)`,
+               values ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb) returning id`,
               [courseId, moduleId, ci, ct.title, c.objective, cDesc, c.videoEnabled, c.activityEnabled, links],
-            );
+            ));
+            chapterId = ins.id;
           }
+          if (c.sourceContentIds.length) contentMap[chapterId] = [...c.sourceContentIds];
         }
         const extraChs = pool.filter((x) => !used.has(x.id)).map((x) => x.id);
         if (extraChs.length) await queryRunner.query(`delete from public.course_chapters where course_id = $1 and id = any($2::uuid[])`, [courseId, extraChs]);
@@ -546,12 +554,13 @@ export class CourseStructureService implements OnModuleInit {
         [courseId, proposal.finalExam],
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
-      await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString() });
+      await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) });
+      await writeContentMap(queryRunner, courseId, { version: 1, contextVersion: academic.version, chapters: contentMap, at: new Date().toISOString() });
       const structure = await this.readStructure(queryRunner, courseId, ownerId);
       await queryRunner.commitTransaction();
       return {
         ...structure,
-        replaced: { previous: currentCounts, modules: proposal.counts.modules, chapters: proposal.counts.chapters, contextVersion: academic.version, confirmed: authority.replaceReasons.length > 0 },
+        replaced: { previous: currentCounts, modules: proposal.counts.modules, chapters: proposal.counts.chapters, contextVersion: academic.version, confirmed: authority.replaceReasons.length > 0, notes: proposal.notes, ...(dto.choice ? { choice: dto.choice } : {}) },
         hadBlueprint: lock.hasBlueprint,
         previousHadDesign,
         notes: proposal.notes,

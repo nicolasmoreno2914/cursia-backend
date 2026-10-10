@@ -1,5 +1,5 @@
 import { Type } from 'class-transformer';
-import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, MaxLength, Min, ValidateNested } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsOptional, IsString, Max, MaxLength, Min, ValidateNested } from 'class-validator';
 
 /** LOOP 8.3 · «Ajustar»: cambios sobre el diseño que se recalcula (nada se guarda). Ausente = lo que ya decidió el curso. */
 export class DesignAdjustDto {
@@ -58,10 +58,27 @@ export class HoursOriginDto {
 
 /** LOOP 8.4 · «Corregir» automático de la verificación. */
 export class DesignFixDto {
-  @IsIn(['link_outcomes'])
-  action: 'link_outcomes';
+  @IsIn(['link_outcomes', 'cover_contents'])
+  action: 'link_outcomes' | 'cover_contents';
 
   @IsInt()
   @Min(0)
   expectedCounter: number;
+}
+
+/** Fase 2/3 · POST /courses/:courseId/design/structure-preview — vista previa de una forma (no aplica nada). */
+export class StructurePreviewDto {
+  @IsInt()
+  @Min(1)
+  @Max(50)
+  modules: number;
+
+  @IsInt()
+  @Min(1)
+  @Max(30)
+  chaptersPerModule: number;
+
+  @IsOptional()
+  @IsIn(['S', 'M', 'L'])
+  format?: 'S' | 'M' | 'L';
 }

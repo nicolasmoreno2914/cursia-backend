@@ -297,6 +297,8 @@ export async function structureEditedByTeacher(q: Q, courseId: number): Promise<
   if (fmt) return true;
   const origin = await readStructureOrigin(q as any, courseId);
   if (!origin) return true;
+  // Fase 2: una forma personalizada (N × M elegida por la institución) es su decisión sobre la estructura.
+  if (origin.choice === 'custom') return true;
   if (origin.shape) {
     const live = await liveStructureShape(q as any, courseId);
     return live.length !== origin.shape.length || live.some((n, i) => n !== origin.shape![i]);

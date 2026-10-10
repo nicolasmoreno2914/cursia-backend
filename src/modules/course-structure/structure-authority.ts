@@ -19,6 +19,12 @@
 export const STRUCTURE_ORIGIN_KEY = 'structureOrigin';
 export const STRUCTURE_ORIGIN_SOURCES = ['ai_proposal', 'academic_context'] as const;
 export type StructureOriginSource = (typeof STRUCTURE_ORIGIN_SOURCES)[number];
+/**
+ * Fase 2 · cómo se eligió la estructura en «¿Cómo quieres estructurar tu curso?»: según el documento, la que recomienda
+ * Cursia, un formato S/M/L o personalizada (N × M de la institución: es SU decisión frente a los requisitos).
+ */
+export const STRUCTURE_CHOICES = ['document', 'cursia', 'format', 'custom'] as const;
+export type StructureChoice = (typeof STRUCTURE_CHOICES)[number];
 
 export interface StructureOrigin {
   source: StructureOriginSource;
@@ -33,6 +39,8 @@ export interface StructureOrigin {
    * (sin forma) se comparan por el contador, como antes.
    */
   shape?: number[];
+  /** Fase 2: la opción elegida (solo presente si se eligió en la pantalla de estructura). */
+  choice?: StructureChoice;
 }
 
 export type StructureReplaceReason = 'user_edits' | 'confirmed_blueprint';
@@ -63,7 +71,8 @@ export function parseStructureOrigin(v: unknown): StructureOrigin | null {
   const cv = o.contextVersion;
   const contextVersion = typeof cv === 'number' && Number.isInteger(cv) && cv >= 1 ? cv : null;
   const shape = Array.isArray(o.shape) && o.shape.length > 0 && o.shape.every((n) => typeof n === 'number' && Number.isInteger(n) && n >= 0) ? (o.shape as number[]) : null;
-  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '', ...(shape ? { shape } : {}) };
+  const choice = (STRUCTURE_CHOICES as readonly string[]).includes(o.choice as string) ? (o.choice as StructureChoice) : null;
+  return { source: o.source as StructureOriginSource, counter: o.counter, contextVersion, at: typeof o.at === 'string' ? o.at : '', ...(shape ? { shape } : {}), ...(choice ? { choice } : {}) };
 }
 
 const blank = (v: unknown) => v === null || v === undefined || !String(v).trim();

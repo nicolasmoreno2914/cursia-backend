@@ -1,3 +1,6 @@
+import { contentCoverage, documentContents, readContentMap, writeContentMap } from '../academic-context/content-coverage';
+import { documentStructureShape, isValidShape, proposeShapedStructureFromContext } from '../academic-context/context-design';
+import { recommendShape, shapeDifferences, structuralRequirements } from './structure-options';
 import { BadRequestException, Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
@@ -27,7 +30,7 @@ import {
 import { DistributionResult } from '../study-time/distributor';
 import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto, RequirementDecisionsDto } from './dto/recommend.dto';
-import { formatDef, formatFit, readCourseFormat } from '../prebrief/course-formats';
+import { COURSE_FORMATS, COURSE_FORMAT_CODES, CourseFormatCode, formatDef, formatFit, readCourseFormat } from '../prebrief/course-formats';
 
 /** Prioridad audiovisual por defecto de V2 (sin preferencia guardada). */
 export const DEFAULT_AUDIOVISUAL = 'recommended' as const;
@@ -47,6 +50,69 @@ export class CourseDesignService {
     private readonly coursesService: CoursesService,
     private readonly pedagogy: PedagogyService,
   ) {}
+
+  /**
+   * Fase 2 · «¿Cómo quieres estructurar tu curso?»: lo que encontró Cursia en el documento, lo que exige, lo que recomienda,
+   * los formatos S/M/L y lo elegido. Solo lectura, sin proveedores.
+   */
+  async structureOptions(courseId: number, ownerId: string) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(() => null);
+    const auth = await loadRequirementAuthority(this.dataSource, courseId, academic ? academic.context.documents : []);
+    const facts = await loadCourseFacts(this.dataSource, courseId);
+    const docShape = academic ? documentStructureShape(academic.context) : null;
+    const contents = academic ? documentContents(academic.context) : [];
+    const hours = facts.targetHours && typeof facts.targetHours.value === 'number' ? facts.targetHours.value : null;
+    const sreq = structuralRequirements(auth.required);
+    const origin = await readStructureOrigin(this.dataSource as any, courseId);
+    const fmt = await readCourseFormat(this.dataSource, courseId);
+    const live: { n: number }[] = await this.dataSource.query(
+      `select count(c.id) filter (where coalesce(to_jsonb(c) ->> 'chapter_kind', 'content') <> 'practice')::int as n
+         from public.course_modules m left join public.course_chapters c on c.module_id = m.id where m.course_id = $1 group by m.id, m.position order by m.position`,
+      [courseId],
+    );
+    return {
+      providersCalled: 0,
+      contextVersion: academic ? academic.version : null,
+      hasDocumentContents: contents.length > 0,
+      contentsCount: contents.length,
+      document: docShape ? { shape: docShape, modules: docShape.length, chapters: docShape.reduce((a, b) => a + b, 0) } : null,
+      requirements: {
+        modules: sreq.modules.map((r) => requirementText(r)),
+        chapters: sreq.chapters.map((r) => requirementText(r)),
+        structure: sreq.structure.map((r) => requirementText(r)),
+        hours: sreq.hours.map((r) => requirementText(r)),
+      },
+      targetHours: hours !== null ? { value: hours, source: facts.targetHours.source } : null,
+      recommended: recommendShape(auth.required, docShape, hours),
+      formats: COURSE_FORMAT_CODES.map((c) => { const f = COURSE_FORMATS[c]; return { code: c, label: f.label, modules: f.modules, chaptersPerModule: f.chaptersPerModule, hoursMin: f.hoursMin, hoursMax: f.hoursMax, targetHours: f.targetHours }; }),
+      current: { choice: origin && origin.choice ? origin.choice : null, format: fmt ? fmt.code : null, shape: live.map((r) => Number(r.n)) },
+    };
+  }
+
+  /**
+   * Fase 2/3 · vista previa de una forma: cómo quedan los contenidos del documento (sin aplicar nada), cuántos quedan en
+   * capítulos y qué diferencias tiene con lo que establece el documento. Solo lectura, sin proveedores.
+   */
+  async structurePreview(courseId: number, ownerId: string, shape: { modules: number; chaptersPerModule: number }, formatCode: string | null) {
+    assertDynamicOwnerAllowed(ownerId);
+    await this.loadCourse(courseId, ownerId);
+    if (!isValidShape(shape)) throw new BadRequestException('INVALID_SHAPE: la estructura debe tener entre 1 y 50 módulos y entre 1 y 30 capítulos por módulo.');
+    const code = formatCode && (COURSE_FORMAT_CODES as readonly string[]).includes(formatCode) ? (formatCode as CourseFormatCode) : null;
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(() => null);
+    const auth = await loadRequirementAuthority(this.dataSource, courseId, academic ? academic.context.documents : []);
+    const differences = shapeDifferences(auth.required, shape, code);
+    const contents = academic ? documentContents(academic.context) : [];
+    if (!academic || !contents.length) return { providersCalled: 0, shape, differences, plan: null, coverage: null, notes: [] };
+    const p = proposeShapedStructureFromContext(academic.context, shape);
+    const assigned = p.modules.flatMap((m) => m.chapters.flatMap((c) => c.sourceContentIds));
+    return {
+      providersCalled: 0, shape, differences, notes: p.notes,
+      plan: p.modules.map((m) => ({ title: m.title, chapters: m.chapters.map((c) => ({ title: c.title, contents: c.sourceContentIds.length, outcomeIds: c.outcomeIds })) })),
+      coverage: { total: contents.length, assigned: new Set(assigned).size, duplicated: assigned.length - new Set(assigned).size },
+    };
+  }
 
   private async loadCourse(courseId: number, ownerId: string) {
     const course = await this.coursesService.findOne(courseId, ownerId); // 404 si no es suyo
@@ -313,6 +379,7 @@ export class CourseDesignService {
         },
         proposedChapterIds: dist.modules.flatMap((m) => m.chapters.filter((c) => c.proposed).map((c) => proposedChapterUuid(c.id))),
         uncoveredContents: academic ? uncoveredUnitContents(academic.context, live) : [],
+        contentCoverage: academic ? contentCoverage(academic.context, academic.version, await readContentMap(this.dataSource, courseId), live.map((c) => c.id)) : null,
         requiredEvaluations: academic ? academic.context.evaluation.map((e) => e.instrument).filter(Boolean) : [],
         pinnedApplicationsOutsideMode: dist.modules.flatMap((m) => m.chapters.filter((c) => c.applicationPinned && c.applicationMinutes
           && ((prefs.applicationActivities || 'auto') === 'none' || ((prefs.applicationActivities || 'auto') === 'practice_only' && c.kind !== 'practice'))).map((c) => c.id)),
@@ -464,8 +531,9 @@ export class CourseDesignService {
   async fix(courseId: number, ownerId: string, action: string, expectedCounter: number) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
-    if (action !== 'link_outcomes') throw new BadRequestException(`Acción desconocida: ${JSON.stringify(action)}`);
+    if (action !== 'link_outcomes' && action !== 'cover_contents') throw new BadRequestException(`Acción desconocida: ${JSON.stringify(action)}`);
     const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
+    if (action === 'cover_contents') return this.coverContents(courseId, expectedCounter, academic);
     if (!academic) throw new BadRequestException('NO_ACADEMIC_CONTEXT: el curso no tiene resultados de aprendizaje para vincular.');
     const qr = this.dataSource.createQueryRunner();
     try {
@@ -509,6 +577,72 @@ export class CourseDesignService {
     await this.loadCourse(courseId, ownerId);
     const released = await clearDesignPins(this.dataSource, courseId);
     return { released };
+  }
+
+  /**
+   * Fase 3 · «Incluirlos en un capítulo»: cada contenido del documento que quedó sin capítulo va al capítulo de su vecino
+   * en el orden del documento (el anterior cubierto; si no hay, el siguiente; si no, el primer capítulo de contenido). Se
+   * agrega a su descripción y a la trazabilidad. Nunca borra ni mueve nada.
+   */
+  private async coverContents(courseId: number, expectedCounter: number, academic: Awaited<ReturnType<typeof loadCurrentAcademicContext>>) {
+    if (!academic) throw new BadRequestException('NO_ACADEMIC_CONTEXT: el curso no tiene un documento con contenidos.');
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      const [course] = await qr.query(`select structure_version_counter c from public.courses where id = $1 for update`, [courseId]);
+      if (Number(course.c) !== expectedCounter) {
+        await qr.rollbackTransaction();
+        throw new ConflictException({ code: 'STRUCTURE_CHANGED', message: 'STRUCTURE_CHANGED: la estructura cambió; vuelve a verla antes de corregir.' });
+      }
+      const map = await readContentMap(qr, courseId);
+      if (!map || map.contextVersion !== academic.version) {
+        await qr.rollbackTransaction();
+        throw new BadRequestException({ code: 'NO_CONTENT_MAP', message: 'NO_CONTENT_MAP: la estructura no se armó con esta versión del documento; vuelve a elegirla en «Estructura».' });
+      }
+      const chs: { id: string; position: number; mpos: number; description: string | null; kind: string | null }[] = await qr.query(
+        `select c.id, c.position, m.position as mpos, c.description, to_jsonb(c) ->> 'chapter_kind' as kind
+           from public.course_chapters c join public.course_modules m on m.id = c.module_id where c.course_id = $1 order by m.position, c.position`,
+        [courseId],
+      );
+      const live = new Set(chs.map((c) => c.id));
+      const contents = documentContents(academic.context);
+      const chapterOf = new Map<string, string>();
+      for (const [cid, ids] of Object.entries(map.chapters)) if (live.has(cid)) for (const id of ids) if (!chapterOf.has(id)) chapterOf.set(id, cid);
+      const firstContent = chs.find((c) => c.kind !== 'practice');
+      const applied: { content: string; chapterId: string }[] = [];
+      contents.forEach((c, i) => {
+        if (chapterOf.has(c.id)) return;
+        let target: string | undefined;
+        for (let j = i - 1; j >= 0 && !target; j--) target = chapterOf.get(contents[j].id);
+        for (let j = i + 1; j < contents.length && !target; j++) target = chapterOf.get(contents[j].id);
+        target = target || (firstContent && firstContent.id);
+        if (!target) return;
+        chapterOf.set(c.id, target);
+        map.chapters[target] = [...(map.chapters[target] || []), c.id];
+        applied.push({ content: c.text, chapterId: target });
+      });
+      for (const a of applied) {
+        const ch = chs.find((c) => c.id === a.chapterId)!;
+        const desc = [ch.description, a.content].filter(Boolean).join('; ');
+        ch.description = desc.length > 2000 ? `${desc.slice(0, 1999)}…` : desc;
+        await qr.query(`update public.course_chapters set description = $1, updated_at = now() where id = $2 and course_id = $3`, [ch.description, a.chapterId, courseId]);
+      }
+      let counter = expectedCounter;
+      if (applied.length) {
+        await writeContentMap(qr, courseId, { ...map, at: new Date().toISOString() });
+        const n = await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter c`, [courseId]);
+        counter = Number(returningRows(n)[0].c);
+        await advanceStructureOriginIfUntouched(qr, courseId, expectedCounter, counter);
+      }
+      await qr.commitTransaction();
+      return { action: 'cover_contents', coveredContents: applied.length, applied: applied.map((a) => a.content), structureVersionCounter: counter };
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
   }
 
   private async liveChapters(courseId: number): Promise<LiveChapter[]> {

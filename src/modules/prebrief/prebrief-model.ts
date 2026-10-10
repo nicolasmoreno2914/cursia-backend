@@ -127,6 +127,10 @@ export interface PrebriefModel {
   };
   structure: {
     origin: PrebriefOrigin;
+    /** Fase 2: cómo se eligió la forma en «¿Cómo quieres estructurar tu curso?» (solo si se eligió ahí). */
+    selected?: { choice: 'document' | 'cursia' | 'format' | 'custom'; label: string };
+    /** Fase 3: contenidos del documento que están en el diseño (solo si la estructura salió del documento). */
+    contents?: { total: number; covered: number };
     modules: PrebriefModule[];
     totals: { modules: number; chapters: number; contentChapters: number; practiceChapters: number; hours: number };
   };
@@ -190,6 +194,10 @@ export interface PrebriefInputs {
   format: StoredCourseFormat | null;
   /** Origen de la estructura (8.0): 'document' si la armó Cursia desde el documento. */
   structureSource: 'document' | 'cursia' | 'teacher';
+  /** Fase 2: elección del paso «Estructura» (null en cursos que no pasaron por él). */
+  structureChoice?: 'document' | 'cursia' | 'format' | 'custom' | null;
+  /** Fase 3: cobertura de los contenidos del documento (null sin mapa de trazabilidad). */
+  contentCoverage?: { total: number; covered: number } | null;
   exceptionReasons: Record<string, StoredExceptionReason>;
   /** Definición del enfoque (registro): resumen y directivas reales (texto). */
   approachInfo: { summary: string | null; cycle: string[] } | null;
@@ -272,6 +280,14 @@ export function canonicalModelJson(m: PrebriefModel): string {
  * del enfoque, texto de los requisitos, etiquetas de decisiones): mejorar un texto en un deploy no invalida aprobaciones.
  * Lo redactado queda archivado en el documento de cada versión.
  */
+/** Quién decidió la forma, en palabras del cliente. */
+export const STRUCTURE_CHOICE_LABEL: Record<'document' | 'cursia' | 'format' | 'custom', string> = {
+  document: 'Según el documento',
+  cursia: 'Recomendada por Cursia',
+  format: 'Formato elegido por la institución',
+  custom: 'Elegida por la institución',
+};
+
 export function hashProjection(m: PrebriefModel): unknown {
   const c = JSON.parse(JSON.stringify(m)) as PrebriefModel;
   c.pedagogy.cycle = [];
@@ -283,6 +299,9 @@ export function hashProjection(m: PrebriefModel): unknown {
   c.decisions = c.decisions.map((d) => ({ ...d, label: '', value: '' })); // el código crudo (`code`) sí entra
   c.course.modality = { ...c.course.modality, value: '' };
   if (c.duration.format) c.duration.format = { ...c.duration.format, value: '' };
+  // Fase 2/3: la elección (código) sí entra; la etiqueta y la cobertura (derivada de la estructura, ya en la huella) no.
+  if (c.structure.selected) c.structure.selected = { ...c.structure.selected, label: '' };
+  delete c.structure.contents;
   return c;
 }
 
@@ -552,7 +571,13 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       format: fdef ? { value: fdef.label, origin: 'format', code: fdef.code, modules: fdef.modules, chaptersPerModule: fdef.chaptersPerModule, hoursMin: fdef.hoursMin, hoursMax: fdef.hoursMax } : null,
       credits,
     },
-    structure: { origin: structureOrigin, modules, totals },
+    structure: {
+      origin: structureOrigin,
+      ...(inp.structureChoice ? { selected: { choice: inp.structureChoice, label: STRUCTURE_CHOICE_LABEL[inp.structureChoice] } } : {}),
+      ...(inp.contentCoverage && inp.contentCoverage.total > 0 ? { contents: { total: inp.contentCoverage.total, covered: inp.contentCoverage.covered } } : {}),
+      modules,
+      totals,
+    },
     evaluation,
     resources,
     requirements: {

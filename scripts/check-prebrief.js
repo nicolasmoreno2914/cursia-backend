@@ -562,6 +562,27 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     eq(build(inp).exceptions.find((e) => e.requirementKey === 'videos@course').reason, 'Motivo anterior del total.', 'motivo propio anterior');
   });
 
+  await check('PB28 (Fase 2/3) «Diseño seleccionado» y contenidos del documento: misma fuente; cursos sin el paso Estructura no cambian su huella', () => {
+    const inp = fixture({});
+    const plain = build(inp);
+    assert(!('selected' in plain.structure) && !('contents' in plain.structure), 'sin elección ni mapa: el modelo no gana claves (huellas aprobadas intactas)');
+    const legacySha = M.prebriefModelSha(plain);
+    const withCov = build({ ...inp, structureChoice: null, contentCoverage: { total: 18, covered: 18 } });
+    eq(withCov.structure.contents, { total: 18, covered: 18 }, 'cobertura en el modelo');
+    eq(M.prebriefModelSha(withCov), legacySha, 'la cobertura (derivada de la estructura) no entra en la huella');
+    const custom = build({ ...inp, structureChoice: 'custom', contentCoverage: { total: 18, covered: 18 } });
+    eq(custom.structure.selected, { choice: 'custom', label: 'Elegida por la institución' }, 'elección en el modelo');
+    assert(M.prebriefModelSha(custom) !== legacySha, 'la elección SÍ entra en la huella (cambiarla invalida la aprobación)');
+    const docRows = (m) => DOC.buildPrebriefDocument(m).sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows);
+    const rows = docRows(custom);
+    const val = (l) => (rows.find((r) => r.label === l) || {}).value;
+    assert(/ · Elegida por la institución$/.test(val('Diseño seleccionado')), `fila «Diseño seleccionado»: ${val('Diseño seleccionado')}`);
+    eq(val('Contenidos del documento'), 'Los 18 contenidos del documento están en el diseño, cada uno en un capítulo.', 'fila de contenidos');
+    eq((docRows(build({ ...inp, contentCoverage: { total: 18, covered: 16 } })).find((r) => r.label === 'Contenidos del documento') || {}).value, '16 de 18 contenidos del documento están en el diseño.', 'cobertura parcial');
+    assert(!docRows(plain).some((r) => r.label === 'Diseño seleccionado' || r.label === 'Contenidos del documento'), 'sin datos: sin filas');
+    eq(['document', 'cursia', 'format'].map((c) => build({ ...inp, structureChoice: c }).structure.selected.label), ['Según el documento', 'Recomendada por Cursia', 'Formato elegido por la institución'], 'etiquetas para el cliente');
+  });
+
   console.log(`\n${ok} OK · ${fail} fallas`);
   process.exit(fail ? 1 : 0);
 })();

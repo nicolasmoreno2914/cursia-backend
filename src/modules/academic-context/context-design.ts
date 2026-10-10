@@ -10,7 +10,7 @@ import {
 import { DISTRIBUTOR_RULES } from '../study-time/distributor';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { ASSESSMENT_METHODS, AssessmentMethod } from '../pedagogy/vocabulary';
-import type { AcademicContextV1, FieldStatus, ThematicUnit } from './academic-context';
+import type { AcademicContextV1, FieldStatus, ThematicUnit, UnitContent } from './academic-context';
 
 /**
  * Fase 3 · Loop 3.5 — Contexto académico → diseño (puro, determinista, sin proveedores).
@@ -232,6 +232,40 @@ function chunk<T>(xs: T[], k: number): T[][] {
   return out.filter((g) => g.length);
 }
 
+
+type OutcomeRef = { id: string; text: string };
+
+/** Un capítulo con un grupo de contenidos del documento (sus vínculos: los del contenido, los de la unidad o por términos). */
+function chapterFromContents(g: UnitContent[], unitLinks: string[], outcomes: OutcomeRef[], raOnly: OutcomeRef[], title: (t: string) => string): ContextChapterProposal {
+  const docLinks = [...new Set(g.flatMap((c) => c.outcomeIds))];
+  let outcomeIds = docLinks;
+  let linkStatus: LinkStatus = docLinks.length ? 'found' : 'none';
+  if (!outcomeIds.length && unitLinks.length) {
+    // La unidad vincula resultados: cada capítulo toma los que mejor le encajan (o todos, si ninguno destaca).
+    const candidates = outcomes.filter((o) => unitLinks.includes(o.id));
+    const lex = lexicalOutcomeMatches(g.map((c) => c.text).join(' '), candidates);
+    // Todos los de la unidad = lo que dice el documento (found); un subconjunto elegido por términos = inferred.
+    outcomeIds = lex.length && lex.length < unitLinks.length ? lex : [...unitLinks];
+    linkStatus = outcomeIds.length < unitLinks.length ? 'inferred' : 'found';
+  }
+  if (!outcomeIds.length && raOnly.length) {
+    outcomeIds = lexicalOutcomeMatches(g.map((c) => c.text).join(' '), raOnly);
+    linkStatus = outcomeIds.length ? 'inferred' : 'none';
+  }
+  const first = titleAndRest(g[0].text);
+  const description = g.length > 1 ? g.map((c) => c.text).join('; ') : first.rest;
+  return {
+    title: title(first.title),
+    objective: null,
+    description: description ? clip(description, 2000) : null,
+    videoEnabled: true,
+    activityEnabled: true,
+    outcomeIds: outcomeIds.slice(0, 8).sort(cmpOutcome),
+    linkStatus,
+    sourceContentIds: g.map((c) => c.id),
+  };
+}
+
 export function proposeStructureFromContext(ctx: AcademicContextV1): ContextStructureProposal {
   const notes: string[] = [];
   const empty = (reason: string): ContextStructureProposal => ({
@@ -258,35 +292,7 @@ export function proposeStructureFromContext(ctx: AcademicContextV1): ContextStru
     const groups = chunk(u.contents, Math.min(maxCh, u.contents.length));
     if (u.contents.length > maxCh) notes.push(`La unidad ${u.id} trae ${u.contents.length} contenidos: se agruparon en ${maxCh} capítulos (sin perder ninguno: cada capítulo lista los suyos).`);
     const unitLinks = u.outcomeIds;
-    const chapters = groups.map((g, gi): ContextChapterProposal => {
-      const docLinks = [...new Set(g.flatMap((c) => c.outcomeIds))];
-      let outcomeIds = docLinks;
-      let linkStatus: LinkStatus = docLinks.length ? 'found' : 'none';
-      if (!outcomeIds.length && unitLinks.length) {
-        // La unidad vincula resultados: cada capítulo toma los que mejor le encajan (o todos, si ninguno destaca).
-        const candidates = outcomes.filter((o) => unitLinks.includes(o.id));
-        const lex = lexicalOutcomeMatches(g.map((c) => c.text).join(' '), candidates);
-        // Todos los de la unidad = lo que dice el documento (found); un subconjunto elegido por términos = inferred.
-        outcomeIds = lex.length && lex.length < unitLinks.length ? lex : [...unitLinks];
-        linkStatus = outcomeIds.length < unitLinks.length ? 'inferred' : 'found';
-      }
-      if (!outcomeIds.length && raOnly.length) {
-        outcomeIds = lexicalOutcomeMatches(g.map((c) => c.text).join(' '), raOnly);
-        linkStatus = outcomeIds.length ? 'inferred' : 'none';
-      }
-      const first = titleAndRest(g[0].text);
-      const description = g.length > 1 ? g.map((c) => c.text).join('; ') : first.rest;
-      return {
-        title: uniqueTitle(first.title, `${u.id}.${gi + 1}`),
-        objective: null,
-        description: description ? clip(description, 2000) : null,
-        videoEnabled: true,
-        activityEnabled: true,
-        outcomeIds: outcomeIds.slice(0, 8).sort(cmpOutcome),
-        linkStatus,
-        sourceContentIds: g.map((c) => c.id),
-      };
-    });
+    const chapters = groups.map((g, gi): ContextChapterProposal => chapterFromContents(g, unitLinks, outcomes, raOnly, (t) => uniqueTitle(t, `${u.id}.${gi + 1}`)));
     const modLinks = [...new Set([...unitLinks, ...chapters.flatMap((c) => c.outcomeIds)])].sort(cmpOutcome);
     const modOutcomeTexts = modLinks.map((id) => outcomes.find((o) => o.id === id)).filter((o): o is { id: string; text: string } => !!o && o.id.startsWith('RA'));
     const t = titleAndRest(u.title);
@@ -302,6 +308,122 @@ export function proposeStructureFromContext(ctx: AcademicContextV1): ContextStru
     };
   });
 
+  return finishContextProposal(ctx, modules, notes);
+}
+
+// ── 2b. Redistribución en otra forma (Fase 3) ─────────────────────────────────────────────────────────────────
+
+/** Forma elegida: N módulos × M capítulos de contenido (las prácticas las agrega el diseño, no cuentan aquí). */
+export interface StructureShape { modules: number; chaptersPerModule: number }
+/** Validación de entrada (no es una capacidad: el editor no tiene máximo); evita pedidos absurdos a la API. */
+export const SHAPE_INPUT_MAX = Object.freeze({ modules: 50, chaptersPerModule: 30 });
+
+export function isValidShape(s: unknown): s is StructureShape {
+  const o = s as StructureShape;
+  return !!o && Number.isInteger(o.modules) && Number.isInteger(o.chaptersPerModule) && o.modules >= 1 && o.chaptersPerModule >= 1
+    && o.modules <= SHAPE_INPUT_MAX.modules && o.chaptersPerModule <= SHAPE_INPUT_MAX.chaptersPerModule;
+}
+
+/** Reparte en EXACTAMENTE k grupos consecutivos lo más parejos posible (los primeros, uno más; puede haber vacíos). */
+function splitEven<T>(xs: T[], k: number): T[][] {
+  const out: T[][] = [];
+  const base = Math.floor(xs.length / k);
+  let extra = xs.length % k;
+  let i = 0;
+  for (let g = 0; g < k; g++) {
+    const size = base + (extra > 0 ? 1 : 0);
+    if (extra > 0) extra--;
+    out.push(xs.slice(i, i + size));
+    i += size;
+  }
+  return out;
+}
+
+/** Forma que trae el documento (capítulos de contenido por módulo), o null si no trae unidades con contenidos. */
+export function documentStructureShape(ctx: AcademicContextV1): number[] | null {
+  const p = proposeStructureFromContext(ctx);
+  return p.available ? p.modules.map((m) => m.chapters.length) : null;
+}
+
+/**
+ * Fase 3 · los contenidos del documento en la forma que eligió la institución (p. ej. un documento 4 × 5 en 3 × 4).
+ * Cada contenido queda en EXACTAMENTE un capítulo (en el orden del documento: nunca se omite ni se duplica) y cada
+ * capítulo dice de qué contenidos viene (sourceContentIds: la trazabilidad que verifica la cobertura). Los resultados
+ * vienen de los contenidos y de sus unidades. Si el documento trae menos contenidos que capítulos, los que sobran se
+ * marcan como profundización sin contenido del documento (nunca se inventa un contenido).
+ */
+export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape: StructureShape): ContextStructureProposal {
+  const notes: string[] = [];
+  const units = ctx.units.filter((u) => u.contents.length > 0);
+  if (!isValidShape(shape) || !units.length) {
+    return {
+      contextDesignVersion: CONTEXT_DESIGN_VERSION, available: false, notes, modules: [], finalExam: true,
+      reason: !units.length ? 'El documento no trae unidades ni contenidos para repartir en otra estructura.' : 'La estructura pedida no es válida.',
+      counts: { modules: 0, chapters: 0, linkedChapters: 0, inferredLinks: 0, outcomesCovered: 0, outcomesTotal: ctx.outcomes.length },
+    };
+  }
+  const outcomes = [...ctx.outcomes.map((o) => ({ id: o.id, text: o.text })), ...ctx.competencies.map((c) => ({ id: c.id, text: c.text }))];
+  const raOnly = ctx.outcomes.map((o) => ({ id: o.id, text: o.text }));
+  const items = units.flatMap((u) => u.contents.map((c) => ({ c, u })));
+  const seenTitles = new Set<string>();
+  const uniqueTitle = (t: string, suffix: string) => {
+    let title = t;
+    if (seenTitles.has(title.toLowerCase())) title = `${t.slice(0, STRUCTURE_TITLE_MAX - suffix.length - 3)} (${suffix})`;
+    seenTitles.add(title.toLowerCase());
+    return title;
+  };
+  const N = shape.modules;
+  const M = shape.chaptersPerModule;
+  let extraChapters = 0;
+  const modules: ContextModuleProposal[] = splitEven(items, N).map((group, mi) => {
+    // Título del módulo: la unidad que más contenidos aporta; las demás que aporta quedan nombradas en la descripción.
+    const spanned = [...new Map(group.map((x) => [x.u.id, x.u])).values()];
+    const dominant = spanned.map((u) => ({ u, n: group.filter((x) => x.u === u).length })).sort((a, b) => b.n - a.n)[0];
+    const t = dominant ? titleAndRest(dominant.u.title) : { title: `Módulo ${mi + 1}`, rest: null };
+    const moduleTitle = uniqueTitle(t.title, `M${mi + 1}`);
+    const unitLinks = [...new Set(spanned.flatMap((u) => u.outcomeIds))];
+    const chapters = splitEven(group, M).map((g, ci): ContextChapterProposal => {
+      if (g.length) {
+        const links = [...new Set(g.flatMap((x) => x.u.outcomeIds))];
+        return chapterFromContents(g.map((x) => x.c), links, outcomes, raOnly, (tt) => uniqueTitle(tt, `${mi + 1}.${ci + 1}`));
+      }
+      extraChapters++;
+      const k = ci - group.length + 1;
+      const base = `Profundización ${k}: ${moduleTitle}`;
+      return {
+        title: uniqueTitle(base.length <= STRUCTURE_TITLE_MAX ? base : `Profundización ${k}`, `${mi + 1}.${ci + 1}`),
+        objective: null, description: null, videoEnabled: true, activityEnabled: true, outcomeIds: [...unitLinks].sort(cmpOutcome).slice(0, 8),
+        linkStatus: unitLinks.length ? 'found' : 'none', sourceContentIds: [],
+      };
+    });
+    const others = spanned.filter((u) => u !== (dominant && dominant.u)).map((u) => titleAndRest(u.title).title);
+    const desc = [t.rest, others.length ? `También incluye contenidos de: ${others.join(' · ')}.` : null].filter(Boolean).join(' ');
+    return {
+      title: moduleTitle,
+      objective: null,
+      description: desc ? clip(desc, 2000) : null,
+      examEnabled: true,
+      outcomeIds: [...new Set([...unitLinks, ...chapters.flatMap((c) => c.outcomeIds)])].sort(cmpOutcome),
+      sourceUnitId: dominant ? dominant.u.id : '',
+      chapters,
+    };
+  });
+  const docShape = units.map((u) => Math.min(DISTRIBUTOR_RULES.maxContentChaptersPerModule, u.contents.length));
+  notes.push(`Los ${items.length} contenidos de las ${units.length} unidades del documento quedan en ${N} × ${M}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
+  if (items.length > N * M) notes.push(`Hay más contenidos (${items.length}) que capítulos (${N * M}): algunos capítulos agrupan varios contenidos y los listan.`);
+  if (extraChapters) notes.push(`${extraChapters === 1 ? 'Un capítulo no tiene' : `${extraChapters} capítulos no tienen`} contenido del documento (el documento trae ${items.length} contenidos para ${N * M} capítulos): quedan como profundización.`);
+  if (N !== units.length || docShape.some((n) => n !== M)) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${docShape.join(', ')} capítulos); la estructura elegida es ${N} × ${M}.`);
+  return finishContextProposal(ctx, modules, notes);
+}
+
+/**
+ * Cierre común de una propuesta a partir del documento: ningún resultado queda sin capítulo si alguno comparte términos
+ * con él, los capítulos sin resultado toman el que mejor les encaja, y los conteos. Lo usan la estructura del documento y
+ * la redistribución en otra forma (Fase 3).
+ */
+function finishContextProposal(ctx: AcademicContextV1, modules: ContextModuleProposal[], notes: string[]): ContextStructureProposal {
+  const outcomes = [...ctx.outcomes.map((o) => ({ id: o.id, text: o.text })), ...ctx.competencies.map((c) => ({ id: c.id, text: c.text }))];
+  const raOnly = ctx.outcomes.map((o) => ({ id: o.id, text: o.text }));
   // LOOP 9.2 · Ningún resultado del documento queda sin capítulo si algún capítulo comparte términos con él: se vincula
   // al que mejor le encaja (inferido: el docente lo ve y lo cambia). Igual con un capítulo sin ningún resultado.
   const allChapters = modules.flatMap((m) => m.chapters);
