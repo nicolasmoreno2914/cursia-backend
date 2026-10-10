@@ -43,6 +43,9 @@ export interface StoredCourseFormat {
   catalogVersion: number;
   at: string;
   by: string | null;
+  /** Cierre: horas que el formato puso en el perfil y las que había antes (al quitar el formato se restauran). */
+  hoursSet?: number | null;
+  hoursBefore?: number | null;
 }
 
 export function isCourseFormatCode(v: unknown): v is CourseFormatCode {
@@ -59,6 +62,8 @@ export function parseCourseFormat(v: unknown): StoredCourseFormat | null {
     catalogVersion: typeof o.catalogVersion === 'number' ? o.catalogVersion : COURSE_FORMAT_CATALOG_VERSION,
     at: typeof o.at === 'string' ? o.at : '',
     by: typeof o.by === 'string' ? o.by : null,
+    ...(typeof o.hoursSet === 'number' || o.hoursSet === null ? { hoursSet: o.hoursSet as number | null } : {}),
+    ...(typeof o.hoursBefore === 'number' || o.hoursBefore === null ? { hoursBefore: o.hoursBefore as number | null } : {}),
   };
 }
 

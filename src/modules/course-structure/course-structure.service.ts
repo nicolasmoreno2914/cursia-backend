@@ -97,7 +97,7 @@ import {
 } from './structure-authority';
 import { proposeShapedStructureFromContext, proposeStructureFromContext } from '../academic-context/context-design';
 import { contentsFingerprint, writeContentMap } from '../academic-context/content-coverage';
-import { COURSE_FORMATS, readCourseFormat, writeCourseFormat } from '../prebrief/course-formats';
+import { COURSE_FORMATS, readCourseFormat } from '../prebrief/course-formats';
 import { validateAcademicContext } from '../academic-context/validate';
 import { ApplyAcademicStructureDto, RecordStructureOriginDto } from './dto/apply-academic-structure.dto';
 import { activityTypeRulesForNextManifest, blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
@@ -437,6 +437,12 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'INVALID_CHOICE', message: 'INVALID_CHOICE: esta opción necesita la forma elegida (módulos y capítulos por módulo).' });
       }
+      // Cierre (review final I1): con otra elección, el formato debe quitarse antes (PUT /format null restaura las horas que
+      // el formato puso); quitarlo aquí dejaba esas horas como si las hubiera elegido la institución.
+      if (dto.choice && dto.choice !== 'format' && (await readCourseFormat(queryRunner, courseId))) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException({ code: 'FORMAT_STILL_SET', message: 'FORMAT_STILL_SET: el curso tiene un formato S/M/L elegido; quítalo antes de usar otra estructura.' });
+      }
       if (dto.choice === 'format') {
         const fmt = await readCourseFormat(queryRunner, courseId);
         const def = fmt ? COURSE_FORMATS[fmt.code] : null;
@@ -576,8 +582,7 @@ export class CourseStructureService implements OnModuleInit {
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
       await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) });
       await writeContentMap(queryRunner, courseId, { version: 1, contextVersion: academic.version, chapters: contentMap, contentsSha: contentsFingerprint(academic.context), at: new Date().toISOString() });
-      // Un formato es una alternativa: elegir otra opción lo quita (nunca queda un formato junto a otra elección).
-      if (dto.choice && dto.choice !== 'format') await writeCourseFormat(queryRunner, courseId, null);
+      // (El formato se quita ANTES con PUT /format null, que también devuelve sus horas: ver la validación de arriba.)
       const structure = await this.readStructure(queryRunner, courseId, ownerId);
       await queryRunner.commitTransaction();
       return {
@@ -612,7 +617,10 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'FORMAT_CHOICE_MISMATCH', message: 'FORMAT_CHOICE_MISMATCH: guarda primero el formato elegido.' });
       }
-      if (dto.choice && dto.choice !== 'format') await writeCourseFormat(queryRunner, courseId, null);
+      if (dto.choice && dto.choice !== 'format' && (await readCourseFormat(queryRunner, courseId))) {
+        await queryRunner.rollbackTransaction();
+        throw new ConflictException({ code: 'FORMAT_STILL_SET', message: 'FORMAT_STILL_SET: el curso tiene un formato S/M/L elegido; quítalo antes de usar otra estructura.' });
+      }
       const origin: StructureOrigin = { source: dto.source, counter: lock.counter, contextVersion: null, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) };
       await writeStructureOrigin(queryRunner, courseId, origin);
       // Review I2: una estructura propuesta por la IA no sale de los contenidos del documento: la trazabilidad anterior
