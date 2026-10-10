@@ -3123,7 +3123,8 @@ function reservationBookkeeping(ev) {
         const apps = Mm.items.filter((i) => i.type === 'application_activity').length;
         const h5p = Mm.items.filter((i) => i.type === 'activity').length;
         const P = await packageRun('E22', pilotId, pVer.blueprintNumber, pRun);
-        results.courses.E22 = { courseId: pilotId, spec: { passing: 70, engine: 'h5p' }, manifestModules: Mm.modules, features: Mm.features, applications: apps,
+        const A22 = D('modules/course-profiles/course-profiles.js');
+        results.courses.E22 = { courseId: pilotId, spec: { passing: 70, engine: 'h5p' }, assessment: { ...A22.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 }, manifestModules: Mm.modules, features: Mm.features, applications: apps,
           reviewCardsChapterIds: ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length)),
           modules: st.modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) })), blueprintNumber: pVer.blueprintNumber, runId: pRun, items: items.length };
         return { pass: stt.failed === 0 && !stt.fatalError && items.every((i) => i.status === 'completed') && Mm.modules.length === 2 && vids === 4 && apps === 2 && h5p === 4 && !!start.data.run
