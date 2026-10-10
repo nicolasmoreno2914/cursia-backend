@@ -87,7 +87,10 @@ function ok(cond, msg, detail) {
   return !!cond;
 }
 function eq(a, b, msg) { return ok(JSON.stringify(a) === JSON.stringify(b), msg, { got: a, want: b }); }
+// Solo para iterar en local: E2E_V3_STEPS=<regex> corre solo los pasos cuyo nombre coincide (el gate nunca lo define).
+const STEP_FILTER = process.env.E2E_V3_STEPS ? new RegExp(process.env.E2E_V3_STEPS) : null;
 async function step(name, fn, { fatal = true } = {}) {
+  if (STEP_FILTER && !STEP_FILTER.test(name)) { console.log(`(paso ${name} omitido por E2E_V3_STEPS)`); return; }
   curStep = name;
   console.log(`\n══════ ${name} ══════`);
   const t0 = Date.now();
@@ -3158,6 +3161,269 @@ function reservationBookkeeping(ev) {
       eq([CASES.length, passN], [32, 32], 'Fase 9: 32/32 casos obligatorios PASS');
       // Sin proveedores reales: la red de la prueba solo habla con 127.0.0.1 (netguard) y el piloto usó proveedores falsos.
       ok(pilot.ex.stats.providersCalled === 0, 'Cierre: lectura del piloto con 0 proveedores');
+    }, { fatal: false });
+
+    // ═══ E23 · Prueba del Formato M con el microcurrículo PDF REAL «Atención Integral en Salud a Víctimas de Violencia
+    // Sexual», tratado como lo entregaría un cliente (tablas con columnas que desbordan, pies de página, rangos de horas,
+    // textos cortados por el borde de la página). USD 0: lectura sin IA, proveedores falsos, se detiene ANTES de
+    // «Autorizar y generar» (solo el estimado). Mide: lectura → requisitos → Formato M → contenidos 12/12 → capacidad de
+    // video honesta (no cubierto + alternativa) → propuesta/PDF → aprobación → Blueprint/Manifest → R68 → costo.
+    if (RUN_E5) await step('v3-E23-formato-m-pdf', async () => {
+      const { PDFParse } = require('pdf-parse');
+      const pdfTextOf = async (buf) => { const p = new PDFParse({ data: new Uint8Array(buf) }); try { return (await p.getText()).text.replace(/\s+/g, ' '); } finally { await p.destroy().catch(() => {}); } };
+      const getPdf = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, buf: Buffer.from(await r.arrayBuffer()) }; };
+      const REP = { checks: [] };
+      const rec23 = (id, desc, pass, actual) => {
+        REP.checks.push({ id, descripcion: desc, resultado: pass ? 'PASS' : 'FAIL', real: actual === undefined ? null : actual });
+        ok(!!pass, `E23 ${id} ${desc}`, actual);
+        fs.writeFileSync(path.join(V3OUT, 'formato-m.json'), JSON.stringify(REP, null, 2));
+      };
+      const PDF_M = fs.readFileSync(path.join(REPO, 'scripts/fixtures/microcurriculum/microcurriculo-m-atencion-violencia-sexual.pdf'));
+      const TITLE = 'Atención Integral en Salud a Víctimas de Violencia Sexual';
+      // 1. Curso nuevo con el título provisional de «Crear» (el documento lo reemplaza).
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: 'Nuevo curso' });
+      const id = Number(cr.data.id);
+      await api('POST', `/courses/${id}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      const A = D('modules/course-profiles/course-profiles.js');
+      await api('POST', `/courses/${id}/profiles/assessment`, { data: { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } });
+      await api('POST', `/courses/${id}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } });
+      REP.courseId = id;
+      // Lo que la pantalla «Crear» guarda como pedido del curso (país por defecto; nivel y tono que la institución confirma).
+      await api('PUT', `/courses/${id}/brief`, { pais: 'Colombia', nivel: 'Intermedio — conoce lo esencial', tono: 'cercano y claro' });
+
+      // 2. Lectura del PDF (el mismo endpoint que «Importar microcurrículo»).
+      const ex = await api('POST', `/courses/${id}/academic-context/extract`, { files: [{ name: 'Microcurriculo_M_Atencion_Integral_Victimas_Violencia_Sexual.pdf', dataBase64: PDF_M.toString('base64') }] });
+      eq(ex.status, 200, 'E23: el PDF se lee', ex.error);
+      const ctx = ex.data.draft;
+      // Los requisitos leídos valen cuando la institución usa ESTOS datos (se guarda el contexto, como «Usar estos datos»).
+      const sv = await api('POST', `/courses/${id}/profiles/academic`, { data: ctx, expectedVersion: 0 });
+      eq(sv.status, 201, 'E23: contexto guardado', sv.error);
+      const cv = sv.data.profile.version;
+      const reqView = (await api('GET', `/courses/${id}/academic-context/requirements`)).data;
+      const reqs = (reqView && reqView.items) || [];
+      REP.lectura = {
+        nombre: ctx.identity.subjectName.value, nivel: ctx.identity.educationLevel.value && ctx.identity.educationLevel.value.text,
+        publico: ctx.learner.profile.value, objetivo: ctx.identity.generalObjective.value, metodologia: ctx.methodology.value,
+        horas: { valor: ctx.hours.total.value, rango: ctx.hours.total.range || null, estado: ctx.hours.total.status },
+        resultados: ctx.outcomes.map((o) => ({ id: o.id, texto: o.text, revisar: o.review || null })),
+        competencias: ctx.competencies.map((o) => o.id),
+        unidades: ctx.units.map((u) => ({ id: u.id, titulo: u.title, horas: u.hours, contenidos: u.contents.map((c) => c.text) })),
+        evaluaciones: ctx.evaluation.map((e) => ({ instrumento: e.instrument, resultados: e.outcomeIds })),
+        conflictos: ctx.conflicts.map((c) => c.path),
+        requisitos: reqs.map((r) => ({ clave: r.key, modo: r.mode, valor: r.value, valorMax: r.valorMax ?? r.valueMax ?? null, obligacion: r.obligation, activo: r.active, cita: r.source && r.source.quote })),
+      };
+      rec23('L1', 'Lectura sin proveedores', ex.data.stats.providersCalled === 0, ex.data.stats);
+      rec23('L2', 'Nombre, nivel, público y objetivo del documento (el público completo, no el cortado de la ficha)',
+        ctx.identity.subjectName.value === TITLE && ctx.identity.educationLevel.value.level === 'university' && /escenarios asistenciales/.test(ctx.learner.profile.value || '') && !ctx.learner.profile.review && /^Fortalecer en el estudiante/.test(ctx.identity.generalObjective.value || ''),
+        { nombre: ctx.identity.subjectName.value, publico: (ctx.learner.profile.value || '').slice(0, 160), revisar: ctx.learner.profile.review || null });
+      rec23('L3', 'RA1–RA5 con su numeración original; el encabezado de la tabla no es un resultado; cada uno pide confirmar su texto cortado',
+        JSON.stringify(ctx.outcomes.map((o) => o.id)) === '["RA1","RA2","RA3","RA4","RA5"]' && /^Reconocer los conceptos/.test(ctx.outcomes[0].text) && /^Resolver situaciones/.test(ctx.outcomes[4].text) && ctx.outcomes.every((o) => !!o.review),
+        ctx.outcomes.map((o) => [o.id, o.text.slice(0, 40), !!o.review]));
+      rec23('L4', 'CO1–CO5', JSON.stringify(ctx.competencies.map((o) => o.id)) === '["CO1","CO2","CO3","CO4","CO5"]', ctx.competencies.map((o) => o.id));
+      rec23('L5', 'Metodología = enfoque pedagógico + metodología del documento (sin el pie de página)',
+        /^Aprendizaje significativo/.test(ctx.methodology.value || '') && /Cada capítulo combina/.test(ctx.methodology.value || '') && !/Página \d/.test(ctx.methodology.value || ''), (ctx.methodology.value || '').slice(0, 200));
+      rec23('L6', 'Horas 40–44 conservadas como RANGO (meta de diseño 42, nunca 44)',
+        ctx.hours.total.range && ctx.hours.total.range.min === 40 && ctx.hours.total.range.max === 44 && ctx.hours.total.value === 42, ctx.hours.total);
+      const contents = ctx.units.flatMap((u) => u.contents);
+      rec23('L7', 'Tabla de capítulos reconstruida: 3 módulos × 4 contenidos (12), con títulos completos y sin la columna de recursos',
+        ctx.units.length === 3 && ctx.units.every((u) => u.contents.length === 4) && contents.every((c) => !/videos?|H5P|\|/.test(c.text)) && contents[0].text === 'Conceptos fundamentales sobre violencia sexual y respuesta en salud' && contents[11].text === 'Resolución de situaciones clínicas simuladas y respuesta segura',
+        ctx.units.map((u) => [u.title, u.hours, u.contents.map((c) => c.text)]));
+      rec23('L8', 'Evaluaciones: 3 parciales + 1 final con sus RA', ctx.evaluation.length === 4 && JSON.stringify(ctx.evaluation.map((e) => e.outcomeIds)) === '[["RA1","RA2"],["RA3"],["RA4","RA5"],["RA1","RA2","RA3","RA4","RA5"]]', ctx.evaluation.map((e) => [e.instrument, e.outcomeIds]));
+      rec23('L9', 'Sin contradicciones falsas (pie de página, ficha cortada, enfoque + metodología)', ctx.conflicts.length === 0, ctx.conflicts);
+      // 3. Requisitos del documento: los 8 institucionales + horas, activos y obligatorios; nada inventado.
+      const R = (k) => reqs.filter((r) => r.key === k && r.active && r.obligation === 'required');
+      const want = [['target_hours@course', 'range', 40, 44], ['modules@course', 'exact', 3], ['chapters@module·each:content', 'exact', 4], ['videos@chapter·each:content', 'exact', 2], ['videos@course', 'exact', 24],
+        ['activities@course', 'exact', 12], ['activities@chapter·each:content', 'exact', 1], ['application_activities@course', 'exact', 3], ['application_activities@module·each:practice', 'exact', 1],
+        ['evaluations@course#partial', 'exact', 3], ['evaluations@course#final', 'exact', 1]];
+      const missing = want.filter(([k, mode, v, vmax]) => !R(k).some((r) => r.mode === mode && r.value === v && (vmax === undefined || r.valueMax === vmax)));
+      rec23('R1', 'Requisitos detectados: 3 módulos, 4 cap./módulo, 3×4, 40–44 h, 2 videos/cap., 24 videos, 12 H5P (1/cap.), 3 AA (1/módulo), 3 parciales, 1 final',
+        missing.length === 0 && reqs.some((r) => r.key === 'structure@structure:content' && r.active), { faltan: missing.map((m) => m[0]), total: reqs.length });
+      const bogus = reqs.filter((r) => r.active && ((r.key === 'videos@course' && r.value !== 24) || (/^videos@chapter/.test(r.key) && r.value !== 2) || /@subject:/.test(r.key)));
+      rec23('R2', 'Nada inventado: ni «varias asignaturas», ni «2 videos en el curso», ni el «1 video» de la nota de implementación', bogus.length === 0 && reqView.multiCourse !== true && ex.data.requirements.multiCourse !== true,
+        { inventados: bogus.map((r) => [r.key, r.value, r.source && r.source.quote]), varias: reqView.multiCourse });
+      rec23('R3', 'Las Actividades de Aplicación del documento van en el espacio de aplicación (capítulo de práctica)', reqs.some((r) => r.key === 'application_activities@module·each:practice' && r.active), reqs.filter((r) => r.kind === 'application_activities').map((r) => r.key));
+
+      const facts = (await api('GET', `/courses/${id}/facts`)).data;
+      rec23('F1', 'El título del curso se adopta del documento; horas como rango con meta', facts.title.value === TITLE && facts.targetHoursRange && facts.targetHoursRange.min === 40 && facts.targetHoursRange.max === 44,
+        { titulo: facts.title.value, horas: facts.targetHours, rango: facts.targetHoursRange || null });
+
+      // 4. «¿Cómo quieres estructurar tu curso?» → Formato M.
+      const o = (await api('GET', `/courses/${id}/design/structure-options`)).data;
+      REP.estructura = { documento: o.document, contenidos: o.contentsCount, requisitos: o.requirements, recomendada: o.recommended };
+      rec23('S1', 'El documento trae 12 contenidos en 3 × 4 y exige esa estructura; «Cursia recomienda» la misma',
+        o.contentsCount === 12 && o.document && JSON.stringify(o.document.shape) === '[4,4,4]' && o.recommended.modules === 3 && o.recommended.chaptersPerModule === 4, REP.estructura);
+      const pvM = (await api('POST', `/courses/${id}/design/structure-preview`, { modules: 3, chaptersPerModule: 4, format: 'M' })).data;
+      rec23('S2', 'Vista previa del Formato M: sin diferencias con el documento; 12 de 12 contenidos asignados, 0 duplicados',
+        pvM.differences.length === 0 && pvM.coverage.total === 12 && pvM.coverage.assigned === 12 && pvM.coverage.duplicated === 0, { diferencias: pvM.differences, cobertura: pvM.coverage });
+      const fr = await api('PUT', `/courses/${id}/format`, { code: 'M' });
+      let st = await readStructure(id);
+      const ap = await api('POST', `/courses/${id}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: cv, choice: 'format', shape: { modules: 3, chaptersPerModule: 4 }, confirmReplace: true });
+      st = await readStructure(id);
+      const shape = st.modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length);
+      const [meta] = await q(`select metadata -> 'contentMap' as cm, metadata -> 'structureOrigin' as so, metadata -> 'courseFormat' as f from public.courses where id = $1`, [id]);
+      const cm = typeof meta.cm === 'string' ? JSON.parse(meta.cm) : meta.cm;
+      const mapped = Object.values((cm && cm.chapters) || {}).flat();
+      const trace = st.modules.map((m) => ({ modulo: m.title, capitulos: m.chapters.filter((c) => c.kind !== 'practice').map((c) => ({ titulo: c.title, contenidos: ((cm && cm.chapters) || {})[c.id] || [] })) }));
+      REP.trazabilidad = trace;
+      rec23('S3', 'Formato M aplicado: 3 × 4 capítulos de contenido; cada contenido del documento en su capítulo (Documento → módulo → capítulo → contenido)',
+        fr.status === 200 && [200, 201].includes(ap.status) && JSON.stringify(shape) === '[4,4,4]' && mapped.length === 12 && new Set(mapped).size === 12 && trace.every((m) => m.capitulos.every((c) => c.contenidos.length === 1)),
+        { formato: [fr.status, meta.f && (typeof meta.f === 'string' ? JSON.parse(meta.f) : meta.f).code], aplicar: ap.status, forma: shape, asignados: mapped.length, unicos: new Set(mapped).size });
+
+      // 5. Diseño (Cursia recomienda + Verificación).
+      let card = (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      const pv = await api('GET', `/courses/${id}/profiles/pedagogy`);
+      // Igual que «Usar este diseño» del frontend: primero lo que decidió el docente y lo que eligió Cursia para cumplir el documento.
+      const rqa = card.requirements && card.requirements.authority;
+      if (rqa && rqa.decisions) await api('POST', `/courses/${id}/design/requirement-decisions`, { audiovisual: rqa.decisions.audiovisual, applicationActivities: rqa.decisions.applicationActivities, cursiaAudiovisual: rqa.cursiaAudiovisual || null });
+      if (card.profileChanged) await api('POST', `/courses/${id}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version });
+      await api('POST', `/courses/${id}/design/hours-origin`, { proposed: card.hours.source === 'proposed' ? card.hours.target : null });
+      if (card.verification.checks.some((c) => c.id === 'outcome_links')) { const s0 = await readStructure(id); await api('POST', `/courses/${id}/design/fix`, { action: 'link_outcomes', expectedCounter: s0.structureVersionCounter }); }
+      card = (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      st = await readStructure(id);
+      const ad = await api('POST', `/courses/${id}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+      card = (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      st = await readStructure(id);
+      const checks = card.verification.checks.map((c) => ({ titulo: c.title, severidad: c.severity }));
+      REP.verificacion = checks;
+      REP.diseño = { horas: card.design.estimatedHours, conteos: card.design.counts, forma: st.modules.map((m) => m.chapters.map((c) => c.kind)),
+        meta: card.hours, preferencias: card.profile && card.profile.designPreferences, estado: card.design.status };
+      const sev = (t) => (card.verification.checks.find((c) => c.title === t) || {}).severity;
+      const okTitles = ['Requisito del documento: 3 módulos', 'Requisito del documento: 4 capítulos de contenido por módulo', 'Requisito del documento: 12 actividades interactivas', 'Requisito del documento: 3 Actividades de Aplicación', 'Requisito del documento: 3 evaluaciones parciales', 'Requisito del documento: 1 evaluación final'];
+      rec23('V1', 'Verificación: estructura, H5P, Actividades de Aplicación y evaluaciones cumplidas', [200, 201].includes(ad.status) && okTitles.every((t) => sev(t) === 'ok'), { aplicarDiseño: ad.status, checks });
+      const nc = card.verification.checks.filter((c) => /^Requisito no cubierto por Cursia: /.test(c.title)).map((c) => c.title).sort();
+      const vids = card.design.modules.flatMap((m) => m.chapters).filter((c) => c.kind !== 'practice' && c.videoEnabled).length;
+      rec23('V2', 'Videos: «2 videos por capítulo» y «24 videos» = «Requisito no cubierto por Cursia»; el diseño tiene 12 (1 por capítulo); nunca se promete 2',
+        ['Requisito no cubierto por Cursia: 2 videos por capítulo de contenido', 'Requisito no cubierto por Cursia: 24 videos'].every((t) => nc.includes(t)) && vids === 12 && !card.verification.checks.some((c) => /video/.test(c.title) && c.severity === 'ok' && /^Requisito del documento/.test(c.title)),
+        { noCubiertos: nc, videosDiseño: vids });
+      // Horas: el documento pide 40–44 h; con lo que fija (12 capítulos de 1 video + 1 H5P, 3 Actividades de Aplicación) la
+      // producción de Cursia equivale a menos. Honesto: «Requisito no cubierto por Cursia» con las horas reales y una
+      // alternativa; nunca «cumplido», nunca rellenar, nunca culpar a la institución por haber elegido el Formato M.
+      const hc = card.verification.checks.find((c) => /40–44 horas/.test(c.title));
+      const inRange = card.design.estimatedHours >= 40 && card.design.estimatedHours <= 44;
+      REP.horasDiseño = { estimadas: card.design.estimatedHours, check: hc && { titulo: hc.title, detalle: hc.detail, propuesta: hc.capability && hc.capability.proposal } };
+      rec23('V3', 'Horas: si el diseño no llega a 40–44 h se dice como «Requisito no cubierto por Cursia» con las horas reales y una alternativa (sin culpar a la elección del Formato M)',
+        inRange ? hc && hc.severity === 'ok' : (hc && hc.title === 'Requisito no cubierto por Cursia: 40–44 horas' && /≈ \d+(,\d)? horas de trabajo del estudiante/.test(hc.detail) && !/que armaste|que elegiste/.test(hc.detail) && /Proponemos/.test(hc.capability.proposal)),
+        REP.horasDiseño);
+      const aaPractice = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.kind));
+      rec23('V4', 'Cada módulo: su Actividad de Aplicación en el capítulo de práctica (no una práctica vacía)', aaPractice.every((k) => k.length === 1 && k[0] === 'practice'), aaPractice);
+
+      // 6. Propuesta: la alternativa de Cursia para los videos; la institución la acepta (decisión explícita).
+      let S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
+      const vidBlockers = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason');
+      REP.alternativa = S0.draft.model.exceptions.filter((e) => e.capability).map((e) => ({ requisito: e.requirementText, aplicado: e.appliedText, propuesta: e.proposal || null }));
+      rec23('P1', 'La propuesta no se prepara sin la decisión de la institución sobre los videos, y Cursia propone una alternativa con lo que sí produce',
+        vidBlockers.length >= 1 && S0.draft.model.exceptions.filter((e) => e.capability && /video/.test(e.requirementText)).every((e) => typeof e.proposal === 'string' && /1 video/.test(e.proposal) && /presentaci/i.test(e.proposal))
+          && S0.draft.model.exceptions.filter((e) => e.capability).every((e) => typeof e.proposal === 'string' && /^Proponemos/.test(e.proposal)), REP.alternativa);
+      for (const b of vidBlockers) {
+        const ex0 = S0.draft.model.exceptions.find((e) => e.requirementKey === b.ref);
+        await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: (ex0 && ex0.proposal) || 'La institución acepta la alternativa propuesta por Cursia.' });
+      }
+      S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${id}/prebrief/confirmations`, { confirmKey: b.ref });
+      S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
+      const rows = S0.draft.document.sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows);
+      const row = (l) => (rows.find((r) => r.label === l) || {}).value || '';
+      const strs = [];
+      const walk = (x, k) => { if (typeof x === 'string') { if (!/^(t|origin|id|n|kind|where|code|ref)$/.test(k || '')) strs.push(x); } else if (Array.isArray(x)) x.forEach((v) => walk(v, k)); else if (x && typeof x === 'object') for (const kk of Object.keys(x)) walk(x[kk], kk); };
+      walk(S0.draft.document);
+      const tech = strs.filter((s) => /\b(RQ\d+|none|null|undefined|NaN|sha256|contentMap|structureOrigin|requirement:|@course|@chapter)\b/.test(s));
+      REP.prebrief = { listo: S0.draft.readiness.ready, bloqueos: S0.draft.readiness.blockers, diseño: row('Diseño seleccionado'), contenidos: row('Contenidos del documento'), excepciones: S0.draft.model.exceptions.map((e) => [e.requirementText, e.appliedText, e.reason]) };
+      rec23('P2', 'Prebrief: Formato M elegido por la institución, 12 de 12 contenidos, excepción de videos con su motivo, sin textos técnicos',
+        S0.draft.readiness.ready && /Formato M elegido por la institución/.test(row('Diseño seleccionado')) && /3 módulos × 4 capítulos de contenido/.test(row('Diseño seleccionado')) && /12 contenidos del documento/.test(row('Contenidos del documento')) && tech.length === 0 && S0.draft.model.course.title === TITLE,
+        { ...REP.prebrief, textosTecnicos: tech.slice(0, 5) });
+      const d = await getPdf(`/courses/${id}/prebrief/draft.pdf`);
+      const dt = await pdfTextOf(d.buf);
+      const need = [TITLE, 'Formato M', 'Diseño seleccionado', '2 videos por capítulo de contenido', '24 videos', 'Requisito no cubierto por Cursia', 'RA1', 'RA5', '40–44'];
+      REP.pdf = { status: d.status, bytes: d.buf.length, contiene: Object.fromEntries(need.map((t) => [t, dt.includes(t)])) };
+      fs.writeFileSync(path.join(V3OUT, 'formato-m-prebrief-borrador.pdf'), d.buf);
+      rec23('P3', 'PDF del Prebrief: nombre, Formato M, requisitos, «Requisito no cubierto por Cursia», RA y rango de horas; sin textos técnicos',
+        d.status === 200 && need.every((t) => dt.includes(t)) && !/\b(RQ\d+|undefined|null|NaN|none)\b/.test(dt), REP.pdf);
+
+      // 7. Aprobación de prueba → Blueprint → Manifest.
+      const prep = await api('POST', `/courses/${id}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      const ver = prep.data.version;
+      const man = await api('POST', `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest`);
+      const apv = await api('POST', `/courses/${id}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Prueba Formato M', role: 'Coordinación académica', confirm: true });
+      const a = await getPdf(`/courses/${id}/prebrief/versions/${ver.version}/pdf?variant=approved`);
+      fs.writeFileSync(path.join(V3OUT, 'formato-m-prebrief-aprobado.pdf'), a.buf);
+      rec23('A1', 'Aprobación de prueba: versión aprobada, PDF aprobado con quién aprobó', [200, 201].includes(prep.status) && [200, 201].includes(apv.status) && a.status === 200 && /Aprobado por: Prueba Formato M/.test(await pdfTextOf(a.buf)), { preparar: prep.status, aprobar: apv.status, version: ver.version });
+      const [bp] = await q(`select b.snapshot_json, b.snapshot_sha256, v.blueprint_sha256, v.model_json from public.course_blueprints b join public.course_prebrief_versions v on v.blueprint_id = b.id where v.course_id = $1 and v.version = $2`, [id, ver.version]);
+      const snap = typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json;
+      const kindOf = (c) => (c.kind === 'practice' ? 'practice' : 'content');
+      const bShape = snap.modules.map((m) => m.chapters.filter((c) => kindOf(c) === 'content').length);
+      const bVideos = snap.modules.flatMap((m) => m.chapters).filter((c) => kindOf(c) === 'content' && (c.video_enabled === true || c.videoEnabled === true)).length;
+      const bTitles = snap.modules.flatMap((m) => m.chapters).filter((c) => kindOf(c) === 'content').map((c) => c.title);
+      REP.blueprint = { forma: bShape, videos: bVideos, titulos: bTitles, huellaIgual: bp.snapshot_sha256 === bp.blueprint_sha256 };
+      rec23('B1', 'Blueprint = lo aprobado: 3 × 4 de contenido, 12 videos (1 por capítulo), los 12 títulos del documento, misma huella',
+        JSON.stringify(bShape) === '[4,4,4]' && bVideos === 12 && bp.snapshot_sha256 === bp.blueprint_sha256 && contents.every((c) => bTitles.includes(c.text)), REP.blueprint);
+      const mf = (await api('GET', `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest`)).data;
+      const Mm = (mf && (mf.manifest || mf)) || {};
+      const items = Mm.items || [];
+      REP.manifest = { construir: man.status, modulos: (Mm.modules || []).length, videos: items.filter((i) => /^video:/.test(i.key)).length, h5p: items.filter((i) => i.type === 'activity').length,
+        aa: items.filter((i) => i.type === 'application_activity').length, examenes: items.filter((i) => /exam/.test(i.type || '')).map((i) => i.type) };
+      rec23('M1', 'Manifest = Blueprint: 3 módulos, 12 videos, 12 H5P, 3 Actividades de Aplicación, exámenes de módulo + final',
+        [200, 201].includes(man.status) && REP.manifest.modulos === 3 && REP.manifest.videos === 12 && REP.manifest.h5p === 12 && REP.manifest.aa === 3, REP.manifest);
+
+      // 8. Costo (solo estimado) — sin «Autorizar y generar».
+      const runsBase = `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest/runs`;
+      const ctxP = { nombre: TITLE, sector: 'Salud', pais: 'Colombia', contexto: 'Universitario', nivel: 'Intermedio', tono: 'cercano y claro', obj: 'Atención inicial segura', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const est = await api('POST', `${runsBase}/estimate-preview`, ctxP);
+      REP.costo = est.status === 200 ? { crudo: JSON.stringify(est.data).slice(0, 1500) } : { error: [est.status, est.error] };
+      rec23('C1', 'Costo estimado y máximo calculados sin ejecutar nada', est.status === 200, REP.costo);
+      const runs0 = await q(`select count(*)::int n from public.production_jobs where (input_payload->>'courseId')::int = $1`, [id]);
+      rec23('C2', 'Ninguna generación iniciada (0 runs)', runs0[0].n === 0, runs0[0]);
+
+      // 9. R68: cada cambio relevante después de aprobar invalida la aprobación y el servidor bloquea producir.
+      const verStatus = async (v) => ((await api('GET', `/courses/${id}/prebrief`)).data.versions || []).find((x) => x.version === v);
+      const reapprove = async () => {
+        let S = (await api('GET', `/courses/${id}/prebrief`)).data;
+        for (const b of S.draft.readiness.blockers.filter((x) => x.code === 'exception_reason')) await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: 'La institución acepta la alternativa propuesta por Cursia.' });
+        S = (await api('GET', `/courses/${id}/prebrief`)).data;
+        for (const b of S.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${id}/prebrief/confirmations`, { confirmKey: b.ref });
+        S = (await api('GET', `/courses/${id}/prebrief`)).data;
+        const cur = (S.versions || []).find((x) => x.status === 'approved' && x.modelSha256 === S.draft.modelSha256);
+        if (cur) return cur;
+        const p2 = await api('POST', `/courses/${id}/prebrief/versions`, { expectedModelSha: S.draft.modelSha256 });
+        if (![200, 201].includes(p2.status)) throw new Error(`preparar: ${p2.status} ${p2.error} ${JSON.stringify(S.draft.readiness.blockers).slice(0, 300)}`);
+        await api('POST', `/courses/${id}/blueprints/${p2.data.version.blueprintNumber}/manifest`);
+        const a2 = await api('POST', `/courses/${id}/prebrief/versions/${p2.data.version.version}/approve`, { expectedModelSha: p2.data.version.modelSha256, name: 'Prueba Formato M', role: 'Coordinación académica', confirm: true });
+        if (![200, 201].includes(a2.status)) throw new Error(`aprobar: ${a2.status} ${a2.error}`);
+        return p2.data.version;
+      };
+      const blocked = async (v) => {
+        const r1 = await api('POST', `/courses/${id}/blueprints/${v.blueprintNumber}/manifest/runs`, ctxP);
+        const r2 = await api('POST', `/courses/${id}/blueprints/${v.blueprintNumber}/manifest/runs/estimate-preview`, ctxP);
+        return [r1.status, r2.status];
+      };
+      REP.r68 = [];
+      const r68 = async (label, change, undo) => {
+        const v = await reapprove();
+        const before = (await verStatus(v.version)).status;
+        const cs = await change();
+        const vs = await verStatus(v.version);
+        const b = await blocked(v);
+        if (undo) await undo();
+        const res = { cambio: label, antes: before, guardar: cs, despues: vs.status, producirYEstimar: b };
+        REP.r68.push(res);
+        return before === 'approved' && vs.status === 'invalidated' && b.every((s) => s === 409);
+      };
+      const sOf = async () => readStructure(id);
+      const r68ok = [];
+      r68ok.push(await r68('estructura (título de un capítulo)', async () => { const s1 = await sOf(); const ch = s1.modules[0].chapters[0]; return (await api('PATCH', `/courses/${id}/modules/${s1.modules[0].id}/chapters/${ch.id}`, { title: `${ch.title} (cambio)`, expectedCounter: s1.structureVersionCounter })).status; },
+        async () => { const s1 = await sOf(); const ch = s1.modules[0].chapters[0]; await api('PATCH', `/courses/${id}/modules/${s1.modules[0].id}/chapters/${ch.id}`, { title: ch.title.replace(/ \(cambio\)$/, ''), expectedCounter: s1.structureVersionCounter }); }));
+      r68ok.push(await r68('horas', async () => { const p0 = await api('GET', `/courses/${id}/profiles/pedagogy`); return (await api('POST', `/courses/${id}/profiles/pedagogy`, { data: { ...p0.data.profile, targetHours: 43 }, expectedVersion: Number(p0.data.version) })).status; },
+        async () => { const p0 = await api('GET', `/courses/${id}/profiles/pedagogy`); await api('POST', `/courses/${id}/profiles/pedagogy`, { data: { ...p0.data.profile, targetHours: 42 }, expectedVersion: Number(p0.data.version) }); }));
+      r68ok.push(await r68('video de un capítulo', async () => { const s1 = await sOf(); const ch = s1.modules[1].chapters.find((c) => c.kind !== 'practice' && c.videoEnabled); return (await api('PATCH', `/courses/${id}/modules/${s1.modules[1].id}/chapters/${ch.id}`, { videoEnabled: false, pinVideo: true, expectedCounter: s1.structureVersionCounter })).status; },
+        async () => { const s1 = await sOf(); const ch = s1.modules[1].chapters.find((c) => c.kind !== 'practice' && !c.videoEnabled); await api('PATCH', `/courses/${id}/modules/${s1.modules[1].id}/chapters/${ch.id}`, { videoEnabled: true, pinVideo: false, expectedCounter: s1.structureVersionCounter }); }));
+      r68ok.push(await r68('resultado de aprendizaje', async () => { const ac = (await api('GET', `/courses/${id}/profiles/academic`)).data; const outs = ac.profile.outcomes.map((x, i) => ({ id: x.id, text: i === 0 ? `${x.text} (ajuste)` : x.text })); return (await api('PUT', `/courses/${id}/academic-context/outcomes`, { expectedVersion: Number(ac.version), outcomes: outs })).status; }));
+      r68ok.push(await r68('motivo de la excepción de videos', async () => { const k = (await api('GET', `/courses/${id}/prebrief`)).data.draft.model.exceptions.find((e) => e.capability && !e.coveredBy).requirementKey; return (await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: k, reason: 'Otro motivo: un solo video por capítulo sin recurso complementario.' })).status; }));
+      r68ok.push(await r68('nombre del curso', async () => (await api('PUT', `/courses/${id}/brief`, { nombre: `${TITLE} (v2)`, pais: 'Colombia', nivel: 'Intermedio — conoce lo esencial', tono: 'cercano y claro' })).status));
+      r68ok.push(await r68('formato (M → L)', async () => (await api('PUT', `/courses/${id}/format`, { code: 'L' })).status,
+        async () => { await api('PUT', `/courses/${id}/format`, { code: null }); await api('PUT', `/courses/${id}/format`, { code: 'M' }); }));
+      rec23('R68', 'R68: estructura, horas, video, resultado, excepción, nombre y formato invalidan la aprobación y el servidor bloquea producir y estimar (409)', r68ok.every(Boolean), REP.r68);
+      REP.casosPass = REP.checks.filter((c) => c.resultado === 'PASS').length;
+      REP.casosTotal = REP.checks.length;
+      fs.writeFileSync(path.join(V3OUT, 'formato-m.json'), JSON.stringify(REP, null, 2));
     }, { fatal: false });
 
     // ═══ Fase 2/3 · E21 — «¿Cómo quieres estructurar tu curso?» + redistribución segura por HTTP real (USD 0, proveedores

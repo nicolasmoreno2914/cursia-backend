@@ -364,11 +364,12 @@ async function dbChecks() {
       eq(card.design.modules.map((m) => m.chapters.length), [4, 4, 4], '4 capítulos por módulo (propuestos)');
       assert(card.requirements.authority.applied.some((a) => /capítulos? propuestos? para llegar a 4 capítulos por módulo/.test(a.text)), JSON.stringify(card.requirements.authority.applied));
       assert(card.requirements.checks.every((c) => c.status === 'met'), 'cada requisito, en su medida, se cumple: ' + JSON.stringify(card.requirements.checks));
-      // Review L86C I3: con el modelo de tiempo de Cursia, 3 × 4 capítulos no llega a 40 h sin rellenar: eso es un choque
-      // entre dos requisitos del documento, y se dice (Cursia no rellena ni elige cuál manda).
+      // Review L86C I3: con el modelo de tiempo de Cursia, 3 × 4 capítulos no llega a 40 h sin rellenar, y se dice.
+      // Documentos imperfectos (2026-10-10): no es un bloqueo sin salida sino «Requisito no cubierto por Cursia» con las
+      // horas reales y una alternativa; la institución decide (R68 exige su aceptación). Cursia no rellena ni lo da por cumplido.
       const bad = card.verification.checks.filter((c) => c.area === 'requirements' && c.severity !== 'ok');
-      eq(bad.map((c) => [c.severity, c.title]), [['critical', 'Conflicto con un requisito del documento: 40–44 horas']], 'solo el choque horas ↔ estructura');
-      assert(/Entra en conflicto con «estructura 3 × 4 \(12 capítulos\)»: con esa estructura el curso llega a ≈ \d+(,\d)? h sin rellenar/.test(bad[0].detail), bad[0].detail);
+      eq(bad.map((c) => [c.severity, c.title]), [['warning', 'Requisito no cubierto por Cursia: 40–44 horas']], 'solo las horas: no cubierto');
+      assert(/el diseño de Cursia equivale a ≈ \d+(,\d)? horas de trabajo del estudiante/.test(bad[0].detail) && /^Proponemos/.test(bad[0].capability.proposal), JSON.stringify(bad[0]));
       eq(await shapeOf(cid), [3, 3, 3], 'nada se aplicó todavía (es una propuesta)');
       const { applied } = await useDesign(cid);
       assert(applied, '«Usar este diseño» aplica');
@@ -482,14 +483,25 @@ async function dbChecks() {
       const cid = await courseWith('Doc contra doc', [4, 4, 4, 4], 'El curso deberá tener 4 módulos con 5 capítulos por módulo. La intensidad horaria total será de 70 horas.');
       const base = await design.recommend(cid, OWNER, {});
       eq(base.design.status, 'cannot_reach_target', '4 × 5 no llega a 70 h aunque el docente no decida nada');
-      eq(reqCheck(base, 'target_hours').severity, 'critical', 'sin decisiones: crítico');
+      // Documentos imperfectos (2026-10-10): sin llegar a las horas por lo que fija el propio documento = «Requisito no cubierto
+      // por Cursia» (horas reales + alternativa, aceptación de la institución), nunca atribuido al docente.
+      const b0 = reqCheck(base, 'target_hours');
+      eq([b0.severity, b0.title], ['warning', 'Requisito no cubierto por Cursia: 70 horas'], 'sin decisiones: no cubierto');
       for (const adjust of [{ applicationActivities: 'none' }, { audiovisual: 'less' }]) {
         const card = await design.recommend(cid, OWNER, { adjust });
         const hc = reqCheck(card, 'target_hours');
-        eq(hc.severity, 'critical', 'documento contra documento, con ' + JSON.stringify(adjust));
-        assert(!/Excepción/.test(hc.title), 'no se atribuye al docente: ' + hc.title);
-        eq(card.verification.blocking, true, 'Verificación lo muestra como crítico');
+        eq([hc.severity, hc.title], ['warning', 'Requisito no cubierto por Cursia: 70 horas'], 'documento contra documento, con ' + JSON.stringify(adjust));
+        assert(!/Excepción|elegiste|que armaste/.test(hc.title + hc.detail), 'no se atribuye al docente: ' + hc.title + ' ' + hc.detail);
+        assert(hc.capability && hc.capability.requirementKey, 'exige la aceptación de la institución (R68)');
       }
+    });
+
+    await check('RC16b documentos imperfectos (revisión I6): sin estructura exigida, no llegar a las horas NO se presenta como límite de Cursia', async () => {
+      const cid = await courseWith('Sin estructura exigida', [1, 1], 'La intensidad horaria total será de 120 horas.');
+      const card = await design.recommend(cid, OWNER, {});
+      const hc = reqCheck(card, 'target_hours');
+      eq(card.design.status, 'cannot_reach_target', 'el caso de la prueba: no llega');
+      assert(!/Requisito no cubierto por Cursia/.test(hc.title) && !hc.capability, 'el documento no fija la estructura: ' + hc.title);
     });
 
     await check('RC17 re-review final L86C IMPORTANTE-A: sin lectura de requisitos, el «Más video» del docente no se confunde con uno viejo de Cursia', async () => {

@@ -67,21 +67,26 @@ export function validateAcademicContext(ctx: AcademicContextV1): AcademicValidat
   // ── Advertencias: horas ──
   const total = known(ctx.hours.total) ? (ctx.hours.total.value as number) : null;
   const comps = ctx.hours.components;
+  // Un total en RANGO del documento («40–44 h»): se compara contra el rango, no contra su punto medio (que es inferido).
+  const tr = ctx.hours.total.range;
+  const outOf = (x: number) => (tr ? x < tr.min - HOURS_TOLERANCE || x > tr.max + HOURS_TOLERANCE : Math.abs(x - (total as number)) > HOURS_TOLERANCE);
+  const comparable = ctx.hours.total.status !== 'inferred' || !!tr;
+  const totalText = tr ? `${fmt(tr.min)}–${fmt(tr.max)}` : fmt(total ?? 0);
   if (total !== null && comps.length) {
     const sum = comps.reduce((a, c) => a + c.hours, 0);
-    if (Math.abs(sum - total) > HOURS_TOLERANCE && ctx.hours.total.status !== 'inferred') {
-      add('warning', 'HOURS_SUM_MISMATCH', 'hours', `El documento indica ${fmt(total)} horas, pero la suma de componentes reportada es ${fmt(sum)} horas.`);
+    if (outOf(sum) && comparable) {
+      add('warning', 'HOURS_SUM_MISMATCH', 'hours', `El documento indica ${totalText} horas, pero la suma de componentes reportada es ${fmt(sum)} horas.`);
     }
   }
   if (total !== null && known(ctx.hours.weekly) && known(ctx.hours.weeks)) {
     const prod = (ctx.hours.weekly.value as number) * (ctx.hours.weeks.value as number);
-    if (Math.abs(prod - total) > HOURS_TOLERANCE && ctx.hours.total.status !== 'inferred') {
-      add('warning', 'WEEKLY_HOURS_MISMATCH', 'hours', `El documento indica ${fmt(total)} horas, pero ${fmt(ctx.hours.weekly.value as number)} horas semanales × ${fmt(ctx.hours.weeks.value as number)} semanas son ${fmt(prod)} horas.`);
+    if (outOf(prod) && comparable) {
+      add('warning', 'WEEKLY_HOURS_MISMATCH', 'hours', `El documento indica ${totalText} horas, pero ${fmt(ctx.hours.weekly.value as number)} horas semanales × ${fmt(ctx.hours.weeks.value as number)} semanas son ${fmt(prod)} horas.`);
     }
   }
   if (total !== null && ctx.units.length > 1 && ctx.units.every((u) => u.hours !== null)) {
     const sum = ctx.units.reduce((a, u) => a + (u.hours as number), 0);
-    if (Math.abs(sum - total) > HOURS_TOLERANCE) add('warning', 'UNIT_HOURS_MISMATCH', 'units', `Las horas de las unidades suman ${fmt(sum)}, pero el total del documento es ${fmt(total)} horas.`);
+    if (outOf(sum)) add('warning', 'UNIT_HOURS_MISMATCH', 'units', `Las horas de las unidades suman ${fmt(sum)}, pero el total del documento es ${totalText} horas.`);
   }
   if (total !== null && !isValidTargetHours(total)) {
     add('warning', 'HOURS_OUT_OF_RANGE', 'hours.total', `El total de ${fmt(total)} horas no se puede usar como horas objetivo del curso (de 1 a 500, en pasos de 0,5).`);

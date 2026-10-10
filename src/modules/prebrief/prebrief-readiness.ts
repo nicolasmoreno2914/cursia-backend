@@ -35,7 +35,15 @@ export interface PrebriefBlocker {
   capability?: true;
   /** Texto sugerido para la aceptación (el docente lo revisa y lo guarda; nunca se guarda solo). */
   suggestion?: string;
+  /** Alternativa que propone Cursia para el requisito no cubierto (con lo que ya produce). */
+  proposal?: string;
 }
+
+/** Nombre, para el docente, de cada dato del curso que pide la propuesta (nunca la clave interna). */
+const CONTEXT_FIELD_LABEL: Record<string, string> = {
+  nombre: 'el nombre del curso', sector: 'el sector', pais: 'el país', ciudad: 'la ciudad', contexto: 'el contexto educativo',
+  nivel: 'el conocimiento previo del estudiante', tono: 'el tono del contenido', obj: 'el objetivo', comp: 'las competencias',
+};
 
 export interface PrebriefReadiness {
   ready: boolean;
@@ -73,12 +81,15 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
       // LOOP 9.2 (capacidades): requisito no cubierto → solo se continúa si la institución acepta la diferencia.
       b.push({ code: 'exception_reason', capability: true, title: `Requisito no cubierto: ${e.requirementText}${covered.length ? ` (también ${covered.join(' y ')})` : ''}. Para continuar, la institución debe aceptar la diferencia.`,
         detail: `El microcurrículo solicita ${e.requirementText}. Actualmente, ${e.appliedText}.`, where: 'reason', ref: e.requirementKey,
-        suggestion: `Se acepta la propuesta de Cursia: ${e.appliedText.replace(/^Cursia (contempla|produce|diseña) /, '')}, en lugar de lo solicitado en el documento: ${e.requirementText}${covered.length ? ` (${covered.join(' y ')})` : ''}.` });
+        ...(e.proposal ? { proposal: e.proposal } : {}),
+        suggestion: e.proposal
+          ? `Se acepta la alternativa que propone Cursia para ${e.requirementText}${covered.length ? ` (${covered.join(' y ')})` : ''}: ${e.proposal.replace(/^Proponemos /, '').replace(/\s*No reemplaza al segundo video: la institución decide si lo acepta\.$/, '')}`
+          : `Se acepta la propuesta de Cursia: ${e.appliedText.replace(/^Cursia (contempla|produce|diseña) /, '')}, en lugar de lo solicitado en el documento: ${e.requirementText}${covered.length ? ` (${covered.join(' y ')})` : ''}.` });
     } else b.push({ code: 'exception_reason', title: `Falta el motivo de la excepción: ${e.requirementText}${covered.length ? ` (el mismo motivo cubre también ${covered.join(' y ')})` : ''}.`,
       detail: `El documento pide ${e.requirementText}; el diseño tiene ${e.appliedText}.`, where: 'reason', ref: e.requirementKey });
   }
   const missing = missingContextFields(model);
-  if (missing.length) b.push({ code: 'context_incomplete', title: `Faltan datos del curso: ${missing.join(', ')}.`, where: 'understood' });
+  if (missing.length) b.push({ code: 'context_incomplete', title: `Faltan datos del curso: ${missing.map((k) => CONTEXT_FIELD_LABEL[k] || k).join(', ')}.`, where: 'understood' });
   for (const f of languageFindings.slice(0, 5)) b.push({ code: 'language', title: `Texto que no está en español neutro: ${f}`, where: 'understood' });
   return { ready: b.length === 0, blockers: b };
 }

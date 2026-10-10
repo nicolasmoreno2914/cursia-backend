@@ -131,7 +131,14 @@ interface Segment {
 }
 
 /** LOOP 9.2 · Título de una sección que no exige nada («15. Información no prescriptiva», «Referencias de contexto»…). */
-const RE_NONPRESCRIPTIVE_HEAD = /(no prescriptiv\w*|informacion (de contexto|contextual|complementaria no obligatoria)|referencias? de contexto|no constituyen requisitos|solo (para )?contextualizar)/;
+const RE_NONPRESCRIPTIVE_HEAD = /(no prescriptiv\w*|informacion (de contexto|contextual|complementaria no obligatoria)|referencias? de contexto|no constituyen requisitos|solo (para )?contextualizar|notas? (para|sobre|de) (la )?(implementacion|produccion|el equipo|cursia|la plataforma)|notas? de diseno|notas? tecnicas?)/;
+/**
+ * Una oración sobre la PLATAFORMA o su capacidad («debe verificarse contra la capacidad real de producción», «si la
+ * plataforma solo puede producir 1 video por capítulo») no exige nada al curso: es una indicación para quien lo produce.
+ */
+/** «ubicadas en el capítulo de práctica», «en el espacio de aplicación (correspondiente)», «en la práctica del módulo». */
+const RE_AA_IN_PRACTICE = /\b(?:(?:ubicad|situad|incluid)\w*\s+)?en (?:el|los|cada|su|la) (?:capitulos? de practica|espacios? de (?:aplicacion|practica)|practicas? (?:del|de cada) modulo)\b/;
+const RE_PLATFORM_NOTE = /\b(capacidad (real|tecnica)( de produccion)?|capacidad de (la plataforma|cursia|produccion)|verificad[oa] contra|verificarse (antes|contra)|no debe asumirse( como cumplible)?|debe ser verificad[oa]|(la plataforma|cursia) solo puede producir|puede producir (la plataforma|cursia))\b/;
 /**
  * ¿La línea abre una sección? Review I10: si el documento tiene títulos con estilo (Word/Markdown), solo esos; si no, un
  * numerado que SIGUE la numeración de las secciones (15 → 16, no los ítems «1.», «2.» de una lista), un título en
@@ -283,6 +290,14 @@ function num(s: string): number {
 }
 
 function scopeAfter(after: string, kind: RequirementKind): RequirementScope | null {
+  // «2 videos por cada uno de los 12 capítulos de contenido», «1 por cada uno de los módulos».
+  const each = /^\s*(?:por|en|de|para) cada un[oa] de (?:los|las) (?:\d{1,3} |[a-z]+ )?(capitulos?|modulos?|unidades?)( de (?:contenido|practica))?\b/.exec(after);
+  if (each) {
+    const what = each[1];
+    if (/^capitulo/.test(what) && kind !== 'chapters') return { level: 'chapter', each: true, ...(each[2] ? { chapterKind: /practica/.test(each[2]) ? 'practice' : 'content' } : {}) } as RequirementScope;
+    if (/^modulo/.test(what) && kind !== 'modules') return { level: 'module', each: true };
+    if (/^unidad/.test(what) && kind !== 'units') return { level: 'unit', each: true };
+  }
   if (kind !== 'modules' && /^\s*(por modulo|en cada modulo|de cada modulo|cada uno|por cada modulo)\b/.test(after)) return { level: 'module', each: true };
   if (kind !== 'chapters' && /^\s*(por capitulo|en cada capitulo|de cada capitulo|por cada capitulo)\b/.test(after)) {
     if (/^\s*\S+ (cada )?capitulo de practica/.test(after) || /capitulo de practica/.test(after.slice(0, 40))) return { level: 'chapter', each: true, chapterKind: 'practice' };
@@ -314,6 +329,14 @@ function mentionsOf(m: string, sentenceScope: RequirementScope | null, ignored: 
     const after = m.slice(start + all.length, start + all.length + 60);
     // Referencia: el sustantivo va ANTES del número («capítulo 6», «parcial 1»).
     if (/\b(capitulo|pagina|pag|seccion|ejemplo|figura|tabla|parcial|examen|semana|unidad|modulo|sesion|paso|nivel|anexo|numeral|item|corte)\s*$/.test(before) && !rangeA && !rangeB && !rangeC) {
+      ignored('reference', all);
+      continue;
+    }
+    // Referencia a lo ya definido («atraviesan los tres módulos», «cada uno de los 12 capítulos», «sus 4 unidades»):
+    // el artículo definido o el posesivo antes del número nombra algo que existe; no exige una cantidad.
+    // Solo con contexto que remite a algo ya definido («de los», «en las», «atraviesan los»); «desarrollar las 3
+    // evaluaciones» o «presentará los 2 exámenes» siguen siendo requisitos.
+    if (/\b(?:de|del|en|entre|atraviesan|atraviesa|abarcan|recorren|integran|retoman|articulan)\s+(los|las|sus|estos|estas|dichos|dichas|ambos|ambas)\s*$|\b(sus|estos|estas|dichos|dichas|ambos|ambas)\s*$/.test(before) && !/\b(exactamente|minimo|maximo|al menos|tendra|tendran|contara|contaran|incluira|incluiran)\b[^.;]{0,20}$/.test(before) && !rangeA && !rangeB && !rangeC) {
       ignored('reference', all);
       continue;
     }
@@ -413,6 +436,36 @@ function conflictSubject(r: DocumentRequirement): string {
   return base + scope;
 }
 
+/**
+ * Fila «Asignatura — N horas» de un documento de varias asignaturas (malla, compendio): un NOMBRE (no un rótulo de
+ * estructura ni de duración) separado por raya, guion o celda de UNA cantidad de horas.
+ * NO lo son: un rango de horas («Duración: 40–44 horas», «Módulo 1 | 13–15 h», «Total | 40–44 h» — la raya entre dos
+ * números es el rango, no el separador), las filas de módulos / unidades / semanas / totales del mismo curso, ni una
+ * oración («La duración requerida … es de 40–44 horas»).
+ */
+export function subjectHoursRow(text: string): { subject: string; hours: number; dash: boolean } | null {
+  const t = text.replace(/\s+/g, ' ').trim();
+  const m = /^([A-ZÁÉÍÓÚÑ][^—–|:]{2,60}?)\s*([—–|]|\s-\s)\s*(.*)$/i.exec(t);
+  if (!m) return null;
+  const label = m[1].trim();
+  const rest = m[3];
+  // Un rango de horas («13–15 h», «40 - 44 horas», «40 a 44 horas»), no «nombre — horas».
+  if (/^\d{1,4}(?:[.,]\d{1,2})?\s*(?:-|–|—|a|al|hasta|y)\s*\d/i.test(rest)) return null;
+  // «Duración 40–44 horas»: la raya pegada a dos números es el rango (el «40» no es parte de un nombre).
+  if (/\d$/.test(label) && m[2] !== '|' && !/\s/.test(t.slice(m.index + m[1].length, m.index + m[1].length + 1)) && /^\d/.test(rest)) return null;
+  const h = /^(\d{1,4})\s*(?:h|hrs?\.?|horas)\b/i.exec(rest);
+  if (!h) return null;
+  if (label.split(/\s+/).length > 8) return null;
+  // Filas del MISMO curso (módulos, unidades, semanas, totales, la duración): no son otras asignaturas.
+  const k = strip(label).replace(/\s*\d+$/, '');
+  if (!k || /^(modulo|unidad|capitulo|leccion|tema|semana|sesion|bloque|eje|corte|periodo|total|subtotal|duracion|intensidad|horas?|carga|trabajo|dedicacion|tiempo|la |el |los |las |cada |todo)/.test(k)) return null;
+  // Componentes de horas de UN curso («Acompañamiento docente | 16 h», «Estudio independiente - 32 h»): no son asignaturas.
+  if (RE_COMPONENT_HOURS.test(k) || /\b(estudio|actividades?|componente|evaluacion|lectura|aplicacion|virtual|campo)\b/.test(k)) return null;
+  // La raya (—/–) es la forma de una malla («Matemáticas — 64 horas»); la celda o el guion corto también los usa una tabla
+  // de horas del propio curso: cuentan solo con otra evidencia de varias asignaturas.
+  return { subject: label, hours: Number(h[1]), dash: m[2] === '—' || m[2] === '–' };
+}
+
 export function extractRequirements(lines: SourceLine[], documentId = 'doc'): RequirementsExtraction {
   const segs = segmentsOf(lines);
   const requirements: DocumentRequirement[] = [];
@@ -422,13 +475,15 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
 
   // Documento de varias asignaturas: filas «Asignatura — N horas», varias identificaciones de asignatura, tablas con
   // créditos por fila o un catálogo con precios.
-  const subjectRows = segs.filter((s) => !s.option && /^([A-ZÁÉÍÓÚÑ][^—–:]{2,60}?)\s*[—–]\s*\d{1,4}\s*(h|horas)\b/i.test(s.text));
+  const subjectRows = segs.filter((s) => !s.option && !!subjectHoursRow(s.text));
   const identities = (joined.match(/nombre (?:del espacio academico|de la asignatura|del curso)\s*:/g) || []).length;
   const creditRows = (joined.match(/\b\d\s*cr\b/g) || []).length;
   const catalog = (joined.match(/\$\s?\d/g) || []).length >= 3 && (joined.match(/\bdiplomados?\b/g) || []).length >= 5;
   // Propuesta o malla que entrega varios cursos («56 cursos en Moodle», «36 cursos», «piloto de 3 asignaturas»).
   const courseCounts = (joined.match(/\b([3-9]|[1-9]\d{1,2}) (?:cursos|asignaturas|materias)\b/g) || []).length;
-  const multiCourse = subjectRows.length >= 2 || identities >= 2 || creditRows >= 3 || catalog || courseCounts >= 2;
+  const otherEvidence = identities >= 2 || creditRows >= 3 || catalog || courseCounts >= 2;
+  const dashRows = subjectRows.filter((s) => subjectHoursRow(s.text)!.dash).length;
+  const multiCourse = dashRows >= 2 || (subjectRows.length >= 2 && otherEvidence) || otherEvidence;
   const subjects: string[] = [];
 
   let seq = 0;
@@ -447,11 +502,11 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
     const src = (quote: string) => ({ documentId, line: seg.line, page: seg.page, quote: (seg.quote || quote).slice(0, 300) });
 
     // Filas de asignatura.
-    const sr = /^([A-ZÁÉÍÓÚÑ][^—–:]{2,60}?)\s*[—–]\s*(\d{1,4})\s*(?:h|horas)\b/i.exec(seg.text);
-    if (subjectRows.length >= 2 && sr) {
-      const subject = sr[1].trim();
+    const sr = subjectHoursRow(seg.text);
+    if (multiCourse && subjectRows.length >= 2 && sr) {
+      const subject = sr.subject;
       subjects.push(subject);
-      push({ kind: 'target_hours', scope: { level: 'subject', subject }, mode: 'exact', value: Number(sr[2]), obligation: 'required', active: false, status: 'found', confidence: 'high', review: ['Aplica solo a esta asignatura: elige la asignatura del curso.'], source: src(seg.text) });
+      push({ kind: 'target_hours', scope: { level: 'subject', subject }, mode: 'exact', value: sr.hours, obligation: 'required', active: false, status: 'found', confidence: 'high', review: ['Aplica solo a esta asignatura: elige la asignatura del curso.'], source: src(seg.text) });
       continue;
     }
 
@@ -460,7 +515,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       const quote = sentence;
       const ign = (reason: IgnoredReason, q: string) => ignored.push({ reason, quote: q.slice(0, 160), line: seg.line });
       // LOOP 9.2: lo que el documento declara no prescriptivo («NO constituyen requisitos») no se convierte en requisito.
-      if (seg.informative) {
+      if (seg.informative || RE_PLATFORM_NOTE.test(n0)) {
         if (/\d/.test(n0)) ign('not_prescriptive', sentence);
         continue;
       }
@@ -537,7 +592,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         const total = [...mentions].filter((x) => x.index < at && x.scope.level === 'course' && x.mode === 'exact').sort((a, b) => b.index - a.index)[0];
         if (!total || total.kind === 'modules' || total.kind === 'target_hours' || total.kind === 'evaluations') continue;
         const unit = dm[2];
-        const inPractice = /\b(ubicad\w*|situad\w*|incluid\w*)?\s*en (el|los|cada) capitulos? de practica/.test(m.slice(at));
+        const inPractice = RE_AA_IN_PRACTICE.test(m.slice(at));
         let scope: RequirementScope;
         if (unit === 'modulo') scope = inPractice ? { level: 'module', each: true, chapterKind: 'practice' } : { level: 'module', each: true };
         else scope = /de contenido/.test(unit) ? { level: 'chapter', each: true, chapterKind: 'content' } : /de practica/.test(unit) ? { level: 'chapter', each: true, chapterKind: 'practice' } : { level: 'chapter', each: true };
@@ -726,6 +781,16 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
     const g: RequirementGroup = { id: `G${finalGroups.length + 1}`, relation: 'all', label: `${m0.value} × ${c0.value}`, requirementIds: [m0.id, c0.id, st.id], source: m0.source };
     finalGroups.push(g);
     m0.groupId = c0.groupId = st.groupId = g.id;
+  }
+  // Dónde van las Actividades de Aplicación, dicho en OTRA frase del documento («Actividades de Aplicación: 3, una por
+  // módulo, ubicadas en el espacio de aplicación correspondiente»): el reparto por módulo va en el capítulo de práctica.
+  const aaWhere = segs.some((sg) => !sg.example && !sg.informative && /actividad(es)? de aplicacion/.test(strip(sg.text)) && RE_AA_IN_PRACTICE.test(strip(sg.text)));
+  if (aaWhere) {
+    for (const r of kept) {
+      if (r.kind !== 'application_activities' || r.scope.level !== 'module' || !('each' in r.scope) || 'chapterKind' in r.scope) continue;
+      r.scope = { level: 'module', each: true, chapterKind: 'practice' } as RequirementScope;
+      r.key = `${r.kind}@${scopeKey(r.scope)}`;
+    }
   }
   return { requirementsVersion: 1, requirements: kept, groups: finalGroups, conflicts, ignored, multiCourse, subjects };
 }

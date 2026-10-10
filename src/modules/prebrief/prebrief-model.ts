@@ -73,6 +73,8 @@ export interface PrebriefException {
    * aceptación de la institución es «Requisito no cubierto»; con ella, «Excepción aceptada». Solo presente si es true.
    */
   capability?: true;
+  /** Alternativa que Cursia propone para un requisito no cubierto (con lo que ya produce). La institución decide. */
+  proposal?: string;
   requirementKey: string;
   requirementText: string;
   appliedText: string;
@@ -295,7 +297,7 @@ export function hashProjection(m: PrebriefModel): unknown {
   c.observations = c.observations.map((o) => ({ id: o.id, text: '' }));
   c.requirements.items = c.requirements.items.map((i) => ({ ...i, text: '', detail: null, actual: null }));
   // LOOP 9.2 (review I1): `capability` se deriva de Verificación (no cambia lo aprobado): fuera de la huella.
-  c.exceptions = c.exceptions.map((e) => { const { capability: _cap, ...rest } = e; return { ...rest, requirementText: '', appliedText: '' }; });
+  c.exceptions = c.exceptions.map((e) => { const { capability: _cap, proposal: _p, ...rest } = e; return { ...rest, requirementText: '', appliedText: '' }; });
   c.decisions = c.decisions.map((d) => ({ ...d, label: '', value: '' })); // el código crudo (`code`) sí entra
   c.course.modality = { ...c.course.modality, value: '' };
   if (c.duration.format) c.duration.format = { ...c.duration.format, value: '' };
@@ -464,6 +466,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
         reason: valid ? clean(saved.reason) : null, by: valid ? saved.by : null, at: valid ? saved.at : null,
         ...(cov ? { coveredBy: String(cov.requirementKey) } : {}),
         ...(vcheck && vcheck.capability ? { capability: true as const } : {}),
+        ...(vcheck && vcheck.capability && typeof vcheck.capability.proposal === 'string' && clean(vcheck.capability.proposal) ? { proposal: clean(vcheck.capability.proposal) } : {}),
       });
     }
   }
@@ -579,7 +582,9 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       origin: structureOrigin,
       // Cierre (review final m): la forma que exige el documento se presenta como tal aunque se haya elegido desde
       // «Cursia recomienda» (que en ese caso propone exactamente la exigida).
-      ...(inp.structureChoice ? { selected: { choice: inp.structureChoice, label: structureOrigin === 'requirement' && (inp.structureChoice === 'cursia' || inp.structureChoice === 'document') ? 'Exigida por el documento' : STRUCTURE_CHOICE_LABEL[inp.structureChoice] } } : {}),
+      ...(inp.structureChoice ? { selected: { choice: inp.structureChoice, label: structureOrigin === 'requirement' && (inp.structureChoice === 'cursia' || inp.structureChoice === 'document') ? 'Exigida por el documento'
+        // El formato se nombra («Formato M elegido por la institución»): la institución eligió ESE formato del catálogo.
+        : inp.structureChoice === 'format' && fdef ? `${fdef.label} elegido por la institución` : STRUCTURE_CHOICE_LABEL[inp.structureChoice] } } : {}),
       ...(inp.contentCoverage && inp.contentCoverage.total > 0 ? { contents: { total: inp.contentCoverage.total, covered: inp.contentCoverage.covered } } : {}),
       modules,
       totals,

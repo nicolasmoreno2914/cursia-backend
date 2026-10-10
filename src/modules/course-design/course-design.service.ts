@@ -25,7 +25,7 @@ import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../cours
 import { compareRequirements, DesignForRequirements, RequirementCheck } from '../academic-context/requirements/document-requirements';
 import {
   DECISION_DEFAULTS, DecisionOverrides, constraintsFor, EXCEPTION_FIELDS, structureEditedByTeacher, EXCEPTION_VALUES, ExceptionField, hoursFromRequirements, loadExceptions, loadRequirementAuthority,
-  requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
+  requiredContentShape, requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
 } from '../academic-context/requirements/requirement-authority';
 import { DistributionResult } from '../study-time/distributor';
 import { ConflictException } from '@nestjs/common';
@@ -295,7 +295,13 @@ export class CourseDesignService {
       const origin = await readStructureOrigin(this.dataSource, courseId);
       const [cnt] = await this.dataSource.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]);
       // Review piloto I5: misma regla que las restricciones (la forma de la estructura, no cualquier edición).
-      const structureByTeacher = await structureEditedByTeacher(this.dataSource, courseId);
+      let structureByTeacher = await structureEditedByTeacher(this.dataSource, courseId);
+      // Una forma elegida (formato S/M/L o personalizada) IGUAL a la que exige el documento no se aparta de él: un choque de
+      // horas con esa forma no es «la estructura que armaste» sino lo que el propio documento fija.
+      const docShape = requiredContentShape(auth.required);
+      const liveShape = dist.modules.map((m) => m.chapters.filter((c) => !c.proposed && c.kind === 'content').length);
+      const shapeIsDocuments = !!docShape && liveShape.length === docShape.length && liveShape.every((n, i) => n === docShape[i]);
+      if (shapeIsDocuments) structureByTeacher = false;
       reqChecks = compareRequirements(auth.applicable, designForRequirements(dist, profile.targetHours ?? null, hoursSource === 'requirement' ? 'proposed' : hoursSource,
         structureByTeacher, !!decisions.audiovisual, !!decisions.applicationActivities));
       const teacherPins = dist.modules.some((m) => m.chapters.some((c) => !c.proposed && (c.videoPinned || c.applicationPinned)));
@@ -345,7 +351,7 @@ export class CourseDesignService {
           && ['modules', 'chapters', 'structure'].includes((auth.applicable.find((r) => r.id === c.requirementId) || { kind: '' }).kind));
         // Fase 2/4: con una forma elegida por la institución en «Estructura» (personalizada o formato), Cursia no agrega
         // capítulos de contenido; si las horas no caben en esa forma, es la excepción de la institución (con su motivo).
-        const chosenShape = !!(origin && origin.choice && origin.choice !== 'document' && origin.choice !== 'cursia');
+        const chosenShape = !!(origin && origin.choice && origin.choice !== 'document' && origin.choice !== 'cursia') && !shapeIsDocuments;
         clashCause = !persists || teacherStructureOff || chosenShape ? 'teacher' : 'document';
       }
       requirementChecks = requirementVerificationChecks(auth.applicable, reqChecks, {

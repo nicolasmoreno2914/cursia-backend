@@ -83,7 +83,7 @@ const HEADINGS: ReadonlyArray<[SectionKey, RegExp]> = [
   ['contents', /^(contenidos?( tematicos?| programaticos?| del curso| de la asignatura| minimos)?|unidades( tematicas| de aprendizaje)?|temario|ejes tematicos|plan tematico|estructura tematica|programa tematico|contenido programatico)$/],
   ['hoursTotal', /^(intensidad horaria total|horas totales|total de horas|numero total de horas)$/],
   ['hoursWeekly', /^(intensidad horaria semanal|horas semanales|horas por semana|intensidad semanal)$/],
-  ['hours', /^(intensidad horaria|carga horaria|distribucion (de|del) (tiempo|las horas|horas)|tiempo de dedicacion|duracion)$/],
+  ['hours', /^(intensidad horaria|carga horaria|distribucion (de|del) (tiempo|las horas|horas)|distribucion horaria|tiempo de dedicacion|duracion( total)?( y distribucion horaria| y distribucion de (las )?horas)?|horas de trabajo( del estudiante)?)$/],
   ['weeks', /^(numero de semanas|semanas|duracion en semanas)$/],
   ['credits', /^(creditos( academicos)?|numero de creditos|n(o|ro)\.? de creditos)$/],
   ['hoursContact', /^(horas (de trabajo )?presencial(es)?|horas de acompanamiento( docente| directo)?|trabajo presencial|horas teoricas|horas de clase|horas con docente|trabajo con acompanamiento docente|acompanamiento directo)$/],
@@ -128,6 +128,34 @@ function keyOf(text: string): SectionKey | null {
   return null;
 }
 
+/**
+ * Rótulos de columna de una tabla (sin tildes, minúsculas). Una fila hecha SOLO de estos rótulos es el encabezado de la
+ * tabla («Código | Resultado de aprendizaje», «Evaluación | Momento | Resultados principales»), nunca un dato.
+ */
+const COLUMN_LABEL_RE = /^(?:codigo|cod\.?|n[°º.o]?|nro\.?|numero|item|#|id|elemento|definicion|descripcion|detalle|nombre|titulo|resultados?(?: de aprendizaje| esperados?| principales| asociados| que evalua)?|competencias?(?: asociadas?)?|ra|co|unidad(?:es)?(?: tematicas?)?|modulos?|capitulos?|temas?|subtemas?|contenidos?(?: principal(?:es)?| tematicos?)?|recursos?(?: previstos| didacticos)?|actividad(?:es)?(?: de aprendizaje)?|horas?(?: de trabajo(?: del estudiante)?| totales| presenciales| autonomas)?|semanas?|sesion(?:es)?|fecha|momento|evaluacion(?:es)?|instrumento|tipo|criterios?(?: de evaluacion)?|evidencias?(?: de aprendizaje)?|porcentaje|peso|ponderacion|%|valor|observaciones|duracion|intensidad horaria|creditos|producto|estrategias?(?: didacticas?)?)$/;
+
+/** ¿La fila (celdas o texto) es el encabezado de una tabla? Todas sus celdas son rótulos de columna (≥ 2 celdas). */
+export function isColumnHeaderRow(l: { text: string; cells?: string[] }): boolean {
+  const cells = (l.cells && l.cells.length ? l.cells : null)?.map((c) => normKey(c)).filter(Boolean);
+  if (cells && cells.length >= 2) return cells.every((c) => COLUMN_LABEL_RE.test(c));
+  // Sin celdas (lectura plana): «Código Resultado de aprendizaje» = 2 rótulos seguidos. Se parte en rótulos conocidos.
+  let rest = normKey(l.text);
+  if (!rest || rest.length > 80 || /\d/.test(rest)) return false;
+  let parts = 0;
+  while (rest) {
+    let hit = '';
+    const words = rest.split(' ');
+    for (let k = Math.min(words.length, 6); k >= 1; k--) {
+      const cand = words.slice(0, k).join(' ');
+      if (COLUMN_LABEL_RE.test(cand)) { hit = cand; break; }
+    }
+    if (!hit) return false;
+    parts++;
+    rest = rest.slice(hit.length).trim();
+  }
+  return parts >= 2;
+}
+
 interface HeadingHit { key: SectionKey; value: string | null; heading: string }
 
 /** ¿La línea es un encabezado conocido? Devuelve la clave y el valor en línea («Clave: valor»), si lo hay. */
@@ -166,17 +194,43 @@ function clip(s: string, max: number): { text: string; clipped: boolean } {
   return { text: cut.slice(0, at > 0 ? at : max).trim(), clipped: true };
 }
 const HOURS_RE = /(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:horas?|hrs?\.?|h)(?![a-z])/i;
+const HNUM = '(\\d{1,4}(?:[.,]\\d{1,2})?)';
+/** «40–44 horas», «40 - 44 h», «40 a 44 horas», «de 40 a 44 horas», «entre 40 y 44 horas». */
+const HOURS_RANGE_RE = new RegExp(`(?:entre\\s+${HNUM}\\s+y\\s+${HNUM}|${HNUM}\\s*(?:-|–|—|a|al|hasta)\\s*${HNUM})\\s*(?:horas?|hrs?\\.?|h)(?![a-z])`, 'i');
+/** Meta de diseño de un rango: el punto medio a la media hora (misma regla que los formatos S/M/L). */
+export const rangeMidpoint = (min: number, max: number) => Math.round(((min + max) / 2) * 2) / 2;
+/**
+ * Horas de un texto, CONSERVANDO un rango: «40–44 horas» → {value 42, min 40, max 44}; «48 horas» → {value 48}.
+ * Un rango nunca se convierte en su extremo superior.
+ */
+export function hoursSpanOf(text: string): { value: number; min?: number; max?: number; raw: string } | null {
+  const r = HOURS_RANGE_RE.exec(text);
+  // «Semana 1 a 4 h», «Módulo 2 - 12 h»: el primer número es un ordinal (semana, módulo…), no el inicio de un rango.
+  // Solo si la palabra va PEGADA al número y no es «por módulo» / «cada módulo» («Horas por módulo 13–15 h» es un rango).
+  const before = text.slice(0, r ? r.index : 0);
+  if (r && /\b(semanas?|m[oó]dulos?|unidad(?:es)?|cap[ií]tulos?|sesi[oó]n(?:es)?|temas?|niveles?|corte)\s?$/i.test(before) && !/\b(por|cada|de cada|en cada)\s+\S+\s?$/i.test(before) && !/\b(m[oó]dulos|unidades|cap[ií]tulos|semanas|sesiones|temas|niveles)\s?$/i.test(before)) {
+    const one = HOURS_RE.exec(text.slice(r.index + r[0].search(/(?:-|–|—|a|al|hasta)\s*\d/)));
+    return one ? { value: num(one[1]), raw: one[0] } : null;
+  }
+  if (r) {
+    const a = num(r[1] ?? r[3]);
+    const b = num(r[2] ?? r[4]);
+    if (Number.isFinite(a) && Number.isFinite(b) && a > 0 && b >= a) return a === b ? { value: a, raw: r[0] } : { value: rangeMidpoint(a, b), min: a, max: b, raw: r[0] };
+  }
+  const m = HOURS_RE.exec(text);
+  return m ? { value: num(m[1]), raw: m[0] } : null;
+}
 const PCT_RE = /(\d{1,3}(?:[.,]\d{1,2})?)\s*%/;
 const num = (s: string) => Number(s.replace(',', '.'));
-const OUTCOME_CODE_RE = /^\s*\(?(RAA|RAP|RA|R)\s*[-.]?\s*([0-9]{1,3})\s*\)?\s*[.:)\-–]?\s+/i;
-const COMPETENCY_CODE_RE = /^\s*\(?(CE|CG|CO|C)\s*[-.]?\s*([0-9]{1,3})\s*\)?\s*[.:)\-–]?\s+/i;
+const OUTCOME_CODE_RE = /^\s*\(?(RAA|RAP|RA|R)\s*[-.]?\s*([0-9]{1,3})\s*\)?\s*[.:)\-–—|]?\s+/i;
+const COMPETENCY_CODE_RE = /^\s*\(?(CE|CG|CO|C)\s*[-.]?\s*([0-9]{1,3})\s*\)?\s*[.:)\-–—|]?\s+/i;
 // Vínculos: «RA1» (mayúsculas) en cualquier parte; las competencias («CE2», «CO1») SOLO dentro de un grupo de códigos
 // —entre paréntesis, al final tras un guion o en una celda que solo trae códigos—, para no confundir «CO2» de
 // «emisiones de CO2» con una competencia.
 const OUTCOME_REF_G = /\b(RAA|RAP|RA)\s*-?\s*([0-9]{1,3})\b/g;
 // Dentro de un grupo de códigos se aceptan minúsculas («(ra1, ra2)»); fuera, solo «RA» en mayúsculas.
 const CODE_G = /\b(RAA|RAP|RA|CE|CG|CO)\s*-?\s*([0-9]{1,3})\b/gi;
-const CODE_LIST = '(?:(?:RAA|RAP|RA|CE|CG|CO)\\s*-?\\s*[0-9]{1,3}[\\s,;y]*)+';
+const CODE_LIST = '(?:(?:RAA|RAP|RA|CE|CG|CO)\\s*-?\\s*[0-9]{1,3}[\\s,;y·/]*)+';
 const GROUP_PAREN_G = new RegExp(`\\((\\s*${CODE_LIST})\\)`, 'gi');
 // Al final tras guion o barra (no «:» — «Gas principal: CO2» no es un vínculo).
 const GROUP_TAIL_RE = new RegExp(`[-–—|]\\s*(${CODE_LIST})$`, 'i');
@@ -197,19 +251,50 @@ interface Section {
 }
 
 /** LOOP 9.2: encabezado de módulo / unidad con título («8. Módulo 1 — Fundamentos, derechos y atención inicial»). */
-const MODULE_HEADING_RE = /^(?:\d{1,2}[.)]\s+)?(?:m[oó]dulo|unidad)\s+(\d{1,2}|[ivxlc]{1,6})\s*[—–:.-]\s*(\S.*)$/i;
+const MODULE_HEADING_RE = /^(?:\d{1,2}[.)]\s+)?(?:m[oó]dulo|unidad)\s+(\d{1,2}|[ivxlc]{1,6})\s*[—–:.·|-]\s*(\S.*)$/i;
+/**
+ * Encabezado de módulo IMPERFECTO (documentos reales): «Módulo 2» sin título (los temas van debajo) o «Módulo: Atención
+ * inicial» sin número. Solo cuenta si lo que sigue son sus temas o capítulos (lo decide isModuleHeading).
+ */
+const BARE_MODULE_RE = /^(?:\d{1,2}[.)]\s+)?(?:m[oó]dulo|unidad)(?:\s+(\d{1,2}|[ivxlc]{1,6}))?\s*(?:[—–:.·|-]\s*(\S.*))?$/i;
+/** Fila o línea de capítulo: «1.1 | título | recursos», «1.1 título», «Capítulo 3: título». */
+const CHAPTER_ROW_RE = /^(?:cap[ií]tulo|lecci[oó]n|tema)?\s*(\d{1,2})[.](\d{1,2})\.?(?:\s|$)|^(?:cap[ií]tulo|lecci[oó]n)\s+(\d{1,2}|[ivxlc]{1,6})\b/i;
 /**
  * Review LOOP 9.2 (C1/I2): solo un ENCABEZADO de módulo abre el árbol — con estilo de título (Word/Markdown) o con la
  * numeración de las secciones del documento («8. Módulo 1 — …») —, con un título de verdad (no «30 %», no una oración).
  */
-function isModuleHeading(l: SourceLine): boolean {
+function isModuleHeading(l: SourceLine, next?: SourceLine, next2?: SourceLine): boolean {
   const t = l.text.trim();
   const m = MODULE_HEADING_RE.exec(t);
+  if (!m && !l.cells && t.length <= 120 && next) {
+    // «Módulo 2» solo, o «Módulo: título» sin número: encabezado si le siguen sus temas (línea corta que no es otro
+    // encabezado ni una oración) o sus capítulos.
+    const b = BARE_MODULE_RE.exec(t);
+    if (!b || (!b[1] && !b[2])) return false;
+    const title = (b[2] || '').trim();
+    if (title && (title.split(/\s+/).length > 14 || /%|\d+\s*(h|horas?)\b/i.test(title) || /[.;]$/.test(title))) return false;
+    // «Módulo: Virtual», «Unidad: Facultad de Ciencias de la Salud»: datos de la ficha, no módulos del curso.
+    if (title && /^(virtual|presencial|h[ií]brid\w*|a distancia|mixt\w*|en l[ií]nea|facultad|escuela|departamento|programa|instituto|centro|sede|campus|vicerrector\w*|direcci[oó]n)\b/i.test(title)) return false;
+    const isTopic = (x?: SourceLine) => {
+      if (!x || x.cells) return false;
+      const t2 = x.text.trim();
+      return t2.split(/\s+/).length <= 12 && !/[.;:]$/.test(t2) && !/\d\s*(h|horas?)\b/i.test(t2) && !keyOf(t2) && !/^[^:]{1,40}:/.test(t2) && !BARE_MODULE_RE.test(t2);
+    };
+    const nt = (next.cells && next.cells.length ? next.cells[0] : next.text).trim();
+    // Sus capítulos (fila o tabla) o al menos DOS temas cortos seguidos.
+    return CHAPTER_ROW_RE.test(nt) || isColumnHeaderRow(next) || (isTopic(next) && (isTopic(next2) || (!!next2 && CHAPTER_ROW_RE.test(next2.text.trim()))));
+  }
   if (!m || l.cells || t.length > 160) return false;
   const title = m[2].trim();
   const words = title.split(/\s+/).filter((w) => /[a-záéíóúñ]{2,}/i.test(w));
-  if (words.length < 2 || words.length > 14 || /%|\d+\s*(h|horas?)\b/i.test(title) || /[.;]$/.test(title)) return false;
-  return !!l.heading || /^\d{1,2}[.)]\s+/.test(t);
+  // Un título de una sola palabra («Módulo 1 — Fundamentos») también vale; nunca una cifra, unas horas o una oración.
+  if (words.length < 1 || words.length > 14 || /%|\d+\s*(h|horas?)\b/i.test(title) || /[.;]$/.test(title)) return false;
+  if (l.heading || /^\d{1,2}[.)]\s+/.test(t)) return true;
+  // Documento sin estilos (PDF, texto copiado): es un encabezado de módulo si lo que sigue son sus capítulos (una fila de
+  // capítulo o el encabezado de la tabla de capítulos).
+  if (!next) return false;
+  const nt = next.cells && next.cells.length ? next.cells[0] : next.text;
+  return CHAPTER_ROW_RE.test(nt.trim()) || isColumnHeaderRow(next);
 }
 /** Review LOOP 9.2 (I4): «Nombre» a secas solo es el nombre del curso en la ficha de identificación (no docente ni firmas). */
 const BARE_NAME_BLOCKERS = /(docente|profesor|tutor|elabor|revis|aprob|firma|autor|responsable|coordinador|estudiante|participante|contacto|integrante|grupo|evaluaci|bibliograf|referencia)/;
@@ -222,6 +307,10 @@ class DocExtraction {
   readonly found = new Set<string>();
   private rawOutcomes: { code: number | null; item: Item; inferredFrom: string | null }[] = [];
   private rawCompetencies: { code: number | null; item: Item }[] = [];
+  /** Horas por módulo / unidad de una tabla de distribución horaria («Módulo 1 | 13–15 h»), por número de módulo. */
+  private unitHours: { index: number; value: number; line: SourceLine }[] = [];
+  /** Encabezado de la primera sección de metodología (otra con distinto encabezado la complementa). */
+  private methodologyHeading: string | null = null;
 
   constructor(readonly docId: string) {}
 
@@ -239,6 +328,16 @@ class DocExtraction {
     const b = show(value);
     if (normKey(a) === normKey(b)) {
       return current.sources.length < ACADEMIC_LIMITS.sourcesPerItem ? { ...current, sources: [...current.sources, source] } : current;
+    }
+    // El mismo texto, una vez cortado («…prácticas clínicas o») y otra completo: no es una contradicción; manda el
+    // completo (y deja de pedir confirmación).
+    const ka = normKey(a);
+    const kb = normKey(b);
+    if (Math.min(ka.length, kb.length) >= 20 && (ka.startsWith(kb) || kb.startsWith(ka))) {
+      const longer = kb.length > ka.length;
+      const sources = (longer ? [source, ...current.sources] : [...current.sources, source]).slice(0, ACADEMIC_LIMITS.sourcesPerItem);
+      const { review: _r, ...rest } = current;
+      return longer ? { ...rest, value, sources } : { ...current, sources };
     }
     this.addConflict(path, [{ value: a, source: current.sources[0] }, { value: b, source }]);
     return current;
@@ -260,6 +359,7 @@ class DocExtraction {
     const sections = this.segment(doc.lines);
     for (const s of sections) this.found.add(s.key);
     for (const s of sections) this.parse(s);
+    this.applyUnitHours();
     this.finishOutcomes(sections);
     this.inferHours();
     this.inferLevel();
@@ -278,14 +378,37 @@ class DocExtraction {
     let context = ''; // último título y última línea (para «Nombre» a secas)
     const bareNameOk = (l: SourceLine) => !seenSubject && l.line <= 40 && !BARE_NAME_BLOCKERS.test(stripAccents(context).toLowerCase());
     const headingNum = (t: string) => { const m = /^\s*(\d{1,2})[.)]\s+\S/.exec(t); return m ? Number(m[1]) : null; };
-    for (const l of lines) {
+    // La sección abierta por una fila «clave | valor» de una ficha: la fila siguiente de esa misma ficha con otro rótulo
+    // («Requisito audiovisual | …») es otro dato, no la continuación del anterior.
+    let curFromRow = false;
+    for (let li = 0; li < lines.length; li++) {
+      const l = lines[li];
       if (l.cells) {
+        // Encabezado de una tabla («Código | Resultado de aprendizaje»): no es un dato ni una clave; la tabla sigue en la
+        // sección abierta (sus parsers lo reconocen y lo saltan).
+        if (isColumnHeaderRow(l)) {
+          if (cur) { cur.lines.push(l); curFromRow = false; }
+          continue;
+        }
         const cells0 = (l.cells ?? []).map(collapse);
         // «Nombre | Atención Integral…» en la ficha del curso (Review LOOP 9.2 I4: solo ahí).
         if (cells0[0] && normKey(cells0[0]) === 'nombre' && cells0[1] && !keyOf(cells0[1])) {
           if (bareNameOk(l)) { out.push({ key: 'subject', heading: cells0[0], headingLine: l, inline: cells0[1], lines: [] }); seenSubject = true; cur = null; }
           else if (cur) cur.lines.push(l);
           context = cells0.join(' ');
+          continue;
+        }
+        // Rótulos en una fila y sus valores en la siguiente («Objetivo general | Metodología» / «Fortalecer… | Casos…»):
+        // cada columna es un dato.
+        const nx = lines[li + 1];
+        if (cells0.length >= 2 && cells0.every((c) => !!c && !!keyOf(c)) && nx && nx.cells && nx.cells.length === cells0.length && nx.cells.every((c) => !keyOf(collapse(c)))) {
+          for (let k = 0; k < cells0.length; k++) {
+            const key = keyOf(cells0[k]) as SectionKey;
+            out.push({ key, heading: cells0[k], headingLine: nx, inline: collapse(nx.cells[k]) || null, lines: [] });
+          }
+          cur = null;
+          curFromRow = false;
+          li++;
           continue;
         }
         const pairs = this.cellPairs(l);
@@ -295,14 +418,20 @@ class DocExtraction {
           // Una fila clave | valor de una sección de varias líneas abre esa sección para lo que sigue.
           const last = pairs[pairs.length - 1];
           cur = SINGLE_VALUE.has(last.key) ? null : out[out.length - 1];
+          curFromRow = !!cur;
           continue;
         }
+        // Otra fila de la ficha con un rótulo que Cursia no modela («Requisito audiovisual | …»): cierra el dato anterior.
+        if (cur && curFromRow && cells0[0] && cells0.length === 2 && cells0[0].split(/\s+/).length <= 5 && !/\d/.test(cells0[0])) { cur = null; curFromRow = false; continue; }
         if (cur) cur.lines.push(l);
         continue;
       }
+      // Un título suelto después de la ficha («Nota de diseño») tampoco continúa el último dato de la ficha.
+      if (cur && curFromRow && (l.heading || (l.text.split(/\s+/).length <= 4 && !/[.;:,]$/.test(l.text)))) { cur = null; curFromRow = false; }
+      curFromRow = false;
       // LOOP 9.2: «Módulo N — título» abre (o continúa) el árbol de contenidos del documento: módulos → capítulos → temas.
       // Review C1/I2: nunca dentro de una sección «Contenidos» o «Evaluación» ya abierta (ahí sigue el lector de siempre).
-      if (isModuleHeading(l) && !(cur && !cur.moduleTree && (cur.key === 'contents' || cur.key === 'evaluation'))) {
+      if (isModuleHeading(l, lines[li + 1], lines[li + 2]) && !(cur && !cur.moduleTree && (cur.key === 'contents' || cur.key === 'evaluation'))) {
         if (!cur || !cur.moduleTree) {
           cur = { key: 'contents', heading: 'Contenidos', headingLine: l, inline: null, lines: [], moduleTree: true };
           out.push(cur);
@@ -463,8 +592,21 @@ class DocExtraction {
     const { text, clipped } = clip(parts.map((p) => p.text).join(' '), ACADEMIC_LIMITS.text);
     if (clipped) this.note('TEXT_CLIPPED', `«${SECTION_LABEL[s.key]}» supera ${ACADEMIC_LIMITS.text} caracteres: se guardó hasta el último punto (revisa el texto completo en el documento).`);
     const src = this.src(parts[0].line, SECTION_LABEL[s.key]);
-    if (path === 'learner.profile') this.ctx.learner.profile = this.setFound(path, this.ctx.learner.profile, text, src, (x) => x);
-    else if (path === 'identity.generalObjective') this.ctx.identity.generalObjective = this.setFound(path, this.ctx.identity.generalObjective, text, src, (x) => x);
+    // Texto que el documento muestra cortado (sale de la página o termina a mitad de frase): se usa y se pide confirmarlo.
+    const cut = cutReview(parts.map((p) => p.line), text);
+    if (path === 'methodology' && this.ctx.methodology.status === 'found' && this.methodologyHeading !== null && this.methodologyHeading !== normKey(s.heading)) {
+      // «Enfoque pedagógico» y «Metodología» son dos partes del mismo dato (cómo se enseña), no valores que chocan.
+      const m = this.ctx.methodology;
+      if (normKey(text).includes(normKey(m.value as string))) {
+        this.ctx.methodology = { ...m, value: text, sources: [src, ...m.sources].slice(0, ACADEMIC_LIMITS.sourcesPerItem) };
+      } else if (!normKey(m.value as string).includes(normKey(text))) {
+        this.ctx.methodology = { ...m, value: clip(`${m.value} ${text}`, ACADEMIC_LIMITS.text).text, sources: [...m.sources, src].slice(0, ACADEMIC_LIMITS.sourcesPerItem) };
+      }
+      return;
+    }
+    if (path === 'methodology') this.methodologyHeading = normKey(s.heading);
+    if (path === 'learner.profile') this.ctx.learner.profile = withReview(this.setFound(path, this.ctx.learner.profile, text, src, (x) => x), text, cut);
+    else if (path === 'identity.generalObjective') this.ctx.identity.generalObjective = withReview(this.setFound(path, this.ctx.identity.generalObjective, text, src, (x) => x), text, cut);
     else if (path === 'identity.description') this.ctx.identity.description = this.setFound(path, this.ctx.identity.description, text, src, (x) => x);
     else this.ctx.methodology = this.setFound(path, this.ctx.methodology, text, src, (x) => x);
   }
@@ -497,11 +639,23 @@ class DocExtraction {
     const anyMarked = lines.some(marked);
     const out: Item[] = [];
     for (const l of lines) {
+      // El encabezado de una tabla («Código | Resultado de aprendizaje») nunca es un elemento.
+      if (isColumnHeaderRow(l)) continue;
       const text = l.cells ? l.cells.filter(Boolean).join(' — ') : l.text;
       const clean = text.replace(BULLET_RE, '').trim();
       if (!clean) continue;
       const prev = out[out.length - 1];
-      if (anyMarked && !marked(l) && prev) {
+      // Sin marcas, una oración partida en varias líneas («… protocolos institucionales. La» / «formación no…») es UN
+      // elemento: la línea que sigue a una que no termina en signo de cierre y empieza en minúscula la continúa.
+      // Solo si la línea anterior se ve CORTADA: termina en coma, conector o artículo, o es una línea larga de PDF que llegó
+      // al ancho de la caja. Una lista sin viñetas en minúscula («aplicar…», «reconocer…») sigue siendo una lista.
+      const prevLine = prev ? prev.lines[prev.lines.length - 1] : null;
+      // Una línea larga que sigue sin un verbo en infinitivo al inicio («protocolos institucionales…») es su continuación;
+      // un elemento nuevo de una lista de resultados empieza con un verbo («reconocer…», «aplicar…»).
+      const startsItem = /^[a-záéíóúñ]+(?:ar|er|ir)(?:se)?\b/i.test(clean);
+      const looksCut = !!prev && (/(?:,|\b(?:y|o|e|u|de|del|la|las|el|los|en|con|a|al|para|por|que|su|sus|un|una|se|como|sin|entre|sobre))$/i.test(prev.text) || (!!prevLine && prevLine.text.length >= 60 && !startsItem));
+      const wrapped = !anyMarked && prev && looksCut && !/[.;:!?]$/.test(prev.text) && /^[a-záéíóúñü(]/.test(clean);
+      if ((anyMarked && !marked(l) && prev) || wrapped) {
         prev.text = `${prev.text} ${clean}`;
         prev.lines.push(l);
       } else {
@@ -523,20 +677,24 @@ class DocExtraction {
       const level = bloomLevelOf(text);
       const section = o.inferredFrom ?? SECTION_LABEL.outcomes;
       const sources = o.item.lines.slice(0, ACADEMIC_LIMITS.sourcesPerItem).map((l) => this.src(l, section));
+      const review = cutReview(o.item.lines, text);
       return o.inferredFrom
-        ? { id: ids[i], text, level, domain: outcomeDomainOf(level), status: 'inferred', sources, basis: `el documento no trae «resultados de aprendizaje»; se usan sus «${o.inferredFrom}»`.slice(0, ACADEMIC_LIMITS.basis) }
-        : { id: ids[i], text, level, domain: outcomeDomainOf(level), status: 'found', sources };
+        ? { id: ids[i], text, level, domain: outcomeDomainOf(level), status: 'inferred', sources, basis: `el documento no trae «resultados de aprendizaje»; se usan sus «${o.inferredFrom}»`.slice(0, ACADEMIC_LIMITS.basis), ...(review ? { review } : {}) }
+        : { id: ids[i], text, level, domain: outcomeDomainOf(level), status: 'found', sources, ...(review ? { review } : {}) };
     });
     if (hasOutcomes) {
       for (const o of this.rawOutcomes.filter((x) => x.inferredFrom !== null)) this.pushListField('additionalInfo', `Objetivo específico: ${o.item.text}`, o.item.lines[0], o.inferredFrom as string);
     }
     const cids = assignIds(this.rawCompetencies.map((c) => c.code), 'CO', ACADEMIC_LIMITS.competencies);
-    this.ctx.competencies = this.rawCompetencies.slice(0, ACADEMIC_LIMITS.competencies).map((c, i): Competency => ({
-      id: cids[i],
-      text: clip(c.item.text, ACADEMIC_LIMITS.outcomeText).text,
-      status: 'found',
-      sources: c.item.lines.slice(0, ACADEMIC_LIMITS.sourcesPerItem).map((l) => this.src(l, SECTION_LABEL.competencies)),
-    }));
+    this.ctx.competencies = this.rawCompetencies.slice(0, ACADEMIC_LIMITS.competencies).map((c, i): Competency => {
+      const text = clip(c.item.text, ACADEMIC_LIMITS.outcomeText).text;
+      const review = cutReview(c.item.lines, text);
+      return {
+        id: cids[i], text, status: 'found',
+        sources: c.item.lines.slice(0, ACADEMIC_LIMITS.sourcesPerItem).map((l) => this.src(l, SECTION_LABEL.competencies)),
+        ...(review ? { review } : {}),
+      };
+    });
   }
 
   // ── Contenidos (unidades + temas) ──
@@ -575,7 +733,10 @@ class DocExtraction {
           for (const c of rest) if (c !== hoursCell && refsOf(c).rest) pushContent(refsOf(c).rest, l);
           continue;
         }
-        pushContent(cells.filter(Boolean).join('; '), l);
+        // Fila de totales y celdas que solo son un número, un código o unas horas: no son temas.
+        if (/^(total|subtotal|totales)\b/i.test(stripAccents(cells.find(Boolean) || ''))) continue;
+        const topics = cells.filter((c) => c && !/^\(?\d{1,4}(?:[.,]\d{1,2})?\)?\.?\s*(?:h|hrs?\.?|horas?)?$/i.test(c) && !GROUP_ALL_RE.test(c.replace(/[·,;]/g, ' ')));
+        if (topics.length) pushContent(topics.join('; '), l);
         continue;
       }
       const text = l.text.replace(BULLET_RE, '');
@@ -605,31 +766,72 @@ class DocExtraction {
     const CH_RE = /^(?:cap[ií]tulo|lecci[oó]n)\s+(\d{1,2}|[ivxlc]{1,6})\s*[.:—–)-]\s*(\S.*)$/i;
     // Review C1: solo los bloques del módulo que no son capítulos de contenido (práctica integradora, evaluación parcial o
     // final, propósito), y solo como encabezado corto; un tema que empieza con «Evaluación de riesgos…» sigue siendo tema.
-    const SKIP_RE = /^(pr[aá]ctica (integradora|final|del m[oó]dulo)|evaluaci[oó]n (parcial|final|del m[oó]dulo)|examen (parcial|final|del m[oó]dulo))\b/i;
+    const SKIP_RE = /^(pr[aá]ctica (integradora|final|del m[oó]dulo)|evaluaci[oó]n (parcial|final|del m[oó]dulo)|examen (parcial|final|del m[oó]dulo)|actividad(es)? de aplicaci[oó]n( del m[oó]dulo)?)\b/i;
+    // Celda de recursos («2 videos · 1 actividad H5P»), horas («12 h») o solo códigos («RA1 · RA2»): no es el título.
+    const RESOURCE_CELL_RE = /^(?:\d{1,3}\s+(?:videos?|actividad(?:es)?|h5p|lecturas?|podcasts?|casos?|talleres?|presentaci\w+|recursos?|evaluaci\w+|quiz\w*)\b|\d{1,4}(?:[.,]\d{1,2})?\s*(?:h|horas?)\b)/i;
+    let header: string[] | null = null;
+    const titleOfRow = (cells: string[]): { title: string; rest: string[] } | null => {
+      const cs = cells.map(collapse);
+      if (!cs.length) return null;
+      const codeIdx = CHAPTER_ROW_RE.test(cs[0]) && cs[0].split(/\s+/).length <= 2 ? 0 : -1;
+      let idx = -1;
+      if (header) {
+        const h = header.findIndex((x, j) => j !== codeIdx && /^(contenidos?|temas?|titulo|nombre|descripcion|capitulo)\b/.test(x) && !!cs[j]);
+        if (h >= 0) idx = h;
+      }
+      if (idx < 0) idx = cs.findIndex((c, j) => j !== codeIdx && !!c && !RESOURCE_CELL_RE.test(c) && !GROUP_ALL_RE.test(c.replace(/[·,;]/g, ' ')));
+      if (idx < 0) return null;
+      // Código y título en la misma celda («1.1 Conceptos…»): el título sin el código.
+      const title = codeIdx < 0 ? cs[idx].replace(/^(?:cap[ií]tulo\s+)?\d{1,2}\.\d{1,2}\.?\s+/i, '') : cs[idx];
+      return { title, rest: cs.filter((_c, j) => j !== idx && j !== codeIdx) };
+    };
     const PURPOSE_RE = /^(prop[oó]sito|objetivo)( del m[oó]dulo)?\s*:/i;
     const isBlockHeading = (l: SourceLine, t: string) => (!!l.heading || (t.split(/\s+/).length <= 8 && !/[.;:]$/.test(t))) && SKIP_RE.test(t);
     const units: { title: string; hours: number | null; line: SourceLine; contents: Item[]; refs: string[] }[] = [];
     const loose: Item[] = [];
     let unit: (typeof units)[number] | null = null;
-    let chapter: { title: string; topics: string[]; lines: SourceLine[] } | null = null;
+    let chapter: { title: string; topics: string[]; lines: SourceLine[]; refs?: string[] } | null = null;
     let skipping = false;
     const flush = () => {
       if (unit && chapter) {
         const text = chapter.topics.length ? `${chapter.title}: ${chapter.topics.join('; ')}` : chapter.title;
-        unit.contents.push({ text, lines: chapter.lines });
+        // Vínculos de la fila («… | RA1 · RA2») al final, como los lee emitUnits.
+        unit.contents.push({ text: chapter.refs && chapter.refs.length ? `${text} (${chapter.refs.join(', ')})` : text, lines: chapter.lines });
       }
       chapter = null;
     };
     for (const l of s.lines) {
+      if (isColumnHeaderRow(l)) { header = (l.cells ?? []).map((c) => normKey(c)); continue; }
       const text = collapse((l.cells ? l.cells.filter(Boolean).join(' — ') : l.text).replace(BULLET_RE, ''));
       if (!text) continue;
-      const mm = MOD_RE.exec(text);
-      if (mm) {
+      // Fila de la tabla de capítulos (con el código del capítulo, o sin código dentro de una tabla con encabezado).
+      if (l.cells && l.cells.length >= 2 && !MOD_RE.test(text)) {
+        const row = titleOfRow(l.cells);
+        if (row && SKIP_RE.test(row.title)) { flush(); skipping = true; continue; }
+        if (row && (CHAPTER_ROW_RE.test(collapse(l.cells[0])) || header)) {
+          flush();
+          skipping = false;
+          const refs = row.rest.flatMap((c) => refsOf(c).ids);
+          chapter = { title: row.title.replace(/[.:]$/, ''), topics: [], lines: [l], ...(refs.length ? { refs } : {}) };
+          continue;
+        }
+      }
+      const nm = !l.cells ? /^(?:cap[ií]tulo\s+)?(\d{1,2})\.(\d{1,2})\.?\s+(\S.*)$/i.exec(text) : null;
+      if (nm && !/\d\s*(h|horas?)\b|%/.test(nm[3])) {
         flush();
         skipping = false;
-        const r = refsOf(mm[2]);
+        chapter = { title: collapse(nm[3]).replace(/[.:]$/, ''), topics: [], lines: [l] };
+        continue;
+      }
+      const mm = MOD_RE.exec(text) || (!l.cells ? BARE_MODULE_RE.exec(text) : null);
+      if (mm && (mm[1] || mm[2])) {
+        flush();
+        skipping = false;
+        // Sin título («Módulo 2»): el módulo se nombra con su número; sin número: con su título.
+        const raw = mm[2] || `${/^unidad/i.test(text.replace(/^\d{1,2}[.)]\s+/, '')) ? 'Unidad' : 'Módulo'} ${mm[1]}`;
+        const r = refsOf(raw);
         const { text: title, hours } = takeHours(r.rest);
-        unit = { title: title || mm[2], hours, line: l, contents: [], refs: r.ids };
+        unit = { title: title || raw, hours, line: l, contents: [], refs: r.ids };
         units.push(unit);
         continue;
       }
@@ -641,6 +843,9 @@ class DocExtraction {
         continue;
       }
       if (PURPOSE_RE.test(text)) continue; // propósito del módulo: no es un tema
+      // Una oración que EXIGE algo («Cada capítulo tendrá 2 videos.») entre los temas es un requisito (lo lee el lector de
+      // requisitos), no un tema del módulo.
+      if (!l.cells && /\b(tendr[aá]n?|deber[aá]n?|debe(?:n)?|incluir[aá]n?|contar[aá]n?|se realizar[aá]n?)(?![a-záéíóúñ])/i.test(text) && /\d/.test(text) && /[.;]$/.test(text)) continue;
       if (isBlockHeading(l, text)) { flush(); skipping = true; continue; }
       if (skipping) continue;
       if (chapter) { chapter.topics.push(text.replace(/[.;]$/, '')); chapter.lines.push(l); continue; }
@@ -651,8 +856,20 @@ class DocExtraction {
     this.emitUnits(s, units, loose);
   }
 
-  private emitUnits(s: Section, units: { title: string; hours: number | null; line: SourceLine; contents: Item[]; refs: string[] }[], loose: Item[]): void {
+  private emitUnits(s: Section, units0: { title: string; hours: number | null; line: SourceLine; contents: Item[]; refs: string[] }[], loose: Item[]): void {
     const section = SECTION_LABEL.contents;
+    // Documento con contenido repetido (una tabla resumen y el detalle, la misma unidad en dos páginas): una unidad por
+    // título y cada tema una sola vez. Nada se pierde (lo nuevo de la repetición se suma) y nada se duplica.
+    const units: typeof units0 = [];
+    for (const u of units0) {
+      const dedup = (list: Item[]) => list.filter((c, i) => list.findIndex((x) => normKey(x.text) === normKey(c.text)) === i);
+      const prev = units.find((x) => normKey(x.title) === normKey(u.title));
+      if (!prev) { units.push({ ...u, contents: dedup(u.contents) }); continue; }
+      for (const c of u.contents) if (!prev.contents.some((x) => normKey(x.text) === normKey(c.text))) prev.contents.push(c);
+      if (prev.hours === null) prev.hours = u.hours;
+      prev.refs = [...new Set([...prev.refs, ...u.refs])];
+      this.note('DUPLICATE_UNIT', `«${clip(u.title, 80).text}» aparece más de una vez en el documento: se tomó una sola vez, sin repetir sus temas.`);
+    }
     if (!units.length && loose.length) {
       units.push({ title: s.heading, hours: null, line: s.headingLine, contents: loose.splice(0), refs: [] });
       (units[0] as any).inferred = true;
@@ -667,7 +884,9 @@ class DocExtraction {
       if (u.contents.length > ACADEMIC_LIMITS.contentsPerUnit) this.note('TOO_MANY_CONTENTS', `La unidad «${u.title}» trae ${u.contents.length} temas; se guardaron los primeros ${ACADEMIC_LIMITS.contentsPerUnit}.`);
       const contents: UnitContent[] = u.contents.slice(0, ACADEMIC_LIMITS.contentsPerUnit).map((c, j) => {
         const r = refsOf(c.text);
-        return { id: `${id}.${j + 1}`, text: clip(r.rest || c.text, ACADEMIC_LIMITS.text).text, outcomeIds: r.ids.slice(0, ACADEMIC_LIMITS.outcomeIdsPerItem), status: 'found', sources: [this.src(c.lines[0], section)] };
+        const text = clip(r.rest || c.text, ACADEMIC_LIMITS.text).text;
+        const review = cutReview(c.lines, text);
+        return { id: `${id}.${j + 1}`, text, outcomeIds: r.ids.slice(0, ACADEMIC_LIMITS.outcomeIdsPerItem), status: 'found', sources: [this.src(c.lines[0], section)], ...(review ? { review } : {}) };
       });
       if (u.hours !== null && !(u.hours > 0 && u.hours <= 5000)) {
         this.note('VALUE_OUT_OF_RANGE', `La unidad «${clip(u.title, 60).text}» declara ${fmtH(u.hours)} h, fuera del rango admitido; no se usó.`);
@@ -689,7 +908,7 @@ class DocExtraction {
     for (const l of s.lines) {
       if (l.cells) {
         const cells = l.cells.map(collapse).filter(Boolean);
-        const numIdx = cells.findIndex((c) => /^\d{1,4}(?:[.,]\d{1,2})?\s*(?:h|horas?)?$/i.test(c));
+        const numIdx = cells.findIndex((c) => /^\d{1,4}(?:[.,]\d{1,2})?(?:\s*(?:-|–|—|a)\s*\d{1,4}(?:[.,]\d{1,2})?)?\s*(?:h|horas?)?$/i.test(c));
         if (numIdx > 0) entries.push({ label: cells.slice(0, numIdx).join(' '), text: cells[numIdx], line: l, key: 'hours' });
         continue;
       }
@@ -704,10 +923,19 @@ class DocExtraction {
     for (const e of entries) {
       const kind = hoursKindOf(e.key, e.label, e.text);
       if (!kind) continue;
-      const m = kind === 'credits' || kind === 'weeks' ? /(\d{1,3}(?:[.,]\d{1,2})?)/.exec(e.text) : HOURS_RE.exec(e.text) ?? /^\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*$/.exec(e.text);
+      // Una oración («La duración requerida … es de 40–44 horas…») no es el rótulo de un componente de horas.
+      if (kind !== 'total' && kind !== 'weekly' && kind !== 'weeks' && kind !== 'credits' && collapse(e.label).split(/\s+/).length > 8) continue;
+      const span = kind === 'credits' || kind === 'weeks' ? null : hoursSpanOf(e.text) ?? hoursSpanOf(`${e.text.replace(/\s+$/, '')} h`);
+      const m = kind === 'credits' || kind === 'weeks' ? /(\d{1,3}(?:[.,]\d{1,2})?)/.exec(e.text) : span ? [span.raw, String(span.value)] : /^\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*$/.exec(e.text);
       if (!m) continue;
       const value = num(m[1]);
       if (!Number.isFinite(value)) continue;
+      // Horas por módulo / unidad («Módulo 1 | 13–15 h»): son las horas de esa unidad, no un componente del total.
+      const um = /^(?:m[oó]dulo|unidad)\s+(\d{1,2})$/i.exec(collapse(e.label));
+      if (um && kind !== 'credits' && kind !== 'weeks') {
+        this.unitHours.push({ index: Number(um[1]), value, line: e.line });
+        continue;
+      }
       // Fuera del rango del modelo: el dato queda «missing» con una nota (nunca rechaza el documento entero).
       const max = kind === 'credits' ? 60 : kind === 'weeks' ? 104 : 5000;
       if (value <= 0 || value > max) {
@@ -716,7 +944,7 @@ class DocExtraction {
       }
       const src = this.src(e.line, section);
       const show = (x: number) => String(x);
-      if (kind === 'total') this.ctx.hours.total = this.setFound('hours.total', this.ctx.hours.total, value, src, show);
+      if (kind === 'total') this.ctx.hours.total = this.setTotalHours(value, span && span.min !== undefined ? { min: span.min, max: span.max as number } : null, src);
       else if (kind === 'weekly') this.ctx.hours.weekly = this.setFound('hours.weekly', this.ctx.hours.weekly, value, src, show);
       else if (kind === 'weeks') this.ctx.hours.weeks = this.setFound('hours.weeks', this.ctx.hours.weeks, value, src, show);
       else if (kind === 'credits') this.ctx.hours.credits = this.setFound('hours.credits', this.ctx.hours.credits, value, src, show);
@@ -737,8 +965,12 @@ class DocExtraction {
   // ── Evaluación ──
 
   private parseEvaluation(s: Section): void {
+    // Con una tabla de evaluaciones, la oración que la presenta («El curso tendrá 3 evaluaciones parciales…») describe la
+    // estrategia: no es otra evaluación (sus cantidades las lee el lector de requisitos).
+    const hasTable = s.lines.some((l) => l.cells && l.cells.length >= 2 && !isColumnHeaderRow(l));
     for (const it of this.items(s)) {
       if (this.ctx.evaluation.length >= ACADEMIC_LIMITS.evaluation) break;
+      if (hasTable && !it.lines[0].cells && it.text.split(/\s+/).length > 12 && /[.;]$/.test(it.text)) continue;
       let pm = PCT_RE.exec(it.text);
       if (pm && !(num(pm[1]) >= 0 && num(pm[1]) <= 100)) {
         this.note('VALUE_OUT_OF_RANGE', `«${clip(it.text, 80).text}»: un peso de ${pm[1]} % no es válido; la actividad quedó sin peso.`);
@@ -789,6 +1021,38 @@ class DocExtraction {
   }
 
   // ── Inferencias declaradas ──
+
+  /**
+   * Total de horas. Un RANGO del documento se conserva (`range`) y el valor es su punto medio, declarado como inferido
+   * (la meta de diseño), nunca el extremo superior. El mismo dato repetido (ficha y requisitos) suma la fuente; otro
+   * valor queda como conflicto (se conserva el primero).
+   */
+  private setTotalHours(value: number, range: { min: number; max: number } | null, src: SourceRef): Field<number> {
+    const cur = this.ctx.hours.total;
+    const next: Field<number> = range
+      ? { status: 'inferred', value, sources: [src], basis: `el documento da un rango de ${fmtH(range.min)}–${fmtH(range.max)} horas: la meta de diseño es el punto medio`, range }
+      : { status: 'found', value, sources: [src] };
+    if (cur.status === 'missing') return next;
+    const show = (f: Field<number>) => (f.range ? `${fmtH(f.range.min)}–${fmtH(f.range.max)}` : fmtH(f.value as number));
+    if (show(cur) === show(next)) {
+      return cur.sources.length < ACADEMIC_LIMITS.sourcesPerItem ? { ...cur, sources: [...cur.sources, src] } : cur;
+    }
+    // Un total exacto dentro del rango lo precisa (no lo contradice), en cualquier orden: manda el exacto, el rango queda.
+    if (cur.range && !range && value >= cur.range.min && value <= cur.range.max) return { status: 'found', value, sources: [src, ...cur.sources].slice(0, ACADEMIC_LIMITS.sourcesPerItem), range: cur.range };
+    if (!cur.range && range && typeof cur.value === 'number' && cur.value >= range.min && cur.value <= range.max) return { status: cur.status === 'inferred' ? 'found' : cur.status, value: cur.value, sources: [...cur.sources, src].slice(0, ACADEMIC_LIMITS.sourcesPerItem), range };
+    if (cur.sources[0]) this.addConflict('hours.total', [{ value: show(cur), source: cur.sources[0] }, { value: show(next), source: src }]);
+    return cur;
+  }
+
+  /** Horas de cada módulo de una tabla de distribución horaria → la unidad (módulo) del mismo número. */
+  private applyUnitHours(): void {
+    for (const h of this.unitHours) {
+      const u = this.ctx.units[h.index - 1];
+      if (!u) continue;
+      if (u.hours === null) u.hours = h.value;
+      else if (u.hours !== h.value) this.addConflict(`units.${u.id}.hours`, [{ value: fmtH(u.hours), source: u.sources[0] }, { value: fmtH(h.value), source: this.src(h.line, SECTION_LABEL.hours) }]);
+    }
+  }
 
   private inferHours(): void {
     const h = this.ctx.hours;
@@ -841,10 +1105,29 @@ export function refsOf(text: string): { ids: string[]; rest: string } {
   return { ids: [...new Set(ids)].sort((a, b) => (a.startsWith('RA') ? 0 : 1) - (b.startsWith('RA') ? 0 : 1) || Number(a.slice(2)) - Number(b.slice(2))), rest };
 }
 
+/**
+ * ¿El documento muestra este texto cortado? Sí si alguna de sus líneas sale de la página (PDF) o si termina a mitad de
+ * frase (coma, conector o artículo al final). Devuelve el aviso para el docente o null.
+ */
+function cutReview(lines: SourceLine[], text: string): string | null {
+  const t = collapse(text);
+  const dangling = /(?:,|\b(?:y|o|e|u|de|del|la|las|el|los|en|con|a|al|para|por|que|su|sus|un|una|ni|se))$/i.test(t);
+  if (lines.some((l) => l.clipped) || dangling) {
+    return 'El texto parece cortado en el documento (no termina la frase): confírmalo o complétalo.';
+  }
+  return null;
+}
+function withReview<T>(f: Field<T>, text: string, review: string | null): Field<T> {
+  if (!review || f.status === 'missing' || f.review) return f;
+  // Solo si el valor guardado es el cortado (no si otra fuente ya trajo el texto completo).
+  if (typeof f.value !== 'string' || collapse(f.value) !== collapse(text)) return f;
+  return { ...f, review };
+}
+
 function takeHours(text: string): { text: string; hours: number | null } {
-  const m = /\(?\s*(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:horas?|hrs?\.?|h)(?![a-z])\s*\)?/i.exec(text);
-  if (!m) return { text: collapse(text), hours: null };
-  return { text: collapse(text.replace(m[0], '').replace(/[\s:.\-–—]+$/, '')), hours: num(m[1]) };
+  const span = hoursSpanOf(text);
+  if (!span) return { text: collapse(text), hours: null };
+  return { text: collapse(text.replace(span.raw, '').replace(/\(\s*\)/g, '').replace(/[\s:.\-–—(]+$/, '')), hours: span.value };
 }
 
 /** Una celda de tabla con varios temas («a; b; c» o «• a • b») → temas separados. */
