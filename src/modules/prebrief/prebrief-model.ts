@@ -408,7 +408,9 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
 
   // Horas.
   const hs = card && card.hours ? card.hours : null;
-  const fit = fdef ? formatFit(fdef, modules, hs && typeof hs.target === 'number' ? hs.target : null) : null;
+  // Las horas del formato se comparan con las que el diseño REALMENTE tiene (misma regla que Verificación); sin diseño, la meta.
+  const designH = card && card.design && typeof card.design.estimatedHours === 'number' ? card.design.estimatedHours : null;
+  const fit = fdef ? formatFit(fdef, modules, designH ?? (hs && typeof hs.target === 'number' ? hs.target : null), designH !== null ? Math.max(1, fdef.hoursMax * 0.05) : 0) : null;
   let hoursOrigin: PrebriefOrigin = 'cursia';
   if (hs) {
     if (hs.source === 'document') hoursOrigin = 'document';
@@ -538,6 +540,8 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
   const observations: { id: string; text: string }[] = [];
   for (const c of ((card && card.verification && card.verification.checks) || []) as any[]) {
     if (c.summary || c.severity !== 'warning' || c.area === 'cost' || EXCEPTION_TITLE_RE.test(String(c.title || ''))) continue;
+    // Las horas fuera del formato las dice la propia observación «format:hours» (una sola fuente).
+    if (c.id === 'format' && /^Las horas están fuera del/.test(String(c.title || ''))) continue;
     observations.push({ id: String(c.id), text: clean(c.title) });
   }
   if (fdef && fit && !fit.structureOk) observations.push({ id: 'format:structure', text: `La estructura (${fit.contentShape.join(', ') || '0'} capítulos de contenido por módulo) no coincide con el ${fdef.label} (${fdef.modules} módulos × ${fdef.chaptersPerModule} capítulos).` });

@@ -112,6 +112,17 @@ check('D2 8 h: la estructura mínima supera el objetivo → informa y propone, s
   eq(r.estimatedHours, r.baseHours, 'no inventa ni quita horas');
 });
 
+check('D3b 300 h: la recomendación nunca contradice lo fijado (forma de la institución, capítulos por módulo, módulos del documento)', () => {
+  const rec = (requirements) => { const r = dist(300, 'competencias', { opts: { requirements: { sources: {}, ...requirements } } }); eq(r.status, 'cannot_reach_target', 'no llega'); return r.recommendations[1]; };
+  assert(/no agrega módulos ni capítulos/.test(rec({ noContentAdditions: true })), 'forma de la institución: nada nuevo');
+  const ch = rec({ contentChaptersPerModule: { min: 3, max: 3 } });
+  assert(/módulo\(s\) nuevo\(s\) con la misma estructura/.test(ch) && !/capítulos más/.test(ch), 'capítulos fijos: solo módulos: ' + ch);
+  const mo = rec({ modulesFixed: 3 });
+  // Con los módulos fijos el distribuidor ya llenó los capítulos posibles: nunca propone módulos nuevos.
+  assert(!/módulo\(s\) nuevo/.test(mo) && (/capítulo\(s\) en los módulos actuales/.test(mo) || /no agrega módulos ni capítulos/.test(mo)), 'módulos fijos: nunca módulos nuevos: ' + mo);
+  assert(/no agrega módulos ni capítulos/.test(rec({ modulesFixed: 3, contentChaptersPerModule: { min: 3, max: 3 } })), 'los dos fijos: nada nuevo');
+});
+
 check('D3 80 h: no alcanza con topes razonables → propone módulos/capítulos, no infla', () => {
   const r = dist(80);
   eq(r.status, 'cannot_reach_target', 'estado');

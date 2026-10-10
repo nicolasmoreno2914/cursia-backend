@@ -904,13 +904,24 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   const perModule = minutes() / design.length;
   const modulesNeeded = Math.ceil(gap / perModule);
   const chapterAvg = avg(est.modules.flatMap((m) => m.chapters).map((c) => c.chapterEstimatedMinutes));
-  // Con la forma FIJADA (la eligió la institución o la exige el documento) Cursia no recomienda agregar módulos ni
-  // capítulos: contradiría esa decisión. Se dice la diferencia y la decide la institución (Verificación la presenta).
-  const shapeFixed = noContentAdditions || rq?.contentChaptersPerModule?.max !== undefined || rq?.chaptersPerModule?.max !== undefined;
+  // La recomendación nunca contradice lo fijado: una forma elegida por la institución (formato o personalizada) no admite
+  // nada nuevo; capítulos por módulo fijos → solo módulos nuevos con la misma estructura; módulos fijos por el documento →
+  // solo capítulos (hasta el máximo por módulo); los dos fijos → nada. La diferencia la decide la institución.
+  const chaptersFixed = rq?.contentChaptersPerModule?.max !== undefined || rq?.chaptersPerModule?.max !== undefined;
+  const modsFixed = typeof rq?.modulesFixed === 'number';
+  const room = design.reduce((n, m) => n + Math.max(0, DISTRIBUTOR_RULES.maxContentChaptersPerModule - m.chapters.filter((c) => c.kind === 'content').length), 0);
+  const noRoom = `La estructura la fijan la institución o el documento: Cursia no agrega módulos ni capítulos por su cuenta ni rellena para llegar. La diferencia queda para que la institución la decida (ver «Verificación»).`;
+  const advice = noContentAdditions || (chaptersFixed && modsFixed)
+    ? noRoom
+    : chaptersFixed
+      ? `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) con la misma estructura (≈ ${fmtH(perModule / 60)} h cada uno). Los temas los decide el docente.`
+      : modsFixed
+        ? room > 0
+          ? `Recomendación: agregar hasta ${Math.min(room, Math.ceil(gap / chapterAvg))} capítulo(s) en los módulos actuales (el documento fija ${rq!.modulesFixed} módulos). Los temas los decide el docente.`
+          : noRoom
+        : `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${fmtH(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`;
   return result('cannot_reach_target', [
     `No alcanza ${fmtH(input.targetHours)} h sin rellenar: el diseño llega a ${fmtH(minutes() / 60)} h y faltan ${fmtH(gap / 60)} h.`,
-    shapeFixed
-      ? `La estructura la fijan la institución o el documento: Cursia no agrega módulos ni capítulos por su cuenta ni rellena para llegar. La diferencia queda para que la institución la decida (ver «Verificación»).`
-      : `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${fmtH(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`,
+    advice,
   ]);
 }
