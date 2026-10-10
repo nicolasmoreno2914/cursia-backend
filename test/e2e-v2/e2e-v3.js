@@ -3309,6 +3309,8 @@ function reservationBookkeeping(ev) {
       rec23('V5', '«Cursia recomienda» no contradice el documento ni el formato (no propone agregar módulos ni capítulos)', !recs.some((r) => /agregar \d+ m[oó]dulo|cap[ií]tulos m[aá]s/i.test(r)), recs);
       const fc = card.verification.checks.find((c) => c.id === 'format');
       rec23('V6', 'Formato M: la estructura sí; las horas del diseño fuera de 40–44 se avisan (no se marca «cumple»)', card.design.estimatedHours >= 40 && card.design.estimatedHours <= 44 ? fc && fc.severity === 'ok' : (fc && fc.severity === 'warning' && /fuera del Formato M/.test(fc.title) && /la estructura sí es la del Formato M/.test(fc.detail || '')), fc);
+      const addMods = card.verification.checks.filter((c) => (c.fix && /add_modules/.test(c.fix.action || '')) || /hacen falta más módulos|Agregar módulos/.test(`${c.detail || ''} ${(c.fix && c.fix.label) || ''}`));
+      rec23('V7', 'Verificación no ofrece «Agregar módulos» ni otra salida que contradiga el documento o el Formato M', addMods.length === 0, addMods.map((c) => [c.title, c.detail, c.fix]));
       const aaPractice = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.kind));
       rec23('V4', 'Cada módulo: su Actividad de Aplicación en el capítulo de práctica (no una práctica vacía)', aaPractice.every((k) => k.length === 1 && k[0] === 'practice'), aaPractice);
 

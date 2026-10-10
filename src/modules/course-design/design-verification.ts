@@ -57,6 +57,11 @@ interface AlignmentLike {
 
 export interface VerificationInput {
   /**
+   * Qué puede crecer sin contradecir lo fijado (forma de la institución, módulos o capítulos del documento): la salida
+   * que se ofrece cuando el diseño no llega a las horas. Ausente = sin límites (como siempre).
+   */
+  growth?: 'any' | 'modules' | 'chapters' | 'none';
+  /**
    * Prebrief · formato S/M/L elegido (decisión de la institución): la forma de contenidos y el rango de horas. Apartarse
    * del propio formato es una advertencia (las excepciones son solo frente al documento). Ausente = sin formato.
    */
@@ -156,7 +161,16 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     add({ id: 'hours', area: 'hours', severity: 'warning', title: hoursTitle, detail: `Queda ${h1(input.estimatedHours - input.targetHours)} h por encima (tolerancia ±${h1(input.toleranceHours)} h).`,
       fix: up <= MAX_TARGET_HOURS ? { kind: 'adjust', action: 'targetHours', value: up, label: `Usar ${up} h` } : { kind: 'editor', action: 'structure', label: 'Quitar contenidos o dividir el curso' } });
   }
-  else if (input.status === 'cannot_reach_target') add({ id: 'hours', area: 'hours', severity: 'warning', title: hoursTitle, detail: 'Con los contenidos actuales no se llega sin rellenar: hacen falta más módulos o capítulos.', fix: { kind: 'editor', action: 'add_modules', label: 'Agregar módulos en el editor' } });
+  else if (input.status === 'cannot_reach_target') {
+    // Nunca una salida que contradiga lo fijado (el documento o la forma que eligió la institución).
+    const g = input.growth || 'any';
+    add({ id: 'hours', area: 'hours', severity: 'warning', title: hoursTitle,
+      detail: g === 'none' ? 'Con lo que fijan la institución o el documento no se llega sin rellenar. Cursia no agrega módulos ni capítulos: la institución decide la diferencia en la propuesta.'
+        : g === 'modules' ? 'Con los contenidos actuales no se llega sin rellenar: harían falta más módulos con la misma estructura (los capítulos por módulo están fijados).'
+          : g === 'chapters' ? 'Con los contenidos actuales no se llega sin rellenar: harían falta más capítulos en los módulos actuales (el documento fija los módulos).'
+            : 'Con los contenidos actuales no se llega sin rellenar: hacen falta más módulos o capítulos.',
+      ...(g === 'none' ? {} : { fix: { kind: 'editor' as const, action: g === 'chapters' ? 'structure' : 'add_modules', label: g === 'chapters' ? 'Agregar capítulos en el editor' : 'Agregar módulos en el editor' } }) });
+  }
   else {
     // Review L84 I4 + m: la tarjeta ya ofrece «Diseñar para N h»; aquí solo la salida que la tarjeta no tiene cuando N > 500.
     const need = Math.ceil(input.baseHours);
@@ -273,7 +287,9 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
       title: !f.structureOk ? `La estructura no coincide con el ${f.label} (${f.modules} módulos × ${f.chaptersPerModule} capítulos de contenido)` : `Las horas están fuera del ${f.label} (${f.hoursMin}–${f.hoursMax} horas)`,
       detail: !f.structureOk ? `Capítulos de contenido por módulo: ${f.contentShape.join(', ') || 'ninguno'}. Las prácticas y las Actividades de Aplicación no cuentan.`
         : typeof f.designHours === 'number' ? `El diseño equivale a ≈ ${String(Math.round(f.designHours * 10) / 10).replace('.', ',')} horas de trabajo del estudiante; la estructura sí es la del ${f.label}.` : undefined,
-      fix: !f.structureOk ? { kind: 'editor', action: 'structure', label: 'Ajustar la estructura' } : { kind: 'adjust', action: 'targetHours', label: 'Revisar las horas' } });
+      // Con la estructura del formato bien, las horas que faltan no se arreglan cambiando la meta: sin botón (la diferencia
+      // la decide la institución en la propuesta).
+      ...(!f.structureOk ? { fix: { kind: 'editor' as const, action: 'structure', label: 'Ajustar la estructura' } } : input.growth === 'none' ? {} : { fix: { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' } }) });
   }
   // Pedagogía.
   if (input.approach) add({ id: 'pedagogy', area: 'pedagogy', severity: 'ok', title: `Enfoque: ${input.approach.label}` });

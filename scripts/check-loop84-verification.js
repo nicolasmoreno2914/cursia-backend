@@ -91,6 +91,11 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
     const above = byId(V.verifyDesign({ ...base, status: 'above_tolerance', estimatedHours: 69.2 })).hours;
     eq([above.severity, above.fix.kind, above.fix.value], ['warning', 'adjust', 70], 'encima');
     const cant = byId(V.verifyDesign({ ...base, status: 'cannot_reach_target', estimatedHours: 40 })).hours;
+    // Documentos imperfectos: la salida nunca contradice lo fijado (forma de la institución, módulos o capítulos del documento).
+    const g = (growth) => byId(V.verifyDesign({ ...base, status: 'cannot_reach_target', estimatedHours: 40, growth })).hours;
+    eq([g('none').fix, /no agrega módulos ni capítulos/.test(g('none').detail)], [undefined, true], 'forma fijada: sin «Agregar módulos»');
+    eq(g('modules').fix.label, 'Agregar módulos en el editor', 'capítulos fijos: módulos');
+    eq(g('chapters').fix.label, 'Agregar capítulos en el editor', 'módulos fijos: capítulos');
     eq([cant.severity, cant.fix.kind, cant.fix.action], ['warning', 'editor', 'add_modules'], 'no alcanza');
     const v = V.verifyDesign({ ...base, status: 'minimum_exceeds_target', targetHours: 16, baseHours: 30.2 });
     eq([byId(v).hours.severity, byId(v).hours.fix, /«Diseñar para 31 h» en la tarjeta/.test(byId(v).hours.detail), v.blocking], ['critical', undefined, true, true], 'contenidos > horas: bloquea; el botón está en la tarjeta (sin duplicar)');

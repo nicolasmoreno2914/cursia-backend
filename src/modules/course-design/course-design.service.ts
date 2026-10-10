@@ -25,7 +25,7 @@ import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../cours
 import { compareRequirements, DesignForRequirements, RequirementCheck } from '../academic-context/requirements/document-requirements';
 import {
   DECISION_DEFAULTS, DecisionOverrides, constraintsFor, EXCEPTION_FIELDS, structureEditedByTeacher, EXCEPTION_VALUES, ExceptionField, hoursFromRequirements, loadExceptions, loadRequirementAuthority,
-  requiredContentShape, requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
+  chosenContentCap, requiredContentShape, requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
 } from '../academic-context/requirements/requirement-authority';
 import { DistributionResult } from '../study-time/distributor';
 import { ConflictException } from '@nestjs/common';
@@ -376,6 +376,7 @@ export class CourseDesignService {
     // LOOP 8.4: la verificación del MISMO diseño (alineación del Coherence Engine incluida).
     const verification = dist
       ? verifyDesign({
+        growth: await this.designGrowth(courseId, previewConstraints),
         status: dist.status, targetHours: dist.targetHours, estimatedHours: dist.estimatedHours, toleranceHours: dist.toleranceHours, baseHours: dist.baseHours,
         counts: dist.counts, manifestErrors: dist.materialized ? dist.materialized.manifestErrors : [{ code: 'NOT_MATERIALIZED' }],
         alignment: dist.materialized ? (dist.materialized as any).alignment : null,
@@ -466,6 +467,14 @@ export class CourseDesignService {
    * audiovisual, modo de Actividades de Aplicación). null quita la decisión (vuelve a mandar el documento). Sin
    * requisitos leídos de los documentos del curso no hay nada que registrar.
    */
+  /** Qué puede crecer sin contradecir lo fijado (misma regla que la recomendación del distribuidor). */
+  private async designGrowth(courseId: number, c: ReturnType<typeof constraintsFor>): Promise<'any' | 'modules' | 'chapters' | 'none'> {
+    const cap = await chosenContentCap(this.dataSource, courseId);
+    const chFixed = !!c && (c.contentChaptersPerModule?.max !== undefined || c.chaptersPerModule?.max !== undefined);
+    const modFixed = !!c && typeof c.modulesFixed === 'number';
+    return cap !== null || (chFixed && modFixed) ? 'none' : chFixed ? 'modules' : modFixed ? 'chapters' : 'any';
+  }
+
   async saveRequirementDecisions(courseId: number, ownerId: string, dto: RequirementDecisionsDto) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
