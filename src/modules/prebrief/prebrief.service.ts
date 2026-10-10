@@ -467,6 +467,8 @@ export class PrebriefService {
     await this.loadCourse(courseId, ownerId);
     if (code !== null && !isCourseFormatCode(code)) throw new BadRequestException('El formato debe ser S, M, L o null.');
     const prev = await readCourseFormat(this.dataSource, courseId);
+    // El mismo formato otra vez: nada que hacer (no pisa las horas que la institución ajustó después).
+    if (code !== null && prev && prev.code === code) return { format: prev };
     const def = formatDef(code);
     // Cierre (review final I1/I2): primero las horas, después el formato (si las horas fallan, nada cambió). Elegir un
     // formato guarda qué horas puso y cuáles había; quitarlo (o cambiarlo) restaura las de antes si nadie las tocó, para
@@ -494,7 +496,14 @@ export class PrebriefService {
         : null);
     } catch (err) {
       // Las horas se devuelven a como estaban: el formato no se guardó (nunca «no cambió nada» con las horas cambiadas).
-      if (appended !== null && oldProfile) { delete oldProfile.designRules; await this.profiles.append(courseId, ownerId, 'pedagogy', oldProfile, appended).catch(() => undefined); }
+      if (appended !== null) {
+        const back: any = oldProfile || emptyPedagogicalProfile();
+        delete back.designRules;
+        await this.profiles.append(courseId, ownerId, 'pedagogy', back, appended).catch((e2: any) => {
+          // Nunca en silencio: si tampoco se pudieron devolver las horas, el error lo dice.
+          throw new ServiceUnavailableException(`FORMAT_PARTIAL: no se guardó el formato y no se pudieron devolver las horas (${String(e2 && e2.message || e2).slice(0, 120)}). Revisa las horas del curso.`);
+        });
+      }
       throw err;
     }
     await this.event(this.dataSource, courseId, null, 'format_selected', user.id, { from: prev ? prev.code : null, to: code });
