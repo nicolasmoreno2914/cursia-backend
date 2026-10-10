@@ -310,6 +310,16 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   sections.push({ id: 'annex', n: 'A', title: 'Anexo: trazabilidad', blocks: annex });
 
   const subtitle = [m.course.program ? m.course.program.value : '', m.course.institution || ''].filter(Boolean);
+  // Las citas de una fila de tabla del documento traen el separador interno de celdas («RA1 | Reconocer…»): para el cliente
+  // se leen como texto («RA1 · Reconocer…»). Solo presentación: el modelo (y su huella) no cambia.
+  const cleanQuote = (s: string) => s.replace(/\s\|\s/g, ' · ');
+  for (const sec of sections) for (const b of sec.blocks as any[]) {
+    if (b.evidence && typeof b.evidence.quote === 'string') b.evidence = { ...b.evidence, quote: cleanQuote(b.evidence.quote) };
+    for (const r of (b.rows || b.items || []) as any[]) {
+      if (r && r.evidence && typeof r.evidence.quote === 'string') r.evidence = { ...r.evidence, quote: cleanQuote(r.evidence.quote) };
+      if (r && sec.id === 'annex' && typeof r.text === 'string') r.text = r.text.replace(/«([^»]*)»/g, (_m: string, q: string) => `«${cleanQuote(q)}»`);
+    }
+  }
   return { prebriefDocumentVersion: PREBRIEF_DOCUMENT_VERSION, cover: { kicker: 'Propuesta de diseño pedagógico', title: m.course.title, subtitle }, sections };
 }
 

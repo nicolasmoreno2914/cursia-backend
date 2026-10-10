@@ -211,7 +211,9 @@ export async function renderPrebriefPdf(document: PrebriefDocument, meta: Prebri
         const hw = 46;
         const tw = 150;
         const titleW = W - hw - tw - 16;
-        const rowH = (c: { title: string; tags: string[] }) => Math.max(hOf(c.title, titleW, false, 9.5), hOf(c.tags.join(' · '), tw, false, 8.5)) + 9;
+        // Se mide EXACTAMENTE lo que se dibuja («10. Práctica integradora: …», con su número): si no, un título que el número
+        // hace pasar a dos líneas se medía en una y la segunda línea quedaba encima de la fila siguiente.
+        const rowH = (c: { n: number | string; title: string; tags: string[] }) => Math.max(hOf(`${c.n}. ${c.title}`, titleW, false, 9.5), hOf(c.tags.join(' · '), tw, false, 8.5)) + 9;
         for (const md of b.modules) {
           const headH = hOf(md.title, W - hw - 20, true, 10.5) + 12;
           const total = headH + md.chapters.reduce((a, c) => a + rowH(c), 0) + (md.exam ? 22 : 0) + 6;
