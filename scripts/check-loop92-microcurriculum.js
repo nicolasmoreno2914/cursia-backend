@@ -13,6 +13,8 @@
  *        de contenido» y «8 videos» son excepciones de capacidad con UN solo motivo (coveredBy); ningún crítico
  *   MC7  la capacidad solo es «imposible» si el documento fija la estructura; si no, faltan videos y es un incumplimiento
  *   MC8  enfoque desde la metodología del documento (casos → ABP); la decisión del docente sigue siendo una excepción
+ *   MC16 (Fase 1 · «Pegar información») el MISMO microcurrículo pegado como texto (sin tablas ni estilos) da el mismo
+ *        contexto y los mismos requisitos que el DOCX: nombre («Nombre» y valor en la línea siguiente), RA, unidades, horas
  *   MC14 (QA staging) las Actividades de Aplicación de las prácticas llevan el mismo nivel y el diseño queda cerca de las
  *        horas del documento; si quedara por encima de la tolerancia, «8 horas» NO cumple (se compara con el diseño)
  *
@@ -310,6 +312,24 @@ const reqsOfText = (text) => X.requirementsFor(X.extractRequirements(T.readText(
       requirements: { contentChaptersPerModule: { min: 2, max: 2 }, practicePerModule: { min: 1, max: 1 }, applicationPerModule: { min: 1, max: 1 }, applicationInPractice: true, sources: {} } });
     const apps3 = d3.modules.map((m) => m.chapters.filter((c) => c.kind === 'practice').map((c) => c.applicationMinutes)[0]);
     assert(apps3.every((a) => a !== null && a === apps3[0]), `prácticas parejas tras los mínimos: ${JSON.stringify(apps3)} (${d3.status} ${d3.estimatedHours} h)`);
+  });
+
+  await check('MC16 (Fase 1) pegado como texto = DOCX: mismo nombre, RA, unidades, horas y los mismos requisitos', async () => {
+    const TXT = fs.readFileSync(path.join(REPO, 'scripts/fixtures/microcurriculum/atencion-violencia-sexual-2x2.txt'));
+    const ct = (await E.extractAcademicContext([{ name: 'informacion-pegada.txt', data: TXT }])).context;
+    eq([ct.identity.subjectName.value, ct.outcomes.length, ct.competencies.length, ct.units.length, ct.hours.total.value],
+      [ctx.identity.subjectName.value, ctx.outcomes.length, ctx.competencies.length, ctx.units.length, ctx.hours.total.value], 'contexto');
+    const rt = X.requirementsFor(X.extractRequirements(T.readText(TXT, 'text/plain').lines), {}).filter((r) => r.obligation === 'required' && r.confidence === 'high');
+    eq(rt.map((r) => r.key).sort(), required.map((r) => r.key).sort(), 'mismos requisitos');
+    // Guarda: «Nombre» fuera de la ficha (p. ej. del docente) no es el nombre del curso.
+    const c4 = (await E.extractAcademicContext([{ name: 'c.txt', data: Buffer.from(['Docente', 'Nombre', 'Juan Pérez', 'Asignatura: Contabilidad'].join('\n'), 'utf8') }])).context;
+    eq(c4.identity.subjectName.value, 'Contabilidad', 'el nombre del docente no es el del curso');
+    // Review: un «Nombre» suelto de otra tabla (evaluación, bibliografía, grupo, contacto) no es la asignatura, y una clave
+    // explícita («Asignatura», «Nombre del curso») siempre gana sobre un «Nombre» suelto.
+    const subj = async (a) => (await E.extractAcademicContext([{ name: 'p.txt', data: Buffer.from(a.join('\n'), 'utf8') }])).context.identity.subjectName.value;
+    for (const a of [['Evaluación', 'Nombre', 'Porcentaje'], ['Bibliografía', 'Nombre', 'Autor'], ['Integrantes del grupo', 'Nombre', 'María López'], ['Datos de contacto', 'Nombre', 'Ana Ruiz']]) eq(await subj(a), null, a[0]);
+    eq(await subj(['Datos de contacto', 'Nombre', 'Ana Ruiz', 'Asignatura: Contabilidad de costos']), 'Contabilidad de costos', 'la clave explícita gana');
+    eq(await subj(['Ficha', 'Nombre: Ana Ruiz', 'Nombre del curso: Excel básico']), 'Excel básico', '«Nombre del curso» gana a «Nombre:»');
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);

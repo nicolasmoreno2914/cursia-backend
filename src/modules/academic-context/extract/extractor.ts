@@ -192,6 +192,8 @@ interface Section {
   lines: SourceLine[];
   /** LOOP 9.2: «Módulo 1 — título» con sus capítulos y temas, sin una sección «Contenidos» que los agrupe. */
   moduleTree?: boolean;
+  /** Fase 1 (review): «Nombre» a secas (con «:» o con el valor en la línea siguiente): solo vale si no hay otra clave. */
+  bareName?: boolean;
 }
 
 /** LOOP 9.2: encabezado de módulo / unidad con título («8. Módulo 1 — Fundamentos, derechos y atención inicial»). */
@@ -210,7 +212,7 @@ function isModuleHeading(l: SourceLine): boolean {
   return !!l.heading || /^\d{1,2}[.)]\s+/.test(t);
 }
 /** Review LOOP 9.2 (I4): «Nombre» a secas solo es el nombre del curso en la ficha de identificación (no docente ni firmas). */
-const BARE_NAME_BLOCKERS = /(docente|profesor|tutor|elabor|revis|aprob|firma|autor|responsable|coordinador|estudiante|participante)/;
+const BARE_NAME_BLOCKERS = /(docente|profesor|tutor|elabor|revis|aprob|firma|autor|responsable|coordinador|estudiante|participante|contacto|integrante|grupo|evaluaci|bibliograf|referencia)/;
 
 interface Item { text: string; lines: SourceLine[] }
 
@@ -324,14 +326,18 @@ class DocExtraction {
         continue;
       }
       // «Nombre: …» a secas (Review I4): solo en la ficha de identificación.
+      let bare = false;
       if (!h && !l.cells) {
         const colon = l.text.indexOf(':');
-        if (colon > 0 && normKey(l.text.slice(0, colon)) === 'nombre' && l.text.slice(colon + 1).trim() && bareNameOk(l)) h = { key: 'subject', value: l.text.slice(colon + 1).trim(), heading: l.text.slice(0, colon).trim() };
+        if (colon > 0 && normKey(l.text.slice(0, colon)) === 'nombre' && l.text.slice(colon + 1).trim() && bareNameOk(l)) { h = { key: 'subject', value: l.text.slice(colon + 1).trim(), heading: l.text.slice(0, colon).trim() }; bare = true; }
+        // Fase 1 («Pegar información»): un texto copiado de la ficha pierde la tabla y queda «Nombre» en una línea y el
+        // valor en la siguiente. Mismas guardas que la celda y que «Nombre: …» (solo en la ficha, antes de otra asignatura).
+        else if (normKey(l.text) === 'nombre' && bareNameOk(l)) { h = { key: 'subject', value: null, heading: l.text.trim() }; bare = true; }
       }
       if (h && h.key === 'subject') seenSubject = true;
       if (l.heading || headingNum(l.text) !== null || l.text.length <= 40) context = l.text;
       if (h) {
-        cur = { key: h.key, heading: h.heading, headingLine: l, inline: h.value, lines: [] };
+        cur = { key: h.key, heading: h.heading, headingLine: l, inline: h.value, lines: [], ...(bare ? { bareName: true } : {}) };
         out.push(cur);
         const hn = headingNum(l.text);
         if (hn !== null) lastHeadingNum = hn;
@@ -354,6 +360,9 @@ class DocExtraction {
         if (SINGLE_VALUE.has(cur.key)) cur = null;
       }
     }
+    // Fase 1 (review): un «Nombre» a secas es el último recurso: si el documento trae la asignatura con su clave
+    // («Asignatura», «Nombre del curso», la fila de la ficha), esa manda y el «Nombre» suelto se descarta.
+    if (out.some((x) => x.key === 'subject' && !x.bareName)) return out.filter((x) => !(x.key === 'subject' && x.bareName));
     return out;
   }
 

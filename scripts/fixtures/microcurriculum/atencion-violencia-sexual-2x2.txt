@@ -1,0 +1,123 @@
+MICROCURRÍCULO Atención Integral en Salud a Víctimas de Violencia Sexual Piloto técnico Cursia · Estructura 2 × 2
+Documento de referencia para una prueba controlada de generación de curso. Dirigido a estudiantes de enfermería y otras áreas de la salud que se preparan para escenarios de práctica clínica.
+1. Identificación del curso
+Nombre
+Atención Integral en Salud a Víctimas de Violencia Sexual
+Denominación de referencia
+Atención a víctimas de violencia sexual / Código Fucsia
+Público objetivo
+Estudiantes de enfermería y estudiantes de otras áreas de la salud que se preparan para prácticas clínicas o escenarios asistenciales.
+Modalidad
+100 % virtual, autoaprendizaje.
+Duración
+8 horas de trabajo del estudiante.
+Nivel
+Formación técnica, tecnológica o universitaria en áreas de la salud.
+Prerrequisitos
+Se recomienda contar con conocimientos básicos de anatomía y fisiología, comunicación en salud, ética y atención al usuario. No se exige un prerrequisito formal para cursar esta formación.
+2. Justificación
+La atención en salud a personas víctimas de violencias sexuales exige respuestas oportunas, dignas, integrales y articuladas. En Colombia existen lineamientos y protocolos oficiales para orientar la atención, incluyendo recepción, valoración clínica, prevención y manejo de infecciones de transmisión sexual, salud mental, derechos, seguimiento y articulación con otros sectores.
+Este curso busca preparar al estudiante para reconocer los principios de una atención segura y humanizada, actuar dentro del alcance de su rol y comprender cuándo debe activar, comunicar o remitir según los protocolos institucionales. El curso no sustituye entrenamiento clínico supervisado ni los protocolos específicos de una IPS.
+3. Objetivo general
+Fortalecer en el estudiante las competencias fundamentales para reconocer y apoyar una respuesta inicial, humanizada, segura y articulada frente a situaciones de violencia sexual en el contexto de los servicios de salud, respetando los derechos de la persona afectada y actuando de acuerdo con la normativa y los protocolos institucionales vigentes.
+4. Resultados de aprendizaje
+Reconocer los conceptos fundamentales, derechos y principios de atención relacionados con las violencias sexuales en el contexto de los servicios de salud.
+Explicar los componentes esenciales de una atención inicial que evite la revictimización y respete la dignidad, autonomía, privacidad y consentimiento de la persona.
+Identificar las principales acciones de valoración, apoyo inicial, prevención y atención integral que pueden intervenir en la respuesta sanitaria, según el caso y el protocolo vigente.
+Distinguir las responsabilidades del estudiante o talento humano en salud frente a la documentación, preservación de evidencias, remisión y articulación con salud, protección y justicia.
+Resolver situaciones clínicas simuladas seleccionando respuestas iniciales seguras y coherentes con el rol profesional y con los protocolos institucionales.
+5. Competencias
+Atención humanizada y comunicación segura con personas víctimas/sobrevivientes.
+Aplicación de principios de derechos humanos, derechos sexuales y derechos reproductivos en la atención.
+Reconocimiento de riesgos y necesidades de atención inicial.
+Comprensión de rutas de atención y articulación intersectorial.
+Actuación responsable dentro del alcance profesional y del protocolo institucional.
+6. Enfoque pedagógico y metodología
+La formación será de autoaprendizaje, centrada en situaciones clínicas y decisiones prácticas. El contenido combinará explicación conceptual, ejemplos, recursos audiovisuales, actividades interactivas y actividades de aplicación.
+La metodología priorizará el razonamiento sobre casos: identificar la situación, reconocer necesidades inmediatas, proteger derechos, evitar la revictimización, seleccionar acciones iniciales y determinar cuándo corresponde activar una ruta o solicitar apoyo de otros profesionales o instituciones.
+El lenguaje deberá ser español latinoamericano neutro, sin voseo, regionalismos ni expresiones propias de un país específico. La comunicación debe ser respetuosa, clara, no revictimizante y adecuada para estudiantes de ciencias de la salud.
+7. Estructura obligatoria del curso
+Para este piloto, el curso tendrá exactamente 2 módulos de contenido. Cada módulo tendrá exactamente 2 capítulos de contenido. Además, cada módulo tendrá 1 capítulo de práctica integradora; los capítulos de práctica no cuentan dentro del requisito de 2 capítulos de contenido por módulo.
+El curso tendrá exactamente 8 videos de contenido: 2 videos por cada capítulo de contenido. No se exige una cantidad determinada de videos para los capítulos de práctica.
+El curso tendrá exactamente 4 actividades interactivas H5P: 1 por cada capítulo de contenido.
+El curso tendrá exactamente 2 Actividades de Aplicación: 1 por módulo, ubicadas en los capítulos de práctica integradora.
+El curso tendrá exactamente 2 evaluaciones parciales, una al cierre de cada módulo, y 1 evaluación final al terminar el curso.
+El curso tendrá 8 horas de trabajo del estudiante. Las horas deben calcularse considerando lectura, videos, actividades interactivas, Actividades de Aplicación y evaluaciones. No se deben alargar artificialmente los textos o videos para alcanzar la meta de horas.
+8. Módulo 1 — Fundamentos, derechos y atención inicial
+Propósito: comprender los principios que deben orientar la primera respuesta en salud ante una situación de violencia sexual y reconocer las actuaciones que protegen la dignidad, la seguridad y los derechos de la persona.
+Capítulo 1. Derechos, conceptos y enfoque de atención
+Conceptos fundamentales sobre violencias sexuales y su impacto en la salud.
+Derechos de las personas víctimas/sobrevivientes en el contexto de la atención en salud.
+Enfoque de derechos, género, diferencial e interseccional.
+Privacidad, confidencialidad, consentimiento informado y trato digno.
+Acción sin daño y prevención de la revictimización.
+Capítulo 2. Recepción y valoración inicial
+Recepción y atención inicial en el servicio de salud.
+Reconocimiento de necesidades clínicas, emocionales y de seguridad.
+Comunicación empática y preguntas pertinentes sin inducir ni revictimizar.
+Valoración clínica inicial y priorización según el estado de la persona.
+Identificación de situaciones que requieren apoyo, remisión o activación de rutas.
+Práctica integradora del módulo 1
+Caso simulado: una estudiante de enfermería recibe a una persona que refiere haber sufrido violencia sexual. El estudiante deberá identificar prioridades de la primera respuesta, seleccionar formas adecuadas de comunicación y reconocer acciones que deben evitarse.
+Evaluación parcial 1
+Evaluación de comprensión y toma de decisiones sobre derechos, atención inicial, comunicación segura y prevención de la revictimización.
+9. Módulo 2 — Atención integral, prevención de consecuencias y articulación
+Propósito: comprender los componentes de la atención integral y la articulación necesaria para responder de manera segura, oportuna y documentada.
+Capítulo 1. Atención clínica integral y prevención de consecuencias
+Pruebas diagnósticas y valoración según el caso y el protocolo vigente.
+Prevención y atención de infecciones de transmisión sexual y VIH.
+Anticoncepción de emergencia y orientación sobre salud sexual y reproductiva.
+Atención de lesiones físicas y necesidades de salud mental.
+Seguimiento y continuidad de la atención.
+Capítulo 2. Evidencias, documentación y articulación de la ruta
+Documentación clínica y registro adecuado de la atención.
+Preservación de evidencias y principios de cadena de custodia cuando corresponda.
+Remisión y articulación con otros profesionales y servicios de salud.
+Articulación con protección y justicia de acuerdo con las competencias institucionales.
+Vigilancia en salud pública y reporte conforme a los sistemas y protocolos aplicables.
+Práctica integradora del módulo 2
+Caso simulado: durante la atención de una persona víctima de violencia sexual, el estudiante debe organizar las acciones de atención, identificar las necesidades de prevención y seguimiento, reconocer qué información debe documentarse y determinar qué articulaciones o remisiones corresponden.
+Evaluación parcial 2
+Evaluación de comprensión y toma de decisiones sobre atención integral, prevención de consecuencias, documentación, evidencias y articulación de la ruta.
+10. Evaluación final
+La evaluación final integrará los aprendizajes de los dos módulos mediante casos clínicos simulados. El estudiante deberá priorizar acciones, reconocer respuestas seguras, identificar conductas de riesgo de revictimización y distinguir las responsabilidades que corresponden a su rol.
+La evaluación final tendrá preguntas de selección y escenarios de decisión. Las preguntas deberán evaluar aplicación y razonamiento, no únicamente memoria de definiciones.
+11. Recursos obligatorios de producción
+1 audio de bienvenida general.
+1 audiolibro del contenido completo del curso, si el flujo de producción vigente lo soporta.
+8 videos de contenido, exactamente 2 por cada capítulo de contenido.
+4 actividades interactivas H5P, exactamente 1 por cada capítulo de contenido.
+2 Actividades de Aplicación, exactamente 1 por módulo.
+2 evaluaciones parciales y 1 evaluación final.
+12. Criterios de calidad del contenido
+No presentar como vigente una norma, resolución o protocolo que no se encuentre vigente al momento de la producción.
+Cuando exista transición normativa, diferenciar claramente entre norma vigente, antecedente normativo y proyecto o documento técnico en consulta.
+No presentar el curso como sustituto del entrenamiento clínico supervisado ni como autorización para actuar fuera del rol profesional.
+Evitar descripciones gráficas o innecesariamente explícitas de hechos de violencia sexual.
+Utilizar lenguaje centrado en la persona y evitar expresiones culpabilizantes o revictimizantes.
+Mantener español latinoamericano neutro, sin voseo, regionalismos ni localismos.
+Usar escenarios clínicos ficticios y no incluir datos personales reales.
+13. Referentes normativos y técnicos
+Ministerio de Salud y Protección Social. Resolución 0459 de 2012, por la cual se adoptó el Protocolo de Atención Integral en Salud para Víctimas de Violencia Sexual.
+Ministerio de Salud y Protección Social. Modelo y Protocolo de Atención Integral en Salud para Víctimas de Violencia Sexual.
+Ministerio de Salud y Protección Social. Ley 1146 de 2007 y materiales de orientación sobre atención integral a niños, niñas y adolescentes víctimas de abuso sexual.
+Ministerio de Salud y Protección Social. Ley 1719 de 2014 y materiales sobre derechos y atención a víctimas de violencia sexual.
+Ministerio de Salud y Protección Social. Proyecto de actualización del Protocolo de Atención Integral en Salud a Personas Víctimas de Violencias Sexuales publicado para consulta pública en mayo de 2026. Se incluye únicamente como referencia de actualización y no debe tratarse automáticamente como norma vigente.
+14. Nota sobre requisitos de producción para este piloto
+Los requisitos de cantidades de módulos, capítulos, videos, actividades y evaluaciones definidos en este documento son intencionales y forman parte del diseño solicitado para la prueba técnica de Cursia. La estructura 2 × 2 se refiere a módulos y capítulos de contenido; las prácticas se contabilizan por separado.
+El objetivo de estas especificaciones es comprobar que Cursia detecta y respeta requisitos explícitos del documento, distingue contenido de práctica, mantiene las cantidades solicitadas y permite verificar cualquier excepción antes de producir.
+15. Información no prescriptiva
+Las siguientes referencias sirven únicamente para contextualizar el diseño y NO constituyen requisitos adicionales de cantidad:
+El Ministerio de Salud describe rutas intersectoriales que pueden involucrar salud, protección y justicia.
+Algunos programas de formación pueden organizar los contenidos en 3 módulos o utilizar una duración diferente.
+Un curso estándar de otra institución podría utilizar 4 módulos.
+Un programa académico puede tener más de 2 evaluaciones.
+Estas afirmaciones no modifican los requisitos de este microcurrículo. Para este curso aplican exclusivamente las cantidades y condiciones expresamente indicadas en la sección 7 y en las demás secciones prescriptivas.
+16. Fuentes consultadas
+Ministerio de Salud y Protección Social — Resolución 0459 de 2012.
+Ministerio de Salud y Protección Social — Derechos de las víctimas de violencias de género.
+Ministerio de Salud y Protección Social — Abordaje integral de las violencias de género.
+Ministerio de Salud y Protección Social — Ruta de atención integral para víctimas de violencias de género.
+Ministerio de Salud y Protección Social — Proyecto de actualización del Protocolo de Atención Integral en Salud a Personas Víctimas de Violencias Sexuales, publicado para consulta pública en mayo de 2026.
+
+Documento preparado para piloto técnico de Cursia. No constituye por sí mismo una guía clínica y no reemplaza los protocolos institucionales o la normativa vigente.
