@@ -2766,6 +2766,9 @@ function reservationBookkeeping(ev) {
       ok([200, 201].includes(ap.status), T('diseño aplicado'), { s: ap.status, e: ap.error });
       st = await readStructure(courseId);
       eq(st.modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length), [4, 3, 4], T('la forma elegida se conserva (Cursia no agrega ni quita capítulos de contenido)'));
+      const card3 = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+      const pend = (card3.design.changes || []).map((c) => `${c.type}: ${c.detail}`);
+      ok(pend.length === 0, T('el diseño aplicado es un punto fijo (sin cambios pendientes)'), { pend, status: card3.design.status || (card3.hours && card3.hours.status), proposed: (card3.design.modules || []).flatMap((m) => m.chapters.filter((c) => c.proposed).map((c) => c.title)) });
 
       // Propuesta → aprobación (motivos de excepción y confirmaciones si las hay).
       let S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
@@ -2787,8 +2790,8 @@ function reservationBookkeeping(ev) {
       const apv = await api('POST', `/courses/${courseId}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Coordinación Académica E21', role: 'Directora académica', confirm: true });
       ok(apv.status === 200 || apv.status === 201, T('propuesta aprobada'), { s: apv.status, e: apv.error });
       const n = ver.blueprintNumber;
-      const [bp] = await q(`select snapshot from public.course_blueprints where course_id = $1 and blueprint_number = $2`, [courseId, n]);
-      const snap = typeof bp.snapshot === 'string' ? JSON.parse(bp.snapshot) : bp.snapshot;
+      const [bp] = await q(`select snapshot_json from public.course_blueprints where course_id = $1 and blueprint_number = $2`, [courseId, n]);
+      const snap = typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json;
       eq(snap.modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length), [4, 3, 4], T('Blueprint = la forma aprobada'));
 
       // Generación MOCK sobre lo aprobado → empaque → Moodle.

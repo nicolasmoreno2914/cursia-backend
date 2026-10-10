@@ -366,5 +366,30 @@ check('D18 LOOP 7 (A1): re-proponer sobre un diseño aplicado conserva las prác
   }
 });
 
+check('D19 Fase 2/4: forma elegida por la institución (sin contenido nuevo) y horas fuera de alcance → sin profundización y punto fijo al aplicar', () => {
+  let nid = 0;
+  const known = new Set(snapOf().modules.flatMap((m) => m.chapters.map((c) => c.id)));
+  // Forma desigual (como «3 × 4» con un capítulo borrado): el módulo 2 pierde un capítulo de contenido.
+  const uneven = () => { const sn = snapOf(); const m2 = sn.modules[1]; const i = m2.chapters.findIndex((c) => c.kind !== 'practice'); if (m2.chapters.length > 1 && i >= 0) m2.chapters.splice(i, 1); return sn; };
+  const apply = (snap, d) => {
+    const out = clone(P.materializeDistribution(snap, d));
+    for (const m of out.modules) for (const c of m.chapters) { if (known.has(c.id)) continue; c.id = `00000000-0000-4000-9100-${String(++nid).padStart(12, '0')}`; known.add(c.id); }
+    return out;
+  };
+  const contentShape = (mods) => mods.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length);
+  for (const k of Object.keys(PF.profiles)) for (const base of [snapOf, uneven]) for (const h of [30, 45, 60, 90, 120, 200]) {
+    const rules = rulesOf(k);
+    const run = (snap) => ST.distributeCourseHours({ snapshot: snap, rules, targetHours: h, activityTypeRules: 2, requirements: { sources: {}, noContentAdditions: true } });
+    let snap = base();
+    const shape0 = contentShape(snap.modules);
+    let d = run(snap);
+    assert(!d.changes.some((c) => c.type === 'add_content_chapter'), `${h} h: ningún capítulo de contenido nuevo`);
+    eq(contentShape(d.modules), shape0, `${h} h: la forma de contenido se conserva`);
+    snap = apply(snap, d);
+    d = run(snap);
+    eq(d.changes.map((c) => c.detail), [], `${k} ${base.name} ${h} h (${d.status}): lo aplicado es un punto fijo`);
+  }
+});
+
 console.log(`\n${passes} OK, ${failures} fallidas`);
 process.exit(failures ? 1 : 0);

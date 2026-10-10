@@ -801,6 +801,22 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
     growApplication();
   }
   seedLeftoverPractice();
+  // Fase 2/4 · punto fijo: con la forma de la institución (sin capítulos de contenido nuevos) y sin llegar al objetivo, el
+  // orden en que se reparten los niveles cambia el resultado (las prácticas nuevas toman su nivel al crearse; al rediseñar
+  // ya están). Se repite el reparto como lo hará el rediseño después de «Usar este diseño»: así lo aplicado no vuelve a
+  // proponer cambios (la propuesta podría quedar bloqueada para siempre por «cambios sin aplicar»).
+  if (noContentAdditions && !reached()) {
+    for (const m of design) for (const c of m.chapters) {
+      if (c.kind === 'practice' && c.proposed) filledPractice.add(c.id);
+      if (pinnedApp(c.id) === undefined) c.applicationMinutes = null;
+    }
+    reEval();
+    for (const s of policy.order) {
+      if (steps[s]()) break;
+      growApplication();
+    }
+    seedLeftoverPractice();
+  }
   // Ajuste fino: si se pasó, bajar niveles de a uno (empezando por las aperturas) SOLO mientras el total siga
   // dentro de la tolerancia por abajo (nunca descarta un diseño válido).
   // LOOP 9.2 (QA): las Actividades de los capítulos de práctica también se ajustan (al final). Antes solo se bajaban las de
