@@ -298,11 +298,10 @@ export class CourseDesignService {
       let structureByTeacher = await structureEditedByTeacher(this.dataSource, courseId);
       // Una forma elegida (formato S/M/L o personalizada) IGUAL a la que exige el documento no se aparta de él: un choque de
       // horas con esa forma no es «la estructura que armaste» sino lo que el propio documento fija.
-      const docShape = structureByTeacher ? requiredContentShape(auth.required) : null;
-      if (docShape) {
-        const live = dist.modules.map((m) => m.chapters.filter((c) => !c.proposed && c.kind === 'content').length);
-        if (live.length === docShape.length && live.every((n, i) => n === docShape[i])) structureByTeacher = false;
-      }
+      const docShape = requiredContentShape(auth.required);
+      const liveShape = dist.modules.map((m) => m.chapters.filter((c) => !c.proposed && c.kind === 'content').length);
+      const shapeIsDocuments = !!docShape && liveShape.length === docShape.length && liveShape.every((n, i) => n === docShape[i]);
+      if (shapeIsDocuments) structureByTeacher = false;
       reqChecks = compareRequirements(auth.applicable, designForRequirements(dist, profile.targetHours ?? null, hoursSource === 'requirement' ? 'proposed' : hoursSource,
         structureByTeacher, !!decisions.audiovisual, !!decisions.applicationActivities));
       const teacherPins = dist.modules.some((m) => m.chapters.some((c) => !c.proposed && (c.videoPinned || c.applicationPinned)));
@@ -352,7 +351,7 @@ export class CourseDesignService {
           && ['modules', 'chapters', 'structure'].includes((auth.applicable.find((r) => r.id === c.requirementId) || { kind: '' }).kind));
         // Fase 2/4: con una forma elegida por la institución en «Estructura» (personalizada o formato), Cursia no agrega
         // capítulos de contenido; si las horas no caben en esa forma, es la excepción de la institución (con su motivo).
-        const chosenShape = !!(origin && origin.choice && origin.choice !== 'document' && origin.choice !== 'cursia');
+        const chosenShape = !!(origin && origin.choice && origin.choice !== 'document' && origin.choice !== 'cursia') && !shapeIsDocuments;
         clashCause = !persists || teacherStructureOff || chosenShape ? 'teacher' : 'document';
       }
       requirementChecks = requirementVerificationChecks(auth.applicable, reqChecks, {

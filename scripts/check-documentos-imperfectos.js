@@ -20,6 +20,8 @@
 //   DI13 «Asignatura — 40 horas» sigue siendo un documento de varias asignaturas; un rango NO lo es
 //   DI14 texto cortado en el borde de la página: se usa y se marca 🟡 para confirmar (sin inventar el resto)
 //   DI15 0 llamadas de red
+//   DI16–DI21 (revisión independiente) PDF tipo Word, componentes de horas, «la plataforma» y artículos, datos de la
+//        ficha, listas sin viñetas y celdas que ocupan varias columnas: lo normal no cambia
 //
 // Uso: node scripts/check-documentos-imperfectos.js [path/to/dist]   (después de npm run build)
 'use strict';
@@ -200,7 +202,7 @@ const contentsOf = (ctx) => ctx.units.map((u) => [u.title, u.contents.map((c) =>
     const one = await read('rango.txt', txt(['Asignatura: Atención inicial', 'Duración: 40–44 horas', 'Módulo 1: 13–15 h', 'Módulo 2: 13–15 h', 'Total: 40–44 h']));
     eq(one.requirements.multiCourse, false, 'rangos de un mismo curso');
     eq([RX.subjectHoursRow('Asignatura — 40 horas'), RX.subjectHoursRow('Duración: 40–44 horas'), RX.subjectHoursRow('Módulo 1 | 13–15 h'), RX.subjectHoursRow('Total | 40–44 h')],
-      [{ subject: 'Asignatura', hours: 40 }, null, null, null], 'fila de asignatura vs. rangos');
+      [{ subject: 'Asignatura', hours: 40, dash: true }, null, null, null], 'fila de asignatura vs. rangos');
   });
 
   await check('DI14 texto cortado en el borde de la página: se usa y se marca 🟡 (sin inventar el resto)', async () => {
@@ -211,6 +213,52 @@ const contentsOf = (ctx) => ctx.units.map((u) => [u.title, u.contents.map((c) =>
     const [ra1, ra2] = r.context.outcomes;
     assert(ra1 && /^Reconocer los conceptos/.test(ra1.text) && !!ra1.review, JSON.stringify(ra1));
     assert(ra2 && !ra2.review, 'un texto completo no pide revisión');
+  });
+
+  // ── Revisión independiente: lo que NO debe cambiar en documentos normales ──
+  await check('DI16 PDF tipo Word: títulos numerados y viñetas con tabulación siguen siendo texto (no filas de tabla)', async () => {
+    const pdf = await pdfOf([[{ x: 50, y: 40, text: 'Asignatura: Primeros auxilios' },
+      { x: 50, y: 70, text: '1.' }, { x: 72, y: 70, text: 'Resultados de aprendizaje', size: 12 },
+      { x: 60, y: 90, text: '•' }, { x: 80, y: 90, text: 'Aplicar el protocolo de atención inicial.' },
+      { x: 60, y: 105, text: '•' }, { x: 80, y: 105, text: 'Reconocer los signos de alarma.' },
+      { x: 50, y: 135, text: '2.' }, { x: 72, y: 135, text: 'Metodología', size: 12 }, { x: 50, y: 155, text: 'Aprendizaje basado en casos con simulación.' }]]);
+    const r = await read('word.pdf', pdf);
+    eq(r.context.outcomes.map((o) => o.text), ['Aplicar el protocolo de atención inicial.', 'Reconocer los signos de alarma.'], 'resultados sin «—»');
+    eq(r.context.methodology.value, 'Aprendizaje basado en casos con simulación.', 'metodología');
+  });
+
+  await check('DI17 tabla de componentes de horas de UN curso: no es un documento de varias asignaturas', async () => {
+    const r = await read('componentes.txt', txt(['Asignatura: Atención inicial', 'Acompañamiento docente | 16 h', 'Estudio independiente | 32 h', 'Prácticas - 16 horas', '', '1. Requisitos institucionales', 'El curso tendrá exactamente 4 módulos de contenido.']));
+    eq(r.requirements.multiCourse, false, 'un solo curso');
+    assert(r.requirements.requirements.some((q) => q.kind === 'modules' && q.value === 4 && q.active), 'el requisito sigue activo');
+  });
+
+  await check('DI18 «la plataforma» y los artículos no borran requisitos reales', async () => {
+    const reqs = async (sentence) => (await read('r.txt', txt(['Asignatura: Curso', '', '1. Requisitos institucionales', sentence]))).requirements.requirements.filter((q) => q.active).map((q) => [q.kind, q.value]);
+    eq(await reqs('El curso se desarrollará en la plataforma Moodle y tendrá exactamente 4 módulos.'), [['modules', 4]], 'plataforma');
+    eq(await reqs('Se deben desarrollar las 3 evaluaciones parciales.'), [['evaluations', 3]], 'artículo + verbo');
+    eq(await reqs('Las competencias atraviesan los tres módulos del curso.'), [], 'referencia a lo ya definido');
+    eq(await reqs('No debe asumirse como cumplible si la plataforma solo puede producir 1 video por capítulo.'), [], 'nota sobre la capacidad de la plataforma');
+  });
+
+  await check('DI19 datos de la ficha («Módulo: Virtual», «Unidad: Facultad…») no son módulos del curso', async () => {
+    const r = await read('ficha.txt', txt(['Asignatura: Atención inicial', 'Unidad: Facultad de Ciencias de la Salud', 'Programa: Enfermería', 'Módulo: Virtual', 'Duración del curso', '48 horas']));
+    eq(r.context.units, [], 'sin unidades inventadas');
+  });
+
+  await check('DI20 una lista sin viñetas en minúscula sigue siendo una lista', async () => {
+    const r = await read('lista.txt', txt(['Asignatura: Atención inicial', 'Resultados de aprendizaje', 'Aplicar el protocolo de atención inicial', 'reconocer los signos de alarma', 'comunicar el caso al equipo']));
+    eq(r.context.outcomes.length, 3, 'tres resultados');
+  });
+
+  await check('DI21 una celda que ocupa varias columnas no se parte a mitad de frase', async () => {
+    const pdf = await pdfOf([[{ x: 51, y: 40, text: 'Contenidos', size: 13 },
+      { x: 80, y: 60, text: 'Unidad' }, { x: 131, y: 60, text: 'Tema' }, { x: 300, y: 60, text: 'Recursos' },
+      { x: 80, y: 80, text: '1' }, { x: 131, y: 80, text: 'Conceptos básicos' }, { x: 300, y: 80, text: '1 video' },
+      { x: 80, y: 100, text: '2' }, { x: 131, y: 100, text: 'Marco legal' }, { x: 300, y: 100, text: '1 video' },
+      { x: 80, y: 120, text: 'Nota' }, { x: 131, y: 120, text: 'Todos los temas se trabajan con casos simulados y retroalimentación inmediata del tutor' }]]);
+    const lines = (await require(path.join(distRoot, 'modules/academic-context/extract/text-sources.js')).readDocument(pdf, 'x.pdf')).lines.map((l) => l.text);
+    assert(lines.includes('Nota | Todos los temas se trabajan con casos simulados y retroalimentación inmediata del tutor'), JSON.stringify(lines));
   });
 
   await check('DI15 0 llamadas de red', async () => { eq(netAttempts, [], 'red'); });

@@ -80,7 +80,7 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
     if (e.capability) {
       // LOOP 9.2 (capacidades): requisito no cubierto → solo se continúa si la institución acepta la diferencia.
       b.push({ code: 'exception_reason', capability: true, title: `Requisito no cubierto: ${e.requirementText}${covered.length ? ` (también ${covered.join(' y ')})` : ''}. Para continuar, la institución debe aceptar la diferencia.`,
-        detail: `El microcurrículo solicita ${e.requirementText}. Actualmente, ${e.appliedText.replace(/^Cursia /, 'Cursia ')}.`, where: 'reason', ref: e.requirementKey,
+        detail: `El microcurrículo solicita ${e.requirementText}. Actualmente, ${e.appliedText}.`, where: 'reason', ref: e.requirementKey,
         ...(e.proposal ? { proposal: e.proposal } : {}),
         suggestion: e.proposal
           ? `Se acepta la alternativa que propone Cursia para ${e.requirementText}${covered.length ? ` (${covered.join(' y ')})` : ''}: ${e.proposal.replace(/^Proponemos /, '').replace(/\s*No reemplaza al segundo video: la institución decide si lo acepta\.$/, '')}`

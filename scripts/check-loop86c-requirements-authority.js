@@ -496,6 +496,17 @@ async function dbChecks() {
       }
     });
 
+    await check('RC16b documentos imperfectos (revisión I6): sin estructura exigida, no llegar a las horas NO se presenta como límite de Cursia', async () => {
+      const cid = await courseWith('Sin estructura exigida', [1, 1], 'La intensidad horaria total será de 120 horas.');
+      const card = await design.recommend(cid, OWNER, {});
+      const hc = reqCheck(card, 'target_hours');
+      if (card.design.status === 'cannot_reach_target') {
+        assert(!/Requisito no cubierto por Cursia/.test(hc.title) && !hc.capability, 'el documento no fija la estructura: ' + hc.title);
+      } else {
+        assert(!hc.capability, 'sin capacidad si llega: ' + hc.title);
+      }
+    });
+
     await check('RC17 re-review final L86C IMPORTANTE-A: sin lectura de requisitos, el «Más video» del docente no se confunde con uno viejo de Cursia', async () => {
       const cid = await courseWith('Sin lectura', [3, 3], 'Cada capítulo tendrá un video. El curso tendrá 3 capítulos por módulo.');
       const { card } = await useDesign(cid);

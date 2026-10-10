@@ -138,7 +138,7 @@ const RE_NONPRESCRIPTIVE_HEAD = /(no prescriptiv\w*|informacion (de contexto|con
  */
 /** «ubicadas en el capítulo de práctica», «en el espacio de aplicación (correspondiente)», «en la práctica del módulo». */
 const RE_AA_IN_PRACTICE = /\b(?:(?:ubicad|situad|incluid)\w*\s+)?en (?:el|los|cada|su|la) (?:capitulos? de practica|espacios? de (?:aplicacion|practica)|practicas? (?:del|de cada) modulo)\b/;
-const RE_PLATFORM_NOTE = /\b(la plataforma|capacidad (real|tecnica)( de produccion)?|capacidad de (la plataforma|cursia|produccion)|verificad[oa] contra|verificarse (antes|contra)|no debe asumirse|debe ser verificad[oa])\b/;
+const RE_PLATFORM_NOTE = /\b(capacidad (real|tecnica)( de produccion)?|capacidad de (la plataforma|cursia|produccion)|verificad[oa] contra|verificarse (antes|contra)|no debe asumirse( como cumplible)?|debe ser verificad[oa]|(la plataforma|cursia) solo puede producir|puede producir (la plataforma|cursia))\b/;
 /**
  * ¿La línea abre una sección? Review I10: si el documento tiene títulos con estilo (Word/Markdown), solo esos; si no, un
  * numerado que SIGUE la numeración de las secciones (15 → 16, no los ítems «1.», «2.» de una lista), un título en
@@ -334,7 +334,9 @@ function mentionsOf(m: string, sentenceScope: RequirementScope | null, ignored: 
     }
     // Referencia a lo ya definido («atraviesan los tres módulos», «cada uno de los 12 capítulos», «sus 4 unidades»):
     // el artículo definido o el posesivo antes del número nombra algo que existe; no exige una cantidad.
-    if (/\b(los|las|sus|estos|estas|dichos|dichas|ambos|ambas)\s*$/.test(before) && !/\b(exactamente|minimo|maximo|al menos|tendra|tendran|contara|contaran|incluira|incluiran)\b[^.;]{0,20}$/.test(before) && !rangeA && !rangeB && !rangeC) {
+    // Solo con contexto que remite a algo ya definido («de los», «en las», «atraviesan los»); «desarrollar las 3
+    // evaluaciones» o «presentará los 2 exámenes» siguen siendo requisitos.
+    if (/\b(?:de|del|en|entre|atraviesan|atraviesa|abarcan|recorren|integran|retoman|articulan)\s+(los|las|sus|estos|estas|dichos|dichas|ambos|ambas)\s*$|\b(sus|estos|estas|dichos|dichas|ambos|ambas)\s*$/.test(before) && !/\b(exactamente|minimo|maximo|al menos|tendra|tendran|contara|contaran|incluira|incluiran)\b[^.;]{0,20}$/.test(before) && !rangeA && !rangeB && !rangeC) {
       ignored('reference', all);
       continue;
     }
@@ -441,7 +443,7 @@ function conflictSubject(r: DocumentRequirement): string {
  * números es el rango, no el separador), las filas de módulos / unidades / semanas / totales del mismo curso, ni una
  * oración («La duración requerida … es de 40–44 horas»).
  */
-export function subjectHoursRow(text: string): { subject: string; hours: number } | null {
+export function subjectHoursRow(text: string): { subject: string; hours: number; dash: boolean } | null {
   const t = text.replace(/\s+/g, ' ').trim();
   const m = /^([A-ZÁÉÍÓÚÑ][^—–|:]{2,60}?)\s*([—–|]|\s-\s)\s*(.*)$/i.exec(t);
   if (!m) return null;
@@ -457,7 +459,11 @@ export function subjectHoursRow(text: string): { subject: string; hours: number 
   // Filas del MISMO curso (módulos, unidades, semanas, totales, la duración): no son otras asignaturas.
   const k = strip(label).replace(/\s*\d+$/, '');
   if (!k || /^(modulo|unidad|capitulo|leccion|tema|semana|sesion|bloque|eje|corte|periodo|total|subtotal|duracion|intensidad|horas?|carga|trabajo|dedicacion|tiempo|la |el |los |las |cada |todo)/.test(k)) return null;
-  return { subject: label, hours: Number(h[1]) };
+  // Componentes de horas de UN curso («Acompañamiento docente | 16 h», «Estudio independiente - 32 h»): no son asignaturas.
+  if (RE_COMPONENT_HOURS.test(k) || /\b(estudio|actividades?|componente|evaluacion|lectura|aplicacion|virtual|campo)\b/.test(k)) return null;
+  // La raya (—/–) es la forma de una malla («Matemáticas — 64 horas»); la celda o el guion corto también los usa una tabla
+  // de horas del propio curso: cuentan solo con otra evidencia de varias asignaturas.
+  return { subject: label, hours: Number(h[1]), dash: m[2] === '—' || m[2] === '–' };
 }
 
 export function extractRequirements(lines: SourceLine[], documentId = 'doc'): RequirementsExtraction {
@@ -475,7 +481,9 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
   const catalog = (joined.match(/\$\s?\d/g) || []).length >= 3 && (joined.match(/\bdiplomados?\b/g) || []).length >= 5;
   // Propuesta o malla que entrega varios cursos («56 cursos en Moodle», «36 cursos», «piloto de 3 asignaturas»).
   const courseCounts = (joined.match(/\b([3-9]|[1-9]\d{1,2}) (?:cursos|asignaturas|materias)\b/g) || []).length;
-  const multiCourse = subjectRows.length >= 2 || identities >= 2 || creditRows >= 3 || catalog || courseCounts >= 2;
+  const otherEvidence = identities >= 2 || creditRows >= 3 || catalog || courseCounts >= 2;
+  const dashRows = subjectRows.filter((s) => subjectHoursRow(s.text)!.dash).length;
+  const multiCourse = dashRows >= 2 || (subjectRows.length >= 2 && otherEvidence) || otherEvidence;
   const subjects: string[] = [];
 
   let seq = 0;
@@ -495,7 +503,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
 
     // Filas de asignatura.
     const sr = subjectHoursRow(seg.text);
-    if (subjectRows.length >= 2 && sr) {
+    if (multiCourse && subjectRows.length >= 2 && sr) {
       const subject = sr.subject;
       subjects.push(subject);
       push({ kind: 'target_hours', scope: { level: 'subject', subject }, mode: 'exact', value: sr.hours, obligation: 'required', active: false, status: 'found', confidence: 'high', review: ['Aplica solo a esta asignatura: elige la asignatura del curso.'], source: src(seg.text) });

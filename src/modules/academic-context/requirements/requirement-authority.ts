@@ -649,7 +649,9 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
     // de Aplicación) y sin decisiones del docente: es lo que la producción de Cursia equivale en horas de trabajo del
     // estudiante (el modelo de tiempo), no una elección de nadie. Se dice como REQUISITO NO CUBIERTO, con las horas reales
     // y una alternativa: la institución decide (nunca se rellena ni se da por cumplido; R68 exige su aceptación).
-    if (hoursClash && ctx.status === 'cannot_reach_target' && !ctx.clashWith) {
+    // Solo cuando el documento FIJA la estructura (módulos / capítulos): si no la fija, la falta de horas viene de cómo se
+    // armó el curso y se resuelve en el editor (conflicto de siempre), nunca se presenta como límite de Cursia.
+    if (hoursClash && ctx.status === 'cannot_reach_target' && !ctx.clashWith && !!(has('structure') || has('chapters') || has('modules'))) {
       const produces = `con lo que fija el documento, el diseño de Cursia equivale a ≈ ${n1(ctx.estimatedHours)} horas de trabajo del estudiante (Cursia no rellena textos ni tiempos para llegar)`;
       out.push({ id, area: 'requirements', severity: 'warning', title: `Requisito no cubierto por Cursia: ${asked}`,
         detail: `El microcurrículo solicita ${asked}. Actualmente, ${produces}. No se puede presentar como cumplido: para continuar, la institución debe aceptar esta diferencia en la propuesta.`,

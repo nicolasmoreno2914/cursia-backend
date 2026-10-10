@@ -209,10 +209,19 @@ async function readPdfPositional(parser: any, total: number): Promise<{ lines: S
 
   pageItems.forEach((pg, pi) => {
     const rows = pdfRows(pg.items);
-    const rowCells = rows.map((r) => pdfCells(r));
+    // Un número o una viñeta separados de su texto por una tabulación («1.⇥Resultados…», «•⇥Aplicar…», típico de Word) son
+    // parte de la línea, no una celda: se unen antes de buscar tablas.
+    const rowCells = rows.map((r) => {
+      const cs = pdfCells(r);
+      if (cs.length >= 2 && /^(?:\(?\d{1,2}[.)]|[•\-–—▪◦*·●○➢►✓]|\(?[a-zA-Z][.)])$/.test(cs[0].text.trim())) {
+        cs.splice(0, 2, { x: cs[0].x, end: cs[1].end, text: `${cs[0].text.trim()} ${cs[1].text}`, items: [...cs[0].items, ...cs[1].items] });
+      }
+      return cs;
+    });
     // Bordes de columna POR TABLA (filas seguidas de ≥ 2 celdas): x donde empieza una celda que no es la primera,
     // repetido en ≥ 2 filas de esa tabla. Una tabla nunca usa los bordes de otra (ni del pie de página).
     const anchorsOf: number[][] = rowCells.map(() => []);
+    const tableRow: boolean[] = rowCells.map(() => false);
     for (let i = 0; i < rowCells.length;) {
       if (rowCells[i].length < 2) { i++; continue; }
       let j = i;
@@ -222,7 +231,10 @@ async function readPdfPositional(parser: any, total: number): Promise<{ lines: S
         for (const c of rowCells[k].slice(1)) starts.set(Math.round(c.x), (starts.get(Math.round(c.x)) || 0) + 1);
       }
       const anchors = [...starts.entries()].filter(([, c]) => c >= 2).map(([x]) => x).sort((a, b) => a - b);
-      for (let k = i; k < j; k++) anchorsOf[k] = anchors;
+      // Es una TABLA solo si al menos 2 filas seguidas comparten un borde de columna; una línea suelta con un hueco grande
+      // (un título con tabulación, una frase justificada) no lo es.
+      const isTable = j - i >= 2 && anchors.length >= 1;
+      for (let k = i; k < j; k++) { anchorsOf[k] = anchors; tableRow[k] = isTable; }
       i = j;
     }
     // Celda partida en varias líneas: la línea siguiente de una fila de tabla, MÁS CERCA que el paso entre filas
@@ -246,10 +258,14 @@ async function readPdfPositional(parser: any, total: number): Promise<{ lines: S
       rows.splice(k, 1);
       rowCells.splice(k, 1);
       anchorsOf.splice(k, 1);
+      tableRow.splice(k, 1);
       k--;
     }
     rowCells.forEach((cells0, ri) => {
-      const cells = cells0.length >= 2 ? splitOverflow(cells0, anchorsOf[ri]) : cells0;
+      // Fila de tabla: sus celdas (y la que desborda, partida en el borde). Fuera de una tabla, una línea con ≥ 3 huecos
+      // grandes se lee como antes (fila «a | b | c»); con menos, es texto corrido.
+      const asCells = tableRow[ri] || cells0.length >= 3;
+      const cells = asCells && cells0.length >= 2 ? (tableRow[ri] ? splitOverflow(cells0, anchorsOf[ri]) : cells0) : [{ ...cells0[0], text: cells0.map((c) => c.text).join(' ') }];
       const texts = cells.map((c) => collapse(stripMarkupTags(c.text))).filter(Boolean);
       if (!texts.length) return;
       const items = rows[ri].filter((it) => it.str.trim());
@@ -323,8 +339,8 @@ function splitOverflow(cells: { x: number; end: number; text: string; items: Pdf
       }
       return at;
     };
-    let best = pick(Math.max(12, Math.round(c.text.length * 0.25)), true);
-    if (best < 0) best = pick(8, false);
+    // Solo un corte FUERTE: una celda que ocupa varias columnas (texto con espacios normales) nunca se parte.
+    const best = pick(Math.max(12, Math.round(c.text.length * 0.25)), true);
     if (best < 0) { out.push(c); continue; }
     out.push({ x: c.x, end: a, text: c.text.slice(0, best), items: c.items });
     out.push({ x: a, end: c.end, text: c.text.slice(best), items: c.items });

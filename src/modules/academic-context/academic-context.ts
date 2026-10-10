@@ -313,6 +313,7 @@ class Checker {
       if (!isObj(r) || typeof r.min !== 'number' || typeof r.max !== 'number' || !(r.min > 0) || !(r.max >= r.min) || r.max > 5000) {
         this.err(`${path}.range`, 'INVALID_RANGE', `${path}.range debe ser {min, max} con 0 < min ≤ max`);
       } else if (v.status === 'missing') this.err(`${path}.range`, 'MISSING_WITH_VALUE', `${path}: un dato faltante no lleva rango`);
+      else if (typeof v.value === 'number' && (v.value < r.min || v.value > r.max)) this.err(`${path}.range`, 'VALUE_OUTSIDE_RANGE', `${path}: el valor debe estar dentro del rango`);
     }
     if (v.status === 'missing') {
       if (v.value !== null) this.err(`${path}.value`, 'MISSING_WITH_VALUE', `${path}: un dato faltante no lleva valor`);
