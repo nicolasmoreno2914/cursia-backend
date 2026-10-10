@@ -290,6 +290,9 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
   const chapters = mods.flatMap((m) => m.chapters);
   const proposedStructure = chapters.some((c) => c.proposed);
   const structureBy: RequirementChooser = d.structureByTeacher && !proposedStructure ? 'teacher' : 'cursia';
+  // Fase 2/4: para requisitos solo de CONTENIDO, una práctica propuesta por Cursia no cambia quién decidió (las prácticas
+  // no cuentan ahí): con la forma de la institución y sin capítulos de contenido propuestos, la decisión es de ella.
+  const contentBy: RequirementChooser = d.structureByTeacher && !chapters.some((c) => c.proposed && c.kind !== 'practice') ? 'teacher' : 'cursia';
   // Review L86C M8: los capítulos que propone Cursia no cambian cuántos módulos hay: la cantidad de módulos es del docente
   // si él armó la estructura, aunque el diseño agregue capítulos.
   const modulesBy: RequirementChooser = d.structureByTeacher ? 'teacher' : 'cursia';
@@ -341,7 +344,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
       // LOOP 9.2: «N × M capítulos de contenido» compara solo contenido (las prácticas van aparte); sin «de contenido», todos.
       const compared = 'chapterKind' in s && s.chapterKind === 'content' ? shape.map((n, i) => n - practice[i]) : shape;
       const ok = !!r.shape && r.shape.length === compared.length && r.shape.every((n, i) => n === compared[i]);
-      out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { shape, practice }, chosenBy: structureBy });
+      out.push({ requirementId: r.id, status: ok ? 'met' : 'unmet', actual: { shape, practice }, chosenBy: 'chapterKind' in s && s.chapterKind === 'content' ? contentBy : structureBy });
       continue;
     }
     if (r.value === null || r.value === undefined) { nv(r, 'Sin cantidad.'); continue; }
@@ -355,7 +358,7 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
         // LOOP 9.2: «capítulos de contenido» / «capítulos de práctica» cuentan solo los de ese tipo.
         const ck = (s as { chapterKind?: 'practice' | 'content' }).chapterKind;
         const ofKind = (cs: { kind: string }[]) => (ck ? cs.filter((c) => (ck === 'practice' ? c.kind === 'practice' : c.kind !== 'practice')).length : cs.length);
-        const by = ck === 'practice' ? practiceBy : structureBy;
+        const by = ck === 'practice' ? practiceBy : ck === 'content' ? contentBy : structureBy;
         if (s.level === 'course') one(r, ofKind(chapters), by);
         else if (s.level === 'module' && isEach) each(r, mods.map((m) => ofKind(m.chapters)), by);
         else if (s.level === 'module' && 'index' in s) {

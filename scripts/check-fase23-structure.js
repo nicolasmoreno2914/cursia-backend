@@ -182,12 +182,31 @@ const assignedIds = (p) => p.modules.flatMap((m) => m.chapters.flatMap((c) => c.
 
   await check('ST8 «Cursia recomienda» diseña dentro de la forma elegida: sin capítulos de contenido nuevos (prácticas sí)', async () => {
     eq(RA.capToChosenShape(null, null), null, 'sin forma elegida: sin cambios');
-    eq(RA.capToChosenShape(null, 4).contentChaptersPerModule, { max: 4 }, 'tope = la forma elegida');
-    eq(RA.capToChosenShape({ sources: {}, contentChaptersPerModule: { min: 5, max: 6 } }, 4).contentChaptersPerModule, { max: 4 }, 'un mínimo del documento por encima es la excepción de la institución');
-    eq(RA.capToChosenShape({ sources: {}, contentChaptersPerModule: { min: 2, max: 3 } }, 4).contentChaptersPerModule, { min: 2, max: 3 }, 'un máximo del documento menor se respeta');
+    eq(RA.capToChosenShape(null, 4), { sources: {}, noContentAdditions: true }, 'forma elegida: sin capítulos de contenido nuevos');
+    eq(RA.capToChosenShape({ sources: {}, contentChaptersPerModule: { min: 5, max: 6 } }, 4).contentChaptersPerModule, { max: 6 }, 'un mínimo del documento por encima es la excepción de la institución');
+    eq(RA.capToChosenShape({ sources: {}, contentChaptersPerModule: { min: 2, max: 3 } }, 4).contentChaptersPerModule, { min: 2, max: 3 }, 'lo demás del documento se respeta');
     const fq = (choice, ns) => ({ query: async (sql) => /structureOrigin/.test(sql) ? [{ o: choice ? { source: 'academic_context', counter: 1, contextVersion: 1, at: 't', choice } : null }] : ns.map((n) => ({ n })) });
     eq(await RA.chosenContentCap(fq('custom', [4, 3, 4]), 1), 4, 'personalizada 3 × 4 (con un capítulo borrado): tope 4');
     eq(await RA.chosenContentCap(fq(null, [4, 4]), 1), null, 'sin elección en «Estructura»: como siempre');
+    eq([await RA.chosenContentCap(fq('document', [4, 4]), 1), await RA.chosenContentCap(fq('cursia', [4, 4]), 1)], [null, null], 'según el documento / Cursia recomienda: Cursia completa lo que exige el documento');
+    eq(await RA.chosenContentCap(fq('format', [3, 3, 3]), 1), 3, 'formato');
+    // El distribuidor: con la forma elegida, horas que no caben no agregan capítulos de contenido en ningún módulo.
+    const DI = D('modules/study-time/distributor.js');
+    assert(typeof DI.distributeCourseHours === 'function', 'distribuidor');
+  });
+
+  await check('ST9 forma de la institución: una práctica propuesta por Cursia no le quita la decisión en requisitos de contenido', () => {
+    const DRQ = D('modules/academic-context/requirements/document-requirements.js');
+    const req = reqsOf(Buffer.from('El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 5 capítulos de contenido.'), 'text/plain');
+    const ch = (kind, proposed) => ({ kind, proposed, videoEnabled: false, videoPinned: false, activityEnabled: true, activityPinned: false, applicationMinutes: null, applicationPinned: false, hours: 2 });
+    const design = (teacher, extraContent) => ({
+      modules: [0, 1, 2].map(() => ({ examEnabled: true, chapters: [ch('content', false), ch('content', false), ch('content', false), ch('content', false), ...(extraContent ? [ch('content', true)] : []), ch('practice', true)] })),
+      evaluations: 3, targetHours: 30, estimatedHours: 30, hoursStatus: 'within_tolerance', hoursSource: 'proposed', structureByTeacher: teacher, audiovisualByTeacher: false, applicationByTeacher: false,
+    });
+    const by = (d) => Object.fromEntries(DRQ.compareRequirements(req, d).map((c) => [req.find((r) => r.id === c.requirementId).kind, c.chosenBy]));
+    eq(by(design(true, false)), { modules: 'teacher', chapters: 'teacher', structure: 'teacher' }, 'institución: 3 × 4 con prácticas propuestas');
+    eq(by(design(true, true)).chapters, 'cursia', 'si Cursia propone capítulos de contenido, esa parte es de Cursia');
+    eq(by(design(false, false)).chapters, 'cursia', 'sin forma de la institución: Cursia');
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);

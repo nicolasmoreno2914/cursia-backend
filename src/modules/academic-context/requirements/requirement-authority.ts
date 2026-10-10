@@ -67,6 +67,8 @@ export function implicitDecisions(savedPrefs: Record<string, unknown> | null | u
 
 /** Restricciones que el distribuidor puede cumplir (todas opcionales). */
 export interface DistributorRequirementConstraints {
+  /** Fase 2/4: la institución eligió la forma (personalizada o formato): Cursia no agrega capítulos de contenido. */
+  noContentAdditions?: boolean;
   /** Capítulos por módulo (D1: los de práctica cuentan). */
   chaptersPerModule?: { min?: number; max?: number };
   /** LOOP 9.2: «N capítulos de contenido por módulo» (las prácticas aparte). */
@@ -294,7 +296,9 @@ export async function requirementConstraintsForCourse(
  */
 export async function chosenContentCap(q: Q, courseId: number): Promise<number | null> {
   const origin = await readStructureOrigin(q as any, courseId);
-  if (!origin || !origin.choice) return null;
+  // Re-review I1: «según el documento» y «Cursia recomienda» no son una forma de la institución: Cursia sigue completando
+  // lo que el documento exige (mismo criterio que la atribución de un choque de horas).
+  if (!origin || !origin.choice || origin.choice === 'document' || origin.choice === 'cursia') return null;
   const res = await q.query(
     `select count(c.id) filter (where coalesce(to_jsonb(c) ->> 'chapter_kind', 'content') <> 'practice')::int as n
        from public.course_modules m left join public.course_chapters c on c.module_id = m.id where m.course_id = $1 group by m.id`,
@@ -309,11 +313,14 @@ export async function chosenContentCap(q: Q, courseId: number): Promise<number |
 export function capToChosenShape(c: DistributorRequirementConstraints | null, cap: number | null): DistributorRequirementConstraints | null {
   if (cap === null) return c;
   const out: DistributorRequirementConstraints = c ? { ...c, sources: { ...c.sources } } : { sources: {} };
+  // Re-review I2: ningún capítulo de contenido nuevo en NINGÚN módulo (un tope global dejaba crecer los módulos más cortos).
+  out.noContentAdditions = true;
   const prev = out.contentChaptersPerModule;
-  out.contentChaptersPerModule = {
-    ...(prev && prev.min !== undefined && prev.min <= cap ? { min: prev.min } : {}),
-    max: Math.min(cap, prev && prev.max !== undefined ? prev.max : cap),
-  };
+  if (prev && prev.min !== undefined && prev.min > cap) {
+    // Un mínimo del documento por encima de la forma elegida es la excepción de la institución (no se completa).
+    const { min: _min, ...rest } = prev;
+    if (rest.max !== undefined) out.contentChaptersPerModule = rest; else delete out.contentChaptersPerModule;
+  }
   return out;
 }
 

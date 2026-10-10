@@ -58,10 +58,10 @@ export function documentContents(ctx: AcademicContextV1): CoverageItem[] {
   return ctx.units.filter((u) => u.contents.length > 0).flatMap((u) => u.contents.map((c) => ({ id: c.id, text: c.text, unit: u.title })));
 }
 
-/** Huella de los contenidos del documento (id, unidad y texto, en orden). */
+/** Huella de los contenidos del documento (id y texto, en orden; el nombre de la unidad no cambia qué se cubre). */
 export function contentsFingerprint(ctx: AcademicContextV1): string {
   const norm = (s: string) => String(s || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
-  return createHash('sha256').update(JSON.stringify(documentContents(ctx).map((c) => [c.id, norm(c.unit), norm(c.text)]))).digest('hex');
+  return createHash('sha256').update(JSON.stringify(documentContents(ctx).map((c) => [c.id, norm(c.text)]))).digest('hex');
 }
 
 /** ¿El mapa se armó con otros contenidos del documento? (mismos ids con otros textos también cuenta). */
