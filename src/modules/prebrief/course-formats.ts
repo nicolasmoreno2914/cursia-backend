@@ -84,10 +84,14 @@ export interface FormatFit {
 }
 
 /** ¿El diseño respeta el formato? La forma se mide en capítulos de contenido; las horas, contra el rango. */
-export function formatFit(d: CourseFormatDef, modules: { chapters: { kind?: string }[] }[], targetHours: number | null): FormatFit {
+/**
+ * `hours`: las horas que se comparan con el rango del formato. Con las horas ESTIMADAS del diseño se pasa la tolerancia
+ * del distribuidor (un diseño «dentro de la tolerancia» de su meta no se marca fuera del formato por décimas).
+ */
+export function formatFit(d: CourseFormatDef, modules: { chapters: { kind?: string }[] }[], targetHours: number | null, tolerance = 0): FormatFit {
   const contentShape = modules.map((m) => m.chapters.filter((c) => (c.kind || 'content') !== 'practice').length);
   const structureOk = contentShape.length === d.modules && contentShape.every((n) => n === d.chaptersPerModule);
-  const hoursOk = typeof targetHours === 'number' && targetHours >= d.hoursMin - 1e-9 && targetHours <= d.hoursMax + 1e-9;
+  const hoursOk = typeof targetHours === 'number' && targetHours >= d.hoursMin - tolerance - 1e-9 && targetHours <= d.hoursMax + tolerance + 1e-9;
   return { structureOk, hoursOk, contentShape };
 }
 

@@ -370,7 +370,9 @@ export class CourseDesignService {
     }
     // Prebrief · formato S/M/L elegido: ¿el diseño lo respeta? (advertencia en Verificación si no).
     const fmt = formatDef((await readCourseFormat(this.dataSource, courseId))?.code ?? null);
-    const fmtFit = fmt && dist ? formatFit(fmt, dist.modules.map((m) => ({ chapters: m.chapters.map((c) => ({ kind: c.kind })) })), profile.targetHours ?? null) : null;
+    // Las horas del formato se comparan con las que el diseño REALMENTE tiene (no con la meta): un diseño de ≈ 22 h no
+    // «cumple» un Formato M de 40–44 h aunque la meta sea 42.
+    const fmtFit = fmt && dist ? formatFit(fmt, dist.modules.map((m) => ({ chapters: m.chapters.map((c) => ({ kind: c.kind })) })), typeof dist.estimatedHours === 'number' ? dist.estimatedHours : (profile.targetHours ?? null), typeof dist.estimatedHours === 'number' ? Math.max(1, fmt.hoursMax * 0.05) : 0) : null;
     // LOOP 8.4: la verificación del MISMO diseño (alineación del Coherence Engine incluida).
     const verification = dist
       ? verifyDesign({
@@ -394,7 +396,7 @@ export class CourseDesignService {
           && ((prefs.applicationActivities || 'auto') === 'none' || ((prefs.applicationActivities || 'auto') === 'practice_only' && c.kind !== 'practice'))).map((c) => c.id)),
         uncoveredEvaluations: academic ? uncoveredEvaluations(academic.context, dist, chapterOutcomes) : [],
         requirementChecks,
-        format: fmt && fmtFit ? { label: fmt.label, modules: fmt.modules, chaptersPerModule: fmt.chaptersPerModule, hoursMin: fmt.hoursMin, hoursMax: fmt.hoursMax, ...fmtFit } : null,
+        format: fmt && fmtFit ? { label: fmt.label, modules: fmt.modules, chaptersPerModule: fmt.chaptersPerModule, hoursMin: fmt.hoursMin, hoursMax: fmt.hoursMax, ...fmtFit, designHours: dist ? dist.estimatedHours : null } : null,
       })
       : null;
     return {

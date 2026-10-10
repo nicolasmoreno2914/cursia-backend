@@ -3304,6 +3304,11 @@ function reservationBookkeeping(ev) {
       rec23('V3', 'Horas: si el diseño no llega a 40–44 h se dice como «Requisito no cubierto por Cursia» con las horas reales y una alternativa (sin culpar a la elección del Formato M)',
         inRange ? hc && hc.severity === 'ok' : (hc && hc.title === 'Requisito no cubierto por Cursia: 40–44 horas' && /≈ \d+(,\d)? horas de trabajo del estudiante/.test(hc.detail) && !/que armaste|que elegiste/.test(hc.detail) && /Proponemos/.test(hc.capability.proposal)),
         REP.horasDiseño);
+      // «Cursia recomienda» no contradice el documento ni el Formato M elegido: nunca «agregar módulos / capítulos».
+      const recs = card.design.recommendations || [];
+      rec23('V5', '«Cursia recomienda» no contradice el documento ni el formato (no propone agregar módulos ni capítulos)', !recs.some((r) => /agregar \d+ m[oó]dulo|cap[ií]tulos m[aá]s/i.test(r)), recs);
+      const fc = card.verification.checks.find((c) => c.id === 'format');
+      rec23('V6', 'Formato M: la estructura sí; las horas del diseño fuera de 40–44 se avisan (no se marca «cumple»)', card.design.estimatedHours >= 40 && card.design.estimatedHours <= 44 ? fc && fc.severity === 'ok' : (fc && fc.severity === 'warning' && /fuera del Formato M/.test(fc.title) && /la estructura sí es la del Formato M/.test(fc.detail || '')), fc);
       const aaPractice = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.kind));
       rec23('V4', 'Cada módulo: su Actividad de Aplicación en el capítulo de práctica (no una práctica vacía)', aaPractice.every((k) => k.length === 1 && k[0] === 'practice'), aaPractice);
 

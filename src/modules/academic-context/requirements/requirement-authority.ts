@@ -93,6 +93,11 @@ export interface DistributorRequirementConstraints {
   /** Actividades de Aplicación por módulo y en el curso. */
   applicationPerModule?: { min?: number; max?: number };
   applicationTotal?: { min?: number; max?: number };
+  /**
+   * El documento fija la CANTIDAD de módulos («exactamente 3 módulos», o la estructura N × M). El distribuidor nunca agrega
+   * módulos por su cuenta; esto solo evita que su recomendación proponga módulos nuevos que contradigan el documento.
+   */
+  modulesFixed?: number;
   /** Requisito de origen de cada restricción (para explicar los cambios). */
   sources: Partial<Record<'chapters' | 'practice' | 'activities' | 'videos' | 'applicationPerModule' | 'applicationTotal', string>>;
 }
@@ -276,7 +281,11 @@ export function constraintsFor(required: DocumentRequirement[], exceptions: Stor
   }
   if (crossed(c.applicationPerModule)) { delete c.applicationPerModule; delete c.sources.applicationPerModule; }
   if (crossed(c.applicationTotal)) { delete c.applicationTotal; delete c.sources.applicationTotal; }
-  const any = c.chaptersPerModule || c.contentChaptersPerModule || c.practicePerModule || c.practiceTotal || c.activitiesTotal || c.activitiesInEveryContent || c.videosAllContent || c.videosNone || c.applicationPerModule || c.applicationTotal;
+  const nModsFixed = required.find((r) => r.kind === 'modules' && r.scope.level === 'course' && r.mode === 'exact' && typeof r.value === 'number');
+  const stShape = required.find((r) => r.kind === 'structure' && Array.isArray(r.shape) && r.shape.length);
+  if (nModsFixed) c.modulesFixed = nModsFixed.value as number;
+  else if (stShape) c.modulesFixed = stShape.shape!.length;
+  const any = c.modulesFixed || c.chaptersPerModule || c.contentChaptersPerModule || c.practicePerModule || c.practiceTotal || c.activitiesTotal || c.activitiesInEveryContent || c.videosAllContent || c.videosNone || c.applicationPerModule || c.applicationTotal;
   return any ? c : null;
 }
 
