@@ -2706,7 +2706,7 @@ function reservationBookkeeping(ev) {
       const op = await api('GET', `/courses/${courseId}/design/structure-options`);
       ok(op.status === 200 && op.data.providersCalled === 0 && op.data.hasDocumentContents && op.data.contentsCount === 18, T('opciones de estructura (18 contenidos del documento)'), { s: op.status, e: op.error });
       eq([op.data.document.shape, op.data.recommended.modules, op.data.recommended.chaptersPerModule, op.data.formats.map((f) => `${f.code}:${f.modules}x${f.chaptersPerModule}`)],
-        [[4, 4, 4, 3, 3], 5, 4, ['S:3x3', 'M:3x4', 'L:4x5']], T('documento 5 unidades; Cursia recomienda su organización; S/M/L son alternativas'));
+        [[4, 4, 4, 3, 3], 5, 3, ['S:3x3', 'M:3x4', 'L:4x5']], T('documento 5 unidades; Cursia recomienda un módulo por unidad (sin inventar capítulos); S/M/L son alternativas'));
       const pv1 = await api('POST', `/courses/${courseId}/design/structure-preview`, { modules: 3, chaptersPerModule: 4 });
       ok(pv1.status === 200 && pv1.data.differences.length === 0 && pv1.data.coverage.total === 18 && pv1.data.coverage.assigned === 18 && pv1.data.coverage.duplicated === 0 && pv1.data.plan.length === 3 && pv1.data.plan.every((m) => m.chapters.length === 4),
         T('vista previa 3 × 4: los 18 contenidos en 12 capítulos, sin duplicados; sin diferencias (el documento no exige una forma)'), pv1.data);
@@ -2852,23 +2852,27 @@ function reservationBookkeeping(ev) {
       const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E21b] Seguridad industrial 4 × 5' });
       const courseId = Number(cr.data.id);
       await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
-      const temas = ['Peligros', 'Riesgos', 'Controles', 'Incidentes', 'Liderazgo'];
-      const lines = ['Asignatura: Seguridad industrial', 'Resultados de aprendizaje', 'RA1. Identificar peligros del área de trabajo.', 'RA2. Aplicar controles de riesgo en planta.',
-        'Estructura del curso', 'El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 5 capítulos de contenido.', 'El curso tendrá 40 horas de trabajo del estudiante.'];
-      temas.slice(0, 4).forEach((t, mi) => {
-        lines.push(`Módulo ${mi + 1} — ${t} en planta`);
-        for (let ci = 1; ci <= 5; ci++) lines.push(`Capítulo ${ci}. ${t}: tema ${ci} del módulo ${mi + 1}`);
-      });
+      // Documento con sección de contenidos por unidad (lo que el extractor reconoce) y estructura obligatoria 4 × 5.
+      const temas = ['Peligros', 'Riesgos', 'Controles', 'Incidentes'];
+      const lines = ['MICROCURRÍCULO', 'Asignatura: Seguridad industrial', 'Modalidad: Virtual', 'Intensidad horaria total: 40 horas', '',
+        '1. Descripción', 'La asignatura desarrolla la gestión de la seguridad en plantas industriales.', '',
+        '2. Resultados de aprendizaje', 'RA1. Identificar peligros del área de trabajo.', 'RA2. Aplicar controles de riesgo en planta.', '',
+        '3. Estructura del curso', 'El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 5 capítulos de contenido.', '',
+        '4. Contenidos', 'Unidad | Contenidos | Horas | RA'];
+      temas.forEach((t, mi) => lines.push(`Unidad ${mi + 1}: ${t} en planta | ${[1, 2, 3, 4, 5].map((ci) => `${t}: tema ${ci}`).join('; ')} | 10 | RA${mi < 2 ? 1 : 2}`));
       const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'seguridad.txt', dataBase64: Buffer.from(lines.join('\n'), 'utf8').toString('base64') }] });
       ok(ex.status === 200, T('documento leído'), { s: ex.status, e: ex.error });
       const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
       const contextVersion = sv.data.profile.version;
       const op = (await api('GET', `/courses/${courseId}/design/structure-options`)).data;
-      eq([op.document && op.document.shape, op.recommended.modules, op.recommended.chaptersPerModule, op.recommended.reason], [[5, 5, 5, 5], 4, 5, 'Es la estructura que exige el documento.'], T('el documento exige 4 × 5: Cursia recomienda esa forma'));
+      eq([op.document && op.document.shape, op.recommended.modules, op.recommended.chaptersPerModule, op.recommended.reason, op.contentsCount], [[5, 5, 5, 5], 4, 5, 'Es la estructura que exige el documento.', 20], T('el documento exige 4 × 5: Cursia recomienda esa forma'));
       const pv = (await api('POST', `/courses/${courseId}/design/structure-preview`, { modules: 3, chaptersPerModule: 4 })).data;
       ok(pv.differences.some((d) => d.text === 'El documento establece 4 módulos y has seleccionado 3 módulos.') && pv.differences.some((d) => /5 capítulos de contenido por módulo y has seleccionado 4 capítulos de contenido por módulo\.$/.test(d.text))
         && pv.coverage.assigned === 20 && pv.coverage.duplicated === 0, T('vista previa 3 × 4: «El documento establece 4 módulos y has seleccionado 3» y los 20 contenidos cubiertos'), pv);
       let st = await readStructure(courseId);
+      const badDoc = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, shape: { modules: 3, chaptersPerModule: 4 }, choice: 'document' });
+      const badFmt = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, shape: { modules: 3, chaptersPerModule: 4 }, choice: 'format' });
+      ok(badDoc.status === 400 && /INVALID_CHOICE/.test(String(badDoc.error)) && badFmt.status === 400 && /FORMAT_CHOICE_MISMATCH/.test(String(badFmt.error)), T('elección incoherente → 400 (según el documento con forma; formato sin guardarlo)'), [badDoc.status, badDoc.error, badFmt.status, badFmt.error]);
       const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, shape: { modules: 3, chaptersPerModule: 4 }, choice: 'custom' });
       ok([200, 201].includes(aa.status), T('forma personalizada aplicada'), { s: aa.status, e: aa.error });
       const rec = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;

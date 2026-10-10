@@ -281,7 +281,8 @@ async function dbChecks() {
       eq(ids.hours.severity, 'ok', 'horas');
       eq(ids.outcomes.title, '6 de 6 resultados de aprendizaje con evidencia · 0 de 2 competencias', 'cobertura de resultados y competencias');
       assert(r.verification.checks.some((x) => /competencia CO1/.test(x.title) && x.fix && x.fix.kind), 'la competencia sin vincular trae su «Corregir»');
-      eq(ids.contents, undefined, 'la estructura armada desde el documento cubre sus contenidos (sin falsos positivos)');
+      // Fase 3: con la trazabilidad por contenido, la cobertura se informa como ok (antes, sin fila); nunca un falso positivo.
+      eq([ids.contents.severity, ids.contents.title], ['ok', 'Contenidos del documento: 18 de 18 en el diseño'], 'la estructura armada desde el documento cubre sus contenidos (sin falsos positivos)');
       eq(r.verification.blocking, false, 'sin bloqueo: ' + JSON.stringify(r.verification.checks.filter((x) => x.severity === 'critical' || x.severity === 'warning').map((x) => [x.id, x.title])));
     });
 

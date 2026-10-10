@@ -54,4 +54,9 @@ export class RecordStructureOriginDto {
 
   @IsIn(['ai_proposal'])
   source: 'ai_proposal';
+
+  /** Fase 2: la forma que se le pidió a la IA (Cursia recomienda, un formato o una personalizada). */
+  @IsOptional()
+  @IsIn(['cursia', 'format', 'custom'])
+  choice?: 'cursia' | 'format' | 'custom';
 }

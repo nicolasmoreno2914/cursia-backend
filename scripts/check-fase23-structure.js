@@ -79,7 +79,9 @@ const assignedIds = (p) => p.modules.flatMap((m) => m.chapters.flatMap((c) => c.
     const pilotReq = reqsOf(PILOT_TXT, 'text/plain');
     eq(SO.recommendShape(pilotReq, CD.documentStructureShape(pilot), 8), { modules: 2, chaptersPerModule: 2, reason: 'Es la estructura que exige el documento.' }, 'piloto');
     const r2 = SO.recommendShape([], [4, 4, 4, 3, 3], 64);
-    eq([r2.modules, r2.chaptersPerModule], [5, 4], 'sin requisitos: la organización del documento');
+    eq([r2.modules, r2.chaptersPerModule], [5, 3], 'sin requisitos: un módulo por unidad, sin inventar capítulos (18 contenidos → 15 capítulos)');
+    const sp = CD.proposeShapedStructureFromContext(costos, { modules: r2.modules, chaptersPerModule: r2.chaptersPerModule });
+    assert(sp.modules.every((m) => m.chapters.every((c) => c.sourceContentIds.length > 0)), 'la forma recomendada no tiene capítulos vacíos');
     eq([SO.recommendShape([], null, 8).modules, SO.recommendShape([], null, 8).chaptersPerModule], [3, 3], '8 h → S');
     eq([SO.recommendShape([], null, 40).chaptersPerModule], [4], '40 h → M');
     eq([SO.recommendShape([], null, 64).modules, SO.recommendShape([], null, 64).chaptersPerModule], [4, 5], '64 h → L');
@@ -97,6 +99,12 @@ const assignedIds = (p) => p.modules.flatMap((m) => m.chapters.flatMap((c) => c.
     assert(dc.includes('El documento establece 2 capítulos de contenido por módulo y has seleccionado 3 capítulos de contenido por módulo.'), JSON.stringify(dc));
     const fm = SO.shapeDifferences(pilotReq, { modules: 3, chaptersPerModule: 4 }, 'M').map((x) => x.text);
     assert(fm.includes('El documento establece 8 horas y el Formato M es de 40–44 horas.'), JSON.stringify(fm));
+    // Review I4: las horas respetan el modo del requisito («al menos 30 horas» con el Formato L se cumple).
+    const atLeast = reqsOf(Buffer.from('Asignatura: Excel\nEl curso tendrá al menos 30 horas de trabajo del estudiante.'), 'text/plain');
+    const hr = atLeast.filter((r) => r.kind === 'target_hours');
+    assert(hr.length === 1 && hr[0].mode === 'min', 'requisito «al menos 30 horas»: ' + JSON.stringify(hr.map((r) => [r.mode, r.value])));
+    eq(SO.shapeDifferences(atLeast, { modules: 4, chaptersPerModule: 5 }, 'L'), [], 'mínimo 30 h y Formato L (60–66 h): cumple');
+    eq(SO.shapeDifferences(atLeast, { modules: 3, chaptersPerModule: 3 }, 'S').map((d) => d.text), ['El documento establece al menos 30 horas y el Formato S es de 20–22 horas.'], 'mínimo 30 h y Formato S: no cumple');
     // Fase 2.3: un documento sin estructura obligatoria (tema, resultados, horas) no genera excepciones.
     const noStruct = reqsOf(Buffer.from('Asignatura: Excel\nEl curso tendrá 40 horas de trabajo del estudiante.'), 'text/plain');
     eq(SO.shapeDifferences(noStruct, { modules: 2, chaptersPerModule: 5 }), [], 'sin estructura obligatoria');
@@ -115,7 +123,12 @@ const assignedIds = (p) => p.modules.flatMap((m) => m.chapters.flatMap((c) => c.
     assert(removed.omitted.every((o) => o.text && o.unit), 'lo omitido dice qué es y de qué unidad');
     const dup = CC.contentCoverage(costos, 3, { ...map, chapters: { ...chapters, extra: [chapters.ch0[0]] } }, [...liveAll, 'extra']);
     eq(dup.duplicated.map((d) => d.chapters), [2], 'duplicado');
-    eq(CC.contentCoverage(costos, 4, map, liveAll).stale, true, 'otra versión del documento');
+    eq(CC.contentCoverage(costos, 4, map, liveAll).stale, false, 'otra versión del contexto con los MISMOS contenidos: sigue vigente');
+    const firstId = CC.documentContents(costos)[0].id;
+    const fewer = JSON.parse(JSON.stringify(costos));
+    fewer.units.find((u) => u.contents.some((c) => c.id === firstId)).contents = fewer.units.find((u) => u.contents.some((c) => c.id === firstId)).contents.filter((c) => c.id !== firstId);
+    eq(CC.contentCoverage(fewer, 4, map, liveAll).stale, true, 'el documento cambió sus contenidos: desactualizado');
+    eq(CC.contentMapIsStale(costos, map), false, 'mismos contenidos');
     eq(CC.contentCoverage(costos, 3, null, liveAll).available, false, 'sin trazabilidad');
     eq(CC.parseContentMap(JSON.stringify(map)).chapters.ch0, chapters.ch0, 'el mapa se lee de la base');
   });

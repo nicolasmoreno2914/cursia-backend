@@ -621,6 +621,8 @@ export function diffModels(prev: PrebriefModel, next: PrebriefModel): string[] {
   } else if (!eq(prev.structure.modules, next.structure.modules)) {
     out.push('Estructura: cambiaron títulos, horas o recursos de algunos capítulos');
   }
+  const chosen = (m: PrebriefModel) => (m.structure.selected ? m.structure.selected.label : 'sin elegir');
+  if ((prev.structure.selected ? prev.structure.selected.choice : null) !== (next.structure.selected ? next.structure.selected.choice : null)) out.push(`Diseño seleccionado: ${chosen(prev)} → ${chosen(next)}`);
   if (!eq(prev.goals.outcomes.map((o) => o.text), next.goals.outcomes.map((o) => o.text))) out.push('Resultados de aprendizaje');
   if (!eq(prev.goals.competencies, next.goals.competencies)) out.push('Competencias');
   if (!eq(prev.goals.generalObjective, next.goals.generalObjective)) out.push('Objetivo general');

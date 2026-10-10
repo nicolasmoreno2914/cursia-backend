@@ -1,4 +1,4 @@
-import { contentCoverage, documentContents, readContentMap, writeContentMap } from '../academic-context/content-coverage';
+import { contentCoverage, contentMapIsStale, documentContents, readContentMap, writeContentMap } from '../academic-context/content-coverage';
 import { documentStructureShape, isValidShape, proposeShapedStructureFromContext } from '../academic-context/context-design';
 import { recommendShape, shapeDifferences, structuralRequirements } from './structure-options';
 import { BadRequestException, Injectable } from '@nestjs/common';
@@ -58,7 +58,7 @@ export class CourseDesignService {
   async structureOptions(courseId: number, ownerId: string) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
-    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(() => null);
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(missingProfilesTable);
     const auth = await loadRequirementAuthority(this.dataSource, courseId, academic ? academic.context.documents : []);
     const facts = await loadCourseFacts(this.dataSource, courseId);
     const docShape = academic ? documentStructureShape(academic.context) : null;
@@ -100,7 +100,7 @@ export class CourseDesignService {
     await this.loadCourse(courseId, ownerId);
     if (!isValidShape(shape)) throw new BadRequestException('INVALID_SHAPE: la estructura debe tener entre 1 y 50 módulos y entre 1 y 30 capítulos por módulo.');
     const code = formatCode && (COURSE_FORMAT_CODES as readonly string[]).includes(formatCode) ? (formatCode as CourseFormatCode) : null;
-    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(() => null);
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId).catch(missingProfilesTable);
     const auth = await loadRequirementAuthority(this.dataSource, courseId, academic ? academic.context.documents : []);
     const differences = shapeDifferences(auth.required, shape, code);
     const contents = academic ? documentContents(academic.context) : [];
@@ -596,7 +596,7 @@ export class CourseDesignService {
         throw new ConflictException({ code: 'STRUCTURE_CHANGED', message: 'STRUCTURE_CHANGED: la estructura cambió; vuelve a verla antes de corregir.' });
       }
       const map = await readContentMap(qr, courseId);
-      if (!map || map.contextVersion !== academic.version) {
+      if (!map || contentMapIsStale(academic.context, map)) {
         await qr.rollbackTransaction();
         throw new BadRequestException({ code: 'NO_CONTENT_MAP', message: 'NO_CONTENT_MAP: la estructura no se armó con esta versión del documento; vuelve a elegirla en «Estructura».' });
       }
@@ -617,7 +617,7 @@ export class CourseDesignService {
         for (let j = i - 1; j >= 0 && !target; j--) target = chapterOf.get(contents[j].id);
         for (let j = i + 1; j < contents.length && !target; j++) target = chapterOf.get(contents[j].id);
         target = target || (firstContent && firstContent.id);
-        if (!target) return;
+        if (!target) throw new ConflictException({ code: 'NO_TARGET_CHAPTER', message: 'NO_TARGET_CHAPTER: el curso no tiene un capítulo de contenido donde incluir los contenidos; agrega uno en «Editar estructura».' });
         chapterOf.set(c.id, target);
         map.chapters[target] = [...(map.chapters[target] || []), c.id];
         applied.push({ content: c.text, chapterId: target });
@@ -776,4 +776,10 @@ function designForRequirements(
     audiovisualByTeacher,
     applicationByTeacher,
   };
+}
+
+/** Solo una base sin las tablas de perfiles (entornos viejos) cuenta como «sin documento»; cualquier otro error se propaga. */
+function missingProfilesTable(err: any): null {
+  if (err && err.code === '42P01') return null;
+  throw err;
 }

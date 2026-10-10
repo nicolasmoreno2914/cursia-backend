@@ -65,7 +65,11 @@ export function shapeDifferences(required: DocumentRequirement[], shape: Structu
   if (f) {
     for (const r of s.hours) {
       const v = r.value as number;
-      const inRange = r.mode === 'range' ? (r.valueMax ?? v) >= f.hoursMin && v <= f.hoursMax : v >= f.hoursMin && v <= f.hoursMax;
+      // Exacto: el número del documento cae dentro del formato; rango: se superponen; mínimo/máximo/aproximado: la meta
+      // del formato (su punto medio) cumple el requisito.
+      const inRange = r.mode === 'exact' ? v >= f.hoursMin && v <= f.hoursMax
+        : r.mode === 'range' ? (r.valueMax ?? v) >= f.hoursMin && v <= f.hoursMax
+          : meets(r, f.targetHours);
       if (!inRange) out.push({ kind: 'hours', text: `El documento establece ${requirementText(r)} y el ${f.label} es de ${f.hoursMin}–${f.hoursMax} horas.` });
     }
   }
@@ -92,11 +96,12 @@ export function recommendShape(required: DocumentRequirement[], documentShape: n
   const reqChapters = fixed(s.chapters) ?? (st ? st.shape![0] : null);
   if (reqModules && reqChapters) return { modules: reqModules, chaptersPerModule: reqChapters, reason: 'Es la estructura que exige el documento.' };
   if (documentShape && documentShape.length) {
-    const avg = Math.max(1, Math.round(documentShape.reduce((a, b) => a + b, 0) / documentShape.length));
+    // Hacia abajo: nunca más capítulos que contenidos (Cursia no inventa capítulos de «profundización» al recomendar).
+    const per = Math.max(1, Math.floor(documentShape.reduce((a, b) => a + b, 0) / documentShape.length));
     return {
       modules: reqModules ?? documentShape.length,
-      chaptersPerModule: reqChapters ?? (documentShape.every((n) => n === documentShape[0]) ? documentShape[0] : avg),
-      reason: `Sigue la organización del documento (${plural(documentShape.length, 'unidad', 'unidades')} con sus contenidos).`,
+      chaptersPerModule: reqChapters ?? (documentShape.every((n) => n === documentShape[0]) ? documentShape[0] : per),
+      reason: `Sigue la organización del documento: un módulo por unidad (${plural(documentShape.length, 'unidad', 'unidades')}).`,
     };
   }
   const code: CourseFormatCode = typeof targetHours === 'number' ? (targetHours <= 26 ? 'S' : targetHours <= 52 ? 'M' : 'L') : 'M';

@@ -184,9 +184,9 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   const durRows: { label: string; value: string; origin?: DocOrigin }[] = [];
   if (m.duration.targetHours) durRows.push({ label: 'Meta de horas', value: hoursText(m.duration.targetHours.value), origin: o(m.duration.targetHours.origin) });
   durRows.push({ label: 'Horas del diseño', value: `${hoursText(S.totals.hours)} de trabajo del estudiante (estimadas)` });
-  durRows.push({ label: 'Organización', value: organization, origin: o(S.origin) });
-  // Fase 2/3: la forma elegida y quién la eligió; los contenidos del documento que quedaron en el diseño.
+  // Fase 2/3: con una forma elegida en «Estructura», la fila dice también quién la eligió (en lugar de «Organización»).
   if (S.selected) durRows.push({ label: 'Diseño seleccionado', value: `${organization} · ${S.selected.label}` });
+  else durRows.push({ label: 'Organización', value: organization, origin: o(S.origin) });
   if (S.contents) durRows.push({ label: 'Contenidos del documento', value: S.contents.covered === S.contents.total ? `Los ${S.contents.total} contenidos del documento están en el diseño, cada uno en un capítulo.` : `${S.contents.covered} de ${S.contents.total} contenidos del documento están en el diseño.` });
   st.push({ t: 'kv', rows: durRows });
   st.push({ t: 'modules', origin: o(S.origin), footnote: m.duration.format ? `Las prácticas y las Actividades de Aplicación no cuentan dentro del ${m.duration.format.value} (${m.duration.format.modules} × ${m.duration.format.chaptersPerModule}).` : 'Horas de trabajo del estudiante estimadas por Cursia para cada capítulo.',

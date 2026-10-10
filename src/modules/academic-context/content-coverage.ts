@@ -5,8 +5,9 @@
 //   { version: 1, contextVersion, chapters: { [chapterId]: [contentId, …] }, at }.
 // La cobertura se calcula contra la estructura VIVA: un capítulo borrado deja sus contenidos sin cubrir (nunca en
 // silencio: Verificación lo marca como crítico y la propuesta no se puede preparar), un contenido en dos capítulos es
-// un duplicado, y un mapa de otra versión del documento queda «desactualizado». Mover o renombrar un capítulo no cambia
-// nada (el id se conserva). Funciones puras salvo leer y escribir el mapa.
+// un duplicado, y un mapa armado con OTROS contenidos (el documento cambió sus contenidos) queda «desactualizado». Una
+// versión nueva del contexto que no toca los contenidos (p. ej. confirmar los resultados) no lo desactualiza. Mover o
+// renombrar un capítulo no cambia nada (el id se conserva). Funciones puras salvo leer y escribir el mapa.
 
 import type { AcademicContextV1 } from './academic-context';
 
@@ -54,9 +55,19 @@ export function documentContents(ctx: AcademicContextV1): CoverageItem[] {
   return ctx.units.filter((u) => u.contents.length > 0).flatMap((u) => u.contents.map((c) => ({ id: c.id, text: c.text, unit: u.title })));
 }
 
+/** ¿El mapa se armó con otros contenidos del documento? (todos los contenidos quedaron en el mapa al aplicar). */
+export function contentMapIsStale(ctx: AcademicContextV1, map: ContentMap): boolean {
+  const now = new Set(documentContents(ctx).map((c) => c.id));
+  const known = new Set(Object.values(map.chapters).flat());
+  if (now.size !== known.size) return true;
+  for (const id of now) if (!known.has(id)) return true;
+  return false;
+}
+
 export function contentCoverage(ctx: AcademicContextV1, contextVersion: number, map: ContentMap | null, liveChapterIds: string[]): ContentCoverage {
   const contents = documentContents(ctx);
   if (!map) return { available: false, stale: false, total: contents.length, covered: 0, omitted: [], duplicated: [] };
+  void contextVersion; // la versión queda registrada en el mapa; la vigencia la deciden los contenidos
   const live = new Set(liveChapterIds);
   const count = new Map<string, number>();
   for (const [chapterId, ids] of Object.entries(map.chapters)) {
@@ -65,7 +76,7 @@ export function contentCoverage(ctx: AcademicContextV1, contextVersion: number, 
   }
   const omitted = contents.filter((c) => !count.get(c.id));
   const duplicated = contents.filter((c) => (count.get(c.id) || 0) > 1).map((c) => ({ ...c, chapters: count.get(c.id)! }));
-  return { available: true, stale: map.contextVersion !== contextVersion, total: contents.length, covered: contents.length - omitted.length, omitted, duplicated };
+  return { available: true, stale: contentMapIsStale(ctx, map), total: contents.length, covered: contents.length - omitted.length, omitted, duplicated };
 }
 
 type Q = { query: (sql: string, params?: unknown[]) => Promise<any> };

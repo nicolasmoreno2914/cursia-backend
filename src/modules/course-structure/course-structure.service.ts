@@ -97,6 +97,7 @@ import {
 } from './structure-authority';
 import { proposeShapedStructureFromContext, proposeStructureFromContext } from '../academic-context/context-design';
 import { writeContentMap } from '../academic-context/content-coverage';
+import { COURSE_FORMATS, readCourseFormat, writeCourseFormat } from '../prebrief/course-formats';
 import { validateAcademicContext } from '../academic-context/validate';
 import { ApplyAcademicStructureDto, RecordStructureOriginDto } from './dto/apply-academic-structure.dto';
 import { activityTypeRulesForNextManifest, blueprintSchemaVersionForRules, readActivityTypeRulesConfig, readConfiguredRulesVersion } from '../generation-manifests/manifest-rules-config';
@@ -425,6 +426,25 @@ export class CourseStructureService implements OnModuleInit {
         await queryRunner.rollbackTransaction();
         throw new BadRequestException({ code: 'CONTEXT_HAS_ERRORS', message: 'CONTEXT_HAS_ERRORS: el contexto académico tiene errores; corrígelos antes de usar su estructura.' });
       }
+      // Fase 2 (review I3): la elección y la forma son coherentes. «Según el documento» usa la forma del documento; las
+      // demás llevan su forma; «formato» exige el formato guardado con esa misma forma (si no, la diferencia con el
+      // documento se le atribuiría a Cursia en vez de ser la excepción de la institución).
+      if (dto.choice === 'document' && dto.shape) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'INVALID_CHOICE', message: 'INVALID_CHOICE: «Según el documento» usa la estructura del documento (sin forma).' });
+      }
+      if (dto.choice && dto.choice !== 'document' && !dto.shape) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'INVALID_CHOICE', message: 'INVALID_CHOICE: esta opción necesita la forma elegida (módulos y capítulos por módulo).' });
+      }
+      if (dto.choice === 'format') {
+        const fmt = await readCourseFormat(queryRunner, courseId);
+        const def = fmt ? COURSE_FORMATS[fmt.code] : null;
+        if (!def || def.modules !== dto.shape!.modules || def.chaptersPerModule !== dto.shape!.chaptersPerModule) {
+          await queryRunner.rollbackTransaction();
+          throw new BadRequestException({ code: 'FORMAT_CHOICE_MISMATCH', message: 'FORMAT_CHOICE_MISMATCH: guarda primero el formato elegido; la forma debe ser la del formato.' });
+        }
+      }
       // Fase 3: con una forma elegida, los contenidos del documento se reparten en ella (cada uno en un solo capítulo).
       const proposal = dto.shape ? proposeShapedStructureFromContext(academic.context, dto.shape) : proposeStructureFromContext(academic.context);
       if (!proposal.available) {
@@ -556,6 +576,8 @@ export class CourseStructureService implements OnModuleInit {
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
       await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) });
       await writeContentMap(queryRunner, courseId, { version: 1, contextVersion: academic.version, chapters: contentMap, at: new Date().toISOString() });
+      // Un formato es una alternativa: elegir otra opción lo quita (nunca queda un formato junto a otra elección).
+      if (dto.choice && dto.choice !== 'format') await writeCourseFormat(queryRunner, courseId, null);
       const structure = await this.readStructure(queryRunner, courseId, ownerId);
       await queryRunner.commitTransaction();
       return {
@@ -585,8 +607,11 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.connect();
       await queryRunner.startTransaction();
       const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
-      const origin: StructureOrigin = { source: dto.source, counter: lock.counter, contextVersion: null, at: new Date().toISOString() };
+      const origin: StructureOrigin = { source: dto.source, counter: lock.counter, contextVersion: null, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) };
       await writeStructureOrigin(queryRunner, courseId, origin);
+      // Review I2: una estructura propuesta por la IA no sale de los contenidos del documento: la trazabilidad anterior
+      // ya no describe estos capítulos (si quedara, marcaría «Contenido no cubierto» sobre una estructura que no lo promete).
+      await writeContentMap(queryRunner, courseId, null);
       await queryRunner.commitTransaction();
       return { structureVersionCounter: lock.counter, structureOrigin: origin };
     } catch (err) {
