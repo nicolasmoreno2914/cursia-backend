@@ -283,7 +283,38 @@ export async function requirementConstraintsForCourse(
   q: Q, courseId: number, contextDocs: { sha256: string }[], savedPrefs: Record<string, unknown> | null | undefined, decisions?: DecisionOverrides,
 ): Promise<DistributorRequirementConstraints | null> {
   const a = await loadRequirementAuthority(q, courseId, contextDocs);
-  return constraintsFor(a.required, teacherDecisions(a, savedPrefs, decisions), { structureByTeacher: await structureEditedByTeacher(q, courseId) });
+  const c = constraintsFor(a.required, teacherDecisions(a, savedPrefs, decisions), { structureByTeacher: await structureEditedByTeacher(q, courseId) });
+  return capToChosenShape(c, await chosenContentCap(q, courseId));
+}
+
+/**
+ * Fase 2/4 · «Cursia recomienda» diseña DENTRO de la forma elegida en «¿Cómo quieres estructurar tu curso?»: no agrega
+ * capítulos de contenido (las prácticas y las Actividades de Aplicación no cuentan dentro de la forma). Devuelve el
+ * máximo de capítulos de contenido por módulo de la estructura vigente, o null si la forma no se eligió en ese paso.
+ */
+export async function chosenContentCap(q: Q, courseId: number): Promise<number | null> {
+  const origin = await readStructureOrigin(q as any, courseId);
+  if (!origin || !origin.choice) return null;
+  const res = await q.query(
+    `select count(c.id) filter (where coalesce(to_jsonb(c) ->> 'chapter_kind', 'content') <> 'practice')::int as n
+       from public.course_modules m left join public.course_chapters c on c.module_id = m.id where m.course_id = $1 group by m.id`,
+    [courseId],
+  );
+  const rows: any[] = Array.isArray(res) ? res : (res && res.rows) || [];
+  const cap = rows.reduce((mx, r) => Math.max(mx, Number(r.n) || 0), 0);
+  return cap > 0 ? cap : null;
+}
+
+/** La decisión de la institución acota el máximo de capítulos de contenido (un mínimo del documento por encima se deja: es su excepción). */
+export function capToChosenShape(c: DistributorRequirementConstraints | null, cap: number | null): DistributorRequirementConstraints | null {
+  if (cap === null) return c;
+  const out: DistributorRequirementConstraints = c ? { ...c, sources: { ...c.sources } } : { sources: {} };
+  const prev = out.contentChaptersPerModule;
+  out.contentChaptersPerModule = {
+    ...(prev && prev.min !== undefined && prev.min <= cap ? { min: prev.min } : {}),
+    max: Math.min(cap, prev && prev.max !== undefined ? prev.max : cap),
+  };
+  return out;
 }
 
 /**

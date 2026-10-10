@@ -96,7 +96,7 @@ import {
   liveStructureShape,
 } from './structure-authority';
 import { proposeShapedStructureFromContext, proposeStructureFromContext } from '../academic-context/context-design';
-import { writeContentMap } from '../academic-context/content-coverage';
+import { contentsFingerprint, writeContentMap } from '../academic-context/content-coverage';
 import { COURSE_FORMATS, readCourseFormat, writeCourseFormat } from '../prebrief/course-formats';
 import { validateAcademicContext } from '../academic-context/validate';
 import { ApplyAcademicStructureDto, RecordStructureOriginDto } from './dto/apply-academic-structure.dto';
@@ -575,7 +575,7 @@ export class CourseStructureService implements OnModuleInit {
       ));
       const newCounter = this.counterOrThrow(cr?.structure_version_counter, courseId);
       await writeStructureOrigin(queryRunner, courseId, { source: 'academic_context', counter: newCounter, contextVersion: academic.version, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) });
-      await writeContentMap(queryRunner, courseId, { version: 1, contextVersion: academic.version, chapters: contentMap, at: new Date().toISOString() });
+      await writeContentMap(queryRunner, courseId, { version: 1, contextVersion: academic.version, chapters: contentMap, contentsSha: contentsFingerprint(academic.context), at: new Date().toISOString() });
       // Un formato es una alternativa: elegir otra opción lo quita (nunca queda un formato junto a otra elección).
       if (dto.choice && dto.choice !== 'format') await writeCourseFormat(queryRunner, courseId, null);
       const structure = await this.readStructure(queryRunner, courseId, ownerId);
@@ -607,6 +607,12 @@ export class CourseStructureService implements OnModuleInit {
       await queryRunner.connect();
       await queryRunner.startTransaction();
       const lock = await this.lockAndVerifyEx(queryRunner, courseId, ownerId, dto.expectedCounter);
+      // Review FE-m3: misma coherencia que apply: «formato» exige un formato guardado; otra elección lo quita.
+      if (dto.choice === 'format' && !(await readCourseFormat(queryRunner, courseId))) {
+        await queryRunner.rollbackTransaction();
+        throw new BadRequestException({ code: 'FORMAT_CHOICE_MISMATCH', message: 'FORMAT_CHOICE_MISMATCH: guarda primero el formato elegido.' });
+      }
+      if (dto.choice && dto.choice !== 'format') await writeCourseFormat(queryRunner, courseId, null);
       const origin: StructureOrigin = { source: dto.source, counter: lock.counter, contextVersion: null, at: new Date().toISOString(), ...(dto.choice ? { choice: dto.choice } : {}) };
       await writeStructureOrigin(queryRunner, courseId, origin);
       // Review I2: una estructura propuesta por la IA no sale de los contenidos del documento: la trazabilidad anterior

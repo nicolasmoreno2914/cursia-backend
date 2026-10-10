@@ -343,7 +343,10 @@ export class CourseDesignService {
         }
         const teacherStructureOff = structureByTeacher && reqChecks.some((c) => c.status === 'unmet' && c.chosenBy === 'teacher'
           && ['modules', 'chapters', 'structure'].includes((auth.applicable.find((r) => r.id === c.requirementId) || { kind: '' }).kind));
-        clashCause = !persists || teacherStructureOff ? 'teacher' : 'document';
+        // Fase 2/4: con una forma elegida por la institución en «Estructura» (personalizada o formato), Cursia no agrega
+        // capítulos de contenido; si las horas no caben en esa forma, es la excepción de la institución (con su motivo).
+        const chosenShape = !!(origin && origin.choice && origin.choice !== 'document' && origin.choice !== 'cursia');
+        clashCause = !persists || teacherStructureOff || chosenShape ? 'teacher' : 'document';
       }
       requirementChecks = requirementVerificationChecks(auth.applicable, reqChecks, {
         clashCause, structureByTeacher, clashWith,

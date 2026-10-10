@@ -2690,7 +2690,7 @@ function reservationBookkeeping(ev) {
       ok(cr.status === 201, T('curso dinámico creado'), { s: cr.status, e: cr.error });
       const courseId = Number(cr.data.id);
       await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
-      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos' };
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro' };
       ok((await api('PUT', `/courses/${courseId}/brief`, brief)).status === 200, T('pedido guardado'));
       const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
       ok(ex.status === 200 && ex.data.stats.providersCalled === 0, T('documento leído (0 proveedores)'), { s: ex.status, e: ex.error });
@@ -2878,7 +2878,8 @@ function reservationBookkeeping(ev) {
       const rec = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
       const exc = rec.verification.checks.filter((c) => /^Excepción al requisito del documento/.test(c.title)).map((c) => c.title);
       ok(exc.some((t) => /4 módulos/.test(t)), T('verificación: «Excepción al requisito del documento: 4 módulos» (decisión de la institución, no un conflicto)'), rec.verification.checks.filter((c) => c.severity !== 'ok').map((c) => `${c.severity} ${c.title}`));
-      ok(!rec.verification.checks.some((c) => c.severity === 'critical' && /m[oó]dulos|cap[ií]tulos/.test(c.title)), T('sin críticos de estructura (no bloquea automáticamente)'));
+      ok(!rec.verification.checks.some((c) => c.severity === 'critical' && /m[oó]dulos|cap[ií]tulos/.test(c.title)), T('sin críticos de estructura (no bloquea automáticamente)'),
+        rec.verification.checks.filter((c) => c.severity === 'critical').map((c) => ({ id: c.id, title: c.title, detail: c.detail })));
       ok(rec.verification.checks.find((c) => c.id === 'contents').severity === 'ok', T('los 20 contenidos siguen cubiertos en 3 × 4'));
       const pb = (await api('GET', `/courses/${courseId}/prebrief`)).data;
       ok(pb.draft.readiness.blockers.some((b) => b.code === 'exception_reason' && /4 módulos/.test(b.title)), T('la propuesta pide el motivo de la excepción antes de aprobar'), pb.draft.readiness.blockers.map((b) => b.title));

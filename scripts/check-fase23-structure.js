@@ -129,6 +129,14 @@ const assignedIds = (p) => p.modules.flatMap((m) => m.chapters.flatMap((c) => c.
     fewer.units.find((u) => u.contents.some((c) => c.id === firstId)).contents = fewer.units.find((u) => u.contents.some((c) => c.id === firstId)).contents.filter((c) => c.id !== firstId);
     eq(CC.contentCoverage(fewer, 4, map, liveAll).stale, true, 'el documento cambió sus contenidos: desactualizado');
     eq(CC.contentMapIsStale(costos, map), false, 'mismos contenidos');
+    // Review FE-I1: los ids son posicionales; otro documento con la misma forma (otros textos) también desactualiza.
+    const sha = CC.contentsFingerprint(costos);
+    const other = JSON.parse(JSON.stringify(costos)); other.units[0].contents[0].text = 'Otro contenido distinto';
+    eq([CC.contentMapIsStale(costos, { ...map, contentsSha: sha }), CC.contentMapIsStale(other, { ...map, contentsSha: sha })], [false, true], 'huella id + texto');
+    eq(CC.parseContentMap({ ...map, contentsSha: sha }).contentsSha, sha, 'la huella se lee de la base');
+    const tenMods = reqsOf(Buffer.from('El curso tendrá exactamente 10 módulos.'), 'text/plain');
+    const r10 = SO.recommendShape(tenMods, [3, 3, 3, 3, 3], null);
+    eq([r10.modules, r10.chaptersPerModule], [10, 1], '10 módulos exigidos, 15 contenidos: nunca más capítulos que contenidos');
     eq(CC.contentCoverage(costos, 3, null, liveAll).available, false, 'sin trazabilidad');
     eq(CC.parseContentMap(JSON.stringify(map)).chapters.ch0, chapters.ch0, 'el mapa se lee de la base');
   });
@@ -170,6 +178,16 @@ const assignedIds = (p) => p.modules.flatMap((m) => m.chapters.flatMap((c) => c.
     });
     eq(await RA.structureEditedByTeacher(fakeQ({ source: 'academic_context', counter: 7, contextVersion: 2, at: 't', shape: [4, 4, 4], choice: 'custom' }, 7, [4, 4, 4]), 1), true, 'personalizada');
     eq(await RA.structureEditedByTeacher(fakeQ({ source: 'academic_context', counter: 7, contextVersion: 2, at: 't', shape: [2, 2], choice: 'document' }, 7, [2, 2]), 1), false, 'según el documento (intacta)');
+  });
+
+  await check('ST8 «Cursia recomienda» diseña dentro de la forma elegida: sin capítulos de contenido nuevos (prácticas sí)', async () => {
+    eq(RA.capToChosenShape(null, null), null, 'sin forma elegida: sin cambios');
+    eq(RA.capToChosenShape(null, 4).contentChaptersPerModule, { max: 4 }, 'tope = la forma elegida');
+    eq(RA.capToChosenShape({ sources: {}, contentChaptersPerModule: { min: 5, max: 6 } }, 4).contentChaptersPerModule, { max: 4 }, 'un mínimo del documento por encima es la excepción de la institución');
+    eq(RA.capToChosenShape({ sources: {}, contentChaptersPerModule: { min: 2, max: 3 } }, 4).contentChaptersPerModule, { min: 2, max: 3 }, 'un máximo del documento menor se respeta');
+    const fq = (choice, ns) => ({ query: async (sql) => /structureOrigin/.test(sql) ? [{ o: choice ? { source: 'academic_context', counter: 1, contextVersion: 1, at: 't', choice } : null }] : ns.map((n) => ({ n })) });
+    eq(await RA.chosenContentCap(fq('custom', [4, 3, 4]), 1), 4, 'personalizada 3 × 4 (con un capítulo borrado): tope 4');
+    eq(await RA.chosenContentCap(fq(null, [4, 4]), 1), null, 'sin elección en «Estructura»: como siempre');
   });
 
   console.log(`\n${ok} OK · ${fail} fallas`);

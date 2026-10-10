@@ -185,7 +185,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   if (m.duration.targetHours) durRows.push({ label: 'Meta de horas', value: hoursText(m.duration.targetHours.value), origin: o(m.duration.targetHours.origin) });
   durRows.push({ label: 'Horas del diseño', value: `${hoursText(S.totals.hours)} de trabajo del estudiante (estimadas)` });
   // Fase 2/3: con una forma elegida en «Estructura», la fila dice también quién la eligió (en lugar de «Organización»).
-  if (S.selected) durRows.push({ label: 'Diseño seleccionado', value: `${organization} · ${S.selected.label}` });
+  if (S.selected) durRows.push({ label: 'Diseño seleccionado', value: `${organization} · ${S.selected.label}`, origin: o(S.origin) });
   else durRows.push({ label: 'Organización', value: organization, origin: o(S.origin) });
   if (S.contents) durRows.push({ label: 'Contenidos del documento', value: S.contents.covered === S.contents.total ? `Los ${S.contents.total} contenidos del documento están en el diseño, cada uno en un capítulo.` : `${S.contents.covered} de ${S.contents.total} contenidos del documento están en el diseño.` });
   st.push({ t: 'kv', rows: durRows });

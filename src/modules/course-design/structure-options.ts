@@ -97,10 +97,11 @@ export function recommendShape(required: DocumentRequirement[], documentShape: n
   if (reqModules && reqChapters) return { modules: reqModules, chaptersPerModule: reqChapters, reason: 'Es la estructura que exige el documento.' };
   if (documentShape && documentShape.length) {
     // Hacia abajo: nunca más capítulos que contenidos (Cursia no inventa capítulos de «profundización» al recomendar).
-    const per = Math.max(1, Math.floor(documentShape.reduce((a, b) => a + b, 0) / documentShape.length));
+    const modules = reqModules ?? documentShape.length;
+    const per = Math.max(1, Math.floor(documentShape.reduce((a, b) => a + b, 0) / modules));
     return {
-      modules: reqModules ?? documentShape.length,
-      chaptersPerModule: reqChapters ?? (documentShape.every((n) => n === documentShape[0]) ? documentShape[0] : per),
+      modules,
+      chaptersPerModule: reqChapters ?? (modules === documentShape.length && documentShape.every((n) => n === documentShape[0]) ? documentShape[0] : per),
       reason: `Sigue la organización del documento: un módulo por unidad (${plural(documentShape.length, 'unidad', 'unidades')}).`,
     };
   }

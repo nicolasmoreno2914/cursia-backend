@@ -9,6 +9,7 @@
 // versión nueva del contexto que no toca los contenidos (p. ej. confirmar los resultados) no lo desactualiza. Mover o
 // renombrar un capítulo no cambia nada (el id se conserva). Funciones puras salvo leer y escribir el mapa.
 
+import { createHash } from 'crypto';
 import type { AcademicContextV1 } from './academic-context';
 
 export const CONTENT_MAP_KEY = 'contentMap';
@@ -19,6 +20,8 @@ export interface ContentMap {
   contextVersion: number;
   /** Capítulo → contenidos del documento que trabaja. */
   chapters: Record<string, string[]>;
+  /** Huella de los contenidos (id + texto) con los que se armó: los ids son posicionales (U1.1…), el texto distingue. */
+  contentsSha?: string;
   at: string;
 }
 
@@ -43,7 +46,7 @@ export function parseContentMap(v: unknown): ContentMap | null {
   for (const [k, ids] of Object.entries(o.chapters as Record<string, unknown>)) {
     if (Array.isArray(ids)) chapters[k] = ids.filter((x): x is string => typeof x === 'string');
   }
-  return { version: 1, contextVersion: o.contextVersion, chapters, at: typeof o.at === 'string' ? o.at : '' };
+  return { version: 1, contextVersion: o.contextVersion, chapters, ...(typeof o.contentsSha === 'string' ? { contentsSha: o.contentsSha } : {}), at: typeof o.at === 'string' ? o.at : '' };
 }
 
 function safeJson(s: string): unknown {
@@ -55,8 +58,15 @@ export function documentContents(ctx: AcademicContextV1): CoverageItem[] {
   return ctx.units.filter((u) => u.contents.length > 0).flatMap((u) => u.contents.map((c) => ({ id: c.id, text: c.text, unit: u.title })));
 }
 
-/** ¿El mapa se armó con otros contenidos del documento? (todos los contenidos quedaron en el mapa al aplicar). */
+/** Huella de los contenidos del documento (id, unidad y texto, en orden). */
+export function contentsFingerprint(ctx: AcademicContextV1): string {
+  const norm = (s: string) => String(s || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+  return createHash('sha256').update(JSON.stringify(documentContents(ctx).map((c) => [c.id, norm(c.unit), norm(c.text)]))).digest('hex');
+}
+
+/** ¿El mapa se armó con otros contenidos del documento? (mismos ids con otros textos también cuenta). */
 export function contentMapIsStale(ctx: AcademicContextV1, map: ContentMap): boolean {
+  if (map.contentsSha) return map.contentsSha !== contentsFingerprint(ctx);
   const now = new Set(documentContents(ctx).map((c) => c.id));
   const known = new Set(Object.values(map.chapters).flat());
   if (now.size !== known.size) return true;
