@@ -206,7 +206,9 @@ export const rangeMidpoint = (min: number, max: number) => Math.round(((min + ma
 export function hoursSpanOf(text: string): { value: number; min?: number; max?: number; raw: string } | null {
   const r = HOURS_RANGE_RE.exec(text);
   // «Semana 1 a 4 h», «Módulo 2 - 12 h»: el primer número es un ordinal (semana, módulo…), no el inicio de un rango.
-  if (r && /\b(semanas?|m[oó]dulos?|unidad(?:es)?|cap[ií]tulos?|sesi[oó]n(?:es)?|temas?|niveles?|corte)\s*$/i.test(text.slice(0, r.index))) {
+  // Solo si la palabra va PEGADA al número y no es «por módulo» / «cada módulo» («Horas por módulo 13–15 h» es un rango).
+  const before = text.slice(0, r ? r.index : 0);
+  if (r && /\b(semanas?|m[oó]dulos?|unidad(?:es)?|cap[ií]tulos?|sesi[oó]n(?:es)?|temas?|niveles?|corte)\s?$/i.test(before) && !/\b(por|cada|de cada|en cada)\s+\S+\s?$/i.test(before) && !/\b(m[oó]dulos|unidades|cap[ií]tulos|semanas|sesiones|temas|niveles)\s?$/i.test(before)) {
     const one = HOURS_RE.exec(text.slice(r.index + r[0].search(/(?:-|–|—|a|al|hasta)\s*\d/)));
     return one ? { value: num(one[1]), raw: one[0] } : null;
   }

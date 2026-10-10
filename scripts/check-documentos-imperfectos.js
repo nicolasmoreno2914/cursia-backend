@@ -143,6 +143,8 @@ const contentsOf = (ctx) => ctx.units.map((u) => [u.title, u.contents.map((c) =>
       eq([s && s.min, s && s.max, s && s.value], [40, 44, 42], `«${t}»`);
     }
     eq(E.hoursSpanOf('48 horas'), { value: 48, raw: '48 horas' }, 'un número sigue siendo un número');
+    eq([E.hoursSpanOf('Horas por módulo 13–15 h').min, E.hoursSpanOf('Cada módulo 13–15 h').max], [13, 15], 'por/cada módulo: rango');
+    eq(E.hoursSpanOf('Semana 1 a 4 h').value, 4, '«Semana 1 a 4 h»: el 1 es la semana');
     const ctxOf = async (line) => (await read('h.txt', txt(['Asignatura: Curso', `Intensidad horaria total: ${line}`]))).context.hours.total;
     const r1 = await ctxOf('40–44 horas');
     eq([r1.value, r1.range, r1.status], [42, { min: 40, max: 44 }, 'inferred'], 'contexto: rango con meta en el punto medio');

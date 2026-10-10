@@ -500,11 +500,8 @@ async function dbChecks() {
       const cid = await courseWith('Sin estructura exigida', [1, 1], 'La intensidad horaria total será de 120 horas.');
       const card = await design.recommend(cid, OWNER, {});
       const hc = reqCheck(card, 'target_hours');
-      if (card.design.status === 'cannot_reach_target') {
-        assert(!/Requisito no cubierto por Cursia/.test(hc.title) && !hc.capability, 'el documento no fija la estructura: ' + hc.title);
-      } else {
-        assert(!hc.capability, 'sin capacidad si llega: ' + hc.title);
-      }
+      eq(card.design.status, 'cannot_reach_target', 'el caso de la prueba: no llega');
+      assert(!/Requisito no cubierto por Cursia/.test(hc.title) && !hc.capability, 'el documento no fija la estructura: ' + hc.title);
     });
 
     await check('RC17 re-review final L86C IMPORTANTE-A: sin lectura de requisitos, el «Más video» del docente no se confunde con uno viejo de Cursia', async () => {
