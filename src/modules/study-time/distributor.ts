@@ -131,6 +131,8 @@ export interface DistributionResult {
   priorityTrace: string[];
   /** Meta fuera de alcance con la forma fija: lo que daría la capacidad que el documento limita (no se aplica sola). */
   hoursAlternative?: HoursAlternative;
+  /** Meta fuera de alcance con la forma fija: las Actividades las limita el documento (true) o los topes de Cursia (false). */
+  applicationLimitedByDocument?: boolean;
   counts: {
     modules: number;
     chapters: number;
@@ -256,28 +258,39 @@ export function proposedTitle(prefix: string, moduleTitle: string): string {
  * Solo informa: aplicarlo se aparta de las cantidades del documento y lo decide la institución.
  */
 export interface HoursAlternative {
+  /** Capítulos de contenido que llevarían la Actividad (todos los que el docente no fijó). */
   contentChapters: number;
   tier: number;
   hours: number;
   reaches: boolean;
+  /** Actividades de Aplicación que se suman (neto) respecto del diseño actual. */
+  added: number;
 }
 
 export function distributeCourseHours(input: DistributorInput): DistributionResult {
   const d = distributeCore(input);
-  if (d.status !== 'cannot_reach_target' || !input.requirements?.noContentAdditions || input.preferences?.applicationActivities === 'none') return d;
-  const free = d.modules.flatMap((m) => m.chapters.filter((c) => c.kind === 'content' && !c.applicationMinutes && !c.applicationPinned && !c.proposed));
-  if (!free.length) return d;
+  if (d.status !== 'cannot_reach_target' || !input.requirements?.noContentAdditions) return d;
+  const rq = input.requirements;
+  // Qué frena las Actividades: el documento (cuántas y dónde) o los topes propios de Cursia (proporción, 4 h por capítulo).
+  const byDocument = !!rq.applicationInPractice || rq.applicationPerModule?.max !== undefined || rq.applicationTotal?.max !== undefined;
+  const out: DistributionResult = { ...d, applicationLimitedByDocument: byDocument };
+  // «Ninguna» o «Solo en prácticas» los eligió el docente: Cursia no propone pasar por encima de esa decisión.
+  const mode = input.preferences?.applicationActivities;
+  if (mode === 'none' || mode === 'practice_only') return out;
+  // Todos los capítulos de contenido que el docente no fijó (también los que ya tienen una Actividad de Cursia).
+  const target = d.modules.flatMap((m) => m.chapters.filter((c) => c.kind === 'content' && !c.applicationPinned && !c.proposed));
+  if (!target.length) return out;
   const tiers = (STUDY_TIME_RULES.applicationActivityTiers as readonly number[]).filter((t) => t <= DISTRIBUTOR_RULES.applicationFirst.contentTierMax);
   let alt: HoursAlternative | null = null;
   for (const tier of tiers) {
     const pins: Record<string, DesignPins[string]> = { ...(input.pins ?? {}) };
-    for (const c of free) pins[c.id] = { ...(pins[c.id] || {}), application: tier };
+    for (const c of target) pins[c.id] = { ...(pins[c.id] || {}), application: tier };
     const r = distributeCore({ ...input, pins });
-    const reaches = r.status === 'within_tolerance' || r.status === 'above_tolerance';
-    alt = { contentChapters: free.length, tier, hours: r.estimatedHours, reaches };
+    const reaches = r.status !== 'cannot_reach_target';
+    alt = { contentChapters: target.length, tier, hours: r.estimatedHours, reaches, added: r.counts.applicationActivities - d.counts.applicationActivities };
     if (reaches) break;
   }
-  return alt ? { ...d, hoursAlternative: alt } : d;
+  return alt && alt.added > 0 ? { ...out, hoursAlternative: alt } : out;
 }
 
 function distributeCore(input: DistributorInput): DistributionResult {
