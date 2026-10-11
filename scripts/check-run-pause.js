@@ -392,6 +392,28 @@ async function dbChecks() {
       assert(row.output_summary.pause.resumedAt && row.output_summary.pause.resumedBy === OWNER, 'registro');
     });
 
+    await check('DB (review I1): con el run PAUSADO, el guard del servidor niega todo envío pagado NUEVO (run_paused) aunque un worker ya tuviera la parte; al reanudar, vuelve a la política de presupuesto normal', async () => {
+      const [vid] = await ds.query(`select id from public.generation_item_runs where job_id = $1 and type = 'video' limit 1`, [C.runId]);
+      assert(vid, 'hay un item de video');
+      await pause();
+      const g = await budget.guardPaidSubmission({ runId: C.runId, itemRunId: vid.id, itemType: 'video' });
+      eq([g.allow, g.reason], [false, F.RUN_PAUSED_GUARD_REASON], 'pausado → run_paused');
+      await resume();
+      const g2 = await budget.guardPaidSubmission({ runId: C.runId, itemRunId: vid.id, itemType: 'video' });
+      assert(g2.reason !== F.RUN_PAUSED_GUARD_REASON, 'reanudado → guard normal: ' + g2.reason);
+    });
+
+    await check('DB (review I3): reanudar un run pausado cuyas partes restantes ya FALLARON → queda terminal con fallas (no despachable, no pausado), nunca colgado en queued', async () => {
+      const E = await makeCourse('Pausa con fallas');
+      await runs.pauseRun(E.cid, OWNER, 1, E.runId);
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'x', finished_at = now() where job_id = $1 and item_key = any($2::text[])`, [E.runId, E.keys]);
+      const dto = await runs.resumeRun(E.cid, OWNER, 1, E.runId);
+      const row = await runRow(E.runId);
+      assert(!dto.paused && !IT.DISPATCHABLE_RUN_WORKER_STATUSES.includes(row.worker_status), 'terminal: ' + row.worker_status);
+      eq(row.worker_status, 'failed', 'muestra las partes fallidas para reintentarlas a mano');
+      assert(row.output_summary.pause.resumedAt, 'registro del reanudar');
+    });
+
     await check('DB: cancelar desde pausado funciona (pausar → cancelar → cancelled; nadie reclama)', async () => {
       await pause();
       await runs.cancelRun(C.cid, OWNER, 1, C.runId);

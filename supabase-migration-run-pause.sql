@@ -7,6 +7,10 @@
 -- coexistir otro run del mismo Manifest mientras está pausado, así que el índice
 -- único de run activo pasa a contarlo.
 --
+-- PRERREQUISITO DE PRODUCCIÓN: deploy-staging.yml la aplica solo en staging; antes de llevar la pausa a
+-- producción hay que correr esta migración allí (sin ella, un run pausado no cuenta en el índice único y
+-- podría arrancar un segundo run del mismo Manifest).
+--
 -- Idempotente: solo recrea el índice si su predicado todavía no incluye 'paused'.
 -- Rollback (si hiciera falta):
 --   drop index if exists public.uq_dynamic_generation_active_run;
