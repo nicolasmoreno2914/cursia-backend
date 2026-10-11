@@ -78,6 +78,8 @@ env $STG node "$REPO/scripts/verify-v21-finops-schema.js" > "$OUT/verify-v21-fin
 # REL R2: log de intentos + columnas de recuperación por item (después del ledger: la vista de costo lo lee).
 env $STG node "$REPO/scripts/migrate-rel-recovery.js" > "$OUT/migrate-rel-recovery.log" 2>&1 || { cat "$OUT/migrate-rel-recovery.log"; exit 9; }
 env $STG node "$REPO/scripts/verify-rel-recovery-schema.js" > "$OUT/verify-rel-recovery.log" 2>&1 || { cat "$OUT/verify-rel-recovery.log"; exit 9; }
+# Loop 4: latido de presencia de los workers de IA.
+env $STG node "$REPO/scripts/migrate-llm-worker-presence.js" > "$OUT/migrate-llm-worker-presence.log" 2>&1 || { cat "$OUT/migrate-llm-worker-presence.log"; exit 9; }
 echo "schema + migraciones reales OK"
 
 echo "== Moodle 4.5 local =="

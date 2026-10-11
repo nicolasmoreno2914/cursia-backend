@@ -661,6 +661,9 @@ jobs:
                echo "━━━ [4h15] Pausa real de un run: índice único de run activo con paused (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-run-pause.js
 
+               echo "━━━ [4h16] Loop 4: presencia de los workers de IA (llm_worker_presence) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-llm-worker-presence.js
+
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
 
@@ -688,6 +691,9 @@ jobs:
                ensure_pm2_drain_worker cursia-dynamic-item-worker-staging dist/workers/dynamic-item-worker.js
                ensure_pm2_drain_worker cursia-dynamic-package-worker-staging dist/workers/dynamic-package-worker.js
                ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js
+               # Loop 4: el worker de IA (dist/workers/dynamic-llm-worker.js) NO se levanta todavía: un 12.º proceso supera el
+               # cupo de clientes del pooler de staging (15; ver check-db-pool-capacity). Activarlo es una decisión aparte
+               # (cupo del pooler + DYNAMIC_LLM_WORKER_ENABLED en API y worker), con aprobación del usuario.
                sudo pm2 save
                sudo pm2 status
 

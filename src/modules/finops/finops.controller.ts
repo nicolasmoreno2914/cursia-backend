@@ -253,6 +253,54 @@ export class FinopsAdminController {
     }
   }
 
+  // GET /api/v1/finops/llm-worker-reservations?courseId=&runId= — Loop 4: llamadas del worker de IA del backend cuyo
+  // resultado es desconocido (o quedó sin liquidar). Cuentan como gasto mientras tanto.
+  @Get('llm-worker-reservations')
+  async llmWorkerReservations(@Query('courseId') courseId?: string, @Query('runId') runId?: string) {
+    const f: { courseId?: number; runId?: string } = {};
+    if (courseId !== undefined) {
+      if (!/^\d{1,12}$/.test(courseId)) throw new BadRequestException('courseId inválido');
+      f.courseId = Number(courseId);
+    }
+    if (runId !== undefined) {
+      if (!UUID_RE.test(runId)) throw new BadRequestException('runId debe ser UUID');
+      f.runId = runId;
+    }
+    try {
+      return { reservations: await this.ledger.pendingLlmWorkerReservations(f) };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // POST /api/v1/finops/llm-worker-reservations/reconcile {reservationKey, outcome: 'charged'|'not_charged', reason}
+  // Decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. Repetir = no-op.
+  @Post('llm-worker-reservations/reconcile')
+  @HttpCode(HttpStatus.OK)
+  async reconcileLlmWorkerReservation(@Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
+    const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    for (const k of Object.keys(b)) if (!['reservationKey', 'outcome', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+    if (typeof b.reservationKey !== 'string' || !/^reservation:llm:[0-9a-f-]{36}:[A-Za-z0-9_.:-]{1,200}$/.test(b.reservationKey)) {
+      throw new BadRequestException('reservationKey inválida');
+    }
+    if (b.outcome !== 'charged' && b.outcome !== 'not_charged') throw new BadRequestException('outcome debe ser charged | not_charged');
+    if (typeof b.reason !== 'string' || !b.reason.trim() || b.reason.length > 500) throw new BadRequestException('reason es obligatorio (≤ 500)');
+    const decidedBy = String(user?.id || '');
+    if (!decidedBy) throw new BadRequestException('usuario sin id');
+    try {
+      const kind = await this.ledger.isLlmWorkerReservation(b.reservationKey);
+      if (kind === 'not_worker') throw new BadRequestException('no es una reserva del worker de IA');
+      if (kind === 'item_running') throw new ConflictException('la parte sigue en ejecución: la llamada puede liquidarse sola; conciliar cuando termine');
+      const r = b.outcome === 'charged'
+        ? await this.ledger.reconcileReservationAsCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } })
+        : await this.ledger.reconcileReservationAsNotCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } });
+      return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+    } catch (err) {
+      if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
+      throw finopsErrorToHttp(err);
+    }
+  }
+
   // POST /api/v1/finops/llm-proxy-reservations/:callId/reconcile {outcome: 'charged'|'not_charged', reason}
   // Decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. Repetir = no-op.
   @Post('llm-proxy-reservations/:callId/reconcile')

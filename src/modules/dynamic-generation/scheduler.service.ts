@@ -1,3 +1,4 @@
+import { browserEffectiveTypes, liveLlmWorkerTypes, llmWorkerEnabled } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
 import {
@@ -368,6 +369,8 @@ function sameJson(a: any, b: any): boolean {
  * de su `summary` antes de mezclar. Los workers internos del servidor (sin ownerId) no pasan por acá.
  */
 export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
+  // Loop 4: puntos de guardado y revisión de las partes del worker de IA.
+  'llmCheckpoints', 'llmPendingReview',
   'sourceVideoItemRunId', 'cascadeFromItemRunId', 'regeneration', 'invalidation',
   'upgradeId', 'videoUpgrade', 'videoUpgradeHistory', 'reusedVideogenJob', 'questionsOnly',
   'mode', 'videoMode', 'videoModeOriginal', 'external', 'externalReservationKey', 'externalSubmitStartedAt',
@@ -485,15 +488,19 @@ export class SchedulerService {
 
     if (opts.runId) {
       if (!UUID_RE.test(opts.runId)) throw new BadRequestException('runId inválido');
+      let claimTypes: ItemType[] = types;
       if (opts.ownerId !== undefined && opts.ownerId !== null) {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
         await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
         await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
+        // Loop 4: con el worker de IA habilitado Y vivo, las partes LARGAS que cubre las genera el servidor (no el navegador).
+        claimTypes = llmWorkerEnabled() ? browserEffectiveTypes(types, await liveLlmWorkerTypes(this.dataSource)) : types;
+        if (claimTypes.length === 0) return { item: null };
       }
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
       for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
-        const r = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
+        const r = await this.claimInRun(opts.runId, executorId, claimTypes, leaseSeconds, opts.ownerId);
         if (r.paused) return { item: null, reason: RUN_PAUSED_REASON };
         if (r.leasedElsewhere) return { item: null, reason: EXEC_LEASE_RUN_LEASED_ELSEWHERE, leaseExpiresAt: r.leasedElsewhere.expiresAt };
         if (r.item) return { item: r.item };

@@ -921,6 +921,56 @@ export class FinopsLedgerService {
   }
 
   /**
+   * Loop 4 (review I4): reservas del worker de IA del backend (`reservation:llm:<itemRunId>:…`, callTag `llmw-*`) que
+   * siguen PENDIENTES: resultado desconocido (el pedido salió y no volvió nada), worker caído en vuelo o respuesta
+   * cuya liquidación falló. Cuentan como gasto hasta que un SUPER_ADMIN las concilia contra la consola del proveedor.
+   */
+  async pendingLlmWorkerReservations(filter: { courseId?: number; runId?: string; limit?: number } = {}): Promise<Array<{
+    reservationKey: string; createdAt: string; ownerId: string | null; courseId: number | null; runId: string | null;
+    itemKey: string | null; model: string | null; amount: string; promptChars: number | null; maxTokens: number | null; callTag: string | null;
+  }>> {
+    // Re-review m2: solo con la parte FUERA de ejecución (sin llamada en vuelo que todavía pueda liquidarse sola).
+    const where: string[] = [`e.idempotency_key like 'reservation:llm:%'`, `(e.metadata->>'callTag') like 'llmw-%'`, `e.event_kind = 'CHARGE'`,
+      `(e.metadata->>'reservation') = 'true'`, `not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`,
+      `coalesce(i.status, '') <> 'running'`];
+    const params: unknown[] = [];
+    if (filter.courseId !== undefined) { params.push(filter.courseId); where.push(`e.course_id = $${params.length}`); }
+    if (filter.runId !== undefined) {
+      if (!UUID_RE.test(filter.runId)) throw new FinopsError('INVALID_INPUT', 'runId debe ser UUID');
+      params.push(filter.runId); where.push(`e.run_id = $${params.length}`);
+    }
+    params.push(Math.min(Math.max(Math.trunc(filter.limit ?? 200), 1), 1000));
+    const rows = await this.dataSource.query(
+      `select e.idempotency_key, e.created_at, e.owner_id, e.course_id, e.run_id, i.item_key, e.model_or_product, e.amount::text as amount, e.metadata
+         from public.generation_cost_events e left join public.generation_item_runs i on i.id = e.item_run_id
+        where ${where.join(' and ')} order by e.created_at limit $${params.length}`,
+      params,
+    );
+    return rows.map((r: any) => ({
+      reservationKey: r.idempotency_key,
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      ownerId: r.owner_id ?? null, courseId: r.course_id ?? null, runId: r.run_id ?? null, itemKey: r.item_key ?? null,
+      model: r.model_or_product ?? null, amount: r.amount,
+      promptChars: Number.isInteger(r.metadata?.promptChars) ? r.metadata.promptChars : null,
+      maxTokens: Number.isInteger(r.metadata?.maxTokens) ? r.metadata.maxTokens : null,
+      callTag: typeof r.metadata?.callTag === 'string' ? r.metadata.callTag : null,
+    }));
+  }
+
+  /** ¿Es una reserva del worker de IA, y su parte ya no está en ejecución? Solo esas se concilian por el endpoint del worker. */
+  async isLlmWorkerReservation(reservationKey: string): Promise<'ok' | 'not_worker' | 'item_running'> {
+    const [r] = await this.dataSource.query(
+      `select coalesce(i.status, '') as item_status from public.generation_cost_events e
+         left join public.generation_item_runs i on i.id = e.item_run_id
+        where e.idempotency_key = $1 and e.event_kind = 'CHARGE'
+          and (e.metadata->>'reservation') = 'true' and (e.metadata->>'callTag') like 'llmw-%'`,
+      [reservationKey],
+    );
+    if (!r) return 'not_worker';
+    return r.item_status === 'running' ? 'item_running' : 'ok';
+  }
+
+  /**
    * Cargos REALES (no mock) de un item run, con su intento: reservas (liquidadas o no)
    * y cargos finales. Un re-claim los usa para no volver a pagar una operación cuyo
    * resultado no quedó persistido (detección durable, no depende de la memoria del worker).
