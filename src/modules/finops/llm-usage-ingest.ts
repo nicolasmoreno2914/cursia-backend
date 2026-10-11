@@ -35,9 +35,18 @@ export interface LlmUsageIngestBody {
    * Ausente = cargo normal (de siempre).
    */
   measurement?: 'conservative' | 'correction';
+  /**
+   * Piloto #1209 (2026-10-11): id de la llamada que el proxy RESERVÓ antes de llamar a Anthropic
+   * (POST /finops/ingest/llm-reservation). Con callId, este usage LIQUIDA esa reserva (cargo exacto por
+   * messageId + reserva a 0, atómico). Sin reserva previa (proxy viejo / reserva fallida) es el cargo de siempre.
+   */
+  callId?: string | null;
 }
 
-const ALLOWED_KEYS = new Set(['subject', 'itemRunId', 'callRole', 'attempt', 'model', 'messageId', 'requestId', 'usage', 'billingAccount', 'mode', 'measurement']);
+const ALLOWED_KEYS = new Set(['subject', 'itemRunId', 'callRole', 'attempt', 'model', 'messageId', 'requestId', 'usage', 'billingAccount', 'mode', 'measurement', 'callId']);
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** Caracteres por token para la cota de la reserva (la misma que usan los workers: conservadora). */
+export const LLM_RESERVATION_CHARS_PER_TOKEN = 3;
 
 function bad(msg: string): never {
   throw new FinopsError('INVALID_INPUT', msg);
@@ -86,7 +95,122 @@ export function parseLlmUsageIngest(body: unknown): LlmUsageIngestBody {
   };
   const measurement = b.measurement ?? undefined;
   if (measurement !== undefined && measurement !== 'conservative' && measurement !== 'correction') bad('measurement debe ser conservative | correction');
-  return { subject, itemRunId, callRole, attempt: b.attempt, model, messageId, requestId, usage, billingAccount: b.billingAccount, mode, ...(measurement ? { measurement } : {}) };
+  const callId = b.callId === undefined || b.callId === null ? null : String(b.callId);
+  if (callId !== null && !UUID_RE.test(callId)) bad('callId debe ser un UUID');
+  // Review (minor 5): callId (liquida una reserva) y measurement (camino conservador/corrección) son excluyentes.
+  if (callId !== null && measurement !== undefined) bad('callId y measurement no se combinan');
+  return { subject, itemRunId, callRole, attempt: b.attempt, model, messageId, requestId, usage, billingAccount: b.billingAccount, mode,
+    ...(measurement ? { measurement } : {}), ...(callId ? { callId } : {}) };
+}
+
+// ─── Reserva ANTES de la llamada (proxy LLM del navegador) ────────────────────
+// Mismo protocolo que los workers (finops-worker-hooks reservePaidCall/settlePaidCall): reserva durable
+// (CHARGE `pending`, metadata.reservation) → llamada → liquidación atómica. Si la respuesta se pierde (524,
+// Worker terminado, el navegador se fue), la reserva QUEDA: cuenta en el presupuesto y aparece en las reservas
+// pendientes del panel de admin para conciliarla explícitamente (nunca se libera sola).
+
+export interface LlmReservationIngestBody {
+  subject: string;
+  itemRunId?: string | null;
+  callRole: CallRole;
+  attempt: number;
+  model: string;
+  callId: string;
+  /** Caracteres del pedido (system + mensajes): cota de los tokens de entrada. */
+  promptChars: number;
+  /** max_tokens del pedido: cota de la salida. */
+  maxTokens: number;
+  billingAccount: 'cursia' | 'user_key';
+  mode?: 'real' | 'mock';
+}
+
+const RESERVATION_KEYS = new Set(['subject', 'itemRunId', 'callRole', 'attempt', 'model', 'callId', 'promptChars', 'maxTokens', 'billingAccount', 'mode']);
+
+export function llmProxyReservationKey(callId: string): string {
+  return `reservation:llm-proxy:${callId}`;
+}
+
+export function parseLlmReservationIngest(body: unknown): LlmReservationIngestBody {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) bad('body debe ser un objeto JSON');
+  const b = body as Record<string, any>;
+  for (const k of Object.keys(b)) if (!RESERVATION_KEYS.has(k)) bad(`campo no permitido: ${k}`);
+  const str = (k: string, required: boolean): string | null => {
+    const v = b[k];
+    if (v === null || v === undefined || v === '') {
+      if (required) bad(`${k} es obligatorio`);
+      return null;
+    }
+    if (typeof v !== 'string' || v.length > 256 || /\s/.test(v)) bad(`${k} inválido`);
+    return v;
+  };
+  const subject = str('subject', true) as string;
+  const itemRunId = str('itemRunId', false);
+  const model = str('model', true) as string;
+  const callId = str('callId', true) as string;
+  if (!UUID_RE.test(callId)) bad('callId debe ser un UUID');
+  const callRole = b.callRole as CallRole;
+  if (!CALL_ROLES.includes(callRole)) bad(`callRole inválido: ${String(b.callRole)}`);
+  if (typeof b.attempt !== 'number' || !Number.isInteger(b.attempt) || b.attempt < 1) bad('attempt debe ser entero >= 1');
+  if (typeof b.promptChars !== 'number' || !Number.isInteger(b.promptChars) || b.promptChars < 0) bad('promptChars debe ser entero >= 0');
+  if (typeof b.maxTokens !== 'number' || !Number.isInteger(b.maxTokens) || b.maxTokens < 1) bad('maxTokens debe ser entero >= 1');
+  if (b.billingAccount !== 'cursia' && b.billingAccount !== 'user_key') bad('billingAccount debe ser cursia | user_key');
+  const mode = b.mode ?? 'real';
+  if (mode !== 'real' && mode !== 'mock') bad('mode debe ser real | mock');
+  return { subject, itemRunId, callRole, attempt: b.attempt, model, callId, promptChars: b.promptChars, maxTokens: b.maxTokens, billingAccount: b.billingAccount, mode };
+}
+
+// Liberación de la reserva: SOLO cuando Anthropic rechazó el pedido de forma definitiva y documentadamente
+// sin cobro (no autenticado / sin permiso / no encontrado / demasiado grande / rate limit / sobrecargado),
+// antes de procesarlo. Cualquier otro error (400 incluido: el piloto #1209 mostró 400 con costo en la
+// consola; 5xx; cortes) es INCIERTO → la reserva queda pendiente para conciliar.
+export const LLM_RESERVATION_RELEASABLE_STATUSES = [401, 403, 404, 413, 429, 529] as const;
+
+export interface LlmReservationReleaseBody {
+  callId: string;
+  providerStatus: number;
+  requestId?: string | null;
+}
+
+export function parseLlmReservationRelease(body: unknown): LlmReservationReleaseBody {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) bad('body debe ser un objeto JSON');
+  const b = body as Record<string, any>;
+  for (const k of Object.keys(b)) if (!['callId', 'providerStatus', 'requestId'].includes(k)) bad(`campo no permitido: ${k}`);
+  if (typeof b.callId !== 'string' || !UUID_RE.test(b.callId)) bad('callId debe ser un UUID');
+  if (!(LLM_RESERVATION_RELEASABLE_STATUSES as readonly number[]).includes(b.providerStatus)) {
+    bad(`providerStatus ${String(b.providerStatus)} no libera la reserva (resultado incierto: queda pendiente)`);
+  }
+  let requestId: string | null = null;
+  if (b.requestId !== undefined && b.requestId !== null && b.requestId !== '') {
+    if (typeof b.requestId !== 'string' || b.requestId.length > 256 || /\s/.test(b.requestId)) bad('requestId inválido');
+    requestId = b.requestId;
+  }
+  return { callId: b.callId, providerStatus: b.providerStatus, requestId };
+}
+
+/** Reserva validada → CHARGE `pending` (cota conservadora: entrada = caracteres/3, salida = max_tokens). */
+export function llmReservationToChargeInput(body: LlmReservationIngestBody): RecordChargeInput {
+  const mock = body.mode === 'mock';
+  return {
+    itemRunId: body.itemRunId ?? null,
+    ownerIdFromAuth: body.subject,
+    provider: 'anthropic',
+    service: 'messages',
+    modelOrProduct: body.model,
+    usage: { input_tokens: Math.max(1, Math.ceil(body.promptChars / LLM_RESERVATION_CHARS_PER_TOKEN)), output_tokens: body.maxTokens },
+    usageUnit: 'output_tokens',
+    externalOperationId: null,
+    idempotencyKey: llmProxyReservationKey(body.callId),
+    callRole: body.callRole,
+    attempt: body.attempt,
+    billingAccount: mock ? 'mock' : body.billingAccount,
+    mode: mock ? 'mock' : 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    pricingFallback: 'pending_zero',
+    recordedBy: 'llm-proxy',
+    metadata: { reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: 'proxy', callId: body.callId, proxy: true,
+      promptChars: body.promptChars, maxTokens: body.maxTokens, billingAccountRequested: body.billingAccount },
+  };
 }
 
 /** Body validado → input del ledger (medidores con los nombres del catálogo). */

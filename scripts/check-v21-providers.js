@@ -1421,7 +1421,7 @@ async function dbChecks() {
         const FG = loadDist('modules/finops/finops-ingest-token.guard.js');
         const FL = loadDist('modules/finops/finops-ledger.service.js');
         class IngestE2EModule {}
-        Module({ controllers: [FC.FinopsIngestController], providers: [{ provide: FL.FinopsLedgerService, useValue: ledger }, FG.FinopsIngestTokenGuard] })(IngestE2EModule);
+        Module({ controllers: [FC.FinopsIngestController, FC.FinopsLlmReservationController], providers: [{ provide: FL.FinopsLedgerService, useValue: ledger }, FG.FinopsIngestTokenGuard] })(IngestE2EModule);
         const app = await NestFactory.create(IngestE2EModule, { logger: false });
         app.setGlobalPrefix('api/v1');
         await app.listen(0, '127.0.0.1');
@@ -1485,7 +1485,15 @@ async function dbChecks() {
           // Otra operación distinta → otro evento (1 operación = 1 evento).
           eq(await callProxy(), 200, 'segunda operación');
           const all = await events(`item_run_id = $1 and provider = 'anthropic'`, [target.id]);
-          eq(all.length, 2, `2 operaciones = 2 eventos (${JSON.stringify(all.map((x) => [x.event_kind, x.idempotency_key, x.recorded_by]))})`);
+          // Piloto #1209: cada llamada se reservó ANTES (reservation:llm-proxy:<callId>) y el usage la liquidó (ADJUSTMENT a 0).
+          const finals = all.filter((x) => x.event_kind === 'CHARGE' && !String(x.idempotency_key).startsWith('reservation:'));
+          eq(finals.length, 2, `2 operaciones = 2 cargos finales (${JSON.stringify(all.map((x) => [x.event_kind, x.idempotency_key, x.recorded_by]))})`);
+          const resv = all.filter((x) => String(x.idempotency_key).startsWith('reservation:llm-proxy:'));
+          eq(resv.length, 3, '3 llamadas al proxy = 3 reservas');
+          for (const r of resv) {
+            const [net] = await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where id = $1 or corrects_event_id = $1`, [r.id]);
+            assert(Math.abs(Number(net.t)) < 1e-9, 'cada reserva liquidada a 0: ' + r.idempotency_key);
+          }
         } finally {
           globalThis.fetch = realFetch;
           if (savedTok === undefined) delete process.env.FINOPS_INGEST_TOKEN; else process.env.FINOPS_INGEST_TOKEN = savedTok;

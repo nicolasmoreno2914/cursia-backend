@@ -747,8 +747,37 @@ export class FinopsLedgerService {
         [res.id],
       );
       let fin: RecordResult | null = null;
+      if (Number(adj.n) > 0) {
+        // Review (I2): si un admin ya la concilió «cobrada», el monto de la reserva YA cuenta como el gasto de esa
+        // llamada: un usage tardío no agrega un segundo cargo (sería doble conteo). En cualquier otro cierre
+        // (liquidada / liberada / «no cobrada») el cargo real sí se registra (nunca de menos).
+        const [asCharged] = await manager.query(
+          `select 1 from public.generation_cost_events where corrects_event_id = $1 and event_kind = 'ADJUSTMENT'
+             and (metadata->>'reservationReconciledAsCharged') = 'true' limit 1`,
+          [res.id],
+        );
+        if (built && !asCharged) fin = await this.insertEvent(built.row, manager);
+        if (built && asCharged) {
+          // Re-review (minor a): la cota de la reserva puede quedarse corta. Si el usage real tardío SUPERA lo que
+          // quedó contado, gana el real (nunca de menos): se inserta el cargo real y la reserva se lleva a 0.
+          const [net] = await manager.query(
+            `select coalesce(sum(amount),0)::text as t from public.generation_cost_events where id = $1 or corrects_event_id = $1`,
+            [res.id],
+          );
+          if (Number(built.row.amount ?? 0) > Number(net.t)) {
+            fin = await this.insertEvent(built.row, manager);
+            if (fin.inserted) {
+              await this.adjustWith(manager, reservationKey, normalizeDecimal(0), 'late_usage_exceeds_reconciled_reservation', {
+                recordedBy: opts.recordedBy || 'dynamic-worker',
+                settlement: true,
+                metadata: { reservationSettled: true, supersededBy: built.idempotencyKey },
+              });
+            }
+          }
+        }
+        return { finalInserted: !!fin?.inserted, finalEvent: fin?.event ?? null, released: false, alreadySettled: true };
+      }
       if (built) fin = await this.insertEvent(built.row, manager);
-      if (Number(adj.n) > 0) return { finalInserted: !!fin?.inserted, finalEvent: fin?.event ?? null, released: false, alreadySettled: true };
       await this.adjustWith(manager, reservationKey, normalizeDecimal(0), reason, {
         recordedBy: opts.recordedBy || 'dynamic-worker',
         settlement: true,
@@ -845,6 +874,50 @@ export class FinopsLedgerService {
       });
       return { reconciled: r.inserted, alreadySettled: false, amount: res.amount, event: r.event };
     });
+  }
+
+  /** ¿La reserva ya se cerró (liquidada, liberada o conciliada)? null si no existe. */
+  async reservationSettled(reservationKey: string): Promise<boolean | null> {
+    const [r] = await this.dataSource.query(
+      `select exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id) as settled
+         from public.generation_cost_events e where e.idempotency_key = $1`,
+      [reservationKey],
+    );
+    return r ? r.settled === true : null;
+  }
+
+  /**
+   * Piloto #1209 (review I2): reservas del proxy LLM (`reservation:llm-proxy:*`) que siguen PENDIENTES (sin
+   * liquidar, liberar ni conciliar): la respuesta se perdió (524 / Worker terminado / stream cortado / 5xx).
+   * Cuentan como gasto hasta que un SUPER_ADMIN las concilia contra la consola del proveedor.
+   */
+  async pendingLlmProxyReservations(filter: { courseId?: number; runId?: string; limit?: number } = {}): Promise<Array<{
+    reservationKey: string; callId: string; createdAt: string; ownerId: string | null; courseId: number | null; runId: string | null;
+    itemKey: string | null; model: string | null; amount: string; promptChars: number | null; maxTokens: number | null;
+  }>> {
+    const where: string[] = [`e.idempotency_key like 'reservation:llm-proxy:%'`, `e.event_kind = 'CHARGE'`,
+      `not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`];
+    const params: unknown[] = [];
+    if (filter.courseId !== undefined) { params.push(filter.courseId); where.push(`e.course_id = $${params.length}`); }
+    if (filter.runId !== undefined) {
+      if (!UUID_RE.test(filter.runId)) throw new FinopsError('INVALID_INPUT', 'runId debe ser UUID');
+      params.push(filter.runId); where.push(`e.run_id = $${params.length}`);
+    }
+    params.push(Math.min(Math.max(Math.trunc(filter.limit ?? 200), 1), 1000));
+    const rows = await this.dataSource.query(
+      `select e.idempotency_key, e.created_at, e.owner_id, e.course_id, e.run_id, i.item_key, e.model_or_product, e.amount::text as amount, e.metadata
+         from public.generation_cost_events e left join public.generation_item_runs i on i.id = e.item_run_id
+        where ${where.join(' and ')} order by e.created_at limit $${params.length}`,
+      params,
+    );
+    return rows.map((r: any) => ({
+      reservationKey: r.idempotency_key, callId: String(r.idempotency_key).slice('reservation:llm-proxy:'.length),
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      ownerId: r.owner_id ?? null, courseId: r.course_id ?? null, runId: r.run_id ?? null, itemKey: r.item_key ?? null,
+      model: r.model_or_product ?? null, amount: r.amount,
+      promptChars: Number.isInteger(r.metadata?.promptChars) ? r.metadata.promptChars : null,
+      maxTokens: Number.isInteger(r.metadata?.maxTokens) ? r.metadata.maxTokens : null,
+    }));
   }
 
   /**
