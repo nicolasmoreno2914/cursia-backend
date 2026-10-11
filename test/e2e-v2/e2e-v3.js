@@ -3302,7 +3302,9 @@ function reservationBookkeeping(ev) {
       const inRange = card.design.estimatedHours >= 40 && card.design.estimatedHours <= 44;
       REP.horasDiseño = { estimadas: card.design.estimatedHours, check: hc && { titulo: hc.title, detalle: hc.detail, propuesta: hc.capability && hc.capability.proposal } };
       rec23('V3', 'Horas: si el diseño no llega a 40–44 h se dice como «Requisito no cubierto por Cursia» con las horas reales y una alternativa (sin culpar a la elección del Formato M)',
-        inRange ? hc && hc.severity === 'ok' : (hc && hc.title === 'Requisito no cubierto por Cursia: 40–44 horas' && /≈ \d+(,\d)? horas de trabajo del estudiante/.test(hc.detail) && !/que armaste|que elegiste/.test(hc.detail) && /Proponemos/.test(hc.capability.proposal)),
+        inRange ? hc && hc.severity === 'ok' : (hc && hc.title === 'Requisito no cubierto por Cursia: 40–44 horas' && /≈ \d+(,\d)? horas de trabajo del estudiante/.test(hc.detail) && !/que armaste|que elegiste/.test(hc.detail)
+          // Agotar capacidades: Cursia ya llevó las Actividades permitidas a su máximo y ofrece la alternativa que sí llega (con números).
+          && /^Cursia ya llevó a sus niveles máximos/.test(hc.capability.proposal) && /Actividad de Aplicación de 90 min en cada uno de los 12 capítulos de contenido llevaría el curso a ≈ 4[0-4](,\d)? horas\./.test(hc.capability.proposal) && /lo decide la institución/.test(hc.capability.proposal)),
         REP.horasDiseño);
       // «Cursia recomienda» no contradice el documento ni el Formato M elegido: nunca «agregar módulos / capítulos».
       const recs = card.design.recommendations || [];
@@ -3313,6 +3315,10 @@ function reservationBookkeeping(ev) {
       rec23('V7', 'Verificación no ofrece «Agregar módulos» ni otra salida que contradiga el documento o el Formato M', addMods.length === 0, addMods.map((c) => [c.title, c.detail, c.fix]));
       const aaPractice = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.kind));
       rec23('V4', 'Cada módulo: su Actividad de Aplicación en el capítulo de práctica (no una práctica vacía)', aaPractice.every((k) => k.length === 1 && k[0] === 'practice'), aaPractice);
+      // Agotar capacidades dentro del documento: las 3 Actividades (1 por módulo, en la práctica) en el nivel máximo (120 min).
+      const aaMin = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.applicationMinutes));
+      rec23('V4b', 'Horas fuera de alcance: las Actividades de Aplicación que permite el documento usan el nivel máximo (120 min), sin agregar otras',
+        aaMin.every((k) => k.length === 1 && k[0] === 120) && card.design.counts.applicationActivities === 3, { aaMin, horas: card.design.estimatedHours });
 
       // 6. Propuesta: la alternativa de Cursia para los videos; la institución la acepta (decisión explícita).
       let S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
@@ -3320,10 +3326,15 @@ function reservationBookkeeping(ev) {
       REP.alternativa = S0.draft.model.exceptions.filter((e) => e.capability).map((e) => ({ requisito: e.requirementText, aplicado: e.appliedText, propuesta: e.proposal || null }));
       rec23('P1', 'La propuesta no se prepara sin la decisión de la institución sobre los videos, y Cursia propone una alternativa con lo que sí produce',
         vidBlockers.length >= 1 && S0.draft.model.exceptions.filter((e) => e.capability && /video/.test(e.requirementText)).every((e) => typeof e.proposal === 'string' && /1 video/.test(e.proposal) && /presentaci/i.test(e.proposal))
-          && S0.draft.model.exceptions.filter((e) => e.capability).every((e) => typeof e.proposal === 'string' && /^Proponemos/.test(e.proposal)), REP.alternativa);
+          && S0.draft.model.exceptions.filter((e) => e.capability).every((e) => typeof e.proposal === 'string' && /^(Proponemos|Cursia ya llevó)/.test(e.proposal)), REP.alternativa);
+      // Lo mismo que envía «Usar la alternativa de Cursia» en la interfaz (la sugerencia del bloqueo), que cabe en el motivo.
+      rec23('P1b', 'Cada «Usar la alternativa de Cursia» cabe en el motivo (≤ 500 caracteres) y el de horas declara la carga real',
+        vidBlockers.every((b) => typeof b.suggestion === 'string' && b.suggestion.length <= 500)
+          && vidBlockers.filter((b) => /^target_hours@/.test(b.ref)).every((b) => /^Se acepta declarar la carga real que estima Cursia para 40–44 horas: \d+(,\d)? horas/.test(b.suggestion)),
+        vidBlockers.map((b) => [b.ref, b.suggestion && b.suggestion.length, b.suggestion]));
       for (const b of vidBlockers) {
-        const ex0 = S0.draft.model.exceptions.find((e) => e.requirementKey === b.ref);
-        await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: (ex0 && ex0.proposal) || 'La institución acepta la alternativa propuesta por Cursia.' });
+        const put = await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: b.suggestion });
+        if (![200, 201].includes(put.status)) throw new Error(`motivo de ${b.ref}: ${put.status} ${put.error}`);
       }
       S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
       for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${id}/prebrief/confirmations`, { confirmKey: b.ref });

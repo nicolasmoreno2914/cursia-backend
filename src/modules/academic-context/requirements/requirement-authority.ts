@@ -568,6 +568,16 @@ export interface ConflictContext {
   moduleExams: number;
   /** Excepciones de preferencias que el docente eligió (registradas o en «Ajustar» ahora). */
   exceptionFields: Partial<Record<ExceptionField, string>>;
+  /** Horas fuera de alcance: lo que daría la capacidad existente que el documento limita (ver hoursAlternativeOf). */
+  hoursAlternative?: HoursAlternative | null;
+}
+
+/** La alternativa de horas que calculó el distribuidor (ver distributeCourseHours). */
+export type HoursAlternative = { contentChapters: number; tier: number; hours: number; reaches: boolean; added: number; limitedByDocument?: boolean };
+
+export function hoursAlternativeOf(d: { hoursAlternative?: Omit<HoursAlternative, 'limitedByDocument'> | null; applicationLimitedByDocument?: boolean }): HoursAlternative | null {
+  if (d.hoursAlternative) return { ...d.hoursAlternative, limitedByDocument: d.applicationLimitedByDocument };
+  return d.applicationLimitedByDocument === undefined ? null : { contentChapters: 0, tier: 0, hours: 0, reaches: false, added: 0, limitedByDocument: d.applicationLimitedByDocument };
 }
 
 /**
@@ -597,12 +607,20 @@ export function capabilityProduces(r: DocumentRequirement, c?: RequirementCheck)
  * cada capítulo de contenido (video, presentación, audiolibro, actividad interactiva, Actividad de Aplicación). La
  * institución la acepta o no: Cursia nunca la aplica por su cuenta ni la presenta como cumplimiento del requisito.
  */
-export function capabilityProposal(r: DocumentRequirement, hours?: number | null): string | null {
+export function capabilityProposal(r: DocumentRequirement, hours?: number | null, alt?: HoursAlternative | null): string | null {
   if (r.kind === 'videos') {
     return 'Proponemos 1 video educativo principal por capítulo de contenido y, como recurso complementario, la presentación del capítulo y su parte del audiolibro, que Cursia ya produce. No reemplaza al segundo video: la institución decide si lo acepta.';
   }
   if (r.kind === 'target_hours' && typeof hours === 'number') {
-    return `Proponemos mantener la estructura y los recursos del documento y declarar la carga real estimada: ≈ ${n1(hours)} horas de trabajo del estudiante. Si la institución necesita más horas, puede ampliar las Actividades de Aplicación o agregar capítulos de práctica (eso se aparta de las cantidades exactas del documento).`;
+    const byDoc = alt?.limitedByDocument !== false;
+    const base = byDoc
+      ? `Cursia ya llevó a sus niveles máximos las Actividades de Aplicación que el documento permite, sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con las cantidades que fija el documento (capítulos, videos, actividades y evaluaciones) no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`
+      : `Cursia ya llevó las Actividades de Aplicación hasta sus propios límites (la mitad del tiempo del curso y 4 horas por capítulo), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con la estructura que fija el documento no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`;
+    if (alt && alt.added > 0) {
+      const scope = byDoc ? `Eso suma ${alt.added} Actividades de Aplicación a las que pide el documento` : `Eso suma ${alt.added} Actividades de Aplicación y supera la proporción de aplicación que Cursia usa por defecto`;
+      return `${base} Alternativa con lo que Cursia ya produce: una Actividad de Aplicación de ${alt.tier} min en cada uno de los ${alt.contentChapters} capítulos de contenido llevaría el curso a ≈ ${n1(alt.hours)} horas${alt.reaches ? '' : ' (aún por debajo de lo pedido)'}. ${scope}, así que lo decide la institución (se fija capítulo por capítulo en «Estructura» y queda como excepción documentada). Si no, se declara la carga real de ≈ ${n1(hours)} horas.`;
+    }
+    return `${base} Proponemos declarar esa carga real. Si la institución necesita más horas, puede ampliar las Actividades de Aplicación o agregar capítulos de práctica (eso se aparta de las cantidades exactas del documento).`;
   }
   return null;
 }
@@ -664,7 +682,7 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
       const produces = `con lo que fija el documento, el diseño de Cursia equivale a ≈ ${n1(ctx.estimatedHours)} horas de trabajo del estudiante (Cursia no rellena textos ni tiempos para llegar)`;
       out.push({ id, area: 'requirements', severity: 'warning', title: `Requisito no cubierto por Cursia: ${asked}`,
         detail: `El microcurrículo solicita ${asked}. Actualmente, ${produces}. No se puede presentar como cumplido: para continuar, la institución debe aceptar esta diferencia en la propuesta.`,
-        capability: { requirementKey: String(r.key), requirementText: asked, produces, proposal: capabilityProposal(r, ctx.estimatedHours) as string } });
+        capability: { requirementKey: String(r.key), requirementText: asked, produces, proposal: capabilityProposal(r, ctx.estimatedHours, ctx.hoursAlternative) as string } });
       continue;
     }
     if (hoursClash) {

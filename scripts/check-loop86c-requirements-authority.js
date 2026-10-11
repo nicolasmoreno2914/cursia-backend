@@ -369,7 +369,7 @@ async function dbChecks() {
       // horas reales y una alternativa; la institución decide (R68 exige su aceptación). Cursia no rellena ni lo da por cumplido.
       const bad = card.verification.checks.filter((c) => c.area === 'requirements' && c.severity !== 'ok');
       eq(bad.map((c) => [c.severity, c.title]), [['warning', 'Requisito no cubierto por Cursia: 40–44 horas']], 'solo las horas: no cubierto');
-      assert(/el diseño de Cursia equivale a ≈ \d+(,\d)? horas de trabajo del estudiante/.test(bad[0].detail) && /^Proponemos/.test(bad[0].capability.proposal), JSON.stringify(bad[0]));
+      assert(/el diseño de Cursia equivale a ≈ \d+(,\d)? horas de trabajo del estudiante/.test(bad[0].detail) && /^Cursia ya llevó (a sus niveles máximos las Actividades de Aplicación que el documento permite|las Actividades de Aplicación hasta sus propios límites)/.test(bad[0].capability.proposal), JSON.stringify(bad[0]));
       eq(await shapeOf(cid), [3, 3, 3], 'nada se aplicó todavía (es una propuesta)');
       const { applied } = await useDesign(cid);
       assert(applied, '«Usar este diseño» aplica');

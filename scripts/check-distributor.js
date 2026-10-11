@@ -402,5 +402,57 @@ check('D19 Fase 2/4: forma elegida por la institución (sin contenido nuevo) y h
   }
 });
 
+// Agotar capacidades (2026-10-10, prueba Formato M): con la forma fija y la meta fuera de alcance, las Actividades de
+// Aplicación que permite el documento usan los niveles máximos de Cursia antes de declarar la diferencia; nunca se agregan
+// Actividades ni capítulos más allá de lo que fija el documento. hoursAlternativeOf informa la alternativa (con números).
+check('D-agotar forma fija + meta fuera de alcance: Actividades permitidas al máximo; la alternativa se calcula con el modelo de tiempo', () => {
+  const RA = loadDist('modules/academic-context/requirements/requirement-authority.js');
+  const m34 = P.snapshotFromStructure({ course: { title: 'Formato M', reviewCards: true, finalExam: true }, modules: [1, 2, 3].map((i) => ({ title: `Módulo ${i}`, examEnabled: true, chapters: [1, 2, 3, 4].map((j) => ({ title: `Capítulo ${i}.${j}`, videoEnabled: true })) })) });
+  const docM = { sources: {}, noContentAdditions: true, applicationInPractice: true, applicationPerModule: { min: 1, max: 1 }, applicationTotal: { min: 3, max: 3 }, activitiesTotal: { min: 12, max: 12 }, activitiesInEveryContent: true, videosAllContent: true, modulesFixed: 3, contentChaptersPerModule: { min: 4, max: 4 } };
+  const d = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: docM });
+  eq(d.status, 'cannot_reach_target', 'no se llega');
+  eq(d.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => [c.kind, c.applicationMinutes])), [[['practice', 120]], [['practice', 120]], [['practice', 120]]], '1 Actividad por módulo, en la práctica, a 120 min');
+  eq([d.counts.applicationActivities, d.counts.activities, d.counts.contentChapters], [3, 12, 12], 'las cantidades del documento no cambian');
+  assert(!d.changes.some((c) => c.type === 'add_content_chapter'), 'sin capítulos de contenido nuevos');
+  assert(d.priorityTrace.some((t) => /niveles máximos de Cursia/.test(t)), JSON.stringify(d.priorityTrace));
+  const alt = RA.hoursAlternativeOf(d);
+  eq([alt.contentChapters, alt.tier, alt.reaches, alt.added, alt.limitedByDocument], [12, 90, true, 12, true], 'alternativa: 90 min en cada capítulo de contenido (+12), lo limita el documento');
+  // Las horas anunciadas son las del diseño con esa alternativa fijada por el docente (como se aplica en «Estructura»).
+  const pins = {};
+  for (const m of d.modules) for (const c of m.chapters) if (c.kind === 'content') pins[c.id] = { application: 90 };
+  const withPins = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: docM, pins });
+  eq([withPins.counts.applicationActivities, withPins.status === 'cannot_reach_target'], [15, false], 'aplicada: 12 + las 3 de las prácticas, dentro de la meta');
+  eq(alt.hours, withPins.estimatedHours, 'las horas anunciadas = las del diseño con la alternativa');
+  assert(withPins.hoursAlternative === undefined, 'si se llega no hay alternativa');
+  // Review I1: tope del documento NO ligado a la práctica («exactamente 3 en el curso»): se fijan los 12 capítulos de contenido
+  // y lo que se suma es el neto real.
+  const tot3 = { sources: {}, noContentAdditions: true, applicationTotal: { min: 3, max: 3 } };
+  const dT = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: tot3 });
+  if (dT.status === 'cannot_reach_target') {
+    const aT = RA.hoursAlternativeOf(dT);
+    eq(aT.contentChapters, 12, 'los 12 capítulos de contenido');
+    const pinsT = {};
+    for (const m of dT.modules) for (const c of m.chapters) if (c.kind === 'content') pinsT[c.id] = { application: aT.tier };
+    const wT = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: tot3, pins: pinsT });
+    eq([aT.added, aT.hours], [wT.counts.applicationActivities - dT.counts.applicationActivities, wT.estimatedHours], 'neto y horas = lo aplicado');
+  }
+  // Review I2: «Solo en prácticas» lo eligió el docente: no se propone pasar por encima.
+  const po = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: docM, preferences: { applicationActivities: 'practice_only' } });
+  assert(po.hoursAlternative === undefined, 'sin alternativa con «Solo en prácticas»');
+  // Review I3: el texto dice qué limita (documento o topes de Cursia).
+  const txtDoc = RA.capabilityProposal({ kind: 'target_hours' }, d.estimatedHours, RA.hoursAlternativeOf(d));
+  assert(/que el documento permite/.test(txtDoc) && /suma 12 Actividades de Aplicación a las que pide el documento/.test(txtDoc), txtDoc);
+  const own = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 80, requirements: { sources: {}, noContentAdditions: true } });
+  const txtOwn = RA.capabilityProposal({ kind: 'target_hours' }, own.estimatedHours, RA.hoursAlternativeOf(own));
+  assert(own.applicationLimitedByDocument === false && /hasta sus propios límites/.test(txtOwn) && !/que el documento permite|a las que pide el documento/.test(txtOwn), txtOwn);
+  // Sin topes de Actividades en el documento: el contenido también llega al tope amplio (90), no al del enfoque (60).
+  const free = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 60, requirements: { sources: {}, noContentAdditions: true } });
+  assert(free.modules.some((m) => m.chapters.some((c) => c.kind === 'content' && c.applicationMinutes === 90)), 'contenido a 90 min');
+  // Dentro de la meta nada cambia: el enfoque manda (sin topes ampliados).
+  const fits = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 24, requirements: docM });
+  assert(fits.status !== 'cannot_reach_target' && !fits.priorityTrace.some((t) => /niveles máximos de Cursia/.test(t)), JSON.stringify([fits.status, fits.priorityTrace]));
+  eq(RA.hoursAlternativeOf(fits), null, 'sin alternativa si se llega');
+});
+
 console.log(`\n${passes} OK, ${failures} fallidas`);
 process.exit(failures ? 1 : 0);

@@ -25,7 +25,7 @@ import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../cours
 import { compareRequirements, DesignForRequirements, RequirementCheck } from '../academic-context/requirements/document-requirements';
 import {
   DECISION_DEFAULTS, DecisionOverrides, constraintsFor, EXCEPTION_FIELDS, structureEditedByTeacher, EXCEPTION_VALUES, ExceptionField, hoursFromRequirements, loadExceptions, loadRequirementAuthority,
-  chosenContentCap, requiredContentShape, requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
+  chosenContentCap, hoursAlternativeOf, requiredContentShape, requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
 } from '../academic-context/requirements/requirement-authority';
 import { DistributionResult } from '../study-time/distributor';
 import { ConflictException } from '@nestjs/common';
@@ -358,6 +358,7 @@ export class CourseDesignService {
         clashCause, structureByTeacher, clashWith,
         status: dist.status, baseHours: dist.baseHours, estimatedHours: dist.estimatedHours, hoursByTeacher: hoursSource === 'user' || hoursSource === 'adjusted',
         teacherPins,
+        hoursAlternative: hoursAlternativeOf(dist),
         modules: dist.modules.length, moduleExams: dist.modules.filter((m) => m.examEnabled).length,
         exceptionFields: Object.fromEntries(EXCEPTION_FIELDS.filter((f) => decisions[f]).map((f) => [f, decisions[f]!.value])) as Partial<Record<ExceptionField, string>>,
       });
