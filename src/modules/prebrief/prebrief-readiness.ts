@@ -82,7 +82,10 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
       b.push({ code: 'exception_reason', capability: true, title: `Requisito no cubierto: ${e.requirementText}${covered.length ? ` (también ${covered.join(' y ')})` : ''}. Para continuar, la institución debe aceptar la diferencia.`,
         detail: `El microcurrículo solicita ${e.requirementText}. Actualmente, ${e.appliedText}.`, where: 'reason', ref: e.requirementKey,
         ...(e.proposal ? { proposal: e.proposal } : {}),
-        suggestion: e.proposal
+        // Horas: la propuesta explica y ofrece una alternativa; aceptarla aquí = declarar la carga real (texto corto, cabe en el motivo).
+        suggestion: e.proposal && /^target_hours@/.test(e.requirementKey)
+          ? `Se acepta declarar la carga real que estima Cursia para ${e.requirementText}: ${e.appliedText}. La institución no agrega las Actividades de Aplicación adicionales que propone Cursia como alternativa.`
+          : e.proposal
           ? `Se acepta la alternativa que propone Cursia para ${e.requirementText}${covered.length ? ` (${covered.join(' y ')})` : ''}: ${e.proposal.replace(/^Proponemos /, '').replace(/\s*No reemplaza al segundo video: la institución decide si lo acepta\.$/, '')}`
           : `Se acepta la propuesta de Cursia: ${e.appliedText.replace(/^Cursia (contempla|produce|diseña) /, '')}, en lugar de lo solicitado en el documento: ${e.requirementText}${covered.length ? ` (${covered.join(' y ')})` : ''}.` });
     } else b.push({ code: 'exception_reason', title: `Falta el motivo de la excepción: ${e.requirementText}${covered.length ? ` (el mismo motivo cubre también ${covered.join(' y ')})` : ''}.`,
