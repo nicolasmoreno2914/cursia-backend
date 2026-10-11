@@ -1,6 +1,6 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from '../../auth/auth.module';
-import { FinopsAdminController, FinopsIngestController } from './finops.controller';
+import { FinopsAdminController, FinopsIngestController, FinopsLlmReservationController } from './finops.controller';
 import { FinopsLedgerService } from './finops-ledger.service';
 import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsBudgetService } from './finops-budget.service';
@@ -12,7 +12,7 @@ import { FinopsBudgetService } from './finops-budget.service';
  */
 @Module({
   imports: [AuthModule],
-  controllers: [FinopsIngestController, FinopsAdminController],
+  controllers: [FinopsIngestController, FinopsLlmReservationController, FinopsAdminController],
   providers: [FinopsLedgerService, FinopsBudgetService, FinopsIngestTokenGuard],
   exports: [FinopsLedgerService, FinopsBudgetService],
 })

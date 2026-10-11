@@ -22,7 +22,7 @@ import { FinopsLedgerService } from './finops-ledger.service';
 import { FinopsBudgetService } from './finops-budget.service';
 import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsError } from './errors';
-import { llmIngestToChargeInput, parseLlmUsageIngest } from './llm-usage-ingest';
+import { llmIngestToChargeInput, llmProxyReservationKey, llmReservationToChargeInput, parseLlmReservationIngest, parseLlmReservationRelease, parseLlmUsageIngest } from './llm-usage-ingest';
 import { costIdempotencyKey } from './idempotency';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -54,6 +54,20 @@ export class FinopsIngestController {
   async llmUsage(@Body() body: Record<string, unknown>, @Res({ passthrough: true }) res: Response) {
     try {
       const parsed = parseLlmUsageIngest(body);
+      // Piloto #1209: la llamada se RESERVÓ antes (callId) → este usage la liquida (cargo exacto + reserva a 0,
+      // atómico e idempotente). Sin la reserva (proxy viejo o reserva fallida) sigue el camino de siempre.
+      if (parsed.callId) {
+        try {
+          const s = await this.ledger.settleReservation(llmProxyReservationKey(parsed.callId), llmIngestToChargeInput(parsed), 'llm_proxy_measured', { recordedBy: 'llm-proxy' });
+          return {
+            settled: true, alreadySettled: s.alreadySettled, finalInserted: s.finalInserted,
+            eventId: s.finalEvent ? s.finalEvent.id : null, idempotencyKey: s.finalEvent ? s.finalEvent.idempotency_key : null,
+            amount: s.finalEvent ? s.finalEvent.amount : null, attributed: s.finalEvent ? s.finalEvent.item_run_id !== null : null,
+          };
+        } catch (err) {
+          if (!(err instanceof FinopsError && err.code === 'ORIGINAL_NOT_FOUND')) throw err;
+        }
+      }
       // #583 fix round 1 (I1): corrección del cargo conservador de un stream cortado (mismo messageId).
       if (parsed.measurement === 'correction') {
         const input = llmIngestToChargeInput(parsed);
@@ -76,6 +90,44 @@ export class FinopsIngestController {
         amount: r.event.amount,
         currency: r.event.currency,
       };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+}
+
+/**
+ * Piloto #1209 (2026-10-11): reserva del proxy LLM ANTES de llamar a Anthropic (server-to-server, mismo token).
+ * Si no se puede registrar, el proxy no llama (nunca hay gasto sin registro).
+ */
+@Controller('finops/ingest')
+@UseGuards(FinopsIngestTokenGuard)
+export class FinopsLlmReservationController {
+  constructor(private readonly ledger: FinopsLedgerService) {}
+
+  // POST /api/v1/finops/ingest/llm-reservation
+  @Post('llm-reservation')
+  @HttpCode(HttpStatus.OK)
+  async llmReservation(@Body() body: Record<string, unknown>) {
+    try {
+      const parsed = parseLlmReservationIngest(body);
+      const r = await this.ledger.recordCharge(llmReservationToChargeInput(parsed));
+      return { reserved: true, inserted: r.inserted, reservationKey: llmProxyReservationKey(parsed.callId), amount: r.event.amount, attributed: r.event.item_run_id !== null };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // POST /api/v1/finops/ingest/llm-reservation/release — Anthropic rechazó el pedido sin cobro (lista cerrada
+  // de estados); cualquier otro resultado deja la reserva pendiente. Idempotente.
+  @Post('llm-reservation/release')
+  @HttpCode(HttpStatus.OK)
+  async llmReservationRelease(@Body() body: Record<string, unknown>) {
+    try {
+      const parsed = parseLlmReservationRelease(body);
+      const reason = `llm_proxy_provider_rejected_${parsed.providerStatus}` + (parsed.requestId ? `:${parsed.requestId}` : '');
+      const r = await this.ledger.settleReservation(llmProxyReservationKey(parsed.callId), null, reason, { recordedBy: 'llm-proxy' });
+      return { released: r.released, alreadySettled: r.alreadySettled };
     } catch (err) {
       throw finopsErrorToHttp(err);
     }

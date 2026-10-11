@@ -410,7 +410,7 @@ async function dbChecks() {
   const { GenerationManifestsService } = loadDist('modules/generation-manifests/generation-manifests.service.js');
   const { RunsService } = loadDist('modules/dynamic-generation/runs.service.js');
   const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
-  const { FinopsIngestController, FinopsAdminController } = loadDist('modules/finops/finops.controller.js');
+  const { FinopsIngestController, FinopsAdminController, FinopsLlmReservationController } = loadDist('modules/finops/finops.controller.js');
   const itemWorker = loadDist('workers/dynamic-item-worker.js');
   const providerWorker = loadDist('workers/dynamic-provider-worker.js');
 
@@ -596,7 +596,7 @@ async function dbChecks() {
 
     // ── Ingest HTTP con el ledger real ──────────────────────────────────
     class IngestDbModule {}
-    Module({ controllers: [FinopsIngestController], providers: [{ provide: F.FinopsLedgerService, useValue: ledger }, F.FinopsIngestTokenGuard] })(IngestDbModule);
+    Module({ controllers: [FinopsIngestController, FinopsLlmReservationController], providers: [{ provide: F.FinopsLedgerService, useValue: ledger }, F.FinopsIngestTokenGuard] })(IngestDbModule);
     app = await NestFactory.create(IngestDbModule, { logger: false });
     app.setGlobalPrefix('api/v1');
     await app.listen(0, '127.0.0.1');
@@ -604,6 +604,10 @@ async function dbChecks() {
     process.env.FINOPS_INGEST_TOKEN = 'tok-rfb';
     const ingest = async (body) => {
       const res = await fetch(ingestUrl, { method: 'POST', headers: { 'content-type': 'application/json', 'x-cursia-finops-token': 'tok-rfb' }, body: JSON.stringify(body) });
+      return { status: res.status, body: await res.json() };
+    };
+    const postIngest = async (pathSuffix, body) => {
+      const res = await fetch(ingestUrl.replace(/llm-usage$/, pathSuffix), { method: 'POST', headers: { 'content-type': 'application/json', 'x-cursia-finops-token': 'tok-rfb' }, body: JSON.stringify(body) });
       return { status: res.status, body: await res.json() };
     };
     const llmBody = (over) => ({
@@ -877,6 +881,79 @@ async function dbChecks() {
       const [nw] = await events(`idempotency_key = 'anthropic:msg:msg_after_price'`, []);
       eq(dec(nw.amount), (1000 * 30 + 2000 * 150) / 1e6, 'nuevo precio');
       assert(nw.pricing_snapshot.pricing_versions.includes('anthropic-rfb-test'), 'snapshot con la versión nueva');
+    });
+
+    // ════ Piloto #1209: reserva del proxy LLM ANTES de llamar a Anthropic ═══════════
+    await check('DB proxy-reserva: reserva (CHARGE pending, cota chars/3 + max_tokens, atribuida) → el usage con callId la LIQUIDA atómico (cargo exacto + reserva a 0); repetir = sin doble cargo', async () => {
+      const it = await itemRow(runB, `content:${Bc.c1}`);
+      const callId = crypto.randomUUID();
+      const resBody = { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 30000, maxTokens: 8000, billingAccount: 'cursia' };
+      const r = await postIngest('llm-reservation', resBody);
+      eq([r.status, r.body.reserved, r.body.inserted, r.body.attributed], [200, true, true, true], 'reservada');
+      const [ev] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + callId]);
+      eq([ev.measurement_status, ev.metadata.reservation, ev.usage.input_tokens, ev.usage.output_tokens, ev.item_run_id], ['pending', true, 10000, 8000, it.id], 'fila de reserva');
+      eq(dec(ev.amount), (10000 * 30 + 8000 * 150) / 1e6, 'monto conservador con el precio vigente');
+      const again = await postIngest('llm-reservation', resBody);
+      eq([again.status, again.body.inserted], [200, false], 'reserva idempotente por callId');
+      const totalBefore = dec((await ledger.costsByRun(runB)).totals.total);
+      const s1 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_proxy_res_1', callId, usage: { input_tokens: 9000, output_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
+      eq([s1.status, s1.body.settled, s1.body.finalInserted, s1.body.alreadySettled], [200, true, true, false], 'liquidada');
+      const exact = (9000 * 30 + 1200 * 150) / 1e6;
+      eq(dec(s1.body.amount), exact, 'cargo exacto');
+      const totalAfter = dec((await ledger.costsByRun(runB)).totals.total);
+      assert(Math.abs(totalAfter - (totalBefore - dec(ev.amount) + exact)) < 1e-9, `total: reserva reemplazada por el exacto (${totalBefore} → ${totalAfter})`);
+      const s2 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_proxy_res_1', callId, usage: { input_tokens: 9000, output_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
+      eq([s2.status, s2.body.finalInserted, s2.body.alreadySettled], [200, false, true], 'reenvío: sin doble cargo');
+      eq(dec((await ledger.costsByRun(runB)).totals.total), totalAfter, 'total sin cambios');
+    });
+
+    await check('DB proxy-reserva: respuesta PERDIDA (524 / Worker terminado / navegador fuera) → la reserva queda PENDIENTE y cuenta en el gasto del run; conciliación explícita (cobrada / no cobrada)', async () => {
+      const it = await itemRow(runB, `content:${Bc.c1}`);
+      const ids = [crypto.randomUUID(), crypto.randomUUID()];
+      const t0 = (await ledger.costsByRun(runB)).totals;
+      let reserved = 0;
+      for (const callId of ids) {
+        const r = await postIngest('llm-reservation', { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 2, model: 'claude-sonnet-4-6', callId, promptChars: 3000, maxTokens: 4000, billingAccount: 'cursia' });
+        reserved += dec(r.body.amount);
+      }
+      const t1 = (await ledger.costsByRun(runB)).totals;
+      assert(Math.abs(dec(t1.total) - dec(t0.total) - reserved) < 1e-9, 'las reservas cuentan en el total del run (presupuesto)');
+      eq(t1.pending_events - t0.pending_events, 2, 'aparecen como pendientes');
+      await ledger.reconcileReservationAsCharged('reservation:llm-proxy:' + ids[0], 'consola Anthropic: cobrada', { decidedBy: 'admin@cursia.test' });
+      await ledger.reconcileReservationAsNotCharged('reservation:llm-proxy:' + ids[1], 'consola Anthropic: sin cobro', { decidedBy: 'admin@cursia.test' });
+      const t2 = (await ledger.costsByRun(runB)).totals;
+      eq(t2.pending_events, t0.pending_events, 'sin pendientes tras conciliar');
+      assert(Math.abs(dec(t2.total) - dec(t0.total) - reserved / 2) < 1e-9, 'la cobrada sigue contada; la no cobrada a 0');
+    });
+
+    await check('DB proxy-reserva: rechazo definitivo de Anthropic (429/529…) → /release la lleva a 0 (idempotente); un estado incierto (400/500/524) → 400 y la reserva sigue pendiente', async () => {
+      const callId = crypto.randomUUID();
+      await postIngest('llm-reservation', { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 300, maxTokens: 100, billingAccount: 'cursia' });
+      for (const st of [400, 500, 524]) {
+        const bad = await postIngest('llm-reservation/release', { callId, providerStatus: st });
+        eq(bad.status, 400, `status ${st} no libera`);
+      }
+      const [still] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + callId]);
+      eq((await ds.query(`select count(*)::int n from public.generation_cost_events where corrects_event_id = $1`, [still.id]))[0].n, 0, 'sigue pendiente');
+      const rel = await postIngest('llm-reservation/release', { callId, providerStatus: 429, requestId: 'req_429' });
+      eq([rel.status, rel.body.released, rel.body.alreadySettled], [200, true, false], 'liberada');
+      const rel2 = await postIngest('llm-reservation/release', { callId, providerStatus: 429 });
+      eq([rel2.status, rel2.body.released, rel2.body.alreadySettled], [200, false, true], 'idempotente');
+      const [adj] = await ds.query(`select amount::text as a, metadata from public.generation_cost_events where corrects_event_id = $1`, [still.id]);
+      assert(Math.abs(dec(still.amount) + dec(adj.a)) < 1e-9 && /provider_rejected_429:req_429/.test(JSON.stringify(adj.metadata)), 'ajuste a 0 con el motivo');
+      const late = await ingest(llmBody({ messageId: 'msg_after_release', callId }));
+      eq([late.status, late.body.alreadySettled], [200, true], 'un usage tardío tras liberar: se registra el cargo, la reserva no se toca de nuevo');
+    });
+
+    await check('DB proxy-reserva: usage con callId SIN reserva (proxy/ledger viejo) → camino de siempre (1 cargo); body inválido / sin token → rechazado', async () => {
+      const r = await ingest(llmBody({ messageId: 'msg_no_res', callId: crypto.randomUUID() }));
+      eq([r.status, r.body.inserted], [200, true], 'cargo normal');
+      const bad = await postIngest('llm-reservation', { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId: 'no-uuid', promptChars: 1, maxTokens: 1, billingAccount: 'cursia' });
+      eq(bad.status, 400, 'callId inválido');
+      const extra = await postIngest('llm-reservation', { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId: crypto.randomUUID(), promptChars: 1, maxTokens: 1, billingAccount: 'cursia', amount: 0 });
+      eq(extra.status, 400, 'campo no permitido');
+      const noTok = await fetch(ingestUrl.replace(/llm-usage$/, 'llm-reservation'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      assert(noTok.status === 401 || noTok.status === 403, 'sin token → rechazado ' + noTok.status);
     });
 
     await check('DB ingest (fix C1/I2): ids fechados del selector (Haiku 4.5 / Sonnet 4) → 200 con precio; id sin precio → 202, CHARGE a 0 pendiente (pricingMissing), nunca perdido; al cargar el precio → ADJUSTMENT y el pendiente se limpia', async () => {
