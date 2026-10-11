@@ -688,6 +688,8 @@ jobs:
                ensure_pm2_drain_worker cursia-dynamic-item-worker-staging dist/workers/dynamic-item-worker.js
                ensure_pm2_drain_worker cursia-dynamic-package-worker-staging dist/workers/dynamic-package-worker.js
                ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js
+               # Loop 4: worker de IA de las partes largas — queda EN ESPERA salvo DYNAMIC_LLM_WORKER_ENABLED=true (no se fija acá).
+               ensure_pm2_drain_worker cursia-dynamic-llm-worker-staging dist/workers/dynamic-llm-worker.js
                sudo pm2 save
                sudo pm2 status
 

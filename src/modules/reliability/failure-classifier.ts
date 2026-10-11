@@ -310,6 +310,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'D', strategy: 'wait_provider', scope: 'provider', provider: 'anthropic', rounds: 0, humanReason: 'config',
   },
   {
+    // Loop 4: segundo resultado desconocido de una parte del worker de IA → solo esa parte queda en revisión (el resto sigue).
+    id: 'llm_pending_review', codes: ['llm_pending_review'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_item',
+  },
+  {
     // Piloto #1209: 524 — la respuesta se perdió pero el proveedor pudo cobrarla: reenviarla solo podría pagarla dos veces.
     id: 'llm_response_lost', codes: ['llm_response_lost'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_item',
   },

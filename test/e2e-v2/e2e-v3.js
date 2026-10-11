@@ -71,6 +71,8 @@ process.env.CURSIA_RESTORE_PHP = process.env.CURSIA_RESTORE_PHP || path.join(REP
 // V2.1 F2: `E2E_V3_ONLY=real-providers` corre SOLO arranque + workers + E4 (Gamma/TTS/LLM reales contra
 // fakes locales), sin E1–E3 ni restores de Moodle (para correrlo aparte cuando el Moodle local está ocupado).
 const ONLY_REAL_PROVIDERS = process.env.E2E_V3_ONLY === 'real-providers';
+// Loop 4: `E2E_V3_ONLY=llm-worker` corre SOLO arranque + workers + E24 (worker de IA del backend; iteración rápida).
+const ONLY_LLM_WORKER = process.env.E2E_V3_ONLY === 'llm-worker';
 // Claves FALSAS de los proveedores reales (Gamma/OpenAI/Anthropic): solo abren los fakes de 127.0.0.1.
 const PROVIDER_KEYS = { gamma: 'fake-gamma-key-e2e-local', openai: 'fake-openai-key-e2e-local', anthropic: 'fake-anthropic-key-e2e-local' };
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
@@ -513,7 +515,7 @@ function reservationBookkeeping(ev) {
       ok(!itemWorker.exited && !providerWorker.exited && !pkgWorker.exited, '3 workers reales vivos (item, provider, package)', { i: itemWorker.exited, p: providerWorker.exited, k: pkgWorker.exited });
     });
 
-    for (const C of (ONLY_REAL_PROVIDERS ? [] : COURSES)) {
+    for (const C of (ONLY_REAL_PROVIDERS || ONLY_LLM_WORKER ? [] : COURSES)) {
       await step(`v3-${C.key}-generacion`, async () => {
         const c = await createCourse(C, llm);
         S[C.key] = c;
@@ -703,7 +705,7 @@ function reservationBookkeeping(ev) {
       }
     }
 
-    if (!ONLY_REAL_PROVIDERS) await step('v3-finops', async () => {
+    if (!ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER) await step('v3-finops', async () => {
       const courseIds = COURSES.map((C) => S[C.key].courseId);
       const ev = await ledgerRows('course_id = any($1::int[])', [courseIds]);
       const bySrc = {};
@@ -795,7 +797,7 @@ function reservationBookkeeping(ev) {
     }, { fatal: false });
 
     // ═══ V2.1 F2: E4 — Gamma / TTS / guion LLM REALES contra fakes locales ═══
-    await step('v3-E4-proveedores-reales', async () => {
+    if (!ONLY_LLM_WORKER) await step('v3-E4-proveedores-reales', async () => {
       const C = { key: 'E4', title: '[E2E V2.1 E4] Seguridad hidráulica (proveedores reales/fakes)', theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
         { title: 'Seguridad hidráulica', objective: 'Operar el circuito con seguridad', exam: true, chapters: [
           { title: 'Bloqueo y etiquetado', v: true, a: true },
@@ -893,8 +895,8 @@ function reservationBookkeeping(ev) {
     }, { fatal: false });
 
     // ═══ EV6 H5P v2 (H4) — E5: rules 2 + «Repaso» + IV avanzado ═══
-    const RUN_E5 = !ONLY_REAL_PROVIDERS && H5P2_MODE !== 'off' && (H5P2 || H5P2_MODE === 'require');
-    if (!ONLY_REAL_PROVIDERS && !RUN_E5) {
+    const RUN_E5 = !ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER && H5P2_MODE !== 'off' && (H5P2 || H5P2_MODE === 'require');
+    if (!ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER && !RUN_E5) {
       results.h5p2 = { skipped: true, reason: H5P2_MODE === 'off' ? 'E2E_H5P2=off' : `el frontend no trae ${path.relative(FE, H5P2_FIXTURE)} (H5P v2 del frontend H3)` };
       console.log(`\n(E5 H5P v2 omitido: ${results.h5p2.reason})`);
     }
@@ -3771,8 +3773,179 @@ function reservationBookkeeping(ev) {
       await fullGenerationFlow('E17', { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra: { v2: true }, courseCtx });
     }, { fatal: false });
 
+    // ═══ Loop 4 · E24: worker de IA del backend para las partes LARGAS (sin Cloudflare, sin depender del navegador) ═══
+    if (RUN_E5 || ONLY_LLM_WORKER) await step('v3-E24-worker-ia', async () => {
+      const { startAnthropicSseFake } = require('./anthropic-sse-fake');
+      const fake = await startAnthropicSseFake(llm);
+      const W1 = 'e2e-llm-worker-1';
+      const W2 = 'e2e-llm-worker-2';
+      const W3 = 'e2e-llm-worker-3';
+      const W4 = 'e2e-llm-worker-4';
+      const LONG = ['content', 'application_activity', 'experience', 'final_exam'];
+      const wEnv = (id) => ({
+        ...baseEnv(), DYNAMIC_LLM_WORKER_ENABLED: 'true', ANTHROPIC_API_BASE_URL: fake.url, DYNAMIC_LLM_WORKER_ID: id,
+        DYNAMIC_LLM_WORKER_POLL_MS: '300', DYNAMIC_LLM_WORKER_LEASE_SECONDS: '15', DYNAMIC_LLM_WORKER_HEARTBEAT_MS: '3000',
+        DYNAMIC_LLM_WORKER_IDLE_MS: '30000', DYNAMIC_LLM_WORKER_CONCURRENCY: '2', DYNAMIC_LLM_WORKER_BACKOFF_MS: '20', DYNAMIC_WORKER_DRAIN_TIMEOUT_MS: '90000',
+      });
+      const waitFor = async (label, fn, timeoutMs = 240000, everyMs = 500) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < timeoutMs) { const v = await fn(); if (v) return v; await sleep(everyMs); }
+        const st = typeof CURRENT_RUN === 'string' ? (await q(`select item_key, status, worker_id, left(error, 300) e from public.generation_item_runs where job_id = $1 and status <> 'completed' order by item_key`, [CURRENT_RUN])) : [];
+        throw new Error(`E24: ${label} — no ocurrió en ${timeoutMs} ms; partes: ${JSON.stringify(st).slice(0, 3000)}`);
+      };
+      const reqs = (pred) => fake.st.requests.filter((r) => pred(r.text));
+      const finished = async (runId) => q(`select item_key, type, status, worker_id, finished_at, error, output_summary, attempt_count, max_attempts from public.generation_item_runs where job_id = $1 order by item_key`, [runId]);
+      const unsettledRes = async (itemRunId) => (await q(`select count(*)::int n from public.generation_cost_events e where e.idempotency_key like $1 and (e.metadata->>'reservation') = 'true'
+          and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [`reservation:llm:${itemRunId}:%`]))[0].n;
+      const startRun = async (c, title) => {
+        const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { nombre: title, ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+        ok(start.status === 201, `E24: run mock creado (${title})`, { s: start.status, e: start.error });
+        if (start.status !== 201) throw new Error(`E24: run no creado ${start.status} ${start.error}`);
+        return start.data.run.id;
+      };
+      let w1 = null; let w2 = null; let w3 = null; let w4 = null;
+      let CURRENT_RUN = null;
+      try {
+        await stopProc(app);
+        app = await startApp({ DYNAMIC_LLM_WORKER_ENABLED: 'true' }, 'app-v3-llmw');
+        w1 = spawnProc('llm-worker-1', 'workers/dynamic-llm-worker.js', wEnv(W1));
+
+        // ── Corrida 1: generación >100 s, navegador cerrado, desconocido (1 reintento), worker caído, idempotencia ──
+        const C = { key: 'E24', title: '[E2E Worker IA E24] Mantenimiento de bombas centrífugas', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+          { title: 'Bombas de proceso', objective: 'Mantener bombas centrífugas de proceso', exam: true, chapters: [
+            { title: 'Inspección de bombas centrífugas', v: false, a: true, app: 60, objective: 'Inspeccionar una bomba centrífuga antes de liberarla' },
+            { title: 'Sellos mecánicos', v: false, a: true, objective: 'Diagnosticar fugas en sellos mecánicos' },
+            { title: 'Alineación de ejes', v: false, a: false, objective: 'Alinear el eje de la bomba con el motor' },
+          ] }] };
+        llm.st.tag = 'E24';
+        const c = await createCourse(C, llm);
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 1 COMPLETO: "Inspección de bombas centrífugas"'), 'slow', 1, 105000);
+        fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Sellos mecánicos"'), 'drop', 1);
+        fake.rule((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'), 'hold', 1);
+        c.runId = await startRun(c, C.title);
+        CURRENT_RUN = c.runId;
+        S.front.DYN_EXAM_BANK_MODE_ENABLED = true;
+        const claims0 = claimLog.length;
+        let ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        // El navegador DESAPARECE apenas el worker tomó el Libro Guía.
+        await waitFor('el worker tomó un Libro Guía', async () => (await finished(c.runId)).some((i) => i.type === 'content' && i.worker_id === W1));
+        ctl.stop();
+        const browserGoneAt = Date.now();
+        await waitFor('Libros Guía completos sin navegador', async () => (await finished(c.runId)).filter((i) => i.type === 'content').every((i) => i.status === 'completed'), 300000);
+        // Worker caído EN VUELO: la 2.ª pasada de la Actividad (solucionario) quedó colgada → kill -9.
+        await waitFor('solucionario en vuelo', async () => fake.st.requests.some((r) => r.action === 'hold'), 300000);
+        const actBefore = reqs((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN')).length;
+        const longDoneWhileGone = (await finished(c.runId)).filter((i) => LONG.includes(i.type) && i.status === 'completed').map((i) => i.item_key);
+        w1.kill('SIGKILL');
+        await waitFor('worker 1 muerto', async () => !!w1.exited, 10000, 100);
+        await sleep(16000); // vence la lease (15 s)
+        w2 = spawnProc('llm-worker-2', 'workers/dynamic-llm-worker.js', wEnv(W2));
+        const browserBackAt = Date.now();
+        ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        const stt = await waitRunTerminal(ctl, 'E24 run', 15 * 60 * 1000, c.runId);
+        const items = await waitItemsDone(c.runId);
+        const rows = await finished(c.runId);
+        ok(items.every((i) => i.status === 'completed'), `E24: las ${items.length} partes completas (navegador + worker de IA)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
+        const longRows = rows.filter((i) => LONG.includes(i.type));
+        ok(longRows.length >= 7 && longRows.every((i) => [W1, W2].includes(i.worker_id)), 'E24: las partes LARGAS (Libro Guía, Actividad, SCORM, examen final) las generó el worker de IA', longRows.map((i) => [i.item_key, i.worker_id]));
+        const browserClaims = claimLog.slice(claims0);
+        ok(browserClaims.length > 0 && !browserClaims.some((x) => LONG.includes(x.type)), 'E24: el navegador nunca reclamó una parte larga (el servidor se las filtra); sí las cortas', browserClaims.map((x) => x.type));
+        const r105 = fake.st.requests.find((r) => r.action === 'slow');
+        ok(r105 && r105.outcome === 'ok' && r105.end - r105.at >= 100000, `E24: generación de ${r105 ? Math.round((r105.end - r105.at) / 1000) : '?'} s (>100 s) completa por streaming directo — sin 524`, r105 && { outcome: r105.outcome, ms: r105.end - r105.at });
+        ok(longDoneWhileGone.filter((k) => k.startsWith('content:')).length === 3, 'E24: con el navegador CERRADO el worker terminó los 3 Libros Guía (y siguió con lo demás)', { longDoneWhileGone, gone: browserGoneAt, back: browserBackAt });
+        const exp2 = reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Sellos mecánicos"'));
+        const exp2Row = rows.find((i) => i.type === 'experience' && exp2.length && i.status === 'completed' && i.item_key.endsWith(c.mods[0].chapters[1].id));
+        ok(exp2.length >= 2 && exp2[0].outcome === 'dropped' && exp2.some((r) => r.outcome === 'ok') && exp2Row, 'E24: resultado DESCONOCIDO (sin respuesta) → UN reintento automático → la experiencia se completó sin intervención', exp2.map((r) => r.outcome));
+        const expItem = (await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c.runId, `experience:${c.mods[0].chapters[1].id}`]))[0];
+        eq(await unsettledRes(expItem.id), 1, 'E24: el desconocido quedó como UNA reserva pendiente (cuenta en el presupuesto; se concilia después)');
+        const actAfter = reqs((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN')).length;
+        eq(actAfter, actBefore, 'E24: tras la caída del worker, la 1.ª pasada de la Actividad NO se volvió a generar ni a cobrar (punto de guardado)');
+        const sol = reqs((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'));
+        const aaRow = rows.find((i) => i.type === 'application_activity');
+        ok(sol.length >= 2 && sol[0].outcome === 'held' && aaRow && aaRow.status === 'completed' && aaRow.worker_id === W2, 'E24: worker caído en vuelo → otro worker retomó la parte desde su punto de guardado y la completó', { sol: sol.map((r) => r.outcome), w: aaRow && aaRow.worker_id });
+        const dupArts = await q(`select g.item_key, a.type, count(*)::int n from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 group by 1, 2 having count(*) > 1`, [c.runId]);
+        eq(dupArts, [], 'E24: idempotencia — un solo artifact por parte y tipo');
+        const dupCharges = await q(`select external_operation_id, count(*)::int n from public.generation_cost_events where run_id = $1 and provider = 'anthropic' and event_kind = 'CHARGE'
+            and coalesce((metadata->>'reservation') = 'true', false) = false group by 1 having count(*) > 1`, [c.runId]);
+        eq(dupCharges, [], 'E24: idempotencia — un solo cargo por respuesta de Anthropic');
+        // Se cobra lo que Anthropic GENERÓ: respuestas completas y streams cortados a mitad (cobro conservador).
+        const okIds = new Set(fake.st.requests.filter((r) => r.messageId && ['ok', 'cut', 'client_gone'].includes(r.outcome)).map((r) => r.messageId));
+        const charged = await q(`select external_operation_id id from public.generation_cost_events where run_id = $1 and provider = 'anthropic' and event_kind = 'CHARGE'
+            and coalesce((metadata->>'reservation') = 'true', false) = false and external_operation_id like 'msg_sse_%'`, [c.runId]);
+        ok(charged.length > 0 && charged.every((r) => okIds.has(r.id)), `E24: cada cargo corresponde a una respuesta que el proveedor falso realmente generó (${charged.length} cargos)`);
+        const cost1 = (await q(`select coalesce(sum(amount),0)::float8 t from public.generation_cost_events where run_id = $1 and provider = 'anthropic'`, [c.runId]))[0].t;
+        results.courses.E24 = { courseId: c.courseId, runId: c.runId, items: items.length, anthropicUsd: cost1, requests: fake.st.requests.map((r) => ({ action: r.action, outcome: r.outcome, ms: r.end ? r.end - r.at : null })), status: stt.status, humanInterventions: rows.filter((i) => i.status !== 'completed').length };
+
+        // ── Corrida 2: pausa/reanudar, drenaje (deploy), desconocido ×2 → revisión, presupuesto agotado; el resto sigue ──
+        const C2 = { key: 'E24b', title: '[E2E Worker IA E24b] Confiabilidad de bombas', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Fallas de bombas', objective: 'Diagnosticar fallas de bombas', exam: false, chapters: [
+            { title: 'Lubricación de rodamientos', v: false, a: false, objective: 'Lubricar rodamientos según el plan' },
+            { title: 'Vibraciones en bombas', v: false, a: false, objective: 'Interpretar vibraciones de una bomba' },
+            { title: 'Cavitación en la succión', v: false, a: false, objective: 'Prevenir la cavitación en la succión' },
+          ] }] };
+        llm.st.tag = 'E24b';
+        const c2 = await createCourse(C2, llm);
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 1 COMPLETO: "Lubricación de rodamientos"'), 'slow', 1, 12000);
+        fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"'), 'drop', 2);
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"'), 'cut', 200);
+        c2.runId = await startRun(c2, C2.title);
+        CURRENT_RUN = c2.runId;
+        const runsBase2 = `/courses/${c2.courseId}/blueprints/${c2.n}/manifest/runs/${c2.runId}`;
+        let ctl2 = S.front.dynExecutorStart({ courseId: c2.courseId, blueprintNumber: c2.n, runId: c2.runId });
+        // PAUSA con el Libro Guía del cap. 1 en vuelo (12 s): nadie toma partes nuevas ni gasta; reanudar sigue.
+        await waitFor('Libro del cap. 1 en vuelo', async () => fake.st.requests.some((r) => r.action === 'slow' && r.text.includes('Lubricación de rodamientos')), 120000);
+        const pz = await api('POST', `${runsBase2}/pause`, {});
+        ok(pz.status === 200 || pz.status === 201, 'E24b: pausa del usuario aceptada', { s: pz.status, e: pz.error });
+        await sleep(15000);
+        const nPaused = fake.st.requests.length;
+        await sleep(8000);
+        eq(fake.st.requests.length, nPaused, 'E24b: con el run PAUSADO el worker no hace llamadas nuevas a la IA');
+        const claimedWhilePaused = (await finished(c2.runId)).filter((i) => i.status === 'running');
+        eq(claimedWhilePaused.length, 0, 'E24b: con el run pausado no queda ninguna parte en curso (la que estaba en vuelo terminó o volvió a la cola)');
+        const rz = await api('POST', `${runsBase2}/resume`, {});
+        ok(rz.status === 200 || rz.status === 201, 'E24b: reanudar aceptado', { s: rz.status, e: rz.error });
+        // Para el drenaje: la experiencia del cap. 1 (aún no pedida: depende del Libro y el run estuvo pausado) tarda 20 s.
+        const lubExpReqs0 = reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Lubricación de rodamientos"')).length;
+        fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Lubricación de rodamientos"'), 'slow', 1, 20000);
+        ctl2.stop();
+        ctl2 = S.front.dynExecutorStart({ courseId: c2.courseId, blueprintNumber: c2.n, runId: c2.runId });
+        eq(lubExpReqs0, 0, 'E24b: la parte usada para el drenaje no se había pedido antes de reanudar');
+        // DRENAJE (deploy): SIGTERM con trabajo en vuelo → termina lo que tiene y sale; otro worker sigue.
+        await waitFor('trabajo en vuelo del worker 2', async () => fake.st.requests.some((r) => r.action === 'slow' && r.outcome === 'pending' && r.text.includes('CAPÍTULO: "Lubricación de rodamientos"') && r.text.includes('Genera la EXPERIENCIA del capítulo'))
+          && (await finished(c2.runId)).some((i) => i.status === 'running' && i.worker_id === W2), 120000, 200);
+        const drainingKeys = (await finished(c2.runId)).filter((i) => i.status === 'running' && i.worker_id === W2).map((i) => i.item_key);
+        w2.kill('SIGTERM');
+        await waitFor('worker 2 drenado', async () => !!w2.exited, 120000, 200);
+        const afterDrain = await finished(c2.runId);
+        ok(drainingKeys.every((k) => { const r = afterDrain.find((i) => i.item_key === k); return r && r.status !== 'running'; }), 'E24b: drenaje — lo que el worker tenía en vuelo terminó o volvió a la cola antes de salir (nada quedó colgado)', { drainingKeys, exited: w2.exited });
+        w3 = spawnProc('llm-worker-3', 'workers/dynamic-llm-worker.js', wEnv(W3));
+        await waitRunTerminal(ctl2, 'E24b run', 15 * 60 * 1000, c2.runId).catch(() => null);
+        const rows2 = await waitItemsDone(c2.runId);
+        const f2 = await finished(c2.runId);
+        const vib = f2.find((i) => i.type === 'experience' && i.item_key.endsWith(c2.mods[0].chapters[1].id));
+        ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 2,
+          'E24b: dos resultados desconocidos → SOLO esa parte queda en revisión (llm_pending_review) con las 2 reservas para conciliar', vib && { st: vib.status, e: (vib.error || '').slice(0, 160), pr: vib.output_summary && vib.output_summary.llmPendingReview });
+        eq(reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"')).length, 2, 'E24b: tras el segundo desconocido la parte NO se volvió a generar');
+        const cav = f2.find((i) => i.type === 'content' && i.item_key.endsWith(c2.mods[0].chapters[2].id));
+        const cavCalls = reqs((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"')).length;
+        const cavSpent = (await q(`select coalesce(sum(amount),0)::float8 t from public.generation_cost_events where run_id = $1 and item_key = $2`, [c2.runId, cav.item_key]))[0].t;
+        ok(cav && cav.status === 'failed' && /^item_recovery_budget_exhausted/.test(cav.error || ''), 'E24b: cortes repetidos → la parte agota su presupuesto de recuperación y se detiene SOLO ella', cav && { st: cav.status, e: (cav.error || '').slice(0, 200), calls: cavCalls, usd: cavSpent });
+        ok(cavCalls <= 12, `E24b: el gasto de la parte quedó acotado (${cavCalls} llamadas, USD ${cavSpent.toFixed(4)})`, { cavCalls, cavSpent });
+        const lub = f2.filter((i) => i.item_key.endsWith(c2.mods[0].chapters[0].id));
+        ok(lub.length > 0 && lub.every((i) => i.status === 'completed'), 'E24b: las partes INDEPENDIENTES (cap. 1) siguieron y se completaron', lub.map((i) => [i.item_key, i.status]));
+        const needsHuman = f2.filter((i) => i.status === 'failed');
+        eq(needsHuman.map((i) => (i.error || '').split(':')[0]).sort(), ['item_recovery_budget_exhausted', 'llm_pending_review'], 'E24b: solo 2 partes piden a una persona (los 2 casos inseguros inyectados); el resto, automático');
+        results.courses.E24b = { courseId: c2.courseId, runId: c2.runId, items: rows2.length, failed: needsHuman.map((i) => [i.item_key, (i.error || '').slice(0, 120)]), cavitationCalls: cavCalls, cavitationUsd: cavSpent };
+      } finally {
+        for (const w of [w1, w2, w3, w4]) if (w && !w.exited) await stopProc(w, 30000);
+        await fake.close();
+        await stopProc(app);
+        app = await startApp();
+      }
+    }, { fatal: false });
+
     // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
-    const MOODLE_JOBS = ONLY_REAL_PROVIDERS ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
+    const MOODLE_JOBS = ONLY_REAL_PROVIDERS || ONLY_LLM_WORKER ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
     // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).
     if (results.mbz.E5) MOODLE_JOBS.push(['E5', 'E5']);
     // LOOP 7 · E11: el curso del flujo completo y su re-empaque tras la regeneración parcial.
@@ -3795,7 +3968,7 @@ function reservationBookkeeping(ev) {
     const PHPINI = process.env.MOODLE_PHPINI;
     const kindOf = (idn) => (/:video$/.test(idn) ? 'video' : /:activity$/.test(idn) ? 'activity' : /^cv3:exam:/.test(idn) ? 'exam' : idn === 'cv3:final_exam' ? 'finalExam' : null);
     results.moodle = {};
-    if (!ONLY_REAL_PROVIDERS) await step('moodle-preflight-h5p', async () => {
+    if (!ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER) await step('moodle-preflight-h5p', async () => {
       const pf = spawnSync(process.execPath, [path.join(REPO, 'scripts/h5p-preflight-moodle.js'), process.env.MOODLE_ROOT, PHPINI], { encoding: 'utf8', env: { ...process.env, PHP_BIN: PHP } });
       ok(pf.status === 0, 'preflight de librerías H5P del sitio vs CURSIA_H5P_PROFILE_V1 (h5p-preflight-moodle.js) pasa', (pf.stdout + pf.stderr).slice(-800));
     }, { fatal: false });

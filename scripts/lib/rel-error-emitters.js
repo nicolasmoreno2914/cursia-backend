@@ -174,6 +174,7 @@ const FN_CODES = {
   drainHandbackMessage: { codes: ['worker_draining'], mention: 'WORKER_DRAINING' },
   runPausedHandbackMessage: { codes: ['run_paused'], mention: 'RUN_PAUSED_HANDBACK' },
   itemRecoveryBudgetMessage: { codes: ['item_recovery_budget_exhausted'], mention: 'ITEM_RECOVERY_BUDGET_EXHAUSTED' },
+  pendingReviewMessage: { codes: ['llm_pending_review'], mention: 'LLM_PENDING_REVIEW' },
   durationUnmeasurableMessage: { codes: ['video_duration_unmeasurable'], mention: 'VIDEO_DURATION_UNMEASURABLE' },
   durationUnmeasuredMessage: { codes: ['video_duration_unmeasured'], mention: 'VIDEO_DURATION_UNMEASURED' },
   v3ValidationErrorMessage: { codes: ['v3_payload_invalid'], mention: 'V3_PAYLOAD_INVALID' },
@@ -196,6 +197,10 @@ const DYNAMIC_EMITTERS = {
   'workers/dynamic-item-worker.ts#`youtube_${state}:${detail}`': ['youtube_blocked_auth'],
   // fail() del worker de proveedores reenvía el mensaje de SUS callers (que se escanean uno por uno).
   'workers/provider-real/real-providers.ts#message': [],
+  // Loop 4: fail() del worker de IA reenvía el mensaje de SUS callers: el texto del ejecutor (mismo código del
+  // navegador, sección 4 --fe), run_paused / item_recovery_budget_exhausted / llm_pending_review (helpers con código)
+  // y frases fijas (no se pudo subir el artifact, complete rechazado, unexpected_error).
+  'workers/dynamic-llm-worker.ts#msg': ['run_paused', 'llm_pending_review', 'item_recovery_budget_exhausted', 'artifact_upload_failed', 'complete_rejected', 'unexpected_error'],
   // Endpoint del ejecutor del navegador: el texto lo arma el ejecutor (sección 4, --fe).
   'modules/dynamic-generation/executor.controller.ts#dto.error': [],
   // Empaque: errMessage(err) de cualquier builder/validador → familias de PACKAGE (sección 3 del escaneo).

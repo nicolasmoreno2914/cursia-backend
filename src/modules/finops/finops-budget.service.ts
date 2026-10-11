@@ -665,6 +665,25 @@ export class FinopsBudgetService {
       [a.itemRunId],
     );
     if (!row || String(row.owner_id) !== String(a.subject)) return null; // sin atribución verificable: el ingest la deja sin run
+    return this.guardLlmCallForRun({ runId: row.job_id, workerStatus: row.worker_status, itemRunId: a.itemRunId, model: a.model, promptChars: a.promptChars, maxTokens: a.maxTokens });
+  }
+
+  /**
+   * Loop 4: misma decisión para una llamada LLM hecha por el WORKER del backend (sin proxy): pausa, tope del run,
+   * presupuesto de recuperación de la parte y disyuntor. → null = permitida.
+   */
+  async guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
+    code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
+  }> {
+    const [row] = await this.dataSource.query(`select worker_status from public.production_jobs where id = $1`, [a.runId]);
+    if (!row) return { code: 'run_paused', message: 'El run no existe.', runId: a.runId, paused: false };
+    return this.guardLlmCallForRun({ runId: a.runId, workerStatus: row.worker_status, itemRunId: a.itemRunId, model: a.model, promptChars: a.promptChars, maxTokens: a.maxTokens });
+  }
+
+  private async guardLlmCallForRun(a: { runId: string; workerStatus: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
+    code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
+  }> {
+    const row = { job_id: a.runId, worker_status: a.workerStatus };
     if (row.worker_status === 'paused') {
       return { code: 'run_paused', message: 'El run está pausado: no se hacen llamadas nuevas hasta reanudarlo.', runId: row.job_id, paused: true };
     }
