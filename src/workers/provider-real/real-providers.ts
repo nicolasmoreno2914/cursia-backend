@@ -84,7 +84,8 @@ import {
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
 import { DRAIN_HANDBACK_RETRY_SECONDS, DrainSignal, drainHandbackMessage, runPausedHandbackMessage } from '../worker-drain';
-import { RUN_PAUSED_GUARD_REASON } from '../../modules/finops/finops-budget.service';
+import { ITEM_RECOVERY_BUDGET_REASON, RUN_PAUSED_GUARD_REASON } from '../../modules/finops/finops-budget.service';
+import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
 import {
   AUDIOBOOK_SCRIPT_MODEL_DEFAULT,
   AUDIOBOOK_SCRIPT_MODEL_ENV,
@@ -274,11 +275,18 @@ async function guard(deps: RealProviderDeps, item: ClaimedItem, provider?: strin
     runId: item.runId, itemRunId: item.itemRunId, itemType: item.type, ...(provider ? { provider } : {}), ...(nextCall ? { nextCall } : {}),
   });
   if (g.allow) return true;
-  if (g.reason === RUN_PAUSED_GUARD_REASON && (deps.tracker?.inFlight || deps.tracker?.unpersistedPaidOutput)) {
+  if ((g.reason === RUN_PAUSED_GUARD_REASON || g.reason === ITEM_RECOVERY_BUDGET_REASON) && (deps.tracker?.inFlight || deps.tracker?.unpersistedPaidOutput)) {
     // Review I1: hay salida PAGADA sin persistir (p. ej. el bloque principal de una sección del audiolibro y falta
     // su continuación): devolver ahora la dejaría huérfana → reconciliación al reanudar y se volvería a pagar.
     // Igual que el drenaje: la unidad en curso termina y se persiste; la pausa se aplica en el próximo borde limpio.
     return true;
+  }
+  if (g.reason === ITEM_RECOVERY_BUDGET_REASON) {
+    // Loop Cost Efficiency: ESTA parte agotó su presupuesto de recuperación → se detiene solo ella (no reintentable,
+    // fuera del auto-heal); el resto del curso sigue.
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, itemRecoveryBudgetMessage((g as { detail?: string }).detail || 'presupuesto de recuperación agotado'), false);
+    deps.logger.warn(`Item ${item.itemKey}: presupuesto de recuperación agotado — no se llama al proveedor`);
+    return false;
   }
   if (g.reason === RUN_PAUSED_GUARD_REASON) {
     // Piloto #1209: el run se pausó con la parte ya reclamada → vuelve a la cola sin llamar (sin gasto, sin

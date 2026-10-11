@@ -43,7 +43,8 @@ import {
   reportVideoDeliveryConfigAtStartup,
 } from '../modules/dynamic-generation/dynamic-video-delivery';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
-import { FinopsBudgetService, RUN_PAUSED_GUARD_REASON } from '../modules/finops/finops-budget.service';
+import { FinopsBudgetService, ITEM_RECOVERY_BUDGET_REASON, RUN_PAUSED_GUARD_REASON } from '../modules/finops/finops-budget.service';
+import { itemRecoveryBudgetMessage } from '../modules/finops/run-spend-guard';
 import {
   WorkerBudget,
   WorkerLedger,
@@ -684,6 +685,11 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           return;
         }
         const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: 'video' });
+        if (!g.allow && g.reason === ITEM_RECOVERY_BUDGET_REASON) {
+          logger.warn(`Item ${item.itemKey} (run ${item.runId}): presupuesto de recuperación agotado — no se envía a Videogen`);
+          await scheduler.failItem(item.itemRunId, deps.executorId, itemRecoveryBudgetMessage((g as { detail?: string }).detail || 'presupuesto de recuperación agotado'), false);
+          return;
+        }
         if (!g.allow && g.reason === RUN_PAUSED_GUARD_REASON) {
           // Piloto #1209: run pausado con la parte ya reclamada → vuelve a la cola sin enviar (sin gasto ni intento).
           logger.warn(`Item ${item.itemKey} (run ${item.runId}): run pausado — no se envía a Videogen; la parte vuelve a la cola`);

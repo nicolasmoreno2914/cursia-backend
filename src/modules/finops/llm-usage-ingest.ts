@@ -163,7 +163,9 @@ export function parseLlmReservationIngest(body: unknown): LlmReservationIngestBo
 // sin cobro (no autenticado / sin permiso / no encontrado / demasiado grande / rate limit / sobrecargado),
 // antes de procesarlo. Cualquier otro error (400 incluido: el piloto #1209 mostró 400 con costo en la
 // consola; 5xx; cortes) es INCIERTO → la reserva queda pendiente para conciliar.
-export const LLM_RESERVATION_RELEASABLE_STATUSES = [401, 403, 404, 413, 429, 529] as const;
+// Loop de costos (review C2): 500 = api_error de Anthropic (error interno, no se factura) → también se libera; si no,
+// cada error temporal del proveedor dejaba una reserva a max_tokens que consumía el presupuesto de la parte.
+export const LLM_RESERVATION_RELEASABLE_STATUSES = [401, 403, 404, 413, 429, 500, 529] as const;
 
 export interface LlmReservationReleaseBody {
   callId: string;

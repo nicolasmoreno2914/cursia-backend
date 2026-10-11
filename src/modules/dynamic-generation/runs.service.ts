@@ -328,6 +328,11 @@ export interface RunDto {
   executionLease: ExecutionLeaseView | null;
   /** Pausada por el usuario (servidor = autoridad): no recibe partes nuevas hasta resumeRun. */
   paused: boolean;
+  /**
+   * Loop Cost Efficiency: quién / por qué se pausó (solo mientras está pausado). `automatic` = la pausó Cursia
+   * (disyuntor de consumo anómalo o tope del presupuesto del run), con el motivo legible en `detail`.
+   */
+  pauseInfo: { automatic: boolean; reason: string | null; detail: string | null; pausedAt: string | null } | null;
 }
 
 /** REL lease: quién consulta el run (solo para `executionLease.heldByYou`). */
@@ -1854,6 +1859,25 @@ export class RunsService {
     ownerId = await this.ownerForActor(courseId, ownerId, actor);
     const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
     const job = await this.loadRunRow(courseId, manifest, runId);
+    // Loop Cost Efficiency: reanudar tras una pausa del DISYUNTOR = el usuario acepta el sobreconsumo hasta ahora;
+    // se registra ANTES de reabrir (todavía pausado) para que no vuelva a disparar por lo mismo en la llamada siguiente.
+    const pauseReason = (job as any)?.output_summary?.pause?.reason;
+    if (isPausedRun(job) && pauseReason === 'run_budget_cap' && this.finopsBudget) {
+      // Review I3: reanudar sin ampliar el presupuesto volvería a pausar en la llamada siguiente.
+      const [auth, spent] = await Promise.all([this.finopsBudget.runAuthorizedBudget(job.id), this.finopsBudget.runActual(job.id)]);
+      // Re-review N2: lo que hacía falta al pausar (gastado + la llamada negada); sin ese dato, lo gastado.
+      const required = Math.max(Number(spent), Number((job as any)?.output_summary?.pause?.requiredUsd ?? 0) || 0);
+      if (auth === null || Number(auth) < required - 1e-9) {
+        throw new ConflictException({
+          code: 'run_budget_cap',
+          message: `La generación se pausó porque alcanzó su presupuesto autorizado (USD ${Number(auth ?? 0).toFixed(2)}; gastado USD ${Number(spent).toFixed(2)}). Para continuar hay que ampliar el presupuesto.`,
+        });
+      }
+    }
+    if (isPausedRun(job) && pauseReason === 'circuit_breaker' && this.finopsBudget) {
+      const over = await this.finopsBudget.acknowledgeBreakerOnResume(job.id);
+      this.logger.warn(`run ${job.id}: reanudado tras el disyuntor — sobreconsumo aceptado USD ${over.toFixed(2)}`);
+    }
     await this.tx(async (qr) => {
       const [locked] = await qr.query(`select id, status, worker_status from public.production_jobs where id = $1 for update`, [job.id]);
       if (!isPausedRun(locked)) {
@@ -2274,13 +2298,16 @@ export class RunsService {
       const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerProbe?.mode === 'canary'
         ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
+      // Loop de costos (review C1): una reapertura MANUAL (dueño / admin) le da a la parte un presupuesto de recuperación
+      // NUEVO (recoveryBudgetResetAt: cuenta lo gastado desde ahora), así una parte detenida por presupuesto siempre se
+      // puede recuperar. Las reaperturas automáticas (auto-heal) NO lo reinician: siguen dentro del mismo presupuesto.
       const updated = returningRows(
         await qr.query(
           `update public.generation_item_runs
               set status = 'pending',
                   max_attempts = attempt_count + $2::int,
                   -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
-                  output_summary = (${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}',
+                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`},
                   error = null,
                   next_retry_at = null,
                   worker_id = null,
@@ -5167,6 +5194,7 @@ export class RunsService {
       lastBrowserActivityAt: lastBrowserActivityOf(rows),
       executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isDispatchableRun(job)),
       paused: isPausedRun(job),
+      pauseInfo: isPausedRun(job) ? pauseInfoOf(job) : null,
     };
   }
 
@@ -5289,4 +5317,16 @@ export class RunsService {
       finishedAt: toIso(r.finished_at),
     };
   }
+}
+
+/** Loop Cost Efficiency: datos de la pausa vigente (output_summary.pause) para el panel. */
+function pauseInfoOf(job: { output_summary?: unknown }): RunDto['pauseInfo'] {
+  const p = (job.output_summary && typeof job.output_summary === 'object' ? (job.output_summary as any).pause : null) || {};
+  const by = typeof p.pausedBy === 'string' ? p.pausedBy : '';
+  return {
+    automatic: by.startsWith('system:'),
+    reason: typeof p.reason === 'string' ? p.reason : null,
+    detail: typeof p.detail === 'string' ? p.detail.slice(0, 500) : null,
+    pausedAt: p.pausedAt ? String(p.pausedAt) : null,
+  };
 }

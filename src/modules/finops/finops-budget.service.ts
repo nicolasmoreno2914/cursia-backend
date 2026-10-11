@@ -7,6 +7,7 @@ import { EstimateItem, EstimateResult, RetryPolicy, estimateCost } from './estim
 import { usageModelPriorsV1 } from './usage-model';
 import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, runtimeGuard } from './budget';
 import { FinopsLedgerService } from './finops-ledger.service';
+import { BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE, decideRunSpend, RunSpendDecision } from './run-spend-guard';
 import {
   RunBudgetDecision,
   RunManifestItem,
@@ -509,6 +510,233 @@ export class FinopsBudgetService {
     if (next === null) {
       return { allow: false, decision: 'BLOCK', committed: addDec(actualSoFar, reservedInFlight), remaining: null, reason: 'call_unpriced', authorizedBudget } as RuntimeGuardResult & { authorizedBudget: string | null };
     }
-    return { ...runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight, next }), authorizedBudget };
+    const base = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight, next });
+    if (!base.allow) return { ...base, authorizedBudget };
+    // Loop Cost Efficiency: presupuesto de recuperación de ESTA parte + disyuntor del run (ver run-spend-guard.ts).
+    const spend = await this.guardRunSpend({ runId: a.runId, itemRunId: a.itemRunId, nextCost: Number(next), authorizedBudget: null });
+    const d = spend.decision;
+    if (d.allow) return { ...base, authorizedBudget };
+    if (d.reason === 'circuit_breaker') {
+      // El run quedó pausado por el disyuntor: el worker devuelve la parte (como cualquier pausa).
+      return { allow: false, decision: 'BLOCK', committed: base.committed, remaining: base.remaining, reason: RUN_PAUSED_GUARD_REASON, authorizedBudget };
+    }
+    return { allow: false, decision: 'BLOCK', committed: base.committed, remaining: base.remaining, reason: ITEM_RECOVERY_BUDGET_REASON, authorizedBudget, detail: 'detail' in d ? d.detail : '' } as RuntimeGuardResult & { authorizedBudget: string | null };
+  }
+
+  // ─── Loop Cost Efficiency + Reliability (tras #1209) ─────────────────────────────────────────────
+
+  /** Costo esperado / máximo estimado por item_key, del estimado vigente del run (cache corto por run). */
+  private readonly runEstimateCache = new Map<string, { at: number; byKey: Map<string, { expected: number; max: number }>; total: number | null }>();
+
+  async runItemEstimates(runId: string): Promise<{ byKey: Map<string, { expected: number; max: number }>; total: number | null }> {
+    const hit = this.runEstimateCache.get(runId);
+    if (hit && Date.now() - hit.at < 60_000) return hit;
+    // Estimado del run (el más reciente) + estimados de regeneración / upgrade de video aprobados SOBRE el mismo run
+    // (review I1): ese gasto aprobado también es «esperado» (si no, un upgrade legítimo dispararía el disyuntor).
+    const rows: Array<{ scope: string; lines: any; totals: any }> = await this.dataSource.query(
+      `(select scope, lines, totals from public.cost_estimates where run_id = $1 and scope = 'run' order by created_at desc, id desc limit 1)
+       union all
+       (select scope, lines, totals from public.cost_estimates where run_id = $1 and scope = 'regeneration')`,
+      [runId],
+    );
+    const byKey = new Map<string, { expected: number; max: number }>();
+    let total = 0;
+    let hasRun = false;
+    for (const est of rows) {
+      if (est.scope === 'run') hasRun = true;
+      for (const l of (est?.lines ?? []) as Array<Record<string, any>>) {
+        if (!l || typeof l.itemKey !== 'string') continue;
+        const cur = byKey.get(l.itemKey) ?? { expected: 0, max: 0 };
+        // Esperado CON la tasa de reintentos del estimado (expected), y su máximo.
+        cur.expected += Number(l.expected ?? l.wouldCost?.expected ?? 0) || 0;
+        cur.max += Number(l.max ?? l.wouldCost?.max ?? 0) || 0;
+        byKey.set(l.itemKey, cur);
+      }
+      if (est?.totals?.expected !== undefined && est?.totals?.expected !== null) total += Number(est.totals.expected) || 0;
+    }
+    const v = { at: Date.now(), byKey, total: hasRun && byKey.size ? total : null };
+    if (this.runEstimateCache.size > 500) this.runEstimateCache.clear();
+    this.runEstimateCache.set(runId, v);
+    return v;
+  }
+
+  /**
+   * Decide una llamada pagada contra el tope del run, el presupuesto de recuperación de la parte y el disyuntor.
+   * Si dispara el disyuntor (o el tope del run en `pauseOnCap`), PAUSA el run (pausa segura del servidor, reanudable
+   * por el usuario). `authorizedBudget`: tope a aplicar (null = no aplicar el punto 1 acá).
+   */
+  async guardRunSpend(a: { runId: string; itemRunId: string | null; nextCost: number; authorizedBudget: number | null; pauseOnCap?: boolean; snapshot?: boolean }): Promise<{
+    decision: RunSpendDecision; itemKey: string | null; paused: boolean; overspend?: number; runExpected?: number | null;
+  }> {
+    const est = await this.runItemEstimates(a.runId);
+    let itemKey: string | null = null;
+    let itemSpent: number | null = null;
+    let itemLargest = 0;
+    if (a.itemRunId) {
+      const [it] = await this.dataSource.query(`select item_key from public.generation_item_runs where id = $1 and job_id = $2`, [a.itemRunId, a.runId]);
+      if (it) {
+        itemKey = it.item_key;
+        // Review C1: lo gastado en la GENERACIÓN vigente de la parte desde su último reinicio de presupuesto (un
+        // reintento manual o una regeneración le dan un presupuesto nuevo: la parte siempre se puede recuperar).
+        // Dentro de esa ventana cuenta TODO (reintentos de la llamada, intentos del item, rondas del auto-heal).
+        const [sp] = await this.dataSource.query(
+          `with cur as (
+             select created_at, nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz as reset_at
+               from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1)
+           select coalesce(sum(e.amount),0)::text as t,
+                  -- la COTA de la llamada más grande = su reserva previa (nunca el uso real: un cargo enorme no
+                  -- puede agrandar su propio presupuesto)
+                  coalesce(max(e.amount) filter (where e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'),0)::text as largest
+             from public.generation_cost_events e, cur
+            where e.run_id = $1 and e.item_key = $2 and e.billing_account <> 'user_key'
+              and e.created_at >= greatest(cur.created_at, coalesce(cur.reset_at, cur.created_at))`,
+          [a.runId, itemKey],
+        );
+        itemSpent = Number(sp.t);
+        itemLargest = Number(sp.largest);
+      }
+    }
+    const [runSpentRow] = await this.dataSource.query(
+      `select coalesce(sum(amount),0)::text as t from public.generation_cost_events where run_id = $1 and billing_account <> 'user_key'`,
+      [a.runId],
+    );
+    const [ackRow] = await this.dataSource.query(
+      `select coalesce((output_summary->'spendBreaker'->>'acknowledgedUsd')::numeric, 0)::text as ack from public.production_jobs where id = $1`,
+      [a.runId],
+    );
+    let progressExpected: number | null = null;
+    if (est.total !== null) {
+      // Avance = partes terminadas, en curso, o en las que ya se gastó algo (una parte en reintento también es avance
+      // con costo esperado): el disyuntor compara lo gastado contra lo esperado de ESAS partes → detecta anomalías
+      // sistémicas (muchas partes por encima de lo esperado), no una sola parte cara (eso lo acota su presupuesto).
+      const rows: Array<{ item_key: string }> = await this.dataSource.query(
+        `select item_key from (
+           select distinct on (item_key) item_key, status from public.generation_item_runs
+            where job_id = $1 order by item_key, generation desc) s
+          where s.status in ('completed', 'running')
+         union
+         select distinct item_key from public.generation_cost_events
+          where run_id = $1 and item_key is not null and billing_account <> 'user_key'`,
+        [a.runId],
+      );
+      progressExpected = rows.reduce((acc, r) => acc + (est.byKey.get(r.item_key)?.expected ?? 0), 0);
+    }
+    const ie = itemKey ? est.byKey.get(itemKey) ?? null : null;
+    const decision = decideRunSpend({
+      authorizedBudget: a.authorizedBudget,
+      runSpent: Number(runSpentRow.t),
+      nextCost: a.nextCost,
+      itemSpent,
+      itemExpected: ie ? ie.expected : null,
+      itemEstimatedMax: ie ? ie.max : null,
+      runExpected: est.total,
+      progressExpected,
+      breakerAcknowledgedUsd: ackRow ? Number(ackRow.ack) : 0,
+      itemLargestCall: itemLargest,
+    });
+    let paused = false;
+    if (!decision.allow && process.env.FINOPS_SPEND_GUARD_DEBUG === '1') {
+      // eslint-disable-next-line no-console
+      console.error(`[spend-guard] run ${a.runId} item ${itemKey}: ${decision.reason} — ${'detail' in decision ? decision.detail : ''}`);
+    }
+    if (a.snapshot) {
+      return { decision, itemKey, paused, overspend: Math.max(0, Number(runSpentRow.t) - (decision.breakerThreshold ?? Infinity)), runExpected: est.total };
+    }
+    if (!decision.allow && (decision.reason === 'circuit_breaker' || (decision.reason === 'run_budget_cap' && a.pauseOnCap))) {
+      // Re-review N2: el tope guarda cuánto hacía falta (gastado + esta llamada) → reanudar exige ampliar a eso.
+      paused = await this.pauseRunBySystem(a.runId, decision.reason, 'detail' in decision ? decision.detail : '',
+        decision.reason === 'run_budget_cap' ? Number(runSpentRow.t) + a.nextCost : null);
+    }
+    return { decision, itemKey, paused };
+  }
+
+  /**
+   * Proxy LLM del navegador (reserva previa): decide la llamada contra la pausa, el tope del run, el presupuesto de
+   * recuperación de la parte y el disyuntor. Solo aplica a llamadas atribuidas a una parte de un run del MISMO dueño
+   * y pagadas por Cursia (BYOK no consume el presupuesto del run). → null = permitida; si no, el código para el proxy.
+   */
+  async guardLlmProxyCall(a: { subject: string; itemRunId: string | null; model: string; promptChars: number; maxTokens: number; billingAccount: string }): Promise<null | {
+    code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
+  }> {
+    if (!a.itemRunId || a.billingAccount !== 'cursia') return null;
+    const [row] = await this.dataSource.query(
+      `select g.job_id, pj.owner_id, pj.worker_status from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id where g.id = $1`,
+      [a.itemRunId],
+    );
+    if (!row || String(row.owner_id) !== String(a.subject)) return null; // sin atribución verificable: el ingest la deja sin run
+    if (row.worker_status === 'paused') {
+      return { code: 'run_paused', message: 'El run está pausado: no se hacen llamadas nuevas hasta reanudarlo.', runId: row.job_id, paused: true };
+    }
+    const nextCost = Number(await this.callCost({
+      provider: 'anthropic', service: 'messages', product: a.model,
+      usage: { input_tokens: Math.max(1, Math.ceil(a.promptChars / 3)), output_tokens: a.maxTokens },
+    }));
+    // Review I4: un presupuesto REVOCADO (BLOCKED) es tope 0 (falla cerrado, como en los workers); sin ninguna
+    // autorización (runs previos a FinOps) no hay tope que aplicar acá.
+    const [authRow] = await this.dataSource.query(
+      `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
+      [row.job_id],
+    );
+    const cap = !authRow ? null : authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
+    const g = await this.guardRunSpend({ runId: row.job_id, itemRunId: a.itemRunId, nextCost, authorizedBudget: cap, pauseOnCap: true });
+    const d = g.decision;
+    if (d.allow) return null;
+    const detail = 'detail' in d ? d.detail : '';
+    if (d.reason === 'item_recovery_budget_exhausted') {
+      return { code: 'item_recovery_budget_exhausted', message: detail, runId: row.job_id, paused: false };
+    }
+    return {
+      code: 'run_paused', runId: row.job_id, paused: g.paused,
+      message: (d.reason === 'circuit_breaker' ? 'Pausa automática por consumo anómalo: ' : 'Pausa automática: se alcanzó el presupuesto autorizado del run: ') + detail,
+    };
+  }
+
+  /**
+   * Al REANUDAR un run que pausó el disyuntor: el usuario acepta el sobreconsumo hasta ahora → se suma al umbral
+   * (acumulado) para que el disyuntor no vuelva a disparar en la llamada siguiente por lo mismo, pero sí ante una
+   * anomalía NUEVA. Devuelve el sobreconsumo aceptado (USD).
+   */
+  async acknowledgeBreakerOnResume(runId: string): Promise<number> {
+    const snap = await this.guardRunSpend({ runId, itemRunId: null, nextCost: 0, authorizedBudget: null, snapshot: true });
+    if (snap.decision.breakerThreshold === null) return 0;
+    // Lo excedido hasta ahora + un margen NUEVO completo: el disyuntor no vuelve a disparar por lo mismo (ni en la
+    // llamada siguiente), pero sí cuando el consumo vuelve a desviarse esa misma magnitud.
+    const slack = Math.max(BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE * (snap.runExpected ?? 0));
+    const over = Math.max(0, snap.overspend ?? 0) + slack;
+    if (over > 0) {
+      // Review M4: idempotente por pausa (doble clic / dos pestañas → se acepta UNA vez por cada pausa del disyuntor).
+      await this.dataSource.query(
+        `update public.production_jobs
+            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('spendBreaker', jsonb_build_object(
+                  'acknowledgedUsd', coalesce((output_summary->'spendBreaker'->>'acknowledgedUsd')::numeric, 0) + $2::numeric,
+                  'acknowledgedAt', now(), 'ackForPauseAt', output_summary->'pause'->>'pausedAt'))
+          where id = $1 and worker_status = 'paused'
+            and coalesce(output_summary->'spendBreaker'->>'ackForPauseAt', '') is distinct from coalesce(output_summary->'pause'->>'pausedAt', '')`,
+        [runId, over.toFixed(6)],
+      );
+    }
+    return over;
+  }
+
+  /** Pausa segura del run decidida por Cursia (disyuntor / tope): misma pausa del servidor que la del usuario. */
+  async pauseRunBySystem(runId: string, reason: string, detail: string, requiredUsd: number | null = null): Promise<boolean> {
+    const rows = await this.dataSource.query(
+      `update public.production_jobs
+          set status = 'paused', worker_status = 'paused', next_retry_at = null,
+              output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
+                'pause', jsonb_build_object('pausedAt', now(), 'pausedBy', $2::text, 'reason', $3::text, 'detail', $4::text,
+                                            'requiredUsd', $5::numeric, 'previousWorkerStatus', worker_status)),
+              updated_at = now()
+        where id = $1 and execution_mode = 'dynamic_generation' and worker_status in ('queued', 'running', 'retrying')
+          and coalesce(status, '') not in ('cancelled', 'cancelling')
+        returning id`,
+      [runId, 'system:' + reason, reason, detail.slice(0, 500), requiredUsd === null ? null : requiredUsd.toFixed(6)],
+    );
+    const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
+    return Array.isArray(list) && list.length > 0;
   }
 }
+
+/** reason del guard cuando la PARTE agotó su presupuesto de recuperación: el worker la falla (solo esa parte). */
+export const ITEM_RECOVERY_BUDGET_REASON = 'item_recovery_budget_exhausted';
