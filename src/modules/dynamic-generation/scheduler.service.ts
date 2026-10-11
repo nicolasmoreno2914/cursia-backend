@@ -43,6 +43,9 @@ import { RunsService } from './runs.service';
 import { canonicalContextHash, sortKeysDeep } from './run-hash';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
+  DISPATCHABLE_RUN_WORKER_STATUSES,
+  isDispatchableRun,
+  isPausedRun,
   applyItemFailure,
   blockDependents,
   isActiveRun,
@@ -319,9 +322,12 @@ export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-1';
  * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
  * del run (otro ejecutor del navegador lo tiene vigente). `item: null` sin `reason` = nada reclamable.
  */
+/** Claim de un run pausado por el usuario: nada que hacer hasta que el usuario lo reanude (resumeRun). */
+export const RUN_PAUSED_REASON = 'run_paused' as const;
+
 export interface ClaimResult {
   item: ClaimedItem | null;
-  reason?: typeof EXEC_LEASE_RUN_LEASED_ELSEWHERE;
+  reason?: typeof EXEC_LEASE_RUN_LEASED_ELSEWHERE | typeof RUN_PAUSED_REASON;
   leaseExpiresAt?: string | null;
 }
 
@@ -488,6 +494,7 @@ export class SchedulerService {
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
       for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
         const r = await this.claimInRun(opts.runId, executorId, types, leaseSeconds, opts.ownerId);
+        if (r.paused) return { item: null, reason: RUN_PAUSED_REASON };
         if (r.leasedElsewhere) return { item: null, reason: EXEC_LEASE_RUN_LEASED_ELSEWHERE, leaseExpiresAt: r.leasedElsewhere.expiresAt };
         if (r.item) return { item: r.item };
         if (!r.unavailable) break;
@@ -530,7 +537,7 @@ export class SchedulerService {
             and ${claimablePredicate('g', '$4')}
           order by g.created_at, mo.ord nulls last, g.id
           limit 1`,
-        [ACTIVE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns],
+        [DISPATCHABLE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns],
       );
       if (!cand) {
         await this.reportMissingDependencies(null, opts.ownerId);
@@ -560,8 +567,9 @@ export class SchedulerService {
     leaseSeconds: number,
     ownerId?: string,
     itemId?: string,
-  ): Promise<{ item: ClaimedItem | null; unavailable: boolean; leasedElsewhere?: { expiresAt: string | null } }> {
+  ): Promise<{ item: ClaimedItem | null; unavailable: boolean; leasedElsewhere?: { expiresAt: string | null }; paused?: boolean }> {
     let cancelledJob: any = null;
+    let paused = false;
     let unavailable: string | null = null;
     let leasedElsewhere: { expiresAt: string | null } | undefined;
     const claimed = await this.runs.tx(async (qr) => {
@@ -571,7 +579,10 @@ export class SchedulerService {
         cancelledJob = job;
         return null;
       }
-      if (!isActiveRun(job)) return null;
+      // Pausa del usuario (servidor = autoridad): un run pausado no entrega partes nuevas a NADIE
+      // (navegador, workers, auto-recovery). Solo resumeRun (acción explícita) lo vuelve a despachar.
+      if (isPausedRun(job)) { paused = true; return null; }
+      if (!isDispatchableRun(job)) return null;
 
       // REL lease de ejecución (solo camino navegador): con la fila del run ya bloqueada, se toma o
       // renueva el lease del run (libre, vencido o ya de este executorId) — aunque después no haya
@@ -638,7 +649,7 @@ export class SchedulerService {
       this.logger.error(`Item ${unavailable} — marcado failed en el claim (dato de una dependencia ausente; no se inventa)`);
     }
     if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
-    return { item: claimed, unavailable: unavailable !== null, ...(leasedElsewhere ? { leasedElsewhere } : {}) };
+    return { item: claimed, unavailable: unavailable !== null, ...(leasedElsewhere ? { leasedElsewhere } : {}), ...(paused ? { paused: true } : {}) };
   }
 
   /**
@@ -1683,7 +1694,7 @@ export class SchedulerService {
                                           where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
                                             and d2.item_key = dk.key))
         limit 50`,
-      [ACTIVE_RUN_WORKER_STATUSES, runId, ownerId ?? null],
+      [DISPATCHABLE_RUN_WORKER_STATUSES, runId, ownerId ?? null],
     );
     for (const r of rows) {
       this.logger.error(

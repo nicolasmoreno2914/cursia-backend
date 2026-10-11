@@ -42,8 +42,19 @@ export function takeCompletedRunsInTx(qr: object): string[] {
   return set ? [...set] : [];
 }
 
-/** worker_status "activo" del run — el mismo set que el predicado de uq_dynamic_generation_active_run. */
-export const ACTIVE_RUN_WORKER_STATUSES = ['queued', 'running', 'retrying'];
+/**
+ * worker_status de un run ABIERTO — el mismo set que el predicado de uq_dynamic_generation_active_run
+ * (supabase-migration-run-pause.sql). Incluye 'paused': un run pausado por el usuario sigue abierto (no puede
+ * coexistir otro del mismo Manifest, bloquea cambios de estructura y deja terminar lo que ya estaba en vuelo).
+ */
+export const ACTIVE_RUN_WORKER_STATUSES = ['queued', 'running', 'retrying', 'paused'];
+/**
+ * worker_status de un run DESPACHABLE: solo estos reciben partes nuevas (claim del navegador y de los workers).
+ * 'paused' queda afuera: la pausa la decide el servidor y ningún mecanismo automático la levanta (solo
+ * resumeRun, una acción explícita del usuario).
+ */
+export const DISPATCHABLE_RUN_WORKER_STATUSES = ['queued', 'running', 'retrying'];
+export const PAUSED_RUN_WORKER_STATUS = 'paused';
 const CANCELLED_LIKE = new Set(['cancelled', 'cancelling']);
 
 /** Backoff de un fallo recuperable: 30s·2^(attempt-1), tope 10 min. */
@@ -56,6 +67,15 @@ export function isCancelledLike(job: { status?: string | null; worker_status?: s
 
 export function isActiveRun(job: { status?: string | null; worker_status?: string | null }): boolean {
   return ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')) && !isCancelledLike(job);
+}
+
+/** Run que puede recibir partes nuevas (abierto y NO pausado). */
+export function isDispatchableRun(job: { status?: string | null; worker_status?: string | null }): boolean {
+  return DISPATCHABLE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')) && !isCancelledLike(job);
+}
+
+export function isPausedRun(job: { status?: string | null; worker_status?: string | null }): boolean {
+  return String(job.worker_status ?? '') === PAUSED_RUN_WORKER_STATUS && !isCancelledLike(job);
 }
 
 export interface FailedTransition {
@@ -275,6 +295,9 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
     total += r.n;
   }
   const active = (c.pending ?? 0) + (c.running ?? 0) + (c.retrying ?? 0);
+  // Pausa del usuario: nada automático la levanta. Con partes por hacer (o fallidas) sigue `paused`; solo si TODO
+  // quedó completo (lo que estaba en vuelo terminó) se cierra como cualquier run.
+  if (isPausedRun(job) && !(total > 0 && (c.completed ?? 0) === total)) return job.worker_status;
   if (active > 0) {
     if ((c.running ?? 0) > 0 && job.worker_status !== 'running') {
       await markRunRunning(qr, jobId);

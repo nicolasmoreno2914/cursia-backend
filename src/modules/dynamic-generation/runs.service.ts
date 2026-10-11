@@ -146,6 +146,8 @@ import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
 import { autoPackageEnabled, loadAutoPackageState } from '../dynamic-packaging/auto-package-state';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
+  isDispatchableRun,
+  isPausedRun,
   isActiveRun,
   isCancelledLike,
   recomputeRunStatus,
@@ -324,6 +326,8 @@ export interface RunDto {
    * Solo informa: leer el run / el curso nunca depende del lease. null sin la migración.
    */
   executionLease: ExecutionLeaseView | null;
+  /** Pausada por el usuario (servidor = autoridad): no recibe partes nuevas hasta resumeRun. */
+  paused: boolean;
 }
 
 /** REL lease: quién consulta el run (solo para `executionLease.heldByYou`). */
@@ -1800,6 +1804,79 @@ export class RunsService {
   }
 
   /**
+   * Pausa REAL (servidor = autoridad). El run queda `paused`: ningún claim (navegador, workers, auto-recovery,
+   * sondas) le entrega partes nuevas; lo que ya estaba en vuelo puede terminar (heartbeat / complete / fail) y
+   * nada automático lo reanuda (recomputeRunStatus lo conserva; el auto-healer lo saltea). Solo resumeRun
+   * (acción explícita del usuario) lo vuelve a despachar. Idempotente: pausar un run ya pausado no cambia nada.
+   */
+  async pauseRun(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    actor?: { id?: string | null; email?: string | null },
+  ): Promise<RunDto> {
+    const actorId = actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    const job = await this.loadRunRow(courseId, manifest, runId);
+    await this.tx(async (qr) => {
+      const [locked] = await qr.query(`select id, status, worker_status from public.production_jobs where id = $1 for update`, [job.id]);
+      if (isCancelledLike(locked)) throw new ConflictException({ message: `La ejecución ${job.id} está cancelada; no se puede pausar`, code: 'run_cancelled' });
+      if (isPausedRun(locked)) return;
+      if (!isDispatchableRun(locked)) {
+        throw new ConflictException({ message: `La ejecución ${job.id} no está en curso (${locked.worker_status}); no hay nada que pausar`, code: 'run_not_active' });
+      }
+      await qr.query(
+        `update public.production_jobs
+            set status = 'paused', worker_status = 'paused', next_retry_at = null,
+                output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
+                  'pause', jsonb_build_object('pausedAt', now(), 'pausedBy', $2::text, 'previousWorkerStatus', $3::text)
+                ),
+                updated_at = now()
+          where id = $1`,
+        [job.id, actorId, locked.worker_status],
+      );
+    });
+    this.logger.warn(`run ${job.id} pausado por ${actorId}`);
+    return this.buildRunDto(await this.loadJobById(job.id), manifest);
+  }
+
+  /** Reanuda un run pausado: ÚNICA transición paused → despachable, siempre por acción explícita del usuario. */
+  async resumeRun(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    actor?: { id?: string | null; email?: string | null },
+  ): Promise<RunDto> {
+    const actorId = actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    const job = await this.loadRunRow(courseId, manifest, runId);
+    await this.tx(async (qr) => {
+      const [locked] = await qr.query(`select id, status, worker_status from public.production_jobs where id = $1 for update`, [job.id]);
+      if (!isPausedRun(locked)) {
+        throw new ConflictException({ message: `La ejecución ${job.id} no está pausada (${locked.worker_status}); no hay nada que reanudar`, code: 'run_not_paused' });
+      }
+      await qr.query(
+        `update public.production_jobs
+            set status = 'queued', worker_status = 'queued',
+                output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
+                  'pause', coalesce(output_summary->'pause', '{}'::jsonb) || jsonb_build_object('resumedAt', now(), 'resumedBy', $2::text)
+                ),
+                updated_at = now()
+          where id = $1`,
+        [job.id, actorId],
+      );
+      // Si mientras estuvo pausado algo quedó en curso (lo que estaba en vuelo), el estado se recalcula.
+      await recomputeRunStatus(qr, job.id);
+    });
+    this.logger.warn(`run ${job.id} reanudado por ${actorId}`);
+    return this.buildRunDto(await this.loadJobById(job.id), manifest);
+  }
+
+  /**
    * Reintenta un item `failed` (solo `failed`; cualquier otro estado → 409):
    * - item → pending, `attempt_count` se conserva, `max_attempts =
    *   attempt_count + 3`, el error anterior queda en
@@ -1949,6 +2026,11 @@ export class RunsService {
       );
       if (isCancelledLike(locked)) {
         throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden reintentar items`);
+      }
+      // Pausa del usuario: ningún mecanismo AUTOMÁTICO (auto-healer, sondas de proveedor, audio ambiguo) toca un run
+      // pausado. Un reintento manual del usuario sí reabre el item, pero el run sigue pausado (no lo despacha).
+      if (auto && isPausedRun(locked)) {
+        throw new ConflictException({ message: `La ejecución ${job.id} está pausada por el usuario: no se reabre nada automáticamente`, code: 'run_paused' });
       }
       // Fix wave (M5): reintentar en un run ya reemplazado (B creado desde él)
       // regeneraría —y podría pagar— salida que nadie va a usar.
@@ -5083,7 +5165,8 @@ export class RunsService {
       completion,
       autoRecovery: autoRecoveryEnabled(),
       lastBrowserActivityAt: lastBrowserActivityOf(rows),
-      executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isActive(job)),
+      executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isDispatchableRun(job)),
+      paused: isPausedRun(job),
     };
   }
 

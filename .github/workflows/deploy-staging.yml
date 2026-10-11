@@ -658,6 +658,9 @@ jobs:
                echo "━━━ [4h14] REL lease de ejecución: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-rel-exec-lease-schema.js
 
+               echo "━━━ [4h15] Pausa real de un run: índice único de run activo con paused (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-run-pause.js
+
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
 

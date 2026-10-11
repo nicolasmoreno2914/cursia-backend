@@ -475,7 +475,7 @@ export class CourseStructureService implements OnModuleInit {
       if (lock.hasBlueprint) {
         const [run] = await queryRunner.query(
           `select id from public.production_jobs
-            where course_id = $1 and execution_mode = 'dynamic_generation' and worker_status in ('queued', 'running', 'retrying')
+            where course_id = $1 and execution_mode = 'dynamic_generation' and worker_status in ('queued', 'running', 'retrying', 'paused')
               and coalesce(status, '') not in ('cancelled', 'cancelling')
             limit 1`,
           [courseId],
