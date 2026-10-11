@@ -657,10 +657,10 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     assert(!fs.existsSync(path.join(repoRoot, '.github/workflows/staging-calibration.yml')), 'sin workflow solo-dispatch no registrado');
     const C = require(path.resolve('scripts/staging-v21-calibration.js'));
     // #583 (aprobado por el usuario 2026-10-02): maxCostPerRun de staging 15, misma constante que staging-budget-policy.js.
-    const pol = { limits: { maxCostPerRun: '15', maxCostPerCourse: '15', monthlyCapStaging: '50' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
+    const pol = { limits: { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCapStaging: '162' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
     eq(C.APPROVED.limits.maxCostPerRun, String(require(path.resolve('scripts/staging-budget-policy.js')).STAGING_MAX_COST_PER_RUN), 'una sola fuente con staging-budget-policy');
     assert(C.policyMatches(pol), 'política aprobada reconocida');
-    assert(C.policyMatches({ ...pol, limits: { maxCostPerRun: 15, maxCostPerCourse: '15.00', monthlyCapStaging: '50' } }), 'numérico equivalente');
+    assert(C.policyMatches({ ...pol, limits: { maxCostPerRun: 106, maxCostPerCourse: '106.00', monthlyCapStaging: '162' } }), 'numérico equivalente');
     assert(!C.policyMatches({ ...pol, on_exceed: 'BLOCK' }) && !C.policyMatches({ ...pol, limits: { ...pol.limits, maxCostPerRun: '10' } }) && !C.policyMatches(null), 'otra política (p.ej. la vieja de 10) ≠ aprobada');
     // La política que deja el deploy ([4h10]) y la de la acción `policy` de calibración son la misma: no se pisan.
     const SBP = require(path.resolve('scripts/staging-budget-policy.js'));
@@ -676,13 +676,13 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       ['segunda aprobación', { existingApprovals: 1 }, /solo se autoriza UNA/],
       ['sin estimado', { estimate: null }, /no hay un estimado/],
       ['max > 8', { estimate: { totals: { expected: '5', max: '8.01' } } }, /supera la aprobación/],
-      ['tope mensual', { monthSpent: '42.5' }, /tope mensual/],
+      ['tope mensual', { monthSpent: '154.5' }, /tope mensual/],
       ['política distinta', { policy: { ...pol, on_exceed: 'BLOCK' } }, /política global vigente no es la aprobada/],
     ]) {
       const d = C.decideAuthorization({ ...base, ...over });
       assert(!d.ok && re.test(d.reason), `${label}: ${JSON.stringify(d)}`);
     }
-    assert(C.decideAuthorization({ ...base, monthSpent: '42' }).ok, '42 + 8 = 50 cabe justo');
+    assert(C.decideAuthorization({ ...base, monthSpent: '154' }).ok, '154 + 8 = 162 cabe justo');
     // Calibración #2: "[CALIBRATION V2.1 #2] …" es de calibración; variantes parecidas no.
     assert(C.decideAuthorization({ ...base, course: { title: '[CALIBRATION V2.1 #2] Provider Cost Verification' } }).ok, 'título con número de calibración');
     for (const bad of ['[CALIBRATION V2.1 #x] A', '[CALIBRATION V2.1#2] A', 'CALIBRATION V2.1 #2 A', '[CALIBRATION V2.10] A']) {
@@ -890,7 +890,7 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     const walk = (d) => fs.readdirSync(d).flatMap((n) => { const p = path.join(d, n); return fs.statSync(p).isDirectory() ? walk(p) : [p]; });
     for (const p of walk(path.join(repoRoot, 'scripts/prod'))) assert(!fs.readFileSync(p, 'utf8').includes('staging-budget-policy'), `no en ${path.relative(repoRoot, p)}`);
     const S = require(path.join(repoRoot, 'scripts/staging-budget-policy.js'));
-    eq(S.STAGING_MAX_COST_PER_RUN, 15, 'límite aprobado');
+    eq([S.STAGING_MAX_COST_PER_RUN, S.STAGING_MAX_COST_PER_COURSE, S.STAGING_MONTHLY_CAP], [106, 106, 162], 'límites aprobados (piloto Formato M)');
     // Guardarraíles (puros + proceso real): sin MIGRATION_ENV=staging, producción o ref indeterminable → exit 1 sin conectar.
     assert(/MIGRATION_ENV/.test(S.refusal({ MIGRATION_ENV: 'production', DB_HOST: 'db.abcstaging.supabase.co' }) || ''), 'sin intención staging');
     assert(/PRODUCCIÓN/.test(S.refusal({ MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co' }) || ''), 'producción por host');
@@ -917,10 +917,11 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50', maxCostPerProvider: { gamma: '4' } }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
     const p = S.planPolicy(cur);
     eq([p.action, p.row.scope, p.row.scope_id, p.row.version, p.row.on_exceed, p.row.require_human_approval_for_real_spend], ['insert', 'global', null, 4, 'ADMIN_APPROVAL', true], 'misma política, versión +1');
-    eq(p.row.limits, { maxCostPerRun: '15', maxCostPerCourse: '15', monthlyCapStaging: '50', maxCostPerProvider: { gamma: '4' } }, 'solo cambia maxCostPerRun');
-    eq(S.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: 10 } }).row.limits.maxCostPerRun, 15, 'conserva el tipo numérico');
-    eq(S.planPolicy({ ...cur, version: 4, limits: p.row.limits }).action, 'noop', 'idempotente: ya en 15');
-    eq(S.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: '15.00' } }).action, 'noop', 'numérico equivalente');
+    eq(p.row.limits, { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCapStaging: '162', maxCostPerProvider: { gamma: '4' } }, 'cambian solo los tres límites aprobados');
+    eq(S.planPolicy({ ...cur, limits: { maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCap: '50' } }).row.limits, { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCap: '162' }, 'tope mensual en la clave que ya usa');
+    eq(S.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: 10 } }).row.limits.maxCostPerRun, 106, 'conserva el tipo numérico');
+    eq(S.planPolicy({ ...cur, version: 4, limits: p.row.limits }).action, 'noop', 'idempotente: ya aplicada');
+    eq(S.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: '106.00', maxCostPerCourse: 106, monthlyCapStaging: '162' } }).action, 'noop', 'numérico equivalente');
     eq(S.planPolicy({ ...cur, scope: 'owner', scope_id: 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57' }).row.scope_id, 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57', 'política del owner: misma scope_id');
     eq(S.planPolicy(null).action, 'none', 'sin política: no inventa una');
   });

@@ -1267,7 +1267,7 @@ async function dbChecks() {
       await rejectsRe(ctl.llmUsage({ ...base, messageId: 'msg_583_c4', usage: { input_tokens: 1, output_tokens: 1 }, measurement: 'maybe' }), /measurement/, 'inválido');
     });
 
-    await check('#583 scripts/staging-budget-policy.js contra PG16: nueva versión de la política vigente (owner de prueba > global) con maxCostPerRun 15 y TODO lo demás igual; idempotente (2.ª corrida no inserta)', async () => {
+    await check('#583 scripts/staging-budget-policy.js contra PG16: nueva versión de la política vigente (owner de prueba > global) con los límites del piloto (106 / 106 / 162) y TODO lo demás igual; idempotente (2.ª corrida no inserta)', async () => {
       const OWNER_STG = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
       const pols = () => ds.query(`select scope, scope_id, version, limits, on_exceed, require_human_approval_for_real_spend from public.cost_budget_policies
                                      where scope = 'global' or (scope = 'owner' and scope_id = $1) order by scope, version`, [OWNER_STG]);
@@ -1278,13 +1278,13 @@ async function dbChecks() {
       const runPolicy = (owner) => spawnSync(process.execPath, [path.join(REPO, 'scripts/staging-budget-policy.js'), ...(owner ? [owner] : [])],
         { cwd: tmpCwd, env: cleanEnv({ MIGRATION_ENV: 'staging', NODE_ENV: 'test', ...localEnv({}) }), encoding: 'utf8', timeout: 60000 });
       let r = runPolicy(OWNER_STG);
-      assert(r.status === 0 && /nueva versión con maxCostPerRun 15/.test(r.stdout), `1.ª corrida: ${r.stdout}${r.stderr}`);
+      assert(r.status === 0 && /nueva versión con por generación 106, por curso 106 y mensual 162/.test(r.stdout), `1.ª corrida: ${r.stdout}${r.stderr}`);
       let rows = (await pols()).filter((x) => x.scope === 'global');
       const top = rows[rows.length - 1];
-      eq([top.version, top.limits, top.on_exceed, top.require_human_approval_for_real_spend], [g0 + 2, { maxCostPerRun: '15', maxCostPerCourse: '15', monthlyCapStaging: '50', maxCostPerProvider: { gamma: '4' } }, 'ADMIN_APPROVAL', true], 'versión nueva, resto igual');
+      eq([top.version, top.limits, top.on_exceed, top.require_human_approval_for_real_spend], [g0 + 2, { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCapStaging: '162', maxCostPerProvider: { gamma: '4' } }, 'ADMIN_APPROVAL', true], 'versión nueva, resto igual');
       eq(rows[rows.length - 2].limits.maxCostPerRun, '10', 'la versión anterior no se toca (inmutable)');
       r = runPolicy(OWNER_STG);
-      assert(r.status === 0 && /ya tiene maxCostPerRun 15/.test(r.stdout), `2.ª corrida: ${r.stdout}${r.stderr}`);
+      assert(r.status === 0 && /ya tiene los límites aprobados/.test(r.stdout), `2.ª corrida: ${r.stdout}${r.stderr}`);
       eq((await pols()).filter((x) => x.scope === 'global').length, rows.length, 'idempotente: sin otra versión');
       // Con política del owner de prueba, esa es la vigente para sus generaciones: se versiona ESA.
       await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by)
@@ -1292,11 +1292,11 @@ async function dbChecks() {
       r = runPolicy(OWNER_STG);
       assert(r.status === 0, r.stderr);
       const own = (await pols()).filter((x) => x.scope === 'owner');
-      eq(own.map((x) => [x.version, x.limits, x.on_exceed]), [[1, { maxCostPerRun: 12, maxCostPerCourse: 30 }, 'BLOCK'], [2, { maxCostPerRun: 15, maxCostPerCourse: 30 }, 'BLOCK']], 'owner versionado (tipo numérico conservado)');
+      eq(own.map((x) => [x.version, x.limits, x.on_exceed]), [[1, { maxCostPerRun: 12, maxCostPerCourse: 30 }, 'BLOCK'], [2, { maxCostPerRun: 106, maxCostPerCourse: 106, monthlyCapStaging: '162' }, 'BLOCK']], 'owner versionado (tipo numérico conservado)');
       eq((await pols()).filter((x) => x.scope === 'global').length, rows.length, 'global intacta');
       // El presupuesto se sigue validando: la política nueva es la que ve el gate (sin aprobaciones automáticas).
       const pf = await budget.policyFor(999999, OWNER_STG);
-      eq([pf.limits.maxCostPerRun, pf.onExceed], [15, 'BLOCK'], 'policyFor ve la versión nueva');
+      eq([pf.limits.maxCostPerRun, pf.onExceed], [106, 'BLOCK'], 'policyFor ve la versión nueva');
       // Guardarraíl real: sin MIGRATION_ENV=staging no corre.
       const bad = spawnSync(process.execPath, [path.join(REPO, 'scripts/staging-budget-policy.js')], { cwd: tmpCwd, env: cleanEnv({ NODE_ENV: 'test', ...localEnv({}) }), encoding: 'utf8' });
       eq(bad.status, 1, 'sin MIGRATION_ENV=staging');
