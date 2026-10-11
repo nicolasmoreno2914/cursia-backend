@@ -43,7 +43,7 @@ import {
   reportVideoDeliveryConfigAtStartup,
 } from '../modules/dynamic-generation/dynamic-video-delivery';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
-import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
+import { FinopsBudgetService, RUN_PAUSED_GUARD_REASON } from '../modules/finops/finops-budget.service';
 import {
   WorkerBudget,
   WorkerLedger,
@@ -64,6 +64,7 @@ import {
   DrainSignal,
   awaitDrain,
   drainHandbackMessage,
+  runPausedHandbackMessage,
   drainTimeoutMs,
   installDrainHandlers,
   runClaimLoop,
@@ -683,6 +684,14 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           return;
         }
         const g = await deps.budget.guardPaidSubmission({ runId: item.runId, itemRunId: item.itemRunId, itemType: 'video' });
+        if (!g.allow && g.reason === RUN_PAUSED_GUARD_REASON) {
+          // Piloto #1209: run pausado con la parte ya reclamada → vuelve a la cola sin enviar (sin gasto ni intento).
+          logger.warn(`Item ${item.itemKey} (run ${item.runId}): run pausado — no se envía a Videogen; la parte vuelve a la cola`);
+          await scheduler.failItem(item.itemRunId, deps.executorId, runPausedHandbackMessage('Videogen'), true, undefined, {
+            retryAfterSeconds: DRAIN_HANDBACK_RETRY_SECONDS, grantAttempt: true,
+          });
+          return;
+        }
         if (!g.allow) {
           logger.warn(`Item ${item.itemKey} (run ${item.runId}): presupuesto excedido (${g.reason}) — no se envía a Videogen`);
           await scheduler.blockItemForBudget(item.itemRunId, deps.executorId, budgetExceededMessage(g));

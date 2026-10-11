@@ -765,6 +765,7 @@ async function fixRound1Checks() {
     const { FinopsBudgetService } = loadDist('modules/finops/finops-budget.service.js');
     let actual = '14.80';
     const ds = { async query(sql) {
+      if (/select worker_status from public\.production_jobs/.test(sql)) return [{ worker_status: 'running' }]; // piloto #1209: el guard mira la pausa
       if (/cost_budget_authorizations/.test(sql)) return [{ decision: 'ADMIN_APPROVED', authorized_budget: '15' }];
       if (/sum\(amount\)/.test(sql)) return [{ total: actual }];
       if (/generation_item_runs g/.test(sql)) return [];
@@ -798,6 +799,7 @@ async function fixRound1Checks() {
     const { FinopsBudgetService } = loadDist('modules/finops/finops-budget.service.js');
     let actual = '0';
     const ds = { async query(sql) {
+      if (/select worker_status from public\.production_jobs/.test(sql)) return [{ worker_status: 'running' }]; // piloto #1209: el guard mira la pausa
       if (/cost_budget_authorizations/.test(sql)) return [{ decision: 'ADMIN_APPROVED', authorized_budget: '15' }];
       if (/sum\(amount\)/.test(sql)) return [{ total: actual }];
       if (/generation_item_runs g/.test(sql)) return [];

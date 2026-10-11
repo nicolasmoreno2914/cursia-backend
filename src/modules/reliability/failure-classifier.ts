@@ -274,6 +274,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     refine: ({ itemType }) => (itemType && WORKER_ITEM_TYPES.has(itemType) ? { paidRisk: 'uncertain' } : null),
   },
   { id: 'worker_draining', codes: ['worker_draining'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
+  // Piloto #1209: devolución por pausa del usuario (sin gasto); la retoma el reanudar, no el auto-heal.
+  { id: 'run_paused', codes: ['run_paused'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'unexpected_error', codes: ['unexpected_error'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'unknown_error', codes: ['unknown_error'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   {
@@ -306,6 +308,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     id: 'llm_config',
     codes: ['llm_credit_exhausted', 'llm_auth_rejected', 'proxy_misconfigured', 'llm_model_config', 'llm_model_not_allowed', 'llm_api_key_missing', 'llm_model_missing'],
     class: 'D', strategy: 'wait_provider', scope: 'provider', provider: 'anthropic', rounds: 0, humanReason: 'config',
+  },
+  {
+    // Piloto #1209: 524 — la respuesta se perdió pero el proveedor pudo cobrarla: reenviarla solo podría pagarla dos veces.
+    id: 'llm_response_lost', codes: ['llm_response_lost'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_item',
   },
   {
     // 400 de la IA sin otra pista: si es por tamaño → B split; si no, D (bug de producto: el mismo pedido vuelve a fallar).
@@ -591,6 +597,8 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^API key no configurada\b/i, 'llm_api_key_missing'],
   [/^Petici[oó]n demasiado grande\b/i, 'llm_request_too_large'],
   [/^Servidor ocupado\b|^Error del servidor\b|^Error de red\b/i, 'llm_transient'],
+  // Piloto #1209: 524 = respuesta perdida que el proveedor pudo cobrar → nunca se reenvía sola (persona decide).
+  [/^(?:⚠️\s*)?Resultado ambiguo de la IA\b/i, 'llm_response_lost'],
   [/^Respuesta vac[ií]a\b/i, 'llm_empty_response'],
   // cursia#68 (streaming SSE de api()): cortes del stream → transitorio de la IA.
   [/^La respuesta de la IA se cort[oó](?![a-z])|^Se cort[oó] la conexi[oó]n con la IA\b|^La IA dej[oó] de responder\b|^Respuesta de la IA incompleta\b/i, 'llm_stream_cut'],

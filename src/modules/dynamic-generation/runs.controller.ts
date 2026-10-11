@@ -165,6 +165,32 @@ export class RunsController {
     return this.runs.cancelRun(courseId, user.id, number, runId, { id: user.id, email: user.email });
   }
 
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/pause
+  // Pausa REAL en el servidor: ningún mecanismo automático le entrega partes nuevas hasta /resume.
+  @Post(':runId/pause')
+  @HttpCode(HttpStatus.OK)
+  pause(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.runs.pauseRun(courseId, user.id, number, runId, { id: user.id, email: user.email });
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/resume
+  // Única transición paused → despachable: acción explícita del usuario.
+  @Post(':runId/resume')
+  @HttpCode(HttpStatus.OK)
+  resume(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.runs.resumeRun(courseId, user.id, number, runId, { id: user.id, email: user.email });
+  }
+
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/retry
   // itemKey va URL-encoded (p.ej. content%3A<uuid>); Express lo decodifica.
   @Post(':runId/items/:itemKey/retry')

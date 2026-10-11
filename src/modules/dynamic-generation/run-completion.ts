@@ -260,7 +260,7 @@ export type ItemCompletionClass = 'done' | 'preview' | 'in_flight' | 'not_done' 
 
 const IN_FLIGHT = new Set(['pending', 'running', 'retrying']);
 // Mismos sets que item-transitions.ts (sin importarlo: item-transitions importa este módulo).
-const ACTIVE_RUN = new Set(['queued', 'running', 'retrying']);
+const ACTIVE_RUN = new Set(['queued', 'running', 'retrying', 'paused']); // 'paused' = abierto (pausa del usuario)
 const CANCELLED_LIKE = new Set(['cancelled', 'cancelling']);
 function isCancelledLike(job: CompletionJob): boolean {
   return CANCELLED_LIKE.has(String(job?.worker_status ?? '').trim()) || CANCELLED_LIKE.has(String(job?.status ?? '').trim());

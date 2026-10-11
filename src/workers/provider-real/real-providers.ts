@@ -83,7 +83,8 @@ import {
 } from '../finops-worker-hooks';
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
-import { DRAIN_HANDBACK_RETRY_SECONDS, DrainSignal, drainHandbackMessage } from '../worker-drain';
+import { DRAIN_HANDBACK_RETRY_SECONDS, DrainSignal, drainHandbackMessage, runPausedHandbackMessage } from '../worker-drain';
+import { RUN_PAUSED_GUARD_REASON } from '../../modules/finops/finops-budget.service';
 import {
   AUDIOBOOK_SCRIPT_MODEL_DEFAULT,
   AUDIOBOOK_SCRIPT_MODEL_ENV,
@@ -273,6 +274,21 @@ async function guard(deps: RealProviderDeps, item: ClaimedItem, provider?: strin
     runId: item.runId, itemRunId: item.itemRunId, itemType: item.type, ...(provider ? { provider } : {}), ...(nextCall ? { nextCall } : {}),
   });
   if (g.allow) return true;
+  if (g.reason === RUN_PAUSED_GUARD_REASON && (deps.tracker?.inFlight || deps.tracker?.unpersistedPaidOutput)) {
+    // Review I1: hay salida PAGADA sin persistir (p. ej. el bloque principal de una sección del audiolibro y falta
+    // su continuación): devolver ahora la dejaría huérfana → reconciliación al reanudar y se volvería a pagar.
+    // Igual que el drenaje: la unidad en curso termina y se persiste; la pausa se aplica en el próximo borde limpio.
+    return true;
+  }
+  if (g.reason === RUN_PAUSED_GUARD_REASON) {
+    // Piloto #1209: el run se pausó con la parte ya reclamada → vuelve a la cola sin llamar (sin gasto, sin
+    // consumir intento); el claim no la entrega mientras el run siga pausado.
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, runPausedHandbackMessage(provider ?? item.type), true, undefined, {
+      retryAfterSeconds: DRAIN_HANDBACK_RETRY_SECONDS, grantAttempt: true,
+    });
+    deps.logger.warn(`Item ${item.itemKey}: run pausado — devuelto sin llamar al proveedor`);
+    return false;
+  }
   if (!deps.scheduler.blockItemForBudget) throw new Error('dynamic-provider-worker: scheduler sin blockItemForBudget');
   deps.logger.warn(`Item ${item.itemKey}: presupuesto excedido (${g.reason}) — no se llama al proveedor${provider ? ` (${provider})` : ''}`);
   await deps.scheduler.blockItemForBudget(item.itemRunId, deps.executorId, budgetExceededMessage(g));

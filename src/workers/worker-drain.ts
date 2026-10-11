@@ -247,3 +247,9 @@ export function installDrainHandlers(opts: {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** Piloto #1209: la parte se devolvió porque el usuario pausó el run (nada se envió al proveedor). */
+export const RUN_PAUSED_HANDBACK = 'run_paused';
+export function runPausedHandbackMessage(where: string): string {
+  return `${RUN_PAUSED_HANDBACK}: el run está pausado; la parte vuelve a la cola sin enviar a ${where} (sin gasto). Se retoma al reanudar.`;
+}

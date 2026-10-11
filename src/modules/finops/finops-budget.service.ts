@@ -51,6 +51,9 @@ export interface StartBudgetEvaluation extends RunBudgetDecision {
  * Manifest, política vigente, aprobaciones administrativas (append-only),
  * vinculación aprobación→run y el runtime guard antes de cada llamada pagada.
  */
+/** reason del guard cuando el run está pausado (= worker_status 'paused'): el worker devuelve la parte, no la bloquea. */
+export const RUN_PAUSED_GUARD_REASON = 'run_paused';
+
 @Injectable()
 export class FinopsBudgetService {
   constructor(
@@ -488,6 +491,12 @@ export class FinopsBudgetService {
   }): Promise<RuntimeGuardResult & { authorizedBudget: string | null }> {
     const itemProvider = paidProviderOfItemType(a.itemType);
     if (!itemProvider) throw new FinopsError('INVALID_INPUT', `guardPaidSubmission: ${a.itemType} no es un item de proveedor pagado`);
+    // Piloto #1209: un run PAUSADO por el usuario no envía trabajo pagado NUEVO, aunque un worker ya tuviera la
+    // parte reclamada antes de la pausa (lo ya enviado sí se sigue y se persiste). El worker la devuelve a la cola.
+    const [job] = await this.dataSource.query(`select worker_status from public.production_jobs where id = $1`, [a.runId]);
+    if (job && job.worker_status === 'paused') {
+      return { allow: false, decision: 'BLOCK', committed: '0', remaining: null, reason: RUN_PAUSED_GUARD_REASON, authorizedBudget: null };
+    }
     const provider = a.provider ?? itemProvider;
     const [authorizedBudget, actualSoFar, reservedInFlight, next] = await Promise.all([
       this.runPaidAuthorizedBudget(a.runId),

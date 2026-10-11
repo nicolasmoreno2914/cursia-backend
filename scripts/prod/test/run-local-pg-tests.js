@@ -200,6 +200,8 @@ async function main() {
           'supabase-migration-rel-recovery.sql',
           // REL: lease de ejecución del navegador por run (preparación).
           'supabase-migration-rel-exec-lease.sql',
+          // Piloto #1209: pausa real (índice de run activo con paused).
+          'supabase-migration-run-pause.sql',
           'supabase-migration-storage-artifacts-policies.sql']), 'orden: ' + files.join(','));
         for (const s of plan.steps.filter((x) => x.status === 'included')) {
           const h = crypto.createHash('sha256').update(fs.readFileSync(path.join(REPO, s.file))).digest('hex');

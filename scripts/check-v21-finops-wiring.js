@@ -671,7 +671,7 @@ async function dbChecks() {
         st,
         async heartbeatItem() { return true; },
         async recordItemExternal(_id, _e, patch) { st.externals.push(patch); return true; },
-        async failItem(id, _e, msg, retryable) { st.failed.push({ id, msg, retryable }); return true; },
+        async failItem(id, _e, msg, retryable, _code, opts) { st.failed.push({ id, msg, retryable, opts }); return true; },
         async completeItem(id, _e, payload) { st.completed.push({ id, payload }); return true; },
         async blockItemForBudget(id, _e, msg) { st.blocked.push({ id, msg }); return true; },
       };
@@ -841,6 +841,29 @@ async function dbChecks() {
       await providerWorker.processProviderItem({ ...deps, scheduler: s2 }, { ...item, itemRunId: pB.id, runId: runB, itemKey: pB.item_key, chapterId: Bc.c1 });
       eq([s2.st.blocked.length, s2.st.failed.length], [1, 0], 'bloqueado, no fallado');
       assert(/budget_exceeded: no_authorization/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
+    });
+
+    await check('DB worker (pausa, review I1): run PAUSADO con la parte ya reclamada → el worker de proveedores y el de video la DEVUELVEN (retryable, sin consumir intento) sin llamar ni cobrar; nunca la bloquean por presupuesto', async () => {
+      const [prev] = await ds.query(`select worker_status, status from public.production_jobs where id = $1`, [runB]);
+      await ds.query(`update public.production_jobs set worker_status = 'paused', status = 'paused' where id = $1`, [runB]);
+      try {
+        const before = (await events(`run_id = $1`, [runB])).length;
+        const pB = await itemRow(runB, `presentation:${Bc.c1}`);
+        const sp = fakeScheduler();
+        const pdeps = { scheduler: sp, dataSource: ds, logger: workerLog, executorId: 'p-pause', leaseSeconds: 60, finops: ledger, budget,
+          artifacts: { async uploadJsonArtifact() { return { id: 'art-pres' }; } } };
+        await providerWorker.processProviderItem(pdeps, { itemRunId: pB.id, runId: runB, itemKey: pB.item_key, type: 'presentation', idempotencyKey: pB.idempotency_key, chapterId: Bc.c1, chapterNumber: 1, manifestId: pB.manifest_id, artifactCourseId: String(Bc.cid), attempt: 1 });
+        eq([sp.st.blocked.length, sp.st.failed.length], [0, 1], 'devuelto, no bloqueado');
+        eq([sp.st.failed[0].retryable, sp.st.failed[0].opts && sp.st.failed[0].opts.grantAttempt, /^run_paused:/.test(sp.st.failed[0].msg)], [true, true, true], sp.st.failed[0].msg);
+        const sv = fakeScheduler();
+        const vg = fakeVideogen(1.5);
+        await itemWorker.processItem(workerDeps(sv, vg), await claimedVideo(runB, Bc.c2));
+        eq([vg.st.submits, sv.st.blocked.length, sv.st.failed.length], [0, 0, 1], 'video: sin envío, devuelto');
+        eq([sv.st.failed[0].retryable, sv.st.failed[0].opts && sv.st.failed[0].opts.grantAttempt, /^run_paused:/.test(sv.st.failed[0].msg)], [true, true, true], sv.st.failed[0].msg);
+        eq((await events(`run_id = $1`, [runB])).length, before, 'sin cargos ni reservas nuevas');
+      } finally {
+        await ds.query(`update public.production_jobs set worker_status = $2, status = $3 where id = $1`, [runB, prev.worker_status, prev.status]);
+      }
     });
 
     // ════ LLM ingest: atribución, idempotencia, precios ═══════════════════

@@ -172,7 +172,7 @@ export class AdminRecoveryService {
          from latest l
          left join public.course_generation_manifests m on m.id = (l.input_payload->>'manifestId')::bigint
          left join public.course_blueprints b on b.id = m.blueprint_id
-        where coalesce(l.worker_status, '') not in ('queued', 'running', 'retrying')
+        where coalesce(l.worker_status, '') not in ('queued', 'running', 'retrying', 'paused')
         order by l.updated_at desc nulls last, l.id desc
         limit $1`,
       [limit],
