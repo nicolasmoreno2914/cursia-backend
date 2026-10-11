@@ -1058,8 +1058,10 @@ export class SchedulerService {
       const d = await recordExamBankDraft(qr, item, job.owner_id, opts?.examBankDraftArtifactId ?? null, !!retryable);
       if (d.recorded === false && opts?.examBankDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
       if (d.recorded === false && opts?.examBankDraftArtifactId === null) await clearExamBankDraft(qr, item);
+      // Loop de costos (review I2): conceder el intento por una devolución `run_paused` solo si el run está pausado.
+      const grant = opts?.grantAttempt === true && (!msg.startsWith('run_paused') || isPausedRun(job));
       const t = await applyItemFailure(
-        qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, opts?.grantAttempt === true,
+        qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, grant,
         { errorCode: isValidFailureCode(opts?.errorCode) ? opts!.errorCode : null, source: failureSourceFor(item.type, ownerId) },
       );
       if (!t) throw new GuardRejection('not_running');

@@ -69,9 +69,10 @@ async function pureChecks() {
   await check('puro: la PRIMERA llamada de una parte siempre pasa; mientras lo gastado < límite (2,5× esperado / máx. estimado / piso USD 0,25) la parte sigue recuperándose', () => {
     eq(G.itemHardLimit(0.1, 0.17), 0.25, 'piso');
     eq(Number(G.itemHardLimit(0.22, 0.4).toFixed(4)), 0.55, '2,5× esperado');
+    eq(Number(G.itemHardLimit(0.1, 0.17, 0.15).toFixed(4)), 0.55, 'esperado + 3 llamadas fallidas (cota 0,15)');
     eq(G.decideRunSpend(base).allow, true, '1.ª llamada');
-    eq(G.decideRunSpend({ ...base, itemSpent: 0.24 }).allow, true, 'aún bajo el límite');
-    const d = G.decideRunSpend({ ...base, itemSpent: 0.25 });
+    eq(G.decideRunSpend({ ...base, itemSpent: 0.54 }).allow, true, 'aún bajo el límite');
+    const d = G.decideRunSpend({ ...base, itemSpent: 0.55 });
     eq([d.allow, d.reason], [false, 'item_recovery_budget_exhausted'], 'alcanzado');
   });
 
@@ -346,7 +347,9 @@ async function dbChecks() {
     const C = await makeCourse('Presupuesto de recuperación');
     const est = await budget.runItemEstimates(C.runId);
     const k1 = `content:${C.c1}`;
-    const hard1 = G.itemHardLimit(est.byKey.get(k1).expected, est.byKey.get(k1).max);
+    // Misma cota de llamada que usa el guard (36 000 caracteres → 12 000 tokens de entrada + 8 000 de salida).
+    const bound = Number(await budget.callCost({ provider: 'anthropic', service: 'messages', product: 'claude-sonnet-4-6', usage: { input_tokens: 12000, output_tokens: 8000 } }));
+    const hard1 = G.itemHardLimit(est.byKey.get(k1).expected, est.byKey.get(k1).max, bound);
 
     await check('DB escenario 6: una parte que gasta MÁS de lo esperado sigue recuperándose dentro de su margen y se detiene SOLO al alcanzar su límite (exceso máx. 1 llamada)', async () => {
       const it = await itemOf(C, k1);
@@ -398,6 +401,30 @@ async function dbChecks() {
       eq(heal.heal, false, 'sin reintento automático');
     });
 
+    await check('DB review C1: una parte detenida por presupuesto SIEMPRE se puede recuperar — un reintento manual le da un presupuesto nuevo (y un reintento automático NO)', async () => {
+      const it = await itemOf(C, k1);
+      eq((await proxyCall(it.id)).denied && true, true, 'sigue agotada');
+      // El auto-heal (reapertura automática) no reinicia el presupuesto.
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = $2, finished_at = now() where id = $1`, [it.id, G.itemRecoveryBudgetMessage('test')]);
+      const r0 = await proxyCall(it.id);
+      eq(r0.denied && r0.denied.code, 'item_recovery_budget_exhausted', 'sin reinicio automático');
+      // Reintento MANUAL del dueño → presupuesto nuevo.
+      await runs.retryItem(C.cid, OWNER, 1, C.runId, k1, false, false, undefined, { email: 'owner@cursia.test' });
+      const r1 = await proxyCall(it.id);
+      assert(r1.ok, 'tras el reintento manual vuelve a poder llamar: ' + JSON.stringify(r1));
+    });
+
+    await check('DB review C2: errores temporales normales (llamadas que quedan PENDIENTES a max_tokens) no agotan la parte: siempre caben esperado + 3 llamadas fallidas', async () => {
+      const k2 = `content:${C.c2}`;
+      const it = await itemOf(C, k2);
+      await ds.query(`update public.generation_item_runs set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('recoveryBudgetResetAt', now()) where id = $1`, [it.id]);
+      let pend = 0;
+      for (let i = 0; i < 3; i++) { const r = await proxyCall(it.id, { outcome: 'unknown' }); if (r.pending) pend++; }
+      eq(pend, 3, '3 fallas temporales con reserva pendiente');
+      const ok = await proxyCall(it.id);
+      assert(ok.ok, 'la 4.ª llamada (la que sale bien) todavía pasa: ' + JSON.stringify(ok));
+    });
+
     // ── Escenario 8: varias capas sobre la MISMA parte no se multiplican ───────────
     await check('DB escenario 8: navegador (reintentos de la llamada) + auto-heal (reaperturas) + worker sobre partes que fallan a la vez → cada parte queda acotada por SU presupuesto, sin importar la capa', async () => {
       const D = await makeCourse('Varias capas');
@@ -414,18 +441,17 @@ async function dbChecks() {
         // el auto-heal reabre (retryItem auto) — no cambia el presupuesto de la parte
       }
       for (const k of keys) {
-        const lim = G.itemHardLimit(estD.byKey.get(k).expected, estD.byKey.get(k).max);
+        const lim = G.itemHardLimit(estD.byKey.get(k).expected, estD.byKey.get(k).max, bound);
         const sp = await itemSpent(D.runId, k);
         assert(sp < lim + 0.35, `${k}: gastado ${sp.toFixed(3)} acotado por su límite ${lim.toFixed(3)} (+ llamadas concurrentes en vuelo)`);
-        assert(allowed[k] <= 6, `${k}: ${allowed[k]} llamadas de 15 intentos`);
+        assert(allowed[k] <= 8, `${k}: ${allowed[k]} llamadas de 15 intentos`);
       }
       // Worker de proveedores: su propia parte con su propio presupuesto (mismo guard).
       const pres = (await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type = 'presentation' limit 1`, [D.runId]))[0];
       const presExp = estD.byKey.get(pres.item_key);
       if (presExp) {
-        const lim = G.itemHardLimit(presExp.expected, presExp.max);
-        // Lo gastado en la parte (cualquier proveedor / capa) supera su límite → el worker tampoco puede enviar.
-        const r = await proxyCall(pres.id, { inTok: Math.ceil(lim / 3e-6) + 1000, outTok: 10 });
+        // Lo gastado en la parte (cualquier proveedor / capa) supera con creces su límite → el worker tampoco puede enviar.
+        const r = await proxyCall(pres.id, { inTok: Math.ceil((10 * (presExp.max + presExp.expected) + 5) / 3e-6), outTok: 10 });
         assert(r.ok, 'carga previa de la parte');
         const g = await budget.guardPaidSubmission({ runId: D.runId, itemRunId: pres.id, itemType: 'presentation' });
         eq([g.allow, g.reason], [false, 'item_recovery_budget_exhausted'], 'worker: misma regla por parte');
@@ -492,6 +518,53 @@ async function dbChecks() {
       await proxyCall(it2.id, { inTok: 1500000, outTok: 50000 });
       const r3 = await proxyCall(it3.id);
       assert(r3.denied && r3.denied.code === 'run_paused', 'rearmado: ' + JSON.stringify(r3));
+    });
+
+    await check('DB review I2: devolver una parte porque el run está PAUSADO no consume su intento (aunque fuera el último)', async () => {
+      const P = await makeCourse('Devolución por pausa');
+      const cl = await sched.claimNextItemDetailed({ runId: P.runId, executorId: A, types: TYPES, leaseSeconds: 120, ownerId: OWNER });
+      assert(cl.item, 'parte en vuelo');
+      await ds.query(`update public.generation_item_runs set max_attempts = attempt_count where id = $1`, [cl.item.itemRunId]);
+      await runs.pauseRun(P.cid, OWNER, 1, P.runId);
+      await sched.failItem(cl.item.itemRunId, A, 'run_paused: el run está pausado', true, OWNER, { grantAttempt: true, retryAfterSeconds: 5 });
+      const row = (await ds.query(`select status, attempt_count, max_attempts from public.generation_item_runs where id = $1`, [cl.item.itemRunId]))[0];
+      assert(row.status !== 'failed', 'no queda fallida por la pausa: ' + JSON.stringify(row));
+    });
+
+    await check('DB review I3 + I4: pausa por TOPE del run → reanudar sin ampliar el presupuesto se rechaza con un motivo claro; presupuesto REVOCADO (BLOCKED) → el navegador no gasta', async () => {
+      const Q = await makeCourse('Tope del run');
+      const auth = Number(await budget.runAuthorizedBudget(Q.runId));
+      const it = await itemOf(Q, `content:${Q.c1}`);
+      // Lleva el run hasta el autorizado (proveedor falso con uso enorme), la llamada siguiente dispara el tope.
+      await proxyCall(it.id, { inTok: Math.ceil(auth / 3e-6), outTok: 10 });
+      const it2 = await itemOf(Q, `content:${Q.c2}`);
+      const r = await proxyCall(it2.id);
+      eq(r.denied && r.denied.code, 'run_paused', 'pausa por tope');
+      eq((await runRow(Q.runId)).output_summary.pause.reason, 'run_budget_cap', 'motivo');
+      let e = null;
+      try { await runs.resumeRun(Q.cid, OWNER, 1, Q.runId); } catch (err) { e = err; }
+      assert(e && e.getResponse().code === 'run_budget_cap', 'reanudar sin ampliar → 409 run_budget_cap');
+      // I4: presupuesto revocado.
+      const R = await makeCourse('Presupuesto revocado');
+      const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [R.runId]);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason) values ($1, $2, $3, 0, 'BLOCKED', 'revocado')`, [R.runId, R.cid, est.id]);
+      const ri = await itemOf(R, `content:${R.c1}`);
+      const rr = await proxyCall(ri.id);
+      eq(rr.denied && rr.denied.code, 'run_paused', 'revocado → no gasta');
+    });
+
+    await check('DB review M4: reanudar dos veces la misma pausa del disyuntor acepta el sobreconsumo UNA sola vez', async () => {
+      const W = await makeCourse('Doble reanudar');
+      await allPending(W);
+      const i1 = await itemOf(W, `content:${W.c1}`);
+      const i2 = await itemOf(W, `content:${W.c2}`);
+      await proxyCall(i1.id, { inTok: 1500000, outTok: 50000 });
+      eq((await proxyCall(i2.id)).denied.code, 'run_paused', 'disyuntor');
+      const a1 = await budget.acknowledgeBreakerOnResume(W.runId);
+      const ack1 = Number((await runRow(W.runId)).output_summary.spendBreaker.acknowledgedUsd);
+      await budget.acknowledgeBreakerOnResume(W.runId);
+      const ack2 = Number((await runRow(W.runId)).output_summary.spendBreaker.acknowledgedUsd);
+      assert(a1 > 0 && Math.abs(ack1 - ack2) < 1e-9, `una sola vez (${ack1} / ${ack2})`);
     });
 
     await check('DB escenario 7b: una desviación PEQUEÑA no pausa (sin falsos positivos): +40 % de gasto sobre lo esperado del avance → sigue', async () => {

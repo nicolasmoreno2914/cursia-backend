@@ -7,11 +7,12 @@
  * y workers del servidor), con lo que el ledger ya sabe:
  *
  *  1. Tope duro del run: gastado (ledger, reservas pendientes incluidas) + esta llamada ≤ autorizado.
- *  2. Presupuesto de recuperación por parte: costo esperado (estimado del run) + margen → límite duro
- *     = max(ITEM_HARD_FACTOR × esperado, máximo estimado del item, ITEM_HARD_FLOOR_USD). Cuenta TODO lo gastado
- *     en esa parte (todas las capas de reintento, todos los intentos y generaciones), así las capas ya no se
- *     multiplican: cuando lo gastado alcanza el límite se detiene SOLO esa parte (exceso máximo: una llamada).
- *     La primera llamada de una parte siempre pasa.
+ *  2. Presupuesto de recuperación por parte: costo esperado (estimados del run) + margen → límite duro
+ *     = max(ITEM_HARD_FACTOR × esperado, máximo estimado, ITEM_HARD_FLOOR_USD, esperado + 3 × cota de una llamada).
+ *     Cuenta lo gastado en la GENERACIÓN vigente de la parte desde su último reinicio de presupuesto (todas las capas
+ *     de reintento: llamada, intentos, auto-heal), así las capas ya no se multiplican: al alcanzar el límite se
+ *     detiene SOLO esa parte (exceso máximo: una llamada por ejecutor concurrente). Un reintento manual o una
+ *     regeneración le dan un presupuesto nuevo (la parte siempre se puede recuperar). La primera llamada pasa.
  *  3. Disyuntor (circuit breaker) del run: el gasto se compara con el costo ESPERADO del progreso real (partes
  *     terminadas, en curso o con gasto). Solo dispara ante una anomalía significativa y sistémica:
  *       gastado + esta llamada > BREAKER_RATIO × esperado(progreso) + max(BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE × esperado(run))
@@ -49,9 +50,21 @@ export interface RunSpendInput {
   breakerAcknowledgedUsd?: number;
 }
 
-export function itemHardLimit(expected: number | null, estimatedMax: number | null): number | null {
+/** Llamadas fallidas (cota de cada una) que el presupuesto de una parte absorbe SIEMPRE además de su costo esperado. */
+export const ITEM_FAILED_CALLS_ALLOWANCE = 3;
+
+/**
+ * Límite duro de una parte. `nextCallBound` (cota de la llamada siguiente) asegura que errores transitorios normales
+ * (cada uno puede dejar una reserva pendiente a max_tokens) no la agoten: siempre caben esperado + 3 llamadas fallidas.
+ */
+export function itemHardLimit(expected: number | null, estimatedMax: number | null, nextCallBound = 0): number | null {
   if (expected === null || !(expected >= 0)) return null;
-  return Math.max(ITEM_HARD_FACTOR * expected, estimatedMax !== null && estimatedMax > 0 ? estimatedMax : 0, ITEM_HARD_FLOOR_USD);
+  return Math.max(
+    ITEM_HARD_FACTOR * expected,
+    estimatedMax !== null && estimatedMax > 0 ? estimatedMax : 0,
+    ITEM_HARD_FLOOR_USD,
+    expected + ITEM_FAILED_CALLS_ALLOWANCE * Math.max(0, nextCallBound),
+  );
 }
 
 export function breakerThreshold(runExpected: number | null, progressExpected: number | null): number | null {
@@ -62,7 +75,7 @@ export function breakerThreshold(runExpected: number | null, progressExpected: n
 const usd = (n: number) => `USD ${n.toFixed(2)}`;
 
 export function decideRunSpend(i: RunSpendInput): RunSpendDecision {
-  const hard = itemHardLimit(i.itemExpected, i.itemEstimatedMax);
+  const hard = itemHardLimit(i.itemExpected, i.itemEstimatedMax, i.nextCost);
   const base = breakerThreshold(i.runExpected, i.progressExpected);
   const breaker = base === null ? null : base + Math.max(0, i.breakerAcknowledgedUsd ?? 0);
   const after = i.runSpent + i.nextCost;

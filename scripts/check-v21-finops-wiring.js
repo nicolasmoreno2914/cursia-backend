@@ -956,10 +956,10 @@ async function dbChecks() {
       assert(Math.abs(dec(t2.total) - dec(t0.total) - reserved / 2) < 1e-9, 'la cobrada sigue contada; la no cobrada a 0');
     });
 
-    await check('DB proxy-reserva: rechazo definitivo de Anthropic (429/529…) → /release la lleva a 0 (idempotente); un estado incierto (400/500/524) → 400 y la reserva sigue pendiente', async () => {
+    await check('DB proxy-reserva: rechazo definitivo de Anthropic (429/529…) → /release la lleva a 0 (idempotente); un estado incierto (400/502/524) → 400 y la reserva sigue pendiente', async () => {
       const callId = crypto.randomUUID();
       await postIngest('llm-reservation', { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 300, maxTokens: 100, billingAccount: 'cursia' });
-      for (const st of [400, 500, 524]) {
+      for (const st of [400, 502, 524]) {
         const bad = await postIngest('llm-reservation/release', { callId, providerStatus: st });
         eq(bad.status, 400, `status ${st} no libera`);
       }

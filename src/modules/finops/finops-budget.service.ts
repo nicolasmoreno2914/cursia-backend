@@ -531,21 +531,31 @@ export class FinopsBudgetService {
   async runItemEstimates(runId: string): Promise<{ byKey: Map<string, { expected: number; max: number }>; total: number | null }> {
     const hit = this.runEstimateCache.get(runId);
     if (hit && Date.now() - hit.at < 60_000) return hit;
-    const [est] = await this.dataSource.query(
-      `select lines, totals from public.cost_estimates where run_id = $1 and scope = 'run' order by created_at desc, id desc limit 1`,
+    // Estimado del run (el más reciente) + estimados de regeneración / upgrade de video aprobados SOBRE el mismo run
+    // (review I1): ese gasto aprobado también es «esperado» (si no, un upgrade legítimo dispararía el disyuntor).
+    const rows: Array<{ scope: string; lines: any; totals: any }> = await this.dataSource.query(
+      `(select scope, lines, totals from public.cost_estimates where run_id = $1 and scope = 'run' order by created_at desc, id desc limit 1)
+       union all
+       (select scope, lines, totals from public.cost_estimates where run_id = $1 and scope = 'regeneration')`,
       [runId],
     );
     const byKey = new Map<string, { expected: number; max: number }>();
-    for (const l of (est?.lines ?? []) as Array<Record<string, any>>) {
-      if (!l || typeof l.itemKey !== 'string') continue;
-      const cur = byKey.get(l.itemKey) ?? { expected: 0, max: 0 };
-      // Esperado CON la tasa de reintentos del estimado (expected), y su máximo.
-      cur.expected += Number(l.expected ?? l.wouldCost?.expected ?? 0) || 0;
-      cur.max += Number(l.max ?? l.wouldCost?.max ?? 0) || 0;
-      byKey.set(l.itemKey, cur);
+    let total = 0;
+    let hasRun = false;
+    for (const est of rows) {
+      if (est.scope === 'run') hasRun = true;
+      for (const l of (est?.lines ?? []) as Array<Record<string, any>>) {
+        if (!l || typeof l.itemKey !== 'string') continue;
+        const cur = byKey.get(l.itemKey) ?? { expected: 0, max: 0 };
+        // Esperado CON la tasa de reintentos del estimado (expected), y su máximo.
+        cur.expected += Number(l.expected ?? l.wouldCost?.expected ?? 0) || 0;
+        cur.max += Number(l.max ?? l.wouldCost?.max ?? 0) || 0;
+        byKey.set(l.itemKey, cur);
+      }
+      if (est?.totals?.expected !== undefined && est?.totals?.expected !== null) total += Number(est.totals.expected) || 0;
     }
-    const total = est?.totals?.expected !== undefined && est?.totals?.expected !== null ? Number(est.totals.expected) : null;
-    const v = { at: Date.now(), byKey, total: byKey.size ? total : null };
+    const v = { at: Date.now(), byKey, total: hasRun && byKey.size ? total : null };
+    if (this.runEstimateCache.size > 500) this.runEstimateCache.clear();
     this.runEstimateCache.set(runId, v);
     return v;
   }
@@ -555,7 +565,7 @@ export class FinopsBudgetService {
    * Si dispara el disyuntor (o el tope del run en `pauseOnCap`), PAUSA el run (pausa segura del servidor, reanudable
    * por el usuario). `authorizedBudget`: tope a aplicar (null = no aplicar el punto 1 acá).
    */
-  async guardRunSpend(a: { runId: string; itemRunId: string | null; nextCost: number; authorizedBudget: number | null; pauseOnCap?: boolean }): Promise<{
+  async guardRunSpend(a: { runId: string; itemRunId: string | null; nextCost: number; authorizedBudget: number | null; pauseOnCap?: boolean; snapshot?: boolean }): Promise<{
     decision: RunSpendDecision; itemKey: string | null; paused: boolean; overspend?: number; runExpected?: number | null;
   }> {
     const est = await this.runItemEstimates(a.runId);
@@ -565,9 +575,16 @@ export class FinopsBudgetService {
       const [it] = await this.dataSource.query(`select item_key from public.generation_item_runs where id = $1 and job_id = $2`, [a.itemRunId, a.runId]);
       if (it) {
         itemKey = it.item_key;
+        // Review C1: lo gastado en la GENERACIÓN vigente de la parte desde su último reinicio de presupuesto (un
+        // reintento manual o una regeneración le dan un presupuesto nuevo: la parte siempre se puede recuperar).
+        // Dentro de esa ventana cuenta TODO (reintentos de la llamada, intentos del item, rondas del auto-heal).
         const [sp] = await this.dataSource.query(
-          `select coalesce(sum(amount),0)::text as t from public.generation_cost_events
-            where run_id = $1 and item_key = $2 and billing_account <> 'user_key'`,
+          `with cur as (
+             select created_at, nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz as reset_at
+               from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1)
+           select coalesce(sum(e.amount),0)::text as t from public.generation_cost_events e, cur
+            where e.run_id = $1 and e.item_key = $2 and e.billing_account <> 'user_key'
+              and e.created_at >= greatest(cur.created_at, coalesce(cur.reset_at, cur.created_at))`,
           [a.runId, itemKey],
         );
         itemSpent = Number(sp.t);
@@ -615,7 +632,7 @@ export class FinopsBudgetService {
       // eslint-disable-next-line no-console
       console.error(`[spend-guard] run ${a.runId} item ${itemKey}: ${decision.reason} — ${'detail' in decision ? decision.detail : ''}`);
     }
-    if (a.nextCost === 0) {
+    if (a.snapshot) {
       return { decision, itemKey, paused, overspend: Math.max(0, Number(runSpentRow.t) - (decision.breakerThreshold ?? Infinity)), runExpected: est.total };
     }
     if (!decision.allow && (decision.reason === 'circuit_breaker' || (decision.reason === 'run_budget_cap' && a.pauseOnCap))) {
@@ -646,8 +663,14 @@ export class FinopsBudgetService {
       provider: 'anthropic', service: 'messages', product: a.model,
       usage: { input_tokens: Math.max(1, Math.ceil(a.promptChars / 3)), output_tokens: a.maxTokens },
     }));
-    const auth = await this.runAuthorizedBudget(row.job_id);
-    const g = await this.guardRunSpend({ runId: row.job_id, itemRunId: a.itemRunId, nextCost, authorizedBudget: auth !== null ? Number(auth) : null, pauseOnCap: true });
+    // Review I4: un presupuesto REVOCADO (BLOCKED) es tope 0 (falla cerrado, como en los workers); sin ninguna
+    // autorización (runs previos a FinOps) no hay tope que aplicar acá.
+    const [authRow] = await this.dataSource.query(
+      `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
+      [row.job_id],
+    );
+    const cap = !authRow ? null : authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
+    const g = await this.guardRunSpend({ runId: row.job_id, itemRunId: a.itemRunId, nextCost, authorizedBudget: cap, pauseOnCap: true });
     const d = g.decision;
     if (d.allow) return null;
     const detail = 'detail' in d ? d.detail : '';
@@ -666,19 +689,21 @@ export class FinopsBudgetService {
    * anomalía NUEVA. Devuelve el sobreconsumo aceptado (USD).
    */
   async acknowledgeBreakerOnResume(runId: string): Promise<number> {
-    const snap = await this.guardRunSpend({ runId, itemRunId: null, nextCost: 0, authorizedBudget: null });
+    const snap = await this.guardRunSpend({ runId, itemRunId: null, nextCost: 0, authorizedBudget: null, snapshot: true });
     if (snap.decision.breakerThreshold === null) return 0;
     // Lo excedido hasta ahora + un margen NUEVO completo: el disyuntor no vuelve a disparar por lo mismo (ni en la
     // llamada siguiente), pero sí cuando el consumo vuelve a desviarse esa misma magnitud.
     const slack = Math.max(BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE * (snap.runExpected ?? 0));
     const over = Math.max(0, snap.overspend ?? 0) + slack;
     if (over > 0) {
+      // Review M4: idempotente por pausa (doble clic / dos pestañas → se acepta UNA vez por cada pausa del disyuntor).
       await this.dataSource.query(
         `update public.production_jobs
             set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('spendBreaker', jsonb_build_object(
                   'acknowledgedUsd', coalesce((output_summary->'spendBreaker'->>'acknowledgedUsd')::numeric, 0) + $2::numeric,
-                  'acknowledgedAt', now()))
-          where id = $1`,
+                  'acknowledgedAt', now(), 'ackForPauseAt', output_summary->'pause'->>'pausedAt'))
+          where id = $1 and worker_status = 'paused'
+            and coalesce(output_summary->'spendBreaker'->>'ackForPauseAt', '') is distinct from coalesce(output_summary->'pause'->>'pausedAt', '')`,
         [runId, over.toFixed(6)],
       );
     }
@@ -695,6 +720,7 @@ export class FinopsBudgetService {
                                             'previousWorkerStatus', worker_status)),
               updated_at = now()
         where id = $1 and execution_mode = 'dynamic_generation' and worker_status in ('queued', 'running', 'retrying')
+          and coalesce(status, '') not in ('cancelled', 'cancelling')
         returning id`,
       [runId, 'system:' + reason, reason, detail.slice(0, 500)],
     );

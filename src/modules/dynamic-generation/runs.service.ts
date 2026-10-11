@@ -1862,6 +1862,16 @@ export class RunsService {
     // Loop Cost Efficiency: reanudar tras una pausa del DISYUNTOR = el usuario acepta el sobreconsumo hasta ahora;
     // se registra ANTES de reabrir (todavía pausado) para que no vuelva a disparar por lo mismo en la llamada siguiente.
     const pauseReason = (job as any)?.output_summary?.pause?.reason;
+    if (isPausedRun(job) && pauseReason === 'run_budget_cap' && this.finopsBudget) {
+      // Review I3: reanudar sin ampliar el presupuesto volvería a pausar en la llamada siguiente.
+      const [auth, spent] = await Promise.all([this.finopsBudget.runAuthorizedBudget(job.id), this.finopsBudget.runActual(job.id)]);
+      if (auth === null || Number(spent) >= Number(auth) - 0.01) {
+        throw new ConflictException({
+          code: 'run_budget_cap',
+          message: `La generación se pausó porque alcanzó su presupuesto autorizado (USD ${Number(auth ?? 0).toFixed(2)}; gastado USD ${Number(spent).toFixed(2)}). Para continuar hay que ampliar el presupuesto.`,
+        });
+      }
+    }
     if (isPausedRun(job) && pauseReason === 'circuit_breaker' && this.finopsBudget) {
       const over = await this.finopsBudget.acknowledgeBreakerOnResume(job.id);
       this.logger.warn(`run ${job.id}: reanudado tras el disyuntor — sobreconsumo aceptado USD ${over.toFixed(2)}`);
@@ -2286,13 +2296,16 @@ export class RunsService {
       const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerProbe?.mode === 'canary'
         ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
+      // Loop de costos (review C1): una reapertura MANUAL (dueño / admin) le da a la parte un presupuesto de recuperación
+      // NUEVO (recoveryBudgetResetAt: cuenta lo gastado desde ahora), así una parte detenida por presupuesto siempre se
+      // puede recuperar. Las reaperturas automáticas (auto-heal) NO lo reinician: siguen dentro del mismo presupuesto.
       const updated = returningRows(
         await qr.query(
           `update public.generation_item_runs
               set status = 'pending',
                   max_attempts = attempt_count + $2::int,
                   -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
-                  output_summary = (${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}',
+                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`},
                   error = null,
                   next_retry_at = null,
                   worker_id = null,

@@ -118,7 +118,9 @@ export class FinopsLlmReservationController {
       const parsed = parseLlmReservationIngest(body);
       // Loop Cost Efficiency: pausa / tope del run / presupuesto de recuperación de la parte / disyuntor, ANTES de
       // reservar (sin reserva, el proxy no llama). 409 con un código estable que el navegador entiende.
-      if ((parsed.mode ?? 'real') === 'real') {
+      // Review M5: el reintento del MISMO POST (timeout del proxy) no vuelve a pasar por el guard (ya está reservada).
+      const already = await this.ledger.reservationSettled(llmProxyReservationKey(parsed.callId));
+      if ((parsed.mode ?? 'real') === 'real' && already === null) {
         const deny = await this.budget.guardLlmProxyCall({
           subject: parsed.subject, itemRunId: parsed.itemRunId ?? null, model: parsed.model,
           promptChars: parsed.promptChars, maxTokens: parsed.maxTokens, billingAccount: parsed.billingAccount,

@@ -86,7 +86,13 @@ export class ExecutorController {
     @CurrentUser() user: AuthUser,
   ): Promise<ItemOpResult> {
     // id = borrador nuevo; null explícito = borrar el anterior (R4); ausente = conservar.
-    const opts: { examBankDraftArtifactId?: string | null; errorCode?: string } = {};
+    const opts: { examBankDraftArtifactId?: string | null; errorCode?: string; grantAttempt?: boolean; retryAfterSeconds?: number } = {};
+    // Loop de costos (review I2): devolver una parte porque el run se PAUSÓ no consume su intento (como en los workers);
+    // el scheduler lo concede solo si el run está pausado de verdad.
+    if (dto.retryable && typeof dto.error === 'string' && dto.error.startsWith('run_paused')) {
+      opts.grantAttempt = true;
+      opts.retryAfterSeconds = 5;
+    }
     if (dto.examBankDraftArtifactId !== undefined) opts.examBankDraftArtifactId = dto.examBankDraftArtifactId;
     // REL R1: código explícito opcional (solo clasificación).
     if (dto.errorCode !== undefined) opts.errorCode = dto.errorCode;
