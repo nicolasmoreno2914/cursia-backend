@@ -274,6 +274,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     refine: ({ itemType }) => (itemType && WORKER_ITEM_TYPES.has(itemType) ? { paidRisk: 'uncertain' } : null),
   },
   { id: 'worker_draining', codes: ['worker_draining'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
+  // Piloto #1209: devolución por pausa del usuario (sin gasto); la retoma el reanudar, no el auto-heal.
+  { id: 'run_paused', codes: ['run_paused'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'unexpected_error', codes: ['unexpected_error'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'unknown_error', codes: ['unknown_error'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   {
