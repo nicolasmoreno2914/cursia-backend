@@ -6,6 +6,7 @@ import { AppModule } from '../app.module';
 import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { DrainSignal, awaitDrain, drainTimeoutMs, installDrainHandlers, runClaimLoop } from './worker-drain';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
+import { V3_PAYLOAD_INVALID } from '../modules/course-shell/v3-validation';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
@@ -31,7 +32,7 @@ import type { CallRole } from '../modules/finops/finops-ledger.service';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface LlmWorkerDeps {
-  scheduler: Pick<SchedulerService, 'heartbeatItem' | 'completeItem' | 'failItemDetailed' | 'recordItemExternal'>;
+  scheduler: Pick<SchedulerService, 'heartbeatItem' | 'completeItem' | 'completeItemDetailed' | 'failItemDetailed' | 'recordItemExternal'>;
   dataSource: DataSource;
   artifacts: Pick<ArtifactsService, 'uploadBufferArtifact' | 'putStorageObject' | 'downloadStorageObject'>;
   finops: WorkerLedger;
@@ -180,13 +181,20 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
         return 'failed';
       }
     }
-    // Review I5: los puntos de guardado ya no hacen falta; se descartan ANTES de completar para que, si el servidor
-    // rechaza el resultado (prevalidación), el reintento genere de nuevo y no repita las mismas respuestas inválidas.
-    await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
     clearInterval(hb);
     const summary = { contextHash: (item as any).context?.contextHash, ...(result.summary || {}), generatedBy: 'llm-worker' };
-    const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, { artifactIds, summary });
-    if (!ok) {
+    const done = await deps.scheduler.completeItemDetailed(item.itemRunId, deps.executorId, { artifactIds, summary });
+    if (!done.ok) {
+      if (done.reason === V3_PAYLOAD_INVALID) {
+        // Review I5: el servidor rechazó el resultado (y ya dejó la parte para reintento): sus puntos de guardado se
+        // descartan para que el reintento genere de nuevo y no repita las mismas respuestas inválidas. Cualquier otro
+        // rechazo (lease, artifacts, red) los conserva: el reintento no vuelve a pagar lo ya generado.
+        await deps.dataSource.query(
+          `update public.generation_item_runs set output_summary = output_summary - 'llmCheckpoints', updated_at = now()
+            where id = $1 and status <> 'running'`,
+          [item.itemRunId],
+        ).catch(() => undefined);
+      }
       await fail('complete rechazado', true);
       return 'failed';
     }
@@ -297,7 +305,7 @@ async function bootstrap() {
   });
   await awaitDrain(active, drainTimeoutMs());
   clearInterval(beatTimer);
-  await ds.query(`delete from public.llm_worker_presence where worker_id = $1`, [deps.executorId]).catch(() => undefined);
+  // El registro NO se borra al salir: su latido envejece solo (60 s) y cubre el arranque del proceso nuevo del deploy.
 }
 
 if (require.main === module) {

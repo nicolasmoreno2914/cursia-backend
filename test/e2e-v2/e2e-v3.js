@@ -3933,7 +3933,7 @@ function reservationBookkeeping(ev) {
         await waitFor('worker 2 drenado', async () => !!w2.exited, 120000, 200);
         const afterDrain = await finished(c2.runId);
         const presW2 = await q(`select draining from public.llm_worker_presence where worker_id = $1`, [W2]);
-        ok(presW2.length === 0 || presW2[0].draining === true, 'E24b: el worker drenado deja de anunciarse (el API no le asigna partes a un worker que se apaga)', presW2);
+        ok(presW2.length === 1 && presW2[0].draining === true, 'E24b: el worker drenado queda marcado como drenando (su latido envejece solo; cubre el arranque del nuevo)', presW2);
         ok(drainingKeys.every((k) => { const r = afterDrain.find((i) => i.item_key === k); return r && r.status !== 'running'; }), 'E24b: drenaje — lo que el worker tenía en vuelo terminó o volvió a la cola antes de salir (nada quedó colgado)', { drainingKeys, exited: w2.exited });
         await waitRunTerminal(ctl2, 'E24b run', 15 * 60 * 1000, c2.runId).catch(() => null);
         const rows2 = await waitItemsDone(c2.runId);

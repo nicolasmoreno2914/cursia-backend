@@ -17,3 +17,17 @@ create table if not exists public.llm_worker_presence (
   draining    boolean not null default false
 );
 create index if not exists llm_worker_presence_last_seen_idx on public.llm_worker_presence (last_seen);
+
+-- Solo el backend (service role) lee/escribe: un cliente (anon/authenticated vía PostgREST) nunca puede fingir ni
+-- borrar la presencia de un worker (decide qué partes reclama el navegador). Mismo patrón que v21-finops-rls.
+alter table public.llm_worker_presence enable row level security;
+do $$
+declare r text;
+begin
+  foreach r in array array['anon','authenticated']
+  loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format('revoke all on table public.llm_worker_presence from %I', r);
+    end if;
+  end loop;
+end $$;

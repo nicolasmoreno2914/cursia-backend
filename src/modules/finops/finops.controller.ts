@@ -288,13 +288,15 @@ export class FinopsAdminController {
     const decidedBy = String(user?.id || '');
     if (!decidedBy) throw new BadRequestException('usuario sin id');
     try {
-      if (!(await this.ledger.isLlmWorkerReservation(b.reservationKey))) throw new BadRequestException('no es una reserva del worker de IA');
+      const kind = await this.ledger.isLlmWorkerReservation(b.reservationKey);
+      if (kind === 'not_worker') throw new BadRequestException('no es una reserva del worker de IA');
+      if (kind === 'item_running') throw new ConflictException('la parte sigue en ejecución: la llamada puede liquidarse sola; conciliar cuando termine');
       const r = b.outcome === 'charged'
         ? await this.ledger.reconcileReservationAsCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } })
         : await this.ledger.reconcileReservationAsNotCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } });
       return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
     } catch (err) {
-      if (err instanceof BadRequestException) throw err;
+      if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
       throw finopsErrorToHttp(err);
     }
   }

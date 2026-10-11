@@ -929,8 +929,10 @@ export class FinopsLedgerService {
     reservationKey: string; createdAt: string; ownerId: string | null; courseId: number | null; runId: string | null;
     itemKey: string | null; model: string | null; amount: string; promptChars: number | null; maxTokens: number | null; callTag: string | null;
   }>> {
+    // Re-review m2: solo con la parte FUERA de ejecución (sin llamada en vuelo que todavía pueda liquidarse sola).
     const where: string[] = [`e.idempotency_key like 'reservation:llm:%'`, `(e.metadata->>'callTag') like 'llmw-%'`, `e.event_kind = 'CHARGE'`,
-      `(e.metadata->>'reservation') = 'true'`, `not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`];
+      `(e.metadata->>'reservation') = 'true'`, `not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`,
+      `coalesce(i.status, '') <> 'running'`];
     const params: unknown[] = [];
     if (filter.courseId !== undefined) { params.push(filter.courseId); where.push(`e.course_id = $${params.length}`); }
     if (filter.runId !== undefined) {
@@ -955,14 +957,17 @@ export class FinopsLedgerService {
     }));
   }
 
-  /** ¿Es una reserva del worker de IA (y existe)? Solo esas se concilian por el endpoint del worker. */
-  async isLlmWorkerReservation(reservationKey: string): Promise<boolean> {
+  /** ¿Es una reserva del worker de IA, y su parte ya no está en ejecución? Solo esas se concilian por el endpoint del worker. */
+  async isLlmWorkerReservation(reservationKey: string): Promise<'ok' | 'not_worker' | 'item_running'> {
     const [r] = await this.dataSource.query(
-      `select 1 from public.generation_cost_events where idempotency_key = $1 and event_kind = 'CHARGE'
-          and (metadata->>'reservation') = 'true' and (metadata->>'callTag') like 'llmw-%'`,
+      `select coalesce(i.status, '') as item_status from public.generation_cost_events e
+         left join public.generation_item_runs i on i.id = e.item_run_id
+        where e.idempotency_key = $1 and e.event_kind = 'CHARGE'
+          and (e.metadata->>'reservation') = 'true' and (e.metadata->>'callTag') like 'llmw-%'`,
       [reservationKey],
     );
-    return !!r;
+    if (!r) return 'not_worker';
+    return r.item_status === 'running' ? 'item_running' : 'ok';
   }
 
   /**

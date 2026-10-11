@@ -38,7 +38,7 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     const s = await R.liveLlmWorkerTypes(ds, t0);
     await R.liveLlmWorkerTypes(ds, t0 + 1000);
     assert([...s].sort().join() === 'content,final_exam' && calls === 1, 'cacheado');
-    assert(/not draining/.test(sql) && /last_seen > now\(\)/.test(sql), 'solo vivos y no drenando');
+    assert(!/not draining/.test(sql) && /last_seen > now\(\)/.test(sql), 'vivos por latido (un worker drenando sigue cubriendo: deploy)');
     await R.liveLlmWorkerTypes(ds, t0 + 6000);
     assert(calls === 2, 'vence la cache');
   });

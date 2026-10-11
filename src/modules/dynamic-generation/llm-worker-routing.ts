@@ -38,14 +38,19 @@ export const LLM_WORKER_PRESENCE_BEAT_MS = 15_000;
 const PRESENCE_CACHE_MS = 5_000;
 let presenceCache: { at: number; types: Set<string> } | null = null;
 
-/** Tipos cubiertos por algún worker de IA vivo y no drenando (cache 5 s). Cualquier error → ninguno (el navegador sigue). */
+/**
+ * Tipos cubiertos por algún worker de IA vivo (cache 5 s). Cualquier error → ninguno (el navegador sigue).
+ * Un worker DRENANDO (deploy) sigue contando mientras su latido esté fresco (re-review N2): durante un deploy las
+ * partes devueltas las toma el worker nuevo, nunca el navegador por el proxy de 100 s. Un worker muerto deja de
+ * contar solo cuando su latido envejece (LLM_WORKER_PRESENCE_FRESH_SECONDS).
+ */
 export async function liveLlmWorkerTypes(ds: DataSource, now = Date.now()): Promise<Set<string>> {
   if (presenceCache && now - presenceCache.at < PRESENCE_CACHE_MS) return presenceCache.types;
   let types = new Set<string>();
   try {
     const rows: Array<{ t: string }> = await ds.query(
       `select distinct unnest(item_types) as t from public.llm_worker_presence
-        where not draining and last_seen > now() - make_interval(secs => $1)`,
+        where last_seen > now() - make_interval(secs => $1)`,
       [LLM_WORKER_PRESENCE_FRESH_SECONDS],
     );
     types = new Set(rows.map((r) => String(r.t)));
