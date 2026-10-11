@@ -172,6 +172,15 @@ const MIGRATION_STEPS = [
     summary: 'REL: production_jobs.executor_lease_holder / executor_lease_expires_at (nullable) + constraints + trigger trg_pj_release_exec_lease',
   },
   {
+    // Piloto #1209: pausa REAL de un run (worker_status 'paused', ya admitido por el CHECK). Recrea el índice
+    // único de run activo para que cuente 'paused' (sin ella, un run pausado no impediría un segundo run del
+    // mismo Manifest). Idempotente; ninguna fila existente está en 'paused'. PRERREQUISITO para llevar la pausa a prod.
+    id: 'run-pause',
+    file: 'supabase-migration-run-pause.sql',
+    stagingStep: '4h15 (migrate-run-pause.js)',
+    summary: 'Pausa real: uq_dynamic_generation_active_run incluye worker_status paused',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el

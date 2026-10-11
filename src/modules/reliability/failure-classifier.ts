@@ -310,6 +310,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'D', strategy: 'wait_provider', scope: 'provider', provider: 'anthropic', rounds: 0, humanReason: 'config',
   },
   {
+    // Piloto #1209: 524 — la respuesta se perdió pero el proveedor pudo cobrarla: reenviarla solo podría pagarla dos veces.
+    id: 'llm_response_lost', codes: ['llm_response_lost'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_item',
+  },
+  {
     // 400 de la IA sin otra pista: si es por tamaño → B split; si no, D (bug de producto: el mismo pedido vuelve a fallar).
     id: 'llm_request_rejected', codes: ['llm_request_rejected'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_item',
     refine: ({ error }) => (/too long|demasiado grande|prompt is too long|max_tokens|context/i.test(error)
@@ -593,6 +597,8 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^API key no configurada\b/i, 'llm_api_key_missing'],
   [/^Petici[oó]n demasiado grande\b/i, 'llm_request_too_large'],
   [/^Servidor ocupado\b|^Error del servidor\b|^Error de red\b/i, 'llm_transient'],
+  // Piloto #1209: 524 = respuesta perdida que el proveedor pudo cobrar → nunca se reenvía sola (persona decide).
+  [/^(?:⚠️\s*)?Resultado ambiguo de la IA\b/i, 'llm_response_lost'],
   [/^Respuesta vac[ií]a\b/i, 'llm_empty_response'],
   // cursia#68 (streaming SSE de api()): cortes del stream → transitorio de la IA.
   [/^La respuesta de la IA se cort[oó](?![a-z])|^Se cort[oó] la conexi[oó]n con la IA\b|^La IA dej[oó] de responder\b|^Respuesta de la IA incompleta\b/i, 'llm_stream_cut'],
