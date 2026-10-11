@@ -945,6 +945,43 @@ async function dbChecks() {
       eq([late.status, late.body.alreadySettled], [200, true], 'un usage tardío tras liberar: se registra el cargo, la reserva no se toca de nuevo');
     });
 
+    await check('DB proxy-reserva (review I2): pendientes LISTADAS para el admin (por curso/run); conciliar cobrada/no cobrada (motivo obligatorio); un usage tardío tras «cobrada» NO agrega un segundo cargo', async () => {
+      const it = await itemRow(runB, `content:${Bc.c1}`);
+      const ids = [crypto.randomUUID(), crypto.randomUUID()];
+      for (const callId of ids) await postIngest('llm-reservation', { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 3, model: 'claude-sonnet-4-6', callId, promptChars: 3000, maxTokens: 2000, billingAccount: 'cursia' });
+      const list = (await admin.llmProxyReservations(undefined, runB)).reservations;
+      for (const callId of ids) assert(list.some((r) => r.callId === callId && r.itemKey === `content:${Bc.c1}` && r.maxTokens === 2000), 'listada ' + callId);
+      const byCourse = (await admin.llmProxyReservations(String(Bc.cid))).reservations;
+      assert(byCourse.some((r) => r.callId === ids[0]), 'filtro por curso');
+      await rejectsRe(admin.reconcileLlmProxyReservation(ids[0], { outcome: 'charged' }, ADMIN_USER), /reason/, 'motivo obligatorio', 400);
+      await rejectsRe(admin.reconcileLlmProxyReservation(ids[0], { outcome: 'maybe', reason: 'x' }, ADMIN_USER), /outcome/, 'outcome', 400);
+      const c = await admin.reconcileLlmProxyReservation(ids[0], { outcome: 'charged', reason: 'consola: cobrada' }, ADMIN_USER);
+      eq([c.reconciled, c.alreadySettled], [true, false], 'cobrada');
+      const n = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'not_charged', reason: 'consola: sin cobro' }, ADMIN_USER);
+      eq([n.reconciled, n.alreadySettled], [true, false], 'no cobrada');
+      const again = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'charged', reason: 'x' }, ADMIN_USER);
+      eq(again.alreadySettled, true, 'repetir = no-op');
+      const left = (await admin.llmProxyReservations(undefined, runB)).reservations;
+      assert(!left.some((r) => ids.includes(r.callId)), 'ya no pendientes');
+      const t0 = dec((await ledger.costsByRun(runB)).totals.total);
+      const late = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_charged', callId: ids[0] }));
+      eq([late.status, late.body.finalInserted, late.body.alreadySettled], [200, false, true], 'sin cargo extra');
+      eq(dec((await ledger.costsByRun(runB)).totals.total), t0, 'total intacto (sin doble conteo)');
+      const late2 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_notcharged', callId: ids[1] }));
+      eq([late2.status, late2.body.finalInserted], [200, true], 'tras «no cobrada», un usage real sí se registra (nunca de menos)');
+    });
+
+    await check('DB proxy-reserva (review minors): callId repetido con la reserva ya cerrada → 400 (el proxy no llama); callId + measurement → 400', async () => {
+      const callId = crypto.randomUUID();
+      const body = { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 30, maxTokens: 10, billingAccount: 'cursia' };
+      eq((await postIngest('llm-reservation', body)).status, 200, 'reserva');
+      eq((await postIngest('llm-reservation', body)).status, 200, 'reintento del mismo POST mientras sigue abierta = idempotente');
+      await postIngest('llm-reservation/release', { callId, providerStatus: 429 });
+      eq((await postIngest('llm-reservation', body)).status, 400, 'cerrada → no cubre una llamada nueva');
+      const bad = await ingest(llmBody({ messageId: 'msg_cid_meas', callId: crypto.randomUUID(), measurement: 'correction' }));
+      eq(bad.status, 400, 'callId + measurement');
+    });
+
     await check('DB proxy-reserva: usage con callId SIN reserva (proxy/ledger viejo) → camino de siempre (1 cargo); body inválido / sin token → rechazado', async () => {
       const r = await ingest(llmBody({ messageId: 'msg_no_res', callId: crypto.randomUUID() }));
       eq([r.status, r.body.inserted], [200, true], 'cargo normal');

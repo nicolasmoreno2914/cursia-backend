@@ -97,6 +97,8 @@ export function parseLlmUsageIngest(body: unknown): LlmUsageIngestBody {
   if (measurement !== undefined && measurement !== 'conservative' && measurement !== 'correction') bad('measurement debe ser conservative | correction');
   const callId = b.callId === undefined || b.callId === null ? null : String(b.callId);
   if (callId !== null && !UUID_RE.test(callId)) bad('callId debe ser un UUID');
+  // Review (minor 5): callId (liquida una reserva) y measurement (camino conservador/corrección) son excluyentes.
+  if (callId !== null && measurement !== undefined) bad('callId y measurement no se combinan');
   return { subject, itemRunId, callRole, attempt: b.attempt, model, messageId, requestId, usage, billingAccount: b.billingAccount, mode,
     ...(measurement ? { measurement } : {}), ...(callId ? { callId } : {}) };
 }

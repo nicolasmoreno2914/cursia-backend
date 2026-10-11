@@ -9,6 +9,7 @@ import {
   Param,
   ParseIntPipe,
   Post,
+  Query,
   Res,
   UnprocessableEntityException,
   UseGuards,
@@ -112,6 +113,10 @@ export class FinopsLlmReservationController {
     try {
       const parsed = parseLlmReservationIngest(body);
       const r = await this.ledger.recordCharge(llmReservationToChargeInput(parsed));
+      // Review (minor 6): un callId repetido cuya reserva ya se cerró no cubre una llamada NUEVA → 409 (el proxy no llama).
+      if (!r.inserted && (await this.ledger.reservationSettled(llmProxyReservationKey(parsed.callId)))) {
+        throw new FinopsError('INVALID_INPUT', `la reserva del callId ${parsed.callId} ya está cerrada: usa un callId nuevo`);
+      }
       return { reserved: true, inserted: r.inserted, reservationKey: llmProxyReservationKey(parsed.callId), amount: r.event.amount, attributed: r.event.item_run_id !== null };
     } catch (err) {
       throw finopsErrorToHttp(err);
@@ -211,5 +216,47 @@ export class FinopsAdminController {
   runCosts(@Param('id') id: string) {
     if (!UUID_RE.test(id)) throw new BadRequestException('id de run debe ser UUID');
     return this.ledger.costsByRun(id);
+  }
+
+  // GET /api/v1/finops/llm-proxy-reservations?courseId=&runId= — piloto #1209: llamadas LLM cuya respuesta se
+  // perdió (pendientes de conciliar contra la consola de Anthropic). Cuentan como gasto mientras tanto.
+  @Get('llm-proxy-reservations')
+  async llmProxyReservations(@Query('courseId') courseId?: string, @Query('runId') runId?: string) {
+    const f: { courseId?: number; runId?: string } = {};
+    if (courseId !== undefined) {
+      if (!/^\d{1,12}$/.test(courseId)) throw new BadRequestException('courseId inválido');
+      f.courseId = Number(courseId);
+    }
+    if (runId !== undefined) {
+      if (!UUID_RE.test(runId)) throw new BadRequestException('runId debe ser UUID');
+      f.runId = runId;
+    }
+    try {
+      return { reservations: await this.ledger.pendingLlmProxyReservations(f) };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // POST /api/v1/finops/llm-proxy-reservations/:callId/reconcile {outcome: 'charged'|'not_charged', reason}
+  // Decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. Repetir = no-op.
+  @Post('llm-proxy-reservations/:callId/reconcile')
+  @HttpCode(HttpStatus.OK)
+  async reconcileLlmProxyReservation(@Param('callId') callId: string, @Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
+    if (!UUID_RE.test(callId)) throw new BadRequestException('callId debe ser UUID');
+    const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    for (const k of Object.keys(b)) if (!['outcome', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+    if (b.outcome !== 'charged' && b.outcome !== 'not_charged') throw new BadRequestException('outcome debe ser charged | not_charged');
+    if (typeof b.reason !== 'string' || !b.reason.trim() || b.reason.length > 500) throw new BadRequestException('reason es obligatorio (≤ 500)');
+    const decidedBy = String(user?.email || user?.id || '');
+    try {
+      const key = llmProxyReservationKey(callId);
+      const r = b.outcome === 'charged'
+        ? await this.ledger.reconcileReservationAsCharged(key, b.reason, { decidedBy, metadata: { llmProxy: true } })
+        : await this.ledger.reconcileReservationAsNotCharged(key, b.reason, { decidedBy, metadata: { llmProxy: true } });
+      return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
   }
 }
