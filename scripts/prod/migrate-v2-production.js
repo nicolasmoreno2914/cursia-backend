@@ -181,6 +181,15 @@ const MIGRATION_STEPS = [
     summary: 'Pausa real: uq_dynamic_generation_active_run incluye worker_status paused',
   },
   {
+    // Loop 4: latido de presencia de los workers de IA del backend (preparación; nada lo usa con
+    // DYNAMIC_LLM_WORKER_ENABLED apagado). Tabla nueva con RLS y sin acceso de anon/authenticated. Sin ella, el
+    // API no le quita ninguna parte al navegador (comportamiento de siempre).
+    id: 'llm-worker-presence',
+    file: 'supabase-migration-llm-worker-presence.sql',
+    stagingStep: '4h16 (migrate-llm-worker-presence.js)',
+    summary: 'Loop 4: tabla llm_worker_presence (RLS, revoke anon/authenticated)',
+  },
+  {
     // Decisión: SÍ se necesita en producción. El ejecutor dynamic de V2 (y el
     // artifactUpload legacy de 39-brandkit/41-course-setup) sube a
     // cursia-artifacts DESDE EL NAVEGADOR con el JWT del usuario; el
