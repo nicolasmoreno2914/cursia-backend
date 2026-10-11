@@ -571,6 +571,7 @@ export class FinopsBudgetService {
     const est = await this.runItemEstimates(a.runId);
     let itemKey: string | null = null;
     let itemSpent: number | null = null;
+    let itemLargest = 0;
     if (a.itemRunId) {
       const [it] = await this.dataSource.query(`select item_key from public.generation_item_runs where id = $1 and job_id = $2`, [a.itemRunId, a.runId]);
       if (it) {
@@ -582,12 +583,17 @@ export class FinopsBudgetService {
           `with cur as (
              select created_at, nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz as reset_at
                from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1)
-           select coalesce(sum(e.amount),0)::text as t from public.generation_cost_events e, cur
+           select coalesce(sum(e.amount),0)::text as t,
+                  -- la COTA de la llamada más grande = su reserva previa (nunca el uso real: un cargo enorme no
+                  -- puede agrandar su propio presupuesto)
+                  coalesce(max(e.amount) filter (where e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'),0)::text as largest
+             from public.generation_cost_events e, cur
             where e.run_id = $1 and e.item_key = $2 and e.billing_account <> 'user_key'
               and e.created_at >= greatest(cur.created_at, coalesce(cur.reset_at, cur.created_at))`,
           [a.runId, itemKey],
         );
         itemSpent = Number(sp.t);
+        itemLargest = Number(sp.largest);
       }
     }
     const [runSpentRow] = await this.dataSource.query(
@@ -626,6 +632,7 @@ export class FinopsBudgetService {
       runExpected: est.total,
       progressExpected,
       breakerAcknowledgedUsd: ackRow ? Number(ackRow.ack) : 0,
+      itemLargestCall: itemLargest,
     });
     let paused = false;
     if (!decision.allow && process.env.FINOPS_SPEND_GUARD_DEBUG === '1') {
@@ -636,7 +643,9 @@ export class FinopsBudgetService {
       return { decision, itemKey, paused, overspend: Math.max(0, Number(runSpentRow.t) - (decision.breakerThreshold ?? Infinity)), runExpected: est.total };
     }
     if (!decision.allow && (decision.reason === 'circuit_breaker' || (decision.reason === 'run_budget_cap' && a.pauseOnCap))) {
-      paused = await this.pauseRunBySystem(a.runId, decision.reason, 'detail' in decision ? decision.detail : '');
+      // Re-review N2: el tope guarda cuánto hacía falta (gastado + esta llamada) → reanudar exige ampliar a eso.
+      paused = await this.pauseRunBySystem(a.runId, decision.reason, 'detail' in decision ? decision.detail : '',
+        decision.reason === 'run_budget_cap' ? Number(runSpentRow.t) + a.nextCost : null);
     }
     return { decision, itemKey, paused };
   }
@@ -711,18 +720,18 @@ export class FinopsBudgetService {
   }
 
   /** Pausa segura del run decidida por Cursia (disyuntor / tope): misma pausa del servidor que la del usuario. */
-  async pauseRunBySystem(runId: string, reason: string, detail: string): Promise<boolean> {
+  async pauseRunBySystem(runId: string, reason: string, detail: string, requiredUsd: number | null = null): Promise<boolean> {
     const rows = await this.dataSource.query(
       `update public.production_jobs
           set status = 'paused', worker_status = 'paused', next_retry_at = null,
               output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object(
                 'pause', jsonb_build_object('pausedAt', now(), 'pausedBy', $2::text, 'reason', $3::text, 'detail', $4::text,
-                                            'previousWorkerStatus', worker_status)),
+                                            'requiredUsd', $5::numeric, 'previousWorkerStatus', worker_status)),
               updated_at = now()
         where id = $1 and execution_mode = 'dynamic_generation' and worker_status in ('queued', 'running', 'retrying')
           and coalesce(status, '') not in ('cancelled', 'cancelling')
         returning id`,
-      [runId, 'system:' + reason, reason, detail.slice(0, 500)],
+      [runId, 'system:' + reason, reason, detail.slice(0, 500), requiredUsd === null ? null : requiredUsd.toFixed(6)],
     );
     const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
     return Array.isArray(list) && list.length > 0;

@@ -46,6 +46,8 @@ export interface RunSpendInput {
   /** Costo esperado del run completo y del progreso real (terminadas + en curso). null = sin estimado. */
   runExpected: number | null;
   progressExpected: number | null;
+  /** Mayor cargo/reserva individual de la parte en su ventana (re-review N1: la holgura se mide con la llamada MÁS grande). */
+  itemLargestCall?: number;
   /** Sobreconsumo ya aceptado por el usuario al reanudar tras una pausa del disyuntor (se suma al umbral). */
   breakerAcknowledgedUsd?: number;
 }
@@ -75,7 +77,7 @@ export function breakerThreshold(runExpected: number | null, progressExpected: n
 const usd = (n: number) => `USD ${n.toFixed(2)}`;
 
 export function decideRunSpend(i: RunSpendInput): RunSpendDecision {
-  const hard = itemHardLimit(i.itemExpected, i.itemEstimatedMax, i.nextCost);
+  const hard = itemHardLimit(i.itemExpected, i.itemEstimatedMax, Math.max(i.nextCost, i.itemLargestCall ?? 0));
   const base = breakerThreshold(i.runExpected, i.progressExpected);
   const breaker = base === null ? null : base + Math.max(0, i.breakerAcknowledgedUsd ?? 0);
   const after = i.runSpent + i.nextCost;

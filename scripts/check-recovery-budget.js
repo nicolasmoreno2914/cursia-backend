@@ -520,6 +520,15 @@ async function dbChecks() {
       assert(r3.denied && r3.denied.code === 'run_paused', 'rearmado: ' + JSON.stringify(r3));
     });
 
+    await check('DB re-review N1: tras 2 fallas inciertas en la llamada grande + el éxito, una llamada CHICA de reparación (sidecar 1200 tokens) no detiene la parte (la holgura se mide con la llamada más grande)', async () => {
+      const N = await makeCourse('Holgura por la llamada grande');
+      const it = await itemOf(N, `content:${N.c1}`);
+      for (let i = 0; i < 2; i++) assert((await proxyCall(it.id, { outcome: 'unknown' })).pending, 'falla incierta');
+      assert((await proxyCall(it.id)).ok, 'éxito de la llamada grande');
+      const small = await proxyCall(it.id, { promptChars: 15000, maxTokens: 1200, inTok: 5000, outTok: 400 });
+      assert(small.ok, 'la reparación chica pasa: ' + JSON.stringify(small));
+    });
+
     await check('DB review I2: devolver una parte porque el run está PAUSADO no consume su intento (aunque fuera el último)', async () => {
       const P = await makeCourse('Devolución por pausa');
       const cl = await sched.claimNextItemDetailed({ runId: P.runId, executorId: A, types: TYPES, leaseSeconds: 120, ownerId: OWNER });
@@ -544,6 +553,20 @@ async function dbChecks() {
       let e = null;
       try { await runs.resumeRun(Q.cid, OWNER, 1, Q.runId); } catch (err) { e = err; }
       assert(e && e.getResponse().code === 'run_budget_cap', 'reanudar sin ampliar → 409 run_budget_cap');
+      // Re-review N2: ampliar a algo por ENCIMA de lo gastado pero por debajo de lo que pedía la llamada negada → sigue rechazado.
+      const req = Number((await runRow(Q.runId)).output_summary.pause.requiredUsd);
+      const spentQ = await runSpent(Q.runId);
+      assert(req > spentQ, `requiredUsd (${req}) > gastado (${spentQ})`);
+      const [estQ] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [Q.runId]);
+      await budget.adminAuthorize({ courseId: Q.cid, runId: Q.runId, authorizedBudget: ((spentQ + req) / 2).toFixed(4), approvedBy: 'admin@cursia.test', reason: 'ampliación corta' }).catch(async () => {
+        await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'ampliación corta', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id, ((spentQ + req) / 2).toFixed(4)]);
+      });
+      let e2 = null;
+      try { await runs.resumeRun(Q.cid, OWNER, 1, Q.runId); } catch (err) { e2 = err; }
+      assert(e2 && e2.getResponse().code === 'run_budget_cap', 'ampliación insuficiente → sigue rechazado');
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'ampliación suficiente', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id, (req + 5).toFixed(4)]);
+      const dtoQ = await runs.resumeRun(Q.cid, OWNER, 1, Q.runId);
+      assert(!dtoQ.paused, 'con la ampliación suficiente se reanuda');
       // I4: presupuesto revocado.
       const R = await makeCourse('Presupuesto revocado');
       const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [R.runId]);

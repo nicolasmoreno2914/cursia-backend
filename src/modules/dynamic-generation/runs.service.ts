@@ -1865,7 +1865,9 @@ export class RunsService {
     if (isPausedRun(job) && pauseReason === 'run_budget_cap' && this.finopsBudget) {
       // Review I3: reanudar sin ampliar el presupuesto volvería a pausar en la llamada siguiente.
       const [auth, spent] = await Promise.all([this.finopsBudget.runAuthorizedBudget(job.id), this.finopsBudget.runActual(job.id)]);
-      if (auth === null || Number(spent) >= Number(auth) - 0.01) {
+      // Re-review N2: lo que hacía falta al pausar (gastado + la llamada negada); sin ese dato, lo gastado.
+      const required = Math.max(Number(spent), Number((job as any)?.output_summary?.pause?.requiredUsd ?? 0) || 0);
+      if (auth === null || Number(auth) < required - 1e-9) {
         throw new ConflictException({
           code: 'run_budget_cap',
           message: `La generación se pausó porque alcanzó su presupuesto autorizado (USD ${Number(auth ?? 0).toFixed(2)}; gastado USD ${Number(spent).toFixed(2)}). Para continuar hay que ampliar el presupuesto.`,
