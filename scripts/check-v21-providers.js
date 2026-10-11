@@ -1420,8 +1420,9 @@ async function dbChecks() {
         const FC = loadDist('modules/finops/finops.controller.js');
         const FG = loadDist('modules/finops/finops-ingest-token.guard.js');
         const FL = loadDist('modules/finops/finops-ledger.service.js');
+        const FB = loadDist('modules/finops/finops-budget.service.js');
         class IngestE2EModule {}
-        Module({ controllers: [FC.FinopsIngestController, FC.FinopsLlmReservationController], providers: [{ provide: FL.FinopsLedgerService, useValue: ledger }, FG.FinopsIngestTokenGuard] })(IngestE2EModule);
+        Module({ controllers: [FC.FinopsIngestController, FC.FinopsLlmReservationController], providers: [{ provide: FL.FinopsLedgerService, useValue: ledger }, { provide: FB.FinopsBudgetService, useValue: new FB.FinopsBudgetService(ds, ledger) }, FG.FinopsIngestTokenGuard] })(IngestE2EModule);
         const app = await NestFactory.create(IngestE2EModule, { logger: false });
         app.setGlobalPrefix('api/v1');
         await app.listen(0, '127.0.0.1');

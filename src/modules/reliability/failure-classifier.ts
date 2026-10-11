@@ -327,6 +327,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'B', strategy: 'regenerate_split', rounds: 2,
   },
   { id: 'budget', codes: ['budget_exceeded', 'budget_approval_required', 'budget_blocked'], class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget' },
+  // Loop Cost Efficiency: una parte agotó su presupuesto de recuperación → solo ESA parte espera (el resto sigue).
+  { id: 'item_recovery_budget', codes: ['item_recovery_budget_exhausted'], class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'budget', adminAction: 'retry_item' },
 
   // ── Validación (B: regenerar solo el componente) ───────────────────────────
   { id: 'v3_payload_invalid', codes: ['v3_payload_invalid'], class: 'B', strategy: 'regenerate_targeted', rounds: 2 },

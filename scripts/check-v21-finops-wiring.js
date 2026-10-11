@@ -596,7 +596,7 @@ async function dbChecks() {
 
     // ── Ingest HTTP con el ledger real ──────────────────────────────────
     class IngestDbModule {}
-    Module({ controllers: [FinopsIngestController, FinopsLlmReservationController], providers: [{ provide: F.FinopsLedgerService, useValue: ledger }, F.FinopsIngestTokenGuard] })(IngestDbModule);
+    Module({ controllers: [FinopsIngestController, FinopsLlmReservationController], providers: [{ provide: F.FinopsLedgerService, useValue: ledger }, { provide: F.FinopsBudgetService, useValue: budget }, F.FinopsIngestTokenGuard] })(IngestDbModule);
     app = await NestFactory.create(IngestDbModule, { logger: false });
     app.setGlobalPrefix('api/v1');
     await app.listen(0, '127.0.0.1');
@@ -823,7 +823,10 @@ async function dbChecks() {
       const after = await ds.query(`select status from public.generation_item_runs where job_id = $1 and $2 = any(depends_on)`, [runB, claimed.itemKey]);
       assert(after.every((d) => d.status === 'pending'), 'dependientes desbloqueados');
       const g = await budget.guardPaidSubmission({ runId: runB, itemRunId: row.id, itemType: 'video' });
-      eq([g.allow, g.decision], [true, 'ALLOW'], 'guard con el presupuesto ampliado');
+      // Loop de costos: con el presupuesto del run ampliado, el tope del RUN ya no frena; si la parte reclamada ya
+      // gastó en pruebas anteriores más de su presupuesto de recuperación, la que frena es ESA regla (por parte).
+      assert(g.allow || g.reason === 'item_recovery_budget_exhausted', 'guard con el presupuesto ampliado: ' + g.reason);
+      assert(!['no_authorization', 'budget_exceeded'].includes(g.reason), 'no es el tope del run');
     });
 
     await check('DB worker de proveedores: mock → evento MOCK a 0; real sin presupuesto → blocked budget_exceeded antes de la llamada (nunca PROVIDER_NOT_WIRED sin guard)', async () => {
@@ -906,9 +909,13 @@ async function dbChecks() {
       assert(nw.pricing_snapshot.pricing_versions.includes('anthropic-rfb-test'), 'snapshot con la versión nueva');
     });
 
+    // Curso/run propio (sin el gasto artificial de las pruebas anteriores sobre runB): el guard de gasto por parte
+    // (loop de costos) frenaría con razón una parte que ya gastó decenas de veces lo esperado.
+    const PR = await makeCourse('Proxy reserva');
+    const prRun = (await startRunT(PR.cid, OWNER, 1, MOCK_CTX)).run.id;
     // ════ Piloto #1209: reserva del proxy LLM ANTES de llamar a Anthropic ═══════════
     await check('DB proxy-reserva: reserva (CHARGE pending, cota chars/3 + max_tokens, atribuida) → el usage con callId la LIQUIDA atómico (cargo exacto + reserva a 0); repetir = sin doble cargo', async () => {
-      const it = await itemRow(runB, `content:${Bc.c1}`);
+      const it = await itemRow(prRun, `content:${PR.c1}`);
       const callId = crypto.randomUUID();
       const resBody = { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 30000, maxTokens: 8000, billingAccount: 'cursia' };
       const r = await postIngest('llm-reservation', resBody);
@@ -918,33 +925,33 @@ async function dbChecks() {
       eq(dec(ev.amount), (10000 * 30 + 8000 * 150) / 1e6, 'monto conservador con el precio vigente');
       const again = await postIngest('llm-reservation', resBody);
       eq([again.status, again.body.inserted], [200, false], 'reserva idempotente por callId');
-      const totalBefore = dec((await ledger.costsByRun(runB)).totals.total);
+      const totalBefore = dec((await ledger.costsByRun(prRun)).totals.total);
       const s1 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_proxy_res_1', callId, usage: { input_tokens: 9000, output_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
       eq([s1.status, s1.body.settled, s1.body.finalInserted, s1.body.alreadySettled], [200, true, true, false], 'liquidada');
       const exact = (9000 * 30 + 1200 * 150) / 1e6;
       eq(dec(s1.body.amount), exact, 'cargo exacto');
-      const totalAfter = dec((await ledger.costsByRun(runB)).totals.total);
+      const totalAfter = dec((await ledger.costsByRun(prRun)).totals.total);
       assert(Math.abs(totalAfter - (totalBefore - dec(ev.amount) + exact)) < 1e-9, `total: reserva reemplazada por el exacto (${totalBefore} → ${totalAfter})`);
       const s2 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_proxy_res_1', callId, usage: { input_tokens: 9000, output_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
       eq([s2.status, s2.body.finalInserted, s2.body.alreadySettled], [200, false, true], 'reenvío: sin doble cargo');
-      eq(dec((await ledger.costsByRun(runB)).totals.total), totalAfter, 'total sin cambios');
+      eq(dec((await ledger.costsByRun(prRun)).totals.total), totalAfter, 'total sin cambios');
     });
 
     await check('DB proxy-reserva: respuesta PERDIDA (524 / Worker terminado / navegador fuera) → la reserva queda PENDIENTE y cuenta en el gasto del run; conciliación explícita (cobrada / no cobrada)', async () => {
-      const it = await itemRow(runB, `content:${Bc.c1}`);
+      const it = await itemRow(prRun, `content:${PR.c1}`);
       const ids = [crypto.randomUUID(), crypto.randomUUID()];
-      const t0 = (await ledger.costsByRun(runB)).totals;
+      const t0 = (await ledger.costsByRun(prRun)).totals;
       let reserved = 0;
       for (const callId of ids) {
         const r = await postIngest('llm-reservation', { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 2, model: 'claude-sonnet-4-6', callId, promptChars: 3000, maxTokens: 4000, billingAccount: 'cursia' });
         reserved += dec(r.body.amount);
       }
-      const t1 = (await ledger.costsByRun(runB)).totals;
+      const t1 = (await ledger.costsByRun(prRun)).totals;
       assert(Math.abs(dec(t1.total) - dec(t0.total) - reserved) < 1e-9, 'las reservas cuentan en el total del run (presupuesto)');
       eq(t1.pending_events - t0.pending_events, 2, 'aparecen como pendientes');
       await ledger.reconcileReservationAsCharged('reservation:llm-proxy:' + ids[0], 'consola Anthropic: cobrada', { decidedBy: 'admin@cursia.test' });
       await ledger.reconcileReservationAsNotCharged('reservation:llm-proxy:' + ids[1], 'consola Anthropic: sin cobro', { decidedBy: 'admin@cursia.test' });
-      const t2 = (await ledger.costsByRun(runB)).totals;
+      const t2 = (await ledger.costsByRun(prRun)).totals;
       eq(t2.pending_events, t0.pending_events, 'sin pendientes tras conciliar');
       assert(Math.abs(dec(t2.total) - dec(t0.total) - reserved / 2) < 1e-9, 'la cobrada sigue contada; la no cobrada a 0');
     });
@@ -969,12 +976,12 @@ async function dbChecks() {
     });
 
     await check('DB proxy-reserva (review I2): pendientes LISTADAS para el admin (por curso/run); conciliar cobrada/no cobrada (motivo obligatorio); un usage tardío tras «cobrada» NO agrega un segundo cargo', async () => {
-      const it = await itemRow(runB, `content:${Bc.c1}`);
+      const it = await itemRow(prRun, `content:${PR.c1}`);
       const ids = [crypto.randomUUID(), crypto.randomUUID()];
       for (const callId of ids) await postIngest('llm-reservation', { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 3, model: 'claude-sonnet-4-6', callId, promptChars: 3000, maxTokens: 2000, billingAccount: 'cursia' });
-      const list = (await admin.llmProxyReservations(undefined, runB)).reservations;
-      for (const callId of ids) assert(list.some((r) => r.callId === callId && r.itemKey === `content:${Bc.c1}` && r.maxTokens === 2000), 'listada ' + callId);
-      const byCourse = (await admin.llmProxyReservations(String(Bc.cid))).reservations;
+      const list = (await admin.llmProxyReservations(undefined, prRun)).reservations;
+      for (const callId of ids) assert(list.some((r) => r.callId === callId && r.itemKey === `content:${PR.c1}` && r.maxTokens === 2000), 'listada ' + callId);
+      const byCourse = (await admin.llmProxyReservations(String(PR.cid))).reservations;
       assert(byCourse.some((r) => r.callId === ids[0]), 'filtro por curso');
       await rejectsRe(admin.reconcileLlmProxyReservation(ids[0], { outcome: 'charged' }, ADMIN_USER), /reason/, 'motivo obligatorio', 400);
       await rejectsRe(admin.reconcileLlmProxyReservation(ids[0], { outcome: 'maybe', reason: 'x' }, ADMIN_USER), /outcome/, 'outcome', 400);
@@ -984,19 +991,19 @@ async function dbChecks() {
       eq([n.reconciled, n.alreadySettled], [true, false], 'no cobrada');
       const again = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'charged', reason: 'x' }, ADMIN_USER);
       eq(again.alreadySettled, true, 'repetir = no-op');
-      const left = (await admin.llmProxyReservations(undefined, runB)).reservations;
+      const left = (await admin.llmProxyReservations(undefined, prRun)).reservations;
       assert(!left.some((r) => ids.includes(r.callId)), 'ya no pendientes');
-      const t0 = dec((await ledger.costsByRun(runB)).totals.total);
+      const t0 = dec((await ledger.costsByRun(prRun)).totals.total);
       const late = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_charged', callId: ids[0] }));
       eq([late.status, late.body.finalInserted, late.body.alreadySettled], [200, false, true], 'sin cargo extra');
-      eq(dec((await ledger.costsByRun(runB)).totals.total), t0, 'total intacto (sin doble conteo)');
+      eq(dec((await ledger.costsByRun(prRun)).totals.total), t0, 'total intacto (sin doble conteo)');
       // Usage tardío MAYOR que lo reservado tras «cobrada» → gana el real (la reserva va a 0): nunca de menos.
       const big = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_big', callId: ids[0], usage: { input_tokens: 500000, output_tokens: 200000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
       eq([big.status, big.body.finalInserted], [200, true], 'real mayor → se registra');
       const [resv] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + ids[0]]);
       const [net] = await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where id = $1 or corrects_event_id = $1`, [resv.id]);
       assert(Math.abs(dec(net.t)) < 1e-9, 'reserva neta 0');
-      eq(dec((await ledger.costsByRun(runB)).totals.total), t0 - dec(resv.amount) + dec(big.body.amount), 'total = real (sin doble conteo)');
+      eq(dec((await ledger.costsByRun(prRun)).totals.total), t0 - dec(resv.amount) + dec(big.body.amount), 'total = real (sin doble conteo)');
       const late2 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_notcharged', callId: ids[1] }));
       eq([late2.status, late2.body.finalInserted], [200, true], 'tras «no cobrada», un usage real sí se registra (nunca de menos)');
     });

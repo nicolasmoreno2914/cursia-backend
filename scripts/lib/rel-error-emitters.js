@@ -173,6 +173,7 @@ const FN_CODES = {
   reconciliationMessage: { codes: ['provider_reconciliation_required'], mention: 'PROVIDER_RECONCILIATION_REQUIRED' },
   drainHandbackMessage: { codes: ['worker_draining'], mention: 'WORKER_DRAINING' },
   runPausedHandbackMessage: { codes: ['run_paused'], mention: 'RUN_PAUSED_HANDBACK' },
+  itemRecoveryBudgetMessage: { codes: ['item_recovery_budget_exhausted'], mention: 'ITEM_RECOVERY_BUDGET_EXHAUSTED' },
   durationUnmeasurableMessage: { codes: ['video_duration_unmeasurable'], mention: 'VIDEO_DURATION_UNMEASURABLE' },
   durationUnmeasuredMessage: { codes: ['video_duration_unmeasured'], mention: 'VIDEO_DURATION_UNMEASURED' },
   v3ValidationErrorMessage: { codes: ['v3_payload_invalid'], mention: 'V3_PAYLOAD_INVALID' },

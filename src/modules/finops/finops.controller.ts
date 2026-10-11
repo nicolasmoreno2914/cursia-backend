@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Body,
+  ConflictException,
   Controller,
   Get,
   HttpCode,
@@ -104,7 +105,10 @@ export class FinopsIngestController {
 @Controller('finops/ingest')
 @UseGuards(FinopsIngestTokenGuard)
 export class FinopsLlmReservationController {
-  constructor(private readonly ledger: FinopsLedgerService) {}
+  constructor(
+    private readonly ledger: FinopsLedgerService,
+    private readonly budget: FinopsBudgetService,
+  ) {}
 
   // POST /api/v1/finops/ingest/llm-reservation
   @Post('llm-reservation')
@@ -112,6 +116,15 @@ export class FinopsLlmReservationController {
   async llmReservation(@Body() body: Record<string, unknown>) {
     try {
       const parsed = parseLlmReservationIngest(body);
+      // Loop Cost Efficiency: pausa / tope del run / presupuesto de recuperación de la parte / disyuntor, ANTES de
+      // reservar (sin reserva, el proxy no llama). 409 con un código estable que el navegador entiende.
+      if ((parsed.mode ?? 'real') === 'real') {
+        const deny = await this.budget.guardLlmProxyCall({
+          subject: parsed.subject, itemRunId: parsed.itemRunId ?? null, model: parsed.model,
+          promptChars: parsed.promptChars, maxTokens: parsed.maxTokens, billingAccount: parsed.billingAccount,
+        });
+        if (deny) throw new ConflictException({ code: deny.code, message: deny.message, runId: deny.runId, paused: deny.paused });
+      }
       const r = await this.ledger.recordCharge(llmReservationToChargeInput(parsed));
       // Review (minor 6): un callId repetido cuya reserva ya se cerró no cubre una llamada NUEVA → 409 (el proxy no llama).
       if (!r.inserted && (await this.ledger.reservationSettled(llmProxyReservationKey(parsed.callId)))) {

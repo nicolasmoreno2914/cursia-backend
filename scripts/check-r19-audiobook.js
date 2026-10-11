@@ -766,6 +766,10 @@ async function fixRound1Checks() {
     let actual = '14.80';
     const ds = { async query(sql) {
       if (/select worker_status from public\.production_jobs/.test(sql)) return [{ worker_status: 'running' }]; // piloto #1209: el guard mira la pausa
+      // Loop costos: presupuesto por parte / disyuntor (sin estimado de run en este fake → no aplican).
+      if (/from public\.cost_estimates/.test(sql)) return [];
+      if (/spendBreaker/.test(sql)) return [{ ack: '0' }];
+      if (/select item_key from public\.generation_item_runs/.test(sql)) return [];
       if (/cost_budget_authorizations/.test(sql)) return [{ decision: 'ADMIN_APPROVED', authorized_budget: '15' }];
       if (/sum\(amount\)/.test(sql)) return [{ total: actual }];
       if (/generation_item_runs g/.test(sql)) return [];
@@ -800,6 +804,10 @@ async function fixRound1Checks() {
     let actual = '0';
     const ds = { async query(sql) {
       if (/select worker_status from public\.production_jobs/.test(sql)) return [{ worker_status: 'running' }]; // piloto #1209: el guard mira la pausa
+      // Loop costos: presupuesto por parte / disyuntor (sin estimado de run en este fake → no aplican).
+      if (/from public\.cost_estimates/.test(sql)) return [];
+      if (/spendBreaker/.test(sql)) return [{ ack: '0' }];
+      if (/select item_key from public\.generation_item_runs/.test(sql)) return [];
       if (/cost_budget_authorizations/.test(sql)) return [{ decision: 'ADMIN_APPROVED', authorized_budget: '15' }];
       if (/sum\(amount\)/.test(sql)) return [{ total: actual }];
       if (/generation_item_runs g/.test(sql)) return [];
