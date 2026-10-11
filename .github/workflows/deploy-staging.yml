@@ -661,6 +661,9 @@ jobs:
                echo "━━━ [4h15] Pausa real de un run: índice único de run activo con paused (staging) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-run-pause.js
 
+               echo "━━━ [4h16] Loop 4: presencia de los workers de IA (llm_worker_presence) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-llm-worker-presence.js
+
                echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
 

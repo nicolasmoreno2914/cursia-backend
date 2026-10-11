@@ -46,7 +46,8 @@ function startAnthropicSseFake(llm) {
     const inTok = Math.max(1, Math.ceil(raw.length / 4));
     send('message_start', { message: { id, type: 'message', role: 'assistant', model: body.model, content: [], stop_reason: null, usage: { input_tokens: inTok, output_tokens: 1 } } });
     send('content_block_start', { index: 0, content_block: { type: 'text', text: '' } });
-    const n = Math.max(1, Math.min(40, Math.ceil(full.length / 400)));
+    // Un corte necesita al menos 2 trozos (se corta a la mitad, después del primero).
+    const n = Math.max(action === 'cut' ? 2 : 1, Math.min(40, Math.ceil(full.length / 400)));
     const size = Math.ceil(full.length / n);
     const per = action === 'slow' ? Math.max(0, Math.floor(rule.totalMs / n)) : 0;
     const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

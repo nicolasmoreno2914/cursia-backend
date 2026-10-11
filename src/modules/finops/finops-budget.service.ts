@@ -687,6 +687,10 @@ export class FinopsBudgetService {
     if (row.worker_status === 'paused') {
       return { code: 'run_paused', message: 'El run está pausado: no se hacen llamadas nuevas hasta reanudarlo.', runId: row.job_id, paused: true };
     }
+    // Loop 4 review I3: un run cancelado/terminado nunca hace llamadas pagadas nuevas (la parte en curso se detiene).
+    if (['cancelled', 'cancelling', 'failed', 'completed'].includes(String(row.worker_status ?? ''))) {
+      return { code: 'run_paused', message: `El run ya no está activo (${row.worker_status}): no se hacen llamadas nuevas.`, runId: row.job_id, paused: false };
+    }
     const nextCost = Number(await this.callCost({
       provider: 'anthropic', service: 'messages', product: a.model,
       usage: { input_tokens: Math.max(1, Math.ceil(a.promptChars / 3)), output_tokens: a.maxTokens },

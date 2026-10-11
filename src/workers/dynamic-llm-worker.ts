@@ -9,10 +9,10 @@ import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
-import { LLM_WORKER_ENABLED_ENV, llmWorkerEnabled, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
+import { LLM_WORKER_ENABLED_ENV, LLM_WORKER_PRESENCE_BEAT_MS, llmWorkerEnabled, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
 import { WorkerLedger } from './finops-worker-hooks';
 import { createExecutorRuntime } from './llm-executor/executor-runtime';
-import { LLM_PENDING_REVIEW, ServerLlmDeps, createServerApi } from './llm-executor/server-llm';
+import { LLM_PENDING_REVIEW, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
 import type { CallRole } from '../modules/finops/finops-ledger.service';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -46,6 +46,8 @@ export interface LlmWorkerDeps {
   idleMs: number;
   totalMs: number;
   fetchImpl?: typeof fetch;
+  /** Deploy: con drenaje pedido, la parte vuelve a la cola antes de su próxima llamada (review I3/M3). */
+  drain?: { isDraining: boolean };
 }
 
 const ROLES: readonly CallRole[] = ['main', 'validation_retry', 'continuation', 'context_summary_retry', 'fallback_template', 'provider_retry'];
@@ -66,9 +68,14 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
   const ownerId = await ownerOfRun(deps.dataSource, item.runId);
   const courseId = String((item as any).artifactCourseId ?? '');
   let abandoned = false;
+  let lastBeatOk = Date.now();
   const hb = setInterval(() => {
-    deps.scheduler.heartbeatItem(item.itemRunId, deps.executorId, deps.leaseSeconds).then((ok) => { if (!ok) abandoned = true; }).catch(() => { /* red: el próximo latido o el complete lo dirán */ });
+    deps.scheduler.heartbeatItem(item.itemRunId, deps.executorId, deps.leaseSeconds)
+      .then((ok) => { if (ok) lastBeatOk = Date.now(); else abandoned = true; })
+      .catch(() => { /* red: si no hay latido OK por buena parte de la lease, la parte se da por perdida (shouldStop) */ });
   }, deps.heartbeatMs);
+  // Review I3: sin latido confirmado por el 80 % de la lease, otro worker puede re-reclamar la parte → no se gasta más.
+  const leaseLost = () => abandoned || Date.now() - lastBeatOk > deps.leaseSeconds * 800;
   const fail = async (msg: string, retryable: boolean, opts?: { grantAttempt?: boolean; retryAfterSeconds?: number; examBankDraftArtifactId?: string | null }) => {
     clearInterval(hb);
     deps.logger.warn(`Item ${item.itemKey}: falla ${retryable ? 'reintentable' : 'definitiva'}: ${String(msg).slice(0, 400)}`);
@@ -78,6 +85,7 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
     const api = createServerApi({
       dataSource: deps.dataSource, finops: deps.finops, budget: deps.budget, logger: deps.logger,
       apiKey: deps.apiKey, baseUrl: deps.baseUrl, defaultModel: deps.defaultModel, idleMs: deps.idleMs, totalMs: deps.totalMs, fetchImpl: deps.fetchImpl,
+      shouldStop: () => (leaseLost() ? 'lease_lost' : deps.drain && deps.drain.isDraining ? 'worker_draining' : null),
       checkpoints: {
         put: async (path, json) => { await deps.artifacts.putStorageObject({ storagePath: path, buffer: Buffer.from(json, 'utf8'), mimeType: 'application/json', upsert: true }); },
         get: async (path) => (await deps.artifacts.downloadStorageObject('cursia-artifacts', path)).toString('utf8'),
@@ -100,10 +108,10 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
     const runtime = createExecutorRuntime({
       api, ownerId, logger: deps.logger,
       artifactText: async (artifactId) => {
-        // Solo artifacts del MISMO curso del item (nunca de otro dueño).
+        // Solo artifacts del MISMO curso y del MISMO dueño del item.
         const [a] = await deps.dataSource.query(
-          `select storage_bucket, storage_path, course_id::text as course_id from public.artifacts where id = $1`,
-          [artifactId],
+          `select storage_bucket, storage_path, course_id::text as course_id from public.artifacts where id = $1 and owner_id = $2`,
+          [artifactId, ownerId],
         );
         if (!a || String(a.course_id) !== courseId) return null;
         return (await deps.artifacts.downloadStorageObject(a.storage_bucket || 'cursia-artifacts', a.storage_path)).toString('utf8');
@@ -114,16 +122,22 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
     try {
       result = await runtime.run(item);
     } catch (e: any) {
-      if (abandoned) { clearInterval(hb); return 'abandoned'; }
+      if (abandoned || (e && e.handBack === 'lease_lost')) { clearInterval(hb); return 'abandoned'; }
       const msg = (e && (e.msg || e.message)) || String(e);
+      if (e && e.handBack === 'worker_draining') {
+        // Deploy: la parte vuelve a la cola (sin consumir intento) y otro worker sigue desde sus puntos de guardado.
+        await fail(msg, true, { grantAttempt: true, retryAfterSeconds: 1 });
+        return 'handed_back';
+      }
       if (e && e.pendingReview) {
         // Límite de resultados desconocidos (2.º de la misma llamada o tope de la parte): SOLO esta parte queda en revisión, sin regenerar; se conserva todo para conciliar.
+        const win = await itemWindowStart(deps.dataSource, item.itemRunId);
         const pend = await deps.dataSource.query(
           `select idempotency_key, created_at from public.generation_cost_events
-            where idempotency_key like $1 and (metadata->>'reservation') = 'true'
+            where idempotency_key like $1 and (metadata->>'reservation') = 'true' and (metadata->>'callTag') like $2 and created_at >= $3
               and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = generation_cost_events.id)
             order by created_at`,
-          [`reservation:llm:${item.itemRunId}:%`],
+          [`reservation:llm:${item.itemRunId}:%`, `${LLM_WORKER_CALL_TAG_PREFIX}-%`, win.since.toISOString()],
         );
         await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
           llmPendingReview: { at: new Date().toISOString(), reason: 'unknown_limit', detail: msg.slice(0, 300), pendingReservations: pend.map((p: any) => p.idempotency_key) },
@@ -166,6 +180,9 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
         return 'failed';
       }
     }
+    // Review I5: los puntos de guardado ya no hacen falta; se descartan ANTES de completar para que, si el servidor
+    // rechaza el resultado (prevalidación), el reintento genere de nuevo y no repita las mismas respuestas inválidas.
+    await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
     clearInterval(hb);
     const summary = { contextHash: (item as any).context?.contextHash, ...(result.summary || {}), generatedBy: 'llm-worker' };
     const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, { artifactIds, summary });
@@ -212,6 +229,14 @@ async function bootstrap() {
     await new Promise<void>(() => { /* idle */ });
     return;
   }
+  let types: ReturnType<typeof llmWorkerTypes>;
+  try {
+    types = llmWorkerTypes();
+  } catch (err) {
+    logger.error(`dynamic-llm-worker: ${err instanceof Error ? err.message : String(err)} — no se reclama nada (fail closed)`);
+    await new Promise<void>(() => { /* idle */ });
+    return;
+  }
   const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
   const scheduler = app.get(SchedulerService);
   const deps: LlmWorkerDeps = {
@@ -231,8 +256,24 @@ async function bootstrap() {
     idleMs: readPositiveInt('DYNAMIC_LLM_WORKER_IDLE_MS', 120_000),
     totalMs: readPositiveInt('DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS', 15 * 60_000),
   };
-  const types = llmWorkerTypes();
   const drain = new DrainSignal();
+  deps.drain = drain;
+  // Latido de presencia (review I7): el API solo le quita al navegador los tipos que cubre un worker VIVO.
+  const ds = deps.dataSource;
+  const beat = async () => {
+    try {
+      await ds.query(
+        `insert into public.llm_worker_presence (worker_id, item_types, last_seen, draining) values ($1, $2::text[], now(), $3)
+         on conflict (worker_id) do update set item_types = excluded.item_types, last_seen = now(), draining = excluded.draining`,
+        [deps.executorId, types, drain.isDraining],
+      );
+    } catch (err) {
+      logger.warn(`dynamic-llm-worker: no se pudo registrar el latido de presencia (${err instanceof Error ? err.message : String(err)}); el navegador seguirá reclamando las partes largas`);
+    }
+  };
+  await beat();
+  const beatTimer = setInterval(() => { void beat(); }, LLM_WORKER_PRESENCE_BEAT_MS);
+  void drain.stopped.then(() => beat());
   const active = new Set<Promise<void>>();
   installDrainHandlers({ name: 'dynamic-llm-worker', logger, drain, active, close: () => app.close() });
   logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2)})`);
@@ -255,6 +296,8 @@ async function bootstrap() {
     describe: (item) => `item ${item.itemKey}`,
   });
   await awaitDrain(active, drainTimeoutMs());
+  clearInterval(beatTimer);
+  await ds.query(`delete from public.llm_worker_presence where worker_id = $1`, [deps.executorId]).catch(() => undefined);
 }
 
 if (require.main === module) {

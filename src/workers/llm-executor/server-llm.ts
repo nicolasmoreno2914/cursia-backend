@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'crypto';
 import type { DataSource } from 'typeorm';
 import { reservePaidCall, serverLlmChargeInput, settlePaidCall, WorkerLedger } from '../finops-worker-hooks';
 import type { CallRole } from '../../modules/finops/finops-ledger.service';
-import { LLM_RESERVATION_RELEASABLE_STATUSES } from '../../modules/finops/llm-usage-ingest';
 import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
 import { LlmStreamError, LlmStreamResult, streamMessage } from './anthropic-stream';
 
@@ -68,15 +67,26 @@ export interface ServerLlmDeps {
   totalMs: number;
   fetchImpl?: typeof fetch;
   logger: { log(m: string): void; warn(m: string): void; error(m: string): void };
+  /**
+   * Review I3/M3: antes de CADA llamada pagada. Devuelve el motivo para no hacerla y devolver la parte ('lease_lost':
+   * la parte ya no es de este worker; 'worker_draining': deploy) o null. Así un worker que perdió la parte o que se
+   * está apagando nunca sigue gastando: la llamada en vuelo termina (y queda guardada) y la siguiente no sale.
+   */
+  shouldStop?: () => 'lease_lost' | 'worker_draining' | null;
+  /** Reintentos de la liquidación en el ledger tras una respuesta OK (review I6). */
+  settleRetryDelaysMs?: number[];
 }
 
 /** Error con la forma que espera el ejecutor (04-api.js). */
-type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean };
+type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean; handBack?: 'lease_lost' | 'worker_draining' };
+
+/** HTTP que NO prueba que Anthropic no procesó el pedido (timeout de gateway): se trata como resultado desconocido. */
+const LLM_HTTP_AMBIGUOUS_STATUSES: readonly number[] = [408, 504];
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
 /** Ventana de la parte (igual que el presupuesto de recuperación): generación vigente desde su último reinicio. */
-async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ since: Date; checkpoints: Record<string, { path: string; at: string }> }> {
+export async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ since: Date; checkpoints: Record<string, { path: string; at: string }> }> {
   const [r] = await ds.query(
     `select greatest(created_at, coalesce(nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz, created_at)) as since,
             coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) as cps
@@ -87,23 +97,28 @@ async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ sin
 }
 
 /** Desconocidos de la parte en su ventana = reservas del worker que siguen pendientes (ni liquidadas ni liberadas). */
-export async function countUnknownCalls(ds: DataSource, itemRunId: string, since: Date, callHash?: string): Promise<number> {
+/**
+ * Reservas del worker sin liquidar en la ventana de la parte = resultados desconocidos. `exclude`: reservas que ESTE
+ * proceso todavía tiene en vuelo o cuya respuesta sí llegó (review I1/I6) — nunca cuentan como desconocidas.
+ */
+export async function countUnknownCalls(ds: DataSource, itemRunId: string, since: Date, callHash?: string, exclude: readonly string[] = []): Promise<number> {
   const tagLike = callHash ? `${LLM_WORKER_CALL_TAG_PREFIX}-%-${callHash.slice(0, LLM_CALL_HASH_LEN)}-%` : `${LLM_WORKER_CALL_TAG_PREFIX}-%`;
   const [r] = await ds.query(
     `select count(*)::int as n from public.generation_cost_events e
       where e.idempotency_key like $1 and e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'
         and (e.metadata->>'callTag') like $2 and e.created_at >= $3
-        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`,
-    [`reservation:llm:${itemRunId}:%`, tagLike, since.toISOString()],
+        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
+        and not (e.idempotency_key = any($4::text[]))`,
+    [`reservation:llm:${itemRunId}:%`, tagLike, since.toISOString(), [...exclude]],
   );
   return r ? Number(r.n) : 0;
 }
 
 /** null = se puede (re)intentar; si no, el motivo de dejar la parte en revisión. */
-async function unknownLimitReached(ds: DataSource, itemRunId: string, since: Date, hash: string): Promise<string | null> {
-  const same = await countUnknownCalls(ds, itemRunId, since, hash);
+async function unknownLimitReached(ds: DataSource, itemRunId: string, since: Date, hash: string, exclude: readonly string[]): Promise<string | null> {
+  const same = await countUnknownCalls(ds, itemRunId, since, hash, exclude);
   if (same >= LLM_UNKNOWN_MAX) return `${same} intentos de la misma llamada sin respuesta`;
-  const total = await countUnknownCalls(ds, itemRunId, since);
+  const total = await countUnknownCalls(ds, itemRunId, since, undefined, exclude);
   if (total >= LLM_UNKNOWN_ITEM_MAX) return `${total} llamadas sin respuesta en esta parte`;
   return null;
 }
@@ -129,6 +144,10 @@ export function pendingReviewMessage(detail: string): string {
 
 export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf: (extraHeaders: any) => { callRole: CallRole; attempt: number }) {
   let seq = 0;
+  // Reservas de ESTE proceso que no son desconocidas: en vuelo (todavía sin resultado) o con respuesta recibida cuya
+  // liquidación falló (quedan pendientes en el ledger para conciliar, pero la respuesta sí llegó).
+  const notUnknown = new Set<string>();
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   return async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>): Promise<string> {
     const useModel = model || deps.defaultModel;
     const maxTokens = Math.max(1, Math.min(maxTok || 4000, LLM_WORKER_MAX_TOKENS_CAP));
@@ -142,8 +161,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     const cp = win.checkpoints[hash];
     if (cp && new Date(cp.at) >= win.since) {
       const raw = await deps.checkpoints.get(cp.path).catch(() => null);
-      if (raw) {
-        const saved = JSON.parse(raw) as { text: string; usage: Record<string, number>; stopReason: string | null };
+      let saved: { text: string; usage: Record<string, number>; stopReason: string | null } | null = null;
+      try { saved = raw ? JSON.parse(raw) : null; } catch { saved = null; } // guardado ilegible = no hay guardado (M2)
+      if (saved && typeof saved.text === 'string' && saved.text) {
         if (metaOut) { metaOut.stopReason = saved.stopReason; metaOut.usage = { ...saved.usage }; metaOut.fromCheckpoint = true; }
         deps.logger.log(`[llm-worker] ${item.itemKey}: respuesta desde el punto de guardado (${hash.slice(0, 10)}) — sin costo`);
         return saved.text;
@@ -152,7 +172,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
 
     const promptChars = JSON.stringify({ system: system ?? null, messages: [{ role: 'user', content: user }] }).length;
     for (;;) {
-      const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash);
+      const stop = deps.shouldStop ? deps.shouldStop() : null;
+      if (stop) throw { fatal: true, handBack: stop, code: stop, msg: `${stop}: la parte vuelve a la cola antes de una llamada nueva` } as ApiError;
+      const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
       if (unknownReason) {
         throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(unknownReason) } as ApiError;
       }
@@ -166,25 +188,29 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       const tag = `${LLM_WORKER_CALL_TAG_PREFIX}-${role.callRole}-${hash.slice(0, LLM_CALL_HASH_LEN)}-${++seq}-${randomUUID().slice(0, 8)}`;
       const reservation = { kind: 'llm' as const, ownerId: item.ownerId, itemRunId: item.itemRunId, generation: item.generation, itemAttempt: item.attempt, tag, estimate: { promptChars, maxTokens, model: useModel } };
       const resKey = await reservePaidCall(deps.finops, reservation);
+      notUnknown.add(resKey);
       let r: LlmStreamResult;
       try {
         r = await streamMessage({ apiKey: deps.apiKey, baseUrl: deps.baseUrl, body, idleMs: deps.idleMs, totalMs: deps.totalMs, fetchImpl: deps.fetchImpl });
       } catch (e) {
-        if (!(e instanceof LlmStreamError)) throw e;
+        if (!(e instanceof LlmStreamError)) { notUnknown.delete(resKey); throw e; }
+        const ambiguousHttp = e.kind === 'http' && LLM_HTTP_AMBIGUOUS_STATUSES.includes(e.extra.status ?? 0);
         if (e.kind === 'never_sent') {
           // El pedido no salió: sin costo (se libera) y reintento seguro (transitorio).
           await settlePaidCall(deps.finops, resKey, null, 'llm_worker_never_sent');
           throw { fatal: false, status: 0, msg: 'Error de red: ' + e.message } as ApiError;
         }
-        if (e.kind === 'http') {
+        if (e.kind === 'http' && !ambiguousHttp) {
+          // Respuesta de error de Anthropic (review I2): resultado CONOCIDO y sin cobro → se libera siempre.
           const st = e.extra.status ?? 0;
-          if ((LLM_RESERVATION_RELEASABLE_STATUSES as readonly number[]).includes(st)) await settlePaidCall(deps.finops, resKey, null, `llm_worker_rejected_${st}`);
+          await settlePaidCall(deps.finops, resKey, null, `llm_worker_rejected_${st}`);
           throw httpError(st, e.extra.body ?? e.message);
         }
         if (e.kind === 'cut') {
           // Empezó y se cortó: Anthropic cobró lo generado. Se registra conservador (entrada exacta, salida = tope)
           // y la parte lo reintenta como cualquier transitorio, dentro de su presupuesto.
           const u = e.extra.usage;
+          notUnknown.delete(resKey); // sin message id no se puede liquidar: queda pendiente y cuenta como desconocida
           if (e.extra.messageId && u) {
             await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
               ownerId: item.ownerId, itemRunId: item.itemRunId, model: useModel, messageId: e.extra.messageId, requestId: e.extra.requestId ?? null,
@@ -193,30 +219,50 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
           }
           throw { fatal: false, status: 0, msg: 'La respuesta de la IA se cortó antes de terminar. Reintentando…' } as ApiError;
         }
-        // Desconocido: la reserva queda PENDIENTE (cuenta en el presupuesto y en el contador de desconocidos).
+        // Desconocido (sin respuesta, o timeout de gateway 408/504): la reserva queda PENDIENTE (cuenta en el
+        // presupuesto y en el contador de desconocidos).
+        notUnknown.delete(resKey);
         deps.logger.warn(`[llm-worker] ${item.itemKey}: resultado DESCONOCIDO (${e.message}); reserva ${resKey} pendiente`);
-        const reason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash);
+        const reason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
         if (reason) {
           throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(reason) } as ApiError;
         }
         continue; // un único reintento automático
       }
-      await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
+      // Review I6: la respuesta llegó y se pagó → se GUARDA ANTES de liquidar. Si el ledger falla al liquidar, se
+      // reintenta; si sigue fallando, la respuesta igual se usa (nunca se vuelve a pedir y pagar) y la reserva queda
+      // pendiente para conciliar (sin contar como desconocida en este proceso).
+      if (r.text) {
+        try {
+          const path = `${item.ownerId}/dynamic/${item.artifactCourseId}/${item.manifestId}/llm-checkpoints/${item.itemRunId}/${hash}.json`;
+          await deps.checkpoints.put(path, JSON.stringify({ text: r.text, usage: r.usage, stopReason: r.stopReason, messageId: r.messageId }));
+          const entry = { path, at: new Date().toISOString() };
+          await deps.recordCheckpoint(item.itemRunId, { [hash]: entry });
+          win.checkpoints[hash] = entry;
+        } catch (err) {
+          deps.logger.warn(`[llm-worker] ${item.itemKey}: no se pudo guardar el punto de guardado: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      const charge = serverLlmChargeInput({
         ownerId: item.ownerId, itemRunId: item.itemRunId, model: useModel, messageId: r.messageId, requestId: r.requestId,
         usage: r.usage, callRole: role.callRole, attempt: role.attempt,
-      }), 'llm_worker_measured');
+      });
+      const delays = deps.settleRetryDelaysMs ?? [500, 2000, 5000];
+      for (let i = 0; ; i++) {
+        try {
+          await settlePaidCall(deps.finops, resKey, charge, 'llm_worker_measured');
+          notUnknown.delete(resKey);
+          break;
+        } catch (err) {
+          if (i >= delays.length) {
+            deps.logger.error(`[llm-worker] ${item.itemKey}: la respuesta ${r.messageId} llegó pero no se pudo liquidar en el ledger (${err instanceof Error ? err.message : String(err)}); reserva ${resKey} queda pendiente para conciliar`);
+            break;
+          }
+          await sleep(delays[i]);
+        }
+      }
       if (metaOut) { metaOut.stopReason = r.stopReason; metaOut.usage = { ...r.usage }; }
       if (!r.text) throw { fatal: false, msg: 'Respuesta vacía de la API' } as ApiError;
-      // Punto de guardado (mejor esfuerzo: si falla, la parte sigue; solo se pierde la reanudación sin costo).
-      try {
-        const path = `${item.ownerId}/dynamic/${item.artifactCourseId}/${item.manifestId}/llm-checkpoints/${item.itemRunId}/${hash}.json`;
-        await deps.checkpoints.put(path, JSON.stringify({ text: r.text, usage: r.usage, stopReason: r.stopReason, messageId: r.messageId }));
-        const entry = { path, at: new Date().toISOString() };
-        await deps.recordCheckpoint(item.itemRunId, { [hash]: entry });
-        win.checkpoints[hash] = entry;
-      } catch (err) {
-        deps.logger.warn(`[llm-worker] ${item.itemKey}: no se pudo guardar el punto de guardado: ${err instanceof Error ? err.message : String(err)}`);
-      }
       return r.text;
     }
   };

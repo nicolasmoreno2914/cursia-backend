@@ -3858,6 +3858,17 @@ function reservationBookkeeping(ev) {
         ok(exp2.length >= 2 && exp2[0].outcome === 'dropped' && exp2.some((r) => r.outcome === 'ok') && exp2Row, 'E24: resultado DESCONOCIDO (sin respuesta) → UN reintento automático → la experiencia se completó sin intervención', exp2.map((r) => r.outcome));
         const expItem = (await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c.runId, `experience:${c.mods[0].chapters[1].id}`]))[0];
         eq(await unsettledRes(expItem.id), 1, 'E24: el desconocido quedó como UNA reserva pendiente (cuenta en el presupuesto; se concilia después)');
+        // Conciliación humana (SUPER_ADMIN) de las reservas del worker: listadas y conciliables, una sola vez.
+        const wres = await api('GET', `/finops/llm-worker-reservations?runId=${c.runId}`);
+        const wlist = (wres.data && wres.data.reservations) || [];
+        const expRes = wlist.find((r) => r.itemKey === `experience:${c.mods[0].chapters[1].id}`);
+        ok(wres.status === 200 && expRes && /^llmw-/.test(expRes.callTag || ''), 'E24: la reserva del desconocido aparece en la cola de conciliación del worker (SUPER_ADMIN)', { s: wres.status, n: wlist.length });
+        const rc1 = expRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: expRes.reservationKey, outcome: 'not_charged', reason: 'E2E: consola sin la request' }) : { status: 0 };
+        const rc2 = expRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: expRes.reservationKey, outcome: 'charged', reason: 'E2E: repetido' }) : { status: 0 };
+        ok(rc1.status === 200 && rc1.data.reconciled === true && rc2.status === 200 && rc2.data.alreadySettled === true && (await unsettledRes(expItem.id)) === 0,
+          'E24: conciliar la reserva del worker la cierra una sola vez (repetir = no-op)', { rc1: rc1.data, rc2: rc2.data });
+        const bad = await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: 'reservation:llm-proxy:x', outcome: 'charged', reason: 'x' });
+        eq(bad.status, 400, 'E24: el endpoint del worker rechaza reservas que no son del worker');
         const actAfter = reqs((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN')).length;
         eq(actAfter, actBefore, 'E24: tras la caída del worker, la 1.ª pasada de la Actividad NO se volvió a generar ni a cobrar (punto de guardado)');
         const sol = reqs((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'));
@@ -3914,13 +3925,20 @@ function reservationBookkeeping(ev) {
         await waitFor('trabajo en vuelo del worker 2', async () => fake.st.requests.some((r) => r.action === 'slow' && r.outcome === 'pending' && r.text.includes('CAPÍTULO: "Lubricación de rodamientos"') && r.text.includes('Genera la EXPERIENCIA del capítulo'))
           && (await finished(c2.runId)).some((i) => i.status === 'running' && i.worker_id === W2), 120000, 200);
         const drainingKeys = (await finished(c2.runId)).filter((i) => i.status === 'running' && i.worker_id === W2).map((i) => i.item_key);
+        // Deploy real (pm2 reload): el proceso NUEVO arranca y se anuncia antes de drenar el viejo.
+        const claims2 = claimLog.length;
+        w3 = spawnProc('llm-worker-3', 'workers/dynamic-llm-worker.js', wEnv(W3));
+        await waitFor('worker 3 anunciado', async () => (await q(`select 1 from public.llm_worker_presence where worker_id = $1 and not draining`, [W3])).length > 0, 60000, 200);
         w2.kill('SIGTERM');
         await waitFor('worker 2 drenado', async () => !!w2.exited, 120000, 200);
         const afterDrain = await finished(c2.runId);
+        const presW2 = await q(`select draining from public.llm_worker_presence where worker_id = $1`, [W2]);
+        ok(presW2.length === 0 || presW2[0].draining === true, 'E24b: el worker drenado deja de anunciarse (el API no le asigna partes a un worker que se apaga)', presW2);
         ok(drainingKeys.every((k) => { const r = afterDrain.find((i) => i.item_key === k); return r && r.status !== 'running'; }), 'E24b: drenaje — lo que el worker tenía en vuelo terminó o volvió a la cola antes de salir (nada quedó colgado)', { drainingKeys, exited: w2.exited });
-        w3 = spawnProc('llm-worker-3', 'workers/dynamic-llm-worker.js', wEnv(W3));
         await waitRunTerminal(ctl2, 'E24b run', 15 * 60 * 1000, c2.runId).catch(() => null);
         const rows2 = await waitItemsDone(c2.runId);
+        const browserClaims2 = claimLog.slice(claims2);
+        ok(!browserClaims2.some((x) => LONG.includes(x.type)), 'E24b: durante el deploy (worker nuevo vivo) el navegador no tomó ninguna parte larga', browserClaims2.map((x) => x.type));
         const f2 = await finished(c2.runId);
         const vib = f2.find((i) => i.type === 'experience' && i.item_key.endsWith(c2.mods[0].chapters[1].id));
         ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 2,

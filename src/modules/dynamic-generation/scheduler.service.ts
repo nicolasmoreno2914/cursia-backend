@@ -1,4 +1,4 @@
-import { browserEffectiveTypes } from './llm-worker-routing';
+import { browserEffectiveTypes, liveLlmWorkerTypes, llmWorkerEnabled } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
 import {
@@ -493,8 +493,8 @@ export class SchedulerService {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
         await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
         await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
-        // Loop 4: con el worker de IA habilitado, las partes LARGAS las genera el servidor (nunca el navegador).
-        claimTypes = browserEffectiveTypes(types);
+        // Loop 4: con el worker de IA habilitado Y vivo, las partes LARGAS que cubre las genera el servidor (no el navegador).
+        claimTypes = llmWorkerEnabled() ? browserEffectiveTypes(types, await liveLlmWorkerTypes(this.dataSource)) : types;
         if (claimTypes.length === 0) return { item: null };
       }
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
