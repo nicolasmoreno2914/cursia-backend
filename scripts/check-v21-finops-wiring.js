@@ -967,6 +967,13 @@ async function dbChecks() {
       const late = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_charged', callId: ids[0] }));
       eq([late.status, late.body.finalInserted, late.body.alreadySettled], [200, false, true], 'sin cargo extra');
       eq(dec((await ledger.costsByRun(runB)).totals.total), t0, 'total intacto (sin doble conteo)');
+      // Usage tardío MAYOR que lo reservado tras «cobrada» → gana el real (la reserva va a 0): nunca de menos.
+      const big = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_big', callId: ids[0], usage: { input_tokens: 500000, output_tokens: 200000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
+      eq([big.status, big.body.finalInserted], [200, true], 'real mayor → se registra');
+      const [resv] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + ids[0]]);
+      const [net] = await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where id = $1 or corrects_event_id = $1`, [resv.id]);
+      assert(Math.abs(dec(net.t)) < 1e-9, 'reserva neta 0');
+      eq(dec((await ledger.costsByRun(runB)).totals.total), t0 - dec(resv.amount) + dec(big.body.amount), 'total = real (sin doble conteo)');
       const late2 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_notcharged', callId: ids[1] }));
       eq([late2.status, late2.body.finalInserted], [200, true], 'tras «no cobrada», un usage real sí se registra (nunca de menos)');
     });

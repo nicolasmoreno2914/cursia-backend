@@ -757,6 +757,24 @@ export class FinopsLedgerService {
           [res.id],
         );
         if (built && !asCharged) fin = await this.insertEvent(built.row, manager);
+        if (built && asCharged) {
+          // Re-review (minor a): la cota de la reserva puede quedarse corta. Si el usage real tardío SUPERA lo que
+          // quedó contado, gana el real (nunca de menos): se inserta el cargo real y la reserva se lleva a 0.
+          const [net] = await manager.query(
+            `select coalesce(sum(amount),0)::text as t from public.generation_cost_events where id = $1 or corrects_event_id = $1`,
+            [res.id],
+          );
+          if (Number(built.row.amount ?? 0) > Number(net.t)) {
+            fin = await this.insertEvent(built.row, manager);
+            if (fin.inserted) {
+              await this.adjustWith(manager, reservationKey, normalizeDecimal(0), 'late_usage_exceeds_reconciled_reservation', {
+                recordedBy: opts.recordedBy || 'dynamic-worker',
+                settlement: true,
+                metadata: { reservationSettled: true, supersededBy: built.idempotencyKey },
+              });
+            }
+          }
+        }
         return { finalInserted: !!fin?.inserted, finalEvent: fin?.event ?? null, released: false, alreadySettled: true };
       }
       if (built) fin = await this.insertEvent(built.row, manager);

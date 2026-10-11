@@ -248,7 +248,8 @@ export class FinopsAdminController {
     for (const k of Object.keys(b)) if (!['outcome', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
     if (b.outcome !== 'charged' && b.outcome !== 'not_charged') throw new BadRequestException('outcome debe ser charged | not_charged');
     if (typeof b.reason !== 'string' || !b.reason.trim() || b.reason.length > 500) throw new BadRequestException('reason es obligatorio (≤ 500)');
-    const decidedBy = String(user?.email || user?.id || '');
+    const decidedBy = String(user?.id || ''); // re-review (minor b): id, nunca el email, en el ledger
+    if (!decidedBy) throw new BadRequestException('usuario sin id');
     try {
       const key = llmProxyReservationKey(callId);
       const r = b.outcome === 'charged'
