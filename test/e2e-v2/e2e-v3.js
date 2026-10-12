@@ -3837,6 +3837,10 @@ function reservationBookkeeping(ev) {
         fake.rule((t) => t.includes('Genera el CAPÍTULO 1 COMPLETO: "Inspección de bombas centrífugas"'), 'slow', 1, 105000);
         fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Sellos mecánicos"'), 'drop', 1);
         fake.rule((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'), 'hold', 1);
+        // Loop 7 (O2): el Libro de «Alineación de ejes» llega con UNA oración con un dato inventado → reparación parcial.
+        const FAB24 = 'Según una encuesta interna de FEDUCC 2024, el 67% de los técnicos no alinea el eje antes del arranque.';
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Alineación de ejes"') && !t.includes('CORRECCIÓN OBLIGATORIA'), 'transform', 1, 0,
+          (txt) => txt.replace(/(\n\n)([^\n#|]{40,}?\.)(\s)/, `$1$2 ${FAB24}$3`));
         c.runId = await startRun(c, C.title);
         CURRENT_RUN = c.runId;
         S.front.DYN_EXAM_BANK_MODE_ENABLED = true;
@@ -3889,6 +3893,15 @@ function reservationBookkeeping(ev) {
         const sol = reqs((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'));
         const aaRow = rows.find((i) => i.type === 'application_activity');
         ok(sol.length >= 2 && sol[0].outcome === 'held' && aaRow && aaRow.status === 'completed' && aaRow.worker_id === W2, 'E24: worker caído en vuelo → otro worker retomó la parte desde su punto de guardado y la completó', { sol: sol.map((r) => r.outcome), w: aaRow && aaRow.worker_id });
+        // Loop 7 (O2): reparación parcial del Libro por el worker — 1 llamada corta en vez de reescribir el capítulo.
+        const alin = rows.find((i) => i.type === 'content' && i.item_key.endsWith(c.mods[0].chapters[2].id));
+        const alinFull = reqs((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Alineación de ejes"'));
+        const repairs = reqs((t) => t.includes('Responde SOLO con JSON: {"replacements"') && t.includes('Alineación de ejes'));
+        ok(alin && alin.status === 'completed' && alin.output_summary && alin.output_summary.partialRepair && alin.output_summary.partialRepair.sentences === 1 && alinFull.length === 1 && repairs.length === 1 && repairs[0].maxTokens === 2000,
+          'E24: dato inventado en el Libro → reparación PARCIAL (1 llamada corta de 2000 tokens), sin reescribir el capítulo', { st: alin && alin.status, pr: alin && alin.output_summary && alin.output_summary.partialRepair, full: alinFull.length, repairs: repairs.length });
+        const alinMd = await q(`select a.storage_bucket, a.storage_path from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and g.item_key = $2 and a.type = 'dynamic_content_md'`, [c.runId, alin && alin.item_key]);
+        const alinText = alinMd[0] ? await (await fetch(`${FAKES.storageUrl}/storage/v1/object/authenticated/${alinMd[0].storage_bucket}/${alinMd[0].storage_path}`)).text() : '';
+        ok(alinText && !alinText.includes('FEDUCC') && alinText.includes('como ejemplo hipotético'), 'E24: el capítulo guardado ya no tiene el dato inventado y conserva el resto', { len: alinText.length });
         const dupArts = await q(`select g.item_key, a.type, count(*)::int n from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 group by 1, 2 having count(*) > 1`, [c.runId]);
         eq(dupArts, [], 'E24: idempotencia — un solo artifact por parte y tipo');
         const dupCharges = await q(`select external_operation_id, count(*)::int n from public.generation_cost_events where run_id = $1 and provider = 'anthropic' and event_kind = 'CHARGE'
