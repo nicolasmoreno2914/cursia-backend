@@ -1,4 +1,6 @@
 import 'reflect-metadata';
+import { llmWorkerEnabled } from '../modules/dynamic-generation/llm-worker-routing';
+import { llmWorkerStartConfig, runLlmWorkerLoop } from './dynamic-llm-worker';
 import { createHash } from 'crypto';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
@@ -320,8 +322,16 @@ async function bootstrap() {
     `dynamic-provider-worker iniciado (executorId=${deps.executorId}, pollMs=${pollMs}, tipos=${PROVIDER_WORKER_TYPES.join(',')}, ` +
       `drainTimeoutMs=${drainTimeoutMs()})`,
   );
+  // Loop 6: el worker de IA puede correr HOSPEDADO en este proceso (sin un 12.º proceso ni otra conexión al pooler).
+  // Solo arranca con flag + instante de activación + API key; si no, el navegador sigue generando las partes largas.
+  let llmLoop: Promise<void> = Promise.resolve();
+  if (llmWorkerEnabled()) {
+    const llmCfg = llmWorkerStartConfig();
+    if (llmCfg.ok === true) llmLoop = runLlmWorkerLoop({ app, logger: new Logger('DynamicLlmWorker'), drain, active, cfg: llmCfg });
+    else logger.error(`worker de IA hospedado NO arranca: ${llmCfg.reason}`);
+  }
   // Serial (concurrency 1), como antes.
-  await runClaimLoop<ClaimedItem>({
+  const providerLoop = runClaimLoop<ClaimedItem>({
     name: 'dynamic-provider-worker',
     logger,
     concurrency: 1,
@@ -338,6 +348,7 @@ async function bootstrap() {
     },
     describe: (item) => `item ${item.itemKey}`,
   });
+  await Promise.all([providerLoop, llmLoop]);
   await awaitDrain(active, drainTimeoutMs());
 }
 

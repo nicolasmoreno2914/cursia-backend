@@ -46,8 +46,20 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     let threw = false;
     try { R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: 'content,video' }); } catch { threw = true; }
     assert(threw, 'tipo desconocido lanza');
-    assert(R.llmWorkerTypes({}).join() === 'content,application_activity,experience,final_exam', 'default');
+    assert(R.llmWorkerTypes({}).join() === 'course_plan,content,application_activity,experience,final_exam', 'default (Loop 6: + course_plan)');
     assert(R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: 'content, content ,experience' }).join() === 'content,experience', 'dedupe');
+  });
+  await check('Loop 6: instante de activación — ruteo solo con flag + DYNAMIC_LLM_WORKER_SINCE válido; solo runs creados desde entonces', async () => {
+    const since = '2026-10-12T00:00:00Z';
+    const env = { DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: since };
+    assert(R.llmWorkerSince(env).toISOString() === '2026-10-12T00:00:00.000Z', 'parse');
+    assert(R.llmWorkerRoutingActive(env), 'activo');
+    for (const bad of ['', 'mañana', '2026-10-12', 'NaN', 'x2026-10-12T00:00:00Z']) assert(!R.llmWorkerRoutingActive({ DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: bad }), `inválido «${bad}» ⇒ sin ruteo`);
+    assert(!R.llmWorkerRoutingActive({ DYNAMIC_LLM_WORKER_SINCE: since }), 'sin flag ⇒ sin ruteo');
+    assert(R.runRoutedToLlmWorker('2026-10-12T00:00:01Z', env) && R.runRoutedToLlmWorker(new Date(since), env), 'run nuevo (incluye el instante exacto)');
+    assert(!R.runRoutedToLlmWorker('2026-10-11T23:59:59Z', env), 'run anterior (p. ej. #1209) ⇒ sigue en el navegador');
+    assert(!R.runRoutedToLlmWorker(null, env) && !R.runRoutedToLlmWorker('basura', env), 'sin fecha ⇒ sin ruteo');
+    assert(!R.runRoutedToLlmWorker('2026-10-13T00:00:00Z', { DYNAMIC_LLM_WORKER_ENABLED: 'true' }), 'sin instante ⇒ sin ruteo');
   });
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures ? 1 : 0);

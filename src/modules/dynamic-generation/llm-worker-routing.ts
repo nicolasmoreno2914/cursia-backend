@@ -13,10 +13,39 @@ import type { ItemType } from './scheduler.service';
  */
 export const LLM_WORKER_ENABLED_ENV = 'DYNAMIC_LLM_WORKER_ENABLED';
 export const LLM_WORKER_TYPES_ENV = 'DYNAMIC_LLM_WORKER_TYPES';
-export const DEFAULT_LLM_WORKER_TYPES: readonly ItemType[] = ['content', 'application_activity', 'experience', 'final_exam'] as ItemType[];
+/**
+ * Loop 6 (activación segura): instante de activación (ISO). El worker de IA y el ruteo del navegador aplican SOLO a
+ * runs creados desde entonces: ningún run anterior (ni uno pausado como #1209) se toma por accidente ni queda
+ * esperando a un worker. Sin un instante válido no hay ruteo (lado seguro: el navegador sigue como siempre).
+ */
+export const LLM_WORKER_SINCE_ENV = 'DYNAMIC_LLM_WORKER_SINCE';
+// Loop 6: + course_plan — en un L (20 capítulos) pide hasta 16 000 tokens de salida: en el navegador el proxy lo corta a
+// 8000 y tarda > 100 s (524); en el worker no hay corte de tiempo y el tope es 16 000. Mismo prompt, mismo costo.
+export const DEFAULT_LLM_WORKER_TYPES: readonly ItemType[] = ['course_plan', 'content', 'application_activity', 'experience', 'final_exam'] as ItemType[];
 
 export function llmWorkerEnabled(env: Record<string, string | undefined> = process.env): boolean {
   return String(env[LLM_WORKER_ENABLED_ENV] ?? '').trim().toLowerCase() === 'true';
+}
+
+/** Instante de activación válido (ISO 8601 con fecha) o null. */
+export function llmWorkerSince(env: Record<string, string | undefined> = process.env): Date | null {
+  const raw = String(env[LLM_WORKER_SINCE_ENV] ?? '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}T/.test(raw)) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Ruteo activo = flag encendido + instante de activación válido. */
+export function llmWorkerRoutingActive(env: Record<string, string | undefined> = process.env): boolean {
+  return llmWorkerEnabled(env) && llmWorkerSince(env) !== null;
+}
+
+/** ¿El run (por su created_at) está alcanzado por el ruteo al worker de IA? */
+export function runRoutedToLlmWorker(runCreatedAt: Date | string | null | undefined, env: Record<string, string | undefined> = process.env): boolean {
+  const since = llmWorkerRoutingActive(env) ? llmWorkerSince(env) : null;
+  if (!since || runCreatedAt === null || runCreatedAt === undefined) return false;
+  const t = runCreatedAt instanceof Date ? runCreatedAt.getTime() : new Date(runCreatedAt).getTime();
+  return Number.isFinite(t) && t >= since.getTime();
 }
 
 /**
