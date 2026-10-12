@@ -703,8 +703,8 @@ jobs:
                sudo pm2 save
                sudo pm2 status
                echo "━━━ Loop 6: arranque del worker de IA hospedado (líneas del log, sin secretos) ━━━"
-               sleep 8
-               sudo pm2 logs cursia-dynamic-provider-worker-staging --lines 80 --nostream 2>/dev/null | grep -E "dynamic-llm-worker iniciado|worker de IA hospedado|DynamicLlmWorker" | tail -5 || true
+               sleep 15
+               sudo pm2 logs cursia-dynamic-provider-worker-staging --lines 400 --nostream 2>/dev/null | grep -E "dynamic-llm-worker iniciado|worker de IA hospedado" | tail -3 || true
 
                echo "━━━ [6b] Fase 5A: preflight (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/preflight-dynamic-generation.js
