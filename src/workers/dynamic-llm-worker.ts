@@ -1,16 +1,17 @@
 import 'reflect-metadata';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
+import type { INestApplicationContext } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
 import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { DrainSignal, awaitDrain, drainTimeoutMs, installDrainHandlers, runClaimLoop } from './worker-drain';
-import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
+import { ClaimedItem, DEFAULT_LEASE_SECONDS, ItemType, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { V3_PAYLOAD_INVALID } from '../modules/course-shell/v3-validation';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
-import { LLM_WORKER_ENABLED_ENV, LLM_WORKER_PRESENCE_BEAT_MS, llmWorkerEnabled, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
+import { LLM_WORKER_ENABLED_ENV, LLM_WORKER_PRESENCE_BEAT_MS, LLM_WORKER_SINCE_ENV, llmWorkerEnabled, llmWorkerSince, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
 import { WorkerLedger } from './finops-worker-hooks';
 import { createExecutorRuntime } from './llm-executor/executor-runtime';
 import { LLM_PENDING_REVIEW, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
@@ -223,29 +224,32 @@ function readPositiveInt(name: string, def: number): number {
   return Number.isFinite(v) && v > 0 ? Math.floor(v) : def;
 }
 
-async function bootstrap() {
-  const logger = new Logger('DynamicLlmWorker');
-  if (holdIdleIfDynamicDisabled(logger, 'dynamic-llm-worker')) return;
-  if (!llmWorkerEnabled()) {
-    logger.warn(`dynamic-llm-worker en espera: ${LLM_WORKER_ENABLED_ENV} no es true (las partes largas las sigue generando el navegador)`);
-    await new Promise<void>(() => { /* idle hasta el próximo deploy */ });
-    return;
-  }
-  const apiKey = String(process.env.ANTHROPIC_API_KEY || '').trim();
-  if (!apiKey) {
-    logger.error('dynamic-llm-worker: falta ANTHROPIC_API_KEY — no se reclama nada (fail closed)');
-    await new Promise<void>(() => { /* idle */ });
-    return;
-  }
-  let types: ReturnType<typeof llmWorkerTypes>;
+/** Lo que el loop necesita para arrancar, o el motivo para NO arrancar (fail closed). */
+export type LlmWorkerStartConfig =
+  | { ok: true; apiKey: string; types: ItemType[]; since: Date }
+  | { ok: false; reason: string };
+
+export function llmWorkerStartConfig(env: Record<string, string | undefined> = process.env): LlmWorkerStartConfig {
+  if (!llmWorkerEnabled(env)) return { ok: false, reason: `${LLM_WORKER_ENABLED_ENV} no es true (las partes largas las sigue generando el navegador)` };
+  const since = llmWorkerSince(env);
+  if (!since) return { ok: false, reason: `${LLM_WORKER_SINCE_ENV} ausente o inválido: sin instante de activación no se reclama nada (el navegador sigue como siempre)` };
+  const apiKey = String(env.ANTHROPIC_API_KEY || '').trim();
+  if (!apiKey) return { ok: false, reason: 'falta ANTHROPIC_API_KEY — no se reclama nada (fail closed)' };
   try {
-    types = llmWorkerTypes();
+    return { ok: true, apiKey, types: llmWorkerTypes(env), since };
   } catch (err) {
-    logger.error(`dynamic-llm-worker: ${err instanceof Error ? err.message : String(err)} — no se reclama nada (fail closed)`);
-    await new Promise<void>(() => { /* idle */ });
-    return;
+    return { ok: false, reason: `${err instanceof Error ? err.message : String(err)} — no se reclama nada (fail closed)` };
   }
-  const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
+}
+
+/**
+ * Loop del worker de IA sobre una app de Nest ya creada. Corre como proceso propio (bootstrap de este archivo) o
+ * HOSPEDADO dentro de otro worker (Loop 6: dynamic-provider-worker, sin un proceso ni una conexión más). Comparte el
+ * drenaje y el set de trabajo en vuelo del proceso anfitrión. Solo reclama partes de runs creados desde la
+ * activación (DYNAMIC_LLM_WORKER_SINCE).
+ */
+export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger: Logger; drain: DrainSignal; active: Set<Promise<void>>; cfg: Extract<LlmWorkerStartConfig, { ok: true }>; hosted?: boolean }): Promise<() => void> {
+  const { app, logger, drain, active, cfg } = p;
   const scheduler = app.get(SchedulerService);
   const deps: LlmWorkerDeps = {
     scheduler,
@@ -258,22 +262,22 @@ async function bootstrap() {
     // Una parte larga hace llamadas de ~2 min: lease amplia + latido frecuente.
     leaseSeconds: readPositiveInt('DYNAMIC_LLM_WORKER_LEASE_SECONDS', Math.max(DEFAULT_LEASE_SECONDS, 300)),
     heartbeatMs: readPositiveInt('DYNAMIC_LLM_WORKER_HEARTBEAT_MS', 30_000),
-    apiKey,
+    apiKey: cfg.apiKey,
     baseUrl: String(process.env.ANTHROPIC_API_BASE_URL || 'https://api.anthropic.com'),
     defaultModel: String(process.env.DYNAMIC_LLM_WORKER_MODEL || 'claude-sonnet-4-6'),
     idleMs: readPositiveInt('DYNAMIC_LLM_WORKER_IDLE_MS', 120_000),
     totalMs: readPositiveInt('DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS', 15 * 60_000),
+    drain,
   };
-  const drain = new DrainSignal();
-  deps.drain = drain;
+  const types = cfg.types;
   // Latido de presencia (review I7): el API solo le quita al navegador los tipos que cubre un worker VIVO.
   const ds = deps.dataSource;
   const beat = async () => {
     try {
       await ds.query(
-        `insert into public.llm_worker_presence (worker_id, item_types, last_seen, draining) values ($1, $2::text[], now(), $3)
-         on conflict (worker_id) do update set item_types = excluded.item_types, last_seen = now(), draining = excluded.draining`,
-        [deps.executorId, types, drain.isDraining],
+        `insert into public.llm_worker_presence (worker_id, item_types, last_seen, draining, since) values ($1, $2::text[], now(), $3, $4::timestamptz)
+         on conflict (worker_id) do update set item_types = excluded.item_types, last_seen = now(), draining = excluded.draining, since = excluded.since`,
+        [deps.executorId, types, drain.isDraining, cfg.since.toISOString()],
       );
     } catch (err) {
       logger.warn(`dynamic-llm-worker: no se pudo registrar el latido de presencia (${err instanceof Error ? err.message : String(err)}); el navegador seguirá reclamando las partes largas`);
@@ -282,30 +286,59 @@ async function bootstrap() {
   await beat();
   const beatTimer = setInterval(() => { void beat(); }, LLM_WORKER_PRESENCE_BEAT_MS);
   void drain.stopped.then(() => beat());
+  const minRunCreatedAt = cfg.since.toISOString();
+  logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2)}, runs desde ${minRunCreatedAt})`);
+  // Loop 6: el ejecutor fija el modelo de la generación dinámica (DYN_GENERATION_MODEL); DYNAMIC_LLM_WORKER_MODEL solo
+  // aplica a una llamada que no traiga modelo. Si apunta a otro, se avisa (configuración sin efecto).
+  if (process.env.DYNAMIC_LLM_WORKER_MODEL && process.env.DYNAMIC_LLM_WORKER_MODEL !== 'claude-sonnet-4-6') logger.warn(`DYNAMIC_LLM_WORKER_MODEL=${process.env.DYNAMIC_LLM_WORKER_MODEL} no tiene efecto: la generación dinámica usa el modelo fijo del ejecutor (claude-sonnet-4-6)`);
+  try {
+    await runClaimLoop<ClaimedItem>({
+      name: 'dynamic-llm-worker',
+      logger,
+      concurrency: readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2),
+      pollMs: readPositiveInt('DYNAMIC_LLM_WORKER_POLL_MS', 5000),
+      drain,
+      active,
+      claim: () => scheduler.claimNextItem({ executorId: deps.executorId, types: [...types], leaseSeconds: deps.leaseSeconds, minRunCreatedAt }),
+      process: async (item) => {
+        try {
+          const outcome = await processLlmItem(deps, item);
+          logger.log(`Item ${item.itemKey}: ${outcome}`);
+        } catch (err) {
+          logger.error(`Item ${item.itemKey}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+      describe: (item) => `item ${item.itemKey}`,
+    });
+    // Hospedado: el proceso anfitrión espera el drenado (una sola vez, sobre la unión de sus loops) y recién después
+    // apaga el latido (re-review: si se apagara al empezar a drenar, con partes largas > 60 s el API devolvería al
+    // navegador partes de runs nuevos durante el deploy). El registro NO se borra: su latido envejece solo (60 s).
+    if (!p.hosted) {
+      await awaitDrain(active, drainTimeoutMs());
+      clearInterval(beatTimer);
+      return () => undefined;
+    }
+    return () => clearInterval(beatTimer);
+  } catch (err) {
+    clearInterval(beatTimer);
+    throw err;
+  }
+}
+
+async function bootstrap() {
+  const logger = new Logger('DynamicLlmWorker');
+  if (holdIdleIfDynamicDisabled(logger, 'dynamic-llm-worker')) return;
+  const cfg = llmWorkerStartConfig();
+  if (cfg.ok === false) {
+    logger.warn(`dynamic-llm-worker en espera: ${cfg.reason}`);
+    await new Promise<void>(() => { /* idle hasta el próximo deploy */ });
+    return;
+  }
+  const app = await NestFactory.createApplicationContext(AppModule, { logger: ['log', 'warn', 'error'] });
+  const drain = new DrainSignal();
   const active = new Set<Promise<void>>();
   installDrainHandlers({ name: 'dynamic-llm-worker', logger, drain, active, close: () => app.close() });
-  logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2)})`);
-  await runClaimLoop<ClaimedItem>({
-    name: 'dynamic-llm-worker',
-    logger,
-    concurrency: readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2),
-    pollMs: readPositiveInt('DYNAMIC_LLM_WORKER_POLL_MS', 5000),
-    drain,
-    active,
-    claim: () => scheduler.claimNextItem({ executorId: deps.executorId, types: [...types], leaseSeconds: deps.leaseSeconds }),
-    process: async (item) => {
-      try {
-        const outcome = await processLlmItem(deps, item);
-        logger.log(`Item ${item.itemKey}: ${outcome}`);
-      } catch (err) {
-        logger.error(`Item ${item.itemKey}: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    },
-    describe: (item) => `item ${item.itemKey}`,
-  });
-  await awaitDrain(active, drainTimeoutMs());
-  clearInterval(beatTimer);
-  // El registro NO se borra al salir: su latido envejece solo (60 s) y cubre el arranque del proceso nuevo del deploy.
+  await runLlmWorkerLoop({ app, logger, drain, active, cfg });
 }
 
 if (require.main === module) {

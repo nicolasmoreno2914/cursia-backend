@@ -13,10 +13,40 @@ import type { ItemType } from './scheduler.service';
  */
 export const LLM_WORKER_ENABLED_ENV = 'DYNAMIC_LLM_WORKER_ENABLED';
 export const LLM_WORKER_TYPES_ENV = 'DYNAMIC_LLM_WORKER_TYPES';
-export const DEFAULT_LLM_WORKER_TYPES: readonly ItemType[] = ['content', 'application_activity', 'experience', 'final_exam'] as ItemType[];
+/**
+ * Loop 6 (activación segura): instante de activación (ISO). El worker de IA y el ruteo del navegador aplican SOLO a
+ * runs creados desde entonces: ningún run anterior (ni uno pausado como #1209) se toma por accidente ni queda
+ * esperando a un worker. Sin un instante válido no hay ruteo (lado seguro: el navegador sigue como siempre).
+ */
+export const LLM_WORKER_SINCE_ENV = 'DYNAMIC_LLM_WORKER_SINCE';
+// Loop 6: + course_plan — en un L (20 capítulos) pide hasta 16 000 tokens de salida: en el navegador el proxy lo corta a
+// 8000 y tarda > 100 s (524); en el worker no hay corte de tiempo y el tope es 16 000. Mismo prompt, mismo costo.
+export const DEFAULT_LLM_WORKER_TYPES: readonly ItemType[] = ['course_plan', 'content', 'application_activity', 'experience', 'final_exam'] as ItemType[];
 
 export function llmWorkerEnabled(env: Record<string, string | undefined> = process.env): boolean {
   return String(env[LLM_WORKER_ENABLED_ENV] ?? '').trim().toLowerCase() === 'true';
+}
+
+/** Instante de activación válido (ISO 8601 con fecha) o null. */
+export function llmWorkerSince(env: Record<string, string | undefined> = process.env): Date | null {
+  const raw = String(env[LLM_WORKER_SINCE_ENV] ?? '').trim();
+  // Review M3: con zona horaria explícita (Z u offset): nunca la hora local del proceso.
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})$/.test(raw)) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** Ruteo activo = flag encendido + instante de activación válido. */
+export function llmWorkerRoutingActive(env: Record<string, string | undefined> = process.env): boolean {
+  return llmWorkerEnabled(env) && llmWorkerSince(env) !== null;
+}
+
+/** ¿El run (por su created_at) está alcanzado por el ruteo al worker de IA? */
+export function runRoutedToLlmWorker(runCreatedAt: Date | string | null | undefined, env: Record<string, string | undefined> = process.env): boolean {
+  const since = llmWorkerRoutingActive(env) ? llmWorkerSince(env) : null;
+  if (!since || runCreatedAt === null || runCreatedAt === undefined) return false;
+  const t = runCreatedAt instanceof Date ? runCreatedAt.getTime() : new Date(runCreatedAt).getTime();
+  return Number.isFinite(t) && t >= since.getTime();
 }
 
 /**
@@ -37,6 +67,10 @@ export const LLM_WORKER_PRESENCE_FRESH_SECONDS = 60;
 export const LLM_WORKER_PRESENCE_BEAT_MS = 15_000;
 const PRESENCE_CACHE_MS = 5_000;
 let presenceCache: { at: number; types: Set<string> } | null = null;
+let coverageCache: { at: number; coverage: LlmWorkerCoverage[] } | null = null;
+
+/** Lo que cubre un worker de IA vivo: sus tipos y SU instante de activación (runs creados desde entonces). */
+export interface LlmWorkerCoverage { types: Set<string>; since: Date }
 
 /**
  * Tipos cubiertos por algún worker de IA vivo (cache 5 s). Cualquier error → ninguno (el navegador sigue).
@@ -63,6 +97,41 @@ export async function liveLlmWorkerTypes(ds: DataSource, now = Date.now()): Prom
 
 export function resetLlmWorkerPresenceCacheForTests(): void {
   presenceCache = null;
+  coverageCache = null;
+}
+
+/**
+ * Review I2: cobertura de los workers de IA vivos con el instante de activación que cada uno PUBLICA en su latido.
+ * El API decide con eso (nunca con su propio env): si el API y el worker tuvieran instantes distintos, un run quedaría
+ * sin dueño. Un worker sin instante publicado (versión anterior) no cubre nada. Cualquier error → sin cobertura.
+ */
+export async function liveLlmWorkerCoverage(ds: DataSource, now = Date.now()): Promise<LlmWorkerCoverage[]> {
+  if (coverageCache && now - coverageCache.at < PRESENCE_CACHE_MS) return coverageCache.coverage;
+  let coverage: LlmWorkerCoverage[] = [];
+  try {
+    const rows: Array<{ item_types: string[]; since: Date | string | null }> = await ds.query(
+      `select item_types, since from public.llm_worker_presence
+        where since is not null and last_seen > now() - make_interval(secs => $1)`,
+      [LLM_WORKER_PRESENCE_FRESH_SECONDS],
+    );
+    coverage = rows
+      .map((r) => ({ types: new Set((r.item_types || []).map(String)), since: r.since instanceof Date ? r.since : new Date(String(r.since)) }))
+      .filter((c) => !Number.isNaN(c.since.getTime()));
+  } catch {
+    coverage = [];
+  }
+  coverageCache = { at: now, coverage };
+  return coverage;
+}
+
+/** Tipos que un worker vivo cubre PARA ESTE RUN (creado desde su instante de activación). */
+export function routedTypesForRun(coverage: readonly LlmWorkerCoverage[], runCreatedAt: Date | string | null | undefined): Set<string> {
+  const out = new Set<string>();
+  if (runCreatedAt === null || runCreatedAt === undefined) return out;
+  const t = runCreatedAt instanceof Date ? runCreatedAt.getTime() : new Date(runCreatedAt).getTime();
+  if (!Number.isFinite(t)) return out;
+  for (const c of coverage) if (t >= c.since.getTime()) for (const x of c.types) out.add(x);
+  return out;
 }
 
 /** Tipos que el NAVEGADOR puede reclamar hoy: con el flag del API y un worker de IA vivo, sin los que ese worker cubre. */

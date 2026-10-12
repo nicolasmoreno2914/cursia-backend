@@ -51,7 +51,9 @@ function createLlm({ getFixtures, getSplit }) {
   }
 
   function respond(body) {
-    const prompt = String((body.messages && body.messages[0] && body.messages[0].content) || '');
+    // Loop 6 (O5): el mensaje puede venir en bloques (caché de prompt): se lee el texto concatenado.
+    const c0 = body.messages && body.messages[0] && body.messages[0].content;
+    const prompt = Array.isArray(c0) ? c0.map((b) => (b && typeof b.text === 'string' ? b.text : '')).join('') : String(c0 || '');
     const hasSchema = !!(body.output_config && body.output_config.format);
     const tag = st.tag;
     try {

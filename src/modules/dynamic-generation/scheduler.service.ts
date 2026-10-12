@@ -1,4 +1,4 @@
-import { browserEffectiveTypes, liveLlmWorkerTypes, llmWorkerEnabled } from './llm-worker-routing';
+import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
 import {
@@ -312,6 +312,8 @@ export interface ClaimOptions {
   ownerId?: string;
   /** Camino navegador: capacidades que declara el ejecutor (query `features`), p. ej. PEDAGOGY_BRIEF_FEATURE. */
   executorFeatures?: string[];
+  /** Worker interno (Loop 6): solo runs creados desde este instante (ISO), p. ej. la activación del worker de IA. */
+  minRunCreatedAt?: string;
 }
 
 /** Motor pedagógico Fase 2: el ejecutor del navegador aplica `ClaimedItem.pedagogy` a sus prompts. */
@@ -494,7 +496,16 @@ export class SchedulerService {
         await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
         await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
         // Loop 4: con el worker de IA habilitado Y vivo, las partes LARGAS que cubre las genera el servidor (no el navegador).
-        claimTypes = llmWorkerEnabled() ? browserEffectiveTypes(types, await liveLlmWorkerTypes(this.dataSource)) : types;
+        // Loop 6: solo en runs creados desde la activación (DYNAMIC_LLM_WORKER_SINCE); los anteriores siguen como siempre.
+        // Review I2: el instante es el que PUBLICA cada worker vivo en su latido (no el env del API).
+        if (llmWorkerEnabled()) {
+          const coverage = await liveLlmWorkerCoverage(this.dataSource);
+          if (coverage.length) {
+            const [runRow] = await this.dataSource.query(`select created_at from public.production_jobs where id = $1`, [opts.runId]);
+            const routed = runRow ? routedTypesForRun(coverage, runRow.created_at) : new Set<string>();
+            if (routed.size) claimTypes = browserEffectiveTypes(types, routed);
+          }
+        }
         if (claimTypes.length === 0) return { item: null };
       }
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
@@ -541,10 +552,11 @@ export class SchedulerService {
             and ($2::text is null or pj.owner_id = $2)
             and not (g.id = any($3::uuid[]))
             and not (g.job_id = any($5::uuid[]))
+            and ($6::timestamptz is null or pj.created_at >= $6::timestamptz)
             and ${claimablePredicate('g', '$4')}
           order by g.created_at, mo.ord nulls last, g.id
           limit 1`,
-        [DISPATCHABLE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns],
+        [DISPATCHABLE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns, opts.minRunCreatedAt ?? null],
       );
       if (!cand) {
         await this.reportMissingDependencies(null, opts.ownerId);

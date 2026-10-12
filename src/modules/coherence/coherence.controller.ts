@@ -44,6 +44,18 @@ export class CoherenceController {
     return out;
   }
 
+  // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/quality
+  // Loop 6 · Bloque 5: batería de calidad del run terminado (solo lectura, no persiste).
+  @Get('blueprints/:number/manifest/runs/:runId/quality')
+  quality(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.coherence.qualityReport(courseId, user.id, number, runId);
+  }
+
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/coherence
   @Get('blueprints/:number/manifest/runs/:runId/coherence')
   latest(

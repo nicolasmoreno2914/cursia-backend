@@ -73,6 +73,11 @@ function _dynMapApiError(e) {
 // más abajo es quien decide la pausa fatal del ejecutor (R21), no esta
 // función.
 var DYN_LLM_BACKOFF_BASE_MS = 2000; // same base as apiRetry (2s·2^attempt)
+// Loop 6 (estimador calibrado): la generación dinámica usa SIEMPRE el modelo con el que se validó la calidad y se
+// calibraron el estimador y los presupuestos (Sonnet 4.6), nunca el selector de la barra lateral (que por defecto
+// muestra Haiku 4.5 y aplica a los flujos legacy). Un cambio de modelo por tarea (model routing) entra solo con
+// evidencia de calidad, por este mismo punto.
+var DYN_GENERATION_MODEL = 'claude-sonnet-4-6';
 var DYN_LLM_BACKOFF_MAX_MS = 30000; // same cap as apiRetry; both overridable by a harness
 
 // metaOut (opcional, fix wave review-rv2 I2): se pasa a api() para recibir
@@ -136,7 +141,7 @@ function _dynAddUsage(acc, u) {
   });
   return out;
 }
-async function _dynLlmCall(system, user, maxTok, maxRetries, schema, metaOut, attr) {
+async function _dynLlmCall(system, user, maxTok, maxRetries, schema, metaOut, attr, cacheOpts) {
   maxRetries = (typeof maxRetries === 'number') ? maxRetries : 3;
   var authRetried = false;
   var usageAcc = null;
@@ -148,15 +153,17 @@ async function _dynLlmCall(system, user, maxTok, maxRetries, schema, metaOut, at
         metaOut.stopReason = null;
         metaOut.usage = null;
         try {
-          if (extra) return await api(system, user, maxTok, schema, undefined, metaOut, extra);
-          return await api(system, user, maxTok, schema, undefined, metaOut);
+          if (cacheOpts) return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL, metaOut, extra || undefined, cacheOpts);
+          if (extra) return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL, metaOut, extra);
+          return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL, metaOut);
         } finally {
           usageAcc = _dynAddUsage(usageAcc, metaOut.usage);
           metaOut.usage = usageAcc;
         }
       }
-      if (extra) return await api(system, user, maxTok, schema, undefined, undefined, extra);
-      return await api(system, user, maxTok, schema);
+      if (cacheOpts) return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL, undefined, extra || undefined, cacheOpts);
+      if (extra) return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL, undefined, extra);
+      return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL);
     } catch (e) {
       if (e && e.fatal && e.status === 401 && !authRetried && (await _dynFreshToken(true))) {
         authRetried = true;
@@ -188,6 +195,16 @@ async function _dynLlmCall(system, user, maxTok, maxRetries, schema, metaOut, at
 // Math.random global (contaminaría otras llamadas concurrentes del
 // ejecutor), se reimplementa acá el MISMO algoritmo (nunca dos plantillas
 // iguales seguidas si el pool tiene >= 2) con un `rng` explícito.
+// Loop 6: semillas DETERMINÍSTICAS por parte y generación. Un reintento de la MISMA generación (falla de Storage,
+// lease vencido, deploy) repite exactamente el mismo prompt y el worker lo responde desde su punto de guardado (sin
+// volver a generar ni cobrar); capítulos distintos siguen con semillas distintas, y una regeneración (generación
+// nueva) obtiene otra semilla. Antes era Math.random(): cada reintento era un prompt nuevo y se pagaba otra vez.
+function _dynItemSeed(item, salt) {
+  return dynFnv1a32(String(salt) + '|' + String((item && (item.chapterId || item.itemKey)) || '') + '|' + String((item && item.generation) || 1)) / 4294967296;
+}
+function _dynItemRng(item, salt) {
+  return _dynMulberry32(dynFnv1a32(String(salt) + '|' + String((item && (item.chapterId || item.itemKey)) || '') + '|' + String((item && item.generation) || 1)));
+}
 function _dynPickRoomTemplate(pool, lastId, rng) {
   var candidates = pool.length > 1 ? pool.filter(function (id) { return id !== lastId; }) : pool;
   return candidates[Math.floor(rng() * candidates.length)];
@@ -255,7 +272,7 @@ async function _dynRunContent(item) {
   var bp = item.blueprint;
   var courseContext = item.context.courseContext;
   var sys = dynSysL(courseContext);
-  var prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber);
+  var prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber, _dynItemSeed(item, 'libro'));
   var md = await _dynLlmCall(sys, prompt, 4096, 3, undefined, undefined, _dynAttr(item, 'main'));
   if (!md || !md.trim()) {
     return { ok: false, error: 'contenido vacío tras generación', retryable: true };
@@ -285,7 +302,7 @@ async function _dynRunScorm(item) {
   // Motor de carga horaria: en un capítulo de PRÁCTICA las salas integran los capítulos de contenido del módulo.
   var practice = _dynPracticeClaim(item);
   if (practice) ped = (ped || '') + _dynScormPracticeBlock(bp, practice);
-  var roomAssignment = _dynAssignRoomTemplates(templateIds, 5);
+  var roomAssignment = _dynAssignRoomTemplates(templateIds, 5, _dynItemRng(item, 'scorm-rooms'));
   var roomsData = [];
   for (var i = 0; i < 5; i++) {
     var templateId = roomAssignment[i];
@@ -794,7 +811,7 @@ async function _dynRunContentV2(item) {
   }
 
   var sys = dynSysL(courseContext);
-  var v1Prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber);
+  var v1Prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber, _dynItemSeed(item, 'libro'));
   var prompt = dynContentV2Prompt(v1Prompt, built.contextPackage, dynPedagogyBlock(item));
   var meta = {};
   var raw = await _dynLlmCall(sys, prompt, DYN_CONTENT_MAX_TOKENS, 3, undefined, meta, _dynAttr(item, 'main'));
@@ -1266,8 +1283,21 @@ function _dynLlmCallHeaders(item, role, attempt) {
   return _dynAttr(item, role) || {};
 }
 
-function _dynV3Llm(item, role, sys, prompt, maxTok, metaOut) {
-  return _dynLlmCall(sys, prompt, maxTok, 3, undefined, metaOut, _dynLlmCallHeaders(item, role, item && item.attempt));
+function _dynV3Llm(item, role, sys, prompt, maxTok, metaOut, cacheOpts) {
+  return _dynLlmCall(sys, prompt, maxTok, 3, undefined, metaOut, _dynLlmCallHeaders(item, role, item && item.attempt), cacheOpts);
+}
+
+// Loop 6 (O5): el prompt original de una parte se marca cacheable (sin reordenar ni cambiar texto). Su reintento
+// dirigido es ese mismo prompt + los errores (dynV3RetryPrompt), y un nuevo intento de la parte repite el prompt:
+// ambos leen el prefijo del caché (5 min) al 10 % del precio de entrada. Escribir el caché cuesta 1,25× la entrada
+// en CADA llamada principal: solo conviene si los reintentos son frecuentes (punto de equilibrio ≈ 28 %). Tipos
+// habilitados = los que en #1209 hicieron ≥ 1,8 llamadas por parte (experiencia ~2,1; video ~4,8; Actividad de
+// Aplicación; actividad H5P ~1,8). El Libro Guía NO: su segunda llamada frecuente es el reintento del sidecar, con
+// otro prefijo (no leería el caché); intros y plan: llamadas cortas.
+var DYN_PROMPT_CACHE_ENABLED = true;
+var DYN_PROMPT_CACHE_TYPES = { experience: true, video_interactions: true, application_activity: true, activity: true };
+function _dynCacheOpts(prompt, itemType) {
+  return DYN_PROMPT_CACHE_ENABLED && DYN_PROMPT_CACHE_TYPES[itemType] === true && typeof prompt === 'string' && prompt ? { cachePrefix: prompt } : undefined;
 }
 
 // ════ Espejos de los lints R2 (RESOURCE_MENTION / QUANTITY_CLAIM) ════
@@ -3540,12 +3570,12 @@ async function _dynV3JsonWithRetry(item, sys, prompt, maxTok, build, opts) {
     return r;
   }
   var meta = {};
-  var first = evaluate(await _dynV3Llm(item, 'main', sys, prompt, maxTok, meta), meta, 1);
+  var first = evaluate(await _dynV3Llm(item, 'main', sys, prompt, maxTok, meta, _dynCacheOpts(prompt, item && item.type)), meta, 1);
   if (first.ok && !first.soft.length) return { ok: true, value: first.value, retried: false, firstErrors: [], softWarnings: [], usedAttempt: 1, moneyNormalized: moneyBy[1] || 0 };
   var firstErrors = first.ok ? first.soft : first.errors;
   console.warn('[dynExecutor:' + item.type + '] ' + item.itemKey + (first.ok ? ' con advertencias blandas' : ' inválido') + ', reintento dirigido: ' + firstErrors.slice(0, 5).join('; '));
   var meta2 = {};
-  var second = evaluate(await _dynV3Llm(item, 'validation_retry', sys, dynV3RetryPrompt(prompt, firstErrors), maxTok, meta2), meta2, 2);
+  var second = evaluate(await _dynV3Llm(item, 'validation_retry', sys, dynV3RetryPrompt(prompt, firstErrors), maxTok, meta2, _dynCacheOpts(prompt, item && item.type)), meta2, 2);
   if (second.ok) return { ok: true, value: second.value, retried: true, firstErrors: firstErrors, softWarnings: second.soft, usedAttempt: 2, moneyNormalized: moneyBy[2] || 0 };
   if (first.ok) {
     console.warn('[dynExecutor:' + item.type + '] ' + item.itemKey + ' reintento inválido: se conserva la primera respuesta válida');
@@ -4833,8 +4863,8 @@ async function _dynRunFinalExam(item) {
 //      reensambla una vez; hoja < piso o regla de banco rota → EXAM_BANK_INCOMPLETE
 //      retryable (nunca se sube un banco corto o sesgado);
 //   6. compuerta final = port JS de validateExamBank (con evidencia).
-// Modelo: el de siempre. Toda llamada pasa por _dynV3Llm (→ _dynLlmCall →
-// api() → getModel()); nunca se pasa un modelo.
+// Modelo: DYN_GENERATION_MODEL (Loop 6). Toda llamada pasa por _dynV3Llm (→ _dynLlmCall →
+// api(…, DYN_GENERATION_MODEL)).
 //
 // INTERRUPTOR DE DESPLIEGUE: ENCENDIDO desde EV6 fase 2 (el backend ya empaqueta
 // bancos — B3 — y publica «Respuestas explicadas» — B4 —, con validadores B5 y

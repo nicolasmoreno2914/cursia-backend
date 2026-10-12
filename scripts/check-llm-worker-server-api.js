@@ -6,7 +6,7 @@
 const http = require('http');
 const path = require('path');
 const distRoot = path.resolve(process.cwd(), process.argv[2] || 'dist');
-const { createServerApi, LLM_UNKNOWN_MAX } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
+const { createServerApi, LLM_UNKNOWN_MAX, cachedUserContent } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
 
 let passes = 0; let failures = 0;
 async function check(name, fn) {
@@ -24,7 +24,9 @@ async function fakeAnthropic(plan) {
   const srv = http.createServer(async (req, res) => {
     let raw = ''; for await (const c of req) raw += c;
     const body = JSON.parse(raw);
-    const prompt = body.messages[0].content;
+    st.bodies = st.bodies || []; st.bodies.push(body);
+    const c0 = body.messages[0].content;
+    const prompt = Array.isArray(c0) ? c0.map((b) => b.text).join('') : c0;
     st.requests.push(prompt);
     const p = plan(prompt, st.requests.filter((x) => x === prompt).length);
     if (p === 'drop') { req.socket.destroy(); return; }
@@ -166,6 +168,27 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     await api('s', 'C');
     for (const k of w.store.keys()) w.store.set(k, '{roto');
     assert((await api('s', 'C')) === 'R:C' && a.st.requests.length === 2, 'regenerada');
+    await a.close();
+  });
+  await check('O5 (Loop 6): cachePrefix → bloques byte-idénticos con cache_control solo en el prefijo; el reintento (original + errores) usa el mismo prefijo; el punto de guardado distingue las llamadas', async () => {
+    const orig = 'PROMPT ORIGINAL ' + 'x'.repeat(50);
+    const retry = orig + ' + ERRORES';
+    const b = cachedUserContent(retry, { cachePrefix: orig });
+    assert(Array.isArray(b) && b.length === 2 && b.map((x) => x.text).join('') === retry && b[0].cache_control && !b[1].cache_control, 'bloques');
+    assert(cachedUserContent('otro', { cachePrefix: orig }) === 'otro' && cachedUserContent(orig) === orig, 'sin cambios si no coincide / sin opciones');
+    const a = await fakeAnthropic(() => 'ok');
+    const w = fakeWorld(); const api = createServerApi({
+      dataSource: w.ds, finops: w.finops, budget: { guardServerLlmCall: async () => null },
+      checkpoints: { put: async (p, j) => { w.store.set(p, j); }, get: async (p) => (w.store.has(p) ? w.store.get(p) : null) },
+      recordCheckpoint: async (_id, e) => { Object.assign(w.cps, e); return true; },
+      apiKey: 'k', baseUrl: a.url, defaultModel: 'm', idleMs: 3000, totalMs: 10000, logger: { log() {}, warn() {}, error() {} }, settleRetryDelaysMs: [0],
+    }, ITEM, () => ({ callRole: 'main', attempt: 1 }));
+    assert((await api('s', orig, 100, undefined, 'm', undefined, undefined, { cachePrefix: orig })) === 'R:' + orig, 'principal');
+    assert((await api('s', retry, 100, undefined, 'm', undefined, undefined, { cachePrefix: orig })) === 'R:' + retry, 'reintento');
+    const [b1, b2] = a.st.bodies.map((x) => x.messages[0].content);
+    assert(Array.isArray(b1) && b1.length === 1 && b1[0].cache_control && b1[0].text === orig, 'principal = un bloque cacheable');
+    assert(Array.isArray(b2) && b2[0].text === orig && b2[0].cache_control && b2[1].text === ' + ERRORES', 'reintento = mismo prefijo + resto');
+    assert(a.st.requests.length === 2, 'dos llamadas distintas (el punto de guardado no confunde el reintento con la principal)');
     await a.close();
   });
   console.log(`\n${passes} ok, ${failures} fail`);
