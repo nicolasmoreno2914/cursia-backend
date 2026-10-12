@@ -797,6 +797,119 @@ function dynContentPedagogy(md, chapterNumber) {
   };
 }
 
+// ════ Loop 7 (O2): reparación parcial del Libro Guía (solo las oraciones señaladas) ════
+var DYN_PARTIAL_REPAIR_ENABLED = true;
+var DYN_SENTENCE_SPLIT_RE = /(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ¿¡"«(])/g;
+
+// Oraciones del Markdown con su posición exacta (mismo corte que dynLintContentTruth: por línea, luego por oración).
+function _dynSentenceSpans(md) {
+  var spans = [];
+  var text = String(md || '');
+  var lineStart = 0;
+  text.split('\n').forEach(function (line) {
+    var cut = 0;
+    var m;
+    DYN_SENTENCE_SPLIT_RE.lastIndex = 0;
+    var bounds = [];
+    while ((m = DYN_SENTENCE_SPLIT_RE.exec(line))) { bounds.push([cut, m.index]); cut = m.index + m[0].length; }
+    bounds.push([cut, line.length]);
+    bounds.forEach(function (b) {
+      var raw = line.slice(b[0], b[1]);
+      var lead = raw.length - raw.replace(/^\s+/, '').length;
+      var t = raw.trim();
+      if (t) spans.push({ start: lineStart + b[0] + lead, end: lineStart + b[0] + lead + t.length, text: t, line: line });
+    });
+    lineStart += line.length + 1;
+  });
+  return spans;
+}
+
+// Cada hallazgo → UNA oración del capítulo (sin ambigüedad); null si alguna no se ubica o se repite.
+function _dynLocateTruthSpans(md, hits) {
+  var spans = _dynSentenceSpans(md);
+  var picked = [];
+  for (var i = 0; i < hits.length; i++) {
+    var key = String(hits[i].text || '').trim();
+    if (key.length < 12) return null;
+    var c = spans.filter(function (s) { return s.text === key || (key.length >= 190 && s.text.indexOf(key.slice(0, 180)) === 0) || s.text.indexOf(key) === 0; });
+    if (c.length !== 1) return null;
+    if (!picked.some(function (p) { return p.start === c[0].start; })) picked.push(Object.assign({ codes: [hits[i].code] }, c[0]));
+    else picked.forEach(function (p) { if (p.start === c[0].start && p.codes.indexOf(hits[i].code) < 0) p.codes.push(hits[i].code); });
+  }
+  return picked.sort(function (a, b) { return a.start - b.start; });
+}
+
+// Lo que una reparación parcial NUNCA puede cambiar: títulos, filas de tabla, glosario, actividades y secciones.
+function _dynMdInvariants(md, chapterNumber) {
+  var text = String(md || '');
+  var ped = dynContentPedagogy(text, chapterNumber);
+  return {
+    headings: text.split('\n').filter(function (l) { return /^\s*#{1,6}\s/.test(l); }).map(function (l) { return l.trim(); }).join('\n'),
+    tableRows: text.split('\n').filter(function (l) { return /^\s*\|/.test(l); }).length,
+    glossaryTerms: ped.glossaryTerms, activities: ped.activities, sections: ped.sections,
+  };
+}
+
+function dynContentSentenceRepairPrompt(courseContext, chapterTitle, spans) {
+  var cc = courseContext || {};
+  var lines = spans.map(function (s, i) {
+    return (i + 1) + '. Oración: «' + s.text + '»\n   Problema: ' + s.codes.map(function (c) { return _dynTruthHitLabel(c); }).join('; ') + '\n   Párrafo donde está (solo contexto, NO lo reescribas): «' + String(s.line).trim().slice(0, 1200) + '»';
+  }).join('\n\n');
+  return 'Curso: "' + (cc.nombre || '') + '" | Sector: ' + (cc.sector || '') + ' | País: ' + (cc.pais || '') + '\nCapítulo: "' + (chapterTitle || '') + '"\n\n'
+    + 'Estas oraciones del capítulo no son aceptables. Reescribe CADA UNA por separado para que conserve su idea y su función en el párrafo (que siga leyéndose con la oración anterior y la siguiente), pero:\n'
+    + '- sin estadísticas, porcentajes, estudios, encuestas, instituciones, autores, fechas ni citas inventadas (si un número ilustra, di que es hipotético);\n'
+    + '- sin rotular casos o personajes como reales;\n'
+    + '- en español latinoamericano neutro con tuteo (tú): nunca voseo, «vosotros», regionalismos ni frases en inglés;\n'
+    + '- UNA sola oración por reemplazo, sin saltos de línea, sin títulos (#), sin viñetas, sin tablas (|) ni markdown nuevo; misma extensión aproximada.\n\n'
+    + lines
+    + '\n\nResponde SOLO con JSON: {"replacements":[{"n":1,"text":"…"}, …]} con un reemplazo por cada número, en el mismo orden.';
+}
+
+/**
+ * Repara SOLO las oraciones señaladas por la veracidad/idioma. Devuelve {ok:true, md, replaced} o {ok:false, reason}.
+ * Invariantes (o se descarta y se usa el reintento completo): ubicación inequívoca de cada oración; un reemplazo
+ * por oración, de una sola línea y sin estructura markdown; títulos, filas de tabla, glosario, actividades y
+ * secciones idénticos; cambio de palabras acotado; y el capítulo resultante sin hallazgos duros.
+ */
+async function _dynContentPartialRepair(item, sys, md, hardHits, courseContext) {
+  if (!DYN_PARTIAL_REPAIR_ENABLED) return { ok: false, reason: 'disabled' };
+  var spans = _dynLocateTruthSpans(md, hardHits);
+  if (!spans || !spans.length) return { ok: false, reason: 'locate' };
+  var chapterTitle = (item.blueprint && item.blueprint.chapter && item.blueprint.chapter.title) || '';
+  var raw;
+  try {
+    raw = await _dynLlmCall(sys, dynContentSentenceRepairPrompt(courseContext, chapterTitle, spans), 2000, 3, undefined, {}, _dynAttr(item, 'validation_retry'));
+  } catch (e) {
+    if (e && e.fatal) throw e; // pausa, presupuesto, desconocido: se respeta igual que en el reintento completo
+    return { ok: false, reason: 'call' };
+  }
+  var obj = null;
+  try { obj = JSON.parse(String(raw || '').replace(/^```[\w]*\n?/, '').replace(/\n?```\s*$/, '').trim()); } catch (e) { obj = null; }
+  var reps = obj && Array.isArray(obj.replacements) ? obj.replacements : null;
+  if (!reps || reps.length !== spans.length) return { ok: false, reason: 'shape' };
+  var out = String(md);
+  var addedWords = 0;
+  var removedWords = 0;
+  for (var i = spans.length - 1; i >= 0; i--) {
+    var r = reps[i];
+    var t = r && Number(r.n) === i + 1 && typeof r.text === 'string' ? r.text.trim() : '';
+    if (!t || /[\n\r|]/.test(t) || /^\s*(?:#|[-*•]\s|\d+[.)]\s)/.test(t) || t === spans[i].text) return { ok: false, reason: 'replacement' };
+    if (t.length > spans[i].text.length * 2 + 80 || t.length < Math.min(20, spans[i].text.length)) return { ok: false, reason: 'length' };
+    // Una oración que vivía en una fila de tabla tampoco puede traer el separador de celdas (ya filtrado arriba).
+    out = out.slice(0, spans[i].start) + t + out.slice(spans[i].end);
+    addedWords += t.split(/\s+/).length;
+    removedWords += spans[i].text.split(/\s+/).length;
+  }
+  var before = _dynMdInvariants(md, item.chapterNumber);
+  var after = _dynMdInvariants(out, item.chapterNumber);
+  if (JSON.stringify(before) !== JSON.stringify(after)) return { ok: false, reason: 'invariants' };
+  if (Math.abs(addedWords - removedWords) > Math.max(40, removedWords)) return { ok: false, reason: 'length' };
+  out = _dynLqaFixText(out, courseContext);
+  var still = dynLintContentTruth(out, courseContext).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; });
+  if (still.length) return { ok: false, reason: 'still_flagged' };
+  return { ok: true, md: out, replaced: spans.length };
+}
+
 async function _dynRunContentV2(item) {
   var bp = item.blueprint;
   var courseContext = item.context.courseContext;
@@ -840,7 +953,21 @@ async function _dynRunContentV2(item) {
   // #542 (M2): la concordancia de persona («lo que dijiste el cliente») es barata solo si ya hay un
   // reintento: sola no reescribe un capítulo entero (≈ 16k tokens) ni lo hace fallar; queda en el summary.
   var hardTruth = function (hs) { return hs.filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; }); };
+  var partialRepair = null;
   if (hardTruth(truthHits).length) {
+    // Loop 7 (O2): primero se reparan SOLO las oraciones señaladas (~cientos de tokens en vez de reescribir el
+    // capítulo, ~8k). La reparación se acepta solo si conserva intacto todo lo demás (títulos, tablas, glosario,
+    // actividades, longitud) y queda limpia; si no, se sigue con el reintento completo de siempre.
+    var pr = await _dynContentPartialRepair(item, sys, ex.markdown, hardTruth(truthHits), courseContext);
+    if (pr.ok) {
+      ex.markdown = pr.md;
+      truthRetried = true;
+      partialRepair = { sentences: pr.replaced };
+    } else {
+      partialRepair = { fallback: pr.reason };
+    }
+  }
+  if (hardTruth(truthHits).length && !(partialRepair && partialRepair.sentences)) {
     console.warn('[dynExecutor:content] ' + item.itemKey + ': ' + truthHits.length + ' oraciones con datos no verificables/voseo — reintento dirigido');
     var metaT = {};
     var rawT = await _dynLlmCall(sys, prompt + dynContentTruthRetrySuffix(truthHits), DYN_CONTENT_MAX_TOKENS, 3, undefined, metaT, _dynAttr(item, 'validation_retry'));
@@ -902,6 +1029,7 @@ async function _dynRunContentV2(item) {
     contextPackageSha256: built.contextPackageSha256,
     coursePlanArtifactId: planRes.artifactId,
     truthRetried: truthRetried,
+    partialRepair: partialRepair,
     truthHits: truthHits.slice(0, 8)
   };
   Object.assign(summary, dynPedagogySummary(item));

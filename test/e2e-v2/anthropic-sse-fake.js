@@ -32,6 +32,8 @@ function startAnthropicSseFake(llm) {
     if (action === 'drop') { rec.outcome = 'dropped'; rec.end = Date.now(); req.socket.destroy(); return; }
     if (action === 'hold') { rec.outcome = 'held'; return; }
     const out = llm.respond(body, {});
+    // Loop 7: `transform` modifica la respuesta válida del LLM falso (p. ej. mete una oración con un dato inventado).
+    if (action === 'transform' && typeof rule.fn === 'function') out.text = rule.fn(String(out.text || ''));
     if (out.httpStatus && out.httpStatus !== 200) {
       rec.outcome = `http_${out.httpStatus}`; rec.end = Date.now();
       res.writeHead(out.httpStatus, { 'content-type': 'application/json' });
@@ -76,7 +78,7 @@ function startAnthropicSseFake(llm) {
   return new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve({
     url: `http://127.0.0.1:${srv.address().port}`,
     st,
-    rule(match, action, times = 1, totalMs = 0) { const r = { match, action, times, totalMs }; st.rules.push(r); return r; },
+    rule(match, action, times = 1, totalMs = 0, fn) { const r = { match, action, times, totalMs, fn }; st.rules.push(r); return r; },
     close: () => new Promise((r) => { for (const s of sockets) s.destroy(); srv.close(() => r()); }),
   })));
 }

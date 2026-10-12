@@ -338,6 +338,12 @@ function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
         if (bad) a.criteria[0].weight += 10;
         return J(a);
       }
+      // Loop 7 (O2): reparación parcial del Libro — un reemplazo neutro por cada oración numerada.
+      if (prompt.indexOf('Responde SOLO con JSON: {"replacements"') >= 0) {
+        const n = (prompt.match(/^\d+\. Oración: «/gm) || []).length;
+        rec('content_partial_repair', 'x', { sentences: n });
+        return J({ replacements: Array.from({ length: n }, (_, i) => ({ n: i + 1, text: 'Imagina, como ejemplo hipotético, que un técnico revisa la alineación antes de cada arranque.' })) });
+      }
       if (prompt.indexOf('Escribe el SOLUCIONARIO DOCENTE de esa actividad') >= 0) {
         const m = /ACTIVIDAD DEL ESTUDIANTE \(ya aprobada; NO la cambies\):\n(.*)\n\nEscribe el SOLUCIONARIO/s.exec(prompt);
         if (!m) throw new Error('fake LLM v3: prompt de solucionario sin la actividad');
