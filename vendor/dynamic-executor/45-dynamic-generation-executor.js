@@ -195,6 +195,16 @@ async function _dynLlmCall(system, user, maxTok, maxRetries, schema, metaOut, at
 // Math.random global (contaminaría otras llamadas concurrentes del
 // ejecutor), se reimplementa acá el MISMO algoritmo (nunca dos plantillas
 // iguales seguidas si el pool tiene >= 2) con un `rng` explícito.
+// Loop 6: semillas DETERMINÍSTICAS por parte y generación. Un reintento de la MISMA generación (falla de Storage,
+// lease vencido, deploy) repite exactamente el mismo prompt y el worker lo responde desde su punto de guardado (sin
+// volver a generar ni cobrar); capítulos distintos siguen con semillas distintas, y una regeneración (generación
+// nueva) obtiene otra semilla. Antes era Math.random(): cada reintento era un prompt nuevo y se pagaba otra vez.
+function _dynItemSeed(item, salt) {
+  return dynFnv1a32(String(salt) + '|' + String((item && (item.chapterId || item.itemKey)) || '') + '|' + String((item && item.generation) || 1)) / 4294967296;
+}
+function _dynItemRng(item, salt) {
+  return _dynMulberry32(dynFnv1a32(String(salt) + '|' + String((item && (item.chapterId || item.itemKey)) || '') + '|' + String((item && item.generation) || 1)));
+}
 function _dynPickRoomTemplate(pool, lastId, rng) {
   var candidates = pool.length > 1 ? pool.filter(function (id) { return id !== lastId; }) : pool;
   return candidates[Math.floor(rng() * candidates.length)];
@@ -262,7 +272,7 @@ async function _dynRunContent(item) {
   var bp = item.blueprint;
   var courseContext = item.context.courseContext;
   var sys = dynSysL(courseContext);
-  var prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber);
+  var prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber, _dynItemSeed(item, 'libro'));
   var md = await _dynLlmCall(sys, prompt, 4096, 3, undefined, undefined, _dynAttr(item, 'main'));
   if (!md || !md.trim()) {
     return { ok: false, error: 'contenido vacío tras generación', retryable: true };
@@ -292,7 +302,7 @@ async function _dynRunScorm(item) {
   // Motor de carga horaria: en un capítulo de PRÁCTICA las salas integran los capítulos de contenido del módulo.
   var practice = _dynPracticeClaim(item);
   if (practice) ped = (ped || '') + _dynScormPracticeBlock(bp, practice);
-  var roomAssignment = _dynAssignRoomTemplates(templateIds, 5);
+  var roomAssignment = _dynAssignRoomTemplates(templateIds, 5, _dynItemRng(item, 'scorm-rooms'));
   var roomsData = [];
   for (var i = 0; i < 5; i++) {
     var templateId = roomAssignment[i];
@@ -801,7 +811,7 @@ async function _dynRunContentV2(item) {
   }
 
   var sys = dynSysL(courseContext);
-  var v1Prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber);
+  var v1Prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber, _dynItemSeed(item, 'libro'));
   var prompt = dynContentV2Prompt(v1Prompt, built.contextPackage, dynPedagogyBlock(item));
   var meta = {};
   var raw = await _dynLlmCall(sys, prompt, DYN_CONTENT_MAX_TOKENS, 3, undefined, meta, _dynAttr(item, 'main'));

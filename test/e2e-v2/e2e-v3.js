@@ -4027,7 +4027,10 @@ function reservationBookkeeping(ev) {
         const c4 = await createCourse(C4, llm);
         c4.runId = await startRun(c4, C4.title);
         CURRENT_RUN = c4.runId;
-        await q(`update public.cost_budget_authorizations set authorized_budget = 0.01 where run_id = $1`, [c4.runId]);
+        // El ledger de autorizaciones es append-only: una autorización NUEVA (la vigente es la última) baja el tope a USD 0,01.
+        await q(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, currency, policy_id, decision, approved_by, reason)
+                 select run_id, course_id, estimate_id, 0.01, currency, policy_id, 'ADMIN_APPROVED', 'e2e-admin', 'E2E E24d: presupuesto agotado'
+                   from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`, [c4.runId]);
         const fakeBefore4 = fake.st.requests.length;
         const ctl4 = S.front.dynExecutorStart({ courseId: c4.courseId, blueprintNumber: c4.n, runId: c4.runId });
         await waitFor('run E24d pausado por el tope', async () => { const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c4.runId]); return j && j.worker_status === 'paused'; }, 120000, 300);
