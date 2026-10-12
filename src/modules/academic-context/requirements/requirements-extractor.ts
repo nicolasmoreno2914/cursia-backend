@@ -560,7 +560,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         obligation = 'required';
         medium = true;
       } else if (seg.option || (field && /\d/.test(field[2]) && RE_MODELED_LABEL.test(field[1]))) obligation = 'required'; // dato de ficha u opción rotulada
-      else if (RE_NOMINAL_STRUCTURE.test(m)) {
+      else if (RE_NOMINAL_STRUCTURE.test(m) && !/\(\s*[a-z][^()]{0,60},?\s*(1[5-9]|20)\d{2}\s*\)/.test(m)) { // una cita («(Pérez, 2019)») no es una estructura
         obligation = 'required';
         medium = true;
       }
@@ -606,7 +606,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         mentions.push({ kind: total.kind, value: Number(dm[1]), mode: 'exact', ...(total.evaluationType ? { evaluationType: total.evaluationType } : {}), scope, index: at, end: at + dm[0].length, raw: dm[0] });
       }
       // «N módulos × M capítulos» / «N módulos de M capítulos» / «N módulos por M capítulos»: los M son de CADA módulo.
-      const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de|,?\s*cada uno (?:con|de))\s*(\d{1,3})\s*capitulos?/.exec(m);
+      const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de|con|,?\s*cada (?:uno|modulo) (?:con|de|tiene))\s*(\d{1,3})\s*capitulos?/.exec(m);
       // Review 2.ª (I3): «2 módulos de 2 capítulos de contenido» conserva «de contenido».
       if (cross) for (const x of mentions) if (x.kind === 'chapters' && x.value === Number(cross[2]) && x.scope.level === 'course') x.scope = (x.scope as { chapterKind?: string }).chapterKind === 'content' ? { level: 'module', each: true, chapterKind: 'content' } : { level: 'module', each: true };
 

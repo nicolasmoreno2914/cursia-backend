@@ -807,11 +807,14 @@ function _dynSentenceSpans(md) {
   var text = String(md || '');
   var lineStart = 0;
   text.split('\n').forEach(function (line) {
-    var cut = 0;
+    // Review L7 (I2): el prefijo de la línea (viñeta, número de lista, cita, rótulo en negrita) queda FUERA del tramo:
+    // una reparación nunca lo borra (antes «- …» perdía la viñeta y se pegaba al ítem anterior).
+    var pm = /^\s*(?:(?:[-*•]|\d{1,3}[.)])\s+|>\s*)?(?:\*\*[^*\n]{1,80}\*\*\s*[:—–-]?\s*)?/.exec(line);
+    var cut = pm ? pm[0].length : 0;
     var m;
-    DYN_SENTENCE_SPLIT_RE.lastIndex = 0;
+    DYN_SENTENCE_SPLIT_RE.lastIndex = cut;
     var bounds = [];
-    while ((m = DYN_SENTENCE_SPLIT_RE.exec(line))) { bounds.push([cut, m.index]); cut = m.index + m[0].length; }
+    while ((m = DYN_SENTENCE_SPLIT_RE.exec(line))) { if (m.index < cut) continue; bounds.push([cut, m.index]); cut = m.index + m[0].length; }
     bounds.push([cut, line.length]);
     bounds.forEach(function (b) {
       var raw = line.slice(b[0], b[1]);
@@ -829,12 +832,16 @@ function _dynLocateTruthSpans(md, hits) {
   var spans = _dynSentenceSpans(md);
   var picked = [];
   for (var i = 0; i < hits.length; i++) {
-    var key = String(hits[i].text || '').trim();
+    // El hallazgo trae la oración con el prefijo de la línea («- », «1. », «**Rótulo**: »); el tramo, sin él.
+    var key = String(hits[i].text || '').trim().replace(/^(?:(?:[-*•]|\d{1,3}[.)])\s+|>\s*)?(?:\*\*[^*\n]{1,80}\*\*\s*[:—–-]?\s*)?/, '');
     if (key.length < 12) return null;
-    var c = spans.filter(function (s) { return s.text === key || (key.length >= 190 && s.text.indexOf(key.slice(0, 180)) === 0) || s.text.indexOf(key) === 0; });
+    var c = spans.filter(function (s) { return s.text.indexOf(key) === 0; });
     if (c.length !== 1) return null;
-    if (!picked.some(function (p) { return p.start === c[0].start; })) picked.push(Object.assign({ codes: [hits[i].code] }, c[0]));
-    else picked.forEach(function (p) { if (p.start === c[0].start && p.codes.indexOf(hits[i].code) < 0) p.codes.push(hits[i].code); });
+    // Review L7 (I1): una oración dentro de una fila de tabla no se repara por partes (el tramo podría llevarse celdas).
+    if (/^\s*\|/.test(c[0].line) || c[0].text.indexOf('|') >= 0) return null;
+    var prev = picked.filter(function (p) { return p.start === c[0].start; })[0];
+    if (!prev) picked.push(Object.assign({ hits: [hits[i]] }, c[0]));
+    else if (!prev.hits.some(function (h) { return h.code === hits[i].code; })) prev.hits.push(hits[i]);
   }
   return picked.sort(function (a, b) { return a.start - b.start; });
 }
@@ -846,6 +853,9 @@ function _dynMdInvariants(md, chapterNumber) {
   return {
     headings: text.split('\n').filter(function (l) { return /^\s*#{1,6}\s/.test(l); }).map(function (l) { return l.trim(); }).join('\n'),
     tableRows: text.split('\n').filter(function (l) { return /^\s*\|/.test(l); }).length,
+    // Review L7: celdas por línea y viñetas/numeración de listas tampoco pueden cambiar.
+    pipesPerLine: text.split('\n').map(function (l) { return (l.match(/\|/g) || []).length; }).join(','),
+    listItems: text.split('\n').filter(function (l) { return /^\s*(?:[-*•]|\d{1,3}[.)])\s+/.test(l); }).length,
     glossaryTerms: ped.glossaryTerms, activities: ped.activities, sections: ped.sections,
   };
 }
@@ -853,7 +863,7 @@ function _dynMdInvariants(md, chapterNumber) {
 function dynContentSentenceRepairPrompt(courseContext, chapterTitle, spans) {
   var cc = courseContext || {};
   var lines = spans.map(function (s, i) {
-    return (i + 1) + '. Oración: «' + s.text + '»\n   Problema: ' + s.codes.map(function (c) { return _dynTruthHitLabel(c); }).join('; ') + '\n   Párrafo donde está (solo contexto, NO lo reescribas): «' + String(s.line).trim().slice(0, 1200) + '»';
+    return (i + 1) + '. Oración: «' + s.text + '»\n   Problema: ' + s.hits.map(function (h) { return _dynTruthHitLabel(h.code, h); }).join('; ') + '\n   Párrafo donde está (solo contexto, NO lo reescribas): «' + String(s.line).trim().slice(0, 1200) + '»';
   }).join('\n\n');
   return 'Curso: "' + (cc.nombre || '') + '" | Sector: ' + (cc.sector || '') + ' | País: ' + (cc.pais || '') + '\nCapítulo: "' + (chapterTitle || '') + '"\n\n'
     + 'Estas oraciones del capítulo no son aceptables. Reescribe CADA UNA por separado para que conserve su idea y su función en el párrafo (que siga leyéndose con la oración anterior y la siguiente), pero:\n'
@@ -873,6 +883,8 @@ function dynContentSentenceRepairPrompt(courseContext, chapterTitle, spans) {
  */
 async function _dynContentPartialRepair(item, sys, md, hardHits, courseContext) {
   if (!DYN_PARTIAL_REPAIR_ENABLED) return { ok: false, reason: 'disabled' };
+  // Review L7 (m2): con muchas oraciones señaladas la reparación casi nunca alcanza: directo al reintento completo.
+  if (hardHits.length > 6) return { ok: false, reason: 'too_many' };
   var spans = _dynLocateTruthSpans(md, hardHits);
   if (!spans || !spans.length) return { ok: false, reason: 'locate' };
   var chapterTitle = (item.blueprint && item.blueprint.chapter && item.blueprint.chapter.title) || '';
@@ -880,7 +892,9 @@ async function _dynContentPartialRepair(item, sys, md, hardHits, courseContext) 
   try {
     raw = await _dynLlmCall(sys, dynContentSentenceRepairPrompt(courseContext, chapterTitle, spans), 2000, 3, undefined, {}, _dynAttr(item, 'validation_retry'));
   } catch (e) {
-    if (e && e.fatal) throw e; // pausa, presupuesto, desconocido: se respeta igual que en el reintento completo
+    // Pausa, presupuesto, desconocido: se respeta igual que en el reintento completo. Reintentos de red agotados en
+    // esta llamada OPCIONAL no hacen fallar la parte (review L7 m1): se sigue con el reintento completo.
+    if (e && e.fatal && !DYN_EXHAUSTED_RETRIES_RE.test((e.msg || e.message || ''))) throw e;
     return { ok: false, reason: 'call' };
   }
   var obj = null;
@@ -895,6 +909,16 @@ async function _dynContentPartialRepair(item, sys, md, hardHits, courseContext) 
     var t = r && Number(r.n) === i + 1 && typeof r.text === 'string' ? r.text.trim() : '';
     if (!t || /[\n\r|]/.test(t) || /^\s*(?:#|[-*•]\s|\d+[.)]\s)/.test(t) || t === spans[i].text) return { ok: false, reason: 'replacement' };
     if (t.length > spans[i].text.length * 2 + 80 || t.length < Math.min(20, spans[i].text.length)) return { ok: false, reason: 'length' };
+    // Review L7 (m4): una sola oración por reemplazo.
+    if (/[.!?]\s+[A-ZÁÉÍÓÚÑ¿¡]/.test(t)) return { ok: false, reason: 'replacement' };
+    // Review L7 (I5): un número de la oración que el capítulo vuelve a usar en otra parte tiene que seguir en el reemplazo
+    // (si no, el resto del capítulo hablaría de una cifra que ya no está).
+    var rest = String(md).slice(0, spans[i].start) + ' ' + String(md).slice(spans[i].end);
+    var nums = spans[i].text.match(/\d+(?:[.,]\d+)?/g) || [];
+    for (var k = 0; k < nums.length; k++) {
+      var nre = new RegExp('(^|[^\\d.,])' + nums[k].replace(/[.,]/g, '[.,]') + '(?![\\d])');
+      if (nre.test(rest) && t.indexOf(nums[k]) < 0) return { ok: false, reason: 'numbers' };
+    }
     // Una oración que vivía en una fila de tabla tampoco puede traer el separador de celdas (ya filtrado arriba).
     out = out.slice(0, spans[i].start) + t + out.slice(spans[i].end);
     addedWords += t.split(/\s+/).length;
@@ -963,6 +987,13 @@ async function _dynRunContentV2(item) {
       ex.markdown = pr.md;
       truthRetried = true;
       partialRepair = { sentences: pr.replaced };
+      // Review L7 (I3): el sidecar se escribió junto con las oraciones reparadas; si repite el dato inventado se descarta
+      // y se pide de nuevo (reintento barato SOLO del sidecar, sobre el capítulo ya reparado).
+      if (ex.contextSummary && _dynJsonTruthHits(ex.contextSummary, courseContext).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; }).length) {
+        ex.contextSummary = null;
+        ex.status = 'missing';
+        partialRepair.sidecarRegenerated = true;
+      }
     } else {
       partialRepair = { fallback: pr.reason };
     }

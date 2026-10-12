@@ -341,7 +341,12 @@ const contentsOf = (ctx) => ctx.units.map((u) => [u.title, u.contents.map((c) =>
     const st = all.find((r) => r.kind === 'structure');
     assert(st && JSON.stringify(st.shape) === '[5,5,5,5]' && st.confidence === 'medium', JSON.stringify(all.map((r) => [r.kind, r.value, r.confidence, r.shape])));
     eq(reqsOf(['MICROCURRÍCULO: Seguridad industrial', '4 módulos, cada uno con 5 capítulos.']).length, 0, 'sin autoridad (no es requisito de confianza alta)');
-    eq(reqsOf(['Los 4 módulos de lectura opcional del libro guía.'], true).filter((r) => r.kind === 'structure').length, 0, 'una mención sin capítulos no se vuelve estructura');
+    eq(reqsOf(['4 módulos de lectura opcional del libro guía.'], true).filter((r) => r.kind === 'structure').length, 0, 'una mención sin capítulos no se vuelve estructura');
+    eq(reqsOf(['2 módulos de 3 capítulos (Pérez, 2019).'], true).filter((r) => r.kind === 'structure').length, 0, 'una cita bibliográfica no es una estructura');
+    for (const line of ['4 módulos, cada módulo con 5 capítulos.', '4 módulos con 5 capítulos.']) {
+      const st = reqsOf(['MICROCURRÍCULO: X', line], true).find((r) => r.kind === 'structure');
+      assert(st && JSON.stringify(st.shape) === '[5,5,5,5]', `${line} ⇒ 5 por módulo: ${JSON.stringify(st)}`);
+    }
   });
 
   await check('DI15 0 llamadas de red', async () => { eq(netAttempts, [], 'red'); });
