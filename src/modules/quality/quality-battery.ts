@@ -266,7 +266,8 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
         // perfil): se informa, no cuenta. La cohesión mide el ORDEN: introducido después de usarse = ruptura.
         if (!allIntroduced.some((x) => matches(a, x))) { f.push({ code: 'Q7_EXTERNAL_PREREQUISITE', severity: 'info', message: `«${c.title}» da por sabido «${a}» (prerrequisito externo al curso)`, ref: c.id }); continue; }
         total++;
-        if ([...seen].some((x) => matches(a, x))) ok++;
+        // re-review M-b: introducido en el MISMO capítulo (lo define y lo usa) no es ruptura de orden.
+        if ([...seen, ...(s.concepts_introduced || [])].some((x) => matches(a, x))) ok++;
         else f.push({ code: 'Q7_ASSUMED_NOT_INTRODUCED', severity: 'warning', message: `«${c.title}» da por sabido «${a}», que el curso introduce recién DESPUÉS`, ref: c.id });
       }
       for (const x of s.concepts_introduced || []) seen.add(x);

@@ -328,11 +328,13 @@ async function bootstrap() {
   // Loop 6: el worker de IA puede correr HOSPEDADO en este proceso (sin un 12.º proceso ni otra conexión al pooler).
   // Solo arranca con flag + instante de activación + API key; si no, el navegador sigue generando las partes largas.
   let llmLoop: Promise<void> = Promise.resolve();
+  let stopLlmBeat: () => void = () => undefined;
   if (llmWorkerEnabled()) {
     const llmCfg = llmWorkerStartConfig();
     if (llmCfg.ok === true) {
       // Review M1: una falla del loop de IA nunca tumba al de proveedores (se registra y el proceso sigue).
       llmLoop = runLlmWorkerLoop({ app, logger: new Logger('DynamicLlmWorker'), drain, active: llmActive, cfg: llmCfg, hosted: true })
+        .then((stop) => { stopLlmBeat = stop; })
         .catch((err) => logger.error(`worker de IA hospedado se detuvo: ${err instanceof Error ? err.message : String(err)} (el loop de proveedores sigue)`));
     }
     else logger.error(`worker de IA hospedado NO arranca: ${llmCfg.reason}`);
@@ -357,6 +359,7 @@ async function bootstrap() {
   });
   await Promise.all([providerLoop, llmLoop]);
   await awaitDrain(unionOfActive(active, llmActive), drainTimeoutMs());
+  stopLlmBeat(); // el latido del worker de IA sigue mientras drena (cubre sus partes en vuelo y el arranque del nuevo)
 }
 
 if (require.main === module) {

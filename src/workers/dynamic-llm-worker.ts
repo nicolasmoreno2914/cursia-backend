@@ -248,7 +248,7 @@ export function llmWorkerStartConfig(env: Record<string, string | undefined> = p
  * drenaje y el set de trabajo en vuelo del proceso anfitrión. Solo reclama partes de runs creados desde la
  * activación (DYNAMIC_LLM_WORKER_SINCE).
  */
-export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger: Logger; drain: DrainSignal; active: Set<Promise<void>>; cfg: Extract<LlmWorkerStartConfig, { ok: true }>; hosted?: boolean }): Promise<void> {
+export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger: Logger; drain: DrainSignal; active: Set<Promise<void>>; cfg: Extract<LlmWorkerStartConfig, { ok: true }>; hosted?: boolean }): Promise<() => void> {
   const { app, logger, drain, active, cfg } = p;
   const scheduler = app.get(SchedulerService);
   const deps: LlmWorkerDeps = {
@@ -310,11 +310,18 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
       },
       describe: (item) => `item ${item.itemKey}`,
     });
-    // Hospedado: el proceso anfitrión espera el drenado (una sola vez, sobre la unión de sus loops).
-    if (!p.hosted) await awaitDrain(active, drainTimeoutMs());
-  } finally {
-    // El registro NO se borra al salir: su latido envejece solo (60 s) y cubre el arranque del proceso nuevo del deploy.
+    // Hospedado: el proceso anfitrión espera el drenado (una sola vez, sobre la unión de sus loops) y recién después
+    // apaga el latido (re-review: si se apagara al empezar a drenar, con partes largas > 60 s el API devolvería al
+    // navegador partes de runs nuevos durante el deploy). El registro NO se borra: su latido envejece solo (60 s).
+    if (!p.hosted) {
+      await awaitDrain(active, drainTimeoutMs());
+      clearInterval(beatTimer);
+      return () => undefined;
+    }
+    return () => clearInterval(beatTimer);
+  } catch (err) {
     clearInterval(beatTimer);
+    throw err;
   }
 }
 

@@ -100,6 +100,11 @@ check('Q7: un prerrequisito EXTERNO (ningún capítulo lo introduce) se informa 
   const r = Q.runQualityBattery(c);
   assert(codes(r, 'Q7').includes('Q7_EXTERNAL_PREREQUISITE') && r.summary.Q7 === 1 && get(r, 'Q7').pass, JSON.stringify(r.summary));
 });
+check('Q7: un concepto que el capítulo define y usa a la vez no es ruptura de orden (re-review M-b)', () => {
+  const c = course(); c.contextSummaries.c2.concepts_assumed = ['alineación de ejes'];
+  const r = Q.runQualityBattery(c);
+  assert(r.summary.Q7 === 1 && !codes(r, 'Q7').includes('Q7_ASSUMED_NOT_INTRODUCED'), JSON.stringify(r.summary));
+});
 check('Q1: un examen sin banco ni GIFT es contenido perdido (review I5); con GIFT alcanza', () => {
   const c = course(); c.artifactTypesByItem['exam:m1'] = [];
   assert(codes(Q.runQualityBattery(c), 'Q1').includes('Q1_MISSING_ARTIFACT'), 'sin banco');

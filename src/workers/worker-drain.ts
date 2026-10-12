@@ -179,13 +179,6 @@ export async function runClaimLoop<T>(opts: ClaimLoopOptions<T>): Promise<void> 
 }
 
 /**
- * Espera a los items en vuelo como máximo `timeoutMs`. 'drained' si todos
- * terminaron; 'timeout' si no (el caller sale igual: PM2 lo mataría al
- * vencer su kill_timeout; el lease vencido NO consume un intento, ver
- * sweepRunExpiredLeases, y una llamada pagada que haya quedado en el aire la
- * detecta el ledger en el próximo claim).
- */
-/**
  * Loop 6: vista de SOLO LECTURA sobre varios sets de trabajo en vuelo (un proceso con dos loops de claim, p. ej. el
  * worker de IA hospedado en el de proveedores). Cada loop conserva su propio set — la concurrencia de uno nunca frena
  * al otro — y el drenado espera la unión (size + iteración, lo único que usan awaitDrain/installDrainHandlers).
@@ -197,6 +190,13 @@ export function unionOfActive(...sets: Array<Set<Promise<void>>>): Set<Promise<v
   } as unknown as Set<Promise<void>>;
 }
 
+/**
+ * Espera a los items en vuelo como máximo `timeoutMs`. 'drained' si todos
+ * terminaron; 'timeout' si no (el caller sale igual: PM2 lo mataría al
+ * vencer su kill_timeout; el lease vencido NO consume un intento, ver
+ * sweepRunExpiredLeases, y una llamada pagada que haya quedado en el aire la
+ * detecta el ledger en el próximo claim).
+ */
 export async function awaitDrain(active: Set<Promise<void>>, timeoutMs: number): Promise<'drained' | 'timeout'> {
   if (active.size === 0) return 'drained';
   let timer: NodeJS.Timeout | null = null;
