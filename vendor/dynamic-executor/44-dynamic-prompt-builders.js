@@ -1853,7 +1853,7 @@ function dynExamBankRepairPrompt(baseParts, rejected, accepted) {
 }
 
 // EV6 P2 (F2): system prompt de las llamadas del banco (generación y reparación).
-// Sin nombre de modelo; el modelo es el de siempre (api() → getModel()).
+// Sin nombre de modelo; el modelo es DYN_GENERATION_MODEL (45-dynamic-generation-executor.js, Loop 6).
 function dynExamBankSys() {
   return 'Eres experto en evaluación educativa de CampusCloud. Escribes bancos de preguntas de evaluación para Moodle a partir del texto de un curso: '
     + 'solo preguntas sobre lo que el texto enseña, con la evidencia copiada textualmente. Respondes SOLO con JSON válido, sin markdown ni texto extra. '

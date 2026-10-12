@@ -180,7 +180,8 @@ const contentIdsOf = (s, mi) => s.modules[mi].chapters.filter((c) => c.kind !== 
     const usd = (x) => Number(x.baseline.providers.estimateUsd.expected);
     const delta = usd(dr) - usd(plain);
     // Solo experience + activity (LLM) por capítulo de práctica; los exámenes NO cambian (no la cubren).
-    assert(delta > 0 && delta < 0.6, `dos capítulos de práctica cuestan < USD 0,60 (${delta.toFixed(4)})`);
+    // Loop 6 (priors v2.0, medidos en #1209): experiencia 0,25 + actividad 0,05 ≈ 0,30 por práctica ⇒ dos < USD 0,70.
+    assert(delta > 0 && delta < 0.7, `dos capítulos de práctica cuestan < USD 0,70 (${delta.toFixed(4)})`);
     for (const prov of ['gamma', 'videogen', 'openai']) {
       const ops = (x) => JSON.stringify((x.baseline.providers.byProvider[prov] || {}).operations || {});
       eq(ops(dr), ops(plain), `${prov}: mismas operaciones`);

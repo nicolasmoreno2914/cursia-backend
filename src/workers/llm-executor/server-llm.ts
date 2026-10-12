@@ -138,6 +138,19 @@ function httpError(status: number, body: string): ApiError {
   return { fatal: false, status, msg: `Error de red (${status}): ${String(msg).slice(0, 200)}` };
 }
 
+/**
+ * Loop 6 (O5): mismo contrato que apiCachedUserContent (04-api.js) — el prefijo pedido va como bloque con
+ * cache_control y el resto como otro bloque; la concatenación es byte-idéntica al mensaje original. Si el prefijo no
+ * es el comienzo del mensaje (o el mensaje ya viene en bloques), no se toca nada.
+ */
+export function cachedUserContent(user: unknown, cacheOpts?: { cachePrefix?: string }): unknown {
+  const pre = cacheOpts && typeof cacheOpts.cachePrefix === 'string' ? cacheOpts.cachePrefix : '';
+  if (!pre || typeof user !== 'string' || !user.startsWith(pre)) return user;
+  const blocks: Array<Record<string, unknown>> = [{ type: 'text', text: pre, cache_control: { type: 'ephemeral' } }];
+  if (user.length > pre.length) blocks.push({ type: 'text', text: user.slice(pre.length) });
+  return blocks;
+}
+
 export function pendingReviewMessage(detail: string): string {
   return `${LLM_PENDING_REVIEW}: resultado ambiguo repetido de la IA (${detail}). Esta parte queda en revisión sin volver a generarse; el resto del curso sigue. Se conservan las reservas para conciliarlas.`;
 }
@@ -148,10 +161,10 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
   // liquidación falló (quedan pendientes en el ledger para conciliar, pero la respuesta sí llegó).
   const notUnknown = new Set<string>();
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-  return async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>): Promise<string> {
+  return async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>, cacheOpts?: { cachePrefix?: string }): Promise<string> {
     const useModel = model || deps.defaultModel;
     const maxTokens = Math.max(1, Math.min(maxTok || 4000, LLM_WORKER_MAX_TOKENS_CAP));
-    const body: Record<string, unknown> = { model: useModel, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] };
+    const body: Record<string, unknown> = { model: useModel, max_tokens: maxTokens, system, messages: [{ role: 'user', content: cachedUserContent(user, cacheOpts) }] };
     if (schema) body.output_config = { format: { type: 'json_schema', schema } };
     const hash = sha(JSON.stringify(body));
     const role = roleOf(extraHeaders);

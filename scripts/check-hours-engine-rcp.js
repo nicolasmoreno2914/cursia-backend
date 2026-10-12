@@ -152,10 +152,14 @@ check('HE6 costo: el video no crece con las horas; la práctica cuesta mucho men
   const perContent = (usd(m(50)) - usd(m(33)) - 4 * perPractice) / 4;
   // Fase 2: la práctica incluye su Actividad de Aplicación (texto LLM): sigue muy por debajo de un capítulo de contenido.
   // Review Fase 2 (I1/M6): la diferencia 20 → 33 h también sube de nivel actividades existentes (costo por nivel): < USD 1.
-  assert(perPractice > 0 && perPractice < 1, `práctica ≈ USD ${perPractice.toFixed(2)}`);
+  // Loop 6 (priors v2.0, medidos en #1209): experiencia 0,25 + actividad 0,05 + Actividad de Aplicación 0,45 por práctica,
+  // más la subida de nivel de las actividades existentes ⇒ < USD 2 (antes < 1 con priors subestimados ×4 en la Actividad).
+  assert(perPractice > 0 && perPractice < 2, `práctica ≈ USD ${perPractice.toFixed(2)}`);
   // Las dos diferencias incluyen la subida de nivel de las actividades existentes (330 → 1.050 → 1.650 min de
   // aplicación, costo por nivel desde la review M6): el capítulo de contenido sigue costando > 3× la práctica.
-  assert(perContent > 3 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (≫ práctica USD ${perPractice.toFixed(2)})`);
+  // Loop 6 (priors v2.0): con costos MEDIDOS la práctica (experiencia + Actividad de Aplicación) cuesta ≈ la mitad de un
+  // capítulo de contenido (video + Gamma + audiolibro + Libro + derivados), no un tercio como suponían los priors viejos.
+  assert(perContent > 1.5 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (> 1,5 × práctica USD ${perPractice.toFixed(2)})`);
 });
 
 check('HE7 0 llamadas de red medidas durante todos los dry-runs (no un literal del objeto de retorno)', () => {
