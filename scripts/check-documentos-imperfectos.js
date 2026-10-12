@@ -26,6 +26,8 @@
 //        (gridSpan) y tabla anidada dentro de una celda: cada tema queda en su unidad y nada se pierde
 //   DI25 horas de las unidades que no suman el total ⇒ UNIT_HOURS_MISMATCH (contradicción visible, no se corrige sola)
 //   DI26 un dato que el documento no trae queda «missing» (horas, evaluación, metodología): nunca se inventa
+//   DI27 Formato S/M/L contra un documento 4×5 de 64 h: S y M muestran las diferencias (excepciones visibles), L encaja
+//   DI28 estructura dicha sin verbo («4 módulos, cada uno con 5 capítulos.») se lee con confianza MEDIA (🟡, sin autoridad)
 //
 // Uso: node scripts/check-documentos-imperfectos.js [path/to/dist]   (después de npm run build)
 'use strict';
@@ -312,6 +314,34 @@ const contentsOf = (ctx) => ctx.units.map((u) => [u.title, u.contents.map((c) =>
     eq(r.context.evaluation, [], 'evaluación');
     const v = V.validateAcademicContext(r.context);
     assert(['MISSING_HOURS', 'MISSING_EVALUATION', 'MISSING_METHODOLOGY'].every((c) => v.issues.some((i) => i.code === c)) && v.canProceed === true, 'se informa lo que falta y se puede seguir');
+  });
+
+  const TSX = require(path.join(distRoot, 'modules/academic-context/extract/text-sources.js'));
+  const CF = require(path.join(distRoot, 'modules/prebrief/course-formats.js'));
+  const SO = require(path.join(distRoot, 'modules/course-design/structure-options.js'));
+  const reqsOf = (lines, all) => RX.requirementsFor(RX.extractRequirements(TSX.readText(txt(lines), 'text/plain').lines), {}).filter((r) => all || (r.obligation === 'required' && r.confidence === 'high'));
+  await check('DI27 Formato S/M/L contra un documento 4×5 de 64 h: S y M muestran las diferencias de estructura y horas; L encaja sin excepciones', async () => {
+    const reqs = reqsOf(['MICROCURRÍCULO: Seguridad industrial', 'El curso debe tener 4 módulos y 5 capítulos por módulo.', 'Intensidad horaria: 64 horas.']);
+    const docShape = Array.from({ length: 4 }, () => ({ chapters: Array(5).fill({}) }));
+    const out = {};
+    for (const code of ['S', 'M', 'L']) {
+      const d = CF.COURSE_FORMATS[code];
+      out[code] = { diffs: SO.shapeDifferences(reqs, { modules: d.modules, chaptersPerModule: d.chaptersPerModule }, code).map((x) => x.kind).sort(), fit: CF.formatFit(d, docShape, 64) };
+    }
+    for (const code of ['S', 'M']) {
+      assert(out[code].diffs.includes('modules') && out[code].diffs.includes('hours'), `${code}: ${JSON.stringify(out[code].diffs)}`);
+      eq([out[code].fit.structureOk, out[code].fit.hoursOk], [false, false], `${code}: no encaja (se informa, no se fuerza)`);
+    }
+    eq(out.L.diffs, [], 'L: sin diferencias');
+    eq([out.L.fit.structureOk, out.L.fit.hoursOk], [true, true], 'L encaja');
+    eq(SO.recommendShape(reqs, [5, 5, 5, 5], 64).modules, 4, 'Cursia recomienda la estructura del documento');
+  });
+  await check('DI28 estructura dicha sin verbo («4 módulos, cada uno con 5 capítulos.») ⇒ se lee con confianza MEDIA (🟡 para revisar, sin autoridad)', async () => {
+    const all = reqsOf(['MICROCURRÍCULO: Seguridad industrial', '4 módulos, cada uno con 5 capítulos.'], true);
+    const st = all.find((r) => r.kind === 'structure');
+    assert(st && JSON.stringify(st.shape) === '[5,5,5,5]' && st.confidence === 'medium', JSON.stringify(all.map((r) => [r.kind, r.value, r.confidence, r.shape])));
+    eq(reqsOf(['MICROCURRÍCULO: Seguridad industrial', '4 módulos, cada uno con 5 capítulos.']).length, 0, 'sin autoridad (no es requisito de confianza alta)');
+    eq(reqsOf(['Los 4 módulos de lectura opcional del libro guía.'], true).filter((r) => r.kind === 'structure').length, 0, 'una mención sin capítulos no se vuelve estructura');
   });
 
   await check('DI15 0 llamadas de red', async () => { eq(netAttempts, [], 'red'); });

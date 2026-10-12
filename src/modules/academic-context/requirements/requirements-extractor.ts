@@ -94,6 +94,9 @@ const RE_REQUIRED = /\b(debera|deberan|debe|deben|tendra|tendran|contara con|con
 // LOOP 9 (P1-3): el presente descriptivo «incluye / contiene / contempla» también fija el curso («Cada módulo incluye 1 Actividad
 // de Aplicación»), con número + sustantivo modelado, igual que «tiene».
 const RE_PRESENT = /\b(tiene|tienen|consta de|constan de|esta dividid\w*|esta compuest\w*|esta organizad\w*|esta conformad\w*|se divide|se organiza|comprende|comprenden|cuenta con)\b/;
+// Loop 6 · B6: estructura dicha SIN verbo («4 módulos, cada uno con 5 capítulos.», «Estructura: 4 módulos de 5 capítulos»):
+// se lee con confianza MEDIA (🟡 «Revisa esta lectura», sin autoridad sobre el diseño) — antes se ignoraba entera.
+const RE_NOMINAL_STRUCTURE = /^\s*(?:estructura\s*:?\s*)?\d{1,2}\s+modulos?\b[^.;]{0,40}?\b\d{1,2}\s+capitulos?\b/;
 // …solo cuando el sujeto es el curso o una de sus partes: «la bibliografía incluye 3 capítulos del libro» no exige nada.
 // El sujeto abre la oración (review BE-L9 m1: «La bibliografía de cada módulo incluye 3 capítulos del libro» no exige nada).
 /** Conector corto al inicio de la oración («Además, cada módulo…»). */
@@ -557,6 +560,10 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         obligation = 'required';
         medium = true;
       } else if (seg.option || (field && /\d/.test(field[2]) && RE_MODELED_LABEL.test(field[1]))) obligation = 'required'; // dato de ficha u opción rotulada
+      else if (RE_NOMINAL_STRUCTURE.test(m)) {
+        obligation = 'required';
+        medium = true;
+      }
 
       // Alcance de la oración («Cada módulo deberá…», «Cada capítulo de práctica…»).
       let sentenceScope: RequirementScope | null = null;
@@ -599,7 +606,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         mentions.push({ kind: total.kind, value: Number(dm[1]), mode: 'exact', ...(total.evaluationType ? { evaluationType: total.evaluationType } : {}), scope, index: at, end: at + dm[0].length, raw: dm[0] });
       }
       // «N módulos × M capítulos» / «N módulos de M capítulos» / «N módulos por M capítulos»: los M son de CADA módulo.
-      const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de)\s*(\d{1,3})\s*capitulos?/.exec(m);
+      const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de|,?\s*cada uno (?:con|de))\s*(\d{1,3})\s*capitulos?/.exec(m);
       // Review 2.ª (I3): «2 módulos de 2 capítulos de contenido» conserva «de contenido».
       if (cross) for (const x of mentions) if (x.kind === 'chapters' && x.value === Number(cross[2]) && x.scope.level === 'course') x.scope = (x.scope as { chapterKind?: string }).chapterKind === 'content' ? { level: 'module', each: true, chapterKind: 'content' } : { level: 'module', each: true };
 
