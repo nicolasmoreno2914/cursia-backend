@@ -22,6 +22,10 @@
 //   DI15 0 llamadas de red
 //   DI16–DI21 (revisión independiente) PDF tipo Word, componentes de horas, «la plataforma» y artículos, datos de la
 //        ficha, listas sin viñetas y celdas que ocupan varias columnas: lo normal no cambia
+//   DI22–DI24 (Loop 6) DOCX: celda de unidad combinada en vertical (vMerge), fila de unidad combinada en horizontal
+//        (gridSpan) y tabla anidada dentro de una celda: cada tema queda en su unidad y nada se pierde
+//   DI25 horas de las unidades que no suman el total ⇒ UNIT_HOURS_MISMATCH (contradicción visible, no se corrige sola)
+//   DI26 un dato que el documento no trae queda «missing» (horas, evaluación, metodología): nunca se inventa
 //
 // Uso: node scripts/check-documentos-imperfectos.js [path/to/dist]   (después de npm run build)
 'use strict';
@@ -261,6 +265,53 @@ const contentsOf = (ctx) => ctx.units.map((u) => [u.title, u.contents.map((c) =>
       { x: 80, y: 120, text: 'Nota' }, { x: 131, y: 120, text: 'Todos los temas se trabajan con casos simulados y retroalimentación inmediata del tutor' }]]);
     const lines = (await require(path.join(distRoot, 'modules/academic-context/extract/text-sources.js')).readDocument(pdf, 'x.pdf')).lines.map((l) => l.text);
     assert(lines.includes('Nota | Todos los temas se trabajan con casos simulados y retroalimentación inmediata del tutor'), JSON.stringify(lines));
+  });
+
+  // ── Loop 6 (B6): DOCX con celdas combinadas y tablas anidadas (el lector las resolvía, sin pruebas que lo fijaran) ──
+  const JSZip = require('jszip');
+  const wp = (t, style) => `<w:p>${style ? `<w:pPr><w:pStyle w:val="${style}"/></w:pPr>` : ''}<w:r><w:t xml:space="preserve">${t}</w:t></w:r></w:p>`;
+  const wtc = (t, o = {}) => `<w:tc><w:tcPr>${o.span ? `<w:gridSpan w:val="${o.span}"/>` : ''}${o.vm === 'restart' ? '<w:vMerge w:val="restart"/>' : o.vm === 'cont' ? '<w:vMerge/>' : ''}</w:tcPr>${t ? wp(t) : '<w:p/>'}</w:tc>`;
+  const wtr = (...c) => `<w:tr>${c.join('')}</w:tr>`;
+  const docxOf = async (body) => { const z = new JSZip(); z.file('word/document.xml', `<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body}</w:body></w:document>`); return z.generateAsync({ type: 'nodebuffer' }); };
+  const docHead = wp('Microcurrículo: Mantenimiento de bombas', 'Heading1') + wp('Resultados de aprendizaje', 'Heading2') + wp('RA1. Aplicar la lubricación de rodamientos según el plan.') + wp('Contenidos', 'Heading2');
+  const UNITS2 = [['Fundamentos del mantenimiento', ['Tipos de mantenimiento', 'Lubricación de rodamientos', 'Alineación de ejes']], ['Diagnóstico de fallas', ['Análisis de vibraciones', 'Termografía']]];
+
+  await check('DI22 DOCX: unidad combinada en vertical (vMerge) sobre varias filas de temas: cada tema queda en su unidad', async () => {
+    const body = docHead + `<w:tbl>${wtr(wtc('Unidad'), wtc('Tema'), wtc('Horas'))}`
+      + wtr(wtc('Unidad 1: Fundamentos del mantenimiento', { vm: 'restart' }), wtc('Tipos de mantenimiento'), wtc('4')) + wtr(wtc('', { vm: 'cont' }), wtc('Lubricación de rodamientos'), wtc('6')) + wtr(wtc('', { vm: 'cont' }), wtc('Alineación de ejes'), wtc('6'))
+      + wtr(wtc('Unidad 2: Diagnóstico de fallas', { vm: 'restart' }), wtc('Análisis de vibraciones'), wtc('8')) + wtr(wtc('', { vm: 'cont' }), wtc('Termografía'), wtc('4')) + '</w:tbl>';
+    eq(contentsOf((await read('vmerge.docx', await docxOf(body))).context), UNITS2, 'temas por unidad');
+  });
+  await check('DI23 DOCX: fila de unidad combinada en horizontal (gridSpan) entre filas de temas', async () => {
+    const body = docHead + `<w:tbl>${wtr(wtc('Semana'), wtc('Tema'), wtc('Horas'))}`
+      + wtr(wtc('Unidad 1: Fundamentos del mantenimiento', { span: 3 })) + wtr(wtc('1'), wtc('Tipos de mantenimiento'), wtc('4')) + wtr(wtc('2'), wtc('Lubricación de rodamientos'), wtc('6')) + wtr(wtc('3'), wtc('Alineación de ejes'), wtc('6'))
+      + wtr(wtc('Unidad 2: Diagnóstico de fallas', { span: 3 })) + wtr(wtc('4'), wtc('Análisis de vibraciones'), wtc('8')) + wtr(wtc('5'), wtc('Termografía'), wtc('4')) + '</w:tbl>';
+    eq(contentsOf((await read('gridspan.docx', await docxOf(body))).context), UNITS2, 'temas por unidad');
+  });
+  await check('DI24 DOCX: tabla anidada dentro de la celda de temas: los temas se leen y el texto posterior a la tabla no se pierde', async () => {
+    const inner = (ts) => `<w:tc><w:tbl>${ts.map((t) => wtr(wtc(t))).join('')}</w:tbl><w:p/></w:tc>`;
+    const body = docHead + `<w:tbl>${wtr(wtc('Unidad'), wtc('Temas'))}` + wtr(wtc('Unidad 1: Fundamentos del mantenimiento'), inner(UNITS2[0][1])) + wtr(wtc('Unidad 2: Diagnóstico de fallas'), inner(UNITS2[1][1])) + '</w:tbl>'
+      + wp('Bibliografía', 'Heading2') + wp('Manual de bombas centrífugas, 2020.');
+    const r = await read('anidada.docx', await docxOf(body));
+    eq(contentsOf(r.context), UNITS2, 'temas por unidad');
+    assert(JSON.stringify(r.context.bibliography || []).includes('Manual de bombas centrífugas'), 'la bibliografía después de la tabla se conserva');
+  });
+  const V = require(path.join(distRoot, 'modules/academic-context/validate.js'));
+  await check('DI25 horas de las unidades que no suman el total del documento ⇒ UNIT_HOURS_MISMATCH visible (no se ajusta solo)', async () => {
+    const r = await read('horas.txt', txt(['MICROCURRÍCULO: Mantenimiento de bombas', 'Intensidad horaria total: 40 horas', '', 'RESULTADOS DE APRENDIZAJE', 'RA1. Aplicar la lubricación de rodamientos según el plan.', '', 'CONTENIDOS',
+      'Unidad 1: Fundamentos (10 horas)', '- Tipos de mantenimiento', 'Unidad 2: Lubricación (10 horas)', '- Lubricantes', 'Unidad 3: Alineación (10 horas)', '- Reloj comparador']));
+    eq(r.context.units.map((u) => u.hours), [10, 10, 10], 'horas de cada unidad tal cual');
+    eq(r.context.hours.total.value, 40, 'total tal cual');
+    const v = V.validateAcademicContext(r.context);
+    assert(v.issues.some((i) => i.code === 'UNIT_HOURS_MISMATCH' && /30/.test(i.message) && /40/.test(i.message)), JSON.stringify(v.issues.map((i) => i.code)));
+  });
+  await check('DI26 lo que el documento no trae queda «missing» (horas, evaluación, metodología): nunca se inventa un valor', async () => {
+    const r = await read('incompleto.txt', txt(['MICROCURRÍCULO: Mantenimiento de bombas', '', 'RESULTADOS DE APRENDIZAJE', 'RA1. Aplicar la lubricación de rodamientos según el plan.', '', 'CONTENIDOS', 'Unidad 1: Fundamentos', '- Tipos de mantenimiento']));
+    eq([r.context.hours.total.status, r.context.hours.total.value], ['missing', null], 'horas');
+    eq([r.context.methodology.status, r.context.methodology.value], ['missing', null], 'metodología');
+    eq(r.context.evaluation, [], 'evaluación');
+    const v = V.validateAcademicContext(r.context);
+    assert(['MISSING_HOURS', 'MISSING_EVALUATION', 'MISSING_METHODOLOGY'].every((c) => v.issues.some((i) => i.code === c)) && v.canProceed === true, 'se informa lo que falta y se puede seguir');
   });
 
   await check('DI15 0 llamadas de red', async () => { eq(netAttempts, [], 'red'); });

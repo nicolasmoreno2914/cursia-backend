@@ -31,6 +31,7 @@ import {
   mergeLlmFindings,
 } from './llm-merge';
 import { LlmFindingsDto, StructureCoherenceDto } from './dto/coherence.dto';
+import { QualityInputs, QualityReport, runQualityBattery } from '../quality/quality-battery';
 
 export const COHERENCE_REPORT_ARTIFACT_TYPE = 'dynamic_coherence_report_json';
 
@@ -150,6 +151,69 @@ export class CoherenceService {
     const { job, manifest } = await this.runOf(courseId, ownerId, blueprintNumber, runId);
     const report = await this.buildDeterministicReport(job, manifest, ownerId, blueprintNumber);
     return this.persist(job, manifest, report, 'deterministic', report.reportSha256, {});
+  }
+
+  /**
+   * Loop 6 · Bloque 5: batería de calidad de un run TERMINADO (contenido perdido, duplicación, terminología,
+   * resultados ↔ texto, competencias, evaluaciones, continuidad, trazabilidad). Solo lectura: no persiste nada.
+   */
+  async qualityReport(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<QualityReport & { runId: string }> {
+    assertDynamicOwnerAllowed(ownerId);
+    const { job, manifest } = await this.runOf(courseId, ownerId, blueprintNumber, runId);
+    if (job.worker_status !== 'completed' && job.worker_status !== 'preview') {
+      throw new ConflictException(`La ejecución ${job.id} no está completada (worker_status=${job.worker_status}); la batería de calidad mide un run terminado.`);
+    }
+    const bp = await this.manifests.blueprintOfForRules(job.course_id, ownerId, blueprintNumber, manifest.rulesVersion);
+    const snap: any = bp.snapshot;
+    const chapters: QualityInputs['chapters'] = [];
+    for (const m of snap.modules || []) {
+      for (const c of m.chapters || []) chapters.push({ id: c.id, moduleId: m.id, title: c.title, objective: c.objective ?? null, outcomeIds: Array.isArray(c.outcomeIds) ? c.outcomeIds : [], ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}) });
+    }
+    const actx: any = snap.course?.academicContext || {};
+    const outcomes = (actx.outcomes || []).map((o: any) => ({ id: String(o.id), text: String(o.text || ''), domain: o.domain }));
+    const competencies = (actx.competencies || []).map((o: any) => ({ id: String(o.id), text: String(o.text || '') }));
+    const items: any[] = (manifest.manifest as any).items || [];
+    const rows: Array<{ item_key: string; chapter_id: string | null; item_run_id: string; artifact_id: string; artifact_type: string; storage_bucket: string; storage_path: string; mime_type: string | null }> =
+      await this.dataSource.query(
+        `select g.item_key, g.chapter_id, g.id as item_run_id, a.id as artifact_id, a.type as artifact_type,
+                a.storage_bucket, a.storage_path, a.mime_type
+           from ${effectiveOutputRowsSql('$1')} g
+           join public.artifacts a on a.item_run_id = g.id and a.status is distinct from 'disabled'
+          where g.status = 'completed'
+          order by g.item_key, a.id`,
+        [job.id],
+      );
+    const artifactTypesByItem: Record<string, string[]> = {};
+    for (const r of rows) (artifactTypesByItem[r.item_key] = artifactTypesByItem[r.item_key] || []).push(r.artifact_type);
+    const text = (r: (typeof rows)[number]) => loadArtifactText(this.artifacts, ownerId, { itemKey: r.item_key, itemRunId: r.item_run_id, artifactId: r.artifact_id, type: r.artifact_type as any, storageBucket: r.storage_bucket, storagePath: r.storage_path, mimeType: r.mime_type } as ResolvedArtifact);
+    const json = async (r: (typeof rows)[number]) => { try { return JSON.parse(await text(r)); } catch { return null; } };
+    const chapterMd: Record<string, string> = {};
+    const contextSummaries: QualityInputs['contextSummaries'] = {};
+    const examBanks: QualityInputs['examBanks'] = {};
+    let introCompetencies: string[] | null = null;
+    for (const r of rows) {
+      if (r.artifact_type === 'dynamic_content_md' && r.chapter_id) chapterMd[r.chapter_id] = await text(r);
+      else if (r.artifact_type === 'dynamic_context_summary_json' && r.chapter_id) {
+        const s = await json(r);
+        if (s) contextSummaries[r.chapter_id] = { concepts_introduced: s.concepts_introduced ?? null, concepts_assumed: s.concepts_assumed ?? null, key_terms: s.key_terms ?? null };
+      } else if (r.artifact_type === 'dynamic_course_intro_json') {
+        const d = await json(r);
+        if (d && Array.isArray(d.competencies)) introCompetencies = d.competencies.map(String);
+      } else if (r.artifact_type === 'dynamic_exam_bank_json') {
+        const d = await json(r);
+        const it = items.find((x) => x.key === r.item_key);
+        if (d && Array.isArray(d.questions) && it) {
+          const scopeChapters = chapters.filter((c) => c.kind !== 'practice' && (it.type === 'final_exam' || c.moduleId === it.moduleId)).map((c) => c.id);
+          examBanks[r.item_key] = { chapterIds: scopeChapters, questions: d.questions.map((q: any) => ({ chapterId: q?.chapterId ?? null, evidence: q?.evidence ?? null })) };
+        }
+      }
+    }
+    const report = runQualityBattery({
+      chapters, outcomes, competencies,
+      manifestItems: items.map((x) => ({ key: String(x.key), type: String(x.type), chapterId: x.chapterId ?? null, moduleId: x.moduleId ?? null })),
+      artifactTypesByItem, chapterMd, contextSummaries, introCompetencies, examBanks,
+    });
+    return { runId: job.id, ...report };
   }
 
   /** GET …/runs/:runId/coherence — último reporte guardado del run (determinístico o LLM). */
