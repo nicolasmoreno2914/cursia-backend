@@ -549,6 +549,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       const generic = RE_GENERIC.test(m);
       let obligation: RequirementObligation | null = null;
       let medium = false;
+      let nominalStructure = false;
       if (RE_RECOMMENDED.test(m)) {
         obligation = 'recommended';
         if (RE_PROPOSE.test(m)) medium = true;
@@ -563,6 +564,7 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
       else if (RE_NOMINAL_STRUCTURE.test(m) && !/\(\s*[a-z][^()]{0,60},?\s*(1[5-9]|20)\d{2}\s*\)/.test(m)) { // una cita («(Pérez, 2019)») no es una estructura
         obligation = 'required';
         medium = true;
+        nominalStructure = true;
       }
 
       // Alcance de la oración («Cada módulo deberá…», «Cada capítulo de práctica…»).
@@ -606,7 +608,10 @@ export function extractRequirements(lines: SourceLine[], documentId = 'doc'): Re
         mentions.push({ kind: total.kind, value: Number(dm[1]), mode: 'exact', ...(total.evaluationType ? { evaluationType: total.evaluationType } : {}), scope, index: at, end: at + dm[0].length, raw: dm[0] });
       }
       // «N módulos × M capítulos» / «N módulos de M capítulos» / «N módulos por M capítulos»: los M son de CADA módulo.
-      const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de|con|,?\s*cada (?:uno|modulo) (?:con|de|tiene))\s*(\d{1,3})\s*capitulos?/.exec(m);
+      // Re-review L7 (N1): «N módulos con M capítulos» solo en una oración SIN verbo (lectura media) y nunca «en total»:
+      // «El curso deberá tener 4 módulos con 12 capítulos en total» son 12 capítulos del curso, no 12 por módulo.
+      const cross = /(\d{1,3})\s*modulos?\s*(?:x|×|\*|por|de|,?\s*cada (?:uno|modulo) (?:con|de|tiene))\s*(\d{1,3})\s*capitulos?/.exec(m)
+        || (nominalStructure && !/\ben (total|todo el curso)\b/.test(m) ? /(\d{1,3})\s*modulos?\s*con\s*(\d{1,3})\s*capitulos?/.exec(m) : null);
       // Review 2.ª (I3): «2 módulos de 2 capítulos de contenido» conserva «de contenido».
       if (cross) for (const x of mentions) if (x.kind === 'chapters' && x.value === Number(cross[2]) && x.scope.level === 'course') x.scope = (x.scope as { chapterKind?: string }).chapterKind === 'content' ? { level: 'module', each: true, chapterKind: 'content' } : { level: 'module', each: true };
 

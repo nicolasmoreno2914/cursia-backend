@@ -343,6 +343,11 @@ const contentsOf = (ctx) => ctx.units.map((u) => [u.title, u.contents.map((c) =>
     eq(reqsOf(['MICROCURRÍCULO: Seguridad industrial', '4 módulos, cada uno con 5 capítulos.']).length, 0, 'sin autoridad (no es requisito de confianza alta)');
     eq(reqsOf(['4 módulos de lectura opcional del libro guía.'], true).filter((r) => r.kind === 'structure').length, 0, 'una mención sin capítulos no se vuelve estructura');
     eq(reqsOf(['2 módulos de 3 capítulos (Pérez, 2019).'], true).filter((r) => r.kind === 'structure').length, 0, 'una cita bibliográfica no es una estructura');
+    for (const line of ['El curso deberá tener 4 módulos con 12 capítulos en total.', 'El curso tiene 4 módulos con 12 capítulos.', '4 módulos con 12 capítulos en total.']) {
+      const rs = reqsOf(['MICROCURRÍCULO: X', line], true);
+      const ch = rs.find((r) => r.kind === 'chapters');
+      assert(ch && ch.value === 12 && ch.scope.level === 'course' && !rs.some((r) => r.kind === 'structure' && JSON.stringify(r.shape) === '[12,12,12,12]'), `${line} ⇒ 12 capítulos del CURSO: ${JSON.stringify(rs.map((r) => [r.kind, r.value, r.scope, r.shape]))}`);
+    }
     for (const line of ['4 módulos, cada módulo con 5 capítulos.', '4 módulos con 5 capítulos.']) {
       const st = reqsOf(['MICROCURRÍCULO: X', line], true).find((r) => r.kind === 'structure');
       assert(st && JSON.stringify(st.shape) === '[5,5,5,5]', `${line} ⇒ 5 por módulo: ${JSON.stringify(st)}`);

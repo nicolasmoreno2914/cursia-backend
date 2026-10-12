@@ -914,7 +914,8 @@ async function _dynContentPartialRepair(item, sys, md, hardHits, courseContext) 
     // Review L7 (I5): un número de la oración que el capítulo vuelve a usar en otra parte tiene que seguir en el reemplazo
     // (si no, el resto del capítulo hablaría de una cifra que ya no está).
     var rest = String(md).slice(0, spans[i].start) + ' ' + String(md).slice(spans[i].end);
-    var nums = spans[i].text.match(/\d+(?:[.,]\d+)?/g) || [];
+    // Re-review L7 (m-a): se ignoran números < 10 y años (títulos «## 3 …» y fechas no son cifras «en uso»).
+    var nums = (spans[i].text.match(/\d+(?:[.,]\d+)?/g) || []).filter(function (x) { var v = Number(x.replace(',', '.')); return !(v < 10) && !/^(1[5-9]|20)\d{2}$/.test(x); });
     for (var k = 0; k < nums.length; k++) {
       var nre = new RegExp('(^|[^\\d.,])' + nums[k].replace(/[.,]/g, '[.,]') + '(?![\\d])');
       if (nre.test(rest) && t.indexOf(nums[k]) < 0) return { ok: false, reason: 'numbers' };
