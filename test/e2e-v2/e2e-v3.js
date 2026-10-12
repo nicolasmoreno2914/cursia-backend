@@ -3914,6 +3914,9 @@ function reservationBookkeeping(ev) {
         fake.rule((t) => t.includes('Genera el CAPÍTULO 1 COMPLETO: "Lubricación de rodamientos"'), 'slow', 1, 12000);
         fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"'), 'drop', 2);
         fake.rule((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"'), 'cut', 200);
+        // Robustez: la PRIMERA subida de un capítulo del Libro hecha por el worker falla (Storage 500) una vez.
+        const failedBefore = FAKES.storage.failedUploads.length;
+        FAKES.storage.failUploads.push({ match: (p) => /\/dynamic_content_md\//.test(p) && /-w\.md$/.test(p), times: 1 });
         c2.runId = await startRun(c2, C2.title);
         CURRENT_RUN = c2.runId;
         const runsBase2 = `/courses/${c2.courseId}/blueprints/${c2.n}/manifest/runs/${c2.runId}`;
@@ -3966,6 +3969,22 @@ function reservationBookkeeping(ev) {
         ok(cavCalls <= 12, `E24b: el gasto de la parte quedó acotado (${cavCalls} llamadas, USD ${cavSpent.toFixed(4)})`, { cavCalls, cavSpent });
         const lub = f2.filter((i) => i.item_key.endsWith(c2.mods[0].chapters[0].id));
         ok(lub.length > 0 && lub.every((i) => i.status === 'completed'), 'E24b: las partes INDEPENDIENTES (cap. 1) siguieron y se completaron', lub.map((i) => [i.item_key, i.status]));
+        // Robustez (Storage): la subida falló una vez → la parte se reintentó desde su punto de guardado (sin volver a
+        // pedirle el capítulo a la IA) y quedó con UN solo artifact.
+        const failedPaths = FAKES.storage.failedUploads.slice(failedBefore);
+        ok(failedPaths.length === 1, 'E24b: una subida del Libro hecha por el worker falló (Storage 500 inyectado)', failedPaths);
+        if (failedPaths.length === 1) {
+          const dir = failedPaths[0].replace(/^[^/]+\//, '').replace(/\/[^/]+$/, '');
+          const [art] = await q(`select g.item_key, g.status, g.chapter_id from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where a.storage_path like $1 || '/%' and a.type = 'dynamic_content_md'`, [dir]);
+          const chTitle = art && C2.modules[0].chapters[c2.mods[0].chapters.findIndex((x) => x.id === art.chapter_id)].title;
+          const chNum = art && (c2.mods[0].chapters.findIndex((x) => x.id === art.chapter_id) + 1);
+          const genCalls = art ? reqs((t) => t.includes(`Genera el CAPÍTULO ${chNum} COMPLETO: "${chTitle}"`)).length : -1;
+          ok(art && art.status === 'completed', 'E24b: tras la falla de Storage la parte se completó sola (reintento automático)', art);
+          ok(genCalls >= 1 && genCalls === reqs((t) => t.includes(`Genera el CAPÍTULO ${chNum} COMPLETO: "${chTitle}"`) && !/RECHAZADA/.test(t)).length && (chTitle !== 'Lubricación de rodamientos' ? genCalls === 1 : true),
+            'E24b: el reintento tras la falla de Storage NO volvió a generar el capítulo (respuesta desde el punto de guardado)', { chTitle, genCalls });
+          const dupA = await q(`select count(*)::int n from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and g.item_key = $2 and a.type = 'dynamic_content_md'`, [c2.runId, art && art.item_key]);
+          eq(dupA[0].n, 1, 'E24b: un solo artifact del capítulo (la subida fallida no dejó basura)');
+        }
         const needsHuman = f2.filter((i) => i.status === 'failed');
         eq(needsHuman.map((i) => (i.error || '').split(':')[0]).sort(), ['item_recovery_budget_exhausted', 'llm_pending_review'], 'E24b: solo 2 partes piden a una persona (los 2 casos inseguros inyectados); el resto, automático');
         results.courses.E24b = { courseId: c2.courseId, runId: c2.runId, items: rows2.length, failed: needsHuman.map((i) => [i.item_key, (i.error || '').slice(0, 120)]), cavitationCalls: cavCalls, cavitationUsd: cavSpent };
@@ -3977,20 +3996,48 @@ function reservationBookkeeping(ev) {
           ] }] };
         llm.st.tag = 'E24c';
         const c3 = await createCourse(C3, llm);
-        c3.runId = await startRun(c3, C3.title);
+        // Review I1: el plan del curso es del worker y no depende de nada → el run tiene que NACER anterior a la
+        // activación (un trigger temporal de la base de la E2E fecha el INSERT), sin ventana en la que el worker lo vea.
+        await q(`create or replace function e2e_backdate_run() returns trigger language plpgsql as $f$ begin if new.execution_mode = 'dynamic_generation' then new.created_at := '${LLM_SINCE}'::timestamptz - interval '1 hour'; end if; return new; end $f$`);
+        await q(`create trigger e2e_backdate_run_trg before insert on public.production_jobs for each row execute function e2e_backdate_run()`);
+        try { c3.runId = await startRun(c3, C3.title); } finally {
+          await q(`drop trigger if exists e2e_backdate_run_trg on public.production_jobs`);
+          await q(`drop function if exists e2e_backdate_run()`);
+        }
         CURRENT_RUN = c3.runId;
-        // Nada largo es reclamable todavía (el Libro depende del plan, que no corrió): se fecha el run antes de la activación.
-        await q(`update public.production_jobs set created_at = $2::timestamptz - interval '1 hour' where id = $1`, [c3.runId, LLM_SINCE]);
+        const [c3row] = await q(`select created_at from public.production_jobs where id = $1`, [c3.runId]);
+        ok(new Date(c3row.created_at).getTime() < new Date(LLM_SINCE).getTime(), 'E24c: el run nació antes de la activación', c3row);
         const fakeBefore = fake.st.requests.length;
         const claims3 = claimLog.length;
         const ctl3 = S.front.dynExecutorStart({ courseId: c3.courseId, blueprintNumber: c3.n, runId: c3.runId });
         await waitRunTerminal(ctl3, 'E24c run', 10 * 60 * 1000, c3.runId).catch(() => null);
         const rows3 = await finished(c3.runId);
-        const long3 = rows3.filter((i) => LONG.includes(i.type));
+        const long3 = rows3.filter((i) => LONG.includes(i.type) || i.type === 'course_plan');
         ok(rows3.length > 0 && rows3.every((i) => i.status === 'completed'), 'E24c: el run anterior a la activación se completa', rows3.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
         ok(long3.length >= 2 && long3.every((i) => ![W1, W2, W3, W4].includes(i.worker_id)), 'E24c: sus partes LARGAS las generó el navegador (el worker de IA no toma runs anteriores a la activación)', long3.map((i) => [i.item_key, i.worker_id]));
-        ok(claimLog.slice(claims3).some((x) => LONG.includes(x.type)), 'E24c: el servidor le dejó al navegador las partes largas de ese run (sin colgarse esperando al worker)');
+        ok(claimLog.slice(claims3).some((x) => LONG.includes(x.type)) && claimLog.slice(claims3).some((x) => x.type === 'course_plan'), 'E24c: el servidor le dejó al navegador las partes largas (y el plan) de ese run, sin colgarse esperando al worker');
         eq(fake.st.requests.slice(fakeBefore).filter((r) => r.text.includes('Juntas de expansión')).length, 0, 'E24c: ninguna llamada del worker de IA para el run anterior');
+
+        // ── Corrida 4 (robustez): presupuesto GLOBAL del run agotado → pausa segura sin gastar; nada queda colgado ──
+        const C4 = { key: 'E24d', title: '[E2E Worker IA E24d] Presupuesto agotado', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Operación de bombas', objective: 'Operar bombas de proceso', exam: false, chapters: [
+            { title: 'Arranque de bombas', v: false, a: false, objective: 'Arrancar una bomba centrífuga con seguridad' },
+          ] }] };
+        llm.st.tag = 'E24d';
+        const c4 = await createCourse(C4, llm);
+        c4.runId = await startRun(c4, C4.title);
+        CURRENT_RUN = c4.runId;
+        await q(`update public.cost_budget_authorizations set authorized_budget = 0.01 where run_id = $1`, [c4.runId]);
+        const fakeBefore4 = fake.st.requests.length;
+        const ctl4 = S.front.dynExecutorStart({ courseId: c4.courseId, blueprintNumber: c4.n, runId: c4.runId });
+        await waitFor('run E24d pausado por el tope', async () => { const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c4.runId]); return j && j.worker_status === 'paused'; }, 120000, 300);
+        ctl4.stop();
+        const [j4] = await q(`select worker_status, output_summary->'pause' p from public.production_jobs where id = $1`, [c4.runId]);
+        ok(j4.worker_status === 'paused' && /cap|tope|budget/i.test(JSON.stringify(j4.p || {})), 'E24d: presupuesto global agotado → el run se pausa solo (pausa segura, reanudable)', j4);
+        await sleep(3000);
+        eq(fake.st.requests.slice(fakeBefore4).filter((r) => r.text.includes('Arranque de bombas') || r.text.includes('Operación de bombas')).length, 0, 'E24d: ninguna llamada pagada del worker con el presupuesto agotado');
+        const running4 = (await finished(c4.runId)).filter((i) => i.status === 'running');
+        eq(running4.length, 0, 'E24d: ninguna parte queda en curso (devueltas a la cola, sin consumir intentos)');
       } finally {
         for (const w of [w1, w2, w3, w4]) if (w && !w.exited) await stopProc(w, 30000);
         await fake.close();

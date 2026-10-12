@@ -12,6 +12,9 @@ const crypto = require('crypto');
 function startStorage() {
   const blobs = new Map(); // "bucket/path" → Buffer
   const log = [];
+  // Loop 6 (robustez): reglas de falla de subida { match(path) → bool, times, status } (500 por defecto) y registro.
+  const failUploads = [];
+  const failedUploads = [];
   const srv = http.createServer((rq, rs) => {
     const chunks = [];
     rq.on('data', (c) => chunks.push(c));
@@ -37,6 +40,13 @@ function startStorage() {
         return rs.end(rq.method === 'GET' ? blobs.get(m[1]) : undefined);
       }
       if ((rq.method === 'POST' || rq.method === 'PUT') && (m = p.match(/^\/storage\/v1\/object\/(.+)$/))) {
+        const fr = failUploads.find((r) => r.times > 0 && r.match(m[1]));
+        if (fr) {
+          fr.times--;
+          failedUploads.push(m[1]);
+          rs.writeHead(fr.status || 500, { 'content-type': 'application/json' });
+          return rs.end('{"statusCode":"500","error":"Internal","message":"falla inyectada (E2E)"}');
+        }
         if (blobs.has(m[1]) && String(rq.headers['x-upsert']) !== 'true') {
           rs.writeHead(400, { 'content-type': 'application/json' });
           return rs.end('{"statusCode":"409","error":"Duplicate","message":"The resource already exists"}');
@@ -54,7 +64,7 @@ function startStorage() {
       rs.end('unsupported');
     });
   });
-  return { srv, blobs, log };
+  return { srv, blobs, log, failUploads, failedUploads };
 }
 
 function startVideogen(apiKey, getHttpsBase) {

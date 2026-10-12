@@ -17,6 +17,8 @@ create table if not exists public.llm_worker_presence (
   draining    boolean not null default false
 );
 create index if not exists llm_worker_presence_last_seen_idx on public.llm_worker_presence (last_seen);
+-- Loop 6: instante de activación con el que reclama ESE worker (el API rutea un run solo si un worker vivo lo cubre).
+alter table public.llm_worker_presence add column if not exists since timestamptz;
 
 -- Solo el backend (service role) lee/escribe: un cliente (anon/authenticated vía PostgREST) nunca puede fingir ni
 -- borrar la presencia de un worker (decide qué partes reclama el navegador). Mismo patrón que v21-finops-rls.

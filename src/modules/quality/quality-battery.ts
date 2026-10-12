@@ -66,15 +66,18 @@ export interface QualityReport {
   summary: Record<string, number | null>;
 }
 
-/** Artifact principal esperado por tipo de item (los demás tipos no generan texto que mida esta batería). */
-export const EXPECTED_ARTIFACT_BY_ITEM_TYPE: Readonly<Record<string, string>> = {
-  course_plan: 'dynamic_course_plan_json',
-  course_intro: 'dynamic_course_intro_json',
-  module_intro: 'dynamic_module_intro_json',
-  content: 'dynamic_content_md',
-  experience: 'dynamic_experience_json',
-  video_interactions: 'dynamic_video_interactions_json',
-  application_activity: 'dynamic_application_json',
+/** Artifact principal esperado por tipo de item (cualquiera de la lista; los demás tipos no generan texto medible). */
+export const EXPECTED_ARTIFACT_BY_ITEM_TYPE: Readonly<Record<string, readonly string[]>> = {
+  course_plan: ['dynamic_course_plan_json'],
+  course_intro: ['dynamic_course_intro_json'],
+  module_intro: ['dynamic_module_intro_json'],
+  content: ['dynamic_content_md'],
+  experience: ['dynamic_experience_json'],
+  video_interactions: ['dynamic_video_interactions_json'],
+  application_activity: ['dynamic_application_json'],
+  // Review I5: un examen sin su banco (o su GIFT) también es contenido perdido.
+  exam: ['dynamic_exam_bank_json', 'dynamic_exam_gift'],
+  final_exam: ['dynamic_exam_bank_json', 'dynamic_exam_gift'],
 };
 
 // ── Normalización léxica (español) ──
@@ -142,8 +145,9 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
       const want = EXPECTED_ARTIFACT_BY_ITEM_TYPE[it.type];
       if (!want) continue;
       expected++;
-      if ((inp.artifactTypesByItem[it.key] || []).includes(want)) present++;
-      else f.push({ code: 'Q1_MISSING_ARTIFACT', severity: 'critical', message: `${it.key}: falta el artifact ${want}`, ref: it.key });
+      const have = inp.artifactTypesByItem[it.key] || [];
+      if (want.some((t) => have.includes(t))) present++;
+      else f.push({ code: 'Q1_MISSING_ARTIFACT', severity: 'critical', message: `${it.key}: falta el artifact ${want.join(' o ')}`, ref: it.key });
     }
     checks.push(check('Q1', 'Contenido perdido (cada parte tiene su artifact)', expected ? present / expected : null, 1, f));
   }
@@ -175,11 +179,12 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
     let hit = 0;
     for (const c of contentChapters) {
       const md = normText(inp.chapterMd[c.id] || '');
+      const mdStems = stems(inp.chapterMd[c.id] || ''); // review M6: por palabra (no subcadena suelta)
       const terms = (inp.contextSummaries[c.id]?.key_terms || []).filter((t) => typeof t === 'string' && t.trim());
       for (const t of terms) {
         total++;
         const words = contentWords(t);
-        const ok = words.length === 0 ? md.includes(normText(t)) : words.every((w) => md.includes(stem(w)));
+        const ok = words.length === 0 ? (' ' + md + ' ').includes(' ' + normText(t) + ' ') : words.every((w) => mdStems.has(stem(w)));
         if (ok) hit++;
         else f.push({ code: 'Q3_KEY_TERM_ABSENT', severity: 'warning', message: `«${c.title}»: el término clave «${t}» no aparece en el texto del capítulo`, ref: c.id });
       }
@@ -251,15 +256,18 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
     const seen = new Set<string>();
     let total = 0;
     let ok = 0;
+    const matches = (a: string, x: string) => { const as = stems(a); const xs = stems(x); return as.size > 0 && [...as].filter((w) => xs.has(w)).length / as.size >= 0.5; };
+    const allIntroduced = contentChapters.flatMap((c) => inp.contextSummaries[c.id]?.concepts_introduced || []);
     for (const c of contentChapters) {
       const s = inp.contextSummaries[c.id];
       if (!s) continue;
       for (const a of s.concepts_assumed || []) {
+        // Review I4: un supuesto que NINGÚN capítulo introduce es un prerrequisito externo (lo del curso anterior o del
+        // perfil): se informa, no cuenta. La cohesión mide el ORDEN: introducido después de usarse = ruptura.
+        if (!allIntroduced.some((x) => matches(a, x))) { f.push({ code: 'Q7_EXTERNAL_PREREQUISITE', severity: 'info', message: `«${c.title}» da por sabido «${a}» (prerrequisito externo al curso)`, ref: c.id }); continue; }
         total++;
-        const as = stems(a);
-        const found = [...seen].some((x) => { const xs = stems(x); return as.size > 0 && [...as].filter((w) => xs.has(w)).length / as.size >= 0.5; });
-        if (found) ok++;
-        else f.push({ code: 'Q7_ASSUMED_NOT_INTRODUCED', severity: 'warning', message: `«${c.title}» da por sabido «${a}», que ningún capítulo anterior introdujo`, ref: c.id });
+        if ([...seen].some((x) => matches(a, x))) ok++;
+        else f.push({ code: 'Q7_ASSUMED_NOT_INTRODUCED', severity: 'warning', message: `«${c.title}» da por sabido «${a}», que el curso introduce recién DESPUÉS`, ref: c.id });
       }
       for (const x of s.concepts_introduced || []) seen.add(x);
     }
@@ -295,6 +303,8 @@ export function compareQualityReports(baseline: QualityReport, candidate: Qualit
     const c = candidate.checks.find((x) => x.id === b.id);
     if (!c) { out.push({ id: b.id, baseline: b.metric, candidate: null, why: 'check ausente' }); continue; }
     if (b.pass && !c.pass) out.push({ id: b.id, baseline: b.metric, candidate: c.metric, why: 'dejó de pasar' });
+    // Review I3: un check que se medía y deja de tener datos (p. ej. sin sidecars o sin evidencia) es una regresión.
+    if (b.metric !== null && c.metric === null) out.push({ id: b.id, baseline: b.metric, candidate: null, why: 'sin datos' });
     if (b.metric !== null && c.metric !== null) {
       const lowerIsBetter = b.id === 'Q2';
       const worse = lowerIsBetter ? c.metric - b.metric : b.metric - c.metric;

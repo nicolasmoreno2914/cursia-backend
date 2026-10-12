@@ -90,10 +90,21 @@ check('Q6: capítulo sin preguntas (crítico) y evidencia que no está en el cap
   const r = Q.runQualityBattery(c);
   assert(codes(r, 'Q6').includes('Q6_CHAPTER_NOT_ASSESSED') && codes(r, 'Q6').includes('Q6_EVIDENCE_NOT_IN_CHAPTER') && !get(r, 'Q6').pass, 'Q6');
 });
-check('Q7: un concepto supuesto que nadie introdujo antes rompe la continuidad', () => {
-  const c = course(); c.contextSummaries.c2.concepts_assumed = ['termografía infrarroja'];
+check('Q7: usar un concepto que el curso introduce recién DESPUÉS rompe la continuidad', () => {
+  const c = course(); c.contextSummaries.c1.concepts_assumed = ['alineación de ejes'];
   const r = Q.runQualityBattery(c);
   assert(codes(r, 'Q7').includes('Q7_ASSUMED_NOT_INTRODUCED') && r.summary.Q7 < 1, JSON.stringify(r.summary));
+});
+check('Q7: un prerrequisito EXTERNO (ningún capítulo lo introduce) se informa y no baja la métrica (review I4)', () => {
+  const c = course(); c.contextSummaries.c1.concepts_assumed = ['termografía infrarroja'];
+  const r = Q.runQualityBattery(c);
+  assert(codes(r, 'Q7').includes('Q7_EXTERNAL_PREREQUISITE') && r.summary.Q7 === 1 && get(r, 'Q7').pass, JSON.stringify(r.summary));
+});
+check('Q1: un examen sin banco ni GIFT es contenido perdido (review I5); con GIFT alcanza', () => {
+  const c = course(); c.artifactTypesByItem['exam:m1'] = [];
+  assert(codes(Q.runQualityBattery(c), 'Q1').includes('Q1_MISSING_ARTIFACT'), 'sin banco');
+  c.artifactTypesByItem['exam:m1'] = ['dynamic_exam_gift'];
+  assert(Q.runQualityBattery(c).summary.Q1 === 1, 'GIFT');
 });
 check('Q8: artifact de un item ajeno al Manifest (crítico) y capítulo sin resultado vinculado', () => {
   const c = course(); c.artifactTypesByItem['content:fantasma'] = ['dynamic_content_md']; c.chapters[1].outcomeIds = [];
@@ -113,6 +124,8 @@ check('compareQualityReports: misma calidad ⇒ sin regresiones; métrica peor o
   assert(reg.some((x) => x.id === 'Q3'), JSON.stringify(reg));
   const dup = course(); dup.chapterMd.c3 += `\n\n${PARA('lubricación de rodamientos', 'usando el lubricante con la frecuencia que indica el fabricante')}`;
   assert(Q.compareQualityReports(base, Q.runQualityBattery(dup)).some((x) => x.id === 'Q2'), 'Q2 más alto = peor');
+  const nodata = course(); nodata.contextSummaries = {};
+  assert(Q.compareQualityReports(base, Q.runQualityBattery(nodata)).some((x) => x.id === 'Q3' && x.why === 'sin datos'), 'perder los datos de un check es regresión (review I3)');
 });
 
 console.log(`\n${passes} ok, ${failures} fail`);

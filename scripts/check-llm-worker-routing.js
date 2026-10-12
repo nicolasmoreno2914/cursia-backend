@@ -12,6 +12,7 @@ async function check(name, fn) {
   catch (e) { failures++; console.error(`❌ ${name}\n   ${e && e.stack ? e.stack.split('\n').slice(0, 3).join('\n   ') : e}`); }
 }
 const assert = (c, m) => { if (!c) throw new Error(m); };
+const eqSet = (set, arr, m) => { const a = [...set].sort().join(); const b = [...arr].sort().join(); if (a !== b) throw new Error(`${m}: ${a} ≠ ${b}`); };
 const ALL = ['course_plan', 'content', 'experience', 'activity', 'application_activity', 'final_exam', 'exam'];
 const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
 
@@ -54,12 +55,25 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     const env = { DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: since };
     assert(R.llmWorkerSince(env).toISOString() === '2026-10-12T00:00:00.000Z', 'parse');
     assert(R.llmWorkerRoutingActive(env), 'activo');
-    for (const bad of ['', 'mañana', '2026-10-12', 'NaN', 'x2026-10-12T00:00:00Z']) assert(!R.llmWorkerRoutingActive({ DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: bad }), `inválido «${bad}» ⇒ sin ruteo`);
+    for (const bad of ['', 'mañana', '2026-10-12', 'NaN', 'x2026-10-12T00:00:00Z', '2026-10-12T00:00', '2026-10-12T00:00:00']) assert(!R.llmWorkerRoutingActive({ DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: bad }), `inválido «${bad}» ⇒ sin ruteo`);
     assert(!R.llmWorkerRoutingActive({ DYNAMIC_LLM_WORKER_SINCE: since }), 'sin flag ⇒ sin ruteo');
     assert(R.runRoutedToLlmWorker('2026-10-12T00:00:01Z', env) && R.runRoutedToLlmWorker(new Date(since), env), 'run nuevo (incluye el instante exacto)');
     assert(!R.runRoutedToLlmWorker('2026-10-11T23:59:59Z', env), 'run anterior (p. ej. #1209) ⇒ sigue en el navegador');
     assert(!R.runRoutedToLlmWorker(null, env) && !R.runRoutedToLlmWorker('basura', env), 'sin fecha ⇒ sin ruteo');
     assert(!R.runRoutedToLlmWorker('2026-10-13T00:00:00Z', { DYNAMIC_LLM_WORKER_ENABLED: 'true' }), 'sin instante ⇒ sin ruteo');
+  });
+  await check('review I2: el API rutea con el instante que PUBLICA cada worker vivo (latido), por run; sin instante publicado no cubre', async () => {
+    R.resetLlmWorkerPresenceCacheForTests();
+    let sql = '';
+    const ds = { query: async (q) => { sql = q; return [{ item_types: ['content', 'experience'], since: new Date('2026-10-12T00:00:00Z') }, { item_types: ['final_exam'], since: '2026-10-13T00:00:00Z' }]; } };
+    const cov = await R.liveLlmWorkerCoverage(ds, Date.now());
+    assert(/since is not null/.test(sql) && /last_seen > now\(\)/.test(sql), 'solo vivos con instante publicado');
+    eqSet(R.routedTypesForRun(cov, '2026-10-12T12:00:00Z'), ['content', 'experience'], 'run entre los dos instantes');
+    eqSet(R.routedTypesForRun(cov, new Date('2026-10-14T00:00:00Z')), ['content', 'experience', 'final_exam'], 'run nuevo para ambos');
+    eqSet(R.routedTypesForRun(cov, '2026-10-11T00:00:00Z'), [], 'run anterior a todos: el navegador sigue');
+    eqSet(R.routedTypesForRun(cov, null), [], 'sin fecha');
+    R.resetLlmWorkerPresenceCacheForTests();
+    assert((await R.liveLlmWorkerCoverage({ query: async () => { throw new Error('column since does not exist'); } })).length === 0, 'error de DB (o tabla vieja) ⇒ sin cobertura');
   });
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures ? 1 : 0);

@@ -183,6 +183,28 @@ function ytPublisher(mp4, st) {
     eq(claims, claimsAtStop, 'ningún claim después de la señal');
   });
 
+  await check('Loop 6 (review C1): dos loops en un proceso con SETS PROPIOS — un item largo en uno no frena los claims del otro; el drenado espera la UNIÓN', async () => {
+    const drain = new WD.DrainSignal();
+    const provActive = new Set();
+    const llmActive = new Set();
+    let llmClaims = 0; let provClaims = 0; let provDone = 0;
+    // Loop "IA": concurrencia 2, items largos.
+    const llmLoop = WD.runClaimLoop({ name: 'llm', logger: capLogger, concurrency: 2, pollMs: 5, drain, active: llmActive,
+      claim: async () => (llmClaims < 2 ? { id: 'L' + (++llmClaims) } : null), process: async () => { await sleep(250); } });
+    // Loop "proveedores": serial (concurrencia 1), items cortos que llegan mientras la IA está ocupada.
+    const provLoop = WD.runClaimLoop({ name: 'prov', logger: capLogger, concurrency: 1, pollMs: 5, drain, active: provActive,
+      claim: async () => (provClaims < 3 ? { id: 'P' + (++provClaims) } : null), process: async () => { await sleep(10); provDone++; } });
+    await sleep(120);
+    eq(llmActive.size, 2, 'la IA tiene 2 items largos en vuelo');
+    eq(provDone, 3, 'el loop de proveedores siguió reclamando y terminó sus 3 items mientras tanto');
+    const union = WD.unionOfActive(provActive, llmActive);
+    eq(union.size, 2, 'la unión ve el trabajo de ambos');
+    drain.request('SIGTERM');
+    await Promise.all([llmLoop, provLoop]);
+    eq(await WD.awaitDrain(union, 2000), 'drained', 'el drenado espera la unión');
+    eq(llmActive.size + provActive.size, 0, 'nada en vuelo al salir');
+  });
+
   await check('#1 awaitDrain con tope: item que no termina → timeout (el proceso sale igual); set vacío → drained', async () => {
     const active = new Set([new Promise(() => {})]);
     const t0 = Date.now();

@@ -1,4 +1,4 @@
-import { browserEffectiveTypes, liveLlmWorkerTypes, llmWorkerRoutingActive, runRoutedToLlmWorker } from './llm-worker-routing';
+import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
 import {
@@ -497,9 +497,14 @@ export class SchedulerService {
         await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
         // Loop 4: con el worker de IA habilitado Y vivo, las partes LARGAS que cubre las genera el servidor (no el navegador).
         // Loop 6: solo en runs creados desde la activación (DYNAMIC_LLM_WORKER_SINCE); los anteriores siguen como siempre.
-        if (llmWorkerRoutingActive()) {
-          const [runRow] = await this.dataSource.query(`select created_at from public.production_jobs where id = $1`, [opts.runId]);
-          if (runRow && runRoutedToLlmWorker(runRow.created_at)) claimTypes = browserEffectiveTypes(types, await liveLlmWorkerTypes(this.dataSource));
+        // Review I2: el instante es el que PUBLICA cada worker vivo en su latido (no el env del API).
+        if (llmWorkerEnabled()) {
+          const coverage = await liveLlmWorkerCoverage(this.dataSource);
+          if (coverage.length) {
+            const [runRow] = await this.dataSource.query(`select created_at from public.production_jobs where id = $1`, [opts.runId]);
+            const routed = runRow ? routedTypesForRun(coverage, runRow.created_at) : new Set<string>();
+            if (routed.size) claimTypes = browserEffectiveTypes(types, routed);
+          }
         }
         if (claimTypes.length === 0) return { item: null };
       }

@@ -157,11 +157,12 @@ export class CoherenceService {
    * Loop 6 · Bloque 5: batería de calidad de un run TERMINADO (contenido perdido, duplicación, terminología,
    * resultados ↔ texto, competencias, evaluaciones, continuidad, trazabilidad). Solo lectura: no persiste nada.
    */
-  async qualityReport(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<QualityReport & { runId: string }> {
+  async qualityReport(courseId: number, ownerId: string, blueprintNumber: number, runId: string): Promise<QualityReport & { runId: string; unreadableArtifacts: string[] }> {
     assertDynamicOwnerAllowed(ownerId);
     const { job, manifest } = await this.runOf(courseId, ownerId, blueprintNumber, runId);
-    if (job.worker_status !== 'completed' && job.worker_status !== 'preview') {
-      throw new ConflictException(`La ejecución ${job.id} no está completada (worker_status=${job.worker_status}); la batería de calidad mide un run terminado.`);
+    // Review M7: también un run terminado CON fallas (ahí Q1 muestra lo que falta); nunca uno en curso.
+    if (!['completed', 'preview', 'failed'].includes(String(job.worker_status))) {
+      throw new ConflictException(`La ejecución ${job.id} no terminó (worker_status=${job.worker_status}); la batería de calidad mide un run terminado.`);
     }
     const bp = await this.manifests.blueprintOfForRules(job.course_id, ownerId, blueprintNumber, manifest.rulesVersion);
     const snap: any = bp.snapshot;
@@ -185,14 +186,23 @@ export class CoherenceService {
       );
     const artifactTypesByItem: Record<string, string[]> = {};
     for (const r of rows) (artifactTypesByItem[r.item_key] = artifactTypesByItem[r.item_key] || []).push(r.artifact_type);
+    const unreadableArtifacts: string[] = [];
     const text = (r: (typeof rows)[number]) => loadArtifactText(this.artifacts, ownerId, { itemKey: r.item_key, itemRunId: r.item_run_id, artifactId: r.artifact_id, type: r.artifact_type as any, storageBucket: r.storage_bucket, storagePath: r.storage_path, mimeType: r.mime_type } as ResolvedArtifact);
-    const json = async (r: (typeof rows)[number]) => { try { return JSON.parse(await text(r)); } catch { return null; } };
+    // Review M5: lectura en paralelo (de a 4) y un artifact ilegible queda listado en el reporte (nunca se omite callado).
+    const wanted = rows.filter((r) => ['dynamic_content_md', 'dynamic_context_summary_json', 'dynamic_course_intro_json', 'dynamic_exam_bank_json'].includes(r.artifact_type));
+    const raw = new Map<string, string | null>();
+    for (let i = 0; i < wanted.length; i += 4) {
+      await Promise.all(wanted.slice(i, i + 4).map(async (r) => {
+        try { raw.set(r.artifact_id, await text(r)); } catch { raw.set(r.artifact_id, null); unreadableArtifacts.push(`${r.item_key}:${r.artifact_type}`); }
+      }));
+    }
+    const json = async (r: (typeof rows)[number]) => { const t = raw.get(r.artifact_id); if (t == null) return null; try { return JSON.parse(t); } catch { unreadableArtifacts.push(`${r.item_key}:${r.artifact_type} (JSON inválido)`); return null; } };
     const chapterMd: Record<string, string> = {};
     const contextSummaries: QualityInputs['contextSummaries'] = {};
     const examBanks: QualityInputs['examBanks'] = {};
     let introCompetencies: string[] | null = null;
     for (const r of rows) {
-      if (r.artifact_type === 'dynamic_content_md' && r.chapter_id) chapterMd[r.chapter_id] = await text(r);
+      if (r.artifact_type === 'dynamic_content_md' && r.chapter_id) { const t = raw.get(r.artifact_id); if (t != null) chapterMd[r.chapter_id] = t; }
       else if (r.artifact_type === 'dynamic_context_summary_json' && r.chapter_id) {
         const s = await json(r);
         if (s) contextSummaries[r.chapter_id] = { concepts_introduced: s.concepts_introduced ?? null, concepts_assumed: s.concepts_assumed ?? null, key_terms: s.key_terms ?? null };
@@ -213,7 +223,7 @@ export class CoherenceService {
       manifestItems: items.map((x) => ({ key: String(x.key), type: String(x.type), chapterId: x.chapterId ?? null, moduleId: x.moduleId ?? null })),
       artifactTypesByItem, chapterMd, contextSummaries, introCompetencies, examBanks,
     });
-    return { runId: job.id, ...report };
+    return { runId: job.id, ...report, unreadableArtifacts };
   }
 
   /** GET …/runs/:runId/coherence — último reporte guardado del run (determinístico o LLM). */

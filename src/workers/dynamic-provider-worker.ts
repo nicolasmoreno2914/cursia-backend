@@ -7,7 +7,7 @@ import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
 import { holdIdleIfDynamicDisabled, holdIdleIfProviderWorkerDisabled } from './dynamic-worker-gate';
-import { DrainSignal, awaitDrain, drainTimeoutMs, installDrainHandlers, runClaimLoop } from './worker-drain';
+import { DrainSignal, awaitDrain, drainTimeoutMs, installDrainHandlers, runClaimLoop, unionOfActive } from './worker-drain';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import type { ManifestItemType } from '../modules/generation-manifests/generation-manifest-builder';
@@ -317,7 +317,10 @@ async function bootstrap() {
   const drain = new DrainSignal();
   deps.drain = drain;
   const active = new Set<Promise<void>>();
-  installDrainHandlers({ name: 'dynamic-provider-worker', logger, drain, active, close: () => app.close() });
+  // Loop 6 (review C1): el worker de IA hospedado tiene su PROPIO set en vuelo (su concurrencia no frena al loop de
+  // proveedores, que es serial, ni al revés); el drenado espera la unión de ambos.
+  const llmActive = new Set<Promise<void>>();
+  installDrainHandlers({ name: 'dynamic-provider-worker', logger, drain, active: unionOfActive(active, llmActive), close: () => app.close() });
   logger.log(
     `dynamic-provider-worker iniciado (executorId=${deps.executorId}, pollMs=${pollMs}, tipos=${PROVIDER_WORKER_TYPES.join(',')}, ` +
       `drainTimeoutMs=${drainTimeoutMs()})`,
@@ -327,7 +330,11 @@ async function bootstrap() {
   let llmLoop: Promise<void> = Promise.resolve();
   if (llmWorkerEnabled()) {
     const llmCfg = llmWorkerStartConfig();
-    if (llmCfg.ok === true) llmLoop = runLlmWorkerLoop({ app, logger: new Logger('DynamicLlmWorker'), drain, active, cfg: llmCfg });
+    if (llmCfg.ok === true) {
+      // Review M1: una falla del loop de IA nunca tumba al de proveedores (se registra y el proceso sigue).
+      llmLoop = runLlmWorkerLoop({ app, logger: new Logger('DynamicLlmWorker'), drain, active: llmActive, cfg: llmCfg, hosted: true })
+        .catch((err) => logger.error(`worker de IA hospedado se detuvo: ${err instanceof Error ? err.message : String(err)} (el loop de proveedores sigue)`));
+    }
     else logger.error(`worker de IA hospedado NO arranca: ${llmCfg.reason}`);
   }
   // Serial (concurrency 1), como antes.
@@ -349,7 +356,7 @@ async function bootstrap() {
     describe: (item) => `item ${item.itemKey}`,
   });
   await Promise.all([providerLoop, llmLoop]);
-  await awaitDrain(active, drainTimeoutMs());
+  await awaitDrain(unionOfActive(active, llmActive), drainTimeoutMs());
 }
 
 if (require.main === module) {
