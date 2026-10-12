@@ -804,7 +804,7 @@ async function _dynRunContentV2(item) {
   var v1Prompt = dynLibroChapterPrompt(courseContext, bp.outline, bp.chapter, bp.module, item.chapterNumber, item.moduleNumber);
   var prompt = dynContentV2Prompt(v1Prompt, built.contextPackage, dynPedagogyBlock(item));
   var meta = {};
-  var raw = await _dynLlmCall(sys, prompt, DYN_CONTENT_MAX_TOKENS, 3, undefined, meta, _dynAttr(item, 'main'), _dynCacheOpts(prompt));
+  var raw = await _dynLlmCall(sys, prompt, DYN_CONTENT_MAX_TOKENS, 3, undefined, meta, _dynAttr(item, 'main'));
   if (!raw || !raw.trim()) {
     return { ok: false, error: 'contenido vacío tras generación', retryable: true };
   }
@@ -833,7 +833,7 @@ async function _dynRunContentV2(item) {
   if (hardTruth(truthHits).length) {
     console.warn('[dynExecutor:content] ' + item.itemKey + ': ' + truthHits.length + ' oraciones con datos no verificables/voseo — reintento dirigido');
     var metaT = {};
-    var rawT = await _dynLlmCall(sys, prompt + dynContentTruthRetrySuffix(truthHits), DYN_CONTENT_MAX_TOKENS, 3, undefined, metaT, _dynAttr(item, 'validation_retry'), _dynCacheOpts(prompt));
+    var rawT = await _dynLlmCall(sys, prompt + dynContentTruthRetrySuffix(truthHits), DYN_CONTENT_MAX_TOKENS, 3, undefined, metaT, _dynAttr(item, 'validation_retry'));
     if (metaT.stopReason === 'max_tokens') {
       return { ok: false, error: 'CONTENT_TRUNCATED_MAX_TOKENS (reintento de veracidad): el capítulo superó el tope de salida.', retryable: false };
     }
@@ -1278,11 +1278,16 @@ function _dynV3Llm(item, role, sys, prompt, maxTok, metaOut, cacheOpts) {
 }
 
 // Loop 6 (O5): el prompt original de una parte se marca cacheable (sin reordenar ni cambiar texto). Su reintento
-// dirigido es ese mismo prompt + los errores (dynV3RetryPrompt / dynContentTruthRetrySuffix), y un nuevo intento de
-// la parte repite el prompt: ambos leen el prefijo del caché (5 min) al 10 % del precio de entrada.
+// dirigido es ese mismo prompt + los errores (dynV3RetryPrompt), y un nuevo intento de la parte repite el prompt:
+// ambos leen el prefijo del caché (5 min) al 10 % del precio de entrada. Escribir el caché cuesta 1,25× la entrada
+// en CADA llamada principal: solo conviene si los reintentos son frecuentes (punto de equilibrio ≈ 28 %). Tipos
+// habilitados = los que en #1209 hicieron ≥ 1,8 llamadas por parte (experiencia ~2,1; video ~4,8; Actividad de
+// Aplicación; actividad H5P ~1,8). El Libro Guía NO: su segunda llamada frecuente es el reintento del sidecar, con
+// otro prefijo (no leería el caché); intros y plan: llamadas cortas.
 var DYN_PROMPT_CACHE_ENABLED = true;
-function _dynCacheOpts(prompt) {
-  return DYN_PROMPT_CACHE_ENABLED && typeof prompt === 'string' && prompt ? { cachePrefix: prompt } : undefined;
+var DYN_PROMPT_CACHE_TYPES = { experience: true, video_interactions: true, application_activity: true, activity: true };
+function _dynCacheOpts(prompt, itemType) {
+  return DYN_PROMPT_CACHE_ENABLED && DYN_PROMPT_CACHE_TYPES[itemType] === true && typeof prompt === 'string' && prompt ? { cachePrefix: prompt } : undefined;
 }
 
 // ════ Espejos de los lints R2 (RESOURCE_MENTION / QUANTITY_CLAIM) ════
@@ -3555,12 +3560,12 @@ async function _dynV3JsonWithRetry(item, sys, prompt, maxTok, build, opts) {
     return r;
   }
   var meta = {};
-  var first = evaluate(await _dynV3Llm(item, 'main', sys, prompt, maxTok, meta, _dynCacheOpts(prompt)), meta, 1);
+  var first = evaluate(await _dynV3Llm(item, 'main', sys, prompt, maxTok, meta, _dynCacheOpts(prompt, item && item.type)), meta, 1);
   if (first.ok && !first.soft.length) return { ok: true, value: first.value, retried: false, firstErrors: [], softWarnings: [], usedAttempt: 1, moneyNormalized: moneyBy[1] || 0 };
   var firstErrors = first.ok ? first.soft : first.errors;
   console.warn('[dynExecutor:' + item.type + '] ' + item.itemKey + (first.ok ? ' con advertencias blandas' : ' inválido') + ', reintento dirigido: ' + firstErrors.slice(0, 5).join('; '));
   var meta2 = {};
-  var second = evaluate(await _dynV3Llm(item, 'validation_retry', sys, dynV3RetryPrompt(prompt, firstErrors), maxTok, meta2, _dynCacheOpts(prompt)), meta2, 2);
+  var second = evaluate(await _dynV3Llm(item, 'validation_retry', sys, dynV3RetryPrompt(prompt, firstErrors), maxTok, meta2, _dynCacheOpts(prompt, item && item.type)), meta2, 2);
   if (second.ok) return { ok: true, value: second.value, retried: true, firstErrors: firstErrors, softWarnings: second.soft, usedAttempt: 2, moneyNormalized: moneyBy[2] || 0 };
   if (first.ok) {
     console.warn('[dynExecutor:' + item.type + '] ' + item.itemKey + ' reintento inválido: se conserva la primera respuesta válida');

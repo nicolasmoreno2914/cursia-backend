@@ -220,11 +220,13 @@ async function pureChecks() {
     const REAL = 12.3;
     const RECORDED = 15.12;
     assert(exp >= REAL && exp <= REAL * 1.4, `expected ${exp} vs real ${REAL}: ${(((exp - REAL) / REAL) * 100).toFixed(1)} % (debe estar en [0, +40 %])`);
+    const anthr = n(e.totals.byProvider.anthropic.expected);
+    assert(anthr >= 5.84 && anthr <= 5.84 * 1.5, `anthropic del 2×2 ${anthr} vs 5.84 medido (lado seguro, ≤ +50 %)`);
     assert(Math.abs(exp - RECORDED) / RECORDED <= 0.2, `expected ${exp} vs registrado ${RECORDED}`);
     const by = (t) => n(e.totals.byItemType[t].expected);
     // Por tipo: nunca por debajo de lo medido en #542 (un estimado bajo frena partes por presupuesto antes de tiempo).
     for (const [t, actual] of [['exam', 1.772], ['final_exam', 2.029], ['experience', 0.64], ['content', 0.4]]) {
-      assert(by(t) >= actual * 0.95, `${t}: estimado ${by(t)} no puede quedar bajo lo medido ${actual}`);
+      assert(by(t) >= actual * 0.95 && by(t) <= actual * 1.7, `${t}: estimado ${by(t)} vs medido ${actual} (lado seguro, ≤ +70 % por prompts más largos)`);
     }
     // El banco se estima con los 4 medidores de Sonnet 4.6 (entrada sin caché, salida, escritura y lectura de caché).
     for (const op of ['llm.exam', 'llm.final_exam']) eq(Object.keys(usageModelPriorsV1().operations[op].meters).sort(), ['cache_read_tokens', 'cache_write_tokens', 'input_tokens', 'output_tokens'], op + ': medidores');

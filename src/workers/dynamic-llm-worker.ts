@@ -285,6 +285,9 @@ async function bootstrap() {
   const active = new Set<Promise<void>>();
   installDrainHandlers({ name: 'dynamic-llm-worker', logger, drain, active, close: () => app.close() });
   logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2)})`);
+  // Loop 6: el ejecutor fija el modelo de la generación dinámica (DYN_GENERATION_MODEL); DYNAMIC_LLM_WORKER_MODEL solo
+  // aplica a una llamada que no traiga modelo. Si apunta a otro, se avisa (configuración sin efecto).
+  if (process.env.DYNAMIC_LLM_WORKER_MODEL && process.env.DYNAMIC_LLM_WORKER_MODEL !== 'claude-sonnet-4-6') logger.warn(`DYNAMIC_LLM_WORKER_MODEL=${process.env.DYNAMIC_LLM_WORKER_MODEL} no tiene efecto: la generación dinámica usa el modelo fijo del ejecutor (claude-sonnet-4-6)`);
   await runClaimLoop<ClaimedItem>({
     name: 'dynamic-llm-worker',
     logger,
