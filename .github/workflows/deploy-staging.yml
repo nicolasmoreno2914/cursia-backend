@@ -539,6 +539,12 @@ jobs:
                ensure_env_exact DB_POOL_MAX 2
                ensure_env_exact DB_POOL_MAX_WORKER 1
                ensure_env_exact DB_POOL_IDLE_MS_WORKER 1000
+               # Loop 6: worker de IA de las partes largas, HOSPEDADO en cursia-dynamic-provider-worker-staging (sin un
+               # proceso ni una conexión más: 12 + 3 = 15). Solo toma runs creados desde DYNAMIC_LLM_WORKER_SINCE (se fija en
+               # el primer deploy que lo trae; un valor puesto a mano gana): ningún run anterior (#1209 incluido) cambia.
+               # Apagado de emergencia: cambiar este true por false y desplegar (el navegador vuelve a todas las partes).
+               ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED true
+               ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
@@ -696,6 +702,9 @@ jobs:
                # (cupo del pooler + DYNAMIC_LLM_WORKER_ENABLED en API y worker), con aprobación del usuario.
                sudo pm2 save
                sudo pm2 status
+               echo "━━━ Loop 6: arranque del worker de IA hospedado (líneas del log, sin secretos) ━━━"
+               sleep 8
+               sudo pm2 logs cursia-dynamic-provider-worker-staging --lines 80 --nostream 2>/dev/null | grep -E "dynamic-llm-worker iniciado|worker de IA hospedado|DynamicLlmWorker" | tail -5 || true
 
                echo "━━━ [6b] Fase 5A: preflight (solo lectura, staging) ━━━"
                MIGRATION_ENV=staging node scripts/preflight-dynamic-generation.js
