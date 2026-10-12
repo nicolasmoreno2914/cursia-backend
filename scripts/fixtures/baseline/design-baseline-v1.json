@@ -29,9 +29,9 @@
         "manifest": "7c0fdbbbb9168229364ade2cbb651b272cf0cf534a13293b8508788aad7c2cf3",
         "manifestErrors": 0,
         "usd": {
-          "expected": "29.78",
+          "expected": "34.15",
           "byProvider": {
-            "anthropic": "11.20",
+            "anthropic": "15.56",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -47,9 +47,9 @@
         "manifest": "94a7215e66bf606fc19b70e220d4dc7fcd8739e7ec0f07576ed99e281bc63bad",
         "manifestErrors": 0,
         "usd": {
-          "expected": "23.12",
+          "expected": "26.27",
           "byProvider": {
-            "anthropic": "11.02",
+            "anthropic": "14.17",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "3.24",
@@ -65,9 +65,9 @@
         "manifest": "b51ab687b729dcae475ad50cbb3bc5a514ad3c2287f23ba5996a8a1059e8a39e",
         "manifestErrors": 0,
         "usd": {
-          "expected": "29.78",
+          "expected": "34.15",
           "byProvider": {
-            "anthropic": "11.20",
+            "anthropic": "15.56",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -83,9 +83,9 @@
         "manifest": "25382fa7166e6e3b9af556901ba25dd072133039c3864a5b488b0707079d034a",
         "manifestErrors": 0,
         "usd": {
-          "expected": "29.78",
+          "expected": "34.15",
           "byProvider": {
-            "anthropic": "11.20",
+            "anthropic": "15.56",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -101,9 +101,9 @@
         "manifest": "80667ff3e60f439d9a3f213aadac16a8839d01998649ddb0634b12a94d668be3",
         "manifestErrors": 0,
         "usd": {
-          "expected": "29.78",
+          "expected": "34.15",
           "byProvider": {
-            "anthropic": "11.20",
+            "anthropic": "15.56",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -119,9 +119,9 @@
         "manifest": "e2b4ead781f88f434a69aae00de8177a90e424a93ee92d5ea8d4de64598e19a2",
         "manifestErrors": 0,
         "usd": {
-          "expected": "29.78",
+          "expected": "34.15",
           "byProvider": {
-            "anthropic": "11.20",
+            "anthropic": "15.56",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -137,9 +137,9 @@
         "manifest": "74f785dc6732464848c50047b58bc966a28395f5db2ffc00090ba6299f78ede9",
         "manifestErrors": 0,
         "usd": {
-          "expected": "23.12",
+          "expected": "26.27",
           "byProvider": {
-            "anthropic": "11.02",
+            "anthropic": "14.17",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "3.24",
@@ -155,9 +155,9 @@
         "manifest": "25382fa7166e6e3b9af556901ba25dd072133039c3864a5b488b0707079d034a",
         "manifestErrors": 0,
         "usd": {
-          "expected": "29.78",
+          "expected": "34.15",
           "byProvider": {
-            "anthropic": "11.20",
+            "anthropic": "15.56",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -210,9 +210,9 @@
         },
         "generableHours": 19.1,
         "usd": {
-          "expected": "31.59",
+          "expected": "37.85",
           "byProvider": {
-            "anthropic": "13.00",
+            "anthropic": "19.26",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -264,9 +264,9 @@
         },
         "generableHours": 31.7,
         "usd": {
-          "expected": "33.25",
+          "expected": "40.89",
           "byProvider": {
-            "anthropic": "14.66",
+            "anthropic": "22.30",
             "gamma": "6.21",
             "openai": "2.65",
             "videogen": "9.73",
@@ -318,9 +318,9 @@
         },
         "generableHours": 48.5,
         "usd": {
-          "expected": "48.23",
+          "expected": "59.78",
           "byProvider": {
-            "anthropic": "21.39",
+            "anthropic": "32.95",
             "gamma": "8.97",
             "openai": "3.82",
             "videogen": "14.05",
@@ -372,9 +372,9 @@
         },
         "generableHours": 52.3,
         "usd": {
-          "expected": "54.70",
+          "expected": "67.50",
           "byProvider": {
-            "anthropic": "23.73",
+            "anthropic": "36.53",
             "gamma": "10.35",
             "openai": "4.40",
             "videogen": "16.21",
@@ -426,9 +426,9 @@
         },
         "generableHours": 35.8,
         "usd": {
-          "expected": "51.13",
+          "expected": "60.15",
           "byProvider": {
-            "anthropic": "20.17",
+            "anthropic": "29.19",
             "gamma": "10.35",
             "openai": "4.40",
             "videogen": "16.21",
@@ -479,9 +479,9 @@
         },
         "generableHours": 23.8,
         "usd": {
-          "expected": "49.40",
+          "expected": "56.56",
           "byProvider": {
-            "anthropic": "18.43",
+            "anthropic": "25.59",
             "gamma": "10.35",
             "openai": "4.40",
             "videogen": "16.21",
