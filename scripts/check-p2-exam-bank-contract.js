@@ -713,6 +713,19 @@ async function main() {
     eq([updates.length, updates[0].params[2], JSON.parse(updates[0].params[1]).artifactId, JSON.parse(updates[0].params[1]).generation, JSON.parse(updates[0].params[1]).attempt], [1, 'applicationDraft', good, 1, 1], 'output_summary.applicationDraft');
   });
 
+  await check('O2b fix 4a: buildClaimV3 — application_activity anuncia application.draftArtifactType; exam/final_exam solo su examBank.draftArtifactType', async () => {
+    const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
+    const build = (row, mItem, manifest) => SchedulerService.prototype.buildClaimV3.call({}, { async query() { throw new Error('no debe consultar'); } }, row, mItem, manifest, { course: { applicationContext: null } });
+    const manifest = { rulesVersion: 3, features: {}, modules: [{ moduleId: M1, chapters: [{ chapterId: ch(1), kind: 'content' }, { chapterId: ch(2), kind: 'content' }, { chapterId: ch(3), kind: 'content' }] }, { moduleId: M2, chapters: [{ chapterId: ch(4) }, { chapterId: ch(5) }] }] };
+    const app = await build({ type: 'application_activity', item_key: 'application_activity:' + ch(1), chapter_id: ch(1), module_id: M1 }, { applicationMinutes: 60 }, manifest);
+    eq([app.validatedArtifactType, app.application.minutes, app.application.draftArtifactType], ['dynamic_application_json', 60, 'dynamic_application_draft_json'], 'claim application_activity');
+    eq('examBank' in app, false, 'sin bloque del banco');
+    const ex = await build({ type: 'exam', item_key: 'exam:' + M1, chapter_id: null, module_id: M1 }, { moduleId: M1 }, manifest);
+    eq([ex.examBank.draftArtifactType, 'application' in ex], ['dynamic_exam_bank_draft_json', false], 'claim exam');
+    const fe = await build({ type: 'final_exam', item_key: 'final_exam:1', chapter_id: null, module_id: null }, {}, manifest);
+    eq([fe.examBank.draftArtifactType, 'application' in fe], ['dynamic_exam_bank_draft_json', false], 'claim final_exam');
+  });
+
   await check('O2b (worker de IA): el runtime con el ejecutor vendorizado devuelve el borrador de la actividad cuando falla el solucionario, reanuda llamando SOLO la 2.ª pasada y draftFailField elige el campo por tipo', async () => {
     const { createExecutorRuntime } = loadDist('workers/llm-executor/executor-runtime.js');
     const C1 = 'a1b2c3d4-0000-4000-8000-000000000001';

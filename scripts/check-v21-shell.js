@@ -1393,11 +1393,26 @@ async function dbChecks() {
       await run();
       eq(await failWith('application_activity inválido: x', true, { examBankDraftArtifactId: null }), { ok: true }, 'null del banco');
       eq((await st()).output_summary.applicationDraft.artifactId, good2, 'el null del banco no borra el de la actividad');
-      // Rechazo del validador del servidor al completar → falla validada: borra (completeItemDetailed → prevalidateV3).
-      // Se emula la ruta interna con el mismo opts que usa completeItemDetailed.
+      // Rechazo del validador del servidor al completar → falla validada: borra (completeItemDetailed → prevalidateV3 real).
+      // El Manifest congelado necesita la entrada del item (minutos); se agrega y se restaura al final (la base es
+      // desechable: el trigger de inmutabilidad se apaga SOLO para esa edición y se vuelve a encender).
       await run();
-      eq(await failWith('v3_payload_invalid: application_activity', true, { examBankDraftArtifactId: null, applicationDraftArtifactId: null }), { ok: true }, 'rechazo del servidor');
-      eq('applicationDraft' in (await st()).output_summary, false, 'borrado por el rechazo');
+      const good2b = await art(appId);
+      eq(await failWith('application_activity inválido: x', true, { applicationDraftArtifactId: good2b }), { ok: true }, 'fail con borrador (antes del rechazo)');
+      const [{ manifest_json: savedManifest }] = await ds.query(`select m.manifest_json from public.course_generation_manifests m where m.id = $1`, [src.manifest_id]);
+      const editManifest = async (sql, params) => {
+        await ds.query(`alter table public.course_generation_manifests disable trigger user`);
+        try { await ds.query(sql, params); } finally { await ds.query(`alter table public.course_generation_manifests enable trigger user`); }
+      };
+      await editManifest(`update public.course_generation_manifests set manifest_json = jsonb_set(manifest_json, '{items}', (manifest_json->'items') || $2::jsonb) where id = $1`,
+        [src.manifest_id, JSON.stringify([{ key: appKey, type: 'application_activity', scope: 'chapter', moduleId: M1, chapterId: C1, dependsOn: [`content:${C1}`], applicationMinutes: 60 }])]);
+      await run();
+      const badDoc = { schemaVersion: 1, chapterId: C1, minutes: 60, activity: { genre: 'calculation' }, solution: {} };
+      const rej = await sched.completeItemDetailed(appId, 'b1', { artifactIds: [await upload('dynamic_application_json', badDoc)], summary: {} }, OWNER);
+      eq([rej.ok, rej.reason], [false, 'v3_payload_invalid'], 'rechazo del validador del servidor (prevalidateV3)');
+      const afterRej = await st();
+      eq([afterRej.status, 'applicationDraft' in afterRej.output_summary], ['retrying', false], 'borrado por el rechazo del servidor');
+      await editManifest(`update public.course_generation_manifests set manifest_json = $2::jsonb where id = $1`, [src.manifest_id, JSON.stringify(savedManifest)]);
       // No retryable: nunca registra.
       await run();
       eq(await failWith('application_activity: OUTPUT_TRUNCATED_MAX_TOKENS', false, { applicationDraftArtifactId: await art(appId) }), { ok: true }, 'fail no retryable');

@@ -4014,10 +4014,11 @@ function dynDraftFailField(item) {
 // → { activity: obj | null, check: resultado del validador | null, resumes, artifactId, reason }.
 async function _dynAppLoadDraft(item, expect) {
   var ref = item && _dynIsPlainObject(item.outputSummary) ? item.outputSummary.applicationDraft : null;
-  var out = { activity: null, check: null, resumes: 0, artifactId: null, reason: null };
+  var out = { activity: null, check: null, resumes: 0, artifactId: null, reason: null, attempt: null };
   if (!dynApplicationDraftSupported(item)) return out;
   if (!_dynIsPlainObject(ref) || typeof ref.artifactId !== 'string' || !ref.artifactId) return out;
   out.artifactId = ref.artifactId;
+  out.attempt = typeof ref.attempt === 'number' ? ref.attempt : null;
   if (ref.generation !== item.generation) { out.reason = 'generation'; return out; }
   var dl = null;
   try { dl = await _dynDownloadArtifactText(ref.artifactId); } catch (e) { dl = null; }
@@ -4030,9 +4031,16 @@ async function _dynAppLoadDraft(item, expect) {
   if (doc.promptVersion !== expect.promptVersion) { out.reason = 'promptVersion'; return out; }
   if (doc.sourceSha256 !== expect.sourceSha256) { out.reason = 'sourceMd'; return out; }
   if (typeof doc.resumes !== 'number' || !(doc.resumes >= 0) || doc.resumes >= DYN_APPLICATION_DRAFT_MAX_RESUMES) { out.reason = 'resumes'; return out; }
+  // Fix round 1 (3): las mismas correcciones deterministas y la misma veracidad/idioma que la 1.ª pasada
+  // (_dynV3JsonWithRetry): dinero (Colombia), Language QA y, tras validar, hallazgos DUROS → corrida completa.
+  var cc = item.context && item.context.courseContext;
+  if (dynCourseIsColombia(cc)) dynNormalizeMoneyDeep(doc.activity);
+  _dynLqaFixDeep(doc.activity, cc);
   var v = null;
   try { v = dynValidateApplicationStudentPart(doc.activity, expect.minutes); } catch (e) { v = null; }
   if (!v || v.errors.length) { out.reason = 'invalid'; return out; }
+  var hardTruth = _dynJsonTruthHits(doc.activity, cc).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; });
+  if (hardTruth.length) { out.reason = 'truth'; return out; }
   out.activity = doc.activity;
   out.check = v;
   out.resumes = doc.resumes;
@@ -4055,7 +4063,17 @@ async function _dynRunApplicationActivity(item) {
   var draft = await _dynAppLoadDraft(item, draftExpect);
   var resumed = !!draft.activity;
   // Falla validada: pide borrar el borrador anterior (null explícito; solo se manda si el claim lo anuncia).
-  function failClear(res) { res.draftClear = true; return res; }
+  // Fix round 1 (2): si el borrador se ignoró por una descarga fallida (transitoria) puede ser bueno: no se borra.
+  function failClear(res) { if (draft.reason !== 'download') res.draftClear = true; return res; }
+  function draftArtifact() {
+    var draftDoc = {
+      draftVersion: 1, itemKey: item.itemKey, generation: item.generation == null ? null : item.generation, chapterId: item.chapterId,
+      minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION,
+      // `resumes` nunca se incrementa: un intento reanudado nunca escribe un borrador nuevo (si falla, lo borra).
+      sourceSha256: draftExpect.sourceSha256, resumes: draft.resumes, activity: activity
+    };
+    return _dynV3JsonArtifact(item, DYN_APPLICATION_DRAFT_ARTIFACT_TYPE, draftDoc, item.chapterId + '_draft').artifact;
+  }
   var r1 = null;
   var activity, v1;
   if (resumed) {
@@ -4073,21 +4091,25 @@ async function _dynRunApplicationActivity(item) {
     v1 = dynValidateApplicationStudentPart(activity, app.minutes);
   }
   // 2.ª pasada: solucionario docente de ESA actividad (ids y criterios fijos).
-  var r2 = await _dynV3JsonWithRetry(item, sys, dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd), 9000, function (obj) {
-    var errs = dynValidateApplicationSolutionPart(obj, v1.exerciseIds, v1.criteriaNames);
-    if (errs.length) return { ok: false, errors: _dynFormatErrors(errs) };
-    return { ok: true, value: obj };
-  }, { normalizeMoney: dynCourseIsColombia(courseContext) });
+  var r2;
+  try {
+    r2 = await _dynV3JsonWithRetry(item, sys, dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd), 9000, function (obj) {
+      var errs = dynValidateApplicationSolutionPart(obj, v1.exerciseIds, v1.criteriaNames);
+      if (errs.length) return { ok: false, errors: _dynFormatErrors(errs) };
+      return { ok: true, value: obj };
+    }, { normalizeMoney: dynCourseIsColombia(courseContext) });
+  } catch (e2) {
+    // Fix round 1 (1): la 2.ª pasada LANZÓ (429/529/red/inactividad) tras una 1.ª pasada nueva y validada: el
+    // borrador viaja en el error y processItem lo sube si el error es reintentable (mismas reglas de anuncio).
+    // Nunca tras reanudar.
+    if (!resumed && e2 && typeof e2 === 'object') { try { e2.__dynDraft = draftArtifact(); } catch (eD) { /* sin borrador */ } }
+    throw e2;
+  }
   if (!r2.ok) {
     var f2 = _dynV3Invalid(item, r2.errors, r2.truncated);
     // Reanudado y vuelve a fallar, o falla no reintentable → el próximo intento regenera las dos pasadas.
     if (resumed || f2.retryable === false) return failClear(f2);
-    var draftDoc = {
-      draftVersion: 1, itemKey: item.itemKey, generation: item.generation == null ? null : item.generation, chapterId: item.chapterId,
-      minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION,
-      sourceSha256: draftExpect.sourceSha256, resumes: draft.resumes, activity: activity
-    };
-    f2.draft = _dynV3JsonArtifact(item, DYN_APPLICATION_DRAFT_ARTIFACT_TYPE, draftDoc, item.chapterId + '_draft').artifact;
+    f2.draft = draftArtifact();
     return f2;
   }
   // chapterId, minutos y schemaVersion los pone Cursia (nunca el LLM).
@@ -4103,7 +4125,7 @@ async function _dynRunApplicationActivity(item) {
       exerciseCount: activity.exercises.length, exampleCount: activity.examples.length, criteriaCount: activity.criteria.length,
       applicationSha256: a.sha, retried: !!((r1 && r1.retried) || r2.retried), promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION, contentArtifactId: src.contentArtifactId,
       resumedFromDraft: resumed
-    }, draft.artifactId ? { draft: { artifactId: draft.artifactId, used: resumed, ignored: draft.reason || null } } : {},
+    }, resumed ? { draftResumedFromAttempt: draft.attempt } : {}, draft.artifactId ? { draft: { artifactId: draft.artifactId, used: resumed, ignored: draft.reason || null } } : {},
     src.practice ? { chapterKind: 'practice', practiceSourceChapterIds: src.sourceChapterIds } : {}, dynPedagogySummary(item))
   };
 }
@@ -7126,8 +7148,23 @@ function dynExecutorStart(opts) {
       clearInterval(hbTimer);
       if (abandoned) { state.abandoned++; emit(); return; }
       var mapped = _dynMapApiError(e);
+      // O2b fix round 1 (1): la actividad ya validada viaja en el error (e.__dynDraft) si la 2.ª pasada lanzó; se sube
+      // solo si el error es reintentable, el run no está pausado y el claim anuncia el borrador (400 → sin el campo).
+      var thrownExtra = null;
+      var thrownField = dynDraftFailField(item);
+      if (e && e.__dynDraft && thrownField && mapped.retryable && !mapped.runPaused && !(abandoned || fatallyPaused())) {
+        try {
+          var upThrown = await uploadClaimedArtifact(item, e.__dynDraft);
+          if (upThrown.ok && upThrown.artifactId) { thrownExtra = {}; thrownExtra[thrownField] = upThrown.artifactId; }
+        } catch (eUp) { /* sin borrador */ }
+      }
       try {
-        await backendDynFail(item.itemRunId, executorId, mapped.msg, mapped.retryable);
+        var thrownRes = thrownExtra
+          ? await backendDynFail(item.itemRunId, executorId, mapped.msg, mapped.retryable, thrownExtra)
+          : await backendDynFail(item.itemRunId, executorId, mapped.msg, mapped.retryable);
+        if (thrownExtra && thrownRes && thrownRes.ok === false && thrownRes._httpStatus === 400) {
+          await backendDynFail(item.itemRunId, executorId, mapped.msg, mapped.retryable);
+        }
       } catch (e2) { /* best-effort: the lease will expire and the item becomes reclaimable anyway */ }
       if (mapped.runPaused) {
         // No es un fallo de la parte: el run se pausó (el servidor decide). Las demás lanes se detienen al volver a reclamar.
