@@ -89,6 +89,9 @@ export const LLM_WORKER_PRESENCE_BEAT_MS = 15_000;
 const PRESENCE_CACHE_MS = 5_000;
 let presenceCache: { at: number; types: Set<string> } | null = null;
 let coverageCache: { at: number; coverage: LlmWorkerCoverage[] } | null = null;
+let strictCoverageCache: { at: number; coverage: LlmWorkerCoverage[] } | null = null;
+/** Loop 9 (fix M2): para AFIRMAR que el servidor genera todo, solo cuentan latidos de los últimos 2 intervalos (30 s). */
+export const LLM_WORKER_PRESENCE_STRICT_SECONDS = Math.round((2 * LLM_WORKER_PRESENCE_BEAT_MS) / 1000);
 
 /** Lo que cubre un worker de IA vivo: sus tipos y SU instante de activación (runs creados desde entonces). */
 export interface LlmWorkerCoverage { types: Set<string>; since: Date }
@@ -119,6 +122,7 @@ export async function liveLlmWorkerTypes(ds: DataSource, now = Date.now()): Prom
 export function resetLlmWorkerPresenceCacheForTests(): void {
   presenceCache = null;
   coverageCache = null;
+  strictCoverageCache = null;
 }
 
 /**
@@ -126,14 +130,16 @@ export function resetLlmWorkerPresenceCacheForTests(): void {
  * El API decide con eso (nunca con su propio env): si el API y el worker tuvieran instantes distintos, un run quedaría
  * sin dueño. Un worker sin instante publicado (versión anterior) no cubre nada. Cualquier error → sin cobertura.
  */
-export async function liveLlmWorkerCoverage(ds: DataSource, now = Date.now()): Promise<LlmWorkerCoverage[]> {
-  if (coverageCache && now - coverageCache.at < PRESENCE_CACHE_MS) return coverageCache.coverage;
+export async function liveLlmWorkerCoverage(ds: DataSource, now = Date.now(), freshSeconds = LLM_WORKER_PRESENCE_FRESH_SECONDS): Promise<LlmWorkerCoverage[]> {
+  const strict = freshSeconds !== LLM_WORKER_PRESENCE_FRESH_SECONDS;
+  const cache = strict ? strictCoverageCache : coverageCache;
+  if (cache && now - cache.at < PRESENCE_CACHE_MS) return cache.coverage;
   let coverage: LlmWorkerCoverage[] = [];
   try {
     const rows: Array<{ item_types: string[]; since: Date | string | null }> = await ds.query(
       `select item_types, since from public.llm_worker_presence
         where since is not null and last_seen > now() - make_interval(secs => $1)`,
-      [LLM_WORKER_PRESENCE_FRESH_SECONDS],
+      [freshSeconds],
     );
     coverage = rows
       .map((r) => ({ types: new Set((r.item_types || []).map(String)), since: r.since instanceof Date ? r.since : new Date(String(r.since)) }))
@@ -141,7 +147,7 @@ export async function liveLlmWorkerCoverage(ds: DataSource, now = Date.now()): P
   } catch {
     coverage = [];
   }
-  coverageCache = { at: now, coverage };
+  if (strict) strictCoverageCache = { at: now, coverage }; else coverageCache = { at: now, coverage };
   return coverage;
 }
 

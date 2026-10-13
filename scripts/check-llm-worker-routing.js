@@ -119,6 +119,18 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     assert(R.runServerExecuted(v3, R.routedTypesForRun(cov, '2026-10-12T01:00:00Z'), ON) === true, 'run nuevo ⇒ true');
     assert(R.runServerExecuted(v3, R.routedTypesForRun(cov, '2026-10-11T01:00:00Z'), ON) === false, 'run anterior a la activación ⇒ false');
   });
+  await check('Loop 9 (fix M2): la cobertura ESTRICTA (para serverExecuted) solo cuenta latidos de los últimos 2 intervalos y no comparte cache con la del ruteo', async () => {
+    R.resetLlmWorkerPresenceCacheForTests();
+    const params = [];
+    const ds = { query: async (q, p) => { params.push(p[0]); return [{ item_types: ['content'], since: new Date('2026-10-12T00:00:00Z') }]; } };
+    const t0 = Date.now();
+    await R.liveLlmWorkerCoverage(ds, t0);
+    await R.liveLlmWorkerCoverage(ds, t0 + 100, R.LLM_WORKER_PRESENCE_STRICT_SECONDS);
+    await R.liveLlmWorkerCoverage(ds, t0 + 200, R.LLM_WORKER_PRESENCE_STRICT_SECONDS);
+    eqSet(new Set(params), [60, 30], 'umbrales 60 s (ruteo) y 30 s (afirmar «puedes cerrar la pestaña»)');
+    assert(params.length === 2, 'cada una con su cache');
+    assert(R.LLM_WORKER_PRESENCE_STRICT_SECONDS === 2 * R.LLM_WORKER_PRESENCE_BEAT_MS / 1000, '2 latidos');
+  });
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures ? 1 : 0);
 })();

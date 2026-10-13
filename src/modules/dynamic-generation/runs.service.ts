@@ -15,7 +15,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { executionLeaseView, ExecutionLeaseView, normalizeRequestingExecutorId } from '../reliability/execution-lease';
-import { liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun, runServerExecuted } from './llm-worker-routing';
+import { LLM_WORKER_PRESENCE_STRICT_SECONDS, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun, runServerExecuted } from './llm-worker-routing';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -339,6 +339,11 @@ export interface RunDto {
    * activación, los mismos helpers del ruteo): la pestaña se puede cerrar. false si el worker no está o no las cubre.
    */
   serverExecuted: boolean;
+  /**
+   * Loop 9 (fix M1): Manifest guardado ANTES de que el examen final dependiera de los exámenes de módulo. Si el final lo
+   * genera el worker de IA (sin la memoria del navegador) no conoce sus preguntas y puede repetir alguna.
+   */
+  legacyFinalExamDeps: boolean;
 }
 
 /** REL lease: quién consulta el run (solo para `executionLease.heldByYou`). */
@@ -5210,14 +5215,16 @@ export class RunsService {
       paused: isPausedRun(job),
       pauseInfo: isPausedRun(job) ? pauseInfoOf(job) : null,
       serverExecuted: await this.serverExecutedOf(job, manifest),
+      legacyFinalExamDeps: manifestHasLegacyFinalExamDeps(manifest.manifest.items),
     };
   }
 
   /** Loop 9: ¿el servidor genera todas las partes de IA del run? (cobertura viva, cache 5 s; cualquier error → false). */
   private async serverExecutedOf(job: any, manifest: ManifestDto): Promise<boolean> {
-    if (!llmWorkerEnabled()) return false;
+    // Fix M5: el worker de IA solo genera runs v3. Fix M2: solo con latidos recientes (2 intervalos), nunca uno a punto de vencer.
+    if (!llmWorkerEnabled() || manifest.rulesVersion !== 3) return false;
     try {
-      const routed = routedTypesForRun(await liveLlmWorkerCoverage(this.dataSource), job.created_at);
+      const routed = routedTypesForRun(await liveLlmWorkerCoverage(this.dataSource, Date.now(), LLM_WORKER_PRESENCE_STRICT_SECONDS), job.created_at);
       return runServerExecuted(manifest.manifest.items.map((it) => String(it.type)), routed);
     } catch {
       return false;
@@ -5343,6 +5350,13 @@ export class RunsService {
       finishedAt: toIso(r.finished_at),
     };
   }
+}
+
+/** Loop 9 (fix M1): ¿el final del Manifest depende solo de los content aunque haya exámenes de módulo? (Manifest anterior). */
+export function manifestHasLegacyFinalExamDeps(items: ReadonlyArray<{ type: string; dependsOn?: readonly string[] }>): boolean {
+  const fin = items.find((i) => i.type === 'final_exam');
+  if (!fin || !items.some((i) => i.type === 'exam')) return false;
+  return !(fin.dependsOn ?? []).some((d) => String(d).startsWith('exam:'));
 }
 
 /** Loop Cost Efficiency: datos de la pausa vigente (output_summary.pause) para el panel. */

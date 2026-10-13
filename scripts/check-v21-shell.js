@@ -1551,6 +1551,15 @@ async function dbChecks() {
       const art2 = await upload('dynamic_module_intro_json', miDoc);
       eq(await sched.completeItemDetailed(a.itemRunId, 'b1', { artifactIds: [art2], summary: {} }, OWNER), { ok: true }, 'completo');
     });
+
+    await check('DB Loop 9 (fix M5): el claim del worker interno con onlyRulesVersion solo toma items de Manifests de ese rulesVersion', async () => {
+      // Un module_intro (solo depende del plan, completo) vuelve a la cola para la prueba.
+      const [mi] = await ds.query(`select id from public.generation_item_runs where job_id = $1 and type = 'module_intro' order by item_key limit 1`, [job.id]);
+      await ds.query(`update public.generation_item_runs set status = 'pending', worker_id = null, lease_until = null, next_retry_at = null, attempt_count = 0, max_attempts = 10 where id = $1`, [mi.id]);
+      eq(await sched.claimNextItem({ executorId: 'w-v2', types: ['module_intro'], leaseSeconds: 60, onlyRulesVersion: 2 }), null, 'worker restringido a v2: no toma el item v3');
+      const w = await sched.claimNextItem({ executorId: 'w-v3', types: ['module_intro'], leaseSeconds: 60, onlyRulesVersion: 3 });
+      assert(w && w.type === 'module_intro' && w.rulesVersion === 3, 'worker v3: lo toma');
+    });
   } finally {
     if (ds && ds.isInitialized) await ds.destroy().catch(() => {});
     for (const [k, v] of Object.entries({ DYNAMIC_COURSE_STRUCTURE: saved.flag, DYNAMIC_V2_ALLOWED_OWNERS: saved.allow, DYNAMIC_MANIFEST_RULES_VERSION: saved.rules, ALLOW_UNOWNED_COURSES: saved.unowned })) {

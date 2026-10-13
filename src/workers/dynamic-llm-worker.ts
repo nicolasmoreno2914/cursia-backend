@@ -301,7 +301,8 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
       pollMs: readPositiveInt('DYNAMIC_LLM_WORKER_POLL_MS', 5000),
       drain,
       active,
-      claim: () => scheduler.claimNextItem({ executorId: deps.executorId, types: [...types], leaseSeconds: deps.leaseSeconds, minRunCreatedAt }),
+      // Fix M5 (Loop 9): solo runs v3 (el ejecutor vendorizado corre v3; v1/v2 tienen scorm, que es solo del navegador).
+      claim: () => scheduler.claimNextItem({ executorId: deps.executorId, types: [...types], leaseSeconds: deps.leaseSeconds, minRunCreatedAt, onlyRulesVersion: 3 }),
       process: async (item) => {
         try {
           const outcome = await processLlmItem(deps, item);

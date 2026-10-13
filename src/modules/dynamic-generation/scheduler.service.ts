@@ -327,6 +327,11 @@ export interface ClaimOptions {
   executorFeatures?: string[];
   /** Worker interno (Loop 6): solo runs creados desde este instante (ISO), p. ej. la activación del worker de IA. */
   minRunCreatedAt?: string;
+  /**
+   * Loop 9 (fix M5): worker interno — solo items de Manifests con este rulesVersion. El worker de IA reclama solo v3:
+   * los runs v1/v2 (scorm solo del navegador) siguen enteros en el navegador, como siempre.
+   */
+  onlyRulesVersion?: number;
 }
 
 /** Motor pedagógico Fase 2: el ejecutor del navegador aplica `ClaimedItem.pedagogy` a sus prompts. */
@@ -525,8 +530,12 @@ export class SchedulerService {
         if (llmWorkerEnabled()) {
           const coverage = await liveLlmWorkerCoverage(this.dataSource);
           if (coverage.length) {
-            const [runRow] = await this.dataSource.query(`select created_at from public.production_jobs where id = $1`, [opts.runId]);
-            const routed = runRow ? routedTypesForRun(coverage, runRow.created_at) : new Set<string>();
+            // Fix M5 (Loop 9): el worker de IA solo reclama runs v3 → un run v1/v2 nunca se rutea (el navegador sigue con todo).
+            const [runRow] = await this.dataSource.query(
+              `select pj.created_at, (select m.rules_version from public.generation_item_runs g join public.course_generation_manifests m on m.id = g.manifest_id
+                                        where g.job_id = pj.id limit 1) as rules_version
+                 from public.production_jobs pj where pj.id = $1`, [opts.runId]);
+            const routed = runRow && Number(runRow.rules_version) === 3 ? routedTypesForRun(coverage, runRow.created_at) : new Set<string>();
             if (routed.size) claimTypes = browserEffectiveTypes(types, routed);
           }
         }
@@ -577,10 +586,11 @@ export class SchedulerService {
             and not (g.id = any($3::uuid[]))
             and not (g.job_id = any($5::uuid[]))
             and ($6::timestamptz is null or pj.created_at >= $6::timestamptz)
+            and ($7::int is null or m.rules_version = $7::int)
             and ${claimablePredicate('g', '$4')}
           order by g.created_at, mo.ord nulls last, g.id
           limit 1`,
-        [DISPATCHABLE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns, opts.minRunCreatedAt ?? null],
+        [DISPATCHABLE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns, opts.minRunCreatedAt ?? null, opts.onlyRulesVersion ?? null],
       );
       if (!cand) {
         await this.reportMissingDependencies(null, opts.ownerId);
