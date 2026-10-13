@@ -190,6 +190,28 @@ function applicationSolution(a) {
   };
 }
 
+// Loop 9 B: práctica guiada VÁLIDA para el plan del prompt (n ejercicios); `unnumbered` = respuesta modelo sin numerar
+// (el validador la rechaza → reintento dirigido). Formativa: sin solucionario ni pesos.
+function guidedPractice(n, unnumbered) {
+  const kinds = ['case_analysis', 'decision_analysis', 'worked_problem'];
+  const answer = '1. La caída de presión al final de la carrera indica que el aceite se desvía antes de llegar al cilindro: la causa más probable es la válvula de alivio mal ajustada o con desgaste. 2. Primero bloqueas y etiquetas el equipo, conectas el manómetro en el puerto de prueba y comparas la lectura con el valor de placa antes de tocar cualquier ajuste. 3. Registras la lectura, el ajuste realizado, la hora y tu nombre en la hoja del turno, y avisas al supervisor antes de liberar el equipo a operación.';
+  return {
+    exercises: Array.from({ length: n }, (_, i) => ({
+      kind: kinds[i % kinds.length],
+      title: `Práctica ${i + 1}: un cilindro que pierde fuerza`,
+      situation: 'En el turno de noche, el operador de una prensa hidráulica informa que el cilindro principal pierde fuerza al final de la carrera y que el ciclo tarda más que al inicio del turno. El equipo ya pasó la mantención de la semana y nadie ha cambiado la configuración. Te piden revisar el circuito antes de que la prensa vuelva a operación, con el equipo detenido y los registros del turno a mano.',
+      tasks: ['Explica qué indica la caída de presión al final de la carrera.', 'Describe en orden cómo verificarías la presión del circuito con seguridad.', 'Indica qué registrarías antes de liberar el equipo.'],
+      expectedProduct: 'Un informe breve con el diagnóstico, los pasos de verificación y el registro del turno.',
+      criteria: [
+        { name: 'Diagnóstico', descriptor: 'Relaciona el síntoma con la causa probable del capítulo.' },
+        { name: 'Seguridad', descriptor: 'Bloquea y etiqueta el equipo antes de medir.' },
+        { name: 'Registro', descriptor: 'Deja la verificación documentada para el supervisor.' },
+      ],
+      modelAnswer: unnumbered ? answer.replace(/\b[123]\. /g, '') : answer,
+    })),
+  };
+}
+
 function giftBlocks(prefix, from, split, typesOnly) {
   const pad = (n) => (n < 10 ? '0' + n : String(n));
   const out = [];
@@ -337,6 +359,18 @@ function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
         const a = applicationActivity(minutes, practice);
         if (bad) a.criteria[0].weight += 10;
         return J(a);
+      }
+      // Loop 9 B · práctica guiada: el plan (n ejercicios) viene del prompt; inválida UNA vez (respuesta sin numerar).
+      if (prompt.indexOf('Diseña la PRÁCTICA GUIADA de este capítulo') >= 0) {
+        const title = (/CAPÍTULO: "([^"]*)"/.exec(prompt) || [])[1] || '';
+        const id = st.chapterByTitle.get(title);
+        if (!id) throw new Error(`fake LLM v3: capítulo desconocido "${title}" (práctica guiada)`);
+        const n = Number((/EXACTAMENTE (\d+) ejercicios/.exec(prompt) || [])[1]);
+        if (!n) throw new Error('fake LLM v3: prompt de práctica guiada sin el plan de ejercicios');
+        if (retry) st.retriesSeen.guided_practice = (st.retriesSeen.guided_practice || 0) + 1;
+        const bad = !retry && once('guided_practice');
+        rec('guided_practice', id, { invalid: bad, retry, exercises: n });
+        return J(guidedPractice(n, bad));
       }
       // Loop 7 (O2): reparación parcial del Libro — un reemplazo neutro por cada oración numerada.
       if (prompt.indexOf('Responde SOLO con JSON: {"replacements"') >= 0) {

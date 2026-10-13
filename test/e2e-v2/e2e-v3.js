@@ -294,6 +294,8 @@ async function createCourse(C, llm) {
       // Fase 2: capítulo de práctica y Actividad de Aplicación (minutos) cuando el escenario los pide.
       if (cs.kind) body.kind = cs.kind;
       if (cs.app) body.applicationMinutes = cs.app;
+      // Loop 9 B: práctica guiada del capítulo de contenido (minutos) cuando el escenario la pide.
+      if (cs.gp) body.guidedPracticeMinutes = cs.gp;
       // Fase 3: descripción y vínculos a resultados del contexto académico.
       if (cs.description) body.description = cs.description;
       if (cs.outcomeIds) body.outcomeIds = cs.outcomeIds;
@@ -322,8 +324,8 @@ async function createCourse(C, llm) {
     }
   }
   st = await readStructure(courseId);
-  const mods = st.modules.map((m) => ({ id: m.id, title: m.title, exam: m.examEnabled, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title, v: !!x.videoEnabled, a: x.activityEnabled !== false, kind: x.kind || 'content', app: x.applicationMinutes ?? null })) }));
-  eq(mods.map((m) => m.chapters.map((x) => `${x.kind}/${x.app}`)), C.modules.map((m) => m.chapters.map((x) => `${x.kind || 'content'}/${x.app || null}`)), `${C.key}: tipo de capítulo y minutos de Actividad de Aplicación persistidos`);
+  const mods = st.modules.map((m) => ({ id: m.id, title: m.title, exam: m.examEnabled, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title, v: !!x.videoEnabled, a: x.activityEnabled !== false, kind: x.kind || 'content', app: x.applicationMinutes ?? null, gp: x.guidedPracticeMinutes ?? null })) }));
+  eq(mods.map((m) => m.chapters.map((x) => `${x.kind}/${x.app}/${x.gp}`)), C.modules.map((m) => m.chapters.map((x) => `${x.kind || 'content'}/${x.app || null}/${x.gp || null}`)), `${C.key}: tipo de capítulo, minutos de Actividad de Aplicación y de práctica guiada persistidos`);
   eq(mods.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), C.modules.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), `${C.key}: estructura viva con las combinaciones V/A pedidas`);
   // Perfiles (append-only, fuera del Blueprint): evaluación y presentación.
   const A = D('modules/course-profiles/course-profiles.js');
@@ -356,6 +358,7 @@ async function createCourse(C, llm) {
   eq([M.totals.videoCount, M.totals.activityCount, M.totals.examCount, M.totals.finalExamCount, M.totals.presentationCount, M.totals.audiobookChapterCount, M.totals.experienceCount],
     [want.videos, want.activities, want.exams, C.finalExam ? 1 : 0, contentChapters, contentChapters, chapters.length], `${C.key}: totales del Manifest v3 (video/actividad/examen/final/Gamma/audiolibro/experiencia)`);
   eq(M.totals.applicationActivityCount ?? 0, chapters.filter((x) => x.app).length, `${C.key}: totales del Manifest v3 (Actividades de Aplicación)`);
+  eq(M.totals.guidedPracticeCount ?? 0, chapters.filter((x) => x.gp).length, `${C.key}: totales del Manifest v3 (prácticas guiadas)`);
   ok(M.items.filter((i) => i.type === 'activity').every((i) => i.variant === C.engine), `${C.key}: actividades con variant ${C.engine}`);
   // mapas del LLM falso (títulos → UUID)
   llm.st.courseId = courseId;
@@ -1151,7 +1154,8 @@ function reservationBookkeeping(ev) {
       const C = { key: 'E7', title: '[E2E Aplicación E7] Inspección de circuitos hidráulicos', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', pedagogy, modules: [
         { title: 'Inspección del circuito', objective: 'Inspeccionar el circuito hidráulico antes de liberarlo', exam: true, chapters: [
           { title: 'Lectura de presión', v: false, a: true, app: 60, objective: 'Medir la presión del circuito en el puerto de prueba' },
-          { title: 'Ajuste de válvulas', v: false, a: true, objective: 'Ajustar la válvula de alivio al valor de placa' },
+          // Loop 9 B: práctica guiada de 80 min (2 ejercicios de 40) en el capítulo de contenido sin Actividad de Aplicación.
+          { title: 'Ajuste de válvulas', v: false, a: true, gp: 80, objective: 'Ajustar la válvula de alivio al valor de placa' },
           { title: 'Práctica integradora', v: false, a: false, kind: 'practice', app: 30, objective: 'Ejecutar la inspección completa del circuito' },
         ] }] };
       const c = await createCourse(C, llm);
@@ -1168,6 +1172,10 @@ function reservationBookkeeping(ev) {
       ok(snap && snap.course.applicationContext && snap.course.applicationContext.learningOutcomes.do[0] === pedagogy.learningOutcomes.do[0], 'E7: Blueprint congela applicationContext (estudiante + resultados)', snap && snap.course.applicationContext);
       const mc = M.chapters ? M.chapters : M.modules.flatMap((m) => m.chapters);
       ok(mc.find((x) => x.chapterId === chContent).applicationMinutes === 60 && mc.find((x) => x.chapterId === chPlain).applicationMinutes === undefined, 'E7: ManifestChapter.applicationMinutes solo donde hay actividad');
+      // Loop 9 B: práctica guiada SOLO en el capítulo de contenido que la pide, dependiendo de su content.
+      const gps = M.items.filter((i) => i.type === 'guided_practice');
+      eq(gps.map((i) => [i.key, i.guidedPracticeMinutes, i.dependsOn]), [[`guided_practice:${chPlain}`, 80, [`content:${chPlain}`]]], 'E7: Manifest con UNA práctica guiada (80 min) en el capítulo de contenido, sobre su content');
+      ok(mc.find((x) => x.chapterId === chPlain).guidedPracticeMinutes === 80 && mc.find((x) => x.chapterId === chPractice).guidedPracticeMinutes === undefined, 'E7: ManifestChapter.guidedPracticeMinutes solo donde la hay (nunca en la práctica)');
 
       const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
       const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { ...ctx, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
@@ -1181,6 +1189,11 @@ function reservationBookkeeping(ev) {
       const claimedOld = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-app'`, [c.runId]);
       ok(old.status === 409 && /rules_version_mismatch/.test(String(old.error)) && /Actividades de Aplicación/.test(String(old.error)) && claimedOld[0].n === 0,
         'E7: ejecutor sin la capacidad application-activity-1 → 409 visible y ningún item reclamado', { s: old.status, e: old.error, n: claimedOld[0].n });
+      // Loop 9 B: lo mismo con una pestaña que sabe generar Actividades de Aplicación pero no prácticas guiadas.
+      const oldGp = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1,application-activity-1', { runId: c.runId, executorId: 'e2e-old-tab-gp', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam', 'application_activity', 'guided_practice'], leaseSeconds: 60 });
+      const claimedOldGp = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-gp'`, [c.runId]);
+      ok(oldGp.status === 409 && /prácticas guiadas/.test(String(oldGp.error)) && claimedOldGp[0].n === 0,
+        'E7: ejecutor sin la capacidad guided-practice-1 → 409 visible y ningún item reclamado (nunca recibe el tipo)', { s: oldGp.status, e: oldGp.error, n: claimedOldGp[0].n });
       const prompts = [];
       const respond0 = llm.respond;
       llm.respond = (b, h) => { prompts.push(b); return respond0(b, h); };
@@ -1207,7 +1220,18 @@ function reservationBookkeeping(ev) {
       const byKey = new Map(sums.map((r) => [r.item_key, r.output_summary]));
       eq([byKey.get(`application_activity:${chContent}`).genre, byKey.get(`application_activity:${chPractice}`).genre, byKey.get(`application_activity:${chPractice}`).chapterKind], ['case_analysis', 'procedure', 'practice'], 'E7: las dos actividades no tienen la misma forma (género por capítulo) y la práctica se registra como tal');
       eq([byKey.get(`application_activity:${chContent}`).minutes, byKey.get(`application_activity:${chPractice}`).minutes], [60, 30], 'E7: summary con los minutos del Manifest');
-      results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applications: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey) };
+      // Loop 9 B: la práctica guiada (una llamada + reintento dirigido por la respuesta modelo sin numerar).
+      ok((llm.st.retriesSeen.guided_practice || 0) >= 1, 'E7: la práctica guiada inválida (respuesta modelo sin numerar) pidió un reintento dirigido', llm.st.retriesSeen);
+      const gpPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña la PRÁCTICA GUIADA de este capítulo'));
+      ok(gpPrompts.length >= 1 && gpPrompts.every((t) => t.includes('EXACTAMENTE 2 ejercicios') && t.includes('~40 min') && t.includes('FORMATIVA y SIN NOTA')), 'E7: el prompt de la práctica guiada trae el plan de Cursia (2 × 40 min) y es formativa', gpPrompts.length);
+      const gpArts = await q(`select g.item_key k from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and a.type = 'dynamic_guided_practice_json'`, [c.runId]);
+      eq(gpArts.map((a) => a.k), [`guided_practice:${chPlain}`], 'E7: un artifact dynamic_guided_practice_json');
+      const [gpSum] = await q(`select output_summary s from public.generation_item_runs where job_id = $1 and type = 'guided_practice' order by generation desc limit 1`, [c.runId]);
+      ok(gpSum && gpSum.s.exerciseCount === 2 && gpSum.s.minutes === 80 && gpSum.s.promptVersion === 'v21-gp-1' && gpSum.s.retried === true && gpSum.s.v3Validation, 'E7: summary de la práctica guiada (2 ejercicios, 80 min, reintentada) validado por el servidor', gpSum && gpSum.s);
+      // Loop 9 B: + lo que necesita el restore en Moodle (moodle-E7): spec, perfiles y Manifest.
+      results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applicationsList: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey),
+        spec: C, modules: c.mods, assessment: c.assessment, manifestModules: M.modules, features: M.features, applications: apps.length, reviewCardsChapterIds: [], examBank: true,
+        guidedPractices: gps.map((i) => ({ key: i.key, minutes: i.guidedPracticeMinutes })) };
       void AA;
     }, { fatal: false });
     if (RUN_E5 && S.E7 && S.E7.runId) await step('v3-E7-aplicacion-empaquetado-y-regeneracion', async () => {
@@ -1219,13 +1243,15 @@ function reservationBookkeeping(ev) {
         for (const f of Object.keys(zip.files).filter((n) => /^activities\/page_\d+\/module\.xml$/.test(n))) {
           const mx = await zip.file(f).async('string');
           const idn = (/<idnumber>([^<]*)<\/idnumber>/.exec(mx) || [])[1] || '';
-          if (!/:application(_solution)?$/.test(idn)) continue;
+          if (!/:(application(_solution)?|guided_practice)$/.test(idn)) continue;
           const px = await zip.file(f.replace('module.xml', 'page.xml')).async('string');
           out.set(idn, { visible: Number((/<visible>(\d)<\/visible>/.exec(mx) || [])[1]), content: px });
         }
         return out;
       };
       const P1 = await packageRun('E7', c.courseId, c.n, c.runId);
+      // Loop 9 B (moodle-E7): «Repaso» reales del paquete, para la secuencia esperada tras el restore.
+      if (results.courses.E7) results.courses.E7.reviewCardsChapterIds = ((P1.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
       const pg = await pagesOf(P1.buf);
       for (const ch of [chContent, chPractice]) {
         const s = pg.get(`cv3:ch:${ch}:application`);
@@ -1233,7 +1259,20 @@ function reservationBookkeeping(ev) {
         ok(s && s.visible === 1 && /\.pdf/.test(s.content) && !s.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: página del estudiante visible, con PDF y sin respuestas`, s && { visible: s.visible });
         ok(t && t.visible === 0 && /\.pdf/.test(t.content) && t.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: solucionario docente OCULTO (visible 0) con respuestas y PDF`, t && { visible: t.visible });
       }
-      ok(![...pg.keys()].some((k) => k.includes(c.mods[0].chapters[1].id)), 'E7: el capítulo sin actividad no tiene páginas de aplicación');
+      ok(![...pg.keys()].some((k) => /:application(_solution)?$/.test(k) && k.includes(c.mods[0].chapters[1].id)), 'E7: el capítulo sin actividad no tiene páginas de aplicación');
+      // Loop 9 B: la práctica guiada es una página VISIBLE del capítulo, tras el texto, con la respuesta modelo; sus minutos cuentan.
+      const chPlainId = c.mods[0].chapters[1].id;
+      const gpPage = pg.get(`cv3:ch:${chPlainId}:guided_practice`);
+      ok(gpPage && gpPage.visible === 1 && /Respuesta modelo \(revísala después de intentarlo\)/.test(gpPage.content.replace(/&[a-z]+;/g, ' ')) && /Práctica guiada/.test(gpPage.content) && !/Solucionario/.test(gpPage.content),
+        'E7: página «Práctica guiada — <capítulo>» visible con la respuesta modelo (sin solucionario)', gpPage && { visible: gpPage.visible });
+      ok(![...pg.keys()].some((k) => /:guided_practice$/.test(k) && !k.includes(chPlainId)), 'E7: ninguna otra práctica guiada (ni en la práctica)');
+      // Horas: la tarjeta del diseño cuenta los 80 min de la práctica guiada en el capítulo y en «Práctica y repaso».
+      const card = await api('POST', `/courses/${c.courseId}/design/recommendation`, {});
+      const dch = card.data && card.data.design && card.data.design.modules.flatMap((m) => m.chapters);
+      const gpCh = dch && dch.find((x) => x.id === chPlainId);
+      const twin = dch && dch.find((x) => x.id === chContent);
+      ok(gpCh && gpCh.guidedPracticeMinutes === 80 && gpCh.guidedPracticePinned === true && twin && gpCh.hours >= 80 / 60 && card.data.design.counts.guidedPractices === 1,
+        'E7: horas — el diseño cuenta la práctica guiada (80 min) en su capítulo', gpCh && { gp: gpCh.guidedPracticeMinutes, h: gpCh.hours, counts: card.data.design.counts });
 
       // Regenerar SOLO la actividad de la práctica: el plan no arrastra nada más.
       const key = `application_activity:${chPractice}`;
@@ -4152,6 +4191,8 @@ function reservationBookkeeping(ev) {
     if (results.mbz.E21 && results.courses.E21) MOODLE_JOBS.push(['E21', 'E21']);
     // Cierre · E22: el piloto «Atención a víctimas de violencia sexual» (generación MOCK) → restore, permisos y notas.
     if (results.mbz.E22 && results.courses.E22) MOODLE_JOBS.push(['E22', 'E22']);
+    // Loop 9 B · E7: el curso con Actividades de Aplicación y práctica guiada → restore, secuencia, permisos y notas.
+    if (results.mbz.E7 && results.courses.E7 && results.courses.E7.manifestModules) MOODLE_JOBS.push(['E7', 'E7']);
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');
@@ -4204,7 +4245,8 @@ function reservationBookkeeping(ev) {
             // EV6 H5P v2: los «Repaso» salen de los paquetes H5P del empaque (vacío en E1–E4: secuencia de siempre).
             const reviewSet = new Set(info.reviewCardsChapterIds || []);
             // LOOP 7: capítulos de práctica y Actividades de Aplicación (página + solucionario) en su lugar.
-            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined })) {
+            // Loop 9 B: y la práctica guiada (página visible tras el texto del capítulo de contenido).
+            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined, guidedPractice: ch.guidedPracticeMinutes !== undefined })) {
               const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
               ids.push(`cv3:ch:${ch.chapterId}:${role}`);
             }
