@@ -1590,6 +1590,9 @@
     if (extra && typeof extra.examBankDraftArtifactId === 'string' && extra.examBankDraftArtifactId) body.examBankDraftArtifactId = extra.examBankDraftArtifactId;
     // Fix round 4 (R4): null explícito = borrar el borrador anterior (falla de reglas sin faltante).
     else if (extra && extra.examBankDraftArtifactId === null) body.examBankDraftArtifactId = null;
+    // O2b: borrador de la actividad de aplicación (mismo contrato; solo si el claim lo anuncia).
+    if (extra && typeof extra.applicationDraftArtifactId === 'string' && extra.applicationDraftArtifactId) body.applicationDraftArtifactId = extra.applicationDraftArtifactId;
+    else if (extra && extra.applicationDraftArtifactId === null) body.applicationDraftArtifactId = null;
     return backendApiRequest('/api/v1/dynamic-generation/items/' + itemRunId + '/fail', {
       method: 'POST',
       body: body

@@ -78,7 +78,7 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
   }, deps.heartbeatMs);
   // Review I3: sin latido confirmado por el 80 % de la lease, otro worker puede re-reclamar la parte → no se gasta más.
   const leaseLost = () => abandoned || Date.now() - lastBeatOk > deps.leaseSeconds * 800;
-  const fail = async (msg: string, retryable: boolean, opts?: { grantAttempt?: boolean; retryAfterSeconds?: number; examBankDraftArtifactId?: string | null }) => {
+  const fail = async (msg: string, retryable: boolean, opts?: { grantAttempt?: boolean; retryAfterSeconds?: number; examBankDraftArtifactId?: string | null; applicationDraftArtifactId?: string | null }) => {
     clearInterval(hb);
     deps.logger.warn(`Item ${item.itemKey}: falla ${retryable ? 'reintentable' : 'definitiva'}: ${String(msg).slice(0, 400)}`);
     await deps.scheduler.failItemDetailed(item.itemRunId, deps.executorId, msg, retryable, undefined, opts);
@@ -161,11 +161,13 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
       // Falla de la parte (validación / reglas): sus puntos de guardado se descartan (un reintento debe generar de nuevo,
       // nunca repetir la misma respuesta inválida).
       await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
+      // Borrador entre intentos (banco de examen o, O2b, actividad de aplicación ya validada): el campo depende del tipo.
       const opts: Record<string, unknown> = {};
-      if (result && result.draft && result.retryable !== false && runtime.examBankDraftSupported(item)) {
-        try { opts.examBankDraftArtifactId = await uploadArtifact(deps, item, ownerId, courseId, result.draft); } catch { /* sin borrador */ }
-      } else if (result && result.draftClear && runtime.examBankDraftSupported(item)) {
-        opts.examBankDraftArtifactId = null;
+      const draftField = runtime.draftFailField(item);
+      if (result && result.draft && result.retryable !== false && draftField) {
+        try { opts[draftField] = await uploadArtifact(deps, item, ownerId, courseId, result.draft); } catch { /* sin borrador */ }
+      } else if (result && result.draftClear && draftField) {
+        opts[draftField] = null;
       }
       await fail((result && result.error) || 'unexpected_error: el ejecutor no devolvió un resultado', !result || result.retryable !== false, Object.keys(opts).length ? (opts as any) : undefined);
       return 'failed';

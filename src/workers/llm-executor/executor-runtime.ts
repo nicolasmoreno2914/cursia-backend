@@ -54,6 +54,12 @@ export interface ExecutorRuntime {
   /** Mismo mapeo de errores que el navegador (_dynMapApiError). */
   mapError(e: unknown): { retryable: boolean; msg: string; itemOnly?: boolean; runPaused?: boolean };
   examBankDraftSupported(item: unknown): boolean;
+  /**
+   * O2b: campo del fail que lleva el borrador de ESTE item según su tipo y el anuncio del claim
+   * (`examBankDraftArtifactId` para exam/final_exam, `applicationDraftArtifactId` para application_activity),
+   * o null si el claim no anuncia soporte. Mismo criterio que el navegador (dynDraftFieldFor).
+   */
+  draftFailField(item: unknown): 'examBankDraftArtifactId' | 'applicationDraftArtifactId' | null;
 }
 
 export function createExecutorRuntime(deps: ExecutorRuntimeDeps): ExecutorRuntime {
@@ -133,6 +139,12 @@ export function createExecutorRuntime(deps: ExecutorRuntimeDeps): ExecutorRuntim
     mapError: (e) => ctx._dynMapApiError(e),
     examBankDraftSupported: (item) => {
       try { return !!ctx.dynExamBankDraftSupported(JSON.parse(JSON.stringify(item))); } catch { return false; }
+    },
+    draftFailField: (item) => {
+      try {
+        const f = ctx.dynDraftFieldFor(JSON.parse(JSON.stringify(item)));
+        return f === 'examBankDraftArtifactId' || f === 'applicationDraftArtifactId' ? f : null;
+      } catch { return null; }
     },
   };
 }

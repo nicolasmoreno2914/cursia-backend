@@ -666,6 +666,121 @@ async function main() {
     eq(await errs({ ...base, examBankDraftArtifactId: null }), [], 'null explícito = sin borrador (fix round 2, N2: borra el anterior)');
     eq(await errs({ ...base, draft: 'x' }), ['draft'], 'otro campo sigue rechazado');
   });
+  await check('O2b: FailItemDto acepta applicationDraftArtifactId (UUID, opcional, null explícito) con la misma whitelist; junto al del banco', async () => {
+    const { plainToInstance } = require('class-transformer');
+    const { validate } = require('class-validator');
+    const { FailItemDto } = loadDist('modules/dynamic-generation/dto/executor.dto.js');
+    const errs = async (body) => (await validate(plainToInstance(FailItemDto, body), { whitelist: true, forbidNonWhitelisted: true })).map((e) => e.property).sort();
+    const base = { executorId: 'ex-1', error: 'application_activity inválido tras reintento dirigido: x', retryable: true };
+    eq(await errs({ ...base, applicationDraftArtifactId: '0b6b6b6b-0000-4000-8000-000000000002' }), [], 'con borrador');
+    eq(await errs({ ...base, applicationDraftArtifactId: 'no-es-uuid' }), ['applicationDraftArtifactId'], 'no UUID');
+    eq(await errs({ ...base, applicationDraftArtifactId: null }), [], 'null explícito = borrar el anterior');
+    eq(await errs({ ...base, applicationDraftArtifactId: 42 }), ['applicationDraftArtifactId'], 'número');
+    const D = loadDist('modules/dynamic-generation/exam-bank-draft.js');
+    eq([D.APPLICATION_DRAFT_ARTIFACT_TYPE, D.EXAM_BANK_DRAFT_ARTIFACT_TYPE, [...D.ITEM_DRAFT_SUMMARY_KEYS]], ['dynamic_application_draft_json', 'dynamic_exam_bank_draft_json', ['examBankDraft', 'applicationDraft']], 'tipos y claves');
+    // Guardas puras (sin consultar la base): tipo de item, retryable, id.
+    const noQ = { async query() { throw new Error('no debe consultar'); } };
+    const app = { id: 'ir-1', type: 'application_activity', generation: 1, attempt_count: 1 };
+    const good = '0b6b6b6b-0000-4000-8000-000000000002';
+    eq(await D.recordApplicationDraft(noQ, app, 'o', undefined, true), { recorded: false, reason: 'not_requested' }, 'sin campo');
+    eq(await D.recordApplicationDraft(noQ, app, 'o', null, true), { recorded: false, reason: 'not_requested' }, 'null');
+    eq(await D.recordApplicationDraft(noQ, { ...app, type: 'exam' }, 'o', good, true), { recorded: false, reason: 'not_application_item' }, 'exam no guarda borrador de actividad');
+    eq(await D.recordApplicationDraft(noQ, { ...app, type: 'activity' }, 'o', good, true), { recorded: false, reason: 'not_application_item' }, 'activity');
+    eq(await D.recordApplicationDraft(noQ, app, 'o', good, false), { recorded: false, reason: 'not_retryable' }, 'no retryable');
+    eq(await D.recordApplicationDraft(noQ, app, 'o', 'no-uuid', true), { recorded: false, reason: 'invalid_id' }, 'id inválido');
+    eq(await D.recordExamBankDraft(noQ, app, 'o', good, true), { recorded: false, reason: 'not_exam_item' }, 'el del banco no acepta application_activity');
+    eq(await D.clearApplicationDraft(noQ, { id: 'x', type: 'exam', output_summary: { applicationDraft: {}, examBankDraft: {} } }), false, 'clear: exam no se toca');
+    eq(await D.clearExamBankDraft(noQ, { id: 'x', type: 'application_activity', output_summary: { applicationDraft: {}, examBankDraft: {} } }), false, 'clear del banco: application no se toca');
+    eq(await D.clearApplicationDraft(noQ, { id: 'x', type: 'application_activity', output_summary: {} }), false, 'clear sin borrador: no-op');
+    // Con un QueryRunner falso que emula la tabla: la consulta exige dueño, tipo de artifact e itemRunId.
+    const arts = [
+      { id: good, owner_id: 'o', type: 'dynamic_application_draft_json', itemRunId: 'ir-1' },
+      { id: '0b6b6b6b-0000-4000-8000-00000000000a', owner_id: 'otro', type: 'dynamic_application_draft_json', itemRunId: 'ir-1' },
+      { id: '0b6b6b6b-0000-4000-8000-00000000000b', owner_id: 'o', type: 'dynamic_exam_bank_draft_json', itemRunId: 'ir-1' },
+      { id: '0b6b6b6b-0000-4000-8000-00000000000c', owner_id: 'o', type: 'dynamic_application_draft_json', itemRunId: 'ir-otro' },
+    ];
+    const updates = [];
+    const fq = { async query(sql, params) {
+      if (/from public\.artifacts/.test(sql)) return arts.filter((a) => a.id === params[0] && a.owner_id === params[1] && a.type === params[2] && a.itemRunId === params[3]).map((a) => ({ id: a.id }));
+      if (/update public\.generation_item_runs/.test(sql)) { updates.push({ sql, params }); return [[{ id: params[0] }], 1]; }
+      throw new Error('consulta inesperada: ' + sql);
+    } };
+    eq(await D.recordApplicationDraft(fq, app, 'o', arts[1].id, true), { recorded: false, reason: 'artifact_mismatch' }, 'de otro dueño');
+    eq(await D.recordApplicationDraft(fq, app, 'o', arts[2].id, true), { recorded: false, reason: 'artifact_mismatch' }, 'de otro tipo (borrador del banco)');
+    eq(await D.recordApplicationDraft(fq, app, 'o', arts[3].id, true), { recorded: false, reason: 'artifact_mismatch' }, 'de otro item run');
+    eq(updates.length, 0, 'ningún update en los rechazos');
+    eq(await D.recordApplicationDraft(fq, app, 'o', good, true), { recorded: true, artifactId: good }, 'positivo');
+    eq([updates.length, updates[0].params[2], JSON.parse(updates[0].params[1]).artifactId, JSON.parse(updates[0].params[1]).generation, JSON.parse(updates[0].params[1]).attempt], [1, 'applicationDraft', good, 1, 1], 'output_summary.applicationDraft');
+  });
+
+  await check('O2b fix 4a: buildClaimV3 — application_activity anuncia application.draftArtifactType; exam/final_exam solo su examBank.draftArtifactType', async () => {
+    const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
+    const build = (row, mItem, manifest) => SchedulerService.prototype.buildClaimV3.call({}, { async query() { throw new Error('no debe consultar'); } }, row, mItem, manifest, { course: { applicationContext: null } });
+    const manifest = { rulesVersion: 3, features: {}, modules: [{ moduleId: M1, chapters: [{ chapterId: ch(1), kind: 'content' }, { chapterId: ch(2), kind: 'content' }, { chapterId: ch(3), kind: 'content' }] }, { moduleId: M2, chapters: [{ chapterId: ch(4) }, { chapterId: ch(5) }] }] };
+    const app = await build({ type: 'application_activity', item_key: 'application_activity:' + ch(1), chapter_id: ch(1), module_id: M1 }, { applicationMinutes: 60 }, manifest);
+    eq([app.validatedArtifactType, app.application.minutes, app.application.draftArtifactType], ['dynamic_application_json', 60, 'dynamic_application_draft_json'], 'claim application_activity');
+    eq('examBank' in app, false, 'sin bloque del banco');
+    const ex = await build({ type: 'exam', item_key: 'exam:' + M1, chapter_id: null, module_id: M1 }, { moduleId: M1 }, manifest);
+    eq([ex.examBank.draftArtifactType, 'application' in ex], ['dynamic_exam_bank_draft_json', false], 'claim exam');
+    const fe = await build({ type: 'final_exam', item_key: 'final_exam:1', chapter_id: null, module_id: null }, {}, manifest);
+    eq([fe.examBank.draftArtifactType, 'application' in fe], ['dynamic_exam_bank_draft_json', false], 'claim final_exam');
+  });
+
+  await check('O2b (worker de IA): el runtime con el ejecutor vendorizado devuelve el borrador de la actividad cuando falla el solucionario, reanuda llamando SOLO la 2.ª pasada y draftFailField elige el campo por tipo', async () => {
+    const { createExecutorRuntime } = loadDist('workers/llm-executor/executor-runtime.js');
+    const C1 = 'a1b2c3d4-0000-4000-8000-000000000001';
+    const M1 = 'a1b2c3d4-0000-4000-8000-00000000000a';
+    const act = {
+      genre: 'calculation', title: 'Calcula la dosis correcta',
+      objective: 'Calcular dosis pediátricas por peso y verificar la dosis máxima diaria sin errores.',
+      context: 'En la droguería llegan fórmulas pediátricas a diario. Tienes que comprobar que cada dosis indicada corresponde al peso del niño antes de dispensar el medicamento.',
+      examples: [{ title: 'Dosis de un jarabe', problem: 'Un niño de 12 kg necesita 15 mg/kg de un jarabe de 120 mg/5 mL.', steps: ['Multiplica 15 mg × 12 kg = 180 mg.', 'Convierte a mL: 180 / 120 × 5 = 7,5 mL.'], result: 'Se administran 7,5 mL por toma.' }],
+      exercises: Array.from({ length: 7 }, (_, i) => ({ id: 'E' + (i + 1), prompt: 'Calcula la dosis del caso hipotético número ' + (i + 1) + ' con los datos indicados.', difficulty: i < 2 ? 'basico' : i < 5 ? 'intermedio' : 'avanzado', answerLines: 3 })),
+      workshop: { title: 'Revisión de fórmulas', situation: 'Recibes cinco fórmulas pediátricas hipotéticas de una jornada. Debes revisar cada dosis y decidir si se dispensa o se consulta al médico.', instructions: ['Calcula la dosis esperada de cada fórmula.', 'Compara con la dosis indicada y decide qué hacer.'] },
+      deliverable: { description: 'Una tabla con el cálculo y la decisión de cada fórmula.', format: 'Tabla', extent: 'Una página' },
+      selfCheck: ['¿Usé el peso en kilogramos?', '¿Verifiqué la dosis máxima diaria?', '¿Convertí bien a mililitros?', '¿Justifiqué cada decisión?'],
+      criteria: [{ name: 'Precisión del cálculo', description: 'Las dosis calculadas son correctas.', weight: 50 }, { name: 'Verificación', description: 'Se revisa la dosis máxima.', weight: 30 }, { name: 'Decisión justificada', description: 'Cada decisión se explica.', weight: 20 }],
+      minutesBySection: { examples: 10, exercises: 30, workshop: 15, selfCheck: 5 },
+    };
+    const sol = (n) => ({
+      answers: act.exercises.slice(0, n).map((e) => ({ exerciseId: e.id, answer: 'Resultado del caso ' + e.id, explanation: 'Se multiplica la dosis por kilogramo por el peso y se convierte a mililitros.' })),
+      workshopSolution: 'Un buen trabajo calcula las cinco dosis, marca las dos que superan la dosis máxima y propone consultar al médico en esos casos.',
+      correctionGuide: act.criteria.map((c) => ({ criterion: c.name, achieved: 'Todo correcto y completo.', developing: 'Errores menores en algún caso.', insufficient: 'Errores que pondrían en riesgo al paciente.' })),
+      teacherNotes: ['El error más frecuente es olvidar convertir libras a kilogramos.'],
+    });
+    const store = { cp1: JSON.stringify({ contextPackageVersion: 1, module: { title: 'Dosificación', summary: 'Dosificar con seguridad' }, chapter: { title: 'Cálculo de dosis por peso', concepts_introduced: ['dosis por kilogramo'], concepts_assumed: [], key_terms: ['mg/kg'] }, previous_chapter_summary: null, accumulated_concepts: [], next_chapter: null }), md1: '# Cálculo de dosis por peso\n\n## Fórmula\nLa dosis se calcula multiplicando los miligramos por kilogramo por el peso del paciente.\n\n## Verificación\nSiempre se verifica la dosis máxima diaria.' };
+    const mkRuntime = (responder, calls) => createExecutorRuntime({
+      api: async (system, user) => { calls.push(user); return responder(calls.length); },
+      artifactText: async (id) => (id in store ? store[id] : null), ownerId: 'owner-1',
+      logger: { log() {}, warn() {}, error() {} },
+    });
+    const mkItem = (announce, outputSummary) => ({
+      itemRunId: 'ir-app', runId: 'run-1', courseId: 1, artifactCourseId: 'course-uuid', manifestId: 7, itemKey: 'application_activity:' + C1, type: 'application_activity',
+      rulesVersion: 3, moduleId: M1, chapterId: C1, moduleNumber: 1, chapterNumber: 1, idempotencyKey: 'idem-app', generation: 1, dependsOn: ['content:' + C1], attempt: 1,
+      outputSummary: outputSummary || {}, context: { courseContext: { nombre: 'Farmacología aplicada', sector: 'Salud', pais: 'Chile', contexto: 'Auxiliares', nivel: 'Técnico', tono: 'Cercano', obj: 'Dispensar' }, contextHash: 'h' },
+      blueprint: { course: { id: 1, title: 'Farmacología aplicada' }, module: { id: M1, title: 'Dosificación', objective: null, position: 1 }, chapter: { id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis', position: 1, videoEnabled: false },
+        moduleChapters: [{ id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis', chapterNumber: 1 }], outline: [{ moduleNumber: 1, id: M1, title: 'Dosificación', objective: null, chapters: [{ chapterNumber: 1, id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis' }] }] },
+      dependencyArtifacts: [{ itemKey: 'content:' + C1, artifactId: 'md1', type: 'dynamic_content_md', storagePath: 'x' }, { itemKey: 'content:' + C1, artifactId: 'cp1', type: 'dynamic_context_package_json', storagePath: 'x' }],
+      claimPayload: { validatedArtifactType: 'dynamic_application_json', chapterId: C1, application: { minutes: 60, chapterKind: 'content', schemaVersion: 1, context: null, ...(announce ? { draftArtifactType: 'dynamic_application_draft_json' } : {}) } },
+    });
+    let calls = [];
+    let rt = mkRuntime((n) => JSON.stringify(n === 1 ? act : sol(6)), calls);
+    eq([rt.draftFailField(mkItem(true)), rt.draftFailField(mkItem(false)), rt.draftFailField({ type: 'exam', claimPayload: { examBank: { draftArtifactType: 'dynamic_exam_bank_draft_json' } } }), rt.examBankDraftSupported(mkItem(true))],
+      ['applicationDraftArtifactId', null, 'examBankDraftArtifactId', false], 'draftFailField / examBankDraftSupported');
+    const r1 = await rt.run(mkItem(true));
+    eq([r1.ok, r1.retryable, !!r1.draft, !!r1.draftClear, calls.length], [false, true, true, false, 3], 'falla del solucionario → borrador');
+    eq(r1.draft.type, 'dynamic_application_draft_json', 'tipo del borrador');
+    store.draft1 = r1.draft.content;
+    const ref = { applicationDraft: { artifactId: 'draft1', generation: 1, attempt: 1, recordedAt: 'x' } };
+    calls = [];
+    rt = mkRuntime(() => JSON.stringify(sol(7)), calls);
+    const r2 = await rt.run(mkItem(true, ref));
+    eq([r2.ok, calls.length, r2.summary.resumedFromDraft], [true, 1, true], 'reanudado: solo la 2.ª pasada');
+    calls = [];
+    rt = mkRuntime(() => JSON.stringify(sol(6)), calls);
+    const r3 = await rt.run(mkItem(true, ref));
+    eq([r3.ok, !!r3.draft, r3.draftClear, calls.length], [false, false, true, 2], 'reanudado + falla → draftClear');
+  });
 
   console.log(`\n${passes} OK, ${failures} FALLAS`);
   process.exit(failures ? 1 : 0);

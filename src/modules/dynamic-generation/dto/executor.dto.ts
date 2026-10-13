@@ -102,6 +102,16 @@ export class FailItemDto extends ExecutorBaseDto {
   examBankDraftArtifactId?: string;
 
   /**
+   * O2b: artifact `dynamic_application_draft_json` con la actividad del estudiante YA validada de un
+   * application_activity cuyo solucionario (2.ª pasada) falló reintentable. Mismas guardas que el borrador del
+   * banco (tipo de item, retryable, dueño, tipo de artifact, itemRunId); `null` explícito = borrarlo; ausente =
+   * conservarlo. Ver exam-bank-draft.ts.
+   */
+  @IsOptional()
+  @IsUUID('all')
+  applicationDraftArtifactId?: string;
+
+  /**
    * REL R1: código estable del fallo (p.ej. `EXAM_BANK_INCOMPLETE`, `content_empty`). Opcional y
    * compatible hacia atrás (un ejecutor viejo no lo manda; uno nuevo contra un backend viejo recibe 400
    * por forbidNonWhitelisted y reintenta sin él). El servidor lo usa SOLO para clasificar
