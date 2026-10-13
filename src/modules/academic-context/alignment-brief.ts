@@ -7,7 +7,7 @@ import { sortOutcomeIds } from './blueprint-academic';
  * CONGELADO (course.academicContext + chapter.outcomeIds), y su bloque para el prompt del generador. Lo arma el
  * backend dentro del brief pedagógico del claim (fuente única del texto): el ejecutor del navegador no cambia.
  *
- *   capítulo (content, experience, activity, video_interactions, application_activity) → sus vínculos; un capítulo de
+ *   capítulo (content, experience, activity, video_interactions, application_activity, guided_practice) → sus vínculos; un capítulo de
  *     práctica sin vínculos propios integra los de los capítulos de contenido de su módulo
  *   module_intro / exam (módulo) → unión de los vínculos de sus capítulos
  *   course_plan / course_intro / final_exam → todos los vínculos del curso
@@ -35,7 +35,7 @@ export interface ItemOutcome {
   domain: 'know' | 'do' | 'competency';
 }
 
-const CHAPTER_TYPES = new Set(['content', 'experience', 'activity', 'video_interactions', 'application_activity']);
+const CHAPTER_TYPES = new Set(['content', 'experience', 'activity', 'video_interactions', 'application_activity', 'guided_practice']);
 
 function chapterLinks(snapshot: BlueprintSnapshotV2, chapterId: string): string[] {
   for (const m of snapshot.modules) {
@@ -91,6 +91,7 @@ const GENERATOR_INSTRUCTION: Record<string, string> = {
   branching_scenario: 'Las decisiones del escenario deben exigir los desempeños de estos resultados.',
   scorm_activity: 'Las salas deben exigir los desempeños de estos resultados.',
   application_activity: 'La actividad de aplicación y su producto deben evidenciar estos resultados, y sus criterios de evaluación deben referirse a ellos.',
+  guided_practice: 'Los ejercicios de la práctica guiada deben ejercitar estos resultados dentro del alcance del capítulo, y sus criterios de autoevaluación deben referirse a ellos.',
   exam: 'Cubre cada resultado con al menos una pregunta; para los de saber hacer (aplicar, analizar, evaluar, crear) usa situaciones o casos que exijan aplicarlo, no solo definiciones.',
   final_exam: 'Cubre cada resultado con al menos una pregunta; para los de saber hacer (aplicar, analizar, evaluar, crear) usa situaciones o casos que exijan aplicarlo, no solo definiciones.',
 };

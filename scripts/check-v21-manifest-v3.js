@@ -457,7 +457,7 @@ async function pureChecks() {
 
   await check('tipos: V3 = orden canónico, ALL = v2 ∪ v3, scope de audio_welcome/final_exam = course, itemTypesForRulesVersion(3)', () => {
     eq(B.MANIFEST_ITEM_TYPES_V3, ['course_plan', 'course_intro', 'audio_welcome', 'module_intro', 'content', 'experience',
-      'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter', 'exam', 'final_exam'], 'V3');
+      'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter', 'exam', 'final_exam'], 'V3');
     eq(B.itemTypesForRulesVersion(3), B.MANIFEST_ITEM_TYPES_V3, 'rv 3');
     eq(B.itemTypesForRulesVersion(2), B.MANIFEST_ITEM_TYPES_V2, 'rv 2 sin cambios');
     eq(B.itemTypesForRulesVersion(1), B.MANIFEST_ITEM_TYPES_V1, 'rv 1 sin cambios');
@@ -745,6 +745,16 @@ async function dbChecks() {
       }
       const va = runScript('scripts/verify-application-activities-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
       assert(va.code === 0 && /application_minutes/.test(va.out), `verify actividades: exit ${va.code}\n${va.out}`);
+      // Loop 9 B: práctica guiada (columna, item y conteos) DESPUÉS de las actividades — dos veces (idempotente) + verificador.
+      for (let i = 0; i < 2; i++) {
+        const res = runScript('scripts/migrate-guided-practice.js', localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(res.code === 0, `práctica guiada, corrida ${i + 1}: exit ${res.code}\n${res.out}`);
+      }
+      const vg = runScript('scripts/verify-guided-practice-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(vg.code === 0 && /guided_practice_minutes/.test(vg.out), `verify práctica guiada: exit ${vg.code}\n${vg.out}`);
+      // Las verificaciones de las actividades siguen verdes con los CHECK reescritos.
+      const va2 = runScript('scripts/verify-application-activities-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(va2.code === 0, `verify actividades tras la práctica guiada: exit ${va2.code}\n${va2.out}`);
     });
     await check('DB: verificadores previos siguen verdes (dynamic-generation, generation-manifests)', async () => {
       for (const s of ['scripts/verify-dynamic-generation-schema.js', 'scripts/verify-generation-manifests-schema.js']) {
@@ -779,7 +789,7 @@ async function dbChecks() {
       { id: cid, title: 'Curso R4', finalExam: true, activityEngine: 'scorm' },
       [{ id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'M1', objective: null, exam_enabled: true },
         { id: '00000000-0000-4000-8000-0000000000a2', position: 1, title: 'M2', objective: null, exam_enabled: false }],
-      [{ id: '00000000-0000-4000-8000-0000000000c1', module_id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'C1', objective: null, video_enabled: true, activity_enabled: true },
+      [{ id: '00000000-0000-4000-8000-0000000000c1', module_id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'C1', objective: null, video_enabled: true, activity_enabled: true, guided_practice_minutes: 80 },
         { id: '00000000-0000-4000-8000-0000000000c2', module_id: '00000000-0000-4000-8000-0000000000a1', position: 1, title: 'C2', objective: null, video_enabled: false, activity_enabled: false, application_minutes: 60 },
         { id: '00000000-0000-4000-8000-0000000000c3', module_id: '00000000-0000-4000-8000-0000000000a2', position: 0, title: 'C3', objective: null, video_enabled: true, activity_enabled: false }],
     );
@@ -787,8 +797,8 @@ async function dbChecks() {
     for (const m of s2.modules) {
       await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cid, m.position, m.title]);
       for (const c of m.chapters) {
-        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled, application_minutes)
-                        values ($1, $2, $3, $4, $5, $6, $7, $8)`, [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled, c.applicationMinutes ?? null]);
+        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled, application_minutes, guided_practice_minutes)
+                        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled, c.applicationMinutes ?? null, c.guidedPracticeMinutes ?? null]);
       }
     }
     await ds.query(
@@ -809,8 +819,8 @@ async function dbChecks() {
       dto = res.manifest;
       const [row] = await ds.query(`select * from public.course_generation_manifests where id = $1`, [dto.id]);
       eq([row.scorm_count, row.experience_count, row.presentation_count, row.video_interactions_count, row.activity_count,
-        row.audiobook_chapter_count, row.audio_welcome_count, row.final_exam_count, row.application_activity_count, row.total_jobs],
-      [0, 3, 3, 2, 1, 3, 1, 1, 1, dto.manifest.items.length], 'columnas');
+        row.audiobook_chapter_count, row.audio_welcome_count, row.final_exam_count, row.application_activity_count, row.guided_practice_count, row.total_jobs],
+      [0, 3, 3, 2, 1, 3, 1, 1, 1, 1, dto.manifest.items.length], 'columnas (Loop 9 B: + 1 práctica guiada)');
       eq(row.manifest_sha256, B.manifestSha256(B.buildGenerationManifest(s2, { courseId: cid, blueprintId: row.blueprint_id, blueprintNumber: 1, blueprintSha256: snap.snapshotSha256V2(s2) }, { rulesVersion: 3 })), 'sha = builder puro');
       const again = await manifests.getOrCreate(cid, OWNER, 1);
       eq([again.created, again.manifest.id, again.manifest.sha256], [false, dto.id, dto.sha256], 'idempotente');
@@ -937,7 +947,12 @@ async function dbChecks() {
         await rejectsRe(sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER }),
           /Actividades de Aplicación/, 'navegador sin application-activity-1', 409);
       }
-      const FEAT = ['pedagogy-brief-1', 'application-activity-1'];
+      // Loop 9 B: con prácticas guiadas en el Manifest, un navegador sin la capacidad → 409 visible (nunca las recibe).
+      const gpInManifest = (await ds.query(`select coalesce(manifest_json->'items', '[]'::jsonb) @> '[{"type":"guided_practice"}]'::jsonb a from public.course_generation_manifests where id = $1`, [dto.id]))[0].a;
+      eq(gpInManifest, true, 'el fixture tiene práctica guiada');
+      await rejectsRe(sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro', 'guided_practice'], runId: job.id, ownerId: OWNER, executorFeatures: ['pedagogy-brief-1', 'application-activity-1'] }),
+        /prácticas guiadas/, 'navegador sin guided-practice-1', 409);
+      const FEAT = ['pedagogy-brief-1', 'application-activity-1', 'guided-practice-1'];
       const act = await sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER, executorFeatures: FEAT });
       assert(act, 'el navegador v3 no reclamó nada');
       const claimedAct = act.type === 'activity' ? act : null;

@@ -163,6 +163,8 @@ function evidenceKindOf(it: ManifestItem, practiceChapters: Set<string>): Eviden
       // `content:`): no se duplica como evidencia de 0 minutos (review F4 M6).
       return it.chapterId && practiceChapters.has(it.chapterId) ? 'practice' : null;
     case 'activity':
+    // Loop 9 B: la práctica guiada es práctica formativa del capítulo (no una Actividad de Aplicación).
+    case 'guided_practice':
       return 'practice';
     case 'video_interactions':
       return 'check';
@@ -187,6 +189,7 @@ function itemMinutes(st: StudyTimeEstimate): Map<string, number> {
         if (r.resource === 'activity') add(`activity:${c.chapterId}`, r.minutes);
         else if (r.resource === 'video_interactions') add(`video_interactions:${c.chapterId}`, r.minutes);
         else if (r.resource === 'application_activity') add(`application_activity:${c.chapterId}`, r.minutes);
+        else if (r.resource === 'guided_practice') add(`guided_practice:${c.chapterId}`, r.minutes);
         else if (r.resource === 'practice_page') add(`experience:${c.chapterId}`, r.minutes);
         else if (r.resource === 'chapter_page' || r.resource === 'libro' || r.resource === 'presentation' || r.resource === 'video') add(`content:${c.chapterId}`, r.minutes);
       }

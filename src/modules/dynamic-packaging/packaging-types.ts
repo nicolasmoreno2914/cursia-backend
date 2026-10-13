@@ -97,7 +97,9 @@ export interface ResolvedArtifact {
     // EV6 P2: banco de preguntas de exam/final_exam (alternativa a dynamic_exam_gift):
     | 'dynamic_exam_bank_json'
     // Fase 2: Actividad de Aplicación (actividad + solucionario):
-    | 'dynamic_application_json';
+    | 'dynamic_application_json'
+    // Loop 9 B: práctica guiada del capítulo:
+    | 'dynamic_guided_practice_json';
   /** Fase 8: 'stale' si el artifact se empaqueta marcado (STALE_NO_AUTO). Ausente = vigente. */
   status?: 'stale';
   storageBucket: string;

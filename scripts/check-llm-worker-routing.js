@@ -47,11 +47,11 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     let threw = false;
     try { R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: 'content,video' }); } catch { threw = true; }
     assert(threw, 'tipo desconocido lanza');
-    assert(R.llmWorkerTypes({}).join() === 'course_plan,course_intro,module_intro,content,experience,video_interactions,activity,application_activity,exam,final_exam', 'default (Loop 9: todas las partes de IA v3)');
+    assert(R.llmWorkerTypes({}).join() === 'course_plan,course_intro,module_intro,content,experience,video_interactions,activity,application_activity,guided_practice,exam,final_exam', 'default (Loop 9: todas las partes de IA v3, Loop 9 B: + práctica guiada)');
     assert(R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: 'content, content ,experience' }).join() === 'content,experience', 'dedupe');
   });
   await check('Loop 9: el worker cubre TODAS las partes de IA v3 (también las cortas); el env solo puede ACOTAR; nunca scorm ni proveedores', async () => {
-    const all = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'exam', 'final_exam'];
+    const all = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'exam', 'final_exam'];
     eqSet(R.DEFAULT_LLM_WORKER_TYPES, all, 'default = todas');
     eqSet(R.ALL_LLM_WORKER_TYPES, all, 'permitidos = todas');
     // Acotar sigue funcionando (p. ej. volver al set de partes largas de Loop 6).

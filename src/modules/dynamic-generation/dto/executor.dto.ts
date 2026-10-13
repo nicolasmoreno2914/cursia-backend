@@ -28,6 +28,8 @@ export const BROWSER_ITEM_TYPES = [
   'experience', 'video_interactions', 'activity', 'final_exam',
   // Fase 2: Actividad de Aplicación (actividad + solucionario, texto LLM del navegador).
   'application_activity',
+  // Loop 9 B: práctica guiada del capítulo (texto LLM; solo con la capacidad GUIDED_PRACTICE_FEATURE).
+  'guided_practice',
 ] as const;
 export type BrowserItemType = (typeof BROWSER_ITEM_TYPES)[number];
 

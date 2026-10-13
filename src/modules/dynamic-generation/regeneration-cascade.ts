@@ -9,7 +9,7 @@
  * invalidación v3 (plan-v3.ts), aplicadas a "la salida de X cambió":
  *  - content:<ch> →
  *      REGENERATE (LLM, generación nueva `pending`): experience:<ch>,
- *        activity:<ch>, exam:<m>, final_exam;
+ *        activity:<ch>, application_activity:<ch>, guided_practice:<ch> (Loop 9 B), exam:<m>, final_exam;
  *      STALE_NO_AUTO (proveedor, nunca se regenera solo; artifacts `stale`
  *        con motivo ⇒ aviso visible en el empaque): presentation:<ch>,
  *        video:<ch>, audiobook_chapter:<ch>; y video_interactions:<ch>, que
@@ -55,7 +55,7 @@ export function regenerationCascade(rulesVersion: number, items: readonly Cascad
       .filter((it) => (it.type === 'experience' || it.type === 'activity' || it.type === 'application_activity') && it.chapterId !== ch && (it.dependsOn ?? []).includes(mItem.key))
       .map((it) => it.key);
     return {
-      regenerate: pick([`experience:${ch}`, `activity:${ch}`, `application_activity:${ch}`, ...practice, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
+      regenerate: pick([`experience:${ch}`, `activity:${ch}`, `application_activity:${ch}`, `guided_practice:${ch}`, ...practice, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
       stale: pick([`presentation:${ch}`, `video:${ch}`, `video_interactions:${ch}`, `audiobook_chapter:${ch}`]),
     };
   }

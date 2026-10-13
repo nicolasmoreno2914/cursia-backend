@@ -152,6 +152,8 @@ function buildBp(spec) {
     video_enabled: !!c.video, activity_enabled: !!c.act,
     // Fase 2: Actividad de Aplicación (minutos) en los capítulos que la piden.
     ...(c.app ? { application_minutes: c.app } : {}),
+    // Loop 9 B: práctica guiada (minutos) en los capítulos de contenido que la piden.
+    ...(c.gp ? { guided_practice_minutes: c.gp } : {}),
   })));
   return snap.buildBlueprintSnapshotV2(
     { id: COURSE_ID, title: spec.title, finalExam: spec.finalExam, activityEngine: spec.engine }, modules, chapters,
@@ -246,9 +248,10 @@ async function pureChecks() {
   const m0 = manifestOf(bp0, 1);
   const chapterItems = (ch) => m0.items.filter((i) => i.chapterId === ch).map((i) => i.key);
 
-  await check('fixture: el Manifest v3 tiene todos los tipos (14, con una Actividad de Aplicación) y el plan sin cambios es todo REUSE', () => {
-    // Fase 2: el fixture base no cambia (sha fijados); los 14 tipos se ven con una actividad en el capítulo 2.
-    const withApp = baseSpec(); chapterOf(withApp, C2).app = 60;
+  await check('fixture: el Manifest v3 tiene todos los tipos (15, con una Actividad de Aplicación y una práctica guiada) y el plan sin cambios es todo REUSE', () => {
+    // Fase 2: el fixture base no cambia (sha fijados); los 15 tipos se ven con una actividad en el capítulo 2
+    // (Loop 9 B: y una práctica guiada en el capítulo 1).
+    const withApp = baseSpec(); chapterOf(withApp, C2).app = 60; chapterOf(withApp, C1).gp = 80;
     const types = new Set([...m0.items, ...manifestOf(buildBp(withApp), 9).items].map((i) => i.type));
     for (const t of B.MANIFEST_ITEM_TYPES_V3) assert(types.has(t), `falta ${t}`);
     const pa = planOf(buildBp(withApp), buildBp(withApp)).plan;
@@ -257,6 +260,25 @@ async function pureChecks() {
     assert(allReuse(plan), 'no todo REUSE');
     eq([plan.fromRulesVersion, plan.toRulesVersion, plan.fingerprintVersion, plan.invalidationPlanVersion], [3, 3, 2, 2], 'versiones');
     eq(plan.actions.length, m0.items.length, 'una acción por item');
+  });
+
+  // Loop 9 B: la práctica guiada es texto LLM que depende del content de su capítulo y de su nivel.
+  await check('Loop 9 B práctica guiada: encender → GENERATE; cambiar el nivel → REGENERATE (solo ella); apagar → SOFT_DISABLE; content nuevo → REGENERATE; nunca un proveedor', () => {
+    const on = baseSpec(); chapterOf(on, C1).gp = 80;
+    let r = planOf(bp0, buildBp(on)).plan;
+    expectPlan(r, { [K('guided_practice', C1)]: 'GENERATE' });
+    assertReason(r, K('guided_practice', C1), 'guided_practice_toggled_on');
+    const more = baseSpec(); chapterOf(more, C1).gp = 120;
+    r = planOf(buildBp(on), buildBp(more)).plan;
+    expectPlan(r, { [K('guided_practice', C1)]: 'REGENERATE' });
+    assertReason(r, K('guided_practice', C1), 'guided_practice_frame_changed');
+    r = planOf(buildBp(on), bp0).plan;
+    expectPlan(r, { [K('guided_practice', C1)]: 'SOFT_DISABLE' });
+    assertReason(r, K('guided_practice', C1), 'guided_practice_toggled_off');
+    const retitled = baseSpec(); chapterOf(retitled, C1).gp = 80; chapterOf(retitled, C1).objective = 'Objetivo uno, reescrito';
+    r = planOf(buildBp(on), buildBp(retitled)).plan;
+    eq(byKey(r)[K('guided_practice', C1)].action, 'REGENERATE', 'content nuevo → la práctica guiada se rehace');
+    assertNoProviderSpend(r);
   });
 
   // ── Filas de §P ───────────────────────────────────────────────────────────

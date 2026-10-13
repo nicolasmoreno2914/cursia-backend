@@ -25,10 +25,10 @@ export const LLM_WORKER_SINCE_ENV = 'DYNAMIC_LLM_WORKER_SINCE';
 // Loop 9 (autonomía): TODAS las partes de IA v3 van al worker por defecto (también las cortas: course_intro, module_intro,
 // video_interactions, activity y exam). Sin esto un run no termina sin una pestaña abierta (audio_welcome depende de
 // course_intro, video_interactions traba el cierre y el empaquetado automático solo corre con el run completado).
-// Nunca scorm (v1/v2) ni los tipos de proveedor. El navegador sigue de respaldo automático: solo deja de reclamar un tipo
+// Loop 9 B: + guided_practice (práctica guiada del capítulo). Nunca scorm (v1/v2) ni los tipos de proveedor. El navegador sigue de respaldo automático: solo deja de reclamar un tipo
 // si un worker VIVO lo cubre (presencia).
 export const ALL_LLM_WORKER_TYPES: readonly ItemType[] = [
-  'course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'exam', 'final_exam',
+  'course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'exam', 'final_exam',
 ] as ItemType[];
 /** Loop 4/6: las partes LARGAS (las primeras que salieron del navegador). Se conserva como referencia. */
 export const LONG_LLM_WORKER_TYPES: readonly ItemType[] = ['course_plan', 'content', 'application_activity', 'experience', 'final_exam'] as ItemType[];

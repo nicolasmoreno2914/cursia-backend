@@ -1,5 +1,6 @@
 import { lqaFindings, lqaHitLabel, LQA_SKIP_KEYS } from '../language-qa/language-qa';
 import { APPLICATION_ARTIFACT_TYPE, applicationActivitySummary, validateApplicationActivityDoc } from './application-activity';
+import { GUIDED_PRACTICE_ARTIFACT_TYPE, guidedPracticeSummary, validateGuidedPracticeDoc } from './guided-practice';
 /**
  * R11a — validación SERVER-SIDE (pura) de los artifacts LLM de rulesVersion 3
  * antes de aceptar la completitud de un item (scheduler.completeItem).
@@ -12,6 +13,8 @@ import { APPLICATION_ARTIFACT_TYPE, applicationActivitySummary, validateApplicat
  * | video_interactions | dynamic_video_interactions_json    | validateVideoInteractionsDoc (R8)          |
  * | activity (h5p)     | dynamic_h5p_params_json            | validateH5pActivityPayload (R7 + rotación) |
  * | final_exam         | dynamic_exam_gift                  | validateExamGift (parseGIFT)               |
+ * | application_activity | dynamic_application_json         | validateApplicationActivityDoc (Fase 2)    |
+ * | guided_practice    | dynamic_guided_practice_json       | validateGuidedPracticeDoc (Loop 9 B)       |
  * | exam / final_exam  | dynamic_exam_bank_json (EV6 P2)    | validateExamBank (plan del Manifest)       |
  *
  * EV6 P2 (despliegue mixto): `exam` y `final_exam` aceptan EXACTAMENTE uno de
@@ -60,6 +63,8 @@ export function v3ValidatedArtifactType(type: string, variant?: string | null): 
       return variant === 'h5p' ? 'dynamic_h5p_params_json' : null;
     case 'application_activity':
       return APPLICATION_ARTIFACT_TYPE;
+    case 'guided_practice':
+      return GUIDED_PRACTICE_ARTIFACT_TYPE;
     case 'exam':
     case 'final_exam':
       return EXAM_BANK_ARTIFACT_TYPE;
@@ -101,6 +106,8 @@ export interface V3ItemValidationContext {
   examChapterMd?: ReadonlyMap<string, string>;
   /** Fase 2: minutos de la Actividad de Aplicación (item del Manifest congelado). */
   applicationMinutes?: number | null;
+  /** Loop 9 B: minutos de la práctica guiada (item del Manifest congelado). */
+  guidedPracticeMinutes?: number | null;
   /** Language QA: curso de idiomas o de lengua/literatura (cita «vosotros», voseo o inglés a propósito) → sin chequeo de idioma. */
   languageCourse?: boolean;
 }
@@ -305,6 +312,13 @@ function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string
       }
       const errors = validateApplicationActivityDoc(doc, { chapterId: ctx.chapterId, minutes: ctx.applicationMinutes });
       return { ok: errors.length === 0, errors, ...(errors.length === 0 ? { summary: applicationActivitySummary(doc) } : {}) };
+    }
+    case 'guided_practice': {
+      if (!ctx.chapterId || typeof ctx.guidedPracticeMinutes !== 'number') {
+        throw new Error(`V3_VALIDATION_CONTEXT: guided_practice ${ctx.itemKey} sin chapterId o minutos`);
+      }
+      const errors = validateGuidedPracticeDoc(doc, { chapterId: ctx.chapterId, minutes: ctx.guidedPracticeMinutes });
+      return { ok: errors.length === 0, errors, ...(errors.length === 0 ? { summary: guidedPracticeSummary(doc) } : {}) };
     }
     default:
       throw new Error(`V3_VALIDATION_CONTEXT: tipo ${ctx.type} sin validador`);

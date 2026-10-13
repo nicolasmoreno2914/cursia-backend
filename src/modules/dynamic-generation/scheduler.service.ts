@@ -1,6 +1,8 @@
 import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
+import { GUIDED_PRACTICE_SCHEMA_VERSION } from '../course-shell/guided-practice';
+import { guidedPracticeExercisePlan } from '../study-time/guided-practice-tiers';
 import {
   BadRequestException,
   ConflictException,
@@ -119,6 +121,8 @@ export const BROWSER_CLAIMABLE_TYPES: ItemType[] = [
   'experience', 'video_interactions', 'activity', 'final_exam',
   // Fase 2: Actividad de Aplicación (actividad + solucionario, texto LLM del navegador).
   'application_activity',
+  // Loop 9 B: práctica guiada del capítulo (solo un ejecutor que anuncia GUIDED_PRACTICE_FEATURE la recibe).
+  'guided_practice',
 ];
 /**
  * V2.1 rulesVersion 3 (R4): items de PROVEEDOR que solo reclama el worker del
@@ -292,6 +296,12 @@ export interface ClaimPayloadV3 {
    * `context` = estudiante + resultados de aprendizaje CONGELADOS en el Blueprint (null si el perfil no los define).
    */
   application?: { minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string };
+  /**
+   * Loop 9 B: práctica guiada del capítulo de contenido. `minutes` = nivel del Manifest; `exercises` = plan de Cursia
+   * (ids E1.. y minutos de cada ejercicio, que el ejecutor copia tal cual); `context` = estudiante + resultados
+   * congelados (null si el Blueprint no los trae).
+   */
+  guidedPractice?: { minutes: number; schemaVersion: number; exercises: { id: string; minutes: number }[]; context: unknown };
 }
 
 /**
@@ -323,6 +333,11 @@ export interface ClaimOptions {
 export const PEDAGOGY_BRIEF_FEATURE = 'pedagogy-brief-1';
 /** Fase 2: el ejecutor del navegador sabe generar items `application_activity` (actividad + solucionario). */
 export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-1';
+/**
+ * Loop 9 B: el ejecutor sabe generar items `guided_practice` (práctica guiada). Un ejecutor que no lo anuncia NUNCA
+ * recibe el tipo: se le quita de los tipos del claim (el worker o una pestaña actualizada lo genera).
+ */
+export const GUIDED_PRACTICE_FEATURE = 'guided-practice-1';
 
 /**
  * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
@@ -480,7 +495,12 @@ export class SchedulerService {
    */
   async claimNextItemDetailed(opts: ClaimOptions): Promise<ClaimResult> {
     const executorId = this.checkExecutorId(opts.executorId);
-    const types = this.checkTypes(opts.types);
+    let types = this.checkTypes(opts.types);
+    // Loop 9 B: un ejecutor del navegador que no anuncia la práctica guiada nunca recibe el tipo (defensa en profundidad:
+    // uno anterior ni siquiera lo pide; el run con prácticas guiadas lo rechaza abajo con el 409 visible).
+    if (opts.ownerId !== undefined && opts.ownerId !== null && !(opts.executorFeatures ?? []).includes(GUIDED_PRACTICE_FEATURE)) {
+      types = types.filter((t) => t !== 'guided_practice');
+    }
     const leaseSeconds = this.clampLease(opts.leaseSeconds);
     if (opts.ownerId !== undefined && opts.ownerId !== null) {
       // Defensa en profundidad (R16): el camino navegador (ownerId) nunca
@@ -498,6 +518,7 @@ export class SchedulerService {
         await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
         await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
         await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
+        await this.assertExecutorGeneratesGuidedPractice(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
         // Loop 4: con el worker de IA habilitado Y vivo, las partes LARGAS que cubre las genera el servidor (no el navegador).
         // Loop 6: solo en runs creados desde la activación (DYNAMIC_LLM_WORKER_SINCE); los anteriores siguen como siempre.
         // Review I2: el instante es el que PUBLICA cada worker vivo en su latido (no el env del API).
@@ -733,6 +754,27 @@ export class SchedulerService {
       `rules_version_mismatch: la ejecución ${runId} tiene Actividades de Aplicación y este navegador ejecuta una versión ` +
       'anterior de Cursia que no sabe generarlas. Recarga la página para continuar; con esta versión el curso no podría terminar.';
     throw new ConflictException({ message, code: 'executor_outdated_application', runId });
+  }
+
+  /**
+   * Loop 9 B: igual que las Actividades de Aplicación — un run con prácticas guiadas solo lo ejecuta un navegador que
+   * sabe generarlas (si no, reclamaría todo lo demás, renovaría el lease exclusivo y las prácticas quedarían en pending
+   * para siempre). 409 visible «recarga la página» ANTES de reclamar nada.
+   */
+  private async assertExecutorGeneratesGuidedPractice(runId: string, ownerId: string, features: string[]): Promise<void> {
+    if (features.includes(GUIDED_PRACTICE_FEATURE)) return;
+    const [row] = await this.dataSource.query(
+      `select coalesce(m.manifest_json->'items', '[]'::jsonb) @> '[{"type":"guided_practice"}]'::jsonb as guided
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    if (!row || row.guided !== true) return;
+    const message =
+      `rules_version_mismatch: la ejecución ${runId} tiene prácticas guiadas y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no sabe generarlas. Recarga la página para continuar; con esta versión el curso no podría terminar.';
+    throw new ConflictException({ message, code: 'executor_outdated_guided_practice', runId });
   }
 
   /**
@@ -1334,6 +1376,13 @@ export class SchedulerService {
         throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin applicationMinutes en el Manifest; no se completa sin validar`);
       }
     }
+    if (g.type === 'guided_practice') {
+      // Loop 9 B: los minutos salen del item del Manifest congelado (nunca del ejecutor).
+      ctx.guidedPracticeMinutes = typeof mItem.guidedPracticeMinutes === 'number' ? mItem.guidedPracticeMinutes : null;
+      if (ctx.guidedPracticeMinutes === null) {
+        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin guidedPracticeMinutes en el Manifest; no se completa sin validar`);
+      }
+    }
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
       ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
@@ -1478,6 +1527,7 @@ export class SchedulerService {
       case 'video_interactions':
       case 'activity':
       case 'application_activity':
+      case 'guided_practice':
         break;
       default:
         return undefined;
@@ -1500,6 +1550,18 @@ export class SchedulerService {
         context: (snapshot as any)?.course?.applicationContext ?? null,
         // O2b: anuncia que el fail acepta `applicationDraftArtifactId` (borrador de la actividad entre intentos).
         draftArtifactType: APPLICATION_DRAFT_ARTIFACT_TYPE,
+      };
+    }
+    if (row.type === 'guided_practice') {
+      // Loop 9 B: minutos (nivel del diseño) y el plan de ejercicios de Cursia (ids y minutos que el ejecutor copia).
+      if (typeof mItem.guidedPracticeMinutes !== 'number') throw new ClaimPayloadUnavailable('MISSING_GUIDED_PRACTICE_MINUTES', `${row.item_key} sin guidedPracticeMinutes en el Manifest`);
+      out.chapterId = row.chapter_id;
+      out.guidedPractice = {
+        minutes: mItem.guidedPracticeMinutes,
+        schemaVersion: GUIDED_PRACTICE_SCHEMA_VERSION,
+        exercises: guidedPracticeExercisePlan(mItem.guidedPracticeMinutes),
+        // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
+        context: (snapshot as any)?.course?.applicationContext ?? null,
       };
     }
     if (row.type === 'experience' || row.type === 'activity' || row.type === 'application_activity') {
