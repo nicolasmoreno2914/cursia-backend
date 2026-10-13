@@ -58,7 +58,14 @@ for f in "$REPO"/scripts/check-*.js; do
     *) a=() ;;
   esac
   (cd "$REPO" && "${CLEAN_ENV[@]}" node "$f" "${a[@]+"${a[@]}"}") > "$REG/$n.log" 2>&1
-  rc=$?; [ $rc -ne 0 ] && FAIL=1
+  rc=$?
+  # Sin frontend, un check que lee el frontend y falla queda BLOCKED (nunca PASS ni se esconde): hay que re-correrlo con acceso.
+  if [ $rc -ne 0 ] && [ -z "$FE" ] && grep -q "CURSIA_FRONTEND_REPO" "$f"; then
+    echo "$n BLOCKED (necesita el frontend: rc=$rc sin acceso; re-correr con CURSIA_FE_READ_TOKEN)" >> "$SUMMARY.notrun"; BLOCKED_FE=1
+    row "$n (BLOCKED)" "$rc" "$REG/$n.log"
+    continue
+  fi
+  [ $rc -ne 0 ] && FAIL=1
   row "$n" "$rc" "$REG/$n.log"
 done
 for h in "harness-blueprint-snapshot:scripts/harness-blueprint-snapshot.js:dist" \
