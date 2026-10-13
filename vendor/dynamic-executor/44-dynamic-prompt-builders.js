@@ -130,7 +130,13 @@ function dynLibroChapterPrompt(courseContext, outline, chapter, module, chapterN
   var capScope = (chapter && typeof chapter.description === 'string' && chapter.description.trim())
     ? '\nAlcance del capítulo (qué temas debe cubrir; úsalo como guía, el título del capítulo es el de arriba): ' + chapter.description.replace(/\s+/g, ' ').trim()
     : '';
-  return c + '\n\nGenera el CAPÍTULO ' + chapterNumber + ' COMPLETO: "' + capTitle + '"\nMódulo ' + moduleNumber + ': ' + modTitle + capScope + '\n\nIncluye:\n1. Secciones ' + chapterNumber + '.1 a ' + chapterNumber + '.5 — 250-400 palabras c/u, ejemplos concretos y plausibles de ' + sector + ' en ' + pais + ' (sin cifras, estudios ni fuentes inventadas)\n2. Mínimo 1 tabla comparativa con criterios cualitativos (sin cifras inventadas)\n3. ■ Caso ' + pais + ': situación ilustrativa de una institución del sector aplicando el tema (en cursiva; hipotética: sin nombres reales ni cifras inventadas)\n4. ✏ Actividad de Apoyo ' + chapterNumber + '.1: ejercicio concreto con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n5. ✏ Actividad de Apoyo ' + chapterNumber + '.2: segundo ejercicio práctico con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n6. ■ Glosario del Capítulo: 8-12 términos con definición clara de 1-2 líneas cada uno\n\nNO generes portada ni tabla de contenido. Empieza directamente con # Capítulo...\nSemilla:' + s;
+  // Loop 9 (B-extra-1): con práctica guiada propia (blueprint.chapter.guidedPracticeMinutes) el capítulo NO pide además las
+  // 2 «Actividades de Apoyo» (serían una práctica duplicada): una línea remite a la práctica guiada. Sin ella, el texto de siempre.
+  var hasGuided = !!(chapter && typeof chapter.guidedPracticeMinutes === 'number' && chapter.guidedPracticeMinutes > 0);
+  var practiceItems = hasGuided
+    ? '4. ✏ Práctica guiada: este capítulo tiene su propia práctica guiada, que el estudiante hace al terminarlo. NO escribas actividades de apoyo ni ejercicios propios; cierra con una línea que invite a hacer la práctica guiada del capítulo.\n5. ■ Glosario del Capítulo: 8-12 términos con definición clara de 1-2 líneas cada uno'
+    : '4. ✏ Actividad de Apoyo ' + chapterNumber + '.1: ejercicio concreto con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n5. ✏ Actividad de Apoyo ' + chapterNumber + '.2: segundo ejercicio práctico con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n6. ■ Glosario del Capítulo: 8-12 términos con definición clara de 1-2 líneas cada uno';
+  return c + '\n\nGenera el CAPÍTULO ' + chapterNumber + ' COMPLETO: "' + capTitle + '"\nMódulo ' + moduleNumber + ': ' + modTitle + capScope + '\n\nIncluye:\n1. Secciones ' + chapterNumber + '.1 a ' + chapterNumber + '.5 — 250-400 palabras c/u, ejemplos concretos y plausibles de ' + sector + ' en ' + pais + ' (sin cifras, estudios ni fuentes inventadas)\n2. Mínimo 1 tabla comparativa con criterios cualitativos (sin cifras inventadas)\n3. ■ Caso ' + pais + ': situación ilustrativa de una institución del sector aplicando el tema (en cursiva; hipotética: sin nombres reales ni cifras inventadas)\n' + practiceItems + '\n\nNO generes portada ni tabla de contenido. Empieza directamente con # Capítulo...\nSemilla:' + s;
 }
 
 // ── dynScormDataPrompt — equivalente puro de pSCORM_data(item,c) (06-scorms.js:1129) ──
@@ -2074,4 +2080,3 @@ function dynGuidedPracticePrompt(courseContext, outline, chapter, sourceMd, gp, 
     + '\n- Dentro del alcance de ESTE capítulo: sin teoría de otros capítulos.'
     + '\n- No menciones otros recursos del curso (videos, actividades interactivas, Actividad de Aplicación, exámenes o evaluaciones, audiolibro, presentación, Libro Guía): la práctica se lee sola.';
 }
-

@@ -1069,6 +1069,8 @@ async function _dynRunContentV2(item) {
     truthHits: truthHits.slice(0, 8)
   };
   Object.assign(summary, dynPedagogySummary(item));
+  // Loop 9 (B-extra-1): variante del Libro para un capítulo con práctica guiada propia (sin «Actividades de Apoyo»).
+  if (bp.chapter && typeof bp.chapter.guidedPracticeMinutes === 'number' && bp.chapter.guidedPracticeMinutes > 0) summary.libroVariant = 'guided-practice-1';
   if (enumLint.length) summary.enumerationLint = enumLint.slice(0, 5);
   if (contextSummary) {
     // Fix round 1 (m2): el resumen del capítulo (lo leen los exámenes) con el mismo formato de moneda.
