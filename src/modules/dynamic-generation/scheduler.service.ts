@@ -79,7 +79,10 @@ import {
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
 import { ItemPedagogyBrief, buildItemPedagogyBrief } from '../pedagogy/generator-directives';
-import { EXAM_BANK_DRAFT_ARTIFACT_TYPE, clearExamBankDraft, recordExamBankDraft } from './exam-bank-draft';
+import {
+  APPLICATION_DRAFT_ARTIFACT_TYPE, EXAM_BANK_DRAFT_ARTIFACT_TYPE, ITEM_DRAFT_SUMMARY_KEYS,
+  clearApplicationDraft, clearExamBankDraft, recordApplicationDraft, recordExamBankDraft,
+} from './exam-bank-draft';
 import { FailureSource, classifyFailure, isValidFailureCode } from '../reliability/failure-classifier';
 import { executorKindFor, openItemAttempt, recordItemCompleted, recordItemFailure } from '../reliability/attempt-log';
 import {
@@ -288,7 +291,7 @@ export interface ClaimPayloadV3 {
    * Fase 2: Actividad de Aplicación. `minutes` = nivel del Manifest (la actividad se dimensiona con él);
    * `context` = estudiante + resultados de aprendizaje CONGELADOS en el Blueprint (null si el perfil no los define).
    */
-  application?: { minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown };
+  application?: { minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string };
 }
 
 /**
@@ -892,7 +895,8 @@ export class SchedulerService {
       // Fix bank-guard-minors (N-R4): un rechazo del validador del servidor es una falla VALIDADA, no
       // transitoria: para exam/final_exam borra el borrador del banco (null explícito; no-op para otros tipos),
       // así un ejecutor con reglas viejas no reanuda una y otra vez una pregunta que el servidor rechaza.
-      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null });
+      // O2b: ídem el borrador de la actividad de aplicación (no-op para otros tipos).
+      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null, applicationDraftArtifactId: null });
       return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
     }
     const validationPatch =
@@ -1020,8 +1024,9 @@ export class SchedulerService {
         }
       }
 
-      // BANKOPT fix round 1 (M4): el borrador del banco solo sirve entre intentos; al completar se quita.
-      if (merged.merged && typeof merged.merged === 'object') delete (merged.merged as Record<string, unknown>).examBankDraft;
+      // BANKOPT fix round 1 (M4): el borrador del banco solo sirve entre intentos; al completar se quita
+      // (O2b: también el de la actividad de aplicación).
+      if (merged.merged && typeof merged.merged === 'object') for (const k of ITEM_DRAFT_SUMMARY_KEYS) delete (merged.merged as Record<string, unknown>)[k];
       const done = returningRows(
         await qr.query(
           `update public.generation_item_runs
@@ -1062,9 +1067,13 @@ export class SchedulerService {
     ownerId?: string,
     /**
      * examBankDraftArtifactId: id = borrador nuevo; null = borrar el anterior (falla sin faltante); ausente = conservar.
+     * applicationDraftArtifactId (O2b): mismo contrato para application_activity.
      * errorCode (REL R1): código explícito del emisor; solo se registra (clasificación), nunca cambia la transición.
      */
-    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; examBankDraftArtifactId?: string | null; errorCode?: string | null },
+    opts?: {
+      retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean;
+      examBankDraftArtifactId?: string | null; applicationDraftArtifactId?: string | null; errorCode?: string | null;
+    },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
@@ -1077,6 +1086,10 @@ export class SchedulerService {
       const d = await recordExamBankDraft(qr, item, job.owner_id, opts?.examBankDraftArtifactId ?? null, !!retryable);
       if (d.recorded === false && opts?.examBankDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
       if (d.recorded === false && opts?.examBankDraftArtifactId === null) await clearExamBankDraft(qr, item);
+      // O2b: borrador de la actividad de aplicación (actividad validada; solucionario fallido). Mismas guardas.
+      const ad = await recordApplicationDraft(qr, item, job.owner_id, opts?.applicationDraftArtifactId ?? null, !!retryable);
+      if (ad.recorded === false && opts?.applicationDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador de la actividad ignorado (${ad.reason})`);
+      if (ad.recorded === false && opts?.applicationDraftArtifactId === null) await clearApplicationDraft(qr, item);
       // Loop de costos (review I2): conceder el intento por una devolución `run_paused` solo si el run está pausado.
       const grant = opts?.grantAttempt === true && (!msg.startsWith('run_paused') || isPausedRun(job));
       const t = await applyItemFailure(
@@ -1485,6 +1498,8 @@ export class SchedulerService {
         schemaVersion: APPLICATION_ACTIVITY_SCHEMA_VERSION,
         // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
         context: (snapshot as any)?.course?.applicationContext ?? null,
+        // O2b: anuncia que el fail acepta `applicationDraftArtifactId` (borrador de la actividad entre intentos).
+        draftArtifactType: APPLICATION_DRAFT_ARTIFACT_TYPE,
       };
     }
     if (row.type === 'experience' || row.type === 'activity' || row.type === 'application_activity') {

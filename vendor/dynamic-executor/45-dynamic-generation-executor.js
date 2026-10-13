@@ -3988,6 +3988,56 @@ function _dynApplicationClaim(item) {
   var a = _dynClaimField(item, ['application']);
   return _dynIsPlainObject(a) ? a : null;
 }
+
+// ── O2b: borrador de la actividad del estudiante entre intentos (servidor) ──
+// Mismo contrato que el borrador del banco (BANKOPT 1e): si la 1.ª pasada (actividad, la cara) quedó VALIDADA y
+// la 2.ª (solucionario) falla reintentable, el ejecutor sube un artifact `dynamic_application_draft_json` con la
+// actividad y lo informa en el fail (`applicationDraftArtifactId`); el backend lo verifica (dueño, tipo, itemRunId)
+// y lo deja en output_summary.applicationDraft. El próximo intento (cualquier navegador o el worker) solo corre
+// la 2.ª pasada SI coinciden generación, item, capítulo, minutos, schemaVersion, versión del prompt y el sha256
+// del Markdown fuente EXACTO de la 1.ª pasada, `resumes` < 1, y la actividad RE-VALIDA. Si la 2.ª pasada vuelve a
+// fallar tras reanudar, el fail pide borrarlo (null explícito): una actividad mala nunca atrapa los reintentos.
+// Solo se manda el campo si el claim lo anuncia (`application.draftArtifactType`).
+var DYN_APPLICATION_DRAFT_ARTIFACT_TYPE = 'dynamic_application_draft_json';
+var DYN_APPLICATION_DRAFT_MAX_RESUMES = 1;
+function dynApplicationDraftSupported(item) {
+  var a = item && item.type === 'application_activity' && item.claimPayload ? item.claimPayload.application : null;
+  return _dynIsPlainObject(a) && a.draftArtifactType === DYN_APPLICATION_DRAFT_ARTIFACT_TYPE;
+}
+// Campo del fail que lleva el borrador de ESTE item (o null si el claim no anuncia soporte).
+function dynDraftFailField(item) {
+  if (dynExamBankDraftSupported(item)) return 'examBankDraftArtifactId';
+  if (dynApplicationDraftSupported(item)) return 'applicationDraftArtifactId';
+  return null;
+}
+// expect = { chapterId, minutes, schemaVersion, promptVersion, sourceSha256 }.
+// → { activity: obj | null, check: resultado del validador | null, resumes, artifactId, reason }.
+async function _dynAppLoadDraft(item, expect) {
+  var ref = item && _dynIsPlainObject(item.outputSummary) ? item.outputSummary.applicationDraft : null;
+  var out = { activity: null, check: null, resumes: 0, artifactId: null, reason: null };
+  if (!dynApplicationDraftSupported(item)) return out;
+  if (!_dynIsPlainObject(ref) || typeof ref.artifactId !== 'string' || !ref.artifactId) return out;
+  out.artifactId = ref.artifactId;
+  if (ref.generation !== item.generation) { out.reason = 'generation'; return out; }
+  var dl = null;
+  try { dl = await _dynDownloadArtifactText(ref.artifactId); } catch (e) { dl = null; }
+  if (!dl || !dl.ok) { out.reason = 'download'; return out; }
+  var doc = null;
+  try { doc = JSON.parse(dl.text); } catch (e) { doc = null; }
+  if (!_dynIsPlainObject(doc) || doc.draftVersion !== 1 || !_dynIsPlainObject(doc.activity)) { out.reason = 'format'; return out; }
+  if (doc.itemKey !== item.itemKey || doc.generation !== item.generation || doc.chapterId !== expect.chapterId) { out.reason = 'item'; return out; }
+  if (doc.minutes !== expect.minutes || doc.schemaVersion !== expect.schemaVersion) { out.reason = 'shape'; return out; }
+  if (doc.promptVersion !== expect.promptVersion) { out.reason = 'promptVersion'; return out; }
+  if (doc.sourceSha256 !== expect.sourceSha256) { out.reason = 'sourceMd'; return out; }
+  if (typeof doc.resumes !== 'number' || !(doc.resumes >= 0) || doc.resumes >= DYN_APPLICATION_DRAFT_MAX_RESUMES) { out.reason = 'resumes'; return out; }
+  var v = null;
+  try { v = dynValidateApplicationStudentPart(doc.activity, expect.minutes); } catch (e) { v = null; }
+  if (!v || v.errors.length) { out.reason = 'invalid'; return out; }
+  out.activity = doc.activity;
+  out.check = v;
+  out.resumes = doc.resumes;
+  return out;
+}
 async function _dynRunApplicationActivity(item) {
   var bp = item.blueprint || {};
   if (!item.chapterId || !bp.chapter) return { ok: false, error: 'application_activity: el claim no trae chapterId/blueprint.chapter', retryable: false };
@@ -4000,38 +4050,61 @@ async function _dynRunApplicationActivity(item) {
   var courseContext = item.context.courseContext;
   var chapter = Object.assign({}, bp.chapter, { id: item.chapterId });
   var sys = dynApplicationSys(courseContext);
-  // 1.ª pasada: actividad del estudiante.
-  var st = null;
-  var r1 = await _dynV3JsonWithRetry(item, sys, dynApplicationActivityPrompt(courseContext, bp.outline, chapter, sourceMd, app, dynPedagogyBlock(item)), 9000, function (obj) {
-    var v = dynValidateApplicationStudentPart(obj, app.minutes);
-    if (v.errors.length) return { ok: false, errors: _dynFormatErrors(v.errors) };
-    st = v;
-    return { ok: true, value: obj };
-  }, { normalizeMoney: dynCourseIsColombia(courseContext) });
-  if (!r1.ok) return _dynV3Invalid(item, r1.errors, r1.truncated);
-  var activity = r1.value;
-  var v1 = dynValidateApplicationStudentPart(activity, app.minutes);
+  // O2b: borrador del intento anterior (actividad ya validada) → solo se corre la 2.ª pasada.
+  var draftExpect = { chapterId: item.chapterId, minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION, sourceSha256: dynSha256Hex(sourceMd) };
+  var draft = await _dynAppLoadDraft(item, draftExpect);
+  var resumed = !!draft.activity;
+  // Falla validada: pide borrar el borrador anterior (null explícito; solo se manda si el claim lo anuncia).
+  function failClear(res) { res.draftClear = true; return res; }
+  var r1 = null;
+  var activity, v1;
+  if (resumed) {
+    activity = draft.activity;
+    v1 = draft.check;
+  } else {
+    // 1.ª pasada: actividad del estudiante.
+    r1 = await _dynV3JsonWithRetry(item, sys, dynApplicationActivityPrompt(courseContext, bp.outline, chapter, sourceMd, app, dynPedagogyBlock(item)), 9000, function (obj) {
+      var v = dynValidateApplicationStudentPart(obj, app.minutes);
+      if (v.errors.length) return { ok: false, errors: _dynFormatErrors(v.errors) };
+      return { ok: true, value: obj };
+    }, { normalizeMoney: dynCourseIsColombia(courseContext) });
+    if (!r1.ok) return failClear(_dynV3Invalid(item, r1.errors, r1.truncated));
+    activity = r1.value;
+    v1 = dynValidateApplicationStudentPart(activity, app.minutes);
+  }
   // 2.ª pasada: solucionario docente de ESA actividad (ids y criterios fijos).
   var r2 = await _dynV3JsonWithRetry(item, sys, dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd), 9000, function (obj) {
     var errs = dynValidateApplicationSolutionPart(obj, v1.exerciseIds, v1.criteriaNames);
     if (errs.length) return { ok: false, errors: _dynFormatErrors(errs) };
     return { ok: true, value: obj };
   }, { normalizeMoney: dynCourseIsColombia(courseContext) });
-  if (!r2.ok) return _dynV3Invalid(item, r2.errors, r2.truncated);
+  if (!r2.ok) {
+    var f2 = _dynV3Invalid(item, r2.errors, r2.truncated);
+    // Reanudado y vuelve a fallar, o falla no reintentable → el próximo intento regenera las dos pasadas.
+    if (resumed || f2.retryable === false) return failClear(f2);
+    var draftDoc = {
+      draftVersion: 1, itemKey: item.itemKey, generation: item.generation == null ? null : item.generation, chapterId: item.chapterId,
+      minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION,
+      sourceSha256: draftExpect.sourceSha256, resumes: draft.resumes, activity: activity
+    };
+    f2.draft = _dynV3JsonArtifact(item, DYN_APPLICATION_DRAFT_ARTIFACT_TYPE, draftDoc, item.chapterId + '_draft').artifact;
+    return f2;
+  }
   // chapterId, minutos y schemaVersion los pone Cursia (nunca el LLM).
   var doc = { schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, chapterId: item.chapterId, minutes: app.minutes, activity: activity, solution: r2.value };
   var all = dynValidateApplicationDoc(doc, { chapterId: item.chapterId, minutes: app.minutes });
-  if (all.length) return _dynV3Invalid(item, _dynFormatErrors(all), false);
+  if (all.length) return failClear(_dynV3Invalid(item, _dynFormatErrors(all), false));
   var a = _dynV3JsonArtifact(item, 'dynamic_application_json', doc, item.chapterId);
-  void st;
   return {
     ok: true,
     artifacts: [a.artifact],
     summary: Object.assign({
       chapterId: item.chapterId, applicationSchemaVersion: DYN_APPLICATION_SCHEMA_VERSION, minutes: app.minutes, genre: activity.genre,
       exerciseCount: activity.exercises.length, exampleCount: activity.examples.length, criteriaCount: activity.criteria.length,
-      applicationSha256: a.sha, retried: !!(r1.retried || r2.retried), promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION, contentArtifactId: src.contentArtifactId
-    }, src.practice ? { chapterKind: 'practice', practiceSourceChapterIds: src.sourceChapterIds } : {}, dynPedagogySummary(item))
+      applicationSha256: a.sha, retried: !!((r1 && r1.retried) || r2.retried), promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION, contentArtifactId: src.contentArtifactId,
+      resumedFromDraft: resumed
+    }, draft.artifactId ? { draft: { artifactId: draft.artifactId, used: resumed, ignored: draft.reason || null } } : {},
+    src.practice ? { chapterKind: 'practice', practiceSourceChapterIds: src.sourceChapterIds } : {}, dynPedagogySummary(item))
   };
 }
 
@@ -6977,14 +7050,16 @@ function dynExecutorStart(opts) {
       if (!result.ok) {
         // BANKOPT (opción 1e): un banco incompleto deja su borrador (preguntas válidas) para que el
         // reintento solo genere lo que falta. Mejor esfuerzo: si la subida falla, el fail va sin él.
+        // O2b: igual para la actividad de aplicación (actividad validada, solucionario fallido); el campo depende del tipo.
         var failExtra = null;
-        if (result.draft && result.retryable !== false && dynExamBankDraftSupported(item) && !(abandoned || fatallyPaused())) {
+        var draftField = dynDraftFailField(item);
+        if (result.draft && result.retryable !== false && draftField && !(abandoned || fatallyPaused())) {
           try {
             var upDraft = await uploadClaimedArtifact(item, result.draft);
-            if (upDraft.ok && upDraft.artifactId) failExtra = { examBankDraftArtifactId: upDraft.artifactId };
+            if (upDraft.ok && upDraft.artifactId) { failExtra = {}; failExtra[draftField] = upDraft.artifactId; }
           } catch (eDraft) { /* sin borrador: el fail va sin el campo y el backend conserva el anterior */ }
-        } else if (result.draftClear && dynExamBankDraftSupported(item)) {
-          failExtra = { examBankDraftArtifactId: null }; // fix round 4 (R4): falla de reglas sin faltante
+        } else if (result.draftClear && draftField) {
+          failExtra = {}; failExtra[draftField] = null; // fix round 4 (R4): falla de reglas sin faltante
         }
         var failRes = failExtra
           ? await backendDynFail(item.itemRunId, executorId, result.error, result.retryable !== false, failExtra)

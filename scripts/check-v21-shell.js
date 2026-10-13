@@ -1335,6 +1335,107 @@ async function dbChecks() {
       eq(await D.recordExamBankDraft({ async query() { throw new Error('no debe consultar'); } }, { id: st.id, type: 'exam', generation: 1, attempt_count: 1 }, OWNER, good, false), { recorded: false, reason: 'not_retryable' }, 'fail no retryable (sin reintento no hay borrador)');
     });
 
+    await check('DB O2b: borrador de la actividad de aplicación — el fail retryable con applicationDraftArtifactId válido lo deja en output_summary.applicationDraft; otro dueño / tipo / item run / no retryable → ignorado; null explícito borra; ausente conserva; el rechazo del validador del servidor y el complete lo quitan; exam no se afecta', async () => {
+      // La base del test tiene el CHECK de tipos v3 sin application_activity: se aplica la migración real (aditiva, idempotente).
+      await ds.query(fs.readFileSync(path.join(REPO, 'supabase-migration-application-activities.sql'), 'utf8'));
+      const src = await item(`content:${C1}`);
+      const appKey = `application_activity:${C1}`;
+      const cols = (await ds.query(`select column_name from information_schema.columns where table_schema = 'public' and table_name = 'generation_item_runs' and column_name <> 'id'`)).map((r) => r.column_name);
+      const over = { type: `'application_activity'`, item_key: '$2', idempotency_key: `md5(random()::text) || md5(random()::text)`, status: `'pending'`, worker_id: 'null', lease_until: 'null', output_summary: `'{}'::jsonb`, attempt_count: '0', max_attempts: '20', next_retry_at: 'null', error: 'null', finished_at: 'null', depends_on: `'{}'::text[]` };
+      const [{ id: appId }] = await ds.query(
+        `insert into public.generation_item_runs (${cols.join(', ')}) select ${cols.map((c) => (c in over ? over[c] : c)).join(', ')} from public.generation_item_runs where id = $1 returning id`,
+        [src.id, appKey],
+      );
+      const D = loadDist('modules/dynamic-generation/exam-bank-draft.js');
+      const OTHER_OWNER = '99999999-9999-4999-8999-999999999999';
+      const run = async () => { await ds.query(`update public.generation_item_runs set status = 'running', worker_id = 'b1', lease_until = now() + interval '10 minutes', next_retry_at = null where id = $1`, [appId]); };
+      const st = async () => (await ds.query(`select * from public.generation_item_runs where id = $1`, [appId]))[0];
+      const art = async (itemRunId, type = 'dynamic_application_draft_json', owner = OWNER) => (await ds.query(
+        `insert into public.artifacts (owner_id, course_id, type, storage_path, metadata) values ($1, $2, $3, $4, $5::jsonb) returning id`,
+        [owner, String(cid), type, `o2b/draft/${Math.random()}`, JSON.stringify({ itemRunId, itemKey: appKey })]))[0].id;
+      const failWith = (msg, retryable, opts) => sched.failItemDetailed(appId, 'b1', msg, retryable, OWNER, opts);
+      // Negativos: el fail se registra (ok), sin borrador.
+      for (const [label, idFn, retryable] of [
+        ['de otro item', () => art(src.id), true],
+        ['de otro tipo (borrador del banco)', () => art(appId, 'dynamic_exam_bank_draft_json'), true],
+        ['de otro tipo (artifact final)', () => art(appId, 'dynamic_application_json'), true],
+        ['de otro dueño', () => art(appId, 'dynamic_application_draft_json', OTHER_OWNER), true],
+        ['inexistente', async () => '00000000-0000-4000-8000-00000000beef', true],
+      ]) {
+        await run();
+        eq(await failWith('application_activity inválido tras reintento dirigido: ' + label, retryable, { applicationDraftArtifactId: await idFn() }), { ok: true }, 'fail registrado: ' + label);
+        const after = await st();
+        eq([after.status, 'applicationDraft' in after.output_summary], ['retrying', false], 'sin borrador: ' + label);
+      }
+      // Positivo.
+      await run();
+      const good = await art(appId);
+      eq(await failWith('application_activity inválido tras reintento dirigido: solucionario', true, { applicationDraftArtifactId: good }), { ok: true }, 'fail con borrador');
+      let cur = await st();
+      eq([cur.status, cur.output_summary.applicationDraft.artifactId, cur.output_summary.applicationDraft.generation, cur.output_summary.applicationDraft.attempt, typeof cur.output_summary.applicationDraft.recordedAt], ['retrying', good, cur.generation, cur.attempt_count, 'string'], 'output_summary.applicationDraft');
+      eq('examBankDraft' in cur.output_summary, false, 'sin clave del banco');
+      // Ausente (fail transitorio) → conserva; borrador inválido → conserva el anterior.
+      await run();
+      eq(await failWith('Error de red: fetch failed', true), { ok: true }, 'fail transitorio');
+      eq((await st()).output_summary.applicationDraft.artifactId, good, 'conservado tras el fail transitorio');
+      await run();
+      eq(await failWith('application_activity inválido: x', true, { applicationDraftArtifactId: await art(src.id) }), { ok: true }, 'fail con borrador ajeno');
+      eq((await st()).output_summary.applicationDraft.artifactId, good, 'borrador ajeno ignorado; el anterior se conserva');
+      // No retryable con un borrador válido → no se registra (y el anterior queda; el item ya no se reintenta).
+      // null explícito → borra.
+      await run();
+      eq(await failWith('application_activity inválido: reanudado y falla', true, { applicationDraftArtifactId: null }), { ok: true }, 'fail con null');
+      eq('applicationDraft' in (await st()).output_summary, false, 'borrado por el null explícito');
+      // El campo del banco en un application_activity no toca nada (y viceversa, abajo).
+      await run();
+      const good2 = await art(appId);
+      eq(await failWith('application_activity inválido: x', true, { applicationDraftArtifactId: good2 }), { ok: true }, 'fail con borrador 2');
+      await run();
+      eq(await failWith('application_activity inválido: x', true, { examBankDraftArtifactId: null }), { ok: true }, 'null del banco');
+      eq((await st()).output_summary.applicationDraft.artifactId, good2, 'el null del banco no borra el de la actividad');
+      // Rechazo del validador del servidor al completar → falla validada: borra (completeItemDetailed → prevalidateV3).
+      // Se emula la ruta interna con el mismo opts que usa completeItemDetailed.
+      await run();
+      eq(await failWith('v3_payload_invalid: application_activity', true, { examBankDraftArtifactId: null, applicationDraftArtifactId: null }), { ok: true }, 'rechazo del servidor');
+      eq('applicationDraft' in (await st()).output_summary, false, 'borrado por el rechazo');
+      // No retryable: nunca registra.
+      await run();
+      eq(await failWith('application_activity: OUTPUT_TRUNCATED_MAX_TOKENS', false, { applicationDraftArtifactId: await art(appId) }), { ok: true }, 'fail no retryable');
+      eq('applicationDraft' in (await st()).output_summary, false, 'no retryable: sin borrador');
+      // Exam no se afecta: un applicationDraftArtifactId en un exam se ignora y no toca su examBankDraft.
+      const examKey = `exam:${M1}`;
+      // El exam quedó completado arriba: se reabre como intento nuevo (como en el check BANKOPT).
+      await ds.query(`update public.artifacts set item_run_id = null where item_run_id = (select id from public.generation_item_runs where job_id = $1 and item_key = $2)`, [job.id, examKey]);
+      await readyAgain(examKey);
+      await ds.query(`update public.generation_item_runs set status = 'retrying', finished_at = null, max_attempts = attempt_count + 5, next_retry_at = now() - interval '1 second' where job_id = $1 and item_key = $2`, [job.id, examKey]);
+      const ex = await claim(['exam']);
+      assert(ex, 'claim exam: ' + JSON.stringify(await item(examKey)));
+      eq(ex.claimPayload.examBank.draftArtifactType, 'dynamic_exam_bank_draft_json', 'el exam sigue anunciando su borrador');
+      eq('application' in ex.claimPayload, false, 'el exam no anuncia el de la actividad');
+      const exDraft = (await ds.query(`insert into public.artifacts (owner_id, course_id, type, storage_path, metadata) values ($1, $2, 'dynamic_exam_bank_draft_json', $3, $4::jsonb) returning id`,
+        [OWNER, String(cid), `o2b/exdraft/${Math.random()}`, JSON.stringify({ itemRunId: ex.itemRunId })]))[0].id;
+      eq(await sched.failItemDetailed(ex.itemRunId, 'b1', 'EXAM_BANK_INCOMPLETE: hoja corta', true, OWNER, { examBankDraftArtifactId: exDraft, applicationDraftArtifactId: await art(ex.itemRunId) }), { ok: true }, 'fail del exam con ambos campos');
+      let exRow = await item(examKey);
+      eq([exRow.output_summary.examBankDraft.artifactId, 'applicationDraft' in exRow.output_summary], [exDraft, false], 'exam: su borrador sí, el de la actividad no');
+      await readyAgain(examKey);
+      const ex2 = await claim(['exam']);
+      eq(await sched.failItemDetailed(ex2.itemRunId, 'b1', 'Error de red', true, OWNER, { applicationDraftArtifactId: null }), { ok: true }, 'null de la actividad en un exam');
+      exRow = await item(examKey);
+      eq(exRow.output_summary.examBankDraft.artifactId, exDraft, 'el null de la actividad no borra el borrador del banco');
+      // Al completar se quitan las claves de borrador (ITEM_DRAFT_SUMMARY_KEYS), también applicationDraft.
+      await readyAgain(examKey);
+      const ex3 = await claim(['exam']);
+      assert(ex3, 'claim exam 3');
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || '{"applicationDraft":{"artifactId":"x"}}'::jsonb where id = $1`, [ex3.itemRunId]);
+      const modCh = [{ id: C1, moduleId: M1 }, { id: C2, moduleId: M1 }];
+      const okBank = EBF.makeExamBank({ scope: 'module', moduleId: M1, chapters: modCh, chapterIndex: new Map([[C1, 0], [C2, 1], [C3, 2]]), plan: ex3.claimPayload.examBank.plan });
+      eq(await sched.completeItemDetailed(ex3.itemRunId, 'b1', { artifactIds: [await upload('dynamic_exam_bank_json', okBank)], summary: { applicationDraft: { artifactId: 'y' } } }, OWNER), { ok: true }, 'completa');
+      exRow = await item(examKey);
+      eq([exRow.status, 'examBankDraft' in exRow.output_summary, 'applicationDraft' in exRow.output_summary], ['completed', false, false], 'sin borradores tras completar');
+      // Limpieza: la fila sintética no participa del resto del test.
+      await ds.query(`delete from public.generation_item_runs where id = $1`, [appId]);
+    });
+
     await check('DB course_intro: QUANTITY_CLAIM rechazado; válido completo', async () => {
       const ci = await claim(['course_intro']);
       eq([ci.type, ci.claimPayload.validatedArtifactType], ['course_intro', 'dynamic_course_intro_json'], 'claim');
