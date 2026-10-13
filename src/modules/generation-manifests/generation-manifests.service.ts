@@ -50,6 +50,19 @@ function describeErrors(errors: ManifestValidationError[]): string {
  * 0 = legacy/hash). Cualquier otro valor es integridad rota → 500 (nunca se
  * interpreta como 0).
  */
+/**
+ * Loop 9: ¿el Manifest guardado es ANTERIOR a que el examen final dependiera de los exámenes de módulo? (su final_exam
+ * depende solo de content aunque el Manifest tenga items exam). Se reconstruye igual para verificar su determinismo:
+ * una fila existente nunca cambia ni deja de ser válida.
+ */
+function storedLegacyFinalExamDeps(row: any): boolean {
+  const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
+  const items: any[] = Array.isArray(stored?.items) ? stored.items : [];
+  const fin = items.find((i) => i && i.type === 'final_exam');
+  if (!fin || !items.some((i) => i && i.type === 'exam')) return false;
+  return !(Array.isArray(fin.dependsOn) ? fin.dependsOn : []).some((d: unknown) => String(d).startsWith('exam:'));
+}
+
 function storedActivityTypeRules(row: any): ActivityTypeRulesVersion {
   const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
   return activityTypeRulesValue(stored?.features?.activityTypeRules, row?.id);
@@ -220,8 +233,9 @@ export class GenerationManifestsService {
     // reconstruyendo con el marcador guardado, nunca con la config.
     let expectedSha = sha;
     const storedRules = rulesVersion === 3 ? storedActivityTypeRules(existing) : 0;
-    if (storedRules !== activityTypeRules) {
-      const rebuilt = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules: storedRules });
+    const legacyFinalExamDeps = rulesVersion === 3 && storedLegacyFinalExamDeps(existing);
+    if (storedRules !== activityTypeRules || legacyFinalExamDeps) {
+      const rebuilt = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules: storedRules, legacyFinalExamDeps });
       expectedSha = manifestSha256(rebuilt);
     }
     if (existing.manifest_sha256 !== expectedSha) {

@@ -273,14 +273,14 @@ export function moduleIntroKey(moduleId: string): string {
 export function buildGenerationManifest(
   snapshotIn: AnyBlueprintSnapshot,
   source: ManifestSource,
-  opts?: { rulesVersion?: ManifestRulesVersion; activityTypeRules?: ActivityTypeRulesVersion },
+  opts?: { rulesVersion?: ManifestRulesVersion; activityTypeRules?: ActivityTypeRulesVersion; legacyFinalExamDeps?: boolean },
 ): GenerationManifestV1 {
   const rulesVersion: ManifestRulesVersion = opts?.rulesVersion ?? 1;
   if (!SUPPORTED_RULES_VERSIONS.includes(rulesVersion)) {
     throw new Error(`buildGenerationManifest: rulesVersion no soportado: ${String(rulesVersion)}`);
   }
   if (rulesVersion === 3) {
-    return buildGenerationManifestV3(snapshotIn as BlueprintSnapshotV2, source, { activityTypeRules: opts?.activityTypeRules ?? 0 });
+    return buildGenerationManifestV3(snapshotIn as BlueprintSnapshotV2, source, { activityTypeRules: opts?.activityTypeRules ?? 0, legacyFinalExamDeps: opts?.legacyFinalExamDeps === true });
   }
   if ((opts?.activityTypeRules ?? 0) !== 0) {
     // Las reglas de tipo de actividad solo existen en rulesVersion 3 (items activity).
@@ -1080,7 +1080,9 @@ export function manifestSha256(m: GenerationManifestV1): string {
 //   activity:<ch>; ambos con dependsOn = los content de los capítulos de CONTENIDO del módulo, en orden (se apoyan
 //   en sus resúmenes). Sin content, presentation, video ni audiobook_chapter, y fuera de exam/final_exam.
 //   exam:<m>                      module  examEnabled        content del módulo, en orden
-//   final_exam:<courseId>         course  course.finalExam   todos los content, en orden
+//   final_exam:<courseId>         course  course.finalExam   todos los content, en orden + los exam:<m>, en orden
+//                                                            (Loop 9: el final recibe los bancos de módulo como
+//                                                            dependencias; Manifests anteriores: solo los content)
 // Orden canónico: course_plan, course_intro, audio_welcome; por módulo:
 // module_intro → por capítulo (content, experience, presentation, video,
 // video_interactions, activity, audiobook_chapter) → exam; al final final_exam.
@@ -1118,7 +1120,14 @@ function assertV2Snapshot(snapshot: any, where: string): asserts snapshot is Blu
 export function buildGenerationManifestV3(
   snapshot: BlueprintSnapshotV2,
   source: ManifestSource,
-  opts?: { activityTypeRules?: ActivityTypeRulesVersion },
+  opts?: {
+    activityTypeRules?: ActivityTypeRulesVersion;
+    /**
+     * Loop 9: SOLO para reconstruir un Manifest guardado ANTES de que el examen final dependiera de los exámenes de
+     * módulo (verificación de determinismo de una fila existente): final_exam con dependsOn = solo los content.
+     */
+    legacyFinalExamDeps?: boolean;
+  },
 ): GenerationManifestV1 {
   assertV2Snapshot(snapshot, 'buildGenerationManifestV3');
   const activityTypeRules = opts?.activityTypeRules ?? 0;
@@ -1151,6 +1160,7 @@ export function buildGenerationManifestV3(
   ];
   const modules: ManifestModule[] = [];
   const allContentKeys: string[] = [];
+  const allExamKeys: string[] = [];
   let chapterNumber = 0;
 
   const modulesSorted = [...snapshot.modules].sort((a, b) => a.position - b.position);
@@ -1235,10 +1245,14 @@ export function buildGenerationManifestV3(
         key: `exam:${m.id}`, type: 'exam', scope: 'module',
         moduleId: m.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [...contentKeys],
       });
+      allExamKeys.push(`exam:${m.id}`);
     }
   });
   if (course.finalExam) {
-    items.push({ key: finalExamKey(source.courseId), type: 'final_exam', ...courseBase, dependsOn: [...allContentKeys] });
+    // Loop 9 (#542 sin navegador): el final depende también de los exámenes de módulo → recibe sus bancos como
+    // dependencias y evita repetir sus preguntas aunque lo genere el worker (un contexto nuevo por parte).
+    const finalDeps = opts?.legacyFinalExamDeps === true ? [...allContentKeys] : [...allContentKeys, ...allExamKeys];
+    items.push({ key: finalExamKey(source.courseId), type: 'final_exam', ...courseBase, dependsOn: finalDeps });
   }
   if (pedagogyFeature) {
     for (let i = 0; i < items.length; i++) {
@@ -1507,6 +1521,7 @@ export function validateGenerationManifestV3(
   const moduleInfo = new Map<string, { examEnabled: boolean }>();
   const expectedModules: ManifestModule[] = [];
   const allContent: string[] = [];
+  const allExams: string[] = [];
   let chNum = 0;
   const mods = [...snapshot.modules].sort((a, b) => a.position - b.position);
   mods.forEach((mod, idx) => {
@@ -1566,9 +1581,13 @@ export function validateGenerationManifestV3(
         key: `exam:${mod.id}`, type: 'exam', scope: 'module',
         moduleId: mod.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [...modContent],
       });
+      allExams.push(`exam:${mod.id}`);
     }
   });
-  if (finalExam) expected.push(course('final_exam', [...allContent]));
+  // Loop 9: el final depende de los content Y de los exam:<m> (en orden). Un Manifest guardado antes (solo los content)
+  // sigue siendo válido: sus runs en curso y su empaque no cambian (legacyFinalDeps).
+  if (finalExam) expected.push(course('final_exam', [...allContent, ...allExams]));
+  const legacyFinalDeps = [...allContent];
   const expectedByKey = new Map(expected.map((e) => [e.key, e]));
 
   // --- modules[] (espejo, con activityEnabled) ---
@@ -1615,7 +1634,8 @@ export function validateGenerationManifestV3(
         });
       }
       const deps = Array.isArray(it.dependsOn) ? it.dependsOn : [];
-      if (deps.length !== exp.dependsOn.length || deps.some((d, i) => d !== exp.dependsOn[i])) {
+      const sameDeps = (want: readonly string[]) => deps.length === want.length && deps.every((d, i) => d === want[i]);
+      if (!sameDeps(exp.dependsOn) && !(exp.type === 'final_exam' && sameDeps(legacyFinalDeps))) {
         errors.push({
           code: 'WRONG_DEPENDENCIES',
           message: `item ${it.key}: dependsOn esperado ${JSON.stringify(exp.dependsOn)}, encontrado ${JSON.stringify(it.dependsOn)}`,
