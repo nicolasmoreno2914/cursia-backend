@@ -175,8 +175,8 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
 
   // ── 6. Metodología ──
   const met: DocBlock[] = [{ t: 'paragraph', text: 'Cada capítulo combina una presentación del tema, un texto de estudio, actividades interactivas con retroalimentación y, cuando el diseño lo indica, un video con preguntas y una Actividad de Aplicación.' }];
-  // Loop 9 B: la práctica guiada es parte de la metodología (formativa; no es una Actividad de Aplicación).
-  if (m.resources.guidedPractice) met.push({ t: 'paragraph', text: `${guidedPracticeText(m.resources.guidedPractice)}. Cada ejercicio trae una situación del tema, consignas, el producto esperado, criterios para revisar el propio trabajo y una respuesta modelo para comparar después de intentarlo; no es una Actividad de Aplicación ni lleva nota.` });
+  // Loop 9 B: los ejercicios guiados son parte de la metodología (formativos; no son una Actividad de Aplicación).
+  if (m.resources.guidedPractice) met.push({ t: 'paragraph', text: `${guidedPracticeText(m.resources.guidedPractice)}. Cada ejercicio trae una situación del tema, consignas, el producto esperado, criterios para revisar el propio trabajo y una respuesta modelo para comparar después de intentarlo; no son una Actividad de Aplicación ni llevan nota. ${guidedPracticeShareText(m.resources.guidedPractice)}` });
   if (m.pedagogy.cycle.length) met.push({ t: 'list', items: m.pedagogy.cycle.map((t) => ({ text: t })) });
   if (m.pedagogy.methodologyFromDocument) met.push({ t: 'paragraph', text: `Metodología indicada por el documento: ${m.pedagogy.methodologyFromDocument.value}`, origin: o(m.pedagogy.methodologyFromDocument.origin), evidence: m.pedagogy.methodologyFromDocument.evidence });
   sections.push({ id: 'methodology', n: '6', title: 'Metodología', blocks: met });
@@ -196,7 +196,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
       title: `Módulo ${md.n} · ${md.title}`, hours: `${n1(md.hours)} h`, exam: md.exam,
       chapters: md.chapters.map((c) => ({
         n: c.n, title: c.title + (c.proposed ? ' (propuesto)' : ''), hours: `${n1(c.hours)} h`, practice: c.kind === 'practice',
-        tags: [c.kind === 'practice' ? 'Práctica' : '', c.video ? 'Video' : '', c.activity ? 'Actividad' : '', c.applicationMinutes ? `Aplicación ${c.applicationMinutes} min` : '', c.guidedPracticeMinutes ? `Práctica guiada ${c.guidedPracticeMinutes} min` : ''].filter(Boolean),
+        tags: [c.kind === 'practice' ? 'Práctica' : '', c.video ? 'Video' : '', c.activity ? 'Actividad' : '', c.applicationMinutes ? `Aplicación ${c.applicationMinutes} min` : '', c.guidedPracticeMinutes ? `Ejercicios guiados ${c.guidedPracticeMinutes} min` : ''].filter(Boolean),
       })),
     })) });
   sections.push({ id: 'structure', n: '7', title: 'Duración y estructura', blocks: st });
@@ -229,7 +229,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   if (R.videos) res.push({ text: plural(R.videos, 'video educativo previsto', 'videos educativos previstos'), note: 'Con preguntas integradas para comprobar la comprensión.' });
   if (R.interactiveActivities) res.push({ text: plural(R.interactiveActivities, 'actividad interactiva prevista', 'actividades interactivas previstas'), note: 'Práctica con retroalimentación inmediata.' });
   if (R.applicationActivities) res.push({ text: plural(R.applicationActivities, 'Actividad de Aplicación prevista', 'Actividades de Aplicación previstas'), note: 'Casos o talleres con solucionario solo para docentes.' });
-  if (R.guidedPractice) res.push({ text: guidedPracticeText(R.guidedPractice), note: 'Ejercicios con respuesta modelo, para practicar después de estudiar el capítulo.' });
+  if (R.guidedPractice) res.push({ text: guidedPracticeText(R.guidedPractice), note: `Ejercicios con respuesta modelo, para practicar después de estudiar el capítulo. ${guidedPracticeShareText(R.guidedPractice)}` });
   if (R.audiobookChapters) res.push({ text: `Audiolibro previsto (${plural(R.audiobookChapters, 'capítulo', 'capítulos')})`, note: 'Versión en audio de los contenidos.' });
   if (R.welcomeAudio) res.push({ text: 'Mensaje de bienvenida en audio' });
   if (R.guideBook) res.push({ text: 'Libro Guía del curso', note: 'Documento descargable con todos los contenidos.' });
@@ -421,10 +421,16 @@ export function approvalStateTexts(meta: PrebriefDocumentMeta): string[] {
   return ['BORRADOR · NO APROBABLE', 'Vista previa: todavía no es una versión para aprobar.'];
 }
 
-/** Loop 9 B: «Práctica guiada en cada capítulo de contenido (formativa, no calificada): N ejercicios de M min». */
+/** Fix round 1 (I1): el peso de los ejercicios guiados en las horas, a la vista: «Ejercicios guiados: X h de Y h (Z %)». */
+export function guidedPracticeShareText(g: { minutes: number; designHours: number; sharePct: number }): string {
+  const h = (n: number) => String(Math.round(n * 10) / 10).replace('.', ',');
+  return `Ejercicios guiados: ${h(g.minutes / 60)} h de ${h(g.designHours)} h (${g.sharePct} %).`;
+}
+
+/** Loop 9 B: «Ejercicios guiados en cada capítulo de contenido (formativos, no calificados): N ejercicios de M min». */
 export function guidedPracticeText(g: { chapters: number; everyContentChapter: boolean; exercises: { min: number; max: number }; exerciseMinutes: { min: number; max: number } }): string {
   const range = (r: { min: number; max: number }) => (r.min === r.max ? String(r.min) : `${r.min}–${r.max}`);
   const where = g.everyContentChapter ? 'en cada capítulo de contenido' : `en ${g.chapters === 1 ? '1 capítulo de contenido' : `${g.chapters} capítulos de contenido`}`;
   const n = range(g.exercises);
-  return `Práctica guiada ${where} (formativa, no calificada): ${n} ${g.exercises.max === 1 ? 'ejercicio' : 'ejercicios'} de ${range(g.exerciseMinutes)} min`;
+  return `Ejercicios guiados ${where} (formativos, no calificados): ${n} ${g.exercises.max === 1 ? 'ejercicio' : 'ejercicios'} de ${range(g.exerciseMinutes)} min`;
 }

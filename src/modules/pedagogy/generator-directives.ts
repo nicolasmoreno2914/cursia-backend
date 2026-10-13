@@ -558,7 +558,7 @@ function directivesFor(gen: PedagogyGeneratorId, input: BriefInput): { directive
       if (verbs.length) directives.push({ target: 'objectives.verbs', value: verbs.join(','), label: verbs.join(', '), instruction: `Redacta las consignas con verbos como: ${verbs.join(', ')}.` });
       directives.push(d('feedback.mode', fb.mode, `${need(FEEDBACK_TEXT, fb.mode, 'feedback.mode')} Aplícalo en la respuesta modelo que el estudiante revisa después de intentarlo.`));
       overridden.push({
-        target: 'feedback.timing', value: fb.timing ?? '', by: 'product', scope: 'partial', rule: 'La práctica guiada muestra la respuesta modelo debajo de cada ejercicio (formativa, sin nota)',
+        target: 'feedback.timing', value: fb.timing ?? '', by: 'product', scope: 'partial', rule: 'Los ejercicios guiados muestran la respuesta modelo debajo de cada ejercicio (formativos, sin nota)',
         effect: 'El estudiante la revisa después de intentarlo; cuántos ejercicios y sus minutos los fija Cursia.',
       });
       break;

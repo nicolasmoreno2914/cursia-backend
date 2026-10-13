@@ -951,7 +951,7 @@ async function dbChecks() {
       const gpInManifest = (await ds.query(`select coalesce(manifest_json->'items', '[]'::jsonb) @> '[{"type":"guided_practice"}]'::jsonb a from public.course_generation_manifests where id = $1`, [dto.id]))[0].a;
       eq(gpInManifest, true, 'el fixture tiene práctica guiada');
       await rejectsRe(sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro', 'guided_practice'], runId: job.id, ownerId: OWNER, executorFeatures: ['pedagogy-brief-1', 'application-activity-1'] }),
-        /prácticas guiadas/, 'navegador sin guided-practice-1', 409);
+        /ejercicios guiados/, 'navegador sin guided-practice-1', 409);
       const FEAT = ['pedagogy-brief-1', 'application-activity-1', 'guided-practice-1'];
       const act = await sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER, executorFeatures: FEAT });
       assert(act, 'el navegador v3 no reclamó nada');

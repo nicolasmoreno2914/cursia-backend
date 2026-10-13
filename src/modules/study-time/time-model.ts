@@ -261,8 +261,8 @@ export function estimateChapterStudyTime(ch: StudyTimeChapterInput): StudyTimeCh
     if (!(R.guidedPracticeTiers as readonly number[]).includes(ch.guidedPracticeMinutes)) {
       throw new StudyTimeError(`guidedPracticeMinutes del ${where} debe ser uno de ${R.guidedPracticeTiers.join('/')} (fue ${JSON.stringify(ch.guidedPracticeMinutes)})`);
     }
-    if (practice) throw new StudyTimeError(`el ${where} es de práctica: la práctica guiada es solo de los capítulos de contenido`);
-    out.push(res('guided_practice', ch.guidedPracticeMinutes, `práctica guiada de ${ch.guidedPracticeMinutes} min fijada por Cursia`, false));
+    if (practice) throw new StudyTimeError(`el ${where} es de práctica: los ejercicios guiados son solo de los capítulos de contenido`);
+    out.push(res('guided_practice', ch.guidedPracticeMinutes, `ejercicios guiados de ${ch.guidedPracticeMinutes} min fijados por Cursia`, false));
   }
   const chapterEstimatedMinutes = r2(out.reduce((a, x) => a + x.minutes, 0));
   return { chapterId: ch.chapterId, chapterEstimatedMinutes, displayMinutes: displayChapterMinutes(chapterEstimatedMinutes), resources: out };

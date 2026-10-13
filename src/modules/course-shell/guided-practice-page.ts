@@ -35,9 +35,9 @@ export const GUIDED_PRACTICE_KIND_LABEL: Readonly<Record<string, string>> = Obje
   decision_analysis: 'Análisis de decisión',
 });
 
-/** Título de la página: «Práctica guiada — <título del capítulo>». */
+/** Título de la página: «Ejercicios guiados — <título del capítulo>» (fix round 1, I4: el nombre visible; el tipo interno sigue siendo guided_practice). */
 export function guidedPracticePageName(chapterTitle: string): string {
-  return `Práctica guiada — ${chapterTitle}`;
+  return `Ejercicios guiados — ${chapterTitle}`;
 }
 
 /** Texto del bloque de la respuesta modelo (página y Libro Guía). */
@@ -69,7 +69,7 @@ function paragraphsHtml(h: Hx, text: string, s: Surf): string {
 
 export function guidedPracticePage(input: GuidedPracticePageInput, theme: ResolvedTheme): GuidedPracticePage {
   const errs = validateGuidedPracticeDoc(input.doc, { chapterId: input.chapterId, minutes: input.doc?.minutes });
-  if (errs.length) shellFail(`Práctica guiada del capítulo ${input.chapterNumber}: documento inválido (${errs.slice(0, 3).map((e) => `${e.code} ${e.path}`).join('; ')})`);
+  if (errs.length) shellFail(`Ejercicios guiados del capítulo ${input.chapterNumber}: documento inválido (${errs.slice(0, 3).map((e) => `${e.code} ${e.path}`).join('; ')})`);
   const doc = input.doc;
   const h = hx(theme); // CLEAN_SAFE: la página nunca lleva <style>.
   const s = bgSurf(h);
@@ -78,9 +78,9 @@ export function guidedPracticePage(input: GuidedPracticePageInput, theme: Resolv
   const name = guidedPracticePageName(input.chapterTitle);
   const n = doc.exercises.length;
   let body =
-    meta(h, `Práctica guiada · Capítulo ${input.chapterNumber} · ${n} ejercicios · ~${doc.minutes} min`, ink, s) +
+    meta(h, `Ejercicios guiados · Capítulo ${input.chapterNumber} · ${n} ejercicios · ~${doc.minutes} min`, ink, s) +
     heading(h, 'h2', name, s) +
-    pHtml(h, labelHtml('Práctica formativa: no tiene nota. Resuelve cada ejercicio con lo que aprendiste en este capítulo y después compara tu trabajo con la respuesta modelo.'), s, { secondary: true });
+    pHtml(h, labelHtml('Ejercicios formativos: no tienen nota. Resuelve cada ejercicio con lo que aprendiste en este capítulo y después compara tu trabajo con la respuesta modelo.'), s, { secondary: true });
   for (const [i, e] of (doc.exercises as any[]).entries()) {
     body += `<div${st(h, [['margin', '28px 0 0 0'], ['padding', '18px 0 0 0'], ['color', s.fg], ['border-top', `1px solid ${h.t.color.border}`]])}>`;
     body += meta(h, `Ejercicio ${i + 1} de ${n} · ${GUIDED_PRACTICE_KIND_LABEL[e.kind] ?? 'Práctica'} · ~${e.minutes} min`, ink, s);
@@ -108,7 +108,7 @@ export function guidedPracticePage(input: GuidedPracticePageInput, theme: Resolv
  * en las palabras del Libro (sus minutos son los de la práctica guiada: el Libro solo la reproduce).
  */
 export function guidedPracticeLibroMarkdown(doc: any): string {
-  const out: string[] = ['## Práctica guiada del capítulo', '', `Práctica formativa (sin nota): ${doc.exercises.length} ejercicios, unos ${doc.minutes} minutos en total. Intenta cada ejercicio antes de leer la respuesta modelo.`, ''];
+  const out: string[] = ['## Ejercicios guiados del capítulo', '', `Ejercicios formativos (sin nota): ${doc.exercises.length} ejercicios, unos ${doc.minutes} minutos en total. Intenta cada ejercicio antes de leer la respuesta modelo.`, ''];
   for (const [i, e] of (doc.exercises as any[]).entries()) {
     out.push(`### Ejercicio ${i + 1}. ${e.title} (~${e.minutes} min)`, '');
     out.push('**Situación.**', '', ...String(e.situation).split(/\n+/).map((x) => x.trim()).filter(Boolean).flatMap((x) => [x, '']));

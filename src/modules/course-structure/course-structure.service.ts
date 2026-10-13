@@ -118,12 +118,12 @@ function applicationMinutesOrThrow(v: unknown): number | null {
 function guidedPracticeMinutesOrThrow(v: unknown): number | null {
   if (v === null || v === 0) return null;
   if (!isGuidedPracticeMinutes(v)) {
-    throw new BadRequestException({ code: 'INVALID_GUIDED_PRACTICE_MINUTES', message: `INVALID_GUIDED_PRACTICE_MINUTES: los minutos de la práctica guiada deben ser 0, ${GUIDED_PRACTICE_TIERS.join(', ')} (fue ${JSON.stringify(v)})` });
+    throw new BadRequestException({ code: 'INVALID_GUIDED_PRACTICE_MINUTES', message: `INVALID_GUIDED_PRACTICE_MINUTES: los minutos de los ejercicios guiados deben ser 0, ${GUIDED_PRACTICE_TIERS.join(', ')} (fue ${JSON.stringify(v)})` });
   }
   return v;
 }
 function guidedPracticeInPracticeError(): BadRequestException {
-  return new BadRequestException({ code: 'GUIDED_PRACTICE_IN_PRACTICE_CHAPTER', message: 'GUIDED_PRACTICE_IN_PRACTICE_CHAPTER: la práctica guiada es solo para capítulos de contenido.' });
+  return new BadRequestException({ code: 'GUIDED_PRACTICE_IN_PRACTICE_CHAPTER', message: 'GUIDED_PRACTICE_IN_PRACTICE_CHAPTER: los ejercicios guiados son solo para capítulos de contenido.' });
 }
 
 /**

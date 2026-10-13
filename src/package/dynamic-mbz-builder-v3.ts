@@ -238,10 +238,11 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * en párrafos de ≤ 70 palabras, antes de la fila de cifras (antes: todo el texto en UN párrafo a tamaño de entrada).
  * Mismo texto, sin esquema nuevo ni llamadas LLM. El divisor de oraciones (compartido con la presentación del
  * módulo) ya no descarta el texto previo a un punto sin espacio («1.5») ni corta en abreviaturas.
- * 3.13.0 (Loop 9 B, práctica guiada, mismo número de versión): un capítulo de contenido con práctica guiada lleva la página
- * «Práctica guiada — <capítulo>» (`cv3:ch:<id>:guided_practice`, visible, completion por vista) justo después de la
- * profundización, y sus ejercicios al final del capítulo en el Libro Guía (sin sumar palabras al Libro). Un paquete sin
- * prácticas guiadas es byte a byte el de siempre; uno con ellas viene de un Manifest nuevo (otra clave de reuse).
+ * Loop 9 B · ejercicios guiados (componente `guided_practice`; la versión sigue en 3.13.0 porque un paquete SIN ejercicios
+ * guiados es byte a byte el de siempre, y uno CON ellos solo sale de un Manifest nuevo, con otra clave de reuse): el
+ * capítulo de contenido con ejercicios guiados lleva la página «Ejercicios guiados — <capítulo>» (`cv3:ch:<id>:guided_practice`,
+ * visible, completion por vista) después de la síntesis y antes de la actividad, y los mismos ejercicios al final del
+ * capítulo en el Libro Guía (sin sumar palabras al Libro).
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.13.0';
 
@@ -293,8 +294,8 @@ export interface DynamicPackageContentsV3 {
    */
   applications?: Map<string, unknown>;
   /**
-   * Loop 9 B: chapterId → documento `dynamic_guided_practice_json` validado. Solo con prácticas guiadas: cada una se
-   * empaqueta como página visible del capítulo y al final del capítulo en el Libro Guía.
+   * Loop 9 B: chapterId → documento `dynamic_guided_practice_json` validado. Solo en los capítulos con ejercicios guiados:
+   * cada documento se empaqueta como página visible del capítulo y al final del capítulo en el Libro Guía.
    */
   guidedPractices?: Map<string, unknown>;
 }

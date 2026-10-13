@@ -91,7 +91,7 @@ const GENERATOR_INSTRUCTION: Record<string, string> = {
   branching_scenario: 'Las decisiones del escenario deben exigir los desempeños de estos resultados.',
   scorm_activity: 'Las salas deben exigir los desempeños de estos resultados.',
   application_activity: 'La actividad de aplicación y su producto deben evidenciar estos resultados, y sus criterios de evaluación deben referirse a ellos.',
-  guided_practice: 'Los ejercicios de la práctica guiada deben ejercitar estos resultados dentro del alcance del capítulo, y sus criterios de autoevaluación deben referirse a ellos.',
+  guided_practice: 'Los ejercicios guiados deben ejercitar estos resultados dentro del alcance del capítulo, y sus criterios de autoevaluación deben referirse a ellos.',
   exam: 'Cubre cada resultado con al menos una pregunta; para los de saber hacer (aplicar, analizar, evaluar, crear) usa situaciones o casos que exijan aplicarlo, no solo definiciones.',
   final_exam: 'Cubre cada resultado con al menos una pregunta; para los de saber hacer (aplicar, analizar, evaluar, crear) usa situaciones o casos que exijan aplicarlo, no solo definiciones.',
 };

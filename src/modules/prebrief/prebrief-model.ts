@@ -156,7 +156,7 @@ export interface PrebriefModel {
      * Loop 9 B: práctica guiada (formativa, no calificada) — capítulos de contenido con ella, si todos la tienen, y el
      * rango de ejercicios por capítulo y de minutos por ejercicio. Solo si el diseño tiene alguna.
      */
-    guidedPractice?: { chapters: number; everyContentChapter: boolean; exercises: { min: number; max: number }; exerciseMinutes: { min: number; max: number } };
+    guidedPractice?: { chapters: number; everyContentChapter: boolean; exercises: { min: number; max: number }; exerciseMinutes: { min: number; max: number }; /** Fix round 1 (I1): minutos totales y su peso en las horas del diseño. */ minutes: number; designHours: number; sharePct: number };
     audiobookChapters: number;
     welcomeAudio: boolean;
     guideBook: boolean;
@@ -675,12 +675,17 @@ function guidedPracticeResource(chs: PrebriefChapter[]): { guidedPractice?: Preb
   const plans = withGp.map((c) => guidedPracticeExercisePlan(c.guidedPracticeMinutes as number));
   const counts = plans.map((p) => p.length);
   const mins = plans.flatMap((p) => p.map((e) => e.minutes));
+  const total = mins.reduce((a, b) => a + b, 0);
+  const designHours = Math.round(chs.reduce((a, c) => a + (c.hours || 0), 0) * 10) / 10;
   return {
     guidedPractice: {
       chapters: withGp.length,
       everyContentChapter: withGp.length === chs.filter((c) => c.kind !== 'practice').length,
       exercises: { min: Math.min(...counts), max: Math.max(...counts) },
       exerciseMinutes: { min: Math.min(...mins), max: Math.max(...mins) },
+      minutes: total,
+      designHours,
+      sharePct: designHours > 0 ? Math.round((total / 60 / designHours) * 100) : 0,
     },
   };
 }

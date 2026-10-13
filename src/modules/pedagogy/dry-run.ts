@@ -123,8 +123,8 @@ export interface ProviderPlan {
 export const COST_CATEGORY_OF_ITEM_TYPE: Readonly<Record<string, 'audiovisual' | 'application' | 'text'>> = Object.freeze({
   video: 'audiovisual', presentation: 'audiovisual', audio_welcome: 'audiovisual', audiobook_chapter: 'audiovisual',
   application_activity: 'application',
-  // Loop 9 B: la práctica guiada es trabajo práctico del estudiante con IA (misma categoría visible que la aplicación).
-  guided_practice: 'application',
+  // Loop 9 B (fix M2): los ejercicios guiados son texto formativo del capítulo (nunca «Actividades de Aplicación»).
+  guided_practice: 'text',
 });
 export const ESTIMATE_ASSUMPTIONS: readonly string[] = Object.freeze([
   'Es una estimación: el uso de cada recurso sale de un modelo típico por tipo (aún no medido con cursos reales), no del contenido de tu curso.',
@@ -476,7 +476,7 @@ export function distributionModelMismatch(
     ['capítulos con video', dist.counts.videoChapters, n('videoCount')],
     ['actividades', dist.counts.activities, n('activityCount')],
     ['Actividades de Aplicación', dist.counts.applicationActivities, n('applicationActivityCount')],
-    ['prácticas guiadas', dist.counts.guidedPractices ?? 0, n('guidedPracticeCount')],
+    ['ejercicios guiados', dist.counts.guidedPractices ?? 0, n('guidedPracticeCount')],
     ['evaluaciones', dist.counts.evaluations, n('examCount') + n('finalExamCount')],
   ];
   const off = pairs.filter(([, a, b]) => Math.abs(a - b) > 1e-6);

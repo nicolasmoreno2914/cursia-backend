@@ -146,7 +146,7 @@ export async function assertGuidedPracticeSchema(q: { query(sql: string, params?
   if (await hasGuidedPracticeSchema(q)) return;
   throw new ServiceUnavailableException({
     code: SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE,
-    message: `${SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE}: esta base no tiene la práctica guiada (course_chapters.guided_practice_minutes); correr supabase-migration-guided-practice.sql antes de usarla.`,
+    message: `${SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE}: esta base no tiene los ejercicios guiados (course_chapters.guided_practice_minutes); correr supabase-migration-guided-practice.sql antes de usarla.`,
   });
 }
 

@@ -647,7 +647,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (a.modname !== 'page') add('GUIDED_PRACTICE', a.idnumber, `debe ser una página (mod_page), es ${a.modname}`);
     if (a.grade || a.inforefGradeItems.length) add('GUIDED_PRACTICE', a.idnumber, 'con ítem de calificación (es formativa)');
     if (a.module.visible === '0') add('GUIDED_PRACTICE', a.idnumber, 'la práctica guiada debe estar visible');
-    if (!/^Práctica guiada — /.test(a.name)) add('GUIDED_PRACTICE', a.idnumber, `nombre «${a.name}» (se espera «Práctica guiada — <capítulo>»)`);
+    if (!/^Ejercicios guiados — /.test(a.name)) add('GUIDED_PRACTICE', a.idnumber, `nombre «${a.name}» (se espera «Ejercicios guiados — <capítulo>»)`);
     const content = unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '');
     const lint = lintCleanSafe(content);
     if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
