@@ -133,7 +133,7 @@ function buildConfig({ moduleCount, examMode, finalExam, engine, objectives }) {
   return snap.buildBlueprintSnapshotV2(course, [...modules].reverse(), [...chapters].reverse());
 }
 // sha256 del Manifest v3 de buildConfig({moduleCount:4, examMode:'alt', finalExam:true, engine:'h5p'}) — fijado en check-v21-manifest-v3.js.
-const PINNED_SHA_V3 = '3992216d4b763eef3dca6524a313decf79af26715240782de928dc63be7953cc';
+const PINNED_SHA_V3 = 'b14bc64f5a907112b5ea61b4daf103d0e1f639f82b829cf7947159f6151510cb';
 const GOLDEN_CFG = { moduleCount: 4, examMode: 'alt', finalExam: true, engine: 'h5p' };
 const OBJECTIVES = [
   'Diseñar estrategias de empaque para exportación',
@@ -151,7 +151,7 @@ const OBJECTIVES = [
 const PINNED_RULES_V1_LISTS_SHA = 'ff995ee83b98028ac66a07ea3c98f3c65529f642f4801698914d4df043dc90a4';
 const PINNED_RULES_V1_BEHAVIOR_SHA = '7d60c85e0b5c6659e241d4e6c78b4fae65c13523d459a9f89c57bd7657cbbdfc';
 const PINNED_RULES_V1_FORM_COUNT = 8451;
-const PINNED_SHA_V3_RULES1 = 'c9ad40c71ef93f797c35e6cded78f439217b1e8b16a5b297e9ac4b62d4414b48';
+const PINNED_SHA_V3_RULES1 = 'efdc78b88b9fef36c7ad530d38831c99bb4dac5fe542cedf9a5e917c39a024a3';
 
 /** Blueprint v2 a medida: chapters = [{ id, objective, title?, activity }] en un solo módulo. */
 function oneModule(chapters, engine = 'h5p') {

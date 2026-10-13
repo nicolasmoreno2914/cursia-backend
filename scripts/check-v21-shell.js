@@ -1109,8 +1109,13 @@ async function dbChecks() {
       eq([a.type, a.chapterId, a.variant, a.claimPayload.activityType, a.claimPayload.validatedArtifactType], ['activity', C1, 'h5p', 'questionset', 'dynamic_h5p_params_json'], 'activity C1');
       const a2 = await claim(['activity']);
       eq([a2.chapterId, a2.claimPayload.activityType], [C2, 'dragtext'], 'activity C2 (rotación)');
+      // Loop 9: el final depende también de los exam:<m> → hasta que no estén completos no es reclamable.
+      eq(await claim(['final_exam']), null, 'final_exam espera a los exámenes de módulo');
+      // Los exámenes de módulo se prueban más abajo (EV6 P2): acá se dan por completos «a mano», como el plan y los content.
+      await ds.query(`update public.generation_item_runs set status = 'completed' where job_id = $1 and type = 'exam'`, [job.id]);
       const fe = await claim(['final_exam']);
       eq([fe.type, fe.claimPayload.finalExam], ['final_exam', { minQuestions: 5, maxQuestions: 40 }], 'final_exam');
+      eq(fe.dependsOn.filter((d) => d.startsWith('exam:')).length, (await ds.query(`select count(*)::int n from public.generation_item_runs where job_id = $1 and type = 'exam'`, [job.id]))[0].n, 'el final depende de cada exam:<m>');
     });
 
     await check('DB completeItem RECHAZA experience inválido: v3_payload_invalid + códigos, item → retrying con error, artifact sin vincular', async () => {
@@ -1173,6 +1178,8 @@ async function dbChecks() {
 
     await check('DB EV6 P2: exam y final_exam aceptan el banco dynamic_exam_bank_json (plan del claim, questionCount = slots); plan ≠ Manifest → EXAM_BANK_PLAN; banco + GIFT → EXAM_ARTIFACT_AMBIGUOUS; evidencia falsa → EXAM_BANK_EVIDENCE al completar', async () => {
       const examKey = `exam:${M1}`;
+      // Loop 9: el examen de módulo se había dado por completo «a mano» (dependencia del final): vuelve a la cola.
+      await ds.query(`update public.generation_item_runs set status = 'pending' where job_id = $1 and item_key = $2`, [job.id, examKey]);
       // Fix 1 (I1): completeItem lee el dynamic_content_md vigente de cada capítulo del examen para la evidencia.
       const gIndex = new Map([[C1, 0], [C2, 1], [C3, 2]]);
       for (const [cId, gi] of gIndex) {
