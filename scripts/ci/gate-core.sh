@@ -82,7 +82,7 @@ else
   echo "harnesses del frontend BLOCKED (sin acceso al frontend: secreto CURSIA_FE_READ_TOKEN)" >> "$SUMMARY.notrun"
 fi
 
-NETBLOCK=$(grep -c . "$REG/net.log" 2>/dev/null || echo 0)
+NETBLOCK=$(grep -c . "$REG/net.log" 2>/dev/null); NETBLOCK=${NETBLOCK:-0}
 {
   echo "## Gate-core (sin Moodle)"
   echo
