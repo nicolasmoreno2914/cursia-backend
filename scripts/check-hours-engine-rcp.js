@@ -125,7 +125,7 @@ check('HE4 sin targetHours y con perfil vacío: la salida de siempre', () => {
   eq([b.distribution, b.pedagogical], [null, null], 'perfil vacío');
   eq(S[33].baseline.blueprintSha256 !== b.baseline.blueprintSha256, true, 'con objetivo, el Blueprint lleva targetHours');
   // Dorado (rama staging 00d2399, idéntico al de antes del motor de horas: check-target-hours fija los 80 casos legacy).
-  const GOLD = ['21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4', 'e4a859788fd35c2496fe7384e3e9c4e47be9b4e707f6a9b3380ca82ba0f31066'];
+  const GOLD = ['21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4', '8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca'];
   eq([a.baseline.blueprintSha256, a.baseline.manifestSha256], GOLD, 'sin objetivo: sha de siempre');
   eq([b.baseline.blueprintSha256, b.baseline.manifestSha256], GOLD, 'perfil vacío: sha de siempre');
 });

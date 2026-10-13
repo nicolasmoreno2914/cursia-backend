@@ -5,28 +5,28 @@
     "noProfile": {
       "baseline": {
         "blueprint": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
-        "manifest": "e4a859788fd35c2496fe7384e3e9c4e47be9b4e707f6a9b3380ca82ba0f31066",
+        "manifest": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca",
         "manifestErrors": 0
       }
     },
     "emptyProfile": {
       "baseline": {
         "blueprint": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
-        "manifest": "e4a859788fd35c2496fe7384e3e9c4e47be9b4e707f6a9b3380ca82ba0f31066",
+        "manifest": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca",
         "manifestErrors": 0
       }
     },
     "competenciasNoTarget": {
       "baseline": {
         "blueprint": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
-        "manifest": "e4a859788fd35c2496fe7384e3e9c4e47be9b4e707f6a9b3380ca82ba0f31066",
+        "manifest": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca",
         "manifestErrors": 0
       }
     },
     "approach:competencias": {
       "pedagogical": {
         "blueprint": "4dee02ac6594ff42b7246cf71c3318f00e2bb976d7b380d9f9c1b8cf5b94e527",
-        "manifest": "7c0fdbbbb9168229364ade2cbb651b272cf0cf534a13293b8508788aad7c2cf3",
+        "manifest": "942b597f3c1e36ca37bba9c9881a5da5dc5104bbfb30984d526a4fb44fcb3739",
         "manifestErrors": 0,
         "usd": {
           "expected": "34.15",
@@ -44,7 +44,7 @@
     "approach:problemas": {
       "pedagogical": {
         "blueprint": "4f08a00d5798ef3e76cb8b268e1ab91d918d8a3de628012f71848c429724577c",
-        "manifest": "94a7215e66bf606fc19b70e220d4dc7fcd8739e7ec0f07576ed99e281bc63bad",
+        "manifest": "c6b3b03bd85dd0e19549d0d95690a5f3cf2f9b411f190200b5e294c3574c09c1",
         "manifestErrors": 0,
         "usd": {
           "expected": "26.27",
@@ -62,7 +62,7 @@
     "approach:experiencial": {
       "pedagogical": {
         "blueprint": "fc52c6739a8e93b5860be47cc09e1ce93a3e774767542c54ad91230851f52ae6",
-        "manifest": "b51ab687b729dcae475ad50cbb3bc5a514ad3c2287f23ba5996a8a1059e8a39e",
+        "manifest": "d1c402266fda001f04b8de8403ad54f3d324f2487f4025d1018396c6d242c2b3",
         "manifestErrors": 0,
         "usd": {
           "expected": "34.15",
@@ -80,7 +80,7 @@
     "approach:significativo": {
       "pedagogical": {
         "blueprint": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
-        "manifest": "25382fa7166e6e3b9af556901ba25dd072133039c3864a5b488b0707079d034a",
+        "manifest": "e696a6d7c137ad30fa844425c89ebd1f3a35e040a4ab723686b20d8a67666228",
         "manifestErrors": 0,
         "usd": {
           "expected": "34.15",
@@ -98,7 +98,7 @@
     "approach:autodirigido": {
       "pedagogical": {
         "blueprint": "43bda4df7550f32c4407fa9cc5a42e2f51529e6ed9c8dccb00e56a8e72038e02",
-        "manifest": "80667ff3e60f439d9a3f213aadac16a8839d01998649ddb0634b12a94d668be3",
+        "manifest": "92964e1d9269c6cebd731f5769231efe1973d0fe9898fd18b88a4ec043120ce4",
         "manifestErrors": 0,
         "usd": {
           "expected": "34.15",
@@ -116,7 +116,7 @@
     "approach:competencias+experiencial": {
       "pedagogical": {
         "blueprint": "cfb13a727faab7ce1d5c4825e3b7006001137fab6b7451cf914ec802d066d2b4",
-        "manifest": "e2b4ead781f88f434a69aae00de8177a90e424a93ee92d5ea8d4de64598e19a2",
+        "manifest": "2c724a255c57a24466fb2179591749635a0537442759097a90f02825ba60e5e4",
         "manifestErrors": 0,
         "usd": {
           "expected": "34.15",
@@ -134,7 +134,7 @@
     "approach:problemas+significativo+autodirigido": {
       "pedagogical": {
         "blueprint": "8829c14a9c06e133f93ea4f86c9c52b88cf7cb64ff2dc7c3513460d5c299ec9f",
-        "manifest": "74f785dc6732464848c50047b58bc966a28395f5db2ffc00090ba6299f78ede9",
+        "manifest": "d7b17d36e95e729932749314518822bb6be6a2a1f9de0cfa675385f54174a43f",
         "manifestErrors": 0,
         "usd": {
           "expected": "26.27",
@@ -152,7 +152,7 @@
     "approach:novatos-significativo": {
       "pedagogical": {
         "blueprint": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
-        "manifest": "25382fa7166e6e3b9af556901ba25dd072133039c3864a5b488b0707079d034a",
+        "manifest": "e696a6d7c137ad30fa844425c89ebd1f3a35e040a4ab723686b20d8a67666228",
         "manifestErrors": 0,
         "usd": {
           "expected": "34.15",
@@ -187,7 +187,7 @@
       "proposalSha256": "94b9e93dc7696398ccd56f1162f76fbc5166e5de695f73d3421f8cac34a35461",
       "materialized": {
         "blueprint": "299e782cfe1456f03c9777e32a1a8c7ff507e31fc774767a2011d36355ccda06",
-        "manifest": "0335a7e6dc7fa7466b03ddbc007ef0c2fb038291616195ab73af82ce97587f2b",
+        "manifest": "9b0a248c75c1c804655f9432edddb82cbcfd05f8f891283479f70463fd9a13e4",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,
@@ -241,7 +241,7 @@
       "proposalSha256": "0fe27ea7a3634374eda4d4220e8ac48114842ad7ebbe5b132c4c5d48eba33b46",
       "materialized": {
         "blueprint": "f6e837fa35d5503dc49be0c91e3970d559337ad9992199d2d2ae1401302a21ef",
-        "manifest": "47b1a6dbb3fbec728522430c8726977b3e179dcb71d27b00dff0330c34a88857",
+        "manifest": "6dba8636a9bae505f659817c0ae5fbe46a1b5b223b2ca82b5bd69084fa3c4e60",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,
@@ -295,7 +295,7 @@
       "proposalSha256": "da5ba7fd4b550f59f425b7e52c01ec0b8556b13b3f7fe95e15491e7b7d186036",
       "materialized": {
         "blueprint": "fd871d9290e31d24180137f6b6d1a38bda96c98d819ef82d7cd8d64557c56bed",
-        "manifest": "cc1c1802ae8132c7d7d2342479db9c58b5a3d95afe3908ad5120dbf37fad0726",
+        "manifest": "2306532ca9f1c24edf2a102c50d7c84eab5920d3d64381e593b1f1e0c65cd518",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,
@@ -349,7 +349,7 @@
       "proposalSha256": "fb8dd28380465c150d75e6f95d886d779cf09de2a7c93ef039d4e32baabb3a56",
       "materialized": {
         "blueprint": "553c6532811b732200ac4e22f34d72e26dbf04775fabe25bbe88485fb801380e",
-        "manifest": "558e7975001071fbcb0483cac60aacbdbf161f5340c1c29849ed72ccbf1710c9",
+        "manifest": "dbb5788f7dd581320374a4093c70b54a5cfcdd16f480973b5bb218017aa05b64",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,
@@ -403,7 +403,7 @@
       "proposalSha256": "bad906f9349f00dafb61f951778db96d7973723e6265f9f8bfd4de79d4d45a30",
       "materialized": {
         "blueprint": "eb26e6f9f31c40ca0ab401f0aa7d4b86f6528a6e174b3506475e5f88f02b49ee",
-        "manifest": "05170d72bb2cff9fbbf0b8e65a11a695c754e64c1eb4e4a3b80772923ad618a2",
+        "manifest": "e1fcd5fa338a6117d61b99b6d639b1ac0ac429ae40563e11c9e8f59a65175107",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,
@@ -457,7 +457,7 @@
       "proposalSha256": "b5f54b707fd7b952c796d2122a02a7a2928df5ee1d83fe2de13507bf2bdbec95",
       "materialized": {
         "blueprint": "73bc22a9e7777850cdf2309b6c37b2307caae093212447a52861069f2345c506",
-        "manifest": "b2c729c6ed7d3de90659aff43a99c23bb86e06e2691d3b17f0f42596b048cbfd",
+        "manifest": "d05845da8c73d5522ca815ce467eb7f2ff400c01d4c0ed041726f25ac1461c75",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,

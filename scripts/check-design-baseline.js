@@ -95,7 +95,7 @@ if (WRITE) {
 const gold = JSON.parse(fs.readFileSync(GOLDEN, 'utf8'));
 
 check('BL1 sin perfil / perfil vacío: sha de Blueprint y Manifest de siempre (= dorado de Fase 1)', () => {
-  const LEGACY = ['21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4', 'e4a859788fd35c2496fe7384e3e9c4e47be9b4e707f6a9b3380ca82ba0f31066'];
+  const LEGACY = ['21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4', '8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca'];
   for (const k of ['noProfile', 'emptyProfile']) {
     eq([now.scenarios[k].baseline.blueprint, now.scenarios[k].baseline.manifest], LEGACY, `${k}`);
     eq(now.scenarios[k], gold.scenarios[k], `${k} = dorado`);
