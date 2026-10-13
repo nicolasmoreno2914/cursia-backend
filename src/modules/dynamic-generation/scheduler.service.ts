@@ -316,6 +316,13 @@ class ClaimPayloadUnavailable extends Error {
   }
 }
 
+/** Loop 9 (B-extra-1): minutos de la práctica guiada del capítulo según el Manifest congelado (item guided_practice), o null. */
+function guidedMinutesOfChapter(manifest: GenerationManifestV1, chapterId: string | null | undefined): number | null {
+  if (!chapterId) return null;
+  const it = (manifest.items || []).find((i: any) => i.type === 'guided_practice' && i.chapterId === chapterId) as any;
+  return it && typeof it.guidedPracticeMinutes === 'number' ? it.guidedPracticeMinutes : null;
+}
+
 export interface ClaimOptions {
   runId?: string;
   executorId: string;
@@ -2046,6 +2053,8 @@ export class SchedulerService {
               description: descOf(sChapter),
               position: sChapter.position,
               videoEnabled: sChapter.videoEnabled,
+              // Loop 9 (B-extra-1): el capítulo tiene práctica guiada propia → el Libro no pide además «Actividades de Apoyo».
+              ...(guidedMinutesOfChapter(manifest, row.chapter_id) !== null ? { guidedPracticeMinutes: guidedMinutesOfChapter(manifest, row.chapter_id) } : {}),
             }
           : null,
         moduleChapters,
