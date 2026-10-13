@@ -16,6 +16,7 @@ import { cmpDec, normalizeDecimal, DecimalLike } from './decimal';
 import { BudgetDecision, BudgetPolicy, EvaluateBudgetResult, SpentSoFar, evaluateBudget } from './budget';
 import type { EstimateItem, EstimateResult } from './estimator';
 import { bankAskCount, expectedExamPlan } from '../course-shell/exam-bank';
+import { guidedPracticeExercisePlan, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 
 export const BUDGET_APPROVAL_REQUIRED = 'budget_approval_required';
 export const BUDGET_BLOCKED = 'budget_blocked';
@@ -88,6 +89,8 @@ export interface RunManifestItem {
   chapterId?: string | null;
   /** Fase 2: minutos de la Actividad de Aplicación (items application_activity). */
   applicationMinutes?: number;
+  /** Loop 9 B: minutos de la práctica guiada (items guided_practice). */
+  guidedPracticeMinutes?: number;
 }
 
 const GENERATING = new Set(['GENERATE', 'REGENERATE']);
@@ -190,6 +193,18 @@ export function applicationUsageScale(minutes: number | null | undefined): Reado
 }
 
 /**
+ * Loop 9 B: la salida de `llm.guided_practice` crece con los ejercicios del nivel; los priors son los de un capítulo de
+ * 80 min (2 ejercicios). 40/60/80 = 2 ejercicios (×1); 120 = 3 (×1,5). La entrada (fuente del capítulo) no cambia.
+ */
+const GUIDED_PRACTICE_REFERENCE_EXERCISES = 2;
+export function guidedPracticeUsageScale(minutes: number | null | undefined): Readonly<Record<string, number>> | null {
+  const m = Number(minutes);
+  if (!isGuidedPracticeMinutes(m)) return null;
+  const n = guidedPracticeExercisePlan(m).length;
+  return { output_tokens: Math.round((n / GUIDED_PRACTICE_REFERENCE_EXERCISES) * 10000) / 10000 };
+}
+
+/**
  * Capítulos (orden del Manifest) por módulo que cubren los exámenes: los que tienen `content` (todo capítulo de
  * contenido lo tiene en v1/v2/v3). Motor de carga horaria: un capítulo de práctica no tiene content ni entra al banco.
  */
@@ -234,7 +249,8 @@ export function estimateItemsForRun(
         : it.type === 'final_exam' ? examBankUsageScale('final_exam', chapters)
           : it.type === 'audiobook_chapter' && it.chapterId ? audiobookUsageScale(opts?.chapterWords?.[it.chapterId])
             : it.type === 'application_activity' ? applicationUsageScale(it.applicationMinutes)
-              : null;
+              : it.type === 'guided_practice' ? guidedPracticeUsageScale(it.guidedPracticeMinutes)
+                : null;
     out.push({
       itemKey: it.key,
       itemType: it.type,
