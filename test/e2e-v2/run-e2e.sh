@@ -13,12 +13,17 @@ export REPO="${E2E_BACKEND_ROOT:?define E2E_BACKEND_ROOT (checkout de orbia-back
 export FE_ROOT="${E2E_FRONTEND_ROOT:?define E2E_FRONTEND_ROOT (checkout de campuscloud-gen a probar)}"
 export OUT="$SCRATCH/e2e-out"
 export TLS_DIR="$OUT/tls"
+# CI (gate-core): E2E_NO_MOODLE=1 solo es válido con E2E_SKIP_V2=1 (fases sin Moodle, p. ej. E24).
+if [ "${E2E_NO_MOODLE:-0}" = "1" ]; then
+  [ "${E2E_SKIP_V2:-0}" = "1" ] || { echo "E2E_NO_MOODLE=1 requiere E2E_SKIP_V2=1"; exit 1; }
+  E2E_MOODLE_DIR="${E2E_MOODLE_DIR:-$SCRATCH/no-moodle}"
+fi
 export MOODLE_SCRATCH="${E2E_MOODLE_DIR:?define E2E_MOODLE_DIR (Moodle 4.5 local, ver moodle-local/README)}"
 export MOODLE_ROOT="$MOODLE_SCRATCH/source"
 export MOODLE_PHPINI="$MOODLE_SCRATCH/php.ini"
-export PHP_BIN="/opt/homebrew/opt/php@8.3/bin/php"
+export PHP_BIN="${PHP_BIN:-/opt/homebrew/opt/php@8.3/bin/php}"
 export LC_ALL=C
-PGBIN=/opt/homebrew/bin
+PGBIN="${PGBIN:-/opt/homebrew/bin}"
 PORT="${E2E_PG_PORT:-55491}"
 export PGPORT_T=$PORT APP_PORT="${E2E_APP_PORT:-38471}"
 DATA="$SCRATCH/e2e-pgdata"
@@ -83,7 +88,9 @@ env $STG node "$REPO/scripts/migrate-llm-worker-presence.js" > "$OUT/migrate-llm
 echo "schema + migraciones reales OK"
 
 echo "== Moodle 4.5 local =="
-if pg_isready -h 127.0.0.1 -p 5570 >/dev/null 2>&1; then
+if [ "${E2E_NO_MOODLE:-0}" = "1" ]; then
+  echo "E2E_NO_MOODLE=1: sin Moodle (solo fases que no lo usan)"
+elif pg_isready -h 127.0.0.1 -p 5570 >/dev/null 2>&1; then
   echo "Postgres del Moodle local ya estaba arriba (127.0.0.1:5570): se usa tal cual y no se detiene al final"
 else
   "$MOODLE_SCRATCH/start.sh" > "$OUT/moodle-start.log" 2>&1 || { cat "$OUT/moodle-start.log"; exit 10; }

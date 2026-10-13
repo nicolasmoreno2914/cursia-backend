@@ -1,0 +1,83 @@
+# Gate-core en GitHub Actions: la parte del gate que no necesita el Moodle local corre en la nube,
+# sin depender de que un portátil siga despierto. USD 0 de proveedores: sin secretos de proveedores,
+# netguard bloquea toda red externa. Repo público → minutos de runners estándar gratis.
+# El gate completo (con Moodle) sigue siendo test/e2e-v2/run-e2e-v21.sh en local.
+name: gate-core
+
+on:
+  pull_request:
+    branches: [staging]
+  workflow_dispatch:
+    inputs:
+      fe_ref:
+        description: 'Rama/commit del frontend (default: misma rama que el backend, si no staging)'
+        required: false
+
+concurrency:
+  group: gate-core-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate-core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: be
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: be/package-lock.json
+
+      - name: PostgreSQL 16 (binarios, sin servicio)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-16 >/dev/null
+          sudo systemctl stop postgresql || true
+          ls /usr/lib/postgresql/16/bin/initdb
+
+      - name: Frontend (repo privado, solo lectura)
+        env:
+          FE_TOKEN: ${{ secrets.CURSIA_FE_READ_TOKEN }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          FE_REF_INPUT: ${{ inputs.fe_ref }}
+        run: |
+          if [ -z "$FE_TOKEN" ]; then
+            echo "::warning::Falta el secreto CURSIA_FE_READ_TOKEN: E24 y harnesses del frontend quedan BLOCKED (el gate-core termina en BLOCKED, nunca PASS)."
+            exit 0
+          fi
+          url="https://x-access-token:${FE_TOKEN}@github.com/nicolasmoreno2914/cursia.git"
+          ref="${FE_REF_INPUT:-$BRANCH}"
+          if git ls-remote --exit-code --heads "$url" "$ref" >/dev/null 2>&1; then :; else ref=staging; fi
+          git clone -q --depth 1 --branch "$ref" "$url" fe
+          git -C fe remote set-url origin https://github.com/nicolasmoreno2914/cursia.git
+          echo "frontend: $ref $(git -C fe rev-parse HEAD)"
+          echo "GATE_FE_ROOT=$GITHUB_WORKSPACE/fe" >> "$GITHUB_ENV"
+
+      - name: Dependencias
+        run: |
+          cd be && npm ci --no-audit --no-fund
+          mkdir -p "$RUNNER_TEMP/jsdom" && cd "$RUNNER_TEMP/jsdom" && npm init -y >/dev/null && npm i --no-audit --no-fund jsdom@26 >/dev/null
+          echo "GATE_JSDOM_NODE_PATH=$RUNNER_TEMP/jsdom/node_modules" >> "$GITHUB_ENV"
+          echo "CHROME_BIN=$(command -v google-chrome || command -v chromium || true)" >> "$GITHUB_ENV"
+
+      - name: Gate-core
+        run: |
+          cd be
+          GATE_OUT="$RUNNER_TEMP/gate-core" bash scripts/ci/gate-core.sh
+      - name: Resumen
+        if: always()
+        run: cat "$RUNNER_TEMP/gate-core/summary.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gate-core-logs
+          path: ${{ runner.temp }}/gate-core
+          retention-days: 7
