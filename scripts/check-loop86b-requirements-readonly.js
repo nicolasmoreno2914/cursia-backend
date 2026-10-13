@@ -77,7 +77,8 @@ const extract = (text, docId = 'D1') => RX.extractRequirements(read(text).lines,
 const SML_TABLE = 'Tamaños de curso\nTAMAÑO HORAS ESTRUCTURA\nS\n1 h/sem\n20–22 h 3 módulos\n× 3 capítulos\nM\n2 h/sem\n40–44 h 3 módulos\n× 4 capítulos\nL\n3 h/sem\n60–66 h 4 módulos\n× 5 capítulos\nLa institución elegirá un tamaño por asignatura.';
 const FULL = 'El curso deberá tener 4 módulos con 5 capítulos por módulo. Cada capítulo tendrá 2 videos. Cada módulo tendrá una Actividad de Aplicación. Se realizarán 3 evaluaciones parciales y 1 evaluación final. La intensidad horaria total será de 64 horas.';
 
-function design({ shape, video = 'content', aa = 'first', exams = true, finalExam = true, target = 42, hoursSource = 'proposed', teacher = false, practiceLast = false, avTeacher = false, appTeacher = false }) {
+// Fix round 1 de Loop 9 (M6): las horas se comparan con las ESTIMADAS (por defecto = la meta: un diseño que la alcanza).
+function design({ shape, video = 'content', aa = 'first', exams = true, finalExam = true, target = 42, estimated = target, hoursSource = 'proposed', teacher = false, practiceLast = false, avTeacher = false, appTeacher = false }) {
   const modules = shape.map((n) => ({
     examEnabled: exams,
     chapters: Array.from({ length: n }, (_, i) => ({
@@ -86,7 +87,7 @@ function design({ shape, video = 'content', aa = 'first', exams = true, finalExa
       activityEnabled: true, applicationMinutes: aa === 'first' && i === 0 ? 60 : aa === 'all' ? 45 : null, hours: 3,
     })),
   }));
-  return { modules, evaluations: (exams ? shape.length : 0) + (finalExam ? 1 : 0), targetHours: target, hoursSource, structureByTeacher: teacher, audiovisualByTeacher: avTeacher, applicationByTeacher: appTeacher };
+  return { modules, evaluations: (exams ? shape.length : 0) + (finalExam ? 1 : 0), targetHours: target, estimatedHours: estimated, hoursStatus: 'within_tolerance', hoursSource, structureByTeacher: teacher, audiovisualByTeacher: avTeacher, applicationByTeacher: appTeacher };
 }
 const byKind = (x, kind, et) => x.requirements.filter((r) => r.kind === kind && (!et || r.evaluationType === et));
 const checkOf = (checks, r) => checks.find((c) => c.requirementId === r.id);

@@ -176,7 +176,7 @@ const aaPerModule = (d) => d.modules.map((m) => m.chapters.filter((c) => c.appli
   await check('RC4 Verificación: ok · excepción del docente (advertencia) · conflicto crítico con su causa · por revisar', async () => {
     const reqs = RX.requirementsFor(extract(FULL), {});
     const design = { modules: [0, 1, 2, 3].map(() => ({ examEnabled: true, chapters: Array.from({ length: 5 }, (_, i) => ({ kind: 'content', proposed: false, videoEnabled: true, activityEnabled: true, applicationMinutes: i === 0 ? 60 : null, hours: 3 })) })),
-      evaluations: 5, targetHours: 64, hoursSource: 'document', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false };
+      evaluations: 5, targetHours: 64, estimatedHours: 64, hoursStatus: 'within_tolerance', hoursSource: 'document', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false };
     const checks = DR.compareRequirements(reqs, design);
     const v = RA.requirementVerificationChecks(reqs, checks, { status: 'within_tolerance', baseHours: 50, estimatedHours: 64, modules: 4, moduleExams: 4, exceptionFields: {} });
     const by = (k, et) => v.find((c) => c.id === `requirement:${reqs.find((r) => r.kind === k && (!et || r.evaluationType === et)).id}`);
@@ -191,7 +191,7 @@ const aaPerModule = (d) => d.modules.map((m) => m.chapters.filter((c) => c.appli
     assert(/Entra en conflicto con «4 módulos»/.test(partial.detail) && /El documento pide 3 evaluaciones parciales; el diseño tiene 4 evaluaciones parciales/.test(partial.detail), partial.detail);
     eq(partial.fix.kind, 'editor', 'se resuelve en el editor');
     // Decisión del docente → excepción (advertencia), no conflicto.
-    const t = DR.compareRequirements(reqs, { ...design, targetHours: 48, hoursSource: 'adjusted' });
+    const t = DR.compareRequirements(reqs, { ...design, targetHours: 48, estimatedHours: 48, hoursSource: 'adjusted' });
     const vh = RA.requirementVerificationChecks(reqs, t, { status: 'within_tolerance', baseHours: 30, estimatedHours: 48, modules: 4, moduleExams: 4, exceptionFields: {} }).find((c) => c.id === `requirement:${reqs.find((r) => r.kind === 'target_hours').id}`);
     eq(vh.severity, 'warning', 'horas del docente');
     eq(vh.title, 'Excepción al requisito del documento: 64 horas', 'título');
@@ -748,8 +748,20 @@ async function dbChecks() {
       eq(DR.compareRequirements([req], d(38.7, 'adjusted'))[0].chosenBy, 'document', 'meta del docente dentro del rango ⇒ no es su excepción');
       eq(DR.compareRequirements([req], { ...d(19), targetHours: 20, hoursSource: 'adjusted' })[0].chosenBy, 'teacher', 'meta del docente fuera del rango ⇒ su excepción');
       eq([DR.teacherHoursDeviate([req], 42), DR.teacherHoursDeviate([req], 20), DR.teacherHoursDeviate([req], null)], [false, true, false], 'teacherHoursDeviate');
-      // Sin horas estimadas (diseño sin distribuir) se compara la meta, como antes.
-      eq(DR.compareRequirements([req], { ...d(null) })[0].status, 'met', 'sin estimadas: la meta');
+      // Fix round 1 (M6): sin horas estimadas no se puede comprobar (nunca «Cumple» por la meta).
+      eq(DR.compareRequirements([req], { ...d(null) })[0].status, 'not_verifiable', 'sin estimadas: no verificable');
+      // Fix round 1 (M7): se compara el valor mostrado (un decimal): 39,96 se muestra «40» y cumple.
+      eq([DR.compareRequirements([req], d(39.96))[0].status, DR.compareRequirements([req], d(39.96))[0].actual.value], ['met', 40], 'redondeo de pantalla = estado');
+      // Fix round 1 (I1): meta en el borde (40) y estimadas dentro de la tolerancia pero fuera del rango (38,7) → no cumple,
+      // pero es un «Requisito no cubierto» aceptable (warning con capability), nunca un crítico sin causa.
+      const edge = { ...d(38.7), targetHours: 40 };
+      const vc = RA.requirementVerificationChecks([req], DR.compareRequirements([req], edge), { status: 'within_tolerance', baseHours: 30, estimatedHours: 38.7, modules: 0, moduleExams: 0, exceptionFields: {} })[0];
+      assert(vc.severity === 'warning' && /^Requisito no cubierto por Cursia/.test(vc.title) && vc.capability && /38,7 horas/.test(vc.capability.produces) && /40 h/.test(vc.capability.produces), JSON.stringify(vc));
+      // Por encima del rango dentro de la tolerancia (45 para 40–44, meta 44): igual, no cubierto (no crítico).
+      const over = RA.requirementVerificationChecks([req], DR.compareRequirements([req], { ...d(45), targetHours: 44 }), { status: 'within_tolerance', baseHours: 30, estimatedHours: 45, modules: 0, moduleExams: 0, exceptionFields: {} })[0];
+      eq([over.severity, !!over.capability], ['warning', true], 'por encima, dentro de la tolerancia');
+      // La meta de Cursia para un RANGO del documento es el punto medio (no el borde): 42 para 40–44.
+      eq(RA.hoursFromRequirements([req], null).value, 42, 'meta = punto medio del rango');
     });
 
     await check('RC9 escenario completo (4 × 5, 64 h, 1 AA/mód., 3+1 eval., 2 videos/cap.): diseña dentro y explica lo que no puede', async () => {

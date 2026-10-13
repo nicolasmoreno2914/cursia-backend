@@ -388,12 +388,15 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
           // sea que la fijó: «Cumple» solo si el diseño realmente está en lo que pide el documento (antes: 24,2 h estimadas
           // con la meta escrita en «Ajustar», o 38,7 h con una meta de 40,7 dentro de 40–44, salían «Cumple»). La meta del
           // docente sigue siendo SU decisión: queda como excepción suya (chosenBy), nunca como cumplimiento.
+          // Fix round 1 (M6): sin horas ESTIMADAS no se puede comprobar (nunca «Cumple» por la meta).
+          else if (typeof d.estimatedHours !== 'number' || !Number.isFinite(d.estimatedHours)) nv(r, 'El diseño todavía no tiene horas estimadas.', hoursBy);
           else {
-            const est = typeof d.estimatedHours === 'number' && Number.isFinite(d.estimatedHours) ? d.estimatedHours : d.targetHours;
+            // Fix round 1 (M7): se compara el valor que se MUESTRA (un decimal), así lo que dice la pantalla y el estado coinciden.
+            const est = round1(d.estimatedHours);
             // Una meta del docente que YA está en lo que pide el documento no es un apartamiento suyo: si el diseño no llega,
             // es el mismo choque que con las horas del documento (Verificación lo trata así, nunca como «su decisión»).
             const by: RequirementChooser = hoursBy === 'teacher' && satisfies(r, d.targetHours, true) ? 'document' : hoursBy;
-            out.push({ requirementId: r.id, status: satisfies(r, est, true) ? 'met' : 'unmet', actual: { value: round1(est), ...(round1(est) !== round1(d.targetHours) ? { target: round1(d.targetHours) } : {}) }, chosenBy: by });
+            out.push({ requirementId: r.id, status: satisfies(r, est, true) ? 'met' : 'unmet', actual: { value: est, ...(est !== round1(d.targetHours) ? { target: round1(d.targetHours) } : {}) }, chosenBy: by });
           }
         } else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];

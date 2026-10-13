@@ -785,6 +785,19 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
     } else if (r.kind === 'application_activities' && ctx.exceptionFields.applicationActivities === undefined) {
       cause = ' Con los capítulos del diseño no se pueden ubicar sin pasar los topes de cada capítulo.';
     }
+    // Fix round 1 (I1): las horas ESTIMADAS quedan fuera de lo que pide el documento aunque el diseño esté dentro de la
+    // tolerancia de su meta (p. ej. meta 40, ≈ 38,7 h para 40–44) y nadie se apartó a propósito: no es un choque sin salida
+    // (crítico sin causa) sino un requisito no cubierto con las horas reales — la institución acepta la diferencia (R68).
+    if (!twin && r.kind === 'target_hours' && r.scope.level === 'course' && c.status === 'unmet' && ctx.status === 'within_tolerance' && typeof c.actual?.value === 'number') {
+      const est = c.actual.value as number;
+      const produces = `el diseño de Cursia equivale a ≈ ${n1(est)} horas de trabajo del estudiante: dentro de la tolerancia de su meta${typeof c.actual.target === 'number' ? ` (${n1(c.actual.target)} h)` : ''}, pero fuera de lo que pide el documento (Cursia no rellena textos ni tiempos para llegar)`;
+      out.push({ id, area: 'requirements', severity: 'warning', title: `Requisito no cubierto por Cursia: ${asked}`,
+        detail: `El microcurrículo solicita ${asked}. Actualmente, ${produces}. No se puede presentar como cumplido: para continuar, la institución debe aceptar esta diferencia en la propuesta o ajustar las horas.`,
+        fix: { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' },
+        capability: { requirementKey: String(r.key), requirementText: asked, produces,
+          proposal: `Declarar la carga real de ≈ ${n1(est)} horas o ajustar las horas en «Ajustar» (lo decide la institución).` } });
+      continue;
+    }
     const fix = (r.kind === 'modules' || r.kind === 'chapters' || r.kind === 'structure' || r.kind === 'evaluations')
       ? { kind: 'editor' as const, action: r.kind === 'evaluations' ? 'module_exams' : 'structure', label: 'Resolver en el editor' }
       : r.kind === 'target_hours' ? { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' } : undefined;
