@@ -1404,15 +1404,19 @@ async function dbChecks() {
         await ds.query(`alter table public.course_generation_manifests disable trigger user`);
         try { await ds.query(sql, params); } finally { await ds.query(`alter table public.course_generation_manifests enable trigger user`); }
       };
-      await editManifest(`update public.course_generation_manifests set manifest_json = jsonb_set(manifest_json, '{items}', (manifest_json->'items') || $2::jsonb) where id = $1`,
-        [src.manifest_id, JSON.stringify([{ key: appKey, type: 'application_activity', scope: 'chapter', moduleId: M1, chapterId: C1, dependsOn: [`content:${C1}`], applicationMinutes: 60 }])]);
-      await run();
-      const badDoc = { schemaVersion: 1, chapterId: C1, minutes: 60, activity: { genre: 'calculation' }, solution: {} };
-      const rej = await sched.completeItemDetailed(appId, 'b1', { artifactIds: [await upload('dynamic_application_json', badDoc)], summary: {} }, OWNER);
-      eq([rej.ok, rej.reason], [false, 'v3_payload_invalid'], 'rechazo del validador del servidor (prevalidateV3)');
-      const afterRej = await st();
-      eq([afterRej.status, 'applicationDraft' in afterRej.output_summary], ['retrying', false], 'borrado por el rechazo del servidor');
-      await editManifest(`update public.course_generation_manifests set manifest_json = $2::jsonb where id = $1`, [src.manifest_id, JSON.stringify(savedManifest)]);
+      // Fix round 2 (N2): el Manifest se restaura SIEMPRE (try/finally), aunque algo lance en el medio.
+      try {
+        await editManifest(`update public.course_generation_manifests set manifest_json = jsonb_set(manifest_json, '{items}', (manifest_json->'items') || $2::jsonb) where id = $1`,
+          [src.manifest_id, JSON.stringify([{ key: appKey, type: 'application_activity', scope: 'chapter', moduleId: M1, chapterId: C1, dependsOn: [`content:${C1}`], applicationMinutes: 60 }])]);
+        await run();
+        const badDoc = { schemaVersion: 1, chapterId: C1, minutes: 60, activity: { genre: 'calculation' }, solution: {} };
+        const rej = await sched.completeItemDetailed(appId, 'b1', { artifactIds: [await upload('dynamic_application_json', badDoc)], summary: {} }, OWNER);
+        eq([rej.ok, rej.reason], [false, 'v3_payload_invalid'], 'rechazo del validador del servidor (prevalidateV3)');
+        const afterRej = await st();
+        eq([afterRej.status, 'applicationDraft' in afterRej.output_summary], ['retrying', false], 'borrado por el rechazo del servidor');
+      } finally {
+        await editManifest(`update public.course_generation_manifests set manifest_json = $2::jsonb where id = $1`, [src.manifest_id, JSON.stringify(savedManifest)]);
+      }
       // No retryable: nunca registra.
       await run();
       eq(await failWith('application_activity: OUTPUT_TRUNCATED_MAX_TOKENS', false, { applicationDraftArtifactId: await art(appId) }), { ok: true }, 'fail no retryable');

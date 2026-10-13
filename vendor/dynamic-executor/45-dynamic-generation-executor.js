@@ -4033,13 +4033,18 @@ async function _dynAppLoadDraft(item, expect) {
   if (typeof doc.resumes !== 'number' || !(doc.resumes >= 0) || doc.resumes >= DYN_APPLICATION_DRAFT_MAX_RESUMES) { out.reason = 'resumes'; return out; }
   // Fix round 1 (3): las mismas correcciones deterministas y la misma veracidad/idioma que la 1.ª pasada
   // (_dynV3JsonWithRetry): dinero (Colombia), Language QA y, tras validar, hallazgos DUROS → corrida completa.
+  // Fix round 2 (N1): cualquier excepción de estas pasadas descarta el borrador (corrida completa), nunca falla el item.
   var cc = item.context && item.context.courseContext;
-  if (dynCourseIsColombia(cc)) dynNormalizeMoneyDeep(doc.activity);
-  _dynLqaFixDeep(doc.activity, cc);
+  try {
+    if (dynCourseIsColombia(cc)) dynNormalizeMoneyDeep(doc.activity);
+    _dynLqaFixDeep(doc.activity, cc);
+  } catch (e) { out.reason = 'invalid'; return out; }
   var v = null;
   try { v = dynValidateApplicationStudentPart(doc.activity, expect.minutes); } catch (e) { v = null; }
   if (!v || v.errors.length) { out.reason = 'invalid'; return out; }
-  var hardTruth = _dynJsonTruthHits(doc.activity, cc).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; });
+  var hardTruth;
+  try { hardTruth = _dynJsonTruthHits(doc.activity, cc).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; }); }
+  catch (e) { out.reason = 'invalid'; return out; }
   if (hardTruth.length) { out.reason = 'truth'; return out; }
   out.activity = doc.activity;
   out.check = v;
