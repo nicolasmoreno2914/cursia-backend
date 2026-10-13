@@ -3794,6 +3794,8 @@ function reservationBookkeeping(ev) {
       const W3 = 'e2e-llm-worker-3';
       const W4 = 'e2e-llm-worker-4';
       const LONG = ['content', 'application_activity', 'experience', 'final_exam'];
+      // Loop 9: el worker cubre TODAS las partes de IA v3 (también las cortas); el navegador solo de respaldo.
+      const LLM_TYPES = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'exam', 'final_exam'];
       // Loop 6: instante de activación — el worker y el ruteo aplican solo a runs creados desde acá.
       const LLM_SINCE = new Date(Date.now() - 1000).toISOString();
       const wEnv = (id) => ({
@@ -3844,6 +3846,12 @@ function reservationBookkeeping(ev) {
         c.runId = await startRun(c, C.title);
         CURRENT_RUN = c.runId;
         S.front.DYN_EXAM_BANK_MODE_ENABLED = true;
+        // Loop 9: como en staging (el worker vive desde mucho antes que cualquier run), el navegador arranca con el worker de
+        // IA YA anunciado: si no, el primer claim (course_plan) podía ganarle al primer latido y caer en el respaldo.
+        await waitFor('worker 1 anunciado con todas las partes de IA', async () => {
+          const [p] = await q(`select item_types from public.llm_worker_presence where worker_id = $1 and last_seen > now() - interval '60 seconds'`, [W1]);
+          return p && LLM_TYPES.every((t) => (p.item_types || []).includes(t));
+        }, 120000, 300);
         const claims0 = claimLog.length;
         let ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
         // El navegador DESAPARECE apenas el worker tomó el Libro Guía.
@@ -3867,8 +3875,15 @@ function reservationBookkeeping(ev) {
         ok(items.every((i) => i.status === 'completed'), `E24: las ${items.length} partes completas (navegador + worker de IA)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
         const longRows = rows.filter((i) => LONG.includes(i.type));
         ok(longRows.length >= 7 && longRows.every((i) => [W1, W2].includes(i.worker_id)), 'E24: las partes LARGAS (Libro Guía, Actividad, SCORM, examen final) las generó el worker de IA', longRows.map((i) => [i.item_key, i.worker_id]));
+        const llmRows = rows.filter((i) => LLM_TYPES.includes(i.type));
+        ok(llmRows.length >= 13 && llmRows.every((i) => [W1, W2].includes(i.worker_id)) && ['course_intro', 'module_intro', 'activity', 'exam'].every((t) => llmRows.some((i) => i.type === t)),
+          'E24: Loop 9 — TODAS las partes de IA (también las cortas: presentación del curso y del módulo, actividades, examen de módulo) las generó el worker', llmRows.map((i) => [i.item_key, i.worker_id]));
         const browserClaims = claimLog.slice(claims0);
-        ok(browserClaims.length > 0 && !browserClaims.some((x) => LONG.includes(x.type)), 'E24: el navegador nunca reclamó una parte larga (el servidor se las filtra); sí las cortas', browserClaims.map((x) => x.type));
+        eq(browserClaims.map((x) => x.type), [], 'E24: con el worker de IA vivo el navegador no reclamó NINGUNA parte (el servidor se las filtra todas)');
+        // Loop 9 (A3): el final depende de los exámenes de módulo → los evita aunque lo genere el worker (sin memoria del navegador).
+        const fin1 = rows.find((i) => i.type === 'final_exam');
+        ok(fin1 && fin1.output_summary && fin1.output_summary.externalStems > 0 && fin1.output_summary.externalStemsSource === 'dependencies' && fin1.output_summary.externalStemsUnreadable === 0,
+          'E24: el examen final (worker) recibió las preguntas del examen de módulo como dependencias (externalStems > 0)', fin1 && { n: fin1.output_summary.externalStems, src: fin1.output_summary.externalStemsSource, unread: fin1.output_summary.externalStemsUnreadable });
         const r105 = fake.st.requests.find((r) => r.action === 'slow');
         ok(r105 && r105.outcome === 'ok' && r105.end - r105.at >= 100000, `E24: generación de ${r105 ? Math.round((r105.end - r105.at) / 1000) : '?'} s (>100 s) completa por streaming directo — sin 524`, r105 && { outcome: r105.outcome, ms: r105.end - r105.at });
         ok(longDoneWhileGone.filter((k) => k.startsWith('content:')).length === 3, 'E24: con el navegador CERRADO el worker terminó los 3 Libros Guía (y siguió con lo demás)', { longDoneWhileGone, gone: browserGoneAt, back: browserBackAt });
@@ -3969,7 +3984,7 @@ function reservationBookkeeping(ev) {
         await waitRunTerminal(ctl2, 'E24b run', 15 * 60 * 1000, c2.runId).catch(() => null);
         const rows2 = await waitItemsDone(c2.runId);
         const browserClaims2 = claimLog.slice(claims2);
-        ok(!browserClaims2.some((x) => LONG.includes(x.type)), 'E24b: durante el deploy (worker nuevo vivo) el navegador no tomó ninguna parte larga', browserClaims2.map((x) => x.type));
+        ok(!browserClaims2.some((x) => LLM_TYPES.includes(x.type)), 'E24b: durante el deploy (worker nuevo vivo) el navegador no tomó ninguna parte de IA (Loop 9: ni las cortas)', browserClaims2.map((x) => x.type));
         const f2 = await finished(c2.runId);
         const vib = f2.find((i) => i.type === 'experience' && i.item_key.endsWith(c2.mods[0].chapters[1].id));
         ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 2,
@@ -4028,7 +4043,8 @@ function reservationBookkeeping(ev) {
         const long3 = rows3.filter((i) => LONG.includes(i.type) || i.type === 'course_plan');
         ok(rows3.length > 0 && rows3.every((i) => i.status === 'completed'), 'E24c: el run anterior a la activación se completa', rows3.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
         ok(long3.length >= 2 && long3.every((i) => ![W1, W2, W3, W4].includes(i.worker_id)), 'E24c: sus partes LARGAS las generó el navegador (el worker de IA no toma runs anteriores a la activación)', long3.map((i) => [i.item_key, i.worker_id]));
-        ok(claimLog.slice(claims3).some((x) => LONG.includes(x.type)) && claimLog.slice(claims3).some((x) => x.type === 'course_plan'), 'E24c: el servidor le dejó al navegador las partes largas (y el plan) de ese run, sin colgarse esperando al worker');
+        ok(claimLog.slice(claims3).some((x) => LONG.includes(x.type)) && claimLog.slice(claims3).some((x) => x.type === 'course_plan') && claimLog.slice(claims3).some((x) => x.type === 'course_intro'),
+          'E24c: el servidor le dejó al navegador las partes de IA (largas, cortas y el plan) de ese run, sin colgarse esperando al worker');
         eq(fake.st.requests.slice(fakeBefore).filter((r) => r.text.includes('Juntas de expansión')).length, 0, 'E24c: ninguna llamada del worker de IA para el run anterior');
 
         // ── Corrida 4 (robustez): presupuesto GLOBAL del run agotado → pausa segura sin gastar; nada queda colgado ──
@@ -4054,6 +4070,64 @@ function reservationBookkeeping(ev) {
         eq(fake.st.requests.slice(fakeBefore4).filter((r) => r.text.includes('Arranque de bombas') || r.text.includes('Operación de bombas')).length, 0, 'E24d: ninguna llamada pagada del worker con el presupuesto agotado');
         const running4 = (await finished(c4.runId)).filter((i) => i.status === 'running');
         eq(running4.length, 0, 'E24d: ninguna parte queda en curso (devueltas a la cola, sin consumir intentos)');
+
+        // ── Corrida 5 (Loop 9 · E24-nobrowser): NINGÚN navegador. El worker de IA genera todas las partes de IA, los workers
+        // de proveedores/video lo suyo, el run termina, el paquete final automático se arma y valida (validateMbzV3) solo. ──
+        const C5 = { key: 'E24e', title: '[E2E Worker IA E24e] Sin navegador: curso completo', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+          { title: 'Puesta en marcha de bombas', objective: 'Poner en marcha bombas centrífugas con seguridad', exam: true, chapters: [
+            { title: 'Cebado de la bomba', v: true, a: true, app: 60, objective: 'Cebar una bomba centrífuga antes del arranque' },
+            { title: 'Arranque y parada', v: false, a: true, objective: 'Arrancar y detener la bomba siguiendo el procedimiento' },
+          ] }] };
+        llm.st.tag = 'E24e';
+        const c5 = await createCourse(C5, llm);
+        const body5 = { nombre: C5.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'real' }; // Gamma/TTS/Videogen REALES contra los fakes locales
+        let st5 = await api('POST', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs`, body5);
+        const est5 = /estimateId=([0-9a-f-]{36})/.exec(String(st5.error || ''));
+        ok(st5.status === 409 && !!est5, 'E24e: proveedores reales sin aprobación → 409 budget_approval_required', { s: st5.status, e: st5.error });
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E24e: aprobación (proveedores FALSOS locales)')`, [c5.courseId, est5 && est5[1]]);
+        st5 = await api('POST', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs`, body5);
+        ok(st5.status === 201, 'E24e: run creado tras ADMIN_APPROVED', { s: st5.status, e: st5.error });
+        c5.runId = st5.data.run.id;
+        CURRENT_RUN = c5.runId;
+        const claims5 = claimLog.length;
+        // Loop 9 (A4): el run dice que lo genera el servidor (worker de IA vivo que cubre todas sus partes de IA).
+        const r5a = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}`);
+        eq(r5a.data && r5a.data.serverExecuted, true, 'E24e: run.serverExecuted = true (la pantalla puede decir «puedes cerrar esta pestaña»)');
+        // Ningún dynExecutorStart: solo los workers del servidor.
+        const done5 = await waitFor('run E24e terminado sin navegador', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c5.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 15 * 60 * 1000, 1000);
+        const rows5 = await finished(c5.runId);
+        ok(done5 === 'completed', `E24e: el run terminó \`completed\` sin ningún navegador abierto (${done5})`, rows5.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+        ok(rows5.length > 0 && rows5.every((i) => i.status === 'completed'), `E24e: las ${rows5.length} partes completas`, rows5.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
+        const llm5 = rows5.filter((i) => LLM_TYPES.includes(i.type));
+        eq([...new Set(llm5.map((i) => i.type))].sort(), [...LLM_TYPES].sort(), 'E24e: el curso tiene TODOS los tipos de parte de IA (incluidas las interacciones del video y el examen de módulo)');
+        ok(llm5.every((i) => i.worker_id === W3 && i.output_summary && i.output_summary.generatedBy === 'llm-worker'), 'E24e: cada parte de IA la generó el worker de IA', llm5.map((i) => [i.item_key, i.worker_id]));
+        eq(claimLog.slice(claims5).length, 0, 'E24e: 0 claims del navegador');
+        const fin5 = rows5.find((i) => i.type === 'final_exam');
+        ok(fin5 && fin5.output_summary.externalStems > 0 && fin5.output_summary.externalStemsSource === 'dependencies', 'E24e: el examen final evitó las preguntas del examen de módulo (externalStems > 0, desde las dependencias)', fin5 && fin5.output_summary);
+        // Empaquetado automático (sin clic): el job del paquete final se arma y valida (validateMbzV3 antes de subir).
+        const pkg5 = await waitFor('paquete final automático de E24e', async () => {
+          const jobs = await q(`select id, worker_status, input_payload, output_summary, error_message from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c5.runId]);
+          return jobs.length && ['completed', 'failed'].includes(jobs[jobs.length - 1].worker_status) ? jobs : null;
+        }, 5 * 60 * 1000, 1000);
+        const pj5 = pkg5[pkg5.length - 1];
+        ok(pkg5.length === 1 && pj5.input_payload.auto === true && pj5.worker_status === 'completed' && pj5.output_summary && pj5.output_summary.artifactId,
+          'E24e: el servidor encoló y COMPLETÓ el paquete final automático (validado con validateMbzV3 por el package worker)', pkg5.map((j) => ({ st: j.worker_status, auto: j.input_payload && j.input_payload.auto, err: (j.error_message || '').slice(0, 300) })));
+        const r5 = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}`);
+        const comp5 = r5.data && r5.data.completion;
+        ok(comp5 && comp5.state === 'complete' && comp5.packageReady === true && comp5.complete === true, 'E24e: el curso queda COMPLETO (completion.state complete) sin intervención ni pestaña', comp5);
+        const pst5 = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}/package`);
+        ok(pst5.data && pst5.data.status === 'completed' && pst5.data.deliverable === true && pst5.data.downloadUrl, 'E24e: paquete final entregable descargable', pst5.data);
+        if (pst5.data && pst5.data.downloadUrl) {
+          const buf5 = Buffer.from(await (await fetch(pst5.data.downloadUrl)).arrayBuffer());
+          const z5 = await JSZip.loadAsync(buf5);
+          ok(!!z5.file('moodle_backup.xml') && !!z5.file('files.xml'), `E24e: el .mbz (${buf5.length} bytes) es un backup de Moodle`);
+          results.mbz.E24e = { bytes: buf5.length, sha256: sha(buf5), jobId: pj5.id };
+        }
+        results.courses.E24e = { courseId: c5.courseId, runId: c5.runId, items: rows5.length, llmParts: llm5.length, browserClaims: claimLog.slice(claims5).length, externalStems: fin5 && fin5.output_summary.externalStems, packageJob: pj5.id };
       } finally {
         for (const w of [w1, w2, w3, w4]) if (w && !w.exited) await stopProc(w, 30000);
         await fake.close();
