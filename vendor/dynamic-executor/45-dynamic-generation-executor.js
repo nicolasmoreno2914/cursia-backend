@@ -5973,7 +5973,9 @@ function dynExamBankAssemble(opts) {
     // decidir con datos si la holgura del pedido (MC 2·s+2, V/F y EM 2·s+1) puede bajar. Solo se reporta: no cambia nada.
     var asked = records.filter(function (r) { return r.leafIndex === li; }).length;
     var row = { owner: _dynEbOwnerOf(leaf), type: leaf.type, slots: leaf.slots, kept: keep.length, target: target, floor: floor,
-      requested: asked, accepted: rs.length, acceptedAfterRepair: rs.filter(function (r) { return r.repaired; }).length };
+      requested: asked, accepted: rs.length, acceptedAfterRepair: rs.filter(function (r) { return r.repaired; }).length,
+      // Revisión O4: «usables» excluye las MC con la correcta como la más larga (solo entran de relleno hasta el piso).
+      acceptedUsable: leaf.type === 'multichoice' ? rs.filter(function (r) { return !_dynEbReachOnlyLongest(r.combos); }).length : rs.length };
     perLeaf.push(row);
     // Fix round 1 (C2): mínimo por capítulo en una hoja del final = floor(objetivo / capítulos del módulo).
     // Un capítulo por debajo (sus preguntas fueron rechazadas) se repara aunque la hoja llegue al objetivo.
@@ -6892,7 +6894,10 @@ async function _dynRunExamBank(item) {
     moduleId: moduleId,
     slots: v.slotCount,
     bankSize: a.questions.length,
-    perLeaf: a.perLeaf.map(function (l) { return { owner: l.owner, type: l.type, slots: l.slots, kept: l.kept, floor: l.floor, requested: l.requested, accepted: l.accepted, acceptedAfterRepair: l.acceptedAfterRepair }; }),
+    perLeaf: a.perLeaf.map(function (l) { return { owner: l.owner, type: l.type, slots: l.slots, kept: l.kept, floor: l.floor, requested: l.requested, accepted: l.accepted, acceptedAfterRepair: l.acceptedAfterRepair, acceptedUsable: l.acceptedUsable }; }),
+    // Revisión O4: con partes desde caché o borrador, una reparación anterior parece de primera pasada → la tasa por
+    // hoja de ESTA corrida no sirve para decidir la holgura (solo se usan corridas con yieldMeasurable).
+    yieldMeasurable: stats.cachedChunks === 0 && !(draftInfo && draftInfo.used),
     rejectedByCode: rejectedByCode,
     distractorsDroppedByCode: droppedByCode,
     repaired: repairedCount,
