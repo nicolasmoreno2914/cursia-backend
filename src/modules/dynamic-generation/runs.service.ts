@@ -3230,6 +3230,7 @@ export class RunsService {
       const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
       const plan = await this.planRegeneration(qr, true, {
         courseId, ownerId, job: locked, manifest, mItem, itemKey, videoMode, costKind, expectedGeneration: o.expectedGeneration,
+        skipExamFinalCascade: !!o.autoRepair,
       });
       if (plan.inFlight) {
         return {
@@ -3331,6 +3332,8 @@ export class RunsService {
       videoMode: RunVideoMode;
       costKind: RegenerationCostKind;
       expectedGeneration?: number;
+      /** Loop 9 (fix I3): reparación automática de un examen — sin la arista exam → final_exam (solo ese examen). */
+      skipExamFinalCascade?: boolean;
     },
   ): Promise<RegenerationPlan> {
     const lock = forUpdate ? ' for update' : '';
@@ -3404,11 +3407,13 @@ export class RunsService {
     const stale = staleArtifacts.length > 0 || latest.output_summary?.invalidation?.action === 'STALE_NO_AUTO';
 
     // Cascada (tabla de Fase 8 "editar el capítulo"; v3: regeneration-cascade.ts, fix round 1 I2).
-    const { regenerate: cascadeKeys, stale: staleKeys } = regenerationCascade(
+    const cascade0 = regenerationCascade(
       manifest.rulesVersion,
       manifest.manifest.items,
       { key: itemKey, type: mItem.type, moduleId: mItem.moduleId ?? null, chapterId: mItem.chapterId ?? null },
     );
+    const cascadeKeys = a.skipExamFinalCascade && mItem.type === 'exam' ? cascade0.regenerate.filter((k) => !k.startsWith('final_exam:')) : cascade0.regenerate;
+    const staleKeys = cascade0.stale;
     const depKeys = [...cascadeKeys, ...staleKeys];
     const depRows: any[] = depKeys.length
       ? await q.query(
