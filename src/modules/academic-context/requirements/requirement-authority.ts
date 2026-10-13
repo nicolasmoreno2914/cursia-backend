@@ -738,8 +738,11 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
         : r.kind === 'videos' && ctx.exceptionFields.audiovisual ? { kind: 'adjust' as const, action: 'audiovisual', value: 'requirement', label: 'Volver al requisito del documento' }
           : r.kind === 'application_activities' && ctx.exceptionFields.applicationActivities ? { kind: 'adjust' as const, action: 'applicationActivities', value: 'requirement', label: 'Volver al requisito del documento' }
             : { kind: 'editor' as const, action: 'structure', label: 'Revisar en el editor' };
+      // Loop 9 (A5): en las horas, `has2` son las ESTIMADAS del diseño; si la meta que elegiste es otra, se dicen las dos.
+      const chosen = r.kind === 'target_hours' && typeof c.actual?.target === 'number'
+        ? `${n1(c.actual.target)} ${c.actual.target === 1 ? 'hora' : 'horas'} (el diseño queda en ≈ ${n1(c.actual.value as number)} h)` : has2;
       out.push({ id, area: 'requirements', severity: 'warning', title: `Excepción al requisito del documento: ${asked}`,
-        detail: `Te estás apartando de un requisito del documento: ${docAsks(asked).replace(/^El/, 'el')}; elegiste ${has2}. Cursia respeta tu decisión.`, fix });
+        detail: `Te estás apartando de un requisito del documento: ${docAsks(asked).replace(/^El/, 'el')}; elegiste ${chosen}. Cursia respeta tu decisión.`, fix });
       continue;
     }
     // Review QA M1: el diseño se pasa de las horas del documento por una decisión del docente (estructura, fijados o

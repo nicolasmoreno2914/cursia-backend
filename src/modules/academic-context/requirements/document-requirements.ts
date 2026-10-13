@@ -248,7 +248,8 @@ export interface RequirementCheck {
   status: RequirementCheckStatus;
   /** Lo que tiene el diseño: un valor, una forma (estructura) o uno por módulo/capítulo (alcance «cada»). */
   /** practice: capítulos de práctica por módulo (incluidos en shape). Solo para mostrar el N×M de contenido. */
-  actual: { value?: number | null; shape?: number[]; practice?: number[]; each?: number[] };
+  /** Loop 9 (A5): en las horas del curso, `value` = horas ESTIMADAS del diseño y `target` = la meta (si es otra). */
+  actual: { value?: number | null; shape?: number[]; practice?: number[]; each?: number[]; target?: number };
   /** Quién decidió el valor del diseño: el docente («Te estás apartando…»), el documento o Cursia. */
   chosenBy: RequirementChooser;
   /** Por qué no se puede verificar (o una aclaración). */
@@ -280,6 +281,16 @@ function satisfies(r: DocumentRequirement, a: number, hours: boolean): boolean {
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
+
+/**
+ * Loop 9 (A5): ¿las horas que eligió el docente se APARTAN de algún requisito de horas del curso? (la meta, no lo estimado).
+ * Una meta dentro de lo que pide el documento no es una excepción suya: el choque de horas se evalúa como sin docente.
+ */
+export function teacherHoursDeviate(applicable: DocumentRequirement[], targetHours: number | null): boolean {
+  if (typeof targetHours !== 'number') return false;
+  return applicable.some((r) => r.kind === 'target_hours' && r.scope.level === 'course' && r.obligation === 'required' && typeof r.value === 'number' && r.active !== false
+    && ['exact', 'min', 'max', 'range', 'approx'].includes(String(r.mode)) && !satisfies(r, targetHours, true));
+}
 
 /**
  * Compara los requisitos que APLICAN con el diseño. Solo informa: nunca cambia el diseño ni bloquea nada.
@@ -373,11 +384,17 @@ export function compareRequirements(applicable: DocumentRequirement[], d: Design
           cap(r, 'Cursia diseña cursos de hasta 500 horas de trabajo del estudiante.', null);
         } else if (s.level === 'course') {
           if (typeof d.targetHours !== 'number') nv(r, 'El diseño todavía no tiene horas.', hoursBy);
-          // Review QA I2/M2: solo cuando las horas no las eligió el docente (su meta sigue siendo SU decisión), y con el estado
-          // del distribuidor (no con el redondeo a un decimal): por encima de la tolerancia no cumple.
-          else if (d.hoursStatus === 'above_tolerance' && typeof d.estimatedHours === 'number' && hoursBy !== 'teacher') {
-            out.push({ requirementId: r.id, status: 'unmet', actual: { value: round1(d.estimatedHours) }, chosenBy: hoursBy });
-          } else one(r, d.targetHours, hoursBy, true);
+          // Loop 9 (A5): se comparan las horas ESTIMADAS del diseño (las que muestra la propuesta), nunca la meta, sea quien
+          // sea que la fijó: «Cumple» solo si el diseño realmente está en lo que pide el documento (antes: 24,2 h estimadas
+          // con la meta escrita en «Ajustar», o 38,7 h con una meta de 40,7 dentro de 40–44, salían «Cumple»). La meta del
+          // docente sigue siendo SU decisión: queda como excepción suya (chosenBy), nunca como cumplimiento.
+          else {
+            const est = typeof d.estimatedHours === 'number' && Number.isFinite(d.estimatedHours) ? d.estimatedHours : d.targetHours;
+            // Una meta del docente que YA está en lo que pide el documento no es un apartamiento suyo: si el diseño no llega,
+            // es el mismo choque que con las horas del documento (Verificación lo trata así, nunca como «su decisión»).
+            const by: RequirementChooser = hoursBy === 'teacher' && satisfies(r, d.targetHours, true) ? 'document' : hoursBy;
+            out.push({ requirementId: r.id, status: satisfies(r, est, true) ? 'met' : 'unmet', actual: { value: round1(est), ...(round1(est) !== round1(d.targetHours) ? { target: round1(d.targetHours) } : {}) }, chosenBy: by });
+          }
         } else if (s.level === 'module' && 'index' in s) {
           const m = mods[s.index - 1];
           if (!m) missingModule(r, s.index, modulesBy);

@@ -22,7 +22,7 @@ import type { AcademicContextV1 } from '../academic-context/academic-context';
 import { tokenSet } from '../coherence/normalize';
 import { proposedChapterUuid } from '../pedagogy/dry-run';
 import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../course-structure/structure-authority';
-import { compareRequirements, DesignForRequirements, RequirementCheck } from '../academic-context/requirements/document-requirements';
+import { compareRequirements, DesignForRequirements, RequirementCheck, teacherHoursDeviate } from '../academic-context/requirements/document-requirements';
 import {
   DECISION_DEFAULTS, DecisionOverrides, constraintsFor, EXCEPTION_FIELDS, structureEditedByTeacher, EXCEPTION_VALUES, ExceptionField, hoursFromRequirements, loadExceptions, loadRequirementAuthority,
   chosenContentCap, hoursAlternativeOf, requiredContentShape, requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
@@ -304,6 +304,10 @@ export class CourseDesignService {
       if (shapeIsDocuments) structureByTeacher = false;
       reqChecks = compareRequirements(auth.applicable, designForRequirements(dist, profile.targetHours ?? null, hoursSource === 'requirement' ? 'proposed' : hoursSource,
         structureByTeacher, !!decisions.audiovisual, !!decisions.applicationActivities));
+      // Loop 9 (A5): las horas son «del docente» (su excepción, sin chequeo de choque) solo si su meta se APARTA del documento.
+      // Una meta escrita en «Ajustar» dentro de lo que pide el documento, con un diseño que no llega, es el mismo choque que
+      // con las horas del documento (antes: «Cumple» junto a «24,2 horas (estimadas)»).
+      const hoursByTeacher = (hoursSource === 'user' || hoursSource === 'adjusted') && teacherHoursDeviate(auth.applicable, profile.targetHours ?? null);
       const teacherPins = dist.modules.some((m) => m.chapters.some((c) => !c.proposed && (c.videoPinned || c.applicationPinned)));
       // Re-review final L86C: la causa de un choque de horas se averigua, no se adivina — el mismo diseño SIN las decisiones
       // ni lo fijado por el docente. Si el choque persiste, es entre requisitos del documento (crítico), salvo que la
@@ -313,7 +317,7 @@ export class CourseDesignService {
       const clash = dist.status === 'minimum_exceeds_target' || dist.status === 'cannot_reach_target';
       const decided = EXCEPTION_FIELDS.some((f) => !!decisions[f]) || teacherPins;
       const hoursRequired = auth.required.some((r) => r.kind === 'target_hours');
-      if (clash && hoursRequired && (decided || structureByTeacher) && hoursSource !== 'user' && hoursSource !== 'adjusted') {
+      if (clash && hoursRequired && (decided || structureByTeacher) && !hoursByTeacher) {
         // Sin decisiones ni fijados el cálculo sería idéntico: el choque persiste (re-review final m-4).
         let persists = true;
         if (decided) {
@@ -356,7 +360,7 @@ export class CourseDesignService {
       }
       requirementChecks = requirementVerificationChecks(auth.applicable, reqChecks, {
         clashCause, structureByTeacher, clashWith,
-        status: dist.status, baseHours: dist.baseHours, estimatedHours: dist.estimatedHours, hoursByTeacher: hoursSource === 'user' || hoursSource === 'adjusted',
+        status: dist.status, baseHours: dist.baseHours, estimatedHours: dist.estimatedHours, hoursByTeacher,
         teacherPins,
         hoursAlternative: hoursAlternativeOf(dist),
         modules: dist.modules.length, moduleExams: dist.modules.filter((m) => m.examEnabled).length,

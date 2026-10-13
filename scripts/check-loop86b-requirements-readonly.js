@@ -480,13 +480,15 @@ async function dbChecks() {
       eq(mods.status, after.design.counts.modules === 3 ? 'met' : 'unmet', 'estado coherente');
       assert(['cursia', 'teacher'].includes(mods.chosenBy), 'quién lo decidió');
       const hrs = ch.find((c) => c.requirementId === item('target_hours').id);
-      eq(hrs.actual.value, after.hours.target, 'horas: la meta del diseño');
+      // Loop 9 (A5): la comparación usa las horas ESTIMADAS del diseño (lo que muestra la propuesta), no la meta.
+      eq(hrs.actual.value, Math.round(after.design.estimatedHours * 10) / 10, 'horas: las estimadas del diseño');
       // No bloquea: el diseño sigue aplicable aunque se aparte.
       assert(typeof after.design.applicable === 'boolean', 'la propuesta sigue siendo aplicable o no por sus propias razones');
       // Horas del docente en «Ajustar» → «Te estás apartando».
       const adj = await design.recommend(cid, OWNER, { adjust: { targetHours: 30 } });
       const h2 = adj.requirements.checks.find((c) => c.requirementId === item('target_hours').id);
-      eq([h2.status, h2.chosenBy, h2.actual.value], ['unmet', 'teacher', 30], '30 h del docente');
+      eq([h2.status, h2.chosenBy, h2.actual.target ?? h2.actual.value], ['unmet', 'teacher', 30], '30 h del docente (la meta; actual.value = las estimadas)');
+      eq(h2.actual.value, Math.round(adj.design.estimatedHours * 10) / 10, 'estimadas del diseño con la meta del docente');
     });
     await check('RB13 un PATCH con metadata no borra ni falsifica requisitos ni elección; el listado no arrastra las lecturas', async () => {
       const { CoursesService } = loadDist('modules/courses/courses.service.js');
