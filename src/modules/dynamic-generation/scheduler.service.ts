@@ -301,7 +301,39 @@ export interface ClaimPayloadV3 {
    * (ids E1.. y minutos de cada ejercicio, que el ejecutor copia tal cual); `context` = estudiante + resultados
    * congelados (null si el Blueprint no los trae).
    */
-  guidedPractice?: { minutes: number; schemaVersion: number; exercises: { id: string; minutes: number }[]; context: unknown };
+  guidedPractice?: {
+    minutes: number; schemaVersion: number; exercises: { id: string; minutes: number }[]; context: unknown;
+    /**
+     * Fix I5: lo que los ejercicios guiados NO deben repetir: los títulos de los capítulos de práctica del módulo y los
+     * casos de sus Actividades de Aplicación ya completadas (título, taller, nombres propios). Ausente = nada que evitar.
+     */
+    avoid?: GuidedPracticeAvoid;
+  };
+}
+
+export interface GuidedPracticeAvoid {
+  practiceChapterTitles: string[];
+  applicationCases: { title: string | null; workshopTitle: string | null; names: string[] }[];
+}
+
+/**
+ * Fix I5 (puro, para el claim y los tests): títulos de los capítulos de práctica del módulo del capítulo y los casos de
+ * las Actividades de Aplicación completadas (output_summary.v3Validation). null = nada que evitar.
+ */
+export function guidedPracticeAvoidOf(
+  manifest: { modules: { chapters: { chapterId: string; kind?: string }[] }[] }, snapshot: unknown, chapterId: string, aaSummaries: unknown[],
+): GuidedPracticeAvoid | null {
+  const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === chapterId));
+  if (!mm) return null;
+  const titles = new Map<string, string>();
+  for (const m of ((snapshot as any)?.modules || []) as any[]) for (const c of (m.chapters || []) as any[]) if (c && typeof c.id === 'string') titles.set(c.id, String(c.title || ''));
+  const practiceChapterTitles = mm.chapters.filter((c) => c.kind === 'practice').map((c) => titles.get(c.chapterId) || '').filter(Boolean);
+  const applicationCases = aaSummaries.map((x) => {
+    const v = (x && typeof x === 'object' ? (x as any).v3Validation : null) || {};
+    return { title: typeof v.title === 'string' ? v.title : null, workshopTitle: typeof v.workshopTitle === 'string' ? v.workshopTitle : null,
+      names: Array.isArray(v.caseNames) ? v.caseNames.filter((n: unknown) => typeof n === 'string').slice(0, 8) : [] };
+  }).filter((c) => c.title || c.workshopTitle || c.names.length);
+  return practiceChapterTitles.length || applicationCases.length ? { practiceChapterTitles, applicationCases } : null;
 }
 
 /**
@@ -774,8 +806,8 @@ export class SchedulerService {
   }
 
   /**
-   * Loop 9 B: igual que las Actividades de Aplicación — un run con prácticas guiadas solo lo ejecuta un navegador que
-   * sabe generarlas (si no, reclamaría todo lo demás, renovaría el lease exclusivo y las prácticas quedarían en pending
+   * Loop 9 B: igual que las Actividades de Aplicación — un run con ejercicios guiados solo lo ejecuta un navegador que
+   * sabe generarlos (si no, reclamaría todo lo demás, renovaría el lease exclusivo y esos items quedarían en pending
    * para siempre). 409 visible «recarga la página» ANTES de reclamar nada.
    */
   private async assertExecutorGeneratesGuidedPractice(runId: string, ownerId: string, features: string[]): Promise<void> {
@@ -789,8 +821,8 @@ export class SchedulerService {
     );
     if (!row || row.guided !== true) return;
     const message =
-      `rules_version_mismatch: la ejecución ${runId} tiene prácticas guiadas y este navegador ejecuta una versión ` +
-      'anterior de Cursia que no sabe generarlas. Recarga la página para continuar; con esta versión el curso no podría terminar.';
+      `rules_version_mismatch: la ejecución ${runId} tiene ejercicios guiados y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no sabe generarlos. Recarga la página para continuar; con esta versión el curso no podría terminar.';
     throw new ConflictException({ message, code: 'executor_outdated_guided_practice', runId });
   }
 
@@ -1580,6 +1612,20 @@ export class SchedulerService {
         // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
         context: (snapshot as any)?.course?.applicationContext ?? null,
       };
+      // Fix I5: no repetir el caso de la práctica del módulo ni de sus Actividades de Aplicación (las ya completadas).
+      const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
+      const aaKeys = mm ? mm.chapters.filter((c) => c.applicationMinutes !== undefined).map((c) => `application_activity:${c.chapterId}`) : [];
+      const aaRows = aaKeys.length
+        ? await qr.query(
+          `select d.output_summary from public.generation_item_runs d
+            where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[]) and d.status = 'completed' and ${latestGenerationPredicate('d')}
+            order by d.item_key`,
+          [row.job_id, row.manifest_id, aaKeys],
+        )
+        : [];
+      const avoid = guidedPracticeAvoidOf(manifest as any, snapshot, row.chapter_id,
+        aaRows.map((r: any) => { try { return typeof r.output_summary === 'string' ? JSON.parse(r.output_summary) : r.output_summary; } catch { return null; } }));
+      if (avoid) out.guidedPractice.avoid = avoid;
     }
     if (row.type === 'experience' || row.type === 'activity' || row.type === 'application_activity') {
       const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
