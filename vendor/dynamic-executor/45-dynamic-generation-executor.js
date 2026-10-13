@@ -5969,7 +5969,11 @@ function dynExamBankAssemble(opts) {
     var keepIds = {};
     keep.forEach(function (r) { keepIds[r.id] = true; });
     kept = kept.concat(keep);
-    var row = { owner: _dynEbOwnerOf(leaf), type: leaf.type, slots: leaf.slots, kept: keep.length, target: target, floor: floor };
+    // O4 (medición para el piloto): pedidas / válidas por hoja (y cuántas válidas salieron de una reparación) para
+    // decidir con datos si la holgura del pedido (MC 2·s+2, V/F y EM 2·s+1) puede bajar. Solo se reporta: no cambia nada.
+    var asked = records.filter(function (r) { return r.leafIndex === li; }).length;
+    var row = { owner: _dynEbOwnerOf(leaf), type: leaf.type, slots: leaf.slots, kept: keep.length, target: target, floor: floor,
+      requested: asked, accepted: rs.length, acceptedAfterRepair: rs.filter(function (r) { return r.repaired; }).length };
     perLeaf.push(row);
     // Fix round 1 (C2): mínimo por capítulo en una hoja del final = floor(objetivo / capítulos del módulo).
     // Un capítulo por debajo (sus preguntas fueron rechazadas) se repara aunque la hoja llegue al objetivo.
@@ -6888,7 +6892,7 @@ async function _dynRunExamBank(item) {
     moduleId: moduleId,
     slots: v.slotCount,
     bankSize: a.questions.length,
-    perLeaf: a.perLeaf.map(function (l) { return { owner: l.owner, type: l.type, slots: l.slots, kept: l.kept, floor: l.floor }; }),
+    perLeaf: a.perLeaf.map(function (l) { return { owner: l.owner, type: l.type, slots: l.slots, kept: l.kept, floor: l.floor, requested: l.requested, accepted: l.accepted, acceptedAfterRepair: l.acceptedAfterRepair }; }),
     rejectedByCode: rejectedByCode,
     distractorsDroppedByCode: droppedByCode,
     repaired: repairedCount,
