@@ -15,6 +15,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { executionLeaseView, ExecutionLeaseView, normalizeRequestingExecutorId } from '../reliability/execution-lease';
+import { liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun, runServerExecuted } from './llm-worker-routing';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -333,6 +334,11 @@ export interface RunDto {
    * (disyuntor de consumo anómalo o tope del presupuesto del run), con el motivo legible en `detail`.
    */
   pauseInfo: { automatic: boolean; reason: string | null; detail: string | null; pausedAt: string | null } | null;
+  /**
+   * Loop 9: un worker de IA VIVO genera en el servidor TODAS las partes de IA de este run (presencia + instante de
+   * activación, los mismos helpers del ruteo): la pestaña se puede cerrar. false si el worker no está o no las cubre.
+   */
+  serverExecuted: boolean;
 }
 
 /** REL lease: quién consulta el run (solo para `executionLease.heldByYou`). */
@@ -5195,7 +5201,19 @@ export class RunsService {
       executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isDispatchableRun(job)),
       paused: isPausedRun(job),
       pauseInfo: isPausedRun(job) ? pauseInfoOf(job) : null,
+      serverExecuted: await this.serverExecutedOf(job, manifest),
     };
+  }
+
+  /** Loop 9: ¿el servidor genera todas las partes de IA del run? (cobertura viva, cache 5 s; cualquier error → false). */
+  private async serverExecutedOf(job: any, manifest: ManifestDto): Promise<boolean> {
+    if (!llmWorkerEnabled()) return false;
+    try {
+      const routed = routedTypesForRun(await liveLlmWorkerCoverage(this.dataSource), job.created_at);
+      return runServerExecuted(manifest.manifest.items.map((it) => String(it.type)), routed);
+    } catch {
+      return false;
+    }
   }
 
   /**

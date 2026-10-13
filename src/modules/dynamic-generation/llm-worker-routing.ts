@@ -160,3 +160,19 @@ export function browserEffectiveTypes(types: readonly ItemType[], live: Readonly
   if (!llmWorkerEnabled(env)) return [...types];
   return types.filter((t) => !live.has(t));
 }
+
+/**
+ * Loop 9 (aviso «puedes cerrar la pestaña»): ¿el SERVIDOR genera todas las partes de IA de este run? Sí solo con el
+ * flag del API encendido y un worker de IA VIVO que cubre, para este run (su instante de activación), cada tipo de IA
+ * presente en el Manifest. `scorm` (v1/v2) nunca va al worker → un run con scorm nunca lo es. Worker caído / sin
+ * latido / run anterior a la activación → false (la pestaña sigue haciendo falta).
+ */
+export function runServerExecuted(
+  manifestItemTypes: readonly string[],
+  routed: ReadonlySet<string>,
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (!llmWorkerEnabled(env)) return false;
+  const llm = [...new Set(manifestItemTypes.filter((t) => t === 'scorm' || (ALL_LLM_WORKER_TYPES as readonly string[]).includes(t)))];
+  return llm.length > 0 && llm.every((t) => routed.has(t));
+}

@@ -105,6 +105,20 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     const w = fs.readFileSync(path.join(__dirname, '..', 'src/workers/dynamic-llm-worker.ts'), 'utf8');
     assert(/concurrency: llmWorkerConcurrency\(\)/.test(w) && !/readPositiveInt\('DYNAMIC_LLM_WORKER_CONCURRENCY'/.test(w), 'el worker usa el valor con tope');
   });
+  await check('Loop 9: serverExecuted (aviso «puedes cerrar la pestaña») solo con flag + worker vivo que cubre TODAS las partes de IA del run', async () => {
+    const v3 = ['course_plan', 'course_intro', 'audio_welcome', 'module_intro', 'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'audiobook_chapter', 'exam', 'final_exam'];
+    const all = new Set(R.ALL_LLM_WORKER_TYPES);
+    assert(R.runServerExecuted(v3, all, ON) === true, 'worker vivo con todo ⇒ true');
+    assert(R.runServerExecuted(v3, all, {}) === false, 'flag del API apagado ⇒ false');
+    assert(R.runServerExecuted(v3, new Set(), ON) === false, 'worker caído (sin cobertura) ⇒ false');
+    assert(R.runServerExecuted(v3, new Set(R.LONG_LLM_WORKER_TYPES), ON) === false, 'worker que solo cubre las largas ⇒ false (las cortas siguen en la pestaña)');
+    assert(R.runServerExecuted(['content', 'scorm', 'exam', 'video'], all, ON) === false, 'run v1 con scorm (nunca en el worker) ⇒ false');
+    assert(R.runServerExecuted(['video', 'presentation'], all, ON) === false, 'sin partes de IA ⇒ false');
+    // Con la cobertura real por run: un run anterior a la activación del worker ⇒ false.
+    const cov = [{ types: all, since: new Date('2026-10-12T00:00:00Z') }];
+    assert(R.runServerExecuted(v3, R.routedTypesForRun(cov, '2026-10-12T01:00:00Z'), ON) === true, 'run nuevo ⇒ true');
+    assert(R.runServerExecuted(v3, R.routedTypesForRun(cov, '2026-10-11T01:00:00Z'), ON) === false, 'run anterior a la activación ⇒ false');
+  });
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures ? 1 : 0);
 })();
