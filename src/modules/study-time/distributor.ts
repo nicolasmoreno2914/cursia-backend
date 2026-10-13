@@ -189,10 +189,14 @@ export type DesignPins = Readonly<Record<string, { video?: boolean; application?
 export type ApplicationActivitiesMode = 'auto' | 'practice_only' | 'none';
 export const DESIGN_EMPHASES: readonly DesignEmphasis[] = ['application', 'balanced', 'depth'];
 export const APPLICATION_ACTIVITIES_MODES: readonly ApplicationActivitiesMode[] = ['auto', 'practice_only', 'none'];
+/** Loop 9 B (fix I1) · «Ejercicios guiados»: auto (por defecto: solo si el documento fija la forma o las Actividades) o none. */
+export type GuidedPracticeMode = 'auto' | 'none';
+export const GUIDED_PRACTICE_MODES: readonly GuidedPracticeMode[] = ['auto', 'none'];
 export interface DesignPreferences {
   emphasis?: DesignEmphasis;
   applicationActivities?: ApplicationActivitiesMode;
   audiovisual?: AudiovisualPriority;
+  guidedPractice?: GuidedPracticeMode;
 }
 
 export interface DistributorInput {
@@ -328,6 +332,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
     throw new DistributorError(`applicationActivities inválido (${JSON.stringify(prefs.applicationActivities)})`);
   }
   if (prefs.audiovisual !== undefined && !AUDIOVISUAL_PRIORITIES.includes(prefs.audiovisual)) throw new DistributorError(`audiovisual inválido (${JSON.stringify(prefs.audiovisual)})`);
+  if (prefs.guidedPractice !== undefined && !GUIDED_PRACTICE_MODES.includes(prefs.guidedPractice)) throw new DistributorError(`guidedPractice inválido (${JSON.stringify(prefs.guidedPractice)})`);
+  const guidedMode: GuidedPracticeMode = prefs.guidedPractice ?? 'auto';
   const appMode: ApplicationActivitiesMode = prefs.applicationActivities ?? 'auto';
   const av: AudiovisualPriority | null = prefs.audiovisual ?? null;
   const pins: DesignPins = input.pins ?? {};
@@ -532,8 +538,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
       const now = c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null;
       if (c.proposed || had === now || changes.some((x) => (x.type === 'set_guided_practice' || x.type === 'remove_guided_practice') && x.chapterId === c.id)) continue;
       changes.push(now
-        ? { type: 'set_guided_practice', moduleId: m.id, chapterId: c.id, detail: had ? `Práctica guiada de «${c.title}»: de ${had} a ${now} min.` : `Práctica guiada de ${now} min en el capítulo «${c.title}».` }
-        : { type: 'remove_guided_practice', moduleId: m.id, chapterId: c.id, detail: `Se quita la práctica guiada de ${had} min de «${c.title}».` });
+        ? { type: 'set_guided_practice', moduleId: m.id, chapterId: c.id, detail: had ? `Ejercicios guiados de «${c.title}»: de ${had} a ${now} min.` : `Ejercicios guiados de ${now} min en el capítulo «${c.title}».` }
+        : { type: 'remove_guided_practice', moduleId: m.id, chapterId: c.id, detail: `Se quitan los ejercicios guiados de ${had} min de «${c.title}».` });
     }
     for (const m of design) for (const c of m.chapters) {
       if (c.proposed || initialActivity.get(c.id) === c.activityEnabled) continue;
@@ -620,7 +626,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // fijado a mano), queda dentro de la tolerancia y respeta las preferencias, no se propone nada (el distribuidor es
   // estable sobre su propio resultado). Si no, se rediseña desde cero (las actividades existentes no condicionan).
   const hasExisting = design.some((m) => m.chapters.some((c) => c.applicationMinutes !== null || (c.guidedPracticeMinutes ?? null) !== null));
-  const respectsMode = design.every((m) => m.chapters.every((c) => c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice'))));
+  const respectsMode = design.every((m) => m.chapters.every((c) => (c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice')))
+    && (guidedMode !== 'none' || !c.guidedPracticeMinutes || pinnedGuided(c.id) !== undefined)));
   // LOOP 8.6C: «ya cumple» también exige cumplir los requisitos del documento que el distribuidor maneja.
   const meetsRequirements = () => design.every((m) => m.chapters.length >= minCh && m.chapters.length <= maxCh && appCount(m.chapters) >= appModuleMin && appCount(m.chapters) <= appModuleMax
       && contentCount(m.chapters) >= contentMin && contentCount(m.chapters) <= contentMax && practiceCount(m.chapters) >= practiceMin && practiceCount(m.chapters) <= practiceMax
@@ -984,7 +991,19 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // Reparto parejo: todos los capítulos libres en un nivel o en el siguiente (0 → 40 → 60 → 80 → 120), el que deja el
   // total más cerca del objetivo (no del borde de la tolerancia), sin pasar de 4 h por capítulo. Lo fijado por el
   // docente no se toca. Los minutos de la práctica guiada suman exactos (el modelo de tiempo los toma tal cual).
-  if (!reached()) {
+  // Fix I1: solo cuando el documento fija la forma (Cursia no puede agregar capítulos) o la cantidad/lugar de las
+  // Actividades de Aplicación; en otro caso, lo de siempre (recomendación de estructura o la carga real declarada). Fix I2:
+  // con horas obligatorias del documento (y la meta dentro de ellas) el relleno nunca queda por debajo de su mínimo.
+  // «Fija la forma» = la institución eligió la forma (noContentAdditions) o el documento fija módulos Y capítulos por módulo
+  // (el mismo criterio con el que la recomendación final dice que Cursia no agrega nada).
+  const shapeFixedByDocument = !!rq && typeof rq.modulesFixed === 'number' && (rq.contentChaptersPerModule?.max !== undefined || rq.chaptersPerModule?.max !== undefined);
+  const guidedAllowed = guidedMode !== 'none' && !!rq && (noContentAdditions || shapeFixedByDocument || !!rq.applicationInPractice
+    || rq.applicationPerModule?.max !== undefined || rq.applicationTotal?.max !== undefined);
+  const hb = rq?.hoursBounds;
+  const hbOn = !!hb && (hb.min === undefined || input.targetHours >= hb.min) && (hb.max === undefined || input.targetHours <= hb.max);
+  const hbMin = hbOn && hb!.min !== undefined ? hb!.min * 60 : -Infinity;
+  const hbMax = hbOn && hb!.max !== undefined ? hb!.max * 60 : Infinity;
+  if (guidedAllowed && (!reached() || minutes() < hbMin - 1e-9)) {
     const free = design.flatMap((m) => m.chapters.filter((c) => c.kind === 'content' && pinnedGuided(c.id) === undefined).map((c) => ({ m, c })));
     // Orden de los capítulos que suben primero al nivel siguiente: cierres, núcleo, aperturas (igual que la aplicación).
     const ordered = free.map((x, i) => ({ ...x, i })).sort((a, b) => rank(roleOf(a.m, a.c)) - rank(roleOf(b.m, b.c)) || a.i - b.i);
@@ -992,7 +1011,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
     const capOfGuided = ordered.map(({ c }) => DISTRIBUTOR_RULES.maxChapterMinutes - (chapterMinutes(c.id) - (c.guidedPracticeMinutes ?? 0)));
     const levels = [0, ...(GUIDED_PRACTICE_TIERS as readonly number[])];
     const fit = (want: number, k: number) => [...levels].reverse().find((l) => l <= want && l <= capOfGuided[k]) ?? 0;
-    let best: { assign: number[]; total: number; dist: number; sum: number } | null = null;
+    let best: { assign: number[]; total: number; dist: number; sum: number; out: number } | null = null;
     for (let li = 0; li < levels.length; li++) {
       const lo = levels[li];
       const hi = levels[Math.min(li + 1, levels.length - 1)];
@@ -1001,7 +1020,9 @@ function distributeCore(input: DistributorInput): DistributionResult {
         const sum = assign.reduce((a, b) => a + b, 0);
         const total = base + sum;
         const dist = Math.abs(total - target);
-        if (!best || dist < best.dist - 1e-9 || (Math.abs(dist - best.dist) <= 1e-9 && sum < best.sum)) best = { assign, total, dist, sum };
+        // Fuera de las horas del documento (por debajo del mínimo o por encima del máximo) solo si ningún candidato entra.
+        const out = total < hbMin - 1e-9 || total > hbMax + 1e-9 ? 1 : 0;
+        if (!best || out < best.out || (out === best.out && (dist < best.dist - 1e-9 || (Math.abs(dist - best.dist) <= 1e-9 && sum < best.sum)))) best = { assign, total, dist, sum, out };
         if (hi === lo) break;
       }
     }
@@ -1009,7 +1030,10 @@ function distributeCore(input: DistributorInput): DistributionResult {
       ordered.forEach(({ c }, k) => { c.guidedPracticeMinutes = best!.assign[k] || null; });
       reEval();
       const n = best.assign.filter((x) => x > 0).length;
-      priorityTrace.push(`Con las Actividades de Aplicación en su máximo, la diferencia con el objetivo se completa con práctica guiada (formativa, sin nota) en ${n} capítulo(s) de contenido: no se agregan capítulos ni Actividades de Aplicación.`);
+      const why = appMode === 'none' ? 'Sin Actividades de Aplicación (decisión del docente)'
+        : appMode === 'practice_only' ? 'Con las Actividades de Aplicación solo en las prácticas (decisión del docente)'
+          : 'Con las Actividades de Aplicación en lo que permiten el documento y los topes de Cursia';
+      priorityTrace.push(`${why} y la forma o las Actividades fijadas por el documento, la diferencia con el objetivo se completa con ejercicios guiados (formativos, sin nota) en ${n} capítulo(s) de contenido: ${fmtH(best.sum / 60)} h de ${fmtH(best.total / 60)} h (${Math.round((best.sum / best.total) * 100)} %). No se agregan capítulos ni Actividades de Aplicación.`);
     }
     const short = Math.max(0, target - tol - minutes());
     guidedFill = { used: !!(best && best.sum > 0), shortfallHours: r1(short / 60) };
@@ -1064,7 +1088,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
           : noRoom
         : `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${fmtH(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`;
   const guidedNote = guidedFill && guidedFill.used
-    ? [`Ni con práctica guiada en los capítulos de contenido (hasta ${GUIDED_PRACTICE_TIERS[GUIDED_PRACTICE_TIERS.length - 1]} min por capítulo) se llega: faltan ${fmtH(gap / 60)} h.`]
+    ? [`Ni con ejercicios guiados en los capítulos de contenido (hasta ${GUIDED_PRACTICE_TIERS[GUIDED_PRACTICE_TIERS.length - 1]} min por capítulo) se llega: faltan ${fmtH(gap / 60)} h.`]
     : [];
   return result('cannot_reach_target', [
     `No alcanza ${fmtH(input.targetHours)} h sin rellenar: el diseño llega a ${fmtH(minutes() / 60)} h y faltan ${fmtH(gap / 60)} h.`,

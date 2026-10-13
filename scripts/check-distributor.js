@@ -128,10 +128,9 @@ check('D3 80 h: no alcanza con topes razonables → propone módulos/capítulos,
   eq(r.status, 'cannot_reach_target', 'estado');
   assert(r.estimatedHours < 80 - r.toleranceHours, `no llega (${r.estimatedHours})`);
   assert(/No alcanza 80 h sin rellenar/.test(r.recommendations[0]) && /módulo\(s\) nuevo\(s\)/.test(r.recommendations[1]), r.recommendations.join(' | '));
-  // Loop 9 B: antes de declarar la diferencia, la práctica guiada de los capítulos de contenido llegó a su máximo (y se dice).
-  eq(r.guidedPracticeFill && r.guidedPracticeFill.used, true, 'práctica guiada usada');
-  assert(r.recommendations.some((x) => /Ni con práctica guiada en los capítulos de contenido/.test(x)), 'la diferencia se dice: ' + r.recommendations.join(' | '));
-  for (const c of chapters(r)) assert(c.kind === 'practice' ? c.guidedPracticeMinutes === null : [null, 40, 60, 80, 120].includes(c.guidedPracticeMinutes), 'niveles válidos, nunca en práctica');
+  // Loop 9 B (fix I1): sin forma ni Actividades fijadas por un documento, los ejercicios guiados NO rellenan: se recomienda.
+  eq(r.guidedPracticeFill, undefined, 'sin ejercicios guiados');
+  assert(chapters(r).every((c) => c.guidedPracticeMinutes === null), 'ningún capítulo con ejercicios guiados');
   for (const m of r.modules) assert(m.chapters.filter((c) => c.kind === 'content').length <= ST.DISTRIBUTOR_RULES.maxContentChaptersPerModule, 'tope de contenido');
   // Nada inflado: cada recurso sale del modelo de tiempo con valores planificados (ningún «medido» inventado).
   for (const c of r.studyTime.modules.flatMap((m) => m.chapters)) assert(c.resources.every((x) => !x.measured), 'sin medidas inventadas');
@@ -163,10 +162,8 @@ check('D5 cada enfoque: política desde las dimensiones del motor; competencias 
   assert(s.counts.contentChapters > c.counts.contentChapters, `significativo más profundidad (${s.counts.contentChapters} vs ${c.counts.contentChapters})`);
   const firstAdd = (r) => (r.changes.find((x) => x.type.startsWith('add_')) || {}).type;
   eq([firstAdd(c), firstAdd(s)], ['add_practice_chapter', 'add_content_chapter'], 'orden de crecimiento');
-  // Loop 9 B: significativo no rellena con capítulos de práctica; la diferencia que deja la profundización la completa la
-  // práctica guiada de los capítulos de contenido (formativa), y si aún falta, lo recomienda.
-  assert(s.counts.practiceChapters < c.counts.practiceChapters, 'significativo 50 h: no rellena con capítulos de práctica');
-  assert(s.counts.guidedPractices > 0 && (s.status !== 'cannot_reach_target' || s.recommendations.length > 0), `significativo 50 h: práctica guiada (${s.counts.guidedPractices}) y, si falta, recomienda`);
+  // Loop 9 B (fix I1): sin documento que fije la forma, tampoco rellena con ejercicios guiados.
+  assert(s.recommendations.length > 0 && s.status === 'cannot_reach_target' && !s.counts.guidedPractices, 'significativo 50 h: no rellena con práctica, recomienda');
 });
 
 check('D6 tolerancia configurable', () => {

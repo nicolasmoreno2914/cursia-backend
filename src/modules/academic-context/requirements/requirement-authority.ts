@@ -98,6 +98,11 @@ export interface DistributorRequirementConstraints {
    * módulos por su cuenta; esto solo evita que su recomendación proponga módulos nuevos que contradigan el documento.
    */
   modulesFixed?: number;
+  /**
+   * Loop 9 B (fix I2): horas OBLIGATORIAS del documento (intersección de sus límites). Solo acompaña a otras restricciones
+   * (no hace que un documento «tenga restricciones»); el relleno con ejercicios guiados nunca queda por debajo del mínimo.
+   */
+  hoursBounds?: { min?: number; max?: number };
   /** Requisito de origen de cada restricción (para explicar los cambios). */
   sources: Partial<Record<'chapters' | 'practice' | 'activities' | 'videos' | 'applicationPerModule' | 'applicationTotal', string>>;
 }
@@ -295,7 +300,25 @@ export async function requirementConstraintsForCourse(
 ): Promise<DistributorRequirementConstraints | null> {
   const a = await loadRequirementAuthority(q, courseId, contextDocs);
   const c = constraintsFor(a.required, teacherDecisions(a, savedPrefs, decisions), { structureByTeacher: await structureEditedByTeacher(q, courseId) });
-  return capToChosenShape(c, await chosenContentCap(q, courseId));
+  const out = capToChosenShape(c, await chosenContentCap(q, courseId));
+  const hb = out ? requiredHoursBounds(a.applicable) : null;
+  return out && hb ? { ...out, hoursBounds: hb } : out;
+}
+
+/**
+ * Loop 9 B (fix I2): límites de las horas OBLIGATORIAS del documento (los mismos que usa `hoursFromRequirements`).
+ * null = sin horas obligatorias con límites, o contradictorias.
+ */
+export function requiredHoursBounds(applicable: DocumentRequirement[]): { min?: number; max?: number } | null {
+  const reqs = applicable.filter((r) => r.kind === 'target_hours' && r.scope.level === 'course' && typeof r.value === 'number'
+    && r.obligation === 'required' && r.mode !== 'approx' && r.confidence === 'high');
+  if (!reqs.length || reqs.some((a) => reqs.some((b) => a !== b && !compatible(a, b)))) return null;
+  let lo: number | undefined;
+  let hi: number | undefined;
+  for (const r of reqs) { const b = bounds(r); if (b) { if (b.min !== undefined) lo = Math.max(lo ?? b.min, b.min); if (b.max !== undefined) hi = Math.min(hi ?? b.max, b.max); } }
+  if (lo === undefined && hi === undefined) return null;
+  if (lo !== undefined && hi !== undefined && lo > hi) return null;
+  return { ...(lo !== undefined ? { min: lo } : {}), ...(hi !== undefined ? { max: hi } : {}) };
 }
 
 /**
@@ -618,8 +641,8 @@ export function capabilityProposal(r: DocumentRequirement, hours?: number | null
   if (r.kind === 'target_hours' && typeof hours === 'number') {
     const byDoc = alt?.limitedByDocument !== false;
     const base = byDoc
-      ? `Cursia ya llevó a sus niveles máximos las Actividades de Aplicación que el documento permite y completó con práctica guiada (formativa, hasta 120 min por capítulo de contenido), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con las cantidades que fija el documento (capítulos, videos, actividades y evaluaciones) no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`
-      : `Cursia ya llevó las Actividades de Aplicación hasta sus propios límites (la mitad del tiempo del curso y 4 horas por capítulo) y completó con práctica guiada (formativa, hasta 120 min por capítulo de contenido), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con la estructura que fija el documento no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`;
+      ? `Cursia ya llevó a sus niveles máximos las Actividades de Aplicación que el documento permite y completó con ejercicios guiados (formativos, hasta 120 min por capítulo de contenido), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con las cantidades que fija el documento (capítulos, videos, actividades y evaluaciones) no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`
+      : `Cursia ya llevó las Actividades de Aplicación hasta sus propios límites (la mitad del tiempo del curso y 4 horas por capítulo) y completó con ejercicios guiados (formativos, hasta 120 min por capítulo de contenido), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con la estructura que fija el documento no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`;
     if (alt && alt.added > 0) {
       const scope = byDoc ? `Eso suma ${alt.added} Actividades de Aplicación a las que pide el documento` : `Eso suma ${alt.added} Actividades de Aplicación y supera la proporción de aplicación que Cursia usa por defecto`;
       return `${base} Alternativa con lo que Cursia ya produce: una Actividad de Aplicación de ${alt.tier} min en cada uno de los ${alt.contentChapters} capítulos de contenido llevaría el curso a ≈ ${n1(alt.hours)} horas${alt.reaches ? '' : ' (aún por debajo de lo pedido)'}. ${scope}, así que lo decide la institución (se fija capítulo por capítulo en «Estructura» y queda como excepción documentada). Si no, se declara la carga real de ≈ ${n1(hours)} horas.`;

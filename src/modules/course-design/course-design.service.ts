@@ -171,6 +171,8 @@ export class CourseDesignService {
     if (adjust.emphasis !== undefined) prefs.emphasis = adjust.emphasis;
     if (adjust.applicationActivities !== undefined) prefs.applicationActivities = adjust.applicationActivities;
     if (adjust.audiovisual !== undefined) prefs.audiovisual = adjust.audiovisual;
+    // Loop 9 B (fix I1): «Ejercicios guiados: Automático / Ninguno» (automático = no se guarda nada).
+    if (adjust.guidedPractice !== undefined) { if (adjust.guidedPractice === 'auto') delete prefs.guidedPractice; else prefs.guidedPractice = adjust.guidedPractice; }
     if (!prefs.audiovisual) prefs.audiovisual = DEFAULT_AUDIOVISUAL;
     base.designPreferences = prefs;
 
@@ -418,7 +420,7 @@ export class CourseDesignService {
         : null,
       hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : hoursSource === 'proposed' ? { reason: `Cursia propuso ${profile.targetHours} h para este curso.` }
         : hoursSource === 'requirement' && hoursRequirement ? { reason: hoursRequirement.required ? `Horas del documento: ${requirementText(hoursRequirement.requirement)}.` : `Horas que sugiere el documento (${requirementText(hoursRequirement.requirement)}); puedes cambiarlas en «Ajustar».` } : {}) },
-      preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual },
+      preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual, guidedPractice: prefs.guidedPractice || 'auto' },
       // Review L83 M-1: solo los fijados que el diseño usa (capítulos de contenido que existen).
       pinnedChapters,
       verification,
@@ -431,6 +433,10 @@ export class CourseDesignService {
           counts: dist.counts,
           hoursByComponent: dist.hoursByComponent,
           ...(dist.guidedPracticeFill ? { guidedPracticeFill: dist.guidedPracticeFill } : {}),
+          // Fix I1: la proporción a la vista («Ejercicios guiados: X h de Y h (Z %)»), para que la institución decida con el número.
+          ...(dist.counts.guidedPracticeMinutes ? { guidedPracticeShare: {
+            hours: Math.round((dist.counts.guidedPracticeMinutes / 60) * 10) / 10, designHours: dist.estimatedHours,
+            pct: Math.round((dist.counts.guidedPracticeMinutes / 60 / Math.max(dist.estimatedHours, 0.1)) * 100) } } : {}),
           recommendations: dist.recommendations,
           proposalSha256: dist.proposalSha256,
           manifestErrors: dist.materialized ? dist.materialized.manifestErrors : [],
