@@ -1192,7 +1192,7 @@ function reservationBookkeeping(ev) {
       // Loop 9 B: lo mismo con una pestaña que sabe generar Actividades de Aplicación pero no prácticas guiadas.
       const oldGp = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1,application-activity-1', { runId: c.runId, executorId: 'e2e-old-tab-gp', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam', 'application_activity', 'guided_practice'], leaseSeconds: 60 });
       const claimedOldGp = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-gp'`, [c.runId]);
-      ok(oldGp.status === 409 && /prácticas guiadas/.test(String(oldGp.error)) && claimedOldGp[0].n === 0,
+      ok(oldGp.status === 409 && /ejercicios guiados/.test(String(oldGp.error)) && claimedOldGp[0].n === 0,
         'E7: ejecutor sin la capacidad guided-practice-1 → 409 visible y ningún item reclamado (nunca recibe el tipo)', { s: oldGp.status, e: oldGp.error, n: claimedOldGp[0].n });
       const prompts = [];
       const respond0 = llm.respond;
@@ -1222,8 +1222,10 @@ function reservationBookkeeping(ev) {
       eq([byKey.get(`application_activity:${chContent}`).minutes, byKey.get(`application_activity:${chPractice}`).minutes], [60, 30], 'E7: summary con los minutos del Manifest');
       // Loop 9 B: la práctica guiada (una llamada + reintento dirigido por la respuesta modelo sin numerar).
       ok((llm.st.retriesSeen.guided_practice || 0) >= 1, 'E7: la práctica guiada inválida (respuesta modelo sin numerar) pidió un reintento dirigido', llm.st.retriesSeen);
-      const gpPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña la PRÁCTICA GUIADA de este capítulo'));
-      ok(gpPrompts.length >= 1 && gpPrompts.every((t) => t.includes('EXACTAMENTE 2 ejercicios') && t.includes('~40 min') && t.includes('FORMATIVA y SIN NOTA')), 'E7: el prompt de la práctica guiada trae el plan de Cursia (2 × 40 min) y es formativa', gpPrompts.length);
+      const gpPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña los EJERCICIOS GUIADOS de este capítulo'));
+      ok(gpPrompts.length >= 1 && gpPrompts.every((t) => t.includes('EXACTAMENTE 2 ejercicios') && t.includes('~40 min') && t.includes('FORMATIVA y SIN NOTA') && t.includes('al menos 700 caracteres, al menos 4 consignas y respuesta modelo de al menos 1100')), 'E7: el prompt de los ejercicios guiados trae el plan de Cursia (2 × 40 min), sus pisos y es formativo', gpPrompts.length);
+      // Loop 9 B fix I5: el claim lleva el caso de la práctica del módulo (y los de sus AA ya completadas) para no repetirlo.
+      ok(gpPrompts.every((t) => t.includes('NO REPITAS estos casos del módulo') && t.includes('Capítulo de práctica del módulo: «Práctica integradora»')), 'E7: el prompt de los ejercicios guiados trae los casos del módulo que no debe repetir', gpPrompts.length);
       const gpArts = await q(`select g.item_key k from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and a.type = 'dynamic_guided_practice_json'`, [c.runId]);
       eq(gpArts.map((a) => a.k), [`guided_practice:${chPlain}`], 'E7: un artifact dynamic_guided_practice_json');
       const [gpSum] = await q(`select output_summary s from public.generation_item_runs where job_id = $1 and type = 'guided_practice' order by generation desc limit 1`, [c.runId]);
@@ -1263,7 +1265,7 @@ function reservationBookkeeping(ev) {
       // Loop 9 B: la práctica guiada es una página VISIBLE del capítulo, tras el texto, con la respuesta modelo; sus minutos cuentan.
       const chPlainId = c.mods[0].chapters[1].id;
       const gpPage = pg.get(`cv3:ch:${chPlainId}:guided_practice`);
-      ok(gpPage && gpPage.visible === 1 && /Respuesta modelo \(revísala después de intentarlo\)/.test(gpPage.content.replace(/&[a-z]+;/g, ' ')) && /Práctica guiada/.test(gpPage.content) && !/Solucionario/.test(gpPage.content),
+      ok(gpPage && gpPage.visible === 1 && /Respuesta modelo \(revísala después de intentarlo\)/.test(gpPage.content.replace(/&[a-z]+;/g, ' ')) && /Ejercicios guiados/.test(gpPage.content) && !/Solucionario/.test(gpPage.content),
         'E7: página «Práctica guiada — <capítulo>» visible con la respuesta modelo (sin solucionario)', gpPage && { visible: gpPage.visible });
       ok(![...pg.keys()].some((k) => /:guided_practice$/.test(k) && !k.includes(chPlainId)), 'E7: ninguna otra práctica guiada (ni en la práctica)');
       // Horas: la tarjeta del diseño cuenta los 80 min de la práctica guiada en el capítulo y en «Práctica y repaso».

@@ -4143,17 +4143,25 @@ async function _dynRunApplicationActivity(item) {
   };
 }
 
-// ── guided_practice:<ch> (Loop 9 B · Práctica guiada del capítulo) ──
+// ── guided_practice:<ch> (Loop 9 B · «Ejercicios guiados» del capítulo) ──
 // Espejo EXACTO de course-shell/guided-practice.ts (validateGuidedPracticeDoc): el servidor re-valida el documento al
-// completar el item y es autoritativo. Paridad: harness test-66 y scripts/check-guided-practice.js. Formativa y sin
+// completar el item y es autoritativo. Paridad: harness test-67 y scripts/check-guided-practice.js. Formativa y sin
 // nota: sin solucionario oculto ni pesos. chapterId, minutes, ids y minutos de cada ejercicio los pone Cursia.
 var DYN_GUIDED_PRACTICE_SCHEMA_VERSION = 1;
 var DYN_GUIDED_PRACTICE_EXERCISES_BY_MINUTES = { 40: [20, 20], 60: [30, 30], 80: [40, 40], 120: [40, 40, 40] };
 var DYN_GUIDED_PRACTICE_LIM = {
-  titleMax: 90, situationMin: 300, situationMax: 1200, tasksMin: 3, tasksMax: 6, taskMin: 10, taskMax: 400,
+  titleMax: 90, situationMin: 300, situationMax: 1400, tasksMin: 3, tasksMax: 6, taskMin: 10, taskMax: 400,
   expectedProductMin: 10, expectedProductMax: 300, criteriaMin: 3, criteriaMax: 5, criterionNameMax: 80,
-  criterionDescriptorMin: 10, criterionDescriptorMax: 300, modelAnswerMin: 400, modelAnswerMax: 1800
+  criterionDescriptorMin: 10, criterionDescriptorMax: 300, modelAnswerMin: 450, modelAnswerMax: 2200
 };
+// Fix C1: pisos por minutos del ejercicio (los minutos acreditados tienen trabajo detrás). Espejo de GUIDED_PRACTICE_FLOORS.
+var DYN_GUIDED_PRACTICE_FLOORS = {
+  20: { situationMin: 300, tasksMin: 3, modelAnswerMin: 450, expectedProductMin: 10 },
+  30: { situationMin: 500, tasksMin: 4, modelAnswerMin: 800, expectedProductMin: 20 },
+  40: { situationMin: 700, tasksMin: 4, modelAnswerMin: 1100, expectedProductMin: 40 }
+};
+// Fix C1: consignas de solo recordar («Define», «Menciona», «Enumera», «¿Qué es…?»): cada consigna debe producir algo.
+var DYN_GUIDED_PRACTICE_RECALL_TASK_RE = /^\s*(?:¿\s*)?(?:defin[ea]|mencion[ae]|enumer[ae]|nombr[ae]|list[ae]|recuerd[ae]|cit[ae]|qu[eé] es|cu[aá]l es la definici[oó]n)(?![\p{L}])/iu;
 var DYN_GUIDED_PRACTICE_DOC_KEYS = ['schemaVersion', 'chapterId', 'minutes', 'exercises'];
 var DYN_GUIDED_PRACTICE_EXERCISE_KEYS = ['id', 'minutes', 'kind', 'title', 'situation', 'tasks', 'expectedProduct', 'criteria', 'modelAnswer'];
 var DYN_GUIDED_PRACTICE_CRITERION_KEYS = ['name', 'descriptor'];
@@ -4167,7 +4175,8 @@ function dynGuidedPracticePlan(minutes) {
 function dynGuidedPracticeAnswerCoversTasks(answer, taskCount) {
   var from = 0;
   for (var k = 1; k <= taskCount; k++) {
-    var re = new RegExp('(^|[\\s(«"“])(consigna\\s+)?' + k + '\\s*[.)\\-:–]', 'gi');
+    // Fix M1: una marca por consigna AL INICIO DE LÍNEA («1. », «2) », «Consigna 3. »); cifras como «2.000» no cuentan.
+    var re = new RegExp('(?:^|\\n)[ \\t]*(?:consigna[ \\t]+)?' + k + '[.)][ \\t]', 'gi');
     re.lastIndex = from;
     var m = re.exec(answer);
     if (!m) return false;
@@ -4205,15 +4214,20 @@ function dynValidateGuidedPracticeDoc(doc, ctx) {
     }
     if (DYN_GUIDED_PRACTICE_KINDS.indexOf(e.kind) < 0) err(p + '.kind', 'GUIDED_PRACTICE_KIND', p + '.kind debe ser ' + DYN_GUIDED_PRACTICE_KINDS.join(' | '));
     text(e.title, p + '.title', 4, L.titleMax);
-    text(e.situation, p + '.situation', L.situationMin, L.situationMax);
+    // C1: pisos según los minutos del ejercicio (los del plan de Cursia; un ejercicio de más usa los de 20 min).
+    var F = DYN_GUIDED_PRACTICE_FLOORS[want ? want.minutes : 20] || DYN_GUIDED_PRACTICE_FLOORS[20];
+    text(e.situation, p + '.situation', F.situationMin, L.situationMax);
     var taskCount = 0;
     if (!Array.isArray(e.tasks)) err(p + '.tasks', 'GUIDED_PRACTICE_SHAPE', p + '.tasks debe ser una lista');
     else {
       taskCount = e.tasks.length;
-      if (e.tasks.length < L.tasksMin || e.tasks.length > L.tasksMax) err(p + '.tasks', 'GUIDED_PRACTICE_COUNT', p + '.tasks debe tener entre ' + L.tasksMin + ' y ' + L.tasksMax + ' consignas (tiene ' + e.tasks.length + ')');
-      e.tasks.forEach(function (t, j) { text(t, p + '.tasks[' + j + ']', L.taskMin, L.taskMax); });
+      if (e.tasks.length < F.tasksMin || e.tasks.length > L.tasksMax) err(p + '.tasks', 'GUIDED_PRACTICE_COUNT', p + '.tasks debe tener entre ' + F.tasksMin + ' y ' + L.tasksMax + ' consignas para ' + (want ? want.minutes : 20) + ' min (tiene ' + e.tasks.length + ')');
+      e.tasks.forEach(function (t, j) {
+        var tt = text(t, p + '.tasks[' + j + ']', L.taskMin, L.taskMax);
+        if (tt && DYN_GUIDED_PRACTICE_RECALL_TASK_RE.test(tt)) err(p + '.tasks[' + j + ']', 'GUIDED_PRACTICE_TASK_RECALL', p + '.tasks[' + j + '] solo pide recordar («' + tt.slice(0, 40) + '»): cada consigna debe pedir analizar, decidir, calcular o justificar');
+      });
     }
-    text(e.expectedProduct, p + '.expectedProduct', L.expectedProductMin, L.expectedProductMax);
+    text(e.expectedProduct, p + '.expectedProduct', F.expectedProductMin, L.expectedProductMax);
     if (!Array.isArray(e.criteria)) err(p + '.criteria', 'GUIDED_PRACTICE_SHAPE', p + '.criteria debe ser una lista');
     else {
       if (e.criteria.length < L.criteriaMin || e.criteria.length > L.criteriaMax) err(p + '.criteria', 'GUIDED_PRACTICE_COUNT', p + '.criteria debe tener entre ' + L.criteriaMin + ' y ' + L.criteriaMax + ' criterios (tiene ' + e.criteria.length + ')');
@@ -4228,9 +4242,9 @@ function dynValidateGuidedPracticeDoc(doc, ctx) {
         text(c.descriptor, cp + '.descriptor', L.criterionDescriptorMin, L.criterionDescriptorMax);
       });
     }
-    var ans = text(e.modelAnswer, p + '.modelAnswer', L.modelAnswerMin, L.modelAnswerMax);
+    var ans = text(e.modelAnswer, p + '.modelAnswer', F.modelAnswerMin, L.modelAnswerMax);
     if (ans && taskCount >= L.tasksMin && !dynGuidedPracticeAnswerCoversTasks(ans, taskCount)) {
-      err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_ORDER', p + '.modelAnswer debe responder las ' + taskCount + ' consignas en orden, numeradas «1.», «2.», …');
+      err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_ORDER', p + '.modelAnswer debe responder las ' + taskCount + ' consignas en orden, una por línea, cada una empezando con «1. », «2. », …');
     }
   });
   return errors;
@@ -4267,6 +4281,41 @@ function dynLintGuidedPracticeNumbers(doc) {
   });
   return out;
 }
+// Fix I5: lo que los ejercicios guiados no deben repetir (del claim: práctica del módulo y casos de sus AA). DURO si un
+// ejercicio usa el mismo título de escenario o a 2+ de los mismos protagonistas; BLANDO con un solo nombre en común o
+// un título muy parecido (un reintento dirigido; si no mejora, se conserva y queda registrado).
+function _dynNormTitle(t) {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/^(practica|taller|caso|ejercicio)[^:]*:\s*/, '').replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function _dynTitleTokens(t) { return _dynNormTitle(t).split(' ').filter(function (w) { return w.length > 3; }); }
+function dynLintGuidedPracticeAvoid(doc, avoid) {
+  var hard = [], soft = [];
+  if (!_dynIsPlainObject(avoid)) return { hard: hard, soft: soft };
+  var titles = [].concat(avoid.practiceChapterTitles || []);
+  var names = [];
+  (avoid.applicationCases || []).forEach(function (c) {
+    if (!_dynIsPlainObject(c)) return;
+    if (c.title) titles.push(c.title);
+    if (c.workshopTitle) titles.push(c.workshopTitle);
+    (c.names || []).forEach(function (n) { if (typeof n === 'string' && n.trim() && names.indexOf(n) < 0) names.push(n); });
+  });
+  var normTitles = titles.map(_dynNormTitle).filter(Boolean);
+  (doc.exercises || []).forEach(function (e, i) {
+    if (!_dynIsPlainObject(e)) return;
+    var p = '$.exercises[' + i + ']';
+    var nt = _dynNormTitle(e.title);
+    var text = String(e.title || '') + '\n' + String(e.situation || '');
+    var shared = names.filter(function (n) { return new RegExp('(^|[^\\p{L}])' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\p{L}])', 'u').test(text); });
+    if (nt && normTitles.indexOf(nt) >= 0) hard.push({ path: p + '.title', code: 'GUIDED_PRACTICE_CASE_CLASH', message: p + '.title repite el escenario de la práctica o de una Actividad de Aplicación del módulo («' + e.title + '»): usa otra situación' });
+    else if (shared.length >= 2) hard.push({ path: p + '.situation', code: 'GUIDED_PRACTICE_CASE_CLASH', message: p + '.situation usa a los mismos protagonistas de una Actividad de Aplicación del módulo (' + shared.slice(0, 4).join(', ') + '): usa otras personas y otra organización' });
+    else {
+      var tk = _dynTitleTokens(e.title);
+      var close = tk.length && titles.some(function (t) { var o = _dynTitleTokens(t); if (!o.length) return false; var inter = tk.filter(function (w) { return o.indexOf(w) >= 0; }).length; return inter / Math.max(tk.length, o.length) >= 0.6; });
+      if (shared.length === 1 || close) soft.push('[GP_CASE_CLASH] ' + p + ': se parece al caso de la práctica o de una Actividad de Aplicación del módulo' + (shared.length ? ' (' + shared[0] + ')' : '') + ': cambia la situación o los protagonistas');
+    }
+  });
+  return { hard: hard, soft: soft };
+}
 async function _dynRunGuidedPractice(item) {
   var bp = item.blueprint || {};
   if (!item.chapterId || !bp.chapter) return { ok: false, error: 'guided_practice: el claim no trae chapterId/blueprint.chapter', retryable: false };
@@ -4281,9 +4330,15 @@ async function _dynRunGuidedPractice(item) {
   var courseContext = item.context.courseContext;
   var chapter = Object.assign({}, bp.chapter, { id: item.chapterId });
   var caseReuse = {};
-  var res = await _dynV3JsonWithRetry(item, dynGuidedPracticeSys(courseContext), dynGuidedPracticePrompt(courseContext, bp.outline, chapter, sourceMd, gp, dynPedagogyBlock(item)), 6000, function (obj, attempt) {
+  var clashSoft = {};
+  // Fix M3: 120 min = 3 ejercicios de 40 → más espacio de salida.
+  var maxTok = gp.minutes === 120 ? 7000 : 6000;
+  var res = await _dynV3JsonWithRetry(item, dynGuidedPracticeSys(courseContext), dynGuidedPracticePrompt(courseContext, bp.outline, chapter, sourceMd, gp, dynPedagogyBlock(item)), maxTok, function (obj, attempt) {
     var doc = dynGuidedPracticeDocFrom(obj, item.chapterId, gp.minutes);
     var v = dynValidateGuidedPracticeDoc(doc, { chapterId: item.chapterId, minutes: gp.minutes });
+    // Fix I5: mismo escenario o protagonistas que la práctica o las AA del módulo → se rehace.
+    var av = dynLintGuidedPracticeAvoid(doc, gp.avoid);
+    v = v.concat(av.hard);
     if (v.length) return { ok: false, errors: _dynFormatErrors(v) };
     var nums = dynLintGuidedPracticeNumbers(doc);
     if (nums.length) return { ok: false, errors: nums.map(function (x) { return '$ ' + x; }) };
@@ -4295,7 +4350,8 @@ async function _dynRunGuidedPractice(item) {
       if (cr.reused) { reused.push(i + 1); soft.push('[GP_CASE_REUSE] $.exercises[' + i + '].situation: repite el caso del capítulo (' + cr.distinct.slice(0, 6).join(', ') + '): usa otra situación, otra organización o una condición distinta'); }
     });
     caseReuse[attempt] = reused;
-    return { ok: true, value: doc, soft: soft };
+    clashSoft[attempt] = av.soft.length;
+    return { ok: true, value: doc, soft: soft.concat(av.soft) };
   }, { normalizeMoney: dynCourseIsColombia(courseContext) });
   if (!res.ok) return _dynV3Invalid(item, res.errors, res.truncated);
   var all = dynValidateGuidedPracticeDoc(res.value, { chapterId: item.chapterId, minutes: gp.minutes });
@@ -4308,7 +4364,7 @@ async function _dynRunGuidedPractice(item) {
       chapterId: item.chapterId, guidedPracticeSchemaVersion: DYN_GUIDED_PRACTICE_SCHEMA_VERSION, minutes: gp.minutes,
       exerciseCount: res.value.exercises.length, kinds: res.value.exercises.map(function (e) { return e.kind; }),
       guidedPracticeSha256: a.sha, retried: !!res.retried, promptVersion: DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION, contentArtifactId: src.contentArtifactId
-    }, (caseReuse[res.usedAttempt] || []).length ? { caseReuse: caseReuse[res.usedAttempt] } : {}, _dynQualSummary(res), dynPedagogySummary(item))
+    }, (caseReuse[res.usedAttempt] || []).length ? { caseReuse: caseReuse[res.usedAttempt] } : {}, clashSoft[res.usedAttempt] ? { caseClashSoft: clashSoft[res.usedAttempt] } : {}, _dynQualSummary(res), dynPedagogySummary(item))
   };
 }
 

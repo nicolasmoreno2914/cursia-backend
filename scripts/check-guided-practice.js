@@ -16,7 +16,7 @@
 //        punto fijo al aplicar; sin alcance → se dice la diferencia
 //   GP6  meta de un rango del documento: el punto medio (42 h para 40–44), igual que la «Meta de diseño» de la UI
 //   GP7  validador del documento (servidor) = contrato; v3-validation y paridad con el ejecutor del navegador (vendor)
-//   GP8  empaque: página «Práctica guiada — <capítulo>» justo después del texto (antes del video y de la actividad),
+//   GP8  empaque: página «Ejercicios guiados — <capítulo>» después de la síntesis (antes de la actividad),
 //        visible, formativa, con la respuesta modelo; en el Libro Guía al final del capítulo (sin sumar palabras);
 //        sin documento o inválido → el paquete se rechaza; el validador del .mbz lo detecta
 //   GP9  estimador: llm.guided_practice (Anthropic, Sonnet 4.6), salida escalada por ejercicios, categoría «content»,
@@ -111,17 +111,17 @@ function pilotStructure(gp) {
 const PILOT_REQ = {
   sources: {}, noContentAdditions: true, modulesFixed: 3, contentChaptersPerModule: { min: 4, max: 4 }, practicePerModule: { min: 1, max: 1 },
   applicationInPractice: true, applicationPerModule: { min: 1, max: 1 }, applicationTotal: { min: 3, max: 3 },
-  activitiesTotal: { min: 12, max: 12 }, activitiesInEveryContent: true, videosAllContent: true,
+  activitiesTotal: { min: 12, max: 12 }, activitiesInEveryContent: true, videosAllContent: true, hoursBounds: { min: 40, max: 44 },
 };
 const distribute = (snapshot, targetHours, extra = {}) => ST.distributeCourseHours({ snapshot, rules: rulesOf('competencias'), targetHours, requirements: PILOT_REQ, ...extra });
 
-const SITUATION = 'Una tienda de barrio recibe a un cliente que compró un electrodoméstico hace diez días y vuelve porque no enciende. El cliente está molesto, trae la factura y pide que le devuelvan el dinero de inmediato. La política de la tienda permite cambio o reparación dentro del primer mes y la devolución solo con autorización de la administración, que hoy no está en el local.';
-const ANSWER = '1. El cliente necesita un producto que funcione y una solución rápida; la política permite cambio o reparación en el primer mes, y la devolución requiere autorización. 2. Le ofreces el cambio inmediato por una unidad igual o la reparación con fecha, y si insiste en la devolución, registras la solicitud y le das la fecha en que la administración responde. 3. Registras fecha, producto, factura, problema reportado, solución ofrecida y responsable, y agendas la llamada de seguimiento.';
+const SITUATION = "Una tienda de barrio recibe a un cliente que compró un electrodoméstico hace diez días y vuelve porque no enciende. El cliente está molesto, trae la factura y pide que le devuelvan el dinero de inmediato. La política de la tienda permite cambio o reparación dentro del primer mes y la devolución solo con autorización de la administración, que hoy no está en el local. En la bodega queda una sola unidad igual, reservada para otro cliente que la recoge mañana, y el servicio técnico autorizado tarda entre cinco y ocho días hábiles en entregar una reparación. El cliente explica que usa el aparato para su negocio de comidas y que cada día sin él pierde ventas. Detrás de él hay tres personas esperando en la fila y tu compañera de turno te pide que lo resuelvas rápido, sin prometer nada que la tienda no pueda cumplir.";
+const ANSWER = "1. El cliente necesita un aparato que funcione cuanto antes, porque cada día sin él pierde ventas; la devolución es lo que pide, pero lo que necesita es continuidad. La política permite cambio o reparación en el primer mes, y la devolución solo con autorización de la administración, que hoy no está.\n2. Le ofreces la reparación con el servicio técnico autorizado y, mientras tanto, revisas con la administración si se puede adelantar el cambio con la próxima unidad que llegue; no le entregas la unidad reservada porque ya tiene dueño. Le das una fecha concreta de respuesta y un número de contacto.\n3. Si insiste en la devolución inmediata, le explicas con calma que esa decisión la toma la administración y que tú no puedes autorizarla, registras su solicitud por escrito y te comprometes a que lo llamen al día siguiente. Así no prometes lo que no puedes cumplir y el cliente sabe qué pasa después.\n4. Registras la fecha de compra, el producto, el número de factura, el problema reportado, la solución ofrecida, la solicitud de devolución y el responsable del seguimiento. Dejas el caso marcado para la administración y agendas la llamada de seguimiento para el día siguiente.";
 function exercise(over = {}) {
   return {
     kind: 'case_analysis', title: 'Un cliente con un reclamo', situation: SITUATION,
-    tasks: ['Identifica qué necesita realmente el cliente.', 'Propón una respuesta concreta con los pasos.', 'Explica cómo registrarías el caso.'],
-    expectedProduct: 'Una respuesta escrita al cliente con los pasos acordados.',
+    tasks: ["Identifica qué necesita realmente el cliente y qué permite la política de la tienda.", "Propón una respuesta concreta con los pasos, sin comprometer la unidad reservada.", "Justifica qué harías si el cliente insiste en la devolución inmediata.", "Explica cómo registrarías el caso para que la administración lo resuelva."],
+    expectedProduct: 'Una respuesta escrita al cliente con los pasos acordados, la fecha de respuesta y el registro del caso.',
     criteria: [{ name: 'Comprensión', descriptor: 'Distingue lo que pide de lo que necesita.' }, { name: 'Política', descriptor: 'Respeta lo que la tienda permite.' }, { name: 'Registro', descriptor: 'Deja trazabilidad del caso.' }],
     modelAnswer: ANSWER, ...over,
   };
@@ -227,8 +227,8 @@ function gpDoc(chapterId, minutes) {
     assert(d.modules.flatMap((x) => x.chapters).every((c) => c.targetMinutes <= ST.DISTRIBUTOR_RULES.maxChapterMinutes), '≤ 4 h por capítulo');
     const gpChanges = d.changes.filter((c) => c.type === 'set_guided_practice');
     eq(gpChanges.length, 12, 'un cambio por capítulo');
-    assert(gpChanges.every((c) => /^Práctica guiada de (40|60|80|120) min en el capítulo «/.test(c.detail)), gpChanges[0].detail);
-    assert(d.priorityTrace.some((t) => /práctica guiada \(formativa, sin nota\)/.test(t)), 'traza');
+    assert(gpChanges.every((c) => /^Ejercicios guiados de (40|60|80|120) min en el capítulo «/.test(c.detail)), gpChanges[0].detail);
+    assert(d.priorityTrace.some((t) => /ejercicios guiados \(formativos, sin nota\) en 12 capítulo\(s\) de contenido: \d+(,\d)? h de \d+(,\d)? h \(\d+ %\)/.test(t)), 'traza');
     eq([d.guidedPracticeFill.used, d.guidedPracticeFill.shortfallHours], [true, 0], 'sin diferencia');
     // Tiempo por componente: la práctica guiada va en «Práctica y repaso»; las AA siguen siendo las 3 de 120.
     eq(d.hoursByComponent.application, 6, 'aplicación = 3 × 120 min');
@@ -246,19 +246,57 @@ function gpDoc(chapterId, minutes) {
     const pinned = distribute(base, 42, { pins: { [first]: { guided: 0 } } });
     eq(pinned.modules[0].chapters.find((c) => c.id === first).guidedPracticeMinutes, null, 'fijado sin práctica guiada');
     assert(pinned.estimatedHours >= 40, 'los demás compensan');
-    console.log(`   piloto: antes ${before} h → con práctica guiada ${d.estimatedHours} h (${levels.join('/')} min; ${d.counts.guidedPracticeMinutes} min en total)`);
+    console.log(`   piloto: antes ${before} h → con ejercicios guiados ${d.estimatedHours} h (${levels.join('/')} min; ${d.counts.guidedPracticeMinutes} min en total = ${Math.round((d.counts.guidedPracticeMinutes / 60) * 10) / 10} h de ${d.estimatedHours} h, ${Math.round((d.counts.guidedPracticeMinutes / 60 / d.estimatedHours) * 100)} %)`);
   });
 
   await check('GP5b sin alcance: ni con 120 min en todos los capítulos de contenido se llega → cannot_reach_target y la diferencia se dice; 0 AA de más', () => {
     const d = distribute(base, 70);
     eq(d.status, 'cannot_reach_target', 'no llega');
     assert(d.modules.flatMap((x) => x.chapters).filter((c) => c.kind === 'content').every((c) => c.guidedPracticeMinutes === 120 || c.targetMinutes + 40 > ST.DISTRIBUTOR_RULES.maxChapterMinutes), 'al máximo (o al tope de 4 h)');
-    assert(d.recommendations.some((x) => /Ni con práctica guiada en los capítulos de contenido \(hasta 120 min por capítulo\) se llega: faltan/.test(x)), d.recommendations.join(' | '));
+    assert(d.recommendations.some((x) => /Ni con ejercicios guiados en los capítulos de contenido \(hasta 120 min por capítulo\) se llega: faltan/.test(x)), d.recommendations.join(' | '));
     assert(d.guidedPracticeFill.shortfallHours > 0, 'shortfall en horas');
     eq(d.counts.applicationActivities, 3, 'sin AA de más');
     // Dentro de la meta sin práctica guiada: nada se agrega.
     const small = distribute(base, 24);
     assert(!small.counts.guidedPractices && !small.guidedPracticeFill, 'si ya llega, no hay práctica guiada');
+  });
+
+  await check('GP5c fix I1/I2: solo con la forma o las AA fijadas por el documento; «Ninguno» lo apaga; nunca por debajo del mínimo del documento; traza según el modo de AA', () => {
+    // Sin restricciones del documento (forma libre): lo de siempre — recomendación de estructura, sin ejercicios guiados.
+    const free = ST.distributeCourseHours({ snapshot: base, rules: rulesOf('competencias'), targetHours: 42, requirements: null });
+    assert(!free.counts.guidedPractices && !free.guidedPracticeFill, 'forma libre: sin ejercicios guiados');
+    // Solo capítulos por módulo (sin módulos fijos): la estructura puede crecer → tampoco.
+    const partial = ST.distributeCourseHours({ snapshot: base, rules: rulesOf('competencias'), targetHours: 42, requirements: { sources: {}, contentChaptersPerModule: { min: 4, max: 4 } } });
+    assert(!partial.counts.guidedPractices, 'forma no fijada: sin ejercicios guiados');
+    // Forma fijada por el documento (módulos × capítulos por módulo), sin AA fijadas: primero las AA (42 h llega con ellas);
+    // si con las AA no alcanza (60 h), los ejercicios guiados.
+    const req34 = { sources: {}, modulesFixed: 3, contentChaptersPerModule: { min: 4, max: 4 } };
+    const shape42 = ST.distributeCourseHours({ snapshot: base, rules: rulesOf('competencias'), targetHours: 42, requirements: req34 });
+    assert(!shape42.counts.guidedPractices && shape42.status === 'within_tolerance', 'forma fijada, 42 h: llegan las AA');
+    const shape = ST.distributeCourseHours({ snapshot: base, rules: rulesOf('competencias'), targetHours: 60, requirements: req34 });
+    assert(shape.counts.guidedPractices > 0 && shape.status === 'within_tolerance', 'forma fijada, 60 h: con ejercicios guiados');
+    // «Ejercicios guiados: Ninguno».
+    const none = distribute(base, 42, { preferences: { guidedPractice: 'none' } });
+    assert(!none.counts.guidedPractices && none.status === 'cannot_reach_target', 'Ninguno: sin ejercicios guiados (la diferencia se declara)');
+    eq(P.profileDesignPreferences({ designPreferences: { guidedPractice: 'none' } }).guidedPractice, 'none', 'preferencia del perfil');
+    throwsRe(() => P.profileDesignPreferences({ designPreferences: { guidedPractice: 'siempre' } }), /guidedPractice inválido/, 'valor inválido');
+    eq(P.normalizePedagogicalProfile({ ...profileOf('competencias'), designPreferences: { guidedPractice: 'auto' } }).designPreferences, undefined, '«Automático» no se guarda (sha de siempre)');
+    // Un diseño aplicado con ejercicios guiados y «Ninguno» después: se quitan (no «ya cumple»).
+    const mat = P.materializeDistribution(base, distribute(base, 42));
+    const off = distribute(mat, 42, { preferences: { guidedPractice: 'none' } });
+    assert(!off.counts.guidedPractices && off.changes.some((c) => c.type === 'remove_guided_practice'), 'Ninguno sobre un diseño aplicado: se quitan');
+    // I2: con 40–44 obligatorias y la meta en 40, el relleno no queda por debajo de 40 h (la tolerancia no lo baja).
+    const low = distribute(base, 40);
+    assert(low.estimatedHours >= 40 && low.estimatedHours <= 44, `meta 40 (40–44): ${low.estimatedHours} h`);
+    const noB = ST.distributeCourseHours({ snapshot: base, rules: rulesOf('competencias'), targetHours: 40, requirements: { ...PILOT_REQ, hoursBounds: undefined } });
+    assert(noB.estimatedHours <= low.estimatedHours, `sin límites del documento puede quedar más abajo (${noB.estimatedHours} ≤ ${low.estimatedHours})`);
+    // Fuera de los límites del documento (meta del docente) no se aplican.
+    const teacher = distribute(base, 30);
+    assert(teacher.estimatedHours < 40, `meta 30 del docente: ${teacher.estimatedHours} h`);
+    // Traza según el modo de AA.
+    const po = distribute(base, 42, { preferences: { applicationActivities: 'none' } });
+    assert(po.priorityTrace.some((t) => /^Sin Actividades de Aplicación \(decisión del docente\)/.test(t)), JSON.stringify(po.priorityTrace));
+    assert(!po.priorityTrace.some((t) => /en su máximo/.test(t)), 'nunca «en su máximo» con AA en Ninguna');
   });
 
   await check('GP6 meta de un rango del documento = su punto medio (la «Meta de diseño» de la UI); dentro del rango se respeta', () => {
@@ -278,9 +316,27 @@ function gpDoc(chapterId, minutes) {
     eq(codes(mut((d) => { d.exercises[0].criteria[0].weight = 50; })), ['GUIDED_PRACTICE_SHAPE'], 'sin pesos');
     eq(codes(mut((d) => { d.exercises[1].minutes = 30; })), ['GUIDED_PRACTICE_EXERCISE_MINUTES'], 'minutos de Cursia');
     eq(codes(doc, 120), ['GUIDED_PRACTICE_COUNT', 'GUIDED_PRACTICE_MINUTES_MISMATCH'], '120 = 3 ejercicios');
-    eq(codes(mut((d) => { d.exercises[0].modelAnswer = ANSWER.replace(/\b[123]\. /g, ''); })), ['GUIDED_PRACTICE_ANSWER_ORDER'], 'respuesta en orden');
+    eq(codes(mut((d) => { d.exercises[0].modelAnswer = ANSWER.replace(/(^|\n)\d\. /g, '$1'); })), ['GUIDED_PRACTICE_ANSWER_ORDER'], 'respuesta en orden');
     eq(codes(mut((d) => { d.exercises[0].tasks[0] = 'Mira el video del capítulo y responde.'; })), ['GUIDED_PRACTICE_RESOURCE_MENTION'], 'sin mencionar recursos');
     throwsRe(() => GP.validateGuidedPracticeDoc(doc, { chapterId: ch, minutes: 90 }), /V3_VALIDATION_CONTEXT/, 'contexto inválido');
+    // Fix C1: los pisos crecen con los minutos de cada ejercicio (lo acreditado tiene trabajo detrás).
+    eq(JSON.parse(JSON.stringify(GP.GUIDED_PRACTICE_FLOORS)), { 20: { situationMin: 300, tasksMin: 3, modelAnswerMin: 450, expectedProductMin: 10 }, 30: { situationMin: 500, tasksMin: 4, modelAnswerMin: 800, expectedProductMin: 20 }, 40: { situationMin: 700, tasksMin: 4, modelAnswerMin: 1100, expectedProductMin: 40 } }, 'pisos por minutos');
+    const short = (d) => { d.exercises.forEach((e) => { e.situation = SITUATION.slice(0, 520); e.tasks = e.tasks.slice(0, 3); e.modelAnswer = ANSWER.split('\n').slice(0, 3).join('\n'); }); };
+    eq(codes(mut(short), 80), ['GUIDED_PRACTICE_COUNT', 'GUIDED_PRACTICE_TEXT'], '40 min: situación < 700, 3 consignas y respuesta < 1100 → no');
+    const d40 = gpDoc(ch, 40);
+    short(d40);
+    eq(codes(d40, 40), [], '20 min: lo mismo alcanza (300 / 3 / 450)');
+    const d60 = gpDoc(ch, 60);
+    short(d60);
+    eq(codes(d60, 60), ['GUIDED_PRACTICE_COUNT'], '30 min: 4 consignas (situación 520 y respuesta de 3 líneas alcanzan… salvo las consignas)');
+    eq(codes(mut((d) => { d.exercises[0].expectedProduct = 'Un informe.'; })), ['GUIDED_PRACTICE_TEXT'], '40 min: producto esperado concreto (≥ 40)');
+    eq(codes(mut((d) => { d.exercises[0].tasks[1] = 'Define qué es una garantía comercial.'; })), ['GUIDED_PRACTICE_TASK_RECALL'], 'consigna de solo recordar');
+    eq(codes(mut((d) => { d.exercises[0].tasks[1] = '¿Qué es una garantía comercial?'; })), ['GUIDED_PRACTICE_TASK_RECALL'], 'consigna «¿Qué es…?»');
+    eq(codes(mut((d) => { d.exercises[0].tasks[1] = 'Decide qué ofrecerías y justifica con la política.'; })), [], 'consigna que produce');
+    // Fix M1: solo cuentan las marcas al inicio de línea (cifras como «2.000» o «3. » en medio de una línea, no).
+    eq(GP.guidedPracticeAnswerCoversTasks('1. Sube a 2.000 unidades y 3.5 % más. 2. Luego. 3. Fin.', 3), false, 'todo en una línea: no');
+    eq(GP.guidedPracticeAnswerCoversTasks('1. Sube a 2.000 unidades.\n2. Baja 3,5 %.\n3. Fin.', 3), true, 'una línea por consigna');
+    eq(GP.guidedPracticeAnswerCoversTasks('1. Primero.\n3. Tercero.\n2. Segundo.', 3), false, 'en orden');
     // v3-validation (lo que hace completeItem).
     eq(V3V.v3ValidatedArtifactType('guided_practice'), 'dynamic_guided_practice_json', 'artifact validado');
     const ok = V3V.validateV3ItemArtifact({ type: 'guided_practice', itemKey: `guided_practice:${ch}`, chapterId: ch, guidedPracticeMinutes: 80 }, JSON.stringify(doc));
@@ -294,7 +350,7 @@ function gpDoc(chapterId, minutes) {
     ctx.window = ctx;
     vm.createContext(ctx);
     for (const f of ['44-dynamic-prompt-builders.js', '45-dynamic-generation-executor.js']) vm.runInContext(fs.readFileSync(path.join(vendor, f), 'utf8'), ctx, { filename: f });
-    const cases = [doc, mut((d) => { d.solution = {}; }), mut((d) => { d.exercises[0].kind = 'quiz'; }), mut((d) => { d.exercises[0].situation = 'corta'; }), mut((d) => { d.exercises[0].criteria.pop(); d.exercises[0].criteria.pop(); }), mut((d) => { d.exercises[0].modelAnswer = ANSWER.replace('1. El', 'El'); }), mut((d) => { d.exercises[0].expectedProduct = 'Igual que en la Actividad de Aplicación.'; })];
+    const cases = [doc, mut((d) => { d.solution = {}; }), mut((d) => { d.exercises[0].kind = 'quiz'; }), mut((d) => { d.exercises[0].situation = 'corta'; }), mut((d) => { d.exercises[0].criteria.pop(); d.exercises[0].criteria.pop(); }), mut((d) => { d.exercises[0].modelAnswer = ANSWER.replace('1. El', 'El'); }), mut((d) => { d.exercises[0].expectedProduct = 'Igual que en la Actividad de Aplicación.'; }), mut((d) => { d.exercises[0].tasks.pop(); }), mut((d) => { d.exercises[0].tasks[1] = 'Enumera los tipos de garantía.'; }), mut((d) => { d.exercises[0].modelAnswer = ANSWER.replace(/\n/g, ' '); }), mut((d) => { d.exercises[0].situation = SITUATION.slice(0, 650); })];
     for (const [i, d] of cases.entries()) {
       const be = [...new Set(GP.validateGuidedPracticeDoc(d, { chapterId: ch, minutes: 80 }).map((e) => e.code))].sort();
       const fe = [...new Set(ctx.dynValidateGuidedPracticeDoc(d, { chapterId: ch, minutes: 80 }).map((e) => e.code))].sort();
@@ -303,6 +359,9 @@ function gpDoc(chapterId, minutes) {
     eq(JSON.parse(JSON.stringify(ctx.DYN_GUIDED_PRACTICE_EXERCISES_BY_MINUTES)), { 40: [20, 20], 60: [30, 30], 80: [40, 40], 120: [40, 40, 40] }, 'mismos niveles');
     eq(String(ctx.DYN_GUIDED_PRACTICE_RESOURCE_RE), String(GP.GUIDED_PRACTICE_RESOURCE_RE), 'misma regex de recursos');
     eq(JSON.parse(JSON.stringify(ctx.DYN_GUIDED_PRACTICE_LIM)), JSON.parse(JSON.stringify(GP.GUIDED_PRACTICE_LIMITS)), 'mismos límites');
+    eq(JSON.parse(JSON.stringify(ctx.DYN_GUIDED_PRACTICE_FLOORS)), JSON.parse(JSON.stringify(GP.GUIDED_PRACTICE_FLOORS)), 'mismos pisos por minutos (C1)');
+    eq(String(ctx.DYN_GUIDED_PRACTICE_RECALL_TASK_RE), String(GP.GUIDED_PRACTICE_RECALL_TASK_RE), 'misma regex de consignas de solo recordar');
+    for (const [a, n] of [['1. Sube a 2.000 unidades y 3.5 % más. 2. Luego. 3. Fin.', 3], ['1. A.\n2. B.\n3. C.', 3], ['1) A\n2) B', 2]]) eq(ctx.dynGuidedPracticeAnswerCoversTasks(a, n), GP.guidedPracticeAnswerCoversTasks(a, n), `marcas de respuesta iguales: ${JSON.stringify(a)}`);
   });
 
   const B = loadDist('package/dynamic-mbz-builder-v3.js');
@@ -327,7 +386,7 @@ function gpDoc(chapterId, minutes) {
   };
   const idnOf = async (zip, dir) => ((await zip.file(`${dir}/module.xml`).async('string')).match(/<idnumber>([^<]*)<\/idnumber>/) || [])[1];
 
-  await check('GP8 empaque: página «Práctica guiada — <capítulo>» tras el texto (antes del video/actividad), visible, formativa, respuesta modelo; Libro Guía; validador', async () => {
+  await check('GP8 empaque: página «Ejercicios guiados — <capítulo>» tras la síntesis (antes de la actividad), visible, formativa, respuesta modelo; Libro Guía; validador', async () => {
     const { input, r, zip } = await pkg();
     const v = await VAL.validateMbzV3(r.mbz, r.expectations);
     assert(v.ok, `validador ${JSON.stringify(v.issues.slice(0, 5))}`);
@@ -341,7 +400,7 @@ function gpDoc(chapterId, minutes) {
       const a = pages[0];
       eq(a.mod, 'page', 'mod_page');
       const title = input.blueprint.modules.flatMap((mm) => mm.chapters).find((x) => x.id === c.chapterId).title;
-      eq(a.title, `Práctica guiada — ${title}`, 'nombre');
+      eq(a.title, `Ejercicios guiados — ${title}`, 'nombre');
       const mx = await zip.file(`${a.dir}/module.xml`).async('string');
       eq([(mx.match(/<visible>(\d)<\/visible>/) || [])[1], (mx.match(/<completion>(\d)<\/completion>/) || [])[1]], ['1', '2'], 'visible, completion por vista');
       const page = await zip.file(`${a.dir}/page.xml`).async('string');
@@ -350,15 +409,15 @@ function gpDoc(chapterId, minutes) {
       const doc = input.contents.guidedPractices.get(c.chapterId);
       assert(html.includes('Respuesta modelo (revísala después de intentarlo)') && html.includes('Qué debes hacer') && html.includes('Producto esperado') && html.includes('Criterios para revisar tu trabajo'), 'estructura');
       eq((html.match(/Ejercicio \d de \d/g) || []).length, doc.exercises.length, 'un bloque por ejercicio');
-      assert(html.includes(`~${doc.exercises[0].minutes} min`) && /no tiene nota/.test(html), 'minutos y formativa');
+      assert(html.includes(`~${doc.exercises[0].minutes} min`) && /no tienen? nota/.test(html), 'minutos y formativa');
       assert(!/Solucionario|Nota mínima|calificad/i.test(html), 'sin solucionario ni nota');
-      // Lugar: después de la profundización, antes del video y de la actividad.
+      // Lugar (fix M4): después de la síntesis (y del video), antes de la actividad.
       const sec = acts.filter((x) => x.sec === a.sec);
       const ids = [];
       for (const x of sec) ids.push((await idnOf(zip, x.dir)).split(':').pop());
       const i = ids.indexOf('guided_practice');
-      eq(ids[i - 1], 'deepening', `capítulo ${c.chapterNumber}: después del texto`);
-      assert(ids.indexOf('video') < 0 || ids.indexOf('video') > i, 'antes del video');
+      eq(ids[i - 1], 'synthesis', `capítulo ${c.chapterNumber}: después de la síntesis`);
+      assert(ids.indexOf('video') < 0 || ids.indexOf('video') < i, 'después del video');
       assert(ids.indexOf('activity') < 0 || ids.indexOf('activity') > i, 'antes de la actividad');
     }
     // Secuencia completa = Manifest + chapterSlotSequence.
@@ -379,7 +438,7 @@ function gpDoc(chapterId, minutes) {
     });
     const GPP = loadDist('modules/course-shell/guided-practice-page.js');
     const md = GPP.guidedPracticeLibroMarkdown(input.contents.guidedPractices.get(gpChapters[0].chapterId));
-    assert(md.startsWith('## Práctica guiada del capítulo') && md.includes('**Respuesta modelo (revísala después de intentarlo).**') && md.includes('1. Identifica'), 'Markdown del Libro');
+    assert(md.startsWith('## Ejercicios guiados del capítulo') && md.includes('**Respuesta modelo (revísala después de intentarlo).**') && md.includes('1. Identifica'), 'Markdown del Libro');
     const [l0, l1] = [await libroOf(null), await libroOf(md)];
     eq(l1.wordCount, l0.wordCount, 'no suma palabras al Libro (sus minutos son los de la práctica guiada)');
     assert(l1.pageCount > l0.pageCount, `más páginas con la práctica (${l0.pageCount} → ${l1.pageCount})`);
@@ -427,6 +486,7 @@ function gpDoc(chapterId, minutes) {
     const lines = e.lines.filter((l) => l.itemType === 'guided_practice');
     eq([...new Set(lines.map((l) => `${l.provider}/${l.operation}`))], ['anthropic/llm.guided_practice'], 'Anthropic');
     eq(NA.ESTIMATE_CATEGORY_OF_PROVIDER.anthropic, 'content', 'categoría «content»');
+    eq(loadDist('modules/pedagogy/dry-run.js').COST_CATEGORY_OF_ITEM_TYPE.guided_practice, 'text', 'categoría visible del costo: texto (fix M2), nunca «aplicación»');
     for (const l of lines) assert(G.itemHardLimit(Number(l.expected), Number(l.max), 0) >= Number(l.max), 'presupuesto de recuperación por parte');
     // Costo del piloto: la propuesta con 12 prácticas guiadas frente a la misma sin ellas.
     const mat = P.materializeDistribution(base, pilot.d);
@@ -443,7 +503,19 @@ function gpDoc(chapterId, minutes) {
     assert(ROUTING.ALL_LLM_WORKER_TYPES.includes('guided_practice') && ROUTING.DEFAULT_LLM_WORKER_TYPES.includes('guided_practice'), 'worker de IA por defecto');
     assert(SCHED.BROWSER_CLAIMABLE_TYPES.includes('guided_practice'), 'reclamable por el navegador (con la capacidad)');
     eq(SCHED.GUIDED_PRACTICE_FEATURE, 'guided-practice-1', 'capacidad del claim');
-    for (const code of ['GUIDED_PRACTICE_TEXT', 'GUIDED_PRACTICE_ANSWER_ORDER', 'GUIDED_PRACTICE_RESOURCE_MENTION']) assert(FC.isKnownValidationCode(code), `clase B: ${code}`);
+    for (const code of ['GUIDED_PRACTICE_TEXT', 'GUIDED_PRACTICE_ANSWER_ORDER', 'GUIDED_PRACTICE_RESOURCE_MENTION', 'GUIDED_PRACTICE_TASK_RECALL', 'GUIDED_PRACTICE_CASE_CLASH']) assert(FC.isKnownValidationCode(code), `clase B: ${code}`);
+    // Fix I5: el claim lleva lo que no se debe repetir (práctica del módulo + casos de sus AA completadas).
+    const AA = loadDist('modules/course-shell/application-activity.js');
+    eq(AA.caseProperNames('Marta Gómez atiende en Ferretería El Tornillo. Luego llama a Pedro. En Bogotá llueve.'), ['Marta Gómez', 'Ferretería El Tornillo', 'Pedro', 'Bogotá'], 'nombres propios del caso');
+    const sum = AA.applicationActivitySummary({ minutes: 120, activity: { title: 'Taller: la ferretería', context: 'Marta Gómez administra la Ferretería El Tornillo.', workshop: { title: 'El inventario de Marta', situation: 'Marta revisa el inventario con Julián Ríos.' } } });
+    eq([sum.title, sum.workshopTitle, sum.caseNames], ['Taller: la ferretería', 'El inventario de Marta', ['Marta Gómez', 'Ferretería El Tornillo', 'Julián Ríos']], 'summary de la AA con el caso');
+    const bpG = base;
+    const mG = manifestOf(bpG);
+    const contentId = mG.modules[0].chapters.find((c) => c.kind !== 'practice').chapterId;
+    const av = SCHED.guidedPracticeAvoidOf(mG, bpG, contentId, [{ v3Validation: sum }, { v3Validation: {} }]);
+    eq(av.practiceChapterTitles, ['Práctica integradora 1'], 'título de la práctica del módulo');
+    eq(av.applicationCases, [{ title: 'Taller: la ferretería', workshopTitle: 'El inventario de Marta', names: ['Marta Gómez', 'Ferretería El Tornillo', 'Julián Ríos'] }], 'casos de las AA');
+    eq(SCHED.guidedPracticeAvoidOf(mG, bpG, 'no-existe', []), null, 'capítulo desconocido');
     // Guarda de esquema (503 sin la migración).
     GUARD._resetGuidedPracticeSchemaGuardForTests();
     let err = null;
@@ -452,6 +524,13 @@ function gpDoc(chapterId, minutes) {
     eq(await GUARD.hasGuidedPracticeSchema({ query: async () => [] }), false, 'sin columna');
     eq(await GUARD.hasGuidedPracticeSchema({ query: async () => [{ '?column?': 1 }] }), true, 'con columna');
     GUARD._resetGuidedPracticeSchemaGuardForTests();
+  });
+
+  await check('GP11 fix I1/I4: Prebrief/PDF con «Ejercicios guiados» y su proporción «X h de Y h (Z %)»', () => {
+    const PD = loadDist('modules/prebrief/prebrief-document.js');
+    eq(PD.guidedPracticeShareText({ minutes: 1120, designHours: 41.7, sharePct: 45 }), 'Ejercicios guiados: 18,7 h de 41,7 h (45 %).', 'proporción');
+    eq(PD.guidedPracticeText({ chapters: 12, everyContentChapter: true, exercises: { min: 2, max: 3 }, exerciseMinutes: { min: 40, max: 40 } }),
+      'Ejercicios guiados en cada capítulo de contenido (formativos, no calificados): 2–3 ejercicios de 40 min', 'texto del recurso');
   });
 
   console.log(`\n${passes} OK, ${failures} fallidas`);
