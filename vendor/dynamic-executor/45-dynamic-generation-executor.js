@@ -6468,20 +6468,31 @@ function _dynEbRememberModuleStems(item, moduleId, questions) {
   if (!st || !item.runId) return;
   try { st.setItem(DYN_EXAM_STEMS_PREFIX + item.runId + '|' + moduleId, JSON.stringify({ v: 1, stems: _dynEbStemEntries(questions) })); } catch (e) { /* sin espacio: sin memoria */ }
 }
-async function _dynEbLoadModuleStems(item) {
+// Loop 9 (worker de IA): el worker corre cada parte en un contexto NUEVO (sin la memoria del navegador): el Manifest
+// hace depender el final de los exam:<m> y los bancos llegan como dependencias. Devuelve la lista de preguntas y, en
+// `meta`, de dónde salieron (source: dependencies | dependencies_unreadable | session | none) y cuántas dependencias
+// no se pudieron leer: el final NUNCA falla por eso (sale sin bloque «no repitas»), pero queda visible en el summary.
+async function _dynEbLoadModuleStemsDetailed(item) {
   var out = [];
   var seen = {};
   function add(list) { (list || []).forEach(function (e) { var k = dynNormalizeExamText(e.stem); if (!seen[k]) { seen[k] = true; out.push(e); } }); }
   var deps = (item.dependencyArtifacts || []).filter(function (a) { return a && a.type === DYN_EXAM_BANK_ARTIFACT_TYPE; });
+  var unreadable = 0;
+  var readable = 0;
   await Promise.all(deps.map(function (d) {
     return _dynDownloadArtifactText(d.artifactId).then(function (dl) {
-      if (!dl || !dl.ok) return;
-      try { var j = JSON.parse(dl.text); if (j && j.scope === 'module') add(_dynEbStemEntries(j.questions)); } catch (e) { /* ilegible: se ignora */ }
-    }).catch(function () {});
+      if (!dl || !dl.ok) { unreadable++; return; }
+      try {
+        var j = JSON.parse(dl.text);
+        if (j && j.scope === 'module') { readable++; add(_dynEbStemEntries(j.questions)); } else { unreadable++; }
+      } catch (e) { unreadable++; /* ilegible: se cuenta */ }
+    }).catch(function () { unreadable++; });
   }));
   // Fix round 1 (m6): si el backend manda los exámenes de módulo como dependencias, son la única fuente
   // (nunca el almacenamiento del navegador).
-  if (deps.length) return out;
+  if (deps.length) {
+    return { stems: out, meta: { source: readable > 0 ? 'dependencies' : 'dependencies_unreadable', dependencies: deps.length, unreadable: unreadable } };
+  }
   var st = _dynEbStorage();
   if (st && item.runId) {
     try {
@@ -6492,7 +6503,10 @@ async function _dynEbLoadModuleStems(item) {
       }
     } catch (e) { /* sin memoria */ }
   }
-  return out;
+  return { stems: out, meta: { source: out.length ? 'session' : 'none', dependencies: 0, unreadable: 0 } };
+}
+async function _dynEbLoadModuleStems(item) {
+  return (await _dynEbLoadModuleStemsDetailed(item)).stems;
 }
 // Bloque «no repitas» del prompt del final: las preguntas de módulo del MISMO capítulo (máx. 12).
 function dynExamBankAvoidBlock(stems, chapterId) {
@@ -6540,7 +6554,8 @@ async function _dynRunExamBank(item) {
   if (mdErr) return fail(mdErr, true);
   var summaries = await _dynLoadContextSummaries(item);
   // #542 (I3): el examen final no repite las preguntas de las evaluaciones de módulo.
-  var externalStems = scope === 'final' ? await _dynEbLoadModuleStems(item) : [];
+  var stemsInfo = scope === 'final' ? await _dynEbLoadModuleStemsDetailed(item) : { stems: [], meta: null };
+  var externalStems = stemsInfo.stems;
   var infoCache = {};
   function chapterInfo(chId) {
     if (!Object.prototype.hasOwnProperty.call(md, chId)) return null;
@@ -6919,6 +6934,12 @@ async function _dynRunExamBank(item) {
     bankSha256: art.sha,
     externalStems: externalStems.length // #542 (I3): preguntas de módulo que el final evitó repetir
   };
+  if (stemsInfo.meta) {
+    // Loop 9: de dónde salieron las preguntas de módulo (y cuántos bancos no se pudieron leer) — nunca en silencio.
+    summary.externalStemsSource = stemsInfo.meta.source;
+    summary.externalStemsDependencies = stemsInfo.meta.dependencies;
+    summary.externalStemsUnreadable = stemsInfo.meta.unreadable;
+  }
   if (draftInfo) { draftInfo.chunksSkipped = stats.draftChunks; summary.draft = draftInfo; }
   Object.assign(summary, dynPedagogySummary(item));
   return { ok: true, artifacts: [art.artifact], summary: summary };
