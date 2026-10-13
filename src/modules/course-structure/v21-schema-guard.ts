@@ -121,6 +121,35 @@ export async function assertApplicationActivitySchema(q: { query(sql: string, pa
   applicationVerified = true;
 }
 
+// ── Loop 9 B: Práctica guiada (course_chapters.guided_practice_minutes) ──
+// Misma regla que las Actividades de Aplicación: la migración (supabase-migration-guided-practice.sql) corre SOLO en
+// staging; sin ella la lectura no informa `guidedPracticeMinutes` y una escritura con la clave responde 503.
+export const SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE = 'schema_not_migrated_guided_practice';
+let guidedPracticeVerified = false;
+
+export function _resetGuidedPracticeSchemaGuardForTests(): void {
+  guidedPracticeVerified = false;
+}
+
+/** ¿La base tiene la columna? (sin lanzar: para escribir la práctica guiada solo donde existe). */
+export async function hasGuidedPracticeSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<boolean> {
+  if (guidedPracticeVerified) return true;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'guided_practice_minutes'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (rows.length) guidedPracticeVerified = true;
+  return rows.length > 0;
+}
+
+export async function assertGuidedPracticeSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (await hasGuidedPracticeSchema(q)) return;
+  throw new ServiceUnavailableException({
+    code: SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE,
+    message: `${SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE}: esta base no tiene la práctica guiada (course_chapters.guided_practice_minutes); correr supabase-migration-guided-practice.sql antes de usarla.`,
+  });
+}
+
 // Fase 3 · Contexto académico: la migración (supabase-migration-academic-context.sql) corre SOLO en staging; sin ella
 // la lectura no informa `outcomeIds` y una escritura con la clave responde 503.
 export const SCHEMA_NOT_MIGRATED_ACADEMIC = 'schema_not_migrated_academic';

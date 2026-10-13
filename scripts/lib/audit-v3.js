@@ -17,7 +17,7 @@
 /** Tipos de item v3, en orden canónico (audit §N.2). */
 const V3_ITEM_TYPES = [
   'course_plan', 'course_intro', 'audio_welcome', 'module_intro', 'content', 'experience',
-  'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter', 'exam', 'final_exam',
+  'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter', 'exam', 'final_exam',
 ];
 
 /** tipo de item → columna de conteo de course_generation_manifests. */
@@ -37,6 +37,8 @@ const V3_COUNT_COLUMNS = {
   final_exam: 'final_exam_count',
   // Fase 2 (columna ausente antes de la migración de actividades → no se compara).
   application_activity: 'application_activity_count',
+  // Loop 9 B (columna ausente antes de la migración de práctica guiada → no se compara).
+  guided_practice: 'guided_practice_count',
 };
 
 /** Roles de artifact obligatorios de un item v3 COMPLETADO (activity según su variant). */
@@ -54,6 +56,7 @@ const V3_ARTIFACT_ROLES = {
   audio_welcome: ['dynamic_audio_mp3'],
   audiobook_chapter: ['dynamic_audio_mp3'],
   application_activity: ['dynamic_application_json'],
+  guided_practice: ['dynamic_guided_practice_json'],
 };
 const V3_ACTIVITY_ROLES = {
   h5p: ['dynamic_h5p_params_json'],
@@ -73,7 +76,7 @@ function requiredRolesV3(type, variant) {
   return V3_ARTIFACT_ROLES[type] ? [...V3_ARTIFACT_ROLES[type]] : undefined;
 }
 
-const CHAPTER_TYPES = ['content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter'];
+const CHAPTER_TYPES = ['content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter'];
 
 /**
  * Invariantes de un Manifest rulesVersion 3 contra el snapshot (schemaVersion
@@ -178,6 +181,9 @@ function auditManifestV3(row, label) {
       // Fase 2: Actividad de Aplicación sii el capítulo tiene applicationMinutes.
       const ap = c.applicationMinutes !== undefined ? 1 : 0;
       if (n(`application_activity:${c.id}`) !== ap) push(`capítulo ${c.id} (applicationMinutes=${JSON.stringify(c.applicationMinutes ?? null)}): ${n(`application_activity:${c.id}`)} application_activity (esperado ${ap}).`);
+      // Loop 9 B: práctica guiada sii el capítulo (de contenido) tiene guidedPracticeMinutes.
+      const gp = !practice && c.guidedPracticeMinutes !== undefined ? 1 : 0;
+      if (n(`guided_practice:${c.id}`) !== gp) push(`capítulo ${c.id} (guidedPracticeMinutes=${JSON.stringify(c.guidedPracticeMinutes ?? null)}): ${n(`guided_practice:${c.id}`)} guided_practice (esperado ${gp}).`);
       const v = c.videoEnabled === true ? 1 : 0;
       for (const t of ['video', 'video_interactions']) {
         if (n(`${t}:${c.id}`) !== v) push(`capítulo ${c.id} (videoEnabled=${c.videoEnabled === true}): ${n(`${t}:${c.id}`)} ${t} (esperado ${v}).`);

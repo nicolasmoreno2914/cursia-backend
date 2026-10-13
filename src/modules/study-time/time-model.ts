@@ -13,6 +13,7 @@
 // El audiolibro NO suma: es otra forma de recorrer el Libro Guía (escucharlo o leerlo, no ambos).
 import { examSlotSplit, finalExamSlotSplit } from '../course-shell/exam-bank';
 import { APPLICATION_ACTIVITY_TIERS } from './application-tiers';
+import { GUIDED_PRACTICE_TIERS } from './guided-practice-tiers';
 import { reflectionPauseCount, videoInteractionCount } from '../../package/h5p/interactive-video/plan';
 
 export const STUDY_TIME_RULES_VERSION = 1 as const;
@@ -32,6 +33,8 @@ export const STUDY_TIME_RULES = Object.freeze({
   forumMinutes: 10,
   /** Niveles de la Actividad de aplicación (Fase 2): los fija Cursia, nunca la IA. */
   applicationActivityTiers: APPLICATION_ACTIVITY_TIERS,
+  /** Loop 9 B · Niveles de la práctica guiada del capítulo (formativa, sin nota): los fija Cursia, nunca la IA. */
+  guidedPracticeTiers: GUIDED_PRACTICE_TIERS,
   /** Valores planificados (antes de generar), calibrados con cursos reales. */
   planned: Object.freeze({
     chapterPageWords: 2200,
@@ -65,6 +68,7 @@ export type StudyTimeResourceKind =
   | 'activity'
   | 'review'
   | 'application_activity'
+  | 'guided_practice'
   | 'module_exam'
   | 'final_exam';
 
@@ -85,6 +89,8 @@ const COMPONENT_OF: Readonly<Record<StudyTimeResourceKind, StudyTimeComponent>> 
   activity: 'practice',
   review: 'review',
   application_activity: 'application',
+  // Loop 9 B: formativa (no es una Actividad de Aplicación) → «Práctica y repaso».
+  guided_practice: 'practice',
   module_exam: 'assessment',
   final_exam: 'assessment',
 });
@@ -121,6 +127,8 @@ export interface StudyTimeChapterInput {
   reviewCards?: number;
   /** Fase 2: minutos de la Actividad de aplicación; debe ser uno de los niveles. */
   applicationMinutes?: number;
+  /** Loop 9 B: minutos de la práctica guiada (solo capítulos de contenido); debe ser uno de los niveles. */
+  guidedPracticeMinutes?: number;
 }
 
 export interface StudyTimeModuleInput {
@@ -249,6 +257,13 @@ export function estimateChapterStudyTime(ch: StudyTimeChapterInput): StudyTimeCh
     }
     out.push(res('application_activity', ch.applicationMinutes, `nivel de ${ch.applicationMinutes} min fijado por Cursia`, false));
   }
+  if (ch.guidedPracticeMinutes !== undefined) {
+    if (!(R.guidedPracticeTiers as readonly number[]).includes(ch.guidedPracticeMinutes)) {
+      throw new StudyTimeError(`guidedPracticeMinutes del ${where} debe ser uno de ${R.guidedPracticeTiers.join('/')} (fue ${JSON.stringify(ch.guidedPracticeMinutes)})`);
+    }
+    if (practice) throw new StudyTimeError(`el ${where} es de práctica: la práctica guiada es solo de los capítulos de contenido`);
+    out.push(res('guided_practice', ch.guidedPracticeMinutes, `práctica guiada de ${ch.guidedPracticeMinutes} min fijada por Cursia`, false));
+  }
   const chapterEstimatedMinutes = r2(out.reduce((a, x) => a + x.minutes, 0));
   return { chapterId: ch.chapterId, chapterEstimatedMinutes, displayMinutes: displayChapterMinutes(chapterEstimatedMinutes), resources: out };
 }
@@ -311,6 +326,6 @@ export function estimateCourseStudyTime(input: StudyTimeCourseInput): StudyTimeE
     resources: course,
     modules,
     byComponent,
-    usesPlannedValues: all.some((x) => !x.measured && x.resource !== 'forum' && x.resource !== 'application_activity'),
+    usesPlannedValues: all.some((x) => !x.measured && x.resource !== 'forum' && x.resource !== 'application_activity' && x.resource !== 'guided_practice'),
   };
 }

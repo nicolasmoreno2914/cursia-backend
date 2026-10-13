@@ -1,7 +1,7 @@
 // Motor de carga horaria — entrada del modelo de tiempo desde un Manifest v3 (lo que se va a generar).
 //
 // Cada recurso existe si el Manifest tiene su trabajo: página (experience), Libro Guía (content),
-// presentación, video (+ preguntas), actividad, Actividad de Aplicación (Fase 2, con sus minutos),
+// presentación, video (+ preguntas), actividad, Actividad de Aplicación (Fase 2, con sus minutos), práctica guiada (Loop 9 B),
 // apertura de módulo, exámenes, bienvenida y audio de bienvenida. El «Repaso» depende del ajuste del Blueprint (mismas condiciones que el empaque) y el foro
 // lo agrega siempre el shell del curso. Las medidas (si ya se generó) llegan aparte y reemplazan a los
 // valores planificados.
@@ -24,6 +24,11 @@ export interface StudyTimeMeasurements {
   frameWords?: number;
   introWordsByModule?: Record<string, number>;
   welcomeAudioSeconds?: number;
+  /**
+   * Loop 9 B · capítulos cuya práctica guiada tiene su artifact VALIDADO (al empaquetar). Presente = solo esos suman sus
+   * minutos (una práctica que falta no se cuenta: la diferencia queda a la vista). Ausente = las del Manifest (plan).
+   */
+  guidedPracticeChapterIds?: readonly string[];
 }
 
 /**
@@ -42,6 +47,14 @@ function applicationMinutesOf(manifest: GenerationManifestV1, chapterId: string)
   return m;
 }
 
+/** Loop 9 B: minutos de la práctica guiada de un capítulo (del item del Manifest; falta o inválido → throw). */
+function guidedPracticeMinutesOf(manifest: GenerationManifestV1, chapterId: string): number {
+  const it = manifest.items.find((i) => i.type === 'guided_practice' && i.chapterId === chapterId);
+  const m = it?.guidedPracticeMinutes;
+  if (typeof m !== 'number') throw new StudyTimeError(`guided_practice:${chapterId} sin guidedPracticeMinutes`);
+  return m;
+}
+
 export function studyTimeInputFromManifest(
   manifest: GenerationManifestV1,
   blueprint: BlueprintSnapshotV2,
@@ -54,6 +67,7 @@ export function studyTimeInputFromManifest(
   const hasType = (type: string) => manifest.items.some((i) => i.type === type);
   const review = reviewCardsEnabledFor(blueprint, manifest);
   const reviewIds = measured.reviewChapterIds ? new Set(measured.reviewChapterIds) : null;
+  const guidedIds = measured.guidedPracticeChapterIds ? new Set(measured.guidedPracticeChapterIds) : null;
   const ivAdvanced = manifest.features?.ivAdvanced === 1;
   const pick = (rec: Record<string, number> | undefined, id: string) => (rec && Object.prototype.hasOwnProperty.call(rec, id) ? rec[id] : undefined);
 
@@ -93,6 +107,8 @@ export function studyTimeInputFromManifest(
           reviewCards: pick(measured.reviewCardsByChapter, id),
           // Fase 2: la Actividad de Aplicación entra con sus minutos (nivel fijado por el diseño, nunca medido).
           ...(has('application_activity', id) ? { applicationMinutes: applicationMinutesOf(manifest, id) } : {}),
+          // Loop 9 B: la práctica guiada entra con sus minutos (nivel del diseño); al empaquetar, solo si se validó.
+          ...(has('guided_practice', id) && (!guidedIds || guidedIds.has(id)) ? { guidedPracticeMinutes: guidedPracticeMinutesOf(manifest, id) } : {}),
         };
       }),
     })),

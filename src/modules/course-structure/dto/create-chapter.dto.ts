@@ -39,6 +39,12 @@ export class CreateChapterDto {
   @IsOptional()
   applicationMinutes?: 30 | 60 | 90 | 120 | null;
 
+  // Loop 9 B · Práctica guiada (formativa, sin nota; solo capítulos de contenido): 40/60/80/120 min; 0 o null = sin
+  // práctica guiada; ausente → sin cambio (al crear: sin práctica guiada).
+  @IsIn([0, 40, 60, 80, 120])
+  @IsOptional()
+  guidedPracticeMinutes?: 0 | 40 | 60 | 80 | 120 | null;
+
   // Fase 3 · Contexto académico: resultados de aprendizaje / competencias que el capítulo debe evidenciar (1–8 ids del
   // contexto académico vigente, «RA1», «CO2»…); null o [] = sin vínculos; ausente → sin cambio.
   @IsArray()

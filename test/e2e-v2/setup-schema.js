@@ -64,6 +64,7 @@ const req = (p) => require(path.join(BUILD, p));
     'supabase-migration-pedagogy-profiles.sql', // Motor pedagógico V1: course_profiles.kind admite 'pedagogy'
     'supabase-migration-practice-chapters.sql', // Motor de carga horaria: course_chapters.chapter_kind (capítulo de práctica)
     'supabase-migration-application-activities.sql', // Fase 2: course_chapters.application_minutes (Actividades de Aplicación)
+    'supabase-migration-guided-practice.sql', // Loop 9 B: course_chapters.guided_practice_minutes (Práctica guiada)
     'supabase-migration-academic-context.sql', // Fase 3: course_profiles.kind 'academic' + course_chapters.outcome_ids
     'supabase-migration-prebrief.sql', // Prebrief pedagógico: versiones, historial y PDF (inmutables)
   ]) {
