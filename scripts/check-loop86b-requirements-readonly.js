@@ -373,7 +373,7 @@ async function dbChecks() {
     await withClient(DB, async (c) => {
       for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql',
         'supabase-migration-v21-blueprint-profiles.sql', 'supabase-migration-pedagogy-profiles.sql', 'supabase-migration-practice-chapters.sql',
-        'supabase-migration-application-activities.sql', 'supabase-migration-academic-context.sql']) {
+        'supabase-migration-application-activities.sql', 'supabase-migration-guided-practice.sql', 'supabase-migration-academic-context.sql']) {
         await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
       }
     });

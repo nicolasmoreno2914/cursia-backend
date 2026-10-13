@@ -287,7 +287,7 @@ export class CourseDesignService {
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
     const providers = dist && dist.materialized ? dist.materialized.providers : null;
-    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && ((c.videoPinned && c.kind === 'content') || c.applicationPinned)).length, 0) : 0;
+    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && ((c.videoPinned && c.kind === 'content') || c.applicationPinned || c.guidedPracticePinned)).length, 0) : 0;
     // LOOP 8.6B/8.6C · requisitos del documento frente a ESTE diseño: cumplimiento, excepciones del docente y conflictos.
     let reqChecks: RequirementCheck[] = [];
     let requirementChecks: ReturnType<typeof requirementVerificationChecks> = [];
@@ -430,6 +430,7 @@ export class CourseDesignService {
           baseHours: dist.baseHours,
           counts: dist.counts,
           hoursByComponent: dist.hoursByComponent,
+          ...(dist.guidedPracticeFill ? { guidedPracticeFill: dist.guidedPracticeFill } : {}),
           recommendations: dist.recommendations,
           proposalSha256: dist.proposalSha256,
           manifestErrors: dist.materialized ? dist.materialized.manifestErrors : [],
@@ -440,6 +441,8 @@ export class CourseDesignService {
             chapters: m.chapters.map((c) => ({
               id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, role: c.role, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, applicationPinned: c.applicationPinned,
               activityEnabled: c.activityEnabled, review: c.review, applicationMinutes: c.applicationMinutes, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
+              // Loop 9 B: práctica guiada del capítulo de contenido (formativa, sin nota) y si la fijó el docente.
+              guidedPracticeMinutes: c.guidedPracticeMinutes ?? null, guidedPracticePinned: c.guidedPracticePinned,
               outcomeIds: chapterOutcomes.get(c.id) || [],
             })),
           })),
@@ -790,6 +793,7 @@ function designForRequirements(
       chapters: m.chapters.map((c) => ({
         kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, activityEnabled: c.activityEnabled, activityPinned: !!c.activityPinned,
         applicationMinutes: c.applicationMinutes ?? null, applicationPinned: c.applicationPinned, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
+        guidedPracticeMinutes: c.guidedPracticeMinutes ?? null,
       })),
     })),
     evaluations: dist.counts.evaluations,

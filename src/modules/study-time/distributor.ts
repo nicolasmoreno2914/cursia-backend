@@ -21,6 +21,11 @@
 // Fase 2: la Actividad de Aplicación SE GENERA (item `application_activity` del Manifest). El distribuidor fija
 // su nivel por capítulo y las horas generables son las del diseño completo (`generableHours` se conserva por
 // compatibilidad: es igual a `estimatedHours`).
+//
+// Loop 9 B: si con las Actividades de Aplicación en su máximo (o fijadas por el documento) el diseño sigue por debajo
+// del objetivo, la diferencia se completa con PRÁCTICA GUIADA en los capítulos de contenido (formativa, sin nota; niveles
+// 40/60/80/120), repartida lo más pareja posible y apuntando al objetivo (no al borde de la tolerancia). No agrega
+// capítulos ni Actividades de Aplicación; si ni con 120 min en todos los capítulos de contenido se llega, lo dice.
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { DesignRules } from '../pedagogy/design-rules';
 import { chapterRole } from '../pedagogy/pedagogical-blueprint';
@@ -28,6 +33,7 @@ import type { ChapterRole } from '../pedagogy/vocabulary';
 import { STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 import { isValidTargetHours } from './target-hours';
 import { STUDY_TIME_RULES, StudyTimeCourseInput, StudyTimeEstimate, estimateCourseStudyTime } from './time-model';
+import { GUIDED_PRACTICE_TIERS } from './guided-practice-tiers';
 import type { DistributorRequirementConstraints } from '../academic-context/requirements/requirement-authority';
 
 export const DISTRIBUTOR_VERSION = 2 as const;
@@ -81,6 +87,10 @@ export interface ProposedChapter {
   applicationPinned: boolean;
   /** LOOP 9.2: la actividad interactiva la fijó el docente. */
   activityPinned?: boolean;
+  /** Loop 9 B: minutos de la práctica guiada (solo capítulos de contenido; null = sin práctica guiada). */
+  guidedPracticeMinutes: number | null;
+  /** Loop 9 B: la práctica guiada la fijó el docente. */
+  guidedPracticePinned: boolean;
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
   generableMinutes: number;
@@ -96,7 +106,7 @@ export interface ProposedModule {
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'role_changed' | 'set_video' | 'set_activity';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'set_guided_practice' | 'remove_guided_practice' | 'role_changed' | 'set_video' | 'set_activity';
   /** LOOP 8.6C: el cambio lo pide un requisito del documento (id del requisito). */
   requirementId?: string;
   moduleId: string;
@@ -143,8 +153,13 @@ export interface DistributionResult {
     reviews: number;
     applicationActivities: number;
     applicationMinutes: number;
+    /** Loop 9 B: capítulos de contenido con práctica guiada y sus minutos (SOLO si hay alguna: sin ella, salida de siempre). */
+    guidedPractices?: number;
+    guidedPracticeMinutes?: number;
     evaluations: number;
   };
+  /** Loop 9 B: la práctica guiada completó la diferencia (o no alcanzó: shortfall en horas, > 0). */
+  guidedPracticeFill?: { used: boolean; shortfallHours: number };
   /** Horas por componente del diseño propuesto. */
   hoursByComponent: Record<string, number>;
   studyTime: StudyTimeEstimate;
@@ -170,7 +185,7 @@ export type AudiovisualPriority = 'less' | 'recommended' | 'more';
 export const AUDIOVISUAL_PRIORITIES: readonly AudiovisualPriority[] = ['less', 'recommended', 'more'];
 /** Valores que el docente fijó a mano en el editor (por id de capítulo). El distribuidor los respeta siempre. */
 /** LOOP 8.3: video fijado a mano · review L84-4: Actividad de Aplicación fijada a mano (minutos; 0 = sin actividad). */
-export type DesignPins = Readonly<Record<string, { video?: boolean; application?: number; activity?: boolean; noPractice?: boolean }>>;
+export type DesignPins = Readonly<Record<string, { video?: boolean; application?: number; guided?: number; activity?: boolean; noPractice?: boolean }>>;
 export type ApplicationActivitiesMode = 'auto' | 'practice_only' | 'none';
 export const DESIGN_EMPHASES: readonly DesignEmphasis[] = ['application', 'balanced', 'depth'];
 export const APPLICATION_ACTIVITIES_MODES: readonly ApplicationActivitiesMode[] = ['auto', 'practice_only', 'none'];
@@ -233,6 +248,8 @@ interface WorkChapter {
   videoEnabled: boolean;
   activityEnabled: boolean;
   applicationMinutes: number | null;
+  /** Loop 9 B: práctica guiada (solo contenido). Ausente en los capítulos que agrega el distribuidor = null. */
+  guidedPracticeMinutes?: number | null;
 }
 interface WorkModule {
   id: string;
@@ -323,6 +340,11 @@ function distributeCore(input: DistributorInput): DistributionResult {
     const a = pins[id] && pins[id].application;
     return typeof a === 'number' && Number.isFinite(a) ? (a > 0 ? a : null) : undefined;
   };
+  /** Loop 9 B: práctica guiada fijada por el docente (null = fijada SIN práctica guiada); undefined = la decide Cursia. */
+  const pinnedGuided = (id: string): number | null | undefined => {
+    const g = pins[id] && pins[id].guided;
+    return typeof g === 'number' && Number.isFinite(g) ? (g > 0 ? g : null) : undefined;
+  };
   const basePolicy = distributorPolicyFor(rules);
   const policy: DistributionResult['policy'] = prefs.emphasis === 'application'
     ? { ...basePolicy, kind: 'application_first', ...DISTRIBUTOR_RULES.applicationFirst }
@@ -350,12 +372,15 @@ function distributeCore(input: DistributorInput): DistributionResult {
         activityEnabled: c.activityEnabled === true,
         // Fase 2: se arranca con las Actividades de Aplicación que la estructura YA tiene (ver «ya cumple», abajo).
         applicationMinutes: typeof (c as { applicationMinutes?: unknown }).applicationMinutes === 'number' ? ((c as { applicationMinutes?: number }).applicationMinutes as number) : null,
+        guidedPracticeMinutes: typeof (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes === 'number' ? ((c as { guidedPracticeMinutes?: number }).guidedPracticeMinutes as number) : null,
       })),
     }));
   if (design.some((m) => m.chapters.length === 0)) throw new DistributorError('cada módulo necesita al menos un capítulo');
   // Review L84-4: una Actividad de Aplicación fijada a mano por el docente se respeta siempre (como el video fijado).
   for (const m of design) for (const c of m.chapters) { const p = pinnedApp(c.id); if (p !== undefined) c.applicationMinutes = p; }
   for (const m of design) for (const c of m.chapters) { const a = pinnedActivity(c.id); if (a !== undefined) c.activityEnabled = a; }
+  // Loop 9 B: la práctica guiada fijada por el docente se respeta siempre (solo en capítulos de contenido).
+  for (const m of design) for (const c of m.chapters) { const g = pinnedGuided(c.id); if (g !== undefined && c.kind === 'content') c.guidedPracticeMinutes = g; }
 
   // LOOP 8.3 · prioridad audiovisual sobre los capítulos de contenido existentes (antes de crecer: el video cambia las
   // horas y el resto del diseño compensa). Lo fijado por el docente manda; la práctica nunca lleva video.
@@ -448,6 +473,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         activity: c.activityEnabled,
         review,
         ...(withApplication && c.applicationMinutes ? { applicationMinutes: c.applicationMinutes } : {}),
+        ...(withApplication && c.kind === 'content' && c.guidedPracticeMinutes ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
       })),
     })),
   });
@@ -462,6 +488,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // Fase 2 (review I2): minutos de Actividad de Aplicación con los que llegó cada capítulo existente; quitar o cambiar
   // una actividad ES un cambio (si no, «Ninguna» dejaría las actividades en la base y se generarían igual).
   const initialMinutes = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.applicationMinutes] as const)));
+  const initialGuided = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.guidedPracticeMinutes ?? null] as const)));
+  let guidedFill: DistributionResult['guidedPracticeFill'];
   const pushRemovals = () => {
     for (const m of design) for (const c of m.chapters) {
       if (c.proposed || initialMinutes.get(c.id) == null || c.applicationMinutes !== null) continue;
@@ -498,6 +526,15 @@ function distributeCore(input: DistributorInput): DistributionResult {
     }
     pushRemovals();
     pushVideoChanges();
+    // Loop 9 B: cambios de la práctica guiada en los capítulos existentes (los propuestos la llevan en su detalle).
+    for (const m of design) for (const c of m.chapters) {
+      const had = initialGuided.get(c.id) ?? null;
+      const now = c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null;
+      if (c.proposed || had === now || changes.some((x) => (x.type === 'set_guided_practice' || x.type === 'remove_guided_practice') && x.chapterId === c.id)) continue;
+      changes.push(now
+        ? { type: 'set_guided_practice', moduleId: m.id, chapterId: c.id, detail: had ? `Práctica guiada de «${c.title}»: de ${had} a ${now} min.` : `Práctica guiada de ${now} min en el capítulo «${c.title}».` }
+        : { type: 'remove_guided_practice', moduleId: m.id, chapterId: c.id, detail: `Se quita la práctica guiada de ${had} min de «${c.title}».` });
+    }
     for (const m of design) for (const c of m.chapters) {
       if (c.proposed || initialActivity.get(c.id) === c.activityEnabled) continue;
       changes.push({ type: 'set_activity', moduleId: m.id, chapterId: c.id, detail: c.activityEnabled ? `«${c.title}» lleva actividad interactiva.` : `«${c.title}» queda sin actividad interactiva (el documento pide un total exacto de actividades interactivas).` });
@@ -530,12 +567,15 @@ function distributeCore(input: DistributorInput): DistributionResult {
         activityEnabled: c.activityEnabled,
         review,
         applicationMinutes: c.applicationMinutes,
+        guidedPracticeMinutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null,
+        guidedPracticePinned: pinnedGuided(c.id) !== undefined,
         targetMinutes: estChapter.get(c.id) as number,
         generableMinutes: genChapter.get(c.id) as number,
       })),
     }));
     const all = modules.flatMap((m) => m.chapters);
     const appMinutes = all.reduce((n, c) => n + (c.applicationMinutes ?? 0), 0);
+    const gpMinutes = all.reduce((n, c) => n + (c.guidedPracticeMinutes ?? 0), 0);
     return {
       distributorVersion: DISTRIBUTOR_VERSION,
       dryRun: true,
@@ -564,10 +604,12 @@ function distributeCore(input: DistributorInput): DistributionResult {
         reviews: all.filter((c) => c.review).length,
         applicationActivities: all.filter((c) => c.applicationMinutes).length,
         applicationMinutes: appMinutes,
+        ...(gpMinutes > 0 ? { guidedPractices: all.filter((c) => c.guidedPracticeMinutes).length, guidedPracticeMinutes: gpMinutes } : {}),
         evaluations: modules.filter((m) => m.examEnabled).length + (snapshot.course.finalExam ? 1 : 0),
       },
       hoursByComponent: Object.fromEntries(Object.entries(est.byComponent).map(([k, v]) => [k, r1(v / 60)])),
       studyTime: est,
+      ...(guidedFill ? { guidedPracticeFill: guidedFill } : {}),
     };
   };
 
@@ -577,7 +619,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // Fase 2 — «ya cumple»: si la estructura ACTUAL, con sus Actividades de Aplicación (p. ej. un diseño ya aplicado o
   // fijado a mano), queda dentro de la tolerancia y respeta las preferencias, no se propone nada (el distribuidor es
   // estable sobre su propio resultado). Si no, se rediseña desde cero (las actividades existentes no condicionan).
-  const hasExisting = design.some((m) => m.chapters.some((c) => c.applicationMinutes !== null));
+  const hasExisting = design.some((m) => m.chapters.some((c) => c.applicationMinutes !== null || (c.guidedPracticeMinutes ?? null) !== null));
   const respectsMode = design.every((m) => m.chapters.every((c) => c.applicationMinutes === null || (appMode !== 'none' && (appMode !== 'practice_only' || c.kind === 'practice'))));
   // LOOP 8.6C: «ya cumple» también exige cumplir los requisitos del documento que el distribuidor maneja.
   const meetsRequirements = () => design.every((m) => m.chapters.length >= minCh && m.chapters.length <= maxCh && appCount(m.chapters) >= appModuleMin && appCount(m.chapters) <= appModuleMax
@@ -594,6 +636,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
   }
   if (hasExisting) {
     for (const m of design) for (const c of m.chapters) if (pinnedApp(c.id) === undefined) c.applicationMinutes = null;
+    // Loop 9 B: la práctica guiada no fijada también se rediseña (se vuelve a calcular al final, si hace falta).
+    for (const m of design) for (const c of m.chapters) if (pinnedGuided(c.id) === undefined) c.guidedPracticeMinutes = null;
     reEval();
   }
 
@@ -935,6 +979,42 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // Review QA I1: los mínimos del documento pueden haber agregado Actividades en prácticas: se vuelven a emparejar.
   balancePractice();
 
+  // Loop 9 B · práctica guiada: con las Actividades de Aplicación ya en su máximo (o fijadas por el documento) y el
+  // diseño todavía por debajo del objetivo, la diferencia se completa con práctica guiada en los capítulos de CONTENIDO.
+  // Reparto parejo: todos los capítulos libres en un nivel o en el siguiente (0 → 40 → 60 → 80 → 120), el que deja el
+  // total más cerca del objetivo (no del borde de la tolerancia), sin pasar de 4 h por capítulo. Lo fijado por el
+  // docente no se toca. Los minutos de la práctica guiada suman exactos (el modelo de tiempo los toma tal cual).
+  if (!reached()) {
+    const free = design.flatMap((m) => m.chapters.filter((c) => c.kind === 'content' && pinnedGuided(c.id) === undefined).map((c) => ({ m, c })));
+    // Orden de los capítulos que suben primero al nivel siguiente: cierres, núcleo, aperturas (igual que la aplicación).
+    const ordered = free.map((x, i) => ({ ...x, i })).sort((a, b) => rank(roleOf(a.m, a.c)) - rank(roleOf(b.m, b.c)) || a.i - b.i);
+    const base = minutes() - ordered.reduce((n, { c }) => n + (c.guidedPracticeMinutes ?? 0), 0);
+    const capOfGuided = ordered.map(({ c }) => DISTRIBUTOR_RULES.maxChapterMinutes - (chapterMinutes(c.id) - (c.guidedPracticeMinutes ?? 0)));
+    const levels = [0, ...(GUIDED_PRACTICE_TIERS as readonly number[])];
+    const fit = (want: number, k: number) => [...levels].reverse().find((l) => l <= want && l <= capOfGuided[k]) ?? 0;
+    let best: { assign: number[]; total: number; dist: number; sum: number } | null = null;
+    for (let li = 0; li < levels.length; li++) {
+      const lo = levels[li];
+      const hi = levels[Math.min(li + 1, levels.length - 1)];
+      for (let j = 0; j <= ordered.length; j++) {
+        const assign = ordered.map((_, k) => fit(k < j ? hi : lo, k));
+        const sum = assign.reduce((a, b) => a + b, 0);
+        const total = base + sum;
+        const dist = Math.abs(total - target);
+        if (!best || dist < best.dist - 1e-9 || (Math.abs(dist - best.dist) <= 1e-9 && sum < best.sum)) best = { assign, total, dist, sum };
+        if (hi === lo) break;
+      }
+    }
+    if (best && best.sum > 0) {
+      ordered.forEach(({ c }, k) => { c.guidedPracticeMinutes = best!.assign[k] || null; });
+      reEval();
+      const n = best.assign.filter((x) => x > 0).length;
+      priorityTrace.push(`Con las Actividades de Aplicación en su máximo, la diferencia con el objetivo se completa con práctica guiada (formativa, sin nota) en ${n} capítulo(s) de contenido: no se agregan capítulos ni Actividades de Aplicación.`);
+    }
+    const short = Math.max(0, target - tol - minutes());
+    guidedFill = { used: !!(best && best.sum > 0), shortfallHours: r1(short / 60) };
+  }
+
   for (const m of design) for (const c of m.chapters) {
     const had = initialMinutes.get(c.id) ?? null;
     if (c.applicationMinutes && !c.proposed && c.applicationMinutes !== had) {
@@ -983,8 +1063,12 @@ function distributeCore(input: DistributorInput): DistributionResult {
           ? `Recomendación: agregar hasta ${Math.min(room, Math.ceil(gap / chapterAvg))} capítulo(s) en los módulos actuales (el documento fija ${rq!.modulesFixed} módulos). Los temas los decide el docente.`
           : noRoom
         : `Recomendación: agregar ${modulesNeeded} módulo(s) nuevo(s) (≈ ${fmtH(perModule / 60)} h cada uno con la misma estructura) o unos ${Math.ceil(gap / chapterAvg)} capítulos más en módulos nuevos. Los temas los decide el docente.`;
+  const guidedNote = guidedFill && guidedFill.used
+    ? [`Ni con práctica guiada en los capítulos de contenido (hasta ${GUIDED_PRACTICE_TIERS[GUIDED_PRACTICE_TIERS.length - 1]} min por capítulo) se llega: faltan ${fmtH(gap / 60)} h.`]
+    : [];
   return result('cannot_reach_target', [
     `No alcanza ${fmtH(input.targetHours)} h sin rellenar: el diseño llega a ${fmtH(minutes() / 60)} h y faltan ${fmtH(gap / 60)} h.`,
     advice,
+    ...guidedNote,
   ]);
 }

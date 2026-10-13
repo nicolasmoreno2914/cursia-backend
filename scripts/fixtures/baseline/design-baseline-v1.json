@@ -330,10 +330,10 @@
       }
     },
     "competencias:64h": {
-      "status": "cannot_reach_target",
-      "estimatedHours": 52.3,
+      "status": "within_tolerance",
+      "estimatedHours": 64,
       "baseHours": 13.6,
-      "applicationShare": 0.54,
+      "applicationShare": 0.45,
       "counts": {
         "modules": 3,
         "chapters": 21,
@@ -344,12 +344,71 @@
         "reviews": 21,
         "applicationActivities": 21,
         "applicationMinutes": 1710,
+        "guidedPractices": 15,
+        "guidedPracticeMinutes": 700,
         "evaluations": 4
       },
-      "proposalSha256": "fb8dd28380465c150d75e6f95d886d779cf09de2a7c93ef039d4e32baabb3a56",
+      "proposalSha256": "c3d5ff4a2fddde8c43e2500fa792d6f9ee400991e017a72bf4d28284a9fbf5c2",
       "materialized": {
-        "blueprint": "553c6532811b732200ac4e22f34d72e26dbf04775fabe25bbe88485fb801380e",
-        "manifest": "dbb5788f7dd581320374a4093c70b54a5cfcdd16f480973b5bb218017aa05b64",
+        "blueprint": "91d46a85d3485313164cf91ec786bc86cc583afbc6181ab21b1cabdab748cb09",
+        "manifest": "ab3ad2e693b2490b6a762c2542c24b8c4f52d16757c3ac8386a1448934f71f4e",
+        "manifestErrors": 0,
+        "totals": {
+          "moduleCount": 3,
+          "chapterCount": 21,
+          "contentCount": 15,
+          "videoCount": 15,
+          "examCount": 3,
+          "coursePlanCount": 1,
+          "courseIntroCount": 1,
+          "moduleIntroCount": 3,
+          "experienceCount": 21,
+          "presentationCount": 15,
+          "videoInteractionsCount": 15,
+          "activityCount": 21,
+          "audiobookChapterCount": 15,
+          "audioWelcomeCount": 1,
+          "finalExamCount": 1,
+          "totalJobs": 163,
+          "applicationActivityCount": 21,
+          "guidedPracticeCount": 15
+        },
+        "generableHours": 64,
+        "usd": {
+          "expected": "68.79",
+          "byProvider": {
+            "anthropic": "37.83",
+            "gamma": "10.35",
+            "openai": "4.40",
+            "videogen": "16.21",
+            "youtube": "0.00"
+          }
+        }
+      }
+    },
+    "competencias:64h:practice_only": {
+      "status": "within_tolerance",
+      "estimatedHours": 63.8,
+      "baseHours": 13.6,
+      "applicationShare": 0.19,
+      "counts": {
+        "modules": 3,
+        "chapters": 21,
+        "contentChapters": 15,
+        "practiceChapters": 6,
+        "videoChapters": 15,
+        "activities": 21,
+        "reviews": 21,
+        "applicationActivities": 6,
+        "applicationMinutes": 720,
+        "guidedPractices": 15,
+        "guidedPracticeMinutes": 1680,
+        "evaluations": 4
+      },
+      "proposalSha256": "1c11e5cfbbb60dbddace7059713df61f733559e421be7879d2938fafa5fcecc1",
+      "materialized": {
+        "blueprint": "c43850e54b0f3afd977e64a97781f795080da2654e23a5473d34627ec5eeda9f",
+        "manifest": "72f648da82764890c247dc9aa45bd62f765837d1c00947db70a38ff0d538cb7b",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,
@@ -368,67 +427,14 @@
           "audioWelcomeCount": 1,
           "finalExamCount": 1,
           "totalJobs": 148,
-          "applicationActivityCount": 21
+          "applicationActivityCount": 6,
+          "guidedPracticeCount": 15
         },
-        "generableHours": 52.3,
+        "generableHours": 63.8,
         "usd": {
-          "expected": "67.50",
+          "expected": "61.78",
           "byProvider": {
-            "anthropic": "36.53",
-            "gamma": "10.35",
-            "openai": "4.40",
-            "videogen": "16.21",
-            "youtube": "0.00"
-          }
-        }
-      }
-    },
-    "competencias:64h:practice_only": {
-      "status": "cannot_reach_target",
-      "estimatedHours": 35.8,
-      "baseHours": 13.6,
-      "applicationShare": 0.34,
-      "counts": {
-        "modules": 3,
-        "chapters": 21,
-        "contentChapters": 15,
-        "practiceChapters": 6,
-        "videoChapters": 15,
-        "activities": 21,
-        "reviews": 21,
-        "applicationActivities": 6,
-        "applicationMinutes": 720,
-        "evaluations": 4
-      },
-      "proposalSha256": "bad906f9349f00dafb61f951778db96d7973723e6265f9f8bfd4de79d4d45a30",
-      "materialized": {
-        "blueprint": "eb26e6f9f31c40ca0ab401f0aa7d4b86f6528a6e174b3506475e5f88f02b49ee",
-        "manifest": "e1fcd5fa338a6117d61b99b6d639b1ac0ac429ae40563e11c9e8f59a65175107",
-        "manifestErrors": 0,
-        "totals": {
-          "moduleCount": 3,
-          "chapterCount": 21,
-          "contentCount": 15,
-          "videoCount": 15,
-          "examCount": 3,
-          "coursePlanCount": 1,
-          "courseIntroCount": 1,
-          "moduleIntroCount": 3,
-          "experienceCount": 21,
-          "presentationCount": 15,
-          "videoInteractionsCount": 15,
-          "activityCount": 21,
-          "audiobookChapterCount": 15,
-          "audioWelcomeCount": 1,
-          "finalExamCount": 1,
-          "totalJobs": 133,
-          "applicationActivityCount": 6
-        },
-        "generableHours": 35.8,
-        "usd": {
-          "expected": "60.15",
-          "byProvider": {
-            "anthropic": "29.19",
+            "anthropic": "30.81",
             "gamma": "10.35",
             "openai": "4.40",
             "videogen": "16.21",
@@ -439,7 +445,7 @@
     },
     "competencias:64h:none": {
       "status": "cannot_reach_target",
-      "estimatedHours": 23.8,
+      "estimatedHours": 53.8,
       "baseHours": 13.6,
       "applicationShare": 0,
       "counts": {
@@ -452,12 +458,14 @@
         "reviews": 21,
         "applicationActivities": 0,
         "applicationMinutes": 0,
+        "guidedPractices": 15,
+        "guidedPracticeMinutes": 1800,
         "evaluations": 4
       },
-      "proposalSha256": "b5f54b707fd7b952c796d2122a02a7a2928df5ee1d83fe2de13507bf2bdbec95",
+      "proposalSha256": "cc94cea59a70d5036d934dd1ca3003a5869796fdf25723444a5b6d6916adeea5",
       "materialized": {
-        "blueprint": "73bc22a9e7777850cdf2309b6c37b2307caae093212447a52861069f2345c506",
-        "manifest": "d05845da8c73d5522ca815ce467eb7f2ff400c01d4c0ed041726f25ac1461c75",
+        "blueprint": "11766970cc940ea2f8cb431c040a316925feb8bc2ac933f8e6976f10a0eca805",
+        "manifest": "9b5849ae105570feb1514f6b01ff45271d7ff4ebb8833cb0e47559c731e7453c",
         "manifestErrors": 0,
         "totals": {
           "moduleCount": 3,
@@ -475,13 +483,14 @@
           "audiobookChapterCount": 15,
           "audioWelcomeCount": 1,
           "finalExamCount": 1,
-          "totalJobs": 127
+          "totalJobs": 142,
+          "guidedPracticeCount": 15
         },
-        "generableHours": 23.8,
+        "generableHours": 53.8,
         "usd": {
-          "expected": "56.56",
+          "expected": "58.27",
           "byProvider": {
-            "anthropic": "25.59",
+            "anthropic": "27.30",
             "gamma": "10.35",
             "openai": "4.40",
             "videogen": "16.21",

@@ -221,7 +221,7 @@ export interface DesignForRequirements {
     examEnabled: boolean;
     /** LOOP 9.2: el docente quitó la práctica de este módulo (su decisión: las diferencias que causa son SU excepción). */
     practiceRemovedByTeacher?: boolean;
-    chapters: { kind: string; proposed?: boolean; videoEnabled: boolean; videoPinned?: boolean; activityEnabled: boolean; activityPinned?: boolean; applicationMinutes: number | null; applicationPinned?: boolean; hours: number }[];
+    chapters: { kind: string; proposed?: boolean; videoEnabled: boolean; videoPinned?: boolean; activityEnabled: boolean; activityPinned?: boolean; applicationMinutes: number | null; applicationPinned?: boolean; hours: number; /** Loop 9 B: práctica guiada (no es una Actividad de Aplicación: no cuenta en sus requisitos). */ guidedPracticeMinutes?: number | null }[];
   }[];
   /** counts.evaluations del distribuidor: evaluaciones de módulo + final. */
   evaluations: number;
