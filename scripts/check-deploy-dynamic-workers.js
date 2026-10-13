@@ -630,6 +630,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       eq((fs.readFileSync(path.join(dir, '.env'), 'utf8').match(/^DYNAMIC_PROVIDER_WORKER_ENABLED=/gm) || []).length, 1, 'una sola línea del flag');
       const kv2 = Object.fromEntries(fs.readFileSync(path.join(dir, '.env'), 'utf8').split('\n').filter((l) => /^[A-Z0-9_]+=/.test(l)).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
       eq([kv2.DB_POOL_MAX, kv2.DB_POOL_MAX_WORKER, kv2.DB_POOL_IDLE_MS_WORKER], ['2', '1', '1000'], 'pool de staging (EMAXCONNSESSION)');
+      // Loop 9: el worker de IA hospedado corre 4 partes en paralelo (sin proceso ni conexión extra: mismo pool).
+      eq(kv2.DYNAMIC_LLM_WORKER_CONCURRENCY, '4', 'concurrencia del worker de IA (Loop 9)');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

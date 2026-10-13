@@ -47,8 +47,26 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     let threw = false;
     try { R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: 'content,video' }); } catch { threw = true; }
     assert(threw, 'tipo desconocido lanza');
-    assert(R.llmWorkerTypes({}).join() === 'course_plan,content,application_activity,experience,final_exam', 'default (Loop 6: + course_plan)');
+    assert(R.llmWorkerTypes({}).join() === 'course_plan,course_intro,module_intro,content,experience,video_interactions,activity,application_activity,exam,final_exam', 'default (Loop 9: todas las partes de IA v3)');
     assert(R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: 'content, content ,experience' }).join() === 'content,experience', 'dedupe');
+  });
+  await check('Loop 9: el worker cubre TODAS las partes de IA v3 (también las cortas); el env solo puede ACOTAR; nunca scorm ni proveedores', async () => {
+    const all = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'exam', 'final_exam'];
+    eqSet(R.DEFAULT_LLM_WORKER_TYPES, all, 'default = todas');
+    eqSet(R.ALL_LLM_WORKER_TYPES, all, 'permitidos = todas');
+    // Acotar sigue funcionando (p. ej. volver al set de partes largas de Loop 6).
+    assert(R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: R.LONG_LLM_WORKER_TYPES.join(',') }).join() === 'course_plan,content,application_activity,experience,final_exam', 'acotar a las largas');
+    assert(R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: 'exam,course_intro' }).join() === 'exam,course_intro', 'acotar a cortas');
+    for (const bad of ['scorm', 'video', 'presentation', 'audio_welcome', 'audiobook_chapter', 'content,scorm', ',', ' ']) {
+      let threw = false;
+      try { R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: bad }); } catch { threw = bad.trim() !== ''; }
+      if (bad.trim() === '') assert(R.llmWorkerTypes({ DYNAMIC_LLM_WORKER_TYPES: bad }).length === all.length, 'vacío = default');
+      else assert(threw, `«${bad}» lanza`);
+    }
+    // Con un worker vivo que cubre todo, el navegador no reclama ninguna parte de IA; con el worker caído, todas.
+    const browserV3 = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'final_exam', 'exam'];
+    assert(R.browserEffectiveTypes(browserV3, new Set(all), ON).length === 0, 'worker vivo ⇒ 0 tipos para el navegador');
+    assert(R.browserEffectiveTypes(browserV3, new Set(), ON).join() === browserV3.join(), 'worker caído ⇒ el navegador reclama todo (respaldo)');
   });
   await check('Loop 6: instante de activación — ruteo solo con flag + DYNAMIC_LLM_WORKER_SINCE válido; solo runs creados desde entonces', async () => {
     const since = '2026-10-12T00:00:00Z';
@@ -74,6 +92,18 @@ const ON = { DYNAMIC_LLM_WORKER_ENABLED: 'true' };
     eqSet(R.routedTypesForRun(cov, null), [], 'sin fecha');
     R.resetLlmWorkerPresenceCacheForTests();
     assert((await R.liveLlmWorkerCoverage({ query: async () => { throw new Error('column since does not exist'); } })).length === 0, 'error de DB (o tabla vieja) ⇒ sin cobertura');
+  });
+  await check('Loop 9: concurrencia del worker de IA — default 2, el env la fija (staging 4), tope duro 6, inválidos → default', async () => {
+    assert(R.llmWorkerConcurrency({}) === 2, 'default');
+    assert(R.llmWorkerConcurrency({ DYNAMIC_LLM_WORKER_CONCURRENCY: '4' }) === 4, 'staging');
+    assert(R.llmWorkerConcurrency({ DYNAMIC_LLM_WORKER_CONCURRENCY: '6' }) === 6, 'tope exacto');
+    assert(R.llmWorkerConcurrency({ DYNAMIC_LLM_WORKER_CONCURRENCY: '50' }) === 6, 'recortado al tope');
+    for (const bad of ['0', '-3', 'x', '']) assert(R.llmWorkerConcurrency({ DYNAMIC_LLM_WORKER_CONCURRENCY: bad }) === 2, `«${bad}» → default`);
+    const fs = require('fs');
+    const yml = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/deploy-staging.yml'), 'utf8');
+    assert(/^\s*ensure_env_exact DYNAMIC_LLM_WORKER_CONCURRENCY 4\s*$/m.test(yml), 'deploy-staging fija DYNAMIC_LLM_WORKER_CONCURRENCY=4 (exacto)');
+    const w = fs.readFileSync(path.join(__dirname, '..', 'src/workers/dynamic-llm-worker.ts'), 'utf8');
+    assert(/concurrency: llmWorkerConcurrency\(\)/.test(w) && !/readPositiveInt\('DYNAMIC_LLM_WORKER_CONCURRENCY'/.test(w), 'el worker usa el valor con tope');
   });
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures ? 1 : 0);
