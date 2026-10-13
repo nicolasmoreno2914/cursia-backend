@@ -133,6 +133,9 @@ export function createExecutorRuntime(deps: ExecutorRuntimeDeps): ExecutorRuntim
   }
   Object.assign(ctx, serverGlobals);
   ctx.DYN_LLM_BACKOFF_BASE_MS = Number(process.env.DYNAMIC_LLM_WORKER_BACKOFF_MS || 2000);
+  // Loop 9 (fix M4): el MISMO interruptor del modo banco que tiene el navegador (DYN_EXAM_BANK_MODE_ENABLED). Encendido
+  // por defecto; DYNAMIC_LLM_WORKER_EXAM_BANK=off vuelve al GIFT de siempre (apagado de emergencia; lo usa la E2E).
+  if (String(process.env.DYNAMIC_LLM_WORKER_EXAM_BANK || '').trim().toLowerCase() === 'off') ctx.DYN_EXAM_BANK_MODE_ENABLED = false;
   const runner = vm.runInContext('(function (j) { return _dynRunItem(JSON.parse(j)); })', ctx) as (j: string) => Promise<ExecutorRunResult>;
   return {
     run: (item) => runner(JSON.stringify(item)),
