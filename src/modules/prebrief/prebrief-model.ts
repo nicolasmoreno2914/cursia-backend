@@ -1,3 +1,4 @@
+import { guidedPracticeExercisePlan, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 import { createHash } from 'crypto';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import type { CourseFacts, FactSource } from '../course-facts/course-facts';
@@ -38,6 +39,8 @@ export interface PrebriefChapter {
   video: boolean;
   activity: boolean;
   applicationMinutes: number | null;
+  /** Loop 9 B: minutos de la práctica guiada (solo capítulos de contenido que la tienen; sin la clave = sin práctica guiada). */
+  guidedPracticeMinutes?: number;
   outcomeIds: string[];
   /** Capítulo que todavía propone Cursia (solo en borrador: con cambios pendientes no se puede preparar). */
   proposed: boolean;
@@ -149,6 +152,11 @@ export interface PrebriefModel {
     presentations: number;
     interactiveActivities: number;
     applicationActivities: number;
+    /**
+     * Loop 9 B: práctica guiada (formativa, no calificada) — capítulos de contenido con ella, si todos la tienen, y el
+     * rango de ejercicios por capítulo y de minutos por ejercicio. Solo si el diseño tiene alguna.
+     */
+    guidedPractice?: { chapters: number; everyContentChapter: boolean; exercises: { min: number; max: number }; exerciseMinutes: { min: number; max: number } };
     audiobookChapters: number;
     welcomeAudio: boolean;
     guideBook: boolean;
@@ -370,6 +378,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       video: !!c.videoEnabled,
       activity: !!c.activityEnabled,
       applicationMinutes: c.applicationMinutes ? Number(c.applicationMinutes) : null,
+      ...(c.kind !== 'practice' && isGuidedPracticeMinutes(Number(c.guidedPracticeMinutes)) ? { guidedPracticeMinutes: Number(c.guidedPracticeMinutes) } : {}),
       outcomeIds: Array.isArray(c.outcomeIds) ? [...c.outcomeIds].map(String).sort() : [],
       proposed: !!c.proposed,
     }));
@@ -514,6 +523,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
     presentations: Number(t.presentationCount || 0),
     interactiveActivities: Number(t.activityCount || 0),
     applicationActivities: Number(t.applicationActivityCount || 0),
+    ...guidedPracticeResource(allCh),
     audiobookChapters: Number(t.audiobookChapterCount || 0),
     welcomeAudio: Number(t.audioWelcomeCount || 0) > 0,
     guideBook: allCh.length > 0,
@@ -656,4 +666,21 @@ export function diffModels(prev: PrebriefModel, next: PrebriefModel): string[] {
   if (prev.blueprintSha256 !== next.blueprintSha256 && !out.length) out.push('Configuración del diseño (perfil o contexto académico)');
   if (!out.length && !eq(prev, next)) out.push('Otros datos de la propuesta');
   return out;
+}
+
+/** Loop 9 B: resumen de la práctica guiada del diseño para «Recursos previstos» y la metodología (sin ella: nada). */
+function guidedPracticeResource(chs: PrebriefChapter[]): { guidedPractice?: PrebriefModel['resources']['guidedPractice'] } {
+  const withGp = chs.filter((c) => c.kind !== 'practice' && typeof c.guidedPracticeMinutes === 'number');
+  if (!withGp.length) return {};
+  const plans = withGp.map((c) => guidedPracticeExercisePlan(c.guidedPracticeMinutes as number));
+  const counts = plans.map((p) => p.length);
+  const mins = plans.flatMap((p) => p.map((e) => e.minutes));
+  return {
+    guidedPractice: {
+      chapters: withGp.length,
+      everyContentChapter: withGp.length === chs.filter((c) => c.kind !== 'practice').length,
+      exercises: { min: Math.min(...counts), max: Math.max(...counts) },
+      exerciseMinutes: { min: Math.min(...mins), max: Math.max(...mins) },
+    },
+  };
 }
