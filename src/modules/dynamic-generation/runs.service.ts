@@ -3195,7 +3195,10 @@ export class RunsService {
       if (costKind !== 'llm') throw notEligible(`tipo ${mItem.type}`);
       const cascade = regenerationCascade(manifest.rulesVersion, manifest.manifest.items,
         { key: itemKey, type: mItem.type, moduleId: mItem.moduleId ?? null, chapterId: mItem.chapterId ?? null });
-      if (cascade.regenerate.length > 0 || cascade.stale.length > 0) throw notEligible('regenerarlo arrastra otros componentes');
+      // Loop 9 (fix I3): la arista exam → final_exam no quita la reparación automática de un examen de módulo (antes no
+      // existía): la reparación toca SOLO ese examen; el final conserva lo ya generado (a lo sumo una pregunta parecida).
+      const cascadeRegen = mItem.type === 'exam' ? cascade.regenerate.filter((k) => !k.startsWith('final_exam:')) : cascade.regenerate;
+      if (cascadeRegen.length > 0 || cascade.stale.length > 0) throw notEligible('regenerarlo arrastra otros componentes');
       const [latest] = await this.dataSource.query(
         `select output_summary from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [job.id, itemKey]);
       if (latest?.output_summary?.regeneration?.reason === PACKAGE_REPAIR_REASON) throw notEligible('ya se reparó una vez');

@@ -37,7 +37,7 @@ export const DEPENDENCY_DOC: Readonly<Record<string, { dependsOn: string; inputs
   guided_practice: { dependsOn: 'content', inputs: 'content, minutos (nivel), diseño del capítulo y resultados vinculados', paid: false },
   audiobook_chapter: { dependsOn: 'content', inputs: 'content (guion + TTS)', paid: true },
   exam: { dependsOn: 'contents del módulo', inputs: 'contents del módulo, diseño de evaluación, resultados del módulo', paid: false },
-  final_exam: { dependsOn: 'todos los contents', inputs: 'contents del curso, diseño de evaluación, todos los resultados', paid: false },
+  final_exam: { dependsOn: 'todos los contents + los exámenes de módulo', inputs: 'contents del curso, preguntas de los exámenes de módulo (no las repite), diseño de evaluación, todos los resultados', paid: false },
 });
 
 export interface ChangeImpactChapter {

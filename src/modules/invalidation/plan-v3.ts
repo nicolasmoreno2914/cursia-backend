@@ -535,6 +535,9 @@ export function computeInvalidationPlanV3(input: InvalidationPlanInput): Invalid
         if (finalIsBank && moduleSet(fromFp) !== moduleSet(toFp)) reasons.push('course_modules_changed');
         const existingContentNew = toFp.outline.chapters.some((c) => contentProducesNew.has(c.id) && fromFp.outline.chapterById.has(c.id));
         if (existingContentNew || (reasons.length === 0 && fromFp.finalExam !== toFp.finalExam)) reasons.push('member_content_changed');
+        // Loop 9 (fix I3): el final depende de los exam:<m> (evita repetir sus preguntas): si alguno se genera de nuevo, el
+        // final también (solo IA, sin costo de proveedor). Los exámenes se deciden antes (orden canónico).
+        if ([...decided.values()].some((x) => x.type === 'exam' && PRODUCES_NEW.has(x.action))) reasons.push('module_exam_regenerated');
         if (reasons.length) regenerate(a, ...reasons);
         else {
           a.reasons.push('unchanged');
