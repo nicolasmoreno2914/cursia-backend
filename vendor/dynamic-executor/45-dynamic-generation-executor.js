@@ -4005,7 +4005,7 @@ function dynApplicationDraftSupported(item) {
   return _dynIsPlainObject(a) && a.draftArtifactType === DYN_APPLICATION_DRAFT_ARTIFACT_TYPE;
 }
 // Campo del fail que lleva el borrador de ESTE item (o null si el claim no anuncia soporte).
-function dynDraftFailField(item) {
+function dynDraftFieldFor(item) {
   if (dynExamBankDraftSupported(item)) return 'examBankDraftArtifactId';
   if (dynApplicationDraftSupported(item)) return 'applicationDraftArtifactId';
   return null;
@@ -4069,7 +4069,7 @@ async function _dynRunApplicationActivity(item) {
   var resumed = !!draft.activity;
   // Falla validada: pide borrar el borrador anterior (null explícito; solo se manda si el claim lo anuncia).
   // Fix round 1 (2): si el borrador se ignoró por una descarga fallida (transitoria) puede ser bueno: no se borra.
-  function failClear(res) { if (draft.reason !== 'download') res.draftClear = true; return res; }
+  function withDraftClear(res) { if (draft.reason !== 'download') res.draftClear = true; return res; }
   function draftArtifact() {
     var draftDoc = {
       draftVersion: 1, itemKey: item.itemKey, generation: item.generation == null ? null : item.generation, chapterId: item.chapterId,
@@ -4091,7 +4091,7 @@ async function _dynRunApplicationActivity(item) {
       if (v.errors.length) return { ok: false, errors: _dynFormatErrors(v.errors) };
       return { ok: true, value: obj };
     }, { normalizeMoney: dynCourseIsColombia(courseContext) });
-    if (!r1.ok) return failClear(_dynV3Invalid(item, r1.errors, r1.truncated));
+    if (!r1.ok) return withDraftClear(_dynV3Invalid(item, r1.errors, r1.truncated));
     activity = r1.value;
     v1 = dynValidateApplicationStudentPart(activity, app.minutes);
   }
@@ -4113,14 +4113,14 @@ async function _dynRunApplicationActivity(item) {
   if (!r2.ok) {
     var f2 = _dynV3Invalid(item, r2.errors, r2.truncated);
     // Reanudado y vuelve a fallar, o falla no reintentable → el próximo intento regenera las dos pasadas.
-    if (resumed || f2.retryable === false) return failClear(f2);
+    if (resumed || f2.retryable === false) return withDraftClear(f2);
     f2.draft = draftArtifact();
     return f2;
   }
   // chapterId, minutos y schemaVersion los pone Cursia (nunca el LLM).
   var doc = { schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, chapterId: item.chapterId, minutes: app.minutes, activity: activity, solution: r2.value };
   var all = dynValidateApplicationDoc(doc, { chapterId: item.chapterId, minutes: app.minutes });
-  if (all.length) return failClear(_dynV3Invalid(item, _dynFormatErrors(all), false));
+  if (all.length) return withDraftClear(_dynV3Invalid(item, _dynFormatErrors(all), false));
   var a = _dynV3JsonArtifact(item, 'dynamic_application_json', doc, item.chapterId);
   return {
     ok: true,
@@ -7079,7 +7079,7 @@ function dynExecutorStart(opts) {
         // reintento solo genere lo que falta. Mejor esfuerzo: si la subida falla, el fail va sin él.
         // O2b: igual para la actividad de aplicación (actividad validada, solucionario fallido); el campo depende del tipo.
         var failExtra = null;
-        var draftField = dynDraftFailField(item);
+        var draftField = dynDraftFieldFor(item);
         if (result.draft && result.retryable !== false && draftField && !(abandoned || fatallyPaused())) {
           try {
             var upDraft = await uploadClaimedArtifact(item, result.draft);
@@ -7156,7 +7156,7 @@ function dynExecutorStart(opts) {
       // O2b fix round 1 (1): la actividad ya validada viaja en el error (e.__dynDraft) si la 2.ª pasada lanzó; se sube
       // solo si el error es reintentable, el run no está pausado y el claim anuncia el borrador (400 → sin el campo).
       var thrownExtra = null;
-      var thrownField = dynDraftFailField(item);
+      var thrownField = dynDraftFieldFor(item);
       if (e && e.__dynDraft && thrownField && mapped.retryable && !mapped.runPaused && !(abandoned || fatallyPaused())) {
         try {
           var upThrown = await uploadClaimedArtifact(item, e.__dynDraft);
