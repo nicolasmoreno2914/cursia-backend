@@ -59,7 +59,9 @@ export type ChapterSlot =
   /** EV6 H5P v2: «Repaso» opcional con Dialog Cards (sin nota); solo si chapterFacts.reviewCards. */
   | { kind: 'review_cards' }
   /** Fase 2: Actividad de Aplicación (página del estudiante + solucionario docente oculto); solo con applicationMinutes. */
-  | { kind: 'application' };
+  | { kind: 'application' }
+  /** Loop 9 B: página «Práctica guiada — <capítulo>» (visible), justo después del texto del capítulo; solo con guidedPracticeMinutes. */
+  | { kind: 'guided_practice' };
 
 export type ChapterLabelRole =
   | 'opening'
@@ -93,9 +95,11 @@ export interface AssembleChapterInput {
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
-export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean; application?: boolean }): string[] {
+export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean; application?: boolean; guidedPractice?: boolean }): string[] {
   // Motor de carga horaria: el capítulo de práctica no tiene presentación (ni video: lo valida el Blueprint).
   const seq = flags.practice ? ['label:opening', 'label:deepening'] : ['label:opening', 'presentation', 'label:deepening'];
+  // Loop 9 B: la práctica guiada va justo después del texto del capítulo (antes del video y de la actividad).
+  if (flags.guidedPractice && !flags.practice) seq.push('guided_practice');
   if (flags.videoEnabled) seq.push('label:video_primer', 'video_h5p');
   else if (flags.videoPendingNotice) seq.push('label:video_pending');
   seq.push('label:synthesis');
@@ -194,6 +198,11 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   if (!practice) slots.push({ kind: 'presentation' });
   // [3] Profundización (en la práctica: la práctica guiada).
   slots.push(label('deepening', practice ? 'Práctica guiada' : 'Profundización', mv('deepening')));
+  // Loop 9 B: práctica guiada del capítulo de contenido (página visible, formativa) justo después del texto.
+  if (ch.guidedPracticeMinutes !== undefined) {
+    if (practice) shellFail(`capítulo de práctica ${ch.number} con práctica guiada`);
+    slots.push({ kind: 'guided_practice' });
+  }
   // [4] Video: guía previa (plantilla + conceptos del LLM) + transición → video.
   if (ch.videoEnabled) {
     const before = chipH(h, 'video', 'Video interactivo', mt, s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
@@ -307,6 +316,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
 function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean, mt: Tone): string {
   // Motor de carga horaria: el capítulo de práctica no tiene presentación; su profundización es la práctica guiada.
   const steps: Array<[EduIcon, string]> = ch.kind === 'practice' ? [['practica', 'Práctica guiada']] : [['presentacion', 'Presentación'], ['libro', 'Profundización']];
+  // Loop 9 B: la práctica guiada del capítulo de contenido (formativa) sigue al texto.
+  if (ch.kind !== 'practice' && ch.guidedPracticeMinutes !== undefined) steps.push(['practica', 'Práctica guiada']);
   if (ch.videoEnabled) steps.push(['video', 'Video interactivo']);
   steps.push(['logro', 'Síntesis']);
   steps.push(ch.activityEnabled ? ['practica', 'Práctica calificada'] : ['repaso', 'Repaso']);

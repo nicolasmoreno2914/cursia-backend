@@ -34,6 +34,11 @@ export interface LibroV3Chapter {
   number: number;
   title: string;
   md: string;
+  /**
+   * Loop 9 B: Markdown que va al final del capítulo (la práctica guiada). Se imprime como el capítulo pero NO suma a
+   * `wordCount` (sus minutos son los de la práctica guiada; el Libro solo la reproduce). Ausente = capítulo de siempre.
+   */
+  appendixMd?: string;
 }
 
 export interface LibroV3Module {
@@ -477,7 +482,7 @@ export function libroUnmappedChars(input: Pick<LibroV3Input, 'courseTitle' | 'br
   for (const b of [...bib.course, ...bib.modules.flatMap((m) => m.entries)]) parts.push(b.author, b.title, b.publisher);
   for (const m of input.modules) {
     parts.push(m.title, m.intro.presentation ?? '', ...(m.intro.outcomes ?? []));
-    for (const ch of m.chapters) parts.push(ch.title, stripLeadingDuplicateTitle(String(ch.md ?? ''), ch.title, ch.number).replace(CALLOUT_LEAD_G, ''));
+    for (const ch of m.chapters) parts.push(ch.title, stripLeadingDuplicateTitle(String(ch.md ?? ''), ch.title, ch.number).replace(CALLOUT_LEAD_G, ''), String(ch.appendixMd ?? '').replace(CALLOUT_LEAD_G, ''));
   }
   return parts.reduce((n, p) => n + unmappedCharCount(String(p ?? '')), 0);
 }
@@ -856,6 +861,12 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
       accentRule(mc);
       const md = stripLeadingDuplicateTitle(String(ch.md ?? ''), ch.title, ch.number);
       blocks(parseLibroMarkdown(md));
+      if (ch.appendixMd) {
+        // Loop 9 B: la práctica guiada al final del capítulo; sus palabras no cuentan en las del Libro.
+        const before = words;
+        blocks(parseLibroMarkdown(String(ch.appendixMd)));
+        words = before;
+      }
     });
   });
 

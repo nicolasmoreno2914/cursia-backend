@@ -227,6 +227,8 @@ const REVIEW_CARDS_RE = /^cv3:ch:([^:]+):review_cards$/;
 /** Fase 2: Actividad de Aplicación — página del estudiante y solucionario docente (oculto). */
 const APPLICATION_RE = /^cv3:ch:([^:]+):application$/;
 const APPLICATION_SOLUTION_RE = /^cv3:ch:([^:]+):application_solution$/;
+/** Loop 9 B: página «Práctica guiada — <capítulo>» (visible, formativa, completion por vista). */
+const GUIDED_PRACTICE_RE = /^cv3:ch:([^:]+):guided_practice$/;
 /** Marcas que solo puede tener el solucionario (la página del estudiante nunca lleva respuestas). */
 // Fase 2: la misma regex que rechaza la generación (validateApplicationStudentPart), para que nunca diverjan.
 const SOLUTION_MARKERS_RE = APPLICATION_SOLUTION_MARKERS_RE;
@@ -560,7 +562,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // F1 (I3): en un curso sin nota el Libro Guía se completa por vista (criterio del curso); el resto, 0.
   const viewCompletion = (a: ParsedActivity) => resolved.withoutGrades === true && a.modname === 'resource' && a.idnumber === 'cv3:shell:libro';
   // Fase 2: la página de la Actividad de Aplicación se completa por vista (seguimiento; nunca criterio del curso).
-  const applicationView = (a: ParsedActivity) => a.modname === 'page' && APPLICATION_RE.test(a.idnumber);
+  const applicationView = (a: ParsedActivity) => a.modname === 'page' && (APPLICATION_RE.test(a.idnumber) || GUIDED_PRACTICE_RE.test(a.idnumber));
   for (const a of acts.filter((x) => !GRADED.has(x.modname))) {
     if (applicationView(a)) {
       if (a.module.completion !== '2' || a.module.completionview !== '1') add('APPLICATION', a.dir, `Actividad de Aplicación con completion ${a.module.completion}/${a.module.completionview} ≠ 2/1`);
@@ -629,6 +631,32 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         }
       }
     }
+  }
+  // Loop 9 B: práctica guiada — por capítulo con guidedPracticeMinutes (facts), EXACTAMENTE una página visible, sin nota ni
+  // archivos, con cada ejercicio y su respuesta modelo; en ningún otro capítulo (ni en los de práctica).
+  for (const ch of facts.chapters) {
+    const want = ch.guidedPracticeMinutes !== undefined;
+    const gp = acts.filter((a) => a.idnumber === `cv3:ch:${ch.id}:guided_practice`);
+    if (gp.length !== (want ? 1 : 0)) {
+      add('GUIDED_PRACTICE', `cv3:ch:${ch.id}:guided_practice`, `capítulo ${ch.number}: ${gp.length} página(s) de práctica guiada (facts ${want ? 'con' : 'sin'} práctica guiada)`);
+      continue;
+    }
+    if (!want) continue;
+    const a = gp[0];
+    if (ch.kind === 'practice') add('GUIDED_PRACTICE', a.idnumber, 'práctica guiada en un capítulo de práctica');
+    if (a.modname !== 'page') add('GUIDED_PRACTICE', a.idnumber, `debe ser una página (mod_page), es ${a.modname}`);
+    if (a.grade || a.inforefGradeItems.length) add('GUIDED_PRACTICE', a.idnumber, 'con ítem de calificación (es formativa)');
+    if (a.module.visible === '0') add('GUIDED_PRACTICE', a.idnumber, 'la práctica guiada debe estar visible');
+    if (!/^Práctica guiada — /.test(a.name)) add('GUIDED_PRACTICE', a.idnumber, `nombre «${a.name}» (se espera «Práctica guiada — <capítulo>»)`);
+    const content = unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '');
+    const lint = lintCleanSafe(content);
+    if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
+    if (/<(style|script)\b/i.test(content)) add('GUIDED_PRACTICE', a.idnumber, 'la página lleva <style>/<script>');
+    if (!/Respuesta modelo \(revísala después de intentarlo\)/.test(extractText(content))) add('GUIDED_PRACTICE', a.idnumber, 'sin «Respuesta modelo (revísala después de intentarlo)»');
+  }
+  for (const a of acts.filter((x) => GUIDED_PRACTICE_RE.test(x.idnumber))) {
+    const id = GUIDED_PRACTICE_RE.exec(a.idnumber) as RegExpExecArray;
+    if (!facts.chapters.some((c) => c.id === id[1])) add('GUIDED_PRACTICE', a.idnumber, 'práctica guiada de un capítulo que no está en facts');
   }
   for (const a of acts.filter((x) => (APPLICATION_RE.test(x.idnumber) || APPLICATION_SOLUTION_RE.test(x.idnumber)))) {
     const id = (APPLICATION_RE.exec(a.idnumber) ?? APPLICATION_SOLUTION_RE.exec(a.idnumber)) as RegExpExecArray;
@@ -822,7 +850,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       // EV6 T5 (ruling 3): un capítulo con video pendiente solo puede nombrar el video si lleva el aviso.
       // Motor de carga horaria: un capítulo de práctica no tiene presentación (no puede nombrarla).
       // Fase 2: la Actividad de Aplicación también es una actividad del capítulo (puede nombrarse).
-      return { video: ch.videoEnabled || ch.videoPendingNotice === true, activity: ch.activityEnabled || ch.applicationMinutes !== undefined, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: ch.kind !== 'practice', other: false };
+      // Loop 9 B: la práctica guiada del capítulo también es práctica del capítulo (el recorrido la nombra).
+      return { video: ch.videoEnabled || ch.videoPendingNotice === true, activity: ch.activityEnabled || ch.applicationMinutes !== undefined || ch.guidedPracticeMinutes !== undefined, exam: !!mod?.examEnabled && last, final_exam: toFinal, presentation: ch.kind !== 'practice', other: false };
     }
     const mm = /^cv3:(?:module_intro|exam_info):(.+)$/.exec(a.idnumber);
     if (mm) {

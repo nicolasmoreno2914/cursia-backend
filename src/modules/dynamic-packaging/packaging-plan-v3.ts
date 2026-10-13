@@ -54,6 +54,8 @@ export interface PackagingChapterPlanV3 {
   kind?: 'practice';
   /** Fase 2: minutos de la Actividad de Aplicación, SOLO en capítulos que la tienen (sin la clave: sha de siempre). */
   applicationMinutes?: number;
+  /** Loop 9 B: minutos de la práctica guiada, SOLO en capítulos de contenido que la tienen (sin la clave: sha de siempre). */
+  guidedPracticeMinutes?: number;
   keys: {
     content: string | null;
     experience: string;
@@ -64,6 +66,8 @@ export interface PackagingChapterPlanV3 {
     activity: string | null;
     /** Fase 2: SOLO en capítulos con Actividad de Aplicación (actividad + solucionario oculto). */
     application?: string;
+    /** Loop 9 B: SOLO en capítulos con práctica guiada. */
+    guidedPractice?: string;
   };
 }
 
@@ -176,6 +180,12 @@ export function buildPackagingPlanV3(
       if (applicationKey && byKey.get(applicationKey)?.applicationMinutes !== mc.applicationMinutes) {
         throw new PackagingPlanV3Error(`${applicationKey} con applicationMinutes distinto del capítulo del Manifest`);
       }
+      // Loop 9 B: la práctica guiada del capítulo de contenido (Manifest = fuente: chapters[].guidedPracticeMinutes).
+      if (practice && mc.guidedPracticeMinutes !== undefined) throw new PackagingPlanV3Error(`el capítulo de práctica ${id} tiene práctica guiada en el Manifest`);
+      const guidedKey = mc.guidedPracticeMinutes !== undefined ? take(`guided_practice:${id}`, 'guided_practice') : null;
+      if (guidedKey && byKey.get(guidedKey)?.guidedPracticeMinutes !== mc.guidedPracticeMinutes) {
+        throw new PackagingPlanV3Error(`${guidedKey} con guidedPracticeMinutes distinto del capítulo del Manifest`);
+      }
       return {
         chapterId: id,
         moduleId: mm.moduleId,
@@ -189,6 +199,7 @@ export function buildPackagingPlanV3(
         activityVariant: variant,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(applicationKey ? { applicationMinutes: mc.applicationMinutes as number } : {}),
+        ...(guidedKey ? { guidedPracticeMinutes: mc.guidedPracticeMinutes as number } : {}),
         keys: {
           content: practice ? null : take(`content:${id}`, 'content'),
           experience: take(`experience:${id}`, 'experience'),
@@ -198,6 +209,7 @@ export function buildPackagingPlanV3(
           videoInteractions: videoPending ? null : videoInteractionsKey,
           activity: activityKey,
           ...(applicationKey ? { application: applicationKey } : {}),
+          ...(guidedKey ? { guidedPractice: guidedKey } : {}),
         },
       };
     });

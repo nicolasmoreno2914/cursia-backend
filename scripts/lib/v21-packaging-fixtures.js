@@ -94,6 +94,9 @@ function packagingInput(distRoot, o = {}) {
   // Fase 2: documento de prueba de cada Actividad de Aplicación (salida simulada del ejecutor; valida contra el contrato).
   const applications = new Map();
   for (const c of chapters) if (c.applicationMinutes !== undefined) applications.set(c.chapterId, applicationDoc(c.chapterId, c.applicationMinutes, c.chapterNumber));
+  // Loop 9 B: documento de prueba de cada práctica guiada (salida simulada del ejecutor; valida contra el contrato).
+  const guidedPractices = new Map();
+  for (const c of chapters) if (c.guidedPracticeMinutes !== undefined) guidedPractices.set(c.chapterId, guidedPracticeDoc(c.chapterId, c.guidedPracticeMinutes, c.chapterNumber));
   chapters.forEach((c, i) => {
     if (c.kind === 'practice') {
       // Motor de carga horaria: el capítulo de práctica no tiene presentación, Libro (content) ni audiolibro.
@@ -178,7 +181,30 @@ function packagingInput(distRoot, o = {}) {
       audioWelcome: welcome,
       audiobookChapters,
       ...(applications.size ? { applications } : {}),
+      ...(guidedPractices.size ? { guidedPractices } : {}),
     },
+  };
+}
+
+/** Loop 9 B: documento `dynamic_guided_practice_json` de prueba (ejercicios y minutos según el nivel). */
+function guidedPracticeDoc(chapterId, minutes, n) {
+  const plan = { 40: [20, 20], 60: [30, 30], 80: [40, 40], 120: [40, 40, 40] }[minutes];
+  const kinds = ['case_analysis', 'decision_analysis', 'worked_problem'];
+  return {
+    schemaVersion: 1, chapterId, minutes,
+    exercises: plan.map((m, i) => ({
+      id: `E${i + 1}`, minutes: m, kind: kinds[i],
+      title: `Práctica ${i + 1} del capítulo ${n}: un cliente con un reclamo`,
+      situation: 'Una tienda de barrio recibe a un cliente que compró un electrodoméstico hace diez días y vuelve porque no enciende. El cliente está molesto, trae la factura y pide que le devuelvan el dinero de inmediato. La política de la tienda permite cambio o reparación dentro del primer mes y la devolución solo con autorización de la administración, que hoy no está en el local.',
+      tasks: ['Identifica qué necesita realmente el cliente y qué permite la política.', 'Propón una respuesta concreta con los pasos a seguir.', 'Explica cómo registrarías el caso para darle seguimiento.'],
+      expectedProduct: 'Una respuesta escrita al cliente con los pasos acordados y el registro del caso.',
+      criteria: [
+        { name: 'Comprensión del caso', descriptor: 'Distingue lo que pide el cliente de lo que necesita.' },
+        { name: 'Solución dentro de la política', descriptor: 'La respuesta respeta lo que la tienda permite.' },
+        { name: 'Registro y seguimiento', descriptor: 'Deja trazabilidad para cerrar el caso.' },
+      ],
+      modelAnswer: '1. El cliente necesita un producto que funcione y una solución rápida; la política permite cambio o reparación en el primer mes, y la devolución requiere autorización. 2. Le ofreces el cambio inmediato por una unidad igual o la reparación con fecha, y si insiste en la devolución, registras la solicitud y le das la fecha en que la administración responde. 3. Registras fecha, producto, factura, problema reportado, solución ofrecida y responsable, y agendas la llamada de seguimiento.',
+    })),
   };
 }
 
@@ -236,7 +262,7 @@ function expectedSequence(distRoot, input) {
   for (const mod of m.modules) {
     mod.chapters.forEach((ch, i) => {
       const ids = i === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
-      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined })) {
+      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined, guidedPractice: ch.guidedPracticeMinutes !== undefined })) {
         const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
         ids.push(`cv3:ch:${ch.chapterId}:${role}`);
       }
@@ -257,4 +283,4 @@ function expectedSequence(distRoot, input) {
   return seq;
 }
 
-module.exports = { packagingInput, expectedSequence, applicationDoc, contentMd, moduleGift, SCORM_HTML, SCORM_MANIFEST, YOUTUBE_ID, VIDEO_SECONDS };
+module.exports = { packagingInput, expectedSequence, applicationDoc, guidedPracticeDoc, contentMd, moduleGift, SCORM_HTML, SCORM_MANIFEST, YOUTUBE_ID, VIDEO_SECONDS };
