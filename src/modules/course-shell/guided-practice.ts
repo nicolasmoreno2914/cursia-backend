@@ -7,7 +7,7 @@
 //
 // Lo valida el servidor al completar el item (scheduler.completeItem → validateV3ItemArtifact) y, con las MISMAS reglas,
 // el ejecutor del navegador antes de subirlo (espejo en 45-dynamic-generation-executor.js; paridad: scripts/
-// check-guided-practice.js y el harness del frontend test-66). El empaque lo vuelve a validar (nunca empaqueta uno roto).
+// check-guided-practice.js y el harness del frontend test-67). El empaque lo vuelve a validar (nunca empaqueta uno roto).
 // chapterId, minutes, los ids y los minutos de cada ejercicio los pone Cursia (plan del nivel), nunca la IA.
 import { GUIDED_PRACTICE_TIERS, guidedPracticeExercisePlan, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 
@@ -16,11 +16,11 @@ export const GUIDED_PRACTICE_ARTIFACT_TYPE = 'dynamic_guided_practice_json';
 export const GUIDED_PRACTICE_KINDS = Object.freeze(['case_analysis', 'worked_problem', 'decision_analysis'] as const);
 export type GuidedPracticeKind = (typeof GUIDED_PRACTICE_KINDS)[number];
 
-/** Límites (caracteres) del documento v1. */
+/** Límites (caracteres) del documento v1. Los mínimos que dependen de los minutos del ejercicio están en FLOORS. */
 export const GUIDED_PRACTICE_LIMITS = Object.freeze({
   titleMax: 90,
   situationMin: 300,
-  situationMax: 1200,
+  situationMax: 1400,
   tasksMin: 3,
   tasksMax: 6,
   taskMin: 10,
@@ -32,9 +32,26 @@ export const GUIDED_PRACTICE_LIMITS = Object.freeze({
   criterionNameMax: 80,
   criterionDescriptorMin: 10,
   criterionDescriptorMax: 300,
-  modelAnswerMin: 400,
-  modelAnswerMax: 1800,
+  modelAnswerMin: 450,
+  modelAnswerMax: 2200,
 });
+
+/**
+ * Fix round 1 (C1): los minutos que se acreditan tienen que estar respaldados por trabajo. Pisos por minutos del ejercicio
+ * (los fija Cursia): situación, cantidad de consignas, respuesta modelo y producto esperado crecen con el tiempo.
+ */
+export const GUIDED_PRACTICE_FLOORS: Readonly<Record<number, { situationMin: number; tasksMin: number; modelAnswerMin: number; expectedProductMin: number }>> = Object.freeze({
+  20: Object.freeze({ situationMin: 300, tasksMin: 3, modelAnswerMin: 450, expectedProductMin: 10 }),
+  30: Object.freeze({ situationMin: 500, tasksMin: 4, modelAnswerMin: 800, expectedProductMin: 20 }),
+  40: Object.freeze({ situationMin: 700, tasksMin: 4, modelAnswerMin: 1100, expectedProductMin: 40 }),
+});
+
+/**
+ * Fix round 1 (C1): cada consigna exige PRODUCIR algo (analizar, decidir, calcular, justificar…), nunca solo recordar.
+ * Consignas que empiezan con un verbo de recuerdo («Define», «Menciona», «Enumera», «Nombra», «Lista», «Recuerda», «Cita»,
+ * «¿Qué es…?») se rechazan.
+ */
+export const GUIDED_PRACTICE_RECALL_TASK_RE = /^\s*(?:¿\s*)?(?:defin[ea]|mencion[ae]|enumer[ae]|nombr[ae]|list[ae]|recuerd[ae]|cit[ae]|qu[eé] es|cu[aá]l es la definici[oó]n)(?![\p{L}])/iu;
 
 export const GUIDED_PRACTICE_DOC_KEYS = Object.freeze(['schemaVersion', 'chapterId', 'minutes', 'exercises']);
 export const GUIDED_PRACTICE_EXERCISE_KEYS = Object.freeze(['id', 'minutes', 'kind', 'title', 'situation', 'tasks', 'expectedProduct', 'criteria', 'modelAnswer']);
@@ -63,11 +80,14 @@ function isObj(v: unknown): v is Record<string, any> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
-/** ¿La respuesta modelo responde las consignas EN ORDEN? Marcas «1.» / «1)» / «Consigna 1» en orden creciente. */
+/**
+ * ¿La respuesta modelo responde las consignas EN ORDEN? Una marca «1.» / «1)» / «Consigna 1.» AL INICIO DE LÍNEA por
+ * consigna, en orden creciente (fix round 1, M1: cifras como «2.000» o «3,5 %» dentro del texto no cuentan).
+ */
 export function guidedPracticeAnswerCoversTasks(answer: string, taskCount: number): boolean {
   let from = 0;
   for (let k = 1; k <= taskCount; k++) {
-    const re = new RegExp(`(^|[\\s(«"“])(consigna\\s+)?${k}\\s*[.)\\-:–]`, 'gi');
+    const re = new RegExp(`(?:^|\\n)[ \\t]*(?:consigna[ \\t]+)?${k}[.)][ \\t]`, 'gi');
     re.lastIndex = from;
     const m = re.exec(answer);
     if (!m) return false;
@@ -117,15 +137,20 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
     }
     if (!(GUIDED_PRACTICE_KINDS as readonly string[]).includes(e.kind)) err(`${p}.kind`, 'GUIDED_PRACTICE_KIND', `${p}.kind debe ser ${GUIDED_PRACTICE_KINDS.join(' | ')}`);
     text(e.title, `${p}.title`, 4, L.titleMax);
-    text(e.situation, `${p}.situation`, L.situationMin, L.situationMax);
+    // C1: pisos según los minutos del ejercicio (los del plan de Cursia; un ejercicio de más usa los de 20 min).
+    const F = GUIDED_PRACTICE_FLOORS[want ? want.minutes : 20] || GUIDED_PRACTICE_FLOORS[20];
+    text(e.situation, `${p}.situation`, F.situationMin, L.situationMax);
     let taskCount = 0;
     if (!Array.isArray(e.tasks)) err(`${p}.tasks`, 'GUIDED_PRACTICE_SHAPE', `${p}.tasks debe ser una lista`);
     else {
       taskCount = e.tasks.length;
-      if (e.tasks.length < L.tasksMin || e.tasks.length > L.tasksMax) err(`${p}.tasks`, 'GUIDED_PRACTICE_COUNT', `${p}.tasks debe tener entre ${L.tasksMin} y ${L.tasksMax} consignas (tiene ${e.tasks.length})`);
-      e.tasks.forEach((t: unknown, j: number) => text(t, `${p}.tasks[${j}]`, L.taskMin, L.taskMax));
+      if (e.tasks.length < F.tasksMin || e.tasks.length > L.tasksMax) err(`${p}.tasks`, 'GUIDED_PRACTICE_COUNT', `${p}.tasks debe tener entre ${F.tasksMin} y ${L.tasksMax} consignas para ${want ? want.minutes : 20} min (tiene ${e.tasks.length})`);
+      e.tasks.forEach((t: unknown, j: number) => {
+        const tt = text(t, `${p}.tasks[${j}]`, L.taskMin, L.taskMax);
+        if (tt && GUIDED_PRACTICE_RECALL_TASK_RE.test(tt)) err(`${p}.tasks[${j}]`, 'GUIDED_PRACTICE_TASK_RECALL', `${p}.tasks[${j}] solo pide recordar («${tt.slice(0, 40)}»): cada consigna debe pedir analizar, decidir, calcular o justificar`);
+      });
     }
-    text(e.expectedProduct, `${p}.expectedProduct`, L.expectedProductMin, L.expectedProductMax);
+    text(e.expectedProduct, `${p}.expectedProduct`, F.expectedProductMin, L.expectedProductMax);
     if (!Array.isArray(e.criteria)) err(`${p}.criteria`, 'GUIDED_PRACTICE_SHAPE', `${p}.criteria debe ser una lista`);
     else {
       if (e.criteria.length < L.criteriaMin || e.criteria.length > L.criteriaMax) err(`${p}.criteria`, 'GUIDED_PRACTICE_COUNT', `${p}.criteria debe tener entre ${L.criteriaMin} y ${L.criteriaMax} criterios (tiene ${e.criteria.length})`);
@@ -140,9 +165,9 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
         text(c.descriptor, `${cp}.descriptor`, L.criterionDescriptorMin, L.criterionDescriptorMax);
       });
     }
-    const ans = text(e.modelAnswer, `${p}.modelAnswer`, L.modelAnswerMin, L.modelAnswerMax);
+    const ans = text(e.modelAnswer, `${p}.modelAnswer`, F.modelAnswerMin, L.modelAnswerMax);
     if (ans && taskCount >= L.tasksMin && !guidedPracticeAnswerCoversTasks(ans, taskCount)) {
-      err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_ORDER', `${p}.modelAnswer debe responder las ${taskCount} consignas en orden, numeradas «1.», «2.», …`);
+      err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_ORDER', `${p}.modelAnswer debe responder las ${taskCount} consignas en orden, una por línea, cada una empezando con «1. », «2. », …`);
     }
   });
   return errors;
