@@ -3858,7 +3858,7 @@ function reservationBookkeeping(ev) {
         if (start.status !== 201) throw new Error(`E24: run no creado ${start.status} ${start.error}`);
         return start.data.run.id;
       };
-      let w1 = null; let w2 = null; let w3 = null; let w4 = null;
+      let w1 = null; let w2 = null; let w3 = null; let w4 = null; let w5 = null;
       let CURRENT_RUN = null;
       try {
         await stopProc(app);
@@ -4133,6 +4133,7 @@ function reservationBookkeeping(ev) {
         // Loop 9 (A4): el run dice que lo genera el servidor (worker de IA vivo que cubre todas sus partes de IA).
         const r5a = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}`);
         eq(r5a.data && r5a.data.serverExecuted, true, 'E24e: run.serverExecuted = true (la pantalla puede decir «puedes cerrar esta pestaña»)');
+        eq(r5a.data && r5a.data.legacyFinalExamDeps, false, 'E24e: Manifest nuevo (el final depende de los exámenes de módulo): sin aviso de estructura anterior');
         // Ningún dynExecutorStart: solo los workers del servidor.
         const done5 = await waitFor('run E24e terminado sin navegador', async () => {
           const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c5.runId]);
@@ -4144,7 +4145,9 @@ function reservationBookkeeping(ev) {
         const llm5 = rows5.filter((i) => LLM_TYPES.includes(i.type));
         eq([...new Set(llm5.map((i) => i.type))].sort(), [...LLM_TYPES].sort(), 'E24e: el curso tiene TODOS los tipos de parte de IA (incluidas las interacciones del video y el examen de módulo)');
         ok(llm5.every((i) => i.worker_id === W3 && i.output_summary && i.output_summary.generatedBy === 'llm-worker'), 'E24e: cada parte de IA la generó el worker de IA', llm5.map((i) => [i.item_key, i.worker_id]));
-        eq(claimLog.slice(claims5).length, 0, 'E24e: 0 claims del navegador');
+        // Fix M3: acá no hay ejecutor del navegador (0 claims por construcción); que el servidor NO le entrega partes de IA a
+        // un navegador ABIERTO lo prueba la corrida 1 (ejecutor corriendo, 0 claims). Acá la prueba es worker_id/generatedBy.
+        eq(claimLog.slice(claims5).length, 0, 'E24e: sin ejecutor del navegador abierto en toda la corrida');
         const fin5 = rows5.find((i) => i.type === 'final_exam');
         ok(fin5 && fin5.output_summary.externalStems > 0 && fin5.output_summary.externalStemsSource === 'dependencies', 'E24e: el examen final evitó las preguntas del examen de módulo (externalStems > 0, desde las dependencias)', fin5 && fin5.output_summary);
         // Empaquetado automático (sin clic): el job del paquete final se arma y valida (validateMbzV3 antes de subir).
@@ -4167,8 +4170,91 @@ function reservationBookkeeping(ev) {
           results.mbz.E24e = { bytes: buf5.length, sha256: sha(buf5), jobId: pj5.id };
         }
         results.courses.E24e = { courseId: c5.courseId, runId: c5.runId, items: rows5.length, llmParts: llm5.length, browserClaims: claimLog.slice(claims5).length, externalStems: fin5 && fin5.output_summary.externalStems, packageJob: pj5.id };
+
+        // ── Corrida 6 (Loop 9 fix I2 · configuración de STAGING): worker de IA HOSPEDADO en dynamic-provider-worker, pool de 1
+        // conexión (DB_POOL_MAX_WORKER=1), 4 partes en paralelo. ≥ 4 partes en vuelo más largas que la lease → los latidos
+        // las sostienen (sin leaseLost); drenaje (SIGTERM) con ≥ 3 en vuelo → se devuelven sin reservas desconocidas ni
+        // llm_pending_review, y otro worker termina el run. ──
+        w3.kill('SIGTERM');
+        await waitFor('worker 3 detenido', async () => !!w3.exited, 120000, 200);
+        const W5 = 'e2e-llm-worker-5';
+        const stagingEnv = (id) => ({ ...wEnv(id), DYNAMIC_LLM_WORKER_CONCURRENCY: '4', DB_POOL_MAX_WORKER: '1', DB_POOL_IDLE_MS_WORKER: '1000' });
+        w4 = spawnProc('llm-worker-4', 'workers/dynamic-provider-worker.js', { ...stagingEnv(W4), DYNAMIC_PROVIDER_WORKER_ID: 'e2e-provider-hosting-llm-4', DYNAMIC_PROVIDER_WORKER_POLL_MS: '400' });
+        await waitFor('worker 4 (hospedado, staging) anunciado', async () => (await q(`select 1 from public.llm_worker_presence where worker_id = $1 and not draining and last_seen > now() - interval '30 seconds'`, [W4])).length > 0, 120000, 300);
+        const C6 = { key: 'E24f', title: '[E2E Worker IA E24f] Config staging: 4 en paralelo', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Mantenimiento de motores', objective: 'Mantener motores eléctricos', exam: false, chapters: [
+            { title: 'Rodamientos de motores', v: false, a: false, objective: 'Revisar rodamientos de un motor' },
+            { title: 'Aislamiento de bobinados', v: false, a: false, objective: 'Medir el aislamiento de un bobinado' },
+            { title: 'Ventilación del motor', v: false, a: false, objective: 'Asegurar la ventilación de un motor' },
+            { title: 'Alineación del acople', v: false, a: false, objective: 'Alinear el acople motor-bomba' },
+          ] }] };
+        llm.st.tag = 'E24f';
+        const c6 = await createCourse(C6, llm);
+        const isExp6 = (t) => t.includes('Genera la EXPERIENCIA del capítulo') && C6.modules[0].chapters.some((ch) => t.includes(`CAPÍTULO: "${ch.title}"`));
+        fake.rule(isExp6, 'slow', 4, 25000); // 25 s > lease de 15 s: solo los latidos las mantienen
+        c6.runId = await startRun(c6, C6.title);
+        CURRENT_RUN = c6.runId;
+        const inflight6 = await waitFor('≥ 4 experiencias en vuelo a la vez en el worker hospedado', async () => {
+          const pend = fake.st.requests.filter((r) => r.action === 'slow' && r.outcome === 'pending' && isExp6(r.text));
+          const run = (await finished(c6.runId)).filter((i) => i.status === 'running' && i.worker_id === W4);
+          return pend.length >= 4 && run.length >= 4 ? run : null;
+        }, 300000, 200);
+        await sleep(18000); // más que la lease (15 s): sin latidos se perderían
+        const held6 = await q(`select item_key, status, worker_id, lease_until > now() as alive from public.generation_item_runs where job_id = $1 and status = 'running'`, [c6.runId]);
+        ok(held6.length >= 4 && held6.every((i) => i.worker_id === W4 && i.alive) && inflight6.length >= 4,
+          'E24f: 4 partes en paralelo con 1 conexión de pool: los latidos renuevan la lease pasada su duración (ninguna se pierde)', held6);
+        // Drenaje (deploy) con ≥ 3 en vuelo.
+        const draining6 = (await finished(c6.runId)).filter((i) => i.status === 'running' && i.worker_id === W4).map((i) => i.item_key);
+        ok(draining6.length >= 3, `E24f: ${draining6.length} partes en vuelo al pedir el drenaje`, draining6);
+        w4.kill('SIGTERM');
+        await waitFor('worker 4 drenado', async () => !!w4.exited, 150000, 200);
+        const after6 = await finished(c6.runId);
+        ok(after6.every((i) => i.status !== 'running'), 'E24f: drenaje — nada quedó en curso (terminó o volvió a la cola)', after6.filter((i) => i.status === 'running').map((i) => i.item_key));
+        ok(!after6.some((i) => /^llm_pending_review/.test(i.error || '') || (i.output_summary && i.output_summary.llmPendingReview)), 'E24f: drenaje sin partes en revisión (llm_pending_review)');
+        const unk6 = (await q(`select count(*)::int n from public.generation_cost_events e where e.run_id = $1 and (e.metadata->>'reservation') = 'true'
+            and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [c6.runId]))[0].n;
+        eq(unk6, 0, 'E24f: drenaje sin reservas desconocidas (todas liquidadas)');
+        const leaseLost6 = fs.readFileSync(w4.logFile, 'utf8').split('\n').filter((l) => /: abandoned\b|lease_lost/.test(l));
+        eq(leaseLost6, [], 'E24f: el worker hospedado nunca perdió una lease (sin abandoned)');
+        // Otro worker (GIFT forzado: corrida 7) termina el run.
+        w5 = spawnProc('llm-worker-5', 'workers/dynamic-llm-worker.js', { ...wEnv(W5), DYNAMIC_LLM_WORKER_EXAM_BANK: 'off' });
+        const done6 = await waitFor('run E24f terminado', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c6.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 10 * 60 * 1000, 1000);
+        const rows6 = await finished(c6.runId);
+        ok(['completed', 'preview'].includes(done6) && rows6.every((i) => i.status === 'completed'), `E24f: el run se completa tras el drenaje (${done6})`, rows6.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 160)]));
+        results.courses.E24f = { courseId: c6.courseId, runId: c6.runId, inFlight: held6.length, drained: draining6.length, unsettled: unk6 };
+
+        // ── Corrida 7 (Loop 9 fix M4): en el worker, actividad variante SCORM y exámenes GIFT (modo banco apagado), sin navegador ──
+        const C7 = { key: 'E24g', title: '[E2E Worker IA E24g] SCORM y GIFT en el worker', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'scorm', modules: [
+          { title: 'Seguridad eléctrica', objective: 'Trabajar con seguridad eléctrica', exam: true, chapters: [
+            { title: 'Bloqueo de energía', v: false, a: true, objective: 'Bloquear la energía antes de intervenir' },
+            { title: 'Equipos de protección', v: false, a: true, objective: 'Elegir el equipo de protección adecuado' },
+          ] }] };
+        llm.st.tag = 'E24g';
+        const c7 = await createCourse(C7, llm);
+        c7.runId = await startRun(c7, C7.title);
+        CURRENT_RUN = c7.runId;
+        const claims7 = claimLog.length;
+        const done7 = await waitFor('run E24g terminado sin navegador', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c7.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 10 * 60 * 1000, 1000);
+        const rows7 = await finished(c7.runId);
+        ok(['completed', 'preview'].includes(done7) && rows7.every((i) => i.status === 'completed'), `E24g: run completo sin navegador (${done7})`, rows7.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+        const arts7 = await artifactsOfRun(c7.runId);
+        const acts7 = rows7.filter((i) => i.type === 'activity');
+        // La variante SCORM no tiene validador de servidor (solo la h5p): se comprueba que el worker la generó con sus artifacts.
+        ok(acts7.length === 2 && acts7.every((i) => i.worker_id === W5 && i.output_summary && i.output_summary.generatedBy === 'llm-worker' && arts7.some((a) => a.item_key === i.item_key)),
+          'E24g: las actividades variante SCORM las generó el worker (con su paquete)', acts7.map((i) => [i.item_key, i.worker_id, arts7.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
+        const exams7 = rows7.filter((i) => i.type === 'exam' || i.type === 'final_exam');
+        ok(exams7.length === 2 && exams7.every((i) => i.worker_id === W5 && arts7.filter((a) => a.item_key === i.item_key && /^dynamic_exam_/.test(a.type)).map((a) => a.type).join() === 'dynamic_exam_gift'),
+          'E24g: examen de módulo y final como GIFT en el worker (DYNAMIC_LLM_WORKER_EXAM_BANK=off)', exams7.map((i) => [i.item_key, i.worker_id, arts7.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
+        eq(claimLog.slice(claims7).length, 0, 'E24g: sin ejecutor del navegador');
+        results.courses.E24g = { courseId: c7.courseId, runId: c7.runId, items: rows7.length, status: done7 };
       } finally {
-        for (const w of [w1, w2, w3, w4]) if (w && !w.exited) await stopProc(w, 30000);
+        for (const w of [w1, w2, w3, w4, w5]) if (w && !w.exited) await stopProc(w, 30000);
         await fake.close();
         await stopProc(app);
         app = await startApp();
