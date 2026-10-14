@@ -481,6 +481,18 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       });
     }
   }
+  // Loop 9 B (fix round 2 · a): ejercicios guiados por encima del 30 % de las horas = proporción que la institución acepta
+  // en la propuesta (mismo mecanismo que un requisito no cubierto: sin su aceptación no se aprueba ni se genera).
+  const gpShare: any = ((card && card.verification && card.verification.checks) || []).find((x: any) => x.id === 'guided_share' && x.capability);
+  if (gpShare) {
+    const key = String(gpShare.capability.requirementKey);
+    const text = clean(gpShare.capability.requirementText);
+    const sv = inp.exceptionReasons[key];
+    const valid = !!(sv && sv.requirementText === text && clean(sv.reason).length > 0);
+    exceptions.push({ requirementKey: key, requirementText: text, appliedText: clean(gpShare.capability.produces),
+      reason: valid ? clean(sv.reason) : null, by: valid ? sv.by : null, at: valid ? sv.at : null, capability: true as const,
+      ...(typeof gpShare.capability.proposal === 'string' ? { proposal: clean(gpShare.capability.proposal) } : {}) });
+  }
   items.sort((a, b) => a.key.localeCompare(b.key));
   exceptions.sort((a, b) => a.requirementKey.localeCompare(b.requirementKey));
   const counts = {
@@ -523,7 +535,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
     presentations: Number(t.presentationCount || 0),
     interactiveActivities: Number(t.activityCount || 0),
     applicationActivities: Number(t.applicationActivityCount || 0),
-    ...guidedPracticeResource(allCh),
+    ...guidedPracticeResource(allCh, totals.hours),
     audiobookChapters: Number(t.audiobookChapterCount || 0),
     welcomeAudio: Number(t.audioWelcomeCount || 0) > 0,
     guideBook: allCh.length > 0,
@@ -669,14 +681,15 @@ export function diffModels(prev: PrebriefModel, next: PrebriefModel): string[] {
 }
 
 /** Loop 9 B: resumen de la práctica guiada del diseño para «Recursos previstos» y la metodología (sin ella: nada). */
-function guidedPracticeResource(chs: PrebriefChapter[]): { guidedPractice?: PrebriefModel['resources']['guidedPractice'] } {
+function guidedPracticeResource(chs: PrebriefChapter[], courseHours: number): { guidedPractice?: PrebriefModel['resources']['guidedPractice'] } {
   const withGp = chs.filter((c) => c.kind !== 'practice' && typeof c.guidedPracticeMinutes === 'number');
   if (!withGp.length) return {};
   const plans = withGp.map((c) => guidedPracticeExercisePlan(c.guidedPracticeMinutes as number));
   const counts = plans.map((p) => p.length);
   const mins = plans.flatMap((p) => p.map((e) => e.minutes));
   const total = mins.reduce((a, b) => a + b, 0);
-  const designHours = Math.round(chs.reduce((a, c) => a + (c.hours || 0), 0) * 10) / 10;
+  // Fix round 2 (a): sobre las horas del CURSO (las mismas que Verificación y la tarjeta: el modelo de tiempo de Cursia).
+  const designHours = courseHours > 0 ? courseHours : Math.round(chs.reduce((a, c) => a + (c.hours || 0), 0) * 10) / 10;
   return {
     guidedPractice: {
       chapters: withGp.length,

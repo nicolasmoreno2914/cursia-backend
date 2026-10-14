@@ -1033,7 +1033,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
       const why = appMode === 'none' ? 'Sin Actividades de Aplicación (decisión del docente)'
         : appMode === 'practice_only' ? 'Con las Actividades de Aplicación solo en las prácticas (decisión del docente)'
           : 'Con las Actividades de Aplicación en lo que permiten el documento y los topes de Cursia';
-      priorityTrace.push(`${why} y la forma o las Actividades fijadas por el documento, la diferencia con el objetivo se completa con ejercicios guiados (formativos, sin nota) en ${n} capítulo(s) de contenido: ${fmtH(best.sum / 60)} h de ${fmtH(best.total / 60)} h (${Math.round((best.sum / best.total) * 100)} %). No se agregan capítulos ni Actividades de Aplicación.`);
+      priorityTrace.push(`${why} y la forma o las Actividades fijadas por el documento, la diferencia con el objetivo se completa con ejercicios guiados (formativos, sin nota) en ${n} capítulo(s) de contenido: ${fmtH(best.sum / 60)} h de ${fmtH(best.total / 60)} h de trabajo estimado del estudiante (modelo de tiempo de Cursia), ${Math.round((best.sum / best.total) * 100)} %. No se agregan capítulos ni Actividades de Aplicación.`);
     }
     const short = Math.max(0, target - tol - minutes());
     guidedFill = { used: !!(best && best.sum > 0), shortfallHours: r1(short / 60) };

@@ -77,6 +77,14 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
   for (const e of model.exceptions) {
     if (e.reason || (e.coveredBy && keys.has(e.coveredBy))) continue;
     const covered = model.exceptions.filter((o) => o.coveredBy === e.requirementKey).map((o) => `«${o.requirementText}»`);
+    if (e.capability && e.requirementKey === 'guided_practice_share@course') {
+      // Loop 9 B (fix round 2 · a): proporción de ejercicios guiados > 30 %: la institución la acepta de forma explícita.
+      b.push({ code: 'exception_reason', capability: true, title: `${e.requirementText}. Supera el 30 %: para continuar, la institución debe aceptar esa proporción.`,
+        detail: `Los ejercicios guiados (formativos, sin nota) completan las horas porque el documento fija la estructura o las Actividades de Aplicación: ${e.appliedText.replace(/^los ejercicios guiados suman /, '')}.`, where: 'reason', ref: e.requirementKey,
+        ...(e.proposal ? { proposal: e.proposal } : {}),
+        suggestion: `Se acepta que ${e.appliedText.replace(/^los ejercicios guiados suman /, '')} del curso sean ejercicios guiados formativos (sin nota), con respuesta modelo, para completar las horas que pide el documento.` });
+      continue;
+    }
     if (e.capability) {
       // LOOP 9.2 (capacidades): requisito no cubierto → solo se continúa si la institución acepta la diferencia.
       b.push({ code: 'exception_reason', capability: true, title: `Requisito no cubierto: ${e.requirementText}${covered.length ? ` (también ${covered.join(' y ')})` : ''}. Para continuar, la institución debe aceptar la diferencia.`,

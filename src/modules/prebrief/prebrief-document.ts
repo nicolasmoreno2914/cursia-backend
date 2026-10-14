@@ -111,8 +111,12 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   if (m.pedagogy.approach) summaryParts.push(`Enfoque pedagógico: ${m.pedagogy.approach.value.toLowerCase()}.`);
   glance.push({ t: 'paragraph', text: summaryParts.join(' ') });
   // LOOP 9.2 (capacidades): lo que Cursia no cubre con su capacidad actual se dice aparte de las decisiones de la institución.
-  const capEx = m.exceptions.filter((e) => e.capability);
-  const ownEx = m.exceptions.length - capEx.length;
+  const GP_SHARE = 'guided_practice_share@course';
+  const gpEx = m.exceptions.find((e) => e.requirementKey === GP_SHARE);
+  const capEx = m.exceptions.filter((e) => e.capability && e.requirementKey !== GP_SHARE);
+  const ownEx = m.exceptions.length - capEx.length - (gpEx ? 1 : 0);
+  // Loop 9 B (fix round 2 · a): más del 30 % en ejercicios guiados = proporción que la institución acepta.
+  if (gpEx) glance.push({ t: 'callout', tone: 'warn', text: `Requiere su atención: ${gpEx.requirementText}. Supera el 30 % de las horas${gpEx.reason ? '; la institución aceptó esa proporción' : '; para aprobar, la institución debe aceptar esa proporción'} (sección 12).` });
   if (capEx.length) glance.push({ t: 'callout', tone: 'warn', text: `Requiere su atención: ${plural(capEx.length, 'requisito', 'requisitos')} del documento que Cursia no cubre con su capacidad actual${capEx.every((e) => e.reason) ? ', aceptados por la institución como excepción' : '; para aprobar, la institución debe aceptar la diferencia'} (sección 12).` });
   if (ownEx) glance.push({ t: 'callout', tone: 'warn', text: `Requiere su atención: ${plural(ownEx, 'excepción', 'excepciones')} al documento institucional (sección 12).` });
   glance.push({ t: 'legend', title: 'Cómo leer el origen de cada dato', items: ORIGIN_LEGEND.map((x) => ({ key: x.key, label: ORIGIN_LABEL[x.key], text: x.text })) });
@@ -280,10 +284,16 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   // ── 12. Excepciones ──
   sections.push({ id: 'exceptions', n: '12', title: 'Excepciones al documento', blocks: [m.exceptions.length
     ? { t: 'exceptions', items: m.exceptions.map((e) => ({ rows: [
-      { label: 'Requisito original', value: reqDisplay(e.requirementText) },
-      { label: e.capability ? 'Propuesta de Cursia' : 'Decisión aplicada', value: e.capability ? proposalText(e.appliedText) : e.appliedText },
-      ...(e.capability && e.proposal ? [{ label: 'Alternativa que propone Cursia', value: e.proposal }] : []),
-      { label: 'Tipo', value: e.capability ? (e.reason ? 'Requisito no cubierto por Cursia · excepción aceptada' : 'Requisito no cubierto por Cursia (capacidad actual)') : 'Excepción al requisito del documento' },
+      ...(e.requirementKey === GP_SHARE ? [
+        { label: 'Proporción', value: e.requirementText },
+        ...(e.proposal ? [{ label: 'Lo que propone Cursia', value: e.proposal }] : []),
+        { label: 'Tipo', value: e.reason ? 'Ejercicios guiados por encima del 30 % de las horas · aceptado por la institución' : 'Ejercicios guiados por encima del 30 % de las horas (requiere aceptación)' },
+      ] : [
+        { label: 'Requisito original', value: reqDisplay(e.requirementText) },
+        { label: e.capability ? 'Propuesta de Cursia' : 'Decisión aplicada', value: e.capability ? proposalText(e.appliedText) : e.appliedText },
+        ...(e.capability && e.proposal ? [{ label: 'Alternativa que propone Cursia', value: e.proposal }] : []),
+        { label: 'Tipo', value: e.capability ? (e.reason ? 'Requisito no cubierto por Cursia · excepción aceptada' : 'Requisito no cubierto por Cursia (capacidad actual)') : 'Excepción al requisito del documento' },
+      ]),
       { label: e.capability ? 'Aceptación de la institución' : 'Motivo', value: e.reason || (e.capability ? 'Pendiente: sin aceptación no se puede aprobar' : 'Motivo pendiente'), strong: true },
       { label: 'Responsable', value: e.by || '—' },
       { label: 'Fecha', value: e.at ? formatDateEs(e.at) : '—' },
@@ -421,10 +431,13 @@ export function approvalStateTexts(meta: PrebriefDocumentMeta): string[] {
   return ['BORRADOR · NO APROBABLE', 'Vista previa: todavía no es una versión para aprobar.'];
 }
 
-/** Fix round 1 (I1): el peso de los ejercicios guiados en las horas, a la vista: «Ejercicios guiados: X h de Y h (Z %)». */
+/**
+ * Fix round 1 (I1) / round 2 (a): el peso de los ejercicios guiados en las horas, a la vista: «Ejercicios guiados: X h de
+ * Y h de trabajo estimado del estudiante (modelo de tiempo de Cursia), Z %.».
+ */
 export function guidedPracticeShareText(g: { minutes: number; designHours: number; sharePct: number }): string {
   const h = (n: number) => String(Math.round(n * 10) / 10).replace('.', ',');
-  return `Ejercicios guiados: ${h(g.minutes / 60)} h de ${h(g.designHours)} h (${g.sharePct} %).`;
+  return `Ejercicios guiados: ${h(g.minutes / 60)} h de ${h(g.designHours)} h de trabajo estimado del estudiante (modelo de tiempo de Cursia), ${g.sharePct} %.`;
 }
 
 /** Loop 9 B: «Ejercicios guiados en cada capítulo de contenido (formativos, no calificados): N ejercicios de M min». */
