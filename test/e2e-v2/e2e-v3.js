@@ -3380,9 +3380,16 @@ function reservationBookkeeping(ev) {
       let S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
       const vidBlockers = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason');
       REP.alternativa = S0.draft.model.exceptions.filter((e) => e.capability).map((e) => ({ requisito: e.requirementText, aplicado: e.appliedText, propuesta: e.proposal || null }));
-      rec23('P1', 'La propuesta no se prepara sin la decisión de la institución sobre los videos, y Cursia propone una alternativa con lo que sí produce',
+      // Loop 9 B (fix 2a): con ejercicios guiados > 30 % del trabajo estimado, la institución también acepta esa proporción
+      // (o elige «Ejercicios guiados: Ninguno»): su propuesta dice el porcentaje y la salida, no «Proponemos…».
+      const isGuidedShare = (e) => /^Ejercicios guiados: /.test(e.requirementText || '');
+      rec23('P1', 'La propuesta no se prepara sin la decisión de la institución sobre los videos (y sobre la proporción de ejercicios guiados si supera el 30 %), y Cursia propone una alternativa con lo que sí produce',
         vidBlockers.length >= 1 && S0.draft.model.exceptions.filter((e) => e.capability && /video/.test(e.requirementText)).every((e) => typeof e.proposal === 'string' && /1 video/.test(e.proposal) && /presentaci/i.test(e.proposal))
-          && S0.draft.model.exceptions.filter((e) => e.capability).every((e) => typeof e.proposal === 'string' && /^(Proponemos|Cursia ya llevó)/.test(e.proposal)), REP.alternativa);
+          && S0.draft.model.exceptions.filter((e) => e.capability && !isGuidedShare(e)).every((e) => typeof e.proposal === 'string' && /^(Proponemos|Cursia ya llevó)/.test(e.proposal))
+          && S0.draft.model.exceptions.filter((e) => e.capability && isGuidedShare(e)).every((e) => typeof e.proposal === 'string'
+            && /^Aceptar que \d+ % del trabajo estimado del estudiante sean ejercicios guiados/.test(e.proposal) && /Ninguno/.test(e.proposal)
+            && /de trabajo estimado del estudiante \(modelo de tiempo de Cursia\), (3[1-9]|[4-9]\d) %$/.test(e.requirementText)),
+        REP.alternativa);
       // Lo mismo que envía «Usar la alternativa de Cursia» en la interfaz (la sugerencia del bloqueo), que cabe en el motivo.
       rec23('P1b', 'Cada «Usar la alternativa de Cursia» cabe en el motivo (≤ 500 caracteres) y el de horas declara la carga real',
         vidBlockers.every((b) => typeof b.suggestion === 'string' && b.suggestion.length <= 500)
