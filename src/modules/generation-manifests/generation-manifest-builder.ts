@@ -1184,6 +1184,9 @@ export function buildGenerationManifestV3(
     const sortedChapters = [...m.chapters].sort((a, b) => a.position - b.position);
     // Motor de carga horaria: la práctica se apoya en los content de los capítulos de CONTENIDO del módulo.
     const moduleContentKeys = sortedChapters.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    // Loop 9 B (fix N1): los ejercicios guiados esperan a las Actividades de Aplicación del módulo (para no repetir su caso).
+    // Sin ciclo: una AA depende solo de content (nunca de guided_practice).
+    const moduleAppKeys = sortedChapters.filter((c) => isApplicationMinutes((c as { applicationMinutes?: unknown }).applicationMinutes)).map((c) => `application_activity:${c.id}`);
     for (const c of sortedChapters) {
       if (typeof c.activityEnabled !== 'boolean') {
         throw new Error(`BLUEPRINT_V2_INVALID_INPUT: chapter ${c.id} sin activityEnabled boolean`);
@@ -1254,7 +1257,7 @@ export function buildGenerationManifestV3(
         items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [contentKey], applicationMinutes: application });
       }
       if (guided !== null) {
-        items.push({ key: `guided_practice:${c.id}`, type: 'guided_practice', ...base, dependsOn: [contentKey], guidedPracticeMinutes: guided });
+        items.push({ key: `guided_practice:${c.id}`, type: 'guided_practice', ...base, dependsOn: [contentKey, ...moduleAppKeys], guidedPracticeMinutes: guided });
       }
       items.push({ key: `audiobook_chapter:${c.id}`, type: 'audiobook_chapter', ...base, dependsOn: [contentKey] });
     }
@@ -1561,6 +1564,7 @@ export function validateGenerationManifestV3(
     const mirrorChapters: ManifestChapter[] = [];
     const sortedCh = [...mod.chapters].sort((a, b) => a.position - b.position);
     const modContentAll = sortedCh.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    const modAppAll = sortedCh.filter((c) => isApplicationMinutes((c as { applicationMinutes?: unknown }).applicationMinutes)).map((c) => `application_activity:${c.id}`);
     for (const c of sortedCh) {
       chNum += 1;
       const videoOn = !!c.videoEnabled;
@@ -1603,7 +1607,7 @@ export function validateGenerationManifestV3(
         } else if (type === 'application_activity') {
           if (appMin !== undefined) expected.push({ ...ch(type, [content]), applicationMinutes: appMin });
         } else if (type === 'guided_practice') {
-          if (gpMin !== undefined) expected.push({ ...ch(type, [content]), guidedPracticeMinutes: gpMin });
+          if (gpMin !== undefined) expected.push({ ...ch(type, [content, ...modAppAll]), guidedPracticeMinutes: gpMin });
         } else expected.push(ch(type, [content]));
       }
     }

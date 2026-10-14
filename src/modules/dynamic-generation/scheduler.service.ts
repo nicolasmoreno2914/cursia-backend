@@ -1,7 +1,8 @@
 import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
-import { GUIDED_PRACTICE_SCHEMA_VERSION } from '../course-shell/guided-practice';
+import { GUIDED_PRACTICE_SCHEMA_VERSION, GuidedPracticeAvoid } from '../course-shell/guided-practice';
+export type { GuidedPracticeAvoid } from '../course-shell/guided-practice';
 import { guidedPracticeExercisePlan } from '../study-time/guided-practice-tiers';
 import {
   BadRequestException,
@@ -311,10 +312,6 @@ export interface ClaimPayloadV3 {
   };
 }
 
-export interface GuidedPracticeAvoid {
-  practiceChapterTitles: string[];
-  applicationCases: { title: string | null; workshopTitle: string | null; names: string[] }[];
-}
 
 /**
  * Fix I5 (puro, para el claim y los tests): títulos de los capítulos de práctica del módulo del capítulo y los casos de
@@ -1431,6 +1428,15 @@ export class SchedulerService {
       if (ctx.guidedPracticeMinutes === null) {
         throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin guidedPracticeMinutes en el Manifest; no se completa sin validar`);
       }
+      // Fix N1: el choque duro con los casos del módulo (práctica + AA) lo verifica el servidor, con el Blueprint del run.
+      const [bp] = await this.dataSource.query(
+        `select b.snapshot_json from public.course_generation_manifests m
+           join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
+          where m.id = $1`,
+        [g.manifest_id],
+      );
+      const snap = bp ? (typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json) : null;
+      ctx.guidedPracticeAvoid = await this.guidedPracticeAvoidFor(this.dataSource, g.job_id, g.manifest_id, manifest, snap, g.chapter_id);
     }
     if (g.type === 'module_intro') {
       const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
@@ -1562,6 +1568,24 @@ export class SchedulerService {
     return facts;
   }
 
+  /** Fix I5/N1: casos del módulo que los ejercicios guiados no repiten (los mismos en el claim y al validar). */
+  private async guidedPracticeAvoidFor(
+    q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, manifestId: number, manifest: any, snapshot: unknown, chapterId: string,
+  ): Promise<GuidedPracticeAvoid | null> {
+    const mm = (manifest?.modules || []).find((m: any) => (m.chapters || []).some((c: any) => c.chapterId === chapterId));
+    const aaKeys: string[] = mm ? mm.chapters.filter((c: any) => c.applicationMinutes !== undefined).map((c: any) => `application_activity:${c.chapterId}`) : [];
+    const aaRows = aaKeys.length
+      ? await q.query(
+        `select d.output_summary from public.generation_item_runs d
+          where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[]) and d.status = 'completed' and ${latestGenerationPredicate('d')}
+          order by d.item_key`,
+        [jobId, manifestId, aaKeys],
+      )
+      : [];
+    return guidedPracticeAvoidOf(manifest, snapshot, chapterId,
+      aaRows.map((r: any) => { try { return typeof r.output_summary === 'string' ? JSON.parse(r.output_summary) : r.output_summary; } catch { return null; } }));
+  }
+
   /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
   private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot): Promise<ClaimPayloadV3 | undefined> {
     if (manifest.rulesVersion !== 3) return undefined;
@@ -1612,19 +1636,9 @@ export class SchedulerService {
         // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
         context: (snapshot as any)?.course?.applicationContext ?? null,
       };
-      // Fix I5: no repetir el caso de la práctica del módulo ni de sus Actividades de Aplicación (las ya completadas).
-      const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
-      const aaKeys = mm ? mm.chapters.filter((c) => c.applicationMinutes !== undefined).map((c) => `application_activity:${c.chapterId}`) : [];
-      const aaRows = aaKeys.length
-        ? await qr.query(
-          `select d.output_summary from public.generation_item_runs d
-            where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[]) and d.status = 'completed' and ${latestGenerationPredicate('d')}
-            order by d.item_key`,
-          [row.job_id, row.manifest_id, aaKeys],
-        )
-        : [];
-      const avoid = guidedPracticeAvoidOf(manifest as any, snapshot, row.chapter_id,
-        aaRows.map((r: any) => { try { return typeof r.output_summary === 'string' ? JSON.parse(r.output_summary) : r.output_summary; } catch { return null; } }));
+      // Fix I5/N1: no repetir el caso de la práctica del módulo ni de sus Actividades de Aplicación (el item depende de
+      // ellas: al reclamarse ya están completadas).
+      const avoid = await this.guidedPracticeAvoidFor(qr, row.job_id, row.manifest_id, manifest, snapshot, row.chapter_id);
       if (avoid) out.guidedPractice.avoid = avoid;
     }
     if (row.type === 'experience' || row.type === 'activity' || row.type === 'application_activity') {

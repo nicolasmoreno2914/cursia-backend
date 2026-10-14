@@ -1,6 +1,6 @@
 import { lqaFindings, lqaHitLabel, LQA_SKIP_KEYS } from '../language-qa/language-qa';
 import { APPLICATION_ARTIFACT_TYPE, applicationActivitySummary, validateApplicationActivityDoc } from './application-activity';
-import { GUIDED_PRACTICE_ARTIFACT_TYPE, guidedPracticeSummary, validateGuidedPracticeDoc } from './guided-practice';
+import { GUIDED_PRACTICE_ARTIFACT_TYPE, GuidedPracticeAvoid, guidedPracticeSummary, validateGuidedPracticeDoc } from './guided-practice';
 /**
  * R11a — validación SERVER-SIDE (pura) de los artifacts LLM de rulesVersion 3
  * antes de aceptar la completitud de un item (scheduler.completeItem).
@@ -108,6 +108,8 @@ export interface V3ItemValidationContext {
   applicationMinutes?: number | null;
   /** Loop 9 B: minutos de la práctica guiada (item del Manifest congelado). */
   guidedPracticeMinutes?: number | null;
+  /** Fix N1: casos del módulo que los ejercicios guiados no repiten (práctica + AA completadas). */
+  guidedPracticeAvoid?: GuidedPracticeAvoid | null;
   /** Language QA: curso de idiomas o de lengua/literatura (cita «vosotros», voseo o inglés a propósito) → sin chequeo de idioma. */
   languageCourse?: boolean;
 }
@@ -317,7 +319,7 @@ function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string
       if (!ctx.chapterId || typeof ctx.guidedPracticeMinutes !== 'number') {
         throw new Error(`V3_VALIDATION_CONTEXT: guided_practice ${ctx.itemKey} sin chapterId o minutos`);
       }
-      const errors = validateGuidedPracticeDoc(doc, { chapterId: ctx.chapterId, minutes: ctx.guidedPracticeMinutes });
+      const errors = validateGuidedPracticeDoc(doc, { chapterId: ctx.chapterId, minutes: ctx.guidedPracticeMinutes, avoid: ctx.guidedPracticeAvoid ?? null });
       return { ok: errors.length === 0, errors, ...(errors.length === 0 ? { summary: guidedPracticeSummary(doc) } : {}) };
     }
     default:

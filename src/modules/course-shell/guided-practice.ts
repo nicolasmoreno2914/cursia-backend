@@ -42,8 +42,8 @@ export const GUIDED_PRACTICE_LIMITS = Object.freeze({
  */
 export const GUIDED_PRACTICE_FLOORS: Readonly<Record<number, { situationMin: number; tasksMin: number; modelAnswerMin: number; expectedProductMin: number }>> = Object.freeze({
   20: Object.freeze({ situationMin: 300, tasksMin: 3, modelAnswerMin: 450, expectedProductMin: 10 }),
-  30: Object.freeze({ situationMin: 500, tasksMin: 4, modelAnswerMin: 800, expectedProductMin: 20 }),
-  40: Object.freeze({ situationMin: 700, tasksMin: 4, modelAnswerMin: 1100, expectedProductMin: 40 }),
+  30: Object.freeze({ situationMin: 550, tasksMin: 4, modelAnswerMin: 950, expectedProductMin: 20 }),
+  40: Object.freeze({ situationMin: 800, tasksMin: 5, modelAnswerMin: 1400, expectedProductMin: 60 }),
 });
 
 /**
@@ -74,6 +74,47 @@ export interface GuidedPracticeValidationError {
 export interface GuidedPracticeValidationContext {
   chapterId: string;
   minutes: number;
+  /** Fix N1: casos del módulo que no se repiten (práctica + AA). Ausente = sin chequeo de choque. */
+  avoid?: GuidedPracticeAvoid | null;
+}
+
+/** Fix I5/N1: lo que los ejercicios guiados no repiten (títulos de las prácticas del módulo y casos de sus AA). */
+export interface GuidedPracticeAvoid {
+  practiceChapterTitles: string[];
+  applicationCases: { title: string | null; workshopTitle: string | null; names: string[] }[];
+}
+
+/** Normalización de títulos (espejo EXACTO de _dynNormTitle del ejecutor). */
+export function guidedPracticeNormTitle(t: unknown): string {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/^(practica|taller|caso|ejercicio)[^:]*:\s*/, '').replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Fix N1: choque DURO con un caso del módulo (espejo de la parte dura de dynLintGuidedPracticeAvoid): el mismo título de
+ * escenario que una práctica o una AA del módulo, o 2+ de sus protagonistas (nombres propios) en el título o la situación.
+ */
+export function guidedPracticeCaseClashes(doc: unknown, avoid: GuidedPracticeAvoid | null | undefined): GuidedPracticeValidationError[] {
+  const out: GuidedPracticeValidationError[] = [];
+  if (!avoid || !isObj(doc) || !Array.isArray((doc as any).exercises)) return out;
+  const titles: string[] = [...(avoid.practiceChapterTitles || [])];
+  const names: string[] = [];
+  for (const c of avoid.applicationCases || []) {
+    if (!isObj(c)) continue;
+    if (c.title) titles.push(c.title);
+    if (c.workshopTitle) titles.push(c.workshopTitle);
+    for (const n of c.names || []) if (typeof n === 'string' && n.trim() && !names.includes(n)) names.push(n);
+  }
+  const normTitles = titles.map(guidedPracticeNormTitle).filter(Boolean);
+  ((doc as any).exercises as unknown[]).forEach((e, i) => {
+    if (!isObj(e)) return;
+    const p = `$.exercises[${i}]`;
+    const nt = guidedPracticeNormTitle(e.title);
+    const text = `${String(e.title || '')}\n${String(e.situation || '')}`;
+    const shared = names.filter((n) => new RegExp(`(^|[^\\p{L}])${n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\p{L}])`, 'u').test(text));
+    if (nt && normTitles.includes(nt)) out.push({ path: `${p}.title`, code: 'GUIDED_PRACTICE_CASE_CLASH', message: `${p}.title repite el escenario de la práctica o de una Actividad de Aplicación del módulo («${e.title}»): usa otra situación` });
+    else if (shared.length >= 2) out.push({ path: `${p}.situation`, code: 'GUIDED_PRACTICE_CASE_CLASH', message: `${p}.situation usa a los mismos protagonistas de una Actividad de Aplicación del módulo (${shared.slice(0, 4).join(', ')}): usa otras personas y otra organización` });
+  });
+  return out;
 }
 
 function isObj(v: unknown): v is Record<string, any> {
@@ -170,6 +211,8 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
       err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_ORDER', `${p}.modelAnswer debe responder las ${taskCount} consignas en orden, una por línea, cada una empezando con «1. », «2. », …`);
     }
   });
+  // Fix N1: el choque duro con los casos del módulo lo verifica también el servidor (no solo el ejecutor).
+  errors.push(...guidedPracticeCaseClashes(doc, ctx.avoid));
   return errors;
 }
 
