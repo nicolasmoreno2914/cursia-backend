@@ -101,11 +101,11 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
 
 (async () => {
   // ══ I3 — piso del banco ══
-  await check('I3: bankFloorFor — v4 = 2·slots (= bankTarget), v1–v3 = piso histórico; la holgura del pedido sigue encima (≤ bankMax)', () => {
+  await check('I3: bankFloorFor — v4 = 2·slots (= bankTarget), v1–v3 = piso histórico; la holgura del pedido sigue encima (exam-bank D2: pool de candidatas; lo subido ≤ bankMax)', () => {
     for (const s of [1, 2, 3, 5, 8, 12, 20]) {
       eq(EB.bankFloorFor(s, 4), EB.bankTarget(s), `v4 s=${s}`);
       for (const v of [1, 2, 3]) eq(EB.bankFloorFor(s, v), EB.bankFloor(s), `v${v} s=${s}`);
-      assert(EB.bankAskCount(s, 'multichoice') > EB.bankFloorFor(s, 4) && EB.bankAskCount(s, 'multichoice') <= EB.bankMax(s), `holgura MC s=${s}`);
+      assert(EB.bankAskCount(s, 'multichoice') > EB.bankFloorFor(s, 4) && EB.bankTarget(s) <= EB.bankMax(s), `holgura MC s=${s}`);
       assert(EB.bankAskCount(s, 'truefalse') > EB.bankFloorFor(s, 4), `holgura V/F s=${s}`);
     }
     eq(EB.EXAM_BANK_VALIDATION_VERSION, 4, 'reglas vigentes');

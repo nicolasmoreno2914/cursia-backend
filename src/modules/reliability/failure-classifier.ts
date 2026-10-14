@@ -352,7 +352,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     family: /^EXAM_BANK_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', rounds: 2,
     // EXAM_BANK_CLAIM: el claim no trae examBank válido → contrato (D), no salida de la IA.
-    refine: ({ code }) => (code === 'EXAM_BANK_CLAIM' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item' } : null),
+    // Exam-bank D3: EXAM_BANK_LEAF_CAPACITY = una hoja que tampoco avanzó con la estrategia alternativa (el texto del
+    // capítulo no alcanza con las reglas del banco) → D: ninguna regeneración automática la arregla; decide una persona.
+    refine: ({ code }) => (code === 'EXAM_BANK_CLAIM' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item' }
+      : code === 'EXAM_BANK_LEAF_CAPACITY' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'unrecoverable', adminAction: 'regenerate_item' } : null),
   },
   {
     id: 'corrupt_dependency',

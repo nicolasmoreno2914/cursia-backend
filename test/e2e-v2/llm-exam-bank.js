@@ -28,6 +28,7 @@ const BANK_MARKERS = {
   'EXAM_BANK_FINAL_MODULE v1': 'final',
 };
 const REPAIR_MARKER = 'EXAM_BANK_REPAIR v2';
+const FAULT_TOTAL = 6;
 const SOURCE_MARKER = 'EXAM_BANK_SOURCE v2';
 const TYPE_IDX = { multichoice: 0, truefalse: 1, match: 2 };
 
@@ -89,10 +90,15 @@ function expandIds(line) {
   return out;
 }
 
-/** Bloques de capítulo del prompt: [{ chapterId|null, md }]. */
+/** Bloques de capítulo del prompt: [{ chapterId|null, md, refs }]. Exam-bank D1: el texto llega marcado con [S#]
+ *  (fragmentos citables); `md` = texto sin las marcas, `refs` = [{ ref, text }] en orden. */
 function chapterBlocks(base) {
   const out = [];
-  for (const m of base.matchAll(/<<<CAPITULO(?: chapterId="([^"]+)"[^\n]*)?\n([\s\S]*?)\nCAPITULO>>>/g)) out.push({ chapterId: m[1] || null, md: m[2] });
+  for (const m of base.matchAll(/<<<CAPITULO(?: chapterId="([^"]+)"[^\n]*)?\n([\s\S]*?)\nCAPITULO>>>/g)) {
+    const raw = m[2];
+    const refs = [...raw.matchAll(/\[(S\d+)\] ([^\n]*?)(?= \[S\d+\] |$)/gm)].map((x) => ({ ref: x[1], text: x[2].replace(/\*\*|__|`/g, '').replace(/\|/g, '').replace(/\s+/g, ' ').trim() }));
+    out.push({ chapterId: m[1] || null, md: raw.replace(/\[S\d+\] /g, ''), refs });
+  }
   return out;
 }
 
@@ -116,10 +122,10 @@ function parseBankPrompt(prompt) {
   let chapters;
   if (chm) {
     if (blocks.length !== 1) throw new Error(`fake banco: ${blocks.length} bloques de capítulo en un prompt de un capítulo`);
-    chapters = [{ id: chm[1], md: blocks[0].md }];
+    chapters = [{ id: chm[1], md: blocks[0].md, refs: blocks[0].refs }];
   } else {
     if (blocks.some((b) => !b.chapterId)) throw new Error('fake banco: prompt de módulo sin chapterId en un bloque');
-    chapters = blocks.map((b) => ({ id: b.chapterId, md: b.md }));
+    chapters = blocks.map((b) => ({ id: b.chapterId, md: b.md, refs: b.refs }));
   }
   const moduleId = scope === 'final' ? ((chm && chm[2]) || (mom && mom[1]) || null) : null;
   if (scope === 'final' && !moduleId) throw new Error('fake banco: prompt del examen final sin moduleId');
@@ -137,7 +143,8 @@ function parseBankPrompt(prompt) {
     }
   }
   if (!asks.length) throw new Error(`fake banco: ${isRepair ? 'reparación' : 'pedido'} sin ids`);
-  return { marker, isRepair, scope, chapters, moduleId, asks };
+  const refMode = /"evidenceRef"/.test(base) && chapters.every((c) => c.refs && c.refs.length);
+  return { marker, isRepair, scope, chapters, moduleId, asks, refMode };
 }
 
 /** Evidencia: la primera línea de prosa del capítulo de 40–220 caracteres, copiada TEXTUAL. */
@@ -147,7 +154,7 @@ function pickEvidence(md) {
   return line;
 }
 
-function makeQuestion(ask, ch, scope, moduleId, fault) {
+function makeQuestion(ask, ch, scope, moduleId, fault, refMode) {
   const p = parseId(ask.id);
   if (p.type !== ask.type) throw new Error(`fake banco: id ${ask.id} no es de tipo ${ask.type}`);
   if (p.final !== (scope === 'final')) throw new Error(`fake banco: id ${ask.id} fuera del alcance ${scope}`);
@@ -156,7 +163,11 @@ function makeQuestion(ask, ch, scope, moduleId, fault) {
   const q = { id: ask.id, type: ask.type, chapterId: ch.id };
   if (scope === 'final') q.moduleId = moduleId;
   q.level = p.n % 3 === 0 ? 'recordar' : p.n % 3 === 1 ? 'aplicar' : 'analizar';
-  q.evidence = fault === 'evidence' ? FAULT_EVIDENCE : pickEvidence(ch.md);
+  // Exam-bank D1: con fragmentos marcados se responde por referencia (la primera marca de prosa de 40–220).
+  if (refMode) {
+    const r = ch.refs.find((x) => x.text.length >= 40 && x.text.length <= 220 && /^[A-ZÁÉÍÓÚÑ]/.test(x.text)) || ch.refs[0];
+    q.evidenceRef = fault === 'evidence' ? 'S9999' : r.ref;
+  } else q.evidence = fault === 'evidence' ? FAULT_EVIDENCE : pickEvidence(ch.md);
   if (ask.type === 'multichoice') {
     const [correct, ds] = MC_T[p.k % MC_T.length];
     q.stem = `${where}: en la ${w1}, ${w2} atiende el ${w3} de ${w4} con ${w5} y nota una respuesta lenta del circuito. ¿Qué debe hacer primero?`;
@@ -184,7 +195,15 @@ function assertContract(contract, parsed, qs, faults) {
   const examModule = parsed.scope === 'module' ? '00000000-0000-4000-8000-0000000b6000' : null;
   const chapters = parsed.chapters.map((c) => ({ id: c.id, moduleId: parsed.scope === 'final' ? parsed.moduleId : examModule }));
   const chapterMd = new Map(parsed.chapters.map((c) => [c.id, c.md]));
-  const projected = qs.map((q) => (q.type === 'multichoice' ? { ...q, distractors: q.distractors.slice(0, 3) } : q));
+  // D1: la referencia se resuelve como lo hace el ejecutor (marca inexistente → la evidencia falsa, que el contrato rechaza).
+  const resolve = (q) => {
+    if (!('evidenceRef' in q)) return q;
+    const ch = parsed.chapters.find((c) => c.id === q.chapterId) || parsed.chapters[0];
+    const hit = (ch.refs || []).find((x) => x.ref === q.evidenceRef);
+    const { evidenceRef, ...rest } = q;
+    return { ...rest, evidence: hit ? hit.text : FAULT_EVIDENCE };
+  };
+  const projected = qs.map(resolve).map((q) => (q.type === 'multichoice' ? { ...q, distractors: q.distractors.slice(0, 3) } : q));
   const r = contract.validateExamBank({ questions: projected }, { scope: parsed.scope, chapters, chapterMd });
   const perQ = new Map();
   for (const e of r.errors) {
@@ -220,18 +239,27 @@ function createExamBankFake({ contract, rec, once, st }) {
     const faults = {};
     // Falla UNA vez por corrida: primer pedido (no reparación ni reintento) de un examen de módulo con ≥ 4 MC
     // (más fallas que la holgura de la hoja: si no, el ejecutor las absorbe sin reparar).
+    // Exam-bank D2: el pedido trae holgura 4 en la hoja MC (2s+4) → la falla inyectada es de FAULT_TOTAL = 6 preguntas
+    // de esa hoja (1 LENGTH_BIAS + 5 EVIDENCE), repartidas entre las partes del mismo capítulo: faltan 2 para el objetivo
+    // y el ejecutor manda UNA reparación (con candidatas del pool).
     const mcIds = parsed.asks.filter((a) => a.type === 'multichoice').map((a) => a.id);
-    if (!parsed.isRepair && !retry && parsed.scope === 'module' && mcIds.length >= 4 && once('exam_bank')) {
-      faults[mcIds[0]] = 'EXAM_BANK_LENGTH_BIAS';
-      faults[mcIds[1]] = 'EXAM_BANK_EVIDENCE';
-      faults[mcIds[2]] = 'EXAM_BANK_EVIDENCE';
-      faults[mcIds[3]] = 'EXAM_BANK_EVIDENCE';
+    const eb = st.examBank;
+    if (!parsed.isRepair && !retry && parsed.scope === 'module' && mcIds.length >= 1 && eb.faultLeft == null && once('exam_bank')) {
+      eb.faultLeft = FAULT_TOTAL;
+      eb.faultChapter = parsed.chapters[0].id;
+    }
+    if (!parsed.isRepair && !retry && parsed.scope === 'module' && eb.faultLeft > 0 && parsed.chapters[0].id === eb.faultChapter) {
+      for (const id of mcIds) {
+        if (eb.faultLeft <= 0) break;
+        faults[id] = eb.faultLeft === FAULT_TOTAL ? 'EXAM_BANK_LENGTH_BIAS' : 'EXAM_BANK_EVIDENCE';
+        eb.faultLeft--;
+      }
     }
     // Pedido de un capítulo: todas al mismo; prompt de módulo (F1): reparto en ronda entre sus capítulos.
     const qs = parsed.asks.map((a, i) => {
       const ch = parsed.chapters[i % parsed.chapters.length];
       const fault = faults[a.id] === 'EXAM_BANK_LENGTH_BIAS' ? 'short' : faults[a.id] === 'EXAM_BANK_EVIDENCE' ? 'evidence' : null;
-      return makeQuestion(a, ch, parsed.scope, parsed.moduleId, fault);
+      return makeQuestion(a, ch, parsed.scope, parsed.moduleId, fault, parsed.refMode);
     });
     assertContract(contract, parsed, qs, faults);
     const chapterId = parsed.chapters[0].id;
@@ -242,7 +270,8 @@ function createExamBankFake({ contract, rec, once, st }) {
       rec('exam_bank_repair', chapterId, { scope: parsed.scope, ids: parsed.asks.map((a) => a.id) });
     } else {
       const ids = Object.keys(faults);
-      if (ids.length) st.examBank.faults.push({ chapterId, faults });
+      // Una sola falla inyectada por corrida (aunque se reparta en dos partes del capítulo).
+      if (ids.length) { const prev = st.examBank.faults.find((f) => f.chapterId === chapterId); if (prev) Object.assign(prev.faults, faults); else st.examBank.faults.push({ chapterId, faults: { ...faults } }); }
       rec(parsed.scope === 'final' ? 'final_exam_bank' : 'exam_bank', chapterId, { invalid: ids.length > 0, faults: ids.length ? faults : undefined, retry, count: qs.length });
     }
     // JSON minificado, como pide el prompt.
