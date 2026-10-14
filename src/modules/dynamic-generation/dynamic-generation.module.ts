@@ -18,6 +18,7 @@ import { ArtifactsService } from '../artifacts/artifacts.service';
 import { ArtifactsServiceTextReader, V3_ARTIFACT_TEXT_READER } from './v3-artifact-reader';
 import { FinopsModule } from '../finops/finops.module';
 import { AdminDynamicRunsController } from './admin-runs.controller';
+import { LlmDiagnosticsService } from './llm-diagnostics.service';
 import { AdminRecoveryService } from './admin-recovery.service';
 import { VideogenReconciliationService } from './videogen-reconciliation.service';
 import { PilotMetricsService } from './pilot-metrics.service';
@@ -49,6 +50,7 @@ import { CoherenceModule } from '../coherence/coherence.module';
     VideogenReconciliationService, // V542 (G6): conciliación explícita de reservas de Videogen (SUPER_ADMIN)
     PilotMetricsService, // Loop 10 C2: métricas del piloto de un run (SUPER_ADMIN, solo lectura)
     SchedulerService,
+    LlmDiagnosticsService,
     DynamicYoutubePreflightService,
     {
       provide: V3_ARTIFACT_TEXT_READER,

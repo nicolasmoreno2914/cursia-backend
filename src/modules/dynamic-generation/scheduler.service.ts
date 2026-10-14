@@ -11,6 +11,7 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
+  NotFoundException,
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -1985,6 +1986,32 @@ export class SchedulerService {
    * artifacts de las dependencias. Cualquier inconsistencia → 500 (y el
    * claim se deshace porque corre dentro de su transacción).
    */
+  /**
+   * Diagnóstico (SUPER_ADMIN, 2026-10-14): el payload EXACTO que recibiría un worker al reclamar `itemKey` (generación
+   * vigente) — mismo buildClaimedItem — en una transacción READ ONLY (nunca toca el item ni el run). Sirve para
+   * reproducir localmente, a USD 0, una parte con sus puntos de guardado (los prompts y sus hashes coinciden).
+   */
+  async claimPreview(runId: string, itemKey: string): Promise<ClaimedItem> {
+    if (!UUID_RE.test(String(runId))) throw new BadRequestException('runId inválido');
+    const qr = this.dataSource.createQueryRunner();
+    await qr.connect();
+    try {
+      await qr.startTransaction();
+      await qr.query('set transaction read only');
+      const [job] = await qr.query(`select * from public.production_jobs where id = $1 and execution_mode = 'dynamic_generation'`, [runId]);
+      if (!job) throw new NotFoundException(`Run ${runId} no encontrado`);
+      const [row] = await qr.query(
+        `select * from public.generation_item_runs g where g.job_id = $1 and g.item_key = $2 order by g.generation desc limit 1`,
+        [runId, itemKey],
+      );
+      if (!row) throw new NotFoundException(`Parte ${itemKey} no encontrada en el run ${runId}`);
+      return await this.buildClaimedItem(qr, job, row);
+    } finally {
+      if (qr.isTransactionActive) await qr.rollbackTransaction().catch(() => undefined);
+      await qr.release().catch(() => undefined);
+    }
+  }
+
   private async buildClaimedItem(qr: QueryRunner, job: any, row: any): Promise<ClaimedItem> {
     const where = `Item ${row.item_key} (run ${job.id})`;
     const fail = (msg: string) => new InternalServerErrorException(`${where}: ${msg} (integridad rota)`);
