@@ -191,25 +191,14 @@ function applicationSolution(a) {
 }
 
 // Loop 9 B: práctica guiada VÁLIDA para el plan del prompt (n ejercicios); `unnumbered` = respuesta modelo sin numerar
-// (el validador la rechaza → reintento dirigido). Formativa: sin solucionario ni pesos.
-function guidedPractice(n, unnumbered) {
-  const kinds = ['case_analysis', 'decision_analysis', 'worked_problem'];
-  const answer = "1. La caída de presión al final de la carrera indica que el aceite se desvía antes de llegar al cilindro: la causa más probable es la válvula de alivio mal ajustada o con desgaste. Que el ciclo tarde más con el paso del turno refuerza esa lectura, porque el aceite se calienta y la fuga interna aumenta.\n2. Primero bloqueas y etiquetas el equipo, liberas la presión acumulada y conectas el manómetro en el puerto de prueba. Con el equipo en condición segura, comparas la lectura con el valor de placa en vacío y al final de la carrera, antes de tocar cualquier ajuste.\n3. Si la lectura queda por debajo del valor de placa solo al final de la carrera, decides ajustar la válvula de alivio en pasos cortos y volver a medir; si la diferencia aparece también en vacío, decides no ajustar y escalar el caso, porque apunta a la bomba y no a la válvula.\n4. Registras las lecturas, el ajuste realizado, la hora y tu nombre en la hoja del turno, y avisas al supervisor antes de liberar el equipo a operación. Dejas anotado qué revisar en la siguiente mantención para que el siguiente turno sepa qué se hizo y por qué.\n5. Al supervisor le informas si la prensa puede seguir con el ajuste o si hay que detenerla, con las lecturas antes y después, la temperatura del aceite y el estado del filtro. Si la presión se sostuvo tras el ajuste, recomiendas operar con controles cada hora durante el pedido; si no, recomiendas detenerla y cambiar piezas antes del pedido, porque una falla a mitad de la producción costaría más tiempo que la parada planificada.";
-  return {
-    exercises: Array.from({ length: n }, (_, i) => ({
-      kind: kinds[i % kinds.length],
-      title: `Práctica ${i + 1}: un cilindro que pierde fuerza`,
-      situation: "En el turno de noche, el operador de una prensa hidráulica informa que el cilindro principal pierde fuerza al final de la carrera y que el ciclo tarda más que al inicio del turno. El equipo ya pasó la mantención de la semana y nadie ha cambiado la configuración. Te piden revisar el circuito antes de que la prensa vuelva a operación, con el equipo detenido y los registros del turno a mano. El supervisor necesita saber antes del cambio de turno si la prensa puede seguir operando con un ajuste o si hay que detenerla para cambiar piezas, porque mañana temprano entra un pedido grande. En la hoja del turno figura que la temperatura del aceite subió durante la noche y que el filtro se cambió hace dos semanas. El operador anotó además que el ruido de la bomba aumentó al final del turno y que no hay repuesto de la válvula en la bodega de la planta.",
-      tasks: ["Explica qué indica la caída de presión al final de la carrera.", "Describe en orden cómo verificarías la presión del circuito con seguridad.", "Decide si ajustarías la válvula o escalarías el caso, y justifica tu decisión.", "Indica qué registrarías antes de liberar el equipo y por qué.", "Justifica qué le informarías al supervisor sobre el pedido grande de mañana y con qué datos."],
-      expectedProduct: 'Un informe breve con el diagnóstico, los pasos de verificación, la decisión tomada y el registro del turno.',
-      criteria: [
-        { name: 'Diagnóstico', descriptor: 'Relaciona el síntoma con la causa probable del capítulo.' },
-        { name: 'Seguridad', descriptor: 'Bloquea y etiqueta el equipo antes de medir.' },
-        { name: 'Registro', descriptor: 'Deja la verificación documentada para el supervisor.' },
-      ],
-      modelAnswer: unnumbered ? answer.replace(/(^|\n)\d\. /g, '$1') : answer,
-    })),
-  };
+// (el validador la rechaza → reintento dirigido). Formativa: sin solucionario ni pesos. Loop 10 C1: ejercicios DISTINTOS
+// dentro del documento (tipo, situación, consignas) y entre capítulos (`ordinal` = orden en que el fake vio el capítulo:
+// otro título y otra combinación de situaciones), como exige la guardia de calidad.
+const GPF = require('../../scripts/lib/guided-practice-fixtures');
+function guidedPractice(n, unnumbered, ordinal = 0, chapterTitle = '') {
+  const doc = GPF.guidedLlmDoc(n, ordinal % 3, chapterTitle ? chapterTitle.slice(0, 40) : '');
+  if (unnumbered) doc.exercises.forEach((e) => { e.modelAnswer = e.modelAnswer.replace(/(^|\n)\d\. /g, '$1'); });
+  return doc;
 }
 
 function giftBlocks(prefix, from, split, typesOnly) {
@@ -370,7 +359,9 @@ function createLlmV3({ base, chapterIdFromText, examBankContract, h5p2 }) {
         if (retry) st.retriesSeen.guided_practice = (st.retriesSeen.guided_practice || 0) + 1;
         const bad = !retry && once('guided_practice');
         rec('guided_practice', id, { invalid: bad, retry, exercises: n });
-        return J(guidedPractice(n, bad));
+        if (!st.gpOrdinal) st.gpOrdinal = new Map();
+        if (!st.gpOrdinal.has(id)) st.gpOrdinal.set(id, st.gpOrdinal.size);
+        return J(guidedPractice(n, bad, st.gpOrdinal.get(id), title));
       }
       // Loop 7 (O2): reparación parcial del Libro — un reemplazo neutro por cada oración numerada.
       if (prompt.indexOf('Responde SOLO con JSON: {"replacements"') >= 0) {

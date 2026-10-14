@@ -1230,7 +1230,11 @@ function reservationBookkeeping(ev) {
       const gpArts = await q(`select g.item_key k from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and a.type = 'dynamic_guided_practice_json'`, [c.runId]);
       eq(gpArts.map((a) => a.k), [`guided_practice:${chPlain}`], 'E7: un artifact dynamic_guided_practice_json');
       const [gpSum] = await q(`select output_summary s from public.generation_item_runs where job_id = $1 and type = 'guided_practice' order by generation desc limit 1`, [c.runId]);
-      ok(gpSum && gpSum.s.exerciseCount === 2 && gpSum.s.minutes === 80 && gpSum.s.promptVersion === 'v21-gp-2' && gpSum.s.retried === true && gpSum.s.v3Validation, 'E7: summary de la práctica guiada (2 ejercicios, 80 min, reintentada) validado por el servidor', gpSum && gpSum.s);
+      ok(gpSum && gpSum.s.exerciseCount === 2 && gpSum.s.minutes === 80 && gpSum.s.promptVersion === 'v21-gp-3' && gpSum.s.retried === true && gpSum.s.v3Validation, 'E7: summary de la práctica guiada (2 ejercicios, 80 min, reintentada) validado por el servidor', gpSum && gpSum.s);
+      // Loop 10 C1: ejercicios distintos (2 tipos) y huellas acotadas en el summary del servidor (para los capítulos siguientes).
+      const fps = (gpSum && gpSum.s.v3Validation && gpSum.s.v3Validation.fingerprints) || [];
+      ok(new Set(gpSum.s.kinds || []).size === 2 && fps.length === 2 && fps.every((f) => f.title && /^(?:[0-9a-f]{8}){1,64}$/.test(f.sig)) && fps[0].title !== fps[1].title,
+        'E7: los 2 ejercicios guiados son de tipos distintos y el servidor guarda sus huellas (título + firma ≤ 64 hashes)', gpSum && { kinds: gpSum.s.kinds, fps });
       // Loop 9 B: + lo que necesita el restore en Moodle (moodle-E7): spec, perfiles y Manifest.
       results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applicationsList: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey),
         spec: C, modules: c.mods, assessment: c.assessment, manifestModules: M.modules, features: M.features, applications: apps.length, reviewCardsChapterIds: [], examBank: true,

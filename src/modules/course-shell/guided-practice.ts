@@ -82,6 +82,191 @@ export interface GuidedPracticeValidationContext {
 export interface GuidedPracticeAvoid {
   practiceChapterTitles: string[];
   applicationCases: { title: string | null; workshopTitle: string | null; names: string[] }[];
+  /**
+   * Loop 10 C1-b: huellas de los ejercicios guiados YA completados en el MISMO run (otros capítulos): título + firma
+   * compacta de la situación (guidedPracticeSignature). Acotado: ≤ GUIDED_PRACTICE_DISTINCT.previousMax ejercicios.
+   * Ausente = nada que comparar (runs anteriores al Loop 10 no tienen huellas: no se comparan).
+   */
+  previousExercises?: GuidedPracticePreviousExercise[];
+}
+
+/** Loop 10 C1-b: huella de un ejercicio guiado de otro capítulo del run. */
+export interface GuidedPracticePreviousExercise {
+  chapterId: string;
+  title: string;
+  /** Firma de la situación: hasta `signatureMax` hashes FNV-1a de 32 bits (8 hex cada uno), ordenados y concatenados. */
+  sig: string;
+}
+
+/**
+ * Loop 10 C1 — guardia de calidad de los ejercicios guiados (los minutos que se acreditan no se inflan con repetición):
+ *  a) en un documento: al menos 2 tipos (`kind`) distintos cuando hay 2+ ejercicios; ninguna pareja casi igual
+ *     (Jaccard de shingles de 3 palabras ≥ situationJaccard entre situaciones, o ≥ tasksJaccard entre consignas);
+ *  b) en el curso: ningún ejercicio repite el título de un ejercicio guiado de OTRO capítulo del run ni su situación
+ *     (Jaccard estimada con las firmas ≥ situationJaccard);
+ *  c) la respuesta modelo responde CADA consigna con contenido (cada tramo ≥ answerSegmentMin caracteres; sin
+ *     remisiones del tipo «ver la tabla del capítulo»).
+ * Espejo EXACTO en el ejecutor (DYN_GUIDED_PRACTICE_DISTINCT).
+ */
+export const GUIDED_PRACTICE_DISTINCT = Object.freeze({
+  shingleSize: 3,
+  situationJaccard: 0.5,
+  tasksJaccard: 0.6,
+  signatureMax: 64,
+  previousMax: 40,
+  answerSegmentMin: 60,
+  answerStubMaxChars: 160,
+});
+
+/** C1-c: tramo de respuesta que solo remite a otra parte («Ver la tabla del capítulo», «Consulta la sección 2»). */
+export const GUIDED_PRACTICE_ANSWER_STUB_RE = /\b(?:ver|v[eé]ase|consulta(?:r)?|revisa(?:r)?|rem[ií]tete)\b[^.\n]{0,40}\b(?:tabla|cuadro|secci[oó]n|cap[ií]tulo|apartado|texto|punto|respuesta)\b/i;
+
+/** Palabras normalizadas (minúsculas, sin tildes, solo [a-z0-9ñ]). Espejo de _dynGpWords. */
+export function guidedPracticeWords(t: unknown): string[] {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ]+/g, ' ').trim().split(' ').filter(Boolean);
+}
+
+/** Shingles de `shingleSize` palabras consecutivas (únicos, en orden de aparición). Menos palabras = un solo shingle. */
+export function guidedPracticeShingles(t: unknown): string[] {
+  const w = guidedPracticeWords(t);
+  const k = GUIDED_PRACTICE_DISTINCT.shingleSize;
+  if (!w.length) return [];
+  if (w.length < k) return [w.join(' ')];
+  const seen = new Set<string>();
+  for (let i = 0; i + k <= w.length; i++) seen.add(w.slice(i, i + k).join(' '));
+  return [...seen];
+}
+
+/** Jaccard de dos conjuntos de shingles (0 si alguno está vacío). */
+export function guidedPracticeJaccard(a: string[], b: string[]): number {
+  if (!a.length || !b.length) return 0;
+  const B = new Set(b);
+  const A = new Set(a);
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
+/** FNV-1a de 32 bits sobre las unidades UTF-16 (8 hex). Espejo de _dynGpHash. */
+export function guidedPracticeHash(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return ('0000000' + h.toString(16)).slice(-8);
+}
+
+function sigHashes(sig: unknown): string[] {
+  if (typeof sig !== 'string' || !/^(?:[0-9a-f]{8})*$/.test(sig)) return [];
+  const out: string[] = [];
+  for (let i = 0; i < sig.length && out.length < GUIDED_PRACTICE_DISTINCT.signatureMax; i += 8) out.push(sig.slice(i, i + 8));
+  return out;
+}
+
+/** Firma compacta de un texto: los `signatureMax` hashes más chicos de sus shingles (bottom-k), ordenados. */
+export function guidedPracticeSignature(t: unknown): string {
+  const hs = [...new Set(guidedPracticeShingles(t).map(guidedPracticeHash))].sort();
+  return hs.slice(0, GUIDED_PRACTICE_DISTINCT.signatureMax).join('');
+}
+
+/**
+ * Jaccard estimada entre dos firmas (estimador bottom-k): de los k hashes más chicos de la unión, la fracción que está
+ * en ambas. Exacta si los dos textos tienen ≤ k shingles.
+ */
+export function guidedPracticeSignatureJaccard(sigA: string, sigB: string): number {
+  const a = sigHashes(sigA);
+  const b = sigHashes(sigB);
+  if (!a.length || !b.length) return 0;
+  const A = new Set(a);
+  const B = new Set(b);
+  const union = [...new Set([...a, ...b])].sort().slice(0, GUIDED_PRACTICE_DISTINCT.signatureMax);
+  let both = 0;
+  for (const h of union) if (A.has(h) && B.has(h)) both++;
+  return both / union.length;
+}
+
+/** Huellas de los ejercicios de un documento (para el output_summary y el `avoid` de los capítulos siguientes). */
+export function guidedPracticeFingerprints(doc: unknown): { id: string | null; title: string; sig: string }[] {
+  if (!isObj(doc) || !Array.isArray((doc as any).exercises)) return [];
+  return ((doc as any).exercises as unknown[]).filter(isObj).map((e: any) => ({
+    id: typeof e.id === 'string' ? e.id : null,
+    title: String(e.title || '').slice(0, GUIDED_PRACTICE_LIMITS.titleMax),
+    sig: guidedPracticeSignature(e.situation),
+  }));
+}
+
+/**
+ * C1-c: los tramos de la respuesta modelo, uno por consigna (entre la marca «k.» y la siguiente). null si las marcas
+ * no están completas y en orden (eso ya lo informa GUIDED_PRACTICE_ANSWER_ORDER).
+ */
+export function guidedPracticeAnswerSegments(answer: string, taskCount: number): string[] | null {
+  const marks: { start: number; end: number }[] = [];
+  let from = 0;
+  for (let k = 1; k <= taskCount; k++) {
+    const re = new RegExp(`(?:^|\\n)[ \\t]*(?:consigna[ \\t]+)?${k}[.)][ \\t]`, 'gi');
+    re.lastIndex = from;
+    const m = re.exec(answer);
+    if (!m) return null;
+    marks.push({ start: m.index, end: m.index + m[0].length });
+    from = m.index + m[0].length;
+  }
+  return marks.map((m, i) => answer.slice(m.end, i + 1 < marks.length ? marks[i + 1].start : answer.length).trim());
+}
+
+/**
+ * C1-a: distinción DENTRO del documento (tipos y parejas casi iguales). Espejo de dynGuidedPracticeDistinctErrors.
+ */
+export function guidedPracticeDistinctErrors(doc: unknown): GuidedPracticeValidationError[] {
+  const out: GuidedPracticeValidationError[] = [];
+  if (!isObj(doc) || !Array.isArray((doc as any).exercises)) return out;
+  const xs = ((doc as any).exercises as unknown[]).map((e) => (isObj(e) ? e : null));
+  const D = GUIDED_PRACTICE_DISTINCT;
+  const kinds = xs.map((e) => (e && (GUIDED_PRACTICE_KINDS as readonly string[]).includes(e.kind) ? String(e.kind) : null));
+  if (xs.length >= 2 && kinds.every((k) => k !== null) && new Set(kinds).size < 2) {
+    out.push({ path: '$.exercises', code: 'GUIDED_PRACTICE_KIND_REPEATED', message: `los ${xs.length} ejercicios son del mismo tipo (${kinds[0]}): usa al menos 2 tipos distintos (${GUIDED_PRACTICE_KINDS.join(', ')})` });
+  }
+  const sit = xs.map((e) => (e ? guidedPracticeShingles(e.situation) : []));
+  const tasks = xs.map((e) => (e && Array.isArray(e.tasks) ? [...new Set(e.tasks.flatMap((t: unknown) => guidedPracticeShingles(t)))] as string[] : []));
+  const titles = xs.map((e) => (e ? guidedPracticeNormTitle(e.title) : ''));
+  for (let j = 1; j < xs.length; j++) {
+    if (!xs[j]) continue;
+    for (let i = 0; i < j; i++) {
+      if (!xs[i]) continue;
+      const p = `$.exercises[${j}]`;
+      if (titles[j] && titles[j] === titles[i]) { out.push({ path: `${p}.title`, code: 'GUIDED_PRACTICE_DUPLICATE', message: `${p}.title repite el título del ejercicio ${i + 1}: cada ejercicio es una situación distinta` }); break; }
+      const js = guidedPracticeJaccard(sit[i], sit[j]);
+      if (js >= D.situationJaccard) { out.push({ path: `${p}.situation`, code: 'GUIDED_PRACTICE_DUPLICATE', message: `${p}.situation es casi igual a la del ejercicio ${i + 1} (similitud ${js.toFixed(2)}): usa otra situación, con otras personas y otro problema` }); break; }
+      const jt = guidedPracticeJaccard(tasks[i], tasks[j]);
+      if (jt >= D.tasksJaccard) { out.push({ path: `${p}.tasks`, code: 'GUIDED_PRACTICE_DUPLICATE', message: `${p}.tasks son casi iguales a las del ejercicio ${i + 1} (similitud ${jt.toFixed(2)}): cada ejercicio pide un trabajo distinto` }); break; }
+    }
+  }
+  return out;
+}
+
+/**
+ * C1-b: choque DURO con un ejercicio guiado de OTRO capítulo del run (mismo título normalizado, o situación con
+ * Jaccard estimada ≥ situationJaccard). Espejo de dynGuidedPracticeRunClashes.
+ */
+export function guidedPracticeRunClashes(doc: unknown, avoid: GuidedPracticeAvoid | null | undefined): GuidedPracticeValidationError[] {
+  const out: GuidedPracticeValidationError[] = [];
+  const prev = avoid && Array.isArray(avoid.previousExercises) ? avoid.previousExercises.slice(0, GUIDED_PRACTICE_DISTINCT.previousMax) : [];
+  if (!prev.length || !isObj(doc) || !Array.isArray((doc as any).exercises)) return out;
+  const prevTitles = prev.map((x) => (isObj(x) ? guidedPracticeNormTitle(x.title) : ''));
+  ((doc as any).exercises as unknown[]).forEach((e, i) => {
+    if (!isObj(e)) return;
+    const p = `$.exercises[${i}]`;
+    const nt = guidedPracticeNormTitle(e.title);
+    const k = nt ? prevTitles.indexOf(nt) : -1;
+    if (k >= 0) { out.push({ path: `${p}.title`, code: 'GUIDED_PRACTICE_RUN_DUPLICATE', message: `${p}.title repite un ejercicio guiado de otro capítulo del curso («${prev[k].title}»): usa otra situación y otro título` }); return; }
+    const sig = guidedPracticeSignature(e.situation);
+    for (const x of prev) {
+      if (!isObj(x)) continue;
+      const j = guidedPracticeSignatureJaccard(sig, (x as any).sig);
+      if (j >= GUIDED_PRACTICE_DISTINCT.situationJaccard) { out.push({ path: `${p}.situation`, code: 'GUIDED_PRACTICE_RUN_DUPLICATE', message: `${p}.situation es casi igual a la de un ejercicio guiado de otro capítulo del curso («${x.title}», similitud ${j.toFixed(2)}): usa otra situación` }); return; }
+    }
+  });
+  return out;
 }
 
 /** Normalización de títulos (espejo EXACTO de _dynNormTitle del ejecutor). */
@@ -209,10 +394,20 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
     const ans = text(e.modelAnswer, `${p}.modelAnswer`, F.modelAnswerMin, L.modelAnswerMax);
     if (ans && taskCount >= L.tasksMin && !guidedPracticeAnswerCoversTasks(ans, taskCount)) {
       err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_ORDER', `${p}.modelAnswer debe responder las ${taskCount} consignas en orden, una por línea, cada una empezando con «1. », «2. », …`);
+    } else if (ans && taskCount >= L.tasksMin) {
+      // Loop 10 C1-c: cada consigna con una respuesta sustantiva (nunca «ver la tabla del capítulo»).
+      const segs = guidedPracticeAnswerSegments(ans, taskCount) || [];
+      const D = GUIDED_PRACTICE_DISTINCT;
+      const thin = segs.map((sg, k) => (sg.length < D.answerSegmentMin || (sg.length < D.answerStubMaxChars && GUIDED_PRACTICE_ANSWER_STUB_RE.test(sg)) ? k + 1 : 0)).filter(Boolean);
+      if (thin.length) err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_THIN', `${p}.modelAnswer no responde de verdad la(s) consigna(s) ${thin.join(', ')}: cada respuesta desarrolla el trabajo pedido (al menos ${D.answerSegmentMin} caracteres), nunca remite a otra parte («ver la tabla…»)`);
     }
   });
+  // Loop 10 C1-a: ejercicios distintos dentro del documento.
+  errors.push(...guidedPracticeDistinctErrors(doc));
   // Fix N1: el choque duro con los casos del módulo lo verifica también el servidor (no solo el ejecutor).
   errors.push(...guidedPracticeCaseClashes(doc, ctx.avoid));
+  // Loop 10 C1-b: ni repetir un ejercicio guiado de otro capítulo del run.
+  errors.push(...guidedPracticeRunClashes(doc, ctx.avoid));
   return errors;
 }
 
@@ -223,5 +418,7 @@ export function guidedPracticeSummary(doc: any): Record<string, unknown> {
     exerciseCount: xs.length,
     minutes: doc?.minutes ?? null,
     kinds: xs.map((e: any) => e?.kind ?? null),
+    // Loop 10 C1-b: huellas (título + firma de la situación) que los capítulos siguientes del run no repiten.
+    fingerprints: guidedPracticeFingerprints(doc),
   };
 }
