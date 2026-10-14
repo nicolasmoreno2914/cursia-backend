@@ -9,8 +9,12 @@
 //   b  hoja atascada: capítulo `stuck.chapterId` × `stuck.type` da como mucho `stuck.capacity` preguntas
 //      válidas «ingenuas»; las siguientes inventan evidencia SALVO que el pedido traiga la estrategia
 //      alternativa (marcador ESTRATEGIA ALTERNATIVA) → entonces salen válidas.
-//   c  capacidad agotada: igual que b, pero la estrategia alternativa TAMPOCO sirve.
-// b y c llevan además el ruido calibrado de a en todas las hojas.
+//   c  capacidad agotada: igual que b, pero la estrategia alternativa TAMPOCO sirve (un solo código: EVIDENCE).
+//   c2 capacidad agotada con códigos MEZCLADOS (EVIDENCE / SCHEMA / enunciado duplicado) — rev. I2.
+// b, c y c2 llevan además el ruido calibrado de a en todas las hojas. En b la estrategia alternativa sirve solo con
+// probabilidad `pB` por candidata (0,6; rev. I3), no siempre.
+// Ruido de formato (rev. I3, `noise: 'realistic'`, igual para el código actual y el nuevo): ids omitidos (3 %), lista a
+// medias (2 %), JSON inválido (2 %), respuesta truncada por max_tokens (1 %) y enunciado duplicado (3 %).
 //
 // Costo (USD) con la tabla real de Sonnet 4.6: salida por pregunta con los tokens medidos en #1542/#1353
 // (MC 660, V/F 265, EM 335); entrada = caracteres/3,6 (prefijo en caché: escritura la 1.ª llamada de cada
@@ -65,7 +69,9 @@ const PARAPHRASE = 'Es importante valorar con calma el contexto de la persona en
  * opts = { profile: 'a'|'b'|'c', seed, x (prob. base por código), refFix, stuck: { chapterId, type, capacity } }.
  */
 function createSimLlm(front, opts) {
-  const o = Object.assign({ x: 0.18, refFix: 0.5, profile: 'a' }, opts);
+  const o = Object.assign({ x: 0.18, refFix: 0.5, profile: 'a', pB: 0.6, noise: 'realistic' }, opts);
+  const NZ = o.noise === 'realistic' ? { omit: 0.03, partial: 0.02, badJson: 0.02, truncate: 0.01, dup: 0.03 } : { omit: 0, partial: 0, badJson: 0, truncate: 0, dup: 0 };
+  const firstStem = new Map(); // chapter|type → enunciado de la primera válida (para duplicados)
   const st = { calls: 0, repairCalls: 0, mainCalls: 0, strategyCalls: 0, questions: 0, outputTokens: 0, inTail: 0, cacheRead: 0, cacheWrite: 0, usd: 0, faults: {}, stuckValid: 0, warm: new Set(), unknownPrompts: 0 };
   const citCache = new Map();
   function citable(md) {
@@ -172,16 +178,30 @@ function createSimLlm(front, opts) {
     if (p.isRepair) st.repairCalls++; else st.mainCalls++;
     if (p.strategy) st.strategyCalls++;
     const rng = rngFor(fnv(`${o.seed}|${st.calls}`));
-    const qs = p.asks.map((ask) => {
+    const callR = rng();
+    let asks = p.asks;
+    if (callR < NZ.partial) asks = asks.slice(0, Math.ceil(asks.length / 2));
+    asks = asks.filter(() => rng() >= NZ.omit);
+    const qs = asks.map((ask) => {
       let fault = pickFault(rng, ask.type);
       if (p.refMode && fault === 'EVIDENCE' && rng() < o.refFix) fault = null;
-      if (o.stuck && o.profile !== 'a' && p.chapterId === o.stuck.chapterId && ask.type === o.stuck.type) {
-        if (o.profile === 'b' && p.strategy) fault = null;
-        else if (st.stuckValid >= o.stuck.capacity) fault = 'EVIDENCE';
+      const isStuck = o.stuck && o.profile !== 'a' && p.chapterId === o.stuck.chapterId && ask.type === o.stuck.type;
+      if (isStuck && st.stuckValid >= o.stuck.capacity) {
+        if (o.profile === 'b' && p.strategy) { if (rng() >= o.pB) fault = fault || 'EVIDENCE'; }
+        else if (o.profile === 'c2') fault = ['EVIDENCE', 'SCHEMA', 'DUP'][st.calls % 3];
+        else fault = 'EVIDENCE';
       }
+      let dupStem = false;
+      if (fault === 'DUP') { fault = null; dupStem = true; }
+      else if (!fault && rng() < NZ.dup) dupStem = true;
       if (fault) st.faults[fault] = (st.faults[fault] || 0) + 1;
       const q = build(ask, p, rng, { fault });
-      if (!fault && o.stuck && p.chapterId === o.stuck.chapterId && ask.type === o.stuck.type) st.stuckValid++;
+      const key = p.chapterId + '|' + ask.type;
+      if (dupStem && firstStem.has(key)) { q.stem = firstStem.get(key); st.faults.DUP = (st.faults.DUP || 0) + 1; }
+      else if (!fault) {
+        if (!firstStem.has(key)) firstStem.set(key, q.stem);
+        if (isStuck) st.stuckValid++;
+      }
       return q;
     });
     // Costo
@@ -193,7 +213,9 @@ function createSimLlm(front, opts) {
     const pre = Math.ceil(prefix / 3.6);
     let usd = outTok * PRICE.output + inTail * PRICE.input;
     if (!st.warm.has(key)) { st.warm.add(key); st.cacheWrite += pre; usd += pre * PRICE.cacheWrite; } else { st.cacheRead += pre; usd += pre * PRICE.cacheRead; }
-    st.questions += qs.length; st.outputTokens += outTok; if (p.isRepair) st.repairQuestions = (st.repairQuestions || 0) + qs.length; else st.mainQuestions = (st.mainQuestions || 0) + qs.length; st.inTail += inTail; st.usd += usd;
+    st.questions += qs.length; st.outputTokens += outTok;
+    if (callR >= NZ.partial && callR < NZ.partial + NZ.badJson) { st.faults.BAD_JSON = (st.faults.BAD_JSON || 0) + 1; st.usd += usd; return { text: '{"questions": [ esto no es JSON' }; }
+    if (callR >= NZ.partial + NZ.badJson && callR < NZ.partial + NZ.badJson + NZ.truncate) { st.faults.TRUNCATED = (st.faults.TRUNCATED || 0) + 1; st.usd += usd; return { text: JSON.stringify({ questions: qs }).slice(0, 200), stopReason: 'max_tokens' }; } if (p.isRepair) st.repairQuestions = (st.repairQuestions || 0) + qs.length; else st.mainQuestions = (st.mainQuestions || 0) + qs.length; st.inTail += inTail; st.usd += usd;
     return { text: JSON.stringify({ questions: qs }) };
   }
   return { respond, st, setAttempt: (a) => { o.attempt = a; }, citable };

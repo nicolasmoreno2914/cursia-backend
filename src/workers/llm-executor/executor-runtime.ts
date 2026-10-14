@@ -5,6 +5,9 @@ import { LLM_WORKER_MAX_TOKENS_CAP } from './server-llm';
 
 /** Exam-bank D: tokens de salida estimados por llamada del banco en el worker (el navegador usa 3.500). */
 export const EXAM_BANK_WORKER_OUTPUT_EST = 7000;
+/** max_tokens de esas llamadas: ~1,7× lo estimado (salida real medida ≈ 0,95× lo estimado). FinOps reserva cada llamada
+ *  a max_tokens: 12.000 (no el tope de 16.000) para no inflar las reservas pendientes ni el límite por parte. */
+export const EXAM_BANK_WORKER_MAX_TOKENS = 12000;
 
 /**
  * Loop 4 — corre el MISMO código de generación que el navegador (copia en vendor/dynamic-executor, sincronizada con
@@ -142,11 +145,11 @@ export function createExecutorRuntime(deps: ExecutorRuntimeDeps): ExecutorRuntim
   if (String(process.env.DYNAMIC_LLM_WORKER_EXAM_BANK || '').trim().toLowerCase() === 'off') ctx.DYN_EXAM_BANK_MODE_ENABLED = false;
   // Exam-bank D (#1353): el tope de 3.500 tokens estimados por llamada del banco existe por el corte de 100 s de
   // Cloudflare en el proxy del NAVEGADOR (#583, 524). El worker llama a Anthropic DIRECTO con streaming (sin ese corte;
-  // timeout total 15 min): partes de ≤ 7.000 tokens estimados con max_tokens 16.000 (= LLM_WORKER_MAX_TOKENS_CAP, ~2×
+  // timeout total 15 min): partes de ≤ 7.000 tokens estimados con max_tokens 12.000 (≤ LLM_WORKER_MAX_TOKENS_CAP; ~1,7×
   // de margen contra el corte por max_tokens). Mismas preguntas y mismas reglas; menos llamadas (el prefijo del
   // capítulo se paga una vez por llamada). El navegador sigue con 3.500 / 8.000.
   ctx.DYN_EXAM_BANK_MAX_OUTPUT_EST = EXAM_BANK_WORKER_OUTPUT_EST;
-  ctx.DYN_EXAM_BANK_CALL_MAX_TOKENS = LLM_WORKER_MAX_TOKENS_CAP;
+  ctx.DYN_EXAM_BANK_CALL_MAX_TOKENS = Math.min(EXAM_BANK_WORKER_MAX_TOKENS, LLM_WORKER_MAX_TOKENS_CAP);
   const runner = vm.runInContext('(function (j) { return _dynRunItem(JSON.parse(j)); })', ctx) as (j: string) => Promise<ExecutorRunResult>;
   return {
     run: (item) => runner(JSON.stringify(item)),

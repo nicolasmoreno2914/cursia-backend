@@ -59,11 +59,14 @@ ok(b.summary.banksWithIssues === 0, 'perfil b: bancos válidos (validateExamBank
 const c = sim('c', 6, ['--x', '0.21']);
 ok(c.summary.completed === 0 && (c.summary.failedByCode.EXAM_BANK_LEAF_CAPACITY || 0) === 6, `perfil c (capacidad agotada): las 6 corridas fallan con EXAM_BANK_LEAF_CAPACITY`, c.summary.failedByCode);
 ok(c.summary.attemptsOnCapacityFail <= 2, `perfil c: el corte llega en ≤ 2 intentos (máx. ${c.summary.attemptsOnCapacityFail})`);
-ok(c.runs.every((r) => /EXAM_BANK_LEAF_CAPACITY: .*× match 3\/4 .*estrategia alternativa/.test((r.perAttempt[r.perAttempt.length - 1] || {}).error || '')), 'perfil c: el mensaje nombra la hoja, el conteo y la estrategia alternativa');
+ok(c.runs.every((r) => /EXAM_BANK_LEAF_CAPACITY: .*× match [0-3]\/4 .*estrategia alternativa/.test((r.perAttempt[r.perAttempt.length - 1] || {}).error || '')), 'perfil c: el mensaje nombra la hoja, el conteo y la estrategia alternativa', c.runs.map((r) => ((r.perAttempt[r.perAttempt.length - 1] || {}).error || '').slice(0, 160)));
+// rev. I2: hoja imposible con códigos MEZCLADOS (evidencia / esquema / enunciado duplicado) → también corta en ≤ 2 intentos.
+const c2 = sim('c2', 6, ['--x', '0.21']);
+ok(c2.summary.completed === 0 && (c2.summary.failedByCode.EXAM_BANK_LEAF_CAPACITY || 0) === 6 && c2.summary.attemptsOnCapacityFail <= 2, `perfil c2 (capacidad agotada, códigos mezclados): las 6 corridas fallan con EXAM_BANK_LEAF_CAPACITY en ≤ 2 intentos (máx. ${c2.summary.attemptsOnCapacityFail})`, c2.summary.failedByCode);
 
-// Worker hospedado: partes de ≤ 7000 tokens estimados con max_tokens 16000 (el navegador sigue con 3500 / 8000).
+// Worker hospedado: partes de ≤ 7000 tokens estimados con max_tokens 12000 (el navegador sigue con 3500 / 8000).
 (async () => {
-  const { createExecutorRuntime, EXAM_BANK_WORKER_OUTPUT_EST } = require(path.join(REPO, 'dist/workers/llm-executor/executor-runtime.js'));
+  const { createExecutorRuntime, EXAM_BANK_WORKER_OUTPUT_EST, EXAM_BANK_WORKER_MAX_TOKENS } = require(path.join(REPO, 'dist/workers/llm-executor/executor-runtime.js'));
   const { LLM_WORKER_MAX_TOKENS_CAP } = require(path.join(REPO, 'dist/workers/llm-executor/server-llm.js'));
   const contract = require(path.join(REPO, 'dist/modules/course-shell/exam-bank.js'));
   const md = {};
@@ -83,7 +86,7 @@ ok(c.runs.every((r) => /EXAM_BANK_LEAF_CAPACITY: .*× match 3\/4 .*estrategia al
   const main = calls.filter((c) => !c.repair);
   const perCh = {};
   main.forEach((c) => { perCh[c.ch] = (perCh[c.ch] || 0) + 1; });
-  ok(EXAM_BANK_WORKER_OUTPUT_EST === 7000 && LLM_WORKER_MAX_TOKENS_CAP === 16000 && calls.length > 0 && calls.every((c) => c.maxTok === 16000), `worker: todas las llamadas del banco con max_tokens 16000 (${calls.length} llamadas)`, calls.slice(0, 3));
+  ok(EXAM_BANK_WORKER_OUTPUT_EST === 7000 && EXAM_BANK_WORKER_MAX_TOKENS === 12000 && EXAM_BANK_WORKER_MAX_TOKENS <= LLM_WORKER_MAX_TOKENS_CAP && calls.length > 0 && calls.every((c) => c.maxTok === 12000), `worker: todas las llamadas del banco con max_tokens 12000 (${calls.length} llamadas)`, calls.slice(0, 3));
   ok(Object.keys(perCh).length === 4 && Object.values(perCh).every((n) => n <= 2), `worker: primera pasada en partes de ≤ 7000 tokens estimados (llamadas por capítulo ${JSON.stringify(Object.values(perCh))}; el navegador usa 4)`, perCh);
   ok(r && r.ok === false && /^EXAM_BANK_/.test(r.error || ''), 'worker: un modelo que no devuelve preguntas nunca deja un banco aceptado (falla EXAM_BANK_*)', r && r.error);
   // D3 (corte sistémico): sin ninguna válida el pool no escala; la ronda sin válidas corta el intento.

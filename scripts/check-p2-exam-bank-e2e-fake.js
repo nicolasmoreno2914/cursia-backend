@@ -140,7 +140,7 @@ function validateArtifact(res, item, md) {
   const injected = (llm.st.examBank.faults[0] || {}).faults || {};
   const injIds = Object.keys(injected).sort();
   ok(Object.keys(injected).length === 6 && repairs.length === 1 && JSON.stringify(repairs[0].ids.slice(0, 2)) === JSON.stringify(injIds.slice(0, 2)) && repairs[0].ids.length > 2 && repairs[0].ids.length <= 10 && repairs[0].ids.every((id) => /^M1-C1-MC-\d+$/.test(id)),
-    'exam-bank D2: 6 rechazadas en la hoja MC (holgura 4) → UNA reparación con las 2 que faltan (las primeras en orden) + candidatas del pool de la MISMA hoja (≤ 5× el faltante)', { repairs, injected });
+    'exam-bank D2: 6 rechazadas en la hoja MC (holgura 4) → UNA reparación con las 2 que faltan (las primeras en orden) + candidatas del pool de la MISMA hoja (≤ 6× el faltante)', { repairs, injected });
   const rp = prompts.filter((p) => p.split('\n').includes('EXAM_BANK_REPAIR v2'));
   ok(rp.length === 1 && /EXAM_BANK_EVIDENCE/.test(rp[0]) && /EXAM_BANK_LENGTH_BIAS/.test(rp[0]) && /EXAM_BANK_POOL/.test(rp[0]) && !rp[0].includes('CANTIDADES ('), 'el prompt de reparación nombra los dos motivos (EVIDENCE y LENGTH_BIAS), marca las adicionales del pool y no repite las CANTIDADES');
   ok(prompts.every((p) => p.startsWith('EXAM_BANK_SOURCE v2\n')) && prompts.filter((p) => !p.includes('EXAM_BANK_REPAIR v2')).every((p) => p.split('\n').includes('EXAM_BANK_CHAPTER v2')), 'módulo: fuente del capítulo primero; llamadas principales EXAM_BANK_CHAPTER v2 (un capítulo por llamada)');

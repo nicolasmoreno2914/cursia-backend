@@ -6156,23 +6156,40 @@ function _dynEbCmpWords(s) { var c = _dynEbCompareText(s); return c ? c.split(' 
 var DYN_EXAM_REF_RE = /^S\d{1,4}$/;
 var DYN_EXAM_REF_TAG_RE = /\[S\d{1,4}\]/;
 var _DYN_EB_UNIT_SPLIT_RE = /(?<=[.!?…])\s+(?=[¿¡«"“(]?[\p{Lu}\p{N}])/u;
-function dynExamBankCitableIndex(md) {
+// Abreviaturas tras las que el corte de oración del guardia parte una oración real («art. 5», «Dr. Pérez»): el trozo
+// siguiente no se ofrece como fragmento (quedaría truncado), aunque siga siendo citable a mano como antes.
+var _DYN_EB_ABBREV_END_RE = /(?:^|[\s(])(?:art|arts|dr|dra|sr|sra|srta|núm|num|no|inc|lit|ej|pág|pag|cap|vol|ed|etc|aprox|tel|av|ud|uds)\.$/i;
+function dynExamBankCitableIndex(md, maxTags) {
   var src = String(md == null ? '' : md);
   var idx = dynExamEvidenceIndex(src);
   var lim = DYN_EXAM_BANK_LIMITS.evidence;
+  var cap = typeof maxTags === 'number' && maxTags >= 0 ? maxTags : Infinity;
   var refs = {};
   var list = [];
   var n = 0;
-  var lines = src.split('\n').map(function (line) {
+  var srcLines = src.split('\n');
+  var lines = srcLines.map(function (line, li) {
+    // Títulos y encabezados / separadores de tabla no son evidencia: sin marca.
+    if (/^[ \t>]*#{1,6}[ \t]/.test(line)) return line;
+    var isRow = /^[ \t]*\|/.test(line);
+    if (isRow && (/^[ \t]*\|?[ \t:|-]+\|?[ \t]*$/.test(line) || /^[ \t]*\|?[ \t:|-]+\|[ \t:|-]*$/.test(srcLines[li + 1] || ''))) return line;
     var r1 = line.replace(/^[ \t>]*(?:[-+*•‣◦▪]|\d{1,3}[.)])[ \t]+/, '');
     var r2 = r1.replace(/^[ \t>]*#{1,6}[ \t]+/, '');
     var body = r2.trim();
     if (!body) return line;
     var lead = line.slice(0, line.length - r2.length) + (/^\s*/.exec(r2) || [''])[0];
+    // Fila de tabla: la marca va DESPUÉS de la barra inicial (no rompe la tabla que lee el modelo).
+    var rowPipe = isRow && body.charAt(0) === '|' ? '| ' : '';
+    if (rowPipe) body = body.replace(/^\|[ \t]*/, '');
     var tagged = false;
+    var prev = '';
     var pieces = body.split(_DYN_EB_UNIT_SPLIT_RE).map(function (sent) {
       var t = sent.trim();
+      var after = prev;
+      prev = t;
       if (!t) return t;
+      if (_DYN_EB_ABBREV_END_RE.test(after)) return t;
+      if (n >= cap) return t;
       var clean = _dynEbCleanEvidence(t);
       if (clean.length < lim[0] || clean.length > lim[1] || DYN_EXAM_REF_TAG_RE.test(clean)) return t;
       if (!dynExamEvidenceSupport(idx, clean).ok) return t;
@@ -6183,7 +6200,7 @@ function dynExamBankCitableIndex(md) {
       tagged = true;
       return '[' + ref + '] ' + t;
     });
-    return tagged ? lead + pieces.join(' ') : line;
+    return tagged ? lead + rowPipe + pieces.join(' ') : line;
   });
   var byText = {};
   list.forEach(function (u) { if (!byText[dynNormalizeExamText(u.text)]) byText[dynNormalizeExamText(u.text)] = u.ref; });
@@ -6763,7 +6780,8 @@ var DYN_EXAM_BANK_TOKENS_EST = { multichoice: 660, truefalse: 265, match: 335 };
 // 3,1 → 5,4 por 2×2); una 3.ª ronda —solo los ids que faltan, prefijo en caché— casi siempre la completa.
 // Exam-bank D2: 4 rondas (la 4.ª solo corre en la cola: hojas que siguen bajo el piso) — con el pool, cerrar dentro del
 // intento cuesta una llamada; repetir el intento entero, decenas (#1353: 19 intentos extra, 104 llamadas).
-var DYN_EXAM_BANK_REPAIR_ROUNDS = 4;               // 2.ª–4.ª ronda solo para hojas bajo el piso (I2)
+var DYN_EXAM_BANK_REPAIR_ROUNDS = 4;
+var DYN_EXAM_BANK_POOL_ROUND_TOKENS = 14000;          // rev. M6: tope del pool por hoja y ronda (tokens de salida estimados)               // 2.ª–4.ª ronda solo para hojas bajo el piso (I2)
 var DYN_EXAM_BANK_CACHE_PREFIX = 'cursia.examBank.v1|';
 
 // Pool con concurrencia fija; al primer error deja de lanzar tareas nuevas.
@@ -7057,7 +7075,7 @@ async function _dynRunExamBank(item) {
     units.sort(function (a, b) { return chapters.findIndex(function (c) { return c.id === a.chapterId; }) - chapters.findIndex(function (c) { return c.id === b.chapterId; }); });
     units.forEach(function (unit) {
       dynExamBankSplitByTokens(unit.seq, DYN_EXAM_BANK_MAX_OUTPUT_EST).forEach(function (part, k) {
-        var ch = { index: chunks.length, unit: unit, first: k === 0, ids: part.map(function (x) { return x.id; }) };
+        var ch = { index: chunks.length, unit: unit, first: k === 0, ids: part.map(function (x) { return x.id; }), seqPart: part };
         ch.parts = _dynEbChunkParts(unit, part, false);
         // Fix round 1 (m6): la clave de caché usa el prompt SIN el bloque «NO REPITAS» (depende de qué exámenes
         // de módulo se conocen en ese momento); la llamada lo lleva al final (fuera del prefijo cacheado).
@@ -7093,6 +7111,27 @@ async function _dynRunExamBank(item) {
   }
   function bodyBytes(parts) { return dynExamBankBodyBytes(sys, dynExamBankUserContent(parts), maxTok); }
   // Ningún cuerpo puede pasar el límite del proxy: falla ANTES de gastar (no retryable: el texto no cambia).
+  var tagsReduced = 0;
+  // rev. M3: las marcas [S#] agrandan el prompt (~7 bytes por fragmento). Un capítulo que no cabe con todas las marcas
+  // se reintenta con MENOS marcas (las primeras del capítulo) antes de fallar; sin marcas = el texto de siempre.
+  chapters.forEach(function (c) {
+    var mine = chunks.filter(function (ch) { return ch.unit.chapterId === c.id; });
+    var over = function () { return mine.some(function (ch) { return bodyBytes(ch.callParts) > DYN_EXAM_BANK_MAX_BODY_BYTES; }); };
+    var tags = cit[c.id].list.length;
+    while (over() && tags > 0) {
+      var excess = Math.max.apply(null, mine.map(function (ch) { return bodyBytes(ch.callParts) - DYN_EXAM_BANK_MAX_BODY_BYTES; }));
+      tags = Math.max(0, tags - Math.max(10, Math.ceil(excess / 6)));
+      cit[c.id] = dynExamBankCitableIndex(md[c.id], tags);
+      infoCache[c.id] = null;
+      delete infoCache[c.id];
+      mine.forEach(function (ch) {
+        ch.parts = _dynEbChunkParts(ch.unit, ch.seqPart, false);
+        ch.prompt = dynExamBankPromptText(ch.parts);
+        ch.callParts = dynExamBankWithTail(ch.parts, ch.parts.tail + avoidFor(ch.unit));
+      });
+      tagsReduced++;
+    }
+  });
   var tooBig = chunks.filter(function (ch) { return bodyBytes(ch.callParts) > DYN_EXAM_BANK_MAX_BODY_BYTES; });
   if (tooBig.length) {
     return fail('EXAM_BANK_PROMPT_TOO_LARGE: el texto del capítulo ' + tooBig[0].unit.chapterId + ' no cabe en una llamada (' + bodyBytes(tooBig[0].callParts) + ' bytes > ' + DYN_EXAM_BANK_MAX_BODY_BYTES + ')', false);
@@ -7101,7 +7140,7 @@ async function _dynRunExamBank(item) {
   var stats = { calls: { main: 0, validation_retry: 0, continuation: 0 }, promptChars: 0, outputChars: 0, repairCallsFailed: 0, repairCallsSkipped: 0, cachedChunks: 0, splitRetries: 0, evidenceRelocated: 0, relocations: [], draftChunks: 0, moneyNormalized: 0,
     // Exam-bank D4 (instrumentación): evidencia por marca, candidatas del pool y de la estrategia alternativa, y la
     // primera pasada (pedidas / válidas por tipo) también cuando el intento falla.
-    evidenceByRef: 0, poolCandidates: 0, mintedIds: 0, strategyCandidates: 0, draftUnused: 0, firstPass: {} };
+    evidenceByRef: 0, poolCandidates: 0, mintedIds: 0, strategyCandidates: 0, draftUnused: 0, firstPass: {}, tagsReduced: tagsReduced };
   // Exam-bank D4: submotivos de rechazo por código (mensaje normalizado: sin cifras ni ids), los 6 más frecuentes.
   var rejectedDetail = {};
   function noteDetail(code, message) {
@@ -7209,10 +7248,11 @@ async function _dynRunExamBank(item) {
     var r0 = recordList().filter(function (r) { return r.leafIndex === li && !r.minted; })[0];
     return r0 ? r0.id.replace(/\d+$/, '') : null;
   }
+  var POOL_REASON = { code: 'EXAM_BANK_POOL', message: 'pregunta ADICIONAL para completar esta hoja: escribe una pregunta NUEVA, distinta de las aceptadas' };
   function addRecord(id, li, unit) {
     var first = chunks.filter(function (ch) { return ch.unit === unit; })[0];
     records[id] = { id: id, leafIndex: li, order: order++, type: plan[li].type, unit: unit, status: 'missing', minted: true,
-      reasons: [{ code: 'EXAM_BANK_POOL', message: 'pregunta ADICIONAL para completar esta hoja: escribe una pregunta NUEVA, distinta de las aceptadas' }],
+      reasons: [POOL_REASON],
       q: null, raw: null, combos: null, chunk: first ? first.index : 0, repaired: false };
     return records[id];
   }
@@ -7266,21 +7306,27 @@ async function _dynRunExamBank(item) {
   function chunkHasValid(ch) { return ch.ids.some(function (id) { return records[id].status === 'valid'; }); }
   // D3: memoria por hoja (se llena desde el borrador antes de reparar); existe desde ya porque una falla de la
   // generación (EXAM_BANK_GENERATION_FAILED) también arma el borrador.
-  var hist = {};
+  var hist = Object.create(null);
   var a = null;
   if (draft.leafHistory) {
+    // rev. M4: memoria del borrador saneada — solo claves de hojas del plan, números enteros acotados, textos con tope
+    // (van al prompt de reparación) y objeto sin prototipo.
+    var planKeys = {};
+    plan.forEach(function (leaf) { planKeys[_dynEbOwnerOf(leaf) + '|' + leaf.type] = true; });
+    var nInt = function (v) { return typeof v === 'number' && isFinite(v) && v > 0 ? Math.min(Math.floor(v), 10000) : 0; };
+    var str = function (v, n) { return typeof v === 'string' ? v.slice(0, n) : null; };
     Object.keys(draft.leafHistory).forEach(function (k) {
+      if (!Object.prototype.hasOwnProperty.call(planKeys, k)) return;
       var h = draft.leafHistory[k];
       if (!_dynIsPlainObject(h)) return;
-      var sc0 = {};
-      if (_dynIsPlainObject(h.stratCodes)) Object.keys(h.stratCodes).slice(0, 20).forEach(function (c) { var v = h.stratCodes[c]; if (typeof v === 'number' && v > 0) sc0[String(c).slice(0, 60)] = Math.floor(v); });
-      hist[k] = { stuck: h.stuck | 0, strategy: h.strategy === true, strategyFails: h.strategyFails | 0, sig: typeof h.sig === 'string' ? h.sig.slice(0, 60) : null, capacity: false,
-        tried: h.tried | 0, triedStrategy: h.triedStrategy | 0, stratCodes: sc0,
-        rejectedRefs: Array.isArray(h.rejectedRefs) ? h.rejectedRefs.filter(function (x) { return typeof x === 'string'; }).slice(-40) : [],
-        rejectedTerms: Array.isArray(h.rejectedTerms) ? h.rejectedTerms.filter(Array.isArray).map(function (t) { return t.filter(function (x) { return typeof x === 'string'; }).slice(0, 6); }).slice(-12) : [] };
+      var sc0 = Object.create(null);
+      if (_dynIsPlainObject(h.stratCodes)) Object.keys(h.stratCodes).slice(0, 20).forEach(function (c) { var v = nInt(h.stratCodes[c]); if (v && /^[A-Z_]{1,60}$/.test(c)) sc0[c] = v; });
+      hist[k] = { stuck: nInt(h.stuck), strategy: h.strategy === true, strategyFails: nInt(h.strategyFails), sig: typeof h.sig === 'string' && /^[A-Z_]{1,60}$/.test(h.sig) ? h.sig : null, capacity: false,
+        tried: nInt(h.tried), triedStrategy: nInt(h.triedStrategy), noProgressAttempts: nInt(h.noProgressAttempts), stratCodes: sc0,
+        rejectedRefs: Array.isArray(h.rejectedRefs) ? h.rejectedRefs.filter(function (x) { return typeof x === 'string' && DYN_EXAM_REF_RE.test(x); }).slice(-40) : [],
+        rejectedTerms: Array.isArray(h.rejectedTerms) ? h.rejectedTerms.filter(Array.isArray).map(function (t) { return t.filter(function (x) { return typeof x === 'string'; }).map(function (x) { return x.slice(0, 40); }).slice(0, 6); }).slice(-12) : [] };
     });
   }
-
   // Generación: caché validada / borrador → si no, una llamada por parte; truncada → la parte se pide
   // PARTIDA EN DOS (validation_retry); JSON inválido → UN reintento del mismo tamaño.
   // BANKOPT (opción 2): la PRIMERA parte de cada capítulo sale antes que sus hermanas; las hermanas
@@ -7289,7 +7335,7 @@ async function _dynRunExamBank(item) {
   units.forEach(function (u, i) { u._key = i; var res; warm[i] = { p: new Promise(function (r) { res = r; }) }; warm[i].done = res; });
   async function runChunk(ch) {
     var cached = _dynEbCacheGet(cacheKey(ch));
-    if (cached) { stats.cachedChunks++; ingest(cached, idSet(ch.ids), false, true); return; }
+    if (cached) { stats.cachedChunks++; ch.fromCache = true; ingest(cached, idSet(ch.ids), false, true); return; }
     if (draft.questions && chunkHasValid(ch)) { stats.draftChunks++; ch.skippedByDraft = true; return; }
     var res = await callJson('main', ch.callParts);
     if (res.ok) { ingest(res.questions, idSet(ch.ids), false); saveChunk(ch); return; }
@@ -7306,7 +7352,10 @@ async function _dynRunExamBank(item) {
         parts = dynExamBankWithTail(ch.callParts, ch.callParts.tail + '\n\nTU RESPUESTA ANTERIOR NO SE PUDO USAR (' + res.error + '). Devuelve el JSON COMPLETO y válido { "questions": [...] } con todas las preguntas pedidas.');
       }
       var r2 = await callJson('validation_retry', parts);
-      if (!r2.ok) throw { examBankFail: true, msg: 'EXAM_BANK_GENERATION_FAILED: la parte ' + (ch.index + 1) + '/' + chunks.length + ' (' + ids[0] + '…) falló dos veces: ' + r2.error };
+      // Exam-bank D2: una parte que falla dos veces (JSON inválido / truncada) ya no tumba el intento entero: sus ids
+      // quedan FALTANTES y la reparación con pool los cubre en este mismo intento (el banco nunca sale corto: si no
+      // alcanzan, EXAM_BANK_INCOMPLETE con borrador como siempre).
+      if (!r2.ok) { stats.mainPartsFailed = (stats.mainPartsFailed || 0) + 1; console.warn('[dynExecutor:' + item.type + '] ' + item.itemKey + ' parte ' + (ch.index + 1) + '/' + chunks.length + ' falló dos veces (' + r2.error + '): la cubre la reparación'); continue; }
       ingest(r2.questions, idSet(ids), false);
       saveChunk(ch);
     }
@@ -7328,7 +7377,11 @@ async function _dynRunExamBank(item) {
   recordList().forEach(function (r) {
     if (r.status !== 'missing') return;
     if (chunks[r.chunk] && chunks[r.chunk].skippedByDraft) stats.draftUnused++;
-    else _dynEbCount(rejectedByCode, 'EXAM_BANK_MISSING');
+    else {
+      _dynEbCount(rejectedByCode, 'EXAM_BANK_MISSING');
+      // D4 (rev. M10): una pregunta pedida y no devuelta cuenta en el rendimiento de la primera pasada (como inválida).
+      if (!(chunks[r.chunk] && chunks[r.chunk].fromCache)) { var fpm = stats.firstPass[r.type] = stats.firstPass[r.type] || { returned: 0, valid: 0 }; fpm.returned++; }
+    }
   });
   if (!rejectedByCode.EXAM_BANK_MISSING) delete rejectedByCode.EXAM_BANK_MISSING;
 
@@ -7337,13 +7390,14 @@ async function _dynRunExamBank(item) {
   // una por parte); nunca más de una llamada de reparación por parte y ronda. Con la holgura,
   // solo se piden los ids que faltan para el objetivo (dynExamBankAssemble → short[].repairs).
   a = assemble();
+  var keptAtStart = a.perLeaf.map(function (r) { return r.kept; }); // rev. I2: avance de cada hoja en ESTE intento
   // ── Exam-bank D2/D3: reparación con pool, memoria por hoja y estrategia alternativa ──
   // Ronda 1 = hojas bajo 2·slots (+ capítulos sin preguntas en el final); rondas 2+ = solo hojas bajo el piso.
-  // D2: por cada hoja corta se piden faltante / rendimiento medido (+1) candidatas (entre faltante+2 y 5×faltante)
+  // D2: por cada hoja corta se piden faltante / rendimiento medido (+1) candidatas (entre faltante+2 y 6×faltante; ×2 desde la 2.ª ronda; tope 2 llamadas por hoja y ronda)
   //     y el ensamblado conserva las mejores 2·slots (duplicados, balance V/F y rangos como siempre).
   // D3: memoria por hoja (fragmentos y términos ya usados o rechazados) en cada reparación. Una hoja que no avanza
   //     en una ronda pasa a la ESTRATEGIA ALTERNATIVA (otro fragmento, otra situación, marcas aún no usadas); si con
-  //     ella tampoco avanza en 2 rondas con la misma firma (≥ 4 candidatas), la hoja queda AGOTADA: no se gasta más
+  //     ella tampoco avanza en 2 rondas con la misma firma (≥ 10 candidatas, ≥ 80 % mismo código) — o en 2 intentos enteros con ella (≥ 20 candidatas) —, la hoja queda AGOTADA: no se gasta más
   //     y el intento falla con EXAM_BANK_LEAF_CAPACITY (clase D: sin reintentos automáticos). La memoria viaja en el
   //     borrador, así que el diagnóstico se completa a más tardar en el 2.º intento.
   function leafKey(li) { return _dynEbOwnerOf(plan[li]) + '|' + plan[li].type; }
@@ -7402,13 +7456,15 @@ async function _dynRunExamBank(item) {
       base.forEach(function (fix) { if (inEntries[fix.id]) return; entries.push(Object.assign({ li: s.leafIndex }, fix)); inEntries[fix.id] = true; });
       var need = Math.max(0, s.need || 0);
       if (need > 0) {
-        // Desde la 2.ª ronda la hoja ya falló una vez con el pool: 1,5× más candidatas (mismo tope de 5×faltante).
         // Desde la 2.ª ronda la hoja ya falló una vez con el pool: el doble de candidatas (tope 6×faltante).
         var ty = plan[s.leafIndex].type;
         var want = Math.min(6 * need, Math.max(need + 2, Math.ceil((round >= 2 ? 2 : 1) * need / Math.max(typeYield(ty), 0.2)) + 1));
         // Rendimiento medido < 5 % (≥ 8 muestras): el modelo no produce (no es una hoja difícil); más candidatas no lo
         // arreglan → sin pool. Un rendimiento bajo pero real (p. ej. 20 %) sí recibe el pool completo.
         if (typeSamples(ty) >= 8 && typeYield(ty) < 0.05) want = need + 2;
+        // rev. M6: tope por hoja y ronda = 14.000 tokens estimados (2 llamadas del worker, 4 del navegador; nunca menos que
+        // faltante + 2): acota el peor caso sin depender del tamaño de llamada de cada ejecutor.
+        want = Math.min(want, Math.max(need + 2, Math.floor(DYN_EXAM_BANK_POOL_ROUND_TOKENS / (DYN_EXAM_BANK_TOKENS_EST[ty] || 600))));
         // Prototipos = pedidos por faltante (no los reemplazos de una «solo más larga» ya conservada).
         var protos = base.filter(function (fix) { return records[fix.id].status !== 'valid' || !keptIds[fix.id]; });
         if (!protos.length) protos = base;
@@ -7466,7 +7522,7 @@ async function _dynRunExamBank(item) {
         var parts = repairParts(accepted, memory);
         if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) parts = repairParts([], memory);
         if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) parts = repairParts([], '');
-        if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) { stats.repairCallsSkipped++; return; }
+        if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) { stats.repairCallsSkipped++; c.list.forEach(function (x) { callFailedIds[x.id] = true; }); return; }
         var res = await callJson('continuation', parts);
         // Una llamada que no sirvió (JSON inválido, truncada) no es evidencia sobre la hoja: sus ids no cuentan como faltantes.
         if (!res.ok) { stats.repairCallsFailed++; c.list.forEach(function (x) { callFailedIds[x.id] = true; }); return; }
@@ -7476,13 +7532,26 @@ async function _dynRunExamBank(item) {
     }), DYN_EXAM_BANK_CONCURRENCY);
     var log = roundLog;
     roundLog = null;
-    // D3: un id pedido que el modelo no devolvió (o una llamada que no sirvió) también es un intento fallido de la
-    // hoja (EXAM_BANK_MISSING): un modelo que no devuelve preguntas no escala el pool sin fin; corta por firma.
+    // D3: un id pedido que el modelo no devolvió también es un intento sin progreso de la hoja (EXAM_BANK_MISSING),
+    // pero NO es evidencia contra el capítulo: no entra en la firma ni en las candidatas que deciden la capacidad
+    // (rev. I1). Una llamada fallida u omitida por tamaño no cuenta en nada.
     entries.forEach(function (fix) {
       if (callFailedIds[fix.id]) return;
       var li = fix.li != null ? fix.li : records[fix.id].leafIndex;
       var got = (log[li] || []).some(function (t) { return t.id === fix.id; });
-      if (!got) (log[li] = log[li] || []).push({ id: fix.id, ok: false, code: 'EXAM_BANK_MISSING', ref: null, terms: null });
+      if (!got) {
+        (log[li] = log[li] || []).push({ id: fix.id, ok: false, code: 'EXAM_BANK_MISSING', ref: null, terms: null });
+        // rev. M5: un id del pool pedido y no devuelto se vuelve a pedir como faltante, no como «adicional».
+        if (records[fix.id] && records[fix.id].status !== 'valid') records[fix.id].reasons = [{ code: 'EXAM_BANK_MISSING', message: 'no se devolvió esta pregunta' }];
+      }
+    });
+    a = assemble();
+    // rev. I2: una candidata válida que el ensamblado descartó (duplicado / casi duplicado) también es un intento fallido.
+    Object.keys(log).forEach(function (k) {
+      log[k].forEach(function (t) {
+        var rec = records[t.id];
+        if (t.ok && rec && rec.status !== 'valid') { t.ok = false; t.code = (rec.reasons && rec.reasons[0] && rec.reasons[0].code) || 'EXAM_BANK_DUPLICATE'; }
+      });
     });
     Object.keys(log).forEach(function (k) {
       log[k].forEach(function (t) {
@@ -7492,7 +7561,6 @@ async function _dynRunExamBank(item) {
         if (t.ok) rp.valid++;
       });
     });
-    a = assemble();
     // Falla sistémica: el rendimiento de TODO el intento (primera pasada + reparaciones, todos los tipos) es < 5 % con
     // ≥ 20 muestras → modelo o servicio que no produce; no se sigue escalando dentro del intento (queda el borrador y
     // decide la recuperación normal; nunca un banco corto). Una hoja difícil con rendimiento bajo pero real no corta.
@@ -7500,6 +7568,7 @@ async function _dynRunExamBank(item) {
     var allV = 0;
     [stats.firstPass, repairPass].forEach(function (src) { Object.keys(src).forEach(function (t) { allN += src[t].returned || 0; allV += src[t].valid || 0; }); });
     var systemic = allN >= 20 && allV < 0.05 * allN;
+    if (systemic) { stats.systemicStop = round; break; } // rev. I1: una ronda sistémica no actualiza la memoria de ninguna hoja
     Object.keys(leafInfo).forEach(function (k) {
       var li = Number(k);
       var h = H(li);
@@ -7507,24 +7576,27 @@ async function _dynRunExamBank(item) {
       var row = a.perLeaf[li];
       var tries = log[li] || [];
       if (!tries.length) return; // sin respuesta del modelo (llamada fallida u omitida): no es evidencia de nada
-      h.tried += tries.length;
-      if (info.strategy) h.triedStrategy += tries.length;
-      tries.forEach(function (t) { if (!t.ok) { if (t.ref) h.rejectedRefs.push(t.ref); if (t.terms && t.terms.length) h.rejectedTerms.push(t.terms); } });
+      var real = tries.filter(function (t) { return t.code !== 'EXAM_BANK_MISSING'; });
+      h.tried += real.length;
+      if (info.strategy) { h.triedStrategy += real.length; if (!h.strategyUsedThisAttempt) { h.strategyUsedThisAttempt = true; h.keptAtStrategy = info.keptBefore; } }
+      real.forEach(function (t) { if (!t.ok) { if (t.ref) h.rejectedRefs.push(t.ref); if (t.terms && t.terms.length) h.rejectedTerms.push(t.terms); } });
       h.rejectedRefs = h.rejectedRefs.slice(-40);
       h.rejectedTerms = h.rejectedTerms.slice(-12);
       if (row.kept >= row.target || row.kept > info.keptBefore) { h.stuck = 0; h.strategyFails = 0; return; }
+      if (!real.length) return; // solo omisiones: la hoja no avanzó, pero nada dice que el capítulo no alcance
       var codes = {};
-      tries.forEach(function (t) { if (!t.ok) codes[t.code] = (codes[t.code] || 0) + 1; });
+      real.forEach(function (t) { if (!t.ok) codes[t.code] = (codes[t.code] || 0) + 1; });
       var dom = Object.keys(codes).sort(function (x, y) { return codes[y] - codes[x]; })[0] || 'EXAM_BANK_DUPLICATE';
       if (info.strategy) {
         h.strategyFails = (h.strategyFails === 0 || h.sig === dom) ? h.strategyFails + 1 : 1;
         h.sig = dom;
         var sc = h.stratCodes = h.stratCodes || {};
-        tries.forEach(function (t) { if (!t.ok) sc[t.code] = (sc[t.code] || 0) + 1; });
+        real.forEach(function (t) { if (!t.ok) sc[t.code] = (sc[t.code] || 0) + 1; });
         var scTotal = Object.keys(sc).reduce(function (t, c) { return t + sc[c]; }, 0);
-        // AGOTADA solo con una FIRMA sistemática: 2 rondas con la estrategia alternativa sin avanzar, ≥ 10 candidatas
-        // con ella y ≥ 80 % de sus rechazos con el mismo código. El ruido de una hoja de bajo rendimiento (códigos
-        // mezclados) nunca la corta: sigue reparando y, si hace falta, sigue en el próximo intento con la memoria.
+        // AGOTADA por FIRMA sistemática: 2 rondas con la estrategia alternativa sin avanzar, ≥ 10 candidatas
+        // (respondidas) con ella y ≥ 80 % de sus rechazos con el mismo código. El ruido de una hoja de bajo rendimiento
+        // (códigos mezclados) no la corta aquí; la regla por intentos (abajo, rev. I2) cubre las hojas imposibles con
+        // códigos mezclados.
         if (h.strategyFails >= 2 && h.triedStrategy >= 10 && scTotal > 0 && (sc[dom] || 0) >= 0.8 * scTotal) h.capacity = true;
       } else {
         h.stuck++;
@@ -7532,7 +7604,21 @@ async function _dynRunExamBank(item) {
         h.strategy = true;
       }
     });
-    if (systemic) { stats.systemicStop = round; break; }
+  }
+  // rev. I2 — regla independiente del código: una hoja bajo el piso que, con la estrategia alternativa activa, no
+  // avanzó NADA en 2 intentos completos (≥ 20 candidatas respondidas con ella) queda AGOTADA. Con el borrador, el
+  // segundo intento ya empieza en la estrategia alternativa: el corte llega a más tardar al final del 2.º intento.
+  if (a) {
+    a.perLeaf.forEach(function (row, li) {
+      var h = hist[leafKey(li)];
+      if (!h || row.kept >= row.floor) { if (h) h.noProgressAttempts = 0; return; }
+      if (!h.strategyUsedThisAttempt) return;
+      // Avance desde que la estrategia alternativa empezó en ESTE intento (no desde el inicio: lo ganado antes de
+      // cambiar de enfoque no cuenta como avance de la estrategia).
+      if (row.kept > (h.keptAtStrategy != null ? h.keptAtStrategy : (keptAtStart[li] || 0))) { h.noProgressAttempts = 0; return; }
+      h.noProgressAttempts = (h.noProgressAttempts | 0) + 1;
+      if (h.noProgressAttempts >= 2 && h.triedStrategy >= 20) { h.capacity = true; if (!h.sig) h.sig = 'sin avance en 2 intentos'; }
+    });
   }
   var repairedCount = recordList().filter(function (r) { return r.repaired && r.status === 'valid'; }).length;
 
@@ -7563,13 +7649,13 @@ async function _dynRunExamBank(item) {
     Object.keys(hist).forEach(function (k) {
       var h = hist[k];
       if (!h.tried && !h.strategy) return;
-      out[k] = { stuck: h.stuck, strategy: h.strategy, strategyFails: h.strategyFails, sig: h.sig, tried: h.tried, triedStrategy: h.triedStrategy, stratCodes: h.stratCodes || {}, rejectedRefs: h.rejectedRefs.slice(-40), rejectedTerms: h.rejectedTerms.slice(-12) };
+      out[k] = { stuck: h.stuck, strategy: h.strategy, strategyFails: h.strategyFails, sig: h.sig, tried: h.tried, triedStrategy: h.triedStrategy, noProgressAttempts: h.noProgressAttempts | 0, stratCodes: h.stratCodes || {}, rejectedRefs: h.rejectedRefs.slice(-40), rejectedTerms: h.rejectedTerms.slice(-12) };
     });
     return out;
   }
   function diagnosticsOut() {
     return { rejectedByCode: rejectedByCode, rejectedDetail: topDetail(), firstPass: stats.firstPass, repairPass: repairPass, calls: stats.calls,
-      poolCandidates: stats.poolCandidates, mintedIds: stats.mintedIds, strategyCandidates: stats.strategyCandidates, evidenceByRef: stats.evidenceByRef, draftUnused: stats.draftUnused, systemicStop: stats.systemicStop || null,
+      poolCandidates: stats.poolCandidates, mintedIds: stats.mintedIds, strategyCandidates: stats.strategyCandidates, evidenceByRef: stats.evidenceByRef, draftUnused: stats.draftUnused, systemicStop: stats.systemicStop || null, mainPartsFailed: stats.mainPartsFailed || 0, tagsReduced: stats.tagsReduced || 0,
       perLeaf: (a ? a.perLeaf : []).map(function (l) { return { owner: l.owner, type: l.type, slots: l.slots, kept: l.kept, requested: l.requested, accepted: l.accepted, acceptedAfterRepair: l.acceptedAfterRepair }; }) };
   }
   function detailTail() {
@@ -7639,6 +7725,8 @@ async function _dynRunExamBank(item) {
     strategyCandidates: stats.strategyCandidates,
     evidenceByRef: stats.evidenceByRef,
     draftUnused: stats.draftUnused,
+    mainPartsFailed: stats.mainPartsFailed || 0,
+    tagsReduced: stats.tagsReduced || 0,
     leafHistory: leafHistoryOut(),
     distractorsDroppedByCode: droppedByCode,
     repaired: repairedCount,

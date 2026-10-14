@@ -73,8 +73,8 @@ async function oneRun(seed) {
   f.DYN_EXAM_BANK_MODE_ENABLED = true;
   f.DYN_LLM_BACKOFF_BASE_MS = 1;
   // --worker 1: mismos ajustes que el worker hospedado (executor-runtime.ts) — partes de ≤ 7000 tokens estimados.
-  if (args.worker === '1') { f.DYN_EXAM_BANK_MAX_OUTPUT_EST = 7000; f.DYN_EXAM_BANK_CALL_MAX_TOKENS = 16000; }
-  llm = createSimLlm(f, { profile: PROFILE, seed, x: X, refFix: REF_FIX, stuck: STUCK });
+  if (args.worker === '1') { f.DYN_EXAM_BANK_MAX_OUTPUT_EST = 7000; f.DYN_EXAM_BANK_CALL_MAX_TOKENS = 12000; }
+  llm = createSimLlm(f, { profile: PROFILE, seed, x: X, refFix: REF_FIX, stuck: STUCK, noise: args.noise || 'realistic', pB: args.pB != null ? Number(args.pB) : 0.6 });
   const drafts = {};
   f._dynDownloadArtifactText = async (id) => {
     if (id && id.startsWith('md:') && MD[id.slice(3)]) return { ok: true, text: MD[id.slice(3)] };
@@ -118,7 +118,7 @@ async function oneRun(seed) {
   const codes = {};
   res.filter((r) => !r.ok).forEach((r) => { codes[r.code] = (codes[r.code] || 0) + 1; });
   const summary = {
-    fe: FE, worker: args.worker === '1', profile: PROFILE, runs: RUNS, x: X, refFix: REF_FIX, maxAttempts: MAX_ATTEMPTS,
+    fe: FE, worker: args.worker === '1', noise: args.noise || 'realistic', profile: PROFILE, runs: RUNS, x: X, refFix: REF_FIX, maxAttempts: MAX_ATTEMPTS,
     firstAttemptCompletion: pct(res.filter((r) => r.firstAttemptOk).length),
     completed: pct(res.filter((r) => r.ok).length),
     failedByCode: codes,
