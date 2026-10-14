@@ -783,7 +783,7 @@ function reservationBookkeeping(ev) {
       eq(kinds.map((k) => llm.st.retriesSeen[k] || 0), kinds.map(() => 1), 'cada respuesta inválida produjo EXACTAMENTE 1 reintento dirigido (validation_retry / continuation) y luego pasó');
       // P2-B6 (A2): bancos — falla inyectada una vez (más rechazos que la holgura de la hoja, BANKOPT),
       // EXACTAMENTE una reparación con lo que falta, y el item que la recibió la registra (rechazos
-      // EVIDENCE + LENGTH_BIAS, 2 reparadas); ningún otro banco necesitó reparación.
+      // EVIDENCE + LENGTH_BIAS; con el pool de D2, ≥ 2 reparadas); ningún otro banco necesitó reparación.
       // BANKOPT (caché): todo prompt de banco llegó como [fuente+cache_control, tarea+cache_control, tail].
       const shapes = (llm.st.examBank && llm.st.examBank.blockShapes) || [];
       ok(shapes.length > 0 && shapes.every((x) => JSON.stringify(x) === JSON.stringify(['ephemeral', 'ephemeral', null])), `bancos: ${shapes.length} prompts con cache_control en fuente y tarea`, shapes.slice(0, 5));
@@ -792,8 +792,9 @@ function reservationBookkeeping(ev) {
       ok(repairs.length === 1 && (llm.st.examBank.faults || []).length === 1, `bancos: exam_bank_repair registrado UNA vez (${bankCalls.length} llamadas de banco al LLM falso, ${repairs.length} reparación)`, { repairs, faults: llm.st.examBank.faults });
       const bankSums = COURSES.filter((C) => C.examBank).flatMap((C) => (results.courses[C.key].examBankSummaries || []).map((x) => ({ course: C.key, ...x })));
       const repairedItems = bankSums.filter((x) => (x.repaired || 0) > 0 || ((x.calls || {}).continuation || 0) > 0);
-      ok(repairedItems.length === 1 && repairedItems[0].repaired === 2 && repairedItems[0].calls.continuation === 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_EVIDENCE >= 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_LENGTH_BIAS >= 1,
-        `bancos: la reparación quedó en UN solo item (${repairedItems.map((x) => `${x.course} ${x.itemKey}`).join(', ')}): rechazos EVIDENCE + LENGTH_BIAS, 2 preguntas reparadas en 1 llamada`, repairedItems);
+      // Exam-bank D2: la falla inyectada (6 > holgura 4) deja 2 por cubrir; la UNA reparación las pide con candidatas del pool.
+      ok(repairedItems.length === 1 && repairedItems[0].repaired >= 2 && repairedItems[0].poolCandidates >= 2 && repairedItems[0].calls.continuation === 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_EVIDENCE >= 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_LENGTH_BIAS >= 1 && repairedItems[0].evidenceByRef > 0,
+        `bancos: la reparación quedó en UN solo item (${repairedItems.map((x) => `${x.course} ${x.itemKey}`).join(', ')}): rechazos EVIDENCE + LENGTH_BIAS, ${repairedItems.length ? repairedItems[0].repaired : 0} preguntas reparadas (faltante 2 + pool) en 1 llamada; evidencia por marca [S#]`, repairedItems);
       ok(bankSums.length === COURSES.filter((C) => C.examBank).reduce((n, C) => n + C.modules.filter((m) => m.exam).length + (C.finalExam ? 1 : 0), 0),
         `bancos: ${bankSums.length} evaluaciones como banco en E1/E3 (todas las de esos cursos)`, bankSums.map((x) => x.itemKey));
       results.counters.examBank = { calls: bankCalls.length, repairs: repairs.length, faults: llm.st.examBank.faults, items: bankSums.map((x) => ({ course: x.course, itemKey: x.itemKey, bankSize: x.bankSize, slots: x.slots, repaired: x.repaired, rejectedByCode: x.rejectedByCode, correctLongestShare: x.correctLongestShare })) };

@@ -623,10 +623,10 @@ async function main() {
     }
   });
 
-  await check('BANKOPT: bankAskCount = lo que pide el ejecutor (MC 2s+2, V/F y EM 2s+1), nunca más que bankMax; el banco subido sigue con bankTarget', () => {
+  await check('Exam-bank D2: bankAskCount = lo que pide el ejecutor (MC 2s+4, V/F y EM 2s+2: pool de candidatas, más que bankTarget); el banco subido sigue con bankTarget ≤ bankMax', () => {
     for (const sl of [1, 2, 5, 12]) {
-      eq([EB.bankAskCount(sl, 'multichoice'), EB.bankAskCount(sl, 'truefalse'), EB.bankAskCount(sl, 'match')], [2 * sl + 2, 2 * sl + 1, 2 * sl + 1], 'slots ' + sl);
-      assert(EB.bankAskCount(sl, 'multichoice') <= EB.bankMax(sl), 'dentro del máximo del contrato');
+      eq([EB.bankAskCount(sl, 'multichoice'), EB.bankAskCount(sl, 'truefalse'), EB.bankAskCount(sl, 'match')], [2 * sl + 4, 2 * sl + 2, 2 * sl + 2], 'slots ' + sl);
+      assert(EB.bankAskCount(sl, 'multichoice') > EB.bankTarget(sl) && EB.bankTarget(sl) <= EB.bankMax(sl), 'pool por encima del objetivo; lo subido dentro del máximo del contrato');
       eq(EB.bankTarget(sl), 2 * sl, 'objetivo sin cambio (2×)');
     }
   });

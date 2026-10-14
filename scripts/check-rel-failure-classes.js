@@ -149,6 +149,8 @@ check('tabla: validación (B, regenerar solo el componente; códigos internos ex
     expectVerdict(m, { class: 'B' });
   }
   expectVerdict('EXAM_BANK_CLAIM: el claim no trae examBank válido para scope module', { class: 'D' });
+  // Exam-bank D3: hoja agotada (tampoco avanzó con la estrategia alternativa) → D retenido, sin reintentos ni auto-heal.
+  expectVerdict('EXAM_BANK_LEAF_CAPACITY: 6e18745f × match 3/4 (9 candidatas, 6 con la estrategia alternativa; motivo EXAM_BANK_EVIDENCE): el texto del capítulo no alcanza', { class: 'D', strategy: 'hold_for_human', targetRounds: 0 });
   for (const m of ['context_package_failed: x', 'context_package_invalid_json: x', 'dynamic_content_md_empty: el artifact a está vacío',
     'course_plan_invalid: el plan del run no calza', 'AUDIO_SCRIPT_EMPTY: sin texto', 'AUDIOBOOK_CONTENT_EMPTY: x', 'AUDIO_WELCOME_TEXT_MISSING: x']) {
     expectVerdict(m, { class: 'B', strategy: 'regenerate_dependency' });

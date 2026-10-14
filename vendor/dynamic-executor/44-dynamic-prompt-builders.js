@@ -1419,7 +1419,10 @@ function dynExamBankTarget(slots) { return 2 * slots; }
 // 2·slots+2, la que más se rechaza) y el ensamblado conserva el objetivo 2·slots. Un rechazo suelto ya
 // no dispara una llamada de reparación (que reenvía todo el capítulo). Nunca más que el máximo del
 // contrato (bankMax = 2s+2): el banco subido sigue con 2·slots por hoja.
-function dynExamBankAskCount(slots, type) { return 2 * slots + (type === 'multichoice' ? 2 : 1); }
+// Exam-bank D2 (#1353): pool moderado — selección múltiple 2·slots+4, V/F y emparejamiento 2·slots+2. En el piloto
+// #1353 el ~40 % de las candidatas pasó la validación en la primera pasada y la holgura de 1–2 dejaba hojas cortas que
+// se cerraban con reparaciones (177 de 227 llamadas). El banco subido sigue con 2·slots por hoja (bankMax 2s+2).
+function dynExamBankAskCount(slots, type) { return 2 * slots + (type === 'multichoice' ? 4 : 2); }
 function dynExamBankMaxCount(slots) { return 2 * slots + 2; }
 
 // Id de capítulo/módulo de entrada: string, o objeto con chapterId|moduleId|id
@@ -1663,14 +1666,14 @@ function _dynExamBankLeafLines(leaves, idPrefix) {
 function _dynExamBankSchemaText(withModule) {
   var common = '"id": "<id indicado>", "type": "multichoice|truefalse|match", "chapterId": "<id del capítulo>", '
     + (withModule ? '"moduleId": "<id del módulo>", ' : '')
-    + '"level": "recordar|comprender|aplicar|analizar", "stem": "…", "explanation": "…", "evidence": "…"';
+    + '"level": "recordar|comprender|aplicar|analizar", "stem": "…", "explanation": "…", "evidenceRef": "S<n>"';
   return '\n\nFORMATO DE SALIDA — SOLO JSON, sin texto antes ni después, sin bloques de código:\n'
     + '{ "questions": [ … ] }\n'
     + 'Cada pregunta tiene las claves comunes { ' + common + ' } más las de su tipo, y NINGUNA otra clave:\n'
     + '- multichoice: "correct": { "text": "…", "why": "…" }, "distractors": [ { "text": "…", "why": "…" } × EXACTAMENTE 5 ]\n'
     + '- truefalse: "answer": true|false, "whyWrong": "…"\n'
     + '- match: "pairs": [ { "term": "…", "definition": "…" } × EXACTAMENTE 4 ]\n'
-    + 'Longitudes (caracteres): stem 20–600; explanation 60–350; evidence 40–220; text de opción 1–200; why 20–200; whyWrong 20–200; term 1–60; definition 1–200. Sé breve: "why" en una oración, "explanation" en dos como máximo.\n'
+    + 'Longitudes (caracteres): stem 20–600; explanation 60–350; text de opción 1–200; why 20–200; whyWrong 20–200; term 1–60; definition 1–200. Sé breve: "why" en una oración, "explanation" en dos como máximo.\n'
     + 'Todo texto plano: sin HTML, sin Markdown, sin sintaxis GIFT, sin URLs.\n'
     + 'JSON MINIFICADO: en una sola línea, sin saltos de línea ni sangría.';
 }
@@ -1678,7 +1681,7 @@ function _dynExamBankSchemaText(withModule) {
 function _dynExamBankRules(scopeFinal) {
   return '\n\nREGLAS DE LAS PREGUNTAS (un validador automático rechaza las que no las cumplan):\n'
     + '- CONTENIDO ENSEÑADO: pregunta SOLO por hechos, criterios y procedimientos que enseña el texto del capítulo' + (scopeFinal ? ' que indicas en "chapterId"' : '') + '. Nada de datos, normas, cifras, entidades ni casos que el texto no trae.\n'
-    + '- EVIDENCIA: "evidence" es un fragmento de 40 a 220 caracteres copiado TEXTUAL (verbatim, palabra por palabra) del texto del capítulo' + (scopeFinal ? ' de su "chapterId"' : '') + ' que respalda la respuesta correcta, la afirmación del verdadero/falso o los pares. Copia un fragmento continuo de UNA sola oración, viñeta o fila (nunca juntes dos viñetas o párrafos). Puedes omitir los símbolos de Markdown (**, #, >), nada más: no resumas ni parafrasees. Si la oración cabe en 220 caracteres, cítala COMPLETA: nunca dejes fuera una negación inicial («No…») ni una condición o excepción («si…», «excepto…», «salvo…», «pero…»); y nunca cites una pregunta.\n'
+    + '- EVIDENCIA POR REFERENCIA: en el texto del capítulo' + (scopeFinal ? ' de su "chapterId"' : '') + ' cada fragmento que se puede citar empieza con una marca [S1], [S2]… Cada pregunta indica en "evidenceRef" la marca del fragmento que respalda la respuesta correcta, la afirmación del verdadero/falso o los pares (por ejemplo "evidenceRef": "S12"); Cursia copia el texto exacto. Usa SOLO marcas que aparecen en ESE texto: nunca inventes una marca ni escribas el fragmento. En emparejamiento elige un fragmento que nombre o defina los términos de los pares. Nunca escribas las marcas [S#] dentro del enunciado, las opciones, los pares ni las explicaciones.\n'
     + '- NIVEL: ≈ 30 % recordar/comprender y ≈ 70 % aplicar/analizar. Las de aplicar/analizar plantean una situación concreta del sector en la que el estudiante decide, diagnostica o elige un procedimiento.\n'
     + '- SELECCIÓN MÚLTIPLE: escribe EXACTAMENTE 5 distractores (Cursia elige después cuáles se usan). Cada distractor es de la misma categoría y con las mismas unidades que la opción correcta, y representa un error conceptual real del tema; su "why" explica esa confusión. '
     + 'LONGITUD: de los 5 distractores, 2 o 3 son MÁS LARGOS y 2 o 3 MÁS CORTOS que la opción correcta (en caracteres), ninguno de menos de la mitad ni de más de 1,7 veces su longitud. '
@@ -1706,7 +1709,7 @@ function _dynExamBankSourceBlock(courseContext, outline, chapter, chapterMd, sum
   return 'EXAM_BANK_SOURCE v2\n'
     + _dynCtxV3(courseContext, outline)
     + '\n\nLO QUE ENSEÑÓ EL CAPÍTULO (resumen):\n' + _dynExamBankSummaryLines(ch, summary)
-    + '\n\nTEXTO COMPLETO DEL CAPÍTULO (única fuente de las preguntas y de "evidence"):\n<<<CAPITULO\n' + String(chapterMd || '') + '\nCAPITULO>>>';
+    + '\n\nTEXTO COMPLETO DEL CAPÍTULO (única fuente de las preguntas; los fragmentos citables llevan su marca [S#] para "evidenceRef"):\n<<<CAPITULO\n' + String(chapterMd || '') + '\nCAPITULO>>>';
 }
 function _dynExamBankQuantitiesTail(leaves, idPrefix) {
   return '\n\nCANTIDADES (' + _dynExamBankRequestCount(leaves) + ' preguntas en total):\n' + _dynExamBankLeafLines(leaves, idPrefix)
@@ -1813,7 +1816,7 @@ function dynFinalExamBankChapterPromptParts(courseContext, outline, module, chap
     task: '\n\nEXAM_BANK_FINAL_CHAPTER v2\n'
       + 'TAREA: escribe una parte del banco de preguntas de la evaluación FINAL del curso: preguntas sobre el capítulo «' + (ch.title || '') + '» del módulo «' + (mo.title || '') + '», para el sector ' + sector + ' en ' + pais + '. '
       + 'Son preguntas INTEGRADORAS de evaluación final: situaciones completas del sector en las que el estudiante aplica lo que enseña este capítulo' + (others.length ? ' en relación con las ideas de los otros capítulos del módulo (resumidos abajo)' : '') + '. Moodle sortea preguntas de este banco para cada estudiante, así que todas deben tener la misma calidad.\n'
-      + 'Todas las preguntas llevan "chapterId": "' + ch.id + '" y "moduleId": "' + mo.id + '"; su "evidence" sale SOLO del texto completo de ESTE capítulo (arriba).'
+      + 'Todas las preguntas llevan "chapterId": "' + ch.id + '" y "moduleId": "' + mo.id + '"; su "evidenceRef" es una marca [S#] SOLO del texto completo de ESTE capítulo (arriba).'
       + (others.length ? '\n\nOTROS CAPÍTULOS DEL MÓDULO (solo contexto; no copies evidencia de aquí):\n' + others.map(function (c) { return _dynExamBankSummaryLines(c, pick(c)); }).join('\n') : '')
       + (ped || '')
       + _dynExamBankRules(true)
@@ -1835,7 +1838,10 @@ function dynFinalExamBankChapterPrompt(courseContext, outline, module, chapter, 
 // `stem` o strings): se listan sus enunciados para que el reemplazo no las repita.
 // BANKOPT: base = partes del pedido original ({ source, task, tail }); la reparación conserva
 // source + task (mismo prefijo → lectura de caché) y cambia solo el tail.
-function dynExamBankRepairParts(baseParts, rejected, accepted) {
+// Exam-bank D3: `memory` (opcional) = bloque de memoria / estrategia alternativa por hoja que arma el ejecutor
+// (fragmentos y términos ya usados o rechazados; con DYN_EXAM_BANK_STRATEGY_MARKER, el cambio de enfoque).
+var DYN_EXAM_BANK_STRATEGY_MARKER = 'ESTRATEGIA ALTERNATIVA';
+function dynExamBankRepairParts(baseParts, rejected, accepted, memory) {
   var final = /EXAM_BANK_FINAL_/.test(String((baseParts && baseParts.task) || ''));
   var list = (rejected || []).slice(0, 60).map(function (r) {
     var reasons = r.reasons || r.errors || (r.code ? [{ code: r.code, message: r.message }] : []);
@@ -1848,8 +1854,9 @@ function dynExamBankRepairParts(baseParts, rejected, accepted) {
   }).join('\n');
   var acc = (accepted || []).slice(0, 60).map(function (q) { return '- ' + _dynExamBankClip(typeof q === 'string' ? q : (q && q.stem), 140); }).filter(function (x) { return x !== '- '; });
   return dynExamBankWithTail(baseParts, '\n\nEXAM_BANK_REPAIR v2\n'
-    + 'Estas preguntas del banco fueron RECHAZADAS por el validador automático:\n' + list
+    + 'Estas preguntas del banco hay que escribirlas (RECHAZADAS por el validador automático, o ADICIONALES para completar la hoja):\n' + list
     + (acc.length ? '\n\nEnunciados YA ACEPTADOS (no los repitas ni los reformules):\n' + acc.join('\n') : '')
+    + (memory ? '\n\n' + String(memory) : '')
     + '\n\nEscribe UNA pregunta de reemplazo por cada id rechazado: el MISMO "id", el MISMO "type" y el MISMO "chapterId"' + (final ? ' y "moduleId"' : '') + ' (la misma hoja), corrigiendo el motivo indicado y cumpliendo TODAS las reglas de arriba. '
     + 'No repitas preguntas aceptadas ni devuelvas las que no están en la lista.'
     + '\n\nDevuelve SOLO el JSON { "questions": [...] } con los reemplazos, nada más.');

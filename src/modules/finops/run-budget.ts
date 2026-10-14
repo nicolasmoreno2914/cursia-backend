@@ -100,7 +100,7 @@ const GENERATING = new Set(['GENERATE', 'REGENERATE']);
  * (usage-model.priors.v1.json v1.2) están calibrados con el curso #542 (2 módulos × 2 capítulos): un
  * examen de módulo de 2 capítulos y un final de 2×2. El banco se genera como el ejecutor del navegador
  * (45-dynamic-generation-executor.js, `_dynRunExamBank`): por hoja se piden 2·slots + 2 (selección
- * múltiple) o 2·slots + 1 (V/F, emparejamiento) preguntas (`bankAskCount`, holgura BANKOPT), repartidas entre los capítulos de la hoja; cada capítulo es una unidad que se parte
+ * múltiple) o 2·slots + 1 (V/F, emparejamiento) preguntas (`bankAskCount`; desde exam-bank D2, 2·slots + 4 / 2·slots + 2), repartidas entre los capítulos de la hoja; cada capítulo es una unidad que se parte
  * en llamadas de ≤ 3500 tokens de salida estimados (MC 660, VF 265, EM 335 por pregunta), y CADA
  * llamada lleva el texto del capítulo. Por eso la entrada escala con las llamadas y la salida con los
  * tokens pedidos: { input_tokens: llamadas / llamadas_ref, output_tokens: salida / salida_ref }.

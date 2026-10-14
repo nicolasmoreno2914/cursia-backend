@@ -131,17 +131,18 @@ function validateArtifact(res, item, md) {
     const v = validateArtifact(r1, exam1, md);
     ok(r1.artifacts.length === 1 && r1.artifacts[0].type === 'dynamic_exam_bank_json' && v.ok, `artifact dynamic_exam_bank_json válido para validateExamBank de B2 (con evidencia): ${v.bankSize} preguntas, ${v.slotCount} slots`, v.errors.slice(0, 5));
     const s = r1.summary;
-    ok(s.repaired === 2 && s.rejectedByCode.EXAM_BANK_EVIDENCE >= 1 && s.rejectedByCode.EXAM_BANK_LENGTH_BIAS >= 1 && s.calls.continuation === 1 && s.evidenceChecked === true,
-      `resumen: rechazos EXAM_BANK_EVIDENCE + EXAM_BANK_LENGTH_BIAS, 2 reparadas en 1 llamada continuation (calls ${JSON.stringify(s.calls)})`, s);
+    ok(s.repaired >= 2 && s.rejectedByCode.EXAM_BANK_EVIDENCE >= 1 && s.rejectedByCode.EXAM_BANK_LENGTH_BIAS >= 1 && s.calls.continuation === 1 && s.evidenceChecked === true && s.poolCandidates >= 2 && s.evidenceByRef > 0,
+      `resumen: rechazos EXAM_BANK_EVIDENCE + EXAM_BANK_LENGTH_BIAS, ${s.repaired} reparadas (pool ${s.poolCandidates}) en 1 llamada continuation; ${s.evidenceByRef} evidencias por marca (calls ${JSON.stringify(s.calls)})`, s);
     ok(s.correctLongestShare <= 0.3, `«correcta = la más larga» en ${Math.round(s.correctLongestShare * 100)} % de las MC (≤ 30 %), histograma ${JSON.stringify(s.lengthRankHistogram)}`);
   }
   const repairs = llm.st.v3calls.filter((c) => c.kind === 'exam_bank_repair');
   ok(llm.st.invalidSent.exam_bank === 1 && repairs.length === 1 && llm.st.retriesSeen.exam_bank === 1, `falla inyectada 1 vez → EXACTAMENTE 1 reparación (${repairs.length})`, { inv: llm.st.invalidSent, rep: repairs });
   const injected = (llm.st.examBank.faults[0] || {}).faults || {};
   const injIds = Object.keys(injected).sort();
-  ok(Object.keys(injected).length === 4 && repairs.length === 1 && JSON.stringify(repairs[0].ids) === JSON.stringify(injIds.slice(0, 2)), 'BANKOPT: 4 rechazadas en la hoja MC (holgura 2) → la reparación pide SOLO las 2 que faltan para el objetivo (las primeras en orden)', { repairs, injected });
+  ok(Object.keys(injected).length === 6 && repairs.length === 1 && JSON.stringify(repairs[0].ids.slice(0, 2)) === JSON.stringify(injIds.slice(0, 2)) && repairs[0].ids.length > 2 && repairs[0].ids.length <= 10 && repairs[0].ids.every((id) => /^M1-C1-MC-\d+$/.test(id)),
+    'exam-bank D2: 6 rechazadas en la hoja MC (holgura 4) → UNA reparación con las 2 que faltan (las primeras en orden) + candidatas del pool de la MISMA hoja (≤ 6× el faltante)', { repairs, injected });
   const rp = prompts.filter((p) => p.split('\n').includes('EXAM_BANK_REPAIR v2'));
-  ok(rp.length === 1 && /EXAM_BANK_EVIDENCE/.test(rp[0]) && /EXAM_BANK_LENGTH_BIAS/.test(rp[0]) && !rp[0].includes('CANTIDADES ('), 'el prompt de reparación nombra los dos motivos (EVIDENCE y LENGTH_BIAS) y no repite las CANTIDADES');
+  ok(rp.length === 1 && /EXAM_BANK_EVIDENCE/.test(rp[0]) && /EXAM_BANK_LENGTH_BIAS/.test(rp[0]) && /EXAM_BANK_POOL/.test(rp[0]) && !rp[0].includes('CANTIDADES ('), 'el prompt de reparación nombra los dos motivos (EVIDENCE y LENGTH_BIAS), marca las adicionales del pool y no repite las CANTIDADES');
   ok(prompts.every((p) => p.startsWith('EXAM_BANK_SOURCE v2\n')) && prompts.filter((p) => !p.includes('EXAM_BANK_REPAIR v2')).every((p) => p.split('\n').includes('EXAM_BANK_CHAPTER v2')), 'módulo: fuente del capítulo primero; llamadas principales EXAM_BANK_CHAPTER v2 (un capítulo por llamada)');
   const shapes = llm.st.examBank.blockShapes;
   ok(shapes.length === prompts.length && shapes.every((x) => JSON.stringify(x) === JSON.stringify(['ephemeral', 'ephemeral', null])), `BANKOPT: ${shapes.length} prompts de banco como [fuente+cache_control, tarea+cache_control, tail]`, shapes);
