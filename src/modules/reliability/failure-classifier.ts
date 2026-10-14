@@ -200,6 +200,8 @@ export const VALIDATION_INNER_FAMILIES: readonly RegExp[] = Object.freeze([
   /^GIFT_[A-Z0-9_]+$/, /^PDF_[A-Z0-9_]+$/, /^COVER_[A-Z0-9_]+$/, /^PNG_[A-Z0-9_]+$/, /^H5P_[A-Z0-9_]+_INVALID$/,
   // Fase 2: validación de la Actividad de Aplicación (course-shell/application-activity.ts) → B, regenerar la actividad.
   /^APPLICATION_[A-Z0-9_]+$/,
+  // Loop 9 B: validación de la práctica guiada (course-shell/guided-practice.ts) → B, regenerar la práctica.
+  /^GUIDED_PRACTICE_[A-Z0-9_]+$/,
 ]);
 
 export function isKnownValidationCode(code: string): boolean {
@@ -574,7 +576,7 @@ export function classifiedCodes(): string[] {
 /** Tipos de item que el ejecutor usa como prefijo de un mensaje de contrato del claim («video_interactions: …»). */
 const ITEM_TYPE_PREFIXES = new Set([
   'content', 'scorm', 'exam', 'video', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity',
-  'final_exam', 'presentation', 'audio_welcome', 'audiobook_chapter', 'application_activity',
+  'final_exam', 'presentation', 'audio_welcome', 'audiobook_chapter', 'application_activity', 'guided_practice',
 ]);
 
 /** Frases estables del ejecutor del navegador / de api() (04-api.js) → código. Orden = prioridad. */

@@ -283,6 +283,8 @@ export interface BlueprintFingerprintsV3 extends BlueprintFingerprints {
    * contexto congelado del estudiante/resultados). Solo capítulos con actividad.
    */
   application?: Map<string, string>;
+  /** Loop 9 B · Práctica guiada: capítulo → sha del nivel (minutos). Solo capítulos de contenido con práctica guiada. */
+  guided?: Map<string, string>;
   /**
    * Fase 3 · Contexto académico (R26): `<type>:<entidad>` → sha de los resultados de aprendizaje (ids + textos) que
    * recibe ese item, SOLO para los items que producen evidencia y con resultados. Entra únicamente en su huella: un
@@ -292,7 +294,7 @@ export interface BlueprintFingerprintsV3 extends BlueprintFingerprints {
 }
 
 /** Fase 3 (R26): tipos cuya huella incluye los resultados que deben evidenciar. */
-export const ALIGNMENT_FINGERPRINT_TYPES: readonly string[] = ['experience', 'activity', 'video_interactions', 'application_activity', 'exam', 'final_exam'];
+export const ALIGNMENT_FINGERPRINT_TYPES: readonly string[] = ['experience', 'activity', 'video_interactions', 'application_activity', 'guided_practice', 'exam', 'final_exam'];
 
 function withAlignment(fps: BlueprintFingerprintsV3, type: string, entityId: string, fp: string | null): string | null {
   const a = fps.alignment?.get(`${type}:${entityId}`);
@@ -378,6 +380,13 @@ export function computeFingerprintsV3(
       }
     }
   }
+  // Loop 9 B: nivel de la práctica guiada de cada capítulo de contenido que la tiene.
+  const guided = new Map<string, string>();
+  for (const m of (bp as any).modules ?? []) {
+    for (const c of m.chapters ?? []) {
+      if (typeof c.guidedPracticeMinutes === 'number') guided.set(c.id, sha256Canonical({ v, kind: 'guided-practice-frame', minutes: c.guidedPracticeMinutes }));
+    }
+  }
   // Fase 3 (R26): resultados que recibe cada item de evidencia (mismo cálculo que el brief del claim).
   const alignment = new Map<string, string>();
   if ((bp as any).course?.academicContext) {
@@ -394,7 +403,7 @@ export function computeFingerprintsV3(
     }
     if (ALIGNMENT_FINGERPRINT_TYPES.includes('final_exam')) add('final_exam', courseId, { type: 'final_exam', chapterId: null });
   }
-  return { ...base, moduleIntro, finalExam, roleDesign, practiceSources, application, ...(alignment.size ? { alignment } : {}) };
+  return { ...base, moduleIntro, finalExam, roleDesign, practiceSources, application, ...(guided.size ? { guided } : {}), ...(alignment.size ? { alignment } : {}) };
 }
 
 /** Sha de la variación por rol que recibe el trabajo `type` del capítulo (null = el rol no le cambia nada). */
@@ -417,6 +426,7 @@ export const CHAPTER_ITEM_TYPES_V3: readonly string[] = [
   'video_interactions',
   'activity',
   'application_activity',
+  'guided_practice',
   'audiobook_chapter',
 ];
 /** Tipos v3 cuya entidad es un módulo (key `<type>:<moduleId>`). */
@@ -473,6 +483,11 @@ function itemFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extras
     const frame = fps.application?.get(entityId);
     return c && frame ? sha256Canonical({ v, kind: 'application_activity', content: c.full, frame }) : null;
   }
+  if (type === 'guided_practice') {
+    const c = fps.content.get(entityId);
+    const frame = fps.guided?.get(entityId);
+    return c && frame ? sha256Canonical({ v, kind: 'guided_practice', content: c.full, frame }) : null;
+  }
   if (type === 'exam') return fps.exam.get(entityId) ?? null;
   if (type === 'module_intro') return fps.moduleIntro.get(entityId) ?? null;
   if (type === 'final_exam') return fps.finalExam;
@@ -504,6 +519,11 @@ function matchFingerprintV3Base(fps: BlueprintFingerprintsV3, key: string, extra
     const c = fps.content.get(entityId);
     const frame = fps.application?.get(entityId);
     return c && frame ? sha256Canonical({ v, kind: 'application_activity', own: c.own, frame }) : null;
+  }
+  if (type === 'guided_practice') {
+    const c = fps.content.get(entityId);
+    const frame = fps.guided?.get(entityId);
+    return c && frame ? sha256Canonical({ v, kind: 'guided_practice', own: c.own, frame }) : null;
   }
   return itemFingerprintV3Base(fps, key, extras);
 }

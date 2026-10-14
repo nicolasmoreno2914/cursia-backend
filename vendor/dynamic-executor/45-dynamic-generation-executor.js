@@ -495,14 +495,18 @@ var DYN_V2_ONLY_TYPES = ['course_plan', 'course_intro', 'module_intro'];
 // worker del backend (scheduler WORKER_ONLY_TYPES), nunca el navegador.
 var DYN_CLAIM_TYPES_V3 = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam'];
 var DYN_V3_ONLY_TYPES = ['experience', 'video_interactions', 'activity', 'final_exam', 'presentation', 'audio_welcome', 'audiobook_chapter'];
+// Loop 9 B: `guided_practice` también se reclama SOLO si el run lo tiene (mismo motivo que application_activity).
 
 // Fase 2: `application_activity` se reclama SOLO si el run lo tiene (un backend anterior no conoce el tipo y
 // rechazaría el claim entero): el run es la prueba de que el backend lo soporta.
 function _dynRunHasApplication(run) {
   return !!(run && Array.isArray(run.items) && run.items.some(function (it) { return it && it.type === 'application_activity'; }));
 }
-function _dynClaimTypesFor(rulesVersion, withApplication) {
-  if (rulesVersion === 3) return DYN_CLAIM_TYPES_V3.slice().concat(withApplication ? ['application_activity'] : []);
+function _dynRunHasGuidedPractice(run) {
+  return !!(run && Array.isArray(run.items) && run.items.some(function (it) { return it && it.type === 'guided_practice'; }));
+}
+function _dynClaimTypesFor(rulesVersion, withApplication, withGuidedPractice) {
+  if (rulesVersion === 3) return DYN_CLAIM_TYPES_V3.slice().concat(withApplication ? ['application_activity'] : [], withGuidedPractice ? ['guided_practice'] : []);
   return rulesVersion === 2 ? DYN_CLAIM_TYPES_V2.slice() : DYN_CLAIM_TYPES_V1.slice();
 }
 
@@ -1065,6 +1069,8 @@ async function _dynRunContentV2(item) {
     truthHits: truthHits.slice(0, 8)
   };
   Object.assign(summary, dynPedagogySummary(item));
+  // Loop 9 (B-extra-1): variante del Libro para un capítulo con práctica guiada propia (sin «Actividades de Apoyo»).
+  if (bp.chapter && typeof bp.chapter.guidedPracticeMinutes === 'number' && bp.chapter.guidedPracticeMinutes > 0) summary.libroVariant = 'guided-practice-1';
   if (enumLint.length) summary.enumerationLint = enumLint.slice(0, 5);
   if (contextSummary) {
     // Fix round 1 (m2): el resumen del capítulo (lo leen los exámenes) con el mismo formato de moneda.
@@ -1366,6 +1372,8 @@ var DYN_V3_PROMPT_VERSIONS = {
 };
 // Fase 2: Actividad de Aplicación + solucionario (2 pasadas). Aparte para no mover DYN_V3_PROMPT_VERSIONS.
 var DYN_V3_APPLICATION_PROMPT_VERSION = 'v21-app-1';
+// Loop 9 B: práctica guiada del capítulo (una pasada + el reintento dirigido).
+var DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION = 'v21-gp-2';
 // EV6 IV avanzado: video_interactions schemaVersion 2 (pausas para pensar). La ruta schemaVersion 1
 // (Manifests sin `ivAdvanced`) sigue reportando DYN_V3_PROMPT_VERSIONS.video_interactions.
 var DYN_V3_VINT_V2_PROMPT_VERSION = 'v21-vint-5'; // #542 (I1) (antes v21-vint-3)
@@ -1455,7 +1463,7 @@ function _dynV3Llm(item, role, sys, prompt, maxTok, metaOut, cacheOpts) {
 // Aplicación; actividad H5P ~1,8). El Libro Guía NO: su segunda llamada frecuente es el reintento del sidecar, con
 // otro prefijo (no leería el caché); intros y plan: llamadas cortas.
 var DYN_PROMPT_CACHE_ENABLED = true;
-var DYN_PROMPT_CACHE_TYPES = { experience: true, video_interactions: true, application_activity: true, activity: true };
+var DYN_PROMPT_CACHE_TYPES = { experience: true, video_interactions: true, application_activity: true, activity: true, guided_practice: true };
 function _dynCacheOpts(prompt, itemType) {
   return DYN_PROMPT_CACHE_ENABLED && DYN_PROMPT_CACHE_TYPES[itemType] === true && typeof prompt === 'string' && prompt ? { cachePrefix: prompt } : undefined;
 }
@@ -4135,6 +4143,231 @@ async function _dynRunApplicationActivity(item) {
   };
 }
 
+// ── guided_practice:<ch> (Loop 9 B · «Ejercicios guiados» del capítulo) ──
+// Espejo EXACTO de course-shell/guided-practice.ts (validateGuidedPracticeDoc): el servidor re-valida el documento al
+// completar el item y es autoritativo. Paridad: harness test-67 y scripts/check-guided-practice.js. Formativa y sin
+// nota: sin solucionario oculto ni pesos. chapterId, minutes, ids y minutos de cada ejercicio los pone Cursia.
+var DYN_GUIDED_PRACTICE_SCHEMA_VERSION = 1;
+var DYN_GUIDED_PRACTICE_EXERCISES_BY_MINUTES = { 40: [20, 20], 60: [30, 30], 80: [40, 40], 120: [40, 40, 40] };
+var DYN_GUIDED_PRACTICE_LIM = {
+  titleMax: 90, situationMin: 300, situationMax: 1400, tasksMin: 3, tasksMax: 6, taskMin: 10, taskMax: 400,
+  expectedProductMin: 10, expectedProductMax: 300, criteriaMin: 3, criteriaMax: 5, criterionNameMax: 80,
+  criterionDescriptorMin: 10, criterionDescriptorMax: 300, modelAnswerMin: 450, modelAnswerMax: 2200
+};
+// Fix C1: pisos por minutos del ejercicio (los minutos acreditados tienen trabajo detrás). Espejo de GUIDED_PRACTICE_FLOORS.
+var DYN_GUIDED_PRACTICE_FLOORS = {
+  20: { situationMin: 300, tasksMin: 3, modelAnswerMin: 450, expectedProductMin: 10 },
+  30: { situationMin: 550, tasksMin: 4, modelAnswerMin: 950, expectedProductMin: 20 },
+  40: { situationMin: 800, tasksMin: 5, modelAnswerMin: 1400, expectedProductMin: 60 }
+};
+// Fix C1: consignas de solo recordar («Define», «Menciona», «Enumera», «¿Qué es…?»): cada consigna debe producir algo.
+var DYN_GUIDED_PRACTICE_RECALL_TASK_RE = /^\s*(?:¿\s*)?(?:defin[ea]|mencion[ae]|enumer[ae]|nombr[ae]|list[ae]|recuerd[ae]|cit[ae]|qu[eé] es|cu[aá]l es la definici[oó]n)(?![\p{L}])/iu;
+var DYN_GUIDED_PRACTICE_DOC_KEYS = ['schemaVersion', 'chapterId', 'minutes', 'exercises'];
+var DYN_GUIDED_PRACTICE_EXERCISE_KEYS = ['id', 'minutes', 'kind', 'title', 'situation', 'tasks', 'expectedProduct', 'criteria', 'modelAnswer'];
+var DYN_GUIDED_PRACTICE_CRITERION_KEYS = ['name', 'descriptor'];
+var DYN_GUIDED_PRACTICE_RESOURCE_RE = /\bvideos? (interactivos?|del cap[ií]tulo|del curso|del m[oó]dulo)\b|\bH5P\b|\bactividad(es)? de aplicaci[oó]n\b|\bex[aá]men(es)? (del|de este) (m[oó]dulo|curso)\b|\bevaluaci[oó]n final\b|\baudiolibro\b|\bpresentaci[oó]n del cap[ií]tulo\b|\blibro gu[ií]a\b|\bSCORM\b/i;
+var DYN_GUIDED_PRACTICE_SOURCE_MAX_CHARS = 16000;
+function dynGuidedPracticePlan(minutes) {
+  var m = DYN_GUIDED_PRACTICE_EXERCISES_BY_MINUTES[minutes];
+  if (!m) throw new Error('V3_VALIDATION_CONTEXT: práctica guiada con minutos inválidos ' + JSON.stringify(minutes));
+  return m.map(function (x, i) { return { id: 'E' + (i + 1), minutes: x }; });
+}
+function dynGuidedPracticeAnswerCoversTasks(answer, taskCount) {
+  var from = 0;
+  for (var k = 1; k <= taskCount; k++) {
+    // Fix M1: una marca por consigna AL INICIO DE LÍNEA («1. », «2) », «Consigna 3. »); cifras como «2.000» no cuentan.
+    var re = new RegExp('(?:^|\\n)[ \\t]*(?:consigna[ \\t]+)?' + k + '[.)][ \\t]', 'gi');
+    re.lastIndex = from;
+    var m = re.exec(answer);
+    if (!m) return false;
+    from = m.index + m[0].length;
+  }
+  return true;
+}
+function dynValidateGuidedPracticeDoc(doc, ctx) {
+  if (!ctx || typeof ctx.chapterId !== 'string' || !ctx.chapterId) throw new Error('V3_VALIDATION_CONTEXT: práctica guiada sin chapterId ' + JSON.stringify(ctx));
+  var plan = dynGuidedPracticePlan(ctx.minutes);
+  var L = DYN_GUIDED_PRACTICE_LIM;
+  var errors = [];
+  function err(path, code, message) { errors.push({ path: path, code: code, message: message }); }
+  if (!_dynIsPlainObject(doc)) return [{ path: '$', code: 'GUIDED_PRACTICE_SHAPE', message: 'el documento debe ser un objeto' }];
+  Object.keys(doc).forEach(function (k) { if (DYN_GUIDED_PRACTICE_DOC_KEYS.indexOf(k) < 0) err('$.' + k, 'GUIDED_PRACTICE_SHAPE', 'campo desconocido: ' + k + ' (la práctica guiada no tiene solucionario oculto ni nota)'); });
+  if (doc.schemaVersion !== DYN_GUIDED_PRACTICE_SCHEMA_VERSION) err('$.schemaVersion', 'GUIDED_PRACTICE_SCHEMA_VERSION', 'schemaVersion debe ser ' + DYN_GUIDED_PRACTICE_SCHEMA_VERSION);
+  if (doc.chapterId !== ctx.chapterId) err('$.chapterId', 'CHAPTER_ID_MISMATCH', 'chapterId debe ser "' + ctx.chapterId + '"');
+  if (doc.minutes !== ctx.minutes) err('$.minutes', 'GUIDED_PRACTICE_MINUTES_MISMATCH', 'minutes debe ser ' + ctx.minutes + ' (nivel del Manifest)');
+  function text(v, path, min, max) {
+    if (typeof v !== 'string' || v.trim().length < Math.max(1, min)) { err(path, 'GUIDED_PRACTICE_TEXT', path + ' debe ser un texto de al menos ' + Math.max(1, min) + ' caracteres'); return null; }
+    if (v.length > max) err(path, 'GUIDED_PRACTICE_TEXT_TOO_LONG', path + ' supera ' + max + ' caracteres (' + v.length + ')');
+    if (DYN_GUIDED_PRACTICE_RESOURCE_RE.test(v)) err(path, 'GUIDED_PRACTICE_RESOURCE_MENTION', path + ' menciona otro recurso del curso («' + (DYN_GUIDED_PRACTICE_RESOURCE_RE.exec(v) || [''])[0] + '»): la práctica guiada se lee sola');
+    return v;
+  }
+  if (!Array.isArray(doc.exercises)) { err('$.exercises', 'GUIDED_PRACTICE_SHAPE', 'exercises debe ser una lista'); return errors; }
+  if (doc.exercises.length !== plan.length) err('$.exercises', 'GUIDED_PRACTICE_COUNT', 'exercises debe tener ' + plan.length + ' ejercicios para ' + ctx.minutes + ' min (tiene ' + doc.exercises.length + ')');
+  doc.exercises.forEach(function (e, i) {
+    var p = '$.exercises[' + i + ']';
+    if (!_dynIsPlainObject(e)) return err(p, 'GUIDED_PRACTICE_SHAPE', p + ' debe ser un objeto');
+    Object.keys(e).forEach(function (k) { if (DYN_GUIDED_PRACTICE_EXERCISE_KEYS.indexOf(k) < 0) err(p + '.' + k, 'GUIDED_PRACTICE_SHAPE', 'campo desconocido en el ejercicio: ' + k); });
+    var want = plan[i];
+    if (want) {
+      if (e.id !== want.id) err(p + '.id', 'GUIDED_PRACTICE_EXERCISE_ID', p + '.id debe ser "' + want.id + '" (en orden)');
+      if (e.minutes !== want.minutes) err(p + '.minutes', 'GUIDED_PRACTICE_EXERCISE_MINUTES', p + '.minutes debe ser ' + want.minutes + ' (lo fija Cursia)');
+    }
+    if (DYN_GUIDED_PRACTICE_KINDS.indexOf(e.kind) < 0) err(p + '.kind', 'GUIDED_PRACTICE_KIND', p + '.kind debe ser ' + DYN_GUIDED_PRACTICE_KINDS.join(' | '));
+    text(e.title, p + '.title', 4, L.titleMax);
+    // C1: pisos según los minutos del ejercicio (los del plan de Cursia; un ejercicio de más usa los de 20 min).
+    var F = DYN_GUIDED_PRACTICE_FLOORS[want ? want.minutes : 20] || DYN_GUIDED_PRACTICE_FLOORS[20];
+    text(e.situation, p + '.situation', F.situationMin, L.situationMax);
+    var taskCount = 0;
+    if (!Array.isArray(e.tasks)) err(p + '.tasks', 'GUIDED_PRACTICE_SHAPE', p + '.tasks debe ser una lista');
+    else {
+      taskCount = e.tasks.length;
+      if (e.tasks.length < F.tasksMin || e.tasks.length > L.tasksMax) err(p + '.tasks', 'GUIDED_PRACTICE_COUNT', p + '.tasks debe tener entre ' + F.tasksMin + ' y ' + L.tasksMax + ' consignas para ' + (want ? want.minutes : 20) + ' min (tiene ' + e.tasks.length + ')');
+      e.tasks.forEach(function (t, j) {
+        var tt = text(t, p + '.tasks[' + j + ']', L.taskMin, L.taskMax);
+        if (tt && DYN_GUIDED_PRACTICE_RECALL_TASK_RE.test(tt)) err(p + '.tasks[' + j + ']', 'GUIDED_PRACTICE_TASK_RECALL', p + '.tasks[' + j + '] solo pide recordar («' + tt.slice(0, 40) + '»): cada consigna debe pedir analizar, decidir, calcular o justificar');
+      });
+    }
+    text(e.expectedProduct, p + '.expectedProduct', F.expectedProductMin, L.expectedProductMax);
+    if (!Array.isArray(e.criteria)) err(p + '.criteria', 'GUIDED_PRACTICE_SHAPE', p + '.criteria debe ser una lista');
+    else {
+      if (e.criteria.length < L.criteriaMin || e.criteria.length > L.criteriaMax) err(p + '.criteria', 'GUIDED_PRACTICE_COUNT', p + '.criteria debe tener entre ' + L.criteriaMin + ' y ' + L.criteriaMax + ' criterios (tiene ' + e.criteria.length + ')');
+      var names = [];
+      e.criteria.forEach(function (c, j) {
+        var cp = p + '.criteria[' + j + ']';
+        if (!_dynIsPlainObject(c)) return err(cp, 'GUIDED_PRACTICE_SHAPE', cp + ' debe ser un objeto { name, descriptor }');
+        Object.keys(c).forEach(function (k) { if (DYN_GUIDED_PRACTICE_CRITERION_KEYS.indexOf(k) < 0) err(cp + '.' + k, 'GUIDED_PRACTICE_SHAPE', 'campo desconocido en el criterio: ' + k + ' (sin pesos ni puntajes: es formativa)'); });
+        var n = text(c.name, cp + '.name', 3, L.criterionNameMax);
+        if (n && names.indexOf(n.trim().toLowerCase()) >= 0) err(cp + '.name', 'GUIDED_PRACTICE_CRITERIA_DUPLICATE', 'criterio repetido: ' + n);
+        if (n) names.push(n.trim().toLowerCase());
+        text(c.descriptor, cp + '.descriptor', L.criterionDescriptorMin, L.criterionDescriptorMax);
+      });
+    }
+    var ans = text(e.modelAnswer, p + '.modelAnswer', F.modelAnswerMin, L.modelAnswerMax);
+    if (ans && taskCount >= L.tasksMin && !dynGuidedPracticeAnswerCoversTasks(ans, taskCount)) {
+      err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_ORDER', p + '.modelAnswer debe responder las ' + taskCount + ' consignas en orden, una por línea, cada una empezando con «1. », «2. », …');
+    }
+  });
+  return errors;
+}
+// Documento desde la respuesta del LLM: Cursia pone chapterId, minutos, ids y minutos de cada ejercicio; del LLM solo se
+// toman los campos de contenido (un campo extra del modelo —p. ej. «solution» o «score»— nunca llega al documento).
+function dynGuidedPracticeDocFrom(obj, chapterId, minutes) {
+  var plan = dynGuidedPracticePlan(minutes);
+  var xs = _dynIsPlainObject(obj) && Array.isArray(obj.exercises) ? obj.exercises : null;
+  return {
+    schemaVersion: DYN_GUIDED_PRACTICE_SCHEMA_VERSION, chapterId: chapterId, minutes: minutes,
+    exercises: xs === null ? null : xs.map(function (e, i) {
+      var x = _dynIsPlainObject(e) ? e : {};
+      var crit = Array.isArray(x.criteria) ? x.criteria.map(function (c) { return _dynIsPlainObject(c) ? { name: c.name, descriptor: c.descriptor } : c; }) : x.criteria;
+      return { id: plan[i] ? plan[i].id : 'E' + (i + 1), minutes: plan[i] ? plan[i].minutes : null, kind: x.kind, title: x.title, situation: x.situation, tasks: x.tasks, expectedProduct: x.expectedProduct, criteria: crit, modelAnswer: x.modelAnswer };
+    })
+  };
+}
+function _dynGuidedPracticeClaim(item) {
+  var g = _dynClaimField(item, ['guidedPractice']);
+  return _dynIsPlainObject(g) ? g : null;
+}
+// Cuentas explícitas de la situación y de la respuesta modelo («$180.000 − $110.000 = $70.000»): las mismas reglas que el
+// ejemplo resuelto de la experiencia (dynLintWorkedExampleNumbers), pero DURAS (una respuesta modelo con cuentas que no
+// dan se rehace: el estudiante la usa para corregirse).
+function dynLintGuidedPracticeNumbers(doc) {
+  var out = [];
+  (doc.exercises || []).forEach(function (e, i) {
+    if (!_dynIsPlainObject(e)) return;
+    var we = { situation: e.situation, steps: [], result: e.modelAnswer };
+    dynLintWorkedExampleNumbers(we, '$.exercises[' + i + ']').forEach(function (h) {
+      if (/^\[WE_ARITH\]/.test(h)) out.push(h.replace('[WE_ARITH]', 'GUIDED_PRACTICE_ARITH:').replace('.result', '.modelAnswer'));
+    });
+  });
+  return out;
+}
+// Fix I5: lo que los ejercicios guiados no deben repetir (del claim: práctica del módulo y casos de sus AA). DURO si un
+// ejercicio usa el mismo título de escenario o a 2+ de los mismos protagonistas; BLANDO con un solo nombre en común o
+// un título muy parecido (un reintento dirigido; si no mejora, se conserva y queda registrado).
+function _dynNormTitle(t) {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/^(practica|taller|caso|ejercicio)[^:]*:\s*/, '').replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function _dynTitleTokens(t) { return _dynNormTitle(t).split(' ').filter(function (w) { return w.length > 3; }); }
+function dynLintGuidedPracticeAvoid(doc, avoid) {
+  var hard = [], soft = [];
+  if (!_dynIsPlainObject(avoid)) return { hard: hard, soft: soft };
+  var titles = [].concat(avoid.practiceChapterTitles || []);
+  var names = [];
+  (avoid.applicationCases || []).forEach(function (c) {
+    if (!_dynIsPlainObject(c)) return;
+    if (c.title) titles.push(c.title);
+    if (c.workshopTitle) titles.push(c.workshopTitle);
+    (c.names || []).forEach(function (n) { if (typeof n === 'string' && n.trim() && names.indexOf(n) < 0) names.push(n); });
+  });
+  var normTitles = titles.map(_dynNormTitle).filter(Boolean);
+  (doc.exercises || []).forEach(function (e, i) {
+    if (!_dynIsPlainObject(e)) return;
+    var p = '$.exercises[' + i + ']';
+    var nt = _dynNormTitle(e.title);
+    var text = String(e.title || '') + '\n' + String(e.situation || '');
+    var shared = names.filter(function (n) { return new RegExp('(^|[^\\p{L}])' + n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?![\\p{L}])', 'u').test(text); });
+    if (nt && normTitles.indexOf(nt) >= 0) hard.push({ path: p + '.title', code: 'GUIDED_PRACTICE_CASE_CLASH', message: p + '.title repite el escenario de la práctica o de una Actividad de Aplicación del módulo («' + e.title + '»): usa otra situación' });
+    else if (shared.length >= 2) hard.push({ path: p + '.situation', code: 'GUIDED_PRACTICE_CASE_CLASH', message: p + '.situation usa a los mismos protagonistas de una Actividad de Aplicación del módulo (' + shared.slice(0, 4).join(', ') + '): usa otras personas y otra organización' });
+    else {
+      var tk = _dynTitleTokens(e.title);
+      var close = tk.length && titles.some(function (t) { var o = _dynTitleTokens(t); if (!o.length) return false; var inter = tk.filter(function (w) { return o.indexOf(w) >= 0; }).length; return inter / Math.max(tk.length, o.length) >= 0.6; });
+      if (shared.length === 1 || close) soft.push('[GP_CASE_CLASH] ' + p + ': se parece al caso de la práctica o de una Actividad de Aplicación del módulo' + (shared.length ? ' (' + shared[0] + ')' : '') + ': cambia la situación o los protagonistas');
+    }
+  });
+  return { hard: hard, soft: soft };
+}
+async function _dynRunGuidedPractice(item) {
+  var bp = item.blueprint || {};
+  if (!item.chapterId || !bp.chapter) return { ok: false, error: 'guided_practice: el claim no trae chapterId/blueprint.chapter', retryable: false };
+  var gp = _dynGuidedPracticeClaim(item);
+  if (!gp || !DYN_GUIDED_PRACTICE_EXERCISES_BY_MINUTES[gp.minutes]) return { ok: false, error: 'claim_payload_unavailable: guided_practice ' + item.itemKey + ' sin minutos válidos en el claim', retryable: false };
+  if (gp.schemaVersion !== DYN_GUIDED_PRACTICE_SCHEMA_VERSION) return { ok: false, error: 'claim_payload_unavailable: guided_practice ' + item.itemKey + ' con schemaVersion ' + JSON.stringify(gp.schemaVersion) + ' (este ejecutor escribe ' + DYN_GUIDED_PRACTICE_SCHEMA_VERSION + ')', retryable: false };
+  // El plan del claim debe ser el del nivel (Cursia fija ejercicios y minutos; un claim incoherente no se adivina).
+  if (JSON.stringify(gp.exercises) !== JSON.stringify(dynGuidedPracticePlan(gp.minutes))) return { ok: false, error: 'claim_payload_unavailable: guided_practice ' + item.itemKey + ' con un plan de ejercicios distinto del nivel ' + gp.minutes, retryable: false };
+  var src = await _dynLoadChapterSources(item);
+  if (!src.ok) return src.result;
+  var sourceMd = _dynTrimAtParagraph(src.contentMd, DYN_GUIDED_PRACTICE_SOURCE_MAX_CHARS);
+  var courseContext = item.context.courseContext;
+  var chapter = Object.assign({}, bp.chapter, { id: item.chapterId });
+  var caseReuse = {};
+  var clashSoft = {};
+  // Fix M3: 120 min = 3 ejercicios de 40 → más espacio de salida.
+  var maxTok = gp.minutes === 120 ? 10000 : 8000; // prior de salida p90 ≈ 6,5k (2 ej.) / 9,75k (3 ej.): sin truncar en el worker (tope 16k)
+  var res = await _dynV3JsonWithRetry(item, dynGuidedPracticeSys(courseContext), dynGuidedPracticePrompt(courseContext, bp.outline, chapter, sourceMd, gp, dynPedagogyBlock(item)), maxTok, function (obj, attempt) {
+    var doc = dynGuidedPracticeDocFrom(obj, item.chapterId, gp.minutes);
+    var v = dynValidateGuidedPracticeDoc(doc, { chapterId: item.chapterId, minutes: gp.minutes });
+    // Fix I5: mismo escenario o protagonistas que la práctica o las AA del módulo → se rehace.
+    var av = dynLintGuidedPracticeAvoid(doc, gp.avoid);
+    v = v.concat(av.hard);
+    if (v.length) return { ok: false, errors: _dynFormatErrors(v) };
+    var nums = dynLintGuidedPracticeNumbers(doc);
+    if (nums.length) return { ok: false, errors: nums.map(function (x) { return '$ ' + x; }) };
+    // No reutilizar el caso del capítulo (blando: un reintento dirigido; si no mejora, se conserva y queda registrado).
+    var soft = [];
+    var reused = [];
+    doc.exercises.forEach(function (e, i) {
+      var cr = dynLintCaseReuse(String(e.title || '') + ' ' + String(e.situation || ''), src.contentMd);
+      if (cr.reused) { reused.push(i + 1); soft.push('[GP_CASE_REUSE] $.exercises[' + i + '].situation: repite el caso del capítulo (' + cr.distinct.slice(0, 6).join(', ') + '): usa otra situación, otra organización o una condición distinta'); }
+    });
+    caseReuse[attempt] = reused;
+    clashSoft[attempt] = av.soft.length;
+    return { ok: true, value: doc, soft: soft.concat(av.soft) };
+  }, { normalizeMoney: dynCourseIsColombia(courseContext) });
+  if (!res.ok) return _dynV3Invalid(item, res.errors, res.truncated);
+  var all = dynValidateGuidedPracticeDoc(res.value, { chapterId: item.chapterId, minutes: gp.minutes });
+  if (all.length) return _dynV3Invalid(item, _dynFormatErrors(all), false);
+  var a = _dynV3JsonArtifact(item, 'dynamic_guided_practice_json', res.value, item.chapterId);
+  return {
+    ok: true,
+    artifacts: [a.artifact],
+    summary: Object.assign({
+      chapterId: item.chapterId, guidedPracticeSchemaVersion: DYN_GUIDED_PRACTICE_SCHEMA_VERSION, minutes: gp.minutes,
+      exerciseCount: res.value.exercises.length, kinds: res.value.exercises.map(function (e) { return e.kind; }),
+      guidedPracticeSha256: a.sha, retried: !!res.retried, promptVersion: DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION, contentArtifactId: src.contentArtifactId
+    }, (caseReuse[res.usedAttempt] || []).length ? { caseReuse: caseReuse[res.usedAttempt] } : {}, clashSoft[res.usedAttempt] ? { caseClashSoft: clashSoft[res.usedAttempt] } : {}, _dynQualSummary(res), dynPedagogySummary(item))
+  };
+}
+
 // ── course_intro / module_intro v3 (JSON) ──
 async function _dynRunIntroV3(item, kind) {
   var bp = item.blueprint || {};
@@ -6468,20 +6701,31 @@ function _dynEbRememberModuleStems(item, moduleId, questions) {
   if (!st || !item.runId) return;
   try { st.setItem(DYN_EXAM_STEMS_PREFIX + item.runId + '|' + moduleId, JSON.stringify({ v: 1, stems: _dynEbStemEntries(questions) })); } catch (e) { /* sin espacio: sin memoria */ }
 }
-async function _dynEbLoadModuleStems(item) {
+// Loop 9 (worker de IA): el worker corre cada parte en un contexto NUEVO (sin la memoria del navegador): el Manifest
+// hace depender el final de los exam:<m> y los bancos llegan como dependencias. Devuelve la lista de preguntas y, en
+// `meta`, de dónde salieron (source: dependencies | dependencies_unreadable | session | none) y cuántas dependencias
+// no se pudieron leer: el final NUNCA falla por eso (sale sin bloque «no repitas»), pero queda visible en el summary.
+async function _dynEbLoadModuleStemsDetailed(item) {
   var out = [];
   var seen = {};
   function add(list) { (list || []).forEach(function (e) { var k = dynNormalizeExamText(e.stem); if (!seen[k]) { seen[k] = true; out.push(e); } }); }
   var deps = (item.dependencyArtifacts || []).filter(function (a) { return a && a.type === DYN_EXAM_BANK_ARTIFACT_TYPE; });
+  var unreadable = 0;
+  var readable = 0;
   await Promise.all(deps.map(function (d) {
     return _dynDownloadArtifactText(d.artifactId).then(function (dl) {
-      if (!dl || !dl.ok) return;
-      try { var j = JSON.parse(dl.text); if (j && j.scope === 'module') add(_dynEbStemEntries(j.questions)); } catch (e) { /* ilegible: se ignora */ }
-    }).catch(function () {});
+      if (!dl || !dl.ok) { unreadable++; return; }
+      try {
+        var j = JSON.parse(dl.text);
+        if (j && j.scope === 'module') { readable++; add(_dynEbStemEntries(j.questions)); } else { unreadable++; }
+      } catch (e) { unreadable++; /* ilegible: se cuenta */ }
+    }).catch(function () { unreadable++; });
   }));
   // Fix round 1 (m6): si el backend manda los exámenes de módulo como dependencias, son la única fuente
   // (nunca el almacenamiento del navegador).
-  if (deps.length) return out;
+  if (deps.length) {
+    return { stems: out, meta: { source: readable > 0 ? 'dependencies' : 'dependencies_unreadable', dependencies: deps.length, unreadable: unreadable } };
+  }
   var st = _dynEbStorage();
   if (st && item.runId) {
     try {
@@ -6492,7 +6736,10 @@ async function _dynEbLoadModuleStems(item) {
       }
     } catch (e) { /* sin memoria */ }
   }
-  return out;
+  return { stems: out, meta: { source: out.length ? 'session' : 'none', dependencies: 0, unreadable: 0 } };
+}
+async function _dynEbLoadModuleStems(item) {
+  return (await _dynEbLoadModuleStemsDetailed(item)).stems;
 }
 // Bloque «no repitas» del prompt del final: las preguntas de módulo del MISMO capítulo (máx. 12).
 function dynExamBankAvoidBlock(stems, chapterId) {
@@ -6540,7 +6787,8 @@ async function _dynRunExamBank(item) {
   if (mdErr) return fail(mdErr, true);
   var summaries = await _dynLoadContextSummaries(item);
   // #542 (I3): el examen final no repite las preguntas de las evaluaciones de módulo.
-  var externalStems = scope === 'final' ? await _dynEbLoadModuleStems(item) : [];
+  var stemsInfo = scope === 'final' ? await _dynEbLoadModuleStemsDetailed(item) : { stems: [], meta: null };
+  var externalStems = stemsInfo.stems;
   var infoCache = {};
   function chapterInfo(chId) {
     if (!Object.prototype.hasOwnProperty.call(md, chId)) return null;
@@ -6919,6 +7167,12 @@ async function _dynRunExamBank(item) {
     bankSha256: art.sha,
     externalStems: externalStems.length // #542 (I3): preguntas de módulo que el final evitó repetir
   };
+  if (stemsInfo.meta) {
+    // Loop 9: de dónde salieron las preguntas de módulo (y cuántos bancos no se pudieron leer) — nunca en silencio.
+    summary.externalStemsSource = stemsInfo.meta.source;
+    summary.externalStemsDependencies = stemsInfo.meta.dependencies;
+    summary.externalStemsUnreadable = stemsInfo.meta.unreadable;
+  }
   if (draftInfo) { draftInfo.chunksSkipped = stats.draftChunks; summary.draft = draftInfo; }
   Object.assign(summary, dynPedagogySummary(item));
   return { ok: true, artifacts: [art.artifact], summary: summary };
@@ -6936,6 +7190,7 @@ async function _dynRunItemV3(item) {
   if (item.type === 'activity') return _dynRunActivity(item);
   if (item.type === 'final_exam') return _dynExamBankModeOn(item) ? _dynRunExamBank(item) : _dynRunFinalExam(item);
   if (item.type === 'application_activity') return _dynRunApplicationActivity(item);
+  if (item.type === 'guided_practice') return _dynRunGuidedPractice(item);
   return { ok: false, error: 'tipo no soportado por el ejecutor del navegador (v3): ' + item.type, retryable: false };
 }
 
@@ -7023,6 +7278,7 @@ function dynExecutorStart(opts) {
       var res = await backendDynGetRun(courseId, blueprintNumber, runId, { quiet: true });
       // Fase 2: el mismo GET dice si el run tiene Actividades de Aplicación (el próximo claim las incluye).
       if (res.ok && res.data && _dynRunHasApplication(res.data)) state.withApplication = true;
+      if (res.ok && res.data && _dynRunHasGuidedPractice(res.data)) state.withGuidedPractice = true;
       if (res.ok && res.data && DYN_TERMINAL_STATUSES.indexOf(res.data.status) >= 0) {
         return res.data.status;
       }
@@ -7239,6 +7495,7 @@ function dynExecutorStart(opts) {
         if (res && res.ok && res.data) {
           setRulesVersion(_dynRunRulesVersion(res.data), 'run');
           state.withApplication = _dynRunHasApplication(res.data);
+          state.withGuidedPractice = _dynRunHasGuidedPractice(res.data);
           return;
         }
       } catch (e) { /* transitorio — reintentar */ }
@@ -7257,7 +7514,7 @@ function dynExecutorStart(opts) {
     await rulesVersionReady;
     while (!stopped) {
       var claimRes;
-      var sentTypes = _dynClaimTypesFor(state.rulesVersion, state.withApplication === true);
+      var sentTypes = _dynClaimTypesFor(state.rulesVersion, state.withApplication === true, state.withGuidedPractice === true);
       try {
         claimRes = await backendDynClaim(runId, executorId, sentTypes, DYN_LEASE_SECONDS);
       } catch (e) {

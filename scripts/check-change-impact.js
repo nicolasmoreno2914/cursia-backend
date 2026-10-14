@@ -90,10 +90,11 @@ const impactOf = (from, to) => {
   await check('CI1 dependencias: cada tipo con lo que lo alimenta, su huella y si es pagado', () => {
     const t = CI.dependencyTable();
     const by = Object.fromEntries(t.map((x) => [x.type, x]));
-    eq(Object.keys(by).length, 14, 'los 14 tipos del Manifest v3');
+    eq(Object.keys(by).length, 15, 'los 15 tipos del Manifest v3 (Loop 9 B: + guided_practice)');
     eq([by.video.paid, by.presentation.paid, by.audiobook_chapter.paid, by.audio_welcome.paid, by.content.paid], [true, true, true, true, false], 'pagados');
     eq([by.activity.outcomesInFingerprint, by.exam.outcomesInFingerprint, by.content.outcomesInFingerprint], [true, true, false], 'resultados solo en la huella de la evidencia (R26)');
     assert(/content/.test(by.application_activity.dependsOn) && /video/.test(by.video_interactions.dependsOn), 'aristas');
+    eq([by.guided_practice.paid, by.guided_practice.outcomesInFingerprint, /content/.test(by.guided_practice.dependsOn)], [false, true, true], 'práctica guiada: texto, con resultados en su huella, depende del content');
   });
 
   await check('CI2 cambiar UN capítulo: solo él (y su examen / intro de módulo / examen final); el resto intacto; lo pagado no se regenera solo', () => {

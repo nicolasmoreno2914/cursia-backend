@@ -1,4 +1,5 @@
 import { APPLICATION_ARTIFACT_TYPE, validateApplicationActivityDoc } from '../course-shell/application-activity';
+import { GUIDED_PRACTICE_ARTIFACT_TYPE, validateGuidedPracticeDoc } from '../course-shell/guided-practice';
 /**
  * Cursia V2.1 — R12: empaque de runs rulesVersion 3 — resolución de
  * artifacts, perfiles vigentes, tema, clave de reuse y carga de contenidos.
@@ -675,6 +676,8 @@ export async function loadContentsV3(
     audio?: Buffer;
     /** Fase 2: Actividad de Aplicación (actividad + solucionario), re-validada contra los minutos del plan. */
     application?: unknown;
+    /** Loop 9 B: práctica guiada, re-validada contra los minutos del plan. */
+    guidedPractice?: unknown;
   };
   const tasks: Array<() => Promise<void>> = [];
   let courseIntro: any;
@@ -795,6 +798,16 @@ export async function loadContentsV3(
           slot.application = doc;
         });
       }
+      const gpKey = ch.keys.guidedPractice;
+      if (gpKey) {
+        tasks.push(async () => {
+          // Loop 9 B: requerida como cualquier parte (sin artifact → falla el empaque); nunca se empaqueta una inválida.
+          const doc = json(await validatedText(L, byItem, gpKey, GUIDED_PRACTICE_ARTIFACT_TYPE), gpKey);
+          const errs = validateGuidedPracticeDoc(doc, { chapterId: ch.chapterId, minutes: ch.guidedPracticeMinutes as number });
+          if (errs.length) throw new Error(`${PACKAGING_V3}: ${gpKey} inválido [${[...new Set(errs.map((e) => e.code))].sort().join(', ')}] ${errs.slice(0, 3).map((e) => `${e.path} ${e.message}`).join(' | ')}`);
+          slot.guidedPractice = doc;
+        });
+      }
     }
   }
   if (plan.keys.finalExam) {
@@ -818,6 +831,7 @@ export async function loadContentsV3(
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
   const applications = new Map<string, unknown>();
+  const guidedPractices = new Map<string, unknown>();
   // r19: manifiesto validado por capítulo (output_summary del item) para el piso de 25 min del audiolibro.
   // null = audio real SIN manifiesto (curso existente, anterior a r19): el piso se omite con aviso y el
   // re-empaque NUNCA re-narra ni llama a un proveedor. Los capítulos simulados no entran al mapa.
@@ -851,6 +865,7 @@ export async function loadContentsV3(
         }
       }
       if (ch.keys.application) applications.set(ch.chapterId, slot.application);
+      if (ch.keys.guidedPractice) guidedPractices.set(ch.chapterId, slot.guidedPractice);
       if (ch.keys.audiobookChapter) {
         audiobookChapters.set(ch.chapterId, slot.audio as Buffer);
         if (!mockProviderItems.includes(ch.keys.audiobookChapter)) {
@@ -900,6 +915,8 @@ export async function loadContentsV3(
       audiobookManifests,
       // Fase 2: solo con actividades (sin ellas, la entrada del builder de siempre).
       ...(applications.size ? { applications } : {}),
+      // Loop 9 B: solo con prácticas guiadas.
+      ...(guidedPractices.size ? { guidedPractices } : {}),
     },
     exams: { modules: examSources, final: finalSrc },
     warnings,

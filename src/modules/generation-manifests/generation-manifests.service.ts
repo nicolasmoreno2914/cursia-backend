@@ -1,4 +1,4 @@
-import { assertApplicationActivitySchema } from '../course-structure/v21-schema-guard';
+import { assertApplicationActivitySchema, assertGuidedPracticeSchema } from '../course-structure/v21-schema-guard';
 import { ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -50,6 +50,19 @@ function describeErrors(errors: ManifestValidationError[]): string {
  * 0 = legacy/hash). Cualquier otro valor es integridad rota → 500 (nunca se
  * interpreta como 0).
  */
+/**
+ * Loop 9: ¿el Manifest guardado es ANTERIOR a que el examen final dependiera de los exámenes de módulo? (su final_exam
+ * depende solo de content aunque el Manifest tenga items exam). Se reconstruye igual para verificar su determinismo:
+ * una fila existente nunca cambia ni deja de ser válida.
+ */
+function storedLegacyFinalExamDeps(row: any): boolean {
+  const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
+  const items: any[] = Array.isArray(stored?.items) ? stored.items : [];
+  const fin = items.find((i) => i && i.type === 'final_exam');
+  if (!fin || !items.some((i) => i && i.type === 'exam')) return false;
+  return !(Array.isArray(fin.dependsOn) ? fin.dependsOn : []).some((d: unknown) => String(d).startsWith('exam:'));
+}
+
 function storedActivityTypeRules(row: any): ActivityTypeRulesVersion {
   const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
   return activityTypeRulesValue(stored?.features?.activityTypeRules, row?.id);
@@ -220,8 +233,9 @@ export class GenerationManifestsService {
     // reconstruyendo con el marcador guardado, nunca con la config.
     let expectedSha = sha;
     const storedRules = rulesVersion === 3 ? storedActivityTypeRules(existing) : 0;
-    if (storedRules !== activityTypeRules) {
-      const rebuilt = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules: storedRules });
+    const legacyFinalExamDeps = rulesVersion === 3 && storedLegacyFinalExamDeps(existing);
+    if (storedRules !== activityTypeRules || legacyFinalExamDeps) {
+      const rebuilt = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules: storedRules, legacyFinalExamDeps });
       expectedSha = manifestSha256(rebuilt);
     }
     if (existing.manifest_sha256 !== expectedSha) {
@@ -323,6 +337,12 @@ export class GenerationManifestsService {
     // sigue aceptando los Manifests de siempre; con actividades y sin migración → 503, nunca un 500 crudo).
     const apps = t.applicationActivityCount ?? 0;
     if (apps > 0) await assertApplicationActivitySchema(this.dataSource);
+    // Loop 9 B: ídem con guided_practice_count (con prácticas guiadas y sin migración → 503).
+    const gps = t.guidedPracticeCount ?? 0;
+    if (gps > 0) await assertGuidedPracticeSchema(this.dataSource);
+    const extraCols = `${apps > 0 ? ', application_activity_count' : ''}${gps > 0 ? ', guided_practice_count' : ''}`;
+    const extraVals = [...(apps > 0 ? [apps] : []), ...(gps > 0 ? [gps] : [])];
+    const extraPh = extraVals.map((_, k) => `, $${24 + k}`).join('');
     return this.dataSource.query(
       `insert into public.course_generation_manifests
          (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
@@ -330,16 +350,16 @@ export class GenerationManifestsService {
           scorm_count, video_count, exam_count, total_jobs, created_by,
           course_plan_count, course_intro_count, module_intro_count,
           experience_count, presentation_count, video_interactions_count, activity_count,
-          audiobook_chapter_count, audio_welcome_count, final_exam_count${apps > 0 ? ', application_activity_count' : ''})
+          audiobook_chapter_count, audio_welcome_count, final_exam_count${extraCols})
        values ($1, $2, 3, $3, $4::jsonb, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, $14, $15, $16,
-               $17, $18, $19, $20, $21, $22, $23${apps > 0 ? ', $24' : ''})
+               $17, $18, $19, $20, $21, $22, $23${extraPh})
        on conflict (blueprint_id, rules_version) do nothing
        returning *`,
       [courseId, blueprintId, MANIFEST_SCHEMA_VERSION, canonical, sha, blueprintSha,
         t.moduleCount, t.chapterCount, t.contentCount, t.videoCount, t.examCount, t.totalJobs, ownerId,
         t.coursePlanCount, t.courseIntroCount, t.moduleIntroCount,
         t.experienceCount, t.presentationCount, t.videoInteractionsCount, t.activityCount,
-        t.audiobookChapterCount, t.audioWelcomeCount, t.finalExamCount, ...(apps > 0 ? [apps] : [])],
+        t.audiobookChapterCount, t.audioWelcomeCount, t.finalExamCount, ...extraVals],
     );
   }
 
@@ -473,10 +493,12 @@ export class GenerationManifestsService {
     cols.push(row.experience_count ?? 0, row.presentation_count ?? 0, row.video_interactions_count ?? 0,
       row.activity_count ?? 0, row.audiobook_chapter_count ?? 0, row.audio_welcome_count ?? 0, row.final_exam_count ?? 0,
       // Fase 2: ausente antes de la migración de actividades → 0 (lo que declara un Manifest sin actividades).
-      row.application_activity_count ?? 0);
+      row.application_activity_count ?? 0,
+      // Loop 9 B: ausente antes de la migración de práctica guiada → 0.
+      row.guided_practice_count ?? 0);
     fromJson.push(t.experienceCount ?? 0, t.presentationCount ?? 0, t.videoInteractionsCount ?? 0,
       t.activityCount ?? 0, t.audiobookChapterCount ?? 0, t.audioWelcomeCount ?? 0, t.finalExamCount ?? 0,
-      t.applicationActivityCount ?? 0);
+      t.applicationActivityCount ?? 0, t.guidedPracticeCount ?? 0);
     if (cols.some((v, i) => v !== fromJson[i])) {
       throw new InternalServerErrorException(
         `${where}: columnas de conteo [${cols.join(',')}] no coinciden con totals del manifest [${fromJson.join(',')}]`,

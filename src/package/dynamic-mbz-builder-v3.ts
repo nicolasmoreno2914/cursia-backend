@@ -146,6 +146,8 @@ import { examExplanationsAvailability, examOverallFeedbackBands } from '../modul
 import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { reviewCardsEnabledFor } from '../modules/study-time/manifest-input';
 import { applicationSolutionPage, applicationStudentPage } from '../modules/course-shell/application-pages';
+import { guidedPracticeLibroMarkdown, guidedPracticePage } from '../modules/course-shell/guided-practice-page';
+import { validateGuidedPracticeDoc } from '../modules/course-shell/guided-practice';
 import { renderApplicationPdf } from './v3/application-pdf';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
@@ -236,6 +238,11 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * en párrafos de ≤ 70 palabras, antes de la fila de cifras (antes: todo el texto en UN párrafo a tamaño de entrada).
  * Mismo texto, sin esquema nuevo ni llamadas LLM. El divisor de oraciones (compartido con la presentación del
  * módulo) ya no descarta el texto previo a un punto sin espacio («1.5») ni corta en abreviaturas.
+ * Loop 9 B · ejercicios guiados (componente `guided_practice`; la versión sigue en 3.13.0 porque un paquete SIN ejercicios
+ * guiados es byte a byte el de siempre, y uno CON ellos solo sale de un Manifest nuevo, con otra clave de reuse): el
+ * capítulo de contenido con ejercicios guiados lleva la página «Ejercicios guiados — <capítulo>» (`cv3:ch:<id>:guided_practice`,
+ * visible, completion por vista) después de la síntesis y antes de la actividad, y los mismos ejercicios al final del
+ * capítulo en el Libro Guía (sin sumar palabras al Libro).
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.13.0';
 
@@ -286,6 +293,11 @@ export interface DynamicPackageContentsV3 {
    * Actividades de Aplicación: cada una se empaqueta como página del estudiante + solucionario docente oculto.
    */
   applications?: Map<string, unknown>;
+  /**
+   * Loop 9 B: chapterId → documento `dynamic_guided_practice_json` validado. Solo en los capítulos con ejercicios guiados:
+   * cada documento se empaqueta como página visible del capítulo y al final del capítulo en el Libro Guía.
+   */
+  guidedPractices?: Map<string, unknown>;
 }
 
 export interface BuildDynamicMbzV3Input {
@@ -874,6 +886,17 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       if (finalExamQuestionCount < 1) throw new Error(`QUIZ_V3_EMPTY: el GIFT de ${plan.keys.finalExam} no produjo preguntas`);
     }
   }
+  // Loop 9 B: prácticas guiadas validadas (falla fuerte: una del plan sin documento o inválida nunca se omite en silencio).
+  const guidedDocs = new Map<string, unknown>();
+  for (const ch of allChapters) {
+    if (!ch.keys.guidedPractice) continue;
+    const doc = c.guidedPractices?.get(ch.chapterId);
+    if (!doc) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${ch.chapterNumber} sin documento`);
+    const errs = validateGuidedPracticeDoc(doc, { chapterId: ch.chapterId, minutes: ch.guidedPracticeMinutes as number });
+    if (errs.length) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${ch.chapterNumber} inválida (${errs.slice(0, 3).map((e) => `${e.code} ${e.path}`).join('; ')})`);
+    guidedDocs.set(ch.chapterId, doc);
+  }
+  for (const id of c.guidedPractices?.keys() ?? []) if (!guidedDocs.has(id)) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${id}, que no la tiene en el plan`);
   // r19 (L3): logo de la marca de agua (cuenta → Cursia); un logo de la cuenta inválido deja su aviso, nunca en silencio.
   let libroLogo = resolveLibroLogo(input.libroBrand?.logo ?? null);
   warnings.push(...libroLogo.warnings);
@@ -885,7 +908,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       number: m.moduleNumber,
       title: m.title,
       intro: moduleIntros.get(m.moduleId) as ModuleIntroV3,
-      chapters: m.chapters.filter((ch) => ch.kind !== 'practice').map((ch) => ({ number: ch.chapterNumber, title: ch.title, md: c.contentMd.get(ch.chapterId) as string })),
+      chapters: m.chapters.filter((ch) => ch.kind !== 'practice').map((ch) => ({
+        number: ch.chapterNumber, title: ch.title, md: c.contentMd.get(ch.chapterId) as string,
+        // Loop 9 B: la práctica guiada del capítulo al final de su capítulo en el Libro (no suma palabras al Libro).
+        ...(guidedDocs.has(ch.chapterId) ? { appendixMd: guidedPracticeLibroMarkdown(guidedDocs.get(ch.chapterId)) } : {}),
+      })),
     })),
     brandName: input.libroBrand?.name ?? null,
     // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.
@@ -930,6 +957,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     ...(reviewDecks.size ? { reviewCardsChapterIds: [...reviewDecks.keys()] } : {}),
     // Motor de carga horaria: tarjetas MEDIDAS de cada «Repaso» (minutos del capítulo).
     ...(reviewDecks.size ? { reviewCardCountByChapter: Object.fromEntries([...reviewDecks].map(([id, d]) => [id, d.cards.length])) } : {}),
+    // Loop 9 B: las prácticas guiadas validadas (sus minutos entran al tiempo del capítulo).
+    ...(guidedDocs.size ? { guidedPracticeChapterIds: [...guidedDocs.keys()] } : {}),
     assessment: input.assessmentProfile,
     hours: input.hours ?? null,
     pendingVideos: plan.omittedVideos.length ? { chapterIds: plan.omittedVideos.map((v) => v.chapterId), noticeChapterIds } : null,
@@ -1369,6 +1398,15 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           addUngradedH5pActivity(sec, `${idp}:review_cards`, name, key, filename, h5p, deck.mainLibrary, (mid) =>
             reviewCardsIntroHtml({ packageFilename: filename, title: deck.title, activityMid: mid, theme: introTheme, frame: frameFor(ch.chapterNumber) }),
           );
+          continue;
+        }
+        if (slot.kind === 'guided_practice') {
+          // Loop 9 B: página visible «Práctica guiada — <capítulo>» (formativa, completion por vista), sin archivos.
+          const doc = guidedDocs.get(ch.chapterId);
+          if (!doc || cf.guidedPracticeMinutes === undefined) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${ch.chapterNumber} sin documento`);
+          const tone = moduleTone(theme, moduleColor(theme, m.moduleNumber - 1), groundColor(theme));
+          const page = guidedPracticePage({ chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone }, theme);
+          addPage(sec, `${idp}:guided_practice`, { name: safeActivityName(page.name), html: page.html }, [], { completionView: true });
           continue;
         }
         if (slot.kind === 'application') {

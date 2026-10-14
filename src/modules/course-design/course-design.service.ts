@@ -22,7 +22,7 @@ import type { AcademicContextV1 } from '../academic-context/academic-context';
 import { tokenSet } from '../coherence/normalize';
 import { proposedChapterUuid } from '../pedagogy/dry-run';
 import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../course-structure/structure-authority';
-import { compareRequirements, DesignForRequirements, RequirementCheck } from '../academic-context/requirements/document-requirements';
+import { compareRequirements, DesignForRequirements, RequirementCheck, teacherHoursDeviate } from '../academic-context/requirements/document-requirements';
 import {
   DECISION_DEFAULTS, DecisionOverrides, constraintsFor, EXCEPTION_FIELDS, structureEditedByTeacher, EXCEPTION_VALUES, ExceptionField, hoursFromRequirements, loadExceptions, loadRequirementAuthority,
   chosenContentCap, hoursAlternativeOf, requiredContentShape, requirementText, requirementVerificationChecks, teacherDecisions, writeExceptions,
@@ -171,6 +171,8 @@ export class CourseDesignService {
     if (adjust.emphasis !== undefined) prefs.emphasis = adjust.emphasis;
     if (adjust.applicationActivities !== undefined) prefs.applicationActivities = adjust.applicationActivities;
     if (adjust.audiovisual !== undefined) prefs.audiovisual = adjust.audiovisual;
+    // Loop 9 B (fix I1): «Ejercicios guiados: Automático / Ninguno» (automático = no se guarda nada).
+    if (adjust.guidedPractice !== undefined) { if (adjust.guidedPractice === 'auto') delete prefs.guidedPractice; else prefs.guidedPractice = adjust.guidedPractice; }
     if (!prefs.audiovisual) prefs.audiovisual = DEFAULT_AUDIOVISUAL;
     base.designPreferences = prefs;
 
@@ -287,7 +289,7 @@ export class CourseDesignService {
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
     const providers = dist && dist.materialized ? dist.materialized.providers : null;
-    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && ((c.videoPinned && c.kind === 'content') || c.applicationPinned)).length, 0) : 0;
+    const pinnedChapters = dist ? dist.modules.reduce((n, m) => n + m.chapters.filter((c) => !c.proposed && ((c.videoPinned && c.kind === 'content') || c.applicationPinned || c.guidedPracticePinned)).length, 0) : 0;
     // LOOP 8.6B/8.6C · requisitos del documento frente a ESTE diseño: cumplimiento, excepciones del docente y conflictos.
     let reqChecks: RequirementCheck[] = [];
     let requirementChecks: ReturnType<typeof requirementVerificationChecks> = [];
@@ -304,6 +306,10 @@ export class CourseDesignService {
       if (shapeIsDocuments) structureByTeacher = false;
       reqChecks = compareRequirements(auth.applicable, designForRequirements(dist, profile.targetHours ?? null, hoursSource === 'requirement' ? 'proposed' : hoursSource,
         structureByTeacher, !!decisions.audiovisual, !!decisions.applicationActivities));
+      // Loop 9 (A5): las horas son «del docente» (su excepción, sin chequeo de choque) solo si su meta se APARTA del documento.
+      // Una meta escrita en «Ajustar» dentro de lo que pide el documento, con un diseño que no llega, es el mismo choque que
+      // con las horas del documento (antes: «Cumple» junto a «24,2 horas (estimadas)»).
+      const hoursByTeacher = (hoursSource === 'user' || hoursSource === 'adjusted') && teacherHoursDeviate(auth.applicable, profile.targetHours ?? null);
       const teacherPins = dist.modules.some((m) => m.chapters.some((c) => !c.proposed && (c.videoPinned || c.applicationPinned)));
       // Re-review final L86C: la causa de un choque de horas se averigua, no se adivina — el mismo diseño SIN las decisiones
       // ni lo fijado por el docente. Si el choque persiste, es entre requisitos del documento (crítico), salvo que la
@@ -313,7 +319,7 @@ export class CourseDesignService {
       const clash = dist.status === 'minimum_exceeds_target' || dist.status === 'cannot_reach_target';
       const decided = EXCEPTION_FIELDS.some((f) => !!decisions[f]) || teacherPins;
       const hoursRequired = auth.required.some((r) => r.kind === 'target_hours');
-      if (clash && hoursRequired && (decided || structureByTeacher) && hoursSource !== 'user' && hoursSource !== 'adjusted') {
+      if (clash && hoursRequired && (decided || structureByTeacher) && !hoursByTeacher) {
         // Sin decisiones ni fijados el cálculo sería idéntico: el choque persiste (re-review final m-4).
         let persists = true;
         if (decided) {
@@ -356,7 +362,7 @@ export class CourseDesignService {
       }
       requirementChecks = requirementVerificationChecks(auth.applicable, reqChecks, {
         clashCause, structureByTeacher, clashWith,
-        status: dist.status, baseHours: dist.baseHours, estimatedHours: dist.estimatedHours, hoursByTeacher: hoursSource === 'user' || hoursSource === 'adjusted',
+        status: dist.status, baseHours: dist.baseHours, estimatedHours: dist.estimatedHours, hoursByTeacher,
         teacherPins,
         hoursAlternative: hoursAlternativeOf(dist),
         modules: dist.modules.length, moduleExams: dist.modules.filter((m) => m.examEnabled).length,
@@ -414,7 +420,7 @@ export class CourseDesignService {
         : null,
       hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : hoursSource === 'proposed' ? { reason: `Cursia propuso ${profile.targetHours} h para este curso.` }
         : hoursSource === 'requirement' && hoursRequirement ? { reason: hoursRequirement.required ? `Horas del documento: ${requirementText(hoursRequirement.requirement)}.` : `Horas que sugiere el documento (${requirementText(hoursRequirement.requirement)}); puedes cambiarlas en «Ajustar».` } : {}) },
-      preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual },
+      preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual, guidedPractice: prefs.guidedPractice || 'auto' },
       // Review L83 M-1: solo los fijados que el diseño usa (capítulos de contenido que existen).
       pinnedChapters,
       verification,
@@ -426,6 +432,11 @@ export class CourseDesignService {
           baseHours: dist.baseHours,
           counts: dist.counts,
           hoursByComponent: dist.hoursByComponent,
+          ...(dist.guidedPracticeFill ? { guidedPracticeFill: dist.guidedPracticeFill } : {}),
+          // Fix I1: la proporción a la vista («Ejercicios guiados: X h de Y h (Z %)»), para que la institución decida con el número.
+          ...(dist.counts.guidedPracticeMinutes ? { guidedPracticeShare: {
+            hours: Math.round((dist.counts.guidedPracticeMinutes / 60) * 10) / 10, designHours: dist.estimatedHours,
+            pct: Math.round((dist.counts.guidedPracticeMinutes / 60 / Math.max(dist.estimatedHours, 0.1)) * 100) } } : {}),
           recommendations: dist.recommendations,
           proposalSha256: dist.proposalSha256,
           manifestErrors: dist.materialized ? dist.materialized.manifestErrors : [],
@@ -436,6 +447,8 @@ export class CourseDesignService {
             chapters: m.chapters.map((c) => ({
               id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, role: c.role, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, applicationPinned: c.applicationPinned,
               activityEnabled: c.activityEnabled, review: c.review, applicationMinutes: c.applicationMinutes, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
+              // Loop 9 B: práctica guiada del capítulo de contenido (formativa, sin nota) y si la fijó el docente.
+              guidedPracticeMinutes: c.guidedPracticeMinutes ?? null, guidedPracticePinned: c.guidedPracticePinned,
               outcomeIds: chapterOutcomes.get(c.id) || [],
             })),
           })),
@@ -786,6 +799,7 @@ function designForRequirements(
       chapters: m.chapters.map((c) => ({
         kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, activityEnabled: c.activityEnabled, activityPinned: !!c.activityPinned,
         applicationMinutes: c.applicationMinutes ?? null, applicationPinned: c.applicationPinned, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
+        guidedPracticeMinutes: c.guidedPracticeMinutes ?? null,
       })),
     })),
     evaluations: dist.counts.evaluations,

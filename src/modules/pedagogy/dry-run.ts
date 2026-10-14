@@ -70,6 +70,8 @@ export interface DryRunChapterInput {
   kind?: 'content' | 'practice';
   /** Fase 2: minutos de la Actividad de Aplicación (30/60/90/120; ausente/null = sin actividad). */
   applicationMinutes?: number | null;
+  /** Loop 9 B: minutos de la práctica guiada (40/60/80/120; ausente/null/0 = sin práctica guiada; solo contenido). */
+  guidedPracticeMinutes?: number | null;
 }
 export interface DryRunModuleInput {
   id?: string;
@@ -121,6 +123,8 @@ export interface ProviderPlan {
 export const COST_CATEGORY_OF_ITEM_TYPE: Readonly<Record<string, 'audiovisual' | 'application' | 'text'>> = Object.freeze({
   video: 'audiovisual', presentation: 'audiovisual', audio_welcome: 'audiovisual', audiobook_chapter: 'audiovisual',
   application_activity: 'application',
+  // Loop 9 B (fix M2): los ejercicios guiados son texto formativo del capítulo (nunca «Actividades de Aplicación»).
+  guided_practice: 'text',
 });
 export const ESTIMATE_ASSUMPTIONS: readonly string[] = Object.freeze([
   'Es una estimación: el uso de cada recurso sale de un modelo típico por tipo (aún no medido con cursos reales), no del contenido de tu curso.',
@@ -316,6 +320,7 @@ export function snapshotFromStructure(input: DryRunStructureInput): BlueprintSna
         description: c.description ?? null, video_enabled: c.kind === 'practice' ? false : c.videoEnabled !== false, activity_enabled: c.activityEnabled !== false,
         ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
         ...(c.applicationMinutes !== undefined ? { application_minutes: c.applicationMinutes } : {}),
+        ...(c.guidedPracticeMinutes !== undefined ? { guided_practice_minutes: c.guidedPracticeMinutes } : {}),
       });
     });
   });
@@ -389,7 +394,8 @@ export function distributionProposalSha256(dist: DistributionResult): string {
     preferences: dist.preferences,
     modules: dist.modules.map((m) => ({
       id: m.id,
-      chapters: m.chapters.map((c) => ({ id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, objective: c.objective, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, applicationMinutes: c.applicationMinutes })),
+      // Loop 9 B: la práctica guiada entra a la huella solo si el capítulo la tiene (las propuestas sin ella, huella de siempre).
+      chapters: m.chapters.map((c) => ({ id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, objective: c.objective, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, applicationMinutes: c.applicationMinutes, ...(c.guidedPracticeMinutes ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}) })),
     })),
   };
   return createHash('sha256').update(JSON.stringify(canon), 'utf8').digest('hex');
@@ -431,7 +437,9 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
       if (existing) {
         // Fase 2: la propuesta fija (o quita) la Actividad de Aplicación de cada capítulo existente.
         // LOOP 8.3: y el video de los capítulos de contenido (prioridad audiovisual / valores fijados por el docente).
-        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}) });
+        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}),
+          // Loop 9 B: la propuesta fija (o quita) la práctica guiada de cada capítulo de contenido.
+          guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null });
         return;
       }
       const inherited = c.kind === 'practice' ? [] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
@@ -439,6 +447,7 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
         id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
         application_minutes: c.applicationMinutes ?? null,
+        ...(c.kind === 'content' && c.guidedPracticeMinutes ? { guided_practice_minutes: c.guidedPracticeMinutes } : {}),
         ...(inherited.length ? { outcome_ids: inherited } : {}),
       });
     });
@@ -467,6 +476,7 @@ export function distributionModelMismatch(
     ['capítulos con video', dist.counts.videoChapters, n('videoCount')],
     ['actividades', dist.counts.activities, n('activityCount')],
     ['Actividades de Aplicación', dist.counts.applicationActivities, n('applicationActivityCount')],
+    ['ejercicios guiados', dist.counts.guidedPractices ?? 0, n('guidedPracticeCount')],
     ['evaluaciones', dist.counts.evaluations, n('examCount') + n('finalExamCount')],
   ];
   const off = pairs.filter(([, a, b]) => Math.abs(a - b) > 1e-6);

@@ -15,6 +15,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { executionLeaseView, ExecutionLeaseView, normalizeRequestingExecutorId } from '../reliability/execution-lease';
+import { LLM_WORKER_PRESENCE_STRICT_SECONDS, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun, runServerExecuted } from './llm-worker-routing';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -333,6 +334,16 @@ export interface RunDto {
    * (disyuntor de consumo anómalo o tope del presupuesto del run), con el motivo legible en `detail`.
    */
   pauseInfo: { automatic: boolean; reason: string | null; detail: string | null; pausedAt: string | null } | null;
+  /**
+   * Loop 9: un worker de IA VIVO genera en el servidor TODAS las partes de IA de este run (presencia + instante de
+   * activación, los mismos helpers del ruteo): la pestaña se puede cerrar. false si el worker no está o no las cubre.
+   */
+  serverExecuted: boolean;
+  /**
+   * Loop 9 (fix M1): Manifest guardado ANTES de que el examen final dependiera de los exámenes de módulo. Si el final lo
+   * genera el worker de IA (sin la memoria del navegador) no conoce sus preguntas y puede repetir alguna.
+   */
+  legacyFinalExamDeps: boolean;
 }
 
 /** REL lease: quién consulta el run (solo para `executionLease.heldByYou`). */
@@ -3189,7 +3200,10 @@ export class RunsService {
       if (costKind !== 'llm') throw notEligible(`tipo ${mItem.type}`);
       const cascade = regenerationCascade(manifest.rulesVersion, manifest.manifest.items,
         { key: itemKey, type: mItem.type, moduleId: mItem.moduleId ?? null, chapterId: mItem.chapterId ?? null });
-      if (cascade.regenerate.length > 0 || cascade.stale.length > 0) throw notEligible('regenerarlo arrastra otros componentes');
+      // Loop 9 (fix I3): la arista exam → final_exam no quita la reparación automática de un examen de módulo (antes no
+      // existía): la reparación toca SOLO ese examen; el final conserva lo ya generado (a lo sumo una pregunta parecida).
+      const cascadeRegen = mItem.type === 'exam' ? cascade.regenerate.filter((k) => !k.startsWith('final_exam:')) : cascade.regenerate;
+      if (cascadeRegen.length > 0 || cascade.stale.length > 0) throw notEligible('regenerarlo arrastra otros componentes');
       const [latest] = await this.dataSource.query(
         `select output_summary from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [job.id, itemKey]);
       if (latest?.output_summary?.regeneration?.reason === PACKAGE_REPAIR_REASON) throw notEligible('ya se reparó una vez');
@@ -3221,6 +3235,7 @@ export class RunsService {
       const [locked] = await qr.query(`select * from public.production_jobs where id = $1 for update`, [job.id]);
       const plan = await this.planRegeneration(qr, true, {
         courseId, ownerId, job: locked, manifest, mItem, itemKey, videoMode, costKind, expectedGeneration: o.expectedGeneration,
+        skipExamFinalCascade: !!o.autoRepair,
       });
       if (plan.inFlight) {
         return {
@@ -3322,6 +3337,8 @@ export class RunsService {
       videoMode: RunVideoMode;
       costKind: RegenerationCostKind;
       expectedGeneration?: number;
+      /** Loop 9 (fix I3): reparación automática de un examen — sin la arista exam → final_exam (solo ese examen). */
+      skipExamFinalCascade?: boolean;
     },
   ): Promise<RegenerationPlan> {
     const lock = forUpdate ? ' for update' : '';
@@ -3395,11 +3412,13 @@ export class RunsService {
     const stale = staleArtifacts.length > 0 || latest.output_summary?.invalidation?.action === 'STALE_NO_AUTO';
 
     // Cascada (tabla de Fase 8 "editar el capítulo"; v3: regeneration-cascade.ts, fix round 1 I2).
-    const { regenerate: cascadeKeys, stale: staleKeys } = regenerationCascade(
+    const cascade0 = regenerationCascade(
       manifest.rulesVersion,
       manifest.manifest.items,
       { key: itemKey, type: mItem.type, moduleId: mItem.moduleId ?? null, chapterId: mItem.chapterId ?? null },
     );
+    const cascadeKeys = a.skipExamFinalCascade && mItem.type === 'exam' ? cascade0.regenerate.filter((k) => !k.startsWith('final_exam:')) : cascade0.regenerate;
+    const staleKeys = cascade0.stale;
     const depKeys = [...cascadeKeys, ...staleKeys];
     const depRows: any[] = depKeys.length
       ? await q.query(
@@ -5195,7 +5214,21 @@ export class RunsService {
       executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isDispatchableRun(job)),
       paused: isPausedRun(job),
       pauseInfo: isPausedRun(job) ? pauseInfoOf(job) : null,
+      serverExecuted: await this.serverExecutedOf(job, manifest),
+      legacyFinalExamDeps: manifestHasLegacyFinalExamDeps(manifest.manifest.items),
     };
+  }
+
+  /** Loop 9: ¿el servidor genera todas las partes de IA del run? (cobertura viva, cache 5 s; cualquier error → false). */
+  private async serverExecutedOf(job: any, manifest: ManifestDto): Promise<boolean> {
+    // Fix M5: el worker de IA solo genera runs v3. Fix M2: solo con latidos recientes (2 intervalos), nunca uno a punto de vencer.
+    if (!llmWorkerEnabled() || manifest.rulesVersion !== 3) return false;
+    try {
+      const routed = routedTypesForRun(await liveLlmWorkerCoverage(this.dataSource, Date.now(), LLM_WORKER_PRESENCE_STRICT_SECONDS), job.created_at);
+      return runServerExecuted(manifest.manifest.items.map((it) => String(it.type)), routed);
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -5317,6 +5350,13 @@ export class RunsService {
       finishedAt: toIso(r.finished_at),
     };
   }
+}
+
+/** Loop 9 (fix M1): ¿el final del Manifest depende solo de los content aunque haya exámenes de módulo? (Manifest anterior). */
+export function manifestHasLegacyFinalExamDeps(items: ReadonlyArray<{ type: string; dependsOn?: readonly string[] }>): boolean {
+  const fin = items.find((i) => i.type === 'final_exam');
+  if (!fin || !items.some((i) => i.type === 'exam')) return false;
+  return !(fin.dependsOn ?? []).some((d) => String(d).startsWith('exam:'));
 }
 
 /** Loop Cost Efficiency: datos de la pausa vigente (output_summary.pause) para el panel. */

@@ -601,6 +601,41 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     eq(M.prebriefModelSha(m), M.prebriefModelSha(mk('cannot_reach_target', 48.7)), 'huella estable');
   });
 
+  await check('PB30 (Loop 9 B fix round 2 · a) ejercicios guiados > 30 % de las horas: aceptación explícita de la institución; sin ella no se aprueba; ≤ 30 % no la pide', async () => {
+    const DV = D('modules/course-design/design-verification.js');
+    const vIn = (gpMin, est) => ({ status: 'within_tolerance', targetHours: 42, estimatedHours: est, toleranceHours: 2.1, baseHours: 23,
+      counts: { modules: 3, chapters: 15, contentChapters: 12, practiceChapters: 3, videoChapters: 12, activities: 12, applicationActivities: 3, evaluations: 4, ...(gpMin ? { guidedPracticeMinutes: gpMin } : {}) },
+      manifestErrors: [], approach: null, policyKind: 'application_first', cost: null, preferences: { emphasis: 'balanced', applicationActivities: 'auto' },
+      alignment: null, audiovisual: null, pinnedChapters: 0, autoLink: { chapterIds: [], outcomeIds: [], preview: [] }, proposedChapterIds: [], uncoveredContents: [], contentCoverage: null, requiredEvaluations: [], pinnedApplicationsOutsideMode: [], uncoveredEvaluations: [], requirementChecks: [], format: null });
+    const v45 = DV.verifyDesign(vIn(1120, 41.7));
+    const gp = v45.checks.find((c) => c.id === 'guided_share');
+    assert(gp && gp.severity === 'warning' && !v45.blocking, 'aviso (no crítico)');
+    eq(gp.capability.requirementKey, DV.GUIDED_SHARE_ACCEPTANCE_KEY, 'clave de la aceptación');
+    eq(gp.capability.requirementText, 'Ejercicios guiados: 18,7 h de 41,7 h de trabajo estimado del estudiante (modelo de tiempo de Cursia), 45 %', 'texto con las horas del modelo de tiempo');
+    eq(gp.fix && [gp.fix.action, gp.fix.value], ['guidedPractice', 'none'], '«Ejercicios guiados: Ninguno» como salida');
+    assert(!DV.verifyDesign(vIn(600, 41.7)).checks.some((c) => c.id === 'guided_share'), '24 %: no se pide aceptación');
+    assert(!DV.verifyDesign(vIn(0, 41.7)).checks.some((c) => c.id === 'guided_share'), 'sin ejercicios guiados: nada');
+    // Prebrief: excepción de capacidad → bloquea hasta la aceptación; con ella, aceptada.
+    const inp = fixture({});
+    inp.card.verification.checks.push(clone(gp));
+    const m0 = build(inp);
+    const ex = m0.exceptions.find((e) => e.requirementKey === DV.GUIDED_SHARE_ACCEPTANCE_KEY);
+    assert(ex && ex.capability && ex.reason === null && /Aceptar que 45 %/.test(ex.proposal), JSON.stringify(ex));
+    const bl = RD.prebriefReadiness(m0, inp.card, [], []).blockers.filter((b) => b.ref === DV.GUIDED_SHARE_ACCEPTANCE_KEY);
+    eq(bl.length, 1, 'bloquea sin la aceptación');
+    assert(/Supera el 30 %: para continuar, la institución debe aceptar esa proporción/.test(bl[0].title) && /^Se acepta que 18,7 h de 41,7 h/.test(bl[0].suggestion), JSON.stringify(bl[0]));
+    const flat = JSON.stringify(DOC.buildPrebriefDocument(m0));
+    assert(/Supera el 30 % de las horas; para aprobar, la institución debe aceptar esa proporción/.test(flat) && /requiere aceptación/.test(flat), 'la propuesta lo muestra: ' + flat.slice(0, 200));
+    assert(!/requisito del documento que Cursia no cubre/.test(flat), 'no se presenta como requisito del documento');
+    inp.exceptionReasons[DV.GUIDED_SHARE_ACCEPTANCE_KEY] = { reason: bl[0].suggestion, requirementText: ex.requirementText, by: 'coordinacion@demo.test', at: '2026-10-13T12:00:00.000Z' };
+    const m1 = build(inp);
+    assert(m1.exceptions.find((e) => e.requirementKey === DV.GUIDED_SHARE_ACCEPTANCE_KEY).reason, 'aceptada');
+    assert(!RD.prebriefReadiness(m1, inp.card, [], []).blockers.some((b) => b.ref === DV.GUIDED_SHARE_ACCEPTANCE_KEY), 'con la aceptación ya no bloquea');
+    // Si la proporción cambia (otro texto), la aceptación anterior no vale.
+    inp.card.verification.checks = inp.card.verification.checks.filter((c) => c.id !== 'guided_share').concat([clone(DV.verifyDesign(vIn(1240, 42.3)).checks.find((c) => c.id === 'guided_share'))]);
+    assert(RD.prebriefReadiness(build(inp), inp.card, [], []).blockers.some((b) => b.ref === DV.GUIDED_SHARE_ACCEPTANCE_KEY), 'otra proporción: se vuelve a pedir');
+  });
+
   console.log(`\n${ok} OK · ${fail} fallas`);
   process.exit(fail ? 1 : 0);
 })();

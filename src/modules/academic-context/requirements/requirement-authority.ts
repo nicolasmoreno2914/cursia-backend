@@ -98,6 +98,11 @@ export interface DistributorRequirementConstraints {
    * módulos por su cuenta; esto solo evita que su recomendación proponga módulos nuevos que contradigan el documento.
    */
   modulesFixed?: number;
+  /**
+   * Loop 9 B (fix I2): horas OBLIGATORIAS del documento (intersección de sus límites). Solo acompaña a otras restricciones
+   * (no hace que un documento «tenga restricciones»); el relleno con ejercicios guiados nunca queda por debajo del mínimo.
+   */
+  hoursBounds?: { min?: number; max?: number };
   /** Requisito de origen de cada restricción (para explicar los cambios). */
   sources: Partial<Record<'chapters' | 'practice' | 'activities' | 'videos' | 'applicationPerModule' | 'applicationTotal', string>>;
 }
@@ -295,7 +300,25 @@ export async function requirementConstraintsForCourse(
 ): Promise<DistributorRequirementConstraints | null> {
   const a = await loadRequirementAuthority(q, courseId, contextDocs);
   const c = constraintsFor(a.required, teacherDecisions(a, savedPrefs, decisions), { structureByTeacher: await structureEditedByTeacher(q, courseId) });
-  return capToChosenShape(c, await chosenContentCap(q, courseId));
+  const out = capToChosenShape(c, await chosenContentCap(q, courseId));
+  const hb = out ? requiredHoursBounds(a.applicable) : null;
+  return out && hb ? { ...out, hoursBounds: hb } : out;
+}
+
+/**
+ * Loop 9 B (fix I2): límites de las horas OBLIGATORIAS del documento (los mismos que usa `hoursFromRequirements`).
+ * null = sin horas obligatorias con límites, o contradictorias.
+ */
+export function requiredHoursBounds(applicable: DocumentRequirement[]): { min?: number; max?: number } | null {
+  const reqs = applicable.filter((r) => r.kind === 'target_hours' && r.scope.level === 'course' && typeof r.value === 'number'
+    && r.obligation === 'required' && r.mode !== 'approx' && r.confidence === 'high');
+  if (!reqs.length || reqs.some((a) => reqs.some((b) => a !== b && !compatible(a, b)))) return null;
+  let lo: number | undefined;
+  let hi: number | undefined;
+  for (const r of reqs) { const b = bounds(r); if (b) { if (b.min !== undefined) lo = Math.max(lo ?? b.min, b.min); if (b.max !== undefined) hi = Math.min(hi ?? b.max, b.max); } }
+  if (lo === undefined && hi === undefined) return null;
+  if (lo !== undefined && hi !== undefined && lo > hi) return null;
+  return { ...(lo !== undefined ? { min: lo } : {}), ...(hi !== undefined ? { max: hi } : {}) };
 }
 
 /**
@@ -400,8 +423,8 @@ function halfStep(n: number, lo = 1, hi = 500): number {
 }
 
 /**
- * Horas que pide el documento (si aplica): obligatorio exacto → ese valor; rango / mínimo / máximo → la propuesta de
- * Cursia llevada dentro del intervalo; aproximado o recomendado → ese valor como sugerencia (sin `required`).
+ * Horas que pide el documento (si aplica): obligatorio exacto → ese valor; rango → la propuesta de Cursia si cae dentro,
+ * si no el punto medio del rango (Loop 9 B); mínimo / máximo → la propuesta de Cursia llevada dentro del intervalo; aproximado o recomendado → ese valor como sugerencia (sin `required`).
  * null = el documento no dice horas del curso.
  */
 export function hoursFromRequirements(applicable: DocumentRequirement[], proposal: number | null): { value: number; requirement: DocumentRequirement; required: boolean } | null {
@@ -420,7 +443,11 @@ export function hoursFromRequirements(applicable: DocumentRequirement[], proposa
     if (Math.ceil(lo * 2) / 2 > Math.floor(hi * 2) / 2) return null;
     const width = (r: DocumentRequirement) => { const b = bounds(r) || {}; return (b.max ?? 500) - (b.min ?? 1); };
     const req = [...reqs].sort((a, b) => width(a) - width(b))[0];
-    const p = proposal ?? lo;
+    // Loop 9 B: con un RANGO del documento («40–44 horas») la meta de diseño es su punto medio (la misma «Meta de diseño»
+    // que muestra «Lo que entendimos»), salvo que la propuesta ya caiga dentro: así el diseño no queda en el borde del rango.
+    const bounded = lo > 1 && hi < 500;
+    const inside = proposal !== null && proposal >= lo && proposal <= hi;
+    const p = bounded && !inside ? (lo + hi) / 2 : proposal ?? lo;
     return { value: halfStep(Math.min(Math.max(p, lo), hi), lo, hi), requirement: req, required: true };
   }
   // Recomendado, aproximado o leído con confianza media: una sugerencia (solo si nadie eligió las horas).
@@ -614,8 +641,8 @@ export function capabilityProposal(r: DocumentRequirement, hours?: number | null
   if (r.kind === 'target_hours' && typeof hours === 'number') {
     const byDoc = alt?.limitedByDocument !== false;
     const base = byDoc
-      ? `Cursia ya llevó a sus niveles máximos las Actividades de Aplicación que el documento permite, sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con las cantidades que fija el documento (capítulos, videos, actividades y evaluaciones) no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`
-      : `Cursia ya llevó las Actividades de Aplicación hasta sus propios límites (la mitad del tiempo del curso y 4 horas por capítulo), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con la estructura que fija el documento no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`;
+      ? `Cursia ya llevó a sus niveles máximos las Actividades de Aplicación que el documento permite y completó con ejercicios guiados (formativos, hasta 120 min por capítulo de contenido), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con las cantidades que fija el documento (capítulos, videos, actividades y evaluaciones) no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`
+      : `Cursia ya llevó las Actividades de Aplicación hasta sus propios límites (la mitad del tiempo del curso y 4 horas por capítulo) y completó con ejercicios guiados (formativos, hasta 120 min por capítulo de contenido), sin agregar capítulos: el diseño equivale a ≈ ${n1(hours)} horas de trabajo del estudiante. Con la estructura que fija el documento no se llega más lejos en el modelo de tiempo de Cursia, que no rellena textos ni tiempos.`;
     if (alt && alt.added > 0) {
       const scope = byDoc ? `Eso suma ${alt.added} Actividades de Aplicación a las que pide el documento` : `Eso suma ${alt.added} Actividades de Aplicación y supera la proporción de aplicación que Cursia usa por defecto`;
       return `${base} Alternativa con lo que Cursia ya produce: una Actividad de Aplicación de ${alt.tier} min en cada uno de los ${alt.contentChapters} capítulos de contenido llevaría el curso a ≈ ${n1(alt.hours)} horas${alt.reaches ? '' : ' (aún por debajo de lo pedido)'}. ${scope}, así que lo decide la institución (se fija capítulo por capítulo en «Estructura» y queda como excepción documentada). Si no, se declara la carga real de ≈ ${n1(hours)} horas.`;
@@ -738,8 +765,11 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
         : r.kind === 'videos' && ctx.exceptionFields.audiovisual ? { kind: 'adjust' as const, action: 'audiovisual', value: 'requirement', label: 'Volver al requisito del documento' }
           : r.kind === 'application_activities' && ctx.exceptionFields.applicationActivities ? { kind: 'adjust' as const, action: 'applicationActivities', value: 'requirement', label: 'Volver al requisito del documento' }
             : { kind: 'editor' as const, action: 'structure', label: 'Revisar en el editor' };
+      // Loop 9 (A5): en las horas, `has2` son las ESTIMADAS del diseño; si la meta que elegiste es otra, se dicen las dos.
+      const chosen = r.kind === 'target_hours' && typeof c.actual?.target === 'number'
+        ? `${n1(c.actual.target)} ${c.actual.target === 1 ? 'hora' : 'horas'} (el diseño queda en ≈ ${n1(c.actual.value as number)} h)` : has2;
       out.push({ id, area: 'requirements', severity: 'warning', title: `Excepción al requisito del documento: ${asked}`,
-        detail: `Te estás apartando de un requisito del documento: ${docAsks(asked).replace(/^El/, 'el')}; elegiste ${has2}. Cursia respeta tu decisión.`, fix });
+        detail: `Te estás apartando de un requisito del documento: ${docAsks(asked).replace(/^El/, 'el')}; elegiste ${chosen}. Cursia respeta tu decisión.`, fix });
       continue;
     }
     // Review QA M1: el diseño se pasa de las horas del documento por una decisión del docente (estructura, fijados o
@@ -777,6 +807,19 @@ export function requirementVerificationChecks(applicable: DocumentRequirement[],
       cause = ' Cursia no quita capítulos existentes ni pasa del máximo por su cuenta.';
     } else if (r.kind === 'application_activities' && ctx.exceptionFields.applicationActivities === undefined) {
       cause = ' Con los capítulos del diseño no se pueden ubicar sin pasar los topes de cada capítulo.';
+    }
+    // Fix round 1 (I1): las horas ESTIMADAS quedan fuera de lo que pide el documento aunque el diseño esté dentro de la
+    // tolerancia de su meta (p. ej. meta 40, ≈ 38,7 h para 40–44) y nadie se apartó a propósito: no es un choque sin salida
+    // (crítico sin causa) sino un requisito no cubierto con las horas reales — la institución acepta la diferencia (R68).
+    if (!twin && r.kind === 'target_hours' && r.scope.level === 'course' && c.status === 'unmet' && ctx.status === 'within_tolerance' && typeof c.actual?.value === 'number') {
+      const est = c.actual.value as number;
+      const produces = `el diseño de Cursia equivale a ≈ ${n1(est)} horas de trabajo del estudiante: dentro de la tolerancia de su meta${typeof c.actual.target === 'number' ? ` (${n1(c.actual.target)} h)` : ''}, pero fuera de lo que pide el documento (Cursia no rellena textos ni tiempos para llegar)`;
+      out.push({ id, area: 'requirements', severity: 'warning', title: `Requisito no cubierto por Cursia: ${asked}`,
+        detail: `El microcurrículo solicita ${asked}. Actualmente, ${produces}. No se puede presentar como cumplido: para continuar, la institución debe aceptar esta diferencia en la propuesta o ajustar las horas.`,
+        fix: { kind: 'adjust' as const, action: 'targetHours', label: 'Revisar las horas' },
+        capability: { requirementKey: String(r.key), requirementText: asked, produces,
+          proposal: `Declarar la carga real de ≈ ${n1(est)} horas o ajustar las horas en «Ajustar» (lo decide la institución).` } });
+      continue;
     }
     const fix = (r.kind === 'modules' || r.kind === 'chapters' || r.kind === 'structure' || r.kind === 'evaluations')
       ? { kind: 'editor' as const, action: r.kind === 'evaluations' ? 'module_exams' : 'structure', label: 'Resolver en el editor' }

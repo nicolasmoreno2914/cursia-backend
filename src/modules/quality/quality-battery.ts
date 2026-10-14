@@ -75,6 +75,8 @@ export const EXPECTED_ARTIFACT_BY_ITEM_TYPE: Readonly<Record<string, readonly st
   experience: ['dynamic_experience_json'],
   video_interactions: ['dynamic_video_interactions_json'],
   application_activity: ['dynamic_application_json'],
+  // Loop 9 B: una práctica guiada sin su artifact también es contenido perdido (Q1).
+  guided_practice: ['dynamic_guided_practice_json'],
   // Review I5: un examen sin su banco (o su GIFT) también es contenido perdido.
   exam: ['dynamic_exam_bank_json', 'dynamic_exam_gift'],
   final_exam: ['dynamic_exam_bank_json', 'dynamic_exam_gift'],

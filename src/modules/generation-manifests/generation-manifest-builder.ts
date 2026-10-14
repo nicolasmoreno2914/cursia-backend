@@ -13,6 +13,7 @@ import {
 } from './activity-type-rules';
 import { chooseActivityTypesV2 } from './activity-type-rules-v2';
 import { isApplicationMinutes } from '../study-time/application-tiers';
+import { isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 import { sortedCanonicalJson } from '../coherence/canonical-json';
 import { ManifestFeaturesPedagogy, manifestFeaturesPedagogy, manifestItemDesign } from '../pedagogy/manifest-design';
 import { allowedPedagogicalTypes, choosePedagogicalActivityTypes } from '../pedagogy/pedagogical-blueprint';
@@ -52,6 +53,8 @@ export type ManifestItemType =
   | 'activity'
   // Fase 2 · Actividades de Aplicación (solo en capítulos con applicationMinutes):
   | 'application_activity'
+  // Loop 9 B · Práctica guiada (solo capítulos de CONTENIDO con guidedPracticeMinutes):
+  | 'guided_practice'
   | 'audiobook_chapter'
   | 'audio_welcome'
   | 'final_exam';
@@ -71,12 +74,12 @@ export const MANIFEST_ITEM_TYPES_V2: readonly ManifestItemType[] = [
  */
 export const MANIFEST_ITEM_TYPES_V3: readonly ManifestItemType[] = [
   'course_plan', 'course_intro', 'audio_welcome', 'module_intro',
-  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter',
+  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter',
   'exam', 'final_exam',
 ];
 /** Tipos que solo existen en rulesVersion 3. */
 export const V3_ONLY_ITEM_TYPES: readonly ManifestItemType[] = [
-  'experience', 'presentation', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter', 'audio_welcome', 'final_exam',
+  'experience', 'presentation', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter', 'audio_welcome', 'final_exam',
 ];
 /** Todos los tipos que existen en algún rulesVersion soportado. */
 export const ALL_MANIFEST_ITEM_TYPES: readonly ManifestItemType[] = [...MANIFEST_ITEM_TYPES_V2, ...V3_ONLY_ITEM_TYPES];
@@ -117,6 +120,8 @@ export interface ManifestChapter {
   kind?: 'practice';
   /** Fase 2: minutos de la Actividad de Aplicación, SOLO en capítulos que la tienen (sin la clave: sha de siempre). */
   applicationMinutes?: number;
+  /** Loop 9 B: minutos de la práctica guiada, SOLO en capítulos de contenido que la tienen (sin la clave: sha de siempre). */
+  guidedPracticeMinutes?: number;
 }
 
 export interface ManifestModule {
@@ -155,6 +160,8 @@ export interface ManifestItem {
   design?: Record<string, unknown>;
   /** Fase 2: SOLO en items `application_activity` — minutos de trabajo del estudiante (30/60/90/120). */
   applicationMinutes?: number;
+  /** Loop 9 B: SOLO en items `guided_practice` — minutos de la práctica guiada (40/60/80/120). */
+  guidedPracticeMinutes?: number;
 }
 
 /** Solo rulesVersion 3: flags de curso del Blueprint v2 que cambian el conjunto de items. */
@@ -208,6 +215,8 @@ export interface ManifestTotals {
   totalJobs: number;
   /** Fase 2: SOLO si el Manifest tiene Actividades de Aplicación (va después de totalJobs; sin ella, sha de siempre). */
   applicationActivityCount?: number;
+  /** Loop 9 B: SOLO si el Manifest tiene prácticas guiadas (después de applicationActivityCount; sin ella, sha de siempre). */
+  guidedPracticeCount?: number;
 }
 
 /**
@@ -273,14 +282,14 @@ export function moduleIntroKey(moduleId: string): string {
 export function buildGenerationManifest(
   snapshotIn: AnyBlueprintSnapshot,
   source: ManifestSource,
-  opts?: { rulesVersion?: ManifestRulesVersion; activityTypeRules?: ActivityTypeRulesVersion },
+  opts?: { rulesVersion?: ManifestRulesVersion; activityTypeRules?: ActivityTypeRulesVersion; legacyFinalExamDeps?: boolean },
 ): GenerationManifestV1 {
   const rulesVersion: ManifestRulesVersion = opts?.rulesVersion ?? 1;
   if (!SUPPORTED_RULES_VERSIONS.includes(rulesVersion)) {
     throw new Error(`buildGenerationManifest: rulesVersion no soportado: ${String(rulesVersion)}`);
   }
   if (rulesVersion === 3) {
-    return buildGenerationManifestV3(snapshotIn as BlueprintSnapshotV2, source, { activityTypeRules: opts?.activityTypeRules ?? 0 });
+    return buildGenerationManifestV3(snapshotIn as BlueprintSnapshotV2, source, { activityTypeRules: opts?.activityTypeRules ?? 0, legacyFinalExamDeps: opts?.legacyFinalExamDeps === true });
   }
   if ((opts?.activityTypeRules ?? 0) !== 0) {
     // Las reglas de tipo de actividad solo existen en rulesVersion 3 (items activity).
@@ -1080,7 +1089,9 @@ export function manifestSha256(m: GenerationManifestV1): string {
 //   activity:<ch>; ambos con dependsOn = los content de los capítulos de CONTENIDO del módulo, en orden (se apoyan
 //   en sus resúmenes). Sin content, presentation, video ni audiobook_chapter, y fuera de exam/final_exam.
 //   exam:<m>                      module  examEnabled        content del módulo, en orden
-//   final_exam:<courseId>         course  course.finalExam   todos los content, en orden
+//   final_exam:<courseId>         course  course.finalExam   todos los content, en orden + los exam:<m>, en orden
+//                                                            (Loop 9: el final recibe los bancos de módulo como
+//                                                            dependencias; Manifests anteriores: solo los content)
 // Orden canónico: course_plan, course_intro, audio_welcome; por módulo:
 // module_intro → por capítulo (content, experience, presentation, video,
 // video_interactions, activity, audiobook_chapter) → exam; al final final_exam.
@@ -1098,7 +1109,7 @@ export function finalExamKey(courseId: number): string {
 
 /** Tipos por capítulo de v3, en orden canónico. */
 const V3_CHAPTER_TYPES_IN_ORDER = [
-  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter',
+  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter',
 ] as const;
 
 function assertV2Snapshot(snapshot: any, where: string): asserts snapshot is BlueprintSnapshotV2 {
@@ -1118,7 +1129,14 @@ function assertV2Snapshot(snapshot: any, where: string): asserts snapshot is Blu
 export function buildGenerationManifestV3(
   snapshot: BlueprintSnapshotV2,
   source: ManifestSource,
-  opts?: { activityTypeRules?: ActivityTypeRulesVersion },
+  opts?: {
+    activityTypeRules?: ActivityTypeRulesVersion;
+    /**
+     * Loop 9: SOLO para reconstruir un Manifest guardado ANTES de que el examen final dependiera de los exámenes de
+     * módulo (verificación de determinismo de una fila existente): final_exam con dependsOn = solo los content.
+     */
+    legacyFinalExamDeps?: boolean;
+  },
 ): GenerationManifestV1 {
   assertV2Snapshot(snapshot, 'buildGenerationManifestV3');
   const activityTypeRules = opts?.activityTypeRules ?? 0;
@@ -1151,6 +1169,7 @@ export function buildGenerationManifestV3(
   ];
   const modules: ManifestModule[] = [];
   const allContentKeys: string[] = [];
+  const allExamKeys: string[] = [];
   let chapterNumber = 0;
 
   const modulesSorted = [...snapshot.modules].sort((a, b) => a.position - b.position);
@@ -1165,6 +1184,9 @@ export function buildGenerationManifestV3(
     const sortedChapters = [...m.chapters].sort((a, b) => a.position - b.position);
     // Motor de carga horaria: la práctica se apoya en los content de los capítulos de CONTENIDO del módulo.
     const moduleContentKeys = sortedChapters.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    // Loop 9 B (fix N1): los ejercicios guiados esperan a las Actividades de Aplicación del módulo (para no repetir su caso).
+    // Sin ciclo: una AA depende solo de content (nunca de guided_practice).
+    const moduleAppKeys = sortedChapters.filter((c) => isApplicationMinutes((c as { applicationMinutes?: unknown }).applicationMinutes)).map((c) => `application_activity:${c.id}`);
     for (const c of sortedChapters) {
       if (typeof c.activityEnabled !== 'boolean') {
         throw new Error(`BLUEPRINT_V2_INVALID_INPUT: chapter ${c.id} sin activityEnabled boolean`);
@@ -1181,10 +1203,17 @@ export function buildGenerationManifestV3(
         throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo ${c.id} tiene applicationMinutes inválido (${JSON.stringify(appMin)})`);
       }
       const application = isApplicationMinutes(appMin) ? appMin : null;
+      // Loop 9 B: práctica guiada (solo contenido; ausente = sin práctica guiada).
+      const gpMin = (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes;
+      if (gpMin !== undefined && (!isGuidedPracticeMinutes(gpMin) || practice)) {
+        throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo ${c.id} tiene guidedPracticeMinutes inválido (${JSON.stringify(gpMin)}${practice ? '; es de práctica' : ''})`);
+      }
+      const guided = isGuidedPracticeMinutes(gpMin) ? gpMin : null;
       chapters.push({
         chapterId: c.id, position: c.position, chapterNumber, videoEnabled, activityEnabled: c.activityEnabled,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(application !== null ? { applicationMinutes: application } : {}),
+        ...(guided !== null ? { guidedPracticeMinutes: guided } : {}),
       });
       const base = { scope: 'chapter' as const, moduleId: m.id, chapterId: c.id, moduleNumber, chapterNumber };
       if (practice) {
@@ -1227,6 +1256,9 @@ export function buildGenerationManifestV3(
       if (application !== null) {
         items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [contentKey], applicationMinutes: application });
       }
+      if (guided !== null) {
+        items.push({ key: `guided_practice:${c.id}`, type: 'guided_practice', ...base, dependsOn: [contentKey, ...moduleAppKeys], guidedPracticeMinutes: guided });
+      }
       items.push({ key: `audiobook_chapter:${c.id}`, type: 'audiobook_chapter', ...base, dependsOn: [contentKey] });
     }
     modules.push({ moduleId: m.id, position: m.position, moduleNumber, examEnabled: !!m.examEnabled, chapters });
@@ -1235,10 +1267,14 @@ export function buildGenerationManifestV3(
         key: `exam:${m.id}`, type: 'exam', scope: 'module',
         moduleId: m.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [...contentKeys],
       });
+      allExamKeys.push(`exam:${m.id}`);
     }
   });
   if (course.finalExam) {
-    items.push({ key: finalExamKey(source.courseId), type: 'final_exam', ...courseBase, dependsOn: [...allContentKeys] });
+    // Loop 9 (#542 sin navegador): el final depende también de los exámenes de módulo → recibe sus bancos como
+    // dependencias y evita repetir sus preguntas aunque lo genere el worker (un contexto nuevo por parte).
+    const finalDeps = opts?.legacyFinalExamDeps === true ? [...allContentKeys] : [...allContentKeys, ...allExamKeys];
+    items.push({ key: finalExamKey(source.courseId), type: 'final_exam', ...courseBase, dependsOn: finalDeps });
   }
   if (pedagogyFeature) {
     for (let i = 0; i < items.length; i++) {
@@ -1285,6 +1321,7 @@ export function buildGenerationManifestV3(
       finalExamCount: count('final_exam'),
       totalJobs: items.length,
       applicationActivityCount: count('application_activity'),
+      guidedPracticeCount: count('guided_practice'),
     }),
   };
 }
@@ -1310,11 +1347,13 @@ function totalsV3From(t: ManifestTotals): ManifestTotals {
     totalJobs: t.totalJobs,
     // Fase 2: la clave existe SOLO con actividades (los Manifests sin ellas conservan su forma y su sha).
     ...(t.applicationActivityCount ? { applicationActivityCount: t.applicationActivityCount } : {}),
+    // Loop 9 B: ídem con las prácticas guiadas.
+    ...(t.guidedPracticeCount ? { guidedPracticeCount: t.guidedPracticeCount } : {}),
   };
 }
 
 /** Fase 2: claves opcionales de totals v3 (después de totalJobs; solo si son > 0). */
-export const MANIFEST_TOTALS_OPTIONAL_KEYS_V3: readonly (keyof ManifestTotals)[] = ['applicationActivityCount'];
+export const MANIFEST_TOTALS_OPTIONAL_KEYS_V3: readonly (keyof ManifestTotals)[] = ['applicationActivityCount', 'guidedPracticeCount'];
 
 /** Claves exactas de totals en v3 (orden canónico). */
 export const MANIFEST_TOTALS_KEYS_V3: readonly (keyof ManifestTotals)[] = [
@@ -1356,6 +1395,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
         activityEnabled: c.activityEnabled,
         ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
         ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
+        ...(c.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
       })),
     })),
     items: m.items.map((i) => ({
@@ -1372,6 +1412,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       // Motor pedagógico V1: claves del diseño ordenadas (independiente del orden de jsonb).
       ...(i.design !== undefined ? { design: JSON.parse(sortedCanonicalJson(i.design)) } : {}),
       ...(i.applicationMinutes !== undefined ? { applicationMinutes: i.applicationMinutes } : {}),
+      ...(i.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: i.guidedPracticeMinutes } : {}),
     })),
     // Se copian TODAS las claves que traiga (en orden v3 primero, luego
     // cualquier extra como scormCount) para que el validador vea un totals
@@ -1398,6 +1439,8 @@ interface ExpectedItemV3 {
   variant?: ActivityVariant;
   /** Fase 2: solo en application_activity. */
   applicationMinutes?: number;
+  /** Loop 9 B: solo en guided_practice. */
+  guidedPracticeMinutes?: number;
 }
 
 /**
@@ -1503,10 +1546,11 @@ export function validateGenerationManifestV3(
   expected.push(course('course_intro', [planKey]));
   expected.push(course('audio_welcome', [introKey]));
 
-  const chapterInfo = new Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number }>();
+  const chapterInfo = new Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number; guidedPracticeMinutes?: number }>();
   const moduleInfo = new Map<string, { examEnabled: boolean }>();
   const expectedModules: ManifestModule[] = [];
   const allContent: string[] = [];
+  const allExams: string[] = [];
   let chNum = 0;
   const mods = [...snapshot.modules].sort((a, b) => a.position - b.position);
   mods.forEach((mod, idx) => {
@@ -1520,6 +1564,7 @@ export function validateGenerationManifestV3(
     const mirrorChapters: ManifestChapter[] = [];
     const sortedCh = [...mod.chapters].sort((a, b) => a.position - b.position);
     const modContentAll = sortedCh.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    const modAppAll = sortedCh.filter((c) => isApplicationMinutes((c as { applicationMinutes?: unknown }).applicationMinutes)).map((c) => `application_activity:${c.id}`);
     for (const c of sortedCh) {
       chNum += 1;
       const videoOn = !!c.videoEnabled;
@@ -1528,11 +1573,15 @@ export function validateGenerationManifestV3(
       // Fase 2: minutos de la Actividad de Aplicación (un valor fuera de los niveles no produce item: lo marca el validador del Blueprint).
       const appRaw = (c as { applicationMinutes?: unknown }).applicationMinutes;
       const appMin = isApplicationMinutes(appRaw) ? appRaw : undefined;
-      chapterInfo.set(c.id, { moduleId: mod.id, videoEnabled: videoOn, activityEnabled: activityOn, ...(appMin !== undefined ? { applicationMinutes: appMin } : {}) });
+      // Loop 9 B: práctica guiada SOLO en capítulos de contenido (un valor inválido o en práctica no produce item).
+      const gpRaw = (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes;
+      const gpMin = !practice && isGuidedPracticeMinutes(gpRaw) ? gpRaw : undefined;
+      chapterInfo.set(c.id, { moduleId: mod.id, videoEnabled: videoOn, activityEnabled: activityOn, ...(appMin !== undefined ? { applicationMinutes: appMin } : {}), ...(gpMin !== undefined ? { guidedPracticeMinutes: gpMin } : {}) });
       mirrorChapters.push({
         chapterId: c.id, position: c.position, chapterNumber: chNum, videoEnabled: videoOn, activityEnabled: activityOn,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(appMin !== undefined ? { applicationMinutes: appMin } : {}),
+        ...(gpMin !== undefined ? { guidedPracticeMinutes: gpMin } : {}),
       });
       const ch = (type: ManifestItemType, dependsOn: string[], variant?: ActivityVariant): ExpectedItemV3 => ({
         key: `${type}:${c.id}`, type, scope: 'chapter', moduleId: mod.id, chapterId: c.id,
@@ -1557,6 +1606,8 @@ export function validateGenerationManifestV3(
           if (activityOn) expected.push(ch(type, [content], engine));
         } else if (type === 'application_activity') {
           if (appMin !== undefined) expected.push({ ...ch(type, [content]), applicationMinutes: appMin });
+        } else if (type === 'guided_practice') {
+          if (gpMin !== undefined) expected.push({ ...ch(type, [content, ...modAppAll]), guidedPracticeMinutes: gpMin });
         } else expected.push(ch(type, [content]));
       }
     }
@@ -1566,9 +1617,13 @@ export function validateGenerationManifestV3(
         key: `exam:${mod.id}`, type: 'exam', scope: 'module',
         moduleId: mod.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [...modContent],
       });
+      allExams.push(`exam:${mod.id}`);
     }
   });
-  if (finalExam) expected.push(course('final_exam', [...allContent]));
+  // Loop 9: el final depende de los content Y de los exam:<m> (en orden). Un Manifest guardado antes (solo los content)
+  // sigue siendo válido: sus runs en curso y su empaque no cambian (legacyFinalDeps).
+  if (finalExam) expected.push(course('final_exam', [...allContent, ...allExams]));
+  const legacyFinalDeps = [...allContent];
   const expectedByKey = new Map(expected.map((e) => [e.key, e]));
 
   // --- modules[] (espejo, con activityEnabled) ---
@@ -1615,7 +1670,8 @@ export function validateGenerationManifestV3(
         });
       }
       const deps = Array.isArray(it.dependsOn) ? it.dependsOn : [];
-      if (deps.length !== exp.dependsOn.length || deps.some((d, i) => d !== exp.dependsOn[i])) {
+      const sameDeps = (want: readonly string[]) => deps.length === want.length && deps.every((d, i) => d === want[i]);
+      if (!sameDeps(exp.dependsOn) && !(exp.type === 'final_exam' && sameDeps(legacyFinalDeps))) {
         errors.push({
           code: 'WRONG_DEPENDENCIES',
           message: `item ${it.key}: dependsOn esperado ${JSON.stringify(exp.dependsOn)}, encontrado ${JSON.stringify(it.dependsOn)}`,
@@ -1653,6 +1709,16 @@ export function validateGenerationManifestV3(
       }
     } else if (gotApp !== undefined) {
       errors.push({ code: 'UNEXPECTED_APPLICATION_MINUTES', message: `item ${it.key}: solo los items application_activity llevan applicationMinutes`, key: it.key });
+    }
+    // Loop 9 B: guidedPracticeMinutes SOLO en guided_practice y igual al del capítulo del Blueprint.
+    const gotGp = (it as any).guidedPracticeMinutes;
+    if (it.type === 'guided_practice') {
+      const wantGp = exp?.guidedPracticeMinutes;
+      if (exp && gotGp !== wantGp) {
+        errors.push({ code: 'WRONG_GUIDED_PRACTICE_MINUTES', message: `item ${it.key}: guidedPracticeMinutes esperado ${JSON.stringify(wantGp ?? null)}, encontrado ${JSON.stringify(gotGp ?? null)}`, key: it.key });
+      }
+    } else if (gotGp !== undefined) {
+      errors.push({ code: 'UNEXPECTED_GUIDED_PRACTICE_MINUTES', message: `item ${it.key}: solo los items guided_practice llevan guidedPracticeMinutes`, key: it.key });
     }
     const h5pType = (it as any).h5pType;
     const isH5pActivity = it.type === 'activity' && it.variant === 'h5p';
@@ -1723,6 +1789,7 @@ export function validateGenerationManifestV3(
     finalExamCount: cnt('final_exam'),
     totalJobs: expected.length,
     applicationActivityCount: cnt('application_activity'),
+    guidedPracticeCount: cnt('guided_practice'),
   });
   const totals: Record<string, unknown> = (m.totals as any) ?? {};
   for (const k of [...MANIFEST_TOTALS_KEYS_V3, ...MANIFEST_TOTALS_OPTIONAL_KEYS_V3]) {
@@ -1755,6 +1822,7 @@ function canonicalModules(mods: ManifestModule[]): unknown {
       activityEnabled: c.activityEnabled,
       ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
       ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
+      ...(c.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
     })),
   }));
 }
@@ -1763,7 +1831,7 @@ function canonicalModules(mods: ManifestModule[]): unknown {
 function unexpectedItemError(
   it: ManifestItem,
   source: ManifestSource,
-  chapterInfo: Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number }>,
+  chapterInfo: Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number; guidedPracticeMinutes?: number }>,
   moduleInfo: Map<string, { examEnabled: boolean }>,
   finalExam: boolean,
 ): ManifestValidationError {
@@ -1797,6 +1865,9 @@ function unexpectedItemError(
   }
   if (it.type === 'application_activity' && ch.applicationMinutes === undefined) {
     return { code: 'APPLICATION_NOT_ENABLED', message: `${it.key} existe pero el capítulo no tiene Actividad de Aplicación`, key: it.key };
+  }
+  if (it.type === 'guided_practice' && ch.guidedPracticeMinutes === undefined) {
+    return { code: 'GUIDED_PRACTICE_NOT_ENABLED', message: `${it.key} existe pero el capítulo no tiene práctica guiada (o es de práctica)`, key: it.key };
   }
   return { code: 'UNEXPECTED_ITEM', message: `${it.key} no corresponde al snapshot`, key: it.key };
 }

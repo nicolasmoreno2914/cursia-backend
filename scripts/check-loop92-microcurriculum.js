@@ -63,7 +63,7 @@ const reqsOfText = (text) => X.requirementsFor(X.extractRequirements(T.readText(
   const distOf = (chs, cons = constraints) => ST.distributeCourseHours({ snapshot: SNAP.buildBlueprintSnapshotV2(course, modules, chs), rules: null, targetHours: 8, preferences: { audiovisual: 'recommended' }, pins: null, requirements: cons });
   const dist = distOf(chapters);
   // Igual que designForRequirements (course-design.service): con lo fijado por el docente.
-  const designOf = (d, extra = {}) => ({ modules: d.modules.map((m) => ({ examEnabled: true, ...(m.practiceRemovedByTeacher ? { practiceRemovedByTeacher: true } : {}), chapters: m.chapters.map((c) => ({ kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, activityPinned: !!c.activityPinned, applicationMinutes: c.applicationMinutes, hours: (c.targetMinutes || 60) / 60 })) })), evaluations: d.counts.evaluations, targetHours: 8, hoursSource: 'document', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false, ...extra });
+  const designOf = (d, extra = {}) => ({ modules: d.modules.map((m) => ({ examEnabled: true, ...(m.practiceRemovedByTeacher ? { practiceRemovedByTeacher: true } : {}), chapters: m.chapters.map((c) => ({ kind: c.kind, proposed: c.proposed, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, activityPinned: !!c.activityPinned, applicationMinutes: c.applicationMinutes, hours: (c.targetMinutes || 60) / 60 })) })), evaluations: d.counts.evaluations, targetHours: 8, estimatedHours: d.estimatedHours, hoursStatus: d.status, hoursSource: 'document', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false, ...extra });
   const verify = (d, extra) => RA.requirementVerificationChecks(applicable, DR.compareRequirements(applicable, designOf(d, extra)), { status: d.status, baseHours: 1, estimatedHours: d.estimatedHours, modules: 2, moduleExams: 2, exceptionFields: {} });
 
   await check('MC1 lectura académica: nombre, prerrequisitos, metodología, 2 módulos × 2 capítulos con temas, sin conflicto de objetivo', () => {
@@ -302,9 +302,10 @@ const reqsOfText = (text) => X.requirementsFor(X.extractRequirements(T.readText(
     const inTol = RA.requirementVerificationChecks(applicable, DR.compareRequirements(applicable, designOf(dist, { estimatedHours: dist.estimatedHours, hoursStatus: dist.status })),
       { status: dist.status, baseHours: 1, estimatedHours: dist.estimatedHours, modules: 2, moduleExams: 2, exceptionFields: {} }).find((c) => /8 horas/.test(c.title));
     eq(inTol.severity, 'ok', 'dentro de la tolerancia');
-    // Review QA I2: las horas elegidas por el docente siguen siendo SU meta (no se reemplazan por las estimadas).
+    // Loop 9 (A5, reemplaza review QA I2): aunque el docente fije la meta, se comparan las horas ESTIMADAS del diseño (nunca
+    // «Cumple» con un diseño de 9,4 h para «8 horas»); su meta (8, igual a la del documento) queda informada en actual.target.
     const t = DR.compareRequirements(applicable, designOf(over, { estimatedHours: 9.4, hoursStatus: 'above_tolerance', hoursSource: 'user' })).find((c) => applicable.find((r) => r.id === c.requirementId).kind === 'target_hours');
-    eq([t.status, t.actual.value, t.chosenBy], ['met', 8, 'teacher'], 'meta del docente');
+    eq([t.status, t.actual.value, t.actual.target, t.chosenBy], ['unmet', 9.4, 8, 'document'], 'meta del docente = la del documento: el exceso no es SU excepción');
     // Review QA M1: el exceso por una decisión del docente es SU excepción (no un conflicto que bloquea).
     const tv = RA.requirementVerificationChecks(applicable, DR.compareRequirements(applicable, designOf(over, { estimatedHours: 9.4, hoursStatus: 'above_tolerance' })),
       { status: 'above_tolerance', baseHours: 1, estimatedHours: 9.4, modules: 2, moduleExams: 2, structureByTeacher: true, exceptionFields: {} }).find((c) => /8 horas/.test(c.title));

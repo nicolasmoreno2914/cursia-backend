@@ -412,6 +412,8 @@ const has = (text, needle, msg) => assert(String(text).includes(needle), `${msg}
       // Fase 2: una Actividad de Aplicación en el primer capítulo (el Manifest emite application_activity).
       const withApp = JSON.parse(JSON.stringify(RCP));
       withApp.modules[0].chapters[0].applicationMinutes = 60;
+      // Loop 9 B: y una práctica guiada en el segundo capítulo (el Manifest emite guided_practice).
+      withApp.modules[0].chapters[1].guidedPracticeMinutes = 80;
       const dr = P.runPedagogyDryRun({ structure: { ...withApp, course: { ...withApp.course, activityEngine: engine, finalExam: true, reviewCards: true } }, profile: profileOf('competencias'), applyStructureAdjustments: false });
       for (const it of dr.pedagogical.manifest.items) kinds.add(it.type);
       for (const g of dr.generators) {

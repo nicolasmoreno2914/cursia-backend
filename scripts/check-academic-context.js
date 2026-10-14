@@ -388,9 +388,11 @@ const profileOf = (k, extra = {}) => ({
     assert(Number(d.materialized.providers.estimateUsd.expected) > 0, 'costo estimado');
     const s = run('significativo').distribution;
     assert(s.counts.practiceChapters < d.counts.practiceChapters && s.counts.contentChapters > d.counts.contentChapters, 'el enfoque cambia cómo crece (práctica vs. profundidad)');
-    // Baseline (Loop 0): la estructura de ejemplo 3 × 3 NO alcanzaba 64 h.
+    // Baseline (Loop 0): la estructura de ejemplo 3 × 3 NO alcanzaba 64 h (Loop 9 B fix I1: sin documento que fije la forma,
+    // tampoco se rellena con ejercicios guiados). El microcurrículo llega con su propia estructura.
     const gold = require('./fixtures/baseline/design-baseline-v1.json');
     eq(gold.scenarios['competencias:64h'].status, 'cannot_reach_target', 'baseline 3 × 3');
+    eq(d.counts.guidedPractices || 0, 0, 'el microcurrículo llega sin ejercicios guiados');
     // Review M11: el Blueprint materializado conserva el contexto congelado y los vínculos de los capítulos existentes.
     const mat = P.materializeDistribution(snap, d);
     eq(mat.course.academicContext, snap.course.academicContext, 'contexto congelado en el diseño materializado');

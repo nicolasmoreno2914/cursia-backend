@@ -9,13 +9,15 @@
  * invalidación v3 (plan-v3.ts), aplicadas a "la salida de X cambió":
  *  - content:<ch> →
  *      REGENERATE (LLM, generación nueva `pending`): experience:<ch>,
- *        activity:<ch>, exam:<m>, final_exam;
+ *        activity:<ch>, application_activity:<ch>, guided_practice:<ch> (Loop 9 B), exam:<m>, final_exam;
  *      STALE_NO_AUTO (proveedor, nunca se regenera solo; artifacts `stale`
  *        con motivo ⇒ aviso visible en el empaque): presentation:<ch>,
  *        video:<ch>, audiobook_chapter:<ch>; y video_interactions:<ch>, que
  *        describe el video vigente — como el video queda STALE (no cambia),
  *        sus interacciones también (misma regla que el plan v3).
  *  - video:<ch> → REGENERATE video_interactions:<ch> (describen un video nuevo).
+ *  - exam:<m> → REGENERATE final_exam (Loop 9: el final depende de los exámenes de módulo; un Manifest anterior, sin esa
+ *    arista, no encadena).
  *  - course_intro → STALE_NO_AUTO audio_welcome (TTS).
  *    Motor de carga horaria: también REGENERATE experience/activity de los capítulos de PRÁCTICA del módulo
  *    (su `dependsOn` incluye este content: se arman con el texto de los capítulos de contenido).
@@ -55,11 +57,13 @@ export function regenerationCascade(rulesVersion: number, items: readonly Cascad
       .filter((it) => (it.type === 'experience' || it.type === 'activity' || it.type === 'application_activity') && it.chapterId !== ch && (it.dependsOn ?? []).includes(mItem.key))
       .map((it) => it.key);
     return {
-      regenerate: pick([`experience:${ch}`, `activity:${ch}`, `application_activity:${ch}`, ...practice, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
+      regenerate: pick([`experience:${ch}`, `activity:${ch}`, `application_activity:${ch}`, `guided_practice:${ch}`, ...practice, mItem.moduleId ? `exam:${mItem.moduleId}` : null, finalExam]),
       stale: pick([`presentation:${ch}`, `video:${ch}`, `video_interactions:${ch}`, `audiobook_chapter:${ch}`]),
     };
   }
   if (mItem.type === 'video' && ch) return { regenerate: pick([`video_interactions:${ch}`]), stale: [] };
+  // Loop 9 (fix I3): el final depende de los exámenes de módulo (no repite sus preguntas) → se regenera con ellos (solo IA).
+  if (mItem.type === 'exam') return { regenerate: pick([items.find((it) => it.type === 'final_exam' && (it.dependsOn ?? [mItem.key]).includes(mItem.key))?.key ?? null]), stale: [] };
   if (mItem.type === 'course_intro') {
     return { regenerate: [], stale: pick([items.find((it) => it.type === 'audio_welcome')?.key ?? null]) };
   }

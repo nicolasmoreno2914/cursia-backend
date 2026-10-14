@@ -77,6 +77,9 @@ env $STG node "$REPO/scripts/verify-v21-manifest-v3-schema.js" > "$OUT/verify-v2
 # y agrega application_activity a gir_type_check (setup-schema.js ya la corrió antes de que existieran esos CHECKs v3).
 env $STG node "$REPO/scripts/migrate-application-activities.js" > "$OUT/migrate-application-activities.log" 2>&1 || { cat "$OUT/migrate-application-activities.log"; exit 9; }
 env $STG node "$REPO/scripts/verify-application-activities-schema.js" > "$OUT/verify-application-activities.log" 2>&1 || { cat "$OUT/verify-application-activities.log"; exit 9; }
+# Loop 9 B (Práctica guiada): DESPUÉS de las Actividades de Aplicación — reescribe cgm_counts_consistent y gir_type_check.
+env $STG node "$REPO/scripts/migrate-guided-practice.js" > "$OUT/migrate-guided-practice.log" 2>&1 || { cat "$OUT/migrate-guided-practice.log"; exit 9; }
+env $STG node "$REPO/scripts/verify-guided-practice-schema.js" > "$OUT/verify-guided-practice.log" 2>&1 || { cat "$OUT/verify-guided-practice.log"; exit 9; }
 # V2.1 RF-b: seed de pricing_catalog (las tablas ya las creó setup-schema.js sql; el script es idempotente).
 env $STG node "$REPO/scripts/migrate-v21-finops.js" > "$OUT/migrate-v21-finops.log" 2>&1 || { cat "$OUT/migrate-v21-finops.log"; exit 9; }
 env $STG node "$REPO/scripts/verify-v21-finops-schema.js" > "$OUT/verify-v21-finops.log" 2>&1 || { cat "$OUT/verify-v21-finops.log"; exit 9; }

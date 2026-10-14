@@ -91,6 +91,11 @@ export interface BuildCourseFactsInput {
   reviewCardsChapterIds?: readonly string[] | null;
   /** Motor de carga horaria: tarjetas MEDIDAS de cada «Repaso» (⊆ reviewCardsChapterIds). Ausente = planificado. */
   reviewCardCountByChapter?: Readonly<Record<string, number>> | null;
+  /**
+   * Loop 9 B: capítulos cuya práctica guiada llega VALIDADA al paquete. Una práctica guiada del Manifest sin documento
+   * no se cuenta (ni se publica): el paquete la rechaza antes; sin la clave, ninguna se cuenta.
+   */
+  guidedPracticeChapterIds?: readonly string[] | null;
 }
 
 export interface ChapterFacts {
@@ -125,6 +130,11 @@ export interface ChapterFacts {
    * capítulos con actividad: página del estudiante + solucionario oculto; entran al tiempo del capítulo.
    */
   applicationMinutes?: number;
+  /**
+   * Loop 9 B: minutos de la práctica guiada del capítulo de contenido (item guided_practice del Manifest). SOLO en
+   * capítulos cuya práctica guiada tiene su documento validado en el paquete: entran al tiempo del capítulo.
+   */
+  guidedPracticeMinutes?: number;
   /** Diapositivas medidas de la presentación (0 en un capítulo de práctica: no tiene presentación). */
   slideCount: number;
   /**
@@ -172,6 +182,8 @@ export interface CourseFacts {
     reviewCards?: number;
     /** Fase 2: capítulos con Actividad de Aplicación (solo si hay alguna). */
     applicationActivities?: number;
+    /** Loop 9 B: capítulos con práctica guiada (solo si hay alguna). */
+    guidedPractices?: number;
   };
   chapters: ChapterFacts[];
   modules: ModuleFacts[];
@@ -246,6 +258,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   for (const id of noticeIds) if (!pendingIds.has(id)) fail(`aviso de video pendiente en un capítulo sin video pendiente (${id})`);
   const itemKeys = new Set(manifest.items.map((i) => i.key));
   const itemByKey = new Map(manifest.items.map((i) => [i.key, i]));
+  const guidedIds = new Set<string>(input.guidedPracticeChapterIds ?? []);
   const chapters: ChapterFacts[] = [];
   const modules: ModuleFacts[] = [];
   const knownChapterIds = new Set<string>();
@@ -279,9 +292,14 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`), { activityTypeRules: manifest.features?.activityTypeRules }) : null,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(mc.applicationMinutes !== undefined ? { applicationMinutes: mc.applicationMinutes } : {}),
+        ...(mc.guidedPracticeMinutes !== undefined && guidedIds.has(mc.chapterId) ? { guidedPracticeMinutes: mc.guidedPracticeMinutes } : {}),
         slideCount: practice ? 0 : posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
       if (itemKeys.has(`application_activity:${mc.chapterId}`) !== (mc.applicationMinutes !== undefined)) fail(`Actividad de Aplicación del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
+      if (itemKeys.has(`guided_practice:${mc.chapterId}`) !== (mc.guidedPracticeMinutes !== undefined)) fail(`práctica guiada del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
+      if (guidedIds.has(mc.chapterId) && mc.guidedPracticeMinutes === undefined) fail(`práctica guiada validada en el capítulo ${mc.chapterNumber}, que no la tiene en el Manifest`);
+      // Loop 9 B: una práctica guiada del Manifest sin su documento validado nunca se omite en silencio: el paquete se rechaza.
+      if (mc.guidedPracticeMinutes !== undefined && !guidedIds.has(mc.chapterId)) fail(`la práctica guiada del capítulo ${mc.chapterNumber} no llegó validada al paquete (falta su documento)`);
       if (practice && artifacts.slideCountByChapter?.[mc.chapterId] !== undefined) fail(`el capítulo de práctica ${mc.chapterNumber} no tiene presentación pero se informaron diapositivas`);
       if (artifacts.experienceWordsByChapter) {
         const ch = chapters[chapters.length - 1];
@@ -430,6 +448,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
               ...(reviewCounts[ch.id] !== undefined ? { reviewCards: reviewCounts[ch.id] } : {}),
               // Fase 2: la Actividad de Aplicación suma sus minutos al capítulo (y al curso).
               ...(ch.applicationMinutes !== undefined ? { applicationMinutes: ch.applicationMinutes } : {}),
+              // Loop 9 B: la práctica guiada (validada) suma sus minutos al capítulo («Práctica y repaso»).
+              ...(ch.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: ch.guidedPracticeMinutes } : {}),
             };
           }),
         })),
@@ -467,6 +487,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       evaluations: exams + (features.finalExam ? 1 : 0),
       ...(reviewIds.size ? { reviewCards: reviewIds.size } : {}),
       ...(chapters.some((c) => c.applicationMinutes !== undefined) ? { applicationActivities: chapters.filter((c) => c.applicationMinutes !== undefined).length } : {}),
+      ...(chapters.some((c) => c.guidedPracticeMinutes !== undefined) ? { guidedPractices: chapters.filter((c) => c.guidedPracticeMinutes !== undefined).length } : {}),
     },
     chapters,
     modules,

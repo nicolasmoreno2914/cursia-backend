@@ -294,6 +294,8 @@ async function createCourse(C, llm) {
       // Fase 2: capítulo de práctica y Actividad de Aplicación (minutos) cuando el escenario los pide.
       if (cs.kind) body.kind = cs.kind;
       if (cs.app) body.applicationMinutes = cs.app;
+      // Loop 9 B: práctica guiada del capítulo de contenido (minutos) cuando el escenario la pide.
+      if (cs.gp) body.guidedPracticeMinutes = cs.gp;
       // Fase 3: descripción y vínculos a resultados del contexto académico.
       if (cs.description) body.description = cs.description;
       if (cs.outcomeIds) body.outcomeIds = cs.outcomeIds;
@@ -322,8 +324,8 @@ async function createCourse(C, llm) {
     }
   }
   st = await readStructure(courseId);
-  const mods = st.modules.map((m) => ({ id: m.id, title: m.title, exam: m.examEnabled, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title, v: !!x.videoEnabled, a: x.activityEnabled !== false, kind: x.kind || 'content', app: x.applicationMinutes ?? null })) }));
-  eq(mods.map((m) => m.chapters.map((x) => `${x.kind}/${x.app}`)), C.modules.map((m) => m.chapters.map((x) => `${x.kind || 'content'}/${x.app || null}`)), `${C.key}: tipo de capítulo y minutos de Actividad de Aplicación persistidos`);
+  const mods = st.modules.map((m) => ({ id: m.id, title: m.title, exam: m.examEnabled, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title, v: !!x.videoEnabled, a: x.activityEnabled !== false, kind: x.kind || 'content', app: x.applicationMinutes ?? null, gp: x.guidedPracticeMinutes ?? null })) }));
+  eq(mods.map((m) => m.chapters.map((x) => `${x.kind}/${x.app}/${x.gp}`)), C.modules.map((m) => m.chapters.map((x) => `${x.kind || 'content'}/${x.app || null}/${x.gp || null}`)), `${C.key}: tipo de capítulo, minutos de Actividad de Aplicación y de práctica guiada persistidos`);
   eq(mods.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), C.modules.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), `${C.key}: estructura viva con las combinaciones V/A pedidas`);
   // Perfiles (append-only, fuera del Blueprint): evaluación y presentación.
   const A = D('modules/course-profiles/course-profiles.js');
@@ -356,6 +358,7 @@ async function createCourse(C, llm) {
   eq([M.totals.videoCount, M.totals.activityCount, M.totals.examCount, M.totals.finalExamCount, M.totals.presentationCount, M.totals.audiobookChapterCount, M.totals.experienceCount],
     [want.videos, want.activities, want.exams, C.finalExam ? 1 : 0, contentChapters, contentChapters, chapters.length], `${C.key}: totales del Manifest v3 (video/actividad/examen/final/Gamma/audiolibro/experiencia)`);
   eq(M.totals.applicationActivityCount ?? 0, chapters.filter((x) => x.app).length, `${C.key}: totales del Manifest v3 (Actividades de Aplicación)`);
+  eq(M.totals.guidedPracticeCount ?? 0, chapters.filter((x) => x.gp).length, `${C.key}: totales del Manifest v3 (prácticas guiadas)`);
   ok(M.items.filter((i) => i.type === 'activity').every((i) => i.variant === C.engine), `${C.key}: actividades con variant ${C.engine}`);
   // mapas del LLM falso (títulos → UUID)
   llm.st.courseId = courseId;
@@ -1151,7 +1154,8 @@ function reservationBookkeeping(ev) {
       const C = { key: 'E7', title: '[E2E Aplicación E7] Inspección de circuitos hidráulicos', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', pedagogy, modules: [
         { title: 'Inspección del circuito', objective: 'Inspeccionar el circuito hidráulico antes de liberarlo', exam: true, chapters: [
           { title: 'Lectura de presión', v: false, a: true, app: 60, objective: 'Medir la presión del circuito en el puerto de prueba' },
-          { title: 'Ajuste de válvulas', v: false, a: true, objective: 'Ajustar la válvula de alivio al valor de placa' },
+          // Loop 9 B: práctica guiada de 80 min (2 ejercicios de 40) en el capítulo de contenido sin Actividad de Aplicación.
+          { title: 'Ajuste de válvulas', v: false, a: true, gp: 80, objective: 'Ajustar la válvula de alivio al valor de placa' },
           { title: 'Práctica integradora', v: false, a: false, kind: 'practice', app: 30, objective: 'Ejecutar la inspección completa del circuito' },
         ] }] };
       const c = await createCourse(C, llm);
@@ -1168,6 +1172,11 @@ function reservationBookkeeping(ev) {
       ok(snap && snap.course.applicationContext && snap.course.applicationContext.learningOutcomes.do[0] === pedagogy.learningOutcomes.do[0], 'E7: Blueprint congela applicationContext (estudiante + resultados)', snap && snap.course.applicationContext);
       const mc = M.chapters ? M.chapters : M.modules.flatMap((m) => m.chapters);
       ok(mc.find((x) => x.chapterId === chContent).applicationMinutes === 60 && mc.find((x) => x.chapterId === chPlain).applicationMinutes === undefined, 'E7: ManifestChapter.applicationMinutes solo donde hay actividad');
+      // Loop 9 B: práctica guiada SOLO en el capítulo de contenido que la pide, dependiendo de su content.
+      const gps = M.items.filter((i) => i.type === 'guided_practice');
+      // Fix round 2 (N1): además de su content, espera a las AA del módulo (para ver su caso y no repetirlo).
+      eq(gps.map((i) => [i.key, i.guidedPracticeMinutes, i.dependsOn]), [[`guided_practice:${chPlain}`, 80, [`content:${chPlain}`, `application_activity:${chContent}`, `application_activity:${chPractice}`]]], 'E7: Manifest con UNOS ejercicios guiados (80 min) en el capítulo de contenido, sobre su content y las AA del módulo');
+      ok(mc.find((x) => x.chapterId === chPlain).guidedPracticeMinutes === 80 && mc.find((x) => x.chapterId === chPractice).guidedPracticeMinutes === undefined, 'E7: ManifestChapter.guidedPracticeMinutes solo donde la hay (nunca en la práctica)');
 
       const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
       const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { ...ctx, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
@@ -1181,6 +1190,11 @@ function reservationBookkeeping(ev) {
       const claimedOld = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-app'`, [c.runId]);
       ok(old.status === 409 && /rules_version_mismatch/.test(String(old.error)) && /Actividades de Aplicación/.test(String(old.error)) && claimedOld[0].n === 0,
         'E7: ejecutor sin la capacidad application-activity-1 → 409 visible y ningún item reclamado', { s: old.status, e: old.error, n: claimedOld[0].n });
+      // Loop 9 B: lo mismo con una pestaña que sabe generar Actividades de Aplicación pero no prácticas guiadas.
+      const oldGp = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1,application-activity-1', { runId: c.runId, executorId: 'e2e-old-tab-gp', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam', 'application_activity', 'guided_practice'], leaseSeconds: 60 });
+      const claimedOldGp = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-gp'`, [c.runId]);
+      ok(oldGp.status === 409 && /ejercicios guiados/.test(String(oldGp.error)) && claimedOldGp[0].n === 0,
+        'E7: ejecutor sin la capacidad guided-practice-1 → 409 visible y ningún item reclamado (nunca recibe el tipo)', { s: oldGp.status, e: oldGp.error, n: claimedOldGp[0].n });
       const prompts = [];
       const respond0 = llm.respond;
       llm.respond = (b, h) => { prompts.push(b); return respond0(b, h); };
@@ -1207,7 +1221,20 @@ function reservationBookkeeping(ev) {
       const byKey = new Map(sums.map((r) => [r.item_key, r.output_summary]));
       eq([byKey.get(`application_activity:${chContent}`).genre, byKey.get(`application_activity:${chPractice}`).genre, byKey.get(`application_activity:${chPractice}`).chapterKind], ['case_analysis', 'procedure', 'practice'], 'E7: las dos actividades no tienen la misma forma (género por capítulo) y la práctica se registra como tal');
       eq([byKey.get(`application_activity:${chContent}`).minutes, byKey.get(`application_activity:${chPractice}`).minutes], [60, 30], 'E7: summary con los minutos del Manifest');
-      results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applications: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey) };
+      // Loop 9 B: la práctica guiada (una llamada + reintento dirigido por la respuesta modelo sin numerar).
+      ok((llm.st.retriesSeen.guided_practice || 0) >= 1, 'E7: la práctica guiada inválida (respuesta modelo sin numerar) pidió un reintento dirigido', llm.st.retriesSeen);
+      const gpPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña los EJERCICIOS GUIADOS de este capítulo'));
+      ok(gpPrompts.length >= 1 && gpPrompts.every((t) => t.includes('EXACTAMENTE 2 ejercicios') && t.includes('~40 min') && t.includes('FORMATIVA y SIN NOTA') && t.includes('al menos 800 caracteres, al menos 5 consignas y respuesta modelo de al menos 1400')), 'E7: el prompt de los ejercicios guiados trae el plan de Cursia (2 × 40 min), sus pisos y es formativo', gpPrompts.length);
+      // Loop 9 B fix I5: el claim lleva el caso de la práctica del módulo (y los de sus AA ya completadas) para no repetirlo.
+      ok(gpPrompts.every((t) => t.includes('NO REPITAS estos casos del módulo') && t.includes('Capítulo de práctica del módulo: «Práctica integradora»') && (t.match(/- Actividad de Aplicación del módulo: /g) || []).length === 2), 'E7: el prompt de los ejercicios guiados trae la práctica y las 2 AA del módulo (ya completadas: dependsOn)', gpPrompts.length);
+      const gpArts = await q(`select g.item_key k from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and a.type = 'dynamic_guided_practice_json'`, [c.runId]);
+      eq(gpArts.map((a) => a.k), [`guided_practice:${chPlain}`], 'E7: un artifact dynamic_guided_practice_json');
+      const [gpSum] = await q(`select output_summary s from public.generation_item_runs where job_id = $1 and type = 'guided_practice' order by generation desc limit 1`, [c.runId]);
+      ok(gpSum && gpSum.s.exerciseCount === 2 && gpSum.s.minutes === 80 && gpSum.s.promptVersion === 'v21-gp-2' && gpSum.s.retried === true && gpSum.s.v3Validation, 'E7: summary de la práctica guiada (2 ejercicios, 80 min, reintentada) validado por el servidor', gpSum && gpSum.s);
+      // Loop 9 B: + lo que necesita el restore en Moodle (moodle-E7): spec, perfiles y Manifest.
+      results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applicationsList: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey),
+        spec: C, modules: c.mods, assessment: c.assessment, manifestModules: M.modules, features: M.features, applications: apps.length, reviewCardsChapterIds: [], examBank: true,
+        guidedPractices: gps.map((i) => ({ key: i.key, minutes: i.guidedPracticeMinutes })) };
       void AA;
     }, { fatal: false });
     if (RUN_E5 && S.E7 && S.E7.runId) await step('v3-E7-aplicacion-empaquetado-y-regeneracion', async () => {
@@ -1219,13 +1246,15 @@ function reservationBookkeeping(ev) {
         for (const f of Object.keys(zip.files).filter((n) => /^activities\/page_\d+\/module\.xml$/.test(n))) {
           const mx = await zip.file(f).async('string');
           const idn = (/<idnumber>([^<]*)<\/idnumber>/.exec(mx) || [])[1] || '';
-          if (!/:application(_solution)?$/.test(idn)) continue;
+          if (!/:(application(_solution)?|guided_practice)$/.test(idn)) continue;
           const px = await zip.file(f.replace('module.xml', 'page.xml')).async('string');
           out.set(idn, { visible: Number((/<visible>(\d)<\/visible>/.exec(mx) || [])[1]), content: px });
         }
         return out;
       };
       const P1 = await packageRun('E7', c.courseId, c.n, c.runId);
+      // Loop 9 B (moodle-E7): «Repaso» reales del paquete, para la secuencia esperada tras el restore.
+      if (results.courses.E7) results.courses.E7.reviewCardsChapterIds = ((P1.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
       const pg = await pagesOf(P1.buf);
       for (const ch of [chContent, chPractice]) {
         const s = pg.get(`cv3:ch:${ch}:application`);
@@ -1233,7 +1262,20 @@ function reservationBookkeeping(ev) {
         ok(s && s.visible === 1 && /\.pdf/.test(s.content) && !s.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: página del estudiante visible, con PDF y sin respuestas`, s && { visible: s.visible });
         ok(t && t.visible === 0 && /\.pdf/.test(t.content) && t.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: solucionario docente OCULTO (visible 0) con respuestas y PDF`, t && { visible: t.visible });
       }
-      ok(![...pg.keys()].some((k) => k.includes(c.mods[0].chapters[1].id)), 'E7: el capítulo sin actividad no tiene páginas de aplicación');
+      ok(![...pg.keys()].some((k) => /:application(_solution)?$/.test(k) && k.includes(c.mods[0].chapters[1].id)), 'E7: el capítulo sin actividad no tiene páginas de aplicación');
+      // Loop 9 B: la práctica guiada es una página VISIBLE del capítulo, tras el texto, con la respuesta modelo; sus minutos cuentan.
+      const chPlainId = c.mods[0].chapters[1].id;
+      const gpPage = pg.get(`cv3:ch:${chPlainId}:guided_practice`);
+      ok(gpPage && gpPage.visible === 1 && /Respuesta modelo \(revísala después de intentarlo\)/.test(gpPage.content.replace(/&[a-z]+;/g, ' ')) && /Ejercicios guiados/.test(gpPage.content) && !/Solucionario/.test(gpPage.content),
+        'E7: página «Práctica guiada — <capítulo>» visible con la respuesta modelo (sin solucionario)', gpPage && { visible: gpPage.visible });
+      ok(![...pg.keys()].some((k) => /:guided_practice$/.test(k) && !k.includes(chPlainId)), 'E7: ninguna otra práctica guiada (ni en la práctica)');
+      // Horas: la tarjeta del diseño cuenta los 80 min de la práctica guiada en el capítulo y en «Práctica y repaso».
+      const card = await api('POST', `/courses/${c.courseId}/design/recommendation`, {});
+      const dch = card.data && card.data.design && card.data.design.modules.flatMap((m) => m.chapters);
+      const gpCh = dch && dch.find((x) => x.id === chPlainId);
+      const twin = dch && dch.find((x) => x.id === chContent);
+      ok(gpCh && gpCh.guidedPracticeMinutes === 80 && gpCh.guidedPracticePinned === true && twin && gpCh.hours >= 80 / 60 && card.data.design.counts.guidedPractices === 1,
+        'E7: horas — el diseño cuenta la práctica guiada (80 min) en su capítulo', gpCh && { gp: gpCh.guidedPracticeMinutes, h: gpCh.hours, counts: card.data.design.counts });
 
       // Regenerar SOLO la actividad de la práctica: el plan no arrastra nada más.
       const key = `application_activity:${chPractice}`;
@@ -3338,9 +3380,16 @@ function reservationBookkeeping(ev) {
       let S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
       const vidBlockers = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason');
       REP.alternativa = S0.draft.model.exceptions.filter((e) => e.capability).map((e) => ({ requisito: e.requirementText, aplicado: e.appliedText, propuesta: e.proposal || null }));
-      rec23('P1', 'La propuesta no se prepara sin la decisión de la institución sobre los videos, y Cursia propone una alternativa con lo que sí produce',
+      // Loop 9 B (fix 2a): con ejercicios guiados > 30 % del trabajo estimado, la institución también acepta esa proporción
+      // (o elige «Ejercicios guiados: Ninguno»): su propuesta dice el porcentaje y la salida, no «Proponemos…».
+      const isGuidedShare = (e) => /^Ejercicios guiados: /.test(e.requirementText || '');
+      rec23('P1', 'La propuesta no se prepara sin la decisión de la institución sobre los videos (y sobre la proporción de ejercicios guiados si supera el 30 %), y Cursia propone una alternativa con lo que sí produce',
         vidBlockers.length >= 1 && S0.draft.model.exceptions.filter((e) => e.capability && /video/.test(e.requirementText)).every((e) => typeof e.proposal === 'string' && /1 video/.test(e.proposal) && /presentaci/i.test(e.proposal))
-          && S0.draft.model.exceptions.filter((e) => e.capability).every((e) => typeof e.proposal === 'string' && /^(Proponemos|Cursia ya llevó)/.test(e.proposal)), REP.alternativa);
+          && S0.draft.model.exceptions.filter((e) => e.capability && !isGuidedShare(e)).every((e) => typeof e.proposal === 'string' && /^(Proponemos|Cursia ya llevó)/.test(e.proposal))
+          && S0.draft.model.exceptions.filter((e) => e.capability && isGuidedShare(e)).every((e) => typeof e.proposal === 'string'
+            && /^Aceptar que \d+ % del trabajo estimado del estudiante sean ejercicios guiados/.test(e.proposal) && /Ninguno/.test(e.proposal)
+            && /de trabajo estimado del estudiante \(modelo de tiempo de Cursia\), (3[1-9]|[4-9]\d) %$/.test(e.requirementText)),
+        REP.alternativa);
       // Lo mismo que envía «Usar la alternativa de Cursia» en la interfaz (la sugerencia del bloqueo), que cabe en el motivo.
       rec23('P1b', 'Cada «Usar la alternativa de Cursia» cabe en el motivo (≤ 500 caracteres) y el de horas declara la carga real',
         vidBlockers.every((b) => typeof b.suggestion === 'string' && b.suggestion.length <= 500)
@@ -3794,6 +3843,8 @@ function reservationBookkeeping(ev) {
       const W3 = 'e2e-llm-worker-3';
       const W4 = 'e2e-llm-worker-4';
       const LONG = ['content', 'application_activity', 'experience', 'final_exam'];
+      // Loop 9: el worker cubre TODAS las partes de IA v3 (también las cortas); el navegador solo de respaldo.
+      const LLM_TYPES = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'exam', 'final_exam'];
       // Loop 6: instante de activación — el worker y el ruteo aplican solo a runs creados desde acá.
       const LLM_SINCE = new Date(Date.now() - 1000).toISOString();
       const wEnv = (id) => ({
@@ -3817,7 +3868,7 @@ function reservationBookkeeping(ev) {
         if (start.status !== 201) throw new Error(`E24: run no creado ${start.status} ${start.error}`);
         return start.data.run.id;
       };
-      let w1 = null; let w2 = null; let w3 = null; let w4 = null;
+      let w1 = null; let w2 = null; let w3 = null; let w4 = null; let w5 = null;
       let CURRENT_RUN = null;
       try {
         await stopProc(app);
@@ -3844,6 +3895,12 @@ function reservationBookkeeping(ev) {
         c.runId = await startRun(c, C.title);
         CURRENT_RUN = c.runId;
         S.front.DYN_EXAM_BANK_MODE_ENABLED = true;
+        // Loop 9: como en staging (el worker vive desde mucho antes que cualquier run), el navegador arranca con el worker de
+        // IA YA anunciado: si no, el primer claim (course_plan) podía ganarle al primer latido y caer en el respaldo.
+        await waitFor('worker 1 anunciado con todas las partes de IA', async () => {
+          const [p] = await q(`select item_types from public.llm_worker_presence where worker_id = $1 and last_seen > now() - interval '60 seconds'`, [W1]);
+          return p && LLM_TYPES.every((t) => (p.item_types || []).includes(t));
+        }, 120000, 300);
         const claims0 = claimLog.length;
         let ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
         // El navegador DESAPARECE apenas el worker tomó el Libro Guía.
@@ -3867,8 +3924,15 @@ function reservationBookkeeping(ev) {
         ok(items.every((i) => i.status === 'completed'), `E24: las ${items.length} partes completas (navegador + worker de IA)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
         const longRows = rows.filter((i) => LONG.includes(i.type));
         ok(longRows.length >= 7 && longRows.every((i) => [W1, W2].includes(i.worker_id)), 'E24: las partes LARGAS (Libro Guía, Actividad, SCORM, examen final) las generó el worker de IA', longRows.map((i) => [i.item_key, i.worker_id]));
+        const llmRows = rows.filter((i) => LLM_TYPES.includes(i.type));
+        ok(llmRows.length >= 13 && llmRows.every((i) => [W1, W2].includes(i.worker_id)) && ['course_intro', 'module_intro', 'activity', 'exam'].every((t) => llmRows.some((i) => i.type === t)),
+          'E24: Loop 9 — TODAS las partes de IA (también las cortas: presentación del curso y del módulo, actividades, examen de módulo) las generó el worker', llmRows.map((i) => [i.item_key, i.worker_id]));
         const browserClaims = claimLog.slice(claims0);
-        ok(browserClaims.length > 0 && !browserClaims.some((x) => LONG.includes(x.type)), 'E24: el navegador nunca reclamó una parte larga (el servidor se las filtra); sí las cortas', browserClaims.map((x) => x.type));
+        eq(browserClaims.map((x) => x.type), [], 'E24: con el worker de IA vivo el navegador no reclamó NINGUNA parte (el servidor se las filtra todas)');
+        // Loop 9 (A3): el final depende de los exámenes de módulo → los evita aunque lo genere el worker (sin memoria del navegador).
+        const fin1 = rows.find((i) => i.type === 'final_exam');
+        ok(fin1 && fin1.output_summary && fin1.output_summary.externalStems > 0 && fin1.output_summary.externalStemsSource === 'dependencies' && fin1.output_summary.externalStemsUnreadable === 0,
+          'E24: el examen final (worker) recibió las preguntas del examen de módulo como dependencias (externalStems > 0)', fin1 && { n: fin1.output_summary.externalStems, src: fin1.output_summary.externalStemsSource, unread: fin1.output_summary.externalStemsUnreadable });
         const r105 = fake.st.requests.find((r) => r.action === 'slow');
         ok(r105 && r105.outcome === 'ok' && r105.end - r105.at >= 100000, `E24: generación de ${r105 ? Math.round((r105.end - r105.at) / 1000) : '?'} s (>100 s) completa por streaming directo — sin 524`, r105 && { outcome: r105.outcome, ms: r105.end - r105.at });
         ok(longDoneWhileGone.filter((k) => k.startsWith('content:')).length === 3, 'E24: con el navegador CERRADO el worker terminó los 3 Libros Guía (y siguió con lo demás)', { longDoneWhileGone, gone: browserGoneAt, back: browserBackAt });
@@ -3969,7 +4033,7 @@ function reservationBookkeeping(ev) {
         await waitRunTerminal(ctl2, 'E24b run', 15 * 60 * 1000, c2.runId).catch(() => null);
         const rows2 = await waitItemsDone(c2.runId);
         const browserClaims2 = claimLog.slice(claims2);
-        ok(!browserClaims2.some((x) => LONG.includes(x.type)), 'E24b: durante el deploy (worker nuevo vivo) el navegador no tomó ninguna parte larga', browserClaims2.map((x) => x.type));
+        ok(!browserClaims2.some((x) => LLM_TYPES.includes(x.type)), 'E24b: durante el deploy (worker nuevo vivo) el navegador no tomó ninguna parte de IA (Loop 9: ni las cortas)', browserClaims2.map((x) => x.type));
         const f2 = await finished(c2.runId);
         const vib = f2.find((i) => i.type === 'experience' && i.item_key.endsWith(c2.mods[0].chapters[1].id));
         ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 2,
@@ -4028,7 +4092,8 @@ function reservationBookkeeping(ev) {
         const long3 = rows3.filter((i) => LONG.includes(i.type) || i.type === 'course_plan');
         ok(rows3.length > 0 && rows3.every((i) => i.status === 'completed'), 'E24c: el run anterior a la activación se completa', rows3.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
         ok(long3.length >= 2 && long3.every((i) => ![W1, W2, W3, W4].includes(i.worker_id)), 'E24c: sus partes LARGAS las generó el navegador (el worker de IA no toma runs anteriores a la activación)', long3.map((i) => [i.item_key, i.worker_id]));
-        ok(claimLog.slice(claims3).some((x) => LONG.includes(x.type)) && claimLog.slice(claims3).some((x) => x.type === 'course_plan'), 'E24c: el servidor le dejó al navegador las partes largas (y el plan) de ese run, sin colgarse esperando al worker');
+        ok(claimLog.slice(claims3).some((x) => LONG.includes(x.type)) && claimLog.slice(claims3).some((x) => x.type === 'course_plan') && claimLog.slice(claims3).some((x) => x.type === 'course_intro'),
+          'E24c: el servidor le dejó al navegador las partes de IA (largas, cortas y el plan) de ese run, sin colgarse esperando al worker');
         eq(fake.st.requests.slice(fakeBefore).filter((r) => r.text.includes('Juntas de expansión')).length, 0, 'E24c: ninguna llamada del worker de IA para el run anterior');
 
         // ── Corrida 4 (robustez): presupuesto GLOBAL del run agotado → pausa segura sin gastar; nada queda colgado ──
@@ -4054,8 +4119,152 @@ function reservationBookkeeping(ev) {
         eq(fake.st.requests.slice(fakeBefore4).filter((r) => r.text.includes('Arranque de bombas') || r.text.includes('Operación de bombas')).length, 0, 'E24d: ninguna llamada pagada del worker con el presupuesto agotado');
         const running4 = (await finished(c4.runId)).filter((i) => i.status === 'running');
         eq(running4.length, 0, 'E24d: ninguna parte queda en curso (devueltas a la cola, sin consumir intentos)');
+
+        // ── Corrida 5 (Loop 9 · E24-nobrowser): NINGÚN navegador. El worker de IA genera todas las partes de IA, los workers
+        // de proveedores/video lo suyo, el run termina, el paquete final automático se arma y valida (validateMbzV3) solo. ──
+        const C5 = { key: 'E24e', title: '[E2E Worker IA E24e] Sin navegador: curso completo', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+          { title: 'Puesta en marcha de bombas', objective: 'Poner en marcha bombas centrífugas con seguridad', exam: true, chapters: [
+            { title: 'Cebado de la bomba', v: true, a: true, app: 60, objective: 'Cebar una bomba centrífuga antes del arranque' },
+            { title: 'Arranque y parada', v: false, a: true, objective: 'Arrancar y detener la bomba siguiendo el procedimiento' },
+          ] }] };
+        llm.st.tag = 'E24e';
+        const c5 = await createCourse(C5, llm);
+        const body5 = { nombre: C5.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'real' }; // Gamma/TTS/Videogen REALES contra los fakes locales
+        let st5 = await api('POST', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs`, body5);
+        const est5 = /estimateId=([0-9a-f-]{36})/.exec(String(st5.error || ''));
+        ok(st5.status === 409 && !!est5, 'E24e: proveedores reales sin aprobación → 409 budget_approval_required', { s: st5.status, e: st5.error });
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E24e: aprobación (proveedores FALSOS locales)')`, [c5.courseId, est5 && est5[1]]);
+        st5 = await api('POST', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs`, body5);
+        ok(st5.status === 201, 'E24e: run creado tras ADMIN_APPROVED', { s: st5.status, e: st5.error });
+        c5.runId = st5.data.run.id;
+        CURRENT_RUN = c5.runId;
+        const claims5 = claimLog.length;
+        // Loop 9 (A4): el run dice que lo genera el servidor (worker de IA vivo que cubre todas sus partes de IA).
+        const r5a = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}`);
+        eq(r5a.data && r5a.data.serverExecuted, true, 'E24e: run.serverExecuted = true (la pantalla puede decir «puedes cerrar esta pestaña»)');
+        eq(r5a.data && r5a.data.legacyFinalExamDeps, false, 'E24e: Manifest nuevo (el final depende de los exámenes de módulo): sin aviso de estructura anterior');
+        // Ningún dynExecutorStart: solo los workers del servidor.
+        const done5 = await waitFor('run E24e terminado sin navegador', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c5.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 15 * 60 * 1000, 1000);
+        const rows5 = await finished(c5.runId);
+        ok(done5 === 'completed', `E24e: el run terminó \`completed\` sin ningún navegador abierto (${done5})`, rows5.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+        ok(rows5.length > 0 && rows5.every((i) => i.status === 'completed'), `E24e: las ${rows5.length} partes completas`, rows5.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
+        const llm5 = rows5.filter((i) => LLM_TYPES.includes(i.type));
+        eq([...new Set(llm5.map((i) => i.type))].sort(), [...LLM_TYPES].sort(), 'E24e: el curso tiene TODOS los tipos de parte de IA (incluidas las interacciones del video y el examen de módulo)');
+        ok(llm5.every((i) => i.worker_id === W3 && i.output_summary && i.output_summary.generatedBy === 'llm-worker'), 'E24e: cada parte de IA la generó el worker de IA', llm5.map((i) => [i.item_key, i.worker_id]));
+        // Fix M3: acá no hay ejecutor del navegador (0 claims por construcción); que el servidor NO le entrega partes de IA a
+        // un navegador ABIERTO lo prueba la corrida 1 (ejecutor corriendo, 0 claims). Acá la prueba es worker_id/generatedBy.
+        eq(claimLog.slice(claims5).length, 0, 'E24e: sin ejecutor del navegador abierto en toda la corrida');
+        const fin5 = rows5.find((i) => i.type === 'final_exam');
+        ok(fin5 && fin5.output_summary.externalStems > 0 && fin5.output_summary.externalStemsSource === 'dependencies', 'E24e: el examen final evitó las preguntas del examen de módulo (externalStems > 0, desde las dependencias)', fin5 && fin5.output_summary);
+        // Empaquetado automático (sin clic): el job del paquete final se arma y valida (validateMbzV3 antes de subir).
+        const pkg5 = await waitFor('paquete final automático de E24e', async () => {
+          const jobs = await q(`select id, worker_status, input_payload, output_summary, error_message from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c5.runId]);
+          return jobs.length && ['completed', 'failed'].includes(jobs[jobs.length - 1].worker_status) ? jobs : null;
+        }, 5 * 60 * 1000, 1000);
+        const pj5 = pkg5[pkg5.length - 1];
+        ok(pkg5.length === 1 && pj5.input_payload.auto === true && pj5.worker_status === 'completed' && pj5.output_summary && pj5.output_summary.artifactId,
+          'E24e: el servidor encoló y COMPLETÓ el paquete final automático (validado con validateMbzV3 por el package worker)', pkg5.map((j) => ({ st: j.worker_status, auto: j.input_payload && j.input_payload.auto, err: (j.error_message || '').slice(0, 300) })));
+        const r5 = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}`);
+        const comp5 = r5.data && r5.data.completion;
+        ok(comp5 && comp5.state === 'complete' && comp5.packageReady === true && comp5.complete === true, 'E24e: el curso queda COMPLETO (completion.state complete) sin intervención ni pestaña', comp5);
+        const pst5 = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}/package`);
+        ok(pst5.data && pst5.data.status === 'completed' && pst5.data.deliverable === true && pst5.data.downloadUrl, 'E24e: paquete final entregable descargable', pst5.data);
+        if (pst5.data && pst5.data.downloadUrl) {
+          const buf5 = Buffer.from(await (await fetch(pst5.data.downloadUrl)).arrayBuffer());
+          const z5 = await JSZip.loadAsync(buf5);
+          ok(!!z5.file('moodle_backup.xml') && !!z5.file('files.xml'), `E24e: el .mbz (${buf5.length} bytes) es un backup de Moodle`);
+          results.mbz.E24e = { bytes: buf5.length, sha256: sha(buf5), jobId: pj5.id };
+        }
+        results.courses.E24e = { courseId: c5.courseId, runId: c5.runId, items: rows5.length, llmParts: llm5.length, browserClaims: claimLog.slice(claims5).length, externalStems: fin5 && fin5.output_summary.externalStems, packageJob: pj5.id };
+
+        // ── Corrida 6 (Loop 9 fix I2 · configuración de STAGING): worker de IA HOSPEDADO en dynamic-provider-worker, pool de 1
+        // conexión (DB_POOL_MAX_WORKER=1), 4 partes en paralelo. ≥ 4 partes en vuelo más largas que la lease → los latidos
+        // las sostienen (sin leaseLost); drenaje (SIGTERM) con ≥ 3 en vuelo → se devuelven sin reservas desconocidas ni
+        // llm_pending_review, y otro worker termina el run. ──
+        w3.kill('SIGTERM');
+        await waitFor('worker 3 detenido', async () => !!w3.exited, 120000, 200);
+        const W5 = 'e2e-llm-worker-5';
+        const stagingEnv = (id) => ({ ...wEnv(id), DYNAMIC_LLM_WORKER_CONCURRENCY: '4', DB_POOL_MAX_WORKER: '1', DB_POOL_IDLE_MS_WORKER: '1000' });
+        w4 = spawnProc('llm-worker-4', 'workers/dynamic-provider-worker.js', { ...stagingEnv(W4), DYNAMIC_PROVIDER_WORKER_ID: 'e2e-provider-hosting-llm-4', DYNAMIC_PROVIDER_WORKER_POLL_MS: '400' });
+        await waitFor('worker 4 (hospedado, staging) anunciado', async () => (await q(`select 1 from public.llm_worker_presence where worker_id = $1 and not draining and last_seen > now() - interval '30 seconds'`, [W4])).length > 0, 120000, 300);
+        const C6 = { key: 'E24f', title: '[E2E Worker IA E24f] Config staging: 4 en paralelo', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Mantenimiento de motores', objective: 'Mantener motores eléctricos', exam: false, chapters: [
+            { title: 'Rodamientos de motores', v: false, a: false, objective: 'Revisar rodamientos de un motor' },
+            { title: 'Aislamiento de bobinados', v: false, a: false, objective: 'Medir el aislamiento de un bobinado' },
+            { title: 'Ventilación del motor', v: false, a: false, objective: 'Asegurar la ventilación de un motor' },
+            { title: 'Alineación del acople', v: false, a: false, objective: 'Alinear el acople motor-bomba' },
+          ] }] };
+        llm.st.tag = 'E24f';
+        const c6 = await createCourse(C6, llm);
+        const isExp6 = (t) => t.includes('Genera la EXPERIENCIA del capítulo') && C6.modules[0].chapters.some((ch) => t.includes(`CAPÍTULO: "${ch.title}"`));
+        fake.rule(isExp6, 'slow', 4, 25000); // 25 s > lease de 15 s: solo los latidos las mantienen
+        c6.runId = await startRun(c6, C6.title);
+        CURRENT_RUN = c6.runId;
+        const inflight6 = await waitFor('≥ 4 experiencias en vuelo a la vez en el worker hospedado', async () => {
+          const pend = fake.st.requests.filter((r) => r.action === 'slow' && r.outcome === 'pending' && isExp6(r.text));
+          const run = (await finished(c6.runId)).filter((i) => i.status === 'running' && i.worker_id === W4);
+          return pend.length >= 4 && run.length >= 4 ? run : null;
+        }, 300000, 200);
+        await sleep(18000); // más que la lease (15 s): sin latidos se perderían
+        const held6 = await q(`select item_key, status, worker_id, lease_until > now() as alive from public.generation_item_runs where job_id = $1 and status = 'running'`, [c6.runId]);
+        ok(held6.length >= 4 && held6.every((i) => i.worker_id === W4 && i.alive) && inflight6.length >= 4,
+          'E24f: 4 partes en paralelo con 1 conexión de pool: los latidos renuevan la lease pasada su duración (ninguna se pierde)', held6);
+        // Drenaje (deploy) con ≥ 3 en vuelo.
+        const draining6 = (await finished(c6.runId)).filter((i) => i.status === 'running' && i.worker_id === W4).map((i) => i.item_key);
+        ok(draining6.length >= 3, `E24f: ${draining6.length} partes en vuelo al pedir el drenaje`, draining6);
+        w4.kill('SIGTERM');
+        await waitFor('worker 4 drenado', async () => !!w4.exited, 150000, 200);
+        const after6 = await finished(c6.runId);
+        ok(after6.every((i) => i.status !== 'running'), 'E24f: drenaje — nada quedó en curso (terminó o volvió a la cola)', after6.filter((i) => i.status === 'running').map((i) => i.item_key));
+        ok(!after6.some((i) => /^llm_pending_review/.test(i.error || '') || (i.output_summary && i.output_summary.llmPendingReview)), 'E24f: drenaje sin partes en revisión (llm_pending_review)');
+        const unk6 = (await q(`select count(*)::int n from public.generation_cost_events e where e.run_id = $1 and (e.metadata->>'reservation') = 'true'
+            and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [c6.runId]))[0].n;
+        eq(unk6, 0, 'E24f: drenaje sin reservas desconocidas (todas liquidadas)');
+        const leaseLost6 = fs.readFileSync(w4.logFile, 'utf8').split('\n').filter((l) => /: abandoned\b|lease_lost/.test(l));
+        eq(leaseLost6, [], 'E24f: el worker hospedado nunca perdió una lease (sin abandoned)');
+        // Otro worker (GIFT forzado: corrida 7) termina el run.
+        w5 = spawnProc('llm-worker-5', 'workers/dynamic-llm-worker.js', { ...wEnv(W5), DYNAMIC_LLM_WORKER_EXAM_BANK: 'off' });
+        const done6 = await waitFor('run E24f terminado', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c6.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 10 * 60 * 1000, 1000);
+        const rows6 = await finished(c6.runId);
+        ok(['completed', 'preview'].includes(done6) && rows6.every((i) => i.status === 'completed'), `E24f: el run se completa tras el drenaje (${done6})`, rows6.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 160)]));
+        results.courses.E24f = { courseId: c6.courseId, runId: c6.runId, inFlight: held6.length, drained: draining6.length, unsettled: unk6 };
+
+        // ── Corrida 7 (Loop 9 fix M4): en el worker, actividad variante SCORM y exámenes GIFT (modo banco apagado), sin navegador ──
+        const C7 = { key: 'E24g', title: '[E2E Worker IA E24g] SCORM y GIFT en el worker', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'scorm', modules: [
+          { title: 'Seguridad eléctrica', objective: 'Trabajar con seguridad eléctrica', exam: true, chapters: [
+            { title: 'Bloqueo de energía', v: false, a: true, objective: 'Bloquear la energía antes de intervenir' },
+            { title: 'Equipos de protección', v: false, a: true, objective: 'Elegir el equipo de protección adecuado' },
+          ] }] };
+        llm.st.tag = 'E24g';
+        const c7 = await createCourse(C7, llm);
+        c7.runId = await startRun(c7, C7.title);
+        CURRENT_RUN = c7.runId;
+        const claims7 = claimLog.length;
+        const done7 = await waitFor('run E24g terminado sin navegador', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c7.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 10 * 60 * 1000, 1000);
+        const rows7 = await finished(c7.runId);
+        ok(['completed', 'preview'].includes(done7) && rows7.every((i) => i.status === 'completed'), `E24g: run completo sin navegador (${done7})`, rows7.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+        const arts7 = await artifactsOfRun(c7.runId);
+        const acts7 = rows7.filter((i) => i.type === 'activity');
+        // La variante SCORM no tiene validador de servidor (solo la h5p): se comprueba que el worker la generó con sus artifacts.
+        ok(acts7.length === 2 && acts7.every((i) => i.worker_id === W5 && i.output_summary && i.output_summary.generatedBy === 'llm-worker' && arts7.some((a) => a.item_key === i.item_key)),
+          'E24g: las actividades variante SCORM las generó el worker (con su paquete)', acts7.map((i) => [i.item_key, i.worker_id, arts7.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
+        const exams7 = rows7.filter((i) => i.type === 'exam' || i.type === 'final_exam');
+        ok(exams7.length === 2 && exams7.every((i) => i.worker_id === W5 && arts7.filter((a) => a.item_key === i.item_key && /^dynamic_exam_/.test(a.type)).map((a) => a.type).join() === 'dynamic_exam_gift'),
+          'E24g: examen de módulo y final como GIFT en el worker (DYNAMIC_LLM_WORKER_EXAM_BANK=off)', exams7.map((i) => [i.item_key, i.worker_id, arts7.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
+        eq(claimLog.slice(claims7).length, 0, 'E24g: sin ejecutor del navegador');
+        results.courses.E24g = { courseId: c7.courseId, runId: c7.runId, items: rows7.length, status: done7 };
       } finally {
-        for (const w of [w1, w2, w3, w4]) if (w && !w.exited) await stopProc(w, 30000);
+        for (const w of [w1, w2, w3, w4, w5]) if (w && !w.exited) await stopProc(w, 30000);
         await fake.close();
         await stopProc(app);
         app = await startApp();
@@ -4078,6 +4287,8 @@ function reservationBookkeeping(ev) {
     if (results.mbz.E21 && results.courses.E21) MOODLE_JOBS.push(['E21', 'E21']);
     // Cierre · E22: el piloto «Atención a víctimas de violencia sexual» (generación MOCK) → restore, permisos y notas.
     if (results.mbz.E22 && results.courses.E22) MOODLE_JOBS.push(['E22', 'E22']);
+    // Loop 9 B · E7: el curso con Actividades de Aplicación y práctica guiada → restore, secuencia, permisos y notas.
+    if (results.mbz.E7 && results.courses.E7 && results.courses.E7.manifestModules) MOODLE_JOBS.push(['E7', 'E7']);
     const SHELL = D('modules/course-shell/index.js');
     const AS = D('package/assessment/index.js');
     const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');
@@ -4130,7 +4341,8 @@ function reservationBookkeeping(ev) {
             // EV6 H5P v2: los «Repaso» salen de los paquetes H5P del empaque (vacío en E1–E4: secuencia de siempre).
             const reviewSet = new Set(info.reviewCardsChapterIds || []);
             // LOOP 7: capítulos de práctica y Actividades de Aplicación (página + solucionario) en su lugar.
-            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined })) {
+            // Loop 9 B: y la práctica guiada (página visible tras el texto del capítulo de contenido).
+            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined, guidedPractice: ch.guidedPracticeMinutes !== undefined })) {
               const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
               ids.push(`cv3:ch:${ch.chapterId}:${role}`);
             }

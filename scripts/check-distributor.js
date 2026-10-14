@@ -128,6 +128,9 @@ check('D3 80 h: no alcanza con topes razonables → propone módulos/capítulos,
   eq(r.status, 'cannot_reach_target', 'estado');
   assert(r.estimatedHours < 80 - r.toleranceHours, `no llega (${r.estimatedHours})`);
   assert(/No alcanza 80 h sin rellenar/.test(r.recommendations[0]) && /módulo\(s\) nuevo\(s\)/.test(r.recommendations[1]), r.recommendations.join(' | '));
+  // Loop 9 B (fix I1): sin forma ni Actividades fijadas por un documento, los ejercicios guiados NO rellenan: se recomienda.
+  eq(r.guidedPracticeFill, undefined, 'sin ejercicios guiados');
+  assert(chapters(r).every((c) => c.guidedPracticeMinutes === null), 'ningún capítulo con ejercicios guiados');
   for (const m of r.modules) assert(m.chapters.filter((c) => c.kind === 'content').length <= ST.DISTRIBUTOR_RULES.maxContentChaptersPerModule, 'tope de contenido');
   // Nada inflado: cada recurso sale del modelo de tiempo con valores planificados (ningún «medido» inventado).
   for (const c of r.studyTime.modules.flatMap((m) => m.chapters)) assert(c.resources.every((x) => !x.measured), 'sin medidas inventadas');
@@ -159,7 +162,8 @@ check('D5 cada enfoque: política desde las dimensiones del motor; competencias 
   assert(s.counts.contentChapters > c.counts.contentChapters, `significativo más profundidad (${s.counts.contentChapters} vs ${c.counts.contentChapters})`);
   const firstAdd = (r) => (r.changes.find((x) => x.type.startsWith('add_')) || {}).type;
   eq([firstAdd(c), firstAdd(s)], ['add_practice_chapter', 'add_content_chapter'], 'orden de crecimiento');
-  assert(s.recommendations.length > 0 && s.status === 'cannot_reach_target', 'significativo 50 h: no rellena con práctica, recomienda');
+  // Loop 9 B (fix I1): sin documento que fije la forma, tampoco rellena con ejercicios guiados.
+  assert(s.recommendations.length > 0 && s.status === 'cannot_reach_target' && !s.counts.guidedPractices, 'significativo 50 h: no rellena con práctica, recomienda');
 });
 
 check('D6 tolerancia configurable', () => {
@@ -409,35 +413,36 @@ check('D-agotar forma fija + meta fuera de alcance: Actividades permitidas al m�
   const RA = loadDist('modules/academic-context/requirements/requirement-authority.js');
   const m34 = P.snapshotFromStructure({ course: { title: 'Formato M', reviewCards: true, finalExam: true }, modules: [1, 2, 3].map((i) => ({ title: `Módulo ${i}`, examEnabled: true, chapters: [1, 2, 3, 4].map((j) => ({ title: `Capítulo ${i}.${j}`, videoEnabled: true })) })) });
   const docM = { sources: {}, noContentAdditions: true, applicationInPractice: true, applicationPerModule: { min: 1, max: 1 }, applicationTotal: { min: 3, max: 3 }, activitiesTotal: { min: 12, max: 12 }, activitiesInEveryContent: true, videosAllContent: true, modulesFixed: 3, contentChaptersPerModule: { min: 4, max: 4 } };
-  const d = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: docM });
+  // Loop 9 B: con la práctica guiada el Formato M llega a 42 h (ver D-guiada); la meta fuera de alcance aquí es 55 h.
+  const d = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 55, requirements: docM });
   eq(d.status, 'cannot_reach_target', 'no se llega');
   eq(d.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => [c.kind, c.applicationMinutes])), [[['practice', 120]], [['practice', 120]], [['practice', 120]]], '1 Actividad por módulo, en la práctica, a 120 min');
   eq([d.counts.applicationActivities, d.counts.activities, d.counts.contentChapters], [3, 12, 12], 'las cantidades del documento no cambian');
   assert(!d.changes.some((c) => c.type === 'add_content_chapter'), 'sin capítulos de contenido nuevos');
   assert(d.priorityTrace.some((t) => /niveles máximos de Cursia/.test(t)), JSON.stringify(d.priorityTrace));
   const alt = RA.hoursAlternativeOf(d);
-  eq([alt.contentChapters, alt.tier, alt.reaches, alt.added, alt.limitedByDocument], [12, 90, true, 12, true], 'alternativa: 90 min en cada capítulo de contenido (+12), lo limita el documento');
+  eq([alt.contentChapters, alt.tier, alt.reaches, alt.added, alt.limitedByDocument], [12, 30, true, 12, true], 'alternativa: 30 min en cada capítulo de contenido (+12, con la práctica guiada), lo limita el documento');
   // Las horas anunciadas son las del diseño con esa alternativa fijada por el docente (como se aplica en «Estructura»).
   const pins = {};
-  for (const m of d.modules) for (const c of m.chapters) if (c.kind === 'content') pins[c.id] = { application: 90 };
-  const withPins = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: docM, pins });
+  for (const m of d.modules) for (const c of m.chapters) if (c.kind === 'content') pins[c.id] = { application: alt.tier };
+  const withPins = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 55, requirements: docM, pins });
   eq([withPins.counts.applicationActivities, withPins.status === 'cannot_reach_target'], [15, false], 'aplicada: 12 + las 3 de las prácticas, dentro de la meta');
   eq(alt.hours, withPins.estimatedHours, 'las horas anunciadas = las del diseño con la alternativa');
   assert(withPins.hoursAlternative === undefined, 'si se llega no hay alternativa');
   // Review I1: tope del documento NO ligado a la práctica («exactamente 3 en el curso»): se fijan los 12 capítulos de contenido
   // y lo que se suma es el neto real.
   const tot3 = { sources: {}, noContentAdditions: true, applicationTotal: { min: 3, max: 3 } };
-  const dT = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: tot3 });
+  const dT = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 55, requirements: tot3 });
   if (dT.status === 'cannot_reach_target') {
     const aT = RA.hoursAlternativeOf(dT);
     eq(aT.contentChapters, 12, 'los 12 capítulos de contenido');
     const pinsT = {};
     for (const m of dT.modules) for (const c of m.chapters) if (c.kind === 'content') pinsT[c.id] = { application: aT.tier };
-    const wT = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: tot3, pins: pinsT });
+    const wT = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 55, requirements: tot3, pins: pinsT });
     eq([aT.added, aT.hours], [wT.counts.applicationActivities - dT.counts.applicationActivities, wT.estimatedHours], 'neto y horas = lo aplicado');
   }
   // Review I2: «Solo en prácticas» lo eligió el docente: no se propone pasar por encima.
-  const po = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 42, requirements: docM, preferences: { applicationActivities: 'practice_only' } });
+  const po = ST.distributeCourseHours({ snapshot: m34, rules: rulesOf('significativo'), targetHours: 55, requirements: docM, preferences: { applicationActivities: 'practice_only' } });
   assert(po.hoursAlternative === undefined, 'sin alternativa con «Solo en prácticas»');
   // Review I3: el texto dice qué limita (documento o topes de Cursia).
   const txtDoc = RA.capabilityProposal({ kind: 'target_hours' }, d.estimatedHours, RA.hoursAlternativeOf(d));

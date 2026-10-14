@@ -80,6 +80,8 @@ const ARTIFACT_TYPES_BY_ITEM_TYPE_V3: Partial<Record<ManifestItemType, ResolvedA
   video_interactions: ['dynamic_video_interactions_json'],
   // Fase 2: actividad del estudiante + solucionario docente en un solo JSON (nunca se desincronizan).
   application_activity: ['dynamic_application_json'],
+  // Loop 9 B: práctica guiada del capítulo (ejercicios + respuesta modelo, visible).
+  guided_practice: ['dynamic_guided_practice_json'],
   audiobook_chapter: ['dynamic_audio_mp3'],
   exam: ['dynamic_exam_gift'],
   final_exam: ['dynamic_exam_gift'],

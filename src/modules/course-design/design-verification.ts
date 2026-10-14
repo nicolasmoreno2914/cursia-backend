@@ -39,6 +39,18 @@ export interface DesignCheck {
   fix?: CheckFix;
   /** Resumen de un área cuyos problemas ya se listan uno por uno: no suma en los contadores. */
   summary?: true;
+  /** Requisito no cubierto / proporción que la institución debe aceptar (R68: sin su aceptación no se genera). */
+  capability?: { requirementKey: string; requirementText: string; produces: string; proposal?: string; coveredBy?: { requirementKey: string; requirementText: string } };
+}
+
+/** Loop 9 B (fix round 2 · a): clave de la aceptación de la proporción de ejercicios guiados (> 30 % de las horas). */
+export const GUIDED_SHARE_ACCEPTANCE_KEY = 'guided_practice_share@course';
+export const GUIDED_SHARE_ACCEPTANCE_THRESHOLD_PCT = 30;
+/** Texto de la proporción: «X h de Y h de trabajo estimado del estudiante (modelo de tiempo de Cursia), Z %». */
+export function guidedShareWording(minutes: number, designHours: number): { hours: number; pct: number; text: string } {
+  const hours = Math.round((minutes / 60) * 10) / 10;
+  const pct = designHours > 0 ? Math.round((minutes / 60 / designHours) * 100) : 0;
+  return { hours, pct, text: `${h1(hours)} h de ${h1(designHours)} h de trabajo estimado del estudiante (modelo de tiempo de Cursia), ${pct} %` };
 }
 
 export interface DesignVerification {
@@ -71,7 +83,7 @@ export interface VerificationInput {
   estimatedHours: number;
   toleranceHours: number;
   baseHours: number;
-  counts: { modules: number; chapters: number; contentChapters: number; practiceChapters: number; videoChapters: number; activities: number; applicationActivities: number; evaluations: number };
+  counts: { modules: number; chapters: number; contentChapters: number; practiceChapters: number; videoChapters: number; activities: number; applicationActivities: number; evaluations: number; guidedPracticeMinutes?: number };
   manifestErrors: { code: string; message?: string }[];
   alignment: AlignmentLike | null | undefined;
   approach: { id: string; label: string } | null;
@@ -244,6 +256,19 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     add({ id: 'practice', area: 'practice', severity: 'info', title: 'Sin capítulos de práctica', detail: 'El enfoque prioriza la aplicación: la práctica está en las Actividades de Aplicación de los capítulos.' });
   } else add({ id: 'practice', area: 'practice', severity: 'ok', title: k.practiceChapters ? plural(k.practiceChapters, 'capítulo de práctica', 'capítulos de práctica') : 'Sin capítulos de práctica (no hacen falta para estas horas)' });
   add({ id: 'application', area: 'activities', severity: 'ok', title: plural(k.applicationActivities, 'Actividad de Aplicación', 'Actividades de Aplicación') });
+  // Loop 9 B (fix round 2 · a): con más del 30 % de las horas en ejercicios guiados, la institución acepta esa proporción
+  // de forma explícita (mismo mecanismo que un requisito no cubierto: sin su aceptación la propuesta no se aprueba).
+  if (k.guidedPracticeMinutes && input.estimatedHours > 0) {
+    const w = guidedShareWording(k.guidedPracticeMinutes, input.estimatedHours);
+    if (w.pct > GUIDED_SHARE_ACCEPTANCE_THRESHOLD_PCT) {
+      const requirementText = `Ejercicios guiados: ${w.text}`;
+      add({ id: 'guided_share', area: 'activities', severity: 'warning', title: `Ejercicios guiados: ${w.pct} % del trabajo estimado del estudiante`,
+        detail: `Los ejercicios guiados (formativos, sin nota) completan las horas: ${w.text}. Supera el ${GUIDED_SHARE_ACCEPTANCE_THRESHOLD_PCT} %: para continuar, la institución debe aceptar esa proporción en la propuesta.`,
+        fix: { kind: 'adjust', action: 'guidedPractice', value: 'none', label: 'Ejercicios guiados: Ninguno' },
+        capability: { requirementKey: GUIDED_SHARE_ACCEPTANCE_KEY, requirementText, produces: `los ejercicios guiados suman ${w.text}`,
+          proposal: `Aceptar que ${w.pct} % del trabajo estimado del estudiante sean ejercicios guiados formativos, o elegir «Ejercicios guiados: Ninguno» en «Ajustar» y declarar la carga real.` } });
+    }
+  }
   const outside = input.pinnedApplicationsOutsideMode || [];
   if (outside.length) {
     add({ id: 'application_pinned', area: 'activities', severity: 'info', title: `${plural(outside.length, 'Actividad de Aplicación fijada por ti se mantiene', 'Actividades de Aplicación fijadas por ti se mantienen')} aunque la preferencia no las pondría`,

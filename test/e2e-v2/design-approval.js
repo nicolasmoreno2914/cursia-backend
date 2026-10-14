@@ -53,6 +53,8 @@ async function keepTeacherDesign(api, courseId, label, opts = {}) {
         for (const c of m.chapters) {
           const body = { videoEnabled: !!c.videoEnabled, pinVideo: true, expectedCounter: counter };
           if (c.applicationMinutes !== undefined) Object.assign(body, { applicationMinutes: c.applicationMinutes ?? null, pinApplication: true });
+          // Loop 9 B: también la práctica guiada de cada capítulo de contenido (0 = sin práctica guiada, fijada).
+          if (c.guidedPracticeMinutes !== undefined && c.kind !== 'practice') Object.assign(body, { guidedPracticeMinutes: c.guidedPracticeMinutes ?? 0, pinGuidedPractice: true });
           const r = await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, body);
           if (r.status !== 200) throw new Error(`${label}: fijar el capítulo ${c.id} → ${r.status} ${r.error}`);
           counter = r.data.structureVersionCounter;

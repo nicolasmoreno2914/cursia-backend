@@ -11,7 +11,7 @@ import { V3_PAYLOAD_INVALID } from '../modules/course-shell/v3-validation';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
-import { LLM_WORKER_ENABLED_ENV, LLM_WORKER_PRESENCE_BEAT_MS, LLM_WORKER_SINCE_ENV, llmWorkerEnabled, llmWorkerSince, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
+import { LLM_WORKER_ENABLED_ENV, LLM_WORKER_PRESENCE_BEAT_MS, LLM_WORKER_SINCE_ENV, llmWorkerConcurrency, llmWorkerEnabled, llmWorkerSince, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
 import { WorkerLedger } from './finops-worker-hooks';
 import { createExecutorRuntime } from './llm-executor/executor-runtime';
 import { LLM_PENDING_REVIEW, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
@@ -289,7 +289,7 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
   const beatTimer = setInterval(() => { void beat(); }, LLM_WORKER_PRESENCE_BEAT_MS);
   void drain.stopped.then(() => beat());
   const minRunCreatedAt = cfg.since.toISOString();
-  logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2)}, runs desde ${minRunCreatedAt})`);
+  logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${llmWorkerConcurrency()}, runs desde ${minRunCreatedAt})`);
   // Loop 6: el ejecutor fija el modelo de la generación dinámica (DYN_GENERATION_MODEL); DYNAMIC_LLM_WORKER_MODEL solo
   // aplica a una llamada que no traiga modelo. Si apunta a otro, se avisa (configuración sin efecto).
   if (process.env.DYNAMIC_LLM_WORKER_MODEL && process.env.DYNAMIC_LLM_WORKER_MODEL !== 'claude-sonnet-4-6') logger.warn(`DYNAMIC_LLM_WORKER_MODEL=${process.env.DYNAMIC_LLM_WORKER_MODEL} no tiene efecto: la generación dinámica usa el modelo fijo del ejecutor (claude-sonnet-4-6)`);
@@ -297,11 +297,12 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
     await runClaimLoop<ClaimedItem>({
       name: 'dynamic-llm-worker',
       logger,
-      concurrency: readPositiveInt('DYNAMIC_LLM_WORKER_CONCURRENCY', 2),
+      concurrency: llmWorkerConcurrency(),
       pollMs: readPositiveInt('DYNAMIC_LLM_WORKER_POLL_MS', 5000),
       drain,
       active,
-      claim: () => scheduler.claimNextItem({ executorId: deps.executorId, types: [...types], leaseSeconds: deps.leaseSeconds, minRunCreatedAt }),
+      // Fix M5 (Loop 9): solo runs v3 (el ejecutor vendorizado corre v3; v1/v2 tienen scorm, que es solo del navegador).
+      claim: () => scheduler.claimNextItem({ executorId: deps.executorId, types: [...types], leaseSeconds: deps.leaseSeconds, minRunCreatedAt, onlyRulesVersion: 3 }),
       process: async (item) => {
         try {
           const outcome = await processLlmItem(deps, item);

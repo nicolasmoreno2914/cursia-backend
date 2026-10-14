@@ -25,6 +25,11 @@ export class UpdateChapterDto extends PartialType(
   @IsBoolean()
   pinApplication?: boolean;
 
+  /** Loop 9 B: el docente cambió la práctica guiada A MANO (editor V2): queda fijada. Solo con guidedPracticeMinutes. */
+  @IsOptional()
+  @IsBoolean()
+  pinGuidedPractice?: boolean;
+
   /** LOOP 9.2 (review C1): el docente cambió la actividad interactiva A MANO (editor V2): queda fijada. Solo con activityEnabled. */
   @IsOptional()
   @IsBoolean()

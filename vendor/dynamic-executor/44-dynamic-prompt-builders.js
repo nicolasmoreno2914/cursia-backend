@@ -130,7 +130,13 @@ function dynLibroChapterPrompt(courseContext, outline, chapter, module, chapterN
   var capScope = (chapter && typeof chapter.description === 'string' && chapter.description.trim())
     ? '\nAlcance del capítulo (qué temas debe cubrir; úsalo como guía, el título del capítulo es el de arriba): ' + chapter.description.replace(/\s+/g, ' ').trim()
     : '';
-  return c + '\n\nGenera el CAPÍTULO ' + chapterNumber + ' COMPLETO: "' + capTitle + '"\nMódulo ' + moduleNumber + ': ' + modTitle + capScope + '\n\nIncluye:\n1. Secciones ' + chapterNumber + '.1 a ' + chapterNumber + '.5 — 250-400 palabras c/u, ejemplos concretos y plausibles de ' + sector + ' en ' + pais + ' (sin cifras, estudios ni fuentes inventadas)\n2. Mínimo 1 tabla comparativa con criterios cualitativos (sin cifras inventadas)\n3. ■ Caso ' + pais + ': situación ilustrativa de una institución del sector aplicando el tema (en cursiva; hipotética: sin nombres reales ni cifras inventadas)\n4. ✏ Actividad de Apoyo ' + chapterNumber + '.1: ejercicio concreto con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n5. ✏ Actividad de Apoyo ' + chapterNumber + '.2: segundo ejercicio práctico con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n6. ■ Glosario del Capítulo: 8-12 términos con definición clara de 1-2 líneas cada uno\n\nNO generes portada ni tabla de contenido. Empieza directamente con # Capítulo...\nSemilla:' + s;
+  // Loop 9 (B-extra-1): con ejercicios guiados propios (blueprint.chapter.guidedPracticeMinutes) el capítulo NO pide además
+  // las 2 «Actividades de Apoyo» (serían una práctica duplicada): una línea remite a ellos. Sin ellos, el texto de siempre.
+  var hasGuided = !!(chapter && typeof chapter.guidedPracticeMinutes === 'number' && chapter.guidedPracticeMinutes > 0);
+  var practiceItems = hasGuided
+    ? '4. ✏ Ejercicios guiados: este capítulo tiene sus propios ejercicios guiados, que el estudiante hace al terminarlo. NO escribas actividades de apoyo ni ejercicios propios; cierra con una línea que invite a hacer los ejercicios guiados del capítulo.\n5. ■ Glosario del Capítulo: 8-12 términos con definición clara de 1-2 líneas cada uno'
+    : '4. ✏ Actividad de Apoyo ' + chapterNumber + '.1: ejercicio concreto con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n5. ✏ Actividad de Apoyo ' + chapterNumber + '.2: segundo ejercicio práctico con pasos numerados\n   ■■ Nota: actividad de apoyo, opcional, no subir a Moodle.\n6. ■ Glosario del Capítulo: 8-12 términos con definición clara de 1-2 líneas cada uno';
+  return c + '\n\nGenera el CAPÍTULO ' + chapterNumber + ' COMPLETO: "' + capTitle + '"\nMódulo ' + moduleNumber + ': ' + modTitle + capScope + '\n\nIncluye:\n1. Secciones ' + chapterNumber + '.1 a ' + chapterNumber + '.5 — 250-400 palabras c/u, ejemplos concretos y plausibles de ' + sector + ' en ' + pais + ' (sin cifras, estudios ni fuentes inventadas)\n2. Mínimo 1 tabla comparativa con criterios cualitativos (sin cifras inventadas)\n3. ■ Caso ' + pais + ': situación ilustrativa de una institución del sector aplicando el tema (en cursiva; hipotética: sin nombres reales ni cifras inventadas)\n' + practiceItems + '\n\nNO generes portada ni tabla de contenido. Empieza directamente con # Capítulo...\nSemilla:' + s;
 }
 
 // ── dynScormDataPrompt — equivalente puro de pSCORM_data(item,c) (06-scorms.js:1129) ──
@@ -1876,7 +1882,8 @@ var DYN_PEDAGOGY_GENERATORS = {
   course_plan: ['course_plan'], course_intro: ['course_intro'], module_intro: ['module_intro'], content: ['content'],
   experience: ['experience'], video_interactions: ['video_interactions'],
   activity: ['activity', 'branching_scenario', 'scorm_activity'], exam: ['exam'], final_exam: ['final_exam'],
-  application_activity: ['application_activity']
+  application_activity: ['application_activity'],
+  guided_practice: ['guided_practice']
 };
 function dynPedagogyBlock(item) {
   var p = item && item.pedagogy;
@@ -2016,4 +2023,88 @@ function dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd
     + '\n- "correctionGuide": EXACTAMENTE uno por criterio, en este orden y con estos nombres: ' + names.map(function (n) { return '«' + n + '»'; }).join(', ') + '.'
     + '\n- "teacherNotes": 1–6 observaciones concretas.'
     + '\n- Respuestas correctas según el texto fuente; si un cálculo usa datos hipotéticos del enunciado, muestra el resultado.';
+}
+
+// ════ Loop 9 B · «Ejercicios guiados» del capítulo (formativos, sin nota, con respuesta modelo; clave guided_practice) ════
+// Contrato: course-shell/guided-practice.ts (backend). Cuántos ejercicios y sus minutos los fija Cursia (plan del claim,
+// `guidedPractice.exercises`, según el nivel 40/60/80/120 del Manifest); la IA escribe solo el contenido de cada uno.
+// NO es una Actividad de Aplicación: sin solucionario oculto, sin pesos ni nota, más corta y dentro del capítulo.
+var DYN_GUIDED_PRACTICE_KINDS = ['case_analysis', 'worked_problem', 'decision_analysis'];
+var DYN_GUIDED_PRACTICE_KIND_TEXT = {
+  case_analysis: 'case_analysis — analizar un caso concreto y decidir o recomendar con argumentos del capítulo',
+  worked_problem: 'worked_problem — resolver un problema o procedimiento paso a paso con datos coherentes',
+  decision_analysis: 'decision_analysis — comparar alternativas con criterios del capítulo y justificar la elección'
+};
+
+function dynGuidedPracticeSys(courseContext) {
+  var tono = (courseContext && courseContext.tono) || '';
+  return 'Eres diseñador instruccional experto de CampusCloud. Diseñas los EJERCICIOS GUIADOS de un capítulo: ejercicios formativos (sin nota) que el estudiante resuelve justo después de estudiar el capítulo y que luego compara con una respuesta modelo. Respondes SOLO con JSON válido (sin markdown, sin texto extra). Todo texto es plano (sin HTML ni markdown), específico del sector y país del curso, en español latinoamericano, tuteando al estudiante. Tono: ' + tono + '.';
+}
+
+// Fix C1: lo que exige cada ejercicio según sus minutos (espejo de DYN_GUIDED_PRACTICE_FLOORS del ejecutor).
+var DYN_GUIDED_PRACTICE_PROMPT_FLOORS = {
+  20: { situation: 300, tasks: 3, answer: 450 },
+  30: { situation: 550, tasks: 4, answer: 950 },
+  40: { situation: 800, tasks: 5, answer: 1400 }
+};
+// Fix I5: lo que no hay que repetir (práctica del módulo y casos de sus Actividades de Aplicación), desde el claim.
+function _dynGuidedPracticeAvoidBlock(gp) {
+  var a = gp && gp.avoid;
+  if (!a || typeof a !== 'object') return '';
+  var lines = [];
+  (a.practiceChapterTitles || []).forEach(function (t) { if (t) lines.push('- Capítulo de práctica del módulo: «' + t + '»'); });
+  (a.applicationCases || []).forEach(function (c) {
+    if (!c) return;
+    var bits = [];
+    if (c.title) bits.push('«' + c.title + '»');
+    if (c.workshopTitle) bits.push('taller «' + c.workshopTitle + '»');
+    if ((c.names || []).length) bits.push('protagonistas: ' + c.names.join(', '));
+    if (bits.length) lines.push('- Actividad de Aplicación del módulo: ' + bits.join('; '));
+  });
+  return lines.length ? '\n\nNO REPITAS estos casos del módulo (ni su título, ni sus personas, empresas o lugares; usa otra situación):\n' + lines.join('\n') : '';
+}
+
+function dynGuidedPracticePrompt(courseContext, outline, chapter, sourceMd, gp, pedagogy) {
+  var ch = chapter || {};
+  var plan = (gp && gp.exercises) || [];
+  var n = plan.length;
+  var planText = plan.map(function (e, i) { return 'Ejercicio ' + (i + 1) + ': ~' + e.minutes + ' min de trabajo del estudiante'; }).join('; ');
+  var floorText = plan.map(function (e, i) {
+    var f = DYN_GUIDED_PRACTICE_PROMPT_FLOORS[e.minutes] || DYN_GUIDED_PRACTICE_PROMPT_FLOORS[20];
+    return 'Ejercicio ' + (i + 1) + ' (~' + e.minutes + ' min): situación de al menos ' + f.situation + ' caracteres, al menos ' + f.tasks + ' consignas y respuesta modelo de al menos ' + f.answer + ' caracteres' + (e.minutes >= 40 ? '; producto esperado concreto (qué entrega, con qué partes)' : '');
+  }).join('\n- ');
+  return _dynCtxV3(courseContext, outline)
+    + '\n\nCAPÍTULO: "' + (ch.title || '') + '"' + (ch.objective ? '\nObjetivo del capítulo: ' + ch.objective : '')
+    + (ch.description ? '\nAlcance del capítulo: ' + String(ch.description).replace(/\s+/g, ' ').trim() : '')
+    + '\nTexto del capítulo (ÚNICA fuente de los conceptos; los datos de las situaciones son HIPOTÉTICOS e ilustrativos):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
+    + _dynApplicationLearnerBlock(gp, pedagogy)
+    + (pedagogy || '')
+    + _dynGuidedPracticeAvoidBlock(gp)
+    + '\n\nDiseña los EJERCICIOS GUIADOS de este capítulo: EXACTAMENTE ' + n + ' ejercicios (' + planText + ', ' + gp.minutes + ' min en total).'
+    + '\nEs FORMATIVA y SIN NOTA: el estudiante intenta cada ejercicio y después revisa la respuesta modelo. No es una Actividad de Aplicación: nada de solucionario oculto, puntajes, pesos ni calificaciones.'
+    + '\nResponde con JSON EXACTAMENTE con esta forma (sin campos extra; los ids y los minutos los pone Cursia):\n'
+    + '{\n'
+    + '  "exercises": [\n'
+    + '    {\n'
+    + '      "kind": "<uno de: ' + DYN_GUIDED_PRACTICE_KINDS.join(', ') + '>",\n'
+    + '      "title": "título breve (≤ 90 caracteres)",\n'
+    + '      "situation": "situación concreta del sector y país del curso, basada en el capítulo (según sus minutos, hasta 1400 caracteres)",\n'
+    + '      "tasks": ["consigna 1 en imperativo", "consigna 2", "consigna 3", "consigna 4", "consigna 5"],\n'
+    + '      "expectedProduct": "qué produce el estudiante (≤ 300 caracteres)",\n'
+    + '      "criteria": [ { "name": "criterio", "descriptor": "cómo se ve un buen trabajo en ese criterio" } ],\n'
+    + '      "modelAnswer": "1. …\\n2. …\\n3. …\\n4. …\\n5. … (una línea por consigna, en el mismo orden; según sus minutos, hasta 2200 caracteres)"\n'
+    + '    }\n'
+    + '  ]\n'
+    + '}\n'
+    + '\nTipos de ejercicio (elige el que mejor practique el capítulo; si hay ' + n + ' ejercicios, que no sean todos iguales cuando el tema lo permita):\n- ' + DYN_GUIDED_PRACTICE_KINDS.map(function (k) { return DYN_GUIDED_PRACTICE_KIND_TEXT[k]; }).join('\n- ')
+    + '\n\nREGLAS (un validador las verifica):'
+    + '\n- "exercises": EXACTAMENTE ' + n + ', en el orden del plan; cada uno dimensionado para sus minutos (los minutos se acreditan al estudiante: tienen que tener trabajo real detrás):\n- ' + floorText
+    + '\n- "situation": como máximo 1400 caracteres; una situación NUEVA y concreta (personas y organizaciones ficticias, sin nombres reales). NO reutilices el caso que trae el capítulo («■ Caso …») ni su empresa, persona o producto, ni el caso de la práctica o de la Actividad de Aplicación del módulo.'
+    + '\n- Si usas datos o cifras, deben ser coherentes entre sí y con la respuesta modelo (las cuentas tienen que dar); sin estadísticas ni normas inventadas presentadas como reales.'
+    + '\n- "tasks": hasta 6 consignas en imperativo; cada una pide PRODUCIR algo con lo que enseña el capítulo: analizar, decidir, calcular, comparar, justificar, proponer o redactar. Nunca consignas de solo recordar («Define…», «Menciona…», «Enumera…», «¿Qué es…?»).'
+    + '\n- "expectedProduct": hasta 300 caracteres; concreto (qué entrega el estudiante y qué contiene).'
+    + '\n- "criteria": de 3 a 5 criterios para que el estudiante revise su propio trabajo, solo { "name", "descriptor" } (sin pesos ni puntajes).'
+    + '\n- "modelAnswer": como máximo 2200 caracteres; responde TODAS las consignas EN ORDEN, UNA LÍNEA POR CONSIGNA (separadas con \\n), y cada línea EMPIEZA con su número: «1. », «2. », «3. »… Es la respuesta que el estudiante ve después de intentarlo.'
+    + '\n- Dentro del alcance de ESTE capítulo: sin teoría de otros capítulos.'
+    + '\n- No menciones otros recursos del curso (videos, actividades interactivas, Actividad de Aplicación, exámenes o evaluaciones, audiolibro, presentación, Libro Guía): la práctica se lee sola.';
 }

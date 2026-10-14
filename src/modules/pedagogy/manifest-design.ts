@@ -79,6 +79,13 @@ export function manifestItemDesign(
             role: d.role, objectiveVerbs: [...d.objectiveVerbs], contentType: d.contentType, depth: d.depth, intent: d.activity.intent,
             scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing },
           };
+        case 'guided_practice':
+          // Loop 9 B: la práctica guiada (formativa) toma del capítulo el tipo de contenido, los verbos del objetivo, el
+          // escenario y la retroalimentación (respuesta modelo después de intentarlo).
+          return {
+            role: d.role, objectiveVerbs: [...d.objectiveVerbs], contentType: d.contentType, depth: d.depth,
+            scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing },
+          };
         default:
           throw new Error(`manifestItemDesign: tipo de item sin diseño definido: ${type}`);
       }

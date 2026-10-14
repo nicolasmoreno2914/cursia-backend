@@ -430,6 +430,30 @@ async function dbChecks() {
       assert(LOGS.some((l) => /auto-heal: barrido — candidatos \d+, reabiertos 1, omitidos \d+/.test(l)), 'log por barrido con conteos');
     });
 
+    await check('DB Loop 9 (fix I4): un examen de módulo fallido bloquea el examen final (depende de él); retryItem lo desbloquea; el healer también', async () => {
+      const C9 = await makeCourse('Curso final espera examen');
+      const examKey = (await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and type = 'exam'`, [C9.runId]))[0].item_key;
+      const finKey = (await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and type = 'final_exam'`, [C9.runId]))[0].item_key;
+      const fin0 = await itemRow(C9.runId, finKey);
+      assert(fin0.depends_on.includes(examKey), 'el final depende del examen del módulo: ' + JSON.stringify(fin0.depends_on));
+      // Falla definitiva del examen (lease del ejecutor + fail no reintentable) → el final queda blocked.
+      const ex = await itemRow(C9.runId, examKey);
+      await setRow(ex.id, `status = 'running', worker_id = 'exec-I4', lease_until = now() + interval '5 minutes', attempt_count = 1`);
+      await sched.failItemDetailed(ex.id, 'exec-I4', 'EXAM_BANK_INCOMPLETE: prueba', false);
+      eq([(await itemRow(C9.runId, examKey)).status, (await itemRow(C9.runId, finKey)).status], ['failed', 'blocked'], 'examen failed → final blocked');
+      // Reintento manual del examen → el final vuelve a la cola.
+      eq((await runs.retryItem(C9.cid, OWNER, 1, C9.runId, examKey)).status, 'pending', 'retryItem del examen');
+      eq((await itemRow(C9.runId, finKey)).status, 'pending', 'final desbloqueado por retryItem');
+      // Falla transitoria (allow-list del healer) → bloqueado otra vez → el healer reabre el examen y desbloquea el final.
+      const ex2 = await itemRow(C9.runId, examKey);
+      await setRow(ex2.id, `status = 'running', worker_id = 'exec-I4', lease_until = now() - interval '1 second', attempt_count = max_attempts,
+                            output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('leaseExpiryGrants', $2::int)`, [IT.LEASE_EXPIRY_FREE_GRANTS]);
+      await sched.sweepExpiredLeases(C9.runId);
+      eq([(await itemRow(C9.runId, examKey)).status, (await itemRow(C9.runId, finKey)).status], ['failed', 'blocked'], 'lease vencido sin intentos → failed; final blocked');
+      await heal(P.backoffSeconds[0] + 5);
+      eq([(await itemRow(C9.runId, examKey)).status, (await itemRow(C9.runId, finKey)).status], ['pending', 'pending'], 'healer: examen reabierto y final desbloqueado');
+    });
+
     await check('DB fix M6: item del navegador (content) → UNA sola ronda automática (cada ronda repite LLM pagado); ya no es candidato', async () => {
       const it = await itemRow(C.runId, contentKey);
       await failAt(it.id, 'unexpected_error: Connection terminated', 60);

@@ -77,7 +77,8 @@ const extract = (text, docId = 'D1') => RX.extractRequirements(read(text).lines,
 const SML_TABLE = 'Tamaños de curso\nTAMAÑO HORAS ESTRUCTURA\nS\n1 h/sem\n20–22 h 3 módulos\n× 3 capítulos\nM\n2 h/sem\n40–44 h 3 módulos\n× 4 capítulos\nL\n3 h/sem\n60–66 h 4 módulos\n× 5 capítulos\nLa institución elegirá un tamaño por asignatura.';
 const FULL = 'El curso deberá tener 4 módulos con 5 capítulos por módulo. Cada capítulo tendrá 2 videos. Cada módulo tendrá una Actividad de Aplicación. Se realizarán 3 evaluaciones parciales y 1 evaluación final. La intensidad horaria total será de 64 horas.';
 
-function design({ shape, video = 'content', aa = 'first', exams = true, finalExam = true, target = 42, hoursSource = 'proposed', teacher = false, practiceLast = false, avTeacher = false, appTeacher = false }) {
+// Fix round 1 de Loop 9 (M6): las horas se comparan con las ESTIMADAS (por defecto = la meta: un diseño que la alcanza).
+function design({ shape, video = 'content', aa = 'first', exams = true, finalExam = true, target = 42, estimated = target, hoursSource = 'proposed', teacher = false, practiceLast = false, avTeacher = false, appTeacher = false }) {
   const modules = shape.map((n) => ({
     examEnabled: exams,
     chapters: Array.from({ length: n }, (_, i) => ({
@@ -86,7 +87,7 @@ function design({ shape, video = 'content', aa = 'first', exams = true, finalExa
       activityEnabled: true, applicationMinutes: aa === 'first' && i === 0 ? 60 : aa === 'all' ? 45 : null, hours: 3,
     })),
   }));
-  return { modules, evaluations: (exams ? shape.length : 0) + (finalExam ? 1 : 0), targetHours: target, hoursSource, structureByTeacher: teacher, audiovisualByTeacher: avTeacher, applicationByTeacher: appTeacher };
+  return { modules, evaluations: (exams ? shape.length : 0) + (finalExam ? 1 : 0), targetHours: target, estimatedHours: estimated, hoursStatus: 'within_tolerance', hoursSource, structureByTeacher: teacher, audiovisualByTeacher: avTeacher, applicationByTeacher: appTeacher };
 }
 const byKind = (x, kind, et) => x.requirements.filter((r) => r.kind === kind && (!et || r.evaluationType === et));
 const checkOf = (checks, r) => checks.find((c) => c.requirementId === r.id);
@@ -373,7 +374,7 @@ async function dbChecks() {
     await withClient(DB, async (c) => {
       for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql',
         'supabase-migration-v21-blueprint-profiles.sql', 'supabase-migration-pedagogy-profiles.sql', 'supabase-migration-practice-chapters.sql',
-        'supabase-migration-application-activities.sql', 'supabase-migration-academic-context.sql']) {
+        'supabase-migration-application-activities.sql', 'supabase-migration-guided-practice.sql', 'supabase-migration-academic-context.sql']) {
         await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
       }
     });
@@ -480,13 +481,15 @@ async function dbChecks() {
       eq(mods.status, after.design.counts.modules === 3 ? 'met' : 'unmet', 'estado coherente');
       assert(['cursia', 'teacher'].includes(mods.chosenBy), 'quién lo decidió');
       const hrs = ch.find((c) => c.requirementId === item('target_hours').id);
-      eq(hrs.actual.value, after.hours.target, 'horas: la meta del diseño');
+      // Loop 9 (A5): la comparación usa las horas ESTIMADAS del diseño (lo que muestra la propuesta), no la meta.
+      eq(hrs.actual.value, Math.round(after.design.estimatedHours * 10) / 10, 'horas: las estimadas del diseño');
       // No bloquea: el diseño sigue aplicable aunque se aparte.
       assert(typeof after.design.applicable === 'boolean', 'la propuesta sigue siendo aplicable o no por sus propias razones');
       // Horas del docente en «Ajustar» → «Te estás apartando».
       const adj = await design.recommend(cid, OWNER, { adjust: { targetHours: 30 } });
       const h2 = adj.requirements.checks.find((c) => c.requirementId === item('target_hours').id);
-      eq([h2.status, h2.chosenBy, h2.actual.value], ['unmet', 'teacher', 30], '30 h del docente');
+      eq([h2.status, h2.chosenBy, h2.actual.target ?? h2.actual.value], ['unmet', 'teacher', 30], '30 h del docente (la meta; actual.value = las estimadas)');
+      eq(h2.actual.value, Math.round(adj.design.estimatedHours * 10) / 10, 'estimadas del diseño con la meta del docente');
     });
     await check('RB13 un PATCH con metadata no borra ni falsifica requisitos ni elección; el listado no arrastra las lecturas', async () => {
       const { CoursesService } = loadDist('modules/courses/courses.service.js');

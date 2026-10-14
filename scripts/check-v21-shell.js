@@ -1109,8 +1109,13 @@ async function dbChecks() {
       eq([a.type, a.chapterId, a.variant, a.claimPayload.activityType, a.claimPayload.validatedArtifactType], ['activity', C1, 'h5p', 'questionset', 'dynamic_h5p_params_json'], 'activity C1');
       const a2 = await claim(['activity']);
       eq([a2.chapterId, a2.claimPayload.activityType], [C2, 'dragtext'], 'activity C2 (rotación)');
+      // Loop 9: el final depende también de los exam:<m> → hasta que no estén completos no es reclamable.
+      eq(await claim(['final_exam']), null, 'final_exam espera a los exámenes de módulo');
+      // Los exámenes de módulo se prueban más abajo (EV6 P2): acá se dan por completos «a mano», como el plan y los content.
+      await ds.query(`update public.generation_item_runs set status = 'completed' where job_id = $1 and type = 'exam'`, [job.id]);
       const fe = await claim(['final_exam']);
       eq([fe.type, fe.claimPayload.finalExam], ['final_exam', { minQuestions: 5, maxQuestions: 40 }], 'final_exam');
+      eq(fe.dependsOn.filter((d) => d.startsWith('exam:')).length, (await ds.query(`select count(*)::int n from public.generation_item_runs where job_id = $1 and type = 'exam'`, [job.id]))[0].n, 'el final depende de cada exam:<m>');
     });
 
     await check('DB completeItem RECHAZA experience inválido: v3_payload_invalid + códigos, item → retrying con error, artifact sin vincular', async () => {
@@ -1173,6 +1178,8 @@ async function dbChecks() {
 
     await check('DB EV6 P2: exam y final_exam aceptan el banco dynamic_exam_bank_json (plan del claim, questionCount = slots); plan ≠ Manifest → EXAM_BANK_PLAN; banco + GIFT → EXAM_ARTIFACT_AMBIGUOUS; evidencia falsa → EXAM_BANK_EVIDENCE al completar', async () => {
       const examKey = `exam:${M1}`;
+      // Loop 9: el examen de módulo se había dado por completo «a mano» (dependencia del final): vuelve a la cola.
+      await ds.query(`update public.generation_item_runs set status = 'pending' where job_id = $1 and item_key = $2`, [job.id, examKey]);
       // Fix 1 (I1): completeItem lee el dynamic_content_md vigente de cada capítulo del examen para la evidencia.
       const gIndex = new Map([[C1, 0], [C2, 1], [C3, 2]]);
       for (const [cId, gi] of gIndex) {
@@ -1543,6 +1550,15 @@ async function dbChecks() {
       eq([(await item(a.itemKey)).status, await linked(art)], ['running', null], 'sigue running y sin vincular');
       const art2 = await upload('dynamic_module_intro_json', miDoc);
       eq(await sched.completeItemDetailed(a.itemRunId, 'b1', { artifactIds: [art2], summary: {} }, OWNER), { ok: true }, 'completo');
+    });
+
+    await check('DB Loop 9 (fix M5): el claim del worker interno con onlyRulesVersion solo toma items de Manifests de ese rulesVersion', async () => {
+      // Un module_intro (solo depende del plan, completo) vuelve a la cola para la prueba.
+      const [mi] = await ds.query(`select id from public.generation_item_runs where job_id = $1 and type = 'module_intro' order by item_key limit 1`, [job.id]);
+      await ds.query(`update public.generation_item_runs set status = 'pending', worker_id = null, lease_until = null, next_retry_at = null, attempt_count = 0, max_attempts = 10 where id = $1`, [mi.id]);
+      eq(await sched.claimNextItem({ executorId: 'w-v2', types: ['module_intro'], leaseSeconds: 60, onlyRulesVersion: 2 }), null, 'worker restringido a v2: no toma el item v3');
+      const w = await sched.claimNextItem({ executorId: 'w-v3', types: ['module_intro'], leaseSeconds: 60, onlyRulesVersion: 3 });
+      assert(w && w.type === 'module_intro' && w.rulesVersion === 3, 'worker v3: lo toma');
     });
   } finally {
     if (ds && ds.isInitialized) await ds.destroy().catch(() => {});

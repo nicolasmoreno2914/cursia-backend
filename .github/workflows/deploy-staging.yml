@@ -545,6 +545,10 @@ jobs:
                # Apagado de emergencia: cambiar este true por false y desplegar (el navegador vuelve a todas las partes).
                ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED true
                ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+               # Loop 9: el worker de IA genera TODAS las partes de IA (también las cortas): 4 partes en paralelo
+               # dentro del mismo proceso (tope 6 en el worker). Sin un proceso ni una conexión más (la cuenta del
+               # pooler no cambia: cada parte usa la conexión del proceso anfitrión).
+               ensure_env_exact DYNAMIC_LLM_WORKER_CONCURRENCY 4
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
@@ -622,6 +626,12 @@ jobs:
 
                echo "━━━ [4h5b] Actividades de Aplicación: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-application-activities-schema.js
+
+               echo "━━━ [4h5a2] Práctica guiada: course_chapters.guided_practice_minutes + conteos del Manifest — migración (staging, DESPUÉS de Actividades de Aplicación: reescribe cgm_counts_consistent) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-guided-practice.js
+
+               echo "━━━ [4h5a3] Práctica guiada: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-guided-practice-schema.js
 
                echo "━━━ [4h5c] Contexto académico: course_profiles kind academic + course_chapters.outcome_ids — migración (staging, DESPUÉS de pedagogy-profiles) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-academic-context.js

@@ -28,3 +28,4 @@ export * from './section-layout';
 export * from './pending-video';
 export { ShellRenderOptions, ShellLevel, injectIntoMovement, unprotectedText } from './html';
 export * from './application-activity';
+export * from './guided-practice';

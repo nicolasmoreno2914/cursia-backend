@@ -152,6 +152,8 @@ function buildBp(spec) {
     video_enabled: !!c.video, activity_enabled: !!c.act,
     // Fase 2: Actividad de Aplicación (minutos) en los capítulos que la piden.
     ...(c.app ? { application_minutes: c.app } : {}),
+    // Loop 9 B: práctica guiada (minutos) en los capítulos de contenido que la piden.
+    ...(c.gp ? { guided_practice_minutes: c.gp } : {}),
   })));
   return snap.buildBlueprintSnapshotV2(
     { id: COURSE_ID, title: spec.title, finalExam: spec.finalExam, activityEngine: spec.engine }, modules, chapters,
@@ -246,9 +248,10 @@ async function pureChecks() {
   const m0 = manifestOf(bp0, 1);
   const chapterItems = (ch) => m0.items.filter((i) => i.chapterId === ch).map((i) => i.key);
 
-  await check('fixture: el Manifest v3 tiene todos los tipos (14, con una Actividad de Aplicación) y el plan sin cambios es todo REUSE', () => {
-    // Fase 2: el fixture base no cambia (sha fijados); los 14 tipos se ven con una actividad en el capítulo 2.
-    const withApp = baseSpec(); chapterOf(withApp, C2).app = 60;
+  await check('fixture: el Manifest v3 tiene todos los tipos (15, con una Actividad de Aplicación y una práctica guiada) y el plan sin cambios es todo REUSE', () => {
+    // Fase 2: el fixture base no cambia (sha fijados); los 15 tipos se ven con una actividad en el capítulo 2
+    // (Loop 9 B: y una práctica guiada en el capítulo 1).
+    const withApp = baseSpec(); chapterOf(withApp, C2).app = 60; chapterOf(withApp, C1).gp = 80;
     const types = new Set([...m0.items, ...manifestOf(buildBp(withApp), 9).items].map((i) => i.type));
     for (const t of B.MANIFEST_ITEM_TYPES_V3) assert(types.has(t), `falta ${t}`);
     const pa = planOf(buildBp(withApp), buildBp(withApp)).plan;
@@ -257,6 +260,25 @@ async function pureChecks() {
     assert(allReuse(plan), 'no todo REUSE');
     eq([plan.fromRulesVersion, plan.toRulesVersion, plan.fingerprintVersion, plan.invalidationPlanVersion], [3, 3, 2, 2], 'versiones');
     eq(plan.actions.length, m0.items.length, 'una acción por item');
+  });
+
+  // Loop 9 B: la práctica guiada es texto LLM que depende del content de su capítulo y de su nivel.
+  await check('Loop 9 B práctica guiada: encender → GENERATE; cambiar el nivel → REGENERATE (solo ella); apagar → SOFT_DISABLE; content nuevo → REGENERATE; nunca un proveedor', () => {
+    const on = baseSpec(); chapterOf(on, C1).gp = 80;
+    let r = planOf(bp0, buildBp(on)).plan;
+    expectPlan(r, { [K('guided_practice', C1)]: 'GENERATE' });
+    assertReason(r, K('guided_practice', C1), 'guided_practice_toggled_on');
+    const more = baseSpec(); chapterOf(more, C1).gp = 120;
+    r = planOf(buildBp(on), buildBp(more)).plan;
+    expectPlan(r, { [K('guided_practice', C1)]: 'REGENERATE' });
+    assertReason(r, K('guided_practice', C1), 'guided_practice_frame_changed');
+    r = planOf(buildBp(on), bp0).plan;
+    expectPlan(r, { [K('guided_practice', C1)]: 'SOFT_DISABLE' });
+    assertReason(r, K('guided_practice', C1), 'guided_practice_toggled_off');
+    const retitled = baseSpec(); chapterOf(retitled, C1).gp = 80; chapterOf(retitled, C1).objective = 'Objetivo uno, reescrito';
+    r = planOf(buildBp(on), buildBp(retitled)).plan;
+    eq(byKey(r)[K('guided_practice', C1)].action, 'REGENERATE', 'content nuevo → la práctica guiada se rehace');
+    assertNoProviderSpend(r);
   });
 
   // ── Filas de §P ───────────────────────────────────────────────────────────
@@ -386,7 +408,7 @@ async function pureChecks() {
     assertReason(plan, K('content', C1), 'reordered_within_module');
   });
 
-  await check('§P mover el capítulo a otro módulo: content/experience REVIEW, exámenes e intros de ambos RG, final_exam y proveedores REUSE', () => {
+  await check('§P mover el capítulo a otro módulo: content/experience REVIEW, exámenes e intros de ambos RG, final_exam RG con ellos (Loop 9), proveedores REUSE', () => {
     const s = baseSpec();
     const c3 = s.modules[0].chapters.pop();
     s.modules[1].chapters.push(c3);
@@ -396,17 +418,20 @@ async function pureChecks() {
       [K('exam', M1)]: 'REGENERATE', [K('exam', M2)]: 'REGENERATE',
       [K('module_intro', M1)]: 'REGENERATE', [K('module_intro', M2)]: 'REGENERATE',
       [CK('course_plan')]: 'REGENERATE', [CK('course_intro')]: 'REGENERATE', [CK('audio_welcome')]: 'STALE_NO_AUTO',
+      // Loop 9 (fix I3): el final depende de los exámenes de módulo → se regenera con ellos (solo IA).
+      [CK('final_exam')]: 'REGENERATE',
     });
     assertReason(plan, K('experience', C3), 'moved_across_modules');
+    assertReason(plan, CK('final_exam'), 'module_exam_regenerated');
     assertNoProviderSpend(plan);
   });
 
-  await check('§P editar módulo (título/objetivo): content/experience del módulo REVIEW, exam + module_intro RG, proveedores REUSE', () => {
+  await check('§P editar módulo (título/objetivo): content/experience del módulo REVIEW, exam + module_intro RG, final_exam RG (Loop 9), proveedores REUSE', () => {
     const s = baseSpec(); s.modules[1].title = 'Aplicaciones prácticas';
     const { plan } = planOf(bp0, buildBp(s));
     expectPlan(plan, {
       [K('content', C4)]: 'REVIEW', [K('content', C5)]: 'REVIEW', [K('experience', C4)]: 'REVIEW', [K('experience', C5)]: 'REVIEW',
-      [K('exam', M2)]: 'REGENERATE', [K('module_intro', M2)]: 'REGENERATE',
+      [K('exam', M2)]: 'REGENERATE', [K('module_intro', M2)]: 'REGENERATE', [CK('final_exam')]: 'REGENERATE',
       [CK('course_plan')]: 'REGENERATE', [CK('course_intro')]: 'REGENERATE', [CK('audio_welcome')]: 'STALE_NO_AUTO',
     });
     assertReason(plan, K('experience', C4), 'module_context_changed');
@@ -575,10 +600,10 @@ async function pureChecks() {
       const m = byKey(planOf(bp0, buildBp(sp)).plan);
       eq([m[K('exam', M1)].action, m[K('exam', M2)].action, m[CK('final_exam')].action], ['REUSE', 'REUSE', 'REUSE'], `reorden de ${name}`);
     }
-    // mover C3 de M1 a M2 (ambos siguen): exámenes de ambos RG; final REUSE (el banco empaqueta con su plan congelado)
+    // mover C3 de M1 a M2 (ambos siguen): exámenes de ambos RG; final RG con ellos (Loop 9; antes REUSE)
     const mv = baseSpec(); mv.modules[1].chapters.push(mv.modules[0].chapters.pop());
     const pm = byKey(planOf(bp0, buildBp(mv)).plan);
-    eq([pm[K('exam', M1)].action, pm[K('exam', M2)].action, pm[CK('final_exam')].action], ['REGENERATE', 'REGENERATE', 'REUSE'], 'mover');
+    eq([pm[K('exam', M1)].action, pm[K('exam', M2)].action, pm[CK('final_exam')].action], ['REGENERATE', 'REGENERATE', 'REGENERATE'], 'mover (Loop 9: el final se regenera con los exámenes de módulo de los que depende)');
     // vaciar y borrar M3 (C6 pasa a M2) / módulo nuevo con un capítulo movido: el conjunto de módulos
     // con capítulos cambia. Final BANCO ⇒ RG course_modules_changed; final GIFT ⇒ REUSE ['unchanged'] (fix 2, R1).
     const del = baseSpec(); del.modules[1].chapters.push(del.modules[2].chapters[0]); del.modules.pop();
@@ -590,7 +615,8 @@ async function pureChecks() {
       assertReason(pb, CK('final_exam'), 'course_modules_changed');
       for (const [twin, over] of [['sin tipos', {}], ['GIFT', { [CK('final_exam')]: { artifactTypes: ['dynamic_exam_gift'] } }]]) {
         const pg = byKey(planOf(bp0, buildBp(sp), { over }).plan)[CK('final_exam')];
-        eq([pg.action, pg.reasons], ['REUSE', ['unchanged']], `${name}: final ${twin}`);
+        // Loop 9 (fix I3): el examen de un módulo que ganó / perdió capítulos se regenera → el final GIFT también (antes REUSE).
+        eq([pg.action, pg.reasons], ['REGENERATE', ['module_exam_regenerated']], `${name}: final ${twin} (con su examen de módulo)`);
       }
     }
     eq(byKey(planOf(bp0, buildBp(nw)).plan)[K('exam', M2)].action, 'REGENERATE', 'exam del módulo que perdió el capítulo');
@@ -883,7 +909,12 @@ async function pureChecks() {
     }, 'v3 content sin video ni actividad');
     eq(RC.regenerationCascade(3, m0.items, it(K('video', C1))), { regenerate: [K('video_interactions', C1)], stale: [] }, 'v3 video');
     eq(RC.regenerationCascade(3, m0.items, it(CK('course_intro'))), { regenerate: [], stale: [CK('audio_welcome')] }, 'v3 course_intro');
-    for (const k of [CK('course_plan'), K('presentation', C1), K('experience', C1), K('module_intro', M1)]) {
+    // Loop 9 (fix I3): el final depende de los exámenes de módulo → regenerar exam:<m> regenera el final (solo IA).
+    eq(RC.regenerationCascade(3, m0.items, it(K('exam', M1))), { regenerate: [CK('final_exam')], stale: [] }, 'v3 exam → final_exam');
+    const legacyItems = m0.items.map((x) => (x.type === 'final_exam' ? { ...x, dependsOn: x.dependsOn.filter((d) => !d.startsWith('exam:')) } : x));
+    eq(RC.regenerationCascade(3, legacyItems, it(K('exam', M1))), { regenerate: [], stale: [] }, 'v3 exam con Manifest anterior (final sin esa arista): sin cascada');
+    eq(RC.regenerationCascade(1, v1items, v1items[3]), { regenerate: [], stale: [] }, 'v1 exam: sin cascada (como siempre)');
+    for (const k of [CK('course_plan'), K('presentation', C1), K('experience', C1), K('module_intro', M1), CK('final_exam')]) {
       eq(RC.regenerationCascade(3, m0.items, it(k)), { regenerate: [], stale: [] }, `v3 ${k} sin cascada`);
     }
   });
@@ -900,8 +931,10 @@ async function pureChecks() {
 // Sha fijado del plan "título de C1 editado" (fixture de arriba). Cambia solo
 // si cambian las huellas v3, las reglas o la forma del plan: en ese caso,
 // revisar el diff y actualizar a propósito.
-const PINNED_GIFT_MODULE_EDIT_SHAS = ['6f45161fe25affe9b3bb9e43aa3d39f1c2dbe95d37c4117faabd848139cced82', '7dbad6f598aa05cfb9d546734b09249e763afde7147eb6bb260ff32caca43edb']; // = dist de la base b236bf0 (fix 2, R1)
-const PINNED_PLAN_SHA = '4b299d6f5384576a6ebacd81bb2264064d566fa6ae95e5edbaddb8b1d3c0acd9';
+// Loop 9 (fix I3): la base b236bf0 daba 6f45161f…/7dbad6f5…; cambian SOLO porque el final se regenera con los exámenes de
+// módulo (verificado: sin esa regla el plan da exactamente los sha de la base).
+const PINNED_GIFT_MODULE_EDIT_SHAS = ['73150b44423cb4ffae6e830114b5eb35fa8e2d1956f605f835cdad3f5fe45a30', '00450ea1b2df657a087e4637ac77a88ea5b4546a036bbd956ecd98b7a7a322a5'];
+const PINNED_PLAN_SHA = '1d99db792ade9e99ee758e7fba8059ab7801f149e94beffe3ffa1f8dfa27c011'; // Loop 9 (fix I3): antes 4b299d6f…, solo por el final con los exámenes
 
 // ════════════════════════════════════════════════════════════════════════════
 // Parte DB: Postgres 16 desechable

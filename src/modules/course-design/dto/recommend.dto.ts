@@ -16,6 +16,10 @@ export class DesignAdjustDto {
   @IsOptional() @IsIn(['less', 'recommended', 'more'])
   audiovisual?: 'less' | 'recommended' | 'more';
 
+  /** Loop 9 B (fix I1): ejercicios guiados para completar horas cuando el documento fija la forma ('auto') o nunca ('none'). */
+  @IsOptional() @IsIn(['auto', 'none'])
+  guidedPractice?: 'auto' | 'none';
+
   /** Enfoque principal, o 'recommended' (el que recomienda Cursia). */
   @IsOptional() @IsString() @MaxLength(64)
   approach?: string;

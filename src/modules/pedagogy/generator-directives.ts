@@ -47,7 +47,9 @@ export type PedagogyGeneratorId =
   | 'exam'
   | 'final_exam'
   // Fase 2: Actividad de Aplicación (actividad + solucionario).
-  | 'application_activity';
+  | 'application_activity'
+  // Loop 9 B: práctica guiada del capítulo (formativa, con respuesta modelo).
+  | 'guided_practice';
 
 /** Generadores que reciben un prompt LLM (bloque con marcador) vs. proveedores (línea compacta). */
 const PROVIDER_GENERATORS: ReadonlySet<PedagogyGeneratorId> = new Set(['presentation', 'video']);
@@ -108,6 +110,7 @@ export const PEDAGOGY_GENERATOR_COVERAGE: Readonly<Record<string, { consumes: bo
   exam: { consumes: true, generator: 'LLM (navegador) — banco de preguntas o GIFT del módulo', reason: 'estrategia, estilo de evaluación y retroalimentación' },
   final_exam: { consumes: true, generator: 'LLM (navegador) — banco de preguntas o GIFT final', reason: 'estrategia, estilo integrador y retroalimentación' },
   application_activity: { consumes: true, generator: 'LLM (navegador) — Actividad de Aplicación + solucionario docente', reason: 'intención, escenario, profundidad, verbos del objetivo y retroalimentación (Fase 2)' },
+  guided_practice: { consumes: true, generator: 'LLM (navegador o worker) — práctica guiada del capítulo con respuesta modelo', reason: 'escenario, profundidad, verbos del objetivo y retroalimentación (Loop 9 B)' },
   audio_welcome: {
     consumes: false,
     generator: 'TTS (worker) — narra la bienvenida ya generada',
@@ -137,6 +140,8 @@ export const BRIEF_ROLE_SENSITIVE_FIELDS: Readonly<Record<string, readonly strin
   activity: ['activity.intent', 'scenario.type', 'scenario.branching', 'feedback.mode', 'feedback.timing'],
   // Fase 2: la Actividad de Aplicación lee el tipo de contenido, el escenario, la intención y la retroalimentación.
   application_activity: ['contentType', 'scenario.type', 'activity.intent', 'feedback.mode'],
+  // Loop 9 B: la práctica guiada lee el tipo de contenido, el escenario y la retroalimentación.
+  guided_practice: ['contentType', 'scenario.type', 'feedback.mode'],
 });
 
 function pick(o: any, path: string): unknown {
@@ -384,6 +389,7 @@ export function generatorForItem(item: BriefInput['item']): PedagogyGeneratorId 
     case 'exam':
     case 'final_exam':
     case 'application_activity':
+    case 'guided_practice':
       return item.type;
     case 'activity':
       if (item.variant === 'scorm') return 'scorm_activity';
@@ -538,6 +544,22 @@ function directivesFor(gen: PedagogyGeneratorId, input: BriefInput): { directive
       overridden.push({
         target: 'activity.intent', value: intent, by: 'product', scope: 'partial', rule: 'Estructura fija de la Actividad de Aplicación de Cursia (objetivo, contexto, ejemplos, 6–10 ejercicios, taller, producto, autoevaluación y 3–4 criterios)',
         effect: 'El diseño orienta el género, los casos y la exigencia; las partes y cantidades las fija Cursia según los minutos.',
+      });
+      break;
+    }
+    case 'guided_practice': {
+      // Loop 9 B: el diseño del capítulo orienta el tipo de situación, la profundidad, los verbos y la respuesta modelo;
+      // cuántos ejercicios y sus minutos los fija Cursia (nivel del Manifest). Es formativa: sin nota ni solucionario oculto.
+      const sc = des.scenario ?? {};
+      const fb = des.feedback ?? {};
+      directives.push(d('scenarios.type', sc.type, `Las situaciones de los ejercicios son ${need(SCENARIO_TEXT, sc.type, 'scenario.type')} (ilustrativas, sin datos reales de personas ni instituciones).`));
+      directives.push(d('content.depth', des.depth, need(DEPTH_TEXT, des.depth, 'depth')));
+      const verbs: string[] = Array.isArray(des.objectiveVerbs) ? des.objectiveVerbs.slice(0, 6) : [];
+      if (verbs.length) directives.push({ target: 'objectives.verbs', value: verbs.join(','), label: verbs.join(', '), instruction: `Redacta las consignas con verbos como: ${verbs.join(', ')}.` });
+      directives.push(d('feedback.mode', fb.mode, `${need(FEEDBACK_TEXT, fb.mode, 'feedback.mode')} Aplícalo en la respuesta modelo que el estudiante revisa después de intentarlo.`));
+      overridden.push({
+        target: 'feedback.timing', value: fb.timing ?? '', by: 'product', scope: 'partial', rule: 'Los ejercicios guiados muestran la respuesta modelo debajo de cada ejercicio (formativos, sin nota)',
+        effect: 'El estudiante la revisa después de intentarlo; cuántos ejercicios y sus minutos los fija Cursia.',
       });
       break;
     }

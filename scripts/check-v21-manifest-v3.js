@@ -140,6 +140,7 @@ function oracle(s) {
   out.push([I, 'course_intro', [P]]);
   out.push([`audio_welcome:${COURSE_ID}`, 'audio_welcome', [I]]);
   const all = [];
+  const exams = [];
   for (const m of [...s.modules].sort((a, b) => a.position - b.position)) {
     out.push([`module_intro:${m.id}`, 'module_intro', [P]]);
     const mc = [];
@@ -157,9 +158,10 @@ function oracle(s) {
       if (c.activityEnabled) out.push([`activity:${c.id}`, 'activity', [C], s.course.activityEngine]);
       out.push([`audiobook_chapter:${c.id}`, 'audiobook_chapter', [C]]);
     }
-    if (m.examEnabled) out.push([`exam:${m.id}`, 'exam', mc]);
+    if (m.examEnabled) { out.push([`exam:${m.id}`, 'exam', mc]); exams.push(`exam:${m.id}`); }
   }
-  if (s.course.finalExam) out.push([`final_exam:${COURSE_ID}`, 'final_exam', all]);
+  // Loop 9: el final depende de todos los content y de los exam:<m>, en orden (recibe los bancos de módulo).
+  if (s.course.finalExam) out.push([`final_exam:${COURSE_ID}`, 'final_exam', [...all, ...exams]]);
   return out;
 }
 
@@ -199,7 +201,7 @@ const SMALL_PINNED_JSON = JSON.stringify({
     ['presentation:cA2', 'presentation', 'chapter', 'mA', 'cA2', 1, 2, ['content:cA2']],
     ['audiobook_chapter:cA2', 'audiobook_chapter', 'chapter', 'mA', 'cA2', 1, 2, ['content:cA2']],
     ['exam:mA', 'exam', 'module', 'mA', null, 1, null, ['content:cA1', 'content:cA2']],
-    ['final_exam:4242', 'final_exam', 'course', null, null, null, null, ['content:cA1', 'content:cA2']],
+    ['final_exam:4242', 'final_exam', 'course', null, null, null, null, ['content:cA1', 'content:cA2', 'exam:mA']],
   ].map(([key, type, scope, moduleId, chapterId, moduleNumber, chapterNumber, dependsOn, variant]) => ({
     key, type, scope, moduleId, chapterId, moduleNumber, chapterNumber, dependsOn, ...(variant ? { variant } : {}),
   })),
@@ -211,7 +213,9 @@ const SMALL_PINNED_JSON = JSON.stringify({
   },
 });
 // sha256 del Manifest v3 de buildConfig({moduleCount:4, examMode:'alt', finalExam:true, engine:'h5p'}).
-const PINNED_SHA_V3 = '3992216d4b763eef3dca6524a313decf79af26715240782de928dc63be7953cc';
+// Loop 9: cambia SOLO por el dependsOn del final (+ exam:<m>); el sha legacy (antes de Loop 9) sigue fijado abajo.
+const PINNED_SHA_V3 = 'b14bc64f5a907112b5ea61b4daf103d0e1f639f82b829cf7947159f6151510cb';
+const PINNED_SHA_V3_LEGACY_FINAL_DEPS = '3992216d4b763eef3dca6524a313decf79af26715240782de928dc63be7953cc';
 
 async function pureChecks() {
   const configs = [];
@@ -283,6 +287,32 @@ async function pureChecks() {
     eq(B.manifestSha256(roundTrip), B.manifestSha256(m1), 'jsonb (claves mezcladas)');
     eq(B.validateGenerationManifest(roundTrip, s, SOURCE), [], 'round trip válido');
     eq(B.manifestSha256(m1), PINNED_SHA_V3, 'sha fijado');
+  });
+
+  await check('Loop 9: final_exam depende de los content + exam:<m>; un Manifest guardado ANTES (solo content) sigue válido y se reconstruye byte a byte (legacyFinalExamDeps)', () => {
+    const cfg = { moduleCount: 4, examMode: 'alt', finalExam: true, engine: 'h5p' };
+    const s = buildConfig(cfg);
+    const m = B.buildGenerationManifest(s, SOURCE, { rulesVersion: 3 });
+    const fin = m.items.find((i) => i.type === 'final_exam');
+    const examKeys = m.items.filter((i) => i.type === 'exam').map((i) => i.key);
+    const contentKeys = m.items.filter((i) => i.type === 'content').map((i) => i.key);
+    assert(examKeys.length >= 1 && examKeys.length < 4, 'config con exámenes alternados');
+    eq(fin.dependsOn, [...contentKeys, ...examKeys], 'final = content (en orden) + exam:<m> (en orden)');
+    // Manifest legacy (antes de Loop 9): sigue válido (runs en curso, empaque) y su sha es el de siempre.
+    const legacy = B.buildGenerationManifest(s, SOURCE, { rulesVersion: 3, legacyFinalExamDeps: true });
+    eq(legacy.items.find((i) => i.type === 'final_exam').dependsOn, contentKeys, 'legacy: solo los content');
+    eq(B.manifestSha256(legacy), PINNED_SHA_V3_LEGACY_FINAL_DEPS, 'legacy: sha de antes de Loop 9 (byte a byte)');
+    eq(B.validateGenerationManifest(legacy, s, SOURCE), [], 'legacy válido');
+    eq(B.validateGenerationManifest(m, s, SOURCE), [], 'nuevo válido');
+    // Cualquier otra variante del final sigue siendo WRONG_DEPENDENCIES.
+    for (const bad of [[...examKeys, ...contentKeys], [...contentKeys, ...examKeys.slice(1)], [...contentKeys, ...examKeys].reverse(), examKeys]) {
+      const mm = clone(m);
+      mm.items.find((i) => i.type === 'final_exam').dependsOn = bad;
+      assert(B.validateGenerationManifest(mm, s, SOURCE).some((e) => e.code === 'WRONG_DEPENDENCIES'), `final con ${JSON.stringify(bad)} ⇒ WRONG_DEPENDENCIES`);
+    }
+    // Sin exámenes de módulo: idéntico a legacy.
+    const sNo = buildConfig({ moduleCount: 2, examMode: 'off', finalExam: true, engine: 'h5p' });
+    eq(B.manifestSha256(B.buildGenerationManifest(sNo, SOURCE, { rulesVersion: 3 })), B.manifestSha256(B.buildGenerationManifest(sNo, SOURCE, { rulesVersion: 3, legacyFinalExamDeps: true })), 'sin exam: sin cambios');
   });
 
   await check('validador v3 detecta cada clase de mutación', () => {
@@ -427,7 +457,7 @@ async function pureChecks() {
 
   await check('tipos: V3 = orden canónico, ALL = v2 ∪ v3, scope de audio_welcome/final_exam = course, itemTypesForRulesVersion(3)', () => {
     eq(B.MANIFEST_ITEM_TYPES_V3, ['course_plan', 'course_intro', 'audio_welcome', 'module_intro', 'content', 'experience',
-      'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'audiobook_chapter', 'exam', 'final_exam'], 'V3');
+      'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter', 'exam', 'final_exam'], 'V3');
     eq(B.itemTypesForRulesVersion(3), B.MANIFEST_ITEM_TYPES_V3, 'rv 3');
     eq(B.itemTypesForRulesVersion(2), B.MANIFEST_ITEM_TYPES_V2, 'rv 2 sin cambios');
     eq(B.itemTypesForRulesVersion(1), B.MANIFEST_ITEM_TYPES_V1, 'rv 1 sin cambios');
@@ -715,6 +745,16 @@ async function dbChecks() {
       }
       const va = runScript('scripts/verify-application-activities-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
       assert(va.code === 0 && /application_minutes/.test(va.out), `verify actividades: exit ${va.code}\n${va.out}`);
+      // Loop 9 B: práctica guiada (columna, item y conteos) DESPUÉS de las actividades — dos veces (idempotente) + verificador.
+      for (let i = 0; i < 2; i++) {
+        const res = runScript('scripts/migrate-guided-practice.js', localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(res.code === 0, `práctica guiada, corrida ${i + 1}: exit ${res.code}\n${res.out}`);
+      }
+      const vg = runScript('scripts/verify-guided-practice-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(vg.code === 0 && /guided_practice_minutes/.test(vg.out), `verify práctica guiada: exit ${vg.code}\n${vg.out}`);
+      // Las verificaciones de las actividades siguen verdes con los CHECK reescritos.
+      const va2 = runScript('scripts/verify-application-activities-schema.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(va2.code === 0, `verify actividades tras la práctica guiada: exit ${va2.code}\n${va2.out}`);
     });
     await check('DB: verificadores previos siguen verdes (dynamic-generation, generation-manifests)', async () => {
       for (const s of ['scripts/verify-dynamic-generation-schema.js', 'scripts/verify-generation-manifests-schema.js']) {
@@ -749,7 +789,7 @@ async function dbChecks() {
       { id: cid, title: 'Curso R4', finalExam: true, activityEngine: 'scorm' },
       [{ id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'M1', objective: null, exam_enabled: true },
         { id: '00000000-0000-4000-8000-0000000000a2', position: 1, title: 'M2', objective: null, exam_enabled: false }],
-      [{ id: '00000000-0000-4000-8000-0000000000c1', module_id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'C1', objective: null, video_enabled: true, activity_enabled: true },
+      [{ id: '00000000-0000-4000-8000-0000000000c1', module_id: '00000000-0000-4000-8000-0000000000a1', position: 0, title: 'C1', objective: null, video_enabled: true, activity_enabled: true, guided_practice_minutes: 80 },
         { id: '00000000-0000-4000-8000-0000000000c2', module_id: '00000000-0000-4000-8000-0000000000a1', position: 1, title: 'C2', objective: null, video_enabled: false, activity_enabled: false, application_minutes: 60 },
         { id: '00000000-0000-4000-8000-0000000000c3', module_id: '00000000-0000-4000-8000-0000000000a2', position: 0, title: 'C3', objective: null, video_enabled: true, activity_enabled: false }],
     );
@@ -757,8 +797,8 @@ async function dbChecks() {
     for (const m of s2.modules) {
       await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cid, m.position, m.title]);
       for (const c of m.chapters) {
-        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled, application_minutes)
-                        values ($1, $2, $3, $4, $5, $6, $7, $8)`, [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled, c.applicationMinutes ?? null]);
+        await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled, application_minutes, guided_practice_minutes)
+                        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled, c.applicationMinutes ?? null, c.guidedPracticeMinutes ?? null]);
       }
     }
     await ds.query(
@@ -779,8 +819,8 @@ async function dbChecks() {
       dto = res.manifest;
       const [row] = await ds.query(`select * from public.course_generation_manifests where id = $1`, [dto.id]);
       eq([row.scorm_count, row.experience_count, row.presentation_count, row.video_interactions_count, row.activity_count,
-        row.audiobook_chapter_count, row.audio_welcome_count, row.final_exam_count, row.application_activity_count, row.total_jobs],
-      [0, 3, 3, 2, 1, 3, 1, 1, 1, dto.manifest.items.length], 'columnas');
+        row.audiobook_chapter_count, row.audio_welcome_count, row.final_exam_count, row.application_activity_count, row.guided_practice_count, row.total_jobs],
+      [0, 3, 3, 2, 1, 3, 1, 1, 1, 1, dto.manifest.items.length], 'columnas (Loop 9 B: + 1 práctica guiada)');
       eq(row.manifest_sha256, B.manifestSha256(B.buildGenerationManifest(s2, { courseId: cid, blueprintId: row.blueprint_id, blueprintNumber: 1, blueprintSha256: snap.snapshotSha256V2(s2) }, { rulesVersion: 3 })), 'sha = builder puro');
       const again = await manifests.getOrCreate(cid, OWNER, 1);
       eq([again.created, again.manifest.id, again.manifest.sha256], [false, dto.id, dto.sha256], 'idempotente');
@@ -789,6 +829,33 @@ async function dbChecks() {
       const byId = await manifests.getById(cid, OWNER, 1, dto.id);
       eq(B.canonicalManifestJson(byId.manifest), B.canonicalManifestJson(dto.manifest), 'getById (jsonb round trip)');
       await manifests.assertBlueprintAccessible(cid, OWNER, 1);
+    });
+    await check('DB servicio (Loop 9): un Manifest guardado ANTES del cambio (final_exam solo con content) sigue válido: getOrCreate no lo da por no determinístico y getById lo valida', async () => {
+      process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
+      const [row] = await ds.query(`select * from public.course_generation_manifests where id = $1`, [dto.id]);
+      const src = { courseId: cid, blueprintId: row.blueprint_id, blueprintNumber: 1, blueprintSha256: snap.snapshotSha256V2(s2) };
+      const legacy = B.buildGenerationManifest(s2, src, { rulesVersion: 3, legacyFinalExamDeps: true });
+      const fin = legacy.items.find((i) => i.type === 'final_exam');
+      assert(fin && !fin.dependsOn.some((d) => d.startsWith('exam:')) && dto.manifest.items.find((i) => i.type === 'final_exam').dependsOn.some((d) => d.startsWith('exam:')), 'el fixture distingue legacy de nuevo');
+      // La tabla es inmutable (trigger): solo esta prueba la reescribe para simular una fila guardada antes de Loop 9.
+      await ds.query(`alter table public.course_generation_manifests disable trigger user`);
+      await ds.query(`update public.course_generation_manifests set manifest_json = $2::jsonb, manifest_sha256 = $3 where id = $1`, [dto.id, B.canonicalManifestJson(legacy), B.manifestSha256(legacy)]);
+      try {
+        const again = await manifests.getOrCreate(cid, OWNER, 1);
+        eq([again.created, again.manifest.id, again.manifest.sha256], [false, dto.id, B.manifestSha256(legacy)], 'fila legacy conservada (sin 500 de determinismo)');
+        const byId = await manifests.getById(cid, OWNER, 1, dto.id);
+        eq(byId.manifest.items.find((i) => i.type === 'final_exam').dependsOn, fin.dependsOn, 'getById: legacy válido');
+        // Una fila corrupta (otro dependsOn) sigue fallando fuerte.
+        const bad = JSON.parse(B.canonicalManifestJson(legacy));
+        bad.items.find((i) => i.type === 'final_exam').dependsOn = fin.dependsOn.slice(1);
+        await ds.query(`update public.course_generation_manifests set manifest_json = $2::jsonb, manifest_sha256 = $3 where id = $1`, [dto.id, B.canonicalManifestJson(bad), B.manifestSha256(bad)]);
+        let threw = false;
+        try { await manifests.getOrCreate(cid, OWNER, 1); } catch { threw = true; }
+        assert(threw, 'fila con otro dependsOn ⇒ error (no determinístico)');
+      } finally {
+        await ds.query(`update public.course_generation_manifests set manifest_json = $2::jsonb, manifest_sha256 = $3 where id = $1`, [dto.id, B.canonicalManifestJson(dto.manifest), dto.sha256]);
+        await ds.query(`alter table public.course_generation_manifests enable trigger user`);
+      }
     });
     await check('DB servicio (Fase 2): Manifest v3 con capítulo de PRÁCTICA + Actividades de Aplicación pasa cgm_counts_consistent (antes lo rechazaba)', async () => {
       process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
@@ -880,7 +947,12 @@ async function dbChecks() {
         await rejectsRe(sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER }),
           /Actividades de Aplicación/, 'navegador sin application-activity-1', 409);
       }
-      const FEAT = ['pedagogy-brief-1', 'application-activity-1'];
+      // Loop 9 B: con prácticas guiadas en el Manifest, un navegador sin la capacidad → 409 visible (nunca las recibe).
+      const gpInManifest = (await ds.query(`select coalesce(manifest_json->'items', '[]'::jsonb) @> '[{"type":"guided_practice"}]'::jsonb a from public.course_generation_manifests where id = $1`, [dto.id]))[0].a;
+      eq(gpInManifest, true, 'el fixture tiene práctica guiada');
+      await rejectsRe(sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro', 'guided_practice'], runId: job.id, ownerId: OWNER, executorFeatures: ['pedagogy-brief-1', 'application-activity-1'] }),
+        /ejercicios guiados/, 'navegador sin guided-practice-1', 409);
+      const FEAT = ['pedagogy-brief-1', 'application-activity-1', 'guided-practice-1'];
       const act = await sched.claimNextItem({ executorId: 'b1', types: ['experience', 'video_interactions', 'activity', 'final_exam', 'exam', 'module_intro'], runId: job.id, ownerId: OWNER, executorFeatures: FEAT });
       assert(act, 'el navegador v3 no reclamó nada');
       const claimedAct = act.type === 'activity' ? act : null;

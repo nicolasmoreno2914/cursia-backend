@@ -113,15 +113,15 @@ const aaPerModule = (d) => d.modules.map((m) => m.chapters.filter((c) => c.appli
     const x = extract(SML);
     const gid = x.groups.find((g) => g.relation === 'oneOf').id;
     const hM = (p) => { const r = RA.hoursFromRequirements(RX.requirementsFor(x, { options: { [gid]: 'M' } }), p); return r.value; };
-    eq([hM(48), hM(32), hM(42), hM(null)], [44, 40, 42, 40], 'rango 40–44: la propuesta se lleva dentro');
+    eq([hM(48), hM(32), hM(42), hM(43), hM(null)], [42, 42, 42, 43, 42], 'rango 40–44: la propuesta dentro se respeta; fuera (o sin propuesta) → punto medio, la «Meta de diseño» (Loop 9 B)');
     eq(RA.hoursFromRequirements(RX.requirementsFor(x, {}), 48), null, 'sin elegir tamaño: ninguna hora aplica');
     eq(h('El curso tendrá como mínimo 40 horas.', 32), [40, true], 'mínimo');
     eq(h('El curso tendrá como máximo 40 horas.', 48), [40, true], 'máximo');
     eq(h('Se recomienda una duración de 48 horas.', 32), [48, false], 'recomendado');
     eq(h('El curso trata de horas y minutos.', 32), null, 'sin horas');
     // Re-review L86C IMP-2: varias horas obligatorias COMPATIBLES se cumplen a la vez (intersección).
-    eq(h('El curso tendrá como mínimo 32 horas.\nEl curso tendrá entre 40 y 44 horas.', 36), [40, true], 'mínimo 32 + 40–44 con propuesta 36 → 40');
-    eq(h('El curso tendrá como máximo 44 horas.\nEl curso tendrá como mínimo 40 horas.', 30), [40, true], 'máximo 44 + mínimo 40 con propuesta 30 → 40');
+    eq(h('El curso tendrá como mínimo 32 horas.\nEl curso tendrá entre 40 y 44 horas.', 36), [42, true], 'mínimo 32 + 40–44 con propuesta 36 → 42 (punto medio del intervalo, Loop 9 B)');
+    eq(h('El curso tendrá como máximo 44 horas.\nEl curso tendrá como mínimo 40 horas.', 30), [42, true], 'máximo 44 + mínimo 40 con propuesta 30 → 42 (punto medio del intervalo, Loop 9 B)');
     // Confianza media («Revisa esta lectura»: presente, totales calculados…): sugerencia, nunca autoridad.
     const med = RX.requirementsFor(extract('El curso tiene 64 horas.'), {});
     eq([med[0].obligation, med[0].confidence], ['required', 'medium'], 'lectura con dudas');
@@ -176,7 +176,7 @@ const aaPerModule = (d) => d.modules.map((m) => m.chapters.filter((c) => c.appli
   await check('RC4 Verificación: ok · excepción del docente (advertencia) · conflicto crítico con su causa · por revisar', async () => {
     const reqs = RX.requirementsFor(extract(FULL), {});
     const design = { modules: [0, 1, 2, 3].map(() => ({ examEnabled: true, chapters: Array.from({ length: 5 }, (_, i) => ({ kind: 'content', proposed: false, videoEnabled: true, activityEnabled: true, applicationMinutes: i === 0 ? 60 : null, hours: 3 })) })),
-      evaluations: 5, targetHours: 64, hoursSource: 'document', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false };
+      evaluations: 5, targetHours: 64, estimatedHours: 64, hoursStatus: 'within_tolerance', hoursSource: 'document', structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false };
     const checks = DR.compareRequirements(reqs, design);
     const v = RA.requirementVerificationChecks(reqs, checks, { status: 'within_tolerance', baseHours: 50, estimatedHours: 64, modules: 4, moduleExams: 4, exceptionFields: {} });
     const by = (k, et) => v.find((c) => c.id === `requirement:${reqs.find((r) => r.kind === k && (!et || r.evaluationType === et)).id}`);
@@ -191,7 +191,7 @@ const aaPerModule = (d) => d.modules.map((m) => m.chapters.filter((c) => c.appli
     assert(/Entra en conflicto con «4 módulos»/.test(partial.detail) && /El documento pide 3 evaluaciones parciales; el diseño tiene 4 evaluaciones parciales/.test(partial.detail), partial.detail);
     eq(partial.fix.kind, 'editor', 'se resuelve en el editor');
     // Decisión del docente → excepción (advertencia), no conflicto.
-    const t = DR.compareRequirements(reqs, { ...design, targetHours: 48, hoursSource: 'adjusted' });
+    const t = DR.compareRequirements(reqs, { ...design, targetHours: 48, estimatedHours: 48, hoursSource: 'adjusted' });
     const vh = RA.requirementVerificationChecks(reqs, t, { status: 'within_tolerance', baseHours: 30, estimatedHours: 48, modules: 4, moduleExams: 4, exceptionFields: {} }).find((c) => c.id === `requirement:${reqs.find((r) => r.kind === 'target_hours').id}`);
     eq(vh.severity, 'warning', 'horas del docente');
     eq(vh.title, 'Excepción al requisito del documento: 64 horas', 'título');
@@ -293,7 +293,7 @@ async function dbChecks() {
     await withClient(DB, async (c) => {
       for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql',
         'supabase-migration-v21-blueprint-profiles.sql', 'supabase-migration-pedagogy-profiles.sql', 'supabase-migration-practice-chapters.sql',
-        'supabase-migration-application-activities.sql', 'supabase-migration-academic-context.sql']) {
+        'supabase-migration-application-activities.sql', 'supabase-migration-guided-practice.sql', 'supabase-migration-academic-context.sql']) {
         await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
       }
     });
@@ -363,19 +363,29 @@ async function dbChecks() {
       assert(card.hours.target >= 40 && card.hours.target <= 44, `horas ${card.hours.target}`);
       eq(card.design.modules.map((m) => m.chapters.length), [4, 4, 4], '4 capítulos por módulo (propuestos)');
       assert(card.requirements.authority.applied.some((a) => /capítulos? propuestos? para llegar a 4 capítulos por módulo/.test(a.text)), JSON.stringify(card.requirements.authority.applied));
-      assert(card.requirements.checks.every((c) => c.status === 'met'), 'cada requisito, en su medida, se cumple: ' + JSON.stringify(card.requirements.checks));
-      // Review L86C I3: con el modelo de tiempo de Cursia, 3 × 4 capítulos no llega a 40 h sin rellenar, y se dice.
-      // Documentos imperfectos (2026-10-10): no es un bloqueo sin salida sino «Requisito no cubierto por Cursia» con las
-      // horas reales y una alternativa; la institución decide (R68 exige su aceptación). Cursia no rellena ni lo da por cumplido.
+      // Loop 9 (A5): las horas se comparan con las ESTIMADAS del diseño, nunca con la meta.
+      // Loop 9 B: la meta de un rango es su punto medio (42 h) y la práctica guiada de los capítulos de contenido completa la
+      // diferencia que antes quedaba (≈ 31 h con 3 × 4): las estimadas caen DENTRO de 40–44 → «Cumple», sin capítulos ni
+      // Actividades de Aplicación nuevas.
+      eq(card.hours.target, 42, 'rango 40–44 → meta de diseño 42 h (punto medio)');
+      const hoursItem = card.requirements.items.find((i) => i.applies && i.kind === 'target_hours');
+      const hoursC = card.requirements.checks.find((c) => c.requirementId === hoursItem.id);
+      eq([hoursC.status, hoursC.actual.value], ['met', Math.round(card.design.estimatedHours * 10) / 10], 'horas: las estimadas del diseño, dentro de 40–44 → cumple');
+      assert(card.design.estimatedHours >= 40 && card.design.estimatedHours <= 44, `estimadas ${card.design.estimatedHours}`);
+      const contentChs = card.design.modules.flatMap((m) => m.chapters).filter((c) => c.kind === 'content');
+      assert(contentChs.length === 9 && contentChs.every((c) => [40, 60, 80, 120].includes(c.guidedPracticeMinutes)), 'práctica guiada en los 9 capítulos de contenido (3 × 3 + 1 práctica propuesta por módulo): ' + JSON.stringify(contentChs.map((c) => c.guidedPracticeMinutes)));
+      assert(card.design.changes.some((x) => x.type === 'set_guided_practice' || x.type === 'add_content_chapter'), 'el cambio queda registrado');
+      assert(card.requirements.checks.every((c) => c.status === 'met'), 'todos los requisitos, en su medida, se cumplen: ' + JSON.stringify(card.requirements.checks));
       const bad = card.verification.checks.filter((c) => c.area === 'requirements' && c.severity !== 'ok');
-      eq(bad.map((c) => [c.severity, c.title]), [['warning', 'Requisito no cubierto por Cursia: 40–44 horas']], 'solo las horas: no cubierto');
-      assert(/el diseño de Cursia equivale a ≈ \d+(,\d)? horas de trabajo del estudiante/.test(bad[0].detail) && /^Cursia ya llevó (a sus niveles máximos las Actividades de Aplicación que el documento permite|las Actividades de Aplicación hasta sus propios límites)/.test(bad[0].capability.proposal), JSON.stringify(bad[0]));
+      eq(bad.map((c) => [c.severity, c.title]), [], 'nada sin cubrir');
       eq(await shapeOf(cid), [3, 3, 3], 'nada se aplicó todavía (es una propuesta)');
       const { applied } = await useDesign(cid);
       assert(applied, '«Usar este diseño» aplica');
       eq(await shapeOf(cid), [4, 4, 4], 'aplicado: 3 × 4');
       const after = await design.recommend(cid, OWNER, {});
-      assert(after.requirements.checks.every((c) => c.status === 'met'), 'después de aplicar, todo cumple');
+      // Loop 9 B: después de aplicar (con la práctica guiada) todo cumple, también las horas; y es un punto fijo.
+      assert(after.requirements.checks.every((c) => c.status === 'met'), 'después de aplicar, todo cumple: ' + JSON.stringify(after.requirements.checks));
+      eq(after.design.changes.filter((x) => x.type === 'set_guided_practice' || x.type === 'remove_guided_practice').length, 0, 'la práctica guiada aplicada no se vuelve a proponer (punto fijo)');
       eq(after.design.modules.flatMap((m) => m.chapters).filter((c) => c.proposed).length, 0, 'sin nuevos propuestos (punto fijo)');
       // S: máximo 3 por módulo — los 4 que Cursia aplicó NO se quitan solos: conflicto crítico con su causa.
       await acx.setRequirementSelection(cid, OWNER, gid, 'S');
@@ -468,8 +478,9 @@ async function dbChecks() {
     });
 
     await check('RC15 re-review L86C IMP-3: una decisión del docente que impide llegar a las horas es su excepción (no un conflicto de Cursia)', async () => {
-      const cid = await courseWith('Límite', [4, 4, 4, 4], 'El curso deberá tener 4 módulos con 5 capítulos por módulo. La intensidad horaria total será de 50 horas.');
-      eq(reqCheck(await design.recommend(cid, OWNER, {}), 'target_hours').severity, 'ok', 'sin la decisión del docente sí llega a 50 h');
+      // Loop 9 B: la práctica guiada completa hasta ≈ 54 h sin Actividades de Aplicación; con ellas llega a ≈ 73 h → 65 h.
+      const cid = await courseWith('Límite', [4, 4, 4, 4], 'El curso deberá tener 4 módulos con 5 capítulos por módulo. La intensidad horaria total será de 65 horas.');
+      eq(reqCheck(await design.recommend(cid, OWNER, {}), 'target_hours').severity, 'ok', 'sin la decisión del docente sí llega a 65 h');
       const card = await design.recommend(cid, OWNER, { adjust: { applicationActivities: 'none' } });
       eq(card.design.status, 'cannot_reach_target', 'sin Actividades de Aplicación no llega');
       const hc = reqCheck(card, 'target_hours');
@@ -480,17 +491,18 @@ async function dbChecks() {
     });
 
     await check('RC16 re-review final L86C IMPORTANTE-1: un choque entre requisitos del documento sigue siendo crítico aunque el docente haya decidido algo', async () => {
-      const cid = await courseWith('Doc contra doc', [4, 4, 4, 4], 'El curso deberá tener 4 módulos con 5 capítulos por módulo. La intensidad horaria total será de 70 horas.');
+      // Loop 9 B: con práctica guiada 4 × 5 llega a ≈ 73 h: 90 h sigue fuera de alcance por lo que fija el documento.
+      const cid = await courseWith('Doc contra doc', [4, 4, 4, 4], 'El curso deberá tener 4 módulos con 5 capítulos por módulo. La intensidad horaria total será de 90 horas.');
       const base = await design.recommend(cid, OWNER, {});
-      eq(base.design.status, 'cannot_reach_target', '4 × 5 no llega a 70 h aunque el docente no decida nada');
+      eq(base.design.status, 'cannot_reach_target', '4 × 5 no llega a 90 h aunque el docente no decida nada');
       // Documentos imperfectos (2026-10-10): sin llegar a las horas por lo que fija el propio documento = «Requisito no cubierto
       // por Cursia» (horas reales + alternativa, aceptación de la institución), nunca atribuido al docente.
       const b0 = reqCheck(base, 'target_hours');
-      eq([b0.severity, b0.title], ['warning', 'Requisito no cubierto por Cursia: 70 horas'], 'sin decisiones: no cubierto');
+      eq([b0.severity, b0.title], ['warning', 'Requisito no cubierto por Cursia: 90 horas'], 'sin decisiones: no cubierto');
       for (const adjust of [{ applicationActivities: 'none' }, { audiovisual: 'less' }]) {
         const card = await design.recommend(cid, OWNER, { adjust });
         const hc = reqCheck(card, 'target_hours');
-        eq([hc.severity, hc.title], ['warning', 'Requisito no cubierto por Cursia: 70 horas'], 'documento contra documento, con ' + JSON.stringify(adjust));
+        eq([hc.severity, hc.title], ['warning', 'Requisito no cubierto por Cursia: 90 horas'], 'documento contra documento, con ' + JSON.stringify(adjust));
         assert(!/Excepción|elegiste|que armaste/.test(hc.title + hc.detail), 'no se atribuye al docente: ' + hc.title + ' ' + hc.detail);
         assert(hc.capability && hc.capability.requirementKey, 'exige la aceptación de la institución (R68)');
       }
@@ -703,6 +715,53 @@ async function dbChecks() {
       eq(hc.severity, 'warning', 'excepción');
       assert(/el documento pide 40 horas; elegiste 48 horas/.test(hc.detail), hc.detail);
       eq(hc.fix.action, 'targetHours', '«Volver al requisito del documento»');
+    });
+
+    await check('Loop 9 (A5-a) horas escritas en «Ajustar» DENTRO del rango del documento con un diseño que no llega: nunca «Cumple»; es el choque de horas (no una excepción del docente)', async () => {
+      // Loop 9 B: con la práctica guiada 2 × 3 llega a 40–44 h; el choque se prueba con la estructura fijada por el documento
+      // y un rango que esa estructura no alcanza (60–64 h).
+      const cid = await courseWith('HorasAjustar', [3, 3], 'El curso tendrá 2 módulos con 3 capítulos por módulo. La intensidad horaria total será de 60 a 64 horas.');
+      const card = await design.recommend(cid, OWNER, { adjust: { targetHours: 62 } });
+      eq([card.hours.target, card.hours.source], [62, 'adjusted'], 'la meta escrita en «Ajustar»');
+      const est = card.design.estimatedHours;
+      assert(est < 60, `el diseño no llega (estimadas ${est})`);
+      const item = card.requirements.items.find((i) => i.applies && i.kind === 'target_hours');
+      const c = card.requirements.checks.find((x) => x.requirementId === item.id);
+      eq([c.status, c.actual.value, c.actual.target], ['unmet', Math.round(est * 10) / 10, 62], 'comparación con las estimadas (antes: met con la meta)');
+      assert(c.chosenBy !== 'teacher', 'una meta dentro del rango no es un apartamiento del docente');
+      const v = reqCheck(card, 'target_hours');
+      assert(v && v.severity !== 'ok' && !/^Excepción/.test(v.title), 'Verificación: choque de horas visible (no ok, no «Excepción» del docente): ' + JSON.stringify(v));
+      // Una meta del docente FUERA del rango sigue siendo SU excepción (se respeta), con las dos cifras.
+      const out = await design.recommend(cid, OWNER, { adjust: { targetHours: 20 } });
+      const v2 = reqCheck(out, 'target_hours');
+      eq(v2.severity, 'warning', 'excepción del docente');
+      assert(/elegiste 20 horas/.test(v2.detail), v2.detail);
+    });
+
+    await check('Loop 9 (A5-b) meta dentro del rango (40,7 en 40–44) con un diseño estimado FUERA (38,7 h): no cumple; dentro del rango sí', () => {
+      const req = { id: 'RQH', key: 'target_hours@course', kind: 'target_hours', scope: { level: 'course' }, mode: 'range', value: 40, valueMax: 44, obligation: 'required', confidence: 'high', active: true, source: { line: 1 } };
+      const d = (estimatedHours, hoursSource = 'proposed') => ({ modules: [], evaluations: 0, targetHours: 40.7, estimatedHours, hoursStatus: 'within_tolerance', hoursSource, structureByTeacher: false, audiovisualByTeacher: false, applicationByTeacher: false });
+      const [b] = DR.compareRequirements([req], d(38.7));
+      eq([b.status, b.actual.value, b.actual.target], ['unmet', 38.7, 40.7], '38,7 h estimadas fuera de 40–44 (antes: met por la meta 40,7)');
+      eq(DR.compareRequirements([req], d(41.2))[0].status, 'met', '41,2 h estimadas dentro del rango');
+      eq(DR.compareRequirements([req], d(38.7, 'adjusted'))[0].status, 'unmet', 'también con horas del docente');
+      eq(DR.compareRequirements([req], d(38.7, 'adjusted'))[0].chosenBy, 'document', 'meta del docente dentro del rango ⇒ no es su excepción');
+      eq(DR.compareRequirements([req], { ...d(19), targetHours: 20, hoursSource: 'adjusted' })[0].chosenBy, 'teacher', 'meta del docente fuera del rango ⇒ su excepción');
+      eq([DR.teacherHoursDeviate([req], 42), DR.teacherHoursDeviate([req], 20), DR.teacherHoursDeviate([req], null)], [false, true, false], 'teacherHoursDeviate');
+      // Fix round 1 (M6): sin horas estimadas no se puede comprobar (nunca «Cumple» por la meta).
+      eq(DR.compareRequirements([req], { ...d(null) })[0].status, 'not_verifiable', 'sin estimadas: no verificable');
+      // Fix round 1 (M7): se compara el valor mostrado (un decimal): 39,96 se muestra «40» y cumple.
+      eq([DR.compareRequirements([req], d(39.96))[0].status, DR.compareRequirements([req], d(39.96))[0].actual.value], ['met', 40], 'redondeo de pantalla = estado');
+      // Fix round 1 (I1): meta en el borde (40) y estimadas dentro de la tolerancia pero fuera del rango (38,7) → no cumple,
+      // pero es un «Requisito no cubierto» aceptable (warning con capability), nunca un crítico sin causa.
+      const edge = { ...d(38.7), targetHours: 40 };
+      const vc = RA.requirementVerificationChecks([req], DR.compareRequirements([req], edge), { status: 'within_tolerance', baseHours: 30, estimatedHours: 38.7, modules: 0, moduleExams: 0, exceptionFields: {} })[0];
+      assert(vc.severity === 'warning' && /^Requisito no cubierto por Cursia/.test(vc.title) && vc.capability && /38,7 horas/.test(vc.capability.produces) && /40 h/.test(vc.capability.produces), JSON.stringify(vc));
+      // Por encima del rango dentro de la tolerancia (45 para 40–44, meta 44): igual, no cubierto (no crítico).
+      const over = RA.requirementVerificationChecks([req], DR.compareRequirements([req], { ...d(45), targetHours: 44 }), { status: 'within_tolerance', baseHours: 30, estimatedHours: 45, modules: 0, moduleExams: 0, exceptionFields: {} })[0];
+      eq([over.severity, !!over.capability], ['warning', true], 'por encima, dentro de la tolerancia');
+      // La meta de Cursia para un RANGO del documento es el punto medio (no el borde): 42 para 40–44.
+      eq(RA.hoursFromRequirements([req], null).value, 42, 'meta = punto medio del rango');
     });
 
     await check('RC9 escenario completo (4 × 5, 64 h, 1 AA/mód., 3+1 eval., 2 videos/cap.): diseña dentro y explica lo que no puede', async () => {

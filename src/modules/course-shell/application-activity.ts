@@ -250,14 +250,42 @@ export function validateApplicationActivityDoc(doc: unknown, ctx: ApplicationVal
   return errors;
 }
 
-/** Métricas para el output_summary del item (no bloquean). */
+const CASE_NAME_STOP = new Set(['El', 'La', 'Los', 'Las', 'Un', 'Una', 'Unos', 'Unas', 'En', 'De', 'Del', 'Con', 'Por', 'Para', 'Si', 'Al', 'Es', 'Se', 'Su', 'Sus', 'Tu', 'Tus', 'Este', 'Esta', 'Ese', 'Esa', 'Cada', 'Durante', 'Como', 'Cuando', 'Luego', 'Después', 'Antes', 'Hoy', 'Ayer', 'Mañana']);
+/**
+ * Loop 9 B (fix I5): nombres propios de un caso (personas, empresas, lugares), para que otro recurso del módulo no repita
+ * a los mismos protagonistas. Palabras con mayúscula que NO abren una oración (las que abren una oración pueden ser
+ * cualquier palabra: ver abajo), sin artículos ni conectores. Determinista; máximo `max`.
+ */
+export function caseProperNames(text: unknown, max = 8): string[] {
+  const t = typeof text === 'string' ? text : '';
+  const out: string[] = [];
+  const re = /(^|[.!?¿¡:;\n]\s*|\s)(\p{Lu}[\p{Ll}\p{Lu}]+(?:\s+(?:de|del|la|las|los|y)\s+\p{Lu}[\p{Ll}\p{Lu}]+|\s+\p{Lu}[\p{Ll}\p{Lu}]+)*)/gu;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) && out.length < max) {
+    const opensSentence = m.index === 0 && m[1] === '' ? true : /[.!?¿¡:;\n]/.test(m[1]);
+    const words = m[2].split(/\s+/);
+    // Al abrir una oración: una sola palabra puede ser cualquiera (se descarta); con varias, se quita la primera solo si es
+    // un artículo o conector («En Bogotá» → «Bogotá»; «Marta Gómez» queda entera).
+    const kept = !opensSentence ? words : words.length === 1 ? [] : CASE_NAME_STOP.has(words[0]) ? words.slice(1) : words;
+    const name = kept.join(' ').replace(/^(?:de|del|la|las|los|y)\s+/u, '').trim();
+    if (!name || CASE_NAME_STOP.has(name) || name.length < 3) continue;
+    if (!out.includes(name)) out.push(name);
+  }
+  return out;
+}
+
+/** Métricas para el output_summary del item (no bloquean). Fix I5: título y protagonistas del caso (para no repetirlos). */
 export function applicationActivitySummary(doc: any): Record<string, unknown> {
   const a = doc?.activity ?? {};
+  const w = a && typeof a.workshop === 'object' && a.workshop ? a.workshop : {};
   return {
     genre: a.genre ?? null,
     exerciseCount: Array.isArray(a.exercises) ? a.exercises.length : 0,
     exampleCount: Array.isArray(a.examples) ? a.examples.length : 0,
     criteriaCount: Array.isArray(a.criteria) ? a.criteria.length : 0,
     minutes: doc?.minutes ?? null,
+    title: typeof a.title === 'string' ? a.title.slice(0, 160) : null,
+    workshopTitle: typeof w.title === 'string' ? w.title.slice(0, 160) : null,
+    caseNames: caseProperNames([a.context, w.situation].filter((x) => typeof x === 'string').join('\n')),
   };
 }

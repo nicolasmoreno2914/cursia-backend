@@ -120,9 +120,9 @@ function profileOf(key) {
 /** Pins (calculados con el código de origin/staging 8716669, SIN el motor pedagógico): el camino sin perfil no puede cambiar. */
 const PINS = {
   blueprintSha: '03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07',
-  manifestSha_r0: '31a84e666e2be215ed5e40a08aa7b6cad6873d26fce490fb88122c3262b188b6',
-  manifestSha_r1: '1bfd09a1d34c56cb87b9ea7096a2d0a3209ea9b07fc925e7207d56b032c58e90',
-  manifestSha_r2: 'aafda77d20d55a78d87218211a177609ff037e37027862bc60138a42d296c3f2',
+  manifestSha_r0: '3dbb4da3fb3f8b14a7e84b46ff7ad9d3747773ce2b4a5b70e5495b9281cf4c89',
+  manifestSha_r1: '6d2395139a427c9dbe3d731bfc5c32fbdbddd63a0fc0f1e000068316b7b19cc6',
+  manifestSha_r2: 'b34a08b3d53ac29ddda12fb2db83d46e6aa4d7fbea7e342567c44c5e01c99079',
   fpCourseOutline: 'a4d9e4696d0eda5d6332800345a3d6ccd8f69e0353869a216e24005111c62016',
   fpFinalExam: '7ad800235b5e0e7d94380f8f9eae2d0cf3f4e3af6a55d9c8ffc9fbe5463727ed',
   fpContentFull1: '69fd33a9bf358b8eee953cc2d5cbfbe84c78794aa456cec2e42555cc3dab7c99',
