@@ -7406,8 +7406,9 @@ async function _dynRunExamBank(item) {
         // Desde la 2.ª ronda la hoja ya falló una vez con el pool: el doble de candidatas (tope 6×faltante).
         var ty = plan[s.leafIndex].type;
         var want = Math.min(6 * need, Math.max(need + 2, Math.ceil((round >= 2 ? 2 : 1) * need / Math.max(typeYield(ty), 0.2)) + 1));
-        // Rendimiento medido < 20 % (≥ 8 muestras): más candidatas no arreglan un modelo que no produce; sin pool.
-        if (typeSamples(ty) >= 8 && typeYield(ty) < 0.2) want = need + 2;
+        // Rendimiento medido < 5 % (≥ 8 muestras): el modelo no produce (no es una hoja difícil); más candidatas no lo
+        // arreglan → sin pool. Un rendimiento bajo pero real (p. ej. 20 %) sí recibe el pool completo.
+        if (typeSamples(ty) >= 8 && typeYield(ty) < 0.05) want = need + 2;
         // Prototipos = pedidos por faltante (no los reemplazos de una «solo más larga» ya conservada).
         var protos = base.filter(function (fix) { return records[fix.id].status !== 'valid' || !keptIds[fix.id]; });
         if (!protos.length) protos = base;
@@ -7492,12 +7493,13 @@ async function _dynRunExamBank(item) {
       });
     });
     a = assemble();
-    // Falla sistémica (ninguna válida en ≥ 10 intentos de la ronda: modelo o servicio que no produce): no se sigue
-    // escalando dentro del intento; queda el borrador y decide la recuperación normal (nunca un banco corto).
-    var roundTries = 0;
-    var roundValid = 0;
-    Object.keys(log).forEach(function (k) { log[k].forEach(function (t) { roundTries++; if (t.ok) roundValid++; }); });
-    var systemic = roundTries >= 10 && roundValid === 0;
+    // Falla sistémica: el rendimiento de TODO el intento (primera pasada + reparaciones, todos los tipos) es < 5 % con
+    // ≥ 20 muestras → modelo o servicio que no produce; no se sigue escalando dentro del intento (queda el borrador y
+    // decide la recuperación normal; nunca un banco corto). Una hoja difícil con rendimiento bajo pero real no corta.
+    var allN = 0;
+    var allV = 0;
+    [stats.firstPass, repairPass].forEach(function (src) { Object.keys(src).forEach(function (t) { allN += src[t].returned || 0; allV += src[t].valid || 0; }); });
+    var systemic = allN >= 20 && allV < 0.05 * allN;
     Object.keys(leafInfo).forEach(function (k) {
       var li = Number(k);
       var h = H(li);
@@ -7520,10 +7522,10 @@ async function _dynRunExamBank(item) {
         var sc = h.stratCodes = h.stratCodes || {};
         tries.forEach(function (t) { if (!t.ok) sc[t.code] = (sc[t.code] || 0) + 1; });
         var scTotal = Object.keys(sc).reduce(function (t, c) { return t + sc[c]; }, 0);
-        // AGOTADA solo con una FIRMA sistemática: 2 rondas con la estrategia alternativa sin avanzar, ≥ 6 candidatas
+        // AGOTADA solo con una FIRMA sistemática: 2 rondas con la estrategia alternativa sin avanzar, ≥ 10 candidatas
         // con ella y ≥ 80 % de sus rechazos con el mismo código. El ruido de una hoja de bajo rendimiento (códigos
         // mezclados) nunca la corta: sigue reparando y, si hace falta, sigue en el próximo intento con la memoria.
-        if (h.strategyFails >= 2 && h.triedStrategy >= 6 && scTotal > 0 && (sc[dom] || 0) >= 0.8 * scTotal) h.capacity = true;
+        if (h.strategyFails >= 2 && h.triedStrategy >= 10 && scTotal > 0 && (sc[dom] || 0) >= 0.8 * scTotal) h.capacity = true;
       } else {
         h.stuck++;
         h.sig = dom;
