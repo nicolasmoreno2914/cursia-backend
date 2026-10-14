@@ -1617,7 +1617,8 @@
   /**
    * EV6 DoD fix round 2 (BE-B): cola de recuperación de admin (SUPER_ADMIN, solo lectura).
    * GET /api/v1/admin/dynamic-runs/needs-attention?limit=N → { generatedAt, scanned,
-   * needsAttention[], legacyPreview[], errors[] }.
+   * needsAttention[], legacyPreview[], manualPackage[], heldPackage[] (empaque retenido por el dueño, solo
+   * lectura), pendingReservations[], pendingReservationsTotals, errors[] }.
    */
   // #542 (G6): POST /api/v1/admin/dynamic-runs/:runId/videogen-reservations/reconcile (solo SUPER_ADMIN).
   // body {reservationKey, outcome: 'not_charged' | 'charged', reason}. Decisión explícita; nunca automática.

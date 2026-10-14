@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   HttpCode,
   HttpStatus,
@@ -9,6 +10,7 @@ import {
   ParseIntPipe,
   ParseUUIDPipe,
   Post,
+  Put,
   Query,
   Res,
   UseGuards,
@@ -20,6 +22,7 @@ import { RunsService, YoutubeResolutionAction, publicPreview, publicVideoUpgrade
 import { CourseContextDto } from './dto/course-context.dto';
 import { RetryItemDto } from './dto/executor.dto';
 import { parseRegenerateItemBody } from './dto/regenerate-item.dto';
+import { parseStopAfterBody } from './stop-after';
 import { FromRunDto, isFromRunRequest } from '../invalidation/dto/from-run.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
@@ -189,6 +192,47 @@ export class RunsController {
     @CurrentUser() user: AuthUser,
   ) {
     return this.runs.resumeRun(courseId, user.id, number, runId, { id: user.id, email: user.email });
+  }
+
+  // PUT /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/stop-after
+  // Body {"itemKeys": ["final_exam:<id>"], "holdPackaging": true}: al completarse una de esas partes el servidor
+  // pausa el run en la misma transacción (ningún claim posterior); holdPackaging → completar el run no encola el
+  // empaque automático. Por run; 409 si una parte ya está completa o el run no está abierto.
+  @Put(':runId/stop-after')
+  @HttpCode(HttpStatus.OK)
+  setStopAfter(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.runs.setStopAfter(courseId, user.id, number, runId, parseStopAfterBody(body), { id: user.id, email: user.email });
+  }
+
+  // DELETE …/runs/:runId/stop-after — quita la config (idempotente). No reanuda ni libera un empaque ya retenido.
+  @Delete(':runId/stop-after')
+  @HttpCode(HttpStatus.OK)
+  clearStopAfter(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.runs.clearStopAfter(courseId, user.id, number, runId, { id: user.id, email: user.email });
+  }
+
+  // POST …/runs/:runId/package-hold/release — acción explícita: libera la retención del empaque (un run ya
+  // completado con el empaque retenido pasa al empaque automático de siempre). 409 si no hay retención.
+  @Post(':runId/package-hold/release')
+  @HttpCode(HttpStatus.OK)
+  releasePackageHold(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.runs.releasePackageHold(courseId, user.id, number, runId, { id: user.id, email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/retry

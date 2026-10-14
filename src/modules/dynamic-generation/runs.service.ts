@@ -152,9 +152,11 @@ import {
   isActiveRun,
   isCancelledLike,
   recomputeRunStatus,
+  noteRunCompletedInTx,
   sweepRunExpiredLeases,
   takeCompletedRunsInTx,
 } from './item-transitions';
+import { StopAfterBody, StopAfterView, packageHoldOf, stopAfterOf, stopAfterView } from './stop-after';
 import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned } from '../reliability/attempt-log';
 import { FailureProvider } from '../reliability/failure-classifier';
 import {
@@ -334,6 +336,13 @@ export interface RunDto {
    * (disyuntor de consumo anómalo o tope del presupuesto del run), con el motivo legible en `detail`.
    */
   pauseInfo: { automatic: boolean; reason: string | null; detail: string | null; pausedAt: string | null } | null;
+  /**
+   * stop-after.ts: «detener después de» por run — partes que, al completarse, pausan el run en el servidor
+   * (misma transacción) y si retiene el empaque automático. `firedAt` = ya disparó (una sola vez). null sin config.
+   */
+  stopAfter: StopAfterView | null;
+  /** Empaque automático RETENIDO (run completado con holdPackaging): el paquete solo se arma por acción explícita. */
+  packageHold: { heldAt: string | null; reason: string | null } | null;
   /**
    * Loop 9: un worker de IA VIVO genera en el servidor TODAS las partes de IA de este run (presencia + instante de
    * activación, los mismos helpers del ruteo): la pestaña se puede cerrar. false si el worker no está o no las cubre.
@@ -1908,6 +1917,131 @@ export class RunsService {
       await recomputeRunStatus(qr, job.id);
     });
     this.logger.warn(`run ${job.id} reanudado por ${actorId}`);
+    return this.buildRunDto(await this.loadJobById(job.id), manifest);
+  }
+
+  /**
+   * stop-after.ts — configura «detener después de» en un run ABIERTO (queued/running/retrying/paused): al
+   * completarse cualquiera de `itemKeys`, el servidor pausa el run en la misma transacción; con
+   * `holdPackaging`, completar el run no encola el empaque automático. Reemplaza la config anterior (un
+   * disparo previo se olvida). Cada clave debe existir en el run y su generación vigente NO estar completa
+   * (409): una parte ya completa nunca dispararía nada nuevo. No toca items, intentos ni checkpoints.
+   */
+  async setStopAfter(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    body: StopAfterBody,
+    actor?: { id?: string | null; email?: string | null },
+  ): Promise<RunDto> {
+    const actorId = actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    const job = await this.loadRunRow(courseId, manifest, runId);
+    await this.tx(async (qr) => {
+      const [locked] = await qr.query(`select id, status, worker_status from public.production_jobs where id = $1 for update`, [job.id]);
+      if (!locked || isCancelledLike(locked) || !isActiveRun(locked)) {
+        throw new ConflictException({ message: `La ejecución ${job.id} no está abierta (${locked?.worker_status}); no se puede configurar «detener después de»`, code: 'run_not_active' });
+      }
+      if (body.itemKeys.length) {
+        const rows: Array<{ item_key: string; status: string }> = await qr.query(
+          `select g.item_key, g.status from public.generation_item_runs g
+            where g.job_id = $1 and g.item_key = any($2::text[]) and ${latestGenerationPredicate('g')}`,
+          [job.id, body.itemKeys],
+        );
+        const found = new Map(rows.map((r) => [r.item_key, r.status]));
+        const missing = body.itemKeys.filter((k) => !found.has(k));
+        if (missing.length) throw new NotFoundException({ message: `Partes que no existen en este run: ${missing.join(', ')}`, code: 'stop_after_item_not_found', missing });
+        const done = body.itemKeys.filter((k) => found.get(k) === 'completed');
+        if (done.length) {
+          throw new ConflictException({ message: `Estas partes ya están completas (nada que esperar): ${done.join(', ')}`, code: 'stop_after_item_already_completed', completed: done });
+        }
+      }
+      await qr.query(
+        `update public.production_jobs
+            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('stopAfter', jsonb_build_object(
+                  'itemKeys', $2::jsonb, 'holdPackaging', $3::boolean, 'setAt', now(), 'setBy', $4::text,
+                  'firedAt', null, 'firedItemKey', null)),
+                updated_at = now()
+          where id = $1`,
+        [job.id, JSON.stringify(body.itemKeys), body.holdPackaging, actorId],
+      );
+    });
+    this.logger.warn(`run ${job.id}: «detener después de» [${body.itemKeys.join(', ')}] holdPackaging=${body.holdPackaging} por ${actorId}`);
+    return this.buildRunDto(await this.loadJobById(job.id), manifest);
+  }
+
+  /**
+   * stop-after.ts — quita la config «detener después de» (idempotente). No reanuda un run que ya pausó (eso es
+   * resumeRun) ni libera un empaque ya retenido de un run completado (eso es releasePackageHold).
+   */
+  async clearStopAfter(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    actor?: { id?: string | null; email?: string | null },
+  ): Promise<RunDto> {
+    const actorId = actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    const job = await this.loadRunRow(courseId, manifest, runId);
+    await this.tx(async (qr) => {
+      await qr.query(`select id from public.production_jobs where id = $1 for update`, [job.id]);
+      await qr.query(
+        `update public.production_jobs set output_summary = output_summary - 'stopAfter', updated_at = now()
+          where id = $1 and output_summary ? 'stopAfter'`,
+        [job.id],
+      );
+    });
+    this.logger.warn(`run ${job.id}: «detener después de» quitado por ${actorId}`);
+    return this.buildRunDto(await this.loadJobById(job.id), manifest);
+  }
+
+  /**
+   * stop-after.ts — acción EXPLÍCITA que libera la retención del empaque: `holdPackaging` pasa a false y, si el run
+   * ya está `completed` con el empaque retenido, se marca para el empaque automático (`autoPackage.eligibleAt`)
+   * y se avisa a los oyentes DESPUÉS del commit (el camino de siempre: un solo job, idempotente). Sin retención → 409.
+   */
+  async releasePackageHold(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    runId: string,
+    actor?: { id?: string | null; email?: string | null },
+  ): Promise<RunDto> {
+    const actorId = actor?.id ?? ownerId;
+    ownerId = await this.ownerForActor(courseId, ownerId, actor);
+    const manifest = await this.manifestOfRun(courseId, ownerId, blueprintNumber, runId);
+    const job = await this.loadRunRow(courseId, manifest, runId);
+    await this.tx(async (qr) => {
+      const [locked] = await qr.query(`select id, status, worker_status, output_summary from public.production_jobs where id = $1 for update`, [job.id]);
+      const held = locked?.worker_status === 'completed' ? packageHoldOf(locked) : null;
+      if (!held && stopAfterOf(locked)?.holdPackaging !== true) {
+        throw new ConflictException({ message: `La ejecución ${job.id} no tiene el empaque retenido`, code: 'package_not_held' });
+      }
+      await qr.query(
+        `update public.production_jobs
+            set output_summary = case when output_summary ? 'stopAfter'
+                  then jsonb_set(output_summary, '{stopAfter,holdPackaging}', 'false'::jsonb, true) else output_summary end,
+                updated_at = now()
+          where id = $1`,
+        [job.id],
+      );
+      if (held) {
+        await qr.query(
+          `update public.production_jobs
+              set output_summary = output_summary || jsonb_build_object('autoPackage', jsonb_build_object(
+                    'eligibleAt', now(), 'releasedHold', jsonb_build_object('at', now(), 'by', $2::text, 'heldAt', output_summary->'autoPackage'->'held'->'at'))),
+                  updated_at = now()
+            where id = $1`,
+          [job.id, actorId],
+        );
+        noteRunCompletedInTx(qr, job.id);
+      }
+    });
+    this.logger.warn(`run ${job.id}: retención del empaque liberada por ${actorId}`);
     return this.buildRunDto(await this.loadJobById(job.id), manifest);
   }
 
@@ -5214,6 +5348,8 @@ export class RunsService {
       executionLease: executionLeaseView(job, normalizeRequestingExecutorId(read?.executorId), isDispatchableRun(job)),
       paused: isPausedRun(job),
       pauseInfo: isPausedRun(job) ? pauseInfoOf(job) : null,
+      stopAfter: stopAfterView(job),
+      packageHold: job.worker_status === 'completed' ? packageHoldOf(job) : null,
       serverExecuted: await this.serverExecutedOf(job, manifest),
       legacyFinalExamDeps: manifestHasLegacyFinalExamDeps(manifest.manifest.items),
     };
@@ -5263,6 +5399,7 @@ export class RunsService {
       autoRetryPending: stale ? pk.rebuildPending : pk.autoRetryPending,
       auto: pk.eligible && autoPackageEnabled(),
       blocked: pk.blocked ? { code: pk.blocked.code, message: pk.blocked.message, missing: pk.blocked.missing } : null,
+      held: !!packageHoldOf(job),
     }, { upgradeOnlyFailure, validationCutoffs, pendingVideogenReservations });
   }
 

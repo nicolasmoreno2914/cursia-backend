@@ -13,6 +13,7 @@ import {
 import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 import { classifyFailure } from '../reliability/failure-classifier';
 import { autoRecoveryEnabled } from '../dynamic-generation/auto-heal';
+import { packageHoldOf } from '../dynamic-generation/stop-after';
 
 /**
  * Fix round 1 (I1): códigos de bloqueo del empaque CAUSADOS POR EL CONTENIDO de un item que se reparan
@@ -108,6 +109,8 @@ export class AutoPackageService implements OnModuleInit {
       );
       if (!run) return { action: 'skipped', runId, reason: 'not_found' };
       if (run.worker_status !== 'completed') return { action: 'skipped', runId, reason: `not_completed:${run.worker_status}` };
+      // stop-after.ts (holdPackaging): empaque retenido por acción del usuario → nunca solo (ni disparo ni barrido).
+      if (packageHoldOf(run)) return { action: 'skipped', runId, reason: 'held' };
       const mark = autoPackageMarkOf(run);
       // Runs completados antes de BE-B: nunca se empaquetan solos (no se tocan).
       if (!mark) return { action: 'skipped', runId, reason: 'not_eligible' };

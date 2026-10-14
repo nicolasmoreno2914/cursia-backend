@@ -3,6 +3,7 @@ import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import { RunsService } from './runs.service';
 import { RunAdminAction, RunAdminActionCode, RunCompletion, loadPendingVideogenReservations } from './run-completion';
+import { packageHoldOf } from './stop-after';
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin (SOLO LECTURA).
@@ -61,6 +62,11 @@ export interface NeedsAttentionListing {
    * none|stale. Acción: `retry_package` (POST …/package, idempotente).
    */
   manualPackage: NeedsAttentionEntry[];
+  /**
+   * stop-after (review I3): runs COMPLETOS con el empaque automático RETENIDO por su dueño (holdPackaging). No son
+   * «paquete manual pendiente»: sin acción de un clic; se libera con POST …/package-hold/release (acción explícita).
+   */
+  heldPackage: Array<NeedsAttentionEntry & { packageHold: { heldAt: string | null; reason: string | null } }>;
   /**
    * V542 (G6): runs (cualquier estado terminal, también `complete`) con reservas de Videogen sin liquidar
    * que solo un SUPER_ADMIN puede conciliar. Acción: `reconcile_videogen` con su `reservationKey`.
@@ -177,19 +183,22 @@ export class AdminRecoveryService {
         limit $1`,
       [limit],
     );
-    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], manualPackage: [], pendingReservations: [], pendingReservationsTotals: { reservations: 0, runs: 0, listedRuns: 0, truncated: false }, errors: [] };
+    const out: NeedsAttentionListing = { generatedAt: new Date().toISOString(), scanned: runs.length, needsAttention: [], legacyPreview: [], manualPackage: [], heldPackage: [], pendingReservations: [], pendingReservationsTotals: { reservations: 0, runs: 0, listedRuns: 0, truncated: false }, errors: [] };
     for (const job of runs) {
       try {
         const bp = Number(job.blueprint_number);
         const manifest = await this.manifests.getById(Number(job.course_id), String(job.owner_id), bp, Number(job.manifest_id_num));
         const { completion, rows } = await this.runs.completionForAdmin(job, manifest);
         const legacy = completion.state === 'preview' && job.worker_status === 'completed';
-        const manual = completion.state === 'packaging' && !!completion.packageJob && !completion.packageJob.auto &&
+        // stop-after (review I3): un run con el empaque RETENIDO por su dueño no es «paquete manual pendiente».
+        const hold = completion.packageJob?.held && !completion.packageReady ? packageHoldOf(job) : null;
+        const manual = !hold && completion.state === 'packaging' && !!completion.packageJob && !completion.packageJob.auto &&
           ['none', 'stale'].includes(completion.packageJob.status);
-        if (completion.state !== 'needs_attention' && !legacy && !manual) continue;
+        if (completion.state !== 'needs_attention' && !legacy && !manual && !hold) continue;
         const ids = { courseId: Number(job.course_id), blueprintNumber: bp, runId: String(job.id) };
         const entry = this.entryOf(job, bp, manifest, completion, rows);
         if (completion.state === 'needs_attention') out.needsAttention.push(entry);
+        if (hold) out.heldPackage.push({ ...entry, adminActions: [], packageHold: hold });
         if (manual) {
           const a: RunAdminAction = { code: 'retry_package' };
           out.manualPackage.push({ ...entry, adminActions: [{ ...a, endpoint: endpointForAction(a, ids) }] });

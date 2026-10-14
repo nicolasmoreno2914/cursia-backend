@@ -714,6 +714,10 @@ export class SchedulerService {
 
       if ((await sweepRunExpiredLeases(qr, job.id)) > 0) {
         await recomputeRunStatus(qr, job.id);
+        // stop-after (review M1): el recálculo pudo pausar (o cerrar) el run → se relee antes de entregar nada.
+        const [now] = await qr.query(`select status, worker_status from public.production_jobs where id = $1`, [job.id]);
+        if (now && isPausedRun(now)) { paused = true; return null; }
+        if (!now || !isDispatchableRun(now)) return null;
       }
 
       const [cand] = await qr.query(
