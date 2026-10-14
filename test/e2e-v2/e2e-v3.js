@@ -4276,7 +4276,8 @@ function reservationBookkeeping(ev) {
           const pk7 = await q(`select id from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1`, [c7.runId]);
           eq(pk7.length, 0, 'E24s: completar el run NO encoló ningún paquete (empaque automático retenido para ESTE run)');
           const g7b = await api('GET', R7);
-          ok(g7b.data && g7b.data.packageHold && g7b.data.packageHold.reason === 'stop_after_item' && g7b.data.completion && g7b.data.completion.generationComplete === true && g7b.data.completion.packageJob && g7b.data.completion.packageJob.auto === false,
+          // Tras el disparo se reconfiguró SOLO la retención (itemKeys vacío) → motivo package_hold (review M2).
+          ok(g7b.data && g7b.data.packageHold && g7b.data.packageHold.reason === 'package_hold' && g7b.data.completion.packageJob && g7b.data.completion.packageJob.held === true && g7b.data.completion && g7b.data.completion.generationComplete === true && g7b.data.completion.packageJob && g7b.data.completion.packageJob.auto === false,
             'E24s: GET → packageHold visible; completion: generación completa y empaque NO automático (solo por acción explícita)', g7b.data && { h: g7b.data.packageHold, c: g7b.data.completion });
           const rel7 = await api('POST', `${R7}/package-hold/release`);
           eq(rel7.status, 200, 'E24s: liberar la retención (acción explícita) → 200');
