@@ -2044,8 +2044,8 @@ function dynGuidedPracticeSys(courseContext) {
 // Fix C1: lo que exige cada ejercicio según sus minutos (espejo de DYN_GUIDED_PRACTICE_FLOORS del ejecutor).
 var DYN_GUIDED_PRACTICE_PROMPT_FLOORS = {
   20: { situation: 300, tasks: 3, answer: 450 },
-  30: { situation: 500, tasks: 4, answer: 800 },
-  40: { situation: 700, tasks: 4, answer: 1100 }
+  30: { situation: 550, tasks: 4, answer: 950 },
+  40: { situation: 800, tasks: 5, answer: 1400 }
 };
 // Fix I5: lo que no hay que repetir (práctica del módulo y casos de sus Actividades de Aplicación), desde el claim.
 function _dynGuidedPracticeAvoidBlock(gp) {
@@ -2089,10 +2089,10 @@ function dynGuidedPracticePrompt(courseContext, outline, chapter, sourceMd, gp, 
     + '      "kind": "<uno de: ' + DYN_GUIDED_PRACTICE_KINDS.join(', ') + '>",\n'
     + '      "title": "título breve (≤ 90 caracteres)",\n'
     + '      "situation": "situación concreta del sector y país del curso, basada en el capítulo (según sus minutos, hasta 1400 caracteres)",\n'
-    + '      "tasks": ["consigna 1 en imperativo", "consigna 2", "consigna 3", "consigna 4"],\n'
+    + '      "tasks": ["consigna 1 en imperativo", "consigna 2", "consigna 3", "consigna 4", "consigna 5"],\n'
     + '      "expectedProduct": "qué produce el estudiante (≤ 300 caracteres)",\n'
     + '      "criteria": [ { "name": "criterio", "descriptor": "cómo se ve un buen trabajo en ese criterio" } ],\n'
-    + '      "modelAnswer": "1. …\\n2. …\\n3. …\\n4. … (una línea por consigna, en el mismo orden; según sus minutos, hasta 2200 caracteres)"\n'
+    + '      "modelAnswer": "1. …\\n2. …\\n3. …\\n4. …\\n5. … (una línea por consigna, en el mismo orden; según sus minutos, hasta 2200 caracteres)"\n'
     + '    }\n'
     + '  ]\n'
     + '}\n'

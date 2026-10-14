@@ -1174,7 +1174,8 @@ function reservationBookkeeping(ev) {
       ok(mc.find((x) => x.chapterId === chContent).applicationMinutes === 60 && mc.find((x) => x.chapterId === chPlain).applicationMinutes === undefined, 'E7: ManifestChapter.applicationMinutes solo donde hay actividad');
       // Loop 9 B: práctica guiada SOLO en el capítulo de contenido que la pide, dependiendo de su content.
       const gps = M.items.filter((i) => i.type === 'guided_practice');
-      eq(gps.map((i) => [i.key, i.guidedPracticeMinutes, i.dependsOn]), [[`guided_practice:${chPlain}`, 80, [`content:${chPlain}`]]], 'E7: Manifest con UNA práctica guiada (80 min) en el capítulo de contenido, sobre su content');
+      // Fix round 2 (N1): además de su content, espera a las AA del módulo (para ver su caso y no repetirlo).
+      eq(gps.map((i) => [i.key, i.guidedPracticeMinutes, i.dependsOn]), [[`guided_practice:${chPlain}`, 80, [`content:${chPlain}`, `application_activity:${chContent}`, `application_activity:${chPractice}`]]], 'E7: Manifest con UNOS ejercicios guiados (80 min) en el capítulo de contenido, sobre su content y las AA del módulo');
       ok(mc.find((x) => x.chapterId === chPlain).guidedPracticeMinutes === 80 && mc.find((x) => x.chapterId === chPractice).guidedPracticeMinutes === undefined, 'E7: ManifestChapter.guidedPracticeMinutes solo donde la hay (nunca en la práctica)');
 
       const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
@@ -1223,13 +1224,13 @@ function reservationBookkeeping(ev) {
       // Loop 9 B: la práctica guiada (una llamada + reintento dirigido por la respuesta modelo sin numerar).
       ok((llm.st.retriesSeen.guided_practice || 0) >= 1, 'E7: la práctica guiada inválida (respuesta modelo sin numerar) pidió un reintento dirigido', llm.st.retriesSeen);
       const gpPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña los EJERCICIOS GUIADOS de este capítulo'));
-      ok(gpPrompts.length >= 1 && gpPrompts.every((t) => t.includes('EXACTAMENTE 2 ejercicios') && t.includes('~40 min') && t.includes('FORMATIVA y SIN NOTA') && t.includes('al menos 700 caracteres, al menos 4 consignas y respuesta modelo de al menos 1100')), 'E7: el prompt de los ejercicios guiados trae el plan de Cursia (2 × 40 min), sus pisos y es formativo', gpPrompts.length);
+      ok(gpPrompts.length >= 1 && gpPrompts.every((t) => t.includes('EXACTAMENTE 2 ejercicios') && t.includes('~40 min') && t.includes('FORMATIVA y SIN NOTA') && t.includes('al menos 800 caracteres, al menos 5 consignas y respuesta modelo de al menos 1400')), 'E7: el prompt de los ejercicios guiados trae el plan de Cursia (2 × 40 min), sus pisos y es formativo', gpPrompts.length);
       // Loop 9 B fix I5: el claim lleva el caso de la práctica del módulo (y los de sus AA ya completadas) para no repetirlo.
-      ok(gpPrompts.every((t) => t.includes('NO REPITAS estos casos del módulo') && t.includes('Capítulo de práctica del módulo: «Práctica integradora»')), 'E7: el prompt de los ejercicios guiados trae los casos del módulo que no debe repetir', gpPrompts.length);
+      ok(gpPrompts.every((t) => t.includes('NO REPITAS estos casos del módulo') && t.includes('Capítulo de práctica del módulo: «Práctica integradora»') && (t.match(/- Actividad de Aplicación del módulo: /g) || []).length === 2), 'E7: el prompt de los ejercicios guiados trae la práctica y las 2 AA del módulo (ya completadas: dependsOn)', gpPrompts.length);
       const gpArts = await q(`select g.item_key k from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and a.type = 'dynamic_guided_practice_json'`, [c.runId]);
       eq(gpArts.map((a) => a.k), [`guided_practice:${chPlain}`], 'E7: un artifact dynamic_guided_practice_json');
       const [gpSum] = await q(`select output_summary s from public.generation_item_runs where job_id = $1 and type = 'guided_practice' order by generation desc limit 1`, [c.runId]);
-      ok(gpSum && gpSum.s.exerciseCount === 2 && gpSum.s.minutes === 80 && gpSum.s.promptVersion === 'v21-gp-1' && gpSum.s.retried === true && gpSum.s.v3Validation, 'E7: summary de la práctica guiada (2 ejercicios, 80 min, reintentada) validado por el servidor', gpSum && gpSum.s);
+      ok(gpSum && gpSum.s.exerciseCount === 2 && gpSum.s.minutes === 80 && gpSum.s.promptVersion === 'v21-gp-2' && gpSum.s.retried === true && gpSum.s.v3Validation, 'E7: summary de la práctica guiada (2 ejercicios, 80 min, reintentada) validado por el servidor', gpSum && gpSum.s);
       // Loop 9 B: + lo que necesita el restore en Moodle (moodle-E7): spec, perfiles y Manifest.
       results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applicationsList: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey),
         spec: C, modules: c.mods, assessment: c.assessment, manifestModules: M.modules, features: M.features, applications: apps.length, reviewCardsChapterIds: [], examBank: true,

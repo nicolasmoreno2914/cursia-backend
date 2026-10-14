@@ -1373,7 +1373,7 @@ var DYN_V3_PROMPT_VERSIONS = {
 // Fase 2: Actividad de Aplicación + solucionario (2 pasadas). Aparte para no mover DYN_V3_PROMPT_VERSIONS.
 var DYN_V3_APPLICATION_PROMPT_VERSION = 'v21-app-1';
 // Loop 9 B: práctica guiada del capítulo (una pasada + el reintento dirigido).
-var DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION = 'v21-gp-1';
+var DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION = 'v21-gp-2';
 // EV6 IV avanzado: video_interactions schemaVersion 2 (pausas para pensar). La ruta schemaVersion 1
 // (Manifests sin `ivAdvanced`) sigue reportando DYN_V3_PROMPT_VERSIONS.video_interactions.
 var DYN_V3_VINT_V2_PROMPT_VERSION = 'v21-vint-5'; // #542 (I1) (antes v21-vint-3)
@@ -4157,8 +4157,8 @@ var DYN_GUIDED_PRACTICE_LIM = {
 // Fix C1: pisos por minutos del ejercicio (los minutos acreditados tienen trabajo detrás). Espejo de GUIDED_PRACTICE_FLOORS.
 var DYN_GUIDED_PRACTICE_FLOORS = {
   20: { situationMin: 300, tasksMin: 3, modelAnswerMin: 450, expectedProductMin: 10 },
-  30: { situationMin: 500, tasksMin: 4, modelAnswerMin: 800, expectedProductMin: 20 },
-  40: { situationMin: 700, tasksMin: 4, modelAnswerMin: 1100, expectedProductMin: 40 }
+  30: { situationMin: 550, tasksMin: 4, modelAnswerMin: 950, expectedProductMin: 20 },
+  40: { situationMin: 800, tasksMin: 5, modelAnswerMin: 1400, expectedProductMin: 60 }
 };
 // Fix C1: consignas de solo recordar («Define», «Menciona», «Enumera», «¿Qué es…?»): cada consigna debe producir algo.
 var DYN_GUIDED_PRACTICE_RECALL_TASK_RE = /^\s*(?:¿\s*)?(?:defin[ea]|mencion[ae]|enumer[ae]|nombr[ae]|list[ae]|recuerd[ae]|cit[ae]|qu[eé] es|cu[aá]l es la definici[oó]n)(?![\p{L}])/iu;
