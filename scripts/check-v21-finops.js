@@ -288,19 +288,20 @@ async function pureChecks() {
     const one = { input_tokens: 1, output_tokens: 1, cache_write_tokens: 1, cache_read_tokens: 1 };
     eq(RB.examBankUsageScale('exam', ch(2, 'a')), one, 'referencia módulo');
     eq(RB.examBankUsageScale('final_exam', [...ch(2, 'a'), ...ch(2, 'b')]), one, 'referencia final');
-    // Holgura (BANKOPT): módulo de 2 = 42 preguntas pedidas (MC 12+12, V/F 5+3, EM 5+5), 2 capítulos; hotfix #583:
-    // ≤ 3.500 tokens estimados por llamada (MC 660, V/F 265, EM 335) ⇒ 10.920 + 10.390 estimados → 4 + 3 = 7 llamadas.
-    eq(RB.examBankShape('module', ch(2, 'a')), { questions: 42, calls: 7, outputEst: 21310, units: 2 }, 'forma del módulo de referencia');
-    eq(RB.examBankUsageScale('exam', ch(3, 'a')), { input_tokens: 1.5714, output_tokens: 1.481, cache_write_tokens: 1.5, cache_read_tokens: 1.5714 }, 'módulo de 3');
-    eq(RB.examBankUsageScale('exam', ch(1, 'a')), { input_tokens: 0.4286, output_tokens: 0.481, cache_write_tokens: 0.5, cache_read_tokens: 0.4286 }, 'módulo de 1');
-    eq(RB.examBankUsageScale('final_exam', [...ch(3, 'a'), ...ch(3, 'b'), ...ch(3, 'c')]), { input_tokens: 1.5, output_tokens: 1.2389, cache_write_tokens: 2.25, cache_read_tokens: 1.5 }, 'final 3×3 (tope 40 slots; 9 capítulos escriben su prefijo)');
+    // Exam-bank D2 (pool 2s+4 / 2s+2): módulo de 2 = 50 preguntas pedidas (MC 14+14, V/F 6+4, EM 6+6), 2 capítulos;
+    // ≤ 3.500 tokens estimados por llamada (MC 660, V/F 265, EM 335) ⇒ 12.840 + 12.310 estimados → 4 + 4 = 8 llamadas.
+    // (Antes, con la holgura BANKOPT 2s+2 / 2s+1: 42 preguntas, 7 llamadas.) La escala es relativa a esta referencia.
+    eq(RB.examBankShape('module', ch(2, 'a')), { questions: 50, calls: 8, outputEst: 25150, units: 2 }, 'forma del módulo de referencia');
+    eq(RB.examBankUsageScale('exam', ch(3, 'a')), { input_tokens: 1.5, output_tokens: 1.4839, cache_write_tokens: 1.5, cache_read_tokens: 1.5 }, 'módulo de 3');
+    eq(RB.examBankUsageScale('exam', ch(1, 'a')), { input_tokens: 0.5, output_tokens: 0.4839, cache_write_tokens: 0.5, cache_read_tokens: 0.5 }, 'módulo de 1');
+    eq(RB.examBankUsageScale('final_exam', [...ch(3, 'a'), ...ch(3, 'b'), ...ch(3, 'c')]), { input_tokens: 1.2857, output_tokens: 1.2629, cache_write_tokens: 2.25, cache_read_tokens: 1.2857 }, 'final 3×3 (tope 40 slots; 9 capítulos escriben su prefijo)');
     eq(RB.examBankUsageScale('exam', []), null, 'sin capítulos');
     const man = [{ key: 'exam:m1', type: 'exam', moduleId: 'm1' }, ...[1, 2, 3].map((i) => ({ key: `content:c${i}`, type: 'content', moduleId: 'm1', chapterId: `c${i}` }))];
     const items = RB.estimateItemsForRun(man, 'real');
-    eq(items[0].usageScale, { input_tokens: 1.5714, output_tokens: 1.481, cache_write_tokens: 1.5, cache_read_tokens: 1.5714 }, 'estimateItemsForRun fija la escala');
+    eq(items[0].usageScale, { input_tokens: 1.5, output_tokens: 1.4839, cache_write_tokens: 1.5, cache_read_tokens: 1.5 }, 'estimateItemsForRun fija la escala');
     const e = estimateCost({ items, catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     const l = e.lines.find((x) => x.itemKey === 'exam:m1');
-    eq(l.usageScale, { input_tokens: 1.5714, output_tokens: 1.481, cache_write_tokens: 1.5, cache_read_tokens: 1.5714 }, 'línea con la escala');
+    eq(l.usageScale, { input_tokens: 1.5, output_tokens: 1.4839, cache_write_tokens: 1.5, cache_read_tokens: 1.5 }, 'línea con la escala');
     const ref = estimateCost({ items: [{ itemKey: 'exam:m1', itemType: 'exam' }], catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
     assert(cmpDec(l.expected, ref.lines[0].expected) > 0, 'módulo de 3 > referencia');
     throwsCode(() => estimateCost({ items: [{ itemKey: 'x', itemType: 'exam', usageScale: 0 }], catalog: CATALOG, usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } }), 'INVALID_INPUT', 'escala 0');
