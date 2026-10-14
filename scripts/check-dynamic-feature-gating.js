@@ -80,6 +80,7 @@ const { DynamicYoutubePreflightService } = loadDist('modules/dynamic-generation/
 const { AdminDynamicRunsController } = loadDist('modules/dynamic-generation/admin-runs.controller.js');
 const { AdminRecoveryService } = loadDist('modules/dynamic-generation/admin-recovery.service.js');
 const { VideogenReconciliationService } = loadDist('modules/dynamic-generation/videogen-reconciliation.service.js');
+const { PilotMetricsService } = loadDist('modules/dynamic-generation/pilot-metrics.service.js');
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
@@ -275,6 +276,7 @@ async function buildApp() {
     providers: [
       { provide: AdminRecoveryService, useValue: fakeService('AdminRecoveryService') },
       { provide: VideogenReconciliationService, useValue: fakeService('VideogenReconciliationService') }, // V542 (G6)
+      { provide: PilotMetricsService, useValue: fakeService('PilotMetricsService') }, // Loop 10 C2
       AppService,
       { provide: CoursesService, useValue: fakeService('CoursesService') },
       { provide: CourseStructureService, useValue: fakeService('CourseStructureService') },
