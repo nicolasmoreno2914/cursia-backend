@@ -8,6 +8,10 @@ import { computePilotMetrics, PilotMetricsNotFound } from './pilot-metrics';
  * READ ONLY (Postgres rechaza cualquier escritura) y siempre terminan en ROLLBACK. La batería de calidad la arma
  * CoherenceService.qualityReport (solo lectura; lee los artifacts del storage); si no se puede (run en curso, owner
  * fuera de la allowlist, storage), la sección dice por qué. Sin llamadas a proveedores.
+ *
+ * Fix M6: la batería NO corre dentro del runner READ ONLY (CoherenceService usa su propio DataSource y lee el storage);
+ * es de solo lectura POR CONVENCIÓN: qualityReport solo hace SELECT y descargas, nunca persiste (a diferencia de
+ * computeRunReport). Si algún día escribiera, este endpoint dejaría de ser de solo lectura: revisarlo al tocarla.
  */
 @Injectable()
 export class PilotMetricsService {

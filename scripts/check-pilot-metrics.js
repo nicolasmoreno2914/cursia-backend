@@ -232,6 +232,15 @@ async function dbChecks() {
     assert(firstAuth, 'el run tiene autorización');
     const T0 = new Date(firstAuth.created_at).getTime();
     const at = (min) => new Date(T0 + min * 60000).toISOString();
+    // Fix I2: el run se creó consumiendo una aprobación HUMANA (fila ADMIN_APPROVED sin run, adminAuthorize) → la fila
+    // del run dice «bound_from:<id>». La hora real de la aprobación es la de la fila original (antes del vínculo).
+    const [boundRow] = await ds.query(`select id, reason, created_at from public.cost_budget_authorizations where run_id = $1 and reason like 'bound_from:%' order by created_at, id limit 1`, [runId]);
+    assert(boundRow, 'el run consumió la aprobación del admin (bound_from)');
+    const [humanRow] = await ds.query(`select id, created_at, approved_by, run_id from public.cost_budget_authorizations where id = $1`, [boundRow.reason.slice('bound_from:'.length)]);
+    assert(humanRow && humanRow.run_id === null && new Date(humanRow.created_at).getTime() <= new Date(boundRow.created_at).getTime(), 'aprobación original sin run y anterior al vínculo');
+    const HUMAN = new Date(humanRow.created_at).toISOString();
+    const BOUND = new Date(boundRow.created_at).toISOString();
+    const secsFrom = (a, b) => Math.round((Date.parse(b) - Date.parse(a)) / 1000);
     await ds.query(`update public.production_jobs set created_at = $2 where id = $1`, [runId, at(-1)]);
     const attempt = (it, no, kind, exec, s, f, outcome, extra = {}) => ds.query(
       `insert into public.generation_item_attempts (item_run_id, job_id, course_id, item_key, generation, attempt_no, executor_kind, executor_id, started_at, finished_at, outcome, failure_class, failure_code, strategy_applied, actor)
@@ -286,8 +295,8 @@ async function dbChecks() {
 
     await check('PM2 timing: autorización, primer claim, completado, paquete listo, tiempo total y p50/máximo por tipo', async () => {
       const t = M.timing;
-      eq([t.authorizedAt, t.firstClaimAt, t.completedAt, t.packageReadyAt, t.packageJobs], [at(0), at(2), at(31), at(40), 1], 'momentos');
-      eq([t.authorizationToFirstClaimSeconds, t.firstClaimToCompletionSeconds, t.completionToPackageSeconds, t.totalWallSeconds, t.totalWallFrom, t.totalWallTo], [120, 1740, 540, 2400, 'authorization', 'package_ready'], 'duraciones');
+      eq([t.authorizedAt, t.boundAt, t.humanApprovedAt, t.humanApprovedBy, t.firstClaimAt, t.completedAt, t.packageReadyAt, t.packageJobs], [at(0), BOUND, HUMAN, 'admin@cursia.test', at(2), at(31), at(40), 1], 'momentos (aprobación humana y vínculo por separado)');
+      eq([t.authorizationToFirstClaimSeconds, t.firstClaimToCompletionSeconds, t.completionToPackageSeconds, t.totalWallSeconds, t.totalWallFrom, t.totalWallTo], [secsFrom(HUMAN, at(2)), 1740, 540, secsFrom(HUMAN, at(40)), 'human_approval', 'package_ready'], 'duraciones desde la aprobación humana');
       eq([t.durationSource, t.byItemType.content], ['attempts', { count: 2, p50Seconds: 240, maxSeconds: 360 }], 'content: intentos completados de 6 y 4 min');
     });
     await check('PM2 cost: por proveedor y tipo, final vs pendiente, reservas abiertas, clave del usuario aparte, vs autorizado y estimado', async () => {
@@ -297,6 +306,7 @@ async function dbChecks() {
       eq(c.byProvider.videogen, { totalUsd: 0, settledUsd: 0, pendingUsd: 0, events: 2 }, 'videogen: reserva conciliada (ajuste final) = ni gasto ni pendiente');
       eq([c.byItemType.content.totalUsd, c.byItemType.audio_welcome.pendingUsd], [2.1, 0.5], 'por tipo');
       eq([c.authorizedBudgetUsd, c.totalVsAuthorized], [80, 0.0325], 'último presupuesto autorizado');
+      eq(M.interventions.list.filter((x) => x.action === 'authorize_budget').length, 2, 'sin duplicar la aprobación (fila sin run + vínculo = 1)');
       assert(c.firstAuthorizedBudgetUsd > 0 && c.estimate && c.estimate.expectedUsd > 0 && typeof c.totalVsEstimateExpected === 'number', JSON.stringify(c.estimate));
     });
     await check('PM2 retries: intentos por item, items con > 1 intento por tipo, desenlaces y clases de falla', async () => {
@@ -315,6 +325,8 @@ async function dbChecks() {
     });
     await check('PM2 interventions: autorización admin, reintento del dueño, regeneración del admin, pausa, reanudar y conciliación con quién/cuándo', async () => {
       const L = M.interventions.list.map((x) => [x.action, x.who, x.at]);
+      const ha = M.interventions.list.find((x) => x.detail && x.detail.boundAt);
+      eq([ha.action, ha.who, ha.at, ha.detail.boundAt, ha.detail.approvalId], ['authorize_budget', 'admin@cursia.test', HUMAN, BOUND, humanRow.id], 'aprobación humana con su hora real (y la del vínculo)');
       for (const want of [['authorize_budget', 'admin@cursia.test', at(16)], ['retry', 'owner', at(20)], ['regenerate', 'admin:admin@cursia.test', at(21)], ['pause', OWNER, at(17)], ['resume', OWNER, at(18)], ['reconcile', 'admin@cursia.test', at(25)]]) {
         assert(L.some((x) => JSON.stringify(x) === JSON.stringify(want)), `falta ${JSON.stringify(want)} en ${JSON.stringify(L)}`);
       }
@@ -332,6 +344,14 @@ async function dbChecks() {
       eq(qualityCalls[0], [cid, OWNER, 1, runId], 'qualityReport(curso, dueño, blueprint, run)');
       eq(M.quality.guidedPracticeFromSummaries, null, 'sin ejercicios guiados en este run');
       eq([M.version, M.readOnly, M.run.id, M.run.blueprintNumber], ['pilot-metrics-v1', true, runId, 1], 'cabecera');
+    });
+    await check('PM2 fix M5: pausa y reanudar del sistema («system:…») van a recuperaciones, no a intervenciones', async () => {
+      const [r2] = await ds.query(`insert into public.production_jobs (owner_id, course_id, status, worker_status, execution_mode, input_payload, output_summary) values ($1, $2, 'completed', 'completed', 'dynamic_generation', $3::jsonb, $4::jsonb) returning id`,
+        [OWNER, cid, JSON.stringify({ blueprintNumber: 1, manifestId: 999 }), JSON.stringify({ pause: { pausedAt: at(3), pausedBy: 'system:circuit_breaker', reason: 'circuit_breaker', resumedAt: at(4), resumedBy: 'system:auto' } })]);
+      const M3 = await new PilotMetricsService(ds).forRun(r2.id);
+      eq(M3.interventions.list.filter((x) => x.action === 'pause' || x.action === 'resume'), [], 'sin intervenciones');
+      eq(M3.recoveries.pauses.map((p) => [p.reason, p.system, p.resumedBySystem]), [['circuit_breaker', true, true]], 'en recuperaciones');
+      await ds.query(`delete from public.production_jobs where id = $1`, [r2.id]);
     });
     await check('PM3 SOLO LECTURA: ninguna tabla cambia; READ ONLY rechaza escrituras; 404; batería que falla → motivo; CLI = mismas secciones', async () => {
       eq(await fingerprint(), before, 'ninguna tabla cambió');

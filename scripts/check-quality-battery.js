@@ -152,7 +152,8 @@ check('Q9 el mismo ejercicio en dos capítulos: repetido informado (warning), m�
   assert(codes(r, 'Q9').includes('Q9_GUIDED_DUPLICATE_ACROSS_CHAPTERS') && r.summary.Q9 === 0 && r.guidedPractice.crossChapterDuplicates === 2 && r.guidedPractice.supported === false, JSON.stringify(r.guidedPractice));
   assert(get(r, 'Q9').pass && r.pass, 'informativo: no bloquea');
   const base = Q.runQualityBattery(withGuided({ c1: GPF.guidedPracticeDocDistinct('c1', 80, 0, 'a'), c2: GPF.guidedPracticeDocDistinct('c2', 80, 1, 'b') }));
-  assert(Q.compareQualityReports(base, r).some((x) => x.id === 'Q9'), 'una optimización que repite ejercicios es una regresión medible');
+  // Fix M7: Q9 es informativo: nunca cuenta como regresión de una optimización (sí se ve en el reporte).
+  assert(!Q.compareQualityReports(base, r).some((x) => x.id === 'Q9') && base.summary.Q9 === 1 && r.summary.Q9 === 0, 'Q9 no bloquea optimizaciones');
 });
 check('Q9 ejercicios en el piso en todo el curso: informado y NO respaldado', () => {
   const floorDoc = (ch, ord) => {

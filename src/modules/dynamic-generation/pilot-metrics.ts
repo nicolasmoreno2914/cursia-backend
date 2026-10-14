@@ -113,11 +113,22 @@ export async function computePilotMetrics(q: PilotMetricsQueryable, runId: strin
   const realAttempts = attempts.filter((a) => a.outcome !== 'reopened');
   const firstClaimAt = realAttempts.length ? realAttempts[0].started_at : items.map((i) => i.claimed_at).filter(Boolean).sort((a, b) => new Date(a).getTime() - new Date(b).getTime())[0] ?? null;
   const authorizedAt = auths.find((a) => a.decision !== 'BLOCKED')?.created_at ?? null;
+  // Fix I2: la aprobación HUMANA del flujo normal es una fila ADMIN_APPROVED sin run (run_id null) que el run consume al
+  // crearse (bindRun: fila del run con reason «bound_from:<id>»). Su created_at es cuándo aprobó la persona; el de la
+  // fila del run, cuándo se vinculó (boundAt).
+  const bound = auths.find((a) => /^bound_from:[0-9a-f-]{36}$/i.test(String(a.reason || '')));
+  let human: Row | null = null;
+  if (bound && hasAuth) {
+    [human] = rowsOf(await q.query(
+      `select id, created_at, approved_by, authorized_budget::text as authorized_budget, decision from public.cost_budget_authorizations where id = $1`,
+      [String(bound.reason).slice('bound_from:'.length)],
+    ));
+  }
   const terminal = ['completed', 'preview'].includes(String(job.worker_status));
   const completedAt = terminal ? job.finished_at ?? job.updated_at : null;
   const lastItemFinishedAt = items.map((i) => i.finished_at).filter(Boolean).sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] ?? null;
   const pkgReady = packages.find((p) => p.worker_status === 'completed');
-  const start = authorizedAt ?? job.created_at;
+  const start = human?.created_at ?? authorizedAt ?? job.created_at;
   const end = pkgReady?.finished_at ?? completedAt ?? null;
   const durByType = new Map<string, number[]>();
   const durSource = realAttempts.filter((a) => a.outcome === 'completed' && a.finished_at && a.started_at);
@@ -126,6 +137,9 @@ export async function computePilotMetrics(q: PilotMetricsQueryable, runId: strin
   const timing = {
     runCreatedAt: iso(job.created_at),
     authorizedAt: iso(authorizedAt),
+    boundAt: iso(bound?.created_at ?? null),
+    humanApprovedAt: iso(human?.created_at ?? null),
+    humanApprovedBy: human?.approved_by ?? null,
     firstClaimAt: iso(firstClaimAt),
     completedAt: iso(completedAt),
     lastItemFinishedAt: iso(lastItemFinishedAt),
@@ -136,7 +150,7 @@ export async function computePilotMetrics(q: PilotMetricsQueryable, runId: strin
     firstClaimToCompletionSeconds: secs(firstClaimAt, completedAt),
     completionToPackageSeconds: secs(completedAt, pkgReady?.finished_at ?? null),
     totalWallSeconds: secs(start, end),
-    totalWallFrom: authorizedAt ? 'authorization' : 'run_created',
+    totalWallFrom: human ? 'human_approval' : authorizedAt ? 'authorization' : 'run_created',
     totalWallTo: pkgReady ? 'package_ready' : completedAt ? 'completed' : null,
     durationSource: durSource.length ? 'attempts' : 'item_runs',
     byItemType: Object.fromEntries([...durByType.entries()].sort().map(([t, xs]) => [t, { count: xs.length, p50Seconds: p50(xs), maxSeconds: Math.max(...xs) }])),
@@ -260,6 +274,7 @@ export async function computePilotMetrics(q: PilotMetricsQueryable, runId: strin
     pauses: pause ? [{
       pausedAt: pause.pausedAt ?? null, pausedBy: pause.pausedBy ?? null, reason: pause.reason ?? (systemPause ? String(pause.pausedBy).slice(7) : 'user'),
       system: !!systemPause, detail: pause.detail ?? null, resumedAt: pause.resumedAt ?? null, resumedBy: pause.resumedBy ?? null,
+      resumedBySystem: /^system:/.test(String(pause.resumedBy || '')),
     }] : [],
     pauseHistory: 'latest_only',
     spendBreaker: out.spendBreaker ?? null,
@@ -267,10 +282,17 @@ export async function computePilotMetrics(q: PilotMetricsQueryable, runId: strin
 
   // ── manual interventions ──
   const manual: Array<{ action: string; who: string | null; at: string | null; detail?: unknown }> = [];
-  for (const a of auths) if (a.decision === 'ADMIN_APPROVED') manual.push({ action: 'authorize_budget', who: a.approved_by ?? null, at: iso(a.created_at), detail: { authorizedBudgetUsd: num(a.authorized_budget), reason: a.reason ?? null } });
+  for (const a of auths) {
+    if (a.decision !== 'ADMIN_APPROVED') continue;
+    // Fix I2: una fila vinculada (bound_from) se lista con la hora y la persona de la aprobación ORIGINAL.
+    const orig = bound && a.id === bound.id && human ? human : null;
+    manual.push({ action: 'authorize_budget', who: (orig ?? a).approved_by ?? null, at: iso((orig ?? a).created_at),
+      detail: { authorizedBudgetUsd: num((orig ?? a).authorized_budget), reason: a.reason ?? null, ...(orig ? { boundAt: iso(a.created_at), approvalId: orig.id } : {}) } });
+  }
   for (const a of reopened.filter((x) => isManualActor(x.actor))) manual.push({ action: reopenAction(a.strategy_applied), who: a.actor, at: iso(a.started_at), detail: { itemKey: a.item_key, generation: Number(a.generation), strategy: a.strategy_applied ?? null } });
   if (pause && !systemPause) manual.push({ action: 'pause', who: pause.pausedBy ?? null, at: pause.pausedAt ?? null });
-  if (pause && pause.resumedAt) manual.push({ action: 'resume', who: pause.resumedBy ?? null, at: pause.resumedAt });
+  // Fix M5: pausas o reanudaciones del sistema («system:…») son recuperaciones, no intervenciones manuales.
+  if (pause && pause.resumedAt && !/^system:/.test(String(pause.resumedBy || ''))) manual.push({ action: 'resume', who: pause.resumedBy ?? null, at: pause.resumedAt });
   if (out.cancellation && typeof out.cancellation === 'object') manual.push({ action: 'cancel', who: out.cancellation.requestedBy ?? null, at: out.cancellation.requestedAt ?? null, detail: { reason: out.cancellation.reason ?? null } });
   if (hasLedger) {
     const rec = rowsOf(await q.query(

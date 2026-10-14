@@ -412,6 +412,8 @@ function guidedPracticeQuality(inp: QualityInputs, chapterById: Map<string, Qual
 export function compareQualityReports(baseline: QualityReport, candidate: QualityReport, tolerance = 0.02): Array<{ id: string; baseline: number | null; candidate: number | null; why: string }> {
   const out: Array<{ id: string; baseline: number | null; candidate: number | null; why: string }> = [];
   for (const b of baseline.checks) {
+    // Loop 10 fix M7: un check informativo (blocking === false, p. ej. Q9) nunca bloquea una optimización.
+    if (b.blocking === false) continue;
     const c = candidate.checks.find((x) => x.id === b.id);
     if (!c) { out.push({ id: b.id, baseline: b.metric, candidate: null, why: 'check ausente' }); continue; }
     if (b.pass && !c.pass) out.push({ id: b.id, baseline: b.metric, candidate: c.metric, why: 'dejó de pasar' });
