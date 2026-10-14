@@ -5,6 +5,7 @@ import { AdminRecoveryService, NeedsAttentionListing } from './admin-recovery.se
 import { VideogenReconciliationService } from './videogen-reconciliation.service';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { PilotMetricsService } from './pilot-metrics.service';
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin de la generación dinámica (SOLO LECTURA).
@@ -18,7 +19,16 @@ export class AdminDynamicRunsController {
   constructor(
     private readonly recovery: AdminRecoveryService,
     private readonly videogen: VideogenReconciliationService,
+    private readonly pilotMetrics: PilotMetricsService,
   ) {}
+
+  // Loop 10 C2 — GET /api/v1/admin/dynamic-runs/:runId/pilot-metrics
+  // Métricas del piloto del run (tiempos, costo, reintentos, recuperaciones, intervenciones manuales, uso del navegador,
+  // calidad). SOLO LECTURA (transacción READ ONLY), sin proveedores. Campos: docs/v21/pilot-metrics.md.
+  @Get(':runId/pilot-metrics')
+  pilotMetricsOf(@Param('runId', ParseUUIDPipe) runId: string) {
+    return this.pilotMetrics.forRun(runId);
+  }
 
   // GET /api/v1/admin/dynamic-runs/needs-attention?limit=100
   @Get('needs-attention')

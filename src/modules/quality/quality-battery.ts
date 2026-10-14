@@ -16,7 +16,11 @@
  *   Q6 evaluaciones           — el banco cubre los capítulos que evalúa y su evidencia está en el texto.
  *   Q7 continuidad (cohesión) — lo que un capítulo da por sabido fue introducido antes (sidecars reales).
  *   Q8 trazabilidad           — capítulos sin resultado vinculado (con contexto académico) y artifacts sin item.
+ *   Q9 ejercicios guiados     — (Loop 10 C1-d, INFORMATIVO: nunca bloquea) repetidos entre capítulos, ejercicios en
+ *                               el piso en todo el curso y volumen de trabajo vs minutos acreditados; dice si las
+ *                               horas acreditadas por los ejercicios guiados están respaldadas (`guidedPractice`).
  */
+import { GUIDED_PRACTICE_DISTINCT, GUIDED_PRACTICE_FLOORS, guidedPracticeJaccard, guidedPracticeNormTitle, guidedPracticeShingles } from '../course-shell/guided-practice';
 
 export const QUALITY_BATTERY_VERSION = 'quality-battery-v1';
 
@@ -47,6 +51,31 @@ export interface QualityInputs {
   introCompetencies?: string[] | null;
   /** itemKey del banco → preguntas (chapterId + evidence). */
   examBanks: Record<string, { chapterIds: string[]; questions: Array<{ chapterId?: string | null; evidence?: string | null }> }>;
+  /** Loop 10 C1-d: capítulo → documento `dynamic_guided_practice_json` vigente (ausente = el run no tiene). */
+  guidedPractices?: Record<string, QualityGuidedPracticeDoc>;
+}
+
+export interface QualityGuidedPracticeDoc {
+  minutes?: number | null;
+  exercises?: Array<{ id?: string; minutes?: number; kind?: string; title?: string; situation?: string; tasks?: string[]; expectedProduct?: string; modelAnswer?: string }> | null;
+}
+
+/** Loop 10 C1-d: lectura del respaldo de las horas de ejercicios guiados (informativa). */
+export interface GuidedPracticeQuality {
+  chapters: number;
+  exercises: number;
+  minutes: number;
+  hours: number;
+  /** Parejas de ejercicios de capítulos DISTINTOS con el mismo título o situación casi igual (Jaccard ≥ 0,5). */
+  crossChapterDuplicates: number;
+  /** Fracción de ejercicios «en el piso» (situación y respuesta < 1,15 × el piso de sus minutos y consignas mínimas). */
+  atFloorShare: number;
+  /** Palabras de trabajo (situación + consignas + producto + respuesta modelo) por minuto acreditado. */
+  wordsPerCreditedMinute: number;
+  /** Máximo de minutos de ejercicios guiados por cada 1000 palabras del texto del capítulo (null sin texto). */
+  maxMinutesPerContentKWords: number | null;
+  /** true = sin repetidos entre capítulos, no todo en el piso y volumen ≥ el mínimo por minuto. */
+  supported: boolean;
 }
 
 export type QualitySeverity = 'critical' | 'warning' | 'info';
@@ -58,12 +87,16 @@ export interface QualityCheck {
   threshold: number;
   pass: boolean;
   findings: QualityFinding[];
+  /** Loop 10: false = informativo (nunca cambia `pass` del reporte). Ausente = bloquea como siempre. */
+  blocking?: false;
 }
 export interface QualityReport {
   version: string;
   pass: boolean;
   checks: QualityCheck[];
   summary: Record<string, number | null>;
+  /** Loop 10 C1-d: respaldo de las horas de ejercicios guiados (null si el run no tiene). */
+  guidedPractice?: GuidedPracticeQuality | null;
 }
 
 /** Artifact principal esperado por tipo de item (cualquiera de la lista; los demás tipos no generan texto medible). */
@@ -125,6 +158,11 @@ const T = {
   Q5_MIN_MATCHED: 0.5,
   Q6_MIN_EVIDENCE: 0.98,
   Q7_MIN_CONTINUITY: 0.8,
+  // Loop 10 C1-d (informativos)
+  Q9_FLOOR_MARGIN: 1.15, // «en el piso»: situación y respuesta modelo < 1,15 × el piso de sus minutos
+  Q9_MAX_AT_FLOOR_SHARE: 0.8, // ≥ 80 % de los ejercicios en el piso = «en el piso en todo el curso»
+  Q9_MIN_WORDS_PER_MINUTE: 10, // palabras de trabajo por minuto acreditado (los pisos de 40 min dan ≈ 10,7)
+  Q9_MAX_MINUTES_PER_CONTENT_KWORDS: 60, // minutos de ejercicios por 1000 palabras del capítulo
 };
 export const QUALITY_THRESHOLDS = T;
 
@@ -291,9 +329,80 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
     checks.push(check('Q8', 'Trazabilidad (capítulos ↔ resultados; artifacts ↔ Manifest)', metric, 0, f));
   }
 
+  // Q9 ejercicios guiados (Loop 10 C1-d, informativo)
+  const gp = guidedPracticeQuality(inp, chapterById);
+  checks.push(gp.check);
+
   const summary: Record<string, number | null> = {};
   for (const c of checks) summary[c.id] = c.metric;
-  return { version: QUALITY_BATTERY_VERSION, pass: checks.every((c) => c.pass), checks, summary };
+  return { version: QUALITY_BATTERY_VERSION, pass: checks.every((c) => c.blocking === false || c.pass), checks, summary, guidedPractice: gp.quality };
+}
+
+function wordCount(s: unknown): number {
+  return normText(String(s || '')).split(' ').filter(Boolean).length;
+}
+
+/** Q9: respaldo de los minutos de ejercicios guiados del run (puro, informativo: nunca bloquea). */
+function guidedPracticeQuality(inp: QualityInputs, chapterById: Map<string, QualityChapter>): { check: QualityCheck; quality: GuidedPracticeQuality | null } {
+  const f: QualityFinding[] = [];
+  const docs = Object.entries(inp.guidedPractices || {}).filter(([, d]) => d && Array.isArray(d.exercises) && d.exercises.length);
+  if (!docs.length) {
+    return { check: { ...check('Q9', 'Ejercicios guiados (repetición, piso y volumen vs minutos; informativo)', null, 1, []), pass: true, blocking: false }, quality: null };
+  }
+  const xs: Array<{ ch: string; i: number; title: string; nt: string; sh: string[]; minutes: number; words: number; atFloor: boolean }> = [];
+  let minutes = 0;
+  for (const [ch, d] of docs) {
+    const dm = typeof d.minutes === 'number' ? d.minutes : 0;
+    minutes += dm;
+    (d.exercises || []).forEach((e, i) => {
+      const m = typeof e?.minutes === 'number' ? e.minutes : 0;
+      const F = GUIDED_PRACTICE_FLOORS[m] || GUIDED_PRACTICE_FLOORS[20];
+      const sit = String(e?.situation || '');
+      const ans = String(e?.modelAnswer || '');
+      const tasks = Array.isArray(e?.tasks) ? e.tasks : [];
+      const atFloor = sit.length < F.situationMin * T.Q9_FLOOR_MARGIN && ans.length < F.modelAnswerMin * T.Q9_FLOOR_MARGIN && tasks.length <= F.tasksMin;
+      xs.push({ ch, i, title: String(e?.title || ''), nt: guidedPracticeNormTitle(e?.title), sh: guidedPracticeShingles(sit), minutes: m, atFloor,
+        words: wordCount(sit) + tasks.reduce((a: number, t: unknown) => a + wordCount(t), 0) + wordCount(e?.expectedProduct) + wordCount(ans) });
+    });
+  }
+  // Repetidos entre capítulos.
+  let dups = 0;
+  const dupIdx = new Set<number>();
+  for (let a = 0; a < xs.length; a++) {
+    for (let b = a + 1; b < xs.length; b++) {
+      if (xs[a].ch === xs[b].ch) continue;
+      const sameTitle = !!xs[a].nt && xs[a].nt === xs[b].nt;
+      const j = guidedPracticeJaccard(xs[a].sh, xs[b].sh);
+      if (sameTitle || j >= GUIDED_PRACTICE_DISTINCT.situationJaccard) {
+        dups++;
+        dupIdx.add(a);
+        dupIdx.add(b);
+        if (f.length < 20) f.push({ code: 'Q9_GUIDED_DUPLICATE_ACROSS_CHAPTERS', severity: 'warning', message: `ejercicio guiado repetido entre «${chapterById.get(xs[a].ch)?.title || xs[a].ch}» y «${chapterById.get(xs[b].ch)?.title || xs[b].ch}»: «${xs[b].title}»${sameTitle ? ' (mismo título)' : ` (situación ${(j * 100).toFixed(0)} % igual)`}`, ref: `${xs[a].ch}|${xs[b].ch}` });
+      }
+    }
+  }
+  const atFloorShare = xs.length ? xs.filter((x) => x.atFloor).length / xs.length : 0;
+  if (xs.length >= 2 && atFloorShare >= T.Q9_MAX_AT_FLOOR_SHARE) f.push({ code: 'Q9_GUIDED_AT_FLOOR', severity: 'warning', message: `${Math.round(atFloorShare * 100)} % de los ejercicios guiados están en el piso de su extensión: los minutos acreditados quedan justo en el mínimo en todo el curso` });
+  const creditedMinutes = xs.reduce((a, x) => a + x.minutes, 0) || minutes;
+  const words = xs.reduce((a, x) => a + x.words, 0);
+  const wpm = creditedMinutes ? words / creditedMinutes : 0;
+  if (wpm < T.Q9_MIN_WORDS_PER_MINUTE) f.push({ code: 'Q9_GUIDED_THIN_VOLUME', severity: 'warning', message: `${wpm.toFixed(1)} palabras de trabajo por minuto acreditado (< ${T.Q9_MIN_WORDS_PER_MINUTE}): poco contenido para los minutos que se cuentan` });
+  let maxPerK: number | null = null;
+  for (const [ch, d] of docs) {
+    const w = wordCount(inp.chapterMd[ch] || '');
+    if (!w) continue;
+    const perK = (Number(d.minutes) || 0) / (w / 1000);
+    maxPerK = maxPerK === null ? perK : Math.max(maxPerK, perK);
+    if (perK > T.Q9_MAX_MINUTES_PER_CONTENT_KWORDS) f.push({ code: 'Q9_GUIDED_MINUTES_VS_CONTENT', severity: 'info', message: `«${chapterById.get(ch)?.title || ch}»: ${d.minutes} min de ejercicios guiados para ${w} palabras de capítulo (${perK.toFixed(0)} min por 1000 palabras)`, ref: ch });
+  }
+  const metric = xs.length ? (xs.length - dupIdx.size) / xs.length : null;
+  const quality: GuidedPracticeQuality = {
+    chapters: docs.length, exercises: xs.length, minutes, hours: Math.round((minutes / 60) * 10) / 10, crossChapterDuplicates: dups,
+    atFloorShare: Math.round(atFloorShare * 10000) / 10000, wordsPerCreditedMinute: Math.round(wpm * 100) / 100,
+    maxMinutesPerContentKWords: maxPerK === null ? null : Math.round(maxPerK * 10) / 10,
+    supported: dups === 0 && !(xs.length >= 2 && atFloorShare >= T.Q9_MAX_AT_FLOOR_SHARE) && wpm >= T.Q9_MIN_WORDS_PER_MINUTE,
+  };
+  return { check: { ...check('Q9', 'Ejercicios guiados (repetición, piso y volumen vs minutos; informativo)', metric, 1, f), pass: true, blocking: false }, quality };
 }
 
 /**
@@ -303,6 +412,8 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
 export function compareQualityReports(baseline: QualityReport, candidate: QualityReport, tolerance = 0.02): Array<{ id: string; baseline: number | null; candidate: number | null; why: string }> {
   const out: Array<{ id: string; baseline: number | null; candidate: number | null; why: string }> = [];
   for (const b of baseline.checks) {
+    // Loop 10 fix M7: un check informativo (blocking === false, p. ej. Q9) nunca bloquea una optimización.
+    if (b.blocking === false) continue;
     const c = candidate.checks.find((x) => x.id === b.id);
     if (!c) { out.push({ id: b.id, baseline: b.metric, candidate: null, why: 'check ausente' }); continue; }
     if (b.pass && !c.pass) out.push({ id: b.id, baseline: b.metric, candidate: c.metric, why: 'dejó de pasar' });

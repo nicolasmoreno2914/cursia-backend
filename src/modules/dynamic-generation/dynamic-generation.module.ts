@@ -20,6 +20,8 @@ import { FinopsModule } from '../finops/finops.module';
 import { AdminDynamicRunsController } from './admin-runs.controller';
 import { AdminRecoveryService } from './admin-recovery.service';
 import { VideogenReconciliationService } from './videogen-reconciliation.service';
+import { PilotMetricsService } from './pilot-metrics.service';
+import { CoherenceModule } from '../coherence/coherence.module';
 
 /**
  * Generación dinámica (Fase 5A): runs sobre un Generation Manifest. No
@@ -38,12 +40,14 @@ import { VideogenReconciliationService } from './videogen-reconciliation.service
     FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
     CourseDesignModule,        // R68: GenerationDesignGate (sin diseño verificado no hay generación)
     PrebriefModule,            // Prebrief: sin la versión aprobada y vigente no hay generación (ni estimado)
+    CoherenceModule,           // Loop 10 C2: batería de calidad en las métricas del piloto (solo lectura)
   ],
   controllers: [RunsController, ExecutorController, DynamicYoutubeController, AdminDynamicRunsController],
   providers: [
     RunsService,
     AdminRecoveryService, // EV6 DoD BE-B: cola de recuperación de admin (solo lectura)
     VideogenReconciliationService, // V542 (G6): conciliación explícita de reservas de Videogen (SUPER_ADMIN)
+    PilotMetricsService, // Loop 10 C2: métricas del piloto de un run (SUPER_ADMIN, solo lectura)
     SchedulerService,
     DynamicYoutubePreflightService,
     {

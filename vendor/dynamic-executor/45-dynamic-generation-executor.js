@@ -1373,7 +1373,7 @@ var DYN_V3_PROMPT_VERSIONS = {
 // Fase 2: Actividad de Aplicación + solucionario (2 pasadas). Aparte para no mover DYN_V3_PROMPT_VERSIONS.
 var DYN_V3_APPLICATION_PROMPT_VERSION = 'v21-app-1';
 // Loop 9 B: práctica guiada del capítulo (una pasada + el reintento dirigido).
-var DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION = 'v21-gp-2';
+var DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION = 'v21-gp-3';
 // EV6 IV avanzado: video_interactions schemaVersion 2 (pausas para pensar). La ruta schemaVersion 1
 // (Manifests sin `ivAdvanced`) sigue reportando DYN_V3_PROMPT_VERSIONS.video_interactions.
 var DYN_V3_VINT_V2_PROMPT_VERSION = 'v21-vint-5'; // #542 (I1) (antes v21-vint-3)
@@ -4167,6 +4167,141 @@ var DYN_GUIDED_PRACTICE_EXERCISE_KEYS = ['id', 'minutes', 'kind', 'title', 'situ
 var DYN_GUIDED_PRACTICE_CRITERION_KEYS = ['name', 'descriptor'];
 var DYN_GUIDED_PRACTICE_RESOURCE_RE = /\bvideos? (interactivos?|del cap[ií]tulo|del curso|del m[oó]dulo)\b|\bH5P\b|\bactividad(es)? de aplicaci[oó]n\b|\bex[aá]men(es)? (del|de este) (m[oó]dulo|curso)\b|\bevaluaci[oó]n final\b|\baudiolibro\b|\bpresentaci[oó]n del cap[ií]tulo\b|\blibro gu[ií]a\b|\bSCORM\b/i;
 var DYN_GUIDED_PRACTICE_SOURCE_MAX_CHARS = 16000;
+// Loop 10 C1 — guardia de calidad (espejo EXACTO de GUIDED_PRACTICE_DISTINCT y sus funciones en guided-practice.ts):
+// a) en el documento, 2+ tipos distintos y ninguna pareja casi igual (shingles de 3 palabras: situación ≥ 0,5 o
+// consignas ≥ 0,6); b) en el curso, ningún ejercicio repite el título ni la situación (firma ≥ 0,5) de un ejercicio
+// guiado de otro capítulo del run (claim `avoid.previousExercises`); c) cada consigna con una respuesta sustantiva.
+var DYN_GUIDED_PRACTICE_DISTINCT = { shingleSize: 3, situationJaccard: 0.5, tasksJaccard: 0.6, signatureMax: 64, previousMax: 40, answerSegmentMin: 60, answerStubRemainderMin: 40 };
+// Fix I1: solo remisiones al MATERIAL DEL CURSO que dejan < answerStubRemainderMin caracteres de respuesta propia.
+// Fix M3: «2 tipos distintos» vale para 2 y 3 ejercicios (3 ejercicios con 2 tipos alcanza).
+var DYN_GUIDED_PRACTICE_ANSWER_STUB_RE = /\b(?:ver|v[eé]ase|consulta(?:r)?|revisa(?:r)?)\s+(?:la|el|los|las)\s+(?:tabla|cuadro|secci[oó]n|apartado|cap[ií]tulo|texto|libro)\s+(?:del|de este|de la)\s+(?:cap[ií]tulo|texto|libro|curso|lectura)\b/i;
+function dynGuidedPracticeThinReason(segment) {
+  var D = DYN_GUIDED_PRACTICE_DISTINCT;
+  var sg = String(segment || '').trim();
+  if (sg.length < D.answerSegmentMin) return 'segmento corto (' + sg.length + ' < ' + D.answerSegmentMin + ' caracteres)';
+  var m = DYN_GUIDED_PRACTICE_ANSWER_STUB_RE.exec(sg);
+  if (m) {
+    var rest = sg.replace(m[0], ' ').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    if (rest.length < D.answerStubRemainderMin) return 'remite al material sin responder («' + m[0] + '»)';
+  }
+  return null;
+}
+function _dynGpWords(t) {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ]+/g, ' ').trim().split(' ').filter(Boolean);
+}
+function _dynGpShingles(t) {
+  var w = _dynGpWords(t);
+  var k = DYN_GUIDED_PRACTICE_DISTINCT.shingleSize;
+  if (!w.length) return [];
+  if (w.length < k) return [w.join(' ')];
+  var seen = {}, out = [];
+  for (var i = 0; i + k <= w.length; i++) { var sh = w.slice(i, i + k).join(' '); if (!seen[sh]) { seen[sh] = true; out.push(sh); } }
+  return out;
+}
+function _dynGpUniq(xs) { var seen = {}, out = []; xs.forEach(function (x) { if (!Object.prototype.hasOwnProperty.call(seen, x)) { seen[x] = true; out.push(x); } }); return out; }
+function _dynGpJaccard(a, b) {
+  if (!a.length || !b.length) return 0;
+  var A = _dynGpUniq(a), B = _dynGpUniq(b), inB = {};
+  B.forEach(function (x) { inB[x] = true; });
+  var inter = 0;
+  A.forEach(function (x) { if (inB[x]) inter++; });
+  return inter / (A.length + B.length - inter);
+}
+function _dynGpHash(s) {
+  var h = 0x811c9dc5;
+  for (var i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; }
+  return ('0000000' + h.toString(16)).slice(-8);
+}
+function _dynGpSigHashes(sig) {
+  if (typeof sig !== 'string' || !/^(?:[0-9a-f]{8})*$/.test(sig)) return [];
+  var out = [];
+  for (var i = 0; i < sig.length && out.length < DYN_GUIDED_PRACTICE_DISTINCT.signatureMax; i += 8) out.push(sig.slice(i, i + 8));
+  return out;
+}
+function dynGuidedPracticeSignature(t) {
+  return _dynGpUniq(_dynGpShingles(t).map(_dynGpHash)).sort().slice(0, DYN_GUIDED_PRACTICE_DISTINCT.signatureMax).join('');
+}
+function dynGuidedPracticeSignatureJaccard(sigA, sigB) {
+  var a = _dynGpSigHashes(sigA), b = _dynGpSigHashes(sigB);
+  if (!a.length || !b.length) return 0;
+  var inA = {}, inB = {};
+  a.forEach(function (h) { inA[h] = true; });
+  b.forEach(function (h) { inB[h] = true; });
+  var union = _dynGpUniq(a.concat(b)).sort().slice(0, DYN_GUIDED_PRACTICE_DISTINCT.signatureMax);
+  var both = 0;
+  union.forEach(function (h) { if (inA[h] && inB[h]) both++; });
+  return both / union.length;
+}
+function dynGuidedPracticeAnswerSegments(answer, taskCount) {
+  // Fix M4: solo marcas de primer nivel (mismo estilo que la 1 y sin más sangría); si no se completan, las de siempre.
+  function find(strict) {
+    var out = [];
+    var from = 0, style = '', indent = 0;
+    for (var k = 1; k <= taskCount; k++) {
+      var re = new RegExp('(?:^|\\n)([ \\t]*)(?:consigna[ \\t]+)?' + k + '([.)])[ \\t]', 'gi');
+      re.lastIndex = from;
+      var m;
+      while ((m = re.exec(answer))) {
+        if (!strict || k === 1 || (m[2] === style && m[1].length <= indent)) break;
+      }
+      if (!m) return null;
+      if (k === 1) { style = m[2]; indent = m[1].length; }
+      out.push({ start: m.index, end: m.index + m[0].length });
+      from = m.index + m[0].length;
+    }
+    return out;
+  }
+  var marks = find(true) || find(false);
+  if (!marks) return null;
+  return marks.map(function (mk, i) { return answer.slice(mk.end, i + 1 < marks.length ? marks[i + 1].start : answer.length).trim(); });
+}
+function dynGuidedPracticeDistinctErrors(doc) {
+  var out = [];
+  if (!_dynIsPlainObject(doc) || !Array.isArray(doc.exercises)) return out;
+  var D = DYN_GUIDED_PRACTICE_DISTINCT;
+  var xs = doc.exercises.map(function (e) { return _dynIsPlainObject(e) ? e : null; });
+  var kinds = xs.map(function (e) { return e && DYN_GUIDED_PRACTICE_KINDS.indexOf(e.kind) >= 0 ? String(e.kind) : null; });
+  if (xs.length >= 2 && kinds.every(function (k) { return k !== null; }) && _dynGpUniq(kinds).length < 2) {
+    out.push({ path: '$.exercises', code: 'GUIDED_PRACTICE_KIND_REPEATED', message: 'los ' + xs.length + ' ejercicios son del mismo tipo (' + kinds[0] + '): usa al menos 2 tipos distintos (' + DYN_GUIDED_PRACTICE_KINDS.join(', ') + ')' });
+  }
+  var sit = xs.map(function (e) { return e ? _dynGpShingles(e.situation) : []; });
+  var tasks = xs.map(function (e) { return e && Array.isArray(e.tasks) ? _dynGpUniq([].concat.apply([], e.tasks.map(function (t) { return _dynGpShingles(t); }))) : []; });
+  var titles = xs.map(function (e) { return e ? _dynNormTitle(e.title) : ''; });
+  for (var j = 1; j < xs.length; j++) {
+    if (!xs[j]) continue;
+    for (var i = 0; i < j; i++) {
+      if (!xs[i]) continue;
+      var p = '$.exercises[' + j + ']';
+      if (titles[j] && titles[j] === titles[i]) { out.push({ path: p + '.title', code: 'GUIDED_PRACTICE_DUPLICATE', message: p + '.title repite el título del ejercicio ' + (i + 1) + ': cada ejercicio es una situación distinta' }); break; }
+      var js = _dynGpJaccard(sit[i], sit[j]);
+      if (js >= D.situationJaccard) { out.push({ path: p + '.situation', code: 'GUIDED_PRACTICE_DUPLICATE', message: p + '.situation es casi igual a la del ejercicio ' + (i + 1) + ' (similitud ' + js.toFixed(2) + '): usa otra situación, con otras personas y otro problema' }); break; }
+      var jt = _dynGpJaccard(tasks[i], tasks[j]);
+      if (jt >= D.tasksJaccard) { out.push({ path: p + '.tasks', code: 'GUIDED_PRACTICE_DUPLICATE', message: p + '.tasks son casi iguales a las del ejercicio ' + (i + 1) + ' (similitud ' + jt.toFixed(2) + '): cada ejercicio pide un trabajo distinto' }); break; }
+    }
+  }
+  return out;
+}
+function dynGuidedPracticeRunClashes(doc, avoid) {
+  var out = [];
+  var prev = _dynIsPlainObject(avoid) && Array.isArray(avoid.previousExercises) ? avoid.previousExercises.slice(0, DYN_GUIDED_PRACTICE_DISTINCT.previousMax) : [];
+  if (!prev.length || !_dynIsPlainObject(doc) || !Array.isArray(doc.exercises)) return out;
+  var prevTitles = prev.map(function (x) { return _dynIsPlainObject(x) ? _dynNormTitle(x.title) : ''; });
+  doc.exercises.forEach(function (e, i) {
+    if (!_dynIsPlainObject(e)) return;
+    var p = '$.exercises[' + i + ']';
+    var nt = _dynNormTitle(e.title);
+    var k = nt ? prevTitles.indexOf(nt) : -1;
+    if (k >= 0) { out.push({ path: p + '.title', code: 'GUIDED_PRACTICE_RUN_DUPLICATE', message: p + '.title repite un ejercicio guiado de otro capítulo del curso («' + prev[k].title + '»): usa otra situación y otro título' }); return; }
+    var sig = dynGuidedPracticeSignature(e.situation);
+    for (var q = 0; q < prev.length; q++) {
+      var x = prev[q];
+      if (!_dynIsPlainObject(x)) continue;
+      var jj = dynGuidedPracticeSignatureJaccard(sig, x.sig);
+      if (jj >= DYN_GUIDED_PRACTICE_DISTINCT.situationJaccard) { out.push({ path: p + '.situation', code: 'GUIDED_PRACTICE_RUN_DUPLICATE', message: p + '.situation es casi igual a la de un ejercicio guiado de otro capítulo del curso («' + x.title + '», similitud ' + jj.toFixed(2) + '): usa otra situación' }); return; }
+    }
+  });
+  return out;
+}
 function dynGuidedPracticePlan(minutes) {
   var m = DYN_GUIDED_PRACTICE_EXERCISES_BY_MINUTES[minutes];
   if (!m) throw new Error('V3_VALIDATION_CONTEXT: práctica guiada con minutos inválidos ' + JSON.stringify(minutes));
@@ -4245,9 +4380,14 @@ function dynValidateGuidedPracticeDoc(doc, ctx) {
     var ans = text(e.modelAnswer, p + '.modelAnswer', F.modelAnswerMin, L.modelAnswerMax);
     if (ans && taskCount >= L.tasksMin && !dynGuidedPracticeAnswerCoversTasks(ans, taskCount)) {
       err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_ORDER', p + '.modelAnswer debe responder las ' + taskCount + ' consignas en orden, una por línea, cada una empezando con «1. », «2. », …');
+    } else if (ans && taskCount >= L.tasksMin) {
+      // Loop 10 C1-c: cada consigna con una respuesta sustantiva (nunca «ver la tabla del capítulo»).
+      var thin = (dynGuidedPracticeAnswerSegments(ans, taskCount) || []).map(function (sg, k) { var r = dynGuidedPracticeThinReason(sg); return r ? (k + 1) + ': ' + r : null; }).filter(Boolean);
+      if (thin.length) err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_THIN', p + '.modelAnswer no responde de verdad la(s) consigna(s) ' + thin.join('; ') + ': cada respuesta desarrolla el trabajo pedido (al menos ' + DYN_GUIDED_PRACTICE_DISTINCT.answerSegmentMin + ' caracteres) y no remite al material del curso');
     }
   });
-  return errors;
+  // Loop 10 C1-a: ejercicios distintos dentro del documento.
+  return errors.concat(dynGuidedPracticeDistinctErrors(doc));
 }
 // Documento desde la respuesta del LLM: Cursia pone chapterId, minutos, ids y minutos de cada ejercicio; del LLM solo se
 // toman los campos de contenido (un campo extra del modelo —p. ej. «solution» o «score»— nunca llega al documento).
@@ -4338,7 +4478,8 @@ async function _dynRunGuidedPractice(item) {
     var v = dynValidateGuidedPracticeDoc(doc, { chapterId: item.chapterId, minutes: gp.minutes });
     // Fix I5: mismo escenario o protagonistas que la práctica o las AA del módulo → se rehace.
     var av = dynLintGuidedPracticeAvoid(doc, gp.avoid);
-    v = v.concat(av.hard);
+    // Loop 10 C1-b: ni repetir un ejercicio guiado de otro capítulo del run (el servidor lo verifica también al completar).
+    v = v.concat(av.hard, dynGuidedPracticeRunClashes(doc, gp.avoid));
     if (v.length) return { ok: false, errors: _dynFormatErrors(v) };
     var nums = dynLintGuidedPracticeNumbers(doc);
     if (nums.length) return { ok: false, errors: nums.map(function (x) { return '$ ' + x; }) };

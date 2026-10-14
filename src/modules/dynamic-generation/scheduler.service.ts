@@ -1,7 +1,7 @@
 import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
-import { GUIDED_PRACTICE_SCHEMA_VERSION, GuidedPracticeAvoid } from '../course-shell/guided-practice';
+import { GUIDED_PRACTICE_DISTINCT, GUIDED_PRACTICE_SCHEMA_VERSION, GuidedPracticeAvoid, GuidedPracticePreviousExercise } from '../course-shell/guided-practice';
 export type { GuidedPracticeAvoid } from '../course-shell/guided-practice';
 import { guidedPracticeExercisePlan } from '../study-time/guided-practice-tiers';
 import {
@@ -306,7 +306,9 @@ export interface ClaimPayloadV3 {
     minutes: number; schemaVersion: number; exercises: { id: string; minutes: number }[]; context: unknown;
     /**
      * Fix I5: lo que los ejercicios guiados NO deben repetir: los títulos de los capítulos de práctica del módulo y los
-     * casos de sus Actividades de Aplicación ya completadas (título, taller, nombres propios). Ausente = nada que evitar.
+     * casos de sus Actividades de Aplicación ya completadas (título, taller, nombres propios). Loop 10 C1-b: y las
+     * huellas de los ejercicios guiados ya completados de otros capítulos del run (`previousExercises`, acotadas).
+     * Ausente = nada que evitar.
      */
     avoid?: GuidedPracticeAvoid;
   };
@@ -319,6 +321,8 @@ export interface ClaimPayloadV3 {
  */
 export function guidedPracticeAvoidOf(
   manifest: { modules: { chapters: { chapterId: string; kind?: string }[] }[] }, snapshot: unknown, chapterId: string, aaSummaries: unknown[],
+  /** Loop 10 C1-b: output_summary de los guided_practice YA completados del run ({ chapterId, summary }), otro capítulo. */
+  previousGuided: { chapterId: string | null; summary: unknown }[] = [],
 ): GuidedPracticeAvoid | null {
   const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === chapterId));
   if (!mm) return null;
@@ -330,7 +334,30 @@ export function guidedPracticeAvoidOf(
     return { title: typeof v.title === 'string' ? v.title : null, workshopTitle: typeof v.workshopTitle === 'string' ? v.workshopTitle : null,
       names: Array.isArray(v.caseNames) ? v.caseNames.filter((n: unknown) => typeof n === 'string').slice(0, 8) : [] };
   }).filter((c) => c.title || c.workshopTitle || c.names.length);
-  return practiceChapterTitles.length || applicationCases.length ? { practiceChapterTitles, applicationCases } : null;
+  const previousExercises = guidedPracticePreviousOf(chapterId, previousGuided);
+  if (!practiceChapterTitles.length && !applicationCases.length && !previousExercises.length) return null;
+  return { practiceChapterTitles, applicationCases, ...(previousExercises.length ? { previousExercises } : {}) };
+}
+
+/**
+ * Loop 10 C1-b (puro): huellas de los ejercicios guiados de OTROS capítulos del run (output_summary.v3Validation.
+ * fingerprints, que escribe el servidor al validar). Acotado a GUIDED_PRACTICE_DISTINCT.previousMax ejercicios y a
+ * firmas bien formadas de ≤ signatureMax hashes; un summary sin huellas (anterior al Loop 10) no aporta nada.
+ */
+export function guidedPracticePreviousOf(chapterId: string, previousGuided: { chapterId: string | null; summary: unknown }[]): GuidedPracticePreviousExercise[] {
+  const D = GUIDED_PRACTICE_DISTINCT;
+  const out: GuidedPracticePreviousExercise[] = [];
+  for (const p of previousGuided || []) {
+    if (!p || !p.chapterId || p.chapterId === chapterId) continue;
+    const v = (p.summary && typeof p.summary === 'object' ? (p.summary as any).v3Validation : null) || {};
+    for (const f of Array.isArray(v.fingerprints) ? v.fingerprints : []) {
+      if (out.length >= D.previousMax) return out;
+      if (!f || typeof f !== 'object' || typeof f.title !== 'string' || typeof f.sig !== 'string') continue;
+      if (!/^(?:[0-9a-f]{8})*$/.test(f.sig)) continue;
+      out.push({ chapterId: p.chapterId, title: f.title.slice(0, 90), sig: f.sig.slice(0, D.signatureMax * 8) });
+    }
+  }
+  return out;
 }
 
 /**
@@ -1582,8 +1609,18 @@ export class SchedulerService {
         [jobId, manifestId, aaKeys],
       )
       : [];
+    // Loop 10 C1-b: ejercicios guiados YA completados de otros capítulos del MISMO run (generación vigente).
+    const gpRows = await q.query(
+      `select d.chapter_id::text as chapter_id, d.output_summary from public.generation_item_runs d
+        where d.job_id = $1 and d.manifest_id = $2 and d.type = 'guided_practice' and d.item_key <> $3 and d.status = 'completed'
+          and ${latestGenerationPredicate('d')}
+        order by d.item_key`,
+      [jobId, manifestId, `guided_practice:${chapterId}`],
+    );
+    const parse = (v: unknown) => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return null; } };
     return guidedPracticeAvoidOf(manifest, snapshot, chapterId,
-      aaRows.map((r: any) => { try { return typeof r.output_summary === 'string' ? JSON.parse(r.output_summary) : r.output_summary; } catch { return null; } }));
+      aaRows.map((r: any) => parse(r.output_summary)),
+      gpRows.map((r: any) => ({ chapterId: r.chapter_id ?? null, summary: parse(r.output_summary) })));
   }
 
   /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */

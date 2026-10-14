@@ -2061,7 +2061,13 @@ function _dynGuidedPracticeAvoidBlock(gp) {
     if ((c.names || []).length) bits.push('protagonistas: ' + c.names.join(', '));
     if (bits.length) lines.push('- Actividad de Aplicación del módulo: ' + bits.join('; '));
   });
-  return lines.length ? '\n\nNO REPITAS estos casos del módulo (ni su título, ni sus personas, empresas o lugares; usa otra situación):\n' + lines.join('\n') : '';
+  var block = lines.length ? '\n\nNO REPITAS estos casos del módulo (ni su título, ni sus personas, empresas o lugares; usa otra situación):\n' + lines.join('\n') : '';
+  // Loop 10 C1-b: ejercicios guiados ya escritos para otros capítulos del curso (solo sus títulos; el validador compara
+  // también la situación).
+  var prev = [];
+  (Array.isArray(a.previousExercises) ? a.previousExercises : []).forEach(function (x) { if (x && x.title && prev.indexOf(x.title) < 0) prev.push(x.title); });
+  if (prev.length) block += '\n\nNO REPITAS los ejercicios guiados de otros capítulos del curso (ni su título ni su situación; cada capítulo practica con situaciones propias):\n' + prev.slice(0, 40).map(function (t) { return '- «' + t + '»'; }).join('\n');
+  return block;
 }
 
 function dynGuidedPracticePrompt(courseContext, outline, chapter, sourceMd, gp, pedagogy) {
@@ -2096,7 +2102,7 @@ function dynGuidedPracticePrompt(courseContext, outline, chapter, sourceMd, gp, 
     + '    }\n'
     + '  ]\n'
     + '}\n'
-    + '\nTipos de ejercicio (elige el que mejor practique el capítulo; si hay ' + n + ' ejercicios, que no sean todos iguales cuando el tema lo permita):\n- ' + DYN_GUIDED_PRACTICE_KINDS.map(function (k) { return DYN_GUIDED_PRACTICE_KIND_TEXT[k]; }).join('\n- ')
+    + '\nTipos de ejercicio (elige el que mejor practique cada parte del capítulo; con ' + n + ' ejercicios usa AL MENOS 2 tipos distintos):\n- ' + DYN_GUIDED_PRACTICE_KINDS.map(function (k) { return DYN_GUIDED_PRACTICE_KIND_TEXT[k]; }).join('\n- ')
     + '\n\nREGLAS (un validador las verifica):'
     + '\n- "exercises": EXACTAMENTE ' + n + ', en el orden del plan; cada uno dimensionado para sus minutos (los minutos se acreditan al estudiante: tienen que tener trabajo real detrás):\n- ' + floorText
     + '\n- "situation": como máximo 1400 caracteres; una situación NUEVA y concreta (personas y organizaciones ficticias, sin nombres reales). NO reutilices el caso que trae el capítulo («■ Caso …») ni su empresa, persona o producto, ni el caso de la práctica o de la Actividad de Aplicación del módulo.'
@@ -2104,7 +2110,8 @@ function dynGuidedPracticePrompt(courseContext, outline, chapter, sourceMd, gp, 
     + '\n- "tasks": hasta 6 consignas en imperativo; cada una pide PRODUCIR algo con lo que enseña el capítulo: analizar, decidir, calcular, comparar, justificar, proponer o redactar. Nunca consignas de solo recordar («Define…», «Menciona…», «Enumera…», «¿Qué es…?»).'
     + '\n- "expectedProduct": hasta 300 caracteres; concreto (qué entrega el estudiante y qué contiene).'
     + '\n- "criteria": de 3 a 5 criterios para que el estudiante revise su propio trabajo, solo { "name", "descriptor" } (sin pesos ni puntajes).'
-    + '\n- "modelAnswer": como máximo 2200 caracteres; responde TODAS las consignas EN ORDEN, UNA LÍNEA POR CONSIGNA (separadas con \\n), y cada línea EMPIEZA con su número: «1. », «2. », «3. »… Es la respuesta que el estudiante ve después de intentarlo.'
+    + '\n- "modelAnswer": como máximo 2200 caracteres; responde TODAS las consignas EN ORDEN, UNA LÍNEA POR CONSIGNA (separadas con \\n), y cada línea EMPIEZA con su número: «1. », «2. », «3. »… Cada línea DESARROLLA la respuesta a su consigna (al menos 60 caracteres, con el razonamiento o el resultado), nunca remite a otra parte («ver la tabla del capítulo»). Es la respuesta que el estudiante ve después de intentarlo.'
+    + '\n- Los ' + n + ' ejercicios son DISTINTOS entre sí: otra situación (otras personas, otra organización, otro problema), otro título y otras consignas; nunca el mismo caso con otras palabras.'
     + '\n- Dentro del alcance de ESTE capítulo: sin teoría de otros capítulos.'
     + '\n- No menciones otros recursos del curso (videos, actividades interactivas, Actividad de Aplicación, exámenes o evaluaciones, audiolibro, presentación, Libro Guía): la práctica se lee sola.';
 }

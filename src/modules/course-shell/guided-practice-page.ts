@@ -68,7 +68,8 @@ function paragraphsHtml(h: Hx, text: string, s: Surf): string {
 }
 
 export function guidedPracticePage(input: GuidedPracticePageInput, theme: ResolvedTheme): GuidedPracticePage {
-  const errs = validateGuidedPracticeDoc(input.doc, { chapterId: input.chapterId, minutes: input.doc?.minutes });
+  // Loop 10 fix M1: la página exige el contrato estructural; la guardia de calidad es de la generación (y del cargador).
+  const errs = validateGuidedPracticeDoc(input.doc, { chapterId: input.chapterId, minutes: input.doc?.minutes, qualityGuard: false });
   if (errs.length) shellFail(`Ejercicios guiados del capítulo ${input.chapterNumber}: documento inválido (${errs.slice(0, 3).map((e) => `${e.code} ${e.path}`).join('; ')})`);
   const doc = input.doc;
   const h = hx(theme); // CLEAN_SAFE: la página nunca lleva <style>.

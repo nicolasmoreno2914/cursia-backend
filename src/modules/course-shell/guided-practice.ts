@@ -76,12 +76,243 @@ export interface GuidedPracticeValidationContext {
   minutes: number;
   /** Fix N1: casos del módulo que no se repiten (práctica + AA). Ausente = sin chequeo de choque. */
   avoid?: GuidedPracticeAvoid | null;
+  /**
+   * Loop 10 fix M1: false = solo el contrato estructural del Loop 9 (sin la guardia de calidad C1: tipos, parejas casi
+   * iguales, respuestas sustantivas, choques con otros capítulos). La generación (ejecutor y completeItem) la aplica
+   * SIEMPRE; el empaque solo a artifacts escritos con el prompt ≥ v21-gp-3 (guidedPracticeQualityGuardApplies), así un
+   * run viejo o un ajuste futuro de umbrales nunca rompe el empaque. Ausente = true.
+   */
+  qualityGuard?: boolean;
+}
+
+/** Loop 10 fix M1: ¿el artifact se escribió con la guardia de calidad? (promptVersion del summary ≥ v21-gp-3). */
+export function guidedPracticeQualityGuardApplies(promptVersion: unknown): boolean {
+  const m = /^v21-gp-(\d+)$/.exec(String(promptVersion || ''));
+  return !!m && Number(m[1]) >= 3;
 }
 
 /** Fix I5/N1: lo que los ejercicios guiados no repiten (títulos de las prácticas del módulo y casos de sus AA). */
 export interface GuidedPracticeAvoid {
   practiceChapterTitles: string[];
   applicationCases: { title: string | null; workshopTitle: string | null; names: string[] }[];
+  /**
+   * Loop 10 C1-b: huellas de los ejercicios guiados YA completados en el MISMO run (otros capítulos): título + firma
+   * compacta de la situación (guidedPracticeSignature). Acotado: ≤ GUIDED_PRACTICE_DISTINCT.previousMax ejercicios.
+   * Ausente = nada que comparar (runs anteriores al Loop 10 no tienen huellas: no se comparan).
+   */
+  previousExercises?: GuidedPracticePreviousExercise[];
+}
+
+/** Loop 10 C1-b: huella de un ejercicio guiado de otro capítulo del run. */
+export interface GuidedPracticePreviousExercise {
+  chapterId: string;
+  title: string;
+  /** Firma de la situación: hasta `signatureMax` hashes FNV-1a de 32 bits (8 hex cada uno), ordenados y concatenados. */
+  sig: string;
+}
+
+/**
+ * Loop 10 C1 — guardia de calidad de los ejercicios guiados (los minutos que se acreditan no se inflan con repetición):
+ *  a) en un documento: al menos 2 tipos (`kind`) distintos cuando hay 2+ ejercicios; ninguna pareja casi igual
+ *     (Jaccard de shingles de 3 palabras ≥ situationJaccard entre situaciones, o ≥ tasksJaccard entre consignas);
+ *  b) en el curso: ningún ejercicio repite el título de un ejercicio guiado de OTRO capítulo del run ni su situación
+ *     (Jaccard estimada con las firmas ≥ situationJaccard);
+ *  c) la respuesta modelo responde CADA consigna con contenido (cada tramo ≥ answerSegmentMin caracteres; sin
+ *     remisiones al material del curso del tipo «ver la tabla del capítulo» que dejan < answerStubRemainderMin
+ *     caracteres de respuesta propia).
+ * Fix M3: «2 tipos distintos» vale para 2 y para 3 ejercicios (3 ejercicios con 2 tipos alcanza): obliga a practicar el
+ * capítulo de dos maneras sin forzar un tipo que no le sirve.
+ * Espejo EXACTO en el ejecutor (DYN_GUIDED_PRACTICE_DISTINCT).
+ */
+export const GUIDED_PRACTICE_DISTINCT = Object.freeze({
+  shingleSize: 3,
+  situationJaccard: 0.5,
+  tasksJaccard: 0.6,
+  signatureMax: 64,
+  previousMax: 40,
+  answerSegmentMin: 60,
+  answerStubRemainderMin: 40,
+});
+
+/**
+ * C1-c (fix I1): remisión al MATERIAL DEL CURSO («Ver la tabla del capítulo», «Consulta la sección del libro»). Solo
+ * cuenta si, sin la remisión, al tramo le quedan < answerStubRemainderMin caracteres de respuesta propia: «Revisa el
+ * punto de equilibrio: 120 u × $5 = $600…» o «Revisar la sección 4 del contrato…» son respuestas, no remisiones.
+ */
+export const GUIDED_PRACTICE_ANSWER_STUB_RE = /\b(?:ver|v[eé]ase|consulta(?:r)?|revisa(?:r)?)\s+(?:la|el|los|las)\s+(?:tabla|cuadro|secci[oó]n|apartado|cap[ií]tulo|texto|libro)\s+(?:del|de este|de la)\s+(?:cap[ií]tulo|texto|libro|curso|lectura)\b/i;
+
+/** Fix I1: ¿por qué un tramo de la respuesta no responde? null = responde. Espejo de dynGuidedPracticeThinReason. */
+export function guidedPracticeThinReason(segment: string): string | null {
+  const D = GUIDED_PRACTICE_DISTINCT;
+  const sg = String(segment || '').trim();
+  if (sg.length < D.answerSegmentMin) return `segmento corto (${sg.length} < ${D.answerSegmentMin} caracteres)`;
+  const m = GUIDED_PRACTICE_ANSWER_STUB_RE.exec(sg);
+  if (m) {
+    const rest = sg.replace(m[0], ' ').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    if (rest.length < D.answerStubRemainderMin) return `remite al material sin responder («${m[0]}»)`;
+  }
+  return null;
+}
+
+/** Palabras normalizadas (minúsculas, sin tildes, solo [a-z0-9ñ]). Espejo de _dynGpWords. */
+export function guidedPracticeWords(t: unknown): string[] {
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ]+/g, ' ').trim().split(' ').filter(Boolean);
+}
+
+/** Shingles de `shingleSize` palabras consecutivas (únicos, en orden de aparición). Menos palabras = un solo shingle. */
+export function guidedPracticeShingles(t: unknown): string[] {
+  const w = guidedPracticeWords(t);
+  const k = GUIDED_PRACTICE_DISTINCT.shingleSize;
+  if (!w.length) return [];
+  if (w.length < k) return [w.join(' ')];
+  const seen = new Set<string>();
+  for (let i = 0; i + k <= w.length; i++) seen.add(w.slice(i, i + k).join(' '));
+  return [...seen];
+}
+
+/** Jaccard de dos conjuntos de shingles (0 si alguno está vacío). */
+export function guidedPracticeJaccard(a: string[], b: string[]): number {
+  if (!a.length || !b.length) return 0;
+  const B = new Set(b);
+  const A = new Set(a);
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
+/** FNV-1a de 32 bits sobre las unidades UTF-16 (8 hex). Espejo de _dynGpHash. */
+export function guidedPracticeHash(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return ('0000000' + h.toString(16)).slice(-8);
+}
+
+function sigHashes(sig: unknown): string[] {
+  if (typeof sig !== 'string' || !/^(?:[0-9a-f]{8})*$/.test(sig)) return [];
+  const out: string[] = [];
+  for (let i = 0; i < sig.length && out.length < GUIDED_PRACTICE_DISTINCT.signatureMax; i += 8) out.push(sig.slice(i, i + 8));
+  return out;
+}
+
+/** Firma compacta de un texto: los `signatureMax` hashes más chicos de sus shingles (bottom-k), ordenados. */
+export function guidedPracticeSignature(t: unknown): string {
+  const hs = [...new Set(guidedPracticeShingles(t).map(guidedPracticeHash))].sort();
+  return hs.slice(0, GUIDED_PRACTICE_DISTINCT.signatureMax).join('');
+}
+
+/**
+ * Jaccard estimada entre dos firmas (estimador bottom-k): de los k hashes más chicos de la unión, la fracción que está
+ * en ambas. Exacta si los dos textos tienen ≤ k shingles.
+ */
+export function guidedPracticeSignatureJaccard(sigA: string, sigB: string): number {
+  const a = sigHashes(sigA);
+  const b = sigHashes(sigB);
+  if (!a.length || !b.length) return 0;
+  const A = new Set(a);
+  const B = new Set(b);
+  const union = [...new Set([...a, ...b])].sort().slice(0, GUIDED_PRACTICE_DISTINCT.signatureMax);
+  let both = 0;
+  for (const h of union) if (A.has(h) && B.has(h)) both++;
+  return both / union.length;
+}
+
+/** Huellas de los ejercicios de un documento (para el output_summary y el `avoid` de los capítulos siguientes). */
+export function guidedPracticeFingerprints(doc: unknown): { id: string | null; title: string; sig: string }[] {
+  if (!isObj(doc) || !Array.isArray((doc as any).exercises)) return [];
+  return ((doc as any).exercises as unknown[]).filter(isObj).map((e: any) => ({
+    id: typeof e.id === 'string' ? e.id : null,
+    title: String(e.title || '').slice(0, GUIDED_PRACTICE_LIMITS.titleMax),
+    sig: guidedPracticeSignature(e.situation),
+  }));
+}
+
+/**
+ * C1-c: los tramos de la respuesta modelo, uno por consigna (entre la marca «k.» y la siguiente). null si las marcas
+ * no están completas y en orden (eso ya lo informa GUIDED_PRACTICE_ANSWER_ORDER).
+ */
+export function guidedPracticeAnswerSegments(answer: string, taskCount: number): string[] | null {
+  // Fix M4: solo las marcas de PRIMER nivel cortan: mismo estilo que la marca 1 («.» o «)») y sin más sangría que ella
+  // (un «2)» anidado dentro de la respuesta 1 no la parte). Si así no se completan, las marcas de siempre.
+  const find = (strict: boolean): { start: number; end: number }[] | null => {
+    const marks: { start: number; end: number }[] = [];
+    let from = 0;
+    let style = '';
+    let indent = 0;
+    for (let k = 1; k <= taskCount; k++) {
+      const re = new RegExp(`(?:^|\\n)([ \\t]*)(?:consigna[ \\t]+)?${k}([.)])[ \\t]`, 'gi');
+      re.lastIndex = from;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(answer))) {
+        if (!strict || k === 1 || (m[2] === style && m[1].length <= indent)) break;
+      }
+      if (!m) return null;
+      if (k === 1) { style = m[2]; indent = m[1].length; }
+      marks.push({ start: m.index, end: m.index + m[0].length });
+      from = m.index + m[0].length;
+    }
+    return marks;
+  };
+  const marks = find(true) || find(false);
+  if (!marks) return null;
+  return marks.map((m, i) => answer.slice(m.end, i + 1 < marks.length ? marks[i + 1].start : answer.length).trim());
+}
+
+/**
+ * C1-a: distinción DENTRO del documento (tipos y parejas casi iguales). Espejo de dynGuidedPracticeDistinctErrors.
+ */
+export function guidedPracticeDistinctErrors(doc: unknown): GuidedPracticeValidationError[] {
+  const out: GuidedPracticeValidationError[] = [];
+  if (!isObj(doc) || !Array.isArray((doc as any).exercises)) return out;
+  const xs = ((doc as any).exercises as unknown[]).map((e) => (isObj(e) ? e : null));
+  const D = GUIDED_PRACTICE_DISTINCT;
+  const kinds = xs.map((e) => (e && (GUIDED_PRACTICE_KINDS as readonly string[]).includes(e.kind) ? String(e.kind) : null));
+  if (xs.length >= 2 && kinds.every((k) => k !== null) && new Set(kinds).size < 2) {
+    out.push({ path: '$.exercises', code: 'GUIDED_PRACTICE_KIND_REPEATED', message: `los ${xs.length} ejercicios son del mismo tipo (${kinds[0]}): usa al menos 2 tipos distintos (${GUIDED_PRACTICE_KINDS.join(', ')})` });
+  }
+  const sit = xs.map((e) => (e ? guidedPracticeShingles(e.situation) : []));
+  const tasks = xs.map((e) => (e && Array.isArray(e.tasks) ? [...new Set(e.tasks.flatMap((t: unknown) => guidedPracticeShingles(t)))] as string[] : []));
+  const titles = xs.map((e) => (e ? guidedPracticeNormTitle(e.title) : ''));
+  for (let j = 1; j < xs.length; j++) {
+    if (!xs[j]) continue;
+    for (let i = 0; i < j; i++) {
+      if (!xs[i]) continue;
+      const p = `$.exercises[${j}]`;
+      if (titles[j] && titles[j] === titles[i]) { out.push({ path: `${p}.title`, code: 'GUIDED_PRACTICE_DUPLICATE', message: `${p}.title repite el título del ejercicio ${i + 1}: cada ejercicio es una situación distinta` }); break; }
+      const js = guidedPracticeJaccard(sit[i], sit[j]);
+      if (js >= D.situationJaccard) { out.push({ path: `${p}.situation`, code: 'GUIDED_PRACTICE_DUPLICATE', message: `${p}.situation es casi igual a la del ejercicio ${i + 1} (similitud ${js.toFixed(2)}): usa otra situación, con otras personas y otro problema` }); break; }
+      const jt = guidedPracticeJaccard(tasks[i], tasks[j]);
+      if (jt >= D.tasksJaccard) { out.push({ path: `${p}.tasks`, code: 'GUIDED_PRACTICE_DUPLICATE', message: `${p}.tasks son casi iguales a las del ejercicio ${i + 1} (similitud ${jt.toFixed(2)}): cada ejercicio pide un trabajo distinto` }); break; }
+    }
+  }
+  return out;
+}
+
+/**
+ * C1-b: choque DURO con un ejercicio guiado de OTRO capítulo del run (mismo título normalizado, o situación con
+ * Jaccard estimada ≥ situationJaccard). Espejo de dynGuidedPracticeRunClashes.
+ */
+export function guidedPracticeRunClashes(doc: unknown, avoid: GuidedPracticeAvoid | null | undefined): GuidedPracticeValidationError[] {
+  const out: GuidedPracticeValidationError[] = [];
+  const prev = avoid && Array.isArray(avoid.previousExercises) ? avoid.previousExercises.slice(0, GUIDED_PRACTICE_DISTINCT.previousMax) : [];
+  if (!prev.length || !isObj(doc) || !Array.isArray((doc as any).exercises)) return out;
+  const prevTitles = prev.map((x) => (isObj(x) ? guidedPracticeNormTitle(x.title) : ''));
+  ((doc as any).exercises as unknown[]).forEach((e, i) => {
+    if (!isObj(e)) return;
+    const p = `$.exercises[${i}]`;
+    const nt = guidedPracticeNormTitle(e.title);
+    const k = nt ? prevTitles.indexOf(nt) : -1;
+    if (k >= 0) { out.push({ path: `${p}.title`, code: 'GUIDED_PRACTICE_RUN_DUPLICATE', message: `${p}.title repite un ejercicio guiado de otro capítulo del curso («${prev[k].title}»): usa otra situación y otro título` }); return; }
+    const sig = guidedPracticeSignature(e.situation);
+    for (const x of prev) {
+      if (!isObj(x)) continue;
+      const j = guidedPracticeSignatureJaccard(sig, (x as any).sig);
+      if (j >= GUIDED_PRACTICE_DISTINCT.situationJaccard) { out.push({ path: `${p}.situation`, code: 'GUIDED_PRACTICE_RUN_DUPLICATE', message: `${p}.situation es casi igual a la de un ejercicio guiado de otro capítulo del curso («${x.title}», similitud ${j.toFixed(2)}): usa otra situación` }); return; }
+    }
+  });
+  return out;
 }
 
 /** Normalización de títulos (espejo EXACTO de _dynNormTitle del ejecutor). */
@@ -145,6 +376,7 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
   if (!ctx || typeof ctx.chapterId !== 'string' || !ctx.chapterId) throw new Error(`V3_VALIDATION_CONTEXT: práctica guiada sin chapterId ${JSON.stringify(ctx)}`);
   if (!isGuidedPracticeMinutes(ctx.minutes)) throw new Error(`V3_VALIDATION_CONTEXT: práctica guiada con minutos inválidos ${JSON.stringify(ctx.minutes)} (${GUIDED_PRACTICE_TIERS.join('/')})`);
   const L = GUIDED_PRACTICE_LIMITS;
+  const guard = ctx.qualityGuard !== false;
   const errors: GuidedPracticeValidationError[] = [];
   const err = (path: string, code: string, message: string) => errors.push({ path, code, message });
   if (!isObj(doc)) return [{ path: '$', code: 'GUIDED_PRACTICE_SHAPE', message: 'el documento debe ser un objeto' }];
@@ -209,10 +441,19 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
     const ans = text(e.modelAnswer, `${p}.modelAnswer`, F.modelAnswerMin, L.modelAnswerMax);
     if (ans && taskCount >= L.tasksMin && !guidedPracticeAnswerCoversTasks(ans, taskCount)) {
       err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_ORDER', `${p}.modelAnswer debe responder las ${taskCount} consignas en orden, una por línea, cada una empezando con «1. », «2. », …`);
+    } else if (ans && taskCount >= L.tasksMin) {
+      // Loop 10 C1-c: cada consigna con una respuesta sustantiva (nunca «ver la tabla del capítulo»).
+      const segs = guard ? guidedPracticeAnswerSegments(ans, taskCount) || [] : [];
+      const thin = segs.map((sg, k) => { const r = guidedPracticeThinReason(sg); return r ? `${k + 1}: ${r}` : null; }).filter(Boolean);
+      if (thin.length) err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_THIN', `${p}.modelAnswer no responde de verdad la(s) consigna(s) ${thin.join('; ')}: cada respuesta desarrolla el trabajo pedido (al menos ${GUIDED_PRACTICE_DISTINCT.answerSegmentMin} caracteres) y no remite al material del curso`);
     }
   });
+  // Loop 10 C1-a: ejercicios distintos dentro del documento.
+  if (guard) errors.push(...guidedPracticeDistinctErrors(doc));
   // Fix N1: el choque duro con los casos del módulo lo verifica también el servidor (no solo el ejecutor).
   errors.push(...guidedPracticeCaseClashes(doc, ctx.avoid));
+  // Loop 10 C1-b: ni repetir un ejercicio guiado de otro capítulo del run.
+  if (guard) errors.push(...guidedPracticeRunClashes(doc, ctx.avoid));
   return errors;
 }
 
@@ -223,5 +464,7 @@ export function guidedPracticeSummary(doc: any): Record<string, unknown> {
     exerciseCount: xs.length,
     minutes: doc?.minutes ?? null,
     kinds: xs.map((e: any) => e?.kind ?? null),
+    // Loop 10 C1-b: huellas (título + firma de la situación) que los capítulos siguientes del run no repiten.
+    fingerprints: guidedPracticeFingerprints(doc),
   };
 }
