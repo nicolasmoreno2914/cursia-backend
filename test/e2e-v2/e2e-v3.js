@@ -2722,7 +2722,7 @@ function reservationBookkeeping(ev) {
       // el reporte completo como línea base de la E2E.
       const qr = await api('GET', `/courses/${courseId}/blueprints/${n}/manifest/runs/${runId}/quality`);
       const qc = (id) => qr.data && qr.data.checks && qr.data.checks.find((c) => c.id === id);
-      ok(qr.status === 200 && qr.data.version === 'quality-battery-v1' && qr.data.checks.length === 8, T('batería de calidad: 200 con los 8 checks'), { s: qr.status, e: qr.error });
+      ok(qr.status === 200 && qr.data.version === 'quality-battery-v1' && qr.data.checks.length === 9 && qc('Q9') && qc('Q9').blocking === false, T('batería de calidad: 200 con los 9 checks (Q9 ejercicios guiados, informativo)'), { s: qr.status, e: qr.error });
       ok(qc('Q1') && qc('Q1').metric === 1 && qc('Q1').pass, T('batería: nada perdido (cada parte tiene su artifact)'), qc('Q1'));
       ok(qc('Q8') && !qc('Q8').findings.some((f) => f.code === 'Q8_ARTIFACT_WITHOUT_ITEM'), T('batería: ningún artifact fuera del Manifest'), qc('Q8') && qc('Q8').findings.slice(0, 3));
       ok(qc('Q6') && !qc('Q6').findings.some((f) => f.code === 'Q6_CHAPTER_NOT_ASSESSED'), T('batería: cada capítulo de un módulo con examen tiene preguntas'), qc('Q6') && qc('Q6').findings.slice(0, 3));

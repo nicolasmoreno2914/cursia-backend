@@ -189,7 +189,7 @@ export class CoherenceService {
     const unreadableArtifacts: string[] = [];
     const text = (r: (typeof rows)[number]) => loadArtifactText(this.artifacts, ownerId, { itemKey: r.item_key, itemRunId: r.item_run_id, artifactId: r.artifact_id, type: r.artifact_type as any, storageBucket: r.storage_bucket, storagePath: r.storage_path, mimeType: r.mime_type } as ResolvedArtifact);
     // Review M5: lectura en paralelo (de a 4) y un artifact ilegible queda listado en el reporte (nunca se omite callado).
-    const wanted = rows.filter((r) => ['dynamic_content_md', 'dynamic_context_summary_json', 'dynamic_course_intro_json', 'dynamic_exam_bank_json'].includes(r.artifact_type));
+    const wanted = rows.filter((r) => ['dynamic_content_md', 'dynamic_context_summary_json', 'dynamic_course_intro_json', 'dynamic_exam_bank_json', 'dynamic_guided_practice_json'].includes(r.artifact_type));
     const raw = new Map<string, string | null>();
     for (let i = 0; i < wanted.length; i += 4) {
       await Promise.all(wanted.slice(i, i + 4).map(async (r) => {
@@ -201,7 +201,14 @@ export class CoherenceService {
     const contextSummaries: QualityInputs['contextSummaries'] = {};
     const examBanks: QualityInputs['examBanks'] = {};
     let introCompetencies: string[] | null = null;
+    // Loop 10 C1-d: ejercicios guiados vigentes (Q9, informativo).
+    const guidedPractices: NonNullable<QualityInputs['guidedPractices']> = {};
     for (const r of rows) {
+      if (r.artifact_type === 'dynamic_guided_practice_json' && r.chapter_id) {
+        const d = await json(r);
+        if (d && Array.isArray(d.exercises)) guidedPractices[r.chapter_id] = { minutes: typeof d.minutes === 'number' ? d.minutes : null, exercises: d.exercises };
+        continue;
+      }
       if (r.artifact_type === 'dynamic_content_md' && r.chapter_id) { const t = raw.get(r.artifact_id); if (t != null) chapterMd[r.chapter_id] = t; }
       else if (r.artifact_type === 'dynamic_context_summary_json' && r.chapter_id) {
         const s = await json(r);
@@ -222,6 +229,7 @@ export class CoherenceService {
       chapters, outcomes, competencies,
       manifestItems: items.map((x) => ({ key: String(x.key), type: String(x.type), chapterId: x.chapterId ?? null, moduleId: x.moduleId ?? null })),
       artifactTypesByItem, chapterMd, contextSummaries, introCompetencies, examBanks,
+      ...(Object.keys(guidedPractices).length ? { guidedPractices } : {}),
     });
     return { runId: job.id, ...report, unreadableArtifacts };
   }

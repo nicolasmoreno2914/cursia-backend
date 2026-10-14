@@ -133,5 +133,42 @@ check('compareQualityReports: misma calidad ⇒ sin regresiones; métrica peor o
   assert(Q.compareQualityReports(base, Q.runQualityBattery(nodata)).some((x) => x.id === 'Q3' && x.why === 'sin datos'), 'perder los datos de un check es regresión (review I3)');
 });
 
+// ── Loop 10 C1-d: Q9 ejercicios guiados (informativo: nunca bloquea) ──
+const GPF = require('./lib/guided-practice-fixtures');
+const withGuided = (docs) => { const c = course(); c.guidedPractices = docs; return c; };
+check('Q9 sin ejercicios guiados: no aplica (null), pasa, guidedPractice null', () => {
+  const r = Q.runQualityBattery(course());
+  assert(get(r, 'Q9').metric === null && get(r, 'Q9').pass && get(r, 'Q9').blocking === false && r.guidedPractice === null && r.pass, JSON.stringify(get(r, 'Q9')));
+});
+check('Q9 ejercicios distintos entre capítulos: métrica 1, respaldado (horas, minutos, palabras por minuto)', () => {
+  const r = Q.runQualityBattery(withGuided({ c1: GPF.guidedPracticeDocDistinct('c1', 120, 0, 'c1'), c2: GPF.guidedPracticeDocDistinct('c2', 80, 1, 'c2') }));
+  const g = r.guidedPractice;
+  assert(r.summary.Q9 === 1 && g.chapters === 2 && g.exercises === 5 && g.minutes === 200 && g.hours === 3.3 && g.crossChapterDuplicates === 0, JSON.stringify(g));
+  assert(g.wordsPerCreditedMinute >= 10 && g.atFloorShare === 0 && g.supported === true && r.pass, JSON.stringify(g));
+  assert(typeof g.maxMinutesPerContentKWords === 'number' && codes(r, 'Q9').includes('Q9_GUIDED_MINUTES_VS_CONTENT'), 'capítulos de prueba muy cortos: minutos vs texto informados');
+});
+check('Q9 el mismo ejercicio en dos capítulos: repetido informado (warning), métrica < 1, NO respaldado, el reporte sigue pasando (no bloquea)', () => {
+  const r = Q.runQualityBattery(withGuided({ c1: GPF.guidedPracticeDocDistinct('c1', 80, 0, 'x'), c2: GPF.guidedPracticeDocDistinct('c2', 80, 0, 'x') }));
+  assert(codes(r, 'Q9').includes('Q9_GUIDED_DUPLICATE_ACROSS_CHAPTERS') && r.summary.Q9 === 0 && r.guidedPractice.crossChapterDuplicates === 2 && r.guidedPractice.supported === false, JSON.stringify(r.guidedPractice));
+  assert(get(r, 'Q9').pass && r.pass, 'informativo: no bloquea');
+  const base = Q.runQualityBattery(withGuided({ c1: GPF.guidedPracticeDocDistinct('c1', 80, 0, 'a'), c2: GPF.guidedPracticeDocDistinct('c2', 80, 1, 'b') }));
+  assert(Q.compareQualityReports(base, r).some((x) => x.id === 'Q9'), 'una optimización que repite ejercicios es una regresión medible');
+});
+check('Q9 ejercicios en el piso en todo el curso: informado y NO respaldado', () => {
+  const floorDoc = (ch, ord) => {
+    const d = GPF.guidedPracticeDocDistinct(ch, 80, ord, ch);
+    d.exercises.forEach((e) => { e.situation = e.situation.slice(0, 820); e.modelAnswer = e.modelAnswer.split('\n').map((l) => l.slice(0, 290)).join('\n'); });
+    return d;
+  };
+  const r = Q.runQualityBattery(withGuided({ c1: floorDoc('c1', 0), c2: floorDoc('c2', 1) }));
+  assert(codes(r, 'Q9').includes('Q9_GUIDED_AT_FLOOR') && r.guidedPractice.atFloorShare === 1 && r.guidedPractice.supported === false && r.pass, JSON.stringify(r.guidedPractice));
+});
+check('Q9 volumen escaso por minuto acreditado: informado', () => {
+  const d = GPF.guidedPracticeDocDistinct('c1', 120, 0, 'c1');
+  d.exercises.forEach((e) => { e.situation = 'Caso breve.'; e.modelAnswer = '1. Sí.'; e.tasks = ['Decide.']; e.expectedProduct = 'Nota.'; });
+  const r = Q.runQualityBattery(withGuided({ c1: d }));
+  assert(codes(r, 'Q9').includes('Q9_GUIDED_THIN_VOLUME') && r.guidedPractice.wordsPerCreditedMinute < 10 && !r.guidedPractice.supported, JSON.stringify(r.guidedPractice));
+});
+
 console.log(`\n${passes} ok, ${failures} fail`);
 process.exit(failures ? 1 : 0);
