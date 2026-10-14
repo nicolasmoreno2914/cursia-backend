@@ -4171,10 +4171,23 @@ var DYN_GUIDED_PRACTICE_SOURCE_MAX_CHARS = 16000;
 // a) en el documento, 2+ tipos distintos y ninguna pareja casi igual (shingles de 3 palabras: situación ≥ 0,5 o
 // consignas ≥ 0,6); b) en el curso, ningún ejercicio repite el título ni la situación (firma ≥ 0,5) de un ejercicio
 // guiado de otro capítulo del run (claim `avoid.previousExercises`); c) cada consigna con una respuesta sustantiva.
-var DYN_GUIDED_PRACTICE_DISTINCT = { shingleSize: 3, situationJaccard: 0.5, tasksJaccard: 0.6, signatureMax: 64, previousMax: 40, answerSegmentMin: 60, answerStubMaxChars: 160 };
-var DYN_GUIDED_PRACTICE_ANSWER_STUB_RE = /\b(?:ver|v[eé]ase|consulta(?:r)?|revisa(?:r)?|rem[ií]tete)\b[^.\n]{0,40}\b(?:tabla|cuadro|secci[oó]n|cap[ií]tulo|apartado|texto|punto|respuesta)\b/i;
+var DYN_GUIDED_PRACTICE_DISTINCT = { shingleSize: 3, situationJaccard: 0.5, tasksJaccard: 0.6, signatureMax: 64, previousMax: 40, answerSegmentMin: 60, answerStubRemainderMin: 40 };
+// Fix I1: solo remisiones al MATERIAL DEL CURSO que dejan < answerStubRemainderMin caracteres de respuesta propia.
+// Fix M3: «2 tipos distintos» vale para 2 y 3 ejercicios (3 ejercicios con 2 tipos alcanza).
+var DYN_GUIDED_PRACTICE_ANSWER_STUB_RE = /\b(?:ver|v[eé]ase|consulta(?:r)?|revisa(?:r)?)\s+(?:la|el|los|las)\s+(?:tabla|cuadro|secci[oó]n|apartado|cap[ií]tulo|texto|libro)\s+(?:del|de este|de la)\s+(?:cap[ií]tulo|texto|libro|curso|lectura)\b/i;
+function dynGuidedPracticeThinReason(segment) {
+  var D = DYN_GUIDED_PRACTICE_DISTINCT;
+  var sg = String(segment || '').trim();
+  if (sg.length < D.answerSegmentMin) return 'segmento corto (' + sg.length + ' < ' + D.answerSegmentMin + ' caracteres)';
+  var m = DYN_GUIDED_PRACTICE_ANSWER_STUB_RE.exec(sg);
+  if (m) {
+    var rest = sg.replace(m[0], ' ').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    if (rest.length < D.answerStubRemainderMin) return 'remite al material sin responder («' + m[0] + '»)';
+  }
+  return null;
+}
 function _dynGpWords(t) {
-  return String(t || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9ñ]+/g, ' ').trim().split(' ').filter(Boolean);
+  return String(t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9ñ]+/g, ' ').trim().split(' ').filter(Boolean);
 }
 function _dynGpShingles(t) {
   var w = _dynGpWords(t);
@@ -4220,16 +4233,26 @@ function dynGuidedPracticeSignatureJaccard(sigA, sigB) {
   return both / union.length;
 }
 function dynGuidedPracticeAnswerSegments(answer, taskCount) {
-  var marks = [];
-  var from = 0;
-  for (var k = 1; k <= taskCount; k++) {
-    var re = new RegExp('(?:^|\\n)[ \\t]*(?:consigna[ \\t]+)?' + k + '[.)][ \\t]', 'gi');
-    re.lastIndex = from;
-    var m = re.exec(answer);
-    if (!m) return null;
-    marks.push({ start: m.index, end: m.index + m[0].length });
-    from = m.index + m[0].length;
+  // Fix M4: solo marcas de primer nivel (mismo estilo que la 1 y sin más sangría); si no se completan, las de siempre.
+  function find(strict) {
+    var out = [];
+    var from = 0, style = '', indent = 0;
+    for (var k = 1; k <= taskCount; k++) {
+      var re = new RegExp('(?:^|\\n)([ \\t]*)(?:consigna[ \\t]+)?' + k + '([.)])[ \\t]', 'gi');
+      re.lastIndex = from;
+      var m;
+      while ((m = re.exec(answer))) {
+        if (!strict || k === 1 || (m[2] === style && m[1].length <= indent)) break;
+      }
+      if (!m) return null;
+      if (k === 1) { style = m[2]; indent = m[1].length; }
+      out.push({ start: m.index, end: m.index + m[0].length });
+      from = m.index + m[0].length;
+    }
+    return out;
   }
+  var marks = find(true) || find(false);
+  if (!marks) return null;
   return marks.map(function (mk, i) { return answer.slice(mk.end, i + 1 < marks.length ? marks[i + 1].start : answer.length).trim(); });
 }
 function dynGuidedPracticeDistinctErrors(doc) {
@@ -4359,9 +4382,8 @@ function dynValidateGuidedPracticeDoc(doc, ctx) {
       err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_ORDER', p + '.modelAnswer debe responder las ' + taskCount + ' consignas en orden, una por línea, cada una empezando con «1. », «2. », …');
     } else if (ans && taskCount >= L.tasksMin) {
       // Loop 10 C1-c: cada consigna con una respuesta sustantiva (nunca «ver la tabla del capítulo»).
-      var D = DYN_GUIDED_PRACTICE_DISTINCT;
-      var thin = (dynGuidedPracticeAnswerSegments(ans, taskCount) || []).map(function (sg, k) { return sg.length < D.answerSegmentMin || (sg.length < D.answerStubMaxChars && DYN_GUIDED_PRACTICE_ANSWER_STUB_RE.test(sg)) ? k + 1 : 0; }).filter(Boolean);
-      if (thin.length) err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_THIN', p + '.modelAnswer no responde de verdad la(s) consigna(s) ' + thin.join(', ') + ': cada respuesta desarrolla el trabajo pedido (al menos ' + D.answerSegmentMin + ' caracteres), nunca remite a otra parte («ver la tabla…»)');
+      var thin = (dynGuidedPracticeAnswerSegments(ans, taskCount) || []).map(function (sg, k) { var r = dynGuidedPracticeThinReason(sg); return r ? (k + 1) + ': ' + r : null; }).filter(Boolean);
+      if (thin.length) err(p + '.modelAnswer', 'GUIDED_PRACTICE_ANSWER_THIN', p + '.modelAnswer no responde de verdad la(s) consigna(s) ' + thin.join('; ') + ': cada respuesta desarrolla el trabajo pedido (al menos ' + DYN_GUIDED_PRACTICE_DISTINCT.answerSegmentMin + ' caracteres) y no remite al material del curso');
     }
   });
   // Loop 10 C1-a: ejercicios distintos dentro del documento.

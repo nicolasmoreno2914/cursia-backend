@@ -192,7 +192,7 @@ function packagingInput(distRoot, o = {}) {
  * ejercicios DISTINTOS (tipos, situaciones y consignas) y, por capítulo, otro título y otra combinación de situaciones.
  */
 function guidedPracticeDoc(chapterId, minutes, n) {
-  return GPF.guidedPracticeDocDistinct(chapterId, minutes, Math.max(0, (Number(n) || 1) - 1) % 3, `capítulo ${n}`);
+  return GPF.guidedPracticeDocDistinct(chapterId, minutes, Math.max(0, (Number(n) || 1) - 1), `capítulo ${n}`);
 }
 
 /** Fase 2: documento `dynamic_application_json` de prueba (cantidades según el nivel de minutos). */

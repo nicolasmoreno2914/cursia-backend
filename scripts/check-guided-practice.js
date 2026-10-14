@@ -561,7 +561,7 @@ function gpDoc(chapterId, minutes) {
     const doc = gpDoc(ch, 80);
     const codes = (d, mins = 80, avoid) => [...new Set(GP.validateGuidedPracticeDoc(d, { chapterId: d.chapterId, minutes: mins, ...(avoid ? { avoid } : {}) }).map((e) => e.code))].sort();
     const mut = (fn, base = doc) => { const d = clone(base); fn(d); return d; };
-    eq(JSON.parse(JSON.stringify(GP.GUIDED_PRACTICE_DISTINCT)), { shingleSize: 3, situationJaccard: 0.5, tasksJaccard: 0.6, signatureMax: 64, previousMax: 40, answerSegmentMin: 60, answerStubMaxChars: 160 }, 'umbrales');
+    eq(JSON.parse(JSON.stringify(GP.GUIDED_PRACTICE_DISTINCT)), { shingleSize: 3, situationJaccard: 0.5, tasksJaccard: 0.6, signatureMax: 64, previousMax: 40, answerSegmentMin: 60, answerStubRemainderMin: 40 }, 'umbrales');
     // a) dentro del documento.
     eq(codes(doc), [], 'E1 ≠ E2: válido');
     eq(codes(mut((d) => { d.exercises[1].kind = 'case_analysis'; })), ['GUIDED_PRACTICE_KIND_REPEATED'], '2 ejercicios del mismo tipo');
@@ -586,6 +586,27 @@ function gpDoc(chapterId, minutes) {
     eq(codes(mut((d) => { d.exercises[0].modelAnswer = thin.replace(/3\. Ver la tabla[^\n]*/, '3. ' + lines[2].slice(3) + ' Para confirmar, revisa la tabla de la política de cambios.'); })), [], 'tramo largo que menciona una tabla: válido');
     eq(GP.guidedPracticeAnswerSegments(ANSWER, 5).map((x) => x.length >= 60), [true, true, true, true, true], 'tramos');
     eq(GP.guidedPracticeAnswerSegments('1. A\n3. C', 3), null, 'marcas incompletas → null');
+    // Fix I1: solo remisiones al material del curso sin respuesta propia; respuestas que «revisan» algo del caso, no.
+    const R = (t) => GP.guidedPracticeThinReason(t);
+    for (const t of ['Revisa el punto de equilibrio: 120 u × $5 = $600, así que con 150 unidades ya cubres los costos fijos del mes.',
+      'Revisar la sección 4 del contrato: la cláusula fija un 10 % de penalidad por entrega tardía, por eso conviene renegociar la fecha.',
+      'La decisión tiene que ver con el apartado de riesgos: si el proveedor falla, la línea se detiene dos días y se pierde el pedido.',
+      'Si quieres, consulta la tabla del capítulo para confirmar, pero el orden correcto es primero la dificultad respiratoria y luego la fiebre del niño.']) eq(R(t), null, `no es remisión: ${t.slice(0, 40)}`);
+    for (const t of ['Ver la tabla del capítulo, donde aparecen los pasos que siguen.', 'Consulta la sección del libro sobre este punto y ahí lo encuentras.', 'Véase el apartado de la lectura sobre este tema, que lo explica muy bien.']) assert(/remite al material sin responder/.test(R(t) || ''), `remisión: ${t} → ${R(t)}`);
+    assert(/segmento corto \(16 < 60/.test(R('Sí, eso haría yo') || ''), 'corto');
+    const thinErr = GP.validateGuidedPracticeDoc(mut((d) => { d.exercises[0].modelAnswer = thin; }), { chapterId: ch, minutes: 80 }).find((e) => e.code === 'GUIDED_PRACTICE_ANSWER_THIN');
+    assert(/consigna\(s\) 3: remite al material sin responder \(«Ver la tabla del capítulo»\)/.test(thinErr.message), thinErr.message);
+    // Fix M4: un «2)» anidado dentro de la respuesta 1 no la parte (marcas de primer nivel: estilo y sangría de la 1).
+    const nested = '1. Primero ordenas los pasos:\n  1) recibir\n  2) revisar\n2. Después decides con la política.\n3. Al final registras el caso.';
+    eq(GP.guidedPracticeAnswerSegments(nested, 3).map((x) => x.split('\n')[0]), ['Primero ordenas los pasos:', 'Después decides con la política.', 'Al final registras el caso.'], 'anidado no corta');
+    eq(GP.guidedPracticeAnswerSegments('1) A uno\n2. B dos\n3) C tres', 3), ['A uno', 'B dos', 'C tres'], 'estilos mezclados: las marcas de siempre');
+    // Fix M1: el empaque aplica la guardia solo a artifacts con prompt ≥ v21-gp-3; el resto, contrato estructural.
+    eq(['v21-gp-3', 'v21-gp-4', 'v21-gp-12', 'v21-gp-2', null, 'x'].map(GP.guidedPracticeQualityGuardApplies), [true, true, true, false, false, false], 'versión con guardia');
+    const oldDoc = mut((d) => { d.exercises[1].kind = d.exercises[0].kind; d.exercises[1].situation = d.exercises[0].situation; d.exercises[0].modelAnswer = thin; });
+    assert(codes(oldDoc).length === 3, `con guardia: ${codes(oldDoc)}`);
+    eq([...new Set(GP.validateGuidedPracticeDoc(oldDoc, { chapterId: ch, minutes: 80, qualityGuard: false }).map((e) => e.code))], [], 'sin guardia (artifact del Loop 9): válido');
+    const shellSrc = fs.readFileSync(path.join(__dirname, '..', 'src/modules/dynamic-packaging/packaging-v3.ts'), 'utf8');
+    assert(/guidedPracticeQualityGuardApplies\(byItem\.get\(gpKey\)\?\.outputSummary\?\.promptVersion\)/.test(shellSrc), 'el cargador del empaque decide por el promptVersion del summary');
     // b) en el curso: huellas (firma acotada) en el summary del servidor y en el avoid de los capítulos siguientes.
     const fps = GP.guidedPracticeFingerprints(doc);
     assert(fps.length === 2 && fps.every((f) => /^(?:[0-9a-f]{8}){1,64}$/.test(f.sig)), 'huellas acotadas');
@@ -609,6 +630,14 @@ function gpDoc(chapterId, minutes) {
     eq(codes(other, 80, avoid), ['GUIDED_PRACTICE_RUN_DUPLICATE'], 'mismos ejercicios que otro capítulo');
     const otherFixed = GPF.guidedPracticeDocDistinct(ch2, 80, 1, 'capítulo 2');
     eq(codes(otherFixed, 80, avoid), [], 'ejercicios de otro capítulo distintos: válido');
+    // Fixture (fix round 1): 12 capítulos de 3 ejercicios, cada uno contra las huellas de TODOS los anteriores → sin choques.
+    const seenSums = [];
+    for (let k = 0; k < 12; k++) {
+      const dk = GPF.guidedPracticeDocDistinct(`k${k}`, 120, k, `capítulo ${k + 1}`);
+      const av = { practiceChapterTitles: [], applicationCases: [], previousExercises: SCHED.guidedPracticePreviousOf(`k${k}`, seenSums) };
+      eq(codes(dk, 120, av), [], `fixture: capítulo ${k + 1} sin choques con los anteriores`);
+      seenSums.push({ chapterId: `k${k}`, summary: sumOf(dk) });
+    }
     eq(codes(mut((d) => { d.exercises[0].title = doc.exercises[1].title; }, otherFixed), 80, avoid), ['GUIDED_PRACTICE_RUN_DUPLICATE'], 'mismo título que un ejercicio de otro capítulo');
     eq(codes(mut((d) => { d.exercises[1].situation = doc.exercises[0].situation + ' La administradora vuelve en la tarde.'; }, otherFixed), 80, avoid), ['GUIDED_PRACTICE_RUN_DUPLICATE'], 'situación casi igual a la de otro capítulo');
     const vv = V3V.validateV3ItemArtifact({ type: 'guided_practice', itemKey: `guided_practice:${ch}`, chapterId: ch, guidedPracticeMinutes: 80, guidedPracticeAvoid: avoid }, JSON.stringify(mut((d) => { d.chapterId = ch; }, other)));
@@ -629,6 +658,8 @@ function gpDoc(chapterId, minutes) {
     for (const f of ['44-dynamic-prompt-builders.js', '45-dynamic-generation-executor.js']) vm.runInContext(fs.readFileSync(path.join(vendor, f), 'utf8'), ctx, { filename: f });
     eq(JSON.parse(JSON.stringify(ctx.DYN_GUIDED_PRACTICE_DISTINCT)), JSON.parse(JSON.stringify(GP.GUIDED_PRACTICE_DISTINCT)), 'vendor: mismos umbrales');
     eq(String(ctx.DYN_GUIDED_PRACTICE_ANSWER_STUB_RE), String(GP.GUIDED_PRACTICE_ANSWER_STUB_RE), 'vendor: misma regex de remisiones');
+    for (const t of ['Revisa el punto de equilibrio: 120 u × $5 = $600, así que con 150 unidades ya cubres los costos fijos del mes.', 'Ver la tabla del capítulo, donde aparecen los pasos que siguen.', 'corto', 'Consulta la sección del libro sobre este punto y ahí lo encuentras.']) eq(ctx.dynGuidedPracticeThinReason(t), GP.guidedPracticeThinReason(t), `vendor: misma razón: ${t.slice(0, 30)}`);
+    eq(JSON.parse(JSON.stringify(ctx.dynGuidedPracticeAnswerSegments(nested, 3))), GP.guidedPracticeAnswerSegments(nested, 3), 'vendor: mismos tramos (anidado)');
     const parity = [doc, d120, mut((d) => { d.exercises[1].kind = 'case_analysis'; }), mut((d) => { d.exercises[1].situation = d.exercises[0].situation; }), mut((d) => { d.exercises[1].tasks = d.exercises[0].tasks.slice(); }),
       mut((d) => { d.exercises[1].title = 'Caso: ' + d.exercises[0].title; }), mut((d) => { d.exercises[0].modelAnswer = thin; }), other, otherFixed];
     for (const [i, d] of parity.entries()) {

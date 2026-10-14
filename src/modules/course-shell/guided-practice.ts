@@ -76,6 +76,19 @@ export interface GuidedPracticeValidationContext {
   minutes: number;
   /** Fix N1: casos del módulo que no se repiten (práctica + AA). Ausente = sin chequeo de choque. */
   avoid?: GuidedPracticeAvoid | null;
+  /**
+   * Loop 10 fix M1: false = solo el contrato estructural del Loop 9 (sin la guardia de calidad C1: tipos, parejas casi
+   * iguales, respuestas sustantivas, choques con otros capítulos). La generación (ejecutor y completeItem) la aplica
+   * SIEMPRE; el empaque solo a artifacts escritos con el prompt ≥ v21-gp-3 (guidedPracticeQualityGuardApplies), así un
+   * run viejo o un ajuste futuro de umbrales nunca rompe el empaque. Ausente = true.
+   */
+  qualityGuard?: boolean;
+}
+
+/** Loop 10 fix M1: ¿el artifact se escribió con la guardia de calidad? (promptVersion del summary ≥ v21-gp-3). */
+export function guidedPracticeQualityGuardApplies(promptVersion: unknown): boolean {
+  const m = /^v21-gp-(\d+)$/.exec(String(promptVersion || ''));
+  return !!m && Number(m[1]) >= 3;
 }
 
 /** Fix I5/N1: lo que los ejercicios guiados no repiten (títulos de las prácticas del módulo y casos de sus AA). */
@@ -105,7 +118,10 @@ export interface GuidedPracticePreviousExercise {
  *  b) en el curso: ningún ejercicio repite el título de un ejercicio guiado de OTRO capítulo del run ni su situación
  *     (Jaccard estimada con las firmas ≥ situationJaccard);
  *  c) la respuesta modelo responde CADA consigna con contenido (cada tramo ≥ answerSegmentMin caracteres; sin
- *     remisiones del tipo «ver la tabla del capítulo»).
+ *     remisiones al material del curso del tipo «ver la tabla del capítulo» que dejan < answerStubRemainderMin
+ *     caracteres de respuesta propia).
+ * Fix M3: «2 tipos distintos» vale para 2 y para 3 ejercicios (3 ejercicios con 2 tipos alcanza): obliga a practicar el
+ * capítulo de dos maneras sin forzar un tipo que no le sirve.
  * Espejo EXACTO en el ejecutor (DYN_GUIDED_PRACTICE_DISTINCT).
  */
 export const GUIDED_PRACTICE_DISTINCT = Object.freeze({
@@ -115,11 +131,28 @@ export const GUIDED_PRACTICE_DISTINCT = Object.freeze({
   signatureMax: 64,
   previousMax: 40,
   answerSegmentMin: 60,
-  answerStubMaxChars: 160,
+  answerStubRemainderMin: 40,
 });
 
-/** C1-c: tramo de respuesta que solo remite a otra parte («Ver la tabla del capítulo», «Consulta la sección 2»). */
-export const GUIDED_PRACTICE_ANSWER_STUB_RE = /\b(?:ver|v[eé]ase|consulta(?:r)?|revisa(?:r)?|rem[ií]tete)\b[^.\n]{0,40}\b(?:tabla|cuadro|secci[oó]n|cap[ií]tulo|apartado|texto|punto|respuesta)\b/i;
+/**
+ * C1-c (fix I1): remisión al MATERIAL DEL CURSO («Ver la tabla del capítulo», «Consulta la sección del libro»). Solo
+ * cuenta si, sin la remisión, al tramo le quedan < answerStubRemainderMin caracteres de respuesta propia: «Revisa el
+ * punto de equilibrio: 120 u × $5 = $600…» o «Revisar la sección 4 del contrato…» son respuestas, no remisiones.
+ */
+export const GUIDED_PRACTICE_ANSWER_STUB_RE = /\b(?:ver|v[eé]ase|consulta(?:r)?|revisa(?:r)?)\s+(?:la|el|los|las)\s+(?:tabla|cuadro|secci[oó]n|apartado|cap[ií]tulo|texto|libro)\s+(?:del|de este|de la)\s+(?:cap[ií]tulo|texto|libro|curso|lectura)\b/i;
+
+/** Fix I1: ¿por qué un tramo de la respuesta no responde? null = responde. Espejo de dynGuidedPracticeThinReason. */
+export function guidedPracticeThinReason(segment: string): string | null {
+  const D = GUIDED_PRACTICE_DISTINCT;
+  const sg = String(segment || '').trim();
+  if (sg.length < D.answerSegmentMin) return `segmento corto (${sg.length} < ${D.answerSegmentMin} caracteres)`;
+  const m = GUIDED_PRACTICE_ANSWER_STUB_RE.exec(sg);
+  if (m) {
+    const rest = sg.replace(m[0], ' ').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    if (rest.length < D.answerStubRemainderMin) return `remite al material sin responder («${m[0]}»)`;
+  }
+  return null;
+}
 
 /** Palabras normalizadas (minúsculas, sin tildes, solo [a-z0-9ñ]). Espejo de _dynGpWords. */
 export function guidedPracticeWords(t: unknown): string[] {
@@ -201,16 +234,29 @@ export function guidedPracticeFingerprints(doc: unknown): { id: string | null; t
  * no están completas y en orden (eso ya lo informa GUIDED_PRACTICE_ANSWER_ORDER).
  */
 export function guidedPracticeAnswerSegments(answer: string, taskCount: number): string[] | null {
-  const marks: { start: number; end: number }[] = [];
-  let from = 0;
-  for (let k = 1; k <= taskCount; k++) {
-    const re = new RegExp(`(?:^|\\n)[ \\t]*(?:consigna[ \\t]+)?${k}[.)][ \\t]`, 'gi');
-    re.lastIndex = from;
-    const m = re.exec(answer);
-    if (!m) return null;
-    marks.push({ start: m.index, end: m.index + m[0].length });
-    from = m.index + m[0].length;
-  }
+  // Fix M4: solo las marcas de PRIMER nivel cortan: mismo estilo que la marca 1 («.» o «)») y sin más sangría que ella
+  // (un «2)» anidado dentro de la respuesta 1 no la parte). Si así no se completan, las marcas de siempre.
+  const find = (strict: boolean): { start: number; end: number }[] | null => {
+    const marks: { start: number; end: number }[] = [];
+    let from = 0;
+    let style = '';
+    let indent = 0;
+    for (let k = 1; k <= taskCount; k++) {
+      const re = new RegExp(`(?:^|\\n)([ \\t]*)(?:consigna[ \\t]+)?${k}([.)])[ \\t]`, 'gi');
+      re.lastIndex = from;
+      let m: RegExpExecArray | null;
+      while ((m = re.exec(answer))) {
+        if (!strict || k === 1 || (m[2] === style && m[1].length <= indent)) break;
+      }
+      if (!m) return null;
+      if (k === 1) { style = m[2]; indent = m[1].length; }
+      marks.push({ start: m.index, end: m.index + m[0].length });
+      from = m.index + m[0].length;
+    }
+    return marks;
+  };
+  const marks = find(true) || find(false);
+  if (!marks) return null;
   return marks.map((m, i) => answer.slice(m.end, i + 1 < marks.length ? marks[i + 1].start : answer.length).trim());
 }
 
@@ -330,6 +376,7 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
   if (!ctx || typeof ctx.chapterId !== 'string' || !ctx.chapterId) throw new Error(`V3_VALIDATION_CONTEXT: práctica guiada sin chapterId ${JSON.stringify(ctx)}`);
   if (!isGuidedPracticeMinutes(ctx.minutes)) throw new Error(`V3_VALIDATION_CONTEXT: práctica guiada con minutos inválidos ${JSON.stringify(ctx.minutes)} (${GUIDED_PRACTICE_TIERS.join('/')})`);
   const L = GUIDED_PRACTICE_LIMITS;
+  const guard = ctx.qualityGuard !== false;
   const errors: GuidedPracticeValidationError[] = [];
   const err = (path: string, code: string, message: string) => errors.push({ path, code, message });
   if (!isObj(doc)) return [{ path: '$', code: 'GUIDED_PRACTICE_SHAPE', message: 'el documento debe ser un objeto' }];
@@ -396,18 +443,17 @@ export function validateGuidedPracticeDoc(doc: unknown, ctx: GuidedPracticeValid
       err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_ORDER', `${p}.modelAnswer debe responder las ${taskCount} consignas en orden, una por línea, cada una empezando con «1. », «2. », …`);
     } else if (ans && taskCount >= L.tasksMin) {
       // Loop 10 C1-c: cada consigna con una respuesta sustantiva (nunca «ver la tabla del capítulo»).
-      const segs = guidedPracticeAnswerSegments(ans, taskCount) || [];
-      const D = GUIDED_PRACTICE_DISTINCT;
-      const thin = segs.map((sg, k) => (sg.length < D.answerSegmentMin || (sg.length < D.answerStubMaxChars && GUIDED_PRACTICE_ANSWER_STUB_RE.test(sg)) ? k + 1 : 0)).filter(Boolean);
-      if (thin.length) err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_THIN', `${p}.modelAnswer no responde de verdad la(s) consigna(s) ${thin.join(', ')}: cada respuesta desarrolla el trabajo pedido (al menos ${D.answerSegmentMin} caracteres), nunca remite a otra parte («ver la tabla…»)`);
+      const segs = guard ? guidedPracticeAnswerSegments(ans, taskCount) || [] : [];
+      const thin = segs.map((sg, k) => { const r = guidedPracticeThinReason(sg); return r ? `${k + 1}: ${r}` : null; }).filter(Boolean);
+      if (thin.length) err(`${p}.modelAnswer`, 'GUIDED_PRACTICE_ANSWER_THIN', `${p}.modelAnswer no responde de verdad la(s) consigna(s) ${thin.join('; ')}: cada respuesta desarrolla el trabajo pedido (al menos ${GUIDED_PRACTICE_DISTINCT.answerSegmentMin} caracteres) y no remite al material del curso`);
     }
   });
   // Loop 10 C1-a: ejercicios distintos dentro del documento.
-  errors.push(...guidedPracticeDistinctErrors(doc));
+  if (guard) errors.push(...guidedPracticeDistinctErrors(doc));
   // Fix N1: el choque duro con los casos del módulo lo verifica también el servidor (no solo el ejecutor).
   errors.push(...guidedPracticeCaseClashes(doc, ctx.avoid));
   // Loop 10 C1-b: ni repetir un ejercicio guiado de otro capítulo del run.
-  errors.push(...guidedPracticeRunClashes(doc, ctx.avoid));
+  if (guard) errors.push(...guidedPracticeRunClashes(doc, ctx.avoid));
   return errors;
 }
 

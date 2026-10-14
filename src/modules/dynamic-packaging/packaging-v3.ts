@@ -1,5 +1,5 @@
 import { APPLICATION_ARTIFACT_TYPE, validateApplicationActivityDoc } from '../course-shell/application-activity';
-import { GUIDED_PRACTICE_ARTIFACT_TYPE, validateGuidedPracticeDoc } from '../course-shell/guided-practice';
+import { GUIDED_PRACTICE_ARTIFACT_TYPE, guidedPracticeQualityGuardApplies, validateGuidedPracticeDoc } from '../course-shell/guided-practice';
 /**
  * Cursia V2.1 — R12: empaque de runs rulesVersion 3 — resolución de
  * artifacts, perfiles vigentes, tema, clave de reuse y carga de contenidos.
@@ -803,7 +803,10 @@ export async function loadContentsV3(
         tasks.push(async () => {
           // Loop 9 B: requerida como cualquier parte (sin artifact → falla el empaque); nunca se empaqueta una inválida.
           const doc = json(await validatedText(L, byItem, gpKey, GUIDED_PRACTICE_ARTIFACT_TYPE), gpKey);
-          const errs = validateGuidedPracticeDoc(doc, { chapterId: ch.chapterId, minutes: ch.guidedPracticeMinutes as number });
+          // Loop 10 fix M1: la guardia de calidad C1 solo para artifacts escritos con ella (prompt ≥ v21-gp-3); los anteriores,
+          // el contrato estructural del Loop 9 (un run viejo o un ajuste de umbrales nunca rompe el empaque).
+          const qualityGuard = guidedPracticeQualityGuardApplies(byItem.get(gpKey)?.outputSummary?.promptVersion);
+          const errs = validateGuidedPracticeDoc(doc, { chapterId: ch.chapterId, minutes: ch.guidedPracticeMinutes as number, qualityGuard });
           if (errs.length) throw new Error(`${PACKAGING_V3}: ${gpKey} inválido [${[...new Set(errs.map((e) => e.code))].sort().join(', ')}] ${errs.slice(0, 3).map((e) => `${e.path} ${e.message}`).join(' | ')}`);
           slot.guidedPractice = doc;
         });

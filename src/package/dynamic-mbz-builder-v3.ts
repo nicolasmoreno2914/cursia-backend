@@ -892,7 +892,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     if (!ch.keys.guidedPractice) continue;
     const doc = c.guidedPractices?.get(ch.chapterId);
     if (!doc) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${ch.chapterNumber} sin documento`);
-    const errs = validateGuidedPracticeDoc(doc, { chapterId: ch.chapterId, minutes: ch.guidedPracticeMinutes as number });
+    // Loop 10 fix M1: invariante ESTRUCTURAL del empaque (la guardia de calidad la aplica el cargador según el promptVersion).
+    const errs = validateGuidedPracticeDoc(doc, { chapterId: ch.chapterId, minutes: ch.guidedPracticeMinutes as number, qualityGuard: false });
     if (errs.length) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${ch.chapterNumber} inválida (${errs.slice(0, 3).map((e) => `${e.code} ${e.path}`).join('; ')})`);
     guidedDocs.set(ch.chapterId, doc);
   }

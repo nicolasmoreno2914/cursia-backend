@@ -196,7 +196,7 @@ function applicationSolution(a) {
 // otro título y otra combinación de situaciones), como exige la guardia de calidad.
 const GPF = require('../../scripts/lib/guided-practice-fixtures');
 function guidedPractice(n, unnumbered, ordinal = 0, chapterTitle = '') {
-  const doc = GPF.guidedLlmDoc(n, ordinal % 3, chapterTitle ? chapterTitle.slice(0, 40) : '');
+  const doc = GPF.guidedLlmDoc(n, ordinal, chapterTitle ? chapterTitle.slice(0, 40) : '');
   if (unnumbered) doc.exercises.forEach((e) => { e.modelAnswer = e.modelAnswer.replace(/(^|\n)\d\. /g, '$1'); });
   return doc;
 }
