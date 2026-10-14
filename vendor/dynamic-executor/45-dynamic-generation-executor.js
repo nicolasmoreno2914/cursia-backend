@@ -6778,9 +6778,9 @@ var DYN_EXAM_BANK_MAX_BODY_BYTES = 56 * 1024;      // < MAX_BODY_BYTES (64 KB) d
 var DYN_EXAM_BANK_TOKENS_EST = { multichoice: 660, truefalse: 265, match: 335 };
 // #583 (I3): con el piso en 2·slots una hoja corta tras 2 rondas fallaba el intento entero (sim. fault ×2: intentos
 // 3,1 → 5,4 por 2×2); una 3.ª ronda —solo los ids que faltan, prefijo en caché— casi siempre la completa.
-// Exam-bank D2: 4 rondas (la 4.ª solo corre en la cola: hojas que siguen bajo el piso) — con el pool, cerrar dentro del
+// Exam-bank D2: 5 rondas (las últimas solo corren en la cola: hojas que siguen bajo el piso) — con el pool, cerrar dentro del
 // intento cuesta una llamada; repetir el intento entero, decenas (#1353: 19 intentos extra, 104 llamadas).
-var DYN_EXAM_BANK_REPAIR_ROUNDS = 4;
+var DYN_EXAM_BANK_REPAIR_ROUNDS = 5;
 var DYN_EXAM_BANK_POOL_ROUND_TOKENS = 14000;          // rev. M6: tope del pool por hoja y ronda (tokens de salida estimados)               // 2.ª–4.ª ronda solo para hojas bajo el piso (I2)
 var DYN_EXAM_BANK_CACHE_PREFIX = 'cursia.examBank.v1|';
 
@@ -7322,7 +7322,7 @@ async function _dynRunExamBank(item) {
       var sc0 = Object.create(null);
       if (_dynIsPlainObject(h.stratCodes)) Object.keys(h.stratCodes).slice(0, 20).forEach(function (c) { var v = nInt(h.stratCodes[c]); if (v && /^[A-Z_]{1,60}$/.test(c)) sc0[c] = v; });
       hist[k] = { stuck: nInt(h.stuck), strategy: h.strategy === true, strategyFails: nInt(h.strategyFails), sig: typeof h.sig === 'string' && /^[A-Z_]{1,60}$/.test(h.sig) ? h.sig : null, capacity: false,
-        tried: nInt(h.tried), triedStrategy: nInt(h.triedStrategy), noProgressAttempts: nInt(h.noProgressAttempts), stratCodes: sc0,
+        tried: nInt(h.tried), triedStrategy: nInt(h.triedStrategy), stratDryRounds: nInt(h.stratDryRounds), stratDryTries: nInt(h.stratDryTries), stratCodes: sc0,
         rejectedRefs: Array.isArray(h.rejectedRefs) ? h.rejectedRefs.filter(function (x) { return typeof x === 'string' && DYN_EXAM_REF_RE.test(x); }).slice(-40) : [],
         rejectedTerms: Array.isArray(h.rejectedTerms) ? h.rejectedTerms.filter(Array.isArray).map(function (t) { return t.filter(function (x) { return typeof x === 'string'; }).map(function (x) { return x.slice(0, 40); }).slice(0, 6); }).slice(-12) : [] };
     });
@@ -7458,7 +7458,9 @@ async function _dynRunExamBank(item) {
       if (need > 0) {
         // Desde la 2.ª ronda la hoja ya falló una vez con el pool: el doble de candidatas (tope 6×faltante).
         var ty = plan[s.leafIndex].type;
-        var want = Math.min(6 * need, Math.max(need + 2, Math.ceil((round >= 2 ? 2 : 1) * need / Math.max(typeYield(ty), 0.2)) + 1));
+        // Sin tope por múltiplo del faltante: con rendimiento bajo (≈ 20 %) 6×faltante dejaba la última pregunta sin cubrir
+        // (Monte Carlo de sensibilidad); el tope es por tokens (abajo).
+        var want = Math.max(need + 2, Math.ceil((round >= 2 ? 2 : 1) * need / Math.max(typeYield(ty), 0.15)) + 1);
         // Rendimiento medido < 5 % (≥ 8 muestras): el modelo no produce (no es una hoja difícil); más candidatas no lo
         // arreglan → sin pool. Un rendimiento bajo pero real (p. ej. 20 %) sí recibe el pool completo.
         if (typeSamples(ty) >= 8 && typeYield(ty) < 0.05) want = need + 2;
@@ -7564,10 +7566,12 @@ async function _dynRunExamBank(item) {
     // Falla sistémica: el rendimiento de TODO el intento (primera pasada + reparaciones, todos los tipos) es < 5 % con
     // ≥ 20 muestras → modelo o servicio que no produce; no se sigue escalando dentro del intento (queda el borrador y
     // decide la recuperación normal; nunca un banco corto). Una hoja difícil con rendimiento bajo pero real no corta.
-    var allN = 0;
-    var allV = 0;
-    [stats.firstPass, repairPass].forEach(function (src) { Object.keys(src).forEach(function (t) { allN += src[t].returned || 0; allV += src[t].valid || 0; }); });
-    var systemic = allN >= 20 && allV < 0.05 * allN;
+    // Debe verse en ≥ 2 tipos de pregunta (≥ 5 muestras cada uno): una sola hoja atascada (p. ej. el reintento con
+    // borrador que solo repara esa hoja) no es una falla sistémica — la decide la regla de capacidad.
+    var byType = {};
+    [stats.firstPass, repairPass].forEach(function (src) { Object.keys(src).forEach(function (t) { var b = byType[t] = byType[t] || { n: 0, v: 0 }; b.n += src[t].returned || 0; b.v += src[t].valid || 0; }); });
+    var sampled = Object.keys(byType).filter(function (t) { return byType[t].n >= 5; });
+    var systemic = sampled.length >= 2 && sampled.every(function (t) { return byType[t].v < 0.05 * byType[t].n; });
     if (systemic) { stats.systemicStop = round; break; } // rev. I1: una ronda sistémica no actualiza la memoria de ninguna hoja
     Object.keys(leafInfo).forEach(function (k) {
       var li = Number(k);
@@ -7582,7 +7586,7 @@ async function _dynRunExamBank(item) {
       real.forEach(function (t) { if (!t.ok) { if (t.ref) h.rejectedRefs.push(t.ref); if (t.terms && t.terms.length) h.rejectedTerms.push(t.terms); } });
       h.rejectedRefs = h.rejectedRefs.slice(-40);
       h.rejectedTerms = h.rejectedTerms.slice(-12);
-      if (row.kept >= row.target || row.kept > info.keptBefore) { h.stuck = 0; h.strategyFails = 0; return; }
+      if (row.kept >= row.target || row.kept > info.keptBefore) { h.stuck = 0; h.strategyFails = 0; h.stratDryRounds = 0; h.stratDryTries = 0; return; }
       if (!real.length) return; // solo omisiones: la hoja no avanzó, pero nada dice que el capítulo no alcance
       var codes = {};
       real.forEach(function (t) { if (!t.ok) codes[t.code] = (codes[t.code] || 0) + 1; });
@@ -7592,32 +7596,18 @@ async function _dynRunExamBank(item) {
         h.sig = dom;
         var sc = h.stratCodes = h.stratCodes || {};
         real.forEach(function (t) { if (!t.ok) sc[t.code] = (sc[t.code] || 0) + 1; });
-        var scTotal = Object.keys(sc).reduce(function (t, c) { return t + sc[c]; }, 0);
-        // AGOTADA por FIRMA sistemática: 2 rondas con la estrategia alternativa sin avanzar, ≥ 10 candidatas
-        // (respondidas) con ella y ≥ 80 % de sus rechazos con el mismo código. El ruido de una hoja de bajo rendimiento
-        // (códigos mezclados) no la corta aquí; la regla por intentos (abajo, rev. I2) cubre las hojas imposibles con
-        // códigos mezclados.
-        if (h.strategyFails >= 2 && h.triedStrategy >= 10 && scTotal > 0 && (sc[dom] || 0) >= 0.8 * scTotal) h.capacity = true;
+        // AGOTADA — regla única, independiente del código (rev. I2 + sensibilidad): ≥ 4 rondas SEGUIDAS con la estrategia
+        // alternativa sin avanzar y ≥ 20 candidatas respondidas desde el último avance. Con 20 candidatas, una hoja con
+        // rendimiento real (≥ 15–20 %) casi nunca queda en cero (≤ 0,85²⁰ ≈ 4 %·10⁻²); el ruido no la corta. Como la
+        // estrategia viaja en el borrador, el corte llega a más tardar en el 2.º intento.
+        h.stratDryRounds = (h.stratDryRounds | 0) + 1;
+        h.stratDryTries = (h.stratDryTries | 0) + real.length;
+        if (h.stratDryRounds >= 4 && h.stratDryTries >= 20) h.capacity = true;
       } else {
         h.stuck++;
         h.sig = dom;
         h.strategy = true;
       }
-    });
-  }
-  // rev. I2 — regla independiente del código: una hoja bajo el piso que, con la estrategia alternativa activa, no
-  // avanzó NADA en 2 intentos completos (≥ 20 candidatas respondidas con ella) queda AGOTADA. Con el borrador, el
-  // segundo intento ya empieza en la estrategia alternativa: el corte llega a más tardar al final del 2.º intento.
-  if (a) {
-    a.perLeaf.forEach(function (row, li) {
-      var h = hist[leafKey(li)];
-      if (!h || row.kept >= row.floor) { if (h) h.noProgressAttempts = 0; return; }
-      if (!h.strategyUsedThisAttempt) return;
-      // Avance desde que la estrategia alternativa empezó en ESTE intento (no desde el inicio: lo ganado antes de
-      // cambiar de enfoque no cuenta como avance de la estrategia).
-      if (row.kept > (h.keptAtStrategy != null ? h.keptAtStrategy : (keptAtStart[li] || 0))) { h.noProgressAttempts = 0; return; }
-      h.noProgressAttempts = (h.noProgressAttempts | 0) + 1;
-      if (h.noProgressAttempts >= 2 && h.triedStrategy >= 20) { h.capacity = true; if (!h.sig) h.sig = 'sin avance en 2 intentos'; }
     });
   }
   var repairedCount = recordList().filter(function (r) { return r.repaired && r.status === 'valid'; }).length;
@@ -7649,7 +7639,7 @@ async function _dynRunExamBank(item) {
     Object.keys(hist).forEach(function (k) {
       var h = hist[k];
       if (!h.tried && !h.strategy) return;
-      out[k] = { stuck: h.stuck, strategy: h.strategy, strategyFails: h.strategyFails, sig: h.sig, tried: h.tried, triedStrategy: h.triedStrategy, noProgressAttempts: h.noProgressAttempts | 0, stratCodes: h.stratCodes || {}, rejectedRefs: h.rejectedRefs.slice(-40), rejectedTerms: h.rejectedTerms.slice(-12) };
+      out[k] = { stuck: h.stuck, strategy: h.strategy, strategyFails: h.strategyFails, sig: h.sig, tried: h.tried, triedStrategy: h.triedStrategy, stratDryRounds: h.stratDryRounds | 0, stratDryTries: h.stratDryTries | 0, stratCodes: h.stratCodes || {}, rejectedRefs: h.rejectedRefs.slice(-40), rejectedTerms: h.rejectedTerms.slice(-12) };
     });
     return out;
   }

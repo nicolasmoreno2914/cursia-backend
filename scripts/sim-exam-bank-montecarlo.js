@@ -97,7 +97,7 @@ async function oneRun(seed) {
     }
     out.code = String((r && r.error) || '').split(':')[0];
     if (out.code === 'EXAM_BANK_LEAF_CAPACITY' || (r && r.retryable === false)) break;
-    if (r && r.draft) { draftRef = `draft:${a}`; drafts[draftRef] = r.draft.content; }
+    if (r && r.draft) { draftRef = `draft:${a}`; drafts[draftRef] = r.draft.content; if (args.debug === '1') { try { const dd = JSON.parse(r.draft.content); out.perAttempt[out.perAttempt.length - 1].diag = { leafHistory: dd.leafHistory, perLeaf: dd.diagnostics.perLeaf, repairPass: dd.diagnostics.repairPass, firstPass: dd.diagnostics.firstPass, pool: dd.diagnostics.poolCandidates, calls: dd.diagnostics.calls, systemic: dd.diagnostics.systemicStop, rejected: dd.diagnostics.rejectedByCode }; } catch (e) { /* nada */ } } }
     else if (r && r.draftClear) draftRef = null;
   }
   try { fs.unlinkSync(logFile); } catch (e) { /* nada */ }
