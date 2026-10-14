@@ -4332,7 +4332,7 @@ async function _dynRunGuidedPractice(item) {
   var caseReuse = {};
   var clashSoft = {};
   // Fix M3: 120 min = 3 ejercicios de 40 → más espacio de salida.
-  var maxTok = gp.minutes === 120 ? 7000 : 6000;
+  var maxTok = gp.minutes === 120 ? 10000 : 8000; // prior de salida p90 ≈ 6,5k (2 ej.) / 9,75k (3 ej.): sin truncar en el worker (tope 16k)
   var res = await _dynV3JsonWithRetry(item, dynGuidedPracticeSys(courseContext), dynGuidedPracticePrompt(courseContext, bp.outline, chapter, sourceMd, gp, dynPedagogyBlock(item)), maxTok, function (obj, attempt) {
     var doc = dynGuidedPracticeDocFrom(obj, item.chapterId, gp.minutes);
     var v = dynValidateGuidedPracticeDoc(doc, { chapterId: item.chapterId, minutes: gp.minutes });
