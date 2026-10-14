@@ -163,6 +163,8 @@ export interface RunCompletion {
     auto: boolean;
     /** Fix round 1 (I2): el precheck no dejó armar el paquete (código + mensaje para admin). */
     blocked?: { code: string; message: string | null };
+    /** stop-after (review I3): el empaque automático está RETENIDO por el dueño (holdPackaging): solo acción explícita. */
+    held?: boolean;
   } | null;
 }
 
@@ -179,6 +181,8 @@ export interface CompletionPackageInfo {
   auto?: boolean;
   /** Fix round 1 (I2): bloqueo del precheck (código, mensaje para admin, faltantes `<itemKey>:<problema>`). */
   blocked?: { code: string; message?: string | null; missing?: string[] } | null;
+  /** stop-after (review I3): empaque automático retenido por el dueño. */
+  held?: boolean;
 }
 
 /**
@@ -643,6 +647,7 @@ export function evaluateRunCompletion(
           autoRetryPending: !packageReady && !!pkg.autoRetryPending,
           auto: !!pkg.auto,
           ...(pkg.blocked && !packageReady ? { blocked: { code: pkg.blocked.code, message: pkg.blocked.message ?? null } } : {}),
+          ...(pkg.held && !packageReady ? { held: true } : {}),
         } }
       : {}),
   };

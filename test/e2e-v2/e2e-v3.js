@@ -4186,6 +4186,110 @@ function reservationBookkeeping(ev) {
         }
         results.courses.E24e = { courseId: c5.courseId, runId: c5.runId, items: rows5.length, llmParts: llm5.length, browserClaims: claimLog.slice(claims5).length, externalStems: fin5 && fin5.output_summary.externalStems, packageJob: pj5.id };
 
+        // ── Corrida 5s (stop_after_item, 2026-10-14): «detener después de» del SERVIDOR con el worker de IA real y la IA falsa,
+        // sin navegador. Al completarse el examen de módulo el run se pausa en la MISMA transacción (el final nunca se
+        // reclama); reanudar → el final se genera y el run termina con el empaque RETENIDO (holdPackaging: ningún job);
+        // liberar la retención (acción explícita) → UN paquete automático. Las partes completas nunca se tocan. ──
+        {
+          const C7 = { key: 'E24s', title: '[E2E Worker IA E24s] Detener después del examen', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+            { title: 'Lubricación de bombas', objective: 'Lubricar bombas centrífugas', exam: true, chapters: [
+              { title: 'Aceites para rodamientos', v: false, a: false, objective: 'Elegir el aceite de un rodamiento' },
+              { title: 'Intervalos de relubricación', v: false, a: false, objective: 'Planificar la relubricación' },
+            ] }] };
+          llm.st.tag = 'E24s';
+          const c7 = await createCourse(C7, llm);
+          const body7 = { nombre: C7.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'real' };
+          let st7 = await api('POST', `/courses/${c7.courseId}/blueprints/${c7.n}/manifest/runs`, body7);
+          const est7 = /estimateId=([0-9a-f-]{36})/.exec(String(st7.error || ''));
+          if (st7.status === 409 && est7) {
+            await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                     values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E24s: aprobación (proveedores FALSOS locales)')`, [c7.courseId, est7[1]]);
+            st7 = await api('POST', `/courses/${c7.courseId}/blueprints/${c7.n}/manifest/runs`, body7);
+          }
+          ok(st7.status === 201, 'E24s: run creado (proveedores falsos locales, sin navegador)', { s: st7.status, e: st7.error });
+          c7.runId = st7.data.run.id;
+          CURRENT_RUN = c7.runId;
+          const R7 = `/courses/${c7.courseId}/blueprints/${c7.n}/manifest/runs/${c7.runId}`;
+          const [ex7] = await q(`select item_key from public.generation_item_runs where job_id = $1 and type = 'exam'`, [c7.runId]);
+          const [fi7] = await q(`select item_key from public.generation_item_runs where job_id = $1 and type = 'final_exam'`, [c7.runId]);
+          const bad7 = await api('PUT', `${R7}/stop-after`, { itemKeys: ['exam:no-existe'], holdPackaging: true });
+          eq(bad7.status, 404, 'E24s: una parte que no existe en el run → 404');
+          const badBody7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [ex7.item_key], holdPackaging: 'true' });
+          eq(badBody7.status, 400, 'E24s: holdPackaging que no es booleano → 400');
+          // Review M6: sin carrera con el worker — se pausa, se configura y se reanuda (el examen todavía no se generó).
+          const pz7 = await api('POST', `${R7}/pause`);
+          eq(pz7.status, 200, 'E24s: pausa previa a la configuración');
+          const ex7Before = (await q(`select status from public.generation_item_runs where job_id = $1 and item_key = $2`, [c7.runId, ex7.item_key]))[0];
+          ok(ex7Before.status !== 'completed', 'E24s: el examen de módulo todavía no estaba completo al configurar', ex7Before);
+          const set7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [ex7.item_key], holdPackaging: true });
+          ok(set7.status === 200 && set7.data && set7.data.stopAfter && set7.data.stopAfter.itemKeys[0] === ex7.item_key && set7.data.stopAfter.holdPackaging === true && set7.data.stopAfter.firedAt === null,
+            'E24s: PUT stop-after → la config queda en el run (por run, sin tocar DYNAMIC_AUTO_PACKAGE_ENABLED)', { s: set7.status, e: set7.error, sa: set7.data && set7.data.stopAfter });
+          const rz7 = await api('POST', `${R7}/resume`);
+          eq(rz7.status, 200, 'E24s: reanudar tras configurar');
+          const fakeBefore7 = fake.st.requests.length;
+          const paused7 = await waitFor('run E24s pausado por stop_after_item', async () => {
+            const [j] = await q(`select worker_status, output_summary from public.production_jobs where id = $1`, [c7.runId]);
+            return j && ['paused', 'completed', 'failed', 'cancelled', 'preview'].includes(j.worker_status) ? j : null;
+          }, 15 * 60 * 1000, 300);
+          const pause7 = paused7.output_summary && paused7.output_summary.pause;
+          ok(paused7.worker_status === 'paused' && pause7 && pause7.reason === 'stop_after_item' && pause7.pausedBy === 'system:stop_after_item' && paused7.output_summary.stopAfter.firedItemKey === ex7.item_key,
+            'E24s: el examen de módulo se completó (worker de IA) → el SERVIDOR pausó el run (reason stop_after_item), sin navegador', { ws: paused7.worker_status, pause: pause7, sa: paused7.output_summary && paused7.output_summary.stopAfter });
+          await sleep(4000); // margen: un worker que sondea cada 300 ms habría reclamado algo
+          const rowsP7 = await finished(c7.runId);
+          const exRow7 = rowsP7.find((i) => i.item_key === ex7.item_key);
+          const fiRow7 = rowsP7.find((i) => i.item_key === fi7.item_key);
+          ok(exRow7.status === 'completed' && fiRow7.status === 'pending' && fiRow7.attempt_count === 0,
+            'E24s: el examen final NUNCA se reclamó (pending, 0 intentos) aunque sus dependencias estaban completas', { ex: [exRow7.status], fin: [fiRow7.status, fiRow7.attempt_count] });
+          const claimedAfter7 = await q(`select item_key from public.generation_item_runs where job_id = $1 and claimed_at > $2::timestamptz`, [c7.runId, pause7.pausedAt]);
+          eq(claimedAfter7.map((x) => x.item_key), [], 'E24s: ninguna parte se reclamó después de la pausa del servidor');
+          const isFinal7 = (t) => /EXAM_BANK_FINAL_CHAPTER|evaluación FINAL del curso|EXAMEN FINAL/.test(t) && C7.modules[0].chapters.some((ch) => t.includes(ch.title));
+          const finalReqsPaused7 = fake.st.requests.length;
+          eq(fake.st.requests.slice(fakeBefore7).filter((r) => isFinal7(r.text)).length, 0, 'E24s: 0 llamadas de IA del examen final mientras está pausado');
+          const g7 = await api('GET', R7);
+          ok(g7.data && g7.data.paused === true && g7.data.pauseInfo && g7.data.pauseInfo.automatic === true && g7.data.pauseInfo.reason === 'stop_after_item' && g7.data.stopAfter.firedAt,
+            'E24s: GET → paused, pauseInfo automático stop_after_item, stopAfter.firedAt', g7.data && { p: g7.data.pauseInfo, sa: g7.data.stopAfter });
+          // Regresión: una parte completa nunca se vuelve a generar ni se toca (config sobre una parte completa → 409).
+          const done7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [ex7.item_key], holdPackaging: true });
+          ok(done7.status === 409 && /already_completed|ya están completas/.test(JSON.stringify(done7.raw || {})), 'E24s: stop-after sobre una parte YA completa → 409 (nunca la regenera)', { s: done7.status, e: done7.error });
+          // Volver a configurar solo la retención del empaque (sin detener) para que siga vigente tras el disparo.
+          const hold7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [], holdPackaging: true });
+          ok(hold7.status === 200 && hold7.data.stopAfter.holdPackaging === true && hold7.data.stopAfter.itemKeys.length === 0, 'E24s: retener solo el empaque (itemKeys vacío + holdPackaging)', { s: hold7.status, e: hold7.error });
+          const fp7 = async () => (await q(`select item_key, status, generation, attempt_count, max_attempts, md5(coalesce(output_summary::text, '')) os, updated_at::text u
+                                              from public.generation_item_runs where job_id = $1 and status = 'completed' order by item_key`, [c7.runId]));
+          const before7 = await fp7();
+          const res7 = await api('POST', `${R7}/resume`);
+          eq(res7.status, 200, 'E24s: reanudar (acción explícita) → 200');
+          const end7 = await waitFor('run E24s terminado', async () => {
+            const [j] = await q(`select worker_status, output_summary from public.production_jobs where id = $1`, [c7.runId]);
+            return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j : null;
+          }, 15 * 60 * 1000, 500);
+          const after7 = await finished(c7.runId);
+          ok(end7.worker_status === 'completed' && after7.every((i) => i.status === 'completed'), `E24s: tras reanudar el examen final se generó y el run terminó \`completed\` (${end7.worker_status})`, after7.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+          ok(fake.st.requests.slice(finalReqsPaused7).filter((r) => isFinal7(r.text)).length > 0, 'E24s: el detector de llamadas del examen final no es vacío (tras reanudar sí las ve)');
+          const stillSame7 = (await fp7()).filter((r) => before7.some((b) => b.item_key === r.item_key));
+          eq(stillSame7, before7, 'E24s: las partes que ya estaban completas quedaron INTACTAS (estado, generación, intentos, salida, updated_at)');
+          const gens7 = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and generation > 1`, [c7.runId]);
+          eq(gens7[0].n, 0, 'E24s: ninguna parte se regeneró (sin generaciones nuevas)');
+          const ap7 = end7.output_summary && end7.output_summary.autoPackage;
+          ok(ap7 && ap7.held && !ap7.eligibleAt, 'E24s: holdPackaging → el run completo queda con autoPackage.held (sin la marca eligibleAt)', ap7);
+          await sleep(6000);
+          const pk7 = await q(`select id from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1`, [c7.runId]);
+          eq(pk7.length, 0, 'E24s: completar el run NO encoló ningún paquete (empaque automático retenido para ESTE run)');
+          const g7b = await api('GET', R7);
+          ok(g7b.data && g7b.data.packageHold && g7b.data.packageHold.reason === 'stop_after_item' && g7b.data.completion && g7b.data.completion.generationComplete === true && g7b.data.completion.packageJob && g7b.data.completion.packageJob.auto === false,
+            'E24s: GET → packageHold visible; completion: generación completa y empaque NO automático (solo por acción explícita)', g7b.data && { h: g7b.data.packageHold, c: g7b.data.completion });
+          const rel7 = await api('POST', `${R7}/package-hold/release`);
+          eq(rel7.status, 200, 'E24s: liberar la retención (acción explícita) → 200');
+          const pkg7 = await waitFor('paquete final de E24s tras liberar la retención', async () => {
+            const jobs = await q(`select id, worker_status, input_payload from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c7.runId]);
+            return jobs.length && ['completed', 'failed'].includes(jobs[jobs.length - 1].worker_status) ? jobs : null;
+          }, 5 * 60 * 1000, 1000);
+          ok(pkg7.length === 1 && pkg7[0].input_payload.auto === true && pkg7[0].worker_status === 'completed', 'E24s: liberada la retención → UN paquete automático, completado', pkg7.map((j) => [j.worker_status, j.input_payload && j.input_payload.auto]));
+          const rel7b = await api('POST', `${R7}/package-hold/release`);
+          eq(rel7b.status, 409, 'E24s: liberar dos veces → 409 (sin segundo paquete)');
+          results.courses.E24s = { courseId: c7.courseId, runId: c7.runId, items: after7.length, pausedAt: pause7 && pause7.pausedAt, packageJob: pkg7[0] && pkg7[0].id };
+        }
+
         // ── Corrida 6 (Loop 9 fix I2 · configuración de STAGING): worker de IA HOSPEDADO en dynamic-provider-worker, pool de 1
         // conexión (DB_POOL_MAX_WORKER=1), 4 partes en paralelo. ≥ 4 partes en vuelo más largas que la lease → los latidos
         // las sostienen (sin leaseLost); drenaje (SIGTERM) con ≥ 3 en vuelo → se devuelven sin reservas desconocidas ni

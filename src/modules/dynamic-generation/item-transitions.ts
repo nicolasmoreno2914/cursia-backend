@@ -6,6 +6,7 @@ import { FailureSource, classifyFailure, currentRecoveryOf, extractFailureCode }
 import { AttemptOutcome, outcomeForFailure, recordItemFailure } from '../reliability/attempt-log';
 import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoHealPolicyFromEnv } from './auto-heal';
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
+import { applyStopAfterInTx, holdsPackaging, packageHoldReason } from './stop-after';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -278,8 +279,13 @@ export async function sweepRunExpiredLeases(qr: QueryRunner, jobId: string): Pro
  * lease_until/worker_id del run nunca se tocan (quedan NULL).
  */
 export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promise<string | null> {
-  const [job] = await qr.query(`select status, worker_status from public.production_jobs where id = $1`, [jobId]);
+  let [job] = await qr.query(`select id, status, worker_status, output_summary from public.production_jobs where id = $1`, [jobId]);
   if (!job || !isActiveRun(job)) return job?.worker_status ?? null;
+  // «Detener después de» (stop-after.ts): si la parte elegida ya se completó, el run se pausa ACÁ, en la misma
+  // transacción (fila del run bloqueada por el caller) — ningún claim posterior le entrega partes.
+  if (await applyStopAfterInTx(qr, job)) {
+    [job] = await qr.query(`select id, status, worker_status, output_summary from public.production_jobs where id = $1`, [jobId]);
+  }
 
   const rows: Array<{ status: string; n: number }> = await qr.query(
     // F78-BE2: solo la generación vigente de cada item (una regeneración en
@@ -328,17 +334,32 @@ export async function recomputeRunStatus(qr: QueryRunner, jobId: string): Promis
       // EV6 DoD BE-B: un run que llega a `completed` DESDE ESTE CAMBIO queda marcado para el empaque
       // automático (`output_summary.autoPackage.eligibleAt`, el inicio de su ventana de intentos). Los
       // runs completados antes nunca tienen la marca → el empaque automático jamás los toca.
+      // stop-after.ts (holdPackaging): con la retención vigente NO hay marca ni aviso post-commit — queda
+      // `autoPackage.held` y el paquete solo se arma por una acción explícita (manual o releasePackageHold).
+      const hold = holdsPackaging(job);
       await qr.query(
         `update public.production_jobs
             set status = $2::text, worker_status = $2::text, progress = 100,
                 finished_at = now(), error_message = null, next_retry_at = null, updated_at = now(),
-                output_summary = case when $2::text = 'completed'
-                  then coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now()))
+                output_summary = case
+                  when $2::text = 'completed' and $3::boolean
+                    then coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoPackage', jsonb_build_object('held', jsonb_build_object('at', now(), 'reason', $4::text)))
+                  when $2::text = 'completed'
+                    then coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoPackage', jsonb_build_object('eligibleAt', now()))
                   else output_summary end
           where id = $1`,
-        [jobId, verdict],
+        [jobId, verdict, hold, packageHoldReason(job)],
       );
-      if (verdict === 'completed') noteRunCompletedInTx(qr, jobId);
+      // stop-after (review r2 N1): el run se cerró con la config todavía ARMADA (la parte elegida se completó con el run
+      // pausado por otra causa) → queda vencida, así una reapertura posterior (regeneración) nunca dispara una pausa tardía.
+      await qr.query(
+        `update public.production_jobs
+            set output_summary = jsonb_set(output_summary, '{stopAfter}',
+                  (output_summary->'stopAfter') || jsonb_build_object('firedAt', now(), 'expiredAt', now()), true)
+          where id = $1 and jsonb_typeof(output_summary->'stopAfter') = 'object' and (output_summary->'stopAfter'->>'firedAt') is null`,
+        [jobId],
+      );
+      if (verdict === 'completed' && !hold) noteRunCompletedInTx(qr, jobId);
       return verdict;
     }
     const completion = evaluateRunCompletion({ ...inputs.job, worker_status: 'completed', status: 'completed' }, inputs.rows, inputs.manifest, null, { validationCutoffs: inputs.validationCutoffs });
