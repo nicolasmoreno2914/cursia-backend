@@ -35,8 +35,14 @@ export class AdminDynamicRunsController {
   // GET /api/v1/admin/dynamic-runs/:runId/items/:itemKey/llm-diagnostics — SOLO LECTURA (2026-10-14): payload exacto del
   // claim (transacción READ ONLY) + respuestas pagadas de sus puntos de guardado, para reproducir la parte a USD 0.
   @Get(':runId/items/:itemKey/llm-diagnostics')
-  llmDiagnosticsOf(@Param('runId', ParseUUIDPipe) runId: string, @Param('itemKey') itemKey: string): Promise<LlmItemDiagnostics> {
-    return this.llmDiagnostics.forItem(runId, itemKey);
+  // ?hash=<sha> (uno) · ?limit=N (primeros N). `truncated` = hay más (tope de cantidad o de bytes).
+  llmDiagnosticsOf(
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Param('itemKey') itemKey: string,
+    @Query('hash') hash?: string,
+    @Query('limit') limit?: string,
+  ): Promise<LlmItemDiagnostics> {
+    return this.llmDiagnostics.forItem(runId, itemKey, { hash: typeof hash === 'string' && hash ? hash : null, limit: limit === undefined ? null : Number(limit) });
   }
 
   // GET /api/v1/admin/dynamic-runs/needs-attention?limit=100
