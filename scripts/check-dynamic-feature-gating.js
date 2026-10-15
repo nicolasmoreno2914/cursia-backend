@@ -81,6 +81,7 @@ const { AdminDynamicRunsController } = loadDist('modules/dynamic-generation/admi
 const { AdminRecoveryService } = loadDist('modules/dynamic-generation/admin-recovery.service.js');
 const { VideogenReconciliationService } = loadDist('modules/dynamic-generation/videogen-reconciliation.service.js');
 const { PilotMetricsService } = loadDist('modules/dynamic-generation/pilot-metrics.service.js');
+const { LlmDiagnosticsService } = loadDist('modules/dynamic-generation/llm-diagnostics.service.js');
 const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
 const { PackagingController } = loadDist('modules/dynamic-packaging/packaging.controller.js');
 const { PackagingService } = loadDist('modules/dynamic-packaging/packaging.service.js');
@@ -277,6 +278,7 @@ async function buildApp() {
       { provide: AdminRecoveryService, useValue: fakeService('AdminRecoveryService') },
       { provide: VideogenReconciliationService, useValue: fakeService('VideogenReconciliationService') }, // V542 (G6)
       { provide: PilotMetricsService, useValue: fakeService('PilotMetricsService') }, // Loop 10 C2
+      { provide: LlmDiagnosticsService, useValue: fakeService('LlmDiagnosticsService') }, // 2026-10-14: diagnóstico de partes (SUPER_ADMIN)
       AppService,
       { provide: CoursesService, useValue: fakeService('CoursesService') },
       { provide: CourseStructureService, useValue: fakeService('CourseStructureService') },
