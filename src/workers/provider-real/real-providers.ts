@@ -66,6 +66,7 @@ import {
   GuardNextCall,
   LedgerWriteFailed,
   TTS_CHARS_PER_SECOND_ESTIMATE,
+  PROVIDER_RESERVATION_MARGIN,
   WorkerBudget,
   WorkerLedger,
   budgetExceededMessage,
@@ -80,6 +81,9 @@ import {
   settleGammaCharge,
   settlePaidCall,
   ttsChargeInput,
+  RunBudgetCapReached,
+  pauseRunForCap,
+  reservePaidCalls,
 } from '../finops-worker-hooks';
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
@@ -107,6 +111,7 @@ import {
   welcomeScriptFromCourseIntro,
   wordCount,
 } from './audio-scripts';
+import { llmCallUpperBoundUsage } from '../../modules/finops/llm-usage-ingest';
 
 type Env = Record<string, string | undefined>;
 
@@ -307,6 +312,25 @@ async function record(deps: RealProviderDeps, item: ClaimedItem, patch: Record<s
   if (!deps.scheduler.recordItemExternal) throw new Error('dynamic-provider-worker: scheduler sin recordItemExternal (modo real)');
   const ok = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, patch);
   if (!ok) throw new LeaseLost();
+}
+
+/**
+ * Review r2 (N1): marcador DURABLE de envío de una llamada pagada de una unidad pre-reservada (chunk de TTS, llamada
+ * del guion): se escribe en el item justo ANTES de llamar. Al re-reclamar, una reserva de unidad SIN marcador nunca
+ * salió → se libera (sin conciliación humana); con marcador sigue el camino de siempre.
+ */
+const PAID_CALLS_SENT_KEY = 'paidCallsSent';
+const sentByItem = new Map<string, Record<string, string>>();
+async function markPaidCallSent(deps: RealProviderDeps, item: ClaimedItem, resKey: string): Promise<void> {
+  const os = (item.outputSummary ?? {}) as Record<string, any>;
+  const cur = sentByItem.get(item.itemRunId) ?? { ...((os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object') ? os[PAID_CALLS_SENT_KEY] : {}) };
+  cur[resKey] = new Date().toISOString();
+  sentByItem.set(item.itemRunId, cur);
+  await record(deps, item, { [PAID_CALLS_SENT_KEY]: cur });
+}
+/** ¿Reserva de una unidad pre-reservada (chunk de TTS de bienvenida o llamada del guion por bloque)? */
+function isUnitReservationKey(key: string): boolean {
+  return /^reservation:tts:.*:chunk\d+$/.test(key) || /^reservation:llm:.*:sec\d+-(main|continuation|condense)$/.test(key);
 }
 
 async function heartbeat(deps: RealProviderDeps, item: ClaimedItem): Promise<void> {
@@ -742,11 +766,22 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
   const requestIds: Array<string | null> = [];
   const ttsTracker = deps.tracker;
   const paidTtsOps: string[] = [];
+  // FinOps atómico (review I4): el audio es UNA unidad — se reservan TODOS sus chunks antes del primero (todos o
+  // ninguno contra el tope del run); así nunca queda a medias por el tope. Los nunca llamados se liberan al salir.
+  const unitRes = chunks.map((c, idx) => ({
+    kind: 'tts' as const, ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
+    tag: `chunk${idx}`, estimate: { characters: c.length, model },
+  }));
+  const unitKeys: string[] = [];
+  const calledChunks = new Set<number>();
+  let unitDone = false;
+  try {
   for (let i = 0; i < chunks.length; i++) {
     // R16 (#1): solo ANTES del primer chunk (nada pagado sin persistir). A mitad del audio
     // se termina: devolverlo dejaría chunks pagados sin persistir (reconciliación).
     if (i === 0 && (await handBackIfDraining(deps, item, 'antes de sintetizar el audio (sin gasto)'))) return;
     await heartbeat(deps, item);
+    if (i === 0) unitKeys.push(...(await reservePaidCalls(deps.finops, unitRes)));
     const chunkIdx = i;
     // Calibración #2: reserva DURABLE del chunk antes de llamar (si falla, no se llama a OpenAI).
     const resKey = await reservePaidCall(deps.finops, {
@@ -754,6 +789,10 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
       tag: `chunk${chunkIdx}`, estimate: { characters: chunks[chunkIdx].length, model },
     });
     if (ttsTracker) ttsTracker.inFlight = { provider: 'openai', key: resKey };
+    // Review r2 (N1): marcador de ENVÍO antes de llamar — una reserva de la unidad sin marcador nunca salió y se libera
+    // sola al re-reclamar (caída dura del worker); con marcador, la de siempre (conciliación si no hay resultado).
+    await markPaidCallSent(deps, item, resKey);
+    calledChunks.add(chunkIdx);
     let res;
     try {
       res = await tts.speech({ model, voice, input: chunks[i] });
@@ -765,7 +804,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
         await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
         if (ttsTracker) ttsTracker.inFlight = null;
       }
-      return fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+      return await fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
     if (ttsTracker && ttsTracker.inFlight) ttsTracker.inFlight.opId = res.requestId;
     let seconds: number | null = null;
@@ -788,6 +827,19 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     requestIds.push(res.requestId);
     // Mismo transcode que tts.service (64 kbps mono; sin ffmpeg → el original, como hoy).
     parts.push(await transcodeMp3Bitrate(res.audio, TTS_TARGET_BITRATE_KBPS));
+  }
+  unitDone = true;
+  } finally {
+    // Reservas de chunks que NUNCA se enviaron (la unidad terminó antes): se liberan (sin gasto). Un chunk enviado
+    // con resultado incierto conserva su reserva (conciliación), como siempre.
+    if (!unitDone) {
+      for (let idx = 0; idx < unitKeys.length; idx++) {
+        if (!calledChunks.has(idx)) {
+          await settlePaidCall(deps.finops, unitKeys[idx], null, 'tts_unit_aborted_before_call').catch((e) =>
+            deps.logger.warn(`Item ${item.itemKey}: no se pudo liberar la reserva no enviada ${unitKeys[idx]} (${e instanceof Error ? e.message : String(e)}); se libera al re-reclamar`));
+        }
+      }
+    }
   }
   let mp3: Buffer;
   let durationSeconds: number;
@@ -922,10 +974,10 @@ export interface PersistedExtension {
 
 /** Costo estimado de UNA llamada (fix round 1, I5): el guard reserva esto, no el p90 del item entero. */
 function ttsCallEstimate(model: string, characters: number): GuardNextCall {
-  return { provider: 'openai', service: 'audio.speech', product: model, usage: { audio_seconds: Math.max(1, Math.ceil(characters / TTS_CHARS_PER_SECOND_ESTIMATE)) } };
+  return { provider: 'openai', service: 'audio.speech', product: model, usage: { audio_seconds: Math.max(1, Math.ceil((characters / TTS_CHARS_PER_SECOND_ESTIMATE) * PROVIDER_RESERVATION_MARGIN)) } };
 }
 function llmCallEstimate(model: string, promptChars: number, maxTokens: number): GuardNextCall {
-  return { provider: 'anthropic', service: 'messages', product: model, usage: { input_tokens: Math.max(1, Math.ceil(promptChars / 3)), output_tokens: Math.max(1, maxTokens) } };
+  return { provider: 'anthropic', service: 'messages', product: model, usage: llmCallUpperBoundUsage(promptChars, maxTokens) };
 }
 /** Cota de una llamada del guion antes de conocer el prompt (sistema + bloque de ~900 palabras + cola; salida máxima). */
 const LLM_CALL_PROMPT_CHARS_BOUND = 9000;
@@ -982,16 +1034,49 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const itemRole = providerCallRoleOf(item.attempt);
   let llmClient: AnthropicClient | null = null;
   /** Llamada pagada del guion (bloque o ampliación): guard por llamada → reserva → llamada → liquidación. */
+  // FinOps atómico (review I4): el guion de un bloque es UNA unidad (principal + continuación + condensación). Antes
+  // de la llamada principal se reservan las tres (todas o ninguna contra el tope): una continuación nunca se queda
+  // sin presupuesto con el principal ya pagado. Cota de continuación/condensación: su prompt incluye la salida del
+  // principal (≤ 4 caracteres × max_tokens) → prompt principal + 4·max_tokens, y max_tokens ≥ el de la principal.
+  const unitState = new Map<string, { keys: Map<string, string>; called: Set<string> }>();
+  const releaseUnitUnused = async (tag: string): Promise<void> => {
+    const st = unitState.get(tag);
+    if (!st) return;
+    for (const [role, key] of st.keys) {
+      if (!st.called.has(role)) {
+        await settlePaidCall(deps.finops, key, null, 'script_unit_unused').catch((e) =>
+          deps.logger.warn(`Item ${item.itemKey}: no se pudo liberar la reserva no enviada ${key} (${e instanceof Error ? e.message : String(e)}); se libera al re-reclamar`));
+      }
+    }
+    unitState.delete(tag);
+  };
   const llmFor = (tag: string, what: string, paidIds: string[]): ScriptLlm => async (prompt, role) => {
     await heartbeat(deps, item);
     if (!(await guard(deps, item, 'anthropic', llmCallEstimate(scriptModel, prompt.system.length + prompt.user.length, prompt.maxTokens)))) throw new BudgetBlocked();
-    // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama).
+    if (role === 'main' && !unitState.has(tag)) {
+      const mainChars = prompt.system.length + prompt.user.length;
+      // Review r2 (N4): la condensación tras una continuación incluye ambas salidas → cota con las dos.
+      const followChars = mainChars + 5 * (prompt.maxTokens + LLM_CALL_MAX_TOKENS_BOUND);
+      const followTokens = Math.max(prompt.maxTokens, LLM_CALL_MAX_TOKENS_BOUND);
+      const roles = ['main', 'continuation', 'condense'] as const;
+      const rs = roles.map((r) => ({
+        kind: 'llm' as const, ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt, tag: `${tag}-${r}`,
+        estimate: r === 'main' ? { promptChars: mainChars, maxTokens: prompt.maxTokens, model: scriptModel } : { promptChars: followChars, maxTokens: followTokens, model: scriptModel },
+      }));
+      const keys = await reservePaidCalls(deps.finops, rs);
+      unitState.set(tag, { keys: new Map(roles.map((r, i) => [r, keys[i]])), called: new Set() });
+    }
+    // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama). Dentro de una unidad ya reservada
+    // devuelve la reserva existente (idempotente, sin volver a contarla).
     const resKey = await reservePaidCall(deps.finops, {
       kind: 'llm', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
       tag: `${tag}-${role}`,
       estimate: { promptChars: prompt.system.length + prompt.user.length, maxTokens: prompt.maxTokens, model: scriptModel },
     });
     if (tracker) tracker.inFlight = { provider: 'anthropic', key: resKey };
+    // Review r2 (N1/N2): enviada = marcada justo antes de la llamada (nunca antes de la reserva).
+    await markPaidCallSent(deps, item, resKey);
+    unitState.get(tag)?.called.add(role);
     if (!llmClient) llmClient = new AnthropicClient(anthropicKey, env);
     let r;
     try {
@@ -1025,6 +1110,8 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const scriptFailure = async (err: unknown, where: string): Promise<'stop'> => {
     if (err instanceof LeaseLost) throw err;
     if (err instanceof BudgetBlocked) return 'stop';
+    // FinOps atómico (review I1): el tope se maneja arriba (pausa del run + devolución sin consumir intento).
+    if (err instanceof RunBudgetCapReached) throw err;
     if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable, { knownOutcome: true });
     const e = err instanceof ProviderCallError ? err : null;
     return fail(deps, item, `audiobook_script_failed: ${where}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
@@ -1050,9 +1137,11 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
         res = await generateSectionScript(input, section, full.sections.length, prevTail,
           llmFor(`sec${section.idx}`, `guion del bloque ${section.idx + 1} del audiolibro pagado sin persistir`, []));
       } catch (err) {
+        await releaseUnitUnused(`sec${section.idx}`);
         await scriptFailure(err, `bloque ${section.idx + 1}/${full.sections.length}`);
         return;
       }
+      await releaseUnitUnused(`sec${section.idx}`);
       sections[k] = {
         sourceSha: res.sourceSha, sourceWords: res.sourceWords, text: res.text, words: res.words, ratio: res.ratio,
         continued: res.continued, condensed: res.condensed, messageIds: res.messageIds, model: scriptModel,
@@ -1402,6 +1491,16 @@ export async function processRealProviderItem(deps: RealProviderDeps, item: Clai
       await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg.slice(0, 1900), false);
       throw new ProviderItemFailed(msg, false);
     }
+    if (err instanceof RunBudgetCapReached) {
+      // FinOps atómico: la reserva de la próxima llamada excedería el tope del run → no se llamó (0 gasto). Run
+      // pausado (run_budget_cap) y la parte vuelve a la cola sin consumir intento (igual que el guard).
+      await pauseRunForCap(deps.budget, err).catch(() => false);
+      await deps.scheduler.failItem(item.itemRunId, deps.executorId, runPausedHandbackMessage(item.type), true, undefined, {
+        retryAfterSeconds: DRAIN_HANDBACK_RETRY_SECONDS, grantAttempt: true,
+      });
+      deps.logger.warn(`Item ${item.itemKey}: ${err.message} — devuelto sin llamar al proveedor`);
+      return;
+    }
     if (err instanceof LedgerWriteFailed && !deps.finops) {
       // Worker real sin ledger FinOps: configuración, no transitorio. Nunca se llamó al proveedor.
       const msg = `finops_unavailable: ${detail}. No se llamó al proveedor (sin gasto); corregí la configuración del worker.`;
@@ -1413,6 +1512,10 @@ export async function processRealProviderItem(deps: RealProviderDeps, item: Clai
     const msg = `unexpected_error: ${detail}`;
     deps.logger.error(`Item ${item.itemKey}: ${msg}`);
     await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg.slice(0, 1900), true);
+  } finally {
+    // La copia en memoria de los marcadores de envío vive solo mientras se procesa el item (lo durable está en el
+    // item): un worker de larga vida no acumula una entrada por item procesado.
+    sentByItem.delete(item.itemRunId);
   }
 }
 
@@ -1467,7 +1570,12 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
     isPersistedOutput: (r) => !r.reservation && !!r.external_operation_id && persisted.has(r.external_operation_id),
     // Gamma: el marcador de envío se escribe DESPUÉS de la reserva y ANTES de llamar. Una reserva de
     // Gamma sin marcador que la nombre = la llamada nunca se hizo → se libera.
-    isSubmitMarked: (key) => !key.startsWith('reservation:gamma:') || key === markedKey,
+    isSubmitMarked: (key) => {
+      if (key.startsWith('reservation:gamma:')) return key === markedKey;
+      // Review r2 (N1): reserva de unidad sin marcador de envío = nunca salió → liberable.
+      if (isUnitReservationKey(key)) return !!(os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object' && os[PAID_CALLS_SENT_KEY][key]);
+      return true;
+    },
   });
   for (const r of releasable) await settlePaidCall(deps.finops, r.idempotency_key, null, 'reserved_without_submit_marker');
   if (!blocking.length) return false;

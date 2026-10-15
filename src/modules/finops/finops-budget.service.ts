@@ -2,7 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, normalizeDecimal, DecimalLike } from './decimal';
-import { PricingCatalogRow, priceUsage } from './pricing';
+import { PricingCatalogRow, conservativePrice, llmUpperBoundVariants, priceUsage } from './pricing';
 import { EstimateItem, EstimateResult, RetryPolicy, estimateCost } from './estimator';
 import { usageModelPriorsV1 } from './usage-model';
 import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, runtimeGuard } from './budget';
@@ -20,6 +20,7 @@ import {
   paidRealProviders,
 } from './run-budget';
 import { APPROVAL_TTL_HOURS, NORMAL_APPROVAL_REASON_PREFIX } from './normal-approval';
+import { llmCallUpperBoundUsage } from './llm-usage-ingest';
 
 /** Advisory lock global (por transacción) que serializa las aprobaciones del flujo normal frente al tope mensual. */
 export const MONTH_CAP_LOCK = 'finops-normal-approval-month-cap';
@@ -420,23 +421,7 @@ export class FinopsBudgetService {
    * (el guard falla cerrado: el item queda bloqueado con un motivo claro, nunca se llama sin poder acotar el gasto).
    */
   conservativeCallCost(usage: Record<string, number>, catalog: PricingCatalogRow[]): string {
-    const now = Date.now();
-    const open = catalog.filter((r) => !r.effective_to || new Date(r.effective_to as any).getTime() > now);
-    let total = normalizeDecimal(0);
-    for (const meter of Object.keys(usage)) {
-      let best: string | null = null;
-      for (const r of open.filter((x) => x.meter === meter)) {
-        try {
-          const amt = priceUsage({ [meter]: usage[meter] }, [r], { provider: r.provider, service: r.service, product: r.product_or_model }).amount;
-          if (best === null || cmpDec(amt, best) > 0) best = amt;
-        } catch {
-          /* fila no aplicable: se ignora */
-        }
-      }
-      if (best === null) throw new FinopsError('CALL_UNPRICED', `no hay ninguna tarifa para el medidor ${meter}`);
-      total = addDec(total, best);
-    }
-    return total;
+    return conservativePrice(usage, catalog);
   }
 
   /** Costo de UNA llamada pagada (p90, sin reintentos) de ese item type contra ese proveedor. */
@@ -691,10 +676,11 @@ export class FinopsBudgetService {
     if (['cancelled', 'cancelling', 'failed', 'completed'].includes(String(row.worker_status ?? ''))) {
       return { code: 'run_paused', message: `El run ya no está activo (${row.worker_status}): no se hacen llamadas nuevas.`, runId: row.job_id, paused: false };
     }
-    const nextCost = Number(await this.callCost({
-      provider: 'anthropic', service: 'messages', product: a.model,
-      usage: { input_tokens: Math.max(1, Math.ceil(a.promptChars / 3)), output_tokens: a.maxTokens },
-    }));
+    // Misma cota que la reserva (FinOps atómico): el máximo entre sus variantes de precio.
+    let nextCost = 0;
+    for (const v of llmUpperBoundVariants(llmCallUpperBoundUsage(a.promptChars, a.maxTokens))) {
+      nextCost = Math.max(nextCost, Number(await this.callCost({ provider: 'anthropic', service: 'messages', product: a.model, usage: v })));
+    }
     // Review I4: un presupuesto REVOCADO (BLOCKED) es tope 0 (falla cerrado, como en los workers); sin ninguna
     // autorización (runs previos a FinOps) no hay tope que aplicar acá.
     const [authRow] = await this.dataSource.query(

@@ -16,6 +16,9 @@
 // Ruido de formato (rev. I3, `noise: 'realistic'`, igual para el código actual y el nuevo): ids omitidos (3 %), lista a
 // medias (2 %), JSON inválido (2 %), respuesta truncada por max_tokens (1 %) y enunciado duplicado (3 %).
 //
+// Revisión de forma (2026-10-15, «EXAM_BANK_REVISION v1»): con probabilidad `pRev` (0,75) por candidata el modelo
+// corrige lo pedido (parche con los campos de una pregunta sana del mismo id); si no, la devuelve igual.
+//
 // Costo (USD) con la tabla real de Sonnet 4.6: salida por pregunta con los tokens medidos en #1542/#1353
 // (MC 660, V/F 265, EM 335); entrada = caracteres/3,6 (prefijo en caché: escritura la 1.ª llamada de cada
 // capítulo por intento, lectura después).
@@ -23,6 +26,7 @@
 
 const PRICE = { input: 3 / 1e6, output: 15 / 1e6, cacheRead: 0.3 / 1e6, cacheWrite: 3.75 / 1e6 };
 const TOKENS_EST = { multichoice: 660, truefalse: 265, match: 335 };
+const REVISION_TOKENS_EST = { multichoice: 450, truefalse: 160, match: 260 };
 const STRATEGY_MARKER = 'ESTRATEGIA ALTERNATIVA';
 
 function fnv(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h >>> 0; }
@@ -69,10 +73,10 @@ const PARAPHRASE = 'Es importante valorar con calma el contexto de la persona en
  * opts = { profile: 'a'|'b'|'c', seed, x (prob. base por código), refFix, stuck: { chapterId, type, capacity } }.
  */
 function createSimLlm(front, opts) {
-  const o = Object.assign({ x: 0.18, refFix: 0.5, profile: 'a', pB: 0.6, noise: 'realistic' }, opts);
+  const o = Object.assign({ x: 0.18, refFix: 0.5, profile: 'a', pB: 0.6, noise: 'realistic', pRev: 0.75 }, opts);
   const NZ = o.noise === 'realistic' ? { omit: 0.03, partial: 0.02, badJson: 0.02, truncate: 0.01, dup: 0.03 } : { omit: 0, partial: 0, badJson: 0, truncate: 0, dup: 0 };
   const firstStem = new Map(); // chapter|type → enunciado de la primera válida (para duplicados)
-  const st = { calls: 0, repairCalls: 0, mainCalls: 0, strategyCalls: 0, questions: 0, outputTokens: 0, inTail: 0, cacheRead: 0, cacheWrite: 0, usd: 0, faults: {}, stuckValid: 0, warm: new Set(), unknownPrompts: 0 };
+  const st = { calls: 0, repairCalls: 0, mainCalls: 0, revisionCalls: 0, revisionAsked: 0, revisionFixed: 0, strategyCalls: 0, questions: 0, outputTokens: 0, inTail: 0, cacheRead: 0, cacheWrite: 0, usd: 0, faults: {}, stuckValid: 0, warm: new Set(), unknownPrompts: 0 };
   const citCache = new Map();
   function citable(md) {
     if (citCache.has(md)) return citCache.get(md);
@@ -97,8 +101,11 @@ function createSimLlm(front, opts) {
     const md = (/<<<CAPITULO\n([\s\S]*?)\nCAPITULO>>>/.exec(prompt) || [])[1] || '';
     const refs = [...md.matchAll(/\[(S\d+)\]\s*([^\n[]+)/g)].map((m) => ({ ref: m[1], text: m[2].trim() }));
     const repairAt = prompt.search(/\nEXAM_BANK_REPAIR v\d+\n/);
+    const revisionAt = prompt.search(/\nEXAM_BANK_REVISION v\d+\n/);
     const asks = [];
-    if (repairAt >= 0) {
+    if (revisionAt >= 0) {
+      for (const m of prompt.slice(revisionAt).matchAll(/^- id "([^"]+)" \(type "([a-z]+)"[^\n]*\n {2}PREGUNTA: (.*)\n {2}CORREGIR: /gm)) asks.push({ id: m[1], type: m[2], question: JSON.parse(m[3]) });
+    } else if (repairAt >= 0) {
       for (const m of prompt.slice(repairAt).matchAll(/^- id "([^"]+)" \(type "([a-z]+)"[^)]*\) → (.*)$/gm)) asks.push({ id: m[1], type: m[2], reasons: m[3] });
     } else {
       for (const line of lines) {
@@ -115,7 +122,7 @@ function createSimLlm(front, opts) {
         ids.forEach((id) => asks.push({ id, type: t[1] }));
       }
     }
-    return { chapterId, md, refs, refMode: refs.length > 0 && /evidenceRef/.test(prompt), isRepair: repairAt >= 0, strategy: prompt.includes(STRATEGY_MARKER), asks };
+    return { chapterId, md, refs, refMode: refs.length > 0 && /evidenceRef/.test(prompt), isRepair: repairAt >= 0, isRevision: revisionAt >= 0, strategy: prompt.includes(STRATEGY_MARKER), asks };
   }
   function pickFault(rng, type) {
     const x = o.x;
@@ -175,6 +182,7 @@ function createSimLlm(front, opts) {
     const p = parse(prompt);
     if (!p) { st.unknownPrompts++; return { httpStatus: 400, error: 'sim: prompt no reconocido' }; }
     st.calls++;
+    if (p.isRevision) return reviseCall(p, blocks, prompt);
     if (p.isRepair) st.repairCalls++; else st.mainCalls++;
     if (p.strategy) st.strategyCalls++;
     const rng = rngFor(fnv(`${o.seed}|${st.calls}`));
@@ -217,6 +225,40 @@ function createSimLlm(front, opts) {
     if (callR >= NZ.partial && callR < NZ.partial + NZ.badJson) { st.faults.BAD_JSON = (st.faults.BAD_JSON || 0) + 1; st.usd += usd; return { text: '{"questions": [ esto no es JSON' }; }
     if (callR >= NZ.partial + NZ.badJson && callR < NZ.partial + NZ.badJson + NZ.truncate) { st.faults.TRUNCATED = (st.faults.TRUNCATED || 0) + 1; st.usd += usd; return { text: JSON.stringify({ questions: qs }).slice(0, 200), stopReason: 'max_tokens' }; } if (p.isRepair) st.repairQuestions = (st.repairQuestions || 0) + qs.length; else st.mainQuestions = (st.mainQuestions || 0) + qs.length; st.inTail += inTail; st.usd += usd;
     return { text: JSON.stringify({ questions: qs }) };
+  }
+  // Revisión: el modelo corrige los campos de forma (pregunta sana del mismo id) con probabilidad pRev; si no, nada cambia.
+  function reviseCall(p, blocks, prompt) {
+    st.revisionCalls++;
+    const rng = rngFor(fnv(`${o.seed}|rev|${st.calls}`));
+    // rev. M9: el mismo ruido de formato que las demás llamadas (ids omitidos, JSON inválido).
+    const callR = rng();
+    const revisions = p.asks.filter(() => rng() >= NZ.omit).map((ask) => {
+      st.revisionAsked++;
+      if (rng() >= o.pRev) return { id: ask.id };
+      // La capacidad de la hoja atascada (perfiles b/c/c2) acota TODAS las válidas, también las corregidas por revisión.
+      const isStuck = o.stuck && o.profile !== 'a' && p.chapterId === o.stuck.chapterId && ask.type === o.stuck.type;
+      if (isStuck && st.stuckValid >= o.stuck.capacity) return { id: ask.id };
+      if (isStuck) st.stuckValid++;
+      st.revisionFixed++;
+      const ok = build(ask, p, rng, { fault: null });
+      const patch = { id: ask.id, explanation: ok.explanation };
+      if (!('evidence' in ask.question) && !('evidenceRef' in ask.question)) patch.evidenceRef = ok.evidenceRef;
+      if (ask.type === 'multichoice') { patch.correct = ok.correct; patch.distractors = ok.distractors; }
+      if (ask.type === 'truefalse') patch.whyWrong = ok.whyWrong;
+      if (ask.type === 'match') patch.pairs = ok.pairs;
+      return patch;
+    });
+    const prefix = blocks.length >= 2 ? (blocks[0].text + blocks[1].text).length : 0;
+    const inTail = Math.ceil((prompt.length - prefix) / 3.6);
+    const pre = Math.ceil(prefix / 3.6);
+    const outTok = p.asks.reduce((t, a) => t + REVISION_TOKENS_EST[a.type], 0);
+    // Sale justo después de la llamada principal del capítulo: el prefijo ya está en caché (lectura).
+    const key = `${p.chapterId}|${o.attempt || 1}`;
+    let usd = outTok * PRICE.output + inTail * PRICE.input;
+    if (!st.warm.has(key)) { st.warm.add(key); st.cacheWrite += pre; usd += pre * PRICE.cacheWrite; } else { st.cacheRead += pre; usd += pre * PRICE.cacheRead; }
+    st.outputTokens += outTok; st.inTail += inTail; st.usd += usd;
+    if (callR < NZ.badJson) { st.faults.BAD_JSON = (st.faults.BAD_JSON || 0) + 1; return { text: '{"revisions": [ esto no es JSON' }; }
+    return { text: JSON.stringify({ revisions }) };
   }
   return { respond, st, setAttempt: (a) => { o.attempt = a; }, citable };
 }

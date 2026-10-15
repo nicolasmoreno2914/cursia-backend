@@ -127,7 +127,20 @@ export class FinopsLlmReservationController {
         });
         if (deny) throw new ConflictException({ code: deny.code, message: deny.message, runId: deny.runId, paused: deny.paused });
       }
-      const r = await this.ledger.recordCharge(llmReservationToChargeInput(parsed));
+      let r;
+      try {
+        r = await this.ledger.recordCharge(llmReservationToChargeInput(parsed));
+      } catch (err) {
+        // FinOps atómico: otra reserva concurrente del run llegó antes al tope → el proxy no llama y el run se pausa.
+        if (err instanceof FinopsError && err.code === 'RUN_BUDGET_CAP') {
+          const d = (err.details ?? {}) as Record<string, unknown>;
+          const runId = String(d.runId ?? '');
+          const detail = err.message.replace(/^RUN_BUDGET_CAP:\s*/, '');
+          const paused = runId ? await this.budget.pauseRunBySystem(runId, 'run_budget_cap', detail, Number(d.requiredUsd ?? NaN) || null).catch(() => false) : false;
+          throw new ConflictException({ code: 'run_paused', message: 'Pausa automática: se alcanzó el presupuesto autorizado del run: ' + detail, runId, paused });
+        }
+        throw err;
+      }
       // Review (minor 6): un callId repetido cuya reserva ya se cerró no cubre una llamada NUEVA → 409 (el proxy no llama).
       if (!r.inserted && (await this.ledger.reservationSettled(llmProxyReservationKey(parsed.callId)))) {
         throw new FinopsError('INVALID_INPUT', `la reserva del callId ${parsed.callId} ya está cerrada: usa un callId nuevo`);

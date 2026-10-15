@@ -347,8 +347,11 @@ async function dbChecks() {
     const C = await makeCourse('Presupuesto de recuperación');
     const est = await budget.runItemEstimates(C.runId);
     const k1 = `content:${C.c1}`;
-    // Misma cota de llamada que usa el guard (36 000 caracteres → 12 000 tokens de entrada + 8 000 de salida).
-    const bound = Number(await budget.callCost({ provider: 'anthropic', service: 'messages', product: 'claude-sonnet-4-6', usage: { input_tokens: 12000, output_tokens: 8000 } }));
+    // Misma cota de llamada que usa el guard (FinOps atómico: llmCallUpperBoundUsage + máximo de sus variantes de precio).
+    let bound = 0;
+    for (const v of F.llmUpperBoundVariants(F.llmCallUpperBoundUsage(36000, 8000))) {
+      bound = Math.max(bound, Number(await budget.callCost({ provider: 'anthropic', service: 'messages', product: 'claude-sonnet-4-6', usage: v })));
+    }
     const hard1 = G.itemHardLimit(est.byKey.get(k1).expected, est.byKey.get(k1).max, bound);
 
     await check('DB escenario 6: una parte que gasta MÁS de lo esperado sigue recuperándose dentro de su margen y se detiene SOLO al alcanzar su límite (exceso máx. 1 llamada)', async () => {
@@ -540,6 +543,23 @@ async function dbChecks() {
       assert(row.status !== 'failed', 'no queda fallida por la pausa: ' + JSON.stringify(row));
     });
 
+    await check('DB review r2 (N3): tope alcanzado ANTES de cualquier sobregasto → lo niega el guard (requiredUsd = gastado + la llamada negada, ESTRICTAMENTE mayor); reanudar con una ampliación menor a eso sigue rechazado', async () => {
+      const Q = await makeCourse('Tope sin sobregasto');
+      const [estQ] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [Q.runId]);
+      // Autorización menor que UNA reserva: la primera llamada ya no cabe (nada gastado, ningún sobregasto).
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, 0.001, 'ADMIN_APPROVED', 'tope mínimo', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id]);
+      const it = await itemOf(Q, `content:${Q.c1}`);
+      const r = await proxyCall(it.id);
+      eq(r.denied && r.denied.code, 'run_paused', 'negada por el tope');
+      const p0 = (await runRow(Q.runId)).output_summary.pause;
+      const spentQ = await runSpent(Q.runId);
+      assert(p0.reason === 'run_budget_cap' && !p0.overshoot && Number(p0.requiredUsd) > spentQ, `requiredUsd ${p0.requiredUsd} > gastado ${spentQ} (sin overshoot)`);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'ampliación corta', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id, ((spentQ + Number(p0.requiredUsd)) / 2).toFixed(6)]);
+      let e = null;
+      try { await runs.resumeRun(Q.cid, OWNER, 1, Q.runId); } catch (err) { e = err; }
+      assert(e && e.getResponse().code === 'run_budget_cap', 'ampliación insuficiente → sigue rechazado');
+    });
+
     await check('DB review I3 + I4: pausa por TOPE del run → reanudar sin ampliar el presupuesto se rechaza con un motivo claro; presupuesto REVOCADO (BLOCKED) → el navegador no gasta', async () => {
       const Q = await makeCourse('Tope del run');
       const auth = Number(await budget.runAuthorizedBudget(Q.runId));
@@ -556,10 +576,12 @@ async function dbChecks() {
       // Re-review N2: ampliar a algo por ENCIMA de lo gastado pero por debajo de lo que pedía la llamada negada → sigue rechazado.
       const req = Number((await runRow(Q.runId)).output_summary.pause.requiredUsd);
       const spentQ = await runSpent(Q.runId);
-      assert(req > spentQ, `requiredUsd (${req}) > gastado (${spentQ})`);
+      // FinOps atómico (review M3): si el cargo REAL superó su reserva y dejó el run sobre el tope, la pausa llega al
+      // liquidar (overshoot) con requiredUsd = gastado; si la negó el guard, requiredUsd = gastado + la llamada negada.
+      assert(req >= spentQ, `requiredUsd (${req}) ≥ gastado (${spentQ})`);
       const [estQ] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [Q.runId]);
-      await budget.adminAuthorize({ courseId: Q.cid, runId: Q.runId, authorizedBudget: ((spentQ + req) / 2).toFixed(4), approvedBy: 'admin@cursia.test', reason: 'ampliación corta' }).catch(async () => {
-        await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'ampliación corta', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id, ((spentQ + req) / 2).toFixed(4)]);
+      await budget.adminAuthorize({ courseId: Q.cid, runId: Q.runId, authorizedBudget: (req > spentQ ? (spentQ + req) / 2 : spentQ - 0.0001).toFixed(4), approvedBy: 'admin@cursia.test', reason: 'ampliación corta' }).catch(async () => {
+        await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'ampliación corta', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id, (req > spentQ ? (spentQ + req) / 2 : spentQ - 0.0001).toFixed(4)]);
       });
       let e2 = null;
       try { await runs.resumeRun(Q.cid, OWNER, 1, Q.runId); } catch (err) { e2 = err; }

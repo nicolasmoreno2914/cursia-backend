@@ -46,9 +46,11 @@ import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService, ITEM_RECOVERY_BUDGET_REASON, RUN_PAUSED_GUARD_REASON } from '../modules/finops/finops-budget.service';
 import { itemRecoveryBudgetMessage } from '../modules/finops/run-spend-guard';
 import {
+  RunBudgetCapReached,
   WorkerBudget,
   WorkerLedger,
   blockWithoutGuard,
+  pauseRunForCap,
   budgetExceededMessage,
   finalizeVideogenCharge,
   priorPaidOperations,
@@ -726,10 +728,22 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           await scheduler.failItem(item.itemRunId, deps.executorId, reconciliationMessage('videogen', 'render pagado de un intento anterior sin resolver', `${what}. No se envió un video nuevo.`).slice(0, 1900), false);
           return;
         }
-        resKey = await reservePaidCall(deps.finops, {
-          kind: 'videogen', ownerId: runHead.ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1,
-          itemAttempt: item.attempt, tag: 'submit', estimate: {},
-        });
+        try {
+          resKey = await reservePaidCall(deps.finops, {
+            kind: 'videogen', ownerId: runHead.ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1,
+            itemAttempt: item.attempt, tag: 'submit', estimate: {},
+          });
+        } catch (e) {
+          if (!(e instanceof RunBudgetCapReached)) throw e;
+          // FinOps atómico: la reserva excedería el tope del run (otra reserva concurrente llegó antes) → sin envío,
+          // run pausado (run_budget_cap) y la parte vuelve a la cola sin consumir intento.
+          await pauseRunForCap(deps.budget, e).catch(() => false);
+          logger.warn(`Item ${item.itemKey} (run ${item.runId}): ${e.message} — no se envía a Videogen; la parte vuelve a la cola`);
+          await scheduler.failItem(item.itemRunId, deps.executorId, runPausedHandbackMessage('Videogen'), true, undefined, {
+            retryAfterSeconds: DRAIN_HANDBACK_RETRY_SECONDS, grantAttempt: true,
+          });
+          return;
+        }
       }
 
       const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {

@@ -6,6 +6,8 @@
 //   EXAM_BANK_FINAL_CHAPTER v2  examen final, un capítulo de un módulo
 //   EXAM_BANK_FINAL_MODULE v1   examen final, un módulo con todos sus capítulos (prompt de F1; F2 ya no lo usa)
 //   EXAM_BANK_REPAIR v2         reparación dirigida (mismo prefijo fuente + tarea; la lista va en el tail)
+//   EXAM_BANK_REVISION v1       revisión de FORMA (2026-10-15): corrige los campos indicados de una candidata rechazada
+//                               (parche { revisions: [{ id, …campos }] }); la falla LENGTH_BIAS inyectada es de forma
 // y responde EXACTAMENTE los ids pedidos, con el esquema que ve el LLM (5 distractores por
 // selección múltiple) y la evidencia copiada TEXTUAL del Markdown del capítulo que trae el prompt.
 //
@@ -28,6 +30,7 @@ const BANK_MARKERS = {
   'EXAM_BANK_FINAL_MODULE v1': 'final',
 };
 const REPAIR_MARKER = 'EXAM_BANK_REPAIR v2';
+const REVISION_MARKER = 'EXAM_BANK_REVISION v1';
 const FAULT_TOTAL = 6;
 const SOURCE_MARKER = 'EXAM_BANK_SOURCE v2';
 const TYPE_IDX = { multichoice: 0, truefalse: 1, match: 2 };
@@ -107,12 +110,14 @@ function parseBankPrompt(prompt) {
   const taskMarker = lines.find((l) => BANK_MARKERS[l]);
   const repairAt = lines.indexOf(REPAIR_MARKER);
   const isRepair = repairAt >= 0;
+  const revisionAt = lines.indexOf(REVISION_MARKER);
+  const isRevision = revisionAt >= 0;
   if (!taskMarker) {
-    if (isRepair || lines[0] === SOURCE_MARKER) throw new Error('fake banco: prompt de banco sin marcador de tarea');
+    if (isRepair || isRevision || lines[0] === SOURCE_MARKER) throw new Error('fake banco: prompt de banco sin marcador de tarea');
     return null;
   }
   if (taskMarker !== 'EXAM_BANK_FINAL_MODULE v1' && lines[0] !== SOURCE_MARKER) throw new Error(`fake banco: la fuente del capítulo no va primero (línea 1 "${lines[0]}")`);
-  const marker = isRepair ? REPAIR_MARKER : taskMarker;
+  const marker = isRepair ? REPAIR_MARKER : isRevision ? REVISION_MARKER : taskMarker;
   const base = prompt;
   const scope = BANK_MARKERS[taskMarker];
   const chm = /Todas las preguntas llevan "chapterId": "([^"]+)"(?: y "moduleId": "([^"]+)")?/.exec(base);
@@ -130,7 +135,10 @@ function parseBankPrompt(prompt) {
   const moduleId = scope === 'final' ? ((chm && chm[2]) || (mom && mom[1]) || null) : null;
   if (scope === 'final' && !moduleId) throw new Error('fake banco: prompt del examen final sin moduleId');
   const asks = [];
-  if (isRepair) {
+  if (isRevision) {
+    const tail = lines.slice(revisionAt).join('\n');
+    for (const m of tail.matchAll(/^- id "([^"]+)" \(type "([a-z]+)", chapterId "([^"]+)"[^\n]*\n {2}PREGUNTA: (.*)\n {2}CORREGIR: (.*)$/gm)) asks.push({ id: m[1], type: m[2], chapterId: m[3], question: JSON.parse(m[4]), fixes: m[5] });
+  } else if (isRepair) {
     const head = lines.slice(repairAt).join('\n');
     for (const m of head.matchAll(/^- id "([^"]+)" \(type "([a-z]+)"[^)]*\) → (.*)$/gm)) asks.push({ id: m[1], type: m[2], reasons: m[3] });
   } else {
@@ -142,9 +150,9 @@ function parseBankPrompt(prompt) {
       for (const id of ids) asks.push({ id, type: t[1] });
     }
   }
-  if (!asks.length) throw new Error(`fake banco: ${isRepair ? 'reparación' : 'pedido'} sin ids`);
+  if (!asks.length) throw new Error(`fake banco: ${isRepair ? 'reparación' : isRevision ? 'revisión' : 'pedido'} sin ids`);
   const refMode = /"evidenceRef"/.test(base) && chapters.every((c) => c.refs && c.refs.length);
-  return { marker, isRepair, scope, chapters, moduleId, asks, refMode };
+  return { marker, isRepair, isRevision, scope, chapters, moduleId, asks, refMode };
 }
 
 /** Evidencia: la primera línea de prosa del capítulo de 40–220 caracteres, copiada TEXTUAL. */
@@ -236,6 +244,25 @@ function createExamBankFake({ contract, rec, once, st }) {
     st.examBank.blockShapes.push(Array.isArray(blocks) ? blocks.map((b) => (b && b.cache_control ? b.cache_control.type : null)) : null);
     if (!contract || typeof contract.validateExamBank !== 'function') throw new Error('fake banco: falta el contrato B2 (validateExamBank) para validar las respuestas');
     const retry = /TU RESPUESTA ANTERIOR NO SE PUDO USAR/.test(prompt);
+    if (parsed.isRevision) {
+      // Revisión: la pregunta sana del mismo id (validada con el contrato B2) es la corrección; se devuelven solo los
+      // campos de forma. Solo puede llegar por la falla LENGTH_BIAS inyectada (las de evidencia no son de forma).
+      const fixed = parsed.asks.map((a) => makeQuestion(a, parsed.chapters[0], parsed.scope, parsed.moduleId, null, parsed.refMode));
+      assertContract(contract, parsed, fixed, {});
+      st.examBank.revisions = st.examBank.revisions || [];
+      st.examBank.revisions.push({ chapterId: parsed.chapters[0].id, ids: parsed.asks.map((a) => a.id), fixes: parsed.asks.map((a) => a.fixes) });
+      rec('exam_bank_revision', parsed.chapters[0].id, { scope: parsed.scope, ids: parsed.asks.map((a) => a.id) });
+      const revisions = fixed.map((q, i) => {
+        const patch = { id: q.id, explanation: q.explanation };
+        const orig = parsed.asks[i].question;
+        if (!('evidence' in orig) && !('evidenceRef' in orig)) { if ('evidenceRef' in q) patch.evidenceRef = q.evidenceRef; }
+        if (q.type === 'multichoice') { patch.correct = q.correct; patch.distractors = q.distractors; }
+        if (q.type === 'truefalse') patch.whyWrong = q.whyWrong;
+        if (q.type === 'match') patch.pairs = q.pairs;
+        return patch;
+      });
+      return { text: JSON.stringify({ revisions }) };
+    }
     const faults = {};
     // Falla UNA vez por corrida: primer pedido (no reparación ni reintento) de un examen de módulo con ≥ 4 MC
     // (más fallas que la holgura de la hoja: si no, el ejecutor las absorbe sin reparar).
@@ -279,4 +306,4 @@ function createExamBankFake({ contract, rec, once, st }) {
   };
 }
 
-module.exports = { createExamBankFake, parseBankPrompt, BANK_MARKERS, REPAIR_MARKER, SOURCE_MARKER };
+module.exports = { createExamBankFake, parseBankPrompt, BANK_MARKERS, REPAIR_MARKER, REVISION_MARKER, SOURCE_MARKER };

@@ -662,7 +662,11 @@ async function dbChecks() {
       const s = row.output_summary.audiobookSections && row.output_summary.audiobookSections['0'];
       assert(s && s.ratio >= 0.85 && s.ratio <= 1.1 && s.continued && s.messageIds.join() === calls.map((c) => c.id).join(), `guion persistido ${JSON.stringify(s && [s.words, s.ratio])}`);
       const llmEv = await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id]);
-      eq((await reservationsOf(row.id, 'anthropic')).map((x) => x.settled), [true, true], 'reservas LLM liquidadas');
+      // FinOps atómico (review I4): la unidad del bloque reserva principal + continuación + condensación juntas; la
+      // condensación no se usó → liberada (sin gasto). Todas cerradas.
+      const unitRes = await reservationsOf(row.id, 'anthropic');
+      eq(unitRes.map((x) => x.settled), [true, true, true], 'reservas LLM liquidadas (unidad de 3, la no usada liberada)');
+      eq(unitRes.map((x) => x.idempotency_key.replace(/^.*:/, '')).sort(), ['sec0-condense', 'sec0-continuation', 'sec0-main'], 'unidad del bloque');
       eq(llmEv.map((e) => [e.operation, e.call_role, e.cost_source, e.external_operation_id, e.idempotency_key]),
         calls.map((c, i) => ['llm.audiobook_script', i === 0 ? 'main' : 'continuation', 'CALCULATED_FROM_USAGE', c.id, `anthropic:msg:${c.id}`]), 'eventos LLM');
       assert(near(llmEv[0].amount, 1200 * 3 / 1e6 + 640 * 15 / 1e6), `monto main ${llmEv[0].amount}`);
@@ -856,8 +860,10 @@ async function dbChecks() {
       let row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'failed', `reconciliación (${row.error})`);
       const resv = await reservationsOf(row.id, 'anthropic');
-      eq(resv.map((x) => [x.settled, x.operation, x.idempotency_key, Number(x.usage.output_tokens) > 0]),
-        [[false, 'llm.audiobook_script', `reservation:llm:${row.id}:g1:a1:sec0-main`, true]], 'reserva LLM');
+      eq(resv.filter((x) => !x.settled).map((x) => [x.settled, x.operation, x.idempotency_key, Number(x.usage.output_tokens) > 0]),
+        [[false, 'llm.audiobook_script', `reservation:llm:${row.id}:g1:a1:sec0-main`, true]], 'reserva LLM (la enviada queda pendiente)');
+      eq(resv.filter((x) => x.settled).map((x) => x.idempotency_key).sort(),
+        [`reservation:llm:${row.id}:g1:a1:sec0-condense`, `reservation:llm:${row.id}:g1:a1:sec0-continuation`], 'unidad: continuación y condensación (nunca enviadas) liberadas');
       eq((await events(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin TTS');
       await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
       const again = await claimProvider(runA2, 'audiobook_chapter');
@@ -865,7 +871,7 @@ async function dbChecks() {
       row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
       eq((await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).map((x) => x.measurement_status), ['final'], 'cargo medido del intento reconocido');
-      eq((await reservationsOf(row.id, 'anthropic')).map((x) => x.settled)[0], false, 'la reserva ambigua queda (reconocida)');
+      eq((await reservationsOf(row.id, 'anthropic')).find((x) => x.idempotency_key === `reservation:llm:${row.id}:g1:a1:sec0-main`).settled, false, 'la reserva ambigua queda (reconocida)');
       assert(fakes.st.llm.length - llm0 >= 2, 'la llamada ambigua + la nueva');
     });
 
@@ -880,7 +886,9 @@ async function dbChecks() {
         return async (...a) => { if (failOn(String(k), a)) throw FAULT(); return v.apply(t, a); };
       },
     });
-    const isReservationWrite = (k, a) => k === 'recordCharge' && String((a[0] && a[0].idempotencyKey) || '').startsWith('reservation:');
+    // FinOps atómico (review I4): una unidad se reserva por lote (recordReservationBatch) — también es una escritura de reserva.
+    const isReservationWrite = (k, a) => (k === 'recordCharge' && String((a[0] && a[0].idempotencyKey) || '').startsWith('reservation:')) ||
+      (k === 'recordReservationBatch' && Array.isArray(a[0]) && a[0].some((x) => String((x && x.idempotencyKey) || '').startsWith('reservation:')));
     const onlyOnce = (pred) => { let used = false; return (k, a) => { if (!used && pred(k, a)) { used = true; return true; } return false; }; };
     async function freshRun(title, videos = false) {
       setReady();
@@ -898,6 +906,90 @@ async function dbChecks() {
     const delta = (c0) => { const c = counts(); return { gamma: c.g - c0.g, tts: c.t - c0.t, llm: c.l - c0.l }; };
     const retryNow = (id) => ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [id]);
     const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400' };
+
+    // Review r2 (M8/N1): bienvenida LARGA (3 chunks de TTS) — la unidad se reserva completa y lo nunca enviado se libera.
+    const LONG_WELCOME = Array.from({ length: 150 }, (_, i) => `Esta es la oración ${i + 1} de la bienvenida al curso de hidráulica de planta, pensada para técnicos de mantenimiento.`).join(' ');
+    async function freshLongWelcomeRun(title) {
+      setReady();
+      const K = await makeCourse(title, { videos: false });
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /^budget_approval_required/, `aprobación ${title}`, 409);
+      await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
+      const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' })).run.id;
+      await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: LONG_WELCOME }), 'application/json');
+      return { ...K, rid };
+    }
+    const ttsKeys = (rowId, attempt = 1) => [0, 1, 2].map((i) => `reservation:tts:${rowId}:g1:a${attempt}:chunk${i}`);
+
+    await check('unidad multi-chunk (review r2 M8): bienvenida de varios chunks (≥ 3), el 2.º se corta DESPUÉS de enviar → reconciliación; chunk 1 liquidado, chunk 2 pendiente (enviado, con marcador), chunk 3 (nunca enviado) LIBERADO al salir', async () => {
+      const R = await freshLongWelcomeRun('Bienvenida larga corte');
+      fakes.plan.ttsFail = ['ok', 'drop']; // 'ok' (no es número ni drop/hang) = respuesta normal
+      const tts0 = fakes.st.tts.length;
+      const item = await claimProvider(R.rid, 'audio_welcome');
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'drop en el chunk 2');
+      fakes.plan.ttsFail = [];
+      const row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, fakes.st.tts.length - tts0], ['failed', 2], 'dos envíos (los siguientes nunca)');
+      const res = await reservationsOf(row.id, 'openai');
+      const k = ttsKeys(row.id);
+      eq(k.map((key) => { const r = res.find((x) => x.idempotency_key === key); return r ? r.settled : null; }), [true, false, true], 'chunk1 liquidado · chunk2 pendiente · chunk3 liberado');
+      eq(Object.keys(row.output_summary.paidCallsSent || {}).sort(), [k[0], k[1]].sort(), 'marcadores de envío solo de los enviados');
+    });
+
+    await check('caída dura del worker (review r2 N1): reservas de la unidad SIN marcador de envío → se LIBERAN solas al re-reclamar; la que tiene marcador → conciliación (nunca se repaga a ciegas)', async () => {
+      // a) solo el chunk 1 se había enviado cuando el worker murió.
+      const R = await freshLongWelcomeRun('Bienvenida caída marcador');
+      const item = await claimProvider(R.rid, 'audio_welcome');
+      const k = ttsKeys(item.itemRunId, item.attempt);
+      await H.reservePaidCalls(ledger, [0, 1, 2].map((i) => ({ kind: 'tts', ownerId: OWNER, itemRunId: item.itemRunId, generation: 1, itemAttempt: item.attempt, tag: `chunk${i}`, estimate: { characters: 3800, model: 'gpt-4o-mini-tts' } })));
+      await sched.recordItemExternal(item.itemRunId, 'f2-provider-worker', { paidCallsSent: { [k[0]]: new Date().toISOString() } });
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [item.itemRunId]);
+      await sched.sweepExpiredLeases(R.rid);
+      await retryNow(item.itemRunId);
+      const again = await claimProvider(R.rid, 'audio_welcome');
+      assert(again && again.attempt > item.attempt, 're-reclamada en un intento nuevo');
+      const tts0 = fakes.st.tts.length;
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^provider_reconciliation_required/, 'el enviado bloquea');
+      eq(fakes.st.tts.length - tts0, 0, 'ninguna llamada nueva');
+      const res = await reservationsOf(item.itemRunId, 'openai');
+      eq(k.map((key) => res.find((x) => x.idempotency_key === key).settled), [false, true, true], 'enviada pendiente · no enviadas liberadas');
+      // b) ninguna se había enviado → todas liberadas y la parte se completa (3 envíos, sin conciliación humana).
+      const R2 = await freshLongWelcomeRun('Bienvenida caída sin envíos');
+      const it2 = await claimProvider(R2.rid, 'audio_welcome');
+      const k2 = ttsKeys(it2.itemRunId, it2.attempt);
+      await H.reservePaidCalls(ledger, [0, 1, 2].map((i) => ({ kind: 'tts', ownerId: OWNER, itemRunId: it2.itemRunId, generation: 1, itemAttempt: it2.attempt, tag: `chunk${i}`, estimate: { characters: 3800, model: 'gpt-4o-mini-tts' } })));
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [it2.itemRunId]);
+      await sched.sweepExpiredLeases(R2.rid);
+      await retryNow(it2.itemRunId);
+      const again2 = await claimProvider(R2.rid, 'audio_welcome');
+      const t0 = fakes.st.tts.length;
+      await PW.processProviderItem(workerDeps(), again2);
+      const done2 = await itemRow(R2.rid, again2.itemKey);
+      const nChunks = Number(done2.output_summary && done2.output_summary.chunks);
+      eq([done2.status, nChunks >= 3, fakes.st.tts.length - t0 === nChunks], ['completed', true, true], `completa sin intervención (${nChunks} chunks, un envío por chunk)`);
+      const res2 = await reservationsOf(it2.itemRunId, 'openai');
+      eq(k2.map((key) => res2.find((x) => x.idempotency_key === key).settled), [true, true, true], 'las del intento caído liberadas');
+    });
+
+    await check('FinOps ATÓMICO (2026-10-14): guard que deja pasar (como dos chequeos concurrentes que leyeron el mismo total) + reserva rechazada por el tope → Gamma / TTS de bienvenida (unidad de chunks) / guion LLM (unidad de 3): 0 llamadas al proveedor, run pausado (run_budget_cap), parte devuelta (retrying) sin consumir intento, 0 reservas pendientes', async () => {
+      for (const type of ['presentation', 'audio_welcome', 'audiobook_chapter']) {
+        const R = await freshRun('Tope atómico ' + type);
+        const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [R.rid]);
+        await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, 0.0001, 'ADMIN_APPROVED', 'tope mínimo (prueba)', 'admin@cursia.test')`, [R.rid, R.cid, est.id]);
+        const permissive = { async guardPaidSubmission() { return { allow: true, decision: 'ALLOW', committed: '0', remaining: '9', reason: 'test', authorizedBudget: '9' }; }, pauseRunBySystem: (...a) => budget.pauseRunBySystem(...a) };
+        const c0 = counts();
+        const item = await claimProvider(R.rid, type);
+        const before = await itemRow(R.rid, item.itemKey);
+        await PW.processProviderItem(workerDeps({ budget: permissive }), item);
+        const row = await itemRow(R.rid, item.itemKey);
+        eq([row.status, delta(c0)], ['retrying', { gamma: 0, tts: 0, llm: 0 }], `${type}: devuelta y 0 llamadas (${row.error})`);
+        assert(Number(row.max_attempts) > Number(before.max_attempts), `${type}: el intento no se consume (max ${before.max_attempts} → ${row.max_attempts})`);
+        const run = (await ds.query(`select worker_status, output_summary->'pause' p from public.production_jobs where id = $1`, [R.rid]))[0];
+        eq([run.worker_status, run.p && run.p.reason], ['paused', 'run_budget_cap'], `${type}: run pausado por el tope`);
+        const pend = await ds.query(`select count(*)::int n from public.generation_cost_events e where e.item_run_id = $1 and e.measurement_status = 'pending'
+                                        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [row.id]);
+        eq(pend[0].n, 0, `${type}: sin reservas pendientes`);
+      }
+    });
 
     await check('FAULT DB cae ANTES del proveedor (la reserva no se puede escribir) → Gamma / TTS / guion LLM: 0 llamadas, 0 eventos, item reintentable; con la DB de vuelta completa sin duplicar', async () => {
       const R = await freshRun('Fault antes');

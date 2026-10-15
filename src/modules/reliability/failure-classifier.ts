@@ -596,6 +596,7 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^GIFT\b.*\b(incompleto|inv[aá]lido)\b/i, 'gift_invalid'],
   [/^JSON inv[aá]lido\b/i, 'llm_output_invalid'],
   [/^falta la lista "questions"/i, 'llm_output_invalid'],
+  [/^falta la lista "revisions"/i, 'llm_output_invalid'], // revisión de forma del banco (2026-10-15)
   [/^tipo no soportado\b/i, 'unsupported_item_type'],
   [/^rulesVersion no soportado\b/i, 'unsupported_rules_version'],
   [/^(?:❌\s*)?No tienes acceso\b/i, 'browser_auth'],

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'crypto';
 import type { DataSource } from 'typeorm';
-import { reservePaidCall, serverLlmChargeInput, settlePaidCall, WorkerLedger } from '../finops-worker-hooks';
+import { pauseRunForCap, reservePaidCall, RunBudgetCapReached, serverLlmChargeInput, settlePaidCall, WorkerLedger } from '../finops-worker-hooks';
 import type { CallRole } from '../../modules/finops/finops-ledger.service';
 import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
 import { LlmStreamError, LlmStreamResult, streamMessage } from './anthropic-stream';
@@ -52,6 +52,8 @@ export interface ServerLlmDeps {
     guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
       code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
     }>;
+    /** FinOps atómico: pausa por el tope cuando la RESERVA se rechazó (el guard ya había permitido). */
+    pauseRunBySystem?(runId: string, reason: string, detail: string, requiredUsd?: number | null): Promise<boolean>;
   };
   /** Guardado de respuestas (Storage). */
   checkpoints: {
@@ -183,7 +185,8 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       }
     }
 
-    const promptChars = JSON.stringify({ system: system ?? null, messages: [{ role: 'user', content: user }] }).length;
+    // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
+    const promptChars = JSON.stringify(body).length;
     for (;;) {
       const stop = deps.shouldStop ? deps.shouldStop() : null;
       if (stop) throw { fatal: true, handBack: stop, code: stop, msg: `${stop}: la parte vuelve a la cola antes de una llamada nueva` } as ApiError;
@@ -200,7 +203,15 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       }
       const tag = `${LLM_WORKER_CALL_TAG_PREFIX}-${role.callRole}-${hash.slice(0, LLM_CALL_HASH_LEN)}-${++seq}-${randomUUID().slice(0, 8)}`;
       const reservation = { kind: 'llm' as const, ownerId: item.ownerId, itemRunId: item.itemRunId, generation: item.generation, itemAttempt: item.attempt, tag, estimate: { promptChars, maxTokens, model: useModel } };
-      const resKey = await reservePaidCall(deps.finops, reservation);
+      let resKey: string;
+      try {
+        resKey = await reservePaidCall(deps.finops, reservation);
+      } catch (e) {
+        if (!(e instanceof RunBudgetCapReached)) throw e;
+        // FinOps atómico: otra reserva concurrente llegó primero al tope → no se llama (0 gasto) y el run se pausa.
+        await pauseRunForCap(deps.budget, e).catch(() => false);
+        throw { fatal: true, runPaused: true, status: 409, code: 'run_paused', msg: 'run_paused: Pausa automática: se alcanzó el presupuesto autorizado del run: ' + e.detail } as ApiError;
+      }
       notUnknown.add(resKey);
       let r: LlmStreamResult;
       try {

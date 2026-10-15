@@ -810,6 +810,9 @@ async function dbChecks() {
     });
 
     await check('DB (R14): reserva ambigua reconocida por el dueño ⇒ se concilia COMO COBRADA (ADJUSTMENT final delta 0): pending 0, el monto sigue contado; repetir = no-op', async () => {
+      // FinOps atómico (2026-10-14): una reserva nueva respeta el tope del run; las pruebas anteriores ya cargaron
+      // más que el estimado de jobA → autorización nueva (append-only, la última manda) para probar la conciliación.
+      await ledger.authorize({ runId: jobA.id, courseId: 101, authorizedBudget: '1000', decision: 'ADMIN_APPROVED', approvedBy: 'admin@cursia', reason: 'R14: conciliación (no prueba el tope)' });
       const resKey = `reservation:llm:${irA.id}:g2:a1:ambiguous`;
       const res = await ledger.recordCharge(llmCharge({
         idempotencyKey: resKey, idempotency: undefined, externalOperationId: null,

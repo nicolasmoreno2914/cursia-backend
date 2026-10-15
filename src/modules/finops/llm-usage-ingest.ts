@@ -8,6 +8,7 @@
  * Nunca se aceptan montos del caller: el monto se calcula del usage.
  */
 import { FinopsError } from './errors';
+export { llmUpperBoundVariants } from './pricing';
 import { CALL_ROLES, CallRole, RecordChargeInput } from './finops-ledger.service';
 
 export interface LlmUsageIngestBody {
@@ -46,7 +47,24 @@ export interface LlmUsageIngestBody {
 const ALLOWED_KEYS = new Set(['subject', 'itemRunId', 'callRole', 'attempt', 'model', 'messageId', 'requestId', 'usage', 'billingAccount', 'mode', 'measurement', 'callId']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Caracteres por token para la cota de la reserva (la misma que usan los workers: conservadora). */
-export const LLM_RESERVATION_CHARS_PER_TOKEN = 3;
+/**
+ * Caracteres por token de la COTA de entrada (FinOps atómico, evidencia 2026-10-14: en 663 llamadas reales de staging
+ * los tokens de entrada llegaron hasta 0,988 × caracteres/3 — margen insuficiente; con /2,5 la cota cubre ×1,2).
+ */
+export const LLM_RESERVATION_CHARS_PER_TOKEN = 2.5;
+
+/**
+ * Cota SUPERIOR de una llamada LLM antes de hacerla (guard + reserva; FinOps atómico 2026-10-14): toda la entrada al
+ * precio de ESCRITURA de caché (el medidor de entrada más caro: el prefijo con cache_control se cobra a 1,25×) y la
+ * salida al tope `max_tokens`. El cargo real (entrada sin caché + caché escrita/leída + salida ≤ max_tokens) nunca la
+ * supera → la suma de reservas acota el gasto real y el tope del run se puede garantizar al reservar.
+ */
+export function llmCallUpperBoundUsage(promptChars: number, maxTokens: number): { cache_write_tokens: number; output_tokens: number } {
+  return {
+    cache_write_tokens: Math.max(1, Math.ceil(Math.max(0, Number(promptChars) || 0) / LLM_RESERVATION_CHARS_PER_TOKEN)),
+    output_tokens: Math.max(1, Math.floor(Number(maxTokens) || 1)),
+  };
+}
 
 function bad(msg: string): never {
   throw new FinopsError('INVALID_INPUT', msg);
@@ -198,7 +216,7 @@ export function llmReservationToChargeInput(body: LlmReservationIngestBody): Rec
     provider: 'anthropic',
     service: 'messages',
     modelOrProduct: body.model,
-    usage: { input_tokens: Math.max(1, Math.ceil(body.promptChars / LLM_RESERVATION_CHARS_PER_TOKEN)), output_tokens: body.maxTokens },
+    usage: llmCallUpperBoundUsage(body.promptChars, body.maxTokens),
     usageUnit: 'output_tokens',
     externalOperationId: null,
     idempotencyKey: llmProxyReservationKey(body.callId),
@@ -210,7 +228,7 @@ export function llmReservationToChargeInput(body: LlmReservationIngestBody): Rec
     measurementStatus: 'pending',
     pricingFallback: 'pending_zero',
     recordedBy: 'llm-proxy',
-    metadata: { reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: 'proxy', callId: body.callId, proxy: true,
+    metadata: { reservation: true, llmUpperBound: true, estimatedPending: true, reservedBeforeCall: true, callTag: 'proxy', callId: body.callId, proxy: true,
       promptChars: body.promptChars, maxTokens: body.maxTokens, billingAccountRequested: body.billingAccount },
   };
 }
