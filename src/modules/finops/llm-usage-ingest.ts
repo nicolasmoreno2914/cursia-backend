@@ -47,7 +47,11 @@ export interface LlmUsageIngestBody {
 const ALLOWED_KEYS = new Set(['subject', 'itemRunId', 'callRole', 'attempt', 'model', 'messageId', 'requestId', 'usage', 'billingAccount', 'mode', 'measurement', 'callId']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Caracteres por token para la cota de la reserva (la misma que usan los workers: conservadora). */
-export const LLM_RESERVATION_CHARS_PER_TOKEN = 3;
+/**
+ * Caracteres por token de la COTA de entrada (FinOps atómico, evidencia 2026-10-14: en 663 llamadas reales de staging
+ * los tokens de entrada llegaron hasta 0,988 × caracteres/3 — margen insuficiente; con /2,5 la cota cubre ×1,2).
+ */
+export const LLM_RESERVATION_CHARS_PER_TOKEN = 2.5;
 
 /**
  * Cota SUPERIOR de una llamada LLM antes de hacerla (guard + reserva; FinOps atómico 2026-10-14): toda la entrada al

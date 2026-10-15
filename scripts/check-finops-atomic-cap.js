@@ -246,10 +246,10 @@ async function dbChecks() {
       costSource: 'CALCULATED_FROM_USAGE', measurementStatus: 'pending', pricingFallback: 'pending_zero', recordedBy: 'check',
       metadata: { reservation: true, callTag: tag }, ...extra,
     });
-    // Cota de UNA reserva (30.000 caracteres, 12.000 de salida, Sonnet 4.6): 10.000 × 3,75/M + 12.000 × 15/M = 0,2175.
-    const ONE = 0.2175;
+    // Cota de UNA reserva (30.000 caracteres → 12.000 tokens con chars/2,5; 12.000 de salida; Sonnet 4.6): 12.000 × 3,75/M + 12.000 × 15/M = 0,225.
+    const ONE = 0.225;
 
-    await check('[AT] 60 reservas EN PARALELO desde 3 procesos contra un tope de USD 1,00 → se aceptan exactamente 4 (4 × 0,2175 = 0,87 ≤ 1,00 < 1,0875); el total del run nunca supera el tope; las rechazadas → RUN_BUDGET_CAP con lo que hacía falta', async () => {
+    await check('[AT] 60 reservas EN PARALELO desde 3 procesos contra un tope de USD 1,00 → se aceptan exactamente 4 (4 × 0,225 = 0,90 ≤ 1,00 < 1,125); el total del run nunca supera el tope; las rechazadas → RUN_BUDGET_CAP con lo que hacía falta', async () => {
       const C = await makeCourse('AT paralelo');
       const it = await itemOf(C.runId);
       await authorize(C.runId, C.cid, '1.00');
@@ -316,6 +316,49 @@ async function dbChecks() {
       await authorize(C.runId, C.cid, '10');
       const r = await ledger.recordCharge(resInput(it.id, 'u', { modelOrProduct: 'claude-modelo-inexistente' }));
       assert(r.inserted && Number(r.event.amount) > 0 && r.event.metadata.amountBasis === 'conservative_catalog_max' && r.pricingMissing, 'conservador: ' + JSON.stringify({ a: r.event.amount, m: r.event.metadata }));
+    });
+
+    await check('[AT] unidad (lote): TODAS o NINGUNA — con lugar para 2, un lote de 3 no inserta nada (RUN_BUDGET_CAP) y uno de 2 entra; 12 lotes de 2 en paralelo desde 3 procesos → nunca se supera el tope y ningún lote queda a medias', async () => {
+      const C = await makeCourse('AT lote');
+      const it = await itemOf(C.runId);
+      await authorize(C.runId, C.cid, String(2 * ONE + 0.01));
+      let e = null;
+      try { await ledger.recordReservationBatch(['a', 'b', 'c'].map((t) => resInput(it.id, 'u3-' + t))); } catch (x) { e = x; }
+      assert(e && e.code === 'RUN_BUDGET_CAP', 'lote de 3 rechazado');
+      eq(await runTotal(C.runId), 0, 'nada insertado');
+      const ok2 = await ledger.recordReservationBatch(['a', 'b'].map((t) => resInput(it.id, 'u2-' + t)));
+      eq(ok2.map((r) => r.inserted), [true, true], 'lote de 2');
+      const again = await ledger.recordReservationBatch(['a', 'b'].map((t) => resInput(it.id, 'u2-' + t)));
+      eq(again.map((r) => r.inserted), [false, false], 'reintento del lote: idempotente sin volver a contar');
+      const D = await makeCourse('AT lotes paralelos');
+      const it2 = await itemOf(D.runId);
+      await authorize(D.runId, D.cid, String(5 * ONE + 0.01));
+      const res = await Promise.allSettled(Array.from({ length: 12 }, (_, i) => ledgers[i % 3].recordReservationBatch(['x', 'y'].map((t) => resInput(it2.id, `p${i}-${t}`)))));
+      const okB = res.filter((r) => r.status === 'fulfilled').length;
+      eq([okB, res.filter((r) => r.status === 'rejected' && r.reason.code === 'RUN_BUDGET_CAP').length], [2, 10], '2 lotes entran (4 reservas ≤ 5 lugares), el resto RUN_BUDGET_CAP');
+      const n = (await ds.query(`select count(*)::int n from public.generation_cost_events where run_id = $1`, [D.runId]))[0].n;
+      eq(n, 4, 'ningún lote a medias (4 filas = 2 lotes completos)');
+      assert((await runTotal(D.runId)) <= 5 * ONE + 0.01 + 1e-9, 'total ≤ tope');
+    });
+
+    await check('[AT] red de seguridad (review M3): un cargo REAL mayor que su reserva que deja el run sobre el tope → el run se PAUSA al liquidar (run_budget_cap, overshoot); bajo el tope no pausa', async () => {
+      const C = await makeCourse('AT overshoot');
+      const it = await itemOf(C.runId);
+      // Tope: una reserva + 0,03 (tras liquidar la 1.ª con su cargo real de 0,018, la 2.ª reserva cabe).
+      await authorize(C.runId, C.cid, String(ONE + 0.03));
+      const settle = (tag, out) => ledger.settleReservation(`reservation:test:${it.id}:${tag}`, {
+        itemRunId: it.id, ownerIdFromAuth: OWNER, provider: 'anthropic', service: 'messages', modelOrProduct: 'claude-sonnet-4-6',
+        usage: { input_tokens: 1000, output_tokens: out }, usageUnit: 'output_tokens', externalOperationId: 'msg_' + tag, idempotency: { kind: 'anthropic', parts: { messageId: 'msg_' + tag } },
+        callRole: 'main', attempt: 1, billingAccount: 'cursia', mode: 'real', costSource: 'CALCULATED_FROM_USAGE', recordedBy: 'check',
+      }, 'test_settled');
+      await ledger.recordCharge(resInput(it.id, 'o1'));
+      await settle('o1', 1000);
+      eq((await ds.query(`select worker_status from public.production_jobs where id = $1`, [C.runId]))[0].worker_status !== 'paused', true, 'bajo el tope: sin pausa');
+      await ledger.recordCharge(resInput(it.id, 'o2'));
+      await settle('o2', 20000); // salida real mayor que el tope de la reserva (12.000): solo posible con un proveedor que no respeta max_tokens
+      const run = (await ds.query(`select worker_status, output_summary->'pause' p from public.production_jobs where id = $1`, [C.runId]))[0];
+      eq([run.worker_status, run.p.reason, run.p.overshoot], ['paused', 'run_budget_cap', true], 'pausado por overshoot');
+      assert(Number(run.p.requiredUsd) > ONE + 0.03, 'requiredUsd = gastado real: ' + run.p.requiredUsd);
     });
 
     await check('[WK] worker de IA REAL (createServerApi) — 8 llamadas EN PARALELO con el guard real y un tope para 3 → exactamente 3 llegan a Anthropic; las otras 5 → run_paused SIN llamar; run pausado (run_budget_cap); el total nunca supera el tope', async () => {

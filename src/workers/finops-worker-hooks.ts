@@ -15,7 +15,7 @@ import { usageModelPriorsV1 } from '../modules/finops/usage-model';
 import { llmCallUpperBoundUsage } from '../modules/finops/llm-usage-ingest';
 
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
-  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges'>>;
+  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges' | 'recordReservationBatch'>>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'> & Partial<Pick<FinopsBudgetService, 'pauseRunBySystem'>>;
 /** r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (el guard la precia con el catálogo). */
 export type GuardNextCall = { provider: string; service: string; product: string; usage: Record<string, number> };
@@ -442,6 +442,11 @@ export async function settleGammaCharge(
 
 /** ~15 caracteres de texto por segundo de voz (≈150 palabras/min): estimado de la reserva de TTS. */
 export const TTS_CHARS_PER_SECOND_ESTIMATE = 15;
+/**
+ * Margen de la RESERVA previa de proveedores no-LLM (FinOps atómico, evidencia 2026-10-14 en el ledger de staging:
+ * cargo real / reserva llegó a 1,21 en TTS (66 de 223) y 1,18 en Videogen (28 de 51)) → la reserva es ×1,25 del estimado.
+ */
+export const PROVIDER_RESERVATION_MARGIN = 1.25;
 
 /**
  * Reserva PENDIENTE de un chunk de TTS cuyo resultado se desconoce (timeout /
@@ -508,7 +513,7 @@ export async function recordLlmReservation(
     pricingFallback: 'pending_zero',
     outcome: 'failed_charged',
     recordedBy: 'dynamic-provider-worker',
-    metadata: { estimatedPending: true, ambiguous: true, serverSide: true, pendingReason: a.reason.slice(0, 300) },
+    metadata: { llmUpperBound: true, estimatedPending: true, ambiguous: true, serverSide: true, pendingReason: a.reason.slice(0, 300) },
   });
 }
 
@@ -593,7 +598,7 @@ function reservationInput(r: PaidCallReservation): RecordChargeInput {
   const meta = { reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: r.tag, generation: r.generation };
   switch (r.kind) {
     case 'tts': {
-      const secs = Math.max(1, Math.ceil((r.estimate.characters ?? 0) / TTS_CHARS_PER_SECOND_ESTIMATE));
+      const secs = Math.max(1, Math.ceil(((r.estimate.characters ?? 0) / TTS_CHARS_PER_SECOND_ESTIMATE) * PROVIDER_RESERVATION_MARGIN));
       return { ...base, provider: 'openai', service: 'audio.speech', modelOrProduct: r.estimate.model || 'gpt-4o-mini-tts',
         usage: { audio_seconds: secs }, usageUnit: 'audio_seconds', metadata: { ...meta, characters: r.estimate.characters ?? null } };
     }
@@ -606,7 +611,7 @@ function reservationInput(r: PaidCallReservation): RecordChargeInput {
         usage: { gamma_credit: gammaEstimatedCredits() }, usageUnit: 'gamma_credit', metadata: meta };
     case 'videogen':
       return { ...base, provider: 'videogen', service: 'render', modelOrProduct: 'video', operation: 'videogen.render',
-        usage: { video_render: 1 }, usageUnit: 'video_render', metadata: meta };
+        usage: { video_render: PROVIDER_RESERVATION_MARGIN }, usageUnit: 'video_render', metadata: meta };
     default:
       throw new Error(`reserva de tipo desconocido: ${String((r as any).kind)}`);
   }
@@ -639,6 +644,30 @@ export async function reservePaidCall(ledger: WorkerLedger | null | undefined, r
     throw new LedgerWriteFailed(`la reserva ${r.kind}/${r.tag}`, err);
   }
   return reservationKey(r);
+}
+
+/**
+ * Reserva de una UNIDAD pagada completa (todas o ninguna, atómico contra el tope del run; review I4). Un ledger sin
+ * reservas por lote (fakes de pruebas antiguas) reserva una por una. → claves en el mismo orden.
+ */
+export async function reservePaidCalls(ledger: WorkerLedger | null | undefined, rs: PaidCallReservation[]): Promise<string[]> {
+  const l = requireLedger(ledger, `la unidad de ${rs.length} reservas`);
+  if (!rs.length) return [];
+  if (!l.recordReservationBatch) {
+    const keys: string[] = [];
+    for (const r of rs) keys.push(await reservePaidCall(l, r));
+    return keys;
+  }
+  try {
+    await l.recordReservationBatch(rs.map(reservationInput));
+  } catch (err) {
+    if (err && (err as { code?: string }).code === 'RUN_BUDGET_CAP') {
+      const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
+      throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_CAP:\s*/, ''), Number(d.requiredUsd ?? NaN));
+    }
+    throw new LedgerWriteFailed(`la unidad de ${rs.length} reservas`, err);
+  }
+  return rs.map(reservationKey);
 }
 
 /**

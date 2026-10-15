@@ -185,7 +185,8 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       }
     }
 
-    const promptChars = JSON.stringify({ system: system ?? null, messages: [{ role: 'user', content: user }] }).length;
+    // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
+    const promptChars = JSON.stringify(body).length;
     for (;;) {
       const stop = deps.shouldStop ? deps.shouldStop() : null;
       if (stop) throw { fatal: true, handBack: stop, code: stop, msg: `${stop}: la parte vuelve a la cola antes de una llamada nueva` } as ApiError;

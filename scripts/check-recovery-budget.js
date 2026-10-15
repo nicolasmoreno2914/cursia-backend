@@ -556,10 +556,12 @@ async function dbChecks() {
       // Re-review N2: ampliar a algo por ENCIMA de lo gastado pero por debajo de lo que pedía la llamada negada → sigue rechazado.
       const req = Number((await runRow(Q.runId)).output_summary.pause.requiredUsd);
       const spentQ = await runSpent(Q.runId);
-      assert(req > spentQ, `requiredUsd (${req}) > gastado (${spentQ})`);
+      // FinOps atómico (review M3): si el cargo REAL superó su reserva y dejó el run sobre el tope, la pausa llega al
+      // liquidar (overshoot) con requiredUsd = gastado; si la negó el guard, requiredUsd = gastado + la llamada negada.
+      assert(req >= spentQ, `requiredUsd (${req}) ≥ gastado (${spentQ})`);
       const [estQ] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [Q.runId]);
-      await budget.adminAuthorize({ courseId: Q.cid, runId: Q.runId, authorizedBudget: ((spentQ + req) / 2).toFixed(4), approvedBy: 'admin@cursia.test', reason: 'ampliación corta' }).catch(async () => {
-        await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'ampliación corta', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id, ((spentQ + req) / 2).toFixed(4)]);
+      await budget.adminAuthorize({ courseId: Q.cid, runId: Q.runId, authorizedBudget: (req > spentQ ? (spentQ + req) / 2 : spentQ - 0.0001).toFixed(4), approvedBy: 'admin@cursia.test', reason: 'ampliación corta' }).catch(async () => {
+        await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason, approved_by) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'ampliación corta', 'admin@cursia.test')`, [Q.runId, Q.cid, estQ.id, (req > spentQ ? (spentQ + req) / 2 : spentQ - 0.0001).toFixed(4)]);
       });
       let e2 = null;
       try { await runs.resumeRun(Q.cid, OWNER, 1, Q.runId); } catch (err) { e2 = err; }

@@ -66,6 +66,7 @@ import {
   GuardNextCall,
   LedgerWriteFailed,
   TTS_CHARS_PER_SECOND_ESTIMATE,
+  PROVIDER_RESERVATION_MARGIN,
   WorkerBudget,
   WorkerLedger,
   budgetExceededMessage,
@@ -82,6 +83,7 @@ import {
   ttsChargeInput,
   RunBudgetCapReached,
   pauseRunForCap,
+  reservePaidCalls,
 } from '../finops-worker-hooks';
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
@@ -745,11 +747,22 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
   const requestIds: Array<string | null> = [];
   const ttsTracker = deps.tracker;
   const paidTtsOps: string[] = [];
+  // FinOps atómico (review I4): el audio es UNA unidad — se reservan TODOS sus chunks antes del primero (todos o
+  // ninguno contra el tope del run); así nunca queda a medias por el tope. Los nunca llamados se liberan al salir.
+  const unitRes = chunks.map((c, idx) => ({
+    kind: 'tts' as const, ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
+    tag: `chunk${idx}`, estimate: { characters: c.length, model },
+  }));
+  const unitKeys: string[] = [];
+  const calledChunks = new Set<number>();
+  let unitDone = false;
+  try {
   for (let i = 0; i < chunks.length; i++) {
     // R16 (#1): solo ANTES del primer chunk (nada pagado sin persistir). A mitad del audio
     // se termina: devolverlo dejaría chunks pagados sin persistir (reconciliación).
     if (i === 0 && (await handBackIfDraining(deps, item, 'antes de sintetizar el audio (sin gasto)'))) return;
     await heartbeat(deps, item);
+    if (i === 0) unitKeys.push(...(await reservePaidCalls(deps.finops, unitRes)));
     const chunkIdx = i;
     // Calibración #2: reserva DURABLE del chunk antes de llamar (si falla, no se llama a OpenAI).
     const resKey = await reservePaidCall(deps.finops, {
@@ -757,6 +770,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
       tag: `chunk${chunkIdx}`, estimate: { characters: chunks[chunkIdx].length, model },
     });
     if (ttsTracker) ttsTracker.inFlight = { provider: 'openai', key: resKey };
+    calledChunks.add(chunkIdx);
     let res;
     try {
       res = await tts.speech({ model, voice, input: chunks[i] });
@@ -791,6 +805,16 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     requestIds.push(res.requestId);
     // Mismo transcode que tts.service (64 kbps mono; sin ffmpeg → el original, como hoy).
     parts.push(await transcodeMp3Bitrate(res.audio, TTS_TARGET_BITRATE_KBPS));
+  }
+  unitDone = true;
+  } finally {
+    // Reservas de chunks que NUNCA se enviaron (la unidad terminó antes): se liberan (sin gasto). Un chunk enviado
+    // con resultado incierto conserva su reserva (conciliación), como siempre.
+    if (!unitDone) {
+      for (let idx = 0; idx < unitKeys.length; idx++) {
+        if (!calledChunks.has(idx)) await settlePaidCall(deps.finops, unitKeys[idx], null, 'tts_unit_aborted_before_call').catch(() => undefined);
+      }
+    }
   }
   let mp3: Buffer;
   let durationSeconds: number;
@@ -925,7 +949,7 @@ export interface PersistedExtension {
 
 /** Costo estimado de UNA llamada (fix round 1, I5): el guard reserva esto, no el p90 del item entero. */
 function ttsCallEstimate(model: string, characters: number): GuardNextCall {
-  return { provider: 'openai', service: 'audio.speech', product: model, usage: { audio_seconds: Math.max(1, Math.ceil(characters / TTS_CHARS_PER_SECOND_ESTIMATE)) } };
+  return { provider: 'openai', service: 'audio.speech', product: model, usage: { audio_seconds: Math.max(1, Math.ceil((characters / TTS_CHARS_PER_SECOND_ESTIMATE) * PROVIDER_RESERVATION_MARGIN)) } };
 }
 function llmCallEstimate(model: string, promptChars: number, maxTokens: number): GuardNextCall {
   return { provider: 'anthropic', service: 'messages', product: model, usage: llmCallUpperBoundUsage(promptChars, maxTokens) };
@@ -985,10 +1009,37 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const itemRole = providerCallRoleOf(item.attempt);
   let llmClient: AnthropicClient | null = null;
   /** Llamada pagada del guion (bloque o ampliación): guard por llamada → reserva → llamada → liquidación. */
+  // FinOps atómico (review I4): el guion de un bloque es UNA unidad (principal + continuación + condensación). Antes
+  // de la llamada principal se reservan las tres (todas o ninguna contra el tope): una continuación nunca se queda
+  // sin presupuesto con el principal ya pagado. Cota de continuación/condensación: su prompt incluye la salida del
+  // principal (≤ 4 caracteres × max_tokens) → prompt principal + 4·max_tokens, y max_tokens ≥ el de la principal.
+  const unitState = new Map<string, { keys: Map<string, string>; called: Set<string> }>();
+  const releaseUnitUnused = async (tag: string): Promise<void> => {
+    const st = unitState.get(tag);
+    if (!st) return;
+    for (const [role, key] of st.keys) {
+      if (!st.called.has(role)) await settlePaidCall(deps.finops, key, null, 'script_unit_unused').catch(() => undefined);
+    }
+    unitState.delete(tag);
+  };
   const llmFor = (tag: string, what: string, paidIds: string[]): ScriptLlm => async (prompt, role) => {
     await heartbeat(deps, item);
     if (!(await guard(deps, item, 'anthropic', llmCallEstimate(scriptModel, prompt.system.length + prompt.user.length, prompt.maxTokens)))) throw new BudgetBlocked();
-    // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama).
+    if (role === 'main' && !unitState.has(tag)) {
+      const mainChars = prompt.system.length + prompt.user.length;
+      const followChars = mainChars + 4 * prompt.maxTokens;
+      const followTokens = Math.max(prompt.maxTokens, LLM_CALL_MAX_TOKENS_BOUND);
+      const roles = ['main', 'continuation', 'condense'] as const;
+      const rs = roles.map((r) => ({
+        kind: 'llm' as const, ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt, tag: `${tag}-${r}`,
+        estimate: r === 'main' ? { promptChars: mainChars, maxTokens: prompt.maxTokens, model: scriptModel } : { promptChars: followChars, maxTokens: followTokens, model: scriptModel },
+      }));
+      const keys = await reservePaidCalls(deps.finops, rs);
+      unitState.set(tag, { keys: new Map(roles.map((r, i) => [r, keys[i]])), called: new Set() });
+    }
+    unitState.get(tag)?.called.add(role);
+    // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama). Dentro de una unidad ya reservada
+    // devuelve la reserva existente (idempotente, sin volver a contarla).
     const resKey = await reservePaidCall(deps.finops, {
       kind: 'llm', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
       tag: `${tag}-${role}`,
@@ -1028,6 +1079,8 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const scriptFailure = async (err: unknown, where: string): Promise<'stop'> => {
     if (err instanceof LeaseLost) throw err;
     if (err instanceof BudgetBlocked) return 'stop';
+    // FinOps atómico (review I1): el tope se maneja arriba (pausa del run + devolución sin consumir intento).
+    if (err instanceof RunBudgetCapReached) throw err;
     if (err instanceof AudioScriptError) return fail(deps, item, err.message, err.retryable, { knownOutcome: true });
     const e = err instanceof ProviderCallError ? err : null;
     return fail(deps, item, `audiobook_script_failed: ${where}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
@@ -1053,9 +1106,11 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
         res = await generateSectionScript(input, section, full.sections.length, prevTail,
           llmFor(`sec${section.idx}`, `guion del bloque ${section.idx + 1} del audiolibro pagado sin persistir`, []));
       } catch (err) {
+        await releaseUnitUnused(`sec${section.idx}`);
         await scriptFailure(err, `bloque ${section.idx + 1}/${full.sections.length}`);
         return;
       }
+      await releaseUnitUnused(`sec${section.idx}`);
       sections[k] = {
         sourceSha: res.sourceSha, sourceWords: res.sourceWords, text: res.text, words: res.words, ratio: res.ratio,
         continued: res.continued, condensed: res.condensed, messageIds: res.messageIds, model: scriptModel,

@@ -873,6 +873,24 @@ async function dbChecks() {
       }
     });
 
+    await check('DB FinOps ATÓMICO (2026-10-14): Videogen — guard que deja pasar + reserva rechazada por el tope del run (×1,25 del render) → 0 envíos, parte devuelta sin consumir intento (run_paused), run pausado (run_budget_cap), sin reservas pendientes', async () => {
+      const VC = await makeCourse('Videogen tope atómico');
+      // Run REAL (videos reales): aprobación de admin con el estimado del 409, como el run B.
+      const e409 = await rejectsRe(startRunT(VC.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'pide aprobación', 409);
+      await admin.authorize(VC.cid, { estimateId: e409.getResponse().estimateId, authorizedBudget: '100', reason: 'test tope atómico' }, ADMIN_USER);
+      const vRun = (await startRunT(VC.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, currency, decision, approved_by, reason) values ($1, $2, 0.0001, 'USD', 'ADMIN_APPROVED', 'admin@cursia.test', 'tope mínimo (prueba)')`, [vRun, VC.cid]);
+      const sv = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      const permissive = { async guardPaidSubmission() { return { allow: true, decision: 'ALLOW', committed: '0', remaining: '9', reason: 'test', authorizedBudget: '9' }; }, pauseRunBySystem: (...a) => budget.pauseRunBySystem(...a) };
+      await itemWorker.processItem({ ...workerDeps(sv, vg), budget: permissive }, await claimedVideo(vRun, VC.c1));
+      eq([vg.st.submits, sv.st.blocked.length, sv.st.failed.length], [0, 0, 1], 'sin envío, devuelto');
+      eq([sv.st.failed[0].retryable, sv.st.failed[0].opts && sv.st.failed[0].opts.grantAttempt, /^run_paused:/.test(sv.st.failed[0].msg)], [true, true, true], sv.st.failed[0].msg);
+      const run = (await ds.query(`select worker_status, output_summary->'pause' p from public.production_jobs where id = $1`, [vRun]))[0];
+      eq([run.worker_status, run.p && run.p.reason], ['paused', 'run_budget_cap'], 'run pausado por el tope');
+      eq((await events(`run_id = $1 and (metadata->>'reservation') = 'true'`, [vRun])).length, 0, 'ninguna reserva insertada');
+    });
+
     // ════ LLM ingest: atribución, idempotencia, precios ═══════════════════
     await check('DB ingest: itemRunId de OTRO owner en la metadata del cliente → NO se atribuye a la víctima (queda llm.unattributed del autenticado)', async () => {
       const victimItem = await itemRow(runB, `content:${Bc.c1}`);
@@ -914,15 +932,15 @@ async function dbChecks() {
     const PR = await makeCourse('Proxy reserva');
     const prRun = (await startRunT(PR.cid, OWNER, 1, MOCK_CTX)).run.id;
     // ════ Piloto #1209: reserva del proxy LLM ANTES de llamar a Anthropic ═══════════
-    await check('DB proxy-reserva: reserva (CHARGE pending, cota chars/3 + max_tokens, atribuida) → el usage con callId la LIQUIDA atómico (cargo exacto + reserva a 0); repetir = sin doble cargo', async () => {
+    await check('DB proxy-reserva: reserva (CHARGE pending, cota chars/2,5 + max_tokens, atribuida) → el usage con callId la LIQUIDA atómico (cargo exacto + reserva a 0); repetir = sin doble cargo', async () => {
       const it = await itemRow(prRun, `content:${PR.c1}`);
       const callId = crypto.randomUUID();
       const resBody = { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 30000, maxTokens: 8000, billingAccount: 'cursia' };
       const r = await postIngest('llm-reservation', resBody);
       eq([r.status, r.body.reserved, r.body.inserted, r.body.attributed], [200, true, true, true], 'reservada');
       const [ev] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + callId]);
-      eq([ev.measurement_status, ev.metadata.reservation, ev.usage.cache_write_tokens, ev.usage.output_tokens, ev.item_run_id], ['pending', true, 10000, 8000, it.id], 'fila de reserva (entrada como cota: escritura de caché, precio = máx. con entrada)');
-      eq(dec(ev.amount), (10000 * 30 + 8000 * 150) / 1e6, 'monto conservador con el precio vigente');
+      eq([ev.measurement_status, ev.metadata.reservation, ev.usage.cache_write_tokens, ev.usage.output_tokens, ev.item_run_id], ['pending', true, 12000, 8000, it.id], 'fila de reserva (entrada como cota: escritura de caché, precio = máx. con entrada)');
+      eq(dec(ev.amount), (12000 * 30 + 8000 * 150) / 1e6, 'monto conservador con el precio vigente (chars/2,5; máx. entre entrada y escritura de caché)');
       const again = await postIngest('llm-reservation', resBody);
       eq([again.status, again.body.inserted], [200, false], 'reserva idempotente por callId');
       const totalBefore = dec((await ledger.costsByRun(prRun)).totals.total);
