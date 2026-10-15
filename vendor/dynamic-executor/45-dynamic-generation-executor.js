@@ -7755,9 +7755,11 @@ async function _dynRunExamBank(item) {
     if (!Object.prototype.hasOwnProperty.call(lenPlans, rec.id)) lenPlans[rec.id] = dynExamBankLengthRevisionPlan(rec.raw, expectFor(rec), chapterInfo);
     return lenPlans[rec.id];
   }
-  function lengthCandidates(asm) {
+  // includeFailed: cuenta también las que fallaron por formato EN ESTE intento (para decidir si queda algo por revisar:
+  // una llamada fallida no es evidencia — rev. r3 R1).
+  function lengthCandidates(asm, includeFailed) {
     var inBank = idSet(asm.questions.filter(function (q) { return q.type === 'multichoice'; }).map(function (q) { return q.id; }));
-    return recordList().filter(function (r) { return inBank[r.id] && r.status === 'valid' && _dynEbReachOnlyLongest(r.combos) && !lenTried[r.id] && !lenFailedThisAttempt[r.id]; })
+    return recordList().filter(function (r) { return inBank[r.id] && r.status === 'valid' && _dynEbReachOnlyLongest(r.combos) && !lenTried[r.id] && (includeFailed || !lenFailedThisAttempt[r.id]); })
       .sort(function (x, y) { return x.order - y.order; })
       .filter(function (r) { return !!lengthPlanOf(r); });
   }
@@ -8214,7 +8216,7 @@ async function _dynRunExamBank(item) {
     var setOnly = a.bankErrors.every(function (e) { return /^EXAM_BANK_LENGTH_BIAS/.test(e); }) &&
       v.errors.every(function (x) { return x.code === 'EXAM_BANK_LENGTH_BIAS' && x.path === '$.questions'; });
     if (setOnly) {
-      var left = lengthCandidates(a).length;
+      var left = lengthCandidates(a, true).length;
       var lbMsg = 'la correcta es la opción más larga en ' + a.histogram[3] + '/' + a.mcTotal + ' MC (máx. 30 %; excedente ' + dynExamBankLengthBiasExcess(a) + ')';
       // Sin bucle: el intento anterior ya terminó por esta regla y (no quedan candidatas, o ni aquel ni este corrigieron
       // ninguna) → la revisión no avanza: falla definitiva.
