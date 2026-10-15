@@ -7374,7 +7374,8 @@ async function _dynRunExamBank(item) {
     if (meta.stopReason === 'max_tokens') return { ok: false, truncated: true, error: 'respuesta truncada (stop_reason=max_tokens)' };
     var p = _dynV3ParseJson(raw);
     if (!p.ok) return { ok: false, error: 'JSON inválido' };
-    if (!_dynIsPlainObject(p.obj) || !Array.isArray(p.obj[key])) return { ok: false, error: 'falta la lista "' + key + '"' };
+    // Mensajes literales (clasificador de fallas del backend: failure-classifier.ts).
+    if (!_dynIsPlainObject(p.obj) || !Array.isArray(p.obj[key])) return { ok: false, error: key === 'revisions' ? 'falta la lista "revisions"' : 'falta la lista "questions"' };
     return { ok: true, questions: p.obj[key] };
   }
   function expectFor(rec) {

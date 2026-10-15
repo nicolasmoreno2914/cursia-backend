@@ -38,6 +38,8 @@ const REPO = path.resolve(__dirname, '..');
 const distRoot = path.join(REPO, 'dist');
 const L = (rel) => require(path.join(distRoot, rel));
 require('reflect-metadata');
+// FinOps atómico (2026-10-14): la reserva de Videogen = estimación (0,94) × PROVIDER_RESERVATION_MARGIN.
+const VG_RES = Math.round(0.94 * L('workers/finops-worker-hooks.js').PROVIDER_RESERVATION_MARGIN * 1e10) / 1e10;
 const realFetch = global.fetch;
 global.fetch = async (u, o) => {
   const s = String(u);
@@ -1151,12 +1153,12 @@ const ENV_KEYS = [
 
     await check('[VG] solo la reserva del intento fallido/archivado queda pendiente de conciliar (no la liquidada, no la del intento en curso); el run `running` ya la muestra en completion.adminActions (clave y monto solo al admin)', async () => {
       const pend = await RC.loadPendingVideogenReservations(ds, rvg);
-      eq(pend.map((p) => [p.reservationKey, p.itemKey, Number(p.amount)]), [[vgKeys.failed, `video:${Cvg.c1}`, 0.94]], 'pendientes');
+      eq(pend.map((p) => [p.reservationKey, p.itemKey, Number(p.amount)]), [[vgKeys.failed, `video:${Cvg.c1}`, VG_RES]], 'pendientes');
       eq((await jobOf(rvg)).worker_status, 'running', 'run en curso');
       const mf = await manifests.getById(Cvg.cid, OWNER, 1, Cvg.manifest.id);
       const { completion } = await runs.completionForAdmin(await jobOf(rvg), mf);
       const a = completion.adminActions.filter((x) => x.code === 'reconcile_videogen_reservation');
-      eq(a.map((x) => [x.itemKey, x.reservationKey, Number(x.amount), x.attemptState, x.mayHaveRendered]), [[`video:${Cvg.c1}`, vgKeys.failed, 0.94, 'archived_failed', false]], 'acción con el run running');
+      eq(a.map((x) => [x.itemKey, x.reservationKey, Number(x.amount), x.attemptState, x.mayHaveRendered]), [[`video:${Cvg.c1}`, vgKeys.failed, VG_RES, 'archived_failed', false]], 'acción con el run running');
       eq(completion.state, 'in_progress', 'estado');
       assert(!JSON.stringify(RC.redactCompletionForOwner(completion)).includes(vgKeys.failed), 'dueño sin la clave');
     });
@@ -1207,9 +1209,9 @@ const ENV_KEYS = [
     await check('[VG] SUPER_ADMIN «no cobrado» → ADJUSTMENT final que lleva la reserva a 0 (append-only: el CHARGE queda), con motivo y actor; repetir = no-op; cambiar la decisión → 409', async () => {
       const reason = 'Videogen: job fallido en generate_script (429), sin cobro en la cuenta';
       const r = await post(`${vgPath}/reconcile`, { reservationKey: vgKeys.failed, outcome: 'not_charged', reason }, ADMIN_X);
-      eq([r.status, r.json.data.reconciled, r.json.data.alreadySettled, Number(r.json.data.amount), Number(r.json.data.countedAmount)], [200, true, false, 0.94, 0], `respuesta ${JSON.stringify(r.json).slice(0, 300)}`);
+      eq([r.status, r.json.data.reconciled, r.json.data.alreadySettled, Number(r.json.data.amount), Number(r.json.data.countedAmount)], [200, true, false, VG_RES, 0], `respuesta ${JSON.stringify(r.json).slice(0, 300)}`);
       const ev = await evs(vgKeys.failed);
-      eq(ev.map((x) => [x.event_kind, Number(x.amount), x.measurement_status]), [['CHARGE', 0.94, 'pending'], ['ADJUSTMENT', -0.94, 'final']], 'append-only');
+      eq(ev.map((x) => [x.event_kind, Number(x.amount), x.measurement_status]), [['CHARGE', VG_RES, 'pending'], ['ADJUSTMENT', -VG_RES, 'final']], 'append-only');
       const m = ev[1].metadata;
       eq([m.settlement, m.reservationReconciledAsNotCharged, m.decidedBy, m.decidedByRole, m.reason, m.runId, m.itemKey, m.outcome, ev[1].recorded_by],
         ['reconciled_as_not_charged', true, ADMIN_X.id, 'SUPER_ADMIN', reason, rvg, `video:${Cvg.c1}`, 'not_charged', 'admin_reconcile_videogen'], 'metadata');
@@ -1224,9 +1226,9 @@ const ENV_KEYS = [
 
     await check('[VG] SUPER_ADMIN «cobrado» → ADJUSTMENT final con delta 0 (el monto sigue contado); después no queda nada pendiente ni acción en la completion', async () => {
       const r = await post(`${vgPath}/reconcile`, { reservationKey: vgKeys.inflight, outcome: 'charged', reason: 'Videogen muestra el cargo del job fallido en la factura' }, ADMIN_X);
-      eq([r.status, r.json.data.reconciled, Number(r.json.data.countedAmount), r.json.data.remaining], [200, true, 0.94, []], `respuesta ${JSON.stringify(r.json).slice(0, 300)}`);
+      eq([r.status, r.json.data.reconciled, Number(r.json.data.countedAmount), r.json.data.remaining], [200, true, VG_RES, []], `respuesta ${JSON.stringify(r.json).slice(0, 300)}`);
       const ev = await evs(vgKeys.inflight);
-      eq(ev.map((x) => [x.event_kind, Number(x.amount), x.metadata.settlement || null]), [['CHARGE', 0.94, null], ['ADJUSTMENT', 0, 'reconciled_as_charged']], 'delta 0');
+      eq(ev.map((x) => [x.event_kind, Number(x.amount), x.metadata.settlement || null]), [['CHARGE', VG_RES, null], ['ADJUSTMENT', 0, 'reconciled_as_charged']], 'delta 0');
       eq(await RC.loadPendingVideogenReservations(ds, rvg), [], 'nada pendiente');
       const mf = await manifests.getById(Cvg.cid, OWNER, 1, Cvg.manifest.id);
       const { completion } = await runs.completionForAdmin(await jobOf(rvg), mf);

@@ -143,7 +143,7 @@ check('tabla: validación (B, regenerar solo el componente; códigos internos ex
   for (const m of ['activity inválido tras reintento dirigido: falta X', 'experience inválido tras reintento dirigido: TEXT_EMPTY',
     'plan de conceptos inválido tras reintento dirigido: x', 'plan de conceptos fusionado inválido: x', 'SCORM v2 inválido: sala 3',
     'contenido vacío tras generación', 'GIFT incompleto tras corrección: faltan 2', 'GIFT del examen final inválido: x',
-    'JSON inválido', 'falta la lista "questions"', 'CONTENT_TRUTH: persisten 2', 'CONTENT_TRUTH_RETRY_INVALID: x',
+    'JSON inválido', 'falta la lista "questions"', 'falta la lista "revisions"', 'CONTENT_TRUTH: persisten 2', 'CONTENT_TRUTH_RETRY_INVALID: x',
     'EXAM_NEUROMYTH: respuestas correctas apoyadas en un neuromito', 'GIFT_NO_QUESTIONS', 'EXAM_BANK_INCOMPLETE: faltan 3',
     'EXAM_BANK_GENERATION_FAILED: la parte 2/3 falló dos veces', 'EXAM_BANK_PLAN: el plan del claim no coincide', 'AUDIOBOOK_SCRIPT_TOO_SHORT: 120 palabras']) {
     expectVerdict(m, { class: 'B' });
