@@ -11,6 +11,7 @@ import {
   Injectable,
   InternalServerErrorException,
   Logger,
+  NotFoundException,
   Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
@@ -1628,7 +1629,7 @@ export class SchedulerService {
   }
 
   /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
-  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot): Promise<ClaimPayloadV3 | undefined> {
+  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot, readOnly = false): Promise<ClaimPayloadV3 | undefined> {
     if (manifest.rulesVersion !== 3) return undefined;
     const validatedArtifactType = v3ValidatedArtifactType(row.type, mItem.variant ?? null);
     const out: ClaimPayloadV3 = { validatedArtifactType };
@@ -1721,7 +1722,8 @@ export class SchedulerService {
       // EV6 T5 fix round 3 (I-4): procedencia explícita — estas preguntas se construyen con ESTA
       // generación del video (cualquier camino: generación inicial, «Regenerar», upgrade).
       const src = (vf as any).videoItemRunId;
-      if (typeof src === 'string' && src) {
+      // Diagnóstico (claimPreview, review I1): solo lectura → nunca registra la procedencia (no es un claim real).
+      if (!readOnly && typeof src === 'string' && src) {
         await qr.query(
           `update public.generation_item_runs
               set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('sourceVideoItemRunId', $2::text)
@@ -1985,7 +1987,35 @@ export class SchedulerService {
    * artifacts de las dependencias. Cualquier inconsistencia → 500 (y el
    * claim se deshace porque corre dentro de su transacción).
    */
-  private async buildClaimedItem(qr: QueryRunner, job: any, row: any): Promise<ClaimedItem> {
+  /**
+   * Diagnóstico (SUPER_ADMIN, 2026-10-14): el payload EXACTO que recibiría un worker al reclamar `itemKey` (generación
+   * vigente) — mismo buildClaimedItem — en una transacción READ ONLY (nunca toca el item ni el run). Sirve para
+   * reproducir localmente, a USD 0, una parte con sus puntos de guardado (los prompts y sus hashes coinciden).
+   * Difiere de un claim real solo en `attempt` (el real es attempt_count+1) y en la lease; ninguno entra a los prompts.
+   * `dependencyArtifacts` lista las dependencias COMPLETAS (igual que el claim real). Sin escrituras (readOnly).
+   */
+  async claimPreview(runId: string, itemKey: string): Promise<ClaimedItem> {
+    if (!UUID_RE.test(String(runId))) throw new BadRequestException('runId inválido');
+    const qr = this.dataSource.createQueryRunner();
+    await qr.connect();
+    try {
+      await qr.startTransaction();
+      await qr.query('set transaction read only');
+      const [job] = await qr.query(`select * from public.production_jobs where id = $1 and execution_mode = 'dynamic_generation'`, [runId]);
+      if (!job) throw new NotFoundException(`Run ${runId} no encontrado`);
+      const [row] = await qr.query(
+        `select * from public.generation_item_runs g where g.job_id = $1 and g.item_key = $2 order by g.generation desc limit 1`,
+        [runId, itemKey],
+      );
+      if (!row) throw new NotFoundException(`Parte ${itemKey} no encontrada en el run ${runId}`);
+      return await this.buildClaimedItem(qr, job, row, true);
+    } finally {
+      if (qr.isTransactionActive) await qr.rollbackTransaction().catch(() => undefined);
+      await qr.release().catch(() => undefined);
+    }
+  }
+
+  private async buildClaimedItem(qr: QueryRunner, job: any, row: any, readOnly = false): Promise<ClaimedItem> {
     const where = `Item ${row.item_key} (run ${job.id})`;
     const fail = (msg: string) => new InternalServerErrorException(`${where}: ${msg} (integridad rota)`);
 
@@ -2102,7 +2132,7 @@ export class SchedulerService {
             [row.job_id, row.manifest_id, deps],
           );
 
-    const v3 = await this.buildClaimV3(qr, row, mItem, manifest, snapshot);
+    const v3 = await this.buildClaimV3(qr, row, mItem, manifest, snapshot, readOnly);
 
     // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
     // Fase 3: también con contexto académico congelado (los resultados que el item debe evidenciar van en el brief).

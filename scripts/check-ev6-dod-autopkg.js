@@ -128,6 +128,7 @@ const ENV_KEYS = [
   const { AdminDynamicRunsController } = L('modules/dynamic-generation/admin-runs.controller.js');
   const { VideogenReconciliationService } = L('modules/dynamic-generation/videogen-reconciliation.service.js');
   const { PilotMetricsService } = L('modules/dynamic-generation/pilot-metrics.service.js');
+  const { LlmDiagnosticsService } = L('modules/dynamic-generation/llm-diagnostics.service.js');
   const FWH = L('workers/finops-worker-hooks.js');
   const { FeaturesController } = L('modules/features/features.controller.js');
   const { ArtifactsService } = L('modules/artifacts/artifacts.service.js');
@@ -995,7 +996,7 @@ const ENV_KEYS = [
     const jwt = require('jsonwebtoken');
     const moduleRef = await Test.createTestingModule({
       controllers: [AdminDynamicRunsController, FeaturesController],
-      providers: [{ provide: AdminRecoveryService, useValue: recovery }, { provide: VideogenReconciliationService, useValue: new VideogenReconciliationService(ds, ledger) }, { provide: PilotMetricsService, useValue: new PilotMetricsService(ds) }],
+      providers: [{ provide: AdminRecoveryService, useValue: recovery }, { provide: VideogenReconciliationService, useValue: new VideogenReconciliationService(ds, ledger) }, { provide: PilotMetricsService, useValue: new PilotMetricsService(ds) }, { provide: LlmDiagnosticsService, useValue: {} }],
     }).compile();
     app = moduleRef.createNestApplication({ logger: false });
     app.useGlobalFilters(new AllExceptionsFilter());
