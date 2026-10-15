@@ -7375,7 +7375,10 @@ async function _dynRunExamBank(item) {
     var p = _dynV3ParseJson(raw);
     if (!p.ok) return { ok: false, error: 'JSON inválido' };
     // Mensajes literales (clasificador de fallas del backend: failure-classifier.ts).
-    if (!_dynIsPlainObject(p.obj) || !Array.isArray(p.obj[key])) return { ok: false, error: key === 'revisions' ? 'falta la lista "revisions"' : 'falta la lista "questions"' };
+    if (!_dynIsPlainObject(p.obj) || !Array.isArray(p.obj[key])) {
+      if (key === 'revisions') return { ok: false, error: 'falta la lista "revisions"' };
+      return { ok: false, error: 'falta la lista "questions"' };
+    }
     return { ok: true, questions: p.obj[key] };
   }
   function expectFor(rec) {
