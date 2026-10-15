@@ -12,10 +12,11 @@ import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../modules/fi
 import { costIdempotencyKey } from '../modules/finops/idempotency';
 import { llmIngestToChargeInput } from '../modules/finops/llm-usage-ingest';
 import { usageModelPriorsV1 } from '../modules/finops/usage-model';
+import { llmCallUpperBoundUsage } from '../modules/finops/llm-usage-ingest';
 
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
   Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges'>>;
-export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'>;
+export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'> & Partial<Pick<FinopsBudgetService, 'pauseRunBySystem'>>;
 /** r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (el guard la precia con el catálogo). */
 export type GuardNextCall = { provider: string; service: string; product: string; usage: Record<string, number> };
 
@@ -494,7 +495,7 @@ export async function recordLlmReservation(
     provider: 'anthropic',
     service: 'messages',
     modelOrProduct: a.model,
-    usage: { input_tokens: Math.max(1, Math.ceil(a.promptChars / 3)), output_tokens: a.maxTokens },
+    usage: llmCallUpperBoundUsage(a.promptChars, a.maxTokens),
     usageUnit: 'output_tokens',
     externalOperationId: null,
     idempotency: { kind: 'anthropic', parts: { messageId: synthetic } },
@@ -598,8 +599,8 @@ function reservationInput(r: PaidCallReservation): RecordChargeInput {
     }
     case 'llm':
       return { ...base, provider: 'anthropic', service: 'messages', modelOrProduct: r.estimate.model || 'claude-sonnet-4-6',
-        usage: { input_tokens: Math.max(1, Math.ceil((r.estimate.promptChars ?? 0) / 3)), output_tokens: Math.max(1, r.estimate.maxTokens ?? 1) },
-        usageUnit: 'output_tokens', callRole: r.tag === 'continuation' ? 'continuation' : role.callRole, metadata: { ...meta, serverSide: true } };
+        usage: llmCallUpperBoundUsage(r.estimate.promptChars ?? 0, r.estimate.maxTokens ?? 1),
+        usageUnit: 'output_tokens', callRole: r.tag === 'continuation' ? 'continuation' : role.callRole, metadata: { ...meta, serverSide: true, llmUpperBound: true } };
     case 'gamma':
       return { ...base, provider: 'gamma', service: 'generations', modelOrProduct: 'gamma-generate', operation: 'gamma.generate',
         usage: { gamma_credit: gammaEstimatedCredits() }, usageUnit: 'gamma_credit', metadata: meta };
@@ -630,9 +631,32 @@ export async function reservePaidCall(ledger: WorkerLedger | null | undefined, r
   try {
     await l.recordCharge(reservationInput(r));
   } catch (err) {
+    // FinOps atómico: la reserva excedería el presupuesto autorizado del run → no se llama al proveedor (0 gasto).
+    if (err && (err as { code?: string }).code === 'RUN_BUDGET_CAP') {
+      const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
+      throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_CAP:\s*/, ''), Number(d.requiredUsd ?? NaN));
+    }
     throw new LedgerWriteFailed(`la reserva ${r.kind}/${r.tag}`, err);
   }
   return reservationKey(r);
+}
+
+/**
+ * FinOps atómico (2026-10-14): la reserva se rechazó porque el run excedería su presupuesto autorizado (verificado
+ * en la MISMA transacción que la inserción, serializado por run). Nada se llamó ni se cobró. El worker pausa el run
+ * (`run_budget_cap`, misma pausa que el guard) y devuelve la parte a la cola sin consumir intento.
+ */
+export class RunBudgetCapReached extends Error {
+  constructor(readonly runId: string, readonly detail: string, readonly requiredUsd: number) {
+    super(`run_budget_cap: ${detail}`);
+    this.name = 'RunBudgetCapReached';
+  }
+}
+
+/** Pausa el run por el tope (idempotente: si ya estaba pausado no cambia nada). Sin pausa cableada → no hace nada. */
+export async function pauseRunForCap(budget: { pauseRunBySystem?: FinopsBudgetService['pauseRunBySystem'] } | null | undefined, e: RunBudgetCapReached): Promise<boolean> {
+  if (!budget || !budget.pauseRunBySystem || !e.runId) return false;
+  return budget.pauseRunBySystem(e.runId, 'run_budget_cap', e.detail, Number.isFinite(e.requiredUsd) ? e.requiredUsd : null);
 }
 
 /** Liquidación DURABLE: cargo final (idempotente por la operación del proveedor) + reserva a 0, atómico. */

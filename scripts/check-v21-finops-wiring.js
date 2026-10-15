@@ -921,7 +921,7 @@ async function dbChecks() {
       const r = await postIngest('llm-reservation', resBody);
       eq([r.status, r.body.reserved, r.body.inserted, r.body.attributed], [200, true, true, true], 'reservada');
       const [ev] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + callId]);
-      eq([ev.measurement_status, ev.metadata.reservation, ev.usage.input_tokens, ev.usage.output_tokens, ev.item_run_id], ['pending', true, 10000, 8000, it.id], 'fila de reserva');
+      eq([ev.measurement_status, ev.metadata.reservation, ev.usage.cache_write_tokens, ev.usage.output_tokens, ev.item_run_id], ['pending', true, 10000, 8000, it.id], 'fila de reserva (entrada como cota: escritura de caché, precio = máx. con entrada)');
       eq(dec(ev.amount), (10000 * 30 + 8000 * 150) / 1e6, 'monto conservador con el precio vigente');
       const again = await postIngest('llm-reservation', resBody);
       eq([again.status, again.body.inserted], [200, false], 'reserva idempotente por callId');

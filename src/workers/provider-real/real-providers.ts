@@ -80,6 +80,8 @@ import {
   settleGammaCharge,
   settlePaidCall,
   ttsChargeInput,
+  RunBudgetCapReached,
+  pauseRunForCap,
 } from '../finops-worker-hooks';
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
@@ -107,6 +109,7 @@ import {
   welcomeScriptFromCourseIntro,
   wordCount,
 } from './audio-scripts';
+import { llmCallUpperBoundUsage } from '../../modules/finops/llm-usage-ingest';
 
 type Env = Record<string, string | undefined>;
 
@@ -925,7 +928,7 @@ function ttsCallEstimate(model: string, characters: number): GuardNextCall {
   return { provider: 'openai', service: 'audio.speech', product: model, usage: { audio_seconds: Math.max(1, Math.ceil(characters / TTS_CHARS_PER_SECOND_ESTIMATE)) } };
 }
 function llmCallEstimate(model: string, promptChars: number, maxTokens: number): GuardNextCall {
-  return { provider: 'anthropic', service: 'messages', product: model, usage: { input_tokens: Math.max(1, Math.ceil(promptChars / 3)), output_tokens: Math.max(1, maxTokens) } };
+  return { provider: 'anthropic', service: 'messages', product: model, usage: llmCallUpperBoundUsage(promptChars, maxTokens) };
 }
 /** Cota de una llamada del guion antes de conocer el prompt (sistema + bloque de ~900 palabras + cola; salida máxima). */
 const LLM_CALL_PROMPT_CHARS_BOUND = 9000;
@@ -1401,6 +1404,16 @@ export async function processRealProviderItem(deps: RealProviderDeps, item: Clai
       deps.logger.error(`Item ${item.itemKey}: ${msg}`);
       await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg.slice(0, 1900), false);
       throw new ProviderItemFailed(msg, false);
+    }
+    if (err instanceof RunBudgetCapReached) {
+      // FinOps atómico: la reserva de la próxima llamada excedería el tope del run → no se llamó (0 gasto). Run
+      // pausado (run_budget_cap) y la parte vuelve a la cola sin consumir intento (igual que el guard).
+      await pauseRunForCap(deps.budget, err).catch(() => false);
+      await deps.scheduler.failItem(item.itemRunId, deps.executorId, runPausedHandbackMessage(item.type), true, undefined, {
+        retryAfterSeconds: DRAIN_HANDBACK_RETRY_SECONDS, grantAttempt: true,
+      });
+      deps.logger.warn(`Item ${item.itemKey}: ${err.message} — devuelto sin llamar al proveedor`);
+      return;
     }
     if (err instanceof LedgerWriteFailed && !deps.finops) {
       // Worker real sin ledger FinOps: configuración, no transitorio. Nunca se llamó al proveedor.

@@ -9,7 +9,7 @@
  * (fila nueva) nunca altera un evento ya registrado.
  */
 import { FinopsError } from './errors';
-import { addDec, priceLine, normalizeDecimal, toScaled, DecimalLike } from './decimal';
+import { addDec, cmpDec, priceLine, normalizeDecimal, toScaled, DecimalLike } from './decimal';
 
 /** Medidores conocidos (audit §W.3). Un medidor desconocido igual se acepta si tiene precio. */
 export const KNOWN_METERS = [
@@ -196,3 +196,41 @@ export function priceUsage(usage: UsageMeters, catalogRows: readonly PricingCata
   };
   return { amount, currency: finalCurrency, lines, pricingSnapshot };
 }
+
+
+/**
+ * Costo CONSERVADOR de un uso sin precio exacto (guard y reservas, FinOps atómico 2026-10-14): por medidor, la tarifa
+ * MÁS CARA vigente del catálogo para ese medidor (cualquier proveedor/producto). Un medidor sin ninguna tarifa →
+ * CALL_UNPRICED (el que llama falla cerrado: nunca se compromete dinero sin poder acotarlo). Puro.
+ */
+export function conservativePrice(usage: Record<string, DecimalLike | null | undefined>, catalog: PricingCatalogRow[], now: Date = new Date()): string {
+  const open = catalog.filter((r) => !r.effective_to || new Date(r.effective_to as any).getTime() > now.getTime());
+  let total = '0';
+  for (const meter of Object.keys(usage)) {
+    const qty = usage[meter];
+    if (qty === null || qty === undefined) continue;
+    let best: string | null = null;
+    for (const r of open.filter((x) => x.meter === meter)) {
+      try {
+        const amt = priceUsage({ [meter]: qty }, [r], { provider: r.provider, service: r.service, product: r.product_or_model }).amount;
+        if (best === null || cmpDec(amt, best) > 0) best = amt;
+      } catch {
+        /* fila no aplicable: se ignora */
+      }
+    }
+    if (best === null) throw new FinopsError('CALL_UNPRICED', `no hay ninguna tarifa para el medidor ${meter}`);
+    total = addDec(total, best);
+  }
+  return total;
+}
+
+/**
+ * Variantes de precio de la cota (review FinOps): el monto de la cota es el MÁXIMO entre la entrada a precio de
+ * escritura de caché y a precio de entrada normal — nunca depende de que el catálogo cumpla «caché ≥ entrada».
+ */
+export function llmUpperBoundVariants(usage: Record<string, unknown>): Array<Record<string, number>> {
+  const cw = Number(usage.cache_write_tokens ?? 0);
+  const out = Number(usage.output_tokens ?? 0);
+  return [{ cache_write_tokens: cw, output_tokens: out }, { input_tokens: cw, output_tokens: out }];
+}
+

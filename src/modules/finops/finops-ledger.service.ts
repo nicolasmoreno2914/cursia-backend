@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, isZeroDec, normalizeDecimal, subDec, DecimalLike } from './decimal';
-import { priceUsage, PricingCatalogRow, PricingSnapshot, UsageMeters } from './pricing';
+import { conservativePrice, llmUpperBoundVariants, priceUsage, PricingCatalogRow, PricingSnapshot, UsageMeters } from './pricing';
 import { adjustmentIdempotencyKey, costIdempotencyKey, CostIdempotencyKind, CostIdempotencyParts } from './idempotency';
 import { familyOfProvider, operationForItem } from './operations';
 import type { EstimateResult } from './estimator';
@@ -289,12 +289,65 @@ export class FinopsLedgerService {
 
   async recordCharge(input: RecordChargeInput): Promise<RecordResult> {
     const { row, pricingError, idempotencyKey } = await this.buildChargeRow(input);
+    // FinOps atómico (2026-10-14, #1353: con 4 llamadas en paralelo las reservas llegaron a USD 47,62 con tope 47,50):
+    // una RESERVA pagada por Cursia de un run se inserta solo si, con ella, el run sigue dentro de su presupuesto
+    // autorizado — verificado e insertado en UNA transacción serializada por run (lock consultivo). Ninguna llamada
+    // nueva compromete dinero por encima del tope, aunque varios workers reserven a la vez.
+    if (isRunCapReservation(row)) {
+      if (pricingError) {
+        // Falla cerrado: una reserva sin precio exacto nunca vale 0 para el tope (tarifa más cara del catálogo).
+        row.amount = conservativePrice(input.usage || {}, await this.loadOpenCatalog());
+        (row.metadata as Record<string, unknown>).amountBasis = 'conservative_catalog_max';
+      }
+      const res = await this.dataSource.transaction((m) => this.insertReservationWithinRunCap(row, m));
+      if (pricingError) this.logPricingMissing(idempotencyKey, input, pricingError);
+      return pricingError ? { ...res, pricingMissing: true } : res;
+    }
     const res = await this.insertEvent(row, this.dataSource);
     if (pricingError) {
       this.logPricingMissing(idempotencyKey, input, pricingError);
       return { ...res, pricingMissing: true };
     }
     return res;
+  }
+
+  /**
+   * Inserta una reserva de un run SOLO si el total del run (cargos + ajustes + reservas pendientes, sin BYOK) más la
+   * reserva no supera la ÚLTIMA autorización del run (BLOCKED = tope 0; sin autorización = sin tope, runs previos a
+   * FinOps). Lock consultivo por run (`finops:run-cap:<runId>`): dos reservas del mismo run nunca se evalúan a la vez,
+   * en ningún proceso. Reintento idempotente de la misma reserva → devuelve la existente sin volver a evaluar.
+   * Excedería el tope → FinopsError RUN_BUDGET_CAP (details: runId, spent, amount, authorizedBudget, requiredUsd).
+   */
+  private async insertReservationWithinRunCap(row: Record<string, unknown>, m: { query: (sql: string, params?: any[]) => Promise<any> }): Promise<RecordResult> {
+    const runId = String(row.run_id);
+    await m.query(`select pg_advisory_xact_lock(hashtext($1))`, [RUN_CAP_LOCK_PREFIX + runId]);
+    const [existing] = await m.query(`select *, amount::text as amount from public.generation_cost_events where idempotency_key = $1`, [row.idempotency_key]);
+    if (existing) return { inserted: false, event: existing };
+    const [auth] = await m.query(
+      `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
+      [runId],
+    );
+    if (auth) {
+      const cap = auth.decision === 'BLOCKED' ? '0' : String(auth.b);
+      const [t] = await m.query(
+        `select coalesce(sum(amount), 0)::text as t from public.generation_cost_events where run_id = $1 and billing_account <> 'user_key'`,
+        [runId],
+      );
+      const after = addDec(t.t, row.amount as string);
+      if (cmpDec(after, cap) > 0) {
+        throw new FinopsError(
+          'RUN_BUDGET_CAP',
+          `el run llegaría a USD ${Number(after).toFixed(2)} con esta reserva y el presupuesto autorizado es USD ${Number(cap).toFixed(2)}`,
+          { runId, spent: t.t, amount: row.amount, authorizedBudget: cap, requiredUsd: after },
+        );
+      }
+    }
+    return this.insertEvent(row, m);
+  }
+
+  /** Catálogo completo vigente (para la tarifa conservadora de una reserva sin precio exacto). */
+  private async loadOpenCatalog(): Promise<PricingCatalogRow[]> {
+    return this.dataSource.query(`select * from public.pricing_catalog where effective_to is null or effective_to > now()`);
   }
 
   private logPricingMissing(idempotencyKey: string, input: RecordChargeInput, pricingError: { code: string; message: string }): void {
@@ -381,13 +434,21 @@ export class FinopsLedgerService {
     } else {
       const catalog = input.pricingCatalog ?? (await this.loadCatalog(input.provider, input.service, input.modelOrProduct));
       try {
-        const priced = priceUsage(input.usage || {}, catalog, {
+        const target = {
           provider: input.provider,
           service: input.service,
           product: input.modelOrProduct,
           // Default: ahora (una fila con effective_from futuro nunca se aplica antes de tiempo).
           asOf: input.pricingAsOf ?? new Date(),
-        });
+        };
+        let priced = priceUsage(input.usage || {}, catalog, target);
+        // Cota de una llamada LLM (reserva): el máximo entre sus variantes de precio (nunca menor al cargo real).
+        if ((input.metadata as Record<string, unknown> | undefined)?.llmUpperBound === true) {
+          for (const v of llmUpperBoundVariants(input.usage || {})) {
+            const alt = priceUsage(v, catalog, target);
+            if (cmpDec(alt.amount, priced.amount) > 0) priced = alt;
+          }
+        }
         amount = priced.amount;
         currency = priced.currency;
         pricingSnapshot = priced.pricingSnapshot;
@@ -1256,4 +1317,15 @@ export class FinopsLedgerService {
       params,
     );
   }
+}
+
+
+/** Lock consultivo por run de las reservas (FinOps atómico). */
+export const RUN_CAP_LOCK_PREFIX = 'finops:run-cap:';
+
+/** ¿Esta fila es una reserva pagada por Cursia de un run (sujeta al tope atómico del run)? */
+export function isRunCapReservation(row: Record<string, unknown>): boolean {
+  const md = (row.metadata && typeof row.metadata === 'object' ? row.metadata : {}) as Record<string, unknown>;
+  return md.reservation === true && row.event_kind === 'CHARGE' && typeof row.run_id === 'string' && !!row.run_id &&
+    row.billing_account !== 'user_key' && row.billing_account !== 'mock';
 }
