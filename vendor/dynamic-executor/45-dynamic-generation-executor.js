@@ -5962,12 +5962,13 @@ function dynExamBankCheckQuestion(raw, expect, chapterInfo) {
 // Clasificador: una candidata es REVISABLE si su rechazo es de forma Y una sonda determinística (esos campos llevados
 // a una longitud válida; "evidenceRef" faltante probado contra las marcas del capítulo) pasa el validador real.
 // Rangos objetivo dentro de los del validador (y de los que el prompt ya pide), con margen para el conteo del modelo.
-var DYN_EXAM_BANK_REVISION_TARGETS = { stem: [40, 520], explanation: [80, 330], why: [30, 190], whyWrong: [30, 190], term: [2, 55], definition: [10, 190], optionMax: 190, correctLong: [110, 160] };
+var DYN_EXAM_BANK_REVISION_TARGETS = { stem: [40, 520], explanation: [80, 330], why: [30, 190], whyWrong: [30, 190], term: [2, 55], definition: [10, 190], optionMax: 190, correctLong: [110, 140] };
 var DYN_EXAM_BANK_REVISION_FORM_CODES = { MISSING_FIELD: true, EXAM_BANK_SCHEMA: true, EXAM_BANK_DISTRACTORS: true, EXAM_BANK_LENGTH_BIAS: true };
 // Salida estimada de una revisión por pregunta (parche: correcta + 5 distractores / un campo de V/F).
 var DYN_EXAM_BANK_REVISION_TOKENS_EST = { multichoice: 450, truefalse: 160, match: 260 };
 var DYN_EXAM_BANK_REVISION_YIELD_PRIOR = 0.75;   // rendimiento supuesto de la revisión hasta medirlo en el intento
-var DYN_EXAM_BANK_REVISION_MAX_REFS = 80;         // marcas probadas por la sonda (evidenceRef faltante)
+var DYN_EXAM_BANK_REVISION_MAX_REFS = 80;
+var DYN_EXAM_BANK_REVISION_MAX_ITEMS = 40;        // ids por llamada de revisión (= lo que lista dynExamBankRevisionParts)         // marcas probadas por la sonda (evidenceRef faltante)
 function _dynEbClampProbe(s, lo, hi) {
   s = String(s == null ? '' : s).trim();
   if (s.length > hi) return s.slice(0, hi).trim();
@@ -5975,7 +5976,41 @@ function _dynEbClampProbe(s, lo, hi) {
   return s.length > hi ? s.slice(0, hi).trim() : s;
 }
 function _dynEbLenOut(v, lim) { return typeof v !== 'string' || _dynEbLen(v) < lim[0] || _dynEbLen(v) > lim[1]; }
-// → null (no revisable: el rechazo es de contenido, o falta estructura) | { fixes: [texto], code, probe } (probe = la sonda que pasó; solo diagnóstico/pruebas).
+// Rechazo de CONTENIDO que la sonda no debe «arreglar» al rellenar o cortar textos (rev. I1): opción prohibida
+// («todas/ninguna de las anteriores»), distractor igual o contenido en la correcta o en otro, unidades distintas,
+// texto con HTML/marcas, neuromito en lo que se afirma, palabras absolutas solo en distractores. Se mira el ORIGINAL.
+function _dynEbRevisionContentIssue(raw, type) {
+  var L = DYN_EXAM_BANK_LIMITS;
+  var notLen = function (v, lim, name) { var e = _dynEbTextErr(v, lim, name); return !!e && !_dynEbLenOut(v, lim); };
+  if (notLen(raw.stem, L.stem, 'stem')) return true;
+  if (typeof raw.explanation === 'string' && notLen(raw.explanation, L.explanation, 'explanation')) return true;
+  if (type === 'multichoice') {
+    var c = raw.correct.text;
+    if (notLen(c, L.optionText, 'correct.text') || DYN_EXAM_OPTION_FORBIDDEN_RE.test(dynNormalizeExamText(c)) || _dynEbNeuromyth(c)) return true;
+    var cNorm = dynNormalizeExamText(c);
+    var cUnits = dynExamUnitClasses(c);
+    var ds = raw.distractors.map(function (d) { return String(d.text); });
+    for (var i = 0; i < ds.length; i++) {
+      var dn = dynNormalizeExamText(ds[i]);
+      if (notLen(ds[i], L.optionText, 'text') || DYN_EXAM_OPTION_FORBIDDEN_RE.test(dn)) return true;
+      if (!dn || dn === cNorm || dynExamTextContains(c, ds[i]) || dynExamTextContains(ds[i], c)) return true;
+      if (_dynEbUnitMismatch(cUnits, ds[i])) return true;
+      for (var j = 0; j < i; j++) {
+        if (dynNormalizeExamText(ds[j]) === dn || dynExamTextContains(ds[j], ds[i]) || dynExamTextContains(ds[i], ds[j])) return true;
+      }
+      if (typeof raw.distractors[i].why === 'string' && notLen(raw.distractors[i].why, L.optionWhy, 'why')) return true;
+    }
+    // ABSOLUTE_CUE (reglas del validador): basta una terna con < 2 absolutas → irrecuperable solo con < 2 distractores sin ellas.
+    if (!_dynEbHasAbsolute(c) && ds.filter(function (d) { return !_dynEbHasAbsolute(d); }).length < 2) return true;
+  } else if (type === 'truefalse') {
+    if (raw.answer === true && _dynEbNeuromyth(raw.stem)) return true;
+  } else if (raw.pairs.some(function (p) { return notLen(p.term, L.term, 'term') || notLen(p.definition, L.definition, 'definition') || _dynEbNeuromyth(p.term + ' ' + p.definition); })) return true;
+  return false;
+}
+// → null (no revisable: el rechazo es de contenido, o falta estructura) | { fixes: [texto], code, fields, probe }
+// (fields = campos que la revisión puede cambiar; probe = la sonda que pasó, solo diagnóstico/pruebas).
+// rev. M1: primero se prueba SOLO con los campos que fallan (faltantes, textos libres, enunciado/términos largos); las
+// longitudes de opciones se piden solo si sin ellas la pregunta no pasa.
 function dynExamBankRevisionPlan(raw, expect, chapterInfo, check) {
   if (!check || check.ok || !DYN_EXAM_BANK_REVISION_FORM_CODES[check.code] || !_dynIsPlainObject(raw)) return null;
   var L = DYN_EXAM_BANK_LIMITS;
@@ -5989,102 +6024,101 @@ function dynExamBankRevisionPlan(raw, expect, chapterInfo, check) {
   if (type === 'truefalse' && typeof raw.answer !== 'boolean') return null;
   if (type === 'match' && !(Array.isArray(raw.pairs) && raw.pairs.length >= L.pairs[0] && raw.pairs.length <= L.pairs[1]
     && raw.pairs.every(function (p) { return _dynIsPlainObject(p) && typeof p.term === 'string' && typeof p.definition === 'string'; }))) return null;
+  // rev. I1: DISTRACTORS solo si TODOS los descartes son de longitud / why vacío; y ningún rechazo de contenido en el original.
+  if (check.code === 'EXAM_BANK_DISTRACTORS' && (check.dropped || []).some(function (d) { return ['EXAM_BANK_LENGTH_RANGE', 'EXAM_BANK_SCHEMA', 'EXAM_BANK_EMPTY_WHY'].indexOf(d.code) < 0; })) return null;
+  if (_dynEbRevisionContentIssue(raw, type)) return null;
   var probe = JSON.parse(JSON.stringify(raw));
   var fixes = [];
-  // Texto libre (explicaciones): faltante o con error de texto → se reescribe; la sonda pone un texto válido.
-  function freeText(get, set, lim, target, label, missingOk) {
+  var fields = {};
+  function freeText(get, set, lim, target, label, field) {
     var v = get(raw);
-    if (v === undefined && !missingOk) { fixes.push('agrega ' + label + ' (' + target[0] + '–' + target[1] + ' caracteres)'); set(probe, _dynEbClampProbe('', target[0], target[1])); return; }
-    if (v === undefined) return;
-    var err = _dynEbTextErr(v, lim, label);
-    if (!err) return;
-    fixes.push(_dynEbLenOut(v, lim) ? label + ': hoy ' + _dynEbLen(v) + ' caracteres → escribe entre ' + target[0] + ' y ' + target[1] : 'corrige ' + label + ' (' + err + ')');
-    set(probe, _dynEbClampProbe(_dynEbLenOut(v, lim) ? v : '', target[0], target[1]));
+    if (v === undefined) { fixes.push('agrega ' + label + ' (' + target[0] + '–' + target[1] + ' caracteres)'); set(probe, _dynEbClampProbe('', target[0], target[1])); fields[field] = true; return; }
+    if (!_dynEbLenOut(v, lim)) return;
+    fixes.push(label + ': hoy ' + _dynEbLen(v) + ' caracteres → escribe entre ' + target[0] + ' y ' + target[1]);
+    set(probe, _dynEbClampProbe(v, target[0], target[1]));
+    fields[field] = true;
   }
-  // Texto anclado al contenido (enunciado, opciones, términos): SOLO longitud; otro error de texto no es de forma.
-  var substance = false;
-  function anchored(v, lim, target, label, set) {
-    if (typeof v !== 'string') { substance = true; return; }
-    var err = _dynEbTextErr(v, lim, label);
-    if (!err) return;
-    if (!_dynEbLenOut(v, lim)) { substance = true; return; }
+  function anchored(v, lim, target, label, set, field) {
+    if (!_dynEbLenOut(v, lim)) return;
     fixes.push(label + ': hoy ' + _dynEbLen(v) + ' caracteres → condénsalo a ' + target[0] + '–' + target[1]);
     set(_dynEbClampProbe(v, target[0], target[1]));
+    fields[field] = true;
   }
-  anchored(raw.stem, L.stem, T.stem, '"stem"', function (x) { probe.stem = x; });
-  freeText(function (o) { return o.explanation; }, function (o, x) { o.explanation = x; }, L.explanation, T.explanation, '"explanation"');
+  anchored(raw.stem, L.stem, T.stem, '"stem"', function (x) { probe.stem = x; }, 'stem');
+  freeText(function (o) { return o.explanation; }, function (o, x) { o.explanation = x; }, L.explanation, T.explanation, '"explanation"', 'explanation');
   var needRef = !('evidenceRef' in raw) && !('evidence' in raw);
-  if (needRef) fixes.push('agrega "evidenceRef": la marca [S#] del texto de ESTE capítulo cuyo fragmento respalda ' + (type === 'multichoice' ? 'la respuesta correcta' : type === 'truefalse' ? 'la afirmación' : 'los pares'));
-  if (type === 'truefalse') freeText(function (o) { return o.whyWrong; }, function (o, x) { o.whyWrong = x; }, L.whyWrong, T.whyWrong, '"whyWrong"');
+  if (needRef) { fixes.push('agrega "evidenceRef": la marca [S#] del texto de ESTE capítulo cuyo fragmento respalda ' + (type === 'multichoice' ? 'la respuesta correcta' : type === 'truefalse' ? 'la afirmación' : 'los pares')); fields.evidenceRef = true; }
+  if (type === 'truefalse') freeText(function (o) { return o.whyWrong; }, function (o, x) { o.whyWrong = x; }, L.whyWrong, T.whyWrong, '"whyWrong"', 'whyWrong');
   if (type === 'match') {
     raw.pairs.forEach(function (p, i) {
-      anchored(p.term, L.term, T.term, 'term del par ' + (i + 1), function (x) { probe.pairs[i].term = x; });
-      anchored(p.definition, L.definition, T.definition, 'definition del par ' + (i + 1), function (x) { probe.pairs[i].definition = x; });
+      anchored(p.term, L.term, T.term, 'term del par ' + (i + 1), function (x) { probe.pairs[i].term = x; }, 'pairs');
+      anchored(p.definition, L.definition, T.definition, 'definition del par ' + (i + 1), function (x) { probe.pairs[i].definition = x; }, 'pairs');
     });
   }
   if (type === 'multichoice') {
-    freeText(function (o) { return o.correct.why; }, function (o, x) { o.correct.why = x; }, L.optionWhy, T.why, '"correct.why"');
+    freeText(function (o) { return o.correct.why; }, function (o, x) { o.correct.why = x; }, L.optionWhy, T.why, '"correct.why"', 'correct.why');
     raw.distractors.forEach(function (d, i) {
-      freeText(function (o) { return o.distractors[i].why; }, function (o, x) { o.distractors[i].why = x; }, L.optionWhy, T.why, '"why" del distractor ' + (i + 1));
+      freeText(function (o) { return o.distractors[i].why; }, function (o, x) { o.distractors[i].why = x; }, L.optionWhy, T.why, '"why" del distractor ' + (i + 1), 'distractors.why');
     });
-    var cl = _dynEbLen(raw.correct.text);
-    var cText = raw.correct.text;
-    if (_dynEbTextErr(cText, L.optionText, 'correct.text') && !_dynEbLenOut(cText, L.optionText)) substance = true;
-    var lens = raw.distractors.map(function (d) { return _dynEbLen(d.text); });
-    // Rango de la correcta: la de más de 170 caracteres se condensa a 110–160; si no, se conserva tal cual.
-    var cLo = cl, cHi = cl;
-    if (cl > 170) { cLo = T.correctLong[0]; cHi = T.correctLong[1]; }
-    // Distractores dentro de 0,6×máx(correcta) y 1,5×mín(correcta) (validador: 0,5–1,7×), nunca más de 190.
-    var dLo = Math.max(1, Math.ceil(0.6 * cHi));
-    var dHi = Math.min(T.optionMax, Math.floor(1.5 * cLo));
-    if (dHi < dLo) return null;
-    var longOk = function (l) { return l > cHi; };
-    var lenBad = cl !== cHi || lens.some(function (l) { return l < dLo || l > dHi; }) || lens.filter(longOk).length < 2 || check.code === 'EXAM_BANK_LENGTH_BIAS';
-    if (lenBad) {
-      if (cl !== cHi) fixes.push('"correct.text": hoy ' + cl + ' caracteres → condénsala a ' + cLo + '–' + cHi + ' (misma respuesta)');
-      fixes.push('"distractors": devuelve los 5 en el mismo orden y con la misma idea de cada uno; cada "text" entre ' + dLo + ' y ' + dHi + ' caracteres, al menos 2 MÁS LARGOS que la opción correcta y al menos 2 MÁS CORTOS (hoy miden ' + lens.join(', ') + ')');
-      probe.correct.text = _dynEbClampProbe(cText, cLo, cHi);
-      var pc = _dynEbLen(probe.correct.text);
-      var longL = Math.min(dHi, Math.max(pc + 10, Math.ceil(1.2 * pc)));
-      var shortL = Math.max(dLo, Math.min(pc - 10, Math.floor(0.8 * pc)));
-      var want = [longL, shortL, longL, shortL, Math.round((longL + shortL) / 2)];
-      probe.distractors.forEach(function (d, i) { d.text = _dynEbClampProbe(d.text, want[i], want[i]); });
-    }
   }
-  if (substance || !fixes.length) return null;
-  // Sonda: el validador REAL sobre la pregunta con esos campos corregidos (cota superior de lo que logra la revisión).
   var refs = [null];
   if (needRef) {
     var info = chapterInfo ? chapterInfo(raw.chapterId) : null;
     refs = info && info.refs ? Object.keys(info.refs).slice(0, DYN_EXAM_BANK_REVISION_MAX_REFS) : [];
   }
-  for (var k = 0; k < refs.length; k++) {
-    if (refs[k]) probe.evidenceRef = refs[k];
-    if (dynExamBankCheckQuestion(probe, expect, chapterInfo).ok) return { fixes: fixes, code: check.code, probe: probe };
+  function passes() {
+    for (var k = 0; k < refs.length; k++) {
+      if (refs[k]) probe.evidenceRef = refs[k];
+      if (dynExamBankCheckQuestion(probe, expect, chapterInfo).ok) return true;
+    }
+    return false;
   }
-  return null;
+  var cl = type === 'multichoice' ? _dynEbLen(raw.correct.text) : 0;
+  if (fixes.length && !(type === 'multichoice' && cl > L.optionText[1]) && passes()) return { fixes: fixes, code: check.code, fields: Object.keys(fields), probe: probe };
+  if (type !== 'multichoice') return null;
+  // Longitudes de opciones: la correcta de más de 170 caracteres se condensa a 110–140; distractores entre 0,6×máx y
+  // 1,5×mín de la correcta (validador: 0,5–1,7×), nunca más de 190, al menos 2 más largos y 2 más cortos que ella.
+  var lens = raw.distractors.map(function (d) { return _dynEbLen(d.text); });
+  var cLo = cl, cHi = cl;
+  if (cl > 170) { cLo = T.correctLong[0]; cHi = T.correctLong[1]; }
+  var dLo = Math.max(1, Math.ceil(0.6 * cHi));
+  var dHi = Math.min(T.optionMax, Math.floor(1.5 * cLo));
+  if (dHi <= cHi || dLo >= cLo) return null;
+  if (cl !== cHi) fixes.push('"correct.text": hoy ' + cl + ' caracteres → condénsala a ' + cLo + '–' + cHi + ' (misma respuesta)');
+  fixes.push('"distractors": devuelve los 5 en el mismo orden y con la misma idea de cada uno; cada "text" entre ' + dLo + ' y ' + dHi + ' caracteres, al menos 2 MÁS LARGOS que la opción correcta y al menos 2 MÁS CORTOS (hoy miden ' + lens.join(', ') + ')');
+  fields['correct.text'] = cl !== cHi; fields.distractors = true;
+  if (!fields['correct.text']) delete fields['correct.text'];
+  probe.correct.text = _dynEbClampProbe(raw.correct.text, cLo, cHi);
+  var pc = _dynEbLen(probe.correct.text);
+  var longL = Math.min(dHi, Math.max(pc + 10, Math.ceil(1.2 * pc)));
+  var shortL = Math.max(dLo, Math.min(pc - 10, Math.floor(0.8 * pc)));
+  var want = [longL, shortL, longL, shortL, Math.round((longL + shortL) / 2)];
+  probe.distractors.forEach(function (d, i) { d.text = _dynEbClampProbe(d.text, want[i], want[i]); });
+  return passes() ? { fixes: fixes, code: check.code, fields: Object.keys(fields), probe: probe } : null;
 }
-// Parche de la revisión sobre la candidata original: solo campos de contenido conocidos; los arreglos (distractores,
-// pares) se combinan por posición y deben tener el mismo largo. id / type / capítulo / nivel / respuesta no cambian.
-function dynExamBankApplyRevision(orig, patch) {
+// Parche de la revisión sobre la candidata original: solo campos de contenido conocidos — y, con `fields` (rev. M3),
+// solo los que la revisión debía corregir; los arreglos (distractores, pares) se combinan por posición y deben tener el
+// mismo largo. id / type / capítulo / nivel / respuesta nunca cambian.
+function dynExamBankApplyRevision(orig, patch, fields) {
   if (!_dynIsPlainObject(orig) || !_dynIsPlainObject(patch)) return null;
+  var allow = function (k) { return !fields || fields.indexOf(k) >= 0; };
   var out = JSON.parse(JSON.stringify(orig));
-  ['stem', 'explanation', 'whyWrong'].forEach(function (k) { if (typeof patch[k] === 'string') out[k] = patch[k]; });
-  if (typeof patch.evidenceRef === 'string') { out.evidenceRef = patch.evidenceRef; delete out.evidence; }
+  ['stem', 'explanation', 'whyWrong'].forEach(function (k) { if (allow(k) && typeof patch[k] === 'string') out[k] = patch[k]; });
+  if (allow('evidenceRef') && typeof patch.evidenceRef === 'string') { out.evidenceRef = patch.evidenceRef; delete out.evidence; }
   if (_dynIsPlainObject(patch.correct) && _dynIsPlainObject(out.correct)) {
-    if (typeof patch.correct.text === 'string') out.correct.text = patch.correct.text;
-    if (typeof patch.correct.why === 'string') out.correct.why = patch.correct.why;
+    if (allow('correct.text') && typeof patch.correct.text === 'string') out.correct.text = patch.correct.text;
+    if (allow('correct.why') && typeof patch.correct.why === 'string') out.correct.why = patch.correct.why;
   }
-  function byIndex(key, fields) {
+  function byIndex(key, fieldsOf) {
     if (!Array.isArray(patch[key]) || !Array.isArray(out[key])) return;
     if (patch[key].length !== out[key].length) return;
     patch[key].forEach(function (p, i) {
       if (!_dynIsPlainObject(p) || !_dynIsPlainObject(out[key][i])) return;
-      fields.forEach(function (f) { if (typeof p[f] === 'string') out[key][i][f] = p[f]; });
+      fieldsOf.forEach(function (f) { if (typeof p[f] === 'string') out[key][i][f] = p[f]; });
     });
   }
-  byIndex('distractors', ['text', 'why']);
-  byIndex('pairs', ['term', 'definition']);
+  byIndex('distractors', allow('distractors') ? ['text', 'why'] : allow('distractors.why') ? ['why'] : []);
+  if (allow('pairs')) byIndex('pairs', ['term', 'definition']);
   return out;
 }
 
@@ -7348,7 +7382,8 @@ async function _dynRunExamBank(item) {
   }
   var roundLog = null; // D3: { leafIndex: [{ ok, code, ref, terms }] } de la ronda de reparación en curso
   // isRevision: la lista viene de una revisión de forma (parche ya aplicado): una revisión por candidata.
-  function ingest(list, allowed, isRepair, fromStore, isRevision) {
+  // quiet: recarga de candidatas del borrador (ya contadas en el intento anterior): no suma a rejectedByCode (rev. M7).
+  function ingest(list, allowed, isRepair, fromStore, isRevision, quiet) {
     var seen = {};
     list.forEach(function (raw) {
       var id = raw && raw.id;
@@ -7386,16 +7421,16 @@ async function _dynRunExamBank(item) {
         if (r.evidenceByRef) delete stored.evidenceRef;
         rec.status = 'valid'; rec.q = r.q; rec.raw = stored;
         rec.combos = r.combos; rec.reasons = []; rec.repaired = !!isRepair; rec._dupAccepted = false;
-        rec.revCand = null; rec.revised = !!isRevision;
+        rec.revCand = null;
       } else {
-        _dynEbCount(rejectedByCode, r.code);
-        noteDetail(r.code, r.message);
+        // rev. M7: el rechazo de una revisión va solo a stats.revision.stillCodes (la candidata ya se contó).
+        if (!isRevision && !quiet) { _dynEbCount(rejectedByCode, r.code); noteDetail(r.code, r.message); }
         if (!(isRepair && rec.status === 'valid')) {
           rec.status = 'rejected'; rec.reasons = [{ code: r.code, message: r.message }];
           // Revisión de forma: la candidata rechazada SOLO por forma se guarda con sus correcciones (una revisión por
           // candidata: el resultado de una revisión ya no se vuelve a revisar; lo cubre la reparación).
           var rp = !isRevision ? dynExamBankRevisionPlan(raw, expectFor(rec), chapterInfo, r) : null;
-          rec.revCand = rp ? { raw: JSON.parse(JSON.stringify(raw)), fixes: rp.fixes, code: rp.code } : null;
+          rec.revCand = rp ? { raw: JSON.parse(JSON.stringify(raw)), fixes: rp.fixes, code: rp.code, fields: rp.fields } : null;
           if (rp) stats.revision.revisable++;
         }
       }
@@ -7470,13 +7505,17 @@ async function _dynRunExamBank(item) {
       draft.candidates.forEach(function (q) { if (_dynIsPlainObject(q) && typeof q.id === 'string' && !records[q.id]) mintFromDraft(q); });
       var candList = draft.candidates.filter(function (q) { return _dynIsPlainObject(q) && typeof q.id === 'string' && records[q.id] && records[q.id].status !== 'valid'; });
       var before = stats.revision.revisable;
-      ingest(candList, idSet(candList.map(function (q) { return q.id; })), false, true);
+      ingest(candList, idSet(candList.map(function (q) { return q.id; })), false, true, false, true);
       stats.revision.fromDraft = stats.revision.revisable - before;
       draftInfo.candidates = stats.revision.fromDraft;
     }
   }
   // Revisión de forma: una parte con candidatas revisables del borrador tampoco se vuelve a pedir (se revisan).
-  function chunkHasValid(ch) { return ch.ids.some(function (id) { return records[id].status === 'valid' || !!records[id].revCand; }); }
+  // rev. M4: con al menos una válida, o con candidatas revisables para la mitad de sus ids o más.
+  function chunkHasValid(ch) {
+    if (ch.ids.some(function (id) { return records[id].status === 'valid'; })) return true;
+    return 2 * ch.ids.filter(function (id) { return !!records[id].revCand; }).length >= ch.ids.length;
+  }
   // D3: memoria por hoja (se llena desde el borrador antes de reparar); existe desde ya porque una falla de la
   // generación (EXAM_BANK_GENERATION_FAILED) también arma el borrador.
   var hist = Object.create(null);
@@ -7510,6 +7549,12 @@ async function _dynRunExamBank(item) {
     var rv = stats.revision;
     return rv.returned >= 4 ? Math.max(0.2, rv.valid / rv.returned) : DYN_EXAM_BANK_REVISION_YIELD_PRIOR;
   }
+  // rev. M5: revisiones que no sirven (≥ 8 devueltas y < 5 % válidas) → no se piden más en el intento (como la reparación).
+  function revisionStopped() {
+    var rv = stats.revision;
+    if (rv.returned >= 8 && rv.valid < 0.05 * rv.returned) { rv.stopped = true; return true; }
+    return false;
+  }
   // Llamadas de revisión para estas candidatas: por capítulo (mismo prefijo que sus partes → caché) y cortadas por la
   // salida estimada del parche. Cada candidata se revisa a lo sumo una vez por intento.
   function revisionCalls(recs) {
@@ -7522,7 +7567,10 @@ async function _dynRunExamBank(item) {
     var out = [];
     byU.forEach(function (g) {
       var first = chunks.filter(function (ch) { return ch.unit === g.unit; })[0];
-      dynExamBankSplitByTokens(g.seq, DYN_EXAM_BANK_MAX_OUTPUT_EST, DYN_EXAM_BANK_REVISION_TOKENS_EST).forEach(function (part) { out.push({ base: first, ids: part.map(function (x) { return x.id; }) }); });
+      // rev. M2: además del tope de tokens, ≤ DYN_EXAM_BANK_REVISION_MAX_ITEMS por llamada (lo que lista el prompt).
+      dynExamBankSplitByTokens(g.seq, DYN_EXAM_BANK_MAX_OUTPUT_EST, DYN_EXAM_BANK_REVISION_TOKENS_EST).forEach(function (part) {
+        for (var i = 0; i < part.length; i += DYN_EXAM_BANK_REVISION_MAX_ITEMS) out.push({ base: first, ids: part.slice(i, i + DYN_EXAM_BANK_REVISION_MAX_ITEMS).map(function (x) { return x.id; }) });
+      });
     });
     return out;
   }
@@ -7553,7 +7601,7 @@ async function _dynRunExamBank(item) {
     res.questions.forEach(function (p) {
       if (!_dynIsPlainObject(p) || typeof p.id !== 'string' || !Object.prototype.hasOwnProperty.call(cands, p.id) || seen[p.id]) return;
       seen[p.id] = true;
-      var m = dynExamBankApplyRevision(cands[p.id].raw, p);
+      var m = dynExamBankApplyRevision(cands[p.id].raw, p, cands[p.id].fields);
       if (m) merged.push(m);
     });
     ingest(merged, idSet(Object.keys(seen)), true, false, true);
@@ -7564,6 +7612,7 @@ async function _dynRunExamBank(item) {
   // en la hoja; en el examen del módulo = la hoja entera), con el rendimiento esperado de la revisión. Lo que falte lo
   // decide la reparación con la hoja ya ensamblada.
   async function reviseAfterMain(ids) {
+    if (revisionStopped()) return;
     var byLeaf = {};
     ids.forEach(function (id) { var r = records[id]; (byLeaf[r.leafIndex] = byLeaf[r.leafIndex] || []).push(r); });
     var pick = [];
@@ -7586,6 +7635,7 @@ async function _dynRunExamBank(item) {
   // Al inicio de cada ronda de reparación: candidatas revisables de las hojas cortas (y de capítulos del final sin
   // preguntas) antes de pedir reemplazos; los reemplazos cubren solo lo que la revisión no cerró.
   async function reviseShortLeaves(round) {
+    if (revisionStopped()) return false;
     var pick = [];
     var taken = {};
     a.short.forEach(function (s) {
@@ -7725,6 +7775,8 @@ async function _dynRunExamBank(item) {
     return blocks.join('\n\n');
   }
   for (var round = 1; round <= DYN_EXAM_BANK_REPAIR_ROUNDS; round++) {
+    // rev. I2: el avance de la ronda se mide desde ANTES de sus revisiones (una hoja que crece por revisión avanzó).
+    var keptPreRound = a.perLeaf.map(function (l) { return l.kept; });
     if (await reviseShortLeaves(round)) a = assemble();
     var keptIds = idSet(a.questions.map(function (q) { return q.id; }));
     var entries = [];
@@ -7769,7 +7821,7 @@ async function _dynRunExamBank(item) {
           stats.poolCandidates++;
         }
       }
-      leafInfo[s.leafIndex] = { strategy: h.strategy, keptBefore: s.kept };
+      leafInfo[s.leafIndex] = { strategy: h.strategy, keptBefore: Math.min(s.kept, keptPreRound[s.leafIndex]) };
     });
     a.uncovered.forEach(function (chId) {
       recordList().forEach(function (r) {

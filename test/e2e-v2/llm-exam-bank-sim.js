@@ -230,7 +230,9 @@ function createSimLlm(front, opts) {
   function reviseCall(p, blocks, prompt) {
     st.revisionCalls++;
     const rng = rngFor(fnv(`${o.seed}|rev|${st.calls}`));
-    const revisions = p.asks.map((ask) => {
+    // rev. M9: el mismo ruido de formato que las demás llamadas (ids omitidos, JSON inválido).
+    const callR = rng();
+    const revisions = p.asks.filter(() => rng() >= NZ.omit).map((ask) => {
       st.revisionAsked++;
       if (rng() >= o.pRev) return { id: ask.id };
       // La capacidad de la hoja atascada (perfiles b/c/c2) acota TODAS las válidas, también las corregidas por revisión.
@@ -255,6 +257,7 @@ function createSimLlm(front, opts) {
     let usd = outTok * PRICE.output + inTail * PRICE.input;
     if (!st.warm.has(key)) { st.warm.add(key); st.cacheWrite += pre; usd += pre * PRICE.cacheWrite; } else { st.cacheRead += pre; usd += pre * PRICE.cacheRead; }
     st.outputTokens += outTok; st.inTail += inTail; st.usd += usd;
+    if (callR < NZ.badJson) { st.faults.BAD_JSON = (st.faults.BAD_JSON || 0) + 1; return { text: '{"revisions": [ esto no es JSON' }; }
     return { text: JSON.stringify({ revisions }) };
   }
   return { respond, st, setAttempt: (a) => { o.attempt = a; }, citable };

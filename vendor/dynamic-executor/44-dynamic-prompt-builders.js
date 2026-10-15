@@ -1869,7 +1869,7 @@ function dynExamBankRepairParts(baseParts, rejected, accepted, memory) {
 // items = [{ id, type, chapterId, moduleId?, question (objeto rechazado), fixes: [texto] }]. Mismo prefijo
 // (source + task) que las partes del capítulo → lectura de caché. El parche se re-valida con el MISMO validador.
 function dynExamBankRevisionParts(baseParts, items) {
-  var list = (items || []).slice(0, 40).map(function (it) {
+  var list = (items || []).slice(0, typeof DYN_EXAM_BANK_REVISION_MAX_ITEMS === "number" ? DYN_EXAM_BANK_REVISION_MAX_ITEMS : 40).map(function (it) {
     return '- id "' + it.id + '" (type "' + it.type + '", chapterId "' + it.chapterId + '"' + (it.moduleId ? ', moduleId "' + it.moduleId + '"' : '') + ')\n'
       + '  PREGUNTA: ' + JSON.stringify(it.question || {}) + '\n'
       + '  CORREGIR: ' + (it.fixes || []).join(' | ');
