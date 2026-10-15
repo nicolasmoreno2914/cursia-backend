@@ -1861,6 +1861,27 @@ function dynExamBankRepairParts(baseParts, rejected, accepted, memory) {
     + 'No repitas preguntas aceptadas ni devuelvas las que no están en la lista.'
     + '\n\nDevuelve SOLO el JSON { "questions": [...] } con los reemplazos, nada más.');
 }
+// ── Revisión de FORMA (2026-10-15, examen final #1353) ──
+// La mayoría de las candidatas rechazadas del examen final tenían el contenido bien (situación, respuesta,
+// evidencia) y fallaban SOLO por forma: opciones demasiado largas, distractores fuera de rango de longitud,
+// "explanation"/"evidenceRef" omitidos. Reescribirlas desde cero (reparación) repetía el mismo patrón; la
+// revisión pide corregir SOLO los campos indicados de la pregunta ya escrita y devolverlos como parche.
+// items = [{ id, type, chapterId, moduleId?, question (objeto rechazado), fixes: [texto] }]. Mismo prefijo
+// (source + task) que las partes del capítulo → lectura de caché. El parche se re-valida con el MISMO validador.
+function dynExamBankRevisionParts(baseParts, items) {
+  var list = (items || []).slice(0, 40).map(function (it) {
+    return '- id "' + it.id + '" (type "' + it.type + '", chapterId "' + it.chapterId + '"' + (it.moduleId ? ', moduleId "' + it.moduleId + '"' : '') + ')\n'
+      + '  PREGUNTA: ' + JSON.stringify(it.question || {}) + '\n'
+      + '  CORREGIR: ' + (it.fixes || []).join(' | ');
+  }).join('\n');
+  return dynExamBankWithTail(baseParts, '\n\nEXAM_BANK_REVISION v1\n'
+    + 'Estas preguntas ya escritas fueron RECHAZADAS por el validador automático SOLO por FORMA (longitudes o campos que faltan). Su situación, su respuesta correcta y su evidencia se conservan: NO las reescribas desde cero ni cambies de qué tratan. '
+    + 'Corrige EXCLUSIVAMENTE lo indicado en CORREGIR, conservando el sentido, la respuesta correcta y el nivel, y cumpliendo TODAS las reglas de arriba. Al acortar un texto, condensa la idea (no la cortes a la mitad).\n'
+    + list
+    + '\n\nDevuelve SOLO el JSON { "revisions": [ { "id": "<id>", …solo los campos corregidos… } ] }, una entrada por id, nada más. '
+    + 'Campos que puedes devolver: "stem", "explanation", "evidenceRef", "whyWrong", "correct" ({ "text", "why" }), "distractors" (los 5, en el MISMO orden, cada uno { "text", "why" }), "pairs" (todos, en el mismo orden, cada uno { "term", "definition" }). '
+    + 'Un campo que no devuelves queda como estaba. JSON MINIFICADO en una sola línea.');
+}
 function dynExamBankRepairPrompt(baseParts, rejected, accepted) {
   return dynExamBankPromptText(dynExamBankRepairParts(baseParts, rejected, accepted));
 }

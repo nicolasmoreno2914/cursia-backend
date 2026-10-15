@@ -139,10 +139,19 @@ function validateArtifact(res, item, md) {
   ok(llm.st.invalidSent.exam_bank === 1 && repairs.length === 1 && llm.st.retriesSeen.exam_bank === 1, `falla inyectada 1 vez → EXACTAMENTE 1 reparación (${repairs.length})`, { inv: llm.st.invalidSent, rep: repairs });
   const injected = (llm.st.examBank.faults[0] || {}).faults || {};
   const injIds = Object.keys(injected).sort();
-  ok(Object.keys(injected).length === 6 && repairs.length === 1 && JSON.stringify(repairs[0].ids.slice(0, 2)) === JSON.stringify(injIds.slice(0, 2)) && repairs[0].ids.length > 2 && repairs[0].ids.length <= 10 && repairs[0].ids.every((id) => /^M1-C1-MC-\d+$/.test(id)),
-    'exam-bank D2: 6 rechazadas en la hoja MC (holgura 4) → UNA reparación con las 2 que faltan (las primeras en orden) + candidatas del pool de la MISMA hoja (≤ 6× el faltante)', { repairs, injected });
+  // Revisión de forma (2026-10-15): la rechazada SOLO por forma (LENGTH_BIAS) se corrige con UNA revisión del capítulo;
+  // las de evidencia inventada (contenido) van a la reparación: falta 1 → la primera de ellas + candidatas del pool.
+  const revs = llm.st.v3calls.filter((c) => c.kind === 'exam_bank_revision');
+  const lbId = injIds.find((id) => injected[id] === 'EXAM_BANK_LENGTH_BIAS');
+  const evIds = injIds.filter((id) => injected[id] === 'EXAM_BANK_EVIDENCE');
+  ok(Object.keys(injected).length === 6 && revs.length === 1 && JSON.stringify(revs[0].ids) === JSON.stringify([lbId]),
+    'revisión de forma: la candidata LENGTH_BIAS se corrige con UNA revisión (solo ella; las de evidencia no son de forma)', { revs, injected });
+  ok(repairs.length === 1 && repairs[0].ids[0] === evIds[0] && repairs[0].ids.length > 1 && repairs[0].ids.length <= 10 && repairs[0].ids.every((id) => /^M1-C1-MC-\d+$/.test(id) && id !== lbId),
+    'exam-bank D2: 6 rechazadas en la hoja MC (holgura 4), 1 corregida por revisión → UNA reparación con la que falta (la primera de evidencia) + candidatas del pool de la MISMA hoja', { repairs, injected });
   const rp = prompts.filter((p) => p.split('\n').includes('EXAM_BANK_REPAIR v2'));
-  ok(rp.length === 1 && /EXAM_BANK_EVIDENCE/.test(rp[0]) && /EXAM_BANK_LENGTH_BIAS/.test(rp[0]) && /EXAM_BANK_POOL/.test(rp[0]) && !rp[0].includes('CANTIDADES ('), 'el prompt de reparación nombra los dos motivos (EVIDENCE y LENGTH_BIAS), marca las adicionales del pool y no repite las CANTIDADES');
+  ok(rp.length === 1 && /EXAM_BANK_EVIDENCE/.test(rp[0]) && /EXAM_BANK_POOL/.test(rp[0]) && !rp[0].includes('CANTIDADES ('), 'el prompt de reparación nombra el motivo (EVIDENCE), marca las adicionales del pool y no repite las CANTIDADES');
+  const vp = prompts.filter((p) => p.split('\n').includes('EXAM_BANK_REVISION v1'));
+  ok(vp.length === 1 && vp[0].includes('- id "' + lbId + '"') && /PREGUNTA: \{/.test(vp[0]) && /"distractors": devuelve los 5 en el mismo orden.*al menos 2 MÁS LARGOS/.test(vp[0]) && !vp[0].includes('CANTIDADES ('), 'el prompt de revisión lleva la pregunta rechazada y la corrección exacta de longitudes (sin CANTIDADES)');
   ok(prompts.every((p) => p.startsWith('EXAM_BANK_SOURCE v2\n')) && prompts.filter((p) => !p.includes('EXAM_BANK_REPAIR v2')).every((p) => p.split('\n').includes('EXAM_BANK_CHAPTER v2')), 'módulo: fuente del capítulo primero; llamadas principales EXAM_BANK_CHAPTER v2 (un capítulo por llamada)');
   const shapes = llm.st.examBank.blockShapes;
   ok(shapes.length === prompts.length && shapes.every((x) => JSON.stringify(x) === JSON.stringify(['ephemeral', 'ephemeral', null])), `BANKOPT: ${shapes.length} prompts de banco como [fuente+cache_control, tarea+cache_control, tail]`, shapes);

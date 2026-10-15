@@ -1512,6 +1512,10 @@ export async function processRealProviderItem(deps: RealProviderDeps, item: Clai
     const msg = `unexpected_error: ${detail}`;
     deps.logger.error(`Item ${item.itemKey}: ${msg}`);
     await deps.scheduler.failItem(item.itemRunId, deps.executorId, msg.slice(0, 1900), true);
+  } finally {
+    // La copia en memoria de los marcadores de envío vive solo mientras se procesa el item (lo durable está en el
+    // item): un worker de larga vida no acumula una entrada por item procesado.
+    sentByItem.delete(item.itemRunId);
   }
 }
 
