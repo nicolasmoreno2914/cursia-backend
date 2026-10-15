@@ -169,11 +169,6 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
     if (abandoned) { clearInterval(hb); return 'abandoned'; }
 
     if (!result || !result.ok) {
-      // Falla de la parte (validación / reglas): sus puntos de guardado se descartan (un reintento debe generar de nuevo,
-      // nunca repetir la misma respuesta inválida) — salvo un banco que solo falla una regla de conjunto (ver arriba).
-      if (discardCheckpointsOnFailure(result)) {
-        await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
-      } else deps.logger.log(`Item ${item.itemKey}: regla de conjunto del banco — puntos de guardado conservados para el reintento`);
       // Borrador entre intentos (banco de examen o, O2b, actividad de aplicación ya validada): el campo depende del tipo.
       const opts: Record<string, unknown> = {};
       const draftField = runtime.draftFailField(item);
@@ -182,6 +177,13 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
       } else if (result && result.draftClear && draftField) {
         opts[draftField] = null;
       }
+      // Falla de la parte (validación / reglas): sus puntos de guardado se descartan (un reintento debe generar de nuevo,
+      // nunca repetir la misma respuesta inválida) — salvo un banco que solo falla una regla de conjunto (ver arriba), y
+      // solo si su borrador QUEDÓ subido (rev. I3: sin borrador el reintento repetiría las mismas respuestas).
+      const draftSaved = !!draftField && typeof opts[draftField] === 'string' && !!opts[draftField];
+      if (!draftSaved || discardCheckpointsOnFailure(result)) {
+        await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
+      } else deps.logger.log(`Item ${item.itemKey}: regla de conjunto del banco — puntos de guardado conservados para el reintento (borrador ${opts[draftField]})`);
       await fail((result && result.error) || 'unexpected_error: el ejecutor no devolvió un resultado', !result || result.retryable !== false, Object.keys(opts).length ? (opts as any) : undefined);
       return 'failed';
     }

@@ -6154,6 +6154,34 @@ function dynExamBankApplyLengthRevision(orig, patch, idx) {
   for (var i = 0; i < out.distractors.length; i++) if (idx.indexOf(i) < 0) out.distractors[i] = JSON.parse(JSON.stringify(orig.distractors[i]));
   return out;
 }
+// rev. I2 (guardia ADITIVA, además del validador): el distractor alargado conserva la idea del original (≥ 60 % de sus
+// palabras), no se rellena con palabras repetidas, no se parece a la correcta (Jaccard < 0,6), los 2 alargados no se
+// parecen entre sí (< 0,8) y no aparecen palabras absolutas nuevas. Si no, la pregunta original queda.
+function _dynEbLenTokens(t) { return dynExamTokens(dynNormalizeExamText(t)).filter(function (x) { return x.length >= 3 || /\p{N}/u.test(x); }); }
+function _dynEbJaccard(a, b) {
+  var A = {}, B = {}, inter = 0, uni = 0;
+  a.forEach(function (x) { A[x] = true; }); b.forEach(function (x) { B[x] = true; });
+  Object.keys(A).forEach(function (x) { uni++; if (B[x]) inter++; });
+  Object.keys(B).forEach(function (x) { if (!A[x]) uni++; });
+  return uni ? inter / uni : 0;
+}
+function dynExamBankLengthPatchOk(origQ, newQ, idx) {
+  var cTok = _dynEbLenTokens(newQ.correct.text);
+  var news = [];
+  for (var k = 0; k < idx.length; k++) {
+    var o = String(origQ.distractors[idx[k]].text), n = String(newQ.distractors[idx[k]].text);
+    var oT = _dynEbLenTokens(o), nT = _dynEbLenTokens(n);
+    var nSet = {}; nT.forEach(function (x) { nSet[x] = true; });
+    var kept = oT.filter(function (x) { return nSet[x]; }).length;
+    if (oT.length && kept < 0.6 * oT.length) return false;                 // otra idea
+    if (nT.length && Object.keys(nSet).length < 0.75 * nT.length) return false; // relleno repetido
+    if (_dynEbJaccard(nT, cTok) >= 0.6) return false;                      // parafrasea la correcta
+    if (!_dynEbHasAbsolute(o) && _dynEbHasAbsolute(n)) return false;       // pista absoluta nueva
+    news.push(nT);
+  }
+  if (news.length === 2 && _dynEbJaccard(news[0], news[1]) >= 0.8) return false; // los 2 alargados casi iguales
+  return true;
+}
 // Excedente sobre el 30 % del banco ensamblado (0 si cumple).
 function dynExamBankLengthBiasExcess(a) {
   if (!a || !a.mcTotal) return 0;
@@ -7128,6 +7156,7 @@ async function _dynEbLoadDraft(item, expect) {
   if (Array.isArray(doc.lengthRevisedIds)) out.lengthRevisedIds = doc.lengthRevisedIds.filter(function (x) { return typeof x === 'string' && DYN_EXAM_BANK_ID_RE.test(x); }).slice(0, DYN_EXAM_BANK_DRAFT_MAX_QUESTIONS);
   if (typeof doc.setRuleAttempts === 'number' && isFinite(doc.setRuleAttempts)) out.setRuleAttempts = Math.max(0, Math.min(10, Math.floor(doc.setRuleAttempts)));
   if (typeof doc.setRuleFixedLast === 'number' && isFinite(doc.setRuleFixedLast)) out.setRuleFixedLast = Math.max(0, Math.floor(doc.setRuleFixedLast));
+  if (typeof doc.setRuleReturnedLast === 'number' && isFinite(doc.setRuleReturnedLast)) out.setRuleReturnedLast = Math.max(0, Math.floor(doc.setRuleReturnedLast));
   // Exam-bank D3: memoria por hoja del intento anterior (opcional; un borrador sin ella empieza de cero).
   if (_dynIsPlainObject(doc.leafHistory)) out.leafHistory = doc.leafHistory;
   // Revisión de forma: candidatas revisables del intento anterior (opcional).
@@ -7728,7 +7757,6 @@ async function _dynRunExamBank(item) {
     var items = [];
     c.ids.forEach(function (id) {
       var r = records[id];
-      lenTried[id] = true;
       items.push({ id: id, type: 'multichoice', chapterId: r.unit.chapterId, moduleId: r.unit.moduleId, question: r.raw, fixes: lenPlans[id].fixes });
     });
     var parts = dynExamBankRevisionParts(c.base.parts, items);
@@ -7741,10 +7769,15 @@ async function _dynRunExamBank(item) {
     res.questions.forEach(function (p) {
       if (!_dynIsPlainObject(p) || typeof p.id !== 'string' || !lenPlans[p.id] || seen[p.id] || c.ids.indexOf(p.id) < 0) return;
       seen[p.id] = true;
+      // rev. I1: solo una respuesta REAL del modelo gasta la revisión de ese id (una llamada fallida no es evidencia).
+      lenTried[p.id] = true;
       setRuleStats.returned++;
       var rec = records[p.id];
       var m = dynExamBankApplyLengthRevision(rec.raw, p, lenPlans[p.id].idx);
       if (!m) return;
+      // rev. M1: moneda es-CO también en los distractores alargados (antes de validar).
+      if (bankMoneyCo) stats.moneyNormalized += dynNormalizeMoneyDeep(m);
+      if (!dynExamBankLengthPatchOk(rec.raw, m, lenPlans[p.id].idx)) { setRuleStats.guardRejected = (setRuleStats.guardRejected || 0) + 1; return; }
       var r = dynExamBankCheckQuestion(m, expectFor(rec), chapterInfo);
       // Solo si pasa el validador Y deja de ser «solo más larga»; si no, queda la original (válida).
       if (!r.ok || _dynEbReachOnlyLongest(r.combos)) return;
@@ -7760,16 +7793,14 @@ async function _dynRunExamBank(item) {
     var excess = dynExamBankLengthBiasExcess(a);
     if (setRuleStats.excessFirst === null && a) setRuleStats.excessFirst = excess;
     if (!excess) return false;
-    // Una pasada que no corrigió ninguna (con respuesta del modelo) corta las siguientes del intento: no insiste.
+    // Sin ninguna corrección tras ≥ 3 respuestas del modelo en el intento → no insiste (las siguientes pasadas no se piden).
     if (setRuleStats.stalled) return false;
     var pick = lengthCandidates(a).slice(0, excess);
     if (!pick.length) return false;
     setRuleStats.passes++;
-    var before = setRuleStats.fixed;
-    var returnedBefore = setRuleStats.returned;
     var calls = revisionCalls(pick);
     await _dynExamBankPool(calls.map(function (c) { return function () { return runLengthRevision(c); }; }), DYN_EXAM_BANK_CONCURRENCY);
-    if (setRuleStats.fixed === before && setRuleStats.returned > returnedBefore) setRuleStats.stalled = true;
+    if (setRuleStats.fixed === 0 && setRuleStats.returned >= 3) setRuleStats.stalled = true;
     return true;
   }
   var warm = {};
@@ -8102,7 +8133,8 @@ async function _dynRunExamBank(item) {
       // Regla de conjunto: ids ya revisados por longitud (no se repiten) e intentos que terminaron con esa falla.
       var lenIds = Object.keys(lenTried).slice(0, DYN_EXAM_BANK_DRAFT_MAX_QUESTIONS);
       if (lenIds.length) doc.lengthRevisedIds = lenIds;
-      if (reason === 'bank_rule') { doc.setRuleAttempts = (draft.draftReason === 'bank_rule' ? (draft.setRuleAttempts || 1) : 0) + 1; doc.setRuleFixedLast = setRuleStats.fixed; }
+      // setRuleAttempts: diagnóstico; setRuleFixedLast/ReturnedLast: deciden el corte sin avance del intento siguiente.
+      if (reason === 'bank_rule') { doc.setRuleAttempts = (draft.draftReason === 'bank_rule' ? (draft.setRuleAttempts || 1) : 0) + 1; doc.setRuleFixedLast = setRuleStats.fixed; doc.setRuleReturnedLast = setRuleStats.returned; }
       out.draft = _dynV3JsonArtifact(item, DYN_EXAM_BANK_DRAFT_ARTIFACT_TYPE, doc, (scope === 'module' ? moduleId : item.itemRunId) + '_draft').artifact;
       out.draftQuestions = qs.length;
       // bank_rule: lo ya pagado se conserva — el worker no descarta los puntos de guardado de este intento.
@@ -8176,7 +8208,8 @@ async function _dynRunExamBank(item) {
       var lbMsg = 'la correcta es la opción más larga en ' + a.histogram[3] + '/' + a.mcTotal + ' MC (máx. 30 %; excedente ' + dynExamBankLengthBiasExcess(a) + ')';
       // Sin bucle: el intento anterior ya terminó por esta regla y (no quedan candidatas, o ni aquel ni este corrigieron
       // ninguna) → la revisión no avanza: falla definitiva.
-      var noProgress = draft.draftReason === 'bank_rule' && (!left || ((draft.setRuleFixedLast || 0) === 0 && setRuleStats.fixed === 0));
+      // rev. I1: «sin avance» exige respuestas REALES del modelo en ambos intentos (fallas de formato no cuentan).
+      var noProgress = draft.draftReason === 'bank_rule' && (!left || ((draft.setRuleFixedLast || 0) === 0 && (draft.setRuleReturnedLast || 0) > 0 && setRuleStats.fixed === 0 && setRuleStats.returned > 0));
       if (noProgress) {
         var srOut = fail('EXAM_BANK_SET_RULE_CAPACITY: ' + lbMsg + ' tras la revisión de longitud (' + setRuleStats.fixed + ' corregidas en este intento, ' + Object.keys(lenTried).length + ' revisadas en total) y sin candidatas revisables: revisar el capítulo o el plan del examen' + detailTail(), false);
         srOut.diagnostics = diagnosticsOut();

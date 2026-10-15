@@ -206,7 +206,7 @@ function createSimLlm(front, opts) {
       if (fault === 'DUP') { fault = null; dupStem = true; }
       else if (!fault && rng() < NZ.dup) dupStem = true;
       if (fault) st.faults[fault] = (st.faults[fault] || 0) + 1;
-      const q = build(ask, p, rng, { fault, longest: !fault && ask.type === 'multichoice' && rng() < o.xLong });
+      const q = build(ask, p, rng, { fault, longest: o.xLong > 0 && !fault && ask.type === 'multichoice' && rng() < o.xLong });
       const key = p.chapterId + '|' + ask.type;
       if (dupStem && firstStem.has(key)) { q.stem = firstStem.get(key); st.faults.DUP = (st.faults.DUP || 0) + 1; }
       else if (!fault) {
