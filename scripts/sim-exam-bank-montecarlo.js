@@ -74,7 +74,7 @@ async function oneRun(seed) {
   f.DYN_LLM_BACKOFF_BASE_MS = 1;
   // --worker 1: mismos ajustes que el worker hospedado (executor-runtime.ts) — partes de ≤ 7000 tokens estimados.
   if (args.worker === '1') { f.DYN_EXAM_BANK_MAX_OUTPUT_EST = 7000; f.DYN_EXAM_BANK_CALL_MAX_TOKENS = 12000; }
-  llm = createSimLlm(f, { profile: PROFILE, seed, x: X, refFix: REF_FIX, stuck: STUCK, noise: args.noise || 'realistic', pB: args.pB != null ? Number(args.pB) : 0.6, pRev: args.pRev != null ? Number(args.pRev) : 0.75 });
+  llm = createSimLlm(f, { profile: PROFILE, seed, x: X, refFix: REF_FIX, stuck: STUCK, noise: args.noise || 'realistic', pB: args.pB != null ? Number(args.pB) : 0.6, pRev: args.pRev != null ? Number(args.pRev) : 0.75, xLong: args.xLong != null ? Number(args.xLong) : 0, pLen: args.pLen != null ? Number(args.pLen) : 0.75 });
   const drafts = {};
   f._dynDownloadArtifactText = async (id) => {
     if (id && id.startsWith('md:') && MD[id.slice(3)]) return { ok: true, text: MD[id.slice(3)] };
