@@ -354,8 +354,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     // EXAM_BANK_CLAIM: el claim no trae examBank válido → contrato (D), no salida de la IA.
     // Exam-bank D3: EXAM_BANK_LEAF_CAPACITY = una hoja que tampoco avanzó con la estrategia alternativa (el texto del
     // capítulo no alcanza con las reglas del banco) → D: ninguna regeneración automática la arregla; decide una persona.
+    // 2026-10-15: EXAM_BANK_SET_RULE_CAPACITY = la regla de conjunto (≤ 30 % «correcta la más larga») no avanzó con la
+    // revisión de longitud en 2 intentos → también D.
     refine: ({ code }) => (code === 'EXAM_BANK_CLAIM' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item' }
-      : code === 'EXAM_BANK_LEAF_CAPACITY' ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'unrecoverable', adminAction: 'regenerate_item' } : null),
+      : (code === 'EXAM_BANK_LEAF_CAPACITY' || code === 'EXAM_BANK_SET_RULE_CAPACITY') ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'unrecoverable', adminAction: 'regenerate_item' } : null),
   },
   {
     id: 'corrupt_dependency',

@@ -73,7 +73,9 @@ const PARAPHRASE = 'Es importante valorar con calma el contexto de la persona en
  * opts = { profile: 'a'|'b'|'c', seed, x (prob. base por código), refFix, stuck: { chapterId, type, capacity } }.
  */
 function createSimLlm(front, opts) {
-  const o = Object.assign({ x: 0.18, refFix: 0.5, profile: 'a', pB: 0.6, noise: 'realistic', pRev: 0.75 }, opts);
+  // xLong (2026-10-15, #1353 intento 3): prob. de una MC VÁLIDA con los 5 distractores más cortos que la correcta (0,8–0,95×:
+  // entra solo de relleno y cuenta para la regla de conjunto ≤ 30 %). 0 = como antes. pLen: la revisión de longitud se cumple.
+  const o = Object.assign({ x: 0.18, refFix: 0.5, profile: 'a', pB: 0.6, noise: 'realistic', pRev: 0.75, xLong: 0, pLen: 0.75 }, opts);
   const NZ = o.noise === 'realistic' ? { omit: 0.03, partial: 0.02, badJson: 0.02, truncate: 0.01, dup: 0.03 } : { omit: 0, partial: 0, badJson: 0, truncate: 0, dup: 0 };
   const firstStem = new Map(); // chapter|type → enunciado de la primera válida (para duplicados)
   const st = { calls: 0, repairCalls: 0, mainCalls: 0, revisionCalls: 0, revisionAsked: 0, revisionFixed: 0, strategyCalls: 0, questions: 0, outputTokens: 0, inTail: 0, cacheRead: 0, cacheWrite: 0, usd: 0, faults: {}, stuckValid: 0, warm: new Set(), unknownPrompts: 0 };
@@ -104,7 +106,7 @@ function createSimLlm(front, opts) {
     const revisionAt = prompt.search(/\nEXAM_BANK_REVISION v\d+\n/);
     const asks = [];
     if (revisionAt >= 0) {
-      for (const m of prompt.slice(revisionAt).matchAll(/^- id "([^"]+)" \(type "([a-z]+)"[^\n]*\n {2}PREGUNTA: (.*)\n {2}CORREGIR: /gm)) asks.push({ id: m[1], type: m[2], question: JSON.parse(m[3]) });
+      for (const m of prompt.slice(revisionAt).matchAll(/^- id "([^"]+)" \(type "([a-z]+)"[^\n]*\n {2}PREGUNTA: (.*)\n {2}CORREGIR: (.*)$/gm)) asks.push({ id: m[1], type: m[2], question: JSON.parse(m[3]), fixes: m[4] });
     } else if (repairAt >= 0) {
       for (const m of prompt.slice(repairAt).matchAll(/^- id "([^"]+)" \(type "([a-z]+)"[^)]*\) → (.*)$/gm)) asks.push({ id: m[1], type: m[2], reasons: m[3] });
     } else {
@@ -160,6 +162,7 @@ function createSimLlm(front, opts) {
       let ds;
       if (fault === 'DISTRACTORS') ds = ['Esperar', 'Registrar', 'Pedir ayuda', fitLen(DISTRACTOR_BASES[3], Math.round(L * 1.05)), fitLen(DISTRACTOR_BASES[4], Math.round(L * 1.1))];
       else if (fault === 'LENGTH_BIAS') ds = DISTRACTOR_BASES.map((b, i) => fitLen(b, Math.round(L * (0.58 + 0.02 * i))));
+      else if (ctx.longest) ds = DISTRACTOR_BASES.map((b, i) => fitLen(b, Math.round(L * [0.8, 0.84, 0.88, 0.91, 0.94][i])));
       else ds = DISTRACTOR_BASES.map((b, i) => fitLen(b, Math.round(L * [0.86, 0.92, 0.97, 1.07, 1.13][i])));
       q.distractors = ds.map((text) => ({ text, why: 'Confunde una acción sin criterio con lo que pide el procedimiento.' }));
     } else if (ask.type === 'truefalse') {
@@ -203,7 +206,7 @@ function createSimLlm(front, opts) {
       if (fault === 'DUP') { fault = null; dupStem = true; }
       else if (!fault && rng() < NZ.dup) dupStem = true;
       if (fault) st.faults[fault] = (st.faults[fault] || 0) + 1;
-      const q = build(ask, p, rng, { fault });
+      const q = build(ask, p, rng, { fault, longest: !fault && ask.type === 'multichoice' && rng() < o.xLong });
       const key = p.chapterId + '|' + ask.type;
       if (dupStem && firstStem.has(key)) { q.stem = firstStem.get(key); st.faults.DUP = (st.faults.DUP || 0) + 1; }
       else if (!fault) {
@@ -234,6 +237,15 @@ function createSimLlm(front, opts) {
     const callR = rng();
     const revisions = p.asks.filter(() => rng() >= NZ.omit).map((ask) => {
       st.revisionAsked++;
+      if (/alárgalos a (\d+)–(\d+)/.test(ask.fixes || '')) {
+        // Revisión de longitud: alarga SOLO los 2 distractores indicados (mismo error, más detalle) con prob. pLen.
+        st.lengthAsked = (st.lengthAsked || 0) + 1;
+        if (rng() >= o.pLen) return { id: ask.id };
+        const lo = Number(/alárgalos a (\d+)–/.exec(ask.fixes)[1]);
+        const which = (/distractores (\d+) y (\d+)/.exec(ask.fixes) || []).slice(1).map((x) => Number(x) - 1);
+        st.lengthFixed = (st.lengthFixed || 0) + 1;
+        return { id: ask.id, distractors: ask.question.distractors.map((d, i) => ({ text: which.includes(i) ? fitLen(d.text + ' en la atención del servicio local', lo + 4) : d.text })) };
+      }
       if (rng() >= o.pRev) return { id: ask.id };
       // La capacidad de la hoja atascada (perfiles b/c/c2) acota TODAS las válidas, también las corregidas por revisión.
       const isStuck = o.stuck && o.profile !== 'a' && p.chapterId === o.stuck.chapterId && ask.type === o.stuck.type;

@@ -54,6 +54,8 @@ export interface ExecutorRunResult {
   retryable?: boolean;
   draft?: { type: string; content: string; filename: string; mimeType: string };
   draftClear?: boolean;
+  /** Banco de examen (2026-10-15): falla de una regla de conjunto con todas las hojas completas — lo pagado se conserva. */
+  keepCheckpoints?: boolean;
 }
 
 export interface ExecutorRuntime {

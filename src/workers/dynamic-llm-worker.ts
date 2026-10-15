@@ -66,6 +66,17 @@ async function ownerOfRun(ds: DataSource, runId: string): Promise<string> {
   return String(r.owner_id);
 }
 
+/**
+ * ¿Se descartan los puntos de guardado de una parte que falló? Por defecto sí (un reintento debe generar de nuevo y
+ * nunca repetir la misma respuesta inválida). Excepción (2026-10-15, examen final #1353): un banco con TODAS las hojas
+ * completas que solo falla una regla de conjunto deja borrador y pide conservarlos (keepCheckpoints): el reintento
+ * reutiliza lo ya pagado y solo corrige el excedente. Solo con borrador reintentable: sin él no hay nada que reanudar.
+ */
+export function discardCheckpointsOnFailure(result: { ok?: boolean; retryable?: boolean; draft?: unknown; keepCheckpoints?: boolean } | null | undefined): boolean {
+  if (!result || result.ok) return true;
+  return !(result.keepCheckpoints === true && !!result.draft && result.retryable !== false);
+}
+
 export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Promise<'completed' | 'failed' | 'handed_back' | 'abandoned'> {
   const ownerId = await ownerOfRun(deps.dataSource, item.runId);
   const courseId = String((item as any).artifactCourseId ?? '');
@@ -159,8 +170,10 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
 
     if (!result || !result.ok) {
       // Falla de la parte (validación / reglas): sus puntos de guardado se descartan (un reintento debe generar de nuevo,
-      // nunca repetir la misma respuesta inválida).
-      await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
+      // nunca repetir la misma respuesta inválida) — salvo un banco que solo falla una regla de conjunto (ver arriba).
+      if (discardCheckpointsOnFailure(result)) {
+        await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
+      } else deps.logger.log(`Item ${item.itemKey}: regla de conjunto del banco — puntos de guardado conservados para el reintento`);
       // Borrador entre intentos (banco de examen o, O2b, actividad de aplicación ya validada): el campo depende del tipo.
       const opts: Record<string, unknown> = {};
       const draftField = runtime.draftFailField(item);

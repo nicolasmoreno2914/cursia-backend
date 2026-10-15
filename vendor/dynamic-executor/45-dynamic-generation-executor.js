@@ -6117,9 +6117,48 @@ function dynExamBankApplyRevision(orig, patch, fields) {
       fieldsOf.forEach(function (f) { if (typeof p[f] === 'string') out[key][i][f] = p[f]; });
     });
   }
-  byIndex('distractors', allow('distractors') ? ['text', 'why'] : allow('distractors.why') ? ['why'] : []);
+  byIndex('distractors', allow('distractors') ? ['text', 'why'] : allow('distractors.text') ? ['text'] : allow('distractors.why') ? ['why'] : []);
   if (allow('pairs')) byIndex('pairs', ['term', 'definition']);
   return out;
+}
+// ── Revisión de LONGITUD por la regla del banco (≤ 30 % «la correcta es la más larga»; 2026-10-15, #1353 intento 3) ──
+// Una MC VÁLIDA cuya única combinación elegible deja la correcta como la más larga entra al banco solo de relleno;
+// si el banco pasa el 30 %, SOLO el excedente se revisa: se alargan 2 distractores (los que mejor sobreviven) para que
+// al menos una combinación deje de tener la correcta como la más larga. Nada más cambia (enunciado, correcta,
+// evidencia, explicación, los otros 3 distractores) y la pregunta resultante pasa por el MISMO validador; se acepta
+// solo si además deja de ser «solo más larga» (si no, se conserva la original válida: nunca se pierde una pregunta).
+// → null (no aplica / imposible sin tocar la correcta) | { fixes, idx: [i, j], probe }.
+function dynExamBankLengthRevisionPlan(raw, expect, chapterInfo) {
+  if (!_dynIsPlainObject(raw) || expect.type !== 'multichoice' || !Array.isArray(raw.distractors) || raw.distractors.length !== 5) return null;
+  var r0 = dynExamBankCheckQuestion(raw, expect, chapterInfo);
+  if (!r0.ok || !_dynEbReachOnlyLongest(r0.combos)) return null;
+  var cl = _dynEbLen(raw.correct.text);
+  var lo = cl + 5;
+  var hi = Math.min(DYN_EXAM_BANK_LIMITS.optionText[1] - 5, Math.floor(1.6 * cl));
+  if (hi < lo + 5) return null;
+  var surv = (r0.survivors || []).slice().sort(function (x, y) { return _dynEbLen(raw.distractors[y].text) - _dynEbLen(raw.distractors[x].text) || x - y; });
+  if (surv.length < 3) return null;
+  var idx = surv.slice(0, 2).sort(function (x, y) { return x - y; });
+  var fixes = ['distractores ' + (idx[0] + 1) + ' y ' + (idx[1] + 1) + ' (hoy ' + _dynEbLen(raw.distractors[idx[0]].text) + ' y ' + _dynEbLen(raw.distractors[idx[1]].text) + ' caracteres): alárgalos a ' + lo + '–' + hi + ' caracteres, MÁS LARGOS que la opción correcta (' + cl + '), desarrollando el MISMO error conceptual con más detalle concreto (sin relleno, sin repetir la respuesta correcta, sin palabras absolutas ni pistas)',
+    'devuelve "distractors" con los 5 en el mismo orden: los otros 3 EXACTAMENTE iguales; no cambies la opción correcta, el enunciado, la explicación ni la evidencia'];
+  var probe = JSON.parse(JSON.stringify(raw));
+  idx.forEach(function (i) { probe.distractors[i].text = _dynEbClampProbe(probe.distractors[i].text, lo + 2, lo + 2); });
+  var pr = dynExamBankCheckQuestion(probe, expect, chapterInfo);
+  if (!pr.ok || _dynEbReachOnlyLongest(pr.combos)) return null;
+  return { fixes: fixes, idx: idx, probe: probe };
+}
+// Parche de longitud: SOLO el texto de los 2 distractores indicados; todo lo demás queda como en el original.
+function dynExamBankApplyLengthRevision(orig, patch, idx) {
+  var out = dynExamBankApplyRevision(orig, patch, ['distractors.text']);
+  if (!out) return null;
+  for (var i = 0; i < out.distractors.length; i++) if (idx.indexOf(i) < 0) out.distractors[i] = JSON.parse(JSON.stringify(orig.distractors[i]));
+  return out;
+}
+// Excedente sobre el 30 % del banco ensamblado (0 si cumple).
+function dynExamBankLengthBiasExcess(a) {
+  if (!a || !a.mcTotal) return 0;
+  var longest = a.histogram ? a.histogram[3] : 0;
+  return 10 * longest > 3 * a.mcTotal ? longest - Math.floor(3 * a.mcTotal / 10) : 0;
 }
 
 
@@ -7056,7 +7095,9 @@ var DYN_EXAM_BANK_DRAFT_ARTIFACT_TYPE = 'dynamic_exam_bank_draft_json';
 var DYN_EXAM_BANK_VALIDATION_VERSION = 4; // #583 (I3): piso por hoja 2·slots (v3 = fix bank-guard-minors: guardia v3)
 var DYN_EXAM_BANK_DRAFT_MAX_QUESTIONS = 400;
 // Fix round 1 (I1): motivos de faltante real que justifican un borrador (otros nunca se reanudan).
-var DYN_EXAM_BANK_DRAFT_REASONS = ['leaf_below_floor', 'chapter_uncovered', 'generation_failed'];
+// bank_rule (2026-10-15): banco con TODAS las hojas completas que falla una regla de conjunto (≤ 30 % «correcta la más
+// larga»): el borrador conserva lo ya pagado y el reintento solo corrige el excedente (revisión de longitud).
+var DYN_EXAM_BANK_DRAFT_REASONS = ['leaf_below_floor', 'chapter_uncovered', 'generation_failed', 'bank_rule'];
 function dynExamBankDraftSupported(item) {
   var eb = item && item.claimPayload && item.claimPayload.examBank;
   return _dynIsPlainObject(eb) && eb.draftArtifactType === DYN_EXAM_BANK_DRAFT_ARTIFACT_TYPE;
@@ -7082,6 +7123,11 @@ async function _dynEbLoadDraft(item, expect) {
   var keys = Object.keys(expect.chapterMdSha);
   if (Object.keys(shas).length !== keys.length || keys.some(function (k) { return shas[k] !== expect.chapterMdSha[k]; })) { out.reason = 'chapterMd'; return out; }
   out.questions = doc.questions.slice(0, DYN_EXAM_BANK_DRAFT_MAX_QUESTIONS);
+  out.draftReason = doc.reason;
+  // Regla de conjunto: ids ya revisados por longitud (no se repiten) e intentos con esa falla.
+  if (Array.isArray(doc.lengthRevisedIds)) out.lengthRevisedIds = doc.lengthRevisedIds.filter(function (x) { return typeof x === 'string' && DYN_EXAM_BANK_ID_RE.test(x); }).slice(0, DYN_EXAM_BANK_DRAFT_MAX_QUESTIONS);
+  if (typeof doc.setRuleAttempts === 'number' && isFinite(doc.setRuleAttempts)) out.setRuleAttempts = Math.max(0, Math.min(10, Math.floor(doc.setRuleAttempts)));
+  if (typeof doc.setRuleFixedLast === 'number' && isFinite(doc.setRuleFixedLast)) out.setRuleFixedLast = Math.max(0, Math.floor(doc.setRuleFixedLast));
   // Exam-bank D3: memoria por hoja del intento anterior (opcional; un borrador sin ella empieza de cero).
   if (_dynIsPlainObject(doc.leafHistory)) out.leafHistory = doc.leafHistory;
   // Revisión de forma: candidatas revisables del intento anterior (opcional).
@@ -7662,6 +7708,70 @@ async function _dynRunExamBank(item) {
     await _dynExamBankPool(revisionCalls(pick).map(function (c) { return function () { return runRevision(c); }; }), DYN_EXAM_BANK_CONCURRENCY);
     return true;
   }
+  // ── Regla de conjunto (≤ 30 % «correcta la más larga»): revisión de longitud SOLO del excedente ──
+  var lenTried = Object.create(null);
+  (draft.lengthRevisedIds || []).forEach(function (id) { lenTried[id] = true; });
+  var setRuleStats = { excessFirst: null, asked: 0, returned: 0, fixed: 0, calls: 0, callsFailed: 0, skipped: 0, passes: 0 };
+  var lenPlans = Object.create(null);
+  function lengthPlanOf(rec) {
+    if (!rec || rec.status !== 'valid' || !rec.raw || rec.type !== 'multichoice') return null;
+    if (!Object.prototype.hasOwnProperty.call(lenPlans, rec.id)) lenPlans[rec.id] = dynExamBankLengthRevisionPlan(rec.raw, expectFor(rec), chapterInfo);
+    return lenPlans[rec.id];
+  }
+  function lengthCandidates(asm) {
+    var inBank = idSet(asm.questions.filter(function (q) { return q.type === 'multichoice'; }).map(function (q) { return q.id; }));
+    return recordList().filter(function (r) { return inBank[r.id] && r.status === 'valid' && _dynEbReachOnlyLongest(r.combos) && !lenTried[r.id]; })
+      .sort(function (x, y) { return x.order - y.order; })
+      .filter(function (r) { return !!lengthPlanOf(r); });
+  }
+  async function runLengthRevision(c) {
+    var items = [];
+    c.ids.forEach(function (id) {
+      var r = records[id];
+      lenTried[id] = true;
+      items.push({ id: id, type: 'multichoice', chapterId: r.unit.chapterId, moduleId: r.unit.moduleId, question: r.raw, fixes: lenPlans[id].fixes });
+    });
+    var parts = dynExamBankRevisionParts(c.base.parts, items);
+    if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) { setRuleStats.skipped += items.length; return; }
+    setRuleStats.asked += items.length;
+    setRuleStats.calls++;
+    var res = await callJson('continuation', parts, 'revisions', 'lengthRevision');
+    if (!res.ok) { setRuleStats.callsFailed++; return; }
+    var seen = {};
+    res.questions.forEach(function (p) {
+      if (!_dynIsPlainObject(p) || typeof p.id !== 'string' || !lenPlans[p.id] || seen[p.id] || c.ids.indexOf(p.id) < 0) return;
+      seen[p.id] = true;
+      setRuleStats.returned++;
+      var rec = records[p.id];
+      var m = dynExamBankApplyLengthRevision(rec.raw, p, lenPlans[p.id].idx);
+      if (!m) return;
+      var r = dynExamBankCheckQuestion(m, expectFor(rec), chapterInfo);
+      // Solo si pasa el validador Y deja de ser «solo más larga»; si no, queda la original (válida).
+      if (!r.ok || _dynEbReachOnlyLongest(r.combos)) return;
+      var stored = (r.evidenceRelocated || r.evidenceByRef) ? Object.assign({}, m, { evidence: r.q.evidence }) : m;
+      if (r.evidenceByRef) delete stored.evidenceRef;
+      rec.q = r.q; rec.raw = stored; rec.combos = r.combos; rec.lengthFixed = true;
+      setRuleStats.fixed++;
+    });
+    chunks.filter(function (ch) { return ch.unit === c.base.unit; }).forEach(saveChunk);
+  }
+  // Una pasada: revisa a lo sumo el excedente actual (las de menos índice primero; cada id una vez por intento).
+  async function reviseLengthExcess() {
+    var excess = dynExamBankLengthBiasExcess(a);
+    if (setRuleStats.excessFirst === null && a) setRuleStats.excessFirst = excess;
+    if (!excess) return false;
+    // Una pasada que no corrigió ninguna (con respuesta del modelo) corta las siguientes del intento: no insiste.
+    if (setRuleStats.stalled) return false;
+    var pick = lengthCandidates(a).slice(0, excess);
+    if (!pick.length) return false;
+    setRuleStats.passes++;
+    var before = setRuleStats.fixed;
+    var returnedBefore = setRuleStats.returned;
+    var calls = revisionCalls(pick);
+    await _dynExamBankPool(calls.map(function (c) { return function () { return runLengthRevision(c); }; }), DYN_EXAM_BANK_CONCURRENCY);
+    if (setRuleStats.fixed === before && setRuleStats.returned > returnedBefore) setRuleStats.stalled = true;
+    return true;
+  }
   var warm = {};
   units.forEach(function (u, i) { u._key = i; var res; warm[i] = { p: new Promise(function (r) { res = r; }) }; warm[i].done = res; });
   async function runChunk(ch) {
@@ -7782,6 +7892,10 @@ async function _dynRunExamBank(item) {
     // rev. I2: el avance de la ronda se mide desde ANTES de sus revisiones (una hoja que crece por revisión avanzó).
     var keptPreRound = a.perLeaf.map(function (l) { return l.kept; });
     if (await reviseShortLeaves(round)) a = assemble();
+    if (await reviseLengthExcess()) a = assemble();
+    // Rellenos «solo más larga» de hojas completas: se piden reemplazos SOLO si el banco sigue sobre el 30 % y a lo
+    // sumo tantos como el excedente (antes: todos, aunque el banco cumpliera la regla).
+    var fillerBudget = dynExamBankLengthBiasExcess(a);
     var keptIds = idSet(a.questions.map(function (q) { return q.id; }));
     var entries = [];
     var inEntries = {};
@@ -7791,6 +7905,16 @@ async function _dynRunExamBank(item) {
       if (h.capacity) return;
       // Ronda 2+: hojas bajo el piso y (fix round 2, N3) capítulos del final bajo su mínimo en la hoja.
       var base = (round >= 2 && s.kept >= s.floor) ? s.repairs.filter(function (fix) { return fix.deficit; }) : s.repairs.slice();
+      // Reemplazo de un relleno «solo más larga» VÁLIDO y conservado (no de un faltante ni de un déficit de capítulo):
+      // solo dentro del excedente del banco sobre el 30 % (una pregunta válida nunca se reemplaza sin necesidad).
+      base = base.filter(function (fix) {
+        var rr = records[fix.id];
+        var isFiller = !fix.deficit && rr && rr.status === 'valid' && keptIds[fix.id] && rr.type === 'multichoice' && _dynEbReachOnlyLongest(rr.combos);
+        if (!isFiller) return true;
+        if (fillerBudget <= 0) return false;
+        fillerBudget--;
+        return true;
+      });
       if (!base.length) return;
       base.forEach(function (fix) { if (inEntries[fix.id]) return; entries.push(Object.assign({ li: s.leafIndex }, fix)); inEntries[fix.id] = true; });
       var need = Math.max(0, s.need || 0);
@@ -7949,6 +8073,11 @@ async function _dynRunExamBank(item) {
       }
     });
   }
+  // Regla de conjunto: con todas las hojas sobre el piso, hasta 2 pasadas de longitud para el excedente que quede
+  // (cada id una vez por intento: acotado).
+  if (!a.perLeaf.some(function (l) { return l.kept < l.floor; })) {
+    for (var lp = 0; lp < 2; lp++) { if (!(await reviseLengthExcess())) break; a = assemble(); }
+  }
   var repairedCount = recordList().filter(function (r) { return r.repaired && r.status === 'valid'; }).length;
 
   // Borrador para un reintento (opción 1e): las preguntas VÁLIDAS de este intento. processItem lo sube
@@ -7970,8 +8099,14 @@ async function _dynRunExamBank(item) {
       // Revisión de forma: candidatas rechazadas solo por forma, aún sin revisar (el próximo intento las revisa).
       var revCands = recordList().filter(function (r) { return r.status !== 'valid' && r.revCand; }).map(function (r) { return r.revCand.raw; }).slice(0, DYN_EXAM_BANK_DRAFT_MAX_QUESTIONS);
       if (revCands.length) doc.candidates = revCands;
+      // Regla de conjunto: ids ya revisados por longitud (no se repiten) e intentos que terminaron con esa falla.
+      var lenIds = Object.keys(lenTried).slice(0, DYN_EXAM_BANK_DRAFT_MAX_QUESTIONS);
+      if (lenIds.length) doc.lengthRevisedIds = lenIds;
+      if (reason === 'bank_rule') { doc.setRuleAttempts = (draft.draftReason === 'bank_rule' ? (draft.setRuleAttempts || 1) : 0) + 1; doc.setRuleFixedLast = setRuleStats.fixed; }
       out.draft = _dynV3JsonArtifact(item, DYN_EXAM_BANK_DRAFT_ARTIFACT_TYPE, doc, (scope === 'module' ? moduleId : item.itemRunId) + '_draft').artifact;
       out.draftQuestions = qs.length;
+      // bank_rule: lo ya pagado se conserva — el worker no descarta los puntos de guardado de este intento.
+      if (reason === 'bank_rule') out.keepCheckpoints = true;
     }
     return out;
   }
@@ -7987,7 +8122,7 @@ async function _dynRunExamBank(item) {
   }
   function diagnosticsOut() {
     return { rejectedByCode: rejectedByCode, rejectedDetail: topDetail(), firstPass: stats.firstPass, repairPass: repairPass, calls: stats.calls,
-      poolCandidates: stats.poolCandidates, mintedIds: stats.mintedIds, strategyCandidates: stats.strategyCandidates, evidenceByRef: stats.evidenceByRef, draftUnused: stats.draftUnused, systemicStop: stats.systemicStop || null, revision: stats.revision, mainPartsFailed: stats.mainPartsFailed || 0, tagsReduced: stats.tagsReduced || 0,
+      poolCandidates: stats.poolCandidates, mintedIds: stats.mintedIds, strategyCandidates: stats.strategyCandidates, evidenceByRef: stats.evidenceByRef, draftUnused: stats.draftUnused, systemicStop: stats.systemicStop || null, revision: stats.revision, setRule: setRuleStats, correctLongest: a ? (a.histogram || [])[3] : null, mcTotal: a ? a.mcTotal : null, mainPartsFailed: stats.mainPartsFailed || 0, tagsReduced: stats.tagsReduced || 0,
       perLeaf: (a ? a.perLeaf : []).map(function (l) { return { owner: l.owner, type: l.type, slots: l.slots, kept: l.kept, requested: l.requested, accepted: l.accepted, acceptedAfterRepair: l.acceptedAfterRepair }; }) };
   }
   function detailTail() {
@@ -8031,6 +8166,24 @@ async function _dynRunExamBank(item) {
   var v = dynValidateExamBank(doc, { scope: scope, chapters: chapters, chapterMd: md });
   if (a.bankErrors.length || !v.ok) {
     var errs = a.bankErrors.concat(v.errors.slice(0, 8).map(function (x) { return x.path + ' ' + x.code + ': ' + x.message; }));
+    // Regla de conjunto con TODAS las hojas completas (el único error es el ≤ 30 % «correcta la más larga» del banco):
+    // borrador bank_rule (se conserva lo pagado; el reintento solo corrige el excedente). Si ya no queda ninguna
+    // candidata revisable y el intento anterior terminó igual → falla DEFINITIVA y explícita (sin bucle).
+    var setOnly = a.bankErrors.every(function (e) { return /^EXAM_BANK_LENGTH_BIAS/.test(e); }) &&
+      v.errors.every(function (x) { return x.code === 'EXAM_BANK_LENGTH_BIAS' && x.path === '$.questions'; });
+    if (setOnly) {
+      var left = lengthCandidates(a).length;
+      var lbMsg = 'la correcta es la opción más larga en ' + a.histogram[3] + '/' + a.mcTotal + ' MC (máx. 30 %; excedente ' + dynExamBankLengthBiasExcess(a) + ')';
+      // Sin bucle: el intento anterior ya terminó por esta regla y (no quedan candidatas, o ni aquel ni este corrigieron
+      // ninguna) → la revisión no avanza: falla definitiva.
+      var noProgress = draft.draftReason === 'bank_rule' && (!left || ((draft.setRuleFixedLast || 0) === 0 && setRuleStats.fixed === 0));
+      if (noProgress) {
+        var srOut = fail('EXAM_BANK_SET_RULE_CAPACITY: ' + lbMsg + ' tras la revisión de longitud (' + setRuleStats.fixed + ' corregidas en este intento, ' + Object.keys(lenTried).length + ' revisadas en total) y sin candidatas revisables: revisar el capítulo o el plan del examen' + detailTail(), false);
+        srOut.diagnostics = diagnosticsOut();
+        return srOut;
+      }
+      return failWithDraft('EXAM_BANK_INCOMPLETE: regla de conjunto: ' + lbMsg + ' — todas las hojas completas; el reintento solo corrige el excedente (' + left + ' candidatas revisables)', 'bank_rule');
+    }
     return failWithDraft('EXAM_BANK_INCOMPLETE: el banco no cumple las reglas del contrato: ' + errs.join('; '), null);
   }
   _dynEbCacheClear(cachePrefix);
@@ -8054,6 +8207,7 @@ async function _dynRunExamBank(item) {
     repairPass: repairPass,
     poolCandidates: stats.poolCandidates,
     revision: stats.revision,
+    setRule: setRuleStats,
     mintedIds: stats.mintedIds,
     strategyCandidates: stats.strategyCandidates,
     evidenceByRef: stats.evidenceByRef,
