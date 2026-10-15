@@ -907,6 +907,69 @@ async function dbChecks() {
     const retryNow = (id) => ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [id]);
     const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400' };
 
+    // Review r2 (M8/N1): bienvenida LARGA (3 chunks de TTS) — la unidad se reserva completa y lo nunca enviado se libera.
+    const LONG_WELCOME = Array.from({ length: 150 }, (_, i) => `Esta es la oración ${i + 1} de la bienvenida al curso de hidráulica de planta, pensada para técnicos de mantenimiento.`).join(' ');
+    async function freshLongWelcomeRun(title) {
+      setReady();
+      const K = await makeCourse(title, { videos: false });
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /^budget_approval_required/, `aprobación ${title}`, 409);
+      await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
+      const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' })).run.id;
+      await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: LONG_WELCOME }), 'application/json');
+      return { ...K, rid };
+    }
+    const ttsKeys = (rowId, attempt = 1) => [0, 1, 2].map((i) => `reservation:tts:${rowId}:g1:a${attempt}:chunk${i}`);
+
+    await check('unidad multi-chunk (review r2 M8): bienvenida de varios chunks (≥ 3), el 2.º se corta DESPUÉS de enviar → reconciliación; chunk 1 liquidado, chunk 2 pendiente (enviado, con marcador), chunk 3 (nunca enviado) LIBERADO al salir', async () => {
+      const R = await freshLongWelcomeRun('Bienvenida larga corte');
+      fakes.plan.ttsFail = ['ok', 'drop']; // 'ok' (no es número ni drop/hang) = respuesta normal
+      const tts0 = fakes.st.tts.length;
+      const item = await claimProvider(R.rid, 'audio_welcome');
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'drop en el chunk 2');
+      fakes.plan.ttsFail = [];
+      const row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, fakes.st.tts.length - tts0], ['failed', 2], 'dos envíos (los siguientes nunca)');
+      const res = await reservationsOf(row.id, 'openai');
+      const k = ttsKeys(row.id);
+      eq(k.map((key) => { const r = res.find((x) => x.idempotency_key === key); return r ? r.settled : null; }), [true, false, true], 'chunk1 liquidado · chunk2 pendiente · chunk3 liberado');
+      eq(Object.keys(row.output_summary.paidCallsSent || {}).sort(), [k[0], k[1]].sort(), 'marcadores de envío solo de los enviados');
+    });
+
+    await check('caída dura del worker (review r2 N1): reservas de la unidad SIN marcador de envío → se LIBERAN solas al re-reclamar; la que tiene marcador → conciliación (nunca se repaga a ciegas)', async () => {
+      // a) solo el chunk 1 se había enviado cuando el worker murió.
+      const R = await freshLongWelcomeRun('Bienvenida caída marcador');
+      const item = await claimProvider(R.rid, 'audio_welcome');
+      const k = ttsKeys(item.itemRunId, item.attempt);
+      await H.reservePaidCalls(ledger, [0, 1, 2].map((i) => ({ kind: 'tts', ownerId: OWNER, itemRunId: item.itemRunId, generation: 1, itemAttempt: item.attempt, tag: `chunk${i}`, estimate: { characters: 3800, model: 'gpt-4o-mini-tts' } })));
+      await sched.recordItemExternal(item.itemRunId, 'f2-provider-worker', { paidCallsSent: { [k[0]]: new Date().toISOString() } });
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [item.itemRunId]);
+      await sched.sweepExpiredLeases(R.rid);
+      await retryNow(item.itemRunId);
+      const again = await claimProvider(R.rid, 'audio_welcome');
+      assert(again && again.attempt > item.attempt, 're-reclamada en un intento nuevo');
+      const tts0 = fakes.st.tts.length;
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^provider_reconciliation_required/, 'el enviado bloquea');
+      eq(fakes.st.tts.length - tts0, 0, 'ninguna llamada nueva');
+      const res = await reservationsOf(item.itemRunId, 'openai');
+      eq(k.map((key) => res.find((x) => x.idempotency_key === key).settled), [false, true, true], 'enviada pendiente · no enviadas liberadas');
+      // b) ninguna se había enviado → todas liberadas y la parte se completa (3 envíos, sin conciliación humana).
+      const R2 = await freshLongWelcomeRun('Bienvenida caída sin envíos');
+      const it2 = await claimProvider(R2.rid, 'audio_welcome');
+      const k2 = ttsKeys(it2.itemRunId, it2.attempt);
+      await H.reservePaidCalls(ledger, [0, 1, 2].map((i) => ({ kind: 'tts', ownerId: OWNER, itemRunId: it2.itemRunId, generation: 1, itemAttempt: it2.attempt, tag: `chunk${i}`, estimate: { characters: 3800, model: 'gpt-4o-mini-tts' } })));
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [it2.itemRunId]);
+      await sched.sweepExpiredLeases(R2.rid);
+      await retryNow(it2.itemRunId);
+      const again2 = await claimProvider(R2.rid, 'audio_welcome');
+      const t0 = fakes.st.tts.length;
+      await PW.processProviderItem(workerDeps(), again2);
+      const done2 = await itemRow(R2.rid, again2.itemKey);
+      const nChunks = Number(done2.output_summary && done2.output_summary.chunks);
+      eq([done2.status, nChunks >= 3, fakes.st.tts.length - t0 === nChunks], ['completed', true, true], `completa sin intervención (${nChunks} chunks, un envío por chunk)`);
+      const res2 = await reservationsOf(it2.itemRunId, 'openai');
+      eq(k2.map((key) => res2.find((x) => x.idempotency_key === key).settled), [true, true, true], 'las del intento caído liberadas');
+    });
+
     await check('FinOps ATÓMICO (2026-10-14): guard que deja pasar (como dos chequeos concurrentes que leyeron el mismo total) + reserva rechazada por el tope → Gamma / TTS de bienvenida (unidad de chunks) / guion LLM (unidad de 3): 0 llamadas al proveedor, run pausado (run_budget_cap), parte devuelta (retrying) sin consumir intento, 0 reservas pendientes', async () => {
       for (const type of ['presentation', 'audio_welcome', 'audiobook_chapter']) {
         const R = await freshRun('Tope atómico ' + type);

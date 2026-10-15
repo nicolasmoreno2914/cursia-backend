@@ -908,7 +908,10 @@ export class FinopsLedgerService {
              and (metadata->>'reservationReconciledAsCharged') = 'true' limit 1`,
           [res.id],
         );
-        if (built && !asCharged) fin = await this.insertEvent(built.row, manager);
+        if (built && !asCharged) {
+          fin = await this.insertEvent(built.row, manager);
+          if (fin.inserted && typeof built.row.run_id === 'string') await this.pauseRunIfOverCap(manager, built.row.run_id as string, reservationKey);
+        }
         if (built && asCharged) {
           // Re-review (minor a): la cota de la reserva puede quedarse corta. Si el usage real tardío SUPERA lo que
           // quedó contado, gana el real (nunca de menos): se inserta el cargo real y la reserva se lleva a 0.
@@ -924,6 +927,8 @@ export class FinopsLedgerService {
                 settlement: true,
                 metadata: { reservationSettled: true, supersededBy: built.idempotencyKey },
               });
+              // Review r2 (M3): también en el usage tardío mayor que lo contado.
+              if (typeof built.row.run_id === 'string') await this.pauseRunIfOverCap(manager, built.row.run_id as string, reservationKey);
             }
           }
         }
@@ -1223,6 +1228,12 @@ export class FinopsLedgerService {
   }, runner: { query: (sql: string, params?: any[]) => Promise<any> } = this.dataSource): Promise<any> {
     if (input.decision === 'ADMIN_APPROVED' && !input.approvedBy) {
       throw new FinopsError('INVALID_INPUT', 'ADMIN_APPROVED exige approvedBy');
+    }
+    // FinOps atómico (review M2): una autorización de un run se serializa con sus reservas (mismo lock del run): una
+    // reserva concurrente ve la autorización anterior o la nueva, nunca una mezcla (p.ej. un BLOCKED a mitad).
+    if (input.runId) {
+      if (runner === this.dataSource) return this.dataSource.transaction((m) => this.authorize(input, m));
+      await runner.query(`select pg_advisory_xact_lock(hashtext($1))`, [RUN_CAP_LOCK_PREFIX + input.runId]);
     }
     const [row] = await runner.query(
       `insert into public.cost_budget_authorizations

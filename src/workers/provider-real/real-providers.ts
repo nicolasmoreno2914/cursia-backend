@@ -314,6 +314,25 @@ async function record(deps: RealProviderDeps, item: ClaimedItem, patch: Record<s
   if (!ok) throw new LeaseLost();
 }
 
+/**
+ * Review r2 (N1): marcador DURABLE de envío de una llamada pagada de una unidad pre-reservada (chunk de TTS, llamada
+ * del guion): se escribe en el item justo ANTES de llamar. Al re-reclamar, una reserva de unidad SIN marcador nunca
+ * salió → se libera (sin conciliación humana); con marcador sigue el camino de siempre.
+ */
+const PAID_CALLS_SENT_KEY = 'paidCallsSent';
+const sentByItem = new Map<string, Record<string, string>>();
+async function markPaidCallSent(deps: RealProviderDeps, item: ClaimedItem, resKey: string): Promise<void> {
+  const os = (item.outputSummary ?? {}) as Record<string, any>;
+  const cur = sentByItem.get(item.itemRunId) ?? { ...((os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object') ? os[PAID_CALLS_SENT_KEY] : {}) };
+  cur[resKey] = new Date().toISOString();
+  sentByItem.set(item.itemRunId, cur);
+  await record(deps, item, { [PAID_CALLS_SENT_KEY]: cur });
+}
+/** ¿Reserva de una unidad pre-reservada (chunk de TTS de bienvenida o llamada del guion por bloque)? */
+function isUnitReservationKey(key: string): boolean {
+  return /^reservation:tts:.*:chunk\d+$/.test(key) || /^reservation:llm:.*:sec\d+-(main|continuation|condense)$/.test(key);
+}
+
 async function heartbeat(deps: RealProviderDeps, item: ClaimedItem): Promise<void> {
   if (!deps.scheduler.heartbeatItem) return;
   const ok = await deps.scheduler.heartbeatItem(item.itemRunId, deps.executorId, deps.leaseSeconds);
@@ -770,6 +789,9 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
       tag: `chunk${chunkIdx}`, estimate: { characters: chunks[chunkIdx].length, model },
     });
     if (ttsTracker) ttsTracker.inFlight = { provider: 'openai', key: resKey };
+    // Review r2 (N1): marcador de ENVÍO antes de llamar — una reserva de la unidad sin marcador nunca salió y se libera
+    // sola al re-reclamar (caída dura del worker); con marcador, la de siempre (conciliación si no hay resultado).
+    await markPaidCallSent(deps, item, resKey);
     calledChunks.add(chunkIdx);
     let res;
     try {
@@ -782,7 +804,7 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
         await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
         if (ttsTracker) ttsTracker.inFlight = null;
       }
-      return fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+      return await fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
     if (ttsTracker && ttsTracker.inFlight) ttsTracker.inFlight.opId = res.requestId;
     let seconds: number | null = null;
@@ -812,7 +834,10 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     // con resultado incierto conserva su reserva (conciliación), como siempre.
     if (!unitDone) {
       for (let idx = 0; idx < unitKeys.length; idx++) {
-        if (!calledChunks.has(idx)) await settlePaidCall(deps.finops, unitKeys[idx], null, 'tts_unit_aborted_before_call').catch(() => undefined);
+        if (!calledChunks.has(idx)) {
+          await settlePaidCall(deps.finops, unitKeys[idx], null, 'tts_unit_aborted_before_call').catch((e) =>
+            deps.logger.warn(`Item ${item.itemKey}: no se pudo liberar la reserva no enviada ${unitKeys[idx]} (${e instanceof Error ? e.message : String(e)}); se libera al re-reclamar`));
+        }
       }
     }
   }
@@ -1018,7 +1043,10 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     const st = unitState.get(tag);
     if (!st) return;
     for (const [role, key] of st.keys) {
-      if (!st.called.has(role)) await settlePaidCall(deps.finops, key, null, 'script_unit_unused').catch(() => undefined);
+      if (!st.called.has(role)) {
+        await settlePaidCall(deps.finops, key, null, 'script_unit_unused').catch((e) =>
+          deps.logger.warn(`Item ${item.itemKey}: no se pudo liberar la reserva no enviada ${key} (${e instanceof Error ? e.message : String(e)}); se libera al re-reclamar`));
+      }
     }
     unitState.delete(tag);
   };
@@ -1027,7 +1055,8 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     if (!(await guard(deps, item, 'anthropic', llmCallEstimate(scriptModel, prompt.system.length + prompt.user.length, prompt.maxTokens)))) throw new BudgetBlocked();
     if (role === 'main' && !unitState.has(tag)) {
       const mainChars = prompt.system.length + prompt.user.length;
-      const followChars = mainChars + 4 * prompt.maxTokens;
+      // Review r2 (N4): la condensación tras una continuación incluye ambas salidas → cota con las dos.
+      const followChars = mainChars + 5 * (prompt.maxTokens + LLM_CALL_MAX_TOKENS_BOUND);
       const followTokens = Math.max(prompt.maxTokens, LLM_CALL_MAX_TOKENS_BOUND);
       const roles = ['main', 'continuation', 'condense'] as const;
       const rs = roles.map((r) => ({
@@ -1037,7 +1066,6 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       const keys = await reservePaidCalls(deps.finops, rs);
       unitState.set(tag, { keys: new Map(roles.map((r, i) => [r, keys[i]])), called: new Set() });
     }
-    unitState.get(tag)?.called.add(role);
     // Calibración #2: reserva DURABLE antes de la llamada (si falla, no se llama). Dentro de una unidad ya reservada
     // devuelve la reserva existente (idempotente, sin volver a contarla).
     const resKey = await reservePaidCall(deps.finops, {
@@ -1046,6 +1074,9 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       estimate: { promptChars: prompt.system.length + prompt.user.length, maxTokens: prompt.maxTokens, model: scriptModel },
     });
     if (tracker) tracker.inFlight = { provider: 'anthropic', key: resKey };
+    // Review r2 (N1/N2): enviada = marcada justo antes de la llamada (nunca antes de la reserva).
+    await markPaidCallSent(deps, item, resKey);
+    unitState.get(tag)?.called.add(role);
     if (!llmClient) llmClient = new AnthropicClient(anthropicKey, env);
     let r;
     try {
@@ -1535,7 +1566,12 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
     isPersistedOutput: (r) => !r.reservation && !!r.external_operation_id && persisted.has(r.external_operation_id),
     // Gamma: el marcador de envío se escribe DESPUÉS de la reserva y ANTES de llamar. Una reserva de
     // Gamma sin marcador que la nombre = la llamada nunca se hizo → se libera.
-    isSubmitMarked: (key) => !key.startsWith('reservation:gamma:') || key === markedKey,
+    isSubmitMarked: (key) => {
+      if (key.startsWith('reservation:gamma:')) return key === markedKey;
+      // Review r2 (N1): reserva de unidad sin marcador de envío = nunca salió → liberable.
+      if (isUnitReservationKey(key)) return !!(os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object' && os[PAID_CALLS_SENT_KEY][key]);
+      return true;
+    },
   });
   for (const r of releasable) await settlePaidCall(deps.finops, r.idempotency_key, null, 'reserved_without_submit_marker');
   if (!blocking.length) return false;
