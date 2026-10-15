@@ -6175,7 +6175,14 @@ function dynExamBankLengthPatchOk(origQ, newQ, idx) {
     var kept = oT.filter(function (x) { return nSet[x]; }).length;
     if (oT.length && kept < 0.6 * oT.length) return false;                 // otra idea
     if (nT.length && Object.keys(nSet).length < 0.75 * nT.length) return false; // relleno repetido
-    if (_dynEbJaccard(nT, cTok) >= 0.6) return false;                      // parafrasea la correcta
+    // rev. r2 N3: una palabra (≥ 4 letras) repetida ≥ 3 veces que en el original aparecía menos de 3 = relleno.
+    var cntN = {}, cntO = {};
+    nT.forEach(function (x) { cntN[x] = (cntN[x] || 0) + 1; }); oT.forEach(function (x) { cntO[x] = (cntO[x] || 0) + 1; });
+    if (Object.keys(cntN).some(function (x) { return x.length >= 4 && cntN[x] >= 3 && (cntO[x] || 0) < 3; })) return false;
+    // rev. r2 N1: parecido a la correcta RELATIVO al original (un distractor que ya compartía el vocabulario de la
+    // correcta puede alargarse; lo que se rechaza es acercarse a ella al alargar).
+    var jn = _dynEbJaccard(nT, cTok), jo = _dynEbJaccard(oT, _dynEbLenTokens(origQ.correct.text));
+    if (jn >= 0.6 && jn - jo >= 0.3) return false;                          // se acerca a la correcta
     if (!_dynEbHasAbsolute(o) && _dynEbHasAbsolute(n)) return false;       // pista absoluta nueva
     news.push(nT);
   }
@@ -7742,6 +7749,7 @@ async function _dynRunExamBank(item) {
   (draft.lengthRevisedIds || []).forEach(function (id) { lenTried[id] = true; });
   var setRuleStats = { excessFirst: null, asked: 0, returned: 0, fixed: 0, calls: 0, callsFailed: 0, skipped: 0, passes: 0 };
   var lenPlans = Object.create(null);
+  var lenFailedThisAttempt = Object.create(null); // rev. r2 N2: una llamada fallida no se repite igual en el intento
   function lengthPlanOf(rec) {
     if (!rec || rec.status !== 'valid' || !rec.raw || rec.type !== 'multichoice') return null;
     if (!Object.prototype.hasOwnProperty.call(lenPlans, rec.id)) lenPlans[rec.id] = dynExamBankLengthRevisionPlan(rec.raw, expectFor(rec), chapterInfo);
@@ -7749,7 +7757,7 @@ async function _dynRunExamBank(item) {
   }
   function lengthCandidates(asm) {
     var inBank = idSet(asm.questions.filter(function (q) { return q.type === 'multichoice'; }).map(function (q) { return q.id; }));
-    return recordList().filter(function (r) { return inBank[r.id] && r.status === 'valid' && _dynEbReachOnlyLongest(r.combos) && !lenTried[r.id]; })
+    return recordList().filter(function (r) { return inBank[r.id] && r.status === 'valid' && _dynEbReachOnlyLongest(r.combos) && !lenTried[r.id] && !lenFailedThisAttempt[r.id]; })
       .sort(function (x, y) { return x.order - y.order; })
       .filter(function (r) { return !!lengthPlanOf(r); });
   }
@@ -7760,11 +7768,13 @@ async function _dynRunExamBank(item) {
       items.push({ id: id, type: 'multichoice', chapterId: r.unit.chapterId, moduleId: r.unit.moduleId, question: r.raw, fixes: lenPlans[id].fixes });
     });
     var parts = dynExamBankRevisionParts(c.base.parts, items);
-    if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) { setRuleStats.skipped += items.length; return; }
+    // rev. r2 N2: el número de intento va en el tail — el reintento pregunta de nuevo (otro cuerpo, otro punto de guardado).
+    parts = dynExamBankWithTail(parts, parts.tail + '\n\nREVISIÓN DE LONGITUD (regla de conjunto del banco), intento ' + (item.attempt || 1) + '.');
+    if (bodyBytes(parts) > DYN_EXAM_BANK_MAX_BODY_BYTES) { setRuleStats.skipped += items.length; c.ids.forEach(function (id) { lenFailedThisAttempt[id] = true; }); return; }
     setRuleStats.asked += items.length;
     setRuleStats.calls++;
     var res = await callJson('continuation', parts, 'revisions', 'lengthRevision');
-    if (!res.ok) { setRuleStats.callsFailed++; return; }
+    if (!res.ok) { setRuleStats.callsFailed++; c.ids.forEach(function (id) { lenFailedThisAttempt[id] = true; }); return; }
     var seen = {};
     res.questions.forEach(function (p) {
       if (!_dynIsPlainObject(p) || typeof p.id !== 'string' || !lenPlans[p.id] || seen[p.id] || c.ids.indexOf(p.id) < 0) return;
