@@ -23,7 +23,7 @@ SUMMARY="$OUT/summary.md"
 FAIL=0
 BLOCKED_FE=0
 # Checks que necesitan el Moodle 4.5 local (PHP + datos de Moodle): solo en el gate completo.
-NEEDS_MOODLE="check-ev6-h5p2-contracts check-dynamic-package-worker-hardening check-ev6-pending-videos check-p2-exams-moodle check-v21-h5p-moodle check-v21-h5p check-v21-h5p-player check-v21-packaging-v3 check-v21-shell-purifier check-v21-packaging-v3-moodle check-v21-vc-moodle-filters check-v21-vc-visual check-v21-vc-purifier check-v21-video check-v21-video-moodle"
+NEEDS_MOODLE="check-ev6-h5p2-contracts check-moodle-grading-invariants check-dynamic-package-worker-hardening check-ev6-pending-videos check-p2-exams-moodle check-v21-h5p-moodle check-v21-h5p check-v21-h5p-player check-v21-packaging-v3 check-v21-shell-purifier check-v21-packaging-v3-moodle check-v21-vc-moodle-filters check-v21-vc-visual check-v21-vc-purifier check-v21-video check-v21-video-moodle"
 
 echo "== build =="
 (cd "$REPO" && npm run build) > "$OUT/build.log" 2>&1 || { tail -30 "$OUT/build.log"; echo "build falló"; exit 2; }
