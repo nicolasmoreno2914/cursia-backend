@@ -69,7 +69,10 @@ export const EXAMS_TEACHER_NOTE_AVAILABILITY =
 export const EXAMS_TEACHER_NOTE_ATTEMPTS =
   'Cada página de “Respuestas explicadas” se abre cuando el estudiante usa todos los intentos de su evaluación. ' +
   'Dar intentos adicionales a un estudiante que ya los usó es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”. ' +
-  'Si marcas a mano una evaluación como completada para un estudiante, su página de “Respuestas explicadas” también se le abre.';
+  'Si marcas a mano una evaluación como completada para un estudiante, su página de “Respuestas explicadas” también se le abre. ' +
+  // r55 review r1 (M4): Moodle ignora sin aviso el cambio directo de «completada (no aprobada)» a «completada»
+  // (lib/completionlib.php update_state, 4.1–4.5; moodle-versions.md §6a).
+  'Si esa evaluación ya figura como completada sin aprobar, Moodle ignora sin aviso marcarla directamente como completada: hazlo en dos pasos, primero márcala como no completada y después como completada.';
 export const EXAMS_TEACHER_NOTE = `${EXAMS_TEACHER_NOTE_AVAILABILITY} ${EXAMS_TEACHER_NOTE_ATTEMPTS}`;
 /** r55 (R6): con intentos ilimitados la página queda oculta hasta que el docente la muestre. */
 export const EXAMS_TEACHER_NOTE_UNLIMITED =

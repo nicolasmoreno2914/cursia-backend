@@ -864,6 +864,44 @@ const MATRIX = [
     const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
     assert(lx.includes('igual o superior a 80/100') && lx.includes('llegue a 80/100'), 'textos con la nota del curso (80)');
   });
+  await check('review r1 (M3/M2/I2/M4): práctica con peso 0 → la regla no la nombra y su tarjeta no dice «cuenta en tu nota final»; nota de referencia; restaurar como curso nuevo / «Sobrescribir configuración del curso»; override en dos pasos; ningún texto del shell dice «aprobar todas»', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.categoryWeights = { practice: 0, moduleExams: 70, finalExam: 30 };
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    const { z, acts } = await actDirs(r.mbz);
+    const label = async (idn) => z.file(`${acts.find((a) => a.idnumber === idn).dir}/label.xml`).async('string');
+    const closing = await label('cv3:shell:closing');
+    assert(closing.includes('calculada con las evaluaciones de módulo y la evaluación final según sus pesos'), `regla sin la práctica (peso 0): ${/Apruebas el curso[^<]*/.exec(closing)}`);
+    assert(!/actividades prácticas|videos interactivos/.test(closing), 'no nombra categorías de peso 0');
+    const instr = acts.filter((a) => /:activity_instruction$/.test(a.idnumber));
+    assert(instr.length > 0, 'hay tarjetas de actividad');
+    for (const a of instr) {
+      const t = await z.file(`${a.dir}/label.xml`).async('string');
+      assert(t.includes('Nota de referencia: 70/100 · no bloquea tu aprobación') && !t.includes('cuenta en tu nota final') && !t.includes('Nota mínima'), `tarjeta ${a.idnumber}`);
+    }
+    const teacher = await label('cv3:shell:certificate_teacher');
+    assert(teacher.includes('Restaura el paquete como un curso nuevo') && teacher.includes('«Sobrescribir configuración del curso: Sí»'), 'nota docente: restaurar como curso nuevo / sobrescribir configuración');
+    assert(teacher.includes('hazlo en dos pasos, primero márcala como no completada y después como completada'), 'nota docente: override en dos pasos');
+    // Pesos normales: la tarjeta sí dice que cuenta en la nota final.
+    const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, MATRIX[0]));
+    const d0 = await actDirs(r0.mbz);
+    const i0 = d0.acts.find((a) => /:activity_instruction$/.test(a.idnumber));
+    assert((await d0.z.file(`${i0.dir}/label.xml`).async('string')).includes('no bloquea tu aprobación; cuenta en tu nota final'), 'práctica con peso > 0');
+    // Texto determinístico del shell (labels cv3:shell:* y tarjetas/cierres de capítulo, en toda la matriz): nunca «aprobar todas».
+    for (const cfg of MATRIX) {
+      const rr = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, cfg));
+      const dd = await actDirs(rr.mbz);
+      for (const a of dd.acts.filter((x) => /^cv3:shell:|:activity_instruction$|:closing$/.test(x.idnumber))) {
+        const f = dd.z.file(`${a.dir}/label.xml`) || dd.z.file(`${a.dir}/page.xml`);
+        if (!f) continue;
+        const t = await f.async('string');
+        assert(!/aprobar todas|apruebes todas|debes aprobar (cada|todas)/i.test(t), `${cfg.id} ${a.idnumber}: «aprobar todas»`);
+      }
+    }
+  });
   await check('EV6 T3: sin evaluación final (aunque el perfil exija todo lo demás o nada) → sin certificado y aviso certificate_omitted:no_final_exam', async () => {
     const input = PF.packagingInput(distRoot, MATRIX[1]);
     input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
@@ -1102,7 +1140,7 @@ const MATRIX = [
     } };
     const prep = await PK.prepareV3Package(q, 'r', { id: 1, sha256: 's', manifest }, 641, '4.1');
     eq(prep.resolved.categories.map((c) => [c.key, c.weight]), [['moduleExams', 100]], 'práctica vacía → exámenes 100');
-    eq(prep.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false }, 'resumen');
+    eq(prep.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false, coursePassingGrade: 70 }, 'resumen');
     eq(prep.profileWarnings, ['presentation_profile_defaulted', 'assessment_weights_normalized:practice=40,moduleExams=60->moduleExams=100'], 'avisos');
     eq(prep.profiles.theme.source, 'default_v3', 'sin perfil ni paleta');
   });
@@ -1152,7 +1190,7 @@ const MATRIX = [
     // F1 (I3): la categoría vacía ya no falla — su peso se redistribuye y el paquete valida.
     const rn = await B.buildDynamicMbzV3(input);
     assert((await validate(rn)).ok, 'práctica vacía (peso 40) → normalizado, empaqueta y valida');
-    eq(rn.summary.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false }, 'resumen normalizado');
+    eq(rn.summary.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false, coursePassingGrade: 70 }, 'resumen normalizado');
     const okProfile = PROF.defaultAssessmentProfile({ finalExam: false });
     okProfile.categoryWeights = { practice: 0, moduleExams: 100 };
     const r = await B.buildDynamicMbzV3({ ...input, assessmentProfile: okProfile });

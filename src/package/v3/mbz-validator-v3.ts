@@ -79,6 +79,9 @@ const ACTIVITY_MAIN_LIBRARY: Record<string, string> = {
   branchingscenario: 'H5P.BranchingScenario',
 };
 
+/** r55 review r1 (M6): `&` que NO abre una entidad XML válida, o `<` — texto XML mal escapado. */
+export const RAW_XML_AMP_OR_LT = /&(?!(?:amp|lt|gt|quot|apos|#[0-9]+|#x[0-9a-fA-F]+);)|</;
+
 export interface MbzV3Issue {
   code: string;
   where: string;
@@ -368,7 +371,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   }
   for (const a of acts) {
     // r55 (moodle-versions.md): availability es texto XML — un `&` (p. ej. `"op":"&"`) o `<` crudo aborta la restauración.
-    if (/&(?!amp;|lt;|gt;|quot;|#39;)|</.test(a.module.availability ?? '')) add('STRUCTURE', a.dir, `availability con & o < sin escapar en XML: ${a.module.availability}`);
+    // r55 review r1 (M6): cualquier entidad XML válida (&amp; &lt; &gt; &quot; &apos; &#NN; &#xHH;) no es un & crudo.
+    if (RAW_XML_AMP_OR_LT.test(a.module.availability ?? '')) add('STRUCTURE', a.dir, `availability con & o < sin escapar en XML: ${a.module.availability}`);
     if (a.moduleXmlId !== a.mid || a.actXmlModuleId !== a.mid) add('STRUCTURE', a.dir, `moduleid incoherente (backup ${a.mid}, module.xml ${a.moduleXmlId}, ${a.modname}.xml ${a.actXmlModuleId})`);
     const want = a.gradeItemId !== null ? [a.gradeItemId] : [];
     if (JSON.stringify(a.inforefGradeItems) !== JSON.stringify(want)) add('STRUCTURE', a.dir, `grade_itemref ${a.inforefGradeItems.join(',')} ≠ grades.xml ${want.join(',')}`);

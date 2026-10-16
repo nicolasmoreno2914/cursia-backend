@@ -288,6 +288,11 @@ async function main() {
     v = await V.validateMbzV3(await mutate(built.mbz, { [PM]: (x) => replaceOnce(x, '"op":"|"', '"op":"&amp;"') }), exp);
     assert(!v.issues.some((i) => /sin escapar/.test(i.message)) && v.issues.some((i) => i.code === 'EXPLANATIONS_GATE'), JSON.stringify(v.issues.slice(0, 3)));
   });
+  await check('review r1 (M6): el chequeo de & crudo no marca entidades XML válidas (&amp; &lt; &gt; &quot; &apos; &#NN; &#xHH;)', async () => {
+    const re = V.RAW_XML_AMP_OR_LT;
+    for (const ok of ['a &amp; b', '&lt;x&gt;', '&quot;q&quot;', 'l&apos;x', '&#38;', '&#x26;', '&#X;'.replace('X', 'x2F'), '{"op":"|"}']) assert(!re.test(ok), `válida: ${ok}`);
+    for (const bad of ['"op":"&"', 'a & b', '&amp', '&#;', '&#xZZ;', '&nbsp;', 'a<b']) assert(re.test(bad), `cruda: ${bad}`);
+  });
   await check('r55: EXPLANATIONS_GATE — intentos ilimitados con availability e=1|e=3 y visible (el 1.er intento abriría el banco) → solo EXPLANATIONS_GATE', async () => {
     const IU = await index(builtU.mbz);
     const uq = IU.byId[examIdn.replace(modId, Object.keys(IU.byId).find((k) => /^cv3:exam:/.test(k)).slice(9))];

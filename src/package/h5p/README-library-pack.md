@@ -157,3 +157,12 @@ descarga. Desde r55 el store solo arma el pack (los paquetes de curso no llevan 
   nunca criterio del curso.
 - El curso se aprueba **solo por la calificación final** (criterio «Calificación del curso» ≥
   la nota mínima del perfil, por defecto 70/100); no hay criterios por actividad.
+- La nota mínima del curso va de 1 a 100 (con 0 el perfil se rechaza al guardar y al empaquetar).
+- Restaura el paquete como **curso nuevo**. Si lo restauras dentro de un curso existente, elige
+  «Sobrescribir configuración del curso: Sí» (o activa el seguimiento de finalización del curso):
+  sin eso el criterio «Calificación del curso» no hace nada y nadie completa el curso ni recibe
+  el certificado.
+- Nota de despliegue: estas reglas son **solo del builder v3** (`dynamic-mbz-builder-v3.ts`,
+  rulesVersion 3). Los builders anteriores (`dynamic-mbz-builder.ts` para Manifests v1/v2 y el
+  `mbz-builder.service.ts` legado) no cambian: conservan su configuración anterior de
+  finalización, intentos y calificación.

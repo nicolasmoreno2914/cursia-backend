@@ -31,6 +31,7 @@ import {
   validateAssessmentProfile,
 } from '../course-profiles/course-profiles';
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
+import { AssessmentCategoryKey, normalizeCategoryWeights } from '../../package/assessment/resolve-assessment';
 import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 import { courseCountNumbers } from './intro-schemas';
@@ -198,6 +199,12 @@ export interface CourseFacts {
      * leer facts guardados antes de r55; `buildCourseFacts` la emite siempre.
      */
     coursePassingGrade?: number;
+    /**
+     * r55 review r1 (M3): peso EFECTIVO (0–100) de cada categoría con ítems calificables — los del perfil, o los
+     * normalizados igual que el resolver si una categoría vacía tenía peso > 0. Los textos de aprobación nombran
+     * solo categorías con peso > 0. Opcional para leer facts anteriores (todas las categorías cuentan).
+     */
+    categoryWeights?: Partial<Record<AssessmentCategoryKey, number>>;
   };
   audio: {
     welcomeSeconds: number;
@@ -233,6 +240,26 @@ function deepFreeze<T>(o: T): T {
     Object.freeze(o);
   }
   return o;
+}
+
+/**
+ * r55 review r1 (M3): pesos efectivos de las categorías con ítems (misma regla que `resolveAssessment` con
+ * `itemCounts`): si una categoría vacía tenía peso > 0 se reparte entre las pobladas; si no, los del perfil.
+ * Sin categorías pobladas (curso sin nota) → nada.
+ */
+function effectiveCategoryWeights(
+  assessment: AssessmentProfile,
+  counts: Record<AssessmentCategoryKey, number>,
+): { categoryWeights?: Partial<Record<AssessmentCategoryKey, number>> } {
+  const original = assessment.categoryWeights as Partial<Record<AssessmentCategoryKey, number>>;
+  const keys = (Object.keys(original) as AssessmentCategoryKey[]);
+  const populated = keys.filter((k) => counts[k] > 0);
+  if (!populated.length) return {};
+  const normalized = keys.some((k) => counts[k] === 0 && (original[k] as number) > 0);
+  const w = normalized ? normalizeCategoryWeights(original, populated) : original;
+  const out: Partial<Record<AssessmentCategoryKey, number>> = {};
+  for (const k of populated) out[k] = w[k] as number;
+  return { categoryWeights: out };
 }
 
 export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
@@ -498,7 +525,16 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     chapters,
     modules,
     finalExam: { enabled: features.finalExam, questionCount: finalQ, ...(finalBank !== undefined ? { bankSize: finalBank } : {}) },
-    assessment: { assessmentProfileVersion: assessment.assessmentProfileVersion, kinds, coursePassingGrade: assessment.passingGrade },
+    assessment: {
+      assessmentProfileVersion: assessment.assessmentProfileVersion,
+      kinds,
+      coursePassingGrade: assessment.passingGrade,
+      ...effectiveCategoryWeights(assessment, {
+        practice: chapters.filter((c) => c.videoEnabled).length + activitiesByVariant.h5p + activitiesByVariant.scorm,
+        moduleExams: exams,
+        finalExam: features.finalExam ? 1 : 0,
+      }),
+    },
     audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,

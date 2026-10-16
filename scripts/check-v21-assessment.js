@@ -177,10 +177,20 @@ check('r55 (R3): resolve fuerza el criterio de nota con un perfil guardado requi
   eq([r3.withoutGrades, r3.courseCompletion.requireCourseGradePass, r3.courseCompletion.courseGradepass], [true, false, 0], 'sin nota');
   const p4 = defFinal();
   p4.passingGrade = 0;
-  throws(() => A.resolveAssessment(p4, { hasFinalExam: true, itemCounts: { practice: 4, moduleExams: 2, finalExam: 1 } }), /ASSESSMENT_UNENFORCEABLE: passingGrade=0/);
+  // review r1 (I1): la nota mínima del curso va de 1 a 100 → el validador lo rechaza antes (INVALID_PASSING_GRADE);
+  // ASSESSMENT_UNENFORCEABLE queda como defensa en el resolver.
+  throws(() => A.resolveAssessment(p4, { hasFinalExam: true, itemCounts: { practice: 4, moduleExams: 2, finalExam: 1 } }), /ASSESSMENT_PROFILE_INVALID: INVALID_PASSING_GRADE/);
   const p5 = defNoFinal();
   p5.passingGrade = 0;
-  eq(A.resolveAssessment(p5, { hasFinalExam: false, itemCounts: { practice: 0, moduleExams: 0 } }).withoutGrades, true, 'sin nota con nota mínima 0: válido');
+  throws(() => A.resolveAssessment(p5, { hasFinalExam: false, itemCounts: { practice: 0, moduleExams: 0 } }), /INVALID_PASSING_GRADE/);
+  const p6 = defNoFinal();
+  p6.passingGrade = 1;
+  eq(A.resolveAssessment(p6, { hasFinalExam: false, itemCounts: { practice: 2, moduleExams: 1 } }).courseGradepass, 1, 'nota mínima 1: válida');
+  const z = defFinal();
+  z.passingGrade = 0;
+  throws(() => P.normalizeAssessmentProfile(z), /PROFILE_INVALID: .*INVALID_PASSING_GRADE/);
+  eq(P.normalizeAssessmentProfile(z, { allowLegacyZeroPassingGrade: true }).passingGrade, 0, 'lectura de un perfil viejo con 0 (GET)');
+  eq(P.validateAssessmentProfile(z, { finalExam: true }).map((e) => e.code), ['INVALID_PASSING_GRADE'], 'guardar con 0 → error por campo');
 });
 check('resolve: defaults sin examen final → 40/60', () => {
   const r = A.resolveAssessment(defNoFinal(), { hasFinalExam: false });

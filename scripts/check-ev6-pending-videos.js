@@ -285,9 +285,12 @@ async function pureChecks() {
   // (completionminattempts), los labels del cierre / certificado / info de evaluaciones, badges.xml y, en 644, los .h5p de
   // QuestionSet 1.21 (solo contenido: files.xml + 2 blobs) — diff por entrada del zip contra 3.13.0 (scratchpad/r55/mbzdiff.js).
   // Dorados 3.13.0: 644 c359c0a5…, 645 d913d39c….
+  // r55 review r1 (sigue 3.14.0): cambian SOLO label.xml de cv3:ch:*:activity_instruction, cv3:ch:*:closing,
+  // cv3:shell:certificate_teacher y cv3:shell:exams_teacher — diff por entrada contra fd67337 (scratchpad/r55b-r1/hook.js).
+  // Dorados r55 (fd67337): 644 b3f18266…, 645 6fc4e222….
   const GOLDEN_PRE_T5 = {
-    644: ['b3f182667bf2164f9fddf4676034a82323838da3db005b9945578685c8494099', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['6fc4e222445a841a71de26c694c413c7c3b9b32d04243146bb2ce5cbbef28115', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['473e168fb481c37951781ca76a17dd05f92e58eb99bb62ee1a636a73aa4f3efa', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['85a5cffc2ea095cf1dfdf4d5fae7fb767e7e9e331ad9321345ee456037a7d6f5', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 Libro Guía PDF + r55 invariantes de calificación, builder 3.14.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

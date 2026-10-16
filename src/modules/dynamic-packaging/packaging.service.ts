@@ -103,6 +103,12 @@ export interface PackageStatusResult {
    */
   restore?: { as: 'site_library_pack'; libraryPack: 'v3'; note: string } | { as: 'admin_or_manager'; note: string };
   /**
+   * r55 review r1 (M1): regla de aprobación del paquete para «Curso listo»: `withoutGrades` (curso sin nota:
+   * se completa viendo el Libro, sin regla de nota) y la nota mínima real del curso (`null` en jobs anteriores a
+   * este campo o en un curso sin nota). Ausente si el job no registró la evaluación.
+   */
+  approval?: { withoutGrades: boolean; coursePassingGrade: number | null };
+  /**
    * EV6 DoD: tipo de paquete. Solo `final` es entregable al cliente; `qa_preview` (run de vista
    * previa) y `degraded` (§2.6) son paquetes de QA rotulados «QA — vista previa, no entregable».
    * Paquetes anteriores sin el campo: inferido de su resumen (videos omitidos / mocks → qa_preview).
@@ -328,6 +334,14 @@ export class PackagingService {
     const restore = job.output_summary?.restore;
     if (restore && restore.as === 'admin_or_manager' && typeof restore.note === 'string') result.restore = { as: 'admin_or_manager', note: restore.note };
     else if (restore && restore.as === 'site_library_pack' && typeof restore.note === 'string') result.restore = { as: 'site_library_pack', libraryPack: 'v3', note: restore.note };
+    const asum = job.output_summary?.assessment;
+    if (asum && typeof asum === 'object' && typeof asum.withoutGrades === 'boolean') {
+      const g = asum.coursePassingGrade;
+      result.approval = {
+        withoutGrades: asum.withoutGrades,
+        coursePassingGrade: !asum.withoutGrades && typeof g === 'number' && Number.isFinite(g) && g > 0 ? g : null,
+      };
+    }
     if (job.worker_status === 'completed') {
       const base = `${String(job.output_summary?.sourceIdsHash ?? job.id)}.mbz`;
       result.downloadFilename = deliverable ? base : `${QA_PACKAGE_FILENAME_PREFIX}${base}`;

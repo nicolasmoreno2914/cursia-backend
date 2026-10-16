@@ -402,6 +402,11 @@ export interface AssessmentPackageSummary {
   weights: Partial<Record<AssessmentCategoryKey, number>>;
   emptyCategories: AssessmentCategoryKey[];
   withoutGrades: boolean;
+  /**
+   * r55 review r1 (M1): nota mínima REAL del curso (gradepass del criterio único «Calificación del curso»);
+   * null en un curso sin nota. «Curso listo» la muestra en vez de un genérico «por defecto 70/100».
+   */
+  coursePassingGrade: number | null;
 }
 
 /** F1 (I3): resumen de una evaluación resuelta CON `itemCounts` (falla si no lo fue). */
@@ -417,6 +422,7 @@ export function assessmentPackageSummary(resolved: ResolvedAssessment): Assessme
     weights,
     emptyCategories: [...resolved.emptyCategories],
     withoutGrades: resolved.withoutGrades,
+    coursePassingGrade: resolved.withoutGrades ? null : resolved.courseGradepass,
   };
 }
 

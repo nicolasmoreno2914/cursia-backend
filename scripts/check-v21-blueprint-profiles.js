@@ -278,6 +278,7 @@ async function pureChecks() {
       [(p) => { p.passingGrade = 101; }, 'INVALID_PASSING_GRADE'],
       [(p) => { p.passingGrade = 70.5; }, 'INVALID_PASSING_GRADE'],
       [(p) => { p.passingGrade = -1; }, 'INVALID_PASSING_GRADE'],
+      [(p) => { p.passingGrade = 0; }, 'INVALID_PASSING_GRADE'], // review r1 (I1): nota mínima del curso 1–100
       [(p) => { p.overrides.exam = 120; }, 'INVALID_OVERRIDE'],
       [(p) => { p.overrides.activity = '80'; }, 'INVALID_OVERRIDE'],
       [(p) => { p.attempts.exam = -1; }, 'INVALID_ATTEMPTS'],

@@ -78,12 +78,27 @@ export function bridgeText(opts: {
   const lead = !opts.activityEnabled
     ? 'Repasa las ideas clave de este capítulo antes de avanzar.'
     : attempts === 0
-      ? 'Si todavía no alcanzaste la nota mínima en la práctica, vuelve a intentarlo.'
+      ? 'Si quieres mejorar tu nota en la práctica, vuelve a intentarlo; su nota de referencia no bloquea tu aprobación.'
       : attempts === 1
         ? 'Revisa tu resultado en la práctica y repasa lo que necesites.'
-        : 'Si todavía no alcanzaste la nota mínima en la práctica y te quedan intentos, vuelve a intentarlo.';
+        : 'Si quieres mejorar tu nota en la práctica y te quedan intentos, vuelve a intentarlo; su nota de referencia no bloquea tu aprobación.';
   const tail = opts.next ? continueWith(opts.next) : COPY.lastChapterOfCourse;
   return `${lead} ${tail}`;
+}
+
+/**
+ * r55 review r1 (M2): dato de la nota de la actividad del capítulo — informativo (marca la actividad aprobada o
+ * no, pero no bloquea el curso, que se aprueba solo por la nota final). «cuenta en tu nota final» solo si la
+ * categoría de práctica pesa > 0.
+ */
+export function activityReferenceGradeText(passingGrade: number, countsInFinalGrade: boolean): string {
+  return `Nota de referencia: ${passingGrade}/100 · no bloquea tu aprobación${countsInFinalGrade ? '; cuenta en tu nota final' : ''}`;
+}
+
+/** r55 review r1 (M2/M3): ¿la práctica (actividades y videos) pesa en la nota final? Facts viejos sin pesos → sí. */
+export function practiceCountsInFinalGrade(assessment: { categoryWeights?: Partial<Record<string, number>> }): boolean {
+  const w = assessment.categoryWeights;
+  return !w || (w.practice ?? 0) > 0;
 }
 
 /** R14-A — solo la parte "repasa / reintenta" del puente (va como párrafo, fuera de la transición). */

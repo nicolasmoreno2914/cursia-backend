@@ -351,7 +351,7 @@ async function pureChecks() {
         eq(secLinks, [want[2]], `cap ${chapterNumber}: un solo botón de sección → ${want[2]}`);
         assert(t.indexOf(want[1]) > t.indexOf('A continuación') && /cvc-btn-link/.test(closingHtml), `cap ${chapterNumber}: el botón va al final de la transición`);
         // Retry/repaso sigue presente (el botón es el elemento dominante, el texto queda secundario).
-        assert(ch.activityEnabled ? /nota mínima|Revisa tu resultado/.test(t) : /Repasa las ideas clave/.test(t), `cap ${chapterNumber}: frase de reintento/repaso: ${t}`);
+        assert(ch.activityEnabled ? /nota de referencia no bloquea tu aprobación|Revisa tu resultado/.test(t) : /Repasa las ideas clave/.test(t), `cap ${chapterNumber}: frase de reintento/repaso: ${t}`);
         // EV5: tras el anuncio del examen no hay «Continúa con el capítulo…» (lo dice el label module_next).
         if (has) assert(!/Continúa con el capítulo|Continuar con el capítulo|terminas el recorrido/.test(t), `mensajes contradictorios: ${t}`);
         assert(!/Continúa con el capítulo|Lo que sigue/.test(t), `cap ${chapterNumber}: queda texto redundante sobre el botón: ${t}`);
@@ -424,7 +424,7 @@ async function pureChecks() {
           } else {
             const instr = vc.extractText(slots.find((s) => s.role === 'activity_instruction').html);
             // P3: tarjeta «Práctica calificada · Capítulo N» con la fila de datos (de facts) y la tarea; el botón no repite el capítulo.
-            assert(instr.startsWith(`Práctica calificada · Capítulo ${chapterNumber} Pon a prueba lo aprendido`) && instr.includes('Nota mínima: 70 de 100') && instr.includes('Intentos: sin límite'), `instrucción: ${instr}`);
+            assert(instr.startsWith(`Práctica calificada · Capítulo ${chapterNumber} Pon a prueba lo aprendido`) && instr.includes('Nota de referencia: 70/100 · no bloquea tu aprobación; cuenta en tu nota final') && !/Nota mínima/.test(instr) && instr.includes('Intentos: sin límite'), `instrucción: ${instr}`);
             assert(/Intentos: sin límite (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
             // UX r18 (problema 4): el botón solo cuando la actividad NO va embebida debajo (SCORM); con H5P
             // la actividad se juega en la misma página y su intro trae el respaldo «Ábrela en su propia página».
@@ -807,7 +807,12 @@ async function pureChecks() {
   });
 
   await check('M4/M12: el puente respeta los intentos de la actividad y omite el texto LLM antes de un examen o al final del curso', () => {
-    eq(S.bridgeText({ activityEnabled: true, activityAttempts: 0, next: { number: 2, title: 'X' } }).startsWith('Si todavía no alcanzaste la nota mínima en la práctica, vuelve a intentarlo.'), true, 'ilimitados');
+    eq(S.bridgeText({ activityEnabled: true, activityAttempts: 0, next: { number: 2, title: 'X' } }).startsWith('Si quieres mejorar tu nota en la práctica, vuelve a intentarlo; su nota de referencia no bloquea tu aprobación.'), true, 'ilimitados');
+    // review r1 (M2): la nota de la actividad es de referencia (no bloquea); «cuenta en tu nota final» solo si la práctica pesa.
+    eq(S.activityReferenceGradeText(70, true), 'Nota de referencia: 70/100 · no bloquea tu aprobación; cuenta en tu nota final', 'dato de la actividad');
+    eq(S.activityReferenceGradeText(70, false), 'Nota de referencia: 70/100 · no bloquea tu aprobación', 'práctica con peso 0');
+    eq([S.practiceCountsInFinalGrade({}), S.practiceCountsInFinalGrade({ categoryWeights: { practice: 0, moduleExams: 100 } }), S.practiceCountsInFinalGrade({ categoryWeights: { practice: 30 } })], [true, false, true], 'peso de la práctica');
+    for (const a of [0, 1, 3]) assert(!/nota mínima/.test(S.bridgeText({ activityEnabled: true, activityAttempts: a, next: null })), `puente (${a}) sin «nota mínima»`);
     eq(S.bridgeText({ activityEnabled: true, activityAttempts: 1, next: null }).includes('vuelve a intentarlo'), false, '1 intento: no promete reintentar');
     eq(S.bridgeText({ activityEnabled: true, activityAttempts: 3, next: null }).includes('te quedan intentos'), true, 'intentos finitos');
     const exps = F.experiencesFor(c2.manifest);

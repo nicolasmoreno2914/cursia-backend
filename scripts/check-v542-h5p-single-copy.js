@@ -111,7 +111,7 @@ const BS_CFG = {
     }
   }
 
-  await check('builder 3.13.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.14.0', 'versión'));
+  await check('builder 3.14.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.14.0', 'versión'));
 
   await check('matriz + rules 2: toda h5pactivity tiene UNA sola copia del .h5p (filearea package) y su inforef apunta solo a ella', () => {
     let n = 0;
@@ -228,7 +228,10 @@ const BS_CFG = {
     // r55 (builder 3.14.0): SOLO cambian completion.xml (criterio único de nota en vez del criterio de la actividad), el
     // module.xml del SCORM (completion al recibir nota, completionpassgrade 0) y el label del cierre (regla de aprobación) —
     // diff por entrada del zip contra el builder 3.13.0 (scratchpad/r55/mbzdiff.js).
-    eq(sha(r.mbz), 'c2ac08cdda9b7bc187606125def0edc2ec84590cb3d77f5fd04699aa58beb555', 'sha256');
+    // r55 review r1 (sigue 3.14.0): en este curso SOLO cambian 2 label.xml — cv3:ch:*:activity_instruction («Nota de
+    // referencia … no bloquea tu aprobación») y cv3:ch:*:closing (puente sin «nota mínima») — diff por entrada contra
+    // fd67337 (scratchpad/r55b-r1/hook.js). Dorado r55 (fd67337): c2ac08cd….
+    eq(sha(r.mbz), '68a4c756877fd0673aa5f549233c81d9b28fe1833fcb22067b34b86fa057083f', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

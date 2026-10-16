@@ -612,12 +612,16 @@ export function coursePassingGradeOf(facts: CourseFacts): number {
 export function courseApprovalRequirements(facts: CourseFacts): CertificateRequirements {
   if (!courseHasGrades(facts)) shellFail('regla de aprobación: el curso no tiene ítems calificables');
   const c = facts.counts;
+  // r55 review r1 (M3): una categoría con ítems pero peso efectivo 0 no aporta a la nota final → no se nombra.
+  // Facts anteriores sin `categoryWeights`: todas las categorías pobladas cuentan (comportamiento previo).
+  const w = facts.assessment?.categoryWeights;
+  const weighs = (k: 'practice' | 'moduleExams' | 'finalExam'): boolean => !w || (w[k] ?? 0) > 0;
   return {
     coursePassingGrade: coursePassingGradeOf(facts),
-    activities: c.activities > 0,
-    videos: c.videos > 0,
-    moduleExams: c.exams > 0,
-    finalExam: c.finalExam === true,
+    activities: c.activities > 0 && weighs('practice'),
+    videos: c.videos > 0 && weighs('practice'),
+    moduleExams: c.exams > 0 && weighs('moduleExams'),
+    finalExam: c.finalExam === true && weighs('finalExam'),
     reviewCards: (c.reviewCards ?? 0) > 0,
   };
 }
@@ -665,9 +669,18 @@ export function courseApprovalTeacherNote(r: CertificateRequirements): string {
   return (
     `El curso se aprueba solo por la calificación final: la finalización del curso tiene un único criterio, «Calificación del curso» ≥ ${r.coursePassingGrade}/100. ` +
     'Una actividad o una evaluación por debajo de su nota mínima no bloquea el curso, y marcar a mano una actividad como completada no lo aprueba. ' +
-    'Moodle revisa ese criterio con su tarea programada (cron): la finalización y el certificado llegan unos minutos después de la última calificación, y mientras tanto el libro de calificaciones ya puede mostrar el curso como aprobado.'
+    'Moodle revisa ese criterio con su tarea programada (cron): la finalización y el certificado llegan unos minutos después de la última calificación, y mientras tanto el libro de calificaciones ya puede mostrar el curso como aprobado. ' +
+    COURSE_RESTORE_COMPLETION_NOTE
   );
 }
+
+/**
+ * r55 review r1 (I2): el criterio «Calificación del curso» solo funciona si el curso destino tiene la finalización
+ * activada. Restaurado como curso NUEVO viene activado; dentro de un curso existente, solo con «Sobrescribir
+ * configuración del curso». Mismo texto en «Cómo restaurarlo en Moodle» del FE (43-dynamic-structure-editor.js).
+ */
+export const COURSE_RESTORE_COMPLETION_NOTE =
+  'Restaura el paquete como un curso nuevo. Si lo restauras dentro de un curso existente, elige «Sobrescribir configuración del curso: Sí» (o activa el seguimiento de finalización del curso y revisa que su finalización tenga el criterio «Calificación del curso»); si no, el criterio de nota no hace nada: nadie completa el curso ni recibe el certificado.';
 
 /**
  * `certificate`: true (o, por compatibilidad, cualquier objeto de requisitos) → panel «Tu certificado». Los

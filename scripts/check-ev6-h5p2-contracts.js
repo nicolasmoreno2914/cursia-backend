@@ -96,12 +96,18 @@ const GOLDEN = {
   // f309c5ac…, scorm-final-light 02a970f2…, h5p-ev5c-rules1 3a8c0028….
   // r55 (builder 3.14.0): huellas RE-CAPTURADAS a propósito — invariantes de calificación (criterio único de nota,
   // completion por nota, completionminattempts, slots aleatorios legados, textos) cambian todo .mbz con nota.
+  // r55 review r1 (sigue siendo builder 3.14.0, rama sin desplegar): RE-CAPTURADAS a propósito — cambian SOLO label.xml
+  // de cv3:ch:*:activity_instruction («Nota de referencia … no bloquea tu aprobación»), cv3:ch:*:closing (puente sin
+  // «nota mínima»), cv3:shell:certificate_teacher y cv3:shell:exams_teacher (restaurar como curso nuevo / «Sobrescribir
+  // configuración del curso», override en dos pasos) — diff por entrada del zip contra fd67337 (scratchpad/r55b-r1/hook.js).
+  // Dorados r55 (fd67337): h5p-final-light 0892ae20…, scorm-nofinal-dark 5feee6eb…, h5p-nofinal-dark-mock-cleansafe
+  // ee6da148…, scorm-final-light 92007263…, h5p-ev5c-rules1 df1ee128….
   mbz: {
-    'h5p-final-light': '0892ae20e44bac31051d5525b6eadd2eced9833f91c646b927fa9e1cec0dd078',
-    'scorm-nofinal-dark': '5feee6eb5f5490834eeef60c28ae7ab23e3f8fd14532c25d85edcaf4b818cfab',
-    'h5p-nofinal-dark-mock-cleansafe': 'ee6da1486781183ce3c33763236fdf49076345fff3ec6f125b99374cc1891ae6',
-    'scorm-final-light': '920072634eb5759b3501b6e464573b6fc439653264349fd305b092668d46a32e',
-    'h5p-ev5c-rules1': 'df1ee1280dc2cd9e07fe11638ce960b14358b4d023bf3378cb711d7e7aa73287',
+    'h5p-final-light': '046edade710990caf80bc5cc95ef429f9cac34f40302a603bd6505d1c32f160b',
+    'scorm-nofinal-dark': '26f7f2305bf0374f1ae096864394d129a60200abb9d0c5034ad717eca4ce4981',
+    'h5p-nofinal-dark-mock-cleansafe': '62c4bc0fd080d9dff4760fb15dcd011c3901f8e5c2d1ac086f8862b1206c9bcd',
+    'scorm-final-light': '139dd6593462e631095352c008facc90752731fb5ce986dbea675676a62263f1',
+    'h5p-ev5c-rules1': '5fa5fafe5a423c35998268763ccd0a70514fdcf699b52c200a18d848f0483e53',
   },
 };
 

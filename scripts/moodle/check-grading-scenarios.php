@@ -7,8 +7,9 @@
 //   - H5P evaluativo: sentencia xAPI «completed» por \core_xapi\handler (la misma vía del reproductor);
 //   - «Repaso»: completion_info::set_module_viewed (lo que hace view.php);
 //   - override manual del docente: completion_info::update_state(..., override).
-// Después: regrade, completion_regular_task ×2 (el criterio de nota lo evalúa el cron), completion_daily_task,
-// badges_cron_task; activación de la insignia (el paso del docente: Moodle la restaura desactivada) + review_all_criteria.
+// Después: regrade; activación de la insignia del curso de prueba (el paso del docente: Moodle la restaura desactivada);
+// completion_regular_task ×2 (el criterio de nota lo evalúa el cron) y review_all_criteria SOLO de esa insignia.
+// Review r1 (I4): sin completion_daily_task ni badges_cron_task (tareas de todo el sitio, el gate comparte Moodle).
 //
 // Escenarios (curso con ≥ 1 evaluación de módulo, evaluación final y «Repaso»; 3 intentos por evaluación):
 //   s1_pass_all             todo aprobado (1 intento)                       → completo + insignia; «Respuestas» ocultas
@@ -208,14 +209,24 @@ foreach ($users as $tag => $uid) $pre[$tag] = (bool)$DB->get_field('course_compl
 $R['pre_cron_completed'] = $pre;
 $ok(!array_filter($pre), 'antes del cron ningún estudiante tiene el curso completo (criterio de nota = tarea programada)');
 
-$runtask = function (string $cls) { $t = new $cls(); ob_start(); $t->execute(); ob_end_clean(); };
-foreach (['\core\task\completion_regular_task', '\core\task\completion_regular_task', '\core\task\completion_daily_task', '\core\task\badges_cron_task'] as $cls) $runtask($cls);
+// review r1 (I4): nada de tareas de todo el sitio que no sean completion_regular_task (el gate comparte este Moodle:
+// completion_daily_task / badges_cron_task tocarían otros cursos e insignias). El paso del docente — activar la
+// insignia del curso de prueba (Moodle la restaura desactivada) — va ANTES del cron, como en producción; luego
+// completion_regular_task ×2 (el criterio de nota) y, acotado a ESA insignia, review_all_criteria (lo mismo que
+// hace «Habilitar acceso» para quien ya cumplía). La aserción insignia ⇔ curso completo sigue abajo, por usuario.
+$issuedIn = fn(): int => (int)$DB->count_records_sql('SELECT COUNT(1) FROM {badge_issued} bi JOIN {badge} b ON b.id = bi.badgeid WHERE b.courseid = ?', [$courseid]);
+$ok($issuedIn() === 0, 'antes del cron no hay insignias emitidas en el curso de prueba');
+$testBadges = [];
 foreach ($DB->get_records('badge', ['courseid' => $courseid]) as $b) {
     $badge = new \core_badges\badge($b->id);
     if (!$badge->is_active()) $badge->set_status(BADGE_STATUS_ACTIVE);
-    $R['badge_review_awarded'] = $badge->review_all_criteria();
+    $testBadges[] = $badge;
 }
-foreach (['\core\task\completion_regular_task', '\core\task\badges_cron_task'] as $cls) $runtask($cls);
+$runtask = function (string $cls) { $t = new $cls(); ob_start(); $t->execute(); ob_end_clean(); };
+foreach (['\core\task\completion_regular_task', '\core\task\completion_regular_task'] as $cls) $runtask($cls);
+$R['badge_issued_after_completion_tasks'] = $issuedIn();
+$R['badge_review_awarded'] = 0;
+foreach ($testBadges as $badge) $R['badge_review_awarded'] += (int)$badge->review_all_criteria();
 
 // ── Estado final ──
 $ci = grade_item::fetch_course_item($courseid);
