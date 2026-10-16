@@ -13,8 +13,10 @@
 //   [L4] filas antiguas de usage_events con costos inventados no cambian NINGUNA cifra de dinero
 //   [AT] un ejecutor que no es el dueño del run no puede saltarse el tope ni el guard (proxy + ledger); un worker
 //        del servidor conserva course_id/run_id y el tope aplica
-//   [UP] cargo final SIN precio: la reserva queda abierta (reservado), el cargo se lista como «sin precio»; al re-preciar
-//        se liquidan ambos y la llamada se cuenta una sola vez
+//   [UP] cargo final SIN precio (review r1 I1): la reserva se liquida a 0 como siempre (nunca queda abierta), el cargo
+//        a 0 pendiente se lista como «sin precio», `completeness: 'partial'`, real NO inflado, ningún lector cuenta doble;
+//        al re-preciar entra el precio real y vuelve a 'complete'. TTS sin medir (m1) también es «sin precio»
+//   [PC] promedio/mín./máx. por curso solo con gasto de Cursia > 0 (review r1 m3): cursos solo BYOK / mock / 0 fuera
 //   [DC] llamadas directas (extracción, /tts/speech): al curso del dueño o sin atribuir con motivo explícito
 //
 // Usage: npm run build && node scripts/check-finops-p0-ledger-truth.js [--pure-only]
@@ -101,6 +103,9 @@ async function pureChecks() {
     const zero = CR.summaryFromAggregates({ events: 2, actual: '0', reserved: '0', committed: '0.0000000000' });
     eq([zero.status, zero.actual, zero.reserved, zero.committed], ['ok', '0.0000000000', '0.0000000000', '0.0000000000'], 'cero real');
     eq(CR.emptySummary('unavailable').status, 'unavailable', 'sin ledger en la base');
+    // Review r1: completeness — 'partial' si hay llamadas sin precio; null sin ledger.
+    eq([none.completeness, zero.completeness, CR.summaryFromAggregates({ events: 3, unpriced: 2 }).completeness, CR.emptySummary('unavailable').completeness],
+      ['complete', 'complete', 'partial', null], 'completeness');
   });
 
   await check('[DC] puro: llamada directa a Anthropic / TTS → input del ledger con atribución al curso o motivo explícito; TTS con segundos medidos = final, sin medir = pendiente', () => {
@@ -112,6 +117,7 @@ async function pureChecks() {
     eq([t.idempotencyKey, t.measurementStatus, t.usage.audio_seconds, t.attributionCourseId], ['openai:req:req_1', 'final', '12.346', 7], 'tts medido');
     const t2 = DC.directTtsChargeInput({ ownerId: 'o', model: 'gpt-4o-mini-tts', requestId: null, audioSeconds: null, characters: 200, unattributedReason: 'legacy_tts_no_course', recordedBy: 'tts', localCallId: 'l2' });
     eq([t2.idempotencyKey, t2.measurementStatus, JSON.stringify(t2.usage), t2.metadata.pendingReason], ['openai:tts-speech:l2', 'pending', '{}', 'tts_audio_not_measurable'], 'tts sin medir');
+    eq([t.unmeasuredUsage, t2.unmeasuredUsage], [false, true], 'tts sin medir → marcado como sin precio (review r1 m1)');
   });
 }
 
@@ -357,6 +363,21 @@ async function dbChecks() {
       eq(F.addDec(day14.committed, day13.committed, (await costRead.periodSummary(new Date('2026-10-12T00:00:00Z'), new Date('2026-10-13T00:00:00Z'))).committed), full.money.committed, 'Σ días = período');
     });
 
+    await check('[PC] promedio/mín./máx. por curso: solo cursos con gasto de Cursia > 0; cursos solo BYOK / solo mock / solo 0 quedan fuera de las estadísticas (no de la lista)', async () => {
+      const day = (h) => `2026-09-10T${h}:00:00Z`;
+      const mk = async (id, title) => ds.query(`insert into public.courses (id, owner_id, title, status, structure_version) values ($1, $2, $3, 'draft', 'dynamic')`, [id, OWNER, title]);
+      await mk(91354, 'Solo BYOK'); await mk(91355, 'Solo mock'); await mk(91356, 'Cursia 2.5'); await mk(91357, 'Cursia 1.5'); await mk(91358, 'Solo empaque 0');
+      await ev({ course: 91354, run: null, amount: '4.0000000000', account: 'user_key', source: 'ACTUAL_PROVIDER', at: day('10') });
+      await ev({ course: 91355, run: null, amount: '0.0000000000', account: 'mock', at: day('10') });
+      await ev({ course: 91356, run: null, amount: '2.5000000000', at: day('11') });
+      await ev({ course: 91357, run: null, amount: '1.5000000000', at: day('12') });
+      await ev({ course: 91358, run: null, amount: '0.0000000000', provider: 'cursia', operation: 'package.build', source: 'ZERO_BY_DESIGN', at: day('13') });
+      const p = await costRead.periodSummary(new Date('2026-09-10T00:00:00Z'), new Date('2026-09-11T00:00:00Z'));
+      eq([p.perCourse.courses, p.perCourse.excluded, p.perCourse.average, p.perCourse.min, p.perCourse.max], [2, 3, '2.0000000000', '1.5000000000', '2.5000000000'], 'estadísticas solo con gasto Cursia');
+      eq(p.courses.length, 5, 'los 5 cursos siguen en la lista del período');
+      eq([p.committed, p.byok.committed, p.completeness], ['4.0000000000', '4.0000000000', 'complete'], 'BYOK aparte; completo');
+    });
+
     await check('[L4] filas antiguas de usage_events con costos inventados (y POST /events) no cambian NINGUNA cifra de dinero; la actividad sí se cuenta', async () => {
       const before = JSON.stringify({ c: await dash.getCourseCost(CID), s: (await dash.getSummary(B0, B1)).money });
       await ds.query(`insert into public.usage_events (user_id, event_type, failed, estimated_cost_usd, real_cost_usd, cost_type, course_id, created_at) values
@@ -447,38 +468,53 @@ async function dbChecks() {
       assert(run.counts.openReservations >= 2 && F.cmpDec(run.reserved, r.event.amount) >= 0, 'cuenta en el reservado del run');
     });
 
-    await check('[UP] cargo final SIN precio: la reserva QUEDA ABIERTA (reservado, cuenta para el tope), el cargo se lista como «sin precio» (no es USD 0 real); al re-preciar se liquidan ambos y la llamada cuenta UNA vez', async () => {
+    await check('[UP] cargo final SIN precio (review r1 I1): la reserva se liquida a 0 (nunca abierta), el cargo a 0 pendiente se lista «sin precio», completeness partial, real NO inflado y ningún lector cuenta doble; al re-preciar entra el precio real', async () => {
       const MODEL = 'claude-modelo-p0-sin-precio';
       const before = await costRead.runCost(grun);
+      const beforeCourse = await costRead.courseCost(gcid);
+      const beforeAdmin = await ledger.costsByRun(grun);
+      eq([before.completeness, beforeCourse.completeness], ['complete', 'complete'], 'antes: completo');
       const resKey = `reservation:test:${gitem.id}:unpriced`;
       const res = await ledger.recordCharge(resInput(OWNER, 'unpriced', { modelOrProduct: MODEL, idempotencyKey: resKey }));
       assert(res.inserted && F.cmpDec(res.event.amount, 0) > 0, 'reserva conservadora > 0');
-      const s = await ledger.settleReservation(resKey, {
+      const finalInput = {
         itemRunId: gitem.id, ownerIdFromAuth: OWNER, provider: 'anthropic', service: 'messages', modelOrProduct: MODEL,
         usage: { input_tokens: 1000, output_tokens: 500 }, usageUnit: 'output_tokens', externalOperationId: 'msg_p0_unpriced',
         idempotency: { kind: 'anthropic', parts: { messageId: 'msg_p0_unpriced' } }, callRole: 'main', attempt: 1, billingAccount: 'cursia', mode: 'real',
         costSource: 'CALCULATED_FROM_USAGE', recordedBy: 'check', pricingFallback: 'pending_zero',
-      }, 'test_settled');
-      eq([s.finalInserted, s.released, s.finalEvent.amount, s.finalEvent.measurement_status, s.finalEvent.metadata.reservationKeptOpen], [true, false, '0.0000000000', 'pending', resKey], 'final a 0 pendiente, reserva abierta');
-      eq(await ledger.reservationSettled(resKey), false, 'la reserva sigue abierta');
+      };
+      const s = await ledger.settleReservation(resKey, finalInput, 'test_settled');
+      eq([s.finalInserted, s.released, s.finalEvent.amount, s.finalEvent.measurement_status, s.finalEvent.metadata.pricingMissing, s.finalEvent.metadata.unpricedReason, s.finalEvent.pricing_snapshot ?? null, 'reservationKeptOpen' in s.finalEvent.metadata],
+        [true, true, '0.0000000000', 'pending', true, 'pricing_missing', null, false], 'final a 0 pendiente con la marca; la reserva se liquida (comportamiento original)');
+      eq(await ledger.reservationSettled(resKey), true, 'la reserva NO queda abierta');
       const mid = await costRead.runCost(grun);
-      eq([mid.unpriced.count, mid.unpriced.events[0].idempotencyKey], [1, 'anthropic:msg:msg_p0_unpriced'], 'listado como sin precio');
-      eq(F.subDec(mid.reserved, before.reserved), res.event.amount, 'reservado = cota de la reserva (el gasto no desaparece)');
-      eq([mid.actual, mid.counts.providerCalls - before.counts.providerCalls], [before.actual, 1], 'real sin cambio; UNA llamada');
-      // Reintento de la misma liquidación con el precio aún faltante: idempotente, la reserva sigue abierta.
-      await ledger.settleReservation(resKey, { itemRunId: gitem.id, ownerIdFromAuth: OWNER, provider: 'anthropic', service: 'messages', modelOrProduct: MODEL,
-        usage: { input_tokens: 1000, output_tokens: 500 }, usageUnit: 'output_tokens', externalOperationId: 'msg_p0_unpriced',
-        idempotency: { kind: 'anthropic', parts: { messageId: 'msg_p0_unpriced' } }, billingAccount: 'cursia', mode: 'real', recordedBy: 'check', pricingFallback: 'pending_zero' }, 'test_settled');
-      eq(await ledger.reservationSettled(resKey), false, 'reintento: sigue abierta');
+      eq([mid.unpriced.count, mid.unpriced.events[0].idempotencyKey, mid.unpriced.events[0].reason, mid.completeness], [1, 'anthropic:msg:msg_p0_unpriced', 'pricing_missing', 'partial'], 'listado «sin precio», alcance parcial');
+      eq([mid.actual, mid.reserved, mid.committed], [before.actual, before.reserved, before.committed], 'real NO inflado (ni con la cota); reservado sin la reserva ya liquidada');
+      eq([mid.counts.providerCalls - before.counts.providerCalls, mid.counts.openReservations - before.counts.openReservations], [1, 0], 'UNA llamada (el cargo sin precio), ninguna reserva abierta nueva');
+      const midCourse = await costRead.courseCost(gcid);
+      eq([midCourse.completeness, midCourse.unpriced.count - beforeCourse.unpriced.count, midCourse.committed], ['partial', 1, beforeCourse.committed], 'curso: parcial, sin doble conteo');
+      const midPeriod = await costRead.periodSummary(new Date('2026-01-01T00:00:00Z'), new Date('2027-01-01T00:00:00Z'));
+      const prow = midPeriod.courses.find((c) => c.courseId === Number(gcid));
+      eq([midPeriod.completeness, prow.money.completeness, prow.money.committed], ['partial', 'partial', beforeCourse.committed], 'período y fila del curso: parcial');
+      // Lectores de «resultado desconocido» / conciliación: la reserva cerrada no aparece y no se puede contar como cobrada.
+      const pend = await ledger.pendingLlmWorkerReservations({ runId: grun });
+      assert(!pend.some((r) => r.reservationKey === resKey), 'no aparece en la lista de reservas a conciliar');
+      const rc = await ledger.reconcileReservationAsCharged(resKey, 'check', { decidedBy: 'admin@cursia.test' });
+      eq([rc.reconciled, rc.alreadySettled], [false, true], 'conciliar «cobrada» es no-op (no suma R)');
+      const midAdmin = await ledger.costsByRun(grun);
+      eq([midAdmin.totals.total, midAdmin.totals.pending, midAdmin.retriesPaid.events], [beforeAdmin.totals.total, beforeAdmin.totals.pending, beforeAdmin.retriesPaid.events], 'lector admin /finops/runs: sin doble conteo');
+      eq(midAdmin.money.completeness, 'partial', 'lector admin: money parcial');
+      // Reintento de la misma liquidación: idempotente.
+      const s2 = await ledger.settleReservation(resKey, finalInput, 'test_settled');
+      eq([s2.finalInserted, s2.alreadySettled], [false, true], 'reintento: no-op');
       await ds.query(`insert into public.pricing_catalog (provider, service, product_or_model, meter, unit_size, unit_price, currency, pricing_version, effective_from, source, verified)
         values ('anthropic','messages',$1,'input_tokens',1000000,3,'USD','p0-test','2026-01-01T00:00:00Z','contract',false),
                ('anthropic','messages',$1,'output_tokens',1000000,15,'USD','p0-test','2026-01-01T00:00:00Z','contract',false)`, [MODEL]);
       const adjR = await ledger.repricePendingCharge('anthropic:msg:msg_p0_unpriced');
       eq([adjR.inserted, adjR.delta], [true, '0.0105000000'], 're-preciado');
-      eq(await ledger.reservationSettled(resKey), true, 'la reserva se liquidó en la misma transacción');
       const after = await costRead.runCost(grun);
-      eq([after.unpriced.count, after.reserved, F.subDec(after.actual, before.actual), after.counts.providerCalls - before.counts.providerCalls],
-        [0, before.reserved, '0.0105000000', 1], 'real = precio real; reservado vuelve; la llamada sigue contando una vez');
+      eq([after.unpriced.count, after.completeness, after.reserved, F.subDec(after.actual, before.actual), after.counts.providerCalls - before.counts.providerCalls],
+        [0, 'complete', before.reserved, '0.0105000000', 1], 'real = precio real; completo; la llamada sigue contando una vez');
     });
 
     await check('[DC] llamada directa: al curso del dueño (course_id, scope course); curso ajeno → sin atribuir con motivo; sin curso → motivo explícito (nunca NULL silencioso); /tts/speech medido', async () => {
@@ -498,6 +534,18 @@ async function dbChecks() {
       eq([tts.amount, tts.measurement_status, tts.course_id, tts.operation], ['0.0300000000', 'final', gcid, 'tts.speech'], 'TTS 120 s × 0,015/min');
       const gc = await costRead.courseCost(gcid);
       assert(gc.runs.some((r) => r.runId === null && F.cmpDec(r.committed, '0.0300000000') >= 0), 'aparece en el costo del curso (fila sin run)');
+      eq(gc.completeness, 'complete', 'TTS medido: completo');
+      // Review r1 (m1): TTS cuya respuesta no se pudo medir → pendiente 0 marcado «sin precio» (lista + parcial).
+      assert(await DC.recordDirectTtsCall(ledger, lg, { ownerId: OWNER, model: 'gpt-4o-mini-tts', requestId: 'req_p0_unmeasured', audioSeconds: null, characters: 900, courseId: gcid, unattributedReason: 'legacy_tts_no_course', recordedBy: 'tts-speech', localCallId: 'l2' }), 'tts sin medir');
+      const [tu] = await eventsOf(`idempotency_key = 'openai:req:req_p0_unmeasured'`, []);
+      eq([tu.amount, tu.measurement_status, tu.metadata.unpricedReason, tu.metadata.pricingMissing ?? null], ['0.0000000000', 'pending', 'usage_not_measured', null], 'TTS sin medir: pendiente 0 con la marca');
+      const gc2 = await costRead.courseCost(gcid);
+      eq([gc2.completeness, gc2.unpriced.count - gc.unpriced.count, gc2.committed, gc2.unpriced.events.find((x) => x.idempotencyKey === 'openai:req:req_p0_unmeasured').reason],
+        ['partial', 1, gc.committed, 'usage_not_measured'], 'curso parcial, listado con su motivo, sin inventar monto');
+      // Un cliente no puede marcar «sin precio» (la marca es server-side).
+      const forged = await ledger.recordCharge({ ownerIdFromAuth: OWNER, provider: 'anthropic', service: 'messages', modelOrProduct: 'claude-sonnet-4-6', usage: { input_tokens: 10, output_tokens: 10 },
+        idempotency: { kind: 'anthropic', parts: { messageId: 'msg_forged_unpriced' } }, billingAccount: 'cursia', mode: 'real', recordedBy: 'llm-proxy', metadata: { unpricedReason: 'pricing_missing' } });
+      eq(forged.event.metadata.unpricedReason ?? null, null, 'metadata del cliente sin la marca');
       // Sin atribución declarada: el ledger marca el motivo explícito.
       const plain = await ledger.recordCharge({ ownerIdFromAuth: OWNER, provider: 'anthropic', service: 'messages', modelOrProduct: 'claude-sonnet-4-6', usage: { input_tokens: 1, output_tokens: 1 },
         idempotency: { kind: 'anthropic', parts: { messageId: 'msg_conn_test' } }, billingAccount: 'cursia', mode: 'real', recordedBy: 'llm-proxy' });

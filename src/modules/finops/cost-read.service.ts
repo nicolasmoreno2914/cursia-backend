@@ -28,13 +28,23 @@ import { FinopsError } from './errors';
  *    ≠ mock, que NO pertenece a una «familia de reserva reemplazada» (reserva liquidada / liberada / conciliada
  *    «no cobrada» / conciliada «cobrada» y luego superada por el uso tardío: en todos esos casos la familia neta 0
  *    y la llamada, si se cobró, es su CHARGE final). Una reserva abierta o conciliada «cobrada» ES la llamada.
- *    Un CHARGE final sin precio cuya reserva quedó abierta (`reservationKeptOpen`) no se cuenta mientras su reserva
- *    siga abierta (la llamada es la reserva). ⇒ reserva + cargo final de una misma llamada cuentan UNA vez.
+ * *    ⇒ reserva + cargo final de una misma llamada cuentan UNA vez.
  *  - Reintento: llamada con `call_role <> 'main'` o `attempt > 1` (el attempt de la LLAMADA). Su monto es el neto
  *    de sus eventos (los ADJUSTMENT copian call_role/attempt del cargo que corrigen, así que netean solos).
  *  - Llamada fallida: llamada con `outcome <> 'succeeded'`.
- *  - Sin precio (unpriced): CHARGE abierto con `metadata.pricingMissing=true` y monto 0 → se lista y se cuenta,
- *    nunca se muestra como «USD 0 real» (vale 0 en reservado hasta que se re-precie).
+ *  - Sin precio (unpriced, review r1 I1/m1): CHARGE que NO es reserva, `measurement_status='pending'`, monto 0, sin
+ *    ningún evento que lo corrija, y con la marca server-side del ledger: `metadata.unpricedReason`
+ *    ('pricing_missing' = el catálogo no tenía precio; 'usage_not_measured' = el proveedor respondió pero el uso no se
+ *    pudo medir, p.ej. TTS no-mp3) o, en eventos previos a esa marca, `metadata.pricingMissing=true` (que es lo que
+ *    el ledger siempre escribió cuando el precio faltaba; pricing_snapshot queda null). La reserva de esa llamada se
+ *    liquida a 0 como siempre (nunca queda abierta: los lectores de «resultado desconocido» no la ven), así que el
+ *    cargo sin precio es la llamada (cuenta una vez) y su gasto real NO está en ningún monto: se lista
+ *    (`unpriced.events`, con su motivo) y el alcance queda `completeness: 'partial'` («Incluye N llamadas sin precio
+ *    (costo real incompleto)»). `completeness: 'complete'` = sin cargos sin precio; null = sin ledger (unavailable).
+ *    Nunca se infla `actual` con una cota. Se re-precia con repricePendingCharge (manual; solo 'pricing_missing').
+ *  - Promedio/mín./máx. por curso (perCourse, review r1 m3): solo cursos con gasto de Cursia > 0 en el período
+ *    (Σ amount con billing_account='cursia' > 0). Un curso con solo BYOK, solo mock o solo cargos a 0 (sin precio)
+ *    no entra en las estadísticas (sí en `courses[]`); `perCourse.excluded` cuenta cuántos se dejaron fuera.
  *  - Sin datos vs cero: sin ningún evento en el alcance → `status: 'no_data'` y montos null; con eventos que suman 0
  *    → "0.0000000000" con `status: 'ok'`. Sin ledger en la base (producción hoy) → `status: 'unavailable'`.
  *  - Período (resumen): `[from, to)` en UTC sobre la FECHA EFECTIVA del evento = la del CHARGE que corrige
@@ -47,6 +57,8 @@ import { FinopsError } from './errors';
 export const COST_READ_DEFINITIONS_VERSION = 'finops-read-v1';
 
 export type CostDataStatus = 'ok' | 'no_data' | 'unavailable';
+/** 'partial' = el alcance incluye llamadas sin precio (su gasto real no está en los montos). null = sin ledger. */
+export type CostCompleteness = 'complete' | 'partial';
 
 export interface CostCounts {
   events: number;
@@ -98,10 +110,14 @@ export interface UnpricedEventView {
   courseId: number | null;
   runId: string | null;
   itemKey: string | null;
+  /** 'pricing_missing' | 'usage_not_measured' (eventos viejos sin la marca: 'pricing_missing'). */
+  reason: string;
+  billingAccount: string;
 }
 
 export interface CostSummary {
   status: CostDataStatus;
+  completeness: CostCompleteness | null;
   definitions: string;
   currency: 'USD';
   actual: string | null;
@@ -146,7 +162,7 @@ export interface PeriodCourseRow {
 export interface PeriodSummary extends CostSummary {
   scope: 'period';
   period: { from: string; to: string; basis: 'effective_at_utc' };
-  perCourse: { courses: number; average: string | null; min: string | null; max: string | null };
+  perCourse: { courses: number; excluded: number; average: string | null; min: string | null; max: string | null };
   unattributed: CostSummary & { byReason: Array<{ reason: string; committed: string; events: number }> };
   courses: PeriodCourseRow[];
   coursesTruncated: boolean;
@@ -174,7 +190,7 @@ export function costEventsCte(where: string): string {
   return `ev as (
     select e.id, e.created_at, e.event_kind, e.amount, e.billing_account, e.provider, e.item_type, e.item_key, e.operation,
            e.course_id, e.run_id, e.call_role, e.attempt, e.outcome, e.owner_id, e.metadata, e.usage, e.idempotency_key,
-           e.model_or_product,
+           e.model_or_product, e.measurement_status,
            coalesce(p.created_at, e.created_at) as effective_at,
            (e.event_kind = 'CHARGE' and coalesce(e.metadata->>'reservation', '') = 'true') as is_reservation,
            coalesce(e.event_kind = 'CHARGE' and e.measurement_status = 'pending'
@@ -182,11 +198,10 @@ export function costEventsCte(where: string): string {
            (e.call_role <> 'main' or e.attempt > 1) as is_retry,
            coalesce(case when e.event_kind = 'CHARGE' then ${dropped('e')} else ${dropped('p')} end, false) as in_dropped_family,
            coalesce(e.event_kind = 'CHARGE' and e.provider <> 'cursia' and e.billing_account <> 'mock'
-             and not ${dropped('e')}
-             and not (coalesce(e.metadata->>'reservationKeptOpen', '') <> '' and exists (
-               select 1 from ${GCE} r where r.idempotency_key = e.metadata->>'reservationKeptOpen'
-                  and not exists (select 1 from ${GCE} a where a.corrects_event_id = r.id))), false) as is_call,
-           coalesce(e.event_kind = 'CHARGE' and coalesce(e.metadata->>'pricingMissing', '') = 'true' and e.amount = 0
+             and not ${dropped('e')}, false) as is_call,
+           coalesce(e.event_kind = 'CHARGE' and coalesce(e.metadata->>'reservation', '') <> 'true'
+             and e.measurement_status = 'pending' and e.amount = 0
+             and (coalesce(e.metadata->>'unpricedReason', '') <> '' or coalesce(e.metadata->>'pricingMissing', '') = 'true')
              and not exists (select 1 from ${GCE} a where a.corrects_event_id = e.id), false) as is_unpriced
       from ${GCE} e
       left join ${GCE} p on p.id = e.corrects_event_id
@@ -249,6 +264,7 @@ export function summaryFromAggregates(row: any): CostSummary {
   const m = (v: unknown) => (has ? dec(v) : null);
   return {
     status: has ? 'ok' : 'no_data',
+    completeness: Number(row?.unpriced ?? 0) > 0 ? 'partial' : 'complete',
     definitions: COST_READ_DEFINITIONS_VERSION,
     currency: 'USD',
     actual: m(row?.actual),
@@ -284,7 +300,7 @@ export function summaryFromAggregates(row: any): CostSummary {
 
 /** Resumen vacío honesto: sin ledger en esta base (`unavailable`) o sin eventos (`no_data`). */
 export function emptySummary(status: CostDataStatus): CostSummary {
-  return { ...summaryFromAggregates({ events: 0 }), status };
+  return { ...summaryFromAggregates({ events: 0 }), status, completeness: status === 'unavailable' ? null : 'complete' };
 }
 
 @Injectable()
@@ -336,13 +352,15 @@ export class CostReadService {
   private async unpricedList(q: Runner, where: string, params: unknown[]): Promise<UnpricedEventView[]> {
     const rows = await q.query(
       `with ${costEventsCte(where)}
-       select id, idempotency_key, created_at, provider, model_or_product, course_id, run_id, item_key
+       select id, idempotency_key, created_at, provider, model_or_product, course_id, run_id, item_key, billing_account,
+              coalesce(nullif(metadata->>'unpricedReason', ''), 'pricing_missing') as reason
          from ev where is_unpriced and billing_account <> 'mock' order by created_at limit 50`,
       params,
     );
     return rows.map((r: any) => ({
       id: r.id, idempotencyKey: r.idempotency_key, createdAt: iso(r.created_at) as string, provider: r.provider,
       model: r.model_or_product ?? null, courseId: r.course_id === null ? null : Number(r.course_id), runId: r.run_id ?? null, itemKey: r.item_key ?? null,
+      reason: String(r.reason), billingAccount: String(r.billing_account),
     }));
   }
 
@@ -478,7 +496,9 @@ export class CostReadService {
       const [per] = await q.query(
         `with ${costEventsCte(inRange)},
          c as (select course_id, coalesce(sum(amount) filter (where ${C}), 0) as committed from ev where course_id is not null group by course_id)
-         select count(*)::int as n, round(avg(committed), 10)::text as avg, min(committed)::text as min, max(committed)::text as max from c`,
+         select count(*) filter (where committed > 0)::int as n, count(*) filter (where not committed > 0)::int as excluded,
+                round(avg(committed) filter (where committed > 0), 10)::text as avg,
+                (min(committed) filter (where committed > 0))::text as min, (max(committed) filter (where committed > 0))::text as max from c`,
         P,
       );
       // Agregados por curso SOLO del período; el nombre/estado/id del frontend salen de courses (no de usage_events).
@@ -511,6 +531,7 @@ export class CostReadService {
         authorized: has ? { amount: Number(cap.with_cap) > 0 ? dec(cap.amount) : null, runsWithCap: Number(cap.with_cap), runsWithoutCap: Number(cap.runs) - Number(cap.with_cap) } : null,
         perCourse: {
           courses: Number(per.n),
+          excluded: Number(per.excluded),
           average: Number(per.n) > 0 ? dec(per.avg) : null,
           min: Number(per.n) > 0 ? dec(per.min) : null,
           max: Number(per.n) > 0 ? dec(per.max) : null,
@@ -524,7 +545,7 @@ export class CostReadService {
       };
     });
     return out ?? {
-      ...emptySummary('unavailable'), scope: 'period', period, perCourse: { courses: 0, average: null, min: null, max: null },
+      ...emptySummary('unavailable'), scope: 'period', period, perCourse: { courses: 0, excluded: 0, average: null, min: null, max: null },
       unattributed: { ...emptySummary('unavailable'), byReason: [] }, courses: [], coursesTruncated: false,
     };
   }

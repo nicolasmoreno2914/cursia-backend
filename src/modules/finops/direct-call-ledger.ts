@@ -109,6 +109,8 @@ export function directTtsChargeInput(a: DirectTtsCall): RecordChargeInput | null
     mode: 'real',
     costSource: 'CALCULATED_FROM_USAGE',
     measurementStatus: measured ? 'final' : 'pending',
+    // Review r1 (m1): sin medición → «sin precio» explícito (lista de no preciados + completeness 'partial').
+    unmeasuredUsage: !measured,
     pricingFallback: 'pending_zero',
     recordedBy: a.recordedBy,
     metadata: { costBasis: 'measured_audio_seconds x pricing_catalog', characters: a.characters, serverSide: true,

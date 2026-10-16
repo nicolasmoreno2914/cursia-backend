@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, isZeroDec, normalizeDecimal, subDec, DecimalLike } from './decimal';
@@ -79,6 +79,12 @@ export interface RecordChargeInput {
    * course_id/run_id (y el tope del run aplica); owner_id = dueño del run y metadata.executorOwnerId = el ejecutor.
    */
   executorAuthorization?: 'owner_only' | 'server_worker';
+  /**
+   * FinOps P0 review r1 (m1): la respuesta del proveedor llegó pero su uso NO se pudo medir (p.ej. un TTS no-mp3): el
+   * cargo queda `pending` a 0 y se marca `metadata.unpricedReason='usage_not_measured'` (server-side) para que el lector
+   * lo liste como «sin precio» y el alcance quede `completeness: 'partial'` (nunca un 0 invisible).
+   */
+  unmeasuredUsage?: boolean;
   /** FinOps P0: motivo explícito de una llamada SIN atribución (p.ej. 'connection_test', 'brand_extraction'). */
   unattributedReason?: string | null;
   /**
@@ -210,7 +216,15 @@ function num(v: DecimalLike | null | undefined): string | null {
 export class FinopsLedgerService {
   private readonly logger = new Logger('FinopsLedger');
 
-  constructor(private readonly dataSource: DataSource) {}
+  /**
+   * Review r1 (m5): CostReadService llega por DI de Nest (FinopsModule lo provee). @Optional solo para los scripts que
+   * construyen el ledger a mano (`new FinopsLedgerService(ds)`): ahí se crea uno sobre el mismo DataSource.
+   */
+  private readonly costRead: CostReadService;
+
+  constructor(private readonly dataSource: DataSource, @Optional() costRead?: CostReadService) {
+    this.costRead = costRead ?? new CostReadService(dataSource);
+  }
 
   // ─── atribución ────────────────────────────────────────────────────────────
 
@@ -622,7 +636,7 @@ export class FinopsLedgerService {
     delete metadata.attribution;
     delete metadata.unattributedReason;
     delete metadata.executorOwnerId;
-    delete metadata.reservationKeptOpen;
+    delete metadata.unpricedReason;
     if (!attribution.attributed) {
       // FinOps P0: nunca un NULL silencioso — sin atribución, con un motivo explícito (scope queda NULL: el CHECK del
       // ledger solo admite course/module/chapter/run/org; la marca vive en metadata, sin migración).
@@ -635,6 +649,9 @@ export class FinopsLedgerService {
       metadata.pricingMissing = true;
       metadata.pricingError = pricingError;
     }
+    // FinOps P0 review r1: marca única de «sin precio» que lee CostReadService (is_unpriced).
+    if (pricingError) metadata.unpricedReason = 'pricing_missing';
+    else if (input.unmeasuredUsage === true && isZeroDec(amount)) metadata.unpricedReason = 'usage_not_measured';
     if (!attribution.attributed && attribution.rejectReason) {
       metadata.attributionRejected = true;
       metadata.attributionRejectReason = attribution.rejectReason;
@@ -677,7 +694,7 @@ export class FinopsLedgerService {
       amount,
       currency,
       cost_source: costSource,
-      measurement_status: pricingError ? 'pending' : input.measurementStatus ?? 'final',
+      measurement_status: pricingError || metadata.unpricedReason === 'usage_not_measured' ? 'pending' : input.measurementStatus ?? 'final',
       billing_account: input.billingAccount,
       billable,
       outcome: input.outcome ?? 'succeeded',
@@ -717,28 +734,10 @@ export class FinopsLedgerService {
       product: orig.model_or_product,
       asOf: orig.created_at,
     });
-    // FinOps P0: si la reserva de esta llamada quedó abierta por el precio faltante, se liquida en la MISMA transacción
-    // (nunca quedan contados a la vez la cota de la reserva y el cargo ya re-preciado).
-    const keptOpen = typeof orig.metadata?.reservationKeptOpen === 'string' && orig.metadata.reservationKeptOpen ? String(orig.metadata.reservationKeptOpen) : null;
-    return this.dataSource.transaction(async (m) => {
-      const r = await this.adjustWith(m, idempotencyKey, normalizeDecimal(priced.amount), 'repriced_after_pricing_missing', {
-        recordedBy: 'reconciler',
-        metadata: { pricingSnapshot: priced.pricingSnapshot },
-        settlement: true,
-      });
-      if (keptOpen) {
-        const [res] = await m.query(
-          `select e.id from public.generation_cost_events e where e.idempotency_key = $1 and e.event_kind = 'CHARGE'
-              and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`,
-          [keptOpen],
-        );
-        if (res) {
-          await this.adjustWith(m, keptOpen, normalizeDecimal(0), 'reservation_settled_after_reprice', {
-            recordedBy: 'reconciler', settlement: true, metadata: { reservationSettled: true, supersededBy: idempotencyKey },
-          });
-        }
-      }
-      return r;
+    return this.recordAdjustment(idempotencyKey, priced.amount, 'repriced_after_pricing_missing', {
+      recordedBy: 'reconciler',
+      metadata: { pricingSnapshot: priced.pricingSnapshot },
+      settlement: true,
     });
   }
 
@@ -1021,16 +1020,11 @@ export class FinopsLedgerService {
         }
         return { finalInserted: !!fin?.inserted, finalEvent: fin?.event ?? null, released: false, alreadySettled: true };
       }
-      // FinOps P0 (audit §4 #9): un cargo final SIN precio queda a 0 `pending`; antes la reserva igual se llevaba a 0
-      // y el gasto desaparecía de los totales hasta re-preciar. Ahora (solo eventos NUEVOS; la historia no se toca) la
-      // reserva QUEDA ABIERTA con su cota (cuenta como «reservado» y para el tope) y el cargo final la referencia
-      // (`metadata.reservationKeptOpen`); repricePendingCharge liquida ambos en una transacción.
-      if (built && built.pricingError) (built.row.metadata as Record<string, unknown>).reservationKeptOpen = reservationKey;
+      // FinOps P0 review r1 (I1): un cargo final SIN precio queda a 0 `pending` (metadata.pricingMissing) y la reserva se
+      // lleva a 0 como siempre (nunca una reserva abierta para una llamada ya respondida: los lectores de «resultado
+      // desconocido» la tomarían por ambigua). El lector (CostReadService) la lista como «sin precio» y marca el
+      // alcance `completeness: 'partial'`; repricePendingCharge la precia después.
       if (built) fin = await this.insertEvent(built.row, manager);
-      if (fin && fin.event && (fin.event.metadata as Record<string, unknown> | null)?.reservationKeptOpen === reservationKey
-        && !(await manager.query(`select 1 from public.generation_cost_events where corrects_event_id = $1 limit 1`, [fin.event.id])).length) {
-        return { finalInserted: !!fin.inserted, finalEvent: fin.event, released: false, alreadySettled: false };
-      }
       await this.adjustWith(manager, reservationKey, normalizeDecimal(0), reason, {
         recordedBy: opts.recordedBy || 'dynamic-worker',
         settlement: true,
@@ -1378,7 +1372,7 @@ export class FinopsLedgerService {
       this.estimatedVsActual(`course_id = $1`, p),
     ]);
     // FinOps P0: dinero oficial (definiciones fijas de CostReadService); el resto queda por compatibilidad.
-    const money = await new CostReadService(this.dataSource).courseCost(courseId);
+    const money = await this.costRead.courseCost(courseId);
     return { courseId, ...totals, byChapter, byItemType, byProvider, retriesPaid: retries, avoided: avoided[0], estimatedVsActual: runs, money };
   }
 
@@ -1403,7 +1397,7 @@ export class FinopsLedgerService {
         p,
       ),
     ]);
-    const money = await new CostReadService(this.dataSource).runCost(runId);
+    const money = await this.costRead.runCost(runId);
     return { runId, ...totals, byItemKey, byItemType, byProvider, retriesPaid: retries, avoided: avoided[0], estimatedVsActual: evsa[0] ?? null, authorizations: auths, money };
   }
 
