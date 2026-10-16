@@ -94,6 +94,25 @@ $zip->close();
 $libdirs = array_values(array_filter($entries, fn($n) => $n !== 'h5p.json' && strpos($n, 'content/') !== 0));
 ($libdirs === [] ? $pass : $fail)('el .h5p es solo contenido (' . count($entries) . ' entradas' . ($libdirs ? ', carpetas: ' . implode(',', array_slice($libdirs, 0, 3)) : '') . ')');
 (($hj['mainLibrary'] ?? '') === 'H5P.Dialogcards' ? $pass : $fail)('principal H5P.Dialogcards');
+// Nunca desplegar aquí un .h5p CON carpetas de librería: guardar una librería dentro de la transacción revertida borra los
+// cachedassets del sitio (H5PCore::deleteCachedAssets → mdl_files → blob a trashdir/); el rollback devuelve las filas pero
+// NO los blobs, y el reproductor queda con un 404 en /core_h5p//cachedassets/<hash>.js (gate r55g2: «sin ventana H5P»).
+if ($libdirs !== []) {
+    $fail('paquete con carpetas de librería: NO se despliega en el sitio local (corrompería los cachedassets)');
+    echo json_encode($results + ['ok' => false], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";
+    exit(1);
+}
+// Integridad de los blobs H5P del sitio (librerías + cachedassets) antes y después: ningún caso puede dejar filas sin blob.
+$h5pblobsmissing = function () use ($DB): array {
+    $fsys = get_file_storage()->get_file_system();
+    $rows = $DB->get_records_sql("SELECT id, filearea, filepath, filename, contenthash FROM {files} WHERE component = 'core_h5p'
+        AND filearea IN ('libraries', 'cachedassets') AND filename <> '.'");
+    $miss = [];
+    foreach ($rows as $r) if (!$fsys->is_file_readable_locally_by_hash($r->contenthash)) $miss[] = "{$r->filearea}{$r->filepath}{$r->filename}";
+    sort($miss);
+    return $miss;
+};
+$blobsbefore = $h5pblobsmissing();
 
 $installed = $DB->get_records_select('h5p_libraries', "machinename = 'H5P.Dialogcards'", null, '', 'id, majorversion, minorversion, patchversion');
 $results['site_dialogcards'] = array_values(array_map(fn($r) => "{$r->majorversion}.{$r->minorversion}.{$r->patchversion}", $installed));
@@ -180,6 +199,10 @@ try {
             $DB->get_records_select('h5p_libraries', "machinename = 'H5P.Dialogcards'", null, '', 'id, majorversion, minorversion, patchversion')))];
 }
 (($results['cleanup']['site_dialogcards_after'] === $results['site_dialogcards']) ? $pass : $fail)('las librerías del sitio quedan como estaban (transacciones revertidas)');
+$blobsafter = $h5pblobsmissing();
+$newmiss = array_values(array_diff($blobsafter, $blobsbefore));
+($newmiss === [] ? $pass : $fail)('los blobs H5P del sitio (librerías + cachedassets) siguen en filedir/' . ($newmiss ? ': faltan ' . implode(', ', array_slice($newmiss, 0, 5)) : '')
+    . ($blobsbefore ? ' (ya faltaban antes: ' . count($blobsbefore) . ')' : ''));
 $results['ok'] = !array_filter($results['asserts'], fn($a) => !$a['ok']);
 $json = json_encode($results, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 if (!empty($opts['out'])) file_put_contents($opts['out'], $json);

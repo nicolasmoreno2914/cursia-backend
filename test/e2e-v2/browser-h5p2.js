@@ -137,6 +137,7 @@ const inH5p = (body) => `(()=>{const w=${FIND};if(!w)throw new Error('sin ventan
 const centerOf = (sel) => inH5p(`const el=(${sel});if(!el)return null;const r=el.getBoundingClientRect();let x=r.left+r.width/2,y=r.top+r.height/2;let cw=w;while(cw!==cw.parent){const fe=cw.frameElement;const fr=fe.getBoundingClientRect();x+=fr.left+fe.clientLeft;y+=fr.top+fe.clientTop;cw=cw.parent}return {x,y};`);
 const BTNS = inH5p(`return [...d.querySelectorAll('button,[role=button],.h5p-joubelui-button,.h5p-branching-question-alternative')].filter(vis).map(e=>((e.innerText||'').trim()||e.getAttribute('aria-label')||e.className).slice(0,60));`);
 const H5P_TEXT = inH5p(`return d.body.innerText;`);
+const HTTP_ERRORS = `(()=>{const o=[];(function walk(w){try{for(const e of w.performance.getEntriesByType('resource'))if(e.responseStatus>=400)o.push(e.responseStatus+' '+e.name.replace(location.origin,'').slice(0,160))}catch(e){}for(let i=0;i<w.frames.length;i++)walk(w.frames[i])})(window);return [...new Set(o)].slice(0,8)})()`;
 
 /** Clic REAL (CDP) en el elemento visible más interno cuyo texto/aria-label contiene alguno de `labels`. */
 async function clickText(b, labels, scopeSel = 'button,[role=button],.h5p-joubelui-button,.h5p-branching-question-alternative') {
@@ -202,7 +203,10 @@ async function login(b, creds) {
 async function openH5p(b, cmid, lib, what) {
   await b.navigate(`${WWW}/mod/h5pactivity/view.php?id=${cmid}`);
   const got = await b.waitFor(inH5p(`return inst.libraryInfo.versionedName;`), { timeoutMs: 60000, what }).catch((e) => e.message);
-  ok(got === lib, `${what}: el reproductor real despliega y carga ${lib} (cm ${cmid})`, got);
+  // Diagnóstico: recursos del Moodle local con estado ≥ 400 en cualquier marco (p. ej. un cachedassets cuyo blob
+  // falta en filedir/ deja H5P sin cargar y solo se vería «sin ventana H5P»).
+  const httpErrors = got === lib ? [] : await b.evaluate(HTTP_ERRORS).catch((e) => [`(sin diagnóstico: ${e.message})`]);
+  ok(got === lib, `${what}: el reproductor real despliega y carga ${lib} (cm ${cmid})`, httpErrors.length ? { got, httpErrors } : got);
   await sleep(1200);
   return got === lib;
 }
