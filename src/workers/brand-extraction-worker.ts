@@ -137,7 +137,7 @@ async function processJob(
   const pdf = await downloadPdf(artifactsService, sourceArtifactId, ownerId);
   logger.log(`PDF descargado (${(pdf.length / 1024).toFixed(0)} KB). Extrayendo con Claude…`);
 
-  const extracted = await extractionService.extractFromPdf(pdf);
+  const extracted = await extractionService.extractFromPdf(pdf, { ownerId, brandProfileId });
 
   profile.palette = {
     ...profile.palette,

@@ -1,5 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import Anthropic from '@anthropic-ai/sdk';
+import { FinopsLedgerService } from '../finops/finops-ledger.service';
+import { recordDirectAnthropicCall } from '../finops/direct-call-ledger';
 
 export interface ExtractedCourseSetup {
   purpose: string | null;
@@ -53,12 +55,14 @@ export class CourseSetupExtractionService {
   private readonly client = new Anthropic();
   private readonly model = process.env.COURSE_SETUP_EXTRACTION_MODEL || 'claude-opus-4-8';
 
+  constructor(@Optional() private readonly ledger?: FinopsLedgerService) {}
+
   /**
    * Extrae los campos de "Datos del curso" de una guía/sílabo en PDF.
    * No persiste nada: es un prefill de un solo uso, nunca inventa datos
    * ausentes (devuelve null) y reporta baja confianza en warnings.
    */
-  async extractFromPdf(pdfBuffer: Buffer): Promise<ExtractedCourseSetup> {
+  async extractFromPdf(pdfBuffer: Buffer, ctx: { ownerId?: string | null } = {}): Promise<ExtractedCourseSetup> {
     const response = await this.client.messages.create({
       model: this.model,
       max_tokens: 2048,
@@ -91,6 +95,12 @@ export class CourseSetupExtractionService {
           ],
         },
       ],
+    });
+
+    // FinOps P0: prefill ANTES de que exista el curso → sin atribuir, con motivo explícito (course_setup_prefill).
+    await recordDirectAnthropicCall(this.ledger, this.logger, {
+      ownerId: ctx.ownerId, model: (response as { model?: string }).model || this.model, messageId: response.id, usage: response.usage as any,
+      operation: 'llm.course_setup_extraction', recordedBy: 'course-setup-extraction', unattributedReason: 'course_setup_prefill',
     });
 
     if (response.stop_reason === 'refusal') {

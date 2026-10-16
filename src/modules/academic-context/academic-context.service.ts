@@ -211,6 +211,9 @@ export class AcademicContextService {
     try {
       await this.ledger.recordCharge({
         ownerIdFromAuth: ownerId,
+        // FinOps P0: antes course_id quedaba NULL (solo metadata.courseId) → invisible en el costo del curso. Ahora se
+        // atribuye al curso (verificado: courses.owner_id = ownerId; el dueño ya se validó al cargar el curso).
+        attributionCourseId: courseId,
         provider: 'anthropic',
         service: 'messages',
         modelOrProduct: t.model,

@@ -73,6 +73,7 @@ export function videogenChargeInput(a: VideogenChargeInput): RecordChargeInput {
   const base = {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     provider: 'videogen',
     service: 'render',
     modelOrProduct: 'video',
@@ -145,6 +146,7 @@ export async function recordYoutubeUpload(
     kind: 'youtube',
     externalId: a.videoId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     itemRunId: a.itemRunId,
     quotaUnits: a.quotaUnits ?? youtubeInsertQuotaUnits(),
     mode: a.mode,
@@ -162,6 +164,7 @@ export async function recordPackageBuild(
     kind: 'package',
     externalId: a.packageJobId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     attributionRunId: a.runId,
     mode: 'real',
     recordedBy: 'package-worker',
@@ -177,6 +180,7 @@ export async function recordProviderMock(
   return ledger.recordCharge({
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     provider: isGamma ? 'gamma' : 'openai',
     service: isGamma ? 'generations' : 'audio.speech',
     modelOrProduct: isGamma ? 'gamma-generate' : 'gpt-4o-mini-tts',
@@ -228,6 +232,7 @@ export function gammaChargeInput(a: Parameters<typeof recordGammaCharge>[1]): Re
   return {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     provider: 'gamma',
     service: 'generations',
     modelOrProduct: 'gamma-generate',
@@ -283,6 +288,7 @@ export function ttsChargeInput(a: Parameters<typeof recordTtsCharge>[1]): Record
   return {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     provider: 'openai',
     service: 'audio.speech',
     modelOrProduct: a.model,
@@ -349,7 +355,7 @@ export function serverLlmChargeInput(a: Parameters<typeof recordServerLlmCharge>
     billingAccount: 'cursia',
     mode: 'real',
   });
-  return { ...input, recordedBy: 'dynamic-provider-worker', metadata: { ...(input.metadata || {}), serverSide: true } };
+  return { ...input, executorAuthorization: 'server_worker', recordedBy: 'dynamic-provider-worker', metadata: { ...(input.metadata || {}), serverSide: true } };
 }
 
 // ─── V2.1 F2 fix round 1: reservas PENDIENTES (gasto posible no medido todavía) ──
@@ -391,6 +397,7 @@ export function gammaPendingInput(a: Parameters<typeof recordGammaPending>[1]): 
   return {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     provider: 'gamma',
     service: 'generations',
     modelOrProduct: 'gamma-generate',
@@ -463,6 +470,7 @@ export async function recordTtsReservation(
   return ledger.recordCharge({
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     provider: 'openai',
     service: 'audio.speech',
     modelOrProduct: a.model,
@@ -497,6 +505,7 @@ export async function recordLlmReservation(
   return ledger.recordCharge({
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
     provider: 'anthropic',
     service: 'messages',
     modelOrProduct: a.model,
@@ -584,6 +593,7 @@ function reservationInput(r: PaidCallReservation): RecordChargeInput {
   const base = {
     itemRunId: r.itemRunId,
     ownerIdFromAuth: r.ownerId,
+    executorAuthorization: 'server_worker' as const,
     idempotencyKey: reservationKey(r),
     externalOperationId: null,
     callRole: role.callRole,
@@ -617,6 +627,9 @@ function reservationInput(r: PaidCallReservation): RecordChargeInput {
   }
 }
 
+// FinOps P0: todo lo que arma este archivo lo registra un worker del SERVIDOR que reclamó la parte (de confianza):
+// `executorAuthorization: 'server_worker'` conserva course_id/run_id aunque el owner que pasa no coincida con el del run
+// (y el tope del run sigue aplicando). El proxy del navegador nunca lo setea (llm-usage-ingest).
 /** Error de ledger que impide seguir (nunca se traga). */
 export class LedgerWriteFailed extends Error {
   constructor(what: string, cause: unknown) {

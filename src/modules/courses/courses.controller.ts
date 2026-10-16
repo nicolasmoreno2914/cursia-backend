@@ -77,7 +77,7 @@ export class CoursesController {
   }
 
   // GET /api/v1/courses/:id/cost
-  // Costo real+estimado del curso (misma fuente que el panel Admin).
+  // FinOps P0: costo del curso desde el ledger V2 (misma fuente que el panel Admin; ver CostReadService).
   @Get(':id/cost')
   getCost(
     @Param('id', ParseIntPipe) id: number,

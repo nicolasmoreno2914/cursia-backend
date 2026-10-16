@@ -38,7 +38,7 @@ export class CourseSetupController {
     }
     const pdfBuffer = Buffer.from(await response.arrayBuffer());
 
-    const extracted = await this.extractionService.extractFromPdf(pdfBuffer);
+    const extracted = await this.extractionService.extractFromPdf(pdfBuffer, { ownerId: user.id });
     return { ok: true, data: extracted };
   }
 }

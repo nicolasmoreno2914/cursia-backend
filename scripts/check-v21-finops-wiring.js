@@ -786,8 +786,16 @@ async function dbChecks() {
       const p2 = await H.recordPackageBuild(ledger, { ownerId: OWNER, packageJobId: pkgJob, runId: runB });
       eq([p1.inserted, p2.inserted, p1.event.cost_source, p1.event.operation, p1.event.course_id, p1.event.run_id, p1.event.item_run_id],
         [true, false, 'ZERO_BY_DESIGN', 'package.build', Bc.cid, runB, null], 'package');
+      // FinOps P0 (2026-10-16): un worker del SERVIDOR (executorAuthorization 'server_worker') que registra para un run
+      // cuyo dueño no coincide conserva course_id/run_id (owner_id = dueño del run, el ejecutor en metadata) — antes
+      // quedaba sin atribuir y fuera del tope. Un no dueño por HTTP (proxy) sigue sin atribuir / rechazado
+      // (check-finops-p0-ledger-truth.js [AT]).
       const px = await H.recordPackageBuild(ledger, { ownerId: ATTACKER, packageJobId: crypto.randomUUID(), runId: runB });
-      eq([px.event.course_id, px.event.run_id, px.event.metadata.attributionRejectReason], [null, null, 'owner_mismatch'], 'run ajeno no se atribuye');
+      eq([px.event.course_id, px.event.run_id, px.event.owner_id, px.event.metadata.executorOwnerId, px.event.metadata.attributionRejectReason],
+        [Bc.cid, runB, OWNER, ATTACKER, undefined], 'worker del servidor: run ajeno se atribuye al run (ejecutor en metadata)');
+      const pxHttp = await ledger.recordZero({ kind: 'package', externalId: crypto.randomUUID(), ownerIdFromAuth: ATTACKER, attributionRunId: runB, mode: 'real', recordedBy: 'check' });
+      eq([pxHttp.event.course_id, pxHttp.event.run_id, pxHttp.event.metadata.attributionRejectReason, pxHttp.event.metadata.unattributedReason],
+        [null, null, 'owner_mismatch', 'owner_mismatch'], 'sin ejecutor de servidor: run ajeno no se atribuye');
     });
 
     await check('DB presupuesto excedido → item `blocked` con budget_exceeded ANTES del envío (0 envíos, 0 cargos nuevos)', async () => {

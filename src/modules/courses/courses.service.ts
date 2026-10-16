@@ -203,13 +203,25 @@ export class CoursesService {
 
   // ── COST ──────────────────────────────────────────────────────────────────
   /**
-   * Costo real+estimado del curso (tokens reales de Claude, videos/audio con
-   * tarifa configurada en cost_rates) — misma agregación que usa el panel
-   * Admin, filtrada a este curso. Verifica ownership antes de calcular.
+   * FinOps P0: costo del curso desde el ledger V2 (CostReadService, la misma fuente y definiciones que el panel
+   * Admin): todos los runs del curso (courses.id = generation_cost_events.course_id) + desglose por run.
+   * Verifica ownership antes de leer. Nunca lee usage_events.
    */
   async getCourseCost(id: number, ownerId?: string) {
     await this.findOne(id, ownerId); // 404 si no existe o no es del usuario
-    return this.adminDashboardService.getCourseCost(String(id));
+    const out = await this.adminDashboardService.getCourseCost(id);
+    // Vista del DUEÑO: totales del curso y por run. El costo por parte (byItemKey) y el detalle de eventos sin precio
+    // (claves internas) quedan solo para SUPER_ADMIN (mismo criterio que items[].cost, owner-safe-run.interceptor);
+    // los montos y contadores no cambian.
+    const m = out.money;
+    return {
+      ...out,
+      money: {
+        ...m,
+        unpriced: { count: m.unpriced.count, events: [] },
+        runs: m.runs.map((r) => ({ ...r, byItemKey: undefined, unpriced: { count: r.unpriced.count, events: [] } })),
+      },
+    };
   }
 
   // ── UPDATE ────────────────────────────────────────────────────────────────

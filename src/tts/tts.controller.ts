@@ -3,10 +3,12 @@ import {
   Controller,
   HttpStatus,
   Logger,
+  Optional,
   Post,
   Res,
   UseGuards,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { Response } from 'express';
 import { DataSource } from 'typeorm';
 import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
@@ -15,6 +17,9 @@ import { AuthUser } from '../auth/auth.types';
 import { assertLegacyAudioAllowed } from '../modules/production-jobs/legacy-audio-guard';
 import { TtsService } from './tts.service';
 import { TtsSpeechDto } from './dto/tts-speech.dto';
+import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
+import { recordDirectTtsCall } from '../modules/finops/direct-call-ledger';
+import { mp3DurationSeconds } from '../package/audio/mp3-parser';
 
 /**
  * Proxy seguro para síntesis de voz con OpenAI TTS.
@@ -36,6 +41,7 @@ export class TtsController {
   constructor(
     private readonly ttsService: TtsService,
     private readonly dataSource: DataSource,
+    @Optional() private readonly ledger?: FinopsLedgerService,
   ) {}
 
   /**
@@ -66,6 +72,20 @@ export class TtsController {
         model:        dto.model,
         format:       dto.format || 'mp3',
         instructions: dto.instructions,
+      });
+
+      // FinOps P0 (audit §4 #8): esta ruta (legacy v1) llamaba a OpenAI con la clave de Cursia sin pasar por el ledger.
+      // Ahora el cargo queda registrado con los segundos MEDIDOS del MP3 (sin medición → pendiente, nunca un monto
+      // inventado), atribuido al curso si el id es numérico y del mismo dueño; si no, sin atribuir con motivo.
+      let audioSeconds: number | null = null;
+      if ((dto.format || 'mp3') === 'mp3') {
+        try { audioSeconds = mp3DurationSeconds(result.audioBuffer); } catch { audioSeconds = null; }
+      }
+      const numericCourse = typeof dto.courseId === 'string' && /^\d{1,9}$/.test(dto.courseId.trim()) ? Number(dto.courseId.trim()) : null;
+      await recordDirectTtsCall(this.ledger, this.logger, {
+        ownerId: user?.id ?? null, model: result.model, requestId: result.requestId ?? null, audioSeconds, characters: result.chars,
+        courseId: numericCourse, unattributedReason: dto.courseId ? 'legacy_tts_course_not_numeric' : 'legacy_tts_no_course',
+        recordedBy: 'tts-speech', localCallId: randomUUID(),
       });
 
       res.set({
