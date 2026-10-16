@@ -204,20 +204,24 @@ async function main() {
 
   // ── QUIZ_RANDOM ──
   const qx = await I.z.file(QX).async('string');
-  const firstLeaf = Number(/"values":\[(\d+)\]/.exec(qx)[1]);
+  // r55: slots aleatorios en formato LEGADO {"questioncategoryid":N,"includingsubcategories":0}.
+  const LEAF_RE = /"questioncategoryid":(\d+)/;
+  const leafTok = (id) => `"questioncategoryid":${id}`;
+  const firstLeaf = Number(LEAF_RE.exec(qx)[1]);
   const qxml = await I.z.file('questions.xml').async('string');
   const catBlock = (id) => new RegExp(`<question_category id="${id}">[\\s\\S]*?</question_category>`).exec(qxml)[0];
   const parentOf = (id) => Number(tag(catBlock(id), 'parent'));
-  const leafIds = [...new Set(Array.from(qx.matchAll(/"values":\[(\d+)\]/g), (m) => Number(m[1])))];
+  const leafIds = [...new Set(Array.from(qx.matchAll(/"questioncategoryid":(\d+)/g), (m) => Number(m[1])))];
   const otherLeaf = leafIds.find((x) => x !== firstLeaf);
   const fqx = await I.z.file(`${fquiz.dir}/quiz.xml`).async('string');
-  const finalLeaf = Number(/"values":\[(\d+)\]/.exec(fqx)[1]);
+  const finalLeaf = Number(LEAF_RE.exec(fqx)[1]);
   const QR = [
-    ['includesubcategories true', { [QX]: (x) => replaceOnce(x, '"includesubcategories":false', '"includesubcategories":true') }],
-    ['slot → categoría padre (no hoja)', { [QX]: (x) => replaceOnce(x, `"values":[${firstLeaf}]`, `"values":[${parentOf(firstLeaf)}]`) }],
-    ['slot → hoja de OTRO quiz (otro contexto)', { [QX]: (x) => replaceOnce(x, `"values":[${firstLeaf}]`, `"values":[${finalLeaf}]`) }],
-    ['slot → categoría inexistente', { [QX]: (x) => replaceOnce(x, `"values":[${firstLeaf}]`, '"values":[987654]') }],
-    ['un slot movido a otra hoja (referencias por hoja ≠ plan)', { [QX]: (x) => replaceOnce(x, `"values":[${firstLeaf}]`, `"values":[${otherLeaf}]`) }],
+    ['includingsubcategories 1', { [QX]: (x) => replaceOnce(x, '"includingsubcategories":0', '"includingsubcategories":1') }],
+    ['formato 4.3+ ({"filter":{"category":…}}, roto en 4.1/4.2)', { [QX]: (x) => replaceOnce(x, `{${leafTok(firstLeaf)},"includingsubcategories":0}`, `{"filter":{"category":{"jointype":1,"values":[${firstLeaf}],"filteroptions":{"includesubcategories":false}}}}`) }],
+    ['slot → categoría padre (no hoja)', { [QX]: (x) => replaceOnce(x, leafTok(firstLeaf), leafTok(parentOf(firstLeaf))) }],
+    ['slot → hoja de OTRO quiz (otro contexto)', { [QX]: (x) => replaceOnce(x, leafTok(firstLeaf), leafTok(finalLeaf)) }],
+    ['slot → categoría inexistente', { [QX]: (x) => replaceOnce(x, leafTok(firstLeaf), leafTok(987654)) }],
+    ['un slot movido a otra hoja (referencias por hoja ≠ plan)', { [QX]: (x) => replaceOnce(x, leafTok(firstLeaf), leafTok(otherLeaf)) }],
     ['slot fijo mezclado con aleatorios', { [QX]: (x) => replaceOnce(x, /<question_set_reference id="\d+">[\s\S]*?<\/question_set_reference>/.exec(x)[0],
       `<question_reference id="99999"><usingcontextid>1</usingcontextid><component>mod_quiz</component><questionarea>slot</questionarea><questionbankentryid>1000</questionbankentryid><version>$@NULL@$</version></question_reference>`) }],
     ['Σ maxmark ≠ 100', { [QX]: (x) => replaceOnce(x, /<maxmark>[\d.]+<\/maxmark>/.exec(x)[0], '<maxmark>9.0000000</maxmark>') }],
@@ -226,7 +230,7 @@ async function main() {
       const entries = Array.from(blk.matchAll(/<question_bank_entry id="\d+">[\s\S]*?<\/question_bank_entry>/g), (m) => m[0]);
       return x.replace(blk, entries.slice(1).reduce((b, e) => b.replace(e, ''), blk));
     } }],
-    ['hoja con preguntas sin referencias', { [QX]: (x) => x.split(`"values":[${otherLeaf}]`).join(`"values":[${firstLeaf}]`) }],
+    ['hoja con preguntas sin referencias', { [QX]: (x) => x.split(leafTok(otherLeaf)).join(leafTok(firstLeaf)) }],
   ];
   for (const [label, edits] of QR) {
     await check(`QUIZ_RANDOM: ${label} → solo QUIZ_RANDOM`, async () => {
@@ -240,14 +244,15 @@ async function main() {
     const ctx = /contextid="(\d+)"/.exec(gx)[1];
     const cat = /<question_category id="(\d+)">[\s\S]*?<contextinstanceid>(\d+)<\//.exec(await IG.z.file('questions.xml').async('string'));
     const bad = await mutate(builtG.mbz, { [`${gq.dir}/quiz.xml`]: (x) => replaceOnce(x, /<question_reference id="\d+">[\s\S]*?<\/question_reference>/.exec(x)[0],
-      `<question_set_reference id="99999"><usingcontextid>${ctx}</usingcontextid><component>mod_quiz</component><questionarea>slot</questionarea><questionscontextid>${ctx}</questionscontextid><filtercondition>{"filter":{"category":{"jointype":1,"values":[${cat[1]}],"filteroptions":{"includesubcategories":false}}}}</filtercondition></question_set_reference>`) });
+      `<question_set_reference id="99999"><usingcontextid>${ctx}</usingcontextid><component>mod_quiz</component><questionarea>slot</questionarea><questionscontextid>${ctx}</questionscontextid><filtercondition>{"questioncategoryid":${cat[1]},"includingsubcategories":0}</filtercondition></question_set_reference>`) });
     await expectOnly(bad, builtG.expectations, 'QUIZ_RANDOM', 'GIFT mezclado');
   });
 
   // ── EXPLANATIONS_GATE ──
   const pm = await I.z.file(PM).async('string');
   const EG = [
-    ['availability sin e=3 con 3 intentos', { [PM]: (x) => replaceOnce(x, `,{"type":"completion","cm":${quiz.mid},"e":3}`, '') }],
+    ['availability sin e=3 con 3 intentos (bloquea a quien reprueba todos los intentos)', { [PM]: (x) => replaceOnce(x, `,{"type":"completion","cm":${quiz.mid},"e":3}`, '') }],
+    ['r55: availability e=2 (abre al APROBAR con intentos restantes)', { [PM]: (x) => replaceOnce(x, `{"type":"completion","cm":${quiz.mid},"e":3}`, `{"type":"completion","cm":${quiz.mid},"e":2}`) }],
     ['availability apunta a OTRO quiz', { [PM]: (x) => x.split(`"cm":${quiz.mid},`).join(`"cm":${fquiz.mid},`) }],
     ['show:true', { [PM]: (x) => replaceOnce(x, '"show":false', '"show":true') }],
     ['downloadcontent 1', { [PM]: (x) => replaceOnce(x, '<downloadcontent>0</downloadcontent>', '<downloadcontent>1</downloadcontent>') }],
@@ -277,13 +282,26 @@ async function main() {
       await expectOnly(await mutate(built.mbz, edits), exp, 'EXPLANATIONS_GATE', label);
     });
   }
-  await check('EXPLANATIONS_GATE: intentos ilimitados con e=1|e=3 (un reprobado abriría el banco) → solo EXPLANATIONS_GATE', async () => {
+  await check('r55 (moodle-versions.md): availability con & sin escapar en XML → STRUCTURE (aborta la restauración); escapado (&amp;) → solo la forma', async () => {
+    let v = await V.validateMbzV3(await mutate(built.mbz, { [PM]: (x) => replaceOnce(x, '"op":"|"', '"op":"&"') }), exp);
+    assert(v.issues.some((i) => i.code === 'STRUCTURE' && /sin escapar en XML/.test(i.message)), JSON.stringify(v.issues.slice(0, 3)));
+    v = await V.validateMbzV3(await mutate(built.mbz, { [PM]: (x) => replaceOnce(x, '"op":"|"', '"op":"&amp;"') }), exp);
+    assert(!v.issues.some((i) => /sin escapar/.test(i.message)) && v.issues.some((i) => i.code === 'EXPLANATIONS_GATE'), JSON.stringify(v.issues.slice(0, 3)));
+  });
+  await check('review r1 (M6): el chequeo de & crudo no marca entidades XML válidas (&amp; &lt; &gt; &quot; &apos; &#NN; &#xHH;)', async () => {
+    const re = V.RAW_XML_AMP_OR_LT;
+    for (const ok of ['a &amp; b', '&lt;x&gt;', '&quot;q&quot;', 'l&apos;x', '&#38;', '&#x26;', '&#X;'.replace('X', 'x2F'), '{"op":"|"}']) assert(!re.test(ok), `válida: ${ok}`);
+    for (const bad of ['"op":"&"', 'a & b', '&amp', '&#;', '&#xZZ;', '&nbsp;', 'a<b']) assert(re.test(bad), `cruda: ${bad}`);
+  });
+  await check('r55: EXPLANATIONS_GATE — intentos ilimitados con availability e=1|e=3 y visible (el 1.er intento abriría el banco) → solo EXPLANATIONS_GATE', async () => {
     const IU = await index(builtU.mbz);
     const uq = IU.byId[examIdn.replace(modId, Object.keys(IU.byId).find((k) => /^cv3:exam:/.test(k)).slice(9))];
     const up = IU.byId[`cv3:exam_explanations:${Object.keys(IU.byId).find((k) => /^cv3:exam:/.test(k)).slice(9)}`];
     const ux = await IU.z.file(`${uq.dir}/quiz.xml`).async('string');
     eq(tag(ux, 'attempts_number'), '0', 'fixture: intentos ilimitados');
-    const bad = await mutate(builtU.mbz, { [`${up.dir}/module.xml`]: (x) => replaceOnce(x, `{"type":"completion","cm":${uq.mid},"e":1}]`, `{"type":"completion","cm":${uq.mid},"e":1},{"type":"completion","cm":${uq.mid},"e":3}]`) });
+    const um = await IU.z.file(`${up.dir}/module.xml`).async('string');
+    eq([tag(um, 'visible'), tag(um, 'availability')], ['0', '$@NULL@$'], 'fixture: oculta, sin availability');
+    const bad = await mutate(builtU.mbz, { [`${up.dir}/module.xml`]: (x) => x.replace('<availability>$@NULL@$</availability>', `<availability>{"op":"|","show":false,"c":[{"type":"completion","cm":${uq.mid},"e":1},{"type":"completion","cm":${uq.mid},"e":3}]}</availability>`).replace('<visible>0</visible>', '<visible>1</visible>').replace('<visibleold>0</visibleold>', '<visibleold>1</visibleold>') });
     await expectOnly(bad, builtU.expectations, 'EXPLANATIONS_GATE', 'ilimitados e=3');
   });
 

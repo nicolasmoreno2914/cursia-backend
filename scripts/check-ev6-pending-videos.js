@@ -200,7 +200,10 @@ async function pureChecks() {
       const critMids = [...comp.matchAll(/<moduleinstance>(\d+)<\/moduleinstance>/g)].map((m) => Number(m[1]));
       const midOf = new Map(acts.map((a) => [a.idnumber, Number(/_(\d+)$/.exec(a.dir || '')?.[1] ?? a.mid)]));
       for (const id of ids) assert(!midOf.has(`cv3:ch:${id}:video`), `video omitido ${id} sin módulo`);
-      eq(critMids.length, graded + r.expectations.facts.counts.exams + (o.finalExam ? 1 : 0), 'criterios = ítems calificables reales (sin los videos omitidos)');
+      // r55 (R3): sin criterios de actividad — solo el criterio de nota; los videos omitidos tampoco entran en la nota.
+      eq(critMids.length, 0, 'sin criterios de actividad');
+      eq([...comp.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], 'solo el criterio de nota');
+      void graded;
       const bx = await z.file('badges.xml').async('string');
       const closing = VC.extractText(acts.find((a) => a.idnumber === 'cv3:shell:closing').intro);
       if (o.finalExam) {
@@ -278,11 +281,18 @@ async function pureChecks() {
   // Motor de carga horaria Loop 1 (study-time): cambia SOLO el badge «~X min» de la apertura de cada capítulo; verificado
   // archivo por archivo (scratchpad/r23/mbzdiff2.js): solo cambian esos label.xml y, normalizando «~N min», son idénticos.
   // Dorados 3.13.0: 644 e64d1b61…, 645 b30a8705….
+  // r55 (builder 3.13.0 → 3.14.0): cambian a propósito completion.xml, los module.xml de los ítems calificables, quiz.xml
+  // (completionminattempts), los labels del cierre / certificado / info de evaluaciones, badges.xml y, en 644, los .h5p de
+  // QuestionSet 1.21 (solo contenido: files.xml + 2 blobs) — diff por entrada del zip contra 3.13.0 (scratchpad/r55/mbzdiff.js).
+  // Dorados 3.13.0: 644 c359c0a5…, 645 d913d39c….
+  // r55 review r1 (sigue 3.14.0): cambian SOLO label.xml de cv3:ch:*:activity_instruction, cv3:ch:*:closing,
+  // cv3:shell:certificate_teacher y cv3:shell:exams_teacher — diff por entrada contra fd67337 (scratchpad/r55b-r1/hook.js).
+  // Dorados r55 (fd67337): 644 b3f18266…, 645 6fc4e222….
   const GOLDEN_PRE_T5 = {
-    644: ['c359c0a59d19e949a13c7762208eee7d62667da5ba0ae68108bdbf34a8a49d2c', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['d913d39cf513af6abd923474f00fcbcec4c5f3e782bfad396b0727816bac8167', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['473e168fb481c37951781ca76a17dd05f92e58eb99bb62ee1a636a73aa4f3efa', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['85a5cffc2ea095cf1dfdf4d5fae7fb767e7e9e331ad9321345ee456037a7d6f5', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
-  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 Libro Guía PDF, builder 3.13.0), con y sin el campo', async () => {
+  await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 Libro Guía PDF + r55 invariantes de calificación, builder 3.14.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {
       const i1 = PF.packagingInput(distRoot, o);
       const i2 = PF.packagingInput(distRoot, o);

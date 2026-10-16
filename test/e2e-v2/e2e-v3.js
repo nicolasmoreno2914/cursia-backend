@@ -966,10 +966,11 @@ function reservationBookkeeping(ev) {
       const os = P.job.output_summary || {};
       const libs = (os.h5pPackages || []).map((p) => p.mainLibrary);
       ok(libs.includes('H5P.BranchingScenario') && libs.filter((l) => l === 'H5P.Dialogcards').length === 2, 'E5: paquete con el Branching Scenario y un «Repaso» (Dialog Cards) por capítulo', libs);
-      eq(P.status.restore && P.status.restore.as, 'admin_or_manager', 'E5: GET …/package devuelve la nota «restaurar como administrador o gestor»');
+      // r55 (R7): todos los .h5p solo contenido → requisito del sitio (pack v3), cualquier rol restaura.
+      eq(P.status.restore && P.status.restore.as, 'site_library_pack', 'E5: GET …/package devuelve el requisito del sitio (Cursia H5P Library Pack v3)');
       results.courses.E5.packageSummary = os;
       results.courses.E5.reviewCardsChapterIds = (os.h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
-      // El paquete BS lleva su delta de librerías (+ LICENSE.txt) y el IV v2 pausas + remediación.
+      // r55: BS y «Repaso» solo contenido; el IV v2 con pausas + remediación.
       const z = await JSZip.loadAsync(P.buf);
       const pkgOf = async (mainLibrary, keyPrefix) => {
         const p = (os.h5pPackages || []).find((x) => x.mainLibrary === mainLibrary && (!keyPrefix || x.itemKey.startsWith(keyPrefix)));
@@ -978,8 +979,10 @@ function reservationBookkeeping(ev) {
       const H = D('package/h5p/index.js');
       const bsz = await pkgOf('H5P.BranchingScenario');
       const tops = bsz ? [...new Set(Object.keys(bsz.files).filter((n) => !bsz.files[n].dir && n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))].sort() : [];
-      eq(tops, H.profileDeltaDirs(H.CURSIA_H5P_PROFILE_V2, 'H5P.BranchingScenario'), 'E5: el .h5p del caso ramificado lleva EXACTAMENTE las 19 carpetas delta de librerías');
-      ok(tops.length > 0 && tops.every((d) => bsz.file(`${d}/LICENSE.txt`)), 'E5: cada carpeta delta trae su aviso LICENSE.txt (MIT)');
+      // r55 (R7): solo contenido (las librerías del caso ramificado vienen del pack v3 del sitio).
+      ok(bsz && tops.length === 0, 'E5: el .h5p del caso ramificado es solo contenido (sin carpetas de librería)', tops);
+      const dcz = await pkgOf('H5P.Dialogcards');
+      ok(dcz && Object.keys(dcz.files).every((n) => n === 'h5p.json' || n.startsWith('content')), 'E5: el «Repaso» es solo contenido', dcz && Object.keys(dcz.files));
       const ivz = await pkgOf('H5P.InteractiveVideo', `video:${c.mods[0].chapters[0].id}`);
       const iv = ivz ? JSON.parse(await ivz.file('content/content.json').async('string')) : null;
       const ints = iv ? iv.interactiveVideo.assets.interactions : [];
@@ -4505,15 +4508,17 @@ function reservationBookkeeping(ev) {
           if (it.gradepass !== passing || k.passingGrade !== passing) bad.push(`${c.idnumber}: gradepass ${it.gradepass} ≠ ${passing}`);
           if (it.grademax !== 100 || it.grademin !== 0) bad.push(`${c.idnumber}: rango ${it.grademin}–${it.grademax}`);
           if (it.category !== AS.ASSESSMENT_CATEGORY_NAMES[k.category]) bad.push(`${c.idnumber}: categoría ${it.category}`);
-          if (!(c.completion === 2 && String(c.completiongradeitemnumber) === '0' && c.completionpassgrade === 1)) bad.push(`${c.idnumber}: completion ${c.completion}/${c.completiongradeitemnumber}/${c.completionpassgrade}`);
+          // r55 (R5/R6): completion al RECIBIR nota (completionpassgrade 0); el gradepass del ítem es informativo.
+          if (!(c.completion === 2 && String(c.completiongradeitemnumber) === '0' && c.completionpassgrade === 0)) bad.push(`${c.idnumber}: completion ${c.completion}/${c.completiongradeitemnumber}/${c.completionpassgrade}`);
         }
-        eq(bad, [], `${label}: ${graded.length} ítems calificables con gradepass ${passing}, 0–100, categoría y completionpassgrade`);
+        eq(bad, [], `${label}: ${graded.length} ítems calificables con gradepass ${passing}, 0–100, categoría y completion al recibir nota`);
         const wantW = M.features.finalExam ? [30, 50, 20] : [40, 60];
         eq(o.categories.filter((x) => x.depth === 2).map((x) => x.weight), wantW, `${label}: categorías ponderadas ${wantW.join('/')}`);
         const top = o.categories.find((x) => x.depth === 1);
         eq([top.aggregation, o.courseItem.grademax], [10, 100], `${label}: curso con media ponderada (aggregation 10), total sobre 100`);
-        const expCrit = AS.completionCriteriaFor(graded.map((c) => ({ moduleId: c.cmid, modname: c.modname, kind: kindOf(c.idnumber) })), rsv.courseCompletion).map((x) => cms.find((c) => c.cmid === x.moduleId).idnumber);
-        eq(o.criteria.filter((x) => x.criteriatype === 4).map((x) => x.idnumber), expCrit, `${label}: criterios de completion del curso (${expCrit.length}) por UUID`);
+        // r55 (R3): UN criterio de nota (tipo 6) = gradepass del ítem del curso; ningún criterio de actividad.
+        eq(o.criteria.map((x) => [x.criteriatype, x.gradepass]), [[6, passing]], `${label}: completion del curso = solo el criterio de nota ${passing} (sin criterios de actividad)`);
+        eq(o.courseItem.gradepass, passing, `${label}: gradepass del ítem del curso = criterio de nota`);
         const quizzes = Object.entries(o.quizzes);
         ok(quizzes.length === M.modules.filter((m) => m.examEnabled).length + (M.features.finalExam ? 1 : 0) && quizzes.every(([id, qz]) => qz.attempts === rsv.kinds[kindOf(id)].attempts && qz.sumgrades === 100 && qz.maxmarkSum === 100 && qz.slots > 0),
           `${label}: quizzes con intentos del perfil (${quizzes.map(([, qz]) => qz.attempts).join(',')}) y Σ maxmark = 100`, o.quizzes);
@@ -4674,19 +4679,24 @@ function reservationBookkeeping(ev) {
           const r = so.sim[who];
           const badG = gradedList.filter((c) => r.grades[c.idnumber] !== plan[who][c.idnumber] || r.grades[c.idnumber] < 0 || r.grades[c.idnumber] > 100).map((c) => [c.idnumber, r.grades[c.idnumber]]);
           eq(badG, [], `${label} [${who}]: notas registradas en 0–100 = las simuladas`);
-          const wantState = (c) => (plan[who][c.idnumber] >= passing ? 2 : isQuizKind(c.idnumber) ? 0 : 3);
+          // r55 (R5/R6): H5P/SCORM se completan al recibir nota (PASS/FAIL según su gradepass informativo); un quiz
+          // con nota escrita y SIN intentos reales queda INCOMPLETE(0) (completionminattempts = intentos), aprobado o no.
+          const wantState = (c) => (isQuizKind(c.idnumber) && rsv.kinds[kindOf(c.idnumber)].attempts > 0 ? 0 : plan[who][c.idnumber] >= passing ? 2 : 3);
           const badS = gradedList.filter((c) => r.states[c.idnumber] !== wantState(c)).map((c) => [c.idnumber, r.states[c.idnumber], plan[who][c.idnumber]]);
-          eq(badS, [], `${label} [${who}]: COMPLETE_PASS(2) sobre la nota aprobatoria ${passing} / COMPLETE_FAIL(3) bajo nota sin intentos agotados (H5P, SCORM) / INCOMPLETE(0) en un quiz reprobado por nota SIN agotar intentos reales (P2-B1)`);
+          eq(badS, [], `${label} [${who}]: H5P/SCORM COMPLETE_PASS(2) / COMPLETE_FAIL(3) según la nota ${passing} / quiz INCOMPLETE(0) sin usar sus intentos reales (r55)`);
           const et = expectTotal(who);
           ok(r.courseTotal !== null && Math.abs(r.courseTotal - et) < 0.01, `${label} [${who}]: total ponderado del curso ${r.courseTotal} ≈ ${et.toFixed(2)}`, { got: r.courseTotal, want: et });
-          if (who === 'pass') ok(r.courseComplete === true, `${label} [pass]: curso completo (criterios por actividad/examen cumplidos)`, r);
+          // r55 (R3): curso completo ⇔ nota final ≥ mínimo (criterio único de nota), en los tres perfiles de notas.
+          ok(r.courseComplete === (r.courseTotal >= passing), `${label} [${who}]: curso completo (${r.courseComplete}) ⇔ nota final ${r.courseTotal} ≥ ${passing}`, r);
+          if (who === 'pass') ok(r.courseComplete === true, `${label} [pass]: curso completo (nota final = mínimo)`, r);
           if (who === 'fail') ok(r.courseComplete === false, `${label} [fail]: curso NO completo`, r);
           // EV6 P2-B5: «Respuestas explicadas» — una página por quiz; disponible SOLO si su quiz está aprobado
           // (con notas escritas nunca se agotan intentos: reprobado = INCOMPLETE → bloqueada).
           const pages = Object.entries(r.pages || {});
           const nQuiz = gradedList.filter((c) => isQuizKind(c.idnumber)).length;
-          const badP = pages.filter(([, p]) => p.available !== (r.states[p.quiz] === 2) || p.uservisible !== p.available).map(([id, p]) => [id, p, r.states[p.quiz]]);
-          ok(pages.length === nQuiz && badP.length === 0, `${label} [${who}]: ${pages.length} página(s) «Respuestas explicadas»: disponible ⇔ su quiz aprobado (P2-B5)`, { pages: r.pages, badP });
+          // r55 (R6): sin intentos reales ningún quiz llega a completo → ninguna página visible, aprobado o no.
+          const badP = pages.filter(([, p]) => p.uservisible !== false).map(([id, p]) => [id, p, r.states[p.quiz]]);
+          ok(pages.length === nQuiz && badP.length === 0, `${label} [${who}]: ${pages.length} página(s) «Respuestas explicadas» ocultas mientras no se usen los intentos (r55)`, { pages: r.pages, badP });
         }
         results.moodle[label].sim = so.sim;
         // P2-B1: la nota sola nunca basta para reprobar un quiz (arriba, INCOMPLETE). Para probar que
@@ -4724,10 +4734,10 @@ function reservationBookkeeping(ev) {
         if (label === 'E5') {
           const bsIdn = `cv3:ch:${info.decideChapterId}:activity`;
           const bsH = o.h5ps[bsIdn];
-          ok(bsH && bsH.deploy.h5pid && bsH.deploy.library === 'H5P.BranchingScenario 1.10' && bsH.grade === 100 && bsH.enabletracking === 1, `${label}: el caso ramificado despliega (H5P.BranchingScenario 1.10, librerías del paquete con restore de administrador) y califica sobre 100`, bsH);
+          ok(bsH && bsH.deploy.h5pid && bsH.deploy.library === 'H5P.BranchingScenario 1.10' && bsH.grade === 100 && bsH.enabletracking === 1, `${label}: el caso ramificado despliega (H5P.BranchingScenario 1.10, paquete solo contenido + pack v3 del sitio) y califica sobre 100`, bsH);
           const bsItem = o.items.find((i) => i.idnumber === bsIdn);
           ok(bsItem && bsItem.gradepass === 70 && bsItem.grademax === 100, `${label}: BS con ítem de calificación (aprobación 70, máximo 100)`, bsItem);
-          ok(o.criteria.filter((x) => x.criteriatype === 4).some((x) => x.idnumber === bsIdn), `${label}: BS es criterio de completion del curso`, o.criteria);
+          ok(!o.criteria.some((x) => x.criteriatype === 4), `${label}: BS cuenta en la nota final pero no es criterio (r55: solo el criterio de nota)`, o.criteria);
           const reviews = cms.filter((c) => /:review_cards$/.test(c.idnumber));
           eq(reviews.length, (info.reviewCardsChapterIds || []).length, `${label}: ${reviews.length} «Repaso» restaurados (uno por capítulo del paquete)`);
           const badR = reviews.filter((c) => {

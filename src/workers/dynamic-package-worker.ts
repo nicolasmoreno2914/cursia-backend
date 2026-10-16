@@ -639,7 +639,7 @@ export async function processV3PackageJob(
     h5pPackages: built.summary.h5pPackages,
     // r19 (L): Libro Guía en PDF (archivo, páginas, logo usado como marca de agua).
     ...(built.summary.libro ? { libro: built.summary.libro } : {}),
-    // EV6 H5P v2: «restaurar como administrador o gestor» (solo paquetes con librerías incluidas).
+    // Instrucción de restauración del paquete (r55: requisito del sitio = pack H5P v3; jobs ≤ 3.13.0: administrador o gestor).
     ...(built.summary.restore ? { restore: built.summary.restore } : {}),
     mockProviderItems: loaded.mockProviderItems,
     validation: validation.stats,

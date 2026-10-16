@@ -256,7 +256,8 @@ async function pureChecks() {
     attempts: { activity: 0, video: 0, exam: 3, finalExam: 3 },
     gradeMethod: { activity: 'highest', video: 'highest', exam: 'highest', finalExam: 'highest' },
   };
-  const COMPLETION = { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: false };
+  // r55 (R3): el default refleja la regla real (nota del curso obligatoria); las otras dos banderas son legado sin efecto.
+  const COMPLETION = { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: true };
 
   await check('perfiles: defaultAssessmentProfile con examen final (30/50/20) y sin (40/60), exactos y válidos', () => {
     const withF = profiles.defaultAssessmentProfile({ finalExam: true });
@@ -277,6 +278,7 @@ async function pureChecks() {
       [(p) => { p.passingGrade = 101; }, 'INVALID_PASSING_GRADE'],
       [(p) => { p.passingGrade = 70.5; }, 'INVALID_PASSING_GRADE'],
       [(p) => { p.passingGrade = -1; }, 'INVALID_PASSING_GRADE'],
+      [(p) => { p.passingGrade = 0; }, 'INVALID_PASSING_GRADE'], // review r1 (I1): nota mínima del curso 1–100
       [(p) => { p.overrides.exam = 120; }, 'INVALID_OVERRIDE'],
       [(p) => { p.overrides.activity = '80'; }, 'INVALID_OVERRIDE'],
       [(p) => { p.attempts.exam = -1; }, 'INVALID_ATTEMPTS'],

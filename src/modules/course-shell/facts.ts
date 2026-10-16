@@ -31,6 +31,7 @@ import {
   validateAssessmentProfile,
 } from '../course-profiles/course-profiles';
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
+import { AssessmentCategoryKey, normalizeCategoryWeights } from '../../package/assessment/resolve-assessment';
 import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 import { courseCountNumbers } from './intro-schemas';
@@ -192,6 +193,18 @@ export interface CourseFacts {
   assessment: {
     assessmentProfileVersion: number;
     kinds: Record<AssessableType, AssessmentFactsKind>;
+    /**
+     * r55 (R3/R4): nota mínima del CURSO (`passingGrade` base del perfil, 0–100) — la que aprueba el curso por la
+     * nota final y la que nombran el cierre, el certificado y la info de las evaluaciones. Opcional solo para
+     * leer facts guardados antes de r55; `buildCourseFacts` la emite siempre.
+     */
+    coursePassingGrade?: number;
+    /**
+     * r55 review r1 (M3): peso EFECTIVO (0–100) de cada categoría con ítems calificables — los del perfil, o los
+     * normalizados igual que el resolver si una categoría vacía tenía peso > 0. Los textos de aprobación nombran
+     * solo categorías con peso > 0. Opcional para leer facts anteriores (todas las categorías cuentan).
+     */
+    categoryWeights?: Partial<Record<AssessmentCategoryKey, number>>;
   };
   audio: {
     welcomeSeconds: number;
@@ -227,6 +240,26 @@ function deepFreeze<T>(o: T): T {
     Object.freeze(o);
   }
   return o;
+}
+
+/**
+ * r55 review r1 (M3): pesos efectivos de las categorías con ítems (misma regla que `resolveAssessment` con
+ * `itemCounts`): si una categoría vacía tenía peso > 0 se reparte entre las pobladas; si no, los del perfil.
+ * Sin categorías pobladas (curso sin nota) → nada.
+ */
+function effectiveCategoryWeights(
+  assessment: AssessmentProfile,
+  counts: Record<AssessmentCategoryKey, number>,
+): { categoryWeights?: Partial<Record<AssessmentCategoryKey, number>> } {
+  const original = assessment.categoryWeights as Partial<Record<AssessmentCategoryKey, number>>;
+  const keys = (Object.keys(original) as AssessmentCategoryKey[]);
+  const populated = keys.filter((k) => counts[k] > 0);
+  if (!populated.length) return {};
+  const normalized = keys.some((k) => counts[k] === 0 && (original[k] as number) > 0);
+  const w = normalized ? normalizeCategoryWeights(original, populated) : original;
+  const out: Partial<Record<AssessmentCategoryKey, number>> = {};
+  for (const k of populated) out[k] = w[k] as number;
+  return { categoryWeights: out };
 }
 
 export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
@@ -492,7 +525,16 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     chapters,
     modules,
     finalExam: { enabled: features.finalExam, questionCount: finalQ, ...(finalBank !== undefined ? { bankSize: finalBank } : {}) },
-    assessment: { assessmentProfileVersion: assessment.assessmentProfileVersion, kinds },
+    assessment: {
+      assessmentProfileVersion: assessment.assessmentProfileVersion,
+      kinds,
+      coursePassingGrade: assessment.passingGrade,
+      ...effectiveCategoryWeights(assessment, {
+        practice: chapters.filter((c) => c.videoEnabled).length + activitiesByVariant.h5p + activitiesByVariant.scorm,
+        moduleExams: exams,
+        finalExam: features.finalExam ? 1 : 0,
+      }),
+    },
     audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
@@ -575,6 +617,7 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
     add(facts.assessment.kinds[k].passingGrade);
     add(facts.assessment.kinds[k].attempts);
   }
+  add(facts.assessment.coursePassingGrade);
   add(100); // "N de 100": escala fija de la nota (§K.1), no un dato inventado.
   if (facts.hours) add(facts.hours.value);
   add(facts.libro.wordCount);

@@ -47,7 +47,7 @@ import {
   transitionBox,
   unprotectedText,
 } from './html';
-import { COPY, activityTask, bridgeLead, moduleEndText, moduleExamTransition } from './microcopy';
+import { COPY, activityReferenceGradeText, activityTask, bridgeLead, moduleEndText, moduleExamTransition, practiceCountsInFinalGrade } from './microcopy';
 import { CTA_ACTIVITY, activityEmbedsInline, ctaButton, ctaSection } from './cta';
 import { ChapterNextStep, chapterNextSteps } from './section-layout';
 
@@ -224,7 +224,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const factsRow =
       `<p class="cvc-facts-row"${st(h, [['margin', '0 0 14px 0'], ['padding', 0], ['color', pss.fg], ['font-size', h.t.typography.sizeSmallPx], ['font-weight', '600'], ['line-height', '1.6']])}>` +
       // fix M1: separador visible «·» entre los dos datos (en CLEAN los espacios colapsan).
-      `<span>${eduIcon(h.enh, 'check', mt.ink, 18)} ${labelHtml(`Nota mínima: ${k.passingGrade} de 100`)}</span><span class="cvc-sep"${st(h, [['color', pss.fg2]])}>${labelHtml(' · ')}</span>` +
+      // r55 review r1 (M2): la nota de la actividad es informativa (el curso se aprueba solo por la nota final).
+      `<span>${eduIcon(h.enh, 'check', mt.ink, 18)} ${labelHtml(activityReferenceGradeText(k.passingGrade, practiceCountsInFinalGrade(assessment)))}</span><span class="cvc-sep"${st(h, [['color', pss.fg2]])}>${labelHtml(' · ')}</span>` +
       `<span>${eduIcon(h.enh, 'repaso', mt.ink, 18)} ${labelHtml(k.attempts === 0 ? 'Intentos: sin límite' : `Intentos: ${k.attempts}`)}</span></p>`;
     const inner = box(
       h,

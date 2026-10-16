@@ -116,7 +116,7 @@ function factsOf(course, opts = {}) {
 function certReqOf(facts) {
   const c = facts.counts;
   if (!facts.finalExam.enabled) return undefined;
-  return { activities: c.activities > 0, videos: c.videos > 0, moduleExams: c.exams > 0, finalExam: true, courseGrade: false };
+  return true; // r55: el panel toma los requisitos de facts (courseApprovalRequirements)
 }
 
 /** Todos los labels del shell de un curso. */
@@ -351,7 +351,7 @@ async function pureChecks() {
         eq(secLinks, [want[2]], `cap ${chapterNumber}: un solo botón de sección → ${want[2]}`);
         assert(t.indexOf(want[1]) > t.indexOf('A continuación') && /cvc-btn-link/.test(closingHtml), `cap ${chapterNumber}: el botón va al final de la transición`);
         // Retry/repaso sigue presente (el botón es el elemento dominante, el texto queda secundario).
-        assert(ch.activityEnabled ? /nota mínima|Revisa tu resultado/.test(t) : /Repasa las ideas clave/.test(t), `cap ${chapterNumber}: frase de reintento/repaso: ${t}`);
+        assert(ch.activityEnabled ? /nota de referencia no bloquea tu aprobación|Revisa tu resultado/.test(t) : /Repasa las ideas clave/.test(t), `cap ${chapterNumber}: frase de reintento/repaso: ${t}`);
         // EV5: tras el anuncio del examen no hay «Continúa con el capítulo…» (lo dice el label module_next).
         if (has) assert(!/Continúa con el capítulo|Continuar con el capítulo|terminas el recorrido/.test(t), `mensajes contradictorios: ${t}`);
         assert(!/Continúa con el capítulo|Lo que sigue/.test(t), `cap ${chapterNumber}: queda texto redundante sobre el botón: ${t}`);
@@ -424,7 +424,7 @@ async function pureChecks() {
           } else {
             const instr = vc.extractText(slots.find((s) => s.role === 'activity_instruction').html);
             // P3: tarjeta «Práctica calificada · Capítulo N» con la fila de datos (de facts) y la tarea; el botón no repite el capítulo.
-            assert(instr.startsWith(`Práctica calificada · Capítulo ${chapterNumber} Pon a prueba lo aprendido`) && instr.includes('Nota mínima: 70 de 100') && instr.includes('Intentos: sin límite'), `instrucción: ${instr}`);
+            assert(instr.startsWith(`Práctica calificada · Capítulo ${chapterNumber} Pon a prueba lo aprendido`) && instr.includes('Nota de referencia: 70/100 · no bloquea tu aprobación; cuenta en tu nota final') && !/Nota mínima/.test(instr) && instr.includes('Intentos: sin límite'), `instrucción: ${instr}`);
             assert(/Intentos: sin límite (Responderás|Arrastrarás|Completarás|Resolverás) /.test(instr), `cap ${chapterNumber}: la instrucción no dice qué hará el estudiante: ${instr}`);
             // UX r18 (problema 4): el botón solo cuando la actividad NO va embebida debajo (SCORM); con H5P
             // la actividad se juega en la misma página y su intro trae el respaldo «Ábrela en su propia página».
@@ -553,30 +553,23 @@ async function pureChecks() {
   await check('EV6 T3: cierre con panel «Tu certificado» (texto según los criterios reales, botón a la insignia, CLEAN_SAFE y ENHANCED)', () => {
     const ci = F.courseIntroFixture();
     const txt = (f, cert, level) => vc.extractText(S.closingLabel(f, ci, THEME, level ? { level } : undefined, cert).html);
-    const R0 = { activities: false, videos: false, moduleExams: false, finalExam: true, courseGrade: false };
+    // r55 (R4): el panel enuncia la regla REAL (nota final ≥ mínimo de facts); los requisitos salen de facts, no del llamador.
     const all2 = certReqOf(f2);
-    assert(all2.activities && all2.videos && all2.moduleExams && all2.finalExam, 'f2 tiene los cuatro tipos');
     for (const level of [undefined, 'enhanced']) {
       const html = S.closingLabel(f2, ci, THEME, level ? { level } : undefined, all2).html;
       assert(html.includes('href="cursia-cta://badges"') && /cvc-btn-link/.test(html), `${level}: botón a la insignia`);
       assert(vc.lintCleanSafe(html).ok, `${level}: CLEAN_SAFE`);
       const t = vc.extractText(html);
       assert(t.includes('Tu certificado') && t.includes('Ver mi certificado →'), `${level}: panel`);
-      assert(t.includes('Cuando apruebes todas las actividades prácticas, todos los videos interactivos, todas las evaluaciones de módulo y la evaluación final, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.'), `${level}: criterios reales: ${t}`);
+      assert(t.includes('Cuando tu calificación final del curso llegue a 70/100 o más, Moodle te otorga el certificado del curso (puede tardar unos minutos en aparecer). Lo encuentras en tu perfil, en Insignias.'), `${level}: regla real: ${t}`);
+      assert(t.includes('Apruebas el curso con una calificación final igual o superior a 70/100, calculada con las actividades prácticas, los videos interactivos, las evaluaciones de módulo y la evaluación final según sus pesos'), `${level}: regla de aprobación: ${t}`);
+      assert(!/aprobar todas|apruebes todas|todas las actividades/i.test(t), `${level}: nunca «aprobar todas»`);
     }
-    // Fix round 1 (review I1): cada combinación nombra SOLO lo que la completion exige.
-    const cases = [
-      [R0, 'Cuando apruebes la evaluación final, Moodle'],
-      [{ ...R0, moduleExams: true }, 'Cuando apruebes todas las evaluaciones de módulo y la evaluación final, Moodle'],
-      [{ ...all2, courseGrade: true }, 'y la evaluación final y alcances la nota mínima del curso, Moodle'],
-      [{ ...R0, courseGrade: true }, 'Cuando apruebes la evaluación final y alcances la nota mínima del curso, Moodle'],
-      [{ ...R0, activities: true }, 'Cuando apruebes todas las actividades prácticas y la evaluación final, Moodle'],
-    ];
-    for (const [req, want] of cases) assert(txt(f2, req).includes(want), `${JSON.stringify(req)} → «${want}»: ${txt(f2, req)}`);
-    for (const [req] of cases) assert(!/complet(es|a) todas/.test(txt(f2, req)), 'nunca «completes» para un ítem que exige aprobar');
-    // Fix round 1b (decisión M5): el certificado existe SOLO con evaluación final.
-    throwsRe(() => S.closingLabel(f2, ci, THEME, undefined, { ...all2, finalExam: false }), /solo existe con evaluación final/, 'sin final no hay panel posible');
-    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, R0), /evaluación final que el curso no tiene/, 'certificado con final en un curso sin final');
+    eq(S.courseApprovalRuleText({ coursePassingGrade: 80, activities: false, videos: false, moduleExams: true, finalExam: true, reviewCards: false }),
+      'Apruebas el curso con una calificación final igual o superior a 80/100, calculada con las evaluaciones de módulo y la evaluación final según sus pesos.', 'solo evaluaciones, 80');
+    eq(S.courseApprovalRuleText({ coursePassingGrade: 70, activities: true, videos: false, moduleExams: false, finalExam: true, reviewCards: true }),
+      'Apruebas el curso con una calificación final igual o superior a 70/100, calculada con las actividades prácticas y la evaluación final según sus pesos; las actividades de repaso no cuentan en la nota.', 'con «Repaso»');
+    throwsRe(() => S.closingLabel(f4, ci, THEME, undefined, true), /solo existe con evaluación final/, 'certificado con final en un curso sin final');
     eq(certReqOf(f4), undefined, 'f4 (sin evaluación final): sin certificado');
     assert(!/certificad|Libro Guía, Moodle/i.test(vc.extractText(S.closingLabel(f4, ci, THEME, undefined, certReqOf(f4)).html)), 'f4: el cierre no promete certificado');
     const sin = txt(f2, undefined);
@@ -587,7 +580,7 @@ async function pureChecks() {
       const tl = S.certificateTeacherLabel(`Certificado: ${f2.course.title}`, f2, THEME, level ? { level } : undefined);
       assert(vc.lintCleanSafe(tl.html).ok && tl.html.includes('href="cursia-cta://badges"'), `${level}: docente CLEAN_SAFE + botón`);
       const t = vc.extractText(tl.html);
-      for (const w of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${f2.course.title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Si no ves la insignia, revisa que las insignias estén habilitadas en el sitio y en el curso, y que la restauración haya incluido todas las actividades.', 'Abrir las insignias del curso →']) {
+      for (const w of ['El curso se aprueba solo por la calificación final', 'marcar a mano una actividad como completada no lo aprueba', 'Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${f2.course.title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Si no ves la insignia, revisa que las insignias estén habilitadas en el sitio y en el curso, y que la restauración haya incluido todas las actividades.', 'Abrir las insignias del curso →']) {
         assert(t.includes(w), `${level}: docente «${w}»: ${t}`);
       }
     }
@@ -814,7 +807,12 @@ async function pureChecks() {
   });
 
   await check('M4/M12: el puente respeta los intentos de la actividad y omite el texto LLM antes de un examen o al final del curso', () => {
-    eq(S.bridgeText({ activityEnabled: true, activityAttempts: 0, next: { number: 2, title: 'X' } }).startsWith('Si todavía no alcanzaste la nota mínima en la práctica, vuelve a intentarlo.'), true, 'ilimitados');
+    eq(S.bridgeText({ activityEnabled: true, activityAttempts: 0, next: { number: 2, title: 'X' } }).startsWith('Si quieres mejorar tu nota en la práctica, vuelve a intentarlo; su nota de referencia no bloquea tu aprobación.'), true, 'ilimitados');
+    // review r1 (M2): la nota de la actividad es de referencia (no bloquea); «cuenta en tu nota final» solo si la práctica pesa.
+    eq(S.activityReferenceGradeText(70, true), 'Nota de referencia: 70/100 · no bloquea tu aprobación; cuenta en tu nota final', 'dato de la actividad');
+    eq(S.activityReferenceGradeText(70, false), 'Nota de referencia: 70/100 · no bloquea tu aprobación', 'práctica con peso 0');
+    eq([S.practiceCountsInFinalGrade({}), S.practiceCountsInFinalGrade({ categoryWeights: { practice: 0, moduleExams: 100 } }), S.practiceCountsInFinalGrade({ categoryWeights: { practice: 30 } })], [true, false, true], 'peso de la práctica');
+    for (const a of [0, 1, 3]) assert(!/nota mínima/.test(S.bridgeText({ activityEnabled: true, activityAttempts: a, next: null })), `puente (${a}) sin «nota mínima»`);
     eq(S.bridgeText({ activityEnabled: true, activityAttempts: 1, next: null }).includes('vuelve a intentarlo'), false, '1 intento: no promete reintentar');
     eq(S.bridgeText({ activityEnabled: true, activityAttempts: 3, next: null }).includes('te quedan intentos'), true, 'intentos finitos');
     const exps = F.experiencesFor(c2.manifest);

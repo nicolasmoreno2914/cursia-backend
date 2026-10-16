@@ -76,7 +76,9 @@ export interface GradedModuleXmlInput {
 
 /**
  * `module.xml` de un ítem calificable: `completion=2` (automática),
- * `completiongradeitemnumber=0` (= "requiere nota"), `completionpassgrade=1`,
+ * `completiongradeitemnumber=0` (= "requiere nota"), `completionpassgrade` según
+ * `passGradeRequired` (r55, R5/R6: el builder v3 pasa SIEMPRE false — la actividad se completa al
+ * recibir nota; su gradepass queda informativo y el curso se aprueba por la nota final),
  * `completionview=0`, `showdescription=1` (el intro lleva el embed inline,
  * HD-V21-2). Forma idéntica a `activities/{scorm,h5pactivity}_N/module.xml` de R0.
  */
@@ -412,6 +414,8 @@ export interface CourseCompletionXmlInput {
  * `completion.xml` raíz (forma de `bk3/completion.xml` de R0): un criterio
  * `activity` (tipo 4) por módulo, más un criterio `grade` (tipo 6) con el
  * `gradepass` del curso si se exige, y el método de agregación global.
+ * r55 (R3): el builder v3 emite en un curso con nota SOLO el criterio tipo 6 (sin criterios de actividad)
+ * y en uno sin nota solo el criterio por vista del Libro Guía. Un criterio de nota exige gradepass > 0.
  * Sin criterios devuelve un `<course_completion>` vacío (el curso no tiene
  * completion configurada).
  */
@@ -431,6 +435,7 @@ export function courseCompletionXml(p: CourseCompletionXmlInput): string {
     if (seen.has(c.moduleId)) throw new Error(`ASSESSMENT_XML_INVALID: criterio repetido para el módulo ${c.moduleId}`);
     seen.add(c.moduleId);
   }
+  if (p.requireCourseGradePass && !(p.courseGradepass > 0)) throw new Error('ASSESSMENT_XML_INVALID: un criterio de nota del curso exige courseGradepass > 0');
   if (p.criteria.length === 0 && !p.requireCourseGradePass) {
     return '<?xml version="1.0" encoding="UTF-8"?>\n<course_completion>\n</course_completion>';
   }
@@ -472,12 +477,14 @@ export function courseCompletionXml(p: CourseCompletionXmlInput): string {
  * intentos se llama `attempts_number` (mod/quiz/backup/moodle2). `sumgrades`
  * y `grade` = 100: los `maxmark` de las preguntas deben sumar 100.
  *
- * P2-B1 (EV6 Fase 2): `completionattemptsexhausted` se fija aquí mismo, junto
- * a `attempts_number`, para que los dos nunca puedan quedar en desacuerdo —
- * 1 cuando hay un tope de intentos (se agotan), 0 con intentos ilimitados
- * (`attempts = 0`, que por definición nunca se agota). Sin esta bandera, un
- * solo intento fallido ya marcaría el quiz como completado-sin-aprobar
- * (`mod/quiz/classes/completion/custom_completion.php`); ver P2-design.md §1.
+ * r55 (R6): completion del quiz = recibir nota (`completionusegrade`, module.xml) + `completionminattempts` =
+ * intentos permitidos (con tope; 0 si son ilimitados), sin nota aprobatoria (`completionpassgrade=0`) y con
+ * `completionattemptsexhausted=0` (esa regla solo existe junto a la nota aprobatoria). Así el quiz queda
+ * «completado» (COMPLETE_PASS / COMPLETE_FAIL según su gradepass informativo) SOLO al usar todos los intentos:
+ * es lo que abre «Respuestas explicadas» (availability e=1 | e=3) y nunca antes, aunque el primer intento apruebe
+ * (`mod/quiz/classes/completion/custom_completion.php` check_min_attempts; `lib/completionlib.php`
+ * internal_get_state: una regla propia INCOMPLETE deja el módulo INCOMPLETE). Antes (P2-B1):
+ * `completionattemptsexhausted = attempts > 0` con `completionpassgrade=1`.
  */
 export function quizAttemptsXmlFields(p: { attempts: number; grademethod: GradeMethod }): Record<string, string> {
   assertInt(p.attempts, 'attempts', 0);
@@ -487,7 +494,8 @@ export function quizAttemptsXmlFields(p: { attempts: number; grademethod: GradeM
     grademethod: String(gradeMethodCode(QUIZ_GRADE_METHOD, p.grademethod, 'grademethod')),
     sumgrades: moodleDecimal(100),
     grade: moodleDecimal(100),
-    completionattemptsexhausted: p.attempts > 0 ? '1' : '0',
+    completionattemptsexhausted: '0',
+    completionminattempts: String(p.attempts),
   };
 }
 

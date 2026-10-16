@@ -229,8 +229,8 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
   // ══ 5. Builder v3 + validador ═════════════════════════════════════════════
   const cfg = GOLD.MBZ_CONFIGS[0]; // h5p-final-light
   const built = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, cfg));
-  await check('builder v3 ≥ 3.12.0: toda actividad QuestionSet es 1.21 con su delta; DragText/Blanks siguen content-only; summary.restore = administrador o gestor (pack v3); summary.h5pProfileVersion = 3', async () => {
-    eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.13.0', 'versión'); // r19 L: 3.12.0 → 3.13.0 (Libro Guía PDF + bienvenida)
+  await check('builder v3 ≥ 3.14.0 (r55): toda actividad QuestionSet es 1.21 SOLO contenido (como DragText/Blanks); summary.restore = requisito del sitio (pack v3); summary.h5pProfileVersion = 3', async () => {
+    eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.14.0', 'versión'); // r19 L: 3.12.0 → 3.13.0 (Libro Guía PDF + bienvenida); r55: 3.14.0
     const z = await JSZip.loadAsync(built.mbz);
     const fx = await z.file('files.xml').async('string');
     const qsPkgs = built.summary.h5pPackages.filter((p) => p.mainLibrary === 'H5P.QuestionSet');
@@ -241,13 +241,13 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
       const tops = [...new Set(Object.keys(hz.files).filter((n) => !hz.files[n].dir && n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))];
       const hj = JSON.parse(await hz.file('h5p.json').async('string'));
       if (p.mainLibrary === 'H5P.QuestionSet') {
-        eq([dirName(hj.preloadedDependencies[0]), tops], [QS_DIR, [QS_DIR]], `${p.itemKey}`);
+        eq([dirName(hj.preloadedDependencies[0]), tops], [QS_DIR, []], `${p.itemKey}`);
         const c = JSON.parse(await hz.file('content/content.json').async('string'));
         eq([c.texts.next, c.texts.previous], ['Siguiente', 'Anterior'], `${p.itemKey} rótulos`);
       } else eq(tops, [], `${p.itemKey} (${p.mainLibrary}) content-only`);
     }
     assert(fx.length > 0, 'files.xml');
-    eq(built.summary.restore && built.summary.restore.as, 'admin_or_manager', 'restore');
+    eq(built.summary.restore && built.summary.restore.as, 'site_library_pack', 'restore');
     // Fix round 1 (M-8): summary.h5pProfileVersion = perfil real (3 con QuestionSet 1.21); un curso SCORM sin H5P bundled = 1.
     eq(built.summary.h5pProfileVersion, 3, 'summary.h5pProfileVersion con QS 1.21');
     const scorm = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, GOLD.MBZ_CONFIGS.find((c) => c.engine === 'scorm')));
@@ -256,7 +256,7 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
     eq(B.H5P_V2_RESTORE_NOTE, B.H5P_BUNDLED_RESTORE_NOTE, 'alias histórico');
     assert(/Library Pack v3/.test(built.summary.restore.note), built.summary.restore.note);
   });
-  await check('validateMbzV3: el .mbz con QuestionSet 1.21 bundled queda limpio; un QuestionSet 1.20 solo-contenido en su lugar → H5P_LIBRARIES (falta la carpeta delta)', async () => {
+  await check('validateMbzV3: el .mbz con QuestionSet 1.21 solo contenido queda limpio; un QuestionSet 1.20 en su lugar → H5P_LIBRARIES (minor ≠ pack v3)', async () => {
     const v = await V.validateMbzV3(built.mbz, built.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
     const z = await JSZip.loadAsync(built.mbz);
@@ -269,7 +269,7 @@ const getPath = (o, p) => p.split('.').reduce((a, k) => (a == null ? a : a[k]), 
     z.file(`files/${newHash.slice(0, 2)}/${newHash}`, legacy);
     const v2 = await V.validateMbzV3(await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' }), built.expectations);
     const msgs = v2.issues.filter((i) => i.code === 'H5P_LIBRARIES').map((i) => i.message);
-    assert(msgs.some((m) => /faltan carpetas de librería del delta del perfil: H5P\.QuestionSet-1\.21/.test(m)), JSON.stringify(v2.issues.slice(0, 5)));
+    assert(msgs.some((m) => /H5P\.QuestionSet declarado 1\.20 ≠ perfil v3 1\.21/.test(m)), JSON.stringify(v2.issues.slice(0, 5)));
   });
 
   // ══ 6. Library Pack v3 + preflight v3 ═════════════════════════════════════

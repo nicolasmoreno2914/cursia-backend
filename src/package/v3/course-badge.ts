@@ -46,13 +46,13 @@ export const BADGE_CRITERIA_AGGREGATION_ALL = 1;
 
 export const COURSE_BADGE_MESSAGE_SUBJECT = '¡Felicitaciones! Obtuviste tu certificado';
 export const COURSE_BADGE_MESSAGE =
-  'Completaste el curso y obtuviste «%badgename%». Lo encuentras en tu perfil, en Insignias, y puedes descargarlo desde ahí.';
+  'Aprobaste el curso y obtuviste «%badgename%». Lo encuentras en tu perfil, en Insignias, y puedes descargarlo desde ahí.';
 
 export interface CourseBadgeInput {
   courseTitle: string;
   /** `<course id>` del backup (el que la restauración remapea). */
   courseBackupId: number;
-  /** Criterios REALES de completion del paquete (fix round 1, review I1). */
+  /** r55: qué entra en la nota final y la nota mínima del curso (`courseApprovalRequirements(facts)`). */
   requirements: CertificateRequirements;
   ts: number;
   issuerName?: string;
@@ -65,10 +65,14 @@ export function courseBadgeName(courseTitle: string): string {
   return safeActivityName(`Certificado: ${title}`, 254);
 }
 
-/** «Otorgado al completar el curso «X»: aprobar … y la evaluación final[, y alcanzar la nota mínima del curso].» */
+/**
+ * r55 (R4): «Otorgado al aprobar el curso «X»: obtener una calificación final igual o superior a 70/100, calculada con
+ * … según sus pesos[; las actividades de repaso no cuentan en la nota].» — la regla REAL (criterio de nota del curso);
+ * antes enumeraba «aprobar todas las actividades…», que ya no es la regla.
+ */
 export function courseBadgeDescription(courseTitle: string, requirements: CertificateRequirements): string {
   const title = String(courseTitle ?? '').trim();
-  return `Otorgado al completar el curso «${title}»: ${certificateRequirementClauses(requirements, 'inf')}.`;
+  return `Otorgado al aprobar el curso «${title}»: ${certificateRequirementClauses(requirements)}.`;
 }
 
 /** `badges.xml` raíz con UNA insignia de curso: criterio global ALL + completion del curso. */

@@ -84,12 +84,20 @@ const GOLDEN = {
   // 4 entradas del zip (los label.xml de apertura) y normalizando «~N min» son idénticas (scratchpad/r23/mbzdiff.js).
   // Dorados anteriores (3.13.0): h5p-final-light 0eb987bf…, scorm-nofinal-dark ef843c54…, h5p-nofinal-dark-mock-cleansafe
   // f309c5ac…, scorm-final-light 02a970f2…, h5p-ev5c-rules1 3a8c0028….
+  // r55 (builder 3.14.0): huellas RE-CAPTURADAS a propósito — invariantes de calificación (criterio único de nota,
+  // completion por nota, completionminattempts, slots aleatorios legados, textos) cambian todo .mbz con nota.
+  // r55 review r1 (sigue siendo builder 3.14.0, rama sin desplegar): RE-CAPTURADAS a propósito — cambian SOLO label.xml
+  // de cv3:ch:*:activity_instruction («Nota de referencia … no bloquea tu aprobación»), cv3:ch:*:closing (puente sin
+  // «nota mínima»), cv3:shell:certificate_teacher y cv3:shell:exams_teacher (restaurar como curso nuevo / «Sobrescribir
+  // configuración del curso», override en dos pasos) — diff por entrada del zip contra fd67337 (scratchpad/r55b-r1/hook.js).
+  // Dorados r55 (fd67337): h5p-final-light 0892ae20…, scorm-nofinal-dark 5feee6eb…, h5p-nofinal-dark-mock-cleansafe
+  // ee6da148…, scorm-final-light 92007263…, h5p-ev5c-rules1 df1ee128….
   mbz: {
-    'h5p-final-light': 'f81e186a6da1aacf3f56d18008c95c7f6211f10e267befefeb55974a97970cb5',
-    'scorm-nofinal-dark': '8e99edd2d00f974b8c36015fcadd77c942dc2470ed9f5f621347f675aa301fb8',
-    'h5p-nofinal-dark-mock-cleansafe': 'b933f95914ba27af4e2e55f57af72873a3b592a3c0818c019d1cb9aeedda0bba',
-    'scorm-final-light': '93f39f3ecad0961062b95052a4e14498c7c75c64228688fbf5fb01c48b66a8a6',
-    'h5p-ev5c-rules1': '18ec532260583fb1dcaa8bf7dce28546395400825b6a4352ca05f90a462a2b6a',
+    'h5p-final-light': '046edade710990caf80bc5cc95ef429f9cac34f40302a603bd6505d1c32f160b',
+    'scorm-nofinal-dark': '26f7f2305bf0374f1ae096864394d129a60200abb9d0c5034ad717eca4ce4981',
+    'h5p-nofinal-dark-mock-cleansafe': '62c4bc0fd080d9dff4760fb15dcd011c3901f8e5c2d1ac086f8862b1206c9bcd',
+    'scorm-final-light': '139dd6593462e631095352c008facc90752731fb5ce986dbea675676a62263f1',
+    'h5p-ev5c-rules1': '5fa5fafe5a423c35998268763ccd0a70514fdcf699b52c200a18d848f0483e53',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */
@@ -268,18 +276,17 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     }
     eq(bySec.map((x, i) => [i, x]).filter((x) => x[1]), want, 'secuencia');
   });
-  await check('paquete v2: la actividad BS lleva EXACTAMENTE las 19 carpetas delta; calificable (nota 100, aprobación del perfil, completion por nota)', async () => {
+  await check('r55: paquete v2 — la actividad BS es solo contenido (+ imágenes de los finales); calificable (nota 100, gradepass informativo, completion al recibir nota); requisito del sitio = pack v3', async () => {
     const chBs = input2.manifest.items.find((i) => i.h5pType === 'branchingscenario').chapterId;
     const a = acts.find((x) => x.idnumber === `cv3:ch:${chBs}:activity`);
     const pkg = await JSZip.loadAsync(await blobOf(a.dir, 'package'));
     const tops = [...new Set(Object.keys(pkg.files).filter((n) => !pkg.files[n].dir && n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))].sort();
-    eq(tops, h.profileDeltaDirs(h.CURSIA_H5P_PROFILE_V2, 'H5P.BranchingScenario'), 'delta');
-    for (const d of tops) assert(pkg.file(`${d}/LICENSE.txt`) && /— MIT License/.test(await pkg.file(`${d}/LICENSE.txt`).async('string')), `${d}: aviso MIT (m-8)`);
+    eq(tops, [], 'sin carpetas de librería');
     eq(JSON.parse(await pkg.file('h5p.json').async('string')).mainLibrary, 'H5P.BranchingScenario', 'principal');
     const grades = await z2.file(`${a.dir}/grades.xml`).async('string');
     assert(/<grademax>100\.00000<\/grademax>|<grademax>100<\/grademax>/.test(grades) && /<gradepass>70/.test(grades), 'grade item 100 / 70');
-    assert(/<completion>2<\/completion>/.test(a.module) && /<completionpassgrade>1<\/completionpassgrade>/.test(a.module), 'completion por nota');
-    eq(built2.summary.restore && built2.summary.restore.as, 'admin_or_manager', 'resumen: restaurar como administrador o gestor');
+    assert(/<completion>2<\/completion>/.test(a.module) && /<completiongradeitemnumber>0<\/completiongradeitemnumber>/.test(a.module) && /<completionpassgrade>0<\/completionpassgrade>/.test(a.module), 'completion al recibir nota');
+    eq(built2.summary.restore && built2.summary.restore.as, 'site_library_pack', 'resumen: requisito del sitio (pack v3)');
   });
   await check('paquete v2: «Repaso» Dialog Cards SIN nota — sin grade item, grade 0, sin tracking, completion por vista, fuera de los criterios del curso; texto «Repaso», nunca «calificable»', async () => {
     const reviews = acts.filter((x) => /:review_cards$/.test(x.idnumber));
@@ -297,7 +304,8 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       assert(!critMids.includes(r.mid), `${r.idnumber} es criterio de completion del curso`);
       const pkg = await JSZip.loadAsync(await blobOf(r.dir, 'package'));
       eq(JSON.parse(await pkg.file('h5p.json').async('string')).mainLibrary, 'H5P.Dialogcards', 'Dialog Cards');
-      eq([...new Set(Object.keys(pkg.files).filter((n) => !pkg.files[n].dir && n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))], ['H5P.Dialogcards-1.9'], 'delta DC');
+      // r55 (R7): solo contenido (sin la carpeta H5P.Dialogcards-1.9 de ≤ 3.13.0).
+      eq([...new Set(Object.keys(pkg.files).filter((n) => !pkg.files[n].dir && n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))], [], 'DC solo contenido');
       const intro = hx.match(/<intro>([\s\S]*?)<\/intro>/)[1];
       assert(/Repaso del capítulo/.test(intro) && !/calificab|nota de esta actividad/i.test(intro), 'texto del «Repaso»');
       const name = /<name>([^<]*)<\/name>/.exec(hx)[1];
@@ -498,9 +506,16 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
       svc.findLatestPackageJob = async () => ({ worker_status: 'running', output_summary: summary });
       return svc.getPackageStatus(1, 'o', 1, 'r');
     };
-    eq((await pkg({ restore: built2.summary.restore })).restore, { as: 'admin_or_manager', note: B.H5P_BUNDLED_RESTORE_NOTE.note }, 'con librerías incluidas');
+    // r55: requisito del sitio (pack v3); los jobs viejos con admin_or_manager se siguen devolviendo.
+    eq((await pkg({ restore: built2.summary.restore })).restore, { as: 'site_library_pack', libraryPack: 'v3', note: B.H5P_SITE_LIBRARY_PACK_RESTORE_NOTE.note }, 'tipos fuera del pack v1');
+    eq((await pkg({ restore: { as: 'admin_or_manager', note: B.H5P_BUNDLED_RESTORE_NOTE.note } })).restore, { as: 'admin_or_manager', note: B.H5P_BUNDLED_RESTORE_NOTE.note }, 'job ≤ 3.13.0');
     assert(!('restore' in (await pkg({}))), 'paquete de siempre: sin restore');
     assert(!('restore' in (await pkg({ restore: { as: 'otro', note: 'x' } }))), 'forma inesperada: se ignora');
+    // review r1 (M1): regla de aprobación real para «Curso listo» (nota mínima del curso; curso sin nota).
+    eq((await pkg({ assessment: { withoutGrades: false, coursePassingGrade: 80 } })).approval, { withoutGrades: false, coursePassingGrade: 80 }, 'nota mínima real');
+    eq((await pkg({ assessment: { withoutGrades: true, coursePassingGrade: null } })).approval, { withoutGrades: true, coursePassingGrade: null }, 'curso sin nota');
+    eq((await pkg({ assessment: { withoutGrades: false } })).approval, { withoutGrades: false, coursePassingGrade: null }, 'job anterior al campo');
+    assert(!('approval' in (await pkg({}))), 'sin evaluación registrada: sin approval');
     const { CourseStructureService } = L('modules/course-structure/course-structure.service.js');
     const cs = Object.create(CourseStructureService.prototype);
     const exec = (rows, fail = false) => ({ calls: 0, async query() { this.calls++; if (fail) throw new Error('relation does not exist'); return rows; } });
@@ -553,9 +568,11 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     v = await V.validateMbzV3(await mut(async (z) => {
       const c = await z.file('completion.xml').async('string');
       const first = /<course_completion_criteria id="\d+">[\s\S]*?<\/course_completion_criteria>/.exec(c)[0];
-      z.file('completion.xml', c.replace(first, first + first.replace(/<moduleinstance>\d+<\/moduleinstance>/, `<moduleinstance>${r0.mid}</moduleinstance>`).replace(/id="\d+"/, 'id="99999"')));
+      const asActivity = first.replace('<criteriatype>6</criteriatype>', '<criteriatype>4</criteriatype>').replace(/<module>[^<]*<\/module>/, '<module>h5pactivity</module>').replace(/<gradepass>[^<]*<\/gradepass>/, '<gradepass>$@NULL@$</gradepass>');
+      z.file('completion.xml', c.replace(first, first + asActivity.replace(/<moduleinstance>[^<]*<\/moduleinstance>/, `<moduleinstance>${r0.mid}</moduleinstance>`).replace(/id="\d+"/, 'id="99999"')));
     }), built2.expectations);
-    assert(v.issues.some((i) => i.code === 'COURSE_COMPLETION'), 'add-on como criterio del curso');
+    // r55 (R3): cualquier criterio de actividad en un curso con nota (el «Repaso» incluido) → CRITERIA_ACTIVITY.
+    assert(v.issues.some((i) => i.code === 'CRITERIA_ACTIVITY'), 'add-on como criterio del curso');
   });
   await check('facts: «Repaso» sin el ajuste del Blueprint ⇒ FACTS_INVALID (nunca se agrega en silencio)', () => {
     const inp = PF.packagingInput(distRoot, { ...V2CFG, reviewCards: false });
@@ -630,7 +647,7 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     eq(PACK.libraryPackFileName(h.CURSIA_H5P_PROFILE_V2.mainLibraries['H5P.BranchingScenario'], 2), 'cursia-h5p-pack-v2-H5P.BranchingScenario-1.10.1.h5p', 'nombre v2');
     eq(PACK.libraryPackFileName(h.CURSIA_H5P_PROFILE_V1.mainLibraries['H5P.Blanks']), 'cursia-h5p-pack-v1-H5P.Blanks-1.14.37.h5p', 'nombre v1');
     const readme = fs.readFileSync(path.join(ROOT, 'src/package/h5p/README-library-pack.md'), 'utf8');
-    assert(/Restaurar como administrador o gestor/.test(readme), 'README: restaurar como administrador o gestor');
+    assert(/Requisito del sitio/.test(readme) && /cualquier docente/.test(readme) && /H5P_PARTIAL_LIBRARY_CLOSURE/.test(readme), 'README: requisito del sitio (pack v3), solo contenido');
   });
   await check('preflight v2: exige v1 + las 19 librerías delta; un sitio solo con v1 falla (missing) y con v2 completo pasa', () => {
     const P2 = h.CURSIA_H5P_PROFILE_V2;

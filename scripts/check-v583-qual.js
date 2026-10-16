@@ -249,11 +249,12 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
   await check('M5: el cierre nunca afirma que el estudiante completó el curso (con y sin evaluación final)', () => {
     const ci = F.courseIntroFixture();
     const withFinal = vc.extractText(S.closingLabel(facts, ci, THEME).html);
-    assert(withFinal.includes('Al aprobar la evaluación final completas el recorrido del curso.') && !/Has completado/.test(withFinal), withFinal);
+    // r55 (R4): la frase del cierre es la regla real de aprobación (nota final), condicional, nunca «completaste».
+    assert(withFinal.includes('Apruebas el curso con una calificación final igual o superior a 70/100') && !/Has completado|Completaste/.test(withFinal), withFinal);
     const c2 = F.course2(distRoot, { finalExam: false });
     const f2 = S.buildCourseFacts({ manifest: c2.manifest, blueprint: c2.snapshot, assessment: cp.defaultAssessmentProfile({ finalExam: false }), artifacts: F.measuredArtifacts(c2.manifest) });
     const noFinal = vc.extractText(S.closingLabel(f2, ci, THEME).html);
-    assert(noFinal.includes('Llegaste al cierre del recorrido del curso.') && !/Has completado|actividad|práctica/i.test(noFinal.replace(/Insignias/, '')), noFinal);
+    assert(noFinal.includes('Apruebas el curso con una calificación final igual o superior a 70/100') && !/Has completado|Completaste|certificad/i.test(noFinal), noFinal);
   });
   await check('M5: la descripción del recurso del Libro Guía = la tarjeta sin el botón (el nombre del recurso ya es el enlace); CLEAN_SAFE y cifras de facts', () => {
     const intro = S.libroResourceIntro(facts, THEME);
@@ -288,7 +289,7 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
   });
   await check('M5: .mbz 3.13.0 — sección 1 con UNA entrada del Libro Guía (recurso con descripción, sin label libro_card), quiz.xml con reviewmaxmarks 272; validador limpio y la descripción pasa las reglas de los labels', async () => {
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 583 }));
-    eq(r.summary.builderVersion, '3.13.0', 'versión'); // UX r18: 3.11.0 → 3.12.0; r19 L+W: 3.13.0
+    eq(r.summary.builderVersion, '3.14.0', 'versión'); // UX r18: 3.11.0 → 3.12.0; r19 L+W: 3.13.0; r55: 3.14.0
     const z = await JSZip.loadAsync(r.mbz);
     const mb = await z.file('moodle_backup.xml').async('string');
     const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>\d+<\/sectionid>\s*<modulename>(\w+)<\/modulename>\s*<title>([^<]*)<\/title>\s*<directory>([^<]+)<\/directory>/g)].map((m) => ({ mid: m[1], mod: m[2], title: m[3], dir: m[4] }));

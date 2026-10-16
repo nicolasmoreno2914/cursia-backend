@@ -203,10 +203,13 @@ export function defaultAssessmentProfile(opts: { finalExam: boolean }): Assessme
     categoryWeights: opts.finalExam
       ? { practice: 30, moduleExams: 50, finalExam: 20 }
       : { practice: 40, moduleExams: 60 },
+    // r55 (R3): estas banderas ya no deciden la completion del curso (el resolver fuerza el criterio de nota
+    // final y ningún criterio de actividad); se conservan en el esquema para leer perfiles guardados. El default
+    // refleja la regla real (nota del curso obligatoria).
     courseCompletion: {
       requireAllChapterActivities: true,
       requireExams: true,
-      requireCourseGradePass: false,
+      requireCourseGradePass: true,
     },
   };
 }
@@ -336,7 +339,10 @@ function checkTypeMap(
  * (con final: practice/moduleExams/finalExam; sin final: practice/moduleExams)
  * y sumar 100.
  */
-export function validateAssessmentProfile(p: unknown, ctx: { finalExam: boolean }): ProfileValidationError[] {
+export function validateAssessmentProfile(
+  p: unknown,
+  ctx: { finalExam: boolean; allowLegacyZeroPassingGrade?: boolean },
+): ProfileValidationError[] {
   const errors: ProfileValidationError[] = [];
   if (!isPlainObject(p)) {
     return [{ path: '', code: 'INVALID_TYPE', message: 'El perfil de evaluación debe ser un objeto' }];
@@ -356,8 +362,13 @@ export function validateAssessmentProfile(p: unknown, ctx: { finalExam: boolean 
       message: `assessmentProfileVersion debe ser ${ASSESSMENT_PROFILE_VERSION}`,
     });
   }
-  if ('passingGrade' in p && !(isInt(p.passingGrade) && p.passingGrade >= 0 && p.passingGrade <= 100)) {
-    errors.push({ path: 'passingGrade', code: 'INVALID_PASSING_GRADE', message: 'passingGrade debe ser un entero entre 0 y 100' });
+  // r55 review r1 (I1): la nota mínima DEL CURSO va de 1 a 100. Con 0 el criterio único «Calificación del curso»
+  // lo cumpliría cualquiera (el resolver lo rechaza con ASSESSMENT_UNENFORCEABLE, que queda como defensa).
+  // Solo la LECTURA de un perfil viejo ya guardado con 0 lo tolera (allowLegacyZeroPassingGrade) para que el panel
+  // lo muestre y se pueda corregir; guardar, el gate de startRun y el empaque lo rechazan.
+  const minPassing = ctx.allowLegacyZeroPassingGrade ? 0 : 1;
+  if ('passingGrade' in p && !(isInt(p.passingGrade) && p.passingGrade >= minPassing && p.passingGrade <= 100)) {
+    errors.push({ path: 'passingGrade', code: 'INVALID_PASSING_GRADE', message: 'passingGrade debe ser un entero entre 1 y 100' });
   }
   checkTypeMap(p, 'overrides', errors, (v) => v === null || (isInt(v) && v >= 0 && v <= 100),
     'INVALID_OVERRIDE', 'debe ser null o un entero entre 0 y 100');
@@ -446,9 +457,12 @@ export function normalizePresentationProfile(p: unknown): PresentationProfile {
  * cambiado `finalExam` después; la coherencia con el curso actual la reporta
  * `validateAssessmentProfile` (ver `warnings` en el GET).
  */
-export function normalizeAssessmentProfile(p: unknown): AssessmentProfile {
+export function normalizeAssessmentProfile(
+  p: unknown,
+  opts: { allowLegacyZeroPassingGrade?: boolean } = {},
+): AssessmentProfile {
   const hasFinal = isPlainObject(p) && isPlainObject(p.categoryWeights) && 'finalExam' in p.categoryWeights;
-  const errors = validateAssessmentProfile(p, { finalExam: hasFinal });
+  const errors = validateAssessmentProfile(p, { finalExam: hasFinal, allowLegacyZeroPassingGrade: opts.allowLegacyZeroPassingGrade === true });
   if (errors.length > 0) throw new Error(`PROFILE_INVALID: ${describe(errors)}`);
   const q = p as AssessmentProfile;
   const map = <T>(m: Record<AssessableType, T>): Record<AssessableType, T> => ({

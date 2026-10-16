@@ -11,7 +11,10 @@
 #      se restauró; si el frontend no trae H5P v2 (E2E_H5P2=auto), E5 queda omitido.
 #   3. Regresión: todos los scripts/check-*.js del backend (incluidos los de Moodle
 #      local), harness-blueprint-snapshot, runner de producción local y los
-#      harnesses del frontend.
+#      harnesses del frontend. r55 (invariantes de calificación): entran solos por el glob
+#      check-review-cards-content-only.js (puro) y check-moodle-grading-invariants.js (Moodle local:
+#      scripts/moodle/check-review-cards-deploy.php + restore-as-teacher.php + check-grading-scenarios.php,
+#      con E2E_MOODLE_DIR / PHP_BIN del entorno limpio de abajo; limpia lo que crea).
 #   4. Resumen (summary-v21.js): aserciones por área, sha de los MBZ, warnings de
 #      restore y contadores de proveedores (0 reales).
 #

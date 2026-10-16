@@ -26,6 +26,7 @@ import {
   defaultPresentationProfileFor,
   isLightDefaultCourse,
   isProfileKind,
+  normalizeAssessmentProfile,
   normalizeProfile,
   profileSha256,
   validateAssessmentProfile,
@@ -471,7 +472,11 @@ export class CourseProfilesService {
   private toDto(row: any, finalExam: boolean): CourseProfileDto {
     const kind = row.kind as ProfileKind;
     const stored = typeof row.data === 'string' ? JSON.parse(row.data) : row.data;
-    const profile = normalizeProfile(kind, stored);
+    // r55 review r1 (I1): un perfil de evaluación viejo guardado con nota mínima 0 se sigue LEYENDO (el GET lo
+    // devuelve con el warning INVALID_PASSING_GRADE para corregirlo en el panel); guardarlo o empacarlo falla.
+    const profile = kind === 'assessment'
+      ? normalizeAssessmentProfile(stored, { allowLegacyZeroPassingGrade: true })
+      : normalizeProfile(kind, stored);
     if (profileSha256(profile) !== row.sha256) {
       throw new Error(`Perfil #${row.id} (${kind} v${row.version}): el contenido no coincide con su sha256 (integridad rota)`);
     }

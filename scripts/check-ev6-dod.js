@@ -522,7 +522,7 @@ const ENV_KEYS = [
       eq([dto.completion.state, dto.completion.packageReady], ['preview', false], 'el run sigue de vista previa');
     });
 
-    await check('dod', 'builder: run 100 % real → .mbz BYTE-IDÉNTICO al dorado (builder 3.13.0, mismo fixture que check-ev6-pending-videos) con qaPreviewNotice ausente o false; con true → nombre «[QA — vista previa, no entregable]» + aviso visible en la bienvenida, validador OK', async () => {
+    await check('dod', 'builder: run 100 % real → .mbz BYTE-IDÉNTICO al dorado (builder 3.14.0, mismo fixture que check-ev6-pending-videos) con qaPreviewNotice ausente o false; con true → nombre «[QA — vista previa, no entregable]» + aviso visible en la bienvenida, validador OK', async () => {
       const PF = require('./lib/v21-packaging-fixtures');
       const B = L('package/dynamic-mbz-builder-v3.js');
       const V = L('package/v3/mbz-validator-v3.js');
@@ -535,7 +535,12 @@ const ENV_KEYS = [
       // r19 L fix round 1: logo de la portada a opacidad plena, /Keywords del PDF (sha del plan) y transliteración — vuelve a mover solo el blob del Libro.
       // r19 L (builder 3.13.0): Libro Guía en PDF + botón en su descripción — mismo dorado que check-ev6-pending-videos (antes 7cb2a7c7…, 3.12.0).
       // Motor de carga horaria L1 (badge de minutos del modelo de tiempo): mismo dorado que check-ev6-pending-videos, verificado por entrada del zip — solo cambian los «~N min» (scratchpad/r23/mbzdiff2.js) (antes e64d1b61…).
-      const GOLDEN_644 = 'c359c0a59d19e949a13c7762208eee7d62667da5ba0ae68108bdbf34a8a49d2c';
+      // r55 invariantes de calificación + review r1 (builder 3.13.0 → 3.14.0): mismo dorado que check-ev6-pending-videos;
+      // diff por entrada del zip contra 3.13.0: completion.xml, completionpassgrade 1→0 en los module.xml calificables,
+      // quiz.xml (attemptsexhausted 0, minattempts 3 y la banda de retroalimentación), badges.xml, files.xml + el blob del
+      // .h5p de QuestionSet 1.21 (solo contenido) y los label.xml activity_instruction / closing / exam_info /
+      // final_exam_info / shell:closing / shell:certificate_teacher (antes c359c0a5…, 3.13.0).
+      const GOLDEN_644 = '473e168fb481c37951781ca76a17dd05f92e58eb99bb62ee1a636a73aa4f3efa';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });
