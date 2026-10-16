@@ -7,8 +7,8 @@
 // válidos (scripts/lib/exam-bank-fixtures.js, el mismo generador de test/fixtures/exam-bank-v1)
 // cuyos textos llevan & < > " y apóstrofes, y verifica (P2-design §2.2):
 //  - #question_set_reference = slots del plan; ninguna question_reference en quizzes de banco;
-//  - cada filtercondition = {"filter":{"category":{"jointype":1,"values":[HOJA],"filteroptions":
-//    {"includesubcategories":false}}}} (sin "cat"), HOJA del MISMO quiz con ≥ piso de preguntas;
+//  - cada filtercondition (r55: formato LEGADO {"questioncategoryid":HOJA,"includingsubcategories":0}; antes {"filter":{"category":{"jointype":1,"values":[HOJA],"filteroptions":
+//    {"includesubcategories":false}}}}), HOJA del MISMO quiz con ≥ piso de preguntas;
 //    por hoja #referencias = slots del plan; slots en el orden de las categorías, página = ⌈slot/5⌉;
 //  - Σ maxmark = 100.0000000 exacto;
 //  - árbol: top (parent 0) → «Por defecto en …» → «Capítulo N: título» | «Módulo N: título» →
@@ -244,7 +244,7 @@ async function main() {
     }
   });
 
-  await check('filtercondition: forma exacta de §2.2 (jointype 1, includesubcategories false, sin "cat"); hoja del MISMO quiz con ≥ piso; #referencias por hoja = slots del plan; orden = orden de categorías', () => {
+  await check('filtercondition: forma LEGADA exacta {"questioncategoryid":N,"includingsubcategories":0} (r55, Moodle 4.1–4.5); hoja del MISMO quiz con ≥ piso; #referencias por hoja = slots del plan; orden = orden de categorías', () => {
     for (const q of R.quizzes) {
       const bank = bankOf(q);
       const byId = new Map(q.cats.map((c) => [c.id, c]));
@@ -252,7 +252,8 @@ async function main() {
       let lastLeafOrder = -1;
       const leafOrder = q.cats.filter((c) => c.entries.length).map((c) => c.id);
       for (const s of q.slots) {
-        const m = /^\{"filter":\{"category":\{"jointype":1,"values":\[(\d+)\],"filteroptions":\{"includesubcategories":false\}\}\}\}$/.exec(s.filter);
+        // r55: formato LEGADO (backup 4.1; 4.1/4.2 no entienden el de 4.3+, que 4.3+ convierten al restaurar).
+        const m = /^\{"questioncategoryid":(\d+),"includingsubcategories":0\}$/.exec(s.filter);
         assert(m, `${q.idnumber} slot ${s.slot}: filtercondition ${s.filter}`);
         const leaf = byId.get(Number(m[1]));
         assert(leaf, `${q.idnumber} slot ${s.slot}: la categoría ${m[1]} no es del quiz`);

@@ -58,12 +58,23 @@ export interface ResolvedCategory {
   weight: number;
 }
 
+/**
+ * r55 (invariantes de calificación, R3): política EFECTIVA de completion del curso — no la del perfil.
+ * - `requireCourseGradePass` = true en TODO curso con ítems calificables (criterio de nota, tipo 6, con
+ *   `courseGradepass`); false solo en un curso sin nota (`withoutGrades`).
+ * - `requireAllChapterActivities` / `requireExams` = false SIEMPRE: ningún curso calificado lleva criterios de
+ *   actividad (aprobar o completar actividades sueltas nunca aprueba el curso, y una actividad bajo su nota mínima
+ *   no lo bloquea si la nota final llega al mínimo). Las banderas del perfil guardado se siguen leyendo y validando
+ *   (perfiles viejos no se rompen), pero ya no deciden nada: quedan en `profileFlags`, solo informativas.
+ */
 export interface ResolvedCourseCompletion {
-  requireAllChapterActivities: boolean;
-  requireExams: boolean;
+  requireAllChapterActivities: false;
+  requireExams: false;
   requireCourseGradePass: boolean;
   courseGradepass: number;
   aggregation: 'all';
+  /** Banderas tal cual vienen del perfil guardado (legado, sin efecto en el paquete). */
+  profileFlags: { requireAllChapterActivities: boolean; requireExams: boolean; requireCourseGradePass: boolean };
 }
 
 export interface ResolvedAssessment {
@@ -248,12 +259,25 @@ export function resolveAssessment(profile: AssessmentProfile, facts: AssessmentF
   const sum = profileCategories.reduce((a, c) => a + c.weight, 0);
   if (sum !== 100) throw new Error(`ASSESSMENT_WEIGHTS_SUM_NOT_100: suman ${sum}`);
 
+  // r55 (R3): el criterio de nota del curso es OBLIGATORIO con nota (se ignora el `false` guardado) y no hay
+  // criterios de actividad; el caso sin nota lo apaga más abajo.
   const courseCompletion: ResolvedCourseCompletion = {
-    requireAllChapterActivities: profile.courseCompletion.requireAllChapterActivities,
-    requireExams: profile.courseCompletion.requireExams,
-    requireCourseGradePass: profile.courseCompletion.requireCourseGradePass,
+    requireAllChapterActivities: false,
+    requireExams: false,
+    requireCourseGradePass: true,
     courseGradepass: profile.passingGrade,
     aggregation: 'all',
+    profileFlags: {
+      requireAllChapterActivities: profile.courseCompletion.requireAllChapterActivities,
+      requireExams: profile.courseCompletion.requireExams,
+      requireCourseGradePass: profile.courseCompletion.requireCourseGradePass,
+    },
+  };
+  // Un criterio de nota con gradepass 0 lo cumple cualquiera: un curso CON nota exige un mínimo > 0.
+  const assertCoursePassingGrade = (): void => {
+    if (!(profile.passingGrade > 0)) {
+      throw new Error(`ASSESSMENT_UNENFORCEABLE: passingGrade=${profile.passingGrade} (un curso con nota exige una nota mínima del curso > 0)`);
+    }
   };
   const base = {
     assessmentProfileVersion: profile.assessmentProfileVersion,
@@ -262,6 +286,7 @@ export function resolveAssessment(profile: AssessmentProfile, facts: AssessmentF
     kinds,
   };
   if (facts.itemCounts === undefined) {
+    assertCoursePassingGrade();
     return { ...base, categories: profileCategories, courseCompletion };
   }
 
@@ -299,6 +324,7 @@ export function resolveAssessment(profile: AssessmentProfile, facts: AssessmentF
       withoutGrades: true,
     };
   }
+  assertCoursePassingGrade();
   const weightsNormalized = emptyCategories.some((k) => (originalWeights[k] as number) > 0);
   const weights = weightsNormalized
     ? normalizeCategoryWeights(originalWeights, populated)
@@ -347,27 +373,20 @@ export interface CompletionCandidate {
 }
 
 /**
- * Criterios de actividad del curso según la política:
- * - `requireAllChapterActivities` → todos los ítems `activity` y `video`
- *   (todo lo calificable de "Práctica de capítulos");
- * - `requireExams` → todos los `exam` y el `finalExam`;
- * - EV6 (T3): el `finalExam` es SIEMPRE criterio cuando existe (decisión de producto: «Curso
- *   completo → Evaluación final aprobada → Cierre → Certificado»; su módulo lleva
- *   `completionpassgrade=1`, así que cuenta solo al aprobarla), aunque `requireExams` sea false.
- * Orden estable: el de `items`.
+ * Criterios de ACTIVIDAD (tipo 4) del curso calificado. r55 (R3): SIEMPRE vacío — el curso se aprueba solo
+ * por la nota final (criterio tipo 6, ver `ResolvedCourseCompletion`). Antes: un criterio por ítem según
+ * `requireAllChapterActivities` / `requireExams` y el examen final siempre (EV6 T3); eso hacía que una actividad
+ * bajo su nota mínima bloqueara el curso aunque la nota final llegara al mínimo, y que completar actividades
+ * sin la nota final (override por tipo, banderas apagadas, override manual del docente) aprobara el curso.
+ * Valida igual los tipos (fail loud) y no mira las banderas de la política (legado).
  */
 export function completionCriteriaFor(
   items: CompletionCandidate[],
-  policy: ResolvedCourseCompletion,
+  _policy: ResolvedCourseCompletion,
 ): Array<{ moduleId: number; modname: CompletionCandidate['modname'] }> {
-  const out: Array<{ moduleId: number; modname: CompletionCandidate['modname'] }> = [];
   for (const it of items) {
-    const chapter = it.kind === 'activity' || it.kind === 'video';
-    const exam = it.kind === 'exam' || it.kind === 'finalExam';
-    if (!chapter && !exam) throw new Error(`ASSESSMENT_UNKNOWN_KIND: ${String(it.kind)}`);
-    if ((chapter && policy.requireAllChapterActivities) || (exam && policy.requireExams) || it.kind === 'finalExam') {
-      out.push({ moduleId: it.moduleId, modname: it.modname });
-    }
+    const known = it.kind === 'activity' || it.kind === 'video' || it.kind === 'exam' || it.kind === 'finalExam';
+    if (!known) throw new Error(`ASSESSMENT_UNKNOWN_KIND: ${String(it.kind)}`);
   }
-  return out;
+  return [];
 }

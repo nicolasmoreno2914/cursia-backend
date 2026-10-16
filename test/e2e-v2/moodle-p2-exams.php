@@ -6,28 +6,26 @@
 // Los demás criterios del curso (H5P/SCORM de práctica) se aprueban con su nota (grade_update), como
 // el gate de notas: no son el objeto de esta prueba.
 //
-// Aserciones (P2-design §1.2/§1.3/§2.2, rulings 1–3):
-//  config restaurada  revisión (8 campos §1.3; V542 fix round 1 I1: reviewattempt D|I|C, reviewmarks O|C), completionattemptsexhausted = intentos > 0,
-//                     cm 2/0/1; slots todos aleatorios (banco: cada filtercondition → hoja del contexto
-//                     del quiz, includesubcategories false) o todos fijos (GIFT); Σ maxmark = 100;
-//                     página «Respuestas explicadas»: misma sección, justo después del quiz,
-//                     availability remapeada al cmid RESTAURADO de su quiz (e=1|e=3, o solo e=1 con
-//                     intentos ilimitados), completion 0, downloadcontent 0, fuera de los criterios.
-//  A (intentos > 0)   reprueba el primer examen de módulo hasta agotarlo: con intentos restantes
-//                     INCOMPLETE y página BLOQUEADA; agotado COMPLETE_FAIL y página DISPONIBLE; tras
-//                     cada intento: página de revisión PERMITIDA al terminar (V542 I4: sin el aviso «No tiene
-//                     permiso para revisar este cuestionario») que, renderizada como el estudiante, muestra sus
-//                     respuestas SIN nota por pregunta (fix round 1 I1: la nota junto a la respuesta revela la
-//                     correcta de una V/F), corrección, respuesta correcta ni feedback; más tarde (abierto) sin
-//                     página de revisión y con la nota TOTAL visible (view.php + ítem del libro visible);
-//                     QUIZFB: al terminar, la retroalimentación global («aprobaste» / «todavía no», bandas de
-//                     la nota mínima del perfil) se ve con el texto de la banda de la nota real; luego aprueba todo lo demás → curso NO completo, sin insignia.
-//  U (intentos = 0)   reprueba 2 veces → página bloqueada (aunque Moodle ya marque COMPLETE_FAIL); aprueba
-//                     → página disponible; aprueba lo demás → curso completo.
-//  B                  aprueba al primer intento → COMPLETE_PASS, página disponible; aprueba lo demás →
-//                     curso completo (+ insignia si el paquete la trae, activada como lo haría el docente).
+// Aserciones (P2-design §1.2/§1.3/§2.2, rulings 1–3; r55 = invariantes de calificación, builder 3.14.0):
+//  config restaurada  revisión (8 campos §1.3; V542 fix round 1 I1: reviewattempt D|I|C, reviewmarks O|C);
+//                     r55: completionminattempts = intentos, completionattemptsexhausted 0, cm 2/0/0 (recibir nota);
+//                     slots todos aleatorios (banco: cada filtercondition → hoja del contexto del quiz, sin
+//                     subcategorías; el paquete usa el formato legado, 4.3+ lo convierte) o todos fijos (GIFT);
+//                     Σ maxmark = 100; página «Respuestas explicadas»: misma sección, justo después del quiz,
+//                     availability remapeada al cmid RESTAURADO de su quiz (e=1|e=3; con intentos ilimitados:
+//                     sin availability y oculta), completion 0, downloadcontent 0, fuera de los criterios.
+//                     Completion del curso: UN criterio de nota (tipo 6), ninguno de actividad.
+//  A (intentos > 0)   reprueba el primer examen de módulo hasta agotarlo: con intentos restantes INCOMPLETE y
+//                     página BLOQUEADA; agotado COMPLETE_FAIL y página DISPONIBLE; revisión tras cada intento
+//                     (V542 I4 / I1 / QUIZFB, ver assert_marks_only); luego aprueba todo lo demás → curso
+//                     completo ⇔ nota final ≥ mínimo (r55: un examen reprobado no bloquea el curso).
+//  U (intentos = 0)   reprueba 2 veces y aprueba → la página sigue OCULTA (el docente la libera); el curso se
+//                     completa ⇔ nota final ≥ mínimo.
+//  B                  aprueba al primer intento → con N > 1 intentos INCOMPLETE y página BLOQUEADA (r55: abre solo
+//                     al usar todos los intentos); aprueba lo demás → curso completo (+ insignia si el paquete la
+//                     trae, activada como lo haría el docente).
 //  C (con final)      aprueba módulos y práctica, agota el final reprobando → final COMPLETE_FAIL, su página
-//                     disponible, curso NO completo, sin insignia.
+//                     disponible, curso completo ⇔ nota final ≥ mínimo (r55; con pesos 30/50/20 sí).
 //  banco              cada pregunta sorteada sale de la hoja de SU slot; por hoja, slots = referencias.
 //  nota docente       el label oculto para docentes no es visible para el estudiante.
 //
@@ -81,6 +79,12 @@ check('el curso tiene al menos un quiz', count($quizzes) > 0, array_keys($byid))
 $moduleExams = array_values(array_filter(array_keys($quizzes), fn($k) => str_starts_with($k, 'cv3:exam:')));
 $final = isset($quizzes['cv3:final_exam']) ? 'cv3:final_exam' : null;
 $criteria = array_map('intval', $DB->get_fieldset_select('course_completion_criteria', 'moduleinstance', 'course = ? AND criteriatype = 4', [$courseid]));
+// r55 (R3): la completion del curso es UN criterio de nota (tipo 6) = gradepass del ítem del curso; sin criterios de actividad.
+$gradecrit = $DB->get_records('course_completion_criteria', ['course' => $courseid, 'criteriatype' => COMPLETION_CRITERIA_TYPE_GRADE]);
+$courseitem = grade_item::fetch_course_item($courseid);
+$gradepass = (float)$courseitem->gradepass;
+check('r55: completion del curso = UN criterio de nota con gradepass del ítem del curso, sin criterios de actividad',
+    $criteria === [] && count($gradecrit) === 1 && abs((float)reset($gradecrit)->gradepass - $gradepass) < 1e-6 && $gradepass > 0, ['type4' => $criteria, 'type6' => array_values($gradecrit), 'gradepass' => $gradepass]);
 
 $REVIEW = ['reviewattempt' => 69648, 'reviewcorrectness' => 16, 'reviewmaxmarks' => 272, 'reviewmarks' => 272,
     'reviewspecificfeedback' => 16, 'reviewgeneralfeedback' => 16, 'reviewrightanswer' => 16, 'reviewoverallfeedback' => 4368];
@@ -104,8 +108,8 @@ foreach ($quizzes as $idn => $Q) {
     $attempts = (int)$q->attempts;
     $got = []; foreach ($REVIEW as $k => $v) $got[$k] = (int)$q->$k;
     check("$idn: revisión = respuestas propias al terminar, sin nota por pregunta/corrección/feedback/respuesta; nota total más tarde (8 campos §1.3 + V542 I1)", $got === $REVIEW, $got);
-    check("$idn: completionattemptsexhausted = intentos > 0 ($attempts)", (int)$q->completionattemptsexhausted === ($attempts > 0 ? 1 : 0), (int)$q->completionattemptsexhausted);
-    check("$idn: cm completion 2/0/1", [(int)$cm->completion, (string)$cm->completiongradeitemnumber, (int)$cm->completionpassgrade] === [2, '0', 1],
+    check("$idn: r55 completionminattempts = intentos ($attempts) y completionattemptsexhausted 0", (int)$q->completionminattempts === $attempts && (int)$q->completionattemptsexhausted === 0, [(int)$q->completionminattempts, (int)$q->completionattemptsexhausted]);
+    check("$idn: cm completion 2/0/0 (recibir nota, sin nota aprobatoria)", [(int)$cm->completion, (string)$cm->completiongradeitemnumber, (int)$cm->completionpassgrade] === [2, '0', 0],
         [$cm->completion, $cm->completiongradeitemnumber, $cm->completionpassgrade]);
     $slots = $DB->count_records('quiz_slots', ['quizid' => $q->id]);
     $random = $DB->count_records('question_set_references', ['usingcontextid' => $ctx->id, 'component' => 'mod_quiz', 'questionarea' => 'slot']);
@@ -118,11 +122,14 @@ foreach ($quizzes as $idn => $Q) {
     if ($mode === 'bank') {
         $bad = [];
         foreach (slot_leaf($cm) as $slot => $fc) {
+            // 4.3+ convierte al restaurar el formato legado del paquete ({"questioncategoryid":N,…}); se aceptan los dos.
             $cat = $fc['filter']['category'] ?? null;
-            $catid = (int)($cat['values'][0] ?? 0);
+            $catid = (int)($cat['values'][0] ?? ($fc['questioncategoryid'] ?? 0));
             $c = $DB->get_record('question_categories', ['id' => $catid]);
             $leaf = $c && !$DB->record_exists('question_categories', ['parent' => $catid]);
-            if (!$c || (int)$c->contextid !== (int)$ctx->id || !$leaf || count($cat['values']) !== 1 || ($cat['filteroptions']['includesubcategories'] ?? true) !== false) {
+            // (4.5 convierte el legado a includesubcategories 0 — entero —; el formato nativo usa false.)
+            $single = $cat ? (count($cat['values']) === 1 && empty($cat['filteroptions']['includesubcategories'] ?? true)) : ((int)($fc['includingsubcategories'] ?? 1) === 0);
+            if (!$c || (int)$c->contextid !== (int)$ctx->id || !$leaf || !$single) {
                 $bad[$slot] = $fc;
             }
             $leafRefs[$catid] = ($leafRefs[$catid] ?? 0) + 1;
@@ -141,9 +148,10 @@ foreach ($quizzes as $idn => $Q) {
     if ($p) {
         $want = $attempts > 0
             ? sprintf('{"op":"|","show":false,"c":[{"type":"completion","cm":%d,"e":1},{"type":"completion","cm":%d,"e":3}]}', $cm->id, $cm->id)
-            : sprintf('{"op":"|","show":false,"c":[{"type":"completion","cm":%d,"e":1}]}', $cm->id);
+            : null;
         $avail = $DB->get_field('course_modules', 'availability', ['id' => $p->id]);
-        check("{$Q['pageidn']}: availability remapeada al cmid restaurado de su quiz ($cm->id), " . ($attempts > 0 ? 'e=1|e=3' : 'solo e=1'), $avail === $want, $avail);
+        check("{$Q['pageidn']}: availability remapeada al cmid restaurado de su quiz ($cm->id), " . ($attempts > 0 ? 'e=1|e=3' : 'sin availability y oculta (ilimitados)'),
+            $avail === $want && ($attempts > 0 || (int)$p->visible === 0), [$avail, (int)$p->visible]);
         $seq = array_map('intval', explode(',', $DB->get_field('course_sections', 'sequence', ['id' => $cm->section])));
         $i = array_search((int)$cm->id, $seq, true);
         check("{$Q['pageidn']}: misma sección y justo después del quiz", (int)$p->section === (int)$cm->section && $i !== false && ($seq[$i + 1] ?? null) === (int)$p->id, $seq);
@@ -305,21 +313,22 @@ function assert_marks_only($label, $r) {
     check("$label: página de revisión renderizada como el estudiante: {$p['questions']} preguntas, SIN «Puntúa como» en ninguna, 0 fugas (nota obtenida, respuesta, corrección, feedback)",
         $p['questions'] > 0 && $p['withMark'] === 0 && !$p['leaks'], $p);
 }
-/** Aprueba (nota real) todo criterio de completion que no es un quiz. */
+/** Aprueba (nota real, 100) todo ítem calificable que no es un quiz (H5P evaluativo / SCORM de práctica). */
 function pass_non_quiz($user) {
     global $DB, $course, $courseid, $modinfo;
     $ci = new completion_info($course);
-    foreach ($DB->get_fieldset_select('course_completion_criteria', 'moduleinstance', 'course = ? AND criteriatype = 4', [$courseid]) as $cmid) {
-        $cm = $modinfo->get_cm($cmid);
-        if ($cm->modname === 'quiz') continue;
+    foreach ($modinfo->get_cms() as $cm) {
+        if (!preg_match('/^cv3:ch:[^:]+:(video|activity)$/', (string)$cm->idnumber) || !in_array($cm->modname, ['h5pactivity', 'scorm'], true)) continue;
         grade_update('mod/' . $cm->modname, $courseid, 'mod', $cm->modname, $cm->instance, 0, ['userid' => $user->id, 'rawgrade' => 100]);
         $ci->update_state($cm, COMPLETION_UNKNOWN, $user->id);
     }
 }
 function state($user, $idn) {
     global $course, $quizzes, $NAMES, $badge, $DB;
-    sleep(1); // aggregate_completions solo toma filas con reaggregate < time()
-    ob_start(); (new \core\task\completion_regular_task())->execute(); ob_end_clean();
+    // aggregate_completions solo toma filas con reaggregate < time(); r55: el criterio de nota necesita DOS pasadas
+    // de completion_regular_task (moodle-versions.md, igual en 4.1–4.5).
+    grade_regrade_final_grades($course->id);
+    foreach ([1, 2] as $pass) { sleep(1); ob_start(); (new \core\task\completion_regular_task())->execute(); ob_end_clean(); }
     get_fast_modinfo($course->id, 0, true);
     $mi = get_fast_modinfo($course, $user->id);
     $ci = new completion_info($course);
@@ -329,6 +338,8 @@ function state($user, $idn) {
         $s['page'] = ['available' => (bool)$p->available, 'uservisible' => (bool)$p->uservisible];
     }
     $s['courseComplete'] = (new completion_completion(['userid' => $user->id, 'course' => $course->id]))->is_complete();
+    $g = grade_item::fetch_course_item($course->id)->get_final($user->id);
+    $s['courseGrade'] = $g && $g->finalgrade !== null ? round((float)$g->finalgrade, 2) : null;
     if ($badge) $s['badge'] = $DB->record_exists('badge_issued', ['badgeid' => $badge->id, 'userid' => $user->id]);
     return $s;
 }
@@ -339,8 +350,11 @@ function student($tag) {
     $gen->enrol_user($u->id, $courseid, $studentrole);
     return $u;
 }
-$locked = fn($s) => isset($s['page']) && $s['page']['available'] === false && $s['page']['uservisible'] === false;
+// Bloqueada = el estudiante no la ve: por availability (intentos > 0) o porque va oculta (intentos ilimitados, r55).
+$locked = fn($s) => isset($s['page']) && $s['page']['uservisible'] === false;
 $open = fn($s) => isset($s['page']) && $s['page']['available'] === true && $s['page']['uservisible'] === true;
+// r55 (R3): curso completo ⇔ nota final ≥ mínimo (criterio único de nota).
+$byGrade = fn($s) => $s['courseGrade'] !== null && $s['courseComplete'] === ($s['courseGrade'] >= $gradepass);
 $steps = [];
 $exam = $moduleExams[0] ?? $final;
 $N = $config[$exam]['attempts'];
@@ -373,7 +387,7 @@ if ($N > 0) {
     foreach (array_keys($quizzes) as $idn) if ($idn !== $exam) attempt($idn, $A, true);
     $s = state($A, $exam);
     $steps['A'][] = ['step' => 'todo lo demás aprobado'] + $s;
-    check("A: con $exam agotado sin aprobar, el curso NO se completa" . ($badge ? ' ni recibe la insignia' : ''), $s['courseComplete'] === false && empty($s['badge']), $s);
+    check("A: con $exam agotado sin aprobar y todo lo demás aprobado, curso completo ⇔ nota final {$s['courseGrade']} ≥ $gradepass" . ($badge ? '; insignia ⇔ completo' : ''), $byGrade($s) && (!$badge || $s['badge'] === $s['courseComplete']), $s);
 } else {
     $U = student('U');
     foreach ([1, 2] as $k) {
@@ -381,17 +395,17 @@ if ($N > 0) {
         assert_marks_only("U $exam intento $k reprobado (ilimitados)", $r);
         $s = state($U, $exam);
         $steps['U'][] = ['step' => "intento $k reprobado", 'grade' => $r['grade']] + $s;
-        check("U $exam (intentos ilimitados) intento $k reprobado: página BLOQUEADA", $locked($s) && $s['completion'] !== 'COMPLETE_PASS', $s);
+        check("U $exam (intentos ilimitados) intento $k reprobado: página BLOQUEADA (oculta)", $locked($s) && $s['completion'] !== 'COMPLETE_PASS', $s);
     }
     $r = attempt($exam, $U, true);
     $s = state($U, $exam);
     $steps['U'][] = ['step' => 'intento 3 aprobado', 'grade' => $r['grade']] + $s;
-    check("U $exam (intentos ilimitados) aprobado: COMPLETE_PASS y página DISPONIBLE", $s['completion'] === 'COMPLETE_PASS' && $open($s), $s);
+    check("U $exam (intentos ilimitados) aprobado: COMPLETE_PASS y página todavía OCULTA (la libera el docente, r55)", $s['completion'] === 'COMPLETE_PASS' && $locked($s), $s);
     pass_non_quiz($U);
     foreach (array_keys($quizzes) as $idn) if ($idn !== $exam) attempt($idn, $U, true);
     $s = state($U, $exam);
     $steps['U'][] = ['step' => 'todo lo demás aprobado'] + $s;
-    check('U: todo aprobado → curso completo', $s['courseComplete'] === true, $s);
+    check('U: todo aprobado → curso completo (nota final ≥ mínimo)', $s['courseComplete'] === true && $byGrade($s), $s);
 }
 
 // ── B: aprueba al primer intento ──
@@ -411,8 +425,16 @@ check("control: tras el cierre el detector SÍ ve respuesta/feedback ({$closed['
     && count(array_filter($closed['leaks'], fn($l) => str_contains($l, 'nota obtenida por pregunta'))) === $closed['questions'], $closed);
 $s = state($B, $exam);
 $steps['B'][] = ['step' => 'intento 1 aprobado', 'grade' => $r['grade']] + $s;
-check("B $exam aprobado al primer intento: COMPLETE_PASS y página DISPONIBLE", $s['completion'] === 'COMPLETE_PASS' && $open($s) && $r['grade'] >= 99.99, $s);
-check('B: con evaluaciones pendientes el curso no se completa', $s['courseComplete'] === false || count($quizzes) === 1, $s);
+if ($N > 1) check("B $exam aprobado al primer intento con $N intentos: INCOMPLETE y página BLOQUEADA (r55: abre al usar todos)", $s['completion'] === 'INCOMPLETE' && $locked($s) && $r['grade'] >= 99.99, $s);
+else if ($N === 1) check("B $exam aprobado en su único intento: COMPLETE_PASS y página DISPONIBLE", $s['completion'] === 'COMPLETE_PASS' && $open($s) && $r['grade'] >= 99.99, $s);
+else check("B $exam aprobado (ilimitados): COMPLETE_PASS y página OCULTA", $s['completion'] === 'COMPLETE_PASS' && $locked($s) && $r['grade'] >= 99.99, $s);
+check('B: con evaluaciones pendientes, curso completo ⇔ nota final ≥ mínimo', $byGrade($s), $s);
+if ($N > 1) {
+    for ($k = 2; $k <= $N; $k++) attempt($exam, $B, true);
+    $s = state($B, $exam);
+    $steps['B'][] = ['step' => "intentos 2..$N aprobados"] + $s;
+    check("B $exam aprobado y con sus $N intentos usados: COMPLETE_PASS y página DISPONIBLE (e=1)", $s['completion'] === 'COMPLETE_PASS' && $open($s), $s);
+}
 pass_non_quiz($B);
 foreach (array_keys($quizzes) as $idn) if ($idn !== $exam) attempt($idn, $B, true);
 $s = state($B, $exam);
@@ -432,8 +454,8 @@ if ($final && $final !== $exam && $config[$final]['attempts'] > 0) {
         $steps['C'][] = ['step' => "final intento $k reprobado"] + $s;
         if ($k < $F) check("C final intento $k/$F reprobado: INCOMPLETE y su página BLOQUEADA", $s['completion'] === 'INCOMPLETE' && $locked($s), $s);
     }
-    check("C final agotado sin aprobar: COMPLETE_FAIL, su página DISPONIBLE, curso NO completo" . ($badge ? ', sin insignia' : ''),
-        $s['completion'] === 'COMPLETE_FAIL' && $open($s) && $s['courseComplete'] === false && empty($s['badge']), $s);
+    check("C final agotado sin aprobar: COMPLETE_FAIL, su página DISPONIBLE, curso completo ⇔ nota final {$s['courseGrade']} ≥ $gradepass" . ($badge ? ', insignia ⇔ completo' : ''),
+        $s['completion'] === 'COMPLETE_FAIL' && $open($s) && $byGrade($s) && (!$badge || $s['badge'] === $s['courseComplete']), $s);
 }
 
 $failed = array_values(array_filter($assertions, fn($a) => !$a['ok']));

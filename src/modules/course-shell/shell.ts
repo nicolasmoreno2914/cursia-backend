@@ -60,7 +60,7 @@ import {
   unprotectedText,
 } from './html';
 import { GRADE_METHOD_ES, attemptsValue } from './microcopy';
-import { EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, examExplanationsInfoText } from './exam-explanations';
+import { EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, EXAMS_TEACHER_NOTE_UNLIMITED, examExplanationsInfoText, examsHaveUnlimitedAttempts, examsTeacherNoteFor } from './exam-explanations';
 
 export interface ShellLabel {
   name: string;
@@ -443,7 +443,8 @@ function examInfo(
   const cs = { s: panelSurf(h), border: h.t.color.border };
   const items = [
     kv('Preguntas', String(questionCount)),
-    kv('Nota mínima para aprobar', `${k.passingGrade} de 100`),
+    // r55 (R4): la nota mínima de la evaluación es informativa (aprobada / no aprobada); el curso se aprueba por la nota final.
+    kv('Nota mínima de esta evaluación', `${k.passingGrade} de 100`),
     kv('Intentos', attemptsValue(k.attempts)),
     kv('Calificación', `se toma ${GRADE_METHOD_ES[k.gradeMethod]}`),
   ]
@@ -457,9 +458,15 @@ function examInfo(
     heading(h, 'h3', title, cs.s) +
     pHtml(h, labelHtml(leadText), cs.s, { secondary: true }) +
     rows(h, items, { cls: 'cvc-cols2' }) +
+    pHtml(h, labelHtml(examCountsText(facts)), cs.s, { secondary: true }) +
     pHtml(h, labelHtml(examExplanationsInfoText(k.attempts, explained)), cs.s, { secondary: true, last: true }) +
     ctaButton(h, CTA_EXAM, ctaText, cs.s);
   return out(name, root(h, uid, box(h, inner, cs)), facts);
+}
+
+/** r55 (R4): cómo cuenta una evaluación — suma a la nota final según su peso; no hay que aprobarla por separado. */
+export function examCountsText(facts: CourseFacts): string {
+  return `Esta evaluación suma a tu calificación final del curso según su peso: apruebas el curso con una calificación final de ${coursePassingGradeOf(facts)}/100 o más.`;
 }
 
 export function examInfoLabel(
@@ -567,83 +574,137 @@ export function finalExamNextLabel(closingSectionNum: number, facts: CourseFacts
 // ─── SZ Cierre ──────────────────────────────────────────────────────────────
 
 /**
- * EV6 (T3): el paquete trae una insignia de curso nativa de Moodle (el certificado), que se otorga
- * al completar el curso. Fix round 1 (review I1): el texto nombra EXACTAMENTE los criterios de
- * completion del paquete (por tipo de ítem) y nunca promete algo que la insignia no cumple:
- * cada ítem calificable cuenta solo APROBADO (`completionpassgrade=1`) y, si el perfil lo exige,
- * también la nota mínima del curso (criterio de nota, sin cifras: la cifra no sale de facts).
+ * r55 (R3/R4) — regla REAL de aprobación del curso, la misma en todo texto del curso (cierre, certificado,
+ * descripción de la insignia, notas para docentes, info de las evaluaciones): el curso se aprueba SOLO por la
+ * calificación final (criterio de nota del curso, tipo 6) ≥ la nota mínima del curso del perfil, calculada con
+ * los ítems calificables según los pesos de sus categorías; el «Repaso» (y las páginas formativas) no cuentan.
+ * Ningún texto promete «aprobar todas las actividades»: una actividad bajo su nota mínima no bloquea el curso.
+ * Todo sale de facts (cifras incluidas: la nota mínima del curso está en `facts.assessment.coursePassingGrade`).
+ *
+ * `CertificateRequirements` (nombre histórico): qué entra en la nota final del curso.
  */
 export interface CertificateRequirements {
-  /** Criterios: actividades prácticas de capítulo (H5P/SCORM). */
+  /** Nota mínima del curso (0 < x ≤ 100). */
+  coursePassingGrade: number;
+  /** Ítems calificables por tipo presentes en el curso (todos entran en la nota final, ninguno es criterio). */
   activities: boolean;
-  /** Criterios: videos interactivos (calificables). */
   videos: boolean;
-  /** Criterios: evaluaciones de módulo. */
   moduleExams: boolean;
-  /** Criterio: evaluación final (aprobada). */
   finalExam: boolean;
-  /** Criterio de nota del curso (`requireCourseGradePass`). */
-  courseGrade: boolean;
+  /** El curso tiene «Repaso» (sin nota). */
+  reviewCards: boolean;
+}
+
+/** r55: ¿el curso tiene ítems calificables (nota final)? Mismo criterio que `withoutGrades` del resolver. */
+export function courseHasGrades(facts: CourseFacts): boolean {
+  const c = facts.counts;
+  return c.activities + c.videos + c.exams > 0 || c.finalExam === true;
+}
+
+/** r55: nota mínima del curso desde facts (fail loud si falta: facts anteriores a r55 no se renderizan). */
+export function coursePassingGradeOf(facts: CourseFacts): number {
+  const g = facts.assessment?.coursePassingGrade;
+  if (typeof g !== 'number' || !Number.isFinite(g) || g <= 0 || g > 100) shellFail(`nota mínima del curso inválida o ausente en facts (${String(g)})`);
+  return g;
+}
+
+/** r55: requisitos (qué cuenta en la nota final) a partir de facts. Fail loud en un curso sin nota. */
+export function courseApprovalRequirements(facts: CourseFacts): CertificateRequirements {
+  if (!courseHasGrades(facts)) shellFail('regla de aprobación: el curso no tiene ítems calificables');
+  const c = facts.counts;
+  return {
+    coursePassingGrade: coursePassingGradeOf(facts),
+    activities: c.activities > 0,
+    videos: c.videos > 0,
+    moduleExams: c.exams > 0,
+    finalExam: c.finalExam === true,
+    reviewCards: (c.reviewCards ?? 0) > 0,
+  };
 }
 
 function joinEs(xs: string[]): string {
   return xs.length <= 1 ? xs.join('') : `${xs.slice(0, -1).join(', ')} y ${xs[xs.length - 1]}`;
 }
 
-/** Condiciones de la insignia en subjuntivo («apruebes…») o infinitivo («aprobar…»). */
-export function certificateRequirementClauses(r: CertificateRequirements, mood: 'sub' | 'inf'): string {
-  // Fix round 1b (decisión M5): «Curso completo → Evaluación final aprobada → Cierre → Certificado»:
-  // el certificado existe SOLO si el curso tiene evaluación final (y siempre la exige aprobada).
-  if (!r.finalExam) shellFail('certificado: solo existe con evaluación final (y la exige aprobada)');
-  const v = mood === 'sub' ? { pass: 'apruebes', reach: 'alcances' } : { pass: 'aprobar', reach: 'alcanzar' };
+/** «las actividades prácticas, los videos interactivos, las evaluaciones de módulo y la evaluación final». */
+export function courseGradeComponentsText(r: CertificateRequirements): string {
   const items: string[] = [];
-  if (r.activities) items.push('todas las actividades prácticas');
-  if (r.videos) items.push('todos los videos interactivos');
-  if (r.moduleExams) items.push('todas las evaluaciones de módulo');
+  if (r.activities) items.push('las actividades prácticas');
+  if (r.videos) items.push('los videos interactivos');
+  if (r.moduleExams) items.push('las evaluaciones de módulo');
   if (r.finalExam) items.push('la evaluación final');
-  const clauses: string[] = [];
-  if (items.length) clauses.push(`${v.pass} ${joinEs(items)}`);
-  if (r.courseGrade) clauses.push(`${v.reach} la nota mínima del curso`);
-  return joinEs(clauses);
+  if (!items.length) shellFail('regla de aprobación: ningún ítem entra en la nota final');
+  return joinEs(items);
 }
 
+function reviewClause(r: CertificateRequirements): string {
+  if (!r.reviewCards) return '';
+  return r.activities ? '; las actividades de repaso no cuentan en la nota' : '; el «Repaso» no cuenta en la nota';
+}
+
+/**
+ * «Apruebas el curso con una calificación final igual o superior a 70/100, calculada con … según sus pesos; las
+ * actividades de repaso no cuentan en la nota.» (texto aprobado, R4).
+ */
+export function courseApprovalRuleText(r: CertificateRequirements): string {
+  return `Apruebas el curso con una calificación final igual o superior a ${r.coursePassingGrade}/100, calculada con ${courseGradeComponentsText(r)} según sus pesos${reviewClause(r)}.`;
+}
+
+/** Panel «Tu certificado» del cierre. */
 export function closingCertificateText(r: CertificateRequirements): string {
-  return `Cuando ${certificateRequirementClauses(r, 'sub')}, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.`;
+  return `Cuando tu calificación final del curso llegue a ${r.coursePassingGrade}/100 o más, Moodle te otorga el certificado del curso (puede tardar unos minutos en aparecer). Lo encuentras en tu perfil, en Insignias.`;
 }
 
+/** Descripción de la insignia (infinitivo). */
+export function certificateRequirementClauses(r: CertificateRequirements): string {
+  return `obtener una calificación final igual o superior a ${r.coursePassingGrade}/100, calculada con ${courseGradeComponentsText(r)} según sus pesos${reviewClause(r)}`;
+}
+
+/** Nota para docentes (en el label oculto del certificado o en el de las evaluaciones): cómo se aprueba de verdad. */
+export function courseApprovalTeacherNote(r: CertificateRequirements): string {
+  return (
+    `El curso se aprueba solo por la calificación final: la finalización del curso tiene un único criterio, «Calificación del curso» ≥ ${r.coursePassingGrade}/100. ` +
+    'Una actividad o una evaluación por debajo de su nota mínima no bloquea el curso, y marcar a mano una actividad como completada no lo aprueba. ' +
+    'Moodle revisa ese criterio con su tarea programada (cron): la finalización y el certificado llegan unos minutos después de la última calificación, y mientras tanto el libro de calificaciones ya puede mostrar el curso como aprobado.'
+  );
+}
+
+/**
+ * `certificate`: true (o, por compatibilidad, cualquier objeto de requisitos) → panel «Tu certificado». Los
+ * requisitos salen SIEMPRE de facts (`courseApprovalRequirements`), nunca del llamador. El certificado existe
+ * solo con evaluación final (decisión M5).
+ */
 export function closingLabel(
   facts: CourseFacts,
   courseIntro: CourseIntroV3,
   theme: ResolvedTheme,
   opts?: ShellRenderOptions,
-  certificate?: CertificateRequirements,
+  certificate?: boolean | object,
 ): ShellLabel {
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
   const s = bgSurf(h);
   // EV6: el cierre va DESPUÉS de la evaluación final. #583 (M5/M7): la frase es condicional — lo ve también
   // quien todavía no aprobó (o ni intentó) la evaluación final, así que nunca afirma que ya la completó.
-  const next = facts.finalExam.enabled
-    ? 'Al aprobar la evaluación final completas el recorrido del curso.'
-    : 'Llegaste al cierre del recorrido del curso.';
+  // r55 (R4): con nota, la frase es la regla REAL de aprobación (nota final ≥ mínimo), no «aprobar la final».
+  const graded = courseHasGrades(facts);
+  const req = graded ? courseApprovalRequirements(facts) : null;
+  const next = req ? courseApprovalRuleText(req) : 'Llegaste al cierre del recorrido del curso.';
+  const withCertificate = !!certificate;
   let inner =
     eyebrow(h, 'Cierre', s) +
     heading(h, 'h3', 'Cierre del curso', s) +
     accentRule(h, s) +
     lead(h, intro.closing, s) +
-    pHtml(h, labelHtml(next), s, { weight: 700, last: !certificate });
-  if (certificate) {
-    const c = facts.counts;
-    if (certificate.finalExam && !facts.finalExam.enabled) shellFail('certificado: exige una evaluación final que el curso no tiene');
-    if ((certificate.activities && c.activities < 1) || (certificate.videos && c.videos < 1) || (certificate.moduleExams && c.exams < 1)) {
-      shellFail('certificado: exige un tipo de ítem que el curso no tiene');
-    }
+    pHtml(h, labelHtml(next), s, { weight: 700, last: !withCertificate });
+  if (withCertificate) {
+    if (!facts.finalExam.enabled || !req) shellFail('certificado: solo existe con evaluación final (y con nota del curso)');
     const cs = toneSurf(h, 'soft');
     inner += box(
       h,
       eyebrow(h, 'Certificado', cs.s) +
         heading(h, 'h4', 'Tu certificado', cs.s) +
-        pHtml(h, labelHtml(closingCertificateText(certificate)), cs.s) +
+        pHtml(h, labelHtml(closingCertificateText(req)), cs.s) +
         ctaButton(h, CTA_BADGES, 'Ver mi certificado →', cs.s),
       cs,
       { cls: 'cvc-certificate' },
@@ -678,13 +739,18 @@ export function certificateTeacherLabel(badgeName: string, facts: CourseFacts, t
       cs.s,
     ) +
     ctaButton(h, CTA_BADGES, 'Abrir las insignias del curso →', cs.s) +
+    // r55 (R4): cómo se aprueba de verdad (criterio único de nota final, cron, override manual sin efecto).
+    `<div${st(h, [['margin', '24px 0 0 0'], ['padding', '16px 0 0 0'], ['color', cs.s.fg], ['border-top', `1px solid ${cs.border}`]])}>` +
+    heading(h, 'h4', 'Cómo se aprueba el curso', cs.s) +
+    pHtml(h, labelHtml(courseApprovalTeacherNote(courseApprovalRequirements(facts))), cs.s, { last: true }) +
+    `</div>` +
     // EV6 P2-B4 (rulings 2 + 3): el certificado exige la evaluación final → siempre hay «Respuestas
     // explicadas»; su nota para docentes va aquí, un párrafo más.
     // Fix 1 (M2): con su propio subtítulo, para no leerse como parte del paso de la insignia.
     (hasExams(facts)
       ? `<div${st(h, [['margin', '24px 0 0 0'], ['padding', '16px 0 0 0'], ['color', cs.s.fg], ['border-top', `1px solid ${cs.border}`]])}>` +
         heading(h, 'h4', 'Respuestas explicadas', cs.s) +
-        pHtml(h, labelHtml(EXAMS_TEACHER_NOTE), cs.s, { last: true }) +
+        pHtml(h, labelHtml(examsTeacherNoteFor(facts)), cs.s, { last: true }) +
         `</div>`
       : '');
   return out('Para docentes: activar el certificado', root(h, 'shell-certificate-teacher', box(h, inner, cs, { cls: 'cvc-certificate-teacher' })), facts);
@@ -703,10 +769,14 @@ export function examsTeacherLabel(facts: CourseFacts, theme: ResolvedTheme, opts
   if (!hasExams(facts)) shellFail('nota para docentes de las evaluaciones en un curso sin evaluaciones');
   const h = hx(theme, opts);
   const cs = toneSurf(h, 'alt');
+  const unlimited = examsHaveUnlimitedAttempts(facts);
   const inner =
     eyebrow(h, 'Solo docentes', cs.s) +
     heading(h, 'h4', 'Para docentes: respuestas explicadas', cs.s) +
     pHtml(h, labelHtml(EXAMS_TEACHER_NOTE_AVAILABILITY), cs.s) +
-    pHtml(h, labelHtml(EXAMS_TEACHER_NOTE_ATTEMPTS), cs.s, { last: true });
+    pHtml(h, labelHtml(EXAMS_TEACHER_NOTE_ATTEMPTS), cs.s, { last: !unlimited && !courseHasGrades(facts) }) +
+    (unlimited ? pHtml(h, labelHtml(EXAMS_TEACHER_NOTE_UNLIMITED), cs.s, { last: !courseHasGrades(facts) }) : '') +
+    // r55 (R4): la regla real de aprobación también para el docente de un curso sin certificado.
+    (courseHasGrades(facts) ? pHtml(h, labelHtml(courseApprovalTeacherNote(courseApprovalRequirements(facts))), cs.s, { last: true }) : '');
   return out('Para docentes: respuestas explicadas', root(h, 'shell-exams-teacher', box(h, inner, cs, { cls: 'cvc-exams-teacher' })), facts);
 }

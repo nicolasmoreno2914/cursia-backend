@@ -158,7 +158,29 @@ check('resolve: defaults con examen final → 70 en todo, 30/50/20, intentos 0/0
     { key: 'moduleExams', fullname: 'Evaluaciones de módulo', weight: 50 },
     { key: 'finalExam', fullname: 'Evaluación final', weight: 20 },
   ]);
-  eq(r.courseCompletion, { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: false, courseGradepass: 70, aggregation: 'all' });
+  // r55 (R3): política EFECTIVA — solo criterio de nota del curso; las banderas del perfil quedan como legado.
+  eq(r.courseCompletion, { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: true, courseGradepass: 70, aggregation: 'all',
+    profileFlags: { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: true } });
+});
+check('r55 (R3): resolve fuerza el criterio de nota con un perfil guardado requireCourseGradePass=false y banderas apagadas; sin nota → false/0', () => {
+  const p = defFinal();
+  p.courseCompletion = { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: false };
+  const r = A.resolveAssessment(p, { hasFinalExam: true, itemCounts: { practice: 4, moduleExams: 2, finalExam: 1 } });
+  eq([r.courseCompletion.requireCourseGradePass, r.courseCompletion.courseGradepass, r.courseCompletion.requireAllChapterActivities, r.courseCompletion.requireExams], [true, 70, false, false]);
+  eq(r.courseCompletion.profileFlags, { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: false }, 'legado intacto');
+  const p2 = defFinal();
+  p2.passingGrade = 80;
+  p2.overrides = { activity: 50, video: 50, exam: 60, finalExam: 90 };
+  const r2 = A.resolveAssessment(p2, { hasFinalExam: true, itemCounts: { practice: 4, moduleExams: 2, finalExam: 1 } });
+  eq([r2.courseGradepass, r2.courseCompletion.courseGradepass, r2.courseCompletion.requireCourseGradePass], [80, 80, true], 'overrides por tipo no cambian la nota del curso');
+  const r3 = A.resolveAssessment(defNoFinal(), { hasFinalExam: false, itemCounts: { practice: 0, moduleExams: 0 } });
+  eq([r3.withoutGrades, r3.courseCompletion.requireCourseGradePass, r3.courseCompletion.courseGradepass], [true, false, 0], 'sin nota');
+  const p4 = defFinal();
+  p4.passingGrade = 0;
+  throws(() => A.resolveAssessment(p4, { hasFinalExam: true, itemCounts: { practice: 4, moduleExams: 2, finalExam: 1 } }), /ASSESSMENT_UNENFORCEABLE: passingGrade=0/);
+  const p5 = defNoFinal();
+  p5.passingGrade = 0;
+  eq(A.resolveAssessment(p5, { hasFinalExam: false, itemCounts: { practice: 0, moduleExams: 0 } }).withoutGrades, true, 'sin nota con nota mínima 0: válido');
 });
 check('resolve: defaults sin examen final → 40/60', () => {
   const r = A.resolveAssessment(defNoFinal(), { hasFinalExam: false });
@@ -245,19 +267,17 @@ check('assertCategoriesPopulated: categoría con peso y sin ítems falla fuerte'
   p.categoryWeights = { practice: 0, moduleExams: 100 };
   A.assertCategoriesPopulated(A.resolveAssessment(p, { hasFinalExam: false }), { moduleExams: 1 });
 });
-check('completionCriteriaFor: según requireAllChapterActivities / requireExams', () => {
+check('r55 (R3): completionCriteriaFor nunca da criterios de actividad (cualquier política), y falla con un tipo desconocido', () => {
   const items = [
     { moduleId: 11, modname: 'scorm', kind: 'activity' },
     { moduleId: 12, modname: 'h5pactivity', kind: 'video' },
     { moduleId: 13, modname: 'quiz', kind: 'exam' },
     { moduleId: 14, modname: 'quiz', kind: 'finalExam' },
   ];
-  const base = { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: false, courseGradepass: 70, aggregation: 'all' };
-  eq(A.completionCriteriaFor(items, base).map((c) => c.moduleId), [11, 12, 13, 14]);
-  eq(A.completionCriteriaFor(items, { ...base, requireExams: false }).map((c) => c.moduleId), [11, 12, 14]); // EV6 T3: el final siempre
-  eq(A.completionCriteriaFor(items, { ...base, requireAllChapterActivities: false }).map((c) => c.moduleId), [13, 14]);
-  eq(A.completionCriteriaFor(items, { ...base, requireAllChapterActivities: false, requireExams: false }).map((c) => c.moduleId), [14]);
-  eq(A.completionCriteriaFor(items.slice(0, 3), { ...base, requireExams: false }).map((c) => c.moduleId), [11, 12]);
+  const base = { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: true, courseGradepass: 70, aggregation: 'all' };
+  for (const pol of [base, { ...base, requireExams: false }, { ...base, requireAllChapterActivities: false }, { ...base, requireCourseGradePass: false }]) {
+    eq(A.completionCriteriaFor(items, pol), [], JSON.stringify(pol));
+  }
   throws(() => A.completionCriteriaFor([{ moduleId: 1, modname: 'quiz', kind: 'x' }], base), /UNKNOWN_KIND/);
 });
 
@@ -379,18 +399,28 @@ check('courseCompletionXml: sin criterios → course_completion vacío; entradas
   throws(() => A.courseCompletionXml({ criteria: [{ moduleId: 1, modname: 'quiz' }, { moduleId: 1, modname: 'quiz' }], aggregation: 'all', requireCourseGradePass: false, courseGradepass: 70 }), /repetido/);
   throws(() => A.courseCompletionXml({ criteria: [], aggregation: 'any', requireCourseGradePass: false, courseGradepass: 70 }), /aggregation/);
 });
+check('r55 (R3): courseCompletionXml con SOLO el criterio de nota (curso con nota): un tipo 6 con gradepass, agregación ALL; gradepass 0 falla', () => {
+  const x = A.courseCompletionXml({ criteria: [], aggregation: 'all', requireCourseGradePass: true, courseGradepass: 70, courseId: 1 });
+  assertXml(x);
+  eq([...x.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], 'solo tipo 6');
+  ok(/<gradepass>70\.00000<\/gradepass>/.test(x), 'gradepass 70');
+  ok(/<course_completion_aggr_methd id="1">[\s\S]*<method>1<\/method>/.test(x), 'ALL');
+  throws(() => A.courseCompletionXml({ criteria: [], aggregation: 'all', requireCourseGradePass: true, courseGradepass: 0 }), /courseGradepass > 0/);
+});
 
 // ── quiz / scorm / h5pactivity ────────────────────────────────────────────
-const SAMPLE_QUIZ = '<?xml version="1.0" encoding="UTF-8"?>\n<activity><quiz id="1"><preferredbehaviour>deferredfeedback</preferredbehaviour><attempts_number>0</attempts_number><attemptonlast>0</attemptonlast><grademethod>1</grademethod><sumgrades>100.00000</sumgrades><grade>100.00000</grade><completionattemptsexhausted>0</completionattemptsexhausted><feedbacks><feedback id="1"><maxgrade>101.00000</maxgrade></feedback></feedbacks></quiz></activity>';
+const SAMPLE_QUIZ = '<?xml version="1.0" encoding="UTF-8"?>\n<activity><quiz id="1"><preferredbehaviour>deferredfeedback</preferredbehaviour><attempts_number>0</attempts_number><attemptonlast>0</attemptonlast><grademethod>1</grademethod><sumgrades>100.00000</sumgrades><grade>100.00000</grade><completionattemptsexhausted>0</completionattemptsexhausted><completionminattempts>0</completionminattempts><feedbacks><feedback id="1"><maxgrade>101.00000</maxgrade></feedback></feedbacks></quiz></activity>';
 // P2-B1 (EV6 Fase 2 — exámenes): completionattemptsexhausted vive aquí, junto a attempts_number, para
 // que los dos nunca puedan quedar en desacuerdo (1 si hay tope de intentos, 0 con intentos ilimitados).
-check('quizAttemptsXmlFields: attempts_number, grademethod (constantes de mod/quiz), sumgrades/grade 100, completionattemptsexhausted = (attempts > 0)', () => {
-  eq(A.quizAttemptsXmlFields({ attempts: 3, grademethod: 'highest' }), { preferredbehaviour: 'deferredfeedback', attempts_number: '3', grademethod: '1', sumgrades: '100.00000', grade: '100.00000', completionattemptsexhausted: '1' });
-  eq(A.quizAttemptsXmlFields({ attempts: 0, grademethod: 'highest' }).completionattemptsexhausted, '0', 'intentos ilimitados nunca se agotan');
+check('quizAttemptsXmlFields: attempts_number, grademethod (constantes de mod/quiz), sumgrades/grade 100, r55: completionminattempts = intentos, attemptsexhausted 0', () => {
+  eq(A.quizAttemptsXmlFields({ attempts: 3, grademethod: 'highest' }), { preferredbehaviour: 'deferredfeedback', attempts_number: '3', grademethod: '1', sumgrades: '100.00000', grade: '100.00000', completionattemptsexhausted: '0', completionminattempts: '3' });
+  eq(A.quizAttemptsXmlFields({ attempts: 0, grademethod: 'highest' }).completionattemptsexhausted, '0', 'sin regla «aprobar o agotar»');
+  eq(A.quizAttemptsXmlFields({ attempts: 0, grademethod: 'highest' }).completionminattempts, '0', 'ilimitados: sin mínimo');
+  eq(A.quizAttemptsXmlFields({ attempts: 1, grademethod: 'last' }).completionminattempts, '1');
   eq(['highest', 'average', 'first', 'last'].map((m) => A.quizAttemptsXmlFields({ attempts: 0, grademethod: m }).grademethod), ['1', '2', '3', '4']);
   const x = A.applyXmlFields(SAMPLE_QUIZ, A.quizAttemptsXmlFields({ attempts: 2, grademethod: 'average' }));
   assertXml(x);
-  eq([val(x, 'attempts_number'), val(x, 'grademethod'), val(x, 'maxgrade'), val(x, 'completionattemptsexhausted')], ['2', '2', '101.00000', '1']);
+  eq([val(x, 'attempts_number'), val(x, 'grademethod'), val(x, 'maxgrade'), val(x, 'completionattemptsexhausted'), val(x, 'completionminattempts')], ['2', '2', '101.00000', '0', '2']);
   throws(() => A.quizAttemptsXmlFields({ attempts: -1, grademethod: 'highest' }), /attempts/);
   throws(() => A.quizAttemptsXmlFields({ attempts: 1, grademethod: 'best' }), /grademethod/);
 });

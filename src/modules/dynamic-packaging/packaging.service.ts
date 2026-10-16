@@ -96,11 +96,12 @@ export interface PackageStatusResult {
    */
   pendingVideos?: Array<{ itemKey: string; chapterId: string; chapterNumber: number | null }>;
   /**
-   * EV6 H5P v2: el paquete lleva librerías H5P incluidas (Branching Scenario / «Repaso») ⇒ la UI
-   * muestra en «Cómo restaurarlo en Moodle» que hay que restaurar como administrador o gestor.
-   * Ausente en los paquetes de siempre.
+   * Instrucción de restauración del paquete para «Cómo restaurarlo en Moodle». r55 (builder ≥ 3.14.0):
+   * `site_library_pack` — tipos H5P fuera del pack v1 (QuestionSet 1.21 / caso ramificado / «Repaso»), todos solo
+   * contenido: el sitio necesita el Cursia H5P Library Pack v3. `admin_or_manager`: paquetes ≤ 3.13.0 (librerías
+   * incluidas, restaurar como administrador o gestor). Ausente en los paquetes de siempre.
    */
-  restore?: { as: 'admin_or_manager'; note: string };
+  restore?: { as: 'site_library_pack'; libraryPack: 'v3'; note: string } | { as: 'admin_or_manager'; note: string };
   /**
    * EV6 DoD: tipo de paquete. Solo `final` es entregable al cliente; `qa_preview` (run de vista
    * previa) y `degraded` (§2.6) son paquetes de QA rotulados «QA — vista previa, no entregable».
@@ -326,6 +327,7 @@ export class PackagingService {
     // reutilizar un .mbz (desde la metadata del artifact), así que el job basta.
     const restore = job.output_summary?.restore;
     if (restore && restore.as === 'admin_or_manager' && typeof restore.note === 'string') result.restore = { as: 'admin_or_manager', note: restore.note };
+    else if (restore && restore.as === 'site_library_pack' && typeof restore.note === 'string') result.restore = { as: 'site_library_pack', libraryPack: 'v3', note: restore.note };
     if (job.worker_status === 'completed') {
       const base = `${String(job.output_summary?.sourceIdsHash ?? job.id)}.mbz`;
       result.downloadFilename = deliverable ? base : `${QA_PACKAGE_FILENAME_PREFIX}${base}`;

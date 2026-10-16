@@ -203,10 +203,13 @@ export function defaultAssessmentProfile(opts: { finalExam: boolean }): Assessme
     categoryWeights: opts.finalExam
       ? { practice: 30, moduleExams: 50, finalExam: 20 }
       : { practice: 40, moduleExams: 60 },
+    // r55 (R3): estas banderas ya no deciden la completion del curso (el resolver fuerza el criterio de nota
+    // final y ningún criterio de actividad); se conservan en el esquema para leer perfiles guardados. El default
+    // refleja la regla real (nota del curso obligatoria).
     courseCompletion: {
       requireAllChapterActivities: true,
       requireExams: true,
-      requireCourseGradePass: false,
+      requireCourseGradePass: true,
     },
   };
 }

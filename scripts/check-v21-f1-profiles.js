@@ -147,6 +147,13 @@ const def = (finalExam) => PROF.defaultAssessmentProfile({ finalExam });
     eq(r.originalWeights, { practice: 40, moduleExams: 60 }, 'pesos originales');
     eq(B.assessmentPackageWarnings(r), ['course_without_grades'], 'aviso');
   });
+  await check('r55 (R3): resolveAssessment + itemCounts con nota → criterio de nota del curso SIEMPRE (true, 70) aunque el perfil guarde false', () => {
+    const p = def(false);
+    p.courseCompletion.requireCourseGradePass = false;
+    const r = A.resolveAssessment(p, { hasFinalExam: false, itemCounts: { practice: 2, moduleExams: 1, finalExam: 0 } });
+    eq([r.withoutGrades, r.courseCompletion.requireCourseGradePass, r.courseCompletion.courseGradepass, r.courseGradepass], [false, true, 70, 70], 'con nota');
+    eq([r.courseCompletion.requireAllChapterActivities, r.courseCompletion.requireExams], [false, false], 'sin criterios de actividad');
+  });
   await check('resolveAssessment: sin itemCounts = comportamiento R6 (sin campos nuevos); facts inválidos fallan fuerte; el perfil inaplicable sigue fallando', () => {
     const r = A.resolveAssessment(def(true), { hasFinalExam: true });
     assert(!('weightsNormalized' in r) && !('withoutGrades' in r) && r.categories.length === 3, 'R6 intacto');

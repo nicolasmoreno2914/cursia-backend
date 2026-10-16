@@ -364,7 +364,11 @@ function buildBankQuizV3(p: QuizV3Input, bank: QuizV3Bank): QuizV3Output {
   let instances = '';
   let slot = 0;
   for (const leaf of leaves) {
-    const filter = JSON.stringify({ filter: { category: { jointype: 1, values: [leaf.id], filteroptions: { includesubcategories: false } } } });
+    // r55 (moodle-versions.md): formato LEGADO de la condición del slot aleatorio. El paquete declara backup 4.1;
+    // 4.1/4.2 solo entienden `questioncategoryid` (con el formato 4.3+ `{"filter":{"category":…}}` la restauración
+    // deja el id viejo sin mapear y todo intento falla «no hay suficientes preguntas»). 4.3+ lo convierten al restaurar
+    // (convert_legacy_set_reference_filter_condition). Verificado en 4.1–4.5.
+    const filter = randomSlotFilterCondition(leaf.id);
     for (let k = 0; k < leaf.slots; k++) {
       slot++;
       instances += `      <question_instance id="${p.ids.take('qinstance')}">
@@ -572,4 +576,10 @@ export function scormActivityXmlV3(p: ScormV3Input): string {
     base,
     scormAssessmentFields({ maxgrade: 100, grademethod: 'highest', whatgrade: p.whatgrade, maxattempt: p.maxattempt, masteryoverride: 1 }),
   );
+}
+
+/** r55: `filtercondition` de un slot aleatorio en el formato legado (4.1/4.2; 4.3+ lo convierten). */
+export function randomSlotFilterCondition(categoryId: number): string {
+  if (!Number.isInteger(categoryId) || categoryId < 1) throw new Error(`MBZ_V3_INVARIANT: categoría de slot aleatorio inválida (${categoryId})`);
+  return JSON.stringify({ questioncategoryid: categoryId, includingsubcategories: 0 });
 }

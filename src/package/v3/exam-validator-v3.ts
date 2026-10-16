@@ -115,7 +115,7 @@ const num = (v: string | null | undefined): number => (v === null || v === undef
 /** Texto de un campo de pregunta según su formato (1 = HTML). */
 const fieldText = (raw: string, format: string | null): string => (format === '1' ? extractText(unxml(raw)) : unxml(raw));
 
-const MODULE_KEYS = ['idnumber', 'visible', 'completion', 'availability', 'downloadcontent', 'showdescription'];
+const MODULE_KEYS = ['idnumber', 'visible', 'visibleold', 'completion', 'availability', 'downloadcontent', 'showdescription'];
 
 export async function readExamPackageV3(zip: JSZip): Promise<ExamPkg> {
   const text = async (p: string): Promise<string> => (zip.file(p) ? zip.file(p)!.async('string') : '');
@@ -253,14 +253,16 @@ export function quizRandomIssues(pkg: ExamPkg, opts: ExamCheckOptions = {}): Exa
         add(where, 'filtercondition no es JSON');
         return;
       }
-      const cat = (fc as { filter?: { category?: { jointype?: unknown; values?: unknown; filteroptions?: { includesubcategories?: unknown } } } })?.filter?.category;
-      const values = Array.isArray(cat?.values) ? (cat!.values as unknown[]) : [];
-      const id = values.length === 1 ? Number(values[0]) : NaN;
-      const exact = JSON.stringify({ filter: { category: { jointype: 1, values: [id], filteroptions: { includesubcategories: false } } } });
-      if (JSON.stringify(fc) !== exact) {
-        add(where, `filtercondition ${JSON.stringify(fc)} ≠ una sola categoría con includesubcategories false`);
-        if (!Number.isInteger(id)) return;
+      // r55 (moodle-versions.md): formato LEGADO exacto {"questioncategoryid":N,"includingsubcategories":0} — el paquete
+      // declara backup 4.1 y 4.1/4.2 no entienden el formato 4.3+ ({"filter":{"category":…}}): restauran sin mapear la
+      // categoría y todo intento falla. 4.3+ convierten el legado al restaurar.
+      const legacy = fc as { questioncategoryid?: unknown; filter?: unknown };
+      const id = Number(legacy?.questioncategoryid);
+      if (legacy && typeof legacy === 'object' && 'filter' in legacy) add(where, `filtercondition en formato 4.3+ (${JSON.stringify(fc)}): el paquete declara backup 4.1 — usar {"questioncategoryid":N,"includingsubcategories":0}`);
+      else if (!Number.isInteger(id) || JSON.stringify(fc) !== JSON.stringify({ questioncategoryid: id, includingsubcategories: 0 })) {
+        add(where, `filtercondition ${JSON.stringify(fc)} ≠ {"questioncategoryid":N,"includingsubcategories":0}`);
       }
+      if (!Number.isInteger(id)) return;
       const c = catById.get(id);
       if (!c) return add(where, `la categoría ${id} no existe en questions.xml`);
       if (c.contextid !== q.ctx || c.contextlevel !== 70 || c.contextinstanceid !== q.mid) add(where, `la categoría ${id} no está en el contexto del quiz (ctx ${c.contextid}, nivel ${c.contextlevel}, instancia ${c.contextinstanceid})`);
@@ -318,16 +320,30 @@ export function explanationsGateIssues(pkg: ExamPkg): ExamIssue[] {
     const qi = seq.indexOf(q.mid);
     if (qi < 0 || seq[qi + 1] !== p.mid) add(P, `no va justo después del quiz en la secuencia de la sección (${seq.join(',')})`);
     const attempts = Number(tag(q.actXml, 'attempts_number'));
-    let wantAvail = '';
+    // r55 (R6): con intentos > 0, availability BYTE-EXACTA = completion del quiz (e=1 | e=3), que con
+    // completionminattempts = intentos solo se cumple al usarlos todos (QUIZ_COMPLETION lo verifica); el builder no
+    // fija `timeclose` (si un perfil lo hiciera, el OR de fecha entra aquí). Con intentos ilimitados: sin availability
+    // y OCULTA (visible=0) hasta que el docente la muestre.
+    let wantAvail: string | null | undefined;
+    const timeclose = Number(tag(q.actXml, 'timeclose') ?? 0) || 0;
     try {
-      wantAvail = examExplanationsAvailability(q.mid, attempts);
+      wantAvail = examExplanationsAvailability(q.mid, attempts, timeclose);
     } catch (err) {
       add(W, `attempts_number inválido (${tag(q.actXml, 'attempts_number')})`);
     }
-    if (wantAvail && p.module.availability !== wantAvail) add(P, `availability ${p.module.availability || '(vacía)'} ≠ ${wantAvail} (attempts_number ${attempts})`);
+    const NULLV = '$@NULL@$';
+    if (wantAvail !== undefined) {
+      // El module.xml guarda el JSON escapado como texto XML; un `&`/`<` crudo es XML inválido (falla de restauración).
+      const raw = p.module.availability || NULLV;
+      // (un & / < crudo lo reporta STRUCTURE en mbz-validator-v3 para TODO módulo)
+      const got = unxml(raw);
+      if (got !== (wantAvail ?? NULLV)) add(P, `availability ${got} ≠ ${wantAvail ?? NULLV} (attempts_number ${attempts})`);
+    }
     if (p.module.downloadcontent !== '0') add(P, `downloadcontent ${p.module.downloadcontent} ≠ 0`);
     if (p.module.completion !== '0') add(P, `completion ${p.module.completion} ≠ 0`);
-    if (p.module.visible !== '1') add(P, `visible ${p.module.visible} ≠ 1 (la oculta availability con show:false, no visible=0)`);
+    if (wantAvail === null) {
+      if (p.module.visible !== '0' || p.module.visibleold !== '0') add(P, `visible/visibleold ${p.module.visible}/${p.module.visibleold} ≠ 0/0 (intentos ilimitados: oculta hasta que el docente la muestre)`);
+    } else if (p.module.visible !== '1') add(P, `visible ${p.module.visible} ≠ 1 (la oculta availability con show:false, no visible=0)`);
     if (pkg.courseCriteria.includes(p.mid)) add(P, 'la página es criterio de completion del curso');
     if (!extractText(p.content).trim()) add(P, 'contenido vacío');
     else {

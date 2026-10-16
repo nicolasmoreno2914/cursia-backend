@@ -4,13 +4,12 @@
 // estudiante, sin atajos en la parte de la insignia):
 //   1. «Habilitar acceso» a la insignia (core la restaura SIEMPRE inactiva);
 //   2. crea un usuario de prueba y lo matricula como estudiante (enrol manual);
-//   3. aprueba (nota REAL en el grade_item; Moodle calcula la completion por nota aprobatoria) los
-//      criterios de completion del curso MENOS el último (la evaluación final si existe) y corre la
-//      tarea real de completion (\core\task\completion_regular_task): sin curso completo ni insignia;
-//   4. el último criterio primero REPROBADO (nota < gradepass → COMPLETION_COMPLETE_FAIL: sin
-//      insignia) y luego APROBADO (nota ≥ gradepass → COMPLETION_COMPLETE_PASS); tarea otra vez:
-//      curso completo → evento course_completed → observer de core_badges →
-//      insignia otorgada y PNG «horneado» (Open Badges) en el perfil del usuario.
+//   3. r55 (R3): todos los ítems calificables por DEBAJO de la nota mínima del curso (nota REAL en su grade_item) y
+//      la tarea real de completion ×2 (\core\task\completion_regular_task): nota final < mínimo → sin curso completo
+//      ni insignia;
+//   4. todo a 100 salvo la evaluación final REPROBADA: nota final ≥ mínimo → curso completo (un ítem bajo su nota
+//      mínima no bloquea) → evento course_completed → observer de core_badges → insignia otorgada y PNG
+//      «horneado» (Open Badges) en el perfil del usuario.
 // Crea un usuario y datos de completion en ESE curso de prueba; no cambia configuración del sitio.
 //
 // Uso: php -c php.ini v21-certificate-award.php <input.json> <output.json>   (input: { moodleRoot, courseid })
@@ -112,101 +111,45 @@ $runTask = function (): void {
     ob_end_clean();
 };
 
-// Criterios de completion del curso (tipo actividad), la evaluación final al final.
+// r55 (R3): la completion del curso es UN criterio de nota (tipo 6); no hay criterios de actividad.
 $modinfo = get_fast_modinfo($course);
-$crit = [];
-foreach ($DB->get_records('course_completion_criteria', ['course' => $courseid, 'criteriatype' => COMPLETION_CRITERIA_TYPE_ACTIVITY], 'id') as $cr) {
-    $cm = $modinfo->get_cm((int)$cr->moduleinstance);
-    $crit[] = $cm;
-}
-$other = $DB->count_records_select('course_completion_criteria', 'course = ? AND criteriatype <> ?', [$courseid, COMPLETION_CRITERIA_TYPE_ACTIVITY]);
-$out['criteriaCount'] = count($crit);
-$out['otherCriteria'] = $other;
-usort($crit, fn($a, $b) => (int)($a->idnumber === 'cv3:final_exam') <=> (int)($b->idnumber === 'cv3:final_exam'));
-$last = end($crit);
-$out['lastIdnumber'] = $last ? $last->idnumber : null;
-
+$out['criteriaCount'] = $DB->count_records('course_completion_criteria', ['course' => $courseid, 'criteriatype' => COMPLETION_CRITERIA_TYPE_ACTIVITY]);
+$out['otherCriteria'] = $DB->count_records_select('course_completion_criteria', 'course = ? AND criteriatype <> ?', [$courseid, COMPLETION_CRITERIA_TYPE_ACTIVITY]);
+$gc = $DB->get_record('course_completion_criteria', ['course' => $courseid, 'criteriatype' => COMPLETION_CRITERIA_TYPE_GRADE]);
+$gradepass = $gc ? (float)$gc->gradepass : null;
+$out['gradeCriterion'] = $gradepass;
 $completion = new completion_info($course);
-// P2-B1: un quiz con completionattemptsexhausted = 1 (attempts > 0) ya NO completa solo con la nota
-// — reprobar con intentos restantes queda INCOMPLETE (ver P2-design.md §1). Para reproducir
-// COMPLETE_FAIL de verdad hace falta agotar intentos REALES (como simulate-b1.php), no escribir la
-// nota a mano. $gen se crea perezosamente: solo si hay algún quiz entre los criterios.
-$gen = null;
-$doQuizAttempt = function ($cm, $correct) use (&$gen, $userid): int {
-    global $DB;
-    if ($gen === null) $gen = new \testing_data_generator();
-    $admin = get_admin();
-    \core\session\manager::set_user($DB->get_record('user', ['id' => $userid]));
-    $quizgen = $gen->get_plugin_generator('mod_quiz');
-    $attempt = $quizgen->create_attempt($cm->instance, $userid);
-    $ao = quiz_attempt::create($attempt->id);
-    $post = [];
-    foreach ($ao->get_slots() as $slot) {
-        $qa = $ao->get_question_attempt($slot);
-        $q = $qa->get_question();
-        $right = $q->get_correct_response();
-        if ($q->get_type_name() === 'multichoice') {
-            $resp = ['answer' => $correct ? $right['answer'] : (($right['answer'] + 1) % count($q->get_order($qa)))];
-        } else if ($q->get_type_name() === 'match') {
-            // P2-B3: los bancos traen emparejamiento; incorrecto = rotar las elecciones correctas (todas distintas).
-            $vals = array_values($right);
-            $resp = $correct ? $right : array_combine(array_keys($right), array_merge(array_slice($vals, 1), array_slice($vals, 0, 1)));
-        } else { // truefalse
-            $resp = ['answer' => $correct ? $right['answer'] : 1 - $right['answer']];
-        }
-        $post[$qa->get_control_field_name('sequencecheck')] = (string)$qa->get_sequence_check_count();
-        foreach ($resp as $k => $v) { $post[$qa->get_qt_field_name($k)] = (string)$v; }
-    }
-    $ao->process_submitted_actions(time(), false, $post);
-    $ao->process_finish(time(), false);
-    \core\session\manager::set_user($admin);
-    return (int)$attempt->id;
-};
-// Ítem calificable: nota REAL en su grade_item (la completion por nota aprobatoria la calcula Moodle);
-// ítem por vista (Libro Guía de un curso sin nota): completion marcada. Un quiz toma intentos REALES
-// (fallidos hasta agotar `attempts`, o uno correcto para aprobar) en vez de escribir la nota a mano,
-// para que `completionattemptsexhausted` participe de verdad en la completion (P2-B1).
-$mark = function ($cm, bool $pass) use ($completion, $userid, $courseid, $doQuizAttempt): array {
-    global $DB;
-    if ($cm->modname === 'quiz') {
-        $attempts = (int)$DB->get_field('quiz', 'attempts', ['id' => $cm->instance]);
-        if ($pass) {
-            $doQuizAttempt($cm, true);
-        } else {
-            // Agota TODOS los intentos permitidos (o uno solo si son ilimitados — nunca se agota).
-            foreach (range(1, max(1, $attempts)) as $_) { $doQuizAttempt($cm, false); }
-        }
-        $raw = null;
-        $completion->update_state($cm, COMPLETION_UNKNOWN, $userid);
-    } else if ((int)$cm->completionpassgrade === 1) {
-        $gi = grade_item::fetch(['courseid' => $courseid, 'itemtype' => 'mod', 'itemmodule' => $cm->modname, 'iteminstance' => $cm->instance, 'itemnumber' => 0]);
-        $raw = $pass ? min(100, (float)$gi->gradepass + 20) : max(0, (float)$gi->gradepass - 30);
+// Ítems calificables (los que entran en la nota final): nota REAL en su grade_item (grade_update, la vía de la
+// actividad). El criterio de nota lo evalúa completion_regular_task (dos pasadas: moodle-versions.md).
+$graded = array_values(array_filter($modinfo->get_cms(), fn($cm) => (bool)preg_match('/^cv3:(ch:[^:]+:(video|activity)|exam:.+|final_exam)$/', (string)$cm->idnumber)));
+$setAll = function (callable $rawOf) use ($graded, $courseid, $userid, $completion): array {
+    $marks = [];
+    foreach ($graded as $cm) {
+        $raw = $rawOf($cm);
         grade_update('mod/' . $cm->modname, $courseid, 'mod', $cm->modname, $cm->instance, 0, ['userid' => $userid, 'rawgrade' => $raw]);
         $completion->update_state($cm, COMPLETION_UNKNOWN, $userid);
-    } else {
-        $completion->update_state($cm, COMPLETION_COMPLETE, $userid, true);
-        $raw = null;
+        $marks[] = ['idnumber' => $cm->idnumber, 'rawgrade' => $raw];
     }
-    $st = (int)$GLOBALS['DB']->get_field('course_modules_completion', 'completionstate', ['coursemoduleid' => $cm->id, 'userid' => $userid]);
-    return ['idnumber' => $cm->idnumber, 'rawgrade' => $raw, 'completionstate' => $st];
+    grade_regrade_final_grades($courseid);
+    return $marks;
 };
-
+$courseGrade = function () use ($courseid, $userid) {
+    $g = grade_item::fetch_course_item($courseid)->get_final($userid);
+    return $g && $g->finalgrade !== null ? round((float)$g->finalgrade, 2) : null;
+};
+$runTwice = function () use ($runTask) { $runTask(); $runTask(); };
 $out['beforeAny'] = $state();
 $out['marks'] = [];
-if (count($crit) > 1) {
-    foreach (array_slice($crit, 0, -1) as $cm) { $out['marks'][] = $mark($cm, true); }
-    $runTask();
-    $out['withoutLast'] = $state();
+if ($gradepass !== null && $graded) {
+    // Todo por debajo del mínimo del curso → nota final < mínimo → ni curso completo ni insignia.
+    $out['marks']['low'] = $setAll(fn($cm) => max(0, $gradepass - 30));
+    $runTwice();
+    $out['low'] = $state() + ['courseGrade' => $courseGrade()];
+    // La evaluación final reprobada pero la nota final ≥ mínimo → curso completo (r55: no hace falta aprobar cada ítem).
+    $out['marks']['high'] = $setAll(fn($cm) => $cm->idnumber === 'cv3:final_exam' ? max(0, $gradepass - 30) : 100);
+    $runTwice();
 }
-if ($last && (int)$last->completionpassgrade === 1) {
-    // El último (la evaluación final si existe) REPROBADO: el curso sigue sin completarse.
-    $out['marks'][] = $mark($last, false);
-    $runTask();
-    $out['lastFailed'] = $state();
-}
-if ($last) { $out['marks'][] = $mark($last, true); }
-$runTask();
-$after = $state();
+$after = $state() + ['courseGrade' => $courseGrade()];
 $issued = $DB->get_record('badge_issued', ['badgeid' => $badge->id, 'userid' => $userid]);
 if ($issued) {
     $after['dateissued'] = (int)$issued->dateissued;

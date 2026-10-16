@@ -81,13 +81,21 @@ encendido en los cursos nuevos creados con H5P v2 y nunca en cursos de motor SCO
 El pack v2 también incluye de nuevo los 7 paquetes de v1 (mismas versiones), así
 que un sitio nuevo puede usar solo el pack v2.
 
-**Restaurar como administrador o gestor.** Los paquetes `.h5p` de estos dos tipos
-llevan sus librerías ADENTRO: si el curso lo restaura un **administrador o un
-gestor**, Moodle instala esas librerías automáticamente la primera vez que se abre
-la actividad y no hace falta ningún paso manual. Si lo restaura un **docente** en
-un sitio que todavía no tiene esos tipos de contenido, Moodle muestra «Missing main
-library» en esas actividades: en ese caso un administrador sube una vez el pack v2
-(mismos pasos de la opción A) y desde ahí cualquier docente puede restaurar.
+**Requisito del sitio (builder ≥ 3.14.0, r55).** Los `.h5p` de estos dos tipos son
+**solo contenido**, igual que los de v1: no traen carpetas de librería. El sitio necesita
+el pack v3 (que incluye estos dos y los 7 de v1, ver abajo) instalado una vez por un
+administrador; desde ahí **cualquier docente** puede restaurar. Sin el pack, la actividad
+muestra «Missing main library» (falla limpia, sin colgar el sitio).
+
+Hasta el builder 3.13.0 estos `.h5p` llevaban adentro sus carpetas «delta» (las
+librerías que no están en v1) y se pedía restaurar como administrador o gestor. Eso
+se retiró: a un docente nunca le servía (Moodle ignora las carpetas si el dueño del
+archivo no puede instalar librerías) y una **clausura parcial** de una librería ya
+instalada hace que `H5PValidator::isValidPackage` (h5plib v128, modo «solo
+actualizar») entre en un bucle infinito cuando un mismo proceso PHP despliega varios
+paquetes con dueños de permisos distintos (CLI, listado del banco de contenido,
+servicios web en lote). El validador del paquete (`H5P_LIBRARIES`,
+`H5P_PARTIAL_LIBRARY_CLOSURE`) ahora rechaza cualquier carpeta de librería.
 
 Construcción y verificación:
 
@@ -115,12 +123,12 @@ navegación «Siguiente ›» / «Anterior». Ningún patch 1.20.x lo corrige.
 El pack v3 incluye además los otros 8 paquetes de v2 (mismas versiones), así que un
 sitio nuevo puede usar solo el pack v3.
 
-**Restaurar como administrador o gestor.** Igual que el caso ramificado y el «Repaso»,
-el `.h5p` del conjunto de preguntas lleva su librería (`H5P.QuestionSet-1.21`) adentro:
-con restauración de administrador o gestor Moodle la instala sola. Si restaura un
-**docente** en un sitio que todavía no tiene QuestionSet 1.21, la actividad muestra
-«Missing main library»: un administrador sube una vez el pack v3 (opción A) y desde ahí
-cualquier docente puede restaurar.
+**Requisito del sitio.** Desde el builder 3.14.0 (r55) el `.h5p` del conjunto de preguntas
+es solo contenido: el sitio necesita el pack v3 (opción A, una vez, un administrador) y
+desde ahí cualquier docente restaura. Es el requisito que la entrega declara en «Cómo
+restaurarlo en Moodle» (`summary.restore = { as: 'site_library_pack', libraryPack: 'v3' }`)
+para todo curso con QuestionSet 1.21, caso ramificado o «Repaso»; el preflight
+`node scripts/h5p-preflight-moodle.js <moodleDir> <php.ini> --profile v3` lo verifica.
 
 **Cursos ya entregados.** Siguen funcionando con QuestionSet 1.20 (las dos versiones
 conviven en el sitio; Moodle no migra contenido de una minor a otra), pero conservan el
@@ -137,4 +145,15 @@ node scripts/h5p-preflight-moodle.js <moodleDir> <php.ini> --profile v3
 
 Las carpetas delta salen del store versionado `assets/h5p-libs/v3` (las 19 de v2, byte a
 byte iguales, + `H5P.QuestionSet-1.21`, MIT, github.com/h5p/h5p-question-set); nada se
-descarga.
+descarga. Desde r55 el store solo arma el pack (los paquetes de curso no llevan librerías).
+
+## Calificación y aprobación (builder ≥ 3.14.0, r55)
+
+- Las actividades H5P **evaluativas** (video interactivo, conjunto de preguntas, arrastrar
+  palabras, completar espacios, caso ramificado) llevan seguimiento (`enabletracking=1`),
+  nota 0–100 en su categoría del libro de calificaciones y se completan **al recibir nota**
+  (su nota mínima es informativa).
+- El «Repaso» (tarjetas) es **pedagógico**: sin nota, sin seguimiento, completion por vista,
+  nunca criterio del curso.
+- El curso se aprueba **solo por la calificación final** (criterio «Calificación del curso» ≥
+  la nota mínima del perfil, por defecto 70/100); no hay criterios por actividad.

@@ -23,22 +23,32 @@ import { groundColor } from '../visual-components/render';
 import { inlineHtml, labelHtml } from '../visual-components/text';
 import type { GiftQuestion } from '../../package/mbz-common';
 import type { ExamBankQuestion, ExamBankV1 } from './exam-bank';
+import type { CourseFacts } from './facts';
 import { EXAM_QUESTION_TYPES } from './exam-bank';
 import { Hx, Surf, bgSurf, eyebrow, hx, pHtml, root, shellFail, st, unprotectedText } from './html';
 
 /**
- * EV6 P2-B4 (P2-design §1.3, ruling 1): con intentos limitados la página se desbloquea si el quiz está
- * completo (e=1, que también acepta COMPLETE_PASS) O completo-y-reprobado (e=3 = intentos agotados,
- * gracias a completionattemptsexhausted=1). `show:false`: oculta hasta entonces.
- * Fix 1 (C1): con intentos ILIMITADOS (attempts 0) B1 emite completionattemptsexhausted=0 y Moodle marca
- * COMPLETE_FAIL tras UN intento reprobado → e=3 abriría el banco y el estudiante reintentaría con las
- * respuestas. Ahí la condición es SOLO aprobar (e=1).
+ * r55 (R6): «Respuestas explicadas» se habilita SOLO al agotar los intentos (o al cerrar el examen):
+ * - intentos > 0: el quiz lleva `completionminattempts = intentos` (y recibir nota), así que su completion pasa a
+ *   COMPLETE_PASS (e=1, que acepta COMPLETE y COMPLETE_PASS) o COMPLETE_FAIL (e=3) recién con el ÚLTIMO intento —
+ *   aprobar antes NO la abre (verificado en el Moodle 4.5 local: scripts/moodle/check-grading-scenarios.php).
+ *   Si el examen tiene fecha de cierre (`timeclose` > 0; hoy ningún perfil la fija), se suma una condición OR de
+ *   fecha ≥ cierre.
+ * - intentos ilimitados (0) y sin fecha de cierre: `null` — la página va OCULTA (visible=0) hasta que el docente
+ *   la muestre (nota para docentes, EXAMS_TEACHER_NOTE_UNLIMITED); con completion por nota, un solo intento ya
+ *   completaría el quiz y abriría las respuestas mientras quedan intentos.
+ * `show:false`: oculta del todo hasta que se cumpla. Antes (EV6 P2-B4): e=1 | e=3 con completionpassgrade +
+ * completionattemptsexhausted, que la abría al APROBAR con intentos restantes.
  */
-export function examExplanationsAvailability(quizMid: number, attempts: number): string {
+export function examExplanationsAvailability(quizMid: number, attempts: number, timeclose = 0): string | null {
   if (!Number.isInteger(quizMid) || quizMid < 1) throw new Error(`MBZ_V3_INVARIANT: moduleid de quiz inválido (${quizMid})`);
   if (!Number.isInteger(attempts) || attempts < 0) throw new Error(`MBZ_V3_INVARIANT: intentos inválidos (${attempts})`);
-  if (attempts === 0) return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1}]}`;
-  return `{"op":"|","show":false,"c":[{"type":"completion","cm":${quizMid},"e":1},{"type":"completion","cm":${quizMid},"e":3}]}`;
+  if (!Number.isInteger(timeclose) || timeclose < 0) throw new Error(`MBZ_V3_INVARIANT: timeclose inválido (${timeclose})`);
+  const c: string[] = [];
+  if (attempts > 0) c.push(`{"type":"completion","cm":${quizMid},"e":1}`, `{"type":"completion","cm":${quizMid},"e":3}`);
+  if (timeclose > 0) c.push(`{"type":"date","d":">=","t":${timeclose}}`);
+  if (!c.length) return null;
+  return `{"op":"|","show":false,"c":[${c.join(',')}]}`;
 }
 
 /** Nombre de la página (P2-task-B4 §1). */
@@ -57,18 +67,34 @@ export const EXAMS_TEACHER_NOTE_AVAILABILITY =
   'Las páginas de “Respuestas explicadas” necesitan el acceso condicional de Moodle activado; si un estudiante las ve antes de presentar la evaluación, actívalo en Administración del sitio. ' +
   'Si el curso ya se restauró con el acceso condicional desactivado, actívalo y vuelve a restaurar el curso, o agrega a cada página “Respuestas explicadas” la restricción “Finalización de actividad” de su evaluación.';
 export const EXAMS_TEACHER_NOTE_ATTEMPTS =
-  'Dar intentos adicionales a un estudiante que agotó una evaluación sin aprobar es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”.';
+  'Cada página de “Respuestas explicadas” se abre cuando el estudiante usa todos los intentos de su evaluación. ' +
+  'Dar intentos adicionales a un estudiante que ya los usó es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”. ' +
+  'Si marcas a mano una evaluación como completada para un estudiante, su página de “Respuestas explicadas” también se le abre.';
 export const EXAMS_TEACHER_NOTE = `${EXAMS_TEACHER_NOTE_AVAILABILITY} ${EXAMS_TEACHER_NOTE_ATTEMPTS}`;
+/** r55 (R6): con intentos ilimitados la página queda oculta hasta que el docente la muestre. */
+export const EXAMS_TEACHER_NOTE_UNLIMITED =
+  'Las evaluaciones con intentos ilimitados no abren solas sus “Respuestas explicadas”: la página queda oculta; muéstrala tú (Mostrar en la página del curso) cuando cierres la evaluación.';
+
+/** r55: ¿alguna evaluación del curso (módulo o final) tiene intentos ilimitados? */
+export function examsHaveUnlimitedAttempts(facts: CourseFacts): boolean {
+  const k = facts.assessment.kinds;
+  return (facts.counts.exams > 0 && k.exam.attempts === 0) || (facts.finalExam.enabled && k.finalExam.attempts === 0);
+}
+
+/** Nota para docentes completa de «Respuestas explicadas» (la del label del certificado). */
+export function examsTeacherNoteFor(facts: CourseFacts): string {
+  return examsHaveUnlimitedAttempts(facts) ? `${EXAMS_TEACHER_NOTE} ${EXAMS_TEACHER_NOTE_UNLIMITED}` : EXAMS_TEACHER_NOTE;
+}
 
 /**
- * Línea del label de información del examen (P2-task-B4 §4), de facts: intentos > 0 → «… cuando
- * apruebes o cuando uses tus N intentos.»; 0 (ilimitados) → «… cuando apruebes.». Con un GIFT
- * (sin explicaciones) no promete «su explicación».
+ * Línea del label de información del examen (P2-task-B4 §4), de facts. r55 (R6): intentos > 0 → «… cuando uses
+ * tus N intentos.» (aprobar antes no las abre); 0 (ilimitados) → «… cuando tu docente cierre la evaluación.».
+ * Con un GIFT (sin explicaciones) no promete «su explicación».
  */
 export function examExplanationsInfoText(attempts: number, explained: boolean): string {
   if (!Number.isInteger(attempts) || attempts < 0) shellFail(`intentos inválidos (${attempts})`);
   const what = explained ? 'Las respuestas correctas y su explicación se habilitan' : 'Las respuestas correctas se habilitan';
-  const when = attempts === 0 ? 'cuando apruebes' : attempts === 1 ? 'cuando apruebes o cuando uses tu único intento' : `cuando apruebes o cuando uses tus ${attempts} intentos`;
+  const when = attempts === 0 ? 'cuando tu docente cierre la evaluación' : attempts === 1 ? 'cuando uses tu único intento' : `cuando uses tus ${attempts} intentos`;
   // QUIZFB (re-verificación #542, R1): con la revisión sin notas por pregunta (builder 3.9.0) la nota del intento NO
   // aparece en la página del cuestionario hasta unos minutos después; lo que se ve AL TERMINAR es el mensaje de
   // «aprobaste / todavía no» (retroalimentación global, examOverallFeedbackBands) y la nota en Calificaciones.
@@ -94,7 +120,12 @@ export interface ExamOverallFeedbackBand {
 export function examOverallFeedbackBands(passingGrade: number, attempts: number): ExamOverallFeedbackBand[] {
   if (!Number.isFinite(passingGrade) || passingGrade <= 0 || passingGrade > 100) shellFail(`nota mínima inválida (${passingGrade})`);
   if (!Number.isInteger(attempts) || attempts < 0) shellFail(`intentos inválidos (${attempts})`);
-  const pass = `Aprobaste esta evaluación: alcanzaste la nota mínima de ${passingGrade} de 100. Ya puedes repasar las respuestas correctas en «${EXAM_EXPLANATIONS_SHORT}», justo debajo.`;
+  // r55 (R6): «Respuestas explicadas» abre solo al usar TODOS los intentos (con 1, ya está abierta).
+  const pass = attempts === 1
+    ? `Aprobaste esta evaluación: alcanzaste la nota mínima de ${passingGrade} de 100. Ya puedes repasar las respuestas correctas en «${EXAM_EXPLANATIONS_SHORT}», justo debajo.`
+    : attempts === 0
+      ? `Aprobaste esta evaluación: alcanzaste la nota mínima de ${passingGrade} de 100. Tu docente habilita las «${EXAM_EXPLANATIONS_SHORT}» al cerrar la evaluación.`
+      : `Aprobaste esta evaluación: alcanzaste la nota mínima de ${passingGrade} de 100. Las «${EXAM_EXPLANATIONS_SHORT}» se habilitan cuando uses todos tus intentos.`;
   const retry = attempts === 1
     ? `Todavía no alcanzas la nota mínima de ${passingGrade} de 100. Este era tu único intento: las respuestas correctas ya están en «${EXAM_EXPLANATIONS_SHORT}», justo debajo.`
     : attempts === 0

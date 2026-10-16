@@ -256,7 +256,8 @@ async function pureChecks() {
     attempts: { activity: 0, video: 0, exam: 3, finalExam: 3 },
     gradeMethod: { activity: 'highest', video: 'highest', exam: 'highest', finalExam: 'highest' },
   };
-  const COMPLETION = { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: false };
+  // r55 (R3): el default refleja la regla real (nota del curso obligatoria); las otras dos banderas son legado sin efecto.
+  const COMPLETION = { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: true };
 
   await check('perfiles: defaultAssessmentProfile con examen final (30/50/20) y sin (40/60), exactos y válidos', () => {
     const withF = profiles.defaultAssessmentProfile({ finalExam: true });

@@ -192,6 +192,12 @@ export interface CourseFacts {
   assessment: {
     assessmentProfileVersion: number;
     kinds: Record<AssessableType, AssessmentFactsKind>;
+    /**
+     * r55 (R3/R4): nota mínima del CURSO (`passingGrade` base del perfil, 0–100) — la que aprueba el curso por la
+     * nota final y la que nombran el cierre, el certificado y la info de las evaluaciones. Opcional solo para
+     * leer facts guardados antes de r55; `buildCourseFacts` la emite siempre.
+     */
+    coursePassingGrade?: number;
   };
   audio: {
     welcomeSeconds: number;
@@ -492,7 +498,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     chapters,
     modules,
     finalExam: { enabled: features.finalExam, questionCount: finalQ, ...(finalBank !== undefined ? { bankSize: finalBank } : {}) },
-    assessment: { assessmentProfileVersion: assessment.assessmentProfileVersion, kinds },
+    assessment: { assessmentProfileVersion: assessment.assessmentProfileVersion, kinds, coursePassingGrade: assessment.passingGrade },
     audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
@@ -575,6 +581,7 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
     add(facts.assessment.kinds[k].passingGrade);
     add(facts.assessment.kinds[k].attempts);
   }
+  add(facts.assessment.coursePassingGrade);
   add(100); // "N de 100": escala fija de la nota (§K.1), no un dato inventado.
   if (facts.hours) add(facts.hours.value);
   add(facts.libro.wordCount);

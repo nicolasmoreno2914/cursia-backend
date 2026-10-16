@@ -58,14 +58,11 @@ import {
   H5P_MOODLE_GRADING,
   H5P_PACKAGE_MIMETYPE,
   H5pBuiltContent,
-  H5pLibrarySource,
   assertH5pGradableInMoodle,
   buildBlanks,
   buildBranchingScenario,
-  buildBundledH5p,
   buildContentOnlyH5p,
   buildDialogCardsFromExperience,
-  openH5pLibraryStore,
   validateBranchingScenarioInput,
   buildDragText,
   buildQuestionSet,
@@ -107,7 +104,9 @@ import {
   audioWelcomeLabel,
   audiobookLabel,
   buildCourseFacts,
+  CertificateRequirements,
   certificateTeacherLabel,
+  courseApprovalRequirements,
   closingLabel,
   competenciesLabel,
   examExplanationsBankPage,
@@ -243,8 +242,16 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * capítulo de contenido con ejercicios guiados lleva la página «Ejercicios guiados — <capítulo>» (`cv3:ch:<id>:guided_practice`,
  * visible, completion por vista) después de la síntesis y antes de la actividad, y los mismos ejercicios al final del
  * capítulo en el Libro Guía (sin sumar palabras al Libro).
+ * 3.14.0 (r55, invariantes de calificación — se calcula TODO al empaquetar, sin regenerar contenido): el curso se
+ * aprueba SOLO por la nota final — completion.xml con UN criterio de nota del curso (tipo 6, gradepass = nota mínima
+ * del curso = gradepass del ítem del curso) y ningún criterio de actividad; cada ítem calificable se completa al
+ * recibir nota (completionpassgrade 0, su gradepass queda informativo); quiz con completionminattempts = intentos y
+ * completionattemptsexhausted 0, y «Respuestas explicadas» abre solo al usar todos los intentos (oculta con intentos
+ * ilimitados); textos del cierre, certificado, insignia, notas para docentes y evaluaciones con la regla real
+ * («calificación final ≥ X/100…»); todos los .h5p solo contenido (QuestionSet 1.21, caso ramificado y «Repaso» sin
+ * carpetas de librería: requisito del sitio = pack v3, summary.restore `site_library_pack`).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.13.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.14.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -381,7 +388,8 @@ export interface BuildDynamicMbzV3Result {
     /** F1 (I3): resultado de la normalización de pesos (ver `assessmentPackageSummary`). */
     assessment: AssessmentPackageSummary;
     /** EV6 H5P v2: solo si el paquete lleva librerías H5P incluidas (restaurar como administrador o gestor). */
-    restore?: { as: 'admin_or_manager'; note: string };
+    /** r55: `site_library_pack` (≥ 3.14.0); `admin_or_manager` solo en paquetes ≤ 3.13.0. */
+    restore?: { as: 'site_library_pack'; libraryPack: 'v3'; note: string } | { as: 'admin_or_manager'; note: string };
     /** r19 (L): Libro Guía en PDF — archivo, páginas y el logo usado como marca de agua. */
     libro: { filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string };
   };
@@ -671,7 +679,6 @@ async function buildActivityH5p(
   passingGrade: number,
   expectedType: H5pActivityTypeV2 | null,
   activityTypeRules: number | undefined,
-  libraryStore: () => H5pLibrarySource,
 ): Promise<{ h5p: Buffer; mainLibrary: string }> {
   if (!expectedType) throw new Error(`MBZ_V3_INVARIANT: facts sin tipo h5p para ${itemKey}`);
   const check = validateH5pActivityPayload(payload, {
@@ -692,18 +699,18 @@ async function buildActivityH5p(
     input.passPercentage = passingGrade;
     validateQuestionSetInput(input);
     // UX #5 (r18): QuestionSet 1.21 (CURSIA_H5P_PROFILE_V3) — su navegación «Siguiente ›» / «Anterior»
-    // es compatible con el tema de H5P.Question 1.5 (en 1.20 era un botón azul vacío). Lleva su delta
-    // (H5P.QuestionSet-1.21) dentro del .h5p, como BS y DC: un sitio con el pack v1 la instala al
-    // restaurar como administrador o gestor (o con el pack v3 instalado, cualquier docente).
+    // es compatible con el tema de H5P.Question 1.5 (en 1.20 era un botón azul vacío).
+    // r55 (R7): solo contenido, como IV/DragText/Blanks: QuestionSet 1.21 viene en el Cursia H5P Library Pack v3
+    // (requisito del sitio, summary.restore). Antes llevaba su delta (H5P.QuestionSet-1.21) adentro: una clausura
+    // parcial que puede colgar el validador de H5P de Moodle (dialogcards-diagnosis.md).
     const qs = buildQuestionSet(input, { profile: CURSIA_H5P_PROFILE_V3 });
     assertH5pGradableInMoodle(qs.mainLibrary);
-    const h5p = await buildBundledH5p({
+    const h5p = await buildContentOnlyH5p({
       mainLibrary: qs.mainLibrary,
       content: qs.content,
       title: qs.title,
       language: 'es',
       profile: CURSIA_H5P_PROFILE_V3,
-      libraryStore: libraryStore(),
     });
     return { h5p, mainLibrary: qs.mainLibrary };
   } else if (p.type === 'dragtext') {
@@ -715,21 +722,20 @@ async function buildActivityH5p(
     validateBlanksInput(input);
     built = buildBlanks(input);
   } else if (p.type === 'branchingscenario') {
-    // EV6 H5P v2 (solo activityTypeRules = 2, ya verificado arriba): caso ramificado calificado,
-    // con sus librerías delta DENTRO del .h5p (perfil v2 + store versionado; nada se descarga).
+    // EV6 H5P v2 (solo activityTypeRules = 2, ya verificado arriba): caso ramificado calificado.
+    // r55 (R7): solo contenido (+ las imágenes de los finales); sus librerías vienen en el pack v3 del sitio.
     delete input.passPercentage;
     if (typeof input.title === 'string') input.title = h5pTitle(input.title, 120);
     validateBranchingScenarioInput(input);
     // #583 fix round 1 (m3): el color del final sigue la nota mínima REAL de la actividad (perfil vigente).
     const bs = buildBranchingScenario(input, { passingGrade });
     assertH5pGradableInMoodle(bs.mainLibrary);
-    const h5p = await buildBundledH5p({
+    const h5p = await buildContentOnlyH5p({
       mainLibrary: bs.mainLibrary,
       content: bs.content,
       title: bs.title,
       language: 'es',
       profile: CURSIA_H5P_PROFILE_V3,
-      libraryStore: libraryStore(),
       // #583 (I4): imágenes de los finales (óptimo verde / aceptable ámbar / malo rojo).
       ...(bs.contentFiles ? { contentFiles: bs.contentFiles } : {}),
     });
@@ -1104,7 +1110,8 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const gradedCommon = (a: ActivityRef, kind: AssessableType, name: string, fileIds: number[], qcats: number[] = []): void => {
     const k = resolved.kinds[kind];
     const gi = W.nextGradeItem();
-    W.put(`${a.dir}/module.xml`, withIdnumber(gradedModuleXml({ mid: a.mid, modname: a.modname as 'quiz' | 'scorm' | 'h5pactivity', secnum: a.secnum, ts, bv: MV.bv, passGradeRequired: true }), a.idnumber));
+    // r55 (R5/R6): completion = recibir nota (completionpassgrade 0); el gradepass del ítem queda informativo.
+    W.put(`${a.dir}/module.xml`, withIdnumber(gradedModuleXml({ mid: a.mid, modname: a.modname as 'quiz' | 'scorm' | 'h5pactivity', secnum: a.secnum, ts, bv: MV.bv, passGradeRequired: false }), a.idnumber));
     W.put(`${a.dir}/grades.xml`, gradeItemXml({
       gradeItemId: gi.id, itemName: name, itemModule: a.modname as 'quiz' | 'scorm' | 'h5pactivity', aid: a.aid, ts,
       grademax: 100, gradepass: k.passingGrade, categoryId: CAT_ID[k.category], sortorder: gi.sortorder,
@@ -1163,10 +1170,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
   };
-  // EV6 H5P v2: store de librerías abierto solo si el paquete lleva librerías incluidas (BS, «Repaso»,
-  // y desde UX #5 QuestionSet 1.21). Perfil v3 (sus carpetas de BS/DC son las mismas de v2, mismos bytes).
-  let storeMemo: H5pLibrarySource | null = null;
-  const libraryStore = (): H5pLibrarySource => (storeMemo ??= openH5pLibraryStore(CURSIA_H5P_PROFILE_V3));
+  // r55 (R7): ningún .h5p del curso lleva librerías (todos solo contenido): el store ya no se abre al empaquetar.
 
   const questionCategories: string[] = [];
   const examBankPlans: ExamBankPlans = {};
@@ -1231,9 +1235,13 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     <timemodified>${ts}</timemodified>
   </page>
 </activity>`);
+    // r55 (R6): abre SOLO al usar todos los intentos (completion del quiz con completionminattempts = intentos);
+    // con intentos ilimitados va oculta (visible=0) hasta que el docente la muestre. El builder no fija `timeclose`.
+    const availability = examExplanationsAvailability(quiz.mid, attempts, 0);
     W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'page', quiz.secnum, ts, MV.bv), idnumber), {
       completion: '0',
-      availability: examExplanationsAvailability(quiz.mid, attempts),
+      // XML: el JSON va escapado (& < >) — un `"op":"&"` o un `"d":">="` crudos abortan la restauración (moodle-versions.md).
+      ...(availability === null ? { visible: '0', visibleold: '0' } : { availability: xmlTextEsc(availability) }),
       downloadcontent: '0',
     }));
     W.put(`${a.dir}/inforef.xml`, inforef([]));
@@ -1387,13 +1395,15 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           if (!deck || cf.reviewCards !== true) throw new Error(`MBZ_V3_INVARIANT: «Repaso» del capítulo ${ch.chapterNumber} sin mazo`);
           const key = `review_cards:${ch.chapterId}`;
           const filename = activityPackageFilename(key);
-          const h5p = await buildBundledH5p({
+          // r55 (R7): «Repaso» solo contenido (H5P.Dialogcards 1.9 viene en el pack v3 del sitio). Antes llevaba
+          // la carpeta H5P.Dialogcards-1.9 (clausura parcial): colgaba el validador de H5P de Moodle en procesos que
+          // despliegan varios paquetes con dueños mixtos y no le servía a un docente (dialogcards-diagnosis.md).
+          const h5p = await buildContentOnlyH5p({
             mainLibrary: deck.mainLibrary,
             content: deck.content,
             title: deck.title,
             language: 'es',
             profile: CURSIA_H5P_PROFILE_V3,
-            libraryStore: libraryStore(),
           });
           const name = safeActivityName(`Repaso · Capítulo ${ch.chapterNumber}: ${ch.title}`);
           addUngradedH5pActivity(sec, `${idp}:review_cards`, name, key, filename, h5p, deck.mainLibrary, (mid) =>
@@ -1445,7 +1455,6 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
             resolved.kinds.activity.passingGrade,
             cf.activityType,
             manifest.features?.activityTypeRules,
-            libraryStore,
           );
           const filename = activityPackageFilename(key);
           addH5pActivity(sec, `${idp}:activity`, name, 'activity', key, filename, built.h5p, built.mainLibrary, (mid) =>
@@ -1530,28 +1539,29 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     addExplanationsPage(quiz, 'cv3:final_exam_explanations', { kind: 'final' }, finalSrc, finalGroups, resolved.kinds.finalExam.attempts);
     addLabel(fsec, 'cv3:final_exam_next', finalExamNextLabel(closing, facts, theme, opts));
   }
-  // EV6 (T3): criterios de completion del curso (la insignia-certificado se otorga al completarlo).
+  // r55 (R3): completion del curso. Con nota: UN solo criterio, el de nota del curso (tipo 6, gradepass = nota
+  // mínima del curso = gradepass del ítem del curso), sin criterios de actividad. Sin nota: el Libro Guía por vista
+  // (comportamiento F1 de siempre, sin insignia). La insignia-certificado se otorga al completar el curso.
   const finalExamMid = W.activities.find((a) => a.idnumber === 'cv3:final_exam')?.mid ?? null;
   const completionCriteria: Array<{ moduleId: number; modname: 'quiz' | 'scorm' | 'h5pactivity' | 'resource' }> = resolved.withoutGrades
     ? [{ moduleId: libroMid, modname: 'resource' as const }]
     : completionCriteriaFor(graded.map((g) => ({ moduleId: g.moduleId, modname: g.modname, kind: g.kind })), resolved.courseCompletion);
-  if (finalExamMid !== null && !completionCriteria.some((x) => x.moduleId === finalExamMid)) {
-    throw new Error('MBZ_V3_INVARIANT: la evaluación final no es criterio de completion del curso');
+  if (!resolved.withoutGrades) {
+    if (graded.length === 0) throw new Error('MBZ_V3_INVARIANT: curso con nota sin ítems calificables');
+    if (completionCriteria.length !== 0) throw new Error('MBZ_V3_INVARIANT: un curso con nota no lleva criterios de actividad (solo la nota final)');
+    if (resolved.courseCompletion.requireCourseGradePass !== true) throw new Error('MBZ_V3_INVARIANT: curso con nota sin criterio de nota del curso');
+    if (!(resolved.courseCompletion.courseGradepass > 0) || resolved.courseCompletion.courseGradepass !== resolved.courseGradepass) {
+      throw new Error('MBZ_V3_INVARIANT: el criterio de nota del curso debe usar la nota mínima del curso (> 0) del gradebook');
+    }
+    if (facts.assessment.coursePassingGrade !== resolved.courseGradepass) throw new Error('MBZ_V3_INVARIANT: facts y el gradebook no coinciden en la nota mínima del curso');
+  } else if (resolved.courseCompletion.requireCourseGradePass) {
+    throw new Error('MBZ_V3_INVARIANT: un curso sin nota no lleva criterio de nota');
   }
-  // Fix round 1 (review I1): requisitos de la insignia = criterios REALES del paquete, por tipo.
-  const kindByMid = new Map(graded.map((g) => [g.moduleId, g.kind]));
-  const critKinds = new Set(completionCriteria.map((x) => kindByMid.get(x.moduleId)));
-  const certificateReq = {
-    activities: critKinds.has('activity'),
-    videos: critKinds.has('video'),
-    moduleExams: critKinds.has('exam'),
-    finalExam: critKinds.has('finalExam'),
-    courseGrade: resolved.courseCompletion.requireCourseGradePass,
-  };
-  // Fix round 1b (decisión M5, flujo del usuario «Curso completo → Evaluación final aprobada →
-  // Cierre → Certificado»): insignia, panel y label para docentes SOLO si hay evaluación final.
-  const hasCertificate = finalExamMid !== null && certificateReq.finalExam;
-  const certificate = hasCertificate ? certificateReq : undefined;
+  // Fix round 1b (decisión M5, flujo «Evaluación final → Cierre → Certificado»): insignia, panel y label para
+  // docentes SOLO si hay evaluación final. r55: la insignia exige el criterio de nota (siempre, con nota).
+  const hasCertificate = finalExamMid !== null && resolved.courseCompletion.requireCourseGradePass === true;
+  const certificateReq = hasCertificate ? courseApprovalRequirements(facts) : null;
+  const certificate = hasCertificate;
   if (hasCertificate !== willHaveCertificate) throw new Error('MBZ_V3_INVARIANT: certificado ≠ evaluación final (nota para docentes de las evaluaciones mal ubicada)');
   if (!hasCertificate && (facts.counts.exams > 0) !== examsTeacherPlaced) throw new Error('MBZ_V3_INVARIANT: nota para docentes de las evaluaciones ausente o sobrante');
   if (!hasCertificate) warnings.push('certificate_omitted:no_final_exam');
@@ -1647,7 +1657,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     W.put('badges.xml', courseBadgeXml({
       courseTitle: certificateTitle,
       courseBackupId: MBZ_V3_COURSE_BACKUP_ID,
-      requirements: certificateReq,
+      requirements: certificateReq as CertificateRequirements,
       ts,
       issuerName: COURSE_BADGE_DEFAULT_ISSUER,
     }));
@@ -1771,9 +1781,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
       libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256 },
-      // EV6 H5P v2: con paquetes que traen sus librerías (Branching Scenario / «Repaso» / desde UX #5
-      // QuestionSet 1.21) la entrega pide restaurar como administrador o gestor (rulings Q1).
-      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_BUNDLED_RESTORE_NOTE } : {}),
+      // r55 (R7): todos los .h5p son solo contenido; con un tipo que no está en el pack v1 (QuestionSet 1.21, BS,
+      // «Repaso») la entrega declara el requisito del sitio: Cursia H5P Library Pack v3 (cualquier rol restaura).
+      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_SITE_LIBRARY_PACK_RESTORE_NOTE } : {}),
     },
   };
 }
@@ -1788,9 +1798,23 @@ export function reviewCardsApply(blueprint: BlueprintSnapshotV2, manifest: Gener
 }
 
 /**
- * EV6 H5P v2 — instrucción de entrega (rulings Q1) para paquetes con librerías H5P incluidas (perfil v3:
- * BS, «Repaso» y, desde UX #5, QuestionSet 1.21). El
- * frontend la muestra en «Cómo restaurarlo en Moodle» (summary.restore del paquete).
+ * r55 (R7) — instrucción de entrega para paquetes con tipos H5P que no están en el pack v1 (QuestionSet 1.21, caso
+ * ramificado, «Repaso»). Todos los .h5p son solo contenido: el sitio necesita el Cursia H5P Library Pack v3 (lo
+ * sube un administrador una vez; `scripts/h5p-preflight-moodle.js --profile v3` lo verifica) y desde ahí cualquier
+ * docente restaura. El frontend la muestra en «Cómo restaurarlo en Moodle» (summary.restore del paquete).
+ */
+export const H5P_SITE_LIBRARY_PACK_RESTORE_NOTE = Object.freeze({
+  as: 'site_library_pack' as const,
+  libraryPack: 'v3' as const,
+  note:
+    'Antes de restaurar, el sitio Moodle debe tener instalado el Cursia H5P Library Pack v3 (un administrador lo sube una sola vez en ' +
+    'Administración del sitio › H5P › Gestionar tipos de contenido H5P). Con el pack instalado, cualquier docente puede restaurar el curso; ' +
+    'sin él, las actividades H5P muestran «Missing main library».',
+});
+
+/**
+ * @deprecated r55: nota de builders ≤ 3.13.0 (los .h5p llevaban carpetas delta y se pedía restaurar como
+ * administrador o gestor). Se conserva solo para leer jobs viejos (packaging.service la acepta).
  */
 export const H5P_BUNDLED_RESTORE_NOTE = Object.freeze({
   as: 'admin_or_manager' as const,
@@ -1799,7 +1823,7 @@ export const H5P_BUNDLED_RESTORE_NOTE = Object.freeze({
     'Si lo restaura un docente en un sitio que aún no los tiene, un administrador debe subir antes el Cursia H5P Library Pack v3.',
 });
 
-/** @deprecated UX #5 fix round 1 (M-2): nombre histórico (EV6 H5P v2); usar H5P_BUNDLED_RESTORE_NOTE. */
+/** @deprecated UX #5 fix round 1 (M-2): nombre histórico (EV6 H5P v2); usar H5P_SITE_LIBRARY_PACK_RESTORE_NOTE. */
 export const H5P_V2_RESTORE_NOTE = H5P_BUNDLED_RESTORE_NOTE;
 
 /**
@@ -1807,7 +1831,13 @@ export const H5P_V2_RESTORE_NOTE = H5P_BUNDLED_RESTORE_NOTE;
  * si algún .h5p lleva librerías incluidas (todos salen de CURSIA_H5P_PROFILE_V3), si no el de v1.
  */
 export function summaryH5pProfileVersion(pkgs: ReadonlyArray<{ mainLibrary: string }>): number {
+  // r55: «principal fuera del pack v1» (las claves de deltaByMain de v3 son exactamente esas principales).
   return pkgs.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? CURSIA_H5P_PROFILE_V3.version : h5pProfileVersion;
+}
+
+/** Escape de texto XML sin tocar comillas (el JSON de availability conserva sus `"`). */
+export function xmlTextEsc(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /** Librerías del perfil (para el validador): "Machine major.minor". */

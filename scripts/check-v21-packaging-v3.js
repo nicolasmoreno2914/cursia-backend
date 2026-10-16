@@ -100,7 +100,7 @@ async function mutate(mbz, edits) {
   const z = await JSZip.loadAsync(mbz);
   for (const [file, fn] of Object.entries(edits)) {
     const cur = await z.file(file).async('string');
-    const next = fn(cur);
+    const next = await fn(cur);
     if (next === cur) throw new Error(`la mutación de ${file} no cambió nada`);
     z.file(file, next);
   }
@@ -205,7 +205,7 @@ const MATRIX = [
   // P2-B1 (EV6 Fase 2 — exámenes): cada quiz_*/quiz.xml (examen de módulo y examen final) de TODA la
   // matriz lleva exactamente los 8 campos de revisión de QUIZ_REVIEW_V3 y, con el perfil por defecto
   // (intentos 3), completionattemptsexhausted 1.
-  await check('P2-B1: todo quiz.xml de la matriz tiene la política de revisión y completionattemptsexhausted = (attempts_number > 0)', async () => {
+  await check('P2-B1 + r55 (R6): todo quiz.xml de la matriz tiene la política de revisión, completionminattempts = attempts_number y attemptsexhausted 0', async () => {
     let quizzes = 0;
     for (const cfg of MATRIX) {
       const { z, acts } = await actDirs(built[cfg.id].r.mbz);
@@ -217,7 +217,12 @@ const MATRIX = [
         }
         const attempts = Number(/<attempts_number>(\d+)<\/attempts_number>/.exec(x)[1]);
         const exhausted = /<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(x)[1];
-        eq(exhausted, attempts > 0 ? '1' : '0', `${cfg.id} ${a.idnumber}: completionattemptsexhausted vs attempts_number ${attempts}`);
+        const minAtt = /<completionminattempts>(\d+)<\/completionminattempts>/.exec(x)[1];
+        // r55 (R6): completo solo tras usar todos los intentos; sin la regla «aprobar o agotar».
+        eq(exhausted, '0', `${cfg.id} ${a.idnumber}: completionattemptsexhausted`);
+        eq(minAtt, String(attempts), `${cfg.id} ${a.idnumber}: completionminattempts vs attempts_number ${attempts}`);
+        const mx = await z.file(`${a.dir}/module.xml`).async('string');
+        eq(['completion', 'completiongradeitemnumber', 'completionpassgrade'].map((t) => new RegExp(`<${t}>([^<]*)</${t}>`).exec(mx)[1]), ['2', '0', '0'], `${cfg.id} ${a.idnumber}: completion por nota, sin nota aprobatoria`);
         quizzes++;
       }
     }
@@ -226,7 +231,7 @@ const MATRIX = [
 
   // P2-B1 acceptance A1: `attempts: { exam: 0 }` → completionattemptsexhausted 0 solo en el examen de
   // módulo (intentos ilimitados nunca se agotan); el examen final, con el perfil por defecto, sigue en 1.
-  await check('P2-B1: attempts.exam = 0 (ilimitado) → completionattemptsexhausted 0 en el examen de módulo', async () => {
+  await check('P2-B1 + r55: attempts.exam = 0 (ilimitado) → completionminattempts 0 y «Respuestas explicadas» del módulo OCULTA sin availability; el final (3) se completa a los 3 intentos', async () => {
     const defaults = PROF.defaultAssessmentProfile({ finalExam: true });
     const profile = { ...defaults, attempts: { ...defaults.attempts, exam: 0 } };
     const { r } = await build({ engine: 'h5p', finalExam: true, profile });
@@ -238,9 +243,19 @@ const MATRIX = [
     const examXml = await z.file(`${moduleExam.dir}/quiz.xml`).async('string');
     const finalXml = await z.file(`${finalExam.dir}/quiz.xml`).async('string');
     eq(/<attempts_number>(\d+)<\/attempts_number>/.exec(examXml)[1], '0', 'examen de módulo: intentos ilimitados');
-    eq(/<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(examXml)[1], '0', 'examen de módulo: nunca se agota');
+    eq(/<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(examXml)[1], '0', 'examen de módulo: sin regla de agotar');
+    eq(/<completionminattempts>(\d+)<\/completionminattempts>/.exec(examXml)[1], '0', 'examen de módulo: sin mínimo de intentos');
     eq(/<attempts_number>(\d+)<\/attempts_number>/.exec(finalXml)[1], '3', 'examen final: intentos del perfil sin tocar');
-    eq(/<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(finalXml)[1], '1', 'examen final: sigue agotándose');
+    eq(/<completionminattempts>(\d+)<\/completionminattempts>/.exec(finalXml)[1], '3', 'examen final: completo a los 3 intentos');
+    const expl = acts.find((a) => /^cv3:exam_explanations:/.test(a.idnumber));
+    const ex = await z.file(`${expl.dir}/module.xml`).async('string');
+    eq(['visible', 'visibleold', 'availability'].map((t) => new RegExp(`<${t}>([^<]*)</${t}>`).exec(ex)[1]), ['0', '0', '$@NULL@$'], 'explicaciones del módulo ilimitado: ocultas, sin availability');
+    const fexpl = acts.find((a) => a.idnumber === 'cv3:final_exam_explanations');
+    const fx = await z.file(`${fexpl.dir}/module.xml`).async('string');
+    eq(/<visible>([^<]*)<\/visible>/.exec(fx)[1], '1', 'explicaciones del final: visibles con availability');
+    const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
+    const tx = await z.file(`${teacher.dir}/label.xml`).async('string');
+    assert(tx.includes('intentos ilimitados no abren solas'), 'nota para docentes de intentos ilimitados');
   });
 
   // Aceptación staging V2.1: el Visual System prohíbe franjas laterales (border-left/right > 1px como acento).
@@ -487,12 +502,43 @@ const MATRIX = [
       const a = find(/^cv3:exam:/);
       return { [`${a.dir}/grades.xml`]: (x) => x.replace('<grademax>100.00000</grademax>', '<grademax>50.00000</grademax>') };
     }],
+    // r55 (R5): un ítem evaluativo con nota aprobatoria exigida (o sin completion por nota, o sin tracking) → COMPLETION.
     ['COMPLETION', () => {
       const a = find(/:video$/);
-      return { [`${a.dir}/module.xml`]: (x) => x.replace('<completionpassgrade>1</completionpassgrade>', '<completionpassgrade>0</completionpassgrade>') };
+      return { [`${a.dir}/module.xml`]: (x) => x.replace('<completionpassgrade>0</completionpassgrade>', '<completionpassgrade>1</completionpassgrade>') };
+    }],
+    ['COMPLETION', () => {
+      const a = find(/:activity$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace('<completiongradeitemnumber>0</completiongradeitemnumber>', '<completiongradeitemnumber>$@NULL@$</completiongradeitemnumber>') };
+    }],
+    ['COMPLETION', () => {
+      const a = find(/:video$/);
+      return { [`${a.dir}/h5pactivity.xml`]: (x) => x.replace('<enabletracking>1</enabletracking>', '<enabletracking>0</enabletracking>') };
+    }],
+    ['COMPLETION', () => {
+      const a = find(/^cv3:final_exam$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace('<completionpassgrade>0</completionpassgrade>', '<completionpassgrade>1</completionpassgrade>') };
+    }],
+    // r55 (R1): lo pedagógico con ítem de calificación → PEDAGOGICAL (+ ADDON para el «Repaso»).
+    ['PEDAGOGICAL', () => {
+      const a = find(/^cv3:shell:welcome$/);
+      const v = find(/:video$/);
+      return { [`${a.dir}/grades.xml`]: async () => (await bz.file(`${v.dir}/grades.xml`).async('string')) };
     }],
     ['CATEGORIES', () => ({ 'gradebook.xml': (x) => x.replace('<aggregationcoef>30.00000</aggregationcoef>', '<aggregationcoef>35.00000</aggregationcoef>') })],
-    ['COURSE_COMPLETION', () => ({ 'completion.xml': (x) => x.replace(/  <course_completion_criteria id="1">[\s\S]*?<\/course_completion_criteria>\n/, '') })],
+    // r55 (R3/R8): invariantes del criterio de nota del curso (independientes del perfil).
+    ['GRADE_CRITERION', () => ({ 'completion.xml': (x) => x.replace(/  <course_completion_criteria id="1">[\s\S]*?<\/course_completion_criteria>\n/, '') })],
+    ['GRADE_CRITERION', () => ({ 'completion.xml': (x) => x.replace('<gradepass>70.00000</gradepass>', '<gradepass>60.00000</gradepass>') })],
+    ['GRADE_CRITERION', () => ({ 'gradebook.xml': (x) => x.replace(/(<itemtype>course<\/itemtype>[\s\S]*?<gradepass>)70\.00000/, '$165.00000') })],
+    ['GRADE_CRITERION', () => ({ 'completion.xml': (x) => x.replace(/(  <course_completion_criteria id="1">[\s\S]*?<\/course_completion_criteria>\n)/, '$1$1') })],
+    ['GRADE_CRITERION_CERT', () => ({ 'completion.xml': (x) => x.replace(/  <course_completion_criteria id="1">[\s\S]*?<\/course_completion_criteria>\n/, '') })],
+    ['CRITERIA_ACTIVITY', () => {
+      const a = find(/^cv3:final_exam$/);
+      const mid = /_(\d+)$/.exec(a.dir)[1];
+      return { 'completion.xml': (x) => x.replace('  <course_completion_aggr_methd', `  <course_completion_criteria id="9">\n    <course>1</course>\n    <criteriatype>4</criteriatype>\n    <module>quiz</module>\n    <moduleinstance>${mid}</moduleinstance>\n    <courseinstanceshortname>$@NULL@$</courseinstanceshortname>\n    <enrolperiod>$@NULL@$</enrolperiod>\n    <timeend>$@NULL@$</timeend>\n    <gradepass>$@NULL@$</gradepass>\n    <role>$@NULL@$</role>\n    <roleshortname>$@NULL@$</roleshortname>\n    <course_completion_crit_completions>\n    </course_completion_crit_completions>\n  </course_completion_criteria>\n  <course_completion_aggr_methd`) };
+    }],
+    ['COURSE_COMPLETION', () => ({ 'completion.xml': (x) => x.replace('<method>1</method>', '<method>2</method>') })],
+    ['COURSE_COMPLETION', () => ({ 'completion.xml': (x) => x.replace('<criteriatype>6</criteriatype>', '<criteriatype>2</criteriatype>') })],
     ['RESOURCE_DISABLED', () => {
       const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:synthesis`);
       return { [`${a.dir}/label.xml`]: (x) => x.replace('&lt;span class=&quot;nolink&quot;&gt;', '&lt;span class=&quot;nolink&quot;&gt;Mira el video antes de seguir. ') };
@@ -627,15 +673,29 @@ const MATRIX = [
       const a = find(/^cv3:exam:/);
       return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<reviewoverallfeedback>4368</reviewoverallfeedback>', '<reviewoverallfeedback>16</reviewoverallfeedback>') };
     }],
-    // completionattemptsexhausted en 0 con intentos > 0 (el fixture base tiene attempts_number 3) → QUIZ_COMPLETION.
+    // r55 (R6): la regla «aprobar o agotar» encendida → QUIZ_COMPLETION.
     ['QUIZ_COMPLETION', () => {
       const a = find(/^cv3:exam:/);
-      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<completionattemptsexhausted>1</completionattemptsexhausted>', '<completionattemptsexhausted>0</completionattemptsexhausted>') };
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<completionattemptsexhausted>0</completionattemptsexhausted>', '<completionattemptsexhausted>1</completionattemptsexhausted>') };
     }],
-    // completionattemptsexhausted en 1 con intentos = 0 (ilimitado, nunca se agota) → QUIZ_COMPLETION.
+    // completionminattempts ≠ intentos (el fixture base tiene attempts_number 3) → QUIZ_COMPLETION.
     ['QUIZ_COMPLETION', () => {
       const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<completionminattempts>3</completionminattempts>', '<completionminattempts>1</completionminattempts>') };
+    }],
+    // intentos ≠ perfil (no se cambia el método ni los intentos del perfil) → QUIZ_COMPLETION.
+    ['QUIZ_COMPLETION', () => {
+      const a = find(/^cv3:final_exam$/);
       return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<attempts_number>3</attempts_number>', '<attempts_number>0</attempts_number>') };
+    }],
+    // r55 (R6): «Respuestas explicadas» abierta por otra vía (aprobar con intentos restantes, e=2) → EXPLANATIONS_GATE.
+    ['EXPLANATIONS_GATE', () => {
+      const a = find(/^cv3:exam_explanations:/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace(/"e":3\}/, '"e":2}') };
+    }],
+    ['EXPLANATIONS_GATE', () => {
+      const a = find(/^cv3:final_exam_explanations$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace(/<availability>[^<]*<\/availability>/, '<availability>$@NULL@$</availability>') };
     }],
   );
   await check('validador (fix 1, I1): dos botones de la MISMA sección al MISMO destino → NAVIGATION «misma sección»', async () => {
@@ -711,11 +771,14 @@ const MATRIX = [
       }
       const title = r.expectations.facts.course.title;
       assert(bx.includes(`<name>Certificado: ${title}</name>`), `${cfg.id}: nombre`);
-      // Fix round 1 (review I1): perfil por defecto → se exige aprobar TODO lo calificable, nombrado por tipo.
-      const kinds = ['todas las actividades prácticas', 'todos los videos interactivos', 'todas las evaluaciones de módulo', 'la evaluación final'];
+      // r55 (R4): la descripción enuncia la regla REAL (nota final ≥ mínimo, por pesos), nunca «aprobar todas…».
+      const c = r.expectations.facts.counts;
+      const kinds = [c.activities ? 'las actividades prácticas' : null, c.videos ? 'los videos interactivos' : null, c.exams ? 'las evaluaciones de módulo' : null, 'la evaluación final'].filter(Boolean);
       const list = `${kinds.slice(0, -1).join(', ')} y ${kinds[kinds.length - 1]}`;
-      const desc = `Otorgado al completar el curso «${title}»: aprobar ${list}.`;
+      const repaso = (c.reviewCards ?? 0) > 0 ? '; las actividades de repaso no cuentan en la nota' : '';
+      const desc = `Otorgado al aprobar el curso «${title}»: obtener una calificación final igual o superior a 70/100, calculada con ${list} según sus pesos${repaso}.`;
       assert(bx.includes(`<description>${desc}</description>`), `${cfg.id}: descripción`);
+      assert(!/aprobar todas|todas las actividades/.test(bx), `${cfg.id}: sin «aprobar todas»`);
       for (const t of ['<type>2</type>', '<courseid>1</courseid>', '<status>1</status>', '<notification>0</notification>', '<language>es</language>', '<issuername>Cursia</issuername>', '<name>course_1</name>', '<value>1</value>']) assert(bx.includes(t), `${cfg.id}: ${t}`);
       assert(/%badgename%/.test(bx), `${cfg.id}: %badgename%`);
       const mb = await z.file('moodle_backup.xml').async('string');
@@ -732,25 +795,25 @@ const MATRIX = [
       const closing = acts.find((a) => a.idnumber === 'cv3:shell:closing');
       const lx = await z.file(`${closing.dir}/label.xml`).async('string');
       assert(lx.includes('$@BADGESVIEWBYID*1@$') && lx.includes('Tu certificado') && lx.includes('Ver mi certificado →'), `${cfg.id}: panel del cierre`);
-      const want = `Cuando apruebes ${list}, Moodle te otorga el certificado del curso. Lo encuentras en tu perfil, en Insignias.`;
+      const want = 'Cuando tu calificación final del curso llegue a 70/100 o más, Moodle te otorga el certificado del curso (puede tardar unos minutos en aparecer). Lo encuentras en tu perfil, en Insignias.';
       assert(lx.includes(want), `${cfg.id}: texto del panel`);
+      assert(lx.includes(`Apruebas el curso con una calificación final igual o superior a 70/100, calculada con ${list} según sus pesos${repaso}.`), `${cfg.id}: regla de aprobación en el cierre`);
       // Fix 0b: label oculto para docentes, justo después del cierre, en la misma sección.
       const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
       assert(teacher && teacher.section === closing.section && acts.indexOf(teacher) === acts.indexOf(closing) + 1, `${cfg.id}: label docente tras el cierre`);
       const tm = await z.file(`${teacher.dir}/module.xml`).async('string');
       assert(tm.includes('<visible>0</visible>') && tm.includes('<visibleold>0</visibleold>'), `${cfg.id}: label docente oculto`);
       const tx = await z.file(`${teacher.dir}/label.xml`).async('string');
-      for (const t of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Abrir las insignias del curso →', '$@BADGESVIEWBYID*1@$']) {
+      for (const t of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Abrir las insignias del curso →', '$@BADGESVIEWBYID*1@$',
+        'El curso se aprueba solo por la calificación final', 'marcar a mano una actividad como completada no lo aprueba', 'cron']) {
         assert(tx.includes(t.replace(/"/g, '&quot;')), `${cfg.id}: label docente «${t}»`);
       }
       const hidden = [];
       for (const a of acts) if ((await z.file(`${a.dir}/module.xml`).async('string')).includes('<visible>0</visible>')) hidden.push(a.idnumber);
       eq(hidden, ['cv3:shell:certificate_teacher'], `${cfg.id}: único módulo oculto`);
-      if (cfg.finalExam) {
-        const fin = acts.find((a) => a.idnumber === 'cv3:final_exam');
-        const comp = await z.file('completion.xml').async('string');
-        assert(comp.includes(`<module>quiz</module>\n    <moduleinstance>${/_(\d+)$/.exec(fin.dir)[1]}</moduleinstance>`), `${cfg.id}: final como criterio`);
-      }
+      // r55 (R3): la completion del curso es SOLO el criterio de nota (la insignia lo hereda).
+      const comp = await z.file('completion.xml').async('string');
+      eq([...comp.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], `${cfg.id}: único criterio = nota del curso`);
     }
     // Imagen determinística y con los colores del tema (acento en el centro de la medalla).
     const t = { color: { accent: '#1D4ED8', accentStrong: '#1E3A8A', textOnAccent: '#FFFFFF' } };
@@ -760,33 +823,46 @@ const MATRIX = [
     assert(!a1.equals(BADGE.renderCourseBadgePng({ color: { ...t.color, accent: '#B91C1C' } }, 512)), 'la imagen cambia con el acento');
     eq(BADGE.courseBadgeName('x'.repeat(400)).length <= 255, true, 'nombre ≤ 255');
   });
-  await check('EV6 T3: perfil con requireExams=false → la evaluación final sigue siendo criterio (los exámenes de módulo no)', async () => {
+  // r55 (R3): las banderas guardadas del perfil ya no cambian la completion: SIEMPRE un único criterio de nota.
+  for (const [what, cc] of [
+    ['requireExams=false', { requireAllChapterActivities: true, requireExams: false, requireCourseGradePass: true }],
+    ['todo apagado', { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: false }],
+    ['requireCourseGradePass=false (perfil viejo)', { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: false }],
+  ]) {
+    await check(`r55 (R3): perfil con ${what} → completion = SOLO el criterio de nota (70), sin criterios de actividad; descripción y panel = regla real`, async () => {
+      const input = PF.packagingInput(distRoot, MATRIX[0]);
+      input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+      input.assessmentProfile.courseCompletion = cc;
+      const r = await B.buildDynamicMbzV3(input);
+      const v = await validate(r);
+      assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+      const { z, acts } = await actDirs(r.mbz);
+      const comp = await z.file('completion.xml').async('string');
+      eq([...comp.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], 'solo tipo 6');
+      assert(comp.includes('<gradepass>70.00000</gradepass>'), 'gradepass 70');
+      const title = r.expectations.facts.course.title;
+      assert((await z.file('badges.xml').async('string')).includes(`<description>Otorgado al aprobar el curso «${title}»: obtener una calificación final igual o superior a 70/100`), 'descripción');
+      const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+      assert(lx.includes('Cuando tu calificación final del curso llegue a 70/100 o más'), 'panel');
+    });
+  }
+  await check('r55 (R3): override por tipo bajo el mínimo del curso (práctica 50, exámenes 60, curso 80) → el criterio de nota usa 80 y cada ítem conserva su gradepass informativo', async () => {
     const input = PF.packagingInput(distRoot, MATRIX[0]);
     input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
-    input.assessmentProfile.courseCompletion.requireExams = false;
+    input.assessmentProfile.passingGrade = 80;
+    input.assessmentProfile.overrides = { activity: 50, video: 50, exam: 60, finalExam: 60 };
     const r = await B.buildDynamicMbzV3(input);
     const v = await validate(r);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
     const { z, acts } = await actDirs(r.mbz);
     const comp = await z.file('completion.xml').async('string');
-    const inst = [...comp.matchAll(/<moduleinstance>(\d+)<\/moduleinstance>/g)].map((m) => Number(m[1]));
-    const mid = (a) => Number(/_(\d+)$/.exec(a.dir)[1]);
-    assert(inst.includes(mid(acts.find((a) => a.idnumber === 'cv3:final_exam'))), 'el final es criterio');
-    assert(!acts.filter((a) => /^cv3:exam:/.test(a.idnumber)).some((a) => inst.includes(mid(a))), 'los exámenes de módulo no');
-  });
-  await check('EV6 T3 (review I1): perfil con requireCourseGradePass y sin prácticas → panel y descripción nombran SOLO evaluaciones + nota mínima', async () => {
-    const input = PF.packagingInput(distRoot, MATRIX[0]);
-    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
-    input.assessmentProfile.courseCompletion = { requireAllChapterActivities: false, requireExams: true, requireCourseGradePass: true };
-    const r = await B.buildDynamicMbzV3(input);
-    const v = await validate(r);
-    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
-    const { z, acts } = await actDirs(r.mbz);
-    const title = r.expectations.facts.course.title;
-    assert((await z.file('badges.xml').async('string')).includes(`<description>Otorgado al completar el curso «${title}»: aprobar todas las evaluaciones de módulo y la evaluación final y alcanzar la nota mínima del curso.</description>`), 'descripción');
+    eq([...comp.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], 'solo tipo 6');
+    assert(comp.includes('<gradepass>80.00000</gradepass>'), 'criterio de nota = 80');
+    assert(/<itemtype>course<\/itemtype>[\s\S]*?<gradepass>80\.00000<\/gradepass>/.test(await z.file('gradebook.xml').async('string')), 'ítem del curso = 80');
+    const vid = acts.find((a) => /:video$/.test(a.idnumber));
+    assert((await z.file(`${vid.dir}/grades.xml`).async('string')).includes('<gradepass>50.00000</gradepass>'), 'video: gradepass informativo 50');
     const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
-    assert(lx.includes('Cuando apruebes todas las evaluaciones de módulo y la evaluación final y alcances la nota mínima del curso, Moodle te otorga'), 'panel');
-    assert(!/actividades prácticas|videos interactivos/.test(lx), 'no nombra lo que no se exige');
+    assert(lx.includes('igual o superior a 80/100') && lx.includes('llegue a 80/100'), 'textos con la nota del curso (80)');
   });
   await check('EV6 T3: sin evaluación final (aunque el perfil exija todo lo demás o nada) → sin certificado y aviso certificate_omitted:no_final_exam', async () => {
     const input = PF.packagingInput(distRoot, MATRIX[1]);
@@ -810,10 +886,15 @@ const MATRIX = [
       ['sin insignia', () => ({ 'badges.xml': (x) => x.replace(/<badge id[\s\S]*<\/badge>/, '') })],
       ['criterio de curso con otro id', () => ({ 'badges.xml': (x) => x.replace('<name>course_1</name>', '<name>course_2</name>') })],
       ['insignia inactiva', () => ({ 'badges.xml': (x) => x.replace('<status>1</status>', '<status>0</status>') })],
-      ['descripción que omite la evaluación final', () => ({ 'badges.xml': (x) => x.replace(' y la evaluación final.</description>', '.</description>') })],
-      ['panel que no enuncia los criterios reales', () => {
+      ['descripción con otra nota mínima', () => ({ 'badges.xml': (x) => x.replace('igual o superior a 70/100', 'igual o superior a 60/100') })],
+      ['descripción que exige aprobar todas las actividades (regla vieja)', () => ({ 'badges.xml': (x) => x.replace(/<description>[^<]*<\/description>/, '<description>Otorgado al completar el curso: aprobar todas las actividades prácticas y la evaluación final.</description>') })],
+      ['panel que no enuncia la regla real', () => {
         const a = find(/^cv3:shell:closing$/);
-        return { [`${a.dir}/label.xml`]: (x) => x.replace('Cuando apruebes todas las actividades prácticas', 'Cuando completes todas las actividades calificadas') };
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Cuando tu calificación final del curso llegue a 70/100 o más', 'Cuando apruebes todas las actividades prácticas') };
+      }],
+      ['label docente sin la regla de aprobación', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('El curso se aprueba solo por la calificación final', 'El curso se aprueba') };
       }],
       ['label docente sin la nota de diagnóstico', () => {
         const a = find(/^cv3:shell:certificate_teacher$/);
@@ -841,11 +922,6 @@ const MATRIX = [
       ['cierre sin enlace a la insignia', () => {
         const a = find(/^cv3:shell:closing$/);
         return { [`${a.dir}/label.xml`]: (x) => x.split('$@BADGESVIEWBYID*1@$').join('#') };
-      }],
-      ['evaluación final fuera de la completion del curso', () => {
-        const a = find(/^cv3:final_exam$/);
-        const mid = /_(\d+)$/.exec(a.dir)[1];
-        return { 'completion.xml': (x) => x.replace(new RegExp(`  <course_completion_criteria id="\\d+">\\n    <course>1</course>\\n    <criteriatype>4</criteriatype>\\n    <module>quiz</module>\\n    <moduleinstance>${mid}</moduleinstance>[\\s\\S]*?</course_completion_criteria>\\n`), '') };
       }],
     ];
     for (const [what, mk] of certCases) {
@@ -1133,7 +1209,7 @@ const MATRIX = [
 
   // V542 fix round 2 (N1): el texto de PLANTILLA de los labels del shell sigue estricto (toda cifra ∈ facts); solo
   // la prosa LLM de las intros admite cifras de contenido.
-  await check('V542 N1: plantilla estricta — «Preguntas: 997», «Duración estimada: 997 h», «997 min», «Intentos: 997», «Nota mínima para aprobar: 997 de 100» → NUMBER_NOT_FROM_FACTS; «Ley 1480 de 2011» en la prosa pasa', async () => {
+  await check('V542 N1: plantilla estricta — «Preguntas: 997», «Duración estimada: 997 h», «997 min», «Intentos: 997», «Nota mínima de esta evaluación: 997 de 100», «calificación final de 997/100» → NUMBER_NOT_FROM_FACTS; «Ley 1480 de 2011» en la prosa pasa', async () => {
     const LAW = 'Aplicar la Ley 1480 de 2011 y responder dentro de los 15 días hábiles que fija la norma.';
     const i = PF.packagingInput(distRoot, MATRIX[0]);
     i.contents.courseIntro = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
@@ -1147,7 +1223,8 @@ const MATRIX = [
     const cases = [
       ['Preguntas: 997', examInfo, (x) => x.replace(/(Preguntas:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
       ['Intentos: 997', examInfo, (x) => x.replace(/(Intentos:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
-      ['Nota mínima para aprobar: 997 de 100', examInfo, (x) => x.replace(/(Nota mínima para aprobar:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['Nota mínima de esta evaluación: 997 de 100', examInfo, (x) => x.replace(/(Nota mínima de esta evaluación:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['calificación final de 997/100', examInfo, (x) => x.replace('calificación final de 70/100 o más', 'calificación final de 997/100 o más')],
       ['997 min (audiolibro)', dirOf(/^cv3:shell:audiobook$/), (x) => x.replace(/Duración total: \d+ min/, 'Duración total: 997 min')],
       // En un label CON prosa LLM (bienvenida): la cifra de plantilla sigue estricta.
       ['Duración estimada: 997 h (bienvenida)', dirOf(/^cv3:shell:welcome$/), (x) => x.replace('&lt;/span&gt;', ' Duración estimada: 997 h&lt;/span&gt;')],
@@ -1253,7 +1330,7 @@ const MATRIX = [
     for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5'], ['libroBrandSha256', 'logo2']]) {
       assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
     }
-    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.13.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.14.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
   });
 
   // ── Medios ────────────────────────────────────────────────────────────────

@@ -33,6 +33,11 @@ export interface ContentOnlyH5pInput {
    * Ausente ⇒ h5p.json idéntico al de siempre.
    */
   extraDependencies?: H5pDependencyRef[];
+  /**
+   * r55 (R7): archivos del contenido (`content/<ruta>`, solo `images/*.png|jpg`), p. ej. las imágenes de los
+   * finales del caso ramificado. Ausente ⇒ paquete idéntico al de siempre.
+   */
+  contentFiles?: Record<string, Buffer>;
 }
 
 export interface H5pJson {
@@ -167,7 +172,11 @@ async function zipDeterministic(entries: Array<[string, Buffer | string]>): Prom
   });
 }
 
-/** `.h5p` solo contenido (sin librerías). Bytes determinísticos. */
+/**
+ * `.h5p` solo contenido (sin librerías). Bytes determinísticos. r55 (R7): es el ÚNICO formato de los paquetes de
+ * curso — nunca carpetas de librería parciales (dialogcards-diagnosis.md: una clausura parcial de una librería ya
+ * instalada cuelga `H5PValidator::isValidPackage` en procesos que despliegan varios paquetes con dueños mixtos).
+ */
 export async function buildContentOnlyH5p(input: ContentOnlyH5pInput): Promise<Buffer> {
   if (!input || typeof input.content !== 'object' || input.content === null) {
     throw new Error('H5P_PACKAGE_INVALID: content debe ser un objeto');
@@ -178,6 +187,7 @@ export async function buildContentOnlyH5p(input: ContentOnlyH5pInput): Promise<B
   return zipDeterministic([
     ['h5p.json', JSON.stringify(h5pJson)],
     ['content/content.json', JSON.stringify(input.content)],
+    ...contentFileEntries(input.content, input.contentFiles),
   ]);
 }
 
@@ -217,8 +227,6 @@ export interface BundledH5pInput extends ContentOnlyH5pInput {
   profile: H5pProfile;
   /** Store de librerías (openH5pLibraryStore). Nada se descarga. */
   libraryStore: H5pLibrarySource;
-  /** #583 (I4): archivos del contenido (`content/<ruta>`), p. ej. imágenes de los finales del caso ramificado. */
-  contentFiles?: Record<string, Buffer>;
 }
 
 /** Rutas de imagen (`{path, mime}`) que el contenido referencia (H5P las resuelve contra `content/`). */
@@ -247,6 +255,11 @@ function contentFileEntries(content: Record<string, unknown>, files: Record<stri
 }
 
 /**
+ * @deprecated r55 (R7): el builder v3 ya no lo usa (todo paquete de curso es content-only con el pack v3 como
+ * requisito del sitio). Una clausura PARCIAL (delta) de una librería ya instalada dispara el bucle infinito de
+ * `H5PValidator::isValidPackage` (upgradeOnly) en Moodle; el validador v3 rechaza cualquier carpeta de librería.
+ * Se conserva solo para leer/reconstruir paquetes viejos en harnesses.
+ *
  * EV6 H5P v2 — `.h5p` con "delta bundling": h5p.json + content/content.json +
  * EXACTAMENTE las carpetas de `profile.deltaByMain[mainLibrary]` (clausura full
  * de la principal − librerías de v1, que el preflight ya exige en el sitio).

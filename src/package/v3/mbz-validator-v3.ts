@@ -3,9 +3,18 @@
  *
  * Lee el paquete ya armado (no el estado en memoria del builder) y lo compara
  * contra lo que DEBE decir (facts + evaluación resuelta del perfil vigente):
- *   GRADEPASS / GRADEMAX / COMPLETION     cada ítem calificable = perfil, 0–100, completion por nota aprobatoria
+ *   GRADEPASS / GRADEMAX / COMPLETION     cada ítem calificable = perfil, 0–100, completion al recibir nota
+ *                                          (r55: completionusegrade 1, completionpassgrade 0); H5P evaluativo con
+ *                                          enabletracking 1 y grade 100
  *   CATEGORIES / COURSE_GRADEPASS          categorías, pesos y nota del curso
  *   COURSE_COMPLETION                      criterios de completion del curso
+ *   GRADE_CRITERION / CRITERIA_ACTIVITY    r55 (invariantes, independientes de las banderas del perfil): curso con nota ⇒
+ *   GRADE_CRITERION_CERT / PEDAGOGICAL      EXACTAMENTE un criterio tipo 6 con gradepass = gradepass del ítem del curso =
+ *                                          nota mínima del perfil (> 0), NINGÚN criterio de actividad, agregación ALL;
+ *                                          insignia ⇒ criterio de nota; lo pedagógico (Repaso, labels, páginas, foro,
+ *                                          Libro) sin ítem de calificación, sin tracking ni criterio
+ *   H5P_PARTIAL_LIBRARY_CLOSURE            r55 (R7): ningún .h5p con carpetas de librería (todos solo contenido) y,
+ *                                          si alguna aparece, su clausura de dependencias debe venir completa
  *   RESOURCE_DISABLED / TRANSITION_*       ningún label menciona un recurso apagado
  *   NUMBER_NOT_FROM_FACTS                  cifras de los labels determinísticos ∈ facts
  *   CLEAN_SAFE                             lint CLEAN_SAFE (cuerpo ≥ 16 px, contraste, hex…) en todo label
@@ -26,7 +35,8 @@
  *                                          imagen f1/f2/f3 PNG, examen final como criterio y el
  *                                          panel «Tu certificado» con $@BADGESVIEWBYID*curso@$
  *   QUIZ_FEEDBACK                          QUIZFB: retroalimentación global «aprobaste / todavía no» con la nota mínima del perfil
- *   QUIZ_REVIEW / QUIZ_COMPLETION          EV6 P2-B1: revisión de las respuestas propias al terminar sin nota por pregunta (V542 I1), nota total más tarde; attemptsexhausted = intentos > 0
+ *   QUIZ_REVIEW / QUIZ_COMPLETION          EV6 P2-B1: revisión de las respuestas propias al terminar sin nota por pregunta (V542 I1), nota total más tarde;
+ *                                          r55 (R6): completionminattempts = intentos (si > 0), attemptsexhausted 0
  *   QUIZ_RANDOM / EXPLANATIONS_GATE /      EV6 P2-B5 (exam-validator-v3.ts): banco aleatorio por hoja,
  *   ANSWER_LEAK                            página «Respuestas explicadas» gated por SU quiz, ningún par
  *                                          enunciado + respuesta correcta fuera de su página
@@ -46,33 +56,19 @@ import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
 import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
-import { APPLICATION_SOLUTION_MARKERS_RE, CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, CertificateRequirements, CourseFacts, chapterNextSteps, closingCertificateText, examOverallFeedbackBands, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
+import { APPLICATION_SOLUTION_MARKERS_RE, CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, EXAMS_TEACHER_NOTE_UNLIMITED, CourseFacts, chapterNextSteps, closingCertificateText, courseApprovalRequirements, courseApprovalTeacherNote, courseHasGrades, examOverallFeedbackBands, examsHaveUnlimitedAttempts, examsTeacherNoteFor, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
 import { courseBadgeDescription } from './course-badge';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
 import {
-  CURSIA_H5P_PROFILE_V1,
   CURSIA_H5P_PROFILE_V3,
   H5P_MOODLE_GRADING,
-  H5P_BUNDLE_LICENSE_NOTICE_FILE,
-  H5pLibraryStoreManifest,
-  h5pLibraryDirName,
-  openH5pLibraryStore,
-  profileBundledMainLibraries,
-  profileDeltaDirs,
 } from '../h5p';
 
 /** r19 W: palabras visibles (sin guiones suaves). */
 const wordCountText = (t: string): number => t.replace(/[\u00AD\u200B]/g, '').trim().split(/\s+/).filter(Boolean).length;
-
-// EV6 H5P v2 (fix round 1, m-3): manifest del store (lista de archivos y sha256 por carpeta delta), leído una vez.
-let storeManifestMemo: H5pLibraryStoreManifest | null = null;
-function storeManifest(): H5pLibraryStoreManifest {
-  if (!storeManifestMemo) storeManifestMemo = openH5pLibraryStore(CURSIA_H5P_PROFILE_V3).manifest;
-  return storeManifestMemo;
-}
 
 const ACTIVITY_MAIN_LIBRARY: Record<string, string> = {
   questionset: 'H5P.QuestionSet',
@@ -141,7 +137,9 @@ interface ParsedActivity {
   moduleXmlId: number;
   actXmlModuleId: number;
   /** P2-B1: solo para modname 'quiz' — campos crudos de quiz.xml que no tienen otro lugar en ParsedActivity. */
-  quiz: { attempts_number: string; completionattemptsexhausted: string; feedbacks: Array<{ text: string; min: number; max: number }> } & Record<keyof typeof QUIZ_REVIEW_V3, string> | null;
+  quiz: { attempts_number: string; completionattemptsexhausted: string; completionminattempts: string; feedbacks: Array<{ text: string; min: number; max: number }> } & Record<keyof typeof QUIZ_REVIEW_V3, string> | null;
+  /** r55: solo h5pactivity — `grade` y `enabletracking` de h5pactivity.xml. */
+  h5p: { grade: string; enabletracking: string } | null;
 }
 
 interface ParsedFile {
@@ -321,7 +319,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const inf = (await text(`${dir}/inforef.xml`)) ?? '';
     const fileref = tag(inf, 'fileref') ?? '';
     const module: Record<string, string> = {};
-    for (const k of ['idnumber', 'completion', 'completiongradeitemnumber', 'completionpassgrade', 'completionview', 'sectionnumber', 'visible', 'visibleold']) {
+    for (const k of ['idnumber', 'completion', 'completiongradeitemnumber', 'completionpassgrade', 'completionview', 'sectionnumber', 'visible', 'visibleold', 'availability']) {
       module[k] = tag(moduleXml, k) ?? '';
     }
     let grade: Record<string, string> | null = null;
@@ -349,12 +347,14 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         ? {
             attempts_number: tag(actXml, 'attempts_number') ?? '',
             completionattemptsexhausted: tag(actXml, 'completionattemptsexhausted') ?? '',
+            completionminattempts: tag(actXml, 'completionminattempts') ?? '',
             feedbacks: [...actXml.matchAll(/<feedback id="\d+">([\s\S]*?)<\/feedback>/g)].map((m) => ({
               text: unxml(tag(m[1], 'feedbacktext') ?? ''), min: Number(tag(m[1], 'mingrade')), max: Number(tag(m[1], 'maxgrade')),
             })),
             ...(Object.fromEntries(Object.keys(QUIZ_REVIEW_V3).map((k) => [k, tag(actXml, k) ?? ''])) as Record<keyof typeof QUIZ_REVIEW_V3, string>),
           }
         : null,
+      h5p: modname === 'h5pactivity' ? { grade: tag(actXml, 'grade') ?? '', enabletracking: tag(actXml, 'enabletracking') ?? '' } : null,
     });
   }
   const byMid = new Map(acts.map((a) => [a.mid, a]));
@@ -367,6 +367,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     add('FILES_INTEGRITY', 'files.xml', `archivo repetido (ctx|component|filearea|filename) ${d}`);
   }
   for (const a of acts) {
+    // r55 (moodle-versions.md): availability es texto XML — un `&` (p. ej. `"op":"&"`) o `<` crudo aborta la restauración.
+    if (/&(?!amp;|lt;|gt;|quot;|#39;)|</.test(a.module.availability ?? '')) add('STRUCTURE', a.dir, `availability con & o < sin escapar en XML: ${a.module.availability}`);
     if (a.moduleXmlId !== a.mid || a.actXmlModuleId !== a.mid) add('STRUCTURE', a.dir, `moduleid incoherente (backup ${a.mid}, module.xml ${a.moduleXmlId}, ${a.modname}.xml ${a.actXmlModuleId})`);
     const want = a.gradeItemId !== null ? [a.gradeItemId] : [];
     if (JSON.stringify(a.inforefGradeItems) !== JSON.stringify(want)) add('STRUCTURE', a.dir, `grade_itemref ${a.inforefGradeItems.join(',')} ≠ grades.xml ${want.join(',')}`);
@@ -532,8 +534,14 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (g.itemmodule !== a.modname) add('GRADEPASS', a.dir, `itemmodule ${g.itemmodule} ≠ ${a.modname}`);
     if (num(g.categoryid) !== catIdByKey.get(k.category)) add('CATEGORIES', a.dir, `categoryid ${g.categoryid} ≠ categoría ${k.category}`);
     const md = a.module;
-    if (md.completion !== '2' || md.completiongradeitemnumber !== '0' || md.completionpassgrade !== '1') {
-      add('COMPLETION', a.dir, `completion ${md.completion}/${md.completiongradeitemnumber}/${md.completionpassgrade} ≠ 2/0/1`);
+    // r55 (R5/R6): todo ítem evaluativo se completa al RECIBIR nota (completionusegrade = completiongradeitemnumber 0),
+    // sin nota aprobatoria (su gradepass es informativo: la aprobación del curso es la nota final).
+    if (md.completion !== '2' || md.completiongradeitemnumber !== '0' || md.completionpassgrade !== '0' || md.completionview !== '0') {
+      add('COMPLETION', a.dir, `completion ${md.completion}/${md.completiongradeitemnumber}/${md.completionpassgrade}/${md.completionview} ≠ 2/0/0/0 (recibir nota)`);
+    }
+    // r55 (R2): H5P evaluativo con seguimiento (xAPI → intento → nota) y escala 0–100.
+    if (a.modname === 'h5pactivity' && (a.h5p?.enabletracking !== '1' || a.h5p?.grade !== '100')) {
+      add('COMPLETION', a.dir, `H5P evaluativo con enabletracking ${a.h5p?.enabletracking} / grade ${a.h5p?.grade} ≠ 1/100`);
     }
     // P2-B1: el quiz nunca revela corrección/retroalimentación/respuesta tras un intento, y
     // `completionattemptsexhausted` debe seguir a `attempts_number` (si no, un intento fallido con
@@ -553,9 +561,13 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
           add('QUIZ_FEEDBACK', a.dir, `retroalimentación global ${JSON.stringify(q.feedbacks.map((f) => [f.min, f.max]))} ≠ bandas de la nota mínima ${resolved.kinds[kind].passingGrade}`);
         }
       }
-      const wantExhausted = Number(q.attempts_number) > 0 ? '1' : '0';
-      if (q.completionattemptsexhausted !== wantExhausted) {
-        add('QUIZ_COMPLETION', a.dir, `completionattemptsexhausted ${q.completionattemptsexhausted} ≠ ${wantExhausted} (attempts_number ${q.attempts_number})`);
+      // r55 (R6): completo SOLO tras usar todos los intentos (completionminattempts = intentos; 0 si ilimitados), sin la
+      // regla «aprobar o agotar» (completionattemptsexhausted 0) ni nota aprobatoria; los intentos y el método salen del perfil.
+      const att = Number(q.attempts_number);
+      if (!Number.isInteger(att) || att < 0 || att !== resolved.kinds[kind].attempts) add('QUIZ_COMPLETION', a.dir, `attempts_number ${q.attempts_number} ≠ perfil ${resolved.kinds[kind].attempts}`);
+      if (q.completionattemptsexhausted !== '0') add('QUIZ_COMPLETION', a.dir, `completionattemptsexhausted ${q.completionattemptsexhausted} ≠ 0`);
+      if (q.completionminattempts !== String(Number.isInteger(att) && att > 0 ? att : 0)) {
+        add('QUIZ_COMPLETION', a.dir, `completionminattempts ${q.completionminattempts} ≠ ${Number.isInteger(att) && att > 0 ? att : 0} (attempts_number ${q.attempts_number})`);
       }
     }
   }
@@ -563,6 +575,10 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const viewCompletion = (a: ParsedActivity) => resolved.withoutGrades === true && a.modname === 'resource' && a.idnumber === 'cv3:shell:libro';
   // Fase 2: la página de la Actividad de Aplicación se completa por vista (seguimiento; nunca criterio del curso).
   const applicationView = (a: ParsedActivity) => a.modname === 'page' && (APPLICATION_RE.test(a.idnumber) || GUIDED_PRACTICE_RE.test(a.idnumber));
+  for (const a of acts.filter((x) => !GRADED.has(x.modname) || REVIEW_CARDS_RE.test(x.idnumber))) {
+    // r55 (R1): lo pedagógico (labels, páginas, foro, Libro, «Repaso») nunca es ítem de calificación.
+    if (a.grade || a.inforefGradeItems.length) add('PEDAGOGICAL', a.dir, `${a.idnumber} (pedagógico) con ítem de calificación`);
+  }
   for (const a of acts.filter((x) => !GRADED.has(x.modname))) {
     if (applicationView(a)) {
       if (a.module.completion !== '2' || a.module.completionview !== '1') add('APPLICATION', a.dir, `Actividad de Aplicación con completion ${a.module.completion}/${a.module.completionview} ≠ 2/1`);
@@ -669,19 +685,35 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   if (gradedActs.filter((g) => g.kind === 'exam').length !== facts.counts.exams) add('STRUCTURE', 'graded', 'cantidad de exámenes de módulo ≠ facts');
   if (gradedActs.filter((g) => g.kind === 'finalExam').length !== (facts.finalExam.enabled ? 1 : 0)) add('STRUCTURE', 'graded', 'examen final ≠ facts');
 
-  // ── completion del curso ──
+  // ── completion del curso ── r55 (R3/R8): invariantes que NO dependen de las banderas del perfil.
   const comp = (await text('completion.xml')) ?? '';
-  const crit = blocks(comp, 'course_completion_criteria').map((b) => ({ type: num(tag(b, 'criteriatype')), mi: num(tag(b, 'moduleinstance')), gp: tag(b, 'gradepass') }));
-  const wantCrit = resolved.withoutGrades === true
-    ? acts.filter(viewCompletion).map((a) => a.mid)
-    : completionCriteriaFor(gradedActs.map((g) => ({ moduleId: g.a.mid, modname: g.a.modname as 'quiz', kind: g.kind })), resolved.courseCompletion)
-      .map((c) => c.moduleId);
-  if (resolved.withoutGrades === true && wantCrit.length !== 1) add('COURSE_COMPLETION', 'completion.xml', `curso sin nota: se esperaba el Libro Guía como criterio (hay ${wantCrit.length})`);
+  const crit = blocks(comp, 'course_completion_criteria').map((b) => ({ type: num(tag(b, 'criteriatype')), mi: num(tag(b, 'moduleinstance')), mod: tag(b, 'module'), gp: tag(b, 'gradepass') }));
   const gotCrit = crit.filter((c) => c.type === 4).map((c) => c.mi);
-  if (JSON.stringify(gotCrit) !== JSON.stringify(wantCrit)) add('COURSE_COMPLETION', 'completion.xml', `criterios ${gotCrit.join(',')} ≠ ${wantCrit.join(',')}`);
   const gradeCrit = crit.filter((c) => c.type === 6);
-  if (resolved.courseCompletion.requireCourseGradePass !== (gradeCrit.length === 1)) add('COURSE_COMPLETION', 'completion.xml', 'criterio de nota del curso incoherente con el perfil');
-  if (gradeCrit.length === 1 && num(gradeCrit[0].gp) !== resolved.courseGradepass) add('COURSE_COMPLETION', 'completion.xml', 'gradepass del criterio de curso ≠ perfil');
+  for (const c of crit.filter((x) => x.type !== 4 && x.type !== 6)) add('COURSE_COMPLETION', 'completion.xml', `criterio de tipo ${c.type} no permitido`);
+  const aggr = blocks(comp, 'course_completion_aggr_methd').map((b) => ({ ct: tag(b, 'criteriatype'), method: tag(b, 'method') }));
+  if (crit.length && (aggr.length !== 1 || aggr[0].ct !== '$@NULL@$' || aggr[0].method !== '1')) add('COURSE_COMPLETION', 'completion.xml', `agregación ${JSON.stringify(aggr)} ≠ una global ALL (1)`);
+  const graded = gradedActs.length > 0;
+  if (graded) {
+    if (resolved.withoutGrades === true) add('COURSE_COMPLETION', 'completion.xml', 'curso con ítems calificables resuelto como sin nota');
+    // CRITERIA_ACTIVITY: aprobar/completar actividades nunca aprueba el curso, y una actividad bajo su mínimo no lo bloquea.
+    if (gotCrit.length) add('CRITERIA_ACTIVITY', 'completion.xml', `curso con nota con ${gotCrit.length} criterio(s) de actividad (${gotCrit.join(',')}): solo la nota final aprueba el curso`);
+    if (gradeCrit.length !== 1) add('GRADE_CRITERION', 'completion.xml', `curso con nota con ${gradeCrit.length} criterio(s) de nota del curso (se exige exactamente 1)`);
+    else {
+      const gp = num(gradeCrit[0].gp);
+      if (!(gp > 0 && gp <= 100)) add('GRADE_CRITERION', 'completion.xml', `gradepass del criterio de nota ${gradeCrit[0].gp} fuera de (0, 100]`);
+      if (gp !== courseItem?.gradepass) add('GRADE_CRITERION', 'completion.xml', `gradepass del criterio de nota ${gp} ≠ gradepass del ítem del curso ${courseItem?.gradepass}`);
+      if (gp !== resolved.courseGradepass) add('GRADE_CRITERION', 'completion.xml', `gradepass del criterio de nota ${gp} ≠ nota mínima del perfil ${resolved.courseGradepass}`);
+      if (facts.assessment.coursePassingGrade !== undefined && gp !== facts.assessment.coursePassingGrade) add('GRADE_CRITERION', 'completion.xml', `gradepass del criterio de nota ${gp} ≠ facts ${facts.assessment.coursePassingGrade}`);
+    }
+    if (resolved.courseCompletion.requireCourseGradePass !== true) add('GRADE_CRITERION', 'resolved', 'la evaluación resuelta de un curso con nota no exige la nota del curso');
+  } else {
+    // Curso sin nota: el Libro Guía por vista es el único criterio; sin criterio de nota.
+    const wantCrit = resolved.withoutGrades === true ? acts.filter(viewCompletion).map((a) => a.mid) : [];
+    if (resolved.withoutGrades === true && wantCrit.length !== 1) add('COURSE_COMPLETION', 'completion.xml', `curso sin nota: se esperaba el Libro Guía como criterio (hay ${wantCrit.length})`);
+    if (JSON.stringify(gotCrit) !== JSON.stringify(wantCrit)) add('COURSE_COMPLETION', 'completion.xml', `criterios ${gotCrit.join(',')} ≠ ${wantCrit.join(',')}`);
+    if (gradeCrit.length) add('COURSE_COMPLETION', 'completion.xml', 'curso sin nota con criterio de nota del curso');
+  }
 
   const backupCourseId = num(tag(mb, 'original_course_id'));
   const backupCourseCtx = num(tag(mb, 'original_course_contextid'));
@@ -692,6 +724,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (a.module.visible === '1') continue;
       // Fase 2: el solucionario docente de cada Actividad de Aplicación va oculto (lo verifica la regla APPLICATION).
       if (APPLICATION_SOLUTION_RE.test(a.idnumber)) continue;
+      // r55 (R6): «Respuestas explicadas» de un quiz con intentos ilimitados va oculta (lo verifica EXPLANATIONS_GATE).
+      if (a.modname === 'page' && /^cv3:(exam_explanations:|final_exam_explanations$)/.test(a.idnumber)) continue;
       if (a.idnumber !== allowed) add('CERTIFICATE', a.idnumber, `módulo oculto inesperado (visible=${a.module.visible}): solo el label para docentes del certificado (o, sin él, el de las evaluaciones) puede estarlo`);
     }
   };
@@ -714,7 +748,11 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const h = holders[0];
     const t = extractText(h.intro);
     if (h.modname !== 'label' || h.module.visible !== '0') add('TEACHER_NOTE', h.idnumber, `la nota para docentes debe ir en un label oculto (visible=0), es ${h.modname} visible=${h.module.visible}`);
-    if (!t.includes(withCertificate ? EXAMS_TEACHER_NOTE : EXAMS_TEACHER_NOTE_ATTEMPTS)) add('TEACHER_NOTE', h.idnumber, 'la nota para docentes no trae las dos oraciones (acceso condicional + intentos adicionales)');
+    if (!t.includes(withCertificate ? examsTeacherNoteFor(facts) : EXAMS_TEACHER_NOTE_ATTEMPTS)) add('TEACHER_NOTE', h.idnumber, 'la nota para docentes no trae las dos oraciones (acceso condicional + intentos adicionales)');
+    // r55 (R6): con intentos ilimitados, la nota explica que la página queda oculta hasta que el docente la muestre.
+    if (examsHaveUnlimitedAttempts(facts) && !t.includes(EXAMS_TEACHER_NOTE_UNLIMITED)) add('TEACHER_NOTE', h.idnumber, 'falta la nota de las evaluaciones con intentos ilimitados (página oculta hasta que el docente la muestre)');
+    // r55 (R4): la regla real de aprobación (criterio único de nota final, cron, override manual sin efecto).
+    if (courseHasGrades(facts) && !t.includes(courseApprovalTeacherNote(courseApprovalRequirements(facts)))) add('TEACHER_NOTE', h.idnumber, 'la nota para docentes no explica la regla de aprobación (nota final)');
     if (!withCertificate) {
       const first = acts.find((a) => a.sectionid === h.sectionid);
       if (first !== h) add('TEACHER_NOTE', h.idnumber, 'la nota para docentes debe ser lo primero de su sección');
@@ -762,25 +800,20 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     for (const [k, v] of Object.entries(fields)) if (tag(b, k) !== v) add('CERTIFICATE', W, `<${k}> ${tag(b, k)} ≠ ${v}`);
     if (!(tag(b, 'issuername') ?? '').trim()) add('CERTIFICATE', W, 'sin emisor');
     if (!(unxml(tag(b, 'message') ?? '')).includes('%badgename%')) add('CERTIFICATE', W, 'el mensaje no usa %badgename%');
-    // Fix round 1 (review I1): descripción y panel nombran EXACTAMENTE los criterios reales.
-    const critSet = new Set(gotCrit);
-    const kindsReq = new Set(gradedActs.filter((g) => critSet.has(g.a.mid)).map((g) => g.kind));
-    const req: CertificateRequirements = {
-      activities: kindsReq.has('activity'),
-      videos: kindsReq.has('video'),
-      moduleExams: kindsReq.has('exam'),
-      finalExam: kindsReq.has('finalExam'),
-      courseGrade: gradeCrit.length > 0,
-    };
-    if (!req.finalExam) {
-      // (el chequeo de completion de abajo también lo reporta) — el validador nunca lanza.
-      add('CERTIFICATE', 'completion.xml', 'la insignia existe pero la evaluación final no es criterio de completion');
-    } else {
+    // r55 (R4/R8): la insignia se otorga al COMPLETAR el curso, y eso exige el criterio de nota (GRADE_CRITERION_CERT);
+    // descripción y panel enuncian la regla real (nota final ≥ mínimo, pesos), nunca «aprobar todas…».
+    if (gradeCrit.length !== 1) add('GRADE_CRITERION_CERT', 'completion.xml', 'la insignia-certificado existe pero el curso no exige la nota final (criterio de nota)');
+    if (!courseHasGrades(facts)) add('CERTIFICATE', W, 'insignia en un curso sin nota');
+    else {
+      const req = courseApprovalRequirements(facts);
       const wantDesc = courseBadgeDescription(safeActivityName(facts.course.title, 254), req);
       const desc = unxml(tag(b, 'description') ?? '');
-      if (desc !== wantDesc) add('CERTIFICATE', W, `descripción «${desc}» ≠ criterios reales «${wantDesc}»`);
+      if (desc !== wantDesc) add('CERTIFICATE', W, `descripción «${desc}» ≠ regla real «${wantDesc}»`);
       const closingTxt = extractText(acts.find((a) => a.idnumber === 'cv3:shell:closing')?.intro ?? '');
-      if (!closingTxt.includes(closingCertificateText(req))) add('CERTIFICATE', 'cv3:shell:closing', `el panel no enuncia los criterios reales: «${closingCertificateText(req)}»`);
+      if (!closingTxt.includes(closingCertificateText(req))) add('CERTIFICATE', 'cv3:shell:closing', `el panel no enuncia la regla real: «${closingCertificateText(req)}»`);
+    }
+    if (/aprobar todas|apruebes todas|todas las actividades|todos los videos|todas las evaluaciones/i.test(unxml(tag(b, 'description') ?? ''))) {
+      add('CERTIFICATE', W, 'la descripción de la insignia exige aprobar todas las actividades (la regla es la nota final)');
     }
     const crits = blocks(b, 'criterion').map((c) => ({
       type: num(tag(c, 'criteriatype')),
@@ -807,12 +840,6 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       const png = blob && blob.length > 24 && blob.readUInt32BE(0) === 0x89504e47 && blob.toString('latin1', 12, 16) === 'IHDR';
       if (!png || blob.readUInt32BE(16) !== size || blob.readUInt32BE(20) !== size) add('CERTIFICATE', 'files.xml', `${fn} no es una PNG de ${size}×${size}`);
     }
-    // Completion del curso: el examen final (si hay) es criterio y solo cuenta aprobado.
-    const fin = gradedActs.find((g) => g.kind === 'finalExam');
-    if (fin) {
-      if (!gotCrit.includes(fin.a.mid)) add('CERTIFICATE', 'completion.xml', 'la evaluación final no es criterio de completion del curso');
-      if (fin.a.module.completionpassgrade !== '1') add('CERTIFICATE', fin.a.dir, 'la evaluación final no exige nota aprobatoria (completionpassgrade)');
-    }
     const closingLbl = acts.find((a) => a.idnumber === 'cv3:shell:closing');
     const tok = `$@BADGESVIEWBYID*${backupCourseId}@$`;
     if (!closingLbl || !closingLbl.intro.includes(`href="${tok}"`) || !extractText(closingLbl.intro).includes('Tu certificado')) {
@@ -827,6 +854,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (!teacher.intro.includes(`href="${tok}"`) || !t.includes('Habilitar acceso') || !t.includes(`«${name}»`) || !t.includes(CERTIFICATE_TEACHER_TROUBLESHOOTING)) {
         add('CERTIFICATE', teacher.idnumber, `sin el paso «Habilitar acceso» de «${name}» o sin el enlace ${tok}`);
       }
+      if (courseHasGrades(facts) && !t.includes(courseApprovalTeacherNote(courseApprovalRequirements(facts)))) add('CERTIFICATE', teacher.idnumber, 'el label para docentes no explica la regla de aprobación (nota final, cron)');
     }
     checkHidden('cv3:shell:certificate_teacher');
     checkExamsTeacher(true);
@@ -983,12 +1011,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // ── EV6 P2-B5: banco aleatorio, página gated, fugas de respuestas ──
   for (const i of examChecksV3(await readExamPackageV3(zip), { facts, examBankPlans: exp.examBankPlans })) add(i.code, i.where, i.message);
 
-  // ── H5P ──
-  const profileKeys = new Set(CURSIA_H5P_PROFILE_V1.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
-  const mainKeys = new Set(Object.values(CURSIA_H5P_PROFILE_V1.mainLibraries).map((l) => l.machineName));
-  // EV6 H5P v2: principales con delta bundling y su perfil. UX #5 (r18): perfil v3 (BS, DC y QuestionSet 1.21).
-  const bundledMains = new Set(profileBundledMainLibraries(CURSIA_H5P_PROFILE_V3));
-  const bundledProfileByDir = new Map(CURSIA_H5P_PROFILE_V3.libraries.map((l) => [h5pLibraryDirName(l), l]));
+  // ── H5P ── r55 (R7): TODO .h5p del curso es solo contenido (h5p.json + content/): sus librerías vienen del pack
+  // del sitio (v3 si hay QuestionSet 1.21, caso ramificado o «Repaso»). Una carpeta de librería en el paquete es
+  // H5P_LIBRARIES; y si trae alguna, su clausura de dependencias debe ser completa (H5P_PARTIAL_LIBRARY_CLOSURE): una
+  // clausura parcial de una librería instalada cuelga `H5PValidator::isValidPackage` (dialogcards-diagnosis.md).
+  const profileKeys = new Set(CURSIA_H5P_PROFILE_V3.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
+  const mainRefs = CURSIA_H5P_PROFILE_V3.mainLibraries as Record<string, { majorVersion: number; minorVersion: number }>;
   const h5pActs = acts.filter((a) => a.modname === 'h5pactivity');
   for (const a of h5pActs) {
     const mine = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_h5pactivity' && f.filename !== '.');
@@ -1006,55 +1034,40 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     const blob = await bin(`files/${pkg.hash.slice(0, 2)}/${pkg.hash}`);
     if (!blob) continue;
     try {
-      // Solo el directorio central + h5p.json (+ library.json de cada carpeta si es bundled):
-      // los JS/CSS/fuentes de las librerías nunca se inflan.
+      // Solo el directorio central + h5p.json (+ library.json de cada carpeta, si las hubiera): los JS/CSS nunca se inflan.
       const hz = await JSZip.loadAsync(blob);
       const names = Object.keys(hz.files).filter((n) => !hz.files[n].dir);
       const extra = names.filter((n) => n !== 'h5p.json' && !n.startsWith('content/'));
       const hjFile = hz.file('h5p.json');
-      // Sin h5p.json: mismo hallazgo y mismo error que antes de H5P v2.
-      if (!hjFile && extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${extra.slice(0, 3).join(', ')}`);
-      const hj = JSON.parse(await hjFile!.async('string'));
-      const bundled = bundledMains.has(hj.mainLibrary);
-      if (!bundled) {
-        if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${extra.slice(0, 3).join(', ')}`);
-        if (!mainKeys.has(hj.mainLibrary)) add('H5P_LIBRARIES', a.idnumber, `librería principal fuera del perfil: ${hj.mainLibrary}`);
-      } else {
-        // Carpetas de librería del paquete == delta calculada (ni una de más ni de menos).
-        const want = profileDeltaDirs(CURSIA_H5P_PROFILE_V3, hj.mainLibrary);
-        const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
-        const missingDirs = want.filter((d) => !tops.includes(d));
-        const extraDirs = tops.filter((d) => !want.includes(d));
-        if (missingDirs.length) add('H5P_LIBRARIES', a.idnumber, `faltan carpetas de librería del delta del perfil: ${missingDirs.slice(0, 5).join(', ')}`);
-        if (extraDirs.length) add('H5P_LIBRARIES', a.idnumber, `carpetas fuera del delta del perfil de ${hj.mainLibrary}: ${extraDirs.slice(0, 5).join(', ')}`);
-        const storeLibs = new Map(storeManifest().libraries.map((l) => [l.dir, l]));
-        for (const d of tops.filter((x) => want.includes(x))) {
-          // Archivos de la carpeta == los del store (nombres; sha256 de library.json). Los JS/CSS no se inflan.
-          const st = storeLibs.get(d);
-          const inPkg = extra.filter((n) => n.startsWith(`${d}/`)).map((n) => n.slice(d.length + 1)).sort();
-          // EV6 H5P v2 (H2, m-8): + el aviso LICENSE.txt que agrega buildBundledH5p (si el store no lo trae).
-          const inStore = st
-            ? [...st.files.map((f) => f.path), ...(st.files.some((f) => f.path === H5P_BUNDLE_LICENSE_NOTICE_FILE) ? [] : [H5P_BUNDLE_LICENSE_NOTICE_FILE])].sort()
-            : [];
-          const missingFiles = inStore.filter((f) => !inPkg.includes(f));
-          const extraFiles = inPkg.filter((f) => !inStore.includes(f));
-          if (missingFiles.length) add('H5P_LIBRARIES', a.idnumber, `${d}: faltan archivos del store: ${missingFiles.slice(0, 3).join(', ')}${missingFiles.length > 3 ? ` (+${missingFiles.length - 3})` : ''}`);
-          if (extraFiles.length) add('H5P_LIBRARIES', a.idnumber, `${d}: archivos que no están en el store: ${extraFiles.slice(0, 3).join(', ')}${extraFiles.length > 3 ? ` (+${extraFiles.length - 3})` : ''}`);
+      if (!hjFile) {
+        add('H5P_LIBRARIES', a.idnumber, 'el paquete no tiene h5p.json');
+        continue;
+      }
+      const hj = JSON.parse(await hjFile.async('string'));
+      const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
+      if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${tops.slice(0, 5).join(', ')} (las librerías vienen del pack del sitio)`);
+      // Clausura: toda dependencia (preloaded/dynamic/editor) de un library.json incluido debe venir incluida.
+      if (tops.length) {
+        const bundled = new Set<string>();
+        const deps: string[] = [];
+        for (const d of tops) {
           const lf = hz.file(`${d}/library.json`);
-          if (!lf) {
-            add('H5P_LIBRARIES', a.idnumber, `${d} sin library.json`);
-            continue;
+          if (!lf) continue;
+          const lj = JSON.parse(await lf.async('string'));
+          bundled.add(`${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}`);
+          for (const k of ['preloadedDependencies', 'dynamicDependencies', 'editorDependencies']) {
+            for (const dep of (lj[k] ?? []) as Array<{ machineName: string; majorVersion: number; minorVersion: number }>) deps.push(`${dep.machineName} ${dep.majorVersion}.${dep.minorVersion}`);
           }
-          const ljBuf = await lf.async('nodebuffer');
-          const ljStore = st?.files.find((f) => f.path === 'library.json');
-          if (ljStore && createHash('sha256').update(ljBuf).digest('hex') !== ljStore.sha256) {
-            add('H5P_LIBRARIES', a.idnumber, `${d}: library.json distinto del store (sha256)`);
-          }
-          const lj = JSON.parse(ljBuf.toString('utf8'));
-          const ref = bundledProfileByDir.get(d)!;
-          if (lj.machineName !== ref.machineName || lj.majorVersion !== ref.majorVersion || lj.minorVersion !== ref.minorVersion || lj.patchVersion !== ref.patchVersion) {
-            add('H5P_LIBRARIES', a.idnumber, `${d}: library.json ${lj.machineName} ${lj.majorVersion}.${lj.minorVersion}.${lj.patchVersion} ≠ perfil ${ref.patchVersion}`);
-          }
+        }
+        const missing = [...new Set(deps.filter((x) => !bundled.has(x)))].sort();
+        if (missing.length) add('H5P_PARTIAL_LIBRARY_CLOSURE', a.idnumber, `carpetas de librería con dependencias que no vienen en el paquete: ${missing.slice(0, 5).join(', ')}${missing.length > 5 ? ` (+${missing.length - 5})` : ''}`);
+      }
+      const main = mainRefs[hj.mainLibrary];
+      if (!main) add('H5P_LIBRARIES', a.idnumber, `librería principal fuera del perfil: ${hj.mainLibrary}`);
+      else {
+        const first = (hj.preloadedDependencies ?? [])[0];
+        if (!first || first.machineName !== hj.mainLibrary || first.majorVersion !== main.majorVersion || first.minorVersion !== main.minorVersion) {
+          add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} declarado ${first ? `${first.majorVersion}.${first.minorVersion}` : '(nada)'} ≠ perfil v3 ${main.majorVersion}.${main.minorVersion}`);
         }
       }
       // G6 M7: la librería principal debe corresponder al rol (video → IV; actividad → tipo de facts: h5pType del Manifest o, legacy, R-012 del UUID; calificable en Moodle).
@@ -1073,16 +1086,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         if (!H5P_MOODLE_GRADING[hj.mainLibrary]?.gradable) add('H5P_LIBRARIES', a.idnumber, `${hj.mainLibrary} no es calificable en Moodle (R-011)`);
         if (want && hj.mainLibrary !== want) add('H5P_LIBRARIES', a.idnumber, `la actividad del capítulo debe ser ${want} (R-012), vino ${hj.mainLibrary}`);
       }
-      // Fix round 1 (I-1): un paquete bundled solo puede declarar lo que el sitio ya tiene (perfil v1)
-      // o lo que trae adentro (SU delta) — nunca otra librería de v2 que no viaja en el paquete.
-      const allowedDeps = bundled
-        ? new Set([...profileKeys, ...(CURSIA_H5P_PROFILE_V3.deltaByMain![hj.mainLibrary] || []).map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`)])
-        : profileKeys;
       for (const d of hj.preloadedDependencies ?? []) {
         const k = `${d.machineName} ${d.majorVersion}.${d.minorVersion}`;
-        if (!allowedDeps.has(k)) {
-          add('H5P_LIBRARIES', a.idnumber, bundled ? `dependencia ni en el perfil v1 ni en la delta de ${hj.mainLibrary}: ${k}` : `dependencia fuera del perfil: ${k}`);
-        }
+        if (!profileKeys.has(k)) add('H5P_LIBRARIES', a.idnumber, `dependencia fuera del perfil v3 (pack del sitio): ${k}`);
       }
     } catch (err) {
       add('H5P_LIBRARIES', a.idnumber, `no se pudo leer el .h5p: ${err instanceof Error ? err.message : String(err)}`);

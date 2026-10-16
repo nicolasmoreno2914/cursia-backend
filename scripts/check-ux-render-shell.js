@@ -483,7 +483,7 @@ function assertSharp(label, m) {
   });
   const engines = {};
   for (const engine of ['h5p', 'scorm']) {
-    await check(`(e) paquete ${engine}: ${engine === 'h5p' ? 'SIN' : 'CON'} botón «Iniciar actividad» en la instrucción; ${engine === 'h5p' ? 'el intro embebido conserva «Ábrela en su propia página →»' : 'apunta a su SCORM'}; finalización por aprobado intacta`, async () => {
+    await check(`(e) paquete ${engine}: ${engine === 'h5p' ? 'SIN' : 'CON'} botón «Iniciar actividad» en la instrucción; ${engine === 'h5p' ? 'el intro embebido conserva «Ábrela en su propia página →»' : 'apunta a su SCORM'}; finalización al recibir nota (r55)`, async () => {
       const r = engine === 'h5p' ? built['aula-clara-light'] : await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine, finalExam: true, theme: { themeFamily: 'editorial', mode: 'light' } }));
       engines[engine] = r;
       const P = await pkg(r.mbz);
@@ -505,7 +505,7 @@ function assertSharp(label, m) {
           assert(intro.includes('Iniciar actividad →') && intro.includes(`href="$@SCORMVIEWBYID*${next.mid}@$"`), `${a.idnumber}: botón al SCORM`);
           assert(!intro.includes('cursia-cta://'), `${a.idnumber}: marcador next-activity resuelto`);
         }
-        assert(/<completion>2<\/completion>/.test(next.module) && /<completionpassgrade>1<\/completionpassgrade>/.test(next.module) && /<completionview>0<\/completionview>/.test(next.module), `${next.idnumber}: finalización por aprobado`);
+        assert(/<completion>2<\/completion>/.test(next.module) && /<completionpassgrade>0<\/completionpassgrade>/.test(next.module) && /<completiongradeitemnumber>0<\/completiongradeitemnumber>/.test(next.module) && /<completionview>0<\/completionview>/.test(next.module), `${next.idnumber}: finalización al recibir nota (r55)`);
         const grades = await P.z.file(`${next.dir}/grades.xml`).async('string');
         assert(/<grade_item id="\d+">/.test(grades) && /<grademax>100\.00000<\/grademax>/.test(grades), `${next.idnumber}: grade item`);
       }

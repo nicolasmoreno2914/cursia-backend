@@ -147,8 +147,10 @@ async function readPkg(mbz) {
   return { z, mb, acts, seq, completion: await T('completion.xml'), byId: (id) => acts.find((a) => a.idnumber === id) };
 }
 
+// r55 (R6): con intentos > 0 la MISMA forma e=1 | e=3, pero el quiz solo llega a esos estados al usar todos los
+// intentos (completionminattempts); con intentos ilimitados: sin availability y página OCULTA hasta que el docente la muestre.
 const AVAIL = (mid, attempts) => attempts === 0
-  ? `{"op":"|","show":false,"c":[{"type":"completion","cm":${mid},"e":1}]}`
+  ? '$@NULL@$'
   : `{"op":"|","show":false,"c":[{"type":"completion","cm":${mid},"e":1},{"type":"completion","cm":${mid},"e":3}]}`;
 
 /** Comprobaciones de estructura comunes a todo paquete con exámenes. */
@@ -176,7 +178,8 @@ function checkPages(R, manifest) {
     assert(Number.isInteger(attempts), `${q.idnumber}: attempts_number`);
     eq(tag(p.module, 'availability'), AVAIL(q.mid, attempts), `${pid}: availability byte-exacta (intentos ${attempts})`);
     p.attempts = attempts;
-    eq([tag(p.module, 'completion'), tag(p.module, 'downloadcontent'), tag(p.module, 'visible'), tag(p.module, 'modulename')], ['0', '0', '1', 'page'], `${pid}: completion/downloadcontent/visible`);
+    eq([tag(p.module, 'completion'), tag(p.module, 'downloadcontent'), tag(p.module, 'visible'), tag(p.module, 'modulename')], ['0', '0', attempts === 0 ? '0' : '1', 'page'], `${pid}: completion/downloadcontent/visible`);
+    eq([tag(q.act, 'completionminattempts'), tag(q.act, 'completionattemptsexhausted')], [String(attempts), '0'], `${q.idnumber}: completo solo tras usar todos los intentos`);
     assert(!critMids.includes(p.mid), `${pid}: es criterio de completion del curso`);
     // page.xml
     const mod = final ? null : manifest.modules.find((m) => m.moduleId === modId);
@@ -208,10 +211,10 @@ async function main() {
   const RA = await readPkg(builtA.mbz);
   const MA = A.input.manifest;
 
-  await check('(a) bancos: validateMbzV3 sin hallazgos y versión 3.13.0', async () => {
+  await check('(a) bancos: validateMbzV3 sin hallazgos y versión 3.14.0', async () => {
     const v = await V.validateMbzV3(builtA.mbz, builtA.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
-    eq(builtA.summary.builderVersion, '3.13.0', 'versión'); // UX r18: 3.11.0 → 3.12.0; r19 (Libro Guía PDF + bienvenida): 3.13.0
+    eq(builtA.summary.builderVersion, '3.14.0', 'versión'); // r55: invariantes de calificación // UX r18: 3.11.0 → 3.12.0; r19 (Libro Guía PDF + bienvenida): 3.13.0
   });
   let pagesA = [];
   await check('(a) una página por quiz, después del quiz, availability exacta a SU quiz, completion 0, downloadcontent 0, fuera de completion.xml, registrada', () => {
@@ -277,14 +280,15 @@ async function main() {
     assert(txt(holders[0].intro).includes(S.EXAMS_TEACHER_NOTE), 'dos oraciones');
     eq([tag(holders[0].module, 'visible'), tag(holders[0].module, 'visibleold')], ['0', '0'], 'oculto');
     assert(!RA.byId('cv3:shell:exams_teacher'), 'sin label propio');
-    eq(S.EXAMS_TEACHER_NOTE, 'Las páginas de “Respuestas explicadas” necesitan el acceso condicional de Moodle activado; si un estudiante las ve antes de presentar la evaluación, actívalo en Administración del sitio. Si el curso ya se restauró con el acceso condicional desactivado, actívalo y vuelve a restaurar el curso, o agrega a cada página “Respuestas explicadas” la restricción “Finalización de actividad” de su evaluación. Dar intentos adicionales a un estudiante que agotó una evaluación sin aprobar es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”.', 'texto exacto');
+    eq(S.EXAMS_TEACHER_NOTE, 'Las páginas de “Respuestas explicadas” necesitan el acceso condicional de Moodle activado; si un estudiante las ve antes de presentar la evaluación, actívalo en Administración del sitio. Si el curso ya se restauró con el acceso condicional desactivado, actívalo y vuelve a restaurar el curso, o agrega a cada página “Respuestas explicadas” la restricción “Finalización de actividad” de su evaluación. Cada página de “Respuestas explicadas” se abre cuando el estudiante usa todos los intentos de su evaluación. Dar intentos adicionales a un estudiante que ya los usó es decisión tuya: ten en cuenta que ya pudo leer sus “Respuestas explicadas”. Si marcas a mano una evaluación como completada para un estudiante, su página de “Respuestas explicadas” también se le abre.', 'texto exacto');
     eq(RA.acts.filter((a) => tag(a.module, 'visible') !== '1').map((a) => a.idnumber), ['cv3:shell:certificate_teacher'], 'único oculto');
+    assert(txt(holders[0].intro).includes('El curso se aprueba solo por la calificación final'), 'r55: regla de aprobación en la nota para docentes');
   });
   await check('(a) info del examen: «Al terminar cada intento…» con los intentos de facts; preguntas = slots', () => {
     const k = builtA.expectations.facts.assessment.kinds;
     for (const m of MA.modules.filter((x) => x.examEnabled)) {
       const t = txt(RA.byId(`cv3:exam_info:${m.moduleId}`).intro);
-      const want = `Al terminar cada intento verás si aprobaste; tu calificación queda en Calificaciones. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes o cuando uses tus ${k.exam.attempts} intentos.`;
+      const want = `Al terminar cada intento verás si aprobaste; tu calificación queda en Calificaciones. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando uses tus ${k.exam.attempts} intentos.`;
       assert(t.includes(want), `exam_info ${m.moduleNumber}: ${t.slice(0, 400)}`);
       assert(t.includes(`Preguntas: ${EB.planSlotCount(A.banks.get(m.moduleId).plan)}`), 'preguntas = slots');
     }
@@ -319,7 +323,7 @@ async function main() {
     }
     for (const id of ['cv3:final_exam_info', ...G.manifest.modules.filter((m) => m.examEnabled).map((m) => `cv3:exam_info:${m.moduleId}`)]) {
       const t = txt(RG.byId(id).intro);
-      assert(t.includes('Las respuestas correctas se habilitan en «Respuestas explicadas» cuando apruebes o cuando uses tus 3 intentos.'), `${id}: ${t.slice(-300)}`);
+      assert(t.includes('Las respuestas correctas se habilitan en «Respuestas explicadas» cuando uses tus 3 intentos.'), `${id}: ${t.slice(-300)}`);
     }
   });
 
@@ -376,7 +380,7 @@ async function main() {
   });
 
   // ── Intentos ilimitados ──
-  await check('fix 1 (C1) intentos ilimitados (exam 0): «… cuando apruebes.», availability SOLO e=1 en el examen de módulo y e=1|e=3 en el final (3 intentos)', async () => {
+  await check('fix 1 (C1) + r55 intentos ilimitados (exam 0): «… cuando tu docente cierre la evaluación.», página del módulo OCULTA sin availability; e=1|e=3 en el final (3 intentos)', async () => {
     const defaults = P.defaultAssessmentProfile({ finalExam: true });
     const X = bankInput({ courseId: 748, profile: { ...defaults, attempts: { ...defaults.attempts, exam: 0 } } });
     const r = await B.buildDynamicMbzV3(X.input);
@@ -389,12 +393,13 @@ async function main() {
       const unl = p.quiz.idnumber !== 'cv3:final_exam';
       eq(p.attempts, unl ? 0 : 3, `${p.idnumber}: intentos`);
       eq(/"e":3/.test(tag(p.module, 'availability')), !unl, `${p.idnumber}: e=3 solo con intentos limitados`);
+      eq(tag(p.module, 'visible'), unl ? '0' : '1', `${p.idnumber}: oculta solo con intentos ilimitados`);
     }
     for (const m of X.input.manifest.modules.filter((x) => x.examEnabled)) {
       const t = txt(R.byId(`cv3:exam_info:${m.moduleId}`).intro);
-      assert(t.includes('Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes.'), t.slice(-300));
+      assert(t.includes('Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando tu docente cierre la evaluación.'), t.slice(-300));
     }
-    eq(S.examExplanationsInfoText(1, true), 'Al terminar cada intento verás si aprobaste; tu calificación queda en Calificaciones. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando apruebes o cuando uses tu único intento.', '1 intento');
+    eq(S.examExplanationsInfoText(1, true), 'Al terminar cada intento verás si aprobaste; tu calificación queda en Calificaciones. Las respuestas correctas y su explicación se habilitan en «Respuestas explicadas» cuando uses tu único intento.', '1 intento');
   });
 
   await check('determinista: mismos insumos → mismos bytes', async () => {

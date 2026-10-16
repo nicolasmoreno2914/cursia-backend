@@ -171,7 +171,7 @@ async function runConfig(cfg) {
       const it = o.items.find((i) => i.idnumber === c.idnumber);
       assert(it, `grade item de ${c.idnumber}`);
       eq([it.gradepass, it.grademax, it.grademin, it.category], [k.passingGrade, 100, 0, A.ASSESSMENT_CATEGORY_NAMES[k.category]], c.idnumber);
-      eq([c.completion, String(c.completiongradeitemnumber), c.completionpassgrade, c.showdescription], [2, '0', 1, 1], `completion ${c.idnumber}`);
+      eq([c.completion, String(c.completiongradeitemnumber), c.completionpassgrade, c.showdescription], [2, '0', 0, 1], `completion (r55: al recibir nota) ${c.idnumber}`);
     }
     for (const c of cms.filter((x) => !kindOf(x.idnumber))) {
       // F1 (I3): en un curso sin nota el Libro Guía se completa por vista.
@@ -187,13 +187,9 @@ async function runConfig(cfg) {
     eq(o.categories.filter((c) => c.depth === 2).map((c) => [c.fullname, c.weight, c.aggregation]), resolved.categories.map((c) => [c.fullname, c.weight, 0]), 'hijas');
     eq(o.courseItem, { gradepass: resolved.courseGradepass, grademax: 100 }, 'curso');
   });
-  check(`${tag} completion del curso: un criterio por ítem requerido (por UUID) + agregación ALL`, () => {
-    const expected = A.completionCriteriaFor(
-      cms.filter((c) => kindOf(c.idnumber)).map((c) => ({ moduleId: c.cmid, modname: c.modname, kind: kindOf(c.idnumber) })),
-      resolved.courseCompletion,
-    ).map((x) => cms.find((c) => c.cmid === x.moduleId).idnumber);
-    eq(o.criteria.filter((c) => c.criteriatype === 4).map((c) => c.idnumber), resolved.withoutGrades ? ['cv3:shell:libro'] : expected, 'criterios');
-    eq(o.criteria.filter((c) => c.criteriatype === 6).length, resolved.courseCompletion.requireCourseGradePass ? 1 : 0, 'criterio de nota');
+  check(`${tag} completion del curso (r55): con nota UN criterio de nota = gradepass del curso, sin criterios de actividad; sin nota, el Libro Guía; agregación ALL`, () => {
+    eq(o.criteria.filter((c) => c.criteriatype === 4).map((c) => c.idnumber), resolved.withoutGrades ? ['cv3:shell:libro'] : [], 'criterios de actividad');
+    eq(o.criteria.filter((c) => c.criteriatype === 6).map((c) => c.gradepass), resolved.withoutGrades ? [] : [resolved.courseGradepass], 'criterio de nota');
     eq(o.aggr, [{ criteriatype: null, method: 1 }], 'agregación');
   });
   const hasCert = facts.finalExam.enabled;
@@ -213,19 +209,15 @@ async function runConfig(cfg) {
     const b = o.badges[0];
     const title = facts.course.title;
     eq([b.name, b.type, b.issuername, b.language, b.notification], [`Certificado: ${title}`, 2, 'Cursia', 'es', 0], 'insignia');
-    // Fix round 1 (review I1): la descripción enuncia los criterios reales (por tipo) del paquete.
-    assert(b.description.startsWith(`Otorgado al completar el curso «${title}»: `) && (facts.finalExam.enabled ? b.description.includes('la evaluación final') : !/evaluación final/.test(b.description)), `descripción: ${b.description}`);
-    assert(b.description.includes(': aprobar ') && b.description.endsWith('la evaluación final.'), `descripción con los criterios reales: ${b.description}`);
+    // r55 (R4): la descripción enuncia la regla real (nota final ≥ mínimo, por pesos).
+    assert(b.description.startsWith(`Otorgado al aprobar el curso «${title}»: obtener una calificación final igual o superior a ${resolved.courseGradepass}/100`) && !/aprobar todas/.test(b.description), `descripción: ${b.description}`);
     assert(b.message.includes('%badgename%'), 'mensaje con %badgename%');
     // Moodle core SIEMPRE restaura las insignias inactivas (restore_badges_structure_step): hay que habilitarla una vez.
     eq(b.status, 0, 'status tras restaurar (core fuerza INACTIVE)');
     eq(b.criteria, [{ criteriatype: 0, method: 1, params: [] }, { criteriatype: 4, method: 1, params: [[`course_${courseid}`, String(courseid)]] }], 'criterios remapeados al curso nuevo');
     eq(b.images.map((i) => [i.name, i.mime, i.w, i.h]), [['f1.png', 'image/png', 100, 100], ['f2.png', 'image/png', 35, 35], ['f3.png', 'image/png', 512, 512]], 'imagen');
     eq(o.closingBadgeLinks, [`${o.wwwroot}/badges/index.php?type=2&id=${courseid}`], 'enlace «Ver mi certificado →» decodificado');
-    if (facts.finalExam.enabled) {
-      assert(o.criteria.some((c) => c.criteriatype === 4 && c.idnumber === 'cv3:final_exam'), 'la evaluación final es criterio de completion');
-      eq(cm['cv3:final_exam'].completionpassgrade, 1, 'la evaluación final solo cuenta aprobada');
-    }
+    if (facts.finalExam.enabled) eq(cm['cv3:final_exam'].completionpassgrade, 0, 'r55: la evaluación final se completa al recibir nota (cuenta por su peso)');
   });
   if (hasCert) check(`${tag} EV6 T3: la insignia se otorga sola al completar el curso (usuario de prueba, cron de completion real)`, () => {
     const awPath = path.join(OUT_DIR, `r12-${cfg.id}.award.json`);
@@ -244,14 +236,12 @@ async function runConfig(cfg) {
     eq(aw.teacherLabel.section, closingSec, 'label docente en «Cierre del curso»');
     eq(aw.teacherLabel.links, [`${o.wwwroot}/badges/index.php?type=2&id=${courseid}`], 'botón a las insignias del curso nuevo');
     assert(aw.teacherLabel.text.includes(`Entra a Insignias → «Certificado: ${facts.course.title}» → «Habilitar acceso». Solo se hace una vez. Si no ves la insignia, revisa que las insignias estén habilitadas en el sitio y en el curso, y que la restauración haya incluido todas las actividades.`), aw.teacherLabel.text);
+    eq([aw.criteriaCount, aw.otherCriteria, aw.gradeCriterion], [0, 1, resolved.courseGradepass], 'r55: solo el criterio de nota');
     eq([aw.beforeAny.courseComplete, aw.beforeAny.issued], [false, false], 'sin nada completado');
-    if (aw.withoutLast) eq([aw.withoutLast.courseComplete, aw.withoutLast.issued], [false, false], `falta ${aw.lastIdnumber}: sin completar ni insignia`);
-    if (facts.finalExam.enabled) {
-      eq(aw.lastIdnumber, 'cv3:final_exam', 'el último criterio es la evaluación final');
-      eq([aw.lastFailed.courseComplete, aw.lastFailed.issued], [false, false], 'evaluación final reprobada: sin completar ni insignia');
-      eq(aw.marks.filter((m) => m.idnumber === 'cv3:final_exam').map((m) => m.completionstate), [3, 2], 'final: COMPLETE_FAIL y luego COMPLETE_PASS');
-    }
-    eq([aw.after.courseComplete, aw.after.issued], [true, true], 'curso completo → insignia otorgada');
+    eq([aw.low.courseComplete, aw.low.issued], [false, false], `nota final ${aw.low.courseGrade} < ${resolved.courseGradepass}: sin completar ni insignia`);
+    assert(aw.low.courseGrade < resolved.courseGradepass, `nota baja: ${aw.low.courseGrade}`);
+    assert(aw.after.courseGrade >= resolved.courseGradepass, `nota alta con la final reprobada: ${aw.after.courseGrade}`);
+    eq([aw.after.courseComplete, aw.after.issued], [true, true], 'nota final ≥ mínimo (aun con la evaluación final reprobada) → curso completo → insignia otorgada');
     assert(aw.after.bakedPng && aw.after.bakedPng.w === 512, `PNG horneado: ${JSON.stringify(aw.after.bakedPng)}`);
   });
   check(`${tag} quiz: intentos/método del perfil, sumgrades = Σ maxmark = 100, preguntas = GIFT`, () => {
@@ -326,6 +316,13 @@ async function runConfig(cfg) {
   }
   check('preflight H5P del sitio vs CURSIA_H5P_PROFILE_V1 (h5p-preflight-moodle.js)', () => {
     const pf = spawnSync(process.execPath, [path.join(__dirname, 'h5p-preflight-moodle.js'), path.join(MOODLE_LOCAL_DIR, 'source'), PHPINI], {
+      encoding: 'utf8', env: { ...process.env, PHP_BIN: PHP },
+    });
+    assert(pf.status === 0, pf.stdout + pf.stderr);
+  });
+  // r55 (R7): los .h5p de QuestionSet 1.21 / caso ramificado / «Repaso» son solo contenido → el sitio necesita el pack v3.
+  check('preflight H5P del sitio vs CURSIA_H5P_PROFILE_V3 (requisito del sitio de los paquetes ≥ 3.14.0)', () => {
+    const pf = spawnSync(process.execPath, [path.join(__dirname, 'h5p-preflight-moodle.js'), path.join(MOODLE_LOCAL_DIR, 'source'), PHPINI, '--profile', 'v3'], {
       encoding: 'utf8', env: { ...process.env, PHP_BIN: PHP },
     });
     assert(pf.status === 0, pf.stdout + pf.stderr);

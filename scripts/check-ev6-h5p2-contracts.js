@@ -94,12 +94,14 @@ const GOLDEN = {
   // 4 entradas del zip (los label.xml de apertura) y normalizando «~N min» son idénticas (scratchpad/r23/mbzdiff.js).
   // Dorados anteriores (3.13.0): h5p-final-light 0eb987bf…, scorm-nofinal-dark ef843c54…, h5p-nofinal-dark-mock-cleansafe
   // f309c5ac…, scorm-final-light 02a970f2…, h5p-ev5c-rules1 3a8c0028….
+  // r55 (builder 3.14.0): huellas RE-CAPTURADAS a propósito — invariantes de calificación (criterio único de nota,
+  // completion por nota, completionminattempts, slots aleatorios legados, textos) cambian todo .mbz con nota.
   mbz: {
-    'h5p-final-light': 'f81e186a6da1aacf3f56d18008c95c7f6211f10e267befefeb55974a97970cb5',
-    'scorm-nofinal-dark': '8e99edd2d00f974b8c36015fcadd77c942dc2470ed9f5f621347f675aa301fb8',
-    'h5p-nofinal-dark-mock-cleansafe': 'b933f95914ba27af4e2e55f57af72873a3b592a3c0818c019d1cb9aeedda0bba',
-    'scorm-final-light': '93f39f3ecad0961062b95052a4e14498c7c75c64228688fbf5fb01c48b66a8a6',
-    'h5p-ev5c-rules1': '18ec532260583fb1dcaa8bf7dce28546395400825b6a4352ca05f90a462a2b6a',
+    'h5p-final-light': '0892ae20e44bac31051d5525b6eadd2eced9833f91c646b927fa9e1cec0dd078',
+    'scorm-nofinal-dark': '5feee6eb5f5490834eeef60c28ae7ab23e3f8fd14532c25d85edcaf4b818cfab',
+    'h5p-nofinal-dark-mock-cleansafe': 'ee6da1486781183ce3c33763236fdf49076345fff3ec6f125b99374cc1891ae6',
+    'scorm-final-light': '920072634eb5759b3501b6e464573b6fc439653264349fd305b092668d46a32e',
+    'h5p-ev5c-rules1': 'df1ee1280dc2cd9e07fe11638ce960b14358b4d023bf3378cb711d7e7aa73287',
   },
 };
 
@@ -817,67 +819,54 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     const v = await V.validateMbzV3(base.mbz, base.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
   });
-  await check('mbz-validator-v3 ACEPTA un BS bundled (3.7 MB, > memo de 1 MiB) con la delta exacta', async () => {
-    const { mbz, target } = await swapActivityPackage(base.mbz, bsPkg);
-    const v = await V.validateMbzV3(mbz, withType(base.expectations, target.chapterId, 'branchingscenario'));
-    assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
+  // r55 (R7): todo .h5p de curso es SOLO contenido (pack v3 en el sitio). La delta de ≤ 3.13.0 se rechaza.
+  const contentOnly = (built) => h.buildContentOnlyH5p({ mainLibrary: built.mainLibrary, content: built.content, title: built.title, language: 'es', profile: h.CURSIA_H5P_PROFILE_V3, ...(built.contentFiles ? { contentFiles: built.contentFiles } : {}) });
+  await check('r55: mbz-validator-v3 RECHAZA un BS con su delta (3.7 MB, formato ≤ 3.13.0: H5P_LIBRARIES + H5P_PARTIAL_LIBRARY_CLOSURE) y ACEPTA el BS solo contenido', async () => {
+    let { mbz, target } = await swapActivityPackage(base.mbz, bsPkg);
+    let v = await V.validateMbzV3(mbz, withType(base.expectations, target.chapterId, 'branchingscenario'));
+    const codes = h5pIssues(v, target.idnumber).map((i) => i.code);
+    assert(codes.includes('H5P_LIBRARIES') && codes.includes('H5P_PARTIAL_LIBRARY_CLOSURE'), JSON.stringify(h5pIssues(v, target.idnumber)));
+    ({ mbz, target } = await swapActivityPackage(base.mbz, await contentOnly(bsBuilt)));
+    v = await V.validateMbzV3(mbz, withType(base.expectations, target.chapterId, 'branchingscenario'));
+    eq(h5pIssues(v, target.idnumber), [], 'BS solo contenido');
     eq(v.stats.h5p > 0, true, 'stats');
   });
-  await check('mbz-validator-v3 RECHAZA carpetas de más, de menos y library.json con otra versión; un QS 1.20 content-only con una carpeta ajena se rechaza por la delta v3', async () => {
+  await check('r55: mbz-validator-v3 RECHAZA cualquier carpeta de librería, dependencias fuera del pack v3 y la minor equivocada; DC en lugar de una actividad calificada → no calificable', async () => {
     const mut = (fn) => async (buf) => {
       const z = await JSZip.loadAsync(buf);
       await fn(z);
       return z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
     };
     const exp = (t) => withType(base.expectations, t.chapterId, 'branchingscenario');
-    let r = await swapActivityPackage(base.mbz, bsPkg, mut((z) => z.file('H5P.Text-1.1/library.json', '{}')));
+    const bsCO = await contentOnly(bsBuilt);
+    let r = await swapActivityPackage(base.mbz, bsCO, mut((z) => z.file('H5P.Text-1.1/library.json', JSON.stringify({ machineName: 'H5P.Text', majorVersion: 1, minorVersion: 1, patchVersion: 0 }))));
     let v = await V.validateMbzV3(r.mbz, exp(r.target));
-    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['carpetas fuera del delta del perfil de H5P.BranchingScenario: H5P.Text-1.1'], 'carpeta de más');
-    r = await swapActivityPackage(base.mbz, bsPkg, mut((z) => { for (const n of Object.keys(z.files)) if (n.startsWith('H5PEditor.Shape-1.0/')) z.remove(n); }));
-    v = await V.validateMbzV3(r.mbz, exp(r.target));
-    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['faltan carpetas de librería del delta del perfil: H5PEditor.Shape-1.0'], 'carpeta de menos');
-    r = await swapActivityPackage(base.mbz, bsPkg, mut(async (z) => {
-      const lj = JSON.parse(await z.file('H5P.Shape-1.0/library.json').async('string'));
-      lj.patchVersion += 1;
-      z.file('H5P.Shape-1.0/library.json', JSON.stringify(lj));
-    }));
-    v = await V.validateMbzV3(r.mbz, exp(r.target));
-    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['H5P.Shape-1.0: library.json distinto del store (sha256)', 'H5P.Shape-1.0: library.json H5P.Shape 1.0.6 ≠ perfil 5'], 'versión');
-    // m-3: archivos de la carpeta delta = los del store (uno de menos, uno de más).
-    const shapeFile = store.manifest.libraries.find((l) => l.dir === 'H5P.Shape-1.0').files.find((f) => f.path !== 'library.json').path;
-    r = await swapActivityPackage(base.mbz, bsPkg, mut((z) => { z.remove(`H5P.Shape-1.0/${shapeFile}`); z.file('H5P.Shape-1.0/extra.js', 'x'); }));
-    v = await V.validateMbzV3(r.mbz, exp(r.target));
-    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), [`H5P.Shape-1.0: faltan archivos del store: ${shapeFile}`, 'H5P.Shape-1.0: archivos que no están en el store: extra.js'], 'archivos');
-    // I-1: dependencias declaradas ⊆ perfil v1 ∪ SU delta. Dialog Cards declarando BS 1.10 (de v2, pero no viaja en el paquete) → rechazo.
-    const dcI1 = h.buildDialogCardsFromExperience({ chapterTitle: 'Atención', experience: experienceWithCards(4, 0, 0) });
+    eq(h5pIssues(v, r.target.idnumber).map((i) => i.code), ['H5P_LIBRARIES'], 'una carpeta (sin dependencias) → no content-only');
     const withDep = (dep) => mut(async (z) => {
       const hj = JSON.parse(await z.file('h5p.json').async('string'));
       hj.preloadedDependencies.push(dep);
       z.file('h5p.json', JSON.stringify(hj));
     });
-    r = await swapActivityPackage(base.mbz, await bundle(dcI1), withDep({ machineName: 'H5P.BranchingScenario', majorVersion: 1, minorVersion: 10 }));
-    v = await V.validateMbzV3(r.mbz, base.expectations);
-    assert(h5pIssues(v, r.target.idnumber).some((i) => i.message === 'dependencia ni en el perfil v1 ni en la delta de H5P.Dialogcards: H5P.BranchingScenario 1.10'), JSON.stringify(h5pIssues(v, r.target.idnumber)));
-    r = await swapActivityPackage(base.mbz, bsPkg, withDep({ machineName: 'H5P.CoursePresentation', majorVersion: 1, minorVersion: 27 }));
+    r = await swapActivityPackage(base.mbz, bsCO, withDep({ machineName: 'H5P.Inventada', majorVersion: 9, minorVersion: 9 }));
     v = await V.validateMbzV3(r.mbz, exp(r.target));
-    eq(h5pIssues(v, r.target.idnumber), [], 'BS declarando una librería de SU delta: aceptado');
-    // Un paquete con BS pero facts dice questionset (Manifest v1) → R-012.
-    r = await swapActivityPackage(base.mbz, bsPkg);
+    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['dependencia fuera del perfil v3 (pack del sitio): H5P.Inventada 9.9'], 'dependencia ajena');
+    r = await swapActivityPackage(base.mbz, bsCO, withDep({ machineName: 'H5P.CoursePresentation', majorVersion: 1, minorVersion: 27 }));
+    v = await V.validateMbzV3(r.mbz, exp(r.target));
+    eq(h5pIssues(v, r.target.idnumber), [], 'dependencia del pack v3: aceptada');
+    r = await swapActivityPackage(base.mbz, bsCO);
     v = await V.validateMbzV3(r.mbz, base.expectations);
     assert(h5pIssues(v, r.target.idnumber).some((i) => /debe ser H5P\.(QuestionSet|DragText|Blanks) \(R-012\), vino H5P\.BranchingScenario/.test(i.message)), JSON.stringify(h5pIssues(v, r.target.idnumber)));
-    // Dialog Cards en el lugar de una actividad calificada: sin hallazgos de carpetas, pero no calificable.
     const dc = h.buildDialogCardsFromExperience({ chapterTitle: 'Atención', experience: experienceWithCards(4, 0, 0) });
-    r = await swapActivityPackage(base.mbz, await bundle(dc));
+    r = await swapActivityPackage(base.mbz, await contentOnly(dc));
     v = await V.validateMbzV3(r.mbz, base.expectations);
     const msgs = h5pIssues(v, r.target.idnumber).map((i) => i.message);
-    assert(msgs.some((m) => /H5P\.Dialogcards no es calificable/.test(m)) && !msgs.some((m) => /carpeta|delta|library\.json/.test(m)), JSON.stringify(msgs));
-    // UX #5: QuestionSet es principal bundled en el perfil v3 (1.21 + su delta): un QS 1.20 content-only con una
-    // carpeta ajena se rechaza por la delta (falta H5P.QuestionSet-1.21, sobra H5P.Text-1.1).
+    assert(msgs.some((m) => /H5P\.Dialogcards no es calificable/.test(m)) && !msgs.some((m) => /content-only|carpeta/.test(m)), JSON.stringify(msgs));
+    // QS 1.20 (perfil v1) en lugar de 1.21 (pack v3) → minor equivocada.
     const qsB = h.buildQuestionSet({ itemKey: 'activity:q', title: 'QS', passPercentage: 70, questions: [{ kind: 'truefalse', question: 'A', correct: true }, { kind: 'truefalse', question: 'B', correct: false }] });
     const qsPkg = await h.buildContentOnlyH5p({ mainLibrary: qsB.mainLibrary, content: qsB.content, title: qsB.title, language: 'es' });
-    r = await swapActivityPackage(base.mbz, qsPkg, mut((z) => z.file('H5P.Text-1.1/library.json', '{}')));
+    r = await swapActivityPackage(base.mbz, qsPkg);
     v = await V.validateMbzV3(r.mbz, withType(base.expectations, r.target.chapterId, 'questionset'));
-    eq(h5pIssues(v, r.target.idnumber).map((i) => i.message), ['faltan carpetas de librería del delta del perfil: H5P.QuestionSet-1.21', 'carpetas fuera del delta del perfil de H5P.QuestionSet: H5P.Text-1.1'], 'QS con carpeta');
+    assert(h5pIssues(v, r.target.idnumber).some((i) => /H5P\.QuestionSet declarado 1\.20 ≠ perfil v3 1\.21/.test(i.message)), JSON.stringify(h5pIssues(v, r.target.idnumber)));
   });
 
   // ══ 7. Calificación + golden legacy ════════════════════════════════════════

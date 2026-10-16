@@ -111,7 +111,7 @@ const BS_CFG = {
     }
   }
 
-  await check('builder 3.13.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.13.0', 'versión'));
+  await check('builder 3.13.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.14.0', 'versión'));
 
   await check('matriz + rules 2: toda h5pactivity tiene UNA sola copia del .h5p (filearea package) y su inforef apunta solo a ella', () => {
     let n = 0;
@@ -214,7 +214,7 @@ const BS_CFG = {
   });
 
   // Curso sin H5P (SCORM, sin videos) y sin quizzes: dorado = staging b959a89 (builder 3.6.0).
-  await check('byte-identidad: un curso SIN actividades H5P ni quizzes da el .mbz dorado (3.6.0 = 3.10.0; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W)', async () => {
+  await check('byte-identidad: un curso SIN actividades H5P ni quizzes da el .mbz dorado (3.6.0 = 3.10.0; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55)', async () => {
     const o = { engine: 'scorm', finalExam: false, courseId: 646, modules: [{ examEnabled: false, chapters: [{ video: false, activity: true }, { video: false, activity: false }] }] };
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
     // #583 QUAL (builder 3.11.0): reviewmaxmarks 69904 → 272, frase del cierre, tarjeta del Libro Guía como <intro> del recurso (sin label libro_card; ids renumerados) y runtime VC 4 — diff semántico en scratchpad/r18/qual/golddiff/sem.js (antes d4e6bc68…: staging 3.6.0 = 3.10.0 para este curso).
@@ -224,8 +224,11 @@ const BS_CFG = {
     // r19 L (builder 3.13.0): solo el Libro Guía (PDF en vez de HTML) y la descripción de su recurso (botón) — diff en scratchpad/r19/impl-l-probe/golddiff.js (antes a169af34…, 3.12.0).
     // Motor de carga horaria Loop 1 (study-time): cambia SOLO el badge «~X min» de la apertura de cada capítulo; verificado
     // archivo por archivo (scratchpad/r23/mbzdiff2.js): solo cambian esos label.xml y, normalizando «~N min», son idénticos.
-    // Dorado 3.13.0: 6c521248….
-    eq(sha(r.mbz), '742d47a3091866dda1fe16768a7e6f92a47e3ef86b45e2fc4ea63e209bb8a7b2', 'sha256');
+    // Dorado 3.13.0: 742d47a3….
+    // r55 (builder 3.14.0): SOLO cambian completion.xml (criterio único de nota en vez del criterio de la actividad), el
+    // module.xml del SCORM (completion al recibir nota, completionpassgrade 0) y el label del cierre (regla de aprobación) —
+    // diff por entrada del zip contra el builder 3.13.0 (scratchpad/r55/mbzdiff.js).
+    eq(sha(r.mbz), 'c2ac08cdda9b7bc187606125def0edc2ec84590cb3d77f5fd04699aa58beb555', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);
