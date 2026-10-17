@@ -33,6 +33,8 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 export function finopsErrorToHttp(err: unknown): unknown {
   if (err instanceof FinopsError) {
     if (err.code === 'ESTIMATE_NOT_FOUND') return new NotFoundException({ code: err.code, message: err.message });
+    // FinOps P0: reserva de una parte de un run ajeno → 409 con código estable (el proxy no llama al proveedor).
+    if (err.code === 'ATTRIBUTION_REJECTED') return new ConflictException({ code: 'attribution_rejected', message: err.message });
     if (err.code === 'PRICING_MISSING' || err.code === 'PRICING_AMBIGUOUS' || err.code === 'CURRENCY_MISMATCH') {
       return new UnprocessableEntityException({ code: err.code, message: err.message });
     }

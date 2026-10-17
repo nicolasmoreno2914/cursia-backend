@@ -4,6 +4,7 @@ import { FinopsAdminController, FinopsIngestController, FinopsLlmReservationCont
 import { FinopsLedgerService } from './finops-ledger.service';
 import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsBudgetService } from './finops-budget.service';
+import { CostReadService } from './cost-read.service';
 
 /**
  * V2.1 RF-a — Cost Ledger / FinOps (audit §W). Ledger append-only, ingest del
@@ -13,7 +14,7 @@ import { FinopsBudgetService } from './finops-budget.service';
 @Module({
   imports: [AuthModule],
   controllers: [FinopsIngestController, FinopsLlmReservationController, FinopsAdminController],
-  providers: [FinopsLedgerService, FinopsBudgetService, FinopsIngestTokenGuard],
-  exports: [FinopsLedgerService, FinopsBudgetService],
+  providers: [FinopsLedgerService, FinopsBudgetService, FinopsIngestTokenGuard, CostReadService],
+  exports: [FinopsLedgerService, FinopsBudgetService, CostReadService],
 })
 export class FinopsModule {}

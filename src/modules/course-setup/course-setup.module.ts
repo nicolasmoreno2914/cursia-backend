@@ -1,10 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ArtifactsModule } from '../artifacts/artifacts.module';
+import { FinopsModule } from '../finops/finops.module';
 import { CourseSetupController } from './course-setup.controller';
 import { CourseSetupExtractionService } from './course-setup-extraction.service';
 
 @Module({
-  imports: [ArtifactsModule],
+  imports: [ArtifactsModule, FinopsModule],
   controllers: [CourseSetupController],
   providers: [CourseSetupExtractionService],
 })

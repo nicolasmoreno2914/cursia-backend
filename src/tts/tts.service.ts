@@ -25,6 +25,8 @@ export interface TtsSpeechResult {
   voice: string;
   model: string;
   format: string;
+  /** FinOps P0: x-request-id de OpenAI (idempotencia del cargo en el ledger). */
+  requestId?: string | null;
 }
 
 @Injectable()
@@ -82,6 +84,7 @@ export class TtsService {
       throw new Error(errMsg);
     }
 
+    const requestId = res.headers && typeof res.headers.get === 'function' ? res.headers.get('x-request-id') : null;
     const arrayBuffer = await res.arrayBuffer();
     const rawAudioBuffer = Buffer.from(arrayBuffer);
 
@@ -98,6 +101,6 @@ export class TtsService {
       this.logger.log(`[TTS] OK — ${audioBuffer.length} bytes`);
     }
 
-    return { audioBuffer, chars: text.length, voice, model, format };
+    return { audioBuffer, chars: text.length, voice, model, format, requestId };
   }
 }

@@ -34,8 +34,12 @@ export interface ItemRecoveryView {
 export interface ItemCostView {
   /** Esperado del estimado congelado del run (null si no hay estimado de run). */
   estimated: string | null;
+  /** FinOps P0: real liquidado de Cursia (sin reservas abiertas ni BYOK) — mismas definiciones que CostReadService. */
   actual: string;
+  /** Reservado (pendientes abiertos) de Cursia. */
   pending: string;
+  /** actual + pending. */
+  committed?: string;
   currency: 'USD';
 }
 
@@ -132,10 +136,13 @@ export async function loadItemCosts(q: Queryable, jobId: string): Promise<Map<st
           where l ? 'itemKey' and l ? 'expected'
           group by 1
        ),
+       -- FinOps P0 (audit §4 #10): antes «actual» incluía las reservas abiertas (cota) y la BYOK. Ahora, igual que
+       -- CostReadService: Cursia solamente; actual = no pendiente; pending = pendientes abiertos; committed = ambos.
+       -- Los eventos sin item_key (a nivel run) no son de ninguna parte: van en CostReadService.runCost().byItemKey.
        act as (
          select e.item_key,
-                sum(e.amount) as actual,
-                coalesce(sum(e.amount) filter (where e.measurement_status = 'pending' and e.event_kind = 'CHARGE'
+                coalesce(sum(e.amount) filter (where e.billing_account = 'cursia'), 0) as committed,
+                coalesce(sum(e.amount) filter (where e.billing_account = 'cursia' and e.measurement_status = 'pending' and e.event_kind = 'CHARGE'
                   and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)), 0) as pending
            from public.generation_cost_events e
           where e.run_id = $1 and e.item_key is not null
@@ -143,8 +150,9 @@ export async function loadItemCosts(q: Queryable, jobId: string): Promise<Map<st
        )
        select coalesce(est.item_key, act.item_key) as item_key,
               trim_scale(round(est.estimated, 6))::text as estimated,
-              trim_scale(round(coalesce(act.actual, 0), 6))::text as actual,
-              trim_scale(round(coalesce(act.pending, 0), 6))::text as pending
+              trim_scale(round(coalesce(act.committed, 0) - coalesce(act.pending, 0), 6))::text as actual,
+              trim_scale(round(coalesce(act.pending, 0), 6))::text as pending,
+              trim_scale(round(coalesce(act.committed, 0), 6))::text as committed
          from est full join act on act.item_key = est.item_key`,
       [jobId],
     );
@@ -155,7 +163,7 @@ export async function loadItemCosts(q: Queryable, jobId: string): Promise<Map<st
   }
   for (const r of rows) {
     if (!r.item_key) continue;
-    out.set(String(r.item_key), { estimated: r.estimated ?? null, actual: r.actual ?? '0', pending: r.pending ?? '0', currency: 'USD' });
+    out.set(String(r.item_key), { estimated: r.estimated ?? null, actual: r.actual ?? '0', pending: r.pending ?? '0', committed: r.committed ?? '0', currency: 'USD' });
   }
   return out;
 }

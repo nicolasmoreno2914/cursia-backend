@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, isZeroDec, normalizeDecimal, subDec, DecimalLike } from './decimal';
@@ -6,6 +6,7 @@ import { conservativePrice, llmUpperBoundVariants, priceUsage, PricingCatalogRow
 import { adjustmentIdempotencyKey, costIdempotencyKey, CostIdempotencyKind, CostIdempotencyParts } from './idempotency';
 import { familyOfProvider, operationForItem } from './operations';
 import type { EstimateResult } from './estimator';
+import { CostReadService, costEventsCte } from './cost-read.service';
 
 /**
  * V2.1 RF-a — ledger de costos (audit §W.3/§W.4). Todas las escrituras son
@@ -65,6 +66,27 @@ export interface RecordChargeInput {
    * owner); nunca viene del cliente.
    */
   attributionRunId?: string | null;
+  /**
+   * FinOps P0 (2026-10-16): atribución a un CURSO (sin run ni item: p.ej. la lectura avanzada del documento, el TTS
+   * legacy con curso). Se verifica contra courses.owner_id = ownerIdFromAuth; nunca viene del cliente sin verificar.
+   */
+  attributionCourseId?: number | null;
+  /**
+   * FinOps P0: quién ejecuta la llamada. 'owner_only' (default; todo lo que llega por HTTP, p.ej. el proxy LLM del
+   * navegador): solo el dueño del run es un ejecutor autorizado — es la única identidad que el claim/heartbeat/complete
+   * aceptan (scheduler.lockRun(ownerId)). 'server_worker': un worker del servidor que reclamó la parte (proceso de
+   * confianza, nunca el cliente): aunque el owner que pasa no coincida con production_jobs.owner_id, el evento conserva
+   * course_id/run_id (y el tope del run aplica); owner_id = dueño del run y metadata.executorOwnerId = el ejecutor.
+   */
+  executorAuthorization?: 'owner_only' | 'server_worker';
+  /**
+   * FinOps P0 review r1 (m1): la respuesta del proveedor llegó pero su uso NO se pudo medir (p.ej. un TTS no-mp3): el
+   * cargo queda `pending` a 0 y se marca `metadata.unpricedReason='usage_not_measured'` (server-side) para que el lector
+   * lo liste como «sin precio» y el alcance quede `completeness: 'partial'` (nunca un 0 invisible).
+   */
+  unmeasuredUsage?: boolean;
+  /** FinOps P0: motivo explícito de una llamada SIN atribución (p.ej. 'connection_test', 'brand_extraction'). */
+  unattributedReason?: string | null;
   /**
    * RF-b fix C1/I2: si el precio falta (o es ambiguo), 'pending_zero' registra
    * IGUAL el CHARGE con monto 0, measurement_status='pending' y
@@ -165,6 +187,8 @@ interface Attribution {
   scope: string | null;
   module_id: string | null;
   chapter_id: string | null;
+  /** FinOps P0: ejecutor de servidor distinto del dueño del run (atribución delegada). */
+  executorOwnerId?: string | null;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -192,12 +216,20 @@ function num(v: DecimalLike | null | undefined): string | null {
 export class FinopsLedgerService {
   private readonly logger = new Logger('FinopsLedger');
 
-  constructor(private readonly dataSource: DataSource) {}
+  /**
+   * Review r1 (m5): CostReadService llega por DI de Nest (FinopsModule lo provee). @Optional solo para los scripts que
+   * construyen el ledger a mano (`new FinopsLedgerService(ds)`): ahí se crea uno sobre el mismo DataSource.
+   */
+  private readonly costRead: CostReadService;
+
+  constructor(private readonly dataSource: DataSource, @Optional() costRead?: CostReadService) {
+    this.costRead = costRead ?? new CostReadService(dataSource);
+  }
 
   // ─── atribución ────────────────────────────────────────────────────────────
 
   /** Deriva la atribución desde generation_item_runs + production_jobs. Nunca desde el cliente. */
-  async resolveAttribution(itemRunId: string | null | undefined, ownerIdFromAuth: string): Promise<Attribution> {
+  async resolveAttribution(itemRunId: string | null | undefined, ownerIdFromAuth: string, executor: 'owner_only' | 'server_worker' = 'owner_only'): Promise<Attribution> {
     const unattributed = (reason: string | null): Attribution => ({
       attributed: false,
       rejectReason: reason,
@@ -226,11 +258,16 @@ export class FinopsLedgerService {
     );
     const r = rows[0];
     if (!r) return unattributed('item_run_not_found');
-    if (String(r.owner_id) !== ownerIdFromAuth) return unattributed('owner_mismatch');
+    // FinOps P0: un ejecutor que no es el dueño solo conserva la atribución si es un worker del servidor (de confianza).
+    // Por HTTP (proxy del navegador) un no dueño queda sin atribuir — y si es una reserva pagada por Cursia, se RECHAZA
+    // en buildChargeRow (nunca un gasto sin tope del run).
+    const delegated = String(r.owner_id) !== ownerIdFromAuth;
+    if (delegated && executor !== 'server_worker') return unattributed('owner_mismatch');
     return {
       attributed: true,
       rejectReason: null,
-      owner_id: ownerIdFromAuth,
+      owner_id: delegated ? String(r.owner_id) : ownerIdFromAuth,
+      executorOwnerId: delegated ? ownerIdFromAuth : null,
       course_id: r.course_id === null ? null : Number(r.course_id),
       blueprint_id: r.blueprint_id === null ? null : Number(r.blueprint_id),
       manifest_id: r.manifest_id === null ? null : Number(r.manifest_id),
@@ -249,7 +286,7 @@ export class FinopsLedgerService {
    * V2.1 RF-b: atribución a nivel RUN (cargos de workers sin item run, p.ej.
    * package.build). Deriva course_id de production_jobs y exige el mismo owner.
    */
-  async resolveRunAttribution(runId: string, ownerIdFromAuth: string): Promise<Attribution> {
+  async resolveRunAttribution(runId: string, ownerIdFromAuth: string, executor: 'owner_only' | 'server_worker' = 'owner_only'): Promise<Attribution> {
     const base: Attribution = {
       attributed: false,
       rejectReason: null,
@@ -273,16 +310,35 @@ export class FinopsLedgerService {
       [runId],
     );
     if (!r) return { ...base, rejectReason: 'run_not_found' };
-    if (String(r.owner_id) !== ownerIdFromAuth) return { ...base, rejectReason: 'owner_mismatch' };
+    const delegated = String(r.owner_id) !== ownerIdFromAuth;
+    if (delegated && executor !== 'server_worker') return { ...base, rejectReason: 'owner_mismatch' };
     const manifestId = Number(r.manifest_id);
     return {
       ...base,
+      owner_id: delegated ? String(r.owner_id) : ownerIdFromAuth,
+      executorOwnerId: delegated ? ownerIdFromAuth : null,
       attributed: true,
       course_id: r.course_id === null ? null : Number(r.course_id),
       manifest_id: Number.isInteger(manifestId) ? manifestId : null,
       run_id: r.id,
       scope: 'run',
     };
+  }
+
+  /**
+   * FinOps P0: atribución a nivel CURSO (sin run ni item). Exige courses.owner_id = ownerIdFromAuth (mismo criterio que
+   * el run: nunca se carga a un curso ajeno). → course_id + scope 'course'.
+   */
+  async resolveCourseAttribution(courseId: number, ownerIdFromAuth: string): Promise<Attribution> {
+    const base: Attribution = {
+      attributed: false, rejectReason: null, owner_id: ownerIdFromAuth, course_id: null, blueprint_id: null, manifest_id: null,
+      run_id: null, item_run_id: null, item_key: null, item_type: null, item_generation: null, scope: null, module_id: null, chapter_id: null,
+    };
+    if (!Number.isInteger(courseId) || courseId < 1) return { ...base, rejectReason: 'invalid_course_id' };
+    const [c] = await this.dataSource.query(`select id, owner_id from public.courses where id = $1`, [courseId]);
+    if (!c) return { ...base, rejectReason: 'course_not_found' };
+    if (String(c.owner_id ?? '') !== ownerIdFromAuth) return { ...base, rejectReason: 'course_owner_mismatch' };
+    return { ...base, attributed: true, course_id: Number(c.id), scope: 'course' };
   }
 
   // ─── cargos ────────────────────────────────────────────────────────────────
@@ -487,10 +543,23 @@ export class FinopsLedgerService {
       throw new FinopsError('INVALID_INPUT', `costSource inválido en el ledger: ${String(costSource)} (ESTIMATED solo vive en cost_estimates)`);
     }
 
+    const executor = input.executorAuthorization === 'server_worker' ? 'server_worker' : 'owner_only';
+    const noItem = input.itemRunId === null || input.itemRunId === undefined || input.itemRunId === '';
     const attribution =
-      (input.itemRunId === null || input.itemRunId === undefined || input.itemRunId === '') && input.attributionRunId
-        ? await this.resolveRunAttribution(input.attributionRunId, owner)
-        : await this.resolveAttribution(input.itemRunId ?? null, owner);
+      noItem && input.attributionRunId
+        ? await this.resolveRunAttribution(input.attributionRunId, owner, executor)
+        : noItem && input.attributionCourseId !== null && input.attributionCourseId !== undefined
+          ? await this.resolveCourseAttribution(Number(input.attributionCourseId), owner)
+          : await this.resolveAttribution(input.itemRunId ?? null, owner, executor);
+    // FinOps P0 (owner mismatch, review del audit §4 #7): una RESERVA real pagada por Cursia de una parte de un run
+    // AJENO se rechaza — sin esto quedaba sin atribuir y sin tope del run ni guard de gasto (bypass). BYOK / mock y los
+    // cargos posteriores al gasto (el dinero ya se gastó: nunca se pierde) se registran sin atribuir con el motivo.
+    if (!attribution.attributed && attribution.rejectReason === 'owner_mismatch' && input.billingAccount === 'cursia' && input.mode === 'real'
+      && (input.metadata as Record<string, unknown> | undefined)?.reservation === true) {
+      throw new FinopsError('ATTRIBUTION_REJECTED',
+        'la parte declarada es de un run de otro dueño: este ejecutor no está autorizado para ese run (no se reserva ni se llama al proveedor)',
+        { itemRunId: typeof input.itemRunId === 'string' ? input.itemRunId.slice(0, 64) : null });
+    }
 
     // Operación: derivada del item atribuido; si no hay atribución, `<base>.unattributed`.
     const family = familyOfProvider(input.provider);
@@ -564,10 +633,25 @@ export class FinopsLedgerService {
     delete metadata.amountBasis;
     delete metadata.pricingMissing;
     delete metadata.pricingError;
+    delete metadata.attribution;
+    delete metadata.unattributedReason;
+    delete metadata.executorOwnerId;
+    delete metadata.unpricedReason;
+    if (!attribution.attributed) {
+      // FinOps P0: nunca un NULL silencioso — sin atribución, con un motivo explícito (scope queda NULL: el CHECK del
+      // ledger solo admite course/module/chapter/run/org; la marca vive en metadata, sin migración).
+      metadata.attribution = 'unattributed';
+      metadata.unattributedReason = attribution.rejectReason
+        ?? (typeof input.unattributedReason === 'string' && input.unattributedReason.trim() ? input.unattributedReason.trim().slice(0, 64) : 'no_attribution_declared');
+    }
+    if (attribution.executorOwnerId) metadata.executorOwnerId = attribution.executorOwnerId;
     if (pricingError) {
       metadata.pricingMissing = true;
       metadata.pricingError = pricingError;
     }
+    // FinOps P0 review r1: marca única de «sin precio» que lee CostReadService (is_unpriced).
+    if (pricingError) metadata.unpricedReason = 'pricing_missing';
+    else if (input.unmeasuredUsage === true && isZeroDec(amount)) metadata.unpricedReason = 'usage_not_measured';
     if (!attribution.attributed && attribution.rejectReason) {
       metadata.attributionRejected = true;
       metadata.attributionRejectReason = attribution.rejectReason;
@@ -610,7 +694,7 @@ export class FinopsLedgerService {
       amount,
       currency,
       cost_source: costSource,
-      measurement_status: pricingError ? 'pending' : input.measurementStatus ?? 'final',
+      measurement_status: pricingError || metadata.unpricedReason === 'usage_not_measured' ? 'pending' : input.measurementStatus ?? 'final',
       billing_account: input.billingAccount,
       billable,
       outcome: input.outcome ?? 'succeeded',
@@ -763,6 +847,7 @@ export class FinopsLedgerService {
     recordedBy: string;
     outcome?: ChargeOutcome;
     metadata?: Record<string, unknown> | null;
+    executorAuthorization?: 'owner_only' | 'server_worker';
   }): Promise<RecordResult> {
     const isYoutube = input.kind === 'youtube';
     if (!isYoutube && input.kind !== 'package') throw new FinopsError('INVALID_INPUT', `recordZero kind inválido: ${String(input.kind)}`);
@@ -771,6 +856,7 @@ export class FinopsLedgerService {
       itemRunId: input.itemRunId ?? null,
       attributionRunId: input.attributionRunId ?? null,
       ownerIdFromAuth: input.ownerIdFromAuth,
+      executorAuthorization: input.executorAuthorization,
       provider: isYoutube ? 'youtube' : 'cursia',
       service: isYoutube ? 'data_api_v3' : 'packaging',
       modelOrProduct: isYoutube ? 'videos.insert' : 'mbz',
@@ -934,6 +1020,10 @@ export class FinopsLedgerService {
         }
         return { finalInserted: !!fin?.inserted, finalEvent: fin?.event ?? null, released: false, alreadySettled: true };
       }
+      // FinOps P0 review r1 (I1): un cargo final SIN precio queda a 0 `pending` (metadata.pricingMissing) y la reserva se
+      // lleva a 0 como siempre (nunca una reserva abierta para una llamada ya respondida: los lectores de «resultado
+      // desconocido» la tomarían por ambigua). El lector (CostReadService) la lista como «sin precio» y marca el
+      // alcance `completeness: 'partial'`; repricePendingCharge la precia después.
       if (built) fin = await this.insertEvent(built.row, manager);
       await this.adjustWith(manager, reservationKey, normalizeDecimal(0), reason, {
         recordedBy: opts.recordedBy || 'dynamic-worker',
@@ -1264,7 +1354,7 @@ export class FinopsLedgerService {
   }
 
   async costsByCourse(courseId: number) {
-    const where = `course_id = $1`;
+    const where = `e.course_id = $1`;
     const p = [courseId];
     const [totals, byChapter, byItemType, byProvider, retries, avoided, runs] = await Promise.all([
       this.totalsQuery(where, p),
@@ -1281,12 +1371,14 @@ export class FinopsLedgerService {
       ),
       this.estimatedVsActual(`course_id = $1`, p),
     ]);
-    return { courseId, ...totals, byChapter, byItemType, byProvider, retriesPaid: retries, avoided: avoided[0], estimatedVsActual: runs };
+    // FinOps P0: dinero oficial (definiciones fijas de CostReadService); el resto queda por compatibilidad.
+    const money = await this.costRead.courseCost(courseId);
+    return { courseId, ...totals, byChapter, byItemType, byProvider, retriesPaid: retries, avoided: avoided[0], estimatedVsActual: runs, money };
   }
 
   async costsByRun(runId: string) {
     if (!UUID_RE.test(runId)) throw new FinopsError('INVALID_INPUT', 'runId debe ser UUID');
-    const where = `run_id = $1`;
+    const where = `e.run_id = $1`;
     const p = [runId];
     const [totals, byItemKey, byItemType, byProvider, retries, avoided, evsa, auths] = await Promise.all([
       this.totalsQuery(where, p),
@@ -1305,11 +1397,12 @@ export class FinopsLedgerService {
         p,
       ),
     ]);
-    return { runId, ...totals, byItemKey, byItemType, byProvider, retriesPaid: retries, avoided: avoided[0], estimatedVsActual: evsa[0] ?? null, authorizations: auths };
+    const money = await this.costRead.runCost(runId);
+    return { runId, ...totals, byItemKey, byItemType, byProvider, retriesPaid: retries, avoided: avoided[0], estimatedVsActual: evsa[0] ?? null, authorizations: auths, money };
   }
 
   async costsByOwner(ownerId: string) {
-    const where = `owner_id = $1`;
+    const where = `e.owner_id = $1`;
     const p = [ownerId];
     const [totals, byCourse, byProvider, unattributed] = await Promise.all([
       this.totalsQuery(where, p),
@@ -1359,20 +1452,27 @@ export class FinopsLedgerService {
     return { inserted: false, event: existing };
   }
 
+  /**
+   * FinOps P0: totales de las lecturas admin `/finops/{courses,runs,owners}/:id/costs` con las MISMAS banderas que
+   * CostReadService (costEventsCte). Cambios (audit §4 #10): `total`/`pending` excluyen BYOK (`user_key`, igual que el
+   * tope del run; BYOK va en `byok`); `charges`/`adjustments` excluyen las familias de reserva reemplazadas (una
+   * reserva liquidada y su ajuste a 0 netean 0: contarlas inflaba `charges` con reserva + cargo final). Sigue
+   * valiendo total = charges + adjustments + refunds. El dinero oficial de la respuesta está en `money`.
+   */
   private async totalsQuery(where: string, params: unknown[]) {
     const [t] = await this.dataSource.query(
-      `select coalesce(sum(amount),0)::text as total,
-              coalesce(sum(amount) filter (where billable),0)::text as billable,
-              coalesce(sum(amount) filter (where event_kind='CHARGE'),0)::text as charges,
-              coalesce(sum(amount) filter (where event_kind='ADJUSTMENT'),0)::text as adjustments,
-              coalesce(sum(amount) filter (where event_kind='REFUND'),0)::text as refunds,
+      `with ${costEventsCte(where)}
+       select coalesce(sum(amount) filter (where billing_account <> 'user_key'),0)::text as total,
+              coalesce(sum(amount) filter (where billing_account = 'cursia'),0)::text as billable,
+              coalesce(sum(amount) filter (where event_kind='CHARGE' and billing_account <> 'user_key' and not in_dropped_family),0)::text as charges,
+              coalesce(sum(amount) filter (where event_kind='ADJUSTMENT' and billing_account <> 'user_key' and not in_dropped_family),0)::text as adjustments,
+              coalesce(sum(amount) filter (where event_kind='REFUND' and billing_account <> 'user_key'),0)::text as refunds,
               -- RF-b fix M5: pendiente = CHARGE pendiente SIN un ADJUSTMENT que lo corrija.
-              coalesce(sum(amount) filter (where measurement_status='pending' and event_kind='CHARGE'
-                and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)),0)::text as pending,
-              count(*) filter (where measurement_status='pending' and event_kind='CHARGE'
-                and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id))::int as pending_events,
+              coalesce(sum(amount) filter (where is_open and billing_account <> 'user_key'),0)::text as pending,
+              count(*) filter (where is_open and billing_account <> 'user_key')::int as pending_events,
+              coalesce(sum(amount) filter (where billing_account = 'user_key'),0)::text as byok,
               count(*)::int as events
-         from public.generation_cost_events e where ${where}`,
+         from ev`,
       params,
     );
     return { totals: t };
@@ -1380,19 +1480,21 @@ export class FinopsLedgerService {
 
   private async groupQuery(column: 'chapter_id' | 'item_type' | 'provider' | 'item_key' | 'course_id', where: string, params: unknown[]) {
     const rows = await this.dataSource.query(
-      `select ${column}::text as key, coalesce(sum(amount),0)::text as total, count(*)::int as events
-         from public.generation_cost_events where ${where}
-        group by ${column} order by ${column} nulls last`,
+      `select e.${column}::text as key, coalesce(sum(e.amount) filter (where e.billing_account <> 'user_key'),0)::text as total, count(*)::int as events
+         from public.generation_cost_events e where ${where}
+        group by e.${column} order by e.${column} nulls last`,
       params,
     );
     return rows;
   }
 
+  /** FinOps P0: reintentos PAGADOS = llamadas (reserva + cargo final cuentan una vez) con call_role<>'main' o attempt>1; monto neto. */
   private async retriesQuery(where: string, params: unknown[]) {
     const [r] = await this.dataSource.query(
-      `select coalesce(sum(amount),0)::text as total, count(*)::int as events
-         from public.generation_cost_events
-        where ${where} and event_kind = 'CHARGE' and (call_role <> 'main' or attempt > 1)`,
+      `with ${costEventsCte(where)}
+       select coalesce(sum(amount) filter (where is_retry and billing_account <> 'user_key'),0)::text as total,
+              count(*) filter (where is_retry and is_call and billing_account <> 'user_key')::int as events
+         from ev`,
       params,
     );
     return r;
@@ -1413,7 +1515,7 @@ export class FinopsLedgerService {
           order by run_id, created_at desc, id desc
        ),
        act as (
-         select run_id, coalesce(sum(amount),0)::text as actual
+         select run_id, coalesce(sum(amount) filter (where billing_account <> 'user_key'),0)::text as actual
            from public.generation_cost_events where run_id in (select run_id from runs) group by run_id
        )
        select runs.run_id, est.estimate_id, est.est_min, est.est_expected, est.est_max, coalesce(act.actual,'0') as actual

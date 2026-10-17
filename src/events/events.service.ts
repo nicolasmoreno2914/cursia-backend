@@ -190,10 +190,20 @@ export class EventsService {
     }
   }
 
+  /**
+   * POST /events (navegador). FinOps P0: es solo telemetría de actividad. Los campos de dinero que manda el cliente
+   * (`real_cost_usd`, `cost_type`='real', `cost_source`) NO son de confianza (cualquier sesión puede forjarlos): no
+   * se guardan como costo (real_cost_usd = null, cost_type nunca 'real') y quedan solo como dato declarado en
+   * metadata.clientDeclaredCost con costUntrusted=true. Ningún lector de dinero lee usage_events (ver CostReadService).
+   */
   async create(dto: CreateEventDto, user: AuthUser): Promise<{ ok: boolean; id?: string }> {
     const costKey = this._resolveCostServiceKey(dto);
-    const costType: UsageEventCostType = dto.cost_type as UsageEventCostType
+    const declaredType = dto.cost_type as UsageEventCostType | undefined;
+    const costType: UsageEventCostType = (declaredType && declaredType !== 'real' ? declaredType : undefined)
       ?? ((dto.tokens_input || dto.tokens_output || dto.video_count) ? 'estimated' : 'unknown');
+    const clientDeclaredCost = (dto.real_cost_usd !== undefined && dto.real_cost_usd !== null) || dto.cost_type !== undefined || dto.cost_source !== undefined
+      ? { cost_type: dto.cost_type ?? null, real_cost_usd: dto.real_cost_usd ?? null, cost_source: dto.cost_source ?? null }
+      : null;
     const mode: UsageEventMode = dto.mode as UsageEventMode ?? 'unknown';
     return this._persistEvent({
       userId: user.id,
@@ -212,8 +222,8 @@ export class EventsService {
       mode,
       costType,
       estimatedCostUsd: undefined,
-      realCostUsd: dto.real_cost_usd ?? null,
-      costSource: (dto.cost_source as UsageEventCostSource) ?? null,
+      realCostUsd: null,
+      costSource: null,
       tokensInput: dto.tokens_input ?? null,
       tokensOutput: dto.tokens_output ?? null,
       units: dto.units ?? dto.video_count ?? null,
@@ -222,6 +232,7 @@ export class EventsService {
       durationMs: dto.duration_ms ?? null,
       metadata: {
         ...(dto.metadata ?? {}),
+        ...(clientDeclaredCost ? { clientDeclaredCost, costUntrusted: true } : {}),
         videoJobId: dto.video_job_id ?? dto.metadata?.videoJobId ?? null,
         videoBatchId: dto.video_batch_id ?? dto.metadata?.videoBatchId ?? null,
         videoCount: dto.video_count ?? dto.metadata?.videoCount ?? null,

@@ -2514,8 +2514,10 @@
   }
 
   /**
-   * Costo real+estimado del curso (tokens reales de Claude + tarifas
-   * configuradas para video/audio) — misma fuente que usa el panel Admin.
+   * Costo del curso desde el ledger V2 (FinOps P0: CostReadService, misma
+   * fuente y definiciones que el panel Admin): `data.money` con actual /
+   * reserved / committed como strings decimales, `completeness` ('partial' =
+   * incluye llamadas sin precio) y el desglose por run. Nunca un estimado.
    * @param {number|string} courseId
    * @returns {Promise<{ok:true,data:object}|{ok:false,error:string}>}
    */

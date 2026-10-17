@@ -641,7 +641,7 @@ export class FinopsBudgetService {
    * y pagadas por Cursia (BYOK no consume el presupuesto del run). → null = permitida; si no, el código para el proxy.
    */
   async guardLlmProxyCall(a: { subject: string; itemRunId: string | null; model: string; promptChars: number; maxTokens: number; billingAccount: string }): Promise<null | {
-    code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
+    code: 'run_paused' | 'item_recovery_budget_exhausted' | 'attribution_rejected'; message: string; runId: string; paused: boolean;
   }> {
     if (!a.itemRunId || a.billingAccount !== 'cursia') return null;
     const [row] = await this.dataSource.query(
@@ -649,7 +649,14 @@ export class FinopsBudgetService {
          join public.production_jobs pj on pj.id = g.job_id where g.id = $1`,
       [a.itemRunId],
     );
-    if (!row || String(row.owner_id) !== String(a.subject)) return null; // sin atribución verificable: el ingest la deja sin run
+    if (!row) return null; // parte inexistente: no hay run cuyo tope aplicar (el ingest la deja sin atribuir, con motivo)
+    // FinOps P0 (audit §4 #7): antes un ejecutor que no era el dueño del run quedaba SIN guard (null = permitida) y su
+    // cargo sin run → sin tope ni disyuntor. Solo el dueño puede ejecutar partes de su run (el claim lo exige): un no
+    // dueño se rechaza ANTES de reservar (el proxy no llama al proveedor).
+    if (String(row.owner_id) !== String(a.subject)) {
+      return { code: 'attribution_rejected', runId: row.job_id, paused: false,
+        message: 'Esta llamada declara una parte de una generación de otra cuenta: no se hizo (sin gasto).' };
+    }
     return this.guardLlmCallForRun({ runId: row.job_id, workerStatus: row.worker_status, itemRunId: a.itemRunId, model: a.model, promptChars: a.promptChars, maxTokens: a.maxTokens });
   }
 

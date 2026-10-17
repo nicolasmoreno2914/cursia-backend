@@ -11,6 +11,7 @@ export * from './incremental';
 export * from './llm-usage-ingest';
 export * from './finops-ingest-token.guard';
 export * from './finops-ledger.service';
+export * from './cost-read.service';
 export * from './run-budget';
 export * from './run-spend-guard';
 export * from './finops-budget.service';
