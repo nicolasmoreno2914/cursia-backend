@@ -557,7 +557,8 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
     // r57 T5: un archivo de trabajo del perfil falta o no es el que se adjuntó (sha256/tamaño/tipo) → el usuario lo corrige.
     // r57 T6: el .mbz supera el límite de subida configurado (PACKAGE_MBZ_MAX_BYTES) o ese límite está mal configurado →
     // una persona sube el límite del almacenamiento / corrige la variable o reduce el curso (nunca se reintenta solo).
-    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID',
+    // Review r1 (M): el artifact de un archivo de trabajo se borró / no es del dueño / no es practice_file → PRACTICE_FILE_MISSING.
+    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID', 'PRACTICE_FILE_MISSING',
       'PACKAGE_SIZE_LIMIT_EXCEEDED', 'PACKAGE_SIZE_CONFIG_INVALID'],
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'config', adminAction: 'resolve_package_block',
   },

@@ -348,6 +348,7 @@ const ENV_KEYS = [
     const staleBuildRuns = new Set();
     packaging.isSameBuild = async (run) => !staleBuildRuns.has(run.id);
     const PFR = L('modules/dynamic-packaging/package-freshness.js');
+    const PFR_REAL_HAS = PFR.hasDeliverablePackage; // review r1 (I1): el check con frescura real lo restaura
     const deliverableJobs = new Set();
     PFR.hasDeliverablePackage = async (q, run) => {
       const [j] = await q.query(`select id from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1
@@ -593,7 +594,7 @@ const ENV_KEYS = [
       process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP = 'true';
       try { return await fn(); } finally { if (prev === undefined) delete process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP; else process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP = prev; }
     };
-    await check('[AP] T8: DEFAULT (sin DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP) un paquete final COMPLETADO con un builder anterior NUNCA se re-arma solo: estado stale sin pendiente → needs_attention + retry_package; el SQL del barrido no lo selecciona; ensure(sweep) → nothing_pending; con el flag = true sí (opt-in); el empaque inicial de un run recién completado sigue igual', async () => {
+    await check('[AP] T8: DEFAULT (sin DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP) un paquete final COMPLETADO con un builder anterior y NO vigente (frescura simulada; el caso «solo cambió el builder» = vigente lo cubre «[AP] review r1 I1») NUNCA se re-arma solo: estado stale sin pendiente → needs_attention + retry_package; el SQL del barrido no lo selecciona; ensure(sweep) → nothing_pending; con el flag = true sí (opt-in); el empaque inicial de un run recién completado sigue igual', async () => {
       assert(process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP === undefined, 'el harness corre con el default');
       eq([APS.autoRepackageOnBuilderBump({}), APS.autoRepackageOnBuilderBump({ DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP: 'TRUE ' }), APS.autoRepackageOnBuilderBump({ DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP: '1' }), APS.autoRepackageOnBuilderBump({ DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP: 'false' })], [false, true, false, false], 'parseo del flag');
       const C = await confirmedCourse('T8 builder bump default');
@@ -619,6 +620,74 @@ const ENV_KEYS = [
         });
       } finally {
         staleBuildRuns.delete(runId);
+      }
+    });
+
+    // Review r1 (I1): frescura REAL (sin los sustitutos de arriba) sobre PG: con el opt-in apagado, un paquete cuyo ÚNICO
+    // cambio es el builder sigue «Curso listo» (complete, sin needs_attention ni acción) y el admin ve el aviso
+    // informativo builderUpdateAvailable; el empaque automático no lo re-arma; un pedido explícito sí. Un cambio de
+    // contenido → stale como siempre; con el opt-in → re-armado pendiente como siempre.
+    await check('[AP] review r1 I1: opt-in APAGADO + solo cambió el builder → complete (sin needs_attention ni retry_package; dueño: stale false, sin el aviso; admin: builderUpdateAvailable); barrido/ensure no lo re-arman; contenido distinto → needs_attention + retry_package; opt-in encendido → packaging con re-armado pendiente; POST manual → job nuevo', async () => {
+      assert(process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP === undefined, 'el harness corre con el default');
+      const PV3 = L('modules/dynamic-packaging/packaging-v3.js');
+      const realPrepare = PV3.prepareV3Package;
+      const realHas = PFR_REAL_HAS;
+      const stubHas = PFR.hasDeliverablePackage;
+      const stubSame = packaging.isSameBuild;
+      const C = await confirmedCourse('review r1 I1');
+      const runId = await seededRealRun(C);
+      eq(await recompute(runId), 'completed', 'completed');
+      const [j0] = await pkgJobs(runId);
+      // Lo que prepareV3Package devolvería HOY para el run (los .mbz reales los cubren check-v21-packaging-v3 / check-review-r1-fixes).
+      let ids = ['art-1', 'art-2'];
+      const reuseKeyFor = (list) => ({ builderVersion: CUR_BUILDER, manifestSha256: C.manifest.sha256, sourceArtifactIds: list, themeSha256: 't', assessmentProfileSha256: 'p', h5pProfileVersion: 1, vcRendererVersion: 'r', moodleVersion: '4.1' });
+      PV3.prepareV3Package = async () => {
+        const reuseKey = reuseKeyFor(ids);
+        return { byItem: new Map(ids.map((id, i) => [`content:k${i}`, { artifacts: [{ artifactId: id }] }])), sourceArtifactIds: [...ids], reuseKey, sourceIdsHash: PV3.packageReuseHashV3(reuseKey) };
+      };
+      PFR.hasDeliverablePackage = realHas;
+      packaging.isSameBuild = PackagingService.prototype.isSameBuild;
+      try {
+        const oldHash = PV3.legacyReuseHashesV3(reuseKeyFor(ids), '3.0.0')[0];
+        await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(), output_summary = $2::jsonb where id = $1`,
+          [j0.id, JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: '3.0.0', sourceIdsHash: oldHash, sourceArtifactIds: ids })]);
+        let dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.complete, dto.completion.packageReady, dto.completion.adminActions, dto.completion.packageJob.status],
+          ['complete', true, true, [], 'completed'], 'solo builder: «Curso listo» sin cambios');
+        const own = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, OWNER_ACTOR);
+        eq([own.stale, own.staleReason, own.builderUpdateAvailable], [false, undefined, undefined], 'dueño: vigente, sin «Hay cambios…» ni aviso de admin');
+        const adm = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, ADMIN_X);
+        eq([adm.stale, adm.builderUpdateAvailable], [false, { packagedWith: '3.0.0', current: CUR_BUILDER }], 'admin: aviso informativo');
+        assert(!(await APS.findAutoPackageCandidates(ds, new Date(), 500)).includes(runId), 'el SQL del barrido no lo selecciona');
+        assert(!(await autoPkg.sweep({ limit: 500 })).some((o) => o.runId === runId), 'el barrido no lo toma');
+        eq((await autoPkg.ensure(runId, 'sweep')).reason, 'nothing_pending', 'ensure(sweep) no lo re-arma');
+        eq((await pkgJobs(runId)).length, 1, 'sin jobs nuevos');
+        const needs = await recovery.listNeedsAttention({ limit: 500 });
+        assert(!needs.needsAttention.some((e) => e.runId === runId), 'no entra a la cola de recuperación de admin');
+        // Contenido distinto (un item se regeneró): stale como siempre → needs_attention + retry_package.
+        ids = ['art-1', 'art-3'];
+        dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob], ['needs_attention', [{ code: 'retry_package' }], { status: 'stale', autoRetryPending: false, auto: true }], 'contenido distinto: stale');
+        const own2 = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, OWNER_ACTOR);
+        assert(own2.stale === true && /^sources_changed/.test(own2.staleReason), `dueño ve «Hay cambios…»: ${own2.staleReason}`);
+        ids = ['art-1', 'art-2'];
+        // Opt-in encendido: el builder nuevo SÍ re-arma (como antes).
+        process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP = 'true';
+        try {
+          dto = await runs.getRun(C.cid, OWNER, 1, runId);
+          eq([dto.completion.state, dto.completion.packageJob], ['packaging', { status: 'stale', autoRetryPending: true, auto: true }], 'opt-in: re-armado pendiente');
+          const a2 = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, ADMIN_X);
+          assert(a2.stale === true && /^builder_changed/.test(a2.staleReason) && !a2.builderUpdateAvailable, `opt-in: ${a2.staleReason}`);
+        } finally {
+          delete process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP;
+        }
+        // Pedido EXPLÍCITO (botón de admin / POST …/package): arma uno con el builder actual.
+        const req = await packaging.requestPackage(C.cid, OWNER, 1, runId, ADMIN_X);
+        eq(req.created, true, 'pedido explícito: job nuevo');
+      } finally {
+        PV3.prepareV3Package = realPrepare;
+        PFR.hasDeliverablePackage = stubHas;
+        packaging.isSameBuild = stubSame;
       }
     });
 

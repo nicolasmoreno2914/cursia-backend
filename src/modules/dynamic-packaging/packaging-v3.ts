@@ -1,4 +1,5 @@
 import { APPLICATION_ARTIFACT_TYPE, validateApplicationActivityDoc } from '../course-shell/application-activity';
+import { Logger } from '@nestjs/common';
 import { GUIDED_PRACTICE_ARTIFACT_TYPE, guidedPracticeQualityGuardApplies, validateGuidedPracticeDoc } from '../course-shell/guided-practice';
 /**
  * Cursia V2.1 — R12: empaque de runs rulesVersion 3 — resolución de
@@ -424,6 +425,17 @@ export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
   return createHash('sha256').update(canon, 'utf8').digest('hex');
 }
 
+/**
+ * Review r1 (I1): claves que un builder ANTERIOR (`builderVersion`) habría calculado hoy para el mismo
+ * contenido: la clave completa con esa versión y, además, sin `libroReferencesSha256` (componente que entró
+ * en la clave con T1 / 3.15.0; los builders anteriores nunca lo incluían).
+ */
+export function legacyReuseHashesV3(k: PackageReuseKeyV3Input, builderVersion: string): string[] {
+  const out = [packageReuseHashV3({ ...k, builderVersion })];
+  if (k.libroReferencesSha256) out.push(packageReuseHashV3({ ...k, builderVersion, libroReferencesSha256: undefined }));
+  return out;
+}
+
 // ─── Marca del Libro Guía (r19 L3) ─────────────────────────────────────────
 
 export interface LibroBrandV3 {
@@ -513,7 +525,15 @@ export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, owner
  * documento de la institución (status `found` / `provided`, con su fuente; nunca las `inferred`), en su orden y sin
  * repetidas. Sin contexto académico guardado → []. Si la lectura falla, aviso visible (nunca en silencio) y [].
  */
-export async function loadLibroReferencesV3(q: QueryExecutor, courseId: number): Promise<{ references: string[]; warnings: string[] }> {
+/**
+ * Review r1 (M8): un error al leer el contexto académico NUNCA es silencioso: se registra en el log del servidor y
+ * queda como aviso `libro_references_unavailable:…` en el resumen del paquete (profileWarnings → warnings).
+ */
+export async function loadLibroReferencesV3(
+  q: QueryExecutor,
+  courseId: number,
+  logger: { warn(msg: string): void } = new Logger('PackagingV3'),
+): Promise<{ references: string[]; warnings: string[] }> {
   try {
     const stored = await loadCurrentAcademicContext(q as any, courseId);
     const seen = new Set<string>();
@@ -529,6 +549,7 @@ export async function loadLibroReferencesV3(q: QueryExecutor, courseId: number):
     return { references, warnings: [] };
   } catch (err) {
     const why = (err instanceof Error ? err.message : String(err)).slice(0, 80).replace(/\s+/g, ' ').replace(/:/g, ';');
+    logger.warn(`loadLibroReferencesV3: no se pudieron leer las referencias del programa académico del curso ${courseId} (el Libro sale sin «Referencias»): ${why}`);
     return { references: [], warnings: [`libro_references_unavailable:${why}`] };
   }
 }
@@ -964,6 +985,8 @@ export async function loadContentsV3(
 
 /** Tipo de artifact de un archivo de trabajo subido desde el panel (artifactUpload del frontend). */
 export const PRACTICE_FILE_ARTIFACT_TYPE = 'practice_file';
+/** Review r1 (M): código del error «el artifact del archivo de trabajo ya no está» (clase D, package_precheck). */
+export const PRACTICE_FILE_MISSING = 'PRACTICE_FILE_MISSING';
 
 /**
  * Descarga los archivos de trabajo `source.kind = 'artifact'` del perfil: el artifact debe ser del DUEÑO del run, de tipo
@@ -983,8 +1006,10 @@ export async function loadPracticeFilesV3(
       `select id, owner_id, type, storage_bucket, storage_path from public.artifacts where id = $1 and owner_id = $2`,
       [r.source.artifactId, ownerId],
     );
-    if (!row) throw new Error(`${PACKAGING_V3}: el archivo de trabajo ${r.id} (artifact ${r.source.artifactId}) no existe o no es del dueño del curso`);
-    if (row.type !== PRACTICE_FILE_ARTIFACT_TYPE) throw new Error(`${PACKAGING_V3}: el artifact ${r.source.artifactId} del archivo de trabajo ${r.id} es de tipo ${row.type}, no ${PRACTICE_FILE_ARTIFACT_TYPE}`);
+    // Review r1 (M): un archivo de trabajo borrado / ajeno / de otro tipo lo corrige una PERSONA (vuelve a adjuntarlo en
+    // el perfil): `PRACTICE_FILE_MISSING`, clase D «package_precheck» igual que PRACTICE_FILE_INVALID (nunca se reintenta solo).
+    if (!row) throw new Error(`${PRACTICE_FILE_MISSING}: el archivo de trabajo ${r.id} (artifact ${r.source.artifactId}) no existe o no es del dueño del curso; vuelve a adjuntarlo en el perfil`);
+    if (row.type !== PRACTICE_FILE_ARTIFACT_TYPE) throw new Error(`${PRACTICE_FILE_MISSING}: el artifact ${r.source.artifactId} del archivo de trabajo ${r.id} es de tipo ${row.type}, no ${PRACTICE_FILE_ARTIFACT_TYPE}; vuelve a adjuntarlo en el perfil`);
     out.set(r.id, await L.loadStorageBytes(row.storage_bucket || 'cursia-artifacts', row.storage_path));
   }
   return out;
@@ -999,6 +1024,8 @@ export interface PreparedV3Package {
   sourceArtifactIds: string[];
   /** Clave de reuse v3 (se guarda como `sourceIdsHash` en el job y en el artifact dynamic_mbz). */
   sourceIdsHash: string;
+  /** Review r1 (I1): las entradas de la clave (para recalcularla con el builder de un paquete anterior). */
+  reuseKey: PackageReuseKeyV3Input;
   staleWarnings: V3StaleWarning[];
   /** F1 (I3): evaluación resuelta contra los ítems del Manifest (pesos normalizados / sin nota). */
   resolved: ResolvedAssessment;
@@ -1149,7 +1176,7 @@ export async function prepareV3Package(
   const libroBrand = await loadLibroBrandV3(q, courseId, run.owner_id ?? null);
   const brandPrint = libroBrandFingerprintV3(libroBrand);
   const libroRefs = await loadLibroReferencesV3(q, courseId);
-  const sourceIdsHash = packageReuseHashV3({
+  const reuseKey: PackageReuseKeyV3Input = {
     builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
     manifestSha256: manifest.sha256,
     sourceArtifactIds,
@@ -1161,13 +1188,15 @@ export async function prepareV3Package(
     omittedVideoKeys,
     libroBrandSha256: brandPrint.sha256,
     libroReferencesSha256: libroReferencesFingerprintV3(libroRefs.references),
-  });
+  };
+  const sourceIdsHash = packageReuseHashV3(reuseKey);
   return {
     run,
     byItem,
     profiles,
     sourceArtifactIds,
     sourceIdsHash,
+    reuseKey,
     staleWarnings: staleWarningsV3(byItem),
     resolved,
     assessment: assessmentPackageSummary(resolved),
