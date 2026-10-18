@@ -1546,6 +1546,28 @@ async function workerChecks() {
     const expected = THEME.themeSha256(THEME.resolveTheme(THEME.presentationProfileFromPaletteId('blanco-corp')));
     eq(s.themeSha256, expected, 'tema = aula-clara/light + seed de blanco-corp');
   });
+  await check('T6 (r57) worker v3: presupuesto de tamaño — sin límites solo informa; sobre el aviso, aviso visible; sobre el límite, PACKAGE_SIZE_LIMIT_EXCEEDED ANTES de subir', async () => {
+    const h0 = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    h0.deps.packageSizeLimits = () => ({ warnBytes: null, maxBytes: null });
+    await W.processItem(h0.deps, h0.job);
+    eq(h0.state.failed, [], 'sin límites: sin fallos');
+    const s0 = h0.state.completed[0];
+    eq(s0.size.totalBytes, h0.state.uploads[0].buffer.length, 'tamaño informado = bytes subidos');
+    assert(s0.size.largest.length > 0 && s0.size.uncompressedBytes > 0 && s0.size.maxBytes === undefined, `size: ${JSON.stringify(s0.size).slice(0, 200)}`);
+    assert(!(s0.warnings || []).some((w) => w.code === 'package_size_over_warn'), 'sin aviso de tamaño');
+    const total = s0.size.totalBytes;
+    const hw = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    hw.deps.packageSizeLimits = () => ({ warnBytes: total - 1, maxBytes: total });
+    await W.processItem(hw.deps, hw.job);
+    eq([hw.state.failed.length, hw.state.uploads.length], [0, 1], 'sobre el aviso: sube igual');
+    assert((hw.state.completed[0].warnings || []).some((w) => w.detail === `package_size_over_warn:${total}:${total - 1}`), `aviso: ${JSON.stringify(hw.state.completed[0].warnings)}`);
+    eq([hw.state.completed[0].size.maxBytes, hw.state.completed[0].size.warnBytes], [total, total - 1], 'límites en el resumen');
+    const hx = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    hx.deps.packageSizeLimits = () => ({ warnBytes: null, maxBytes: total - 1 });
+    await W.processItem(hx.deps, hx.job);
+    eq(hx.state.uploads.length, 0, 'sobre el límite: SIN upload');
+    assert(hx.state.failed.length === 1 && /^PACKAGE_SIZE_LIMIT_EXCEEDED: el paquete pesa \d+ bytes/.test(hx.state.failed[0]), `falla: ${hx.state.failed[0]}`);
+  });
   await check('worker v3: run REAL con fixtures de proveedor → falla MOCK_ARTIFACT_IN_REAL_RUN antes de construir o subir', async () => {
     const h = harness({ providerModes: { presentation: 'real', audio: 'real' } });
     await W.processItem(h.deps, h.job);

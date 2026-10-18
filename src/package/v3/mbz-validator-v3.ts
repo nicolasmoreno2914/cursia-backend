@@ -26,6 +26,14 @@
  *                                          con library.json = versión del perfil; los demás siguen content-only (v1)
  *   AUDIO_DURATION                         las duraciones mostradas = las medidas de los MP3 del paquete
  *   FILES_INTEGRITY / STRUCTURE / LIBRO    blobs, inforef, secuencias, Libro Guía
+ *   T6 (r57) FILES_INTEGRITY               además: ningún blob huérfano ni con ruta mal formada; todo archivo de files.xml
+ *                                          con dueño (inforef de su actividad, o la imagen de la insignia); @@PLUGINFILE@@
+ *                                          también en el contenido de las páginas (filearea content)
+ *   T6 (r57) TOKEN_INVALID                 además: tokens del contenido de las páginas y enlaces muertos (href="#",
+ *                                          vacío, javascript:) en todo HTML visible
+ *   T6 (r57) MANIFEST_COVERAGE             cada parte de facts por capítulo (presentación con PDF+portada, video,
+ *                                          actividad con su tipo de módulo) está exactamente una vez; nada de más
+ *   T6 (r57) H5P_FILES                     además: content/content.json presente y JSON válido
  *   LIBRO_CTA (≥ 3.13.0)                   botón «Abrir Libro Guía» a su propio recurso, pestaña nueva
  *   SECTIONS / NAVIGATION                  EV6: una sección por capítulo/evaluación, cierre al final
  *                                          (después del examen final), coursedisplay = 1 y cada
@@ -402,6 +410,26 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       const f = fileById.get(id);
       if (!f) add('FILES_INTEGRITY', a.dir, `inforef apunta al file ${id}, que no está en files.xml`);
       else if (f.ctx !== a.ctx) add('FILES_INTEGRITY', a.dir, `file ${id} (${f.filename}) es de otro contexto`);
+    }
+  }
+  // T6 (r57): integridad completa del almacén de archivos — todo blob de files/ lo declara files.xml (sin huérfanos ni
+  // rutas mal formadas), y todo archivo declarado tiene dueño: el inforef de la actividad de su contexto o, fuera de
+  // las actividades, solo la imagen de la insignia (badges/badgeimage, la juzga CERTIFICATE).
+  const declaredHashes = new Set(files.filter((f) => f.filename !== '.').map((f) => f.hash));
+  for (const n of Object.keys(zip.files)) {
+    if (!n.startsWith('files/') || zip.files[n].dir) continue;
+    const m = /^files\/([0-9a-f]{2})\/([0-9a-f]{40})$/.exec(n);
+    if (!m || m[2].slice(0, 2) !== m[1]) add('FILES_INTEGRITY', n, 'blob con ruta mal formada (se espera files/<sha1[:2]>/<sha1>)');
+    else if (!declaredHashes.has(m[2])) add('FILES_INTEGRITY', n, 'blob huérfano: ningún archivo de files.xml lo declara');
+  }
+  const actByCtx = new Map(acts.map((a) => [a.ctx, a]));
+  for (const f of files) {
+    if (f.filename === '.') continue;
+    const owner = actByCtx.get(f.ctx);
+    if (owner) {
+      if (!owner.inforefFiles.includes(f.id)) add('FILES_INTEGRITY', owner.dir, `file ${f.id} (${f.component}/${f.filearea}/${f.filename}) sin referencia en el inforef de su actividad`);
+    } else if (!(f.component === 'badges' && f.filearea === 'badgeimage')) {
+      add('FILES_INTEGRITY', `file ${f.id}`, `archivo sin dueño (contexto ${f.ctx}, ${f.component}/${f.filearea}/${f.filename})`);
     }
   }
 
@@ -1089,6 +1117,34 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (hits.length) add('INTERNAL_VOCABULARY', a.idnumber, `texto interno del generador visible: ${[...new Set(hits.map((h) => `«${h.match}»`))].slice(0, 5).join(', ')}`);
     }
   }
+  // T6 (r57): cobertura del Manifest — cada parte que facts declara por capítulo está en el paquete con su tipo de
+  // módulo (nada se omite en silencio) y no hay partes de más: presentación ⇔ capítulo de contenido (con su PDF y su
+  // portada), video ⇔ video real, actividad ⇔ actividad encendida (h5pactivity | scorm según la variante).
+  for (const ch of facts.chapters) {
+    const one = (role: string) => acts.filter((a) => a.idnumber === `cv3:ch:${ch.id}:${role}`);
+    const expectPart = (role: string, want: boolean, modname: string | null) => {
+      const got = one(role);
+      if (got.length !== (want ? 1 : 0)) add('MANIFEST_COVERAGE', `cv3:ch:${ch.id}:${role}`, `capítulo ${ch.number}: ${got.length} módulo(s) ${role}, facts ${want ? 'lo declara' : 'no lo declara'}`);
+      else if (want && modname && got[0].modname !== modname) add('MANIFEST_COVERAGE', got[0].idnumber, `capítulo ${ch.number}: ${role} es ${got[0].modname}, se esperaba ${modname}`);
+      return got[0];
+    };
+    const pres = expectPart('presentation', ch.kind !== 'practice', 'label');
+    if (pres && ch.kind !== 'practice') {
+      const mine = files.filter((f) => f.ctx === pres.ctx && f.component === 'mod_label' && f.filearea === 'intro' && f.filename !== '.');
+      const pdf = mine.find((f) => /\.pdf$/i.test(f.filename));
+      if (!pdf || !mine.some((f) => /\.png$/i.test(f.filename))) add('MANIFEST_COVERAGE', pres.idnumber, `capítulo ${ch.number}: la presentación no lleva su PDF y su portada`);
+      else {
+        const b = await bin(`files/${pdf.hash.slice(0, 2)}/${pdf.hash}`);
+        if (!b || b.subarray(0, 5).toString('latin1') !== '%PDF-') add('MANIFEST_COVERAGE', pres.idnumber, `capítulo ${ch.number}: el PDF de la presentación no es un PDF`);
+      }
+    }
+    expectPart('video', ch.videoEnabled, 'h5pactivity');
+    expectPart('activity', ch.activityEnabled, ch.activityVariant === 'scorm' ? 'scorm' : ch.activityVariant === 'h5p' ? 'h5pactivity' : null);
+  }
+  for (const a of acts) {
+    const m = /^cv3:ch:([^:]+):/.exec(a.idnumber);
+    if (m && !chapterById.has(m[1])) add('MANIFEST_COVERAGE', a.idnumber, 'módulo de un capítulo que no está en facts');
+  }
   // EV6 T5: video pendiente = sin actividad de video; el aviso existe si y solo si facts lo pide.
   for (const ch of facts.chapters) {
     const hasVideo = acts.some((a) => a.idnumber === `cv3:ch:${ch.id}:video`);
@@ -1096,29 +1152,41 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (ch.videoPending === true && hasVideo) add('STRUCTURE', `cv3:ch:${ch.id}:video`, 'video pendiente (vista previa) empaquetado como actividad');
     if (hasNotice !== (ch.videoPendingNotice === true)) add('STRUCTURE', `cv3:ch:${ch.id}:video_pending`, `aviso de video pendiente ${hasNotice ? 'sin' : 'faltante con'} video pendiente mencionado`);
   }
+  // T6 (r57): los tokens, @@PLUGINFILE@@ y enlaces se revisan en TODO HTML visible del paquete: el intro de cada
+  // actividad y el contenido de cada página (mod_page/content), cada uno contra SU filearea.
+  const pageContent = new Map<number, string>();
+  for (const a of acts.filter((x) => x.modname === 'page')) pageContent.set(a.mid, unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? ''));
   for (const a of acts) {
-    if (`${a.intro}`.includes('cursia-cta://')) add('TOKEN_INVALID', a.idnumber, 'botón de navegación con marcador cursia-cta sin resolver');
-    for (const m of `${a.intro}`.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
-      // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
-      if (m[1] === 'COURSESECTIONBYID') {
-        if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a una sección del paquete`);
-        continue;
+    const comp = a.modname === 'label' ? 'mod_label' : `mod_${a.modname}`;
+    const surfaces: Array<{ html: string; filearea: string; where: string }> = [{ html: `${a.intro}`, filearea: 'intro', where: a.idnumber }];
+    if (pageContent.has(a.mid)) surfaces.push({ html: pageContent.get(a.mid) as string, filearea: 'content', where: `${a.idnumber}#content` });
+    for (const s of surfaces) {
+      if (s.html.includes('cursia-cta://')) add('TOKEN_INVALID', s.where, 'botón de navegación con marcador cursia-cta sin resolver');
+      for (const m of s.html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
+        // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
+        if (m[1] === 'COURSESECTIONBYID') {
+          if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a una sección del paquete`);
+          continue;
+        }
+        // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
+        if (m[1] === 'BADGESVIEWBYID') {
+          if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
+          continue;
+        }
+        const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
+        const target = m[2] ? byMid.get(Number(m[2])) : undefined;
+        if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);
       }
-      // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
-      if (m[1] === 'BADGESVIEWBYID') {
-        if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
-        continue;
+      // T6 (r57): un enlace muerto (href="#", vacío o javascript:) es un token saneado o inventado: nunca se entrega.
+      for (const m of s.html.matchAll(/\bhref\s*=\s*(["'])\s*(#?|javascript:[^"']*)\s*\1/gi)) {
+        add('TOKEN_INVALID', s.where, `enlace muerto href=${m[1]}${m[2]}${m[1]} (un destino del paquete que no resolvió)`);
       }
-      const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
-      const target = m[2] ? byMid.get(Number(m[2])) : undefined;
-      if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);
-    }
-    for (const m of a.intro.matchAll(/@@PLUGINFILE@@\/([^"'?&<>\s]+)/g)) {
-      const name = decodeURIComponent(m[1]);
-      if (name.startsWith('..')) continue; // ruta del embed.php (se resuelve a wwwroot)
-      const comp = a.modname === 'label' ? 'mod_label' : `mod_${a.modname}`;
-      if (!files.some((f) => f.ctx === a.ctx && f.component === comp && f.filearea === 'intro' && f.filename === name)) {
-        add('FILES_INTEGRITY', a.idnumber, `@@PLUGINFILE@@/${name} sin archivo en su filearea intro`);
+      for (const m of s.html.matchAll(/@@PLUGINFILE@@\/([^"'?&<>\s]+)/g)) {
+        const name = decodeURIComponent(m[1]);
+        if (name.startsWith('..')) continue; // ruta del embed.php (se resuelve a wwwroot)
+        if (!files.some((f) => f.ctx === a.ctx && f.component === comp && f.filearea === s.filearea && f.filename === name)) {
+          add('FILES_INTEGRITY', s.where, `@@PLUGINFILE@@/${name} sin archivo en su filearea ${s.filearea}`);
+        }
       }
     }
   }
@@ -1200,6 +1268,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         continue;
       }
       const hj = JSON.parse(await hjFile.async('string'));
+      // T6 (r57): un .h5p sin content/content.json (o ilegible) se restaura vacío.
+      const cj = hz.file('content/content.json');
+      if (!cj) add('H5P_FILES', a.idnumber, 'el paquete no tiene content/content.json');
+      else {
+        try {
+          JSON.parse(await cj.async('string'));
+        } catch {
+          add('H5P_FILES', a.idnumber, 'content/content.json no es JSON válido');
+        }
+      }
       const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
       if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${tops.slice(0, 5).join(', ')} (las librerías vienen del pack del sitio)`);
       // Clausura: toda dependencia (preloaded/dynamic/editor) de un library.json incluido debe venir incluida.

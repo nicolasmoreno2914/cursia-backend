@@ -535,6 +535,8 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'CURSIA_IV_INLINE_SCRIPT_PKG', 'H5P_NOT_GRADABLE_IN_MOODLE', 'ACTIVITY_INTRO_THEME', 'GAMMA_THEME_CONFIG', 'FACTS_INVALID',
       'VIDEO_PACKAGE_FILENAME_INVALID', 'ACTIVITY_PACKAGE_FILENAME_INVALID', 'V3_VALIDATION_CONTEXT', 'PNG_ENCODE', 'PNG_UNSUPPORTED',
       'PACKAGE_BUILDER_ERROR',
+      // r57 T6: el validador encontró una parte de facts (presentación, video, actividad) ausente o de más en el .mbz.
+      'MANIFEST_COVERAGE',
       // r19: los capítulos pasaron su validación pero el total queda bajo el piso de 25 min → un humano mira el diagnóstico.
       'AUDIOBOOK_TOO_SHORT_FOR_SOURCE',
       // r19 L: asset del logo de Cursia ausente/roto (deploy) o invariante de una marca de agua por página.
@@ -553,7 +555,10 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
   },
   {
     // r57 T5: un archivo de trabajo del perfil falta o no es el que se adjuntó (sha256/tamaño/tipo) → el usuario lo corrige.
-    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID'],
+    // r57 T6: el .mbz supera el límite de subida configurado (PACKAGE_MBZ_MAX_BYTES) o ese límite está mal configurado →
+    // una persona sube el límite del almacenamiento / corrige la variable o reduce el curso (nunca se reintenta solo).
+    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID',
+      'PACKAGE_SIZE_LIMIT_EXCEEDED', 'PACKAGE_SIZE_CONFIG_INVALID'],
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'config', adminAction: 'resolve_package_block',
   },
 ] as Rule[]);

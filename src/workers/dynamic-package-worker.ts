@@ -22,6 +22,7 @@ import { buildDynamicMbzV3, DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../package/dy
 import { PACKAGE_KINDS, PackageKind, QA_INTERNAL_STORAGE_PREFIX, QA_PACKAGE_FILENAME_PREFIX, summaryLooksPreview } from '../modules/dynamic-packaging/package-freshness';
 import { frozenProviderModesOf } from '../modules/dynamic-generation/provider-modes';
 import { validateMbzV3 } from '../package/v3/mbz-validator-v3';
+import { PackageSizeLimits, packageSizeBudget, packageSizeLimitsFromEnv } from '../package/v3/package-size-budget';
 import { buildPackagingPlanV3 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import {
   ContentLoadersV3,
@@ -130,6 +131,11 @@ export interface DynamicPackageWorkerDeps {
   loadersV3?: (ownerId: string) => ContentLoadersV3;
   /** Reloj inyectable (segundos UNIX) para el `ts` del .mbz v3. */
   nowSeconds?: () => number;
+  /**
+   * T6 (r57): límites de tamaño del .mbz v3 (default: PACKAGE_MBZ_WARN_BYTES / PACKAGE_MBZ_MAX_BYTES del entorno,
+   * leídos en cada job; sin variables = solo medir e informar).
+   */
+  packageSizeLimits?: () => PackageSizeLimits;
 }
 
 export interface PackageJobRow {
@@ -589,6 +595,10 @@ export async function processV3PackageJob(
         validation.issues.slice(0, 8).map((i) => `${i.code} ${i.where}: ${i.message}`).join(' | '),
     );
   }
+  // T6 (r57): presupuesto de tamaño ANTES de subir — un paquete sobre el límite configurado falla acá con un código
+  // claro (nunca un 413 del almacenamiento después de armarlo); sobre el umbral de aviso, aviso visible.
+  const sizeVerdict = await packageSizeBudget(built.mbz, (deps.packageSizeLimits ?? packageSizeLimitsFromEnv)());
+  if (sizeVerdict.error) throw new Error(sizeVerdict.error);
   if (isLeaseLost()) return;
 
   // EV6 T5 (fix round 1, m-2): pendientes con el flag `notice` del builder (ruling 3, medible).
@@ -633,6 +643,7 @@ export async function processV3PackageJob(
     ...prepared.staleWarnings,
     ...profileWarnings,
     ...[...loaded.warnings, ...built.summary.warnings].filter((w) => !profileDetails.has(w)).map((w) => ({ code: w.split(':')[0], detail: w })),
+    ...sizeVerdict.warnings.map((w) => ({ code: w.split(':')[0], detail: w })),
   ];
   const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
     artifactId: artifact.id,
@@ -648,6 +659,8 @@ export async function processV3PackageJob(
     ...(built.summary.restore ? { restore: built.summary.restore } : {}),
     mockProviderItems: loaded.mockProviderItems,
     validation: validation.stats,
+    // T6 (r57): tamaño del paquete subido y lo más pesado (siempre; los límites solo si están configurados).
+    size: { totalBytes: sizeVerdict.stats.totalBytes, uncompressedBytes: sizeVerdict.stats.uncompressedBytes, entries: sizeVerdict.stats.entries, largest: sizeVerdict.stats.largest, ...(sizeVerdict.limits.maxBytes !== null ? { maxBytes: sizeVerdict.limits.maxBytes } : {}), ...(sizeVerdict.limits.warnBytes !== null ? { warnBytes: sizeVerdict.limits.warnBytes } : {}) },
     ...(warnings.length ? { warnings } : {}),
     // T1 (r57): avisos de calidad del contenido (fórmulas repetidas entre capítulos); informativos, nunca fallan.
     ...(built.summary.qualityWarnings?.length ? { qualityWarnings: built.summary.qualityWarnings } : {}),
