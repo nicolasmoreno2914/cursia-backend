@@ -75,6 +75,15 @@ Un run siembra **todos** los ítems del Manifest [V AU1 §1.6]. `stop-after` pau
 
 Por los ítems mock, R2 clasifica el run como `preview`. Solo se puede empaquetar `qa_preview` (SUPER_ADMIN) y nunca un final [V I5B]. Para este experimento eso es lo deseado.
 
+**Verificación I6 (r58, USD 0, `scripts/check-r58-one-by-one.js` 7/0; curso `1x1-sin-examenes` de `scripts/fixtures/commercial-simulation/courses.json`).** Los tres [P] de arriba quedan así:
+- **Flags en false: [V].** El perfil pedagógico y el de evaluación con `finalExam=false` pasan los validadores reales. El Blueprint congela `examEnabled=false` y `finalExam=false`. El Manifest es exactamente la lista blanca (11 ítems), y `validateGenerationManifestV3` no da errores. En la Verificación (el mismo cálculo que el gate R68 y el Prebrief), «El curso no tiene evaluaciones» es una **advertencia**, no un crítico: el diseño es aplicable, sin cambios pendientes y sin bloqueos de diseño. No hizo falta ningún cambio de producto. Lo que se verificó es el código puro con los mismos insumos. El flujo HTTP en staging (toggles del editor, `PATCH …/settings {finalExam:false}`, `examEnabled` del módulo) se confirma en el checklist §12.
+- **Carga horaria: [V], con dos condiciones obligatorias.**
+  - `designPreferences.applicationActivities='none'`: con `auto` el distribuidor agrega una AA ya con 3 h.
+  - `targetHours` entre 1 y 2,5 h: con 3 h agrega capítulos de práctica. `guidedPractice='none'` se fija también.
+  - Con eso el diseño queda `within_tolerance`, con 1,5 h estimadas.
+- **Guion del audiolibro en mock: [V] por código.** En modo `mock`, `dynamic-provider-worker.ts` produce la fixture determinista y no entra a `processRealProviderItem`, que es donde vive el guion LLM (`provider-real/audio-scripts.ts`). El estimado con video, presentación y audio en mock trae solo los 7 ítems de IA y 0 proveedores pagados reales: esperado ≈ USD 0,85 y máximo ≈ USD 2,63 (precios del seed, [E]). **Requisito:** el mock exige `DYNAMIC_ALLOW_PROVIDER_MOCK=true` en el entorno; sin esa variable el ítem falla con `provider_mock_not_allowed` y no se produce nada.
+- **Nota y certificado:** con H5P calificable (video + actividad) el curso tiene criterio de nota (categoría única «Práctica» 100 %) y **no tiene insignia**, porque no hay evaluación final (aviso `certificate_omitted:no_final_exam`). Restaurado en Moodle 4.1–4.5 con estudiantes ficticios (r58 I6).
+
 **R5:** el curso es **nuevo y desechable**, así que las claves de generación 1 (`sha256(manifestId:itemKey:generation)`) que se consumen pertenecen a un Manifest que no sirve para nada más. **Nunca** se usa #1353, #1209, #542 ni ningún curso existente.
 
 ---
