@@ -1,5 +1,5 @@
 {
-  "_comment": "T7 (r57) — cursos SINTÉTICOS de la simulación comercial. Clientes genéricos A/B/C; ningún cliente, institución ni curso real. Cada curso es SOLO configuración: el mismo motor (scripts/lib/commercial-simulation.js) los lleva a paquete. Letras de capítulo = tipo esperado (P procedimental, R protocolo, K comunicación, D decisión/caso, N normativo/ético, C conceptual) con títulos/objetivos del banco genérico de scripts/lib/composition-fixtures.js; o [título, objetivo] explícitos.",
+  "_comment": "T7 (r57) — cursos SINTÉTICOS de la simulación comercial. Clientes genéricos A/B/C; ningún cliente, institución ni curso real. Cada curso es SOLO configuración: el mismo motor (scripts/lib/commercial-simulation.js) los lleva a paquete. Letras de capítulo = tipo esperado (P procedimental, R protocolo, K comunicación, D decisión/caso, N normativo/ético, C conceptual) con títulos/objetivos del banco genérico de scripts/lib/composition-fixtures.js; o [título, objetivo] explícitos. r58 (I6): + cursos teórico (16 h), muy práctico (32 h), protocolos, por casos (64 h), mixto Gagné con entregas formativas (96 h) y los mínimos 1×1 sin exámenes (forma del experimento de Fase B) y sin ítems calificables; designPreferences/designPins = lo que el docente ajusta o fija.",
   "courses": [
     {
       "id": "A-S", "client": "A", "kind": "format_S", "courseId": 9701, "title": "Curso de ejemplo del cliente A (formato S)",
@@ -152,6 +152,66 @@
         "h5pLibrariesInclude": ["H5P.InteractiveVideo", "H5P.DragText", "H5P.Blanks", "H5P.QuestionSet", "H5P.BranchingScenario", "H5P.Dialogcards"],
         "reviewCards": true
       }
+    },
+    {
+      "id": "teorico-16", "client": "A", "kind": "theory_heavy", "courseId": 9711, "title": "Curso teórico de ejemplo (16 h, profundidad)",
+      "targetHours": 16,
+      "modules": [{ "chapters": "CCC" }, { "chapters": "CC" }],
+      "pedagogy": { "designPreferences": { "emphasis": "depth", "audiovisual": "less" }, "learningPlan": { "framework": "default", "composition": { "videos": "by_need" } } },
+      "exams": "bank",
+      "expect": { "counts": { "modules": 2, "content": 5 }, "learningTypesOnly": ["conceptual"], "reviewCards": true }
+    },
+    {
+      "id": "practico-32", "client": "B", "kind": "highly_practical", "courseId": 9712, "title": "Curso muy práctico de ejemplo (32 h, aplicación)",
+      "targetHours": 32,
+      "modules": [{ "chapters": "PPK" }, { "chapters": "PRP" }, { "chapters": "KPP" }],
+      "pedagogy": { "designPreferences": { "emphasis": "application", "audiovisual": "more" }, "learningPlan": { "framework": "teoria_demostracion_practica", "composition": { "videos": "by_need" } } },
+      "exams": "bank",
+      "expect": { "counts": { "modules": 3, "content": 9 }, "videoForEveryContentChapter": true, "applicationActivitiesMin": 1, "framework": "teoria_demostracion_practica" }
+    },
+    {
+      "id": "protocolo-20", "client": "C", "kind": "protocol", "courseId": 9713, "title": "Curso de protocolos de ejemplo (20 h)",
+      "targetHours": 20,
+      "modules": [{ "chapters": "RRR" }, { "chapters": "RR" }],
+      "pedagogy": { "learningPlan": { "framework": "teoria_demostracion_practica", "phaseLabels": true, "composition": { "videos": "by_need" } } },
+      "exams": "bank",
+      "expect": { "counts": { "modules": 2, "content": 5 }, "learningTypesOnly": ["protocolo"], "videoRulePrefix": "vid.need.", "phaseLabels": true }
+    },
+    {
+      "id": "casos-64", "client": "A", "kind": "case_based", "courseId": 9714, "title": "Curso basado en casos de ejemplo (64 h)",
+      "targetHours": 64,
+      "modules": [{ "chapters": "DDDD" }, { "chapters": "DNDD" }, { "chapters": "DDKD" }, { "chapters": "NDDD" }],
+      "pedagogy": { "designPreferences": { "audiovisual": "recommended" }, "learningPlan": { "framework": "default", "composition": { "videos": "by_need" } } },
+      "exams": "gift",
+      "expect": { "counts": { "modules": 4 }, "activityTypesInclude": ["branchingscenario"], "examMode": "gift" }
+    },
+    {
+      "id": "mixto-96", "client": "B", "kind": "mixed_methodology", "courseId": 9715, "title": "Curso de metodología mixta de ejemplo (96 h, entregas formativas)",
+      "targetHours": 96,
+      "modules": [{ "chapters": "PCRKD" }, { "chapters": "CPDNR" }, { "chapters": "KPCRD" }, { "chapters": "DRPCK" }, { "chapters": "NCPDP" }],
+      "pedagogy": { "learningPlan": { "framework": "gagne_9_eventos", "composition": { "videos": "by_need" } } },
+      "assessment": { "applicationDelivery": { "mode": "assign", "submission": { "onlineText": true, "file": true, "maxFiles": 2, "maxBytes": 10485760, "fileTypes": [".pdf", ".docx"] }, "dueOffsetDays": 14, "grading": { "graded": false } }, "practiceResources": [{ "id": "guia-caso", "chapter": { "app": 0 }, "title": "Guía del caso", "instructions": "Lee la guía antes de entregar.", "relation": "application", "file": { "format": "pdf", "filename": "guia-caso.pdf", "pages": 2 } }, { "id": "plantilla-entrega", "chapter": { "app": 1 }, "title": "Plantilla de entrega", "instructions": "Usa esta plantilla para tu entrega.", "relation": "application", "file": { "format": "docx", "filename": "plantilla-entrega.docx", "title": "Plantilla de entrega", "lines": ["1. Situación", "2. Decisión", "3. Justificación"] } }] },
+      "exams": "bank",
+      "expect": { "counts": { "modules": 5, "content": 25 }, "framework": "gagne_9_eventos", "assign": { "graded": false, "category": null, "rubric": false }, "practiceFiles": { "formats": ["docx", "pdf"], "count": 2 } }
+    },
+    {
+      "id": "1x1-sin-examenes", "client": "C", "kind": "one_by_one_no_exams", "courseId": 9716, "title": "Curso mínimo de ejemplo 1×1 sin exámenes (Fase B)",
+      "targetHours": 2,
+      "finalExam": false,
+      "modules": [{ "examEnabled": false, "chapters": "P" }],
+      "pedagogy": { "designPreferences": { "applicationActivities": "none", "guidedPractice": "none" }, "learningPlan": { "framework": "default", "composition": { "videos": "by_need" } } },
+      "exams": "bank",
+      "expect": { "counts": { "modules": 1, "content": 1, "practice": 0 }, "manifestTypes": { "course_plan": 1, "course_intro": 1, "audio_welcome": 1, "module_intro": 1, "content": 1, "experience": 1, "presentation": 1, "video": 1, "video_interactions": 1, "activity": 1, "audiobook_chapter": 1 }, "grading": { "withoutGrades": false, "courseGradeCriterion": true, "badge": false } }
+    },
+    {
+      "id": "1x1-sin-nota", "client": "A", "kind": "one_by_one_without_grades", "courseId": 9717, "title": "Curso mínimo de ejemplo 1×1 sin ítems calificables",
+      "targetHours": 1,
+      "finalExam": false,
+      "modules": [{ "examEnabled": false, "activityEnabled": false, "chapters": "C" }],
+      "designPins": { "0.0": { "video": false } },
+      "pedagogy": { "designPreferences": { "applicationActivities": "none", "guidedPractice": "none" }, "learningPlan": { "framework": "default" } },
+      "exams": "bank",
+      "expect": { "counts": { "modules": 1, "content": 1, "practice": 0 }, "manifestTypes": { "course_plan": 1, "course_intro": 1, "audio_welcome": 1, "module_intro": 1, "content": 1, "experience": 1, "presentation": 1, "audiobook_chapter": 1 }, "grading": { "withoutGrades": true, "courseGradeCriterion": false, "badge": false } }
     }
   ]
 }

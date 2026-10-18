@@ -20,9 +20,14 @@
 //   CS5 determinismo: el mismo curso dos veces → el mismo .mbz byte a byte
 //   CS7 las aserciones muerden: expectativas equivocadas (tipo, rúbrica, fase, guía, librería, formato) fallan
 //   CS6 informe: proyección del diseño (vista previa) vs tipo de actividad congelado en el Manifest (hallazgo F1)
+//   r58 (I6): en CS1 además, para TODO curso, las relaciones objetivos ↔ actividades ↔ evaluaciones ↔ registro de
+//       horas (gap reportado, nunca rellenado) ↔ archivos ↔ notas/insignia, y el informe de calidad sin BLOCKER;
+//       expectativas nuevas: counts.videos, applicationActivitiesMin, manifestTypes (lista blanca), grading
+//   CS8 defectos sembrados → el informe de calidad los detecta (y un .mbz corrupto → BLOCKER)
+//   CS9 composición por necesidad: prioridad audiovisual menos ≤ recomendado ≤ más sobre la misma estructura
 //
 // Usage: node scripts/check-commercial-simulation.js [--only=A-S,…] [--out=<dir>]  (evidencia JSON en --out, default
-//   ~/cursia-test-env/work/r57/t7-out)
+//   ~/cursia-test-env/work/r57/t7-out; r58: usar --out=~/cursia-test-env/work/r58/out/…)
 'use strict';
 require('reflect-metadata');
 const path = require('path');
@@ -48,6 +53,74 @@ async function check(name, fn) {
 const assert = (c, msg) => { if (!c) throw new Error(msg); };
 const eq = (a, b, msg) => { const x = JSON.stringify(a); const y = JSON.stringify(b); if (x !== y) throw new Error(`${msg}: ${x} !== ${y}`); };
 const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+
+/**
+ * r58 (I6) · RELACIONES que todo curso debe cumplir (no dependen de `expect`): objetivos ↔ actividades ↔ evaluaciones ↔
+ * registro de horas (gap reportado, nunca rellenado) ↔ archivos ↔ notas ↔ requisitos de Moodle (validateMbzV3 ya en
+ * assertCourse). Devuelve un resumen para la evidencia.
+ */
+function assertRelations(sim, insp) {
+  const { built, locked, manifest, input, dryRun } = sim;
+  const f = built.expectations.facts;
+  const resolved = built.expectations.resolved;
+  const items = new Set(manifest.items.map((i) => i.key));
+  const lockedCh = locked.modules.flatMap((m) => m.chapters.map((c) => ({ ...c, moduleId: m.id, examEnabled: m.examEnabled })));
+  const content = lockedCh.filter((c) => (c.kind || 'content') === 'content');
+  const idn = new Set(insp.h5p.map((h) => h.idnumber));
+  // Objetivos ↔ actividades: cada capítulo de contenido tiene objetivo, content + experience; actividad ⇒ item + H5P.
+  for (const c of content) {
+    assert(typeof c.objective === 'string' && c.objective.trim().length > 0, `${c.title}: capítulo sin objetivo`);
+    assert(items.has(`content:${c.id}`) && items.has(`experience:${c.id}`), `${c.title}: sin content/experience en el Manifest`);
+  }
+  for (const c of f.chapters.filter((x) => x.activityEnabled && x.activityVariant !== 'scorm')) {
+    assert(items.has(`activity:${c.id}`), `${c.id}: actividad sin item del Manifest`);
+    assert(idn.has(`cv3:ch:${c.id}:activity`), `${c.id}: actividad sin H5P en el paquete`);
+  }
+  // Actividades ↔ evaluaciones: un quiz por módulo con examen (y ninguno sin él); el banco cubre cada capítulo.
+  const quizIdn = new Set(insp.quizzes.map((q) => q.idnumber));
+  for (const m of manifest.modules) {
+    eq(quizIdn.has(`cv3:exam:${m.moduleId}`), !!m.examEnabled, `módulo ${m.moduleNumber}: examen ⇔ examEnabled`);
+    const bank = input.contents.examBanks && input.contents.examBanks.get(m.moduleId);
+    if (m.examEnabled && bank) {
+      const covered = new Set(bank.questions.map((q) => q.chapterId));
+      for (const c of m.chapters.filter((x) => x.kind !== 'practice')) assert(covered.has(c.chapterId), `módulo ${m.moduleNumber}: el banco no evalúa el capítulo ${c.chapterId}`);
+    }
+  }
+  eq(quizIdn.has('cv3:final_exam'), !!manifest.features.finalExam, 'evaluación final ⇔ finalExam');
+  // Registro de horas: líneas = total; gap = objetivo − total; HOURS_TARGET_GAP ⇔ fuera de tolerancia; sin relleno
+  // (el paquete tiene exactamente los capítulos del Blueprint: el gap no agrega nada).
+  const hr = f.hoursReport;
+  assert(hr && Array.isArray(hr.lines) && hr.lines.length > 0, 'facts sin hoursReport');
+  const sum = hr.lines.reduce((n, l) => n + l.minutes, 0);
+  assert(Math.abs(sum - hr.totals.minutes) < 0.02, `líneas ${sum} ≠ total ${hr.totals.minutes}`);
+  assert(hr.gap && Math.abs(hr.gap.minutes - (sim.cfg.targetHours * 60 - hr.totals.minutes)) < 0.02, `gap ${JSON.stringify(hr.gap)}`);
+  eq(hr.findings.some((x) => x.code === 'HOURS_TARGET_GAP'), !hr.gap.within, 'HOURS_TARGET_GAP ⇔ gap fuera de tolerancia');
+  eq(f.chapters.length, lockedCh.length, 'capítulos del paquete = Blueprint (el gap no se rellena)');
+  // Archivos: cada archivo de práctica pertenece a un capítulo del Blueprint; los de una AA, a un capítulo con AA.
+  for (const r of built.summary.practiceResources || []) {
+    const ch = f.chapters.find((c) => c.id === r.chapterId);
+    assert(ch, `${r.id}: capítulo inexistente`);
+    if (r.relation === 'application') assert(items.has(`application_activity:${r.chapterId}`), `${r.id}: archivo de AA en un capítulo sin AA`);
+  }
+  // Notas: con nota ⇒ pesos suman 100 y cada categoría con peso tiene ítems calificables; sin nota ⇒ sin criterio de nota.
+  const gradedH5p = insp.h5p.filter((h) => h.hasGradeItem).length;
+  if (!resolved.withoutGrades) {
+    const total = resolved.categories.reduce((n, c) => n + c.weight, 0);
+    assert(Math.abs(total - 100) < 0.01, `pesos ${total} ≠ 100`);
+    const has = { practice: gradedH5p > 0, moduleExams: insp.quizzes.some((q) => q.idnumber !== 'cv3:final_exam'), finalExam: quizIdn.has('cv3:final_exam'), applications: (f.counts.applicationAssignsGraded || 0) > 0 };
+    for (const c of resolved.categories.filter((x) => x.weight > 0)) assert(has[c.key] !== false, `categoría ${c.key} con peso y sin ítems calificables`);
+    eq(resolved.courseCompletion.requireCourseGradePass, true, 'con nota: criterio de nota del curso');
+  } else {
+    eq([gradedH5p, insp.quizzes.length, f.counts.applicationAssignsGraded || 0], [0, 0, 0], 'sin nota: ningún ítem calificable');
+    eq(resolved.courseCompletion.requireCourseGradePass, false, 'sin nota: sin criterio de nota');
+  }
+  // Insignia ⇔ evaluación final (y curso con nota) — r55.
+  eq(insp.badges > 0, !!manifest.features.finalExam && !resolved.withoutGrades, 'insignia ⇔ evaluación final con nota');
+  return {
+    contentChapters: content.length, activities: f.counts.activities, quizzes: insp.quizzes.length, gradedH5p, practiceFiles: (built.summary.practiceResources || []).length,
+    hours: { target: sim.cfg.targetHours, total: hr.totals.hours, gap: hr.gap.hours, within: hr.gap.within, designStatus: dryRun.distribution.status }, withoutGrades: !!resolved.withoutGrades, badge: insp.badges > 0,
+  };
+}
 
 /** Aserciones genéricas: cada una se activa SOLO por una clave `expect` de la configuración del curso. */
 async function assertCourse(sim) {
@@ -159,6 +232,23 @@ async function assertCourse(sim) {
     const tg = insp.pages.filter((p) => p.idnumber === 'cv3:shell:teacher_guide');
     eq(tg.map((p) => p.visible), e.teacherGuide ? [0] : [], 'Guía del docente oculta');
   }
+  // r58 (I6) · expectativas nuevas (cada una activada SOLO por su clave `expect`).
+  if (e.counts && e.counts.videos !== undefined) eq(f.counts.videos, e.counts.videos, 'videos');
+  if (e.applicationActivitiesMin !== undefined) assert((f.counts.applicationActivities || 0) >= e.applicationActivitiesMin, `AA ${f.counts.applicationActivities || 0} < ${e.applicationActivitiesMin}`);
+  if (e.manifestTypes) {
+    const byType = {};
+    for (const it of manifest.items) byType[it.type] = (byType[it.type] || 0) + 1;
+    eq(Object.fromEntries(Object.entries(byType).sort()), Object.fromEntries(Object.entries(e.manifestTypes).sort()), 'tipos de items del Manifest (lista blanca)');
+  }
+  if (e.grading) {
+    eq(!!resolved.withoutGrades, e.grading.withoutGrades, 'curso sin nota (withoutGrades)');
+    eq(resolved.courseCompletion.requireCourseGradePass === true, e.grading.courseGradeCriterion, 'criterio de nota del curso');
+    eq(insp.badges > 0, e.grading.badge, 'insignia');
+  }
+  const relations = assertRelations(sim, insp);
+  const quality = S.qualityReportOf(distRoot, sim);
+  eq(quality.counts.BLOCKER, 0, `informe de calidad sin BLOCKER en un curso limpio (${JSON.stringify(quality.findings.filter((x) => x.severity === 'BLOCKER').slice(0, 3))})`);
+  assert(!quality.blocksDelivery, 'informe de calidad: la entrega no se bloquea');
   // F1 (corregido): la proyección del diseño (dry-run `chapters[].activityDecision`) sale del Manifest materializado
   // (con los capítulos de práctica incluidos); debe coincidir con el h5pType congelado en cada capítulo.
   const manAct = new Map(manifest.items.filter((i) => i.type === 'activity').map((i) => [i.chapterId, i.h5pType]));
@@ -172,6 +262,7 @@ async function assertCourse(sim) {
     videoRules: dChapters.map((c) => c.videoDecision ? c.videoDecision.ruleId : null), hours: dryRun.distribution.estimatedHours, status: dryRun.distribution.status,
     usdExpected: Number(dryRun.distribution.materialized.providers.estimateUsd.expected), providers: dryRun.distribution.materialized.providers,
     quizzes: insp.quizzes, categories: resolved.categories, projectionMismatch, note: notes.join(' '),
+    relations, quality: { counts: quality.counts, codes: [...new Set(quality.findings.map((x) => `${x.severity}:${x.code}`))].sort() }, badges: insp.badges, withoutGrades: !!resolved.withoutGrades,
   };
 }
 
@@ -252,6 +343,9 @@ async function assertCourse(sim) {
       ['A-S', { teacherGuide: false }, /Guía del docente/],
       ['multi-h5p', { h5pLibrariesInclude: ['H5P.Flashcards'] }, /Flashcards/],
       ['ofimatica', { practiceFiles: { formats: ['xlsx'], count: 4 } }, /formatos/],
+      ['1x1-sin-examenes', { manifestTypes: { course_plan: 1, exam: 1 } }, /lista blanca/],
+      ['1x1-sin-nota', { grading: { withoutGrades: false, courseGradeCriterion: true, badge: false } }, /withoutGrades/],
+      ['practico-32', { counts: { videos: 3 } }, /videos/],
     ];
     let bitten = 0;
     for (const [id, expect, re] of muts) {
@@ -262,7 +356,92 @@ async function assertCourse(sim) {
       bitten++;
     }
     assert(bitten > 0, 'sin cursos para mutar');
+    // r58 (I6): las relaciones también muerden (un gap sin hallazgo; un capítulo sin preguntas en el banco).
+    const rel = sims['A-S'] || sims[Object.keys(sims)[0]];
+    const insp = await S.inspectMbz(rel.built.mbz);
+    const clone = (o) => JSON.parse(JSON.stringify(o));
+    const facts = clone(rel.built.expectations.facts);
+    facts.hoursReport.findings = facts.hoursReport.findings.filter((x) => x.code !== 'HOURS_TARGET_GAP');
+    facts.hoursReport.gap.within = false;
+    let err = null;
+    try { assertRelations({ ...rel, built: { ...rel.built, expectations: { ...rel.built.expectations, facts } } }, insp); } catch (e) { err = e; }
+    assert(err && /HOURS_TARGET_GAP/.test(err.message), `gap sin hallazgo debía fallar (${err ? err.message : 'no falló'})`);
+    const m0 = rel.manifest.modules.find((m) => m.examEnabled);
+    if (m0 && rel.input.contents.examBanks && rel.input.contents.examBanks.get(m0.moduleId)) {
+      const banks = new Map(rel.input.contents.examBanks);
+      const ch0 = m0.chapters.find((c) => c.kind !== 'practice').chapterId;
+      banks.set(m0.moduleId, { ...banks.get(m0.moduleId), questions: banks.get(m0.moduleId).questions.filter((q) => q.chapterId !== ch0) });
+      err = null;
+      try { assertRelations({ ...rel, input: { ...rel.input, contents: { ...rel.input.contents, examBanks: banks } } }, insp); } catch (e) { err = e; }
+      assert(err && /no evalúa el capítulo/.test(err.message), `capítulo sin preguntas debía fallar (${err ? err.message : 'no falló'})`);
+    }
   });
+
+  // ── CS8 (r58 I6) ───────────────────────────────────────────────────────────
+  const seedId = ['practico-32', 'mixto-96', 'ofimatica'].find((id) => sims[id]);
+  if (seedId) {
+    await check(`CS8 defectos sembrados en [${seedId}] → el informe de calidad los detecta (conteo, archivo inexistente, ventana numérica, cierre prematuro; .mbz corrupto → BLOCKER)`, async () => {
+      const sim = sims[seedId];
+      const base = S.qualityReportOf(distRoot, sim);
+      const codes = (r) => new Set(r.findings.map((x) => x.code));
+      const before = codes(base);
+      const c = sim.input.contents;
+      const contentIds = sim.manifest.modules.flatMap((m) => m.chapters.filter((x) => x.kind !== 'practice').map((x) => x.chapterId));
+      const [c1, c2] = contentIds;
+      const contentMd = new Map(c.contentMd);
+      contentMd.set(c1, `${contentMd.get(c1)}\n\nLos cinco pasos del procedimiento son:\n- Preparar el área.\n- Verificar el equipo.\n\nEl reporte del incidente se entrega como máximo en 24 horas.`);
+      contentMd.set(c2, `${contentMd.get(c2)}\n\nEl reporte del incidente se entrega como máximo en 72 horas.\n\nHas recorrido todo el curso y ya dominas el método.`);
+      const applications = new Map(c.applications);
+      const aaId = [...applications.keys()][0];
+      assert(aaId, 'el curso sembrado necesita una AA');
+      const aa = JSON.parse(JSON.stringify(applications.get(aaId)));
+      aa.activity.instructions = `${aa.activity.instructions || ''} Abre plantilla_inexistente.xlsx y completa la tabla.`;
+      applications.set(aaId, aa);
+      const seeded = S.qualityReportOf(distRoot, sim, { contents: { ...c, contentMd, applications } });
+      const want = { COUNT_CLAIM_MISMATCH: 'MINOR', PRACTICE_FILE_REFERENCE_UNKNOWN: 'MAJOR', NUMERIC_WINDOW_CONFLICT: 'MAJOR', PREMATURE_COURSE_CLOSURE: 'MINOR' };
+      for (const [code, sev] of Object.entries(want)) {
+        const hit = seeded.findings.filter((x) => x.code === code);
+        assert(hit.length >= 1 && hit.every((x) => x.severity === sev), `${code}: ${JSON.stringify(hit.slice(0, 2))}`);
+        assert(!before.has(code), `${code} ya estaba en el curso limpio (la siembra no prueba nada)`);
+      }
+      eq(seeded.counts.BLOCKER, 0, 'defectos de contenido: no bloquean (revisión humana)');
+      assert(seeded.requiresHumanResolution, 'MAJOR ⇒ requiere resolución humana');
+      // .mbz corrupto: falta el blob de un archivo declarado en files.xml → validateMbzV3 lo detecta → BLOCKER.
+      const JSZip = require('jszip');
+      const z = await JSZip.loadAsync(sim.built.mbz);
+      const blob = Object.keys(z.files).find((n) => /^files\/[0-9a-f]{2}\/[0-9a-f]{40}$/.test(n));
+      z.remove(blob);
+      const broken = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+      const vb = await require(path.join(distRoot, 'package/v3/mbz-validator-v3.js')).validateMbzV3(broken, sim.built.expectations);
+      assert(!vb.ok && vb.issues.length > 0, 'el validador no detectó el blob faltante');
+      const rb = S.qualityReportOf(distRoot, sim, { mbzIssues: vb.issues });
+      assert(rb.blocksDelivery && rb.counts.BLOCKER >= 1, `BLOCKER con el .mbz corrupto: ${JSON.stringify(rb.counts)}`);
+      results._seeded = { course: seedId, clean: base.counts, seeded: seeded.counts, corruptMbz: { issues: vb.issues.slice(0, 3).map((i) => i.code), counts: rb.counts } };
+    });
+  }
+
+  // ── CS9 (r58 I6) ───────────────────────────────────────────────────────────
+  // Curso mixto (capítulos con video necesario y opcional): la prioridad solo mueve los opcionales.
+  const avBase = CONFIG.courses.find((c) => c.id === 'A-S');
+  if (avBase && (!only.length || only.includes('A-S'))) {
+    await check('CS9 composición por necesidad: la MISMA estructura con prioridad audiovisual menos ≤ recomendado ≤ más; los videos necesarios se mantienen siempre; «más» = todos los capítulos de contenido; Prebrief = Manifest', async () => {
+      const counts = {};
+      for (const av of ['less', 'recommended', 'more']) {
+        const cfg = JSON.parse(JSON.stringify(avBase));
+        cfg.pedagogy.designPreferences = { ...(cfg.pedagogy.designPreferences || {}), audiovisual: av };
+        const p = await S.prepareCourse(distRoot, cfg);
+        const content = p.manifest.modules.flatMap((m) => m.chapters.filter((c) => c.kind !== 'practice'));
+        const need = p.dryRun.distribution.modules.flatMap((m) => m.chapters.filter((c) => c.kind === 'content' && c.videoDecision && /^vid\.need\./.test(c.videoDecision.ruleId))).length;
+        counts[av] = { videos: p.manifest.totals.videoCount, content: content.length, prebrief: p.prebrief.resources.videos, need };
+        assert(counts[av].videos >= need, `${av}: ${counts[av].videos} videos < ${need} necesarios`);
+        eq(counts[av].prebrief, counts[av].videos, `${av}: Prebrief = Manifest`);
+      }
+      assert(counts.less.videos <= counts.recommended.videos && counts.recommended.videos <= counts.more.videos, `no monótono: ${JSON.stringify(counts)}`);
+      assert(counts.less.videos < counts.more.videos, `la prioridad no cambia nada: ${JSON.stringify(counts)}`);
+      eq(counts.more.videos, counts.more.content, '«más»: un video por capítulo de contenido');
+      results._audiovisual = counts;
+    });
+  }
 
   const summary = Object.fromEntries(Object.entries(results).map(([k, v]) => [k, v && v.id ? { ...v, providers: undefined } : v]));
   fs.writeFileSync(path.join(OUT, 'commercial-simulation-summary.json'), JSON.stringify(summary, null, 2));
