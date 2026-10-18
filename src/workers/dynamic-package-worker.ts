@@ -35,6 +35,9 @@ import { resolveTheme } from '../modules/theme-engine';
 import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 import { hoursReportSummary } from '../modules/study-time/hours-ledger';
+import { PACKAGE_REUSE_REJECTED, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
+import { sha256Hex } from '../modules/artifacts/artifacts.service';
+import { isNonRealLlmMode } from '../modules/artifacts/artifact-type-policy';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5B.1 — B3: dynamic-package-worker. Reclama production_jobs con
@@ -157,6 +160,26 @@ function artifactCourseId(job: PackageJobRow): string {
   return job.frontend_course_id ?? String(job.course_id);
 }
 
+/**
+ * r58 (AU1 R1): de los candidatos que coinciden por metadata, el primero (más nuevo) que pasa la verificación
+ * del servidor (ruta canónica + checksum + bytes; v3: validado). Un descarte se loguea y se sigue buscando;
+ * sin ninguno → null (el job reconstruye).
+ */
+async function firstVerifiedCandidate<T extends { id: string; storageBucket?: string | null; storagePath?: string | null; checksumSha256?: string | null; metadata?: any }>(
+  artifacts: ArtifactsService,
+  candidates: T[],
+  expected: { ownerId: string; courseId: string; manifestId: number; runId: string; sourceIdsHash: string; qa: boolean },
+  requireValidated: boolean,
+  logger?: Pick<Logger, 'warn'>,
+): Promise<T | null> {
+  for (const c of candidates) {
+    const v = await verifyReusableDynamicMbz(artifacts, c, expected, { requireValidated });
+    if (v.ok === true) return c;
+    logger?.warn(`${PACKAGE_REUSE_REJECTED}:${(v as { reason: string }).reason} — dynamic_mbz ${c.id} del run ${expected.runId} no se reutiliza (se reconstruye)`);
+  }
+  return null;
+}
+
 async function findExistingDynamicMbz(
   artifacts: ArtifactsService,
   ownerId: string,
@@ -165,9 +188,11 @@ async function findExistingDynamicMbz(
   sourceIdsHash: string,
   moodleVersion: string,
   packageKind: PackageKind = 'final',
+  manifestId?: number,
+  logger?: Pick<Logger, 'warn'>,
 ): Promise<{ id: string } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
-  const match = list.find((a) => {
+  const candidates = list.filter((a) => {
     const meta = a.metadata as Record<string, any> | null;
     // I3: la clave ya incluye la versión (salvo el default, byte-idéntico);
     // además se exige que la versión registrada coincida — sin campo (.mbz
@@ -180,6 +205,9 @@ async function findExistingDynamicMbz(
     if (packageKind !== 'final') return meta?.packageKind === packageKind;
     return !meta?.packageKind;
   });
+  if (!candidates.length) return null;
+  const expected = { ownerId, courseId, manifestId: Number(manifestId ?? candidates[0].metadata?.manifestId), runId, sourceIdsHash, qa: packageKind !== 'final' };
+  const match = await firstVerifiedCandidate(artifacts, candidates, expected, false, logger);
   return match ? { id: match.id } : null;
 }
 
@@ -365,7 +393,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     if (leaseLost) return;
 
     // Restore-first: mismo runId + mismo set de artifacts de origen + misma versión -> reusar.
-    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, moodle.resolved, packageKind);
+    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, moodle.resolved, packageKind, manifest.id, logger);
     if (existing) {
       logger.log(`Job ${job.id}: dynamic_mbz ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
       const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
@@ -414,6 +442,8 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       // insertar el row, el reintento adopta el objeto verificado en vez de
       // fallar para siempre con "already exists".
       adoptExistingOnConflict: true,
+      // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes.
+      replaceUnverifiedOnConflict: true,
       metadata: {
         runId,
         manifestId: manifest.id,
@@ -492,13 +522,16 @@ export async function processV3PackageJob(
   const { sourceIdsHash, sourceArtifactIds: ids } = prepared;
   // EV6 DoD: un paquete FINAL nunca lleva componentes de vista previa (videos omitidos o Gamma/TTS
   // simulados). Defensa en el worker (un job viejo o encolado por otro camino): falla fuerte.
+  // r58 (AU1 R2): texto generado por un LLM falso o reproducido (llmMode mock/replay) nunca va en un final.
+  const nonRealLlm = nonRealLlmItemKeys(prepared.byItem);
   if (!qa) {
     const pm = frozenProviderModesOf(prepared.run?.input_payload);
     const mockProviders = !!pm && (pm.presentation === 'mock' || pm.audio === 'mock');
-    if (prepared.pendingVideos.length > 0 || mockProviders) {
+    if (prepared.pendingVideos.length > 0 || mockProviders || nonRealLlm.length > 0) {
       throw new Error(
         `preview_not_deliverable: el run ${runId} tiene componentes de vista previa ` +
-          `(${prepared.pendingVideos.length} video(s) pendiente(s)${mockProviders ? ', Gamma/TTS simulados' : ''}); ` +
+          `(${prepared.pendingVideos.length} video(s) pendiente(s)${mockProviders ? ', Gamma/TTS simulados' : ''}` +
+          `${nonRealLlm.length ? `, ${nonRealLlm.length} item(s) con texto de IA simulado/reproducido: ${nonRealLlm.slice(0, 8).join(', ')}` : ''}); ` +
           'un paquete final solo se arma con todos los componentes reales (el paquete QA lo pide un administrador).',
       );
     }
@@ -519,6 +552,8 @@ export async function processV3PackageJob(
     pendingVideos: pendingVideosSummary(manifest, prepared.pendingVideos.map((p) => p.itemKey)),
     // EV6 DoD: solo los paquetes QA lo declaran (el resumen de un final no cambia).
     ...(qa ? { packageKind, deliverable: false } : {}),
+    // r58 (AU1 R2): items con texto de IA simulado / reproducido (solo un paquete QA puede tenerlos).
+    ...(nonRealLlm.length ? { llmNonRealItems: nonRealLlm } : {}),
   };
   // F1: avisos de perfiles (tema por defecto, pesos normalizados, curso sin nota) — también en un paquete reutilizado.
   const profileWarnings = prepared.profileWarnings.map((w) => ({ code: w.split(':')[0], detail: w }));
@@ -527,7 +562,7 @@ export async function processV3PackageJob(
   // EV6 T5 (fix round 1, m-2): el aviso de video pendiente de cada capítulo solo se decide al
   // construir; un .mbz reutilizado lo trae en su metadata (mismo sourceIdsHash = mismos textos).
   const pendingWarnings = baseSummary.pendingVideos.map((p) => ({ code: 'pending_video_omitted', detail: `pending_video_omitted:${p.itemKey}` }));
-  const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, packageKind);
+  const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, packageKind, manifest.id, logger);
   if (existing) {
     logger.log(`Job ${job.id}: dynamic_mbz v3 ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
     const reusedPending: any[] = Array.isArray(existing.metadata?.pendingVideos) ? existing.metadata.pendingVideos : baseSummary.pendingVideos;
@@ -630,7 +665,10 @@ export async function processV3PackageJob(
     mimeType: 'application/vnd.moodle.backup',
     upsert: false,
     adoptExistingOnConflict: true,
-    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}) },
+    // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes (validados).
+    replaceUnverifiedOnConflict: true,
+    // r58 (AU1 R1): sha256 de los bytes que aprobó validateMbzV3 (el reuse lo exige igual al checksum de Storage).
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), validatedSha256: sha256Hex(built.mbz) },
   });
   if (isLeaseLost()) return;
 
@@ -684,6 +722,18 @@ export function packageDeclaredHours(snapshot: BlueprintSnapshotV2): number | nu
 }
 
 /**
+ * r58 (AU1 R2): items del run cuyo texto de IA NO es real (`output_summary.llmMode` del servidor o
+ * `metadata.llmMode` de alguno de sus artifacts = mock | replay). Ordenados. Exportado para tests.
+ */
+export function nonRealLlmItemKeys(byItem: Map<string, { itemKey: string; outputSummary?: Record<string, any> | null; artifacts: Array<{ metadata?: Record<string, any> | null }> }>): string[] {
+  const out: string[] = [];
+  for (const it of byItem.values()) {
+    if (isNonRealLlmMode(it.outputSummary?.llmMode) || it.artifacts.some((a) => isNonRealLlmMode(a.metadata?.llmMode))) out.push(it.itemKey);
+  }
+  return out.sort();
+}
+
+/**
  * EV6 T5: videos pendientes del paquete para el resumen del job / metadata del .mbz
  * (orden del Manifest). La UI solo necesita saber cuáles y cuántos.
  */
@@ -709,9 +759,11 @@ async function findExistingDynamicMbzV3(
   runId: string,
   sourceIdsHash: string,
   packageKind: PackageKind = 'final',
+  manifestId?: number,
+  logger?: Pick<Logger, 'warn'>,
 ): Promise<{ id: string; metadata: Record<string, any> | null } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
-  const match = list.find((a) => {
+  const candidates = list.filter((a) => {
     const meta = a.metadata as Record<string, any> | null;
     if (!(meta?.runId === runId && meta?.sourceIdsHash === sourceIdsHash && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION_V3)) return false;
     // EV6 DoD: solo se reutiliza un .mbz del MISMO tipo. Un paquete QA nunca reutiliza uno sin
@@ -719,6 +771,10 @@ async function findExistingDynamicMbzV3(
     if (packageKind !== 'final') return meta?.packageKind === packageKind;
     return !meta?.packageKind && !summaryLooksPreview(meta);
   });
+  if (!candidates.length) return null;
+  // r58 (AU1 R1): v3 exige además que esos bytes hayan pasado validateMbzV3 (metadata.validatedSha256).
+  const expected = { ownerId, courseId, manifestId: Number(manifestId ?? (candidates[0].metadata as any)?.manifestId), runId, sourceIdsHash, qa: packageKind !== 'final' };
+  const match = await firstVerifiedCandidate(artifacts, candidates, expected, true, logger);
   return match ? { id: match.id, metadata: (match.metadata as Record<string, any> | null) ?? null } : null;
 }
 

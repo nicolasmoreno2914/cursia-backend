@@ -452,7 +452,12 @@ function workerHarness({ videoMode = 'mock', videoModeByItem = null, omitMode = 
     dataSource: ds,
     artifacts: {
       async findAll(owner, f) { return f.type === 'dynamic_mbz' ? state.dynamicMbz : []; },
-      async uploadBufferArtifact(i) { const a = { id: `mbz-${state.uploads.length + 1}`, metadata: i.metadata }; state.uploads.push(i); state.dynamicMbz.push(a); return a; },
+      // r58 (AU1 R1): como ArtifactsService — bucket, ruta y checksum de los bytes; el reuse los descarga y verifica.
+      async uploadBufferArtifact(i) {
+        const a = { id: `mbz-${state.uploads.length + 1}`, metadata: i.metadata, storageBucket: 'cursia-artifacts', storagePath: i.storagePath, checksumSha256: require('crypto').createHash('sha256').update(i.buffer).digest('hex') };
+        state.uploads.push(i); state.dynamicMbz.push(a); (state.storage = state.storage || new Map()).set(i.storagePath, i.buffer); return a;
+      },
+      async downloadStorageObject(bucket, p) { const b = state.storage && state.storage.get(p); if (!b) throw new Error(`404 ${bucket}/${p}`); return b; },
     },
     manifests: { async getById() { return { id: 9001, sha256: 'manifest-sha', manifest }; } },
     blueprints: {

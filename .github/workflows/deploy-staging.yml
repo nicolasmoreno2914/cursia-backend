@@ -215,6 +215,9 @@ jobs:
       - name: Check REL sonda del proveedor tras crédito/cuota agotados (puro; la parte PG16 corre local)
         run: node scripts/check-rel-provider-probe.js --pure-only
 
+      - name: Check r58 endurecimiento del pipeline (tipos del servidor, reuse verificado, procedencia LLM, URLs base en prod; puro, la parte PG16 corre local)
+        run: node scripts/check-r58-pipeline-hardening.js --pure-only
+
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh

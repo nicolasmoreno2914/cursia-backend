@@ -1447,9 +1447,11 @@ async function workerChecks() {
     }
   }
 
-  function harness({ providerModes, profiles = [], stripMockMetadata = false, courseMetadata = {} } = {}) {
-    const rowsFor = stripMockMetadata ? rows.map((r) => ({ ...r, metadata: {} })) : rows;
-    const state = { completed: [], failed: [], uploads: [], ledger: [], dynamicMbz: [] };
+  function harness({ providerModes, profiles = [], stripMockMetadata = false, courseMetadata = {}, llmMockTypes = null, forceFinal = false } = {}) {
+    let rowsFor = stripMockMetadata ? rows.map((r) => ({ ...r, metadata: {} })) : rows;
+    // r58 (AU1 R2): artifacts de texto de IA marcados como LLM simulado (metadata.llmMode = mock).
+    if (llmMockTypes) rowsFor = rowsFor.map((r) => (llmMockTypes.includes(r.artifact_type) ? { ...r, metadata: { ...(r.metadata || {}), llmMode: 'mock' } } : r));
+    const state = { completed: [], failed: [], uploads: [], ledger: [], dynamicMbz: [], storage: new Map() };
     const runRow = { id: RUN_ID, owner_id: OWNER, execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: { videoMode: 'real', videoDelivery: 'youtube', ...(providerModes ? { providerModes } : {}) } };
     const ds = {
       async query(sql, params) {
@@ -1470,7 +1472,12 @@ async function workerChecks() {
       dataSource: ds,
       artifacts: {
         async findAll(owner, f) { return f.type === 'dynamic_mbz' ? state.dynamicMbz : []; },
-        async uploadBufferArtifact(i) { const a = { id: `mbz-${state.uploads.length + 1}`, metadata: i.metadata }; state.uploads.push(i); state.dynamicMbz.push(a); return a; },
+        // r58 (AU1 R1): como ArtifactsService — el row lleva bucket, ruta y checksum de los bytes; el reuse los descarga.
+        async uploadBufferArtifact(i) {
+          const a = { id: `mbz-${state.uploads.length + 1}`, metadata: i.metadata, storageBucket: 'cursia-artifacts', storagePath: i.storagePath, checksumSha256: require('crypto').createHash('sha256').update(i.buffer).digest('hex') };
+          state.uploads.push(i); state.dynamicMbz.push(a); state.storage.set(i.storagePath, i.buffer); return a;
+        },
+        async downloadStorageObject(bucket, p) { const b = state.storage.get(p); if (!b) throw new Error(`404 ${bucket}/${p}`); return b; },
       },
       manifests: { async getById() { return { id: 9001, sha256: 'manifest-sha', manifest }; } },
       blueprints: {
@@ -1496,7 +1503,7 @@ async function workerChecks() {
     };
     // EV6 DoD (BE-A): un run con Gamma/TTS mock es de vista previa → su paquete es QA (lo declara el job,
     // como lo encola PackagingService para un SUPER_ADMIN con el escape); un run real → paquete final.
-    const qa = !!providerModes && (providerModes.presentation === 'mock' || providerModes.audio === 'mock');
+    const qa = !forceFinal && !!providerModes && (providerModes.presentation === 'mock' || providerModes.audio === 'mock');
     const job = { id: 'job-1', owner_id: OWNER, course_id: manifest.source.courseId, frontend_course_id: null, worker_status: 'running', status: 'running', input_payload: { runId: RUN_ID, manifestId: 9001, blueprintNumber: 1, ...(qa ? { packageKind: 'qa_preview' } : {}) }, output_summary: {}, attempt_count: 1, max_attempts: 3 };
     return { deps, job, state };
   }
@@ -1524,6 +1531,29 @@ async function workerChecks() {
     h.state.completed.length = 0;
     await W.processItem(h.deps, h.job);
     eq([h.state.uploads.length, h.state.completed[0].reused, h.state.completed[0].artifactId], [1, true, 'mbz-1'], 'reuse');
+    eq(h.state.dynamicMbz[0].metadata.validatedSha256, h.state.dynamicMbz[0].checksumSha256, 'r58 R1: metadata.validatedSha256 = checksum de los bytes validados');
+    // r58 (AU1 R1): bytes reemplazados en Storage (carpeta escribible por el dueño) → NO se reutiliza: se reconstruye.
+    {
+      const path0 = h.state.uploads[0].storagePath;
+      const orig = h.state.storage.get(path0);
+      h.state.storage.set(path0, Buffer.from('FORGED'));
+      h.state.completed.length = 0;
+      await W.processItem(h.deps, h.job);
+      eq([h.state.uploads.length, h.state.completed[0].reused, h.state.uploads[1].replaceUnverifiedOnConflict], [2, false, true], 'r58 R1: bytes forjados → rebuild con replaceUnverifiedOnConflict');
+      h.state.storage.set(path0, orig);
+      h.state.uploads.pop(); h.state.dynamicMbz.pop();
+      // Sin validatedSha256 (no pasó por validateMbzV3) → tampoco se reutiliza.
+      const meta0 = h.state.dynamicMbz[0].metadata;
+      h.state.dynamicMbz[0].metadata = { ...meta0, validatedSha256: undefined };
+      h.state.completed.length = 0;
+      await W.processItem(h.deps, h.job);
+      eq([h.state.uploads.length, h.state.completed[0].reused], [2, false], 'r58 R1: sin validatedSha256 → rebuild');
+      h.state.uploads.pop(); h.state.dynamicMbz.pop();
+      h.state.dynamicMbz[0].metadata = meta0;
+      h.state.completed.length = 0;
+      await W.processItem(h.deps, h.job);
+      eq([h.state.uploads.length, h.state.completed[0].reused, h.state.completed[0].artifactId], [1, true, 'mbz-1'], 'r58 R1: el verificado se vuelve a reutilizar');
+    }
     assert((h.state.completed[0].warnings || []).some((w) => w.code === 'presentation_profile_defaulted'), 'el aviso también en el paquete reutilizado');
     // un perfil de evaluación nuevo (nota 80) = clave nueva = paquete nuevo, sin artifacts nuevos
     const p80 = PROF.defaultAssessmentProfile({ finalExam: true });
@@ -1567,6 +1597,23 @@ async function workerChecks() {
     await W.processItem(hx.deps, hx.job);
     eq(hx.state.uploads.length, 0, 'sobre el límite: SIN upload');
     assert(hx.state.failed.length === 1 && /^PACKAGE_SIZE_LIMIT_EXCEEDED: el paquete pesa \d+ bytes/.test(hx.state.failed[0]), `falla: ${hx.state.failed[0]}`);
+  });
+  await check('r58 R2 worker v3: texto de IA simulado (metadata.llmMode=mock) → paquete QA con llmNonRealItems; como FINAL → preview_not_deliverable sin build ni upload', async () => {
+    const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, llmMockTypes: ['dynamic_content_md'] });
+    await W.processItem(h.deps, h.job);
+    eq([h.state.failed.length, h.state.uploads.length], [0, 1], 'QA empaqueta');
+    const s = h.state.completed[0];
+    const contentKeys = manifest.items.filter((i) => i.type === 'content').map((i) => i.key).sort();
+    eq([s.packageKind, s.llmNonRealItems], ['qa_preview', contentKeys], 'resumen QA declara los items no reales');
+    const hf = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, llmMockTypes: ['dynamic_content_md'], forceFinal: true });
+    await W.processItem(hf.deps, hf.job);
+    eq(hf.state.uploads.length, 0, 'sin upload');
+    assert(hf.state.failed.length === 1 && /^preview_not_deliverable:/.test(hf.state.failed[0]) && /texto de IA simulado\/reproducido/.test(hf.state.failed[0]) && hf.state.failed[0].includes(contentKeys[0]),
+      `falla: ${hf.state.failed[0]}`);
+    // Sin marca LLM el resumen QA no cambia (regresión).
+    const h0 = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    await W.processItem(h0.deps, h0.job);
+    eq('llmNonRealItems' in h0.state.completed[0], false, 'sin llmNonRealItems');
   });
   await check('worker v3: run REAL con fixtures de proveedor → falla MOCK_ARTIFACT_IN_REAL_RUN antes de construir o subir', async () => {
     const h = harness({ providerModes: { presentation: 'real', audio: 'real' } });

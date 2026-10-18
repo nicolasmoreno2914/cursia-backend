@@ -1,10 +1,12 @@
-import { ForbiddenException, Injectable, NotFoundException, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { Artifact } from './entities/artifact.entity';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { isAdminOnlyPackageArtifact } from '../dynamic-packaging/qa-package';
+import { ARTIFACT_TYPE_SERVER_ONLY, LLM_MODES, LLM_MODE_INVALID, isLlmMode, isServerOnlyArtifactType } from './artifact-type-policy';
 
 export interface UploadJsonArtifactInput {
   ownerId: string;
@@ -47,6 +49,18 @@ export interface UploadBufferArtifactInput {
    * original del upload. Default false (comportamiento previo).
    */
   adoptExistingOnConflict?: boolean;
+  /**
+   * r58 (AU1 R1): con `adoptExistingOnConflict`, el objeto existente solo se adopta si sus BYTES son los que
+   * se acaban de construir (sha256 igual); si no (un objeto puesto por el dueño en su carpeta, o uno de un
+   * build anterior que ya no se verifica) se REEMPLAZA con los bytes construidos y validados. Lo usa el
+   * worker de empaque (`dynamic_mbz`, ruta canónica del servidor). Default false (adopción de siempre).
+   */
+  replaceUnverifiedOnConflict?: boolean;
+}
+
+/** sha256 hex de un buffer (checksum_sha256 de los artifacts que sube el servidor). */
+export function sha256Hex(buf: Buffer): string {
+  return createHash('sha256').update(buf).digest('hex');
 }
 
 /**
@@ -169,6 +183,23 @@ export class ArtifactsService {
     if (String(dto.storage_path ?? '').split('/')[0] !== ownerId) {
       throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
     }
+    // r58 (AU1 R1): los tipos que solo crea el servidor (paquete .mbz, Gamma, TTS, video, reporte de coherencia)
+    // nunca se registran desde el cliente: un `dynamic_mbz` con metadata arbitraria se podía reutilizar como el
+    // paquete final del run sin construirlo ni validarlo.
+    if (isServerOnlyArtifactType(dto.type)) {
+      throw new ForbiddenException({
+        code: ARTIFACT_TYPE_SERVER_ONLY,
+        message: `${ARTIFACT_TYPE_SERVER_ONLY}: el tipo de artifact ${JSON.stringify(String(dto.type))} lo crea solo el servidor.`,
+      });
+    }
+    // r58 (AU1 R2): procedencia del LLM declarada por el ejecutor / driver (solo real | mock | replay).
+    const llmMode = (dto.metadata as Record<string, unknown> | undefined)?.llmMode;
+    if (llmMode !== undefined && llmMode !== null && !isLlmMode(llmMode)) {
+      throw new BadRequestException({
+        code: LLM_MODE_INVALID,
+        message: `${LLM_MODE_INVALID}: metadata.llmMode=${JSON.stringify(llmMode).slice(0, 40)} (permitidos: ${LLM_MODES.join(', ')}).`,
+      });
+    }
     return this.create(dto, ownerId);
   }
 
@@ -254,6 +285,10 @@ export class ArtifactsService {
     const provider = input.storageProvider ?? 'supabase';
     const put = await this.putStorageObject(input);
     const metadata = put.adopted ? { ...(input.metadata ?? {}), adoptedExistingObject: true } : input.metadata ?? {};
+    // r58 (AU1 R1): el servidor registra el checksum de los bytes que quedaron en Storage (los que subió, o los
+    // adoptados si se verificó que son idénticos). Un objeto adoptado sin verificar queda sin checksum (nunca se
+    // reutiliza como paquete).
+    const checksum = put.sha256 ?? null;
     return this.create(
       {
         course_id: input.courseId ?? null,
@@ -265,6 +300,7 @@ export class ArtifactsService {
         filename: input.filename,
         mime_type: input.mimeType,
         size_bytes: put.sizeBytes,
+        checksum_sha256: checksum ?? undefined,
         metadata,
       },
       input.ownerId,
@@ -278,8 +314,8 @@ export class ArtifactsService {
    * adopción de un objeto inmutable preexistente que `uploadBufferArtifact`.
    */
   async putStorageObject(
-    input: Pick<UploadBufferArtifactInput, 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict'>,
-  ): Promise<{ sizeBytes: number; adopted: boolean }> {
+    input: Pick<UploadBufferArtifactInput, 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict' | 'replaceUnverifiedOnConflict'>,
+  ): Promise<{ sizeBytes: number; adopted: boolean; sha256: string | null }> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
     const bucket = input.storageBucket ?? 'cursia-artifacts';
@@ -305,7 +341,8 @@ export class ArtifactsService {
       body: input.buffer as unknown as BodyInit,
     });
 
-    if (response.ok) return { sizeBytes: input.buffer.length, adopted: false };
+    const builtSha = sha256Hex(input.buffer);
+    if (response.ok) return { sizeBytes: input.buffer.length, adopted: false, sha256: builtSha };
     const errorText = await response.text();
     const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
     if (!(input.adoptExistingOnConflict && input.upsert === false && isStorageDuplicateResponse(response.status, errorText))) {
@@ -320,10 +357,32 @@ export class ArtifactsService {
       );
       throw uploadError;
     }
+    if (input.replaceUnverifiedOnConflict) {
+      // r58 (AU1 R1): solo se adoptan bytes IDÉNTICOS a los construidos; si no, se reemplazan (nunca se adopta
+      // un objeto que nadie verificó como el paquete del run).
+      let existingSha: string | null = null;
+      try {
+        existingSha = sha256Hex(await this.downloadStorageObject(bucket, input.storagePath));
+      } catch (err) {
+        this.logger.warn(`uploadBufferArtifact: no se pudo leer ${input.storagePath} para verificarlo (${err instanceof Error ? err.message : String(err)}) — se reemplaza`);
+      }
+      if (existingSha === builtSha) {
+        this.logger.warn(`uploadBufferArtifact: ${input.storagePath} ya existía con los MISMOS bytes (sha256) — se adopta`);
+        return { sizeBytes: existingSize, adopted: true, sha256: builtSha };
+      }
+      this.logger.warn(`uploadBufferArtifact: ${input.storagePath} ya existía con OTROS bytes — se reemplaza con los construidos (PACKAGE_OBJECT_REPLACED)`);
+      const replace = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: { ...supabaseServiceHeaders(serviceKey), 'Content-Type': input.mimeType, 'x-upsert': 'true' },
+        body: input.buffer as unknown as BodyInit,
+      });
+      if (!replace.ok) throw new Error(`Supabase Storage upload failed: ${replace.status} ${await replace.text()}`);
+      return { sizeBytes: input.buffer.length, adopted: false, sha256: builtSha };
+    }
     this.logger.warn(
       `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
     );
-    return { sizeBytes: existingSize, adopted: true };
+    return { sizeBytes: existingSize, adopted: true, sha256: null };
   }
 
   /**
