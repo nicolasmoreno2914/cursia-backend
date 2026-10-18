@@ -22,6 +22,7 @@ import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { EventsService } from '../../events/events.service';
 import { assertLegacyAudioAllowed, assertLegacyGenerationAllowed } from './legacy-audio-guard';
+import { assertClientMayPatchJob } from './client-patch-guard';
 
 /** Pasos estándar del pipeline (matching CP_STEP_DEFS en 31-course-production.js) */
 const STANDARD_STEPS = [
@@ -2744,6 +2745,7 @@ export class ProductionJobsService implements OnModuleInit {
 
   async update(id: string, dto: UpdateJobDto, ownerId: string): Promise<ProductionJob> {
     const job = await this.findOne(id, ownerId);
+    assertClientMayPatchJob(job.executionMode);
 
     if (this.isCancelledLike(job)) {
       return job;
@@ -2771,7 +2773,8 @@ export class ProductionJobsService implements OnModuleInit {
     ownerId: string,
   ): Promise<ProductionStep> {
     // Verify ownership
-    await this.findOne(jobId, ownerId);
+    const owned = await this.findOne(jobId, ownerId);
+    assertClientMayPatchJob(owned.executionMode);
 
     // Find existing step or create
     let step = await this.stepRepo.findOne({

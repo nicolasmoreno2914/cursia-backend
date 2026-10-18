@@ -14,6 +14,7 @@ import {
   Res,
   UseGuards,
 } from '@nestjs/common';
+import { assertUploadUrlAllowed } from './upload-url-policy';
 import { Response } from 'express';
 import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -254,6 +255,8 @@ export class YoutubeController {
     if (!downloadUrl || typeof downloadUrl !== 'string' || !downloadUrl.startsWith('http')) {
       throw new BadRequestException('download_url es requerido y debe ser una URL válida.');
     }
+    // r58 (SSRF): solo el almacenamiento de Cursia / Videogen, https, IPs públicas (también en dry-run).
+    await assertUploadUrlAllowed(downloadUrl);
 
     const title         = (body['title']          as string  | undefined) ?? null;
     const description   = (body['description']    as string  | undefined) ?? '';
@@ -318,6 +321,7 @@ export class YoutubeController {
       description:    description as string,
       privacyStatus:  privacyStatus as 'public' | 'unlisted' | 'private',
       chapterNumber:  chapterNumber ?? undefined,
+      untrustedUrl:   true,
     });
 
     return {

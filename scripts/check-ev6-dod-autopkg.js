@@ -1116,7 +1116,8 @@ const ENV_KEYS = [
     await app.init();
     await app.listen(0, '127.0.0.1');
     const base = `http://127.0.0.1:${app.getHttpServer().address().port}`;
-    const token = (u) => jwt.sign({ sub: u.id, email: u.email, role: 'authenticated' }, JWT_SECRET, { expiresIn: 600 });
+    // r58: token como el de Supabase (email confirmado en user_metadata): el guard exige identidad verificada a los admins.
+    const token = (u) => jwt.sign({ sub: u.id, email: u.email, role: 'authenticated', user_metadata: { email_verified: true } }, JWT_SECRET, { expiresIn: 600 });
     const get = async (p, u) => {
       const res = await realFetch(base + p, { headers: u ? { authorization: `Bearer ${token(u)}` } : {} });
       let json = null;
