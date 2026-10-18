@@ -186,3 +186,53 @@ export async function applyStopAfterInTx(
   );
   return returningRows(rows).length === 1;
 }
+
+/**
+ * T8 (factory mode, 2026-10-18) — retención del empaque POR DEFECTO para owners configurados.
+ *
+ * `DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS`: UUIDs de owner separados por coma (o `*` = todos). Los runs NUEVOS de esos
+ * owners nacen con `stopAfter = {itemKeys: [], holdPackaging: true, setBy: 'system:default_hold_packaging'}` — lo
+ * mismo que el `PUT …/stop-after {"itemKeys":[],"holdPackaging":true}` que el operador hacía a mano tras «Autorizar
+ * y generar». El paquete se arma solo por acción explícita («Preparar paquete» / `releasePackageHold`); el dueño
+ * puede quitar la retención con DELETE como siempre. Ausente / vacía → ningún run cambia (default).
+ * Se lee de `process.env` en cada llamada (sin caché). Una entrada que no es UUID ni `*` se ignora con aviso (la
+ * lista nunca bloquea el arranque de un run).
+ */
+export const DEFAULT_HOLD_PACKAGING_OWNERS_ENV = 'DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS';
+export const DEFAULT_HOLD_PACKAGING_SET_BY = 'system:default_hold_packaging';
+const OWNER_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** ¿Los runs nuevos de este owner nacen con el empaque retenido? (puro) */
+export function defaultHoldPackagingFor(ownerId: string | null | undefined, env: Record<string, string | undefined> = process.env): boolean {
+  const raw = String(env[DEFAULT_HOLD_PACKAGING_OWNERS_ENV] ?? '').trim();
+  if (!raw) return false;
+  const entries = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (entries.includes('*')) return true;
+  const owner = String(ownerId ?? '').trim().toLowerCase();
+  if (!owner) return false;
+  return entries.some((e) => OWNER_UUID_RE.test(e) && e === owner);
+}
+
+/** Entradas inválidas de la lista (para el aviso de configuración). */
+export function invalidDefaultHoldPackagingEntries(env: Record<string, string | undefined> = process.env): string[] {
+  return String(env[DEFAULT_HOLD_PACKAGING_OWNERS_ENV] ?? '')
+    .split(',').map((s) => s.trim()).filter(Boolean)
+    .filter((e) => e !== '*' && !OWNER_UUID_RE.test(e));
+}
+
+/**
+ * `output_summary` inicial de un run nuevo: `{stopAfter: …}` con la retención por defecto, o `{}` (sin cambios).
+ * `base` se conserva (p.ej. `invalidation` de un run derivado).
+ */
+export function initialRunOutputSummary(
+  ownerId: string | null | undefined,
+  base: Record<string, unknown> = {},
+  env: Record<string, string | undefined> = process.env,
+  now: Date = new Date(),
+): Record<string, unknown> {
+  if (!defaultHoldPackagingFor(ownerId, env)) return { ...base };
+  return {
+    ...base,
+    stopAfter: { itemKeys: [], holdPackaging: true, setAt: now.toISOString(), setBy: DEFAULT_HOLD_PACKAGING_SET_BY, firedAt: null, firedItemKey: null },
+  };
+}
