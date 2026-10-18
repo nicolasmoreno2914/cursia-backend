@@ -42,6 +42,11 @@ require_once($CFG->dirroot . '/completion/completion_completion.php');
 use mod_quiz\quiz_attempt;
 use mod_quiz\quiz_settings;
 global $DB, $CFG;
+// T7 (r57): compatibilidad con Moodle 4.1 (antes de 4.2 las clases del quiz y de la insignia no tenían namespace).
+// En 4.2+ las clases existen y estas líneas no hacen nada.
+if (!class_exists('\mod_quiz\quiz_settings') && class_exists('quiz')) class_alias('quiz', 'mod_quiz\quiz_settings');
+if (!class_exists('\mod_quiz\quiz_attempt') && class_exists('quiz_attempt')) class_alias('quiz_attempt', 'mod_quiz\quiz_attempt');
+if (!class_exists('\core_badges\badge') && class_exists('badge')) class_alias('badge', 'core_badges\badge');
 
 const PROTECTED_COURSES = [5372, 5374, 5375, 5377, 5378];
 $courseid = (int)$opts['courseid'];
@@ -223,7 +228,10 @@ foreach ($DB->get_records('badge', ['courseid' => $courseid]) as $b) {
     $testBadges[] = $badge;
 }
 $runtask = function (string $cls) { $t = new $cls(); ob_start(); $t->execute(); ob_end_clean(); };
-foreach (['\core\task\completion_regular_task', '\core\task\completion_regular_task'] as $cls) $runtask($cls);
+// T7 (r57): aggregate_completions() solo agrega las filas con reaggregate < inicio de la corrida (segundos): dos
+// corridas en el MISMO segundo (Moodle 4.1–4.4, donde la marca del criterio no agrega en línea) no completaban a nadie.
+// En producción el cron corre con minutos de diferencia; aquí se espera 2 s antes de cada corrida.
+foreach (['\core\task\completion_regular_task', '\core\task\completion_regular_task'] as $cls) { sleep(2); $runtask($cls); }
 $R['badge_issued_after_completion_tasks'] = $issuedIn();
 $R['badge_review_awarded'] = 0;
 foreach ($testBadges as $badge) $R['badge_review_awarded'] += (int)$badge->review_all_criteria();
