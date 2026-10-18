@@ -13,6 +13,7 @@
  */
 
 import 'reflect-metadata';
+import { createLegacyPaidClaimGate } from './legacy-paid-job-gate';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
@@ -801,10 +802,11 @@ async function bootstrap() {
   process.on('SIGINT',  () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
+  const legacyPaidGate = createLegacyPaidClaimGate(logger, 'full-course-worker');
   logger.log(`Full course worker started (workerId=${workerId}, pollMs=${pollMs}, leaseSeconds=${leaseSeconds}, dryRun=${dryRun})`);
 
   while (!shuttingDown) {
-    const claimed = await jobsService.claimNextFullCourseJob(workerId, leaseSeconds);
+    const claimed = legacyPaidGate() ? await jobsService.claimNextFullCourseJob(workerId, leaseSeconds) : null;
 
     if (!claimed) {
       idlePolls++;

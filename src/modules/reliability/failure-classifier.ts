@@ -338,6 +338,13 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // FinOps P0: la llamada declaró una parte de un run de OTRA cuenta → el proxy no reservó ni llamó (0 gasto). No se
   // reintenta sola: es una sesión equivocada (otra cuenta en el navegador) o un intento de saltar el tope del run.
   { id: 'attribution_rejected', codes: ['attribution_rejected'], class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'config', adminAction: 'retry_item' },
+  // r58 (AU3 §H4): controles de gasto del servidor. Nada se reservó ni se llamó (0 gasto). No se reintentan solos: el
+  // kill switch / la allow-list de proveedores / el techo de gasto sin atribuir son decisiones de operación, y una parte
+  // declarada que no existe es un ejecutor desfasado o un intento de saltar el tope del run.
+  {
+    id: 'spend_control_denied', codes: ['finops_kill_switch', 'provider_not_allowed', 'unattributed_ceiling_reached', 'item_run_not_found'],
+    class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
+  },
 
   // ── Validación (B: regenerar solo el componente) ───────────────────────────
   { id: 'v3_payload_invalid', codes: ['v3_payload_invalid'], class: 'B', strategy: 'regenerate_targeted', rounds: 2 },

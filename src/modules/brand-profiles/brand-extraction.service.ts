@@ -1,7 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import Anthropic from '@anthropic-ai/sdk';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
-import { recordDirectAnthropicCall } from '../finops/direct-call-ledger';
+import { assertDirectCallAllowed, recordDirectAnthropicCall } from '../finops/direct-call-ledger';
 
 export interface ExtractedBrand {
   colors: {
@@ -77,6 +77,8 @@ export class BrandExtractionService {
    * registra en warnings para la revisión humana.
    */
   async extractFromPdf(pdfBuffer: Buffer, ctx: { ownerId?: string | null; brandProfileId?: string | null } = {}): Promise<ExtractedBrand> {
+    // r58: kill switch / allow-list de proveedores ANTES de llamar (esta llamada directa no reserva).
+    assertDirectCallAllowed('anthropic');
     const response = await this.client.messages.create({
       model: this.model,
       max_tokens: 4096,

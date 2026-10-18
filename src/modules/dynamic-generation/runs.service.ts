@@ -1129,8 +1129,11 @@ export class RunsService {
     const policy = await this.finopsBudget!.policyFor(courseId, ownerId, runner);
     const spent = await this.finopsBudget!.spentSoFar(courseId, runner);
     const month = await this.finopsBudget!.monthCommitted(runner);
+    // r58: límite mensual POR DUEÑO (solo si la política lo define; si no, ni se consulta).
+    const ownerMonth = (policy?.limits as Record<string, unknown> | undefined)?.ownerMonthlyCap != null ? await this.finopsBudget!.ownerMonthCommitted(ownerId, runner) : null;
     const plan = planNormalApproval({
       estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider,
+      ownerMonthSpent: ownerMonth ? ownerMonth.total : null,
     });
     return { spent, month, plan };
   }
@@ -4233,7 +4236,9 @@ export class RunsService {
     const runActual = await fb.runActual(job.id, runner);
     const runPaidAuthorized = await fb.runPaidAuthorizedBudget(job.id, runner);
     const decision = decideRunBudget({ estimate, policy, spentSoFar: spent, paidRealProviders: paidRealProviders(estimateItems, modes) });
-    let np = planNormalApproval({ estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider });
+    const ownerMonth = (policy?.limits as Record<string, unknown> | undefined)?.ownerMonthlyCap != null ? await fb.ownerMonthCommitted(ownerId, runner) : null;
+    let np = planNormalApproval({ estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider,
+      ownerMonthSpent: ownerMonth ? ownerMonth.total : null });
     if (decision.decision === 'BLOCK' && np.withinPolicy) {
       np = { ...np, withinPolicy: false, amount: null, cappedByLimit: null,
         blockedBy: [{ limit: 'policy_block', limitValue: null, spent: normalizeDecimal(spent.course), expected: estimate.totals.expected, over: 'expected' }] };

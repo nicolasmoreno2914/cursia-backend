@@ -1,4 +1,6 @@
+import { ServiceUnavailableException } from '@nestjs/common';
 import type { Logger } from '@nestjs/common';
+import { spendBlockReason } from './spend-controls';
 import type { FinopsLedgerService, RecordChargeInput } from './finops-ledger.service';
 
 /**
@@ -14,6 +16,16 @@ import type { FinopsLedgerService, RecordChargeInput } from './finops-ledger.ser
  * se hizo; no se pierde el resultado del usuario).
  */
 export type DirectLedger = Pick<FinopsLedgerService, 'recordCharge'>;
+
+/**
+ * r58 (AU3 §H4.5): estas llamadas no reservan (ver arriba), así que el kill switch y la allow-list de proveedores se
+ * verifican ANTES de llamar: FINOPS_KILL_SWITCH=true o un proveedor fuera de FINOPS_PROVIDER_ALLOWLIST → 503 con
+ * `code` estable y CERO llamadas al proveedor. Defaults (sin las env) → sin cambio.
+ */
+export function assertDirectCallAllowed(provider: string, env: NodeJS.ProcessEnv = process.env): void {
+  const r = spendBlockReason(provider, env);
+  if (r) throw new ServiceUnavailableException({ code: r.code, message: r.message });
+}
 
 export interface DirectAnthropicCall {
   ownerId: string | null | undefined;
