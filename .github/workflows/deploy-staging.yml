@@ -27,7 +27,8 @@ on:
   # Calibración V2.1 (#2): con calibration_action ≠ none el dispatch corre SOLO el job
   # `calibration` (sin rsync / npm / migraciones / reinicio de los 11 procesos). Un push o un
   # dispatch con none despliega, y todo deploy deja DYNAMIC_PROVIDER_WORKER_ENABLED=true
-  # (staging operativo para generar cursos completos; worker_off lo apaga hasta el próximo deploy).
+  # (staging operativo para generar cursos completos; worker_off lo apaga y queda apagado aunque haya deploys
+  # — DYNAMIC_WORKERS_HOLD — hasta un worker_on).
   workflow_dispatch:
     inputs:
       calibration_action:
@@ -572,7 +573,14 @@ jobs:
                # UI). El gasto sigue bajo los gates FinOps (aprobación, límites por run/curso, guard
                # previo a cada llamada pagada). Apagado de emergencia: dispatch worker_off (dura
                # hasta el próximo deploy; para dejarlo apagado, cambiar este true por false).
-               ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED true
+               # r58 (AU3 §J2): worker_off es PERSISTENTE — deja DYNAMIC_WORKERS_HOLD en true en el .env y el deploy
+               # lo respeta (los workers de proveedores y de IA quedan apagados) hasta un worker_on explícito.
+               _DYN_WORKERS=true
+               if grep -q "^DYNAMIC_WORKERS_HOLD=true$" .env; then
+                 _DYN_WORKERS=false
+                 echo "⚠ DYNAMIC_WORKERS_HOLD activo (worker_off persistente): workers de proveedores y de IA quedan APAGADOS"
+               fi
+               ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED "$_DYN_WORKERS"
                # Gamma V2.1: temas por defecto (ids públicos de Gamma, no secretos), elegidos del
                # listado real de la cuenta (GET /themes). Solo si faltan: un valor puesto a mano gana.
                ensure_env_default_if_absent GAMMA_THEME_V21_LIGHT_DEFAULT default-light
@@ -587,7 +595,7 @@ jobs:
                # proceso ni una conexión más: 12 + 3 = 15). Solo toma runs creados desde DYNAMIC_LLM_WORKER_SINCE (se fija en
                # el primer deploy que lo trae; un valor puesto a mano gana): ningún run anterior (#1209 incluido) cambia.
                # Apagado de emergencia: cambiar este true por false y desplegar (el navegador vuelve a todas las partes).
-               ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED true
+               ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED "$_DYN_WORKERS"
                ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
                # Loop 9: el worker de IA genera TODAS las partes de IA (también las cortas): 4 partes en paralelo
                # dentro del mismo proceso (tope 6 en el worker). Sin un proceso ni una conexión más (la cuenta del

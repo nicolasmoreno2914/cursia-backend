@@ -525,7 +525,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
     // 2026-09-29 (autorizado por Nicolás): staging queda operativo, el deploy deja el worker ENCENDIDO.
     assert(!/DYNAMIC_PROVIDER_WORKER_ENABLED\s+false/.test(block), 'el deploy de staging ya no apaga el worker');
-    assert(block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED true'), 'el deploy lo deja explícitamente en true');
+    // r58: encendido salvo worker_off persistente (DYNAMIC_WORKERS_HOLD=true en el .env del VPS).
+    assert(block.includes('_DYN_WORKERS=true') && block.includes('ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED "$_DYN_WORKERS"'), 'el deploy lo deja explícitamente en true (salvo HOLD)');
     const SECRET = 'valor-secreto-no-imprimir-123';
     const scenarios = [
       { label: '.env mínimo', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\n` },
@@ -533,6 +534,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
         label: '.env con valores manuales',
         env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\nDYNAMIC_V2_ALLOWED_OWNERS=11111111-2222-4333-8444-555555555555\nDYNAMIC_VIDEO_DELIVERY=videogen_direct\nDYNAMIC_MANIFEST_RULES_VERSION=1\nPRESENTATION_LIGHT_DEFAULT_SINCE=2026-10-02T13:14:15Z\n`,
       },
+      // r58: worker_off persistente (lo escribe `staging-v21-calibration.js worker off`): el deploy no re-enciende nada.
+      { label: '.env con worker_off persistente', env: `NODE_ENV=production\nSUPABASE_SERVICE_KEY=${SECRET}\nDYNAMIC_WORKERS_HOLD=true\nDYNAMIC_PROVIDER_WORKER_ENABLED=false\n` },
     ];
     for (const sc of scenarios) {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hd6-env-'));
@@ -556,6 +559,9 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
         assert(kv.DYNAMIC_REAL_VIDEO_OWNERS.split(',').includes(OWNER), `${sc.label}: DYNAMIC_REAL_VIDEO_OWNERS sin el owner`);
         assert(!('DYNAMIC_COHERENCE_LLM' in kv), `${sc.label}: DYNAMIC_COHERENCE_LLM se agregó`);
         eq(kv.SUPABASE_SERVICE_KEY, SECRET, `${sc.label}: otra clave alterada`);
+        const held = sc.label === '.env con worker_off persistente';
+        eq([kv.DYNAMIC_PROVIDER_WORKER_ENABLED, kv.DYNAMIC_LLM_WORKER_ENABLED], held ? ['false', 'false'] : ['true', 'true'], `${sc.label}: workers ${held ? 'apagados (HOLD)' : 'encendidos'}`);
+        if (held) continue;
         if (sc.label === '.env mínimo') {
           eq(kv.DYNAMIC_VIDEO_DELIVERY, 'youtube', 'default DYNAMIC_VIDEO_DELIVERY');
           eq(kv.DYNAMIC_MANIFEST_RULES_VERSION, '3', 'DYNAMIC_MANIFEST_RULES_VERSION agregado en 3');
@@ -710,6 +716,11 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       assert(fs.existsSync(path.join(tmpW, '.env.bak')), 'backup');
       assert(/ya vale true/.test(w('on').stdout), 'idempotente');
       assert(w('off').status === 0 && /DYNAMIC_PROVIDER_WORKER_ENABLED=false/.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'off');
+      // r58: worker_off es persistente (DYNAMIC_WORKERS_HOLD=true, lo respeta el deploy); worker_on lo levanta.
+      assert(/^DYNAMIC_WORKERS_HOLD=true$/m.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'off deja el HOLD');
+      assert(w('on').status === 0 && /^DYNAMIC_WORKERS_HOLD=false$/m.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'on levanta el HOLD');
+      assert(/ya vale true/.test(w('on').stdout), 'idempotente con HOLD');
+      assert(fs.readFileSync(path.join(tmpW, '.env'), 'utf8').includes(`DB_PASS=${SECRET}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\nOTHER=1\n`), 'sin cambio de otras claves');
       assert(w('maybe').status === 1, 'modo inválido');
       const guard = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'worker', 'on'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co' }, cwd: tmpW, encoding: 'utf8' });
       eq(guard.status, 1, 'guard de producción también para worker');
