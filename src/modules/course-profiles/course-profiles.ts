@@ -208,6 +208,31 @@ export interface AssessmentProfile {
   applicationDelivery?: ApplicationDeliveryProfile;
   /** T5 (r57): archivos de trabajo por capítulo (mod_resource; la AA los enlaza). Ausente/vacío = ninguno. */
   practiceResources?: PracticeResourceSpec[];
+  /**
+   * T6 (r57): «Guía del docente» del curso — página oculta solo para docentes (sección 0), armada sin IA desde lo ya
+   * generado (objetivos, tipo de aprendizaje y fases, actividades, criterios, solucionarios, archivos, evaluación,
+   * horas). Ausente o `include: false` = paquete de siempre.
+   */
+  teacherGuide?: TeacherGuideProfile;
+}
+
+/** T6 (r57): opción de la Guía del docente. */
+export interface TeacherGuideProfile {
+  include: boolean;
+}
+
+/** T6 (r57): valida `teacherGuide` ({ include: boolean }, sin otros campos). */
+export function validateTeacherGuide(v: unknown): ProfileValidationError[] {
+  if (!isPlainObject(v)) return [{ path: 'teacherGuide', code: 'INVALID_TEACHER_GUIDE', message: 'teacherGuide debe ser un objeto { include: boolean }' }];
+  const errors: ProfileValidationError[] = [];
+  checkKeys(v, ['include'], [], 'teacherGuide', errors);
+  if ('include' in v && typeof v.include !== 'boolean') errors.push({ path: 'teacherGuide.include', code: 'INVALID_TEACHER_GUIDE', message: 'teacherGuide.include debe ser true o false' });
+  return errors;
+}
+
+/** T6 (r57): ¿el perfil pide la Guía del docente? */
+export function teacherGuideEnabled(p: { teacherGuide?: TeacherGuideProfile } | null | undefined): boolean {
+  return p?.teacherGuide?.include === true;
 }
 
 /** Defaults de producto (DECISIONES VIGENTES): 70; formativos ilimitados (0), exámenes 3; 30/50/20 o 40/60. */
@@ -371,11 +396,12 @@ export function validateAssessmentProfile(
   checkKeys(
     p,
     ['assessmentProfileVersion', 'passingGrade', 'overrides', 'attempts', 'gradeMethod', 'categoryWeights', 'courseCompletion'],
-    ['applicationDelivery', 'practiceResources'],
+    ['applicationDelivery', 'practiceResources', 'teacherGuide'],
     '',
     errors,
   );
   // T4/T5 (r57): claves opcionales (ausentes = perfil de siempre).
+  if ('teacherGuide' in p) errors.push(...validateTeacherGuide(p.teacherGuide));
   if ('applicationDelivery' in p) errors.push(...validateApplicationDelivery(p.applicationDelivery));
   if ('practiceResources' in p) errors.push(...validatePracticeResources(p.practiceResources));
   const ownCategory = 'applicationDelivery' in p && validateApplicationDelivery(p.applicationDelivery).length === 0 && deliveryNeedsOwnCategory(p.applicationDelivery as ApplicationDeliveryProfile);
@@ -512,6 +538,8 @@ export function normalizeAssessmentProfile(
     // T4/T5 (r57): solo si el perfil las trae (sin ellas, el mismo objeto y el mismo sha de siempre).
     ...(q.applicationDelivery ? { applicationDelivery: normalizeApplicationDelivery(q.applicationDelivery) } : {}),
     ...(q.practiceResources && q.practiceResources.length ? { practiceResources: normalizePracticeResources(q.practiceResources) } : {}),
+    // T6 (r57): solo si el perfil la trae.
+    ...(q.teacherGuide ? { teacherGuide: { include: q.teacherGuide.include === true } } : {}),
   };
 }
 

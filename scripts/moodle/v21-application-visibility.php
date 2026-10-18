@@ -7,7 +7,8 @@
 //   - cada página conserva su PDF en mod_page/content (mismo nombre que enlaza el contenido).
 // Crea dos usuarios en ESE curso de prueba; no cambia la configuración del sitio.
 //
-// Uso: php -c php.ini v21-application-visibility.php <input.json> <output.json>   (input: { moodleRoot, courseid })
+// Uso: php -c php.ini v21-application-visibility.php <input.json> <output.json>   (input: { moodleRoot, courseid,
+//      pagesPattern?, hiddenPattern? } — T6: patrones de idnumber opcionales; default = AA + solucionario)
 define('CLI_SCRIPT', 1);
 $in = json_decode(file_get_contents($argv[1]), true);
 require($in['moodleRoot'] . '/config.php');
@@ -37,10 +38,13 @@ $manual->enrol_user($instance, $teacher, $DB->get_field('role', 'id', ['shortnam
 
 $fs = get_file_storage();
 $out = ['courseid' => $courseid, 'pages' => []];
+// T6 (r57): patrones opcionales (la Guía del docente usa la misma prueba que el solucionario).
+$pagesRe = isset($in['pagesPattern']) ? (string)$in['pagesPattern'] : '/^cv3:ch:[^:]+:application(_solution)?$/';
+$hiddenRe = isset($in['hiddenPattern']) ? (string)$in['hiddenPattern'] : '/^cv3:ch:[^:]+:application_solution$/';
 $asStudent = get_fast_modinfo($course, $student);
 $asTeacher = get_fast_modinfo($course, $teacher);
 foreach ($asStudent->get_cms() as $cm) {
-    if ($cm->modname !== 'page' || !preg_match('/^cv3:ch:[^:]+:application(_solution)?$/', (string)$cm->idnumber)) continue;
+    if ($cm->modname !== 'page' || !preg_match($pagesRe, (string)$cm->idnumber)) continue;
     $tcm = $asTeacher->get_cm($cm->id);
     $page = $DB->get_record('page', ['id' => $cm->instance], '*', MUST_EXIST);
     $ctx = context_module::instance($cm->id);
@@ -64,7 +68,7 @@ foreach ($asStudent->get_cms() as $cm) {
 require_once($CFG->dirroot . '/course/lib.php');
 $out['shownByMistake'] = [];
 foreach (get_fast_modinfo($course)->get_cms() as $cm) {
-    if ($cm->modname !== 'page' || !preg_match('/^cv3:ch:[^:]+:application_solution$/', (string)$cm->idnumber)) continue;
+    if ($cm->modname !== 'page' || !preg_match($hiddenRe, (string)$cm->idnumber)) continue;
     set_coursemodule_visible($cm->id, 1);
     $ctx = context_module::instance($cm->id);
     $s = get_fast_modinfo($course, $student)->get_cm($cm->id);

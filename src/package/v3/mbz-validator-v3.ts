@@ -34,6 +34,8 @@
  *   T6 (r57) MANIFEST_COVERAGE             cada parte de facts por capítulo (presentación con PDF+portada, video,
  *                                          actividad con su tipo de módulo) está exactamente una vez; nada de más
  *   T6 (r57) H5P_FILES                     además: content/content.json presente y JSON válido
+ *   T6 (r57) TEACHER_GUIDE                 Guía del docente ⇔ facts.teacherGuide: página oculta, estudiante prohibido,
+ *                                          sin nota, con el aviso y cada módulo/capítulo; nadie la enlaza
  *   LIBRO_CTA (≥ 3.13.0)                   botón «Abrir Libro Guía» a su propio recurso, pestaña nueva
  *   SECTIONS / NAVIGATION                  EV6: una sección por capítulo/evaluación, cierre al final
  *                                          (después del examen final), coursedisplay = 1 y cada
@@ -68,6 +70,7 @@ import { APPLICATION_SOLUTION_MARKERS_RE, CERTIFICATE_TEACHER_TROUBLESHOOTING, E
 import { safeActivityName } from '../mbz-common';
 import { PRACTICE_FILE_MIMETYPES, PRACTICE_RESOURCE_LIMITS, extensionOf } from '../../modules/course-profiles/application-delivery';
 import { courseBadgeDescription } from './course-badge';
+import { TEACHER_GUIDE_HIDDEN_NOTICE, TEACHER_GUIDE_IDNUMBER } from '../../modules/course-shell/teacher-guide-page';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
@@ -461,7 +464,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const courseXml = (await text('course/course.xml')) ?? '';
   if (!/<name>coursedisplay<\/name><value>1<\/value>/.test(courseXml)) add('SECTIONS', 'course/course.xml', 'coursedisplay ≠ 1 (una sección por página)');
   const expectedSection = (idn: string): number | undefined => {
-    if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start)$/.test(idn)) return 0;
+    if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start|teacher_guide)$/.test(idn)) return 0;
     if (/^cv3:shell:(route|libro|libro_card|audiobook|route_start)$/.test(idn)) return 1;
     if (idn === 'cv3:shell:closing' || idn === 'cv3:shell:certificate_teacher') return layout.closingSection;
     if (/^cv3:final_exam(_info|_next|_explanations)?$/.test(idn)) return layout.finalExamSection ?? undefined;
@@ -786,6 +789,38 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       }
     }
   }
+  // ── T6 (r57): «Guía del docente» — existe ⇔ facts.teacherGuide; página OCULTA (visible=0 y visibleold=0) con el
+  // estudiante PROHIBIDO (mod/page:view −1000 en la actividad, rol en inforef y roles.xml), sin nota ni completion,
+  // con el aviso fijo, cada módulo y capítulo de facts nombrado, y nadie la enlaza.
+  {
+    const guides = acts.filter((a) => a.idnumber === TEACHER_GUIDE_IDNUMBER);
+    if (guides.length !== (facts.teacherGuide === true ? 1 : 0)) add('TEACHER_GUIDE', TEACHER_GUIDE_IDNUMBER, `${guides.length} Guía(s) del docente (facts ${facts.teacherGuide === true ? 'la pide' : 'no la pide'})`);
+    const g = guides[0];
+    if (g) {
+      if (g.modname !== 'page') add('TEACHER_GUIDE', g.idnumber, `debe ser una página (mod_page), es ${g.modname}`);
+      if (g.module.visible !== '0' || g.module.visibleold !== '0') add('TEACHER_GUIDE', g.idnumber, 'la Guía del docente debe estar oculta (visible=0, visibleold=0)');
+      if (g.grade || g.inforefGradeItems.length || g.module.completion !== '0') add('TEACHER_GUIDE', g.idnumber, 'la Guía del docente no lleva nota ni completion');
+      const rx = (await text(`${g.dir}/roles.xml`)) ?? '';
+      const prohibits = (rx.match(/<override\b[\s\S]*?<\/override>/g) ?? []).some((o) => tag(o, 'roleid') === '5' && tag(o, 'capability') === 'mod/page:view' && tag(o, 'permission') === '-1000');
+      if (!prohibits) add('TEACHER_GUIDE', g.idnumber, 'la Guía del docente no prohíbe mod/page:view al rol estudiante');
+      const inf = (await text(`${g.dir}/inforef.xml`)) ?? '';
+      if (!/<roleref>[\s\S]*<role><id>5<\/id><\/role>[\s\S]*<\/roleref>/.test(inf)) add('TEACHER_GUIDE', g.idnumber, 'inforef sin el rol estudiante (el override no se restauraría)');
+      if (!/<role id="5">[\s\S]*<archetype>student<\/archetype>/.test(rootRoles)) add('TEACHER_GUIDE', 'roles.xml', 'roles.xml raíz no define el rol estudiante del override');
+      const content = unxml(tag((await text(`${g.dir}/page.xml`)) ?? '', 'content') ?? '');
+      const txt = extractText(content);
+      if (!txt.includes(TEACHER_GUIDE_HIDDEN_NOTICE)) add('TEACHER_GUIDE', g.idnumber, 'sin el aviso de página oculta para docentes');
+      for (const m of facts.modules) if (!txt.includes(`Módulo ${m.number}: ${m.title}`)) add('TEACHER_GUIDE', g.idnumber, `no nombra el módulo ${m.number}`);
+      for (const ch of facts.chapters) if (!txt.includes(`Capítulo ${ch.number}: ${ch.title}`)) add('TEACHER_GUIDE', g.idnumber, `no nombra el capítulo ${ch.number}`);
+      const lint = lintCleanSafe(content);
+      if (!lint.ok) add('CLEAN_SAFE', g.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
+      if (/<(style|script)\b/i.test(content)) add('TEACHER_GUIDE', g.idnumber, 'la página lleva <style>/<script>');
+      for (const other of acts) {
+        if (other === g) continue;
+        const body = `${other.intro}\n${other.modname === 'page' ? unxml(tag((await text(`${other.dir}/page.xml`)) ?? '', 'content') ?? '') : ''}`;
+        if (body.includes(`VIEWBYID*${g.mid}@$`)) add('TEACHER_GUIDE', other.idnumber, 'enlaza a la Guía del docente (es solo para docentes)');
+      }
+    }
+  }
   // ── T5 (r57): archivos de trabajo — por recurso de facts, EXACTAMENTE un mod_resource visible del capítulo, sin nota, con
   // UN archivo (nombre, tipo permitido, tamaño y sha256 = facts) y ninguno fuera de facts. El enlace desde la AA lo verifica
   // APPLICATION (arriba).
@@ -899,6 +934,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (APPLICATION_SOLUTION_RE.test(a.idnumber)) continue;
       // r55 (R6): «Respuestas explicadas» de un quiz con intentos ilimitados va oculta (lo verifica EXPLANATIONS_GATE).
       if (a.modname === 'page' && /^cv3:(exam_explanations:|final_exam_explanations$)/.test(a.idnumber)) continue;
+      // T6 (r57): la Guía del docente va oculta (la verifica TEACHER_GUIDE).
+      if (a.modname === 'page' && a.idnumber === TEACHER_GUIDE_IDNUMBER) continue;
       if (a.idnumber !== allowed) add('CERTIFICATE', a.idnumber, `módulo oculto inesperado (visible=${a.module.visible}): solo el label para docentes del certificado (o, sin él, el de las evaluaciones) puede estarlo`);
     }
   };

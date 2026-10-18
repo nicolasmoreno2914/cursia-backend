@@ -131,6 +131,7 @@ import {
   activityEmbedsInline,
 } from '../modules/course-shell';
 import type { H5pActivityTypeV2 } from '../modules/course-shell';
+import { TEACHER_GUIDE_IDNUMBER, teacherGuidePage } from '../modules/course-shell/teacher-guide-page';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { LIBRO_PDF_MIMETYPE, libroPdfFilename, renderLibroPdfV3 } from './v3/libro-v3';
 import { LibroLogoCandidate, cursiaDefaultLogo, resolveLibroLogo } from './v3/libro-logo';
@@ -1468,6 +1469,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   addLabel(0, 'cv3:shell:competencies', competenciesLabel(facts, courseIntro, theme, opts));
   addLabel(0, 'cv3:shell:methodology', methodologyLabel(facts, courseIntro, theme, opts));
   addLabel(0, 'cv3:shell:start', welcomeStartLabel(firstChapterSection as number, facts, theme, opts));
+  // T6 (r57): «Guía del docente» (opt-in del perfil): página OCULTA solo para docentes, antes del foro de avisos.
+  if (facts.teacherGuide === true) {
+    const guide = teacherGuidePage({ facts, resolved, blueprint, applications: c.applications ?? null }, theme);
+    addPage(0, TEACHER_GUIDE_IDNUMBER, { name: safeActivityName(guide.name), html: guide.html }, [], { teacherOnly: true });
+  }
   {
     const name = '📢 Avisos del Curso';
     const a = W.newActivity('forum', 0, name, 'cv3:shell:forum');

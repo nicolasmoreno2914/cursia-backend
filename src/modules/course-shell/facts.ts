@@ -256,6 +256,8 @@ export interface CourseFacts {
   };
   libro: { wordCount: number; hasBibliography: boolean };
   hours: { value: number; source: string } | null;
+  /** T6 (r57): el paquete lleva la «Guía del docente» (página oculta de la sección 0). Solo si el perfil la pide. */
+  teacherGuide?: true;
   /**
    * Motor de carga horaria: tiempo de estudio estimado del curso (modelo study-time con las medidas del
    * paquete). Solo si el empaque informó las palabras del experience. No se imprime en el shell.
@@ -627,6 +629,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
     ...(studyTime ? { studyTime } : {}),
+    ...(assessment.teacherGuide?.include === true ? { teacherGuide: true as const } : {}),
   };
   // Sanidad contra los totales del Manifest (dos fuentes, un número).
   const t = manifest.totals;
