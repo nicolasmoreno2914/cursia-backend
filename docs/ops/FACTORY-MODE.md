@@ -24,6 +24,8 @@ After you edit `.env`, run `sudo pm2 restart <process> --update-env` for the API
 | `STAGING_BUDGET_MAX_COST_PER_COURSE` | `106` | as approved | Same. |
 | `STAGING_BUDGET_MONTHLY_CAP` | `162` | as approved | Same. The value is written to the monthly key that the policy already uses (`monthlyCap` or `monthlyCapStaging`). |
 | `DEPLOY_FREEZE` | unset | `true` outside release windows | The VPS-side deploy guard (§2) refuses every deploy, with exit 3. |
+| `PACKAGE_MBZ_MAX_BYTES` | unset (measure and report only) | the Storage global upload limit in bytes (e.g. `209715200` for 200 MB) | T6: the package worker measures every built `.mbz` before upload. Above this limit the job fails with `PACKAGE_SIZE_LIMIT_EXCEEDED` (held for a person: raise the storage limit or reduce the course) instead of a 413 from Storage after the build. The job summary always carries `size` (total bytes and the 10 heaviest files). Not a positive integer → `PACKAGE_SIZE_CONFIG_INVALID`. |
+| `PACKAGE_MBZ_WARN_BYTES` | 90 % of `PACKAGE_MBZ_MAX_BYTES` (none if that is unset) | optional | Above it the package is still uploaded, with the visible warning `package_size_over_warn:<bytes>:<threshold>`. Must be ≤ the max. |
 
 Raising a budget is an owner decision. It is never done by code or by the agent loop. Set the three `STAGING_BUDGET_*` values only after the owner approves them in chat.
 If you remove the variables, the next deploy restores 106/106/162.
@@ -92,6 +94,7 @@ Regression harness: `node scripts/check-deploy-freeze-guard.js`. CI runs the pur
 ## 5. Storage limit and backups
 
 - **Supabase Storage**: keep the spend cap OFF, or set the global upload limit to **≥ 200 MB**, for the whole factory period. #1353 produced a 106 MB `.mbz`, and the 50 MB limit (spend cap ON) rejects it. Accept the pay-as-you-go storage and egress cost.
+- Set `PACKAGE_MBZ_MAX_BYTES` to the same limit (§1.1) so an oversized package fails before upload with a clear code.
 - **DB backups**: confirm that daily backups are enabled on the staging plan. Decide on PITR (≥ 7 days) for the contract period. That is an owner decision.
 - **Storage objects are not in DB backups.** Keep an **offline copy of every delivered `.mbz`** (Drive or S3).
 - **Delivery log**, one row per delivery: course id, run id, package job id, artifact id, `.mbz` SHA-256, builder version, delivery date, and the client contact who received it.
