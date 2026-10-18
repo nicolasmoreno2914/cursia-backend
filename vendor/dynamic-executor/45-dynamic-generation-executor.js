@@ -1420,8 +1420,23 @@ function _dynExperienceEduFields(item) {
   var f = _dynClaimField(item, ['experienceFeatures']);
   return _dynIsPlainObject(f) && f.eduFields === true;
 }
+// T2 (r57): con requisitos del marco instruccional en el brief (solo un backend que los valida los manda), el ejecutor
+// los espeja y reporta v21-exp-7: el backend los exige solo desde esa versión (frameworkRequirementsApply).
+var DYN_V3_EXPERIENCE_FRAMEWORK_PROMPT = 'v21-exp-7';
+function _dynExperienceFrameworkRequirements(item) {
+  var p = item && item.pedagogy;
+  var reqs = p && Array.isArray(p.experienceRequirements) ? p.experienceRequirements : null;
+  if (!reqs || !reqs.length) return null;
+  reqs.forEach(function (r) {
+    if (!_dynIsPlainObject(r) || typeof r.id !== 'string' || typeof r.message !== 'string' || !Array.isArray(r.movements) || !Array.isArray(r.anyOf) || !r.movements.length || !r.anyOf.length) {
+      throw new Error('PEDAGOGY_BRIEF_INVALID: requisitos del marco con forma inválida en el item ' + (item && item.itemKey));
+    }
+  });
+  return reqs;
+}
 function _dynExperiencePromptVersion(item) {
-  return _dynExperienceEduFields(item) ? DYN_V3_PROMPT_VERSIONS.experience : DYN_V3_EXPERIENCE_PROMPT_FALLBACK;
+  if (!_dynExperienceEduFields(item)) return DYN_V3_EXPERIENCE_PROMPT_FALLBACK;
+  return _dynExperienceFrameworkRequirements(item) ? DYN_V3_EXPERIENCE_FRAMEWORK_PROMPT : DYN_V3_PROMPT_VERSIONS.experience;
 }
 // Sin soporte del backend: why/apply se quitan (el validador anterior los rechazaría como UNKNOWN_FIELD).
 function _dynStripEduFields(doc, repairs) {
@@ -1635,6 +1650,21 @@ function dynValidatePedagogyV3(doc) {
         if (len > P.denseMax) errors.push({ path: '$.movements.' + m + '[' + i + '].' + key + '[' + j + '].body', code: 'TEXT_DENSE', message: len + ' caracteres: un bloque de explicación lleva como máximo ' + P.denseMax + ' (2–3 frases); divide la idea o pásala a un recurso visual' });
       });
     });
+  });
+  return errors;
+}
+
+// ════ T2 (r57) — requisitos del marco instruccional (espejo de validateFrameworkRequirements, pedagogy.ts) ════
+// Datos del brief (item.pedagogy.experienceRequirements): algún componente de anyOf en alguno de movements.
+function dynValidateFrameworkRequirementsV3(doc, reqs) {
+  var errors = [];
+  if (!reqs || !reqs.length) return errors;
+  var mv = (doc && doc.movements) || {};
+  reqs.forEach(function (r) {
+    var found = r.movements.some(function (m) {
+      return (Array.isArray(mv[m]) ? mv[m] : []).some(function (c) { return c && r.anyOf.indexOf(c.type) >= 0; });
+    });
+    if (!found) errors.push({ path: '$.movements.' + r.movements[0], code: 'FRAMEWORK_ELEMENT_MISSING', message: r.message + ' [' + r.id + ']' });
   });
   return errors;
 }
@@ -3784,6 +3814,8 @@ async function _dynRunExperience(item) {
   var courseContext = item.context.courseContext;
   var chapter = Object.assign({}, bp.chapter, { id: item.chapterId });
   var eduFields = _dynExperienceEduFields(item);
+  // T2 (r57): requisitos del marco (solo con why/apply: el mismo backend que los valida anuncia eduFields).
+  var fwReqs = eduFields ? _dynExperienceFrameworkRequirements(item) : null;
   var prompt = dynExperiencePrompt(courseContext, bp.outline, chapter, src.contentMd, src.contextPackage, Object.assign({ eduFields: eduFields, pedagogy: dynPedagogyBlock(item) }, src.practice ? { practice: true } : {}));
   // Fix round 2 (n4): reparaciones POR INTENTO; el summary usa las del intento que se conserva.
   var repairsBy = {};
@@ -3807,14 +3839,14 @@ async function _dynRunExperience(item) {
       var rep = dynRepairExperienceV3(obj);
       // El reintento dirigido también nombra lo que falta de la estructura educativa (si no, el 2.º intento
       // arreglaría el schema y fallaría la pedagogía sin reintentos restantes).
-      if (!rep.ok) return { ok: false, errors: _dynFormatErrors(v.errors.concat(_dynIsPlainObject(obj) ? dynValidatePedagogyV3(obj).concat(dynValidateSimulatedDiagramsV3(obj), eduFields ? dynValidateEduFieldsV3(obj) : []) : [])) };
+      if (!rep.ok) return { ok: false, errors: _dynFormatErrors(v.errors.concat(_dynIsPlainObject(obj) ? dynValidatePedagogyV3(obj).concat(dynValidateSimulatedDiagramsV3(obj), eduFields ? dynValidateEduFieldsV3(obj) : [], dynValidateFrameworkRequirementsV3(obj, fwReqs)) : [])) };
       autoRepairs = repairsBy[attempt] = autoRepairs.concat(rep.repairs);
       doc = rep.doc;
     }
     // Edu EV2: estructura educativa mínima (el backend la exige al completar el item).
     // EV6: sin decisiones aplanadas en secuencias ni diagramas dibujados con flechas (el backend los exige desde v21-exp-5).
     // P3: why/apply en ≥ 2 bloques (el backend los exige desde v21-exp-6).
-    var ped = dynValidatePedagogyV3(doc).concat(dynValidateSimulatedDiagramsV3(doc), eduFields ? dynValidateEduFieldsV3(doc) : []);
+    var ped = dynValidatePedagogyV3(doc).concat(dynValidateSimulatedDiagramsV3(doc), eduFields ? dynValidateEduFieldsV3(doc) : [], dynValidateFrameworkRequirementsV3(doc, fwReqs));
     if (ped.length) return { ok: false, errors: _dynFormatErrors(ped) };
     // #583 (M2/M3): cuentas del ejemplo resuelto y listas con nombre iguales a las del capítulo (blandos).
     var qsoft = [];
