@@ -22,6 +22,13 @@ import { autoHealEnabled } from '../dynamic-generation/auto-heal';
 
 /** `DYNAMIC_AUTO_PACKAGE_ENABLED=false` apaga el empaque automático (disparo y barrido). Default: encendido. */
 export const AUTO_PACKAGE_ENABLED_ENV = 'DYNAMIC_AUTO_PACKAGE_ENABLED';
+/**
+ * T8 (factory mode, 2026-10-18): re-armar SOLO un paquete final completado porque cambió la versión del builder es
+ * OPT-IN. Default false: un deploy que sube el builder nunca re-empaqueta cursos ya entregados (16-oct: un deploy
+ * re-armó 4 cursos viejos con 3.14.0). El empaque inicial de un run recién completado (y el reintento de un fallo /
+ * la re-completitud sin confirmar) no cambia: lo gobiernan DYNAMIC_AUTO_PACKAGE_ENABLED y holdPackaging.
+ */
+export const AUTO_REPACKAGE_ON_BUILDER_BUMP_ENV = 'DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP';
 /** Intentos automáticos de paquete final por completitud del run (el primero + 2 reintentos). */
 export const AUTO_PACKAGE_MAX_ATTEMPTS = 3;
 /** Espera mínima entre un job de paquete fallido y el reintento automático. */
@@ -81,6 +88,11 @@ type Q = { query: (sql: string, params?: any[]) => Promise<any> };
 
 export function autoPackageEnabled(env: Record<string, string | undefined> = process.env): boolean {
   return String(env[AUTO_PACKAGE_ENABLED_ENV] ?? '').trim().toLowerCase() !== 'false';
+}
+
+/** T8: `DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP=true` re-arma solo los paquetes de un builder anterior. Default: apagado. */
+export function autoRepackageOnBuilderBump(env: Record<string, string | undefined> = process.env): boolean {
+  return String(env[AUTO_REPACKAGE_ON_BUILDER_BUMP_ENV] ?? '').trim().toLowerCase() === 'true';
 }
 
 function obj(v: unknown): Record<string, any> {
@@ -202,7 +214,8 @@ export async function loadAutoPackageState(
   let rebuildPending = false;
   if (status === 'completed' && latest && mark && capsOk && sweepOn) {
     const builder = obj(latest.output_summary).builderVersion;
-    const builderChanged = builder !== currentBuilderVersionFor(rulesVersion);
+    // T8: un builder nuevo solo re-arma con el opt-in (default: el paquete queda `stale` con acción visible).
+    const builderChanged = autoRepackageOnBuilderBump(env) && builder !== currentBuilderVersionFor(rulesVersion);
     const unconfirmed = new Date(latest.created_at).getTime() < mark.eligibleAt.getTime() && mark.satisfiedJobId !== latest.id;
     rebuildPending = builderChanged || (withinWindow && unconfirmed);
   }
@@ -214,14 +227,20 @@ export async function loadAutoPackageState(
  * `loadAutoPackageState`): runs `completed` CON la marca, sin bloqueo de precheck vigente, sin job final
  * activo, con intentos disponibles (fallidos desde la marca y transitorios), pasada la espera, y además:
  *  - sin job final o con el último fallido — dentro de la ventana;
- *  - último job final completado con OTRA versión del builder — en cualquier momento (fix round 1, I1);
+ *  - último job final completado con OTRA versión del builder — en cualquier momento (fix round 1, I1), SOLO con
+ *    `DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP=true` (T8; default apagado);
  *  - último job final completado ANTES de la marca vigente sin confirmar como mismo build — dentro de la
  *    ventana (re-completitud cuyo disparo se perdió; fix round 1, I1/M2).
  * DoD follow-up (R8): «final» se clasifica igual que `packageKindOf` (`finalPackageKindSql`), un bloqueo
  * deja de contar si después se creó un job final (igual que el estado), y un run saltado por «nada
  * pendiente» espera `AUTO_PACKAGE_SKIP_BACKOFF_SECONDS` antes de volver a seleccionarse.
  */
-export async function findAutoPackageCandidates(q: Q, now: Date, limit = 50): Promise<string[]> {
+export async function findAutoPackageCandidates(
+  q: Q,
+  now: Date,
+  limit = 50,
+  env: Record<string, string | undefined> = process.env,
+): Promise<string[]> {
   const isFinal = finalPackageKindSql('p');
   const rows: Array<{ id: string }> = await q.query(
     `with marked as (
@@ -267,7 +286,7 @@ export async function findAutoPackageCandidates(q: Q, now: Date, limit = 50): Pr
         and coalesce((c.ap->'lastSkip'->>'at')::timestamptz, '-infinity'::timestamptz) <= $1::timestamptz - make_interval(secs => $12::int)
         and (
           ((c.job_id is null or c.job_status = any($4::text[])) and c.eligible_at > $1::timestamptz - make_interval(hours => $2::int))
-          or (c.job_status = 'completed' and c.builder is distinct from (case when c.rules_version = 3 then $10 else $11 end))
+          or ($13::boolean and c.job_status = 'completed' and c.builder is distinct from (case when c.rules_version = 3 then $10 else $11 end))
           or (c.job_status = 'completed' and c.job_created < c.eligible_at
               and coalesce(c.ap->>'satisfiedJobId', '') <> c.job_id::text
               and c.eligible_at > $1::timestamptz - make_interval(hours => $2::int))
@@ -277,7 +296,7 @@ export async function findAutoPackageCandidates(q: Q, now: Date, limit = 50): Pr
     [now.toISOString(), AUTO_PACKAGE_MAX_AGE_HOURS, [...PACKAGE_JOB_ACTIVE_STATUSES], [...PACKAGE_JOB_FAILED_STATUSES],
       AUTO_PACKAGE_MAX_ATTEMPTS, AUTO_PACKAGE_RETRY_BACKOFF_SECONDS, limit, AUTO_PACKAGE_MAX_TRANSIENT,
       AUTO_PACKAGE_TRANSIENT_BACKOFF_SECONDS, DYNAMIC_MBZ_BUILDER_VERSION_V3, DYNAMIC_MBZ_BUILDER_VERSION,
-      AUTO_PACKAGE_SKIP_BACKOFF_SECONDS],
+      AUTO_PACKAGE_SKIP_BACKOFF_SECONDS, autoRepackageOnBuilderBump(env)],
   );
   return rows.map((r) => r.id);
 }
