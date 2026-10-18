@@ -89,7 +89,7 @@ import {
   themeSha256,
   validateTheme,
 } from '../modules/theme-engine';
-import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION } from '../modules/visual-components';
+import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION, internalVocabularyExemptions, repairInternalVocabularyDeep } from '../modules/visual-components';
 import {
   CTA_BADGES,
   CourseFacts,
@@ -365,6 +365,8 @@ export interface MbzV3Expectations {
   shellProseByLabel: Record<string, string[]>;
   /** UX r18 fix 1 (M4): versión del builder que armó el paquete (las reglas nuevas del validador dependen de ella). */
   builderVersion: string;
+  /** T1 (r57): reglas de vocabulario interno exentas porque el contenido del curso las usa como vocabulario del tema. */
+  internalVocabularyExempt: string[];
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -825,9 +827,47 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
   return { modules, final };
 }
 
+/**
+ * T1 (r57): reparación determinística del vocabulario interno en todo el contenido LLM que se muestra (experiencias,
+ * intros, interacciones del video, actividad H5P, bancos de examen, AA + solucionario, ejercicios guiados). El Libro
+ * (contentMd) es la referencia del dominio: define las exenciones y no se toca. Aviso por regla con su cantidad.
+ */
+export function repairContentsInternalVocabulary(contents: DynamicPackageContentsV3): { contents: DynamicPackageContentsV3; exempt: string[]; warnings: string[] } {
+  const exempt = internalVocabularyExemptions(contents.contentMd ? contents.contentMd.values() : []);
+  const counts = new Map<string, number>();
+  const fix = <T>(v: T): T => {
+    if (v === undefined || v === null) return v;
+    const r = repairInternalVocabularyDeep(v, exempt);
+    for (const f of r.fixes) counts.set(f, (counts.get(f) ?? 0) + 1);
+    return r.value;
+  };
+  const fixMap = <T>(m: Map<string, T> | undefined): Map<string, T> | undefined => (m ? new Map(Array.from(m, ([k, v]) => [k, fix(v)])) : m);
+  const activities = contents.activities
+    ? new Map(Array.from(contents.activities, ([k, a]) => [k, a.variant === 'h5p' ? { ...a, payload: fix(a.payload) } : a] as [string, ActivityContentV3]))
+    : contents.activities;
+  const out: DynamicPackageContentsV3 = {
+    ...contents,
+    courseIntro: fix(contents.courseIntro),
+    moduleIntros: fixMap(contents.moduleIntros) as Map<string, unknown>,
+    experiences: fixMap(contents.experiences) as Map<string, unknown>,
+    videoInteractions: fixMap(contents.videoInteractions) as Map<string, unknown>,
+    activities,
+    ...(contents.examBanks ? { examBanks: fixMap(contents.examBanks) } : {}),
+    ...(contents.finalExamBank ? { finalExamBank: fix(contents.finalExamBank) } : {}),
+    ...(contents.applications ? { applications: fixMap(contents.applications) } : {}),
+    ...(contents.guidedPractices ? { guidedPractices: fixMap(contents.guidedPractices) } : {}),
+  };
+  const warnings = Array.from(counts, ([rule, n]) => `internal_vocabulary_repaired:${rule}:${n}`).sort();
+  return { contents: out, exempt, warnings };
+}
+
 export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<BuildDynamicMbzV3Result> {
   if (!Number.isInteger(input?.ts) || input.ts <= 0) throw new Error('MBZ_V3_INVALID: ts (reloj inyectado) debe ser un entero > 0');
-  const { manifest, blueprint, contents: c, ts } = input;
+  const { manifest, blueprint, ts } = input;
+  // T1 (r57): vocabulario interno del generador («worked_example», «texto fuente», «[S12]»…) → lenguaje natural,
+  // determinístico, ANTES de validar/renderizar (también repara artifacts ya generados al re-empaquetar).
+  const vocab = repairContentsInternalVocabulary(input.contents);
+  const c = vocab.contents;
   const pendingIds = [...new Set(input.pendingVideoChapterIds ?? [])];
   const plan = buildPackagingPlanV3(manifest, blueprint, { manifestId: input.manifestId ?? null, omitVideoChapterIds: pendingIds });
   const omittedVideoKeys = plan.omittedVideos.map((v) => v.videoKey);
@@ -840,6 +880,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const warnings: string[] = [];
   // EV6 T5: aviso visible en el resumen del paquete por cada video pendiente omitido.
   for (const v of plan.omittedVideos) warnings.push(`pending_video_omitted:${v.videoKey}`);
+  warnings.push(...vocab.warnings);
 
   // ── Tema (R1) y evaluación (R6) ──────────────────────────────────────────
   const theme: ResolvedTheme = resolveTheme(input.presentation);
@@ -1762,7 +1803,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3 },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,

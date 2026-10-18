@@ -39,3 +39,12 @@ export {
   CssDecl,
 } from './lint-output';
 export { escapeHtml, lintView } from './text';
+export {
+  INTERNAL_VOCABULARY_RULES,
+  InternalVocabularyHit,
+  InternalVocabularyRule,
+  internalVocabularyExemptions,
+  lintInternalVocabulary,
+  repairInternalVocabulary,
+  repairInternalVocabularyDeep,
+} from './internal-vocabulary';

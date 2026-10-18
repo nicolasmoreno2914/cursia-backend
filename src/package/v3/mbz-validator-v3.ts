@@ -54,7 +54,7 @@ import {
 } from '../assessment';
 import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
-import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
+import { extractText, lintCleanSafe, lintInternalVocabulary, lintResourceMentions, parseHtml } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
 import { APPLICATION_SOLUTION_MARKERS_RE, CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, EXAMS_TEACHER_NOTE_UNLIMITED, CourseFacts, chapterNextSteps, closingCertificateText, courseApprovalRequirements, courseApprovalTeacherNote, courseHasGrades, examOverallFeedbackBands, examsHaveUnlimitedAttempts, examsTeacherNoteFor, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
@@ -105,6 +105,8 @@ export interface MbzV3ValidationExpectations {
    * válido no se reporta como fallido.
    */
   builderVersion?: string;
+  /** T1 (r57): exenciones de dominio del vocabulario interno (del builder). Ausente = el check no aplica (paquete viejo). */
+  internalVocabularyExempt?: string[];
 }
 
 /** true si `v` (x.y.z) ≥ `min`. Una versión ausente o mal formada → false. */
@@ -935,6 +937,17 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         if (!railMod?.examEnabled && /evaluaci[oó]n del m[oó]dulo/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'el riel promete una evaluación del módulo inexistente');
         if (/\bvideos?\b|\b(actividad|práctica|practica)\b|evaluaci[oó]n final|examen final/i.test(t)) add('TRANSITION_DISABLED_RESOURCE', a.idnumber, 'el riel del módulo nombra un recurso que no es un capítulo ni la evaluación del módulo');
       }
+    }
+  }
+  // T1 (r57): vocabulario interno del generador («worked_example», «texto fuente», «[S12]»…) en NINGÚN texto visible
+  // (labels, páginas del estudiante y del docente, descripciones). Solo paquetes cuyas expectativas traen las
+  // exenciones del dominio (builder con la reparación determinística); las expectativas viejas no se re-juzgan.
+  if (Array.isArray(exp.internalVocabularyExempt)) {
+    for (const a of acts) {
+      if (!['label', 'page', 'resource', 'h5pactivity', 'quiz', 'forum'].includes(a.modname)) continue;
+      const body = a.modname === 'page' ? unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '') : '';
+      const hits = lintInternalVocabulary(`${a.name}\n${extractText(a.intro)}\n${body ? extractText(body) : ''}`, exp.internalVocabularyExempt);
+      if (hits.length) add('INTERNAL_VOCABULARY', a.idnumber, `texto interno del generador visible: ${[...new Set(hits.map((h) => `«${h.match}»`))].slice(0, 5).join(', ')}`);
     }
   }
   // EV6 T5: video pendiente = sin actividad de video; el aviso existe si y solo si facts lo pide.
