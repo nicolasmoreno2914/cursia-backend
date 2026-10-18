@@ -89,7 +89,7 @@ import {
   themeSha256,
   validateTheme,
 } from '../modules/theme-engine';
-import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION, internalVocabularyExemptions, repairInternalVocabularyDeep } from '../modules/visual-components';
+import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION, internalVocabularyExemptions, repairInternalVocabularyDeep, formulaicOpeningWarnings } from '../modules/visual-components';
 import {
   CTA_BADGES,
   CourseFacts,
@@ -391,6 +391,11 @@ export interface BuildDynamicMbzV3Result {
     /** EV6 T5: videos omitidos por estar pendientes (vista previa) y si el capítulo lleva el aviso. */
     pendingVideos: Array<{ itemKey: string; chapterId: string; chapterNumber: number; title: string; notice: boolean }>;
     warnings: string[];
+    /**
+     * T1 (r57): avisos de CALIDAD del contenido (no operativos; nunca fallan el empaque), p. ej.
+     * `formulaic_opening:reflection:piensa_en:11/15` — la misma apertura en muchos capítulos.
+     */
+    qualityWarnings: string[];
     counts: CourseFacts['counts'];
     /** F1 (I3): resultado de la normalización de pesos (ver `assessmentPackageSummary`). */
     assessment: AssessmentPackageSummary;
@@ -1831,6 +1836,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         itemKey: v.videoKey, chapterId: v.chapterId, chapterNumber: v.chapterNumber, title: v.title, notice: noticeChapterIds.includes(v.chapterId),
       })),
       warnings,
+      qualityWarnings: formulaicOpeningWarnings(plan.modules.flatMap((m) => m.chapters.map((ch) => c.experiences.get(ch.chapterId)))),
       // r19: piso de 25 min del audiolibro (solo si el empaque pasó los manifiestos; no entra al .mbz).
       ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,

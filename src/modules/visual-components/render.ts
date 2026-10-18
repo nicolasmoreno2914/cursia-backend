@@ -941,13 +941,30 @@ function chip(r: R, icon: EduIcon, label: string, k: Tone, s: Surf, opts: { marg
   );
 }
 
+/**
+ * T1 (r57): rótulos de `why` / `apply` con VARIACIÓN determinística. Antes eran SIEMPRE «Por qué importa:» y
+ * «Cómo lo aplicas:» (141 veces en un curso de 15 capítulos: fórmula que el estudiante deja de leer). La variante
+ * sale del uid del bloque: base del movimiento (capítulo + movimiento → punto de partida distinto por capítulo) + su
+ * posición (rotación: dos bloques seguidos nunca repiten). Mismos insumos → mismo texto (sin azar ni IA).
+ */
+export const VC_WHY_LABELS = Object.freeze(['Por qué importa', 'Para qué te sirve', 'Por qué es clave']);
+export const VC_APPLY_LABELS = Object.freeze(['Cómo lo aplicas', 'En la práctica', 'Aplícalo así']);
+export function eduLabelVariant(uid: string, n: number): number {
+  const m = /^(.*)-(\d+)$/.exec(String(uid ?? ''));
+  const base = m ? m[1] : String(uid ?? '');
+  const pos = m ? Number(m[2]) : 0;
+  let h = 2166136261;
+  for (let i = 0; i < base.length; i++) h = Math.imul(h ^ base.charCodeAt(i), 16777619) >>> 0;
+  return (h + pos) % n;
+}
+
 /** «¿Por qué importa?» bajo el título (opcional, generado). */
 function whyLine(r: R, why: string | undefined, k: Tone, s: Surf): string {
   if (!why || !why.trim()) return '';
   const ink = textInk(k.ink, s);
   return (
     `<p class="cvc-why"${st(r, [['margin', `0 0 ${D(r, 18)}px 0`], ['padding', 0], ['color', s.fg2], ['font-size', r.t.typography.sizeBodyPx], ['line-height', '1.5'], ['max-width', `${r.t.typography.measureCh}ch`]])}>` +
-    `<strong${st(r, [['color', ink]])}>${labelHtml('Por qué importa: ')}</strong>${inlineHtml(why)}</p>`
+    `<strong${st(r, [['color', ink]])}>${labelHtml(`${VC_WHY_LABELS[eduLabelVariant(r.uid, VC_WHY_LABELS.length)]}: `)}</strong>${inlineHtml(why)}</p>`
   );
 }
 
@@ -958,7 +975,7 @@ function applyLine(r: R, apply: string | undefined, k: Tone, s: Surf): string {
   return (
     `<div class="cvc-apply"${st(r, [['margin', `${D(r, 20)}px 0 0 0`], ['padding', `${D(r, 14)}px 0 0 0`], ['color', s.fg], ['border-top', `1px solid ${k.edge}`]])}>` +
     `<p${st(r, [['margin', 0], ['padding', 0], ['color', s.fg], ['line-height', '1.5'], ['max-width', `${r.t.typography.measureCh}ch`]])}>` +
-    `${eduIcon(r.enh, 'flecha', ink, 18)} <strong${st(r, [['color', ink]])}>${labelHtml('Cómo lo aplicas: ')}</strong>${inlineHtml(apply)}</p></div>`
+    `${eduIcon(r.enh, 'flecha', ink, 18)} <strong${st(r, [['color', ink]])}>${labelHtml(`${VC_APPLY_LABELS[eduLabelVariant(r.uid, VC_APPLY_LABELS.length)]}: `)}</strong>${inlineHtml(apply)}</p></div>`
   );
 }
 

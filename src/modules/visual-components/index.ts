@@ -19,7 +19,7 @@ export {
 } from './validate';
 export { validateEduFields, eduMetrics, VC_EDU_FIELDS_MIN, VC_TEXT_RUN_TYPES, VC_TEXT_RUN_TARGET_WORDS } from './pedagogy';
 export { validatePedagogy, VC_PEDAGOGY, validateSimulatedDiagrams, arrowChainLength, isBranchHead, isQuestionHead, branchHead, branchingHeadIndexes, VcBranchHead, VC_ARROW_CHAIN_MIN } from './pedagogy';
-export { renderComponent, renderMovement, VC_RENDER_STYLE_VERSION, VcRenderContext, VcRenderLevel, VC_TABLE_MAX_COLUMNS, VC_CRITERION_HEADER_RE, normalizeLegacyLabelColumn } from './render';
+export { renderComponent, renderMovement, VC_WHY_LABELS, VC_APPLY_LABELS, eduLabelVariant, VC_RENDER_STYLE_VERSION, VcRenderContext, VcRenderLevel, VC_TABLE_MAX_COLUMNS, VC_CRITERION_HEADER_RE, normalizeLegacyLabelColumn } from './render';
 export { VC_RUNTIME_VERSION } from './runtime';
 export { EDU_ICONS, eduIcon, roleTone, moduleTone, EduIcon, Tone } from './edu';
 export {
@@ -48,3 +48,4 @@ export {
   repairInternalVocabulary,
   repairInternalVocabularyDeep,
 } from './internal-vocabulary';
+export { lintFormulaicOpenings, formulaicOpeningWarnings, FormulaicOpeningFinding, FORMULAIC_MIN_CHAPTERS, FORMULAIC_MIN_SHARE } from './formulaic-lint';

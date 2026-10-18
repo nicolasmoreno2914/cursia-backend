@@ -870,6 +870,13 @@ function _dynInternalVocabularyBan() {
   return '- NUNCA escribas en el texto los nombres técnicos de los bloques, movimientos o campos de este JSON (p.ej. worked_example, case_scenario, concept_cards, process_steps, summary_visual, self_check, deepening, bridge_to_next) ni «texto fuente», «[S1]» o delimitadores como «<<<CAPITULO»: para el lector son «el ejemplo resuelto», «el caso», «los conceptos clave», «el procedimiento», «la síntesis» o «el Libro Guía».';
 }
 
+// T1 (r57): un curso real repetía las mismas aperturas y cierres en casi todos los capítulos («Ya sabes… Ahora
+// viene…» 9/15, «Piensa en…» 11/15). Regla de estilo (no un validador): el backend mide la repetición entre capítulos
+// (lintFormulaicOpenings) y la deja como aviso de calidad del paquete.
+function _dynFormulaVarietyRule() {
+  return '- ESTILO: cada capítulo abre y cierra con una entrada PROPIA de su tema; nada de fórmulas repetidas entre capítulos: no abras el hero con «Ya sabes… / Hasta aquí… → Ahora viene…», no empieces la reflexión con «Piensa en…», no arranques why/apply siempre con la misma muletilla («Porque…», «Úsalo cuando…»): escribe directamente la razón o la acción concreta.\n';
+}
+
 // Reglas duras comunes a experience / course_intro / module_intro.
 function _dynV3StrictBans() {
   return '\n\nPROHIBICIONES ABSOLUTAS (un validador automático rechaza la respuesta si las incumples):\n'
@@ -1041,6 +1048,7 @@ function dynExperiencePrompt(courseContext, outline, chapter, contentMd, context
     + '- Antes de responder, cuenta los componentes de cada movimiento: nunca más que el máximo indicado.\n'
     + '- hero.eyebrow (opcional): 1 a 3 palabras del TEMA (p. ej. "Evaluación auténtica"); nunca "Capítulo N" ni "Módulo N": Cursia ya muestra la ubicación.\n'
     + '- Respeta TODOS los límites de caracteres; ningún texto vacío; los campos de texto no llevan HTML.\n'
+    + _dynFormulaVarietyRule()
     + '- "chapterId" es exactamente "' + chapterId + '".'
     + _dynV3StrictBans()
     + '\n\nSOLO el JSON, nada más; cierra todos los objetos y arrays.';

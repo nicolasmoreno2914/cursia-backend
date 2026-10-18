@@ -645,6 +645,8 @@ export async function processV3PackageJob(
     mockProviderItems: loaded.mockProviderItems,
     validation: validation.stats,
     ...(warnings.length ? { warnings } : {}),
+    // T1 (r57): avisos de calidad del contenido (fórmulas repetidas entre capítulos); informativos, nunca fallan.
+    ...(built.summary.qualityWarnings?.length ? { qualityWarnings: built.summary.qualityWarnings } : {}),
   });
   if (!ok) logger.warn(`Job ${job.id}: el .mbz v3 se subió (artifact ${artifact.id}) pero completeJob devolvió false (lease perdida)`);
 }

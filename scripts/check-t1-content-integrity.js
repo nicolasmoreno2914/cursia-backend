@@ -33,6 +33,7 @@ const eq = (a, b, m) => assert.deepStrictEqual(a, b, m);
   const V = L('package/v3/mbz-validator-v3.js');
   const PF = require('./lib/v21-packaging-fixtures');
   const JSZip = require('jszip');
+  const TE0 = L('modules/theme-engine/index.js').resolveTheme({ themeFamily: 'editorial', mode: 'light' });
 
   await check('V1 reparación determinística: ids de bloque y «texto fuente» → lenguaje natural con el artículo correcto', () => {
     const cases = [
@@ -113,6 +114,31 @@ const eq = (a, b, m) => assert.deepStrictEqual(a, b, m);
     void internalVocabularyExempt;
     const v2 = await V.validateMbzV3(bad, old);
     assert(!v2.issues.some((s) => s.code === 'INTERNAL_VOCABULARY'), 'expectativas viejas: sin el check');
+  });
+
+  // ─── Frases formulaicas ───
+  await check('F1 rótulos why/apply: variación determinística (rotan dentro del movimiento, otro punto de partida por capítulo)', () => {
+    const lab = (uid) => VC.VC_WHY_LABELS[VC.eduLabelVariant(uid, VC.VC_WHY_LABELS.length)];
+    const seq = [0, 1, 2, 3, 4].map((i) => lab(`deepening-ch3-${i}`));
+    for (let i = 1; i < seq.length; i++) assert(seq[i] !== seq[i - 1], `dos bloques seguidos con el mismo rótulo: ${seq}`);
+    eq(new Set(seq).size, VC.VC_WHY_LABELS.length, 'usa todas las variantes');
+    const starts = new Set(Array.from({ length: 15 }, (_, k) => lab(`deepening-ch${k + 1}-0`)));
+    assert(starts.size > 1, 'los capítulos no empiezan todos igual');
+    eq(lab('deepening-ch3-1'), lab('deepening-ch3-1'), 'determinístico');
+    const html = VC.renderComponent({ type: 'checklist', title: 'Lista', items: ['a uno', 'b dos', 'c tres'], why: 'Evita errores.', apply: 'Úsala hoy.' }, TE0, { uid: 'deepening-ch2-1' });
+    const t = VC.extractText(html);
+    assert(t.includes(`${lab('deepening-ch2-1')}: Evita errores.`) && t.includes(`${VC.VC_APPLY_LABELS[VC.eduLabelVariant('deepening-ch2-1', 3)]}: Úsala hoy.`), t);
+  });
+
+  await check('F2 lint de curso: la misma apertura en ≥ 3 capítulos y ≥ 40 % → aviso de calidad (nunca falla); variadas → nada', async () => {
+    const exp = (lead, refl, bridge) => ({ movements: { opening: [{ type: 'hero', title: 't', lead }], closing: [{ type: 'reflection', prompt: refl }] }, bridge_to_next: bridge });
+    const same = [1, 2, 3, 4, 5].map((n) => exp(`Ya sabes lo del tema ${n}. Ahora viene más.`, `Piensa en tu caso ${n}.`, `Tema ${n} distinto aquí.`));
+    eq(VC.formulaicOpeningWarnings(same), ['formulaic_opening:hero_lead:ya_sabes:5/5', 'formulaic_opening:reflection:piensa_en:5/5']);
+    const varied = ['Una tarde', 'Cuando llega', 'En la guardia', 'Tres señales', 'Antes de'].map((l, i) => exp(`${l} algo ${i}.`, `${['Recuerda', 'Imagina', 'Revisa', 'Anota', 'Compara'][i]} tu caso.`, `Puente ${i} propio.`));
+    eq(VC.formulaicOpeningWarnings(varied), []);
+    const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true }));
+    assert(Array.isArray(r.summary.qualityWarnings), 'summary.qualityWarnings');
+    assert(!r.summary.warnings.some((w) => /^formulaic_opening/.test(w)), 'no se mezcla con los avisos operativos');
   });
 
   // ─── Libro Guía (PDF) ───
