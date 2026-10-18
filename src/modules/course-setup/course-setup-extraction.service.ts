@@ -1,7 +1,7 @@
 import { Injectable, Logger, Optional } from '@nestjs/common';
 import Anthropic from '@anthropic-ai/sdk';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
-import { recordDirectAnthropicCall } from '../finops/direct-call-ledger';
+import { assertDirectCallAllowed, recordDirectAnthropicCall } from '../finops/direct-call-ledger';
 
 export interface ExtractedCourseSetup {
   purpose: string | null;
@@ -63,6 +63,8 @@ export class CourseSetupExtractionService {
    * ausentes (devuelve null) y reporta baja confianza en warnings.
    */
   async extractFromPdf(pdfBuffer: Buffer, ctx: { ownerId?: string | null } = {}): Promise<ExtractedCourseSetup> {
+    // r58: kill switch / allow-list de proveedores ANTES de llamar (esta llamada directa no reserva).
+    assertDirectCallAllowed('anthropic');
     const response = await this.client.messages.create({
       model: this.model,
       max_tokens: 2048,

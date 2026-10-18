@@ -5,6 +5,7 @@
 // extractor determinista (mismas reglas, mismas validaciones, mismas citas). El gasto se registra en FinOps.
 // Apagada por defecto (ACADEMIC_ADVANCED_EXTRACTION_ENABLED=true para encenderla): USD 0 hasta que el dueño la active.
 import Anthropic from '@anthropic-ai/sdk';
+import { assertDirectCallAllowed } from '../finops/direct-call-ledger';
 
 export const ADVANCED_EXTRACTION_OPERATION = 'llm.academic_extraction';
 export const ADVANCED_MAX_OUTPUT_TOKENS = 16000;
@@ -78,6 +79,8 @@ export const TRANSCRIPTION_PROMPT =
 export class AnthropicTranscriber implements DocumentTranscriber {
   private client: Anthropic | null = null;
   async transcribe(input: { name: string; pdf: Buffer; model: string }): Promise<TranscriptionResult> {
+    // r58: kill switch / allow-list de proveedores ANTES de llamar (la lectura avanzada no reserva).
+    assertDirectCallAllowed('anthropic');
     if (!this.client) this.client = new Anthropic();
     const res = await this.client.messages.create({
       model: input.model,

@@ -95,8 +95,14 @@ function actionWorker(mode, envPath) {
   if (mode !== 'on' && mode !== 'off') throw new Error('uso: worker <on|off>');
   const value = mode === 'on' ? 'true' : 'false';
   const text = fs.readFileSync(envPath, 'utf8');
-  const { text: next, before } = setEnvKeyText(text, 'DYNAMIC_PROVIDER_WORKER_ENABLED', value);
-  if (before === value) {
+  // r58: worker_off persistente — DYNAMIC_WORKERS_HOLD (el deploy de staging lo respeta y no re-enciende los workers).
+  const step1 = setEnvKeyText(text, 'DYNAMIC_PROVIDER_WORKER_ENABLED', value);
+  // worker on solo toca el HOLD si existe (un .env sin HOLD queda igual que antes).
+  const hasHold = /^DYNAMIC_WORKERS_HOLD=/m.test(step1.text);
+  const step2 = mode === 'off' || hasHold ? setEnvKeyText(step1.text, 'DYNAMIC_WORKERS_HOLD', mode === 'on' ? 'false' : 'true') : { text: step1.text, before: 'false' };
+  const next = step2.text;
+  const before = step1.before;
+  if (before === value && step2.before === (mode === 'on' ? 'false' : 'true')) {
     console.log(`✓ DYNAMIC_PROVIDER_WORKER_ENABLED ya vale ${value} — no se toca`);
     return;
   }
@@ -107,6 +113,7 @@ function actionWorker(mode, envPath) {
   fs.copyFileSync(envPath, `${envPath}.bak`);
   fs.renameSync(tmp, envPath);
   console.log(`+ DYNAMIC_PROVIDER_WORKER_ENABLED: ${before === null ? '(ausente)' : before} → ${value} (backup: .env.bak)`);
+  if (mode === 'off' || hasHold) console.log(`+ DYNAMIC_WORKERS_HOLD: ${step2.before === null ? '(ausente)' : step2.before} → ${mode === 'on' ? 'false' : 'true'}`);
 }
 
 /** ¿La fila vigente ya es exactamente la política aprobada? (pura) */

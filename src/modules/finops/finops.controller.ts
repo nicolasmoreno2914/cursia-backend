@@ -26,8 +26,17 @@ import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsError } from './errors';
 import { llmIngestToChargeInput, llmProxyReservationKey, llmReservationToChargeInput, parseLlmReservationIngest, parseLlmReservationRelease, parseLlmUsageIngest } from './llm-usage-ingest';
 import { costIdempotencyKey } from './idempotency';
+import { SPEND_CONTROL_CODES } from './spend-controls';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** r58: FinopsError.code de los controles de gasto → `code` HTTP (409) que entienden el proxy y el navegador. */
+export const SPEND_CONTROL_HTTP_CODES: Readonly<Record<string, string>> = Object.freeze({
+  FINOPS_KILL_SWITCH: SPEND_CONTROL_CODES.killSwitch,
+  PROVIDER_NOT_ALLOWED: SPEND_CONTROL_CODES.providerNotAllowed,
+  UNATTRIBUTED_CEILING: SPEND_CONTROL_CODES.unattributedCeiling,
+  ITEM_RUN_NOT_FOUND: SPEND_CONTROL_CODES.itemRunNotFound,
+});
 
 /** FinopsError → HTTP (fail loud: un precio faltante es 422, nunca un 200 con 0). */
 export function finopsErrorToHttp(err: unknown): unknown {
@@ -35,6 +44,9 @@ export function finopsErrorToHttp(err: unknown): unknown {
     if (err.code === 'ESTIMATE_NOT_FOUND') return new NotFoundException({ code: err.code, message: err.message });
     // FinOps P0: reserva de una parte de un run ajeno → 409 con código estable (el proxy no llama al proveedor).
     if (err.code === 'ATTRIBUTION_REJECTED') return new ConflictException({ code: 'attribution_rejected', message: err.message });
+    // r58: controles de gasto del servidor → 409 con código estable (el proxy no llama y el navegador no reintenta).
+    const spendCode = SPEND_CONTROL_HTTP_CODES[err.code];
+    if (spendCode) return new ConflictException({ code: spendCode, message: err.message });
     if (err.code === 'PRICING_MISSING' || err.code === 'PRICING_AMBIGUOUS' || err.code === 'CURRENCY_MISMATCH') {
       return new UnprocessableEntityException({ code: err.code, message: err.message });
     }

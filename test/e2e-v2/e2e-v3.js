@@ -169,7 +169,9 @@ async function startApp(extraEnv = {}, label = 'app-v3') {
 }
 
 // ─── HTTP ──────────────────────────────────────────────────────────────────
-const TOKEN = jwt.sign({ sub: OWNER, email: 'e2e-v3-owner@example.com', role: 'authenticated', aud: 'authenticated' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '6h' });
+// r58: como un token real de Supabase (email confirmado en user_metadata): el owner del e2e es SuperAdmin y el guard
+// exige identidad verificada (sin auth.users en el PG del e2e, decide el claim).
+const TOKEN = jwt.sign({ sub: OWNER, email: 'e2e-v3-owner@example.com', role: 'authenticated', aud: 'authenticated', user_metadata: { email_verified: true } }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '6h' });
 const BASE = `http://127.0.0.1:${APP_PORT}/api/v1`;
 async function api(method, p, body, token = TOKEN) {
   const headers = { 'content-type': 'application/json' };

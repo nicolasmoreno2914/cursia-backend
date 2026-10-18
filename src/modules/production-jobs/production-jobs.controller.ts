@@ -9,6 +9,7 @@ import {
   HttpCode,
   HttpStatus,
   UseGuards,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ProductionJobsService } from './production-jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
@@ -26,6 +27,17 @@ import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import { redactJobForOwner } from './owner-safe-job';
+import { legacyPaidJobsDisabledMessage, legacyPaidJobsEnabled, SPEND_CONTROL_CODES } from '../finops/spend-controls';
+
+/**
+ * r58 (AU3 §H1 #14): kill switch de los jobs v1 PAGADOS (Gamma, TTS, Videogen, job maestro). LEGACY_PAID_JOBS_ENABLED
+ * ausente / true → sin cambio (producción v1); false (modo fábrica / experimento) → 503 `legacy_paid_jobs_disabled`
+ * ANTES de crear o reactivar nada. Los workers v1 lo vuelven a verificar antes de reclamar (legacy-paid-job-gate.ts).
+ */
+export function assertLegacyPaidJobsEnabled(kind: string, env: NodeJS.ProcessEnv = process.env): void {
+  if (legacyPaidJobsEnabled(env)) return;
+  throw new ServiceUnavailableException({ code: SPEND_CONTROL_CODES.legacyPaidJobsDisabled, message: legacyPaidJobsDisabledMessage(kind) });
+}
 
 @Controller('jobs')
 @UseGuards(SupabaseJwtGuard)
@@ -69,6 +81,7 @@ export class ProductionJobsController {
     @Body() dto: CreateVideoJobDto,
     @CurrentUser() user: AuthUser,
   ) {
+    assertLegacyPaidJobsEnabled('videos');
     return this.jobsService.createVideoJob(user.id, dto);
   }
 
@@ -83,6 +96,7 @@ export class ProductionJobsController {
     @Body() dto: CreateAudioJobDto,
     @CurrentUser() user: AuthUser,
   ) {
+    assertLegacyPaidJobsEnabled('audio');
     return this.jobsService.createAudioJob(user.id, dto);
   }
 
@@ -111,6 +125,7 @@ export class ProductionJobsController {
     @Body() dto: CreateGammaJobDto,
     @CurrentUser() user: AuthUser,
   ) {
+    assertLegacyPaidJobsEnabled('gamma');
     return this.jobsService.createGammaJob(user.id, dto);
   }
 
@@ -196,6 +211,7 @@ export class ProductionJobsController {
     @Body() dto: CreateFullCourseJobDto,
     @CurrentUser() user: AuthUser,
   ) {
+    assertLegacyPaidJobsEnabled('full');
     return this.jobsService.createFullCourseJob(user.id, dto);
   }
 
@@ -215,6 +231,7 @@ export class ProductionJobsController {
     @Param('id') id: string,
     @CurrentUser() user: AuthUser,
   ) {
+    assertLegacyPaidJobsEnabled('videos/requeue');
     const result = await this.jobsService.requeueVideoJob(id, user.id);
     if (!result.ok) {
       return { ok: false, reason: result.reason };
@@ -238,6 +255,7 @@ export class ProductionJobsController {
     @Param('id') id: string,
     @CurrentUser() user: AuthUser,
   ) {
+    assertLegacyPaidJobsEnabled('full/retry');
     const result = await this.jobsService.requeueFullCourseJob(id, user.id);
     if (!result.ok) {
       return { ok: false, reason: result.reason };

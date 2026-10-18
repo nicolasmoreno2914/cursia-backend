@@ -191,6 +191,35 @@ export class FinopsBudgetService {
   }
 
   /**
+   * r58 (AU3 §H1.2): comprometido del mes calendario de UN dueño — misma definición que monthCommitted, filtrada por
+   * owner_id (eventos del ledger del dueño, sin atribuir incluidos, + presupuesto pendiente de SUS runs vivos). Lo usa
+   * el límite `ownerMonthlyCap` de la política (el caller ya tiene MONTH_CAP_LOCK).
+   */
+  async ownerMonthCommitted(ownerId: string, runner: Runner = this.dataSource): Promise<{ spent: string; outstanding: string; total: string }> {
+    const [s] = await runner.query(
+      `select coalesce(sum(amount),0)::text as total from public.generation_cost_events
+        where owner_id = $1 and billing_account <> 'user_key' and created_at >= date_trunc('month', now())`,
+      [ownerId],
+    );
+    const [o] = await runner.query(
+      `select coalesce(sum(greatest(a.authorized_budget - coalesce(sp.spent, 0), 0)),0)::text as total
+         from (select distinct on (run_id) run_id, authorized_budget from public.cost_budget_authorizations
+                where run_id is not null and decision in ('ADMIN_APPROVED','AUTO_WITHIN_POLICY')
+                order by run_id, created_at desc, id desc) a
+         join public.production_jobs j on j.id = a.run_id
+         left join (select run_id, sum(amount) as spent from public.generation_cost_events
+                     where run_id is not null and billing_account <> 'user_key' group by run_id) sp on sp.run_id = a.run_id
+        where j.owner_id = $1
+          and coalesce(j.worker_status, '') not in ('completed', 'preview', 'failed', 'cancelled', 'cancelling')
+          and coalesce(j.status, '') not in ('cancelled', 'cancelling')`,
+      [ownerId],
+    );
+    const spent = normalizeDecimal(s?.total ?? 0);
+    const outstanding = normalizeDecimal(o?.total ?? 0);
+    return { spent, outstanding, total: addDec(spent, outstanding) };
+  }
+
+  /**
    * Flujo normal (UI): guarda el estimado que vio el usuario y UNA aprobación
    * ADMIN_APPROVED por `amount` (ya validado contra la política por el caller),
    * sin run todavía — el run que se crea a continuación la consume (bindRun).
@@ -641,15 +670,22 @@ export class FinopsBudgetService {
    * y pagadas por Cursia (BYOK no consume el presupuesto del run). → null = permitida; si no, el código para el proxy.
    */
   async guardLlmProxyCall(a: { subject: string; itemRunId: string | null; model: string; promptChars: number; maxTokens: number; billingAccount: string }): Promise<null | {
-    code: 'run_paused' | 'item_recovery_budget_exhausted' | 'attribution_rejected'; message: string; runId: string; paused: boolean;
+    code: 'run_paused' | 'item_recovery_budget_exhausted' | 'attribution_rejected' | 'item_run_not_found'; message: string; runId: string | null; paused: boolean;
   }> {
     if (!a.itemRunId || a.billingAccount !== 'cursia') return null;
+    if (!UUID_RE.test(a.itemRunId)) {
+      return { code: 'item_run_not_found', runId: null, paused: false, message: 'La llamada declara una parte inválida: no se hizo (sin gasto).' };
+    }
     const [row] = await this.dataSource.query(
       `select g.job_id, pj.owner_id, pj.worker_status from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id where g.id = $1`,
       [a.itemRunId],
     );
-    if (!row) return null; // parte inexistente: no hay run cuyo tope aplicar (el ingest la deja sin atribuir, con motivo)
+    // r58 (AU3 §H4.6, I2): antes una parte inexistente (UUID inventado) pasaba como llamada «sin atribuir», sin tope del
+    // run ni techo. Ahora se rechaza ANTES de reservar (el proxy no llama). Una llamada legítima sin parte no manda el header.
+    if (!row) {
+      return { code: 'item_run_not_found', runId: null, paused: false, message: 'La llamada declara una parte que no existe: no se hizo (sin gasto).' };
+    }
     // FinOps P0 (audit §4 #7): antes un ejecutor que no era el dueño del run quedaba SIN guard (null = permitida) y su
     // cargo sin run → sin tope ni disyuntor. Solo el dueño puede ejecutar partes de su run (el claim lo exige): un no
     // dueño se rechaza ANTES de reservar (el proxy no llama al proveedor).

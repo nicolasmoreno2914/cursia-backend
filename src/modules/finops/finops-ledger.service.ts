@@ -7,6 +7,7 @@ import { adjustmentIdempotencyKey, costIdempotencyKey, CostIdempotencyKind, Cost
 import { familyOfProvider, operationForItem } from './operations';
 import type { EstimateResult } from './estimator';
 import { CostReadService, costEventsCte } from './cost-read.service';
+import { assertProviderSpendAllowed, unattributedCeilings } from './spend-controls';
 
 /**
  * V2.1 RF-a — ledger de costos (audit §W.3/§W.4). Todas las escrituras son
@@ -344,6 +345,7 @@ export class FinopsLedgerService {
   // ─── cargos ────────────────────────────────────────────────────────────────
 
   async recordCharge(input: RecordChargeInput): Promise<RecordResult> {
+    assertReservationSpendAllowed(input);
     const { row, pricingError, idempotencyKey } = await this.buildChargeRow(input);
     // FinOps atómico (2026-10-14, #1353: con 4 llamadas en paralelo las reservas llegaron a USD 47,62 con tope 47,50):
     // una RESERVA pagada por Cursia de un run se inserta solo si, con ella, el run sigue dentro de su presupuesto
@@ -361,12 +363,52 @@ export class FinopsLedgerService {
       if (pricingError) this.logPricingMissing(idempotencyKey, input, pricingError);
       return pricingError ? { ...res, pricingMissing: true } : res;
     }
-    const res = await this.insertEvent(row, this.dataSource);
+    // r58 (AU3 §H4.6, I2): una reserva pagada por Cursia SIN run ni curso (proxy del navegador sin parte declarada) se
+    // inserta solo si cabe en el techo de gasto sin atribuir (por dueño, 24 h móviles, y global) — verificado e
+    // insertado bajo UN lock consultivo (dos reservas concurrentes nunca pasan el techo). Sin techo configurado → igual
+    // que antes.
+    const ceilings = isUnattributedPaidReservation(row) ? unattributedCeilings() : null;
+    const res = ceilings && (ceilings.perOwner !== null || ceilings.global !== null)
+      ? await this.dataSource.transaction((m) => this.insertReservationWithinUnattributedCeiling(row, ceilings, m))
+      : await this.insertEvent(row, this.dataSource);
     if (pricingError) {
       this.logPricingMissing(idempotencyKey, input, pricingError);
       return { ...res, pricingMissing: true };
     }
     return res;
+  }
+
+  /**
+   * r58: techo del gasto SIN atribuir (run_id y course_id nulos, Cursia). Suma el neto (cargos + reservas + ajustes) de
+   * las últimas 24 h del dueño y global; si con esta reserva alguno pasaría su techo → FinopsError UNATTRIBUTED_CEILING
+   * (el proxy responde 409 `unattributed_ceiling_reached` y no llama). Reintento idempotente → la existente, sin evaluar.
+   */
+  private async insertReservationWithinUnattributedCeiling(
+    row: Record<string, unknown>,
+    ceilings: { perOwner: string | null; global: string | null },
+    m: { query: (sql: string, params?: any[]) => Promise<any> },
+  ): Promise<RecordResult> {
+    await m.query(`set local lock_timeout = '20s'`);
+    await m.query(`select pg_advisory_xact_lock(hashtext($1))`, [UNATTRIBUTED_CEILING_LOCK]);
+    const [existing] = await m.query(`select *, amount::text as amount from public.generation_cost_events where idempotency_key = $1`, [row.idempotency_key]);
+    if (existing) return { inserted: false, event: existing };
+    const [t] = await m.query(
+      `select coalesce(sum(amount) filter (where owner_id = $1), 0)::text as owner_total, coalesce(sum(amount), 0)::text as global_total
+         from public.generation_cost_events
+        where run_id is null and course_id is null and billing_account = 'cursia' and created_at > now() - interval '24 hours'`,
+      [row.owner_id],
+    );
+    const checks: Array<[string, string | null, string]> = [['por dueño', ceilings.perOwner, t.owner_total], ['global', ceilings.global, t.global_total]];
+    for (const [scope, cap, spent] of checks) {
+      if (cap === null) continue;
+      const after = addDec(spent, row.amount as string);
+      if (cmpDec(after, cap) > 0) {
+        throw new FinopsError('UNATTRIBUTED_CEILING',
+          `el gasto sin atribuir de las últimas 24 h (${scope}) llegaría a USD ${Number(after).toFixed(4)} y el techo es USD ${Number(cap).toFixed(4)}: no se hace la llamada`,
+          { scope: scope === 'global' ? 'global' : 'owner', spent, amount: row.amount, ceiling: cap });
+      }
+    }
+    return this.insertEvent(row, m);
   }
 
   /**
@@ -377,6 +419,7 @@ export class FinopsLedgerService {
    */
   async recordReservationBatch(inputs: RecordChargeInput[]): Promise<RecordResult[]> {
     if (!inputs.length) return [];
+    for (const input of inputs) assertReservationSpendAllowed(input);
     const built = [];
     for (const input of inputs) {
       const b = await this.buildChargeRow(input);
@@ -554,10 +597,17 @@ export class FinopsLedgerService {
     // FinOps P0 (owner mismatch, review del audit §4 #7): una RESERVA real pagada por Cursia de una parte de un run
     // AJENO se rechaza — sin esto quedaba sin atribuir y sin tope del run ni guard de gasto (bypass). BYOK / mock y los
     // cargos posteriores al gasto (el dinero ya se gastó: nunca se pierde) se registran sin atribuir con el motivo.
-    if (!attribution.attributed && attribution.rejectReason === 'owner_mismatch' && input.billingAccount === 'cursia' && input.mode === 'real'
-      && (input.metadata as Record<string, unknown> | undefined)?.reservation === true) {
+    const paidReservation = input.billingAccount === 'cursia' && input.mode === 'real' && (input.metadata as Record<string, unknown> | undefined)?.reservation === true;
+    if (!attribution.attributed && attribution.rejectReason === 'owner_mismatch' && paidReservation) {
       throw new FinopsError('ATTRIBUTION_REJECTED',
         'la parte declarada es de un run de otro dueño: este ejecutor no está autorizado para ese run (no se reserva ni se llama al proveedor)',
+        { itemRunId: typeof input.itemRunId === 'string' ? input.itemRunId.slice(0, 64) : null });
+    }
+    // r58 (AU3 §H4.6): una reserva pagada que DECLARA una parte inexistente (UUID inventado / inválido) ya no se acepta
+    // como «sin atribuir» (era la forma de saltarse el tope del run): se rechaza antes de reservar (no se llama).
+    if (!attribution.attributed && (attribution.rejectReason === 'item_run_not_found' || attribution.rejectReason === 'invalid_item_run_id') && paidReservation) {
+      throw new FinopsError('ITEM_RUN_NOT_FOUND',
+        'la parte declarada no existe: no se reserva ni se llama al proveedor (una llamada sin parte no declara x-cursia-item-run-id)',
         { itemRunId: typeof input.itemRunId === 'string' ? input.itemRunId.slice(0, 64) : null });
     }
 
@@ -1529,6 +1579,26 @@ export class FinopsLedgerService {
 
 /** Lock consultivo por run de las reservas (FinOps atómico). */
 export const RUN_CAP_LOCK_PREFIX = 'finops:run-cap:';
+/** r58: lock consultivo (global) del techo de gasto sin atribuir. */
+export const UNATTRIBUTED_CEILING_LOCK = 'finops:unattributed-ceiling';
+
+/**
+ * r58 (AU3 §H4.4–5): kill switch + allow-list de proveedores en el punto de RESERVA (toda llamada pagada por Cursia del
+ * pipeline reserva antes de llamar). Solo reservas reales de Cursia: un cargo posterior (dinero ya gastado), BYOK o mock
+ * nunca se rechazan acá.
+ */
+function assertReservationSpendAllowed(input: RecordChargeInput): void {
+  if (!input || input.billingAccount !== 'cursia' || input.mode !== 'real') return;
+  if ((input.metadata as Record<string, unknown> | undefined)?.reservation !== true) return;
+  assertProviderSpendAllowed(input.provider);
+}
+
+/** ¿Reserva pagada por Cursia sin run ni curso (sujeta al techo de gasto sin atribuir)? */
+export function isUnattributedPaidReservation(row: Record<string, unknown>): boolean {
+  const md = (row.metadata && typeof row.metadata === 'object' ? row.metadata : {}) as Record<string, unknown>;
+  return md.reservation === true && row.event_kind === 'CHARGE' && !row.run_id && (row.course_id === null || row.course_id === undefined)
+    && row.billing_account === 'cursia' && row.cost_source !== 'MOCK';
+}
 
 /** ¿Esta fila es una reserva pagada por Cursia de un run (sujeta al tope atómico del run)? */
 export function isRunCapReservation(row: Record<string, unknown>): boolean {
