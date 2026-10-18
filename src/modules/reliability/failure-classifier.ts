@@ -541,6 +541,8 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'LIBRO_LOGO_ASSET_MISSING', 'LIBRO_LOGO_ASSET_INVALID', 'LIBRO_V3_WATERMARK',
       // r19 L fix round 1 (I1): pdfkit no pudo generar el Libro Guía (ni con el logo de Cursia) → bug de producto.
       'LIBRO_V3_PDF_FAILED',
+      // r57 T1: un mapa/diagrama/tabla del Libro Guía tiene caracteres sin glifo en la fuente → bug de producto.
+      'LIBRO_V3_GLYPHS',
       // Fase 2: pdfkit no pudo generar el PDF imprimible de una Actividad de Aplicación / documento ya validado sin
       // actividad o sin solucionario al llegar al render → bug de producto (el item ya pasó su validación).
       'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID'],
