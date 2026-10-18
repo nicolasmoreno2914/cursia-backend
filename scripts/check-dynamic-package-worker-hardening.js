@@ -130,6 +130,12 @@ function workerDeps(ds, over = {}) {
     artifacts: {
       async findAll() { return over.existing || []; },
       async uploadBufferArtifact(input) { uploads.push(input); return { id: `artifact-${uploads.length}` }; },
+      // r58 (AU1 R1): el reuse descarga los bytes del candidato y verifica su sha256.
+      async downloadStorageObject(bucket, p) {
+        const b = (over.storage || {})[`${bucket}/${p}`];
+        if (!b) throw new Error(`Supabase Storage download failed: 404 ${bucket}/${p}`);
+        return b;
+      },
     },
     // El worker lee el Manifest CONGELADO del run (getById, R1/R3); `get`
     // queda por compatibilidad con código previo. Stub desactualizado hasta
@@ -300,15 +306,59 @@ function withEnv(key, value, fn) {
       assert(uploads[0].storagePath.includes(uploads[0].metadata.sourceIdsHash), 'el path usa la clave con versión');
     }));
 
-  await check('I3 reuse default: un dynamic_mbz existente sin moodleVersion en metadata (pre-fix) se sigue reusando sin env', () =>
+  // r58 (AU1 R1): un candidato a reuse tiene que ser un .mbz del SERVIDOR: ruta canónica + checksum + bytes iguales.
+  const MBZ_BYTES = Buffer.from('mbz-bytes-built-by-server');
+  const MBZ_SHA = crypto.createHash('sha256').update(MBZ_BYTES).digest('hex');
+  const canonicalRow = (over = {}) => {
+    const h = reuse.sourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ['aaaa', 'bbbb']);
+    return { id: 'old', storageBucket: 'cursia-artifacts', storagePath: `owner-1/dynamic/fc-1/1/dynamic_mbz/run-1/${h}.mbz`, checksumSha256: MBZ_SHA,
+      metadata: { runId: 'run-1', manifestId: 1, sourceIdsHash: h, builderVersion: DYNAMIC_MBZ_BUILDER_VERSION }, ...over };
+  };
+  const storageOf = (row, bytes = MBZ_BYTES) => ({ [`cursia-artifacts/${row.storagePath}`]: bytes });
+
+  await check('I3 reuse default: un dynamic_mbz del servidor (ruta canónica + checksum) sin moodleVersion en metadata (pre-fix) se sigue reusando sin env', () =>
     withEnv('DYNAMIC_MBZ_MOODLE_VERSION', undefined, async () => {
-      const legacyHash = reuse.sourceIdsHash(DYNAMIC_MBZ_BUILDER_VERSION, ['aaaa', 'bbbb']);
-      const existing = [{ id: 'old', metadata: { runId: 'run-1', sourceIdsHash: legacyHash, builderVersion: DYNAMIC_MBZ_BUILDER_VERSION } }];
+      const row = canonicalRow();
       const ds = fakeDataSource();
-      const { deps, built } = workerDeps(ds, { existing });
+      const { deps, built } = workerDeps(ds, { existing: [row], storage: storageOf(row) });
       await worker.processItem(deps, JOB());
       eq(built.length, 0, 'builds');
       eq(ds.state.completed[0]?.summary?.artifactId, 'old', 'reusa el existente');
+    }));
+
+  console.log('\n=== r58 R1: el reuse no confía en un dynamic_mbz forjado ===');
+
+  for (const [label, row, storage] of [
+    ['sin checksum (fila registrada por el cliente / legacy)', canonicalRow({ checksumSha256: null }), null],
+    ['ruta NO canónica (otro archivo de la carpeta del dueño)', canonicalRow({ storagePath: 'owner-1/1/mbz_final/forjado.mbz' }), null],
+    ['bytes reemplazados en Storage (sha256 distinto del checksum)', canonicalRow(), 'tampered'],
+    ['objeto ausente en Storage', canonicalRow(), 'missing'],
+    ['otro bucket', canonicalRow({ storageBucket: 'otro-bucket' }), null],
+  ]) {
+    await check(`R1 forjado: ${label} → NO se reusa; se construye y sube con replaceUnverifiedOnConflict`, () =>
+      withEnv('DYNAMIC_MBZ_MOODLE_VERSION', undefined, async () => {
+        const ds = fakeDataSource();
+        const logger = silentLogger();
+        const st = storage === 'tampered' ? storageOf(row, Buffer.from('FORGED')) : storage === 'missing' ? {} : storageOf(row);
+        const { deps, built, uploads } = workerDeps(ds, { existing: [row], storage: st, logger });
+        await worker.processItem(deps, JOB());
+        eq(built.length, 1, 'build');
+        eq(uploads.length, 1, 'upload');
+        eq(uploads[0].replaceUnverifiedOnConflict, true, 'replaceUnverifiedOnConflict');
+        eq(ds.state.completed[0]?.summary?.reused, false, 'reused');
+        assert(logger.calls.warn.some((m) => /PACKAGE_REUSE_REJECTED:/.test(m)), 'aviso PACKAGE_REUSE_REJECTED');
+      }));
+  }
+
+  await check('R1 dos candidatos: el forjado (más nuevo) se descarta y se reusa el del servidor', () =>
+    withEnv('DYNAMIC_MBZ_MOODLE_VERSION', undefined, async () => {
+      const good = canonicalRow({ id: 'good' });
+      const forged = canonicalRow({ id: 'forged', storagePath: 'owner-1/x/forged.mbz', checksumSha256: MBZ_SHA });
+      const ds = fakeDataSource();
+      const { deps, built } = workerDeps(ds, { existing: [forged, good], storage: storageOf(good) });
+      await worker.processItem(deps, JOB());
+      eq(built.length, 0, 'builds');
+      eq(ds.state.completed[0]?.summary?.artifactId, 'good', 'reusa el verificado');
     }));
 
   console.log('\n=== I2: adopción idempotente del objeto inmutable ya subido ===');
@@ -331,6 +381,10 @@ function withEnv(key, value, fn) {
         }
         objects.set(key, Buffer.from(init.body));
         return new Response(JSON.stringify({ Key: key }), { status: 200 });
+      }
+      if (method === 'GET') {
+        const obj = objects.get(key);
+        return obj ? new Response(obj, { status: 200 }) : new Response('not found', { status: 404 });
       }
       if (method === 'HEAD') {
         if (headStatus) return new Response(null, { status: headStatus });
@@ -380,6 +434,43 @@ function withEnv(key, value, fn) {
       eq((row.metadata || {}).adoptedExistingObject, true, 'metadata.adoptedExistingObject');
       eq((row.metadata || {}).runId, 'run-1', 'metadata original conservada');
       assert(storage.calls.some((c) => c.method === 'HEAD'), 'se verificó el objeto (HEAD)');
+    } finally {
+      global.fetch = async (u) => { throw new Error(`NETWORK FORBIDDEN in check: ${u}`); };
+    }
+  });
+
+  await check('r58 R1 replaceUnverifiedOnConflict: objeto ajeno en la ruta canónica → se REEMPLAZA con los bytes construidos; checksum = sha256 construido', async () => {
+    const storage = inMemoryStorage();
+    global.fetch = storage.fetchImpl;
+    try {
+      const repo = fakeRepo();
+      const key = `cursia-artifacts/${UPLOAD().storagePath}`;
+      storage.objects.set(key, Buffer.from('FORGED-BY-OWNER'));
+      const svc = new ArtifactsService(repo, CONFIG);
+      const built = Buffer.from('mbz-bytes-validated');
+      const row = await svc.uploadBufferArtifact(UPLOAD({ adoptExistingOnConflict: true, replaceUnverifiedOnConflict: true, buffer: built }));
+      eq(storage.objects.get(key).toString(), 'mbz-bytes-validated', 'objeto reemplazado');
+      eq(row.checksumSha256, crypto.createHash('sha256').update(built).digest('hex'), 'checksum');
+      eq((row.metadata || {}).adoptedExistingObject, undefined, 'no adoptado');
+      // Mismos bytes → se adopta (sin re-subir) con checksum.
+      const row2 = await svc.uploadBufferArtifact(UPLOAD({ adoptExistingOnConflict: true, replaceUnverifiedOnConflict: true, buffer: built }));
+      eq((row2.metadata || {}).adoptedExistingObject, true, 'adoptado (bytes idénticos)');
+      eq(row2.checksumSha256, row.checksumSha256, 'checksum adoptado');
+    } finally {
+      global.fetch = async (u) => { throw new Error(`NETWORK FORBIDDEN in check: ${u}`); };
+    }
+  });
+
+  await check('r58 R1 adopción legacy sin verificar → checksum null (nunca reusable como paquete)', async () => {
+    const storage = inMemoryStorage();
+    global.fetch = storage.fetchImpl;
+    try {
+      const repo = fakeRepo();
+      const svc = new ArtifactsService(repo, CONFIG);
+      const first = await svc.uploadBufferArtifact(UPLOAD());
+      eq(first.checksumSha256, crypto.createHash('sha256').update(Buffer.from('mbz-bytes-v1')).digest('hex'), 'checksum del upload');
+      const row = await svc.uploadBufferArtifact(UPLOAD({ adoptExistingOnConflict: true, buffer: Buffer.from('otro') }));
+      eq(row.checksumSha256, null, 'checksum null en adopción sin verificar');
     } finally {
       global.fetch = async (u) => { throw new Error(`NETWORK FORBIDDEN in check: ${u}`); };
     }

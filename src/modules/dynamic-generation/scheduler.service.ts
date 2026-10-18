@@ -61,6 +61,7 @@ import {
   sweepRunExpiredLeases,
 } from './item-transitions';
 import { latestGenerationPredicate } from './item-generations';
+import { LLM_MODE_INVALID, combineLlmModes, isNonRealLlmMode } from '../artifacts/artifact-type-policy';
 import { artifactOutputIdentity } from '../invalidation/invalidation-apply';
 import {
   FINAL_EXAM_QUESTION_RANGE,
@@ -1004,8 +1005,11 @@ export class SchedulerService {
     const ids = [...new Set((output?.artifactIds ?? []).map(String))];
     if (ids.length === 0) return { ok: false, reason: 'no_artifacts' };
     if (ids.some((id) => !UUID_RE.test(id))) return { ok: false, reason: 'invalid_artifact_id' };
-    const rawSummary = output?.summary ?? {};
-    if (!isPlainObject(rawSummary)) return { ok: false, reason: 'invalid_summary' };
+    const summaryIn = output?.summary ?? {};
+    if (!isPlainObject(summaryIn)) return { ok: false, reason: 'invalid_summary' };
+    // r58 (AU1 R2): `llmMode` lo decide el servidor (abajo, con la metadata de los artifacts); lo que declara el
+    // ejecutor solo cuenta como una declaración más (puede degradar la procedencia, nunca subirla a real).
+    const { llmMode: claimedLlmMode, ...rawSummary } = summaryIn as Record<string, any>;
     // m-11: el ejecutor del navegador (ownerId presente) nunca fija claves del servidor.
     let summary: Record<string, any> = rawSummary;
     if (ownerId !== undefined) {
@@ -1071,6 +1075,18 @@ export class SchedulerService {
         throw err;
       }
       if (linked.length !== ids.length) throw new GuardRejection('artifacts_not_linkable');
+
+      // r58 (AU1 R2): procedencia del texto de IA del item = la peor de lo declarado (resumen + metadata.llmMode
+      // de cada artifact vinculado). Solo se escribe si NO es real (mock | replay): un item real queda con el
+      // output_summary de siempre. Un valor desconocido → rechazo (nunca se lo trata como real).
+      const llmRows: Array<{ llm_mode: string | null }> = await qr.query(
+        `select metadata->>'llmMode' as llm_mode from public.artifacts where id = any($1::uuid[])`,
+        [ids],
+      );
+      const llm = combineLlmModes([claimedLlmMode, ...(Array.isArray(llmRows) ? llmRows : []).map((r) => r?.llm_mode)]);
+      if (llm.ok === false) throw new GuardRejection(LLM_MODE_INVALID);
+      if (isNonRealLlmMode(llm.mode)) merged.merged.llmMode = llm.mode;
+      else delete (merged.merged as Record<string, unknown>).llmMode;
 
       // M1 (review-rv2): en rulesVersion 2 un item solo se completa con TODOS
       // sus roles obligatorios (misma tabla que el resolver de empaquetado:
