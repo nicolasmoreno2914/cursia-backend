@@ -30,11 +30,22 @@ const C8 = L.uuid('c', 8);
 const lm = L.lockAndManifest(dist, L.STRUCTURE, prof({ framework: 'gagne_9_eventos' }), 2);
 const expItem = lm.manifest.items.find((i) => i.type === 'experience' && i.chapterId === L.uuid('c', 1));
 const out = {
-  _generated: 'Salidas REALES del backend (plan de aprendizaje T2 r57) para test-68-learning-plan.mjs. Regenerar con scripts/learning-plan-export-fe-fixtures.js.',
+  _generated: 'Salidas REALES del backend (plan de aprendizaje T2 r57 + composición T3 r57) para test-68-learning-plan.mjs. Regenerar con scripts/learning-plan-export-fe-fixtures.js.',
   catalog: svc.PedagogyService.prototype.catalog.call({}),
   dryRunTdp: Object.assign(slim(P.runPedagogyDryRun({ structure: L.STRUCTURE, profile: prof({ framework: 'teoria_demostracion_practica' }) })), { profileSource: 'request', savedProfileVersion: 0 }),
   dryRunTdpOverride: Object.assign(slim(P.runPedagogyDryRun({ structure: L.STRUCTURE, profile: prof({ framework: 'teoria_demostracion_practica', chapterOverrides: { [C8]: { learningType: 'conceptual' } } }) })), { profileSource: 'request', savedProfileVersion: 0 }),
   overrideChapterId: C8,
+  // T3 (r57): composición por necesidad (videos por tipo de aprendizaje) con horas objetivo: el diseño recomendado
+  // trae la decisión de video por capítulo.
+  dryRunTdpComposition: Object.assign((() => {
+    const r = P.runPedagogyDryRun({ structure: L.STRUCTURE, profile: { ...prof({ framework: 'teoria_demostracion_practica', composition: { videos: 'by_need', maxVideos: 4 } }), targetHours: 20 } });
+    const d = r.distribution;
+    const out = slim(r);
+    // La propuesta completa (la tarjeta de horas la usa); sin el detalle del modelo de tiempo por capítulo.
+    out.distribution = JSON.parse(JSON.stringify(d));
+    delete out.distribution.studyTime;
+    return out;
+  })(), { profileSource: 'request', savedProfileVersion: 0 }),
   experienceBriefGagne: P.buildItemPedagogyBrief({ item: expItem, snapshot: lm.snapshot, activityTypeRules: 2 }),
 };
 fs.mkdirSync(outDir, { recursive: true });

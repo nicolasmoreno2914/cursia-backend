@@ -1,5 +1,6 @@
 import { sha256Canonical } from '../coherence/canonical-json';
 import { TARGET_HOURS_MAX, TARGET_HOURS_MIN, isValidTargetHours } from '../study-time/target-hours';
+import { PracticeMixSpec, normalizePracticeMixSpec, practiceMixSpecErrors } from '../study-time/practice-mix';
 import { PedagogicalApproachRegistry } from './approach-registry';
 import { defaultApproachRegistry } from './builtin-approaches';
 import { InstructionalFrameworkRegistry, defaultFrameworkRegistry } from './instructional-frameworks';
@@ -97,11 +98,30 @@ export interface LearningPlanConfig {
   moduleFrameworks?: Record<string, string>;
   /** Por capítulo (id → tipo de aprendizaje fijado por el docente y/o marco propio). */
   chapterOverrides?: Record<string, { learningType?: LearningType; framework?: string }>;
+  /**
+   * T3 (r57) · Composición por necesidad (opt-in; ausente = composición de siempre, byte a byte):
+   *   - videos 'by_need': el video de cada capítulo de contenido sale de su tipo de aprendizaje, las horas y las
+   *     restricciones (study-time/video-composition.ts), con motivo por capítulo;
+   *   - minVideos / maxVideos: restricción explícita del curso (solo con videos 'by_need');
+   *   - practiceMix: cuántos capítulos de práctica por módulo / en el curso (study-time/practice-mix.ts).
+   */
+  composition?: LearningPlanComposition;
 }
+
+/** T3 (r57): composición por necesidad del plan de aprendizaje. */
+export interface LearningPlanComposition {
+  videos?: 'by_need';
+  minVideos?: number;
+  maxVideos?: number;
+  practiceMix?: PracticeMixSpec;
+}
+export const COMPOSITION_VIDEO_MODES = ['by_need'] as const;
+const COMPOSITION_KEYS = ['videos', 'minVideos', 'maxVideos', 'practiceMix'];
+const COMPOSITION_MAX_VIDEOS = 500;
 
 /** Máximo de entradas por mapa del plan (módulos o capítulos). */
 export const LEARNING_PLAN_MAX_ENTRIES = 300;
-const LEARNING_PLAN_KEYS = ['framework', 'phaseLabels', 'moduleFrameworks', 'chapterOverrides'];
+const LEARNING_PLAN_KEYS = ['framework', 'phaseLabels', 'moduleFrameworks', 'chapterOverrides', 'composition'];
 const ENTITY_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
 
 function checkLearningPlan(v: unknown, p: Record<string, unknown>, errors: PedagogyValidationError[], frameworks: InstructionalFrameworkRegistry): void {
@@ -138,6 +158,33 @@ function checkLearningPlan(v: unknown, p: Record<string, unknown>, errors: Pedag
     }
     if (val.framework !== undefined) fw(val.framework, `${at}.framework`);
   });
+  if (v.composition !== undefined) checkComposition(v.composition, err);
+}
+
+/** T3 (r57): validación de `learningPlan.composition` (falla fuerte: nunca se «arregla» en silencio). */
+function checkComposition(c: unknown, err: (path: string, code: string, message: string) => void): void {
+  const at = 'learningPlan.composition';
+  if (!isPlainObject(c)) { err(at, 'INVALID_TYPE', `${at} debe ser un objeto`); return; }
+  for (const k of Object.keys(c)) if (!COMPOSITION_KEYS.includes(k)) err(`${at}.${k}`, 'UNKNOWN_FIELD', `Campo desconocido "${at}.${k}"`);
+  if (c.videos !== undefined && !isOneOf(COMPOSITION_VIDEO_MODES, c.videos)) err(`${at}.videos`, 'INVALID_OPTION', `videos inválido ${JSON.stringify(c.videos)} (permitido: by_need)`);
+  const count = (k: 'minVideos' | 'maxVideos') => {
+    if (c[k] === undefined) return;
+    if (typeof c[k] !== 'number' || !Number.isInteger(c[k]) || (c[k] as number) < 0 || (c[k] as number) > COMPOSITION_MAX_VIDEOS) err(`${at}.${k}`, 'INVALID_NUMBER', `${k} debe ser un entero entre 0 y ${COMPOSITION_MAX_VIDEOS}`);
+    else if (c.videos !== 'by_need') err(`${at}.${k}`, 'COMPOSITION_REQUIRES_BY_NEED', `${k} solo aplica con videos «by_need»`);
+  };
+  count('minVideos');
+  count('maxVideos');
+  if (typeof c.minVideos === 'number' && typeof c.maxVideos === 'number' && c.minVideos > c.maxVideos) err(at, 'COMPOSITION_MIN_ABOVE_MAX', `minVideos (${c.minVideos}) mayor que maxVideos (${c.maxVideos})`);
+  if (c.practiceMix !== undefined) for (const m of practiceMixSpecErrors(c.practiceMix)) err(`${at}.practiceMix`, 'PRACTICE_MIX_INVALID', m);
+}
+
+function normalizeComposition(c: LearningPlanComposition): LearningPlanComposition | null {
+  const out: LearningPlanComposition = {};
+  if (c.videos !== undefined) out.videos = c.videos;
+  if (c.minVideos !== undefined) out.minVideos = c.minVideos;
+  if (c.maxVideos !== undefined) out.maxVideos = c.maxVideos;
+  if (c.practiceMix !== undefined) out.practiceMix = normalizePracticeMixSpec(c.practiceMix);
+  return Object.keys(out).length ? out : null;
 }
 
 /** Plan normalizado: claves en orden fijo, mapas ordenados por id, entradas vacías fuera. */
@@ -160,6 +207,8 @@ function normalizeLearningPlan(v: LearningPlanConfig): LearningPlanConfig {
     if (Object.keys(n).length) entries[k] = n;
   }
   if (Object.keys(entries).length) out.chapterOverrides = entries;
+  const comp = v.composition ? normalizeComposition(v.composition) : null;
+  if (comp) out.composition = comp;
   return out;
 }
 

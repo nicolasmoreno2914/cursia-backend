@@ -47,6 +47,7 @@ import { LearningType, PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 import { ChapterLearningTypeDesign, LEARNING_TYPE_LABELS, classifyLearningType, learningTypeJustification } from './learning-type';
 import { defaultFrameworkRegistry, frameworkSlotLabels } from './instructional-frameworks';
 import { profileLearningPlan } from './pedagogy-profile';
+import { PracticeMixEvaluation, evaluatePracticeMix } from '../study-time/practice-mix';
 
 /**
  * Motor pedagógico V1 — DRY RUN.
@@ -215,7 +216,12 @@ export interface DryRunResult {
    * Motor de carga horaria (Loop 3): diseño propuesto por el distribuidor para alcanzar targetHours (null sin
    * objetivo). Solo propuesta: no cambia el Blueprint ni el Manifest de este dry-run.
    */
-  distribution: (DistributionResult & { materialized: DistributionMaterialized; proposalSha256: string }) | null;
+  distribution: (DistributionResult & {
+    materialized: DistributionMaterialized;
+    proposalSha256: string;
+    /** T3 (r57): mezcla de práctica del plan de aprendizaje (solo si está configurada). */
+    practiceMix?: Pick<PracticeMixEvaluation, 'status' | 'ruleId' | 'plan' | 'fit' | 'notes'>;
+  }) | null;
   /**
    * Fase 4 · Coherence Engine (capa A): alineación resultado → evidencia del diseño que se ve (con diseño pedagógico si
    * hay perfil). La clave existe SOLO si el Blueprint trae contexto académico (los dry-runs de siempre no cambian).
@@ -768,7 +774,13 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       // NUNCA sobre la vista con los cambios de estructura sugeridos (videos/actividades/repaso): esos no los escribe
       // «Aplicar diseño» (los decide el docente en el editor), y contarlos haría que lo mostrado ≠ lo aplicado.
       const lockShaped = rules ? applyPedagogyToSnapshot(base, rules) : base;
-      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements: input.requirementConstraints ?? null });
+      // T3 (r57): mezcla de práctica del plan de aprendizaje → restricciones del distribuidor (el documento manda).
+      const mixSpec = rules?.learningPlan?.composition?.practiceMix;
+      const mix = mixSpec
+        ? evaluatePracticeMix(mixSpec, [...lockShaped.modules].sort((a, b) => a.position - b.position), input.requirementConstraints ?? null)
+        : null;
+      const requirements = mix ? mix.constraints : input.requirementConstraints ?? null;
+      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements });
       const materialized = materializeOrError(lockShaped, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
         return {
@@ -785,7 +797,8 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
         };
       }, appContext);
       // Fase 2 · «Aplicar diseño»: huella de la propuesta que ve el docente (el servidor la recalcula al aplicar).
-      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist) };
+      const mixView = mix ? { practiceMix: { status: mix.status, ruleId: mix.ruleId, plan: mix.plan, fit: mix.fit, notes: [...mix.notes] } } : {};
+      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist), ...mixView };
     })(),
     workload: targetHours === null
       ? null

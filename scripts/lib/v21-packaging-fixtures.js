@@ -76,7 +76,10 @@ function packagingInput(distRoot, o = {}) {
     // EV6 H5P v2: ajuste «Repaso» del Blueprint.
     ...(o.reviewCards ? { reviewCards: true } : {}),
   };
-  const { snapshot, manifest } = o.modules
+  // T3 (r57): `o.snapshot` + `o.manifest` → empaquetar un curso armado afuera (p. ej. distribuidor → Manifest materializado).
+  const { snapshot, manifest } = o.snapshot && o.manifest
+    ? { snapshot: o.snapshot, manifest: o.manifest }
+    : o.modules
     ? SF.buildCourse(distRoot, { engine, finalExam, courseId: o.courseId || 601, modules: o.modules, ...(o.chapterTitles ? { chapterTitles: o.chapterTitles } : {}), ...ev5c })
     : SF.course2(distRoot, { engine, finalExam, courseId: o.courseId || 601, ...ev5c });
   const itemByKey = new Map(manifest.items.map((i) => [i.key, i]));

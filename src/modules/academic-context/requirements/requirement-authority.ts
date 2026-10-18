@@ -77,6 +77,11 @@ export interface DistributorRequirementConstraints {
   practicePerModule?: { min?: number; max?: number };
   /** LOOP 9.2 (review I11): «N capítulos de práctica» en todo el curso. */
   practiceTotal?: { min?: number; max?: number };
+  /**
+   * T3 (r57): capítulos de práctica EXACTOS por módulo (índice = orden del módulo). Solo la mezcla de práctica del plan
+   * de aprendizaje (study-time/practice-mix.ts); el documento nunca la produce. Ausente = lo de siempre.
+   */
+  practiceByModule?: number[];
   /** LOOP 9.2: las Actividades de Aplicación van en el capítulo de práctica («1 por módulo, en la práctica»). */
   applicationInPractice?: boolean;
   /** LOOP 9.2: total de actividades interactivas del curso («exactamente 4 actividades interactivas H5P»). */
