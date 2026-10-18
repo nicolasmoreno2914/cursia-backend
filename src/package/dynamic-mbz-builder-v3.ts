@@ -402,6 +402,12 @@ export interface MbzV3Expectations {
    * Solo presente si hay alguno.
    */
   internalVocabularyUserTexts?: string[];
+  /**
+   * Review r2 (I3): fragmentos GENERADOS que quedaron sin reparar porque la reparación pasaba el límite de largo del
+   * campo (aviso `internal_vocabulary_kept_length_limit`). Se exentan por fragmento (no la regla en todo el curso).
+   * Solo presente si hay alguno.
+   */
+  internalVocabularyKeptTexts?: string[];
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -883,11 +889,17 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
 }
 
 /** Claves de identificadores (nunca texto de una persona) al recolectar los textos escritos por el usuario. */
-const USER_TEXT_SKIP_KEYS = new Set(['id', 'type', 'kind', 'variant', 'engine', 'activityEngine', 'structureVersion', 'storagePath', 'sha256', 'mimetype', 'mimeType', 'artifactId', 'origin', 'relation', 'filename', 'chapterId', 'moduleId', 'source']);
+const USER_TEXT_SKIP_KEYS = new Set(['id', 'type', 'kind', 'variant', 'engine', 'activityEngine', 'structureVersion', 'storagePath', 'sha256', 'mimetype', 'mimeType', 'artifactId', 'origin', 'relation', 'chapterId', 'moduleId', 'source']);
 const USER_TEXT_TITLE_KEYS = new Set(['title', 'name', 'label']);
+/** Review r2 (I2): nombre de un archivo que subió o nombró el usuario («worked_example.xlsx»): siempre es suyo. */
+const USER_FILENAME_KEYS = new Set(['filename']);
 
 function collectUserStrings(v: unknown, key: string | null, out: string[]): void {
   if (typeof v === 'string') {
+    if (key !== null && USER_FILENAME_KEYS.has(key)) {
+      if (v.trim()) out.push(v);
+      return;
+    }
     if (key !== null && USER_TEXT_SKIP_KEYS.has(key)) return;
     if (/\s/.test(v.trim()) || (key !== null && USER_TEXT_TITLE_KEYS.has(key))) out.push(v);
     return;
@@ -899,14 +911,41 @@ function collectUserStrings(v: unknown, key: string | null, out: string[]): void
 }
 
 /**
- * Review r1 (I2): textos que escribió una PERSONA y que el paquete muestra: títulos y textos del Blueprint (curso,
- * módulos, capítulos, contexto académico/pedagógico del perfil), el perfil de evaluación (archivos de práctica: título
- * e instrucciones; textos de la Tarea), las referencias importadas del documento de la institución y el nombre de la
- * institución. Solo devuelve los fragmentos con un término interno (si no hay ninguno, nada cambia).
+ * Review r2 (M-a, procedencia): del Blueprint solo cuenta como texto de una PERSONA lo que el docente escribe o edita en
+ * el paso de estructura (el título del curso; título, objetivo y descripción de cada módulo y capítulo — una estructura
+ * sugerida se revisa y edita ahí antes de congelarse) y el perfil del estudiante y sus resultados escritos en el perfil
+ * pedagógico (`course.applicationContext`). NO cuenta lo que propone un modelo o una regla y queda guardado en el
+ * Blueprint: `course.academicContext` (resultados/competencias: el snapshot no guarda su origen por dato y pueden ser
+ * propuestos por IA — PROPOSAL_BASIS — así que se tratan como texto generado: se reparan y se juzgan) ni `pedagogy` /
+ * `design` (motor de reglas). Lo que viene del documento importado de la institución entra por `libroReferences`.
+ */
+function blueprintUserStrings(bp: BlueprintSnapshotV2 | null | undefined, out: string[]): void {
+  if (!bp || typeof bp !== 'object') return;
+  const push = (t: unknown) => { if (typeof t === 'string' && t.trim()) out.push(t); };
+  push(bp.course?.title);
+  collectUserStrings(bp.course?.applicationContext ?? null, null, out);
+  for (const m of Array.isArray(bp.modules) ? bp.modules : []) {
+    push(m.title);
+    push(m.objective);
+    push(m.description);
+    for (const ch of Array.isArray(m.chapters) ? m.chapters : []) {
+      push(ch.title);
+      push(ch.objective);
+      push(ch.description);
+    }
+  }
+}
+
+/**
+ * Review r1 (I2) + r2: textos que escribió, editó o subió una PERSONA y que el paquete muestra: del Blueprint lo que
+ * edita el docente (ver `blueprintUserStrings`), el perfil de evaluación completo (lo configura el docente: archivos de
+ * práctica con su título, instrucciones y NOMBRE DE ARCHIVO; textos de la Tarea), las referencias importadas del
+ * documento de la institución y el nombre de la institución. Solo devuelve los fragmentos con un término interno (si
+ * no hay ninguno, nada cambia), ya en la vista normalizada (`plainTextView`).
  */
 export function userProvidedVocabularyTexts(input: Pick<BuildDynamicMbzV3Input, 'blueprint' | 'assessmentProfile' | 'libroReferences' | 'libroBrand'>, exempt: readonly string[]): string[] {
   const all: string[] = [];
-  collectUserStrings(input.blueprint, null, all);
+  blueprintUserStrings(input.blueprint, all);
   collectUserStrings(input.assessmentProfile, null, all);
   for (const r of input.libroReferences ?? []) if (typeof r === 'string') all.push(r);
   if (typeof input.libroBrand?.name === 'string') all.push(input.libroBrand.name);
@@ -923,11 +962,12 @@ export function userProvidedVocabularyTexts(input: Pick<BuildDynamicMbzV3Input, 
 export function repairContentsInternalVocabulary(
   contents: DynamicPackageContentsV3,
   opts: { protectedTexts?: readonly string[]; noGrowth?: boolean } = {},
-): { contents: DynamicPackageContentsV3; exempt: string[]; warnings: string[]; fixed: number } {
+): { contents: DynamicPackageContentsV3; exempt: string[]; keptTexts: string[]; warnings: string[]; fixed: number } {
   const exempt = internalVocabularyExemptions(contents.contentMd ? contents.contentMd.values() : []);
   const counts = new Map<string, number>();
   const shortCounts = new Map<string, number>();
   const keptCounts = new Map<string, number>();
+  const keptTexts: string[] = [];
   const bump = (m: Map<string, number>, ids: string[]) => { for (const f of ids) m.set(f, (m.get(f) ?? 0) + 1); };
   const fix = <T>(v: T): T => {
     if (v === undefined || v === null) return v;
@@ -935,6 +975,7 @@ export function repairContentsInternalVocabulary(
     bump(counts, r.fixes);
     bump(shortCounts, r.shortened);
     bump(keptCounts, r.kept);
+    keptTexts.push(...r.keptTexts);
     return r.value;
   };
   const fixMap = <T>(m: Map<string, T> | undefined): Map<string, T> | undefined => (m ? new Map(Array.from(m, ([k, v]) => [k, fix(v)])) : m);
@@ -958,11 +999,11 @@ export function repairContentsInternalVocabulary(
     ...Array.from(shortCounts, ([rule, n]) => `internal_vocabulary_short_label:${rule}:${n}`),
     ...Array.from(keptCounts, ([rule, n]) => `internal_vocabulary_kept_length_limit:${rule}:${n}`),
   ].sort();
-  // I3: un término que no se pudo reparar sin pasar el límite del campo queda visible con aviso: su regla no bloquea.
-  const keptRules = [...keptCounts.keys()].filter((r) => !exempt.includes(r));
+  // I3 (review r2): un término que no se pudo reparar sin pasar el límite del campo queda visible con aviso; se exenta
+  // SOLO ese fragmento (`keptTexts` → expectations.internalVocabularyKeptTexts), nunca la regla en todo el curso.
   let fixed = 0;
   for (const n of counts.values()) fixed += n;
-  return { contents: out, exempt: [...exempt, ...keptRules], warnings, fixed };
+  return { contents: out, exempt, keptTexts: protectedVocabularyTexts(keptTexts, exempt), warnings, fixed };
 }
 
 /** Review r1 (I3): error de largo de un esquema (caracteres o palabras) al validar el contenido ya reparado. */
@@ -2081,7 +2122,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}) },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,

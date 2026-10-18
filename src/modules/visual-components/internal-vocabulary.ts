@@ -24,7 +24,17 @@
  *  - I3: `repairInternalVocabularyDeep(…, { noGrowth: true })` nunca alarga un texto (caracteres ni palabras): prueba
  *    el rótulo completo, después el corto (`shortLabel`) y, si los dos alargan, deja el original y lo informa
  *    (`kept`). El builder lo usa solo si la reparación completa empujó un campo más allá de su límite.
+ *
+ * Review r2:
+ *  - I2: los fragmentos protegidos y el texto visible se comparan sobre la MISMA vista normalizada (`plainTextView`:
+ *    sin `**`/`*`, sin invisibles ni guiones suaves, espacios colapsados), así un `**texto fuente**` de las
+ *    instrucciones coincide con el `<strong>` renderizado. Un nombre de actividad recortado con «…»
+ *    (`safeActivityName`) también reconoce el comienzo del fragmento protegido (`truncatedTail`).
+ *  - I3: lo que quedó sin reparar por el límite de largo (`keptTexts`) se protege por FRAGMENTO, no por regla para
+ *    todo el curso: la misma regla en otro texto generado sigue bloqueando.
  */
+
+import { plainTextView } from './text';
 
 type Gender = 'm' | 'f';
 type Num = 's' | 'p';
@@ -177,7 +187,7 @@ export function protectedVocabularyTexts(texts: Iterable<unknown>, exempt: reado
   for (const t of texts) {
     if (typeof t !== 'string') continue;
     for (const line of t.split(/\r?\n/)) {
-      const frag = line.replace(/\s+/g, ' ').trim();
+      const frag = plainTextView(line);
       if (frag.length >= 3 && lintInternalVocabulary(frag, exempt).length) out.add(frag);
     }
   }
@@ -190,10 +200,41 @@ function protectedRe(protectedTexts: readonly string[]): RegExp | null {
   return new RegExp(`(${esc.join('|')})`, 'gi');
 }
 
-/** Review r1 (I2): quita del texto visible los fragmentos escritos por una persona (no se juzgan). */
-export function stripProtectedVocabularyTexts(text: string, protectedTexts: readonly string[] = []): string {
-  const re = protectedRe(protectedTexts);
-  return re ? String(text ?? '').replace(re, ' ') : String(text ?? '');
+/** Mínimo de caracteres del comienzo de un fragmento protegido para reconocerlo al final de un nombre recortado. */
+const TRUNCATED_PREFIX_MIN = 12;
+
+/**
+ * Review r2 (I2): un nombre recortado por `safeActivityName` («… · Capítulo 2: Worked example de vent…») termina con el
+ * COMIENZO de un fragmento protegido; se quita ese comienzo (mismo recorte de separadores finales que el builder).
+ */
+function stripTruncatedProtectedTail(view: string, protectedTexts: readonly string[]): string {
+  if (!view.endsWith('…')) return view;
+  let stem = view.slice(0, -1);
+  const low = stem.toLowerCase();
+  let best = 0;
+  for (const f of protectedTexts) {
+    for (let k = Math.min(f.length, stem.length); k >= TRUNCATED_PREFIX_MIN; k--) {
+      const pre = f.slice(0, k).replace(/[\s—\-:,]+$/, '');
+      if (pre.length >= TRUNCATED_PREFIX_MIN && low.endsWith(pre.toLowerCase())) {
+        best = Math.max(best, pre.length);
+        break;
+      }
+    }
+  }
+  if (best) stem = stem.slice(0, stem.length - best);
+  return `${stem} …`;
+}
+
+/**
+ * Review r1 (I2) + r2: quita del texto visible los fragmentos escritos por una persona (no se juzgan). Los dos lados
+ * se comparan sobre `plainTextView`; `truncatedTail` = el texto es un nombre que pudo recortarse con «…».
+ */
+export function stripProtectedVocabularyTexts(text: string, protectedTexts: readonly string[] = [], opts: { truncatedTail?: boolean } = {}): string {
+  const prot = protectedTexts.map((t) => plainTextView(t)).filter((t) => t.length >= 3);
+  let view = plainTextView(String(text ?? ''));
+  if (opts.truncatedTail) view = stripTruncatedProtectedTail(view, prot);
+  const re = protectedRe(prot);
+  return re ? view.replace(re, ' ') : view;
 }
 
 /** Repara solo los tramos que NO son texto protegido (escrito por una persona). */
@@ -228,10 +269,11 @@ export function repairInternalVocabularyDeep<T>(
   value: T,
   exempt: readonly string[] = [],
   opts: { protectedTexts?: readonly string[]; noGrowth?: boolean } = {},
-): { value: T; fixes: string[]; shortened: string[]; kept: string[] } {
+): { value: T; fixes: string[]; shortened: string[]; kept: string[]; keptTexts: string[] } {
   const fixes: string[] = [];
   const shortened: string[] = [];
   const kept: string[] = [];
+  const keptTexts: string[] = [];
   const re = protectedRe(opts.protectedTexts ?? []);
   const fits = (orig: string, next: string): boolean => {
     const a = measure(orig);
@@ -254,6 +296,7 @@ export function repairInternalVocabularyDeep<T>(
         return sh.text;
       }
       kept.push(...r.fixes);
+      keptTexts.push(v);
       return v;
     }
     if (Array.isArray(v)) return v.map((x) => walk(x, key));
@@ -264,5 +307,5 @@ export function repairInternalVocabularyDeep<T>(
     }
     return v;
   };
-  return { value: walk(value, null) as T, fixes, shortened, kept };
+  return { value: walk(value, null) as T, fixes, shortened, kept, keptTexts };
 }

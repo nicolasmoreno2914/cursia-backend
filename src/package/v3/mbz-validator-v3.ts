@@ -121,6 +121,8 @@ export interface MbzV3ValidationExpectations {
   internalVocabularyExempt?: string[];
   /** Review r1 (I2): fragmentos escritos por una persona (títulos, archivos de práctica, perfil): nunca se juzgan. */
   internalVocabularyUserTexts?: string[];
+  /** Review r2 (I3): fragmentos generados que quedaron sin reparar por el límite de largo (exentos solo ellos). */
+  internalVocabularyKeptTexts?: string[];
 }
 
 /** true si `v` (x.y.z) ≥ `min`. Una versión ausente o mal formada → false. */
@@ -1152,9 +1154,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     for (const a of acts) {
       if (!['label', 'page', 'resource', 'h5pactivity', 'quiz', 'forum', 'assign'].includes(a.modname)) continue;
       const body = a.modname === 'page' ? unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '') : '';
-      // Review r1 (I2): solo el texto GENERADO se juzga: lo que escribió una persona se quita antes.
-      const visible = `${a.name}\n${extractText(a.intro)}\n${body ? extractText(body) : ''}`;
-      const hits = lintInternalVocabulary(stripProtectedVocabularyTexts(visible, exp.internalVocabularyUserTexts ?? []), exp.internalVocabularyExempt);
+      // Review r1 (I2): solo el texto GENERADO se juzga: lo que escribió una persona se quita antes. Review r2: los dos
+      // lados en la misma vista normalizada (sin `**`, invisibles, guiones suaves); el nombre puede venir recortado con
+      // «…»; y lo que quedó sin reparar por el límite de largo se exenta por fragmento (I3).
+      const prot = [...(exp.internalVocabularyUserTexts ?? []), ...(exp.internalVocabularyKeptTexts ?? [])];
+      const visible = [
+        stripProtectedVocabularyTexts(a.name, prot, { truncatedTail: true }),
+        stripProtectedVocabularyTexts(extractText(a.intro), prot),
+        body ? stripProtectedVocabularyTexts(extractText(body), prot) : '',
+      ].join('\n');
+      const hits = lintInternalVocabulary(visible, exp.internalVocabularyExempt);
       if (hits.length) add('INTERNAL_VOCABULARY', a.idnumber, `texto interno del generador visible: ${[...new Set(hits.map((h) => `«${h.match}»`))].slice(0, 5).join(', ')}`);
     }
   }

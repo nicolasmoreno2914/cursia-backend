@@ -10,7 +10,14 @@ import { xmlEsc } from '../mbz-common';
 
 /** Mismo criterio que el validador (TOKEN_INVALID «enlace muerto»). */
 const DEAD_HREF_RE = /\bhref\s*=\s*(["'])\s*(#?|javascript:[^"']*)\s*\1/i;
-const ANCHOR_RE = /<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi;
+/**
+ * Review r2 (M9): etiqueta de apertura tokenizada por atributos — un valor entre comillas puede traer `>`
+ * (`title="a > b"`) sin cortar la etiqueta. Las alternativas empiezan con caracteres disjuntos (sin comillas ni `>` /
+ * `"` / `'`), así que el regex es lineal (sin retroceso catastrófico). Una comilla sin cerrar no forma etiqueta: el
+ * enlace queda como está (nunca se inventa HTML). Se usa un tokenizador y no `parseHtml` porque el resto del HTML
+ * debe quedar byte a byte igual (parsear y re-serializar lo normalizaría).
+ */
+const ANCHOR_RE = /<a\b((?:[^>"']|"[^"]*"|'[^']*')*)>([\s\S]*?)<\/a\s*>/gi;
 
 /** Quita los `<a>` con destino muerto y deja su contenido (texto). */
 export function unwrapDeadAnchorsHtml(html: string): { html: string; count: number } {

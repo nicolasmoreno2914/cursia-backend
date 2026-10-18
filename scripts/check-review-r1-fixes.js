@@ -18,6 +18,15 @@
 //   M3  artifact de archivo de trabajo borrado → PRACTICE_FILE_MISSING (clase D package_precheck, igual que INVALID)
 //   G   Tarea formativa sin ítem de nota; calificada con categoría aggregateonlygraded=0 (nota vacía = 0 hasta calificar)
 //
+// Review r2 (re-revisión):
+//   I1  hash GOLDEN del builder 3.14.0 REAL (origin/staging d718673, armado en un worktree temporal) para la misma
+//       entrada: el paquete de staging se reconoce vigente (no es la misma función calculando los dos lados)
+//   I2  nombres de archivo del usuario («worked_example.xlsx», «(Texto fuente caso.docx)») e instrucciones con **…**
+//       → paquete OK; una fuga GENERADA en el mismo curso se repara y, inyectada, se rechaza; nombre recortado «…»
+//   M-a procedencia: resultados del contexto académico (pueden ser propuestos por IA) NO son texto protegido
+//   I3  lo que quedó sin reparar por largo se exenta por FRAGMENTO: la misma regla en otro label sigue fallando
+//   M9  `>` dentro de un valor de atributo no corta la etiqueta del enlace
+//
 // Uso: npm run build && node scripts/check-review-r1-fixes.js [dist]
 'use strict';
 require('reflect-metadata');
@@ -125,6 +134,23 @@ const withEnv = async (k, v, fn) => {
     eq(PKG.legacyReuseHashesV3({ ...k, libroReferencesSha256: undefined }, '3.14.0').length, 1, 'sin referencias: una');
   });
 
+  await check('I1 (r2) GOLDEN: la clave que guardó el builder 3.14.0 REAL de origin/staging para esta misma entrada → vigente (stale:false) con builderUpdateAvailable; una clave alterada → stale', async () => {
+    const golden = require('./fixtures/review-r2/golden-reuse-key-3.14.0.json');
+    eq(golden.builderVersion, '3.14.0', 'golden de 3.14.0');
+    assert(/^[0-9a-f]{64}$/.test(golden.sourceIdsHash), 'hash golden');
+    const q = fakeQ(rowsOf());
+    const prep = await PKG.prepareV3Package(q, 'r', M3, 641, '4.1');
+    eq([...prep.sourceArtifactIds].sort(), golden.sourceArtifactIds, 'misma entrada (mismos artifacts) que la usada para el golden');
+    assert(prep.sourceIdsHash !== golden.sourceIdsHash, 'la clave actual (3.15.x) es otra: el caso es real');
+    const job = (h) => ({ id: 'j', worker_status: 'completed', input_payload: {}, output_summary: { artifactId: 'a', builderVersion: golden.builderVersion, sourceIdsHash: h, sourceArtifactIds: prep.sourceArtifactIds } });
+    await withEnv('DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP', undefined, async () => {
+      eq(await PFR.buildPackageFreshness(q, run, M3, job(golden.sourceIdsHash)), { stale: false, builderUpdateAvailable: { packagedWith: '3.14.0', current: CUR3 } }, 'paquete real de 3.14.0');
+      const bad = golden.sourceIdsHash.replace(/^./, (c) => (c === '0' ? '1' : '0'));
+      const f = await PFR.buildPackageFreshness(q, run, M3, job(bad));
+      assert(f.stale === true, `clave alterada: ${JSON.stringify(f)}`);
+    });
+  });
+
   await check('I1 v2: builder anterior + opt-in apagado + mismos artifacts → vigente con builderUpdateAvailable; opt-in → builder_changed', async () => {
     const CUR2 = L('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION;
     const RES = L('modules/dynamic-packaging/artifact-resolver.js');
@@ -185,6 +211,21 @@ const withEnv = async (k, v, fn) => {
     const on = { ...JSON.parse(JSON.stringify(base)), teacherGuide: { include: true } };
     assert(P.profileSha256(P.normalizeAssessmentProfile(on)) !== P.profileSha256(P.normalizeAssessmentProfile(base)), 'encendida cambia el sha');
   });
+
+  // Inyecta texto en un label GENERADO (puente/reflexión) del paquete: simula una fuga que la reparación no vio.
+  const injectIntoGeneratedLabel = async (mbz, txt) => {
+    const z = await JSZip.loadAsync(mbz);
+    const OPEN = '&lt;span class=&quot;nolink&quot;&gt;';
+    for (const p of Object.keys(z.files).filter((x) => /activities\/label_\d+\/label\.xml$/.test(x))) {
+      const x = await z.file(p).async('string');
+      if (/cvc-bridge|Para reflexionar/.test(x) && x.includes(OPEN)) {
+        const i = x.indexOf(OPEN) + OPEN.length;
+        z.file(p, x.slice(0, i) + txt + x.slice(i));
+        return z.generateAsync({ type: 'nodebuffer' });
+      }
+    }
+    throw new Error('sin label generado con texto');
+  };
 
   // ════ I2 — texto del usuario no bloquea ═════════════════════════════════
   // Título de capítulo del usuario con un término interno que el Libro NO usa como vocabulario del tema (el Libro del fixture
@@ -253,6 +294,64 @@ const withEnv = async (k, v, fn) => {
     eq(VC.lintInternalVocabulary(VC.stripProtectedVocabularyTexts('Archivo: Worked example ventas', prot)), [], 'strip quita lo del usuario');
   });
 
+  await check('I2 (r2) nombres de archivo del usuario «worked_example.xlsx» y «(Texto fuente caso.docx)» + instrucciones con **texto fuente** y *worked example* → paquete OK y tal cual; una fuga GENERADA en el mismo curso se repara (aviso) y, inyectada, se rechaza', async () => {
+    const input0 = userCourse();
+    const ids = appIdsOf(input0);
+    const prof = DF.deliveryProfile(base, { graded: true, category: 'applications', rubric: true });
+    const { input } = await DF.withPracticeFiles(distRoot, input0, prof, ids);
+    const res = input.assessmentProfile.practiceResources;
+    res[0].source.filename = 'worked_example.xlsx';
+    res[1].source.filename = 'Texto fuente caso.docx';
+    res[1].instructions = 'Lee el **texto fuente** y revisa el *worked example* antes de escribir.\nDespués completa la plantilla.';
+    eq(P.validateAssessmentProfile(input.assessmentProfile, { finalExam: true }), [], 'perfil válido');
+    // Fuga generada en el MISMO curso.
+    const [chId, exp] = Array.from(input.contents.experiences.entries())[1];
+    const e = JSON.parse(JSON.stringify(exp));
+    e.movements.closing.find((c) => c.type === 'reflection').prompt = 'Vuelve al texto fuente y piensa qué harías distinto.';
+    input.contents.experiences.set(chId, e);
+    const built = await B.buildDynamicMbzV3(input);
+    eq(built.expectations.internalVocabularyExempt, [], 'sin exenciones de dominio');
+    const ut = built.expectations.internalVocabularyUserTexts;
+    for (const t of ['worked_example.xlsx', 'Texto fuente caso.docx', 'Lee el texto fuente y revisa el worked example antes de escribir.']) assert(ut.includes(t), `protegido (vista normalizada) ${t}: ${JSON.stringify(ut)}`);
+    assert(built.summary.warnings.includes('internal_vocabulary_repaired:texto_fuente:1'), JSON.stringify(built.summary.warnings));
+    const v = await V.validateMbzV3(built.mbz, built.expectations);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 6)));
+    const z = await JSZip.loadAsync(built.mbz);
+    const all = (await Promise.all(Object.keys(z.files).filter((f) => /^activities\/.+\.xml$/.test(f)).map((f) => z.file(f).async('string')))).map(unxml).join('\n');
+    assert(all.includes('(worked_example.xlsx)') && all.includes('(Texto fuente caso.docx)'), 'los nombres de archivo quedan tal cual en la descripción del recurso');
+    assert(/<strong>[^<]*texto fuente/.test(all) || all.includes('texto fuente</strong>'), 'el **texto fuente** del usuario se renderiza en negrita, sin reparar');
+    assert(!all.includes('Vuelve al texto fuente'), 'la fuga generada se reparó');
+    // Sin la protección r2 (fragmentos crudos, sin nombres de archivo) el mismo .mbz fallaba: el caso es real.
+    const vOld = await V.validateMbzV3(built.mbz, { ...built.expectations, internalVocabularyUserTexts: ['Lee el **texto fuente** y revisa el *worked example* antes de escribir.'] });
+    assert(vOld.issues.some((i) => i.code === 'INTERNAL_VOCABULARY'), 'con la protección de r1 el validador lo rechazaba');
+    // La fuga generada inyectada en un label sigue rechazándose.
+    const v2 = await V.validateMbzV3(await injectIntoGeneratedLabel(built.mbz, 'Según el texto fuente del capítulo. '), built.expectations);
+    assert(v2.issues.some((i) => i.code === 'INTERNAL_VOCABULARY' && /texto fuente/i.test(i.message)), JSON.stringify(v2.issues.slice(0, 4)));
+  });
+
+  await check('I2 (r2) vista normalizada y nombre recortado: **…**, *…*, invisibles y guiones suaves coinciden; «…» al final de un nombre reconoce el comienzo del fragmento; lo generado sigue juzgándose', async () => {
+    const prot = VC.protectedVocabularyTexts(['Lee el **texto fuente** del\u00ADcaso', 'Guía worked example de ventas regionales del trimestre'], []);
+    eq(prot, ['Guía worked example de ventas regionales del trimestre', 'Lee el texto fuente delcaso'], 'fragmentos normalizados');
+    eq(VC.lintInternalVocabulary(VC.stripProtectedVocabularyTexts('Lee el texto fuente del\u00ADcaso. Fin.', prot)), [], 'guion suave en el visible');
+    const name = 'Archivo de trabajo · Capítulo 2: Guía worked example de ventas region…';
+    eq(VC.lintInternalVocabulary(VC.stripProtectedVocabularyTexts(name, prot, { truncatedTail: true })), [], 'nombre recortado');
+    assert(VC.lintInternalVocabulary(VC.stripProtectedVocabularyTexts(name, prot)).length > 0, 'sin truncatedTail no coincide (el caso es real)');
+    assert(VC.lintInternalVocabulary(VC.stripProtectedVocabularyTexts('Revisa el worked example…', prot, { truncatedTail: true })).length > 0, 'un final corto (< 12) que no es del usuario sigue juzgándose');
+    assert(VC.lintInternalVocabulary(VC.stripProtectedVocabularyTexts('Repasa el **texto fuente** hoy.', prot)).length > 0, 'texto generado con el término: se juzga');
+  });
+
+  await check('I2 (r2, M-a procedencia) los resultados/competencias del contexto académico del Blueprint (pueden ser propuestos por IA) NO se protegen: su eco en un texto generado se repara; títulos/objetivos del docente sí se protegen', async () => {
+    const input = userCourse();
+    const bp = JSON.parse(JSON.stringify(input.blueprint));
+    bp.course.academicContext = { version: 1, contextSha256: 'a'.repeat(64), subjectName: 'Ventas', outcomes: [{ id: 'RA1', text: 'Analiza el worked example del texto fuente', level: 'analizar', domain: 'know' }], competencies: [{ id: 'CO1', text: 'Resuelve un case scenario real', level: null }] };
+    bp.course.pedagogy = { principles: ['Usa el worked example como andamiaje'] };
+    bp.modules[0].objective = 'Aplicar el worked example del módulo';
+    const prot = B.userProvidedVocabularyTexts({ blueprint: bp, assessmentProfile: null, libroReferences: null, libroBrand: null }, []);
+    eq(prot, ['Aplicar el worked example del módulo'], 'solo lo editado por el docente');
+    const r = B.repairContentsInternalVocabulary({ ...input.contents, courseIntro: { ...input.contents.courseIntro, competencies: ['Analiza el worked example del texto fuente'] } }, { protectedTexts: prot });
+    assert(!/worked example|texto fuente/i.test(r.contents.courseIntro.competencies[0]), `el eco del resultado propuesto se repara: ${r.contents.courseIntro.competencies[0]}`);
+  });
+
   // ════ I3 — límite de largo ══════════════════════════════════════════════
   await check('I3 noGrowth: nunca alarga (caracteres ni palabras) — rótulo completo si entra, corto si no, original (kept) si tampoco', async () => {
     const r1 = VC.repairInternalVocabularyDeep({ a: 'Haz el self_check ahora.' }, [], { noGrowth: true });
@@ -287,9 +386,13 @@ const withEnv = async (k, v, fn) => {
     input2.contents.courseIntro = ci2;
     const built2 = await B.buildDynamicMbzV3(input2);
     assert(built2.summary.warnings.includes('internal_vocabulary_kept_length_limit:self_check:1'), JSON.stringify(built2.summary.warnings));
-    assert(built2.expectations.internalVocabularyExempt.includes('self_check'), 'regla exenta en el validador');
+    // Review r2 (I3): exento SOLO el fragmento que quedó (no la regla en todo el curso).
+    assert(!built2.expectations.internalVocabularyExempt.includes('self_check'), 'la regla NO queda exenta en todo el curso');
+    assert((built2.expectations.internalVocabularyKeptTexts || []).some((t) => t.startsWith('Volver al self_check de cada capítulo')), JSON.stringify(built2.expectations.internalVocabularyKeptTexts));
     const v2 = await V.validateMbzV3(built2.mbz, built2.expectations);
     assert(v2.ok, JSON.stringify(v2.issues.slice(0, 4)));
+    const v2b = await V.validateMbzV3(await injectIntoGeneratedLabel(built2.mbz, 'Haz el self_check del capítulo. '), built2.expectations);
+    assert(v2b.issues.some((i) => i.code === 'INTERNAL_VOCABULARY' && /self_check/.test(i.message)), `la misma regla en OTRO texto generado sigue fallando: ${JSON.stringify(v2b.issues.slice(0, 4))}`);
     // Un error de largo SIN reparaciones sube igual (no se enmascara).
     const input3 = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
     const ci3 = JSON.parse(JSON.stringify(input3.contents.courseIntro));
@@ -376,6 +479,17 @@ const withEnv = async (k, v, fn) => {
     eq(DEAD.repairDeadAnchorsInActivityXml(xml), { xml: '<label><intro>&lt;p&gt;Abrir &amp;amp; ver&lt;/p&gt;</intro><name>n</name></label>', count: 1 }, 'xml');
     const clean = '<label><intro>&lt;a href=&quot;$@PAGEVIEWBYID*3@$&quot;&gt;x&lt;/a&gt;</intro></label>';
     assert(DEAD.repairDeadAnchorsInActivityXml(clean).xml === clean, 'sin enlaces muertos: idéntico');
+  });
+
+  await check('M9 (r2) `>` dentro de un valor de atributo no corta la etiqueta: se desenvuelve entero (sin restos del atributo); enlaces vivos con `>` en atributos intactos; comilla sin cerrar → sin cambios', async () => {
+    eq(DEAD.unwrapDeadAnchorsHtml('<p>Ver <a title="a > b" href="#" style="color:red">el Libro</a>.</p>'), { html: '<p>Ver el Libro.</p>', count: 1 }, 'title con >');
+    eq(DEAD.unwrapDeadAnchorsHtml("<a data-x='1>2' href=\"javascript:void(0)\">y</a>"), { html: 'y', count: 1 }, 'comilla simple con >');
+    const live = '<a title="x > y" href="$@PAGEVIEWBYID*3@$">ok</a>';
+    eq(DEAD.unwrapDeadAnchorsHtml(live), { html: live, count: 0 }, 'vivo intacto');
+    const broken = '<a title="x href="#">z</a>';
+    eq(DEAD.unwrapDeadAnchorsHtml(broken).html.includes('z'), true, 'comilla sin cerrar: el texto sigue');
+    const xml = '<label><intro>&lt;a title=&quot;1 &amp;gt; 0&quot; href=&quot;#&quot;&gt;Abrir&lt;/a&gt;</intro></label>';
+    eq(DEAD.repairDeadAnchorsInActivityXml(xml), { xml: '<label><intro>Abrir</intro></label>', count: 1 }, 'xml con &gt; en el atributo');
   });
 
   await check('M9 builder: un botón cuyo destino quedó en "#" (contenido viejo) ya no bloquea el re-empaque: se desenvuelve con aviso dead_link_unwrapped y el validador queda en verde; un token $@…@$ sin resolver SIGUE fallando', async () => {

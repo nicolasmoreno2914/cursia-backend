@@ -1,0 +1,21 @@
+{
+  "_comment": "Review r2 (I1): reuse key (sourceIdsHash) of the check-review-r1-fixes I1 fixture input (courseId 641, 1 module, 1 chapter, h5p, no final exam, default profiles, manifest sha \"s\", Moodle 4.1), produced by the REAL origin/staging builder 3.14.0 code (d718673) in a temporary git worktree. Do not regenerate with the current code.",
+  "generatedFrom": {
+    "ref": "origin/staging",
+    "commit": "d7186734c39b329bb25433e59ab19ed9a9261751"
+  },
+  "builderVersion": "3.14.0",
+  "sourceIdsHash": "2146c06969364b69ebd0fb7eee4ea16a1d858c2033bd426f84043adb8f908917",
+  "sourceArtifactIds": [
+    "audio_welcome:641-dynamic_audio_mp3",
+    "audiobook_chapter:00000000-0000-4000-8000-c00000064101-dynamic_audio_mp3",
+    "content:00000000-0000-4000-8000-c00000064101-dynamic_content_md",
+    "content:00000000-0000-4000-8000-c00000064101-dynamic_context_package_json",
+    "course_intro:641-dynamic_course_intro_json",
+    "course_plan:641-dynamic_course_plan_json",
+    "exam:00000000-0000-4000-8000-a00000006411-dynamic_exam_gift",
+    "experience:00000000-0000-4000-8000-c00000064101-dynamic_experience_json",
+    "module_intro:00000000-0000-4000-8000-a00000006411-dynamic_module_intro_json",
+    "presentation:00000000-0000-4000-8000-c00000064101-dynamic_presentation"
+  ]
+}
