@@ -214,7 +214,7 @@ async function main() {
   await check('(a) bancos: validateMbzV3 sin hallazgos y versión 3.14.0', async () => {
     const v = await V.validateMbzV3(builtA.mbz, builtA.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
-    eq(builtA.summary.builderVersion, '3.15.0', 'versión'); // r55: invariantes de calificación // UX r18: 3.11.0 → 3.12.0; r19 (Libro Guía PDF + bienvenida): 3.13.0
+    eq(builtA.summary.builderVersion, '3.15.1', 'versión'); // r58 I3: 3.15.1; // r55: invariantes de calificación // UX r18: 3.11.0 → 3.12.0; r19 (Libro Guía PDF + bienvenida): 3.13.0
   });
   let pagesA = [];
   await check('(a) una página por quiz, después del quiz, availability exacta a SU quiz, completion 0, downloadcontent 0, fuera de completion.xml, registrada', () => {

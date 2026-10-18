@@ -72,6 +72,42 @@ const hoursText = (min: number): string => {
   return `${String(h).replace('.', ',')} h`;
 };
 
+const HOUR_CATEGORY_LABEL: Record<string, string> = {
+  estudio_contenido: 'Estudio del contenido (páginas y presentaciones)',
+  video: 'Videos (con sus preguntas)',
+  lectura: 'Lectura del Libro Guía',
+  practica_guiada: 'Práctica guiada',
+  practica_autonoma: 'Práctica autónoma (actividades y repaso)',
+  entregable: 'Actividades de Aplicación (entregables)',
+  evaluacion: 'Evaluaciones',
+  retroalimentacion: 'Retroalimentación',
+  foro_otros: 'Orientación, foro y otros',
+};
+const h1 = (min: number): string => `${String(Math.round((min / 60) * 10) / 10).replace('.', ',')} h`;
+
+/** r58 (I3): de dónde salen las horas — por categoría, medido/estimado vs declarado, y la diferencia con el objetivo. */
+function hoursBreakdown(h: Hx, r: NonNullable<CourseFacts['hoursReport']>, ink: string, s: Surf): string {
+  const rows: string[] = [];
+  for (const [k, label] of Object.entries(HOUR_CATEGORY_LABEL)) {
+    const est = r.estimated.byCategory[k as keyof typeof r.estimated.byCategory] ?? 0;
+    const asg = r.assigned.byCategory[k as keyof typeof r.assigned.byCategory] ?? 0;
+    if (est + asg <= 0) continue;
+    const parts = [est > 0 ? `${h1(est)} estimadas` : '', asg > 0 ? `${h1(asg)} declaradas por nivel` : ''].filter(Boolean);
+    rows.push(kv(label, labelHtml(parts.join(' + '))));
+  }
+  const lines: string[] = [
+    kv('Estimadas (medidas o con evidencia)', labelHtml(h1(r.estimated.minutes))),
+    kv('Declaradas por nivel (sin medición)', labelHtml(h1(r.assigned.minutes))),
+  ];
+  if (r.target.hours !== null && r.gap) {
+    lines.push(kv('Objetivo', labelHtml(`${String(r.target.hours).replace('.', ',')} h`)));
+    lines.push(kv('Diferencia con el objetivo', labelHtml(r.gap.within ? 'dentro de la tolerancia' : r.gap.minutes > 0 ? `faltan ${h1(r.gap.minutes)} (no se rellenan)` : `${h1(-r.gap.minutes)} por encima`)));
+  }
+  lines.push(kv('Tiempo observado', labelHtml('sin datos (Cursia no mide la dedicación real)')));
+  return section(h, 'reloj', ink, 'Carga horaria: de dónde salen las horas', s) + ul(h, rows, s) + ul(h, lines, s) +
+    pHtml(h, labelHtml(`Modelo de tiempo: ${r.configId}.`), s, { secondary: true, last: true }) + end;
+}
+
 function frameworkOf(id: string | undefined | null): { label: string; summary: string; phases: Array<{ label: string; elements: string[] }> } | null {
   if (!id) return null;
   try {
@@ -119,6 +155,9 @@ export function teacherGuidePage(input: TeacherGuideInput, theme: ResolvedTheme)
   if (c.evaluations) parts.push(`${c.evaluations} ${c.evaluations === 1 ? 'evaluación' : 'evaluaciones'}`);
   if (parts.length) summary.push(kv('Contenido', labelHtml(parts.join(' · '))));
   body += section(h, 'objetivo', ink, 'Resumen del curso', s) + ul(h, summary, s) + end;
+
+  // ── r58 (I3): desglose de horas (solo si la configuración del modelo de tiempo lo pide) ──
+  if (facts.hoursBreakdownInTeacherGuide && facts.hoursReport) body += hoursBreakdown(h, facts.hoursReport, ink, s);
 
   // ── metodología ──
   if (courseFramework) {

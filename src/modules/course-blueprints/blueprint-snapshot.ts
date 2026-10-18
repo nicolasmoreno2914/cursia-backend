@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import { isApplicationMinutes } from '../study-time/application-tiers';
 import { GUIDED_PRACTICE_TIERS, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 import { isValidTargetHours } from '../study-time/target-hours';
+import { HoursModelOverride, canonicalHoursModel } from '../study-time/time-model-config';
 import {
   BlueprintPedagogyInput,
   ChapterDesign,
@@ -532,6 +533,8 @@ export interface BlueprintCourseInputV2 {
    * el snapshot no lleva la clave y conserva su sha.
    */
   targetHours?: number | null;
+  /** r58 (I3): configuración propia del modelo de tiempo (del perfil). null/ausente = default: la clave no entra al snapshot. */
+  hoursModel?: unknown;
   /** Fase 2: contexto del perfil para las Actividades de Aplicación (entra solo si algún capítulo tiene una). */
   applicationContext?: unknown;
   /** Fase 3: contexto académico en su forma congelada (academicBlueprintContext); null/ausente = sin contexto. */
@@ -594,6 +597,11 @@ export interface BlueprintSnapshotV2 {
      * SOLO con objetivo: los snapshots sin ella conservan su sha. No cambia los items del Manifest.
      */
     targetHours?: number;
+    /**
+     * r58 (I3) · Configuración propia del modelo de tiempo (forma canónica de time-model-config). La clave existe SOLO
+     * con configuración: los snapshots sin ella conservan su sha y sus horas.
+     */
+    hoursModel?: HoursModelOverride;
     /**
      * Fase 2 · Actividades de Aplicación: estudiante + resultados de aprendizaje congelados. SOLO si algún capítulo
      * tiene Actividad de Aplicación y el perfil los define.
@@ -658,6 +666,12 @@ export function buildBlueprintSnapshotV2(
   if (course.targetHours !== undefined && course.targetHours !== null && !isValidTargetHours(course.targetHours)) {
     throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.targetHours debe ser un número de 1 a 500 en pasos de 0,5 o null (fue ${JSON.stringify(course.targetHours)})`);
   }
+  let hoursModel: HoursModelOverride | null;
+  try {
+    hoursModel = canonicalHoursModel(course.hoursModel);
+  } catch (e) {
+    throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.hoursModel: ${(e as Error).message}`);
+  }
   const kindErrors = practiceErrors(
     modules.map((m) => ({ id: m.id, chapters: chapters.filter((c) => c.module_id === m.id).map((c) => ({ id: c.id, kind: rawChapterKind(c.chapter_kind), videoEnabled: !!c.video_enabled })) })),
     (mi, ci) => `modules[${mi}].chapters[${ci}]`,
@@ -714,6 +728,7 @@ export function buildBlueprintSnapshotV2(
       activityEngine: course.activityEngine,
       ...(course.reviewCards === true ? { reviewCards: true as const } : {}),
       ...(course.targetHours !== undefined && course.targetHours !== null ? { targetHours: course.targetHours } : {}),
+      ...(hoursModel ? { hoursModel } : {}),
       ...(applicationContext ? { applicationContext } : {}),
       ...(academicContext ? { academicContext } : {}),
       ...(coursePedagogy ? { pedagogy: coursePedagogy } : {}),
@@ -813,6 +828,7 @@ export function snapshotV2ToRows(s: any): {
       activityEngine: s.course.activityEngine,
       ...(s.course.reviewCards !== undefined ? { reviewCards: s.course.reviewCards } : {}),
       ...(s.course.targetHours !== undefined ? { targetHours: s.course.targetHours } : {}),
+      ...(s.course.hoursModel !== undefined ? { hoursModel: s.course.hoursModel } : {}),
       ...(s.course.applicationContext !== undefined ? { applicationContext: s.course.applicationContext } : {}),
       ...(s.course.academicContext !== undefined ? { academicContext: s.course.academicContext } : {}),
     },
@@ -893,6 +909,13 @@ export function validateBlueprintSnapshotV2(s: BlueprintSnapshotV2): BlueprintVa
     s.modules.map((m) => ({ id: m.id, chapters: m.chapters.map((c) => ({ id: c.id, kind: rawChapterKind((c as { kind?: unknown }).kind), videoEnabled: !!c.videoEnabled })) })),
     (mi, ci) => `modules[${mi}].chapters[${ci}]`,
   ));
+  // r58 (I3): la configuración propia del modelo de tiempo, en forma canónica.
+  const hm = (s.course as { hoursModel?: unknown }).hoursModel;
+  if (hm !== undefined) {
+    let hcanon: HoursModelOverride | null = null;
+    try { hcanon = canonicalHoursModel(hm); } catch { hcanon = null; }
+    if (!hcanon || JSON.stringify(hcanon) !== JSON.stringify(hm)) errors.push({ path: 'course.hoursModel', code: 'INVALID_HOURS_MODEL', message: 'course.hoursModel no está en forma canónica' });
+  }
   // Fase 2: el contexto de las actividades existe solo con alguna actividad, y en forma canónica.
   const ctx = (s.course as { applicationContext?: unknown }).applicationContext;
   if (ctx !== undefined) {

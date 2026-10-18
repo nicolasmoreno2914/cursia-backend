@@ -2,7 +2,7 @@ import { academicBlueprintContext, loadCurrentAcademicContext } from '../academi
 import type { AcademicBlueprintContext } from '../academic-context/blueprint-academic';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
-import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
+import { profileApplicationContext, profileHoursModel, profileTargetHours } from '../pedagogy/pedagogy-profile';
 import {
   BlueprintSnapshotV2,
   BlueprintValidationError,
@@ -77,6 +77,8 @@ export function composeLockSnapshotV2(
     ...plainCourseRefV2(course, academicContext),
     // Sin objetivo de horas: la clave no entra al snapshot (sha de siempre).
     targetHours: profileTargetHours(profile),
+    // r58 (I3): configuración propia del modelo de tiempo (sin ella, la clave no entra al snapshot: sha de siempre).
+    hoursModel: profileHoursModel(profile),
     // Fase 2: estudiante + resultados de aprendizaje congelados (solo entran si hay Actividades de Aplicación).
     applicationContext: profileApplicationContext(profile),
   };

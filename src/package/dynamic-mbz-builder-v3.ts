@@ -176,8 +176,8 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * REGLA (review G6 M9): TODO cambio que altere el `.mbz` para los mismos
  * insumos — plantillas del shell/capítulo (R11a), tarjeta (R9), intros de
  * actividad, Libro v3, XML — exige subir esta versión; si no, el reuse sirve
- * paquetes viejos. Hoy `hours` no se cablea desde el worker (no hay dato de
- * setup en el backend); el día que se cablee debe entrar en la clave de reuse.
+ * paquetes viejos. r58 (I3): `hours` ahora lo cablea el worker (horas objetivo del Blueprint); como el Blueprint entra
+ * al sha del Manifest, ya está en la clave de reuse, y 3.15.1 invalida los paquetes armados sin él.
  * 3.0.1 (fix round 1 G6): Libro sin links inseguros (M2).
  * 3.0.2 (F1/I3): categorías vacías fuera del gradebook, pesos normalizados y
  * curso sin nota (completion por vista del Libro Guía).
@@ -269,8 +269,12 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * enlazados desde la AA), ambos desde claves OPCIONALES del perfil de evaluación (`applicationDelivery`,
  * `practiceResources`). Sin esas claves el paquete es byte a byte el de antes (dorado scripts/fixtures/deliverables); con
  * ellas cambia el sha del perfil y, con él, la clave de reuse — no hace falta subir la versión.
+ * 3.15.1 (r58 I3): el worker pasa por fin las horas objetivo del Blueprint (`hours`): la bienvenida muestra «Duración
+ * estimada: X h (definida por la institución)» y la Guía del docente «Carga horaria declarada» en los cursos CON objetivo
+ * (antes ese texto nunca salía: facts.hours era siempre null). Sin objetivo de horas, el .mbz es byte a byte el de 3.15.0
+ * (el builder no cambió; solo su entrada). Desglose opcional de horas en la Guía del docente (`hoursModel.teacherGuideBreakdown`).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.15.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.15.1';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
