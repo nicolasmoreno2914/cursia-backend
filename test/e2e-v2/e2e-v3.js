@@ -4032,7 +4032,9 @@ function reservationBookkeeping(ev) {
         const drainingKeys = (await finished(c2.runId)).filter((i) => i.status === 'running' && i.worker_id === W2).map((i) => i.item_key);
         // Deploy real (pm2 reload): el proceso NUEVO arranca y se anuncia antes de drenar el viejo.
         const claims2 = claimLog.length;
-        w3 = spawnProc('llm-worker-3', 'workers/dynamic-llm-worker.js', wEnv(W3));
+        // Review r2 (m4): el worker 3 es el que prueba el camino REAL hasta el paquete final (E24e, E24s): declara su override
+        // (la IA falsa local) como proveedor real. Los demás workers NO llevan el flag → su texto queda llmMode=mock (E24g lo verifica).
+        w3 = spawnProc('llm-worker-3', 'workers/dynamic-llm-worker.js', { ...wEnv(W3), ANTHROPIC_BASE_URL_IS_REAL_PROVIDER: 'true' });
         await waitFor('worker 3 anunciado', async () => (await q(`select 1 from public.llm_worker_presence where worker_id = $1 and not draining`, [W3])).length > 0, 60000, 200);
         w2.kill('SIGTERM');
         await waitFor('worker 2 drenado', async () => !!w2.exited, 120000, 200);
@@ -4377,6 +4379,11 @@ function reservationBookkeeping(ev) {
         ok(exams7.length === 2 && exams7.every((i) => i.worker_id === W5 && arts7.filter((a) => a.item_key === i.item_key && /^dynamic_exam_/.test(a.type)).map((a) => a.type).join() === 'dynamic_exam_gift'),
           'E24g: examen de módulo y final como GIFT en el worker (DYNAMIC_LLM_WORKER_EXAM_BANK=off)', exams7.map((i) => [i.item_key, i.worker_id, arts7.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
         eq(claimLog.slice(claims7).length, 0, 'E24g: sin ejecutor del navegador');
+        // Review r2 (m4) / R2: worker 5 apunta a la IA falsa SIN ANTHROPIC_BASE_URL_IS_REAL_PROVIDER → todo su texto es mock
+        // y el run nunca puede ser final (vista previa).
+        const llm7 = rows7.filter((i) => LLM_TYPES.includes(i.type) && i.worker_id === W5);
+        ok(llm7.length > 0 && llm7.every((i) => i.output_summary && i.output_summary.llmMode === 'mock') && done7 === 'preview',
+          'E24g: override sin el flag de proveedor real → llmMode=mock en cada parte del worker y run en vista previa (R2)', { done7, m: llm7.map((i) => [i.item_key, i.output_summary && i.output_summary.llmMode]) });
         results.courses.E24g = { courseId: c7.courseId, runId: c7.runId, items: rows7.length, status: done7 };
       } finally {
         for (const w of [w1, w2, w3, w4, w5]) if (w && !w.exited) await stopProc(w, 30000);

@@ -35,6 +35,7 @@ r58 changed the default from open to closed.
 - [ ] `SUPER_ADMIN_USER_IDS` (recommended) and `SUPER_ADMIN_EMAIL_VERIFICATION` (leave it `required`). Admins need a confirmed email. Without a readable `auth.users` row, the guard uses the JWT `email_verified` claim.
 - [ ] `YOUTUBE_UPLOAD_ALLOWED_HOSTS`: needed only if Videogen download URLs redirect to a host other than `VIDEOGEN_API_URL` / `SUPABASE_URL`.
 - [ ] `FINOPS_KILL_SWITCH` / `FINOPS_PROVIDER_ALLOWLIST`: unset in production unless spend must stop.
+- [ ] `ANTHROPIC_API_BASE_URL`: leave it unset (official API). If a legitimate gateway or regional proxy is used, the LLM worker marks everything it generates `llmMode=mock` (preview only, never a final package) unless you also set `ANTHROPIC_BASE_URL_IS_REAL_PROVIDER=true`. In production that flag counts only with `ALLOW_PROVIDER_BASE_URL_OVERRIDE_IN_PRODUCTION=true` and an https URL; otherwise it is ignored.
 
 ### 3. After the deploy
 

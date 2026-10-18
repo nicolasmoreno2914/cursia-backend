@@ -70,12 +70,27 @@ export function providerBaseUrlFindings(env: Record<string, string | undefined>)
  * Review r1 (M-1): procedencia del texto de IA del worker de servidor. `real` solo si la URL base de Anthropic es la
  * oficial (https, api.anthropic.com, sin puerto ni credenciales) o no está configurada; cualquier otra (un fake local, un
  * proxy de pruebas) → `mock`: lo que genere nunca llega a un paquete final (classifyRunItems → preview). En cualquier
- * entorno (la guarda de arranque solo cubre producción).
+ * entorno (la guarda de arranque solo cubre producción). Sin env: SOLO la URL (el flag de abajo no aplica).
+ *
+ * Review r2 (m4) — Ruling: una override se declara proveedor REAL solo de forma explícita con
+ * `ANTHROPIC_BASE_URL_IS_REAL_PROVIDER=true` (gateway / proxy regional legítimo; el e2e lo pone SOLO al worker que
+ * prueba el camino real hacia el paquete final). Fuera de producción el flag basta. En producción el flag se IGNORA
+ * (→ mock) salvo que también esté `ALLOW_PROVIDER_BASE_URL_OVERRIDE_IN_PRODUCTION=true` y la override sea https
+ * (nunca http en claro con claves reales). Sin el flag, una override sigue siendo `mock` (R2 intacto).
  */
-export function anthropicLlmModeForBaseUrl(raw: string | null | undefined): 'real' | 'mock' {
+export const ANTHROPIC_BASE_URL_IS_REAL_PROVIDER_ENV = 'ANTHROPIC_BASE_URL_IS_REAL_PROVIDER';
+
+export function anthropicLlmModeForBaseUrl(raw: string | null | undefined, env?: Record<string, string | undefined> | null): 'real' | 'mock' {
   const v = String(raw ?? '').trim();
   if (!v) return 'real';
-  return providerBaseUrlFindings({ ANTHROPIC_API_BASE_URL: v }).length ? 'mock' : 'real';
+  const findings = providerBaseUrlFindings({ ANTHROPIC_API_BASE_URL: v });
+  if (!findings.length) return 'real';
+  if (!env || env[ANTHROPIC_BASE_URL_IS_REAL_PROVIDER_ENV] !== 'true') return 'mock';
+  if (pointsToProduction(env as NodeJS.ProcessEnv)) {
+    if (env[ALLOW_PROVIDER_BASE_URL_OVERRIDE_ENV] !== 'true') return 'mock';
+    if (findings.some((f) => f.why !== 'non_official_host')) return 'mock';
+  }
+  return 'real';
 }
 
 export interface ProviderBaseUrlVerdict {

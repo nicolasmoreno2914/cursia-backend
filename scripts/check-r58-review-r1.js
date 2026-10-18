@@ -80,6 +80,8 @@ const RV = loadDist('modules/dynamic-packaging/package-reuse-verify.js');
 const FC = loadDist('modules/reliability/failure-classifier.js');
 const G = loadDist('config/provider-base-url-guard.js');
 const LW = loadDist('workers/dynamic-llm-worker.js');
+const RC = loadDist('modules/dynamic-generation/run-completion.js');
+const PROD_REF = loadDist('modules/dynamic-generation/dynamic-video-delivery.js').PRODUCTION_SUPABASE_REF;
 const RB = loadDist('modules/finops/run-budget.js');
 const QB = loadDist('modules/quality/quality-battery.js');
 
@@ -192,9 +194,46 @@ async function pureChecks() {
     for (const u of ['http://127.0.0.1:8787', 'https://api.anthropic.com.evil.test', 'https://api.anthropic.com:8443', 'http://api.anthropic.com', 'nota-una-url', 'https://u:p@api.anthropic.com']) eq(G.anthropicLlmModeForBaseUrl(u), 'mock', `mock ${u}`);
     eq([LW.workerLlmMode({ baseUrl: 'https://api.anthropic.com' }), LW.workerLlmMode({ baseUrl: 'http://127.0.0.1:1' }), LW.workerLlmMode({ baseUrl: 'https://api.anthropic.com', llmMode: 'replay' })], ['real', 'mock', 'replay'], 'worker');
     const src = fs.readFileSync(path.join(REPO, 'src/workers/dynamic-llm-worker.ts'), 'utf8');
-    assert(/llmMode: anthropicLlmModeForBaseUrl\(process\.env\.ANTHROPIC_API_BASE_URL\)/.test(src), 'el loop deriva el modo de la URL base');
+    assert(/llmMode: anthropicLlmModeForBaseUrl\(process\.env\.ANTHROPIC_API_BASE_URL, process\.env\)/.test(src), 'el loop deriva el modo de la URL base (+ flag de proveedor real)');
     assert(/generatedBy: 'llm-worker', \.\.\.\(llmMode !== 'real' \? \{ llmMode \} : \{\}\)/.test(src), 'el resumen del complete lleva llmMode no real');
     assert(/\.\.\.\(workerLlmMode\(deps\) !== 'real' \? \{ llmMode: workerLlmMode\(deps\) \} : \{\}\)/.test(src), 'la metadata del artifact lleva llmMode no real');
+  });
+  await check('r2 m4 ANTHROPIC_BASE_URL_IS_REAL_PROVIDER: override + flag → real (fuera de prod); sin flag → mock; prod sin escape o http → mock (flag ignorado)', () => {
+    const FAKE = 'http://127.0.0.1:8787';
+    const PROXY = 'https://llm-gw.example.test';
+    const F = G.ANTHROPIC_BASE_URL_IS_REAL_PROVIDER_ENV;
+    eq(F, 'ANTHROPIC_BASE_URL_IS_REAL_PROVIDER', 'nombre');
+    const prod = { SUPABASE_URL: `https://${PROD_REF}.supabase.co` };
+    const cases = [
+      [FAKE, undefined, 'mock'], [FAKE, {}, 'mock'], [FAKE, { [F]: 'false' }, 'mock'], [FAKE, { [F]: '1' }, 'mock'], [FAKE, { [F]: 'TRUE' }, 'mock'],
+      [FAKE, { [F]: 'true' }, 'real'], [PROXY, { [F]: 'true' }, 'real'],
+      [PROXY, { ...prod, [F]: 'true' }, 'mock'], // producción sin el escape: ignorado
+      [PROXY, { ...prod, [F]: 'true', ALLOW_PROVIDER_BASE_URL_OVERRIDE_IN_PRODUCTION: 'true' }, 'real'],
+      [FAKE, { ...prod, [F]: 'true', ALLOW_PROVIDER_BASE_URL_OVERRIDE_IN_PRODUCTION: 'true' }, 'mock'], // http en producción: nunca real
+      [PROXY, { ...prod, ALLOW_PROVIDER_BASE_URL_OVERRIDE_IN_PRODUCTION: 'true' }, 'mock'], // el escape solo NO declara real
+      ['https://api.anthropic.com', {}, 'real'], [undefined, { [F]: 'true' }, 'real'],
+    ];
+    for (const [u, env, want] of cases) eq(G.anthropicLlmModeForBaseUrl(u, env), want, `${u} ${JSON.stringify(env)}`);
+  });
+  await check('r2 m4 camino de decisión (E24e vs fake sin flag): modo del worker → output_summary → classifyRunItems/evaluateRunCompletion', () => {
+    const FAKE = 'http://127.0.0.1:8787';
+    const manifest = { rulesVersion: 2, items: [{ key: 'content:a', type: 'content' }, { key: 'exam:m', type: 'exam' }, { key: 'final_exam:f', type: 'final_exam' }] };
+    const job = { input_payload: {}, worker_status: 'completed', status: 'completed' };
+    const run = (env) => {
+      // = runLlmWorkerLoop: deps.llmMode = anthropicLlmModeForBaseUrl(URL, env); processLlmItem: resumen con llmMode si no es real.
+      const mode = LW.workerLlmMode({ baseUrl: FAKE, llmMode: G.anthropicLlmModeForBaseUrl(FAKE, env) });
+      const summary = { generatedBy: 'llm-worker', ...(mode !== 'real' ? { llmMode: mode } : {}) };
+      const rows = manifest.items.map((it) => ({ item_key: it.key, status: 'completed', output_summary: summary, finished_at: new Date().toISOString() }));
+      const cls = RC.classifyRunItems(job, new Map(rows.map((r) => [r.item_key, r])), manifest);
+      return { mode, classes: [...new Set(cls.values())], complete: RC.evaluateRunCompletion(job, rows, manifest, null, {}).generationComplete };
+    };
+    eq(run({ ANTHROPIC_BASE_URL_IS_REAL_PROVIDER: 'true' }), { mode: 'real', classes: ['done'], complete: true }, 'E24e (worker 3 con el flag): final posible');
+    eq(run({}), { mode: 'mock', classes: ['preview'], complete: false }, 'fake sin flag: vista previa, nunca final (R2)');
+    const e2e = fs.readFileSync(path.join(REPO, 'test/e2e-v2/e2e-v3.js'), 'utf8');
+    const flagged = e2e.split('\n').filter((l) => l.includes("ANTHROPIC_BASE_URL_IS_REAL_PROVIDER: 'true'"));
+    assert(flagged.length === 1 && /spawnProc\('llm-worker-3'/.test(flagged[0]), 'e2e: solo el worker 3 (E24e/E24s) declara la IA falsa como proveedor real');
+    assert(!/ANTHROPIC_BASE_URL_IS_REAL_PROVIDER/.test(e2e.slice(e2e.indexOf('const wEnv = (id) =>'), e2e.indexOf('const waitFor = async (label'))), 'e2e: wEnv base sin el flag');
+    assert(/E24g: override sin el flag de proveedor real → llmMode=mock/.test(e2e), 'e2e: E24g verifica el lado mock');
   });
   await check('M-1 ejecutor del navegador (vendor, mismo archivo que el frontend): sin marca → real; CURSIA_LLM_MODE / api.__cursiaLlmMode → mock|replay; valores raros → real; metadata + resumen cableados', () => {
     const file = path.join(REPO, 'vendor/dynamic-executor/45-dynamic-generation-executor.js');

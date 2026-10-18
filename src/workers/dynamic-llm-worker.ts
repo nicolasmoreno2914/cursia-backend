@@ -295,7 +295,7 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
     heartbeatMs: readPositiveInt('DYNAMIC_LLM_WORKER_HEARTBEAT_MS', 30_000),
     apiKey: cfg.apiKey,
     baseUrl: String(process.env.ANTHROPIC_API_BASE_URL || 'https://api.anthropic.com'),
-    llmMode: anthropicLlmModeForBaseUrl(process.env.ANTHROPIC_API_BASE_URL),
+    llmMode: anthropicLlmModeForBaseUrl(process.env.ANTHROPIC_API_BASE_URL, process.env),
     defaultModel: String(process.env.DYNAMIC_LLM_WORKER_MODEL || 'claude-sonnet-4-6'),
     idleMs: readPositiveInt('DYNAMIC_LLM_WORKER_IDLE_MS', 120_000),
     totalMs: readPositiveInt('DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS', 15 * 60_000),
@@ -320,6 +320,7 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
   void drain.stopped.then(() => beat());
   const minRunCreatedAt = cfg.since.toISOString();
   logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${llmWorkerConcurrency()}, runs desde ${minRunCreatedAt})`);
+  if (deps.llmMode === 'real' && anthropicLlmModeForBaseUrl(process.env.ANTHROPIC_API_BASE_URL) !== 'real') logger.warn(`dynamic-llm-worker: ANTHROPIC_API_BASE_URL no es la API oficial pero ANTHROPIC_BASE_URL_IS_REAL_PROVIDER=true la declara proveedor REAL — lo que genere puede llegar a un paquete final`);
   if (deps.llmMode !== 'real') logger.warn(`dynamic-llm-worker: ANTHROPIC_API_BASE_URL no es la API oficial — todo lo que genere se marca llmMode=${deps.llmMode} (vista previa, nunca un paquete final)`);
   // Loop 6: el ejecutor fija el modelo de la generación dinámica (DYN_GENERATION_MODEL); DYNAMIC_LLM_WORKER_MODEL solo
   // aplica a una llamada que no traiga modelo. Si apunta a otro, se avisa (configuración sin efecto).
