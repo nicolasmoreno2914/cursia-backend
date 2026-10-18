@@ -2,6 +2,7 @@ import { sha256Canonical } from '../coherence/canonical-json';
 import { TARGET_HOURS_MAX, TARGET_HOURS_MIN, isValidTargetHours } from '../study-time/target-hours';
 import { PedagogicalApproachRegistry } from './approach-registry';
 import { defaultApproachRegistry } from './builtin-approaches';
+import { InstructionalFrameworkRegistry, defaultFrameworkRegistry } from './instructional-frameworks';
 import {
   AGE_GROUPS,
   ASSESSMENT_METHODS,
@@ -14,7 +15,9 @@ import {
   ExperienceLevel,
   ExperienceType,
   LEARNING_MODES,
+  LEARNING_TYPES,
   LearningMode,
+  LearningType,
   PRIOR_KNOWLEDGE_LEVELS,
   PriorKnowledgeLevel,
   isOneOf,
@@ -76,6 +79,97 @@ export interface PedagogicalProfile {
    * si alguna difiere del valor por defecto (perfiles anteriores conservan su sha).
    */
   designPreferences?: { emphasis?: 'application' | 'depth'; applicationActivities?: 'practice_only' | 'none'; audiovisual?: 'less' | 'recommended' | 'more'; guidedPractice?: 'none' };
+  /**
+   * T2 (r57) · Plan de aprendizaje: marco instruccional (instructional-frameworks.ts) + tipo de aprendizaje por
+   * capítulo (learning-type.ts). Opcional: la clave existe SOLO si se activó (perfiles anteriores conservan su sha y
+   * el diseño es byte a byte el de antes). Requiere enfoque principal.
+   */
+  learningPlan?: LearningPlanConfig;
+}
+
+/** T2 (r57): configuración del plan de aprendizaje (en el perfil pedagógico del curso). */
+export interface LearningPlanConfig {
+  /** Marco del curso (id del registro de marcos instruccionales). */
+  framework: string;
+  /** Mostrar las fases al estudiante; ausente = lo que diga el marco (`phaseLabelsDefault`). */
+  phaseLabels?: boolean;
+  /** Marco propio de un módulo (id del módulo → id del marco). */
+  moduleFrameworks?: Record<string, string>;
+  /** Por capítulo (id → tipo de aprendizaje fijado por el docente y/o marco propio). */
+  chapterOverrides?: Record<string, { learningType?: LearningType; framework?: string }>;
+}
+
+/** Máximo de entradas por mapa del plan (módulos o capítulos). */
+export const LEARNING_PLAN_MAX_ENTRIES = 300;
+const LEARNING_PLAN_KEYS = ['framework', 'phaseLabels', 'moduleFrameworks', 'chapterOverrides'];
+const ENTITY_ID_RE = /^[A-Za-z0-9_-]{1,80}$/;
+
+function checkLearningPlan(v: unknown, p: Record<string, unknown>, errors: PedagogyValidationError[], frameworks: InstructionalFrameworkRegistry): void {
+  const err = (path: string, code: string, message: string) => errors.push({ path, code, message });
+  if (!isPlainObject(v)) {
+    err('learningPlan', 'INVALID_TYPE', 'learningPlan debe ser un objeto');
+    return;
+  }
+  for (const k of Object.keys(v)) if (!LEARNING_PLAN_KEYS.includes(k)) err(`learningPlan.${k}`, 'UNKNOWN_FIELD', `Campo desconocido "learningPlan.${k}"`);
+  const fw = (x: unknown, path: string) => {
+    if (!frameworks.has(x)) err(path, 'UNKNOWN_FRAMEWORK', `Metodología desconocida ${JSON.stringify(x)} (disponibles: ${frameworks.ids().join(', ')})`);
+  };
+  fw(v.framework, 'learningPlan.framework');
+  if (v.phaseLabels !== undefined && typeof v.phaseLabels !== 'boolean') err('learningPlan.phaseLabels', 'INVALID_TYPE', 'phaseLabels debe ser boolean');
+  if (p.primaryApproach === null || p.primaryApproach === undefined || p.primaryApproach === '') {
+    err('learningPlan', 'LEARNING_PLAN_WITHOUT_APPROACH', 'Elige un enfoque principal antes de la metodología y los tipos de aprendizaje');
+  }
+  const map = (m: unknown, path: string, each: (val: unknown, at: string) => void) => {
+    if (m === undefined) return;
+    if (!isPlainObject(m)) { err(path, 'INVALID_TYPE', `${path} debe ser un objeto`); return; }
+    const keys = Object.keys(m);
+    if (keys.length > LEARNING_PLAN_MAX_ENTRIES) err(path, 'TOO_MANY_ITEMS', `${path}: como máximo ${LEARNING_PLAN_MAX_ENTRIES} entradas`);
+    for (const k of keys) {
+      if (!ENTITY_ID_RE.test(k)) err(`${path}.${k}`, 'INVALID_ID', `${path}: id inválido ${JSON.stringify(k)}`);
+      each(m[k], `${path}.${k}`);
+    }
+  };
+  map(v.moduleFrameworks, 'learningPlan.moduleFrameworks', (val, at) => fw(val, at));
+  map(v.chapterOverrides, 'learningPlan.chapterOverrides', (val, at) => {
+    if (!isPlainObject(val)) { err(at, 'INVALID_TYPE', `${at} debe ser un objeto`); return; }
+    for (const k of Object.keys(val)) if (k !== 'learningType' && k !== 'framework') err(`${at}.${k}`, 'UNKNOWN_FIELD', `Campo desconocido "${at}.${k}"`);
+    if (val.learningType !== undefined && !isOneOf(LEARNING_TYPES, val.learningType)) {
+      err(`${at}.learningType`, 'INVALID_OPTION', `Tipo de aprendizaje inválido ${JSON.stringify(val.learningType)} (permitidos: ${LEARNING_TYPES.join(', ')})`);
+    }
+    if (val.framework !== undefined) fw(val.framework, `${at}.framework`);
+  });
+}
+
+/** Plan normalizado: claves en orden fijo, mapas ordenados por id, entradas vacías fuera. */
+function normalizeLearningPlan(v: LearningPlanConfig): LearningPlanConfig {
+  const out: LearningPlanConfig = { framework: v.framework };
+  if (typeof v.phaseLabels === 'boolean') out.phaseLabels = v.phaseLabels;
+  const mf = v.moduleFrameworks ?? {};
+  const mkeys = Object.keys(mf).sort();
+  if (mkeys.length) {
+    out.moduleFrameworks = {};
+    for (const k of mkeys) out.moduleFrameworks[k] = mf[k];
+  }
+  const co = v.chapterOverrides ?? {};
+  const entries: Record<string, { learningType?: LearningType; framework?: string }> = {};
+  for (const k of Object.keys(co).sort()) {
+    const e = co[k];
+    const n: { learningType?: LearningType; framework?: string } = {};
+    if (e.learningType !== undefined) n.learningType = e.learningType;
+    if (e.framework !== undefined) n.framework = e.framework;
+    if (Object.keys(n).length) entries[k] = n;
+  }
+  if (Object.keys(entries).length) out.chapterOverrides = entries;
+  return out;
+}
+
+/** Plan de aprendizaje de un perfil (null = desactivado, comportamiento anterior). Lanza si es inválido. */
+export function profileLearningPlan(p: unknown): LearningPlanConfig | null {
+  if (!isPlainObject(p) || p.learningPlan === undefined || p.learningPlan === null) return null;
+  const errs: PedagogyValidationError[] = [];
+  checkLearningPlan(p.learningPlan, p, errs, defaultFrameworkRegistry());
+  if (errs.length) throw new Error(`PROFILE_INVALID: ${errs.map((e) => `${e.code} ${e.path}: ${e.message}`).join('; ')}`);
+  return normalizeLearningPlan(p.learningPlan as LearningPlanConfig);
 }
 
 export interface PedagogyValidationError {
@@ -120,7 +214,7 @@ const TOP_KEYS = [
 /** `designRules` lo escribe el servidor: se tolera en la entrada (se ignora y se recalcula). */
 const TOLERATED_KEYS = ['designRules'];
 /** Claves opcionales (ausentes = comportamiento anterior). */
-const OPTIONAL_KEYS = ['targetHours', 'designPreferences'];
+const OPTIONAL_KEYS = ['targetHours', 'designPreferences', 'learningPlan'];
 const DESIGN_EMPHASES_ALLOWED = ['application', 'balanced', 'depth'];
 const APPLICATION_MODES_ALLOWED = ['auto', 'practice_only', 'none'];
 /** LOOP 8.3: prioridad audiovisual (sin valor por defecto: ausente = comportamiento anterior, por eso se guarda tal cual). */
@@ -256,6 +350,7 @@ export function validatePedagogicalProfile(
     err('targetHours', 'INVALID_TARGET_HOURS', `targetHours debe ser un número de ${TARGET_HOURS_MIN} a ${TARGET_HOURS_MAX} horas, en pasos de 0,5`);
   }
   if ('designPreferences' in p && p.designPreferences !== null) checkDesignPreferences(p.designPreferences, errors);
+  if ('learningPlan' in p && p.learningPlan !== null) checkLearningPlan(p.learningPlan, p, errors, defaultFrameworkRegistry());
   return errors;
 }
 
@@ -348,6 +443,8 @@ export function normalizePedagogicalProfile(
       if (dp.guidedPractice && dp.guidedPractice !== 'auto') out.guidedPractice = dp.guidedPractice;
       return Object.keys(out).length ? { designPreferences: out as PedagogicalProfile['designPreferences'] } : {};
     })(),
+    // T2 (r57): solo si se activó (sin plan: bytes y sha de siempre).
+    ...((q as any).learningPlan ? { learningPlan: normalizeLearningPlan((q as any).learningPlan) } : {}),
   };
 }
 

@@ -26,6 +26,17 @@ export function manifestFeaturesPedagogy(snapshot: BlueprintSnapshotV2): Manifes
   return p ? { engineVersion: p.engineVersion, profileSha256: p.profileSha256 } : undefined;
 }
 
+/**
+ * T2 (r57): lo que cada generador del capítulo recibe del plan de aprendizaje (tipo + nivel y marco). SOLO si el
+ * diseño del capítulo lo trae; la justificación completa (evidencia) queda en el Blueprint y en la huella del capítulo.
+ */
+function chapterPlanFields(d: { learningType?: { type: string; level: string | null }; framework?: string }): Record<string, unknown> {
+  return {
+    ...(d.learningType ? { learningType: { type: d.learningType.type, level: d.learningType.level } } : {}),
+    ...(d.framework !== undefined ? { framework: d.framework } : {}),
+  };
+}
+
 export function manifestItemDesign(
   snapshot: BlueprintSnapshotV2,
   type: string,
@@ -40,14 +51,23 @@ export function manifestItemDesign(
       return { approaches, objectivesStyle: p.objectivesStyle, contentDepth: p.contentDepth };
     case 'course_intro':
       return { approaches, interactionLevel: p.interactionLevel };
-    case 'exam':
-      return { strategy: p.assessment.strategy, examStyle: p.assessment.examStyle, feedback: { mode: p.assessment.feedbackMode, timing: p.assessment.feedbackTiming } };
+    case 'exam': {
+      // T2 (r57): con plan de aprendizaje, el marco del módulo (evento «evaluar» de la metodología).
+      const m = snapshot.modules.find((x) => x.id === moduleId);
+      return {
+        strategy: p.assessment.strategy, examStyle: p.assessment.examStyle, feedback: { mode: p.assessment.feedbackMode, timing: p.assessment.feedbackTiming },
+        ...(m?.design?.framework !== undefined ? { framework: m.design.framework } : {}),
+      };
+    }
     case 'final_exam':
-      return { strategy: p.assessment.strategy, finalExamStyle: p.assessment.finalExamStyle, feedback: { mode: p.assessment.feedbackMode, timing: p.assessment.feedbackTiming } };
+      return {
+        strategy: p.assessment.strategy, finalExamStyle: p.assessment.finalExamStyle, feedback: { mode: p.assessment.feedbackMode, timing: p.assessment.feedbackTiming },
+        ...(p.learningPlan ? { framework: p.learningPlan.framework } : {}),
+      };
     case 'module_intro': {
       const m = snapshot.modules.find((x) => x.id === moduleId);
       if (!m?.design) throw new Error(`manifestItemDesign: el módulo ${moduleId} no tiene diseño pedagógico`);
-      return { opening: m.design.opening, closing: m.design.closing };
+      return { opening: m.design.opening, closing: m.design.closing, ...(m.design.framework !== undefined ? { framework: m.design.framework } : {}) };
     }
     case 'audio_welcome':
     case 'audiobook_chapter':
@@ -57,27 +77,30 @@ export function manifestItemDesign(
       if (!ch?.design) throw new Error(`manifestItemDesign: el capítulo ${chapterId} no tiene diseño pedagógico`);
       // Diseño efectivo: el congelado + las variaciones del rol que le da su posición actual.
       const d = effectiveChapterDesign(snapshot, ch.id);
+      const plan = chapterPlanFields(d);
       switch (type) {
         case 'content':
           return {
             role: d.role, sequence: [...d.sequence], objectiveStyle: d.objectiveStyle, objectiveVerbs: [...d.objectiveVerbs],
             contentType: d.contentType, depth: d.depth, scenario: { type: d.scenario.type, branching: d.scenario.branching }, resources: [...d.resources],
+            ...plan,
           };
         case 'experience':
-          return { contentType: d.contentType, scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing } };
+          return { contentType: d.contentType, scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing }, ...plan };
         case 'presentation':
-          return { contentType: d.contentType, sequence: [...d.sequence] };
+          return { contentType: d.contentType, sequence: [...d.sequence], ...plan };
         case 'video':
-          return { style: d.video.style };
+          return { style: d.video.style, ...plan };
         case 'video_interactions':
-          return { interactions: d.video.interactions, feedback: { mode: d.feedback.mode, timing: d.feedback.timing } };
+          return { interactions: d.video.interactions, feedback: { mode: d.feedback.mode, timing: d.feedback.timing }, ...plan };
         case 'activity':
-          return { intent: d.activity.intent, scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing } };
+          return { intent: d.activity.intent, scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing }, ...plan };
         case 'application_activity':
           // Fase 2: la Actividad de Aplicación adapta tipo de tarea, profundidad y retroalimentación al diseño del capítulo.
           return {
             role: d.role, objectiveVerbs: [...d.objectiveVerbs], contentType: d.contentType, depth: d.depth, intent: d.activity.intent,
             scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing },
+            ...plan,
           };
         case 'guided_practice':
           // Loop 9 B: la práctica guiada (formativa) toma del capítulo el tipo de contenido, los verbos del objetivo, el
@@ -85,6 +108,7 @@ export function manifestItemDesign(
           return {
             role: d.role, objectiveVerbs: [...d.objectiveVerbs], contentType: d.contentType, depth: d.depth,
             scenario: { type: d.scenario.type, branching: d.scenario.branching }, feedback: { mode: d.feedback.mode, timing: d.feedback.timing },
+            ...plan,
           };
         default:
           throw new Error(`manifestItemDesign: tipo de item sin diseño definido: ${type}`);

@@ -1,3 +1,4 @@
+import { learningPlanExperienceRequirements } from '../pedagogy/learning-plan-directives';
 import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
@@ -1446,6 +1447,15 @@ export class SchedulerService {
       ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null }, { activityTypeRules: rules });
       // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
       if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
+    }
+    if (g.type === 'experience' && mItem.design && typeof mItem.design.framework === 'string') {
+      // T2 (r57): requisitos del marco instruccional del Manifest congelado (solo capítulos de contenido; los de
+      // práctica tienen su propia forma). Mismo cálculo que el brief del claim (learningPlanExperienceRequirements).
+      const mc = (manifest.modules ?? []).flatMap((m: any) => m.chapters ?? []).find((c: any) => c.chapterId === g.chapter_id);
+      if (mc && mc.kind !== 'practice') {
+        const reqs = learningPlanExperienceRequirements(mItem.design);
+        if (reqs.length) ctx.experienceRequirements = reqs;
+      }
     }
     if (g.type === 'application_activity') {
       // Fase 2: los minutos salen del item del Manifest congelado (nunca del ejecutor).

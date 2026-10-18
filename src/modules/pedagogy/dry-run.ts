@@ -33,15 +33,20 @@ import { defaultApproachRegistry } from './builtin-approaches';
 import { AppliedRule, DesignRules, deriveDesignRulesOrNull } from './design-rules';
 import {
   ObjectiveLint,
+  PedagogicalActivityDecision,
   StructureChange,
   applyPedagogyToSnapshot,
+  choosePedagogicalActivityTypes,
   effectiveChapterDesign,
   lintObjectives,
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
 import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileDesignPreferences, profileTargetHours } from './pedagogy-profile';
-import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
+import { LearningType, PEDAGOGY_ENGINE_VERSION } from './vocabulary';
+import { ChapterLearningTypeDesign, LEARNING_TYPE_LABELS, classifyLearningType, learningTypeJustification } from './learning-type';
+import { defaultFrameworkRegistry, frameworkSlotLabels } from './instructional-frameworks';
+import { profileLearningPlan } from './pedagogy-profile';
 
 /**
  * Motor pedagógico V1 — DRY RUN.
@@ -157,6 +162,13 @@ export interface DryRunChapterRow {
   scenario: { type: string; branching: boolean } | null;
   feedback: { mode: string; timing: string } | null;
   resources: string[] | null;
+  /**
+   * T2 (r57): SOLO con plan de aprendizaje — tipo de aprendizaje con su justificación (regla + evidencia, puntos de
+   * cada tipo) y la decisión de la actividad calificada (regla de la tabla, candidatos y por qué quedó ese tipo).
+   */
+  learningType?: ChapterLearningTypeDesign & { label: string; justification: string; scores: Partial<Record<LearningType, number>> };
+  framework?: { id: string; label: string; phaseLabels: Partial<Record<string, string>> };
+  activityDecision?: { type: string; reason: PedagogicalActivityDecision['reason']; ruleId: string; candidates: string[]; rationale: string } | null;
 }
 
 /** Fase 2: lo que recibe el generador de cada trabajo del Manifest pedagógico. */
@@ -231,6 +243,15 @@ export interface DryRunResult {
   /** Fase 2: brief de cada trabajo (vacío sin perfil: los prompts son los de siempre). */
   generators: DryRunGeneratorRow[];
   courseOverrides: DryRunCourseOverride[];
+  /**
+   * T2 (r57): SOLO si el perfil activa el plan de aprendizaje — marco del curso con sus fases y las fijaciones del
+   * docente que no corresponden a ningún capítulo de la estructura (se ignoran al congelar; se muestran para corregir).
+   */
+  learningPlan?: {
+    framework: { id: string; label: string; summary: string; phases: { id: string; order: number; label: string; studentLabel: string; slots: string[]; required: boolean; elements: string[] }[] };
+    phaseLabels: boolean;
+    unknownOverrides: string[];
+  };
 }
 
 const DELIVERED_AS: Readonly<Record<string, string>> = Object.freeze({
@@ -642,11 +663,28 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       examEnabled: !!m.examEnabled, examStyle: ped && m.examEnabled ? ped.assessment.examStyle : null,
     });
   });
+  // T2 (r57): decisiones de la actividad con el plan de aprendizaje (mismas funciones que el Manifest).
+  const planOn = !!ped?.learningPlan;
+  const decisions = planOn ? choosePedagogicalActivityTypes(view.blueprint, activityTypeRules) : null;
   for (const it of view.manifest.items) {
     if (it.type !== 'content') continue;
     const c = view.blueprint.modules.flatMap((m) => m.chapters).find((x) => x.id === it.chapterId)!;
     const b = baseChapterById.get(c.id)!;
     const d = c.design ? effectiveChapterDesign(view.blueprint, c.id) : null;
+    const lt = d?.learningType as ChapterLearningTypeDesign | undefined;
+    const dec = decisions?.get(c.id);
+    const planFields = planOn && lt && d
+      ? {
+        learningType: { ...lt, label: LEARNING_TYPE_LABELS[lt.type], justification: learningTypeJustification(lt), scores: classifyLearningType(c).scores },
+        framework: (() => {
+          const fw = defaultFrameworkRegistry().get(d.framework as string);
+          return { id: fw.id, label: fw.label, phaseLabels: frameworkSlotLabels(fw) };
+        })(),
+        activityDecision: dec?.learningType
+          ? { type: dec.type, reason: dec.reason, ruleId: dec.learningType.ruleId, candidates: [...dec.learningType.candidates], rationale: dec.learningType.rationale }
+          : null,
+      }
+      : {};
     chapters.push({
       moduleNumber: it.moduleNumber as number,
       chapterNumber: it.chapterNumber as number,
@@ -667,6 +705,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       scenario: d ? { ...d.scenario } : null,
       feedback: d ? { ...d.feedback } : null,
       resources: d ? [...d.resources] : null,
+      ...planFields,
     });
   }
 
@@ -693,8 +732,28 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   const alignment = base.course.academicContext
     ? alignmentOf(rules ? side(applyPedagogyToSnapshot(base, rules), activityTypeRules) : baseline, input.alignment, registry)
     : undefined;
+  const learningPlan = (() => {
+    if (!planOn || !rules?.learningPlan) return undefined;
+    const fw = defaultFrameworkRegistry().get(rules.learningPlan.framework);
+    const lp = profileLearningPlan(profile)!;
+    const ids = new Set(view.blueprint.modules.flatMap((m) => [m.id, ...m.chapters.map((c) => c.id)]));
+    const unknownOverrides = [...Object.keys(lp.chapterOverrides ?? {}), ...Object.keys(lp.moduleFrameworks ?? {})].filter((k) => !ids.has(k)).sort();
+    return {
+      framework: { id: fw.id, label: fw.label, summary: fw.summary, phases: fw.phases.map((p) => ({ id: p.id, order: p.order, label: p.label, studentLabel: p.studentLabel, slots: [...p.slots], required: p.required, elements: [...p.elements] })) },
+      phaseLabels: ped!.learningPlan!.phaseLabels,
+      unknownOverrides,
+    };
+  })();
+  if (learningPlan) {
+    summary.push(`Metodología: ${learningPlan.framework.label}${learningPlan.phaseLabels ? ' (fases visibles en el curso)' : ''}.`);
+    const byType = new Map<string, number>();
+    for (const ch of chapters) if (ch.learningType) byType.set(ch.learningType.label, (byType.get(ch.learningType.label) ?? 0) + 1);
+    summary.push(`Tipos de aprendizaje: ${[...byType.entries()].map(([k, n]) => `${k} ${n}`).join(' · ')}.`);
+    if (learningPlan.unknownOverrides.length) summary.push(`${learningPlan.unknownOverrides.length} ajuste(s) del plan apuntan a capítulos o módulos que ya no existen (se ignoran).`);
+  }
   return {
     ...(alignment ? { alignment } : {}),
+    ...(learningPlan ? { learningPlan } : {}),
     dryRun: true,
     providersCalled: 0,
     spendUsd: '0.00',

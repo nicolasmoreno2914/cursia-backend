@@ -1,6 +1,7 @@
 import { ApproachVote, PedagogicalApproachDefinition, PedagogicalApproachRegistry } from './approach-registry';
 import { defaultApproachRegistry } from './builtin-approaches';
 import {
+  LearningPlanConfig,
   PedagogicalProfile,
   isEmptyPedagogicalProfile,
   normalizePedagogicalProfile,
@@ -70,6 +71,8 @@ export interface DesignRules {
   suggestedWeights: { practice: number; moduleExams: number; finalExam: number };
   principles: string[];
   applied: AppliedRule[];
+  /** T2 (r57): plan de aprendizaje del perfil (normalizado). SOLO si el perfil lo activa. */
+  learningPlan?: LearningPlanConfig;
 }
 
 const PRIMARY_WEIGHT_WITH_SECONDARIES = 0.6;
@@ -269,6 +272,7 @@ export function deriveDesignRules(
     suggestedWeights,
     principles: [...profile.principles],
     applied,
+    ...(profile.learningPlan ? { learningPlan: JSON.parse(JSON.stringify(profile.learningPlan)) as LearningPlanConfig } : {}),
   };
 }
 

@@ -37,6 +37,11 @@ interface PedagogyLookup {
 function coursePedagogyDesignProjection(p: any): unknown {
   if (p === undefined || p === null) return undefined;
   const { profileSha256: _sha, engineVersion: _engine, ...design } = p;
+  // T2 (r57): mostrar u ocultar las fases es solo del empaquetado (rótulos del shell): no regenera contenido.
+  if (design.learningPlan && typeof design.learningPlan === 'object') {
+    const { phaseLabels: _labels, ...plan } = design.learningPlan;
+    return { ...design, learningPlan: plan };
+  }
   return design;
 }
 

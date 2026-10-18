@@ -17,7 +17,12 @@ import {
   ModuleDesign,
 } from './blueprint-design';
 import { DesignRules, deriveDesignRulesOrNull } from './design-rules';
-import { ChapterRole } from './vocabulary';
+import { defaultFrameworkRegistry } from './instructional-frameworks';
+import { learningTypeActivityRule, resolveChapterLearningType } from './learning-type';
+import { ChapterRole, LearningType } from './vocabulary';
+
+/** T2 (r57): versión del plan de aprendizaje congelado (clasificador + marcos + derivación de la actividad). */
+export const LEARNING_PLAN_VERSION = 1;
 
 /**
  * Motor pedagógico V1 — Reglas → Blueprint.
@@ -66,7 +71,30 @@ export function coursePedagogyFromRules(rules: DesignRules): CoursePedagogyDesig
     },
     principles: [...rules.principles],
     roleTargets: JSON.parse(JSON.stringify(rules.roleTargets)),
+    ...(rules.learningPlan
+      ? {
+        learningPlan: {
+          version: LEARNING_PLAN_VERSION,
+          framework: rules.learningPlan.framework,
+          phaseLabels: rules.learningPlan.phaseLabels ?? defaultFrameworkRegistry().get(rules.learningPlan.framework).phaseLabelsDefault,
+        },
+      }
+      : {}),
   };
+}
+
+/** T2 (r57): marco de un módulo (override del módulo o el del curso). null sin plan. */
+export function moduleFrameworkId(rules: DesignRules, moduleId: string): string | null {
+  const lp = rules.learningPlan;
+  if (!lp) return null;
+  return lp.moduleFrameworks?.[moduleId] ?? lp.framework;
+}
+
+/** T2 (r57): marco de un capítulo (override del capítulo > módulo > curso). null sin plan. */
+export function chapterFrameworkId(rules: DesignRules, moduleId: string, chapterId: string): string | null {
+  const lp = rules.learningPlan;
+  if (!lp) return null;
+  return lp.chapterOverrides?.[chapterId]?.framework ?? moduleFrameworkId(rules, moduleId);
 }
 
 /** Diseño base de un capítulo (sin rol: las variaciones por rol viven en course.pedagogy.roleTargets). */
@@ -92,9 +120,17 @@ export function moduleDesignFromRules(rules: DesignRules): ModuleDesign {
 
 export function deriveBlueprintPedagogy(snapshot: BlueprintSnapshotV2, rules: DesignRules): BlueprintPedagogyInput {
   const out: BlueprintPedagogyInput = { course: coursePedagogyFromRules(rules), modules: {}, chapters: {} };
+  const lp = rules.learningPlan;
   for (const m of sortedModules(snapshot)) {
-    out.modules[m.id] = moduleDesignFromRules(rules);
-    for (const c of m.chapters) out.chapters[c.id] = chapterDesignFromRules(rules);
+    const md = moduleDesignFromRules(rules);
+    // T2 (r57): con plan de aprendizaje, el marco del módulo y, por capítulo, su tipo de aprendizaje (reglas u override) y marco.
+    out.modules[m.id] = lp ? { ...md, framework: moduleFrameworkId(rules, m.id)! } : md;
+    for (const c of m.chapters) {
+      const cd = chapterDesignFromRules(rules);
+      out.chapters[c.id] = lp
+        ? { ...cd, learningType: resolveChapterLearningType(c, lp.chapterOverrides?.[c.id]?.learningType ?? null), framework: chapterFrameworkId(rules, m.id, c.id)! }
+        : cd;
+    }
   }
   return out;
 }
@@ -240,7 +276,9 @@ const DESIGN_INTENT_TYPE: Readonly<Record<string, PedagogicalH5pType>> = Object.
 
 export interface PedagogicalActivityDecision {
   type: PedagogicalH5pType;
-  reason: 'design_intent' | 'objective' | 'branching_cap' | 'variety';
+  reason: 'design_intent' | 'objective' | 'branching_cap' | 'variety' | 'learning_type';
+  /** T2 (r57): SOLO con plan de aprendizaje — regla de la tabla tipo de aprendizaje → actividad y sus candidatos. */
+  learningType?: { type: LearningType; level: string | null; ruleId: string; candidates: PedagogicalH5pType[]; rationale: string };
 }
 
 /** Tipos permitidos según las reglas de actividad del Manifest (branchingscenario solo con H5P v2 = 2). */
@@ -265,12 +303,19 @@ export function choosePedagogicalActivityTypes(
   if (!snapshot.course.pedagogy) throw new Error('choosePedagogicalActivityTypes: el snapshot no tiene diseño pedagógico');
   const allowed = allowedPedagogicalTypes(activityTypeRules);
   const v2 = activityTypeRules === 2;
-  const chapters: { id: string; role: string; candidates: PedagogicalH5pType[]; objectiveType: PedagogicalH5pType | null }[] = [];
+  const chapters: { id: string; role: string; candidates: PedagogicalH5pType[]; objectiveType: PedagogicalH5pType | null; lt?: PedagogicalActivityDecision['learningType'] }[] = [];
   for (const m of sortedModules(snapshot)) {
     for (const c of m.chapters) {
       if (c.activityEnabled !== true) continue;
       if (!c.design) throw new Error(`choosePedagogicalActivityTypes: el capítulo ${c.id} no tiene diseño`);
       const d = effectiveChapterDesign(snapshot, c.id);
+      if (d.learningType) {
+        // T2 (r57): el tipo de aprendizaje decide los candidatos (tabla de datos); el balance solo se mueve dentro de ellos.
+        const r = learningTypeActivityRule(d.learningType.type as LearningType, d.learningType.level, allowed);
+        const lt = { type: d.learningType.type as LearningType, level: d.learningType.level, ruleId: r.ruleId, candidates: r.candidates, rationale: r.rationale };
+        chapters.push({ id: c.id, role: d.role, candidates: r.candidates, objectiveType: null, lt });
+        continue;
+      }
       const prefs = d.activity.preferredTypes.filter((t): t is PedagogicalH5pType => (allowed as readonly string[]).includes(t));
       for (const t of allowed) if (!prefs.includes(t)) prefs.push(t);
       const intentType = DESIGN_INTENT_TYPE[d.activity.intent];
@@ -283,6 +328,10 @@ export function choosePedagogicalActivityTypes(
   }
   const out = new Map<string, PedagogicalActivityDecision>();
   for (const ch of chapters) {
+    if (ch.lt) {
+      out.set(ch.id, { type: ch.candidates[0], reason: 'learning_type', learningType: ch.lt });
+      continue;
+    }
     const top2 = ch.candidates.slice(0, 2);
     if (ch.objectiveType && ch.objectiveType !== ch.candidates[0] && top2.includes(ch.objectiveType)) {
       out.set(ch.id, { type: ch.objectiveType, reason: 'objective' });
@@ -304,7 +353,7 @@ export function choosePedagogicalActivityTypes(
       .sort((a, b) => priority(a.ch.role) - priority(b.ch.role) || a.idx - b.idx);
     for (const { ch } of bs.slice(cap)) {
       const t = nextOther(ch, new Set(['branchingscenario']));
-      if (t) out.set(ch.id, { type: t, reason: 'branching_cap' });
+      if (t) out.set(ch.id, { type: t, reason: 'branching_cap', ...(ch.lt ? { learningType: ch.lt } : {}) });
     }
   }
   // 4. Variedad.
@@ -325,7 +374,7 @@ export function choosePedagogicalActivityTypes(
       });
       if (!victim) break;
       const alt = victim.candidates.find((t) => t !== dominant && (t !== 'branchingscenario' || bsCount < bsCap))!;
-      out.set(victim.id, { type: alt, reason: 'variety' });
+      out.set(victim.id, { type: alt, reason: 'variety', ...(victim.lt ? { learningType: victim.lt } : {}) });
     }
   }
   return out;

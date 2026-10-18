@@ -13,6 +13,7 @@
  * Cualquier dato faltante o incoherente → throw FACTS_INVALID (nunca un
  * default inventado).
  */
+import { FrameworkSlot, defaultFrameworkRegistry, frameworkSlotLabels } from '../pedagogy/instructional-frameworks';
 import { VC_MOVEMENT_IDS, VcMovementId } from '../visual-components/schema';
 import {
   AnyBlueprintSnapshot,
@@ -136,6 +137,11 @@ export interface ChapterFacts {
    * capítulos cuya práctica guiada tiene su documento validado en el paquete: entran al tiempo del capítulo.
    */
   guidedPracticeMinutes?: number;
+  /**
+   * T2 (r57): rótulos visibles de las fases del marco instruccional por bloque del capítulo (bloque → rótulo). SOLO si
+   * el Blueprint trae plan de aprendizaje con `phaseLabels` activo; ausente = shell de siempre.
+   */
+  phaseLabels?: Partial<Record<FrameworkSlot, string>>;
   /** Diapositivas medidas de la presentación (0 en un capítulo de práctica: no tiene presentación). */
   slideCount: number;
   /**
@@ -262,6 +268,15 @@ function effectiveCategoryWeights(
   return { categoryWeights: out };
 }
 
+/** T2 (r57): rótulos de fase del capítulo (vacío sin plan de aprendizaje o con los rótulos apagados). */
+function chapterPhaseLabels(bp: BlueprintSnapshotV2, sc: { design?: { framework?: string } }): { phaseLabels?: Partial<Record<FrameworkSlot, string>> } {
+  const lp = bp.course.pedagogy?.learningPlan;
+  const fw = sc.design?.framework;
+  if (!lp || lp.phaseLabels !== true || typeof fw !== 'string') return {};
+  const labels = frameworkSlotLabels(defaultFrameworkRegistry().get(fw));
+  return Object.keys(labels).length ? { phaseLabels: labels } : {};
+}
+
 export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   const { manifest, blueprint, assessment, artifacts } = input ?? ({} as BuildCourseFactsInput);
   if (!manifest || manifest.rulesVersion !== 3) fail('el Manifest debe ser rulesVersion 3');
@@ -326,6 +341,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(mc.applicationMinutes !== undefined ? { applicationMinutes: mc.applicationMinutes } : {}),
         ...(mc.guidedPracticeMinutes !== undefined && guidedIds.has(mc.chapterId) ? { guidedPracticeMinutes: mc.guidedPracticeMinutes } : {}),
+        ...chapterPhaseLabels(bp, sc),
         slideCount: practice ? 0 : posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
       if (itemKeys.has(`application_activity:${mc.chapterId}`) !== (mc.applicationMinutes !== undefined)) fail(`Actividad de Aplicación del capítulo ${mc.chapterNumber} incoherente con el Manifest`);

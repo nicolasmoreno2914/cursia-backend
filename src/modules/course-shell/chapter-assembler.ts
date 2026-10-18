@@ -182,6 +182,16 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   });
   const s = bgSurf(h);
   const alt = s;
+  // T2 (r57): rótulo de la fase del marco instruccional en cada bloque (solo con ch.phaseLabels; sin él, bytes de siempre).
+  const phases = ch.phaseLabels;
+  const phaseChip = (slot: string, surf: { bg: string; fg: string } = s): string => {
+    const t = phases ? (phases as Record<string, string | undefined>)[slot] : undefined;
+    return t ? `<div class="cvc-phase">${chipH(h, 'proceso', t, mt, surf)}</div>` : '';
+  };
+  const withPhase = (slot: string, html: string): string => {
+    const chip = phaseChip(slot);
+    return chip ? injectIntoMovement(html, chip, '') : html;
+  };
 
   const slots: ChapterSlot[] = [];
   // [1] Apertura: identificación determinística + movimiento opening.
@@ -198,11 +208,11 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // [2] Presentación (obligatoria en V2.1 en los capítulos de contenido; el de práctica no tiene).
   if (!practice) slots.push({ kind: 'presentation' });
   // [3] Profundización (en la práctica: la práctica guiada).
-  slots.push(label('deepening', practice ? 'Práctica guiada' : 'Profundización', mv('deepening')));
+  slots.push(label('deepening', practice ? 'Práctica guiada' : 'Profundización', withPhase('deepening', mv('deepening'))));
   if (ch.guidedPracticeMinutes !== undefined && practice) shellFail(`capítulo de práctica ${ch.number} con ejercicios guiados`);
   // [4] Video: guía previa (plantilla + conceptos del LLM) + transición → video.
   if (ch.videoEnabled) {
-    const before = chipH(h, 'video', 'Video interactivo', mt, s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
+    const before = phaseChip('video') + chipH(h, 'video', 'Video interactivo', mt, s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
     const after = transitionBox(h, pHtml(h, labelHtml(COPY.videoGo), alt, { last: true }), mt.ink);
     slots.push(label('video_primer', 'Antes del video', injectIntoMovement(mv('video_primer'), before, after)));
     slots.push({ kind: 'video_h5p' });
@@ -215,7 +225,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     slots.push(label('video_pending', 'Video pendiente', root(h, uid('video_pending'), inner)));
   }
   // [5] Síntesis.
-  slots.push(label('synthesis', 'Síntesis', mv('synthesis')));
+  slots.push(label('synthesis', 'Síntesis', withPhase('synthesis', mv('synthesis'))));
   // Loop 9 B (fix M4): ejercicios guiados del capítulo de contenido (página visible, formativa) al terminar el estudio.
   if (ch.guidedPracticeMinutes !== undefined) slots.push({ kind: 'guided_practice' });
   // [6] Actividad (instrucción determinística con nota mínima/intentos de facts) o repaso no calificado.
@@ -230,6 +240,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
       `<span>${eduIcon(h.enh, 'repaso', mt.ink, 18)} ${labelHtml(k.attempts === 0 ? 'Intentos: sin límite' : `Intentos: ${k.attempts}`)}</span></p>`;
     const inner = box(
       h,
+      phaseChip('activity', pss) +
       chipH(h, 'practica', `Práctica calificada · Capítulo ${ch.number}`, mt, pss, true) +
         heading(h, 'h3', COPY.activityTitle, pss) +
         factsRow +
@@ -244,7 +255,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     slots.push(label('activity_instruction', 'Práctica', root(h, uid('activity_instruction'), inner)));
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {
-    const before = pHtml(h, labelHtml(COPY.selfCheckLead), s);
+    const before = phaseChip('self_check') + pHtml(h, labelHtml(COPY.selfCheckLead), s);
     // H2 fix round 1 (M-6): con «Repaso» (Dialog Cards) el label no repite el nombre «Repaso».
     slots.push(label('self_check', ch.reviewCards === true ? 'Comprueba lo aprendido' : 'Repaso', injectIntoMovement(mv('self_check'), before, '')));
   }
@@ -255,6 +266,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     const ps = surfOn(h.t, mt.soft);
     const inner = box(
       h,
+      phaseChip('application', ps) +
       chipH(h, 'practica', `Actividad de Aplicación · Capítulo ${ch.number} · ~${ch.applicationMinutes} min`, mt, ps, true) +
         heading(h, 'h3', 'Aplica lo aprendido', ps) +
         pHtml(h, labelHtml('Ejercicios graduados, un taller y un producto para entregar. Puedes resolverla en la plataforma o descargarla en PDF para trabajar en papel; al final revisa tu trabajo con la autoevaluación y los criterios.'), ps, { last: true }),
@@ -307,9 +319,9 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
       ctaButton(h, ctaSection(step.sectionNum), button, alt, fill),
     mt.ink,
   );
-  slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
-  const route = chapterRouteSteps(slots, { practice, reviewCards: ch.reviewCards === true, examNext });
-  slots.unshift(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, route, mt))));
+  slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), phaseChip('closing'), after)));
+  const route = chapterRouteSteps(slots, { practice, reviewCards: ch.reviewCards === true, examNext, ...(phases ? { phases } : {}) });
+  slots.unshift(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head + phaseChip('opening'), chapterRoute(h, route, mt))));
   return slots;
 }
 
@@ -353,23 +365,29 @@ export type ChapterRouteStep = [EduIcon, string];
  */
 export function chapterRouteSteps(
   slots: ReadonlyArray<ChapterSlot>,
-  o: { practice: boolean; reviewCards: boolean; examNext: boolean },
+  o: { practice: boolean; reviewCards: boolean; examNext: boolean; phases?: Partial<Record<string, string>> },
 ): ChapterRouteStep[] {
   const steps: ChapterRouteStep[] = [];
+  // T2 (r57): con rótulos de fase, cada paso del recorrido nombra su fase («Presentación · Teoría»).
+  const ph = o.phases;
+  const at = (slot: string, step: ChapterRouteStep): ChapterRouteStep => {
+    const t = ph?.[slot];
+    return t ? [step[0], `${step[1]} · ${t}`] : step;
+  };
   for (const sl of slots) {
-    if (sl.kind === 'presentation') steps.push(['presentacion', 'Presentación']);
-    else if (sl.kind === 'video_h5p') steps.push(['video', 'Video interactivo']);
-    else if (sl.kind === 'guided_practice') steps.push(['practica', 'Ejercicios guiados']);
-    else if (sl.kind === 'activity') steps.push(['practica', 'Práctica calificada']);
-    else if (sl.kind === 'review_cards') steps.push(['repaso', 'Repaso']);
-    else if (sl.kind === 'application') steps.push(['logro', 'Actividad de Aplicación']);
+    if (sl.kind === 'presentation') steps.push(at('presentation', ['presentacion', 'Presentación']));
+    else if (sl.kind === 'video_h5p') steps.push(at('video', ['video', 'Video interactivo']));
+    else if (sl.kind === 'guided_practice') steps.push(at('guided_practice', ['practica', 'Ejercicios guiados']));
+    else if (sl.kind === 'activity') steps.push(at('activity', ['practica', 'Práctica calificada']));
+    else if (sl.kind === 'review_cards') steps.push(at('review_cards', ['repaso', 'Repaso']));
+    else if (sl.kind === 'application') steps.push(at('application', ['logro', 'Actividad de Aplicación']));
     else if (sl.kind === 'label') {
-      if (sl.role === 'deepening') steps.push(o.practice ? ['practica', 'Práctica guiada'] : ['libro', 'Profundización']);
-      else if (sl.role === 'synthesis') steps.push(['logro', 'Síntesis']);
-      else if (sl.role === 'self_check') steps.push(['repaso', o.reviewCards ? 'Comprueba lo aprendido' : 'Repaso']);
+      if (sl.role === 'deepening') steps.push(at('deepening', o.practice ? ['practica', 'Práctica guiada'] : ['libro', 'Profundización']));
+      else if (sl.role === 'synthesis') steps.push(at('synthesis', ['logro', 'Síntesis']));
+      else if (sl.role === 'self_check') steps.push(at('self_check', ['repaso', o.reviewCards ? 'Comprueba lo aprendido' : 'Repaso']));
     }
   }
-  if (o.examNext) steps.push(['examen', 'Evaluación del módulo']);
+  if (o.examNext) steps.push(at('module_exam', ['examen', 'Evaluación del módulo']));
   return steps;
 }
 

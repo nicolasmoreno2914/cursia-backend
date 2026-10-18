@@ -1,3 +1,6 @@
+import { defaultFrameworkRegistry } from './instructional-frameworks';
+import { LEARNING_TYPE_LABELS, LEARNING_TYPE_SUMMARIES } from './learning-type';
+import { LEARNING_TYPES } from './vocabulary';
 import { loadDesignPins } from '../course-design/design-pins';
 import { DecisionOverrides, requirementConstraintsForCourse } from '../academic-context/requirements/requirement-authority';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
@@ -56,6 +59,12 @@ export class PedagogyService {
       engineVersion: PEDAGOGY_ENGINE_VERSION,
       approaches: registry.list().map((a) => ({ id: a.id, label: a.label, shortLabel: a.shortLabel, summary: a.summary, sequence: [...a.sequence] })),
       labels: { values: PEDAGOGY_VALUE_LABELS, sections: PEDAGOGY_SECTION_LABELS, targets: PEDAGOGY_TARGET_LABELS, roles: PEDAGOGY_ROLE_LABELS },
+      // T2 (r57): metodologías (marcos instruccionales) y tipos de aprendizaje para el panel.
+      frameworks: defaultFrameworkRegistry().list().map((f) => ({
+        id: f.id, label: f.label, shortLabel: f.shortLabel, summary: f.summary, phaseLabelsDefault: f.phaseLabelsDefault,
+        phases: f.phases.map((p) => ({ id: p.id, order: p.order, label: p.label, studentLabel: p.studentLabel, slots: [...p.slots], required: p.required, elements: [...p.elements] })),
+      })),
+      learningTypes: LEARNING_TYPES.map((t) => ({ id: t, label: LEARNING_TYPE_LABELS[t], summary: LEARNING_TYPE_SUMMARIES[t] })),
     };
   }
 

@@ -5,6 +5,9 @@ import { defaultApproachRegistry } from './builtin-approaches';
 import { PEDAGOGY_SECTION_LABELS, PEDAGOGY_VALUE_LABELS } from './labels';
 import { allowedPedagogicalTypes, choosePedagogicalActivityTypes, effectiveChapterDesign } from './pedagogical-blueprint';
 import { ENUM_TARGETS } from './vocabulary';
+import { chapterKindOf } from '../course-blueprints/blueprint-snapshot';
+import type { FrameworkExperienceRequirement } from './instructional-frameworks';
+import { learningPlanDirectives, learningPlanExperienceRequirements, missingLearningPlanTexts } from './learning-plan-directives';
 import { itemOutcomes, renderAlignmentBlock } from '../academic-context/alignment-brief';
 
 /**
@@ -88,6 +91,11 @@ export interface ItemPedagogyBrief {
   textSha256: string;
   /** Fase 3: ids de los resultados de aprendizaje que el item debe evidenciar (solo si el bloque entró al texto). */
   outcomes?: string[];
+  /**
+   * T2 (r57): SOLO experiencias de capítulos de contenido con marco instruccional que define requisitos: lo que la
+   * validación de la experiencia exige además de la estructura EV2 (el ejecutor la espeja; el backend es autoritativo).
+   */
+  experienceRequirements?: FrameworkExperienceRequirement[];
 }
 
 // ── Cobertura: qué hace cada tipo de item con el diseño ─────────────────────
@@ -594,15 +602,17 @@ function activityTypeOverrides(input: BriefInput): PedagogyOverride[] {
   const got = input.item.h5pType;
   if (!got) return out;
   let reason: string | undefined;
+  let decision: ReturnType<ReturnType<typeof choosePedagogicalActivityTypes>['get']>;
   try {
-    reason = choosePedagogicalActivityTypes(input.snapshot, input.activityTypeRules ?? null).get(chapterId)?.reason;
+    decision = choosePedagogicalActivityTypes(input.snapshot, input.activityTypeRules ?? null).get(chapterId);
+    reason = decision?.reason;
   } catch {
     reason = undefined;
   }
   if (reason === 'branching_cap') {
     out.push({ target: 'activity.preferredTypes', value: 'branchingscenario', by: 'product', scope: 'full', rule: 'Tope de escenarios ramificados por curso (uno cada cuatro actividades)', effect: `La actividad queda como «${label(got)}».` });
   } else if (reason === 'variety') {
-    out.push({ target: 'activity.preferredTypes', value: eff.activity.preferredTypes[0] ?? got, by: 'product', scope: 'full', rule: 'Variedad: ningún tipo de actividad domina el curso', effect: `La actividad queda como «${label(got)}».` });
+    out.push({ target: 'activity.preferredTypes', value: (decision?.learningType?.candidates[0]) ?? eff.activity.preferredTypes[0] ?? got, by: 'product', scope: 'full', rule: 'Variedad: ningún tipo de actividad domina el curso', effect: `La actividad queda como «${label(got)}».` });
   } else if (reason === 'objective') {
     out.push({ target: 'activity.intent', value: eff.activity.intent, by: 'course', scope: 'partial', rule: 'El objetivo del capítulo pide otro tipo (dentro de los 2 preferidos del enfoque)', effect: `La actividad queda como «${label(got)}».` });
   }
@@ -640,6 +650,11 @@ export function buildItemPedagogyBrief(input: BriefInput): ItemPedagogyBrief | n
   const outcomes = itemOutcomes(input.snapshot, input.item);
   if (!withDesign && !outcomes.length) return null;
   const { directives, overridden } = withDesign ? directivesFor(gen, input) : { directives: [] as PedagogyDirective[], overridden: [] as PedagogyOverride[] };
+  // T2 (r57): plan de aprendizaje (tipo de aprendizaje del capítulo + fases del marco). Solo si el diseño lo trae.
+  if (withDesign) directives.push(...learningPlanDirectives(gen, input.item.design as Record<string, any>, input.item.h5pType));
+  const requirements = withDesign && gen === 'experience' && input.item.chapterId && isContentChapter(input.snapshot, input.item.chapterId)
+    ? learningPlanExperienceRequirements(input.item.design as Record<string, any>)
+    : [];
   let text = withDesign ? renderText(gen, directives) : '';
   let alignment = '';
   if (outcomes.length && !PROVIDER_GENERATORS.has(gen)) {
@@ -657,7 +672,14 @@ export function buildItemPedagogyBrief(input: BriefInput): ItemPedagogyBrief | n
     text,
     textSha256: sha256(text),
     ...(alignment ? { outcomes: outcomes.map((o) => o.id) } : {}),
+    ...(requirements.length ? { experienceRequirements: requirements } : {}),
   };
+}
+
+/** ¿Capítulo de contenido? (los capítulos de práctica tienen su propia forma de experiencia: sin requisitos del marco). */
+function isContentChapter(snapshot: BlueprintSnapshotV2, chapterId: string): boolean {
+  const c = snapshot.modules.flatMap((m) => m.chapters).find((x) => x.id === chapterId);
+  return !!c && chapterKindOf(c) !== 'practice';
 }
 
 /** Valores del vocabulario que algún generador podría recibir sin texto (vacío = completo). */
@@ -684,5 +706,6 @@ export function missingGeneratorTexts(): string[] {
   check(CLOSING_TEXT, ENUM_TARGETS['module.closing'], 'module.closing');
   check(DEPTH_TEXT, ['introductory', 'standard', 'advanced'], 'depth');
   check(INTERACTION_LEVEL_TEXT, ['high', 'medium', 'low'], 'interactionLevel');
+  missing.push(...missingLearningPlanTexts());
   return missing;
 }

@@ -1,8 +1,8 @@
 /**
  * Motor pedagógico V1 — forma del diseño pedagógico dentro del Blueprint v2.
  *
- * Sin imports a propósito (lo usa blueprint-snapshot.ts; el motor importa
- * blueprint-snapshot.ts: este archivo corta el ciclo).
+ * Sin imports del motor a propósito (lo usa blueprint-snapshot.ts; el motor importa
+ * blueprint-snapshot.ts: este archivo corta el ciclo). Solo el vocabulario (vocabulary.ts, sin imports).
  *
  * Claves en el snapshot (SOLO cuando el curso tiene perfil pedagógico; sin
  * perfil el JSON canónico es byte a byte el de antes):
@@ -12,6 +12,26 @@
  * Los canonicalizadores construyen objetos NUEVOS en orden de claves fijo y
  * fallan fuerte ante un tipo inválido (nunca "arreglan" en silencio).
  */
+
+import { LEARNING_TYPES } from './vocabulary';
+
+/** T2 (r57): plan de aprendizaje congelado del curso (marco por defecto + rótulos visibles). */
+export interface CourseLearningPlanDesign {
+  version: number;
+  framework: string;
+  phaseLabels: boolean;
+}
+
+/** T2 (r57): tipo de aprendizaje congelado de un capítulo, con su justificación (learning-type.ts). */
+export interface ChapterLearningTypeFrozen {
+  type: string;
+  source: 'rules' | 'override';
+  rulesVersion: number;
+  ruleId: string;
+  level: string | null;
+  evidence: { field: string; cue: string; kind: string }[];
+  suggested?: string;
+}
 
 export interface CoursePedagogyDesign {
   engineVersion: number;
@@ -36,11 +56,15 @@ export interface CoursePedagogyDesign {
    * ni sus huellas (review I2).
    */
   roleTargets: Record<string, Record<string, string>>;
+  /** T2 (r57): SOLO con plan de aprendizaje (sin él, el JSON es el de siempre). */
+  learningPlan?: CourseLearningPlanDesign;
 }
 
 export interface ModuleDesign {
   opening: string;
   closing: string;
+  /** T2 (r57): marco del módulo (SOLO con plan de aprendizaje). */
+  framework?: string;
 }
 
 /** Diseño de un capítulo, independiente de su posición (ver CoursePedagogyDesign.roleTargets). */
@@ -55,6 +79,10 @@ export interface ChapterDesign {
   scenario: { type: string; branching: boolean };
   feedback: { mode: string; timing: string };
   resources: string[];
+  /** T2 (r57): SOLO con plan de aprendizaje. */
+  learningType?: ChapterLearningTypeFrozen;
+  /** T2 (r57): marco del capítulo (curso, módulo u override). SOLO con plan de aprendizaje. */
+  framework?: string;
 }
 
 /** Diseño completo listo para el builder del Blueprint (todo módulo y capítulo del curso). */
@@ -114,7 +142,40 @@ export function canonicalCoursePedagogy(v: unknown): CoursePedagogyDesign {
     },
     principles: Array.isArray(o.principles) ? (o.principles as unknown[]).map((x, i) => str(x, `course.pedagogy.principles[${i}]`)) : fail('course.pedagogy.principles', 'debe ser un array'),
     roleTargets: canonicalRoleTargets(o.roleTargets),
+    ...(o.learningPlan !== undefined ? { learningPlan: canonicalCourseLearningPlan(o.learningPlan) } : {}),
   };
+}
+
+function canonicalCourseLearningPlan(v: unknown): CourseLearningPlanDesign {
+  const o = obj(v, 'course.pedagogy.learningPlan');
+  if (typeof o.phaseLabels !== 'boolean') fail('course.pedagogy.learningPlan.phaseLabels', 'debe ser boolean');
+  return { version: num(o.version, 'course.pedagogy.learningPlan.version'), framework: str(o.framework, 'course.pedagogy.learningPlan.framework'), phaseLabels: o.phaseLabels as boolean };
+}
+
+function canonicalLearningType(v: unknown, path: string): ChapterLearningTypeFrozen {
+  const o = obj(v, path);
+  const type = str(o.type, `${path}.type`);
+  if (!(LEARNING_TYPES as readonly string[]).includes(type)) fail(`${path}.type`, `tipo de aprendizaje desconocido (${LEARNING_TYPES.join(', ')})`);
+  if (o.source !== 'rules' && o.source !== 'override') fail(`${path}.source`, "debe ser 'rules' u 'override'");
+  if (o.level !== null && typeof o.level !== 'string') fail(`${path}.level`, 'debe ser texto o null');
+  if (!Array.isArray(o.evidence)) fail(`${path}.evidence`, 'debe ser un array');
+  const out: ChapterLearningTypeFrozen = {
+    type,
+    source: o.source as 'rules' | 'override',
+    rulesVersion: num(o.rulesVersion, `${path}.rulesVersion`),
+    ruleId: str(o.ruleId, `${path}.ruleId`),
+    level: (o.level as string | null),
+    evidence: (o.evidence as unknown[]).map((x, i) => {
+      const e = obj(x, `${path}.evidence[${i}]`);
+      return { field: str(e.field, `${path}.evidence[${i}].field`), cue: str(e.cue, `${path}.evidence[${i}].cue`), kind: str(e.kind, `${path}.evidence[${i}].kind`) };
+    }),
+  };
+  if (o.suggested !== undefined) {
+    const sg = str(o.suggested, `${path}.suggested`);
+    if (!(LEARNING_TYPES as readonly string[]).includes(sg)) fail(`${path}.suggested`, 'tipo de aprendizaje desconocido');
+    out.suggested = sg;
+  }
+  return out;
 }
 
 /** Roles y metas en orden alfabético (determinístico, independiente del orden de jsonb). */
@@ -132,7 +193,11 @@ function canonicalRoleTargets(v: unknown): Record<string, Record<string, string>
 
 export function canonicalModuleDesign(v: unknown, path = 'module.design'): ModuleDesign {
   const o = obj(v, path);
-  return { opening: str(o.opening, `${path}.opening`), closing: str(o.closing, `${path}.closing`) };
+  return {
+    opening: str(o.opening, `${path}.opening`),
+    closing: str(o.closing, `${path}.closing`),
+    ...(o.framework !== undefined ? { framework: str(o.framework, `${path}.framework`) } : {}),
+  };
 }
 
 export function canonicalChapterDesign(v: unknown, path = 'chapter.design'): ChapterDesign {
@@ -153,5 +218,7 @@ export function canonicalChapterDesign(v: unknown, path = 'chapter.design'): Cha
     scenario: { type: str(scenario.type, `${path}.scenario.type`), branching: scenario.branching as boolean },
     feedback: { mode: str(feedback.mode, `${path}.feedback.mode`), timing: str(feedback.timing, `${path}.feedback.timing`) },
     resources: strList(o.resources, `${path}.resources`),
+    ...(o.learningType !== undefined ? { learningType: canonicalLearningType(o.learningType, `${path}.learningType`) } : {}),
+    ...(o.framework !== undefined ? { framework: str(o.framework, `${path}.framework`) } : {}),
   };
 }
