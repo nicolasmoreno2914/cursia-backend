@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { PROVIDER_BASE_URL_GUARD, assertProviderBaseUrlsSafe } from './config/provider-base-url-guard';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { DatabaseModule } from './database/database.module';
@@ -73,6 +74,11 @@ import { FinopsModule } from './modules/finops/finops.module';
     FinopsModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    // r58 (AU1 R3): en producción, una URL base de proveedor no oficial impide arrancar (la API y TODOS los
+    // workers cargan AppModule). Corre al inicializar el módulo, con el .env ya volcado en process.env.
+    { provide: PROVIDER_BASE_URL_GUARD, useFactory: () => (assertProviderBaseUrlsSafe(process.env), true) },
+  ],
 })
 export class AppModule {}
