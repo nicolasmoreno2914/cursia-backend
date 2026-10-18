@@ -127,6 +127,11 @@ export interface PackageStatusResult {
    */
   builderUpdateAvailable?: { packagedWith: string; current: string };
   /**
+   * r58 (I2): informe de calidad del paquete (formato común: contadores por severidad + hallazgos). SOLO para un SUPER_ADMIN
+   * (mismo criterio que builderUpdateAvailable): un MAJOR requiere resolución humana antes de entregar; no bloquea solo.
+   */
+  qualityReport?: Record<string, unknown>;
+  /**
    * DoD follow-up (R1): (no admin) el intento de paquete FINAL más reciente falló, así que se devuelve el
    * paquete final COMPLETADO anterior (sigue descargable; `stale`/`staleReason` dicen si ya no es el
    * vigente). Valor = worker_status del intento fallido. Ausente = se devuelve el job más reciente.
@@ -361,6 +366,8 @@ export class PackagingService {
         if (fresh.staleItemKeys) result.staleItemKeys = fresh.staleItemKeys;
       }
       if (fresh.builderUpdateAvailable && isSuperAdminEmail(actor?.email)) result.builderUpdateAvailable = fresh.builderUpdateAvailable;
+      const qr = job.output_summary?.qualityReport;
+      if (qr && typeof qr === 'object' && !Array.isArray(qr) && qr.counts && Array.isArray(qr.findings) && isSuperAdminEmail(actor?.email)) result.qualityReport = qr;
       const artifactId = job.output_summary?.artifactId as string | undefined;
       // Fix round 2 (M4): un paquete QA / degradado NUEVO (declarado en el job por PackagingService) es
       // solo de SUPER_ADMIN, también para descargar. Los paquetes ya construidos antes (sin packageKind

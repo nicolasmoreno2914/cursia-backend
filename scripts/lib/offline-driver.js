@@ -67,6 +67,7 @@ function libs(distRoot) {
     VAL: L('package/v3/mbz-validator-v3.js'),
     ASM: L('package/assessment/index.js'),
     THEME: L('modules/theme-engine/index.js'),
+    QR: L('modules/quality/course-quality-report.js'),
   };
 }
 
@@ -229,6 +230,8 @@ function schedulerFacade(X, state) {
       return out;
     },
     async manifestBlueprintSnapshot() { return state.locked; },
+    // r58 (I4-3): archivos de trabajo del capítulo desde el perfil de evaluación de la corrida (mismo mapeo que el servidor).
+    async practiceFilesForChapter(_q, _job, chapterId) { return chapterId ? X.SCH.practiceFilesOfProfile(state.assessmentProfile, chapterId) : []; },
   });
   return self;
 }
@@ -350,6 +353,7 @@ async function runInner(distRoot, cfg0, opts, barrier, attempts0) {
     manifest: manifestCanon, locked, structure, manifestId, ownerId, store: createMemStore(ns), items: new Map(),
     source: { courseId: locked.course.id, blueprintId: 1, blueprintNumber: 1, blueprintSha256: manifest.source.blueprintSha256 },
     job: { id: runId, course_id: cfg.courseId, frontend_course_id: null },
+    assessmentProfile: prep.assessment.profile || null,
     ctx: { context, context_hash: X.RH.canonicalContextHash(context) },
     rowOf(mItem) {
       return {
@@ -577,8 +581,18 @@ async function buildPackage(X, distRoot, prep, state, cfg, warnings) {
   const mbz = await z.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
   const validationMarked = await X.VAL.validateMbzV3(mbz, vargs);
   if (!validationMarked.ok) throw new DriverError('MBZ_V3_VALIDATION_FAILED', `con la marca sintética: ${validationMarked.issues.slice(0, 5).map((i) => `${i.code} ${i.where}`).join(' | ')}`);
+  // r58 (I2): el mismo informe de calidad que arma el worker al empaquetar (formato común, contadores por severidad).
+  const qualityReport = X.QR.buildPackageQualityReport({
+    manifest, blueprint: state.locked, contents: loaded.contents,
+    packageWarnings: [...built.summary.warnings, ...(built.summary.qualityWarnings || [])],
+    practiceResources: built.summary.practiceResources || null,
+    practiceTitles: new Map(((prep.assessment.profile && prep.assessment.profile.practiceResources) || []).map((r) => [r.id, r.title])),
+    hoursReport: built.expectations.facts.hoursReport || null,
+    builderVersion: built.summary.builderVersion,
+  });
   return {
     mbz, sha256: sha256(mbz), bytes: mbz.length, builderVersion: X.B.DYNAMIC_MBZ_BUILDER_VERSION_V3, validation: { ok: validationMarked.ok, issues: validationMarked.issues.length },
+    qualityReport,
     pendingVideos: split.pendingVideos, packageFixtures: filled, mockProviderItems: loaded.mockProviderItems, facts: built.expectations.facts, marker,
   };
 }
