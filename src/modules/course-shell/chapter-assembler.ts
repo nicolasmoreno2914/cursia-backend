@@ -61,7 +61,12 @@ export type ChapterSlot =
   /** Fase 2: Actividad de Aplicación (página del estudiante + solucionario docente oculto); solo con applicationMinutes. */
   | { kind: 'application' }
   /** Loop 9 B: página «Ejercicios guiados — <capítulo>» (visible), después de la síntesis (fin del estudio del capítulo); solo con guidedPracticeMinutes. */
-  | { kind: 'guided_practice' };
+  | { kind: 'guided_practice' }
+  /**
+   * T5 (r57): archivo de trabajo (mod_resource). Los de la Actividad de Aplicación van entre su instrucción y la actividad
+   * (la actividad los enlaza); los del capítulo, antes del cierre.
+   */
+  | { kind: 'practice_resource'; resourceId: string };
 
 export type ChapterLabelRole =
   | 'opening'
@@ -95,7 +100,7 @@ export interface AssembleChapterInput {
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
-export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean; application?: boolean; guidedPractice?: boolean }): string[] {
+export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean; application?: boolean; guidedPractice?: boolean; applicationResources?: number; chapterResources?: number }): string[] {
   // Motor de carga horaria: el capítulo de práctica no tiene presentación (ni video: lo valida el Blueprint).
   const seq = flags.practice ? ['label:opening', 'label:deepening'] : ['label:opening', 'presentation', 'label:deepening'];
   if (flags.videoEnabled) seq.push('label:video_primer', 'video_h5p');
@@ -107,7 +112,9 @@ export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnab
   else seq.push('label:self_check');
   if (flags.reviewCards) seq.push('review_cards');
   // Fase 2: Actividad de Aplicación = instrucción + página del estudiante + solucionario docente (oculto).
-  if (flags.application) seq.push('label:application_instruction', 'application', 'application_solution');
+  // T5 (r57): archivos de trabajo de la AA entre su instrucción y la actividad; los del capítulo, antes del cierre.
+  if (flags.application) seq.push('label:application_instruction', ...Array(flags.applicationResources ?? 0).fill('practice_resource'), 'application', 'application_solution');
+  for (let i = 0; i < (flags.chapterResources ?? 0); i++) seq.push('practice_resource');
   seq.push('label:closing');
   return seq;
 }
@@ -264,18 +271,26 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // Fase 2: Actividad de Aplicación (trabajo práctico con producto; sin nota en Moodle) antes del cierre.
   if (ch.applicationMinutes !== undefined) {
     const ps = surfOn(h.t, mt.soft);
+    const nAppRes = (ch.resources ?? []).filter((r) => r.relation === 'application').length;
+    const resourcesLead = nAppRes === 1 ? ' Antes de empezar, descarga el archivo de trabajo que está debajo.' : nAppRes > 1 ? ' Antes de empezar, descarga los archivos de trabajo que están debajo.' : '';
+    // T4 (r57): con entrega como Tarea, el texto dice dónde y cómo se entrega (y si cuenta en la nota final, solo si pesa).
+    const lead = ch.applicationDelivery?.mode === 'assign'
+      ? `Ejercicios graduados, un taller y un producto para entregar. Trabaja en la plataforma o en el PDF y entrega tu producto en la tarea de esta actividad; el docente la revisa con los criterios y te deja su retroalimentación.${ch.applicationDelivery.graded && applicationCountsInFinalGrade(assessment) ? ' Su nota cuenta en tu calificación final.' : ch.applicationDelivery.graded ? '' : ' Es formativa: no lleva nota.'}${resourcesLead}`
+      : `Ejercicios graduados, un taller y un producto para entregar. Puedes resolverla en la plataforma o descargarla en PDF para trabajar en papel; al final revisa tu trabajo con la autoevaluación y los criterios.${resourcesLead}`;
     const inner = box(
       h,
       phaseChip('application', ps) +
       chipH(h, 'practica', `Actividad de Aplicación · Capítulo ${ch.number} · ~${ch.applicationMinutes} min`, mt, ps, true) +
         heading(h, 'h3', 'Aplica lo aprendido', ps) +
-        pHtml(h, labelHtml('Ejercicios graduados, un taller y un producto para entregar. Puedes resolverla en la plataforma o descargarla en PDF para trabajar en papel; al final revisa tu trabajo con la autoevaluación y los criterios.'), ps, { last: true }),
+        pHtml(h, labelHtml(lead), ps, { last: true }),
       { s: ps, border: mt.edge },
       { cls: 'cvc-application' },
     );
     slots.push(label('application_instruction', 'Actividad de Aplicación', root(h, uid('application_instruction'), inner)));
+    for (const r of ch.resources ?? []) if (r.relation === 'application') slots.push({ kind: 'practice_resource', resourceId: r.id });
     slots.push({ kind: 'application' });
   }
+  for (const r of ch.resources ?? []) if (r.relation === 'chapter') slots.push({ kind: 'practice_resource', resourceId: r.id });
   // [7] Cierre + puente (LLM, sin recursos) + transiciones determinísticas.
   // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
   // capítulo; antes de un examen de módulo o al final del curso manda la
@@ -381,6 +396,7 @@ export function chapterRouteSteps(
     else if (sl.kind === 'activity') steps.push(at('activity', ['practica', 'Práctica calificada']));
     else if (sl.kind === 'review_cards') steps.push(at('review_cards', ['repaso', 'Repaso']));
     else if (sl.kind === 'application') steps.push(at('application', ['logro', 'Actividad de Aplicación']));
+    // T5 (r57): los archivos de trabajo no son un paso del recorrido (se descargan dentro de la actividad o del capítulo).
     else if (sl.kind === 'label') {
       if (sl.role === 'deepening') steps.push(at('deepening', o.practice ? ['practica', 'Práctica guiada'] : ['libro', 'Profundización']));
       else if (sl.role === 'synthesis') steps.push(at('synthesis', ['logro', 'Síntesis']));
@@ -483,3 +499,14 @@ export function assembleAllChapters(
   });
 }
 
+
+/**
+ * T4 (r57): ¿las Tareas calificadas pesan en la nota final? Su categoría (propia o práctica) con peso efectivo > 0.
+ * Facts sin pesos (anteriores) → sí.
+ */
+export function applicationCountsInFinalGrade(assessment: CourseFacts['assessment']): boolean {
+  const a = assessment.application;
+  if (!a || !a.graded || !a.category) return false;
+  const w = assessment.categoryWeights;
+  return !w || (w[a.category] ?? 0) > 0;
+}

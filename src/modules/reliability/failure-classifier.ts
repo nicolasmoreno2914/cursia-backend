@@ -545,12 +545,15 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'LIBRO_V3_GLYPHS',
       // Fase 2: pdfkit no pudo generar el PDF imprimible de una Actividad de Aplicación / documento ya validado sin
       // actividad o sin solucionario al llegar al render → bug de producto (el item ya pasó su validación).
-      'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID'],
+      'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID',
+      // r57 T4: XML de la Tarea / rúbrica fuera de rango con un perfil ya validado → bug de producto.
+      'ASSIGN_XML_INVALID', 'ASSIGN_RUBRIC_INVALID'],
     family: /^(MBZ_V3_[A-Z0-9_]+|ASSESSMENT_[A-Z0-9_]+|WEIGHTS_[A-Z0-9_]+|THEME_[A-Z0-9_]+|H5P_PROFILE_[A-Z0-9_]+|H5P_PACK_[A-Z0-9_]+|H5P_L10N_[A-Z0-9_]+|H5P_PREFLIGHT_[A-Z0-9_]+|H5P_STORE_[A-Z0-9_]+|H5P_UUID_[A-Z0-9_]+|H5P_SUBCONTENT_[A-Z0-9_]+|MOCK_[A-Z0-9_]+|ACTIVITY_TYPE_INVALID_[A-Z0-9_]+)$/,
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
   },
   {
-    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed'],
+    // r57 T5: un archivo de trabajo del perfil falta o no es el que se adjuntó (sha256/tamaño/tipo) → el usuario lo corrige.
+    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID'],
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'config', adminAction: 'resolve_package_block',
   },
 ] as Rule[]);

@@ -26,6 +26,40 @@ export interface ApplicationPageInput {
   /** Nombre del PDF adjunto a la página (en su filearea; el enlace usa @@PLUGINFILE@@). */
   pdfFilename: string;
   tone: Tone;
+  /**
+   * T4 (r57): la AA se entrega como Tarea de Moodle — la página es la descripción de la tarea y lleva «Cómo entregar».
+   * Ausente = la página de siempre (byte a byte).
+   */
+  delivery?: ApplicationDeliveryText;
+  /** T5 (r57): archivos de trabajo de la AA (enlaces a su recurso del curso). Ausente/vacío = sin la sección. */
+  resources?: Array<{ title: string; instructions: string; href: string; filename: string }>;
+}
+
+/** T4 (r57): lo que la sección «Cómo entregar» le dice al estudiante (de la entrega efectiva del perfil). */
+export interface ApplicationDeliveryText {
+  onlineText: boolean;
+  file: boolean;
+  maxFiles: number;
+  maxMegabytes: number;
+  fileTypes: string[];
+  dueOffsetDays: number | null;
+  graded: boolean;
+  maxGrade: number | null;
+  rubric: boolean;
+}
+
+/** Oraciones de «Cómo entregar» (texto plano, determinístico). */
+export function applicationDeliveryLines(d: ApplicationDeliveryText): string[] {
+  const kinds = [d.onlineText ? 'escribir tu respuesta en el editor de texto de la tarea' : '', d.file ? `subir ${d.maxFiles === 1 ? 'un archivo' : `hasta ${d.maxFiles} archivos`} (máximo ${d.maxMegabytes} MB por archivo${d.fileTypes.length ? `; formatos ${d.fileTypes.join(', ')}` : ''})` : '']
+    .filter(Boolean);
+  const lines = [
+    `Entrega tu producto en esta tarea: puedes ${kinds.join(' o ')}. Al enviar tu entrega, la actividad queda completada.`,
+    d.dueOffsetDays === null ? 'No tiene fecha límite: entrégala cuando la termines.' : 'La fecha límite aparece arriba, en la información de la tarea.',
+    d.graded
+      ? `El docente la califica sobre ${d.maxGrade}${d.rubric ? ' con una rúbrica hecha con los criterios de evaluación' : ' con los criterios de evaluación'} y te deja comentarios de retroalimentación.`
+      : 'Es formativa: no lleva nota. El docente la revisa con los criterios de evaluación y te deja comentarios de retroalimentación.',
+  ];
+  return lines;
 }
 
 export interface ApplicationPage {
@@ -137,6 +171,15 @@ export function applicationStudentPage(input: ApplicationPageInput, theme: Resol
   body += section(h, 'logro', ink, 'Producto o evidencia', s) +
     pHtml(h, inlineHtml(a.deliverable.description), s) +
     pHtml(h, `<strong>${labelHtml('Formato: ')}</strong>${inlineHtml(a.deliverable.format)}${labelHtml(' · ')}<strong>${labelHtml('Extensión: ')}</strong>${inlineHtml(a.deliverable.extent)}`, s, { secondary: true }) + end;
+  // T5 (r57): archivos de trabajo (cada uno en su recurso del capítulo).
+  if (input.resources && input.resources.length) {
+    body += section(h, 'libro', ink, input.resources.length === 1 ? 'Archivo de trabajo' : 'Archivos de trabajo', s) +
+      ul(h, input.resources.map((r) => link(h, r.href, `${r.title} (${r.filename}) →`, s, { target: '_blank' }) + (r.instructions.trim() ? `${labelHtml(' — ')}${inlineHtml(r.instructions.trim())}` : '')), s) + end;
+  }
+  // T4 (r57): entrega como Tarea de Moodle.
+  if (input.delivery) {
+    body += section(h, 'logro', ink, 'Cómo entregar', s) + applicationDeliveryLines(input.delivery).map((t, i, xs) => pHtml(h, labelHtml(t), s, { last: i === xs.length - 1 })).join('') + end;
+  }
   body += section(h, 'check', ex, 'Autoevaluación: revisa tu trabajo', s) + ul(h, a.selfCheck.map((x: string) => `${labelHtml('☐ ')}${inlineHtml(x)}`), s) + end;
   body += section(h, 'objetivo', ink, 'Criterios de evaluación', s) +
     ul(h, a.criteria.map((c: any) => `<strong>${inlineHtml(c.name)}</strong>${labelHtml(` (${c.weight} %) — `)}${inlineHtml(c.description)}`), s) + end;
@@ -189,4 +232,26 @@ export function applicationSolutionPage(input: ApplicationPageInput, theme: Reso
   body += end;
   body += section(h, 'reflexion', ink, 'Observaciones para el docente', s) + ul(h, sol.teacherNotes.map((x: string) => inlineHtml(x)), s) + end;
   return finish(name, `application-solution-ch${input.chapterNumber}`, h, body);
+}
+
+/** T5 (r57): nombre del recurso del archivo de trabajo en el curso. */
+export function practiceResourceName(r: { title: string; relation: 'application' | 'chapter' }, chapterNumber: number): string {
+  return r.relation === 'application'
+    ? `Archivo de trabajo · Actividad de Aplicación del capítulo ${chapterNumber}: ${r.title}`
+    : `Archivo de trabajo · Capítulo ${chapterNumber}: ${r.title}`;
+}
+
+/** T5 (r57): descripción del recurso (se muestra en la página del curso, debajo del enlace de descarga). */
+export function practiceResourceIntro(
+  r: { id: string; title: string; instructions: string; relation: 'application' | 'chapter'; filename: string },
+  chapterNumber: number,
+  theme: ResolvedTheme,
+): string {
+  const h = hx(theme);
+  const s = bgSurf(h);
+  const what = r.relation === 'application'
+    ? `Archivo de trabajo de la Actividad de Aplicación del capítulo ${chapterNumber} (${r.filename}). Descárgalo, trabaja sobre él y entrega tu resultado en la actividad.`
+    : `Archivo de trabajo del capítulo ${chapterNumber} (${r.filename}). Descárgalo para practicar.`;
+  const body = pHtml(h, labelHtml(what), s, { last: !r.instructions.trim() }) + (r.instructions.trim() ? pHtml(h, inlineHtml(r.instructions.trim()), s, { last: true, secondary: true }) : '');
+  return finish(`Archivo de trabajo: ${r.title}`, `practice-resource-ch${chapterNumber}-${r.id}`, h, body).html;
 }

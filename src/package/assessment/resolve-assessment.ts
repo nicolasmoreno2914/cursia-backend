@@ -5,6 +5,12 @@ import {
   GradeMethod,
   validateAssessmentProfile,
 } from '../../modules/course-profiles/course-profiles';
+import {
+  ApplicationDeliveryProfile,
+  ApplicationGradeCategory,
+  ApplicationSubmissionSettings,
+  gradedAssignCount,
+} from '../../modules/course-profiles/application-delivery';
 
 /**
  * Cursia V2.1 — R6: perfil de evaluación → valores efectivos para Moodle
@@ -15,11 +21,13 @@ import {
  * paquete nunca decide aprobado/no aprobado; lo decide el gradebook.
  */
 
-export type AssessmentCategoryKey = 'practice' | 'moduleExams' | 'finalExam';
+/** T4 (r57): `applications` = «Actividades de Aplicación» (Tareas calificadas en su propia categoría); solo si el perfil la pesa. */
+export type AssessmentCategoryKey = 'practice' | 'applications' | 'moduleExams' | 'finalExam';
 
 /** Nombres fijos de las categorías del gradebook (§K.5). No se traducen ni se configuran. */
 export const ASSESSMENT_CATEGORY_NAMES: Readonly<Record<AssessmentCategoryKey, string>> = Object.freeze({
   practice: 'Práctica de capítulos',
+  applications: 'Actividades de Aplicación',
   moduleExams: 'Evaluaciones de módulo',
   finalExam: 'Evaluación final',
 });
@@ -77,6 +85,37 @@ export interface ResolvedCourseCompletion {
   profileFlags: { requireAllChapterActivities: boolean; requireExams: boolean; requireCourseGradePass: boolean };
 }
 
+/**
+ * T4 (r57): entrega EFECTIVA de las Actividades de Aplicación (solo si el perfil trae `applicationDelivery`).
+ * `graded` → cada Tarea es un ítem de nota (grademax = maxGrade) en `category`; formativa → sin ítem de nota.
+ */
+export interface ResolvedApplicationDelivery {
+  mode: 'page' | 'assign';
+  chapterModes: Record<string, 'page' | 'assign'>;
+  submission: ApplicationSubmissionSettings;
+  dueOffsetDays: number | null;
+  graded: boolean;
+  maxGrade: number | null;
+  gradepass: number | null;
+  category: ApplicationGradeCategory | null;
+  rubric: boolean;
+}
+
+export function resolveApplicationDelivery(d: ApplicationDeliveryProfile): ResolvedApplicationDelivery {
+  const g = d.grading;
+  return {
+    mode: d.mode,
+    chapterModes: { ...(d.chapterModes ?? {}) },
+    submission: { ...d.submission, fileTypes: [...d.submission.fileTypes] },
+    dueOffsetDays: d.dueOffsetDays,
+    graded: g.graded,
+    maxGrade: g.graded ? g.maxGrade : null,
+    gradepass: g.graded ? g.gradepass : null,
+    category: g.graded ? g.category : null,
+    rubric: g.graded ? g.rubric : false,
+  };
+}
+
 export interface ResolvedAssessment {
   assessmentProfileVersion: number;
   hasFinalExam: boolean;
@@ -109,6 +148,8 @@ export interface ResolvedAssessment {
   originalWeights?: Partial<Record<AssessmentCategoryKey, number>>;
   emptyCategories?: AssessmentCategoryKey[];
   withoutGrades?: boolean;
+  /** T4 (r57): solo con `applicationDelivery` en el perfil (sin ella, la evaluación resuelta de siempre). */
+  application?: ResolvedApplicationDelivery;
 }
 
 export interface AssessmentFacts {
@@ -130,23 +171,32 @@ export interface AssessmentFacts {
 }
 
 /** Orden fijo de las categorías (también desempata el resto mayor). */
-export const ASSESSMENT_CATEGORY_ORDER: readonly AssessmentCategoryKey[] = Object.freeze(['practice', 'moduleExams', 'finalExam']);
+export const ASSESSMENT_CATEGORY_ORDER: readonly AssessmentCategoryKey[] = Object.freeze(['practice', 'applications', 'moduleExams', 'finalExam']);
 
 /**
  * F1 (I3): ítems calificables por categoría a partir de los tipos de item de
  * un Manifest (v3): `video` + `activity` → practice, `exam` → moduleExams,
  * `final_exam` → finalExam. Pura.
  */
-export function assessmentItemCountsFromManifest(manifest: { items: ReadonlyArray<{ type: string }> }): Record<AssessmentCategoryKey, number> {
+export function assessmentItemCountsFromManifest(
+  manifest: { items: ReadonlyArray<{ type: string; key?: string; chapterId?: string | null }> },
+  profile?: Pick<AssessmentProfile, 'applicationDelivery' | 'categoryWeights'> | null,
+): Partial<Record<AssessmentCategoryKey, number>> & Record<'practice' | 'moduleExams' | 'finalExam', number> {
   if (!manifest || !Array.isArray(manifest.items)) {
     throw new Error('ASSESSMENT_INVALID_FACTS: el Manifest no tiene items');
   }
   const count = (t: string) => manifest.items.filter((i) => i && i.type === t).length;
-  return {
+  const base = {
     practice: count('video') + count('activity'),
     moduleExams: count('exam'),
     finalExam: count('final_exam'),
   };
+  // T4 (r57): las Tareas calificadas son ítems de su categoría (propia o práctica). Sin entrega: los conteos de siempre.
+  const ga = gradedAssignCount(manifest, profile?.applicationDelivery ?? null);
+  const ownKey = !!profile && profile.categoryWeights && 'applications' in (profile.categoryWeights as object);
+  if (ga.category === 'applications' || ownKey) return { ...base, applications: ga.category === 'applications' ? ga.count : 0 };
+  if (ga.category === 'practice') return { ...base, practice: base.practice + ga.count };
+  return base;
 }
 
 /**
@@ -154,10 +204,11 @@ export function assessmentItemCountsFromManifest(manifest: { items: ReadonlyArra
  * previa) que el paquete omite. Única fuente para servicio, worker y builder.
  */
 export function assessmentItemCountsForPackage(
-  manifest: { items: ReadonlyArray<{ type: string; key?: string }> },
+  manifest: { items: ReadonlyArray<{ type: string; key?: string; chapterId?: string | null }> },
   omittedVideoKeys: readonly string[] = [],
-): Record<AssessmentCategoryKey, number> {
-  const counts = assessmentItemCountsFromManifest(manifest);
+  profile?: Pick<AssessmentProfile, 'applicationDelivery' | 'categoryWeights'> | null,
+): Partial<Record<AssessmentCategoryKey, number>> & Record<'practice' | 'moduleExams' | 'finalExam', number> {
+  const counts = assessmentItemCountsFromManifest(manifest, profile);
   const videoKeys = new Set(manifest.items.filter((i) => i && i.type === 'video').map((i) => i.key));
   for (const k of new Set(omittedVideoKeys)) {
     if (!videoKeys.has(k)) throw new Error(`ASSESSMENT_INVALID_FACTS: video omitido desconocido (${k})`);
@@ -246,10 +297,11 @@ export function resolveAssessment(profile: AssessmentProfile, facts: AssessmentF
     };
   }
 
-  const keys: AssessmentCategoryKey[] = facts.hasFinalExam
-    ? ['practice', 'moduleExams', 'finalExam']
-    : ['practice', 'moduleExams'];
   const w = profile.categoryWeights as unknown as Record<string, number>;
+  // T4 (r57): la categoría «Actividades de Aplicación» existe SOLO si el perfil la pesa (validado: Tareas calificadas en ella).
+  const keys: AssessmentCategoryKey[] = ASSESSMENT_CATEGORY_ORDER.filter((k) =>
+    k === 'applications' ? 'applications' in w : k === 'finalExam' ? facts.hasFinalExam : true,
+  );
   const profileCategories: ResolvedCategory[] = keys.map((key) => ({
     key,
     fullname: ASSESSMENT_CATEGORY_NAMES[key],
@@ -284,6 +336,7 @@ export function resolveAssessment(profile: AssessmentProfile, facts: AssessmentF
     hasFinalExam: facts.hasFinalExam,
     courseGradepass: profile.passingGrade,
     kinds,
+    ...(profile.applicationDelivery ? { application: resolveApplicationDelivery(profile.applicationDelivery) } : {}),
   };
   if (facts.itemCounts === undefined) {
     assertCoursePassingGrade();

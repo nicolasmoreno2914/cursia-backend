@@ -28,6 +28,7 @@ import {
   artifactsServiceLoadersV3,
   loadContentsV3,
   prepareV3Package,
+  loadPracticeFilesV3,
 } from '../modules/dynamic-packaging/packaging-v3';
 import { resolveTheme } from '../modules/theme-engine';
 import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
@@ -547,6 +548,9 @@ export async function processV3PackageJob(
   const theme = resolveTheme(prepared.profiles.theme.input);
   const loaders = deps.loadersV3 ? deps.loadersV3(job.owner_id) : artifactsServiceLoadersV3(deps.artifacts, job.owner_id);
   const loaded = await loadContentsV3(loaders, plan, prepared.byItem, prepared.run, { familyId: theme.familyId, mode: theme.mode });
+  // T5 (r57): archivos de trabajo SUBIDOS del perfil (los de tabla los genera el builder). Sin ellos, la entrada de siempre.
+  const practiceFiles = await loadPracticeFilesV3(q, loaders, job.owner_id, prepared.profiles.assessment);
+  if (practiceFiles.size) loaded.contents.practiceFiles = practiceFiles;
   if (isLeaseLost()) return;
 
   const build = deps.buildMbzV3 ?? buildDynamicMbzV3;
@@ -573,7 +577,7 @@ export async function processV3PackageJob(
   const resolved = resolveAssessment(prepared.profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,
-    itemCounts: assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys),
+    itemCounts: assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys, prepared.profiles.assessment),
   });
   if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
     throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');

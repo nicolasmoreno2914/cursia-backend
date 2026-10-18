@@ -960,6 +960,36 @@ export async function loadContentsV3(
   };
 }
 
+// ─── T5 (r57): archivos de trabajo SUBIDOS del perfil de evaluación ─────────
+
+/** Tipo de artifact de un archivo de trabajo subido desde el panel (artifactUpload del frontend). */
+export const PRACTICE_FILE_ARTIFACT_TYPE = 'practice_file';
+
+/**
+ * Descarga los archivos de trabajo `source.kind = 'artifact'` del perfil: el artifact debe ser del DUEÑO del run, de tipo
+ * `practice_file` y estar en su carpeta de Storage (assertOwnerStoragePath). Los bytes se verifican en el builder
+ * (sha256/tamaño/formato contra el perfil): acá solo se cargan. Un artifact faltante falla fuerte (nunca se omite).
+ */
+export async function loadPracticeFilesV3(
+  q: QueryExecutor,
+  L: Pick<ContentLoadersV3, 'loadStorageBytes'>,
+  ownerId: string,
+  profile: { practiceResources?: ReadonlyArray<{ id: string; source: { kind: string; artifactId?: string } }> } | null | undefined,
+): Promise<Map<string, Buffer>> {
+  const out = new Map<string, Buffer>();
+  for (const r of profile?.practiceResources ?? []) {
+    if (r.source.kind !== 'artifact') continue;
+    const [row] = await q.query(
+      `select id, owner_id, type, storage_bucket, storage_path from public.artifacts where id = $1 and owner_id = $2`,
+      [r.source.artifactId, ownerId],
+    );
+    if (!row) throw new Error(`${PACKAGING_V3}: el archivo de trabajo ${r.id} (artifact ${r.source.artifactId}) no existe o no es del dueño del curso`);
+    if (row.type !== PRACTICE_FILE_ARTIFACT_TYPE) throw new Error(`${PACKAGING_V3}: el artifact ${r.source.artifactId} del archivo de trabajo ${r.id} es de tipo ${row.type}, no ${PRACTICE_FILE_ARTIFACT_TYPE}`);
+    out.set(r.id, await L.loadStorageBytes(row.storage_bucket || 'cursia-artifacts', row.storage_path));
+  }
+  return out;
+}
+
 // ─── Preparación compartida (servicio + worker): una sola fuente de la clave ──
 
 export interface PreparedV3Package {
@@ -1106,7 +1136,7 @@ export async function prepareV3Package(
   // Falla temprano (antes de encolar/descargar) si el perfil vigente no se puede aplicar a ESTE run
   // (p.ej. pesos con examen final y el run no lo tiene: R3 ruling 7; intentos no aplicables: R6).
   // F1 (I3): las categorías vacías se omiten y sus pesos se redistribuyen (o el curso queda sin nota).
-  const itemCounts = assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys);
+  const itemCounts = assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys, profiles.assessment);
   const resolved = resolveAssessment(profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,

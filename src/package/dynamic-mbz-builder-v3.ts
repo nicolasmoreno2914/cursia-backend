@@ -144,7 +144,10 @@ import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { examExplanationsAvailability, examOverallFeedbackBands } from '../modules/course-shell/exam-explanations';
 import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { reviewCardsEnabledFor } from '../modules/study-time/manifest-input';
-import { applicationSolutionPage, applicationStudentPage } from '../modules/course-shell/application-pages';
+import { ApplicationDeliveryText, applicationSolutionPage, applicationStudentPage, practiceResourceIntro, practiceResourceName } from '../modules/course-shell/application-pages';
+import { deliveryMegabytes } from '../modules/course-shell/facts';
+import { ASSIGN_PLUGIN_CONFIG_COUNT, assignActivityXml, assignDueDate, assignGradeItemXml, assignRubricGradingXml, rubricCriteriaFromApplication } from './v3/assign-v3';
+import { resolvePracticeFiles } from './v3/practice-files';
 import { guidedPracticeLibroMarkdown, guidedPracticePage } from '../modules/course-shell/guided-practice-page';
 import { validateGuidedPracticeDoc } from '../modules/course-shell/guided-practice';
 import { renderApplicationPdf } from './v3/application-pdf';
@@ -259,6 +262,11 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * capítulos reales (práctica incluida) y «Referencias» desde fuentes estructuradas; summary.qualityWarnings
  * (aperturas repetidas entre capítulos, sesgo de longitud de las MC de los videos). Un paquete sin esos casos es
  * byte a byte el de 3.14.0 (los dorados no cambian).
+ * T4/T5 (r57, misma versión 3.15.0): Actividad de Aplicación como Tarea (mod_assign: entrega, completion al enviar,
+ * comentarios, nota en su categoría + rúbrica gradingform_rubric, o formativa sin nota) y archivos de trabajo (mod_resource
+ * enlazados desde la AA), ambos desde claves OPCIONALES del perfil de evaluación (`applicationDelivery`,
+ * `practiceResources`). Sin esas claves el paquete es byte a byte el de antes (dorado scripts/fixtures/deliverables); con
+ * ellas cambia el sha del perfil y, con él, la clave de reuse — no hace falta subir la versión.
  */
 export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.15.0';
 
@@ -314,6 +322,11 @@ export interface DynamicPackageContentsV3 {
    * cada documento se empaqueta como página visible del capítulo y al final del capítulo en el Libro Guía.
    */
   guidedPractices?: Map<string, unknown>;
+  /**
+   * T5 (r57): resourceId → bytes de los archivos de trabajo SUBIDOS (artifact `practice_file`) del perfil de evaluación.
+   * Los generados desde una tabla (CSV/XLSX) los produce el builder. Ausente = ninguno subido.
+   */
+  practiceFiles?: Map<string, Buffer>;
 }
 
 export interface BuildDynamicMbzV3Input {
@@ -413,6 +426,10 @@ export interface BuildDynamicMbzV3Result {
     restore?: { as: 'site_library_pack'; libraryPack: 'v3'; note: string } | { as: 'admin_or_manager'; note: string };
     /** r19 (L): Libro Guía en PDF — archivo, páginas y el logo usado como marca de agua. */
     libro: { filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string };
+    /** T4 (r57): Actividades de Aplicación entregadas como Tarea (solo si hay alguna). */
+    applicationAssigns?: { count: number; graded: number; rubric: number; category: string | null };
+    /** T5 (r57): archivos de trabajo publicados (solo si hay alguno): id, capítulo, archivo, sha256, bytes y origen. */
+    practiceResources?: Array<{ id: string; chapterId: string; filename: string; mimetype: string; sha256: string; bytes: number; origin: string; relation: string }>;
   };
 }
 
@@ -469,7 +486,8 @@ export class PackagingV3ContentMissingError extends Error {
 
 // ─── ids fijos ─────────────────────────────────────────────────────────────
 
-const CAT_ID: Record<AssessmentCategoryKey, number> = { practice: 2, moduleExams: 3, finalExam: 4 };
+// T4 (r57): `applications` (id 5) solo existe en el gradebook si el perfil la pesa: los ids 2–4 no cambian.
+const CAT_ID: Record<AssessmentCategoryKey, number> = { practice: 2, moduleExams: 3, finalExam: 4, applications: 5 };
 const NULL = '$@NULL@$';
 const EMPTY_SHA1 = 'da39a3ee5e6b4b0d3255bfef95601890afd80709';
 
@@ -909,7 +927,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const resolved = resolveAssessment(input.assessmentProfile, {
     hasFinalExam: plan.features.finalExam,
     activityEngine: plan.features.activityEngine,
-    itemCounts: assessmentItemCountsForPackage(manifest, omittedVideoKeys),
+    itemCounts: assessmentItemCountsForPackage(manifest, omittedVideoKeys, input.assessmentProfile),
   });
 
   // ── Contenidos LLM validados ─────────────────────────────────────────────
@@ -970,6 +988,17 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     guidedDocs.set(ch.chapterId, doc);
   }
   for (const id of c.guidedPractices?.keys() ?? []) if (!guidedDocs.has(id)) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${id}, que no la tiene en el plan`);
+  // T5 (r57): archivos de trabajo del perfil (subidos: verificados por sha256/tamaño/formato; tabla: generados). Falla fuerte.
+  const practice = await resolvePracticeFiles(
+    input.assessmentProfile.practiceResources,
+    allChapters.map((ch) => ({ chapterId: ch.chapterId, hasApplication: !!ch.keys.application })),
+    c.practiceFiles,
+  );
+  warnings.push(...practice.warnings);
+  // T4 (r57): excepciones de entrega de capítulos sin AA (o fuera del curso) no aplican: aviso visible, nunca en silencio.
+  for (const id of Object.keys(input.assessmentProfile.applicationDelivery?.chapterModes ?? {})) {
+    if (!allChapters.some((ch) => ch.chapterId === id && !!ch.keys.application)) warnings.push(`application_delivery_chapter_ignored:${id}`);
+  }
   // r19 (L3): logo de la marca de agua (cuenta → Cursia); un logo de la cuenta inválido deja su aviso, nunca en silencio.
   let libroLogo = resolveLibroLogo(input.libroBrand?.logo ?? null);
   warnings.push(...libroLogo.warnings);
@@ -1035,6 +1064,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     ...(reviewDecks.size ? { reviewCardCountByChapter: Object.fromEntries([...reviewDecks].map(([id, d]) => [id, d.cards.length])) } : {}),
     // Loop 9 B: las prácticas guiadas validadas (sus minutos entran al tiempo del capítulo).
     ...(guidedDocs.size ? { guidedPracticeChapterIds: [...guidedDocs.keys()] } : {}),
+    ...(practice.resolved.length ? { practiceResources: practice.resolved } : {}),
     assessment: input.assessmentProfile,
     hours: input.hours ?? null,
     pendingVideos: plan.omittedVideos.length ? { chapterIds: plan.omittedVideos.map((v) => v.chapterId), noticeChapterIds } : null,
@@ -1059,10 +1089,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     },
   });
   // R6: una categoría con peso > 0 y sin ítems calificables deja el curso sin poder llegar a 100 → falla fuerte.
+  // T4 (r57): las Tareas calificadas cuentan en su categoría (propia o práctica).
+  const gradedAssignCount = facts.counts.applicationAssignsGraded ?? 0;
+  const assignCategory = resolved.application?.graded ? resolved.application.category : null;
   assertCategoriesPopulated(resolved, {
-    practice: facts.counts.activities + facts.counts.videos,
+    practice: facts.counts.activities + facts.counts.videos + (assignCategory === 'practice' ? gradedAssignCount : 0),
     moduleExams: facts.counts.exams,
     finalExam: facts.finalExam.enabled ? 1 : 0,
+    ...(assignCategory === 'applications' || resolved.categories.some((x) => x.key === 'applications') ? { applications: assignCategory === 'applications' ? gradedAssignCount : 0 } : {}),
   });
 
   // EV6: el shell (facts) y el plan (Manifest) derivan las MISMAS secciones; si difieren, los
@@ -1174,6 +1208,100 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     if (opts.teacherOnly) W.put(`${a.dir}/roles.xml`, TEACHER_ONLY_ROLES_XML);
     labelsHtml.push({ where: idnumber, html: page.html });
     return a;
+  };
+
+  // T4 (r57): Actividad de Aplicación como Tarea (mod_assign): la descripción es la página del estudiante (con su PDF en
+  // `intro`), entrega por texto en línea y/o archivos, completion al ENVIAR (completionsubmit), comentarios de
+  // retroalimentación; calificada → ítem de nota en su categoría (+ rúbrica con los criterios de la AA); formativa → sin
+  // ítem de nota. El solucionario sigue en su página oculta solo para docentes.
+  let assignPluginConfigId = 1;
+  let gradingSeq = 1;
+  let rubricCriterionId = 1;
+  let rubricLevelId = 1;
+  let assignsGraded = 0;
+  let assignsTotal = 0;
+  let assignsRubric = 0;
+  const addAssign = (
+    secnum: number,
+    idnumber: string,
+    name: string,
+    introHtml: string,
+    files: Array<{ name: string; data: Buffer; mime: string }>,
+    doc: unknown,
+  ): ActivityRef => {
+    const d = resolved.application;
+    if (!d) throw new Error('MBZ_V3_INVARIANT: Tarea de entrega sin applicationDelivery resuelta');
+    const a = W.newActivity('assign', secnum, name, idnumber);
+    assignsTotal++;
+    const fileIds = files.map((f) => W.addFile(a.ctx, 'mod_assign', 'intro', f.name, f.data, f.mime));
+    W.put(`${a.dir}/assign.xml`, assignActivityXml({ aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml, ts, delivery: d, duedate: assignDueDate(ts, d.dueOffsetDays), pluginConfigId: assignPluginConfigId }));
+    assignPluginConfigId += ASSIGN_PLUGIN_CONFIG_COUNT;
+    // Completion al ENVIAR (completionsubmit 1 en assign.xml): la aprobación del curso sigue siendo solo la nota final (r55).
+    W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'assign', secnum, ts, MV.bv), idnumber), { completion: '2', completionview: '0', downloadcontent: '0' }));
+    if (d.graded) {
+      assignsGraded++;
+      const gi = W.nextGradeItem();
+      W.put(`${a.dir}/grades.xml`, assignGradeItemXml({
+        gradeItemId: gi.id, itemName: name, aid: a.aid, ts, grademax: d.maxGrade as number, gradepass: d.gradepass as number,
+        categoryId: CAT_ID[d.category as AssessmentCategoryKey], sortorder: gi.sortorder,
+      }));
+      W.put(`${a.dir}/inforef.xml`, inforef(fileIds, [gi.id]));
+      if (d.rubric) {
+        const criteria = rubricCriteriaFromApplication(doc);
+        if (criteria.length) {
+          const g = assignRubricGradingXml({
+            areaId: gradingSeq, definitionId: gradingSeq, criterionId: rubricCriterionId, levelId: rubricLevelId,
+            name: `Rúbrica · ${name}`.slice(0, 255), description: 'Rúbrica hecha con los criterios de evaluación de la Actividad de Aplicación.', criteria, ts,
+          });
+          gradingSeq++;
+          rubricCriterionId += g.criteria;
+          rubricLevelId += g.levels;
+          W.put(`${a.dir}/grading.xml`, g.xml);
+          assignsRubric++;
+        }
+      }
+    } else {
+      W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+      W.put(`${a.dir}/inforef.xml`, inforef(fileIds));
+    }
+    W.boilerplate(a.dir);
+    labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
+    return a;
+  };
+
+  // T5 (r57): archivo de trabajo = mod_resource del capítulo (descarga; la AA lo enlaza con $@RESOURCEVIEWBYID*mid@$).
+  const resourceMidById = new Map<string, number>();
+  const practiceById = new Map(practice.resolved.map((r) => [r.id, r]));
+  const addPracticeResource = (secnum: number, chapterId: string, chapterNumber: number, resourceId: string): void => {
+    const r = practiceById.get(resourceId);
+    const data = practice.bytes.get(resourceId);
+    if (!r || !data || r.chapterId !== chapterId) throw new Error(`MBZ_V3_INVARIANT: archivo de trabajo ${resourceId} sin bytes o de otro capítulo`);
+    const name = safeActivityName(practiceResourceName(r, chapterNumber), 255);
+    const a = W.newActivity('resource', secnum, name, `cv3:ch:${chapterId}:resource:${resourceId}`);
+    resourceMidById.set(resourceId, a.mid);
+    const intro = practiceResourceIntro(r, chapterNumber, theme);
+    const fid = W.addFile(a.ctx, 'mod_resource', 'content', r.filename, data, r.mimetype);
+    W.put(`${a.dir}/resource.xml`, `<?xml version="1.0" encoding="UTF-8"?>
+<activity id="${a.aid}" moduleid="${a.mid}" modulename="resource" contextid="${a.ctx}">
+  <resource id="${a.aid}">
+    <name>${xmlEsc(name)}</name>
+    <intro>${xmlEsc(intro)}</intro>
+    <introformat>1</introformat>
+    <tobemigrated>0</tobemigrated>
+    <legacyfiles>0</legacyfiles>
+    <legacyfileslast>${NULL}</legacyfileslast>
+    <display>0</display>
+    <displayoptions>a:1:{s:10:"printintro";s:1:"1";}</displayoptions>
+    <filterfiles>0</filterfiles>
+    <revision>1</revision>
+    <timemodified>${ts}</timemodified>
+  </resource>
+</activity>`);
+    W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'resource', secnum, ts, MV.bv), a.idnumber), { showdescription: '1' }));
+    W.put(`${a.dir}/inforef.xml`, inforef([fid]));
+    W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+    W.boilerplate(a.dir);
+    labelsHtml.push({ where: `${a.idnumber}#intro`, html: intro });
   };
 
   const gradedCommon = (a: ActivityRef, kind: AssessableType, name: string, fileIds: number[], qcats: number[] = []): void => {
@@ -1489,6 +1617,10 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           addPage(sec, `${idp}:guided_practice`, { name: safeActivityName(page.name), html: page.html }, [], { completionView: true });
           continue;
         }
+        if (slot.kind === 'practice_resource') {
+          addPracticeResource(sec, ch.chapterId, ch.chapterNumber, slot.resourceId);
+          continue;
+        }
         if (slot.kind === 'application') {
           // Fase 2: página del estudiante (visible, con su PDF imprimible) + solucionario docente (OCULTO, con su PDF).
           const doc = c.applications?.get(ch.chapterId);
@@ -1500,9 +1632,28 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           const studentPdf = await renderApplicationPdf(pdfIn, 'student');
           const teacherPdf = await renderApplicationPdf(pdfIn, 'teacher');
           for (const r of [studentPdf, teacherPdf]) if (r.unmappedChars > 0) warnings.push(`application_chars_unmapped:${ch.keys.application}:${r.unmappedChars}`);
-          const pageIn = { chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone };
-          const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName }, theme);
-          addPage(sec, `${idp}:application`, { name: safeActivityName(student.name), html: student.html }, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], { completionView: true });
+          // T5 (r57): archivos de trabajo de la AA (ya creados en la sección, antes de la actividad) → enlaces en la actividad.
+          const appResources = (cf.resources ?? []).filter((r) => r.relation === 'application').map((r) => {
+            const mid = resourceMidById.get(r.id);
+            if (mid === undefined) throw new Error(`MBZ_V3_INVARIANT: archivo de trabajo ${r.id} no creado antes de su Actividad de Aplicación`);
+            return { title: r.title, instructions: r.instructions, filename: r.filename, href: `$@RESOURCEVIEWBYID*${mid}@$` };
+          });
+          const pageIn = { chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone, ...(appResources.length ? { resources: appResources } : {}) };
+          if (cf.applicationDelivery?.mode === 'assign') {
+            // T4 (r57): Tarea de Moodle con la AA como descripción (+ «Cómo entregar») y el PDF del estudiante en `intro`.
+            const d = resolved.application;
+            if (!d) throw new Error('MBZ_V3_INVARIANT: capítulo con Tarea sin entrega resuelta');
+            const delivery: ApplicationDeliveryText = {
+              onlineText: d.submission.onlineText, file: d.submission.file, maxFiles: d.submission.maxFiles,
+              maxMegabytes: deliveryMegabytes(d.submission.maxBytes), fileTypes: d.submission.fileTypes,
+              dueOffsetDays: d.dueOffsetDays, graded: d.graded, maxGrade: d.maxGrade, rubric: d.graded && d.rubric,
+            };
+            const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName, delivery }, theme);
+            addAssign(sec, `${idp}:application`, safeActivityName(student.name), student.html, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], doc);
+          } else {
+            const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName }, theme);
+            addPage(sec, `${idp}:application`, { name: safeActivityName(student.name), html: student.html }, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], { completionView: true });
+          }
           const teacher = applicationSolutionPage({ ...pageIn, pdfFilename: teacherPdfName }, theme);
           addPage(sec, `${idp}:application_solution`, { name: safeActivityName(teacher.name), html: teacher.html }, [{ name: teacherPdfName, data: teacherPdf.pdf, mime: 'application/pdf' }], { teacherOnly: true });
           continue;
@@ -1616,7 +1767,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     ? [{ moduleId: libroMid, modname: 'resource' as const }]
     : completionCriteriaFor(graded.map((g) => ({ moduleId: g.moduleId, modname: g.modname, kind: g.kind })), resolved.courseCompletion);
   if (!resolved.withoutGrades) {
-    if (graded.length === 0) throw new Error('MBZ_V3_INVARIANT: curso con nota sin ítems calificables');
+    if (graded.length + assignsGraded === 0) throw new Error('MBZ_V3_INVARIANT: curso con nota sin ítems calificables');
     if (completionCriteria.length !== 0) throw new Error('MBZ_V3_INVARIANT: un curso con nota no lleva criterios de actividad (solo la nota final)');
     if (resolved.courseCompletion.requireCourseGradePass !== true) throw new Error('MBZ_V3_INVARIANT: curso con nota sin criterio de nota del curso');
     if (!(resolved.courseCompletion.courseGradepass > 0) || resolved.courseCompletion.courseGradepass !== resolved.courseGradepass) {
@@ -1704,9 +1855,13 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     categories: resolved.categories.map((cat) => ({ id: CAT_ID[cat.key], fullname: cat.fullname, weight: cat.weight, gradeItemId: CAT_ID[cat.key] })),
     ...(resolved.withoutGrades ? { withoutGrades: true } : {}),
   }));
-  if (resolved.withoutGrades && graded.length > 0) {
-    throw new Error(`ASSESSMENT_INVALID_FACTS: curso sin nota con ${graded.length} ítem(s) calificable(s) en el paquete`);
+  if (resolved.withoutGrades && graded.length + assignsGraded > 0) {
+    throw new Error(`ASSESSMENT_INVALID_FACTS: curso sin nota con ${graded.length + assignsGraded} ítem(s) calificable(s) en el paquete`);
   }
+  if (assignsTotal !== (facts.counts.applicationAssigns ?? 0) || assignsGraded !== (facts.counts.applicationAssignsGraded ?? 0)) {
+    throw new Error(`MBZ_V3_INVARIANT: ${assignsTotal} Tarea(s) (${assignsGraded} calificadas) ≠ facts ${facts.counts.applicationAssigns ?? 0} (${facts.counts.applicationAssignsGraded ?? 0})`);
+  }
+  if (resourceMidById.size !== practice.resolved.length) throw new Error(`MBZ_V3_INVARIANT: ${resourceMidById.size} archivo(s) de trabajo publicados ≠ ${practice.resolved.length} resueltos`);
   W.put('completion.xml', courseCompletionXml({
     criteria: completionCriteria,
     aggregation: 'all',
@@ -1855,6 +2010,10 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
       libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256 },
+      ...(assignsTotal ? { applicationAssigns: { count: assignsTotal, graded: assignsGraded, rubric: assignsRubric, category: resolved.application?.category ?? null } } : {}),
+      ...(practice.resolved.length
+        ? { practiceResources: practice.resolved.map((r) => ({ id: r.id, chapterId: r.chapterId, filename: r.filename, mimetype: r.mimetype, sha256: r.sha256, bytes: r.bytes, origin: r.origin, relation: r.relation })) }
+        : {}),
       // r55 (R7): todos los .h5p son solo contenido; con un tipo que no está en el pack v1 (QuestionSet 1.21, BS,
       // «Repaso») la entrega declara el requisito del sitio: Cursia H5P Library Pack v3 (cualquier rol restaura).
       ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_SITE_LIBRARY_PACK_RESTORE_NOTE } : {}),

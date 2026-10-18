@@ -252,8 +252,14 @@ function expectedSequence(distRoot, input) {
   for (const mod of m.modules) {
     mod.chapters.forEach((ch, i) => {
       const ids = i === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
-      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined, guidedPractice: ch.guidedPracticeMinutes !== undefined })) {
-        const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
+      // T5 (r57): archivos de trabajo del perfil (los de la AA, si el capítulo la tiene; el resto, del capítulo).
+      const res = ((input.assessmentProfile && input.assessmentProfile.practiceResources) || []).filter((r) => r.chapterId === ch.chapterId);
+      const hasApp = ch.applicationMinutes !== undefined;
+      const appRes = res.filter((r) => r.relation === 'application' && hasApp).map((r) => r.id);
+      const chRes = res.filter((r) => !(r.relation === 'application' && hasApp)).map((r) => r.id);
+      const resQueue = [...appRes, ...chRes];
+      for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: hasReview(ch.chapterId), practice: ch.kind === 'practice', application: hasApp, guidedPractice: ch.guidedPracticeMinutes !== undefined, applicationResources: appRes.length, chapterResources: chRes.length })) {
+        const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s === 'practice_resource' ? `resource:${resQueue.shift()}` : s;
         ids.push(`cv3:ch:${ch.chapterId}:${role}`);
       }
       seq.push([n++, ids]);
