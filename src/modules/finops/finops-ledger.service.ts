@@ -448,6 +448,11 @@ export class FinopsLedgerService {
         `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
         [runId],
       );
+      // r58 H4: sin ninguna autorización → falla cerrado (antes = sin tope). Una unidad de monto 0 no compromete dinero.
+      if (!auth && fresh.length) {
+        const amount = addDec(...fresh.map((b) => b.row.amount as string));
+        if (cmpDec(amount, 0) > 0) throw runBudgetNotAuthorizedError(runId, amount);
+      }
       if (auth && fresh.length) {
         const cap = auth.decision === 'BLOCKED' ? '0' : String(auth.b);
         const [t] = await m.query(`select coalesce(sum(amount), 0)::text as t from public.generation_cost_events where run_id = $1 and billing_account <> 'user_key'`, [runId]);
@@ -469,8 +474,8 @@ export class FinopsLedgerService {
 
   /**
    * Inserta una reserva de un run SOLO si el total del run (cargos + ajustes + reservas pendientes, sin BYOK) más la
-   * reserva no supera la ÚLTIMA autorización del run (BLOCKED = tope 0; sin autorización = sin tope, runs previos a
-   * FinOps). Lock consultivo por run (`finops:run-cap:<runId>`): dos reservas del mismo run nunca se evalúan a la vez,
+   * reserva no supera la ÚLTIMA autorización del run (BLOCKED = tope 0; r58 H4: sin ninguna autorización → FinopsError
+   * RUN_BUDGET_NOT_AUTHORIZED, falla cerrado). Lock consultivo por run (`finops:run-cap:<runId>`): dos reservas del mismo run nunca se evalúan a la vez,
    * en ningún proceso. Reintento idempotente de la misma reserva → devuelve la existente sin volver a evaluar.
    * Excedería el tope → FinopsError RUN_BUDGET_CAP (details: runId, spent, amount, authorizedBudget, requiredUsd).
    */
@@ -485,6 +490,8 @@ export class FinopsLedgerService {
       `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
       [runId],
     );
+    // r58 H4: sin ninguna autorización → falla cerrado (antes = sin tope). Una reserva de monto 0 no compromete dinero.
+    if (!auth && cmpDec(row.amount as string, 0) > 0) throw runBudgetNotAuthorizedError(runId, row.amount as string);
     if (auth) {
       const cap = auth.decision === 'BLOCKED' ? '0' : String(auth.b);
       const [t] = await m.query(
@@ -1598,6 +1605,16 @@ export function isUnattributedPaidReservation(row: Record<string, unknown>): boo
   const md = (row.metadata && typeof row.metadata === 'object' ? row.metadata : {}) as Record<string, unknown>;
   return md.reservation === true && row.event_kind === 'CHARGE' && !row.run_id && (row.course_id === null || row.course_id === undefined)
     && row.billing_account === 'cursia' && row.cost_source !== 'MOCK';
+}
+
+/**
+ * r58 H4: reserva pagada (Cursia, no mock, no BYOK) de un run que NO tiene ninguna fila en cost_budget_authorizations.
+ * Antes pasaba sin tope («runs previos a FinOps»); ahora se rechaza ANTES de reservar (el llamador no llama al proveedor).
+ */
+export function runBudgetNotAuthorizedError(runId: string, amount: string): FinopsError {
+  return new FinopsError('RUN_BUDGET_NOT_AUTHORIZED',
+    `el run ${runId} no tiene un presupuesto autorizado (ninguna autorización registrada): no se reserva ni se llama al proveedor (USD ${Number(amount).toFixed(4)}). Un administrador tiene que autorizar el presupuesto del run (POST /finops/courses/:courseId/authorizations con runId) antes de reanudar`,
+    { runId, amount, authorizedBudget: null });
 }
 
 /** ¿Esta fila es una reserva pagada por Cursia de un run (sujeta al tope atómico del run)? */

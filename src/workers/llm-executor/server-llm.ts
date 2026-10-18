@@ -50,7 +50,7 @@ export interface ServerLlmDeps {
   finops: WorkerLedger;
   budget: {
     guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
-      code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
+      code: 'run_paused' | 'item_recovery_budget_exhausted' | 'run_budget_not_authorized'; message: string; runId: string; paused: boolean;
     }>;
     /** FinOps atómico: pausa por el tope cuando la RESERVA se rechazó (el guard ya había permitido). */
     pauseRunBySystem?(runId: string, reason: string, detail: string, requiredUsd?: number | null): Promise<boolean>;
@@ -216,6 +216,10 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         if (deny.code === 'item_recovery_budget_exhausted') {
           throw { fatal: true, itemBudget: true, status: 409, code: deny.code, msg: itemRecoveryBudgetMessage(deny.message) } as ApiError;
         }
+        // r58 H4: run sin ninguna autorización → no se llama (0 gasto); el guard pausó el run y la parte vuelve a la cola.
+        if (deny.code === 'run_budget_not_authorized') {
+          throw { fatal: true, runPaused: true, status: 409, code: deny.code, msg: 'run_budget_not_authorized: ' + deny.message } as ApiError;
+        }
         throw { fatal: true, runPaused: true, status: 409, code: 'run_paused', msg: 'run_paused: ' + deny.message } as ApiError;
       }
       const tag = `${LLM_WORKER_CALL_TAG_PREFIX}-${role.callRole}-${hash.slice(0, LLM_CALL_HASH_LEN)}-${++seq}-${randomUUID().slice(0, 8)}`;
@@ -227,6 +231,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         if (!(e instanceof RunBudgetCapReached)) throw e;
         // FinOps atómico: otra reserva concurrente llegó primero al tope → no se llama (0 gasto) y el run se pausa.
         await pauseRunForCap(deps.budget, e).catch(() => false);
+        if (e.reason === 'run_budget_not_authorized') {
+          throw { fatal: true, runPaused: true, status: 409, code: e.reason, msg: 'run_budget_not_authorized: ' + e.detail } as ApiError;
+        }
         throw { fatal: true, runPaused: true, status: 409, code: 'run_paused', msg: 'run_paused: Pausa automática: se alcanzó el presupuesto autorizado del run: ' + e.detail } as ApiError;
       }
       notUnknown.add(resKey);

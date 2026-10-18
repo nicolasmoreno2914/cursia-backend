@@ -111,6 +111,7 @@ import {
   paidProviderOfItemType,
   paidRealProviders,
   decideRunBudget,
+  RUN_BUDGET_NOT_AUTHORIZED,
 } from '../finops/run-budget';
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
@@ -1903,6 +1904,22 @@ export class RunsService {
         throw new ConflictException({
           code: 'run_budget_cap',
           message: `La generación se pausó porque alcanzó su presupuesto autorizado (USD ${Number(auth ?? 0).toFixed(2)}; gastado USD ${Number(spent).toFixed(2)}). Para continuar hay que ampliar el presupuesto.`,
+        });
+      }
+    }
+    // r58 H4: un run sin NINGUNA autorización de presupuesto (o con la última BLOCKED) no se reanuda: sus llamadas
+    // pagadas se rechazarían igual (falla cerrado). Primero un administrador autoriza el presupuesto del run.
+    if (isPausedRun(job) && this.finopsBudget) {
+      const [lastAuth] = await this.dataSource.query(
+        `select decision from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
+        [job.id],
+      );
+      if (!lastAuth || lastAuth.decision === 'BLOCKED') {
+        throw new ConflictException({
+          code: RUN_BUDGET_NOT_AUTHORIZED,
+          message: !lastAuth
+            ? `${RUN_BUDGET_NOT_AUTHORIZED}: la generación ${job.id} no tiene un presupuesto autorizado. Un administrador tiene que autorizarlo (POST /finops/courses/${courseId}/authorizations con runId) antes de reanudar.`
+            : `${RUN_BUDGET_NOT_AUTHORIZED}: el presupuesto de la generación ${job.id} fue revocado (BLOCKED). Un administrador tiene que autorizar uno nuevo antes de reanudar.`,
         });
       }
     }

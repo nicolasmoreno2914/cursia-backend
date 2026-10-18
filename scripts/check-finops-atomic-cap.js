@@ -7,11 +7,14 @@
 //   [UB] cota: llmCallUpperBoundUsage (entrada a precio de escritura de caché + salida al tope) ≥ cualquier cargo real
 //        posible (mezcla entrada/caché escrita/leída, salida ≤ max_tokens) con tokens ≤ caracteres/3;
 //   [AT] 60 reservas en paralelo desde 3 «procesos» (3 DataSource) contra un tope → la suma NUNCA supera el tope y se
-//        aceptan exactamente las que entran; reintento idempotente; BLOCKED = 0; sin autorización = sin tope; BYOK y
-//        mock fuera; precio faltante → monto conservador (nunca 0); liquidar libera lugar;
+//        aceptan exactamente las que entran; reintento idempotente; BLOCKED = 0; sin autorización = RECHAZO (r58 H4,
+//        falla cerrado); BYOK y mock fuera; precio faltante → monto conservador (nunca 0); liquidar libera lugar;
 //   [WK] worker de IA real (createServerApi) con 8 llamadas en paralelo y el guard real: solo llegan a Anthropic las
 //        que caben; el resto → run_paused sin llamar, run pausado (run_budget_cap); con el guard «engañado» (permite
 //        todo) el ledger sigue impidiendo el exceso; proxy del navegador: 409 run_paused + run pausado.
+//   [H4] r58: run SIN ninguna fila de cost_budget_authorizations → toda reserva pagada (Cursia, real) se rechaza
+//        (RUN_BUDGET_NOT_AUTHORIZED) ANTES de reservar: ledger, lote, guard del worker y del proxy, worker de IA real
+//        (0 pedidos a Anthropic), reanudar sin autorización → 409; mock / BYOK / monto 0 no cambian; con autorización → OK.
 // PG16 desechable + Anthropic falso en 127.0.0.1; USD 0.
 //
 // Usage: npm run build && node scripts/check-finops-atomic-cap.js
@@ -287,7 +290,7 @@ async function dbChecks() {
       assert((await runTotal(C.runId)) <= 2 * ONE + 0.04 + 1e-9, 'sigue dentro del tope');
     });
 
-    await check('[AT] BLOCKED = tope 0 (ninguna reserva); sin ninguna autorización (runs previos a FinOps) = sin tope; BYOK (user_key) y mock nunca entran al tope', async () => {
+    await check('[AT] BLOCKED = tope 0 (ninguna reserva); sin ninguna autorización (runs previos a FinOps) = RECHAZO (r58 H4); BYOK (user_key) y mock nunca entran al tope', async () => {
       const C = await makeCourse('AT bloqueado');
       const it = await itemOf(C.runId);
       await authorize(C.runId, C.cid, '100', 'BLOCKED');
@@ -306,8 +309,133 @@ async function dbChecks() {
          select $2, course_id, blueprint_id, manifest_id, item_key, generation + 100, type, module_id, chapter_id, depends_on, md5(idempotency_key || ':legacy') || md5(idempotency_key), 'pending'
            from public.generation_item_runs where id = $1 returning id`, [it.id, j2.id]);
       eq((await ds.query(`select count(*)::int n from public.cost_budget_authorizations where run_id = $1`, [j2.id]))[0].n, 0, 'sin autorización');
-      const many = await Promise.all(Array.from({ length: 6 }, (_, i) => ledger.recordCharge(resInput(it2.id, `n${i}`))));
-      assert(many.every((r) => r.inserted), 'sin autorización: sin tope (comportamiento previo)');
+      const many = await Promise.allSettled(Array.from({ length: 6 }, (_, i) => ledger.recordCharge(resInput(it2.id, `n${i}`))));
+      assert(many.every((r) => r.status === 'rejected' && r.reason.code === 'RUN_BUDGET_NOT_AUTHORIZED'), 'sin autorización: falla cerrado (r58 H4)');
+      eq((await ds.query(`select count(*)::int n from public.generation_cost_events where run_id = $1`, [j2.id]))[0].n, 0, 'ninguna reserva');
+    });
+
+    // ── r58 H4: falla cerrado sin autorización ──────────────────────────────────────────────────────────────────────
+    /** Run ACTIVO sin ninguna autorización (como uno previo a FinOps): cancela el run de C y crea una copia sin filas. */
+    async function noAuthRun(C, workerStatus = 'running') {
+      await ds.query(`update public.production_jobs set status = 'cancelled', worker_status = 'cancelled' where id = $1`, [C.runId]);
+      const [j] = await ds.query(
+        `insert into public.production_jobs (owner_id, course_id, frontend_course_id, execution_mode, status, worker_status, current_step, progress, blueprint_version_id, input_payload, output_summary, options, result)
+         select owner_id, course_id, frontend_course_id, execution_mode, $2::text, $2::text, current_step, 0, blueprint_version_id, input_payload, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb
+           from public.production_jobs where id = $1 returning id`, [C.runId, workerStatus]);
+      await ds.query(`insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash) select $2, manifest_id, context, context_hash from public.generation_run_contexts where job_id = $1`, [C.runId, j.id]);
+      // Todos los items (el DTO del run exige los del Manifest); la parte de prueba = el primer content.
+      await ds.query(
+        `insert into public.generation_item_runs (job_id, course_id, blueprint_id, manifest_id, item_key, generation, type, module_id, chapter_id, depends_on, idempotency_key, status)
+         select $2, course_id, blueprint_id, manifest_id, item_key, generation + 200, type, module_id, chapter_id, depends_on, md5(idempotency_key || ':h4') || md5(idempotency_key), status
+           from public.generation_item_runs where job_id = $1`, [C.runId, j.id]);
+      const it2 = await itemOf(j.id);
+      eq((await ds.query(`select count(*)::int n from public.cost_budget_authorizations where run_id = $1`, [j.id]))[0].n, 0, 'sin autorización');
+      return { runId: j.id, itemRunId: it2.id };
+    }
+    const eventsOf = async (runId) => (await ds.query(`select count(*)::int n from public.generation_cost_events where run_id = $1`, [runId]))[0].n;
+    const runRow = async (runId) => (await ds.query(`select worker_status, output_summary->'pause' p from public.production_jobs where id = $1`, [runId]))[0];
+
+    await check('[H4] ledger: run sin autorización → reserva pagada (Cursia, real) y lote RECHAZADOS con RUN_BUDGET_NOT_AUTHORIZED (0 filas); mock, BYOK y monto 0 siguen entrando', async () => {
+      const C = await makeCourse('H4 ledger');
+      const R = await noAuthRun(C);
+      let e = null; try { await ledger.recordCharge(resInput(R.itemRunId, 'one')); } catch (x) { e = x; }
+      assert(e && e.code === 'RUN_BUDGET_NOT_AUTHORIZED' && e.details.runId === R.runId && /presupuesto autorizado/.test(e.message), 'una: ' + (e && e.message));
+      e = null; try { await ledger.recordReservationBatch([resInput(R.itemRunId, 'b1'), resInput(R.itemRunId, 'b2')]); } catch (x) { e = x; }
+      assert(e && e.code === 'RUN_BUDGET_NOT_AUTHORIZED', 'lote: ' + (e && e.message));
+      eq(await eventsOf(R.runId), 0, 'ninguna reserva pagada');
+      const mock = await ledger.recordCharge(resInput(R.itemRunId, 'mock', { billingAccount: 'mock', mode: 'mock', costSource: 'MOCK' }));
+      const byok = await ledger.recordCharge(resInput(R.itemRunId, 'byok', { billingAccount: 'user_key' }));
+      const zero = await ledger.recordCharge(resInput(R.itemRunId, 'zero', { usage: { input_tokens: 0, output_tokens: 0 } }));
+      assert(mock.inserted && byok.inserted && zero.inserted && Number(zero.event.amount) === 0, 'mock / BYOK / 0 entran');
+      const h = WH.reservePaidCall(ledger, { kind: 'llm', ownerId: OWNER, itemRunId: R.itemRunId, generation: 201, itemAttempt: 1, tag: 'h', estimate: { promptChars: 30000, maxTokens: 12000, model: 'claude-sonnet-4-6' } });
+      e = null; try { await h; } catch (x) { e = x; }
+      assert(e instanceof WH.RunBudgetCapReached && !(e instanceof WH.LedgerWriteFailed) && e.reason === 'run_budget_not_authorized' && e.runId === R.runId
+        && /^run_budget_not_authorized:/.test(e.message), 'reservePaidCall → RunBudgetCapReached(run_budget_not_authorized): ' + (e && e.message));
+      assert(await WH.pauseRunForCap(budget, e), 'pauseRunForCap pausa');
+      eq([(await runRow(R.runId)).p.reason], ['run_budget_not_authorized'], 'motivo de la pausa');
+    });
+
+    await check('[H4] con autorización válida → reservas dentro del tope entran; BLOCKED posterior → rechazo (RUN_BUDGET_CAP, tope 0)', async () => {
+      const C = await makeCourse('H4 válida');
+      const R = await noAuthRun(C);
+      await authorize(R.runId, C.cid, String(2 * ONE + 0.01));
+      assert((await ledger.recordCharge(resInput(R.itemRunId, 'v1'))).inserted && (await ledger.recordCharge(resInput(R.itemRunId, 'v2'))).inserted, 'dos entran');
+      let e = null; try { await ledger.recordCharge(resInput(R.itemRunId, 'v3')); } catch (x) { e = x; }
+      assert(e && e.code === 'RUN_BUDGET_CAP', 'la tercera excede el tope');
+      await authorize(R.runId, C.cid, '100', 'BLOCKED');
+      e = null; try { await ledger.recordCharge(resInput(R.itemRunId, 'v4', { usage: LUI.llmCallUpperBoundUsage(100, 10) })); } catch (x) { e = x; }
+      assert(e && e.code === 'RUN_BUDGET_CAP' && e.details.authorizedBudget === '0', 'BLOCKED = tope 0');
+      const g = await budget.guardServerLlmCall({ runId: R.runId, itemRunId: R.itemRunId, model: 'claude-sonnet-4-6', promptChars: 100, maxTokens: 10 });
+      assert(g && g.code === 'run_paused' && g.paused === true, 'guard con BLOCKED → run_paused + pausa: ' + JSON.stringify(g));
+    });
+
+    await check('[H4] worker de IA REAL (createServerApi) en run sin autorización → 0 pedidos a Anthropic, 0 reservas, run pausado (run_budget_not_authorized); con el guard «engañado» el ledger igual lo impide', async () => {
+      const C = await makeCourse('H4 worker');
+      const R = await noAuthRun(C);
+      const fake = await fakeAnthropic(50);
+      try {
+        const item = { itemRunId: R.itemRunId, runId: R.runId, itemKey: 'content:x', attempt: 1, generation: 201, ownerId: OWNER, artifactCourseId: String(C.cid), manifestId: 1 };
+        const mk = (b) => createServerApi({
+          dataSource: ds, finops: ledger, budget: b,
+          checkpoints: { put: async () => {}, get: async () => null }, recordCheckpoint: async () => true,
+          apiKey: 'fake-anthropic-never-real', baseUrl: fake.url, defaultModel: 'claude-sonnet-4-6', idleMs: 5000, totalMs: 20000,
+          logger: { log() {}, warn() {}, error() {} }, settleRetryDelaysMs: [0, 0],
+        }, item, () => ({ callRole: 'main', attempt: 1 }));
+        let e = null; try { await mk(budget)('s', 'hola', 1000); } catch (x) { e = x; }
+        assert(e && e.runPaused && e.code === 'run_budget_not_authorized' && /^run_budget_not_authorized:/.test(e.msg), 'guard real: ' + JSON.stringify(e));
+        const row = await runRow(R.runId);
+        eq([row.worker_status, row.p && row.p.reason], ['paused', 'run_budget_not_authorized'], 'run pausado');
+        await ds.query(`update public.production_jobs set status = 'running', worker_status = 'running' where id = $1`, [R.runId]);
+        e = null; try { await mk({ guardServerLlmCall: async () => null, pauseRunBySystem: (...a) => budget.pauseRunBySystem(...a) })('s', 'hola', 1000); } catch (x) { e = x; }
+        assert(e && e.runPaused && e.code === 'run_budget_not_authorized', 'guard engañado → el ledger rechaza: ' + JSON.stringify(e));
+        eq([fake.st.requests, await eventsOf(R.runId), (await runRow(R.runId)).worker_status], [0, 0, 'paused'], 'pedidos a Anthropic / reservas / estado');
+      } finally { await fake.close(); }
+    });
+
+    await check('[H4] proxy LLM del navegador (guard + controller reales) en run sin autorización → 409 run_budget_not_authorized sin reservar; mock y BYOK sin cambio', async () => {
+      const C = await makeCourse('H4 proxy');
+      const R = await noAuthRun(C);
+      const ctrl = new FinopsLlmReservationController(ledger, budget);
+      const body = (extra) => ({ callId: crypto.randomUUID(), subject: OWNER, itemRunId: R.itemRunId, model: 'claude-sonnet-4-6', promptChars: 3000, maxTokens: 1000,
+        billingAccount: 'cursia', callRole: 'main', attempt: 1, mode: 'real', ...extra });
+      let e = null; try { await ctrl.llmReservation(body()); } catch (x) { e = x; }
+      const b = e && e.getResponse ? e.getResponse() : null;
+      assert(e && e.getStatus() === 409 && b.code === 'run_budget_not_authorized' && b.runId === R.runId && b.paused === true, 'proxy: ' + JSON.stringify(b || (e && e.message)));
+      eq(await eventsOf(R.runId), 0, 'ninguna reserva');
+      // Un run pausado ya no admite llamadas pagadas; mock / BYOK no pasan por el guard del run.
+      const mock = await ctrl.llmReservation(body({ mode: 'mock' }));
+      const byok = await ctrl.llmReservation(body({ billingAccount: 'user_key' }));
+      assert(mock.reserved && byok.reserved, 'mock y BYOK reservan');
+      // Carrera (guard que deja pasar): el ledger rechaza igual → 409 run_budget_not_authorized.
+      await ds.query(`update public.production_jobs set status = 'running', worker_status = 'running' where id = $1`, [R.runId]);
+      const ctrl2 = new FinopsLlmReservationController(ledger, { guardLlmProxyCall: async () => null, pauseRunBySystem: (...a) => budget.pauseRunBySystem(...a) });
+      e = null; try { await ctrl2.llmReservation(body()); } catch (x) { e = x; }
+      const b2 = e && e.getResponse ? e.getResponse() : null;
+      assert(e && e.getStatus() === 409 && b2.code === 'run_budget_not_authorized' && b2.paused === true, 'carrera: ' + JSON.stringify(b2 || (e && e.message)));
+      eq((await ds.query(`select count(*)::int n from public.generation_cost_events where run_id = $1 and billing_account = 'cursia'`, [R.runId]))[0].n, 0, 'ninguna reserva de Cursia');
+    });
+
+    await check('[H4] reanudar un run pausado sin autorización → 409 run_budget_not_authorized (no se reabre); tras la autorización del admin → se reanuda y la llamada entra', async () => {
+      const C = await makeCourse('H4 reanudar');
+      const R = await noAuthRun(C, 'paused');
+      await ds.query(`update public.production_jobs set output_summary = jsonb_build_object('pause', jsonb_build_object('pausedAt', now(), 'reason', 'run_budget_not_authorized')) where id = $1`, [R.runId]);
+      let e = null; try { await runs.resumeRun(C.cid, OWNER, 1, R.runId); } catch (x) { e = x; }
+      const b = e && e.getResponse ? e.getResponse() : null;
+      assert(b && b.code === 'run_budget_not_authorized' && /autoriz/.test(b.message), 'resume: ' + JSON.stringify(b || (e && e.message)));
+      eq((await runRow(R.runId)).worker_status, 'paused', 'sigue pausado');
+      await budget.adminAuthorizeRun({ courseId: C.cid, runId: R.runId, authorizedBudget: '5', approvedBy: 'admin@cursia.test', reason: 'check H4' });
+      await runs.resumeRun(C.cid, OWNER, 1, R.runId);
+      assert((await runRow(R.runId)).worker_status !== 'paused', 'reanudado');
+      eq(await budget.guardServerLlmCall({ runId: R.runId, itemRunId: R.itemRunId, model: 'claude-sonnet-4-6', promptChars: 3000, maxTokens: 1000 }), null, 'guard permite');
+      assert((await ledger.recordCharge(resInput(R.itemRunId, 'after'))).inserted, 'reserva entra');
+    });
+
+    await check('[H4] clasificación: run_budget_not_authorized → clase D, hold_for_human, presupuesto (approve_budget); también como código explícito', async () => {
+      const FC = L('modules/reliability/failure-classifier.js');
+      const v = FC.classifyFailure({ error: 'run_budget_not_authorized: el run x no tiene un presupuesto autorizado' });
+      const v2 = FC.classifyFailure({ error: 'algo', errorCode: 'run_budget_not_authorized' });
+      for (const x of [v, v2]) assert(x.class === 'D' && x.code === 'run_budget_not_authorized' && x.strategy === 'hold_for_human', 'veredicto: ' + JSON.stringify(x));
+      assert(FC.isFailureCodeClassified('run_budget_not_authorized'), 'código clasificado');
     });
 
     await check('[AT] precio faltante (modelo sin fila en el catálogo): la reserva NUNCA vale 0 — monto conservador (tarifa más cara) y cuenta para el tope', async () => {

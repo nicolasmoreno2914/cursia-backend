@@ -8,7 +8,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 import type { FinopsLedgerService, RecordResult, CallRole, RecordChargeInput, ItemPaidCharge } from '../modules/finops/finops-ledger.service';
 import type { FinopsBudgetService } from '../modules/finops/finops-budget.service';
-import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../modules/finops/run-budget';
+import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED, RUN_BUDGET_NOT_AUTHORIZED } from '../modules/finops/run-budget';
 import { costIdempotencyKey } from '../modules/finops/idempotency';
 import { llmIngestToChargeInput } from '../modules/finops/llm-usage-ingest';
 import { usageModelPriorsV1 } from '../modules/finops/usage-model';
@@ -654,6 +654,7 @@ export async function reservePaidCall(ledger: WorkerLedger | null | undefined, r
       const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
       throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_CAP:\s*/, ''), Number(d.requiredUsd ?? NaN));
     }
+    throwIfRunBudgetNotAuthorized(err);
     throw new LedgerWriteFailed(`la reserva ${r.kind}/${r.tag}`, err);
   }
   return reservationKey(r);
@@ -678,6 +679,7 @@ export async function reservePaidCalls(ledger: WorkerLedger | null | undefined, 
       const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
       throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_CAP:\s*/, ''), Number(d.requiredUsd ?? NaN));
     }
+    throwIfRunBudgetNotAuthorized(err);
     throw new LedgerWriteFailed(`la unidad de ${rs.length} reservas`, err);
   }
   return rs.map(reservationKey);
@@ -689,16 +691,29 @@ export async function reservePaidCalls(ledger: WorkerLedger | null | undefined, 
  * (`run_budget_cap`, misma pausa que el guard) y devuelve la parte a la cola sin consumir intento.
  */
 export class RunBudgetCapReached extends Error {
-  constructor(readonly runId: string, readonly detail: string, readonly requiredUsd: number) {
-    super(`run_budget_cap: ${detail}`);
+  constructor(
+    readonly runId: string,
+    readonly detail: string,
+    readonly requiredUsd: number,
+    /** r58 H4: 'run_budget_not_authorized' = el run no tiene NINGUNA autorización (mismo manejo: pausa + devolución). */
+    readonly reason: 'run_budget_cap' | 'run_budget_not_authorized' = 'run_budget_cap',
+  ) {
+    super(`${reason}: ${detail}`);
     this.name = 'RunBudgetCapReached';
   }
+}
+
+/** r58 H4: FinopsError RUN_BUDGET_NOT_AUTHORIZED de la reserva → RunBudgetCapReached('run_budget_not_authorized'). */
+function throwIfRunBudgetNotAuthorized(err: unknown): void {
+  if (!err || (err as { code?: string }).code !== 'RUN_BUDGET_NOT_AUTHORIZED') return;
+  const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
+  throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_NOT_AUTHORIZED:\s*/, ''), NaN, RUN_BUDGET_NOT_AUTHORIZED);
 }
 
 /** Pausa el run por el tope (idempotente: si ya estaba pausado no cambia nada). Sin pausa cableada → no hace nada. */
 export async function pauseRunForCap(budget: { pauseRunBySystem?: FinopsBudgetService['pauseRunBySystem'] } | null | undefined, e: RunBudgetCapReached): Promise<boolean> {
   if (!budget || !budget.pauseRunBySystem || !e.runId) return false;
-  return budget.pauseRunBySystem(e.runId, 'run_budget_cap', e.detail, Number.isFinite(e.requiredUsd) ? e.requiredUsd : null);
+  return budget.pauseRunBySystem(e.runId, e.reason, e.detail, Number.isFinite(e.requiredUsd) ? e.requiredUsd : null);
 }
 
 /** Liquidación DURABLE: cargo final (idempotente por la operación del proveedor) + reserva a 0, atómico. */

@@ -27,6 +27,7 @@ import { FinopsError } from './errors';
 import { llmIngestToChargeInput, llmProxyReservationKey, llmReservationToChargeInput, parseLlmReservationIngest, parseLlmReservationRelease, parseLlmUsageIngest } from './llm-usage-ingest';
 import { costIdempotencyKey } from './idempotency';
 import { SPEND_CONTROL_CODES } from './spend-controls';
+import { RUN_BUDGET_NOT_AUTHORIZED } from './run-budget';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -44,6 +45,8 @@ export function finopsErrorToHttp(err: unknown): unknown {
     if (err.code === 'ESTIMATE_NOT_FOUND') return new NotFoundException({ code: err.code, message: err.message });
     // FinOps P0: reserva de una parte de un run ajeno → 409 con código estable (el proxy no llama al proveedor).
     if (err.code === 'ATTRIBUTION_REJECTED') return new ConflictException({ code: 'attribution_rejected', message: err.message });
+    // r58 H4: reserva pagada de un run sin ninguna autorización → 409 con código estable (el proxy no llama).
+    if (err.code === 'RUN_BUDGET_NOT_AUTHORIZED') return new ConflictException({ code: RUN_BUDGET_NOT_AUTHORIZED, message: err.message });
     // r58: controles de gasto del servidor → 409 con código estable (el proxy no llama y el navegador no reintenta).
     const spendCode = SPEND_CONTROL_HTTP_CODES[err.code];
     if (spendCode) return new ConflictException({ code: spendCode, message: err.message });
@@ -152,6 +155,13 @@ export class FinopsLlmReservationController {
           const detail = err.message.replace(/^RUN_BUDGET_CAP:\s*/, '');
           const paused = runId ? await this.budget.pauseRunBySystem(runId, 'run_budget_cap', detail, Number(d.requiredUsd ?? NaN) || null).catch(() => false) : false;
           throw new ConflictException({ code: 'run_paused', message: 'Pausa automática: se alcanzó el presupuesto autorizado del run: ' + detail, runId, paused });
+        }
+        // r58 H4: el run no tiene ninguna autorización (el guard ya lo negó salvo carrera) → falla cerrado, run pausado.
+        if (err instanceof FinopsError && err.code === 'RUN_BUDGET_NOT_AUTHORIZED') {
+          const runId = String(((err.details ?? {}) as Record<string, unknown>).runId ?? '');
+          const detail = err.message.replace(/^RUN_BUDGET_NOT_AUTHORIZED:\s*/, '');
+          const paused = runId ? await this.budget.pauseRunBySystem(runId, RUN_BUDGET_NOT_AUTHORIZED, detail).catch(() => false) : false;
+          throw new ConflictException({ code: RUN_BUDGET_NOT_AUTHORIZED, message: detail, runId, paused });
         }
         throw err;
       }

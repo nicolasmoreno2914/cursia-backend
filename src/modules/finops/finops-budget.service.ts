@@ -9,6 +9,7 @@ import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, runtimeGuard } from './bu
 import { FinopsLedgerService } from './finops-ledger.service';
 import { BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE, decideRunSpend, RunSpendDecision } from './run-spend-guard';
 import {
+  RUN_BUDGET_NOT_AUTHORIZED,
   RunBudgetDecision,
   RunManifestItem,
   RunSpendMode,
@@ -670,7 +671,7 @@ export class FinopsBudgetService {
    * y pagadas por Cursia (BYOK no consume el presupuesto del run). → null = permitida; si no, el código para el proxy.
    */
   async guardLlmProxyCall(a: { subject: string; itemRunId: string | null; model: string; promptChars: number; maxTokens: number; billingAccount: string }): Promise<null | {
-    code: 'run_paused' | 'item_recovery_budget_exhausted' | 'attribution_rejected' | 'item_run_not_found'; message: string; runId: string | null; paused: boolean;
+    code: 'run_paused' | 'item_recovery_budget_exhausted' | 'attribution_rejected' | 'item_run_not_found' | 'run_budget_not_authorized'; message: string; runId: string | null; paused: boolean;
   }> {
     if (!a.itemRunId || a.billingAccount !== 'cursia') return null;
     if (!UUID_RE.test(a.itemRunId)) {
@@ -701,7 +702,7 @@ export class FinopsBudgetService {
    * presupuesto de recuperación de la parte y disyuntor. → null = permitida.
    */
   async guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
-    code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
+    code: 'run_paused' | 'item_recovery_budget_exhausted' | 'run_budget_not_authorized'; message: string; runId: string; paused: boolean;
   }> {
     const [row] = await this.dataSource.query(`select worker_status from public.production_jobs where id = $1`, [a.runId]);
     if (!row) return { code: 'run_paused', message: 'El run no existe.', runId: a.runId, paused: false };
@@ -709,7 +710,7 @@ export class FinopsBudgetService {
   }
 
   private async guardLlmCallForRun(a: { runId: string; workerStatus: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
-    code: 'run_paused' | 'item_recovery_budget_exhausted'; message: string; runId: string; paused: boolean;
+    code: 'run_paused' | 'item_recovery_budget_exhausted' | 'run_budget_not_authorized'; message: string; runId: string; paused: boolean;
   }> {
     const row = { job_id: a.runId, worker_status: a.workerStatus };
     if (row.worker_status === 'paused') {
@@ -724,13 +725,19 @@ export class FinopsBudgetService {
     for (const v of llmUpperBoundVariants(llmCallUpperBoundUsage(a.promptChars, a.maxTokens))) {
       nextCost = Math.max(nextCost, Number(await this.callCost({ provider: 'anthropic', service: 'messages', product: a.model, usage: v })));
     }
-    // Review I4: un presupuesto REVOCADO (BLOCKED) es tope 0 (falla cerrado, como en los workers); sin ninguna
-    // autorización (runs previos a FinOps) no hay tope que aplicar acá.
+    // Review I4: un presupuesto REVOCADO (BLOCKED) es tope 0 (falla cerrado, como en los workers).
     const [authRow] = await this.dataSource.query(
       `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
       [row.job_id],
     );
-    const cap = !authRow ? null : authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
+    // r58 H4: sin NINGUNA autorización (antes «runs previos a FinOps» = sin tope) → falla cerrado: no se reserva ni se
+    // llama, y el run se pausa (`run_budget_not_authorized`) hasta que un administrador autorice su presupuesto.
+    if (!authRow) {
+      const detail = `el run ${row.job_id} no tiene un presupuesto autorizado (ninguna autorización registrada): no se hace la llamada (sin gasto). Un administrador tiene que autorizar el presupuesto del run antes de reanudar.`;
+      const paused = await this.pauseRunBySystem(row.job_id, RUN_BUDGET_NOT_AUTHORIZED, detail).catch(() => false);
+      return { code: 'run_budget_not_authorized', message: detail, runId: row.job_id, paused };
+    }
+    const cap = authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
     const g = await this.guardRunSpend({ runId: row.job_id, itemRunId: a.itemRunId, nextCost, authorizedBudget: cap, pauseOnCap: true });
     const d = g.decision;
     if (d.allow) return null;

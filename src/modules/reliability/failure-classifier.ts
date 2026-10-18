@@ -332,7 +332,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     codes: ['OUTPUT_TRUNCATED_MAX_TOKENS', 'CONTENT_TRUNCATED_MAX_TOKENS', 'CONTENT_TRUNCATED', 'llm_output_truncated'],
     class: 'B', strategy: 'regenerate_split', rounds: 2,
   },
-  { id: 'budget', codes: ['budget_exceeded', 'budget_approval_required', 'budget_blocked'], class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget' },
+  // r58 H4: run_budget_not_authorized = reserva pagada de un run SIN ninguna autorización (falla cerrado, 0 gasto).
+  { id: 'budget', codes: ['budget_exceeded', 'budget_approval_required', 'budget_blocked', 'run_budget_not_authorized'], class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget' },
   // Loop Cost Efficiency: una parte agotó su presupuesto de recuperación → solo ESA parte espera (el resto sigue).
   { id: 'item_recovery_budget', codes: ['item_recovery_budget_exhausted'], class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'budget', adminAction: 'retry_item' },
   // FinOps P0: la llamada declaró una parte de un run de OTRA cuenta → el proxy no reservó ni llamó (0 gasto). No se

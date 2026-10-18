@@ -409,6 +409,8 @@ const ENV_KEYS = [
         [OWNER, C.cid, JSON.stringify({ manifestId: m.id, blueprintNumber: 1, contextHash, videoMode: 'real', videoDelivery: 'youtube', providerModes: { presentation: 'real', audio: 'real' } })]);
       await ds.query(`insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash) values ($1, $2, $3::jsonb, $4)`,
         [job.id, m.id, JSON.stringify(RH.normalizeCourseContext(ctx)), contextHash]);
+      // r58 H4: un run real nace con su autorización (approve-and-start); sin ninguna, sus reservas pagadas fallan cerrado.
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, decision, approved_by, reason) values ($1, $2, 100, 'ADMIN_APPROVED', 'admin@cursia.test', 'check: run sembrado')`, [job.id, C.cid]);
       const items = [...m.manifest.items].sort((a, b) => (a.type === 'video' ? -1 : 0) - (b.type === 'video' ? -1 : 0));
       const videoOf = new Map();
       for (const it of items) {
