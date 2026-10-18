@@ -109,9 +109,11 @@ const code = async (fn) => { try { await fn(); return 'OK'; } catch (e) { return
     for (const t of ['dynamic_content_md', 'dynamic_context_package_json', 'dynamic_context_summary_json', 'dynamic_course_plan_json', 'dynamic_exam_bank_json',
       'dynamic_exam_gift', 'dynamic_scorm_html', 'dynamic_scorm_manifest', 'dynamic_application_json', 'dynamic_application_draft_json', 'dynamic_course_intro_json',
       'dynamic_module_intro_json', 'dynamic_experience_json', 'dynamic_guided_practice_json', 'dynamic_h5p_params_json', 'dynamic_video_interactions_json',
-      'dynamic_exam_bank_draft_json', 'mbz_final', 'content_snapshot', 'h5p_snapshot', 'practice_file']) {
+      'dynamic_exam_bank_draft_json', 'mbz_final', 'content_snapshot', 'h5p_snapshot']) {
       eq(await code(() => svc.createFromApi(own(t), ME)), 'OK', t);
     }
+    // r58 (I4-2): un archivo de trabajo se valida al adjuntarlo (declaración + bytes; casos en check-quality-report P1).
+    eq(await code(() => svc.createFromApi(own('practice_file', 'pdf'), ME)), 'practice_file_invalid', 'practice_file sin declaración');
     // El backend (uploadBufferArtifact → create) sí registra los suyos.
     eq(await code(() => svc.create(forged, ME)), 'OK', 'backend: dynamic_mbz');
   });

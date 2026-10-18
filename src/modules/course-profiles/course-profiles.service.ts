@@ -7,6 +7,7 @@ import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { suggestProfileFromContext } from '../academic-context/context-design';
 import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
+import { PRACTICE_FILE_ATTACH_MISMATCH_CODE, practiceResourceAttachErrors } from '../artifacts/practice-file-attach';
 import {
   BadRequestException,
   ConflictException,
@@ -271,6 +272,28 @@ export class CourseProfilesService {
           message: `Perfil "${kind}" inválido [${codes}]: ${errors.map((e) => `${e.path || '(raíz)'}: ${e.message}`).join('; ')}`,
           errors,
         });
+      }
+      // r58 (I4-2): cada archivo de trabajo subido del perfil apunta a SU artifact practice_file (verificado al adjuntarlo):
+      // mismo tamaño y sha256. Antes un perfil con un archivo cambiado o ajeno recién fallaba al empaquetar.
+      if (kind === 'assessment') {
+        const resources = (data as { practiceResources?: Array<{ id: string; source: { kind: string; artifactId?: string } }> })?.practiceResources;
+        const ids = [...new Set((resources ?? []).filter((r) => r?.source?.kind === 'artifact' && typeof r.source.artifactId === 'string').map((r) => r.source.artifactId as string))];
+        if (ids.length) {
+          const found: Array<{ id: string; type: string; size_bytes: number | string | null; checksum_sha256: string | null; filename: string | null }> = await qr.query(
+            `select id, type, size_bytes, checksum_sha256, filename from public.artifacts where id = any($1::uuid[]) and owner_id = $2`,
+            [ids, ownerId],
+          );
+          const rows = new Map(ids.map((id) => [id, found.find((r) => String(r.id) === id) ?? null]));
+          const attachErrors = practiceResourceAttachErrors(resources as any, rows);
+          if (attachErrors.length) {
+            await qr.rollbackTransaction();
+            throw new BadRequestException({
+              code: PRACTICE_FILE_ATTACH_MISMATCH_CODE,
+              message: `Perfil "${kind}" inválido [${PRACTICE_FILE_ATTACH_MISMATCH_CODE}]: ${attachErrors.map((e) => `${e.path}: ${e.message}`).join('; ')}`,
+              errors: attachErrors,
+            });
+          }
+        }
       }
       const profile = normalizeProfile(kind, data);
       const sha = profileSha256(profile);

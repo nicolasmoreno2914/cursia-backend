@@ -86,6 +86,7 @@ import {
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
 import { ItemPedagogyBrief, buildItemPedagogyBrief } from '../pedagogy/generator-directives';
 import { ANSWER_BIAS_POOL_ITEM_TYPES, AnswerBiasPool, answerBiasPoolFrom } from '../quality/answer-bias-pool';
+import { VIDEO_MC_COURSE_BIAS_CODE, videoMcCourseRecheck } from '../quality/answer-length-bias';
 import {
   APPLICATION_DRAFT_ARTIFACT_TYPE, EXAM_BANK_DRAFT_ARTIFACT_TYPE, ITEM_DRAFT_SUMMARY_KEYS,
   clearApplicationDraft, clearExamBankDraft, recordApplicationDraft, recordExamBankDraft,
@@ -306,7 +307,11 @@ export interface ClaimPayloadV3 {
    * Fase 2: Actividad de Aplicación. `minutes` = nivel del Manifest (la actividad se dimensiona con él);
    * `context` = estudiante + resultados de aprendizaje CONGELADOS en el Blueprint (null si el perfil no los define).
    */
-  application?: { minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string };
+  application?: {
+    minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string;
+    /** r58 (I4-3): archivos de trabajo adjuntos del capítulo (solo si hay). */
+    practiceFiles?: Array<{ title: string; filename: string; instructions: string; relation: string }>;
+  };
   /**
    * Loop 9 B: práctica guiada del capítulo de contenido. `minutes` = nivel del Manifest; `exercises` = plan de Cursia
    * (ids E1.. y minutos de cada ejercicio, que el ejecutor copia tal cual); `context` = estudiante + resultados
@@ -474,9 +479,20 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'mode', 'videoMode', 'videoModeOriginal', 'external', 'externalReservationKey', 'externalSubmitStartedAt',
   'delivery', 'youtubeVideoId', 'youtubeUrl', 'youtubeUploadStartedAt', 'videogenStatus', 'videogenDownloadUrl',
   'videoIdentity', 'v3Validation', 'artifactIds',
+  // r58 (I4-1): rechazos del re-chequeo de sesgo de las MC de video (lo escribe solo el servidor al fallar el item).
+  'answerBiasRecheck',
   // REL CREDIT: estado de la sonda del proveedor (lo escribe solo el barrido / retryItem).
   'providerProbe',
 ]);
+
+/** r58 (I4-3): archivos de trabajo de UN capítulo en un perfil de evaluación (los del claim de la Actividad de Aplicación). */
+export function practiceFilesOfProfile(profile: unknown, chapterId: string): Array<{ title: string; filename: string; instructions: string; relation: string }> {
+  const list: any[] = Array.isArray((profile as any)?.practiceResources) ? (profile as any).practiceResources : [];
+  return list
+    .filter((r) => r && r.chapterId === chapterId && typeof r?.source?.filename === 'string')
+    .slice(0, 10)
+    .map((r) => ({ title: String(r.title ?? '').slice(0, 160), filename: String(r.source.filename), instructions: String(r.instructions ?? '').slice(0, 400), relation: r.relation === 'chapter' ? 'chapter' : 'application' }));
+}
 
 /** `summary` del ejecutor del navegador sin las claves del servidor (y la lista de las descartadas). */
 export function stripServerOwnedSummaryKeys(summary: Record<string, any>): { summary: Record<string, any>; dropped: string[] } {
@@ -1028,7 +1044,7 @@ export class SchedulerService {
       // transitoria: para exam/final_exam borra el borrador del banco (null explícito; no-op para otros tipos),
       // así un ejecutor con reglas viejas no reanuda una y otra vez una pregunta que el servidor rechaza.
       // O2b: ídem el borrador de la actividad de aplicación (no-op para otros tipos).
-      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null, applicationDraftArtifactId: null });
+      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null, applicationDraftArtifactId: null, ...(pre.answerBiasRejection ? { answerBiasRejection: true } : {}) });
       return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
     }
     const validationPatch =
@@ -1044,7 +1060,11 @@ export class SchedulerService {
           throw new GuardRejection('artifact_changed_after_validation');
         }
       }
-      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...validationPatch, artifactIds: ids });
+      // r58 (I4-1): las señales de sesgo que entran al acumulado del curso son las del SERVIDOR (nunca las declaradas).
+      const biasPatch = pre.kind === 'valid' && pre.answerBiasSignals
+        ? { answerBias: { ...(isPlainObject(summary.answerBias) ? summary.answerBias : {}), signals: pre.answerBiasSignals } }
+        : {};
+      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...biasPatch, ...validationPatch, artifactIds: ids });
       if (merged.ok === false) throw new GuardRejection(merged.reason);
 
       // Spec §3.3 / R16: un artifact por item y rol (type). Se rechaza antes
@@ -1217,6 +1237,8 @@ export class SchedulerService {
     opts?: {
       retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean;
       examBankDraftArtifactId?: string | null; applicationDraftArtifactId?: string | null; errorCode?: string | null;
+      /** r58 (I4-1): el rechazo vino del re-chequeo de sesgo de video del servidor → se cuenta en output_summary.answerBiasRecheck. */
+      answerBiasRejection?: boolean;
     },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
@@ -1234,6 +1256,15 @@ export class SchedulerService {
       const ad = await recordApplicationDraft(qr, item, job.owner_id, opts?.applicationDraftArtifactId ?? null, !!retryable);
       if (ad.recorded === false && opts?.applicationDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador de la actividad ignorado (${ad.reason})`);
       if (ad.recorded === false && opts?.applicationDraftArtifactId === null) await clearApplicationDraft(qr, item);
+      if (opts?.answerBiasRejection === true) {
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('answerBiasRecheck',
+                    jsonb_build_object('rejections', coalesce((output_summary -> 'answerBiasRecheck' ->> 'rejections')::int, 0) + 1))
+            where id = $1`,
+          [item.id],
+        );
+      }
       // Loop de costos (review I2): conceder el intento por una devolución `run_paused` solo si el run está pausado.
       const grant = opts?.grantAttempt === true && (!msg.startsWith('run_paused') || isPausedRun(job));
       const t = await applyItemFailure(
@@ -1473,9 +1504,11 @@ export class SchedulerService {
     promptVersion: string | null = null,
   ): Promise<
     | { kind: 'skip' }
-    | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean }
+    | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean; answerBiasRejection?: true }
     | {
         kind: 'valid';
+        /** r58 (I4-1): señales de sesgo calculadas por el SERVIDOR (video_interactions); reemplazan las del ejecutor. */
+        answerBiasSignals?: { k: 'video_interactions'; ranks: Array<{ m: number; r: number }>; tf: boolean[] };
         artifactType: string;
         artifactId: string;
         storageBucket: string;
@@ -1487,6 +1520,7 @@ export class SchedulerService {
     if (!UUID_RE.test(String(itemRunId))) return { kind: 'skip' };
     const [g] = await this.dataSource.query(
       `select g.id, g.job_id, g.manifest_id, g.item_key, g.type, g.status, g.worker_id, g.chapter_id, g.module_id,
+              g.output_summary -> 'answerBiasRecheck' ->> 'rejections' as answer_bias_rejections,
               pj.owner_id, pj.course_id as job_course_id, pj.frontend_course_id, m.rules_version, m.manifest_json
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
@@ -1572,7 +1606,26 @@ export class SchedulerService {
         retryable: true,
       };
     }
+    // r58 (I4-1): re-chequeo del sesgo «la correcta es la más larga» de las MC de video del CURSO con señales persistidas
+    // (los demás videos completados del run) y las del item calculadas acá. Un rechazo reintentable; después, aceptación
+    // blanda registrada (mismo camino de reparación que el ejecutor). Sin pool → solo se registran las señales.
+    let answerBiasSignals: { k: 'video_interactions'; ranks: Array<{ m: number; r: number }>; tf: boolean[] } | undefined;
+    const extraSummary: Record<string, unknown> = {};
+    if (g.type === 'video_interactions') {
+      let doc: unknown = null;
+      try { doc = JSON.parse(text); } catch { doc = null; }
+      const pool = await this.answerBiasPoolFor(this.dataSource, g.job_id, g.manifest_id, g.item_key);
+      const prior = Number.parseInt(String(g.answer_bias_rejections ?? '0'), 10) || 0;
+      const v = videoMcCourseRecheck(doc, pool, prior);
+      if (v.action === 'reject') {
+        const errors = [{ path: '$.checkpoints', code: VIDEO_MC_COURSE_BIAS_CODE, message: v.message as string }];
+        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, errors), codes: [VIDEO_MC_COURSE_BIAS_CODE], retryable: true, answerBiasRejection: true };
+      }
+      answerBiasSignals = v.signals;
+      if (v.action === 'soft_accept') extraSummary.answerBiasCourse = { ...v.course, accepted: 'soft', rejections: prior, fixPaths: v.fixPaths };
+    }
     return {
+      ...(answerBiasSignals ? { answerBiasSignals } : {}),
       kind: 'valid',
       artifactType,
       artifactId: art.id,
@@ -1580,7 +1633,7 @@ export class SchedulerService {
       storagePath: art.storage_path,
       // M7: huella del contenido validado; el empaque (R12) verifica que el objeto descargado coincida.
       contentSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
-      summary: (r.summary ?? {}) as Record<string, unknown>,
+      summary: { ...((r.summary ?? {}) as Record<string, unknown>), ...extraSummary },
     };
   }
 
@@ -1654,6 +1707,17 @@ export class SchedulerService {
     const facts = videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata, ...(ivAdvanced ? { ivAdvanced: true } : {}) });
     if (facts.ok) (facts as any).videoItemRunId = v.video_item_run_id;
     return facts;
+  }
+
+  /** r58 (I4-3): archivos de trabajo del capítulo en el perfil de evaluación vigente del curso del run (título, archivo, consigna). */
+  private async practiceFilesForChapter(q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, chapterId: string | null): Promise<Array<{ title: string; filename: string; instructions: string; relation: string }>> {
+    if (!chapterId) return [];
+    const [p] = await q.query(
+      `select p.data from public.course_profiles p join public.production_jobs j on j.course_id = p.course_id
+        where j.id = $1 and p.kind = 'assessment' order by p.version desc limit 1`,
+      [jobId],
+    );
+    return practiceFilesOfProfile(p ? (typeof p.data === 'string' ? JSON.parse(p.data) : p.data) : null, chapterId);
   }
 
   /** T6 (r57): acumulado del curso para la prueba de sesgo de respuesta (señales de los items completados del run). */
@@ -1735,6 +1799,12 @@ export class SchedulerService {
         // O2b: anuncia que el fail acepta `applicationDraftArtifactId` (borrador de la actividad entre intentos).
         draftArtifactType: APPLICATION_DRAFT_ARTIFACT_TYPE,
       };
+      // r58 (I4-3): archivos de trabajo del capítulo (perfil de evaluación vigente = el que usa el empaque) para que la
+      // actividad los nombre tal cual (sin otra llamada a la IA). Sin archivos → el claim queda como antes.
+      if (row.job_id) {
+        const files = await this.practiceFilesForChapter(qr, row.job_id, row.chapter_id);
+        if (files.length) out.application.practiceFiles = files;
+      }
     }
     if (row.type === 'guided_practice') {
       // Loop 9 B: minutos (nivel del diseño) y el plan de ejercicios de Cursia (ids y minutos que el ejecutor copia).
