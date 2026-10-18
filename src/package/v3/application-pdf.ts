@@ -7,6 +7,7 @@ import PDFDocument = require('pdfkit');
 import type { ResolvedTheme } from '../../modules/theme-engine';
 import { contrastRatio } from '../../modules/theme-engine';
 import { APPLICATION_GENRE_LABEL } from '../../modules/course-shell/application-pages';
+import { criterionForGuide } from '../../modules/course-shell/application-activity';
 import { LIBRO_PDF_FIXED_DATE, pdfText, unmappedCharCount } from './libro-v3';
 
 export interface ApplicationPdfInput {
@@ -168,7 +169,7 @@ async function render(input: ApplicationPdfInput, mode: 'student' | 'teacher'): 
     text(sol.workshopSolution);
     head('Guía de corrección por criterio');
     sol.correctionGuide.forEach((g: any, i: number) => {
-      text(`${g.criterion} (${a.criteria[i].weight} %)`, { bold: true, gap: 2 });
+      text(`${g.criterion} (${criterionForGuide(a.criteria, g, i)?.weight} %)`, { bold: true, gap: 2 });
       text(`Logrado: ${g.achieved}`, { indent: 12, gap: 2 });
       text(`En proceso: ${g.developing}`, { indent: 12, gap: 2 });
       text(`Insuficiente: ${g.insufficient}`, { indent: 12, gap: 8 });

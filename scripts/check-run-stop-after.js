@@ -112,6 +112,22 @@ async function pureChecks() {
     eq(SA.packageHoldOf({ output_summary: { autoPackage: { eligibleAt: '2026-10-14T00:00:00Z', held: { at: 'x' } } } }), null, 'con marca no está retenido');
     eq(SA.holdsPackaging({ output_summary: { stopAfter: { itemKeys: [], holdPackaging: true } } }), true, 'solo retención');
   });
+  await check('puro (T8): DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS — ausente/vacía → nadie (default); lista de UUIDs (mayúsculas/espacios); `*` = todos; entradas inválidas se ignoran (y se reportan); output_summary inicial con stopAfter solo-retención, conserva base', async () => {
+    const A = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
+    const B = '11111111-2222-4333-8444-555555555555';
+    const K = SA.DEFAULT_HOLD_PACKAGING_OWNERS_ENV;
+    eq(K, 'DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS', 'nombre');
+    eq([SA.defaultHoldPackagingFor(A, {}), SA.defaultHoldPackagingFor(A, { [K]: '' }), SA.defaultHoldPackagingFor(A, { [K]: '  ' })], [false, false, false], 'default: nadie');
+    eq([SA.defaultHoldPackagingFor(A, { [K]: ` ${A.toUpperCase()} , ${B}` }), SA.defaultHoldPackagingFor(B, { [K]: A }), SA.defaultHoldPackagingFor(null, { [K]: A })], [true, false, false], 'lista');
+    eq([SA.defaultHoldPackagingFor(B, { [K]: '*' }), SA.defaultHoldPackagingFor(B, { [K]: `${A},*` })], [true, true], 'comodín');
+    eq([SA.defaultHoldPackagingFor(A, { [K]: 'no-uuid' }), SA.invalidDefaultHoldPackagingEntries({ [K]: `no-uuid,${A},*, x ` })], [false, ['no-uuid', 'x']], 'inválidas ignoradas');
+    eq(SA.initialRunOutputSummary(B, {}, { [K]: A }), {}, 'otro owner: {}');
+    eq(SA.initialRunOutputSummary(A, { invalidation: { x: 1 } }, {}), { invalidation: { x: 1 } }, 'sin lista: base intacta');
+    const now = new Date('2026-10-18T00:00:00Z');
+    const o = SA.initialRunOutputSummary(A, { invalidation: { x: 1 } }, { [K]: A }, now);
+    eq(o, { invalidation: { x: 1 }, stopAfter: { itemKeys: [], holdPackaging: true, setAt: now.toISOString(), setBy: 'system:default_hold_packaging', firedAt: null, firedItemKey: null } }, 'retención por defecto');
+    eq([SA.holdsPackaging({ output_summary: o }), SA.packageHoldReason({ output_summary: o }), SA.stopAfterView({ output_summary: o }).holdPackaging], [true, 'package_hold', true], 'la misma config que el PUT solo-retención');
+  });
 }
 
 // ════ DB ════════════════════════════════════════════════════════════════════
@@ -315,6 +331,29 @@ async function dbChecks() {
       return { cid, m1, c1, c2, c3, runId, keys };
     }
     const setSA = (C, body, actor) => runs.setStopAfter(C.cid, OWNER, 1, C.runId, SA.parseStopAfterBody(body), actor);
+
+    await check('[T8] DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS: startRun de un owner listado → el run NACE con stopAfter solo-retención (GET lo muestra; DELETE lo quita como siempre); sin la lista o con otro owner → output_summary {} como antes', async () => {
+      const K = SA.DEFAULT_HOLD_PACKAGING_OWNERS_ENV;
+      const prev = process.env[K];
+      try {
+        process.env[K] = `99999999-2222-4333-8444-555555555555, ${OWNER}`;
+        const C = await makeCourse('T8 hold por defecto');
+        const row = await runRow(C.runId);
+        eq([row.output_summary.stopAfter.itemKeys, row.output_summary.stopAfter.holdPackaging, row.output_summary.stopAfter.setBy, row.output_summary.stopAfter.firedAt], [[], true, 'system:default_hold_packaging', null], 'config inicial');
+        const dto = await runs.getRun(C.cid, OWNER, 1, C.runId);
+        eq([dto.stopAfter.holdPackaging, dto.stopAfter.itemKeys], [true, []], 'GET');
+        await runs.clearStopAfter(C.cid, OWNER, 1, C.runId);
+        eq(SA.stopAfterOf(await runRow(C.runId)), null, 'DELETE la quita');
+        process.env[K] = '99999999-2222-4333-8444-555555555555';
+        const C2 = await makeCourse('T8 otro owner listado');
+        eq((await runRow(C2.runId)).output_summary.stopAfter, undefined, 'owner no listado: sin config');
+        delete process.env[K];
+        const C3 = await makeCourse('T8 sin lista');
+        eq((await runRow(C3.runId)).output_summary, {}, 'sin lista: {} como antes');
+      } finally {
+        if (prev === undefined) delete process.env[K]; else process.env[K] = prev;
+      }
+    });
 
     // ── [SA] ────────────────────────────────────────────────────────────────
     await check('[SA] PUT: parte inexistente → 404; parte YA completa → 409 (nunca la regenera); curso de otro dueño → 404; body inválido por el controlador → 400', async () => {

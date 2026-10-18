@@ -89,7 +89,7 @@ import {
   themeSha256,
   validateTheme,
 } from '../modules/theme-engine';
-import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION } from '../modules/visual-components';
+import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION, internalVocabularyExemptions, protectedVocabularyTexts, repairInternalVocabularyDeep, formulaicOpeningWarnings } from '../modules/visual-components';
 import {
   CTA_BADGES,
   CourseFacts,
@@ -131,6 +131,7 @@ import {
   activityEmbedsInline,
 } from '../modules/course-shell';
 import type { H5pActivityTypeV2 } from '../modules/course-shell';
+import { TEACHER_GUIDE_IDNUMBER, teacherGuidePage } from '../modules/course-shell/teacher-guide-page';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { LIBRO_PDF_MIMETYPE, libroPdfFilename, renderLibroPdfV3 } from './v3/libro-v3';
 import { LibroLogoCandidate, cursiaDefaultLogo, resolveLibroLogo } from './v3/libro-logo';
@@ -144,10 +145,15 @@ import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { examExplanationsAvailability, examOverallFeedbackBands } from '../modules/course-shell/exam-explanations';
 import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { reviewCardsEnabledFor } from '../modules/study-time/manifest-input';
-import { applicationSolutionPage, applicationStudentPage } from '../modules/course-shell/application-pages';
+import { ApplicationDeliveryText, applicationSolutionPage, applicationStudentPage, practiceResourceIntro, practiceResourceName } from '../modules/course-shell/application-pages';
+import { deliveryMegabytes } from '../modules/course-shell/facts';
+import { repairDeadAnchorsInActivityXml } from './v3/dead-links-v3';
+import { ASSIGN_PLUGIN_CONFIG_COUNT, assignActivityXml, assignDueDate, assignGradeItemXml, assignRubricGradingXml, rubricCriteriaFromApplication } from './v3/assign-v3';
+import { resolvePracticeFiles } from './v3/practice-files';
 import { guidedPracticeLibroMarkdown, guidedPracticePage } from '../modules/course-shell/guided-practice-page';
 import { validateGuidedPracticeDoc } from '../modules/course-shell/guided-practice';
 import { renderApplicationPdf } from './v3/application-pdf';
+import { videoMcLengthBiasWarnings } from '../modules/quality/answer-length-bias';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
 /**
@@ -250,8 +256,21 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * ilimitados); textos del cierre, certificado, insignia, notas para docentes y evaluaciones con la regla real
  * («calificación final ≥ X/100…»); todos los .h5p solo contenido (QuestionSet 1.21, caso ramificado y «Repaso» sin
  * carpetas de librería: requisito del sitio = pack v3, summary.restore `site_library_pack`).
+ * 3.15.0 (T1 r57, defectos de contenido repetibles — sin regenerar contenido): vocabulario interno del generador
+ * reparado antes de renderizar («worked_example» → «ejemplo resuelto», «texto fuente» → «Libro Guía», «[S12]» fuera;
+ * check INTERNAL_VOCABULARY del validador); «Tu recorrido» derivado de los slots reales; el puente que repite un
+ * bloque del cierre se omite; rótulos why/apply con variación determinística; Libro Guía: mapas con ASCII de una
+ * columna (LIBRO_V3_GLYPHS si queda algo sin glifo), listas sueltas numeradas 1..n, portada/índice/tarjeta con los
+ * capítulos reales (práctica incluida) y «Referencias» desde fuentes estructuradas; summary.qualityWarnings
+ * (aperturas repetidas entre capítulos, sesgo de longitud de las MC de los videos). Un paquete sin esos casos es
+ * byte a byte el de 3.14.0 (los dorados no cambian).
+ * T4/T5 (r57, misma versión 3.15.0): Actividad de Aplicación como Tarea (mod_assign: entrega, completion al enviar,
+ * comentarios, nota en su categoría + rúbrica gradingform_rubric, o formativa sin nota) y archivos de trabajo (mod_resource
+ * enlazados desde la AA), ambos desde claves OPCIONALES del perfil de evaluación (`applicationDelivery`,
+ * `practiceResources`). Sin esas claves el paquete es byte a byte el de antes (dorado scripts/fixtures/deliverables); con
+ * ellas cambia el sha del perfil y, con él, la clave de reuse — no hace falta subir la versión.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.14.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.15.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -305,6 +324,11 @@ export interface DynamicPackageContentsV3 {
    * cada documento se empaqueta como página visible del capítulo y al final del capítulo en el Libro Guía.
    */
   guidedPractices?: Map<string, unknown>;
+  /**
+   * T5 (r57): resourceId → bytes de los archivos de trabajo SUBIDOS (artifact `practice_file`) del perfil de evaluación.
+   * Los generados desde una tabla (CSV/XLSX) los produce el builder. Ausente = ninguno subido.
+   */
+  practiceFiles?: Map<string, Buffer>;
 }
 
 export interface BuildDynamicMbzV3Input {
@@ -339,6 +363,11 @@ export interface BuildDynamicMbzV3Input {
    * Cursia con aviso) y nombre de la institución para la portada y el pie. Ausente → logo de Cursia, sin nombre.
    */
   libroBrand?: { logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null; name?: string | null } | null;
+  /**
+   * T1 (r57): bibliografía del programa académico de la institución (textos extraídos de SU documento, con fuente) →
+   * «Referencias» del Libro Guía, tal cual. Ausente/vacía → sin esa subsección (nunca se inventa una referencia).
+   */
+  libroReferences?: ReadonlyArray<string> | null;
 }
 
 /** EV6 DoD: sufijo del nombre del curso de un paquete de QA. */
@@ -365,6 +394,20 @@ export interface MbzV3Expectations {
   shellProseByLabel: Record<string, string[]>;
   /** UX r18 fix 1 (M4): versión del builder que armó el paquete (las reglas nuevas del validador dependen de ella). */
   builderVersion: string;
+  /** T1 (r57): reglas de vocabulario interno exentas porque el contenido del curso las usa como vocabulario del tema. */
+  internalVocabularyExempt: string[];
+  /**
+   * Review r1 (I2): fragmentos escritos por una PERSONA (títulos del Blueprint, archivos de práctica, perfil,
+   * referencias importadas) que contienen un término interno: el validador los quita antes de buscar (nunca bloquean).
+   * Solo presente si hay alguno.
+   */
+  internalVocabularyUserTexts?: string[];
+  /**
+   * Review r2 (I3): fragmentos GENERADOS que quedaron sin reparar porque la reparación pasaba el límite de largo del
+   * campo (aviso `internal_vocabulary_kept_length_limit`). Se exentan por fragmento (no la regla en todo el curso).
+   * Solo presente si hay alguno.
+   */
+  internalVocabularyKeptTexts?: string[];
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -384,6 +427,11 @@ export interface BuildDynamicMbzV3Result {
     /** EV6 T5: videos omitidos por estar pendientes (vista previa) y si el capítulo lleva el aviso. */
     pendingVideos: Array<{ itemKey: string; chapterId: string; chapterNumber: number; title: string; notice: boolean }>;
     warnings: string[];
+    /**
+     * T1 (r57): avisos de CALIDAD del contenido (no operativos; nunca fallan el empaque), p. ej.
+     * `formulaic_opening:reflection:piensa_en:11/15` — la misma apertura en muchos capítulos.
+     */
+    qualityWarnings: string[];
     counts: CourseFacts['counts'];
     /** F1 (I3): resultado de la normalización de pesos (ver `assessmentPackageSummary`). */
     assessment: AssessmentPackageSummary;
@@ -392,6 +440,10 @@ export interface BuildDynamicMbzV3Result {
     restore?: { as: 'site_library_pack'; libraryPack: 'v3'; note: string } | { as: 'admin_or_manager'; note: string };
     /** r19 (L): Libro Guía en PDF — archivo, páginas y el logo usado como marca de agua. */
     libro: { filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string };
+    /** T4 (r57): Actividades de Aplicación entregadas como Tarea (solo si hay alguna). */
+    applicationAssigns?: { count: number; graded: number; rubric: number; category: string | null };
+    /** T5 (r57): archivos de trabajo publicados (solo si hay alguno): id, capítulo, archivo, sha256, bytes y origen. */
+    practiceResources?: Array<{ id: string; chapterId: string; filename: string; mimetype: string; sha256: string; bytes: number; origin: string; relation: string }>;
   };
 }
 
@@ -448,7 +500,8 @@ export class PackagingV3ContentMissingError extends Error {
 
 // ─── ids fijos ─────────────────────────────────────────────────────────────
 
-const CAT_ID: Record<AssessmentCategoryKey, number> = { practice: 2, moduleExams: 3, finalExam: 4 };
+// T4 (r57): `applications` (id 5) solo existe en el gradebook si el perfil la pesa: los ids 2–4 no cambian.
+const CAT_ID: Record<AssessmentCategoryKey, number> = { practice: 2, moduleExams: 3, finalExam: 4, applications: 5 };
 const NULL = '$@NULL@$';
 const EMPTY_SHA1 = 'da39a3ee5e6b4b0d3255bfef95601890afd80709';
 
@@ -504,9 +557,19 @@ class MbzWriter {
   private gradeSort = 10;
   readonly idnumbers = new Set<string>();
 
+  /** Review r1 (M9): enlaces muertos reparados por archivo (la última escritura de cada archivo cuenta). */
+  readonly deadLinksUnwrapped = new Map<string, number>();
+
   constructor(readonly ts: number, readonly MV: MoodleVersionInfo) {}
 
   put(name: string, data: string | Buffer | Uint8Array): void {
+    // Review r1 (M9): un enlace muerto (`href="#"`) en el HTML visible de una actividad se desenvuelve (queda el texto).
+    if (typeof data === 'string' && /^activities\/[a-z0-9]+_\d+\/[a-z0-9]+\.xml$/.test(name) && !/\/(module|inforef|grades|roles|calendar|grade_history|competencies|filters|completion|comments|xapistate|grading)\.xml$/.test(name)) {
+      const r = repairDeadAnchorsInActivityXml(data);
+      if (r.count) this.deadLinksUnwrapped.set(name, r.count);
+      else this.deadLinksUnwrapped.delete(name);
+      data = r.xml;
+    }
     this.zip.file(name, data, { date: MBZ_V3_ZIP_FIXED_DATE, createFolders: false });
   }
 
@@ -825,9 +888,156 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
   return { modules, final };
 }
 
+/** Claves de identificadores (nunca texto de una persona) al recolectar los textos escritos por el usuario. */
+const USER_TEXT_SKIP_KEYS = new Set(['id', 'type', 'kind', 'variant', 'engine', 'activityEngine', 'structureVersion', 'storagePath', 'sha256', 'mimetype', 'mimeType', 'artifactId', 'origin', 'relation', 'chapterId', 'moduleId', 'source']);
+const USER_TEXT_TITLE_KEYS = new Set(['title', 'name', 'label']);
+/** Review r2 (I2): nombre de un archivo que subió o nombró el usuario («worked_example.xlsx»): siempre es suyo. */
+const USER_FILENAME_KEYS = new Set(['filename']);
+
+function collectUserStrings(v: unknown, key: string | null, out: string[]): void {
+  if (typeof v === 'string') {
+    if (key !== null && USER_FILENAME_KEYS.has(key)) {
+      if (v.trim()) out.push(v);
+      return;
+    }
+    if (key !== null && USER_TEXT_SKIP_KEYS.has(key)) return;
+    if (/\s/.test(v.trim()) || (key !== null && USER_TEXT_TITLE_KEYS.has(key))) out.push(v);
+    return;
+  }
+  if (Array.isArray(v)) for (const x of v) collectUserStrings(x, key, out);
+  else if (v && typeof v === 'object' && !(v instanceof Buffer) && !(v instanceof Uint8Array)) {
+    for (const k of Object.keys(v as Record<string, unknown>)) collectUserStrings((v as Record<string, unknown>)[k], k, out);
+  }
+}
+
+/**
+ * Review r2 (M-a, procedencia): del Blueprint solo cuenta como texto de una PERSONA lo que el docente escribe o edita en
+ * el paso de estructura (el título del curso; título, objetivo y descripción de cada módulo y capítulo — una estructura
+ * sugerida se revisa y edita ahí antes de congelarse) y el perfil del estudiante y sus resultados escritos en el perfil
+ * pedagógico (`course.applicationContext`). NO cuenta lo que propone un modelo o una regla y queda guardado en el
+ * Blueprint: `course.academicContext` (resultados/competencias: el snapshot no guarda su origen por dato y pueden ser
+ * propuestos por IA — PROPOSAL_BASIS — así que se tratan como texto generado: se reparan y se juzgan) ni `pedagogy` /
+ * `design` (motor de reglas). Lo que viene del documento importado de la institución entra por `libroReferences`.
+ */
+function blueprintUserStrings(bp: BlueprintSnapshotV2 | null | undefined, out: string[]): void {
+  if (!bp || typeof bp !== 'object') return;
+  const push = (t: unknown) => { if (typeof t === 'string' && t.trim()) out.push(t); };
+  push(bp.course?.title);
+  collectUserStrings(bp.course?.applicationContext ?? null, null, out);
+  for (const m of Array.isArray(bp.modules) ? bp.modules : []) {
+    push(m.title);
+    push(m.objective);
+    push(m.description);
+    for (const ch of Array.isArray(m.chapters) ? m.chapters : []) {
+      push(ch.title);
+      push(ch.objective);
+      push(ch.description);
+    }
+  }
+}
+
+/**
+ * Review r1 (I2) + r2: textos que escribió, editó o subió una PERSONA y que el paquete muestra: del Blueprint lo que
+ * edita el docente (ver `blueprintUserStrings`), el perfil de evaluación completo (lo configura el docente: archivos de
+ * práctica con su título, instrucciones y NOMBRE DE ARCHIVO; textos de la Tarea), las referencias importadas del
+ * documento de la institución y el nombre de la institución. Solo devuelve los fragmentos con un término interno (si
+ * no hay ninguno, nada cambia), ya en la vista normalizada (`plainTextView`).
+ */
+export function userProvidedVocabularyTexts(input: Pick<BuildDynamicMbzV3Input, 'blueprint' | 'assessmentProfile' | 'libroReferences' | 'libroBrand'>, exempt: readonly string[]): string[] {
+  const all: string[] = [];
+  blueprintUserStrings(input.blueprint, all);
+  collectUserStrings(input.assessmentProfile, null, all);
+  for (const r of input.libroReferences ?? []) if (typeof r === 'string') all.push(r);
+  if (typeof input.libroBrand?.name === 'string') all.push(input.libroBrand.name);
+  return protectedVocabularyTexts(all, exempt);
+}
+
+/**
+ * T1 (r57): reparación determinística del vocabulario interno en todo el contenido LLM que se muestra (experiencias,
+ * intros, interacciones del video, actividad H5P, bancos de examen, AA + solucionario, ejercicios guiados). El Libro
+ * (contentMd) es la referencia del dominio: define las exenciones y no se toca. Aviso por regla con su cantidad.
+ * Review r1: `protectedTexts` (I2, texto de una persona citado por el modelo) nunca se toca; `noGrowth` (I3) nunca
+ * alarga un campo (rótulo corto o, si tampoco entra, el original queda con aviso y su regla exenta en el validador).
+ */
+export function repairContentsInternalVocabulary(
+  contents: DynamicPackageContentsV3,
+  opts: { protectedTexts?: readonly string[]; noGrowth?: boolean } = {},
+): { contents: DynamicPackageContentsV3; exempt: string[]; keptTexts: string[]; warnings: string[]; fixed: number } {
+  const exempt = internalVocabularyExemptions(contents.contentMd ? contents.contentMd.values() : []);
+  const counts = new Map<string, number>();
+  const shortCounts = new Map<string, number>();
+  const keptCounts = new Map<string, number>();
+  const keptTexts: string[] = [];
+  const bump = (m: Map<string, number>, ids: string[]) => { for (const f of ids) m.set(f, (m.get(f) ?? 0) + 1); };
+  const fix = <T>(v: T): T => {
+    if (v === undefined || v === null) return v;
+    const r = repairInternalVocabularyDeep(v, exempt, opts);
+    bump(counts, r.fixes);
+    bump(shortCounts, r.shortened);
+    bump(keptCounts, r.kept);
+    keptTexts.push(...r.keptTexts);
+    return r.value;
+  };
+  const fixMap = <T>(m: Map<string, T> | undefined): Map<string, T> | undefined => (m ? new Map(Array.from(m, ([k, v]) => [k, fix(v)])) : m);
+  const activities = contents.activities
+    ? new Map(Array.from(contents.activities, ([k, a]) => [k, a.variant === 'h5p' ? { ...a, payload: fix(a.payload) } : a] as [string, ActivityContentV3]))
+    : contents.activities;
+  const out: DynamicPackageContentsV3 = {
+    ...contents,
+    courseIntro: fix(contents.courseIntro),
+    moduleIntros: fixMap(contents.moduleIntros) as Map<string, unknown>,
+    experiences: fixMap(contents.experiences) as Map<string, unknown>,
+    videoInteractions: fixMap(contents.videoInteractions) as Map<string, unknown>,
+    activities,
+    ...(contents.examBanks ? { examBanks: fixMap(contents.examBanks) } : {}),
+    ...(contents.finalExamBank ? { finalExamBank: fix(contents.finalExamBank) } : {}),
+    ...(contents.applications ? { applications: fixMap(contents.applications) } : {}),
+    ...(contents.guidedPractices ? { guidedPractices: fixMap(contents.guidedPractices) } : {}),
+  };
+  const warnings = [
+    ...Array.from(counts, ([rule, n]) => `internal_vocabulary_repaired:${rule}:${n}`),
+    ...Array.from(shortCounts, ([rule, n]) => `internal_vocabulary_short_label:${rule}:${n}`),
+    ...Array.from(keptCounts, ([rule, n]) => `internal_vocabulary_kept_length_limit:${rule}:${n}`),
+  ].sort();
+  // I3 (review r2): un término que no se pudo reparar sin pasar el límite del campo queda visible con aviso; se exenta
+  // SOLO ese fragmento (`keptTexts` → expectations.internalVocabularyKeptTexts), nunca la regla en todo el curso.
+  let fixed = 0;
+  for (const n of counts.values()) fixed += n;
+  return { contents: out, exempt, keptTexts: protectedVocabularyTexts(keptTexts, exempt), warnings, fixed };
+}
+
+/** Review r1 (I3): error de largo de un esquema (caracteres o palabras) al validar el contenido ya reparado. */
+function isLengthLimitError(err: unknown): boolean {
+  return /TEXT_TOO_LONG|WORD_RANGE/.test(err instanceof Error ? err.message : String(err));
+}
+
+/**
+ * Review r1 (I3): la reparación del vocabulario nunca deja un paquete sin armar por largo. Primero se arma con los
+ * rótulos completos; si ESO falla por un límite de largo (caracteres/palabras) y hubo reparaciones, se re-arma con la
+ * reparación que nunca alarga un campo (`noGrowth`). Cualquier otro error, o el mismo sin reparaciones, sube igual.
+ */
 export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<BuildDynamicMbzV3Result> {
+  try {
+    return await buildDynamicMbzV3Once(input, false);
+  } catch (err) {
+    if (!isLengthLimitError(err)) throw err;
+    if (!input?.contents || repairContentsInternalVocabulary(input.contents, { protectedTexts: userProvidedVocabularyTexts(input, []) }).fixed === 0) throw err;
+    return buildDynamicMbzV3Once(input, true);
+  }
+}
+
+async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: boolean): Promise<BuildDynamicMbzV3Result> {
   if (!Number.isInteger(input?.ts) || input.ts <= 0) throw new Error('MBZ_V3_INVALID: ts (reloj inyectado) debe ser un entero > 0');
-  const { manifest, blueprint, contents: c, ts } = input;
+  const { manifest, blueprint, ts } = input;
+  // Review r1 (M): fecha de inicio del curso EN EL BACKUP (course.xml <startdate> y <original_course_startdate>): las
+  // fechas relativas (fecha límite de la Tarea) se anclan a ella, así Moodle las corre juntas al restaurar.
+  const courseStartDate = ts;
+  // T1 (r57): vocabulario interno del generador («worked_example», «texto fuente», «[S12]»…) → lenguaje natural,
+  // determinístico, ANTES de validar/renderizar (también repara artifacts ya generados al re-empaquetar).
+  // Review r1 (I2): el texto que escribió una persona (títulos, archivos de práctica, perfil, referencias) nunca se repara.
+  const vocabUserTexts = userProvidedVocabularyTexts(input, internalVocabularyExemptions(input.contents?.contentMd ? input.contents.contentMd.values() : []));
+  const vocab = repairContentsInternalVocabulary(input.contents, { protectedTexts: vocabUserTexts, noGrowth });
+  const c = vocab.contents;
   const pendingIds = [...new Set(input.pendingVideoChapterIds ?? [])];
   const plan = buildPackagingPlanV3(manifest, blueprint, { manifestId: input.manifestId ?? null, omitVideoChapterIds: pendingIds });
   const omittedVideoKeys = plan.omittedVideos.map((v) => v.videoKey);
@@ -840,6 +1050,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const warnings: string[] = [];
   // EV6 T5: aviso visible en el resumen del paquete por cada video pendiente omitido.
   for (const v of plan.omittedVideos) warnings.push(`pending_video_omitted:${v.videoKey}`);
+  warnings.push(...vocab.warnings);
 
   // ── Tema (R1) y evaluación (R6) ──────────────────────────────────────────
   const theme: ResolvedTheme = resolveTheme(input.presentation);
@@ -849,7 +1060,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   const resolved = resolveAssessment(input.assessmentProfile, {
     hasFinalExam: plan.features.finalExam,
     activityEngine: plan.features.activityEngine,
-    itemCounts: assessmentItemCountsForPackage(manifest, omittedVideoKeys),
+    itemCounts: assessmentItemCountsForPackage(manifest, omittedVideoKeys, input.assessmentProfile),
   });
 
   // ── Contenidos LLM validados ─────────────────────────────────────────────
@@ -910,6 +1121,17 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     guidedDocs.set(ch.chapterId, doc);
   }
   for (const id of c.guidedPractices?.keys() ?? []) if (!guidedDocs.has(id)) throw new Error(`MBZ_V3_INVARIANT: práctica guiada del capítulo ${id}, que no la tiene en el plan`);
+  // T5 (r57): archivos de trabajo del perfil (subidos: verificados por sha256/tamaño/formato; tabla: generados). Falla fuerte.
+  const practice = await resolvePracticeFiles(
+    input.assessmentProfile.practiceResources,
+    allChapters.map((ch) => ({ chapterId: ch.chapterId, hasApplication: !!ch.keys.application })),
+    c.practiceFiles,
+  );
+  warnings.push(...practice.warnings);
+  // T4 (r57): excepciones de entrega de capítulos sin AA (o fuera del curso) no aplican: aviso visible, nunca en silencio.
+  for (const id of Object.keys(input.assessmentProfile.applicationDelivery?.chapterModes ?? {})) {
+    if (!allChapters.some((ch) => ch.chapterId === id && !!ch.keys.application)) warnings.push(`application_delivery_chapter_ignored:${id}`);
+  }
   // r19 (L3): logo de la marca de agua (cuenta → Cursia); un logo de la cuenta inválido deja su aviso, nunca en silencio.
   let libroLogo = resolveLibroLogo(input.libroBrand?.logo ?? null);
   warnings.push(...libroLogo.warnings);
@@ -930,6 +1152,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     brandName: input.libroBrand?.name ?? null,
     // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.
     documentKey: packagingPlanV3Sha256(plan),
+    // T1 (r57): la portada y el índice cuentan los capítulos REALES (los de práctica, sin texto en el Libro, en su lugar).
+    practiceChapters: plan.modules.flatMap((m) => m.chapters.filter((ch) => ch.kind === 'practice').map((ch) => ({ number: ch.chapterNumber, title: ch.title, moduleNumber: m.moduleNumber }))),
+    ...(input.libroReferences && input.libroReferences.length ? { programReferences: [...input.libroReferences] } : {}),
   };
   let libro: Awaited<ReturnType<typeof renderLibroPdfV3>>;
   try {
@@ -972,6 +1197,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     ...(reviewDecks.size ? { reviewCardCountByChapter: Object.fromEntries([...reviewDecks].map(([id, d]) => [id, d.cards.length])) } : {}),
     // Loop 9 B: las prácticas guiadas validadas (sus minutos entran al tiempo del capítulo).
     ...(guidedDocs.size ? { guidedPracticeChapterIds: [...guidedDocs.keys()] } : {}),
+    ...(practice.resolved.length ? { practiceResources: practice.resolved } : {}),
     assessment: input.assessmentProfile,
     hours: input.hours ?? null,
     pendingVideos: plan.omittedVideos.length ? { chapterIds: plan.omittedVideos.map((v) => v.chapterId), noticeChapterIds } : null,
@@ -996,10 +1222,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     },
   });
   // R6: una categoría con peso > 0 y sin ítems calificables deja el curso sin poder llegar a 100 → falla fuerte.
+  // T4 (r57): las Tareas calificadas cuentan en su categoría (propia o práctica).
+  const gradedAssignCount = facts.counts.applicationAssignsGraded ?? 0;
+  const assignCategory = resolved.application?.graded ? resolved.application.category : null;
   assertCategoriesPopulated(resolved, {
-    practice: facts.counts.activities + facts.counts.videos,
+    practice: facts.counts.activities + facts.counts.videos + (assignCategory === 'practice' ? gradedAssignCount : 0),
     moduleExams: facts.counts.exams,
     finalExam: facts.finalExam.enabled ? 1 : 0,
+    ...(assignCategory === 'applications' || resolved.categories.some((x) => x.key === 'applications') ? { applications: assignCategory === 'applications' ? gradedAssignCount : 0 } : {}),
   });
 
   // EV6: el shell (facts) y el plan (Manifest) derivan las MISMAS secciones; si difieren, los
@@ -1111,6 +1341,100 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     if (opts.teacherOnly) W.put(`${a.dir}/roles.xml`, TEACHER_ONLY_ROLES_XML);
     labelsHtml.push({ where: idnumber, html: page.html });
     return a;
+  };
+
+  // T4 (r57): Actividad de Aplicación como Tarea (mod_assign): la descripción es la página del estudiante (con su PDF en
+  // `intro`), entrega por texto en línea y/o archivos, completion al ENVIAR (completionsubmit), comentarios de
+  // retroalimentación; calificada → ítem de nota en su categoría (+ rúbrica con los criterios de la AA); formativa → sin
+  // ítem de nota. El solucionario sigue en su página oculta solo para docentes.
+  let assignPluginConfigId = 1;
+  let gradingSeq = 1;
+  let rubricCriterionId = 1;
+  let rubricLevelId = 1;
+  let assignsGraded = 0;
+  let assignsTotal = 0;
+  let assignsRubric = 0;
+  const addAssign = (
+    secnum: number,
+    idnumber: string,
+    name: string,
+    introHtml: string,
+    files: Array<{ name: string; data: Buffer; mime: string }>,
+    doc: unknown,
+  ): ActivityRef => {
+    const d = resolved.application;
+    if (!d) throw new Error('MBZ_V3_INVARIANT: Tarea de entrega sin applicationDelivery resuelta');
+    const a = W.newActivity('assign', secnum, name, idnumber);
+    assignsTotal++;
+    const fileIds = files.map((f) => W.addFile(a.ctx, 'mod_assign', 'intro', f.name, f.data, f.mime));
+    W.put(`${a.dir}/assign.xml`, assignActivityXml({ aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml, ts, delivery: d, duedate: assignDueDate(courseStartDate, d.dueOffsetDays), pluginConfigId: assignPluginConfigId }));
+    assignPluginConfigId += ASSIGN_PLUGIN_CONFIG_COUNT;
+    // Completion al ENVIAR (completionsubmit 1 en assign.xml): la aprobación del curso sigue siendo solo la nota final (r55).
+    W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'assign', secnum, ts, MV.bv), idnumber), { completion: '2', completionview: '0', downloadcontent: '0' }));
+    if (d.graded) {
+      assignsGraded++;
+      const gi = W.nextGradeItem();
+      W.put(`${a.dir}/grades.xml`, assignGradeItemXml({
+        gradeItemId: gi.id, itemName: name, aid: a.aid, ts, grademax: d.maxGrade as number, gradepass: d.gradepass as number,
+        categoryId: CAT_ID[d.category as AssessmentCategoryKey], sortorder: gi.sortorder,
+      }));
+      W.put(`${a.dir}/inforef.xml`, inforef(fileIds, [gi.id]));
+      if (d.rubric) {
+        const criteria = rubricCriteriaFromApplication(doc);
+        if (criteria.length) {
+          const g = assignRubricGradingXml({
+            areaId: gradingSeq, definitionId: gradingSeq, criterionId: rubricCriterionId, levelId: rubricLevelId,
+            name: `Rúbrica · ${name}`.slice(0, 255), description: 'Rúbrica hecha con los criterios de evaluación de la Actividad de Aplicación.', criteria, ts,
+          });
+          gradingSeq++;
+          rubricCriterionId += g.criteria;
+          rubricLevelId += g.levels;
+          W.put(`${a.dir}/grading.xml`, g.xml);
+          assignsRubric++;
+        }
+      }
+    } else {
+      W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+      W.put(`${a.dir}/inforef.xml`, inforef(fileIds));
+    }
+    W.boilerplate(a.dir);
+    labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
+    return a;
+  };
+
+  // T5 (r57): archivo de trabajo = mod_resource del capítulo (descarga; la AA lo enlaza con $@RESOURCEVIEWBYID*mid@$).
+  const resourceMidById = new Map<string, number>();
+  const practiceById = new Map(practice.resolved.map((r) => [r.id, r]));
+  const addPracticeResource = (secnum: number, chapterId: string, chapterNumber: number, resourceId: string): void => {
+    const r = practiceById.get(resourceId);
+    const data = practice.bytes.get(resourceId);
+    if (!r || !data || r.chapterId !== chapterId) throw new Error(`MBZ_V3_INVARIANT: archivo de trabajo ${resourceId} sin bytes o de otro capítulo`);
+    const name = safeActivityName(practiceResourceName(r, chapterNumber), 255);
+    const a = W.newActivity('resource', secnum, name, `cv3:ch:${chapterId}:resource:${resourceId}`);
+    resourceMidById.set(resourceId, a.mid);
+    const intro = practiceResourceIntro(r, chapterNumber, theme);
+    const fid = W.addFile(a.ctx, 'mod_resource', 'content', r.filename, data, r.mimetype);
+    W.put(`${a.dir}/resource.xml`, `<?xml version="1.0" encoding="UTF-8"?>
+<activity id="${a.aid}" moduleid="${a.mid}" modulename="resource" contextid="${a.ctx}">
+  <resource id="${a.aid}">
+    <name>${xmlEsc(name)}</name>
+    <intro>${xmlEsc(intro)}</intro>
+    <introformat>1</introformat>
+    <tobemigrated>0</tobemigrated>
+    <legacyfiles>0</legacyfiles>
+    <legacyfileslast>${NULL}</legacyfileslast>
+    <display>0</display>
+    <displayoptions>a:1:{s:10:"printintro";s:1:"1";}</displayoptions>
+    <filterfiles>0</filterfiles>
+    <revision>1</revision>
+    <timemodified>${ts}</timemodified>
+  </resource>
+</activity>`);
+    W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'resource', secnum, ts, MV.bv), a.idnumber), { showdescription: '1' }));
+    W.put(`${a.dir}/inforef.xml`, inforef([fid]));
+    W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+    W.boilerplate(a.dir);
+    labelsHtml.push({ where: `${a.idnumber}#intro`, html: intro });
   };
 
   const gradedCommon = (a: ActivityRef, kind: AssessableType, name: string, fileIds: number[], qcats: number[] = []): void => {
@@ -1277,6 +1601,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   addLabel(0, 'cv3:shell:competencies', competenciesLabel(facts, courseIntro, theme, opts));
   addLabel(0, 'cv3:shell:methodology', methodologyLabel(facts, courseIntro, theme, opts));
   addLabel(0, 'cv3:shell:start', welcomeStartLabel(firstChapterSection as number, facts, theme, opts));
+  // T6 (r57): «Guía del docente» (opt-in del perfil): página OCULTA solo para docentes, antes del foro de avisos.
+  if (facts.teacherGuide === true) {
+    const guide = teacherGuidePage({ facts, resolved, blueprint, applications: c.applications ?? null }, theme);
+    addPage(0, TEACHER_GUIDE_IDNUMBER, { name: safeActivityName(guide.name), html: guide.html }, [], { teacherOnly: true });
+  }
   {
     const name = '📢 Avisos del Curso';
     const a = W.newActivity('forum', 0, name, 'cv3:shell:forum');
@@ -1426,6 +1755,10 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           addPage(sec, `${idp}:guided_practice`, { name: safeActivityName(page.name), html: page.html }, [], { completionView: true });
           continue;
         }
+        if (slot.kind === 'practice_resource') {
+          addPracticeResource(sec, ch.chapterId, ch.chapterNumber, slot.resourceId);
+          continue;
+        }
         if (slot.kind === 'application') {
           // Fase 2: página del estudiante (visible, con su PDF imprimible) + solucionario docente (OCULTO, con su PDF).
           const doc = c.applications?.get(ch.chapterId);
@@ -1437,9 +1770,28 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
           const studentPdf = await renderApplicationPdf(pdfIn, 'student');
           const teacherPdf = await renderApplicationPdf(pdfIn, 'teacher');
           for (const r of [studentPdf, teacherPdf]) if (r.unmappedChars > 0) warnings.push(`application_chars_unmapped:${ch.keys.application}:${r.unmappedChars}`);
-          const pageIn = { chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone };
-          const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName }, theme);
-          addPage(sec, `${idp}:application`, { name: safeActivityName(student.name), html: student.html }, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], { completionView: true });
+          // T5 (r57): archivos de trabajo de la AA (ya creados en la sección, antes de la actividad) → enlaces en la actividad.
+          const appResources = (cf.resources ?? []).filter((r) => r.relation === 'application').map((r) => {
+            const mid = resourceMidById.get(r.id);
+            if (mid === undefined) throw new Error(`MBZ_V3_INVARIANT: archivo de trabajo ${r.id} no creado antes de su Actividad de Aplicación`);
+            return { title: r.title, instructions: r.instructions, filename: r.filename, href: `$@RESOURCEVIEWBYID*${mid}@$` };
+          });
+          const pageIn = { chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone, ...(appResources.length ? { resources: appResources } : {}) };
+          if (cf.applicationDelivery?.mode === 'assign') {
+            // T4 (r57): Tarea de Moodle con la AA como descripción (+ «Cómo entregar») y el PDF del estudiante en `intro`.
+            const d = resolved.application;
+            if (!d) throw new Error('MBZ_V3_INVARIANT: capítulo con Tarea sin entrega resuelta');
+            const delivery: ApplicationDeliveryText = {
+              onlineText: d.submission.onlineText, file: d.submission.file, maxFiles: d.submission.maxFiles,
+              maxMegabytes: deliveryMegabytes(d.submission.maxBytes), fileTypes: d.submission.fileTypes,
+              dueOffsetDays: d.dueOffsetDays, graded: d.graded, maxGrade: d.maxGrade, rubric: d.graded && d.rubric,
+            };
+            const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName, delivery }, theme);
+            addAssign(sec, `${idp}:application`, safeActivityName(student.name), student.html, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], doc);
+          } else {
+            const student = applicationStudentPage({ ...pageIn, pdfFilename: studentPdfName }, theme);
+            addPage(sec, `${idp}:application`, { name: safeActivityName(student.name), html: student.html }, [{ name: studentPdfName, data: studentPdf.pdf, mime: 'application/pdf' }], { completionView: true });
+          }
           const teacher = applicationSolutionPage({ ...pageIn, pdfFilename: teacherPdfName }, theme);
           addPage(sec, `${idp}:application_solution`, { name: safeActivityName(teacher.name), html: teacher.html }, [{ name: teacherPdfName, data: teacherPdf.pdf, mime: 'application/pdf' }], { teacherOnly: true });
           continue;
@@ -1553,7 +1905,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     ? [{ moduleId: libroMid, modname: 'resource' as const }]
     : completionCriteriaFor(graded.map((g) => ({ moduleId: g.moduleId, modname: g.modname, kind: g.kind })), resolved.courseCompletion);
   if (!resolved.withoutGrades) {
-    if (graded.length === 0) throw new Error('MBZ_V3_INVARIANT: curso con nota sin ítems calificables');
+    if (graded.length + assignsGraded === 0) throw new Error('MBZ_V3_INVARIANT: curso con nota sin ítems calificables');
     if (completionCriteria.length !== 0) throw new Error('MBZ_V3_INVARIANT: un curso con nota no lleva criterios de actividad (solo la nota final)');
     if (resolved.courseCompletion.requireCourseGradePass !== true) throw new Error('MBZ_V3_INVARIANT: curso con nota sin criterio de nota del curso');
     if (!(resolved.courseCompletion.courseGradepass > 0) || resolved.courseCompletion.courseGradepass !== resolved.courseGradepass) {
@@ -1607,7 +1959,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   <shortname>${esc(courseTitle)}</shortname><fullname>${esc(courseTitle)}</fullname>
   <idnumber></idnumber><summary></summary><summaryformat>1</summaryformat>
   <format>topics</format><showgrades>1</showgrades><newsitems>5</newsitems>
-  <startdate>${ts}</startdate><enddate>0</enddate><marker>0</marker>
+  <startdate>${courseStartDate}</startdate><enddate>0</enddate><marker>0</marker>
   <maxbytes>0</maxbytes><legacyfiles>0</legacyfiles><showreports>0</showreports>
   <visible>1</visible><groupmode>0</groupmode><groupmodeforce>0</groupmodeforce>
   <defaultgroupingid>0</defaultgroupingid><lang>es</lang><theme></theme>
@@ -1641,9 +1993,13 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     categories: resolved.categories.map((cat) => ({ id: CAT_ID[cat.key], fullname: cat.fullname, weight: cat.weight, gradeItemId: CAT_ID[cat.key] })),
     ...(resolved.withoutGrades ? { withoutGrades: true } : {}),
   }));
-  if (resolved.withoutGrades && graded.length > 0) {
-    throw new Error(`ASSESSMENT_INVALID_FACTS: curso sin nota con ${graded.length} ítem(s) calificable(s) en el paquete`);
+  if (resolved.withoutGrades && graded.length + assignsGraded > 0) {
+    throw new Error(`ASSESSMENT_INVALID_FACTS: curso sin nota con ${graded.length + assignsGraded} ítem(s) calificable(s) en el paquete`);
   }
+  if (assignsTotal !== (facts.counts.applicationAssigns ?? 0) || assignsGraded !== (facts.counts.applicationAssignsGraded ?? 0)) {
+    throw new Error(`MBZ_V3_INVARIANT: ${assignsTotal} Tarea(s) (${assignsGraded} calificadas) ≠ facts ${facts.counts.applicationAssigns ?? 0} (${facts.counts.applicationAssignsGraded ?? 0})`);
+  }
+  if (resourceMidById.size !== practice.resolved.length) throw new Error(`MBZ_V3_INVARIANT: ${resourceMidById.size} archivo(s) de trabajo publicados ≠ ${practice.resolved.length} resueltos`);
   W.put('completion.xml', courseCompletionXml({
     criteria: completionCriteria,
     aggregation: 'all',
@@ -1736,7 +2092,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   <original_course_fullname>${esc(courseTitle)}</original_course_fullname>
   <original_course_shortname>${esc(courseTitle)}</original_course_shortname>
   <original_course_format>topics</original_course_format>
-  <original_course_startdate>${ts}</original_course_startdate>
+  <original_course_startdate>${courseStartDate}</original_course_startdate>
   <original_course_enddate>0</original_course_enddate>
   <original_course_contextid>${MBZ_V3_COURSE_BACKUP_CONTEXTID}</original_course_contextid>
   <original_system_contextid>${MBZ_V3_SYSTEM_BACKUP_CONTEXTID}</original_system_contextid>
@@ -1759,10 +2115,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
 </information>
 </moodle_backup>`);
 
+  // Review r1 (M9): aviso visible por cada enlace muerto reparado (nunca en silencio).
+  let deadLinks = 0;
+  for (const n of W.deadLinksUnwrapped.values()) deadLinks += n;
+  if (deadLinks) warnings.push(`dead_link_unwrapped:${deadLinks}`);
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3 },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,
@@ -1782,11 +2142,20 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         itemKey: v.videoKey, chapterId: v.chapterId, chapterNumber: v.chapterNumber, title: v.title, notice: noticeChapterIds.includes(v.chapterId),
       })),
       warnings,
+      qualityWarnings: [
+        ...formulaicOpeningWarnings(plan.modules.flatMap((m) => m.chapters.map((ch) => c.experiences.get(ch.chapterId)))),
+        // T1 (r57): la regla de conjunto del banco de examen (≤ 30 % «la correcta es la más larga») sobre TODOS los videos del paquete.
+        ...videoMcLengthBiasWarnings(plan.modules.flatMap((m) => m.chapters.filter((ch) => !!ch.keys.video).map((ch) => c.videoInteractions.get(ch.chapterId)))),
+      ],
       // r19: piso de 25 min del audiolibro (solo si el empaque pasó los manifiestos; no entra al .mbz).
       ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
       libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256 },
+      ...(assignsTotal ? { applicationAssigns: { count: assignsTotal, graded: assignsGraded, rubric: assignsRubric, category: resolved.application?.category ?? null } } : {}),
+      ...(practice.resolved.length
+        ? { practiceResources: practice.resolved.map((r) => ({ id: r.id, chapterId: r.chapterId, filename: r.filename, mimetype: r.mimetype, sha256: r.sha256, bytes: r.bytes, origin: r.origin, relation: r.relation })) }
+        : {}),
       // r55 (R7): todos los .h5p son solo contenido; con un tipo que no está en el pack v1 (QuestionSet 1.21, BS,
       // «Repaso») la entrega declara el requisito del sitio: Cursia H5P Library Pack v3 (cualquier rol restaura).
       ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_SITE_LIBRARY_PACK_RESTORE_NOTE } : {}),

@@ -1,3 +1,4 @@
+import { learningPlanExperienceRequirements } from '../pedagogy/learning-plan-directives';
 import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
@@ -83,6 +84,7 @@ import {
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
 import { ItemPedagogyBrief, buildItemPedagogyBrief } from '../pedagogy/generator-directives';
+import { ANSWER_BIAS_POOL_ITEM_TYPES, AnswerBiasPool, answerBiasPoolFrom } from '../quality/answer-bias-pool';
 import {
   APPLICATION_DRAFT_ARTIFACT_TYPE, EXAM_BANK_DRAFT_ARTIFACT_TYPE, ITEM_DRAFT_SUMMARY_KEYS,
   clearApplicationDraft, clearExamBankDraft, recordApplicationDraft, recordExamBankDraft,
@@ -287,6 +289,12 @@ export interface ClaimPayloadV3 {
    * rechazaría el campo) sigue con el prompt de siempre. El orden de deploy FE/BE no rompe la generación.
    */
   activityFeatures?: { dragTextDistractors: boolean };
+  /**
+   * T6 (r57): señales de patrón de respuesta (#542) de los items `video_interactions` / `activity` YA completados del run
+   * (generación vigente, sin el propio item). El ejecutor siembra con ellas su acumulado del run: la prueba de sesgo
+   * ve el curso entero aunque cada item lo genere un proceso distinto. Ausente = ninguno completado todavía.
+   */
+  answerBiasPool?: AnswerBiasPool;
   /**
    * Motor de carga horaria: experience/activity de un CAPÍTULO DE PRÁCTICA. El ejecutor arma la página y la
    * actividad desde los capítulos de contenido del módulo (`sourceChapterIds`, en orden; sus content llegan en
@@ -1447,6 +1455,15 @@ export class SchedulerService {
       // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
       if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
     }
+    if (g.type === 'experience' && mItem.design && typeof mItem.design.framework === 'string') {
+      // T2 (r57): requisitos del marco instruccional del Manifest congelado (solo capítulos de contenido; los de
+      // práctica tienen su propia forma). Mismo cálculo que el brief del claim (learningPlanExperienceRequirements).
+      const mc = (manifest.modules ?? []).flatMap((m: any) => m.chapters ?? []).find((c: any) => c.chapterId === g.chapter_id);
+      if (mc && mc.kind !== 'practice') {
+        const reqs = learningPlanExperienceRequirements(mItem.design);
+        if (reqs.length) ctx.experienceRequirements = reqs;
+      }
+    }
     if (g.type === 'application_activity') {
       // Fase 2: los minutos salen del item del Manifest congelado (nunca del ejecutor).
       ctx.applicationMinutes = typeof mItem.applicationMinutes === 'number' ? mItem.applicationMinutes : null;
@@ -1600,6 +1617,19 @@ export class SchedulerService {
     return facts;
   }
 
+  /** T6 (r57): acumulado del curso para la prueba de sesgo de respuesta (señales de los items completados del run). */
+  private async answerBiasPoolFor(q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, manifestId: number, itemKey: string): Promise<AnswerBiasPool | null> {
+    const rows = await q.query(
+      `select d.item_key, d.output_summary -> 'answerBias' as answer_bias from public.generation_item_runs d
+        where d.job_id = $1 and d.manifest_id = $2 and d.type = any($3::text[]) and d.item_key <> $4 and d.status = 'completed'
+          and ${latestGenerationPredicate('d')}
+        order by d.item_key`,
+      [jobId, manifestId, [...ANSWER_BIAS_POOL_ITEM_TYPES], itemKey],
+    );
+    const parse = (v: unknown) => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return null; } };
+    return answerBiasPoolFrom(rows.map((r: any) => ({ itemKey: String(r.item_key), summary: { answerBias: parse(r.answer_bias) } })), itemKey);
+  }
+
   /** Fix I5/N1: casos del módulo que los ejercicios guiados no repiten (los mismos en el claim y al validar). */
   private async guidedPracticeAvoidFor(
     q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, manifestId: number, manifest: any, snapshot: unknown, chapterId: string,
@@ -1710,6 +1740,11 @@ export class SchedulerService {
         out.activityTypeSource = r.source;
       }
       out.activityFeatures = { dragTextDistractors: true };
+    }
+    // (Solo filas reales de un run: job_id + manifest_id; los harnesses que arman un claim sin run no consultan.)
+    if ((row.type === 'video_interactions' || (row.type === 'activity' && mItem.variant === 'h5p')) && row.job_id && row.manifest_id != null) {
+      const pool = await this.answerBiasPoolFor(qr, row.job_id, row.manifest_id, row.item_key);
+      if (pool) out.answerBiasPool = pool;
     }
     if (row.type === 'video_interactions') {
       const ivAdvanced = manifest.features?.ivAdvanced === 1;

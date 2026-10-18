@@ -348,6 +348,7 @@ const ENV_KEYS = [
     const staleBuildRuns = new Set();
     packaging.isSameBuild = async (run) => !staleBuildRuns.has(run.id);
     const PFR = L('modules/dynamic-packaging/package-freshness.js');
+    const PFR_REAL_HAS = PFR.hasDeliverablePackage; // review r1 (I1): el check con frescura real lo restaura
     const deliverableJobs = new Set();
     PFR.hasDeliverablePackage = async (q, run) => {
       const [j] = await q.query(`select id from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1
@@ -586,8 +587,113 @@ const ENV_KEYS = [
       }
     });
 
+    // T8: re-armar por builder nuevo es OPT-IN (DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP=true). Los checks que prueban
+    // ese re-armado lo encienden; el default (apagado) lo prueba el check «[AP] T8» de abajo.
+    const withBuilderBump = async (fn) => {
+      const prev = process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP;
+      process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP = 'true';
+      try { return await fn(); } finally { if (prev === undefined) delete process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP; else process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP = prev; }
+    };
+    await check('[AP] T8: DEFAULT (sin DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP) un paquete final COMPLETADO con un builder anterior y NO vigente (frescura simulada; el caso «solo cambió el builder» = vigente lo cubre «[AP] review r1 I1») NUNCA se re-arma solo: estado stale sin pendiente → needs_attention + retry_package; el SQL del barrido no lo selecciona; ensure(sweep) → nothing_pending; con el flag = true sí (opt-in); el empaque inicial de un run recién completado sigue igual', async () => {
+      assert(process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP === undefined, 'el harness corre con el default');
+      eq([APS.autoRepackageOnBuilderBump({}), APS.autoRepackageOnBuilderBump({ DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP: 'TRUE ' }), APS.autoRepackageOnBuilderBump({ DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP: '1' }), APS.autoRepackageOnBuilderBump({ DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP: 'false' })], [false, true, false, false], 'parseo del flag');
+      const C = await confirmedCourse('T8 builder bump default');
+      const runId = await seededRealRun(C);
+      eq(await recompute(runId), 'completed', 'completed');
+      const jobs0 = await pkgJobs(runId);
+      eq(jobs0.map((j) => j.worker_status), ['queued'], 'empaque inicial automático sin cambios');
+      await completeJob(jobs0[0].id, '3.0.0'); // armado con un builder anterior (deploy posterior subió la versión)
+      staleBuildRuns.add(runId);
+      try {
+        let dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob], ['needs_attention', [{ code: 'retry_package' }], { status: 'stale', autoRetryPending: false, auto: true }], 'default: stale con acción visible, sin re-armado');
+        assert(!(await APS.findAutoPackageCandidates(ds, new Date(), 500)).includes(runId), 'default: el SQL no lo selecciona');
+        assert(!(await autoPkg.sweep({ limit: 500 })).some((o) => o.runId === runId), 'default: el barrido no lo toma');
+        eq((await autoPkg.ensure(runId, 'sweep')).reason, 'nothing_pending', 'default: ensure(sweep) no lo re-arma');
+        eq((await pkgJobs(runId)).length, 1, 'default: sin jobs nuevos');
+        await withBuilderBump(async () => {
+          assert((await APS.findAutoPackageCandidates(ds, new Date(), 500, process.env)).includes(runId), 'opt-in: el SQL lo selecciona');
+          dto = await runs.getRun(C.cid, OWNER, 1, runId);
+          eq([dto.completion.state, dto.completion.packageJob], ['packaging', { status: 'stale', autoRetryPending: true, auto: true }], 'opt-in: re-armado pendiente');
+          await ds.query(`update public.production_jobs set output_summary = output_summary - 'autoPackage' || jsonb_build_object('autoPackage', (output_summary->'autoPackage') - 'lastSkip') where id = $1`, [runId]);
+          eq((await autoPkg.sweep({ limit: 500 })).filter((o) => o.runId === runId).map((o) => o.action), ['enqueued'], 'opt-in: el barrido lo re-arma');
+        });
+      } finally {
+        staleBuildRuns.delete(runId);
+      }
+    });
+
+    // Review r1 (I1): frescura REAL (sin los sustitutos de arriba) sobre PG: con el opt-in apagado, un paquete cuyo ÚNICO
+    // cambio es el builder sigue «Curso listo» (complete, sin needs_attention ni acción) y el admin ve el aviso
+    // informativo builderUpdateAvailable; el empaque automático no lo re-arma; un pedido explícito sí. Un cambio de
+    // contenido → stale como siempre; con el opt-in → re-armado pendiente como siempre.
+    await check('[AP] review r1 I1: opt-in APAGADO + solo cambió el builder → complete (sin needs_attention ni retry_package; dueño: stale false, sin el aviso; admin: builderUpdateAvailable); barrido/ensure no lo re-arman; contenido distinto → needs_attention + retry_package; opt-in encendido → packaging con re-armado pendiente; POST manual → job nuevo', async () => {
+      assert(process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP === undefined, 'el harness corre con el default');
+      const PV3 = L('modules/dynamic-packaging/packaging-v3.js');
+      const realPrepare = PV3.prepareV3Package;
+      const realHas = PFR_REAL_HAS;
+      const stubHas = PFR.hasDeliverablePackage;
+      const stubSame = packaging.isSameBuild;
+      const C = await confirmedCourse('review r1 I1');
+      const runId = await seededRealRun(C);
+      eq(await recompute(runId), 'completed', 'completed');
+      const [j0] = await pkgJobs(runId);
+      // Lo que prepareV3Package devolvería HOY para el run (los .mbz reales los cubren check-v21-packaging-v3 / check-review-r1-fixes).
+      let ids = ['art-1', 'art-2'];
+      const reuseKeyFor = (list) => ({ builderVersion: CUR_BUILDER, manifestSha256: C.manifest.sha256, sourceArtifactIds: list, themeSha256: 't', assessmentProfileSha256: 'p', h5pProfileVersion: 1, vcRendererVersion: 'r', moodleVersion: '4.1' });
+      PV3.prepareV3Package = async () => {
+        const reuseKey = reuseKeyFor(ids);
+        return { byItem: new Map(ids.map((id, i) => [`content:k${i}`, { artifacts: [{ artifactId: id }] }])), sourceArtifactIds: [...ids], reuseKey, sourceIdsHash: PV3.packageReuseHashV3(reuseKey) };
+      };
+      PFR.hasDeliverablePackage = realHas;
+      packaging.isSameBuild = PackagingService.prototype.isSameBuild;
+      try {
+        const oldHash = PV3.legacyReuseHashesV3(reuseKeyFor(ids), '3.0.0')[0];
+        await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now(), output_summary = $2::jsonb where id = $1`,
+          [j0.id, JSON.stringify({ artifactId: crypto.randomUUID(), builderVersion: '3.0.0', sourceIdsHash: oldHash, sourceArtifactIds: ids })]);
+        let dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.complete, dto.completion.packageReady, dto.completion.adminActions, dto.completion.packageJob.status],
+          ['complete', true, true, [], 'completed'], 'solo builder: «Curso listo» sin cambios');
+        const own = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, OWNER_ACTOR);
+        eq([own.stale, own.staleReason, own.builderUpdateAvailable], [false, undefined, undefined], 'dueño: vigente, sin «Hay cambios…» ni aviso de admin');
+        const adm = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, ADMIN_X);
+        eq([adm.stale, adm.builderUpdateAvailable], [false, { packagedWith: '3.0.0', current: CUR_BUILDER }], 'admin: aviso informativo');
+        assert(!(await APS.findAutoPackageCandidates(ds, new Date(), 500)).includes(runId), 'el SQL del barrido no lo selecciona');
+        assert(!(await autoPkg.sweep({ limit: 500 })).some((o) => o.runId === runId), 'el barrido no lo toma');
+        eq((await autoPkg.ensure(runId, 'sweep')).reason, 'nothing_pending', 'ensure(sweep) no lo re-arma');
+        eq((await pkgJobs(runId)).length, 1, 'sin jobs nuevos');
+        const needs = await recovery.listNeedsAttention({ limit: 500 });
+        assert(!needs.needsAttention.some((e) => e.runId === runId), 'no entra a la cola de recuperación de admin');
+        // Contenido distinto (un item se regeneró): stale como siempre → needs_attention + retry_package.
+        ids = ['art-1', 'art-3'];
+        dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob], ['needs_attention', [{ code: 'retry_package' }], { status: 'stale', autoRetryPending: false, auto: true }], 'contenido distinto: stale');
+        const own2 = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, OWNER_ACTOR);
+        assert(own2.stale === true && /^sources_changed/.test(own2.staleReason), `dueño ve «Hay cambios…»: ${own2.staleReason}`);
+        ids = ['art-1', 'art-2'];
+        // Opt-in encendido: el builder nuevo SÍ re-arma (como antes).
+        process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP = 'true';
+        try {
+          dto = await runs.getRun(C.cid, OWNER, 1, runId);
+          eq([dto.completion.state, dto.completion.packageJob], ['packaging', { status: 'stale', autoRetryPending: true, auto: true }], 'opt-in: re-armado pendiente');
+          const a2 = await packaging.getPackageStatus(C.cid, OWNER, 1, runId, ADMIN_X);
+          assert(a2.stale === true && /^builder_changed/.test(a2.staleReason) && !a2.builderUpdateAvailable, `opt-in: ${a2.staleReason}`);
+        } finally {
+          delete process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP;
+        }
+        // Pedido EXPLÍCITO (botón de admin / POST …/package): arma uno con el builder actual.
+        const req = await packaging.requestPackage(C.cid, OWNER, 1, runId, ADMIN_X);
+        eq(req.created, true, 'pedido explícito: job nuevo');
+      } finally {
+        PV3.prepareV3Package = realPrepare;
+        PFR.hasDeliverablePackage = stubHas;
+        packaging.isSameBuild = stubSame;
+      }
+    });
+
     let STALE_OLD = null;
     await check('[AP] fix I1: paquete automático COMPLETADO y vigente → complete; deja de ser vigente sin builder nuevo (p.ej. tema) → needs_attention + retry_package (nunca packaging sin nada pendiente); con builder nuevo → packaging y el barrido lo RE-ARMA (mismos topes)', async () => {
+      await withBuilderBump(async () => {
       const C = await confirmedCourse('BE-B vigencia');
       const runId = await seededRealRun(C);
       eq(await recompute(runId), 'completed', 'completed');
@@ -637,6 +743,7 @@ const ENV_KEYS = [
       assert(!(await autoPkg.sweep()).some((o) => o.runId === ro), 'el barrido no toca runs viejos');
       eq([JSON.stringify(await jobOf(ro)), (await pkgJobs(ro)).length, jo.id.length > 0], [before, 1, true], 'run viejo intacto, sin jobs nuevos');
       STALE_OLD = { C: Co, runId: ro };
+      });
     });
 
     await check('[AP] fix M2: re-completitud con el MISMO build (job completado antes de la marca nueva) → el barrido lo confirma UNA vez (satisfiedJobId) y no lo vuelve a evaluar en cada tick', async () => {
@@ -686,6 +793,7 @@ const ENV_KEYS = [
     };
     let R2RUN = null;
     await check('[AP] follow-up R2: con el tick del barrido apagado (DYNAMIC_AUTO_HEAL_ENABLED=false) nada queda «pendiente»: re-armado por builder nuevo, reintento de un fallo o run sin job → needs_attention + retry_package (acción manual/admin), nunca `packaging` para siempre; solo un run recién marcado sin job (el aviso post-commit lo encola) espera la gracia; con el tick encendido → packaging como antes', async () => {
+      await withBuilderBump(async () => {
       const C = await confirmedCourse('BE-B R2 builder');
       const runId = await seededRealRun(C);
       eq(await recompute(runId), 'completed', 'completed');
@@ -728,6 +836,7 @@ const ENV_KEYS = [
       const d3 = await runs.getRun(C2.cid, OWNER, 1, r2);
       eq([d3.completion.state, d3.completion.packageJob.autoRetryPending], ['packaging', true], 'tick encendido: el barrido lo toma');
       R2RUN = { C: C2, runId: r2 };
+      });
     });
 
     await check('[AP] follow-up R8: el SQL del barrido clasifica «final» EXACTAMENTE como packageKindOf (mismos jobs, también los anteriores sin packageKind con videos omitidos / mocks)', async () => {
@@ -756,6 +865,7 @@ const ENV_KEYS = [
     });
 
     await check('[AP] follow-up R8: un run nunca queda «seleccionado y saltado» en cada tick — un paquete anterior de vista previa (sin packageKind) con builder viejo no lo selecciona fuera de la ventana; un bloqueo superado por un job final posterior vuelve a contar como en el estado; lo que el SQL elige y el estado no declara pendiente queda registrado (lastSkip) y espera; los saltos por Blueprint irresoluble o error de lectura cuentan como transitorios', async () => {
+      await withBuilderBump(async () => {
       // (a) job anterior «de vista previa» (pendingVideos, sin packageKind) con builder viejo; marca fuera de la ventana.
       const C = await confirmedCourse('BE-B R8 preview viejo');
       const runId = await seededRealRun(C);
@@ -819,6 +929,7 @@ const ENV_KEYS = [
       eq((await jobOf(r4)).output_summary.autoPackage.transient.count, 2, 'contado como transitorio');
       // Sin dejar un run roto para la cola de admin de los casos siguientes.
       await ds.query(`update public.production_jobs set input_payload = input_payload || jsonb_build_object('manifestId', $2::bigint) where id = $1`, [r4, C4.manifest.id]);
+      });
     });
 
     // ════ [AR] reintento automático SEGURO (worker real + Videogen falso) ══════

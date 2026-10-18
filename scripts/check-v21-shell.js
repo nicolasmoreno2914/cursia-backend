@@ -405,6 +405,35 @@ async function pureChecks() {
     }
   });
 
+  await check('T1 r57: «Tu recorrido» anuncia EXACTAMENTE el orden real de los slots (ejercicios guiados después de la síntesis, repaso, AA)', () => {
+    const ROUTE_OF = { presentation: 'Presentación', video_h5p: 'Video interactivo', guided_practice: 'Ejercicios guiados', activity: 'Práctica calificada', review_cards: 'Repaso', application: 'Actividad de Aplicación' };
+    const ch0 = f2.chapters[0];
+    const variants = [
+      {},
+      { guidedPracticeMinutes: 40 },
+      { guidedPracticeMinutes: 40, reviewCards: true },
+      { guidedPracticeMinutes: 40, reviewCards: true, applicationMinutes: 60 },
+      { videoEnabled: false, guidedPracticeMinutes: 40, reviewCards: true },
+      { activityEnabled: false, activityVariant: undefined, reviewCards: true, guidedPracticeMinutes: 40 },
+    ];
+    for (const v of variants) {
+      const ch = { ...ch0, ...v };
+      const slots = S.assembleChapter({ chapterFacts: ch, moduleFacts: f2.modules[0], experience: F.experienceFor(ch.id), assessment: f2.assessment, isLastChapterOfModule: false, nextChapter: { number: 2, title: 'x' }, nextStep: { kind: 'chapter', number: 2, title: 'x', sectionNum: 3 }, finalExamEnabled: f2.finalExam.enabled, theme: THEME });
+      const expected = [];
+      for (const s of slots) {
+        if (s.kind === 'label') {
+          if (s.role === 'deepening') expected.push('Profundización');
+          else if (s.role === 'synthesis') expected.push('Síntesis');
+          else if (s.role === 'self_check') expected.push(ch.reviewCards ? 'Comprueba lo aprendido' : 'Repaso');
+        } else if (ROUTE_OF[s.kind]) expected.push(ROUTE_OF[s.kind]);
+      }
+      const html = slots[0].html;
+      const items = Array.from(html.slice(html.indexOf('<ol class="cvc-route-steps"')).split('</ol>')[0].matchAll(/<li[^>]*>([\s\S]*?)<\/li>/g), (m) => vc.extractText(m[1]).trim());
+      eq(items, expected, `recorrido ${JSON.stringify(v)}`);
+      if (v.guidedPracticeMinutes && ch.videoEnabled !== false) assert(items.indexOf('Ejercicios guiados') > items.indexOf('Video interactivo'), 'ejercicios guiados después del video');
+    }
+  });
+
   await check('sin referencias fantasma: video OFF → ningún "video"; actividad OFF → sin "actividad"/"práctica" en transiciones; ON → sí', () => {
     for (const [course, facts] of [[c2, f2], [c4, f4]]) {
       for (const { theme } of [THEMES[0], THEMES[6]]) {

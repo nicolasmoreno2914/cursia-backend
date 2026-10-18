@@ -125,3 +125,13 @@ export function round2(n: number): number {
 export function clamp01(n: number): number {
   return n < 0 ? 0 : n > 1 ? 1 : n;
 }
+
+// ── T2 (r57) · Plan de aprendizaje por capítulo ─────────────────────────────
+
+/**
+ * Tipo de aprendizaje de un capítulo (vocabulario CERRADO). Lo decide `learning-type.ts` con reglas
+ * deterministas sobre el objetivo, el título y la descripción (o el docente lo fija). Solo existe en el
+ * diseño cuando el perfil activa el plan de aprendizaje (`learningPlan`); sin él, nada cambia.
+ */
+export const LEARNING_TYPES = ['conceptual', 'procedimental', 'protocolo', 'decision_caso', 'comunicacion', 'normativo_etico'] as const;
+export type LearningType = (typeof LEARNING_TYPES)[number];

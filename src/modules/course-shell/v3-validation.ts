@@ -112,6 +112,11 @@ export interface V3ItemValidationContext {
   guidedPracticeAvoid?: GuidedPracticeAvoid | null;
   /** Language QA: curso de idiomas o de lengua/literatura (cita «vosotros», voseo o inglés a propósito) → sin chequeo de idioma. */
   languageCourse?: boolean;
+  /**
+   * T2 (r57): requisitos del marco instruccional del capítulo (item.design.framework del Manifest congelado; solo
+   * capítulos de contenido). Se exigen con el prompt que los conoce (≥ v21-exp-7, frameworkRequirementsApply).
+   */
+  experienceRequirements?: Array<{ id: string; movements: string[]; anyOf: string[]; message: string }>;
 }
 
 /**
@@ -124,6 +129,17 @@ export const PEDAGOGY_MIN_EXPERIENCE_PROMPT = 4;
 export function pedagogyApplies(promptVersion: string | null | undefined): boolean {
   const m = /^v21-exp-(\d+)$/.exec(String(promptVersion ?? ''));
   return !!m && Number(m[1]) >= PEDAGOGY_MIN_EXPERIENCE_PROMPT;
+}
+
+/**
+ * T2 (r57) — requisitos del marco instruccional (FRAMEWORK_ELEMENT_MISSING): solo con el prompt que los recibe y
+ * los valida en el ejecutor (v21-exp-7). Una pestaña con el bundle anterior no queda reintentando contra reglas
+ * que su ejecutor no conoce (mismo criterio de despliegue que la estructura EV2).
+ */
+export const FRAMEWORK_MIN_EXPERIENCE_PROMPT = 7;
+export function frameworkRequirementsApply(promptVersion: string | null | undefined): boolean {
+  const m = /^v21-exp-(\d+)$/.exec(String(promptVersion ?? ''));
+  return !!m && Number(m[1]) >= FRAMEWORK_MIN_EXPERIENCE_PROMPT;
 }
 
 /**
@@ -264,7 +280,10 @@ function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string
       const errors: ShellValidationError[] = r.errors.map((e) => ({ path: e.path, code: e.code, message: e.message }));
       // Edu EV2: estructura educativa mínima, solo para experiencias NUEVAS (el empaque no la exige:
       // los cursos ya generados siguen siendo válidos).
-      if (r.ok && pedagogyApplies(ctx.promptVersion)) for (const e of validatePedagogy(doc as never)) errors.push({ path: e.path, code: e.code, message: e.message });
+      if (r.ok && pedagogyApplies(ctx.promptVersion)) {
+        const requirements = ctx.experienceRequirements?.length && frameworkRequirementsApply(ctx.promptVersion) ? ctx.experienceRequirements : undefined;
+        for (const e of validatePedagogy(doc as never, requirements ? { requirements } : undefined)) errors.push({ path: e.path, code: e.code, message: e.message });
+      }
       if (r.ok && antiSimulationApplies(ctx.promptVersion)) for (const e of validateSimulatedDiagrams(doc as never)) errors.push({ path: e.path, code: e.code, message: e.message });
       if (r.ok && eduFieldsApply(ctx.promptVersion)) for (const e of validateEduFields(doc as never)) errors.push({ path: e.path, code: e.code, message: e.message });
       const cid = doc && typeof doc === 'object' ? (doc as Record<string, unknown>).chapterId : undefined;

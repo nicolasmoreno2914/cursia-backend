@@ -143,7 +143,8 @@ check('exporta la API pública', () => {
     'quizAttemptsXmlFields', 'scormAssessmentFields', 'h5pactivityXml', 'h5pDisplayOptionsInt', 'applyXmlFields']) {
     ok(typeof A[n] === 'function', `falta ${n}`);
   }
-  eq(A.ASSESSMENT_CATEGORY_NAMES, { practice: 'Práctica de capítulos', moduleExams: 'Evaluaciones de módulo', finalExam: 'Evaluación final' });
+  // T4 (r57): + «Actividades de Aplicación» (solo existe en el gradebook si el perfil la pesa).
+  eq(A.ASSESSMENT_CATEGORY_NAMES, { practice: 'Práctica de capítulos', applications: 'Actividades de Aplicación', moduleExams: 'Evaluaciones de módulo', finalExam: 'Evaluación final' });
 });
 
 // ── resolveAssessment ─────────────────────────────────────────────────────

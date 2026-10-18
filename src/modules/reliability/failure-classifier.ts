@@ -181,7 +181,7 @@ export const GUARD_REASON_CODES: readonly string[] = Object.freeze([
 export const VALIDATION_INNER_CODES: readonly string[] = Object.freeze([
   // course-shell / visual-components / intro-schemas / final-exam / activity-type
   'ACTIVITY_TYPE_MISMATCH', 'ACTIVITY_TYPE_RULES', 'ACTIVITY_TYPE_UNKNOWN', 'ANSWER_LEAK', 'ARITY_MISMATCH', 'CHAPTER_ID',
-  'CHAPTER_ID_MISMATCH', 'COMPONENT_NOT_ALLOWED', 'COUNT_RANGE', 'DIGIT_IN_TEXT', 'EDU_FIELDS_MISSING', 'ENUM_VALUE',
+  'CHAPTER_ID_MISMATCH', 'COMPONENT_NOT_ALLOWED', 'COUNT_RANGE', 'DIGIT_IN_TEXT', 'EDU_FIELDS_MISSING', 'ENUM_VALUE', 'FRAMEWORK_ELEMENT_MISSING',
   'EXPLANATIONS_GATE', 'FORBIDDEN_CLAIM', 'HTML_IN_TEXT', 'ITEM_KEY_MISMATCH', 'JOURNEY_MISMATCH', 'JSON_INVALID',
   'MISSING_FIELD', 'MOVEMENT_RANGE', 'NOT_OBJECT', 'PEDAGOGY_MISSING', 'QUANTITY_CLAIM', 'QUIZ_RANDOM', 'RESOURCE_MENTION',
   'SCHEMA_VERSION', 'TEXT_DENSE', 'TEXT_EMPTY', 'TEXT_FORMAT', 'TEXT_SIMULATED_DIAGRAM', 'TEXT_TOO_LONG', 'TYPE_DIVERSITY',
@@ -535,20 +535,31 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'CURSIA_IV_INLINE_SCRIPT_PKG', 'H5P_NOT_GRADABLE_IN_MOODLE', 'ACTIVITY_INTRO_THEME', 'GAMMA_THEME_CONFIG', 'FACTS_INVALID',
       'VIDEO_PACKAGE_FILENAME_INVALID', 'ACTIVITY_PACKAGE_FILENAME_INVALID', 'V3_VALIDATION_CONTEXT', 'PNG_ENCODE', 'PNG_UNSUPPORTED',
       'PACKAGE_BUILDER_ERROR',
+      // r57 T6: el validador encontró una parte de facts (presentación, video, actividad) ausente o de más en el .mbz.
+      'MANIFEST_COVERAGE',
       // r19: los capítulos pasaron su validación pero el total queda bajo el piso de 25 min → un humano mira el diagnóstico.
       'AUDIOBOOK_TOO_SHORT_FOR_SOURCE',
       // r19 L: asset del logo de Cursia ausente/roto (deploy) o invariante de una marca de agua por página.
       'LIBRO_LOGO_ASSET_MISSING', 'LIBRO_LOGO_ASSET_INVALID', 'LIBRO_V3_WATERMARK',
       // r19 L fix round 1 (I1): pdfkit no pudo generar el Libro Guía (ni con el logo de Cursia) → bug de producto.
       'LIBRO_V3_PDF_FAILED',
+      // r57 T1: un mapa/diagrama/tabla del Libro Guía tiene caracteres sin glifo en la fuente → bug de producto.
+      'LIBRO_V3_GLYPHS',
       // Fase 2: pdfkit no pudo generar el PDF imprimible de una Actividad de Aplicación / documento ya validado sin
       // actividad o sin solucionario al llegar al render → bug de producto (el item ya pasó su validación).
-      'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID'],
+      'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID',
+      // r57 T4: XML de la Tarea / rúbrica fuera de rango con un perfil ya validado → bug de producto.
+      'ASSIGN_XML_INVALID', 'ASSIGN_RUBRIC_INVALID'],
     family: /^(MBZ_V3_[A-Z0-9_]+|ASSESSMENT_[A-Z0-9_]+|WEIGHTS_[A-Z0-9_]+|THEME_[A-Z0-9_]+|H5P_PROFILE_[A-Z0-9_]+|H5P_PACK_[A-Z0-9_]+|H5P_L10N_[A-Z0-9_]+|H5P_PREFLIGHT_[A-Z0-9_]+|H5P_STORE_[A-Z0-9_]+|H5P_UUID_[A-Z0-9_]+|H5P_SUBCONTENT_[A-Z0-9_]+|MOCK_[A-Z0-9_]+|ACTIVITY_TYPE_INVALID_[A-Z0-9_]+)$/,
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
   },
   {
-    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed'],
+    // r57 T5: un archivo de trabajo del perfil falta o no es el que se adjuntó (sha256/tamaño/tipo) → el usuario lo corrige.
+    // r57 T6: el .mbz supera el límite de subida configurado (PACKAGE_MBZ_MAX_BYTES) o ese límite está mal configurado →
+    // una persona sube el límite del almacenamiento / corrige la variable o reduce el curso (nunca se reintenta solo).
+    // Review r1 (M): el artifact de un archivo de trabajo se borró / no es del dueño / no es practice_file → PRACTICE_FILE_MISSING.
+    id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID', 'PRACTICE_FILE_MISSING',
+      'PACKAGE_SIZE_LIMIT_EXCEEDED', 'PACKAGE_SIZE_CONFIG_INVALID'],
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'config', adminAction: 'resolve_package_block',
   },
 ] as Rule[]);

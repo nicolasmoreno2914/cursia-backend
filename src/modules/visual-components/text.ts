@@ -188,3 +188,13 @@ export function labelHtml(text: string): string {
 export function lintView(text: string): string {
   return String(text).replace(INVISIBLE_CHARS_RE, '').split('**').join('').replace(/\s+/g, ' ').trim();
 }
+
+/**
+ * Review r2 (I2): el texto como lo VE el lector después de renderizarlo (`richParagraphs`/`inlineHtml`): sin invisibles
+ * ni guiones suaves, sin `*énfasis*` simple ni `**énfasis**`, espacios normalizados. Se aplica igual al texto de una
+ * persona (fragmentos protegidos) y al texto visible del paquete, así un `**texto fuente**` del usuario coincide con el
+ * `<strong>texto fuente</strong>` renderizado.
+ */
+export function plainTextView(text: string): string {
+  return lintView(stripSingleStars(String(text ?? '').replace(INVISIBLE_CHARS_RE, '')));
+}

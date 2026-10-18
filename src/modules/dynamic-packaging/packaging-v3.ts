@@ -1,4 +1,5 @@
 import { APPLICATION_ARTIFACT_TYPE, validateApplicationActivityDoc } from '../course-shell/application-activity';
+import { Logger } from '@nestjs/common';
 import { GUIDED_PRACTICE_ARTIFACT_TYPE, guidedPracticeQualityGuardApplies, validateGuidedPracticeDoc } from '../course-shell/guided-practice';
 /**
  * Cursia V2.1 — R12: empaque de runs rulesVersion 3 — resolución de
@@ -81,6 +82,7 @@ import { syntheticCoverPng, syntheticMp3, syntheticPdf } from '../../package/v3/
 import { themeMismatch, validatePresentationArtifact } from '../../package/presentation';
 import { pdfPageCount } from '../../package/presentation';
 import { LibroLogoCandidate, resolveLibroLogo } from '../../package/v3/libro-logo';
+import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 
 export const PACKAGING_V3 = 'PACKAGING_V3';
 export const V3_VIDEO_REQUIRES_YOUTUBE = 'v3_video_requires_youtube';
@@ -400,6 +402,8 @@ export interface PackageReuseKeyV3Input {
   omittedVideoKeys?: string[];
   /** r19 (L3): sha256 de la marca del Libro Guía (logo resuelto + nombre): un cambio de logo re-empaqueta. */
   libroBrandSha256?: string;
+  /** T1 (r57): sha256 de las referencias del programa académico del Libro (entra SOLO si hay alguna). */
+  libroReferencesSha256?: string;
 }
 
 export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
@@ -416,8 +420,20 @@ export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
     // EV6 T5: solo si hay omisiones → la clave de un run 100% real no cambia.
     ...(k.omittedVideoKeys && k.omittedVideoKeys.length ? { omittedVideoKeys: [...k.omittedVideoKeys].sort() } : {}),
     ...(k.libroBrandSha256 ? { libroBrandSha256: k.libroBrandSha256 } : {}),
+    ...(k.libroReferencesSha256 ? { libroReferencesSha256: k.libroReferencesSha256 } : {}),
   });
   return createHash('sha256').update(canon, 'utf8').digest('hex');
+}
+
+/**
+ * Review r1 (I1): claves que un builder ANTERIOR (`builderVersion`) habría calculado hoy para el mismo
+ * contenido: la clave completa con esa versión y, además, sin `libroReferencesSha256` (componente que entró
+ * en la clave con T1 / 3.15.0; los builders anteriores nunca lo incluían).
+ */
+export function legacyReuseHashesV3(k: PackageReuseKeyV3Input, builderVersion: string): string[] {
+  const out = [packageReuseHashV3({ ...k, builderVersion })];
+  if (k.libroReferencesSha256) out.push(packageReuseHashV3({ ...k, builderVersion, libroReferencesSha256: undefined }));
+  return out;
 }
 
 // ─── Marca del Libro Guía (r19 L3) ─────────────────────────────────────────
@@ -504,6 +520,44 @@ export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, owner
 }
 
 /** Hash de la marca del Libro Guía tal como la verá el builder (logo YA resuelto + nombre) y sus avisos. */
+/**
+ * T1 (r57): referencias del programa académico para el Libro Guía — la bibliografía que el extractor leyó del
+ * documento de la institución (status `found` / `provided`, con su fuente; nunca las `inferred`), en su orden y sin
+ * repetidas. Sin contexto académico guardado → []. Si la lectura falla, aviso visible (nunca en silencio) y [].
+ */
+/**
+ * Review r1 (M8): un error al leer el contexto académico NUNCA es silencioso: se registra en el log del servidor y
+ * queda como aviso `libro_references_unavailable:…` en el resumen del paquete (profileWarnings → warnings).
+ */
+export async function loadLibroReferencesV3(
+  q: QueryExecutor,
+  courseId: number,
+  logger: { warn(msg: string): void } = new Logger('PackagingV3'),
+): Promise<{ references: string[]; warnings: string[] }> {
+  try {
+    const stored = await loadCurrentAcademicContext(q as any, courseId);
+    const seen = new Set<string>();
+    const references: string[] = [];
+    for (const b of stored?.context.bibliography ?? []) {
+      if (b.status !== 'found' && b.status !== 'provided') continue;
+      const t = String(b.text ?? '').replace(/\s+/g, ' ').trim();
+      const k = t.toLowerCase();
+      if (!t || seen.has(k)) continue;
+      seen.add(k);
+      references.push(t);
+    }
+    return { references, warnings: [] };
+  } catch (err) {
+    const why = (err instanceof Error ? err.message : String(err)).slice(0, 80).replace(/\s+/g, ' ').replace(/:/g, ';');
+    logger.warn(`loadLibroReferencesV3: no se pudieron leer las referencias del programa académico del curso ${courseId} (el Libro sale sin «Referencias»): ${why}`);
+    return { references: [], warnings: [`libro_references_unavailable:${why}`] };
+  }
+}
+
+export function libroReferencesFingerprintV3(references: readonly string[]): string | undefined {
+  return references.length ? createHash('sha256').update(JSON.stringify(references), 'utf8').digest('hex') : undefined;
+}
+
 export function libroBrandFingerprintV3(brand: Pick<LibroBrandV3, 'logo' | 'name'> & { candidates?: LibroLogoCandidate[] }): { sha256: string; warnings: string[]; logoSource: string } {
   // fix round 3: hash de los bytes del logo RESUELTO (el primer candidato válido), igual que antes.
   const logo = resolveLibroLogo(brand.candidates ?? brand.logo);
@@ -927,6 +981,40 @@ export async function loadContentsV3(
   };
 }
 
+// ─── T5 (r57): archivos de trabajo SUBIDOS del perfil de evaluación ─────────
+
+/** Tipo de artifact de un archivo de trabajo subido desde el panel (artifactUpload del frontend). */
+export const PRACTICE_FILE_ARTIFACT_TYPE = 'practice_file';
+/** Review r1 (M): código del error «el artifact del archivo de trabajo ya no está» (clase D, package_precheck). */
+export const PRACTICE_FILE_MISSING = 'PRACTICE_FILE_MISSING';
+
+/**
+ * Descarga los archivos de trabajo `source.kind = 'artifact'` del perfil: el artifact debe ser del DUEÑO del run, de tipo
+ * `practice_file` y estar en su carpeta de Storage (assertOwnerStoragePath). Los bytes se verifican en el builder
+ * (sha256/tamaño/formato contra el perfil): acá solo se cargan. Un artifact faltante falla fuerte (nunca se omite).
+ */
+export async function loadPracticeFilesV3(
+  q: QueryExecutor,
+  L: Pick<ContentLoadersV3, 'loadStorageBytes'>,
+  ownerId: string,
+  profile: { practiceResources?: ReadonlyArray<{ id: string; source: { kind: string; artifactId?: string } }> } | null | undefined,
+): Promise<Map<string, Buffer>> {
+  const out = new Map<string, Buffer>();
+  for (const r of profile?.practiceResources ?? []) {
+    if (r.source.kind !== 'artifact') continue;
+    const [row] = await q.query(
+      `select id, owner_id, type, storage_bucket, storage_path from public.artifacts where id = $1 and owner_id = $2`,
+      [r.source.artifactId, ownerId],
+    );
+    // Review r1 (M): un archivo de trabajo borrado / ajeno / de otro tipo lo corrige una PERSONA (vuelve a adjuntarlo en
+    // el perfil): `PRACTICE_FILE_MISSING`, clase D «package_precheck» igual que PRACTICE_FILE_INVALID (nunca se reintenta solo).
+    if (!row) throw new Error(`${PRACTICE_FILE_MISSING}: el archivo de trabajo ${r.id} (artifact ${r.source.artifactId}) no existe o no es del dueño del curso; vuelve a adjuntarlo en el perfil`);
+    if (row.type !== PRACTICE_FILE_ARTIFACT_TYPE) throw new Error(`${PRACTICE_FILE_MISSING}: el artifact ${r.source.artifactId} del archivo de trabajo ${r.id} es de tipo ${row.type}, no ${PRACTICE_FILE_ARTIFACT_TYPE}; vuelve a adjuntarlo en el perfil`);
+    out.set(r.id, await L.loadStorageBytes(row.storage_bucket || 'cursia-artifacts', row.storage_path));
+  }
+  return out;
+}
+
 // ─── Preparación compartida (servicio + worker): una sola fuente de la clave ──
 
 export interface PreparedV3Package {
@@ -936,6 +1024,8 @@ export interface PreparedV3Package {
   sourceArtifactIds: string[];
   /** Clave de reuse v3 (se guarda como `sourceIdsHash` en el job y en el artifact dynamic_mbz). */
   sourceIdsHash: string;
+  /** Review r1 (I1): las entradas de la clave (para recalcularla con el builder de un paquete anterior). */
+  reuseKey: PackageReuseKeyV3Input;
   staleWarnings: V3StaleWarning[];
   /** F1 (I3): evaluación resuelta contra los ítems del Manifest (pesos normalizados / sin nota). */
   resolved: ResolvedAssessment;
@@ -954,6 +1044,8 @@ export interface PreparedV3Package {
   profileWarnings: string[];
   /** r19 (L3): marca del Libro Guía (logo candidato + nombre) que el worker pasa al builder. */
   libroBrand: LibroBrandV3;
+  /** T1 (r57): referencias del programa académico para el Libro Guía (el worker las pasa al builder). */
+  libroReferences: string[];
 }
 
 export interface PendingVideoV3 {
@@ -1071,7 +1163,7 @@ export async function prepareV3Package(
   // Falla temprano (antes de encolar/descargar) si el perfil vigente no se puede aplicar a ESTE run
   // (p.ej. pesos con examen final y el run no lo tiene: R3 ruling 7; intentos no aplicables: R6).
   // F1 (I3): las categorías vacías se omiten y sus pesos se redistribuyen (o el curso queda sin nota).
-  const itemCounts = assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys);
+  const itemCounts = assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys, profiles.assessment);
   const resolved = resolveAssessment(profiles.assessment, {
     hasFinalExam: manifest.manifest.features?.finalExam === true,
     activityEngine: manifest.manifest.features?.activityEngine,
@@ -1083,7 +1175,8 @@ export async function prepareV3Package(
   // r19 (L3): el logo resuelto (y el nombre) entran en la clave: cambiar el logo de la cuenta re-empaqueta.
   const libroBrand = await loadLibroBrandV3(q, courseId, run.owner_id ?? null);
   const brandPrint = libroBrandFingerprintV3(libroBrand);
-  const sourceIdsHash = packageReuseHashV3({
+  const libroRefs = await loadLibroReferencesV3(q, courseId);
+  const reuseKey: PackageReuseKeyV3Input = {
     builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
     manifestSha256: manifest.sha256,
     sourceArtifactIds,
@@ -1094,18 +1187,22 @@ export async function prepareV3Package(
     moodleVersion,
     omittedVideoKeys,
     libroBrandSha256: brandPrint.sha256,
-  });
+    libroReferencesSha256: libroReferencesFingerprintV3(libroRefs.references),
+  };
+  const sourceIdsHash = packageReuseHashV3(reuseKey);
   return {
     run,
     byItem,
     profiles,
     sourceArtifactIds,
     sourceIdsHash,
+    reuseKey,
     staleWarnings: staleWarningsV3(byItem),
     resolved,
     assessment: assessmentPackageSummary(resolved),
-    profileWarnings: [...profileWarningsV3(profiles.theme, resolved), ...libroBrand.warnings, ...brandPrint.warnings],
+    profileWarnings: [...profileWarningsV3(profiles.theme, resolved), ...libroBrand.warnings, ...brandPrint.warnings, ...libroRefs.warnings],
     pendingVideos,
     libroBrand,
+    libroReferences: libroRefs.references,
   };
 }

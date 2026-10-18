@@ -334,9 +334,15 @@ function libroCard(
   const h = hx(theme, opts);
   const cs = { s: panelSurf(h), border: h.t.color.border };
   const c = facts.counts;
+  // T1 (r57): el Libro trae el texto de los capítulos de CONTENIDO; los de práctica no tienen texto propio. Antes decía
+  // «15 capítulos» y el PDF tenía 12 (y su portada decía 12): ahora ambos cuentan lo mismo y lo dicen.
+  const practiceN = facts.chapters.filter((x) => x.kind === 'practice').length;
+  const contentN = c.chapters - practiceN;
+  const chaptersText = practiceN
+    ? `los ${contentN} ${plural(contentN, 'capítulo', 'capítulos')} de contenido en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')} (${plural(practiceN, 'el capítulo', `los ${practiceN} capítulos`)} de práctica se ${plural(practiceN, 'trabaja', 'trabajan')} en el aula virtual)`
+    : `${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}`;
   const text =
-    `El texto completo del curso en un solo documento${cta.pdf ? ' PDF' : ''}: ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} ` +
-    `en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}${facts.libro.hasBibliography === false ? '' : ', con bibliografía sugerida'}. ` +
+    `El texto completo del curso en un solo documento${cta.pdf ? ' PDF' : ''}: ${chaptersText}${facts.libro.hasBibliography === false ? '' : ', con bibliografía sugerida'}. ` +
     `Extensión aproximada: ${facts.libro.wordCount} palabras.`;
   const inner =
     eyebrow(h, 'Material de estudio', cs.s) +
@@ -593,12 +599,15 @@ export interface CertificateRequirements {
   finalExam: boolean;
   /** El curso tiene «Repaso» (sin nota). */
   reviewCards: boolean;
+  /** T4 (r57): Actividades de Aplicación entregadas como Tarea calificada que pesan en la nota final. Solo si true. */
+  applications?: true;
 }
 
 /** r55: ¿el curso tiene ítems calificables (nota final)? Mismo criterio que `withoutGrades` del resolver. */
 export function courseHasGrades(facts: CourseFacts): boolean {
   const c = facts.counts;
-  return c.activities + c.videos + c.exams > 0 || c.finalExam === true;
+  // T4 (r57): una Tarea calificada también es un ítem de la nota final.
+  return c.activities + c.videos + c.exams + (c.applicationAssignsGraded ?? 0) > 0 || c.finalExam === true;
 }
 
 /** r55: nota mínima del curso desde facts (fail loud si falta: facts anteriores a r55 no se renderizan). */
@@ -615,7 +624,9 @@ export function courseApprovalRequirements(facts: CourseFacts): CertificateRequi
   // r55 review r1 (M3): una categoría con ítems pero peso efectivo 0 no aporta a la nota final → no se nombra.
   // Facts anteriores sin `categoryWeights`: todas las categorías pobladas cuentan (comportamiento previo).
   const w = facts.assessment?.categoryWeights;
-  const weighs = (k: 'practice' | 'moduleExams' | 'finalExam'): boolean => !w || (w[k] ?? 0) > 0;
+  const weighs = (k: 'practice' | 'moduleExams' | 'finalExam' | 'applications'): boolean => !w || (w[k] ?? 0) > 0;
+  const appCategory = facts.assessment?.application?.category;
+  const applications = (c.applicationAssignsGraded ?? 0) > 0 && !!appCategory && weighs(appCategory);
   return {
     coursePassingGrade: coursePassingGradeOf(facts),
     activities: c.activities > 0 && weighs('practice'),
@@ -623,6 +634,7 @@ export function courseApprovalRequirements(facts: CourseFacts): CertificateRequi
     moduleExams: c.exams > 0 && weighs('moduleExams'),
     finalExam: c.finalExam === true && weighs('finalExam'),
     reviewCards: (c.reviewCards ?? 0) > 0,
+    ...(applications ? { applications: true as const } : {}),
   };
 }
 
@@ -635,6 +647,7 @@ export function courseGradeComponentsText(r: CertificateRequirements): string {
   const items: string[] = [];
   if (r.activities) items.push('las actividades prácticas');
   if (r.videos) items.push('los videos interactivos');
+  if (r.applications) items.push('las Actividades de Aplicación calificadas');
   if (r.moduleExams) items.push('las evaluaciones de módulo');
   if (r.finalExam) items.push('la evaluación final');
   if (!items.length) shellFail('regla de aprobación: ningún ítem entra en la nota final');

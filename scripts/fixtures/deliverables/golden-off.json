@@ -1,0 +1,8 @@
+{
+  "_note": "sha256 de .mbz SIN applicationDelivery/practiceResources, calculados con el build ANTERIOR a T4/T5 (BE 3198288, worktree desechable). check-application-deliverables D3 exige igualdad con el build actual.",
+  "baseCommit": "3198288",
+  "appModulesH5p": "4bf9abed5fe86cee9232ded6657f31d37529fb35c79c806c89af0f978c0029e0",
+  "appModulesScorm": "a247579625c6ff1e40643c0b517150ff71382dc701908620528ba4a32a8b15d3",
+  "course2NoFinal": "297ab047717407d3abca22642ecea89705b6a43ad3370bd9dfead70487fd9c6e",
+  "course2H5pV2Review": "3f024d2377b95d2a600f80c03ae05301a39e8326ecf62dec4352206f40f10cde"
+}

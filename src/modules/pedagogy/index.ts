@@ -12,3 +12,6 @@ export * from './dry-run';
 export * from './labels';
 export * from './pedagogy-db';
 export * from './generator-directives';
+export * from './learning-type';
+export * from './instructional-frameworks';
+export * from './learning-plan-directives';

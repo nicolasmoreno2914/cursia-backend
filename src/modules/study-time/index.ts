@@ -4,3 +4,5 @@ export * from './target-hours';
 export * from './distributor';
 export * from './application-tiers';
 export * from './guided-practice-tiers';
+export * from './video-composition';
+export * from './practice-mix';

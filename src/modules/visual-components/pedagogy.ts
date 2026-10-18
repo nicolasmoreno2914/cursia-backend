@@ -43,7 +43,37 @@ const hasAny = (types: string[], wanted: readonly string[]) => types.some((t) =>
  * Errores PEDAGOGY_MISSING / TEXT_DENSE (vacío = cumple). Espera un documento que ya pasó
  * validateExperience (no re-valida el schema).
  */
-export function validatePedagogy(doc: Doc): VcValidationError[] {
+/**
+ * T2 (r57): requisito de un marco instruccional (pedagogy/instructional-frameworks.ts) sobre la experiencia:
+ * algún componente de `anyOf` en alguno de `movements`. Datos, no código: el marco los define.
+ */
+export interface VcPedagogyRequirement {
+  id: string;
+  movements: readonly string[];
+  anyOf: readonly string[];
+  message: string;
+}
+
+/**
+ * T2 (r57): FRAMEWORK_ELEMENT_MISSING por cada requisito del marco que la experiencia no cumple (vacío = cumple).
+ * Mismo criterio que validatePedagogy: solo experiencias NUEVAS, nunca al empaquetar.
+ */
+export function validateFrameworkRequirements(doc: Doc, requirements: readonly VcPedagogyRequirement[] | undefined): VcValidationError[] {
+  const errors: VcValidationError[] = [];
+  if (!doc || typeof doc !== 'object' || !doc.movements || !requirements?.length) return errors;
+  for (const r of requirements) {
+    if (!hasAny(typesIn(doc, r.movements as Array<keyof ChapterExperience['movements']>), r.anyOf)) {
+      errors.push({ path: `$.movements.${r.movements[0]}`, code: 'FRAMEWORK_ELEMENT_MISSING', message: `${r.message} [${r.id}]` });
+    }
+  }
+  return errors;
+}
+
+/**
+ * Estructura educativa EV2 (mínimo de producto, igual para todo curso) + T2 (r57): los requisitos del marco
+ * instruccional del capítulo cuando se pasan (`opts.requirements`). Sin `opts`, el resultado es el de siempre.
+ */
+export function validatePedagogy(doc: Doc, opts?: { requirements?: readonly VcPedagogyRequirement[] }): VcValidationError[] {
   const errors: VcValidationError[] = [];
   if (!doc || typeof doc !== 'object' || !doc.movements) return errors;
   const opening = doc.movements.opening;
@@ -75,6 +105,7 @@ export function validatePedagogy(doc: Doc): VcValidationError[] {
       });
     });
   }
+  errors.push(...validateFrameworkRequirements(doc, opts?.requirements));
   return errors;
 }
 

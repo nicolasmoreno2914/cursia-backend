@@ -593,7 +593,7 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
   });
   const exp = { facts: built.expectations.facts, resolved: built.expectations.resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion };
   await check('.mbz: validador v3 en verde (builder ≥ 3.13.0; r55: 3.14.0)', async () => {
-    assert(built.expectations.builderVersion === '3.14.0', built.expectations.builderVersion);
+    assert(built.expectations.builderVersion === '3.15.0', built.expectations.builderVersion);
     const v = await V.validateMbzV3(built.mbz, exp);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
   });

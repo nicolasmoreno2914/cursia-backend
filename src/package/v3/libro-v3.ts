@@ -59,6 +59,17 @@ export interface LibroV3Input {
   brandName?: string | null;
   /** Fix round 1 (M8): clave del documento (p.ej. sha del plan) → Info /Keywords, y así /ID único por curso y determinístico. */
   documentKey?: string | null;
+  /**
+   * T1 (r57): capítulos de PRÁCTICA del curso (no tienen texto en el Libro). Con ellos la portada cuenta TODOS los
+   * capítulos del curso («15 capítulos (12 de contenido y 3 de práctica)») y el índice los nombra en su lugar, sin
+   * página (se trabajan en el aula virtual). Ausente/vacío = libro de siempre.
+   */
+  practiceChapters?: Array<{ number: number; title: string; moduleNumber: number }>;
+  /**
+   * T1 (r57): referencias del programa académico de la institución (bibliografía extraída de SU documento, con fuente).
+   * Se publican tal cual en «Referencias» — nunca se inventan ni se completan. Ausente/vacío = sin esa subsección.
+   */
+  programReferences?: string[];
 }
 
 export interface LibroPdfResult {
@@ -75,6 +86,16 @@ export interface LibroPdfResult {
   coverLogoDraws: number;
   /** Fix round 1 (I2): caracteres visibles del insumo sin equivalente en WinAnsi (quitados; aviso en el paquete). */
   unmappedChars: number;
+  /** T1 (r57): caracteres sin glifo en mapas/diagramas y tablas (el renderer falla si > 0, así que siempre 0). */
+  structureUnmappedChars: number;
+  /** T1 (r57): línea de cantidades de la portada (derivada de la estructura real). */
+  coverLine: string;
+  /** T1 (r57): números de capítulo nombrados en el índice, en orden (contenido con página + práctica sin página). */
+  tocChapterNumbers: number[];
+  /** T1 (r57): normas y documentos citados en el texto (los de la sección «Referencias»), en orden. */
+  citedReferences: string[];
+  /** T1 (r57): ¿hay sección de referencias/bibliografía al final? (verificada, del programa o citada en el texto). */
+  hasReferences: boolean;
 }
 
 /** Opacidad de la marca de agua (≈ 0.06–0.10: discreta, el texto sigue completamente legible). */
@@ -147,6 +168,42 @@ for (let n = 1; n <= 20; n++) CHAR_MAP[String.fromCodePoint(0x2460 + n - 1)] = `
 for (let n = 1; n <= 10; n++) CHAR_MAP[String.fromCodePoint(0x2776 + n - 1)] = `${n}.`; // ❶ … ❿
 for (let n = 1; n <= 10; n++) CHAR_MAP[String.fromCodePoint(0x2780 + n - 1)] = `${n}.`; // ➀ … ➉
 
+/**
+ * T1 (r57): mapas conceptuales y diagramas de texto (bloques de código) se dibujan con caracteres de cajas (├ └ │ ─),
+ * flechas y triángulos que las fuentes estándar no tienen: antes se QUITABAN (452 en un curso real) y el mapa quedaba
+ * plano, con conectores huérfanos. Ahora cada uno tiene un equivalente ASCII de UNA columna (la alineación del
+ * monoespaciado se conserva): horizontales → «-» («=» doble), verticales → «|», esquinas/uniones → «+», diagonales →
+ * «/ \\ X», bloques → «#», flechas y triángulos → «> < ^ v». En la prosa, las flechas comunes siguen en CHAR_MAP.
+ */
+const CODE_ONE_COL: Record<string, string> = {
+  '→': '>', '⇒': '>', '➜': '>', '➔': '>', '➡': '>', '⟶': '>', '⟹': '>', '↦': '>', '⇢': '>', '↠': '>', '⇾': '>',
+  '←': '<', '⇐': '<', '⬅': '<', '⟵': '<', '⇠': '<', '↞': '<', '⇽': '<',
+  '↑': '^', '⇑': '^', '⬆': '^', '⇡': '^', '↓': 'v', '⇓': 'v', '⬇': 'v', '⇣': 'v',
+  '↔': '-', '⇔': '=', '⟷': '-', '↕': '|', '⇕': '|', '↗': '/', '↙': '/', '↖': '\\', '↘': '\\', '↳': '+', '↲': '+', '↪': '>', '↩': '<',
+  '▼': 'v', '▾': 'v', '▽': 'v', '▿': 'v', '▲': '^', '▴': '^', '△': '^', '▵': '^',
+  '►': '>', '▶': '>', '▸': '>', '▹': '>', '▷': '>', '◄': '<', '◀': '<', '◂': '<', '◃': '<', '◁': '<',
+  '●': 'o', '○': 'o', '◯': 'o', '◉': 'o', '◎': 'o', '■': '#', '□': '#', '▪': '#', '▫': '#', '◆': '*', '◇': '*', '◼': '#', '◻': '#',
+};
+const BOX_H = new Set('─━┄┅┈┉╌╍╴╶╸╺╼╾');
+const BOX_V = new Set('│┃┆┇┊┋╎╏╵╷╹╻╽╿');
+/** Carácter de caja / bloque → ASCII de una columna (undefined si no es de esos bloques). */
+function boxAscii(ch: string): string | undefined {
+  const cp = ch.codePointAt(0) as number;
+  if (cp >= 0x2500 && cp <= 0x257f) {
+    if (ch === '═') return '=';
+    if (ch === '║') return '|';
+    if (BOX_H.has(ch)) return '-';
+    if (BOX_V.has(ch)) return '|';
+    if (ch === '╱') return '/';
+    if (ch === '╲') return '\\';
+    if (ch === '╳') return 'X';
+    return '+';
+  }
+  if (cp >= 0x2580 && cp <= 0x259f) return '#';
+  return undefined;
+}
+const PICTOGRAPHIC = /^[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u20E3]$/u;
+
 /** Caracteres de formato invisibles: se quitan sin contar (no son contenido). */
 const INVISIBLE = /^(?:[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f­​-‏⁠-⁤︀-️﻿]|[\u{e0020}-\u{e007f}])$/u;
 
@@ -173,16 +230,69 @@ export function pdfText(s: string): string {
     }
     if (isWinAnsi(ch)) out += ch;
     else if (ch === '\n' || ch === '\r') out += ' ';
+    else {
+      const box = boxAscii(ch) ?? CODE_ONE_COL[ch];
+      if (box !== undefined) out += box;
+    }
     // resto (emoji, CJK, pictogramas, formato invisible): se quita; `unmappedCharCount` cuenta los visibles
   }
   return out.replace(/ {2,}/g, ' ');
+}
+
+/**
+ * T1 (r57): texto de UNA línea de un bloque de código / mapa conceptual (Courier). Cada carácter de cajas, flecha o
+ * triángulo → UNA columna ASCII (la estructura del mapa se conserva); los pictogramas (emoji decorativos) se quitan a
+ * propósito; los espacios NO colapsan (la sangría es la jerarquía). Lo que quede sin glifo lo cuenta
+ * `structureUnmappedCount` (el renderer falla fuerte si > 0: nunca un mapa roto en silencio).
+ */
+export function pdfCodeText(s: string): string {
+  let out = '';
+  for (const ch of String(s ?? '').normalize('NFC')) {
+    if (ch === '\t') { out += '  '; continue; }
+    const one = CODE_ONE_COL[ch] ?? boxAscii(ch);
+    if (one !== undefined) { out += one; continue; }
+    if (isWinAnsi(ch)) { out += ch; continue; }
+    const mapped = CHAR_MAP[ch];
+    if (mapped !== undefined) out += mapped;
+    // pictogramas / formato invisible / sin glifo: se quitan (los sin glifo se cuentan aparte)
+  }
+  return out;
+}
+
+/** T1 (r57): caracteres VISIBLES sin glifo en una línea de código/mapa (sin contar pictogramas decorativos). */
+export function structureUnmappedCount(s: string): number {
+  let n = 0;
+  for (const ch of String(s ?? '').normalize('NFC')) {
+    if (ch === '\t' || ch === '\n' || ch === '\r') continue;
+    if (CODE_ONE_COL[ch] !== undefined || boxAscii(ch) !== undefined || isWinAnsi(ch) || CHAR_MAP[ch] !== undefined) continue;
+    if (INVISIBLE.test(ch) || PICTOGRAPHIC.test(ch) || /[\u{FE0E}\u{FE0F}\u200D]/u.test(ch)) continue;
+    n++;
+  }
+  return n;
+}
+
+/** Líneas de las estructuras esenciales de un Markdown (bloques de código cercados = mapas/diagramas, y tablas). */
+export function markdownStructureLines(md: string): string[] {
+  const out: string[] = [];
+  const lines = String(md ?? '').split(/\r?\n/);
+  let fence: string | null = null;
+  for (const l of lines) {
+    const f = /^\s*(```|~~~)/.exec(l);
+    if (f) {
+      if (fence === null) fence = f[1];
+      else if (l.trim().startsWith(fence)) fence = null;
+      continue;
+    }
+    if (fence !== null || isTableRow(l)) out.push(l);
+  }
+  return out;
 }
 
 /** Fix round 1 (I2): caracteres VISIBLES que `pdfText` quitaría sin equivalente (para el aviso del paquete). */
 export function unmappedCharCount(s: string): number {
   let n = 0;
   for (const ch of String(s ?? '').normalize('NFC')) {
-    if (CHAR_MAP[ch] !== undefined || isWinAnsi(ch) || ch === '\n' || ch === '\r' || INVISIBLE.test(ch)) continue;
+    if (CHAR_MAP[ch] !== undefined || isWinAnsi(ch) || boxAscii(ch) !== undefined || CODE_ONE_COL[ch] !== undefined || ch === '\n' || ch === '\r' || INVISIBLE.test(ch)) continue;
     n++;
   }
   return n;
@@ -202,7 +312,7 @@ type Block =
   | { t: 'h'; level: number; text: string }
   | { t: 'p'; runs: Run[] }
   | { t: 'callout'; runs: Run[] }
-  | { t: 'list'; ordered: boolean; items: Run[][] }
+  | { t: 'list'; ordered: boolean; items: Run[][]; start?: number }
   | { t: 'quote'; paras: Run[][] }
   | { t: 'table'; header: string[]; rows: string[][] }
   | { t: 'code'; lines: string[] }
@@ -253,6 +363,8 @@ function parseInline(s: string, base: Omit<Run, 'text'> = {}): Run[] {
 const plain = (runs: Run[]): string => runs.map((r) => r.text).join('');
 const plainInline = (s: string): string => plain(parseInline(s)).trim();
 
+/** T1 (r57): línea de un diagrama de texto (caracteres de cajas U+2500–U+257F). */
+const BOX_LINE = /[\u2500-\u257F]/;
 const isTableRow = (l: string): boolean => l.includes('|') && l.trim().length > 0;
 const isTableSep = (l: string): boolean => /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/.test(l);
 function splitRow(l: string): string[] {
@@ -271,7 +383,7 @@ export function parseLibroMarkdown(md: string): Block[] {
   const lines = sanitizeMarkdownLinks(md).split(/\r?\n/);
   const blocks: Block[] = [];
   let para: string[] = [];
-  let list: { ordered: boolean; items: string[] } | null = null;
+  let list: { ordered: boolean; items: string[]; start: number } | null = null;
   let quote: string[] | null = null;
   const flushPara = () => {
     if (!para.length) return;
@@ -289,7 +401,7 @@ export function parseLibroMarkdown(md: string): Block[] {
   const flushList = () => {
     if (!list) return;
     const items = list.items.map((it) => parseInline(it)).filter((r) => r.length > 0);
-    if (items.length) blocks.push({ t: 'list', ordered: list.ordered, items });
+    if (items.length) blocks.push({ t: 'list', ordered: list.ordered, items, ...(list.ordered ? { start: list.start } : {}) });
     list = null;
   };
   const flushQuote = () => {
@@ -321,10 +433,19 @@ export function parseLibroMarkdown(md: string): Block[] {
       flushAll();
       const code: string[] = [];
       i++;
-      while (i < lines.length && !lines[i].trim().startsWith(fenceM[1])) code.push(pdfText(lines[i++].replace(/\s+$/, '')));
+      while (i < lines.length && !lines[i].trim().startsWith(fenceM[1])) code.push(pdfCodeText(lines[i++].replace(/\s+$/, '')));
       i++;
       while (code.length && !code[code.length - 1].trim()) code.pop();
       if (code.length) blocks.push({ t: 'code', lines: code });
+      continue;
+    }
+    // T1 (r57): un mapa/árbol dibujado SIN cerco (≥ 2 líneas seguidas con caracteres de cajas) también es un
+    // diagrama: va línea por línea en monoespaciado (antes se unía en un párrafo y la jerarquía se perdía).
+    if (BOX_LINE.test(line) && i + 1 < lines.length && BOX_LINE.test(lines[i + 1]) && !(isTableRow(line) && isTableSep(lines[i + 1]))) {
+      flushAll();
+      const code: string[] = [];
+      while (i < lines.length && lines[i].trim() && (BOX_LINE.test(lines[i]) || /^\s{2,}\S/.test(lines[i]))) code.push(pdfCodeText(lines[i++].replace(/\s+$/, '')));
+      blocks.push({ t: 'code', lines: code });
       continue;
     }
     if (isTableRow(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
@@ -364,10 +485,26 @@ export function parseLibroMarkdown(md: string): Block[] {
       const ordered = !!ol;
       if (!list || list.ordered !== ordered) {
         flushList();
-        list = { ordered, items: [] };
+        // T1 (r57): una lista numerada empieza en el número de su primer ítem («3.» sigue siendo 3).
+        list = { ordered, items: [], start: ol ? Math.max(1, parseInt(/^\s*(\d+)/.exec(line)?.[1] ?? '1', 10)) : 1 };
       }
       list.items.push((ol ?? ul)[1]);
     } else if (!line.trim()) {
+      // T1 (r57): una línea en blanco ENTRE ítems del mismo tipo no corta la lista (lista «suelta» de Markdown):
+      // antes cada ítem separado por un blanco era una lista nueva y TODOS salían «1.» (24 de 27 respuestas modelo).
+      if (list) {
+        let j = i + 1;
+        while (j < lines.length && !lines[j].trim()) j++;
+        const nx = j < lines.length ? lines[j] : '';
+        const nextOrdered = /^\s*\d+[.)]\s+/.test(nx);
+        const nextBullet = /^\s*[-*+•]\s+/.test(nx) && !/^\s*(-{3,}|_{3,}|\*{3,})\s*$/.test(nx);
+        if ((list.ordered && nextOrdered) || (!list.ordered && nextBullet)) {
+          flushPara();
+          flushQuote();
+          i = j;
+          continue;
+        }
+      }
       flushAll();
     } else if (list && /^\s{2,}\S/.test(line)) {
       list.items[list.items.length - 1] += ` ${line.trim()}`;
@@ -414,6 +551,67 @@ export function libroBibliographyV3(input: Pick<LibroV3Input, 'courseIntro' | 'm
       .map((m) => ({ number: m.number, title: m.title, entries: verified(m.intro.bibliography, `del módulo ${m.number}`) }))
       .filter((x) => x.entries.length > 0),
   };
+}
+
+// ─── T1 (r57): normas y documentos citados en el texto ────────────────────
+
+const NORM_KIND: Array<[RegExp, string]> = [
+  [/^ley(?:es)?$/i, 'Ley'], [/^decretos?(?:-ley)?$/i, 'Decreto'], [/^(?:resoluci[oó]n|res\.)$/i, 'Resolución'], [/^acuerdos?$/i, 'Acuerdo'],
+  [/^circular(?:es)?$/i, 'Circular'], [/^ordenanzas?$/i, 'Ordenanza'], [/^directivas?$/i, 'Directiva'], [/^acto legislativo$/i, 'Acto Legislativo'],
+];
+/** «Ley 1257 de 2008», «Resolución 459 de 2012», «Ley 1098/2006», «Decreto 780 de 2016», «Ley 599». */
+const NORM_RE = /\b(Ley(?:es)?|Decretos?(?:-[Ll]ey)?|Resoluci[oó]n|Res\.|Acuerdos?|Circular(?:es)?|Ordenanzas?|Directivas?|Acto [Ll]egislativo)\s+(?:(?:N\.?\s?[ºo°]|n[uú]mero|No\.)\s*)?(\d{1,3}(?:\.\d{3})+|\d{1,5})(?!\d)(?:\s*(?:de|del)\s+(?:\d{1,2}\s+de\s+[a-záéíóú]+\s+de\s+)?(\d{4})|\s*\/\s*(\d{4}))?/g;
+/** «Sentencia C-355 de 2006», «Sentencia T-760/08». */
+const SENTENCE_RE = /\bSentencia\s+([A-Z]{1,3}-\d{1,4})(?:\s*(?:de|del)\s+(\d{4})|\s*\/\s*(\d{2,4}))?/g;
+/** Normas técnicas: «ISO 9001:2015», «NTC 1486», «NFPA 70E», «NOM-035-STPS-2018». */
+const STANDARD_RE = /\b(ISO(?:\/IEC)?|IEC|NTC|NFPA|ASTM|UNE(?:-EN)?|IRAM|NCh|NOM)[\s-]+(\d{1,5}[A-Z]?(?:[-.]\d{1,4})*(?:-[A-Z]{2,6}-\d{4})?)(?::(\d{4}))?/g;
+
+/**
+ * Normas y documentos que el TEXTO del Libro cita (determinístico, sin red ni IA): cada uno una vez, con la forma
+ * más completa encontrada («Ley 599» + «Ley 599 de 2000» → «Ley 599 de 2000») y los capítulos donde aparece.
+ * Nunca agrega datos que el texto no trae (si el texto no dice el año, no hay año).
+ */
+export function citedNormativeReferences(chapters: ReadonlyArray<{ number: number; md: string }>): Array<{ label: string; chapters: number[] }> {
+  const byKey = new Map<string, { label: string; year: string | null; chapters: Set<number>; order: number }>();
+  let order = 0;
+  const put = (key: string, base: string, year: string | null, ch: number) => {
+    const cur = byKey.get(key);
+    if (cur) {
+      cur.chapters.add(ch);
+      if (!cur.year && year) { cur.year = year; cur.label = `${base} de ${year}`; }
+      return;
+    }
+    byKey.set(key, { label: year ? `${base} de ${year}` : base, year, chapters: new Set([ch]), order: order++ });
+  };
+  for (const ch of chapters) {
+    const text = String(ch.md ?? '').replace(/\s+/g, ' ');
+    // Orden de APARICIÓN en el texto (las tres familias intercaladas).
+    const found: Array<{ at: number; run: () => void }> = [];
+    for (const m of text.matchAll(NORM_RE)) found.push({ at: m.index as number, run: () => normHit(m) });
+    for (const m of text.matchAll(SENTENCE_RE)) found.push({ at: m.index as number, run: () => sentenceHit(m) });
+    for (const m of text.matchAll(STANDARD_RE)) found.push({ at: m.index as number, run: () => standardHit(m) });
+    found.sort((a, b) => a.at - b.at).forEach((f) => f.run());
+    function normHit(m: RegExpMatchArray) {
+      const kind = NORM_KIND.find(([re]) => re.test(m[1]))?.[1];
+      if (!kind) return;
+      const num = m[2].replace(/\./g, '');
+      const year = m[3] ?? m[4] ?? null;
+      put(`${kind}|${num}`, `${kind} ${num}`, year, ch.number);
+    }
+    function sentenceHit(m: RegExpMatchArray) {
+      let year = m[2] ?? m[3] ?? null;
+      if (year && year.length === 2) year = null; // «T-760/08»: el año abreviado no se completa (no se inventa)
+      put(`Sentencia|${m[1]}`, `Sentencia ${m[1]}`, year, ch.number);
+    }
+    function standardHit(m: RegExpMatchArray) {
+      const label = `${m[1]} ${m[2]}${m[3] ? `:${m[3]}` : ''}`;
+      const key = `${m[1]}|${m[2]}`;
+      const cur = byKey.get(key);
+      if (cur) { cur.chapters.add(ch.number); if (m[3] && !cur.year) { cur.year = m[3]; cur.label = label; } return; }
+      byKey.set(key, { label, year: m[3] ?? null, chapters: new Set([ch.number]), order: order++ });
+    }
+  }
+  return [...byKey.values()].sort((a, b) => a.order - b.order).map((v) => ({ label: v.label, chapters: [...v.chapters].sort((x, y) => x - y) }));
 }
 
 // ─── Colores y fuentes para papel blanco ──────────────────────────────────
@@ -476,8 +674,8 @@ export async function renderLibroPdfV3(input: LibroV3Input): Promise<LibroPdfRes
 }
 
 /** Fix round 1 (I2): caracteres visibles sin equivalente WinAnsi en el texto que el libro imprime (cada fuente una vez). */
-export function libroUnmappedChars(input: Pick<LibroV3Input, 'courseTitle' | 'brandName' | 'courseIntro' | 'modules'>): number {
-  const parts: string[] = [input.courseTitle, input.brandName ?? ''];
+export function libroUnmappedChars(input: Pick<LibroV3Input, 'courseTitle' | 'brandName' | 'courseIntro' | 'modules' | 'programReferences' | 'practiceChapters'>): number {
+  const parts: string[] = [input.courseTitle, input.brandName ?? '', ...(input.programReferences ?? []), ...(input.practiceChapters ?? []).map((p) => p.title)];
   const bib = libroBibliographyV3(input);
   for (const b of [...bib.course, ...bib.modules.flatMap((m) => m.entries)]) parts.push(b.author, b.title, b.publisher);
   for (const m of input.modules) {
@@ -500,6 +698,23 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
   const brandName = input.brandName ? pdfText(input.brandName).trim() : '';
   const bib = libroBibliographyV3(input);
   const hasBibliography = bib.course.length > 0 || bib.modules.length > 0;
+  // T1 (r57): glifos de las estructuras esenciales (mapas/diagramas en código y tablas): todo carácter tiene un
+  // equivalente o el Libro NO se genera (antes 452 caracteres se perdían en silencio y los mapas quedaban rotos).
+  const structureUnmapped = modules.reduce(
+    (n, m) => n + m.chapters.reduce((k, ch) => k + [ch.md, ch.appendixMd ?? ''].reduce((z, md) => z + markdownStructureLines(md).reduce((w, l) => w + structureUnmappedCount(l), 0), 0), 0),
+    0,
+  );
+  if (structureUnmapped > 0) {
+    throw new Error(`LIBRO_V3_GLYPHS: ${structureUnmapped} caracteres sin glifo en mapas, diagramas o tablas del Libro Guía (se perderían)`);
+  }
+  // T1 (r57): referencias — del programa académico (tal cual) y normas/documentos citados en el texto (determinístico).
+  const programRefs = (input.programReferences ?? []).map((r) => pdfText(String(r ?? '')).trim()).filter(Boolean);
+  const cited = citedNormativeReferences(modules.flatMap((m) => m.chapters.map((ch) => ({ number: ch.number, md: `${ch.md ?? ''}\n${ch.appendixMd ?? ''}` }))));
+  const extraRefs = programRefs.length > 0 || cited.length > 0;
+  const hasReferences = hasBibliography || extraRefs;
+  // Sin referencias nuevas, el cierre se sigue llamando «Bibliografía» (bytes idénticos a los de antes).
+  const refsTitle = extraRefs ? 'Referencias' : 'Bibliografía';
+  const practice = [...(input.practiceChapters ?? [])].sort((a, b) => a.number - b.number);
 
   const c = t.color;
   const accent = onPaper([c.accentStrong, c.accent, c.textPrimary], 4.5, '#1F3A5F');
@@ -689,12 +904,13 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
     paraGap();
   };
 
-  const list = (items: Run[][], ordered: boolean) => {
-    const indent = 18;
+  const list = (items: Run[][], ordered: boolean, start = 1) => {
+    // T1 (r57): números de 2+ cifras («10.») necesitan más sangría.
+    const indent = start + items.length - 1 >= 10 && ordered ? 24 : 18;
     items.forEach((it, k) => {
       ensure(SIZE.body * 2.6);
       const y = doc.y;
-      const marker = ordered ? `${k + 1}.` : '•';
+      const marker = ordered ? `${start + k}.` : '•';
       doc.font(ordered ? FONTS[bodyFamily].b : FONTS[bodyFamily].r).fontSize(SIZE.body).fillColor(accent).text(marker, PAGE.left + 2, y, { width: indent - 2, lineBreak: false });
       doc.y = y;
       textRuns(it, PAGE.left + indent, contentW - indent, { size: SIZE.body, color: ink, family: bodyFamily });
@@ -717,7 +933,7 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
       } else if (b.t === 'quote') {
         leftBarBlock(b.paras, { italic: true, color: inkSoft, bar: rule });
       } else if (b.t === 'list') {
-        list(b.items, b.ordered);
+        list(b.items, b.ordered, b.start ?? 1);
       } else if (b.t === 'table') {
         table(b.header, b.rows);
       } else if (b.t === 'code') {
@@ -753,7 +969,12 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
   doc.y += 14;
   accentRule(accent, 72, 3);
   const nCh = modules.reduce((s, m) => s + m.chapters.length, 0);
-  const coverLine = `${modules.length} ${modules.length === 1 ? 'módulo' : 'módulos'} · ${nCh} ${nCh === 1 ? 'capítulo' : 'capítulos'}${hasBibliography ? ' · bibliografía verificada' : ''}`;
+  // T1 (r57): la portada cuenta los capítulos REALES del curso; con práctica, explícito cuántos son de cada tipo.
+  const nAll = nCh + practice.length;
+  const chapterCount = practice.length
+    ? `${nAll} capítulos (${nCh} de contenido y ${practice.length} de práctica)`
+    : `${nCh} ${nCh === 1 ? 'capítulo' : 'capítulos'}`;
+  const coverLine = `${modules.length} ${modules.length === 1 ? 'módulo' : 'módulos'} · ${chapterCount}${hasBibliography ? ' · bibliografía verificada' : extraRefs ? ' · referencias' : ''}`;
   doc.font(FONTS[bodyFamily].r).fontSize(12).fillColor(inkSoft).text(coverLine, PAGE.left, doc.y, { width: contentW });
   doc.y += 8;
   doc.font(FONTS[bodyFamily].r).fontSize(11).fillColor(inkSoft).text('Material de estudio del curso: el texto completo, organizado por módulos y capítulos.', PAGE.left, doc.y, { width: contentW });
@@ -779,13 +1000,33 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
     toc.push({ key, page: pageIdx, y: doc.y - doc.currentLineHeight(true), xEnd, bold });
     doc.y += 4;
   };
+  const tocChapterNumbers: number[] = [];
+  // T1 (r57): capítulo de práctica en el índice, en su lugar, sin página (no tiene texto en el Libro).
+  const tocPractice = (pc: { number: number; title: string }) => {
+    const text = `Capítulo ${pc.number}. ${pdfText(pc.title)} · capítulo de práctica (en el aula virtual)`;
+    const w = contentW - 16 - 30;
+    doc.font(FONTS[bodyFamily].i).fontSize(10.5);
+    const h = doc.heightOfString(text, { width: w, lineGap: 2 });
+    ensure(h + 6);
+    doc.fillColor(inkSoft).text(text, PAGE.left + 16, doc.y, { width: w, lineGap: 2 });
+    doc.y += 4;
+    tocChapterNumbers.push(pc.number);
+  };
   modules.forEach((m) => {
     tocLine(`mod-${m.number}`, `Módulo ${m.number} — ${pdfText(m.title)}`, 0, true);
-    m.chapters.forEach((ch) => tocLine(`cap-${ch.number}`, `Capítulo ${ch.number}. ${pdfText(ch.title)}`, 16, false));
+    const mp = practice.filter((p) => p.moduleNumber === m.number);
+    const entries = [...m.chapters.map((ch) => ({ ch, p: null as null | (typeof practice)[number] })), ...mp.map((p) => ({ ch: null as null | LibroV3Chapter, p }))]
+      .sort((a, b) => ((a.ch?.number ?? a.p?.number) as number) - ((b.ch?.number ?? b.p?.number) as number));
+    for (const e of entries) {
+      if (e.ch) {
+        tocLine(`cap-${e.ch.number}`, `Capítulo ${e.ch.number}. ${pdfText(e.ch.title)}`, 16, false);
+        tocChapterNumbers.push(e.ch.number);
+      } else if (e.p) tocPractice(e.p);
+    }
   });
-  if (hasBibliography) {
+  if (hasReferences) {
     doc.y += 6;
-    tocLine('bibliografia', 'Bibliografía', 0, true);
+    tocLine('bibliografia', refsTitle, 0, true);
   }
 
   // ── 3. Módulos y capítulos ──
@@ -881,20 +1122,37 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
     textRuns(runs, PAGE.left + 12, contentW - 12, { size: SIZE.body, color: ink, family: bodyFamily });
     doc.y += 5;
   };
-  if (hasBibliography) {
+  if (hasReferences) {
     newPage();
     startOf.bibliografia = pageIdx;
     doc.addNamedDestination('bibliografia');
-    outline.addItem('Bibliografía');
-    heading('Bibliografía', SIZE.h1, ink, { before: 0, after: 6 });
+    outline.addItem(refsTitle);
+    heading(refsTitle, SIZE.h1, ink, { before: 0, after: 6 });
     accentRule(accent);
     if (bib.course.length) {
-      heading('Bibliografía general del curso', SIZE.h3, accent);
+      heading(extraRefs ? 'Bibliografía verificada del curso' : 'Bibliografía general del curso', SIZE.h3, accent);
       bib.course.forEach(entry);
     }
     for (const mb of bib.modules) {
       heading(`Módulo ${mb.number} — ${pdfText(mb.title)}`, SIZE.h3, accent);
       mb.entries.forEach(entry);
+    }
+    const plainEntry = (runs: Run[]) => {
+      ensure(SIZE.body * 2.6);
+      textRuns(runs, PAGE.left + 12, contentW - 12, { size: SIZE.body, color: ink, family: bodyFamily });
+      doc.y += 5;
+    };
+    if (programRefs.length) {
+      heading('Referencias del programa académico', SIZE.h3, accent);
+      programRefs.forEach((r) => plainEntry([{ text: r }]));
+    }
+    if (cited.length) {
+      heading('Normas y documentos citados en el texto', SIZE.h3, accent);
+      textRuns([{ text: 'Documentos que el texto menciona. Consulta siempre su versión oficial vigente.', i: true }], PAGE.left, contentW, { size: SIZE.body, color: inkSoft, family: bodyFamily });
+      doc.y += 8;
+      cited.forEach((r) =>
+        plainEntry([{ text: pdfText(r.label), b: true }, { text: pdfText(` — ${r.chapters.length === 1 ? 'capítulo' : 'capítulos'} ${r.chapters.join(', ')}.`) }]),
+      );
     }
   }
 
@@ -965,5 +1223,8 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
   const chapterPages: Record<number, number> = {};
   for (const m of modules) for (const ch of m.chapters) chapterPages[ch.number] = (startOf[`cap-${ch.number}`] as number) + 1;
   if (coverLogoDraws !== 1) throw new Error(`LIBRO_V3_WATERMARK: se esperaba exactamente 1 logo en la portada (${coverLogoDraws})`);
-  return { pdf, pageCount: total, wordCount: words, hasBibliography, watermarkDrawsPerPage: draws, chapterPages, coverLogoDraws, unmappedChars: libroUnmappedChars(input) };
+  return {
+    pdf, pageCount: total, wordCount: words, hasBibliography, watermarkDrawsPerPage: draws, chapterPages, coverLogoDraws, unmappedChars: libroUnmappedChars(input),
+    structureUnmappedChars: structureUnmapped, coverLine, tocChapterNumbers, citedReferences: cited.map((r) => r.label), hasReferences,
+  };
 }

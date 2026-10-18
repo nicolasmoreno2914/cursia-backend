@@ -289,3 +289,12 @@ export function applicationActivitySummary(doc: any): Record<string, unknown> {
     caseNames: caseProperNames([a.context, w.situation].filter((x) => typeof x === 'string').join('\n')),
   };
 }
+
+/**
+ * Review r1 (M): criterio de la actividad para una entrada de la guía de corrección, por NOMBRE (no por posición); la
+ * posición queda solo como respaldo si el nombre no coincide (documentos ya validados: mismo orden y nombre).
+ */
+export function criterionForGuide(criteria: readonly any[], guide: { criterion?: unknown } | null | undefined, index: number): any {
+  const name = typeof guide?.criterion === 'string' ? guide.criterion.trim() : '';
+  return (name && criteria.find((c) => String(c?.name ?? '').trim() === name)) ?? criteria[index];
+}

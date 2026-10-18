@@ -863,6 +863,20 @@ var DYN_VC_COMPONENT_USES = {
 var DYN_V3_BANNED_RESOURCE_REFERENCES = ['el video', 'los videos', 'la actividad interactiva / de práctica / calificada', 'la siguiente actividad', 'el examen', 'la evaluación del módulo / final', 'la presentación (del capítulo)', 'las diapositivas', 'el quiz', 'SCORM', 'H5P', 'un juego interactivo / de práctica', 'el siguiente recurso'];
 var DYN_V3_ALLOWED_DOMAIN_EXAMPLES = ['juego de roles', 'evaluación de riesgos', 'presentación de resultados', 'actividad económica', 'examen médico'];
 
+// T1 (r57): el prompt nombra los bloques por su id técnico y rotula el capítulo como «texto fuente»; el modelo a veces
+// copiaba ese vocabulario en la prosa («la situación ilustrativa del worked_example»). Espejo de la reparación
+// determinística y del check INTERNAL_VOCABULARY del backend (visual-components/internal-vocabulary.ts).
+function _dynInternalVocabularyBan() {
+  return '- NUNCA escribas en el texto los nombres técnicos de los bloques, movimientos o campos de este JSON (p.ej. worked_example, case_scenario, concept_cards, process_steps, summary_visual, self_check, deepening, bridge_to_next) ni «texto fuente», «[S1]» o delimitadores como «<<<CAPITULO»: para el lector son «el ejemplo resuelto», «el caso», «los conceptos clave», «el procedimiento», «la síntesis» o «el Libro Guía».';
+}
+
+// T1 (r57): un curso real repetía las mismas aperturas y cierres en casi todos los capítulos («Ya sabes… Ahora
+// viene…» 9/15, «Piensa en…» 11/15). Regla de estilo (no un validador): el backend mide la repetición entre capítulos
+// (lintFormulaicOpenings) y la deja como aviso de calidad del paquete.
+function _dynFormulaVarietyRule() {
+  return '- ESTILO: cada capítulo abre y cierra con una entrada PROPIA de su tema; nada de fórmulas repetidas entre capítulos: no abras el hero con «Ya sabes… / Hasta aquí… → Ahora viene…», no empieces la reflexión con «Piensa en…», no arranques why/apply siempre con la misma muletilla («Porque…», «Úsalo cuando…»): escribe directamente la razón o la acción concreta.\n';
+}
+
 // Reglas duras comunes a experience / course_intro / module_intro.
 function _dynV3StrictBans() {
   return '\n\nPROHIBICIONES ABSOLUTAS (un validador automático rechaza la respuesta si las incumples):\n'
@@ -870,6 +884,7 @@ function _dynV3StrictBans() {
     + 'El vocabulario propio del tema SÍ está permitido (p.ej. ' + DYN_V3_ALLOWED_DOMAIN_EXAMPLES.map(function (w) { return '"' + w + '"'; }).join(', ') + '); habla de CONCEPTOS del tema.\n'
     + '- NUNCA escribas cantidades de la estructura del curso: nada de números junto a módulos, capítulos, videos, actividades, preguntas, intentos, minutos, horas o páginas, ni porcentajes ("30%"), ni "capítulo 3" / "módulo 2". Para referirte a otra parte del curso, usa su TÍTULO, nunca su número. ÚNICA excepción: dentro de un "worked_example" los datos del caso pueden llevar cifras, porcentajes, horas o minutos ilustrativos (nunca módulos, capítulos, videos, actividades, preguntas ni intentos).\n'
     + '- NUNCA escribas navegación ni instrucciones de interfaz ("haz clic", "a continuación verás", "en la siguiente sección", "continúa con…"): las transiciones las pone Cursia.\n'
+    + _dynInternalVocabularyBan() + '\n'
     + '- Solo texto plano: sin HTML, sin Markdown (salvo **énfasis** puntual, siempre cerrado), sin URLs.';
 }
 
@@ -1033,6 +1048,7 @@ function dynExperiencePrompt(courseContext, outline, chapter, contentMd, context
     + '- Antes de responder, cuenta los componentes de cada movimiento: nunca más que el máximo indicado.\n'
     + '- hero.eyebrow (opcional): 1 a 3 palabras del TEMA (p. ej. "Evaluación auténtica"); nunca "Capítulo N" ni "Módulo N": Cursia ya muestra la ubicación.\n'
     + '- Respeta TODOS los límites de caracteres; ningún texto vacío; los campos de texto no llevan HTML.\n'
+    + _dynFormulaVarietyRule()
     + '- "chapterId" es exactamente "' + chapterId + '".'
     + _dynV3StrictBans()
     + '\n\nSOLO el JSON, nada más; cierra todos los objetos y arrays.';
@@ -1999,7 +2015,8 @@ function dynApplicationActivityPrompt(courseContext, outline, chapter, sourceMd,
     + (practice
       ? '\nEs un CAPÍTULO DE PRÁCTICA: integra lo de los capítulos de contenido del módulo (abajo), sin teoría nueva.'
       : '')
-    + '\nTexto fuente (ÚNICA fuente de los conceptos; los datos de ejercicios y casos son HIPOTÉTICOS e ilustrativos):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
+    + '\nTexto del capítulo en el Libro Guía (ÚNICA fuente de los conceptos; los datos de ejercicios y casos son HIPOTÉTICOS e ilustrativos):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
+    + '\n' + _dynInternalVocabularyBan()
     + _dynApplicationLearnerBlock(app, pedagogy)
     + (pedagogy || '')
     + '\n\nDiseña la ACTIVIDAD DE APLICACIÓN de este capítulo para ' + minutes + ' minutos de trabajo del estudiante.'
@@ -2037,7 +2054,7 @@ function dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd
   var names = (activity.criteria || []).map(function (c) { return c.name; });
   return _dynCtxV3(courseContext, null)
     + '\n\nCAPÍTULO: "' + (ch.title || '') + '"'
-    + '\nTexto fuente (para que las respuestas sean correctas y consistentes con lo enseñado):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
+    + '\nTexto del capítulo en el Libro Guía (para que las respuestas sean correctas y consistentes con lo enseñado):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
     + '\n\nACTIVIDAD DEL ESTUDIANTE (ya aprobada; NO la cambies):\n' + JSON.stringify(activity)
     + '\n\nEscribe el SOLUCIONARIO DOCENTE de esa actividad como JSON EXACTAMENTE con esta forma:\n'
     + '{\n'
@@ -2050,7 +2067,9 @@ function dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd
     + '\n- "answers": EXACTAMENTE una por ejercicio, en este orden de ids: ' + ids.join(', ') + '.'
     + '\n- "correctionGuide": EXACTAMENTE uno por criterio, en este orden y con estos nombres: ' + names.map(function (n) { return '«' + n + '»'; }).join(', ') + '.'
     + '\n- "teacherNotes": 1–6 observaciones concretas.'
-    + '\n- Respuestas correctas según el texto fuente; si un cálculo usa datos hipotéticos del enunciado, muestra el resultado.';
+    + '\n- Respuestas correctas según el capítulo; si un cálculo usa datos hipotéticos del enunciado, muestra el resultado.'
+    + '\n- Cuando remitas al material, di «el Libro Guía» o «el capítulo» (nunca «texto fuente», «la fuente» ni nombres técnicos del JSON).'
+    + '\n' + _dynInternalVocabularyBan();
 }
 
 // ════ Loop 9 B · «Ejercicios guiados» del capítulo (formativos, sin nota, con respuesta modelo; clave guided_practice) ════
@@ -2111,6 +2130,7 @@ function dynGuidedPracticePrompt(courseContext, outline, chapter, sourceMd, gp, 
     + '\n\nCAPÍTULO: "' + (ch.title || '') + '"' + (ch.objective ? '\nObjetivo del capítulo: ' + ch.objective : '')
     + (ch.description ? '\nAlcance del capítulo: ' + String(ch.description).replace(/\s+/g, ' ').trim() : '')
     + '\nTexto del capítulo (ÚNICA fuente de los conceptos; los datos de las situaciones son HIPOTÉTICOS e ilustrativos):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
+    + '\n' + _dynInternalVocabularyBan()
     + _dynApplicationLearnerBlock(gp, pedagogy)
     + (pedagogy || '')
     + _dynGuidedPracticeAvoidBlock(gp)

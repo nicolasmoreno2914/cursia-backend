@@ -357,7 +357,7 @@ function welcomeIssues(html, { welcome, title, theme, clean, noLead = false }) {
     const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, theme: { themeFamily: 'editorial', mode: 'light' } });
     input.contents.courseIntro = { ...input.contents.courseIntro, welcome: WELCOMES.w616 };
     const r = await loadDist('package/dynamic-mbz-builder-v3.js').buildDynamicMbzV3(input);
-    eq(r.summary.builderVersion, '3.14.0', 'versión'); // r55: invariantes de calificación
+    eq(r.summary.builderVersion, '3.15.0', 'versión'); // r55: invariantes de calificación
     mbz = r.mbz;
     exp = r.expectations;
     const z = await JSZip.loadAsync(mbz);

@@ -7,6 +7,15 @@ import {
   validatePedagogicalProfile,
 } from '../pedagogy/pedagogy-profile';
 import { AcademicContextV1, normalizeAcademicContext, validateAcademicContextShape } from '../academic-context/academic-context';
+import {
+  ApplicationDeliveryProfile,
+  PracticeResourceSpec,
+  deliveryNeedsOwnCategory,
+  normalizeApplicationDelivery,
+  normalizePracticeResources,
+  validateApplicationDelivery,
+  validatePracticeResources,
+} from './application-delivery';
 
 /**
  * Cursia V2.1 — R3: perfiles de curso (audit §M.2, §K.2). Lógica PURA: sin
@@ -174,6 +183,11 @@ export interface CategoryWeightsWithoutFinal {
   practice: number;
   moduleExams: number;
 }
+/**
+ * T4 (r57): con `applicationDelivery.grading` calificada en categoría propia, los pesos traen además `applications`
+ * («Actividades de Aplicación»). Sin esa entrega, la clave no existe (perfiles de siempre).
+ */
+export type CategoryWeights = (CategoryWeightsWithFinal | CategoryWeightsWithoutFinal) & { applications?: number };
 
 export interface AssessmentProfile {
   assessmentProfileVersion: number;
@@ -181,12 +195,44 @@ export interface AssessmentProfile {
   overrides: Record<AssessableType, number | null>;
   attempts: Record<AssessableType, number>;
   gradeMethod: Record<AssessableType, GradeMethod>;
-  categoryWeights: CategoryWeightsWithFinal | CategoryWeightsWithoutFinal;
+  categoryWeights: CategoryWeights;
   courseCompletion: {
     requireAllChapterActivities: boolean;
     requireExams: boolean;
     requireCourseGradePass: boolean;
   };
+  /**
+   * T4 (r57): entrega de las Actividades de Aplicación (página de siempre o Tarea de Moodle). Ausente = página: el
+   * perfil, su sha y el paquete son los de siempre.
+   */
+  applicationDelivery?: ApplicationDeliveryProfile;
+  /** T5 (r57): archivos de trabajo por capítulo (mod_resource; la AA los enlaza). Ausente/vacío = ninguno. */
+  practiceResources?: PracticeResourceSpec[];
+  /**
+   * T6 (r57): «Guía del docente» del curso — página oculta solo para docentes (sección 0), armada sin IA desde lo ya
+   * generado (objetivos, tipo de aprendizaje y fases, actividades, criterios, solucionarios, archivos, evaluación,
+   * horas). Ausente o `include: false` = paquete de siempre.
+   */
+  teacherGuide?: TeacherGuideProfile;
+}
+
+/** T6 (r57): opción de la Guía del docente. */
+export interface TeacherGuideProfile {
+  include: boolean;
+}
+
+/** T6 (r57): valida `teacherGuide` ({ include: boolean }, sin otros campos). */
+export function validateTeacherGuide(v: unknown): ProfileValidationError[] {
+  if (!isPlainObject(v)) return [{ path: 'teacherGuide', code: 'INVALID_TEACHER_GUIDE', message: 'teacherGuide debe ser un objeto { include: boolean }' }];
+  const errors: ProfileValidationError[] = [];
+  checkKeys(v, ['include'], [], 'teacherGuide', errors);
+  if ('include' in v && typeof v.include !== 'boolean') errors.push({ path: 'teacherGuide.include', code: 'INVALID_TEACHER_GUIDE', message: 'teacherGuide.include debe ser true o false' });
+  return errors;
+}
+
+/** T6 (r57): ¿el perfil pide la Guía del docente? */
+export function teacherGuideEnabled(p: { teacherGuide?: TeacherGuideProfile } | null | undefined): boolean {
+  return p?.teacherGuide?.include === true;
 }
 
 /** Defaults de producto (DECISIONES VIGENTES): 70; formativos ilimitados (0), exámenes 3; 30/50/20 o 40/60. */
@@ -350,10 +396,15 @@ export function validateAssessmentProfile(
   checkKeys(
     p,
     ['assessmentProfileVersion', 'passingGrade', 'overrides', 'attempts', 'gradeMethod', 'categoryWeights', 'courseCompletion'],
-    [],
+    ['applicationDelivery', 'practiceResources', 'teacherGuide'],
     '',
     errors,
   );
+  // T4/T5 (r57): claves opcionales (ausentes = perfil de siempre).
+  if ('teacherGuide' in p) errors.push(...validateTeacherGuide(p.teacherGuide));
+  if ('applicationDelivery' in p) errors.push(...validateApplicationDelivery(p.applicationDelivery));
+  if ('practiceResources' in p) errors.push(...validatePracticeResources(p.practiceResources));
+  const ownCategory = 'applicationDelivery' in p && validateApplicationDelivery(p.applicationDelivery).length === 0 && deliveryNeedsOwnCategory(p.applicationDelivery as ApplicationDeliveryProfile);
 
   if ('assessmentProfileVersion' in p && p.assessmentProfileVersion !== ASSESSMENT_PROFILE_VERSION) {
     errors.push({
@@ -382,14 +433,14 @@ export function validateAssessmentProfile(
     if (!isPlainObject(w)) {
       errors.push({ path: 'categoryWeights', code: 'INVALID_TYPE', message: 'categoryWeights debe ser un objeto' });
     } else {
-      const expected = ctx.finalExam ? ['practice', 'moduleExams', 'finalExam'] : ['practice', 'moduleExams'];
+      const expected = [...(ctx.finalExam ? ['practice', 'moduleExams', 'finalExam'] : ['practice', 'moduleExams']), ...(ownCategory ? ['applications'] : [])];
       const keys = Object.keys(w).sort();
       if (JSON.stringify(keys) !== JSON.stringify([...expected].sort())) {
         errors.push({
           path: 'categoryWeights',
           code: 'WEIGHTS_FINAL_EXAM_MISMATCH',
           message: `categoryWeights debe tener exactamente [${expected.join(', ')}] ` +
-            `(${ctx.finalExam ? 'el curso tiene' : 'el curso no tiene'} examen final); tiene [${keys.join(', ')}]`,
+            `(${ctx.finalExam ? 'el curso tiene' : 'el curso no tiene'} examen final${ownCategory ? '; las Actividades de Aplicación califican en su propia categoría' : ''}); tiene [${keys.join(', ')}]`,
         });
       }
       let allValid = true;
@@ -468,7 +519,8 @@ export function normalizeAssessmentProfile(
   const map = <T>(m: Record<AssessableType, T>): Record<AssessableType, T> => ({
     activity: m.activity, video: m.video, exam: m.exam, finalExam: m.finalExam,
   });
-  const w = q.categoryWeights as CategoryWeightsWithFinal;
+  const w = q.categoryWeights as CategoryWeightsWithFinal & { applications?: number };
+  const apps = w.applications !== undefined ? { applications: w.applications } : {};
   return {
     assessmentProfileVersion: q.assessmentProfileVersion,
     passingGrade: q.passingGrade,
@@ -476,13 +528,19 @@ export function normalizeAssessmentProfile(
     attempts: map(q.attempts),
     gradeMethod: map(q.gradeMethod),
     categoryWeights: hasFinal
-      ? { practice: w.practice, moduleExams: w.moduleExams, finalExam: w.finalExam }
-      : { practice: w.practice, moduleExams: w.moduleExams },
+      ? { practice: w.practice, moduleExams: w.moduleExams, finalExam: w.finalExam, ...apps }
+      : { practice: w.practice, moduleExams: w.moduleExams, ...apps },
     courseCompletion: {
       requireAllChapterActivities: q.courseCompletion.requireAllChapterActivities,
       requireExams: q.courseCompletion.requireExams,
       requireCourseGradePass: q.courseCompletion.requireCourseGradePass,
     },
+    // T4/T5 (r57): solo si el perfil las trae (sin ellas, el mismo objeto y el mismo sha de siempre).
+    ...(q.applicationDelivery ? { applicationDelivery: normalizeApplicationDelivery(q.applicationDelivery) } : {}),
+    ...(q.practiceResources && q.practiceResources.length ? { practiceResources: normalizePracticeResources(q.practiceResources) } : {}),
+    // T6 (r57): solo si el perfil la ENCIENDE. Review r1 (M4): `{ include: false }` ≡ ausente (mismo objeto, mismo sha:
+    // apagarla no re-empaqueta un curso que nunca la tuvo).
+    ...(q.teacherGuide?.include === true ? { teacherGuide: { include: true } } : {}),
   };
 }
 

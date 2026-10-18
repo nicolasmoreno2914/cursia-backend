@@ -1,0 +1,26 @@
+{
+  "description": "T2 (r57): huellas calculadas con el código ANTERIOR al plan de aprendizaje (backend 8d598b8) para el perfil base SIN learningPlan. check-learning-plan.js exige que el código actual dé exactamente lo mismo (compatibilidad byte a byte).",
+  "baseCommit": "8d598b8",
+  "digests": {
+    "profile": "f7a8c7eb0806e70b4c4a5c8f2b539efec2da506751e41e7ab56109eae9b26894",
+    "profileSha256": "facf09d321a51069d490cea54fad7aef7a4f3238bfb1124c7e1adc4a851bb971",
+    "rules": "01f79e2ceeac91cd35e70f328b2048b4057a64c72bd39e57328f262803afc90e",
+    "snapshot.r0": "c49db93510334d032c0439249bf03ecbd20c9b8135102e5905d59ee23e49dd42",
+    "manifest.r0": "feb85ca60aaea4c2e810f1762a4b243de22fde60b79f165bb9432db4f24ab340",
+    "briefs.r0": "594eb4d48ab077436cbb240685a39349cd6b190abb435e8dbf2e2fa8569597bf",
+    "fingerprints.r0": "a38492c81d1a595867131927f02c9cb5896449ac90b333b6f1127a5be09cef67",
+    "snapshot.r1": "c49db93510334d032c0439249bf03ecbd20c9b8135102e5905d59ee23e49dd42",
+    "manifest.r1": "8bfef08cc6a7fcd355999130e0a5fcd3b257c2eaa7d140cdb1d7a4b7403d55cc",
+    "briefs.r1": "594eb4d48ab077436cbb240685a39349cd6b190abb435e8dbf2e2fa8569597bf",
+    "fingerprints.r1": "a38492c81d1a595867131927f02c9cb5896449ac90b333b6f1127a5be09cef67",
+    "snapshot.r2": "c49db93510334d032c0439249bf03ecbd20c9b8135102e5905d59ee23e49dd42",
+    "manifest.r2": "7291c3b22e38446765e325437c44c9812ca341ef650822ff28f09af51cb945e2",
+    "briefs.r2": "19f98a75989564e42f3215f9f46ccfcfb97eca3d236405dcb19f3703c410644f",
+    "fingerprints.r2": "7401d53f8d16ef538560987bc33fc88dd73afd09d37c3e9f282b0c0fdc384b65",
+    "noProfile": "5d3ac04db9f2b5247e4477630c689c7673edf76601be78a08dac078ca442a110",
+    "dryRun": "1ccf631eb7d1d68d4defc043ac2bec0801fe49776dc3aa6fa79d2c4e496dc7a5",
+    "dryRunNoProfile": "ea251d883d60c9a23cb586a8a37b798fc55ae968cf97b160d24740f8fda38239",
+    "facts": "e75930592c1927b1e901909731d716f2cf02cca4b01adc119304350acdf42704",
+    "shell": "c483f43de3dbfc7570bb716d8467a2b6f05232087157be3cc2d470e13c427dd0"
+  }
+}

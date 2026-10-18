@@ -35,6 +35,9 @@ import { isValidTargetHours } from './target-hours';
 import { STUDY_TIME_RULES, StudyTimeCourseInput, StudyTimeEstimate, estimateCourseStudyTime } from './time-model';
 import { GUIDED_PRACTICE_TIERS } from './guided-practice-tiers';
 import type { DistributorRequirementConstraints } from '../academic-context/requirements/requirement-authority';
+import { classifyLearningType } from '../pedagogy/learning-type';
+import type { LearningType } from '../pedagogy/vocabulary';
+import { VIDEO_COMPOSITION_VERSION, VideoCompositionResult, VideoNeed, decideVideosByNeed } from './video-composition';
 
 export const DISTRIBUTOR_VERSION = 2 as const;
 
@@ -91,6 +94,11 @@ export interface ProposedChapter {
   guidedPracticeMinutes: number | null;
   /** Loop 9 B: la práctica guiada la fijó el docente. */
   guidedPracticePinned: boolean;
+  /**
+   * T3 (r57): por qué este capítulo de contenido lleva (o no) video — SOLO con la composición por necesidad del plan de
+   * aprendizaje (`learningPlan.composition.videos = 'by_need'`); sin ella la clave no existe (salida de siempre).
+   */
+  videoDecision?: { ruleId: string; need: VideoNeed; learningType: LearningType; reason: string };
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
   generableMinutes: number;
@@ -160,6 +168,11 @@ export interface DistributionResult {
   };
   /** Loop 9 B: la práctica guiada completó la diferencia (o no alcanzó: shortfall en horas, > 0). */
   guidedPracticeFill?: { used: boolean; shortfallHours: number };
+  /** T3 (r57): composición por necesidad (solo con `learningPlan.composition.videos = 'by_need'`). */
+  composition?: {
+    version: typeof VIDEO_COMPOSITION_VERSION;
+    videos: Pick<VideoCompositionResult, 'hoursBudgetVideos' | 'counts' | 'unmet'> & { minVideos?: number; maxVideos?: number };
+  };
   /** Horas por componente del diseño propuesto. */
   hoursByComponent: Record<string, number>;
   studyTime: StudyTimeEstimate;
@@ -336,6 +349,9 @@ function distributeCore(input: DistributorInput): DistributionResult {
   const guidedMode: GuidedPracticeMode = prefs.guidedPractice ?? 'auto';
   const appMode: ApplicationActivitiesMode = prefs.applicationActivities ?? 'auto';
   const av: AudiovisualPriority | null = prefs.audiovisual ?? null;
+  // T3 (r57): composición por necesidad (plan de aprendizaje). Ausente = comportamiento de siempre (byte a byte).
+  const lpComp = rules?.learningPlan?.composition ?? null;
+  const compOn = !!lpComp && lpComp.videos === 'by_need';
   const pins: DesignPins = input.pins ?? {};
   const pinnedVideo = (id: string): boolean | undefined => (pins[id] && typeof pins[id].video === 'boolean' ? pins[id].video : undefined);
   /** Minutos fijados por el docente (null = fijada SIN actividad); undefined = la decide Cursia. */
@@ -398,7 +414,10 @@ function distributeCore(input: DistributorInput): DistributionResult {
     if (av === 'less') return contentIndex === 0;
     return contentCount === 1 || contentIndex < contentCount - 1; // recommended: abre o desarrolla, no el cierre
   };
-  if (av) {
+  if (compOn) {
+    // T3: el video lo decide la composición por necesidad (más abajo, con los requisitos del documento ya leídos).
+    for (const m of design) for (const c of m.chapters) if (c.kind === 'practice') c.videoEnabled = false;
+  } else if (av) {
     for (const m of design) {
       const content = m.chapters.filter((c) => c.kind === 'content');
       content.forEach((c, i) => {
@@ -413,9 +432,36 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // LOOP 8.6C · requisitos del documento: video en todos los capítulos de contenido (o en ninguno). Lo fijado manda.
   const rq = input.requirements ?? null;
   const reqVideo: boolean | null = rq && rq.videosAllContent ? true : rq && rq.videosNone ? false : null;
-  if (reqVideo !== null) {
+  if (reqVideo !== null && !compOn) {
     for (const m of design) for (const c of m.chapters) if (c.kind === 'content' && pinnedVideo(c.id) === undefined) c.videoEnabled = reqVideo;
   }
+  // T3 (r57) · composición por necesidad: tipo de aprendizaje congelado en el diseño del capítulo (lock); para un capítulo
+  // que propone el distribuidor, el mismo clasificador sobre su título y objetivo (lo que congelará el lock al aplicarlo).
+  const frozenType = new Map<string, LearningType>();
+  for (const m of snapshot.modules) for (const c of m.chapters) {
+    const t = (c as { design?: { learningType?: { type?: string } } }).design?.learningType?.type;
+    if (typeof t === 'string') frozenType.set(c.id, t as LearningType);
+  }
+  const learningTypeOf = (c: WorkChapter): LearningType => frozenType.get(c.id) ?? classifyLearningType({ title: c.title, objective: c.objective, description: null }).type;
+  let videoComp: VideoCompositionResult | null = null;
+  /** Recalcula el video de TODOS los capítulos de contenido (la decisión depende del conjunto). true = algo cambió. */
+  const applyComposition = (): boolean => {
+    if (!compOn) return false;
+    const list = design.flatMap((m) => m.chapters.filter((c) => c.kind === 'content'));
+    videoComp = decideVideosByNeed({
+      chapters: list.map((c, order) => { const p = pinnedVideo(c.id); return { chapterId: c.id, order, learningType: learningTypeOf(c), ...(p !== undefined ? { pinned: p } : {}) }; }),
+      targetHours: input.targetHours,
+      audiovisual: av,
+      documentVideo: reqVideo,
+      ...(lpComp!.minVideos !== undefined ? { minVideos: lpComp!.minVideos } : {}),
+      ...(lpComp!.maxVideos !== undefined ? { maxVideos: lpComp!.maxVideos } : {}),
+    });
+    const byId = new Map(videoComp.decisions.map((d) => [d.chapterId, d.enabled]));
+    let changed = false;
+    for (const c of list) { const v = byId.get(c.id)!; if (c.videoEnabled !== v) { c.videoEnabled = v; changed = true; } }
+    return changed;
+  };
+  applyComposition();
   const minCh = rq?.chaptersPerModule?.min ?? 0;
   const maxCh = rq?.chaptersPerModule?.max ?? Infinity;
   // LOOP 9.2 · Requisitos del documento por tipo de capítulo, lugar de las Actividades de Aplicación y total de actividades.
@@ -425,6 +471,12 @@ function distributeCore(input: DistributorInput): DistributionResult {
   const contentMax = rq?.contentChaptersPerModule?.max ?? Infinity;
   const practiceMin = rq?.practicePerModule?.min ?? 0;
   const practiceMax = rq?.practicePerModule?.max ?? Infinity;
+  // T3 (r57): práctica EXACTA por módulo (mezcla de práctica del plan de aprendizaje). Sin ella, los límites de siempre.
+  const byModule = Array.isArray(rq?.practiceByModule) ? rq!.practiceByModule! : null;
+  const moduleIndex = new Map(design.map((m, i) => [m.id, i] as const));
+  const pMin = (m: WorkModule) => (byModule ? byModule[moduleIndex.get(m.id) as number] ?? 0 : practiceMin);
+  const pMax = (m: WorkModule) => (byModule ? byModule[moduleIndex.get(m.id) as number] ?? 0 : practiceMax);
+  const practiceTitle = (k: number, moduleTitle: string) => proposedTitle(k === 1 ? 'Práctica integradora' : byModule && k > 2 ? `Práctica de casos ${k - 1}` : 'Práctica de casos', moduleTitle);
   const appInPractice = !!rq?.applicationInPractice;
   const practiceTotalMin = rq?.practiceTotal?.min ?? 0;
   const practiceTotalMax = rq?.practiceTotal?.max ?? Infinity;
@@ -509,7 +561,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
     for (const m of design) for (const c of m.chapters) {
       if (c.proposed || c.kind !== 'content' || initialVideo.get(c.id) === c.videoEnabled) continue;
       if (changes.some((x) => x.type === 'set_video' && x.chapterId === c.id)) continue;
-      changes.push({ type: 'set_video', moduleId: m.id, chapterId: c.id, detail: c.videoEnabled ? `«${c.title}» lleva video.` : `«${c.title}» queda sin video.` });
+      const why = compOn && videoComp ? videoComp.decisions.find((d) => d.chapterId === c.id)?.reason : undefined;
+      changes.push({ type: 'set_video', moduleId: m.id, chapterId: c.id, detail: (c.videoEnabled ? `«${c.title}» lleva video.` : `«${c.title}» queda sin video.`) + (why ? ` ${why}` : '') });
     }
   };
   const result = (status: DistributionStatus, recs: string[]): DistributionResult => {
@@ -517,7 +570,9 @@ function distributeCore(input: DistributorInput): DistributionResult {
     fitActivities();
     // Review 2.ª (I5): la prioridad audiovisual se aplica sobre la lista FINAL de capítulos de contenido (con los que se
     // agregaron), igual que la verá la siguiente pasada: así aplicar el diseño es un punto fijo.
-    if (av) {
+    if (compOn) {
+      if (applyComposition()) reEval();
+    } else if (av) {
       let changed = false;
       for (const m of design) {
         const content = m.chapters.filter((c) => c.kind === 'content');
@@ -549,6 +604,12 @@ function distributeCore(input: DistributorInput): DistributionResult {
     // Re-revisión L3: los capítulos de práctica no tienen tope de aplicación; si el diseño queda por encima de la
     // proporción del enfoque, se dice explícitamente.
     const share = est.byComponent.application / est.courseEstimatedMinutes;
+    const vc = compOn ? (videoComp as VideoCompositionResult | null) : null;
+    if (vc && vc.unmet.length) recs = [...recs, ...vc.unmet];
+    if (vc && !priorityTrace.some((t) => t.startsWith('Composición por necesidad'))) {
+      priorityTrace.push(`Composición por necesidad (plan de aprendizaje): ${vc.counts.videos} de ${vc.counts.contentChapters} capítulos de contenido llevan video — ${vc.counts.byNeed} porque su tipo de aprendizaje lo necesita (demostración o modelado), ${vc.counts.optional} opcionales${vc.counts.pinned ? ` y ${vc.counts.pinned} fijados por el docente` : ''}. Presupuesto de horas: hasta ${vc.hoursBudgetVideos} videos en ${fmtH(input.targetHours)} h para los opcionales.`);
+    }
+    const decisionOf = new Map((vc ? vc.decisions : []).map((d) => [d.chapterId, d]));
     const recommendations = share > policy.maxApplicationShare + 1e-9
       ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de Aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque). Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.`]
       : recs;
@@ -575,6 +636,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         applicationMinutes: c.applicationMinutes,
         guidedPracticeMinutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null,
         guidedPracticePinned: pinnedGuided(c.id) !== undefined,
+        ...(vc && c.kind === 'content' && decisionOf.has(c.id) ? (() => { const d = decisionOf.get(c.id)!; return { videoDecision: { ruleId: d.ruleId, need: d.need, learningType: d.learningType, reason: d.reason } }; })() : {}),
         targetMinutes: estChapter.get(c.id) as number,
         generableMinutes: genChapter.get(c.id) as number,
       })),
@@ -613,6 +675,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         ...(gpMinutes > 0 ? { guidedPractices: all.filter((c) => c.guidedPracticeMinutes).length, guidedPracticeMinutes: gpMinutes } : {}),
         evaluations: modules.filter((m) => m.examEnabled).length + (snapshot.course.finalExam ? 1 : 0),
       },
+      ...(vc ? { composition: { version: VIDEO_COMPOSITION_VERSION, videos: { hoursBudgetVideos: vc.hoursBudgetVideos, counts: { ...vc.counts }, unmet: [...vc.unmet], ...(lpComp!.minVideos !== undefined ? { minVideos: lpComp!.minVideos } : {}), ...(lpComp!.maxVideos !== undefined ? { maxVideos: lpComp!.maxVideos } : {}) } } } : {}),
       hoursByComponent: Object.fromEntries(Object.entries(est.byComponent).map(([k, v]) => [k, r1(v / 60)])),
       studyTime: est,
       ...(guidedFill ? { guidedPracticeFill: guidedFill } : {}),
@@ -630,7 +693,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
     && (guidedMode !== 'none' || !c.guidedPracticeMinutes || pinnedGuided(c.id) !== undefined)));
   // LOOP 8.6C: «ya cumple» también exige cumplir los requisitos del documento que el distribuidor maneja.
   const meetsRequirements = () => design.every((m) => m.chapters.length >= minCh && m.chapters.length <= maxCh && appCount(m.chapters) >= appModuleMin && appCount(m.chapters) <= appModuleMax
-      && contentCount(m.chapters) >= contentMin && contentCount(m.chapters) <= contentMax && practiceCount(m.chapters) >= practiceMin && practiceCount(m.chapters) <= practiceMax
+      && contentCount(m.chapters) >= contentMin && contentCount(m.chapters) <= contentMax && practiceCount(m.chapters) >= pMin(m) && practiceCount(m.chapters) <= pMax(m)
       && (!appInPractice || m.chapters.every((c) => !c.applicationMinutes || c.kind === 'practice')))
     && appTotal() >= appTotalMin && appTotal() <= appTotalMax && activitiesOk();
   if (hasExisting && respectsMode && Math.abs(minutes() - target) <= tol && meetsRequirements()) {
@@ -654,17 +717,20 @@ function distributeCore(input: DistributorInput): DistributionResult {
   const filledPractice = new Set<string>();
   // LOOP 9.2 · «N capítulos de práctica por módulo» y «N capítulos de contenido por módulo»: el documento los exige aunque
   // las horas ya alcancen (antes la práctica se descartaba «porque no hacía falta para estas horas»).
-  if (practiceMin > 0 || contentMin > 0 || practiceTotalMin > 0) {
+  if (practiceMin > 0 || contentMin > 0 || practiceTotalMin > 0 || (byModule && byModule.some((n) => n > 0))) {
     for (const m of design) {
       let k = practiceCount(m.chapters);
       // Review I1: sin pasar del máximo de capítulos por módulo del documento (D1: ahí la práctica cuenta).
-      while (k < practiceMin && m.chapters.length < maxCh && !noPracticeModule(m.id)) {
+      while (k < pMin(m) && m.chapters.length < maxCh && !noPracticeModule(m.id)) {
         k++;
-        const pc: WorkChapter = { id: `proposed:practice:${m.id}:${k}`, proposed: true, kind: 'practice', title: proposedTitle(k === 1 ? 'Práctica integradora' : 'Práctica de casos', m.title),
+        const pc: WorkChapter = { id: `proposed:practice:${m.id}:${k}`, proposed: true, kind: 'practice', title: practiceTitle(k, m.title),
           objective: `Aplicar lo aprendido en «${m.title}» en una situación completa`, videoEnabled: false, activityEnabled: true, applicationMinutes: null };
         m.chapters.push(pc);
         filledPractice.add(pc.id);
-        changes.push({ type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id, detail: `Capítulo de práctica «${pc.title}» (el documento pide ${practiceMin} ${practiceMin === 1 ? 'capítulo de práctica' : 'capítulos de práctica'} por módulo).`, ...(rq?.sources.practice ? { requirementId: rq.sources.practice } : {}) });
+        const want = pMin(m);
+        changes.push({ type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id, detail: byModule
+          ? `Capítulo de práctica «${pc.title}» (la mezcla de práctica del curso pide ${want} ${want === 1 ? 'capítulo de práctica' : 'capítulos de práctica'} en este módulo).`
+          : `Capítulo de práctica «${pc.title}» (el documento pide ${practiceMin} ${practiceMin === 1 ? 'capítulo de práctica' : 'capítulos de práctica'} por módulo).`, ...(rq?.sources.practice ? { requirementId: rq.sources.practice } : {}) });
       }
       let n = m.chapters.filter((c) => c.kind === 'content' && c.proposed).length;
       while (contentCount(m.chapters) < contentMin) {
@@ -681,7 +747,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
     for (let round = 0; practiceTotal() < practiceTotalMin && round < 4; round++) {
       for (const m of design) {
         if (practiceTotal() >= practiceTotalMin) break;
-        if (m.chapters.length >= maxCh || practiceCount(m.chapters) >= practiceMax || noPracticeModule(m.id)) continue;
+        if (m.chapters.length >= maxCh || practiceCount(m.chapters) >= pMax(m) || noPracticeModule(m.id)) continue;
         const k = practiceCount(m.chapters) + 1;
         const pc: WorkChapter = { id: `proposed:practice:${m.id}:${k}`, proposed: true, kind: 'practice', title: proposedTitle(k === 1 ? 'Práctica integradora' : 'Práctica de casos', m.title),
           objective: `Aplicar lo aprendido en «${m.title}» en una situación completa`, videoEnabled: false, activityEnabled: true, applicationMinutes: null };
@@ -690,6 +756,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         changes.push({ type: 'add_practice_chapter', moduleId: m.id, chapterId: pc.id, detail: `Capítulo de práctica «${pc.title}» (el documento pide ${practiceTotalMin} ${practiceTotalMin === 1 ? 'capítulo de práctica' : 'capítulos de práctica'} en el curso).`, ...(rq?.sources.practice ? { requirementId: rq.sources.practice } : {}) });
       }
     }
+    applyComposition();
     fitActivities();
     reEval();
     if (filledPractice.size || changes.some((x) => x.requirementId)) baseHours = r1(estimateCourseStudyTime(toInput(false)).courseEstimatedMinutes / 60);
@@ -716,6 +783,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         changes.push({ type: 'add_content_chapter', moduleId: m.id, chapterId: cc.id, detail: `Capítulo de profundización «${cc.title}»${cc.videoEnabled ? ' con video' : ''}${why}.`, ...(reqId ? { requirementId: reqId } : {}) });
       }
     }
+    applyComposition();
     reEval();
     // Review L86C I2: las horas base incluyen los capítulos que exige el documento (con ellas Cursia propone la meta y
     // el botón «Diseñar para N h»; sin esto proponía una meta que el diseño exigido ya superaba).
@@ -812,7 +880,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         if (reached()) return true;
         const existing = m.chapters.filter((c) => c.kind === 'practice');
         if (existing.length < round && m.chapters.length >= maxCh) continue; // LOOP 8.6C: no pasar del máximo del documento
-        if (existing.length < round && existing.length >= practiceMax) continue; // LOOP 9.2: ni del máximo de prácticas
+        if (existing.length < round && existing.length >= pMax(m)) continue; // LOOP 9.2: ni del máximo de prácticas
         if (existing.length < round && practiceTotal() >= practiceTotalMax) continue; // ni del total de prácticas del curso
         if (existing.length < round && noPracticeModule(m.id)) continue; // el docente quitó la práctica de este módulo
         if (existing.length >= round) {
@@ -871,11 +939,12 @@ function distributeCore(input: DistributorInput): DistributionResult {
         let last = -1;
         m.chapters.forEach((c, i) => { if (c.kind === 'content') last = i; });
         m.chapters.splice(last + 1, 0, cc);
+        applyComposition(); // T3: la profundización también se decide por necesidad (clampToRoleCaps recalcula)
         clampToRoleCaps();
         trySetTier(m, cc, tiers[0]);
         changes.push({
           type: 'add_content_chapter', moduleId: m.id, chapterId: cc.id,
-          detail: `Capítulo de profundización «${cc.title}»${usesVideo ? ' con video' : ''}, actividad${review ? ', repaso' : ''}${cc.applicationMinutes ? ` y Actividad de Aplicación de ${cc.applicationMinutes} min` : ''}.`,
+          detail: `Capítulo de profundización «${cc.title}»${cc.videoEnabled ? ' con video' : ''}, actividad${review ? ', repaso' : ''}${cc.applicationMinutes ? ` y Actividad de Aplicación de ${cc.applicationMinutes} min` : ''}.`,
         });
         growApplication();
       }

@@ -26,6 +26,16 @@
  *                                          con library.json = versión del perfil; los demás siguen content-only (v1)
  *   AUDIO_DURATION                         las duraciones mostradas = las medidas de los MP3 del paquete
  *   FILES_INTEGRITY / STRUCTURE / LIBRO    blobs, inforef, secuencias, Libro Guía
+ *   T6 (r57) FILES_INTEGRITY               además: ningún blob huérfano ni con ruta mal formada; todo archivo de files.xml
+ *                                          con dueño (inforef de su actividad, o la imagen de la insignia); @@PLUGINFILE@@
+ *                                          también en el contenido de las páginas (filearea content)
+ *   T6 (r57) TOKEN_INVALID                 además: tokens del contenido de las páginas y enlaces muertos (href="#",
+ *                                          vacío, javascript:) en todo HTML visible
+ *   T6 (r57) MANIFEST_COVERAGE             cada parte de facts por capítulo (presentación con PDF+portada, video,
+ *                                          actividad con su tipo de módulo) está exactamente una vez; nada de más
+ *   T6 (r57) H5P_FILES                     además: content/content.json presente y JSON válido
+ *   T6 (r57) TEACHER_GUIDE                 Guía del docente ⇔ facts.teacherGuide: página oculta, estudiante prohibido,
+ *                                          sin nota, con el aviso y cada módulo/capítulo; nadie la enlaza
  *   LIBRO_CTA (≥ 3.13.0)                   botón «Abrir Libro Guía» a su propio recurso, pestaña nueva
  *   SECTIONS / NAVIGATION                  EV6: una sección por capítulo/evaluación, cierre al final
  *                                          (después del examen final), coursedisplay = 1 y cada
@@ -54,11 +64,13 @@ import {
 } from '../assessment';
 import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
-import { extractText, lintCleanSafe, lintResourceMentions, parseHtml } from '../../modules/visual-components';
+import { extractText, lintCleanSafe, lintInternalVocabulary, lintResourceMentions, parseHtml, stripProtectedVocabularyTexts } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
 import { APPLICATION_SOLUTION_MARKERS_RE, CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, EXAMS_TEACHER_NOTE_UNLIMITED, CourseFacts, chapterNextSteps, closingCertificateText, courseApprovalRequirements, courseApprovalTeacherNote, courseHasGrades, examOverallFeedbackBands, examsHaveUnlimitedAttempts, examsTeacherNoteFor, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
+import { PRACTICE_FILE_MIMETYPES, PRACTICE_RESOURCE_LIMITS, extensionOf } from '../../modules/course-profiles/application-delivery';
 import { courseBadgeDescription } from './course-badge';
+import { TEACHER_GUIDE_HIDDEN_NOTICE, TEACHER_GUIDE_IDNUMBER } from '../../modules/course-shell/teacher-guide-page';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
@@ -105,6 +117,12 @@ export interface MbzV3ValidationExpectations {
    * válido no se reporta como fallido.
    */
   builderVersion?: string;
+  /** T1 (r57): exenciones de dominio del vocabulario interno (del builder). Ausente = el check no aplica (paquete viejo). */
+  internalVocabularyExempt?: string[];
+  /** Review r1 (I2): fragmentos escritos por una persona (títulos, archivos de práctica, perfil): nunca se juzgan. */
+  internalVocabularyUserTexts?: string[];
+  /** Review r2 (I3): fragmentos generados que quedaron sin reparar por el límite de largo (exentos solo ellos). */
+  internalVocabularyKeptTexts?: string[];
 }
 
 /** true si `v` (x.y.z) ≥ `min`. Una versión ausente o mal formada → false. */
@@ -143,6 +161,8 @@ interface ParsedActivity {
   quiz: { attempts_number: string; completionattemptsexhausted: string; completionminattempts: string; feedbacks: Array<{ text: string; min: number; max: number }> } & Record<keyof typeof QUIZ_REVIEW_V3, string> | null;
   /** r55: solo h5pactivity — `grade` y `enabletracking` de h5pactivity.xml. */
   h5p: { grade: string; enabletracking: string } | null;
+  /** T4 (r57): solo assign — campos de assign.xml y su plugin_config (`subtype/plugin/name` → valor). */
+  assign: { grade: string; completionsubmit: string; duedate: string; alwaysshowdescription: string; teamsubmission: string; configs: Record<string, string> } | null;
 }
 
 interface ParsedFile {
@@ -358,6 +378,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
           }
         : null,
       h5p: modname === 'h5pactivity' ? { grade: tag(actXml, 'grade') ?? '', enabletracking: tag(actXml, 'enabletracking') ?? '' } : null,
+      assign: modname === 'assign'
+        ? {
+            grade: tag(actXml, 'grade') ?? '',
+            completionsubmit: tag(actXml, 'completionsubmit') ?? '',
+            duedate: tag(actXml, 'duedate') ?? '',
+            alwaysshowdescription: tag(actXml, 'alwaysshowdescription') ?? '',
+            teamsubmission: tag(actXml, 'teamsubmission') ?? '',
+            configs: Object.fromEntries(blocks(actXml, 'plugin_config').map((b) => [`${tag(b, 'subtype')}/${tag(b, 'plugin')}/${tag(b, 'name')}`, unxml(tag(b, 'value') ?? '')])),
+          }
+        : null,
     });
   }
   const byMid = new Map(acts.map((a) => [a.mid, a]));
@@ -389,6 +419,26 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       else if (f.ctx !== a.ctx) add('FILES_INTEGRITY', a.dir, `file ${id} (${f.filename}) es de otro contexto`);
     }
   }
+  // T6 (r57): integridad completa del almacén de archivos — todo blob de files/ lo declara files.xml (sin huérfanos ni
+  // rutas mal formadas), y todo archivo declarado tiene dueño: el inforef de la actividad de su contexto o, fuera de
+  // las actividades, solo la imagen de la insignia (badges/badgeimage, la juzga CERTIFICATE).
+  const declaredHashes = new Set(files.filter((f) => f.filename !== '.').map((f) => f.hash));
+  for (const n of Object.keys(zip.files)) {
+    if (!n.startsWith('files/') || zip.files[n].dir) continue;
+    const m = /^files\/([0-9a-f]{2})\/([0-9a-f]{40})$/.exec(n);
+    if (!m || m[2].slice(0, 2) !== m[1]) add('FILES_INTEGRITY', n, 'blob con ruta mal formada (se espera files/<sha1[:2]>/<sha1>)');
+    else if (!declaredHashes.has(m[2])) add('FILES_INTEGRITY', n, 'blob huérfano: ningún archivo de files.xml lo declara');
+  }
+  const actByCtx = new Map(acts.map((a) => [a.ctx, a]));
+  for (const f of files) {
+    if (f.filename === '.') continue;
+    const owner = actByCtx.get(f.ctx);
+    if (owner) {
+      if (!owner.inforefFiles.includes(f.id)) add('FILES_INTEGRITY', owner.dir, `file ${f.id} (${f.component}/${f.filearea}/${f.filename}) sin referencia en el inforef de su actividad`);
+    } else if (!(f.component === 'badges' && f.filearea === 'badgeimage')) {
+      add('FILES_INTEGRITY', `file ${f.id}`, `archivo sin dueño (contexto ${f.ctx}, ${f.component}/${f.filearea}/${f.filename})`);
+    }
+  }
 
   // ── secciones ──
   const sectionIds = new Set<number>();
@@ -418,7 +468,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const courseXml = (await text('course/course.xml')) ?? '';
   if (!/<name>coursedisplay<\/name><value>1<\/value>/.test(courseXml)) add('SECTIONS', 'course/course.xml', 'coursedisplay ≠ 1 (una sección por página)');
   const expectedSection = (idn: string): number | undefined => {
-    if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start)$/.test(idn)) return 0;
+    if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start|teacher_guide)$/.test(idn)) return 0;
     if (/^cv3:shell:(route|libro|libro_card|audiobook|route_start)$/.test(idn)) return 1;
     if (idn === 'cv3:shell:closing' || idn === 'cv3:shell:certificate_teacher') return layout.closingSection;
     if (/^cv3:final_exam(_info|_next|_explanations)?$/.test(idn)) return layout.finalExamSection ?? undefined;
@@ -579,12 +629,20 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   const viewCompletion = (a: ParsedActivity) => resolved.withoutGrades === true && a.modname === 'resource' && a.idnumber === 'cv3:shell:libro';
   // Fase 2: la página de la Actividad de Aplicación se completa por vista (seguimiento; nunca criterio del curso).
   const applicationView = (a: ParsedActivity) => a.modname === 'page' && (APPLICATION_RE.test(a.idnumber) || GUIDED_PRACTICE_RE.test(a.idnumber));
-  for (const a of acts.filter((x) => !GRADED.has(x.modname) || REVIEW_CARDS_RE.test(x.idnumber))) {
+  // T4 (r57): la Tarea de la Actividad de Aplicación la juzga APPLICATION (calificada ⇔ ítem de nota; formativa ⇔ ninguno).
+  const isAppAssign = (a: ParsedActivity) => a.modname === 'assign' && APPLICATION_RE.test(a.idnumber);
+  for (const a of acts.filter((x) => (!GRADED.has(x.modname) || REVIEW_CARDS_RE.test(x.idnumber)) && !isAppAssign(x))) {
     // r55 (R1): lo pedagógico (labels, páginas, foro, Libro, «Repaso») nunca es ítem de calificación.
     if (a.grade || a.inforefGradeItems.length) add('PEDAGOGICAL', a.dir, `${a.idnumber} (pedagógico) con ítem de calificación`);
   }
   for (const a of acts.filter((x) => !GRADED.has(x.modname))) {
-    if (applicationView(a)) {
+    if (a.modname === 'assign') {
+      if (!isAppAssign(a)) add('APPLICATION', a.idnumber, 'Tarea (assign) que no es una Actividad de Aplicación');
+      // Completion al ENVIAR: completion 2 automática, sin vista ni nota como condición; completionsubmit 1.
+      else if (a.module.completion !== '2' || a.module.completionview !== '0' || a.module.completiongradeitemnumber !== '$@NULL@$' || a.assign?.completionsubmit !== '1') {
+        add('APPLICATION', a.dir, `Tarea con completion ${a.module.completion}/${a.module.completionview}/${a.module.completiongradeitemnumber}/submit ${a.assign?.completionsubmit} ≠ 2/0/NULL/1 (al enviar)`);
+      }
+    } else if (applicationView(a)) {
       if (a.module.completion !== '2' || a.module.completionview !== '1') add('APPLICATION', a.dir, `Actividad de Aplicación con completion ${a.module.completion}/${a.module.completionview} ≠ 2/1`);
     } else if (viewCompletion(a)) {
       if (a.module.completion !== '2' || a.module.completionview !== '1') {
@@ -608,6 +666,77 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (/calificab|nota de esta actividad/i.test(a.intro) || /calificab/i.test(a.name)) add('ADDON', a.dir, '«Repaso» presentado como calificable');
   }
   if (reviewActs.length !== (facts.counts.reviewCards ?? 0)) add('ADDON', 'review_cards', `${reviewActs.length} «Repaso» en el paquete ≠ facts ${facts.counts.reviewCards ?? 0}`);
+  // ── T4 (r57): Tarea de la Actividad de Aplicación (mod_assign) ──
+  // calificada ⇔ ítem de nota en la categoría de la entrega (grademax = nota máxima, gradepass = la de referencia), grade de
+  // la tarea = nota máxima y, con rúbrica, grading.xml con la rúbrica LISTA; formativa ⇔ sin ítem de nota, grade 0 y sin
+  // grading.xml. Entrega = la configuración resuelta del perfil (tipos, archivos, tamaño, formatos, fecha límite) con
+  // comentarios de retroalimentación; envío = completion. El solucionario sigue oculto (regla de abajo).
+  const courseStart = num(tag(courseXml, 'startdate'));
+  const checkAssign = async (a: ParsedActivity, ch: CourseFacts['chapters'][number], intro: string): Promise<void> => {
+    const d = resolved.application;
+    const fd = facts.assessment.application;
+    if (!d || !fd) {
+      add('APPLICATION', a.idnumber, 'Tarea de entrega sin entrega resuelta en el perfil / facts');
+      return;
+    }
+    const graded = ch.applicationDelivery?.graded === true;
+    if (graded !== d.graded || graded !== fd.graded) add('APPLICATION', a.idnumber, `calificación de la Tarea incoherente (facts ${graded}, perfil ${d.graded})`);
+    const x = a.assign;
+    if (!x) return;
+    const gx = (await text(`${a.dir}/grading.xml`)) ?? '';
+    if (d.graded) {
+      if (!a.grade) add('APPLICATION', a.idnumber, 'Tarea calificada sin ítem de nota (grades.xml)');
+      else {
+        if (num(a.grade.grademax) !== d.maxGrade || num(a.grade.grademin) !== 0) add('APPLICATION', a.dir, `grademax/min ${a.grade.grademax}/${a.grade.grademin} ≠ ${d.maxGrade}/0`);
+        if (num(a.grade.gradepass) !== d.gradepass) add('APPLICATION', a.dir, `gradepass ${a.grade.gradepass} ≠ ${d.gradepass}`);
+        if (a.grade.itemmodule !== 'assign') add('APPLICATION', a.dir, `itemmodule ${a.grade.itemmodule} ≠ assign`);
+        const catId = catIdByKey.get(d.category as AssessmentCategoryKey);
+        if (catId === undefined) add('CATEGORIES', a.dir, `la categoría ${d.category} de la Tarea calificada no está en el libro de calificaciones`);
+        else if (num(a.grade.categoryid) !== catId) add('CATEGORIES', a.dir, `categoryid ${a.grade.categoryid} ≠ categoría ${d.category}`);
+      }
+      if (num(x.grade) !== d.maxGrade) add('APPLICATION', a.dir, `grade de la Tarea ${x.grade} ≠ nota máxima ${d.maxGrade}`);
+      if (d.rubric) {
+        // (los <level> traen su propio <definition>: la definición se lee sobre el área completa, no con blocks()).
+        const area = blocks(gx, 'area')[0] ?? '';
+        const def = area;
+        const crit = blocks(area, 'criterion');
+        const okArea = tag(area, 'areaname') === 'submissions' && tag(area, 'activemethod') === 'rubric' && tag(def, 'method') === 'rubric' && tag(def, 'status') === '20';
+        if (!okArea) add('RUBRIC', a.idnumber, 'falta la rúbrica LISTA (grading.xml: área submissions, método rubric, status 20)');
+        else if (!crit.length) add('RUBRIC', a.idnumber, 'la rúbrica no tiene criterios');
+        else {
+          let maxSum = 0;
+          for (const c of crit) {
+            const scores = blocks(c, 'level').map((l) => num(tag(l, 'score')));
+            if (scores.length < 2 || new Set(scores).size !== scores.length || scores.some((v) => !(v >= 0))) add('RUBRIC', a.idnumber, `criterio «${unxml(tag(c, 'description') ?? '').slice(0, 40)}» con niveles inválidos`);
+            maxSum += Math.max(...scores, 0);
+          }
+          if (!(maxSum > 0)) add('RUBRIC', a.idnumber, 'la rúbrica no suma puntos');
+          if (/alwaysshowdefinition"\s*:\s*1/.test(unxml(tag(def, 'options') ?? ''))) add('RUBRIC', a.idnumber, 'la rúbrica (con la guía del solucionario) se muestra antes de calificar');
+        }
+      } else if (gx) add('RUBRIC', a.idnumber, 'grading.xml sin rúbrica pedida');
+    } else {
+      if (a.grade || a.inforefGradeItems.length) add('APPLICATION', a.idnumber, 'Tarea formativa con ítem de nota');
+      if (num(x.grade) !== 0) add('APPLICATION', a.dir, `Tarea formativa con grade ${x.grade} (se espera 0)`);
+      if (gx) add('RUBRIC', a.idnumber, 'Tarea formativa con calificación avanzada (grading.xml)');
+    }
+    const cfg = x.configs;
+    const want: Record<string, string> = {
+      'assignsubmission/onlinetext/enabled': d.submission.onlineText ? '1' : '0',
+      'assignsubmission/file/enabled': d.submission.file ? '1' : '0',
+      'assignsubmission/file/maxfilesubmissions': String(d.submission.maxFiles),
+      'assignsubmission/file/maxsubmissionsizebytes': String(d.submission.maxBytes),
+      'assignsubmission/file/filetypeslist': d.submission.fileTypes.join(','),
+      'assignfeedback/comments/enabled': '1',
+    };
+    for (const [k, v] of Object.entries(want)) if (cfg[k] !== v) add('SUBMISSION', a.idnumber, `${k} = ${JSON.stringify(cfg[k])} ≠ ${JSON.stringify(v)}`);
+    if (cfg['assignsubmission/onlinetext/enabled'] !== '1' && cfg['assignsubmission/file/enabled'] !== '1') add('SUBMISSION', a.idnumber, 'la Tarea no admite ningún tipo de entrega');
+    const due = d.dueOffsetDays === null ? 0 : courseStart + d.dueOffsetDays * 86400;
+    if (num(x.duedate) !== due) add('SUBMISSION', a.idnumber, `duedate ${x.duedate} ≠ ${due} (${d.dueOffsetDays === null ? 'sin fecha' : `inicio + ${d.dueOffsetDays} días`})`);
+    if (x.alwaysshowdescription !== '1') add('SUBMISSION', a.idnumber, 'la descripción (la actividad) debe verse siempre');
+    if (x.teamsubmission !== '0') add('SUBMISSION', a.idnumber, 'entrega en grupo no configurada por el perfil');
+    if (!/Cómo entregar/.test(extractText(intro))) add('SUBMISSION', a.idnumber, 'la Tarea no explica cómo entregar');
+  };
+
   // Fase 2: Actividades de Aplicación — por capítulo con applicationMinutes, EXACTAMENTE una página visible del
   // estudiante (sin respuestas, con su PDF) y un solucionario oculto (visible=0, con su PDF); en ningún otro capítulo.
   for (const ch of facts.chapters) {
@@ -619,13 +748,25 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       continue;
     }
     if (!want) continue;
+    // T4 (r57): con entrega como Tarea, la actividad del estudiante es un mod_assign (su descripción = la página).
+    const asAssign = ch.applicationDelivery?.mode === 'assign';
     for (const [a, hidden] of [[st[0], false], [so[0], true]] as const) {
-      if (a.modname !== 'page') add('APPLICATION', a.idnumber, `debe ser una página (mod_page), es ${a.modname}`);
-      if (a.grade || a.inforefGradeItems.length) add('APPLICATION', a.idnumber, 'con ítem de calificación');
+      const wantMod = !hidden && asAssign ? 'assign' : 'page';
+      if (a.modname !== wantMod) add('APPLICATION', a.idnumber, wantMod === 'assign' ? `facts declara entrega como Tarea (mod_assign), es ${a.modname}` : `debe ser una página (mod_page), es ${a.modname}`);
+      if (wantMod === 'page' && (a.grade || a.inforefGradeItems.length)) add('APPLICATION', a.idnumber, 'con ítem de calificación');
       if ((a.module.visible === '0') !== hidden) add('APPLICATION', a.idnumber, hidden ? 'el solucionario docente debe estar oculto (visible=0)' : 'la página del estudiante debe estar visible');
-      const pdfs = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_page' && f.filearea === 'content' && /\.pdf$/i.test(f.filename));
+      const isAssign = a.modname === 'assign';
+      const pdfs = files.filter((f) => f.ctx === a.ctx && f.component === (isAssign ? 'mod_assign' : 'mod_page') && f.filearea === (isAssign ? 'intro' : 'content') && /\.pdf$/i.test(f.filename));
       if (pdfs.length !== 1) add('APPLICATION', a.idnumber, `${pdfs.length} PDF adjunto(s) (se espera 1)`);
-      const content = unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '');
+      const content = isAssign ? a.intro : unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '');
+      if (isAssign && !hidden) await checkAssign(a, ch, content);
+      // T5 (r57): la actividad enlaza cada archivo de trabajo «de la Actividad de Aplicación» (a su recurso del capítulo).
+      if (!hidden) {
+        for (const r of (ch.resources ?? []).filter((x) => x.relation === 'application')) {
+          const res = acts.find((x) => x.idnumber === `cv3:ch:${ch.id}:resource:${r.id}`);
+          if (res && !content.includes(`$@RESOURCEVIEWBYID*${res.mid}@$`)) add('PRACTICE_RESOURCE', a.idnumber, `la Actividad de Aplicación no enlaza su archivo de trabajo ${r.id}`);
+        }
+      }
       if (pdfs.length === 1 && !content.includes(`@@PLUGINFILE@@/${pdfs[0].filename}`)) add('APPLICATION', a.idnumber, 'la página no enlaza su PDF');
       const lint = lintCleanSafe(content);
       if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
@@ -652,6 +793,68 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       }
     }
   }
+  // ── T6 (r57): «Guía del docente» — existe ⇔ facts.teacherGuide; página OCULTA (visible=0 y visibleold=0) con el
+  // estudiante PROHIBIDO (mod/page:view −1000 en la actividad, rol en inforef y roles.xml), sin nota ni completion,
+  // con el aviso fijo, cada módulo y capítulo de facts nombrado, y nadie la enlaza.
+  {
+    const guides = acts.filter((a) => a.idnumber === TEACHER_GUIDE_IDNUMBER);
+    if (guides.length !== (facts.teacherGuide === true ? 1 : 0)) add('TEACHER_GUIDE', TEACHER_GUIDE_IDNUMBER, `${guides.length} Guía(s) del docente (facts ${facts.teacherGuide === true ? 'la pide' : 'no la pide'})`);
+    const g = guides[0];
+    if (g) {
+      if (g.modname !== 'page') add('TEACHER_GUIDE', g.idnumber, `debe ser una página (mod_page), es ${g.modname}`);
+      if (g.module.visible !== '0' || g.module.visibleold !== '0') add('TEACHER_GUIDE', g.idnumber, 'la Guía del docente debe estar oculta (visible=0, visibleold=0)');
+      if (g.grade || g.inforefGradeItems.length || g.module.completion !== '0') add('TEACHER_GUIDE', g.idnumber, 'la Guía del docente no lleva nota ni completion');
+      const rx = (await text(`${g.dir}/roles.xml`)) ?? '';
+      const prohibits = (rx.match(/<override\b[\s\S]*?<\/override>/g) ?? []).some((o) => tag(o, 'roleid') === '5' && tag(o, 'capability') === 'mod/page:view' && tag(o, 'permission') === '-1000');
+      if (!prohibits) add('TEACHER_GUIDE', g.idnumber, 'la Guía del docente no prohíbe mod/page:view al rol estudiante');
+      const inf = (await text(`${g.dir}/inforef.xml`)) ?? '';
+      if (!/<roleref>[\s\S]*<role><id>5<\/id><\/role>[\s\S]*<\/roleref>/.test(inf)) add('TEACHER_GUIDE', g.idnumber, 'inforef sin el rol estudiante (el override no se restauraría)');
+      if (!/<role id="5">[\s\S]*<archetype>student<\/archetype>/.test(rootRoles)) add('TEACHER_GUIDE', 'roles.xml', 'roles.xml raíz no define el rol estudiante del override');
+      const content = unxml(tag((await text(`${g.dir}/page.xml`)) ?? '', 'content') ?? '');
+      const txt = extractText(content);
+      if (!txt.includes(TEACHER_GUIDE_HIDDEN_NOTICE)) add('TEACHER_GUIDE', g.idnumber, 'sin el aviso de página oculta para docentes');
+      for (const m of facts.modules) if (!txt.includes(`Módulo ${m.number}: ${m.title}`)) add('TEACHER_GUIDE', g.idnumber, `no nombra el módulo ${m.number}`);
+      for (const ch of facts.chapters) if (!txt.includes(`Capítulo ${ch.number}: ${ch.title}`)) add('TEACHER_GUIDE', g.idnumber, `no nombra el capítulo ${ch.number}`);
+      const lint = lintCleanSafe(content);
+      if (!lint.ok) add('CLEAN_SAFE', g.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
+      if (/<(style|script)\b/i.test(content)) add('TEACHER_GUIDE', g.idnumber, 'la página lleva <style>/<script>');
+      for (const other of acts) {
+        if (other === g) continue;
+        const body = `${other.intro}\n${other.modname === 'page' ? unxml(tag((await text(`${other.dir}/page.xml`)) ?? '', 'content') ?? '') : ''}`;
+        if (body.includes(`VIEWBYID*${g.mid}@$`)) add('TEACHER_GUIDE', other.idnumber, 'enlaza a la Guía del docente (es solo para docentes)');
+      }
+    }
+  }
+  // ── T5 (r57): archivos de trabajo — por recurso de facts, EXACTAMENTE un mod_resource visible del capítulo, sin nota, con
+  // UN archivo (nombre, tipo permitido, tamaño y sha256 = facts) y ninguno fuera de facts. El enlace desde la AA lo verifica
+  // APPLICATION (arriba).
+  const RESOURCE_RE = /^cv3:ch:([^:]+):resource:([a-z0-9-]+)$/;
+  const factsResources = new Map<string, NonNullable<CourseFacts["chapters"][number]["resources"]>[number]>(facts.chapters.flatMap((ch) => (ch.resources ?? []).map((r) => [`cv3:ch:${ch.id}:resource:${r.id}`, r] as [string, typeof r])));
+  for (const a of acts.filter((x) => RESOURCE_RE.test(x.idnumber))) {
+    const r = factsResources.get(a.idnumber);
+    if (!r) {
+      add('PRACTICE_RESOURCE', a.idnumber, 'archivo de trabajo que facts no declara');
+      continue;
+    }
+    if (a.modname !== 'resource') add('PRACTICE_RESOURCE', a.idnumber, `debe ser un recurso (mod_resource), es ${a.modname}`);
+    if (a.module.visible !== '1') add('PRACTICE_RESOURCE', a.idnumber, 'el archivo de trabajo debe estar visible');
+    if (a.grade || a.inforefGradeItems.length) add('PRACTICE_RESOURCE', a.idnumber, 'con ítem de calificación');
+    const fs2 = files.filter((f) => f.ctx === a.ctx && f.component === 'mod_resource' && f.filearea === 'content' && f.filename !== '.');
+    if (fs2.length !== 1) {
+      add('PRACTICE_RESOURCE', a.idnumber, `${fs2.length} archivo(s) en el recurso (se espera 1)`);
+      continue;
+    }
+    const f = fs2[0];
+    if (f.filename !== r.filename) add('PRACTICE_RESOURCE', a.idnumber, `archivo ${f.filename} ≠ facts ${r.filename}`);
+    const ext = extensionOf(f.filename);
+    if (!(ext in PRACTICE_FILE_MIMETYPES) || f.mimetype !== PRACTICE_FILE_MIMETYPES[ext] || f.mimetype !== r.mimetype) add('PRACTICE_RESOURCE', a.idnumber, `tipo ${f.mimetype} (${ext}) fuera de la lista permitida o ≠ facts ${r.mimetype}`);
+    if (f.size !== r.bytes || f.size > PRACTICE_RESOURCE_LIMITS.fileBytesMax) add('PRACTICE_RESOURCE', a.idnumber, `tamaño ${f.size} ≠ facts ${r.bytes} o mayor que ${PRACTICE_RESOURCE_LIMITS.fileBytesMax}`);
+    const blob = await bin(`files/${f.hash.slice(0, 2)}/${f.hash}`);
+    if (!blob || createHash('sha256').update(blob).digest('hex') !== r.sha256) add('PRACTICE_RESOURCE', a.idnumber, 'el archivo del paquete no es el registrado (sha256)');
+    if (!a.inforefFiles.includes(f.id)) add('PRACTICE_RESOURCE', a.idnumber, 'inforef del recurso no referencia su archivo');
+  }
+  for (const idn of factsResources.keys()) if (!acts.some((a) => a.idnumber === idn)) add('PRACTICE_RESOURCE', idn, 'archivo de trabajo de facts ausente en el paquete');
+
   // Loop 9 B: práctica guiada — por capítulo con guidedPracticeMinutes (facts), EXACTAMENTE una página visible, sin nota ni
   // archivos, con cada ejercicio y su respuesta modelo; en ningún otro capítulo (ni en los de práctica).
   for (const ch of facts.chapters) {
@@ -697,7 +900,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   for (const c of crit.filter((x) => x.type !== 4 && x.type !== 6)) add('COURSE_COMPLETION', 'completion.xml', `criterio de tipo ${c.type} no permitido`);
   const aggr = blocks(comp, 'course_completion_aggr_methd').map((b) => ({ ct: tag(b, 'criteriatype'), method: tag(b, 'method') }));
   if (crit.length && (aggr.length !== 1 || aggr[0].ct !== '$@NULL@$' || aggr[0].method !== '1')) add('COURSE_COMPLETION', 'completion.xml', `agregación ${JSON.stringify(aggr)} ≠ una global ALL (1)`);
-  const graded = gradedActs.length > 0;
+  // T4 (r57): una Tarea calificada también hace que el curso tenga nota.
+  const gradedAssigns = acts.filter((a) => a.modname === 'assign' && !!a.grade);
+  if (resolved.withoutGrades === true && gradedAssigns.length > 0) add('STRUCTURE', 'graded', `curso sin nota con ${gradedAssigns.length} Tarea(s) calificada(s)`);
+  if (gradedAssigns.length !== (facts.counts.applicationAssignsGraded ?? 0)) add('STRUCTURE', 'graded', `Tareas calificadas ${gradedAssigns.length} ≠ facts ${facts.counts.applicationAssignsGraded ?? 0}`);
+  if (acts.filter((a) => a.modname === 'assign').length !== (facts.counts.applicationAssigns ?? 0)) add('STRUCTURE', 'assign', `Tareas ${acts.filter((a) => a.modname === 'assign').length} ≠ facts ${facts.counts.applicationAssigns ?? 0}`);
+  const graded = gradedActs.length + gradedAssigns.length > 0;
   if (graded) {
     if (resolved.withoutGrades === true) add('COURSE_COMPLETION', 'completion.xml', 'curso con ítems calificables resuelto como sin nota');
     // CRITERIA_ACTIVITY: aprobar/completar actividades nunca aprueba el curso, y una actividad bajo su mínimo no lo bloquea.
@@ -730,6 +938,8 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (APPLICATION_SOLUTION_RE.test(a.idnumber)) continue;
       // r55 (R6): «Respuestas explicadas» de un quiz con intentos ilimitados va oculta (lo verifica EXPLANATIONS_GATE).
       if (a.modname === 'page' && /^cv3:(exam_explanations:|final_exam_explanations$)/.test(a.idnumber)) continue;
+      // T6 (r57): la Guía del docente va oculta (la verifica TEACHER_GUIDE).
+      if (a.modname === 'page' && a.idnumber === TEACHER_GUIDE_IDNUMBER) continue;
       if (a.idnumber !== allowed) add('CERTIFICATE', a.idnumber, `módulo oculto inesperado (visible=${a.module.visible}): solo el label para docentes del certificado (o, sin él, el de las evaluaciones) puede estarlo`);
     }
   };
@@ -937,6 +1147,54 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       }
     }
   }
+  // T1 (r57): vocabulario interno del generador («worked_example», «texto fuente», «[S12]»…) en NINGÚN texto visible
+  // (labels, páginas del estudiante y del docente, descripciones). Solo paquetes cuyas expectativas traen las
+  // exenciones del dominio (builder con la reparación determinística); las expectativas viejas no se re-juzgan.
+  if (Array.isArray(exp.internalVocabularyExempt)) {
+    for (const a of acts) {
+      if (!['label', 'page', 'resource', 'h5pactivity', 'quiz', 'forum', 'assign'].includes(a.modname)) continue;
+      const body = a.modname === 'page' ? unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '') : '';
+      // Review r1 (I2): solo el texto GENERADO se juzga: lo que escribió una persona se quita antes. Review r2: los dos
+      // lados en la misma vista normalizada (sin `**`, invisibles, guiones suaves); el nombre puede venir recortado con
+      // «…»; y lo que quedó sin reparar por el límite de largo se exenta por fragmento (I3).
+      const prot = [...(exp.internalVocabularyUserTexts ?? []), ...(exp.internalVocabularyKeptTexts ?? [])];
+      const visible = [
+        stripProtectedVocabularyTexts(a.name, prot, { truncatedTail: true }),
+        stripProtectedVocabularyTexts(extractText(a.intro), prot),
+        body ? stripProtectedVocabularyTexts(extractText(body), prot) : '',
+      ].join('\n');
+      const hits = lintInternalVocabulary(visible, exp.internalVocabularyExempt);
+      if (hits.length) add('INTERNAL_VOCABULARY', a.idnumber, `texto interno del generador visible: ${[...new Set(hits.map((h) => `«${h.match}»`))].slice(0, 5).join(', ')}`);
+    }
+  }
+  // T6 (r57): cobertura del Manifest — cada parte que facts declara por capítulo está en el paquete con su tipo de
+  // módulo (nada se omite en silencio) y no hay partes de más: presentación ⇔ capítulo de contenido (con su PDF y su
+  // portada), video ⇔ video real, actividad ⇔ actividad encendida (h5pactivity | scorm según la variante).
+  for (const ch of facts.chapters) {
+    const one = (role: string) => acts.filter((a) => a.idnumber === `cv3:ch:${ch.id}:${role}`);
+    const expectPart = (role: string, want: boolean, modname: string | null) => {
+      const got = one(role);
+      if (got.length !== (want ? 1 : 0)) add('MANIFEST_COVERAGE', `cv3:ch:${ch.id}:${role}`, `capítulo ${ch.number}: ${got.length} módulo(s) ${role}, facts ${want ? 'lo declara' : 'no lo declara'}`);
+      else if (want && modname && got[0].modname !== modname) add('MANIFEST_COVERAGE', got[0].idnumber, `capítulo ${ch.number}: ${role} es ${got[0].modname}, se esperaba ${modname}`);
+      return got[0];
+    };
+    const pres = expectPart('presentation', ch.kind !== 'practice', 'label');
+    if (pres && ch.kind !== 'practice') {
+      const mine = files.filter((f) => f.ctx === pres.ctx && f.component === 'mod_label' && f.filearea === 'intro' && f.filename !== '.');
+      const pdf = mine.find((f) => /\.pdf$/i.test(f.filename));
+      if (!pdf || !mine.some((f) => /\.png$/i.test(f.filename))) add('MANIFEST_COVERAGE', pres.idnumber, `capítulo ${ch.number}: la presentación no lleva su PDF y su portada`);
+      else {
+        const b = await bin(`files/${pdf.hash.slice(0, 2)}/${pdf.hash}`);
+        if (!b || b.subarray(0, 5).toString('latin1') !== '%PDF-') add('MANIFEST_COVERAGE', pres.idnumber, `capítulo ${ch.number}: el PDF de la presentación no es un PDF`);
+      }
+    }
+    expectPart('video', ch.videoEnabled, 'h5pactivity');
+    expectPart('activity', ch.activityEnabled, ch.activityVariant === 'scorm' ? 'scorm' : ch.activityVariant === 'h5p' ? 'h5pactivity' : null);
+  }
+  for (const a of acts) {
+    const m = /^cv3:ch:([^:]+):/.exec(a.idnumber);
+    if (m && !chapterById.has(m[1])) add('MANIFEST_COVERAGE', a.idnumber, 'módulo de un capítulo que no está en facts');
+  }
   // EV6 T5: video pendiente = sin actividad de video; el aviso existe si y solo si facts lo pide.
   for (const ch of facts.chapters) {
     const hasVideo = acts.some((a) => a.idnumber === `cv3:ch:${ch.id}:video`);
@@ -944,29 +1202,41 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     if (ch.videoPending === true && hasVideo) add('STRUCTURE', `cv3:ch:${ch.id}:video`, 'video pendiente (vista previa) empaquetado como actividad');
     if (hasNotice !== (ch.videoPendingNotice === true)) add('STRUCTURE', `cv3:ch:${ch.id}:video_pending`, `aviso de video pendiente ${hasNotice ? 'sin' : 'faltante con'} video pendiente mencionado`);
   }
+  // T6 (r57): los tokens, @@PLUGINFILE@@ y enlaces se revisan en TODO HTML visible del paquete: el intro de cada
+  // actividad y el contenido de cada página (mod_page/content), cada uno contra SU filearea.
+  const pageContent = new Map<number, string>();
+  for (const a of acts.filter((x) => x.modname === 'page')) pageContent.set(a.mid, unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? ''));
   for (const a of acts) {
-    if (`${a.intro}`.includes('cursia-cta://')) add('TOKEN_INVALID', a.idnumber, 'botón de navegación con marcador cursia-cta sin resolver');
-    for (const m of `${a.intro}`.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
-      // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
-      if (m[1] === 'COURSESECTIONBYID') {
-        if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a una sección del paquete`);
-        continue;
+    const comp = a.modname === 'label' ? 'mod_label' : `mod_${a.modname}`;
+    const surfaces: Array<{ html: string; filearea: string; where: string }> = [{ html: `${a.intro}`, filearea: 'intro', where: a.idnumber }];
+    if (pageContent.has(a.mid)) surfaces.push({ html: pageContent.get(a.mid) as string, filearea: 'content', where: `${a.idnumber}#content` });
+    for (const s of surfaces) {
+      if (s.html.includes('cursia-cta://')) add('TOKEN_INVALID', s.where, 'botón de navegación con marcador cursia-cta sin resolver');
+      for (const m of s.html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
+        // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
+        if (m[1] === 'COURSESECTIONBYID') {
+          if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a una sección del paquete`);
+          continue;
+        }
+        // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
+        if (m[1] === 'BADGESVIEWBYID') {
+          if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
+          continue;
+        }
+        const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
+        const target = m[2] ? byMid.get(Number(m[2])) : undefined;
+        if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);
       }
-      // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
-      if (m[1] === 'BADGESVIEWBYID') {
-        if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
-        continue;
+      // T6 (r57): un enlace muerto (href="#", vacío o javascript:) es un token saneado o inventado: nunca se entrega.
+      for (const m of s.html.matchAll(/\bhref\s*=\s*(["'])\s*(#?|javascript:[^"']*)\s*\1/gi)) {
+        add('TOKEN_INVALID', s.where, `enlace muerto href=${m[1]}${m[2]}${m[1]} (un destino del paquete que no resolvió)`);
       }
-      const kind = /^(.+)VIEWBYID$/.exec(m[1])?.[1]?.toLowerCase();
-      const target = m[2] ? byMid.get(Number(m[2])) : undefined;
-      if (!kind || !target || target.modname !== kind) add('TOKEN_INVALID', a.idnumber, `token ${m[0]} no resuelve a un ${kind ?? '?'} del paquete`);
-    }
-    for (const m of a.intro.matchAll(/@@PLUGINFILE@@\/([^"'?&<>\s]+)/g)) {
-      const name = decodeURIComponent(m[1]);
-      if (name.startsWith('..')) continue; // ruta del embed.php (se resuelve a wwwroot)
-      const comp = a.modname === 'label' ? 'mod_label' : `mod_${a.modname}`;
-      if (!files.some((f) => f.ctx === a.ctx && f.component === comp && f.filearea === 'intro' && f.filename === name)) {
-        add('FILES_INTEGRITY', a.idnumber, `@@PLUGINFILE@@/${name} sin archivo en su filearea intro`);
+      for (const m of s.html.matchAll(/@@PLUGINFILE@@\/([^"'?&<>\s]+)/g)) {
+        const name = decodeURIComponent(m[1]);
+        if (name.startsWith('..')) continue; // ruta del embed.php (se resuelve a wwwroot)
+        if (!files.some((f) => f.ctx === a.ctx && f.component === comp && f.filearea === s.filearea && f.filename === name)) {
+          add('FILES_INTEGRITY', s.where, `@@PLUGINFILE@@/${name} sin archivo en su filearea ${s.filearea}`);
+        }
       }
     }
   }
@@ -1048,6 +1318,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
         continue;
       }
       const hj = JSON.parse(await hjFile.async('string'));
+      // T6 (r57): un .h5p sin content/content.json (o ilegible) se restaura vacío.
+      const cj = hz.file('content/content.json');
+      if (!cj) add('H5P_FILES', a.idnumber, 'el paquete no tiene content/content.json');
+      else {
+        try {
+          JSON.parse(await cj.async('string'));
+        } catch {
+          add('H5P_FILES', a.idnumber, 'content/content.json no es JSON válido');
+        }
+      }
       const tops = [...new Set(extra.map((n) => n.split('/')[0]))].sort();
       if (extra.length) add('H5P_LIBRARIES', a.idnumber, `el paquete no es content-only: ${tops.slice(0, 5).join(', ')} (las librerías vienen del pack del sitio)`);
       // Clausura: toda dependencia (preloaded/dynamic/editor) de un library.json incluido debe venir incluida.

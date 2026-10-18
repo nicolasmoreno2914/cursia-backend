@@ -61,7 +61,12 @@ export type ChapterSlot =
   /** Fase 2: Actividad de Aplicación (página del estudiante + solucionario docente oculto); solo con applicationMinutes. */
   | { kind: 'application' }
   /** Loop 9 B: página «Ejercicios guiados — <capítulo>» (visible), después de la síntesis (fin del estudio del capítulo); solo con guidedPracticeMinutes. */
-  | { kind: 'guided_practice' };
+  | { kind: 'guided_practice' }
+  /**
+   * T5 (r57): archivo de trabajo (mod_resource). Los de la Actividad de Aplicación van entre su instrucción y la actividad
+   * (la actividad los enlaza); los del capítulo, antes del cierre.
+   */
+  | { kind: 'practice_resource'; resourceId: string };
 
 export type ChapterLabelRole =
   | 'opening'
@@ -95,7 +100,7 @@ export interface AssembleChapterInput {
 }
 
 /** Secuencia de slots (solo `kind`/`role`) — útil para tests y para R12. */
-export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean; application?: boolean; guidedPractice?: boolean }): string[] {
+export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnabled: boolean; videoPendingNotice?: boolean; reviewCards?: boolean; practice?: boolean; application?: boolean; guidedPractice?: boolean; applicationResources?: number; chapterResources?: number }): string[] {
   // Motor de carga horaria: el capítulo de práctica no tiene presentación (ni video: lo valida el Blueprint).
   const seq = flags.practice ? ['label:opening', 'label:deepening'] : ['label:opening', 'presentation', 'label:deepening'];
   if (flags.videoEnabled) seq.push('label:video_primer', 'video_h5p');
@@ -107,7 +112,9 @@ export function chapterSlotSequence(flags: { videoEnabled: boolean; activityEnab
   else seq.push('label:self_check');
   if (flags.reviewCards) seq.push('review_cards');
   // Fase 2: Actividad de Aplicación = instrucción + página del estudiante + solucionario docente (oculto).
-  if (flags.application) seq.push('label:application_instruction', 'application', 'application_solution');
+  // T5 (r57): archivos de trabajo de la AA entre su instrucción y la actividad; los del capítulo, antes del cierre.
+  if (flags.application) seq.push('label:application_instruction', ...Array(flags.applicationResources ?? 0).fill('practice_resource'), 'application', 'application_solution');
+  for (let i = 0; i < (flags.chapterResources ?? 0); i++) seq.push('practice_resource');
   seq.push('label:closing');
   return seq;
 }
@@ -182,6 +189,16 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   });
   const s = bgSurf(h);
   const alt = s;
+  // T2 (r57): rótulo de la fase del marco instruccional en cada bloque (solo con ch.phaseLabels; sin él, bytes de siempre).
+  const phases = ch.phaseLabels;
+  const phaseChip = (slot: string, surf: { bg: string; fg: string } = s): string => {
+    const t = phases ? (phases as Record<string, string | undefined>)[slot] : undefined;
+    return t ? `<div class="cvc-phase">${chipH(h, 'proceso', t, mt, surf)}</div>` : '';
+  };
+  const withPhase = (slot: string, html: string): string => {
+    const chip = phaseChip(slot);
+    return chip ? injectIntoMovement(html, chip, '') : html;
+  };
 
   const slots: ChapterSlot[] = [];
   // [1] Apertura: identificación determinística + movimiento opening.
@@ -191,17 +208,18 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   const headsWithHero = Array.isArray(opening) && opening.length > 0 && (opening[0] as { type?: string }).type === 'hero';
   const head = headsWithHero ? '' : eyebrow(h, opener.kicker, s) + heading(h, 'h2', ch.title, s);
   const examNext = lastOfModule && mod.examEnabled;
-  slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, ch, examNext, mt))));
+  // T1 (r57): la apertura se arma AL FINAL — el recorrido «Tu recorrido en este capítulo» se deriva de
+  // la secuencia REAL de slots ensamblada (única fuente de verdad), nunca de una lista paralela de flags.
   const practice = ch.kind === 'practice';
   if (practice && (ch.videoEnabled || ch.videoPending)) shellFail(`capítulo de práctica ${ch.number} con video`);
   // [2] Presentación (obligatoria en V2.1 en los capítulos de contenido; el de práctica no tiene).
   if (!practice) slots.push({ kind: 'presentation' });
   // [3] Profundización (en la práctica: la práctica guiada).
-  slots.push(label('deepening', practice ? 'Práctica guiada' : 'Profundización', mv('deepening')));
+  slots.push(label('deepening', practice ? 'Práctica guiada' : 'Profundización', withPhase('deepening', mv('deepening'))));
   if (ch.guidedPracticeMinutes !== undefined && practice) shellFail(`capítulo de práctica ${ch.number} con ejercicios guiados`);
   // [4] Video: guía previa (plantilla + conceptos del LLM) + transición → video.
   if (ch.videoEnabled) {
-    const before = chipH(h, 'video', 'Video interactivo', mt, s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
+    const before = phaseChip('video') + chipH(h, 'video', 'Video interactivo', mt, s) + heading(h, 'h3', COPY.videoPrimerTitle, s) + pHtml(h, labelHtml(COPY.videoPrimerLead), s);
     const after = transitionBox(h, pHtml(h, labelHtml(COPY.videoGo), alt, { last: true }), mt.ink);
     slots.push(label('video_primer', 'Antes del video', injectIntoMovement(mv('video_primer'), before, after)));
     slots.push({ kind: 'video_h5p' });
@@ -214,7 +232,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     slots.push(label('video_pending', 'Video pendiente', root(h, uid('video_pending'), inner)));
   }
   // [5] Síntesis.
-  slots.push(label('synthesis', 'Síntesis', mv('synthesis')));
+  slots.push(label('synthesis', 'Síntesis', withPhase('synthesis', mv('synthesis'))));
   // Loop 9 B (fix M4): ejercicios guiados del capítulo de contenido (página visible, formativa) al terminar el estudio.
   if (ch.guidedPracticeMinutes !== undefined) slots.push({ kind: 'guided_practice' });
   // [6] Actividad (instrucción determinística con nota mínima/intentos de facts) o repaso no calificado.
@@ -229,6 +247,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
       `<span>${eduIcon(h.enh, 'repaso', mt.ink, 18)} ${labelHtml(k.attempts === 0 ? 'Intentos: sin límite' : `Intentos: ${k.attempts}`)}</span></p>`;
     const inner = box(
       h,
+      phaseChip('activity', pss) +
       chipH(h, 'practica', `Práctica calificada · Capítulo ${ch.number}`, mt, pss, true) +
         heading(h, 'h3', COPY.activityTitle, pss) +
         factsRow +
@@ -243,7 +262,7 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     slots.push(label('activity_instruction', 'Práctica', root(h, uid('activity_instruction'), inner)));
     slots.push({ kind: 'activity', variant: ch.activityVariant as 'h5p' | 'scorm' });
   } else {
-    const before = pHtml(h, labelHtml(COPY.selfCheckLead), s);
+    const before = phaseChip('self_check') + pHtml(h, labelHtml(COPY.selfCheckLead), s);
     // H2 fix round 1 (M-6): con «Repaso» (Dialog Cards) el label no repite el nombre «Repaso».
     slots.push(label('self_check', ch.reviewCards === true ? 'Comprueba lo aprendido' : 'Repaso', injectIntoMovement(mv('self_check'), before, '')));
   }
@@ -252,22 +271,34 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // Fase 2: Actividad de Aplicación (trabajo práctico con producto; sin nota en Moodle) antes del cierre.
   if (ch.applicationMinutes !== undefined) {
     const ps = surfOn(h.t, mt.soft);
+    const nAppRes = (ch.resources ?? []).filter((r) => r.relation === 'application').length;
+    const resourcesLead = nAppRes === 1 ? ' Antes de empezar, descarga el archivo de trabajo que está debajo.' : nAppRes > 1 ? ' Antes de empezar, descarga los archivos de trabajo que están debajo.' : '';
+    // T4 (r57): con entrega como Tarea, el texto dice dónde y cómo se entrega (y si cuenta en la nota final, solo si pesa).
+    const lead = ch.applicationDelivery?.mode === 'assign'
+      ? `Ejercicios graduados, un taller y un producto para entregar. Trabaja en la plataforma o en el PDF y entrega tu producto en la tarea de esta actividad; el docente la revisa con los criterios y te deja su retroalimentación.${ch.applicationDelivery.graded && applicationCountsInFinalGrade(assessment) ? ' Su nota cuenta en tu calificación final.' : ch.applicationDelivery.graded ? '' : ' Es formativa: no lleva nota.'}${resourcesLead}`
+      : `Ejercicios graduados, un taller y un producto para entregar. Puedes resolverla en la plataforma o descargarla en PDF para trabajar en papel; al final revisa tu trabajo con la autoevaluación y los criterios.${resourcesLead}`;
     const inner = box(
       h,
+      phaseChip('application', ps) +
       chipH(h, 'practica', `Actividad de Aplicación · Capítulo ${ch.number} · ~${ch.applicationMinutes} min`, mt, ps, true) +
         heading(h, 'h3', 'Aplica lo aprendido', ps) +
-        pHtml(h, labelHtml('Ejercicios graduados, un taller y un producto para entregar. Puedes resolverla en la plataforma o descargarla en PDF para trabajar en papel; al final revisa tu trabajo con la autoevaluación y los criterios.'), ps, { last: true }),
+        pHtml(h, labelHtml(lead), ps, { last: true }),
       { s: ps, border: mt.edge },
       { cls: 'cvc-application' },
     );
     slots.push(label('application_instruction', 'Actividad de Aplicación', root(h, uid('application_instruction'), inner)));
+    for (const r of ch.resources ?? []) if (r.relation === 'application') slots.push({ kind: 'practice_resource', resourceId: r.id });
     slots.push({ kind: 'application' });
   }
+  for (const r of ch.resources ?? []) if (r.relation === 'chapter') slots.push({ kind: 'practice_resource', resourceId: r.id });
   // [7] Cierre + puente (LLM, sin recursos) + transiciones determinísticas.
   // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
   // capítulo; antes de un examen de módulo o al final del curso manda la
   // transición determinística (nunca dos mensajes de navegación contradictorios).
-  let after = input.nextChapter && !examNext ? `<div class="cvc-bridge"${st(h, [['margin', '28px 0 0 0'], ['color', s.fg]])}>${paras(h, exp.bridge_to_next, s)}</div>` : '';
+  // T1 (r57): si el cierre del LLM ya dice lo mismo que el puente (otro texto con el mismo fin: «el siguiente paso es…»),
+  // el puente se omite — antes el estudiante leía dos párrafos casi iguales seguidos (curso real, cierre del cap. 6).
+  const bridgeDup = bridgeRepeatsClosing(exp.bridge_to_next, exp.movements.closing);
+  let after = input.nextChapter && !examNext && !bridgeDup ? `<div class="cvc-bridge"${st(h, [['margin', '28px 0 0 0'], ['color', s.fg]])}>${paras(h, exp.bridge_to_next, s)}</div>` : '';
   // R14-A (I5): la transición dice primero qué repasar/reintentar y después el siguiente paso,
   // sin repetir "Con este capítulo terminas…" dos veces.
   const bridgeLeadText = bridgeLead({ activityEnabled: ch.activityEnabled, activityAttempts: assessment.kinds.activity.attempts });
@@ -303,25 +334,84 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
       ctaButton(h, ctaSection(step.sectionNum), button, alt, fill),
     mt.ink,
   );
-  slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
+  slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), phaseChip('closing'), after)));
+  const route = chapterRouteSteps(slots, { practice, reviewCards: ch.reviewCards === true, examNext, ...(phases ? { phases } : {}) });
+  slots.unshift(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head + phaseChip('opening'), chapterRoute(h, route, mt))));
   return slots;
 }
 
+/** T1 (r57): proporción mínima de las palabras del puente presentes en UN bloque del cierre para considerarlo repetido. */
+export const BRIDGE_DUPLICATE_MIN_CONTAINMENT = 0.5;
+
+const contentStems = (t: string): Set<string> =>
+  new Set(
+    (String(t ?? '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .match(/[a-zñ]{4,}/g) ?? []).map((w) => w.slice(0, 5)),
+  );
+const stringsOf = (v: unknown): string[] =>
+  typeof v === 'string' ? [v] : Array.isArray(v) ? v.flatMap(stringsOf) : v && typeof v === 'object' ? Object.entries(v as Record<string, unknown>).filter(([k]) => k !== 'type').flatMap(([, x]) => stringsOf(x)) : [];
+
 /**
- * EV4b — «En este capítulo»: el recorrido del capítulo al final de la apertura, armado SOLO con los
- * flags del capítulo (nunca nombra un recurso que no existe). El estudiante sabe qué viene y en qué
- * orden, como en un curso, no como en un artículo.
+ * T1 (r57): ¿el puente (`bridge_to_next`) repite un bloque del cierre? Contención de raíces (5 letras, palabras ≥ 4)
+ * del puente en el texto de cada bloque del cierre ≥ BRIDGE_DUPLICATE_MIN_CONTAINMENT. Determinístico.
  */
-function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean, mt: Tone): string {
-  // Motor de carga horaria: el capítulo de práctica no tiene presentación; su profundización es la práctica guiada.
-  const steps: Array<[EduIcon, string]> = ch.kind === 'practice' ? [['practica', 'Práctica guiada']] : [['presentacion', 'Presentación'], ['libro', 'Profundización']];
-  // Loop 9 B: la práctica guiada del capítulo de contenido (formativa) sigue al texto.
-  if (ch.kind !== 'practice' && ch.guidedPracticeMinutes !== undefined) steps.push(['practica', 'Ejercicios guiados']);
-  if (ch.videoEnabled) steps.push(['video', 'Video interactivo']);
-  steps.push(['logro', 'Síntesis']);
-  steps.push(ch.activityEnabled ? ['practica', 'Práctica calificada'] : ['repaso', 'Repaso']);
-  if (ch.applicationMinutes !== undefined) steps.push(['logro', 'Actividad de Aplicación']);
-  if (examNext) steps.push(['examen', 'Evaluación del módulo']);
+export function bridgeRepeatsClosing(bridge: string, closing: ReadonlyArray<unknown> | undefined): boolean {
+  const b = contentStems(bridge);
+  if (b.size < 4 || !Array.isArray(closing)) return false;
+  return closing.some((c) => {
+    const t = contentStems(stringsOf(c).join(' '));
+    let n = 0;
+    for (const w of b) if (t.has(w)) n++;
+    return n / b.size >= BRIDGE_DUPLICATE_MIN_CONTAINMENT;
+  });
+}
+
+/** Paso del recorrido anunciado en la apertura (ícono + etiqueta). */
+export type ChapterRouteStep = [EduIcon, string];
+
+/**
+ * T1 (r57) — pasos de «Tu recorrido en este capítulo» DERIVADOS de los slots ensamblados, en su orden
+ * real. Antes la lista se armaba con flags en un orden propio y anunciaba «Ejercicios guiados» antes
+ * del video aunque el ensamblador los pone después de la síntesis (12/12 capítulos de un curso real).
+ * «Antes del video» se anuncia junto al video (es su guía); el aviso de video pendiente no se anuncia.
+ */
+export function chapterRouteSteps(
+  slots: ReadonlyArray<ChapterSlot>,
+  o: { practice: boolean; reviewCards: boolean; examNext: boolean; phases?: Partial<Record<string, string>> },
+): ChapterRouteStep[] {
+  const steps: ChapterRouteStep[] = [];
+  // T2 (r57): con rótulos de fase, cada paso del recorrido nombra su fase («Presentación · Teoría»).
+  const ph = o.phases;
+  const at = (slot: string, step: ChapterRouteStep): ChapterRouteStep => {
+    const t = ph?.[slot];
+    return t ? [step[0], `${step[1]} · ${t}`] : step;
+  };
+  for (const sl of slots) {
+    if (sl.kind === 'presentation') steps.push(at('presentation', ['presentacion', 'Presentación']));
+    else if (sl.kind === 'video_h5p') steps.push(at('video', ['video', 'Video interactivo']));
+    else if (sl.kind === 'guided_practice') steps.push(at('guided_practice', ['practica', 'Ejercicios guiados']));
+    else if (sl.kind === 'activity') steps.push(at('activity', ['practica', 'Práctica calificada']));
+    else if (sl.kind === 'review_cards') steps.push(at('review_cards', ['repaso', 'Repaso']));
+    else if (sl.kind === 'application') steps.push(at('application', ['logro', 'Actividad de Aplicación']));
+    // T5 (r57): los archivos de trabajo no son un paso del recorrido (se descargan dentro de la actividad o del capítulo).
+    else if (sl.kind === 'label') {
+      if (sl.role === 'deepening') steps.push(at('deepening', o.practice ? ['practica', 'Práctica guiada'] : ['libro', 'Profundización']));
+      else if (sl.role === 'synthesis') steps.push(at('synthesis', ['logro', 'Síntesis']));
+      else if (sl.role === 'self_check') steps.push(at('self_check', ['repaso', o.reviewCards ? 'Comprueba lo aprendido' : 'Repaso']));
+    }
+  }
+  if (o.examNext) steps.push(at('module_exam', ['examen', 'Evaluación del módulo']));
+  return steps;
+}
+
+/**
+ * EV4b — «En este capítulo»: el recorrido del capítulo al final de la apertura. T1 (r57): los pasos
+ * vienen de chapterRouteSteps (la secuencia real de slots), nunca nombra un recurso que no existe.
+ */
+function chapterRoute(h: Hx, steps: ChapterRouteStep[], mt: Tone): string {
   const s = bgSurf(h);
   const items = steps
     .map(([ic, x]) => `<li${st(h, [['margin', '0 0 6px 0'], ['padding', 0], ['color', s.fg], ['font-weight', '600']])}>${eduIcon(h.enh, ic, mt.ink, 20)} ${labelHtml(x)}</li>`)
@@ -409,3 +499,14 @@ export function assembleAllChapters(
   });
 }
 
+
+/**
+ * T4 (r57): ¿las Tareas calificadas pesan en la nota final? Su categoría (propia o práctica) con peso efectivo > 0.
+ * Facts sin pesos (anteriores) → sí.
+ */
+export function applicationCountsInFinalGrade(assessment: CourseFacts['assessment']): boolean {
+  const a = assessment.application;
+  if (!a || !a.graded || !a.category) return false;
+  const w = assessment.categoryWeights;
+  return !w || (w[a.category] ?? 0) > 0;
+}

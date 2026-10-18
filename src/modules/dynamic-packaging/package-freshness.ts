@@ -19,7 +19,8 @@ import { resolveRunArtifacts } from './artifact-resolver';
 import { packageReuseHash, resolveDynamicMoodleVersion, sortedArtifactIds } from './packaging-reuse-key';
 import { DYNAMIC_MBZ_BUILDER_VERSION } from '../../package/dynamic-mbz-builder';
 import { DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../../package/dynamic-mbz-builder-v3';
-import { prepareV3Package } from './packaging-v3';
+import { legacyReuseHashesV3, prepareV3Package } from './packaging-v3';
+import { autoRepackageOnBuilderBump } from './auto-package-state';
 
 export type PackageKind = 'final' | 'qa_preview' | 'degraded';
 export const PACKAGE_KINDS: readonly PackageKind[] = ['final', 'qa_preview', 'degraded'];
@@ -71,6 +72,21 @@ export interface BuildFreshness {
   stale: boolean;
   reason?: string;
   staleItemKeys?: string[];
+  /**
+   * Review r1 (I1): el paquete es VIGENTE (mismo contenido, perfil, tema y Moodle) pero se armó con un builder
+   * anterior y `DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP` está apagado: sigue «Curso listo»; solo informativo
+   * para admin (puede re-empaquetar a mano con POST …/package).
+   */
+  builderUpdateAvailable?: { packagedWith: string; current: string };
+}
+
+/**
+ * Review r1 (I1): ¿un builder distinto deja el paquete stale? Solo con el opt-in T8 (o si el job no registró
+ * versión: no se puede recomputar su clave). Si no, la clave se recalcula con el builder del paquete y, si
+ * coincide, el paquete sigue vigente con `builderUpdateAvailable`.
+ */
+function builderBumpIsStale(existingBuilderVersion: unknown): boolean {
+  return autoRepackageOnBuilderBump() || typeof existingBuilderVersion !== 'string' || existingBuilderVersion.trim() === '';
 }
 
 type Q = { query: (sql: string, params?: any[]) => Promise<any> };
@@ -105,15 +121,22 @@ export async function buildPackageFreshness(q: Q, run: any, manifest: ManifestDt
     return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintenta los items fallidos` };
   }
   const existingBuilderVersion = existing.output_summary?.builderVersion;
-  if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION) {
+  const builderBumped = existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION;
+  if (builderBumped && builderBumpIsStale(existingBuilderVersion)) {
     return { stale: true, reason: `builder_changed: el paquete se construyó con el builder ${existingBuilderVersion ?? '?'} (actual ${DYNAMIC_MBZ_BUILDER_VERSION})` };
   }
   try {
     const byItem = await resolveRunArtifacts(q, run.id, manifest.manifest);
     const ids = sortedArtifactIds(byItem);
-    // I3 (review-it2): misma clave que el worker (incluye la versión de Moodle resuelta).
-    const currentHash = packageReuseHash(DYNAMIC_MBZ_BUILDER_VERSION, ids, resolveDynamicMoodleVersion().resolved);
-    if (currentHash === existing.output_summary?.sourceIdsHash) return { stale: false };
+    // I3 (review-it2): misma clave que el worker (incluye la versión de Moodle resuelta). Review r1 (I1): con un
+    // builder anterior (opt-in apagado) se compara contra la clave de ESE builder.
+    const keyBuilder = builderBumped ? String(existingBuilderVersion) : DYNAMIC_MBZ_BUILDER_VERSION;
+    const currentHash = packageReuseHash(keyBuilder, ids, resolveDynamicMoodleVersion().resolved);
+    if (currentHash === existing.output_summary?.sourceIdsHash) {
+      return builderBumped
+        ? { stale: false, builderUpdateAvailable: { packagedWith: String(existingBuilderVersion), current: DYNAMIC_MBZ_BUILDER_VERSION } }
+        : { stale: false };
+    }
     const packaged = new Set<string>(Array.isArray(existing.output_summary?.sourceArtifactIds) ? existing.output_summary.sourceArtifactIds : []);
     const staleItemKeys = [...byItem.entries()]
       .filter(([, list]) => list.some((a) => !packaged.has(a.artifactId)))
@@ -153,12 +176,17 @@ async function buildFreshnessV3(q: Q, run: any, manifest: ManifestDto, existing:
     return { stale: true, reason: `run_not_completed: la ejecución terminó en ${run.worker_status} (p.ej. una regeneración falló); reintenta los items fallidos` };
   }
   const existingBuilderVersion = existing.output_summary?.builderVersion;
-  if (existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION_V3) {
+  const builderBumped = existingBuilderVersion !== DYNAMIC_MBZ_BUILDER_VERSION_V3;
+  if (builderBumped && builderBumpIsStale(existingBuilderVersion)) {
     return { stale: true, reason: `builder_changed: el paquete se construyó con el builder ${existingBuilderVersion ?? '?'} (actual ${DYNAMIC_MBZ_BUILDER_VERSION_V3})` };
   }
   try {
     const prepared = await prepareV3Package(q, run.id, manifest, run.course_id, resolveDynamicMoodleVersion().resolved);
-    if (prepared.sourceIdsHash === existing.output_summary?.sourceIdsHash) return { stale: false };
+    if (!builderBumped && prepared.sourceIdsHash === existing.output_summary?.sourceIdsHash) return { stale: false };
+    // Review r1 (I1): builder anterior y opt-in apagado → la clave que ESE builder habría calculado hoy.
+    if (builderBumped && legacyReuseHashesV3(prepared.reuseKey, String(existingBuilderVersion)).includes(existing.output_summary?.sourceIdsHash)) {
+      return { stale: false, builderUpdateAvailable: { packagedWith: String(existingBuilderVersion), current: DYNAMIC_MBZ_BUILDER_VERSION_V3 } };
+    }
     const packaged = new Set<string>(Array.isArray(existing.output_summary?.sourceArtifactIds) ? existing.output_summary.sourceArtifactIds : []);
     const staleItemKeys = [...prepared.byItem.entries()]
       .filter(([, it]) => it.artifacts.some((a) => !packaged.has(a.artifactId)))

@@ -122,6 +122,11 @@ export interface PackageStatusResult {
   /** Fix round 2 (M4): paquete QA/degradado nuevo pedido por un no admin → sin artifactId ni URL. */
   downloadRestricted?: boolean;
   /**
+   * Review r1 (I1), SOLO SUPER_ADMIN: el paquete vigente se armó con un builder anterior (re-empaque automático
+   * por builder apagado). Informativo: el curso sigue listo; POST …/package arma uno con el builder actual.
+   */
+  builderUpdateAvailable?: { packagedWith: string; current: string };
+  /**
    * DoD follow-up (R1): (no admin) el intento de paquete FINAL más reciente falló, así que se devuelve el
    * paquete final COMPLETADO anterior (sigue descargable; `stale`/`staleReason` dicen si ya no es el
    * vigente). Valor = worker_status del intento fallido. Ausente = se devuelve el job más reciente.
@@ -207,7 +212,7 @@ export class PackagingService {
     // bajo el lock solo se usa si el último job sigue siendo el mismo (si no, se recalcula: caso raro).
     const pre = await this.findLatestPackageJob(runId);
     const preSame = pre && packageKindOf(pre) === packageKind && pre.worker_status === RUN_DONE_STATUS
-      ? { id: pre.id, same: await this.isSameBuild(run, manifest, pre) }
+      ? { id: pre.id, same: await this.isSameBuild(run, manifest, pre, opts.auto === true) }
       : null;
     const qr = this.dataSource.createQueryRunner();
     try {
@@ -221,7 +226,7 @@ export class PackagingService {
         if (IN_PROGRESS_PACKAGE_STATUSES.includes(existing.worker_status)) {
           reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
         } else if (existing.worker_status === RUN_DONE_STATUS) {
-          const sameBuild = preSame && preSame.id === existing.id ? preSame.same : await this.isSameBuild(run, manifest, existing);
+          const sameBuild = preSame && preSame.id === existing.id ? preSame.same : await this.isSameBuild(run, manifest, existing, opts.auto === true);
           if (sameBuild) {
             reuse = { jobId: existing.id, status: existing.worker_status, created: false, packageKind, deliverable };
           } else {
@@ -263,8 +268,11 @@ export class PackagingService {
    * artifact ids de origen (recalculado en vivo vía `resolveRunArtifacts`,
    * igual que hace el worker antes de reusar un `dynamic_mbz`).
    */
-  private async isSameBuild(run: any, manifest: ManifestDto, existing: PackageJobRow): Promise<boolean> {
-    return !(await this.buildFreshness(run, manifest, existing)).stale;
+  private async isSameBuild(run: any, manifest: ManifestDto, existing: PackageJobRow, auto = false): Promise<boolean> {
+    const fresh = await this.buildFreshness(run, manifest, existing);
+    // Review r1 (I1): un paquete vigente de un builder anterior se reusa en el empaque AUTOMÁTICO (nunca se
+    // re-arma solo sin el opt-in); un pedido EXPLÍCITO (POST …/package) arma uno con el builder actual.
+    return !fresh.stale && (auto || !fresh.builderUpdateAvailable);
   }
 
   /**
@@ -352,6 +360,7 @@ export class PackagingService {
         result.staleReason = fresh.reason;
         if (fresh.staleItemKeys) result.staleItemKeys = fresh.staleItemKeys;
       }
+      if (fresh.builderUpdateAvailable && isSuperAdminEmail(actor?.email)) result.builderUpdateAvailable = fresh.builderUpdateAvailable;
       const artifactId = job.output_summary?.artifactId as string | undefined;
       // Fix round 2 (M4): un paquete QA / degradado NUEVO (declarado en el job por PackagingService) es
       // solo de SUPER_ADMIN, también para descargar. Los paquetes ya construidos antes (sin packageKind

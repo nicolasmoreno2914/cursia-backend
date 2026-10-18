@@ -36,7 +36,7 @@ export function preflightAssessmentProfile(profile: AssessmentProfile, manifest:
     const resolved = resolveAssessment(profile, {
       hasFinalExam: manifest?.features?.finalExam === true,
       activityEngine: manifest?.features?.activityEngine,
-      itemCounts: assessmentItemCountsFromManifest(manifest),
+      itemCounts: assessmentItemCountsFromManifest(manifest, profile),
     });
     return { ok: true, resolved };
   } catch (err: any) {

@@ -1022,7 +1022,15 @@ const ENV_KEYS = [
       await mk('failed', {}, 'MBZ_V3_VALIDATION_FAILED: simulado');
       const signer = { async getDownloadUrl(id) { return { url: `https://signed.invalid/${id}` }; } };
       const pk = new PackagingService(ds, manifests, signer);
-      const own = await pk.getPackageStatus(R.cid, OWNER, 1, R.runId, OWNER_NOT_ADMIN);
+      // Review r1 (I1): un re-armado por builder nuevo existe solo con el opt-in DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP
+      // (sin él, un paquete cuyo único cambio es el builder sigue vigente: check-review-r1-fixes / autopkg «review r1 I1»).
+      process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP = 'true';
+      let own;
+      try {
+        own = await pk.getPackageStatus(R.cid, OWNER, 1, R.runId, OWNER_NOT_ADMIN);
+      } finally {
+        delete process.env.DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP;
+      }
       eq([own.status, own.artifactId, own.downloadUrl, own.stale, /^builder_changed/.test(own.staleReason), own.newerAttemptFailed, own.complete, own.deliverable, own.error],
         ['completed', prevArt, `https://signed.invalid/${prevArt}`, true, true, 'failed', false, true, undefined], 'dueño: paquete anterior, no vigente');
       const adm = await pk.getPackageStatus(R.cid, OWNER, 1, R.runId, { id: OWNER, email: ADMIN.email });

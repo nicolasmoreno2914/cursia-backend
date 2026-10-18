@@ -253,11 +253,12 @@ check('P3: «¿Por qué importa?» / «¿Cómo lo aplicas?» — se muestran sol
     for (const type of ['concept_cards', 'accordion', 'tabs', 'timeline', 'process_steps', 'comparison', 'myth_reality', 'case_scenario', 'checklist', 'worked_example', 'diagram']) {
       const c = components.find((x) => x.type === type);
       const plain = vc.extractText(vc.renderComponent(c, t, { uid: 'w', level }));
-      assert(!plain.includes('Por qué importa') && !plain.includes('Cómo lo aplicas'), `${type}: sin campos no hay líneas`);
+      assert(![...vc.VC_WHY_LABELS, ...vc.VC_APPLY_LABELS].some((l) => plain.includes(`${l}:`)), `${type}: sin campos no hay líneas`);
       const html = vc.renderComponent({ ...c, why: 'Porque evita un error caro.', apply: 'Úsalo mañana en tu turno.' }, t, { uid: 'w', level });
       const txt = vc.extractText(html);
-      const iw = txt.indexOf('Por qué importa: Porque evita un error caro.');
-      const ia = txt.indexOf('Cómo lo aplicas: Úsalo mañana en tu turno.');
+      // T1 (r57): el rótulo varía de forma determinística según el uid del bloque (VC_WHY_LABELS / VC_APPLY_LABELS).
+      const iw = txt.indexOf(`${vc.VC_WHY_LABELS[vc.eduLabelVariant('w', vc.VC_WHY_LABELS.length)]}: Porque evita un error caro.`);
+      const ia = txt.indexOf(`${vc.VC_APPLY_LABELS[vc.eduLabelVariant('w', vc.VC_APPLY_LABELS.length)]}: Úsalo mañana en tu turno.`);
       assert(iw > 0 && ia > iw, `${type}/${level || 'clean'}: por qué/cómo en orden: ${txt.slice(0, 160)}`);
       // el «por qué» va después del título del bloque (si lo tiene)
       if (c.title) assert(txt.indexOf(vc.extractText(`<p>${c.title}</p>`)) < iw, `${type}: por qué después del título`);

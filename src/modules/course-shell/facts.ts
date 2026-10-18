@@ -13,6 +13,7 @@
  * Cualquier dato faltante o incoherente → throw FACTS_INVALID (nunca un
  * default inventado).
  */
+import { FrameworkSlot, defaultFrameworkRegistry, frameworkSlotLabels } from '../pedagogy/instructional-frameworks';
 import { VC_MOVEMENT_IDS, VcMovementId } from '../visual-components/schema';
 import {
   AnyBlueprintSnapshot,
@@ -31,7 +32,8 @@ import {
   validateAssessmentProfile,
 } from '../course-profiles/course-profiles';
 import { formatDurationEs, formatDurationShortEs } from '../../package/audio';
-import { AssessmentCategoryKey, normalizeCategoryWeights } from '../../package/assessment/resolve-assessment';
+import { AssessmentCategoryKey, ResolvedApplicationDelivery, normalizeCategoryWeights, resolveApplicationDelivery } from '../../package/assessment/resolve-assessment';
+import { ResolvedPracticeResource, chapterDeliveryMode } from '../course-profiles/application-delivery';
 import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 import { courseCountNumbers } from './intro-schemas';
@@ -97,6 +99,25 @@ export interface BuildCourseFactsInput {
    * no se cuenta (ni se publica): el paquete la rechaza antes; sin la clave, ninguna se cuenta.
    */
   guidedPracticeChapterIds?: readonly string[] | null;
+  /**
+   * T5 (r57): archivos de trabajo RESUELTOS (bytes medidos) de los capítulos del curso. Ausente/vacío = ninguno (facts de
+   * siempre). Un recurso de un capítulo que no está en el Manifest es un error (el builder los filtra antes, con aviso).
+   */
+  practiceResources?: readonly ResolvedPracticeResource[] | null;
+}
+
+/** T5 (r57): archivo de trabajo de un capítulo en facts (lo que el paquete publica y el validador verifica). */
+export interface ChapterResourceFacts {
+  id: string;
+  title: string;
+  instructions: string;
+  /** `application`: lo enlaza la Actividad de Aplicación del capítulo; `chapter`: material del capítulo. */
+  relation: 'application' | 'chapter';
+  filename: string;
+  mimetype: string;
+  bytes: number;
+  sha256: string;
+  origin: 'upload' | 'csv' | 'xlsx';
 }
 
 export interface ChapterFacts {
@@ -136,6 +157,18 @@ export interface ChapterFacts {
    * capítulos cuya práctica guiada tiene su documento validado en el paquete: entran al tiempo del capítulo.
    */
   guidedPracticeMinutes?: number;
+  /**
+   * T4 (r57): la Actividad de Aplicación se entrega como Tarea de Moodle (mod_assign). SOLO en capítulos con AA cuyo
+   * modo efectivo es `assign`; ausente = página de siempre. `graded` = ítem de nota en su categoría.
+   */
+  applicationDelivery?: { mode: 'assign'; graded: boolean };
+  /** T5 (r57): archivos de trabajo del capítulo (orden del perfil). Solo si hay alguno. */
+  resources?: ChapterResourceFacts[];
+  /**
+   * T2 (r57): rótulos visibles de las fases del marco instruccional por bloque del capítulo (bloque → rótulo). SOLO si
+   * el Blueprint trae plan de aprendizaje con `phaseLabels` activo; ausente = shell de siempre.
+   */
+  phaseLabels?: Partial<Record<FrameworkSlot, string>>;
   /** Diapositivas medidas de la presentación (0 en un capítulo de práctica: no tiene presentación). */
   slideCount: number;
   /**
@@ -185,6 +218,11 @@ export interface CourseFacts {
     applicationActivities?: number;
     /** Loop 9 B: capítulos con práctica guiada (solo si hay alguna). */
     guidedPractices?: number;
+    /** T4 (r57): Actividades de Aplicación entregadas como Tarea (solo si hay alguna) y cuántas califican. */
+    applicationAssigns?: number;
+    applicationAssignsGraded?: number;
+    /** T5 (r57): archivos de trabajo del curso (solo si hay alguno). */
+    practiceResources?: number;
   };
   chapters: ChapterFacts[];
   modules: ModuleFacts[];
@@ -205,6 +243,11 @@ export interface CourseFacts {
      * solo categorías con peso > 0. Opcional para leer facts anteriores (todas las categorías cuentan).
      */
     categoryWeights?: Partial<Record<AssessmentCategoryKey, number>>;
+    /**
+     * T4 (r57): entrega efectiva de las Actividades de Aplicación — SOLO si algún capítulo la entrega como Tarea
+     * (sin Tareas, facts de siempre aunque el perfil traiga la clave).
+     */
+    application?: Omit<ResolvedApplicationDelivery, 'chapterModes'>;
   };
   audio: {
     welcomeSeconds: number;
@@ -213,6 +256,8 @@ export interface CourseFacts {
   };
   libro: { wordCount: number; hasBibliography: boolean };
   hours: { value: number; source: string } | null;
+  /** T6 (r57): el paquete lleva la «Guía del docente» (página oculta de la sección 0). Solo si el perfil la pide. */
+  teacherGuide?: true;
   /**
    * Motor de carga horaria: tiempo de estudio estimado del curso (modelo study-time con las medidas del
    * paquete). Solo si el empaque informó las palabras del experience. No se imprime en el shell.
@@ -251,6 +296,7 @@ function effectiveCategoryWeights(
   assessment: AssessmentProfile,
   counts: Record<AssessmentCategoryKey, number>,
 ): { categoryWeights?: Partial<Record<AssessmentCategoryKey, number>> } {
+  // T4 (r57): `applications` solo existe si el perfil la pesa (Object.keys de sus pesos); su conteo = Tareas calificadas.
   const original = assessment.categoryWeights as Partial<Record<AssessmentCategoryKey, number>>;
   const keys = (Object.keys(original) as AssessmentCategoryKey[]);
   const populated = keys.filter((k) => counts[k] > 0);
@@ -260,6 +306,15 @@ function effectiveCategoryWeights(
   const out: Partial<Record<AssessmentCategoryKey, number>> = {};
   for (const k of populated) out[k] = w[k] as number;
   return { categoryWeights: out };
+}
+
+/** T2 (r57): rótulos de fase del capítulo (vacío sin plan de aprendizaje o con los rótulos apagados). */
+function chapterPhaseLabels(bp: BlueprintSnapshotV2, sc: { design?: { framework?: string } }): { phaseLabels?: Partial<Record<FrameworkSlot, string>> } {
+  const lp = bp.course.pedagogy?.learningPlan;
+  const fw = sc.design?.framework;
+  if (!lp || lp.phaseLabels !== true || typeof fw !== 'string') return {};
+  const labels = frameworkSlotLabels(defaultFrameworkRegistry().get(fw));
+  return Object.keys(labels).length ? { phaseLabels: labels } : {};
 }
 
 export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
@@ -292,6 +347,20 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   const itemKeys = new Set(manifest.items.map((i) => i.key));
   const itemByKey = new Map(manifest.items.map((i) => [i.key, i]));
   const guidedIds = new Set<string>(input.guidedPracticeChapterIds ?? []);
+  // T5 (r57): archivos de trabajo resueltos, por capítulo (orden del perfil).
+  const resourcesByChapter = new Map<string, ChapterResourceFacts[]>();
+  const resourceIds = new Set<string>();
+  for (const r of input.practiceResources ?? []) {
+    if (!r || typeof r.id !== 'string' || resourceIds.has(r.id)) fail(`archivo de trabajo inválido o repetido (${JSON.stringify(r?.id)})`);
+    resourceIds.add(r.id);
+    if (!Number.isInteger(r.bytes) || r.bytes < 1 || !/^[0-9a-f]{64}$/.test(r.sha256)) fail(`archivo de trabajo ${r.id} sin tamaño o sha256 medidos`);
+    const one: ChapterResourceFacts = { id: r.id, title: r.title, instructions: r.instructions, relation: r.relation, filename: r.filename, mimetype: r.mimetype, bytes: r.bytes, sha256: r.sha256, origin: r.origin };
+    resourcesByChapter.set(r.chapterId, [...(resourcesByChapter.get(r.chapterId) ?? []), one]);
+  }
+  const chapterResources = (id: string): { resources?: ChapterResourceFacts[] } => {
+    const list = resourcesByChapter.get(id);
+    return list && list.length ? { resources: list } : {};
+  };
   const chapters: ChapterFacts[] = [];
   const modules: ModuleFacts[] = [];
   const knownChapterIds = new Set<string>();
@@ -326,6 +395,12 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(mc.applicationMinutes !== undefined ? { applicationMinutes: mc.applicationMinutes } : {}),
         ...(mc.guidedPracticeMinutes !== undefined && guidedIds.has(mc.chapterId) ? { guidedPracticeMinutes: mc.guidedPracticeMinutes } : {}),
+        // T4 (r57): modo efectivo de la AA (excepción del capítulo o el del curso); `page` = la página de siempre (sin clave).
+        ...(chapterDeliveryMode(assessment.applicationDelivery, mc.chapterId, mc.applicationMinutes !== undefined) === 'assign'
+          ? { applicationDelivery: { mode: 'assign' as const, graded: assessment.applicationDelivery?.grading.graded === true } }
+          : {}),
+        ...chapterResources(mc.chapterId),
+        ...chapterPhaseLabels(bp, sc),
         slideCount: practice ? 0 : posInt(artifacts.slideCountByChapter?.[mc.chapterId], `slideCount del capítulo ${mc.chapterNumber}`),
       });
       if (itemKeys.has(`application_activity:${mc.chapterId}`) !== (mc.applicationMinutes !== undefined)) fail(`Actividad de Aplicación del capítulo ${mc.chapterNumber} incoherente con el Manifest`);
@@ -374,6 +449,10 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     });
   }
   for (const id of pendingIds) if (!knownChapterIds.has(id)) fail(`video pendiente de un capítulo que no está en el Manifest (${id})`);
+  for (const id of resourcesByChapter.keys()) if (!knownChapterIds.has(id)) fail(`archivo de trabajo de un capítulo que no está en el Manifest (${id})`);
+  for (const ch of chapters) {
+    if ((ch.resources ?? []).some((r) => r.relation === 'application') && ch.applicationMinutes === undefined) fail(`archivo de trabajo de la Actividad de Aplicación del capítulo ${ch.number}, que no tiene Actividad de Aplicación`);
+  }
   // EV6 H5P v2: «Repaso» solo con el ajuste del Blueprint y en capítulos del Manifest.
   const reviewIds = new Set<string>(input.reviewCardsChapterIds ?? []);
   if (reviewIds.size && bp.course.reviewCards !== true) fail('«Repaso» (Dialog Cards) sin el ajuste course.reviewCards del Blueprint');
@@ -505,6 +584,13 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     scorm: chapters.filter((c) => c.activityVariant === 'scorm').length,
   };
   const exams = modules.filter((m) => m.examEnabled).length;
+  // T4 (r57): Tareas de entrega (y las calificadas, que son ítems de su categoría).
+  const assignChapters = chapters.filter((c) => c.applicationDelivery?.mode === 'assign');
+  const gradedAssigns = assignChapters.filter((c) => c.applicationDelivery?.graded).length;
+  const deliveryCategory = assessment.applicationDelivery?.grading.graded === true ? assessment.applicationDelivery.grading.category : null;
+  const appDelivery = assignChapters.length && assessment.applicationDelivery
+    ? (({ chapterModes: _cm, ...rest }) => rest)(resolveApplicationDelivery(assessment.applicationDelivery))
+    : null;
   const facts: CourseFacts = {
     factsVersion: COURSE_FACTS_VERSION,
     course: { id: bp.course.id, title: bp.course.title },
@@ -521,6 +607,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       ...(reviewIds.size ? { reviewCards: reviewIds.size } : {}),
       ...(chapters.some((c) => c.applicationMinutes !== undefined) ? { applicationActivities: chapters.filter((c) => c.applicationMinutes !== undefined).length } : {}),
       ...(chapters.some((c) => c.guidedPracticeMinutes !== undefined) ? { guidedPractices: chapters.filter((c) => c.guidedPracticeMinutes !== undefined).length } : {}),
+      ...(assignChapters.length ? { applicationAssigns: assignChapters.length, applicationAssignsGraded: assignChapters.filter((c) => c.applicationDelivery?.graded).length } : {}),
+      ...(resourceIds.size ? { practiceResources: resourceIds.size } : {}),
     },
     chapters,
     modules,
@@ -530,15 +618,18 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       kinds,
       coursePassingGrade: assessment.passingGrade,
       ...effectiveCategoryWeights(assessment, {
-        practice: chapters.filter((c) => c.videoEnabled).length + activitiesByVariant.h5p + activitiesByVariant.scorm,
+        practice: chapters.filter((c) => c.videoEnabled).length + activitiesByVariant.h5p + activitiesByVariant.scorm + (deliveryCategory === 'practice' ? gradedAssigns : 0),
         moduleExams: exams,
         finalExam: features.finalExam ? 1 : 0,
+        applications: deliveryCategory === 'applications' ? gradedAssigns : 0,
       }),
+      ...(appDelivery ? { application: appDelivery } : {}),
     },
     audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
     ...(studyTime ? { studyTime } : {}),
+    ...(assessment.teacherGuide?.include === true ? { teacherGuide: true as const } : {}),
   };
   // Sanidad contra los totales del Manifest (dos fuentes, un número).
   const t = manifest.totals;
@@ -618,6 +709,15 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
     add(facts.assessment.kinds[k].attempts);
   }
   add(facts.assessment.coursePassingGrade);
+  // T4 (r57): cifras de la entrega que el shell nombra (nota máxima / de referencia, archivos, MB, días).
+  const ap = facts.assessment.application;
+  if (ap) {
+    add(ap.maxGrade);
+    add(ap.gradepass);
+    add(ap.dueOffsetDays);
+    add(ap.submission.maxFiles);
+    add(deliveryMegabytes(ap.submission.maxBytes));
+  }
   add(100); // "N de 100": escala fija de la nota (§K.1), no un dato inventado.
   if (facts.hours) add(facts.hours.value);
   add(facts.libro.wordCount);
@@ -700,4 +800,9 @@ export function stripStructureTitles(text: string, facts: CourseFacts): string {
   let t = String(text ?? '');
   for (const title of titles) t = t.split(title).join(' ');
   return t;
+}
+
+/** T4 (r57): MB de la entrega que muestra el shell (entero, hacia abajo; mínimo 1). */
+export function deliveryMegabytes(bytes: number): number {
+  return Math.max(1, Math.floor(bytes / (1024 * 1024)));
 }
