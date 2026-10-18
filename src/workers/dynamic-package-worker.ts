@@ -34,6 +34,7 @@ import {
 import { resolveTheme } from '../modules/theme-engine';
 import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
+import { hoursReportSummary } from '../modules/study-time/hours-ledger';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5B.1 — B3: dynamic-package-worker. Reclama production_jobs con
@@ -574,6 +575,9 @@ export async function processV3PackageJob(
     // fix round 3: candidatos en orden (brand_profile → user_settings); el builder usa el primero que valida.
     libroBrand: { logo: prepared.libroBrand?.candidates ?? prepared.libroBrand?.logo ?? null, name: prepared.libroBrand?.name ?? null },
     libroReferences: prepared.libroReferences ?? null,
+    // r58 (I3) fix: horas objetivo congeladas en el Blueprint → «Duración estimada: X h (definida por la institución)» en
+    // la bienvenida y «Carga horaria declarada» en la Guía del docente. Antes nunca se pasaban (facts.hours = null siempre).
+    hours: packageDeclaredHours(snapshot),
     // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
     ...(qa ? { qaPreviewNotice: true } : {}),
   });
@@ -664,8 +668,19 @@ export async function processV3PackageJob(
     ...(warnings.length ? { warnings } : {}),
     // T1 (r57): avisos de calidad del contenido (fórmulas repetidas entre capítulos); informativos, nunca fallan.
     ...(built.summary.qualityWarnings?.length ? { qualityWarnings: built.summary.qualityWarnings } : {}),
+    // r58 (I3): registro de horas del paquete (sin las líneas; están en facts): objetivo / estimado / asignado / gap.
+    ...(built.expectations.facts.hoursReport ? { hoursReport: hoursReportSummary(built.expectations.facts.hoursReport) } : {}),
   });
   if (!ok) logger.warn(`Job ${job.id}: el .mbz v3 se subió (artifact ${artifact.id}) pero completeJob devolvió false (lease perdida)`);
+}
+
+/**
+ * r58 (I3): horas que la bienvenida muestra como «definidas por la institución»: las horas objetivo congeladas en el
+ * Blueprint (perfil del curso o documento). Sin objetivo → null (la bienvenida no muestra duración; nunca se inventa).
+ */
+export function packageDeclaredHours(snapshot: BlueprintSnapshotV2): number | null {
+  const t = snapshot?.course?.targetHours;
+  return typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null;
 }
 
 /**
