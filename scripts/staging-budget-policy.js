@@ -23,6 +23,12 @@
 // estimado USD 105,62) los límites de STAGING pasan a maxCostPerRun 106, maxCostPerCourse 106 y tope mensual 162
 // (56,35 ya gastados + 105,62). Misma mecánica: una versión nueva de la política vigente, el resto igual.
 //
+// T8 (factory mode, 2026-10-18): los límites se pueden fijar desde el .env de staging en el VPS, sin cambiar código,
+// así un deploy ya no revierte un tope subido a mano por ops:
+//   STAGING_BUDGET_MAX_COST_PER_RUN, STAGING_BUDGET_MAX_COST_PER_COURSE, STAGING_BUDGET_MONTHLY_CAP (USD, > 0).
+// Ausentes/vacíos → los defaults de abajo (106 / 106 / 162, sin cambios). Un valor inválido (no numérico, ≤ 0) aborta
+// ruidoso (exit 1) en vez de aplicar un tope que nadie pidió. Este código nunca sube ni baja los valores por sí solo.
+//
 // Uso: MIGRATION_ENV=staging node scripts/staging-budget-policy.js [ownerId]
 const fs = require('fs');
 const path = require('path');
@@ -33,6 +39,34 @@ const STAGING_MAX_COST_PER_RUN = 106;
 const STAGING_MAX_COST_PER_COURSE = 106;
 const STAGING_MONTHLY_CAP = 162;
 const CREATED_BY = 'staging-budget-policy (piloto Formato M: por generación 106, por curso 106, mensual 162 USD; aprobado por el usuario 2026-10-11)';
+/** T8: variables del .env de staging que reemplazan los defaults (USD). */
+const BUDGET_ENV = Object.freeze({
+  maxCostPerRun: 'STAGING_BUDGET_MAX_COST_PER_RUN',
+  maxCostPerCourse: 'STAGING_BUDGET_MAX_COST_PER_COURSE',
+  monthly: 'STAGING_BUDGET_MONTHLY_CAP',
+});
+const DEFAULT_TARGET = Object.freeze({ maxCostPerRun: STAGING_MAX_COST_PER_RUN, maxCostPerCourse: STAGING_MAX_COST_PER_COURSE, monthly: STAGING_MONTHLY_CAP });
+
+/**
+ * T8 (puro): límites objetivo desde el entorno. → {target, overridden: string[], createdBy} o lanza con el motivo.
+ * Cada variable ausente/vacía usa su default; un valor presente debe ser un número finito > 0 (hasta 2 decimales).
+ */
+function targetFromEnv(env = process.env) {
+  const target = { ...DEFAULT_TARGET };
+  const overridden = [];
+  for (const [k, name] of Object.entries(BUDGET_ENV)) {
+    const raw = env[name];
+    if (raw === undefined || raw === null || String(raw).trim() === '') continue;
+    const txt = String(raw).trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(txt) || !(Number(txt) > 0)) throw new Error(`${name} inválido ("${txt.slice(0, 40)}"): debe ser un número > 0 en USD (p.ej. 110 o 75.50)`);
+    target[k] = Number(txt);
+    overridden.push(name);
+  }
+  const createdBy = overridden.length
+    ? `staging-budget-policy (.env de staging: por generación ${target.maxCostPerRun}, por curso ${target.maxCostPerCourse}, mensual ${target.monthly} USD; ${overridden.join(', ')})`
+    : CREATED_BY;
+  return { target, overridden, createdBy };
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function loadEnvFile(envPath) {
@@ -79,7 +113,7 @@ const sameNum = (a, b) => a !== undefined && a !== null && b !== undefined && b 
  * Cada valor se guarda con el mismo tipo que tenía (texto → '106', número → 106). El tope mensual va en la clave que ya
  * usa la política (monthlyCap, o monthlyCapStaging, que es la que lee el flujo de aprobación cuando no hay monthlyCap).
  */
-function planPolicy(current, target = { maxCostPerRun: STAGING_MAX_COST_PER_RUN, maxCostPerCourse: STAGING_MAX_COST_PER_COURSE, monthly: STAGING_MONTHLY_CAP }) {
+function planPolicy(current, target = DEFAULT_TARGET, createdBy = CREATED_BY) {
   if (!current) return { action: 'none' };
   const limits = current.limits && typeof current.limits === 'object' ? current.limits : {};
   const monthlyKey = limits.monthlyCap !== undefined && limits.monthlyCap !== null ? 'monthlyCap' : 'monthlyCapStaging';
@@ -96,7 +130,7 @@ function planPolicy(current, target = { maxCostPerRun: STAGING_MAX_COST_PER_RUN,
       limits: next,
       require_human_approval_for_real_spend: current.require_human_approval_for_real_spend,
       on_exceed: current.on_exceed,
-      created_by: CREATED_BY,
+      created_by: createdBy,
     },
   };
 }
@@ -116,6 +150,8 @@ async function currentPolicy(c, ownerId) {
 const fmt = (p) => `${p.scope}${p.scope_id ? ` ${p.scope_id}` : ''} v${p.version} (${p.id || 'nueva'}): maxCostPerRun ${p.limits && p.limits.maxCostPerRun} · maxCostPerCourse ${p.limits && p.limits.maxCostPerCourse} · mensual ${p.limits && (p.limits.monthlyCap ?? p.limits.monthlyCapStaging)} · on_exceed ${p.on_exceed}`;
 
 async function run(env, ownerId) {
+  const { target, overridden, createdBy } = targetFromEnv(env);
+  if (overridden.length) console.log(`ℹ️  límites desde el .env de staging (${overridden.join(', ')}): ${target.maxCostPerRun} / ${target.maxCostPerCourse} / ${target.monthly}`);
   const { Client } = require('pg');
   const c = new Client({
     host: env.DB_HOST, port: Number(env.DB_PORT || 5432), user: env.DB_USER, password: env.DB_PASS, database: env.DB_NAME,
@@ -127,14 +163,14 @@ async function run(env, ownerId) {
     // Dos deploys a la vez nunca insertan dos versiones (además del índice único scope/scope_id/version).
     await c.query(`select pg_advisory_xact_lock(hashtext('cursia:staging-budget-policy'))`);
     const cur = await currentPolicy(c, ownerId);
-    const plan = planPolicy(cur);
+    const plan = planPolicy(cur, target, createdBy);
     if (plan.action === 'none') {
       console.log('⚠️  No hay política de presupuesto global (ni del owner de prueba) en staging: no se inventa una (el gate responde ADMIN_APPROVAL).');
       await c.query('rollback');
       return plan;
     }
     if (plan.action === 'noop') {
-      console.log(`✓ La política vigente ya tiene los límites aprobados (${STAGING_MAX_COST_PER_RUN} / ${STAGING_MAX_COST_PER_COURSE} / ${STAGING_MONTHLY_CAP}) — no se crea otra versión`);
+      console.log(`✓ La política vigente ya tiene los límites aprobados (${target.maxCostPerRun} / ${target.maxCostPerCourse} / ${target.monthly}) — no se crea otra versión`);
       console.log(`  ${fmt(cur)}`);
       await c.query('rollback');
       return plan;
@@ -147,7 +183,7 @@ async function run(env, ownerId) {
       [r.scope, r.scope_id, r.version, JSON.stringify(r.limits), r.require_human_approval_for_real_spend, r.on_exceed, r.created_by],
     );
     await c.query('commit');
-    console.log(`+ Política de staging: nueva versión con por generación ${STAGING_MAX_COST_PER_RUN}, por curso ${STAGING_MAX_COST_PER_COURSE} y mensual ${STAGING_MONTHLY_CAP} (el resto igual)`);
+    console.log(`+ Política de staging: nueva versión con por generación ${target.maxCostPerRun}, por curso ${target.maxCostPerCourse} y mensual ${target.monthly} (el resto igual)`);
     console.log(`  antes:   ${fmt(cur)}`);
     console.log(`  después: ${fmt(rows[0])}`);
     return { ...plan, inserted: rows[0] };
@@ -172,6 +208,12 @@ async function main() {
     console.error(`❌ staging-budget-policy: ${why}`);
     process.exit(1);
   }
+  try {
+    targetFromEnv(process.env);
+  } catch (e) {
+    console.error(`❌ staging-budget-policy: ${e.message}`);
+    process.exit(1);
+  }
   const ownerArg = process.argv[2] || null;
   if (ownerArg && !UUID_RE.test(ownerArg)) {
     console.error('❌ ownerId inválido (UUID)');
@@ -180,7 +222,7 @@ async function main() {
   await run(process.env, ownerArg);
 }
 
-module.exports = { STAGING_MAX_COST_PER_RUN, STAGING_MAX_COST_PER_COURSE, STAGING_MONTHLY_CAP, planPolicy, refusal, dbProjectRef, CREATED_BY };
+module.exports = { STAGING_MAX_COST_PER_RUN, STAGING_MAX_COST_PER_COURSE, STAGING_MONTHLY_CAP, BUDGET_ENV, targetFromEnv, planPolicy, refusal, dbProjectRef, CREATED_BY };
 if (require.main === module) {
   main().catch((err) => {
     console.error(`❌ staging-budget-policy: ${String((err && (err.code || err.message)) || err).slice(0, 200)}`);

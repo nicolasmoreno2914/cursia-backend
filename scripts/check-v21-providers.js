@@ -1389,6 +1389,24 @@ async function dbChecks() {
       // El presupuesto se sigue validando: la política nueva es la que ve el gate (sin aprobaciones automáticas).
       const pf = await budget.policyFor(999999, OWNER_STG);
       eq([pf.limits.maxCostPerRun, pf.onExceed], [106, 'BLOCK'], 'policyFor ve la versión nueva');
+      // T8: límites desde el .env de staging (ops los sube sin tocar código); el próximo deploy no los revierte.
+      const runPolicyEnv = (owner, extra) => spawnSync(process.execPath, [path.join(REPO, 'scripts/staging-budget-policy.js'), owner],
+        { cwd: tmpCwd, env: cleanEnv({ MIGRATION_ENV: 'staging', NODE_ENV: 'test', ...localEnv({}), ...extra }), encoding: 'utf8', timeout: 60000 });
+      const T8ENV = { STAGING_BUDGET_MAX_COST_PER_RUN: '110', STAGING_BUDGET_MAX_COST_PER_COURSE: '110', STAGING_BUDGET_MONTHLY_CAP: '2500' };
+      r = runPolicyEnv(OWNER_STG, T8ENV);
+      assert(r.status === 0 && /nueva versión con por generación 110, por curso 110 y mensual 2500/.test(r.stdout), `T8 override: ${r.stdout}${r.stderr}`);
+      let own2 = (await pols()).filter((x) => x.scope === 'owner');
+      eq([own2[own2.length - 1].version, own2[own2.length - 1].limits], [3, { maxCostPerRun: 110, maxCostPerCourse: 110, monthlyCapStaging: '2500' }], 'T8: versión nueva con los valores del .env');
+      r = runPolicyEnv(OWNER_STG, T8ENV);
+      assert(r.status === 0 && /ya tiene los límites aprobados \(110 \/ 110 \/ 2500\)/.test(r.stdout), `T8 2.ª corrida: ${r.stdout}${r.stderr}`);
+      eq((await pols()).filter((x) => x.scope === 'owner').length, own2.length, 'T8: idempotente con el override');
+      // Sin las variables vuelve a los defaults (106/106/162): el código nunca sube ni baja los valores por sí solo.
+      r = runPolicy(OWNER_STG);
+      own2 = (await pols()).filter((x) => x.scope === 'owner');
+      eq([r.status, own2[own2.length - 1].limits], [0, { maxCostPerRun: 106, maxCostPerCourse: 106, monthlyCapStaging: '162' }], 'T8: sin override → defaults');
+      r = runPolicyEnv(OWNER_STG, { STAGING_BUDGET_MONTHLY_CAP: '-1' });
+      assert(r.status === 1 && /STAGING_BUDGET_MONTHLY_CAP inválido/.test(r.stderr), `T8 inválido: ${r.stderr}`);
+      eq((await pols()).filter((x) => x.scope === 'owner').length, own2.length, 'T8: inválido no inserta');
       // Guardarraíl real: sin MIGRATION_ENV=staging no corre.
       const bad = spawnSync(process.execPath, [path.join(REPO, 'scripts/staging-budget-policy.js')], { cwd: tmpCwd, env: cleanEnv({ NODE_ENV: 'test', ...localEnv({}) }), encoding: 'utf8' });
       eq(bad.status, 1, 'sin MIGRATION_ENV=staging');
