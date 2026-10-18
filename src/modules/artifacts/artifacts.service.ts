@@ -1,5 +1,5 @@
 import { createHash } from 'crypto';
-import { BadRequestException, ForbiddenException, Injectable, NotFoundException, Logger } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
@@ -7,6 +7,7 @@ import { Artifact } from './entities/artifact.entity';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { isAdminOnlyPackageArtifact } from '../dynamic-packaging/qa-package';
 import { ARTIFACT_TYPE_SERVER_ONLY, LLM_MODES, LLM_MODE_INVALID, isLlmMode, isServerOnlyArtifactType } from './artifact-type-policy';
+import { PRACTICE_FILE_INVALID_CODE, PRACTICE_FILE_TYPE, PRACTICE_FILE_UNVERIFIABLE_CODE, practiceFileBytesErrors, practiceFileDeclarationErrors } from './practice-file-attach';
 
 export interface UploadJsonArtifactInput {
   ownerId: string;
@@ -200,7 +201,30 @@ export class ArtifactsService {
         message: `${LLM_MODE_INVALID}: metadata.llmMode=${JSON.stringify(llmMode).slice(0, 40)} (permitidos: ${LLM_MODES.join(', ')}).`,
       });
     }
+    if (String(dto.type ?? '').trim() === PRACTICE_FILE_TYPE) return this.create(await this.verifiedPracticeFileDto(dto), ownerId);
     return this.create(dto, ownerId);
+  }
+
+  /**
+   * r58 (I4-2): un archivo de trabajo se valida AL ADJUNTARLO (declaración + bytes en Storage: tamaño, sha256 y firma del
+   * formato). Antes un archivo dañado o con otra extensión recién fallaba al empaquetar (PRACTICE_FILE_INVALID).
+   */
+  private async verifiedPracticeFileDto(dto: CreateArtifactDto): Promise<CreateArtifactDto> {
+    const decl = practiceFileDeclarationErrors(dto);
+    const reject = (errors: string[]) => new BadRequestException({ code: PRACTICE_FILE_INVALID_CODE, message: `${PRACTICE_FILE_INVALID_CODE}: ${errors.join('; ')}`, errors });
+    if (decl.length) throw reject(decl);
+    let bytes: Buffer;
+    try {
+      bytes = await this.downloadStorageObject(dto.storage_bucket ?? 'cursia-artifacts', dto.storage_path);
+    } catch (err) {
+      throw new ServiceUnavailableException({
+        code: PRACTICE_FILE_UNVERIFIABLE_CODE,
+        message: `${PRACTICE_FILE_UNVERIFIABLE_CODE}: no se pudo leer el archivo subido para verificarlo (${err instanceof Error ? err.message.slice(0, 160) : String(err)}); vuelve a adjuntarlo.`,
+      });
+    }
+    const v = await practiceFileBytesErrors(dto, bytes);
+    if (v.errors.length) throw reject(v.errors);
+    return { ...dto, checksum_sha256: v.sha256, size_bytes: v.size, metadata: { ...(dto.metadata ?? {}), practiceFileVerified: { sha256: v.sha256, bytes: v.size, rules: 1 } } };
   }
 
   async create(dto: CreateArtifactDto, ownerId: string): Promise<Artifact> {

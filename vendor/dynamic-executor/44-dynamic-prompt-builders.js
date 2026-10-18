@@ -2004,6 +2004,17 @@ function _dynApplicationLearnerBlock(app, pedagogy) {
     : '\n\nESTUDIANTE Y RESULTADOS DE APRENDIZAJE DEL CURSO (la actividad debe trabajarlos; elige los que este capítulo aporta):\n- ' + lines.join('\n- ');
 }
 
+// r58 (I4-3): archivos de trabajo ADJUNTOS al capítulo (claim application.practiceFiles, del perfil de evaluación). La
+// actividad los nombra tal cual (título y archivo) y nunca inventa otros. Sin archivos → '' (el prompt de siempre).
+function _dynApplicationPracticeFilesBlock(app) {
+  var fs = app && Array.isArray(app.practiceFiles) ? app.practiceFiles.filter(function (f) { return f && typeof f.filename === 'string' && f.filename; }) : [];
+  if (!fs.length) return '';
+  return '\n\nARCHIVOS DE TRABAJO ADJUNTOS (el estudiante los descarga junto a la actividad):\n- ' + fs.map(function (f) {
+    return '«' + String(f.title || f.filename) + '» (archivo ' + f.filename + ')' + (f.relation === 'chapter' ? ' — material del capítulo' : ' — de esta actividad') + (f.instructions ? ': ' + String(f.instructions) : '');
+  }).join('\n- ') +
+    '\nCuando una consigna use un archivo, nómbralo EXACTAMENTE como arriba (título y nombre del archivo). No menciones otros archivos, plantillas ni hojas de cálculo «adjuntas» que no estén en esta lista.';
+}
+
 // 1.ª pasada: la actividad del ESTUDIANTE (sin respuestas).
 function dynApplicationActivityPrompt(courseContext, outline, chapter, sourceMd, app, pedagogy) {
   var ch = chapter || {};
@@ -2019,6 +2030,7 @@ function dynApplicationActivityPrompt(courseContext, outline, chapter, sourceMd,
     + '\n' + _dynInternalVocabularyBan()
     + _dynApplicationLearnerBlock(app, pedagogy)
     + (pedagogy || '')
+    + _dynApplicationPracticeFilesBlock(app)
     + '\n\nDiseña la ACTIVIDAD DE APLICACIÓN de este capítulo para ' + minutes + ' minutos de trabajo del estudiante.'
     + '\n1) Elige el GÉNERO que mejor encaja con la disciplina y el tema (no uses siempre el mismo):\n- ' + DYN_APPLICATION_GENRES.map(function (g) { return DYN_APPLICATION_GENRE_TEXT[g]; }).join('\n- ')
     + '\n2) Responde con JSON EXACTAMENTE con esta forma (sin campos extra):\n'

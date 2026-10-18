@@ -209,6 +209,9 @@ const expectErr = async (fn, code, what) => {
     eq(rep.errors, [], 'errores');
     const md = REP.renderReportMarkdown(rep);
     for (const s of ['SINTÉTICO', 'runKind: synthetic', '## Decisiones pedagógicas', '## Componentes no verificados', '## Dependencias externas']) assert(md.includes(s), `Markdown sin «${s}»`);
+    // r58 (I2): informe de calidad del paquete sintético (mismo formato que el job de empaque).
+    assert(rep.quality && rep.quality.counts && rep.quality.counts.BLOCKER === 0 && Array.isArray(rep.quality.findings) && rep.quality.blocksDelivery === false, `calidad: ${JSON.stringify(rep.quality && rep.quality.counts)}`);
+    assert(md.includes('## Informe de calidad (BLOCKER 0'), 'Markdown sin el informe de calidad');
     // Un informe que dice synthetic sin el flag no pasa el esquema.
     assert(REP.validateReport({ ...rep, synthetic: false }).length > 0, 'el esquema debía exigir synthetic:true');
     fs.mkdirSync(OUT, { recursive: true });

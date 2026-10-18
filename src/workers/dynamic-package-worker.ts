@@ -35,6 +35,7 @@ import { resolveTheme } from '../modules/theme-engine';
 import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 import { hoursReportSummary } from '../modules/study-time/hours-ledger';
+import { buildPackageQualityReport, courseQualityReportSummary, CourseQualityReport } from '../modules/quality/course-quality-report';
 import { PACKAGE_REUSE_REJECTED, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
 import { sha256Hex } from '../modules/artifacts/artifacts.service';
 import { isNonRealLlmMode } from '../modules/artifacts/artifact-type-policy';
@@ -575,6 +576,8 @@ export async function processV3PackageJob(
       pendingVideoNoticeCount: reusedPending.filter((p) => p && p.notice === true).length,
       // EV6 H5P v2: la instrucción de restauración viaja en la metadata del .mbz reutilizado.
       ...(existing.metadata?.restore ? { restore: existing.metadata.restore } : {}),
+      // r58 (I2): el informe de calidad viaja en la metadata del .mbz reutilizado (mismos textos = mismo informe).
+      ...(existing.metadata?.qualityReport && typeof existing.metadata.qualityReport === 'object' ? { qualityReport: existing.metadata.qualityReport } : {}),
       ...(reuseWarnings.length ? { warnings: reuseWarnings } : {}),
     });
     if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
@@ -640,6 +643,28 @@ export async function processV3PackageJob(
   if (sizeVerdict.error) throw new Error(sizeVerdict.error);
   if (isLeaseLost()) return;
 
+  // r58 (I2): informe de calidad del curso (formato común E4) sobre los artifacts ya pagados: avisos del builder, registro de
+  // horas y chequeos determinísticos nuevos. Nunca bloquea por sí solo (un BLOCKER real ya falló arriba); un MAJOR requiere
+  // resolución humana (visible a administradores en «Curso listo»). Si el informe falla, aviso VISIBLE (nunca en silencio).
+  let qualityReport: CourseQualityReport | null = null;
+  const qualityReportWarnings: string[] = [];
+  try {
+    const titles = new Map<string, string>(((prepared.profiles.assessment as any)?.practiceResources ?? []).map((r: any) => [String(r.id), String(r.title ?? '')]));
+    qualityReport = courseQualityReportSummary(buildPackageQualityReport({
+      manifest: manifest.manifest as any,
+      blueprint: snapshot as any,
+      contents: loaded.contents as any,
+      packageWarnings: [...built.summary.warnings, ...(built.summary.qualityWarnings ?? [])],
+      practiceResources: built.summary.practiceResources ?? null,
+      practiceTitles: titles,
+      hoursReport: (built.expectations.facts as any).hoursReport ?? null,
+      builderVersion: built.summary.builderVersion,
+    }));
+  } catch (err) {
+    qualityReportWarnings.push(`quality_report_failed:${errMessage(err).slice(0, 160)}`);
+    logger.error(`Job ${job.id}: no se pudo armar el informe de calidad — ${errMessage(err)}`);
+  }
+
   // EV6 T5 (fix round 1, m-2): pendientes con el flag `notice` del builder (ruling 3, medible).
   const noticeByKey = new Map(built.summary.pendingVideos.map((p) => [p.itemKey, p.notice === true]));
   const pendingVideos = baseSummary.pendingVideos.map((p) => ({ ...p, notice: noticeByKey.get(p.itemKey) === true }));
@@ -668,7 +693,7 @@ export async function processV3PackageJob(
     // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes (validados).
     replaceUnverifiedOnConflict: true,
     // r58 (AU1 R1): sha256 de los bytes que aprobó validateMbzV3 (el reuse lo exige igual al checksum de Storage).
-    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), validatedSha256: sha256Hex(built.mbz) },
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), ...(qualityReport ? { qualityReport } : {}), validatedSha256: sha256Hex(built.mbz) },
   });
   if (isLeaseLost()) return;
 
@@ -686,6 +711,7 @@ export async function processV3PackageJob(
     ...profileWarnings,
     ...[...loaded.warnings, ...built.summary.warnings].filter((w) => !profileDetails.has(w)).map((w) => ({ code: w.split(':')[0], detail: w })),
     ...sizeVerdict.warnings.map((w) => ({ code: w.split(':')[0], detail: w })),
+    ...qualityReportWarnings.map((w) => ({ code: w.split(':')[0], detail: w })),
   ];
   const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
     artifactId: artifact.id,
@@ -706,6 +732,8 @@ export async function processV3PackageJob(
     ...(warnings.length ? { warnings } : {}),
     // T1 (r57): avisos de calidad del contenido (fórmulas repetidas entre capítulos); informativos, nunca fallan.
     ...(built.summary.qualityWarnings?.length ? { qualityWarnings: built.summary.qualityWarnings } : {}),
+    // r58 (I2): informe de calidad (contadores por severidad + hallazgos, tope COURSE_QUALITY_SUMMARY_MAX_FINDINGS).
+    ...(qualityReport ? { qualityReport } : {}),
     // r58 (I3): registro de horas del paquete (sin las líneas; están en facts): objetivo / estimado / asignado / gap.
     ...(built.expectations.facts.hoursReport ? { hoursReport: hoursReportSummary(built.expectations.facts.hoursReport) } : {}),
   });

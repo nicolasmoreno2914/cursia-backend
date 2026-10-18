@@ -6,7 +6,7 @@
 'use strict';
 
 const REPORT_VERSION = 1;
-const REPORT_SCHEMA_KEYS = ['reportVersion', 'runKind', 'synthetic', 'generatedAt', 'configuration', 'pedagogicalDecisions', 'plannedResources', 'validationsPassed', 'warnings', 'errors', 'componentsNotVerified', 'externalDependencies', 'components', 'affectedComponents', 'package', 'network'];
+const REPORT_SCHEMA_KEYS = ['reportVersion', 'runKind', 'synthetic', 'generatedAt', 'configuration', 'pedagogicalDecisions', 'plannedResources', 'validationsPassed', 'warnings', 'errors', 'componentsNotVerified', 'externalDependencies', 'components', 'affectedComponents', 'package', 'quality', 'network'];
 
 const LLM_TYPES = new Set(['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'activity', 'video_interactions', 'application_activity', 'guided_practice', 'exam', 'final_exam']);
 const WORKER_OF = { llm: 'dynamic-llm-worker', presentation: 'dynamic-provider-worker', audio_welcome: 'dynamic-provider-worker', audiobook_chapter: 'dynamic-provider-worker', video: 'dynamic-item-worker', package: 'dynamic-package-worker' };
@@ -139,6 +139,8 @@ function buildDryRunReport(r, o = {}) {
     components: items.map((it) => ({ itemKey: it.key, type: it.type, role: it.role, status: it.status, source: it.source, llmCalls: it.llmCalls || 0, artifacts: (it.artifacts || []).map((a) => ({ type: a.type, sha256: a.sha256, bytes: a.bytes })), error: it.error || null })),
     affectedComponents: r.affected,
     package: r.package ? { sha256: r.package.sha256, bytes: r.package.bytes, builderVersion: r.package.builderVersion, validation: r.package.validation, syntheticMarker: r.package.marker, pendingVideos: r.package.pendingVideos.map((p) => p.itemKey), mockProviderItems: r.package.mockProviderItems } : null,
+    // r58 (I2): informe de calidad del paquete sintético (mismo formato que el job de empaque); null sin paquete.
+    quality: r.package && r.package.qualityReport ? { counts: r.package.qualityReport.counts, blocksDelivery: r.package.qualityReport.blocksDelivery, requiresHumanResolution: r.package.qualityReport.requiresHumanResolution, notMeasured: r.package.qualityReport.notMeasured, findings: r.package.qualityReport.findings } : null,
     network: { barrier: true, attempts: r.network.attempts.length },
   };
   const errs = validateReport(report);
@@ -203,6 +205,13 @@ function renderReportMarkdown(rep) {
     L.push('## Paquete sintético');
     L.push(`- \`${rep.package.sha256.slice(0, 16)}\` · ${rep.package.bytes} bytes · validateMbzV3 ${rep.package.validation.ok ? 'OK' : 'FALLÓ'} · marca \`cursia-synthetic.json\` + título «[SINTÉTICO] …» + aviso QA`);
     L.push(`- Videos omitidos (vista previa): ${rep.package.pendingVideos.length}`);
+    L.push('');
+  }
+  if (rep.quality) {
+    const q = rep.quality;
+    L.push(`## Informe de calidad (BLOCKER ${q.counts.BLOCKER} · MAJOR ${q.counts.MAJOR} · MINOR ${q.counts.MINOR} · INFO ${q.counts.INFO})`);
+    L.push(`- Entrega: ${q.blocksDelivery ? 'BLOQUEADA (hay BLOCKER)' : 'sin bloqueantes'}${q.requiresHumanResolution ? '; hay MAJOR que una persona debe resolver o aceptar' : ''}${q.notMeasured.length ? `; no medido: ${q.notMeasured.join(', ')}` : ''}`);
+    for (const f of q.findings.slice(0, 40)) L.push(`- **${f.severity}** ${f.code}${f.location.chapterId ? ` (${f.location.section || ''} ${f.location.chapterId})` : ''}: ${String(f.evidence).slice(0, 200)}${f.kind === 'needs_human_review' ? ' — revisión humana' : ''}`);
     L.push('');
   }
   L.push(`Red: barrera activa, ${rep.network.attempts} intento(s).`);

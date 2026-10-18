@@ -169,7 +169,7 @@ export function welcomeLabel(
   const bodyParas = split.rest ? splitBodyParagraphs(split.rest, { maxWords: WELCOME_PARA_MAX_WORDS, target: WELCOME_PARA_TARGET_WORDS }) : [];
   const body = bodyParas.length ? `<div class="cvc-welcome-body"${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg]])}>${paras(h, bodyParas.join('\n\n'), s, { enh: WRAP })}</div>` : '';
   const hours = facts.hours
-    ? pHtml(h, labelHtml(`Duración estimada: ${facts.hours.value} h (${facts.hours.source}).`), s, { secondary: true, last: true })
+    ? pHtml(h, labelHtml(`Duración estimada: ${String(facts.hours.value).replace('.', ',')} h (${facts.hours.source}).`), s, { secondary: true, last: true })
     : '';
   let qa = '';
   if (qaPreviewNotice) {
