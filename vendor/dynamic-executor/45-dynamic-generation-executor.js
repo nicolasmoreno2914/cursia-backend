@@ -3148,6 +3148,10 @@ var DYN_BIAS_ALPHA = 0.025;
 var DYN_ANSWER_OUTLIER_MIN_DIFF = 8;
 var DYN_ANSWER_OUTLIER_MIN_PCT = 15;
 var DYN_BIAS_POOL_PREFIX = 'cursia.answerBias.v1|';
+// T6 (r57): regla de conjunto de las MC de video (= VIDEO_MC_* de be/src/modules/quality/answer-length-bias.ts).
+var DYN_VIDEO_MC_LONGEST_MAX_SHARE = 0.3;
+var DYN_VIDEO_MC_MIN_QUESTIONS = 10;
+var DYN_VIDEO_MC_MIN_Z = 1.96;
 var _DYN_BS_QUALITY_RANK = { optimal: 3, acceptable: 2, poor: 1 };
 var _DYN_BIAS_POOL = {};
 
@@ -3271,12 +3275,34 @@ function _dynBiasPool(runKey) {
   }
   return _DYN_BIAS_POOL[runKey];
 }
+// T6 (r57): el claim de video_interactions / activity trae las señales de los items YA completados del run
+// (claimPayload.answerBiasPool, del servidor: generación vigente). Se siembran en el acumulado del run para que la
+// prueba vea el CURSO aunque cada item lo genere un proceso distinto (workers del servidor, otra pestaña). El servidor
+// manda sobre las entradas de otros items; la del propio item nunca viene (la excluye el claim).
+function _dynBiasSeedFromClaim(item, pool) {
+  var cp = item && item.claimPayload && item.claimPayload.answerBiasPool;
+  if (!_dynIsPlainObject(cp) || cp.v !== 1 || !_dynIsPlainObject(cp.items)) return 0;
+  var n = 0;
+  Object.keys(cp.items).forEach(function (k) {
+    var e = cp.items[k];
+    if (k === String(item.itemKey) || !_dynIsPlainObject(e) || !Array.isArray(e.ranks) || !Array.isArray(e.tf)) return;
+    var ranks = e.ranks.filter(function (x) { return _dynIsPlainObject(x) && x.m >= 2 && x.r >= 0 && x.r <= x.m - 1; }).map(function (x) { return { m: x.m, r: x.r }; });
+    pool[k] = { k: typeof e.k === 'string' ? e.k : null, ranks: ranks, tf: e.tf.filter(function (v) { return typeof v === 'boolean'; }) };
+    n++;
+  });
+  return n;
+}
+// Señales compactas de un item para el summary (`answerBias.signals`): el servidor las devuelve en el claim de los
+// demás items del run (T6). Solo longitudes relativas y valores V/F: nunca texto.
+function _dynBiasCompactSignals(kind, s) {
+  return { k: kind, ranks: s.ranks.map(function (x) { return { m: x.m, r: x.r }; }), tf: s.tf.map(function (x) { return x.v; }) };
+}
 // Registra las señales de la respuesta ACEPTADA de un item (reemplaza las de un intento anterior del mismo item).
 function dynAnswerBiasRemember(item, kind, data) {
   var key = _dynBiasRunKey(item);
   var pool = _dynBiasPool(key);
   var s = dynAnswerBiasSignals(kind, data);
-  pool[String(item.itemKey)] = { ranks: s.ranks.map(function (x) { return { m: x.m, r: x.r }; }), tf: s.tf.map(function (x) { return x.v; }) };
+  pool[String(item.itemKey)] = _dynBiasCompactSignals(kind, s);
   var st = (typeof _dynEbStorage === 'function') ? _dynEbStorage() : null;
   try { if (st) st.setItem(DYN_BIAS_POOL_PREFIX + key, JSON.stringify({ v: 1, items: pool })); } catch (e) { /* sin espacio: solo memoria */ }
 }
@@ -3285,6 +3311,7 @@ function dynAnswerBiasRemember(item, kind, data) {
 function dynAnswerBiasTest(item, kind, data) {
   var own = dynAnswerBiasSignals(kind, data);
   var pool = _dynBiasPool(_dynBiasRunKey(item));
+  _dynBiasSeedFromClaim(item, pool);
   var ranks = own.ranks.map(function (x) { return { m: x.m, r: x.r }; });
   var tfs = own.tf.map(function (x) { return x.v; });
   var pooledItems = 0;
@@ -3319,13 +3346,39 @@ function dynAnswerBiasTest(item, kind, data) {
         ' (un patrón así no se da por azar): reescribe ' + ownMajor[0].path + ' para que sea ' + (major ? 'FALSA (correct: false)' : 'VERDADERA (correct: true)') + '.');
     }
   }
+  // T6 (r57): regla de CONJUNTO de los videos del curso (la misma del banco de examen y del aviso del paquete,
+  // video_mc_length_bias): correcta = la más larga en > 30 % de las MC de video Y por encima del azar (z > 1,96 sobre
+  // Σ 1/m). Solo pide el reintento si ESTE item empuja: más del 30 % de sus MC con la correcta más larga Y más que su
+  // azar (Σ 1/m del item: con 3 opciones, 1 de 3 es azar, no empuje).
+  var course = null;
+  if (kind === 'video_interactions' && own.ranks.length) {
+    var vr = own.ranks.map(function (x) { return { m: x.m, r: x.r }; });
+    Object.keys(pool).forEach(function (k) {
+      if (k !== String(item.itemKey) && pool[k] && pool[k].k === 'video_interactions') vr = vr.concat(pool[k].ranks || []);
+    });
+    var vLongest = vr.filter(function (x) { return x.r === x.m - 1; }).length;
+    var vExp = 0;
+    var vVar = 0;
+    vr.forEach(function (x) { var p = 1 / x.m; vExp += p; vVar += p * (1 - p); });
+    var vZ = vVar > 0 ? (vLongest - vExp) / Math.sqrt(vVar) : 0;
+    var ownLongest = own.ranks.filter(function (x) { return x.longest; }).length;
+    var ownChance = own.ranks.reduce(function (a, x) { return a + 1 / x.m; }, 0);
+    course = { mc: vr.length, correctLongest: vLongest, z: Math.round(vZ * 100) / 100 };
+    var biasedCourse = vr.length >= DYN_VIDEO_MC_MIN_QUESTIONS && vLongest > DYN_VIDEO_MC_LONGEST_MAX_SHARE * vr.length && vZ > DYN_VIDEO_MC_MIN_Z;
+    if (biasedCourse && ownLongest > Math.max(DYN_VIDEO_MC_LONGEST_MAX_SHARE * own.ranks.length, ownChance) && !errors.some(function (e) { return e.indexOf('[ANSWER_LENGTH_BIAS]') === 0; })) {
+      var fixV = own.ranks.filter(function (x) { return x.longest; });
+      errors.push('[ANSWER_LENGTH_BIAS] en los videos de este curso la respuesta correcta es la más larga en ' + vLongest + ' de ' + vr.length +
+        ' preguntas (máximo 30 %): en ' + fixV.map(function (x) { return x.path; }).join(', ') + ' haz que una opción incorrecta sea igual o más larga y detallada que la correcta.');
+    }
+  }
   var stats = {};
   stats[kind === 'branchingscenario' ? 'decisions' : 'mc'] = own.ranks.length;
   return {
     stats: Object.assign(stats, {
       correctLongest: own.ranks.filter(function (x) { return x.longest; }).length, outliers: own.ranks.filter(function (x) { return x.outlier; }).length,
       tf: own.tf.length, tfTrue: own.tf.filter(function (x) { return x.v; }).length,
-      pLength: Math.round(pLen * 10000) / 10000, pTf: Math.round(pTf * 10000) / 10000, pooledItems: pooledItems }),
+      pLength: Math.round(pLen * 10000) / 10000, pTf: Math.round(pTf * 10000) / 10000, pooledItems: pooledItems },
+      course ? { course: course } : {}, { signals: _dynBiasCompactSignals(kind, own) }),
     errors: errors
   };
 }
