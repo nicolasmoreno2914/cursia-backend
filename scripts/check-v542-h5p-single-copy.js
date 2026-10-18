@@ -111,7 +111,7 @@ const BS_CFG = {
     }
   }
 
-  await check('builder 3.14.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.14.0', 'versión'));
+  await check('builder 3.15.0 (3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación; 3.15.0 = T1 r57 Libro + vocabulario interno)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.15.0', 'versión'));
 
   await check('matriz + rules 2: toda h5pactivity tiene UNA sola copia del .h5p (filearea package) y su inforef apunta solo a ella', () => {
     let n = 0;

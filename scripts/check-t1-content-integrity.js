@@ -149,6 +149,23 @@ const eq = (a, b, m) => assert.deepStrictEqual(a, b, m);
     eq(SH.bridgeRepeatsClosing('Corto.', closing), false, 'puente demasiado corto: no se juzga');
   });
 
+  await check('B1 videos: sesgo «la correcta es la más larga» medido sobre TODO el curso (umbral del banco 30 % + exceso significativo sobre el azar) → aviso de calidad', async () => {
+    const Q = L('modules/quality/answer-length-bias.js');
+    const mc = (c, ws) => ({ kind: 'multichoice', question: 'q', answers: [{ text: 'x'.repeat(c), correct: true }, ...ws.map((w) => ({ text: 'y'.repeat(w), correct: false }))] });
+    // 29 de 55 (53 %), 3 opciones → sesgado
+    const biased = Array.from({ length: 11 }, (_, i) => ({ checkpoints: Array.from({ length: 5 }, (_, k) => (i * 5 + k < 29 ? mc(60, [40, 45]) : mc(40, [60, 45]))) }));
+    const b = Q.videoMcLengthBias(biased);
+    eq([b.mc, b.correctLongest, b.biased], [55, 29, true]);
+    eq(Q.videoMcLengthBiasWarnings(biased), ['video_mc_length_bias:29/55']);
+    // al azar con 3 opciones (≈ 33 %: 18 de 55) → NO (el 30 % solo no basta)
+    const chance = Array.from({ length: 11 }, (_, i) => ({ checkpoints: Array.from({ length: 5 }, (_, k) => (i * 5 + k < 18 ? mc(60, [40, 45]) : mc(40, [60, 45]))) }));
+    eq(Q.videoMcLengthBias(chance).biased, false, 'azar');
+    eq(Q.videoMcLengthBias([{ checkpoints: [mc(60, [40, 45]), mc(60, [40, 45])] }]).biased, false, 'pocas MC');
+    const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
+    const r = await B.buildDynamicMbzV3(input);
+    assert(r.summary.qualityWarnings.every((w) => !/^video_mc_length_bias/.test(w)) || r.summary.qualityWarnings.some((w) => /^video_mc_length_bias:\d+\/\d+$/.test(w)), 'formato del aviso');
+  });
+
   // ─── Libro Guía (PDF) ───
   const LB = L('package/v3/libro-v3.js');
   const LL = L('package/v3/libro-logo.js');

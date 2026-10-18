@@ -148,6 +148,7 @@ import { applicationSolutionPage, applicationStudentPage } from '../modules/cour
 import { guidedPracticeLibroMarkdown, guidedPracticePage } from '../modules/course-shell/guided-practice-page';
 import { validateGuidedPracticeDoc } from '../modules/course-shell/guided-practice';
 import { renderApplicationPdf } from './v3/application-pdf';
+import { videoMcLengthBiasWarnings } from '../modules/quality/answer-length-bias';
 import { COURSE_BADGE_BACKUP_ID, COURSE_BADGE_DEFAULT_ISSUER, courseBadgeImages, courseBadgeName, courseBadgeXml } from './v3/course-badge';
 
 /**
@@ -250,8 +251,16 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * ilimitados); textos del cierre, certificado, insignia, notas para docentes y evaluaciones con la regla real
  * («calificación final ≥ X/100…»); todos los .h5p solo contenido (QuestionSet 1.21, caso ramificado y «Repaso» sin
  * carpetas de librería: requisito del sitio = pack v3, summary.restore `site_library_pack`).
+ * 3.15.0 (T1 r57, defectos de contenido repetibles — sin regenerar contenido): vocabulario interno del generador
+ * reparado antes de renderizar («worked_example» → «ejemplo resuelto», «texto fuente» → «Libro Guía», «[S12]» fuera;
+ * check INTERNAL_VOCABULARY del validador); «Tu recorrido» derivado de los slots reales; el puente que repite un
+ * bloque del cierre se omite; rótulos why/apply con variación determinística; Libro Guía: mapas con ASCII de una
+ * columna (LIBRO_V3_GLYPHS si queda algo sin glifo), listas sueltas numeradas 1..n, portada/índice/tarjeta con los
+ * capítulos reales (práctica incluida) y «Referencias» desde fuentes estructuradas; summary.qualityWarnings
+ * (aperturas repetidas entre capítulos, sesgo de longitud de las MC de los videos). Un paquete sin esos casos es
+ * byte a byte el de 3.14.0 (los dorados no cambian).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.14.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.15.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -1836,7 +1845,11 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
         itemKey: v.videoKey, chapterId: v.chapterId, chapterNumber: v.chapterNumber, title: v.title, notice: noticeChapterIds.includes(v.chapterId),
       })),
       warnings,
-      qualityWarnings: formulaicOpeningWarnings(plan.modules.flatMap((m) => m.chapters.map((ch) => c.experiences.get(ch.chapterId)))),
+      qualityWarnings: [
+        ...formulaicOpeningWarnings(plan.modules.flatMap((m) => m.chapters.map((ch) => c.experiences.get(ch.chapterId)))),
+        // T1 (r57): la regla de conjunto del banco de examen (≤ 30 % «la correcta es la más larga») sobre TODOS los videos del paquete.
+        ...videoMcLengthBiasWarnings(plan.modules.flatMap((m) => m.chapters.filter((ch) => !!ch.keys.video).map((ch) => c.videoInteractions.get(ch.chapterId)))),
+      ],
       // r19: piso de 25 min del audiolibro (solo si el empaque pasó los manifiestos; no entra al .mbz).
       ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,
