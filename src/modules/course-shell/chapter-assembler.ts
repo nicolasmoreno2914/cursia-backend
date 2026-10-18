@@ -268,7 +268,10 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   // M12: el puente del LLM ("a continuación…") solo cuando realmente sigue otro
   // capítulo; antes de un examen de módulo o al final del curso manda la
   // transición determinística (nunca dos mensajes de navegación contradictorios).
-  let after = input.nextChapter && !examNext ? `<div class="cvc-bridge"${st(h, [['margin', '28px 0 0 0'], ['color', s.fg]])}>${paras(h, exp.bridge_to_next, s)}</div>` : '';
+  // T1 (r57): si el cierre del LLM ya dice lo mismo que el puente (otro texto con el mismo fin: «el siguiente paso es…»),
+  // el puente se omite — antes el estudiante leía dos párrafos casi iguales seguidos (curso real, cierre del cap. 6).
+  const bridgeDup = bridgeRepeatsClosing(exp.bridge_to_next, exp.movements.closing);
+  let after = input.nextChapter && !examNext && !bridgeDup ? `<div class="cvc-bridge"${st(h, [['margin', '28px 0 0 0'], ['color', s.fg]])}>${paras(h, exp.bridge_to_next, s)}</div>` : '';
   // R14-A (I5): la transición dice primero qué repasar/reintentar y después el siguiente paso,
   // sin repetir "Con este capítulo terminas…" dos veces.
   const bridgeLeadText = bridgeLead({ activityEnabled: ch.activityEnabled, activityAttempts: assessment.kinds.activity.attempts });
@@ -308,6 +311,35 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   const route = chapterRouteSteps(slots, { practice, reviewCards: ch.reviewCards === true, examNext });
   slots.unshift(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, route, mt))));
   return slots;
+}
+
+/** T1 (r57): proporción mínima de las palabras del puente presentes en UN bloque del cierre para considerarlo repetido. */
+export const BRIDGE_DUPLICATE_MIN_CONTAINMENT = 0.5;
+
+const contentStems = (t: string): Set<string> =>
+  new Set(
+    (String(t ?? '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .match(/[a-zñ]{4,}/g) ?? []).map((w) => w.slice(0, 5)),
+  );
+const stringsOf = (v: unknown): string[] =>
+  typeof v === 'string' ? [v] : Array.isArray(v) ? v.flatMap(stringsOf) : v && typeof v === 'object' ? Object.entries(v as Record<string, unknown>).filter(([k]) => k !== 'type').flatMap(([, x]) => stringsOf(x)) : [];
+
+/**
+ * T1 (r57): ¿el puente (`bridge_to_next`) repite un bloque del cierre? Contención de raíces (5 letras, palabras ≥ 4)
+ * del puente en el texto de cada bloque del cierre ≥ BRIDGE_DUPLICATE_MIN_CONTAINMENT. Determinístico.
+ */
+export function bridgeRepeatsClosing(bridge: string, closing: ReadonlyArray<unknown> | undefined): boolean {
+  const b = contentStems(bridge);
+  if (b.size < 4 || !Array.isArray(closing)) return false;
+  return closing.some((c) => {
+    const t = contentStems(stringsOf(c).join(' '));
+    let n = 0;
+    for (const w of b) if (t.has(w)) n++;
+    return n / b.size >= BRIDGE_DUPLICATE_MIN_CONTAINMENT;
+  });
 }
 
 /** Paso del recorrido anunciado en la apertura (ícono + etiqueta). */

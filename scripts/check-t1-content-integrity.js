@@ -141,6 +141,14 @@ const eq = (a, b, m) => assert.deepStrictEqual(a, b, m);
     assert(!r.summary.warnings.some((w) => /^formulaic_opening/.test(w)), 'no se mezcla con los avisos operativos');
   });
 
+  await check('D1 cierre: el puente que repite un bloque del cierre se omite (dos párrafos casi iguales); uno distinto se conserva', () => {
+    const SH = L('modules/course-shell/chapter-assembler.js');
+    const closing = [{ type: 'callout', variant: 'tip', title: 'Lo que sigue', body: 'Con los riesgos identificados y documentados, el siguiente paso es saber qué hacer con esa información: cómo brindar apoyo inmediato y qué medidas de cuidado se activan según lo que encontraste en la valoración.' }];
+    eq(SH.bridgeRepeatsClosing('Identificar los riesgos es el primer paso; el siguiente es saber qué hacer con esa información: qué formas de apoyo inmediato y medidas de cuidado responden a cada riesgo.', closing), true);
+    eq(SH.bridgeRepeatsClosing('La comunicación con la familia exige otro tipo de cuidado: lenguaje claro, tiempos y acuerdos explícitos.', closing), false);
+    eq(SH.bridgeRepeatsClosing('Corto.', closing), false, 'puente demasiado corto: no se juzga');
+  });
+
   // ─── Libro Guía (PDF) ───
   const LB = L('package/v3/libro-v3.js');
   const LL = L('package/v3/libro-logo.js');
