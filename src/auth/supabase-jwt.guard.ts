@@ -17,7 +17,8 @@ import { ADMIN_EMAIL_UNVERIFIED, adminIdentityProblem, EmailConfirmedLookup, isS
 /** r58: confirmaciones de email de admins ya verificadas (solo positivas; 5 min) — sin una query por request. */
 const ADMIN_VERIFIED_TTL_MS = 5 * 60_000;
 const adminVerifiedCache = new Map<string, number>();
-export function resetAdminVerifiedCacheForTests(): void { adminVerifiedCache.clear(); }
+let authUsersUnreadableLogged = false;
+export function resetAdminVerifiedCacheForTests(): void { adminVerifiedCache.clear(); authUsersUnreadableLogged = false; }
 
 /** Caché del JWKS remoto — una sola instancia por proceso para evitar re-fetch en cada request */
 let _jwksCache: ReturnType<typeof createRemoteJWKSet> | null = null;
@@ -43,9 +44,21 @@ export class SupabaseJwtGuard implements CanActivate {
     const ds = this.dataSource;
     if (!ds || typeof ds.query !== 'function') return null;
     return async (userId: string) => {
-      const rows = await ds.query(`select email, email_confirmed_at is not null as confirmed from auth.users where id = $1`, [userId]);
+      let rows: unknown;
+      try {
+        rows = await ds.query(`select email, email_confirmed_at is not null as confirmed from auth.users where id = $1`, [userId]);
+      } catch (err) {
+        // Review r1 (M-4): auth.users ilegible (sin permisos / sin esquema) → se usa el claim del JWT; se avisa UNA vez.
+        if (!authUsersUnreadableLogged) {
+          authUsersUnreadableLogged = true;
+          this.logger.warn(`auth.users no se puede leer (${err instanceof Error ? err.message.slice(0, 120) : String(err)}): la verificación de email de administradores usa el claim email_verified del JWT`);
+        }
+        return null;
+      }
       const r = Array.isArray(rows) ? rows[0] : null;
-      return r ? { confirmed: r.confirmed === true, email: r.email ?? null } : { confirmed: false, email: null };
+      // Review r1 (M-4): sin fila (base local / stub con esquema auth) → null = se usa el claim del JWT. Solo una fila
+      // EXISTENTE sin confirmar niega.
+      return r ? { confirmed: r.confirmed === true, email: r.email ?? null } : null;
     };
   }
 

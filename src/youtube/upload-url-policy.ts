@@ -54,6 +54,18 @@ function deny(reason: string): never {
   throw new BadRequestException({ code: DOWNLOAD_URL_NOT_ALLOWED, message: `${DOWNLOAD_URL_NOT_ALLOWED}: ${reason}` });
 }
 
+/**
+ * Review r1 (I-3): validación SOLO sintáctica para un dry-run (no se descarga nada → ni lista de hosts ni DNS): URL
+ * parseable, https, sin credenciales. Así el preflight (`https://preflight-test.local/…`) valida el resto del flujo.
+ */
+export function assertUploadUrlSyntax(raw: string): URL {
+  let u: URL;
+  try { u = new URL(String(raw)); } catch { return deny('URL inválida'); }
+  if (u.protocol !== 'https:') deny('solo https');
+  if (u.username || u.password) deny('la URL no puede llevar credenciales');
+  return u;
+}
+
 /** Valida UNA URL (la del cliente o una redirección). Lanza 400 `download_url_not_allowed`. */
 export async function assertUploadUrlAllowed(raw: string, opts: { env?: NodeJS.ProcessEnv; resolve?: HostResolver } = {}): Promise<URL> {
   let u: URL;

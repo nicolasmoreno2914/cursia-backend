@@ -347,8 +347,10 @@ export interface BuildDynamicMbzV3Input {
   /** Reloj inyectado (segundos UNIX): el builder nunca lee el reloj. */
   ts: number;
   moodleVersion?: string;
-  /** Horas del setup (se muestran etiquetadas como definidas por la institución). */
+  /** Horas objetivo del Blueprint (bienvenida + Guía del docente). */
   hours?: number | null;
+  /** Review r1 (M-5): origen de las horas; solo `document` las etiqueta «(definida por la institución)». */
+  hoursSource?: 'document' | null;
   /** Nivel de render de los labels (default ENHANCED sobre la base CLEAN_SAFE). */
   level?: 'enhanced' | 'clean_safe';
   /**
@@ -1204,6 +1206,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     ...(practice.resolved.length ? { practiceResources: practice.resolved } : {}),
     assessment: input.assessmentProfile,
     hours: input.hours ?? null,
+    hoursSource: input.hoursSource ?? null,
     pendingVideos: plan.omittedVideos.length ? { chapterIds: plan.omittedVideos.map((v) => v.chapterId), noticeChapterIds } : null,
     artifacts: {
       audioWelcomeSeconds,

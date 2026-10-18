@@ -53,11 +53,18 @@ export interface UploadBufferArtifactInput {
   /**
    * r58 (AU1 R1): con `adoptExistingOnConflict`, el objeto existente solo se adopta si sus BYTES son los que
    * se acaban de construir (sha256 igual); si no (un objeto puesto por el dueño en su carpeta, o uno de un
-   * build anterior que ya no se verifica) se REEMPLAZA con los bytes construidos y validados. Lo usa el
-   * worker de empaque (`dynamic_mbz`, ruta canónica del servidor). Default false (adopción de siempre).
+   * build anterior que ya no se verifica) se REEMPLAZA con los bytes construidos y validados — review r1 (I-1): SOLO si
+   * ningún row de `artifacts` referencia esa ruta; si alguno la referencia (bytes entregados) → PACKAGE_OBJECT_CONFLICT,
+   * nunca se sobrescribe. Lo usa el worker de empaque (`dynamic_mbz`). Default false (adopción de siempre).
    */
   replaceUnverifiedOnConflict?: boolean;
 }
+
+/**
+ * Review r1 (I-1): el objeto de Storage de una ruta ya referenciada por un artifact tiene otros bytes. Nunca se
+ * sobrescribe (bytes entregados); el job falla y se reintenta (el reintento elige una ruta nueva). Clase A.
+ */
+export const PACKAGE_OBJECT_CONFLICT = 'PACKAGE_OBJECT_CONFLICT';
 
 /** sha256 hex de un buffer (checksum_sha256 de los artifacts que sube el servidor). */
 export function sha256Hex(buf: Buffer): string {
@@ -385,15 +392,24 @@ export class ArtifactsService {
       // r58 (AU1 R1): solo se adoptan bytes IDÉNTICOS a los construidos; si no, se reemplazan (nunca se adopta
       // un objeto que nadie verificó como el paquete del run).
       let existingSha: string | null = null;
+      let readError: string | null = null;
       try {
         existingSha = sha256Hex(await this.downloadStorageObject(bucket, input.storagePath));
       } catch (err) {
-        this.logger.warn(`uploadBufferArtifact: no se pudo leer ${input.storagePath} para verificarlo (${err instanceof Error ? err.message : String(err)}) — se reemplaza`);
+        readError = err instanceof Error ? err.message : String(err);
       }
       if (existingSha === builtSha) {
         this.logger.warn(`uploadBufferArtifact: ${input.storagePath} ya existía con los MISMOS bytes (sha256) — se adopta`);
         return { sizeBytes: existingSize, adopted: true, sha256: builtSha };
       }
+      // Review r1 (I-1): NUNCA se pisan bytes que un row de `artifacts` referencia (un paquete entregado). Solo se
+      // reemplaza un objeto huérfano (crash entre Storage y el insert, o puesto por el dueño en su carpeta).
+      if (await this.isStoragePathReferenced(bucket, input.storagePath)) {
+        throw new Error(
+          `${PACKAGE_OBJECT_CONFLICT}: ${bucket}/${input.storagePath} ya existe con otros bytes${readError ? ` (no se pudo leer: ${readError})` : ''} y un artifact lo referencia — nunca se sobrescribe`,
+        );
+      }
+      if (readError) this.logger.warn(`uploadBufferArtifact: no se pudo leer ${input.storagePath} para verificarlo (${readError}) — sin row que lo referencie, se reemplaza`);
       this.logger.warn(`uploadBufferArtifact: ${input.storagePath} ya existía con OTROS bytes — se reemplaza con los construidos (PACKAGE_OBJECT_REPLACED)`);
       const replace = await fetch(uploadUrl, {
         method: 'POST',
@@ -407,6 +423,15 @@ export class ArtifactsService {
       `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
     );
     return { sizeBytes: existingSize, adopted: true, sha256: null };
+  }
+
+  /**
+   * Review r1 (I-1): ¿algún row de `artifacts` (de cualquier dueño) referencia este objeto de Storage? Un objeto
+   * referenciado es inmutable: el worker de empaque escribe un rebuild a OTRA ruta en vez de sobrescribirlo.
+   */
+  async isStoragePathReferenced(bucket: string, storagePath: string): Promise<boolean> {
+    const n = await this.artifactRepo.count({ where: { storagePath, storageBucket: bucket } });
+    return n > 0;
   }
 
   /**

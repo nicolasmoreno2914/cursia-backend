@@ -171,7 +171,8 @@ const CLEAN = [
     const q7 = (cs) => QB.runQualityBattery({ ...base, contextSummaries: cs }).checks.find((c) => c.id === 'Q7');
     for (const [cs, reason] of [[{}, 'no_sidecars'], [{ c1: { concepts_introduced: ['costo'], concepts_assumed: [] } }, 'no_assumed_concepts'], [{ c1: { concepts_introduced: ['costo'], concepts_assumed: ['álgebra lineal'] } }, 'all_assumed_external']]) {
       const c = q7(cs);
-      eq([c.metric, c.pass, c.blocking, c.status, c.measuredReason], [null, false, false, 'not_measured', reason], `Q7 ${reason}`);
+      // Review r1 (M-6): no medido = pass null (neutral: ni aprobado ni fallido).
+      eq([c.metric, c.pass, c.blocking, c.status, c.measuredReason], [null, null, false, 'not_measured', reason], `Q7 ${reason}`);
       assert(c.findings[0].code === 'Q7_NOT_MEASURED', 'hallazgo NOT_MEASURED primero');
     }
     const rep = QB.runQualityBattery({ ...base, contextSummaries: {} });
@@ -410,7 +411,7 @@ const CLEAN = [
       { id: 'datos', chapterId: 'c1', title: 'Datos de ventas', instructions: 'Usa la hoja Datos.', relation: 'application', source: { kind: 'table', format: 'xlsx', filename: 'ventas.xlsx' } },
       { id: 'otro', chapterId: 'c2', title: 'Otro capítulo', instructions: '', relation: 'chapter', source: { kind: 'artifact', filename: 'otro.pdf' } },
     ] };
-    const qr = (data) => ({ async query(sql, params) { if (/from public\.course_profiles p join public\.production_jobs j/.test(sql)) { eq(params, ['job-1'], 'job'); return data ? [{ data }] : []; } throw new Error(`SQL no esperado ${sql.slice(0, 50)}`); } });
+    const qr = (data) => ({ async query(sql, params) { if (/from public\.course_profiles p join public\.production_jobs j/.test(sql)) { eq(params, ['job-1'], 'job'); assert(/p\.created_at <= j\.created_at/.test(sql), 'review r1 (M-7): perfil congelado al crear el run'); return data ? [{ data }] : []; } throw new Error(`SQL no esperado ${sql.slice(0, 50)}`); } });
     const row = { type: 'application_activity', chapter_id: 'c1', job_id: 'job-1', item_key: mItem.key };
     const claim = await svc.buildClaimV3(qr(profile), row, mItem, manifest);
     eq(claim.application.practiceFiles, [{ title: 'Datos de ventas', filename: 'ventas.xlsx', instructions: 'Usa la hoja Datos.', relation: 'application' }], 'solo los del capítulo');
@@ -449,11 +450,15 @@ const CLEAN = [
       }
       return '';
     };
-    const frac = await B.buildDynamicMbzV3({ ...input, hours: 40.5 });
+    const frac = await B.buildDynamicMbzV3({ ...input, hours: 40.5, hoursSource: 'document' });
     assert((await welcomeOf(frac.mbz)).includes('Duración estimada: 40,5 h (definida por la institución).'), 'coma decimal');
+    // Review r1 (M-5): sin origen documento → redacción neutra (también con coma decimal).
+    const neutral = await B.buildDynamicMbzV3({ ...input, hours: 40.5 });
+    assert((await welcomeOf(neutral.mbz)).includes('Duración estimada del curso: 40,5 h.'), 'neutra con coma decimal');
+    assert((await V.validateMbzV3(neutral.mbz, neutral.expectations)).ok, 'neutra: valida');
     const v = await V.validateMbzV3(frac.mbz, frac.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
-    const whole = await B.buildDynamicMbzV3({ ...input, hours: 40 });
+    const whole = await B.buildDynamicMbzV3({ ...input, hours: 40, hoursSource: 'document' });
     assert((await welcomeOf(whole.mbz)).includes('Duración estimada: 40 h (definida por la institución).'), 'entera igual');
   });
 

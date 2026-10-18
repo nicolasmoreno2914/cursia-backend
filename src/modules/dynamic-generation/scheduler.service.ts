@@ -1709,12 +1709,19 @@ export class SchedulerService {
     return facts;
   }
 
-  /** r58 (I4-3): archivos de trabajo del capítulo en el perfil de evaluación vigente del curso del run (título, archivo, consigna). */
+  /**
+   * r58 (I4-3): archivos de trabajo del capítulo (título, archivo, consigna) del perfil de evaluación del run.
+   * Review r1 (M-7): el perfil CONGELADO al crear el run — la última versión (append-only) con created_at ≤ la creación del
+   * run —, nunca uno editado después. El perfil de evaluación no se congela en el Blueprint ni en el Manifest (el
+   * pedagógico sí, en el lock); su punto de congelamiento es startRun, que lo valida (assertAssessmentProfileResolvableForRun).
+   * Un archivo agregado o quitado después no cambia lo que la actividad nombra; si el paquete (perfil vigente) ya no lo
+   * trae, el informe de calidad lo marca (PRACTICE_FILE_REFERENCE_UNKNOWN, MAJOR).
+   */
   private async practiceFilesForChapter(q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, chapterId: string | null): Promise<Array<{ title: string; filename: string; instructions: string; relation: string }>> {
     if (!chapterId) return [];
     const [p] = await q.query(
       `select p.data from public.course_profiles p join public.production_jobs j on j.course_id = p.course_id
-        where j.id = $1 and p.kind = 'assessment' order by p.version desc limit 1`,
+        where j.id = $1 and p.kind = 'assessment' and p.created_at <= j.created_at order by p.version desc limit 1`,
       [jobId],
     );
     return practiceFilesOfProfile(p ? (typeof p.data === 'string' ? JSON.parse(p.data) : p.data) : null, chapterId);
@@ -1799,8 +1806,8 @@ export class SchedulerService {
         // O2b: anuncia que el fail acepta `applicationDraftArtifactId` (borrador de la actividad entre intentos).
         draftArtifactType: APPLICATION_DRAFT_ARTIFACT_TYPE,
       };
-      // r58 (I4-3): archivos de trabajo del capítulo (perfil de evaluación vigente = el que usa el empaque) para que la
-      // actividad los nombre tal cual (sin otra llamada a la IA). Sin archivos → el claim queda como antes.
+      // r58 (I4-3): archivos de trabajo del capítulo para que la actividad los nombre tal cual (sin otra llamada a la IA).
+      // Review r1 (M-7): del perfil congelado al crear el run (no el vivo). Sin archivos → el claim queda como antes.
       if (row.job_id) {
         const files = await this.practiceFilesForChapter(qr, row.job_id, row.chapter_id);
         if (files.length) out.application.practiceFiles = files;

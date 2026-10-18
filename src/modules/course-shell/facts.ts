@@ -81,8 +81,13 @@ export interface BuildCourseFactsInput {
   blueprint: AnyBlueprintSnapshot;
   assessment: AssessmentProfile;
   artifacts: CourseFactsArtifactsInput;
-  /** Dato del setup (horas); se muestra etiquetado como definido por la institución. */
+  /** Horas objetivo congeladas en el Blueprint. */
   hours?: number | null;
+  /**
+   * Review r1 (M-5): origen de esas horas. Solo `document` (documento de la institución) muestra «(definida por la
+   * institución)»; cualquier otro (perfil escrito por el usuario, propuesta de Cursia aceptada, ausente) → redacción neutra.
+   */
+  hoursSource?: 'document' | null;
   /**
    * EV6 T5: videos pendientes (vista previa) que el paquete omite. `chapterIds` = capítulos con
    * video en el Manifest cuyo video no es real todavía (quedan `videoEnabled:false`,
@@ -258,7 +263,8 @@ export interface CourseFacts {
     audiobookParts: Array<{ chapterId: string; chapterNumber: number; seconds: number; offsetSeconds: number }>;
   };
   libro: { wordCount: number; hasBibliography: boolean };
-  hours: { value: number; source: string } | null;
+  /** `source` = etiqueta de origen (solo horas del documento de la institución); null = redacción neutra. */
+  hours: { value: number; source: string | null } | null;
   /** T6 (r57): el paquete lleva la «Guía del docente» (página oculta de la sección 0). Solo si el perfil la pide. */
   teacherGuide?: true;
   /**
@@ -602,7 +608,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   let hours: CourseFacts['hours'] = null;
   if (input.hours !== undefined && input.hours !== null) {
     if (typeof input.hours !== 'number' || !Number.isFinite(input.hours) || input.hours <= 0) fail('hours debe ser un número > 0');
-    hours = { value: input.hours, source: HOURS_SOURCE_LABEL };
+    hours = { value: input.hours, source: input.hoursSource === 'document' ? HOURS_SOURCE_LABEL : null };
   }
 
   const activitiesByVariant = {

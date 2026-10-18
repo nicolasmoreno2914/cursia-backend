@@ -73,6 +73,9 @@ export const QUALITY_SEVERITY_MAP: Readonly<Record<string, QualitySeverityV2>> =
   A1: 'BLOCKER',
   DESIGN_CRITICAL: 'BLOCKER',
   // Mayores: persona resuelve o acepta.
+  // Review r1 (M-6): MAJOR aunque «puede ser legítimo» — un plazo/cantidad contradictorio entre capítulos y exámenes es
+  // un error de contenido con consecuencia (la respuesta correcta del examen depende de cuál vale); la heurística no puede
+  // decidir si son casos distintos → `needs_human_review`, nunca bloquea ni se corrige solo (docs/v21/quality-reports.md).
   NUMERIC_WINDOW_CONFLICT: 'MAJOR',
   ASSESSMENT_MEMORY_FOR_PRACTICAL: 'MAJOR',
   VIDEO_MC_LENGTH_BIAS: 'MAJOR',

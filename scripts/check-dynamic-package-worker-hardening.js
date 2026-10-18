@@ -402,6 +402,8 @@ function withEnv(key, value, fn) {
     return {
       rows,
       create: (x) => ({ ...x }),
+      // Review r1 (I-1): ArtifactsService.isStoragePathReferenced.
+      async count({ where }) { return rows.filter((r) => (r.storagePath ?? r.storage_path) === where.storagePath && (r.storageBucket ?? r.storage_bucket ?? 'cursia-artifacts') === where.storageBucket).length; },
       async save(x) {
         if (toFail > 0) { toFail--; throw new Error('simulated DB blip / crash after Storage write'); }
         const row = { ...x, id: `row-${rows.length + 1}` };

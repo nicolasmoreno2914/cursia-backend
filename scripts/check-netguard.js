@@ -65,6 +65,34 @@ const socketBlocked = (host, port) => new Promise((resolve) => {
     assert(globalThis.fetch === origFetch, 'uninstall no restauró fetch');
   });
 
+  await check('NG1b review r1 (M-7): DNS (dns / dns.promises / Resolver, lookup y resolve*) y dgram bloqueados y registrados en modo estricto; con allowLoopback pasa lookup("localhost"); uninstall restaura', async () => {
+    const dns = require('dns');
+    const dgram = require('dgram');
+    const orig = [dns.lookup, dns.resolve4, dns.promises.lookup, dns.promises.resolveTxt, dns.Resolver.prototype.resolve4, dgram.createSocket];
+    const b = NG.installNetworkBarrier({ label: 'check-dns' });
+    try {
+      await throwsBlocked(() => dns.lookup('api.anthropic.com', () => {}), 'dns.lookup');
+      await throwsBlocked(() => dns.resolve4('videosb.nomaddi.com', () => {}), 'dns.resolve4');
+      await throwsBlocked(() => dns.promises.lookup('preflight-test.local'), 'dns.promises.lookup');
+      await throwsBlocked(() => require('dns/promises').resolveTxt('example.com'), 'dns/promises.resolveTxt');
+      await throwsBlocked(() => new dns.Resolver().resolve4('example.com', () => {}), 'Resolver.resolve4');
+      await throwsBlocked(() => dns.lookup('localhost', () => {}), 'estricto: también localhost');
+      await throwsBlocked(() => dgram.createSocket('udp4'), 'dgram.createSocket');
+      const vias = b.attempts.map((a) => a.via);
+      for (const v of ['dns.lookup', 'dns.resolve4', 'dns.promises.lookup', 'dns.promises.resolveTxt', 'dns.Resolver.resolve4', 'dgram.createSocket']) assert(vias.includes(v), `intento ${v} no registrado (${vias.join(',')})`);
+      let err = null; try { b.assertClean(); } catch (e) { err = e; }
+      assert(err && err.code === NG.NETWORK_BLOCKED, 'assertClean falla tras un intento de DNS');
+    } finally { b.uninstall(); }
+    const now = [dns.lookup, dns.resolve4, dns.promises.lookup, dns.promises.resolveTxt, dns.Resolver.prototype.resolve4, dgram.createSocket];
+    assert(now.every((f, i) => f === orig[i]), 'uninstall no restauró DNS y dgram');
+    const lb = NG.installNetworkBarrier({ allowLoopback: true });
+    try {
+      const addr = await new Promise((res, rej) => dns.lookup('localhost', (e, a) => (e ? rej(e) : res(a))));
+      assert(/^(127\.0\.0\.1|::1)$/.test(addr), `localhost resolvió a ${addr}`);
+      await throwsBlocked(() => dns.promises.lookup('example.com'), 'allowLoopback: externo bloqueado');
+    } finally { lb.uninstall(); }
+  });
+
   await check('NG2 assertClean falla con intentos y pasa sin ellos; uninstall restaura https.request y net.Socket.connect', async () => {
     const origReq = require('https').request;
     const origConnect = net.Socket.prototype.connect;

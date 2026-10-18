@@ -418,6 +418,9 @@ async function dbChecks() {
     await check('[H4] reanudar un run pausado sin autorización → 409 run_budget_not_authorized (no se reabre); tras la autorización del admin → se reanuda y la llamada entra', async () => {
       const C = await makeCourse('H4 reanudar');
       const R = await noAuthRun(C, 'paused');
+      // Review r1 (M-3): el bloqueo aplica porque al run le queda un proveedor pagado real (el video, modo real).
+      const vRows = await ds.query(`update public.generation_item_runs set status = 'pending', finished_at = null where job_id = $1 and type = 'video' returning id`, [R.runId]);
+      assert(vRows.length > 0, 'el run tiene un video real pendiente');
       await ds.query(`update public.production_jobs set output_summary = jsonb_build_object('pause', jsonb_build_object('pausedAt', now(), 'reason', 'run_budget_not_authorized')) where id = $1`, [R.runId]);
       let e = null; try { await runs.resumeRun(C.cid, OWNER, 1, R.runId); } catch (x) { e = x; }
       const b = e && e.getResponse ? e.getResponse() : null;
@@ -428,6 +431,19 @@ async function dbChecks() {
       assert((await runRow(R.runId)).worker_status !== 'paused', 'reanudado');
       eq(await budget.guardServerLlmCall({ runId: R.runId, itemRunId: R.itemRunId, model: 'claude-sonnet-4-6', promptChars: 3000, maxTokens: 1000 }), null, 'guard permite');
       assert((await ledger.recordCharge(resInput(R.itemRunId, 'after'))).inserted, 'reserva entra');
+    });
+
+    await check('[H4] review r1 (M-3): run pausado sin autorización al que solo le quedan partes de IA / ya generadas (ningún proveedor pagado real pendiente) → se reanuda; el ledger igual rechaza la reserva LLM pagada por Cursia', async () => {
+      const C = await makeCourse('H4 reanudar sin pagados');
+      const R = await noAuthRun(C, 'paused');
+      await ds.query(`update public.production_jobs set output_summary = jsonb_build_object('pause', jsonb_build_object('pausedAt', now(), 'reason', 'user')) where id = $1`, [R.runId]);
+      // Los items de proveedores pagados (video / presentación / audio) ya están generados; quedan partes de IA.
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where job_id = $1 and type = any($2::text[])`,
+        [R.runId, ['video', 'presentation', 'audio_welcome', 'audiobook_chapter']]);
+      await runs.resumeRun(C.cid, OWNER, 1, R.runId);
+      assert((await runRow(R.runId)).worker_status !== 'paused', 'reanudado sin autorización (nada pagado real pendiente)');
+      let e = null; try { await ledger.recordCharge(resInput(R.itemRunId, 'llm-after-resume')); } catch (x) { e = x; }
+      assert(e && e.code === 'RUN_BUDGET_NOT_AUTHORIZED', 'la reserva LLM pagada por Cursia sigue fallando cerrado: ' + (e && e.message));
     });
 
     await check('[H4] clasificación: run_budget_not_authorized → clase D, hold_for_human, presupuesto (approve_budget); también como código explícito', async () => {

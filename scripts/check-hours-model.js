@@ -355,7 +355,15 @@ const measuredCourse = (o = {}) => ({
     const before = await B.buildDynamicMbzV3(inT); // lo que armaba el worker antes (sin `hours`)
     const after = await B.buildDynamicMbzV3({ ...inT, hours: W.packageDeclaredHours(withTarget) });
     assert(!/Duración estimada/.test(await welcomeOf(before.mbz)), 'antes del fix: la línea faltaba (bug confirmado en el fixture)');
-    assert((await welcomeOf(after.mbz)).includes('Duración estimada: 40 h (definida por la institución).'), 'después: la bienvenida dice la duración');
+    // Review r1 (M-5): sin origen congelado = redacción neutra; «(definida por la institución)» solo con horas del documento.
+    assert((await welcomeOf(after.mbz)).includes('Duración estimada del curso: 40 h.'), 'después: la bienvenida dice la duración (neutra)');
+    assert(!/definida por la instituci/.test(await welcomeOf(after.mbz)), 'neutra: sin «definida por la institución»');
+    eq(W.packageDeclaredHoursSource(withTarget), null, 'sin origen congelado → null');
+    const docBp = { ...withTarget, course: { ...withTarget.course, targetHoursSource: 'document' } };
+    eq(W.packageDeclaredHoursSource(docBp), 'document', 'origen documento congelado');
+    const afterDoc = await B.buildDynamicMbzV3({ ...inT, hours: 40, hoursSource: 'document' });
+    assert((await welcomeOf(afterDoc.mbz)).includes('Duración estimada: 40 h (definida por la institución).'), 'documento: etiqueta de la institución');
+    assert((await V.validateMbzV3(afterDoc.mbz, afterDoc.expectations)).ok, 'documento: valida');
     const v = await V.validateMbzV3(after.mbz, after.expectations);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
     const fr = after.expectations.facts.hoursReport;

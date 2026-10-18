@@ -4,7 +4,7 @@
 //     comportamiento de siempre: conexión TCP/TLS fuera de loopback → bloqueada + renglón en $E2E_NET_LOG);
 //   - el driver offline de componentes y el replay (scripts/lib/offline-driver.js, scripts/lib/replay-api.js):
 //     `installNetworkBarrier()` bloquea TODO (también loopback por defecto): sockets, fetch, http(s).request/get,
-//     tls.connect y http2.connect. Cada intento queda registrado y `assertClean()` falla si hubo alguno.
+//     tls.connect, http2.connect y (review r1 M-7) DNS (`dns` / `dns.promises` / `Resolver`) y `dgram.createSocket`. Cada intento queda registrado y `assertClean()` falla si hubo alguno.
 // No es código de producto: instrumentación de pruebas. Sin dependencias.
 'use strict';
 const net = require('net');
@@ -86,6 +86,32 @@ function installNetworkBarrier(o = {}) {
   patch('https', 'get', 'https.get');
   patch('tls', 'connect', 'tls.connect');
   patch('http2', 'connect', 'http2.connect');
+  // Review r1 (M-7): DNS y UDP también son red. En modo estricto (default) se bloquean todas las consultas de
+  // `dns` / `dns.promises` (lookup, lookupService, resolve*, reverse; también los métodos de `Resolver`) y
+  // `dgram.createSocket`; con allowLoopback solo pasa `lookup` de los nombres de LOOPBACK.
+  const dnsMethods = ['lookup', 'lookupService', 'resolve', 'resolve4', 'resolve6', 'resolveAny', 'resolveCaa', 'resolveCname', 'resolveMx',
+    'resolveNaptr', 'resolveNs', 'resolvePtr', 'resolveSoa', 'resolveSrv', 'resolveTxt', 'reverse'];
+  const dnsAllowed = (name, host) => allowLoopback && name === 'lookup' && typeof host === 'string' && LOOPBACK.has(host);
+  const patchDns = (obj, via, isPromise) => {
+    if (!obj) return;
+    for (const name of dnsMethods) {
+      const orig = obj[name];
+      if (typeof orig !== 'function') continue;
+      obj[name] = function (host, ...rest) {
+        if (dnsAllowed(name, host)) return orig.call(this, host, ...rest);
+        const err = blocked(`${via}.${name}`, host);
+        if (isPromise) return Promise.reject(err);
+        throw err;
+      };
+      restore.push(() => { obj[name] = orig; });
+    }
+  };
+  const dns = require('dns');
+  patchDns(dns, 'dns', false);
+  patchDns(dns.promises, 'dns.promises', true);
+  patchDns(dns.Resolver && dns.Resolver.prototype, 'dns.Resolver', false);
+  patchDns(dns.promises && dns.promises.Resolver && dns.promises.Resolver.prototype, 'dns.promises.Resolver', true);
+  patch('dgram', 'createSocket', 'dgram.createSocket');
   g.__CURSIA_NETWORK_BARRIER__ = true;
   active = {
     active: true,

@@ -279,6 +279,24 @@ export function paidRealProviders(items: readonly EstimateItem[], mode: RunSpend
   return Array.from(set).sort();
 }
 
+/**
+ * Review r1 (M-3): proveedores pagados REALES de los items que a un run pausado le QUEDAN por generar (sin generación
+ * `completed` / `cancelled` en `latestStatusByKey`; sin fila = pendiente). Lo usa la guarda de reanudación H4: sin
+ * ninguno (todo lo restante es LLM / mock / ya generado) el run se reanuda aunque no tenga autorización — una llamada
+ * LLM pagada por Cursia igual se rechaza en el ledger (H4, falla cerrado) y BYOK / mock nunca gastan de Cursia.
+ */
+export function pendingPaidRealProviders(
+  items: readonly RunManifestItem[],
+  latestStatusByKey: ReadonlyMap<string, string>,
+  mode: RunSpendMode | RunSpendModes,
+): string[] {
+  const remaining = items.filter((it) => {
+    const st = latestStatusByKey.get(it.key);
+    return st !== 'completed' && st !== 'cancelled';
+  });
+  return paidRealProviders(estimateItemsForRun(remaining, mode, null, { coverageItems: items }), mode);
+}
+
 export interface RunBudgetDecision extends EvaluateBudgetResult {
   paidRealProviders: string[];
 }

@@ -525,7 +525,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
 
 /** Empaque (scope package, R9). El código sale de CUALQUIER token en mayúsculas conocido del mensaje. */
 const PACKAGE_RULES: readonly Rule[] = Object.freeze([
-  { id: 'package_transient', codes: ['PACKAGING_V3_CONTENT_MISSING', 'ERR_BUFFER_TOO_LARGE', 'package_transient'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
+  // Review r1 (I-1): PACKAGE_REUSE_VERIFY_UNAVAILABLE = Storage no dejó descargar el candidato a reuse (nunca se reconstruye
+  // encima); PACKAGE_OBJECT_CONFLICT = carrera sobre una ruta ya referenciada (el reintento elige ruta nueva). Ambos A.
+  { id: 'package_transient', codes: ['PACKAGING_V3_CONTENT_MISSING', 'ERR_BUFFER_TOO_LARGE', 'package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
   {
     id: 'package_component',
     codes: ['EXAM_BANK_INVALID', 'QUIZ_V3_BANK_INVALID', 'QUIZ_V3_EMPTY', 'QUIZ_V3_INVALID', 'H5P_ACTIVITY_PAYLOAD_INVALID', 'H5P_INPUT_INVALID',

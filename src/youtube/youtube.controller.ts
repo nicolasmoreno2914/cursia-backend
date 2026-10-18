@@ -14,7 +14,7 @@ import {
   Res,
   UseGuards,
 } from '@nestjs/common';
-import { assertUploadUrlAllowed } from './upload-url-policy';
+import { assertUploadUrlAllowed, assertUploadUrlSyntax } from './upload-url-policy';
 import { Response } from 'express';
 import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
@@ -255,20 +255,22 @@ export class YoutubeController {
     if (!downloadUrl || typeof downloadUrl !== 'string' || !downloadUrl.startsWith('http')) {
       throw new BadRequestException('download_url es requerido y debe ser una URL válida.');
     }
-    // r58 (SSRF): solo el almacenamiento de Cursia / Videogen, https, IPs públicas (también en dry-run).
-    await assertUploadUrlAllowed(downloadUrl);
-
-    const title         = (body['title']          as string  | undefined) ?? null;
-    const description   = (body['description']    as string  | undefined) ?? '';
-    const privacyStatus = (body['privacy_status'] as string  | undefined) ?? 'unlisted';
-    const chapterNumber = (body['chapter_number'] as number  | undefined) ?? null;
-
     // dry-run: cuerpo JSON { dryRun: true } o header X-Cursia-Dry-Run: true
     const isDryRun =
       body['dryRun'] === true ||
       body['dry_run'] === true ||
       dryRunHeader === 'true' ||
       dryRunHeader === '1';
+
+    // r58 (SSRF): solo el almacenamiento de Cursia / Videogen, https, IPs públicas. Review r1 (I-3): en dry-run no se
+    // descarga nada → solo sintaxis (sin lista de hosts ni DNS).
+    if (isDryRun) assertUploadUrlSyntax(downloadUrl);
+    else await assertUploadUrlAllowed(downloadUrl);
+
+    const title         = (body['title']          as string  | undefined) ?? null;
+    const description   = (body['description']    as string  | undefined) ?? '';
+    const privacyStatus = (body['privacy_status'] as string  | undefined) ?? 'unlisted';
+    const chapterNumber = (body['chapter_number'] as number  | undefined) ?? null;
 
     if (!['public', 'unlisted', 'private'].includes(privacyStatus)) {
       throw new BadRequestException('privacy_status debe ser public, unlisted o private.');

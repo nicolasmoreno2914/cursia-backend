@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { anthropicLlmModeForBaseUrl } from '../config/provider-base-url-guard';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { INestApplicationContext } from '@nestjs/common';
@@ -48,6 +49,11 @@ export interface LlmWorkerDeps {
   idleMs: number;
   totalMs: number;
   fetchImpl?: typeof fetch;
+  /**
+   * Review r1 (M-1): procedencia del texto (`mock` si `baseUrl` no es la API oficial de Anthropic). Sin el campo se
+   * deriva de `baseUrl`. Un item `mock` se marca en la metadata de sus artifacts y en el resumen del complete.
+   */
+  llmMode?: 'real' | 'mock' | 'replay';
   /** Deploy: con drenaje pedido, la parte vuelve a la cola antes de su próxima llamada (review I3/M3). */
   drain?: { isDraining: boolean };
 }
@@ -200,7 +206,8 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
       }
     }
     clearInterval(hb);
-    const summary = { contextHash: (item as any).context?.contextHash, ...(result.summary || {}), generatedBy: 'llm-worker' };
+    const llmMode = workerLlmMode(deps);
+    const summary = { contextHash: (item as any).context?.contextHash, ...(result.summary || {}), generatedBy: 'llm-worker', ...(llmMode !== 'real' ? { llmMode } : {}) };
     const done = await deps.scheduler.completeItemDetailed(item.itemRunId, deps.executorId, { artifactIds, summary });
     if (!done.ok) {
       if (done.reason === V3_PAYLOAD_INVALID) {
@@ -231,9 +238,16 @@ async function uploadArtifact(deps: LlmWorkerDeps, item: ClaimedItem, ownerId: s
     metadata: {
       manifestId: (item as any).manifestId, itemKey: item.itemKey, itemRunId: item.itemRunId, idempotencyKey: (item as any).idempotencyKey,
       contextHash: (item as any).context?.contextHash, runId: item.runId, generatedBy: 'llm-worker',
+      ...(workerLlmMode(deps) !== 'real' ? { llmMode: workerLlmMode(deps) } : {}),
     },
   });
   return String(art.id);
+}
+
+/** Review r1 (M-1): `real` | `mock` | `replay` del worker (explícito en deps o derivado de la URL base de Anthropic). */
+export function workerLlmMode(deps: Pick<LlmWorkerDeps, 'llmMode' | 'baseUrl'>): 'real' | 'mock' | 'replay' {
+  if (deps.llmMode === 'mock' || deps.llmMode === 'replay' || deps.llmMode === 'real') return deps.llmMode;
+  return anthropicLlmModeForBaseUrl(deps.baseUrl);
 }
 
 function readPositiveInt(name: string, def: number): number {
@@ -281,6 +295,7 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
     heartbeatMs: readPositiveInt('DYNAMIC_LLM_WORKER_HEARTBEAT_MS', 30_000),
     apiKey: cfg.apiKey,
     baseUrl: String(process.env.ANTHROPIC_API_BASE_URL || 'https://api.anthropic.com'),
+    llmMode: anthropicLlmModeForBaseUrl(process.env.ANTHROPIC_API_BASE_URL),
     defaultModel: String(process.env.DYNAMIC_LLM_WORKER_MODEL || 'claude-sonnet-4-6'),
     idleMs: readPositiveInt('DYNAMIC_LLM_WORKER_IDLE_MS', 120_000),
     totalMs: readPositiveInt('DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS', 15 * 60_000),
@@ -305,6 +320,7 @@ export async function runLlmWorkerLoop(p: { app: INestApplicationContext; logger
   void drain.stopped.then(() => beat());
   const minRunCreatedAt = cfg.since.toISOString();
   logger.log(`dynamic-llm-worker iniciado (executorId=${deps.executorId}, tipos=${types.join(',')}, concurrencia=${llmWorkerConcurrency()}, runs desde ${minRunCreatedAt})`);
+  if (deps.llmMode !== 'real') logger.warn(`dynamic-llm-worker: ANTHROPIC_API_BASE_URL no es la API oficial — todo lo que genere se marca llmMode=${deps.llmMode} (vista previa, nunca un paquete final)`);
   // Loop 6: el ejecutor fija el modelo de la generación dinámica (DYN_GENERATION_MODEL); DYNAMIC_LLM_WORKER_MODEL solo
   // aplica a una llamada que no traiga modelo. Si apunta a otro, se avisa (configuración sin efecto).
   if (process.env.DYNAMIC_LLM_WORKER_MODEL && process.env.DYNAMIC_LLM_WORKER_MODEL !== 'claude-sonnet-4-6') logger.warn(`DYNAMIC_LLM_WORKER_MODEL=${process.env.DYNAMIC_LLM_WORKER_MODEL} no tiene efecto: la generación dinámica usa el modelo fijo del ejecutor (claude-sonnet-4-6)`);

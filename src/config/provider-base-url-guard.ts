@@ -66,6 +66,18 @@ export function providerBaseUrlFindings(env: Record<string, string | undefined>)
   return out;
 }
 
+/**
+ * Review r1 (M-1): procedencia del texto de IA del worker de servidor. `real` solo si la URL base de Anthropic es la
+ * oficial (https, api.anthropic.com, sin puerto ni credenciales) o no está configurada; cualquier otra (un fake local, un
+ * proxy de pruebas) → `mock`: lo que genere nunca llega a un paquete final (classifyRunItems → preview). En cualquier
+ * entorno (la guarda de arranque solo cubre producción).
+ */
+export function anthropicLlmModeForBaseUrl(raw: string | null | undefined): 'real' | 'mock' {
+  const v = String(raw ?? '').trim();
+  if (!v) return 'real';
+  return providerBaseUrlFindings({ ANTHROPIC_API_BASE_URL: v }).length ? 'mock' : 'real';
+}
+
 export interface ProviderBaseUrlVerdict {
   production: boolean;
   findings: ProviderBaseUrlFinding[];

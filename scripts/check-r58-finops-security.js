@@ -106,7 +106,10 @@ async function pureChecks() {
     const d = (action, user, env, payload = {}) => VA.decideVideoEngineAccess({ action, payload, user }, env);
     eq(d('create', U, env0, { dryRun: true }), { allow: true, dryRun: true }, 'dry-run usuario');
     eq(d('batch-create', U, env0, { dry_run: true }).allow, true, 'dry_run usuario');
-    for (const a of ['create', 'batch-create', 'status', 'batch-status', 'auth-test']) eq([d(a, U, env0).allow, d(a, U, env0).status, d(a, U, env0).code], [false, 403, 'video_engine_forbidden'], `${a} sin rol`);
+    for (const a of ['create', 'batch-create', 'auth-test']) eq([d(a, U, env0).allow, d(a, U, env0).status, d(a, U, env0).code], [false, 403, 'video_engine_forbidden'], `${a} sin rol`);
+    // Review r1 (I-2): status / batch-status (solo lectura) → todo usuario autenticado, sin VIDEO_ENGINE_* (v1 en prod).
+    eq([d('status', U, {}, { job_id: 'vg-123' }), d('batch-status', U, {}, { batch_id: 'b_9' })], [{ allow: true, dryRun: false }, { allow: true, dryRun: false }], 'lectura sin rol');
+    eq([d('status', null, {}).status, d('status', U, {}, { job_id: '../x' }).status, d('batch-status', U, {}, { batch_id: { $ne: 1 } }).status], [403, 400, 400], 'lectura: sin usuario / id inválido');
     eq([d('create', A, env0).status, d('create', A, env0).code], [503, 'video_engine_disabled'], 'admin sin VIDEO_ENGINE_ENABLED');
     eq(d('status', A, env0).allow, true, 'status admin (no gasta)');
     const on = { ...env0, VIDEO_ENGINE_ENABLED: 'true' };

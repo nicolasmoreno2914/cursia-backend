@@ -112,6 +112,7 @@ import {
   paidRealProviders,
   decideRunBudget,
   RUN_BUDGET_NOT_AUTHORIZED,
+  pendingPaidRealProviders,
 } from '../finops/run-budget';
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
@@ -1880,6 +1881,18 @@ export class RunsService {
     return this.buildRunDto(await this.loadJobById(job.id), manifest);
   }
 
+  /** Review r1 (M-3): proveedores pagados reales de lo que le queda por generar al run (modos congelados del run). */
+  private async pendingPaidRealProvidersOfRun(job: any, manifest: ManifestDto): Promise<string[]> {
+    const rows: Array<{ item_key: string; status: string }> = await this.dataSource.query(
+      `select distinct on (item_key) item_key, status from public.generation_item_runs where job_id = $1 order by item_key, generation desc`,
+      [job.id],
+    );
+    const statusByKey = new Map(rows.map((r) => [String(r.item_key), String(r.status)]));
+    const ip = (job?.input_payload ?? {}) as Record<string, any>;
+    const modes = runSpendModes(ip.videoMode ?? null, ip.providerModes ?? null);
+    return pendingPaidRealProviders((manifest.manifest?.items ?? []) as RunManifestItem[], statusByKey, modes);
+  }
+
   /** Reanuda un run pausado: ÚNICA transición paused → despachable, siempre por acción explícita del usuario. */
   async resumeRun(
     courseId: number,
@@ -1909,17 +1922,21 @@ export class RunsService {
     }
     // r58 H4: un run sin NINGUNA autorización de presupuesto (o con la última BLOCKED) no se reanuda: sus llamadas
     // pagadas se rechazarían igual (falla cerrado). Primero un administrador autoriza el presupuesto del run.
+    // Review r1 (M-3): solo si a lo que le QUEDA le toca un proveedor pagado real (Videogen / Gamma / TTS en modo real).
+    // Un run pausado al que solo le quedan partes de IA, mock o ya generadas se reanuda: BYOK / mock no gastan de Cursia
+    // y una llamada LLM pagada por Cursia sigue fallando cerrado en el ledger (H4).
     if (isPausedRun(job) && this.finopsBudget) {
       const [lastAuth] = await this.dataSource.query(
         `select decision from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
         [job.id],
       );
-      if (!lastAuth || lastAuth.decision === 'BLOCKED') {
+      const pendingPaid = !lastAuth || lastAuth.decision === 'BLOCKED' ? await this.pendingPaidRealProvidersOfRun(job, manifest) : [];
+      if ((!lastAuth || lastAuth.decision === 'BLOCKED') && pendingPaid.length > 0) {
         throw new ConflictException({
           code: RUN_BUDGET_NOT_AUTHORIZED,
           message: !lastAuth
-            ? `${RUN_BUDGET_NOT_AUTHORIZED}: la generación ${job.id} no tiene un presupuesto autorizado. Un administrador tiene que autorizarlo (POST /finops/courses/${courseId}/authorizations con runId) antes de reanudar.`
-            : `${RUN_BUDGET_NOT_AUTHORIZED}: el presupuesto de la generación ${job.id} fue revocado (BLOCKED). Un administrador tiene que autorizar uno nuevo antes de reanudar.`,
+            ? `${RUN_BUDGET_NOT_AUTHORIZED}: la generación ${job.id} no tiene un presupuesto autorizado y le quedan partes pagadas (${pendingPaid.join(', ')}). Un administrador tiene que autorizarlo (POST /finops/courses/${courseId}/authorizations con runId) antes de reanudar.`
+            : `${RUN_BUDGET_NOT_AUTHORIZED}: el presupuesto de la generación ${job.id} fue revocado (BLOCKED) y le quedan partes pagadas (${pendingPaid.join(', ')}). Un administrador tiene que autorizar uno nuevo antes de reanudar.`,
         });
       }
     }

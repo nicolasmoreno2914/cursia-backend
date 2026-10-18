@@ -703,7 +703,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     eq(n.status, 1, 'sin MIGRATION_ENV=staging no corre');
     const bad = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'authorize', '1;drop'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.abc.supabase.co' }, cwd: os.tmpdir(), encoding: 'utf8' });
     assert(bad.status === 1 && /courseId inválido/.test(bad.stderr), 'courseId validado en el script');
-    // worker on/off: SOLO esa clave del .env, atómico, con backup y sin imprimir otros valores.
+    // worker on/off: SOLO las claves de los workers (proveedores + IA, review r1 M-2) y el HOLD, atómico, con backup y sin
+    // imprimir otros valores.
     const SECRET = 'db-pass-SECRET-9191';
     const tmpW = fs.mkdtempSync(path.join(os.tmpdir(), 'cal-worker-'));
     try {
@@ -712,14 +713,16 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       const on = w('on');
       assert(on.status === 0 && /false → true/.test(on.stdout) && !(on.stdout + on.stderr).includes(SECRET), `on: ${on.stdout}${on.stderr}`);
       const txt = fs.readFileSync(path.join(tmpW, '.env'), 'utf8');
-      eq(txt, `NODE_ENV=production\nDB_PASS=${SECRET}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\nOTHER=1\n`, '.env: solo cambia el flag');
+      eq(txt, `NODE_ENV=production\nDB_PASS=${SECRET}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\nOTHER=1\nDYNAMIC_LLM_WORKER_ENABLED=true\n`, '.env: solo cambian los flags de los workers');
       assert(fs.existsSync(path.join(tmpW, '.env.bak')), 'backup');
-      assert(/ya vale true/.test(w('on').stdout), 'idempotente');
+      assert(/ya valen true/.test(w('on').stdout), 'idempotente');
       assert(w('off').status === 0 && /DYNAMIC_PROVIDER_WORKER_ENABLED=false/.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'off');
+      assert(/^DYNAMIC_LLM_WORKER_ENABLED=false$/m.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'off apaga también el worker de IA');
       // r58: worker_off es persistente (DYNAMIC_WORKERS_HOLD=true, lo respeta el deploy); worker_on lo levanta.
       assert(/^DYNAMIC_WORKERS_HOLD=true$/m.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'off deja el HOLD');
       assert(w('on').status === 0 && /^DYNAMIC_WORKERS_HOLD=false$/m.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'on levanta el HOLD');
-      assert(/ya vale true/.test(w('on').stdout), 'idempotente con HOLD');
+      assert(/^DYNAMIC_LLM_WORKER_ENABLED=true$/m.test(fs.readFileSync(path.join(tmpW, '.env'), 'utf8')), 'on enciende también el worker de IA');
+      assert(/ya valen true/.test(w('on').stdout), 'idempotente con HOLD');
       assert(fs.readFileSync(path.join(tmpW, '.env'), 'utf8').includes(`DB_PASS=${SECRET}\nDYNAMIC_PROVIDER_WORKER_ENABLED=true\nOTHER=1\n`), 'sin cambio de otras claves');
       assert(w('maybe').status === 1, 'modo inválido');
       const guard = spawnSync(process.execPath, [path.resolve('scripts/staging-v21-calibration.js'), 'worker', 'on'], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging', DB_HOST: 'db.hriwbakbuypaiovvvkqh.supabase.co' }, cwd: tmpW, encoding: 'utf8' });

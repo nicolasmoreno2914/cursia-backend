@@ -85,13 +85,15 @@ export interface QualityCheck {
   title: string;
   metric: number | null; // 0..1 (1 = mejor); null = no aplica (sin datos)
   threshold: number;
-  pass: boolean;
+  /** Review r1 (M-6): `null` = neutral (check NO MEDIDO: ni aprobado ni fallido). Medido → true / false como siempre. */
+  pass: boolean | null;
   findings: QualityFinding[];
   /** Loop 10: false = informativo (nunca cambia `pass` del reporte). Ausente = bloquea como siempre. */
   blocking?: false;
   /**
    * r58 (I2): `not_measured` = la regla no tuvo datos para medirse (p. ej. Q7 sin sidecars o sin supuestos internos). Un
-   * check NO MEDIDO nunca es aprobado (`pass: false`) y no cuenta para `report.pass` (`blocking: false`). Ausente = medido.
+   * check NO MEDIDO nunca es aprobado y tampoco es una falla: `pass: null` (neutral; review r1 M-6) y no cuenta para
+   * `report.pass` (`blocking: false`). Ausente = medido.
    */
   status?: 'not_measured';
   /** r58 (I2): por qué no se midió (solo con status not_measured). */
@@ -322,7 +324,8 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
     if (total) {
       checks.push(check('Q7', 'Continuidad entre capítulos (cohesión)', ok / total, T.Q7_MIN_CONTINUITY, f.slice(0, 30)));
     } else {
-      // r58 (I2, AU2 E0.4): antes `null` contaba como aprobado. Ahora NO MEDIDO: nunca pasa, no bloquea el reporte y dice por qué.
+      // r58 (I2, AU2 E0.4): antes `null` contaba como aprobado. Ahora NO MEDIDO: nunca pasa (pass null = neutral, ni
+      // aprobado ni fallido; review r1 M-6), no bloquea el reporte y dice por qué.
       const sidecars = contentChapters.filter((c) => !!inp.contextSummaries[c.id]).length;
       const assumed = contentChapters.reduce((a, c) => a + (inp.contextSummaries[c.id]?.concepts_assumed || []).length, 0);
       const external = f.filter((x) => x.code === 'Q7_EXTERNAL_PREREQUISITE').length;
@@ -333,7 +336,7 @@ export function runQualityBattery(inp: QualityInputs): QualityReport {
           ? `${sidecars} sidecar(s) sin conceptos supuestos`
           : `los ${assumed} conceptos supuestos son prerrequisitos externos (${external}); ninguno coincide con un concepto introducido por el curso`;
       checks.push({
-        id: 'Q7', title: 'Continuidad entre capítulos (cohesión)', metric: null, threshold: T.Q7_MIN_CONTINUITY, pass: false, blocking: false, status: 'not_measured', measuredReason: reason,
+        id: 'Q7', title: 'Continuidad entre capítulos (cohesión)', metric: null, threshold: T.Q7_MIN_CONTINUITY, pass: null, blocking: false, status: 'not_measured', measuredReason: reason,
         findings: [{ code: 'Q7_NOT_MEASURED', severity: 'info', message: `continuidad no medida: ${why} (sidecars ${sidecars}, supuestos ${assumed}, externos ${external})` }, ...f.slice(0, 29)],
       });
     }
@@ -440,7 +443,8 @@ export function compareQualityReports(baseline: QualityReport, candidate: Qualit
     if (b.blocking === false) continue;
     const c = candidate.checks.find((x) => x.id === b.id);
     if (!c) { out.push({ id: b.id, baseline: b.metric, candidate: null, why: 'check ausente' }); continue; }
-    if (b.pass && !c.pass) out.push({ id: b.id, baseline: b.metric, candidate: c.metric, why: 'dejó de pasar' });
+    // Review r1 (M-6): un candidato NO MEDIDO (pass null) no «deja de pasar»: es la regresión «sin datos» de abajo.
+    if (b.pass === true && c.pass === false) out.push({ id: b.id, baseline: b.metric, candidate: c.metric, why: 'dejó de pasar' });
     // Review I3: un check que se medía y deja de tener datos (p. ej. sin sidecars o sin evidencia) es una regresión.
     if (b.metric !== null && c.metric === null) out.push({ id: b.id, baseline: b.metric, candidate: null, why: 'sin datos' });
     if (b.metric !== null && c.metric !== null) {

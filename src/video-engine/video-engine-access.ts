@@ -6,7 +6,11 @@ import { spendBlockReason } from '../modules/finops/spend-controls';
  * la clave de Cursia para CUALQUIER usuario autenticado, sin ledger ni tope. Ahora (puro, testeable):
  *   - dry-run (`payload.dryRun|dry_run === true` en create / batch-create): sin proveedor → cualquier usuario autenticado
  *     (preflight / QA, igual que antes);
- *   - toda otra acción (auth-test, status, batch-status, create, batch-create reales) exige rol: SuperAdmin (email
+ *   - review r1 (I-2): `status` / `batch-status` (solo lectura, costo 0) → cualquier usuario autenticado: así el v1 en
+ *     producción sigue pudiendo seguir los renders que ya envió aunque VIDEO_ENGINE_* no esté configurado. El job_id /
+ *     batch_id de Videogen es opaco (lo devuelve el create al mismo dueño) y actúa como capacidad: no hay registro
+ *     local de dueño por render v1; se valida su forma;
+ *   - toda otra acción (auth-test, create, batch-create reales) exige rol: SuperAdmin (email
  *     verificado, ver super-admin.ts) o `sub` en VIDEO_ENGINE_ALLOWED_OWNERS (coma; `*` = todo usuario autenticado,
  *     opt-in explícito para conservar el v1 abierto) → si no, 403 `video_engine_forbidden`;
  *   - los renders REALES (create / batch-create) además exigen VIDEO_ENGINE_ENABLED=true (default false) → 503
@@ -14,6 +18,9 @@ import { spendBlockReason } from '../modules/finops/spend-controls';
  */
 export const VIDEO_ENGINE_ACTIONS = ['auth-test', 'batch-create', 'create', 'status', 'batch-status'] as const;
 export const VIDEO_ENGINE_RENDER_ACTIONS = new Set(['create', 'batch-create']);
+/** Review r1 (I-2): acciones de solo lectura (sin proveedor pagado) abiertas a todo usuario autenticado. */
+export const VIDEO_ENGINE_READ_ACTIONS = new Set(['status', 'batch-status']);
+const VIDEO_ENGINE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 export type VideoEngineDecision =
   | { allow: true; dryRun: boolean }
@@ -46,6 +53,13 @@ export function decideVideoEngineAccess(
   }
   if (!a.user || !a.user.id) return { allow: false, status: 403, code: 'video_engine_forbidden', message: 'No autenticado.' };
   if (isVideoEngineDryRun(action, a.payload)) return { allow: true, dryRun: true };
+  if (VIDEO_ENGINE_READ_ACTIONS.has(action)) {
+    const id = action === 'status' ? a.payload?.['job_id'] : a.payload?.['batch_id'];
+    if (id !== undefined && id !== null && !(typeof id === 'string' && VIDEO_ENGINE_ID_RE.test(id))) {
+      return { allow: false, status: 400, code: 'video_engine_bad_request', message: 'Identificador de render inválido.' };
+    }
+    return { allow: true, dryRun: false };
+  }
   if (!videoEngineRoleAllowed(a.user, env)) {
     return { allow: false, status: 403, code: 'video_engine_forbidden', message: 'Esta cuenta no tiene acceso al Video Engine.' };
   }

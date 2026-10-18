@@ -36,7 +36,7 @@ import { assessmentItemCountsForPackage, resolveAssessment } from '../package/as
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 import { hoursReportSummary } from '../modules/study-time/hours-ledger';
 import { buildPackageQualityReport, courseQualityReportSummary, CourseQualityReport } from '../modules/quality/course-quality-report';
-import { PACKAGE_REUSE_REJECTED, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
+import { PACKAGE_REUSE_REJECTED, PACKAGE_REUSE_VERIFY_UNAVAILABLE, chooseDynamicMbzUploadPath, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
 import { sha256Hex } from '../modules/artifacts/artifacts.service';
 import { isNonRealLlmMode } from '../modules/artifacts/artifact-type-policy';
 
@@ -176,6 +176,11 @@ async function firstVerifiedCandidate<T extends { id: string; storageBucket?: st
   for (const c of candidates) {
     const v = await verifyReusableDynamicMbz(artifacts, c, expected, { requireValidated });
     if (v.ok === true) return c;
+    // Review r1 (I-1): un fallo transitorio de Storage al verificar NO dispara un rebuild (que antes terminaba
+    // pisando los bytes entregados): el job falla con un código clase A y se reintenta.
+    if ((v as { reason: string }).reason === 'download_failed') {
+      throw new Error(`${PACKAGE_REUSE_VERIFY_UNAVAILABLE}: no se pudo descargar dynamic_mbz ${c.id} del run ${expected.runId} para verificarlo (Storage) — se reintenta, nunca se reconstruye encima`);
+    }
     logger?.warn(`${PACKAGE_REUSE_REJECTED}:${(v as { reason: string }).reason} — dynamic_mbz ${c.id} del run ${expected.runId} no se reutiliza (se reconstruye)`);
   }
   return null;
@@ -426,7 +431,10 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     // DoD follow-up (R7): un paquete QA va con el prefijo `QA-VISTA-PREVIA-` y bajo `qa-internal/` (fuera de
     // las políticas own-folder del dueño), igual que en v3.
     const mbzFilename = `${qa ? QA_PACKAGE_FILENAME_PREFIX : ''}${sourceIdsHash}.mbz`;
-    const storagePath = `${qa ? `${QA_INTERNAL_STORAGE_PREFIX}/` : ''}${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
+    const canonicalPath = `${qa ? `${QA_INTERNAL_STORAGE_PREFIX}/` : ''}${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
+    // Review r1 (I-1): si un artifact ya referencia la ruta canónica (paquete entregado), el rebuild va a una ruta NUEVA.
+    const { storagePath, rebuilt } = await chooseDynamicMbzUploadPath(deps.artifacts, canonicalPath, sha256Hex(buffer));
+    if (rebuilt) logger.warn(`Job ${job.id}: ${canonicalPath} ya está referenciado por un artifact — el rebuild se sube a ${storagePath} (los bytes entregados quedan intactos)`);
     const artifact = await deps.artifacts.uploadBufferArtifact({
       ownerId: job.owner_id,
       courseId: artifactCourseId(job),
@@ -443,7 +451,8 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       // insertar el row, el reintento adopta el objeto verificado en vez de
       // fallar para siempre con "already exists".
       adoptExistingOnConflict: true,
-      // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes.
+      // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes; review r1 (I-1):
+      // solo se reemplaza un objeto HUÉRFANO (sin row); uno referenciado → PACKAGE_OBJECT_CONFLICT (nunca se pisa).
       replaceUnverifiedOnConflict: true,
       metadata: {
         runId,
@@ -616,6 +625,8 @@ export async function processV3PackageJob(
     // r58 (I3) fix: horas objetivo congeladas en el Blueprint → «Duración estimada: X h (definida por la institución)» en
     // la bienvenida y «Carga horaria declarada» en la Guía del docente. Antes nunca se pasaban (facts.hours = null siempre).
     hours: packageDeclaredHours(snapshot),
+    // Review r1 (M-5): «(definida por la institución)» solo si el Blueprint congeló que las horas vienen del documento.
+    hoursSource: packageDeclaredHoursSource(snapshot),
     // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
     ...(qa ? { qaPreviewNotice: true } : {}),
   });
@@ -676,9 +687,12 @@ export async function processV3PackageJob(
   // Fix round 3 (N2): un paquete QA / degradado va bajo un prefijo INTERNO (primer segmento ≠ uid del
   // dueño): ninguna política de Storage de `authenticated` (own-folder) lo cubre → solo el backend
   // (service role, para un SUPER_ADMIN) lo firma. El paquete final conserva la ruta de siempre.
-  const storagePath = qa
+  const canonicalPath = qa
     ? `${QA_INTERNAL_STORAGE_PREFIX}/${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`
     : `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
+  // Review r1 (I-1): nunca se sobrescribe un .mbz que un artifact referencia; el rebuild va a `<clave>.<sha16>.mbz`.
+  const { storagePath, rebuilt } = await chooseDynamicMbzUploadPath(deps.artifacts, canonicalPath, sha256Hex(built.mbz));
+  if (rebuilt) logger.warn(`Job ${job.id}: ${canonicalPath} ya está referenciado por un artifact — el rebuild v3 se sube a ${storagePath} (los bytes entregados quedan intactos)`);
   const artifact = await deps.artifacts.uploadBufferArtifact({
     ownerId: job.owner_id,
     courseId: artifactCourseId(job),
@@ -747,6 +761,15 @@ export async function processV3PackageJob(
 export function packageDeclaredHours(snapshot: BlueprintSnapshotV2): number | null {
   const t = snapshot?.course?.targetHours;
   return typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null;
+}
+
+/**
+ * Review r1 (M-5): origen de las horas objetivo. `document` solo si el Blueprint lo congeló explícitamente
+ * (`course.targetHoursSource = 'document'`); hoy el lock no lo congela (decisión #9 pendiente) → null = redacción neutra
+ * «Duración estimada del curso: X h.» (el objetivo puede venir del perfil, de una propuesta de Cursia o del documento).
+ */
+export function packageDeclaredHoursSource(snapshot: BlueprintSnapshotV2): 'document' | null {
+  return packageDeclaredHours(snapshot) !== null && (snapshot?.course as Record<string, unknown> | undefined)?.['targetHoursSource'] === 'document' ? 'document' : null;
 }
 
 /**
