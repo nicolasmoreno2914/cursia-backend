@@ -191,7 +191,8 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
   const headsWithHero = Array.isArray(opening) && opening.length > 0 && (opening[0] as { type?: string }).type === 'hero';
   const head = headsWithHero ? '' : eyebrow(h, opener.kicker, s) + heading(h, 'h2', ch.title, s);
   const examNext = lastOfModule && mod.examEnabled;
-  slots.push(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, ch, examNext, mt))));
+  // T1 (r57): la apertura se arma AL FINAL — el recorrido «Tu recorrido en este capítulo» se deriva de
+  // la secuencia REAL de slots ensamblada (única fuente de verdad), nunca de una lista paralela de flags.
   const practice = ch.kind === 'practice';
   if (practice && (ch.videoEnabled || ch.videoPending)) shellFail(`capítulo de práctica ${ch.number} con video`);
   // [2] Presentación (obligatoria en V2.1 en los capítulos de contenido; el de práctica no tiene).
@@ -304,24 +305,47 @@ export function assembleChapter(input: AssembleChapterInput): ChapterSlot[] {
     mt.ink,
   );
   slots.push(label('closing', 'Cierre', injectIntoMovement(mv('closing'), '', after)));
+  const route = chapterRouteSteps(slots, { practice, reviewCards: ch.reviewCards === true, examNext });
+  slots.unshift(label('opening', 'Apertura', injectIntoMovement(mv('opening'), head, chapterRoute(h, route, mt))));
   return slots;
 }
 
+/** Paso del recorrido anunciado en la apertura (ícono + etiqueta). */
+export type ChapterRouteStep = [EduIcon, string];
+
 /**
- * EV4b — «En este capítulo»: el recorrido del capítulo al final de la apertura, armado SOLO con los
- * flags del capítulo (nunca nombra un recurso que no existe). El estudiante sabe qué viene y en qué
- * orden, como en un curso, no como en un artículo.
+ * T1 (r57) — pasos de «Tu recorrido en este capítulo» DERIVADOS de los slots ensamblados, en su orden
+ * real. Antes la lista se armaba con flags en un orden propio y anunciaba «Ejercicios guiados» antes
+ * del video aunque el ensamblador los pone después de la síntesis (12/12 capítulos de un curso real).
+ * «Antes del video» se anuncia junto al video (es su guía); el aviso de video pendiente no se anuncia.
  */
-function chapterRoute(h: Hx, ch: ChapterFacts, examNext: boolean, mt: Tone): string {
-  // Motor de carga horaria: el capítulo de práctica no tiene presentación; su profundización es la práctica guiada.
-  const steps: Array<[EduIcon, string]> = ch.kind === 'practice' ? [['practica', 'Práctica guiada']] : [['presentacion', 'Presentación'], ['libro', 'Profundización']];
-  // Loop 9 B: la práctica guiada del capítulo de contenido (formativa) sigue al texto.
-  if (ch.kind !== 'practice' && ch.guidedPracticeMinutes !== undefined) steps.push(['practica', 'Ejercicios guiados']);
-  if (ch.videoEnabled) steps.push(['video', 'Video interactivo']);
-  steps.push(['logro', 'Síntesis']);
-  steps.push(ch.activityEnabled ? ['practica', 'Práctica calificada'] : ['repaso', 'Repaso']);
-  if (ch.applicationMinutes !== undefined) steps.push(['logro', 'Actividad de Aplicación']);
-  if (examNext) steps.push(['examen', 'Evaluación del módulo']);
+export function chapterRouteSteps(
+  slots: ReadonlyArray<ChapterSlot>,
+  o: { practice: boolean; reviewCards: boolean; examNext: boolean },
+): ChapterRouteStep[] {
+  const steps: ChapterRouteStep[] = [];
+  for (const sl of slots) {
+    if (sl.kind === 'presentation') steps.push(['presentacion', 'Presentación']);
+    else if (sl.kind === 'video_h5p') steps.push(['video', 'Video interactivo']);
+    else if (sl.kind === 'guided_practice') steps.push(['practica', 'Ejercicios guiados']);
+    else if (sl.kind === 'activity') steps.push(['practica', 'Práctica calificada']);
+    else if (sl.kind === 'review_cards') steps.push(['repaso', 'Repaso']);
+    else if (sl.kind === 'application') steps.push(['logro', 'Actividad de Aplicación']);
+    else if (sl.kind === 'label') {
+      if (sl.role === 'deepening') steps.push(o.practice ? ['practica', 'Práctica guiada'] : ['libro', 'Profundización']);
+      else if (sl.role === 'synthesis') steps.push(['logro', 'Síntesis']);
+      else if (sl.role === 'self_check') steps.push(['repaso', o.reviewCards ? 'Comprueba lo aprendido' : 'Repaso']);
+    }
+  }
+  if (o.examNext) steps.push(['examen', 'Evaluación del módulo']);
+  return steps;
+}
+
+/**
+ * EV4b — «En este capítulo»: el recorrido del capítulo al final de la apertura. T1 (r57): los pasos
+ * vienen de chapterRouteSteps (la secuencia real de slots), nunca nombra un recurso que no existe.
+ */
+function chapterRoute(h: Hx, steps: ChapterRouteStep[], mt: Tone): string {
   const s = bgSurf(h);
   const items = steps
     .map(([ic, x]) => `<li${st(h, [['margin', '0 0 6px 0'], ['padding', 0], ['color', s.fg], ['font-weight', '600']])}>${eduIcon(h.enh, ic, mt.ink, 20)} ${labelHtml(x)}</li>`)
