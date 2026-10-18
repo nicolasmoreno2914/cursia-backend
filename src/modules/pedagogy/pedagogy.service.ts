@@ -22,6 +22,7 @@ import { loadCurrentPedagogicalProfile } from './pedagogy-db';
 import { PedagogyRecommendation, WIZARD_QUESTIONS, recommendApproaches } from './recommendation';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 import { plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
+import { declaredHoursFromAcademicContext } from '../study-time/hours-ledger';
 
 /** Límites del dry-run en línea (lógica pura, pero sin estructuras gigantes). */
 const MAX_DRY_RUN_MODULES = 20;
@@ -96,6 +97,8 @@ export class PedagogyService {
       profile: body.profile ?? null,
       activityTypeRules: this.activityTypeRules(body.activityTypeRules),
       applyStructureAdjustments: body.applyStructureAdjustments,
+      // r58 (I3): registro de horas del diseño (sin documento: declarado = null).
+      hoursReport: true,
     };
     return asBadRequest(() => runPedagogyDryRun(input));
   }
@@ -168,6 +171,8 @@ export class PedagogyService {
         // LOOP 8.3: lo que el docente fijó a mano (el mismo mapa que usa «Aplicar diseño»: misma propuesta, misma huella).
         designPins,
         requirementConstraints,
+        // r58 (I3): registro de horas con las horas que declara el documento (total, componentes, créditos), si las hay.
+        hoursReport: { declared: academic ? declaredHoursFromAcademicContext(academic.context) : null },
       }),
     );
     return {
