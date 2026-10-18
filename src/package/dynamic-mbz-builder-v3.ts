@@ -339,6 +339,11 @@ export interface BuildDynamicMbzV3Input {
    * Cursia con aviso) y nombre de la institución para la portada y el pie. Ausente → logo de Cursia, sin nombre.
    */
   libroBrand?: { logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null; name?: string | null } | null;
+  /**
+   * T1 (r57): bibliografía del programa académico de la institución (textos extraídos de SU documento, con fuente) →
+   * «Referencias» del Libro Guía, tal cual. Ausente/vacía → sin esa subsección (nunca se inventa una referencia).
+   */
+  libroReferences?: ReadonlyArray<string> | null;
 }
 
 /** EV6 DoD: sufijo del nombre del curso de un paquete de QA. */
@@ -971,6 +976,9 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     brandName: input.libroBrand?.name ?? null,
     // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.
     documentKey: packagingPlanV3Sha256(plan),
+    // T1 (r57): la portada y el índice cuentan los capítulos REALES (los de práctica, sin texto en el Libro, en su lugar).
+    practiceChapters: plan.modules.flatMap((m) => m.chapters.filter((ch) => ch.kind === 'practice').map((ch) => ({ number: ch.chapterNumber, title: ch.title, moduleNumber: m.moduleNumber }))),
+    ...(input.libroReferences && input.libroReferences.length ? { programReferences: [...input.libroReferences] } : {}),
   };
   let libro: Awaited<ReturnType<typeof renderLibroPdfV3>>;
   try {

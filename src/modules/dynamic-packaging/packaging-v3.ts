@@ -81,6 +81,7 @@ import { syntheticCoverPng, syntheticMp3, syntheticPdf } from '../../package/v3/
 import { themeMismatch, validatePresentationArtifact } from '../../package/presentation';
 import { pdfPageCount } from '../../package/presentation';
 import { LibroLogoCandidate, resolveLibroLogo } from '../../package/v3/libro-logo';
+import { loadCurrentAcademicContext } from '../academic-context/academic-db';
 
 export const PACKAGING_V3 = 'PACKAGING_V3';
 export const V3_VIDEO_REQUIRES_YOUTUBE = 'v3_video_requires_youtube';
@@ -400,6 +401,8 @@ export interface PackageReuseKeyV3Input {
   omittedVideoKeys?: string[];
   /** r19 (L3): sha256 de la marca del Libro Guía (logo resuelto + nombre): un cambio de logo re-empaqueta. */
   libroBrandSha256?: string;
+  /** T1 (r57): sha256 de las referencias del programa académico del Libro (entra SOLO si hay alguna). */
+  libroReferencesSha256?: string;
 }
 
 export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
@@ -416,6 +419,7 @@ export function packageReuseHashV3(k: PackageReuseKeyV3Input): string {
     // EV6 T5: solo si hay omisiones → la clave de un run 100% real no cambia.
     ...(k.omittedVideoKeys && k.omittedVideoKeys.length ? { omittedVideoKeys: [...k.omittedVideoKeys].sort() } : {}),
     ...(k.libroBrandSha256 ? { libroBrandSha256: k.libroBrandSha256 } : {}),
+    ...(k.libroReferencesSha256 ? { libroReferencesSha256: k.libroReferencesSha256 } : {}),
   });
   return createHash('sha256').update(canon, 'utf8').digest('hex');
 }
@@ -504,6 +508,35 @@ export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, owner
 }
 
 /** Hash de la marca del Libro Guía tal como la verá el builder (logo YA resuelto + nombre) y sus avisos. */
+/**
+ * T1 (r57): referencias del programa académico para el Libro Guía — la bibliografía que el extractor leyó del
+ * documento de la institución (status `found` / `provided`, con su fuente; nunca las `inferred`), en su orden y sin
+ * repetidas. Sin contexto académico guardado → []. Si la lectura falla, aviso visible (nunca en silencio) y [].
+ */
+export async function loadLibroReferencesV3(q: QueryExecutor, courseId: number): Promise<{ references: string[]; warnings: string[] }> {
+  try {
+    const stored = await loadCurrentAcademicContext(q as any, courseId);
+    const seen = new Set<string>();
+    const references: string[] = [];
+    for (const b of stored?.context.bibliography ?? []) {
+      if (b.status !== 'found' && b.status !== 'provided') continue;
+      const t = String(b.text ?? '').replace(/\s+/g, ' ').trim();
+      const k = t.toLowerCase();
+      if (!t || seen.has(k)) continue;
+      seen.add(k);
+      references.push(t);
+    }
+    return { references, warnings: [] };
+  } catch (err) {
+    const why = (err instanceof Error ? err.message : String(err)).slice(0, 80).replace(/\s+/g, ' ').replace(/:/g, ';');
+    return { references: [], warnings: [`libro_references_unavailable:${why}`] };
+  }
+}
+
+export function libroReferencesFingerprintV3(references: readonly string[]): string | undefined {
+  return references.length ? createHash('sha256').update(JSON.stringify(references), 'utf8').digest('hex') : undefined;
+}
+
 export function libroBrandFingerprintV3(brand: Pick<LibroBrandV3, 'logo' | 'name'> & { candidates?: LibroLogoCandidate[] }): { sha256: string; warnings: string[]; logoSource: string } {
   // fix round 3: hash de los bytes del logo RESUELTO (el primer candidato válido), igual que antes.
   const logo = resolveLibroLogo(brand.candidates ?? brand.logo);
@@ -954,6 +987,8 @@ export interface PreparedV3Package {
   profileWarnings: string[];
   /** r19 (L3): marca del Libro Guía (logo candidato + nombre) que el worker pasa al builder. */
   libroBrand: LibroBrandV3;
+  /** T1 (r57): referencias del programa académico para el Libro Guía (el worker las pasa al builder). */
+  libroReferences: string[];
 }
 
 export interface PendingVideoV3 {
@@ -1083,6 +1118,7 @@ export async function prepareV3Package(
   // r19 (L3): el logo resuelto (y el nombre) entran en la clave: cambiar el logo de la cuenta re-empaqueta.
   const libroBrand = await loadLibroBrandV3(q, courseId, run.owner_id ?? null);
   const brandPrint = libroBrandFingerprintV3(libroBrand);
+  const libroRefs = await loadLibroReferencesV3(q, courseId);
   const sourceIdsHash = packageReuseHashV3({
     builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
     manifestSha256: manifest.sha256,
@@ -1094,6 +1130,7 @@ export async function prepareV3Package(
     moodleVersion,
     omittedVideoKeys,
     libroBrandSha256: brandPrint.sha256,
+    libroReferencesSha256: libroReferencesFingerprintV3(libroRefs.references),
   });
   return {
     run,
@@ -1104,8 +1141,9 @@ export async function prepareV3Package(
     staleWarnings: staleWarningsV3(byItem),
     resolved,
     assessment: assessmentPackageSummary(resolved),
-    profileWarnings: [...profileWarningsV3(profiles.theme, resolved), ...libroBrand.warnings, ...brandPrint.warnings],
+    profileWarnings: [...profileWarningsV3(profiles.theme, resolved), ...libroBrand.warnings, ...brandPrint.warnings, ...libroRefs.warnings],
     pendingVideos,
     libroBrand,
+    libroReferences: libroRefs.references,
   };
 }

@@ -115,6 +115,177 @@ const eq = (a, b, m) => assert.deepStrictEqual(a, b, m);
     assert(!v2.issues.some((s) => s.code === 'INTERNAL_VOCABULARY'), 'expectativas viejas: sin el check');
   });
 
+  // ─── Libro Guía (PDF) ───
+  const LB = L('package/v3/libro-v3.js');
+  const LL = L('package/v3/libro-logo.js');
+  const TE = L('modules/theme-engine/index.js');
+  const ROOT = path.resolve(__dirname, '..');
+  let pdfjs;
+  const pdfPages = async (buf) => {
+    pdfjs = pdfjs || (await import(require.resolve('pdfjs-dist/legacy/build/pdf.mjs', { paths: [ROOT] })));
+    const sf = path.join(path.dirname(require.resolve('pdfjs-dist/package.json', { paths: [ROOT] })), 'standard_fonts') + '/';
+    const d = await pdfjs.getDocument({ data: new Uint8Array(buf), standardFontDataUrl: sf, verbosity: 0, isOffscreenCanvasSupported: false, isImageDecoderSupported: false }).promise;
+    const out = [];
+    for (let p = 1; p <= d.numPages; p++) out.push((await (await d.getPage(p)).getTextContent()).items.map((it) => it.str).filter((x) => x.trim() !== ''));
+    return out;
+  };
+  const pdfItems = async (buf, page) => {
+    const d = await pdfjs.getDocument({ data: new Uint8Array(buf), verbosity: 0, isOffscreenCanvasSupported: false, isImageDecoderSupported: false }).promise;
+    return (await (await d.getPage(page)).getTextContent()).items.filter((it) => it.str.trim() !== '').map((it) => ({ s: it.str, x: Math.round(it.transform[4]), y: Math.round(it.transform[5]) }));
+  };
+  const MAP_MD = [
+    '## Mapa conceptual del capítulo', '',
+    '```',
+    'Atención a la víctima',
+    '├── Valoración inicial ──► Riesgos',
+    '│   └── Documentación ▼',
+    '└── Activación de la ruta → Notificación ↓',
+    '    ◄ Seguimiento ╰─╮ ═══',
+    '```', '',
+    'Árbol sin cerco:',
+    '',
+    'Ruta',
+    '├─ Salud',
+    '└─ Justicia',
+    '',
+  ].join('\n');
+  const ANSWERS_MD = [
+    '**Respuesta modelo.**', '',
+    '1. Primera respuesta completa.', '', '2. Segunda respuesta completa.', '', '3. Tercera respuesta completa.', '',
+    'Otra lista con numeración perezosa:', '',
+    '1. Uno', '', '1. Dos', '', '1. Tres', '',
+    'Continúa desde el cuatro:', '',
+    '4. Cuarta', '5. Quinta', '',
+  ].join('\n');
+  const NORMS_MD = 'Según la Ley 1257 de 2008 y la Resolución 459 de 2012, el equipo actúa. La Ley 1257 vuelve a citarse. La Sentencia C-355 de 2006 y la norma ISO 9001:2015 también. La Ley 1.098/2006 protege a la infancia.';
+  const libroInput = (o = {}) => ({
+    courseTitle: 'Curso de prueba de estructura',
+    theme: TE.resolveTheme({ themeFamily: 'editorial', mode: 'light' }),
+    courseIntro: { schemaVersion: 1, welcome: 'w', competencies: ['c'], methodology_note: 'm', closing: 'c', bibliography: [] },
+    modules: [{
+      number: 1,
+      title: 'Primer módulo',
+      intro: { schemaVersion: 1, presentation: 'Presentación del módulo.', outcomes: ['Aplicar la ruta'], journey: [], bibliography: [] },
+      chapters: [
+        { number: 1, title: 'Primer capítulo', md: `# Capítulo 1\n\nTexto.\n\n${MAP_MD}\n${o.extraMd || ''}` },
+        { number: 2, title: 'Segundo capítulo', md: `Texto del segundo.\n\n${NORMS_MD}\n\n${ANSWERS_MD}` },
+      ],
+    }],
+    logo: LL.resolveLibroLogo(null),
+    brandName: null,
+    ...(o.practice === false ? {} : { practiceChapters: [{ number: 3, title: 'Práctica integradora', moduleNumber: 1 }] }),
+    ...(o.refs ? { programReferences: o.refs } : {}),
+  });
+
+  await check('L1 mapas conceptuales: conectores de cajas/flechas/triángulos → ASCII de una columna; 0 sin glifo; el mapa conserva su jerarquía', async () => {
+    const r = await LB.renderLibroPdfV3(libroInput());
+    eq([r.unmappedChars, r.structureUnmappedChars], [0, 0], 'sin caracteres perdidos');
+    const pages = await pdfPages(r.pdf);
+    const all = pages.flat();
+    assert(all.some((x) => /^\+-- Valoración inicial --> Riesgos$/.test(x.trim())), `rama: ${JSON.stringify(all.filter((x) => /Valoración/.test(x)))}`);
+    const it1 = await pdfItems(r.pdf, r.chapterPages[1]);
+    const rama = it1.find((x) => x.s.startsWith('+-- Valoración'));
+    const sub = it1.find((x) => x.s === '+-- Documentación v');
+    const bar = sub && it1.find((x) => x.s.trim() === '|' && Math.abs(x.y - sub.y) <= 1);
+    assert(rama && sub && bar && sub.x > rama.x && bar.x === rama.x, `sub-rama con «|» y «+--» sangrada: ${JSON.stringify(it1.filter((x) => /Documentaci|Valoraci|^\|/.test(x.s)))}`);
+    assert(all.some((x) => /^\+-- Activación de la ruta > Notificación v$/.test(x.trim())), 'flechas → «>» / «v»');
+    assert(all.some((x) => x.trim() === '+- Salud') && all.some((x) => x.trim() === '+- Justicia'), 'árbol sin cerco también línea por línea');
+    assert(!all.some((x) => /\(abajo\)/.test(x)), 'sin «(abajo)» dentro del mapa');
+    eq(LB.structureUnmappedCount('├── ▼ ► → ╰─╮ ═ █'), 0);
+    eq(LB.pdfCodeText('│   └── Documentación ▼'), '|   +-- Documentación v');
+  });
+
+  await check('L1b glifos: un carácter sin equivalente en un mapa/tabla hace FALLAR el Libro (LIBRO_V3_GLYPHS); un emoji decorativo no', async () => {
+    let msg = '';
+    try { await LB.renderLibroPdfV3(libroInput({ extraMd: '```\nNodo 漢 central\n```\n' })); } catch (e) { msg = String(e.message || e); }
+    assert(/^LIBRO_V3_GLYPHS: 1 caracteres/.test(msg), msg);
+    const r = await LB.renderLibroPdfV3(libroInput({ extraMd: '```\n🎯 Nodo central\n```\n' }));
+    eq(r.structureUnmappedChars, 0);
+  });
+
+  await check('L2 listas numeradas: ítems separados por líneas en blanco siguen 1..n (antes todos «1.»), «1. 1. 1.» → 1,2,3 y «4.» empieza en 4', async () => {
+    const r = await LB.renderLibroPdfV3(libroInput());
+    const pages = await pdfPages(r.pdf);
+    const p = pages[r.chapterPages[2] - 1].concat(pages[r.chapterPages[2]] || []);
+    const markers = p.filter((x) => /^\d+\.$/.test(x.trim())).map((x) => Number(x.trim().slice(0, -1)));
+    eq(markers, [1, 2, 3, 1, 2, 3, 4, 5], 'marcadores');
+    const blocks = LB.parseLibroMarkdown('1. a\n\n2. b\n\n3. c');
+    eq(blocks.length, 1, 'una sola lista');
+  });
+
+  await check('L3 portada e índice derivados de la estructura: «3 capítulos (2 de contenido y 1 de práctica)», el índice nombra los 3 en orden y sus páginas coinciden', async () => {
+    const r = await LB.renderLibroPdfV3(libroInput());
+    eq(r.coverLine.startsWith('1 módulo · 3 capítulos (2 de contenido y 1 de práctica)'), true, r.coverLine);
+    eq(r.tocChapterNumbers, [1, 2, 3]);
+    eq(Object.keys(r.chapterPages).map(Number), [1, 2]);
+    const pages = await pdfPages(r.pdf);
+    assert(pages[0].join(' ').includes('3 capítulos (2 de contenido y 1 de práctica)'), 'portada');
+    const toc = pages[1];
+    const items = await pdfItems(r.pdf, 2);
+    for (const n of [1, 2]) {
+      const line = items.find((x) => x.s.startsWith(`Capítulo ${n}.`));
+      const num = items.find((x) => Math.abs(x.y - line.y) <= 3 && /^\d+$/.test(x.s.trim()));
+      eq(Number(num && num.s), r.chapterPages[n], `índice → página del capítulo ${n}`);
+      assert(pages[r.chapterPages[n] - 1].join(' ').includes(['Primer capítulo', 'Segundo capítulo'][n - 1]), `la página ${r.chapterPages[n]} abre el capítulo ${n}`);
+    }
+    assert(toc.some((x) => /Capítulo 3\. Práctica integradora · capítulo de práctica/.test(x)), 'práctica en el índice, sin página');
+    const r0 = await LB.renderLibroPdfV3(libroInput({ practice: false }));
+    eq(r0.coverLine.startsWith('1 módulo · 2 capítulos'), true, 'sin práctica: como antes');
+  });
+
+  await check('L4 referencias: normas citadas en el texto (forma más completa, sin inventar) + programa académico → sección «Referencias»; sin fuentes → se omite', async () => {
+    eq(LB.citedNormativeReferences([{ number: 2, md: NORMS_MD }]).map((x) => x.label), ['Ley 1257 de 2008', 'Resolución 459 de 2012', 'Sentencia C-355 de 2006', 'ISO 9001:2015', 'Ley 1098 de 2006']);
+    eq(LB.citedNormativeReferences([{ number: 1, md: 'La Ley 599 regula.' }, { number: 4, md: 'Ley 599 de 2000.' }]), [{ label: 'Ley 599 de 2000', chapters: [1, 4] }]);
+    eq(LB.citedNormativeReferences([{ number: 1, md: 'La Sentencia T-760/08 y la ley del mercado.' }]).map((x) => x.label), ['Sentencia T-760'], 'año abreviado: no se completa');
+    const refs = ['Ministerio de Salud (2012). Protocolo de atención. Bogotá.'];
+    const r = await LB.renderLibroPdfV3(libroInput({ refs }));
+    eq(r.hasReferences, true);
+    const pages = await pdfPages(r.pdf);
+    const last = pages[pages.length - 1].join(' ');
+    assert(/Referencias/.test(last) && /Normas y documentos citados en el texto/.test(last) && /Referencias del programa académico/.test(last) && last.includes('Protocolo de atención'), last.slice(0, 300));
+    assert(/Ley 1257 de 2008 — capítulo 2\./.test(last), 'norma con su capítulo');
+    assert(pages[1].some((x) => x === 'Referencias'), 'índice con «Referencias»');
+    const none = await LB.renderLibroPdfV3({ ...libroInput(), modules: [{ ...libroInput().modules[0], chapters: [{ number: 1, title: 'Uno', md: 'Texto sin normas.' }] }] });
+    eq([none.hasReferences, none.citedReferences], [false, []]);
+    assert(!(await pdfPages(none.pdf)).flat().some((x) => x === 'Referencias' || x === 'Bibliografía'), 'sin fuentes: sin sección');
+  });
+
+  await check('L5 .mbz con capítulos de práctica + referencias del programa: portada/índice/tarjeta del Libro coherentes, «Referencias» en el PDF, validador en verde', async () => {
+    const mods = [
+      { examEnabled: true, chapters: [{ video: true, activity: true }, { video: false, activity: true }, { practice: true, activity: true }] },
+      { examEnabled: false, chapters: [{ video: true, activity: true }, { practice: true, activity: true }] },
+    ];
+    const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 735, modules: mods });
+    const r = await B.buildDynamicMbzV3({ ...input, libroReferences: ['Organización Mundial de la Salud (2003). Guías para la atención. Ginebra.'] });
+    const v = await V.validateMbzV3(r.mbz, r.expectations);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 4)));
+    const z = await JSZip.loadAsync(r.mbz);
+    const files = await z.file('files.xml').async('string');
+    const block = (files.match(/<file id="\d+">[\s\S]*?<\/file>/g) || []).find((b) => /<filename>libro_guia_[^<]*\.pdf<\/filename>/.test(b));
+    const hash = /<contenthash>([0-9a-f]{40})<\/contenthash>/.exec(block)[1];
+    const pdf = await z.file(`files/${hash.slice(0, 2)}/${hash}`).async('nodebuffer');
+    const pages = await pdfPages(pdf);
+    assert(pages[0].join(' ').includes('5 capítulos (3 de contenido y 2 de práctica)'), `portada: ${pages[0].join(' ')}`);
+    const toc = pages[1].join(' ');
+    for (const n of [1, 2, 3, 4, 5]) assert(toc.includes(`Capítulo ${n}.`), `índice sin el capítulo ${n}: ${toc}`);
+    assert(/Referencias/.test(toc) && pages[pages.length - 1].join(' ').includes('Guías para la atención'), 'referencias del programa');
+    const res = Object.keys(z.files).find((f) => /activities\/resource_\d+\/resource\.xml$/.test(f));
+    const intro = VC.extractText((await z.file(res).async('string')).replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+    assert(/los 3 capítulos de contenido en 2 módulos \(los 2 capítulos de práctica se trabajan en el aula virtual\)/.test(intro), `tarjeta del Libro: ${intro.slice(0, 300)}`);
+  });
+
+  await check('L6 referencias del programa: lectura sin contexto → [], falla de lectura → aviso visible (nunca en silencio); clave de reuse solo cambia con referencias', async () => {
+    const PK = L('modules/dynamic-packaging/packaging-v3.js');
+    eq(await PK.loadLibroReferencesV3({ query: async () => [] }, 1), { references: [], warnings: [] });
+    const bad = await PK.loadLibroReferencesV3({ query: async () => { throw new Error('relation "public.course_profiles" does not exist'); } }, 1);
+    eq(bad.references, []);
+    assert(bad.warnings.length === 1 && /^libro_references_unavailable:/.test(bad.warnings[0]), JSON.stringify(bad.warnings));
+    eq(PK.libroReferencesFingerprintV3([]), undefined);
+    const k = { builderVersion: 'x', manifestSha256: 'm', sourceArtifactIds: ['a'], themeSha256: 't', assessmentProfileSha256: 'p', h5pProfileVersion: 1, vcRendererVersion: 'v', moodleVersion: '4.5' };
+    eq(PK.packageReuseHashV3({ ...k, libroReferencesSha256: undefined }), PK.packageReuseHashV3(k), 'sin referencias: misma clave');
+    assert(PK.packageReuseHashV3({ ...k, libroReferencesSha256: PK.libroReferencesFingerprintV3(['R']) }) !== PK.packageReuseHashV3(k), 'con referencias: otra clave');
+  });
+
   console.log(`\n${ok} ok, ${fail} fail`);
   process.exit(fail ? 1 : 0);
 })();

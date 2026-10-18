@@ -334,9 +334,15 @@ function libroCard(
   const h = hx(theme, opts);
   const cs = { s: panelSurf(h), border: h.t.color.border };
   const c = facts.counts;
+  // T1 (r57): el Libro trae el texto de los capítulos de CONTENIDO; los de práctica no tienen texto propio. Antes decía
+  // «15 capítulos» y el PDF tenía 12 (y su portada decía 12): ahora ambos cuentan lo mismo y lo dicen.
+  const practiceN = facts.chapters.filter((x) => x.kind === 'practice').length;
+  const contentN = c.chapters - practiceN;
+  const chaptersText = practiceN
+    ? `los ${contentN} ${plural(contentN, 'capítulo', 'capítulos')} de contenido en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')} (${plural(practiceN, 'el capítulo', `los ${practiceN} capítulos`)} de práctica se ${plural(practiceN, 'trabaja', 'trabajan')} en el aula virtual)`
+    : `${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}`;
   const text =
-    `El texto completo del curso en un solo documento${cta.pdf ? ' PDF' : ''}: ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')} ` +
-    `en ${c.modules} ${plural(c.modules, 'módulo', 'módulos')}${facts.libro.hasBibliography === false ? '' : ', con bibliografía sugerida'}. ` +
+    `El texto completo del curso en un solo documento${cta.pdf ? ' PDF' : ''}: ${chaptersText}${facts.libro.hasBibliography === false ? '' : ', con bibliografía sugerida'}. ` +
     `Extensión aproximada: ${facts.libro.wordCount} palabras.`;
   const inner =
     eyebrow(h, 'Material de estudio', cs.s) +
