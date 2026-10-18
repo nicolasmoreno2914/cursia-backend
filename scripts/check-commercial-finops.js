@@ -316,13 +316,17 @@ const MODEL_OF = { anthropic: 'claude-sonnet-4-6', openai: 'gpt-4o-mini-tts', ga
       assert(e[0] < e[1] && e[1] < e[2], `estimado ${e}`);
     });
 
-    await check('[FA8] (informe) desglose por modelo: el ledger lo guarda por evento; CostReadService no expone byModel', async () => {
+    await check('[FA8] desglose por modelo: el ledger lo guarda por evento y CostReadService lo expone (byModel, F2)', async () => {
       const models = await ds.query(`select provider, model_or_product, count(*)::int n, sum(amount)::text total from public.generation_cost_events where billing_account = 'cursia' group by 1, 2 order by 1, 2`);
       evidence.models = models;
       for (const m of models) if (m.provider !== 'cursia') eq(m.model_or_product, MODEL_OF[m.provider], `modelo de ${m.provider}`);
       const rc = R['A-S'].rc;
       evidence.costReadHasByModel = Object.prototype.hasOwnProperty.call(rc, 'byModel');
-      if (!evidence.costReadHasByModel) console.log('   HALLAZGO F2: CostReadService no tiene desglose por modelo (byProvider / byItemType / byOperation / byItemKey); el modelo solo se ve en el ledger y en «sin precio»');
+      assert(evidence.costReadHasByModel, 'F2: CostReadService expone byModel');
+      const sum = (arr) => n10(arr.reduce((n, r) => n + Number(r.committed), 0));
+      eq(sum(rc.byModel), n10(rc.committed), 'Σ por modelo = comprometido');
+      eq(sum(rc.byModel.filter((g) => g.provider !== 'cursia' && g.provider !== null)), sum(rc.byProvider.filter((g) => g.key !== 'cursia')), 'Σ modelos de proveedor = Σ proveedores externos');
+      for (const g of rc.byModel) if (g.provider !== 'cursia' && MODEL_OF[g.provider]) eq(g.model, MODEL_OF[g.provider], `byModel: modelo de ${g.provider}`);
     });
 
     for (const [id, x] of Object.entries(R)) evidence[id] = { courseId: x.cid, runId: x.runId, items: x.items.length, committed: x.rc && x.rc.committed, actual: x.rc && x.rc.actual, reserved: x.rc && x.rc.reserved, estimated: x.rc && x.rc.estimated && x.rc.estimated.expected, retries: x.rc && x.rc.retries, byProvider: x.rc && x.rc.byProvider.map((p) => [p.key, p.committed, p.providerCalls]) };

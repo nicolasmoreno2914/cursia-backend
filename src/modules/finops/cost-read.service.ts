@@ -73,6 +73,15 @@ export interface CostCounts {
   unpriced: number;
 }
 
+/** F2 (r57): desglose por proveedor + modelo/producto del ledger (mismas definiciones que byProvider). */
+export interface CostModelBreakdownRow extends CostBreakdownRow {
+  provider: string | null;
+  /** `model_or_product` del evento (null si el evento no lo registra). */
+  model: string | null;
+  /** Alias de providerCalls. */
+  calls: number;
+}
+
 export interface CostBreakdownRow {
   key: string | null;
   actual: string;
@@ -129,6 +138,7 @@ export interface CostSummary {
   retries: { calls: number; actual: string | null; committed: string | null };
   counts: CostCounts;
   byProvider: CostBreakdownRow[];
+  byModel: CostModelBreakdownRow[];
   byItemType: CostBreakdownRow[];
   byOperation: CostBreakdownRow[];
   unpriced: { count: number; events: UnpricedEventView[] };
@@ -287,6 +297,7 @@ export function summaryFromAggregates(row: any): CostSummary {
       unpriced: Number(row?.unpriced ?? 0),
     },
     byProvider: [],
+    byModel: [],
     byItemType: [],
     byOperation: [],
     unpriced: { count: Number(row?.unpriced ?? 0), events: [] },
@@ -349,6 +360,31 @@ export class CostReadService {
     }));
   }
 
+  private async modelBreakdown(q: Runner, where: string, params: unknown[]): Promise<CostModelBreakdownRow[]> {
+    const rows = await q.query(
+      `with ${costEventsCte(where)},
+       g as (
+         select provider::text as provider, model_or_product::text as model,
+                coalesce(sum(amount) filter (where ${C} and not is_open), 0) as actual,
+                coalesce(sum(amount) filter (where ${C} and is_open), 0) as reserved,
+                coalesce(sum(amount) filter (where ${C}), 0) as committed,
+                count(*) filter (where ${C} and is_call)::int as provider_calls,
+                count(*)::int as events
+           from ev group by provider, model_or_product),
+       t as (select sum(committed) as total from g)
+       select g.provider, g.model, g.actual::text as actual, g.reserved::text as reserved, g.committed::text as committed, g.provider_calls, g.events,
+              case when t.total is null or t.total = 0 then null else round(100 * g.committed / t.total, 1)::text end as share_pct
+         from g, t
+        order by g.committed desc, g.provider nulls last, g.model nulls last`,
+      params,
+    );
+    return rows.map((r: any) => ({
+      key: `${r.provider ?? ''}/${r.model ?? ''}`, provider: r.provider ?? null, model: r.model ?? null,
+      actual: dec(r.actual), reserved: dec(r.reserved), committed: dec(r.committed),
+      providerCalls: Number(r.provider_calls), calls: Number(r.provider_calls), events: Number(r.events), sharePct: r.share_pct ?? null,
+    }));
+  }
+
   private async unpricedList(q: Runner, where: string, params: unknown[]): Promise<UnpricedEventView[]> {
     const rows = await q.query(
       `with ${costEventsCte(where)}
@@ -369,10 +405,11 @@ export class CostReadService {
     if (base.status === 'no_data') return base;
     // Secuencial: un solo cliente de la transacción (pg no admite consultas concurrentes sobre el mismo cliente).
     const byProvider = await this.breakdown(q, 'provider', where, params);
+    const byModel = await this.modelBreakdown(q, where, params);
     const byItemType = await this.breakdown(q, 'item_type', where, params);
     const byOperation = await this.breakdown(q, 'operation', where, params);
     const unpriced = base.counts.unpriced > 0 ? await this.unpricedList(q, where, params) : [];
-    return { ...base, byProvider, byItemType, byOperation, unpriced: { count: base.counts.unpriced, events: unpriced } };
+    return { ...base, byProvider, byModel, byItemType, byOperation, unpriced: { count: base.counts.unpriced, events: unpriced } };
   }
 
   /** Último estimado scope='run' del run (nunca dinero gastado). */

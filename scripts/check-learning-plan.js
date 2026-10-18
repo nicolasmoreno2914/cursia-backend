@@ -400,6 +400,22 @@ check('L9 dry-run: cada capítulo muestra tipo, justificación, puntos y la deci
   assert(off.learningPlan === undefined && off.chapters.every((c) => c.learningType === undefined && c.activityDecision === undefined), 'sin plan: sin claves nuevas');
 });
 
+check('L9b F1 (r57): la vista previa muestra el tipo del Manifest materializado (con la práctica), con el motivo; sin horas objetivo no cambia nada', () => {
+  const mk = (h) => P.runPedagogyDryRun({ structure: L.STRUCTURE, profile: L.baseProfile({ targetHours: h, learningPlan: { framework: 'teoria_demostracion_practica' } }), activityTypeRules: 2 });
+  // 30 h: el distribuidor agrega capítulos de práctica; el tope de ramificados (1 por 4) del curso completo mueve el escenario.
+  const r30 = mk(30);
+  const moved = r30.chapters.filter((c) => c.activityDecision && /mueve de/.test(c.activityDecision.rationale));
+  assert(moved.length >= 1, 'hay al menos un capítulo cuya decisión cambia al materializar la práctica');
+  for (const c of moved) {
+    assert(c.activityDecision.type !== 'branchingscenario' || c.activityDecision.reason !== 'branching_cap', 'tipo/motivo coherentes');
+    eq(c.activityDecision.reason, 'branching_cap', `${c.title}: el motivo dice que lo movió el tope`);
+    assert(/curso completo/.test(c.activityDecision.rationale), 'la razón explica el movimiento');
+  }
+  // Sin horas objetivo no hay distribución: la decisión es la de siempre (sin texto de movimiento).
+  const r0 = P.runPedagogyDryRun({ structure: L.STRUCTURE, profile: L.baseProfile({ learningPlan: { framework: 'teoria_demostracion_practica' } }), activityTypeRules: 2 });
+  assert(r0.chapters.every((c) => !c.activityDecision || !/mueve de/.test(c.activityDecision.rationale)), 'sin distribución no se mueve nada');
+});
+
 check('L9 catálogo: metodologías y tipos de aprendizaje para el panel', () => {
   const svc = loadDist('modules/pedagogy/pedagogy.service.js');
   const cat = svc.PedagogyService.prototype.catalog.call({});

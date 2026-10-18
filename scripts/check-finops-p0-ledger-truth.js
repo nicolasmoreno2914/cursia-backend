@@ -317,6 +317,11 @@ async function dbChecks() {
       const prov = Object.fromEntries(course.byProvider.map((g) => [g.key, g]));
       eq([prov.anthropic.committed, prov.openai.reserved, prov.openai.actual, prov.videogen.providerCalls, prov.cursia.providerCalls], ['50.6813810500', '0.0522500000', '0.0000000000', 1, 0], 'por proveedor');
       eq(F.addDec(...course.byProvider.map((g) => g.committed)), course.committed, 'Σ proveedores = curso');
+      // F2 (r57): byModel (proveedor + modelo) con las mismas definiciones: suma = curso, y por proveedor = byProvider.
+      eq(F.addDec(...course.byModel.map((g) => g.committed)), course.committed, 'Σ modelos = curso');
+      eq(F.addDec(...course.byModel.map((g) => g.reserved)), F.addDec(...course.byProvider.map((g) => g.reserved)), 'Σ reservado por modelo = por proveedor');
+      eq(F.addDec(...course.byModel.filter((g) => g.provider === 'anthropic').map((g) => g.committed)), prov.anthropic.committed, 'modelos de anthropic = proveedor anthropic');
+      eq(course.byModel.reduce((n, g) => n + g.calls, 0), course.byProvider.reduce((n, g) => n + g.providerCalls, 0), 'llamadas por modelo = por proveedor');
       eq(course.tokens.input, 18100, 'tokens del ledger (cargos finales de Anthropic)');
     });
     await check('[L1] lector admin /finops/courses/:id/costs: total = comprometido Cursia (sin BYOK); charges sin doble conteo (total = charges + adjustments + refunds); retriesPaid = 1 llamada neta', async () => {

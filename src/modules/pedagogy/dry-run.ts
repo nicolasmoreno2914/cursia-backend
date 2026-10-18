@@ -783,6 +783,27 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements });
       const materialized = materializeOrError(lockShaped, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
+        // F1 (r57): con plan de aprendizaje, la decisión de actividad que ve el docente sale del Manifest materializado
+        // (con los capítulos de práctica incluidos), no de la estructura previa: fuente única = lo que se congela.
+        if (planOn && ms.blueprint.course.pedagogy) {
+          const finalDec = choosePedagogicalActivityTypes(ms.blueprint, activityTypeRules);
+          const manifestType = new Map(ms.manifest.items.filter((i) => i.type === 'activity').map((i) => [i.chapterId as string, i.h5pType as string | undefined]));
+          for (const ch of chapters) {
+            const cur = ch.activityDecision;
+            const fin = finalDec.get(ch.chapterId);
+            const mt = manifestType.get(ch.chapterId);
+            if (!cur || !fin || !fin.learningType) continue;
+            const type = mt ?? fin.type;
+            if (type === cur.type && fin.reason === cur.reason) continue;
+            const moved = type !== cur.type;
+            ch.activityDecision = {
+              type, reason: fin.reason, ruleId: fin.learningType.ruleId, candidates: [...fin.learningType.candidates],
+              rationale: moved
+                ? `${fin.learningType.rationale} El tope/balance del curso completo (con los capítulos de práctica) lo mueve de «${cur.type}» a «${type}».`
+                : fin.learningType.rationale,
+            };
+          }
+        }
         return {
           blueprintSha256: ms.blueprintSha256,
           manifestSha256: ms.manifestSha256,

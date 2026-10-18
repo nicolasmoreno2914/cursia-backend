@@ -159,9 +159,8 @@ async function assertCourse(sim) {
     const tg = insp.pages.filter((p) => p.idnumber === 'cv3:shell:teacher_guide');
     eq(tg.map((p) => p.visible), e.teacherGuide ? [0] : [], 'Guía del docente oculta');
   }
-  // Hallazgo (no bloqueante, se informa): la proyección del diseño (dry-run `chapters[].activityDecision`, la que ve el
-  // docente en la vista previa) se calcula ANTES de que el distribuidor agregue capítulos de práctica; el Manifest
-  // congelado reaplica el tope de escenarios ramificados con la práctica incluida y puede mover el ramificado.
+  // F1 (corregido): la proyección del diseño (dry-run `chapters[].activityDecision`) sale del Manifest materializado
+  // (con los capítulos de práctica incluidos); debe coincidir con el h5pType congelado en cada capítulo.
   const manAct = new Map(manifest.items.filter((i) => i.type === 'activity').map((i) => [i.chapterId, i.h5pType]));
   const projectionMismatch = (dryRun.chapters || []).filter((ch) => ch.activityDecision && manAct.has(ch.chapterId) && manAct.get(ch.chapterId) !== ch.activityDecision.type)
     .map((ch) => ({ chapter: ch.title, projected: ch.activityDecision.type, manifest: manAct.get(ch.chapterId) }));
@@ -229,10 +228,10 @@ async function assertCourse(sim) {
   });
 
   // ── CS6 ────────────────────────────────────────────────────────────────────
-  await check('CS6 (informe) proyección del diseño vs Manifest congelado: tipo de actividad por capítulo', () => {
+  await check('CS6 proyección del diseño == Manifest congelado: tipo de actividad por capítulo (F1: fuente única = Manifest materializado)', () => {
     const rows = Object.values(results).filter((x) => x && x.id).flatMap((r) => r.projectionMismatch.map((m) => ({ course: r.id, ...m })));
     results._findings = { projectionMismatch: rows };
-    if (rows.length) console.log(`   HALLAZGO F1: ${rows.length} capítulo(s) donde la vista previa dice un tipo y el Manifest congela otro: ${rows.map((m) => `${m.course}/${m.chapter} ${m.projected}→${m.manifest}`).join('; ')}`);
+    eq(rows, [], `la vista previa dice un tipo y el Manifest congela otro: ${rows.map((m) => `${m.course}/${m.chapter} ${m.projected}→${m.manifest}`).join('; ')}`);
   });
 
   // ── CS5 ────────────────────────────────────────────────────────────────────
