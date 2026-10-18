@@ -153,6 +153,26 @@ export function cachedUserContent(user: unknown, cacheOpts?: { cachePrefix?: str
   return blocks;
 }
 
+/**
+ * r58 (record/replay): el pedido EXACTO que el worker manda a Anthropic por cada llamada de api() — una sola definición
+ * para el worker (createServerApi) y para el replay offline (scripts/lib/replay-api.js): mismo body ⇒ mismo hash ⇒
+ * los puntos de guardado del servidor sirven de fixtures sin volver a pagar.
+ */
+export function serverLlmRequestBody(a: {
+  system: unknown; user: unknown; maxTok?: number; schema?: unknown; model?: string; defaultModel: string; cacheOpts?: { cachePrefix?: string };
+}): { body: Record<string, unknown>; model: string; maxTokens: number } {
+  const useModel = a.model || a.defaultModel;
+  const maxTokens = Math.max(1, Math.min(a.maxTok || 4000, LLM_WORKER_MAX_TOKENS_CAP));
+  const body: Record<string, unknown> = { model: useModel, max_tokens: maxTokens, system: a.system, messages: [{ role: 'user', content: cachedUserContent(a.user, a.cacheOpts) }] };
+  if (a.schema) body.output_config = { format: { type: 'json_schema', schema: a.schema } };
+  return { body, model: useModel, maxTokens };
+}
+
+/** Hash del pedido (clave del punto de guardado `output_summary.llmCheckpoints[hash]`). */
+export function serverLlmRequestHash(body: Record<string, unknown>): string {
+  return sha(JSON.stringify(body));
+}
+
 export function pendingReviewMessage(detail: string): string {
   return `${LLM_PENDING_REVIEW}: resultado ambiguo repetido de la IA (${detail}). Esta parte queda en revisión sin volver a generarse; el resto del curso sigue. Se conservan las reservas para conciliarlas.`;
 }
@@ -164,11 +184,8 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
   const notUnknown = new Set<string>();
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   return async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>, cacheOpts?: { cachePrefix?: string }): Promise<string> {
-    const useModel = model || deps.defaultModel;
-    const maxTokens = Math.max(1, Math.min(maxTok || 4000, LLM_WORKER_MAX_TOKENS_CAP));
-    const body: Record<string, unknown> = { model: useModel, max_tokens: maxTokens, system, messages: [{ role: 'user', content: cachedUserContent(user, cacheOpts) }] };
-    if (schema) body.output_config = { format: { type: 'json_schema', schema } };
-    const hash = sha(JSON.stringify(body));
+    const { body, model: useModel, maxTokens } = serverLlmRequestBody({ system, user, maxTok, schema, model, defaultModel: deps.defaultModel, cacheOpts });
+    const hash = serverLlmRequestHash(body);
     const role = roleOf(extraHeaders);
 
     // ── Punto de guardado: la misma llamada ya respondida en esta ventana de la parte → sin costo ni generación. ──
