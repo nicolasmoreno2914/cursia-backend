@@ -86,12 +86,26 @@ rebuilds the `.mbz` without regenerating content.
 
 - `mode`: `page` (default behaviour) or `assign` (Moodle Tarea); `chapterModes` overrides per chapter.
 - `submission`: online text and/or files; `maxFiles` 1–20; `maxBytes` per file, 1 KB–100 MB; `fileTypes` allowlist.
-- `dueOffsetDays`: `null` or 1–365 days from the course start (Moodle shifts it on restore).
+- `dueOffsetDays` (optional): absent or `null` = **no due date** (the default; the panel leaves it empty). With
+  1–365, `duedate` = the course `<startdate>` **in the backup** + N days (`assignDueDate`; the backup's
+  `<startdate>` and `<original_course_startdate>` are the same value, the packaging clock). When the course is
+  restored with a new start date, Moodle shifts every date by (new start − backup start), so the due date stays N days
+  after the course start. If the course is restored keeping the backup's start date (e.g. the CLI restore without a
+  start date, or «Mantener la fecha de inicio original»), the due date is N days after the **packaging** time and can
+  already be in the past: set the course start date on restore, or leave `dueOffsetDays` empty.
 - `grading`: `{ "graded": false }` (formative: no grade item, no rubric, feedback comments on) or graded with
   `maxGrade` 1–100, `gradepass` 0–max, `category` `applications` (own gradebook category, needs the `applications`
-  weight) or `practice`, `rubric` (built from the AA criteria and the solucionario correction guide; visible to the
-  student after grading).
+  weight) or `practice`, `rubric` (one criterion per AA criterion with its weight; levels Insuficiente 0 / En proceso
+  ⌊w/2⌋ / Logrado w with **generic** descriptors built from the criterion name; visible to the student after
+  grading). The solucionario's correction guide is teacher-only (hidden page + PDF) and never goes into the rubric;
+  the teacher material pairs each guide entry with its criterion **by name** (position only as fallback).
 - Completion is on submit. The course is still approved only by the final course grade.
+- Gradebook before grading (review r1): a **formative** assign has no grade item, so it can never change a grade.
+  A **graded** assign is a grade item in its category; v3 categories and the course use `aggregateonlygraded = 0`
+  («Solo calificaciones no vacías» = No), so an assign that is submitted but **not yet graded counts as 0** in its
+  category and in the course total until the teacher grades it. A student cannot reach the course passing grade
+  (and the certificate badge) while graded assigns are pending. Tell clients to grade assigns before judging course
+  results; harness `check-review-r1-fixes` (G) asserts both behaviours.
 
 ## 4. `practiceResources` (assessment profile, T5)
 
@@ -114,7 +128,9 @@ rebuilds the `.mbz` without regenerating content.
 
 - `relation`: `application` (placed before the AA and linked from it) or `chapter` (chapter material).
 - `source.kind: artifact`: a `practice_file` artifact of the run owner (uploaded with `artifactUpload`); size, sha256,
-  mimetype and format signature are verified at packaging (`PRACTICE_FILE_INVALID` = held for the user).
+  mimetype and format signature are verified at packaging (`PRACTICE_FILE_INVALID` = held for the user). An artifact
+  that was deleted, belongs to someone else or is not a `practice_file` fails with `PRACTICE_FILE_MISSING` — same
+  class D «package_precheck» group (held for a person: re-attach the file in the profile; never retried alone).
 - `source.kind: table`: CSV (RFC 4180 + BOM) or minimal XLSX generated deterministically.
 - Allowlist: pdf, docx, xlsx, pptx, odt, ods, odp, csv, txt, zip, png, jpg. Limits: 20 MB per file, 60 MB per course,
   10 files per chapter, 40 per course.
@@ -133,7 +149,9 @@ rebuilds the `.mbz` without regenerating content.
   approval rule; per module and chapter the objective, learning type, resources, the Application Activity (title,
   delivery, product, criteria with weights), the solucionario **by name** (never linked or copied) and the practice
   files; module and final exam question counts.
-- `include: false` or the key absent → the `.mbz` is byte-identical to before. The panel offers it under
+- `include: false` or the key absent → the `.mbz` is byte-identical to before. Both normalize to the same profile
+  (the key is dropped unless `include: true`), so the profile sha is the same and switching it off on a course that
+  never had it does not repackage (review r1, M4). The panel offers it under
   «Entrega y archivos de trabajo → Guía del docente».
 - Validator rule `TEACHER_GUIDE` (exists ⇔ facts say so, hidden, student prohibited, no grade/completion, names every
   module and chapter, nobody links to it).
@@ -150,8 +168,24 @@ rebuilds the `.mbz` without regenerating content.
 | Packager integrity: orphan/malformed blobs, files without owner or inforef, tokens and `@@PLUGINFILE@@` in page content, dead links (`href="#"`, empty, `javascript:`), `MANIFEST_COVERAGE` (presentation with PDF + cover, video, activity per facts), `content/content.json` in every `.h5p` | T6 | `package/v3/mbz-validator-v3.ts` |
 | Package size budget before upload (`PACKAGE_MBZ_MAX_BYTES`, `PACKAGE_MBZ_WARN_BYTES`; job `summary.size`) | T6 | `package/v3/package-size-budget.ts`, `docs/ops/FACTORY-MODE.md` |
 | Deploy freeze, default packaging hold per owner, budget limits from env, auto-repackage on builder bump opt-in | T8 | `docs/ops/FACTORY-MODE.md` |
+| Builder bump with `DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP` off: when the **only** difference is the builder version (same content, profiles, theme, Moodle), the package stays fresh — «Curso listo», no `needs_attention`, no «Hay cambios…». `GET …/package` adds `builderUpdateAvailable: { packagedWith, current }` **for SUPER_ADMIN only** (the panel shows an admin notice with «Re-empaquetar con el armado nuevo»); an explicit `POST …/package` builds with the current builder, the automatic packaging reuses the fresh package. Any other change is stale as before; with the flag on, a builder bump repackages as before | review r1 I1 | `package-freshness.ts`, `packaging.service.ts` |
+| `INTERNAL_VOCABULARY` judges only **generated** text: text written by a person (Blueprint titles and texts, practice file titles/instructions, assessment profile texts, imported program references, institution name) is never repaired and is removed before the validator looks for terms (`expectations.internalVocabularyUserTexts`) | review r1 I2 | `internal-vocabulary.ts`, `dynamic-mbz-builder-v3.ts` |
+| The vocabulary repair never pushes a field past its length limit: if the full repair makes the build fail with `TEXT_TOO_LONG`/`WORD_RANGE`, it is rebuilt with a repair that never lengthens a string (short label, or the original with warning `internal_vocabulary_kept_length_limit:<rule>:n` and that rule exempt) | review r1 I3 | same |
+| Dead links (`href="#"`, empty, `javascript:`) in legacy content are unwrapped deterministically (the text stays; warning `dead_link_unwrapped:n`); only unresolved Moodle tokens `$@…@$` still fail | review r1 M9 | `package/v3/dead-links-v3.ts` |
+| A DB error reading the program references is logged and reported as `libro_references_unavailable:<why>` in the package warnings (the Libro ships without «Referencias») | review r1 M8 | `packaging-v3.ts` |
 
 Harnesses: `check-t1-content-integrity`, `check-learning-plan`, `check-composition-formats`,
 `check-application-deliverables` (+ `-moodle`), `check-t6-package-integrity`, `check-t6-answer-bias-pool`,
-`check-t6-teacher-guide` (+ `-moodle`); fe `test-68-learning-plan`, `test-69-deliverables`,
-`test-70-answer-bias-claim-pool`.
+`check-t6-teacher-guide` (+ `-moodle`), `check-review-r1-fixes` (+ `check-ev6-dod-autopkg` «[AP] review r1 I1», PG);
+fe `test-68-learning-plan`, `test-69-deliverables`, `test-70-answer-bias-claim-pool`, `test-71-builder-update-notice`.
+
+## 7. Cost risks not in the estimator (review r1)
+
+Neither of these retries is modelled in the FinOps priors (`usage-model.priors.v1.json`; changing the priors is a
+calibration decision, not done here). Watch retries and cost per item on the pilot (`byModel` / `byProvider`):
+
+- **Video MC length bias (course level, T6)**: once the course's answer pool is biased (> 30 % «the correct option
+  is the longest», z > 1.96), each new `video_interactions` (and H5P `activity`) item can take **one extra targeted
+  retry** through the existing soft retry. Upper bound ≈ +1 LLM call per biased item.
+- **`FRAMEWORK_ELEMENT_MISSING` (opt-in `learningPlan`, prompt v21-exp-7)**: a hard validation of the methodology
+  phases (e.g. Gagné's 9 events) that adds experience retries when an element is missing. Only with `learningPlan`.
