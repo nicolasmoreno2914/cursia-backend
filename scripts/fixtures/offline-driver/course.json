@@ -1,0 +1,14 @@
+{
+  "_comment": "r58 (I1) — curso SINTÉTICO del driver offline de componentes (scripts/lib/offline-driver.js). Ningún cliente, institución ni curso real: títulos del banco genérico de scripts/lib/composition-fixtures.js (letras = tipo de capítulo). courseId en el rango sintético 9700–9999.",
+  "id": "OD-1", "courseId": 9781, "title": "Curso de ejemplo del driver offline",
+  "format": "S", "targetHours": 12,
+  "modules": [{ "chapters": "PC" }, { "chapters": "KD" }],
+  "pedagogy": { "learningPlan": { "framework": "teoria_demostracion_practica", "composition": { "videos": "by_need" } } },
+  "assessment": {
+    "practiceResources": [
+      { "id": "pr-od-1", "chapter": { "m": 0, "c": 0 }, "title": "Tabla de registro de prueba", "instructions": "Completa la tabla con los datos del caso.", "relation": "chapter",
+        "table": { "format": "csv", "filename": "registro.csv", "columns": ["Paso", "Valor"], "rows": [["Medición inicial", "10"], ["Medición final", "12"]] } }
+    ]
+  },
+  "exams": "bank"
+}

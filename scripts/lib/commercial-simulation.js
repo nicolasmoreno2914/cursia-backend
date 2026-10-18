@@ -234,10 +234,12 @@ function attachExamGift(X, input) {
 }
 
 /**
- * Lleva UNA configuración de curso a paquete validado. Mismo código para todos los cursos.
- * @returns {{ cfg, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment, input, built, validation }}
+ * r58 (I1): la parte de simulateCourse ANTES de los artifacts — configuración → perfiles validados → dry-run → Prebrief →
+ * Blueprint (lock) → Manifest v3 → briefs → perfil de evaluación. La comparten la simulación comercial y el driver
+ * offline de componentes (scripts/lib/offline-driver.js): un solo camino de la configuración al Manifest.
+ * @returns {{ X, cfg, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment }}
  */
-async function simulateCourse(distRoot, cfg) {
+async function prepareCourse(distRoot, cfg) {
   const X = libs(distRoot);
   const structure = C.plainStructure(structureOf(cfg));
   const profile = pedagogyProfileOf(cfg, structure);
@@ -268,8 +270,19 @@ async function simulateCourse(distRoot, cfg) {
     const b = X.P.buildItemPedagogyBrief({ item: it, snapshot: m.locked, activityTypeRules: 2 });
     if (b) briefs.set(it.key, b);
   }
-  // Artifacts de proveedores falsos + perfil de evaluación.
+  // Perfil de evaluación.
   const assessment = await assessmentOf(X, cfg, structure, m.manifest);
+  return { X, cfg, structure, profile, dryRun, prebrief, locked: m.locked, manifest: m.manifest, briefs, assessment };
+}
+
+/**
+ * Lleva UNA configuración de curso a paquete validado. Mismo código para todos los cursos.
+ * @returns {{ cfg, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment, input, built, validation }}
+ */
+async function simulateCourse(distRoot, cfg) {
+  const { X, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment } = await prepareCourse(distRoot, cfg);
+  const m = { locked, manifest };
+  // Artifacts de proveedores falsos.
   const input = PF.packagingInput(distRoot, { snapshot: m.locked, manifest: m.manifest, engine: cfg.engine || 'h5p', finalExam: cfg.finalExam !== false, profile: assessment.profile });
   if (assessment.files.size) input.contents.practiceFiles = assessment.files;
   if ((cfg.exams || 'bank') === 'bank') attachExamBanks(X, input);
@@ -311,4 +324,4 @@ async function inspectMbz(mbz) {
   return { byModname, h5p, quizzes, pages };
 }
 
-module.exports = { simulateCourse, inspectMbz, structureOf, pedagogyProfileOf, minimalPptx, sha256, MIME };
+module.exports = { simulateCourse, prepareCourse, attachExamGift, inspectMbz, structureOf, pedagogyProfileOf, minimalPptx, sha256, MIME };
