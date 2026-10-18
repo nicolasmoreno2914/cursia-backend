@@ -39,6 +39,13 @@ on:
         description: 'Id numérico del curso (authorize / report / reconcile_charged[_dry]; opcional en titles_dry/titles_apply/failures_report)'
         type: string
         default: ''
+      # T8 (factory mode): escape EXPLÍCITO de la guardia de congelamiento (DEPLOY_FREEZE + runs/empaques activos).
+      # Solo por dispatch: un push nunca la saltea. Ver docs/ops/FACTORY-MODE.md.
+      force_deploy:
+        description: 'yes = desplegar aunque DEPLOY_FREEZE=true o haya runs dinámicos / empaques activos (el deploy los interrumpe)'
+        type: choice
+        options: ['no', 'yes']
+        default: 'no'
 
 concurrency:
   group: deploy-staging
@@ -52,6 +59,24 @@ jobs:
     environment: staging
 
     steps:
+      # T8 (factory mode): DEPLOY_FREEZE=true (variable del repo o del environment staging) congela TODO deploy;
+      # solo un workflow_dispatch con force_deploy=yes pasa. Primer paso: nada corre antes.
+      - name: Deploy freeze guard (DEPLOY_FREEZE variable)
+        env:
+          DEPLOY_FREEZE: ${{ vars.DEPLOY_FREEZE }}
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy || 'no' }}
+        run: |
+          freeze="$(printf '%s' "$DEPLOY_FREEZE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          if [ "$freeze" = "true" ]; then
+            if [ "$FORCE_DEPLOY" = "yes" ]; then
+              echo "::warning::DEPLOY_FREEZE=true pero force_deploy=yes: el deploy sigue (forzado)."
+            else
+              echo "::error::DEPLOY_FREEZE=true: deploys a staging congelados (factory mode). Forzar: workflow_dispatch con force_deploy=yes."
+              exit 1
+            fi
+          fi
+          echo "✓ sin DEPLOY_FREEZE (o forzado)"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -95,6 +120,9 @@ jobs:
 
       - name: Check dynamic feature gating (Fase 9 — G1/G3/G4 + video real I1)
         run: node scripts/check-dynamic-feature-gating.js
+
+      - name: Check T8 deploy freeze guard (DEPLOY_FREEZE + runs/empaques activos; puro, la parte PG16 corre local)
+        run: node scripts/check-deploy-freeze-guard.js --pure-only
 
       - name: Check deploy workflows run the dynamic workers (HD-6)
         run: node scripts/check-deploy-dynamic-workers.js
@@ -193,6 +221,22 @@ jobs:
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      # T8 (factory mode): ANTES del rsync (nada del código nuevo llega al VPS) — consulta de SOLO LECTURA con el
+      # .env y el driver pg que ya están en el VPS; el script viaja por stdin (versión de este commit). Aborta si hay
+      # runs dinámicos activos, items reclamados o empaques activos (exit 2), DEPLOY_FREEZE=true en el .env del VPS
+      # (exit 3) o la consulta falla (exit 1, fail closed). force_deploy=yes → solo reporta.
+      - name: Deploy freeze guard (no active dynamic runs / package jobs on the staging VPS)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH_STAGING: ${{ secrets.VPS_PATH_STAGING }}
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy || 'no' }}
+        run: |
+          FORCE_ARG=""
+          if [ "$FORCE_DEPLOY" = "yes" ]; then FORCE_ARG="--force"; fi
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cd '$DEPLOY_VPS_PATH_STAGING' && node - $FORCE_ARG" < scripts/ops/check-active-runs.js
 
       - name: Fix VPS staging file ownership (heals stale root-owned files)
         run: |

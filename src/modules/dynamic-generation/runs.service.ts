@@ -156,7 +156,15 @@ import {
   sweepRunExpiredLeases,
   takeCompletedRunsInTx,
 } from './item-transitions';
-import { StopAfterBody, StopAfterView, packageHoldOf, stopAfterOf, stopAfterView } from './stop-after';
+import {
+  StopAfterBody,
+  StopAfterView,
+  initialRunOutputSummary,
+  invalidDefaultHoldPackagingEntries,
+  packageHoldOf,
+  stopAfterOf,
+  stopAfterView,
+} from './stop-after';
 import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned } from '../reliability/attempt-log';
 import { FailureProvider } from '../reliability/failure-classifier';
 import {
@@ -1405,7 +1413,8 @@ export class RunsService {
                    null, null, now(), now())
            returning id`,
           [ownerId, courseId, course?.frontend_course_id ?? null, manifestB.blueprintId, JSON.stringify(inputPayload),
-            JSON.stringify({ invalidation })],
+            // T8: retención del empaque por defecto (DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS); sin la lista, {invalidation}.
+            JSON.stringify(this.initialOutputSummary(ownerId, { invalidation }))],
         );
         await qr.query(
           `insert into public.generation_run_contexts (job_id, manifest_id, context, context_hash)
@@ -4752,6 +4761,15 @@ export class RunsService {
    * NOTHING, en el orden del Manifest. Si no se insertaron TODOS (alguno ya
    * existía de otro run) → 409 y rollback: nunca un run con items ajenos.
    */
+  /** T8: `output_summary` inicial de un run nuevo (retención del empaque por defecto por owner; aviso si la lista es inválida). */
+  private initialOutputSummary(ownerId: string, base: Record<string, unknown> = {}): Record<string, unknown> {
+    const bad = invalidDefaultHoldPackagingEntries();
+    if (bad.length) this.logger.warn(`DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS: ${bad.length} entrada(s) que no son UUID ni '*' — ignoradas`);
+    const out = initialRunOutputSummary(ownerId, base);
+    if (out.stopAfter) this.logger.log(`run nuevo del owner ${ownerId}: empaque retenido por defecto (DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS)`);
+    return out;
+  }
+
   private async insertRun(
     qr: QueryRunner,
     manifest: ManifestDto,
@@ -4779,10 +4797,11 @@ export class RunsService {
           progress, blueprint_version_id, input_payload, output_summary, options, result,
           lease_until, worker_id, created_at, updated_at)
        values ($1, $2, $3, 'dynamic_generation', 'queued', 'queued', 'dynamic_generation',
-               0, $4, $5::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+               0, $4, $5::jsonb, $6::jsonb, '{}'::jsonb, '{}'::jsonb,
                null, null, now(), now())
        returning id`,
-      [ownerId, courseId, frontendCourseId, manifest.blueprintId, JSON.stringify(inputPayload)],
+      // T8: retención del empaque por defecto (DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS); sin la lista, '{}' como antes.
+      [ownerId, courseId, frontendCourseId, manifest.blueprintId, JSON.stringify(inputPayload), JSON.stringify(this.initialOutputSummary(ownerId))],
     );
 
     await qr.query(

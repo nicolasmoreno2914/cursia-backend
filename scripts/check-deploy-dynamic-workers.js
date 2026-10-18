@@ -928,6 +928,37 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     eq(S.planPolicy(null).action, 'none', 'sin política: no inventa una');
   });
 
+  // ── T8 (factory mode): límites de la política de staging desde el .env del VPS (mismos defaults) ──
+  await check('T8 staging-budget-policy.js: STAGING_BUDGET_MAX_COST_PER_RUN / _PER_COURSE / _MONTHLY_CAP del entorno (o del .env de staging) reemplazan los defaults 106/106/162 sin cambiar código; ausentes/vacíos → defaults; inválidos (texto, ≤ 0, >2 decimales) → exit 1 sin conectar', () => {
+    const S = require(path.join(repoRoot, 'scripts/staging-budget-policy.js'));
+    eq(S.BUDGET_ENV, { maxCostPerRun: 'STAGING_BUDGET_MAX_COST_PER_RUN', maxCostPerCourse: 'STAGING_BUDGET_MAX_COST_PER_COURSE', monthly: 'STAGING_BUDGET_MONTHLY_CAP' }, 'nombres');
+    const d = S.targetFromEnv({});
+    eq([d.target, d.overridden, d.createdBy], [{ maxCostPerRun: 106, maxCostPerCourse: 106, monthly: 162 }, [], S.CREATED_BY], 'defaults sin cambios');
+    eq(S.targetFromEnv({ STAGING_BUDGET_MAX_COST_PER_RUN: ' ', STAGING_BUDGET_MONTHLY_CAP: '' }).target, { maxCostPerRun: 106, maxCostPerCourse: 106, monthly: 162 }, 'vacíos → defaults');
+    const o = S.targetFromEnv({ STAGING_BUDGET_MAX_COST_PER_RUN: '110', STAGING_BUDGET_MONTHLY_CAP: '2500.50' });
+    eq([o.target, o.overridden], [{ maxCostPerRun: 110, maxCostPerCourse: 106, monthly: 2500.5 }, ['STAGING_BUDGET_MAX_COST_PER_RUN', 'STAGING_BUDGET_MONTHLY_CAP']], 'override parcial');
+    assert(/\.env de staging/.test(o.createdBy) && /110/.test(o.createdBy), `created_by con origen: ${o.createdBy}`);
+    for (const bad of ['abc', '0', '-5', '1e3', '10.123', '12,5']) {
+      let err = null;
+      try { S.targetFromEnv({ STAGING_BUDGET_MAX_COST_PER_COURSE: bad }); } catch (e) { err = e; }
+      assert(err && /STAGING_BUDGET_MAX_COST_PER_COURSE inválido/.test(err.message), `rechaza "${bad}"`);
+    }
+    const cur = { scope: 'global', scope_id: null, version: 3, limits: { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCapStaging: '162' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
+    eq(S.planPolicy(cur).action, 'noop', 'defaults: la política vigente no cambia');
+    const p = S.planPolicy(cur, o.target, o.createdBy);
+    eq([p.action, p.row.limits, p.row.created_by], ['insert', { maxCostPerRun: '110', maxCostPerCourse: '106', monthlyCapStaging: '2500.5' }, o.createdBy], 'override: versión nueva con los valores del .env');
+    eq(S.planPolicy({ ...cur, limits: p.row.limits }, o.target, o.createdBy).action, 'noop', 'override idempotente (el próximo deploy no lo revierte)');
+    // Proceso real: un valor inválido en el .env del VPS aborta antes de conectarse.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'stg-policy-t8-'));
+    try {
+      fs.writeFileSync(path.join(tmp, '.env'), 'DB_HOST=db.abcstaging.supabase.co\nSTAGING_BUDGET_MAX_COST_PER_RUN=muchos\n');
+      const r = spawnSync(process.execPath, [path.join(repoRoot, 'scripts/staging-budget-policy.js')], { env: { PATH: process.env.PATH, MIGRATION_ENV: 'staging' }, cwd: tmp, encoding: 'utf8', timeout: 20000 });
+      assert(r.status === 1 && /STAGING_BUDGET_MAX_COST_PER_RUN inválido/.test(r.stderr) && !/ECONNREFUSED|ENOTFOUND/.test(r.stderr), `inválido en .env: ${r.stderr}`);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   // ── Límite de GitHub: un `run` con expresiones ${{ }} se rechaza (≈21000 caracteres) y el workflow
   // falla en 0 s sin correr ("workflow file issue"). Pasó en staging con #66/#67 (20976 y 21327 bytes).
   await check('workflows: ningún `run` con expresiones ${{ }} supera 20000 bytes (margen bajo el límite de GitHub)', async () => {
