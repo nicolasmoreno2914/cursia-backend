@@ -16,6 +16,14 @@
  * Excepción por dominio: si el CONTENIDO del propio curso (el Libro) usa el término (p. ej. un curso de
  * traducción habla de «texto fuente»; uno de pedagogía, de «worked example»), es vocabulario del tema y la
  * regla no aplica a ese curso (`internalVocabularyExemptions`).
+ *
+ * Review r1:
+ *  - I2: el texto que escribió una PERSONA (títulos del curso/módulos/capítulos del Blueprint, título e instrucciones
+ *    de un archivo de práctica, textos del perfil, referencias importadas de su documento) nunca se repara ni bloquea:
+ *    se pasa como `protectedTexts` (la reparación no lo toca) y el validador lo quita antes de buscar términos.
+ *  - I3: `repairInternalVocabularyDeep(…, { noGrowth: true })` nunca alarga un texto (caracteres ni palabras): prueba
+ *    el rótulo completo, después el corto (`shortLabel`) y, si los dos alargan, deja el original y lo informa
+ *    (`kept`). El builder lo usa solo si la reparación completa empujó un campo más allá de su límite.
  */
 
 type Gender = 'm' | 'f';
@@ -28,18 +36,21 @@ export interface InternalVocabularyRule {
   re: RegExp;
   /** reemplazo en lenguaje natural ('' = se elimina). */
   label: string;
+  /** Review r1 (I3): reemplazo corto (una palabra, mismo género y número) para un campo al límite de su largo. */
+  shortLabel: string;
   gender: Gender;
   num: Num;
   /** texto que, si aparece en el contenido del curso, convierte el término en vocabulario del dominio. */
   domainProbe: RegExp;
 }
 
-const term = (id: string, label: string, gender: Gender, num: Num, extra?: string): InternalVocabularyRule => {
+const term = (id: string, label: string, gender: Gender, num: Num, extra?: string, shortLabel?: string): InternalVocabularyRule => {
   const body = extra ?? id;
   return {
     id,
     re: new RegExp(`\\b${body}\\b`, 'gi'),
     label,
+    shortLabel: shortLabel ?? label,
     gender,
     num,
     domainProbe: new RegExp(`\\b${body}\\b`, 'i'),
@@ -51,30 +62,31 @@ const term = (id: string, label: string, gender: Gender, num: Num, extra?: strin
  * inglesas que no son español (nunca palabras corrientes como «hero», «tabs» o «closing»: podrían ser del tema).
  */
 export const INTERNAL_VOCABULARY_RULES: readonly InternalVocabularyRule[] = Object.freeze([
-  term('worked_example', 'ejemplo resuelto', 'm', 's', 'worked[_ ]examples?'),
+  term('worked_example', 'ejemplo resuelto', 'm', 's', 'worked[_ ]examples?', 'ejemplo'),
   term('case_scenario', 'caso', 'm', 's', 'case[_ ]scenarios?'),
-  term('concept_cards', 'conceptos clave', 'm', 'p'),
-  term('reveal_cards', 'tarjetas para descubrir', 'f', 'p'),
-  term('process_steps', 'procedimiento paso a paso', 'm', 's'),
-  term('myth_reality', 'contraste entre mitos y realidades', 'm', 's'),
+  term('concept_cards', 'conceptos clave', 'm', 'p', undefined, 'conceptos'),
+  term('reveal_cards', 'tarjetas para descubrir', 'f', 'p', undefined, 'tarjetas'),
+  term('process_steps', 'procedimiento paso a paso', 'm', 's', undefined, 'procedimiento'),
+  term('myth_reality', 'contraste entre mitos y realidades', 'm', 's', undefined, 'contraste'),
   term('summary_visual', 'síntesis', 'f', 's'),
-  term('self_check', 'autoevaluación', 'f', 's'),
-  term('learning_objectives', 'objetivos de aprendizaje', 'm', 'p'),
+  term('self_check', 'autoevaluación', 'f', 's', undefined, 'prueba'),
+  term('learning_objectives', 'objetivos de aprendizaje', 'm', 'p', undefined, 'objetivos'),
   term('bridge_to_next', 'cierre', 'm', 's'),
-  term('video_primer', 'guía previa', 'f', 's'),
-  term('guided_practice', 'ejercicios guiados', 'm', 'p'),
-  term('application_activity', 'actividad de aplicación', 'f', 's'),
-  term('deepening', 'profundización', 'f', 's'),
-  term('workshopSolution', 'solución del taller', 'f', 's'),
-  term('correctionGuide', 'guía de corrección', 'f', 's'),
-  term('teacherNotes', 'notas para el docente', 'f', 'p'),
-  term('answerLines', 'espacio de respuesta', 'm', 's'),
+  term('video_primer', 'guía previa', 'f', 's', undefined, 'guía'),
+  term('guided_practice', 'ejercicios guiados', 'm', 'p', undefined, 'ejercicios'),
+  term('application_activity', 'actividad de aplicación', 'f', 's', undefined, 'actividad'),
+  term('deepening', 'profundización', 'f', 's', undefined, 'extensión'),
+  term('workshopSolution', 'solución del taller', 'f', 's', undefined, 'solución'),
+  term('correctionGuide', 'guía de corrección', 'f', 's', undefined, 'pauta'),
+  term('teacherNotes', 'notas para el docente', 'f', 'p', undefined, 'notas'),
+  term('answerLines', 'espacio de respuesta', 'm', 's', undefined, 'espacio'),
   term('exerciseId', 'ejercicio', 'm', 's'),
   // «Texto fuente» = rótulo del prompt para el capítulo; para el lector es el Libro Guía.
   {
     id: 'texto_fuente',
     re: /\btextos? fuentes?\b/gi,
     label: 'Libro Guía',
+    shortLabel: 'Libro',
     gender: 'm',
     num: 's',
     domainProbe: /\btextos? fuentes?\b/i,
@@ -127,15 +139,16 @@ export function lintInternalVocabulary(text: string, exempt: readonly string[] =
 }
 
 /** Reparación determinística de UN texto. Devuelve el texto y las reglas aplicadas. */
-export function repairInternalVocabulary(text: string, exempt: readonly string[] = []): { text: string; fixes: string[] } {
+export function repairInternalVocabulary(text: string, exempt: readonly string[] = [], opts: { short?: boolean } = {}): { text: string; fixes: string[] } {
   let s = String(text ?? '');
   const fixes: string[] = [];
   for (const r of INTERNAL_VOCABULARY_RULES) {
     if (exempt.includes(r.id)) continue;
     const re = new RegExp(`\\b${ARTICLE_RE}(${r.re.source.replace(/^\\b/, '').replace(/\\b$/, '')})\\b`, 'gi');
+    const base = opts.short ? r.shortLabel : r.label;
     s = s.replace(re, (_m, art: string | undefined, word: string) => {
       fixes.push(r.id);
-      const label = !art && word[0] !== word[0].toLowerCase() ? r.label[0].toUpperCase() + r.label.slice(1) : r.label;
+      const label = !art && word[0] !== word[0].toLowerCase() ? base[0].toUpperCase() + base.slice(1) : base;
       return art ? `${article(art, r.gender, r.num)} ${label}` : label;
     });
   }
@@ -149,6 +162,54 @@ export function repairInternalVocabulary(text: string, exempt: readonly string[]
   return { text: s, fixes };
 }
 
+/** Largo que cuentan los validadores de esquema: caracteres (code points) y palabras. */
+function measure(t: string): { chars: number; words: number } {
+  const trimmed = t.trim();
+  return { chars: Array.from(t).length, words: trimmed ? trimmed.split(/\s+/).length : 0 };
+}
+
+/**
+ * Review r1 (I2): fragmentos de texto escrito por una persona que contienen un término interno (solo esos importan:
+ * el resto no cambia nada). Se parten por línea para que coincidan con el texto visible ya renderizado.
+ */
+export function protectedVocabularyTexts(texts: Iterable<unknown>, exempt: readonly string[] = []): string[] {
+  const out = new Set<string>();
+  for (const t of texts) {
+    if (typeof t !== 'string') continue;
+    for (const line of t.split(/\r?\n/)) {
+      const frag = line.replace(/\s+/g, ' ').trim();
+      if (frag.length >= 3 && lintInternalVocabulary(frag, exempt).length) out.add(frag);
+    }
+  }
+  return [...out].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function protectedRe(protectedTexts: readonly string[]): RegExp | null {
+  if (!protectedTexts.length) return null;
+  const esc = protectedTexts.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s+'));
+  return new RegExp(`(${esc.join('|')})`, 'gi');
+}
+
+/** Review r1 (I2): quita del texto visible los fragmentos escritos por una persona (no se juzgan). */
+export function stripProtectedVocabularyTexts(text: string, protectedTexts: readonly string[] = []): string {
+  const re = protectedRe(protectedTexts);
+  return re ? String(text ?? '').replace(re, ' ') : String(text ?? '');
+}
+
+/** Repara solo los tramos que NO son texto protegido (escrito por una persona). */
+function repairOutsideProtected(text: string, exempt: readonly string[], re: RegExp | null, short: boolean): { text: string; fixes: string[] } {
+  if (!re) return repairInternalVocabulary(text, exempt, { short });
+  const parts = text.split(re);
+  const fixes: string[] = [];
+  const out = parts.map((part, i) => {
+    if (i % 2 === 1) return part; // tramo protegido (grupo capturado)
+    const r = repairInternalVocabulary(part, exempt, { short });
+    fixes.push(...r.fixes);
+    return r.text;
+  });
+  return { text: out.join(''), fixes };
+}
+
 /**
  * Claves estructurales que nunca se tocan (ids, tipos, rutas, referencias de evidencia que deben citar el
  * contenido tal cual). Un string sin espacios tampoco se toca: es un identificador, no prosa.
@@ -160,15 +221,40 @@ const STRUCTURAL_KEYS = new Set([
 
 /**
  * Reparación determinística en profundidad (copia; nunca muta la entrada). `fixes` cuenta cada reemplazo por regla.
+ * Review r1: `protectedTexts` (I2) nunca se tocan; `noGrowth` (I3) nunca alarga un texto — rótulo completo, después
+ * el corto y, si ambos alargan, el original queda tal cual (`kept`: reglas que quedaron sin reparar).
  */
-export function repairInternalVocabularyDeep<T>(value: T, exempt: readonly string[] = []): { value: T; fixes: string[] } {
+export function repairInternalVocabularyDeep<T>(
+  value: T,
+  exempt: readonly string[] = [],
+  opts: { protectedTexts?: readonly string[]; noGrowth?: boolean } = {},
+): { value: T; fixes: string[]; shortened: string[]; kept: string[] } {
   const fixes: string[] = [];
+  const shortened: string[] = [];
+  const kept: string[] = [];
+  const re = protectedRe(opts.protectedTexts ?? []);
+  const fits = (orig: string, next: string): boolean => {
+    const a = measure(orig);
+    const b = measure(next);
+    return b.chars <= a.chars && b.words <= a.words;
+  };
   const walk = (v: unknown, key: string | null): unknown => {
     if (typeof v === 'string') {
       if ((key !== null && STRUCTURAL_KEYS.has(key)) || !/\s/.test(v)) return v;
-      const r = repairInternalVocabulary(v, exempt);
-      if (r.fixes.length) fixes.push(...r.fixes);
-      return r.text;
+      const r = repairOutsideProtected(v, exempt, re, false);
+      if (!r.fixes.length) return v;
+      if (!opts.noGrowth || fits(v, r.text)) {
+        fixes.push(...r.fixes);
+        return r.text;
+      }
+      const sh = repairOutsideProtected(v, exempt, re, true);
+      if (fits(v, sh.text)) {
+        fixes.push(...sh.fixes);
+        shortened.push(...sh.fixes);
+        return sh.text;
+      }
+      kept.push(...r.fixes);
+      return v;
     }
     if (Array.isArray(v)) return v.map((x) => walk(x, key));
     if (v && typeof v === 'object' && !(v instanceof Buffer) && !(v instanceof Uint8Array)) {
@@ -178,5 +264,5 @@ export function repairInternalVocabularyDeep<T>(value: T, exempt: readonly strin
     }
     return v;
   };
-  return { value: walk(value, null) as T, fixes };
+  return { value: walk(value, null) as T, fixes, shortened, kept };
 }

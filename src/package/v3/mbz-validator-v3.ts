@@ -64,7 +64,7 @@ import {
 } from '../assessment';
 import type { AssessmentCategoryKey } from '../assessment/resolve-assessment';
 import type { AssessableType } from '../../modules/course-profiles/course-profiles';
-import { extractText, lintCleanSafe, lintInternalVocabulary, lintResourceMentions, parseHtml } from '../../modules/visual-components';
+import { extractText, lintCleanSafe, lintInternalVocabulary, lintResourceMentions, parseHtml, stripProtectedVocabularyTexts } from '../../modules/visual-components';
 import type { HtmlNode } from '../../modules/visual-components';
 import { APPLICATION_SOLUTION_MARKERS_RE, CERTIFICATE_TEACHER_TROUBLESHOOTING, EXAMS_TEACHER_NOTE_ATTEMPTS, EXAMS_TEACHER_NOTE_AVAILABILITY, EXAMS_TEACHER_NOTE_UNLIMITED, CourseFacts, chapterNextSteps, closingCertificateText, courseApprovalRequirements, courseApprovalTeacherNote, courseHasGrades, examOverallFeedbackBands, examsHaveUnlimitedAttempts, examsTeacherNoteFor, lintShellNumbers, sectionLayoutFromFacts, stripStructureTitles, WELCOME_LEAD_MAX_WORDS, WELCOME_PARA_MAX_WORDS } from '../../modules/course-shell';
 import { safeActivityName } from '../mbz-common';
@@ -119,6 +119,8 @@ export interface MbzV3ValidationExpectations {
   builderVersion?: string;
   /** T1 (r57): exenciones de dominio del vocabulario interno (del builder). Ausente = el check no aplica (paquete viejo). */
   internalVocabularyExempt?: string[];
+  /** Review r1 (I2): fragmentos escritos por una persona (títulos, archivos de práctica, perfil): nunca se juzgan. */
+  internalVocabularyUserTexts?: string[];
 }
 
 /** true si `v` (x.y.z) ≥ `min`. Una versión ausente o mal formada → false. */
@@ -1150,7 +1152,9 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     for (const a of acts) {
       if (!['label', 'page', 'resource', 'h5pactivity', 'quiz', 'forum', 'assign'].includes(a.modname)) continue;
       const body = a.modname === 'page' ? unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? '') : '';
-      const hits = lintInternalVocabulary(`${a.name}\n${extractText(a.intro)}\n${body ? extractText(body) : ''}`, exp.internalVocabularyExempt);
+      // Review r1 (I2): solo el texto GENERADO se juzga: lo que escribió una persona se quita antes.
+      const visible = `${a.name}\n${extractText(a.intro)}\n${body ? extractText(body) : ''}`;
+      const hits = lintInternalVocabulary(stripProtectedVocabularyTexts(visible, exp.internalVocabularyUserTexts ?? []), exp.internalVocabularyExempt);
       if (hits.length) add('INTERNAL_VOCABULARY', a.idnumber, `texto interno del generador visible: ${[...new Set(hits.map((h) => `«${h.match}»`))].slice(0, 5).join(', ')}`);
     }
   }

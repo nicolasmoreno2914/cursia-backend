@@ -89,7 +89,7 @@ import {
   themeSha256,
   validateTheme,
 } from '../modules/theme-engine';
-import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION, internalVocabularyExemptions, repairInternalVocabularyDeep, formulaicOpeningWarnings } from '../modules/visual-components';
+import { ChapterExperience, VC_RENDER_STYLE_VERSION, VC_RUNTIME_VERSION, VC_SCHEMA_VERSION, internalVocabularyExemptions, protectedVocabularyTexts, repairInternalVocabularyDeep, formulaicOpeningWarnings } from '../modules/visual-components';
 import {
   CTA_BADGES,
   CourseFacts,
@@ -147,6 +147,7 @@ import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { reviewCardsEnabledFor } from '../modules/study-time/manifest-input';
 import { ApplicationDeliveryText, applicationSolutionPage, applicationStudentPage, practiceResourceIntro, practiceResourceName } from '../modules/course-shell/application-pages';
 import { deliveryMegabytes } from '../modules/course-shell/facts';
+import { repairDeadAnchorsInActivityXml } from './v3/dead-links-v3';
 import { ASSIGN_PLUGIN_CONFIG_COUNT, assignActivityXml, assignDueDate, assignGradeItemXml, assignRubricGradingXml, rubricCriteriaFromApplication } from './v3/assign-v3';
 import { resolvePracticeFiles } from './v3/practice-files';
 import { guidedPracticeLibroMarkdown, guidedPracticePage } from '../modules/course-shell/guided-practice-page';
@@ -395,6 +396,12 @@ export interface MbzV3Expectations {
   builderVersion: string;
   /** T1 (r57): reglas de vocabulario interno exentas porque el contenido del curso las usa como vocabulario del tema. */
   internalVocabularyExempt: string[];
+  /**
+   * Review r1 (I2): fragmentos escritos por una PERSONA (títulos del Blueprint, archivos de práctica, perfil,
+   * referencias importadas) que contienen un término interno: el validador los quita antes de buscar (nunca bloquean).
+   * Solo presente si hay alguno.
+   */
+  internalVocabularyUserTexts?: string[];
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -544,9 +551,19 @@ class MbzWriter {
   private gradeSort = 10;
   readonly idnumbers = new Set<string>();
 
+  /** Review r1 (M9): enlaces muertos reparados por archivo (la última escritura de cada archivo cuenta). */
+  readonly deadLinksUnwrapped = new Map<string, number>();
+
   constructor(readonly ts: number, readonly MV: MoodleVersionInfo) {}
 
   put(name: string, data: string | Buffer | Uint8Array): void {
+    // Review r1 (M9): un enlace muerto (`href="#"`) en el HTML visible de una actividad se desenvuelve (queda el texto).
+    if (typeof data === 'string' && /^activities\/[a-z0-9]+_\d+\/[a-z0-9]+\.xml$/.test(name) && !/\/(module|inforef|grades|roles|calendar|grade_history|competencies|filters|completion|comments|xapistate|grading)\.xml$/.test(name)) {
+      const r = repairDeadAnchorsInActivityXml(data);
+      if (r.count) this.deadLinksUnwrapped.set(name, r.count);
+      else this.deadLinksUnwrapped.delete(name);
+      data = r.xml;
+    }
     this.zip.file(name, data, { date: MBZ_V3_ZIP_FIXED_DATE, createFolders: false });
   }
 
@@ -865,18 +882,59 @@ function resolveExamSources(plan: PackagingPlanV3, c: DynamicPackageContentsV3):
   return { modules, final };
 }
 
+/** Claves de identificadores (nunca texto de una persona) al recolectar los textos escritos por el usuario. */
+const USER_TEXT_SKIP_KEYS = new Set(['id', 'type', 'kind', 'variant', 'engine', 'activityEngine', 'structureVersion', 'storagePath', 'sha256', 'mimetype', 'mimeType', 'artifactId', 'origin', 'relation', 'filename', 'chapterId', 'moduleId', 'source']);
+const USER_TEXT_TITLE_KEYS = new Set(['title', 'name', 'label']);
+
+function collectUserStrings(v: unknown, key: string | null, out: string[]): void {
+  if (typeof v === 'string') {
+    if (key !== null && USER_TEXT_SKIP_KEYS.has(key)) return;
+    if (/\s/.test(v.trim()) || (key !== null && USER_TEXT_TITLE_KEYS.has(key))) out.push(v);
+    return;
+  }
+  if (Array.isArray(v)) for (const x of v) collectUserStrings(x, key, out);
+  else if (v && typeof v === 'object' && !(v instanceof Buffer) && !(v instanceof Uint8Array)) {
+    for (const k of Object.keys(v as Record<string, unknown>)) collectUserStrings((v as Record<string, unknown>)[k], k, out);
+  }
+}
+
+/**
+ * Review r1 (I2): textos que escribió una PERSONA y que el paquete muestra: títulos y textos del Blueprint (curso,
+ * módulos, capítulos, contexto académico/pedagógico del perfil), el perfil de evaluación (archivos de práctica: título
+ * e instrucciones; textos de la Tarea), las referencias importadas del documento de la institución y el nombre de la
+ * institución. Solo devuelve los fragmentos con un término interno (si no hay ninguno, nada cambia).
+ */
+export function userProvidedVocabularyTexts(input: Pick<BuildDynamicMbzV3Input, 'blueprint' | 'assessmentProfile' | 'libroReferences' | 'libroBrand'>, exempt: readonly string[]): string[] {
+  const all: string[] = [];
+  collectUserStrings(input.blueprint, null, all);
+  collectUserStrings(input.assessmentProfile, null, all);
+  for (const r of input.libroReferences ?? []) if (typeof r === 'string') all.push(r);
+  if (typeof input.libroBrand?.name === 'string') all.push(input.libroBrand.name);
+  return protectedVocabularyTexts(all, exempt);
+}
+
 /**
  * T1 (r57): reparación determinística del vocabulario interno en todo el contenido LLM que se muestra (experiencias,
  * intros, interacciones del video, actividad H5P, bancos de examen, AA + solucionario, ejercicios guiados). El Libro
  * (contentMd) es la referencia del dominio: define las exenciones y no se toca. Aviso por regla con su cantidad.
+ * Review r1: `protectedTexts` (I2, texto de una persona citado por el modelo) nunca se toca; `noGrowth` (I3) nunca
+ * alarga un campo (rótulo corto o, si tampoco entra, el original queda con aviso y su regla exenta en el validador).
  */
-export function repairContentsInternalVocabulary(contents: DynamicPackageContentsV3): { contents: DynamicPackageContentsV3; exempt: string[]; warnings: string[] } {
+export function repairContentsInternalVocabulary(
+  contents: DynamicPackageContentsV3,
+  opts: { protectedTexts?: readonly string[]; noGrowth?: boolean } = {},
+): { contents: DynamicPackageContentsV3; exempt: string[]; warnings: string[]; fixed: number } {
   const exempt = internalVocabularyExemptions(contents.contentMd ? contents.contentMd.values() : []);
   const counts = new Map<string, number>();
+  const shortCounts = new Map<string, number>();
+  const keptCounts = new Map<string, number>();
+  const bump = (m: Map<string, number>, ids: string[]) => { for (const f of ids) m.set(f, (m.get(f) ?? 0) + 1); };
   const fix = <T>(v: T): T => {
     if (v === undefined || v === null) return v;
-    const r = repairInternalVocabularyDeep(v, exempt);
-    for (const f of r.fixes) counts.set(f, (counts.get(f) ?? 0) + 1);
+    const r = repairInternalVocabularyDeep(v, exempt, opts);
+    bump(counts, r.fixes);
+    bump(shortCounts, r.shortened);
+    bump(keptCounts, r.kept);
     return r.value;
   };
   const fixMap = <T>(m: Map<string, T> | undefined): Map<string, T> | undefined => (m ? new Map(Array.from(m, ([k, v]) => [k, fix(v)])) : m);
@@ -895,16 +953,49 @@ export function repairContentsInternalVocabulary(contents: DynamicPackageContent
     ...(contents.applications ? { applications: fixMap(contents.applications) } : {}),
     ...(contents.guidedPractices ? { guidedPractices: fixMap(contents.guidedPractices) } : {}),
   };
-  const warnings = Array.from(counts, ([rule, n]) => `internal_vocabulary_repaired:${rule}:${n}`).sort();
-  return { contents: out, exempt, warnings };
+  const warnings = [
+    ...Array.from(counts, ([rule, n]) => `internal_vocabulary_repaired:${rule}:${n}`),
+    ...Array.from(shortCounts, ([rule, n]) => `internal_vocabulary_short_label:${rule}:${n}`),
+    ...Array.from(keptCounts, ([rule, n]) => `internal_vocabulary_kept_length_limit:${rule}:${n}`),
+  ].sort();
+  // I3: un término que no se pudo reparar sin pasar el límite del campo queda visible con aviso: su regla no bloquea.
+  const keptRules = [...keptCounts.keys()].filter((r) => !exempt.includes(r));
+  let fixed = 0;
+  for (const n of counts.values()) fixed += n;
+  return { contents: out, exempt: [...exempt, ...keptRules], warnings, fixed };
 }
 
+/** Review r1 (I3): error de largo de un esquema (caracteres o palabras) al validar el contenido ya reparado. */
+function isLengthLimitError(err: unknown): boolean {
+  return /TEXT_TOO_LONG|WORD_RANGE/.test(err instanceof Error ? err.message : String(err));
+}
+
+/**
+ * Review r1 (I3): la reparación del vocabulario nunca deja un paquete sin armar por largo. Primero se arma con los
+ * rótulos completos; si ESO falla por un límite de largo (caracteres/palabras) y hubo reparaciones, se re-arma con la
+ * reparación que nunca alarga un campo (`noGrowth`). Cualquier otro error, o el mismo sin reparaciones, sube igual.
+ */
 export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<BuildDynamicMbzV3Result> {
+  try {
+    return await buildDynamicMbzV3Once(input, false);
+  } catch (err) {
+    if (!isLengthLimitError(err)) throw err;
+    if (!input?.contents || repairContentsInternalVocabulary(input.contents, { protectedTexts: userProvidedVocabularyTexts(input, []) }).fixed === 0) throw err;
+    return buildDynamicMbzV3Once(input, true);
+  }
+}
+
+async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: boolean): Promise<BuildDynamicMbzV3Result> {
   if (!Number.isInteger(input?.ts) || input.ts <= 0) throw new Error('MBZ_V3_INVALID: ts (reloj inyectado) debe ser un entero > 0');
   const { manifest, blueprint, ts } = input;
+  // Review r1 (M): fecha de inicio del curso EN EL BACKUP (course.xml <startdate> y <original_course_startdate>): las
+  // fechas relativas (fecha límite de la Tarea) se anclan a ella, así Moodle las corre juntas al restaurar.
+  const courseStartDate = ts;
   // T1 (r57): vocabulario interno del generador («worked_example», «texto fuente», «[S12]»…) → lenguaje natural,
   // determinístico, ANTES de validar/renderizar (también repara artifacts ya generados al re-empaquetar).
-  const vocab = repairContentsInternalVocabulary(input.contents);
+  // Review r1 (I2): el texto que escribió una persona (títulos, archivos de práctica, perfil, referencias) nunca se repara.
+  const vocabUserTexts = userProvidedVocabularyTexts(input, internalVocabularyExemptions(input.contents?.contentMd ? input.contents.contentMd.values() : []));
+  const vocab = repairContentsInternalVocabulary(input.contents, { protectedTexts: vocabUserTexts, noGrowth });
   const c = vocab.contents;
   const pendingIds = [...new Set(input.pendingVideoChapterIds ?? [])];
   const plan = buildPackagingPlanV3(manifest, blueprint, { manifestId: input.manifestId ?? null, omitVideoChapterIds: pendingIds });
@@ -1235,7 +1326,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
     const a = W.newActivity('assign', secnum, name, idnumber);
     assignsTotal++;
     const fileIds = files.map((f) => W.addFile(a.ctx, 'mod_assign', 'intro', f.name, f.data, f.mime));
-    W.put(`${a.dir}/assign.xml`, assignActivityXml({ aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml, ts, delivery: d, duedate: assignDueDate(ts, d.dueOffsetDays), pluginConfigId: assignPluginConfigId }));
+    W.put(`${a.dir}/assign.xml`, assignActivityXml({ aid: a.aid, mid: a.mid, ctx: a.ctx, name, introHtml, ts, delivery: d, duedate: assignDueDate(courseStartDate, d.dueOffsetDays), pluginConfigId: assignPluginConfigId }));
     assignPluginConfigId += ASSIGN_PLUGIN_CONFIG_COUNT;
     // Completion al ENVIAR (completionsubmit 1 en assign.xml): la aprobación del curso sigue siendo solo la nota final (r55).
     W.put(`${a.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(a.mid, 'assign', secnum, ts, MV.bv), idnumber), { completion: '2', completionview: '0', downloadcontent: '0' }));
@@ -1827,7 +1918,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   <shortname>${esc(courseTitle)}</shortname><fullname>${esc(courseTitle)}</fullname>
   <idnumber></idnumber><summary></summary><summaryformat>1</summaryformat>
   <format>topics</format><showgrades>1</showgrades><newsitems>5</newsitems>
-  <startdate>${ts}</startdate><enddate>0</enddate><marker>0</marker>
+  <startdate>${courseStartDate}</startdate><enddate>0</enddate><marker>0</marker>
   <maxbytes>0</maxbytes><legacyfiles>0</legacyfiles><showreports>0</showreports>
   <visible>1</visible><groupmode>0</groupmode><groupmodeforce>0</groupmodeforce>
   <defaultgroupingid>0</defaultgroupingid><lang>es</lang><theme></theme>
@@ -1960,7 +2051,7 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
   <original_course_fullname>${esc(courseTitle)}</original_course_fullname>
   <original_course_shortname>${esc(courseTitle)}</original_course_shortname>
   <original_course_format>topics</original_course_format>
-  <original_course_startdate>${ts}</original_course_startdate>
+  <original_course_startdate>${courseStartDate}</original_course_startdate>
   <original_course_enddate>0</original_course_enddate>
   <original_course_contextid>${MBZ_V3_COURSE_BACKUP_CONTEXTID}</original_course_contextid>
   <original_system_contextid>${MBZ_V3_SYSTEM_BACKUP_CONTEXTID}</original_system_contextid>
@@ -1983,10 +2074,14 @@ export async function buildDynamicMbzV3(input: BuildDynamicMbzV3Input): Promise<
 </information>
 </moodle_backup>`);
 
+  // Review r1 (M9): aviso visible por cada enlace muerto reparado (nunca en silencio).
+  let deadLinks = 0;
+  for (const n of W.deadLinksUnwrapped.values()) deadLinks += n;
+  if (deadLinks) warnings.push(`dead_link_unwrapped:${deadLinks}`);
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt },
+    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,

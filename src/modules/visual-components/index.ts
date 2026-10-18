@@ -45,7 +45,9 @@ export {
   InternalVocabularyRule,
   internalVocabularyExemptions,
   lintInternalVocabulary,
+  protectedVocabularyTexts,
   repairInternalVocabulary,
   repairInternalVocabularyDeep,
+  stripProtectedVocabularyTexts,
 } from './internal-vocabulary';
 export { lintFormulaicOpenings, formulaicOpeningWarnings, FormulaicOpeningFinding, FORMULAIC_MIN_CHAPTERS, FORMULAIC_MIN_SHARE } from './formulaic-lint';
