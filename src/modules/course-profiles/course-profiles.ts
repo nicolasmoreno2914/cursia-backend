@@ -538,8 +538,9 @@ export function normalizeAssessmentProfile(
     // T4/T5 (r57): solo si el perfil las trae (sin ellas, el mismo objeto y el mismo sha de siempre).
     ...(q.applicationDelivery ? { applicationDelivery: normalizeApplicationDelivery(q.applicationDelivery) } : {}),
     ...(q.practiceResources && q.practiceResources.length ? { practiceResources: normalizePracticeResources(q.practiceResources) } : {}),
-    // T6 (r57): solo si el perfil la trae.
-    ...(q.teacherGuide ? { teacherGuide: { include: q.teacherGuide.include === true } } : {}),
+    // T6 (r57): solo si el perfil la ENCIENDE. Review r1 (M4): `{ include: false }` ≡ ausente (mismo objeto, mismo sha:
+    // apagarla no re-empaqueta un curso que nunca la tuvo).
+    ...(q.teacherGuide?.include === true ? { teacherGuide: { include: true } } : {}),
   };
 }
 

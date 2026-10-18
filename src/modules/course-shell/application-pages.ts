@@ -15,7 +15,7 @@ import { lintCleanSafe } from '../visual-components';
 import { eduIcon, roleTone, Tone } from '../visual-components/edu';
 import { inlineHtml, labelHtml } from '../visual-components/text';
 import { Hx, Surf, bgSurf, box, eyebrow, heading, hx, link, pHtml, root, shellFail, st, toneSurf, ul, unprotectedText } from './html';
-import { validateApplicationActivityDoc } from './application-activity';
+import { criterionForGuide, validateApplicationActivityDoc } from './application-activity';
 
 export interface ApplicationPageInput {
   chapterId: string;
@@ -218,7 +218,7 @@ export function applicationSolutionPage(input: ApplicationPageInput, theme: Reso
   body += section(h, 'caso', ink, 'Solución esperada del taller', s) + pHtml(h, inlineHtml(sol.workshopSolution), s) + end;
   body += section(h, 'objetivo', ink, 'Guía de corrección por criterio', s);
   for (const [i, g] of sol.correctionGuide.entries()) {
-    const c = a.criteria[i];
+    const c = criterionForGuide(a.criteria, g, i);
     const cs = toneSurf(h, 'alt');
     body += box(
       h,

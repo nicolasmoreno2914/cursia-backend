@@ -107,7 +107,7 @@ export function resolveApplicationDelivery(d: ApplicationDeliveryProfile): Resol
     mode: d.mode,
     chapterModes: { ...(d.chapterModes ?? {}) },
     submission: { ...d.submission, fileTypes: [...d.submission.fileTypes] },
-    dueOffsetDays: d.dueOffsetDays,
+    dueOffsetDays: typeof d.dueOffsetDays === 'number' ? d.dueOffsetDays : null,
     graded: g.graded,
     maxGrade: g.graded ? g.maxGrade : null,
     gradepass: g.graded ? g.gradepass : null,

@@ -251,27 +251,33 @@ ${crit}
 }
 
 /**
- * Criterios de la rúbrica desde la AA: cada criterio (nombre, peso y descripción) con 3 niveles de la guía de corrección
- * del solucionario — Insuficiente 0, En proceso ⌊peso/2⌋ y Logrado = peso (los pesos suman 100 → máximo 100 puntos).
+ * Criterios de la rúbrica desde la AA: cada criterio (nombre, peso y descripción) con 3 niveles — Insuficiente 0,
+ * En proceso ⌊peso/2⌋ y Logrado = peso (los pesos suman 100 → máximo 100 puntos).
+ * Review r1 (M): los descriptores de nivel son GENÉRICOS, armados desde el criterio (la rúbrica la ve el estudiante
+ * después de la calificación: `showdescriptionstudent`); el texto de la guía de corrección del solucionario es solo
+ * del docente (página oculta + PDF) y NUNCA entra en la rúbrica.
  */
 export function rubricCriteriaFromApplication(doc: any): RubricCriterionInput[] {
   const crit: any[] = doc?.activity?.criteria ?? [];
-  const guide: any[] = doc?.solution?.correctionGuide ?? [];
-  return crit.map((c, i) => {
-    const g = guide[i] ?? {};
+  return crit.map((c) => {
     const w = Number(c.weight);
+    const name = String(c.name ?? '').trim();
     return {
-      description: `${c.name} (${w} %): ${c.description}`,
+      description: `${name} (${w} %): ${c.description}`,
       levels: [
-        { score: 0, definition: `Insuficiente. ${g.insufficient ?? ''}`.trim() },
-        { score: Math.floor(w / 2), definition: `En proceso. ${g.developing ?? ''}`.trim() },
-        { score: w, definition: `Logrado. ${g.achieved ?? ''}`.trim() },
+        { score: 0, definition: `Insuficiente. El trabajo todavía no muestra «${name}» de forma suficiente.` },
+        { score: Math.floor(w / 2), definition: `En proceso. El trabajo muestra «${name}» de forma parcial o con errores importantes.` },
+        { score: w, definition: `Logrado. El trabajo muestra «${name}» de forma completa y correcta.` },
       ],
     };
   });
 }
 
-/** Fecha límite del backup: inicio del curso (ts del backup) + días; 0 sin fecha. */
-export function assignDueDate(courseStart: number, dueOffsetDays: number | null): number {
-  return dueOffsetDays === null ? 0 : courseStart + dueOffsetDays * 86400;
+/**
+ * Fecha límite del backup: `<startdate>` del curso EN EL BACKUP + días; 0 = sin fecha (default: `dueOffsetDays` null o
+ * ausente). Review r1 (M): se ancla a la fecha de inicio del backup (no al reloj) para que el corrimiento de fechas de
+ * Moodle al restaurar con otra fecha de inicio la mantenga relativa al curso.
+ */
+export function assignDueDate(courseStartDate: number, dueOffsetDays: number | null | undefined): number {
+  return typeof dueOffsetDays === 'number' && Number.isInteger(dueOffsetDays) && dueOffsetDays > 0 ? courseStartDate + dueOffsetDays * 86400 : 0;
 }

@@ -70,8 +70,12 @@ export interface ApplicationDeliveryProfile {
   /** Excepciones por capítulo (chapterId → modo). Ausente = todos con `mode`. */
   chapterModes?: Record<string, ApplicationDeliveryMode>;
   submission: ApplicationSubmissionSettings;
-  /** Fecha límite = inicio del curso + N días (Moodle la corre al restaurar con la fecha de inicio); null = sin fecha. */
-  dueOffsetDays: number | null;
+  /**
+   * Fecha límite = fecha de inicio del curso DEL BACKUP + N días; null o ausente = sin fecha (default). Moodle corre
+   * todas las fechas al restaurar con otra fecha de inicio (la relación se conserva); restaurado conservando la fecha
+   * original del backup (p. ej. CLI), la fecha límite queda N días después del momento del empaque.
+   */
+  dueOffsetDays?: number | null;
   grading: ApplicationGrading;
 }
 
@@ -153,7 +157,8 @@ export function validateApplicationDelivery(d: unknown, path = 'applicationDeliv
   const errors: DeliveryValidationError[] = [];
   const err = (p: string, code: string, message: string) => errors.push({ path: p, code, message });
   if (!isObj(d)) return [{ path, code: 'INVALID_TYPE', message: `${path} debe ser un objeto` }];
-  keys(d, ['mode', 'submission', 'dueOffsetDays', 'grading'], ['chapterModes'], path, errors);
+  // Review r1 (M): `dueOffsetDays` es opcional — ausente ≡ null (sin fecha límite, el default).
+  keys(d, ['mode', 'submission', 'grading'], ['chapterModes', 'dueOffsetDays'], path, errors);
   if ('mode' in d && !(APPLICATION_DELIVERY_MODES as readonly unknown[]).includes(d.mode)) err(`${path}.mode`, 'INVALID_DELIVERY_MODE', `${path}.mode debe ser page o assign`);
   if ('chapterModes' in d) {
     const cm = d.chapterModes;
@@ -298,7 +303,7 @@ export function normalizeApplicationDelivery(d: ApplicationDeliveryProfile): App
       maxBytes: d.submission.maxBytes,
       fileTypes: [...d.submission.fileTypes],
     },
-    dueOffsetDays: d.dueOffsetDays,
+    dueOffsetDays: typeof d.dueOffsetDays === 'number' ? d.dueOffsetDays : null,
     grading: g.graded ? { graded: true, maxGrade: g.maxGrade, gradepass: g.gradepass, category: g.category, rubric: g.rubric } : { graded: false },
   };
 }
