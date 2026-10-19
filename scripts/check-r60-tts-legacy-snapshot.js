@@ -12,6 +12,7 @@
 //       pricing-seed.v1 tiene filas audio.speech para el snapshot;
 //   (d) guardas de fuente: sin default literal al alias en tts.service / audio-worker; una sola constante.
 //
+//   (V2 / Videogen: check-r59-tts-pinned-snapshot.js cubre el alias en real-providers y dynamicVideogenTtsModel.)
 // Usage: node scripts/check-r60-tts-legacy-snapshot.js [path/to/dist]
 const fs = require('fs');
 const path = require('path');
@@ -154,6 +155,10 @@ async function main() {
       assert(/resolveTtsModel\(/.test(src), `${name} no usa resolveTtsModel`);
     }
     eq(RP.TTS_MODEL_DEFAULT, M.TTS_SNAPSHOT_MODEL, 'real-providers TTS_MODEL_DEFAULT = TTS_SNAPSHOT_MODEL');
+    // Review I-2: el camino V2 (bienvenida y audiolibro) usa la misma regla, sin leer OPENAI_TTS_MODEL a mano.
+    const rp = fs.readFileSync(path.join(REPO, 'src/workers/provider-real/real-providers.ts'), 'utf8');
+    assert(!/trimmed\(env,\s*'OPENAI_TTS_MODEL'\)/.test(rp), 'real-providers todavía lee OPENAI_TTS_MODEL sin resolveTtsModel');
+    eq((rp.match(/resolveTtsModel\(undefined, env\)/g) || []).length, 2, 'bienvenida + audiolibro con resolveTtsModel');
   });
 
   global.fetch = realFetch;
