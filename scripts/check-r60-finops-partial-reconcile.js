@@ -49,6 +49,7 @@ const RD = L('modules/finops/reconcile-decision.js');
 const CTRL = L('modules/finops/finops.controller.js');
 const F = L('modules/finops/index.js');
 
+const EVID5 = { source: 'provider_usage_log', referenceIds: ['videogen:job:edef3614'], observedAmount: '0.5' };
 const EVID = { source: 'provider_usage_log', referenceIds: ['videogen:job:edef3614', 'api_usage_logs'], observedAmount: '0.5351', notes: 'guion gpt-4o 0.371 + 4 imágenes 0.16 + 13 TTS 0.004; sin render' };
 
 async function pureChecks() {
@@ -68,15 +69,19 @@ async function pureChecks() {
       [{ outcome: 'charged_partial', reason: 'x', amount: '-1', evidence: EVID }, /amount/],
       [{ outcome: 'charged_partial', reason: 'x', amount: '1e3', evidence: EVID }, /amount/],
       [{ outcome: 'charged_partial', reason: 'x', amount: '0.5' }, /evidence es obligatoria/],
-      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID, source: 'me' } }, /evidence.source/],
-      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID, referenceIds: [] } }, /referenceIds/],
-      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID, referenceIds: ['a b'] } }, /referenceIds/],
-      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID, observedAmount: 0.5 } }, /observedAmount/],
-      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID, currency: 'EUR' } }, /currency/],
-      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID, hack: 1 } }, /campo no permitido/],
+      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID5, source: 'me' } }, /evidence.source/],
+      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID5, referenceIds: [] } }, /referenceIds/],
+      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID5, referenceIds: ['a b'] } }, /referenceIds/],
+      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID5, observedAmount: 0.5 } }, /observedAmount/],
+      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID5, currency: 'EUR' } }, /currency/],
+      [{ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID5, hack: 1 } }, /campo no permitido/],
       [{ outcome: 'charged', reason: 'x', force: true }, /campo no permitido/],
+      // M1: el monto contado es exactamente el observado.
+      [{ outcome: 'charged_partial', reason: 'x', amount: '0.10', evidence: { ...EVID, observedAmount: '0.90' } }, /igual a evidence.observedAmount/],
     ];
     for (const [b, re] of bad) throwsSync(() => RD.parseReconcileDecision(b), re, JSON.stringify(b).slice(0, 90));
+    eq(RD.parseReconcileDecision({ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: { ...EVID5, observedAmount: '0.5000' } }).amount, '0.5000000000', 'igualdad decimal (no de texto)');
+    eq(RD.parseReconcileDecision({ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: EVID5 }).evidence.currency, 'USD', 'currency opcional → USD (M2)');
   });
 
   await check('[PU] TTS: el cuerpo acepta charged_partial con amount+evidence; las validaciones previas (clave, campos extra) siguen igual → 400', async () => {
@@ -96,7 +101,7 @@ async function pureChecks() {
       reconcileReservationAsNotCharged: async (k, r, o) => { calls.push(['not_charged', k]); return { reconciled: true, alreadySettled: false, amount: '1.0000000000' }; },
       reconcileReservationAsChargedPartial: async (k, a, r, ev, o) => { calls.push(['partial', k, a, ev.source, o.decidedBy]); return partialRes; },
     });
-    const dP = RD.parseReconcileDecision({ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: EVID });
+    const dP = RD.parseReconcileDecision({ outcome: 'charged_partial', reason: 'x', amount: '0.5', evidence: EVID5 });
     const ok = await CTRL.applyReconcileDecision(mk({ reconciled: true, alreadySettled: false, amount: '1.0000000000', countedAmount: '0.5000000000', recordedSettlement: 'reconciled_as_charged_partial' }), 'k', dP, 'u1', { m: 1 });
     eq([ok.outcome, ok.countedAmount, ok.reconciled], ['charged_partial', '0.5000000000', true], 'partial');
     const same = await CTRL.applyReconcileDecision(mk({ reconciled: false, alreadySettled: true, amount: '1.0000000000', countedAmount: '0.5000000000', recordedSettlement: 'reconciled_as_charged_partial' }), 'k', dP, 'u1', {});
@@ -244,11 +249,12 @@ async function dbChecks() {
     const net = async (key) => (await ds.query(
       `select coalesce(sum(amount),0)::text as t from public.generation_cost_events where idempotency_key = $1 or corrects_event_id = (select id from public.generation_cost_events where idempotency_key = $1)`, [key]))[0].t;
     const count = async () => Number((await ds.query(`select count(*)::int as n from public.generation_cost_events`))[0].n);
-    const TEVID = { source: 'equivalent_request_ledger', referenceIds: ['openai_tts:req:equivalente-snapshot'], observedAmount: '0.0545' };
+    const TEV = (amount) => ({ source: 'equivalent_request_ledger', referenceIds: ['openai_tts:req:equivalente-snapshot'], observedAmount: String(amount) });
+    const TEVID = TEV('0.0545');
 
     const r1 = await tts('a');
     await check('[P1] charged_partial: UN ADJUSTMENT final append-only (corrects_event_id = reserva, delta = amount − reservado) con evidencia, actor y montos; el CHARGE original intacto', async () => {
-      const out = await ledger.reconcileReservationAsChargedPartial(r1.idempotency_key, '0.0545', 'r60 check: equivalente medido', TEVID, { decidedBy: 'admin-uuid', metadata: { ttsReservation: true } });
+      const out = await ledger.reconcileReservationAsChargedPartial(r1.idempotency_key, '0.0545', 'r60 check: equivalente medido', TEV('0.0545'), { decidedBy: 'admin-uuid', metadata: { ttsReservation: true } });
       eq([out.reconciled, out.alreadySettled, out.amount, out.countedAmount, out.recordedSettlement], [true, false, '0.0735000000', '0.0545000000', 'reconciled_as_charged_partial'], 'resultado');
       const fam = await family(r1.idempotency_key);
       eq(fam.map((e) => [e.event_kind, e.amount, e.measurement_status]), [['CHARGE', '0.0735000000', 'pending'], ['ADJUSTMENT', '-0.0190000000', 'final']], 'familia');
@@ -263,36 +269,64 @@ async function dbChecks() {
 
     await check('[P2] idempotente: repetir = no-op; luego charged / not_charged / otro monto = alreadySettled sin escribir', async () => {
       const n0 = await count();
-      const again = await ledger.reconcileReservationAsChargedPartial(r1.idempotency_key, '0.0545', 'otra vez', TEVID, { decidedBy: 'admin-uuid' });
+      const again = await ledger.reconcileReservationAsChargedPartial(r1.idempotency_key, '0.0545', 'otra vez', TEV('0.0545'), { decidedBy: 'admin-uuid' });
       eq([again.reconciled, again.alreadySettled, again.countedAmount, again.recordedSettlement], [false, true, '0.0545000000', 'reconciled_as_charged_partial'], 'repetir');
-      const other = await ledger.reconcileReservationAsChargedPartial(r1.idempotency_key, '0.0100', 'otro monto', TEVID, { decidedBy: 'admin-uuid' });
+      const other = await ledger.reconcileReservationAsChargedPartial(r1.idempotency_key, '0.0100', 'otro monto', TEV('0.0100'), { decidedBy: 'admin-uuid' });
       eq([other.reconciled, other.alreadySettled, other.countedAmount], [false, true, '0.0545000000'], 'otro monto: informa lo registrado');
       eq((await ledger.reconcileReservationAsCharged(r1.idempotency_key, 'x', { decidedBy: 'a' })).alreadySettled, true, 'charged');
       eq((await ledger.reconcileReservationAsNotCharged(r1.idempotency_key, 'x', { decidedBy: 'a' })).alreadySettled, true, 'not_charged');
       eq(await count(), n0, 'sin filas nuevas');
-      await rejects(CTRL.applyReconcileDecision(ledger, r1.idempotency_key, RD.parseReconcileDecision({ outcome: 'charged_partial', reason: 'x', amount: '0.0100', evidence: TEVID }), 'admin-uuid', {}),
+      await rejects(CTRL.applyReconcileDecision(ledger, r1.idempotency_key, RD.parseReconcileDecision({ outcome: 'charged_partial', reason: 'x', amount: '0.0100', evidence: TEV('0.0100') }), 'admin-uuid', {}),
         (e) => e instanceof ConflictException, 'endpoint: otro monto → 409');
       const ok = await CTRL.applyReconcileDecision(ledger, r1.idempotency_key, RD.parseReconcileDecision({ outcome: 'charged_partial', reason: 'x', amount: '0.0545', evidence: TEVID }), 'admin-uuid', {});
       eq([ok.alreadySettled, ok.countedAmount], [true, '0.0545000000'], 'endpoint: mismo monto → no-op');
+    });
+
+    await check('[I1] endpoints FinOps: repetir la MISMA decisión = 200 no-op; cualquier otra (dirección inversa, otro monto, liquidada por el worker) → 409 con la decisión y el monto registrados', async () => {
+      const apply = (key, body) => CTRL.applyReconcileDecision(ledger, key, RD.parseReconcileDecision(body), 'admin-uuid', { ttsReservation: true });
+      const conflict = async (p, outcome, counted, m) => {
+        const e = await rejects(p, (x) => x instanceof ConflictException, m);
+        const r = e.getResponse();
+        eq([r.code, r.recordedOutcome, r.countedAmount], ['reservation_already_settled', outcome, counted], m);
+      };
+      const n0 = await count();
+      // r1 quedó charged_partial 0.0545 ([P1]).
+      await conflict(apply(r1.idempotency_key, { outcome: 'charged', reason: 'x' }), 'charged_partial', '0.0545000000', 'partial → charged');
+      await conflict(apply(r1.idempotency_key, { outcome: 'not_charged', reason: 'x' }), 'charged_partial', '0.0545000000', 'partial → not_charged');
+      const rc = await tts('i1c');
+      eq((await apply(rc.idempotency_key, { outcome: 'charged', reason: 'x' })).reconciled, true, 'charged');
+      const same = await apply(rc.idempotency_key, { outcome: 'charged', reason: 'otra vez' });
+      eq([same.alreadySettled, same.reconciled, same.countedAmount], [true, false, '0.0735000000'], 'charged repetido = no-op');
+      await conflict(apply(rc.idempotency_key, { outcome: 'not_charged', reason: 'x' }), 'charged', '0.0735000000', 'charged → not_charged');
+      await conflict(apply(rc.idempotency_key, { outcome: 'charged_partial', reason: 'x', amount: '0.05', evidence: TEV('0.05') }), 'charged', '0.0735000000', 'charged → partial');
+      const rn = await tts('i1n');
+      await apply(rn.idempotency_key, { outcome: 'not_charged', reason: 'x' });
+      eq((await apply(rn.idempotency_key, { outcome: 'not_charged', reason: 'x' })).countedAmount, '0.0000000000', 'not_charged repetido = no-op');
+      await conflict(apply(rn.idempotency_key, { outcome: 'charged', reason: 'x' }), 'not_charged', '0.0000000000', 'not_charged → charged');
+      await conflict(apply(rn.idempotency_key, { outcome: 'charged_partial', reason: 'x', amount: '0.05', evidence: TEV('0.05') }), 'not_charged', '0.0000000000', 'not_charged → partial');
+      const rw = await tts('i1w');
+      await ledger.settleReservation(rw.idempotency_key, null, 'worker: rechazo definitivo');
+      await conflict(apply(rw.idempotency_key, { outcome: 'charged', reason: 'x' }), null, '0.0000000000', 'liquidada por el worker → charged');
+      eq(await count(), n0 + 3 + 3, 'solo las 3 reservas + sus 3 cierres (los 409 no escriben)');
     });
 
     await check('[P3] rechazos sin escribir: amount > reservado, amount 0, sin evidence/decidedBy, no es reserva, reserva no pendiente, no existe', async () => {
       const r = await tts('b');
       const n0 = await count();
       const inv = (e) => e && e.code === 'INVALID_INPUT';
-      await rejects(ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0.0735000001', 'x', TEVID, { decidedBy: 'a' }), (e) => inv(e) && /supera lo reservado/.test(e.message), 'amount > reservado');
-      await rejects(ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0', 'x', TEVID, { decidedBy: 'a' }), inv, 'amount 0');
+      await rejects(ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0.0735000001', 'x', TEV('0.0735000001'), { decidedBy: 'a' }), (e) => inv(e) && /supera lo reservado/.test(e.message), 'amount > reservado');
+      await rejects(ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0', 'x', TEV('0'), { decidedBy: 'a' }), inv, 'amount 0');
       await rejects(ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0.01', 'x', null, { decidedBy: 'a' }), inv, 'sin evidence');
-      await rejects(ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0.01', 'x', TEVID, {}), inv, 'sin decidedBy');
+      await rejects(ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0.01', 'x', TEV('0.01'), {}), inv, 'sin decidedBy');
       const notRes = await reservation({ itemRunId: TTS_ITEM, itemKey: 'audiobook_chapter:c1', itemType: 'audiobook_chapter', operation: 'tts.speech', provider: 'openai', service: 'audio.speech', model: 'gpt-4o-mini-tts',
         key: `openai_tts:req:${crypto.randomUUID()}`, amount: '0.05', status: 'final', meta: {} });
       const n1 = await count();
-      await rejects(ledger.reconcileReservationAsChargedPartial(notRes.idempotency_key, '0.01', 'x', TEVID, { decidedBy: 'a' }), (e) => inv(e) && /no es una reserva/.test(e.message), 'no reserva');
+      await rejects(ledger.reconcileReservationAsChargedPartial(notRes.idempotency_key, '0.01', 'x', TEV('0.01'), { decidedBy: 'a' }), (e) => inv(e) && /no es una reserva/.test(e.message), 'no reserva');
       const finalRes = await tts('c');
       await ds.query(`insert into public.generation_cost_events (event_kind, owner_id, course_id, run_id, operation, call_role, attempt, provider, idempotency_key, amount, cost_source, measurement_status, billing_account, billable, outcome, recorded_by, metadata)
         values ('CHARGE',$1,$2,$3,'tts.speech','main',1,'openai',$4,'0.07','CALCULATED_FROM_USAGE','final','cursia',true,'succeeded','check-r60','{"reservation":true}'::jsonb)`, [OWNER, CID, RUN, `reservation:tts:${TTS_ITEM}:g1:a99:seg_final`]);
-      await rejects(ledger.reconcileReservationAsChargedPartial(`reservation:tts:${TTS_ITEM}:g1:a99:seg_final`, '0.01', 'x', TEVID, { decidedBy: 'a' }), (e) => inv(e) && /no está pendiente/.test(e.message), 'no pendiente');
-      await rejects(ledger.reconcileReservationAsChargedPartial('reservation:tts:nope', '0.01', 'x', TEVID, { decidedBy: 'a' }), (e) => e.code === 'ORIGINAL_NOT_FOUND', 'no existe');
+      await rejects(ledger.reconcileReservationAsChargedPartial(`reservation:tts:${TTS_ITEM}:g1:a99:seg_final`, '0.01', 'x', TEV('0.01'), { decidedBy: 'a' }), (e) => inv(e) && /no está pendiente/.test(e.message), 'no pendiente');
+      await rejects(ledger.reconcileReservationAsChargedPartial('reservation:tts:nope', '0.01', 'x', TEV('0.01'), { decidedBy: 'a' }), (e) => e.code === 'ORIGINAL_NOT_FOUND', 'no existe');
       eq(await count(), n1 + 2, 'solo las filas del fixture');
       assert(n1 === n0 + 1, 'rechazos sin escribir');
       eq(await ledger.reservationSettled(finalRes.idempotency_key), false, 'otra reserva sigue abierta');
@@ -300,7 +334,7 @@ async function dbChecks() {
 
     await check('[P4] concurrencia: 8 conciliaciones parciales simultáneas (montos distintos) de la misma clave → UN ADJUSTMENT', async () => {
       const r = await tts('d');
-      const outs = await Promise.all(Array.from({ length: 8 }, (_, i) => ledger.reconcileReservationAsChargedPartial(r.idempotency_key, `0.0${50 + i}`, `c${i}`, TEVID, { decidedBy: 'a' })));
+      const outs = await Promise.all(Array.from({ length: 8 }, (_, i) => ledger.reconcileReservationAsChargedPartial(r.idempotency_key, `0.0${50 + i}`, `c${i}`, TEV(`0.0${50 + i}`), { decidedBy: 'a' })));
       eq(outs.filter((o) => o.reconciled).length, 1, 'una sola decisión gana');
       const fam = await family(r.idempotency_key);
       eq(fam.filter((e) => e.event_kind === 'ADJUSTMENT').length, 1, 'un ADJUSTMENT');
@@ -315,7 +349,7 @@ async function dbChecks() {
       const mid = await costRead.runCost(RUN);
       eq(F.subDec(mid.reserved, before.reserved), '0.0735000000', 'abierta en reservado');
       eq(mid.counts.providerCalls - before.counts.providerCalls, 1, 'reserva abierta = 1 llamada');
-      await ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0.0300', 'x', TEVID, { decidedBy: 'a' });
+      await ledger.reconcileReservationAsChargedPartial(r.idempotency_key, '0.0300', 'x', TEV('0.0300'), { decidedBy: 'a' });
       const after = await costRead.runCost(RUN);
       eq([after.reserved, F.subDec(after.actual, mid.actual), F.subDec(mid.committed, after.committed)], [before.reserved, '0.0300000000', '0.0435000000'], 'reservado / real / comprometido');
       eq([after.counts.providerCalls, after.counts.openReservations], [mid.counts.providerCalls, mid.counts.openReservations - 1], 'llamadas sin doble conteo');
@@ -328,7 +362,7 @@ async function dbChecks() {
         usage: { audio_seconds: 200 }, idempotencyKey: `openai_tts:req:${rid}`, billingAccount: 'cursia', mode: 'real', costSource: 'ACTUAL_PROVIDER', actualAmount: amount, recordedBy: 'check-r60' });
       for (const [tag, partial, real] of [['f', '0.0500', '0.0410000000'], ['g', '0.0300', '0.0700000000']]) {
         const r = await tts(tag);
-        await ledger.reconcileReservationAsChargedPartial(r.idempotency_key, partial, 'x', TEVID, { decidedBy: 'a' });
+        await ledger.reconcileReservationAsChargedPartial(r.idempotency_key, partial, 'x', TEV(partial), { decidedBy: 'a' });
         const c0 = await costRead.runCost(RUN);
         const s = await ledger.settleReservation(r.idempotency_key, charge(`late-${tag}`, real), 'openai_tts_measured');
         eq([s.finalInserted, s.alreadySettled], [true, true], `${tag}: cargo real insertado`);
@@ -362,7 +396,7 @@ async function dbChecks() {
         await rejects(svc.reconcile(RUN, body, ADMIN), (e) => e instanceof ConflictException && e.getResponse().code === 'may_have_rendered_ack_required', 'ack obligatorio');
         body.acknowledgeMayHaveRendered = true;
       }
-      await rejects(svc.reconcile(RUN, { ...body, amount: '2' }, ADMIN), (e) => /supera lo reservado/.test(e.message), 'amount > reservado');
+      await rejects(svc.reconcile(RUN, { ...body, amount: '2', evidence: { ...EVID, observedAmount: '2' } }, ADMIN), (e) => /supera lo reservado/.test(e.message), 'amount > reservado');
       const out = await svc.reconcile(RUN, body, ADMIN);
       eq([out.outcome, out.reconciled, out.amount, out.countedAmount], ['charged_partial', true, '1.1750000000', '0.5351000000'], 'conciliada');
       assert(!out.remaining.some((p) => p.reservationKey === vg.idempotency_key), 'ya no pendiente');
@@ -371,7 +405,7 @@ async function dbChecks() {
         ['-0.6399000000', 'admin_reconcile_videogen', 'reconciled_as_charged_partial', 'SUPER_ADMIN', 'videogen:job:edef3614'], 'ADJUSTMENT');
       const again = await svc.reconcile(RUN, body, ADMIN);
       eq([again.reconciled, again.alreadySettled, again.countedAmount], [false, true, '0.5351000000'], 'repetir = no-op');
-      await rejects(svc.reconcile(RUN, { ...body, amount: '0.6' }, ADMIN), (e) => e instanceof ConflictException, 'otro monto → 409');
+      await rejects(svc.reconcile(RUN, { ...body, amount: '0.6', evidence: { ...EVID, observedAmount: '0.6' } }, ADMIN), (e) => e instanceof ConflictException, 'otro monto → 409');
       await rejects(svc.reconcile(RUN, { reservationKey: vg.idempotency_key, outcome: 'not_charged', reason: 'cambio de opinión ya registrado', acknowledgeMayHaveRendered: true }, ADMIN), (e) => e instanceof ConflictException, 'otra decisión → 409');
     });
 

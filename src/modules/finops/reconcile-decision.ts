@@ -31,8 +31,9 @@ export interface ReconcileEvidence {
   source: ReconcileEvidenceSource;
   /** Ids que permiten rehacer la verificación (job id, request id, idempotency_key de la llamada equivalente…). */
   referenceIds: string[];
-  /** Monto observado en la fuente (USD, decimal normalizado a 10 decimales). */
+  /** Monto observado en la fuente (USD, decimal normalizado a 10 decimales). Debe ser igual a `amount` (M1). */
   observedAmount: string;
+  /** Opcional en el cuerpo (default USD); solo se acepta 'USD'. Siempre presente tras el parseo. */
   currency: 'USD';
   /** Qué se observó exactamente (opcional, ≤ 1000). */
   notes?: string;
@@ -112,5 +113,19 @@ export function parseReconcileDecision(
     if (b.amount !== undefined || b.evidence !== undefined) bad('amount/evidence solo con outcome charged_partial');
     return { outcome, reason };
   }
-  return { outcome, reason, amount: parsePartialAmount(b.amount), evidence: parseReconcileEvidence(b.evidence) };
+  const amount = parsePartialAmount(b.amount);
+  const evidence = parseReconcileEvidence(b.evidence);
+  assertEvidenceMatchesAmount(amount, evidence);
+  return { outcome, reason, amount, evidence };
+}
+
+/**
+ * r60 fix round (M1): el monto contado es EXACTAMENTE el observado en la evidencia (igualdad decimal a 10 decimales).
+ * Contar otra cifra (p.ej. 0.10 con evidencia de 0.90) no se acepta: si la evidencia no respalda el monto, se corrige
+ * la evidencia (u otra fuente) antes de conciliar. Lanza FinopsError INVALID_INPUT.
+ */
+export function assertEvidenceMatchesAmount(amount: string, evidence: ReconcileEvidence): void {
+  if (cmpDec(normalizeDecimal(amount), normalizeDecimal(evidence.observedAmount)) !== 0) {
+    bad(`amount (${normalizeDecimal(amount)}) debe ser igual a evidence.observedAmount (${normalizeDecimal(evidence.observedAmount)})`);
+  }
 }

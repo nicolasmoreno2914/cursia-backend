@@ -26,6 +26,7 @@ import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsError } from './errors';
 import { llmIngestToChargeInput, llmProxyReservationKey, llmReservationToChargeInput, parseLlmReservationIngest, parseLlmReservationRelease, parseLlmUsageIngest } from './llm-usage-ingest';
 import { costIdempotencyKey } from './idempotency';
+import { normalizeDecimal } from './decimal';
 import { SPEND_CONTROL_CODES } from './spend-controls';
 import { RUN_BUDGET_NOT_AUTHORIZED } from './run-budget';
 import { parseReconcileDecision, ReconcileDecision, ReconcileEvidence } from './reconcile-decision';
@@ -65,29 +66,46 @@ export function parseDecisionOrBadRequest(body: unknown, extraKeys: readonly str
 /**
  * r60: aplica la decisión sobre una reserva (los tres endpoints de este controlador). → respuesta común:
  * {outcome, reconciled, alreadySettled, amount (reservado), countedAmount?, recordedSettlement?}. Un `charged_partial`
- * sobre una reserva ya cerrada de OTRA forma (o con otro monto) → 409 `reservation_already_settled`.
+ * (o cualquier outcome) sobre una reserva ya cerrada de OTRA forma (o con otro monto) → 409 `reservation_already_settled` (I1).
  */
 export async function applyReconcileDecision(
-  ledger: Pick<FinopsLedgerService, 'reconcileReservationAsCharged' | 'reconcileReservationAsNotCharged' | 'reconcileReservationAsChargedPartial'>,
+  ledger: Pick<FinopsLedgerService, 'reconcileReservationAsCharged' | 'reconcileReservationAsNotCharged' | 'reconcileReservationAsChargedPartial' | 'reservationDecisionOf'>,
   key: string,
   d: ReconcileDecision,
   decidedBy: string,
   metadata: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
+  // r60 fix round (I1): una reserva YA cerrada solo responde 200 (no-op) si la decisión registrada es exactamente la
+  // pedida (mismo outcome y, en charged_partial, mismo monto). Cualquier otra (dirección inversa, otro monto, o una
+  // liquidación del worker) → 409 con la decisión y el monto registrados; nunca un 200 con el monto reservado.
+  const conflict = (settlement: string | null, counted: string) => new ConflictException({
+    code: 'reservation_already_settled',
+    message: `reservation_already_settled: la reserva ya está cerrada (${settlement ?? 'liquidada'}, cuenta USD ${counted}); no se cambia una decisión registrada.`,
+    recordedOutcome: outcomeOfSettlement(settlement),
+    recordedSettlement: settlement,
+    countedAmount: counted,
+  });
   if (d.outcome === 'charged_partial') {
     const r = await ledger.reconcileReservationAsChargedPartial(key, d.amount as string, d.reason, d.evidence as ReconcileEvidence, { decidedBy, metadata });
-    if (r.alreadySettled && (r.recordedSettlement !== 'reconciled_as_charged_partial' || r.countedAmount !== d.amount)) {
-      throw new ConflictException({
-        code: 'reservation_already_settled',
-        message: `reservation_already_settled: la reserva ya está cerrada (${r.recordedSettlement ?? 'liquidada'}, cuenta USD ${r.countedAmount}); no se cambia una decisión registrada.`,
-      });
-    }
+    if (r.alreadySettled && (r.recordedSettlement !== 'reconciled_as_charged_partial' || r.countedAmount !== d.amount)) throw conflict(r.recordedSettlement, r.countedAmount);
     return { outcome: d.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount, countedAmount: r.countedAmount, recordedSettlement: r.recordedSettlement };
   }
   const r = d.outcome === 'charged'
     ? await ledger.reconcileReservationAsCharged(key, d.reason, { decidedBy, metadata })
     : await ledger.reconcileReservationAsNotCharged(key, d.reason, { decidedBy, metadata });
+  if (r.alreadySettled) {
+    const rec = await ledger.reservationDecisionOf(key);
+    const expected = d.outcome === 'charged' ? 'reconciled_as_charged' : 'reconciled_as_not_charged';
+    if (!rec || rec.settlement !== expected) throw conflict(rec?.settlement ?? null, rec?.countedAmount ?? normalizeDecimal(0));
+    return { outcome: d.outcome, reconciled: false, alreadySettled: true, amount: r.amount, countedAmount: rec.countedAmount, recordedSettlement: rec.settlement };
+  }
   return { outcome: d.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+}
+
+/** `settlement` del ledger → outcome de conciliación (null = liquidación del worker u otra). */
+export function outcomeOfSettlement(settlement: string | null): ReconcileDecision['outcome'] | null {
+  return settlement === 'reconciled_as_charged' ? 'charged' : settlement === 'reconciled_as_not_charged' ? 'not_charged'
+    : settlement === 'reconciled_as_charged_partial' ? 'charged_partial' : null;
 }
 
 /** FinopsError → HTTP (fail loud: un precio faltante es 422, nunca un 200 con 0). */

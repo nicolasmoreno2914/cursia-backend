@@ -8,7 +8,7 @@ import { familyOfProvider, operationForItem } from './operations';
 import type { EstimateResult } from './estimator';
 import { CostReadService, costEventsCte } from './cost-read.service';
 import { assertProviderSpendAllowed, unattributedCeilings } from './spend-controls';
-import { parsePartialAmount, parseReconcileEvidence, ReconcileEvidence } from './reconcile-decision';
+import { assertEvidenceMatchesAmount, parsePartialAmount, parseReconcileEvidence, ReconcileEvidence } from './reconcile-decision';
 
 /**
  * V2.1 RF-a — ledger de costos (audit §W.3/§W.4). Todas las escrituras son
@@ -1220,6 +1220,7 @@ export class FinopsLedgerService {
     const decidedBy = nonEmpty(opts.decidedBy, 'decidedBy');
     const partial = parsePartialAmount(typeof amount === 'string' ? amount : normalizeDecimal(amount));
     const ev = parseReconcileEvidence(evidence);
+    assertEvidenceMatchesAmount(partial, ev);
     return this.dataSource.transaction(async (manager) => {
       await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + reservationKey]);
       const [res] = await manager.query(
@@ -1267,6 +1268,25 @@ export class FinopsLedgerService {
       });
       return { reconciled: r.inserted, alreadySettled: false, amount: reserved, countedAmount: partial, recordedSettlement: 'reconciled_as_charged_partial', event: r.event };
     });
+  }
+
+  /**
+   * r60 fix round (I1): decisión registrada sobre una reserva cerrada — `settlement` del último ADJUSTMENT que la lleva
+   * (reconciled_as_charged / _not_charged / _charged_partial, o la liquidación del worker) y el monto que quedó contado
+   * (neto de la familia). null si la reserva no existe o sigue abierta.
+   */
+  async reservationDecisionOf(reservationKey: string): Promise<{ settlement: string | null; countedAmount: string } | null> {
+    const [r] = await this.dataSource.query(
+      `select (select a.metadata->>'settlement' from public.generation_cost_events a
+                where a.corrects_event_id = e.id and a.event_kind = 'ADJUSTMENT' and a.metadata ? 'settlement'
+                order by a.created_at desc, a.id desc limit 1) as settlement,
+              (select count(*)::int from public.generation_cost_events a where a.corrects_event_id = e.id) as n,
+              (select coalesce(sum(x.amount),0)::text from public.generation_cost_events x where x.id = e.id or x.corrects_event_id = e.id) as counted
+         from public.generation_cost_events e where e.idempotency_key = $1 and e.event_kind = 'CHARGE'`,
+      [reservationKey],
+    );
+    if (!r || Number(r.n) === 0) return null;
+    return { settlement: r.settlement ?? null, countedAmount: normalizeDecimal(r.counted) };
   }
 
   /** ¿La reserva ya se cerró (liquidada, liberada o conciliada)? null si no existe. */

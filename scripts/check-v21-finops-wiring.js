@@ -1015,8 +1015,10 @@ async function dbChecks() {
       eq([c.reconciled, c.alreadySettled], [true, false], 'cobrada');
       const n = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'not_charged', reason: 'consola: sin cobro' }, ADMIN_USER);
       eq([n.reconciled, n.alreadySettled], [true, false], 'no cobrada');
-      const again = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'charged', reason: 'x' }, ADMIN_USER);
+      const again = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'not_charged', reason: 'x' }, ADMIN_USER);
       eq(again.alreadySettled, true, 'repetir = no-op');
+      // r60 (I1): la decisión inversa → 409 reservation_already_settled (antes: 200 alreadySettled).
+      await rejectsRe(admin.reconcileLlmProxyReservation(ids[1], { outcome: 'charged', reason: 'x' }, ADMIN_USER), /reservation_already_settled/, 'inversa → 409', 409);
       const left = (await admin.llmProxyReservations(undefined, prRun)).reservations;
       assert(!left.some((r) => ids.includes(r.callId)), 'ya no pendientes');
       const t0 = dec((await ledger.costsByRun(prRun)).totals.total);

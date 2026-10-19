@@ -1,4 +1,5 @@
 {
+  "seedVersion": "pricing-proposal.r60",
   "proposalVersion": "pricing-proposal.r60",
   "status": "PROPUESTA — requiere aprobación del usuario; NO la siembra migrate-v21-finops.js (solo lee pricing-seed.v1.json)",
   "howToApply": "Agregar estas filas a pricing_catalog (append-only: filas nuevas con otro pricing_version y effective_from posterior; selectPriceRow elige la de effective_from más reciente; ninguna fila vieja se edita). Los cargos anteriores a effective_from conservan su precio.",
