@@ -88,6 +88,8 @@ const PENDING = { pendingUsd: 0.0735, providers: ['openai'] };
     const errs = [
       `${RECON} tts_failed: chunk 1/7 (persisted 0): openai POST /audio/speech: error de red (TypeError)${TAIL}`,
       `${RECON} tts_failed: chunk 3/4 (persisted 2): socket hang up (ECONNRESET)${TAIL}`,
+      // Caso real de #1353 (2026-10-14): socket cortado a mitad del cuerpo; el reenvío automático lo recuperó.
+      `${RECON} tts_failed: chunk 6/6 (persisted 5): terminated${TAIL}`,
       'provider_reconciliation_required: openai — audio TTS pagado sin persistir. El proveedor pudo haber completado',
     ];
     for (const e of errs) {
