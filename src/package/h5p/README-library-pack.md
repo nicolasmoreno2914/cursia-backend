@@ -166,3 +166,27 @@ descarga. Desde r55 el store solo arma el pack (los paquetes de curso no llevan 
   rulesVersion 3). Los builders anteriores (`dynamic-mbz-builder.ts` para Manifests v1/v2 y el
   `mbz-builder.service.ts` legado) no cambian: conservan su configuración anterior de
   finalización, intentos y calificación.
+
+## Versión mínima de Moodle (r60)
+
+Todas las librerías del pack (v1, v2 y v3) son las versiones actuales de H5P, y la mayoría declara
+`coreApi` **1.28** en su `library.json` (JoubelUI 1.3.45, Question 1.5.53, Components 1.0.97, Video 1.6.79,
+MultiChoice 1.16.27, QuestionSet 1.21.13…). Moodle solo instala una librería si su `coreApi` es menor o igual
+a la API H5P de su núcleo:
+
+| Moodle | API H5P del núcleo (`h5p/h5plib`) | ¿Instala el pack? |
+|---|---|---|
+| 4.1 | 1.24 | No («api-version-unsupported») |
+| 4.2 | 1.26 | No |
+| 4.3 / 4.4 | 1.27 | No |
+| 4.5 | 1.28 | Sí |
+
+Por eso **un curso de Cursia con actividades H5P funciona solo en Moodle 4.5 o superior**. El paquete lo
+declara (`summary.moodleCompatibility.minimumMoodle`, `expectations.moodleMinimum`) y el validador lo
+recalcula desde los `h5p.json` del `.mbz` (`MOODLE_COMPAT`). La tabla de `coreApi` por librería está en
+`cursia-h5p-core-api.json` (`node scripts/generate-h5p-core-api.js <libsDir>`; `--check` verifica que siga al día).
+
+No hay un patch alternativo para 4.1–4.4 sin cambiar el contenido: QuestionSet 1.21 solo existe como 1.21.13
+(coreApi 1.28), InteractiveVideo 1.27 pide al menos 1.26 (1.27.1–1.27.3) y Branching Scenario 1.10 pide 1.28.
+Un paquete **sin H5P** conserva el piso del formato de backup (4.1): sus botones a secciones usan
+`$@COURSEVIEWBYID*curso@$&section=n` (decodificado desde 4.1) en lugar de `$@COURSESECTIONBYID*n@$` (solo 4.4+).

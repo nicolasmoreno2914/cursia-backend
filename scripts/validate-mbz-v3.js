@@ -4,7 +4,7 @@
 // las expectativas (facts + evaluación resuelta del perfil vigente, tal como
 // las devuelve buildDynamicMbzV3 en `expectations`) y lista cada hallazgo.
 //
-// Usage: node scripts/validate-mbz-v3.js <paquete.mbz> --expect <expectativas.json> [--dist <dist>]
+// Usage: node scripts/validate-mbz-v3.js <paquete.mbz> --expect <expectativas.json> [--dist <dist>] [--moodle-minimum <x.y>]
 // Salida: una línea por hallazgo (❌ CODE where: message) o ✅; exit 1 si hay alguno.
 
 const fs = require('fs');
@@ -15,7 +15,7 @@ const opt = (name) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 };
-const mbzPath = args.find((a) => !a.startsWith('--') && args[args.indexOf(a) - 1] !== '--expect' && args[args.indexOf(a) - 1] !== '--dist');
+const mbzPath = args.find((a) => !a.startsWith('--') && args[args.indexOf(a) - 1] !== '--expect' && args[args.indexOf(a) - 1] !== '--dist' && args[args.indexOf(a) - 1] !== '--moodle-minimum');
 const expectPath = opt('--expect');
 if (!mbzPath || !expectPath) {
   console.error('Usage: node scripts/validate-mbz-v3.js <paquete.mbz> --expect <expectativas.json> [--dist <dist>]');
@@ -31,6 +31,9 @@ const { validateMbzV3 } = require(path.join(dist, 'package/v3/mbz-validator-v3.j
     console.error('❌ el archivo de expectativas debe tener { facts, resolved }');
     process.exit(2);
   }
+  // r60: --moodle-minimum <x.y> valida contra un Moodle objetivo (p. ej. el del cliente): el paquete tiene que funcionar ahí.
+  const mm = opt('--moodle-minimum');
+  if (mm) exp.moodleMinimum = mm;
   const r = await validateMbzV3(mbz, exp);
   for (const i of r.issues) console.log(`❌ ${i.code} ${i.where}: ${i.message}`);
   if (r.ok) console.log(`✅ ${path.basename(mbzPath)}: sin hallazgos (${JSON.stringify(r.stats)})`);

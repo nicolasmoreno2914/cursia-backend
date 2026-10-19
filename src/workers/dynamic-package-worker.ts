@@ -585,6 +585,7 @@ export async function processV3PackageJob(
       pendingVideoNoticeCount: reusedPending.filter((p) => p && p.notice === true).length,
       // EV6 H5P v2: la instrucción de restauración viaja en la metadata del .mbz reutilizado.
       ...(existing.metadata?.restore ? { restore: existing.metadata.restore } : {}),
+      ...(existing.metadata?.moodleCompatibility && typeof existing.metadata.moodleCompatibility === 'object' ? { moodleCompatibility: existing.metadata.moodleCompatibility } : {}),
       // r58 (I2): el informe de calidad viaja en la metadata del .mbz reutilizado (mismos textos = mismo informe).
       ...(existing.metadata?.qualityReport && typeof existing.metadata.qualityReport === 'object' ? { qualityReport: existing.metadata.qualityReport } : {}),
       ...(reuseWarnings.length ? { warnings: reuseWarnings } : {}),
@@ -641,7 +642,7 @@ export async function processV3PackageJob(
   if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
     throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
   }
-  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, { facts: built.expectations.facts, resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion, internalVocabularyExempt: built.expectations.internalVocabularyExempt, internalVocabularyUserTexts: built.expectations.internalVocabularyUserTexts });
+  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, { facts: built.expectations.facts, resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion, moodleMinimum: built.expectations.moodleMinimum, internalVocabularyExempt: built.expectations.internalVocabularyExempt, internalVocabularyUserTexts: built.expectations.internalVocabularyUserTexts });
   if (!validation.ok) {
     throw new Error(
       `MBZ_V3_VALIDATION_FAILED: ${validation.issues.length} hallazgo(s): ` +
@@ -707,7 +708,7 @@ export async function processV3PackageJob(
     // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes (validados).
     replaceUnverifiedOnConflict: true,
     // r58 (AU1 R1): sha256 de los bytes que aprobó validateMbzV3 (el reuse lo exige igual al checksum de Storage).
-    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), ...(qualityReport ? { qualityReport } : {}), validatedSha256: sha256Hex(built.mbz) },
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), ...(built.summary.moodleCompatibility ? { moodleCompatibility: built.summary.moodleCompatibility } : {}), ...(qualityReport ? { qualityReport } : {}), validatedSha256: sha256Hex(built.mbz) },
   });
   if (isLeaseLost()) return;
 
@@ -739,6 +740,8 @@ export async function processV3PackageJob(
     ...(built.summary.libro ? { libro: built.summary.libro } : {}),
     // Instrucción de restauración del paquete (r55: requisito del sitio = pack H5P v3; jobs ≤ 3.13.0: administrador o gestor).
     ...(built.summary.restore ? { restore: built.summary.restore } : {}),
+    // r60: Moodle mínimo en el que el curso funciona (H5P core API / tokens), aparte del formato del backup.
+    ...(built.summary.moodleCompatibility ? { moodleCompatibility: built.summary.moodleCompatibility } : {}),
     mockProviderItems: loaded.mockProviderItems,
     validation: validation.stats,
     // T6 (r57): tamaño del paquete subido y lo más pesado (siempre; los límites solo si están configurados).

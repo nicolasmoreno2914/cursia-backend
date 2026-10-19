@@ -109,6 +109,11 @@ export interface PackageStatusResult {
    */
   approval?: { withoutGrades: boolean; coursePassingGrade: number | null };
   /**
+   * r60 (D1/D2): Moodle mínimo en el que el curso funciona completo (`minimumMoodle`, p. ej. «4.5» si hay H5P: las
+   * librerías del pack piden la API H5P 1.28) y formato del backup (`backupFormat`). Ausente en jobs anteriores a r60.
+   */
+  moodleCompatibility?: { minimumMoodle: string; backupFormat: string; h5pCoreApi: string | null };
+  /**
    * EV6 DoD: tipo de paquete. Solo `final` es entregable al cliente; `qa_preview` (run de vista
    * previa) y `degraded` (§2.6) son paquetes de QA rotulados «QA — vista previa, no entregable».
    * Paquetes anteriores sin el campo: inferido de su resumen (videos omitidos / mocks → qa_preview).
@@ -347,6 +352,10 @@ export class PackagingService {
     const restore = job.output_summary?.restore;
     if (restore && restore.as === 'admin_or_manager' && typeof restore.note === 'string') result.restore = { as: 'admin_or_manager', note: restore.note };
     else if (restore && restore.as === 'site_library_pack' && typeof restore.note === 'string') result.restore = { as: 'site_library_pack', libraryPack: 'v3', note: restore.note };
+    const mc = job.output_summary?.moodleCompatibility;
+    if (mc && typeof mc.minimumMoodle === 'string' && typeof mc.backupFormat === 'string') {
+      result.moodleCompatibility = { minimumMoodle: mc.minimumMoodle, backupFormat: mc.backupFormat, h5pCoreApi: typeof mc.h5pCoreApi === 'string' ? mc.h5pCoreApi : null };
+    }
     const asum = job.output_summary?.assessment;
     if (asum && typeof asum === 'object' && typeof asum.withoutGrades === 'boolean') {
       const g = asum.coursePassingGrade;

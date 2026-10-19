@@ -568,7 +568,7 @@ async function buildPackage(X, distRoot, prep, state, cfg, warnings) {
     itemCounts: X.ASM.assessmentItemCountsForPackage(manifest, omittedVideoKeys, prep.assessment.profile),
   });
   if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) throw new DriverError('MBZ_V3_VALIDATION_FAILED', 'el builder resolvió una evaluación distinta de la del perfil');
-  const vargs = { facts: built.expectations.facts, resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion, internalVocabularyExempt: built.expectations.internalVocabularyExempt, internalVocabularyUserTexts: built.expectations.internalVocabularyUserTexts };
+  const vargs = { facts: built.expectations.facts, resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion, moodleMinimum: built.expectations.moodleMinimum, internalVocabularyExempt: built.expectations.internalVocabularyExempt, internalVocabularyUserTexts: built.expectations.internalVocabularyUserTexts };
   const validation = await X.VAL.validateMbzV3(built.mbz, vargs);
   if (!validation.ok) throw new DriverError('MBZ_V3_VALIDATION_FAILED', `${validation.issues.length} hallazgo(s): ${validation.issues.slice(0, 5).map((i) => `${i.code} ${i.where}`).join(' | ')}`);
   // Marca sintética oculta dentro del .mbz (además del título y del aviso QA visible).

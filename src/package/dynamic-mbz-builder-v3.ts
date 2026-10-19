@@ -23,6 +23,7 @@
  *  - v1/v2 no cambian: este archivo es independiente de `dynamic-mbz-builder.ts`.
  */
 import * as JSZip from 'jszip';
+import { MOODLE_TOKEN_MIN_VERSION, MoodleCompatibility, compareMajorMinor, moodleRequirementSentence, profileClosureKeys, h5pPackageLibraryKeys, h5pRequirement, maxMajorMinor, moodleCompatibilityOf, rewriteSectionTokensLegacy, sectionTokenSupported } from './v3/moodle-compat';
 import {
   MoodleVersionInfo,
   esc,
@@ -273,8 +274,13 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * estimada: X h (definida por la institución)» y la Guía del docente «Carga horaria declarada» en los cursos CON objetivo
  * (antes ese texto nunca salía: facts.hours era siempre null). Sin objetivo de horas, el .mbz es byte a byte el de 3.15.0
  * (el builder no cambió; solo su entrada). Desglose opcional de horas en la Guía del docente (`hoursModel.teacherGuideBreakdown`).
+ * 3.16.0 (r60, compatibilidad real con Moodle): el paquete declara su Moodle mínimo (`summary.moodleCompatibility`,
+ * `expectations.moodleMinimum`): con H5P es 4.5 (las librerías del pack exigen la API H5P 1.28; 4.1–4.4 las rechazan
+ * con «api-version-unsupported»). Un paquete SIN H5P queda en el formato del backup (4.1) y sus botones a secciones
+ * pasan de `$@COURSESECTIONBYID*n@$` (solo 4.4+) a `$@COURSEVIEWBYID*curso@$&section=n` (todas): ese .mbz cambia.
+ * Con H5P el .mbz es byte a byte el de 3.15.1; cambia solo summary.restore.note (agrega «Requiere Moodle 4.5…»).
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.15.1';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.16.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -414,6 +420,8 @@ export interface MbzV3Expectations {
    * Solo presente si hay alguno.
    */
   internalVocabularyKeptTexts?: string[];
+  /** r60: Moodle mínimo que el paquete declara (el validador lo recalcula desde los bytes y exige que alcance). */
+  moodleMinimum?: string;
 }
 
 export interface BuildDynamicMbzV3Result {
@@ -421,7 +429,10 @@ export interface BuildDynamicMbzV3Result {
   expectations: MbzV3Expectations;
   summary: {
     builderVersion: string;
+    /** Formato del backup (moodle_release): versión mínima para restaurar. */
     moodleVersion: string;
+    /** r60: Moodle mínimo en el que el curso funciona completo (H5P instalable y enlaces resueltos). */
+    moodleCompatibility: MoodleCompatibility;
     planSha256: string;
     themeSha256: string;
     themeFamily: string;
@@ -688,15 +699,28 @@ const TOKEN_MODNAME: Record<string, string> = {
 };
 
 /** Falla fuerte ante cualquier token `$@…$` que no apunte a un módulo del paquete del tipo correcto. */
-export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string, sectionNums?: Set<number>, courseBackupId?: number): void {
+export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string, sectionNums?: Set<number>, courseBackupId?: number, minimumMoodle?: string): void {
   const bad: string[] = [];
   if (/cursia-cta:\/\//.test(html)) bad.push('marcador cursia-cta sin resolver');
   for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
     const kind = m[1];
     const idStr = m[2];
+    // r60 (D2): un token sin regla de decodificación en el Moodle mínimo del paquete queda literal al restaurar.
+    const since = MOODLE_TOKEN_MIN_VERSION[kind];
+    if (since && minimumMoodle !== undefined && compareMajorMinor(minimumMoodle, since) < 0) {
+      bad.push(`${m[0]} (solo Moodle ${since}+; el paquete funciona desde ${minimumMoodle})`);
+      continue;
+    }
     // Edu EV3: enlace a una sección del paquete (botón «Continuar con el módulo…»).
     if (kind === 'COURSESECTIONBYID') {
       if (!idStr || !sectionNums || !sectionNums.has(Number(idStr))) bad.push(m[0]);
+      continue;
+    }
+    // r60 (D2): curso del backup, opcionalmente `&section=n` (botón a sección de un paquete que funciona en < 4.4).
+    if (kind === 'COURSEVIEWBYID') {
+      if (!idStr || courseBackupId === undefined || Number(idStr) !== courseBackupId) bad.push(m[0]);
+      const sec = /^&(?:amp;)?section=(\d+)/.exec(html.slice((m.index ?? 0) + m[0].length));
+      if (sec && (!sectionNums || !sectionNums.has(Number(sec[1])))) bad.push(`${m[0]}&section=${sec[1]}`);
       continue;
     }
     // EV6 (T3): página de insignias (certificado) del curso del backup.
@@ -1262,6 +1286,10 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   });
   const graded: Array<CompletionCandidate & { name: string }> = [];
   const labelsHtml: Array<{ where: string; html: string }> = [];
+  // r60 (D2): último label.xml escrito por actividad (para reescribir los botones a secciones si el paquete funciona en < 4.4).
+  const labelWrites = new Map<string, { a: ActivityRef; name: string; logIdx: number }>();
+  // r60 (D1): bytes de cada .h5p del paquete (su h5p.json fija el requisito de API H5P del sitio).
+  const h5pBuffersForCompat: Buffer[] = [];
   const h5pPackages: MbzV3H5pPackage[] = [];
   const mockPresentationChapters: string[] = [];
   const introTheme = introThemeFrom(theme);
@@ -1284,6 +1312,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
       p.html = p.html.split(`cursia-cta://${marker}`).join(token);
       W.put(`${p.a.dir}/label.xml`, labelXmlWithCtx(p.a.aid, p.a.mid, p.a.ctx, p.name, p.html, ts));
       labelsHtml[p.logIdx].html = p.html;
+      labelWrites.set(p.a.dir, { a: p.a, name: p.name, logIdx: p.logIdx });
       if (!p.html.includes('cursia-cta://')) pendingCtas.splice(i, 1);
       return;
     }
@@ -1304,6 +1333,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     W.put(`${a.dir}/inforef.xml`, inforef(fileIds));
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
+    labelWrites.set(a.dir, { a, name: label.name, logIdx: labelsHtml.length });
     labelsHtml.push({ where: idnumber, html: label.html });
     return a;
   };
@@ -1474,6 +1504,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
     if (kind === 'activity') resolveCta('next-activity', secnum, `$@H5PACTIVITYVIEWBYID*${a.mid}@$`);
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
+    h5pBuffersForCompat.push(h5p);
   };
 
   /**
@@ -1506,6 +1537,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     W.boilerplate(a.dir);
     labelsHtml.push({ where: `${idnumber}#intro`, html: introHtml });
     h5pPackages.push({ itemKey, filename, mainLibrary, sha1: sha1Buf(h5p), bytes: h5p.length });
+    h5pBuffersForCompat.push(h5p);
   };
   // r55 (R7): ningún .h5p del curso lleva librerías (todos solo contenido): el store ya no se abre al empaquetar.
 
@@ -1939,9 +1971,35 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     W.put(`${t.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(t.mid, 'label', closing, ts, MV.bv), t.idnumber), { visible: '0', visibleold: '0' }));
   }
 
+  // ── r60: compatibilidad real con Moodle (D1 H5P, D2 tokens) ─────────────
+  // Moodle mínimo por el H5P (coreApi de las librerías del h5p.json de cada paquete). Si queda < 4.4, los botones a
+  // secciones no pueden usar $@COURSESECTIONBYID*n@$ (sin regla de decodificación en 4.1–4.3): van a
+  // $@COURSEVIEWBYID*curso@$&section=n, que resuelve en todas. Con H5P (≥ 4.5) el paquete queda byte a byte igual.
+  const h5pLibraryKeys = await h5pPackageLibraryKeys(h5pBuffersForCompat);
+  const h5pFloor = h5pRequirement(h5pLibraryKeys).minimumMoodle;
+  // Review r60 (I1): sin requisito H5P manda el formato del backup (4.0/3.11/3.9 siguen armándose como en 3.15.1).
+  const preTokenFloor = h5pFloor === null ? MV.br : (maxMajorMinor([MV.br, h5pFloor]) as string);
+  const sectionLinks: MoodleCompatibility['sectionLinks'] = !labelsHtml.some((l) => l.html.includes('$@COURSESECTIONBYID*'))
+    ? 'none'
+    : sectionTokenSupported(preTokenFloor) ? 'COURSESECTIONBYID' : 'COURSEVIEWBYID_SECTION';
+  if (sectionLinks === 'COURSEVIEWBYID_SECTION') {
+    for (const [dir, w] of labelWrites) {
+      const html = labelsHtml[w.logIdx].html;
+      if (!html.includes('$@COURSESECTIONBYID*')) continue;
+      const fixed = rewriteSectionTokensLegacy(html, MBZ_V3_COURSE_BACKUP_ID);
+      labelsHtml[w.logIdx].html = fixed;
+      W.put(`${dir}/label.xml`, labelXmlWithCtx(w.a.aid, w.a.mid, w.a.ctx, w.name, fixed, ts));
+    }
+    if (labelsHtml.some((l) => l.html.includes('$@COURSESECTIONBYID*'))) throw new Error('MBZ_V3_INVARIANT: botón a sección con token de Moodle 4.4+ fuera de un label');
+  }
+  const moodleCompatibility = moodleCompatibilityOf({ backupFormat: MV.br, h5pLibraryKeys, html: labelsHtml.map((l) => l.html), sectionLinks });
+  if (compareMajorMinor(moodleCompatibility.minimumMoodle, preTokenFloor) !== 0) {
+    throw new Error(`MBZ_V3_INVARIANT: los tokens suben el Moodle mínimo a ${moodleCompatibility.minimumMoodle} (piso ${preTokenFloor})`);
+  }
+
   // ── Tokens (fail loud) ───────────────────────────────────────────────────
   const sectionNums = new Set(plan.sections.map((s) => s.sectionNum));
-  for (const l of labelsHtml) assertTokensV3(l.html, W.modnameByMid, l.where, sectionNums, MBZ_V3_COURSE_BACKUP_ID);
+  for (const l of labelsHtml) assertTokensV3(l.html, W.modnameByMid, l.where, sectionNums, MBZ_V3_COURSE_BACKUP_ID, moodleCompatibility.minimumMoodle);
   if (pendingCtas.length) throw new Error(`MBZ_V3_INVARIANT: botones de navegación sin destino: ${pendingCtas.map((p) => p.name).join(', ')}`);
 
   // ── Secciones ────────────────────────────────────────────────────────────
@@ -2129,10 +2187,12 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}) },
+    expectations: { facts, resolved, h5pProfileVersion, moodleMinimum: moodleCompatibility.minimumMoodle, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,
+      // r60: Moodle mínimo en el que el curso funciona completo (≠ moodleVersion = formato del backup).
+      moodleCompatibility,
       planSha256: packagingPlanV3Sha256(plan),
       themeSha256: themeSha256(theme),
       themeFamily: theme.familyId,
@@ -2165,7 +2225,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
         : {}),
       // r55 (R7): todos los .h5p son solo contenido; con un tipo que no está en el pack v1 (QuestionSet 1.21, BS,
       // «Repaso») la entrega declara el requisito del sitio: Cursia H5P Library Pack v3 (cualquier rol restaura).
-      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_SITE_LIBRARY_PACK_RESTORE_NOTE } : {}),
+      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: h5pSiteLibraryPackRestoreNote(moodleCompatibility) } : {}),
     },
   };
 }
@@ -2185,14 +2245,28 @@ export function reviewCardsApply(blueprint: BlueprintSnapshotV2, manifest: Gener
  * sube un administrador una vez; `scripts/h5p-preflight-moodle.js --profile v3` lo verifica) y desde ahí cualquier
  * docente restaura. El frontend la muestra en «Cómo restaurarlo en Moodle» (summary.restore del paquete).
  */
-export const H5P_SITE_LIBRARY_PACK_RESTORE_NOTE = Object.freeze({
-  as: 'site_library_pack' as const,
-  libraryPack: 'v3' as const,
-  note:
-    'Antes de restaurar, el sitio Moodle debe tener instalado el Cursia H5P Library Pack v3 (un administrador lo sube una sola vez en ' +
-    'Administración del sitio › H5P › Gestionar tipos de contenido H5P). Con el pack instalado, cualquier docente puede restaurar el curso; ' +
-    'sin él, las actividades H5P muestran «Missing main library».',
-});
+/** Review r60 (M2): nota del pack v3 con el requisito de Moodle CALCULADO del paquete (summary.moodleCompatibility). */
+export function h5pSiteLibraryPackRestoreNote(c: Pick<MoodleCompatibility, 'minimumMoodle' | 'h5pCoreApi'>): { as: 'site_library_pack'; libraryPack: 'v3'; note: string } {
+  return Object.freeze({
+    as: 'site_library_pack' as const,
+    libraryPack: 'v3' as const,
+    note:
+      moodleRequirementSentence(c.minimumMoodle, c.h5pCoreApi) + ' ' +
+      'Antes de restaurar, el sitio Moodle debe tener instalado el Cursia H5P Library Pack v3 (un administrador lo sube una sola vez en ' +
+      'Administración del sitio › H5P › Gestionar tipos de contenido H5P). Con el pack instalado, cualquier docente puede restaurar el curso; ' +
+      'sin él, las actividades H5P muestran «Missing main library».',
+  });
+}
+
+/** Nota del pack v3 para el requisito de su propia clausura (todas sus principales: API H5P 1.28 → Moodle 4.5). */
+export const H5P_SITE_LIBRARY_PACK_RESTORE_NOTE = (() => {
+  const keys = Object.keys(CURSIA_H5P_PROFILE_V3.mainLibraries).flatMap((m) => {
+    const r = CURSIA_H5P_PROFILE_V3.mainLibraries[m];
+    return profileClosureKeys(m, r.majorVersion, r.minorVersion);
+  });
+  const req = h5pRequirement(keys);
+  return h5pSiteLibraryPackRestoreNote({ minimumMoodle: req.minimumMoodle as string, h5pCoreApi: req.coreApi });
+})();
 
 /**
  * @deprecated r55: nota de builders ≤ 3.13.0 (los .h5p llevaban carpetas delta y se pedía restaurar como
