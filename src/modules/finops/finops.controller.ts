@@ -26,8 +26,10 @@ import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsError } from './errors';
 import { llmIngestToChargeInput, llmProxyReservationKey, llmReservationToChargeInput, parseLlmReservationIngest, parseLlmReservationRelease, parseLlmUsageIngest } from './llm-usage-ingest';
 import { costIdempotencyKey } from './idempotency';
+import { normalizeDecimal } from './decimal';
 import { SPEND_CONTROL_CODES } from './spend-controls';
 import { RUN_BUDGET_NOT_AUTHORIZED } from './run-budget';
+import { parseReconcileDecision, ReconcileDecision, ReconcileEvidence } from './reconcile-decision';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -39,14 +41,71 @@ export const SPEND_CONTROL_HTTP_CODES: Readonly<Record<string, string>> = Object
   ITEM_RUN_NOT_FOUND: SPEND_CONTROL_CODES.itemRunNotFound,
 });
 
-/** r59: validación del cuerpo de POST tts-reservations/reconcile (mismo estilo que el del worker de IA). */
-export function parseTtsReservationReconcileBody(body: unknown): { reservationKey: string; outcome: 'charged' | 'not_charged'; reason: string } {
+/**
+ * r59/r60: validación del cuerpo de POST tts-reservations/reconcile:
+ * {reservationKey, outcome: 'charged'|'not_charged'|'charged_partial', reason, amount?, evidence?}.
+ */
+export function parseTtsReservationReconcileBody(body: unknown): { reservationKey: string } & ReconcileDecision {
   const b = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
-  for (const k of Object.keys(b)) if (!['reservationKey', 'outcome', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+  for (const k of Object.keys(b)) if (!['reservationKey', 'outcome', 'reason', 'amount', 'evidence'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
   if (typeof b.reservationKey !== 'string' || !TTS_RESERVATION_KEY_RE.test(b.reservationKey)) throw new BadRequestException('reservationKey inválida');
-  if (b.outcome !== 'charged' && b.outcome !== 'not_charged') throw new BadRequestException('outcome debe ser charged | not_charged');
-  if (typeof b.reason !== 'string' || !b.reason.trim() || b.reason.length > 500) throw new BadRequestException('reason es obligatorio (≤ 500)');
-  return { reservationKey: b.reservationKey, outcome: b.outcome, reason: b.reason };
+  const d = parseDecisionOrBadRequest(b, ['reservationKey']);
+  return { reservationKey: b.reservationKey, ...d };
+}
+
+/** r60: parseReconcileDecision → 400 (mismo estilo que el resto de los endpoints de conciliación). */
+export function parseDecisionOrBadRequest(body: unknown, extraKeys: readonly string[] = []): ReconcileDecision {
+  try {
+    return parseReconcileDecision(body, { extraKeys });
+  } catch (err) {
+    if (err instanceof FinopsError) throw new BadRequestException(err.message.replace(/^INVALID_INPUT:\s*/, ''));
+    throw err;
+  }
+}
+
+/**
+ * r60: aplica la decisión sobre una reserva (los tres endpoints de este controlador). → respuesta común:
+ * {outcome, reconciled, alreadySettled, amount (reservado), countedAmount?, recordedSettlement?}. Un `charged_partial`
+ * (o cualquier outcome) sobre una reserva ya cerrada de OTRA forma (o con otro monto) → 409 `reservation_already_settled` (I1).
+ */
+export async function applyReconcileDecision(
+  ledger: Pick<FinopsLedgerService, 'reconcileReservationAsCharged' | 'reconcileReservationAsNotCharged' | 'reconcileReservationAsChargedPartial' | 'reservationDecisionOf'>,
+  key: string,
+  d: ReconcileDecision,
+  decidedBy: string,
+  metadata: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  // r60 fix round (I1): una reserva YA cerrada solo responde 200 (no-op) si la decisión registrada es exactamente la
+  // pedida (mismo outcome y, en charged_partial, mismo monto). Cualquier otra (dirección inversa, otro monto, o una
+  // liquidación del worker) → 409 con la decisión y el monto registrados; nunca un 200 con el monto reservado.
+  const conflict = (settlement: string | null, counted: string) => new ConflictException({
+    code: 'reservation_already_settled',
+    message: `reservation_already_settled: la reserva ya está cerrada (${settlement ?? 'liquidada'}, cuenta USD ${counted}); no se cambia una decisión registrada.`,
+    recordedOutcome: outcomeOfSettlement(settlement),
+    recordedSettlement: settlement,
+    countedAmount: counted,
+  });
+  if (d.outcome === 'charged_partial') {
+    const r = await ledger.reconcileReservationAsChargedPartial(key, d.amount as string, d.reason, d.evidence as ReconcileEvidence, { decidedBy, metadata });
+    if (r.alreadySettled && (r.recordedSettlement !== 'reconciled_as_charged_partial' || r.countedAmount !== d.amount)) throw conflict(r.recordedSettlement, r.countedAmount);
+    return { outcome: d.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount, countedAmount: r.countedAmount, recordedSettlement: r.recordedSettlement };
+  }
+  const r = d.outcome === 'charged'
+    ? await ledger.reconcileReservationAsCharged(key, d.reason, { decidedBy, metadata })
+    : await ledger.reconcileReservationAsNotCharged(key, d.reason, { decidedBy, metadata });
+  if (r.alreadySettled) {
+    const rec = await ledger.reservationDecisionOf(key);
+    const expected = d.outcome === 'charged' ? 'reconciled_as_charged' : 'reconciled_as_not_charged';
+    if (!rec || rec.settlement !== expected) throw conflict(rec?.settlement ?? null, rec?.countedAmount ?? normalizeDecimal(0));
+    return { outcome: d.outcome, reconciled: false, alreadySettled: true, amount: r.amount, countedAmount: rec.countedAmount, recordedSettlement: rec.settlement };
+  }
+  return { outcome: d.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+}
+
+/** `settlement` del ledger → outcome de conciliación (null = liquidación del worker u otra). */
+export function outcomeOfSettlement(settlement: string | null): ReconcileDecision['outcome'] | null {
+  return settlement === 'reconciled_as_charged' ? 'charged' : settlement === 'reconciled_as_not_charged' ? 'not_charged'
+    : settlement === 'reconciled_as_charged_partial' ? 'charged_partial' : null;
 }
 
 /** FinopsError → HTTP (fail loud: un precio faltante es 422, nunca un 200 con 0). */
@@ -320,28 +379,24 @@ export class FinopsAdminController {
     }
   }
 
-  // POST /api/v1/finops/llm-worker-reservations/reconcile {reservationKey, outcome: 'charged'|'not_charged', reason}
+  // POST /api/v1/finops/llm-worker-reservations/reconcile {reservationKey, outcome: 'charged'|'not_charged'|'charged_partial', reason, amount?, evidence?}
   // Decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. Repetir = no-op.
   @Post('llm-worker-reservations/reconcile')
   @HttpCode(HttpStatus.OK)
   async reconcileLlmWorkerReservation(@Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
     const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
-    for (const k of Object.keys(b)) if (!['reservationKey', 'outcome', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+    for (const k of Object.keys(b)) if (!['reservationKey', 'outcome', 'reason', 'amount', 'evidence'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
     if (typeof b.reservationKey !== 'string' || !/^reservation:llm:[0-9a-f-]{36}:[A-Za-z0-9_.:-]{1,200}$/.test(b.reservationKey)) {
       throw new BadRequestException('reservationKey inválida');
     }
-    if (b.outcome !== 'charged' && b.outcome !== 'not_charged') throw new BadRequestException('outcome debe ser charged | not_charged');
-    if (typeof b.reason !== 'string' || !b.reason.trim() || b.reason.length > 500) throw new BadRequestException('reason es obligatorio (≤ 500)');
+    const d = parseDecisionOrBadRequest(b, ['reservationKey']);
     const decidedBy = String(user?.id || '');
     if (!decidedBy) throw new BadRequestException('usuario sin id');
     try {
       const kind = await this.ledger.isLlmWorkerReservation(b.reservationKey);
       if (kind === 'not_worker') throw new BadRequestException('no es una reserva del worker de IA');
       if (kind === 'item_running') throw new ConflictException('la parte sigue en ejecución: la llamada puede liquidarse sola; conciliar cuando termine');
-      const r = b.outcome === 'charged'
-        ? await this.ledger.reconcileReservationAsCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } })
-        : await this.ledger.reconcileReservationAsNotCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } });
-      return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+      return await applyReconcileDecision(this.ledger, b.reservationKey, d, decidedBy, { llmWorker: true });
     } catch (err) {
       if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
       throw finopsErrorToHttp(err);
@@ -368,7 +423,7 @@ export class FinopsAdminController {
     }
   }
 
-  // POST /api/v1/finops/tts-reservations/reconcile {reservationKey, outcome: 'charged'|'not_charged', reason}
+  // POST /api/v1/finops/tts-reservations/reconcile {reservationKey, outcome: 'charged'|'not_charged'|'charged_partial', reason, amount?, evidence?}
   // r59: decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. Repetir = no-op.
   @Post('tts-reservations/reconcile')
   @HttpCode(HttpStatus.OK)
@@ -380,35 +435,26 @@ export class FinopsAdminController {
       const kind = await this.ledger.isTtsReservation(b.reservationKey);
       if (kind === 'not_tts') throw new BadRequestException('no es una reserva de TTS');
       if (kind === 'item_running') throw new ConflictException('la parte sigue en ejecución: la llamada puede liquidarse sola; conciliar cuando termine');
-      const r = b.outcome === 'charged'
-        ? await this.ledger.reconcileReservationAsCharged(b.reservationKey, b.reason, { decidedBy, metadata: { ttsReservation: true } })
-        : await this.ledger.reconcileReservationAsNotCharged(b.reservationKey, b.reason, { decidedBy, metadata: { ttsReservation: true } });
-      return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+      return await applyReconcileDecision(this.ledger, b.reservationKey, b, decidedBy, { ttsReservation: true });
     } catch (err) {
       if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
       throw finopsErrorToHttp(err);
     }
   }
 
-  // POST /api/v1/finops/llm-proxy-reservations/:callId/reconcile {outcome: 'charged'|'not_charged', reason}
+  // POST /api/v1/finops/llm-proxy-reservations/:callId/reconcile {outcome: 'charged'|'not_charged'|'charged_partial', reason, amount?, evidence?}
   // Decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. Repetir = no-op.
   @Post('llm-proxy-reservations/:callId/reconcile')
   @HttpCode(HttpStatus.OK)
   async reconcileLlmProxyReservation(@Param('callId') callId: string, @Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
     if (!UUID_RE.test(callId)) throw new BadRequestException('callId debe ser UUID');
-    const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
-    for (const k of Object.keys(b)) if (!['outcome', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
-    if (b.outcome !== 'charged' && b.outcome !== 'not_charged') throw new BadRequestException('outcome debe ser charged | not_charged');
-    if (typeof b.reason !== 'string' || !b.reason.trim() || b.reason.length > 500) throw new BadRequestException('reason es obligatorio (≤ 500)');
+    const d = parseDecisionOrBadRequest(body);
     const decidedBy = String(user?.id || ''); // re-review (minor b): id, nunca el email, en el ledger
     if (!decidedBy) throw new BadRequestException('usuario sin id');
     try {
-      const key = llmProxyReservationKey(callId);
-      const r = b.outcome === 'charged'
-        ? await this.ledger.reconcileReservationAsCharged(key, b.reason, { decidedBy, metadata: { llmProxy: true } })
-        : await this.ledger.reconcileReservationAsNotCharged(key, b.reason, { decidedBy, metadata: { llmProxy: true } });
-      return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+      return await applyReconcileDecision(this.ledger, llmProxyReservationKey(callId), d, decidedBy, { llmProxy: true });
     } catch (err) {
+      if (err instanceof ConflictException) throw err;
       throw finopsErrorToHttp(err);
     }
   }

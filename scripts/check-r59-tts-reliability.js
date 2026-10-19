@@ -173,6 +173,8 @@ const PENDING = { pendingUsd: 0.0735, providers: ['openai'] };
         return { reconciled: true, alreadySettled: false, amount: '0.0735' };
       },
       pendingTtsReservations: async (f) => [{ reservationKey: KEY, filter: f }],
+      // r60 (I1): decisión registrada (para distinguir el no-op del 409).
+      reservationDecisionOf: async (k) => (settled.has(k) ? { settlement: `reconciled_as_${settled.get(k)}`, countedAmount: settled.get(k) === 'charged' ? '0.0735000000' : '0.0000000000' } : null),
     };
     const ctrl = new CTRL.FinopsAdminController(fakeLedger, {});
     const admin = { id: 'admin-uuid', email: 'x@y' };
@@ -183,8 +185,10 @@ const PENDING = { pendingUsd: 0.0735, providers: ['openai'] };
     const r1 = await ctrl.reconcileTtsReservation({ reservationKey: KEY, outcome: 'charged', reason: 'OpenAI lo cobró (consola)' }, admin);
     eq(r1, { outcome: 'charged', reconciled: true, alreadySettled: false, amount: '0.0735' }, 'charged');
     eq(calls[0][3], { decidedBy: 'admin-uuid', metadata: { ttsReservation: true } }, 'decidedBy = id (nunca el email) + metadata');
-    const r2 = await ctrl.reconcileTtsReservation({ reservationKey: KEY, outcome: 'not_charged', reason: 'repetido' }, admin);
-    eq([r2.reconciled, r2.alreadySettled], [false, true], 'repetir = no-op');
+    const r2 = await ctrl.reconcileTtsReservation({ reservationKey: KEY, outcome: 'charged', reason: 'repetido' }, admin);
+    eq([r2.reconciled, r2.alreadySettled], [false, true], 'repetir la misma decisión = no-op');
+    // r60 (I1): la decisión inversa sobre una reserva ya conciliada → 409 (antes: 200 alreadySettled).
+    await rejects(ctrl.reconcileTtsReservation({ reservationKey: KEY, outcome: 'not_charged', reason: 'cambio' }, admin), ConflictException, /reservation_already_settled/, 'inversa → 409');
     eq(settled.get(KEY), 'charged', 'la primera decisión se conserva');
     const list = await ctrl.ttsReservations('1510', undefined);
     eq(list.reservations[0].filter, { courseId: 1510 }, 'GET con filtro de curso');
