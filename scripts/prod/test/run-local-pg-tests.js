@@ -189,9 +189,13 @@ async function main() {
           'scripts/lib/production-jobs-constraints.js',
           'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql',
           'supabase-migration-v21-blueprint-profiles.sql',
+          // r60: las 6 que antes eran solo de staging (pedagogy/practice tras R3; application/guided/academic/prebrief tras R4).
+          'supabase-migration-pedagogy-profiles.sql', 'supabase-migration-practice-chapters.sql',
           'supabase-migration-generation-manifests.sql', 'supabase-migration-dynamic-generation.sql',
           'supabase-migration-dynamic-generation-v2.sql', 'supabase-migration-invalidation.sql',
           'supabase-migration-v21-manifest-v3.sql',
+          'supabase-migration-application-activities.sql', 'supabase-migration-guided-practice.sql',
+          'supabase-migration-academic-context.sql', 'supabase-migration-prebrief.sql',
           // V2.1 RF (FinOps ledger + seed de precios por hook) y RF-b (RLS de FinOps + course_profiles).
           'supabase-migration-v21-finops.sql', 'supabase-migration-v21-finops-rls.sql',
           // EV6 H5P v2 (H2): courses.review_cards_enabled (preparación; default false).
