@@ -20,7 +20,7 @@ import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import type { AuthUser } from '../../auth/auth.types';
-import { FinopsLedgerService } from './finops-ledger.service';
+import { FinopsLedgerService, TTS_RESERVATION_KEY_RE } from './finops-ledger.service';
 import { FinopsBudgetService } from './finops-budget.service';
 import { FinopsIngestTokenGuard } from './finops-ingest-token.guard';
 import { FinopsError } from './errors';
@@ -38,6 +38,16 @@ export const SPEND_CONTROL_HTTP_CODES: Readonly<Record<string, string>> = Object
   UNATTRIBUTED_CEILING: SPEND_CONTROL_CODES.unattributedCeiling,
   ITEM_RUN_NOT_FOUND: SPEND_CONTROL_CODES.itemRunNotFound,
 });
+
+/** r59: validación del cuerpo de POST tts-reservations/reconcile (mismo estilo que el del worker de IA). */
+export function parseTtsReservationReconcileBody(body: unknown): { reservationKey: string; outcome: 'charged' | 'not_charged'; reason: string } {
+  const b = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
+  for (const k of Object.keys(b)) if (!['reservationKey', 'outcome', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+  if (typeof b.reservationKey !== 'string' || !TTS_RESERVATION_KEY_RE.test(b.reservationKey)) throw new BadRequestException('reservationKey inválida');
+  if (b.outcome !== 'charged' && b.outcome !== 'not_charged') throw new BadRequestException('outcome debe ser charged | not_charged');
+  if (typeof b.reason !== 'string' || !b.reason.trim() || b.reason.length > 500) throw new BadRequestException('reason es obligatorio (≤ 500)');
+  return { reservationKey: b.reservationKey, outcome: b.outcome, reason: b.reason };
+}
 
 /** FinopsError → HTTP (fail loud: un precio faltante es 422, nunca un 200 con 0). */
 export function finopsErrorToHttp(err: unknown): unknown {
@@ -331,6 +341,48 @@ export class FinopsAdminController {
       const r = b.outcome === 'charged'
         ? await this.ledger.reconcileReservationAsCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } })
         : await this.ledger.reconcileReservationAsNotCharged(b.reservationKey, b.reason, { decidedBy, metadata: { llmWorker: true } });
+      return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
+    } catch (err) {
+      if (err instanceof BadRequestException || err instanceof ConflictException) throw err;
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // GET /api/v1/finops/tts-reservations?courseId=&runId= — r59: segmentos de TTS de OpenAI cuyo resultado es desconocido
+  // (timeout del cliente: OpenAI suele generar y cobrar igual). Cuentan como gasto mientras tanto.
+  @Get('tts-reservations')
+  async ttsReservations(@Query('courseId') courseId?: string, @Query('runId') runId?: string) {
+    const f: { courseId?: number; runId?: string } = {};
+    if (courseId !== undefined) {
+      if (!/^\d{1,12}$/.test(courseId)) throw new BadRequestException('courseId inválido');
+      f.courseId = Number(courseId);
+    }
+    if (runId !== undefined) {
+      if (!UUID_RE.test(runId)) throw new BadRequestException('runId debe ser UUID');
+      f.runId = runId;
+    }
+    try {
+      return { reservations: await this.ledger.pendingTtsReservations(f) };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // POST /api/v1/finops/tts-reservations/reconcile {reservationKey, outcome: 'charged'|'not_charged', reason}
+  // r59: decisión HUMANA (SUPER_ADMIN), con motivo; nunca automática. Repetir = no-op.
+  @Post('tts-reservations/reconcile')
+  @HttpCode(HttpStatus.OK)
+  async reconcileTtsReservation(@Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
+    const b = parseTtsReservationReconcileBody(body);
+    const decidedBy = String(user?.id || '');
+    if (!decidedBy) throw new BadRequestException('usuario sin id');
+    try {
+      const kind = await this.ledger.isTtsReservation(b.reservationKey);
+      if (kind === 'not_tts') throw new BadRequestException('no es una reserva de TTS');
+      if (kind === 'item_running') throw new ConflictException('la parte sigue en ejecución: la llamada puede liquidarse sola; conciliar cuando termine');
+      const r = b.outcome === 'charged'
+        ? await this.ledger.reconcileReservationAsCharged(b.reservationKey, b.reason, { decidedBy, metadata: { ttsReservation: true } })
+        : await this.ledger.reconcileReservationAsNotCharged(b.reservationKey, b.reason, { decidedBy, metadata: { ttsReservation: true } });
       return { outcome: b.outcome, reconciled: r.reconciled, alreadySettled: r.alreadySettled, amount: r.amount };
     } catch (err) {
       if (err instanceof BadRequestException || err instanceof ConflictException) throw err;

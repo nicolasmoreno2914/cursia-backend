@@ -394,6 +394,13 @@ export const AMBIGUOUS_AUDIO_RESUBMIT_CODE = 'ambiguous_audio_resubmit';
 /** Regex POSIX gruesa del barrido (la decisión fina es ambiguousAudioResubmitDecision). */
 export const AMBIGUOUS_AUDIO_RESUBMIT_SQL_REGEX = `^${PROVIDER_RECONCILIATION_REQUIRED}: openai([^a-z0-9_]|$)`;
 const AMBIGUOUS_AUDIO_RESUBMIT_RE = new RegExp(`^${PROVIDER_RECONCILIATION_REQUIRED}: openai(?![a-z0-9_])`);
+/**
+ * r59: la operación incierta fue un TIMEOUT del cliente (AbortSignal.timeout): el pedido llegó entero a OpenAI,
+ * que casi seguro lo generó y lo COBRÓ aunque nadie leyera la respuesta. Un reenvío automático duplica el cobro
+ * (#1510: dos timeouts seguidos del mismo segmento, dos reservas pendientes). Queda para un admin, que concilia
+ * y reenvía explícitamente (retry {resubmitProvider:true}). Otros cortes ambiguos (conexión caída) siguen igual.
+ */
+export const AMBIGUOUS_AUDIO_TIMEOUT_RE = /TimeoutError|aborted due to timeout|\btimeout\b|\btimed out\b/i;
 /** La deny-list del auto-healer SIN las dos entradas que describen justamente este caso (incierto/conciliación). */
 const AMBIGUOUS_AUDIO_DENY: readonly RegExp[] = Object.freeze(
   AUTO_HEAL_DENY_PATTERNS.filter((re) => !re.test(PROVIDER_RECONCILIATION_REQUIRED) && !re.test('ambiguous')),
@@ -414,7 +421,7 @@ export interface AmbiguousAudioPending {
 
 export type AmbiguousAudioDecision =
   | { heal: true; round: number; pendingUsd: number | null }
-  | { heal: false; reason: AutoHealSkipReason | 'declined' | 'over_threshold' | 'not_audio'; retryAt?: Date; pendingUsd?: number | null };
+  | { heal: false; reason: AutoHealSkipReason | 'declined' | 'over_threshold' | 'not_audio' | 'timeout_likely_charged'; retryAt?: Date; pendingUsd?: number | null };
 
 /**
  * Decisión pura. `pending` undefined = el llamador no consultó el ledger (completion: solo decide si
@@ -433,6 +440,7 @@ export function ambiguousAudioResubmitDecision(
   if (!error) return { heal: false, reason: 'no_error' };
   if (!AMBIGUOUS_AUDIO_RESUBMIT_RE.test(error)) return { heal: false, reason: 'not_allow_listed' };
   if (AMBIGUOUS_AUDIO_DENY.some((re) => re.test(error))) return { heal: false, reason: 'denied' };
+  if (AMBIGUOUS_AUDIO_TIMEOUT_RE.test(error)) return { heal: false, reason: 'timeout_likely_charged' };
   const os = (row.output_summary ?? {}) as Record<string, any>;
   if (os.ambiguousAudioResubmit?.declined) return { heal: false, reason: 'declined' };
   const rounds = ambiguousAudioResubmitRoundsOf(os);
