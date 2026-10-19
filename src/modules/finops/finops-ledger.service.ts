@@ -193,6 +193,13 @@ interface Attribution {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** r59: clave de una reserva de TTS de OpenAI (`reservationKey` de finops-worker-hooks: `reservation:tts:<itemRunId>:g…:a…:<tag>`). */
+export const TTS_RESERVATION_KEY_RE = /^reservation:tts:[0-9a-f-]{36}:[A-Za-z0-9_.:-]{1,200}$/;
+/** r59: decisión pura sobre la fila de la reserva (null = no existe como reserva CHARGE). */
+export function ttsReservationCheckOf(row: { item_status?: unknown } | null): 'ok' | 'not_tts' | 'item_running' {
+  if (!row) return 'not_tts';
+  return row.item_status === 'running' || row.item_status === 'claimed' ? 'item_running' : 'ok';
+}
 
 export const EVENT_COLUMNS = [
   'event_kind', 'corrects_event_id', 'owner_id', 'institution_id', 'course_id', 'blueprint_id', 'manifest_id', 'run_id',
@@ -1275,6 +1282,54 @@ export class FinopsLedgerService {
     );
     if (!r) return 'not_worker';
     return r.item_status === 'running' ? 'item_running' : 'ok';
+  }
+
+  /**
+   * r59: reservas de TTS de OpenAI (`reservation:tts:<itemRunId>:…`) que siguen PENDIENTES (timeout del cliente, worker
+   * caído en vuelo o liquidación fallida). Cuentan como gasto hasta que un SUPER_ADMIN las concilia contra la consola.
+   */
+  async pendingTtsReservations(filter: { courseId?: number; runId?: string; limit?: number } = {}): Promise<Array<{
+    reservationKey: string; createdAt: string; ownerId: string | null; courseId: number | null; runId: string | null;
+    itemKey: string | null; model: string | null; amount: string; characters: number | null;
+  }>> {
+    const where: string[] = [`e.idempotency_key like 'reservation:tts:%'`, `e.event_kind = 'CHARGE'`, `(e.metadata->>'reservation') = 'true'`,
+      `not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`,
+      `coalesce(i.status, '') not in ('running', 'claimed')`];
+    const params: unknown[] = [];
+    if (filter.courseId !== undefined) { params.push(filter.courseId); where.push(`e.course_id = $${params.length}`); }
+    if (filter.runId !== undefined) {
+      if (!UUID_RE.test(filter.runId)) throw new FinopsError('INVALID_INPUT', 'runId debe ser UUID');
+      params.push(filter.runId); where.push(`e.run_id = $${params.length}`);
+    }
+    params.push(Math.min(Math.max(Math.trunc(filter.limit ?? 200), 1), 1000));
+    const rows = await this.dataSource.query(
+      `select e.idempotency_key, e.created_at, e.owner_id, e.course_id, e.run_id, i.item_key, e.model_or_product, e.amount::text as amount, e.metadata
+         from public.generation_cost_events e left join public.generation_item_runs i on i.id = e.item_run_id
+        where ${where.join(' and ')} order by e.created_at limit $${params.length}`,
+      params,
+    );
+    return rows.map((r: any) => ({
+      reservationKey: r.idempotency_key,
+      createdAt: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      ownerId: r.owner_id ?? null, courseId: r.course_id ?? null, runId: r.run_id ?? null, itemKey: r.item_key ?? null,
+      model: r.model_or_product ?? null, amount: r.amount,
+      characters: Number.isInteger(r.metadata?.characters) ? r.metadata.characters : null,
+    }));
+  }
+
+  /**
+   * r59: ¿es una reserva de TTS (CHARGE con `reservation: true`), y su parte ya no está en ejecución? Solo esas se
+   * concilian por el endpoint de TTS. Una ya liquidada pasa ('ok'): la conciliación responde no-op (`alreadySettled`).
+   */
+  async isTtsReservation(reservationKey: string): Promise<'ok' | 'not_tts' | 'item_running'> {
+    if (!TTS_RESERVATION_KEY_RE.test(reservationKey)) return 'not_tts';
+    const [r] = await this.dataSource.query(
+      `select coalesce(i.status, '') as item_status from public.generation_cost_events e
+         left join public.generation_item_runs i on i.id = e.item_run_id
+        where e.idempotency_key = $1 and e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'`,
+      [reservationKey],
+    );
+    return ttsReservationCheckOf(r ?? null);
   }
 
   /**
