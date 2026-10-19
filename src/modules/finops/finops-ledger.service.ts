@@ -8,6 +8,7 @@ import { familyOfProvider, operationForItem } from './operations';
 import type { EstimateResult } from './estimator';
 import { CostReadService, costEventsCte } from './cost-read.service';
 import { assertProviderSpendAllowed, unattributedCeilings } from './spend-controls';
+import { parsePartialAmount, parseReconcileEvidence, ReconcileEvidence } from './reconcile-decision';
 
 /**
  * V2.1 RF-a — ledger de costos (audit §W.3/§W.4). Todas las escrituras son
@@ -1053,9 +1054,12 @@ export class FinopsLedgerService {
         // Review (I2): si un admin ya la concilió «cobrada», el monto de la reserva YA cuenta como el gasto de esa
         // llamada: un usage tardío no agrega un segundo cargo (sería doble conteo). En cualquier otro cierre
         // (liquidada / liberada / «no cobrada») el cargo real sí se registra (nunca de menos).
+        // r60: una conciliación PARCIAL (`reservationReconciledAsPartial`) también cuenta como «cobrada», pero su monto
+        // es una lectura de evidencia: si después llega la medición real del proveedor, gana la medición (mayor o menor).
         const [asCharged] = await manager.query(
-          `select 1 from public.generation_cost_events where corrects_event_id = $1 and event_kind = 'ADJUSTMENT'
-             and (metadata->>'reservationReconciledAsCharged') = 'true' limit 1`,
+          `select bool_or(coalesce(metadata->>'reservationReconciledAsPartial', '') = 'true') as partial
+             from public.generation_cost_events where corrects_event_id = $1 and event_kind = 'ADJUSTMENT'
+              and (metadata->>'reservationReconciledAsCharged') = 'true' having count(*) > 0`,
           [res.id],
         );
         if (built && !asCharged) {
@@ -1069,10 +1073,11 @@ export class FinopsLedgerService {
             `select coalesce(sum(amount),0)::text as t from public.generation_cost_events where id = $1 or corrects_event_id = $1`,
             [res.id],
           );
-          if (Number(built.row.amount ?? 0) > Number(net.t)) {
+          const partialSupersede = asCharged.partial === true && !isZeroDec(net.t);
+          if (partialSupersede || Number(built.row.amount ?? 0) > Number(net.t)) {
             fin = await this.insertEvent(built.row, manager);
             if (fin.inserted) {
-              await this.adjustWith(manager, reservationKey, normalizeDecimal(0), 'late_usage_exceeds_reconciled_reservation', {
+              await this.adjustWith(manager, reservationKey, normalizeDecimal(0), partialSupersede ? 'late_usage_supersedes_partial_reconciliation' : 'late_usage_exceeds_reconciled_reservation', {
                 recordedBy: opts.recordedBy || 'dynamic-worker',
                 settlement: true,
                 metadata: { reservationSettled: true, supersededBy: built.idempotencyKey },
@@ -1187,6 +1192,80 @@ export class FinopsLedgerService {
         metadata: { ...(opts.metadata || {}), reservationReconciledAsNotCharged: true, decidedBy },
       });
       return { reconciled: r.inserted, alreadySettled: false, amount: res.amount, event: r.event };
+    });
+  }
+
+  /**
+   * r60 — conciliación ADMINISTRATIVA PARCIAL: el proveedor cobró MENOS que la cota reservada y hay evidencia del
+   * monto (p.ej. Videogen falló antes del render pero su base muestra el consumo interno del job). Inserta UN
+   * ADJUSTMENT `final` (append-only, `corrects_event_id` = la reserva) que lleva la reserva a `amount`
+   * (0 < amount ≤ reservado), con `settlement='reconciled_as_charged_partial'`, el actor, el motivo y la evidencia
+   * estructurada en la metadata. Cuenta como «cobrada» para los lectores (`reservationReconciledAsCharged`: la reserva
+   * ES la llamada) y para el uso tardío (settleReservation: si llega la medición real del proveedor, gana el real).
+   * Mismo lock por clave que las otras conciliaciones. Una reserva ya cerrada (por esta u otra decisión) =
+   * `alreadySettled` con `recordedSettlement` y `countedAmount` (nunca se cambia una decisión registrada).
+   */
+  async reconcileReservationAsChargedPartial(
+    reservationKey: string,
+    amount: DecimalLike,
+    reason: string,
+    evidence: ReconcileEvidence,
+    opts: { decidedBy?: string; recordedBy?: string; metadata?: Record<string, unknown> } = {},
+  ): Promise<{
+    reconciled: boolean; alreadySettled: boolean; amount: string; countedAmount: string;
+    recordedSettlement: string | null; event: CostEventRow | null;
+  }> {
+    nonEmpty(reservationKey, 'reservationKey');
+    nonEmpty(reason, 'reason');
+    const decidedBy = nonEmpty(opts.decidedBy, 'decidedBy');
+    const partial = parsePartialAmount(typeof amount === 'string' ? amount : normalizeDecimal(amount));
+    const ev = parseReconcileEvidence(evidence);
+    return this.dataSource.transaction(async (manager) => {
+      await manager.query(`select pg_advisory_xact_lock(hashtext($1))`, ['finops:adj:' + reservationKey]);
+      const [res] = await manager.query(
+        `select id, event_kind, metadata, measurement_status, amount::text as amount from public.generation_cost_events where idempotency_key = $1`,
+        [reservationKey],
+      );
+      if (!res) throw new FinopsError('ORIGINAL_NOT_FOUND', `no existe la reserva ${reservationKey}`);
+      if (res.event_kind !== 'CHARGE' || res.metadata?.reservation !== true) {
+        throw new FinopsError('INVALID_INPUT', `${reservationKey} no es una reserva de llamada pagada`);
+      }
+      const reserved = normalizeDecimal(res.amount);
+      const adjs = await manager.query(
+        `select metadata from public.generation_cost_events
+          where corrects_event_id = $1 and event_kind = 'ADJUSTMENT' order by created_at desc, id desc`,
+        [res.id],
+      );
+      if (adjs.length > 0) {
+        const [net] = await manager.query(
+          `select coalesce(sum(amount),0)::text as t from public.generation_cost_events where id = $1 or corrects_event_id = $1`,
+          [res.id],
+        );
+        const label = (adjs.find((a: any) => typeof a.metadata?.settlement === 'string')?.metadata?.settlement as string | undefined) ?? null;
+        return { reconciled: false, alreadySettled: true, amount: reserved, countedAmount: normalizeDecimal(net.t), recordedSettlement: label, event: null };
+      }
+      if (res.measurement_status !== 'pending') {
+        throw new FinopsError('INVALID_INPUT', `${reservationKey} no está pendiente (${String(res.measurement_status)}): no hay nada que conciliar`);
+      }
+      if (cmpDec(partial, reserved) > 0) {
+        throw new FinopsError('INVALID_INPUT', `amount ${partial} supera lo reservado (${reserved}): una conciliación parcial nunca cuenta más que la reserva`);
+      }
+      const r = await this.adjustWith(manager, reservationKey, partial, reason, {
+        recordedBy: opts.recordedBy || 'reconciler',
+        settlement: true,
+        settlementLabel: 'reconciled_as_charged_partial',
+        forceInsert: true,
+        metadata: {
+          ...(opts.metadata || {}),
+          reservationReconciledAsCharged: true,
+          reservationReconciledAsPartial: true,
+          reservedAmount: reserved,
+          countedAmount: partial,
+          evidence: ev,
+          decidedBy,
+        },
+      });
+      return { reconciled: r.inserted, alreadySettled: false, amount: reserved, countedAmount: partial, recordedSettlement: 'reconciled_as_charged_partial', event: r.event };
     });
   }
 
