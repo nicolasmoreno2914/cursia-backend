@@ -632,7 +632,7 @@ async function dbChecks() {
       eq(row.status, 'completed', `estado (${row.error})`);
       eq([fakes.st.llm.length - llm0, fakes.st.tts.length - tts0], [0, 1], 'sin LLM, 1 TTS');
       const call = fakes.st.tts[tts0];
-      eq([call.model, call.voice, call.response_format], ['gpt-4o-mini-tts', 'marin', 'mp3'], 'request');
+      eq([call.model, call.voice, call.response_format], ['gpt-4o-mini-tts-2025-03-20', 'marin', 'mp3'], 'request (r59: snapshot fijo por defecto)');
       const [art] = await ds.query(`select * from public.artifacts where item_run_id = $1 and type = 'dynamic_audio_mp3'`, [row.id]);
       const mp3 = storage.blobs.get(`cursia-artifacts/${art.storage_path}`);
       eq(art.mime_type, 'audio/mpeg', 'mime');

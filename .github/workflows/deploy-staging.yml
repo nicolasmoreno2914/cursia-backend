@@ -604,6 +604,10 @@ jobs:
                # dentro del mismo proceso (tope 6 en el worker). Sin un proceso ni una conexión más (la cuenta del
                # pooler no cambia: cada parte usa la conexión del proceso anfitrión).
                ensure_env_exact DYNAMIC_LLM_WORKER_CONCURRENCY 4
+               # r59: el alias gpt-4o-mini-tts se cuelga ~45 % de las veces desde 2026-10-15/16 (2–3 min, y se cobra);
+               # el snapshot fijo no (0/13 en pruebas reales). OPENAI_TTS_MODEL pisa el default del código, así que
+               # se fija acá (solo el .env de staging; producción no cambia).
+               ensure_env_exact OPENAI_TTS_MODEL gpt-4o-mini-tts-2025-03-20
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
