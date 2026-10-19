@@ -992,6 +992,12 @@ async function _dynRunContentV2(item) {
   }
   // Language QA: el voseo sin otra lectura se corrige solo antes de verificar.
   ex.markdown = _dynLqaFixText(ex.markdown, courseContext);
+  // r60 Q-03 (review I-1): la nota interna se quita GRATIS antes de verificar (nunca dispara reparación ni reintento
+  // pagados); el lint INTERNAL_NOTE queda solo como respaldo para la nota incrustada en prosa.
+  var internalNotesRemoved = 0;
+  var stripped = dynStripInternalNotes(ex.markdown);
+  ex.markdown = stripped.text;
+  internalNotesRemoved += stripped.removed;
   // R14: veracidad + tuteo. Un reintento dirigido del capítulo completo; si persiste, falla visible.
   var truthHits = dynLintContentTruth(ex.markdown, courseContext);
   var truthRetried = false;
@@ -1031,6 +1037,9 @@ async function _dynRunContentV2(item) {
       return { ok: false, error: 'CONTENT_TRUTH_RETRY_INVALID: el reintento de veracidad no produjo un capítulo válido.', retryable: true };
     }
     exT.markdown = _dynLqaFixText(exT.markdown, courseContext);
+    var strippedT = dynStripInternalNotes(exT.markdown); // r60 Q-03: antes del lint, gratis
+    exT.markdown = strippedT.text;
+    internalNotesRemoved += strippedT.removed;
     var still = hardTruth(dynLintContentTruth(exT.markdown, courseContext));
     if (still.length) {
       return { ok: false, error: 'CONTENT_TRUTH: persisten ' + still.length + ' oraciones con datos no verificables, casos rotulados como reales o voseo tras el reintento dirigido: ' + still.slice(0, 3).map(function (h) { return '[' + h.code + '] ' + h.text.slice(0, 90); }).join(' | '), retryable: true };
@@ -1042,9 +1051,10 @@ async function _dynRunContentV2(item) {
   // #583 (M4): un solo formato de moneda en el curso (es-CO «$180.000»): el Markdown sale normalizado, así que
   // todo lo que se genera desde él (experiencia, video, actividad, banco con evidencia textual) lo cita igual.
   var contentMd = ex.markdown;
-  // r60 Q-03: una nota interna de producción («Nota: … no subir a Moodle») nunca es texto para el estudiante.
+  // r60 Q-03: una nota interna de producción nunca es texto para el estudiante (también tras la reparación parcial).
   var internalNotes = dynStripInternalNotes(contentMd);
   contentMd = internalNotes.text;
+  internalNotesRemoved += internalNotes.removed;
   var moneyNormalized = 0;
   if (dynCourseIsColombia(courseContext)) {
     var mn = dynNormalizeMoneyEsCo(contentMd);
@@ -1113,7 +1123,7 @@ async function _dynRunContentV2(item) {
     summary.contextSummaryErrors = summaryErrors.slice(0, 5);
   }
   if (moneyNormalized) summary.moneyNormalized = moneyNormalized;
-  if (internalNotes.removed) summary.internalNotesRemoved = internalNotes.removed;
+  if (internalNotesRemoved) summary.internalNotesRemoved = internalNotesRemoved;
   return { ok: true, artifacts: artifacts, summary: summary };
 }
 
@@ -1121,8 +1131,11 @@ async function _dynRunContentV2(item) {
 // El prompt viejo pedía «■■ Nota: actividad de apoyo, opcional, no subir a Moodle.» bajo cada Actividad de
 // Apoyo y llegaba al PDF del estudiante. El prompt V2 ya no lo pide; si el modelo la escribe igual, la línea
 // completa de la nota se quita (determinista, contada en el summary: nunca en silencio).
-var DYN_INTERNAL_NOTE_LINE_RE = /^[ \t>*_\-\u2022\u25a0]*(?:nota|note)\b[^\n]*\bno\s+subir\s+a\s+moodle\b[^\n]*$/i;
-var DYN_INTERNAL_NOTE_PHRASE_RE = /\bno\s+subir\s+a\s+moodle\b/i;
+// Review M-1: anclado a la forma completa de la nota («actividad de apoyo … (opcional) … no subir a Moodle»), no a
+// «no subir a Moodle» suelto: un curso que enseña Moodle puede decirlo con todo derecho.
+var _DYN_INTERNAL_NOTE_CORE = 'actividad(?:es)?\\s+de\\s+apoyo\\b[^\\n]{0,120}?\\bno\\s+subir\\s+a\\s+moodle\\b';
+var DYN_INTERNAL_NOTE_LINE_RE = new RegExp('^[ \\t>*_\\-\\u2022\\u25a0]*(?:nota|note)\\s*:?[^\\n]*?' + _DYN_INTERNAL_NOTE_CORE + '[^\\n]*$', 'i');
+var DYN_INTERNAL_NOTE_PHRASE_RE = new RegExp(_DYN_INTERNAL_NOTE_CORE, 'i');
 function dynStripInternalNotes(md) {
   var removed = 0;
   var lines = String(md == null ? '' : md).split('\n').filter(function (line) {
