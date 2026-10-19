@@ -23,7 +23,7 @@
  *  - v1/v2 no cambian: este archivo es independiente de `dynamic-mbz-builder.ts`.
  */
 import * as JSZip from 'jszip';
-import { MOODLE_TOKEN_MIN_VERSION, MoodleCompatibility, compareMajorMinor, h5pPackageLibraryKeys, h5pRequirement, maxMajorMinor, moodleCompatibilityOf, rewriteSectionTokensLegacy, sectionTokenSupported } from './v3/moodle-compat';
+import { MOODLE_TOKEN_MIN_VERSION, MoodleCompatibility, compareMajorMinor, moodleRequirementSentence, profileClosureKeys, h5pPackageLibraryKeys, h5pRequirement, maxMajorMinor, moodleCompatibilityOf, rewriteSectionTokensLegacy, sectionTokenSupported } from './v3/moodle-compat';
 import {
   MoodleVersionInfo,
   esc,
@@ -1977,7 +1977,8 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   // $@COURSEVIEWBYID*curso@$&section=n, que resuelve en todas. Con H5P (≥ 4.5) el paquete queda byte a byte igual.
   const h5pLibraryKeys = await h5pPackageLibraryKeys(h5pBuffersForCompat);
   const h5pFloor = h5pRequirement(h5pLibraryKeys).minimumMoodle;
-  const preTokenFloor = maxMajorMinor([MV.br, h5pFloor]) as string;
+  // Review r60 (I1): sin requisito H5P manda el formato del backup (4.0/3.11/3.9 siguen armándose como en 3.15.1).
+  const preTokenFloor = h5pFloor === null ? MV.br : (maxMajorMinor([MV.br, h5pFloor]) as string);
   const sectionLinks: MoodleCompatibility['sectionLinks'] = !labelsHtml.some((l) => l.html.includes('$@COURSESECTIONBYID*'))
     ? 'none'
     : sectionTokenSupported(preTokenFloor) ? 'COURSESECTIONBYID' : 'COURSEVIEWBYID_SECTION';
@@ -2224,7 +2225,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
         : {}),
       // r55 (R7): todos los .h5p son solo contenido; con un tipo que no está en el pack v1 (QuestionSet 1.21, BS,
       // «Repaso») la entrega declara el requisito del sitio: Cursia H5P Library Pack v3 (cualquier rol restaura).
-      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: H5P_SITE_LIBRARY_PACK_RESTORE_NOTE } : {}),
+      ...(h5pPackages.some((p) => p.mainLibrary in (CURSIA_H5P_PROFILE_V3.deltaByMain ?? {})) ? { restore: h5pSiteLibraryPackRestoreNote(moodleCompatibility) } : {}),
     },
   };
 }
@@ -2244,15 +2245,28 @@ export function reviewCardsApply(blueprint: BlueprintSnapshotV2, manifest: Gener
  * sube un administrador una vez; `scripts/h5p-preflight-moodle.js --profile v3` lo verifica) y desde ahí cualquier
  * docente restaura. El frontend la muestra en «Cómo restaurarlo en Moodle» (summary.restore del paquete).
  */
-export const H5P_SITE_LIBRARY_PACK_RESTORE_NOTE = Object.freeze({
-  as: 'site_library_pack' as const,
-  libraryPack: 'v3' as const,
-  note:
-    'Requiere Moodle 4.5 o superior: las actividades H5P usan librerías que exigen la API H5P 1.28, que Moodle 4.1–4.4 no traen. ' +
-    'Antes de restaurar, el sitio Moodle debe tener instalado el Cursia H5P Library Pack v3 (un administrador lo sube una sola vez en ' +
-    'Administración del sitio › H5P › Gestionar tipos de contenido H5P). Con el pack instalado, cualquier docente puede restaurar el curso; ' +
-    'sin él, las actividades H5P muestran «Missing main library».',
-});
+/** Review r60 (M2): nota del pack v3 con el requisito de Moodle CALCULADO del paquete (summary.moodleCompatibility). */
+export function h5pSiteLibraryPackRestoreNote(c: Pick<MoodleCompatibility, 'minimumMoodle' | 'h5pCoreApi'>): { as: 'site_library_pack'; libraryPack: 'v3'; note: string } {
+  return Object.freeze({
+    as: 'site_library_pack' as const,
+    libraryPack: 'v3' as const,
+    note:
+      moodleRequirementSentence(c.minimumMoodle, c.h5pCoreApi) + ' ' +
+      'Antes de restaurar, el sitio Moodle debe tener instalado el Cursia H5P Library Pack v3 (un administrador lo sube una sola vez en ' +
+      'Administración del sitio › H5P › Gestionar tipos de contenido H5P). Con el pack instalado, cualquier docente puede restaurar el curso; ' +
+      'sin él, las actividades H5P muestran «Missing main library».',
+  });
+}
+
+/** Nota del pack v3 para el requisito de su propia clausura (todas sus principales: API H5P 1.28 → Moodle 4.5). */
+export const H5P_SITE_LIBRARY_PACK_RESTORE_NOTE = (() => {
+  const keys = Object.keys(CURSIA_H5P_PROFILE_V3.mainLibraries).flatMap((m) => {
+    const r = CURSIA_H5P_PROFILE_V3.mainLibraries[m];
+    return profileClosureKeys(m, r.majorVersion, r.minorVersion);
+  });
+  const req = h5pRequirement(keys);
+  return h5pSiteLibraryPackRestoreNote({ minimumMoodle: req.minimumMoodle as string, h5pCoreApi: req.coreApi });
+})();
 
 /**
  * @deprecated r55: nota de builders ≤ 3.13.0 (los .h5p llevaban carpetas delta y se pedía restaurar como

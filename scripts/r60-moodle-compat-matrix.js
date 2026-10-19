@@ -7,8 +7,11 @@
 // Por versión y paquete: restaurar (sesión de admin), scripts/moodle/r60-compat-inspect.php (API H5P del núcleo,
 // librerías instaladas, despliegue de cada H5P, interacciones del video, tokens y destino de cada botón a sección,
 // nota mínima y criterio), render HTTP como ESTUDIANTE (php -S en el wwwroot del sitio: curso, cada botón a sección,
-// view.php de cada H5P y su embed), nota/finalización con estudiantes ficticios (check-grading-scenarios.php: xAPI
-// real de H5P + cron ×2) y limpieza (curso + usuarios). El resultado de cada fila se compara con lo que el paquete
+// view.php de cada H5P y su embed), nota/finalización con estudiantes ficticios (check-grading-scenarios.php: sentencias
+// xAPI SINTÉTICAS + cron ×2 — prueban la lógica del gradebook, NO que el estudiante pueda contestar el H5P) y limpieza.
+// Límites: el inspector despliega cada H5P como ADMIN antes del render (el caso «el estudiante lo abre primero» no se
+// prueba); el render es HTTP sin JS; si el puerto del wwwroot ya está ocupado se reutiliza ese servidor sin verificar
+// que sea el mismo sitio (dejar libres 8099/8101–8105 antes de correr). El resultado de cada fila se compara con lo que el paquete
 // DECLARA: en una versión ≥ minimumMoodle todo tiene que funcionar; en una menor, el H5P tiene que fallar como se
 // documenta (no se finge compatibilidad).
 // Requisito: el pack H5P v3 instalado en los sitios ≥ 4.5 (install-h5p-pack.php; en 4.1–4.4 Moodle lo rechaza).
@@ -197,7 +200,7 @@ async function studentRender(t, credsFile, insp, kind) {
             const sp = php(t, [path.join(__dirname, 'moodle/r60-test-student.php'), `--moodle=${t.root}`, '--action=create', `--courseids=${courseid}`, `--creds=${credsFile}`]);
             assert(/created userid=\d+ siteadmin=0/.test(sp.stdout), `estudiante: ${(sp.stderr || sp.stdout).slice(-300)}`);
             row.student = await studentRender(t, credsFile, insp, p.kind);
-            // Nota / finalización con estudiantes ficticios (xAPI real de H5P; curso sin nota: vista del Libro).
+            // Nota / finalización con estudiantes ficticios (sentencias xAPI SINTÉTICAS: se aceptan aunque el H5P no se pueda abrir; curso sin nota: vista del Libro).
             const gOut = path.join(OUT, `grades-${tag}.json`);
             const gp = php(t, [path.join(__dirname, 'moodle/check-grading-scenarios.php'), `--moodle=${t.root}`, `--courseid=${courseid}`, `--out=${gOut}`]);
             fs.writeFileSync(path.join(OUT, `grades-${tag}.log`), `${gp.stdout}\n${gp.stderr}`);

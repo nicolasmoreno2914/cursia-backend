@@ -5,9 +5,10 @@
 // Moodle rechaza al instalar una librería cuyo coreApi supera el del núcleo que trae (h5plib v124 = 4.1 … v128 = 4.5:
 // «api-version-unsupported»). El builder y el validador usan esta tabla para declarar el Moodle mínimo real del paquete.
 // Se genera (nunca a mano) y se versiona. Uso:
-//   node scripts/generate-h5p-core-api.js <libsDir> [--check]
-// Las carpetas se buscan en <libsDir> y en el store versionado assets/h5p-libs/v3 (y v2). Con --check no escribe:
-// falla si el JSON versionado difiere de lo que hay en las librerías.
+//   node scripts/generate-h5p-core-api.js [<libsDir>] [--check]
+// Las carpetas se buscan en <libsDir> (opcional) y en lo que el repo YA versiona: los stores assets/h5p-libs/v3 y v2 y
+// la fixture test/fixtures/h5p-profile-v1/libs (las 76 library.json de v1/v2/v3). Con --check no escribe: falla si el
+// JSON versionado difiere de lo que dicen esas library.json.
 const fs = require('fs');
 const path = require('path');
 
@@ -15,9 +16,9 @@ const ROOT = path.resolve(__dirname, '..');
 const args = process.argv.slice(2);
 const check = args.includes('--check');
 const libsDir = args.find((a) => !a.startsWith('--'));
-if (!libsDir) { console.error('uso: node scripts/generate-h5p-core-api.js <libsDir> [--check]'); process.exit(2); }
+
 const OUT = path.join(ROOT, 'src/package/h5p/cursia-h5p-core-api.json');
-const dirs = [path.resolve(libsDir), path.join(ROOT, 'assets/h5p-libs/v3'), path.join(ROOT, 'assets/h5p-libs/v2')];
+const dirs = [...(libsDir ? [path.resolve(libsDir)] : []), path.join(ROOT, 'assets/h5p-libs/v3'), path.join(ROOT, 'assets/h5p-libs/v2'), path.join(ROOT, 'test/fixtures/h5p-profile-v1/libs')];
 
 const libraries = {};
 for (const v of ['v1', 'v2', 'v3']) {

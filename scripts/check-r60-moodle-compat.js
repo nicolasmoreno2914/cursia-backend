@@ -2,7 +2,7 @@
 /* eslint-disable no-console */
 // r60 (D1/D2) — compatibilidad REAL del paquete v3 con Moodle 4.1–4.5. Offline, determinístico, USD 0.
 //   1. Tablas: API H5P del núcleo por versión (4.1 = 1.24 … 4.5 = 1.28) y token de sección solo desde 4.4.
-//   2. cursia-h5p-core-api.json al día con las library.json (si ~/cursia-test-env/h5p-libs existe) y con el store.
+//   2. cursia-h5p-core-api.json al día con las library.json que el repo versiona y con los perfiles (h5p-libs local: extra o SKIP).
 //   3. Requisito H5P: cada principal de los perfiles v1/v2/v3 exige 1.28 → Moodle 4.5 (D1, documentado).
 //   4. Paquetes de la simulación comercial: con H5P → minimumMoodle 4.5 y .mbz BYTE A BYTE igual a 3.15.1 (dorados);
 //      sin H5P → minimumMoodle 4.1 y botones a secciones $@COURSEVIEWBYID*1@$&section=n (sin COURSESECTIONBYID).
@@ -117,11 +117,20 @@ async function labelXmls(mbz) {
 
   // ── 2. Tabla de coreApi ──
   const LIBS = path.join(os.homedir(), 'cursia-test-env/h5p-libs');
-  await check('cursia-h5p-core-api.json al día (generate-h5p-core-api.js --check)', async () => {
-    if (!fs.existsSync(LIBS)) { console.log('   (sin ~/cursia-test-env/h5p-libs: solo el store versionado)'); }
-    const r = spawnSync(process.execPath, [path.join(__dirname, 'generate-h5p-core-api.js'), fs.existsSync(LIBS) ? LIBS : path.join(ROOT, 'assets/h5p-libs/v3'), '--check'], { encoding: 'utf8' });
-    if (fs.existsSync(LIBS)) assert(r.status === 0, r.stderr || r.stdout);
+  // Review r60 (I2): siempre con lo que el repo versiona (stores + fixture v1 = las 76 library.json), sin depender del entorno.
+  await check('cursia-h5p-core-api.json = library.json versionadas en el repo (generate-h5p-core-api.js --check) y = perfiles v1/v2/v3', async () => {
+    const r = spawnSync(process.execPath, [path.join(__dirname, 'generate-h5p-core-api.js'), '--check'], { encoding: 'utf8' });
+    assert(r.status === 0, r.stderr || r.stdout);
+    eq(MC.coreApiTableMismatches(), [], 'tabla vs perfiles (machineName major.minor + patch)');
   });
+  if (fs.existsSync(LIBS)) {
+    await check('cursia-h5p-core-api.json = ~/cursia-test-env/h5p-libs (fuente completa del pack)', async () => {
+      const r = spawnSync(process.execPath, [path.join(__dirname, 'generate-h5p-core-api.js'), LIBS, '--check'], { encoding: 'utf8' });
+      assert(r.status === 0, r.stderr || r.stdout);
+    });
+  } else {
+    console.log('⏭️  SKIP cursia-h5p-core-api.json vs ~/cursia-test-env/h5p-libs: carpeta ausente (no cuenta como aprobado)');
+  }
 
   // ── 3. Requisito H5P ──
   await check('D1: toda principal de los perfiles v1/v2/v3 exige la API H5P 1.28 → Moodle 4.5', async () => {
@@ -135,7 +144,17 @@ async function labelXmls(mbz) {
     eq(MC.h5pRequirement(['H5P.InteractiveVideo 1.27']).minimumMoodle, '4.3', 'IV 1.27.9 sola = 4.3 (sus dependencias suben a 4.5)');
     eq(MC.h5pRequirement(['H5P.QuestionSet 1.20']).minimumMoodle, '4.2', 'QS 1.20.29 = 4.2');
     eq(MC.h5pRequirement(['H5P.QuestionSet 1.21']).minimumMoodle, '4.5', 'QS 1.21.13 = 4.5');
-    eq(MC.h5pRequirement([]), { coreApi: null, minimumMoodle: '4.1', worst: [] }, 'sin H5P');
+    eq(MC.h5pRequirement([]), { coreApi: null, minimumMoodle: null, worst: [] }, 'sin H5P: no sube el piso');
+    eq(MC.h5pRequirement(['FontAwesome 4.5']).minimumMoodle, null, 'librería sin coreApi: no sube el piso');
+    // Review r60 (M1): la clausura del perfil cuenta aunque el h5p.json declare solo la principal.
+    const JSZip2 = require('jszip');
+    const z = new JSZip2();
+    z.file('h5p.json', JSON.stringify({ title: 'x', mainLibrary: 'H5P.InteractiveVideo', preloadedDependencies: [{ machineName: 'H5P.InteractiveVideo', majorVersion: 1, minorVersion: 27 }] }));
+    const keys = await MC.h5pPackageLibraryKeys([await z.generateAsync({ type: 'nodebuffer' })]);
+    assert(keys.includes('H5P.JoubelUI 1.3') && keys.includes('H5P.Components 1.0'), `clausura: ${keys.join(', ')}`);
+    eq(MC.h5pRequirement(keys).minimumMoodle, '4.5', 'IV declarado solo → piso de su clausura (4.5)');
+    // Review r60 (M3/I1): versiones aceptadas como mínimo declarado.
+    eq(['3.9', '3.11', '4.0', '4.1', '4.2', '4.5', '4.6', '5.0', '5.1', '3.8', '4', 'x'].map(MC.isKnownMoodleVersion), [true, true, true, true, true, true, true, true, true, false, false, false], 'versiones conocidas');
     throws(() => MC.h5pRequirement(['H5P.Inventada 9.9']), /MOODLE_COMPAT_UNKNOWN_H5P_LIBRARY/, 'librería desconocida');
   });
 
@@ -168,6 +187,22 @@ async function labelXmls(mbz) {
     assert(!noH5p.built.summary.restore, 'sin H5P no hay requisito de pack');
   });
 
+  await check('I1: sin H5P y formato de backup 4.0 / 3.11 / 3.9 → arma, minimumMoodle = formato, validador limpio (como 17dc7b0)', async () => {
+    const PF = require('./lib/v21-packaging-fixtures');
+    const o = { engine: 'scorm', finalExam: false, courseId: 646, modules: [{ examEnabled: false, chapters: [{ video: false, activity: true }, { video: false, activity: false }] }] };
+    for (const mv of ['4.0', '3.11', '3.9', '4.4', '4.5']) {
+      const r = await B.buildDynamicMbzV3({ ...PF.packagingInput(dist, o), moodleVersion: mv });
+      const c = r.summary.moodleCompatibility;
+      eq([c.backupFormat, c.minimumMoodle, c.h5pCoreApi, c.sectionLinks], [mv, mv, null, MC.compareMajorMinor(mv, '4.4') >= 0 ? 'COURSESECTIONBYID' : 'COURSEVIEWBYID_SECTION'], `formato ${mv}`);
+      const v = await VAL.validateMbzV3(r.mbz, r.expectations);
+      assert(v.ok, `${mv}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+  });
+  await check('M2: la nota del pack v3 sale del piso calculado', async () => {
+    eq(B.h5pSiteLibraryPackRestoreNote({ minimumMoodle: '4.6', h5pCoreApi: '1.29' }).note.slice(0, 40), 'Requiere Moodle 4.6 o superior: las acti', 'texto');
+    eq(sims['1x1-sin-examenes'].built.summary.restore, B.H5P_SITE_LIBRARY_PACK_RESTORE_NOTE, 'paquete con QS 1.21 = nota del pack (4.5 / 1.28)');
+  });
+
   // ── 5. Validador ──
   const h5pSim = sims['1x1-sin-examenes'];
   await check('validador: H5P declarado para 4.1 / 4.4 → MOODLE_COMPAT; 4.5 limpio; sin declarar no aplica', async () => {
@@ -184,7 +219,13 @@ async function labelXmls(mbz) {
     const legacy = await VAL.validateMbzV3(h5pSim.built.mbz, old);
     assert(legacy.ok, 'sin moodleMinimum (expectativas anteriores a r60) no se evalúa');
     const bad = await VAL.validateMbzV3(h5pSim.built.mbz, { ...e, moodleMinimum: '4.0' });
-    assert(codes(bad).includes('MOODLE_COMPAT'), 'versión desconocida');
+    assert(codes(bad).includes('MOODLE_COMPAT') && bad.issues.some((i) => /exige Moodle 4\.5\+/.test(i.message)), '4.0 (formato válido) < requisito H5P');
+    const unk = await VAL.validateMbzV3(h5pSim.built.mbz, { ...e, moodleMinimum: 'x.y' });
+    assert(unk.issues.some((i) => /desconocido/.test(i.message)), 'versión mal formada');
+    for (const v of ['4.6', '5.0']) {
+      const nw = await VAL.validateMbzV3(h5pSim.built.mbz, { ...e, moodleMinimum: v });
+      assert(nw.ok, `${v} (posterior a 4.5) debe pasar: ${JSON.stringify(nw.issues.slice(0, 2))}`);
+    }
   });
   await check('validador: paquete 4.1 con un $@COURSESECTIONBYID*n@$ → MOODLE_COMPAT', async () => {
     const m = await mutate(noH5p.built.mbz, (x) => x.replace(/\$@COURSEVIEWBYID\*1@\$&amp;amp;section=(\d+)/, '$@COURSESECTIONBYID*$1@$'));

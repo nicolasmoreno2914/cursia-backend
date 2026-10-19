@@ -72,7 +72,7 @@ import { PRACTICE_FILE_MIMETYPES, PRACTICE_RESOURCE_LIMITS, extensionOf } from '
 import { courseBadgeDescription } from './course-badge';
 import { TEACHER_GUIDE_HIDDEN_NOTICE, TEACHER_GUIDE_IDNUMBER } from '../../modules/course-shell/teacher-guide-page';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
-import { MOODLE_COMPAT_VERSIONS, compareMajorMinor, h5pPackageLibraryKeys, h5pRequirement, sectionLinkTargets, tokenRequirements } from './moodle-compat';
+import { compareMajorMinor, isKnownMoodleVersion, h5pPackageLibraryKeys, h5pRequirement, sectionLinkTargets, tokenRequirements } from './moodle-compat';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
 import {
@@ -1472,7 +1472,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   if (exp.moodleMinimum !== undefined) {
     const declared = exp.moodleMinimum;
     const release = /^(\d+\.\d+)/.exec(tag(mb, 'moodle_release') ?? '')?.[1];
-    if (!(MOODLE_COMPAT_VERSIONS as readonly string[]).includes(declared)) add('MOODLE_COMPAT', 'expectations', `Moodle mínimo declarado desconocido: ${declared}`);
+    if (!isKnownMoodleVersion(declared)) add('MOODLE_COMPAT', 'expectations', `Moodle mínimo declarado desconocido: ${declared}`);
     else if (!release) add('MOODLE_COMPAT', 'moodle_backup.xml', 'moodle_release sin versión x.y');
     else {
       const need: Array<{ v: string; why: string }> = [{ v: release, why: `formato del backup ${release}` }];
@@ -1484,7 +1484,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       }
       try {
         const req = h5pRequirement(await h5pPackageLibraryKeys(bufs));
-        if (req.coreApi !== null) need.push({ v: req.minimumMoodle, why: `H5P core API ${req.coreApi} (${req.worst.slice(0, 3).join(', ')}${req.worst.length > 3 ? '…' : ''})` });
+        if (req.coreApi !== null && req.minimumMoodle !== null) need.push({ v: req.minimumMoodle, why: `H5P core API ${req.coreApi} (${req.worst.slice(0, 3).join(', ')}${req.worst.length > 3 ? '…' : ''})` });
       } catch (err) {
         add('MOODLE_COMPAT', 'h5p', `no se pudo calcular el requisito H5P: ${(err as Error).message}`);
       }

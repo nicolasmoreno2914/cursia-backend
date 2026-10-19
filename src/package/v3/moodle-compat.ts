@@ -15,6 +15,8 @@
 // recalcula desde los bytes: un paquete nunca declara compatibilidad con una versión en la que no funciona.
 import * as JSZip from 'jszip';
 import * as coreApiJson from '../h5p/cursia-h5p-core-api.json';
+import { CURSIA_H5P_PROFILE_V1, CURSIA_H5P_PROFILE_V2, CURSIA_H5P_PROFILE_V3, H5pProfile, profileRuntimeDependencies } from '../h5p/profile';
+import { MOODLE_VERSIONS } from '../mbz-common';
 
 /** Versiones de Moodle que Cursia conoce (las que tienen entorno de prueba local). */
 export const MOODLE_COMPAT_VERSIONS = ['4.1', '4.2', '4.3', '4.4', '4.5'] as const;
@@ -40,6 +42,29 @@ export const MOODLE_SECTION_TOKEN_MIN_VERSION: MoodleCompatVersion = MOODLE_TOKE
 const CORE_API: Readonly<Record<string, { patch: number; coreApi: string | null }>> = Object.freeze(
   JSON.parse(JSON.stringify((coreApiJson as any).libraries ?? (coreApiJson as any).default?.libraries ?? {})),
 );
+
+/**
+ * Review r60 (I2): la tabla debe cubrir EXACTAMENTE las librerías de los perfiles v1/v2/v3 con su patch. Un perfil que
+ * cambia un patch sin regenerar cursia-h5p-core-api.json falla al cargar el módulo (nunca un piso calculado con datos viejos).
+ */
+export function coreApiTableMismatches(): string[] {
+  const want = new Map<string, number>();
+  for (const prof of [CURSIA_H5P_PROFILE_V1, CURSIA_H5P_PROFILE_V2, CURSIA_H5P_PROFILE_V3]) {
+    for (const l of prof.libraries) want.set(`${l.machineName} ${l.majorVersion}.${l.minorVersion}`, l.patchVersion);
+  }
+  const bad: string[] = [];
+  for (const [k, patch] of want) {
+    const r = CORE_API[k];
+    if (!r) bad.push(`${k}: falta en la tabla`);
+    else if (r.patch !== patch) bad.push(`${k}: patch ${r.patch} en la tabla ≠ ${patch} en el perfil`);
+  }
+  for (const k of Object.keys(CORE_API)) if (!want.has(k)) bad.push(`${k}: sobra en la tabla (no está en ningún perfil)`);
+  return bad.sort();
+}
+{
+  const bad = coreApiTableMismatches();
+  if (bad.length) throw new Error(`MOODLE_COMPAT_CORE_API_TABLE_STALE: regenerar cursia-h5p-core-api.json (${bad.slice(0, 5).join('; ')})`);
+}
 
 function vparse(v: string): [number, number] {
   const m = /^(\d+)\.(\d+)$/.exec(v);
@@ -91,11 +116,13 @@ export interface MoodleCompatibility {
  * Requisito de Moodle de un conjunto de librerías H5P («Machine major.minor», las del h5p.json de cada paquete).
  * Fail loud si una librería no está en la tabla o si ninguna versión conocida de Moodle la soporta.
  */
-export function h5pRequirement(libraryKeys: Iterable<string>): { coreApi: string | null; minimumMoodle: MoodleCompatVersion; worst: string[] } {
+export function h5pRequirement(libraryKeys: Iterable<string>): { coreApi: string | null; minimumMoodle: MoodleCompatVersion | null; worst: string[] } {
+  // Review r60 (I1): sin requisito de API H5P el H5P no sube el piso (null): manda el formato del backup (p. ej. 4.0/3.11/3.9).
   const keys = Array.from(new Set(libraryKeys)).sort();
-  if (!keys.length) return { coreApi: null, minimumMoodle: MOODLE_COMPAT_VERSIONS[0], worst: [] };
+  if (!keys.length) return { coreApi: null, minimumMoodle: null, worst: [] };
   const apis = keys.map((k) => ({ k, api: h5pLibraryCoreApi(k) }));
   const coreApi = maxMajorMinor(apis.map((x) => x.api).filter((x): x is string => x !== null));
+  if (coreApi === null) return { coreApi: null, minimumMoodle: null, worst: [] };
   const minimumMoodle = minimumMoodleForH5pCoreApi(coreApi);
   if (!minimumMoodle) throw new Error(`MOODLE_COMPAT_H5P_UNSUPPORTED: coreApi ${coreApi} > la de Moodle ${MOODLE_COMPAT_VERSIONS[MOODLE_COMPAT_VERSIONS.length - 1]}`);
   return { coreApi, minimumMoodle, worst: apis.filter((x) => x.api !== null && x.api === coreApi).map((x) => x.k) };
@@ -149,7 +176,7 @@ export function moodleCompatibilityOf(p: {
   const reasons: string[] = [];
   const h = h5pRequirement(p.h5pLibraryKeys);
   const cands: string[] = [p.backupFormat];
-  if (h.coreApi !== null) {
+  if (h.coreApi !== null && h.minimumMoodle !== null) {
     cands.push(h.minimumMoodle);
     reasons.push(`h5p_core_api:${h.coreApi}→moodle_${h.minimumMoodle}`);
   }
@@ -175,9 +202,13 @@ export async function h5pPackageLibraryKeys(packages: ReadonlyArray<Buffer>): Pr
     const f = zip.file('h5p.json');
     if (!f) throw new Error('MOODLE_COMPAT_H5P_JSON_MISSING: .h5p sin h5p.json');
     const j = JSON.parse((await f.async('string')).replace(/^\uFEFF/, ''));
-    for (const d of [...(Array.isArray(j.preloadedDependencies) ? j.preloadedDependencies : [])]) {
-      keys.add(`${d.machineName} ${d.majorVersion}.${d.minorVersion}`);
-    }
+    const deps: Array<{ machineName: string; majorVersion: number; minorVersion: number }> = Array.isArray(j.preloadedDependencies) ? j.preloadedDependencies : [];
+    for (const d of deps) keys.add(`${d.machineName} ${d.majorVersion}.${d.minorVersion}`);
+    // Review r60 (M1): además la clausura de runtime del PERFIL de la librería principal (lo que el pack instala y el
+    // player carga), por si el h5p.json declara de menos.
+    const main = deps.find((d) => d.machineName === j.mainLibrary);
+    if (!main) throw new Error(`MOODLE_COMPAT_H5P_MAIN_MISSING: h5p.json sin la principal ${j.mainLibrary} en preloadedDependencies`);
+    for (const k of profileClosureKeys(main.machineName, main.majorVersion, main.minorVersion)) keys.add(k);
     // Carpetas de librería dentro del .h5p (paquetes ≤ 3.13.0): también cuentan.
     for (const name of Object.keys(zip.files)) {
       const m = /^([A-Za-z0-9._-]+)-(\d+)\.(\d+)\/library\.json$/.exec(name);
@@ -185,4 +216,32 @@ export async function h5pPackageLibraryKeys(packages: ReadonlyArray<Buffer>): Pr
     }
   }
   return Array.from(keys).sort();
+}
+
+/** Clausura de runtime («Machine major.minor») de una principal según el perfil que la fija (v3 → v2 → v1). */
+export function profileClosureKeys(machineName: string, major: number, minor: number): string[] {
+  const prof = ([CURSIA_H5P_PROFILE_V3, CURSIA_H5P_PROFILE_V2, CURSIA_H5P_PROFILE_V1] as H5pProfile[]).find((p) => {
+    const m = p.mainLibraries[machineName];
+    return !!m && m.majorVersion === major && m.minorVersion === minor;
+  });
+  if (!prof) throw new Error(`MOODLE_COMPAT_UNKNOWN_H5P_MAIN: ${machineName} ${major}.${minor} no es principal de ningún perfil Cursia`);
+  return profileRuntimeDependencies(prof, machineName).map((r) => `${r.machineName} ${r.majorVersion}.${r.minorVersion}`);
+}
+
+/**
+ * Review r60 (I1/M3): versiones de Moodle que un paquete puede declarar como mínimo: los formatos de backup permitidos
+ * (MOODLE_VERSIONS: 3.9, 3.11, 4.0, 4.1, 4.4, 4.5), las de la tabla 4.1–4.5 y cualquier versión x.y posterior a la más
+ * nueva conocida (4.6, 5.0…: un Moodle más nuevo trae la API H5P y los tokens de 4.5).
+ */
+export function isKnownMoodleVersion(v: string): boolean {
+  if (typeof v !== 'string' || !/^\d+\.\d+$/.test(v)) return false;
+  if (Object.prototype.hasOwnProperty.call(MOODLE_VERSIONS, v) || (MOODLE_COMPAT_VERSIONS as readonly string[]).includes(v)) return true;
+  return compareMajorMinor(v, MOODLE_COMPAT_VERSIONS[MOODLE_COMPAT_VERSIONS.length - 1]) > 0;
+}
+
+/** Review r60 (M2): frase de requisito para la entrega, desde el piso calculado (nunca un número fijo). */
+export function moodleRequirementSentence(minimumMoodle: string, h5pCoreApi: string | null): string {
+  return h5pCoreApi
+    ? `Requiere Moodle ${minimumMoodle} o superior: las actividades H5P usan librerías que exigen la API H5P ${h5pCoreApi}, que las versiones anteriores de Moodle no traen.`
+    : `Requiere Moodle ${minimumMoodle} o superior.`;
 }
