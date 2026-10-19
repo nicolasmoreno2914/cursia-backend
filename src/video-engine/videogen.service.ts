@@ -6,6 +6,8 @@ export interface VideogenVideoPayload {
   chapter_number: number;
   client_reference_id: string;
   tts_voice?: string;
+  /** r59: metadata libre que Videogen guarda con el pedido; lee `tts_model` (p.ej. snapshot fijo del TTS). */
+  external_metadata?: Record<string, unknown>;
 }
 
 export interface VideogenBatchJob {

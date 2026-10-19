@@ -352,6 +352,18 @@ export function isVideogenDefinitiveRejection(err: unknown): boolean {
   return /Videogen batch-create failed \(HTTP 4\d\d\)/.test(m);
 }
 
+/**
+ * r59: modelo de TTS que se le pide a Videogen (vía `external_metadata.tts_model`). El alias
+ * `gpt-4o-mini-tts` (default de Videogen) se cuelga de forma intermitente desde 2026-10-15/16; el
+ * snapshot fijo no (staging 2026-10-19: 0 de 13 colgadas). DYNAMIC_VIDEOGEN_TTS_MODEL lo pisa.
+ * Voz y proveedor quedan con los defaults de Videogen.
+ */
+export const DYNAMIC_VIDEOGEN_TTS_MODEL_DEFAULT = 'gpt-4o-mini-tts-2025-03-20';
+export function dynamicVideogenTtsModel(env: Record<string, string | undefined> = process.env): string {
+  const v = env.DYNAMIC_VIDEOGEN_TTS_MODEL;
+  return typeof v === 'string' && v.trim() ? v.trim() : DYNAMIC_VIDEOGEN_TTS_MODEL_DEFAULT;
+}
+
 interface RunHead {
   ownerId: string;
   videoMode: 'mock' | 'real';
@@ -771,6 +783,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
               content_txt: contentTxt,
               chapter_number: item.chapterNumber ?? 0,
               client_reference_id: item.idempotencyKey,
+              external_metadata: { tts_model: dynamicVideogenTtsModel() },
             },
           ]);
         } catch (err) {
