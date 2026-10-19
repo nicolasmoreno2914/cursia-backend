@@ -72,6 +72,7 @@ import { PRACTICE_FILE_MIMETYPES, PRACTICE_RESOURCE_LIMITS, extensionOf } from '
 import { courseBadgeDescription } from './course-badge';
 import { TEACHER_GUIDE_HIDDEN_NOTICE, TEACHER_GUIDE_IDNUMBER } from '../../modules/course-shell/teacher-guide-page';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
+import { MOODLE_COMPAT_VERSIONS, compareMajorMinor, h5pPackageLibraryKeys, h5pRequirement, sectionLinkTargets, tokenRequirements } from './moodle-compat';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
 import {
@@ -123,6 +124,11 @@ export interface MbzV3ValidationExpectations {
   internalVocabularyUserTexts?: string[];
   /** Review r2 (I3): fragmentos generados que quedaron sin reparar por el límite de largo (exentos solo ellos). */
   internalVocabularyKeptTexts?: string[];
+  /**
+   * r60 (D1/D2): Moodle mínimo que el paquete declara (del builder). El validador recalcula el requisito real desde
+   * los bytes (formato del backup, API H5P de cada h5p.json, tokens de 4.4+) y falla si lo supera. Ausente = no aplica.
+   */
+  moodleMinimum?: string;
 }
 
 /** true si `v` (x.y.z) ≥ `min`. Una versión ausente o mal formada → false. */
@@ -508,10 +514,12 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     }
     return undefined;
   };
+  const navCourseId = num(tag(mb, 'original_course_id'));
   const navIds = new Set<string>();
   const navBySectionTarget = new Map<string, string[]>();
   for (const a of acts) {
-    const secLinks = Array.from(a.intro.matchAll(/\$@COURSESECTIONBYID\*(\d+)@\$/g), (x) => Number(x[1]));
+    // r60 (D2): las dos formas de botón a sección (token de 4.4+ o COURSEVIEWBYID + &section=n).
+    const secLinks = sectionLinkTargets(a.intro, navCourseId);
     // Fix 1 (I1): dos botones de navegación de la MISMA sección al MISMO destino = botón duplicado.
     for (const t of new Set(secLinks)) {
       const k = `${a.sectionid}→${t}`;
@@ -1218,6 +1226,14 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
           if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a una sección del paquete`);
           continue;
         }
+        // r60 (D2): página del curso del backup (+ `&section=n` en los botones a secciones de paquetes < 4.4).
+        if (m[1] === 'COURSEVIEWBYID') {
+          if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
+          const after = s.html.slice((m.index ?? 0) + m[0].length);
+          const sec = /^&(?:amp;)?section=(\d+)/.exec(after);
+          if (sec && !sectionIds.has(Number(sec[1]))) add('TOKEN_INVALID', s.where, `token ${m[0]}&section=${sec[1]} no resuelve a una sección del paquete`);
+          continue;
+        }
         // EV6 T3: página de insignias (certificado) del curso DEL BACKUP (decode rule 'course').
         if (m[1] === 'BADGESVIEWBYID') {
           if (!m[2] || Number(m[2]) !== backupCourseId) add('TOKEN_INVALID', s.where, `token ${m[0]} no apunta al curso del backup (${backupCourseId})`);
@@ -1446,6 +1462,39 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     else {
       if (!/<\/html>\s*$/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'no cierra en </html>');
       if (!/<style>[\s\S]*@media print[\s\S]*<\/style>/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'sin <style> con CSS de impresión');
+    }
+  }
+
+  // ── r60 (D1/D2): compatibilidad con Moodle recalculada desde los bytes ─────────────────────────────
+  // Requisito real = máx(formato del backup, API H5P de las librerías de cada h5p.json, tokens de 4.4+). Un paquete
+  // que declara un mínimo (expectations.moodleMinimum) menor que ese requisito promete una versión en la que no
+  // funciona: MOODLE_COMPAT. Sin declaración (expectativas anteriores a r60) no se evalúa.
+  if (exp.moodleMinimum !== undefined) {
+    const declared = exp.moodleMinimum;
+    const release = /^(\d+\.\d+)/.exec(tag(mb, 'moodle_release') ?? '')?.[1];
+    if (!(MOODLE_COMPAT_VERSIONS as readonly string[]).includes(declared)) add('MOODLE_COMPAT', 'expectations', `Moodle mínimo declarado desconocido: ${declared}`);
+    else if (!release) add('MOODLE_COMPAT', 'moodle_backup.xml', 'moodle_release sin versión x.y');
+    else {
+      const need: Array<{ v: string; why: string }> = [{ v: release, why: `formato del backup ${release}` }];
+      const pkgFiles = files.filter((f) => f.component === 'mod_h5pactivity' && f.filearea === 'package' && f.filename !== '.');
+      const bufs: Buffer[] = [];
+      for (const f of pkgFiles) {
+        const b = await bin(`files/${f.hash.slice(0, 2)}/${f.hash}`);
+        if (b) bufs.push(b);
+      }
+      try {
+        const req = h5pRequirement(await h5pPackageLibraryKeys(bufs));
+        if (req.coreApi !== null) need.push({ v: req.minimumMoodle, why: `H5P core API ${req.coreApi} (${req.worst.slice(0, 3).join(', ')}${req.worst.length > 3 ? '…' : ''})` });
+      } catch (err) {
+        add('MOODLE_COMPAT', 'h5p', `no se pudo calcular el requisito H5P: ${(err as Error).message}`);
+      }
+      for (const a of acts) {
+        const surfaces = [a.intro, ...(pageContent.has(a.mid) ? [pageContent.get(a.mid) as string] : [])];
+        for (const html of surfaces) for (const t of tokenRequirements(html)) need.push({ v: t.minimumMoodle, why: `${t.token} en ${a.idnumber}` });
+      }
+      for (const n of need) {
+        if (compareMajorMinor(n.v, declared) > 0) add('MOODLE_COMPAT', 'package', `declara Moodle ${declared}+ pero ${n.why} exige Moodle ${n.v}+`);
+      }
     }
   }
 
