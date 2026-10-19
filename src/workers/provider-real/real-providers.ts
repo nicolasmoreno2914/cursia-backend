@@ -61,6 +61,7 @@ import {
   validateChapterAudioManifest,
 } from '../../package/audio';
 import { transcodeMp3Bitrate } from '../../tts/mp3-transcode.util';
+import { TTS_SNAPSHOT_MODEL } from '../../tts/tts-models';
 import type { ThemeFamilyId, ThemeMode } from '../../modules/theme-engine/types';
 import {
   GuardNextCall,
@@ -119,7 +120,7 @@ export const GAMMA_NUM_CARDS = 10;
 // r59: se fija el snapshot. El alias `gpt-4o-mini-tts` se colgaba de forma intermitente (staging 2026-10-19:
 // 5 de 11 llamadas >60 s, terminaban a los 125–172 s y se cobraban); el snapshot fijo, 0 de 13. Mismo precio
 // que el alias (filas propias en pricing-seed.v1). OPENAI_TTS_MODEL sigue teniendo prioridad.
-export const TTS_MODEL_DEFAULT = 'gpt-4o-mini-tts-2025-03-20';
+export const TTS_MODEL_DEFAULT = TTS_SNAPSHOT_MODEL; // r60: una sola constante (src/tts/tts-models.ts)
 export const TTS_VOICE_DEFAULT = 'marin';
 export const TTS_TARGET_BITRATE_KBPS = 64;
 /** Envío a Gamma de resultado desconocido (5xx/red/timeout/sin id tras enviar): nunca se reenvía solo. */

@@ -1,9 +1,9 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { transcodeMp3Bitrate } from './mp3-transcode.util';
+import { resolveTtsModel } from './tts-models';
 
 const MAX_CHARS = 4000;
 const DEFAULT_VOICE = 'marin';
-const DEFAULT_MODEL = 'gpt-4o-mini-tts';
 const OPENAI_TTS_URL = 'https://api.openai.com/v1/audio/speech';
 // OpenAI TTS entrega mp3 a 128 kbps por defecto — de sobra para voz hablada. Recodificar a
 // 64 kbps (mono, sin música de por medio) reduce el peso ~50% sin pérdida perceptible, y deja
@@ -41,7 +41,13 @@ export class TtsService {
   async synthesize(opts: TtsSpeechOpts): Promise<TtsSpeechResult> {
     const text   = opts.text?.trim() ?? '';
     const voice  = (opts.voice  || process.env.OPENAI_TTS_VOICE  || DEFAULT_VOICE).trim();
-    const model  = (opts.model  || process.env.OPENAI_TTS_MODEL  || DEFAULT_MODEL).trim();
+    // r60 Q-22: default = snapshot fijo; el alias exacto `gpt-4o-mini-tts` (lo manda el frontend V1) se cambia por el
+    // snapshot salvo OPENAI_TTS_ALLOW_ALIAS=true. OPENAI_TTS_MODEL aplica si no se pasa modelo.
+    const resolved = resolveTtsModel(opts.model);
+    const model  = resolved.model;
+    if (resolved.normalized) {
+      this.logger.log(`[TTS] modelo ${resolved.requested} → ${model} (alias inestable; OPENAI_TTS_ALLOW_ALIAS=true lo permite)`);
+    }
     const format = (opts.format || 'mp3').trim();
 
     if (!this.apiKey) {

@@ -7,6 +7,7 @@ import { AppModule } from '../app.module';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { TtsService } from '../tts/tts.service';
+import { resolveTtsModel } from '../tts/tts-models';
 import {
   ProductionJobsService,
   AudioWorkerProgressSummary,
@@ -445,7 +446,11 @@ export async function handleAudioJob(
   const generateAudiobook = options.generateAudiobook    !== false;
   const audiobookOptional = options.audiobookOptional    !== false;
   const voice = options.voice || process.env.OPENAI_TTS_VOICE || 'marin';
-  const model = options.model || process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts';
+  // r60 Q-22: el modelo que se llama de verdad (snapshot fijo; el alias exacto se normaliza) — el mismo que
+  // tts.service usa y el que se registra en eventos/artifacts.
+  const ttsModel = resolveTtsModel(options.model);
+  const model = ttsModel.model;
+  if (ttsModel.normalized) logger.log(`[AudioWorker] Job ${job.id}: modelo TTS ${ttsModel.requested} → ${model}`);
 
   const rawCourseId = job.frontendCourseId || String(job.courseId ?? 'unknown');
   const apiKey = (process.env.OPENAI_API_KEY ?? '').trim();
@@ -942,7 +947,7 @@ async function bootstrap() {
         parentJobId: claimed.inputPayload?.metadata?.parentJobId ?? null,
         component: 'audio',
         provider: 'openai_tts',
-        model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts',
+        model: resolveTtsModel(undefined).model,
         mode: 'dry_run',
         costType: 'mock_zero',
         estimatedCostUsd: 0,

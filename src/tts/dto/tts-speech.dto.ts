@@ -13,7 +13,7 @@ export class TtsSpeechDto {
   @MaxLength(50)
   voice?: string;
 
-  /** Modelo OpenAI TTS (default: gpt-4o-mini-tts) */
+  /** Modelo OpenAI TTS (default: snapshot gpt-4o-mini-tts-2025-03-20; el alias gpt-4o-mini-tts se normaliza al snapshot — r60) */
   @IsOptional()
   @IsString()
   @MaxLength(80)
