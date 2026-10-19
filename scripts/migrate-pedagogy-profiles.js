@@ -25,7 +25,8 @@ function loadEnvFile(envPath) {
 // kind = 'pedagogy' (perfil pedagógico del curso). Solo amplía el CHECK (ninguna fila
 // cambia). Aditiva, idempotente y SOLO staging: la cablea deploy-staging.yml (nunca
 // deploy.yml), después de migrate-v21-blueprint-profiles.js / migrate-ev6-h5p2.js.
-// Producción: fuera de alcance de esta fase (no está en scripts/prod/migrate-v2-production.js).
+// Producción: este script es SOLO staging; en producción el mismo .sql lo aplica
+// scripts/prod/migrate-v2-production.js (paso propio, r60) con sus guardas y aprobación del owner.
 //
 // Guardarraíl de intención explícita: esta migración es solo para staging.
 // No se infiere nada de DB_HOST/DB_NAME — el operador tiene que

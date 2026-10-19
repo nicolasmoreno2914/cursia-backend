@@ -50,7 +50,9 @@ function assert(c, m) { if (!c) throw new Error(m); }
 /** Scripts migrate-*.js que corre un workflow, en orden de aparición. */
 function workflowMigrations(yml) {
   const out = [];
-  const re = /^\s*(?:MIGRATION_ENV=\w+\s+)?node\s+scripts\/(migrate-[\w-]+\.js)\b/gm;
+  // Review M-3: cualquier aparición en la línea (env previos, `&&`, `if …; then node …`), no solo al inicio. Se ignoran
+  // las líneas de comentario de shell.
+  const re = /^(?![ \t]*#).*?\bnode\s+(?:\.\/)?scripts\/(migrate-[\w-]+\.js)\b/gm;
   let m;
   while ((m = re.exec(yml))) out.push(m[1]);
   return out;
@@ -104,6 +106,19 @@ const plan = { steps: runner.MIGRATION_STEPS, excluded: runner.buildPlan ? (runn
 check('deploy-staging.yml: se leen sus migraciones (≥ 20 scripts migrate-*.js)', () => {
   assert(stagingScripts.length >= 20, `solo ${stagingScripts.length}: ${stagingScripts.join(', ')}`);
   assert(stagingScripts.includes(BUILTIN_STEP0), `${BUILTIN_STEP0} no aparece en deploy-staging.yml`);
+});
+
+check('M-3: el parser encuentra migraciones en cualquier posición de la línea (y no en comentarios)', () => {
+  const yml = [
+    '  run: |',
+    '    MIGRATION_ENV=staging node scripts/migrate-a.js',
+    '    DB_SSL=true MIGRATION_ENV=staging node scripts/migrate-b.js && echo ok',
+    '    if [ -n "$X" ]; then node ./scripts/migrate-c.js; fi',
+    '    set -e; FOO=1 node scripts/migrate-d.js',
+    '    # node scripts/migrate-commented.js',
+  ].join('\n');
+  const got = workflowMigrations(yml);
+  assert(JSON.stringify(got) === JSON.stringify(['migrate-a.js', 'migrate-b.js', 'migrate-c.js', 'migrate-d.js']), JSON.stringify(got));
 });
 
 check('EXCLUDED del runner se lee (buildPlan().excluded)', () => {

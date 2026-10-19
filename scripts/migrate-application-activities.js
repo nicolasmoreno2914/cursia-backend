@@ -25,7 +25,8 @@ function loadEnvFile(envPath) {
 // null). Las filas existentes quedan null (ningún Blueprint cambia). Aditiva, idempotente y SOLO
 // staging: la cablea deploy-staging.yml (nunca deploy.yml), DESPUÉS de migrate-v21-manifest-v3.js (paso 4h5a):
 // reescribe cgm_counts_consistent y gir_type_check, que esa migración crea; antes, en una base nueva, quedarían los v3.
-// Producción: fuera de alcance de esta fase (no está en scripts/prod/migrate-v2-production.js).
+// Producción: este script es SOLO staging; en producción el mismo .sql lo aplica
+// scripts/prod/migrate-v2-production.js (paso propio, r60) con sus guardas y aprobación del owner.
 //
 // Guardarraíl de intención explícita: esta migración es solo para staging.
 // No se infiere nada de DB_HOST/DB_NAME — el operador tiene que
