@@ -18,7 +18,7 @@ import { assertLegacyAudioAllowed } from '../modules/production-jobs/legacy-audi
 import { TtsService } from './tts.service';
 import { TtsSpeechDto } from './dto/tts-speech.dto';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
-import { recordDirectTtsCall } from '../modules/finops/direct-call-ledger';
+import { assertDirectCallAllowed, recordDirectTtsCall } from '../modules/finops/direct-call-ledger';
 import { mp3DurationSeconds } from '../package/audio/mp3-parser';
 
 /**
@@ -65,6 +65,8 @@ export class TtsController {
     if (dto.courseId) {
       await assertLegacyAudioAllowed((sql, params) => this.dataSource.query(sql, params), user?.id ?? '', dto.courseId);
     }
+    // r58: kill switch / allow-list de proveedores ANTES de llamar a OpenAI (esta ruta no reserva).
+    assertDirectCallAllowed('openai');
     try {
       const result = await this.ttsService.synthesize({
         text:         dto.text,

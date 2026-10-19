@@ -34,6 +34,11 @@ import {
 import { resolveTheme } from '../modules/theme-engine';
 import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
+import { hoursReportSummary } from '../modules/study-time/hours-ledger';
+import { buildPackageQualityReport, courseQualityReportSummary, CourseQualityReport } from '../modules/quality/course-quality-report';
+import { PACKAGE_REUSE_REJECTED, PACKAGE_REUSE_VERIFY_UNAVAILABLE, chooseDynamicMbzUploadPath, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
+import { sha256Hex } from '../modules/artifacts/artifacts.service';
+import { isNonRealLlmMode } from '../modules/artifacts/artifact-type-policy';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5B.1 — B3: dynamic-package-worker. Reclama production_jobs con
@@ -156,6 +161,31 @@ function artifactCourseId(job: PackageJobRow): string {
   return job.frontend_course_id ?? String(job.course_id);
 }
 
+/**
+ * r58 (AU1 R1): de los candidatos que coinciden por metadata, el primero (más nuevo) que pasa la verificación
+ * del servidor (ruta canónica + checksum + bytes; v3: validado). Un descarte se loguea y se sigue buscando;
+ * sin ninguno → null (el job reconstruye).
+ */
+async function firstVerifiedCandidate<T extends { id: string; storageBucket?: string | null; storagePath?: string | null; checksumSha256?: string | null; metadata?: any }>(
+  artifacts: ArtifactsService,
+  candidates: T[],
+  expected: { ownerId: string; courseId: string; manifestId: number; runId: string; sourceIdsHash: string; qa: boolean },
+  requireValidated: boolean,
+  logger?: Pick<Logger, 'warn'>,
+): Promise<T | null> {
+  for (const c of candidates) {
+    const v = await verifyReusableDynamicMbz(artifacts, c, expected, { requireValidated });
+    if (v.ok === true) return c;
+    // Review r1 (I-1): un fallo transitorio de Storage al verificar NO dispara un rebuild (que antes terminaba
+    // pisando los bytes entregados): el job falla con un código clase A y se reintenta.
+    if ((v as { reason: string }).reason === 'download_failed') {
+      throw new Error(`${PACKAGE_REUSE_VERIFY_UNAVAILABLE}: no se pudo descargar dynamic_mbz ${c.id} del run ${expected.runId} para verificarlo (Storage) — se reintenta, nunca se reconstruye encima`);
+    }
+    logger?.warn(`${PACKAGE_REUSE_REJECTED}:${(v as { reason: string }).reason} — dynamic_mbz ${c.id} del run ${expected.runId} no se reutiliza (se reconstruye)`);
+  }
+  return null;
+}
+
 async function findExistingDynamicMbz(
   artifacts: ArtifactsService,
   ownerId: string,
@@ -164,9 +194,11 @@ async function findExistingDynamicMbz(
   sourceIdsHash: string,
   moodleVersion: string,
   packageKind: PackageKind = 'final',
+  manifestId?: number,
+  logger?: Pick<Logger, 'warn'>,
 ): Promise<{ id: string } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
-  const match = list.find((a) => {
+  const candidates = list.filter((a) => {
     const meta = a.metadata as Record<string, any> | null;
     // I3: la clave ya incluye la versión (salvo el default, byte-idéntico);
     // además se exige que la versión registrada coincida — sin campo (.mbz
@@ -179,6 +211,9 @@ async function findExistingDynamicMbz(
     if (packageKind !== 'final') return meta?.packageKind === packageKind;
     return !meta?.packageKind;
   });
+  if (!candidates.length) return null;
+  const expected = { ownerId, courseId, manifestId: Number(manifestId ?? candidates[0].metadata?.manifestId), runId, sourceIdsHash, qa: packageKind !== 'final' };
+  const match = await firstVerifiedCandidate(artifacts, candidates, expected, false, logger);
   return match ? { id: match.id } : null;
 }
 
@@ -364,7 +399,7 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     if (leaseLost) return;
 
     // Restore-first: mismo runId + mismo set de artifacts de origen + misma versión -> reusar.
-    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, moodle.resolved, packageKind);
+    const existing = await findExistingDynamicMbz(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, moodle.resolved, packageKind, manifest.id, logger);
     if (existing) {
       logger.log(`Job ${job.id}: dynamic_mbz ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
       const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
@@ -396,7 +431,10 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
     // DoD follow-up (R7): un paquete QA va con el prefijo `QA-VISTA-PREVIA-` y bajo `qa-internal/` (fuera de
     // las políticas own-folder del dueño), igual que en v3.
     const mbzFilename = `${qa ? QA_PACKAGE_FILENAME_PREFIX : ''}${sourceIdsHash}.mbz`;
-    const storagePath = `${qa ? `${QA_INTERNAL_STORAGE_PREFIX}/` : ''}${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
+    const canonicalPath = `${qa ? `${QA_INTERNAL_STORAGE_PREFIX}/` : ''}${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
+    // Review r1 (I-1): si un artifact ya referencia la ruta canónica (paquete entregado), el rebuild va a una ruta NUEVA.
+    const { storagePath, rebuilt } = await chooseDynamicMbzUploadPath(deps.artifacts, canonicalPath, sha256Hex(buffer));
+    if (rebuilt) logger.warn(`Job ${job.id}: ${canonicalPath} ya está referenciado por un artifact — el rebuild se sube a ${storagePath} (los bytes entregados quedan intactos)`);
     const artifact = await deps.artifacts.uploadBufferArtifact({
       ownerId: job.owner_id,
       courseId: artifactCourseId(job),
@@ -413,6 +451,9 @@ export async function processItem(deps: DynamicPackageWorkerDeps, job: PackageJo
       // insertar el row, el reintento adopta el objeto verificado en vez de
       // fallar para siempre con "already exists".
       adoptExistingOnConflict: true,
+      // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes; review r1 (I-1):
+      // solo se reemplaza un objeto HUÉRFANO (sin row); uno referenciado → PACKAGE_OBJECT_CONFLICT (nunca se pisa).
+      replaceUnverifiedOnConflict: true,
       metadata: {
         runId,
         manifestId: manifest.id,
@@ -491,13 +532,16 @@ export async function processV3PackageJob(
   const { sourceIdsHash, sourceArtifactIds: ids } = prepared;
   // EV6 DoD: un paquete FINAL nunca lleva componentes de vista previa (videos omitidos o Gamma/TTS
   // simulados). Defensa en el worker (un job viejo o encolado por otro camino): falla fuerte.
+  // r58 (AU1 R2): texto generado por un LLM falso o reproducido (llmMode mock/replay) nunca va en un final.
+  const nonRealLlm = nonRealLlmItemKeys(prepared.byItem);
   if (!qa) {
     const pm = frozenProviderModesOf(prepared.run?.input_payload);
     const mockProviders = !!pm && (pm.presentation === 'mock' || pm.audio === 'mock');
-    if (prepared.pendingVideos.length > 0 || mockProviders) {
+    if (prepared.pendingVideos.length > 0 || mockProviders || nonRealLlm.length > 0) {
       throw new Error(
         `preview_not_deliverable: el run ${runId} tiene componentes de vista previa ` +
-          `(${prepared.pendingVideos.length} video(s) pendiente(s)${mockProviders ? ', Gamma/TTS simulados' : ''}); ` +
+          `(${prepared.pendingVideos.length} video(s) pendiente(s)${mockProviders ? ', Gamma/TTS simulados' : ''}` +
+          `${nonRealLlm.length ? `, ${nonRealLlm.length} item(s) con texto de IA simulado/reproducido: ${nonRealLlm.slice(0, 8).join(', ')}` : ''}); ` +
           'un paquete final solo se arma con todos los componentes reales (el paquete QA lo pide un administrador).',
       );
     }
@@ -518,6 +562,8 @@ export async function processV3PackageJob(
     pendingVideos: pendingVideosSummary(manifest, prepared.pendingVideos.map((p) => p.itemKey)),
     // EV6 DoD: solo los paquetes QA lo declaran (el resumen de un final no cambia).
     ...(qa ? { packageKind, deliverable: false } : {}),
+    // r58 (AU1 R2): items con texto de IA simulado / reproducido (solo un paquete QA puede tenerlos).
+    ...(nonRealLlm.length ? { llmNonRealItems: nonRealLlm } : {}),
   };
   // F1: avisos de perfiles (tema por defecto, pesos normalizados, curso sin nota) — también en un paquete reutilizado.
   const profileWarnings = prepared.profileWarnings.map((w) => ({ code: w.split(':')[0], detail: w }));
@@ -526,7 +572,7 @@ export async function processV3PackageJob(
   // EV6 T5 (fix round 1, m-2): el aviso de video pendiente de cada capítulo solo se decide al
   // construir; un .mbz reutilizado lo trae en su metadata (mismo sourceIdsHash = mismos textos).
   const pendingWarnings = baseSummary.pendingVideos.map((p) => ({ code: 'pending_video_omitted', detail: `pending_video_omitted:${p.itemKey}` }));
-  const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, packageKind);
+  const existing = await findExistingDynamicMbzV3(deps.artifacts, job.owner_id, artifactCourseId(job), runId, sourceIdsHash, packageKind, manifest.id, logger);
   if (existing) {
     logger.log(`Job ${job.id}: dynamic_mbz v3 ya existe (${existing.id}) para runId=${runId} — reutilizando sin reconstruir`);
     const reusedPending: any[] = Array.isArray(existing.metadata?.pendingVideos) ? existing.metadata.pendingVideos : baseSummary.pendingVideos;
@@ -539,6 +585,8 @@ export async function processV3PackageJob(
       pendingVideoNoticeCount: reusedPending.filter((p) => p && p.notice === true).length,
       // EV6 H5P v2: la instrucción de restauración viaja en la metadata del .mbz reutilizado.
       ...(existing.metadata?.restore ? { restore: existing.metadata.restore } : {}),
+      // r58 (I2): el informe de calidad viaja en la metadata del .mbz reutilizado (mismos textos = mismo informe).
+      ...(existing.metadata?.qualityReport && typeof existing.metadata.qualityReport === 'object' ? { qualityReport: existing.metadata.qualityReport } : {}),
       ...(reuseWarnings.length ? { warnings: reuseWarnings } : {}),
     });
     if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
@@ -574,6 +622,11 @@ export async function processV3PackageJob(
     // fix round 3: candidatos en orden (brand_profile → user_settings); el builder usa el primero que valida.
     libroBrand: { logo: prepared.libroBrand?.candidates ?? prepared.libroBrand?.logo ?? null, name: prepared.libroBrand?.name ?? null },
     libroReferences: prepared.libroReferences ?? null,
+    // r58 (I3) fix: horas objetivo congeladas en el Blueprint → «Duración estimada: X h (definida por la institución)» en
+    // la bienvenida y «Carga horaria declarada» en la Guía del docente. Antes nunca se pasaban (facts.hours = null siempre).
+    hours: packageDeclaredHours(snapshot),
+    // Review r1 (M-5): «(definida por la institución)» solo si el Blueprint congeló que las horas vienen del documento.
+    hoursSource: packageDeclaredHoursSource(snapshot),
     // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
     ...(qa ? { qaPreviewNotice: true } : {}),
   });
@@ -601,6 +654,28 @@ export async function processV3PackageJob(
   if (sizeVerdict.error) throw new Error(sizeVerdict.error);
   if (isLeaseLost()) return;
 
+  // r58 (I2): informe de calidad del curso (formato común E4) sobre los artifacts ya pagados: avisos del builder, registro de
+  // horas y chequeos determinísticos nuevos. Nunca bloquea por sí solo (un BLOCKER real ya falló arriba); un MAJOR requiere
+  // resolución humana (visible a administradores en «Curso listo»). Si el informe falla, aviso VISIBLE (nunca en silencio).
+  let qualityReport: CourseQualityReport | null = null;
+  const qualityReportWarnings: string[] = [];
+  try {
+    const titles = new Map<string, string>(((prepared.profiles.assessment as any)?.practiceResources ?? []).map((r: any) => [String(r.id), String(r.title ?? '')]));
+    qualityReport = courseQualityReportSummary(buildPackageQualityReport({
+      manifest: manifest.manifest as any,
+      blueprint: snapshot as any,
+      contents: loaded.contents as any,
+      packageWarnings: [...built.summary.warnings, ...(built.summary.qualityWarnings ?? [])],
+      practiceResources: built.summary.practiceResources ?? null,
+      practiceTitles: titles,
+      hoursReport: (built.expectations.facts as any).hoursReport ?? null,
+      builderVersion: built.summary.builderVersion,
+    }));
+  } catch (err) {
+    qualityReportWarnings.push(`quality_report_failed:${errMessage(err).slice(0, 160)}`);
+    logger.error(`Job ${job.id}: no se pudo armar el informe de calidad — ${errMessage(err)}`);
+  }
+
   // EV6 T5 (fix round 1, m-2): pendientes con el flag `notice` del builder (ruling 3, medible).
   const noticeByKey = new Map(built.summary.pendingVideos.map((p) => [p.itemKey, p.notice === true]));
   const pendingVideos = baseSummary.pendingVideos.map((p) => ({ ...p, notice: noticeByKey.get(p.itemKey) === true }));
@@ -612,9 +687,12 @@ export async function processV3PackageJob(
   // Fix round 3 (N2): un paquete QA / degradado va bajo un prefijo INTERNO (primer segmento ≠ uid del
   // dueño): ninguna política de Storage de `authenticated` (own-folder) lo cubre → solo el backend
   // (service role, para un SUPER_ADMIN) lo firma. El paquete final conserva la ruta de siempre.
-  const storagePath = qa
+  const canonicalPath = qa
     ? `${QA_INTERNAL_STORAGE_PREFIX}/${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`
     : `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}/dynamic_mbz/${runId}/${mbzFilename}`;
+  // Review r1 (I-1): nunca se sobrescribe un .mbz que un artifact referencia; el rebuild va a `<clave>.<sha16>.mbz`.
+  const { storagePath, rebuilt } = await chooseDynamicMbzUploadPath(deps.artifacts, canonicalPath, sha256Hex(built.mbz));
+  if (rebuilt) logger.warn(`Job ${job.id}: ${canonicalPath} ya está referenciado por un artifact — el rebuild v3 se sube a ${storagePath} (los bytes entregados quedan intactos)`);
   const artifact = await deps.artifacts.uploadBufferArtifact({
     ownerId: job.owner_id,
     courseId: artifactCourseId(job),
@@ -626,7 +704,10 @@ export async function processV3PackageJob(
     mimeType: 'application/vnd.moodle.backup',
     upsert: false,
     adoptExistingOnConflict: true,
-    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}) },
+    // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes (validados).
+    replaceUnverifiedOnConflict: true,
+    // r58 (AU1 R1): sha256 de los bytes que aprobó validateMbzV3 (el reuse lo exige igual al checksum de Storage).
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), ...(qualityReport ? { qualityReport } : {}), validatedSha256: sha256Hex(built.mbz) },
   });
   if (isLeaseLost()) return;
 
@@ -644,6 +725,7 @@ export async function processV3PackageJob(
     ...profileWarnings,
     ...[...loaded.warnings, ...built.summary.warnings].filter((w) => !profileDetails.has(w)).map((w) => ({ code: w.split(':')[0], detail: w })),
     ...sizeVerdict.warnings.map((w) => ({ code: w.split(':')[0], detail: w })),
+    ...qualityReportWarnings.map((w) => ({ code: w.split(':')[0], detail: w })),
   ];
   const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
     artifactId: artifact.id,
@@ -664,8 +746,42 @@ export async function processV3PackageJob(
     ...(warnings.length ? { warnings } : {}),
     // T1 (r57): avisos de calidad del contenido (fórmulas repetidas entre capítulos); informativos, nunca fallan.
     ...(built.summary.qualityWarnings?.length ? { qualityWarnings: built.summary.qualityWarnings } : {}),
+    // r58 (I2): informe de calidad (contadores por severidad + hallazgos, tope COURSE_QUALITY_SUMMARY_MAX_FINDINGS).
+    ...(qualityReport ? { qualityReport } : {}),
+    // r58 (I3): registro de horas del paquete (sin las líneas; están en facts): objetivo / estimado / asignado / gap.
+    ...(built.expectations.facts.hoursReport ? { hoursReport: hoursReportSummary(built.expectations.facts.hoursReport) } : {}),
   });
   if (!ok) logger.warn(`Job ${job.id}: el .mbz v3 se subió (artifact ${artifact.id}) pero completeJob devolvió false (lease perdida)`);
+}
+
+/**
+ * r58 (I3): horas que la bienvenida muestra como «definidas por la institución»: las horas objetivo congeladas en el
+ * Blueprint (perfil del curso o documento). Sin objetivo → null (la bienvenida no muestra duración; nunca se inventa).
+ */
+export function packageDeclaredHours(snapshot: BlueprintSnapshotV2): number | null {
+  const t = snapshot?.course?.targetHours;
+  return typeof t === 'number' && Number.isFinite(t) && t > 0 ? t : null;
+}
+
+/**
+ * Review r1 (M-5): origen de las horas objetivo. `document` solo si el Blueprint lo congeló explícitamente
+ * (`course.targetHoursSource = 'document'`); hoy el lock no lo congela (decisión #9 pendiente) → null = redacción neutra
+ * «Duración estimada del curso: X h.» (el objetivo puede venir del perfil, de una propuesta de Cursia o del documento).
+ */
+export function packageDeclaredHoursSource(snapshot: BlueprintSnapshotV2): 'document' | null {
+  return packageDeclaredHours(snapshot) !== null && (snapshot?.course as Record<string, unknown> | undefined)?.['targetHoursSource'] === 'document' ? 'document' : null;
+}
+
+/**
+ * r58 (AU1 R2): items del run cuyo texto de IA NO es real (`output_summary.llmMode` del servidor o
+ * `metadata.llmMode` de alguno de sus artifacts = mock | replay). Ordenados. Exportado para tests.
+ */
+export function nonRealLlmItemKeys(byItem: Map<string, { itemKey: string; outputSummary?: Record<string, any> | null; artifacts: Array<{ metadata?: Record<string, any> | null }> }>): string[] {
+  const out: string[] = [];
+  for (const it of byItem.values()) {
+    if (isNonRealLlmMode(it.outputSummary?.llmMode) || it.artifacts.some((a) => isNonRealLlmMode(a.metadata?.llmMode))) out.push(it.itemKey);
+  }
+  return out.sort();
 }
 
 /**
@@ -694,9 +810,11 @@ async function findExistingDynamicMbzV3(
   runId: string,
   sourceIdsHash: string,
   packageKind: PackageKind = 'final',
+  manifestId?: number,
+  logger?: Pick<Logger, 'warn'>,
 ): Promise<{ id: string; metadata: Record<string, any> | null } | null> {
   const list = await artifacts.findAll(ownerId, { courseId, type: 'dynamic_mbz' });
-  const match = list.find((a) => {
+  const candidates = list.filter((a) => {
     const meta = a.metadata as Record<string, any> | null;
     if (!(meta?.runId === runId && meta?.sourceIdsHash === sourceIdsHash && meta?.builderVersion === DYNAMIC_MBZ_BUILDER_VERSION_V3)) return false;
     // EV6 DoD: solo se reutiliza un .mbz del MISMO tipo. Un paquete QA nunca reutiliza uno sin
@@ -704,6 +822,10 @@ async function findExistingDynamicMbzV3(
     if (packageKind !== 'final') return meta?.packageKind === packageKind;
     return !meta?.packageKind && !summaryLooksPreview(meta);
   });
+  if (!candidates.length) return null;
+  // r58 (AU1 R1): v3 exige además que esos bytes hayan pasado validateMbzV3 (metadata.validatedSha256).
+  const expected = { ownerId, courseId, manifestId: Number(manifestId ?? (candidates[0].metadata as any)?.manifestId), runId, sourceIdsHash, qa: packageKind !== 'final' };
+  const match = await firstVerifiedCandidate(artifacts, candidates, expected, true, logger);
   return match ? { id: match.id, metadata: (match.metadata as Record<string, any> | null) ?? null } : null;
 }
 

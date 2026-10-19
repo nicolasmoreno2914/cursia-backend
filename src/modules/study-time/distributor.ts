@@ -32,7 +32,8 @@ import { chapterRole } from '../pedagogy/pedagogical-blueprint';
 import type { ChapterRole } from '../pedagogy/vocabulary';
 import { STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 import { isValidTargetHours } from './target-hours';
-import { STUDY_TIME_RULES, StudyTimeCourseInput, StudyTimeEstimate, estimateCourseStudyTime } from './time-model';
+import { STUDY_TIME_RULES, StudyTimeCourseInput, StudyTimeEstimate, estimateCourseStudyTime as estimateCourseStudyTimeWith } from './time-model';
+import { DEFAULT_TIME_MODEL_CONFIG, TimeModelConfig } from './time-model-config';
 import { GUIDED_PRACTICE_TIERS } from './guided-practice-tiers';
 import type { DistributorRequirementConstraints } from '../academic-context/requirements/requirement-authority';
 import { classifyLearningType } from '../pedagogy/learning-type';
@@ -230,6 +231,11 @@ export interface DistributorInput {
    * contenido o ninguno, y topes de Actividades de Aplicación. Lo que no se puede cumplir lo explica Verificación.
    */
   requirements?: DistributorRequirementConstraints | null;
+  /**
+   * r58 (I3): configuración del modelo de tiempo (tasas / minutos acreditados por nivel). Ausente = el default: mismos
+   * minutos y misma propuesta de siempre.
+   */
+  timeModelConfig?: TimeModelConfig | null;
 }
 
 export class DistributorError extends Error {
@@ -329,6 +335,9 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
 
 function distributeCore(input: DistributorInput): DistributionResult {
   const { snapshot, rules } = input ?? ({} as DistributorInput);
+  // r58 (I3): la misma configuración del modelo de tiempo en TODAS las estimaciones del distribuidor.
+  const timeCfg = input?.timeModelConfig ?? DEFAULT_TIME_MODEL_CONFIG;
+  const estimateCourseStudyTime = (x: StudyTimeCourseInput): StudyTimeEstimate => estimateCourseStudyTimeWith(x, timeCfg);
   if (!snapshot || snapshot.schemaVersion !== 2 || !Array.isArray(snapshot.modules) || snapshot.modules.length === 0) {
     throw new DistributorError('se necesita un Blueprint v2 con al menos un módulo');
   }

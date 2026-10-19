@@ -37,7 +37,10 @@ import { ResolvedPracticeResource, chapterDeliveryMode } from '../course-profile
 import { H5pActivityTypeV2, resolveActivityType } from './activity-type';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 import { courseCountNumbers } from './intro-schemas';
-import { estimateCourseStudyTime, StudyTimeEstimate } from '../study-time/time-model';
+import { estimateCourseStudyTimeDetailed, HourLine, StudyTimeEstimate } from '../study-time/time-model';
+import { HoursReport, buildHoursReport } from '../study-time/hours-ledger';
+import { timeModelConfigOf } from '../study-time/manifest-input';
+import type { TimeModelConfig } from '../study-time/time-model-config';
 
 export const COURSE_FACTS_VERSION = 1;
 export const HOURS_SOURCE_LABEL = 'definida por la institución';
@@ -78,8 +81,13 @@ export interface BuildCourseFactsInput {
   blueprint: AnyBlueprintSnapshot;
   assessment: AssessmentProfile;
   artifacts: CourseFactsArtifactsInput;
-  /** Dato del setup (horas); se muestra etiquetado como definido por la institución. */
+  /** Horas objetivo congeladas en el Blueprint. */
   hours?: number | null;
+  /**
+   * Review r1 (M-5): origen de esas horas. Solo `document` (documento de la institución) muestra «(definida por la
+   * institución)»; cualquier otro (perfil escrito por el usuario, propuesta de Cursia aceptada, ausente) → redacción neutra.
+   */
+  hoursSource?: 'document' | null;
   /**
    * EV6 T5: videos pendientes (vista previa) que el paquete omite. `chapterIds` = capítulos con
    * video en el Manifest cuyo video no es real todavía (quedan `videoEnabled:false`,
@@ -255,14 +263,23 @@ export interface CourseFacts {
     audiobookParts: Array<{ chapterId: string; chapterNumber: number; seconds: number; offsetSeconds: number }>;
   };
   libro: { wordCount: number; hasBibliography: boolean };
-  hours: { value: number; source: string } | null;
+  /** `source` = etiqueta de origen (solo horas del documento de la institución); null = redacción neutra. */
+  hours: { value: number; source: string | null } | null;
   /** T6 (r57): el paquete lleva la «Guía del docente» (página oculta de la sección 0). Solo si el perfil la pide. */
   teacherGuide?: true;
   /**
    * Motor de carga horaria: tiempo de estudio estimado del curso (modelo study-time con las medidas del
    * paquete). Solo si el empaque informó las palabras del experience. No se imprime en el shell.
    */
-  studyTime?: { rulesVersion: number; courseEstimatedMinutes: number; courseEstimatedHours: number; usesPlannedValues: boolean };
+  studyTime?: { rulesVersion: number; courseEstimatedMinutes: number; courseEstimatedHours: number; usesPlannedValues: boolean; configId?: string };
+  /**
+   * r58 (I3): registro de horas del paquete (mismas líneas que `studyTime`, con categoría, base, evidencia, regla y
+   * configuración; objetivo / estimado / asignado / observado = null / gap). Solo junto con `studyTime`. No se imprime en
+   * el shell salvo el desglose opcional de la «Guía del docente» (`hoursModel.teacherGuideBreakdown`).
+   */
+  hoursReport?: HoursReport;
+  /** r58 (I3): la «Guía del docente» muestra el desglose del registro (solo si la configuración lo pide). */
+  hoursBreakdownInTeacherGuide?: true;
 }
 
 function fail(msg: string): never {
@@ -515,6 +532,14 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
   // Motor de carga horaria: el tiempo de cada capítulo y del curso sale del modelo único (study-time) con las
   // MEDIDAS del paquete; lo no medido (preguntas de la actividad, tarjetas, textos del marco) usa el planificado.
   let studyTime: CourseFacts['studyTime'];
+  let hoursReport: HoursReport | undefined;
+  // r58 (I3): configuración del modelo de tiempo congelada en el Blueprint (sin ella, el default de siempre).
+  let timeCfg: TimeModelConfig;
+  try {
+    timeCfg = timeModelConfigOf(bp);
+  } catch (e) {
+    fail(`configuración del modelo de tiempo: ${(e as Error).message}`);
+  }
   const reviewCounts = input.reviewCardCountByChapter ?? {};
   for (const [id, n] of Object.entries(reviewCounts)) {
     if (!reviewIds.has(id)) fail(`tarjetas de «Repaso» de un capítulo sin «Repaso» (${id})`);
@@ -528,8 +553,9 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     const byModule = new Map<string, ChapterFacts[]>();
     for (const ch of chapters) byModule.set(ch.moduleId, [...(byModule.get(ch.moduleId) ?? []), ch]);
     let est: StudyTimeEstimate;
+    let lines: HourLine[];
     try {
-      est = estimateCourseStudyTime({
+      ({ estimate: est, lines } = estimateCourseStudyTimeDetailed({
         frame: true,
         welcomeAudio: true,
         welcomeAudioSeconds: welcomeSeconds,
@@ -565,18 +591,24 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
             };
           }),
         })),
-      });
+      }, timeCfg));
     } catch (e) {
       fail(`tiempo de estudio: ${(e as Error).message}`);
     }
     const byId = new Map(est.modules.flatMap((m) => m.chapters.map((c) => [c.chapterId, c.displayMinutes] as const)));
     for (const ch of chapters) ch.estimatedMinutes = byId.get(ch.id);
-    studyTime = { rulesVersion: est.rulesVersion, courseEstimatedMinutes: est.courseEstimatedMinutes, courseEstimatedHours: est.courseEstimatedHours, usesPlannedValues: est.usesPlannedValues };
+    studyTime = { rulesVersion: est.rulesVersion, courseEstimatedMinutes: est.courseEstimatedMinutes, courseEstimatedHours: est.courseEstimatedHours, usesPlannedValues: est.usesPlannedValues, ...(est.configId ? { configId: est.configId } : {}) };
+    // r58 (I3): las horas del documento no se congelan en el Blueprint (solo el objetivo): declarado = null con motivo.
+    try {
+      hoursReport = buildHoursReport({ stage: 'package', estimate: est, lines, config: timeCfg, targetHours: bp.course.targetHours ?? null, declared: null, declaredReason: 'document_hours_not_frozen' });
+    } catch (e) {
+      fail(`registro de horas: ${(e as Error).message}`);
+    }
   }
   let hours: CourseFacts['hours'] = null;
   if (input.hours !== undefined && input.hours !== null) {
     if (typeof input.hours !== 'number' || !Number.isFinite(input.hours) || input.hours <= 0) fail('hours debe ser un número > 0');
-    hours = { value: input.hours, source: HOURS_SOURCE_LABEL };
+    hours = { value: input.hours, source: input.hoursSource === 'document' ? HOURS_SOURCE_LABEL : null };
   }
 
   const activitiesByVariant = {
@@ -629,6 +661,8 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
     ...(studyTime ? { studyTime } : {}),
+    ...(hoursReport ? { hoursReport } : {}),
+    ...(hoursReport && timeCfg.teacherGuideBreakdown ? { hoursBreakdownInTeacherGuide: true as const } : {}),
     ...(assessment.teacherGuide?.include === true ? { teacherGuide: true as const } : {}),
   };
   // Sanidad contra los totales del Manifest (dos fuentes, un número).

@@ -29,7 +29,7 @@ export const NORMAL_APPROVAL_REASON_PREFIX = 'ui_normal_approval';
 export const APPROVAL_TTL_HOURS = 24;
 
 export interface ApprovalLimitBlock {
-  /** maxCostPerRun | maxCostPerCourse | monthlyCap | maxCostPerProvider.<p> | maxCostPerItemType.<t> | no_budget_policy */
+  /** maxCostPerRun | maxCostPerCourse | monthlyCap | ownerMonthlyCap | maxCostPerProvider.<p> | maxCostPerItemType.<t> | no_budget_policy */
   limit: string;
   limitValue: string | null;
   /** Lo que ya se gastó contra ese límite (curso / mes). */
@@ -65,6 +65,12 @@ export function planNormalApproval(input: {
   monthSpent: DecimalLike;
   /** Gasto del curso por proveedor (spentSoFar.byProvider). */
   providerSpent?: Record<string, DecimalLike> | null;
+  /**
+   * r58: comprometido del mes de ESTE dueño (ownerMonthCommitted). Solo cuenta si la política define
+   * `ownerMonthlyCap` (límite mensual POR DUEÑO; `monthlyCap` sigue siendo global). Sin el dato con el límite
+   * configurado → falla cerrado (se bloquea nombrando el límite).
+   */
+  ownerMonthSpent?: DecimalLike | null;
 }): NormalApprovalPlan {
   const est = input.estimate.totals;
   const noLimits = { maxCostPerRun: null, maxCostPerCourse: null, monthlyCap: null };
@@ -78,6 +84,7 @@ export function planNormalApproval(input: {
   const perRun = lim(limits.maxCostPerRun, 'maxCostPerRun');
   const perCourse = lim(limits.maxCostPerCourse, 'maxCostPerCourse');
   const monthly = lim(limits.monthlyCap ?? limits.monthlyCapStaging, 'monthlyCap');
+  const ownerMonthly = lim(limits.ownerMonthlyCap, 'ownerMonthlyCap');
   const courseSpent = normalizeDecimal(input.courseSpent, 'courseSpent');
   const monthSpent = normalizeDecimal(input.monthSpent, 'monthSpent');
   const zero = normalizeDecimal(0);
@@ -89,6 +96,11 @@ export function planNormalApproval(input: {
     { limit: 'maxCostPerCourse', value: perCourse, spent: courseSpent },
     { limit: 'monthlyCap', value: monthly, spent: monthSpent },
   ];
+  if (ownerMonthly !== null) {
+    const ownerSpent = input.ownerMonthSpent === null || input.ownerMonthSpent === undefined ? null : normalizeDecimal(input.ownerMonthSpent, 'ownerMonthSpent');
+    // Fail closed: sin el comprometido del dueño no se puede probar que entra → el límite se toma como agotado.
+    totals.push({ limit: 'ownerMonthlyCap', value: ownerMonthly, spent: ownerSpent ?? ownerMonthly });
+  }
   let amount = normalizeDecimal(est.max, 'max');
   let cappedByLimit: string | null = null;
   for (const t of totals) {

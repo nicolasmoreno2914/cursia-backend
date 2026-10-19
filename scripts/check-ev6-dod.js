@@ -943,6 +943,7 @@ const ENV_KEYS = [
           createQueryRunner() { return { async connect() {}, async release() {}, async query() { return [{}]; } }; },
         };
       };
+      const MBZ_OLD = Buffer.from('mbz-anterior-del-servidor');
       const runJob = async (input, existing = []) => {
         const dsF = mkDs();
         const uploads = [];
@@ -950,7 +951,9 @@ const ENV_KEYS = [
         const silent = { log() {}, warn() {}, error() {} };
         const deps = {
           dataSource: dsF,
-          artifacts: { async findAll() { return existing; }, async uploadBufferArtifact(i) { uploads.push(i); return { id: `art-${uploads.length}` }; } },
+          artifacts: { async findAll() { return existing; }, async uploadBufferArtifact(i) { uploads.push(i); return { id: `art-${uploads.length}` }; },
+            // r58 (AU1 R1): el reuse descarga y verifica el sha256 de los bytes del candidato.
+            async downloadStorageObject() { return MBZ_OLD; } },
           manifests: { async getById() { return { id: 1, blueprintNumber: 1, rulesVersion: 2, manifest: { items: [] } }; } },
           blueprints: { async getByNumber() { return { snapshot: {} }; } },
           buildPlan: () => ({ planVersion: 1, manifestId: 1, course: { id: 1, title: 'x', summary: null }, sections: [], modules: [], totals: {} }),
@@ -971,8 +974,12 @@ const ENV_KEYS = [
       const fin = await runJob({});
       eq(['qaPreviewNotice' in fin.built[0], fin.uploads[0].storagePath, fin.uploads[0].filename, 'packageKind' in fin.uploads[0].metadata, 'packageKind' in fin.dsF.st.completed[0]],
         [false, `owner-1/dynamic/fc/1/dynamic_mbz/run-1/${hash}.mbz`, `${hash}.mbz`, false, false], 'final: como siempre');
-      const finalArt = { id: 'final-old', metadata: { runId: 'run-1', sourceIdsHash: hash, builderVersion: DYNAMIC_MBZ_BUILDER_VERSION, moodleVersion: '4.1' } };
-      const qaArt = { id: 'qa-old', metadata: { ...finalArt.metadata, packageKind: 'degraded', deliverable: false } };
+      // r58 (AU1 R1): un .mbz reutilizable es del servidor — ruta canónica + checksum de sus bytes.
+      const oldSha = require('crypto').createHash('sha256').update(MBZ_OLD).digest('hex');
+      const finalArt = { id: 'final-old', storageBucket: 'cursia-artifacts', storagePath: `owner-1/dynamic/fc/1/dynamic_mbz/run-1/${hash}.mbz`, checksumSha256: oldSha,
+        metadata: { runId: 'run-1', manifestId: 1, sourceIdsHash: hash, builderVersion: DYNAMIC_MBZ_BUILDER_VERSION, moodleVersion: '4.1' } };
+      const qaArt = { id: 'qa-old', storageBucket: 'cursia-artifacts', storagePath: `qa-internal/owner-1/dynamic/fc/1/dynamic_mbz/run-1/QA-VISTA-PREVIA-${hash}.mbz`, checksumSha256: oldSha,
+        metadata: { ...finalArt.metadata, packageKind: 'degraded', deliverable: false } };
       const qa2 = await runJob({ packageKind: 'degraded' }, [finalArt]);
       eq([qa2.built.length, qa2.uploads.length], [1, 1], 'un QA nunca reutiliza el .mbz final');
       const qa3 = await runJob({ packageKind: 'degraded' }, [finalArt, qaArt]);

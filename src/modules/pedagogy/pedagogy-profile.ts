@@ -1,5 +1,6 @@
 import { sha256Canonical } from '../coherence/canonical-json';
 import { TARGET_HOURS_MAX, TARGET_HOURS_MIN, isValidTargetHours } from '../study-time/target-hours';
+import { HoursModelOverride, canonicalHoursModel } from '../study-time/time-model-config';
 import { PracticeMixSpec, normalizePracticeMixSpec, practiceMixSpecErrors } from '../study-time/practice-mix';
 import { PedagogicalApproachRegistry } from './approach-registry';
 import { defaultApproachRegistry } from './builtin-approaches';
@@ -86,6 +87,12 @@ export interface PedagogicalProfile {
    * el diseño es byte a byte el de antes). Requiere enfoque principal.
    */
   learningPlan?: LearningPlanConfig;
+  /**
+   * r58 (I3) · Configuración propia del modelo de tiempo (tasas, minutos acreditados por nivel, horas por crédito,
+   * mapeo de componentes del documento). Opcional: la clave existe SOLO si se definió (perfiles anteriores conservan su
+   * sha y el diseño es byte a byte el de antes). Puede ir en un perfil sin enfoque. Se congela en el Blueprint.
+   */
+  hoursModel?: HoursModelOverride;
 }
 
 /** T2 (r57): configuración del plan de aprendizaje (en el perfil pedagógico del curso). */
@@ -263,7 +270,7 @@ const TOP_KEYS = [
 /** `designRules` lo escribe el servidor: se tolera en la entrada (se ignora y se recalcula). */
 const TOLERATED_KEYS = ['designRules'];
 /** Claves opcionales (ausentes = comportamiento anterior). */
-const OPTIONAL_KEYS = ['targetHours', 'designPreferences', 'learningPlan'];
+const OPTIONAL_KEYS = ['targetHours', 'designPreferences', 'learningPlan', 'hoursModel'];
 const DESIGN_EMPHASES_ALLOWED = ['application', 'balanced', 'depth'];
 const APPLICATION_MODES_ALLOWED = ['auto', 'practice_only', 'none'];
 /** LOOP 8.3: prioridad audiovisual (sin valor por defecto: ausente = comportamiento anterior, por eso se guarda tal cual). */
@@ -313,6 +320,19 @@ export function profileTargetHours(p: unknown): number | null {
   }
   return p.targetHours;
 }
+/**
+ * r58 (I3): configuración propia del modelo de tiempo de un perfil (con o sin enfoque), en forma canónica. null = sin
+ * configuración (el default de siempre). Un valor inválido lanza PROFILE_INVALID (nunca se ignora en silencio).
+ */
+export function profileHoursModel(p: unknown): HoursModelOverride | null {
+  if (!isPlainObject(p) || p.hoursModel === undefined || p.hoursModel === null) return null;
+  try {
+    return canonicalHoursModel(p.hoursModel);
+  } catch (e) {
+    throw new Error(`PROFILE_INVALID: INVALID_HOURS_MODEL hoursModel: ${(e as Error).message}`);
+  }
+}
+
 /**
  * Fase 2 · Actividades de Aplicación: estudiante + resultados de aprendizaje del perfil (lo que el Blueprint congela
  * en course.applicationContext). null sin perfil.
@@ -400,6 +420,13 @@ export function validatePedagogicalProfile(
   }
   if ('designPreferences' in p && p.designPreferences !== null) checkDesignPreferences(p.designPreferences, errors);
   if ('learningPlan' in p && p.learningPlan !== null) checkLearningPlan(p.learningPlan, p, errors, defaultFrameworkRegistry());
+  if ('hoursModel' in p && p.hoursModel !== null) {
+    try {
+      canonicalHoursModel(p.hoursModel);
+    } catch (e) {
+      err('hoursModel', 'INVALID_HOURS_MODEL', (e as Error).message);
+    }
+  }
   return errors;
 }
 
@@ -494,6 +521,8 @@ export function normalizePedagogicalProfile(
     })(),
     // T2 (r57): solo si se activó (sin plan: bytes y sha de siempre).
     ...((q as any).learningPlan ? { learningPlan: normalizeLearningPlan((q as any).learningPlan) } : {}),
+    // r58 (I3): solo si se definió (sin configuración: bytes y sha de siempre).
+    ...((q as any).hoursModel ? { hoursModel: canonicalHoursModel((q as any).hoursModel) as HoursModelOverride } : {}),
   };
 }
 

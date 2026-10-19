@@ -61,6 +61,7 @@ import {
   sweepRunExpiredLeases,
 } from './item-transitions';
 import { latestGenerationPredicate } from './item-generations';
+import { LLM_MODE_INVALID, combineLlmModes, isNonRealLlmMode } from '../artifacts/artifact-type-policy';
 import { artifactOutputIdentity } from '../invalidation/invalidation-apply';
 import {
   FINAL_EXAM_QUESTION_RANGE,
@@ -85,6 +86,7 @@ import {
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
 import { ItemPedagogyBrief, buildItemPedagogyBrief } from '../pedagogy/generator-directives';
 import { ANSWER_BIAS_POOL_ITEM_TYPES, AnswerBiasPool, answerBiasPoolFrom } from '../quality/answer-bias-pool';
+import { VIDEO_MC_COURSE_BIAS_CODE, videoMcCourseRecheck } from '../quality/answer-length-bias';
 import {
   APPLICATION_DRAFT_ARTIFACT_TYPE, EXAM_BANK_DRAFT_ARTIFACT_TYPE, ITEM_DRAFT_SUMMARY_KEYS,
   clearApplicationDraft, clearExamBankDraft, recordApplicationDraft, recordExamBankDraft,
@@ -305,7 +307,11 @@ export interface ClaimPayloadV3 {
    * Fase 2: Actividad de Aplicación. `minutes` = nivel del Manifest (la actividad se dimensiona con él);
    * `context` = estudiante + resultados de aprendizaje CONGELADOS en el Blueprint (null si el perfil no los define).
    */
-  application?: { minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string };
+  application?: {
+    minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string;
+    /** r58 (I4-3): archivos de trabajo adjuntos del capítulo (solo si hay). */
+    practiceFiles?: Array<{ title: string; filename: string; instructions: string; relation: string }>;
+  };
   /**
    * Loop 9 B: práctica guiada del capítulo de contenido. `minutes` = nivel del Manifest; `exercises` = plan de Cursia
    * (ids E1.. y minutos de cada ejercicio, que el ejecutor copia tal cual); `context` = estudiante + resultados
@@ -473,9 +479,20 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'mode', 'videoMode', 'videoModeOriginal', 'external', 'externalReservationKey', 'externalSubmitStartedAt',
   'delivery', 'youtubeVideoId', 'youtubeUrl', 'youtubeUploadStartedAt', 'videogenStatus', 'videogenDownloadUrl',
   'videoIdentity', 'v3Validation', 'artifactIds',
+  // r58 (I4-1): rechazos del re-chequeo de sesgo de las MC de video (lo escribe solo el servidor al fallar el item).
+  'answerBiasRecheck',
   // REL CREDIT: estado de la sonda del proveedor (lo escribe solo el barrido / retryItem).
   'providerProbe',
 ]);
+
+/** r58 (I4-3): archivos de trabajo de UN capítulo en un perfil de evaluación (los del claim de la Actividad de Aplicación). */
+export function practiceFilesOfProfile(profile: unknown, chapterId: string): Array<{ title: string; filename: string; instructions: string; relation: string }> {
+  const list: any[] = Array.isArray((profile as any)?.practiceResources) ? (profile as any).practiceResources : [];
+  return list
+    .filter((r) => r && r.chapterId === chapterId && typeof r?.source?.filename === 'string')
+    .slice(0, 10)
+    .map((r) => ({ title: String(r.title ?? '').slice(0, 160), filename: String(r.source.filename), instructions: String(r.instructions ?? '').slice(0, 400), relation: r.relation === 'chapter' ? 'chapter' : 'application' }));
+}
 
 /** `summary` del ejecutor del navegador sin las claves del servidor (y la lista de las descartadas). */
 export function stripServerOwnedSummaryKeys(summary: Record<string, any>): { summary: Record<string, any>; dropped: string[] } {
@@ -1004,8 +1021,11 @@ export class SchedulerService {
     const ids = [...new Set((output?.artifactIds ?? []).map(String))];
     if (ids.length === 0) return { ok: false, reason: 'no_artifacts' };
     if (ids.some((id) => !UUID_RE.test(id))) return { ok: false, reason: 'invalid_artifact_id' };
-    const rawSummary = output?.summary ?? {};
-    if (!isPlainObject(rawSummary)) return { ok: false, reason: 'invalid_summary' };
+    const summaryIn = output?.summary ?? {};
+    if (!isPlainObject(summaryIn)) return { ok: false, reason: 'invalid_summary' };
+    // r58 (AU1 R2): `llmMode` lo decide el servidor (abajo, con la metadata de los artifacts); lo que declara el
+    // ejecutor solo cuenta como una declaración más (puede degradar la procedencia, nunca subirla a real).
+    const { llmMode: claimedLlmMode, ...rawSummary } = summaryIn as Record<string, any>;
     // m-11: el ejecutor del navegador (ownerId presente) nunca fija claves del servidor.
     let summary: Record<string, any> = rawSummary;
     if (ownerId !== undefined) {
@@ -1024,7 +1044,7 @@ export class SchedulerService {
       // transitoria: para exam/final_exam borra el borrador del banco (null explícito; no-op para otros tipos),
       // así un ejecutor con reglas viejas no reanuda una y otra vez una pregunta que el servidor rechaza.
       // O2b: ídem el borrador de la actividad de aplicación (no-op para otros tipos).
-      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null, applicationDraftArtifactId: null });
+      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null, applicationDraftArtifactId: null, ...(pre.answerBiasRejection ? { answerBiasRejection: true } : {}) });
       return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
     }
     const validationPatch =
@@ -1040,7 +1060,11 @@ export class SchedulerService {
           throw new GuardRejection('artifact_changed_after_validation');
         }
       }
-      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...validationPatch, artifactIds: ids });
+      // r58 (I4-1): las señales de sesgo que entran al acumulado del curso son las del SERVIDOR (nunca las declaradas).
+      const biasPatch = pre.kind === 'valid' && pre.answerBiasSignals
+        ? { answerBias: { ...(isPlainObject(summary.answerBias) ? summary.answerBias : {}), signals: pre.answerBiasSignals } }
+        : {};
+      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...biasPatch, ...validationPatch, artifactIds: ids });
       if (merged.ok === false) throw new GuardRejection(merged.reason);
 
       // Spec §3.3 / R16: un artifact por item y rol (type). Se rechaza antes
@@ -1071,6 +1095,18 @@ export class SchedulerService {
         throw err;
       }
       if (linked.length !== ids.length) throw new GuardRejection('artifacts_not_linkable');
+
+      // r58 (AU1 R2): procedencia del texto de IA del item = la peor de lo declarado (resumen + metadata.llmMode
+      // de cada artifact vinculado). Solo se escribe si NO es real (mock | replay): un item real queda con el
+      // output_summary de siempre. Un valor desconocido → rechazo (nunca se lo trata como real).
+      const llmRows: Array<{ llm_mode: string | null }> = await qr.query(
+        `select metadata->>'llmMode' as llm_mode from public.artifacts where id = any($1::uuid[])`,
+        [ids],
+      );
+      const llm = combineLlmModes([claimedLlmMode, ...(Array.isArray(llmRows) ? llmRows : []).map((r) => r?.llm_mode)]);
+      if (llm.ok === false) throw new GuardRejection(LLM_MODE_INVALID);
+      if (isNonRealLlmMode(llm.mode)) merged.merged.llmMode = llm.mode;
+      else delete (merged.merged as Record<string, unknown>).llmMode;
 
       // M1 (review-rv2): en rulesVersion 2 un item solo se completa con TODOS
       // sus roles obligatorios (misma tabla que el resolver de empaquetado:
@@ -1201,6 +1237,8 @@ export class SchedulerService {
     opts?: {
       retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean;
       examBankDraftArtifactId?: string | null; applicationDraftArtifactId?: string | null; errorCode?: string | null;
+      /** r58 (I4-1): el rechazo vino del re-chequeo de sesgo de video del servidor → se cuenta en output_summary.answerBiasRecheck. */
+      answerBiasRejection?: boolean;
     },
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
@@ -1218,6 +1256,15 @@ export class SchedulerService {
       const ad = await recordApplicationDraft(qr, item, job.owner_id, opts?.applicationDraftArtifactId ?? null, !!retryable);
       if (ad.recorded === false && opts?.applicationDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador de la actividad ignorado (${ad.reason})`);
       if (ad.recorded === false && opts?.applicationDraftArtifactId === null) await clearApplicationDraft(qr, item);
+      if (opts?.answerBiasRejection === true) {
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('answerBiasRecheck',
+                    jsonb_build_object('rejections', coalesce((output_summary -> 'answerBiasRecheck' ->> 'rejections')::int, 0) + 1))
+            where id = $1`,
+          [item.id],
+        );
+      }
       // Loop de costos (review I2): conceder el intento por una devolución `run_paused` solo si el run está pausado.
       const grant = opts?.grantAttempt === true && (!msg.startsWith('run_paused') || isPausedRun(job));
       const t = await applyItemFailure(
@@ -1349,6 +1396,106 @@ export class SchedulerService {
     return v3LanguageErrors(text);
   }
 
+  /**
+   * r58 (I1): contexto del validador v3 de un item (lo que exige el Manifest congelado), separado de prevalidateV3 sin
+   * cambios. Las lecturas pasan por métodos de la instancia (loadExamChapterMd, guidedPracticeAvoidFor, loadVideoFacts,
+   * manifestBlueprintSnapshot): el driver offline los da en memoria y valida con EXACTAMENTE este contexto.
+   */
+  private async v3ValidationContext(
+    g: { id?: string; job_id: string; manifest_id: number; item_key: string; type: string; chapter_id: string | null; module_id: string | null; owner_id: string },
+    mItem: any,
+    manifest: any,
+    o: { promptVersion: string | null; artifactType: string; languageCourse: boolean },
+  ): Promise<{ kind: 'ctx'; ctx: Parameters<typeof validateV3ItemArtifact>[0] } | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean }> {
+    const { promptVersion, artifactType, languageCourse } = o;
+    const ctx: Parameters<typeof validateV3ItemArtifact>[0] = {
+      type: g.type,
+      variant: mItem.variant ?? null,
+      itemKey: g.item_key,
+      chapterId: g.chapter_id ?? null,
+      chapterNumber: mItem.chapterNumber ?? null,
+      promptVersion,
+      artifactType,
+      languageCourse,
+    };
+    if (g.type === 'exam' || g.type === 'final_exam') {
+      // EV6 P2: el plan del banco sale de los capítulos del Manifest congelado.
+      ctx.examChapters = examChaptersFromManifest(manifest, g.type, g.module_id ?? mItem.moduleId ?? null);
+      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && ctx.examChapters.length === 0) {
+        throw new InternalServerErrorException(`v3_validation_context: el ${g.type} ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
+      }
+      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && this.v3Reader) {
+        // Fix 1 (I1): la evidencia se verifica YA contra el dynamic_content_md vigente de cada capítulo
+        // (dependencias completadas del item): una evidencia falsa falla el item (reintentable, el
+        // ejecutor repara) en vez de trabar el empaque más tarde.
+        ctx.examChapterMd = await this.loadExamChapterMd(g, ctx.examChapters.map((c) => c.id));
+      }
+    }
+    if (g.type === 'activity') {
+      // EV5-C: tipo esperado del Manifest congelado del run (h5pType o, legacy, hash).
+      const rules = manifest?.features?.activityTypeRules;
+      ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null }, { activityTypeRules: rules });
+      // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
+      if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
+    }
+    if (g.type === 'experience' && mItem.design && typeof mItem.design.framework === 'string') {
+      // T2 (r57): requisitos del marco instruccional del Manifest congelado (solo capítulos de contenido; los de
+      // práctica tienen su propia forma). Mismo cálculo que el brief del claim (learningPlanExperienceRequirements).
+      const mc = (manifest.modules ?? []).flatMap((m: any) => m.chapters ?? []).find((c: any) => c.chapterId === g.chapter_id);
+      if (mc && mc.kind !== 'practice') {
+        const reqs = learningPlanExperienceRequirements(mItem.design);
+        if (reqs.length) ctx.experienceRequirements = reqs;
+      }
+    }
+    if (g.type === 'application_activity') {
+      // Fase 2: los minutos salen del item del Manifest congelado (nunca del ejecutor).
+      ctx.applicationMinutes = typeof mItem.applicationMinutes === 'number' ? mItem.applicationMinutes : null;
+      if (ctx.applicationMinutes === null) {
+        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin applicationMinutes en el Manifest; no se completa sin validar`);
+      }
+    }
+    if (g.type === 'guided_practice') {
+      // Loop 9 B: los minutos salen del item del Manifest congelado (nunca del ejecutor).
+      ctx.guidedPracticeMinutes = typeof mItem.guidedPracticeMinutes === 'number' ? mItem.guidedPracticeMinutes : null;
+      if (ctx.guidedPracticeMinutes === null) {
+        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin guidedPracticeMinutes en el Manifest; no se completa sin validar`);
+      }
+      // Fix N1: el choque duro con los casos del módulo (práctica + AA) lo verifica el servidor, con el Blueprint del run.
+      const snap = await this.manifestBlueprintSnapshot(g.manifest_id);
+      ctx.guidedPracticeAvoid = await this.guidedPracticeAvoidFor(this.dataSource, g.job_id, g.manifest_id, manifest, snap, g.chapter_id);
+    }
+    if (g.type === 'module_intro') {
+      const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
+      ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
+      if (ctx.moduleChapterIds.length === 0) {
+        throw new InternalServerErrorException(`v3_validation_context: el module_intro ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
+      }
+    }
+    if (g.type === 'video_interactions') {
+      const ivAdvanced = manifest?.features?.ivAdvanced === 1;
+      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`, ivAdvanced);
+      if (vf.ok === false) {
+        // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
+        return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true } as const;
+      }
+      ctx.video = { videoItemKey: vf.video.videoItemKey, durationSec: vf.video.durationSec };
+      // EV6 IV avanzado: schemaVersion 2 (pausas validadas contra la duración MEDIDA del video).
+      if (ivAdvanced) ctx.videoInteractionsSchemaVersion = 2;
+    }
+    return { kind: 'ctx', ctx } as const;
+  }
+
+  /** Blueprint congelado (snapshot_json) del Manifest; null si no existe. */
+  private async manifestBlueprintSnapshot(manifestId: number): Promise<any> {
+    const [bp] = await this.dataSource.query(
+      `select b.snapshot_json from public.course_generation_manifests m
+         join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
+        where m.id = $1`,
+      [manifestId],
+    );
+    return bp ? (typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json) : null;
+  }
+
   private async prevalidateV3(
     itemRunId: string,
     executorId: string,
@@ -1357,9 +1504,11 @@ export class SchedulerService {
     promptVersion: string | null = null,
   ): Promise<
     | { kind: 'skip' }
-    | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean }
+    | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean; answerBiasRejection?: true }
     | {
         kind: 'valid';
+        /** r58 (I4-1): señales de sesgo calculadas por el SERVIDOR (video_interactions); reemplazan las del ejecutor. */
+        answerBiasSignals?: { k: 'video_interactions'; ranks: Array<{ m: number; r: number }>; tf: boolean[] };
         artifactType: string;
         artifactId: string;
         storageBucket: string;
@@ -1371,6 +1520,7 @@ export class SchedulerService {
     if (!UUID_RE.test(String(itemRunId))) return { kind: 'skip' };
     const [g] = await this.dataSource.query(
       `select g.id, g.job_id, g.manifest_id, g.item_key, g.type, g.status, g.worker_id, g.chapter_id, g.module_id,
+              g.output_summary -> 'answerBiasRecheck' ->> 'rejections' as answer_bias_rejections,
               pj.owner_id, pj.course_id as job_course_id, pj.frontend_course_id, m.rules_version, m.manifest_json
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
@@ -1425,86 +1575,9 @@ export class SchedulerService {
       );
     }
 
-    const ctx: Parameters<typeof validateV3ItemArtifact>[0] = {
-      type: g.type,
-      variant: mItem.variant ?? null,
-      itemKey: g.item_key,
-      chapterId: g.chapter_id ?? null,
-      chapterNumber: mItem.chapterNumber ?? null,
-      promptVersion,
-      artifactType,
-      languageCourse,
-    };
-    if (g.type === 'exam' || g.type === 'final_exam') {
-      // EV6 P2: el plan del banco sale de los capítulos del Manifest congelado.
-      ctx.examChapters = examChaptersFromManifest(manifest, g.type, g.module_id ?? mItem.moduleId ?? null);
-      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && ctx.examChapters.length === 0) {
-        throw new InternalServerErrorException(`v3_validation_context: el ${g.type} ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
-      }
-      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && this.v3Reader) {
-        // Fix 1 (I1): la evidencia se verifica YA contra el dynamic_content_md vigente de cada capítulo
-        // (dependencias completadas del item): una evidencia falsa falla el item (reintentable, el
-        // ejecutor repara) en vez de trabar el empaque más tarde.
-        ctx.examChapterMd = await this.loadExamChapterMd(g, ctx.examChapters.map((c) => c.id));
-      }
-    }
-    if (g.type === 'activity') {
-      // EV5-C: tipo esperado del Manifest congelado del run (h5pType o, legacy, hash).
-      const rules = manifest?.features?.activityTypeRules;
-      ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null }, { activityTypeRules: rules });
-      // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
-      if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
-    }
-    if (g.type === 'experience' && mItem.design && typeof mItem.design.framework === 'string') {
-      // T2 (r57): requisitos del marco instruccional del Manifest congelado (solo capítulos de contenido; los de
-      // práctica tienen su propia forma). Mismo cálculo que el brief del claim (learningPlanExperienceRequirements).
-      const mc = (manifest.modules ?? []).flatMap((m: any) => m.chapters ?? []).find((c: any) => c.chapterId === g.chapter_id);
-      if (mc && mc.kind !== 'practice') {
-        const reqs = learningPlanExperienceRequirements(mItem.design);
-        if (reqs.length) ctx.experienceRequirements = reqs;
-      }
-    }
-    if (g.type === 'application_activity') {
-      // Fase 2: los minutos salen del item del Manifest congelado (nunca del ejecutor).
-      ctx.applicationMinutes = typeof mItem.applicationMinutes === 'number' ? mItem.applicationMinutes : null;
-      if (ctx.applicationMinutes === null) {
-        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin applicationMinutes en el Manifest; no se completa sin validar`);
-      }
-    }
-    if (g.type === 'guided_practice') {
-      // Loop 9 B: los minutos salen del item del Manifest congelado (nunca del ejecutor).
-      ctx.guidedPracticeMinutes = typeof mItem.guidedPracticeMinutes === 'number' ? mItem.guidedPracticeMinutes : null;
-      if (ctx.guidedPracticeMinutes === null) {
-        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin guidedPracticeMinutes en el Manifest; no se completa sin validar`);
-      }
-      // Fix N1: el choque duro con los casos del módulo (práctica + AA) lo verifica el servidor, con el Blueprint del run.
-      const [bp] = await this.dataSource.query(
-        `select b.snapshot_json from public.course_generation_manifests m
-           join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
-          where m.id = $1`,
-        [g.manifest_id],
-      );
-      const snap = bp ? (typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json) : null;
-      ctx.guidedPracticeAvoid = await this.guidedPracticeAvoidFor(this.dataSource, g.job_id, g.manifest_id, manifest, snap, g.chapter_id);
-    }
-    if (g.type === 'module_intro') {
-      const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
-      ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
-      if (ctx.moduleChapterIds.length === 0) {
-        throw new InternalServerErrorException(`v3_validation_context: el module_intro ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
-      }
-    }
-    if (g.type === 'video_interactions') {
-      const ivAdvanced = manifest?.features?.ivAdvanced === 1;
-      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`, ivAdvanced);
-      if (vf.ok === false) {
-        // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
-        return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true };
-      }
-      ctx.video = { videoItemKey: vf.video.videoItemKey, durationSec: vf.video.durationSec };
-      // EV6 IV avanzado: schemaVersion 2 (pausas validadas contra la duración MEDIDA del video).
-      if (ivAdvanced) ctx.videoInteractionsSchemaVersion = 2;
-    }
+    const built = await this.v3ValidationContext(g, mItem, manifest, { promptVersion, artifactType, languageCourse });
+    if (built.kind === 'invalid') return built;
+    const ctx = built.ctx;
 
     let text: string;
     try {
@@ -1533,7 +1606,26 @@ export class SchedulerService {
         retryable: true,
       };
     }
+    // r58 (I4-1): re-chequeo del sesgo «la correcta es la más larga» de las MC de video del CURSO con señales persistidas
+    // (los demás videos completados del run) y las del item calculadas acá. Un rechazo reintentable; después, aceptación
+    // blanda registrada (mismo camino de reparación que el ejecutor). Sin pool → solo se registran las señales.
+    let answerBiasSignals: { k: 'video_interactions'; ranks: Array<{ m: number; r: number }>; tf: boolean[] } | undefined;
+    const extraSummary: Record<string, unknown> = {};
+    if (g.type === 'video_interactions') {
+      let doc: unknown = null;
+      try { doc = JSON.parse(text); } catch { doc = null; }
+      const pool = await this.answerBiasPoolFor(this.dataSource, g.job_id, g.manifest_id, g.item_key);
+      const prior = Number.parseInt(String(g.answer_bias_rejections ?? '0'), 10) || 0;
+      const v = videoMcCourseRecheck(doc, pool, prior);
+      if (v.action === 'reject') {
+        const errors = [{ path: '$.checkpoints', code: VIDEO_MC_COURSE_BIAS_CODE, message: v.message as string }];
+        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, errors), codes: [VIDEO_MC_COURSE_BIAS_CODE], retryable: true, answerBiasRejection: true };
+      }
+      answerBiasSignals = v.signals;
+      if (v.action === 'soft_accept') extraSummary.answerBiasCourse = { ...v.course, accepted: 'soft', rejections: prior, fixPaths: v.fixPaths };
+    }
     return {
+      ...(answerBiasSignals ? { answerBiasSignals } : {}),
       kind: 'valid',
       artifactType,
       artifactId: art.id,
@@ -1541,7 +1633,7 @@ export class SchedulerService {
       storagePath: art.storage_path,
       // M7: huella del contenido validado; el empaque (R12) verifica que el objeto descargado coincida.
       contentSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
-      summary: (r.summary ?? {}) as Record<string, unknown>,
+      summary: { ...((r.summary ?? {}) as Record<string, unknown>), ...extraSummary },
     };
   }
 
@@ -1615,6 +1707,24 @@ export class SchedulerService {
     const facts = videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata, ...(ivAdvanced ? { ivAdvanced: true } : {}) });
     if (facts.ok) (facts as any).videoItemRunId = v.video_item_run_id;
     return facts;
+  }
+
+  /**
+   * r58 (I4-3): archivos de trabajo del capítulo (título, archivo, consigna) del perfil de evaluación del run.
+   * Review r1 (M-7): el perfil CONGELADO al crear el run — la última versión (append-only) con created_at ≤ la creación del
+   * run —, nunca uno editado después. El perfil de evaluación no se congela en el Blueprint ni en el Manifest (el
+   * pedagógico sí, en el lock); su punto de congelamiento es startRun, que lo valida (assertAssessmentProfileResolvableForRun).
+   * Un archivo agregado o quitado después no cambia lo que la actividad nombra; si el paquete (perfil vigente) ya no lo
+   * trae, el informe de calidad lo marca (PRACTICE_FILE_REFERENCE_UNKNOWN, MAJOR).
+   */
+  private async practiceFilesForChapter(q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, chapterId: string | null): Promise<Array<{ title: string; filename: string; instructions: string; relation: string }>> {
+    if (!chapterId) return [];
+    const [p] = await q.query(
+      `select p.data from public.course_profiles p join public.production_jobs j on j.course_id = p.course_id
+        where j.id = $1 and p.kind = 'assessment' and p.created_at <= j.created_at order by p.version desc limit 1`,
+      [jobId],
+    );
+    return practiceFilesOfProfile(p ? (typeof p.data === 'string' ? JSON.parse(p.data) : p.data) : null, chapterId);
   }
 
   /** T6 (r57): acumulado del curso para la prueba de sesgo de respuesta (señales de los items completados del run). */
@@ -1696,6 +1806,12 @@ export class SchedulerService {
         // O2b: anuncia que el fail acepta `applicationDraftArtifactId` (borrador de la actividad entre intentos).
         draftArtifactType: APPLICATION_DRAFT_ARTIFACT_TYPE,
       };
+      // r58 (I4-3): archivos de trabajo del capítulo para que la actividad los nombre tal cual (sin otra llamada a la IA).
+      // Review r1 (M-7): del perfil congelado al crear el run (no el vivo). Sin archivos → el claim queda como antes.
+      if (row.job_id) {
+        const files = await this.practiceFilesForChapter(qr, row.job_id, row.chapter_id);
+        if (files.length) out.application.practiceFiles = files;
+      }
     }
     if (row.type === 'guided_practice') {
       // Loop 9 B: minutos (nivel del diseño) y el plan de ejercicios de Cursia (ids y minutos que el ejecutor copia).
@@ -2097,144 +2213,21 @@ export class SchedulerService {
       blueprintNumber: bp.blueprint_number,
       blueprintSha256: bp.snapshot_sha256,
     };
-    const errors = validateGenerationManifest(manifest, snapshot, source);
-    if (errors.length > 0) throw fail(`Manifest inválido contra el Blueprint: ${errors.slice(0, 3).map((e) => e.code).join(', ')}`);
-
-    const mItem = manifest.items.find((i) => i.key === row.item_key);
-    if (
-      !mItem ||
-      mItem.type !== row.type ||
-      (mItem.moduleId ?? null) !== (row.module_id ?? null) ||
-      (mItem.chapterId ?? null) !== (row.chapter_id ?? null) ||
-      !sameJson(mItem.dependsOn, row.depends_on ?? [])
-    ) {
-      throw fail('el item no coincide con su entrada del Manifest');
-    }
-    // rulesVersion 2: items de scope course (course_plan, course_intro) no
-    // tienen módulo ni capítulo — module/chapter null y moduleChapters vacío.
-    // Cualquier otro item exige su módulo (como siempre).
-    const courseScope = mItem.scope === 'course';
-    if (courseScope && (row.module_id !== null || row.chapter_id !== null)) {
-      throw fail('item de scope course con module_id/chapter_id');
-    }
-    const mModule = courseScope ? null : manifest.modules.find((m) => m.moduleId === row.module_id);
-    const sModule = courseScope ? null : snapshot.modules.find((m) => m.id === row.module_id);
-    if (!courseScope && (!mModule || !sModule)) throw fail('módulo ausente en Manifest/Blueprint');
-    const sChapter = row.chapter_id && sModule ? sModule.chapters.find((c) => c.id === row.chapter_id) : null;
-    if (row.chapter_id && !sChapter) throw fail('capítulo ausente en el Blueprint');
-    const moduleChapters = !mModule
-      ? []
-      : mModule.chapters.map((mc) => {
-          const sc = sModule!.chapters.find((c) => c.id === mc.chapterId);
-          if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), chapterNumber: mc.chapterNumber, ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
-        });
-
-    // Outline del curso completo (R18), en el mismo orden en que el Manifest
-    // enumera sus módulos (manifest.modules ya está en orden de moduleNumber
-    // — ver generation-manifest-builder.ts), resuelto contra el snapshot
-    // congelado del Blueprint (misma fuente que moduleChapters arriba).
-    const outline = manifest.modules.map((mm) => {
-      const sm = snapshot.modules.find((m) => m.id === mm.moduleId);
-      if (!sm) throw fail(`módulo ${mm.moduleId} del Manifest ausente en el Blueprint`);
-      return {
-        moduleNumber: mm.moduleNumber,
-        id: sm.id,
-        title: sm.title,
-        objective: sm.objective ?? null,
-        description: descOf(sm),
-        chapters: mm.chapters.map((mc) => {
-          const sc = sm.chapters.find((c) => c.id === mc.chapterId);
-          if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
-          return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
-        }),
-      };
+    return assembleClaimedItem({
+      job, row, ctx, manifest, snapshot, source, blueprintNumber: bp.blueprint_number, artifactCourseId: this.artifactCourseId(job), fail,
+      loadDependencyArtifacts: (deps) => qr.query(
+        `select d.item_key, a.id, a.type, a.storage_path
+           from public.generation_item_runs d
+           join public.artifacts a on a.item_run_id = d.id
+          where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[])
+            and d.status = 'completed' and ${latestGenerationPredicate('d')}
+          order by array_position($3::text[], d.item_key), a.created_at, a.id`,
+        // F78-BE2: artifacts de la generación VIGENTE de cada dependencia
+        // (la que el predicado de claim exigió completed).
+        [row.job_id, row.manifest_id, deps],
+      ),
+      claimV3: (mItem) => this.buildClaimV3(qr, row, mItem, manifest, snapshot, readOnly),
     });
-
-    const deps: string[] = row.depends_on ?? [];
-    const depArtifacts =
-      deps.length === 0
-        ? []
-        : await qr.query(
-            `select d.item_key, a.id, a.type, a.storage_path
-               from public.generation_item_runs d
-               join public.artifacts a on a.item_run_id = d.id
-              where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[])
-                and d.status = 'completed' and ${latestGenerationPredicate('d')}
-              order by array_position($3::text[], d.item_key), a.created_at, a.id`,
-            // F78-BE2: artifacts de la generación VIGENTE de cada dependencia
-            // (la que el predicado de claim exigió completed).
-            [row.job_id, row.manifest_id, deps],
-          );
-
-    const v3 = await this.buildClaimV3(qr, row, mItem, manifest, snapshot, readOnly);
-
-    // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
-    // Fase 3: también con contexto académico congelado (los resultados que el item debe evidenciar van en el brief).
-    let pedagogy: ItemPedagogyBrief | null = null;
-    if (snapshot.schemaVersion === 2 && ((mItem as any).design !== undefined || (snapshot as any).course?.academicContext !== undefined)) {
-      try {
-        pedagogy = buildItemPedagogyBrief({ item: mItem as any, snapshot, activityTypeRules: (manifest as any).features?.activityTypeRules ?? null });
-      } catch (err) {
-        // Determinista (p. ej. un valor del diseño congelado sin texto de generador): el item falla visible y no
-        // reintentable en el claim, en vez de trabar el run con un 500 en cada claim (review M8).
-        throw new ClaimPayloadUnavailable('PEDAGOGY_DIRECTIVE_UNKNOWN', `no se pudo armar el brief pedagógico de ${row.item_key} (${err instanceof Error ? err.message : String(err)})`);
-      }
-    }
-
-    return {
-      itemRunId: row.id,
-      runId: job.id,
-      courseId: row.course_id,
-      frontendCourseId: job.frontend_course_id ?? null,
-      artifactCourseId: this.artifactCourseId(job),
-      manifestId: row.manifest_id,
-      blueprintId: row.blueprint_id,
-      blueprintNumber: bp.blueprint_number,
-      itemKey: row.item_key,
-      type: row.type,
-      rulesVersion: manifest.rulesVersion,
-      // V2.1 (R4): solo items activity de rulesVersion 3.
-      ...(mItem.variant !== undefined ? { variant: mItem.variant } : {}),
-      moduleId: row.module_id ?? null,
-      chapterId: row.chapter_id ?? null,
-      moduleNumber: mItem.moduleNumber ?? null,
-      chapterNumber: mItem.chapterNumber ?? null,
-      idempotencyKey: row.idempotency_key,
-      generation: row.generation,
-      dependsOn: deps,
-      attempt: row.attempt_count,
-      outputSummary: row.output_summary ?? {},
-      context: { courseContext: ctx.context, contextHash: ctx.context_hash },
-      blueprint: {
-        course: { id: snapshot.course.id, title: snapshot.course.title },
-        module: sModule
-          ? { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, description: descOf(sModule), position: sModule.position }
-          : null,
-        chapter: sChapter
-          ? {
-              id: sChapter.id,
-              title: sChapter.title,
-              objective: sChapter.objective ?? null,
-              description: descOf(sChapter),
-              position: sChapter.position,
-              videoEnabled: sChapter.videoEnabled,
-              // Loop 9 (B-extra-1): el capítulo tiene práctica guiada propia → el Libro no pide además «Actividades de Apoyo».
-              ...(guidedMinutesOfChapter(manifest, row.chapter_id) !== null ? { guidedPracticeMinutes: guidedMinutesOfChapter(manifest, row.chapter_id) } : {}),
-            }
-          : null,
-        moduleChapters,
-        outline,
-      },
-      dependencyArtifacts: depArtifacts.map((a: any) => ({
-        itemKey: a.item_key,
-        artifactId: a.id,
-        type: a.type,
-        storagePath: a.storage_path,
-      })),
-      ...(v3 ? { claimPayload: v3 } : {}),
-      ...(pedagogy ? { pedagogy } : {}),
-    };
   }
 
   /**
@@ -2285,6 +2278,153 @@ export class SchedulerService {
       throw fail(`snapshot del Blueprint inválido (${err instanceof Error ? err.message : String(err)})`);
     }
   }
+}
+
+/**
+ * r58 (I1): la parte PURA de buildClaimedItem — del contexto, Manifest y Blueprint ya leídos y verificados (hash) al
+ * ClaimedItem, con las mismas comprobaciones de integridad y en el mismo orden. El claim real (scheduler) y el driver
+ * offline de componentes (scripts/lib/offline-driver.js) usan ESTA función: mismo payload, sin DB en el driver. Las
+ * dependencias y el bloque v3 llegan por callback para conservar el orden original de lecturas y errores.
+ */
+export async function assembleClaimedItem(a: {
+  job: any;
+  row: any;
+  ctx: { context: any; context_hash: string };
+  manifest: GenerationManifestV1;
+  snapshot: AnyBlueprintSnapshot;
+  source: { courseId: number; blueprintId: number; blueprintNumber: number; blueprintSha256: string };
+  blueprintNumber: number;
+  artifactCourseId: string;
+  fail: (msg: string) => Error;
+  loadDependencyArtifacts: (deps: string[]) => Promise<any[]>;
+  claimV3: (mItem: any) => Promise<ClaimPayloadV3 | undefined>;
+}): Promise<ClaimedItem> {
+  const { job, row, ctx, manifest, snapshot, source, fail } = a;
+  const errors = validateGenerationManifest(manifest, snapshot, source);
+  if (errors.length > 0) throw fail(`Manifest inválido contra el Blueprint: ${errors.slice(0, 3).map((e) => e.code).join(', ')}`);
+
+  const mItem = manifest.items.find((i) => i.key === row.item_key);
+  if (
+    !mItem ||
+    mItem.type !== row.type ||
+    (mItem.moduleId ?? null) !== (row.module_id ?? null) ||
+    (mItem.chapterId ?? null) !== (row.chapter_id ?? null) ||
+    !sameJson(mItem.dependsOn, row.depends_on ?? [])
+  ) {
+    throw fail('el item no coincide con su entrada del Manifest');
+  }
+  // rulesVersion 2: items de scope course (course_plan, course_intro) no
+  // tienen módulo ni capítulo — module/chapter null y moduleChapters vacío.
+  // Cualquier otro item exige su módulo (como siempre).
+  const courseScope = mItem.scope === 'course';
+  if (courseScope && (row.module_id !== null || row.chapter_id !== null)) {
+    throw fail('item de scope course con module_id/chapter_id');
+  }
+  const mModule = courseScope ? null : manifest.modules.find((m) => m.moduleId === row.module_id);
+  const sModule = courseScope ? null : snapshot.modules.find((m) => m.id === row.module_id);
+  if (!courseScope && (!mModule || !sModule)) throw fail('módulo ausente en Manifest/Blueprint');
+  const sChapter = row.chapter_id && sModule ? sModule.chapters.find((c) => c.id === row.chapter_id) : null;
+  if (row.chapter_id && !sChapter) throw fail('capítulo ausente en el Blueprint');
+  const moduleChapters = !mModule
+    ? []
+    : mModule.chapters.map((mc) => {
+        const sc = sModule!.chapters.find((c) => c.id === mc.chapterId);
+        if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
+        return { id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), chapterNumber: mc.chapterNumber, ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
+      });
+
+  // Outline del curso completo (R18), en el mismo orden en que el Manifest
+  // enumera sus módulos (manifest.modules ya está en orden de moduleNumber
+  // — ver generation-manifest-builder.ts), resuelto contra el snapshot
+  // congelado del Blueprint (misma fuente que moduleChapters arriba).
+  const outline = manifest.modules.map((mm) => {
+    const sm = snapshot.modules.find((m) => m.id === mm.moduleId);
+    if (!sm) throw fail(`módulo ${mm.moduleId} del Manifest ausente en el Blueprint`);
+    return {
+      moduleNumber: mm.moduleNumber,
+      id: sm.id,
+      title: sm.title,
+      objective: sm.objective ?? null,
+      description: descOf(sm),
+      chapters: mm.chapters.map((mc) => {
+        const sc = sm.chapters.find((c) => c.id === mc.chapterId);
+        if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
+        return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
+      }),
+    };
+  });
+
+  const deps: string[] = row.depends_on ?? [];
+  const depArtifacts = deps.length === 0 ? [] : await a.loadDependencyArtifacts(deps);
+
+  const v3 = await a.claimV3(mItem);
+
+  // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
+  // Fase 3: también con contexto académico congelado (los resultados que el item debe evidenciar van en el brief).
+  let pedagogy: ItemPedagogyBrief | null = null;
+  if (snapshot.schemaVersion === 2 && ((mItem as any).design !== undefined || (snapshot as any).course?.academicContext !== undefined)) {
+    try {
+      pedagogy = buildItemPedagogyBrief({ item: mItem as any, snapshot, activityTypeRules: (manifest as any).features?.activityTypeRules ?? null });
+    } catch (err) {
+      // Determinista (p. ej. un valor del diseño congelado sin texto de generador): el item falla visible y no
+      // reintentable en el claim, en vez de trabar el run con un 500 en cada claim (review M8).
+      throw new ClaimPayloadUnavailable('PEDAGOGY_DIRECTIVE_UNKNOWN', `no se pudo armar el brief pedagógico de ${row.item_key} (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+
+  return {
+    itemRunId: row.id,
+    runId: job.id,
+    courseId: row.course_id,
+    frontendCourseId: job.frontend_course_id ?? null,
+    artifactCourseId: a.artifactCourseId,
+    manifestId: row.manifest_id,
+    blueprintId: row.blueprint_id,
+    blueprintNumber: a.blueprintNumber,
+    itemKey: row.item_key,
+    type: row.type,
+    rulesVersion: manifest.rulesVersion,
+    // V2.1 (R4): solo items activity de rulesVersion 3.
+    ...(mItem.variant !== undefined ? { variant: mItem.variant } : {}),
+    moduleId: row.module_id ?? null,
+    chapterId: row.chapter_id ?? null,
+    moduleNumber: mItem.moduleNumber ?? null,
+    chapterNumber: mItem.chapterNumber ?? null,
+    idempotencyKey: row.idempotency_key,
+    generation: row.generation,
+    dependsOn: deps,
+    attempt: row.attempt_count,
+    outputSummary: row.output_summary ?? {},
+    context: { courseContext: ctx.context, contextHash: ctx.context_hash },
+    blueprint: {
+      course: { id: snapshot.course.id, title: snapshot.course.title },
+      module: sModule
+        ? { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, description: descOf(sModule), position: sModule.position }
+        : null,
+      chapter: sChapter
+        ? {
+            id: sChapter.id,
+            title: sChapter.title,
+            objective: sChapter.objective ?? null,
+            description: descOf(sChapter),
+            position: sChapter.position,
+            videoEnabled: sChapter.videoEnabled,
+            // Loop 9 (B-extra-1): el capítulo tiene práctica guiada propia → el Libro no pide además «Actividades de Apoyo».
+            ...(guidedMinutesOfChapter(manifest, row.chapter_id) !== null ? { guidedPracticeMinutes: guidedMinutesOfChapter(manifest, row.chapter_id) } : {}),
+          }
+        : null,
+      moduleChapters,
+      outline,
+    },
+    dependencyArtifacts: depArtifacts.map((a: any) => ({
+      itemKey: a.item_key,
+      artifactId: a.id,
+      type: a.type,
+      storagePath: a.storage_path,
+    })),
+    ...(v3 ? { claimPayload: v3 } : {}),
+    ...(pedagogy ? { pedagogy } : {}),
+  };
 }
 
 /** REL R1: origen de un fallo según quién ejecuta el item (navegador = ownerId presente). */

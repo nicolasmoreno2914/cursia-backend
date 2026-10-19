@@ -1,10 +1,13 @@
-import { ForbiddenException, Injectable, NotFoundException, Logger } from '@nestjs/common';
+import { createHash } from 'crypto';
+import { BadRequestException, ForbiddenException, Injectable, NotFoundException, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConfigService } from '@nestjs/config';
 import { Artifact } from './entities/artifact.entity';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { isAdminOnlyPackageArtifact } from '../dynamic-packaging/qa-package';
+import { ARTIFACT_TYPE_SERVER_ONLY, LLM_MODES, LLM_MODE_INVALID, isLlmMode, isServerOnlyArtifactType } from './artifact-type-policy';
+import { PRACTICE_FILE_INVALID_CODE, PRACTICE_FILE_TYPE, PRACTICE_FILE_UNVERIFIABLE_CODE, practiceFileBytesErrors, practiceFileDeclarationErrors } from './practice-file-attach';
 
 export interface UploadJsonArtifactInput {
   ownerId: string;
@@ -47,6 +50,25 @@ export interface UploadBufferArtifactInput {
    * original del upload. Default false (comportamiento previo).
    */
   adoptExistingOnConflict?: boolean;
+  /**
+   * r58 (AU1 R1): con `adoptExistingOnConflict`, el objeto existente solo se adopta si sus BYTES son los que
+   * se acaban de construir (sha256 igual); si no (un objeto puesto por el dueño en su carpeta, o uno de un
+   * build anterior que ya no se verifica) se REEMPLAZA con los bytes construidos y validados — review r1 (I-1): SOLO si
+   * ningún row de `artifacts` referencia esa ruta; si alguno la referencia (bytes entregados) → PACKAGE_OBJECT_CONFLICT,
+   * nunca se sobrescribe. Lo usa el worker de empaque (`dynamic_mbz`). Default false (adopción de siempre).
+   */
+  replaceUnverifiedOnConflict?: boolean;
+}
+
+/**
+ * Review r1 (I-1): el objeto de Storage de una ruta ya referenciada por un artifact tiene otros bytes. Nunca se
+ * sobrescribe (bytes entregados); el job falla y se reintenta (el reintento elige una ruta nueva). Clase A.
+ */
+export const PACKAGE_OBJECT_CONFLICT = 'PACKAGE_OBJECT_CONFLICT';
+
+/** sha256 hex de un buffer (checksum_sha256 de los artifacts que sube el servidor). */
+export function sha256Hex(buf: Buffer): string {
+  return createHash('sha256').update(buf).digest('hex');
 }
 
 /**
@@ -169,7 +191,47 @@ export class ArtifactsService {
     if (String(dto.storage_path ?? '').split('/')[0] !== ownerId) {
       throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
     }
+    // r58 (AU1 R1): los tipos que solo crea el servidor (paquete .mbz, Gamma, TTS, video, reporte de coherencia)
+    // nunca se registran desde el cliente: un `dynamic_mbz` con metadata arbitraria se podía reutilizar como el
+    // paquete final del run sin construirlo ni validarlo.
+    if (isServerOnlyArtifactType(dto.type)) {
+      throw new ForbiddenException({
+        code: ARTIFACT_TYPE_SERVER_ONLY,
+        message: `${ARTIFACT_TYPE_SERVER_ONLY}: el tipo de artifact ${JSON.stringify(String(dto.type))} lo crea solo el servidor.`,
+      });
+    }
+    // r58 (AU1 R2): procedencia del LLM declarada por el ejecutor / driver (solo real | mock | replay).
+    const llmMode = (dto.metadata as Record<string, unknown> | undefined)?.llmMode;
+    if (llmMode !== undefined && llmMode !== null && !isLlmMode(llmMode)) {
+      throw new BadRequestException({
+        code: LLM_MODE_INVALID,
+        message: `${LLM_MODE_INVALID}: metadata.llmMode=${JSON.stringify(llmMode).slice(0, 40)} (permitidos: ${LLM_MODES.join(', ')}).`,
+      });
+    }
+    if (String(dto.type ?? '').trim() === PRACTICE_FILE_TYPE) return this.create(await this.verifiedPracticeFileDto(dto), ownerId);
     return this.create(dto, ownerId);
+  }
+
+  /**
+   * r58 (I4-2): un archivo de trabajo se valida AL ADJUNTARLO (declaración + bytes en Storage: tamaño, sha256 y firma del
+   * formato). Antes un archivo dañado o con otra extensión recién fallaba al empaquetar (PRACTICE_FILE_INVALID).
+   */
+  private async verifiedPracticeFileDto(dto: CreateArtifactDto): Promise<CreateArtifactDto> {
+    const decl = practiceFileDeclarationErrors(dto);
+    const reject = (errors: string[]) => new BadRequestException({ code: PRACTICE_FILE_INVALID_CODE, message: `${PRACTICE_FILE_INVALID_CODE}: ${errors.join('; ')}`, errors });
+    if (decl.length) throw reject(decl);
+    let bytes: Buffer;
+    try {
+      bytes = await this.downloadStorageObject(dto.storage_bucket ?? 'cursia-artifacts', dto.storage_path);
+    } catch (err) {
+      throw new ServiceUnavailableException({
+        code: PRACTICE_FILE_UNVERIFIABLE_CODE,
+        message: `${PRACTICE_FILE_UNVERIFIABLE_CODE}: no se pudo leer el archivo subido para verificarlo (${err instanceof Error ? err.message.slice(0, 160) : String(err)}); vuelve a adjuntarlo.`,
+      });
+    }
+    const v = await practiceFileBytesErrors(dto, bytes);
+    if (v.errors.length) throw reject(v.errors);
+    return { ...dto, checksum_sha256: v.sha256, size_bytes: v.size, metadata: { ...(dto.metadata ?? {}), practiceFileVerified: { sha256: v.sha256, bytes: v.size, rules: 1 } } };
   }
 
   async create(dto: CreateArtifactDto, ownerId: string): Promise<Artifact> {
@@ -254,6 +316,10 @@ export class ArtifactsService {
     const provider = input.storageProvider ?? 'supabase';
     const put = await this.putStorageObject(input);
     const metadata = put.adopted ? { ...(input.metadata ?? {}), adoptedExistingObject: true } : input.metadata ?? {};
+    // r58 (AU1 R1): el servidor registra el checksum de los bytes que quedaron en Storage (los que subió, o los
+    // adoptados si se verificó que son idénticos). Un objeto adoptado sin verificar queda sin checksum (nunca se
+    // reutiliza como paquete).
+    const checksum = put.sha256 ?? null;
     return this.create(
       {
         course_id: input.courseId ?? null,
@@ -265,6 +331,7 @@ export class ArtifactsService {
         filename: input.filename,
         mime_type: input.mimeType,
         size_bytes: put.sizeBytes,
+        checksum_sha256: checksum ?? undefined,
         metadata,
       },
       input.ownerId,
@@ -278,8 +345,8 @@ export class ArtifactsService {
    * adopción de un objeto inmutable preexistente que `uploadBufferArtifact`.
    */
   async putStorageObject(
-    input: Pick<UploadBufferArtifactInput, 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict'>,
-  ): Promise<{ sizeBytes: number; adopted: boolean }> {
+    input: Pick<UploadBufferArtifactInput, 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict' | 'replaceUnverifiedOnConflict'>,
+  ): Promise<{ sizeBytes: number; adopted: boolean; sha256: string | null }> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
     const bucket = input.storageBucket ?? 'cursia-artifacts';
@@ -305,7 +372,8 @@ export class ArtifactsService {
       body: input.buffer as unknown as BodyInit,
     });
 
-    if (response.ok) return { sizeBytes: input.buffer.length, adopted: false };
+    const builtSha = sha256Hex(input.buffer);
+    if (response.ok) return { sizeBytes: input.buffer.length, adopted: false, sha256: builtSha };
     const errorText = await response.text();
     const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
     if (!(input.adoptExistingOnConflict && input.upsert === false && isStorageDuplicateResponse(response.status, errorText))) {
@@ -320,10 +388,50 @@ export class ArtifactsService {
       );
       throw uploadError;
     }
+    if (input.replaceUnverifiedOnConflict) {
+      // r58 (AU1 R1): solo se adoptan bytes IDÉNTICOS a los construidos; si no, se reemplazan (nunca se adopta
+      // un objeto que nadie verificó como el paquete del run).
+      let existingSha: string | null = null;
+      let readError: string | null = null;
+      try {
+        existingSha = sha256Hex(await this.downloadStorageObject(bucket, input.storagePath));
+      } catch (err) {
+        readError = err instanceof Error ? err.message : String(err);
+      }
+      if (existingSha === builtSha) {
+        this.logger.warn(`uploadBufferArtifact: ${input.storagePath} ya existía con los MISMOS bytes (sha256) — se adopta`);
+        return { sizeBytes: existingSize, adopted: true, sha256: builtSha };
+      }
+      // Review r1 (I-1): NUNCA se pisan bytes que un row de `artifacts` referencia (un paquete entregado). Solo se
+      // reemplaza un objeto huérfano (crash entre Storage y el insert, o puesto por el dueño en su carpeta).
+      if (await this.isStoragePathReferenced(bucket, input.storagePath)) {
+        throw new Error(
+          `${PACKAGE_OBJECT_CONFLICT}: ${bucket}/${input.storagePath} ya existe con otros bytes${readError ? ` (no se pudo leer: ${readError})` : ''} y un artifact lo referencia — nunca se sobrescribe`,
+        );
+      }
+      if (readError) this.logger.warn(`uploadBufferArtifact: no se pudo leer ${input.storagePath} para verificarlo (${readError}) — sin row que lo referencie, se reemplaza`);
+      this.logger.warn(`uploadBufferArtifact: ${input.storagePath} ya existía con OTROS bytes — se reemplaza con los construidos (PACKAGE_OBJECT_REPLACED)`);
+      const replace = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: { ...supabaseServiceHeaders(serviceKey), 'Content-Type': input.mimeType, 'x-upsert': 'true' },
+        body: input.buffer as unknown as BodyInit,
+      });
+      if (!replace.ok) throw new Error(`Supabase Storage upload failed: ${replace.status} ${await replace.text()}`);
+      return { sizeBytes: input.buffer.length, adopted: false, sha256: builtSha };
+    }
     this.logger.warn(
       `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
     );
-    return { sizeBytes: existingSize, adopted: true };
+    return { sizeBytes: existingSize, adopted: true, sha256: null };
+  }
+
+  /**
+   * Review r1 (I-1): ¿algún row de `artifacts` (de cualquier dueño) referencia este objeto de Storage? Un objeto
+   * referenciado es inmutable: el worker de empaque escribe un rebuild a OTRA ruta en vez de sobrescribirlo.
+   */
+  async isStoragePathReferenced(bucket: string, storagePath: string): Promise<boolean> {
+    const n = await this.artifactRepo.count({ where: { storagePath, storageBucket: bucket } });
+    return n > 0;
   }
 
   /**

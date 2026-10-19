@@ -32,7 +32,7 @@ const S = require('./lib/commercial-simulation');
 const CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/commercial-simulation/courses.json'), 'utf8'));
 const PHP = process.env.PHP_BIN || '/opt/homebrew/opt/php@8.3/bin/php';
 const ENV = path.join(os.homedir(), 'cursia-test-env');
-const OUT = process.env.T7_OUT_DIR || path.join(ENV, 'work/r57/t7-moodle-out');
+const OUT = (process.argv.find((a) => a.startsWith('--out=')) || '').slice(6) || process.env.T7_OUT_DIR || path.join(ENV, 'work/r57/t7-moodle-out');
 const arg = (k) => (process.argv.find((a) => a.startsWith(`--${k}=`)) || '').slice(k.length + 3).split(',').filter(Boolean);
 const onlyTargets = arg('targets');
 const onlyCourses = arg('courses');
@@ -74,6 +74,8 @@ async function acceptanceExpect(sim) {
     courseGradepass: res.courseGradepass,
     categories: res.categories.map((c) => ({ fullname: c.fullname, weight: c.weight })),
     badge: !!f.finalExam.enabled,
+    // r58 (I6): curso sin ítems calificables (r55 R3) → completion por vista del Libro Guía, sin nota.
+    withoutGrades: !!res.withoutGrades,
     assigns: insp.pages.filter((p) => p.modname === 'assign').map((p) => {
       const chId = p.idnumber.split(':')[2];
       const d = appByChapter.get(chId);

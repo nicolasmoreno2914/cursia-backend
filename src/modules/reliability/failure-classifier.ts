@@ -187,7 +187,7 @@ export const VALIDATION_INNER_CODES: readonly string[] = Object.freeze([
   'SCHEMA_VERSION', 'TEXT_DENSE', 'TEXT_EMPTY', 'TEXT_FORMAT', 'TEXT_SIMULATED_DIAGRAM', 'TEXT_TOO_LONG', 'TYPE_DIVERSITY',
   'TYPE_MISMATCH', 'TYPE_REPEATED', 'UNKNOWN_COMPONENT', 'UNKNOWN_FIELD', 'URL_IN_TEXT', 'VIDEO_DURATION_MISSING',
   'VIDEO_YOUTUBE_ID_MISSING', 'WORD_RANGE', 'FABRICATED_DATA', 'REAL_LABEL', 'OUTDATED_CLAIM', 'FOREIGN_LAW',
-  'GRAMMAR_PERSON', 'ANSWER_LENGTH_BIAS', 'TF_BALANCE', 'H5P_INPUT_INVALID', 'H5P_TYPE_NOT_GRADABLE',
+  'GRAMMAR_PERSON', 'ANSWER_LENGTH_BIAS', 'VIDEO_MC_COURSE_LENGTH_BIAS', 'TF_BALANCE', 'H5P_INPUT_INVALID', 'H5P_TYPE_NOT_GRADABLE',
   'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'VIDEO_PLAN_INVARIANT', 'VIDEO_DURATION_INVALID', 'EXAM_ARTIFACT_AMBIGUOUS',
   'GIFT_EMPTY', 'GIFT_EMPTY_QUESTION', 'GIFT_NO_QUESTIONS', 'GIFT_QUESTION_COUNT', 'GIFT_UNPARSEABLE_BLOCK',
   'EXAM_NEUROMYTH', 'PRESENTATION_CARD_SLIDE_COUNT', 'SLIDE_COUNT',
@@ -332,12 +332,20 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     codes: ['OUTPUT_TRUNCATED_MAX_TOKENS', 'CONTENT_TRUNCATED_MAX_TOKENS', 'CONTENT_TRUNCATED', 'llm_output_truncated'],
     class: 'B', strategy: 'regenerate_split', rounds: 2,
   },
-  { id: 'budget', codes: ['budget_exceeded', 'budget_approval_required', 'budget_blocked'], class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget' },
+  // r58 H4: run_budget_not_authorized = reserva pagada de un run SIN ninguna autorización (falla cerrado, 0 gasto).
+  { id: 'budget', codes: ['budget_exceeded', 'budget_approval_required', 'budget_blocked', 'run_budget_not_authorized'], class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget' },
   // Loop Cost Efficiency: una parte agotó su presupuesto de recuperación → solo ESA parte espera (el resto sigue).
   { id: 'item_recovery_budget', codes: ['item_recovery_budget_exhausted'], class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'budget', adminAction: 'retry_item' },
   // FinOps P0: la llamada declaró una parte de un run de OTRA cuenta → el proxy no reservó ni llamó (0 gasto). No se
   // reintenta sola: es una sesión equivocada (otra cuenta en el navegador) o un intento de saltar el tope del run.
   { id: 'attribution_rejected', codes: ['attribution_rejected'], class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'config', adminAction: 'retry_item' },
+  // r58 (AU3 §H4): controles de gasto del servidor. Nada se reservó ni se llamó (0 gasto). No se reintentan solos: el
+  // kill switch / la allow-list de proveedores / el techo de gasto sin atribuir son decisiones de operación, y una parte
+  // declarada que no existe es un ejecutor desfasado o un intento de saltar el tope del run.
+  {
+    id: 'spend_control_denied', codes: ['finops_kill_switch', 'provider_not_allowed', 'unattributed_ceiling_reached', 'item_run_not_found'],
+    class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
+  },
 
   // ── Validación (B: regenerar solo el componente) ───────────────────────────
   { id: 'v3_payload_invalid', codes: ['v3_payload_invalid'], class: 'B', strategy: 'regenerate_targeted', rounds: 2 },
@@ -517,7 +525,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
 
 /** Empaque (scope package, R9). El código sale de CUALQUIER token en mayúsculas conocido del mensaje. */
 const PACKAGE_RULES: readonly Rule[] = Object.freeze([
-  { id: 'package_transient', codes: ['PACKAGING_V3_CONTENT_MISSING', 'ERR_BUFFER_TOO_LARGE', 'package_transient'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
+  // Review r1 (I-1): PACKAGE_REUSE_VERIFY_UNAVAILABLE = Storage no dejó descargar el candidato a reuse (nunca se reconstruye
+  // encima); PACKAGE_OBJECT_CONFLICT = carrera sobre una ruta ya referenciada (el reintento elige ruta nueva). Ambos A.
+  { id: 'package_transient', codes: ['PACKAGING_V3_CONTENT_MISSING', 'ERR_BUFFER_TOO_LARGE', 'package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
   {
     id: 'package_component',
     codes: ['EXAM_BANK_INVALID', 'QUIZ_V3_BANK_INVALID', 'QUIZ_V3_EMPTY', 'QUIZ_V3_INVALID', 'H5P_ACTIVITY_PAYLOAD_INVALID', 'H5P_INPUT_INVALID',
@@ -549,7 +559,10 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       // actividad o sin solucionario al llegar al render → bug de producto (el item ya pasó su validación).
       'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID',
       // r57 T4: XML de la Tarea / rúbrica fuera de rango con un perfil ya validado → bug de producto.
-      'ASSIGN_XML_INVALID', 'ASSIGN_RUBRIC_INVALID'],
+      'ASSIGN_XML_INVALID', 'ASSIGN_RUBRIC_INVALID',
+      // r58 I3: la configuración del modelo de tiempo congelada en el Blueprint no valida (el lock ya la validó) o las
+      // líneas del registro de horas no suman la estimación → bug de producto (nunca se cae al default en silencio).
+      'HOURS_MODEL_INVALID', 'HOURS_REPORT_INVARIANT'],
     family: /^(MBZ_V3_[A-Z0-9_]+|ASSESSMENT_[A-Z0-9_]+|WEIGHTS_[A-Z0-9_]+|THEME_[A-Z0-9_]+|H5P_PROFILE_[A-Z0-9_]+|H5P_PACK_[A-Z0-9_]+|H5P_L10N_[A-Z0-9_]+|H5P_PREFLIGHT_[A-Z0-9_]+|H5P_STORE_[A-Z0-9_]+|H5P_UUID_[A-Z0-9_]+|H5P_SUBCONTENT_[A-Z0-9_]+|MOCK_[A-Z0-9_]+|ACTIVITY_TYPE_INVALID_[A-Z0-9_]+)$/,
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
   },

@@ -95,6 +95,38 @@ const code = async (fn) => { try { await fn(); return 'OK'; } catch (e) { return
     eq(calls.filter((c) => c.method === 'DELETE').map((c) => c.url.endsWith(`${ME}/1/package/curso.mbz`)), [true], 'objeto propio borrado');
   });
 
+  await check('AS5 (r58 R1) POST /artifacts: tipos SOLO del servidor → 403 artifact_type_server_only (incl. un dynamic_mbz forjado); los del ejecutor del navegador y legacy → OK', async () => {
+    const { svc, rows } = env();
+    const own = (t, ext = 'json') => ({ type: t, storage_path: `${ME}/dynamic/9/8/${t}/k/a1.${ext}`, metadata: { runId: 'r', manifestId: 8 } });
+    const forged = { type: 'dynamic_mbz', storage_path: `${ME}/dynamic/9/8/dynamic_mbz/run-1/abc.mbz`, checksum_sha256: 'a'.repeat(64),
+      metadata: { runId: 'run-1', sourceIdsHash: 'abc', builderVersion: 'x', validatedSha256: 'a'.repeat(64) } };
+    eq(await code(() => svc.createFromApi(forged, ME)), 'artifact_type_server_only', 'dynamic_mbz forjado');
+    for (const t of ['dynamic_presentation', 'dynamic_audio_mp3', 'dynamic_audio_segment', 'dynamic_video', 'dynamic_coherence_report_json', ' dynamic_mbz']) {
+      eq(await code(() => svc.createFromApi(own(t), ME)), 'artifact_type_server_only', t);
+    }
+    eq(rows.size, 0, 'nada registrado');
+    // Tipos que sube el ejecutor del navegador (45-dynamic-generation-executor.js) y el flujo legacy: intactos.
+    for (const t of ['dynamic_content_md', 'dynamic_context_package_json', 'dynamic_context_summary_json', 'dynamic_course_plan_json', 'dynamic_exam_bank_json',
+      'dynamic_exam_gift', 'dynamic_scorm_html', 'dynamic_scorm_manifest', 'dynamic_application_json', 'dynamic_application_draft_json', 'dynamic_course_intro_json',
+      'dynamic_module_intro_json', 'dynamic_experience_json', 'dynamic_guided_practice_json', 'dynamic_h5p_params_json', 'dynamic_video_interactions_json',
+      'dynamic_exam_bank_draft_json', 'mbz_final', 'content_snapshot', 'h5p_snapshot']) {
+      eq(await code(() => svc.createFromApi(own(t), ME)), 'OK', t);
+    }
+    // r58 (I4-2): un archivo de trabajo se valida al adjuntarlo (declaración + bytes; casos en check-quality-report P1).
+    eq(await code(() => svc.createFromApi(own('practice_file', 'pdf'), ME)), 'practice_file_invalid', 'practice_file sin declaración');
+    // El backend (uploadBufferArtifact → create) sí registra los suyos.
+    eq(await code(() => svc.create(forged, ME)), 'OK', 'backend: dynamic_mbz');
+  });
+
+  await check('AS6 (r58 R2) POST /artifacts: metadata.llmMode solo real | mock | replay (otro valor → 400 llm_mode_invalid)', async () => {
+    const { svc, rows } = env();
+    const d = (m) => ({ type: 'dynamic_content_md', storage_path: `${ME}/dynamic/9/8/dynamic_content_md/k/a1.md`, metadata: { llmMode: m } });
+    for (const m of ['real', 'mock', 'replay']) eq(await code(() => svc.createFromApi(d(m), ME)), 'OK', m);
+    for (const m of ['REAL', 'fake', 1, true, '']) eq(await code(() => svc.createFromApi(d(m), ME)), 'llm_mode_invalid', JSON.stringify(m));
+    eq(await code(() => svc.createFromApi({ type: 'dynamic_content_md', storage_path: `${ME}/x.md` }, ME)), 'OK', 'sin metadata');
+    eq([...rows.values()].map((r) => r.metadata && r.metadata.llmMode), ['real', 'mock', 'replay', undefined], 'se guarda tal cual');
+  });
+
   await check('AS4 rutas de los writers y tope de expires', () => {
     eq([
       storagePathOwnedBy(ME, 'cursia-artifacts', `${ME}/dynamic/9/8/dynamic_mbz/r/c.mbz`),

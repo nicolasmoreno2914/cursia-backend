@@ -11,7 +11,7 @@ import { providerPlanFor, runPedagogyDryRun } from '../pedagogy/dry-run';
 import { profileTargetHours } from '../pedagogy/pedagogy-profile';
 import type { ProposedModule } from '../study-time/distributor';
 import { estimateCourseStudyTime } from '../study-time/time-model';
-import { studyTimeInputFromManifest } from '../study-time/manifest-input';
+import { studyTimeInputFromManifest, timeModelConfigOf } from '../study-time/manifest-input';
 import { computePlanFromDb } from './invalidation-apply';
 import { dependencyTable, summarizeChangeImpact } from './change-impact';
 
@@ -116,7 +116,7 @@ export class ChangeImpactService {
         available: false as const, reason: 'NO_PREVIOUS_RUN', dryRun: true, providersCalled: 0, spendUsd: '0.00',
         message: 'El curso todavía no se generó: no hay nada que conservar. Generarlo completo costaría lo estimado.',
         fullGeneration: providerPlanFor(manifestB),
-        hours: estimateCourseStudyTime(studyTimeInputFromManifest(manifestB, to)).courseEstimatedHours,
+        hours: estimateCourseStudyTime(studyTimeInputFromManifest(manifestB, to), timeModelConfigOf(to)).courseEstimatedHours,
         distribution,
         dependencies: dependencyTable(),
       };
@@ -133,8 +133,8 @@ export class ChangeImpactService {
     });
     const impact = summarizeChangeImpact({
       plan,
-      to: { blueprint: to, manifest: manifestB, studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifestB, to)) },
-      from: { manifest: manifestA.manifest as GenerationManifestV1, studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifestA.manifest as GenerationManifestV1, blueprintA)) },
+      to: { blueprint: to, manifest: manifestB, studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifestB, to), timeModelConfigOf(to)) },
+      from: { manifest: manifestA.manifest as GenerationManifestV1, studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifestA.manifest as GenerationManifestV1, blueprintA), timeModelConfigOf(blueprintA)) },
     });
     return {
       available: true as const,

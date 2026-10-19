@@ -111,6 +111,8 @@ import {
   paidProviderOfItemType,
   paidRealProviders,
   decideRunBudget,
+  RUN_BUDGET_NOT_AUTHORIZED,
+  pendingPaidRealProviders,
 } from '../finops/run-budget';
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
@@ -1129,8 +1131,11 @@ export class RunsService {
     const policy = await this.finopsBudget!.policyFor(courseId, ownerId, runner);
     const spent = await this.finopsBudget!.spentSoFar(courseId, runner);
     const month = await this.finopsBudget!.monthCommitted(runner);
+    // r58: límite mensual POR DUEÑO (solo si la política lo define; si no, ni se consulta).
+    const ownerMonth = (policy?.limits as Record<string, unknown> | undefined)?.ownerMonthlyCap != null ? await this.finopsBudget!.ownerMonthCommitted(ownerId, runner) : null;
     const plan = planNormalApproval({
       estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider,
+      ownerMonthSpent: ownerMonth ? ownerMonth.total : null,
     });
     return { spent, month, plan };
   }
@@ -1876,6 +1881,18 @@ export class RunsService {
     return this.buildRunDto(await this.loadJobById(job.id), manifest);
   }
 
+  /** Review r1 (M-3): proveedores pagados reales de lo que le queda por generar al run (modos congelados del run). */
+  private async pendingPaidRealProvidersOfRun(job: any, manifest: ManifestDto): Promise<string[]> {
+    const rows: Array<{ item_key: string; status: string }> = await this.dataSource.query(
+      `select distinct on (item_key) item_key, status from public.generation_item_runs where job_id = $1 order by item_key, generation desc`,
+      [job.id],
+    );
+    const statusByKey = new Map(rows.map((r) => [String(r.item_key), String(r.status)]));
+    const ip = (job?.input_payload ?? {}) as Record<string, any>;
+    const modes = runSpendModes(ip.videoMode ?? null, ip.providerModes ?? null);
+    return pendingPaidRealProviders((manifest.manifest?.items ?? []) as RunManifestItem[], statusByKey, modes);
+  }
+
   /** Reanuda un run pausado: ÚNICA transición paused → despachable, siempre por acción explícita del usuario. */
   async resumeRun(
     courseId: number,
@@ -1900,6 +1917,26 @@ export class RunsService {
         throw new ConflictException({
           code: 'run_budget_cap',
           message: `La generación se pausó porque alcanzó su presupuesto autorizado (USD ${Number(auth ?? 0).toFixed(2)}; gastado USD ${Number(spent).toFixed(2)}). Para continuar hay que ampliar el presupuesto.`,
+        });
+      }
+    }
+    // r58 H4: un run sin NINGUNA autorización de presupuesto (o con la última BLOCKED) no se reanuda: sus llamadas
+    // pagadas se rechazarían igual (falla cerrado). Primero un administrador autoriza el presupuesto del run.
+    // Review r1 (M-3): solo si a lo que le QUEDA le toca un proveedor pagado real (Videogen / Gamma / TTS en modo real).
+    // Un run pausado al que solo le quedan partes de IA, mock o ya generadas se reanuda: BYOK / mock no gastan de Cursia
+    // y una llamada LLM pagada por Cursia sigue fallando cerrado en el ledger (H4).
+    if (isPausedRun(job) && this.finopsBudget) {
+      const [lastAuth] = await this.dataSource.query(
+        `select decision from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
+        [job.id],
+      );
+      const pendingPaid = !lastAuth || lastAuth.decision === 'BLOCKED' ? await this.pendingPaidRealProvidersOfRun(job, manifest) : [];
+      if ((!lastAuth || lastAuth.decision === 'BLOCKED') && pendingPaid.length > 0) {
+        throw new ConflictException({
+          code: RUN_BUDGET_NOT_AUTHORIZED,
+          message: !lastAuth
+            ? `${RUN_BUDGET_NOT_AUTHORIZED}: la generación ${job.id} no tiene un presupuesto autorizado y le quedan partes pagadas (${pendingPaid.join(', ')}). Un administrador tiene que autorizarlo (POST /finops/courses/${courseId}/authorizations con runId) antes de reanudar.`
+            : `${RUN_BUDGET_NOT_AUTHORIZED}: el presupuesto de la generación ${job.id} fue revocado (BLOCKED) y le quedan partes pagadas (${pendingPaid.join(', ')}). Un administrador tiene que autorizar uno nuevo antes de reanudar.`,
         });
       }
     }
@@ -4233,7 +4270,9 @@ export class RunsService {
     const runActual = await fb.runActual(job.id, runner);
     const runPaidAuthorized = await fb.runPaidAuthorizedBudget(job.id, runner);
     const decision = decideRunBudget({ estimate, policy, spentSoFar: spent, paidRealProviders: paidRealProviders(estimateItems, modes) });
-    let np = planNormalApproval({ estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider });
+    const ownerMonth = (policy?.limits as Record<string, unknown> | undefined)?.ownerMonthlyCap != null ? await fb.ownerMonthCommitted(ownerId, runner) : null;
+    let np = planNormalApproval({ estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider,
+      ownerMonthSpent: ownerMonth ? ownerMonth.total : null });
     if (decision.decision === 'BLOCK' && np.withinPolicy) {
       np = { ...np, withinPolicy: false, amount: null, cappedByLimit: null,
         blockedBy: [{ limit: 'policy_block', limitValue: null, spent: normalizeDecimal(spent.course), expected: estimate.totals.expected, over: 'expected' }] };

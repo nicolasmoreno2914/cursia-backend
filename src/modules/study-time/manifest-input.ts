@@ -8,6 +8,7 @@
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { GenerationManifestV1 } from '../generation-manifests/generation-manifest-builder';
 import { StudyTimeChapterInput, StudyTimeCourseInput, StudyTimeError } from './time-model';
+import { TimeModelConfig, resolveTimeModelConfig } from './time-model-config';
 
 /** Medidas opcionales del curso ya generado (cualquier subconjunto). */
 export interface StudyTimeMeasurements {
@@ -29,6 +30,14 @@ export interface StudyTimeMeasurements {
    * minutos (una práctica que falta no se cuenta: la diferencia queda a la vista). Ausente = las del Manifest (plan).
    */
   guidedPracticeChapterIds?: readonly string[];
+}
+
+/**
+ * r58 (I3): configuración del modelo de tiempo congelada en el Blueprint (`course.hoursModel`); sin ella, el default.
+ * Lanza HOURS_MODEL_INVALID si la del Blueprint no valida (nunca se cae al default en silencio).
+ */
+export function timeModelConfigOf(blueprint: BlueprintSnapshotV2): TimeModelConfig {
+  return resolveTimeModelConfig(blueprint?.course?.hoursModel);
 }
 
 /**

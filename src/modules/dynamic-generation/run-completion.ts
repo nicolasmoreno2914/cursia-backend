@@ -28,6 +28,7 @@
  *  - sin validación de servidor (content, activity SCORM, course_plan, exam GIFT): cuentan como
  *    hechos al completarse (sin validación nueva acá — ver el reporte de BE-A).
  */
+import { isNonRealLlmMode } from '../artifacts/artifact-type-policy';
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
@@ -395,6 +396,12 @@ export function classifyRunItems(
       continue;
     }
     const s = os(r);
+    // r58 (AU1 R2): texto de IA simulado o reproducido (output_summary.llmMode, lo escribe el servidor al
+    // completar) = componente de vista previa: nunca un paquete final (solo QA rotulado).
+    if (isNonRealLlmMode(s.llmMode)) {
+      out.set(it.key, 'preview');
+      continue;
+    }
     if (PROVIDER_TYPES.has(it.type)) {
       const kind = providerKindOfItemType(it.type);
       if (hasMockSignal(s) || (kind && modes && modes[kind] === 'mock')) {

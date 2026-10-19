@@ -106,6 +106,7 @@ function factsOf(course, opts = {}) {
     assessment: opts.assessment || cp.defaultAssessmentProfile({ finalExam }),
     artifacts: opts.artifacts || F.measuredArtifacts(course.manifest),
     hours: opts.hours,
+    hoursSource: opts.hoursSource,
   });
 }
 
@@ -210,7 +211,9 @@ async function pureChecks() {
     eq(f2.assessment.kinds.activity.attempts, 0, 'formativos ilimitados');
     eq(f2.audio.audiobookParts.map((p) => [p.chapterNumber, +p.offsetSeconds.toFixed(2)]), [[1, 0], [2, 181.44], [3, 399.88], [4, 655.32]], 'offsets');
     eq(+f2.audio.audiobookSeconds.toFixed(2), 947.76, 'total audiolibro');
-    eq(f2.hours, { value: 40, source: 'definida por la institución' }, 'horas');
+    // Review r1 (M-5): sin origen documento → source null (redacción neutra); con documento → etiqueta de la institución.
+    eq(f2.hours, { value: 40, source: null }, 'horas (neutra)');
+    eq(factsOf(c2, { hours: 40, hoursSource: 'document' }).hours, { value: 40, source: 'definida por la institución' }, 'horas del documento');
     assert(Object.isFrozen(f2) && Object.isFrozen(f2.chapters[0]) && Object.isFrozen(f2.counts), 'facts no congelado');
   });
 
@@ -625,7 +628,10 @@ async function pureChecks() {
     const ab = vc.extractText(byName['Audiolibro'].html);
     assert(ab.includes('Duración total: 15 min 48 s.') && ab.toLowerCase().includes('empieza en 3 min 01 s · dura 3 min 38 s'), `índice del audiolibro: ${ab}`);
     assert(byName['Libro Guía'].html.includes('href="$@RESOURCEVIEWBYID*77@$"'), 'token del Libro');
-    assert(vc.extractText(byName['Bienvenida'].html).includes('Duración estimada: 40 h (definida por la institución).'), 'horas etiquetadas');
+    assert(vc.extractText(byName['Bienvenida'].html).includes('Duración estimada del curso: 40 h.'), 'horas (redacción neutra, review r1 M-5)');
+    const fDoc = factsOf(c2, { hours: 40, hoursSource: 'document' });
+    const docWelcome = shellLabels(fDoc, c2, THEME).find((l) => l.name === 'Bienvenida');
+    assert(vc.extractText(docWelcome.html).includes('Duración estimada: 40 h (definida por la institución).'), 'horas del documento etiquetadas');
     for (const w of ['certificado', 'narración profesional', 'minutos por pregunta']) {
       // EV6 T3: «certificado» solo en el panel «Tu certificado» del cierre (la insignia nativa existe en el paquete).
       const sinPanel = (l) => (l.name === 'Cierre del curso' ? l.html.replace(/<div class="cvc-certificate"[\s\S]*$/, '') : l.html);

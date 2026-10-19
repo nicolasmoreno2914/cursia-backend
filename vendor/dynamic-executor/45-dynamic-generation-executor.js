@@ -78,6 +78,21 @@ var DYN_LLM_BACKOFF_BASE_MS = 2000; // same base as apiRetry (2s·2^attempt)
 // muestra Haiku 4.5 y aplica a los flujos legacy). Un cambio de modelo por tarea (model routing) entra solo con
 // evidencia de calidad, por este mismo punto.
 var DYN_GENERATION_MODEL = 'claude-sonnet-4-6';
+
+// Review r1 (M-1): procedencia del texto de IA de ESTE ejecutor. `real` salvo que quien inyecta un LLM falso o de
+// reproducción lo declare: `window.CURSIA_LLM_MODE` ('mock' | 'replay') o la marca `api.__cursiaLlmMode` del api()
+// sustituido (fixtures / harnesses / el runtime del worker). Un item no real va con `llmMode` en la metadata de sus
+// artifacts y en el resumen del complete: el servidor lo clasifica como vista previa (nunca un paquete final).
+function _dynExecutorLlmMode() {
+  var ok = function (m) { return m === 'mock' || m === 'replay'; };
+  try {
+    var g = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : {});
+    if (ok(g.CURSIA_LLM_MODE)) return g.CURSIA_LLM_MODE;
+    var f = typeof api === 'function' ? api : g.api;
+    if (f && ok(f.__cursiaLlmMode)) return f.__cursiaLlmMode;
+  } catch (e) { /* sin entorno → real */ }
+  return 'real';
+}
 var DYN_LLM_BACKOFF_MAX_MS = 30000; // same cap as apiRetry; both overridable by a harness
 
 // metaOut (opcional, fix wave review-rv2 I2): se pasa a api() para recibir
@@ -8497,6 +8512,8 @@ function dynExecutorStart(opts) {
       contextHash: item.context.contextHash,
       runId: item.runId
     };
+    var llmMode = _dynExecutorLlmMode();
+    if (llmMode !== 'real') meta.llmMode = llmMode;
     var uid = (window.SB_USER && window.SB_USER.id) || 'unknown';
     var extMatch = /\.([a-zA-Z0-9]+)$/.exec(a.filename || '');
     var ext = extMatch ? extMatch[1] : 'bin';
@@ -8596,6 +8613,8 @@ function dynExecutorStart(opts) {
       if (abandoned || fatallyPaused()) { state.abandoned++; emit(); return; }
 
       var summary = Object.assign({ contextHash: item.context.contextHash }, result.summary || {});
+      var execLlmMode = _dynExecutorLlmMode();
+      if (execLlmMode !== 'real') summary.llmMode = execLlmMode;
       var compRes = await backendDynComplete(item.itemRunId, executorId, artifactIds, summary);
       if (compRes.ok && compRes.data && compRes.data.ok !== false) {
         state.completed++;

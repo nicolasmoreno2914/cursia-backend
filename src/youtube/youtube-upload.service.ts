@@ -6,6 +6,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { YoutubeTokenService } from './youtube-token.service';
+import { fetchAllowedDownload } from './upload-url-policy';
 import { YoutubeConnection } from './entities/youtube-connection.entity';
 
 /**
@@ -49,6 +50,12 @@ function httpStatusOf(err: unknown): number | undefined {
 
 export interface YoutubeUploadOptions {
   downloadUrl:    string;
+  /**
+   * r58 (SSRF): la URL vino del CLIENTE (POST /youtube/upload-from-url) → se descarga con la política de URLs
+   * (upload-url-policy.ts: lista blanca de hosts, solo IPs públicas, redirecciones validadas, errores genéricos).
+   * Los workers (URLs del servidor) no lo setean: sin cambio.
+   */
+  untrustedUrl?:  boolean;
   title:          string;
   description?:   string;
   privacyStatus?: 'public' | 'unlisted' | 'private';
@@ -126,7 +133,14 @@ export class YoutubeUploadService {
     // ── 2. Descargar MP4 desde Videogen ───────────────────────────────────
     this.logger.log(`[YTUpload] Descargando MP4: ${downloadUrl}`);
     let fileBuffer: Buffer;
-    try {
+    if (options.untrustedUrl) {
+      const dl = await fetchAllowedDownload(downloadUrl);
+      try {
+        fileBuffer = Buffer.from(await dl.arrayBuffer());
+      } catch {
+        throw new BadRequestException('No se pudo descargar el video desde Videogen.');
+      }
+    } else try {
       const dlResp = await fetch(downloadUrl, {
         signal: AbortSignal.timeout(180_000),  // 3 min max download
       });

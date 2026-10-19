@@ -3774,6 +3774,9 @@
           checksum_sha256: options.checksumSha256 || null,
           metadata:     metadata || {}
         }).then(function (regRes) {
+          // r58 (I4-2): el backend valida un archivo de trabajo al adjuntarlo (tipo, tamaño, sha256, firma): su rechazo
+          // llega al panel con el motivo (antes quedaba ok:true sin artifactId y el panel no sabía por qué).
+          if (type === 'practice_file' && !regRes.ok) return { ok: false, error: regRes.error || 'register_failed' };
           var artifactId = (regRes.ok && regRes.data && regRes.data.id) ? regRes.data.id : null;
           return { ok: true, artifactId: artifactId, storagePath: storagePath, bucket: bucket };
         });

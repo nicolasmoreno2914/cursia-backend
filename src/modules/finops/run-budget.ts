@@ -21,6 +21,11 @@ import { guidedPracticeExercisePlan, isGuidedPracticeMinutes } from '../study-ti
 export const BUDGET_APPROVAL_REQUIRED = 'budget_approval_required';
 export const BUDGET_BLOCKED = 'budget_blocked';
 export const BUDGET_EXCEEDED = 'budget_exceeded';
+/**
+ * r58 H4: reserva pagada por Cursia de un run SIN ninguna fila de cost_budget_authorizations → falla cerrado (antes
+ * = sin tope). Nada se reservó ni se llamó; el run se pausa hasta que un administrador autorice su presupuesto.
+ */
+export const RUN_BUDGET_NOT_AUTHORIZED = 'run_budget_not_authorized';
 /** Calibración #2: item con una operación pagada de resultado ambiguo (no se reintenta solo). */
 export const PROVIDER_RECONCILIATION_REQUIRED = 'provider_reconciliation_required';
 export const FINOPS_UNAVAILABLE = 'finops_unavailable';
@@ -272,6 +277,24 @@ export function paidRealProviders(items: readonly EstimateItem[], mode: RunSpend
     if (p && spendModeOfItemType(modes, String(it.itemType)) === 'real' && GENERATING.has(String(it.action ?? 'GENERATE'))) set.add(p);
   }
   return Array.from(set).sort();
+}
+
+/**
+ * Review r1 (M-3): proveedores pagados REALES de los items que a un run pausado le QUEDAN por generar (sin generación
+ * `completed` / `cancelled` en `latestStatusByKey`; sin fila = pendiente). Lo usa la guarda de reanudación H4: sin
+ * ninguno (todo lo restante es LLM / mock / ya generado) el run se reanuda aunque no tenga autorización — una llamada
+ * LLM pagada por Cursia igual se rechaza en el ledger (H4, falla cerrado) y BYOK / mock nunca gastan de Cursia.
+ */
+export function pendingPaidRealProviders(
+  items: readonly RunManifestItem[],
+  latestStatusByKey: ReadonlyMap<string, string>,
+  mode: RunSpendMode | RunSpendModes,
+): string[] {
+  const remaining = items.filter((it) => {
+    const st = latestStatusByKey.get(it.key);
+    return st !== 'completed' && st !== 'cancelled';
+  });
+  return paidRealProviders(estimateItemsForRun(remaining, mode, null, { coverageItems: items }), mode);
 }
 
 export interface RunBudgetDecision extends EvaluateBudgetResult {

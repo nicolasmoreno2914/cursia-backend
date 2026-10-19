@@ -91,13 +91,40 @@ function setEnvKeyText(text, key, value) {
   return { text: lines.join('\n'), before };
 }
 
-function actionWorker(mode, envPath) {
+/**
+ * Review r1 (M-2): claves que worker_on / worker_off cambian JUNTAS (worker de proveedores y worker de IA — este último
+ * hospedado en el mismo proceso cursia-dynamic-provider-worker-staging, que la acción reinicia) + el HOLD persistente
+ * que respeta el deploy de staging. Antes solo se tocaba DYNAMIC_PROVIDER_WORKER_ENABLED: el worker de IA seguía
+ * encendido tras worker_off (hasta el próximo deploy) y quedaba apagado tras un worker_on posterior a un deploy con HOLD.
+ */
+const WORKER_TOGGLE_KEYS = ['DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_LLM_WORKER_ENABLED'];
+
+/** Pura: nuevo texto del .env para worker <on|off> + los cambios (clave, antes, después). */
+function workerEnvText(text, mode) {
   if (mode !== 'on' && mode !== 'off') throw new Error('uso: worker <on|off>');
   const value = mode === 'on' ? 'true' : 'false';
+  const hold = mode === 'on' ? 'false' : 'true';
+  let cur = text;
+  const changes = [];
+  for (const key of WORKER_TOGGLE_KEYS) {
+    const step = setEnvKeyText(cur, key, value);
+    if (step.before !== value) changes.push({ key, before: step.before, after: value });
+    cur = step.text;
+  }
+  // r58: worker_off persistente — DYNAMIC_WORKERS_HOLD; worker on solo toca el HOLD si existe (un .env sin HOLD queda igual).
+  if (mode === 'off' || /^DYNAMIC_WORKERS_HOLD=/m.test(cur)) {
+    const step = setEnvKeyText(cur, 'DYNAMIC_WORKERS_HOLD', hold);
+    if (step.before !== hold) changes.push({ key: 'DYNAMIC_WORKERS_HOLD', before: step.before, after: hold });
+    cur = step.text;
+  }
+  return { text: cur, changes };
+}
+
+function actionWorker(mode, envPath) {
   const text = fs.readFileSync(envPath, 'utf8');
-  const { text: next, before } = setEnvKeyText(text, 'DYNAMIC_PROVIDER_WORKER_ENABLED', value);
-  if (before === value) {
-    console.log(`✓ DYNAMIC_PROVIDER_WORKER_ENABLED ya vale ${value} — no se toca`);
+  const { text: next, changes } = workerEnvText(text, mode);
+  if (!changes.length) {
+    console.log(`✓ ${WORKER_TOGGLE_KEYS.join(' y ')} ya valen ${mode === 'on' ? 'true' : 'false'} — no se toca`);
     return;
   }
   const tmp = `${envPath}.worker.tmp.${process.pid}`;
@@ -106,7 +133,7 @@ function actionWorker(mode, envPath) {
   if (lines(next) < lines(text)) { fs.rmSync(tmp); throw new Error('la reescritura del .env perdió líneas — se aborta sin tocar .env'); }
   fs.copyFileSync(envPath, `${envPath}.bak`);
   fs.renameSync(tmp, envPath);
-  console.log(`+ DYNAMIC_PROVIDER_WORKER_ENABLED: ${before === null ? '(ausente)' : before} → ${value} (backup: .env.bak)`);
+  for (const c of changes) console.log(`+ ${c.key}: ${c.before === null ? '(ausente)' : c.before} → ${c.after}${c === changes[0] ? ' (backup: .env.bak)' : ''}`);
 }
 
 /** ¿La fila vigente ya es exactamente la política aprobada? (pura) */
@@ -519,7 +546,7 @@ async function actionReconcileCharged(c, courseId, { dryRun }) {
 }
 
 module.exports = {
-  APPROVED, policyMatches, decideAuthorization, CALIBRATION_TITLE_PREFIX, setEnvKeyText, summarizeEvents,
+  APPROVED, policyMatches, decideAuthorization, CALIBRATION_TITLE_PREFIX, setEnvKeyText, workerEnvText, WORKER_TOGGLE_KEYS, summarizeEvents,
   selectChargedReconciliations, RECONCILE_CHARGED_MAX_USD, pgDataSource,
 };
 if (require.main === module) {

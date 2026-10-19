@@ -23,7 +23,7 @@ import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-
 import { createHash } from 'crypto';
 import { estimateCost } from '../finops/estimator';
 import type { DistributorRequirementConstraints } from '../academic-context/requirements/requirement-authority';
-import { DistributionResult, distributeCourseHours, estimateCourseStudyTime, StudyTimeEstimate, studyTimeInputFromManifest } from '../study-time';
+import { DeclaredHoursInput, DistributionResult, HoursReport, buildHoursReport, distributeCourseHours, estimateCourseStudyTime, estimateCourseStudyTimeDetailed, StudyTimeEstimate, studyTimeInputFromManifest, timeModelConfigOf } from '../study-time';
 import { ITEM_TYPE_OPERATIONS, isFinopsItemType, providerOfOperation } from '../finops/operations';
 import { estimateItemsForRun } from '../finops/run-budget';
 import { usageModelPriorsV1 } from '../finops/usage-model';
@@ -42,7 +42,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileDesignPreferences, profileTargetHours } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileDesignPreferences, profileHoursModel, profileTargetHours } from './pedagogy-profile';
 import { LearningType, PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 import { ChapterLearningTypeDesign, LEARNING_TYPE_LABELS, classifyLearningType, learningTypeJustification } from './learning-type';
 import { defaultFrameworkRegistry, frameworkSlotLabels } from './instructional-frameworks';
@@ -108,6 +108,11 @@ export interface DryRunInput {
   designPins?: Record<string, { video?: boolean }> | null;
   /** LOOP 8.6C: requisitos obligatorios del documento que el distribuidor cumple (null = sin requisitos). */
   requirementConstraints?: DistributorRequirementConstraints | null;
+  /**
+   * r58 (I3): pedir el registro de horas (`hoursReport`) — con las horas del documento si las hay. Sin pedirlo y sin
+   * `hoursModel` en el perfil, el resultado no lleva la clave (salida byte a byte la de antes).
+   */
+  hoursReport?: boolean | { declared?: DeclaredHoursInput | null };
 }
 
 export interface ProviderPlan {
@@ -212,6 +217,12 @@ export interface DryRunResult {
   targetHours: number | null;
   /** Objetivo vs. estimado de la vista final (pedagógica o línea base). null sin objetivo. */
   workload: { targetHours: number; estimatedHours: number; deltaHours: number } | null;
+  /**
+   * r58 (I3): registro de horas (líneas por recurso con categoría, base, evidencia, regla y configuración; declarado /
+   * objetivo / estimado / asignado / observado / gap). Del diseño que se congelaría (la propuesta materializada si hay
+   * distribución; si no, la vista final). SOLO si se pidió (`hoursReport`) o el perfil trae `hoursModel`.
+   */
+  hoursReport?: HoursReport;
   /**
    * Motor de carga horaria (Loop 3): diseño propuesto por el distribuidor para alcanzar targetHours (null sin
    * objetivo). Solo propuesta: no cambia el Blueprint ni el Manifest de este dry-run.
@@ -547,6 +558,12 @@ export function withApplicationContext(s: BlueprintSnapshotV2, applicationContex
   return buildBlueprintSnapshotV2({ ...rows.course, applicationContext }, rows.modules, rows.chapters, rows.pedagogy);
 }
 
+/** r58 (I3): el mismo snapshot con `course.hoursModel` (pasa por el builder: forma canónica y validación). */
+export function withHoursModel(s: BlueprintSnapshotV2, hoursModel: unknown): BlueprintSnapshotV2 {
+  const rows = snapshotV2ToRows(s);
+  return buildBlueprintSnapshotV2({ ...rows.course, hoursModel }, rows.modules, rows.chapters, rows.pedagogy);
+}
+
 /** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
 export function withTargetHours(s: BlueprintSnapshotV2, targetHours: number | null): BlueprintSnapshotV2 {
   const rows = snapshotV2ToRows(s);
@@ -621,8 +638,15 @@ function side(snapshot: BlueprintSnapshotV2, activityTypeRules: ActivityTypeRule
     manifestSha256: manifestSha256(manifest),
     manifestErrors: validateGenerationManifestV3(manifest, snapshot, source),
     providers: providerPlanFor(manifest),
-    studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifest, snapshot)),
+    studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifest, snapshot), timeModelConfigOf(snapshot)),
   };
+}
+
+/** r58 (I3): registro de horas de un lado del dry-run (mismo modelo y misma configuración que su `studyTime`). */
+function hoursReportOf(sd: { blueprint: BlueprintSnapshotV2; manifest: GenerationManifestV1 }, declared: DeclaredHoursInput | null, hoursBounds: { min?: number; max?: number } | null): HoursReport {
+  const cfg = timeModelConfigOf(sd.blueprint);
+  const { estimate, lines } = estimateCourseStudyTimeDetailed(studyTimeInputFromManifest(sd.manifest, sd.blueprint), cfg);
+  return buildHoursReport({ stage: 'design', estimate, lines, config: cfg, targetHours: sd.blueprint.course.targetHours ?? null, hoursBounds, declared });
 }
 
 export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
@@ -634,7 +658,12 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   const base0 = isSnapshot(input.structure) ? snapshotFromSnapshot(input.structure) : snapshotFromStructure(input.structure as DryRunStructureInput);
   // Motor de carga horaria: el objetivo de horas viene del perfil (con o sin enfoque); sin él, el del snapshot recibido.
   const profileHours = profileTargetHours(input.profile);
-  const base1 = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  const base1h = profileHours !== null ? withTargetHours(base0, profileHours) : base0;
+  // r58 (I3): configuración propia del modelo de tiempo del perfil (lo mismo que congela el lock; sin ella, nada cambia).
+  const profileHm = profileHoursModel(input.profile);
+  const base1 = profileHm ? withHoursModel(base1h, profileHm) : base1h;
+  const wantHoursReport = (input.hoursReport !== undefined && input.hoursReport !== false) || profileHm !== null;
+  let materializedSide: { blueprint: BlueprintSnapshotV2; manifest: GenerationManifestV1 } | null = null;
   // Fase 2: estudiante + resultados de aprendizaje del perfil (lo mismo que congela el lock).
   const appContext = profileApplicationContext(input.profile);
   const base = appContext ? withApplicationContext(base1, appContext) : base1;
@@ -757,7 +786,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     summary.push(`Tipos de aprendizaje: ${[...byType.entries()].map(([k, n]) => `${k} ${n}`).join(' · ')}.`);
     if (learningPlan.unknownOverrides.length) summary.push(`${learningPlan.unknownOverrides.length} ajuste(s) del plan apuntan a capítulos o módulos que ya no existen (se ignoran).`);
   }
-  return {
+  const out: DryRunResult = {
     ...(alignment ? { alignment } : {}),
     ...(learningPlan ? { learningPlan } : {}),
     dryRun: true,
@@ -780,9 +809,10 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
         ? evaluatePracticeMix(mixSpec, [...lockShaped.modules].sort((a, b) => a.position - b.position), input.requirementConstraints ?? null)
         : null;
       const requirements = mix ? mix.constraints : input.requirementConstraints ?? null;
-      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements });
+      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}) });
       const materialized = materializeOrError(lockShaped, dist, (plain) => {
         const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
+        materializedSide = ms;
         // F1 (r57): con plan de aprendizaje, la decisión de actividad que ve el docente sale del Manifest materializado
         // (con los capítulos de práctica incluidos), no de la estructura previa: fuente única = lo que se congela.
         if (planOn && ms.blueprint.course.pedagogy) {
@@ -854,4 +884,9 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     generators: pedagogical ? generatorPlanFor(pedagogical, registry) : [],
     courseOverrides: pedagogical ? courseOverridesFor(pedagogical.blueprint) : [],
   };
+  if (!wantHoursReport) return out;
+  // r58 (I3): el registro de horas del diseño que se congelaría (propuesta materializada; si no hay, la vista final).
+  const declared = typeof input.hoursReport === 'object' && input.hoursReport ? input.hoursReport.declared ?? null : null;
+  const sd = materializedSide ?? view;
+  return { ...out, hoursReport: hoursReportOf(sd, declared, input.requirementConstraints?.hoursBounds ?? null) };
 }

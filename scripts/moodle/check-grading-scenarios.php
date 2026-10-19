@@ -72,8 +72,16 @@ foreach ($byidn as $idn => $cm) {
 }
 $quizzes = $exams + ($final ? ['cv3:final_exam' => $final] : []);
 $explFor = function (string $quizidn) use ($expl) { return $quizidn === 'cv3:final_exam' ? ($expl['final'] ?? null) : ($expl[substr($quizidn, strlen('cv3:exam:'))] ?? null); };
-$R['inventory'] = ['exams' => count($exams), 'final' => (bool)$final, 'graded_h5p' => count($graded), 'review_cards' => count($dialog), 'explanations' => count($expl)];
-$ok(count($exams) >= 1 && $final && count($graded) >= 1 && count($dialog) >= 1 && count($expl) === count($quizzes), 'inventario: evaluaciones de módulo, final, H5P evaluativo, «Repaso» y una página de respuestas por evaluación');
+// r58 (I6): tres formas de curso. full = exámenes de módulo + final (+ insignia), el caso de siempre (sin cambios);
+// no_final = sin evaluación final (con o sin exámenes de módulo): nota del curso, criterio tipo 6, SIN insignia;
+// without_grades = sin ningún ítem calificable: completion por vista del Libro Guía, sin nota ni insignia (r55 R3).
+$libro = $byidn['cv3:shell:libro'] ?? null;
+$mode = $final ? 'full' : (count($graded) + count($exams) > 0 ? 'no_final' : 'without_grades');
+$R['mode'] = $mode;
+$R['inventory'] = ['exams' => count($exams), 'final' => (bool)$final, 'graded_h5p' => count($graded), 'review_cards' => count($dialog), 'explanations' => count($expl), 'libro' => (bool)$libro];
+if ($mode === 'full') $ok(count($exams) >= 1 && $final && count($graded) >= 1 && count($dialog) >= 1 && count($expl) === count($quizzes), 'inventario: evaluaciones de módulo, final, H5P evaluativo, «Repaso» y una página de respuestas por evaluación');
+else if ($mode === 'no_final') $ok(count($graded) + count($exams) >= 1 && count($expl) === count($quizzes) && $libro !== null, 'inventario (sin evaluación final): ítems calificables, una página de respuestas por evaluación, Libro Guía');
+else $ok(!$quizzes && !$graded && $libro !== null, 'inventario (sin nota): sin evaluaciones ni H5P evaluativo, con Libro Guía');
 
 // ── Configuración restaurada ──
 $ci = grade_item::fetch_course_item($courseid);
@@ -84,7 +92,9 @@ $R['config'] = ['course_gradepass' => (float)$ci->gradepass, 'criteria' => array
     'badges' => array_values(array_map(fn($b) => ['id' => (int)$b->id, 'status' => (int)$b->status, 'name' => $b->name], $DB->get_records('badge', ['courseid' => $courseid])))];
 $gp = (float)$ci->gradepass;
 $ok((int)$course->enablecompletion === 1, 'el curso restaurado tiene la finalización habilitada (sin ella los criterios no hacen nada)');
-$ok(count($crit) === 1 && (int)$crit[0]->criteriatype === COMPLETION_CRITERIA_TYPE_GRADE && abs((float)$crit[0]->gradepass - $gp) < 1e-6 && $gp > 0,
+if ($mode === 'without_grades') $ok(count($crit) === 1 && (int)$crit[0]->criteriatype === COMPLETION_CRITERIA_TYPE_ACTIVITY && (int)$crit[0]->moduleinstance === (int)$libro->id && $gp == 0,
+    "completion del curso sin nota = UN criterio de actividad: vista del Libro Guía (gradepass del curso $gp = 0)");
+else $ok(count($crit) === 1 && (int)$crit[0]->criteriatype === COMPLETION_CRITERIA_TYPE_GRADE && abs((float)$crit[0]->gradepass - $gp) < 1e-6 && $gp > 0,
     "completion del curso = UN criterio de nota (tipo 6) con gradepass = ítem del curso ($gp); sin criterios de actividad");
 $ok(count($aggr) === 1 && $aggr[0]->criteriatype === null && (int)$aggr[0]->method === COMPLETION_AGGREGATION_ALL, 'agregación global ALL');
 foreach ($quizzes as $idn => $cm) {
@@ -102,11 +112,20 @@ foreach ($graded as $idn => $cm) {
     $gi = grade_item::fetch(['courseid' => $courseid, 'itemtype' => 'mod', 'itemmodule' => 'h5pactivity', 'iteminstance' => $cm->instance]);
     $ok((int)$a->enabletracking === 1 && $gi && (int)$cm->completionpassgrade === 0 && $cm->completiongradeitemnumber !== null, "$idn: H5P evaluativo con tracking, ítem de nota y completion al recibir nota");
 }
-$ok(count($R['config']['badges']) === 1, 'una insignia-certificado restaurada (' . json_encode($R['config']['badges']) . ')');
+if ($mode === 'full') $ok(count($R['config']['badges']) === 1, 'una insignia-certificado restaurada (' . json_encode($R['config']['badges']) . ')');
+else $ok(count($R['config']['badges']) === 0, 'sin evaluación final: ninguna insignia restaurada (' . json_encode($R['config']['badges']) . ')');
 
 // ── Escenarios ──
 $EX = fn($v) => array_fill_keys(array_keys($exams), $v);
-$S = [
+$S = $mode !== 'full' ? ($mode === 'no_final' ? [
+    's1_pass_all' => ['h5p' => 85, 'q' => $EX([85]), 'dc' => true, 'expect' => true],
+    's3_low' => ['h5p' => 40, 'q' => $EX([55]), 'dc' => true, 'expect' => false],
+    's5a_dc_viewed' => ['h5p' => 80, 'q' => $EX([80]), 'dc' => true, 'expect' => true],
+    's5b_dc_not_viewed' => ['h5p' => 80, 'q' => $EX([80]), 'dc' => false, 'expect' => true],
+] : [
+    'n1_libro_viewed' => ['h5p' => 0, 'q' => [], 'dc' => true, 'libro' => true, 'expect' => true],
+    'n2_libro_not_viewed' => ['h5p' => 0, 'q' => [], 'dc' => true, 'libro' => false, 'expect' => false],
+]) : [
     's1_pass_all' => ['h5p' => 85, 'q' => $EX([85]) + ['cv3:final_exam' => [85]], 'dc' => true, 'expect' => true],
     's2_exam_fail_x3' => ['h5p' => 95, 'q' => $EX([60, 60, 60]) + ['cv3:final_exam' => [95]], 'dc' => true, 'expect' => true],
     's3_low_final' => ['h5p' => 40, 'q' => $EX([55]) + ['cv3:final_exam' => [55]], 'dc' => true, 'expect' => false],
@@ -169,6 +188,7 @@ foreach ($S as $tag => $sc) {
         $handler->process_statements([$st]);
     }
     if ($sc['dc']) foreach ($dialog as $cm) $cinfo->set_module_viewed(cm_info::create($cm, $uid), $uid);
+    if (!empty($sc['libro']) && $libro) $cinfo->set_module_viewed(cm_info::create($libro, $uid), $uid);
     foreach ($quizzes as $idn => $cm) {
         $quizobj = quiz_settings::create($cm->instance, $uid);
         $last = null; $attemptlog = [];
@@ -212,7 +232,8 @@ grade_regrade_final_grades($courseid);
 $pre = [];
 foreach ($users as $tag => $uid) $pre[$tag] = (bool)$DB->get_field('course_completions', 'timecompleted', ['userid' => $uid, 'course' => $courseid]);
 $R['pre_cron_completed'] = $pre;
-$ok(!array_filter($pre), 'antes del cron ningún estudiante tiene el curso completo (criterio de nota = tarea programada)');
+// (Sin nota, el criterio de actividad puede completarse en línea al marcar la vista: no aplica.)
+if ($mode !== 'without_grades') $ok(!array_filter($pre), 'antes del cron ningún estudiante tiene el curso completo (criterio de nota = tarea programada)');
 
 // review r1 (I4): nada de tareas de todo el sitio que no sean completion_regular_task (el gate comparte este Moodle:
 // completion_daily_task / badges_cron_task tocarían otros cursos e insignias). El paso del docente — activar la
@@ -250,9 +271,10 @@ foreach ($S as $tag => $sc) {
     $row = ['course_grade' => $grade, 'gradepass' => (float)$ci->gradepass, 'complete' => $complete, 'badges' => $badges, 'quiz_states' => $qs, 'explanations_available' => $ex];
     $R['users'][$tag] += $row;
     $grades[$tag] = $grade;
-    $ok($grade !== null && $complete === ($grade >= (float)$ci->gradepass), "$tag: completo ($complete) ⇔ nota final $grade ≥ {$ci->gradepass}");
+    if ($mode !== 'without_grades') $ok($grade !== null && $complete === ($grade >= (float)$ci->gradepass), "$tag: completo ($complete) ⇔ nota final $grade ≥ {$ci->gradepass}");
     $ok($complete === $sc['expect'], "$tag: resultado esperado del escenario (" . ($sc['expect'] ? 'completo' : 'no completo') . "), nota $grade");
-    $ok(($badges > 0) === $complete, "$tag: insignia ($badges) ⇔ curso completo");
+    if ($mode === 'full') $ok(($badges > 0) === $complete, "$tag: insignia ($badges) ⇔ curso completo");
+    else $ok($badges === 0, "$tag: sin evaluación final no se emite insignia ($badges)");
     // «Respuestas explicadas»: abierta ⇔ el estudiante usó todos los intentos (o, con override del docente, a pedido del docente).
     foreach ($quizzes as $idn => $cm) {
         $q = $DB->get_record('quiz', ['id' => $cm->instance]);
@@ -261,14 +283,16 @@ foreach ($S as $tag => $sc) {
         $ok($ex[$idn] === $want, "$tag $idn: «Respuestas explicadas» " . ($want ? 'visible' : 'oculta') . " (intentos usados $used de {$q->attempts}, estado {$qs[$idn]})");
     }
 }
-$ok($grades['s5a_dc_viewed'] === $grades['s5b_dc_not_viewed'], "«Repaso» visto / no visto: misma nota ({$grades['s5a_dc_viewed']} = {$grades['s5b_dc_not_viewed']})");
-foreach ($R['users']['s6_pass_exhaust']['probe'] as $p) {
+if ($mode !== 'without_grades') $ok($grades['s5a_dc_viewed'] === $grades['s5b_dc_not_viewed'], "«Repaso» visto / no visto: misma nota ({$grades['s5a_dc_viewed']} = {$grades['s5b_dc_not_viewed']})");
+if ($mode === 'full') foreach ($R['users']['s6_pass_exhaust']['probe'] as $p) {
     $ok($p['explanations_available'] === ($p['after_attempt'] >= 3), "s6 {$p['quiz']} tras el intento {$p['after_attempt']} (aprobado): «Respuestas explicadas» " . ($p['after_attempt'] >= 3 ? 'visible' : 'oculta') . " (estado del quiz {$p['quiz_state']})");
 }
-foreach (['s2_exam_fail_x3' => array_keys($exams)[0], 's4_final_fail_x3' => 'cv3:final_exam'] as $tag => $idn) {
-    $ok($R['users'][$tag]['quiz_states'][$idn] === 'complete_fail', "$tag $idn agotado sin aprobar: estado complete_fail (e=3 abre la página)");
+if ($mode === 'full') {
+    foreach (['s2_exam_fail_x3' => array_keys($exams)[0], 's4_final_fail_x3' => 'cv3:final_exam'] as $tag => $idn) {
+        $ok($R['users'][$tag]['quiz_states'][$idn] === 'complete_fail', "$tag $idn agotado sin aprobar: estado complete_fail (e=3 abre la página)");
+    }
+    $ok($R['users']['s6_pass_exhaust']['quiz_states']['cv3:final_exam'] === 'complete_pass', 's6 final agotado aprobando: estado complete_pass (e=1 abre la página)');
 }
-$ok($R['users']['s6_pass_exhaust']['quiz_states']['cv3:final_exam'] === 'complete_pass', 's6 final agotado aprobando: estado complete_pass (e=1 abre la página)');
 
 // ── Limpieza ──
 if (isset($opts['cleanup'])) {

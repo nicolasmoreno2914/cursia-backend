@@ -112,6 +112,13 @@ $ci = grade_item::fetch_course_item($courseid);
 $crit = array_values($DB->get_records('course_completion_criteria', ['course' => $courseid]));
 $aggr = array_values($DB->get_records('course_completion_aggr_methd', ['course' => $courseid]));
 $ok((int)$course->enablecompletion === 1, 'R4 finalización habilitada');
+if (!empty($exp['withoutGrades'])) {
+    // r58 (I6) · r55 R3: curso sin ítems calificables → un criterio de actividad (vista del Libro Guía), sin nota.
+    $libro = null;
+    foreach (get_fast_modinfo($courseid)->get_cms() as $cm) if ($cm->idnumber === 'cv3:shell:libro') $libro = $cm;
+    $ok($libro && count($crit) === 1 && (int)$crit[0]->criteriatype === COMPLETION_CRITERIA_TYPE_ACTIVITY && (int)$crit[0]->moduleinstance === (int)$libro->id
+        && (float)$ci->gradepass == 0.0, "R4 sin nota: UN criterio de actividad (vista del Libro Guía), gradepass del curso {$ci->gradepass} = 0");
+} else
 $ok(count($crit) === 1 && (int)$crit[0]->criteriatype === COMPLETION_CRITERIA_TYPE_GRADE && abs((float)$crit[0]->gradepass - (float)$ci->gradepass) < 1e-6
     && abs((float)$ci->gradepass - (float)$exp['courseGradepass']) < 1e-6, "R4 UN criterio tipo 6 (nota del curso) con gradepass {$ci->gradepass} = esperado {$exp['courseGradepass']}");
 $ok(count($aggr) === 1 && $aggr[0]->criteriatype === null && (int)$aggr[0]->method === COMPLETION_AGGREGATION_ALL, 'R4 agregación ALL');

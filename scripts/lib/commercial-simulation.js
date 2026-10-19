@@ -40,6 +40,7 @@ function libs(distRoot) {
     RA: L('modules/academic-context/requirements/requirement-authority.js'),
     PFILES: L('package/v3/practice-files.js'),
     MEDIA: L('package/v3/synthetic-media.js'),
+    QR: L('modules/quality/course-quality-report.js'),
   };
 }
 
@@ -69,7 +70,7 @@ function structureOf(cfg) {
           } else {
             [title, objective] = spec;
           }
-          return { id: C.uuid('f', courseId * 100 + ci), title, objective, videoEnabled: true, activityEnabled: true };
+          return { id: C.uuid('f', courseId * 100 + ci), title, objective, videoEnabled: mod.videoEnabled !== false, activityEnabled: mod.activityEnabled !== false };
         }),
       };
     }),
@@ -102,6 +103,9 @@ function pedagogyProfileOf(cfg, structure) {
     origin: 'manual',
     targetHours: cfg.targetHours,
     ...(plan ? { learningPlan: plan } : {}),
+    // r58 (I6): «Ajustar» del docente (designPreferences del perfil: emphasis / applicationActivities / audiovisual /
+    // guidedPractice), validado por el backend real como cualquier otro campo del perfil.
+    ...(pg.designPreferences ? { designPreferences: JSON.parse(JSON.stringify(pg.designPreferences)) } : {}),
   };
 }
 
@@ -234,17 +238,28 @@ function attachExamGift(X, input) {
 }
 
 /**
- * Lleva UNA configuración de curso a paquete validado. Mismo código para todos los cursos.
- * @returns {{ cfg, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment, input, built, validation }}
+ * r58 (I1): la parte de simulateCourse ANTES de los artifacts — configuración → perfiles validados → dry-run → Prebrief →
+ * Blueprint (lock) → Manifest v3 → briefs → perfil de evaluación. La comparten la simulación comercial y el driver
+ * offline de componentes (scripts/lib/offline-driver.js): un solo camino de la configuración al Manifest.
+ * @returns {{ X, cfg, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment }}
  */
-async function simulateCourse(distRoot, cfg) {
+async function prepareCourse(distRoot, cfg) {
   const X = libs(distRoot);
   const structure = C.plainStructure(structureOf(cfg));
   const profile = pedagogyProfileOf(cfg, structure);
   const pErr = X.CP.validateProfile('pedagogy', profile, { finalExam: cfg.finalExam !== false });
   if (pErr.length) throw new Error(`perfil pedagógico inválido: ${JSON.stringify(pErr.slice(0, 4))}`);
   // Distribuidor (dry-run del diseño): mismo cálculo que «Usar este diseño».
-  const dryRun = X.P.runPedagogyDryRun({ structure, profile, activityTypeRules: 2, requirementConstraints: FIXED_REQUIREMENTS });
+  // r58 (I6): lo fijado a mano por el docente en el editor (courses.metadata.designPins), por posición «m.c» → id.
+  let designPins = null;
+  if (cfg.designPins) {
+    designPins = {};
+    for (const [pos, v] of Object.entries(cfg.designPins)) {
+      const [mi, ci] = pos.split('.').map(Number);
+      designPins[structure.modules[mi].chapters[ci].id] = JSON.parse(JSON.stringify(v));
+    }
+  }
+  const dryRun = X.P.runPedagogyDryRun({ structure, profile, activityTypeRules: 2, requirementConstraints: FIXED_REQUIREMENTS, ...(designPins ? { designPins } : {}) });
   const d = dryRun.distribution;
   if (d.materialized.manifestErrors.length) throw new Error(`Manifest materializado con errores: ${JSON.stringify(d.materialized.manifestErrors.slice(0, 3))}`);
   // Prebrief: la tarjeta que aprobaría la institución (diseño + totales del Manifest).
@@ -268,8 +283,19 @@ async function simulateCourse(distRoot, cfg) {
     const b = X.P.buildItemPedagogyBrief({ item: it, snapshot: m.locked, activityTypeRules: 2 });
     if (b) briefs.set(it.key, b);
   }
-  // Artifacts de proveedores falsos + perfil de evaluación.
+  // Perfil de evaluación.
   const assessment = await assessmentOf(X, cfg, structure, m.manifest);
+  return { X, cfg, structure, profile, dryRun, prebrief, locked: m.locked, manifest: m.manifest, briefs, assessment };
+}
+
+/**
+ * Lleva UNA configuración de curso a paquete validado. Mismo código para todos los cursos.
+ * @returns {{ cfg, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment, input, built, validation }}
+ */
+async function simulateCourse(distRoot, cfg) {
+  const { X, structure, profile, dryRun, prebrief, locked, manifest, briefs, assessment } = await prepareCourse(distRoot, cfg);
+  const m = { locked, manifest };
+  // Artifacts de proveedores falsos.
   const input = PF.packagingInput(distRoot, { snapshot: m.locked, manifest: m.manifest, engine: cfg.engine || 'h5p', finalExam: cfg.finalExam !== false, profile: assessment.profile });
   if (assessment.files.size) input.contents.practiceFiles = assessment.files;
   if ((cfg.exams || 'bank') === 'bank') attachExamBanks(X, input);
@@ -277,6 +303,23 @@ async function simulateCourse(distRoot, cfg) {
   const built = await X.B.buildDynamicMbzV3(input);
   const validation = await X.VAL.validateMbzV3(built.mbz, built.expectations);
   return { cfg, structure, profile, dryRun, prebrief, locked: m.locked, manifest: m.manifest, briefs, assessment, input, built, validation, builderVersion: X.B.DYNAMIC_MBZ_BUILDER_VERSION_V3 };
+}
+
+/**
+ * r58 (I6): el informe de calidad del paquete simulado, con la MISMA llamada que el worker de empaque y el driver offline
+ * (buildPackageQualityReport). `override` permite sembrar defectos (contenidos o hallazgos del validador) en un check.
+ */
+function qualityReportOf(distRoot, sim, override = {}) {
+  const X = libs(distRoot);
+  return X.QR.buildPackageQualityReport({
+    manifest: sim.manifest, blueprint: sim.locked, contents: override.contents || sim.input.contents,
+    packageWarnings: [...(sim.built.summary.warnings || []), ...(sim.built.summary.qualityWarnings || [])],
+    practiceResources: sim.built.summary.practiceResources || null,
+    practiceTitles: new Map(((sim.assessment.profile && sim.assessment.profile.practiceResources) || []).map((r) => [r.id, r.title])),
+    hoursReport: sim.built.expectations.facts.hoursReport || null,
+    builderVersion: sim.built.summary.builderVersion,
+    ...(override.mbzIssues ? { mbzIssues: override.mbzIssues } : {}),
+  });
 }
 
 /** Inventario del .mbz por modname (moodle_backup.xml) + datos de cada actividad H5P (tracking, nota, completion). */
@@ -308,7 +351,13 @@ async function inspectMbz(mbz) {
     const mod = await z.file(`activities/${a.modname}_${a.moduleid}/module.xml`).async('string');
     pages.push({ modname: a.modname, idnumber: tag(mod, 'idnumber'), visible: Number(tag(mod, 'visible')), hasRubric: a.modname === 'assign' && !!z.file(`activities/assign_${a.moduleid}/grading.xml`) });
   }
-  return { byModname, h5p, quizzes, pages };
+  // r58 (I6): insignias del curso (badges.xml) y criterios de finalización del curso (raíz del
+  // backup: completion.xml).
+  const badgesXml = z.file('badges.xml') ? await z.file('badges.xml').async('string') : '';
+  const badges = (badgesXml.match(/<badge id=/g) || []).length;
+  const ccXml = z.file('completion.xml') ? await z.file('completion.xml').async('string') : '';
+  const completionCriteria = [...ccXml.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => Number(m[1]));
+  return { byModname, h5p, quizzes, pages, badges, completionCriteria };
 }
 
-module.exports = { simulateCourse, inspectMbz, structureOf, pedagogyProfileOf, minimalPptx, sha256, MIME };
+module.exports = { simulateCourse, prepareCourse, attachExamGift, inspectMbz, qualityReportOf, structureOf, pedagogyProfileOf, minimalPptx, sha256, MIME };
