@@ -3060,7 +3060,7 @@ export class RunsService {
       if (d.heal === false) {
         result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
         // Lo que nunca va a calificar queda para un admin YA (sin re-evaluarlo en cada tick).
-        if (d.reason === 'over_threshold' || d.reason === 'missing_precondition' || d.reason === 'denied') {
+        if (d.reason === 'over_threshold' || d.reason === 'missing_precondition' || d.reason === 'denied' || d.reason === 'timeout_likely_charged') {
           await decline(r, d.reason, d.pendingUsd ?? null);
           this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía solo (${d.reason}, pendiente USD ${d.pendingUsd ?? '?'}); queda para un admin`);
         }
