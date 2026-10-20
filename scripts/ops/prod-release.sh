@@ -31,8 +31,8 @@
 #       release que dejó un rollback, que puede ser anterior a r61 y no tener este script).
 #
 #   rollback <dir>                                   (por stdin: bash -s -- rollback …)
-#       Restaura <dir>/.release-prev/ (copia la release fallida a .release-failed/ para
-#       diagnóstico), npm install --omit=dev, recarga PM2. NO corre migraciones: el esquema
+#       Restaura <dir>/.release-prev/ (código + node_modules del snapshot; copia la release fallida,
+#       sin node_modules, a .release-failed/ para diagnóstico), recarga PM2. NO corre migraciones: el esquema
 #       V2 es aditivo y el CHECK de main fallaría con filas dynamic (N1). No toca el .env.
 #
 # Nunca imprime valores del .env: solo nombres de clave y valores NO secretos que este
@@ -64,6 +64,11 @@ TTS_SNAPSHOT=gpt-4o-mini-tts-2025-03-20
 STABILITY_WINDOW_S="${PROD_STABILITY_WINDOW_S:-45}"
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 RELEASE_EXCLUDES=(--exclude node_modules --exclude .env --exclude '.env.*' --exclude '.release-*')
+# Workers V1 que salen A PROPÓSITO al arrancar si están deshabilitados (r61 fix I1): con la condición
+# cumplida se DETIENEN (no se reinician en bucle) y no cuentan en la presencia/estabilidad.
+#   cursia-video-worker: sale con 0 si VIDEO_WORKER_ENABLED != true (video-worker.ts)
+#   cursia-gamma-worker: sale con 1 si GAMMA_API_KEY está vacío (gamma-worker.ts)
+PRELOOP_WINDOW_S="${PROD_PRELOOP_WINDOW_S:-15}"
 PM2="${PM2_BIN:-sudo pm2}"
 
 die() { echo "❌ $*"; exit 1; }
@@ -94,9 +99,16 @@ env_val() {
 }
 _atomic_replace_line() {
   # $1 clave, $2 línea nueva: reemplaza la ÚNICA línea KEY=… (validado por el caller).
+  # r61 fix I3: el temporal nace como COPIA del .env (cp -p: mismo modo, p. ej. 0600) con umask 077 y se
+  # sobrescribe en su lugar, así el mv atómico nunca deja el .env de producción legible por otros (0644).
+  # Fix M1: clave y línea viajan por ENVIRON (no por argv de awk: sin exposición en /proc/*/cmdline y sin
+  # procesar escapes \ de -v, que corromperían un token con barras).
   local key="$1" new="$2" tmp before after
   tmp=".env.flags.tmp.$$"
-  awk -v k="$key" -v v="$new" 'BEGIN{p=k "="} index($0,p)==1 && !d {print v; d=1; next} {print}' .env > "$tmp"
+  (umask 077 && cp -p .env "$tmp") || { echo "❌ ${key}: no se pudo crear el temporal del .env"; return 1; }
+  if ! _K="$key" _V="$new" awk 'BEGIN{p=ENVIRON["_K"] "="; v=ENVIRON["_V"]} index($0,p)==1 && !d {print v; d=1; next} {print}' .env > "$tmp"; then
+    rm -f "$tmp"; echo "❌ ${key}: la reescritura del .env falló — se aborta sin tocar .env"; return 1
+  fi
   before=$(awk 'END{print NR}' .env)
   after=$(awk 'END{print NR}' "$tmp")
   if [ ! -s "$tmp" ] || [ "$before" != "$after" ]; then
@@ -104,7 +116,7 @@ _atomic_replace_line() {
     echo "❌ ${key}: la reescritura del .env no validó — se aborta sin tocar .env"
     return 1
   fi
-  cp .env .env.bak
+  (umask 077 && cp -p .env .env.bak)
   mv "$tmp" .env
 }
 # Fija una clave NO secreta a un valor exacto (imprime clave y valores: solo se usa con valores no secretos).
@@ -221,9 +233,11 @@ const [mode, ...rest] = process.argv.slice(1);
 let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
   let list; try { list = JSON.parse(s); } catch (e) { console.log("pm2 jlist ilegible"); process.exit(2); }
   const snap = mode === "compare" ? JSON.parse(rest.shift()) : null;
+  const snap0 = mode === "increased" ? JSON.parse(rest.shift()) : null;
   const want = rest;
   const by = Object.fromEntries(list.filter((p) => want.includes(p.name)).map((p) => [p.name, { status: p.pm2_env && p.pm2_env.status, restarts: Number(p.pm2_env && p.pm2_env.restart_time) }]));
   if (mode === "snapshot") { console.log(JSON.stringify(Object.fromEntries(Object.entries(by).map(([k, v]) => [k, v.restarts])))); return; }
+  if (mode === "increased") { console.log(want.filter((n) => by[n] && snap0[n] !== undefined && by[n].restarts > snap0[n]).join(" ")); return; }
   let bad = 0;
   for (const n of want) {
     const p = by[n];
@@ -239,11 +253,47 @@ let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
 pm2_check() { $PM2 jlist | node -e "$PM2_CHECK_JS" "$@"; }
 
 STOPPED_NAMES=()
+ADVISORY_NAMES=()
+_in_list() { local x="$1" y; shift; for y in "$@"; do [ "$y" = "$x" ] && return 0; done; return 1; }
+# r61 fix I1: motivo por el que un worker V1 está deshabilitado por su propio flag (vacío = habilitado).
+legacy_disabled_reason() {
+  case "$1" in
+    cursia-video-worker) [ "$(env_val VIDEO_WORKER_ENABLED | tr '[:upper:]' '[:lower:]')" = "true" ] || echo "VIDEO_WORKER_ENABLED ≠ true (el worker sale al arrancar)" ;;
+    cursia-gamma-worker) [ -n "$(env_val GAMMA_API_KEY)" ] || echo "GAMMA_API_KEY vacío (el worker sale al arrancar)" ;;
+  esac
+  return 0
+}
+# r61 fix I1: workers V1 que YA se reiniciaban en bucle ANTES de este deploy (ventana corta, sin tocar nada) →
+# su estabilidad es solo informativa: un problema preexistente no debe tumbar el deploy después del rsync.
+detect_preexisting_loops() {
+  local names=() entry n a inc
+  for entry in "${PROD_PROCESSES_LEGACY[@]}"; do
+    n="${entry%% *}"
+    [ -n "$(legacy_disabled_reason "$n")" ] || names+=("$n")
+  done
+  [ "${#names[@]}" -gt 0 ] || return 0
+  a=$(pm2_check snapshot "${names[@]}") || return 0
+  sleep "$PRELOOP_WINDOW_S"
+  inc=$(pm2_check increased "$a" "${names[@]}") || inc=""
+  for n in $inc; do
+    ADVISORY_NAMES+=("$n")
+    echo "⚠️  ${n} ya se reiniciaba en bucle ANTES del deploy: su estabilidad queda como aviso (no bloquea). Revisar su .env/logs."
+  done
+  return 0
+}
 reload_all_processes() {
   # $1 = install | rollback
-  local mode="$1" entry name arg
+  local mode="$1" entry name arg why
   $PM2 reload cursia-backend --update-env || $PM2 restart cursia-backend --update-env
   for entry in "${PROD_PROCESSES_LEGACY[@]}"; do
+    name="${entry%% *}"
+    why=$(legacy_disabled_reason "$name")
+    if [ -n "$why" ]; then
+      echo "⏸  ${name}: deshabilitado (${why}) — se detiene en vez de reiniciarse en bucle"
+      if $PM2 describe "$name" > /dev/null 2>&1; then $PM2 stop "$name" || true; fi
+      STOPPED_NAMES+=("$name")
+      continue
+    fi
     # shellcheck disable=SC2086
     ensure_pm2_process $entry
   done
@@ -262,18 +312,22 @@ reload_all_processes() {
 }
 
 verify_processes() {
-  local names=() n s skip
+  local names=() adv=() n
   for n in "${PROD_ALL_NAMES[@]}"; do
-    skip=0
-    for s in ${STOPPED_NAMES[@]+"${STOPPED_NAMES[@]}"}; do [ "$s" = "$n" ] && skip=1; done
-    [ "$skip" = 1 ] || names+=("$n")
+    _in_list "$n" ${STOPPED_NAMES[@]+"${STOPPED_NAMES[@]}"} && continue
+    if _in_list "$n" ${ADVISORY_NAMES[@]+"${ADVISORY_NAMES[@]}"}; then adv+=("$n"); else names+=("$n"); fi
   done
-  echo "━━━ Presencia de los ${#names[@]} procesos de producción ━━━"
+  [ "${#STOPPED_NAMES[@]}" -eq 0 ] || echo "  (detenidos a propósito, fuera de la presencia: ${STOPPED_NAMES[*]})"
+  echo "━━━ Presencia de los ${#names[@]} procesos de producción esperados ━━━"
   pm2_check presence "${names[@]}" || die "faltan procesos de producción o no están online"
   echo "━━━ Estabilidad PM2 (ventana de ${STABILITY_WINDOW_S} s) ━━━"
-  local before
+  local before before_adv=""
   before=$(pm2_check snapshot "${names[@]}")
+  [ "${#adv[@]}" -eq 0 ] || before_adv=$(pm2_check snapshot "${adv[@]}")
   sleep "$STABILITY_WINDOW_S"
+  if [ "${#adv[@]}" -gt 0 ]; then
+    pm2_check compare "$before_adv" "${adv[@]}" || echo "⚠️  inestables ya antes del deploy (aviso, no bloquea): ${adv[*]}"
+  fi
   pm2_check compare "$before" "${names[@]}" || die "procesos inestables tras el deploy (crash loop) — evaluar rollback (workflow_dispatch action=rollback)"
 }
 
@@ -304,12 +358,16 @@ cmd_snapshot() {
       ok\ *|none)
         rm -rf .release-prev.tmp
         rsync -a --checksum --delete "${RELEASE_EXCLUDES[@]}" ./ .release-prev.tmp/
+        # r61 fix M6: también node_modules (rollback sin depender del registro de npm). Comparación por
+        # tamaño+mtime: npm reescribe lo que cambia.
+        if [ -d node_modules ]; then rsync -a --delete node_modules/ .release-prev.tmp/node_modules/; fi
         cp .release-sha .release-prev.tmp/.release-sha 2>/dev/null || echo "pre-r61" > .release-prev.tmp/.release-sha
         rm -rf .release-prev
         mv .release-prev.tmp .release-prev
         echo "✓ release actual ($(cat .release-prev/.release-sha)) guardada en .release-prev/ (rollback)"
         ;;
       *)
+        # deploying / failed / rolledback: la release en disco no está probada → no pisar el último snapshot sano.
         echo "⚠️  la release actual NO quedó marcada sana (estado: ${state}) — se conserva el .release-prev existente ($(cat .release-prev/.release-sha 2>/dev/null || echo 'ninguno'))"
         ;;
     esac
@@ -317,11 +375,12 @@ cmd_snapshot() {
   echo "deploying ${sha}" > .release-state
 }
 
-CFG_KEYS="PROD_V2_CANARY_OWNER PROD_V2_WORKERS_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER DEPLOY_SHA"
+CFG_KEYS="PROD_V2_CANARY_OWNER PROD_V2_WORKERS_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER PROD_SKIP_STORAGE_POLICY_PROBE DEPLOY_SHA"
 cmd_install() {
   local fit="" line key val
   local CFG_PROD_V2_CANARY_OWNER="" CFG_PROD_V2_WORKERS_ENABLED=false CFG_PROD_V2_GENERAL_AVAILABILITY=false
   local CFG_PROD_DB_POOL_MAX="" CFG_PROD_DB_POOL_MAX_WORKER="" CFG_PROD_DB_POOL_IDLE_MS_WORKER="" CFG_DEPLOY_SHA=""
+  local CFG_PROD_SKIP_STORAGE_POLICY_PROBE=false
   IFS= read -r fit || true
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -330,7 +389,7 @@ cmd_install() {
     printf -v "CFG_${key}" "%s" "$val"
   done
   [ -n "$CFG_PROD_V2_CANARY_OWNER" ] && ! [[ "$CFG_PROD_V2_CANARY_OWNER" =~ $UUID_RE ]] && die "PROD_V2_CANARY_OWNER no es un UUID"
-  for key in PROD_V2_WORKERS_ENABLED PROD_V2_GENERAL_AVAILABILITY; do
+  for key in PROD_V2_WORKERS_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_SKIP_STORAGE_POLICY_PROBE; do
     val="CFG_${key}"; case "${!val}" in true|false) ;; *) die "${key} debe ser true|false" ;; esac
   done
   for key in PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER; do
@@ -339,6 +398,10 @@ cmd_install() {
   [[ "$CFG_DEPLOY_SHA" =~ ^[0-9a-f]{7,40}$ ]] || die "DEPLOY_SHA inválido"
 
   assert_env_production
+  # r61 fix I1: si algo falla de acá en adelante (el código nuevo ya está en disco), el estado queda
+  # «failed <sha>» — explícito para el operador y para el auto-rollback del workflow; el próximo snapshot
+  # conserva la última release sana.
+  trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "failed ${CFG_DEPLOY_SHA}" > .release-state; echo "❌ install falló (rc=${rc}): estado failed ${CFG_DEPLOY_SHA}; los procesos siguen como quedaron — rollback: workflow_dispatch action=rollback (o el auto-rollback del workflow)"; fi' EXIT
 
   echo "━━━ [0a] Flags V2 de producción (defaults SEGUROS: V2 apagado salvo canario explícito) ━━━"
   local canary="$CFG_PROD_V2_CANARY_OWNER" workers=false
@@ -358,7 +421,7 @@ cmd_install() {
     echo "  sin PROD_V2_CANARY_OWNER: V2 queda como esté en el .env (default: apagado)"
     ensure_env_default_if_absent DYNAMIC_COURSE_STRUCTURE false
   fi
-  if grep -q "^DYNAMIC_WORKERS_HOLD=true$" .env; then
+  if [ "$(env_val DYNAMIC_WORKERS_HOLD | tr '[:upper:]' '[:lower:]')" = "true" ]; then
     workers=false
     echo "⚠ DYNAMIC_WORKERS_HOLD=true: workers de proveedores y de IA quedan APAGADOS"
   fi
@@ -390,6 +453,9 @@ cmd_install() {
   echo "━━━ [0c] poppler-utils (pdftoppm — portadas de Gamma) ━━━"
   command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
 
+  echo "━━━ [0d] Procesos V1 que ya se reiniciaban en bucle ANTES del deploy (ventana de ${PRELOOP_WINDOW_S} s, solo lectura) ━━━"
+  detect_preexisting_loops
+
   echo "━━━ [1/4] Instalar dependencias de producción ━━━"
   npm install --omit=dev
 
@@ -405,7 +471,12 @@ cmd_install() {
   verify_processes
 
   echo "━━━ Base: conectividad + esquema V2 (sondas de solo lectura, .env de producción) ━━━"
-  node scripts/prod/v2-schema-probes.js || die "la base no responde o el esquema V2 no está completo"
+  local probe_args=()
+  if [ "$CFG_PROD_SKIP_STORAGE_POLICY_PROBE" = "true" ]; then
+    probe_args=(--skip-storage-policies)
+    echo "⚠️  PROD_SKIP_STORAGE_POLICY_PROBE=true: no se verifican las políticas de storage.objects (apply con --skip-storage-policies)"
+  fi
+  node scripts/prod/v2-schema-probes.js ${probe_args[@]+"${probe_args[@]}"} || die "la base no responde o el esquema V2 no está completo"
   echo "✅ Deploy de producción instalado (${CFG_DEPLOY_SHA})."
 }
 
@@ -435,9 +506,15 @@ cmd_rollback() {
   rsync -a --checksum --delete "${RELEASE_EXCLUDES[@]}" .release-prev/ ./
   cp .release-prev/.release-sha .release-sha
   echo "rolledback ${prev}" > .release-state
-  echo "━━━ npm install --omit=dev (dependencias de la release restaurada) ━━━"
-  npm install --omit=dev
+  if [ -d .release-prev/node_modules ]; then
+    echo "━━━ node_modules de la release restaurada (desde el snapshot, sin npm) ━━━"
+    rsync -a --delete .release-prev/node_modules/ ./node_modules/
+  else
+    echo "━━━ npm install --omit=dev (snapshot sin node_modules: depende del registro de npm) ━━━"
+    npm install --omit=dev
+  fi
   echo "━━━ SIN migraciones: el esquema V2 es aditivo (el CHECK de main fallaría con filas dynamic, N1) ━━━"
+  detect_preexisting_loops
   reload_all_processes rollback
   verify_processes
   echo "✅ Rollback instalado (${prev}). El workflow marca la release sana tras el health check."

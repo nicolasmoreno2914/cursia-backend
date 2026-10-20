@@ -104,13 +104,16 @@ async function workflowChecks() {
   await check('[WF] variables V2 validadas en el runner (bash ejecutado): UUID, booleanos, enteros, ref del frontend; default seguro = V2 apagado', () => {
     const s = steps[idx((x) => x.id === 'cfg', 'cfg')];
     let r = bashStep(s.run, {});
-    eq([r.status, r.outputs.canary, r.outputs.workers, r.outputs.ga, r.outputs.block_v1, r.outputs.fe_ref], [0, '', 'false', 'false', 'false', 'main'], 'sin variables → V2 apagado');
+    assert(r.status === 1 && /Falta la variable PROD_FE_GATE_REF/.test(r.stdout), 'I2: sin PROD_FE_GATE_REF falla (nunca el main V1 del frontend por default)');
+    r = bashStep(s.run, { FE_REF: 'staging' });
+    eq([r.status, r.outputs.canary, r.outputs.workers, r.outputs.ga, r.outputs.block_v1, r.outputs.fe_ref, r.outputs.skip_storage], [0, '', 'false', 'false', 'false', 'staging', 'false'], 'solo el ref → V2 apagado');
     r = bashStep(s.run, { CANARY: ` ${OWNER.toUpperCase()} `, WORKERS: 'TRUE', POOL_MAX: '2', FE_REF: 'release/v2' });
     eq([r.status, r.outputs.canary, r.outputs.workers, r.outputs.pool_max, r.outputs.fe_ref], [0, OWNER, 'true', '2', 'release/v2'], 'canario normalizado');
-    for (const bad of [{ CANARY: 'no-uuid' }, { CANARY: `${OWNER}'; rm -rf /` }, { WORKERS: 'yes' }, { GA: '1' }, { POOL_MAX: '2;id' }, { FE_REF: "main' x" }]) {
-      eq(bashStep(s.run, bad).status, 1, `rechaza ${JSON.stringify(bad)}`);
+    for (const bad of [{ CANARY: 'no-uuid' }, { CANARY: `${OWNER}'; rm -rf /` }, { WORKERS: 'yes' }, { GA: '1' }, { POOL_MAX: '2;id' }, { FE_REF: "main' x" }, { SKIP_STORAGE: 'si' }]) {
+      eq(bashStep(s.run, { FE_REF: 'staging', ...bad }).status, 1, `rechaza ${JSON.stringify(bad)}`);
     }
-    assert(/sin PROD_V2_CANARY_OWNER/.test(bashStep(s.run, { WORKERS: 'true' }).stdout), 'aviso: workers sin canario quedan apagados');
+    assert(/sin PROD_V2_CANARY_OWNER/.test(bashStep(s.run, { FE_REF: 'staging', WORKERS: 'true' }).stdout), 'aviso: workers sin canario quedan apagados');
+    eq(bashStep(s.run, { FE_REF: 'staging', SKIP_STORAGE: 'TRUE' }).outputs.skip_storage, 'true', 'skip storage');
   });
 
   await check('[WF] paridad con deploy-staging.yml: todo check de staging corre en producción salvo los que necesitan Moodle (con motivo); + los de producción', () => {
@@ -176,7 +179,8 @@ async function workflowChecks() {
 
   await check('[WF] esquema V2: VERIFICA (sondas por stdin, seed v1 obligatorio, propuesta r60 informativa) y NUNCA migra V2 desde deploy.yml; force no lo saltea', () => {
     const s = steps[idx((x) => /< scripts\/prod\/v2-schema-probes\.js/.test(runOf(x)), 'esquema')];
-    assert(/--pricing-keys-b64 '\$SEED_KEYS' --info-pricing-keys-b64 '\$PROPOSAL_KEYS'" < scripts\/prod\/v2-schema-probes\.js/.test(s.run), s.run);
+    assert(/--pricing-keys-b64 '\$SEED_KEYS' --info-pricing-keys-b64 '\$PROPOSAL_KEYS' \$STORAGE_ARG" < scripts\/prod\/v2-schema-probes\.js/.test(s.run), s.run);
+    assert(/STORAGE_ARG="--skip-storage-policies"/.test(s.run) && /::warning::PROD_SKIP_STORAGE_POLICY_PROBE=true/.test(s.run), 'M2: omitir las políticas de Storage solo con variable explícita y aviso');
     assert(!s.env.FORCE_DEPLOY && !/--force/.test(s.run), 'force_deploy no aplica');
     const all = wfText + fs.readFileSync(SH, 'utf8');
     assert(!/migrate-v2-production|MIGRATION_ENV=/.test(all), 'deploy.yml / prod-release.sh no corren el runner V2 ni migraciones V2');
@@ -218,13 +222,57 @@ async function workflowChecks() {
     assert(!JSON.stringify(rs).includes('DEPLOY_FREEZE'), 'el rollback no lo bloquea DEPLOY_FREEZE');
   });
 
-  await check('[WF] V1 intacto: cada proceso PM2 y cada migración del deploy.yml de origin/main sigue en prod-release.sh (mismo npm script)', () => {
-    let base;
-    try { base = execFileSync('git', ['show', 'origin/main:.github/workflows/deploy.yml'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); } catch (e) {
-      console.log('   (origin/main no disponible en este checkout: se compara contra la lista fija de V1)');
-      base = ['sudo pm2 reload cursia-backend --update-env', ...PROD_NAMES.slice(1, 8).map((n) => `ensure_pm2_process ${n} start:${n.replace(/^cursia-/, '')}`),
-        'node scripts/migrate-production-jobs-constraints.js', 'node scripts/migrate-usage-events-costs.js'].join('\n');
+  // r61 fix M4: la base de V1 es FIJA (deploy.yml de main 713a3f2, pre-V2): comparar contra origin/main pasaría en
+  // vacío después del merge de la promoción (el deploy.yml nuevo ya no tiene líneas ensure_pm2_process inline).
+  await check('[WF] I2: el gate REL R1 exige un frontend con el ejecutor dinámico (el main V1 del frontend no lo tiene) — bash ejecutado', () => {
+    const s = steps[idx((x) => /ejecutor dinámico/.test(x.name || ''), 'frontend con ejecutor')];
+    const iCo = idx((x) => x.uses === 'actions/checkout@v4' && x.with && x.with.repository === 'nicolasmoreno2914/cursia', 'checkout FE');
+    const iGate = idx((x) => /check-rel-failure-classes\.js/.test(runOf(x)), 'gate');
+    const me = steps.indexOf(s);
+    assert(iCo < me && me < iGate, 'entre el checkout y el gate');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'r61-fe-'));
+    try {
+      let r = spawnSync('bash', ['-e', '-c', s.run], { cwd: tmp, env: { PATH: process.env.PATH, FE_REF: 'main' }, encoding: 'utf8' });
+      assert(r.status === 1 && /no tiene src\/js\/45-dynamic-generation-executor\.js/.test(r.stdout), r.stdout);
+      fs.mkdirSync(path.join(tmp, 'frontend-for-gate/src/js'), { recursive: true });
+      fs.writeFileSync(path.join(tmp, 'frontend-for-gate/src/js/45-dynamic-generation-executor.js'), '//');
+      r = spawnSync('bash', ['-e', '-c', s.run], { cwd: tmp, env: { PATH: process.env.PATH, FE_REF: 'staging' }, encoding: 'utf8' });
+      eq(r.status, 0, 'con ejecutor');
+    } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  });
+
+  await check('[WF] I1: auto-rollback SOLO tras un fallo posterior al rsync (desactivable), restaura .release-prev por stdin, health + mark-ok restored; Notify sin la promesa falsa de «vaciar el canario apaga V2» (M3)', () => {
+    const iSync = idx((x) => x.id === 'sync', 'rsync con id sync');
+    const iAr = idx((x) => /Auto-rollback/.test(x.name || ''), 'auto-rollback');
+    const ar = steps[iAr];
+    eq(ar.if, "failure() && steps.sync.outcome == 'success' && vars.PROD_AUTO_ROLLBACK != 'false'", 'condición');
+    assert(iAr > iSync && iAr > idx((x) => /mark-ok/.test(runOf(x)), 'mark-ok'), 'después del rsync y del mark-ok');
+    assert(/bash -s -- rollback '\$DEPLOY_VPS_PATH'" < scripts\/ops\/prod-release\.sh/.test(ar.run) && /mark-ok '\$DEPLOY_VPS_PATH' restored/.test(ar.run) && /HEALTH_URL/.test(ar.run), ar.run);
+    const notify = steps.find((x) => x.name === 'Notify on failure');
+    assert(!/Apagar solo V2 sin tocar código: vaciar PROD_V2_CANARY_OWNER/.test(notify.run) && /V2 sigue encendido para el allowlist/.test(notify.run), 'M3');
+  });
+
+  await check('[WF] M5: el job rollback normaliza el dueño de VPS_PATH ANTES de restaurar', () => {
+    const rs = wf.jobs.rollback.steps;
+    const iC = rs.findIndex((x) => /chown -R/.test(runOf(x)));
+    const iR = rs.findIndex((x) => /bash -s -- rollback/.test(runOf(x)));
+    assert(iC >= 0 && iC < iR, `chown ${iC} restore ${iR}`);
+  });
+
+  await check('[WF] V1 intacto: cada proceso PM2 y cada migración del deploy.yml V1 (main 713a3f2, lista fija) sigue en prod-release.sh (mismo npm script)', () => {
+    const FIXED_V1 = ['sudo pm2 reload cursia-backend --update-env', ...PROD_NAMES.slice(1, 8).map((n) => `ensure_pm2_process ${n} start:${n.replace(/^cursia-/, '').replace(/^full-worker$/, 'full-worker')}`),
+      'node scripts/migrate-production-jobs-constraints.js', 'node scripts/migrate-usage-events-costs.js'].join('\n');
+    let base = FIXED_V1;
+    try {
+      const pinned = execFileSync('git', ['show', '713a3f2:.github/workflows/deploy.yml'], { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+      const pick = (t) => [...t.matchAll(/ensure_pm2_process (cursia-[\w-]+) (start:[\w-]+)|node (scripts\/migrate-[\w-]+\.js)/g)].map((m) => m[0]).sort();
+      eq(pick(pinned), pick(FIXED_V1), 'la lista fija coincide con el deploy.yml de 713a3f2');
+      base = pinned;
+    } catch (e) {
+      if (/la lista fija/.test(e.message)) throw e;
+      console.log('   (713a3f2 no disponible en este checkout: se usa la lista fija de V1)');
     }
+    assert((base.match(/ensure_pm2_process cursia-/g) || []).length === 7 && (base.match(/node scripts\/migrate-/g) || []).length === 2, 'base V1 no vacía (7 workers + 2 migraciones)');
     const sh = fs.readFileSync(SH, 'utf8');
     const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'));
     for (const m of base.matchAll(/ensure_pm2_process (cursia-[\w-]+) (start:[\w-]+)/g)) {
@@ -273,7 +321,9 @@ function mkFakeVps() {
   w(path.join(bin, 'apt-get'), '#!/bin/sh\necho "apt-get $*" >> "$CALLS"\n', 0o755);
   // pm2 falso: describe según PM2_EXISTS (lista), jlist desde el archivo (BUMP_ON_SLEEP simula crash loop).
   w(path.join(bin, 'pm2'), '#!/bin/sh\necho "pm2 $*" >> "$CALLS"\ncase "$1" in\n  describe) case " $PM2_EXISTS " in *" $2 "*) exit 0 ;; *) exit 1 ;; esac ;;\n  jlist) cat "$PM2_JLIST" ;;\nesac\nexit 0\n', 0o755);
-  w(path.join(bin, 'sleep'), '#!/bin/sh\n[ -n "$BUMP_ON_SLEEP" ] && node -e \'const f=process.argv[1];const l=JSON.parse(require("fs").readFileSync(f));l[0].pm2_env.restart_time++;require("fs").writeFileSync(f,JSON.stringify(l))\' "$PM2_JLIST"\nexit 0\n', 0o755);
+  // sleep falso: con BUMP_ON_SLEEP, a partir de la llamada nº BUMP_FROM (default 1) suma un reinicio a BUMP_NAME
+  // (default: el primer proceso del jlist = cursia-backend) → simula un crash loop antes / después del deploy.
+  w(path.join(bin, 'sleep'), '#!/bin/sh\n[ -n "$BUMP_ON_SLEEP" ] && node -e \'const fs=require("fs");const f=process.argv[1];const c=f+".sleeps";const n=(fs.existsSync(c)?Number(fs.readFileSync(c,"utf8")):0)+1;fs.writeFileSync(c,String(n));if(n<Number(process.env.BUMP_FROM||1))process.exit(0);const l=JSON.parse(fs.readFileSync(f));const p=process.env.BUMP_NAME?l.find((x)=>x.name===process.env.BUMP_NAME):l[0];p.pm2_env.restart_time++;fs.writeFileSync(f,JSON.stringify(l))\' "$PM2_JLIST"\nexit 0\n', 0o755);
   const jl = PROD_NAMES.map((n) => ({
     name: n,
     pm2_env: { status: 'online', restart_time: 0, env: { SECRET_IN_ENV: 'nunca-impreso' },
@@ -294,7 +344,7 @@ function writeRelease(app, tag, { drainHelper = true, dynamicWorkers = true } = 
   for (const m of ['migrate-production-jobs-constraints', 'migrate-usage-events-costs']) {
     fs.writeFileSync(path.join(app, `scripts/${m}.js`), `require('fs').appendFileSync(process.env.CALLS, 'node ${m} ${tag}\\n');\n`);
   }
-  fs.writeFileSync(path.join(app, 'scripts/prod/v2-schema-probes.js'), `require('fs').appendFileSync(process.env.CALLS, 'node v2-schema-probes ${tag}\\n'); process.exit(Number(process.env.PROBES_EXIT || 0));\n`);
+  fs.writeFileSync(path.join(app, 'scripts/prod/v2-schema-probes.js'), `require('fs').appendFileSync(process.env.CALLS, ['node v2-schema-probes ${tag}', ...process.argv.slice(2)].join(' ') + '\\n'); process.exit(Number(process.env.PROBES_EXIT || 0));\n`);
   const helper = path.join(app, 'scripts/pm2-drain-config.js');
   if (drainHelper) fs.copyFileSync(path.join(REPO, 'scripts/pm2-drain-config.js'), helper); else fs.rmSync(helper, { force: true });
   fs.copyFileSync(SH, path.join(app, 'scripts/ops/prod-release.sh'));
@@ -304,6 +354,7 @@ function runSh(vps, args, { input = '', env = {}, stdinScript = false } = {}) {
   const e = { PATH: `${vps.bin}:${process.env.PATH}`, HOME: vps.root, CALLS: vps.log, PM2_JLIST: vps.jlist, PM2_BIN: 'pm2',
     PM2_EXISTS: PROD_NAMES.join(' '), PROD_STABILITY_WINDOW_S: '0', ...env };
   fs.writeFileSync(vps.log, '');
+  fs.rmSync(`${vps.jlist}.sleeps`, { force: true });
   const r = stdinScript
     ? spawnSync('bash', ['-s', '--', ...args], { cwd: vps.root, env: e, input: fs.readFileSync(SH), encoding: 'utf8' })
     : spawnSync('bash', [path.join(vps.app, 'scripts/ops/prod-release.sh'), ...args], { cwd: vps.app, env: e, input, encoding: 'utf8' });
@@ -311,7 +362,8 @@ function runSh(vps, args, { input = '', env = {}, stdinScript = false } = {}) {
 }
 const cfgInput = (o = {}) => [o.token === undefined ? SECRET : o.token,
   `PROD_V2_CANARY_OWNER=${o.canary || ''}`, `PROD_V2_WORKERS_ENABLED=${o.workers || 'false'}`, `PROD_V2_GENERAL_AVAILABILITY=${o.ga || 'false'}`,
-  `PROD_DB_POOL_MAX=${o.poolMax || ''}`, 'PROD_DB_POOL_MAX_WORKER=', 'PROD_DB_POOL_IDLE_MS_WORKER=', `DEPLOY_SHA=${o.sha || 'abcdef1'}`, ...(o.extra || [])].join('\n') + '\n';
+  `PROD_DB_POOL_MAX=${o.poolMax || ''}`, 'PROD_DB_POOL_MAX_WORKER=', 'PROD_DB_POOL_IDLE_MS_WORKER=',
+  `PROD_SKIP_STORAGE_POLICY_PROBE=${o.skipStorage || 'false'}`, `DEPLOY_SHA=${o.sha || 'abcdef1'}`, ...(o.extra || [])].join('\n') + '\n';
 const envOf = (app) => fs.readFileSync(path.join(app, '.env'), 'utf8');
 const envMap = (app) => Object.fromEntries(envOf(app).split('\n').filter((l) => l.includes('=')).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
 
@@ -325,7 +377,7 @@ async function shellChecks() {
   const vps = mkFakeVps();
   try {
     writeRelease(vps.app, 'A');
-    fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nDB_HOST=db.x.supabase.co\nDB_PASS=pw-secreta\n');
+    fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nDB_HOST=db.x.supabase.co\nDB_PASS=pw-secreta\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=gk-secreta\n');
 
     await check('[SH] install sin canario: V2 apagado (DYNAMIC_COURSE_STRUCTURE=false si faltaba), workers de gasto OFF, TTS fijado, secreto escrito sin imprimirse, 2 migraciones de siempre, PM2 V1 + drenado, presencia, sondas', () => {
       const r = runSh(vps, ['install'], { input: cfgInput() });
@@ -437,9 +489,69 @@ async function shellChecks() {
       assert(r.status === 1 && /esquema V2 no está completo/.test(r.out), r.out);
     });
 
+    await check('[SH] I1: workers V1 deshabilitados por su flag (VIDEO_WORKER_ENABLED≠true, GAMMA_API_KEY vacío) se DETIENEN y no cuentan en la presencia/estabilidad', () => {
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=false\n');
+      fs.rmSync(path.join(vps.app, '.release-state'), { force: true });
+      const saved = fs.readFileSync(vps.jlist, 'utf8');
+      // En PM2 quedan detenidos/errored (salen al arrancar): no deben tumbar el deploy.
+      fs.writeFileSync(vps.jlist, JSON.stringify(JSON.parse(saved).map((p) => (['cursia-video-worker', 'cursia-gamma-worker'].includes(p.name) ? { ...p, pm2_env: { ...p.pm2_env, status: 'errored', restart_time: 40 } } : p))));
+      const r = runSh(vps, ['install'], { input: cfgInput(), env: { BUMP_ON_SLEEP: '1', BUMP_NAME: 'cursia-video-worker' } });
+      fs.writeFileSync(vps.jlist, saved);
+      eq(r.status, 0, r.out);
+      for (const n of ['cursia-video-worker', 'cursia-gamma-worker']) {
+        assert(r.calls.includes(`pm2 stop ${n}`) && !r.calls.includes(`pm2 restart ${n} --update-env`), `${n} detenido, no reiniciado`);
+      }
+      assert(/detenidos a propósito, fuera de la presencia: cursia-video-worker cursia-gamma-worker/.test(r.out), r.out);
+      assert(r.calls.includes('pm2 restart cursia-audio-worker --update-env'), 'los demás V1 igual que antes');
+      eq(fs.existsSync(path.join(vps.app, '.release-state')), false, 'un install exitoso no marca failed');
+    });
+
+    await check('[SH] I1: worker V1 que YA se reiniciaba en bucle antes del deploy → aviso, no bloquea; uno que empieza a fallar DESPUÉS → install falla y deja «failed <sha>»', () => {
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n');
+      fs.writeFileSync(path.join(vps.app, '.release-state'), 'deploying abcdef1\n');
+      let r = runSh(vps, ['install'], { input: cfgInput(), env: { BUMP_ON_SLEEP: '1', BUMP_NAME: 'cursia-audio-worker' } });
+      eq(r.status, 0, r.out);
+      assert(/cursia-audio-worker ya se reiniciaba en bucle ANTES del deploy/.test(r.out) && /inestables ya antes del deploy \(aviso, no bloquea\): cursia-audio-worker/.test(r.out), r.out);
+      r = runSh(vps, ['install'], { input: cfgInput(), env: { BUMP_ON_SLEEP: '1', BUMP_NAME: 'cursia-audio-worker', BUMP_FROM: '2' } });
+      assert(r.status === 1 && /cursia-audio-worker.*se reinició/.test(r.out), r.out);
+      eq(fs.readFileSync(path.join(vps.app, '.release-state'), 'utf8').trim(), 'failed abcdef1', 'estado explícito para el operador / auto-rollback');
+      fs.rmSync(path.join(vps.app, '.release-state'), { force: true });
+    });
+
+    await check('[SH] I3 + M1: reescribir el .env conserva su modo (0600, también .env.bak) y un secreto con barras invertidas / & se escribe literal, sin pasar por argv', () => {
+      const p = path.join(vps.app, '.env');
+      const tricky = 'tok\\n\\\\x&y\\t' + SECRET;
+      fs.writeFileSync(p, 'NODE_ENV=production\nOPENAI_TTS_MODEL=gpt-4o-mini-tts\nFINOPS_INGEST_TOKEN=viejo\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n');
+      fs.chmodSync(p, 0o600);
+      fs.rmSync(path.join(vps.app, '.env.bak'), { force: true });
+      const r = runSh(vps, ['install'], { input: cfgInput({ token: tricky }) });
+      eq(r.status, 0, r.out);
+      eq([fs.statSync(p).mode & 0o777, fs.statSync(path.join(vps.app, '.env.bak')).mode & 0o777], [0o600, 0o600], 'modo');
+      const env = envMap(vps.app);
+      eq([env.OPENAI_TTS_MODEL, env.FINOPS_INGEST_TOKEN], ['gpt-4o-mini-tts-2025-03-20', tricky], 'valores literales');
+      assert(!r.out.includes(SECRET), 'secreto no impreso');
+      const sh = fs.readFileSync(SH, 'utf8');
+      assert(!/awk -v v=/.test(sh) && /ENVIRON\["_V"\]/.test(sh), 'M1: el valor viaja por ENVIRON, no por awk -v');
+    });
+
+    await check('[SH] M8: DYNAMIC_WORKERS_HOLD con comillas / CRLF / comentario sigue apagando los workers de gasto; M2: PROD_SKIP_STORAGE_POLICY_PROBE pasa --skip-storage-policies a las sondas', () => {
+      for (const line of ['DYNAMIC_WORKERS_HOLD="true"', 'DYNAMIC_WORKERS_HOLD=true\r', 'DYNAMIC_WORKERS_HOLD=TRUE # pausa']) {
+        fs.writeFileSync(path.join(vps.app, '.env'), `NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n${line}\n`);
+        const r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true' }) });
+        eq([r.status, envMap(vps.app).DYNAMIC_PROVIDER_WORKER_ENABLED], [0, 'false'], JSON.stringify(line));
+      }
+      let r = runSh(vps, ['install'], { input: cfgInput({ skipStorage: 'true' }) });
+      assert(r.status === 0 && r.calls.includes('node v2-schema-probes A --skip-storage-policies') && /PROD_SKIP_STORAGE_POLICY_PROBE=true/.test(r.out), r.calls.join(' | '));
+      r = runSh(vps, ['install'], { input: cfgInput() });
+      assert(r.calls.includes('node v2-schema-probes A'), 'sin la variable: sondas completas');
+      eq(runSh(vps, ['install'], { input: cfgInput({ skipStorage: 'si' }) }).status, 1, 'valor inválido');
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n');
+    });
+
     await check('[SH] ciclo de releases: snapshot (pre-r61) → mark-ok → snapshot; deploy a medias NO pisa el snapshot sano; rollback restaura (sin migrar; .env y node_modules intactos)', () => {
       const app = vps.app;
       fs.rmSync(path.join(app, '.release-sha'), { force: true });
+      fs.rmSync(path.join(app, '.release-state'), { force: true });
       fs.mkdirSync(path.join(app, 'node_modules/pg'), { recursive: true });
       fs.writeFileSync(path.join(app, 'node_modules/pg/index.js'), '// pg');
       writeRelease(app, 'A');
@@ -448,7 +560,7 @@ async function shellChecks() {
       eq(r.status, 0, r.out);
       eq([fs.readFileSync(path.join(app, '.release-prev/dist/main.js'), 'utf8'), fs.readFileSync(path.join(app, '.release-prev/.release-sha'), 'utf8').trim(),
         fs.readFileSync(path.join(app, '.release-state'), 'utf8').trim()], ['// release A\n', 'pre-r61', 'deploying b0b0b0b'], 'snapshot A');
-      assert(!fs.existsSync(path.join(app, '.release-prev/node_modules')) && !fs.existsSync(path.join(app, '.release-prev/.env')), 'sin node_modules ni .env');
+      assert(fs.existsSync(path.join(app, '.release-prev/node_modules/pg/index.js')) && !fs.existsSync(path.join(app, '.release-prev/.env')), 'con node_modules (M6), sin .env');
       // 2) deploy B ok.
       writeRelease(app, 'B');
       fs.writeFileSync(path.join(app, '.release-sha'), 'b0b0b0b\n');
@@ -471,7 +583,8 @@ async function shellChecks() {
       ['// release B\n', 'b0b0b0b', 'rolledback b0b0b0b', '// release C\n'], 'restaurado');
       eq(envOf(app), envBefore, '.env intacto');
       assert(fs.existsSync(path.join(app, 'node_modules/pg/index.js')), 'node_modules intacto');
-      assert(r.calls.includes('npm install --omit=dev') && !r.calls.some((c) => /migrate-/.test(c)), `sin migraciones: ${r.calls.join(' | ')}`);
+      assert(!r.calls.includes('npm install --omit=dev') && !r.calls.some((c) => /migrate-/.test(c)), `sin npm (node_modules del snapshot) y sin migraciones: ${r.calls.join(' | ')}`);
+      assert(!fs.existsSync(path.join(app, '.release-failed/node_modules')), 'la copia de diagnóstico no duplica node_modules');
       assert(r.calls.includes('pm2 reload cursia-backend --update-env') && r.calls.includes('pm2 save'), 'PM2 recargado');
       r = runSh(vps, ['mark-ok', app, 'restored'], { stdinScript: true });
       eq([r.status, fs.readFileSync(path.join(app, '.release-state'), 'utf8').trim()], [0, 'ok b0b0b0b'], 'mark-ok restored');

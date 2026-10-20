@@ -25,7 +25,11 @@
 #   PROD_DB_POOL_MAX / PROD_DB_POOL_MAX_WORKER / PROD_DB_POOL_IDLE_MS_WORKER
 #                                   pool por proceso (vacío = no se toca el .env).
 #   PROD_DEPLOY_BLOCK_ON_V1_JOBS=true  los jobs V1 con lease vigente también bloquean.
-#   PROD_FE_GATE_REF                rama/commit del frontend para el gate REL R1 (default main).
+#   PROD_FE_GATE_REF                OBLIGATORIA: rama/commit del frontend contra el que corre el gate
+#                                   REL R1 (el frontend que se promueve; el main V1 del frontend NO tiene
+#                                   el ejecutor dinámico). Sin ella el deploy falla con instrucciones.
+#   PROD_SKIP_STORAGE_POLICY_PROBE=true  solo si el apply se hizo con --skip-storage-policies (aviso).
+#   PROD_AUTO_ROLLBACK=false        desactiva el rollback automático tras un fallo POSTERIOR al rsync.
 #
 # ESTRATEGIA:
 #   0. Guardia DEPLOY_FREEZE (primer paso).
@@ -104,6 +108,7 @@ jobs:
           POOL_IDLE_WORKER: ${{ vars.PROD_DB_POOL_IDLE_MS_WORKER }}
           BLOCK_V1: ${{ vars.PROD_DEPLOY_BLOCK_ON_V1_JOBS }}
           FE_REF: ${{ vars.PROD_FE_GATE_REF }}
+          SKIP_STORAGE: ${{ vars.PROD_SKIP_STORAGE_POLICY_PROBE }}
         run: |
           set -e
           CANARY="$(printf '%s' "$CANARY" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
@@ -114,14 +119,19 @@ jobs:
           WORKERS="$(b "$WORKERS" PROD_V2_WORKERS_ENABLED)"
           GA="$(b "$GA" PROD_V2_GENERAL_AVAILABILITY)"
           BLOCK_V1="$(b "$BLOCK_V1" PROD_DEPLOY_BLOCK_ON_V1_JOBS)"
+          SKIP_STORAGE="$(b "$SKIP_STORAGE" PROD_SKIP_STORAGE_POLICY_PROBE)"
           for v in "$POOL_MAX" "$POOL_MAX_WORKER" "$POOL_IDLE_WORKER"; do
             if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq '^[0-9]{1,6}$'; then echo "::error::PROD_DB_POOL_* debe ser un entero"; exit 1; fi
           done
-          FE_REF="${FE_REF:-main}"
+          # r61 fix I2: sin default. El main V1 del frontend no tiene el ejecutor dinámico y el gate REL R1 fallaría.
+          if [ -z "$FE_REF" ]; then
+            echo "::error title=PROD_FE_GATE_REF::Falta la variable PROD_FE_GATE_REF (rama/commit del frontend que se promueve, p. ej. el commit de release del frontend o staging). Ver docs/v2-production-promotion-runbook.md §1.2 y Fase 2."
+            exit 1
+          fi
           if ! printf '%s' "$FE_REF" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$'; then echo "::error::PROD_FE_GATE_REF inválido"; exit 1; fi
           if [ "$WORKERS" = "true" ] && [ -z "$CANARY" ]; then echo "::warning::PROD_V2_WORKERS_ENABLED=true sin PROD_V2_CANARY_OWNER: los workers de gasto quedan APAGADOS"; fi
           {
-            echo "canary=$CANARY"; echo "workers=$WORKERS"; echo "ga=$GA"; echo "block_v1=$BLOCK_V1"; echo "fe_ref=$FE_REF"
+            echo "canary=$CANARY"; echo "workers=$WORKERS"; echo "ga=$GA"; echo "block_v1=$BLOCK_V1"; echo "fe_ref=$FE_REF"; echo "skip_storage=$SKIP_STORAGE"
             echo "pool_max=$POOL_MAX"; echo "pool_max_worker=$POOL_MAX_WORKER"; echo "pool_idle_worker=$POOL_IDLE_WORKER"
           } >> "$GITHUB_OUTPUT"
           echo "V2 canario: ${CANARY:-(ninguno → V2 apagado)} · workers de gasto: $WORKERS · GA: $GA · bloquear por jobs V1: $BLOCK_V1 · FE gate ref: $FE_REF"
@@ -229,6 +239,16 @@ jobs:
           token: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
           persist-credentials: false
 
+      - name: Frontend del gate trae el ejecutor dinámico (no el main V1)
+        env:
+          FE_REF: ${{ steps.cfg.outputs.fe_ref }}
+        run: |
+          if [ ! -f frontend-for-gate/src/js/45-dynamic-generation-executor.js ]; then
+            echo "::error title=PROD_FE_GATE_REF::El frontend en '$FE_REF' no tiene src/js/45-dynamic-generation-executor.js (¿el main V1 del frontend?). Apuntar PROD_FE_GATE_REF al frontend que se promueve."
+            exit 1
+          fi
+          echo "✓ frontend $FE_REF con el ejecutor dinámico"
+
       - name: Check REL R1 clasificador central de fallos (backend + frontend, obligatorio)
         run: node scripts/check-rel-failure-classes.js --require-fe --fe frontend-for-gate
 
@@ -295,9 +315,15 @@ jobs:
           DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
           SEED_KEYS: ${{ steps.pricing.outputs.seed }}
           PROPOSAL_KEYS: ${{ steps.pricing.outputs.proposal }}
+          SKIP_STORAGE: ${{ steps.cfg.outputs.skip_storage }}
         run: |
+          STORAGE_ARG=""
+          if [ "$SKIP_STORAGE" = "true" ]; then
+            STORAGE_ARG="--skip-storage-policies"
+            echo "::warning::PROD_SKIP_STORAGE_POLICY_PROBE=true: no se verifican las políticas de storage.objects (apply con --skip-storage-policies; los uploads del ejecutor V2 darían 403)."
+          fi
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
-            "cd '$DEPLOY_VPS_PATH' && node - --pricing-keys-b64 '$SEED_KEYS' --info-pricing-keys-b64 '$PROPOSAL_KEYS'" < scripts/prod/v2-schema-probes.js
+            "cd '$DEPLOY_VPS_PATH' && node - --pricing-keys-b64 '$SEED_KEYS' --info-pricing-keys-b64 '$PROPOSAL_KEYS' $STORAGE_ARG" < scripts/prod/v2-schema-probes.js
 
       - name: Fix VPS file ownership (heals stale root-owned files from past manual deploys)
         env:
@@ -320,6 +346,7 @@ jobs:
 
       # .release-* (snapshot de rollback, estado, sha) queda excluido: --delete nunca lo borra.
       - name: Sync source + dist to VPS
+        id: sync
         env:
           DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
           DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
@@ -347,13 +374,14 @@ jobs:
           POOL_MAX: ${{ steps.cfg.outputs.pool_max }}
           POOL_MAX_WORKER: ${{ steps.cfg.outputs.pool_max_worker }}
           POOL_IDLE_WORKER: ${{ steps.cfg.outputs.pool_idle_worker }}
+          SKIP_STORAGE: ${{ steps.cfg.outputs.skip_storage }}
           DEPLOY_SHA: ${{ github.sha }}
         run: |
           # Línea 1 = secreto (nunca en argv ni en el log); luego KEY=VALUE no secretos (re-validados en el VPS).
           printf '%s\n' "$FINOPS_INGEST_TOKEN_PRODUCTION" \
             "PROD_V2_CANARY_OWNER=$CANARY" "PROD_V2_WORKERS_ENABLED=$WORKERS" "PROD_V2_GENERAL_AVAILABILITY=$GA" \
             "PROD_DB_POOL_MAX=$POOL_MAX" "PROD_DB_POOL_MAX_WORKER=$POOL_MAX_WORKER" "PROD_DB_POOL_IDLE_MS_WORKER=$POOL_IDLE_WORKER" \
-            "DEPLOY_SHA=$DEPLOY_SHA" \
+            "PROD_SKIP_STORAGE_POLICY_PROBE=$SKIP_STORAGE" "DEPLOY_SHA=$DEPLOY_SHA" \
           | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
               "cd '$DEPLOY_VPS_PATH' && bash scripts/ops/prod-release.sh install"
 
@@ -387,15 +415,43 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
             "bash -s -- mark-ok '$DEPLOY_VPS_PATH' '$DEPLOY_SHA'" < scripts/ops/prod-release.sh
 
+      # r61 fix I1: un fallo DESPUÉS del rsync (install / health) no deja producción a medias sin dueño: se
+      # restaura automáticamente la última release sana (.release-prev, sin migrar). Desactivable con
+      # PROD_AUTO_ROLLBACK=false (queda el estado «failed <sha>» y el rollback manual por dispatch).
+      - name: Auto-rollback tras un fallo posterior al rsync
+        if: failure() && steps.sync.outcome == 'success' && vars.PROD_AUTO_ROLLBACK != 'false'
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "bash -s -- rollback '$DEPLOY_VPS_PATH'" < scripts/ops/prod-release.sh
+          sleep 20
+          for i in 1 2 3 4 5; do
+            RESPONSE=$(curl -sf --max-time 15 "$HEALTH_URL" || echo "FAILED")
+            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
+              ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+                "bash -s -- mark-ok '$DEPLOY_VPS_PATH' restored" < scripts/ops/prod-release.sh
+              echo "::warning::Deploy fallido revertido automáticamente a la release anterior (.release-prev). El job queda en rojo a propósito."
+              exit 0
+            fi
+            sleep 8
+          done
+          echo "::error::El auto-rollback no pasó el health check — intervención manual (runbook §4)."
+          exit 1
+
       - name: Notify on failure
         if: failure()
         run: |
           echo "⚠️  El deploy de PRODUCCIÓN falló en el commit $(git rev-parse --short HEAD 2>/dev/null || echo '?')."
           echo "Si falló ANTES del rsync (checks / preflight / guardia / esquema), producción NO cambió."
-          echo "Si falló después: Actions → «Deploy to Contabo VPS» → Run workflow → action=rollback"
-          echo "  (restaura .release-prev/ = la última release sana, sin migrar)."
-          echo "Apagar solo V2 sin tocar código: vaciar PROD_V2_CANARY_OWNER y redeployar, o editar el .env del VPS"
-          echo "  (docs/v2-production-promotion-runbook.md §Rollback)."
+          echo "Si falló después: el paso «Auto-rollback» restauró .release-prev/ (salvo PROD_AUTO_ROLLBACK=false);"
+          echo "  si no corrió o falló: Actions → «Deploy to Contabo VPS» → Run workflow → action=rollback."
+          echo "Cortar el GASTO de V2 sin tocar código: vaciar PROD_V2_CANARY_OWNER y redeployar (apaga los workers de"
+          echo "  proveedores/IA; V2 sigue encendido para el allowlist). Apagar V2 del todo: DYNAMIC_COURSE_STRUCTURE=false"
+          echo "  en el .env del VPS + pm2 restart --update-env de los 11 procesos (docs/v2-production-promotion-runbook.md §4)."
 
   rollback:
     name: Rollback to previous release (.release-prev, sin migraciones)
@@ -427,7 +483,16 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
             "cd '$DEPLOY_VPS_PATH' && node - --legacy --force" < scripts/ops/check-active-runs.js
 
-      - name: Restore .release-prev on the VPS (npm install + PM2, sin migraciones)
+      - name: Fix VPS file ownership (antes de restaurar; un archivo de root cortaría el rsync a mitad)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "sudo chown -R '$DEPLOY_VPS_USER:$DEPLOY_VPS_USER' '$DEPLOY_VPS_PATH'"
+
+      - name: Restore .release-prev on the VPS (código + node_modules del snapshot + PM2, sin migraciones)
         env:
           DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
           DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
