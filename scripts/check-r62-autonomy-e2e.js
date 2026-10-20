@@ -171,6 +171,33 @@ const SCENARIOS = [
     },
   },
   {
+    id: 'lease_takeover_alive', what: 'el proceso del worker de IA se congela (SIGSTOP) con el Libro cap. 2 en vuelo, pierde la lease, otro proceso la toma y el primero revive (SIGCONT) con la respuesta',
+    // Inactividad del stream holgada (60 s) solo acá: lo que se prueba es la toma de la lease con A vivo, no el timeout.
+    env: { DYNAMIC_LLM_WORKER_IDLE_MS: '60000' },
+    setup({ P }) { P.llm.rule('inflightLlm', (i) => LLM_POST(i) && isContent(i.text, 2, CH2), 'delay', { times: 1, ms: 5_000 }); },
+    async tick(ctx) {
+      const { P, S, stack } = ctx;
+      if (!S.frozen && P.llm.st.calls.some((c) => c.rule === 'inflightLlm' && c.outcome === 'pending' && Date.now() - c.at > 2000)) {
+        S.frozen = stack.workers.provider;
+        S.frozenAt = Date.now();
+        S.llmVictim = `${S.frozen.label}-llm`;
+        log(`  ↯ SIGSTOP ${S.frozen.label} (Libro cap. 2 en vuelo); proceso nuevo`);
+        S.frozen.kill('SIGSTOP');
+        await stack.spawnWorker('provider', 'b');
+      }
+      if (S.frozen && !S.resumed && Date.now() - S.frozenAt > 25_000) {
+        S.resumed = true;
+        log(`  ↯ SIGCONT ${S.frozen.label}`);
+        S.frozen.kill('SIGCONT');
+      }
+    },
+    async verify(ctx, rows) {
+      const { S } = ctx;
+      const content2 = rows.find((r) => r.type === 'content' && r.chapter_id === ctx.course.mods[0].chapters[1].id);
+      return { llmTakeover: S.frozen ? `${content2 && content2.status}/${content2 && content2.worker_id} (víctima ${S.llmVictim})` : 'no se disparó' };
+    },
+  },
+  {
     id: 'run_interrupt_resume', what: 'interrupción del run completo (kill -9 de app + todos los workers con 5+ partes hechas) y reanudación (procesos nuevos)',
     async tick(ctx) {
       const { S, stack } = ctx;
@@ -363,7 +390,8 @@ async function createStack(name) {
   };
   S.spawnWorker = async (kind, suffix) => {
     const id = `r62-${kind}-${S.scen || 'x'}-${suffix}`;
-    const [script, env] = S.workerSpec(kind, id);
+    const [script, env0] = S.workerSpec(kind, id);
+    const env = { ...env0, ...(S.envOverride || {}) };
     const ch = spawnProc(id, script, env);
     S.workers[kind] = ch;
     return ch;
@@ -563,6 +591,7 @@ async function operatorAct(S, ctx, snap, reason) {
 async function runScenario(S, sc) {
   const { duplicateReport } = require('./lib/r62-fault-proxy');
   S.scen = sc.id;
+  S.envOverride = sc.env || null;
   for (const p of Object.values(S.P)) p.reset(sc.id);
   S.llm.st.invalidSent = {}; S.llm.st.retriesSeen = {}; S.llm.st.unknown = [];
   S.llm.st.tag = sc.id;
