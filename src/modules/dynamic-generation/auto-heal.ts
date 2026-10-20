@@ -503,6 +503,9 @@ export interface AmbiguousAudioPending {
    */
   lostUsd?: number;
   lostProviders?: string[];
+  /** Trozos / segmentos TTS perdidos (metadata.chunk) y cargos del guion LLM perdidos: lo único que se marca al reenviar. */
+  lostChunks?: number[];
+  lostLlm?: number;
 }
 
 /** r62: resultado de ambiguousResendBudget (finops/run-spend-guard.ts) para el reenvío de ESTE item. */

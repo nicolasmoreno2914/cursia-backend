@@ -274,8 +274,9 @@ async function pureChecks() {
       // re-review 3: dependencia cancelada / omitida → nunca oculta para siempre; con el techo desde el fin de la dependencia.
       for (const st of ['cancelled', 'skipped']) {
         const dd = (minsAgo) => ({ item_key: 'video:ch1', type: 'video', status: st, finished_at: new Date(now.getTime() - minsAgo * 60_000).toISOString() });
-        eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, { dep: dd(5) }), null, `${st} reciente: dentro del techo`);
-        eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, { dep: dd(40) })?.code, 'retry_item', `${st} hace 40 min: acción visible`);
+        // review lost_result: sin recuperación automática viva → acción INMEDIATA (sin esperar el techo).
+        eq(RC.adminActionFor(cpRow(1)[0], 'not_done', now, { dep: dd(1) })?.code, 'retry_item', `${st}: acción inmediata`);
+        eq(RC.adminActionFor({ ...cpRow(1)[0], attention_reason: 'dependency_unavailable' }, 'not_done', now)?.code, 'retry_item', `${st}: atención dependency_unavailable → acción inmediata`);
         eq(CPR.claimPayloadRecoveryDecision(cpRow(1)[0], dd(1), 'mock'), { action: 'exception', depKey: 'video:ch1', code: 'VIDEO_YOUTUBE_ID_MISSING', reason: 'dependency_unavailable' }, `${st}: el barrido la registra como excepción`);
       }
       const vjob = { id: 'j', status: 'failed', worker_status: 'failed', input_payload: {} };
@@ -658,14 +659,14 @@ async function dbChecks() {
     const SEC = (t, n) => `## ${t}\n\n` + Array.from({ length: n }, (_, i) => `El técnico revisa la bomba número ${i} y registra presión, caudal y temperatura en la planilla del turno.`).join(' ');
     /** Capítulo de 3 bloques (≥ 3 segmentos de TTS): el reenvío tiene que tocar SOLO el segmento afectado. */
     const LONG_MD = `# Bombas\n\n${SEC('Inspección', 34)}\n\n${SEC('Mantenimiento', 41)}\n\n${SEC('Registro', 49)}`;
-    async function freshRun(title, { videos = false, authorized = '500', c1Md = null } = {}) {
+    async function freshRun(title, { videos = false, authorized = '500', c1Md = null, welcome = null } = {}) {
       const K = await makeCourse(title, { videos });
       const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /^budget_approval_required/, `aprobación ${title}`, 409);
       await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: authorized, approvedBy: 'admin@cursia.test' });
       const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' })).run.id;
       await seedDependency(rid, `content:${K.c1}`, 'dynamic_content_md', c1Md || CONTENT_MD('Bombas'), 'text/markdown');
       await seedDependency(rid, `content:${K.c2}`, 'dynamic_content_md', CONTENT_MD('Válvulas'), 'text/markdown');
-      await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: 'Hola y bienvenida al curso de hidráulica de planta.' }), 'application/json');
+      await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: welcome || 'Hola y bienvenida al curso de hidráulica de planta.' }), 'application/json');
       return { ...K, rid };
     }
     const workerDeps = (over = {}) => ({
@@ -802,6 +803,115 @@ async function dbChecks() {
       await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
       row = await itemRow(R.rid, key);
       eq(row.status, 'completed', `completa (${row.error})`);
+    });
+
+    const LONG_WELCOME = Array.from({ length: 40 }, (_, i) => `Esta es la oración ${i + 1} de la bienvenida al curso de hidráulica de planta, pensada para técnicos de mantenimiento.`).join(' ');
+    const faulty = (obj, pred) => new Proxy(obj, { get(t, k) { const v = t[k]; if (typeof v !== 'function') return v; return (...a) => (pred(k, a) ? Promise.reject(new Error('EMAXCONNSESSION: db caída (simulada)')) : v.apply(t, a)); } });
+    const ackOf = (row) => Number(row.output_summary?.reconciliationAcknowledgedThroughAttempt ?? 0);
+    const orphansBehindAck = async (row) => (await reservationsOf(row.id, 'openai')).filter((x) => !x.adj && Number(x.attempt) <= ackOf(row));
+
+    await check('review lost_result I1: bienvenida de 2 trozos, 529 en el trozo 2 → el trozo 1 COBRADO se liquida ANTES del ack (0 reservas detrás del ack); con la liquidación caída no hay ack (reconciliación) y el barrido lo resuelve: 0 reservas abiertas', async () => {
+      const R = await freshRun('r62 529 trozo 2', { welcome: LONG_WELCOME });
+      const key = `audio_welcome:${R.cid}`;
+      fakes.plan.ttsFail = [undefined, 529];
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      let row = await itemRow(R.rid, key);
+      eq([row.status, ackOf(row)], ['retrying', 1], `529 conocido: reintentable y reconocido (${row.error})`);
+      eq((await orphansBehindAck(row)).length, 0, 'ninguna reserva cobrada detrás del ack');
+      // Ahora con la DB del ledger caída en la liquidación (≈ kill entre liquidar y reconocer).
+      const R2 = await freshRun('r62 529 trozo 2 sin ledger', { welcome: LONG_WELCOME });
+      const key2 = `audio_welcome:${R2.cid}`;
+      fakes.plan.ttsFail = [undefined, 529];
+      await PW.processProviderItem(workerDeps({ finops: faulty(ledger, (k) => k === 'settleReservation') }), await claimProvider(R2.rid, 'audio_welcome')).catch(() => {});
+      fakes.plan.ttsFail = [];
+      let r2 = await itemRow(R2.rid, key2);
+      eq([r2.status, ackOf(r2)], ['failed', 0], `sin ack (reconciliación): ${r2.error}`);
+      eq((await orphansBehindAck(r2)).length, 0, 'nada detrás del ack');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), R2.rid).length, 1, 'el barrido lo toma (reenvío acotado)');
+      await PW.processProviderItem(workerDeps(), await claimProvider(R2.rid, 'audio_welcome'));
+      r2 = await itemRow(R2.rid, key2);
+      eq(r2.status, 'completed', `completa (${r2.error})`);
+      eq((await reservationsOf(r2.id, 'openai')).filter((x) => !x.adj).length, 0, '0 reservas abiertas');
+    });
+
+    await check('review lost_result: la SUBIDA del MP3 falla (Storage) → cobrado y liquidado sin resultado → lost_result a nivel worker: UN reenvío, solo el trozo perdido marcado; un 2.º perdido → excepción (sin otro reenvío)', async () => {
+      const R = await freshRun('r62 subida caída');
+      const key = `audio_welcome:${R.cid}`;
+      const t0 = fakes.st.tts.length;
+      await rejectsRe(PW.processProviderItem(workerDeps({ artifacts: faulty(artifacts, (k) => k === 'uploadBufferArtifact') }), await claimProvider(R.rid, 'audio_welcome')), /pagado sin persistir/, 'subida caída → resultado perdido');
+      let row = await itemRow(R.rid, key);
+      eq([row.status, AH.isLostPaidResultError(row.error)], ['failed', true], 'forma lost_result');
+      eq((await reservationsOf(row.id, 'openai')).filter((x) => !x.adj).length, 0, 'lo cobrado quedó liquidado (registrado)');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), R.rid).length, 1, 'UN reenvío');
+      row = await itemRow(R.rid, key);
+      eq(row.output_summary.lostResultResend.lostChunks, [0], 'solo el trozo perdido');
+      // El reenvío vuelve a perder el resultado (otra subida caída) → excepción, nunca un 2.º reenvío.
+      await rejectsRe(PW.processProviderItem(workerDeps({ artifacts: faulty(artifacts, (k) => k === 'uploadBufferArtifact') }), await claimProvider(R.rid, 'audio_welcome')), /pagado sin persistir/, '2.º perdido');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(10) }), R.rid).length, 0, 'sin 2.º reenvío');
+      row = await itemRow(R.rid, key);
+      eq([row.status, row.attention_reason], ['failed', 'duplicate_charge'], 'excepción registrada');
+      const marked = (await events(`item_run_id = $1 and provider = 'openai' and event_kind = 'CHARGE' and coalesce(metadata->>'reservation','false') <> 'true'`, [row.id])).filter((c) => c.metadata.lostResultResend === true);
+      eq([marked.length, fakes.st.tts.length - t0], [1, 2], 'el cargo del reenvío marcado; 2 llamadas en total');
+    });
+
+    await check('review lost_result duda 3: el intento N+1 cae ANTES de llegar al proveedor (lease) → la marca la consume el intento que de verdad reenvía (N+2)', async () => {
+      const R = await freshRun('r62 marca N+2');
+      const key = `audio_welcome:${R.cid}`;
+      const it = await itemRow(R.rid, key);
+      const H = loadDist('workers/finops-worker-hooks.js');
+      await ledger.recordCharge(H.ttsChargeInput({ ownerId: OWNER, itemRunId: it.id, requestId: 'req_r62_n2', audioSeconds: 4, characters: 60, model: 'gpt-4o-mini-tts-2025-03-20', generation: 1, chunk: 0, itemAttempt: 1 }));
+      await ds.query(`update public.generation_item_runs set status = 'retrying', attempt_count = 1, max_attempts = 3, error = 'lease_expired', next_retry_at = now() - interval '1 second' where id = $1`, [it.id]);
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /sin resultado persistido/, 'frenado');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), R.rid).length, 1, 'reabierto');
+      // N+1 se reclama y su lease vence antes de llamar a OpenAI.
+      const n1 = await claimProvider(R.rid, 'audio_welcome');
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [n1.itemRunId]);
+      await sched.sweepExpiredLeases(R.rid);
+      await ds.query(`update public.generation_item_runs set next_retry_at = now() - interval '1 second' where id = $1`, [n1.itemRunId]);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      const row = await itemRow(R.rid, key);
+      eq(row.status, 'completed', `completa (${row.error})`);
+      const charges = await events(`item_run_id = $1 and provider = 'openai' and event_kind = 'CHARGE' and coalesce(metadata->>'reservation','false') <> 'true'`, [row.id]);
+      eq(charges.filter((c) => c.metadata.lostResultResend === true).length, 1, 'el reenvío real (N+2) quedó marcado');
+      eq([typeof row.output_summary.lostResultResend.consumedAttempt], ['number'], 'marca consumida');
+    });
+
+    await check('review lost_result: guion LLM del audiolibro COBRADO sin guardar (anthropic) → lost_result de punta a punta: UN reenvío, el cargo LLM nuevo marcado; una reserva LLM ENVIADA sin liquidar → provider_check (sin reenvío)', async () => {
+      const R = await freshRun('r62 lost llm');
+      const key = `audiobook_chapter:${R.c1}`;
+      const it = await itemRow(R.rid, key);
+      const H = loadDist('workers/finops-worker-hooks.js');
+      await ledger.recordCharge(H.serverLlmChargeInput({ ownerId: OWNER, itemRunId: it.id, model: 'claude-sonnet-4-6', messageId: 'msg_r62_lost', requestId: null,
+        usage: { input_tokens: 100, output_tokens: 200 }, callRole: 'main', attempt: 1 }));
+      await ds.query(`update public.generation_item_runs set status = 'retrying', attempt_count = 1, max_attempts = 3, error = 'lease_expired', next_retry_at = now() - interval '1 second' where id = $1`, [it.id]);
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter')), /^provider_reconciliation_required: anthropic .*sin resultado persistido/, 'frenado (anthropic)');
+      const f = await itemRow(R.rid, key);
+      eq(FC.classifyFailure({ error: f.error, itemType: 'audiobook_chapter', source: 'provider_worker' }).strategy, 'auto_resubmit_once', 'clasificador = barrido');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), R.rid).length, 1, 'UN reenvío');
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter'));
+      const row = await itemRow(R.rid, key);
+      eq(row.status, 'completed', `completa (${row.error})`);
+      const llm = await events(`item_run_id = $1 and provider = 'anthropic' and event_kind = 'CHARGE' and coalesce(metadata->>'reservation','false') <> 'true'`, [row.id]);
+      eq(llm.filter((c) => c.metadata.lostResultResend === true).length, 1, 'un solo cargo LLM marcado (el reenviado)');
+      eq((await events(`item_run_id = $1 and provider = 'openai' and event_kind = 'CHARGE' and coalesce(metadata->>'reservation','false') <> 'true'`, [row.id])).filter((c) => c.metadata.lostResultResend === true).length, 0, 'los segmentos nuevos (nunca pagados) sin marca');
+    });
+
+    await check('review lost_result M4: falla la liquidación de un segmento YA guardado → transitorio (no gasta el reenvío único); el próximo claim liquida el segmento con su medición y completa sin repagar', async () => {
+      const R = await freshRun('r62 seg liquidación caída');
+      const key = `audiobook_chapter:${R.c1}`;
+      let n = 0;
+      await PW.processProviderItem(workerDeps({ finops: faulty(ledger, (k, a) => k === 'settleReservation' && String(a[0]).includes(':seg_') && n++ === 0) }), await claimProvider(R.rid, 'audiobook_chapter')).catch(() => {});
+      let row = await itemRow(R.rid, key);
+      assert(row.status === 'retrying' && !/reconciliation/.test(String(row.error)), `transitorio (${row.status}: ${row.error})`);
+      eq(row.output_summary.ambiguousAudioResubmit, undefined, 'el reenvío único no se tocó');
+      const t0 = fakes.st.tts.length;
+      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter'));
+      row = await itemRow(R.rid, key);
+      eq(row.status, 'completed', `completa (${row.error})`);
+      assert(row.output_summary.reusedSegments >= 1, 'reutiliza el segmento guardado');
+      eq((await reservationsOf(row.id, 'openai')).filter((x) => !x.adj).length, 0, '0 reservas abiertas');
+      assert(fakes.st.tts.length - t0 < row.output_summary.chunks, 'no repagó el segmento guardado');
     });
 
     // ═══ E2E-M «resultado pagado perdido» (run_interrupt_resume, 2.ª vuelta) ═══════════

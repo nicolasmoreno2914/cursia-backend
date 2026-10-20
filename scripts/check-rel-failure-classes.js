@@ -522,6 +522,10 @@ check('#583 + r62: el reenvío automático ÚNICO de audio TTS incierto (peor ca
   // reenvío único acotado (auto_resubmit_once); un guion ENVIADO sin resultado (en el aire) sigue siendo provider_check.
   expectVerdict('provider_reconciliation_required: anthropic — guion pagado sin persistir', { class: 'C', strategy: 'auto_resubmit_once' }, { itemType: 'audiobook_chapter' });
   expectVerdict('provider_reconciliation_required: anthropic — llamada pagada enviada sin resultado liquidado', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
+  // review lost_result M1: la reserva ENVIADA y sin liquidar de un intento anterior (texto distinto de priorPaidBlock) no
+  // es un resultado perdido: el clasificador coincide con el barrido (provider_check, sin reenvío automático).
+  expectVerdict('provider_reconciliation_required: anthropic — operación pagada de un intento anterior enviada y sin liquidar. anthropic reservation:llm:x (intento 1).', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
+  expectVerdict('provider_reconciliation_required: anthropic — operación pagada de un intento anterior sin resultado persistido. anthropic msg_1 (intento 1).', { class: 'C', strategy: 'auto_resubmit_once' }, { itemType: 'audiobook_chapter' });
   assert(FC.currentRecoveryOf('provider_reconciliation_required: anthropic — x', 'audiobook_chapter', {}) === 'denied', 'anthropic');
   for (const itemType of ['video', 'presentation']) {
     expectVerdict(msg, { class: 'C', strategy: 'provider_check' }, { itemType });
