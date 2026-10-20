@@ -12,10 +12,14 @@ import { latestGenerationPredicate } from './item-generations';
 import { RunsService } from './runs.service';
 import { loadPendingVideogenReservations } from './run-completion';
 import {
-  PROVIDER_RECONCILE_AMBIGUOUS_KINDS,
-  PROVIDER_RECONCILE_EXCLUDED_COURSE_IDS,
+  PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK,
+  PROVIDER_RECONCILE_EXCLUDED_RUN_IDS,
+  PROVIDER_RECONCILE_EXCLUDED_RUN_PREFIXES,
   PROVIDER_RECONCILE_KEY,
+  PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS,
   PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS,
+  PROVIDER_RECONCILE_MAX_REPOLLS,
+  PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS,
   PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS,
   PROVIDER_RECONCILE_MAX_AMBIGUOUS_RESUBMITS,
   PROVIDER_RECONCILE_MAX_RESUBMITS,
@@ -24,8 +28,13 @@ import {
   ProviderReconcileKind,
   gammaMeasuredCreditsOf,
   providerReconcileDecision,
+  providerReconcileRecheckSeconds,
+  providerReconcileRunEligible,
+  providerReconcileRunsSince,
   providerReconcileStateOf,
   videogenCountedAmount,
+  videogenJobIdOf,
+  videogenZeroCostReleasable,
 } from './provider-reconcile';
 
 /**
@@ -43,6 +52,8 @@ import {
 export interface ProviderReconcileClients {
   videogen?: Pick<VideogenService, 'getVideoStatus' | 'getVideoCost'> | null;
   gamma?: { getGeneration(generationId: string): Promise<GammaGenerationStatus> } | null;
+  /** Timeout de cada GET del barrido (default PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS; pruebas). */
+  lookupTimeoutMs?: number;
 }
 export const PROVIDER_RECONCILE_CLIENTS = 'PROVIDER_RECONCILE_CLIENTS';
 
@@ -53,14 +64,16 @@ export const PROVIDER_RECONCILE_DECIDED_BY = 'system';
 type Row = {
   id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
   finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number; attempt_count: number;
+  generation: number; run_created_at: Date | null;
 };
 
 type PendingCharge = { idempotency_key: string; amount: string; reservation: boolean; attempt: number; provider: string; external_operation_id: string | null };
 
 /** Resultado de la evidencia de UNA parte. */
 type Evidence =
-  | { action: 'wait'; why: string }
-  | { action: 'repoll'; why: string }
+  | { action: 'wait'; why: string; recheck?: boolean; zeroCostSeenAt?: string }
+  | { action: 'repoll'; why: string; adoptJobId?: string | null }
+  | { action: 'decline'; reason: string; attention: 'budget' | 'duplicate_charge' | 'unrecoverable'; why: string }
   | { action: 'resubmit'; ambiguous: boolean; settlement: string; counted: string | null; why: string; reservedAmount: string | null };
 
 export interface ProviderReconcileSweepResult {
@@ -75,6 +88,8 @@ export interface ProviderReconcileSweepResult {
 }
 
 class LookupError extends Error {}
+/** Review I2: la fila cambió desde el SELECT del barrido (reapertura, otro tick, otro proceso): no se escribe nada. */
+class StaleRow extends Error {}
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let t: NodeJS.Timeout | null = null;
@@ -101,6 +116,11 @@ export class ProviderReconcileService {
     this.clients = clients ?? {};
   }
 
+  private lookupMs(): number {
+    const n = Number(this.clients.lookupTimeoutMs);
+    return Number.isFinite(n) && n > 0 ? n : PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS;
+  }
+
   private videogen(): Pick<VideogenService, 'getVideoStatus' | 'getVideoCost'> {
     if (this.clients.videogen === undefined) this.clients.videogen = new VideogenService();
     if (!this.clients.videogen) throw new LookupError('Videogen no configurado en el barrido');
@@ -124,7 +144,7 @@ export class ProviderReconcileService {
     const windowSecs = Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600);
     const rows: Row[] = await this.dataSource.query(
       `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.attempt_count,
-              pj.course_id, pj.owner_id, b.blueprint_number
+              g.generation, pj.created_at as run_created_at, pj.course_id, pj.owner_id, b.blueprint_number
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
          join public.course_generation_manifests m on m.id = g.manifest_id
@@ -132,7 +152,10 @@ export class ProviderReconcileService {
         where pj.execution_mode = 'dynamic_generation'
           and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
           and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
-          and not (pj.course_id = any($5::bigint[]))
+          -- review M1: solo runs creados desde la activación, nunca los históricos conocidos
+          and pj.created_at >= $5::timestamptz
+          and not (pj.id::text = any($6::text[]))
+          and not (pj.id::text like any($7::text[]))
           and g.status = 'failed'
           and g.type in ('video', 'presentation')
           and ${latestGenerationPredicate('g')}
@@ -148,7 +171,8 @@ export class ProviderReconcileService {
                    and coalesce(g.output_summary->'${PROVIDER_RECONCILE_KEY}'->>'declinedError', '') = coalesce(g.error, ''))
         order by g.finished_at desc, g.id desc
         limit $4`,
-      [now.toISOString(), windowSecs, PROVIDER_RECONCILE_SQL_REGEX, limit, [...PROVIDER_RECONCILE_EXCLUDED_COURSE_IDS]],
+      [now.toISOString(), windowSecs, PROVIDER_RECONCILE_SQL_REGEX, limit, providerReconcileRunsSince(),
+        [...PROVIDER_RECONCILE_EXCLUDED_RUN_IDS], PROVIDER_RECONCILE_EXCLUDED_RUN_PREFIXES.map((x) => `${x}%`)],
     );
     result.candidates = rows.length;
     const handled = new Set<string>();
@@ -157,6 +181,10 @@ export class ProviderReconcileService {
       try {
         await this.reconcileOne(r, now, policy, result);
       } catch (err) {
+        if (err instanceof StaleRow) {
+          result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'stale_row' });
+          continue;
+        }
         // Infraestructura (DB / ledger): se reintenta en el próximo tick (la ventana de edad acota).
         result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: `error: ${errText(err)}` });
         this.logger.warn(`conciliación de proveedor: ${r.item_key} (run ${r.job_id}) falló este tick (${errText(err)}); se reintenta`);
@@ -177,7 +205,7 @@ export class ProviderReconcileService {
   // ── una parte ──────────────────────────────────────────────────────────────
 
   private async reconcileOne(r: Row, now: Date, policy: AutoHealPolicy, result: ProviderReconcileSweepResult): Promise<void> {
-    const d = providerReconcileDecision(r, now, policy);
+    const d = providerReconcileDecision(r, now, policy, { id: r.job_id, created_at: r.run_created_at });
     if (d.heal === false) {
       result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
       if (PROVIDER_RECONCILE_PERMANENT_SKIPS.includes(d.reason)) {
@@ -189,26 +217,43 @@ export class ProviderReconcileService {
     const os = (r.output_summary ?? {}) as Record<string, any>;
     const ack = Math.max(0, Math.floor(Number(os.reconciliationAcknowledgedThroughAttempt ?? 0)) || 0);
     const provider = r.type === 'video' ? 'videogen' : 'gamma';
-    const pending = await this.pendingCharges(r.id, provider, ack);
+    const pending = await this.pendingCharges(r, provider, ack);
     const ageSecs = (now.getTime() - new Date(r.finished_at).getTime()) / 1000;
-    const giveUp = ageSecs >= PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS;
+    const prevState = providerReconcileStateOf(os);
 
     let ev: Evidence;
     switch (d.kind) {
       case 'videogen_failed':
       case 'videogen_stuck':
-        ev = await this.videogenEvidence(r, os, d.kind, pending, giveUp);
+      case 'videogen_orphan':
+        ev = await this.videogenEvidence(r, os, d.kind, pending, ageSecs, prevState, now);
         break;
       case 'gamma_failed':
-        ev = await this.gammaEvidence(r, os, pending, giveUp);
+        ev = await this.gammaEvidence(r, os, pending, ageSecs >= PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS);
         break;
       default:
         ev = { action: 'resubmit', ambiguous: true, settlement: 'none', counted: null, reservedAmount: null, why: `${d.kind}: envío sin id del proveedor (nada que consultar)` };
     }
 
     if (ev.action === 'wait') {
+      // Review C1: job vivo / lookup caído / segunda lectura de un costo 0 → se vuelve a consultar con espera creciente,
+      // nunca un reenvío.
       result.waiting.push({ runId: r.job_id, itemKey: r.item_key, why: ev.why });
-      await this.patchState(r, { lastCheckAt: now.toISOString(), lastWait: ev.why.slice(0, 300) });
+      const checks = Math.max(0, Math.floor(Number(prevState.checks ?? 0)) || 0) + 1;
+      const wait = ev.zeroCostSeenAt ? PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS : providerReconcileRecheckSeconds(checks - 1);
+      await this.patchState(r, {
+        lastCheckAt: now.toISOString(), lastWait: ev.why.slice(0, 300), checks,
+        nextCheckAt: new Date(now.getTime() + wait * 1000).toISOString(), nextCheckError: String(r.error ?? ''),
+        ...(ev.zeroCostSeenAt ? { zeroCostSeenAt: ev.zeroCostSeenAt } : {}),
+      });
+      return;
+    }
+    if (ev.action === 'decline') {
+      await this.decline(r, ev.reason, ev.attention, now, result, ev.why);
+      return;
+    }
+    if (ev.action === 'repoll' && Math.floor(Number(prevState.repolls ?? 0)) >= PROVIDER_RECONCILE_MAX_REPOLLS) {
+      await this.decline(r, 'repoll_cap_reached', 'unrecoverable', now, result, `Videogen informa el job terminado pero el worker no lo completó tras ${PROVIDER_RECONCILE_MAX_REPOLLS} re-poll`);
       return;
     }
     if (ev.action === 'resubmit' && ev.ambiguous && !d.ambiguousAllowed) {
@@ -221,9 +266,10 @@ export class ProviderReconcileService {
     if (ev.action === 'resubmit') {
       // Todo lo que siga pendiente de la parte (sin evidencia) se liquida de forma conservadora: el próximo intento
       // nunca convive con una reserva incierta sin decidir.
-      const left = await this.pendingCharges(r.id, provider, ack);
+      const left = await this.pendingCharges(r, provider, ack);
       for (const c of left) {
-        await this.settleConservative(r, c, d.kind, ev.why);
+        await this.assertUnchanged(r);
+        await this.settleConservative(r, c, d.kind, ev.why, ev.ambiguous);
         if (settlement === 'none') settlement = 'reconciled_as_charged';
         if (!reservedAmount && c.reservation) reservedAmount = c.amount;
       }
@@ -251,8 +297,10 @@ export class ProviderReconcileService {
     const ambiguous = ev.action === 'resubmit' && ev.ambiguous;
     const nowIso = now.toISOString();
     const history = (Array.isArray(prev.history) ? prev.history : []).slice(-9);
+    // Review M3: un re-poll (gratis) no consume reenvíos; tiene su propio tope.
     const state = {
-      rounds: d.round,
+      rounds: ev.action === 'repoll' ? d.round - 1 : d.round,
+      repolls: Math.max(0, Math.floor(Number(prev.repolls ?? 0)) || 0) + (ev.action === 'repoll' ? 1 : 0),
       ambiguousRounds: d.ambiguousRounds + (ambiguous ? 1 : 0),
       lastAt: nowIso, lastKind: d.kind, lastAction: ev.action, lastSettlement: settlement,
       lastReason: ev.why.slice(0, 300),
@@ -264,6 +312,18 @@ export class ProviderReconcileService {
     };
     const resubmitVideo = ev.action === 'resubmit' && r.type === 'video';
     const resubmitProvider = ev.action === 'resubmit' && r.type === 'presentation';
+    if (ev.action === 'repoll' && ev.adoptJobId) {
+      // Review I3: el job existe (sufijo del error) pero el worker no llegó a persistirlo → se registra (cercado por el
+      // error y el intento) para que el re-poll lo retome sin reenviar.
+      await this.assertUnchanged(r);
+      await this.dataSource.query(
+        `update public.generation_item_runs
+            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('external',
+                  coalesce(output_summary->'external', '{}'::jsonb) || jsonb_build_object('videogenJobId', $2::text, 'mode', 'real', 'adoptedBy', 'provider_reconcile'))
+          where id = $1 and status = 'failed' and coalesce(error, '') = $3 and attempt_count = $4 and not (coalesce(output_summary->'external', '{}'::jsonb) ? 'videogenJobId')`,
+        [r.id, ev.adoptJobId, String(r.error ?? ''), r.attempt_count],
+      );
+    }
     try {
       await this.runs.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), r.job_id, r.item_key, resubmitVideo, resubmitProvider, {
         policy, now,
@@ -295,63 +355,111 @@ export class ProviderReconcileService {
     }
   }
 
-  /** Videogen con jobId: estado → costo → conciliación (released / charged_partial / charged con tope en la reserva). */
-  private async videogenEvidence(r: Row, os: Record<string, any>, kind: ProviderReconcileKind, pending: PendingCharge[], giveUp: boolean): Promise<Evidence> {
-    const jobId = String(os.external?.videogenJobId ?? '');
+  /**
+   * Videogen con jobId (persistido o del sufijo del error): estado → costo → conciliación. Review C1: con un estado no
+   * terminal (o el GET caído) NUNCA se reenvía (el job viejo todavía puede renderizar y cobrar): se vuelve a consultar
+   * con espera creciente y, pasado el tope, queda la excepción. Review I1: un costo 0 libera solo con evidencia fuerte.
+   */
+  private async videogenEvidence(r: Row, os: Record<string, any>, kind: ProviderReconcileKind, pending: PendingCharge[], ageSecs: number,
+    prevState: Record<string, any>, now: Date): Promise<Evidence> {
+    const jobId = String(videogenJobIdOf(os, r.error) ?? '');
     const resKey = typeof os.externalReservationKey === 'string' ? os.externalReservationKey : null;
     const res = resKey ? pending.find((p) => p.idempotency_key === resKey && p.reservation) ?? null : null;
     let st: VideogenBatchJob;
     try {
-      st = await withTimeout(this.videogen().getVideoStatus(jobId), PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS, `GET status ${jobId}`);
+      st = await withTimeout(this.videogen().getVideoStatus(jobId), this.lookupMs(), `GET status ${jobId}`);
     } catch (err) {
-      if (giveUp) return { action: 'resubmit', ambiguous: true, settlement: 'none', counted: null, reservedAmount: res?.amount ?? null, why: `estado de ${jobId} no disponible desde hace ${PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS / 3600} h (${errText(err)})` };
-      return { action: 'wait', why: `estado de ${jobId} no disponible (${errText(err)})` };
+      if (ageSecs >= PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS) {
+        return { action: 'decline', reason: 'videogen_lookup_unavailable', attention: 'duplicate_charge',
+          why: `el estado del job ${jobId} no se pudo consultar durante ${PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS / 3600} h (${errText(err)}); no se reenvía con el job posiblemente vivo` };
+      }
+      return { action: 'wait', recheck: true, why: `estado de ${jobId} no disponible (${errText(err)})` };
     }
     const status = String(st.status ?? '');
     if (isJobCompleted(status) || status.toLowerCase() === 'completed_local') {
       // El job terminó bien: se retoma por poll (gratis); el worker liquida la reserva con el costo al completar.
-      return { action: 'repoll', why: `Videogen informa ${status} para ${jobId}` };
+      return { action: 'repoll', adoptJobId: os.external?.videogenJobId ? null : jobId, why: `Videogen informa ${status} para ${jobId}` };
     }
     if (!isJobFailed(status)) {
-      // Sigue en curso. Un job que nunca termina (auto-healer agotado) puede todavía cobrar: conservador.
-      if (kind === 'videogen_stuck' || giveUp) {
-        return { action: 'resubmit', ambiguous: true, settlement: 'none', counted: null, reservedAmount: res?.amount ?? null, why: `el job ${jobId} sigue ${status || 'sin estado'} y no terminó (puede cobrar todavía)` };
+      if (ageSecs >= PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS) {
+        return { action: 'decline', reason: 'videogen_job_not_terminal', attention: 'duplicate_charge',
+          why: `el job ${jobId} sigue ${status || 'sin estado'} tras ${PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS / 3600} h; no se reenvía (puede terminar y cobrar)` };
       }
-      return { action: 'wait', why: `el job ${jobId} figura ${status || 'sin estado'}` };
+      return { action: 'wait', recheck: true, why: `el job ${jobId} sigue ${status || 'sin estado'} (se vuelve a consultar, sin reenviar)` };
     }
-    // Falla CONOCIDA: costo (estimado) del job.
+    // Job TERMINAL fallido: ya no puede renderizar. Costo (estimado) del job.
     let cost: VideogenCostBreakdown;
     try {
-      cost = await withTimeout(this.videogen().getVideoCost(jobId), PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS, `GET cost ${jobId}`);
+      cost = await withTimeout(this.videogen().getVideoCost(jobId), this.lookupMs(), `GET cost ${jobId}`);
     } catch (err) {
-      if (giveUp) return { action: 'resubmit', ambiguous: true, settlement: 'none', counted: null, reservedAmount: res?.amount ?? null, why: `costo de ${jobId} no disponible desde hace ${PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS / 3600} h (${errText(err)})` };
-      return { action: 'wait', why: `costo de ${jobId} no disponible (${errText(err)})` };
+      if (ageSecs >= PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS) {
+        // Sin costo pero con el job muerto: se cuenta la reserva completa (conservador) y se puede reenviar (no hay doble render).
+        return { action: 'resubmit', ambiguous: false, settlement: 'none', counted: null, reservedAmount: res?.amount ?? null,
+          why: `job ${jobId} falló; costo no disponible durante ${PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS / 3600} h (${errText(err)}): se cuenta la reserva completa` };
+      }
+      return { action: 'wait', recheck: true, why: `costo de ${jobId} no disponible (${errText(err)})` };
     }
     if (!res) {
       // Sin la reserva del intento (ya conciliada por otro tick, o una parte sin reserva): nada que liquidar acá.
       return { action: 'resubmit', ambiguous: false, settlement: 'none', counted: null, reservedAmount: null, why: `job ${jobId} falló (${st.error ?? 'sin detalle'}); costo informado ${cost.estimated_total_cost}` };
     }
-    const reserved = Number(res.amount);
-    const counted = normalizeDecimal(videogenCountedAmount(cost.estimated_total_cost, reserved));
-    const reason = `r62 auto: Videogen informó el job ${jobId} ${status} (${String(st.error ?? 'sin detalle').slice(0, 120)}); ` +
-      `GET /api/costs/videos/{id} estimated_total_cost=${cost.estimated_total_cost} (estimado, con tope en la reserva ${normalizeDecimal(reserved)})`;
-    const meta = this.meta(r, kind, { videogenJobId: jobId, reportedCost: cost.estimated_total_cost, reservedAmount: normalizeDecimal(reserved), countedAmount: counted, breakdown: cost.breakdown ?? null });
-    let settlement: string;
+    const reserved = normalizeDecimal(res.amount);
+    const counted = normalizeDecimal(videogenCountedAmount(cost.estimated_total_cost, cost.breakdown ?? null));
+    let mode: 'release' | 'partial' | 'charged' | 'over';
     if (cmpDec(counted, 0) === 0) {
-      const out = await this.ledger.reconcileReservationAsNotCharged(res.idempotency_key, reason, { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata: meta });
-      settlement = out.alreadySettled ? 'already_settled' : 'released';
-    } else if (cmpDec(counted, normalizeDecimal(reserved)) < 0) {
-      const out = await this.ledger.reconcileReservationAsChargedPartial(res.idempotency_key, counted, reason, {
-        source: 'provider_api_response', referenceIds: [`videogen:job:${jobId}`.slice(0, 200)], observedAmount: counted, currency: 'USD',
-        notes: `GET /api/external/videos/{id}/status=${status}; GET /api/costs/videos/{id} estimated_total_cost=${cost.estimated_total_cost}`.slice(0, 1000),
-        observedAt: new Date().toISOString(),
-      }, { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata: meta });
-      settlement = out.alreadySettled ? 'already_settled' : 'charged_partial';
-    } else {
-      const out = await this.ledger.reconcileReservationAsCharged(res.idempotency_key, reason, { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata: meta });
-      settlement = out.alreadySettled ? 'already_settled' : 'charged';
+      if (videogenZeroCostReleasable({ status, error: st.error ?? r.error, reportedCost: cost.estimated_total_cost, breakdown: cost.breakdown ?? null })) {
+        // Dos lecturas en 0 separadas por ≥ 10 min (para ESTE error) antes de liberar.
+        const seen = prevState.zeroCostSeenAt && String(prevState.nextCheckError ?? '') === String(r.error ?? '') ? Date.parse(String(prevState.zeroCostSeenAt)) : NaN;
+        if (!Number.isFinite(seen)) return { action: 'wait', zeroCostSeenAt: now.toISOString(), why: `Videogen informa costo 0 para ${jobId}: se confirma con una segunda lectura` };
+        if (now.getTime() - seen < PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS * 1000) {
+          return { action: 'wait', zeroCostSeenAt: String(prevState.zeroCostSeenAt), why: `costo 0 de ${jobId}: esperando la segunda lectura` };
+        }
+        mode = 'release';
+      } else {
+        mode = 'charged'; // 0 sin evidencia fuerte (desglose ausente / etapas pagadas / estimado no ingerido) → conservador
+      }
+    } else if (cmpDec(counted, reserved) < 0) mode = 'partial';
+    else if (cmpDec(counted, reserved) === 0) mode = 'charged';
+    else mode = 'over';
+    const reason = `r62 auto: Videogen informó el job ${jobId} ${status} (${String(st.error ?? 'sin detalle').slice(0, 120)}); ` +
+      `GET /api/costs/videos/{id} estimated_total_cost=${cost.estimated_total_cost} (estimado; contado ${counted}, reserva ${reserved}, ${mode})`;
+    const meta = this.meta(r, kind, { videogenJobId: jobId, reportedCost: cost.estimated_total_cost, reservedAmount: reserved, countedAmount: mode === 'charged' ? reserved : counted, breakdown: cost.breakdown ?? null, settleMode: mode });
+    await this.assertUnchanged(r);
+    const settlement = await this.settleVideogenReservation(res.idempotency_key, mode, counted, reason, jobId, status, cost.estimated_total_cost, meta);
+    return { action: 'resubmit', ambiguous: false, settlement, counted: mode === 'charged' ? reserved : mode === 'release' ? normalizeDecimal(0) : counted, reservedAmount: res.amount,
+      why: `job ${jobId} falló (${String(st.error ?? 'sin detalle').slice(0, 120)}); conciliado ${settlement}` };
+  }
+
+  /** Liquidación de una reserva de Videogen según el modo (release / partial / charged / over). Idempotente. */
+  private async settleVideogenReservation(key: string, mode: 'release' | 'partial' | 'charged' | 'over', counted: string, reason: string,
+    jobId: string, status: string, reported: number, meta: Record<string, unknown>): Promise<string> {
+    const opts = { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata: meta };
+    if (mode === 'release') {
+      const o = await this.ledger.reconcileReservationAsNotCharged(key, reason, opts);
+      return o.alreadySettled ? 'already_settled' : 'released';
     }
-    return { action: 'resubmit', ambiguous: false, settlement, counted, reservedAmount: res.amount, why: `job ${jobId} falló (${String(st.error ?? 'sin detalle').slice(0, 120)}); conciliado ${settlement} USD ${counted}` };
+    if (mode === 'partial') {
+      const o = await this.ledger.reconcileReservationAsChargedPartial(key, counted, reason, {
+        source: 'provider_api_response', referenceIds: [`videogen:job:${jobId}`.slice(0, 200)], observedAmount: counted, currency: 'USD',
+        notes: `GET /api/external/videos/{id}/status=${status}; GET /api/costs/videos/{id} estimated_total_cost=${reported}`.slice(0, 1000),
+        observedAt: new Date().toISOString(),
+      }, opts);
+      return o.alreadySettled ? 'already_settled' : 'charged_partial';
+    }
+    if (mode === 'over') {
+      // Review I1: lo informado supera la reserva → se cuenta TODO lo informado (nunca de menos); el peor caso del
+      // reenvío lo mide con este monto (si el run no tiene saldo, la excepción es de presupuesto).
+      const [ev] = await this.dataSource.query(`select (select count(*)::int from public.generation_cost_events a where a.corrects_event_id = e.id) as n
+        from public.generation_cost_events e where e.idempotency_key = $1 and e.event_kind = 'CHARGE'`, [key]);
+      if (ev && Number(ev.n) > 0) return 'already_settled';
+      await this.ledger.recordAdjustment(key, counted, reason, {
+        recordedBy: PROVIDER_RECONCILE_RECORDED_BY, settlement: true, settlementLabel: 'reconciled_as_charged',
+        metadata: { ...meta, reservationReconciledAsCharged: true, overReservation: true, decidedBy: PROVIDER_RECONCILE_DECIDED_BY },
+      });
+      return 'charged_over_reservation';
+    }
+    const o = await this.ledger.reconcileReservationAsCharged(key, reason, opts);
+    return o.alreadySettled ? 'already_settled' : 'charged';
   }
 
   /** Gamma con generationId: `credits.deducted` (del mensaje del worker o de un GET nuevo) → liquidación medida. */
@@ -369,7 +477,7 @@ export class ProviderReconcileService {
     let detail = measured !== null ? `créditos del mensaje: ${measured}` : '';
     if (credits === null) {
       try {
-        const g = await this.gamma().getGeneration(gid);
+        const g = await withTimeout(this.gamma().getGeneration(gid), this.lookupMs(), `GET /generations/${gid}`);
         if (typeof g.creditsDeducted === 'number' && Number.isFinite(g.creditsDeducted) && g.creditsDeducted >= 0) {
           credits = g.creditsDeducted;
           detail = `GET /generations/{id}: status=${g.status}, credits.deducted=${g.creditsDeducted}`;
@@ -381,10 +489,12 @@ export class ProviderReconcileService {
       }
     }
     if (credits === null) {
-      if (giveUp) return { action: 'resubmit', ambiguous: true, settlement: 'none', counted: null, reservedAmount, why: `Gamma no informó los créditos de ${gid} (${detail})` };
+      // La generación ya terminó (falló): no hay doble generación viva; sin créditos se cuenta el estimado completo.
+      if (giveUp) return { action: 'resubmit', ambiguous: false, settlement: 'none', counted: null, reservedAmount, why: `Gamma no informó los créditos de ${gid} (${detail}): se cuenta el estimado completo` };
       return { action: 'wait', why: `Gamma todavía no informa los créditos de ${gid} (${detail})` };
     }
     if (!open) return { action: 'resubmit', ambiguous: false, settlement: 'already_settled', counted: null, reservedAmount, why: `generación ${gid} falló; ${detail}` };
+    await this.assertUnchanged(r);
     const out = await this.ledger.settleMeasuredUsage(key, { gamma_credit: credits }, 'gamma_credits_measured', {
       recordedBy: PROVIDER_RECONCILE_RECORDED_BY,
       metadata: this.meta(r, 'gamma_failed', { gammaGenerationId: gid, creditsDeducted: credits, evidence: detail.slice(0, 300) }),
@@ -393,9 +503,9 @@ export class ProviderReconcileService {
   }
 
   /** Punto 3: la llamada perdida se cuenta COBRADA (monto reservado) con la marca possible_duplicate. Idempotente. */
-  private async settleConservative(r: Row, c: PendingCharge, kind: ProviderReconcileKind, why: string): Promise<void> {
-    const reason = `r62 auto: resultado sin evidencia del proveedor (${why.slice(0, 200)}) — se cuenta como cobrado (possible_duplicate)`;
-    const metadata = this.meta(r, kind, { possible_duplicate: true, conservative: true, why: why.slice(0, 300) });
+  private async settleConservative(r: Row, c: PendingCharge, kind: ProviderReconcileKind, why: string, ambiguous: boolean): Promise<void> {
+    const reason = `r62 auto: resultado sin evidencia del proveedor (${why.slice(0, 200)}) — se cuenta como cobrado${ambiguous ? ' (possible_duplicate)' : ''}`;
+    const metadata = this.meta(r, kind, { ...(ambiguous ? { possible_duplicate: true } : {}), conservative: true, why: why.slice(0, 300) });
     if (c.reservation) {
       await this.ledger.reconcileReservationAsCharged(c.idempotency_key, reason, { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata });
       return;
@@ -449,16 +559,17 @@ export class ProviderReconcileService {
   }
 
   /** Cargos reales PENDIENTES (sin ningún ajuste) de la parte, de intentos todavía no reconocidos, del proveedor. */
-  private async pendingCharges(itemRunId: string, provider: string, ack: number): Promise<PendingCharge[]> {
+  /** Review I2: acotado a los intentos que el barrido VIO (attempt ≤ attempt_count del SELECT): nunca toca el intento nuevo en vuelo. */
+  private async pendingCharges(r: Row, provider: string, ack: number): Promise<PendingCharge[]> {
     const rows: any[] = await this.dataSource.query(
       `select e.idempotency_key, e.amount::text as amount, coalesce((e.metadata->>'reservation') = 'true', false) as reservation,
               coalesce(e.attempt, 0) as attempt, e.provider, e.external_operation_id
          from public.generation_cost_events e
         where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock' and e.provider = $2
-          and e.measurement_status = 'pending' and coalesce(e.attempt, 0) > $3::int
+          and e.measurement_status = 'pending' and coalesce(e.attempt, 0) > $3::int and coalesce(e.attempt, 0) <= $4::int
           and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
         order by e.created_at, e.id`,
-      [itemRunId, provider, ack],
+      [r.id, provider, ack, Math.max(0, Math.floor(Number(r.attempt_count) || 0))],
     );
     return rows.map((x) => ({ idempotency_key: String(x.idempotency_key), amount: String(x.amount), reservation: !!x.reservation, attempt: Number(x.attempt), provider: String(x.provider), external_operation_id: x.external_operation_id ?? null }));
   }
@@ -470,21 +581,42 @@ export class ProviderReconcileService {
     };
   }
 
-  private async patchState(r: { id: string }, patch: Record<string, unknown>): Promise<void> {
+  /** Review M4: solo sobre la MISMA falla que se evaluó (mismo error e intento). */
+  private async patchState(r: Row, patch: Record<string, unknown>): Promise<void> {
     await this.dataSource.query(
       `update public.generation_item_runs
           set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${PROVIDER_RECONCILE_KEY}',
                 coalesce(output_summary->'${PROVIDER_RECONCILE_KEY}', '{}'::jsonb) || $2::jsonb)
-        where id = $1 and status = 'failed'`,
-      [r.id, JSON.stringify(patch)],
+        where id = $1 and status = 'failed' and coalesce(error, '') = $3 and attempt_count = $4`,
+      [r.id, JSON.stringify(patch), String(r.error ?? ''), r.attempt_count],
     );
+  }
+
+  /**
+   * Review I2: antes de cada escritura en el ledger, la parte tiene que seguir EXACTAMENTE como la vio el barrido
+   * (failed, mismo error, mismo intento y generación vigente). Si cambió (reapertura manual, otro tick, otro proceso
+   * durante un reload), no se liquida nada: el próximo tick re-evalúa. Junto con la cota de intento de pendingCharges,
+   * la reserva de un intento nuevo nunca se liquida acá.
+   */
+  private async assertUnchanged(r: Row): Promise<void> {
+    const [cur] = await this.dataSource.query(
+      `select g.status, g.error, g.attempt_count, g.generation,
+              (select max(n.generation) from public.generation_item_runs n where n.job_id = g.job_id and n.item_key = g.item_key) as latest
+         from public.generation_item_runs g where g.id = $1`,
+      [r.id],
+    );
+    if (!cur || cur.status !== 'failed' || String(cur.error ?? '') !== String(r.error ?? '') || Number(cur.attempt_count) !== Number(r.attempt_count)
+      || Number(cur.latest) !== Number(cur.generation)) {
+      throw new StaleRow(`la parte ${r.item_key} cambió desde la lectura`);
+    }
   }
 
   /** Excepción explícita (punto 3): queda en el item (providerReconcile.declined + attention_reason) y en el log. */
   private async decline(r: Row, reason: string, attention: 'budget' | 'duplicate_charge' | 'unrecoverable', now: Date, result: ProviderReconcileSweepResult, detail: string): Promise<void> {
     await this.patchState(r, { declined: reason.slice(0, 100), declinedAt: now.toISOString(), declinedError: String(r.error ?? ''), declinedDetail: detail.slice(0, 400), attentionReason: attention });
     try {
-      await this.dataSource.query(`update public.generation_item_runs set attention_reason = $2 where id = $1 and status = 'failed'`, [r.id, attention]);
+      await this.dataSource.query(`update public.generation_item_runs set attention_reason = $2 where id = $1 and status = 'failed' and coalesce(error, '') = $3 and attempt_count = $4`,
+        [r.id, attention, String(r.error ?? ''), r.attempt_count]);
     } catch {
       // Esquema sin columnas de recuperación (bases previas a REL): el motivo queda en output_summary.
     }
@@ -496,58 +628,52 @@ export class ProviderReconcileService {
 
   /**
    * Reservas de Videogen PENDIENTES de partes que ya no las usan (las que listaba la herramienta de admin), con un jobId
-   * conocido y recientes: se concilian con la evidencia del job (terminal) — nunca de forma conservadora acá (no hay
-   * reenvío que lo justifique: siguen contadas como gasto hasta tener evidencia).
+   * conocido y recientes, de runs elegibles: se concilian con la evidencia del job TERMINAL. Nunca se liberan acá (un
+   * costo 0 o un job completado se cuentan como cobrados; review I1) ni se concilian sin evidencia (siguen contadas).
+   * Review I4: a lo sumo PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK reservas consultadas por tick (el tick es serial con
+   * el empaque automático).
    */
   private async reconcileVideogenReservations(now: Date, windowSecs: number, skipItems: Set<string>, result: ProviderReconcileSweepResult): Promise<void> {
     const pend = await loadPendingVideogenReservations(this.dataSource, null);
+    let lookups = 0;
     for (const p of pend) {
+      if (lookups >= PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK) break;
       if (!p.videogenJobId || skipItems.has(p.itemRunId)) continue;
-      if (p.courseId !== null && PROVIDER_RECONCILE_EXCLUDED_COURSE_IDS.includes(Number(p.courseId))) continue;
       if (!p.createdAt || now.getTime() - Date.parse(p.createdAt) > windowSecs * 1000) continue;
       const [it] = await this.dataSource.query(
-        `select g.id, g.job_id, g.item_key, g.status, g.error, g.output_summary, pj.status as job_status, pj.worker_status
+        `select g.id, g.job_id, g.item_key, g.status, g.error, g.output_summary, pj.status as job_status, pj.worker_status, pj.created_at as run_created_at
            from public.generation_item_runs g join public.production_jobs pj on pj.id = g.job_id where g.id = $1`,
         [p.itemRunId],
       );
       if (!it || ['cancelled', 'cancelling'].includes(String(it.job_status)) || ['cancelled', 'cancelling'].includes(String(it.worker_status))) continue;
+      if (!providerReconcileRunEligible({ id: String(it.job_id), created_at: it.run_created_at })) continue;
       if (['pending', 'running', 'retrying'].includes(String(it.status))) continue;
       const os = (typeof it.output_summary === 'string' ? JSON.parse(it.output_summary) : it.output_summary) ?? {};
       const archived = (Array.isArray(os.previousExternals) ? os.previousExternals : []).find((x: any) => x && x.externalReservationKey === p.reservationKey);
       const jobId = String(archived?.external?.videogenJobId ?? (os.externalReservationKey === p.reservationKey ? os.external?.videogenJobId ?? '' : ''));
       if (!jobId) continue;
+      lookups++;
       let st: VideogenBatchJob;
       let cost: VideogenCostBreakdown;
       try {
-        st = await withTimeout(this.videogen().getVideoStatus(jobId), PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS, `GET status ${jobId}`);
+        st = await withTimeout(this.videogen().getVideoStatus(jobId), this.lookupMs(), `GET status ${jobId}`);
         const status = String(st.status ?? '');
         const terminal = isJobFailed(status) || isJobCompleted(status) || status.toLowerCase() === 'completed_local';
         if (!terminal) continue;
-        cost = await withTimeout(this.videogen().getVideoCost(jobId), PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS, `GET cost ${jobId}`);
+        cost = await withTimeout(this.videogen().getVideoCost(jobId), this.lookupMs(), `GET cost ${jobId}`);
       } catch {
         continue; // sin evidencia: sigue pendiente (contada como gasto); próximo tick
       }
-      const reserved = Number(p.amount);
-      const counted = normalizeDecimal(videogenCountedAmount(cost.estimated_total_cost, reserved));
+      const reserved = normalizeDecimal(p.amount);
+      const counted = normalizeDecimal(videogenCountedAmount(cost.estimated_total_cost, cost.breakdown ?? null));
+      const mode: 'partial' | 'charged' | 'over' = cmpDec(counted, 0) === 0 || cmpDec(counted, reserved) === 0 ? 'charged'
+        : cmpDec(counted, reserved) < 0 ? 'partial' : 'over';
       const row = { id: String(it.id), job_id: String(it.job_id), item_key: String(it.item_key), error: it.error } as Row;
-      const reason = `r62 auto: reserva de Videogen del job ${jobId} (${st.status}) conciliada con GET /api/costs/videos/{id} estimated_total_cost=${cost.estimated_total_cost} (estimado, tope en la reserva)`;
-      const meta = this.meta(row, 'reservation', { videogenJobId: jobId, reportedCost: cost.estimated_total_cost, reservedAmount: normalizeDecimal(reserved), countedAmount: counted, attemptState: p.attemptState });
-      let settlement: string;
-      if (cmpDec(counted, 0) === 0) {
-        const o = await this.ledger.reconcileReservationAsNotCharged(p.reservationKey, reason, { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata: meta });
-        settlement = o.alreadySettled ? 'already_settled' : 'released';
-      } else if (cmpDec(counted, normalizeDecimal(reserved)) < 0) {
-        const o = await this.ledger.reconcileReservationAsChargedPartial(p.reservationKey, counted, reason, {
-          source: 'provider_api_response', referenceIds: [`videogen:job:${jobId}`.slice(0, 200)], observedAmount: counted, currency: 'USD',
-          notes: `status=${st.status}; estimated_total_cost=${cost.estimated_total_cost}`, observedAt: new Date().toISOString(),
-        }, { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata: meta });
-        settlement = o.alreadySettled ? 'already_settled' : 'charged_partial';
-      } else {
-        const o = await this.ledger.reconcileReservationAsCharged(p.reservationKey, reason, { decidedBy: PROVIDER_RECONCILE_DECIDED_BY, recordedBy: PROVIDER_RECONCILE_RECORDED_BY, metadata: meta });
-        settlement = o.alreadySettled ? 'already_settled' : 'charged';
-      }
+      const reason = `r62 auto: reserva de Videogen del job ${jobId} (${st.status}) conciliada con GET /api/costs/videos/{id} estimated_total_cost=${cost.estimated_total_cost} (estimado; ${mode})`;
+      const meta = this.meta(row, 'reservation', { videogenJobId: jobId, reportedCost: cost.estimated_total_cost, reservedAmount: reserved, countedAmount: mode === 'charged' ? reserved : counted, attemptState: p.attemptState, settleMode: mode });
+      const settlement = await this.settleVideogenReservation(p.reservationKey, mode, counted, reason, jobId, String(st.status), cost.estimated_total_cost, meta);
       result.reservationsReconciled.push({ runId: p.runId, reservationKey: p.reservationKey, settlement });
-      this.logger.warn(`conciliación de reservas de Videogen: ${p.reservationKey} (run ${p.runId}) → ${settlement} USD ${counted} (job ${jobId})`);
+      this.logger.warn(`conciliación de reservas de Videogen: ${p.reservationKey} (run ${p.runId}) → ${settlement} (job ${jobId})`);
     }
   }
 }

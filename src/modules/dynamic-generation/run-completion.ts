@@ -212,6 +212,9 @@ export interface CompletionJob {
   status?: string | null;
   worker_status?: string | null;
   input_payload?: any;
+  /** r62 (N2, review M1): id y alta del run (exclusión de runs históricos de la conciliación automática). */
+  id?: string | null;
+  created_at?: Date | string | null;
 }
 
 export interface CompletionRow {
@@ -511,7 +514,7 @@ function isAmbiguousYoutube(r: CompletionRow): boolean {
 }
 
 /** Acción de admin para un item no hecho (null = el auto-healer lo toma o es un bloqueo por dependencia). */
-export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletionClass, now: Date): RunAdminAction | null {
+export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletionClass, now: Date, job?: CompletionJob | null): RunAdminAction | null {
   if (!r) return null;
   const key = r.item_key;
   const err = String(r.error ?? '');
@@ -549,7 +552,7 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   if (tickOn && adCeilingOk && (ad.heal === true || (ad.heal === false && ad.reason === 'backoff'))) return null;
   // r62 (N2): render/generación fallida con id del proveedor o envío ambiguo que el barrido concilia y reenvía solo
   // (dentro de su techo: espera + consulta máxima + 3 ticks; si lo declina, la acción de admin aparece).
-  if (tickOn && providerReconcilePending(ahRow, now, autoHealIntervalMs(process.env))) return null;
+  if (tickOn && providerReconcilePending(ahRow, now, autoHealIntervalMs(process.env), undefined, job ? { id: job.id ?? null, created_at: job.created_at ?? null } : null)) return null;
   if (err.includes(PROVIDER_RECONCILIATION_REQUIRED)) {
     return { code: r.type === 'video' ? 'reconcile_videogen' : 'reconcile_provider', itemKey: key };
   }
@@ -610,7 +613,7 @@ export function evaluateRunCompletion(
   };
   for (const it of manifest.items) {
     const c = classes.get(it.key) as ItemCompletionClass;
-    if (c === 'not_done' || c === 'unvalidated') push(adminActionFor(rowsByKey.get(it.key), c, now));
+    if (c === 'not_done' || c === 'unvalidated') push(adminActionFor(rowsByKey.get(it.key), c, now, job));
   }
   if (previewComponents.some((k) => k.startsWith('video:')) && manifest.rulesVersion === 3) push({ code: 'generate_real_videos' });
   // V542 (G6): nunca se liberan solas (resultado incierto): una acción de admin por reserva.
@@ -619,7 +622,8 @@ export function evaluateRunCompletion(
     const owner = rowsByKey.get(r.itemKey);
     if (owner && String(owner.id ?? '') === r.itemRunId && autoHealEnabled(process.env) &&
       providerReconcilePending({ id: owner.id, status: owner.status, type: owner.type, error: owner.error ?? null, output_summary: os(owner),
-        finished_at: owner.finished_at ?? null, updated_at: owner.updated_at ?? null }, now, autoHealIntervalMs(process.env))) continue;
+        finished_at: owner.finished_at ?? null, updated_at: owner.updated_at ?? null }, now, autoHealIntervalMs(process.env), undefined,
+        { id: job.id ?? null, created_at: job.created_at ?? null })) continue;
     push({ code: 'reconcile_videogen_reservation', itemKey: r.itemKey, reservationKey: r.reservationKey, amount: r.amount, attemptState: r.attemptState, mayHaveRendered: r.mayHaveRendered });
   }
 
@@ -753,7 +757,7 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
   manifest: CompletionManifest;
 } | null> {
   const [job] = await q.query(
-    `select id, status, worker_status, input_payload from public.production_jobs where id = $1`,
+    `select id, status, worker_status, input_payload, created_at from public.production_jobs where id = $1`,
     [jobId],
   );
   if (!job) return null;

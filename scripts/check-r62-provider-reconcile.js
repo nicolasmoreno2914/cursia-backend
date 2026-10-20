@@ -7,8 +7,14 @@
 //   [PU]  decisión pura: casos, topes (2 reenvíos, 1 ambiguo), espera, excepción registrada, cursos históricos fuera
 //   [V1]  reproducción de #1510: el job falla ANTES del render (costo 0,5351) → charged_partial (system) → reenvío →
 //         render OK → video completo; video_interactions se reencola solo; 0 acciones de admin; intentos actor=system
-//   [V2]  job que nunca termina (auto-healer agotado): liquidación conservadora `charged` + possible_duplicate, UN
-//         reenvío; si el nuevo tampoco termina → excepción registrada (nunca un segundo reenvío ambiguo)
+//   [V2]  job que nunca termina (review C1): mientras siga vivo NUNCA se reenvía (re-consulta con espera creciente);
+//         si termina `failed` → conciliado + reenvío; si no termina en 12 h → excepción; lookup caído 6 h → excepción
+//   [Z]   regla de liberación (review I1): 0 libera solo failed + desglose en 0 + sin etapas pagadas + 2 lecturas ≥10 min;
+//         0 con etapas pagadas → charged; informado > reserva → se cuenta todo (nunca de menos)
+//   [O]   jobId solo en el sufijo del error (review I3): vivo → espera; completado → se adopta y re-poll; failed → conciliado
+//   [R]   carrera (review I2): la parte cambia durante la consulta → no se liquida nada (ni el intento nuevo)
+//   [T]   timeouts (review I4): GET de Gamma colgado acotado; tope de consultas d5 por tick; VideogenService con timeout
+//   [X]   runs históricos / anteriores al corte (review M1): ni el barrido ni la completitud los toman
 //   [G1]  Gamma fallido con créditos DEDUCIDOS (medidos por el worker) → reenvío sin consultar
 //   [G2]  Gamma fallido SIN créditos en el fallo → GET /generations/{id} informa credits.deducted → liquidado medido → reenvío
 //   [G3]  Gamma fallido sin créditos y Gamma nunca los informa → espera; pasado el tope, conservador + 1 reenvío ambiguo
@@ -84,13 +90,24 @@ async function pureChecks() {
     eq(PR.providerReconcileDecision(row({ status: 'completed' }), new Date(), P).reason, 'not_failed', 'solo failed');
   });
   await check('[PU] monto contado = costo informado de Videogen con tope en la reserva; créditos medidos del mensaje del worker; cursos históricos excluidos', async () => {
-    eq(PR.videogenCountedAmount(0.5351, 1.175), 0.5351, 'parcial');
-    eq(PR.videogenCountedAmount(3, 1.175), 1.175, 'tope');
-    eq(PR.videogenCountedAmount(0, 1.175), 0, 'cero');
-    let e = null; try { PR.videogenCountedAmount(-1, 1); } catch (x) { e = x; } assert(e, 'negativo rechazado');
+    eq(PR.videogenCountedAmount(0.5351, null), 0.5351, 'informado');
+    eq(PR.videogenCountedAmount(3, null), 3, 'nunca de menos (supera la reserva)');
+    eq(PR.videogenCountedAmount(0.2, { script: 0.371, images: 0.16 }), 0.531, 'piso del desglose');
+    eq(PR.videogenCountedAmount(0, {}), 0, 'cero');
+    let e = null; try { PR.videogenCountedAmount(-1, null); } catch (x) { e = x; } assert(e, 'negativo rechazado');
+    const z = (o) => PR.videogenZeroCostReleasable({ status: 'failed', error: 'content_txt vacío', reportedCost: 0, breakdown: { script: 0, tts: 0 }, ...o });
+    eq([z({}), z({ status: 'completed' }), z({ breakdown: null }), z({ breakdown: { script: 0.01 } }), z({ error: 'generate_script: 429' }), z({ reportedCost: 0.01 })],
+      [true, false, false, false, false, false], 'liberación solo con evidencia fuerte (failed, desglose en 0, sin etapas pagadas)');
+    eq(PR.videogenJobIdFromError('ambiguous_video_submission: db caída (job de Videogen vg-abc_1)'), 'vg-abc_1', 'sufijo anclado');
+    eq(PR.videogenJobIdFromError('ambiguous_video_submission: texto (job de Videogen x) y más'), null, 'solo al final');
+    eq(PR.providerReconcileKindOf('video', 'ambiguous_video_submission: db (job de Videogen vg-1)', {}, AH.DEFAULT_AUTO_HEAL_POLICY), 'videogen_orphan', 'I3');
+    eq(PR.PROVIDER_RECONCILE_AMBIGUOUS_KINDS.includes('videogen_stuck'), false, 'C1: un job con id nunca es «ambiguo»');
     eq(PR.gammaMeasuredCreditsOf('gamma_generation_failed: la generación g falló en Gamma (x) [créditos medidos: 40]. No se reenvía sola: regenera'), 40, 'medidos');
     eq(PR.gammaMeasuredCreditsOf('gamma_generation_failed: ... [Gamma no informó los créditos: cobro incierto]. No se reenvía sola'), null, 'sin medir');
-    eq([...PR.PROVIDER_RECONCILE_EXCLUDED_COURSE_IDS].sort(), [1209, 1353, 1510], 'históricos');
+    const E = (id, created_at) => PR.providerReconcileRunEligible({ id, created_at }, { PROVIDER_RECONCILE_RUNS_SINCE: '2026-10-20T00:00:00Z' });
+    eq([E('6ccb5763-5c44-4ce4-9c1b-bf05ed155b4a', '2026-11-01'), E('d7155541-2ec4-43a4-ba3c-fb0787c17852', '2026-11-01'), E('1c02fd27-0000-4000-8000-000000000000', '2026-11-01'),
+      E('aaaaaaaa-0000-4000-8000-000000000000', '2026-10-19T23:00:00Z'), E('aaaaaaaa-0000-4000-8000-000000000000', '2026-10-21T00:00:00Z')],
+      [false, false, false, false, true], 'históricos (#1209, #1353, #1510) y runs anteriores al corte excluidos');
   });
   await check('[PU] clasificador: con id del proveedor la estrategia es provider_check y «qué hace hoy» es provider_reconcile; sin id sigue igual', async () => {
     const v = FC.classifyFailure({ source: 'video_worker', itemType: 'video', error: 'videogen_failed: x', outputSummary: { external: { videogenJobId: 'j' } } });
@@ -119,11 +136,13 @@ function startFakes() {
         const next = vg.plan.shift() || { kind: 'ok' };
         if (next.kind === 'http502') return json(rs, 502, { error: 'upstream timeout' });
         const id = next.jobId || `vg-${vg.submits}-${crypto.randomUUID().slice(0, 6)}`;
-        vg.jobs.set(id, { statuses: next.statuses || ['completed_local'], error: next.error || null, cost: next.cost ?? 0.97 });
+        vg.jobs.set(id, { statuses: next.statuses || ['completed_local'], error: next.error || null, cost: next.cost ?? 0.97, breakdown: next.breakdown === undefined ? null : next.breakdown });
         return json(rs, 200, { batch_id: `b-${vg.submits}`, jobs: [{ job_id: id, chapter_number: 1, status: 'queued' }] });
       }
       if (rq.method === 'GET' && (m = p.match(/^\/api\/external\/videos\/([^/]+)\/status$/))) {
         vg.statusCalls++;
+        if (vg.statusDown) return json(rs, 503, { error: 'videogen down' });
+        if (m[1] === 'vg-hang') return; // nunca responde (timeout del cliente)
         const j = vg.jobs.get(m[1]);
         if (!j) return json(rs, 404, { error: 'not found' });
         const st = j.statuses.length > 1 ? j.statuses.shift() : j.statuses[0];
@@ -133,10 +152,12 @@ function startFakes() {
         vg.costCalls++;
         const j = vg.jobs.get(m[1]);
         if (!j || j.cost === 'error') return json(rs, 503, { error: 'cost service unavailable' });
-        return json(rs, 200, { job_id: m[1], estimated_total_cost: j.cost, breakdown: { script: 0.371, images: 0.16, tts: 0.0041 } });
+        if (vg.onCost) { const h = vg.onCost; vg.onCost = null; return Promise.resolve(h(m[1])).then(() => json(rs, 200, { job_id: m[1], estimated_total_cost: j.cost, breakdown: j.breakdown })); }
+        return json(rs, 200, { job_id: m[1], estimated_total_cost: j.cost, breakdown: j.breakdown });
       }
       if (rq.method === 'GET' && (m = p.match(/^\/gamma\/generations\/([^/]+)$/))) {
         gm.getCalls++;
+        if (m[1] === 'gen-hang') return; // nunca responde
         const g = gm.gens.get(m[1]);
         if (!g) return json(rs, 404, { error: 'not found' });
         return json(rs, 200, { generationId: m[1], status: g.status, ...(g.credits === null ? {} : { credits: { deducted: g.credits, remaining: 1000 } }), error: g.status === 'failed' ? 'render failed' : null });
@@ -176,7 +197,7 @@ const CONTEXT = { nombre: 'Curso r62 N2', sector: 'Minería', pais: 'Chile', con
   videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' } };
 const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'VIDEOGEN_API_KEY', 'VIDEOGEN_API_URL', 'SUPER_ADMIN_EMAILS',
-  'GAMMA_API_KEY', 'GAMMA_API_BASE_URL', 'DYNAMIC_AUTO_HEAL_ENABLED'];
+  'GAMMA_API_KEY', 'GAMMA_API_BASE_URL', 'DYNAMIC_AUTO_HEAL_ENABLED', 'PROVIDER_RECONCILE_RUNS_SINCE', 'VIDEOGEN_HTTP_TIMEOUT_MS'];
 
 async function dbChecks() {
   const { Client } = require('pg');
@@ -243,6 +264,7 @@ async function dbChecks() {
     process.env.GAMMA_API_KEY = 'fake-gamma-key-local-only';
     process.env.GAMMA_API_BASE_URL = `${fakes.base}/gamma`;
     process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test';
+    process.env.PROVIDER_RECONCILE_RUNS_SINCE = '2020-01-01T00:00:00Z'; // los runs del check son de hoy
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [Artifact], synchronize: false, extra: { max: 8 } });
     await ds.initialize();
@@ -387,7 +409,8 @@ async function dbChecks() {
     const ikey = `video_interactions:${V1.c1}`;
     let jobA = null;
     await check('[V1] #1510: Videogen acepta el job y falla ANTES del render (generate_script 429) → videogen_failed con jobId; la reserva queda pendiente; video_interactions bloqueado', async () => {
-      fakes.vg.plan.push({ kind: 'ok', jobId: 'vg-1510-a', statuses: ['processing', 'failed'], error: 'generate_script: OpenAI 429 rate limit', cost: 0.5351 });
+      fakes.vg.plan.push({ kind: 'ok', jobId: 'vg-1510-a', statuses: ['processing', 'failed'], error: 'generate_script: OpenAI 429 rate limit', cost: 0.5351,
+        breakdown: { script: 0.371, images: 0.16, tts: 0.0041 } });
       const s = await runVideo(V1);
       eq(s.st.failed.map((f) => [f.msg.split(':')[0], f.retryable]), [['videogen_failed', false]], `fallo ${JSON.stringify(s.st.failed)} ${workerLog.errors.join(' | ')}`);
       const row = await latest(V1.runId, vkey);
@@ -451,47 +474,6 @@ async function dbChecks() {
       eq([r.resubmitted.length, r.declined.length, (await events(V1.runId)).length, fakes.vg.costCalls - c0], [0, 0, n, 0], 'nada');
     });
 
-    // ═══ V2 — job que nunca termina ═══════════════════════════════════════════
-    const V2 = await makeCourse('r62 job eterno');
-    const v2key = `video:${V2.c1}`;
-    const stuckFail = async (jobId) => {
-      fakes.vg.plan.push({ kind: 'ok', jobId, statuses: ['processing'] });
-      const s = await runVideo(V2); // el poll corta por video_timeout (reintentable); el auto-healer lo re-pollea gratis
-      assert(s.st.failed.some((f) => f.msg === 'video_timeout'), `video_timeout ${JSON.stringify(s.st.failed)}`);
-      const row = await latest(V2.runId, v2key);
-      // El auto-healer ya agotó sus rondas de re-poll gratis (5): el job sigue «processing».
-      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout', finished_at = now() - interval '10 minutes',
-                        output_summary = output_summary || jsonb_build_object('autoHeal', jsonb_build_object('rounds', $2::int)) where id = $1`, [row.id, P.maxRounds]);
-      return row.id;
-    };
-    await check('[V2] job que nunca termina (auto-healer agotado): sigue «processing» → liquidación CONSERVADORA charged + possible_duplicate → UN reenvío (ambiguo), dentro del presupuesto', async () => {
-      await stuckFail('vg-stuck-1');
-      const sub0 = fakes.vg.submits;
-      const r = await sweepAt(5);
-      eq(r.resubmitted.map((x) => [x.kind, x.settlement, x.ambiguous]), [['videogen_stuck', 'reconciled_as_charged', true]], JSON.stringify(r));
-      eq(fakes.vg.submits - sub0, 0, 'el barrido no envía');
-      const adj = (await events(V2.runId)).filter((e) => e.provider === 'videogen' && e.event_kind === 'ADJUSTMENT');
-      eq(adj.map((e) => [e.amount, e.metadata.settlement, e.metadata.possible_duplicate, e.recorded_by]), [['0.0000000000', 'reconciled_as_charged', true, 'system_provider_reconcile']], 'charged conservador');
-      const row = await latest(V2.runId, v2key);
-      eq([row.status, row.output_summary.providerReconcile.ambiguousRounds, row.output_summary.autoHeal.rounds], ['pending', 1, 0], 'reabierto; re-poll gratis reiniciado para el job nuevo');
-      await ledgerWithinAuthorized(V2.runId);
-    });
-    await check('[V2] el job nuevo tampoco termina → excepción registrada (ambiguous_cap_reached, attention_reason), nunca un segundo reenvío ambiguo; la acción de admin aparece', async () => {
-      await stuckFail('vg-stuck-2');
-      const sub0 = fakes.vg.submits;
-      const r = await sweepAt(5);
-      eq([r.resubmitted.length, r.declined.map((x) => x.reason)], [0, ['ambiguous_cap_reached']], JSON.stringify(r));
-      eq(fakes.vg.submits - sub0, 0, 'sin reenvío');
-      const row = await latest(V2.runId, v2key);
-      eq([row.status, row.output_summary.providerReconcile.declined, row.attention], ['failed', 'ambiguous_cap_reached', 'duplicate_charge'], 'excepción explícita');
-      const comp = await completionOf(V2);
-      assert((comp.adminActions || []).some((a) => a.itemKey === v2key), `acción de admin visible: ${JSON.stringify(comp.adminActions)}`);
-      const r2 = await sweepAt(60);
-      eq([r2.resubmitted.length, r2.declined.length], [0, 0], 'no se re-evalúa en cada tick');
-      await ledgerWithinAuthorized(V2.runId);
-    });
-
-    // ═══ Gamma ═══════════════════════════════════════════════════════════════
     /** Estado que deja el worker de Gamma real ante `failed` (mismas funciones del ledger que real-providers.ts). */
     const gammaFailed = async (C, gid, credits) => {
       const it = await latest(C.runId, `presentation:${C.c1}`);
@@ -511,13 +493,218 @@ async function dbChecks() {
           external: { gammaGenerationId: gid, gammaThemeId: 't', themeFamily: 'f', themeMode: 'light', acceptedAtAttempt: attempt } })]);
       return it.id;
     };
+    // ═══ V2 — job que nunca termina (review C1) ═════════════════════════════
+    const stuckFail = async (C, jobId, statuses = ['processing']) => {
+      fakes.vg.plan.push({ kind: 'ok', jobId, statuses, cost: 0.6, breakdown: { script: 0.4, images: 0.2 } });
+      const s = await runVideo(C); // el poll corta por video_timeout (reintentable); el auto-healer lo re-pollea gratis
+      assert(s.st.failed.some((f) => f.msg === 'video_timeout'), `video_timeout ${JSON.stringify(s.st.failed)}`);
+      const row = await latest(C.runId, `video:${C.c1}`);
+      // El auto-healer ya agotó sus rondas de re-poll gratis (5): el job sigue «processing».
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout', finished_at = now() - interval '10 minutes',
+                        output_summary = output_summary || jsonb_build_object('autoHeal', jsonb_build_object('rounds', $2::int)) where id = $1`, [row.id, P.maxRounds]);
+      return row.id;
+    };
+    const V2 = await makeCourse('r62 job eterno');
+    const v2key = `video:${V2.c1}`;
+    await check('[V2] job atascado que SIGUE VIVO: nunca se reenvía ni se liquida; re-consulta con espera creciente; sin acción de admin mientras tanto', async () => {
+      await stuckFail(V2, 'vg-stuck-1');
+      const sub0 = fakes.vg.submits; const n0 = (await events(V2.runId)).length;
+      const r1 = await sweepAt(5);
+      eq([r1.resubmitted.length, r1.waiting.map((x) => x.itemKey)], [0, [v2key]], JSON.stringify(r1));
+      const st1 = (await latest(V2.runId, v2key)).output_summary.providerReconcile;
+      eq([st1.checks, Date.parse(st1.nextCheckAt) > Date.now() + 100 * 1000], [1, true], 'próxima consulta reprogramada');
+      const rIn = await sweepAt(60);
+      assert(rIn.skipped.some((x) => x.itemKey === v2key && x.reason === 'backoff'), `dentro de la espera no consulta: ${JSON.stringify(rIn)}`);
+      const r2 = await sweepAt(3600);
+      eq([r2.resubmitted.length, r2.waiting.length], [0, 1], 'sigue vivo → sigue esperando');
+      eq([fakes.vg.submits - sub0, (await events(V2.runId)).length - n0], [0, 0], '0 envíos, 0 ajustes con el job vivo');
+      eq((await latest(V2.runId, v2key)).status, 'failed', 'no se reabre');
+      eq(((await completionOf(V2)).adminActions || []).filter((a) => a.itemKey === v2key), [], 'el servidor lo sigue');
+    });
+    await check('[V2] el job atascado termina `failed` → recién ahí: conciliado con su costo (charged_partial) y UN reenvío (no ambiguo)', async () => {
+      fakes.vg.jobs.get('vg-stuck-1').statuses = ['failed'];
+      fakes.vg.jobs.get('vg-stuck-1').error = 'render: ffmpeg crashed';
+      const r = await sweepAt(3 * 3600);
+      eq(r.resubmitted.map((x) => [x.kind, x.settlement, x.ambiguous]), [['videogen_stuck', 'charged_partial', false]], JSON.stringify(r));
+      const row = await latest(V2.runId, v2key);
+      eq([row.status, row.output_summary.providerReconcile.ambiguousRounds, row.output_summary.autoHeal.rounds], ['pending', 0, 0], 'reabierto; re-poll gratis reiniciado');
+      await ledgerWithinAuthorized(V2.runId);
+    });
+    const V2b = await makeCourse('r62 job eterno 2');
+    const v2bkey = `video:${V2b.c1}`;
+    await check('[V2] un job que no termina en 12 h → excepción videogen_job_not_terminal (duplicate_charge), 0 reenvíos; la acción de admin aparece', async () => {
+      await stuckFail(V2b, 'vg-stuck-2');
+      const sub0 = fakes.vg.submits;
+      await sweepAt(5);
+      const r = await sweepAt(PR.PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS + 60);
+      eq([r.resubmitted.length, r.declined.map((x) => x.reason)], [0, ['videogen_job_not_terminal']], JSON.stringify(r));
+      eq(fakes.vg.submits - sub0, 0, 'sin reenvío');
+      const row = await latest(V2b.runId, v2bkey);
+      eq([row.status, row.output_summary.providerReconcile.declined, row.attention], ['failed', 'videogen_job_not_terminal', 'duplicate_charge'], 'excepción explícita');
+      assert(((await completionOf(V2b)).adminActions || []).some((a) => a.itemKey === v2bkey), 'acción de admin visible');
+      eq((await sweepAt(PR.PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS + 600)).declined.length, 0, 'no se re-evalúa en cada tick');
+      await ledgerWithinAuthorized(V2b.runId);
+    });
+    const V2c = await makeCourse('r62 lookup caído');
+    const v2ckey = `video:${V2c.c1}`;
+    await check('[V2] lookup de estado caído con jobId → espera; a las 6 h excepción videogen_lookup_unavailable (no reenvío)', async () => {
+      await stuckFail(V2c, 'vg-down-1');
+      fakes.vg.statusDown = true;
+      try {
+        const sub0 = fakes.vg.submits;
+        const r1 = await sweepAt(5);
+        eq([r1.resubmitted.length, r1.waiting.length], [0, 1], JSON.stringify(r1));
+        const r2 = await sweepAt(PR.PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS + 60);
+        eq([r2.resubmitted.length, r2.declined.map((x) => x.reason)], [0, ['videogen_lookup_unavailable']], JSON.stringify(r2));
+        eq(fakes.vg.submits - sub0, 0, 'sin reenvío');
+        eq((await latest(V2c.runId, v2ckey)).attention, 'duplicate_charge', 'attention_reason');
+      } finally { fakes.vg.statusDown = false; }
+    });
+
+    // ═══ Z — regla de liberación (review I1) ═══════════════════════════════
+    const videogenFailed = async (title, job) => {
+      const C = await makeCourse(title);
+      fakes.vg.plan.push({ kind: 'ok', ...job, statuses: ['failed'] });
+      const s = await runVideo(C);
+      assert(s.st.failed.some((f) => /^videogen_failed/.test(f.msg)), JSON.stringify(s.st.failed));
+      await ds.query(`update public.generation_item_runs set finished_at = now() - interval '10 minutes' where id = $1`, [(await latest(C.runId, `video:${C.c1}`)).id]);
+      return C;
+    };
+    const vgAdj = async (C) => (await events(C.runId)).filter((e) => e.provider === 'videogen' && e.event_kind === 'ADJUSTMENT');
+    await check('[Z] costo 0 con evidencia fuerte (failed, desglose en 0, sin etapas pagadas): primera lectura espera; < 10 min sigue esperando; ≥ 10 min → released', async () => {
+      const C = await videogenFailed('r62 cero ok', { jobId: 'vg-zero-ok', error: 'content_txt vacío', cost: 0, breakdown: { script: 0, images: 0 } });
+      const r1 = await sweepAt(5);
+      eq([r1.resubmitted.length, r1.waiting.length, (await vgAdj(C)).length], [0, 1, 0], `primera lectura ${JSON.stringify(r1)}`);
+      const r2 = await sweepAt(5 + 300);
+      eq([r2.resubmitted.length, (await vgAdj(C)).length], [0, 0], 'dentro de los 10 min');
+      const r3 = await sweepAt(5 + PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 30);
+      eq(r3.resubmitted.map((x) => x.settlement), ['released'], JSON.stringify(r3));
+      eq((await vgAdj(C)).map((e) => e.metadata.settlement), ['reconciled_as_not_charged'], 'liberada');
+    });
+    await check('[Z] costo 0 de un job que falló en una etapa pagada (generate_script 429) → charged (reserva completa), nunca released', async () => {
+      const C = await videogenFailed('r62 cero no', { jobId: 'vg-zero-no', error: 'generate_script: OpenAI 429', cost: 0, breakdown: null });
+      const r = await sweepAt(5);
+      eq(r.resubmitted.map((x) => x.settlement), ['charged'], JSON.stringify(r));
+      eq((await vgAdj(C)).map((e) => [e.amount, e.metadata.settlement]), [['0.0000000000', 'reconciled_as_charged']], 'cuenta la reserva entera');
+    });
+    await check('[Z] lo informado (2,00) supera la reserva (1,175) → se cuenta TODO lo informado (nunca de menos)', async () => {
+      const C = await videogenFailed('r62 sobre reserva', { jobId: 'vg-over', error: 'render: timeout', cost: 2, breakdown: { render: 2 } });
+      const r = await sweepAt(5);
+      eq(r.resubmitted.map((x) => x.settlement), ['charged_over_reservation'], JSON.stringify(r));
+      const fam = (await events(C.runId)).filter((e) => e.provider === 'videogen');
+      assert(Math.abs(fam.reduce((t, e) => t + dec(e.amount), 0) - 2) < 1e-9, `contado ${JSON.stringify(fam.map((e) => e.amount))}`);
+      await ledgerWithinAuthorized(C.runId);
+    });
+
+    // ═══ O — jobId solo en el sufijo del error (review I3) ═══════════════════
+    const orphan = async (title, jobId, statuses, cost = 0.6) => {
+      const C = await makeCourse(title);
+      const it = await latest(C.runId, `video:${C.c1}`);
+      await ds.query(`update public.generation_item_runs set attempt_count = 1 where id = $1`, [it.id]);
+      const resKey = await HK.reservePaidCall(ledger, { kind: 'videogen', ownerId: OWNER, itemRunId: it.id, generation: it.generation, itemAttempt: 1, tag: 'submit', estimate: {} });
+      fakes.vg.jobs.set(jobId, { statuses, error: 'render failed', cost, breakdown: { script: cost } });
+      await ds.query(`update public.generation_item_runs set status = 'failed', finished_at = now() - interval '10 minutes', error = $2,
+                        output_summary = coalesce(output_summary, '{}'::jsonb) || $3::jsonb where id = $1`,
+        [it.id, `ambiguous_video_submission: connection terminated (job de Videogen ${jobId})`, JSON.stringify({ externalSubmitStartedAt: new Date().toISOString(), externalReservationKey: resKey })]);
+      return C;
+    };
+    await check('[O] jobId en el sufijo, job vivo → espera (0 reenvíos, 0 ajustes); al terminar `failed` → conciliado con su costo y reenvío NO ambiguo', async () => {
+      const C = await orphan('r62 huérfano', 'vg-orph-1', ['processing']);
+      const sub0 = fakes.vg.submits;
+      const r1 = await sweepAt(5);
+      eq([r1.resubmitted.length, r1.waiting.length, (await vgAdj(C)).length, fakes.vg.submits - sub0], [0, 1, 0, 0], JSON.stringify(r1));
+      fakes.vg.jobs.get('vg-orph-1').statuses = ['failed'];
+      const r2 = await sweepAt(3600);
+      eq(r2.resubmitted.map((x) => [x.kind, x.settlement, x.ambiguous]), [['videogen_orphan', 'charged_partial', false]], JSON.stringify(r2));
+    });
+    await check('[O] jobId en el sufijo, job COMPLETADO → se adopta el job y se re-pollea (sin reenvío, sin consumir reenvíos); el worker lo completa', async () => {
+      const C = await orphan('r62 huérfano ok', 'vg-orph-2', ['completed_local'], 0.97);
+      const r = await sweepAt(5);
+      eq(r.repolled.map((x) => x.kind), ['videogen_orphan'], JSON.stringify(r));
+      const row = await latest(C.runId, `video:${C.c1}`);
+      eq([row.status, row.output_summary.external.videogenJobId, row.output_summary.providerReconcile.rounds, row.output_summary.providerReconcile.repolls], ['pending', 'vg-orph-2', 0, 1], 'adoptado');
+      const sub0 = fakes.vg.submits;
+      const s = await runVideo(C);
+      eq([s.st.completed.length, fakes.vg.submits - sub0], [1, 0], `completado por poll ${JSON.stringify(s.st.failed)} ${workerLog.errors.slice(-2).join(' | ')}`);
+      await ledgerWithinAuthorized(C.runId);
+    });
+
+    // ═══ R — carrera (review I2) ═════════════════════════════════════════════
+    await check('[R] la parte se reabre y reclama (intento nuevo con su reserva) MIENTRAS el barrido consulta el costo → no se liquida nada (stale_row): ni la reserva vieja ni la del intento en vuelo', async () => {
+      const C = await videogenFailed('r62 carrera', { jobId: 'vg-race', error: 'render failed', cost: 0.5, breakdown: { render: 0.5 } });
+      const it = await latest(C.runId, `video:${C.c1}`);
+      fakes.vg.onCost = async () => {
+        await ds.query(`update public.generation_item_runs set status = 'running', attempt_count = attempt_count + 1, error = null where id = $1`, [it.id]);
+        await HK.reservePaidCall(ledger, { kind: 'videogen', ownerId: OWNER, itemRunId: it.id, generation: it.generation, itemAttempt: it.attempt_count + 1, tag: 'submit', estimate: {} });
+      };
+      const r = await sweepAt(5);
+      eq([r.resubmitted.length, r.skipped.some((x) => x.reason === 'stale_row')], [0, true], JSON.stringify(r));
+      eq((await vgAdj(C)).length, 0, 'ningún ajuste');
+      const pend = (await events(C.runId)).filter((e) => e.provider === 'videogen' && e.measurement_status === 'pending');
+      eq(pend.length, 2, 'las dos reservas siguen pendientes (la nueva intacta)');
+    });
+
+    // ═══ T — timeouts (review I4) ════════════════════════════════════════════
+    await check('[T] VideogenService (cliente de Cursia) corta un GET colgado con VIDEOGEN_HTTP_TIMEOUT_MS; el barrido corta un GET de Gamma colgado (espera, sin reenvío)', async () => {
+      process.env.VIDEOGEN_HTTP_TIMEOUT_MS = '300';
+      try {
+        const t0 = Date.now();
+        let e = null; try { await videogen.getVideoStatus('vg-hang'); } catch (x) { e = x; }
+        assert(e && /error de red \(TimeoutError/.test(e.message) && Date.now() - t0 < 5000, `timeout del cliente: ${e && e.message}`);
+      } finally { delete process.env.VIDEOGEN_HTTP_TIMEOUT_MS; }
+      const recon2 = new ProviderReconcileService(ds, runs, ledger, budget, { videogen, gamma: gammaClient, lookupTimeoutMs: 300 });
+      const C = await makeCourse('r62 gamma colgado');
+      await gammaFailed(C, 'gen-hang', null);
+      const t0 = Date.now();
+      const r = await recon2.sweep({ now: new Date(Date.now() + 5000), policy: P });
+      assert(Date.now() - t0 < 10000, 'el GET colgado no bloquea el tick');
+      eq([r.resubmitted.length, r.waiting.length], [0, 1], JSON.stringify(r));
+    });
+    await check('[T] d5: a lo sumo 10 consultas por tick; el resto en el próximo', async () => {
+      const C = await makeCourse('r62 d5 tope');
+      const it = await latest(C.runId, `video:${C.c1}`);
+      const prev = [];
+      for (let i = 1; i <= 12; i++) {
+        const k = await HK.reservePaidCall(ledger, { kind: 'videogen', ownerId: OWNER, itemRunId: it.id, generation: it.generation, itemAttempt: i, tag: 'submit', estimate: {} });
+        fakes.vg.jobs.set(`vg-cap-${i}`, { statuses: ['failed'], error: 'render failed', cost: 0.3, breakdown: { render: 0.3 } });
+        prev.push({ external: { videogenJobId: `vg-cap-${i}`, mode: 'real' }, externalReservationKey: k, reason: 'videogen_failed: render failed' });
+      }
+      await ds.query(`update public.generation_item_runs set attempt_count = 13, status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || $2::jsonb where id = $1`,
+        [it.id, JSON.stringify({ previousExternals: prev, reconciliationAcknowledgedThroughAttempt: 12, v3Validation: { artifactType: 'fixture' } })]);
+      const r1 = await sweepAt(5);
+      assert(r1.reservationsReconciled.length <= PR.PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK, `tope por tick: ${r1.reservationsReconciled.length}`);
+      const mine1 = r1.reservationsReconciled.filter((x) => x.runId === C.runId).length;
+      assert(mine1 >= 1 && mine1 < 12, `no todas en un tick: ${mine1}`);
+      let total = mine1;
+      for (let t = 0; t < 3 && total < 12; t++) {
+        const rn = await sweepAt(65 + t * 60);
+        assert(rn.reservationsReconciled.length <= PR.PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK, 'tope por tick');
+        total += rn.reservationsReconciled.filter((x) => x.runId === C.runId).length;
+      }
+      eq(total, 12, 'el resto en los ticks siguientes');
+      await ledgerWithinAuthorized(C.runId);
+    });
+
+    // ═══ X — runs anteriores al corte (review M1) ═══════════════════════════
+    await check('[X] un run creado ANTES del corte de activación: el barrido no lo toma y la completitud muestra la acción de admin de inmediato', async () => {
+      const C = await videogenFailed('r62 histórico', { jobId: 'vg-hist', error: 'render failed', cost: 0.5, breakdown: { render: 0.5 } });
+      process.env.PROVIDER_RECONCILE_RUNS_SINCE = new Date(Date.now() + 86400000).toISOString();
+      try {
+        const r = await sweepAt(5);
+        eq([r.resubmitted.length, r.waiting.length, r.declined.length], [0, 0, 0], JSON.stringify(r));
+        eq((await vgAdj(C)).length, 0, 'nada conciliado');
+        assert(((await completionOf(C)).adminActions || []).some((a) => a.itemKey === `video:${C.c1}`), 'acción visible (no oculta 6 h)');
+      } finally { process.env.PROVIDER_RECONCILE_RUNS_SINCE = '2020-01-01T00:00:00Z'; }
+    });
+
+    // ═══ Gamma ═══════════════════════════════════════════════════════════════
     const G = await makeCourse('r62 Gamma');
     const gkey = `presentation:${G.c1}`;
     await check('[G1] Gamma fallido con créditos DEDUCIDOS (el worker ya liquidó 40 créditos) → reenvío automático sin consultar ni reajustar', async () => {
       await gammaFailed(G, 'gen-g1', 40);
       const n0 = (await events(G.runId)).length; const g0 = fakes.gm.getCalls;
       const r = await sweepAt(5);
-      eq(r.resubmitted.map((x) => [x.itemKey, x.kind, x.settlement]), [[gkey, 'gamma_failed', 'measured_by_worker']], JSON.stringify(r));
+      eq(r.resubmitted.filter((x) => x.runId === G.runId).map((x) => [x.itemKey, x.kind, x.settlement]), [[gkey, 'gamma_failed', 'measured_by_worker']], JSON.stringify(r));
       eq([(await events(G.runId)).length - n0, fakes.gm.getCalls - g0], [0, 0], 'sin ajustes ni GET');
       const row = await latest(G.runId, gkey);
       eq([row.status, !!row.output_summary.external, row.output_summary.previousExternals.slice(-1)[0].external.gammaGenerationId], ['pending', false, 'gen-g1'], 'generación archivada (resubmitProvider)');
@@ -528,7 +715,7 @@ async function dbChecks() {
       fakes.gm.gens.set('gen-g2', { status: 'failed', credits: 12 });
       await gammaFailed(G, 'gen-g2', null);
       const r = await sweepAt(5);
-      eq(r.resubmitted.map((x) => [x.kind, x.settlement, x.ambiguous]), [['gamma_failed', 'measured', false]], JSON.stringify(r));
+      eq(r.resubmitted.filter((x) => x.runId === G.runId).map((x) => [x.kind, x.settlement, x.ambiguous]), [['gamma_failed', 'measured', false]], JSON.stringify(r));
       const fam = (await events(G.runId)).filter((e) => e.idempotency_key === 'gamma:gen:gen-g2' || (e.event_kind === 'ADJUSTMENT' && e.metadata.adjusts === 'gamma:gen:gen-g2'));
       const net = fam.reduce((t, e) => t + dec(e.amount), 0);
       assert(Math.abs(net - 0.12) < 1e-9, `liquidado a 12 créditos: ${net} ${JSON.stringify(fam.map((e) => [e.event_kind, e.amount]))}`);
@@ -539,29 +726,29 @@ async function dbChecks() {
     await check('[G4] tercera falla de la MISMA parte (ya usó sus 2 reenvíos) → excepción registrada (cap_reached) una sola vez, sin reenvío; la acción de admin aparece', async () => {
       await gammaFailed(G, 'gen-g4', 40);
       const r = await sweepAt(5);
-      eq([r.resubmitted.length, r.declined.map((x) => x.reason)], [0, ['cap_reached']], JSON.stringify(r));
+      eq([r.resubmitted.filter((x) => x.runId === G.runId).length, r.declined.filter((x) => x.runId === G.runId).map((x) => x.reason)], [0, ['cap_reached']], JSON.stringify(r));
       const row = await latest(G.runId, gkey);
       eq([row.status, row.output_summary.providerReconcile.declined, row.attention], ['failed', 'cap_reached', 'unrecoverable'], 'excepción');
       const comp = await completionOf(G);
       assert((comp.adminActions || []).some((a) => a.itemKey === gkey), `acción visible: ${JSON.stringify(comp.adminActions)}`);
       const r2 = await sweepAt(60);
-      eq([r2.candidates, r2.declined.length], [0, 0], 'no se re-evalúa');
+      eq([r2.skipped.concat(r2.declined, r2.resubmitted, r2.waiting).filter((x) => x.runId === G.runId).length], [0], 'no se re-evalúa (ni siquiera es candidato)');
       await ledgerWithinAuthorized(G.runId);
     });
     const G3 = await makeCourse('r62 Gamma sin créditos');
     const g3key = `presentation:${G3.c1}`;
-    await check('[G3] Gamma sin créditos y Gamma nunca los informa → en espera (sin reenvío) hasta el tope de consulta; después conservador (possible_duplicate) + 1 reenvío ambiguo', async () => {
+    await check('[G3] Gamma sin créditos y Gamma nunca los informa → en espera (sin reenvío) hasta el tope de consulta; después conservador (estimado completo) + reenvío (la generación ya terminó: sin doble generación viva)', async () => {
       fakes.gm.gens.set('gen-g3', { status: 'failed', credits: null });
       await gammaFailed(G3, 'gen-g3', null);
       const r1 = await sweepAt(5);
-      eq([r1.resubmitted.length, r1.waiting.map((x) => x.itemKey)], [0, [g3key]], `espera ${JSON.stringify(r1)}`);
+      eq([r1.resubmitted.filter((x) => x.runId === G3.runId).length, r1.waiting.filter((x) => x.runId === G3.runId).map((x) => x.itemKey)], [0, [g3key]], `espera ${JSON.stringify(r1)}`);
       const comp = await completionOf(G3);
       eq((comp.adminActions || []).filter((a) => a.itemKey === g3key), [], 'mientras espera, sin acción de admin');
       const r2 = await sweepAt(PR.PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS + 5);
-      eq(r2.resubmitted.map((x) => [x.kind, x.settlement, x.ambiguous]), [['gamma_failed', 'reconciled_as_charged', true]], JSON.stringify(r2));
+      eq(r2.resubmitted.filter((x) => x.runId === G3.runId).map((x) => [x.kind, x.settlement, x.ambiguous]), [['gamma_failed', 'reconciled_as_charged', false]], JSON.stringify(r2));
       const adj = (await events(G3.runId)).filter((e) => e.event_kind === 'ADJUSTMENT' && e.metadata.adjusts === 'gamma:gen:gen-g3');
-      eq(adj.map((e) => [e.amount, e.metadata.settlement, e.metadata.possible_duplicate]), [['0.0000000000', 'reconciled_as_charged', true]], 'conservador con la marca');
-      eq((await latest(G3.runId, g3key)).output_summary.providerReconcile.ambiguousRounds, 1, 'un reenvío ambiguo');
+      eq(adj.map((e) => [e.amount, e.metadata.settlement, e.metadata.conservative, e.metadata.possible_duplicate]), [['0.0000000000', 'reconciled_as_charged', true, undefined]], 'conservador');
+      eq((await latest(G3.runId, g3key)).output_summary.providerReconcile.ambiguousRounds, 0, 'no consume el reenvío ambiguo');
       await ledgerWithinAuthorized(G3.runId);
     });
 
@@ -627,7 +814,7 @@ async function dbChecks() {
     });
 
     await check('[L] en todos los runs: ledger ≤ autorizado; ningún ajuste de admin; todo ajuste automático lleva decidedBy=system', async () => {
-      for (const C of [V1, V2, G, G3, A1, A2, D]) {
+      for (const C of [V1, V2, V2b, V2c, G, G3, A1, A2, D]) {
         await ledgerWithinAuthorized(C.runId);
         await noAdminAdjustments(C.runId);
         for (const e of (await events(C.runId)).filter((x) => x.recorded_by === 'system_provider_reconcile')) eq(e.metadata.decidedBy, 'system', 'decidedBy');

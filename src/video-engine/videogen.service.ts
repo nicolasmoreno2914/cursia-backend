@@ -73,6 +73,27 @@ function videogenDurationSeconds(j: any): number | null {
   return null;
 }
 
+/**
+ * r62 (N2, review I4): timeout HTTP del CLIENTE de Cursia hacia Videogen (Videogen no cambia). Antes ninguna llamada
+ * tenía timeout: un GET colgado dejaba la parte `running` con la lease viva (bloqueo silencioso). Un POST que vence
+ * sigue siendo un envío ambiguo (el worker ya lo trata así); un GET que vence es un error reintentable.
+ * VIDEOGEN_HTTP_TIMEOUT_MS acota los GET (default 60 s); el POST de batch-create usa VIDEOGEN_SUBMIT_TIMEOUT_MS (180 s).
+ */
+export const VIDEOGEN_GET_TIMEOUT_MS_DEFAULT = 60_000;
+export const VIDEOGEN_SUBMIT_TIMEOUT_MS_DEFAULT = 180_000;
+function timeoutFromEnv(key: string, dflt: number): number {
+  const n = Number(process.env[key]);
+  return Number.isInteger(n) && n > 0 ? n : dflt;
+}
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, what: string): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (err) {
+    const name = err instanceof Error ? err.name : 'error';
+    throw new Error(`Videogen ${what}: error de red (${name}${name === 'TimeoutError' ? `, ${timeoutMs} ms` : ''})`);
+  }
+}
+
 @Injectable()
 export class VideogenService {
   private readonly logger = new Logger(VideogenService.name);
@@ -105,14 +126,14 @@ export class VideogenService {
 
     this.logger.log(`Submitting batch-create to Videogen: ${videos.length} videos`);
 
-    const response = await fetch(`${baseUrl}/api/external/videos/batch-create`, {
+    const response = await fetchWithTimeout(`${baseUrl}/api/external/videos/batch-create`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({ videos }),
-    });
+    }, timeoutFromEnv('VIDEOGEN_SUBMIT_TIMEOUT_MS', VIDEOGEN_SUBMIT_TIMEOUT_MS_DEFAULT), 'batch-create');
 
     const text = await response.text();
     this.logger.log(`Videogen batch-create response: HTTP ${response.status}`);
@@ -142,10 +163,10 @@ export class VideogenService {
     const url = `${baseUrl}/api/external/videos/batches/${encodeURIComponent(batchId)}/status`;
     this.logger.log(`Polling Videogen batch status: ${batchId}`);
 
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    });
+    }, timeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_GET_TIMEOUT_MS_DEFAULT), 'batch-status');
 
     const text = await response.text();
     this.logger.log(`Videogen batch-status response: HTTP ${response.status}`);
@@ -176,10 +197,10 @@ export class VideogenService {
     const url = `${baseUrl}/api/external/videos/${encodeURIComponent(jobId)}/status`;
     this.logger.log(`Polling Videogen video status: ${jobId}`);
 
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    });
+    }, timeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_GET_TIMEOUT_MS_DEFAULT), 'video-status');
 
     const text = await response.text();
 
@@ -211,10 +232,10 @@ export class VideogenService {
     const url = `${baseUrl}/api/costs/videos/${encodeURIComponent(jobId)}`;
     this.logger.log(`Fetching Videogen real cost: ${jobId}`);
 
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    });
+    }, timeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_GET_TIMEOUT_MS_DEFAULT), 'cost');
 
     const text = await response.text();
 

@@ -2371,7 +2371,7 @@ export class RunsService {
       } else if (auto && auto.providerReconcile) {
         // r62 (N2): misma decisión que el barrido, con la fila bloqueada; el error tiene que ser el que se concilió.
         const pr = auto.providerReconcile;
-        const d = providerReconcileDecision(target, auto.now ?? new Date(), auto.policy);
+        const d = providerReconcileDecision(target, auto.now ?? new Date(), auto.policy, { id: String(job.id), created_at: job.created_at ?? null });
         if (d.heal === false || d.kind !== pr.kind || String(target.error ?? '') !== pr.expectError || (pr.ambiguous && !d.ambiguousAllowed)) {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (provider_reconcile: ${d.heal === false ? d.reason : 'changed'})`, code: 'auto_heal_not_eligible' });
         }
