@@ -314,7 +314,7 @@ function ytPublisher(mp4, st) {
   });
 
   // ═══ #16: timeouts gratuitos ══════════════════════════════════════════════
-  await check('#16 video_timeout dentro del tope de reloj → grantAttempt; con videoPollSince viejo (> 3 h) → consume intento (sin opts)', async () => {
+  await check('#16 video_timeout dentro del tope de reloj → grantAttempt; con videoPollSince viejo (> 3 h) → videogen_render_overdue (r62)', async () => {
     const ext = { external: { videogenBatchId: 'mb', videogenJobId: 'mock_idem-v1', mode: 'mock' } };
     const s1 = fakeScheduler(ext);
     await IW.processItem(videoDeps(s1, MOCK_RUN, { mockScenario: 'timeout', videoTimeoutMin: 0.0005 }), videoItem({ outputSummary: s1.st.summary }));
@@ -323,7 +323,9 @@ function ytPublisher(mp4, st) {
     const old = new Date(Date.now() - IW.VIDEO_TIMEOUT_FREE_WALL_MS - 60000).toISOString();
     const s2 = fakeScheduler({ ...ext, videoPollSince: old });
     await IW.processItem(videoDeps(s2, MOCK_RUN, { mockScenario: 'timeout', videoTimeoutMin: 0.0005 }), videoItem({ outputSummary: s2.st.summary }));
-    eq([s2.st.failed[0].msg, s2.st.failed[0].opts], ['video_timeout', null], 'pasado el tope consume');
+    // r62 (N2): pasado el tope ÚNICO de render con el job vivo → failed visible (videogen_render_overdue), nunca un
+    // job nuevo ni más intentos consumidos re-polleando sin salida.
+    eq([s2.st.failed[0].msg.split(':')[0], s2.st.failed[0].retryable], ['videogen_render_overdue', false], 'pasado el tope: vencido visible');
   });
 
   // ═══ #7: duración medida ══════════════════════════════════════════════════

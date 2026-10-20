@@ -241,6 +241,26 @@ export class VideogenService {
   }
 
   /**
+   * r62 (N2): cancelación de un job (`POST /api/videos/{id}/cancel`, endpoint EXISTENTE de Videogen con DualAuthGuard,
+   * la misma API key; Videogen no cambia). Solo la usa la conciliación V2 y solo para un job ENCOLADO: Videogen lo saca
+   * de la cola y lo marca failed. Para un job que ya está PROCESANDO no lo detiene (el procesador no consulta la
+   * cancelación y vuelve a escribir su progreso), así que el llamador nunca lo usa como prueba de que no hay render.
+   * `alreadyInactive` = Videogen respondió que el job ya no está activo (400 job_not_active).
+   */
+  async cancelVideo(jobId: string, opts?: VideogenCallOptions): Promise<{ cancelled: boolean; alreadyInactive: boolean }> {
+    const { apiKey, baseUrl } = this.getConfig();
+    const url = `${baseUrl}/api/videos/${encodeURIComponent(jobId)}/cancel`;
+    this.logger.log(`Cancelling Videogen job: ${jobId}`);
+    const response = await videogenFetch(url, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` } }, opts, 'cancel');
+    const text = await response.text();
+    let parsed: Record<string, any> = {};
+    try { parsed = JSON.parse(text); } catch { /* cuerpo no JSON */ }
+    if (response.ok) return { cancelled: true, alreadyInactive: false };
+    if (response.status === 400 && parsed?.error === 'job_not_active') return { cancelled: false, alreadyInactive: true };
+    throw new Error(`Videogen cancel failed (HTTP ${response.status}): ${String(parsed?.error ?? parsed?.message ?? text).slice(0, 200)}`);
+  }
+
+  /**
    * Costo real por video, calculado por Videogen a partir de sus logs de uso
    * reales (OpenAI texto/imágenes, voz, render, YouTube) — no una tarifa
    * configurada. Mismo baseUrl/apiKey que el resto de este servicio; el

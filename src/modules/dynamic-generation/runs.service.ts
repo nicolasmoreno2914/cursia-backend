@@ -2764,7 +2764,10 @@ export class RunsService {
         const eligible = err.startsWith('videogen_failed') || err.startsWith('ambiguous_video_submission')
           || err.startsWith('videogen_submit_rejected') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED)
           // r62 (N2): job que nunca termina (re-poll del auto-healer agotado), ya liquidado de forma conservadora.
-          || (!!auto?.providerReconcile && auto.providerReconcile.kind === 'videogen_stuck' && err.startsWith('video_timeout'));
+          || (!!auto?.providerReconcile && auto.providerReconcile.kind === 'videogen_stuck' && err.startsWith('video_timeout'))
+          // r62 (N2): job vencido (tope único de render): reenvío de admin con aviso de posible render doble, o el
+          // automático tras una cancelación confirmada.
+          || err.startsWith('videogen_render_overdue');
         if (!eligible) {
           throw new BadRequestException(
             `resubmitVideo solo aplica cuando el último error es "videogen_failed", "ambiguous_video_submission", "videogen_submit_rejected" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,

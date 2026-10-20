@@ -10,13 +10,13 @@ import { GammaClient, GammaGenerationStatus } from '../../workers/provider-real/
 import { AUTO_HEAL_MAX_AGE_HOURS_RANGE, AutoHealPolicy, autoHealPolicyFromEnv } from './auto-heal';
 import { latestGenerationPredicate } from './item-generations';
 import { RunsService } from './runs.service';
+import { PROVIDER_STUCK_NO_CANCEL } from './videogen-render-cap';
 import { loadPendingVideogenReservations } from './run-completion';
 import {
   PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK,
   PROVIDER_RECONCILE_EXCLUDED_RUN_IDS,
   PROVIDER_RECONCILE_EXCLUDED_RUN_PREFIXES,
   PROVIDER_RECONCILE_KEY,
-  PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS,
   PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS,
   PROVIDER_RECONCILE_MAX_REPOLLS,
   PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS,
@@ -28,6 +28,7 @@ import {
   ProviderReconcileKind,
   gammaMeasuredCreditsOf,
   providerReconcileDecision,
+  providerReconcileLiveJobMaxSeconds,
   providerReconcileRecheckSeconds,
   providerReconcileRunEligible,
   providerReconcileRunsSince,
@@ -50,7 +51,7 @@ import {
 
 /** Clientes del proveedor que usa el barrido (solo los GET de estado / costo). Inyectables en pruebas. */
 export interface ProviderReconcileClients {
-  videogen?: Pick<VideogenService, 'getVideoStatus' | 'getVideoCost'> | null;
+  videogen?: (Pick<VideogenService, 'getVideoStatus' | 'getVideoCost'> & Partial<Pick<VideogenService, 'cancelVideo'>>) | null;
   gamma?: { getGeneration(generationId: string): Promise<GammaGenerationStatus> } | null;
   /** Timeout de cada GET del barrido (default PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS; pruebas). */
   lookupTimeoutMs?: number;
@@ -121,7 +122,7 @@ export class ProviderReconcileService {
     return Number.isFinite(n) && n > 0 ? n : PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS;
   }
 
-  private videogen(): Pick<VideogenService, 'getVideoStatus' | 'getVideoCost'> {
+  private videogen(): Pick<VideogenService, 'getVideoStatus' | 'getVideoCost'> & Partial<Pick<VideogenService, 'cancelVideo'>> {
     if (this.clients.videogen === undefined) this.clients.videogen = new VideogenService();
     if (!this.clients.videogen) throw new LookupError('Videogen no configurado en el barrido');
     return this.clients.videogen;
@@ -225,6 +226,7 @@ export class ProviderReconcileService {
     switch (d.kind) {
       case 'videogen_failed':
       case 'videogen_stuck':
+      case 'videogen_overdue':
       case 'videogen_orphan':
         ev = await this.videogenEvidence(r, os, d.kind, pending, ageSecs, prevState, now);
         break;
@@ -378,12 +380,36 @@ export class ProviderReconcileService {
       // El job terminó bien: se retoma por poll (gratis); el worker liquida la reserva con el costo al completar.
       return { action: 'repoll', adoptJobId: os.external?.videogenJobId ? null : jobId, why: `Videogen informa ${status} para ${jobId}` };
     }
+    const cancelAt = Date.parse(String(prevState.cancelRequestedAt ?? ''));
+    const cancelPending = Number.isFinite(cancelAt) && String(prevState.cancelError ?? '') === String(r.error ?? '');
+    if (cancelPending && now.getTime() - cancelAt < PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS * 1000) {
+      // Tras cancelar, el estado terminal se confirma con una lectura ≥ 10 min después (carrera cola → procesador).
+      return { action: 'wait', recheck: true, why: `cancelación del job ${jobId} pedida; se confirma el estado (${status || 'sin estado'})` };
+    }
     if (!isJobFailed(status)) {
-      if (ageSecs >= PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS) {
-        return { action: 'decline', reason: 'videogen_job_not_terminal', attention: 'duplicate_charge',
-          why: `el job ${jobId} sigue ${status || 'sin estado'} tras ${PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS / 3600} h; no se reenvía (puede terminar y cobrar)` };
+      // Tope ÚNICO de render (el del worker), desde el primer poll del job.
+      const since = Date.parse(String(os.videoPollSince ?? '')) || new Date(r.finished_at).getTime();
+      const liveSecs = (now.getTime() - since) / 1000;
+      const cap = providerReconcileLiveJobMaxSeconds();
+      if (kind !== 'videogen_overdue' && kind !== 'videogen_stuck' && liveSecs < cap) {
+        return { action: 'wait', recheck: true, why: `el job ${jobId} sigue ${status || 'sin estado'} (se vuelve a consultar, sin reenviar)` };
       }
-      return { action: 'wait', recheck: true, why: `el job ${jobId} sigue ${status || 'sin estado'} (se vuelve a consultar, sin reenviar)` };
+      const queued = /^(queued|pending|waiting)$/i.test(status);
+      const vg = this.videogen();
+      if (queued && !cancelPending && typeof vg.cancelVideo === 'function') {
+        // Encolado: la cancelación de Videogen lo saca de la cola (nunca empezó a gastar). Se confirma y se sigue por evidencia.
+        try {
+          const c = await withTimeout(vg.cancelVideo(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `POST cancel ${jobId}`);
+          await this.patchState(r, { cancelRequestedAt: now.toISOString(), cancelError: String(r.error ?? ''), cancelResult: c });
+          return { action: 'wait', recheck: true, why: `job ${jobId} encolado pasado el tope de render: cancelación pedida` };
+        } catch (err) {
+          return { action: 'wait', recheck: true, why: `no se pudo cancelar el job ${jobId} (${errText(err)}); se reintenta` };
+        }
+      }
+      // Procesando (o sin cancelación efectiva): reenviar podría producir un doble render pagado → excepción (c).
+      return { action: 'decline', reason: PROVIDER_STUCK_NO_CANCEL, attention: 'duplicate_charge',
+        why: `el job ${jobId} sigue ${status || 'sin estado'} tras ${(liveSecs / 3600).toFixed(2)} h (tope ${(cap / 3600).toFixed(2)} h) y Videogen no puede detener un job ` +
+          `${queued ? 'encolado ya cancelado sin efecto' : 'que ya está procesando'}: reenviar podría producir un doble render pagado` };
     }
     // Job TERMINAL fallido: ya no puede renderizar. Costo (estimado) del job.
     let cost: VideogenCostBreakdown;

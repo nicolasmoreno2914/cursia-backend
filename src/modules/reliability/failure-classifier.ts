@@ -474,6 +474,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // r62 (N2, d4): con jobId el barrido consulta estado + costo del job, concilia la reserva y reenvía acotado (provider_check).
   { id: 'videogen_failed', codes: ['videogen_failed'], class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'videogen', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_video_render',
     refine: ({ outputSummary }) => (hasVideogenJob(outputSummary) ? { strategy: 'provider_check', rounds: PROVIDER_RECONCILE_MAX_RESUBMITS } : null) },
+  // r62 (N2): job vivo pasado el tope único de render → la conciliación cancela (encolado) o deja la excepción (c).
+  { id: 'videogen_render_overdue', codes: ['videogen_render_overdue'], class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', provider: 'videogen', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'retry_video_render' },
   {
     id: 'provider_config',
     codes: ['videogen_not_configured', 'real_video_not_allowed', 'video_preview_not_allowed', 'PROVIDER_MODE_UNSET', 'provider_mode_unset',
