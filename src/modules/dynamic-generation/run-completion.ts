@@ -33,6 +33,8 @@ import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes'
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
 import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, autoHealPolicyFromEnv, safeAutoRetryDecision } from './auto-heal';
+// r62 (N2): Videogen/Gamma que el barrido de conciliación todavía va a resolver solo (sin acción de admin).
+import { providerReconcilePending } from './provider-reconcile';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -545,6 +547,9 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   const adCeilingOk = !adFailedAt || !Number.isFinite(adFailedAt.getTime()) ||
     now.getTime() < adFailedAt.getTime() + AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS * 1000 + 3 * autoHealIntervalMs(process.env);
   if (tickOn && adCeilingOk && (ad.heal === true || (ad.heal === false && ad.reason === 'backoff'))) return null;
+  // r62 (N2): render/generación fallida con id del proveedor o envío ambiguo que el barrido concilia y reenvía solo
+  // (dentro de su techo: espera + consulta máxima + 3 ticks; si lo declina, la acción de admin aparece).
+  if (tickOn && providerReconcilePending(ahRow, now, autoHealIntervalMs(process.env))) return null;
   if (err.includes(PROVIDER_RECONCILIATION_REQUIRED)) {
     return { code: r.type === 'video' ? 'reconcile_videogen' : 'reconcile_provider', itemKey: key };
   }
@@ -610,6 +615,11 @@ export function evaluateRunCompletion(
   if (previewComponents.some((k) => k.startsWith('video:')) && manifest.rulesVersion === 3) push({ code: 'generate_real_videos' });
   // V542 (G6): nunca se liberan solas (resultado incierto): una acción de admin por reserva.
   for (const r of opts.pendingVideogenReservations ?? []) {
+    // r62 (N2, d5): la reserva del intento vigente de una parte que el barrido va a conciliar sola no es un paso de admin.
+    const owner = rowsByKey.get(r.itemKey);
+    if (owner && String(owner.id ?? '') === r.itemRunId && autoHealEnabled(process.env) &&
+      providerReconcilePending({ id: owner.id, status: owner.status, type: owner.type, error: owner.error ?? null, output_summary: os(owner),
+        finished_at: owner.finished_at ?? null, updated_at: owner.updated_at ?? null }, now, autoHealIntervalMs(process.env))) continue;
     push({ code: 'reconcile_videogen_reservation', itemKey: r.itemKey, reservationKey: r.reservationKey, amount: r.amount, attemptState: r.attemptState, mayHaveRendered: r.mayHaveRendered });
   }
 

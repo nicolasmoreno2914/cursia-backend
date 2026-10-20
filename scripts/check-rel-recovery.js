@@ -103,7 +103,7 @@ async function pureChecks() {
     eq([rec.source, rec.class, rec.code, rec.strategy, rec.round, rec.maxRounds, rec.nextRetryAt, rec.currentRecovery],
       ['recorded', 'A', 'gamma_poll_failed', 'repoll_external', 2, 3, '2026-10-02T00:00:00.000Z', 'auto_heal'], 'registrada');
     const der = RV.recoveryViewOf({ status: 'failed', error: 'ambiguous_video_submission', type: 'video', output_summary: {} });
-    eq([der.source, der.class, der.code, der.attentionReason, der.maxRounds, der.currentRecovery], ['derived', 'C', 'ambiguous_video_submission', 'duplicate_charge', 0, 'denied'], 'derivada');
+    eq([der.source, der.class, der.code, der.attentionReason, der.maxRounds, der.currentRecovery], ['derived', 'C', 'ambiguous_video_submission', 'duplicate_charge', 1, 'provider_reconcile'], 'derivada (r62 N2: c2 → conciliación conservadora + 1 reenvío)');
     const der2 = RV.recoveryViewOf({ status: 'failed', error: 'lease_expired', type: 'content', output_summary: {} });
     eq([der2.class, der2.maxRounds, der2.attentionReason], ['A', 5, null], 'derivada A (REL MVP: 5 rondas por clase)');
     const none = RV.recoveryViewOf({ status: 'completed', error: null, type: 'content', recovery_round: 1 });
@@ -444,7 +444,7 @@ async function dbChecks() {
       await R.sched.failItem(v.itemRunId, 'rel-video-worker', 'ambiguous_video_submission: timeout del batchCreate', false);
       row = await R.itemRow(relSeq.C.runId, vkey);
       eq([row.status, row.failure_class, row.failure_code, row.recovery_strategy, row.attention_reason, row.recovery_max_rounds],
-        ['failed', 'C', 'ambiguous_video_submission', 'provider_check', 'duplicate_charge', 0], 'C terminal');
+        ['failed', 'C', 'ambiguous_video_submission', 'provider_check', 'duplicate_charge', 1], 'C terminal (r62 N2: 1 reenvío ambiguo acotado)');
       const [a] = await attempts(v.itemRunId);
       eq([a.executor_kind, a.outcome, a.failure_class, a.provider], ['video_worker', 'failed', 'C', 'videogen'], 'intento del video');
     });

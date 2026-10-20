@@ -960,7 +960,8 @@ export class FinopsLedgerService {
     originalKey: string,
     newAmount: DecimalLike,
     reason: string,
-    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean } = {},
+    // r62 (N2): `settlementLabel` = etiqueta explícita de la liquidación (p.ej. la conciliación conservadora del sistema).
+    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean; settlementLabel?: string } = {},
   ): Promise<{ inserted: boolean; event: CostEventRow | null; delta: string; previousTotal: string; newTotal: string }> {
     nonEmpty(originalKey, 'originalKey');
     nonEmpty(reason, 'reason');

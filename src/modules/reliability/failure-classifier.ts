@@ -35,6 +35,8 @@ import {
 // del item en el ledger es ≤ USD 0.10. La decisión (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa
 // la misma función pura SIN ledger para informar qué hace hoy el sistema.
 import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv } from '../dynamic-generation/auto-heal';
+// r62 (N2): conciliación automática de Videogen/Gamma con la evidencia del proveedor (+ reenvío acotado).
+import { PROVIDER_RECONCILE_MAX_RESUBMITS, providerReconcileDecision } from '../dynamic-generation/provider-reconcile';
 
 export type FailureClass = 'A' | 'B' | 'C' | 'D';
 export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
@@ -87,6 +89,7 @@ export type CurrentRecovery =
   | 'ambiguous_audio_resubmit' // #583: UN reenvío automático de audio TTS incierto (≤ USD 0.10 pendiente, lo decide auto-heal con el ledger)
   | 'auto_regenerate' // REL MVP: clase B de un componente de la IA → el auto-healer lo regenera solo (≤ 2 rondas)
   | 'provider_probe' // REL CREDIT: crédito/cuota agotados → sonda del proveedor (canario) y reanudación sola (solo en la vista)
+  | 'provider_reconcile' // r62 (N2): Videogen/Gamma → conciliación con la evidencia del proveedor y reenvío acotado (provider-reconcile.ts)
   | 'denied' // deny-list: nunca se reabre solo
   | 'manual'; // nada automático: humano (retry/regenerate)
 
@@ -400,9 +403,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     id: 'gamma_generation_failed', codes: ['gamma_generation_failed'],
     class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'gamma', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
     // N4: anclado al SUFIJO que agrega el worker (real-providers.ts), nunca al texto de Gamma que va antes.
-    refine: ({ error }) => (/\[créditos medidos: \d+(?:\.\d+)?\]\. No se reenvía sola/.test(error)
+    // r62 (N2, d13): sin créditos medidos pero con generationId → el barrido consulta `credits.deducted` (provider_check).
+    refine: ({ error, outputSummary }) => (/\[créditos medidos: \d+(?:\.\d+)?\]\. No se reenvía sola/.test(error)
       ? { class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', rounds: 1, humanReason: undefined, adminAction: undefined }
-      : null),
+      : hasGammaId(outputSummary) ? { strategy: 'provider_check', rounds: PROVIDER_RECONCILE_MAX_RESUBMITS } : null),
   },
   {
     id: 'audio_invalid',
@@ -453,7 +457,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   },
   // Decisión del usuario D4 (2026-10-02): render fallido con cobro incierto → política FinOps, nunca un reenvío
   // automático que duplique gasto. «El proveedor confirma que no cobró → puede reintentar» llega con R8.
-  { id: 'videogen_failed', codes: ['videogen_failed'], class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'videogen', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_video_render' },
+  // r62 (N2, d4): con jobId el barrido consulta estado + costo del job, concilia la reserva y reenvía acotado (provider_check).
+  { id: 'videogen_failed', codes: ['videogen_failed'], class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'videogen', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_video_render',
+    refine: ({ outputSummary }) => (hasVideogenJob(outputSummary) ? { strategy: 'provider_check', rounds: PROVIDER_RECONCILE_MAX_RESUBMITS } : null) },
   {
     id: 'provider_config',
     codes: ['videogen_not_configured', 'real_video_not_allowed', 'video_preview_not_allowed', 'PROVIDER_MODE_UNSET', 'provider_mode_unset',
@@ -711,6 +717,7 @@ export function currentRecoveryOf(
   // #583: va ANTES de la deny-list (la deny-list describe justamente este caso incierto; la función de
   // auto-heal aplica su propia deny-list reducida).
   if (ambiguousAudioResubmitDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date()).heal) return 'ambiguous_audio_resubmit';
+  if (providerReconcileDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date()).heal) return 'provider_reconcile';
   const denied = AUTO_HEAL_DENY_PATTERNS.some((re) => re.test(e));
   const safe = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(e) && (!itemType || itemType === r.type));
   if (safe && !denied && safe.requires(os, e)) return 'safe_auto_retry';
