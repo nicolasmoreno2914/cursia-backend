@@ -21,6 +21,9 @@
 #   PROD_V2_CANARY_OWNER=<uuid>     enciende V2 SOLO para ese owner (vacío = V2 apagado).
 #   PROD_V2_WORKERS_ENABLED=true    con canario: enciende el worker de proveedores reales
 #                                   + el worker de IA hospedado (gasto). Default false.
+#   PROD_V2_LLM_WORKER_ENABLED=true con canario + PROD_V2_WORKERS_ENABLED: worker de IA HOSPEDADO en el
+#                                   worker de proveedores (las partes LLM no dependen de una pestaña
+#                                   abierta). Default false; el drenado sube a la duración de una llamada.
 #   PROD_V2_GENERAL_AVAILABILITY=true  único modo de permitir V2 con allowlist vacía.
 #   PROD_DB_POOL_MAX / PROD_DB_POOL_MAX_WORKER / PROD_DB_POOL_IDLE_MS_WORKER
 #                                   pool por proceso (vacío = no se toca el .env).
@@ -102,6 +105,7 @@ jobs:
         env:
           CANARY: ${{ vars.PROD_V2_CANARY_OWNER }}
           WORKERS: ${{ vars.PROD_V2_WORKERS_ENABLED }}
+          LLM: ${{ vars.PROD_V2_LLM_WORKER_ENABLED }}
           GA: ${{ vars.PROD_V2_GENERAL_AVAILABILITY }}
           POOL_MAX: ${{ vars.PROD_DB_POOL_MAX }}
           POOL_MAX_WORKER: ${{ vars.PROD_DB_POOL_MAX_WORKER }}
@@ -117,6 +121,7 @@ jobs:
           fi
           b() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in true) echo true ;; ''|false) echo false ;; *) echo "::error::$2 debe ser true|false" >&2; return 1 ;; esac; }
           WORKERS="$(b "$WORKERS" PROD_V2_WORKERS_ENABLED)"
+          LLM="$(b "$LLM" PROD_V2_LLM_WORKER_ENABLED)"
           GA="$(b "$GA" PROD_V2_GENERAL_AVAILABILITY)"
           BLOCK_V1="$(b "$BLOCK_V1" PROD_DEPLOY_BLOCK_ON_V1_JOBS)"
           SKIP_STORAGE="$(b "$SKIP_STORAGE" PROD_SKIP_STORAGE_POLICY_PROBE)"
@@ -129,9 +134,10 @@ jobs:
             exit 1
           fi
           if ! printf '%s' "$FE_REF" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$'; then echo "::error::PROD_FE_GATE_REF inválido"; exit 1; fi
+          if [ "$LLM" = "true" ] && [ "$WORKERS" != "true" ]; then echo "::warning::PROD_V2_LLM_WORKER_ENABLED=true sin PROD_V2_WORKERS_ENABLED: el worker de IA va hospedado en el de proveedores y queda APAGADO"; fi
           if [ "$WORKERS" = "true" ] && [ -z "$CANARY" ]; then echo "::warning::PROD_V2_WORKERS_ENABLED=true sin PROD_V2_CANARY_OWNER: los workers de gasto quedan APAGADOS"; fi
           {
-            echo "canary=$CANARY"; echo "workers=$WORKERS"; echo "ga=$GA"; echo "block_v1=$BLOCK_V1"; echo "fe_ref=$FE_REF"; echo "skip_storage=$SKIP_STORAGE"
+            echo "canary=$CANARY"; echo "workers=$WORKERS"; echo "llm=$LLM"; echo "ga=$GA"; echo "block_v1=$BLOCK_V1"; echo "fe_ref=$FE_REF"; echo "skip_storage=$SKIP_STORAGE"
             echo "pool_max=$POOL_MAX"; echo "pool_max_worker=$POOL_MAX_WORKER"; echo "pool_idle_worker=$POOL_IDLE_WORKER"
           } >> "$GITHUB_OUTPUT"
           echo "V2 canario: ${CANARY:-(ninguno → V2 apagado)} · workers de gasto: $WORKERS · GA: $GA · bloquear por jobs V1: $BLOCK_V1 · FE gate ref: $FE_REF"
@@ -370,6 +376,7 @@ jobs:
           DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
           CANARY: ${{ steps.cfg.outputs.canary }}
           WORKERS: ${{ steps.cfg.outputs.workers }}
+          LLM: ${{ steps.cfg.outputs.llm }}
           GA: ${{ steps.cfg.outputs.ga }}
           POOL_MAX: ${{ steps.cfg.outputs.pool_max }}
           POOL_MAX_WORKER: ${{ steps.cfg.outputs.pool_max_worker }}
@@ -379,7 +386,7 @@ jobs:
         run: |
           # Línea 1 = secreto (nunca en argv ni en el log); luego KEY=VALUE no secretos (re-validados en el VPS).
           printf '%s\n' "$FINOPS_INGEST_TOKEN_PRODUCTION" \
-            "PROD_V2_CANARY_OWNER=$CANARY" "PROD_V2_WORKERS_ENABLED=$WORKERS" "PROD_V2_GENERAL_AVAILABILITY=$GA" \
+            "PROD_V2_CANARY_OWNER=$CANARY" "PROD_V2_WORKERS_ENABLED=$WORKERS" "PROD_V2_LLM_WORKER_ENABLED=$LLM" "PROD_V2_GENERAL_AVAILABILITY=$GA" \
             "PROD_DB_POOL_MAX=$POOL_MAX" "PROD_DB_POOL_MAX_WORKER=$POOL_MAX_WORKER" "PROD_DB_POOL_IDLE_MS_WORKER=$POOL_IDLE_WORKER" \
             "PROD_SKIP_STORAGE_POLICY_PROBE=$SKIP_STORAGE" "DEPLOY_SHA=$DEPLOY_SHA" \
           | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
@@ -388,6 +395,7 @@ jobs:
       # Liveness HTTP. La disponibilidad real (base + 11 procesos online y estables) ya la verificó el paso
       # anterior en el VPS; un /health/ready HTTP queda como gap de la app (runbook §6).
       - name: Health check post-deploy
+        id: health
         env:
           HEALTH_URL: ${{ secrets.HEALTH_URL }}
         run: |
@@ -419,13 +427,19 @@ jobs:
       # restaura automáticamente la última release sana (.release-prev, sin migrar). Desactivable con
       # PROD_AUTO_ROLLBACK=false (queda el estado «failed <sha>» y el rollback manual por dispatch).
       - name: Auto-rollback tras un fallo posterior al rsync
-        if: failure() && steps.sync.outcome == 'success' && vars.PROD_AUTO_ROLLBACK != 'false'
+        # m3: también un rsync que falló a mitad (árbol mezclado); m4: no si el health pasó y solo falló el mark-ok.
+        if: failure() && steps.sync.outcome != 'skipped' && steps.health.outcome != 'success' && vars.PROD_AUTO_ROLLBACK != 'false'
         env:
           DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
           DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
           DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
           HEALTH_URL: ${{ secrets.HEALTH_URL }}
         run: |
+          # m6: queda registrado qué estaba en vuelo (informativo). El rollback NO lo corta: recarga los workers
+          # dinámicos con el MISMO drenado que el deploy (SIGINT, kill_timeout de la release; ninguna llamada pagada
+          # enviada se corta) y los V1 como siempre.
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cd '$DEPLOY_VPS_PATH' && node - --legacy --force" < scripts/ops/check-active-runs.js
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
             "bash -s -- rollback '$DEPLOY_VPS_PATH'" < scripts/ops/prod-release.sh
           sleep 20

@@ -114,6 +114,11 @@ async function workflowChecks() {
     }
     assert(/sin PROD_V2_CANARY_OWNER/.test(bashStep(s.run, { FE_REF: 'staging', WORKERS: 'true' }).stdout), 'aviso: workers sin canario quedan apagados');
     eq(bashStep(s.run, { FE_REF: 'staging', SKIP_STORAGE: 'TRUE' }).outputs.skip_storage, 'true', 'skip storage');
+    // r62 d9: variable propia del worker de IA, default false; sin workers de gasto avisa que queda apagado.
+    eq(bashStep(s.run, { FE_REF: 'staging' }).outputs.llm, 'false', 'IA apagada por defecto');
+    r = bashStep(s.run, { FE_REF: 'staging', LLM: 'true' });
+    assert(r.outputs.llm === 'true' && /hospedado en el de proveedores y queda APAGADO/.test(r.stdout), r.stdout);
+    eq(bashStep(s.run, { FE_REF: 'staging', LLM: 'si' }).status, 1, 'LLM inválido');
   });
 
   await check('[WF] paridad con deploy-staging.yml: todo check de staging corre en producción salvo los que necesitan Moodle (con motivo); + los de producción', () => {
@@ -248,7 +253,10 @@ async function workflowChecks() {
     const iSync = idx((x) => x.id === 'sync', 'rsync con id sync');
     const iAr = idx((x) => /Auto-rollback/.test(x.name || ''), 'auto-rollback');
     const ar = steps[iAr];
-    eq(ar.if, "failure() && steps.sync.outcome == 'success' && vars.PROD_AUTO_ROLLBACK != 'false'", 'condición');
+    eq(ar.if, "failure() && steps.sync.outcome != 'skipped' && steps.health.outcome != 'success' && vars.PROD_AUTO_ROLLBACK != 'false'", 'condición (m3: rsync a mitad; m4: no tras un health OK)');
+    eq(steps[idx((x) => x.id === 'health', 'health')].name, 'Health check post-deploy', 'id health');
+    const iAct = ar.run.indexOf('< scripts/ops/check-active-runs.js');
+    assert(iAct > 0 && iAct < ar.run.indexOf('bash -s -- rollback') && /node - --legacy --force/.test(ar.run), 'm6: registra los runs activos (informativo) antes de restaurar');
     assert(iAr > iSync && iAr > idx((x) => /mark-ok/.test(runOf(x)), 'mark-ok'), 'después del rsync y del mark-ok');
     assert(/bash -s -- rollback '\$DEPLOY_VPS_PATH'" < scripts\/ops\/prod-release\.sh/.test(ar.run) && /mark-ok '\$DEPLOY_VPS_PATH' restored/.test(ar.run) && /HEALTH_URL/.test(ar.run), ar.run);
     const notify = steps.find((x) => x.name === 'Notify on failure');
@@ -364,7 +372,7 @@ function runSh(vps, args, { input = '', env = {}, stdinScript = false } = {}) {
   return { status: r.status, out: (r.stdout || '') + (r.stderr || ''), calls: fs.readFileSync(vps.log, 'utf8').trim().split('\n').filter(Boolean) };
 }
 const cfgInput = (o = {}) => [o.token === undefined ? SECRET : o.token,
-  `PROD_V2_CANARY_OWNER=${o.canary || ''}`, `PROD_V2_WORKERS_ENABLED=${o.workers || 'false'}`, `PROD_V2_GENERAL_AVAILABILITY=${o.ga || 'false'}`,
+  `PROD_V2_CANARY_OWNER=${o.canary || ''}`, `PROD_V2_WORKERS_ENABLED=${o.workers || 'false'}`, `PROD_V2_LLM_WORKER_ENABLED=${o.llm || 'false'}`, `PROD_V2_GENERAL_AVAILABILITY=${o.ga || 'false'}`,
   `PROD_DB_POOL_MAX=${o.poolMax || ''}`, 'PROD_DB_POOL_MAX_WORKER=', 'PROD_DB_POOL_IDLE_MS_WORKER=',
   `PROD_SKIP_STORAGE_POLICY_PROBE=${o.skipStorage || 'false'}`, `DEPLOY_SHA=${o.sha || 'abcdef1'}`, ...(o.extra || [])].join('\n') + '\n';
 const envOf = (app) => fs.readFileSync(path.join(app, '.env'), 'utf8');
@@ -429,6 +437,11 @@ async function shellChecks() {
       let r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true', poolMax: '2' }) });
       eq(r.status, 0, r.out);
       let env = envMap(vps.app);
+      // r62 d9: el worker de IA tiene variable propia, apagada por defecto aun con los workers de gasto encendidos.
+      eq([env.DYNAMIC_PROVIDER_WORKER_ENABLED, env.DYNAMIC_LLM_WORKER_ENABLED, env.DYNAMIC_WORKER_DRAIN_TIMEOUT_MS], ['true', 'false', '270000'], 'IA apagada por defecto');
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true', llm: 'true', poolMax: '2' }) });
+      eq(r.status, 0, r.out);
+      env = envMap(vps.app);
       eq([env.DYNAMIC_COURSE_STRUCTURE, env.DYNAMIC_V2_ALLOWED_OWNERS, env.DYNAMIC_MANIFEST_RULES_VERSION, env.DYNAMIC_ACTIVITY_TYPE_RULES, env.DYNAMIC_VIDEO_DELIVERY,
         env.DYNAMIC_PROVIDER_WORKER_ENABLED, env.DYNAMIC_LLM_WORKER_ENABLED, env.DYNAMIC_LLM_WORKER_CONCURRENCY, env.DB_POOL_MAX],
       ['true', OWNER, '3', '2', 'youtube', 'true', 'true', '4', '2'], 'canario');
@@ -445,6 +458,54 @@ async function shellChecks() {
       r = runSh(vps, ['install'], { input: cfgInput() });
       env = envMap(vps.app);
       eq([r.status, env.DYNAMIC_PROVIDER_WORKER_ENABLED, env.DYNAMIC_COURSE_STRUCTURE, env.DYNAMIC_V2_ALLOWED_OWNERS], [0, 'false', 'true', OWNER], 'sin canario');
+    });
+
+    await check('[SH] r62 d9/d11: worker de IA hospedado — solo con canario + workers de gasto + PROD_V2_LLM_WORKER_ENABLED; el drenado sube a llamada + 90 s (kill_timeout) y −30 s (tope interno), recrea UNA vez los 3 workers con el kill_timeout nuevo y vuelve a 300/270 s al apagarlo', () => {
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n');
+      // Sin el worker de proveedores, la IA hospedada no puede arrancar: queda apagada con aviso.
+      let r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, llm: 'true' }) });
+      assert(r.status === 0 && /queda APAGADO/.test(r.out) && envMap(vps.app).DYNAMIC_LLM_WORKER_ENABLED === 'false', r.out);
+      r = runSh(vps, ['install'], { input: cfgInput({ llm: 'true', workers: 'true' }) });
+      eq(envMap(vps.app).DYNAMIC_LLM_WORKER_ENABLED, 'false', 'sin canario tampoco');
+      // Encendido: llamada default 15 min → kill_timeout 990000, tope interno 960000; jlist con 300000 → recrear.
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true', llm: 'true' }) });
+      eq(r.status, 0, r.out);
+      let env = envMap(vps.app);
+      eq([env.DYNAMIC_LLM_WORKER_ENABLED, env.DYNAMIC_WORKER_DRAIN_TIMEOUT_MS, env.DYNAMIC_LLM_WORKER_CONCURRENCY], ['true', '960000', '4'], 'IA encendida');
+      assert(/^\d{4}-\d\d-\d\dT/.test(env.DYNAMIC_LLM_WORKER_SINCE), 'instante de activación');
+      for (const n of PROD_NAMES.slice(8)) {
+        const script = `dist/workers/${n.replace(/^cursia-/, '')}.js`;
+        assert(r.calls.includes(`pm2 delete ${n}`) && r.calls.includes(`pm2 start ${script} --name ${n} --kill-timeout 990000`), `${n}: ${r.calls.join(' | ')}`);
+      }
+      // Llamada configurada a mano (20 min) → kill_timeout 1290000.
+      fs.appendFileSync(path.join(vps.app, '.env'), 'DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS=1200000\n');
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true', llm: 'true' }) });
+      eq([r.status, envMap(vps.app).DYNAMIC_WORKER_DRAIN_TIMEOUT_MS], [0, '1260000'], 'llamada larga');
+      assert(r.calls.includes('pm2 start dist/workers/dynamic-provider-worker.js --name cursia-dynamic-provider-worker --kill-timeout 1290000'), r.calls.join(' | '));
+      // El tope interno queda SIEMPRE por debajo del kill_timeout; apagado → 300/270.
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true' }) });
+      eq([envMap(vps.app).DYNAMIC_LLM_WORKER_ENABLED, envMap(vps.app).DYNAMIC_WORKER_DRAIN_TIMEOUT_MS], ['false', '270000'], 'apagado');
+      // Con el jlist en 300000 (fake) no se recrea nada: reload con drenado (SIGINT + kill_timeout).
+      for (const n of PROD_NAMES.slice(8)) assert(r.calls.includes(`pm2 reload ${n} --update-env`) && !r.calls.includes(`pm2 delete ${n}`), `${n} reload`);
+      // Rollback con la IA encendida en el .env: también drena con el kill_timeout largo.
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\nDYNAMIC_LLM_WORKER_ENABLED=true\n');
+      const sh = fs.readFileSync(SH, 'utf8');
+      assert(/compute_drain_timeouts\n  detect_preexisting_loops\n  reload_all_processes rollback/.test(sh), 'rollback calcula el drenado antes de recargar');
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n');
+    });
+
+    await check('[SH] r62 m2: el preflight (por stdin, ANTES del rsync) mide los workers V1 en bucle y deja .release-preloop; install lo usa sin volver a medir y lo borra', () => {
+      fs.rmSync(path.join(vps.app, '.release-preloop'), { force: true });
+      let r = runSh(vps, ['preflight', vps.app], { stdinScript: true, env: { BUMP_ON_SLEEP: '1', BUMP_NAME: 'cursia-h5p-worker' } });
+      eq(r.status, 0, r.out);
+      assert(/cursia-h5p-worker ya se reiniciaba en bucle ANTES del deploy/.test(r.out), r.out);
+      eq(fs.readFileSync(path.join(vps.app, '.release-preloop'), 'utf8').trim(), 'cursia-h5p-worker', 'archivo');
+      r = runSh(vps, ['install'], { input: cfgInput(), env: { BUMP_ON_SLEEP: '1', BUMP_NAME: 'cursia-h5p-worker' } });
+      eq(r.status, 0, r.out);
+      assert(/medido en el preflight/.test(r.out) && /inestables ya antes del deploy \(aviso, no bloquea\): cursia-h5p-worker/.test(r.out), r.out);
+      assert(!fs.existsSync(path.join(vps.app, '.release-preloop')), 'consumido');
+      const sleeps = Number(fs.readFileSync(`${vps.jlist}.sleeps`, 'utf8'));
+      eq(sleeps, 1, 'install no volvió a medir (solo la ventana de estabilidad)');
     });
 
     await check('[SH] compuerta «V2 abierto a TODOS»: DYNAMIC_COURSE_STRUCTURE=true con allowlist vacía → falla ANTES de npm/PM2; PROD_V2_GENERAL_AVAILABILITY=true la permite', () => {

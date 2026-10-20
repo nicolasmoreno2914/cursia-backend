@@ -60,6 +60,21 @@ PROD_ALL_NAMES=(cursia-backend cursia-content-worker cursia-video-worker cursia-
   cursia-dynamic-package-worker cursia-dynamic-provider-worker)
 # R16 (#1): kill_timeout de los workers dinámicos (drenado interno 270 s < 300 s).
 DRAIN_KILL_TIMEOUT_MS=300000
+DRAIN_TIMEOUT_MS=270000
+# r62 d9/d11: con el worker de IA hospedado encendido, una llamada larga de Anthropic puede durar hasta
+# DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS (default 15 min) y el drenado NUNCA corta una llamada pagada ya enviada:
+# el kill_timeout de PM2 sube a llamada + 90 s y el tope interno de drenado a kill_timeout − 30 s (siempre
+# por debajo). Sin el worker de IA: 300 s / 270 s (los cuelgues del TTS terminan a los 125–172 s).
+compute_drain_timeouts() {
+  local call
+  DRAIN_KILL_TIMEOUT_MS=300000
+  if [ "$(env_val DYNAMIC_LLM_WORKER_ENABLED)" = "true" ]; then
+    call=$(env_val DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS)
+    [[ "$call" =~ ^[0-9]{4,8}$ ]] || call=900000
+    if [ $((call + 90000)) -gt "$DRAIN_KILL_TIMEOUT_MS" ]; then DRAIN_KILL_TIMEOUT_MS=$((call + 90000)); fi
+  fi
+  DRAIN_TIMEOUT_MS=$((DRAIN_KILL_TIMEOUT_MS - 30000))
+}
 TTS_SNAPSHOT=gpt-4o-mini-tts-2025-03-20
 STABILITY_WINDOW_S="${PROD_STABILITY_WINDOW_S:-45}"
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
@@ -265,8 +280,25 @@ legacy_disabled_reason() {
 }
 # r61 fix I1: workers V1 que YA se reiniciaban en bucle ANTES de este deploy (ventana corta, sin tocar nada) →
 # su estabilidad es solo informativa: un problema preexistente no debe tumbar el deploy después del rsync.
+PRELOOP_FILE=.release-preloop
 detect_preexisting_loops() {
-  local names=() entry n a inc
+  local names=() entry n a inc age
+  # r62 (re-review m2): la medición se hace en el PREFLIGHT, antes del rsync y sin tocar nada; install usa ese
+  # resultado (si tiene menos de 1 h) y solo mide acá como respaldo.
+  if [ "${1:-}" = "use-preflight" ] && [ -f "$PRELOOP_FILE" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$PRELOOP_FILE" 2>/dev/null || stat -f %m "$PRELOOP_FILE") ))
+    if [ "$age" -lt 3600 ]; then
+      for n in $(cat "$PRELOOP_FILE"); do
+        _in_list "$n" "${PROD_ALL_NAMES[@]}" || continue
+        ADVISORY_NAMES+=("$n")
+        echo "⚠️  ${n} ya se reiniciaba en bucle ANTES del deploy (medido en el preflight): su estabilidad queda como aviso."
+      done
+      rm -f "$PRELOOP_FILE"
+      echo "  (medición del preflight, hace ${age} s)"
+      return 0
+    fi
+    rm -f "$PRELOOP_FILE"
+  fi
   for entry in "${PROD_PROCESSES_LEGACY[@]}"; do
     n="${entry%% *}"
     [ -n "$(legacy_disabled_reason "$n")" ] || names+=("$n")
@@ -279,6 +311,9 @@ detect_preexisting_loops() {
     ADVISORY_NAMES+=("$n")
     echo "⚠️  ${n} ya se reiniciaba en bucle ANTES del deploy: su estabilidad queda como aviso (no bloquea). Revisar su .env/logs."
   done
+  if [ "${1:-}" = "save" ]; then
+    { printf "%s\n" "$inc" > "$PRELOOP_FILE"; } 2>/dev/null || echo "⚠️  no se pudo guardar ${PRELOOP_FILE}: install mide como respaldo"
+  fi
   return 0
 }
 reload_all_processes() {
@@ -342,6 +377,8 @@ cmd_preflight() {
   assert_env_production
   assert_v2_not_open_to_all "$canary" "$ga"
   echo "  release actual: $(cat .release-sha 2>/dev/null || echo '(anterior a r61, sin .release-sha)')  estado: $(cat .release-state 2>/dev/null || echo '(sin estado)')"
+  echo "━━━ Workers V1 que ya se reinician en bucle (ventana de ${PRELOOP_WINDOW_S} s, ANTES del rsync) ━━━"
+  if $PM2 jlist > /dev/null 2>&1; then detect_preexisting_loops save; else echo "⚠️  pm2 jlist no disponible: install mide como respaldo"; fi
   echo "  snapshot de rollback: $( [ -f .release-prev/dist/main.js ] && echo "presente ($(cat .release-prev/.release-sha 2>/dev/null || echo '?'))" || echo 'ninguno todavía')"
 }
 
@@ -375,12 +412,12 @@ cmd_snapshot() {
   echo "deploying ${sha}" > .release-state
 }
 
-CFG_KEYS="PROD_V2_CANARY_OWNER PROD_V2_WORKERS_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER PROD_SKIP_STORAGE_POLICY_PROBE DEPLOY_SHA"
+CFG_KEYS="PROD_V2_CANARY_OWNER PROD_V2_WORKERS_ENABLED PROD_V2_LLM_WORKER_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER PROD_SKIP_STORAGE_POLICY_PROBE DEPLOY_SHA"
 cmd_install() {
   local fit="" line key val
   local CFG_PROD_V2_CANARY_OWNER="" CFG_PROD_V2_WORKERS_ENABLED=false CFG_PROD_V2_GENERAL_AVAILABILITY=false
   local CFG_PROD_DB_POOL_MAX="" CFG_PROD_DB_POOL_MAX_WORKER="" CFG_PROD_DB_POOL_IDLE_MS_WORKER="" CFG_DEPLOY_SHA=""
-  local CFG_PROD_SKIP_STORAGE_POLICY_PROBE=false
+  local CFG_PROD_SKIP_STORAGE_POLICY_PROBE=false CFG_PROD_V2_LLM_WORKER_ENABLED=false
   IFS= read -r fit || true
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -389,7 +426,7 @@ cmd_install() {
     printf -v "CFG_${key}" "%s" "$val"
   done
   [ -n "$CFG_PROD_V2_CANARY_OWNER" ] && ! [[ "$CFG_PROD_V2_CANARY_OWNER" =~ $UUID_RE ]] && die "PROD_V2_CANARY_OWNER no es un UUID"
-  for key in PROD_V2_WORKERS_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_SKIP_STORAGE_POLICY_PROBE; do
+  for key in PROD_V2_WORKERS_ENABLED PROD_V2_LLM_WORKER_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_SKIP_STORAGE_POLICY_PROBE; do
     val="CFG_${key}"; case "${!val}" in true|false) ;; *) die "${key} debe ser true|false" ;; esac
   done
   for key in PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER; do
@@ -427,11 +464,23 @@ cmd_install() {
   fi
   # Los workers de gasto (proveedores reales + IA hospedada) se fijan SIEMPRE: encendidos solo con canario + opt-in.
   ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED "$workers"
-  ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED "$workers"
-  if [ "$workers" = "true" ]; then
-    ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(now_utc)"
-    ensure_env_default_if_absent DYNAMIC_LLM_WORKER_CONCURRENCY 4
+  # r62 d9: worker de IA HOSPEDADO en cursia-dynamic-provider-worker (como staging, sin un 12.º proceso ni otra
+  # conexión al pooler): las partes LLM ya no dependen de una pestaña abierta. Variable propia, apagada por
+  # defecto; requiere el worker de proveedores encendido (el anfitrión queda inactivo sin él).
+  local llm=false
+  if [ "$CFG_PROD_V2_LLM_WORKER_ENABLED" = "true" ]; then
+    if [ "$workers" = "true" ]; then llm=true
+    else echo "⚠️  PROD_V2_LLM_WORKER_ENABLED=true sin el worker de proveedores encendido (canario + PROD_V2_WORKERS_ENABLED, sin DYNAMIC_WORKERS_HOLD): el worker de IA hospedado queda APAGADO"; fi
   fi
+  ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED "$llm"
+  if [ "$llm" = "true" ]; then
+    # Instante de activación: solo los runs creados desde acá van al worker (ninguno anterior cambia).
+    ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(now_utc)"
+    ensure_env_exact DYNAMIC_LLM_WORKER_CONCURRENCY 4
+  fi
+  compute_drain_timeouts
+  ensure_env_exact DYNAMIC_WORKER_DRAIN_TIMEOUT_MS "$DRAIN_TIMEOUT_MS"
+  echo "  drenado de los workers dinámicos: kill_timeout ${DRAIN_KILL_TIMEOUT_MS} ms, tope interno ${DRAIN_TIMEOUT_MS} ms"
   if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env — no se toca"; else echo "✓ DYNAMIC_COHERENCE_LLM ausente (OFF)"; fi
   assert_v2_not_open_to_all "" "$CFG_PROD_V2_GENERAL_AVAILABILITY"
 
@@ -454,7 +503,7 @@ cmd_install() {
   command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
 
   echo "━━━ [0d] Procesos V1 que ya se reiniciaban en bucle ANTES del deploy (ventana de ${PRELOOP_WINDOW_S} s, solo lectura) ━━━"
-  detect_preexisting_loops
+  detect_preexisting_loops use-preflight
 
   echo "━━━ [1/4] Instalar dependencias de producción ━━━"
   npm install --omit=dev
@@ -514,6 +563,7 @@ cmd_rollback() {
     npm install --omit=dev
   fi
   echo "━━━ SIN migraciones: el esquema V2 es aditivo (el CHECK de main fallaría con filas dynamic, N1) ━━━"
+  compute_drain_timeouts
   detect_preexisting_loops
   reload_all_processes rollback
   verify_processes
