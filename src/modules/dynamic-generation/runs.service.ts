@@ -122,6 +122,8 @@ import { MONTH_CAP_LOCK } from '../finops/finops-budget.service';
 import type { EstimateResult, MinExpMax } from '../finops/estimator';
 import { assertAssessmentProfileResolvableForRun } from '../course-profiles/assessment-preflight';
 import { randomUUID } from 'crypto';
+import { PACKAGE_SIZE_PROJECTED_OVER_LIMIT, PackageSizeProjection, projectPackageSize } from '../../package/v3/package-size-projection';
+import { PACKAGE_SIZE_CONFIG_INVALID, packageSizeLimitsFromEnv } from '../../package/v3/package-size-budget';
 import {
   VIDEO_MODE_INCONSISTENT,
   VIDEO_UPGRADE_CASCADE_REASON,
@@ -697,6 +699,11 @@ export interface StartPreview {
   } | null;
   policy: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; courseSpent: string; monthSpent: string } | null;
   estimateHash: string | null;
+  /**
+   * r61 (Q-24): tamaño proyectado del `.mbz` contra el límite de subida del almacenamiento (solo v3, run nuevo).
+   * `verdict: 'over'` nunca llega acá: la vista previa responde 409 PACKAGE_SIZE_PROJECTED_OVER_LIMIT.
+   */
+  packageSize?: PackageSizeProjection | null;
   /** Internos (no viajan al cliente: ver publicPreview). */
   _plan?: NormalApprovalPlan;
   _evaluation?: StartBudgetEvaluation;
@@ -927,6 +934,9 @@ export class RunsService {
     // los chequeos bajo advisory lock en insertRun/reopenRun/retryItem.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
+    // r61 (Q-24): un run NUEVO (o reabierto: vuelve a gastar) cuyo paquete no cabría en el límite de subida del
+    // almacenamiento se rechaza ANTES de gastar. Retomar el run activo de este Manifest nunca se bloquea.
+    if (!(await this.findActiveRunRow(manifest.id))) this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));
     // LOOP 8.1: alineado con el estudiante del Blueprint, DESPUÉS de los gates previos (mismos errores y mismo orden).
     const context = await this.contextAlignedWithFacts(courseId, manifest, rawContext);
     const contextHash = canonicalContextHash(context);
@@ -1056,6 +1066,8 @@ export class RunsService {
     // Mismos 409/403 que startRun daría para un run nuevo, ANTES de ofrecer autorizar.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
+    // r61 (Q-24): el mismo 409 de tamaño que daría startRun, ANTES de ofrecer autorizar (sin run: siempre aplica).
+    const packageSize = this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));
     // LOOP 8.1: el mismo contexto (y hash) que congelaría startRun.
     const context = await this.contextAlignedWithFacts(courseId, manifest, rawContext);
     const contextHash = canonicalContextHash(context);
@@ -1070,7 +1082,7 @@ export class RunsService {
           message: `${FINOPS_UNAVAILABLE}: no se puede evaluar el presupuesto de un run con proveedores pagados reales (${paid.join(', ')}); no se creó nada.`,
         });
       }
-      return { ...base, ...empty, existingRun: null };
+      return { ...base, ...empty, existingRun: null, packageSize };
     }
     let evaluation: StartBudgetEvaluation;
     let np: NormalPlanContext;
@@ -1120,6 +1132,7 @@ export class RunsService {
       },
       policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total },
       estimateHash,
+      packageSize,
       _plan: plan,
       _evaluation: evaluation,
     } as StartPreview;
@@ -5158,6 +5171,31 @@ export class RunsService {
     if (!this.designGate) return null;
     if (await this.findActiveRunRow(manifestId)) return null;
     return this.designGate.assertVerified(courseId, ownerId, blueprintNumber);
+  }
+
+  /**
+   * r61 (Q-24): proyección del `.mbz` v3 contra el límite de subida configurado (STORAGE_MAX_UPLOAD_BYTES, default
+   * 50 MB; o PACKAGE_MBZ_MAX_BYTES) — el MISMO límite que aplica el worker de empaque antes de subir. Esperado sobre el
+   * límite → 409 PACKAGE_SIZE_PROJECTED_OVER_LIMIT con la acción; config inválida → 409 PACKAGE_SIZE_CONFIG_INVALID.
+   * v1/v2 (otro builder) → null, sin cambios.
+   */
+  private assertPackageSizeFits(
+    manifest: { rulesVersion: number; manifest: { items: ReadonlyArray<{ type: string; chapterId?: string | null }> } },
+    modes: { presentation: 'mock' | 'real'; audio: 'mock' | 'real' },
+  ): PackageSizeProjection | null {
+    if (manifest.rulesVersion !== 3) return null;
+    let limits;
+    try {
+      limits = packageSizeLimitsFromEnv();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new ConflictException({ code: PACKAGE_SIZE_CONFIG_INVALID, message: `${message} — corrige la variable del backend; no se generó nada.` });
+    }
+    const projection = projectPackageSize(manifest.manifest.items, modes, limits);
+    if (projection.verdict === 'over') {
+      throw new ConflictException({ code: PACKAGE_SIZE_PROJECTED_OVER_LIMIT, message: projection.error, packageSize: projection });
+    }
+    return projection;
   }
 
   private async findActiveRunRow(manifestId: number): Promise<any | null> {
