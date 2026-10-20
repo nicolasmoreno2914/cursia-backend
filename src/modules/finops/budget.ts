@@ -22,6 +22,7 @@
 import { FinopsError } from './errors';
 import { addDec, cmpDec, subDec, normalizeDecimal, DecimalLike } from './decimal';
 import type { MinExpMax } from './estimator';
+import { pointsToProduction } from '../dynamic-generation/dynamic-video-delivery';
 
 export type BudgetDecision = 'AUTO_WITHIN_POLICY' | 'ADMIN_APPROVAL' | 'BLOCK';
 
@@ -107,13 +108,21 @@ function checkLimit(
   return onExceed;
 }
 
-/** r62: topes totales de una política (null = sin tope). El mensual es `monthlyCap` o, si falta, `monthlyCapStaging`. */
-export const SINGLE_AUTHORIZATION_REQUIRED_CAPS = ['maxCostPerRun', 'maxCostPerCourse', 'monthlyCap'] as const;
+/**
+ * r62: topes que exige la autorización única (null = sin tope): por run, por curso, mensual de la plataforma y mensual
+ * POR CLIENTE (`ownerMonthlyCap`; decisión 2026-10-20: sin él una cuenta podría agotar el mes de las demás → admin).
+ * El mensual es `monthlyCap`; `monthlyCapStaging` solo cuenta como tal en STAGING (el proceso no apunta al proyecto de
+ * producción: `pointsToProduction`, el mismo detector que el escape de Videogen y el guard de URLs de proveedores).
+ * Fuera de staging sigue limitando (planNormalApproval lo aplica igual: fail-safe), pero no habilita la firma única.
+ */
+export const SINGLE_AUTHORIZATION_REQUIRED_CAPS = ['maxCostPerRun', 'maxCostPerCourse', 'monthlyCap', 'ownerMonthlyCap'] as const;
 
-export function policySpendCaps(policy: BudgetPolicy | null | undefined): { present: string[]; missing: string[] } {
+export function policySpendCaps(policy: BudgetPolicy | null | undefined, opts: { production?: boolean } = {}): { present: string[]; missing: string[] } {
   const l = ((policy && policy.limits) || {}) as Record<string, unknown>;
   const has = (v: unknown) => v !== null && v !== undefined && v !== '';
-  const caps: Record<string, unknown> = { maxCostPerRun: l.maxCostPerRun, maxCostPerCourse: l.maxCostPerCourse, monthlyCap: has(l.monthlyCap) ? l.monthlyCap : l.monthlyCapStaging };
+  const production = opts.production ?? pointsToProduction(process.env);
+  const monthly = has(l.monthlyCap) ? l.monthlyCap : production ? null : l.monthlyCapStaging;
+  const caps: Record<string, unknown> = { maxCostPerRun: l.maxCostPerRun, maxCostPerCourse: l.maxCostPerCourse, monthlyCap: monthly, ownerMonthlyCap: l.ownerMonthlyCap };
   const present: string[] = [];
   const missing: string[] = [];
   for (const k of SINGLE_AUTHORIZATION_REQUIRED_CAPS) (has(caps[k]) ? present : missing).push(k);
@@ -125,7 +134,7 @@ export function policySpendCaps(policy: BudgetPolicy | null | undefined): { pres
  * DEFAULT true desde V2.1 y nunca distinguió «lo pidió alguien» de «default» (todas las filas existentes la tienen en
  * true), así que deja de forzar admin por sí sola. El pedido EXPLÍCITO de admin por política es
  * `limits.requireHumanApprovalForRealSpend: true` (lo escribe el endpoint de admin de políticas junto con la columna).
- * Default para las políticas existentes: con tope por run, por curso y mensual → autorización única del usuario; sin
+ * Default para las políticas existentes: con tope por run, por curso, mensual y mensual por cliente (ownerMonthlyCap) → autorización única del usuario; sin
  * alguno de esos topes → admin (ver decideRunBudget).
  */
 export function policyFromRow(r: { id: string; version: number | string; limits: Record<string, unknown> | null; require_human_approval_for_real_spend?: boolean | null; on_exceed: string | null }): BudgetPolicy & { id: string; legacyRequireHumanColumn: boolean | null } {

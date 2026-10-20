@@ -79,7 +79,7 @@ const dec = (x) => Number(x);
 // Parte pura
 // ════════════════════════════════════════════════════════════════════════════
 const est = (min, expected, max, byProvider = {}) => ({ totals: { min, expected, max, byProvider, byItemType: {} } });
-const CAPS = { maxCostPerRun: '20', maxCostPerCourse: '50', monthlyCap: '200' };
+const CAPS = { maxCostPerRun: '20', maxCostPerCourse: '50', monthlyCap: '200', ownerMonthlyCap: '100' };
 /** Política como la lee policyFor: la columna legacy es true en TODAS las filas existentes (NOT NULL DEFAULT true). */
 const rowPolicy = (limits, onExceed = 'ADMIN_APPROVAL', column = true) => F.policyFromRow({ id: 'p1', version: 3, limits, require_human_approval_for_real_spend: column, on_exceed: onExceed });
 
@@ -94,8 +94,8 @@ async function pureChecks() {
     assert(r.reasons.includes('within_policy') && r.reasons.includes('paid_real_provider_user_authorization:gamma,openai'), JSON.stringify(r.reasons));
     assert(!r.reasons.some((x) => /requires_admin/.test(x)), 'sin razón de admin');
     // monthlyCapStaging (clave histórica de staging) cuenta como tope mensual.
-    const rs = F.decideRunBudget({ estimate: E, policy: rowPolicy({ maxCostPerRun: '20', maxCostPerCourse: '50', monthlyCapStaging: '200' }), paidRealProviders: ['gamma'] });
-    eq(rs.decision, 'AUTO_WITHIN_POLICY', 'monthlyCapStaging');
+    const rs = F.decideRunBudget({ estimate: E, policy: rowPolicy({ maxCostPerRun: '20', maxCostPerCourse: '50', monthlyCapStaging: '200', ownerMonthlyCap: '100' }), paidRealProviders: ['gamma'] });
+    eq(rs.decision, 'AUTO_WITHIN_POLICY', 'monthlyCapStaging (en staging)');
   });
 
   await check('puro: excede la política → ADMIN (on_exceed ADMIN_APPROVAL o banda esperado ≤ L < máx) o BLOCK (on_exceed BLOCK); nunca firma de usuario', () => {
@@ -112,7 +112,7 @@ async function pureChecks() {
     const none = F.decideRunBudget({ estimate: E, policy: null, paidRealProviders: ['videogen'] });
     eq([none.decision, !!none.userAuthorizationRequired], ['ADMIN_APPROVAL', false], 'sin política');
     assert(none.reasons.includes('no_budget_policy'), 'razón');
-    for (const drop of ['maxCostPerRun', 'maxCostPerCourse', 'monthlyCap']) {
+    for (const drop of ['maxCostPerRun', 'maxCostPerCourse', 'monthlyCap', 'ownerMonthlyCap']) {
       const l = { ...CAPS }; delete l[drop];
       const r = F.decideRunBudget({ estimate: E, policy: rowPolicy(l), paidRealProviders: ['gamma'] });
       eq(r.decision, 'ADMIN_APPROVAL', `sin ${drop}`);
@@ -147,6 +147,28 @@ async function pureChecks() {
     eq([F.BREAKER_RATIO, F.BREAKER_MIN_SLACK_USD], [1.5, 3], 'constantes del disyuntor intactas');
   });
 
+  await check('puro (decisión 2026-10-20): la firma única exige ownerMonthlyCap (con él → AUTO, sin él → ADMIN); monthlyCapStaging solo cuenta como mensual en staging (pointsToProduction); fuera de staging sigue limitando', () => {
+    eq(F.decideRunBudget({ estimate: E, policy: rowPolicy(CAPS), paidRealProviders: ['gamma'] }).decision, 'AUTO_WITHIN_POLICY', 'con ownerMonthlyCap');
+    const { ownerMonthlyCap, ...noOwner } = CAPS;
+    const r = F.decideRunBudget({ estimate: E, policy: rowPolicy(noOwner), paidRealProviders: ['gamma'] });
+    eq(r.decision, 'ADMIN_APPROVAL', 'sin ownerMonthlyCap');
+    assert(r.reasons.includes('policy_missing_caps_for_single_authorization:ownerMonthlyCap'), JSON.stringify(r.reasons));
+    const stg = { maxCostPerRun: '20', maxCostPerCourse: '50', monthlyCapStaging: '200', ownerMonthlyCap: '100' };
+    eq(F.policySpendCaps(rowPolicy(stg), { production: false }).missing, [], 'staging: monthlyCapStaging es el mensual');
+    eq(F.policySpendCaps(rowPolicy(stg), { production: true }).missing, ['monthlyCap'], 'producción: monthlyCapStaging no cuenta');
+    const saved = process.env.DB_HOST;
+    process.env.DB_HOST = 'db.hriwbakbuypaiovvvkqh.supabase.co'; // detector de entorno (pointsToProduction); sin red
+    try {
+      const rp = F.decideRunBudget({ estimate: E, policy: rowPolicy(stg), paidRealProviders: ['gamma'] });
+      eq(rp.decision, 'ADMIN_APPROVAL', 'producción con solo monthlyCapStaging → admin');
+      assert(rp.reasons.includes('policy_missing_caps_for_single_authorization:monthlyCap'), JSON.stringify(rp.reasons));
+      eq(F.decideRunBudget({ estimate: E, policy: rowPolicy({ ...stg, monthlyCap: '200' }), paidRealProviders: ['gamma'] }).decision, 'AUTO_WITHIN_POLICY', 'producción con monthlyCap → AUTO');
+    } finally { if (saved === undefined) delete process.env.DB_HOST; else process.env.DB_HOST = saved; }
+    // Fuera de staging, monthlyCapStaging sigue LIMITANDO el monto (fail-safe), aunque no habilite la firma única.
+    const NA = F.planNormalApproval({ estimate: E, policy: rowPolicy({ monthlyCapStaging: '6' }), courseSpent: 0, monthSpent: 0 });
+    eq([NA.withinPolicy, NA.amount, NA.cappedByLimit], [true, '6.0000000000', 'monthlyCap'], 'sigue acotando');
+  });
+
   await check('puro (M4): el deploy de staging registra UNA versión con el marcador de la semántica r62 (auditoría); idempotente', () => {
     const SBP = require(path.join(REPO, 'scripts/staging-budget-policy.js'));
     const cur = { scope: 'global', scope_id: null, version: 7, limits: { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCapStaging: '162' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
@@ -159,7 +181,9 @@ async function pureChecks() {
     const p2 = SBP.withApprovalSemantics(cur, SBP.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: '10' } }));
     eq([p2.action, p2.row.limits.approvalSemantics], ['insert', SBP.APPROVAL_SEMANTICS], 'una versión con cambio de límites lleva el marcador');
     eq(SBP.withApprovalSemantics(null, SBP.planPolicy(null)).action, 'none', 'sin política no inventa');
-    eq(F.decideRunBudget({ estimate: est('2', '5', '9', { gamma: { min: '1', expected: '2', max: '4' } }), policy: rowPolicy(p1.row.limits), paidRealProviders: ['gamma'] }).decision, 'AUTO_WITHIN_POLICY', 'el marcador no cambia la decisión');
+    const dec2 = (l) => F.decideRunBudget({ estimate: est('2', '5', '9', { gamma: { min: '1', expected: '2', max: '4' } }), policy: rowPolicy(l), paidRealProviders: ['gamma'] }).decision;
+    eq(dec2(p1.row.limits), dec2(cur.limits), 'el marcador no cambia la decisión');
+    eq(dec2({ ...p1.row.limits, ownerMonthlyCap: '500' }), 'AUTO_WITHIN_POLICY', 'con el tope por cliente: firma única');
   });
 
   await check('puro (d12): parsePolicyUpdate valida scope/scopeId/limits/onExceed/flag/reason; planPolicyUpdate = parche append-only (versión+1, null quita, noop, auditoría en created_by)', () => {
@@ -196,7 +220,8 @@ async function pureChecks() {
     const same = { ...cur, limits: { ...cur.limits }, require_human_approval_for_real_spend: false };
     eq(F.planPolicyUpdate(same, P({ scope: 'course', scopeId: '7', limits: { maxCostPerRun: 106 }, reason: 'reaplicar igual' }), 'a@b').action, 'noop', 'sin cambios → noop');
     throwsCode(() => F.planPolicyUpdate(null, P({ scope: 'owner', scopeId: crypto.randomUUID(), limits: { maxCostPerRun: 5 }, reason: 'nueva sin topes' }), 'a@b'), 'INVALID_INPUT', 'política nueva sin los tres topes');
-    eq(F.planPolicyUpdate(null, P({ scope: 'global', limits: CAPS, reason: 'global inicial' }), 'a@b').row.version, 1, 'política nueva con los tres topes');
+    eq(F.planPolicyUpdate(null, P({ scope: 'global', limits: CAPS, reason: 'global inicial' }), 'a@b').row.version, 1, 'política nueva con los cuatro topes');
+    throwsCode(() => F.planPolicyUpdate(null, P({ scope: 'global', limits: { maxCostPerRun: '1', maxCostPerCourse: '1', monthlyCap: '1' }, reason: 'sin tope por cliente' }), 'a@b'), 'INVALID_INPUT', 'nueva sin ownerMonthlyCap');
   });
 }
 
@@ -360,7 +385,7 @@ async function dbChecks() {
     const coursePolicy = (cid, limits, onExceed = 'ADMIN_APPROVAL') => ds.query(
       `insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, $3) returning id`,
       [String(cid), JSON.stringify(limits), onExceed]);
-    const BIG = { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '1000000000' };
+    const BIG = { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '1000000000', ownerMonthlyCap: '1000000000' };
     const authRows = (cid) => ds.query(`select id, run_id, estimate_id, decision, approved_by, reason, authorized_budget::text as b from public.cost_budget_authorizations where course_id = $1 order by created_at, (run_id is not null), id`, [cid]);
     const runCount = async (cid) => (await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [cid]))[0].n;
     /** La consulta de runPaidAuthorizedBudget ANTES de r62 (solo ADMIN_APPROVED / BLOCKED). */
@@ -470,7 +495,7 @@ async function dbChecks() {
 
     await check('DB política sin tope mensual → ADMIN (policy_missing_caps_for_single_authorization:monthlyCap)', async () => {
       const Mc = await makeCourse('Sin mensual');
-      await coursePolicy(Mc.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000' });
+      await coursePolicy(Mc.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000', ownerMonthlyCap: '1000000000' }); // falta solo el mensual
       const pv = await runs.previewStart(Mc.cid, USER, 1, NCTX);
       eq([pv.decision, pv.approval.mode], ['ADMIN_APPROVAL', 'admin'], 'decisión');
       assert(pv.reasons.includes('policy_missing_caps_for_single_authorization:monthlyCap'), JSON.stringify(pv.reasons));
@@ -478,7 +503,7 @@ async function dbChecks() {
 
     await check('DB mes agotado con decisión AUTO → bloqueado (budget_blocked monthlyCap), la firma no se escribe', async () => {
       const Mo = await makeCourse('Mes agotado');
-      await coursePolicy(Mo.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '0.000001' });
+      await coursePolicy(Mo.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '0.000001', ownerMonthlyCap: '1000000000' });
       const pv = await runs.previewStart(Mo.cid, USER, 1, NCTX);
       eq([pv.approval.mode, pv.approval.withinPolicy], ['user', false], 'mode user pero fuera del plan');
       await rejectsRe(runs.approveAndStart(Mo.cid, USER, 1, NCTX, pv.estimateHash), /budget_blocked.*monthlyCap/, 'mes', 409);
@@ -549,7 +574,7 @@ async function dbChecks() {
 
     // ════ d12: endpoint de admin de políticas ════
     // Endpoint: la cota de cordura de un tope es USD 100.000.
-    const EP = { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '100000' };
+    const EP = { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '100000', ownerMonthlyCap: '100000' };
     await check('DB d12: endpoint solo SuperAdmin (guards de la clase); POST valida (400), crea versión nueva append-only con auditoría; la anterior queda intacta; noop sin cambios; GET versiones y política vigente del curso', async () => {
       const guards = Reflect.getMetadata('__guards__', FinopsAdminController) || [];
       assert(guards.includes(SuperAdminGuard), 'SuperAdminGuard en FinopsAdminController');
@@ -607,7 +632,7 @@ async function dbChecks() {
       const cap = (dec(m0.total) + max * 2.5).toFixed(6);
       for (const [i, K] of Ks.entries()) {
         await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, $2, $3::jsonb, 'ADMIN_APPROVAL')`,
-          [String(K.cid), i === 0 ? 2 : 1, JSON.stringify({ maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: cap })]);
+          [String(K.cid), i === 0 ? 2 : 1, JSON.stringify({ maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: cap, ownerMonthlyCap: '1000000000' })]);
       }
       const pvs = [];
       for (const K of Ks) pvs.push(await runs.previewStart(K.cid, USER, 1, NCTX));
@@ -647,7 +672,7 @@ async function dbChecks() {
       await rejectsRe(dup.updateBudgetPolicy({ scope: 'global', limits: BIG, reason: 'carrera' }, ADMIN), /policy_version_conflict/, 'carrera', 409);
       const Z = await makeCourse('Poison');
       await rejectsRe(admin.updateBudgetPolicy({ scope: 'course', scopeId: String(Z.cid), limits: { maxCostPerRun: 1e-20, maxCostPerCourse: '10', monthlyCap: '10' }, reason: 'notación científica' }, ADMIN), /decimal inválido/, '1e-20', 400);
-      const r = await admin.updateBudgetPolicy({ scope: 'course', scopeId: String(Z.cid), limits: { maxCostPerRun: 0.5, maxCostPerCourse: '1000.50', monthlyCap: '99999.9900' }, reason: 'decimales válidos' }, ADMIN);
+      const r = await admin.updateBudgetPolicy({ scope: 'course', scopeId: String(Z.cid), limits: { maxCostPerRun: 0.5, maxCostPerCourse: '1000.50', monthlyCap: '99999.9900', ownerMonthlyCap: '500' }, reason: 'decimales válidos' }, ADMIN);
       eq([r.policy.limits.maxCostPerRun, r.policy.limits.maxCostPerCourse, r.policy.limits.monthlyCap], ['0.5', '1000.5', '99999.99'], 'normalizado');
       const pv = await runs.previewStart(Z.cid, USER, 1, NCTX);
       assert(pv.decision && pv.estimate, 'la política sigue legible (sin 503)');

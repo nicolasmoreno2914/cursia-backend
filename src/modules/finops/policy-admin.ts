@@ -165,8 +165,8 @@ export function planPolicyUpdate(current: PolicyRow | null, req: PolicyUpdateReq
   } else {
     const has = (k: string) => next[k] !== undefined && next[k] !== null;
     const monthly = has('monthlyCap') || has('monthlyCapStaging');
-    if (!explicit && !(has('maxCostPerRun') && has('maxCostPerCourse') && monthly)) {
-      bad('una política nueva necesita maxCostPerRun, maxCostPerCourse y monthlyCap (o requireHumanApprovalForRealSpend: true)');
+    if (!explicit && !(has('maxCostPerRun') && has('maxCostPerCourse') && monthly && has('ownerMonthlyCap'))) {
+      bad('una política nueva necesita maxCostPerRun, maxCostPerCourse, monthlyCap y ownerMonthlyCap (o requireHumanApprovalForRealSpend: true)');
     }
   }
   return {

@@ -674,6 +674,8 @@ interface NormalPlanContext {
    * de otros cursos; el tope mensual se verifica aparte (signedPlanFits).
    */
   signedPlan: NormalApprovalPlan;
+  /** r62: comprometido del mes de ESTE dueño (solo si la política define ownerMonthlyCap). */
+  ownerMonth: { spent: string; outstanding: string; total: string } | null;
 }
 
 /**
@@ -755,7 +757,8 @@ export interface StartPreview {
     /** r62: true = el run nace solo con la autorización firmada del usuario (mode 'user' y sin aprobación vigente). */
     userAuthorizationRequired: boolean;
   } | null;
-  policy: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; courseSpent: string; monthSpent: string } | null;
+  /** r62: + ownerMonthlyCap (tope mensual de la cuenta) y lo comprometido por la cuenta este mes (null sin ese tope). */
+  policy: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; ownerMonthlyCap?: string | null; courseSpent: string; monthSpent: string; ownerMonthSpent?: string | null } | null;
   estimateHash: string | null;
   /**
    * r61 (Q-24): tamaño proyectado del `.mbz` contra el límite de subida del almacenamiento (solo v3, run nuevo).
@@ -1213,7 +1216,7 @@ export class RunsService {
         mode,
         userAuthorizationRequired,
       },
-      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total },
+      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
       estimateHash,
       packageSize,
       _plan: plan,
@@ -1237,7 +1240,7 @@ export class RunsService {
       estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: '0', providerSpent: spent.byProvider,
       ownerMonthSpent: ownerMonth ? '0' : null,
     });
-    return { spent, month, plan, policy, signedPlan };
+    return { spent, month, plan, policy, signedPlan, ownerMonth };
   }
 
   /**
@@ -1457,7 +1460,7 @@ export class RunsService {
         existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
         mode, userAuthorizationRequired,
       },
-      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total },
+      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
       estimateHash,
       _plan: plan,
     };

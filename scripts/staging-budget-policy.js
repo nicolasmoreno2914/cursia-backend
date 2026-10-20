@@ -143,7 +143,7 @@ function planPolicy(current, target = DEFAULT_TARGET, createdBy = CREATED_BY) {
  * Puro. → plan con el marcador (insert) | el mismo noop/none.
  */
 const APPROVAL_SEMANTICS = 'r62_single_authorization';
-const SEMANTICS_CREATED_BY = 'staging-budget-policy r62: semántica de autorización única (tope por run + por curso + mensual → firma del usuario; admin solo si excede, sin topes o limits.requireHumanApprovalForRealSpend=true)';
+const SEMANTICS_CREATED_BY = 'staging-budget-policy r62: semántica de autorización única (tope por run + por curso + mensual + mensual por cliente (ownerMonthlyCap) → firma del usuario; admin solo si excede, sin topes o limits.requireHumanApprovalForRealSpend=true)';
 function withApprovalSemantics(current, plan) {
   if (!current || plan.action === 'none') return plan;
   if (plan.action === 'insert') {

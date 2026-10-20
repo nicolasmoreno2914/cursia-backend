@@ -894,7 +894,7 @@ async function dbChecks() {
       setReady();
       const K = await makeCourse(title, { videos });
       const mode = videos ? 'real' : 'mock';
-      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode }), (await budget.policyFor(K.cid, OWNER)) ? /^user_authorization_required/ : /^budget_approval_required/, `aprobación ${title}`, 409); // r62: con política (la global de #583 tiene los 3 topes) = firma única; sin política = admin. La aprobación de admin del estimado sigue cubriendo
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode }), (await (async () => { const pol = await budget.policyFor(K.cid, OWNER); return !!pol && pol.requireHumanApprovalForRealSpend !== true && F.policySpendCaps(pol).missing.length === 0; })()) ? /^user_authorization_required/ : /^budget_approval_required/, `aprobación ${title}`, 409); // r62: política con los 4 topes (run, curso, mensual, mensual por cliente) y sin admin explícito = firma única; si no, admin. La aprobación de admin del estimado sigue cubriendo
       await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
       const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode })).run.id;
       await seedDependency(rid, `content:${K.c1}`, 'dynamic_content_md', CONTENT_MD('Bombas'), 'text/markdown');
@@ -921,7 +921,7 @@ async function dbChecks() {
     async function freshLongWelcomeRun(title) {
       setReady();
       const K = await makeCourse(title, { videos: false });
-      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), (await budget.policyFor(K.cid, OWNER)) ? /^user_authorization_required/ : /^budget_approval_required/, `aprobación ${title}`, 409); // r62: con política (la global de #583 tiene los 3 topes) = firma única; sin política = admin. La aprobación de admin del estimado sigue cubriendo
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), (await (async () => { const pol = await budget.policyFor(K.cid, OWNER); return !!pol && pol.requireHumanApprovalForRealSpend !== true && F.policySpendCaps(pol).missing.length === 0; })()) ? /^user_authorization_required/ : /^budget_approval_required/, `aprobación ${title}`, 409); // r62: política con los 4 topes (run, curso, mensual, mensual por cliente) y sin admin explícito = firma única; si no, admin. La aprobación de admin del estimado sigue cubriendo
       await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
       const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' })).run.id;
       await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: LONG_WELCOME }), 'application/json');

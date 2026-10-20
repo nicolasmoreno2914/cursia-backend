@@ -47,7 +47,7 @@ export interface NormalApprovalPlan {
   /** true si el monto quedó por debajo del máximo del estimado por algún límite. */
   cappedByLimit: string | null;
   blockedBy: ApprovalLimitBlock[];
-  limits: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null };
+  limits: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; ownerMonthlyCap?: string | null };
 }
 
 function lim(v: DecimalLike | null | undefined, what: string): string | null {
@@ -141,7 +141,7 @@ export function planNormalApproval(input: {
     amount: withinPolicy ? amount : null,
     cappedByLimit: withinPolicy ? cappedByLimit : null,
     blockedBy,
-    limits: { maxCostPerRun: perRun, maxCostPerCourse: perCourse, monthlyCap: monthly },
+    limits: { maxCostPerRun: perRun, maxCostPerCourse: perCourse, monthlyCap: monthly, ownerMonthlyCap: ownerMonthly },
   };
 }
 
