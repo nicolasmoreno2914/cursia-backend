@@ -34,8 +34,9 @@ function paidKeyOf(method, path, raw) {
   return null;
 }
 
+/** upstreamBase: URL fija o función (info) → URL (p. ej. Anthropic: streaming → falso SSE del worker de IA; sin
+ *  streaming → falso JSON del guion del audiolibro; en staging ambos van al mismo api.anthropic.com). */
 function startFaultProxy(name, upstreamBase) {
-  const up = new URL(upstreamBase);
   const st = { name, calls: [], rules: [], scenario: null, counts: new Map() };
   const sockets = new Set();
   const srv = http.createServer((rq, rs) => {
@@ -70,6 +71,7 @@ function startFaultProxy(name, upstreamBase) {
       if (action === 'reset') { rq.socket.destroy(); return done('reset'); }
       if (action === 'hang') { rec.outcome = 'hang'; rs.on('close', () => { rec.end = Date.now(); }); return; }
       // Reenvío al proveedor falso de atrás.
+      const up = new URL(typeof upstreamBase === 'function' ? upstreamBase(info) : upstreamBase);
       const headers = { ...rq.headers, host: up.host };
       delete headers['content-length'];
       headers['content-length'] = String(raw.length);

@@ -81,11 +81,11 @@ const VG_STATUS = (i) => i.method === 'GET' && /^\/api\/external\/videos\/[^/]+\
 const SCENARIOS = [
   { id: 'baseline', what: 'sin fallas (control)', setup() {} },
   {
-    id: 'anthropic_529_429_500', what: 'Anthropic 529 ×2 (Libro cap. 1), 429 + retry-after (experiencia), 500 (6.ª llamada)',
+    id: 'anthropic_529_429_500', what: 'Anthropic 529 ×2 (Libro cap. 1), 429 + retry-after (experiencia), 500 (interacciones del video)',
     setup({ P }) {
       P.llm.rule('529', (i) => LLM_POST(i) && isContent(i.text, 1, CH1), 529, { times: 2 });
       P.llm.rule('429', (i) => LLM_POST(i) && isExperience(i.text), 429, { times: 1, headers: { 'retry-after': '2' } });
-      P.llm.rule('500', (i) => LLM_POST(i) && i.n >= 6 && !isContent(i.text, 1, CH1) && !isExperience(i.text), 500, { times: 1 });
+      P.llm.rule('500', (i) => LLM_POST(i) && i.text.includes('Puntos de pausa (fijos'), 500, { times: 1 });
     },
   },
   {
@@ -137,35 +137,37 @@ const SCENARIOS = [
     },
   },
   {
-    id: 'worker_restart', what: 'kill -9 del worker de IA con el Libro cap. 2 en vuelo y del worker de proveedores con una síntesis en vuelo; workers nuevos toman la lease',
+    id: 'worker_restart', what: 'kill -9 del dynamic-provider-worker (hospeda el worker de IA) con el Libro cap. 2 en vuelo y, después, con una síntesis TTS en vuelo; procesos nuevos toman la lease',
     setup({ P }) {
       P.llm.rule('inflightLlm', (i) => LLM_POST(i) && isContent(i.text, 2, CH2), 'delay', { times: 1, ms: 25_000 });
       P.prov.rule('inflightTts', (i) => SPEECH(i) && i.n === 2, 'delay', { times: 1, ms: 20_000 });
     },
     async tick(ctx) {
       const { P, S, stack } = ctx;
-      if (!S.killedLlm && P.llm.st.calls.some((c) => c.rule === 'inflightLlm' && c.outcome === 'pending' && Date.now() - c.at > 2000)) {
+      const pend = (p, rule) => p.st.calls.some((c) => c.rule === rule && c.outcome === 'pending' && Date.now() - c.at > 2000);
+      if (!S.killedLlm && pend(P.llm, 'inflightLlm')) {
         S.killedLlm = true;
-        S.llmVictim = stack.workers.llm.label;
-        log(`  ↯ kill -9 ${S.llmVictim} (Libro cap. 2 en vuelo)`);
-        await stack.killWorker('llm');
-        await stack.spawnWorker('llm', 'b');
+        S.llmVictim = `${stack.workers.provider.label}-llm`;
+        log(`  ↯ kill -9 ${stack.workers.provider.label} (Libro cap. 2 en vuelo en ${S.llmVictim})`);
+        await stack.killWorker('provider');
+        await stack.spawnWorker('provider', 'b');
       }
-      if (!S.killedProv && P.prov.st.calls.some((c) => c.rule === 'inflightTts' && c.outcome === 'pending' && Date.now() - c.at > 2000)) {
+      if (!S.killedProv && pend(P.prov, 'inflightTts')) {
         S.killedProv = true;
         S.provVictim = stack.workers.provider.label;
         log(`  ↯ kill -9 ${S.provVictim} (síntesis TTS en vuelo)`);
         await stack.killWorker('provider');
-        await stack.spawnWorker('provider', 'b');
+        await stack.spawnWorker('provider', S.killedLlm ? 'c' : 'b');
       }
     },
     async verify(ctx, rows) {
       const { S } = ctx;
-      const out = {};
       const content2 = rows.find((r) => r.type === 'content' && r.chapter_id === ctx.course.mods[0].chapters[1].id);
-      out.llmTakeover = S.killedLlm ? (content2 && content2.status === 'completed' && content2.worker_id !== S.llmVictim ? `ok (${content2.worker_id})` : `NO (${content2 && content2.status}/${content2 && content2.worker_id})`) : 'no se disparó';
-      out.provTakeover = S.killedProv ? 'disparado' : 'no se disparó';
-      return out;
+      const audio = rows.filter((r) => ['audio_welcome', 'audiobook_chapter'].includes(r.type));
+      return {
+        llmTakeover: S.killedLlm ? (content2 && content2.status === 'completed' && content2.worker_id !== S.llmVictim ? `ok (${content2.worker_id})` : `NO (${content2 && content2.status}/${content2 && content2.worker_id})`) : 'no se disparó',
+        provTakeover: S.killedProv ? audio.map((r) => `${r.type}:${r.status}/${r.worker_id}`).join(' ') : 'no se disparó',
+      };
     },
   },
   {
@@ -180,7 +182,7 @@ const SCENARIOS = [
         await stack.killAll();
         await sleep(5000);
         await stack.startApp();
-        for (const k of ['llm', 'provider', 'item', 'package']) await stack.spawnWorker(k, 'r');
+        for (const k of ['provider', 'item', 'package']) await stack.spawnWorker(k, 'r');
       }
     },
   },
@@ -287,8 +289,10 @@ async function createStack(name) {
   S.llm = createLlmV3({ base: llmBase, examBankContract: D('modules/course-shell/exam-bank.js'), h5p2: H5P2 });
   S.sse = await startAnthropicSseFake(S.llm);
   S.P = {
-    llm: await startFaultProxy('anthropic-llm-worker', S.sse.url),
-    prov: await startFaultProxy('gamma-openai-anthropic', S.purls.gammaUrl),
+    // Anthropic: un solo host como en staging; el pedido en streaming (worker de IA) va al falso SSE con el LLM falso
+    // v3 y el no-streaming (guion del audiolibro) al falso de fakes.js.
+    llm: await startFaultProxy('anthropic', (i) => { try { return JSON.parse(i.raw || '{}').stream === true ? S.sse.url : S.purls.anthropicUrl; } catch { return S.purls.anthropicUrl; } }),
+    prov: await startFaultProxy('gamma-openai', S.purls.gammaUrl),
     vg: await startFaultProxy('videogen', S.fakes.videogenUrl),
   };
   S.OWNER = crypto.randomUUID();
@@ -317,7 +321,7 @@ async function createStack(name) {
     GAMMA_API_KEY: KEYS.gamma, GAMMA_API_BASE_URL: S.P.prov.url,
     GAMMA_THEME_V21_LIGHT_DEFAULT: 'e2e-theme-light', GAMMA_THEME_V21_DARK_DEFAULT: 'e2e-theme-dark',
     OPENAI_API_KEY: KEYS.openai, OPENAI_API_BASE_URL: `${S.P.prov.url}/v1`,
-    ANTHROPIC_API_KEY: KEYS.anthropic, ANTHROPIC_API_BASE_URL: S.P.prov.url,
+    ANTHROPIC_API_KEY: KEYS.anthropic, ANTHROPIC_API_BASE_URL: S.P.llm.url,
     DYNAMIC_GAMMA_POLL_MS: '200',
     // Compresión de tiempos (solo cadencias y timeouts por llamada; las reglas/backoffs del producto quedan como están).
     PROVIDER_CALL_TIMEOUT_MS: '8000', DYNAMIC_AUTO_HEAL_INTERVAL_MS: '5000',
@@ -346,13 +350,15 @@ async function createStack(name) {
   };
   S.workerSpec = (kind, id) => {
     const b = S.baseEnv();
-    if (kind === 'llm') return ['workers/dynamic-llm-worker.js', { ...b, ANTHROPIC_API_BASE_URL: S.P.llm.url, ANTHROPIC_BASE_URL_IS_REAL_PROVIDER: 'true', DYNAMIC_LLM_WORKER_ID: id,
-      DYNAMIC_LLM_WORKER_POLL_MS: '300', DYNAMIC_LLM_WORKER_LEASE_SECONDS: '15', DYNAMIC_LLM_WORKER_HEARTBEAT_MS: '3000', DYNAMIC_LLM_WORKER_IDLE_MS: '8000',
+    // Topología de staging (Loop 6): el worker de IA corre HOSPEDADO en el dynamic-provider-worker (un proceso). Su
+    // executorId es DYNAMIC_LLM_WORKER_ID (= `<id>-llm`). Los demás procesos no lo hospedan.
+    if (kind === 'provider') return ['workers/dynamic-provider-worker.js', { ...b, DYNAMIC_PROVIDER_WORKER_ID: id, DYNAMIC_PROVIDER_WORKER_POLL_MS: '400', DYNAMIC_PROVIDER_WORKER_LEASE_SECONDS: '20',
+      ANTHROPIC_BASE_URL_IS_REAL_PROVIDER: 'true', DYNAMIC_LLM_WORKER_ID: `${id}-llm`,
+      DYNAMIC_LLM_WORKER_POLL_MS: '300', DYNAMIC_LLM_WORKER_LEASE_SECONDS: '15', DYNAMIC_LLM_WORKER_HEARTBEAT_MS: '3000', DYNAMIC_LLM_WORKER_IDLE_MS: '20000',
       DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS: '60000', DYNAMIC_LLM_WORKER_CONCURRENCY: '2', DYNAMIC_LLM_WORKER_BACKOFF_MS: '20', DYNAMIC_WORKER_DRAIN_TIMEOUT_MS: '30000' }];
-    if (kind === 'provider') return ['workers/dynamic-provider-worker.js', { ...b, DYNAMIC_PROVIDER_WORKER_ID: id, DYNAMIC_PROVIDER_WORKER_POLL_MS: '400', DYNAMIC_PROVIDER_WORKER_LEASE_SECONDS: '20' }];
-    if (kind === 'item') return ['workers/dynamic-item-worker.js', { ...b, DYNAMIC_ITEM_WORKER_ID: id, DYNAMIC_ITEM_WORKER_POLL_MS: '400', DYNAMIC_ITEM_WORKER_VIDEO_POLL_MS: '300',
+    if (kind === 'item') return ['workers/dynamic-item-worker.js', { ...b, DYNAMIC_LLM_WORKER_ENABLED: 'false', DYNAMIC_ITEM_WORKER_ID: id, DYNAMIC_ITEM_WORKER_POLL_MS: '400', DYNAMIC_ITEM_WORKER_VIDEO_POLL_MS: '300',
       DYNAMIC_ITEM_WORKER_HEARTBEAT_MS: '5000', DYNAMIC_ITEM_WORKER_LEASE_SECONDS: '20', DYNAMIC_ITEM_WORKER_VIDEO_TIMEOUT_MIN: '1', DYNAMIC_YOUTUBE_UPLOAD_RETRY_BASE_MS: '50', NODE_TLS_REJECT_UNAUTHORIZED: '0' }];
-    if (kind === 'package') return ['workers/dynamic-package-worker.js', { ...b, DYNAMIC_PACKAGE_WORKER_ID: id, DYNAMIC_PACKAGE_WORKER_POLL_MS: '400' }];
+    if (kind === 'package') return ['workers/dynamic-package-worker.js', { ...b, DYNAMIC_LLM_WORKER_ENABLED: 'false', DYNAMIC_PACKAGE_WORKER_ID: id, DYNAMIC_PACKAGE_WORKER_POLL_MS: '400' }];
     throw new Error(kind);
   };
   S.spawnWorker = async (kind, suffix) => {
@@ -560,7 +566,7 @@ async function runScenario(S, sc) {
   for (const p of Object.values(S.P)) p.reset(sc.id);
   S.llm.st.invalidSent = {}; S.llm.st.retriesSeen = {}; S.llm.st.unknown = [];
   S.llm.st.tag = sc.id;
-  for (const k of ['llm', 'provider', 'item', 'package']) await S.spawnWorker(k, 'a');
+  for (const k of ['provider', 'item', 'package']) await S.spawnWorker(k, 'a');
   const res = { id: sc.id, what: sc.what, interventions: 0, actions: [], notes: [] };
   const ctx = { P: S.P, S: {}, stack: S, q: S.q };
   try {
@@ -572,7 +578,7 @@ async function runScenario(S, sc) {
     // Presencia del worker de IA antes de crear el run (como en staging: el worker vive desde antes).
     const tw = Date.now();
     while (Date.now() - tw < 60_000) {
-      const p = await S.q(`select 1 from public.llm_worker_presence where worker_id like $1 and last_seen > now() - interval '60 seconds'`, [`r62-llm-${sc.id}-%`]);
+      const p = await S.q(`select 1 from public.llm_worker_presence where worker_id like $1 and last_seen > now() - interval '60 seconds'`, [`r62-provider-${sc.id}-%-llm`]);
       if (p.length) break;
       await sleep(300);
     }
@@ -676,7 +682,10 @@ async function runScenario(S, sc) {
     res.paidCalls = dr.paidCalls;
     res.duplicatePaid = dr.dup;
     res.ambiguousThenPaid = dr.ambiguousThenPaid;
-    res.injected = calls.filter((c) => c.rule).map((c) => `${c.rule}:${c.outcome}`);
+    const inj = new Map();
+    for (const c of calls.filter((x) => x.rule)) inj.set(`${c.rule}:${c.outcome}`, (inj.get(`${c.rule}:${c.outcome}`) || 0) + 1);
+    res.injected = [...inj].map(([k, n]) => (n > 1 ? `${k}×${n}` : k));
+    res.calls = calls.filter((c) => c.kind).map((c) => ({ t: c.at - ctx.t0, kind: c.kind, key: c.key, outcome: c.outcome, rule: c.rule || null, ms: c.end ? c.end - c.at : null, snippet: c.snippet.slice(0, 120) }));
     const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
     res.netViolations = blocked ? blocked.split('\n').length : 0;
   } catch (e) {
@@ -687,7 +696,7 @@ async function runScenario(S, sc) {
     if (ctx.runId && res.runStatus && !['completed', 'cancelled', 'failed'].includes(res.runStatus)) {
       await S.api('POST', `/courses/${ctx.course.courseId}/blueprints/${ctx.course.n}/manifest/runs/${ctx.runId}/cancel`).catch(() => null);
     }
-    for (const k of ['llm', 'provider', 'item', 'package']) await S.stopWorker(k, 8000);
+    for (const k of ['provider', 'item', 'package']) await S.stopWorker(k, 8000);
     if (S.app && S.app.exited) await S.startApp().catch(() => null);
     fs.writeFileSync(path.join(OUT, `scenario-${sc.id}.json`), JSON.stringify(res, null, 1));
   }
