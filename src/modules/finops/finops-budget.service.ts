@@ -5,12 +5,14 @@ import { addDec, cmpDec, normalizeDecimal, DecimalLike } from './decimal';
 import { PricingCatalogRow, conservativePrice, llmUpperBoundVariants, priceUsage } from './pricing';
 import { EstimateItem, EstimateResult, RetryPolicy, estimateCost } from './estimator';
 import { usageModelPriorsV1 } from './usage-model';
-import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, runtimeGuard } from './budget';
+import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, policyFromRow, policySpendCaps, runtimeGuard } from './budget';
+import { PolicyAdminScope, PolicyRow, parsePolicyUpdate, planPolicyUpdate } from './policy-admin';
 import { FinopsLedgerService } from './finops-ledger.service';
 import { BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE, decideRunSpend, RunSpendDecision } from './run-spend-guard';
 import {
   RUN_BUDGET_NOT_AUTHORIZED,
   RunBudgetDecision,
+  USER_AUTHORIZATION_REASON_PREFIX,
   RunManifestItem,
   RunSpendMode,
   RunSpendModes,
@@ -95,13 +97,68 @@ export class FinopsBudgetService {
     );
     const r = rows[0];
     if (!r) return null;
-    return {
-      id: r.id,
-      version: Number(r.version),
-      limits: r.limits || {},
-      requireHumanApprovalForRealSpend: r.require_human_approval_for_real_spend,
-      onExceed: r.on_exceed,
-    };
+    // r62: el flag explícito de admin es limits.requireHumanApprovalForRealSpend (ver policyFromRow).
+    return policyFromRow(r);
+  }
+
+  // ─── r62 (d12): administración de políticas (SOLO SuperAdmin, vía FinopsAdminController) ────────────
+
+  /** Versiones de una política (más nueva primero). scope global → scopeId null. */
+  async listPolicyVersions(scope: PolicyAdminScope, scopeId: string | null, limit = 20, runner: Runner = this.dataSource): Promise<PolicyRow[]> {
+    const rows = await runner.query(
+      `select id, scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by, created_at
+         from public.cost_budget_policies
+        where scope = $1 and coalesce(scope_id, '') = coalesce($2::text, '')
+        order by version desc, created_at desc limit $3`,
+      [scope, scopeId, Math.max(1, Math.min(100, Math.floor(limit)))],
+    );
+    return rows;
+  }
+
+  /**
+   * Política vigente de un curso (misma resolución que policyFor: course > owner > global) + si un run nuevo con
+   * proveedores pagados puede arrancar con la autorización única del usuario (topes completos y sin admin explícito).
+   */
+  async effectivePolicyForCourse(courseId: number, runner: Runner = this.dataSource): Promise<{
+    courseId: number; ownerId: string | null; policy: (BudgetPolicy & { id: string; scope?: string }) | null;
+    caps: { present: string[]; missing: string[] }; singleUserAuthorization: boolean; reason: string;
+  }> {
+    const [course] = await runner.query(`select id, owner_id from public.courses where id = $1`, [courseId]);
+    if (!course) throw new FinopsError('ESTIMATE_NOT_FOUND', `no existe el curso #${courseId}`);
+    const ownerId: string | null = course.owner_id ?? null;
+    const policy = await this.policyFor(courseId, ownerId ?? '00000000-0000-0000-0000-000000000000', runner);
+    const caps = policySpendCaps(policy);
+    const reason = !policy ? 'no_budget_policy'
+      : policy.requireHumanApprovalForRealSpend === true ? 'policy_requires_admin_explicitly'
+        : caps.missing.length ? `policy_missing_caps:${caps.missing.join(',')}` : 'single_user_authorization_within_policy';
+    return { courseId, ownerId, policy, caps, singleUserAuthorization: reason === 'single_user_authorization_within_policy', reason };
+  }
+
+  /**
+   * Versión nueva (append-only) de una política, validada (parsePolicyUpdate + planPolicyUpdate) y serializada por
+   * scope con un advisory lock; el índice único (scope, scope_id, version) es la última red. Sin cambios → noop.
+   * `created_by` lleva quién y por qué (auditoría en la fila inmutable).
+   */
+  async updatePolicy(body: unknown, actor: string): Promise<{ created: boolean; policy: PolicyRow }> {
+    const req = parsePolicyUpdate(body);
+    return this.dataSource.transaction(async (m) => {
+      await m.query(`select pg_advisory_xact_lock(hashtext($1))`, [`finops-policy:${req.scope}:${req.scopeId ?? ''}`]);
+      if (req.scope === 'course') {
+        const [c] = await m.query(`select id from public.courses where id = $1`, [Number(req.scopeId)]);
+        if (!c) throw new FinopsError('ESTIMATE_NOT_FOUND', `no existe el curso #${req.scopeId}`);
+      }
+      const [current] = await this.listPolicyVersions(req.scope, req.scopeId, 1, m);
+      const plan = planPolicyUpdate(current ?? null, req, actor);
+      if (plan.action === 'noop') return { created: false, policy: plan.current };
+      const r = plan.row;
+      const [row] = await m.query(
+        `insert into public.cost_budget_policies (scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by)
+         values ($1, $2, $3, $4::jsonb, $5, $6, $7)
+         returning id, scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by, created_at`,
+        [r.scope, r.scope_id, r.version, JSON.stringify(r.limits), r.require_human_approval_for_real_spend, r.on_exceed, r.created_by],
+      );
+      return { created: true, policy: row };
+    });
   }
 
   async spentSoFar(courseId: number, runner: Runner = this.dataSource): Promise<SpentSoFar> {
@@ -235,8 +292,15 @@ export class FinopsBudgetService {
     policyId: string | null;
     approvedBy: string;
     fingerprint: string;
-  }): Promise<{ estimateId: string; authorizationId: string }> {
+    /**
+     * r62: 'user' = autorización única del usuario DENTRO de la política (fila AUTO_WITHIN_POLICY firmada: approved_by
+     * + reason `user_authorized_within_policy:<huella>`); 'admin' (default) = aprobación ADMIN_APPROVED de siempre.
+     */
+    kind?: 'admin' | 'user';
+  }): Promise<{ estimateId: string; authorizationId: string; decision: 'ADMIN_APPROVED' | 'AUTO_WITHIN_POLICY' }> {
     if (typeof a.approvedBy !== 'string' || !a.approvedBy.trim()) throw new FinopsError('INVALID_INPUT', 'approvedBy es obligatorio');
+    const kind = a.kind ?? 'admin';
+    if (kind !== 'admin' && kind !== 'user') throw new FinopsError('INVALID_INPUT', `kind inválido: ${String(kind)}`);
     const amount = normalizeDecimal(a.amount, 'amount');
     if (cmpDec(amount, a.estimate.totals.expected) < 0) {
       throw new FinopsError('INVALID_INPUT', `el monto aprobado (${amount}) no cubre el esperado (${a.estimate.totals.expected})`);
@@ -244,11 +308,14 @@ export class FinopsBudgetService {
     const est = await this.recordEstimate({
       scope: 'run', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: null, estimate: a.estimate,
     }, runner);
+    const decision = kind === 'user' ? 'AUTO_WITHIN_POLICY' as const : 'ADMIN_APPROVED' as const;
+    if (kind === 'user' && !a.policyId) throw new FinopsError('INVALID_INPUT', 'la autorización del usuario exige una política vigente');
     const auth = await this.ledger.authorize({
       runId: null, courseId: a.courseId, estimateId: est.id, authorizedBudget: amount, policyId: a.policyId,
-      decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: `${NORMAL_APPROVAL_REASON_PREFIX}:${a.fingerprint}`,
+      decision, approvedBy: a.approvedBy.trim(),
+      reason: `${kind === 'user' ? USER_AUTHORIZATION_REASON_PREFIX : NORMAL_APPROVAL_REASON_PREFIX}:${a.fingerprint}`,
     }, runner);
-    return { estimateId: est.id, authorizationId: auth.id };
+    return { estimateId: est.id, authorizationId: auth.id, decision };
   }
 
   /**
@@ -320,7 +387,8 @@ export class FinopsBudgetService {
     ownerId: string;
     manifestId: number;
     evaluation: StartBudgetEvaluation;
-    approval: { id: string; estimate_id: string; authorized_budget: string; approved_by: string; policy_id: string | null } | null;
+    /** r62: `decision` AUTO_WITHIN_POLICY = autorización firmada por el usuario (recordNormalApproval kind 'user'). */
+    approval: { id: string; estimate_id: string; authorized_budget: string; approved_by: string; policy_id: string | null; decision?: 'ADMIN_APPROVED' | 'AUTO_WITHIN_POLICY' } | null;
     invalidationPlanSha?: string | null;
   }): Promise<{ estimateId: string; authorizationId: string }> {
     const est = await this.recordEstimate({
@@ -330,7 +398,7 @@ export class FinopsBudgetService {
     const auth = a.approval
       ? await this.ledger.authorize({
           runId: a.runId, courseId: a.courseId, estimateId: a.approval.estimate_id, authorizedBudget: a.approval.authorized_budget,
-          policyId: a.approval.policy_id ?? a.evaluation.policyId, decision: 'ADMIN_APPROVED', approvedBy: a.approval.approved_by,
+          policyId: a.approval.policy_id ?? a.evaluation.policyId, decision: a.approval.decision ?? 'ADMIN_APPROVED', approvedBy: a.approval.approved_by,
           reason: `bound_from:${a.approval.id}`,
         }, runner)
       : await this.ledger.authorize({
@@ -399,16 +467,26 @@ export class FinopsBudgetService {
 
   /**
    * RF-b fix I1: presupuesto para PROVEEDORES PAGADOS (Videogen/Gamma/TTS):
-   * SOLO la última autorización ADMIN_APPROVED del run (una BLOCKED posterior la
-   * revoca). AUTO_WITHIN_POLICY nunca cubre gasto real de proveedores (HD-V21-19).
+   * SOLO la última autorización HUMANA del run (una BLOCKED posterior la revoca): ADMIN_APPROVED o, desde r62, la
+   * autorización única FIRMADA por el usuario dentro de la política (fila AUTO_WITHIN_POLICY con approved_by, vinculada
+   * — bound_from — a una fila sin run con reason `user_authorized_within_policy:<huella>`). Una AUTO_WITHIN_POLICY sin
+   * firma (la de bindRun sin aprobación, p. ej. runs mock/solo LLM o runs históricos) nunca cubre gasto real de
+   * proveedores (HD-V21-19). Los runs anteriores a r62 no tienen filas firmadas: su resultado no cambia.
    */
   async runPaidAuthorizedBudget(runId: string, runner: Runner = this.dataSource): Promise<string | null> {
     const [row] = await runner.query(
-      `select decision, authorized_budget::text as authorized_budget from public.cost_budget_authorizations
-        where run_id = $1 and decision in ('ADMIN_APPROVED', 'BLOCKED') order by created_at desc, id desc limit 1`,
-      [runId],
+      `select a.decision, a.authorized_budget::text as authorized_budget from public.cost_budget_authorizations a
+        where a.run_id = $1
+          and (a.decision in ('ADMIN_APPROVED', 'BLOCKED')
+               or (a.decision = 'AUTO_WITHIN_POLICY' and a.approved_by is not null and a.reason like 'bound_from:%'
+                   and exists (select 1 from public.cost_budget_authorizations s
+                                where s.id::text = substring(a.reason from 12) and s.run_id is null
+                                  and s.decision = 'AUTO_WITHIN_POLICY' and s.estimate_id = a.estimate_id
+                                  and s.reason like $2)))
+        order by a.created_at desc, a.id desc limit 1`,
+      [runId, `${USER_AUTHORIZATION_REASON_PREFIX}:%`],
     );
-    if (!row || row.decision !== 'ADMIN_APPROVED') return null;
+    if (!row || row.decision === 'BLOCKED') return null;
     return row.authorized_budget;
   }
 

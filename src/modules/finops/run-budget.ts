@@ -5,15 +5,18 @@
  * - Items del Manifest (v1/v2/v3) → items del estimador. En un run MOCK los
  *   items de proveedor de worker (video/presentation/audio_*) se excluyen: el
  *   worker devuelve fixtures y el ledger los registra como MOCK a 0.
- * - Un run con algún proveedor pagado REAL (Videogen, Gamma, TTS) que va a
- *   GENERAR/REGENERAR requiere siempre aprobación humana (ADMIN_APPROVAL).
+ * - r62 (autorización única): un run con algún proveedor pagado REAL (Videogen, Gamma, TTS) que va a
+ *   GENERAR/REGENERAR es AUTO_WITHIN_POLICY si la política vigente tiene tope por run, por curso y mensual, no pide
+ *   admin explícitamente y el estimado entra en sus límites; en ese caso el run solo nace con la autorización
+ *   FIRMADA del usuario («Autorizar y generar», huella del estimado; `userAuthorizationRequired`). Sin política,
+ *   con algún tope faltante, con el flag explícito o fuera de los límites ⇒ ADMIN_APPROVAL / BLOCK como siempre.
  * - El LLM corre en el navegador: el backend no puede pre-bloquearlo. Con
  *   política, superar sus límites con el estimado LLM ⇒ ADMIN_APPROVAL
  *   (nunca BLOCK); sin política ⇒ AUTO (se registra el estimado igual).
  */
 import { FinopsError } from './errors';
 import { cmpDec, normalizeDecimal, DecimalLike } from './decimal';
-import { BudgetDecision, BudgetPolicy, EvaluateBudgetResult, SpentSoFar, evaluateBudget } from './budget';
+import { BudgetDecision, BudgetPolicy, EvaluateBudgetResult, SpentSoFar, evaluateBudget, policySpendCaps } from './budget';
 import type { EstimateItem, EstimateResult } from './estimator';
 import { bankAskCount, expectedExamPlan } from '../course-shell/exam-bank';
 import { guidedPracticeExercisePlan, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
@@ -299,7 +302,17 @@ export function pendingPaidRealProviders(
 
 export interface RunBudgetDecision extends EvaluateBudgetResult {
   paidRealProviders: string[];
+  /**
+   * r62: true = AUTO_WITHIN_POLICY con proveedores pagados reales: el run solo nace con la autorización firmada del
+   * usuario (b1) por el monto del plan de la política. Una fila AUTO sin esa firma nunca cubre proveedores pagados.
+   */
+  userAuthorizationRequired?: boolean;
 }
+
+/** r62: reason de la autorización firmada por el usuario dentro de la política (fila AUTO_WITHIN_POLICY sin run). */
+export const USER_AUTHORIZATION_REASON_PREFIX = 'user_authorized_within_policy';
+/** r62: 409 de un run nuevo con proveedores pagados dentro de la política sin la firma del usuario. */
+export const USER_AUTHORIZATION_REQUIRED = 'user_authorization_required';
 
 const RANK: Record<BudgetDecision, number> = { AUTO_WITHIN_POLICY: 0, ADMIN_APPROVAL: 1, BLOCK: 2 };
 
@@ -313,12 +326,13 @@ export function decideRunBudget(input: {
   const paid = [...(input.paidRealProviders || [])].sort();
   if (paid.length === 0) {
     if (!input.policy) return { decision: 'AUTO_WITHIN_POLICY', reasons: ['no_paid_worker_provider', 'no_budget_policy'], paidRealProviders: paid };
-    // Solo LLM (navegador): los límites de la política aplican, pero nunca bloquean.
+    // Solo LLM (navegador): los límites de la política aplican, pero nunca bloquean (ni piden admin dentro de ellos).
     const r = evaluateBudget({
       estimate: input.estimate,
-      policy: { ...input.policy, requireHumanApprovalForRealSpend: false },
+      policy: input.policy,
       spentSoFar: input.spentSoFar ?? null,
       realSpend: true,
+      humanApprovalRules: false,
     });
     const decision: BudgetDecision = r.decision === 'BLOCK' ? 'ADMIN_APPROVAL' : r.decision;
     const reasons = r.decision === 'BLOCK' ? [...r.reasons, 'llm_only_block_downgraded_to_admin_approval'] : r.reasons;
@@ -332,6 +346,18 @@ export function decideRunBudget(input: {
   });
   let decision = r.decision;
   const reasons = [...r.reasons];
+  if (decision === 'AUTO_WITHIN_POLICY') {
+    // r62: la autorización única exige una política con TODOS los topes totales (por run, por curso y mensual).
+    const caps = policySpendCaps(input.policy);
+    if (caps.missing.length > 0) {
+      decision = 'ADMIN_APPROVAL';
+      reasons.push(`policy_missing_caps_for_single_authorization:${caps.missing.join(',')}`);
+    }
+  }
+  if (decision === 'AUTO_WITHIN_POLICY') {
+    reasons.push(`paid_real_provider_user_authorization:${paid.join(',')}`);
+    return { decision, reasons, paidRealProviders: paid, userAuthorizationRequired: true };
+  }
   if (RANK[decision] < RANK.ADMIN_APPROVAL) decision = 'ADMIN_APPROVAL';
   reasons.push(`paid_real_provider_requires_admin_approval:${paid.join(',')}`);
   return { decision, reasons, paidRealProviders: paid };

@@ -98,6 +98,7 @@ import {
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import {
   BUDGET_APPROVAL_REQUIRED,
+  USER_AUTHORIZATION_REQUIRED,
   BUDGET_BLOCKED,
   BUDGET_EXCEEDED,
   PROVIDER_RECONCILIATION_REQUIRED,
@@ -628,6 +629,11 @@ export interface NormalApprovalRequest {
   max: string;
   /** Lo completa finopsBindRun al escribirla. */
   result: { authorizationId: string; amount: string } | null;
+  /**
+   * r62: 'user' = autorización única del usuario DENTRO de la política (AUTO_WITHIN_POLICY firmada, sin admin);
+   * 'admin' (default) = aprobación ADMIN_APPROVED de un SuperAdmin (fuera de la política / política que la exige).
+   */
+  kind?: 'admin' | 'user';
 }
 
 type FinopsGate = { evaluation: StartBudgetEvaluation; approval: any | null; normalApproval?: NormalApprovalRequest };
@@ -696,6 +702,13 @@ export interface StartPreview {
     cappedByLimit: string | null; blockedBy: NormalApprovalPlan['blockedBy'];
     /** Aprobación de admin vigente sin consumir que ya cubre el esperado (startRun la usa). */
     existing: { amount: string } | null;
+    /**
+     * r62: quién autoriza este run. 'user' = el usuario con «Autorizar y generar» (dentro de la política, sin admin);
+     * 'admin' = hace falta un SuperAdmin (`required`); 'none' = no hace falta autorizar (mock / solo LLM / existente).
+     */
+    mode: 'user' | 'admin' | 'none';
+    /** r62: true = el run nace solo con la autorización firmada del usuario (mode 'user' y sin aprobación vigente). */
+    userAuthorizationRequired: boolean;
   } | null;
   policy: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; courseSpent: string; monthSpent: string } | null;
   estimateHash: string | null;
@@ -1092,7 +1105,7 @@ export class RunsService {
     try {
       evaluation = await this.finopsBudget.evaluateStart({ courseId, ownerId, mode: modes, items: manifest.manifest.items });
       np = await this.normalPlan(this.dataSource, courseId, ownerId, evaluation);
-      if (evaluation.decision === 'ADMIN_APPROVAL') {
+      if (evaluation.decision === 'ADMIN_APPROVAL' || evaluation.userAuthorizationRequired) {
         existing = await this.finopsBudget.findUnconsumedApproval(courseId, manifest.id, evaluation.estimate.totals.expected);
       }
     } catch (err) {
@@ -1106,6 +1119,9 @@ export class RunsService {
     }
     // Una aprobación de admin vigente para este Manifest ya cubre el esperado: startRun la consume (camino normal).
     const required = evaluation.decision !== 'AUTO_WITHIN_POLICY' && !existing;
+    // r62 (autorización única): dentro de la política con proveedores pagados, autoriza el propio usuario (b1).
+    const userAuthorizationRequired = evaluation.decision === 'AUTO_WITHIN_POLICY' && !!evaluation.userAuthorizationRequired && !existing;
+    const mode: 'user' | 'admin' | 'none' = required ? 'admin' : userAuthorizationRequired ? 'user' : 'none';
     const canApprove = isSuperAdminEmail(user.email);
     const estimateHash = estimateFingerprint({
       courseId, manifestId: manifest.id, manifestSha: manifest.sha256, contextHash, modes, estimate: evaluation.estimate,
@@ -1131,6 +1147,8 @@ export class RunsService {
         cappedByLimit: plan.cappedByLimit,
         blockedBy: plan.blockedBy,
         existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
+        mode,
+        userAuthorizationRequired,
       },
       policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total },
       estimateHash,
@@ -1187,6 +1205,22 @@ export class RunsService {
         preview: publicPreview(pv),
       });
     }
+    // r62 (autorización única): dentro de la política con proveedores pagados → la firma del usuario (con la huella que
+    // vio) es la autorización del run, por el monto del plan; sin admin. Fuera de la política → 409 budget_blocked.
+    if (pv.approval.userAuthorizationRequired) {
+      if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicPreview(pv));
+      const ua: NormalApprovalRequest = {
+        approvedBy: String(user.email || `user:${user.id}`),
+        fingerprint: estimateHash,
+        amount: pv._plan!.amount!,
+        expected: pv.estimate.expected,
+        max: pv.estimate.max,
+        result: null,
+        kind: 'user',
+      };
+      const started = await this.startRun(courseId, user.id, blueprintNumber, courseContext, { normalApproval: ua });
+      return { ...started, approval: ua.result ?? none };
+    }
     // AUTO o una aprobación de admin vigente: el camino normal (startRun la consume).
     if (!pv.approval.required) return { ...(await this.startRun(courseId, user.id, blueprintNumber, courseContext)), approval: none };
     if (!pv.approval.canApprove) {
@@ -1203,6 +1237,7 @@ export class RunsService {
       expected: pv.estimate.expected,
       max: pv.estimate.max,
       result: null,
+      kind: 'admin',
     };
     const started = await this.startRun(courseId, user.id, blueprintNumber, courseContext, { normalApproval: na });
     return { ...started, approval: na.result ?? none };
@@ -4361,7 +4396,17 @@ export class RunsService {
       throw this.finopsUnavailable(err);
     }
     if (evaluation.decision === 'BLOCK') throw new BudgetGateRejection(evaluation, BUDGET_BLOCKED, a.planSha ?? null);
-    if (evaluation.decision === 'ADMIN_APPROVAL') {
+    // r62: dentro de la política con proveedores pagados reales → la autorización firmada del usuario (b1).
+    const userAuth = evaluation.decision === 'AUTO_WITHIN_POLICY' && !!evaluation.userAuthorizationRequired;
+    if (a.normalApproval && a.normalApproval.kind === 'user' && !userAuth) {
+      // La firma del usuario solo vale DENTRO de la política: si ahora hace falta un admin (o ya no hay gasto pagado),
+      // la decisión cambió desde que la vio.
+      throw new ConflictException({
+        code: ESTIMATE_STALE,
+        message: `${ESTIMATE_STALE}: la decisión de presupuesto cambió desde que la viste (${evaluation.decision}); revisa el estimado nuevo. No se creó nada.`,
+      });
+    }
+    if (evaluation.decision === 'ADMIN_APPROVAL' || userAuth) {
       if (a.normalApproval) {
         // Flujo normal: el estimado de ESTE start tiene que ser el que vio el usuario; la aprobación
         // se escribe en la tx del run (finopsBindRun), nunca se reutiliza otra.
@@ -4375,8 +4420,13 @@ export class RunsService {
         }
         return { evaluation, approval: null, normalApproval: na };
       }
+      // Una aprobación de admin vigente (p. ej. calibración) sigue sirviendo; sin ella, un run nuevo dentro de la
+      // política pide la firma del usuario (USER_AUTHORIZATION_REQUIRED) y uno fuera, un admin. Un run B desde un plan
+      // de invalidación (planSha) no tiene UI de firma: sigue el camino de admin de siempre.
       const approval = await this.finopsBudget.findUnconsumedApproval(a.courseId, a.manifestId, evaluation.estimate.totals.expected, a.runner);
-      if (!approval) throw new BudgetGateRejection(evaluation, BUDGET_APPROVAL_REQUIRED, a.planSha ?? null);
+      if (!approval) {
+        throw new BudgetGateRejection(evaluation, userAuth && !a.planSha ? USER_AUTHORIZATION_REQUIRED : BUDGET_APPROVAL_REQUIRED, a.planSha ?? null);
+      }
       return { evaluation, approval };
     }
     return { evaluation, approval: null };
@@ -4430,7 +4480,9 @@ export class RunsService {
     const totals = estimateSummary(estimate);
     const human = code === BUDGET_BLOCKED
       ? 'la política de presupuesto bloquea esta generación (supera el límite configurado); un administrador tiene que cambiar la política.'
-      : 'esta generación requiere la aprobación de un administrador antes de gastar en proveedores pagados.';
+      : code === USER_AUTHORIZATION_REQUIRED
+        ? 'esta generación entra en la política de presupuesto: autorízala con «Autorizar y generar» (monto y huella del estimado); no necesita un administrador.'
+        : 'esta generación requiere la aprobación de un administrador antes de gastar en proveedores pagados.';
     // El filtro global aplana el 409 a su mensaje: estimateId y totales viajan también en el texto.
     const message =
       `${code}: ${human} No se creó ni se envió nada. estimateId=${estimateId} ` +
@@ -4460,9 +4512,9 @@ export class RunsService {
       }
       const rec = await this.finopsBudget.recordNormalApproval(qr, {
         courseId: a.courseId, ownerId: a.ownerId, manifestId: a.manifestId, estimate: gate.evaluation.estimate, amount: na.amount,
-        policyId: gate.evaluation.policyId, approvedBy: na.approvedBy, fingerprint: na.fingerprint,
+        policyId: gate.evaluation.policyId, approvedBy: na.approvedBy, fingerprint: na.fingerprint, kind: na.kind ?? 'admin',
       });
-      gate = { ...gate, approval: { id: rec.authorizationId, estimate_id: rec.estimateId, authorized_budget: na.amount, approved_by: na.approvedBy, policy_id: gate.evaluation.policyId } };
+      gate = { ...gate, approval: { id: rec.authorizationId, estimate_id: rec.estimateId, authorized_budget: na.amount, approved_by: na.approvedBy, policy_id: gate.evaluation.policyId, decision: rec.decision } };
       na.result = { authorizationId: rec.authorizationId, amount: na.amount };
     }
     if (gate.approval) {

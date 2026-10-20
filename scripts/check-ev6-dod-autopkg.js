@@ -978,7 +978,9 @@ const ENV_KEYS = [
     /** Run REAL arrancado por el camino normal (estimado → aprobación de admin → start), con el content del cap. 1 listo. */
     async function freshRun(title) {
       const K = await confirmedCourse(title, { c2Video: false, c2Title: 'Válvulas' });
-      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /^budget_approval_required/, `aprobación ${title}`, 409);
+      // r62: con los tres topes la política habilita la firma única (409 user_authorization_required, con estimateId);
+      // una aprobación de admin vigente del estimado sigue cubriendo el start (camino de este fixture).
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /^(budget_approval_required|user_authorization_required)/, `aprobación ${title}`, 409);
       await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
       const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
       await seedDependency(rid, `content:${K.c1}`, 'dynamic_content_md', CONTENT_MD('Bombas'), 'text/markdown');
