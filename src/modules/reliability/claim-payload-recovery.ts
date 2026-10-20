@@ -55,7 +55,12 @@ export type ClaimPayloadDecision =
   | { action: 'reopen'; depKey: string; code: string }
   | { action: 'regenerate_dependency'; depKey: string; code: string }
   | { action: 'wait'; depKey: string; code: string }
-  | { action: 'exception'; depKey: string | null; code: string; reason: 'contract' | 'already_regenerated' | 'reopen_cap' | 'real_video_requires_review' };
+  | { action: 'exception'; depKey: string | null; code: string; reason: 'contract' | 'already_regenerated' | 'reopen_cap' | 'real_video_requires_review' | 'dependency_unavailable' };
+
+/** r62 (re-review 3): estados de la dependencia que todavía pueden terminar solos (esperar). */
+export const CLAIM_PAYLOAD_DEP_ALIVE: readonly string[] = Object.freeze(['pending', 'queued', 'claimed', 'running', 'retrying', 'blocked']);
+/** r62 (re-review 3): estados terminales SIN salida automática (no va a completarse): excepción registrada. */
+export const CLAIM_PAYLOAD_DEP_DEAD: readonly string[] = Object.freeze(['cancelled', 'skipped']);
 
 /** Código interno del mensaje `claim_payload_unavailable: <CODE>: …` (null si no tiene la forma). */
 export function claimPayloadCodeOf(error: string | null | undefined): string | null {
@@ -95,6 +100,8 @@ export function claimPayloadRecoveryDecision(row: ClaimPayloadRow, dep: ClaimPay
     if (reopens >= CLAIM_PAYLOAD_MAX_REOPENS) return { action: 'exception', depKey, code, reason: 'reopen_cap' };
     return { action: 'reopen', depKey, code };
   }
+  // r62 (re-review 3): una dependencia cancelada / omitida nunca se va a completar → excepción explícita (sin esperar).
+  if (CLAIM_PAYLOAD_DEP_DEAD.includes(dep.status)) return { action: 'exception', depKey, code, reason: 'dependency_unavailable' };
   if (dep.status !== 'completed') return { action: 'wait', depKey, code };
   if (regeneratedForThis) return { action: 'exception', depKey, code, reason: 'already_regenerated' };
   if (videoMode !== 'mock') return { action: 'exception', depKey, code, reason: 'real_video_requires_review' };

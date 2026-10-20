@@ -275,13 +275,21 @@ async function pureChecks() {
       eq(RC.adminActionFor(cpRow(1)[0], 'not_done', now), null, 'claim incompleto reciente: el barrido lo resuelve');
       eq(RC.adminActionFor(cpRow(31)[0], 'not_done', now)?.code, 'retry_item', 'pasado el techo de 30 min: acción visible');
       // re-review m5-bis: con la dependencia (video) viva / en vuelo o fallida → sin retry_item aunque pasen horas.
-      for (const st of ['pending', 'running', 'retrying', 'failed']) {
+      for (const st of ['pending', 'running', 'retrying', 'blocked', 'failed']) {
         eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: { item_key: 'video:ch1', type: 'video', status: st, finished_at: null } }), null, `dependencia ${st}: sin acción`);
       }
       // Dependencia completada hace poco: el techo se cuenta desde su fin (no desde el fallo de la parte).
       const depDone = (minsAgo) => ({ item_key: 'video:ch1', type: 'video', status: 'completed', finished_at: new Date(now.getTime() - minsAgo * 60_000).toISOString() });
       eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: depDone(5) }), null, 'dependencia recién completada: dentro del techo');
       eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: depDone(40) })?.code, 'retry_item', 'dependencia completada hace 40 min y sin resolver: acción visible');
+      // re-review 3: dependencia cancelada / omitida → nunca oculta para siempre; con el techo desde el fin de la dependencia.
+      for (const st of ['cancelled', 'skipped']) {
+        const dd = (minsAgo) => ({ item_key: 'video:ch1', type: 'video', status: st, finished_at: new Date(now.getTime() - minsAgo * 60_000).toISOString() });
+        eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: dd(5) }), null, `${st} reciente: dentro del techo`);
+        eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: dd(40) })?.code, 'retry_item', `${st} hace 40 min: acción visible`);
+        eq(CPR.claimPayloadRecoveryDecision(cpRow(1)[0], dd(1), 'mock'), { action: 'exception', depKey: 'video:ch1', code: 'VIDEO_YOUTUBE_ID_MISSING', reason: 'dependency_unavailable' }, `${st}: el barrido la registra como excepción`);
+        eq(RC.adminActionFor({ ...cpRow(1)[0], output_summary: { claimPayloadRecovery: { declined: 'dependency_unavailable' } } }, 'not_done', now, null, { dep: dd(1) })?.code, 'retry_item', `${st}: excepción registrada → acción inmediata`);
+      }
       const vjob = { id: 'j', status: 'failed', worker_status: 'failed', input_payload: {} };
       const vm = { items: [{ key: 'video:ch1', type: 'video' }, { key: 'content:x', type: 'video_interactions' }], rulesVersion: 2 };
       const ev = RC.evaluateRunCompletion(vjob, [...cpRow(180), { id: 'v1', item_key: 'video:ch1', type: 'video', status: 'running', output_summary: {}, finished_at: null }], vm, null, { now });
@@ -321,7 +329,9 @@ const like = (pat) => new RegExp('^' + pat.split('%').map((x) => x.replace(/[.*+
 function llmWorld(budgetFits, o = {}) {
   const w = { res: new Map(), cps: {}, sent: {}, store: new Map(), budgetCalls: [], released: [] };
   // r62 (I2-ter): reloj de la DB desfasado respecto del worker (created_at y now() salen de la DB).
-  const dbClock = () => Date.now() + (o.dbSkewMs || 0);
+  // Monótono estricto (como now() de una DB con resolución de µs): dos lecturas nunca empatan en el mismo ms.
+  let lastDb = 0;
+  const dbClock = () => { lastDb = Math.max(lastDb + 1, Date.now() + (o.dbSkewMs || 0)); return lastDb; };
   const unknown = (v) => !v.settled || v.possibleDuplicate;
   w.ds = {
     async query(sql, params) {
@@ -446,6 +456,7 @@ async function llmChecks() {
       const w = llmWorld(true, { dbSkewMs });
       const api = w.api(a.url);
       eq((await err(api('s', 'A'))).v, 'R2', `skew ${dbSkewMs}: A un reenvío`);
+      await new Promise((r) => setTimeout(r, 3)); // B nace DESPUÉS (en producción, tras el viaje de red del reenvío de A)
       const rb = await err(api('s', 'B'));
       assert(rb.e && rb.e.pendingReview && /eventos ambiguos/.test(rb.e.msg), `skew ${dbSkewMs}: B → revisión: ${JSON.stringify(rb.e)}`);
       eq(a.st.requests, 3, `skew ${dbSkewMs}: B no se reenvía`);

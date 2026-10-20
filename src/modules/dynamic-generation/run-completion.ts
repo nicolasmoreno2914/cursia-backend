@@ -36,7 +36,7 @@ import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecisio
 // r62 (N2): Videogen/Gamma que el barrido de conciliación todavía va a resolver solo (sin acción de admin).
 import { providerReconcilePending } from './provider-reconcile';
 import { spendControlHoldOf } from '../reliability/spend-control-hold';
-import { CLAIM_PAYLOAD_SWEEP_CEILING_MS, claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
+import { CLAIM_PAYLOAD_DEP_ALIVE, CLAIM_PAYLOAD_SWEEP_CEILING_MS, claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -567,7 +567,9 @@ export function adminActionFor(
     // acción si falló— reintentar esta parte no sirve: sin acción acá. Completada, el barrido la reabre / regenera; el
     // techo (el barrido falla en cada tick) se cuenta desde max(fallo de la parte, fin de la dependencia).
     const dep = ctx?.dep ?? null;
-    if (dep && dep.status !== 'completed') return null;
+    // Viva / en vuelo (su propio estado) o fallida (su propia acción en este mismo run): nada acá. Cancelada / omitida u
+    // otro terminal sin salida (re-review 3): la acción reaparece con el techo contado desde el fin de la dependencia.
+    if (dep && (CLAIM_PAYLOAD_DEP_ALIVE.includes(dep.status) || dep.status === 'failed')) return null;
     const ms = (v: unknown) => (v ? new Date(v as any).getTime() : NaN);
     const anchors = [ms(r.finished_at ?? r.updated_at), ms(dep?.finished_at)].filter((x) => Number.isFinite(x));
     const cpAt = anchors.length ? Math.max(...anchors) : NaN;
