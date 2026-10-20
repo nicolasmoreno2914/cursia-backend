@@ -517,6 +517,12 @@ export function mergeOutputSummary(
   const merged = { ...(existing ?? {}) };
   for (const [k, v] of Object.entries(patch ?? {})) {
     if (v === undefined) continue;
+    // r62 (re-review m1): las marcas durables de envío solo CRECEN — se unen con las ya guardadas (bajo el lock de la
+    // fila), así una tarea con su copia en memoria nunca borra la marca que escribió otra tarea/proceso.
+    if (k === 'paidCallsSent' && isPlainObject(v) && existing && isPlainObject(existing.paidCallsSent)) {
+      merged.paidCallsSent = { ...existing.paidCallsSent, ...v };
+      continue;
+    }
     if (k === 'external' && existing && existing.external !== undefined && existing.external !== null) {
       const cur = existing.external;
       if (isPlainObject(cur) && isPlainObject(v)) {

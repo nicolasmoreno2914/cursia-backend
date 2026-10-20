@@ -154,9 +154,15 @@ export const OPENAI_TTS_TIMEOUT_ENV = 'OPENAI_TTS_TIMEOUT_MS';
  * timeout ambiguo de #1510. Solo `OPENAI_TTS_TIMEOUT_MS` explícito lo cambia (pruebas de fault injection / E2E); el
  * worker lo loguea al arrancar.
  */
+/**
+ * r62 (re-review m4): techo del override explícito = lease del worker de proveedores (300 s) − margen en vuelo (30 s).
+ * La ventana en vuelo de Q-21 (lease-takeover.ts) se DERIVA del timeout efectivo (máx(210 s, override) + margen), así un
+ * takeover nunca pisa una llamada viva; un override más corto (pruebas / E2E) solo hace la ventana más conservadora.
+ */
+export const OPENAI_TTS_TIMEOUT_MAX_MS = 270_000;
 export function ttsTimeoutMs(env: Env): { ms: number; source: 'default' | 'OPENAI_TTS_TIMEOUT_MS' } {
   const n = Number(env[OPENAI_TTS_TIMEOUT_ENV]);
-  if (Number.isInteger(n) && n > 0) return { ms: n, source: 'OPENAI_TTS_TIMEOUT_MS' };
+  if (Number.isInteger(n) && n > 0) return { ms: Math.min(n, OPENAI_TTS_TIMEOUT_MAX_MS), source: 'OPENAI_TTS_TIMEOUT_MS' };
   return { ms: OPENAI_TTS_TIMEOUT_MS, source: 'default' };
 }
 

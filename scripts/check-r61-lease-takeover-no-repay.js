@@ -123,7 +123,7 @@ function world() {
       if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
         const [keyLike, tagLike, , exclude, includePd] = params;
         return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
-          .map(([k, v]) => ({ key: k, amount: String(UB), settled: !!v.settled, send_marked: !!v.sendMarked }));
+          .map(([k, v]) => ({ key: k, amount: String(UB), settled: !!v.settled, send_marked: !!v.sendMarked, created_at: v.at ? new Date(v.at).toISOString() : null }));
       }
       // r62: marca durable de envío (LLM_MARK_SENT_SQL) del worker dueño de la parte.
       if (sql.includes("'{llmSent}'")) { if (params[1] !== w.owner) return []; w.sent[params[2]] = params[3]; return [{ id: params[0] }]; }

@@ -84,7 +84,7 @@ function world(cap = Infinity) {
       if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
         const [keyLike, tagLike, , exclude, includePd] = params;
         return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
-          .map(([k, v]) => ({ key: k, amount: String(UB), settled: !!v.settled, send_marked: !!v.sendMarked }));
+          .map(([k, v]) => ({ key: k, amount: String(UB), settled: !!v.settled, send_marked: !!v.sendMarked, created_at: v.at ? new Date(v.at).toISOString() : null }));
       }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
@@ -95,7 +95,7 @@ function world(cap = Infinity) {
       if (w.committed() + UB > w.cap + 1e-9) {
         const e = new Error(`RUN_BUDGET_CAP: el run ${RUN} excedería su presupuesto autorizado`); e.code = 'RUN_BUDGET_CAP'; e.details = { runId: RUN, requiredUsd: UB }; throw e;
       }
-      w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false });
+      w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false, at: Date.now() });
       return {};
     },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },

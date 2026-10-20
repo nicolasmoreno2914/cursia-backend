@@ -62,14 +62,14 @@ function fakeWorld(opts = {}) {
       if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
         const [keyLike, tagLike, , exclude, includePd] = params;
         return [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
-          .map(([k, v]) => ({ key: k, amount: '0.01', settled: !!v.settled, send_marked: !!v.sendMarked }));
+          .map(([k, v]) => ({ key: k, amount: '0.01', settled: !!v.settled, send_marked: !!v.sendMarked, created_at: v.at ? new Date(v.at).toISOString() : null }));
       }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...cps } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
     },
   };
   const finops = {
-    async recordCharge(i) { res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false }); return {}; },
+    async recordCharge(i) { res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false, at: Date.now() }); return {}; },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },
     // r62 (I3): conciliación conservadora del reenvío ambiguo (obligatoria: sin ella el worker falla cerrado).
     async reconcileReservationAsCharged(key, reason, o) {
@@ -128,12 +128,23 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     assert(unknownOf(w) === 2 && pdOf(w) === 1 && pending(w) === 1, `inciertas ${unknownOf(w)} / posible duplicado ${pdOf(w)} / pendientes ${pending(w)}`);
     await a.close();
   });
-  await check('regla por llamada: un desconocido en la llamada A y otro en la B → cada una se reintenta una vez y la parte sigue', async () => {
+  // r62 (re-review I2-bis — cambio DELIBERADO de la regla Loop-4 «una vez por llamada»): A desconocida → UN reenvío; una
+  // desconocida NUEVA después (B, mismo intento, no solapada con A) es un SEGUNDO evento ambiguo → revisión, sin pedirla otra vez.
+  await check('r62 tope por evento: A desconocida → UN reenvío; después B desconocida en el mismo intento → revisión (sin reenviar B)', async () => {
     const a = await fakeAnthropic((p, n) => (n === 1 ? 'drop' : 'ok'));
     const w = fakeWorld(); const api = makeApi(w, a.url);
-    assert((await api('s', 'A')) === 'R:A' && (await api('s', 'B')) === 'R:B', 'ambas completas');
-    // r62: cada reserva perdida se liquida como cobrada (posible duplicado) antes de su reenvío único: 0 abiertas.
-    assert(a.st.requests.length === 4 && unknownOf(w) === 2 && pdOf(w) === 2 && pending(w) === 0, `4 pedidos / 2 posibles duplicados (${a.st.requests.length}/${pdOf(w)}/${pending(w)})`);
+    assert((await api('s', 'A')) === 'R:A', 'A completa con su reenvío único');
+    const e = await err(api('s', 'B'));
+    assert(e && e.pendingReview === true && /eventos ambiguos/.test(e.msg), 'B → revisión: ' + JSON.stringify(e));
+    assert(a.st.requests.length === 3 && unknownOf(w) === 2 && pdOf(w) === 1 && pending(w) === 1, `3 pedidos / A posible duplicado / B pendiente (${a.st.requests.length}/${pdOf(w)}/${pending(w)})`);
+    await a.close();
+  });
+  await check('r62 un mismo evento: 2 llamadas EN PARALELO sin respuesta a la vez (solapadas) → cada una reenvía una vez, sin revisión', async () => {
+    const a = await fakeAnthropic((p, n) => (n === 1 ? 'drop' : 'ok'));
+    const w = fakeWorld(); const api = makeApi(w, a.url);
+    const out = await Promise.all(['P1', 'P2'].map((p) => err(api('s', p))));
+    assert(out.every((x) => x === null), 'ningún carril a revisión: ' + JSON.stringify(out));
+    assert(a.st.requests.length === 4 && pdOf(w) === 2 && pending(w) === 0, `4 pedidos / 2 posibles duplicados (${a.st.requests.length}/${pdOf(w)}/${pending(w)})`);
     await a.close();
   });
   await check('I1: llamadas EN VUELO en paralelo no cuentan como desconocidas (huérfanas de un crash + 3 carriles nuevos)', async () => {

@@ -34,7 +34,7 @@ import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
 import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, autoHealPolicyFromEnv, autoRecoveryEnabled, safeAutoRetryDecision } from './auto-heal';
 import { spendControlHoldOf } from '../reliability/spend-control-hold';
-import { claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
+import { CLAIM_PAYLOAD_SWEEP_CEILING_MS, claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -538,7 +538,12 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   if (tickOn0 && autoRecoveryEnabled(process.env) && spendControlHoldOf(err, r.type)) return null;
   // r62 (M1): claim incompleto por el dato de la dependencia → lo resuelve el barrido (reapertura / regenerate_dependency)
   // hasta que lo registra como excepción (claimPayloadRecovery.declined).
-  if (tickOn0 && autoRecoveryEnabled(process.env) && claimPayloadDependencyKey(r as any) && !s.claimPayloadRecovery?.declined) return null;
+  {
+    // r62 (re-review m5): con techo (si el barrido no lo resolvió a tiempo, la acción aparece igual).
+    const cpAt = r.finished_at ? new Date(r.finished_at as any).getTime() : r.updated_at ? new Date(r.updated_at as any).getTime() : NaN;
+    const cpWithin = !Number.isFinite(cpAt) || now.getTime() < cpAt + CLAIM_PAYLOAD_SWEEP_CEILING_MS;
+    if (tickOn0 && cpWithin && autoRecoveryEnabled(process.env) && claimPayloadDependencyKey(r as any) && !s.claimPayloadRecovery?.declined) return null;
+  }
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
   // REL MVP: id (semilla del jitter) y clase registrada → misma decisión que el barrido y el lock.
   const ahRow = { id: r.id, status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null,
