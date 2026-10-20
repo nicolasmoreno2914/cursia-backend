@@ -17,6 +17,7 @@ import { WorkerLedger } from './finops-worker-hooks';
 import { createExecutorRuntime } from './llm-executor/executor-runtime';
 import { LLM_PENDING_REVIEW, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
 import type { CallRole } from '../modules/finops/finops-ledger.service';
+import { fencedScheduler, IN_FLIGHT_MARGIN_MS, PRIOR_CALL_IN_FLIGHT, PROCESS_ITEM_FENCE, priorAttemptMayBeInFlight } from './lease-takeover';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Loop 4 — worker de IA del backend para las partes LARGAS (Libro Guía, Actividades de Aplicación, SCORM, examen
@@ -83,7 +84,35 @@ export function discardCheckpointsOnFailure(result: { ok?: boolean; retryable?: 
   return !(result.keepCheckpoints === true && !!result.draft && result.retryable !== false);
 }
 
+/**
+ * r61 (Q-21): guardado TARDÍO (el worker ya no es dueño de la parte). Solo agrega la clave si falta (nunca pisa), con
+ * la parte viva (no completada ni fallida), y si el pedido salió dentro de la ventana vigente: después del último
+ * reinicio del presupuesto de recuperación y del último descarte de guardados (`llmCheckpointsResetAt`).
+ */
+export const LATE_CHECKPOINT_SQL =
+  `update public.generation_item_runs
+      set output_summary = jsonb_set(coalesce(output_summary, '{}'::jsonb), '{llmCheckpoints}',
+                                     coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) || jsonb_build_object($2::text, $3::jsonb)),
+          updated_at = now()
+    where id = $1 and status in ('running', 'pending', 'retrying')
+      and not (coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) ? $2::text)
+      and $4::timestamptz >= greatest(created_at, coalesce(nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz, created_at))
+      and $4::timestamptz >= coalesce(nullif(output_summary->>'llmCheckpointsResetAt', '')::timestamptz, '-infinity'::timestamptz)
+    returning id`;
+
 export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Promise<'completed' | 'failed' | 'handed_back' | 'abandoned'> {
+  // r61 (Q-21): cerco por intento dentro del proceso (mismo executorId): si este proceso vuelve a reclamar la parte
+  // mientras esta tarea sigue viva, esta deja de escribir en ella (latido/guardado de estado/complete/fail = no-op).
+  const fenceToken = PROCESS_ITEM_FENCE.enter(item.itemRunId);
+  deps = { ...deps, scheduler: fencedScheduler(deps.scheduler, item.itemRunId, fenceToken) };
+  try {
+    return await processLlmItemFenced(deps, item, () => PROCESS_ITEM_FENCE.isCurrent(item.itemRunId, fenceToken));
+  } finally {
+    PROCESS_ITEM_FENCE.leave(item.itemRunId, fenceToken);
+  }
+}
+
+async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCurrentTask: () => boolean): Promise<'completed' | 'failed' | 'handed_back' | 'abandoned'> {
   const ownerId = await ownerOfRun(deps.dataSource, item.runId);
   const courseId = String((item as any).artifactCourseId ?? '');
   let abandoned = false;
@@ -94,7 +123,7 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
       .catch(() => { /* red: si no hay latido OK por buena parte de la lease, la parte se da por perdida (shouldStop) */ });
   }, deps.heartbeatMs);
   // Review I3: sin latido confirmado por el 80 % de la lease, otro worker puede re-reclamar la parte → no se gasta más.
-  const leaseLost = () => abandoned || Date.now() - lastBeatOk > deps.leaseSeconds * 800;
+  const leaseLost = () => abandoned || !isCurrentTask() || Date.now() - lastBeatOk > deps.leaseSeconds * 800;
   const fail = async (msg: string, retryable: boolean, opts?: { grantAttempt?: boolean; retryAfterSeconds?: number; examBankDraftArtifactId?: string | null; applicationDraftArtifactId?: string | null }) => {
     clearInterval(hb);
     deps.logger.warn(`Item ${item.itemKey}: falla ${retryable ? 'reintentable' : 'definitiva'}: ${String(msg).slice(0, 400)}`);
@@ -120,6 +149,14 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
         const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
         return Array.isArray(list) && list.length > 0;
       },
+      recordLateCheckpoint: async (itemRunId, hash, entry, sentAt) => {
+        const rows = await deps.dataSource.query(LATE_CHECKPOINT_SQL, [itemRunId, hash, JSON.stringify(entry), sentAt]);
+        const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
+        return Array.isArray(list) && list.length > 0;
+      },
+      // r61 (Q-21): una llamada de otro intento puede seguir en vuelo hasta su timeout total (+ margen).
+      // Solo tras una TOMA de la lease (si el intento anterior falló por sí mismo, su llamada ya terminó).
+      priorInFlightWindowMs: priorAttemptMayBeInFlight(item) ? deps.totalMs + IN_FLIGHT_MARGIN_MS : 0,
     }, {
       itemRunId: item.itemRunId, runId: item.runId, itemKey: item.itemKey, attempt: Number(item.attempt) || 1, generation: Number((item as any).generation) || 1,
       ownerId, artifactCourseId: courseId, manifestId: (item as any).manifestId,
@@ -143,6 +180,12 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
     } catch (e: any) {
       if (abandoned || (e && e.handBack === 'lease_lost')) { clearInterval(hb); return 'abandoned'; }
       const msg = (e && (e.msg || e.message)) || String(e);
+      if (e && e.handBack === PRIOR_CALL_IN_FLIGHT) {
+        // r61 (Q-21): la misma llamada del intento anterior sigue en vuelo → vuelve a la cola sin consumir intento y
+        // sin reenviar; al retomarla, su guardado tardío (si llegó) la responde sin costo.
+        await fail(msg, true, { grantAttempt: true, retryAfterSeconds: Math.max(1, Number(e.retryAfterSeconds) || 1) });
+        return 'handed_back';
+      }
       if (e && e.handBack === 'worker_draining') {
         // Deploy: la parte vuelve a la cola (sin consumir intento) y otro worker sigue desde sus puntos de guardado.
         await fail(msg, true, { grantAttempt: true, retryAfterSeconds: 1 });
@@ -188,7 +231,7 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
       // solo si su borrador QUEDÓ subido (rev. I3: sin borrador el reintento repetiría las mismas respuestas).
       const draftSaved = !!draftField && typeof opts[draftField] === 'string' && !!opts[draftField];
       if (!draftSaved || discardCheckpointsOnFailure(result)) {
-        await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {} }).catch(() => false);
+        await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {}, llmCheckpointsResetAt: new Date().toISOString() }).catch(() => false);
       } else deps.logger.log(`Item ${item.itemKey}: regla de conjunto del banco — puntos de guardado conservados para el reintento (borrador ${opts[draftField]})`);
       await fail((result && result.error) || 'unexpected_error: el ejecutor no devolvió un resultado', !result || result.retryable !== false, Object.keys(opts).length ? (opts as any) : undefined);
       return 'failed';
@@ -215,9 +258,10 @@ export async function processLlmItem(deps: LlmWorkerDeps, item: ClaimedItem): Pr
         // descartan para que el reintento genere de nuevo y no repita las mismas respuestas inválidas. Cualquier otro
         // rechazo (lease, artifacts, red) los conserva: el reintento no vuelve a pagar lo ya generado.
         await deps.dataSource.query(
-          `update public.generation_item_runs set output_summary = output_summary - 'llmCheckpoints', updated_at = now()
+          `update public.generation_item_runs
+              set output_summary = (output_summary - 'llmCheckpoints') || jsonb_build_object('llmCheckpointsResetAt', $2::text), updated_at = now()
             where id = $1 and status <> 'running'`,
-          [item.itemRunId],
+          [item.itemRunId, new Date().toISOString()],
         ).catch(() => undefined);
       }
       await fail('complete rechazado', true);

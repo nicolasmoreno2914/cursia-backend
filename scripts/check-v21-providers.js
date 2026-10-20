@@ -905,6 +905,15 @@ async function dbChecks() {
     const counts = () => ({ g: fakes.st.gammaPosts.length, t: fakes.st.tts.length, l: fakes.st.llm.length });
     const delta = (c0) => { const c = counts(); return { gamma: c.g - c0.g, tts: c.t - c0.t, llm: c.l - c0.l }; };
     const retryNow = (id) => ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [id]);
+    // r61 (Q-21): simula que pasó la ventana en vuelo de los envíos del intento anterior (marcadores 1 h atrás).
+    const ageInFlightMarkers = async (id) => {
+      const [r] = await ds.query(`select output_summary from public.generation_item_runs where id = $1`, [id]);
+      const os = r.output_summary || {};
+      const old = new Date(Date.now() - 3600_000).toISOString();
+      const sent = Object.fromEntries(Object.keys(os.paidCallsSent || {}).map((k) => [k, old]));
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || $2::jsonb where id = $1`,
+        [id, JSON.stringify({ paidCallsSent: sent, ...(os.externalSubmitStartedAt ? { externalSubmitStartedAt: old } : {}) })]);
+    };
     const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400' };
 
     // Review r2 (M8/N1): bienvenida LARGA (3 chunks de TTS) — la unidad se reserva completa y lo nunca enviado se libera.
@@ -945,9 +954,17 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [item.itemRunId]);
       await sched.sweepExpiredLeases(R.rid);
       await retryNow(item.itemRunId);
-      const again = await claimProvider(R.rid, 'audio_welcome');
-      assert(again && again.attempt > item.attempt, 're-reclamada en un intento nuevo');
+      const again0 = await claimProvider(R.rid, 'audio_welcome');
+      assert(again0 && again0.attempt > item.attempt, 're-reclamada en un intento nuevo');
       const tts0 = fakes.st.tts.length;
+      // r61 (Q-21): dentro de la ventana en vuelo del chunk enviado → devuelta sin llamar (sin consumir intento, nada liberado aún).
+      await PW.processProviderItem(workerDeps(), again0);
+      const back = await itemRow(R.rid, again0.itemKey);
+      assert(back.status === 'retrying' && /^prior_call_in_flight/.test(back.error), `devuelta mientras puede estar en vuelo (${back.status} ${back.error})`);
+      eq(fakes.st.tts.length - tts0, 0, 'en la ventana: ninguna llamada');
+      await ageInFlightMarkers(item.itemRunId);
+      await retryNow(item.itemRunId);
+      const again = await claimProvider(R.rid, 'audio_welcome');
       await rejectsRe(PW.processProviderItem(workerDeps(), again), /^provider_reconciliation_required/, 'el enviado bloquea');
       eq(fakes.st.tts.length - tts0, 0, 'ninguna llamada nueva');
       const res = await reservationsOf(item.itemRunId, 'openai');
@@ -1056,6 +1073,12 @@ async function dbChecks() {
       eq([row.status, delta(c0).tts], ['running', 1], 'quedó running tras 1 llamada');
       await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [row.id]);
       await sched.sweepExpiredLeases(R.rid);
+      await retryNow(row.id);
+      // r61 (Q-21): el chunk enviado y sin liquidar puede seguir en vuelo → primero devuelta sin llamar; pasada la ventana, reconciliación.
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      row = await itemRow(R.rid, item.itemKey);
+      assert(row.status === 'retrying' && /^prior_call_in_flight/.test(row.error) && delta(c0).tts === 1, `devuelta en la ventana (${row.status} ${row.error})`);
+      await ageInFlightMarkers(row.id);
       await retryNow(row.id);
       await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required/, 're-claim');
       row = await itemRow(R.rid, item.itemKey);

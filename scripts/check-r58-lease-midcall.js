@@ -18,6 +18,10 @@
 //       el contador de desconocidos de la misma llamada); B hace un único intento más y la parte no entra en bucle
 //   LM6 A detecta la lease perdida ANTES de llamar → devuelve la parte sin reservar ni llamar (shouldStop)
 //
+// r61 (Q-21): LM1/LM2 fijan el comportamiento de createServerApi SIN los deps nuevos (priorInFlightWindowMs,
+// recordLateCheckpoint). El worker real (processLlmItem) los pasa tras una toma: B no reenvía y reutiliza el guardado
+// tardío de A → ver scripts/check-r61-lease-takeover-no-repay.js (LT1/LT2).
+//
 // Usage: npm run build && node scripts/check-r58-lease-midcall.js [dist]
 'use strict';
 const http = require('http');

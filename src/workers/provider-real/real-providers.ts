@@ -89,6 +89,10 @@ import {
 import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
 import { DRAIN_HANDBACK_RETRY_SECONDS, DrainSignal, drainHandbackMessage, runPausedHandbackMessage } from '../worker-drain';
+import {
+  adoptLateExternalId, fencedScheduler, IN_FLIGHT_WINDOW_MS, inFlightRemainingMs, priorAttemptMayBeInFlight, priorCallInFlightMessage,
+  PROCESS_ITEM_FENCE, providerOfReservationKey, retryAfterSecondsFor,
+} from '../lease-takeover';
 import { ITEM_RECOVERY_BUDGET_REASON, RUN_PAUSED_GUARD_REASON } from '../../modules/finops/finops-budget.service';
 import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
 import {
@@ -275,6 +279,25 @@ async function handBackIfDraining(deps: RealProviderDeps, item: ClaimedItem, whe
     grantAttempt: true,
   });
   deps.logger.warn(`Item ${item.itemKey}: drenado — devuelto ${where}${ok ? '' : ' (el item ya no era de este worker)'}`);
+  return true;
+}
+
+/**
+ * r61 (Q-21): una llamada pagada de un intento ANTERIOR figura enviada (`sentAt`) y sin liquidar y todavía puede estar
+ * en vuelo (lease tomada) → el item vuelve a la cola con retryAfter ≥ lo que falta de la ventana, sin consumir intento
+ * y sin llamar. true = devuelto. Pasada la ventana responde false (sigue el camino de reconciliación de siempre).
+ */
+async function handBackIfPriorInFlight(deps: RealProviderDeps, item: ClaimedItem, what: string, sentAt: string | Date | null | undefined, windowMs: number): Promise<boolean> {
+  return handBackPriorInFlight(deps, item, what, inFlightRemainingMs(sentAt ?? null, windowMs));
+}
+
+async function handBackPriorInFlight(deps: RealProviderDeps, item: ClaimedItem, what: string, left: number): Promise<boolean> {
+  if (!(left > 0) || !priorAttemptMayBeInFlight(item)) return false;
+  const ok = await deps.scheduler.failItem(item.itemRunId, deps.executorId, priorCallInFlightMessage(what, left), true, undefined, {
+    retryAfterSeconds: retryAfterSecondsFor(left),
+    grantAttempt: true,
+  });
+  deps.logger.warn(`Item ${item.itemKey}: ${what} del intento anterior puede seguir en vuelo (~${Math.ceil(left / 1000)} s) — devuelto sin llamar${ok ? '' : ' (el item ya no era de este worker)'}`);
   return true;
 }
 
@@ -481,6 +504,9 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     themeMode = external.themeMode;
     themeId = external.gammaThemeId;
   } else if (item.outputSummary?.externalSubmitStartedAt) {
+    // r61 (Q-21): el envío del intento anterior todavía puede estar en vuelo (lease tomada) → no se decide aún:
+    // la parte vuelve a la cola; si el worker anterior recibe el generationId lo registra (adoptLateExternalId).
+    if (await handBackIfPriorInFlight(deps, item, 'el envío a Gamma', String(item.outputSummary.externalSubmitStartedAt), IN_FLIGHT_WINDOW_MS.gamma)) return;
     await gammaAmbiguous(
       deps, item, ownerId, String(item.outputSummary.externalSubmitStartedAt),
       `un envío empezó (${item.outputSummary.externalSubmitStartedAt}) y no registró el generationId (crash o lease perdida a mitad)`,
@@ -565,9 +591,19 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
     }
     if (tracker && tracker.inFlight) tracker.inFlight.opId = generationId;
     deps.logger.log(`Item ${item.itemKey}: Gamma aceptó la generación ${generationId}`);
-    await record(deps, item, {
-      external: { gammaGenerationId: generationId, gammaThemeId: themeId!, themeFamily, themeMode, acceptedAtAttempt: item.attempt },
-    });
+    const gammaExternal = { gammaGenerationId: generationId, gammaThemeId: themeId!, themeFamily, themeMode, acceptedAtAttempt: item.attempt };
+    try {
+      await record(deps, item, { external: gammaExternal });
+    } catch (err) {
+      if (!(err instanceof LeaseLost)) throw err;
+      // r61 (Q-21): la lease se tomó con el envío en vuelo. La generación YA existe (y se cobra): se registra su id
+      // cercado por el marcador de ESTE envío, así el próximo reclamante la retoma por poll (gratis) y liquida esta
+      // reserva en el terminal, en vez de quedar ambigua o de reenviarla.
+      const adopted = await adoptLateExternalId(deps.dataSource as any, item.itemRunId, marker, 'gammaGenerationId', gammaExternal).catch(() => false);
+      deps.logger.warn(`Item ${item.itemKey}: lease perdida tras el envío a Gamma (${generationId}) — id ${adopted ? 'registrado tarde para el próximo reclamante' : 'NO registrado (el marcador cambió)'}`);
+      if (adopted && tracker) tracker.inFlight = null;
+      throw err;
+    }
     // Id persistido: la generación es reanudable (poll gratis) → ya no es un gasto "en el aire".
     // La reserva sigue contando el gasto (p90) hasta el terminal, donde se liquida con los créditos medidos.
     if (tracker) tracker.inFlight = null;
@@ -1476,6 +1512,10 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
 
 /** Despacho del modo real. La lease perdida corta en silencio (otro ejecutor sigue). */
 export async function processRealProviderItem(deps: RealProviderDeps, item: ClaimedItem, ownerId: string): Promise<void> {
+  // r61 (Q-21): cerco por intento dentro del proceso (mismo executorId): una tarea vieja de esta parte, si este proceso
+  // la vuelve a reclamar, deja de escribir en ella (sus escrituras del scheduler responden «lease perdida»).
+  const fenceToken = PROCESS_ITEM_FENCE.enter(item.itemRunId);
+  deps = { ...deps, scheduler: fencedScheduler(deps.scheduler, item.itemRunId, fenceToken) };
   const tracked: RealProviderDeps = { ...deps, tracker: deps.tracker ?? newPaidCallTracker() };
   try {
     // Calibración #2 — detección DURABLE: una operación pagada de un intento anterior sin resultado
@@ -1527,7 +1567,8 @@ export async function processRealProviderItem(deps: RealProviderDeps, item: Clai
   } finally {
     // La copia en memoria de los marcadores de envío vive solo mientras se procesa el item (lo durable está en el
     // item): un worker de larga vida no acumula una entrada por item procesado.
-    sentByItem.delete(item.itemRunId);
+    if (PROCESS_ITEM_FENCE.isCurrent(item.itemRunId, fenceToken)) sentByItem.delete(item.itemRunId);
+    PROCESS_ITEM_FENCE.leave(item.itemRunId, fenceToken);
   }
 }
 
@@ -1589,6 +1630,21 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
       return true;
     },
   });
+  // r61 (Q-21): ANTES de liberar nada — una reserva enviada y sin liquidar de un intento anterior que todavía puede
+  // estar en vuelo (lease tomada) no se decide aún: el item vuelve a la cola sin llamar (sin consumir intento). Su envío
+  // se fecha con el marcador (paidCallsSent / externalSubmitStartedAt) o, sin marcador, con el alta de la reserva.
+  const sentMarks = (os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object') ? os[PAID_CALLS_SENT_KEY] as Record<string, string> : {};
+  let inFlight: { left: number; provider: string } | null = null;
+  for (const b of priorAttemptMayBeInFlight(item) ? blocking : []) {
+    if (!b.reservation || b.settled) continue;
+    const provider = providerOfReservationKey(b.idempotency_key) ?? b.provider;
+    const sentAt = sentMarks[b.idempotency_key]
+      ?? (b.idempotency_key === markedKey && typeof os.externalSubmitStartedAt === 'string' ? os.externalSubmitStartedAt : null)
+      ?? b.created_at ?? null;
+    const left = inFlightRemainingMs(sentAt, IN_FLIGHT_WINDOW_MS[provider] ?? 0);
+    if (left > 0 && (!inFlight || left > inFlight.left)) inFlight = { left, provider };
+  }
+  if (inFlight && (await handBackPriorInFlight(deps, item, `una llamada pagada (${inFlight.provider})`, inFlight.left))) return true;
   for (const r of releasable) await settlePaidCall(deps.finops, r.idempotency_key, null, 'reserved_without_submit_marker');
   if (!blocking.length) return false;
   const what = blocking.map((b) => `${b.provider} ${b.external_operation_id ?? b.idempotency_key} (intento ${b.attempt})`).join('; ');
