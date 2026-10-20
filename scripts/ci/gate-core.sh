@@ -70,7 +70,8 @@ for f in "$REPO"/scripts/check-*.js; do
 done
 for h in "harness-blueprint-snapshot:scripts/harness-blueprint-snapshot.js:dist" \
          "prod-run-local-pg-tests:scripts/prod/test/run-local-pg-tests.js:" \
-         "prod-legacy-app-compat:scripts/prod/test/run-legacy-app-compat-test.js:"; do
+         "prod-legacy-app-compat:scripts/prod/test/run-legacy-app-compat-test.js:" \
+         "ci-prod-deploy-hardening:scripts/ci/check-prod-deploy-hardening.js:"; do
   n="${h%%:*}"; rest="${h#*:}"; s="${rest%%:*}"; arg="${rest#*:}"
   if [ -n "$arg" ]; then (cd "$REPO" && "${CLEAN_ENV[@]}" node "$s" "$REPO/$arg") > "$REG/$n.log" 2>&1; else (cd "$REPO" && "${CLEAN_ENV[@]}" node "$s") > "$REG/$n.log" 2>&1; fi
   rc=$?; [ $rc -ne 0 ] && FAIL=1

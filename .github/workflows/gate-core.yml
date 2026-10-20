@@ -6,7 +6,9 @@ name: gate-core
 
 on:
   pull_request:
-    branches: [staging]
+    # r61: también los PR de promoción a producción (main / release/**). Ahí el frontend es OBLIGATORIO:
+    # sin CURSIA_FE_READ_TOKEN el job falla de entrada (en staging termina BLOCKED = exit 3, también rojo).
+    branches: [staging, main, 'release/**']
   workflow_dispatch:
     inputs:
       fe_ref:
@@ -46,9 +48,15 @@ jobs:
         env:
           FE_TOKEN: ${{ secrets.CURSIA_FE_READ_TOKEN }}
           BRANCH: ${{ github.head_ref || github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
           FE_REF_INPUT: ${{ inputs.fe_ref }}
         run: |
           if [ -z "$FE_TOKEN" ]; then
+            case "$BASE_REF" in
+              main|release/*)
+                echo "::error::Falta el secreto CURSIA_FE_READ_TOKEN: un PR a $BASE_REF (promoción a producción) exige el gate con frontend (E24 + harnesses). Ver docs/v2-production-promotion-runbook.md §1."
+                exit 1 ;;
+            esac
             echo "::warning::Falta el secreto CURSIA_FE_READ_TOKEN: E24 y harnesses del frontend quedan BLOCKED (el gate-core termina en BLOCKED, nunca PASS)."
             exit 0
           fi
