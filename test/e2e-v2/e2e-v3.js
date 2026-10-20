@@ -4758,8 +4758,18 @@ function reservationBookkeeping(ev) {
         // hoja si el examen es un banco. Usuarios propios (p2b5_*), nunca los de la simulación de notas.
         if (quizForExhaust) {
           const p2Out = path.join(V3OUT, `moodle-${label}.p2exams.json`);
-          const p2 = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-p2-exams.php'), process.env.MOODLE_ROOT, String(courseid), p2Out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 300000 });
-          ok(!/warning|notice|deprecated/i.test(p2.stderr || '') && fs.existsSync(p2Out), `${label}: escenarios de evaluaciones (moodle-p2-exams.php) sin error de PHP`, (p2.stderr || p2.stdout || '').slice(-800));
+          // r62 (gate): el cron de completion (mtrace) escribe en stdout y el JSON va al archivo. Si el proceso no terminó por
+          // sí mismo (timeout de spawnSync / señal: p. ej. el equipo se suspendió en medio y el reloj de pared consumió los
+          // 300 s), no hay JSON: se reintenta UNA vez con usuarios nuevos (el script usa un sufijo aleatorio por corrida).
+          // Un error real de PHP (stderr, exit ≠ 0 con proceso terminado) nunca se reintenta.
+          const runP2 = () => { try { fs.rmSync(p2Out, { force: true }); } catch { /* no existía */ }
+            return spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-p2-exams.php'), process.env.MOODLE_ROOT, String(courseid), p2Out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 300000 }); };
+          let p2 = runP2();
+          const p2Killed = (r) => r.status === null || !!r.signal || (r.error && r.error.code === 'ETIMEDOUT');
+          const p2First = p2Killed(p2) ? { status: p2.status, signal: p2.signal, error: p2.error && p2.error.code } : null;
+          if (p2First) { console.log(`   ↻ ${label}: moodle-p2-exams.php no terminó (${JSON.stringify(p2First)}) — reintento único`); p2 = runP2(); }
+          ok(!/warning|notice|deprecated/i.test(p2.stderr || '') && fs.existsSync(p2Out), `${label}: escenarios de evaluaciones (moodle-p2-exams.php) sin error de PHP${p2First ? ' (tras 1 reintento por proceso cortado)' : ''}`,
+            { status: p2.status, signal: p2.signal, error: p2.error && p2.error.code, first: p2First, stderr: (p2.stderr || '').slice(-600), stdoutTail: (p2.stdout || '').slice(-200) });
           const p2o = fs.existsSync(p2Out) ? JSON.parse(fs.readFileSync(p2Out, 'utf8')) : { pass: false, failed: ['sin salida'], assertions: 0 };
           ok(p2.status === 0 && p2o.pass === true && p2o.assertions > 0, `${label}: ${p2o.assertions} aserciones de evaluaciones con intentos reales (revisión, página gated, completion del curso${Object.values(p2o.quizzes || {}).some((q) => q.mode === 'bank') ? ', sorteo por hoja' : ''})`, p2o.failed);
           const modes = Object.values(p2o.quizzes || {}).map((q) => q.mode);
