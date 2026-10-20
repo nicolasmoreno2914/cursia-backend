@@ -55,16 +55,29 @@ function fakeWorld(opts = {}) {
     async query(sql, params) {
       if (sql.includes('count(*)::int as n')) {
         const [keyLike, tagLike, , exclude] = params;
-        const n = [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k)).length;
+        const n = [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || v.possibleDuplicate) && !exclude.includes(k)).length;
         return [{ n }];
+      }
+      // r62: reservas desconocidas (sin liquidar) de UNA llamada → el próximo envío es el reenvío ambiguo de la parte.
+      if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
+        const [keyLike, tagLike, , exclude, includePd] = params;
+        return [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
+          .map(([k, v]) => ({ key: k, amount: '0.01', settled: !!v.settled, send_marked: !!v.sendMarked }));
       }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...cps } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
     },
   };
   const finops = {
-    async recordCharge(i) { res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false }); return {}; },
+    async recordCharge(i) { res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false }); return {}; },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },
+    // r62 (I3): conciliación conservadora del reenvío ambiguo (obligatoria: sin ella el worker falla cerrado).
+    async reconcileReservationAsCharged(key, reason, o) {
+      const r = res.get(key);
+      if (!r || r.settled) return { reconciled: false, alreadySettled: true, amount: '0', event: null };
+      Object.assign(r, { settled: true, possibleDuplicate: !!(o && o.metadata && o.metadata.possibleDuplicate), reason });
+      return { reconciled: true, alreadySettled: false, amount: '1', event: null };
+    },
     async settleReservation(key, charge, reason) {
       if (settleFailures > 0) { settleFailures--; throw new Error('db blip'); }
       const r = res.get(key); r.settled = true; r.reason = reason; r.charged = !!charge;
@@ -76,7 +89,7 @@ function fakeWorld(opts = {}) {
 
 function makeApi(w, url, extra = {}) {
   return createServerApi({
-    dataSource: w.ds, finops: w.finops, budget: { guardServerLlmCall: async () => null },
+    dataSource: w.ds, finops: w.finops, budget: { guardServerLlmCall: async () => null, ambiguousResendBudget: async () => ({ fits: true, reason: null, worstItem: 0, worstRun: 0 }) },
     checkpoints: { put: async (p, j) => { w.store.set(p, j); }, get: async (p) => (w.store.has(p) ? w.store.get(p) : null) },
     recordCheckpoint: async (_id, e) => { Object.assign(w.cps, e); return true; },
     apiKey: 'k', baseUrl: url, defaultModel: 'm', idleMs: 3000, totalMs: 10000,
@@ -84,6 +97,8 @@ function makeApi(w, url, extra = {}) {
   }, ITEM, () => ({ callRole: 'main', attempt: 1 }));
 }
 const pending = (w) => [...w.res.values()].filter((v) => !v.settled).length;
+const pdOf = (w) => [...w.res.values()].filter((v) => v.possibleDuplicate).length;
+const unknownOf = (w) => [...w.res.values()].filter((v) => !v.settled || v.possibleDuplicate).length;
 async function err(p) { try { await p; return null; } catch (e) { return e; } }
 
 (async () => {
@@ -109,14 +124,16 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     const e = await err(api('s', 'p504'));
     assert(e && e.pendingReview === true, 'revisión: ' + JSON.stringify(e));
     assert(a.st.requests.length === LLM_UNKNOWN_MAX, 'exactamente 2 pedidos: ' + a.st.requests.length);
-    assert(pending(w) === 2, 'dos reservas pendientes para conciliar');
+    // r62: la 1.ª reserva perdida se liquidó como cobrada (posible duplicado) antes del reenvío; la 2.ª queda para conciliar.
+    assert(unknownOf(w) === 2 && pdOf(w) === 1 && pending(w) === 1, `inciertas ${unknownOf(w)} / posible duplicado ${pdOf(w)} / pendientes ${pending(w)}`);
     await a.close();
   });
   await check('regla por llamada: un desconocido en la llamada A y otro en la B → cada una se reintenta una vez y la parte sigue', async () => {
     const a = await fakeAnthropic((p, n) => (n === 1 ? 'drop' : 'ok'));
     const w = fakeWorld(); const api = makeApi(w, a.url);
     assert((await api('s', 'A')) === 'R:A' && (await api('s', 'B')) === 'R:B', 'ambas completas');
-    assert(a.st.requests.length === 4 && pending(w) === 2, `4 pedidos / 2 pendientes (${a.st.requests.length}/${pending(w)})`);
+    // r62: cada reserva perdida se liquida como cobrada (posible duplicado) antes de su reenvío único: 0 abiertas.
+    assert(a.st.requests.length === 4 && unknownOf(w) === 2 && pdOf(w) === 2 && pending(w) === 0, `4 pedidos / 2 posibles duplicados (${a.st.requests.length}/${pdOf(w)}/${pending(w)})`);
     await a.close();
   });
   await check('I1: llamadas EN VUELO en paralelo no cuentan como desconocidas (huérfanas de un crash + 3 carriles nuevos)', async () => {
@@ -129,10 +146,12 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     assert(pending(w) === 3, 'solo quedan las 3 huérfanas');
     await a.close();
   });
-  await check('tope anti-loop: 4 desconocidos en total en la parte (llamadas distintas) → revisión', async () => {
+  // r62 (I2): el tope es por llamada y por EVENTO (intento): un SEGUNDO evento ambiguo en la ventana → revisión sin llamar;
+  // el tope total (LLM_UNKNOWN_ITEM_MAX) queda solo como respaldo anti-bucle.
+  await check('r62 tope por evento: desconocidos de DOS intentos distintos (dos eventos) en la parte → revisión sin llamar', async () => {
     const a = await fakeAnthropic(() => 'ok');
     const w = fakeWorld();
-    for (let i = 0; i < 4; i++) w.res.set(`reservation:llm:${ITEM.itemRunId}:g1:a1:o${i}`, { tag: `llmw-main-zzzz${i}-1-x`, settled: false });
+    for (let i = 0; i < 2; i++) w.res.set(`reservation:llm:${ITEM.itemRunId}:g1:a${i + 1}:o${i}`, { tag: `llmw-main-zzzz${i}-1-x`, settled: false });
     const e = await err(makeApi(w, a.url)('s', 'nueva'));
     assert(e && e.pendingReview === true && a.st.requests.length === 0, 'revisión sin llamar');
     await a.close();
@@ -178,7 +197,7 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     assert(cachedUserContent('otro', { cachePrefix: orig }) === 'otro' && cachedUserContent(orig) === orig, 'sin cambios si no coincide / sin opciones');
     const a = await fakeAnthropic(() => 'ok');
     const w = fakeWorld(); const api = createServerApi({
-      dataSource: w.ds, finops: w.finops, budget: { guardServerLlmCall: async () => null },
+      dataSource: w.ds, finops: w.finops, budget: { guardServerLlmCall: async () => null, ambiguousResendBudget: async () => ({ fits: true, reason: null, worstItem: 0, worstRun: 0 }) },
       checkpoints: { put: async (p, j) => { w.store.set(p, j); }, get: async (p) => (w.store.has(p) ? w.store.get(p) : null) },
       recordCheckpoint: async (_id, e) => { Object.assign(w.cps, e); return true; },
       apiKey: 'k', baseUrl: a.url, defaultModel: 'm', idleMs: 3000, totalMs: 10000, logger: { log() {}, warn() {}, error() {} }, settleRetryDelaysMs: [0],

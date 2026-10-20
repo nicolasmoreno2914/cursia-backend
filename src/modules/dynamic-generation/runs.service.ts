@@ -79,6 +79,9 @@ import {
   AUTO_HEAL_PERMANENT_SKIPS,
   AutoHealKind,
   autoHealDecision,
+  autoHealFirstAt,
+  autoHealHasExtendedPhase,
+  AUTO_HEAL_EXTENDED_SQL_ROUNDS_CAP,
   autoHealMaxRoundsFor,
   autoHealPolicyFromEnv,
   autoHealRoundsOf,
@@ -89,15 +92,27 @@ import {
   safeAutoRetryDecision,
   AMBIGUOUS_AUDIO_RESUBMIT_CODE,
   AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS,
-  AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD,
   AMBIGUOUS_AUDIO_RESUBMIT_SQL_REGEX,
   AMBIGUOUS_AUDIO_RESUBMIT_TYPES,
+  AmbiguousAudioBudget,
   AmbiguousAudioPending,
   ambiguousAudioResubmitDecision,
 } from './auto-heal';
 // r62 (N2): conciliación automática de Videogen/Gamma con evidencia del proveedor + reenvío acotado.
 import { PROVIDER_RECONCILE_CODE, PROVIDER_RECONCILE_KEY, ProviderReconcileKind, providerReconcileDecision } from './provider-reconcile';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
+import { FinopsLedgerService } from '../finops/finops-ledger.service';
+import { reservationHasConsultableId, settleAmbiguousAsPossibleDuplicate } from '../finops/ambiguous-resend';
+import { spendBlockReason } from '../finops/spend-controls';
+import { SPEND_CONTROL_RESUME_STRATEGY, spendControlHoldOf } from '../reliability/spend-control-hold';
+import {
+  CLAIM_PAYLOAD_DEPENDENCY_REASON,
+  CLAIM_PAYLOAD_DEPENDENCY_STRATEGY,
+  CLAIM_PAYLOAD_RESUME_STRATEGY,
+  ClaimPayloadRow,
+  claimPayloadDependencyKey,
+  claimPayloadRecoveryDecision,
+} from '../reliability/claim-payload-recovery';
 import {
   BUDGET_APPROVAL_REQUIRED,
   USER_AUTHORIZATION_REQUIRED,
@@ -173,7 +188,7 @@ import {
   stopAfterOf,
   stopAfterView,
 } from './stop-after';
-import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned } from '../reliability/attempt-log';
+import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned, relSchemaReady } from '../reliability/attempt-log';
 import { FailureProvider } from '../reliability/failure-classifier';
 import {
   PROVIDER_PROBE_KEY,
@@ -517,6 +532,12 @@ export interface RegenerateItemOptions {
    * item (la generación nueva queda con `regeneration.reason = 'package_repair'`; otra → 409).
    */
   autoRepair?: { code: string };
+  /**
+   * r62 (d8): regeneración AUTOMÁTICA de la dependencia cuyo dato faltó en el claim de `forItemKey`
+   * (claim_payload_unavailable). Una vez por dependencia (la generación nueva queda con
+   * `regeneration.reason = 'claim_payload_dependency'`; otra → 409), con el gate de FinOps de siempre (saldo autorizado).
+   */
+  autoDependency?: { code: string; forItemKey: string };
 }
 
 /** REL MVP: motivo de la generación nueva creada por la reparación automática del empaque. */
@@ -2383,6 +2404,8 @@ export class RunsService {
     resubmitProvider = false,
     auto?: {
       policy: AutoHealPolicy; now?: Date; safe?: boolean; ambiguousAudio?: boolean; maxUsd?: number;
+      /** r62: peor caso del reenvío ambiguo contra lo autorizado (lo calcula el barrido; null = no se pudo evaluar → no). */
+      ambiguousBudget?: AmbiguousAudioBudget | null;
       /** REL CREDIT: sonda del proveedor tras crédito/cuota agotados (canario) o reanudación del resto. */
       providerProbe?: { mode: 'canary' | 'resume'; provider: FailureProvider };
       /**
@@ -2391,6 +2414,10 @@ export class RunsService {
        * (resubmitVideo / resubmitProvider); `repoll` retoma el MISMO job. `state` = output_summary.providerReconcile.
        */
       providerReconcile?: { kind: ProviderReconcileKind; action: 'resubmit' | 'repoll'; ambiguous: boolean; expectError: string; state: Record<string, any> };
+      /** r62 (K3): el control de gasto (kill switch / allow-list) que frenó la parte ya no la frena → reapertura sola. */
+      spendControlResume?: boolean;
+      /** r62 (d8): la dependencia cuyo dato faltó en el claim (claim_payload_unavailable) ya se completó → reapertura sola. */
+      dependencyResolved?: boolean;
     },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
@@ -2402,6 +2429,12 @@ export class RunsService {
     }
     // EV6 DoD BE-B: el ÚNICO reenvío automático permitido es el reintento seguro (`auto.safe`) de un
     // rechazo DEFINITIVO de Videogen sin gasto (videogen_submit_rejected), re-evaluado bajo lock.
+    if (auto?.dependencyResolved && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.spendControlResume || auto.providerReconcile)) {
+      throw new BadRequestException('auto-heal: la reapertura por dependencia resuelta nunca reenvía ni se combina con otro modo automático');
+    }
+    if (auto?.spendControlResume && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.providerReconcile)) {
+      throw new BadRequestException('auto-heal: la reanudación tras un control de gasto nunca reenvía ni se combina con otro modo automático');
+    }
     if (auto?.providerProbe && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio)) {
       throw new BadRequestException('auto-heal: la sonda del proveedor nunca reenvía ni se combina con otro modo automático');
     }
@@ -2507,6 +2540,8 @@ export class RunsService {
       }
     }
 
+    // r62: reservas inciertas del intento previo a liquidar tras un reenvío explícito (resubmitProvider).
+    let resubmitPriorReservations: { keys: string[]; providers: string[]; itemRunId: string } | null = null;
     const targetId = await this.tx(async (qr) => {
       // I1: lock del curso primero — este reintento puede reabrir el run.
       await this.lockCourseRuns(qr, courseId);
@@ -2549,6 +2584,8 @@ export class RunsService {
         // F78-BE2: la generación VIGENTE de cada item (una regeneración
         // fallida se reintenta sobre su propia fila, nunca sobre la histórica).
         `select id, item_key, status, depends_on, type, error, output_summary, finished_at, updated_at, claimed_at,
+                -- r62 (d8): capítulo y generación (dependencia de un claim incompleto).
+                chapter_id, generation,
                 -- REL MVP: clase registrada (R2) sin depender de que la columna exista (esquema tolerado).
                 to_jsonb(g)->>'failure_class' as failure_class
             from public.generation_item_runs g
@@ -2570,7 +2607,10 @@ export class RunsService {
       }
       // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
       // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
-      let autoMeta: { round: number; code: string; pendingUsd?: number | null; kind?: AutoHealKind; strategy?: string } | null = null;
+      let autoMeta: {
+        round: number; code: string; pendingUsd?: number | null; kind?: AutoHealKind; strategy?: string;
+        cause?: string; resendUsd?: number | null; possibleDuplicateKeys?: string[]; extended?: boolean; alert?: boolean;
+      } | null = null;
       // REL CREDIT: estado de la sonda que deja esta reapertura (canario) — null = se borra (cualquier otra reapertura).
       let probeState: Record<string, any> | null = null;
       if (auto && auto.providerProbe) {
@@ -2603,12 +2643,14 @@ export class RunsService {
         autoMeta = { round: plan!.round + (pp.mode === 'canary' ? 1 : 0), code: pp.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY };
       } else if (auto && auto.ambiguousAudio) {
         // #583: misma decisión que el barrido, con la fila bloqueada y lo pendiente del ledger releído acá.
-        const pending = await this.ambiguousAudioPending(qr, target.id, target.output_summary);
-        const d = ambiguousAudioResubmitDecision(target, auto.now ?? new Date(), pending, auto.policy, auto.maxUsd ?? AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD);
+        const pending = await this.ambiguousAudioPending(qr, target.id, target.output_summary, target.type);
+        const d = ambiguousAudioResubmitDecision(target, auto.now ?? new Date(), pending, auto.policy,
+          { budget: auto.ambiguousBudget === undefined ? null : auto.ambiguousBudget, maxUsd: auto.maxUsd ?? null });
         if (d.heal === false) {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible', reason: d.reason });
         }
-        autoMeta = { round: d.round, code: AMBIGUOUS_AUDIO_RESUBMIT_CODE, pendingUsd: d.pendingUsd };
+        autoMeta = { round: d.round, code: AMBIGUOUS_AUDIO_RESUBMIT_CODE, pendingUsd: d.pendingUsd, cause: d.cause,
+          resendUsd: pending.resendUsd ?? null, possibleDuplicateKeys: pending.keys ?? [] };
       } else if (auto && auto.providerReconcile) {
         // r62 (N2): misma decisión que el barrido, con la fila bloqueada; el error tiene que ser el que se concilió.
         const pr = auto.providerReconcile;
@@ -2617,6 +2659,23 @@ export class RunsService {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (provider_reconcile: ${d.heal === false ? d.reason : 'changed'})`, code: 'auto_heal_not_eligible' });
         }
         autoMeta = { round: d.round, code: PROVIDER_RECONCILE_CODE };
+      } else if (auto && auto.dependencyResolved) {
+        // r62 (d8): misma decisión que el barrido, con las filas del run bloqueadas.
+        const depKey = claimPayloadDependencyKey(target as ClaimPayloadRow);
+        const dep = depKey ? (items as any[]).find((i) => i.item_key === depKey) ?? null : null;
+        const d = claimPayloadRecoveryDecision(target as ClaimPayloadRow, dep, this.videoModeOf(job));
+        if (d.action !== 'reopen') {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (claim_payload: ${d.action})`, code: 'auto_heal_not_eligible', reason: d.action });
+        }
+        autoMeta = { round: 0, code: d.code, strategy: CLAIM_PAYLOAD_RESUME_STRATEGY };
+      } else if (auto && auto.spendControlResume) {
+        // r62 (K3): re-evaluado bajo lock — sigue frenado por un control de gasto y ese control YA no lo frena (env vigente).
+        const hold = spendControlHoldOf(target.error, target.type);
+        if (!hold) throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (spend_control: not_held)`, code: 'auto_heal_not_eligible', reason: 'not_held' });
+        if (spendBlockReason(hold.provider ?? 'anthropic')) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (spend_control: still_blocked)`, code: 'auto_heal_not_eligible', reason: 'still_blocked' });
+        }
+        autoMeta = { round: 0, code: hold.code, strategy: SPEND_CONTROL_RESUME_STRATEGY };
       } else if (auto && auto.safe) {
         // BE-B: reintento automático seguro (una vez; solo rechazos probados sin gasto).
         const d = safeAutoRetryDecision(target, auto.now ?? new Date(), auto.policy);
@@ -2629,7 +2688,7 @@ export class RunsService {
         if (d.heal === false) {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible' });
         }
-        autoMeta = { round: d.round, code: d.rule.code, kind: d.kind, strategy: d.strategy };
+        autoMeta = { round: d.round, code: d.rule.code, kind: d.kind, strategy: d.strategy, extended: !!d.extended, alert: !!d.alert };
       }
 
       // I1 (fix wave / review controller ruling: "un retry NO es un resume").
@@ -2685,6 +2744,15 @@ export class RunsService {
           );
         }
         this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
+        // r62 (E2E M): todo reenvío liquida PRIMERO el intento previo — sus reservas inciertas quedan cobradas con la marca
+        // possible_duplicate (después del commit), así nunca queda una reserva abierta con la parte completada.
+        // Integración N1 × N2: con un id consultable (Videogen jobId / Gamma generationId) la reserva la concilia el
+        // barrido de N2 con la evidencia (y su propia reapertura ya la concilió antes): esta vía conservadora no la toca.
+        const prev = await this.ambiguousAudioPending(qr, target.id, target.output_summary, target.type);
+        resubmitPriorReservations = auto?.providerReconcile ? null : {
+          keys: (prev.keys ?? []).filter((k) => !reservationHasConsultableId(k, target.output_summary)),
+          providers: prev.providers, itemRunId: String(target.id),
+        };
         // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
@@ -2746,10 +2814,15 @@ export class RunsService {
       const entryExtra = autoMeta && auto?.providerReconcile
         ? { auto: true, providerReconcile: true, providerReconcileKind: auto.providerReconcile.kind, providerReconcileAction: auto.providerReconcile.action,
             providerReconcileRound: autoMeta.round, possibleDuplicate: auto.providerReconcile.ambiguous, autoHealCode: autoMeta.code }
+        : autoMeta && auto?.dependencyResolved
+        ? { auto: true, dependencyResolved: true, autoHealCode: autoMeta.code, actor: 'system' }
+        : autoMeta && auto?.spendControlResume
+        ? { auto: true, spendControlResume: true, autoHealCode: autoMeta.code, actor: 'system' }
         : autoMeta && auto?.providerProbe
         ? { auto: true, providerProbe: auto.providerProbe.mode, provider: auto.providerProbe.provider, providerProbeRound: autoMeta.round }
         : autoMeta && auto?.ambiguousAudio
-        ? { auto: true, ambiguousAudioResubmit: true, ambiguousAudioResubmitRound: autoMeta.round, autoHealCode: autoMeta.code, pendingUsd: autoMeta.pendingUsd ?? null }
+        ? { auto: true, ambiguousAudioResubmit: true, ambiguousAudioResubmitRound: autoMeta.round, autoHealCode: autoMeta.code, pendingUsd: autoMeta.pendingUsd ?? null,
+            cause: autoMeta.cause ?? null, actor: 'system' }
         : autoMeta && auto?.safe
         ? { auto: true, safeAutoRetry: true, safeAutoRetryRound: autoMeta.round, autoHealCode: autoMeta.code }
         : autoMeta
@@ -2760,11 +2833,19 @@ export class RunsService {
         // Un reenvío es un job NUEVO: el re-poll gratis del auto-healer vuelve a empezar (repoll conserva sus rondas).
         ? { [PROVIDER_RECONCILE_KEY]: auto.providerReconcile.state,
             ...(auto.providerReconcile.action === 'resubmit' ? { autoHeal: { rounds: 0, regenRounds: autoRegenRoundsOf(target.output_summary), lastAt: nowIso, resetBy: PROVIDER_RECONCILE_CODE } } : {}) }
+        : autoMeta && auto?.dependencyResolved
+        ? { claimPayloadRecovery: { ...(target.output_summary?.claimPayloadRecovery ?? {}),
+            reopens: Math.max(0, Math.floor(Number(target.output_summary?.claimPayloadRecovery?.reopens ?? 0)) || 0) + 1, lastAt: nowIso, lastCode: autoMeta.code } }
+        : autoMeta && auto?.spendControlResume
+        ? { spendControlResume: { count: Math.max(0, Math.floor(Number(target.output_summary?.spendControlResume?.count ?? 0)) || 0) + 1, lastAt: nowIso, lastCode: autoMeta.code } }
         : autoMeta && auto?.providerProbe
         ? (probeState ? { [PROVIDER_PROBE_KEY]: probeState } : {})
         : autoMeta && auto?.ambiguousAudio
         ? { ambiguousAudioResubmit: { rounds: autoMeta.round, lastAt: nowIso, pendingUsd: autoMeta.pendingUsd ?? null,
-            maxUsd: auto.maxUsd ?? AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD, maxRounds: AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS } }
+            // r62: causa, cota del reenvío, peor caso contra lo autorizado y las reservas liquidadas como posible duplicado.
+            cause: autoMeta.cause ?? null, resendUsd: autoMeta.resendUsd ?? null, possibleDuplicateKeys: autoMeta.possibleDuplicateKeys ?? [],
+            budget: auto.ambiguousBudget ?? null, ...(typeof auto.maxUsd === 'number' ? { maxUsd: auto.maxUsd } : {}),
+            maxRounds: AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS } }
         : autoMeta && auto?.safe
         ? { safeAutoRetry: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: SAFE_AUTO_RETRY_MAX_ROUNDS } }
         : autoMeta
@@ -2773,6 +2854,10 @@ export class RunsService {
             ? { autoHeal: {
                 rounds: autoMeta.kind === 'B' ? autoHealRoundsOf(target.output_summary) : autoMeta.round,
                 regenRounds: autoMeta.kind === 'B' ? autoMeta.round : autoRegenRoundsOf(target.output_summary),
+                // r62 (d2): inicio de la recuperación automática (ventana total de la clase A) y alerta previa.
+                firstAt: target.output_summary?.autoHeal?.firstAt ?? autoHealFirstAt(target.output_summary ?? {}, null)?.toISOString() ?? nowIso,
+                ...(autoMeta.extended ? { extended: true } : {}),
+                ...(autoMeta.alert ? { alertAt: target.output_summary?.autoHeal?.alertAt ?? nowIso } : {}),
                 lastAt: nowIso, lastCode: autoMeta.code, lastClass: autoMeta.kind, lastStrategy: autoMeta.strategy,
                 maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy), regenMaxRounds: auto!.policy.regenMaxRounds ?? 0 } }
             : { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } })
@@ -2810,12 +2895,15 @@ export class RunsService {
       }
       // REL R2: la reapertura queda en el log de intentos (misma transacción; no-op sin esquema).
       await recordItemReopened(qr, target.id, {
-        // r62 (N2): la conciliación de proveedor la decide el sistema (no el auto-healer por clase).
-        actor: auto?.providerReconcile ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
+        // r62 (regla 5): todo REENVÍO automático a un proveedor queda con actor `system` y su motivo (strategy); la
+        // conciliación de proveedor (N2) también la decide el sistema.
+        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
         // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
         strategy: auto?.providerReconcile ? `${PROVIDER_RECONCILE_CODE}_${auto.providerReconcile.action}:${auto.providerReconcile.kind}`
+          : auto?.dependencyResolved ? CLAIM_PAYLOAD_RESUME_STRATEGY
+          : auto?.spendControlResume ? `${SPEND_CONTROL_RESUME_STRATEGY}:${autoMeta?.code ?? ''}`.slice(0, 64)
           : auto?.providerProbe ? (auto.providerProbe.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY)
-          : auto?.ambiguousAudio ? 'ambiguous_audio_resubmit' : auto?.safe ? 'safe_auto_retry'
+          : auto?.ambiguousAudio ? `ambiguous_audio_resubmit:${autoMeta?.cause ?? 'connection_cut'}` : auto?.safe ? 'safe_auto_retry'
           : auto && auto.policy.classAware && autoMeta?.strategy ? `auto_heal_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}`
           : auto ? 'auto_heal'
           : resubmitVideo ? 'manual_resubmit_video' : resubmitProvider ? 'manual_resubmit_provider' : 'manual_retry',
@@ -2863,6 +2951,13 @@ export class RunsService {
       return target.id;
     });
 
+    const prior = resubmitPriorReservations as { keys: string[]; providers: string[]; itemRunId: string } | null;
+    if (prior && prior.keys.length) {
+      const r = await settleAmbiguousAsPossibleDuplicate(this.recoveryLedger(), prior.keys, {
+        provider: prior.providers.join(',') || 'unknown', cause: auto?.ambiguousAudio ? 'connection_cut' : 'manual_resubmit', itemRunId: prior.itemRunId, itemKey, runId: job.id,
+      }, auto ? 'system' : String(actorId));
+      if (r.failed.length) this.logger.warn(`retryItem: no se pudo liquidar ${r.failed.map((f) => f.key).join(', ')} del intento previo de ${itemKey} (${r.failed[0].error}); siguen contadas como gasto`);
+    }
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
     return this.toItemDto(row, frozenDelivery);
   }
@@ -2954,7 +3049,9 @@ export class RunsService {
           limit $11`,
         [
           now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), allowRegex, AUTO_HEAL_SQL_DENY_REGEX,
-          [...AUTO_HEAL_WORKER_ITEM_TYPES], policy.maxRounds, policy.browserMaxRounds, backoffs,
+          // r62 (d2): con fase extendida el tope de rondas no corta la clase A (la acota el tiempo total, en JS).
+          [...AUTO_HEAL_WORKER_ITEM_TYPES], autoHealHasExtendedPhase(policy) ? AUTO_HEAL_EXTENDED_SQL_ROUNDS_CAP : policy.maxRounds,
+          autoHealHasExtendedPhase(policy) ? AUTO_HEAL_EXTENDED_SQL_ROUNDS_CAP : policy.browserMaxRounds, backoffs,
           cursor ? cursor.finishedUs : null, cursor ? cursor.id : null, pageSize, now.getTime(), !!policy.classAware,
         ],
       );
@@ -2986,6 +3083,11 @@ export class RunsService {
       result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
       // REL MVP: motivo permanente para ESTE error → marca (md5 del error) y el SQL deja de seleccionarlo
       // hasta que el item vuelva a fallar con otro error. Solo si sigue igual (nunca pisa un item que cambió).
+      // r62 (d2): la ventana TOTAL de la clase A se agotó → excepción registrada (attention_reason explícito).
+      if (d.reason === 'recovery_window_exhausted') {
+        await this.recordAttention(r.id, 'unrecoverable');
+        this.logger.error(`auto-heal: ${r.item_key} (run ${r.job_id}) agotó la ventana de recuperación automática (${policy.classATotalHours} h): queda como excepción para un humano; error: ${String(r.error ?? '').slice(0, 200)}`);
+      }
       if (policy.classAware && AUTO_HEAL_PERMANENT_SKIPS.includes(d.reason)) {
         await this.dataSource.query(
           `update public.generation_item_runs
@@ -3000,7 +3102,11 @@ export class RunsService {
     try {
       await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now });
       this.autoHealLastSkip.delete(r.id);
-      result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round, kind: d.kind, strategy: d.strategy });
+      result.reopened.push({ runId: r.job_id, itemKey: r.item_key, code: d.rule.code, round: d.round, kind: d.kind, strategy: d.strategy,
+        ...(d.extended ? { extended: true } : {}), ...(d.alert ? { alert: true } : {}) });
+      if (d.alert) {
+        this.logger.error(`auto-heal: ALERTA — ${r.item_key} (run ${r.job_id}) lleva más de ${policy.classAAlertHours} h de recuperación automática (ronda ${d.round}); se agota a las ${policy.classATotalHours} h`);
+      }
       this.logger.warn(
         `auto-heal: reabierto ${r.item_key} (run ${r.job_id}) — ${policy.classAware ? `clase ${d.kind} (${d.strategy}), ` : ''}` +
           `ronda ${d.round}/${d.kind === 'B' ? policy.regenMaxRounds ?? 0 : autoHealMaxRoundsFor(r.type, policy)}, ` +
@@ -3030,6 +3136,162 @@ export class RunsService {
         this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) no se reabre automáticamente (${code}): ${msg.slice(0, 300)}`);
       }
     }
+  }
+
+  /**
+   * r62 (d8) — barrido de `claim_payload_unavailable` (reliability/claim-payload-recovery.ts), mismo tick que el
+   * auto-healer. Por cada parte `failed` porque su claim no se pudo armar con el dato de su dependencia:
+   *  - dependencia (re)completada después del fallo → la parte se reabre sola (retryItem auto.dependencyResolved, sin gasto);
+   *  - dependencia completada con el dato inutilizable → se regenera UNA vez (regenerateItem autoDependency, con el gate de
+   *    FinOps de siempre: dentro del saldo autorizado; la cascada regenera también a la parte);
+   *  - si ya se regeneró, el presupuesto no alcanza o el código es de contrato → excepción registrada (attention_reason).
+   * Cada parte se marca en output_summary.claimPayloadRecovery (declined = no se vuelve a evaluar).
+   */
+  async autoRecoverClaimPayloadUnavailable(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number } = {},
+  ): Promise<{ candidates: number; reopened: string[]; regenerated: string[]; waiting: string[]; exceptions: Array<{ itemKey: string; reason: string }> }> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const now = opts.now ?? new Date();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const out = { candidates: 0, reopened: [] as string[], regenerated: [] as string[], waiting: [] as string[], exceptions: [] as Array<{ itemKey: string; reason: string }> };
+    if (!policy.classAware) return out;
+    const rows: Array<{ id: string; job_id: string; item_key: string; type: string; chapter_id: string | null; error: string | null; output_summary: Record<string, any> | null;
+      finished_at: Date; course_id: number; owner_id: string; blueprint_number: number; input_payload: Record<string, any> | null }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.chapter_id, g.error, g.output_summary, g.finished_at, pj.course_id, pj.owner_id, b.blueprint_number, pj.input_payload
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
+          and g.status = 'failed'
+          and ${latestGenerationPredicate('g')}
+          and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+          and g.error like 'claim_payload_unavailable:%'
+          and not coalesce(g.output_summary->'claimPayloadRecovery' ? 'declined', false)
+        order by g.finished_at desc, g.id desc
+        limit $3`,
+      [now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), limit],
+    );
+    out.candidates = rows.length;
+    const decline = async (r: { id: string; item_key: string }, reason: string, attention: 'budget' | 'product_bug' | 'unrecoverable') => {
+      await this.dataSource.query(
+        `update public.generation_item_runs
+            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('claimPayloadRecovery',
+                  coalesce(output_summary->'claimPayloadRecovery', '{}'::jsonb) || jsonb_build_object('declined', $2::text, 'declinedAt', $3::text))
+          where id = $1 and status = 'failed'`,
+        [r.id, reason.slice(0, 100), now.toISOString()],
+      ).catch((e) => this.logger.warn(`claim incompleto: no se pudo registrar la excepción de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
+      await this.recordAttention(r.id, attention);
+      out.exceptions.push({ itemKey: r.item_key, reason });
+    };
+    for (const r of rows) {
+      const depKey = claimPayloadDependencyKey(r);
+      const [dep] = depKey
+        ? await this.dataSource.query(
+          `select item_key, status, generation, output_summary, finished_at from public.generation_item_runs
+            where job_id = $1 and item_key = $2 order by generation desc limit 1`, [r.job_id, depKey])
+        : [];
+      const d = claimPayloadRecoveryDecision(r, dep ?? null, this.videoModeOf(r));
+      try {
+        if (d.action === 'wait') { out.waiting.push(r.item_key); continue; }
+        if (d.action === 'exception') {
+          await decline(r, d.reason, d.reason === 'contract' ? 'product_bug' : 'unrecoverable');
+          if (d.reason === 'real_video_requires_review') {
+            this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) — video REAL: nunca se repaga un render automáticamente; queda para un admin (${d.code})`);
+          }
+          this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) queda como excepción (${d.reason}, ${d.code})`);
+          continue;
+        }
+        if (d.action === 'reopen') {
+          await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now, dependencyResolved: true });
+          out.reopened.push(r.item_key);
+          this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) reabierto solo (dependencia ${d.depKey} resuelta)`);
+          continue;
+        }
+        await this.regenerateItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), r.job_id, d.depKey,
+          { confirmPaid: true, autoDependency: { code: d.code, forItemKey: r.item_key } });
+        out.regenerated.push(d.depKey);
+        this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) — dependencia ${d.depKey} regenerada UNA vez (${d.code}), dentro del presupuesto autorizado`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        const status = (err as { getStatus?: () => number })?.getStatus?.();
+        // Presupuesto insuficiente / ya regenerada → excepción registrada; carreras o infraestructura → próximo tick.
+        if (/budget|presupuesto/i.test(code)) await decline(r, `budget:${code}`, 'budget');
+        else if (code === 'auto_dependency_not_eligible') await decline(r, 'already_regenerated', 'unrecoverable');
+        else if (typeof status === 'number' && status >= 400 && status < 500 && code !== 'auto_heal_not_eligible') await decline(r, code, 'unrecoverable');
+        this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) no se recuperó solo (${code})`);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * r62 (K3) — barrido de reanudación tras un CONTROL DE GASTO (mismo tick que el auto-healer). Las partes `failed`
+   * frenadas por el kill switch o la allow-list de proveedores de FinOps (reliability/spend-control-hold.ts; 0 gasto)
+   * esperan; en cuanto el control vigente (env de este proceso, leído en cada tick) ya no frena su proveedor, se reabren
+   * con retryItem(auto.spendControlResume): locks, re-evaluación bajo lock, gate de FinOps en simulación, sin consumir
+   * rondas del auto-healer; sus dependientes bloqueados se desbloquean en la misma transacción. Ventana: 7 días (el
+   * tope de la ventana del auto-healer), solo la ejecución vigente del curso.
+   */
+  async autoResumeSpendControlHolds(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number } = {},
+  ): Promise<{ candidates: number; resumed: Array<{ runId: string; itemKey: string; code: string }>; waiting: Array<{ runId: string; itemKey: string; code: string }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const now = opts.now ?? new Date();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 100));
+    const out = { candidates: 0, resumed: [] as Array<{ runId: string; itemKey: string; code: string }>, waiting: [] as Array<{ runId: string; itemKey: string; code: string }>, skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
+    if (!policy.classAware) return out; // kill-switch de la recuperación (DYNAMIC_AUTO_HEAL_POLICY=legacy)
+    const rows: Array<{ id: string; job_id: string; item_key: string; type: string; error: string | null; course_id: number; owner_id: string; blueprint_number: number }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.error, pj.course_id, pj.owner_id, b.blueprint_number
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
+          and g.status = 'failed'
+          and ${latestGenerationPredicate('g')}
+          and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+          and g.error ~ '(finops_kill_switch|FINOPS_KILL_SWITCH|provider_not_allowed|FINOPS_PROVIDER_ALLOWLIST)'
+        order by g.finished_at desc, g.id desc
+        limit $3`,
+      [now.toISOString(), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max * 3600, limit],
+    );
+    out.candidates = rows.length;
+    for (const r of rows) {
+      const hold = spendControlHoldOf(r.error, r.type);
+      if (!hold) { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'not_held' }); continue; }
+      // Mismo env que la re-evaluación bajo lock de retryItem (el del proceso de la API, leído en cada tick).
+      if (spendBlockReason(hold.provider ?? 'anthropic')) { out.waiting.push({ runId: r.job_id, itemKey: r.item_key, code: hold.code }); continue; }
+      try {
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now, spendControlResume: true });
+        out.resumed.push({ runId: r.job_id, itemKey: r.item_key, code: hold.code });
+        this.logger.warn(`control de gasto revertido: ${r.item_key} (run ${r.job_id}) reabierto solo (${hold.code}, ${hold.provider ?? '?'})`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+        this.logger.warn(`control de gasto revertido: ${r.item_key} (run ${r.job_id}) no se pudo reabrir (${code}); se reintenta en el próximo tick`);
+      }
+    }
+    if (out.resumed.length || out.skipped.length) {
+      this.logger.log(`control de gasto: candidatos ${out.candidates}, reabiertos ${out.resumed.length}, esperando ${out.waiting.length}, omitidos ${out.skipped.length}`);
+    }
+    return out;
   }
 
   /**
@@ -3264,39 +3526,91 @@ export class RunsService {
   }
 
   /**
-   * #583 — lo pendiente (reservas reales sin liquidar) de un item en el ledger, de los intentos que todavía
-   * no se reconocieron, por proveedor. Es lo que costaría repetir la operación incierta.
+   * #583 / r62 — lo INCIERTO de un item en el ledger (intentos todavía no reconocidos): reservas sin liquidar, o ya
+   * liquidadas por el sistema como `charged` + `possible_duplicate` para un reenvío que todavía no se reabrió (una
+   * carrera / reinicio entre la liquidación y la reapertura no pierde el caso). `resendUsd` = cota de lo que se vuelve
+   * a pagar: el audiolibro reutiliza sus segmentos guardados (= lo incierto); la bienvenida repite el último intento
+   * entero (sus trozos no se guardan por separado: lo incierto + los trozos ya cobrados de ese intento).
    */
   private async ambiguousAudioPending(
     q: { query: (sql: string, params?: any[]) => Promise<any> },
     itemRunId: string,
     outputSummary: Record<string, any> | null,
+    itemType?: string | null,
   ): Promise<AmbiguousAudioPending> {
-    const ack = Number(outputSummary?.reconciliationAcknowledgedThroughAttempt ?? 0);
-    const rows: Array<{ provider: string; amount: string }> = await q.query(
-      `select e.provider, coalesce(sum(e.amount), 0)::text as amount
+    const ackRaw = Number(outputSummary?.reconciliationAcknowledgedThroughAttempt ?? 0);
+    const ack = Number.isFinite(ackRaw) ? Math.floor(ackRaw) : 0;
+    const rows: Array<{ key: string; provider: string; amount: string }> = await q.query(
+      `select e.idempotency_key as key, e.provider, e.amount::text as amount
          from public.generation_cost_events e
         where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock'
           and coalesce((e.metadata->>'reservation') = 'true', false)
           and coalesce(e.attempt, 0) > $2::int
-          and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
-        group by e.provider`,
-      [itemRunId, Number.isFinite(ack) ? Math.floor(ack) : 0],
+          and (not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
+               or exists (select 1 from public.generation_cost_events a
+                           where a.corrects_event_id = e.id and a.event_kind = 'ADJUSTMENT'
+                             and coalesce(a.metadata->>'possibleDuplicate', '') = 'true'))
+        order by e.created_at, e.id`,
+      [itemRunId, ack],
     );
+    const pendingUsd = rows.reduce((t, r) => t + Number(r.amount || 0), 0);
+    let resendUsd = pendingUsd;
+    if (itemType === 'audio_welcome' && rows.length > 0) {
+      const [paid] = await q.query(
+        `select coalesce(sum(e.amount), 0)::text as t from public.generation_cost_events e
+          where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock' and e.provider = 'openai'
+            and not coalesce((e.metadata->>'reservation') = 'true', false)
+            and coalesce(e.attempt, 0) > $2::int`,
+        [itemRunId, ack],
+      );
+      resendUsd += Number(paid?.t ?? 0) || 0;
+    }
     return {
-      pendingUsd: rows.reduce((t, r) => t + Number(r.amount || 0), 0),
-      providers: rows.map((r) => String(r.provider)).sort(),
+      pendingUsd,
+      providers: [...new Set(rows.map((r) => String(r.provider)))].sort(),
+      keys: rows.map((r) => String(r.key)),
+      resendUsd,
     };
   }
 
+  /** r62: peor caso del reenvío ambiguo de un audio contra lo autorizado. null = FinOps no disponible (no se reenvía). */
+  private async ambiguousAudioBudget(runId: string, itemRunId: string, resendUsd: number): Promise<AmbiguousAudioBudget | null> {
+    if (!this.finopsBudget || typeof this.finopsBudget.ambiguousResendBudget !== 'function') return null;
+    try {
+      const b = await this.finopsBudget.ambiguousResendBudget({ runId, itemRunId, nextCost: resendUsd, authorization: 'paid' });
+      return { fits: b.fits, reason: b.reason, worstItem: b.worstItem, worstRun: b.worstRun, itemHardLimit: b.itemHardLimit, authorizedBudget: b.authorizedBudget };
+    } catch (err) {
+      this.logger.warn(`reenvío de audio incierto: no se pudo evaluar el presupuesto (${err instanceof Error ? err.message : String(err)}); se reintenta en el próximo tick`);
+      return null;
+    }
+  }
+
+  /** r62: ledger para la liquidación conservadora `possible_duplicate` (sin cambiar la inyección del servicio). */
+  private recoveryLedger(): FinopsLedgerService {
+    this.recoveryLedgerInstance ??= new FinopsLedgerService(this.dataSource);
+    return this.recoveryLedgerInstance;
+  }
+  private recoveryLedgerInstance: FinopsLedgerService | null = null;
+
+  /** r62: la excepción queda registrada con un attention_reason explícito (no-op sin el esquema REL R2). */
+  private async recordAttention(itemRunId: string, reason: 'budget' | 'config' | 'duplicate_charge' | 'unrecoverable' | 'product_bug'): Promise<void> {
+    try {
+      if (!(await relSchemaReady(this.dataSource))) return;
+      await this.dataSource.query(`update public.generation_item_runs set attention_reason = $2 where id = $1 and status in ('failed', 'blocked')`, [itemRunId, reason]);
+    } catch (err) {
+      this.logger.warn(`no se pudo registrar attention_reason=${reason} de ${itemRunId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /**
-   * #583 (decisión del usuario 2026-10-02) — barrido del reenvío automático ÚNICO de un audio con
-   * resultado incierto (mismo tick que el auto-healer). Solo audio_welcome / audiobook_chapter con
-   * `provider_reconciliation_required: openai …`, recientes, de la ejecución vigente, sin su reenvío
-   * usado ni rechazado, y con lo pendiente del item ≤ AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD. Pasa por
-   * retryItem(auto.ambiguousAudio, resubmitProvider): locks, decisión re-evaluada con el ledger bajo lock,
-   * gate de FinOps en simulación (presupuesto YA autorizado) y, en el worker, el runtime guard. Lo que no
-   * califica (sobre el tope, otro proveedor pendiente, FinOps lo rechaza…) queda `declined` → admin.
+   * #583 + r62 (regla de ambigüedad acotada, punto 3) — barrido del reenvío automático ÚNICO de un audio con resultado
+   * incierto (mismo tick que el auto-healer). Solo audio_welcome / audiobook_chapter con
+   * `provider_reconciliation_required: openai …` (corte de conexión o TIMEOUT del cliente), recientes, de la ejecución
+   * vigente, sin su reenvío usado ni rechazado. Antes de reabrir: el peor caso (lo gastado por la parte con la reserva
+   * perdida + la reserva del reenvío) tiene que entrar en el presupuesto de recuperación de la parte y en el saldo
+   * autorizado del run; la reserva perdida se liquida como `charged` + `possible_duplicate` (actor system). Pasa por
+   * retryItem(auto.ambiguousAudio, resubmitProvider): locks, decisión re-evaluada con el ledger bajo lock, gate de FinOps
+   * en simulación y, en el worker, el runtime guard. Lo que no califica queda `declined` con attention_reason explícito.
    */
   async autoResubmitAmbiguousAudio(
     opts: { policy?: AutoHealPolicy; now?: Date; limit?: number; maxUsd?: number } = {},
@@ -3304,7 +3618,7 @@ export class RunsService {
     const policy = opts.policy ?? autoHealPolicyFromEnv();
     const now = opts.now ?? new Date();
     const limit = Math.max(1, Math.floor(opts.limit ?? 50));
-    const maxUsd = typeof opts.maxUsd === 'number' && opts.maxUsd >= 0 ? opts.maxUsd : AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD;
+    const maxUsd = typeof opts.maxUsd === 'number' && opts.maxUsd >= 0 ? opts.maxUsd : null;
     const result = { candidates: 0, resubmitted: [] as Array<{ runId: string; itemKey: string; pendingUsd: number | null }>, skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
     const rows: Array<{
       id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
@@ -3337,50 +3651,71 @@ export class RunsService {
         AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, limit, [...AMBIGUOUS_AUDIO_RESUBMIT_TYPES]],
     );
     result.candidates = rows.length;
-    const decline = async (r: { id: string; item_key: string }, reason: string, pendingUsd: number | null) => {
+    const decline = async (r: { id: string; item_key: string }, reason: string, pendingUsd: number | null, budget?: AmbiguousAudioBudget | null) => {
       try {
         await this.dataSource.query(
           `update public.generation_item_runs
               set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('ambiguousAudioResubmit',
-                    coalesce(output_summary->'ambiguousAudioResubmit', '{}'::jsonb) || jsonb_build_object('declined', $2::text, 'declinedAt', $3::text, 'pendingUsd', $4::numeric, 'maxUsd', $5::numeric))
+                    coalesce(output_summary->'ambiguousAudioResubmit', '{}'::jsonb) || jsonb_build_object('declined', $2::text, 'declinedAt', $3::text, 'pendingUsd', $4::numeric, 'maxUsd', $5::numeric, 'budget', $6::jsonb))
             where id = $1 and status = 'failed'`,
-          [r.id, reason.slice(0, 100), now.toISOString(), pendingUsd, maxUsd],
+          [r.id, reason.slice(0, 100), now.toISOString(), pendingUsd, maxUsd, JSON.stringify(budget ?? null)],
         );
       } catch (e) {
         this.logger.warn(`reenvío de audio incierto: no se pudo registrar el rechazo de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`);
       }
+      // r62: excepción (c) registrada con su motivo (presupuesto vs. riesgo de cobro duplicado).
+      await this.recordAttention(r.id, /budget|presupuesto|over_threshold/i.test(reason) ? 'budget' : 'duplicate_charge');
     };
     for (const r of rows) {
-      const pending = await this.ambiguousAudioPending(this.dataSource, r.id, r.output_summary);
-      const d = ambiguousAudioResubmitDecision(r, now, pending, policy, maxUsd);
+      const pending = await this.ambiguousAudioPending(this.dataSource, r.id, r.output_summary, r.type);
+      // Solo se evalúa el presupuesto cuando el resto de la decisión ya califica (sin consultas de FinOps de más).
+      const pre = ambiguousAudioResubmitDecision(r, now, pending, policy, { maxUsd, budget: { fits: true, reason: null } });
+      const budget = pre.heal ? await this.ambiguousAudioBudget(r.job_id, r.id, pending.resendUsd ?? pending.pendingUsd) : undefined;
+      const d = pre.heal ? ambiguousAudioResubmitDecision(r, now, pending, policy, { maxUsd, budget: budget ?? null }) : pre;
       if (d.heal === false) {
-        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
-        // Lo que nunca va a calificar queda para un admin YA (sin re-evaluarlo en cada tick).
-        if (d.reason === 'over_threshold' || d.reason === 'missing_precondition' || d.reason === 'denied' || d.reason === 'timeout_likely_charged') {
-          await decline(r, d.reason, d.pendingUsd ?? null);
-          this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía solo (${d.reason}, pendiente USD ${d.pendingUsd ?? '?'}); queda para un admin`);
+        // FinOps no disponible (budget null por error): transitorio → se re-evalúa en el próximo tick.
+        if (d.reason === 'over_budget' && budget === null) {
+          result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'budget_unavailable' });
+          continue;
+        }
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason === 'over_budget' ? `over_budget:${d.budgetReason ?? '?'}` : d.reason });
+        // Lo que nunca va a calificar queda registrado YA como excepción (sin re-evaluarlo en cada tick).
+        if (d.reason === 'over_threshold' || d.reason === 'over_budget' || d.reason === 'missing_precondition' || d.reason === 'denied') {
+          await decline(r, d.reason === 'over_budget' ? `over_budget:${d.budgetReason ?? '?'}` : d.reason, d.pendingUsd ?? null, budget);
+          this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía solo (${d.reason}${d.reason === 'over_budget' ? `: ${d.budgetReason}` : ''}, incierto USD ${d.pendingUsd ?? '?'}); excepción registrada`);
         }
         continue;
       }
+      // Regla 3: la reserva perdida se liquida como cobrada (conservador) con la marca possible_duplicate ANTES de reabrir.
+      // Idempotente: un tick que se repite (carrera / reinicio) la encuentra ya liquidada y sigue.
+      const settled = await settleAmbiguousAsPossibleDuplicate(this.recoveryLedger(), pending.keys ?? [], {
+        provider: 'openai', cause: d.cause, itemRunId: r.id, itemKey: r.item_key, runId: r.job_id,
+      });
+      if (settled.failed.length) {
+        this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) — no se pudo liquidar ${settled.failed.map((f) => f.key).join(', ')} (${settled.failed[0].error}); se reintenta en el próximo tick`);
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'settle_failed' });
+        continue;
+      }
       try {
-        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, true, { policy, now, ambiguousAudio: true, maxUsd });
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, true,
+          { policy, now, ambiguousAudio: true, ...(maxUsd !== null ? { maxUsd } : {}), ambiguousBudget: budget ?? null });
         result.resubmitted.push({ runId: r.job_id, itemKey: r.item_key, pendingUsd: d.pendingUsd });
-        this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) — UN reenvío automático (pendiente USD ${d.pendingUsd} ≤ ${maxUsd}); la reserva incierta queda contada`);
+        this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) — UN reenvío automático (${d.cause}; incierto USD ${d.pendingUsd} liquidado como posible duplicado; peor caso dentro de lo autorizado)`);
       } catch (err) {
         const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
         const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
         result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
         // Una carrera (otro tick/retry lo cambió: espera, ya no failed) o una falla de infraestructura
         // (DB/lock/timeout, FinOps no disponible, 5xx) se re-evalúa en el próximo tick (fix round 1, M5): solo
-        // un rechazo DEFINITIVO (presupuesto, tope, precondición, run reemplazado…) lo deja para un admin.
+        // un rechazo DEFINITIVO (presupuesto, tope, precondición, run reemplazado…) lo deja como excepción.
         // La ventana de edad (maxAgeHours) sigue acotando los reintentos.
         const status = (err as { getStatus?: () => number })?.getStatus?.();
         const transient = code === 'backoff' || code === 'not_failed' || code === 'auto_heal_not_eligible' ||
           /unavailable|timeout|ECONN|EMAXCONN|deadlock|lock|QueryFailed|Connection|InternalServerError|Error$/i.test(code) ||
           (typeof status === 'number' && status >= 500) || typeof status !== 'number';
         if (transient) continue;
-        await decline(r, code, d.pendingUsd);
-        this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía (${code}); queda para un admin`);
+        await decline(r, code, d.pendingUsd, budget);
+        this.logger.warn(`reenvío de audio incierto: ${r.item_key} (run ${r.job_id}) no se reenvía (${code}); excepción registrada`);
       }
     }
     if (rows.length) {
@@ -3684,6 +4019,13 @@ export class RunsService {
         `select output_summary from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [job.id, itemKey]);
       if (latest?.output_summary?.regeneration?.reason === PACKAGE_REPAIR_REASON) throw notEligible('ya se reparó una vez');
     }
+    if (o.autoDependency) {
+      const [latestDep] = await this.dataSource.query(
+        `select output_summary from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [job.id, itemKey]);
+      if (latestDep?.output_summary?.regeneration?.reason === CLAIM_PAYLOAD_DEPENDENCY_REASON) {
+        throw new ConflictException({ message: `auto_dependency_not_eligible: "${itemKey}" (ya se regeneró una vez por un claim incompleto)`, code: 'auto_dependency_not_eligible', reason: 'already_regenerated' });
+      }
+    }
     if (costKind !== 'none' && o.confirmPaid !== true && !o.autoRepair) {
       throw new BadRequestException({
         message:
@@ -3742,8 +4084,9 @@ export class RunsService {
       return this.applyRegeneration(qr, plan, {
         job: locked, manifest, itemKey, mItem, ownerId, costKind,
         // REL R2 (M4): la generación nueva queda en el log de intentos como reapertura (dueño o admin).
-        attemptActor: o.autoRepair ? 'recovery' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : 'owner',
+        attemptActor: o.autoDependency ? 'system' : o.autoRepair ? 'recovery' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : 'owner',
         autoRepair: o.autoRepair,
+        autoDependency: o.autoDependency,
       });
     });
 
@@ -3944,7 +4287,7 @@ export class RunsService {
     qr: QueryRunner,
     plan: RegenerationPlan,
     a: { job: any; manifest: ManifestDto; itemKey: string; mItem: { type: string }; ownerId: string; costKind: RegenerationCostKind; attemptActor?: AttemptActor;
-      autoRepair?: { code: string } },
+      autoRepair?: { code: string }; autoDependency?: { code: string; forItemKey: string } },
   ): Promise<{ kind: 'created'; itemRunId: string; previousItemRunId: string; previousGeneration: number; affected: RegenerationAffectedItem[] }> {
     const { job, manifest, itemKey, ownerId, costKind } = a;
     const latest = plan.latest;
@@ -3964,8 +4307,10 @@ export class RunsService {
       await recordItemReopened(qr, row.id, {
         actor: a.attemptActor ?? 'owner',
         strategy: regeneration.reason === PACKAGE_REPAIR_REASON ? 'package_repair:regenerate_targeted'
+          : regeneration.reason === CLAIM_PAYLOAD_DEPENDENCY_REASON ? CLAIM_PAYLOAD_DEPENDENCY_STRATEGY
           : String(regeneration.reason).startsWith('cascade_from_') ? 'regenerate_cascade' : 'regenerate',
-        automatic: regeneration.reason === PACKAGE_REPAIR_REASON,
+        automatic: regeneration.reason === PACKAGE_REPAIR_REASON || regeneration.reason === CLAIM_PAYLOAD_DEPENDENCY_REASON
+          || (!!a.autoDependency && String(regeneration.reason).startsWith('cascade_from_')),
       });
       // Fix wave M4 (tabla de Fase 8, fila REGENERATE): la salida de la
       // generación anterior pasa a stale con motivo — solo status + metadata
@@ -3986,8 +4331,9 @@ export class RunsService {
     const primary = await insertGeneration(latest, itemKey, {
       fromItemRunId: latest.id,
       fromGeneration: Number(latest.generation),
-      reason: a.autoRepair ? PACKAGE_REPAIR_REASON : plan.stale ? 'stale_no_auto' : 'user_requested',
+      reason: a.autoRepair ? PACKAGE_REPAIR_REASON : a.autoDependency ? CLAIM_PAYLOAD_DEPENDENCY_REASON : plan.stale ? 'stale_no_auto' : 'user_requested',
       ...(a.autoRepair ? { packageRepairCode: a.autoRepair.code } : {}),
+      ...(a.autoDependency ? { claimPayloadCode: a.autoDependency.code, forItemKey: a.autoDependency.forItemKey } : {}),
       staleArtifactIds: plan.staleArtifactIds,
       costKind,
       requestedBy: ownerId,

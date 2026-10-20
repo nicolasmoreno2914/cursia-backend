@@ -71,12 +71,20 @@ async function fakeAnthropic(opts = {}) {
 function world(cap = Infinity) {
   const w = { owner: 'A', cps: {}, store: new Map(), res: new Map(), finals: [], paused: [], cap };
   const like = (pat) => new RegExp('^' + pat.split('%').map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
-  w.committed = () => [...w.res.values()].filter((r) => !r.settled).length * UB + w.finals.length * ACTUAL;
+  // r62: una reserva liquidada como cobrada (posible duplicado) SIGUE contando su cota (ADJUSTMENT de delta 0), salvo que
+  // llegue su cargo real (entonces cuenta el real, como en settleReservation del ledger).
+  w.committed = () => [...w.res.values()].filter((r) => !r.settled || (r.possibleDuplicate && !r.charged)).length * UB + w.finals.length * ACTUAL;
   w.ds = {
     async query(sql, params) {
       if (sql.includes('count(*)::int as n')) {
         const [keyLike, tagLike, , exclude] = params;
-        return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k)).length }];
+        return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || v.possibleDuplicate) && !exclude.includes(k)).length }];
+      }
+      // r62: reservas desconocidas de UNA llamada (el próximo envío es el reenvío ambiguo único de la parte).
+      if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
+        const [keyLike, tagLike, , exclude, includePd] = params;
+        return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
+          .map(([k, v]) => ({ key: k, amount: String(UB), settled: !!v.settled, send_marked: !!v.sendMarked }));
       }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
@@ -87,10 +95,17 @@ function world(cap = Infinity) {
       if (w.committed() + UB > w.cap + 1e-9) {
         const e = new Error(`RUN_BUDGET_CAP: el run ${RUN} excedería su presupuesto autorizado`); e.code = 'RUN_BUDGET_CAP'; e.details = { runId: RUN, requiredUsd: UB }; throw e;
       }
-      w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false });
+      w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false });
       return {};
     },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },
+    // r62 (I3): conciliación conservadora del reenvío ambiguo (obligatoria: sin ella el worker falla cerrado).
+    async reconcileReservationAsCharged(key, reason, o) {
+      const r = w.res.get(key);
+      if (!r || r.settled) return { reconciled: false, alreadySettled: true, amount: '0', event: null };
+      Object.assign(r, { settled: true, possibleDuplicate: !!(o && o.metadata && o.metadata.possibleDuplicate), reason });
+      return { reconciled: true, alreadySettled: false, amount: '1', event: null };
+    },
     async settleReservation(key, charge, reason) {
       const r = w.res.get(key);
       r.settled = true; r.reason = reason; r.charged = !!charge;
@@ -98,7 +113,7 @@ function world(cap = Infinity) {
       return { finalInserted: !!charge, finalEvent: null };
     },
   };
-  w.budget = { guardServerLlmCall: async () => null, pauseRunBySystem: async (runId, reason) => { w.paused.push({ runId, reason }); return true; } };
+  w.budget = { guardServerLlmCall: async () => null, ambiguousResendBudget: async () => ({ fits: true, reason: null, worstItem: 0, worstRun: 0 }), pauseRunBySystem: async (runId, reason) => { w.paused.push({ runId, reason }); return true; } };
   w.api = (who, url, extra = {}) => createServerApi({
     dataSource: w.ds, finops: w.finops, budget: w.budget,
     checkpoints: { put: async (p, j) => { w.store.set(p, j); }, get: async (p) => (w.store.has(p) ? w.store.get(p) : null) },
@@ -183,13 +198,15 @@ async function err(p) { try { return { v: await p }; } catch (e) { return { e };
     w.owner = 'B';
     await tick(150); // la conexión de A se cortó: A reintenta una vez por su cuenta (es lo que hace con un desconocido)
     const rA = await pA;
-    const pendingAfterA = w.pending();
-    assert(pendingAfterA === 1, `la reserva sin respuesta queda pendiente (${pendingAfterA})`);
+    // r62: la reserva sin respuesta queda CONTADA (pendiente, o liquidada como cobrada con possible_duplicate antes del reenvío).
+    const unknownAfterA = () => [...w.res.values()].filter((v) => !v.settled || v.possibleDuplicate).length;
+    const pendingAfterA = unknownAfterA();
+    assert(pendingAfterA === 1, `la reserva sin respuesta queda contada (${pendingAfterA})`);
     assert(Math.abs(w.committed() - (UB + (rA.e ? 0 : ACTUAL))) < 1e-9, `la pendiente cuenta su cota en el tope (${w.committed()})`);
     const rB = await err(w.api('B', a.url)('s', 'U'));
     assert(!rB.e || rB.e.pendingReview === true, `B: respuesta o revisión, nunca un bucle (${JSON.stringify(rB.e)})`);
     assert(a.st.requests <= 1 + LLM_UNKNOWN_MAX, `pedidos acotados: ${a.st.requests}`);
-    assert(w.pending() === 1, 'solo la reserva desconocida queda para conciliar');
+    assert(unknownAfterA() === 1, 'solo la reserva desconocida queda contada');
     await a.close();
   });
 

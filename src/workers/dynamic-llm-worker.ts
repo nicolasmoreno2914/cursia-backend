@@ -15,7 +15,7 @@ import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
 import { LLM_WORKER_ENABLED_ENV, LLM_WORKER_PRESENCE_BEAT_MS, LLM_WORKER_SINCE_ENV, llmWorkerConcurrency, llmWorkerEnabled, llmWorkerSince, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
 import { WorkerLedger } from './finops-worker-hooks';
 import { createExecutorRuntime } from './llm-executor/executor-runtime';
-import { LLM_PENDING_REVIEW, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
+import { LLM_MARK_SENT_SQL, LLM_PENDING_REVIEW, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
 import type { CallRole } from '../modules/finops/finops-ledger.service';
 import { fencedScheduler, IN_FLIGHT_MARGIN_MS, PRIOR_CALL_IN_FLIGHT, PROCESS_ITEM_FENCE, priorAttemptMayBeInFlight } from './lease-takeover';
 
@@ -156,6 +156,12 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
         const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
         return Array.isArray(list) && list.length > 0;
       },
+      // r62 (E2E M): marca durable de envío bajo la lease (una reserva sin ella, de un intento caído, nunca salió).
+      markSent: async (itemRunId, reservationKey, sentAt) => {
+        const rows = await deps.dataSource.query(LLM_MARK_SENT_SQL, [itemRunId, deps.executorId, reservationKey, sentAt]);
+        const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
+        return Array.isArray(list) && list.length > 0;
+      },
       recordLateCheckpoint: async (itemRunId, hash, entry, sentAt) => {
         const rows = await deps.dataSource.query(LATE_CHECKPOINT_SQL, [itemRunId, hash, JSON.stringify(entry), sentAt]);
         const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
@@ -210,7 +216,7 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
           [`reservation:llm:${item.itemRunId}:%`, `${LLM_WORKER_CALL_TAG_PREFIX}-%`, win.since.toISOString()],
         );
         await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
-          llmPendingReview: { at: new Date().toISOString(), reason: 'unknown_limit', detail: msg.slice(0, 300), pendingReservations: pend.map((p: any) => p.idempotency_key) },
+          llmPendingReview: { at: new Date().toISOString(), reason: /presupuesto autorizado/.test(msg) ? 'resend_over_budget' : 'unknown_limit', detail: msg.slice(0, 300), pendingReservations: pend.map((p: any) => p.idempotency_key) },
         });
         await fail(msg.startsWith(LLM_PENDING_REVIEW) ? msg : `${LLM_PENDING_REVIEW}: ${msg}`, false);
         return 'failed';
@@ -255,6 +261,13 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
         await fail('no se pudo subir el artifact ' + a.type + ': ' + (err instanceof Error ? err.message : String(err)), true);
         return 'failed';
       }
+    }
+    // r62 (E2E M): ninguna reserva desconocida queda abierta con la parte completada.
+    try {
+      const lo = await api.settleLeftovers();
+      if (lo.released || lo.settled) deps.logger.warn(`Item ${item.itemKey}: reservas desconocidas resueltas antes de completar (liberadas ${lo.released}, posible duplicado ${lo.settled})`);
+    } catch (err) {
+      deps.logger.warn(`Item ${item.itemKey}: no se pudieron resolver las reservas desconocidas antes de completar (${err instanceof Error ? err.message : String(err)}); siguen contadas como gasto`);
     }
     clearInterval(hb);
     const llmMode = workerLlmMode(deps);

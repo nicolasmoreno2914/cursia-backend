@@ -711,7 +711,9 @@ async function dbChecks() {
       eq(row.status, 'completed', `completado (${row.error})`);
       eq(fakes.st.llm.length, llmAfterFirst, '0 llamadas LLM en la reanudación (guion reutilizado)');
       eq((await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).length, 1, 'un solo cargo LLM');
-      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false, true], 'reserva ambigua (queda, reconocida) + la del nuevo intento liquidada');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [true, true], 'reserva ambigua (cobrada, posible duplicado) + la del nuevo intento liquidada');
     });
 
     await check('DB video (I2): el worker mide la duración desde el mvhd del MP4 que sube y la persiste ANTES de terminar la subida; artifact + summary con durationSource mp4_mvhd; video_interactions la usa', async () => {
@@ -811,7 +813,9 @@ async function dbChecks() {
       row = await itemRow(runA2, item.itemKey);
       eq([row.status, fakes.st.gammaPosts.length - posts0], ['completed', 2], 'nueva generación tras la decisión');
       eq((await finalCharges(`item_run_id = $1 and provider = 'gamma'`, [row.id])).length, 1, 'un cargo final (la nueva generación)');
-      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [false, true], 'reserva ambigua (queda) + la nueva liquidada');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [true, true], 'reserva ambigua (cobrada, posible duplicado) + la nueva liquidada');
     });
 
     await check('DB Gamma 4xx definitivo (429) → reserva LIBERADA (neto 0), marcador limpio, reintentable; conexión cortada tras enviar → ambiguo con reserva pendiente', async () => {
@@ -848,7 +852,9 @@ async function dbChecks() {
       await rejectsRe(PW.processProviderItem(workerDeps(), again), /tts_failed/, '400 definitivo');
       row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'failed', '400 no reintentable');
-      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false, true], 'el 400 libera su reserva; la ambigua queda');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [true, true], 'el 400 libera su reserva; la ambigua, cobrada (posible duplicado)');
       eq((await finalCharges(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin cargos finales');
     });
 
@@ -871,7 +877,9 @@ async function dbChecks() {
       row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
       eq((await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).map((x) => x.measurement_status), ['final'], 'cargo medido del intento reconocido');
-      eq((await reservationsOf(row.id, 'anthropic')).find((x) => x.idempotency_key === `reservation:llm:${row.id}:g1:a1:sec0-main`).settled, false, 'la reserva ambigua queda (reconocida)');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'anthropic')).find((x) => x.idempotency_key === `reservation:llm:${row.id}:g1:a1:sec0-main`).settled, true, 'la reserva ambigua: cobrada (posible duplicado)');
       assert(fakes.st.llm.length - llm0 >= 2, 'la llamada ambigua + la nueva');
     });
 
@@ -914,7 +922,8 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set output_summary = output_summary || $2::jsonb where id = $1`,
         [id, JSON.stringify({ paidCallsSent: sent, ...(os.externalSubmitStartedAt ? { externalSubmitStartedAt: old } : {}) })]);
     };
-    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400' };
+    // r62 (M4): el TTS ya no se acorta con PROVIDER_CALL_TIMEOUT_MS (mínimo 210 s): su timeout de prueba va explícito.
+    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400' };
 
     // Review r2 (M8/N1): bienvenida LARGA (3 chunks de TTS) — la unidad se reserva completa y lo nunca enviado se libera.
     const LONG_WELCOME = Array.from({ length: 150 }, (_, i) => `Esta es la oración ${i + 1} de la bienvenida al curso de hidráulica de planta, pensada para técnicos de mantenimiento.`).join(' ');
@@ -1196,7 +1205,7 @@ async function dbChecks() {
     await check('#583 audio incierto → UN reenvío automático tras la espera (la reserva incierta QUEDA registrada y reconocida, sin estimados ni aprobaciones nuevas); el worker reenvía UNA vez y completa', async () => {
       const A = await ambiguousWelcome('583 audio incierto');
       const [pend] = await reservationsOf(A.row.id, 'openai');
-      assert(pend && !pend.settled && Number(pend.amount) > 0 && Number(pend.amount) <= AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD, `reserva pendiente chica (${pend && pend.amount})`);
+      assert(pend && !pend.settled && Number(pend.amount) > 0, `reserva pendiente (${pend && pend.amount})`);
       // Mientras el servidor lo va a reenviar solo, no hay acción de admin.
       eq(RC.adminActionFor(A.row, 'not_done', new Date()), null, 'sin acción de admin (pendiente del servidor)');
       const f0 = await finopsCounts(A.cid);
@@ -1215,7 +1224,10 @@ async function dbChecks() {
       await PW.processProviderItem(workerDeps(), await claimProvider(A.rid, 'audio_welcome'));
       row = await itemRow(A.rid, A.key);
       eq([row.status, fakes.st.tts.length - t0], ['completed', 1], `reenvío único y completa (${row.error})`);
-      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false, true], 'la reserva incierta queda contada + la del reenvío liquidada');
+      // r62: la reserva incierta se liquidó como COBRADA (posible duplicado, actor system) antes del reenvío; la del reenvío, medida.
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [true, true], 'la reserva incierta liquidada como cobrada + la del reenvío liquidada');
+      const [pd] = await events(`corrects_event_id = $1`, [pend.id]);
+      eq([pd.metadata.possibleDuplicate, pd.metadata.decidedBy, pd.metadata.settlement, Number(pd.amount)], [true, 'system', 'reconciled_as_charged', 0], 'posible duplicado en el ledger (cuenta como gasto)');
       eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(10) }), A.rid).length, 0, 'nada más que reenviar');
     });
 
@@ -1264,9 +1276,11 @@ async function dbChecks() {
       const t0 = fakes.st.tts.length;
       const res = await runs.autoResubmitAmbiguousAudio({ now: later(3) });
       eq(resubOf(res, A.rid).length, 0, 'no se reabre');
-      eq(res.skipped.filter((x) => x.runId === A.rid).map((x) => x.reason), ['budget_approval_required'], 'motivo FinOps');
+      // r62: el peor caso se evalúa contra lo autorizado ANTES de reabrir (sin autorización vigente → excepción de presupuesto).
+      eq(res.skipped.filter((x) => x.runId === A.rid).map((x) => x.reason), ['over_budget:no_authorization'], 'motivo FinOps');
       const row = await itemRow(A.rid, A.key);
-      eq([row.status, row.output_summary.ambiguousAudioResubmit.declined], ['failed', 'budget_approval_required'], 'declinado → admin');
+      // (attention_reason = 'budget' lo cubre check-r62-recovery: este esquema no tiene la migración REL R2.)
+      eq([row.status, row.output_summary.ambiguousAudioResubmit.declined], ['failed', 'over_budget:no_authorization'], 'declinado → excepción de presupuesto');
       eq(await finopsCounts(A.cid), f0, 'sin estimados ni aprobaciones nuevas');
       eq(fakes.st.tts.length - t0, 0, 'cero llamadas');
       // Runtime guard: reabierto con presupuesto y revocado ANTES de que el worker llame.

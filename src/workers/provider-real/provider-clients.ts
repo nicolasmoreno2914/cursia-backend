@@ -138,8 +138,30 @@ export interface TtsCallResult {
   requestId: string | null;
 }
 
+/**
+ * r62 (K1, regla de ambigüedad acotada punto 1: PREVENIR antes que resolver). Los cuelgues del TTS de OpenAI observados
+ * terminan entre 125 y 172 s (phase-b-n1-tts-root-cause.md, #1510); con el corte en 120 s el cliente abortaba llamadas
+ * que OpenAI igual completaba y cobraba → resultado ambiguo. 210 s queda por encima de la cola observada con margen.
+ * Invariantes: < lease del worker de proveedores (300 s, PROVIDER_WORKER_MIN_LEASE_SECONDS) y < drenado (270 s);
+ * la ventana en vuelo de Q-21 (lease-takeover.ts, IN_FLIGHT_WINDOW_MS.openai) se deriva de este valor.
+ */
+export const OPENAI_TTS_TIMEOUT_MS = 210_000;
+export const OPENAI_TTS_TIMEOUT_ENV = 'OPENAI_TTS_TIMEOUT_MS';
+
+/**
+ * r62 (review M4): timeout EFECTIVO del cliente TTS. `PROVIDER_CALL_TIMEOUT_MS` (acorta los demás proveedores) ya NO lo
+ * baja del mínimo de 210 s: un valor operativo genérico (p. ej. 8 s del E2E o un 120 s heredado) reintroduciría el
+ * timeout ambiguo de #1510. Solo `OPENAI_TTS_TIMEOUT_MS` explícito lo cambia (pruebas de fault injection / E2E); el
+ * worker lo loguea al arrancar.
+ */
+export function ttsTimeoutMs(env: Env): { ms: number; source: 'default' | 'OPENAI_TTS_TIMEOUT_MS' } {
+  const n = Number(env[OPENAI_TTS_TIMEOUT_ENV]);
+  if (Number.isInteger(n) && n > 0) return { ms: n, source: 'OPENAI_TTS_TIMEOUT_MS' };
+  return { ms: OPENAI_TTS_TIMEOUT_MS, source: 'default' };
+}
+
 export class OpenAiTtsClient {
-  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = callTimeoutMs(env, 120_000)) {
+  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = ttsTimeoutMs(env).ms) {
     if (!apiKey || !apiKey.trim()) throw new ProviderCallError('openai', false, 'openai: OPENAI_API_KEY no configurada');
   }
 

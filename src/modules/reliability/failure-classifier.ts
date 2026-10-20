@@ -31,12 +31,15 @@ import {
   AUTO_HEAL_DENY_PATTERNS,
   SAFE_AUTO_RETRY_RULES,
 } from './auto-heal-rules';
-// #583 (decisión del usuario A, 2026-10-02): UN reenvío automático de un audio TTS incierto si lo pendiente
-// del item en el ledger es ≤ USD 0.10. La decisión (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa
-// la misma función pura SIN ledger para informar qué hace hoy el sistema.
-import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv } from '../dynamic-generation/auto-heal';
+// #583 + r62 (regla de ambigüedad acotada): UN reenvío automático de un audio TTS incierto (corte o timeout del
+// cliente) si el peor caso entra en lo autorizado (presupuesto de recuperación de la parte + saldo del run). La decisión
+// (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa la misma función pura SIN ledger para informar qué hace hoy
+// el sistema.
+import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv, autoRecoveryEnabled } from '../dynamic-generation/auto-heal';
 // r62 (N2): conciliación automática de Videogen/Gamma con la evidencia del proveedor (+ reenvío acotado).
 import { PROVIDER_RECONCILE_MAX_RESUBMITS, providerReconcileDecision } from '../dynamic-generation/provider-reconcile';
+import { spendControlHoldOf } from './spend-control-hold';
+import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
 
 export type FailureClass = 'A' | 'B' | 'C' | 'D';
 export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
@@ -86,10 +89,11 @@ export type CurrentRecovery =
   | 'executor_retry' // retryable en el item (attempt_count < max_attempts): el scheduler lo reintenta
   | 'auto_heal' // allow-list del auto-healer (R16)
   | 'safe_auto_retry' // reintento automático seguro (EV6 DoD BE-B)
-  | 'ambiguous_audio_resubmit' // #583: UN reenvío automático de audio TTS incierto (≤ USD 0.10 pendiente, lo decide auto-heal con el ledger)
+  | 'ambiguous_audio_resubmit' // #583 + r62: UN reenvío automático de audio TTS incierto (peor caso dentro de lo autorizado, lo decide auto-heal con el ledger)
   | 'auto_regenerate' // REL MVP: clase B de un componente de la IA → el auto-healer lo regenera solo (≤ 2 rondas)
   | 'provider_probe' // REL CREDIT: crédito/cuota agotados → sonda del proveedor (canario) y reanudación sola (solo en la vista)
   | 'provider_reconcile' // r62 (N2): Videogen/Gamma → conciliación con la evidencia del proveedor y reenvío acotado (provider-reconcile.ts)
+  | 'spend_control_resume' // r62 (K3): frenado por el kill switch / la allow-list de FinOps → se reabre solo al revertirlo
   | 'denied' // deny-list: nunca se reabre solo
   | 'manual'; // nada automático: humano (retry/regenerate)
 
@@ -243,6 +247,9 @@ export const PROVIDER_CALL_RULE_IDS: readonly string[] = Object.freeze(Object.ke
  * guarda cada segmento apenas se paga y lo anota («chunk N/M (persisted J)» → N-1-J): con todos los
  * anteriores guardados el reintento solo sintetiza lo que falta (A, sin riesgo de pagar dos veces).
  */
+/** r62 (K2, review C1): mensaje de TTS con un rechazo de admisión del proveedor (429/503/529; formato de classify()). */
+const TTS_KNOWN_HTTP_RE = /\bopenai POST \/audio\/speech HTTP (?:429|503|529)\b/;
+
 function ttsPaidChunks(error: string): number {
   const m = /chunk (\d+)\/(\d+)(?: \(persisted (\d+)\))?/.exec(error);
   return m ? Math.max(0, Number(m[1]) - 1 - (m[3] ? Number(m[3]) : 0)) : 0;
@@ -320,6 +327,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   {
     // Loop 4: segundo resultado desconocido de una parte del worker de IA → solo esa parte queda en revisión (el resto sigue).
     id: 'llm_pending_review', codes: ['llm_pending_review'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_item',
+    // r62: el reenvío ambiguo único no entraba en lo autorizado → la excepción es de presupuesto, no de cobro duplicado.
+    refine: ({ error }) => (/no entra en el presupuesto autorizado/.test(error) ? { humanReason: 'budget' } : null),
   },
   {
     // Piloto #1209: 524 — la respuesta se perdió pero el proveedor pudo cobrarla: reenviarla solo podría pagarla dos veces.
@@ -441,6 +450,11 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       'PEDAGOGY_BRIEF_INVALID'],
     family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,
     class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item',
+    // r62 (d8): un claim incompleto por un DATO de la dependencia (video del capítulo) no es un contrato roto: B
+    // `regenerate_dependency` (lo aplica solo el barrido autoRecoverClaimPayloadUnavailable, una vez y con presupuesto).
+    refine: ({ code, error }) => (code === 'claim_payload_unavailable' && CLAIM_PAYLOAD_DEPENDENCY_RE.test(error)
+      ? { class: 'B', strategy: 'regenerate_dependency', rounds: 1, humanReason: undefined, adminAction: undefined }
+      : null),
   },
   { id: 'v3_validator_infra', codes: ['v3_validator_unavailable', 'v3_artifact_unreadable', 'V3_VALIDATION_CONTEXT'], class: 'A', strategy: 'retry_backoff', rounds: 2 },
 
@@ -519,21 +533,31 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // ── TTS (OpenAI) ───────────────────────────────────────────────────────────
   {
     // Antes del primer trozo cobrado → A. Después de trozos ya cobrados (chunk N/M, N > 1) → C (user decision 1).
+    // r62 (K2, regla punto 4; review C1): con un RECHAZO DE ADMISIÓN del proveedor (429/503/529; el resto es ambiguo) el resultado es
+    // CONOCIDO: el worker liberó la reserva de ese trozo y reconoció el intento (los trozos anteriores quedaron cobrados
+    // y medidos en el ledger); repetirlo es gasto medido dentro del presupuesto de la parte → A (backoff), no C.
     id: 'tts_failed', codes: ['tts_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3,
-    refine: ({ error }) => {
+    refine: ({ error, httpStatus }) => {
       const n = ttsPaidChunks(error);
+      if (n > 0 && httpStatus !== null && TTS_KNOWN_HTTP_RE.test(error)) return null;
       return n > 0 ? { class: 'C', strategy: 'auto_resubmit_once', rounds: 1, adminAction: 'reconcile_provider', humanReason: 'duplicate_charge', paidRisk: 'uncertain' } : null;
     },
   },
   {
     id: 'provider_reconciliation',
     codes: ['provider_reconciliation_required', 'confirm_paid_required', 'may_have_rendered_ack_required'],
-    // #583 (decisión A del usuario): TTS de OpenAI incierto en un item de audio → UN reenvío automático acotado
-    // (≤ USD 0.10 pendiente en el ledger, lo verifica auto-heal bajo lock); sigue siendo C (pago incierto).
-    refine: ({ error, itemType }) => (/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error)
-      && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter')
-      ? { strategy: 'auto_resubmit_once', provider: 'openai' }
-      : null),
+    // #583 + r62 (K6): TTS de OpenAI incierto en un item de audio (corte o timeout del cliente) → UN reenvío automático
+    // acotado (peor caso dentro de lo autorizado, lo verifica auto-heal bajo lock); sigue siendo C (pago incierto). La
+    // etiqueta refleja lo que pasa DE VERDAD: con su reenvío ya usado o rechazado (presupuesto) es una excepción para un
+    // humano (hold_for_human), no «reenvío automático».
+    refine: ({ error, itemType, outputSummary }) => {
+      if (!(/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error) && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter'))) return null;
+      const used = outputSummary?.ambiguousAudioResubmit;
+      if (used && (used.declined || Number(used.rounds ?? 0) >= 1)) {
+        return { strategy: 'hold_for_human', provider: 'openai', rounds: 0, humanReason: /budget|presupuesto|over_threshold/i.test(String(used.declined ?? '')) ? 'budget' : 'duplicate_charge' };
+      }
+      return { strategy: 'auto_resubmit_once', provider: 'openai' };
+    },
     class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
   },
 ] as Rule[]);
@@ -751,6 +775,11 @@ export function currentRecoveryOf(
 ): CurrentRecovery {
   const e = String(error ?? '').trim();
   const os = outputSummary ?? {};
+  // r62 (K3): frenado por un control de gasto → lo reabre solo el barrido al revertirse (si la recuperación está activa).
+  if (spendControlHoldOf(e, itemType) && autoRecoveryEnabled(process.env)) return 'spend_control_resume';
+  // r62 (d8): claim incompleto por el dato de la dependencia → regenerate_dependency automático (barrido propio).
+  if (CLAIM_PAYLOAD_DEPENDENCY_RE.test(e) && itemType === 'video_interactions' && autoRecoveryEnabled(process.env)
+    && !os.claimPayloadRecovery?.declined) return 'auto_regenerate';
   // #583: va ANTES de la deny-list (la deny-list describe justamente este caso incierto; la función de
   // auto-heal aplica su propia deny-list reducida).
   if (ambiguousAudioResubmitDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date()).heal) return 'ambiguous_audio_resubmit';
@@ -867,7 +896,23 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
     return unclassifiedVerdict(extractFailureCode(error), httpStatus, 'package', 'none');
   }
 
-  return moneyFloor(classifyItem(input, error, ctxBase), error);
+  return spendControlWait(moneyFloor(classifyItem(input, error, ctxBase), error), error, itemType);
+}
+
+/**
+ * r62 (K3): punto de extensión mínimo. Una parte frenada por un control de gasto del servidor (kill switch / allow-list
+ * de proveedores; reliability/spend-control-hold.ts) ESPERA a que el operador lo revierta (D `wait_provider`, scope run,
+ * attention `config`): el barrido autoResumeSpendControlHolds la reabre sola en cuanto el control ya no la frena. Gana
+ * sobre el código de adelante (`unexpected_error: finops_ledger_write_failed: …`) y sobre el piso de dinero (el texto
+ * `provider_not_allowed` coincide con la deny-list), nunca sobre un fallo con riesgo de pago (spendControlHoldOf → null).
+ */
+function spendControlWait(v: FailureVerdict, error: string, itemType: string | null): FailureVerdict {
+  const hold = spendControlHoldOf(error, itemType);
+  if (!hold) return v;
+  return {
+    ...v, class: 'D', strategy: 'wait_provider', scope: 'run', provider: 'finops', targetRounds: 0, paidRisk: 'none',
+    humanReason: 'config', adminAction: 'retry_item', moneyFloor: undefined, unclassified: false,
+  };
 }
 
 /**

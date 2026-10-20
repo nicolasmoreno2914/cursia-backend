@@ -15,7 +15,7 @@ import { usageModelPriorsV1 } from '../modules/finops/usage-model';
 import { llmCallUpperBoundUsage } from '../modules/finops/llm-usage-ingest';
 
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
-  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges' | 'recordReservationBatch'>>;
+  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges' | 'recordReservationBatch' | 'reconcileReservationAsCharged'>>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'> & Partial<Pick<FinopsBudgetService, 'pauseRunBySystem'>>;
 /** r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (el guard la precia con el catálogo). */
 export type GuardNextCall = { provider: string; service: string; product: string; usage: Record<string, number> };
@@ -581,6 +581,11 @@ export interface PaidCallReservation {
   tag: string;
   /** Estimado conservador de la llamada (solo para la reserva). */
   estimate: { characters?: number; promptChars?: number; maxTokens?: number; model?: string };
+  /**
+   * r62 (E2E M): la llamada escribe una marca DURABLE de envío antes de salir. Una reserva así, de un intento caído y SIN
+   * marca, nunca salió y se libera sola; sin el flag (reservas anteriores) se trata como siempre (ambigua).
+   */
+  sendMarked?: boolean;
 }
 
 export function reservationKey(r: Pick<PaidCallReservation, 'kind' | 'itemRunId' | 'generation' | 'itemAttempt' | 'tag'>): string {
@@ -605,7 +610,7 @@ function reservationInput(r: PaidCallReservation): RecordChargeInput {
     pricingFallback: 'pending_zero' as const,
     recordedBy: r.kind === 'videogen' ? 'dynamic-item-worker' : 'dynamic-provider-worker',
   };
-  const meta = { reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: r.tag, generation: r.generation };
+  const meta = { reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: r.tag, generation: r.generation, ...(r.sendMarked ? { sendMarked: true } : {}) };
   switch (r.kind) {
     case 'tts': {
       const secs = Math.max(1, Math.ceil(((r.estimate.characters ?? 0) / TTS_CHARS_PER_SECOND_ESTIMATE) * PROVIDER_RESERVATION_MARGIN));
@@ -750,7 +755,7 @@ export async function priorPaidOperations(
     currentAttempt: number;
     acknowledgedThroughAttempt: number;
     skipProviders?: string[];
-    isSubmitMarked?: (key: string) => boolean;
+    isSubmitMarked?: (key: string, row: ItemPaidCharge) => boolean;
     /** r19: cargo cuyo resultado YA quedó guardado en el item (bloque del guion / segmento del audiolibro) → no bloquea. */
     isPersistedOutput?: (row: ItemPaidCharge) => boolean;
   },
@@ -770,7 +775,7 @@ export async function priorPaidOperations(
   for (const r of prior) {
     if (r.reservation && r.settled) continue;
     if (opts.isPersistedOutput && opts.isPersistedOutput(r)) continue;
-    if (r.reservation && opts.isSubmitMarked && !opts.isSubmitMarked(r.idempotency_key)) releasable.push(r);
+    if (r.reservation && opts.isSubmitMarked && !opts.isSubmitMarked(r.idempotency_key, r)) releasable.push(r);
     else blocking.push(r);
   }
   return { blocking, releasable };

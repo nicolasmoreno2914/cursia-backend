@@ -4,8 +4,8 @@
 // timeout de 120 s DOS veces —el intento original y el reenvío automático #583— y dejó dos reservas pendientes).
 //
 // Sin red y sin gasto: funciones puras + el controlador con un ledger FALSO en memoria.
-//   (d) auto-heal: el reenvío automático ÚNICO de audio incierto declina un timeout del cliente
-//       (`timeout_likely_charged`) y sigue aceptando otro corte ambiguo (conexión caída);
+//   (d) auto-heal: el reenvío automático ÚNICO de audio incierto — r62: también un timeout del cliente (antes
+//       `timeout_likely_charged` → admin), siempre con el peor caso dentro de lo autorizado; otro corte ambiguo igual;
 //   (e) POST finops/tts-reservations/reconcile: validación (400), reserva que no es de TTS, parte en ejecución (409),
 //       decisión charged / not_charged con metadata { ttsReservation: true }, repetir = no-op; SUPER_ADMIN.
 //
@@ -67,24 +67,32 @@ const PENDING = { pendingUsd: 0.0735, providers: ['openai'] };
 
 (async () => {
   // ── (d) auto-heal ──────────────────────────────────────────────────────────
-  await check('(d) timeout del cliente (#1510: «aborted due to timeout» / TimeoutError) → el reenvío automático declina (timeout_likely_charged); el clasificador no lo ofrece como reenvío automático', () => {
+  // r62 (K1, regla de ambigüedad acotada — cambio DELIBERADO de r59): un timeout del cliente ya NO va a un admin
+  // (`timeout_likely_charged` dejó de existir). Igual que un corte de conexión: UN reenvío automático, solo si el peor caso
+  // entra en lo autorizado (presupuesto de la parte + saldo del run), con la reserva perdida liquidada como posible duplicado.
+  const FITS = { fits: true, reason: null };
+  await check('(d) r62: timeout del cliente (#1510: «aborted due to timeout» / TimeoutError) → UN reenvío automático acotado (causa timeout_presumed_charged); el clasificador lo informa como reenvío automático', () => {
     const errs = [
       `${RECON} tts_failed: chunk 1/7 (persisted 0): The operation was aborted due to timeout${TAIL}`,
       `${RECON} tts_failed: chunk 1/7 (persisted 0): openai POST /audio/speech: error de red (TimeoutError)${TAIL}`,
-      `${RECON} tts_failed: chunk 2/3 (persisted 1): request timeout${TAIL}`,
     ];
     for (const e of errs) {
       for (const type of ['audiobook_chapter', 'audio_welcome']) {
-        const d = AH.ambiguousAudioResubmitDecision(rowOf(e, type), NOW, PENDING);
-        eq([d.heal, d.reason], [false, 'timeout_likely_charged'], `${type}: ${e.slice(90, 160)}`);
-        // Sin consultar el ledger (run-completion / clasificador): misma respuesta.
-        eq(AH.ambiguousAudioResubmitDecision(rowOf(e, type), NOW).reason, 'timeout_likely_charged', 'sin ledger');
-        assert(FC.currentRecoveryOf(e, type, {}) !== 'ambiguous_audio_resubmit', `clasificador: ${type}`);
+        const d = AH.ambiguousAudioResubmitDecision(rowOf(e, type), NOW, PENDING, undefined, { budget: FITS });
+        eq([d.heal, d.round, d.cause], [true, 1, 'timeout_presumed_charged'], `${type}: ${e.slice(90, 160)}`);
+        // Sin consultar el ledger (run-completion / clasificador): el servidor lo va a resolver solo.
+        eq(AH.ambiguousAudioResubmitDecision(rowOf(e, type), NOW).heal, true, 'sin ledger');
+        assert(FC.currentRecoveryOf(e, type, {}) === 'ambiguous_audio_resubmit', `clasificador: ${type}`);
+        // Peor caso fuera de lo autorizado → excepción (no reenvío), y sin evaluación del presupuesto nunca reenvía.
+        eq(AH.ambiguousAudioResubmitDecision(rowOf(e, type), NOW, PENDING, undefined, { budget: { fits: false, reason: 'item_recovery_budget' } }).reason, 'over_budget', 'fuera del presupuesto');
+        eq(AH.ambiguousAudioResubmitDecision(rowOf(e, type), NOW, PENDING, undefined, { budget: null }).reason, 'over_budget', 'sin presupuesto evaluado');
       }
     }
+    // «request timeout» (texto libre del cuerpo) ya no se lee como timeout del cliente (K2): causa connection_cut.
+    eq(AH.ambiguousAudioCause(`${RECON} tts_failed: chunk 2/3 (persisted 1): request timeout${TAIL}`), 'connection_cut', 'texto libre');
   });
 
-  await check('(d) otro corte ambiguo (conexión caída antes de la respuesta) → el reenvío automático ÚNICO sigue igual (heal tras la espera, ≤ USD 0.10)', () => {
+  await check('(d) otro corte ambiguo (conexión caída antes de la respuesta) → el reenvío automático ÚNICO sigue igual (heal tras la espera, dentro de lo autorizado)', () => {
     const errs = [
       `${RECON} tts_failed: chunk 1/7 (persisted 0): openai POST /audio/speech: error de red (TypeError)${TAIL}`,
       `${RECON} tts_failed: chunk 3/4 (persisted 2): socket hang up (ECONNRESET)${TAIL}`,
@@ -93,16 +101,19 @@ const PENDING = { pendingUsd: 0.0735, providers: ['openai'] };
       'provider_reconciliation_required: openai — audio TTS pagado sin persistir. El proveedor pudo haber completado',
     ];
     for (const e of errs) {
-      const d = AH.ambiguousAudioResubmitDecision(rowOf(e), NOW, PENDING);
-      eq([d.heal, d.round], [true, 1], e.slice(90, 160));
+      const d = AH.ambiguousAudioResubmitDecision(rowOf(e), NOW, PENDING, undefined, { budget: FITS });
+      eq([d.heal, d.round, d.cause], [true, 1, 'connection_cut'], e.slice(90, 160));
       assert(FC.currentRecoveryOf(e, 'audiobook_chapter', {}) === 'ambiguous_audio_resubmit', 'clasificador: reenvío automático');
     }
-    // Las demás reglas no cambian.
-    eq(AH.ambiguousAudioResubmitDecision(rowOf(errs[0]), NOW, { pendingUsd: 0.11, providers: ['openai'] }).reason, 'over_threshold', 'tope');
+    // Las demás reglas no cambian (el tope fijo de USD 0,10 ya no existe: solo un tope OPCIONAL de operación).
+    eq(AH.ambiguousAudioResubmitDecision(rowOf(errs[0]), NOW, { pendingUsd: 0.11, providers: ['openai'] }, undefined, { budget: FITS }).heal, true, 'sin tope fijo');
+    eq(AH.ambiguousAudioResubmitDecision(rowOf(errs[0]), NOW, { pendingUsd: 0.11, providers: ['openai'] }, undefined, { budget: FITS, maxUsd: 0.1 }).reason, 'over_threshold', 'tope opcional');
     eq(AH.ambiguousAudioResubmitDecision(rowOf(errs[0], 'video'), NOW, PENDING).reason, 'not_audio', 'video');
     eq(AH.ambiguousAudioResubmitDecision({ ...rowOf(errs[0]), output_summary: { ambiguousAudioResubmit: { rounds: 1 } } }, NOW, PENDING).reason, 'cap_reached', 'una sola vez');
     assert(!AH.AMBIGUOUS_AUDIO_TIMEOUT_RE.test(TAIL) && !AH.AMBIGUOUS_AUDIO_TIMEOUT_RE.test(RECON), 'el texto fijo de la reconciliación no cuenta como timeout');
     assert(!AH.AMBIGUOUS_AUDIO_TIMEOUT_RE.test('connect ETIMEDOUT 1.2.3.4:443'), 'ETIMEDOUT (conexión, antes de enviar) no es un timeout de respuesta');
+    // K2: el cuerpo de un 5xx que menciona «timeout» no es un timeout del cliente.
+    assert(!AH.AMBIGUOUS_AUDIO_TIMEOUT_RE.test('openai POST /audio/speech HTTP 504: upstream request timeout'), '504 con cuerpo');
   });
 
   // ── (e) conciliación de reservas de TTS ────────────────────────────────────

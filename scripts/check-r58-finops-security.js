@@ -323,9 +323,11 @@ async function pureChecks() {
     const FC = L('modules/reliability/failure-classifier.js');
     const fn = FC.classifyItemFailure || FC.classifyFailure;
     assert(typeof fn === 'function', 'clasificador exportado');
-    for (const c of ['finops_kill_switch', 'provider_not_allowed', 'unattributed_ceiling_reached', 'item_run_not_found']) {
+    // r62 (K3, cambio DELIBERADO): kill switch / allow-list siguen siendo D sin reintento propio, pero ESPERAN a que el
+    // operador los revierta (wait_provider; el barrido autoResumeSpendControlHolds las reabre solas). Los otros dos, igual.
+    for (const [c, strategy] of [['finops_kill_switch', 'wait_provider'], ['provider_not_allowed', 'wait_provider'], ['unattributed_ceiling_reached', 'hold_for_human'], ['item_run_not_found', 'hold_for_human']]) {
       const r = fn({ error: `${c}: detalle`, itemType: 'content' });
-      eq([r.class, r.strategy, r.ruleId || r.rule], ['D', 'hold_for_human', 'spend_control_denied'], c);
+      eq([r.class, r.strategy, r.ruleId || r.rule], ['D', strategy, 'spend_control_denied'], c);
     }
   });
 }
