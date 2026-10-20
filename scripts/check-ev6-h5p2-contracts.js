@@ -704,8 +704,10 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     throws(() => h.validateVideoInteractionsDoc(liar, { durationSec: 468, schemaVersion: 2 }), /durationSec: debe coincidir con la duración real 468/, 'duración medida');
     // v3-validation: summary con reflexiones solo en v2; v1 igual que siempre.
     const ctx = { type: 'video_interactions', itemKey: 'video_interactions:ch9', video: { videoItemKey: 'video:ch9', durationSec: d } };
-    eq(V3V.validateV3ItemArtifact(ctx, JSON.stringify(v1)), { ok: true, errors: [], summary: { interactionCount: 5 } }, 'v3 v1');
-    eq(V3V.validateV3ItemArtifact({ ...ctx, videoInteractionsSchemaVersion: 2 }, JSON.stringify(doc)), { ok: true, errors: [], summary: { interactionCount: 5, reflectionCount: 2, droppedReflections: [] } }, 'v3 v2');
+    // r61 Q-04 (re-review I-2): el summary guarda además los segundos validados (el empaque los usa tal cual).
+    const atSec = h.planInteractionCheckpoints(d).map((c) => c.atSec);
+    eq(V3V.validateV3ItemArtifact(ctx, JSON.stringify(v1)), { ok: true, errors: [], summary: { interactionCount: 5, checkpointsAtSec: atSec } }, 'v3 v1');
+    eq(V3V.validateV3ItemArtifact({ ...ctx, videoInteractionsSchemaVersion: 2 }, JSON.stringify(doc)), { ok: true, errors: [], summary: { interactionCount: 5, checkpointsAtSec: atSec, reflectionCount: 2, droppedReflections: [] } }, 'v3 v2');
     eq(V3V.validateV3ItemArtifact(ctx, JSON.stringify(doc)).ok, false, 'v3 v2 sin marcador');
     // videoClaimFacts: sin ivAdvanced idéntico; con ivAdvanced lleva el plan.
     const claim = V3V.videoClaimFacts({ videoItemKey: 'video:ch9', outputSummary: { youtubeVideoId: 'IdwOipZAeqY', durationSec: d } });

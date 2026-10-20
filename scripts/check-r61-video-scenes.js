@@ -116,7 +116,6 @@ async function main() {
     });
     P.assertSceneAnchoredCheckpoints(D, p.checkpoints, p.scenes);
     eq(P.planVideoCheckpoints(D, SCENES), p, 'determinístico');
-    eq(P.planVideoCheckpoints(Math.floor(D) + 0.99, SCENES), p, 'función de los segundos enteros (claim crudo = validación/.h5p con floor)');
     // El ancla de la pregunta 1 es el fin de escena más cercano a su punto equidistante.
     const best = ends.filter((b) => b >= 30).reduce((a, b) => (Math.abs(b - even[0].atSec) < Math.abs(a - even[0].atSec) ? b : a));
     assert(Math.abs(p.checkpoints[0].atSec - even[0].atSec) <= Math.abs(best - even[0].atSec) + 45, 'cercano');
@@ -190,9 +189,9 @@ async function main() {
     const ctx = { type: 'video_interactions', itemKey: 'video_interactions:ch1', chapterId: 'ch1', video: { videoItemKey: 'video:ch1', durationSec: D, videoScenes: SCENES } };
     const r = V3.validateV3ItemArtifact(ctx, text);
     assert(r.ok, JSON.stringify(r.errors));
-    eq(r.summary, { interactionCount: n, timelineSource: 'videogen_scenes' }, 'summary anclado');
+    eq(r.summary, { interactionCount: n, timelineSource: 'videogen_scenes', checkpointsAtSec: P.planVideoCheckpoints(D, SCENES).checkpoints.map((c) => c.atSec) }, 'summary anclado (+ segundos validados, re-review I-2)');
     const r0 = V3.validateV3ItemArtifact({ ...ctx, video: { videoItemKey: 'video:ch1', durationSec: D } }, text);
-    eq(r0.summary, { interactionCount: n }, 'summary de siempre');
+    eq(r0.summary, { interactionCount: n, checkpointsAtSec: P.planInteractionCheckpoints(D).map((c) => c.atSec) }, 'summary equidistante + segundos validados');
     // v2: las reflexiones se exigen en los index del plan de pausas ANCLADO.
     const want = P.planReflectionPauses(D, P.planVideoCheckpoints(D, SCENES).checkpoints).reflections;
     const doc2 = interactionsDoc(n, D, { schemaVersion: 2, reflections: want.map((x) => ({ index: x.index, prompt: '¿Cómo lo aplicarías?' })) });
@@ -231,9 +230,9 @@ async function main() {
     const d = SCENES[SCENES.length - 1].endSec + 1.5;
     const p = P.planVideoCheckpoints(d, SCENES);
     eq(p.timelineSource, 'videogen_scenes', 'source');
-    const f = Math.floor(d) / SCENES[SCENES.length - 1].endSec;
+    const f = d / SCENES[SCENES.length - 1].endSec;
     eq(p.scenes.map((x) => x.endSec), SCENES.map((x) => Math.round(x.endSec * f * 1000) / 1000), 'escenas escaladas');
-    eq(p.scenes[p.scenes.length - 1].endSec, Math.floor(d), 'la última termina en floor(d)');
+    eq(p.scenes[p.scenes.length - 1].endSec, Math.round(d * 1000) / 1000, 'la última termina en la d medida (re-review M-7: sin floor)');
     p.checkpoints.forEach((c) => assert(p.scenes.some((x) => c.atSec === Math.ceil(x.endSec - 1e-6)), `atSec ${c.atSec} = fin escalado`));
     P.assertSceneAnchoredCheckpoints(d, p.checkpoints, p.scenes);
   });
@@ -311,7 +310,7 @@ async function main() {
     if (oldSrc) {
       const r = await run(oldSrc, legacyClaim);
       assert(r.ok === true, `ejecutor anterior falló: ${r.error}`);
-      eq(serverOk(r, false), { interactionCount: legacyClaim.checkpoints.length }, 'validado equidistante');
+      eq(serverOk(r, false), { interactionCount: legacyClaim.checkpoints.length, checkpointsAtSec: legacyClaim.checkpoints.map((c) => c.atSec) }, 'validado equidistante');
       // Control: sin la negociación, el claim anclado lo dejaba retenido (el bug I-1).
       const bad = await run(oldSrc, anchoredClaim);
       assert(bad.ok === false && /VIDEO_PLAN_MISMATCH/.test(bad.error), 'control: ' + JSON.stringify(bad));
@@ -322,6 +321,55 @@ async function main() {
     eq(serverOk(rc, true).timelineSource, 'videogen_scenes', 'validado anclado');
     const rl = await run(curSrc, legacyClaim);
     assert(rl.ok === true && rl.summary.timelineSource === 'even_spacing', 'ejecutor actual con claim de siempre');
+  });
+
+  await check('M-7 duración cruda: con d no entera, claim, validación del servidor y .h5p dan el MISMO plan anclado (escala con la d medida)', async () => {
+    const d2 = SCENES[SCENES.length - 1].endSec + 0.83;
+    const claim = V3.videoClaimFacts({ videoItemKey: 'video:ch1', outputSummary: { youtubeVideoId: YT, durationSec: d2, videoScenes: SCENES } }).video;
+    eq(claim.checkpoints, P.planVideoCheckpoints(d2, SCENES).checkpoints, 'claim');
+    const n = claim.checkpoints.length;
+    const r = V3.validateV3ItemArtifact({ type: 'video_interactions', itemKey: 'video_interactions:ch1', chapterId: 'ch1', video: { videoItemKey: 'video:ch1', durationSec: d2, videoScenes: SCENES } }, JSON.stringify(interactionsDoc(n, d2)));
+    assert(r.ok, JSON.stringify(r.errors));
+    eq(r.summary.checkpointsAtSec, claim.checkpoints.map((c) => c.atSec), 'validación');
+    const b = await ACT.buildVideoActivity({ itemKey: 'video:ch1', title: 'Capítulo 1', youtubeId: YT, durationSec: d2, interactionsDoc: interactionsDoc(n, d2), videoScenes: SCENES });
+    eq(b.checkpoints, claim.checkpoints, '.h5p');
+  });
+
+  await check('I-2 checkpointsFromValidatedSeconds: válidos → esos segundos (segmento [anterior, atSec]); n distinta, fuera de ventana, gap < 20, no enteros → motivo', () => {
+    const even = P.planInteractionCheckpoints(D).map((c) => c.atSec);
+    const ok = P.checkpointsFromValidatedSeconds(D, even.map((a) => a + 3));
+    assert(ok.ok, JSON.stringify(ok));
+    eq(ok.checkpoints.map((c) => [c.atSec, c.segment]), even.map((a, i) => [a + 3, [i === 0 ? 0 : even[i - 1] + 3, a + 3]]), 'segundos');
+    const bad = [[even.slice(1), /preguntas validadas; las reglas vigentes piden/], [[10, ...even.slice(1)], /fuera de \[30,/], [even.map((a, i) => (i === 1 ? even[0] + 5 : a)), /a menos de 20 s/], [even.map((a) => a + 0.5), /no entero/], [null, /sin segundos/]];
+    for (const [x, re] of bad) {
+      const r = P.checkpointsFromValidatedSeconds(D, x);
+      assert(r.ok === false && re.test(r.reason), JSON.stringify(r));
+    }
+  });
+
+  await check('I-2 buildVideoActivity con los segundos validados: iguales al plan → bytes de siempre; distintos y válidos → esos segundos en el .h5p (marcado); inválidos → VIDEO_TIMELINE_MISMATCH', async () => {
+    const n = P.planInteractionCheckpoints(D).length;
+    const input = { itemKey: 'video:ch1', title: 'Capítulo 1', youtubeId: YT, durationSec: D, interactionsDoc: interactionsDoc(n, D) };
+    const same = await ACT.buildVideoActivity({ ...input, checkpointsAtSec: P.planInteractionCheckpoints(D).map((c) => c.atSec) });
+    eq([same.sha256, !!same.checkpointsFromValidation], [GOLDEN_SHA_V1, false], 'iguales');
+    const moved = P.planInteractionCheckpoints(D).map((c) => c.atSec + 4);
+    const b = await ACT.buildVideoActivity({ ...input, checkpointsAtSec: moved });
+    eq([b.checkpoints.map((c) => c.atSec), b.checkpointsFromValidation], [moved, true], 'validados');
+    const content = JSON.parse(await (await JSZip.loadAsync(b.h5p)).file('content/content.json').async('string'));
+    eq(content.interactiveVideo.assets.interactions.map((x) => x.duration.from), moved, 'en el .h5p');
+    let msg = '';
+    try { await ACT.buildVideoActivity({ ...input, checkpointsAtSec: moved.slice(1) }); } catch (e) { msg = e.message; }
+    assert(/VIDEO_TIMELINE_MISMATCH/.test(msg), msg);
+  });
+
+  await check('I-2 VIDEO_TIMELINE_MISMATCH es clase B (package_component, reparable): el empaque automático regenera SOLO ese video_interactions — nunca unclassified/hold_for_human', () => {
+    const C = load('modules/reliability/failure-classifier.js');
+    const AP = load('modules/dynamic-packaging/auto-package.service.js');
+    const text = 'VIDEO_TIMELINE_MISMATCH: las preguntas de video_interactions:ch1 no se pueden colocar en los segundos con que se validaron sobre video:ch1 (3 preguntas validadas; las reglas vigentes piden 4); se regeneran solo esas preguntas (no se mueven en silencio).';
+    const v = C.classifyFailure({ source: 'package_worker', error: text });
+    eq([v.unclassified, v.class, v.rule, v.code], [false, 'B', 'package_component', 'VIDEO_TIMELINE_MISMATCH'], 'veredicto');
+    assert(v.strategy !== 'hold_for_human', v.strategy);
+    eq(AP.packageBlockItemKey(text, ['video_interactions:ch1:VIDEO_TIMELINE_MISMATCH'], ['video:ch1', 'video_interactions:ch1', 'content:ch1']), 'video_interactions:ch1', 'item a regenerar');
   });
 
   console.log(`\n${passes} ok, ${failures} fail`);

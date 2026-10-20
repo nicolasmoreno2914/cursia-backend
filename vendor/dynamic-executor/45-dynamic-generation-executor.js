@@ -3597,7 +3597,7 @@ function dynScenesForCheckpoint(checkpoint, scenes) {
   var s0 = Array.isArray(checkpoint.segment) ? checkpoint.segment[0] : checkpoint.segmentStart;
   return (scenes || []).filter(function (s) { var e = Math.ceil(s.endSec - 1e-6); return e > s0 && e <= checkpoint.atSec; });
 }
-// Review M-1: tiempos re-escalados por d/Σ (d = segundos enteros medidos) a la línea de tiempo del MP4; espejo de scaleVideoScenes.
+// Review M-1/M-7: tiempos re-escalados por d/Σ (d = duración medida, sin redondear) a la línea de tiempo del MP4; espejo de scaleVideoScenes.
 function dynScaleVideoScenes(durationSec, scenes) {
   var f = durationSec / scenes[scenes.length - 1].endSec;
   var at = function (x) { return Math.round(x * f * 1000) / 1000; };
@@ -3613,7 +3613,7 @@ function dynPlanVideoCheckpoints(durationSec, scenes) {
   var lo = C.noInteractionFirstSec;
   var hi = d - C.noInteractionLastSec;
   var cand = [];
-  var sc = dynScaleVideoScenes(d, scenes); // d = floor(duración), como el servidor
+  var sc = dynScaleVideoScenes(durationSec, scenes); // review M-7: la duración MEDIDA cruda, como el servidor
   sc.forEach(function (s) {
     var b = Math.ceil(s.endSec - 1e-6);
     if (b >= lo && b <= hi && (!cand.length || b > cand[cand.length - 1])) cand.push(b);
@@ -3708,7 +3708,7 @@ function dynValidateVideoInteractionsDoc(doc, expect) {
   try {
     var pd = dynVideoPlanDurationSec(doc.durationSec);
     if (expect.durationSec !== undefined && pd !== dynVideoPlanDurationSec(expect.durationSec)) issues.add('durationSec', 'debe coincidir con la duración real ' + dynVideoPlanDurationSec(expect.durationSec) + ' s (recibido ' + pd + ')');
-    plan = dynPlanVideoCheckpoints(pd, expect.videoScenes).checkpoints;
+    plan = dynPlanVideoCheckpoints(expect.durationSec !== undefined ? expect.durationSec : pd, expect.videoScenes).checkpoints;
   } catch (e) { issues.add('durationSec', (e && e.message) || String(e)); }
   if (plan && _dynH5pArray(issues, 'checkpoints', doc.checkpoints, plan.length, plan.length)) {
     doc.checkpoints.forEach(function (c, i) {

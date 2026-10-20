@@ -353,10 +353,12 @@ async function r61TimelineChecks() {
     }
     return f;
   };
-  const load = async (f, validatedAnchored) => {
+  const load = async (f, validatedAnchored, atSec) => {
     const byItem = await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest);
-    if (validatedAnchored) for (const it of byItem.values()) {
-      if (it.type === 'video_interactions') it.outputSummary = { ...(it.outputSummary || {}), v3Validation: { timelineSource: 'videogen_scenes' } };
+    for (const it of byItem.values()) {
+      if (it.type !== 'video_interactions') continue;
+      const v = { ...(validatedAnchored ? { timelineSource: 'videogen_scenes' } : {}), ...(atSec ? { checkpointsAtSec: atSec } : {}) };
+      if (Object.keys(v).length) it.outputSummary = { ...(it.outputSummary || {}), v3Validation: v };
     }
     const plan = PV3.buildPackagingPlanV3(f.manifest, f.fx.blueprint, { manifestId: 9001 });
     return PK.loadContentsV3(fakeLoaders(f).L, plan, byItem, f.run, { familyId: 'aula-clara', mode: 'light' });
@@ -372,6 +374,33 @@ async function r61TimelineChecks() {
     const r = await load(setup(true), true);
     assert(r.contents.videos.size > 0, 'hay videos');
     for (const v of r.contents.videos.values()) eq(v.videoScenes, scenes, 'escenas');
+  });
+  const C = loadDist('modules/reliability/failure-classifier.js');
+  const AP = loadDist('modules/dynamic-packaging/auto-package.service.js');
+  const anchoredToday = IV.planVideoCheckpoints(PF.VIDEO_SECONDS, scenes).checkpoints.map((c) => c.atSec);
+  await check('r61 Q-04 re-review I-2: re-empaque tras un cambio de reglas/escalado (los segundos validados ya no son los que se re-derivan hoy) → usa los VALIDADOS, deja el aviso, arma el .mbz solo (sin hold)', async () => {
+    const validated = anchoredToday.map((a) => a + 2); // validados con otro escalado/regla: siguen cumpliendo el invariante
+    const f = setup(true);
+    const r = await load(f, true, validated);
+    for (const v of r.contents.videos.values()) eq(v.checkpointsAtSec, validated, 'segundos validados');
+    const keys = [...(await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest)).values()].filter((i) => i.type === 'video_interactions').map((i) => i.itemKey);
+    eq(r.warnings.filter((w) => w.startsWith('video_checkpoints_from_validation:')).sort(), keys.map((k) => `video_checkpoints_from_validation:${k}`).sort(), 'evento registrado por capítulo');
+    const built = await B.buildDynamicMbzV3({ ...realRunFixture('h5p').fx, contents: r.contents });
+    assert(built && built.mbz && built.mbz.length > 0, 'el .mbz se arma');
+    // Segundos validados = los de hoy → sin aviso (y el .mbz de siempre con el plan anclado).
+    const same = await load(setup(true), true, anchoredToday);
+    eq(same.warnings.filter((w) => w.startsWith('video_checkpoints_from_validation:')), [], 'sin aviso si coinciden');
+  });
+  await check('r61 Q-04 re-review I-2: segundos validados que ya no cumplen el invariante (otra cantidad de preguntas) → VIDEO_TIMELINE_MISMATCH clase B con el item a regenerar (auto-reparación, nunca hold_for_human)', async () => {
+    let err = null;
+    try { await load(setup(true), true, anchoredToday.slice(1)); } catch (e) { err = e; }
+    assert(err instanceof PT.PackagingNotReadyError && /^VIDEO_TIMELINE_MISMATCH: /.test(err.message), `vino ${err && err.message}`);
+    const v = C.classifyFailure({ source: 'package_worker', error: err.message });
+    eq([v.unclassified, v.class, v.rule], [false, 'B', 'package_component'], 'clase B reparable');
+    const f = setup(true);
+    const items = [...(await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest)).keys()];
+    const key = AP.packageBlockItemKey(err.message, err.missing, items);
+    assert(key && key.startsWith('video_interactions:'), `item a regenerar: ${key}`);
   });
   await check('r61 Q-04: preguntas validadas ancladas pero el video ya no da ese plan → PackagingNotReadyError VIDEO_TIMELINE_MISMATCH (nunca se mueven en silencio)', async () => {
     let err = null;

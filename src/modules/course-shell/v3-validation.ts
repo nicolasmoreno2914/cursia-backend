@@ -305,7 +305,11 @@ function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string
           ...(ctx.video.videoScenes !== undefined ? { videoScenes: ctx.video.videoScenes } : {}),
         });
         // r61 Q-04: solo se marca el plan anclado a escenas (el equidistante deja el summary de siempre).
-        const tl = r.timelineSource === 'videogen_scenes' ? { timelineSource: r.timelineSource } : {};
+        const tl = {
+          ...(r.timelineSource === 'videogen_scenes' ? { timelineSource: r.timelineSource } : {}),
+          // Re-review I-2: los segundos con que se validaron (el empaquetado los usa tal cual; nunca re-deriva otros).
+          checkpointsAtSec: r.checkpoints.map((c) => c.atSec),
+        };
         if (!v2) return { ok: true, errors: [], summary: { interactionCount: r.checkpoints.length, ...tl } };
         return {
           ok: true,

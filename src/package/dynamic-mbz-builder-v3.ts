@@ -304,7 +304,7 @@ export interface DynamicPackageContentsV3 {
   /** chapterId → bytes del PDF y de la portada (reales, o sintéticos si el run es mock). */
   presentations: Map<string, { pdf: Buffer; cover: Buffer; mock?: boolean }>;
   /** chapterId → video publicado (YouTube) con su duración MEDIDA. */
-  videos: Map<string, { youtubeId: string; durationSec: number; videoScenes?: unknown }>;
+  videos: Map<string, { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] }>;
   videoInteractions: Map<string, unknown>;
   activities: Map<string, ActivityContentV3>;
   examGift: Map<string, string>;
@@ -1744,7 +1744,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
           continue;
         }
         if (slot.kind === 'video_h5p') {
-          const video = c.videos.get(ch.chapterId) as { youtubeId: string; durationSec: number; videoScenes?: unknown };
+          const video = c.videos.get(ch.chapterId) as { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] };
           const key = ch.keys.video as string;
           const built = await buildVideoActivity({
             itemKey: key,
@@ -1755,6 +1755,8 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
             interactionsDoc: c.videoInteractions.get(ch.chapterId),
             // r61 Q-04: preguntas al final de la escena que cubren (sin escenas → plan equidistante).
             ...(video.videoScenes !== undefined ? { videoScenes: video.videoScenes } : {}),
+            // Re-review I-2: los segundos con que se validaron las preguntas (los verificó loadContentsV3).
+            ...(video.checkpointsAtSec !== undefined ? { checkpointsAtSec: video.checkpointsAtSec } : {}),
             // EV6 IV avanzado: solo Manifests con features.ivAdvanced = 1 (schemaVersion 2).
             ...(manifest.features?.ivAdvanced === 1 ? { ivAdvanced: true } : {}),
           });

@@ -240,7 +240,7 @@ export interface VideoCheckpointPlan {
 
 /**
  * Review M-1: el MP4 real deriva respecto de Σ escenas (cada clip `-t` se redondea a frames y el AAC agrega
- * relleno). Se re-escalan los tiempos por d/Σ (d = duración medida en segundos enteros) para que el fin de cada escena
+ * relleno). Se re-escalan los tiempos por d/Σ (d = duración medida, sin redondear) para que el fin de cada escena
  * caiga donde termina en el video publicado. 3 decimales, misma aritmética en el espejo del navegador.
  */
 export function scaleVideoScenes(durationSec: number, scenes: VideoScene[]): VideoScene[] {
@@ -360,8 +360,9 @@ export function planVideoCheckpoints(durationSec: number, scenes?: unknown): Vid
   const d = videoPlanDurationSec(durationSec);
   const problem = videoScenesProblem(d, scenes);
   if (problem) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: problem };
-  // Se escala a d = floor(duración): el plan es función de los segundos enteros (claim, validación y .h5p coinciden).
-  const sc = scaleVideoScenes(d, scenes as VideoScene[]);
+  // Review M-7: se escala con la duración MEDIDA (sin floor): claim, validación y .h5p reciben la misma d cruda
+  // (activity.ts la pasa sin redondear), así el fin escalado de cada escena es el del MP4.
+  const sc = scaleVideoScenes(durationSec, scenes as VideoScene[]);
   const lo = R.noInteractionFirstSec;
   const hi = d - R.noInteractionLastSec;
   const cand: number[] = [];
@@ -411,4 +412,31 @@ export function planVideoCheckpoints(durationSec: number, scenes?: unknown): Vid
   const out: VideoCheckpoint[] = picks.map((atSec, i) => ({ index: i + 1, atSec, segment: [i === 0 ? 0 : picks[i - 1], atSec] as [number, number] }));
   assertSceneAnchoredCheckpoints(d, out, sc);
   return { checkpoints: out, timelineSource: 'videogen_scenes', scenes: sc };
+}
+
+/**
+ * r61 Q-04 (re-review I-2): checkpoints a partir de los segundos con los que el servidor VALIDÓ las preguntas
+ * (`v3Validation.checkpointsAtSec`). El empaquetado los usa tal cual mientras sigan cumpliendo el invariante del
+ * .h5p con las reglas vigentes: misma cantidad n que el plan de la duración, enteros crecientes en [30, d − 15] y
+ * ≥ 20 s entre sí; segmento [anterior (0), atSec]. Si no, null + motivo (→ regenerar solo esas preguntas).
+ */
+export function checkpointsFromValidatedSeconds(durationSec: number, atSecs: unknown): { ok: true; checkpoints: VideoCheckpoint[] } | { ok: false; reason: string } {
+  const R = VIDEO_CHECKPOINT_RULES;
+  let d: number;
+  let n: number;
+  try {
+    d = videoPlanDurationSec(durationSec);
+    n = planInteractionCheckpoints(d).length;
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message };
+  }
+  if (!Array.isArray(atSecs)) return { ok: false, reason: 'sin segundos validados' };
+  if (atSecs.length !== n) return { ok: false, reason: `${atSecs.length} preguntas validadas; las reglas vigentes piden ${n}` };
+  for (let i = 0; i < atSecs.length; i++) {
+    const a = atSecs[i];
+    if (!Number.isInteger(a)) return { ok: false, reason: `segundo ${i + 1} no entero` };
+    if (a < R.noInteractionFirstSec || a > d - R.noInteractionLastSec) return { ok: false, reason: `pregunta ${i + 1} en ${a} s fuera de [${R.noInteractionFirstSec}, ${d - R.noInteractionLastSec}]` };
+    if (i > 0 && a - atSecs[i - 1] < R.minGapSec) return { ok: false, reason: `preguntas ${i} y ${i + 1} a menos de ${R.minGapSec} s` };
+  }
+  return { ok: true, checkpoints: (atSecs as number[]).map((atSec, i) => ({ index: i + 1, atSec, segment: [i === 0 ? 0 : (atSecs as number[])[i - 1], atSec] as [number, number] })) };
 }

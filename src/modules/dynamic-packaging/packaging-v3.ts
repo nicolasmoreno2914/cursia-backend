@@ -76,7 +76,7 @@ import {
   assessmentPackageSummary,
   assessmentPackageWarnings,
 } from '../../package/dynamic-mbz-builder-v3';
-import { h5pProfileVersion, planVideoCheckpoints } from '../../package/h5p';
+import { checkpointsFromValidatedSeconds, h5pProfileVersion, planVideoCheckpoints } from '../../package/h5p';
 import { resolveAssessment } from '../../package/assessment';
 import { syntheticCoverPng, syntheticMp3, syntheticPdf } from '../../package/v3/synthetic-media';
 import { themeMismatch, validatePresentationArtifact } from '../../package/presentation';
@@ -722,7 +722,7 @@ export async function loadContentsV3(
     content?: string;
     experience?: unknown;
     presentation?: PresentationSlot;
-    video?: { youtubeId: string; durationSec: number; videoScenes?: unknown };
+    video?: { value: { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] }; warnings: string[] };
     videoInteractions?: unknown;
     activityPayload?: unknown;
     scormHtml?: string;
@@ -781,7 +781,8 @@ export async function loadContentsV3(
     return { value: { pdf, cover }, warnings: w };
   };
 
-  const loadVideo = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<{ youtubeId: string; durationSec: number; videoScenes?: unknown }> => {
+  type VideoSlot = { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] };
+  const loadVideo = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<{ value: VideoSlot; warnings: string[] }> => {
     if (delivery !== 'youtube') {
       throw new PackagingNotReadyError(
         [`${ch.keys.video}:${V3_VIDEO_REQUIRES_YOUTUBE}`],
@@ -797,23 +798,39 @@ export async function loadContentsV3(
     if (!Number.isFinite(dur) || dur <= 0) {
       throw new PackagingNotReadyError([`${ch.keys.video}:VIDEO_DURATION_MISSING`], `VIDEO_DURATION_MISSING: ${ch.keys.video} no tiene la duración medida del video.`);
     }
-    // r61 Q-04 (review M-6): las preguntas se colocan con el plan con el que se VALIDARON (v3Validation.timelineSource
-    // del item video_interactions), nunca con uno re-derivado distinto. Validadas ancladas → las escenas del video
-    // deben dar ese mismo plan anclado (si no, falla a la vista: regenerar las preguntas); validadas equidistantes
-    // (o antes de r61) → plan equidistante aunque el video traiga escenas.
-    const validatedSource = ch.keys.videoInteractions ? byItem.get(ch.keys.videoInteractions as string)?.outputSummary?.v3Validation?.timelineSource : undefined;
-    if (validatedSource === 'videogen_scenes') {
-      let ok = false;
-      try { ok = planVideoCheckpoints(dur, Array.isArray(data.videoScenes) ? data.videoScenes : null).timelineSource === 'videogen_scenes'; } catch { ok = false; }
-      if (!ok) {
-        throw new PackagingNotReadyError(
-          [`${ch.keys.videoInteractions}:VIDEO_TIMELINE_MISMATCH`],
-          `VIDEO_TIMELINE_MISMATCH: las preguntas de ${ch.keys.videoInteractions} se validaron ancladas a las escenas del video, pero ${ch.keys.video} ya no da ese plan; regenera las preguntas del video (no se mueven en silencio).`,
-        );
-      }
-      return { youtubeId: check.videoId, durationSec: dur, videoScenes: data.videoScenes };
+    // r61 Q-04 (review M-6, re-review I-2): las preguntas se colocan con el plan con el que se VALIDARON, nunca con
+    // uno re-derivado distinto (un deploy que cambia reglas o escalado entre la validación y un re-empaque):
+    //  1. v3Validation.checkpointsAtSec (los segundos validados) → se usan tal cual si siguen cumpliendo el
+    //     invariante del .h5p; si difieren del plan de hoy queda el aviso `video_checkpoints_from_validation`;
+    //  2. sin segundos (validado antes de r61) → el plan de su timelineSource (equidistante si no dice nada);
+    //  3. si nada de eso sirve → VIDEO_TIMELINE_MISMATCH (clase B, package_component): el empaque automático
+    //     regenera SOLO esas preguntas y vuelve a empaquetar (nunca un humano, nunca un corrimiento silencioso).
+    const viKey = ch.keys.videoInteractions as string | undefined;
+    const validation = viKey ? byItem.get(viKey)?.outputSummary?.v3Validation : undefined;
+    const anchoredValidated = validation?.timelineSource === 'videogen_scenes';
+    const scenes = Array.isArray(data.videoScenes) ? data.videoScenes : null;
+    const mismatch = (why: string) => new PackagingNotReadyError(
+      [`${viKey}:VIDEO_TIMELINE_MISMATCH`],
+      `VIDEO_TIMELINE_MISMATCH: las preguntas de ${viKey} no se pueden colocar en los segundos con que se validaron sobre ${ch.keys.video} (${why}); se regeneran solo esas preguntas (no se mueven en silencio).`,
+    );
+    const base = { youtubeId: check.videoId, durationSec: dur, ...(anchoredValidated && scenes ? { videoScenes: scenes } : {}) };
+    if (Array.isArray(validation?.checkpointsAtSec)) {
+      const fixed = checkpointsFromValidatedSeconds(dur, validation.checkpointsAtSec);
+      if (fixed.ok === false) throw mismatch(fixed.reason);
+      let today: number[] | null = null;
+      try { today = planVideoCheckpoints(dur, anchoredValidated ? scenes : null).checkpoints.map((c) => c.atSec); } catch { today = null; }
+      const same = !!today && today.length === fixed.checkpoints.length && today.every((a, i) => a === fixed.checkpoints[i].atSec);
+      return {
+        value: { ...base, checkpointsAtSec: fixed.checkpoints.map((c) => c.atSec) },
+        warnings: same ? [] : [`video_checkpoints_from_validation:${viKey}`],
+      };
     }
-    return { youtubeId: check.videoId, durationSec: dur };
+    if (anchoredValidated) {
+      let ok = false;
+      try { ok = planVideoCheckpoints(dur, scenes).timelineSource === 'videogen_scenes'; } catch { ok = false; }
+      if (!ok) throw mismatch('las escenas del video ya no dan el plan anclado');
+    }
+    return { value: base, warnings: [] };
   };
 
   // Tareas en el MISMO orden que el loop secuencial de antes.
@@ -899,7 +916,7 @@ export async function loadContentsV3(
   const contentMd = new Map<string, string>();
   const experiences = new Map<string, unknown>();
   const presentations = new Map<string, { pdf: Buffer; cover: Buffer; mock?: boolean }>();
-  const videos = new Map<string, { youtubeId: string; durationSec: number; videoScenes?: unknown }>();
+  const videos = new Map<string, { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] }>();
   const videoInteractions = new Map<string, unknown>();
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
@@ -927,7 +944,9 @@ export async function loadContentsV3(
         presentations.set(ch.chapterId, pres.value);
       }
       if (ch.keys.video) {
-        videos.set(ch.chapterId, slot.video as { youtubeId: string; durationSec: number; videoScenes?: unknown });
+        const vs = slot.video as { value: { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] }; warnings: string[] };
+        warnings.push(...vs.warnings);
+        videos.set(ch.chapterId, vs.value);
         videoInteractions.set(ch.chapterId, slot.videoInteractions);
       }
       if (ch.keys.activity) {

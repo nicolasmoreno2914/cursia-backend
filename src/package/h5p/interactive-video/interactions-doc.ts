@@ -21,7 +21,7 @@ import {
   checkPlainText,
   isPlainObject,
 } from '../types/common';
-import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, VideoTimelineSource, planReflectionPauses, planVideoCheckpoints, videoPlanDurationSec } from './plan';
+import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, VideoPlanError, VideoTimelineSource, checkpointsFromValidatedSeconds, planReflectionPauses, planVideoCheckpoints, videoPlanDurationSec } from './plan';
 
 export const VIDEO_INTERACTIONS_SCHEMA_VERSION = 1;
 /**
@@ -85,6 +85,12 @@ export interface VideoInteractionsExpectations {
    * escenas utilizables el plan se ancla a ellas (planVideoCheckpoints); ausente ⇒ plan equidistante.
    */
   videoScenes?: unknown;
+  /**
+   * r61 Q-04 (re-review I-2): segundos con los que el servidor validó las preguntas (v3Validation.checkpointsAtSec).
+   * Si se dan y siguen cumpliendo el invariante, el plan son ESOS segundos (nunca se mueven en silencio); si ya no
+   * lo cumplen → VIDEO_TIMELINE_MISMATCH (el empaquetado regenera solo esas preguntas).
+   */
+  checkpointsAtSec?: number[];
 }
 
 export interface VideoInteractionsPlan {
@@ -92,6 +98,8 @@ export interface VideoInteractionsPlan {
   /** r61 Q-04: de dónde salen los segundos de los checkpoints. */
   timelineSource: VideoTimelineSource;
   timelineReason?: string;
+  /** r61 Q-04 (I-2): true = los segundos salen de la validación y difieren del plan re-derivado hoy. */
+  checkpointsFromValidation?: boolean;
   /** Vacío en schemaVersion 1. */
   reflectionPlan: ReflectionPlan;
 }
@@ -129,14 +137,26 @@ export function validateVideoInteractionsDocFull(doc: unknown, expect: VideoInte
   let plan: VideoCheckpoint[] | null = null;
   let planDur: number | null = null;
   let timeline: { timelineSource: VideoTimelineSource; timelineReason?: string } = { timelineSource: 'even_spacing', timelineReason: 'no_scene_data' };
+  let checkpointsFromValidation = false;
   try {
     planDur = videoPlanDurationSec(d.durationSec as number);
     if (expect.durationSec !== undefined && planDur !== videoPlanDurationSec(expect.durationSec)) {
       issues.add('durationSec', `debe coincidir con la duración real ${videoPlanDurationSec(expect.durationSec)} s (recibido ${planDur})`);
     }
-    const vp = planVideoCheckpoints(planDur, expect.videoScenes);
+    // Review M-7: el plan se calcula con la duración MEDIDA cruda (expect.durationSec) si se da.
+    const vp = planVideoCheckpoints(expect.durationSec !== undefined ? expect.durationSec : planDur, expect.videoScenes);
     plan = vp.checkpoints;
     timeline = vp.timelineReason !== undefined ? { timelineSource: vp.timelineSource, timelineReason: vp.timelineReason } : { timelineSource: vp.timelineSource };
+    if (expect.checkpointsAtSec !== undefined) {
+      const fixed = checkpointsFromValidatedSeconds(planDur, expect.checkpointsAtSec);
+      if (fixed.ok === false) throw new VideoPlanError('VIDEO_TIMELINE_MISMATCH', `los segundos validados ya no sirven: ${fixed.reason}`);
+      // Iguales al plan de hoy → el plan de siempre (mismos segmentos, mismos bytes); distintos → los validados.
+      const cur = plan;
+      if (fixed.checkpoints.some((c, i) => c.atSec !== cur[i]?.atSec)) {
+        plan = fixed.checkpoints;
+        checkpointsFromValidation = true;
+      }
+    }
   } catch (err) {
     issues.add('durationSec', (err as Error).message);
   }
@@ -204,7 +224,7 @@ export function validateVideoInteractionsDocFull(doc: unknown, expect: VideoInte
     }
   }
   issues.throwIfAny('VideoInteractions');
-  return { checkpoints: plan as VideoCheckpoint[], reflectionPlan, ...timeline };
+  return { checkpoints: plan as VideoCheckpoint[], reflectionPlan, ...timeline, ...(checkpointsFromValidation ? { checkpointsFromValidation: true } : {}) };
 }
 
 /** Mensaje de remediación por defecto (pregunta sin feedbackIncorrect). */
