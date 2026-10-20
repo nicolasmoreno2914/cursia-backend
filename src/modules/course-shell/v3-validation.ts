@@ -318,6 +318,8 @@ function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string
             interactionCount: r.checkpoints.length,
             ...tl,
             reflectionCount: r.reflectionPlan.reflections.length,
+            // r61 Q-04: las pausas validadas (el empaque las usa tal cual mientras sigan siendo válidas).
+            reflectionsAt: r.reflectionPlan.reflections.map((x) => ({ index: x.index, atSec: x.atSec, afterCheckpoint: x.afterCheckpoint })),
             droppedReflections: r.reflectionPlan.droppedReflections,
           },
         };

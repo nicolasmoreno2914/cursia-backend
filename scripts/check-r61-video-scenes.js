@@ -62,6 +62,7 @@ const YT = 'IdwOipZAeqY';
 // buildVideoActivity sin escenas con origin/staging 7138145 (dist compilado de ese commit, mismas entradas).
 const GOLDEN_SHA_V1 = 'fe950bbbea524dac0ad8b058def5097749acb0f488111372017549d603980a62';
 const GOLDEN_SHA_V2 = '2d1f1f97fe4aaa2605c933b4f63107fdbc5720ef466a7d82fd2f168cfe879b1a';
+const GOLDEN_SHA_V2_D = GOLDEN_SHA_V2; // mismo documento (prompts iguales) → mismos bytes de origin/staging
 
 function interactionsDoc(n, durationSec, extra) {
   return Object.assign({
@@ -370,6 +371,39 @@ async function main() {
     eq([v.unclassified, v.class, v.rule, v.code], [false, 'B', 'package_component', 'VIDEO_TIMELINE_MISMATCH'], 'veredicto');
     assert(v.strategy !== 'hold_for_human', v.strategy);
     eq(AP.packageBlockItemKey(text, ['video_interactions:ch1:VIDEO_TIMELINE_MISMATCH'], ['video:ch1', 'video_interactions:ch1', 'content:ch1']), 'video_interactions:ch1', 'item a regenerar');
+  });
+
+  await check('duda 2 (ivAdvanced): pausas validadas — válidas → esas en el .h5p (marcado); iguales → bytes de siempre; inválidas (choque, cantidad, fuera de tramo) → VIDEO_TIMELINE_MISMATCH', async () => {
+    const cps = P.planInteractionCheckpoints(D);
+    const n = cps.length;
+    const today = P.planReflectionPauses(D, cps).reflections;
+    const doc = (k) => interactionsDoc(n, D, { schemaVersion: 2, reflections: Array.from({ length: k }, (_, i) => ({ index: (today[i] || { index: i + 1 }).index, prompt: '¿Cómo lo aplicarías?' })) });
+    const input = { itemKey: 'video:ch1', title: 'Capítulo 1', youtubeId: YT, durationSec: D, ivAdvanced: true };
+    const same = await ACT.buildVideoActivity({ ...input, interactionsDoc: doc(today.length), reflectionsAt: today });
+    eq([same.sha256, !!same.checkpointsFromValidation], [GOLDEN_SHA_V2_D, false], 'iguales → bytes de siempre');
+    const moved = today.map((r) => ({ ...r, atSec: r.atSec + 2 }));
+    eq(P.reflectionsFromValidated(D, cps, moved).ok, true, 'movidas válidas');
+    const b = await ACT.buildVideoActivity({ ...input, interactionsDoc: doc(moved.length), reflectionsAt: moved });
+    eq([b.reflections, b.checkpointsFromValidation], [moved, true], 'validadas');
+    const content = JSON.parse(await (await JSZip.loadAsync(b.h5p)).file('content/content.json').async('string'));
+    const froms = content.interactiveVideo.assets.interactions.map((x) => x.duration.from);
+    moved.forEach((r) => assert(froms.includes(r.atSec), `pausa en ${r.atSec} dentro del .h5p`));
+    const bad = [
+      [[{ ...today[0], atSec: cps[today[0].afterCheckpoint - 1].atSec + 5 }], /choca con la pregunta/],
+      [[...today, { index: 3, atSec: today[today.length - 1].atSec + 30, afterCheckpoint: today[today.length - 1].afterCheckpoint }], /admiten/],
+      [[{ ...today[0], afterCheckpoint: n }], /no hay checkpoints/],
+      [[{ index: 1, atSec: 'x', afterCheckpoint: 1 }], /mal formada/],
+    ];
+    for (const [x, re] of bad) {
+      const r = P.reflectionsFromValidated(D, cps, x);
+      assert(r.ok === false && re.test(r.reason), JSON.stringify(r));
+    }
+    let msg = '';
+    try { await ACT.buildVideoActivity({ ...input, interactionsDoc: doc(1), reflectionsAt: bad[0][0] }); } catch (e) { msg = e.message; }
+    assert(/VIDEO_TIMELINE_MISMATCH/.test(msg), msg);
+    const C = load('modules/reliability/failure-classifier.js');
+    const v = C.classifyFailure({ source: 'package_worker', error: 'video_interactions:ch1: H5P_INPUT_INVALID(VideoInteractions): reflections: debe tener 2 elementos' });
+    eq([v.class, v.rule], ['B', 'package_component'], 'documento que ya no cuadra (nombrado por el builder) → reparable');
   });
 
   console.log(`\n${passes} ok, ${failures} fail`);

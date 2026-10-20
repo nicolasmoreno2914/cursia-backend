@@ -76,7 +76,7 @@ import {
   assessmentPackageSummary,
   assessmentPackageWarnings,
 } from '../../package/dynamic-mbz-builder-v3';
-import { checkpointsFromValidatedSeconds, h5pProfileVersion, planVideoCheckpoints } from '../../package/h5p';
+import { checkpointsFromValidatedSeconds, h5pProfileVersion, planReflectionPauses, planVideoCheckpoints, reflectionsFromValidated } from '../../package/h5p';
 import { resolveAssessment } from '../../package/assessment';
 import { syntheticCoverPng, syntheticMp3, syntheticPdf } from '../../package/v3/synthetic-media';
 import { themeMismatch, validatePresentationArtifact } from '../../package/presentation';
@@ -722,7 +722,7 @@ export async function loadContentsV3(
     content?: string;
     experience?: unknown;
     presentation?: PresentationSlot;
-    video?: { value: { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] }; warnings: string[] };
+    video?: { value: { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[]; reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }> }; warnings: string[] };
     videoInteractions?: unknown;
     activityPayload?: unknown;
     scormHtml?: string;
@@ -781,7 +781,7 @@ export async function loadContentsV3(
     return { value: { pdf, cover }, warnings: w };
   };
 
-  type VideoSlot = { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] };
+  type VideoSlot = { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[]; reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }> };
   const loadVideo = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<{ value: VideoSlot; warnings: string[] }> => {
     if (delivery !== 'youtube') {
       throw new PackagingNotReadyError(
@@ -814,15 +814,28 @@ export async function loadContentsV3(
       `VIDEO_TIMELINE_MISMATCH: las preguntas de ${viKey} no se pueden colocar en los segundos con que se validaron sobre ${ch.keys.video} (${why}); se regeneran solo esas preguntas (no se mueven en silencio).`,
     );
     const base = { youtubeId: check.videoId, durationSec: dur, ...(anchoredValidated && scenes ? { videoScenes: scenes } : {}) };
+    // Pausas de reflexión validadas (ivAdvanced): mismas reglas — válidas contra los checkpoints con que se
+    // empaqueta → esas; si no → VIDEO_TIMELINE_MISMATCH nombrando el item (auto-reparación de ESAS preguntas).
+    const reflections = (cps: Array<{ index: number; atSec: number; segment: [number, number] }>): { reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }>; moved: boolean } => {
+      if (!Array.isArray(validation?.reflectionsAt)) return { moved: false };
+      const fixedR = reflectionsFromValidated(dur, cps, validation.reflectionsAt);
+      if (fixedR.ok === false) throw mismatch(`pausas de reflexión: ${fixedR.reason}`);
+      let todayR: Array<{ index: number; atSec: number; afterCheckpoint: number }> | null = null;
+      try { todayR = planReflectionPauses(dur, cps).reflections; } catch { todayR = null; }
+      const sameR = !!todayR && todayR.length === fixedR.reflections.length
+        && todayR.every((r, i) => r.index === fixedR.reflections[i].index && r.atSec === fixedR.reflections[i].atSec && r.afterCheckpoint === fixedR.reflections[i].afterCheckpoint);
+      return { reflectionsAt: fixedR.reflections, moved: !sameR };
+    };
     if (Array.isArray(validation?.checkpointsAtSec)) {
       const fixed = checkpointsFromValidatedSeconds(dur, validation.checkpointsAtSec);
       if (fixed.ok === false) throw mismatch(fixed.reason);
-      let today: number[] | null = null;
-      try { today = planVideoCheckpoints(dur, anchoredValidated ? scenes : null).checkpoints.map((c) => c.atSec); } catch { today = null; }
-      const same = !!today && today.length === fixed.checkpoints.length && today.every((a, i) => a === fixed.checkpoints[i].atSec);
+      let todayCps: Array<{ index: number; atSec: number; segment: [number, number] }> | null = null;
+      try { todayCps = planVideoCheckpoints(dur, anchoredValidated ? scenes : null).checkpoints; } catch { todayCps = null; }
+      const same = !!todayCps && todayCps.length === fixed.checkpoints.length && todayCps.every((c, i) => c.atSec === fixed.checkpoints[i].atSec);
+      const refl = reflections(same && todayCps ? todayCps : fixed.checkpoints);
       return {
-        value: { ...base, checkpointsAtSec: fixed.checkpoints.map((c) => c.atSec) },
-        warnings: same ? [] : [`video_checkpoints_from_validation:${viKey}`],
+        value: { ...base, checkpointsAtSec: fixed.checkpoints.map((c) => c.atSec), ...(refl.reflectionsAt ? { reflectionsAt: refl.reflectionsAt } : {}) },
+        warnings: same && !refl.moved ? [] : [`video_checkpoints_from_validation:${viKey}`],
       };
     }
     if (anchoredValidated) {
@@ -916,7 +929,7 @@ export async function loadContentsV3(
   const contentMd = new Map<string, string>();
   const experiences = new Map<string, unknown>();
   const presentations = new Map<string, { pdf: Buffer; cover: Buffer; mock?: boolean }>();
-  const videos = new Map<string, { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] }>();
+  const videos = new Map<string, { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[]; reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }> }>();
   const videoInteractions = new Map<string, unknown>();
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
@@ -944,7 +957,7 @@ export async function loadContentsV3(
         presentations.set(ch.chapterId, pres.value);
       }
       if (ch.keys.video) {
-        const vs = slot.video as { value: { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[] }; warnings: string[] };
+        const vs = slot.video as { value: { youtubeId: string; durationSec: number; videoScenes?: unknown; checkpointsAtSec?: number[]; reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }> }; warnings: string[] };
         warnings.push(...vs.warnings);
         videos.set(ch.chapterId, vs.value);
         videoInteractions.set(ch.chapterId, slot.videoInteractions);

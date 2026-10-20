@@ -402,6 +402,32 @@ async function r61TimelineChecks() {
     const key = AP.packageBlockItemKey(err.message, err.missing, items);
     assert(key && key.startsWith('video_interactions:'), `item a regenerar: ${key}`);
   });
+  await check('r61 Q-04 duda 2 (ivAdvanced): pausas validadas que siguen sirviendo → se empaquetan ESAS (aviso); que ya no sirven → VIDEO_TIMELINE_MISMATCH nombrando el video_interactions (clase B, auto-reparación)', async () => {
+    const even = IV.planInteractionCheckpoints(PF.VIDEO_SECONDS);
+    const atSec = even.map((c) => c.atSec);
+    const today = IV.planReflectionPauses(PF.VIDEO_SECONDS, even).reflections;
+    const withRefl = async (refl) => {
+      const f = setup(false);
+      const byItem = await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest);
+      for (const it of byItem.values()) if (it.type === 'video_interactions') it.outputSummary = { ...(it.outputSummary || {}), v3Validation: { checkpointsAtSec: atSec, reflectionsAt: refl } };
+      const plan = PV3.buildPackagingPlanV3(f.manifest, f.fx.blueprint, { manifestId: 9001 });
+      return { r: await PK.loadContentsV3(fakeLoaders(f).L, plan, byItem, f.run, { familyId: 'aula-clara', mode: 'light' }).catch((e) => ({ err: e })), items: [...byItem.keys()] };
+    };
+    const eqToday = await withRefl(today);
+    eq(eqToday.r.warnings.filter((w) => w.startsWith('video_checkpoints_from_validation:')), [], 'iguales: sin aviso');
+    for (const v of eqToday.r.contents.videos.values()) eq(v.reflectionsAt, today, 'pausas de siempre');
+    const moved = today.map((x) => ({ ...x, atSec: x.atSec + 2 }));
+    const mv = await withRefl(moved);
+    for (const v of mv.r.contents.videos.values()) eq(v.reflectionsAt, moved, 'pausas validadas');
+    assert(mv.r.warnings.some((w) => w.startsWith('video_checkpoints_from_validation:video_interactions:')), 'evento registrado');
+    const bad = await withRefl([{ ...today[0], atSec: even[today[0].afterCheckpoint - 1].atSec + 5 }]);
+    const err = bad.r.err;
+    assert(err instanceof PT.PackagingNotReadyError && /^VIDEO_TIMELINE_MISMATCH: .*pausas de reflexión/.test(err.message), `vino ${err && err.message}`);
+    const v = C.classifyFailure({ source: 'package_worker', error: err.message });
+    eq([v.unclassified, v.class, v.rule], [false, 'B', 'package_component'], 'clase B');
+    const key = AP.packageBlockItemKey(err.message, err.missing, bad.items);
+    assert(key && key.startsWith('video_interactions:'), `item: ${key}`);
+  });
   await check('r61 Q-04: preguntas validadas ancladas pero el video ya no da ese plan → PackagingNotReadyError VIDEO_TIMELINE_MISMATCH (nunca se mueven en silencio)', async () => {
     let err = null;
     try { await load(setup(false), true); } catch (e) { err = e; }

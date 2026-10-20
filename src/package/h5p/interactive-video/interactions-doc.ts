@@ -21,7 +21,7 @@ import {
   checkPlainText,
   isPlainObject,
 } from '../types/common';
-import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, VideoPlanError, VideoTimelineSource, checkpointsFromValidatedSeconds, planReflectionPauses, planVideoCheckpoints, videoPlanDurationSec } from './plan';
+import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, VideoPlanError, VideoTimelineSource, checkpointsFromValidatedSeconds, planReflectionPauses, planVideoCheckpoints, reflectionsFromValidated, videoPlanDurationSec } from './plan';
 
 export const VIDEO_INTERACTIONS_SCHEMA_VERSION = 1;
 /**
@@ -91,6 +91,11 @@ export interface VideoInteractionsExpectations {
    * lo cumplen → VIDEO_TIMELINE_MISMATCH (el empaquetado regenera solo esas preguntas).
    */
   checkpointsAtSec?: number[];
+  /**
+   * r61 Q-04: pausas de reflexión validadas (v3Validation.reflectionsAt, ivAdvanced). Si siguen siendo válidas con
+   * las reglas vigentes se usan ESAS; si no → VIDEO_TIMELINE_MISMATCH (regenerar solo esas preguntas).
+   */
+  reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }>;
 }
 
 export interface VideoInteractionsPlan {
@@ -205,6 +210,17 @@ export function validateVideoInteractionsDocFull(doc: unknown, expect: VideoInte
   let reflectionPlan: ReflectionPlan = { reflections: [], droppedReflections: [] };
   if (v2 && plan && planDur !== null) {
     reflectionPlan = planReflectionPauses(planDur, plan);
+    if (expect.reflectionsAt !== undefined) {
+      const fixedR = reflectionsFromValidated(planDur, plan, expect.reflectionsAt);
+      if (fixedR.ok === false) throw new VideoPlanError('VIDEO_TIMELINE_MISMATCH', `las pausas validadas ya no sirven: ${fixedR.reason}`);
+      const today = reflectionPlan.reflections;
+      const same = today.length === fixedR.reflections.length && today.every((r, i) => r.index === fixedR.reflections[i].index && r.atSec === fixedR.reflections[i].atSec && r.afterCheckpoint === fixedR.reflections[i].afterCheckpoint);
+      // Iguales → el plan de siempre (con sus descartes); distintas → las validadas (sin descartes nuevos).
+      if (!same) {
+        reflectionPlan = { reflections: fixedR.reflections, droppedReflections: [] };
+        checkpointsFromValidation = true;
+      }
+    }
     const want = reflectionPlan.reflections;
     // Fix round 1 (m-6): sin pausas planificadas (d < 180 s) `reflections` puede omitirse o venir vacío.
     if (want.length === 0 && d.reflections === undefined) {

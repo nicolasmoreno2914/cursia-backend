@@ -707,7 +707,7 @@ function v2Doc(durationSec, videoItemKey = 'video:ch9') {
     // r61 Q-04 (re-review I-2): el summary guarda además los segundos validados (el empaque los usa tal cual).
     const atSec = h.planInteractionCheckpoints(d).map((c) => c.atSec);
     eq(V3V.validateV3ItemArtifact(ctx, JSON.stringify(v1)), { ok: true, errors: [], summary: { interactionCount: 5, checkpointsAtSec: atSec } }, 'v3 v1');
-    eq(V3V.validateV3ItemArtifact({ ...ctx, videoInteractionsSchemaVersion: 2 }, JSON.stringify(doc)), { ok: true, errors: [], summary: { interactionCount: 5, checkpointsAtSec: atSec, reflectionCount: 2, droppedReflections: [] } }, 'v3 v2');
+    eq(V3V.validateV3ItemArtifact({ ...ctx, videoInteractionsSchemaVersion: 2 }, JSON.stringify(doc)), { ok: true, errors: [], summary: { interactionCount: 5, checkpointsAtSec: atSec, reflectionCount: 2, reflectionsAt: h.planReflectionPauses(d, h.planInteractionCheckpoints(d)).reflections, droppedReflections: [] } }, 'v3 v2');
     eq(V3V.validateV3ItemArtifact(ctx, JSON.stringify(doc)).ok, false, 'v3 v2 sin marcador');
     // videoClaimFacts: sin ivAdvanced idéntico; con ivAdvanced lleva el plan.
     const claim = V3V.videoClaimFacts({ videoItemKey: 'video:ch9', outputSummary: { youtubeVideoId: 'IdwOipZAeqY', durationSec: d } });

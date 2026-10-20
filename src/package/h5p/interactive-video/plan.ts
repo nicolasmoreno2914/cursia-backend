@@ -440,3 +440,41 @@ export function checkpointsFromValidatedSeconds(durationSec: number, atSecs: unk
   }
   return { ok: true, checkpoints: (atSecs as number[]).map((atSec, i) => ({ index: i + 1, atSec, segment: [i === 0 ? 0 : (atSecs as number[])[i - 1], atSec] as [number, number] })) };
 }
+
+/**
+ * r61 Q-04 (duda 2 de la re-review): pausas de reflexión a partir de las VALIDADAS (`v3Validation.reflectionsAt`,
+ * ivAdvanced). Se usan tal cual mientras cumplan, contra los checkpoints con que se empaqueta, las reglas vigentes:
+ * cantidad ≤ reflectionPauseCount(d), index crecientes, entre el checkpoint `afterCheckpoint` y el siguiente, dentro
+ * de [30, d − 15], ≥ 10 s tras la ventana de toda pregunta anterior y ≥ 10 s antes de la siguiente, ≥ 10 s entre
+ * pausas. Si no, motivo (→ regenerar solo esas preguntas).
+ */
+export function reflectionsFromValidated(
+  durationSec: number,
+  checkpoints: VideoCheckpoint[],
+  validated: unknown,
+): { ok: true; reflections: ReflectionPause[] } | { ok: false; reason: string } {
+  const R = REFLECTION_PAUSE_RULES;
+  const C = VIDEO_CHECKPOINT_RULES;
+  let d: number;
+  try { d = videoPlanDurationSec(durationSec); } catch (err) { return { ok: false, reason: (err as Error).message }; }
+  if (!Array.isArray(validated)) return { ok: false, reason: 'sin pausas validadas' };
+  if (validated.length > reflectionPauseCount(d)) return { ok: false, reason: `${validated.length} pausas validadas; las reglas vigentes admiten ${reflectionPauseCount(d)}` };
+  const out: ReflectionPause[] = [];
+  for (let i = 0; i < validated.length; i++) {
+    const r = validated[i] as Record<string, unknown>;
+    const ok = !!r && typeof r === 'object' && Number.isInteger(r.index) && Number.isInteger(r.atSec) && Number.isInteger(r.afterCheckpoint);
+    if (!ok) return { ok: false, reason: `pausa ${i + 1} mal formada` };
+    const p = { index: r.index as number, atSec: r.atSec as number, afterCheckpoint: r.afterCheckpoint as number };
+    if (i > 0 && p.index <= out[i - 1].index) return { ok: false, reason: `pausas fuera de orden (${p.index})` };
+    const a = checkpoints[p.afterCheckpoint - 1];
+    const b = checkpoints[p.afterCheckpoint];
+    if (!a || !b) return { ok: false, reason: `pausa ${p.index}: no hay checkpoints ${p.afterCheckpoint} y ${p.afterCheckpoint + 1}` };
+    if (p.atSec < C.noInteractionFirstSec || p.atSec > d - C.noInteractionLastSec) return { ok: false, reason: `pausa ${p.index} en ${p.atSec} s fuera de [${C.noInteractionFirstSec}, ${d - C.noInteractionLastSec}]` };
+    if (p.atSec <= a.atSec || p.atSec >= b.atSec) return { ok: false, reason: `pausa ${p.index} en ${p.atSec} s fuera del tramo ${a.atSec}–${b.atSec}` };
+    const clash = checkpoints.find((c) => (c.atSec <= p.atSec ? p.atSec < c.atSec + R.windowSec + R.afterWindowSec : c.atSec - p.atSec < R.beforeQuestionSec));
+    if (clash) return { ok: false, reason: `pausa ${p.index} choca con la pregunta ${clash.index} (${clash.atSec} s)` };
+    if (out.some((o) => Math.abs(o.atSec - p.atSec) < R.minGapBetweenPausesSec)) return { ok: false, reason: `pausa ${p.index} a menos de ${R.minGapBetweenPausesSec} s de otra` };
+    out.push(p);
+  }
+  return { ok: true, reflections: out };
+}

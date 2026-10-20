@@ -36,6 +36,8 @@ export interface BuildVideoActivityInput {
    * difieren del plan re-derivado se usan ESTOS (el empaquetado ya verificó que siguen cumpliendo el invariante).
    */
   checkpointsAtSec?: number[];
+  /** r61 Q-04: pausas de reflexión validadas (v3Validation.reflectionsAt); ver checkpointsAtSec. */
+  reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }>;
 }
 
 export interface VideoActivityBuild {
@@ -73,6 +75,7 @@ export async function buildVideoActivity(input: BuildVideoActivityInput): Promis
     // Review M-7: la duración MEDIDA cruda (el plan escala las escenas con ella); el .h5p usa la entera.
     durationSec: input.durationSec,
     ...(Array.isArray(input.checkpointsAtSec) ? { checkpointsAtSec: input.checkpointsAtSec } : {}),
+    ...(advanced && Array.isArray(input.reflectionsAt) ? { reflectionsAt: input.reflectionsAt } : {}),
     ...(advanced ? { schemaVersion: VIDEO_INTERACTIONS_SCHEMA_VERSION_V2 } : {}),
     ...(input.videoScenes !== undefined && input.videoScenes !== null ? { videoScenes: input.videoScenes } : {}),
   });
