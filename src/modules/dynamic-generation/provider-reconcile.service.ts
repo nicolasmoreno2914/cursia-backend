@@ -268,8 +268,7 @@ export class ProviderReconcileService {
       // nunca convive con una reserva incierta sin decidir.
       const left = await this.pendingCharges(r, provider, ack);
       for (const c of left) {
-        await this.assertUnchanged(r);
-        await this.settleConservative(r, c, d.kind, ev.why, ev.ambiguous);
+        await this.whileUnchanged(r, () => this.settleConservative(r, c, d.kind, ev.why, ev.ambiguous));
         if (settlement === 'none') settlement = 'reconciled_as_charged';
         if (!reservedAmount && c.reservation) reservedAmount = c.amount;
       }
@@ -315,14 +314,13 @@ export class ProviderReconcileService {
     if (ev.action === 'repoll' && ev.adoptJobId) {
       // Review I3: el job existe (sufijo del error) pero el worker no llegó a persistirlo → se registra (cercado por el
       // error y el intento) para que el re-poll lo retome sin reenviar.
-      await this.assertUnchanged(r);
-      await this.dataSource.query(
+      await this.whileUnchanged(r, (m) => m.query( // misma transacción: la fila ya está tomada
         `update public.generation_item_runs
             set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('external',
                   coalesce(output_summary->'external', '{}'::jsonb) || jsonb_build_object('videogenJobId', $2::text, 'mode', 'real', 'adoptedBy', 'provider_reconcile'))
           where id = $1 and status = 'failed' and coalesce(error, '') = $3 and attempt_count = $4 and not (coalesce(output_summary->'external', '{}'::jsonb) ? 'videogenJobId')`,
         [r.id, ev.adoptJobId, String(r.error ?? ''), r.attempt_count],
-      );
+      ));
     }
     try {
       await this.runs.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), r.job_id, r.item_key, resubmitVideo, resubmitProvider, {
@@ -367,7 +365,7 @@ export class ProviderReconcileService {
     const res = resKey ? pending.find((p) => p.idempotency_key === resKey && p.reservation) ?? null : null;
     let st: VideogenBatchJob;
     try {
-      st = await withTimeout(this.videogen().getVideoStatus(jobId), this.lookupMs(), `GET status ${jobId}`);
+      st = await withTimeout(this.videogen().getVideoStatus(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `GET status ${jobId}`);
     } catch (err) {
       if (ageSecs >= PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS) {
         return { action: 'decline', reason: 'videogen_lookup_unavailable', attention: 'duplicate_charge',
@@ -390,7 +388,7 @@ export class ProviderReconcileService {
     // Job TERMINAL fallido: ya no puede renderizar. Costo (estimado) del job.
     let cost: VideogenCostBreakdown;
     try {
-      cost = await withTimeout(this.videogen().getVideoCost(jobId), this.lookupMs(), `GET cost ${jobId}`);
+      cost = await withTimeout(this.videogen().getVideoCost(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `GET cost ${jobId}`);
     } catch (err) {
       if (ageSecs >= PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS) {
         // Sin costo pero con el job muerto: se cuenta la reserva completa (conservador) y se puede reenviar (no hay doble render).
@@ -424,8 +422,7 @@ export class ProviderReconcileService {
     const reason = `r62 auto: Videogen informó el job ${jobId} ${status} (${String(st.error ?? 'sin detalle').slice(0, 120)}); ` +
       `GET /api/costs/videos/{id} estimated_total_cost=${cost.estimated_total_cost} (estimado; contado ${counted}, reserva ${reserved}, ${mode})`;
     const meta = this.meta(r, kind, { videogenJobId: jobId, reportedCost: cost.estimated_total_cost, reservedAmount: reserved, countedAmount: mode === 'charged' ? reserved : counted, breakdown: cost.breakdown ?? null, settleMode: mode });
-    await this.assertUnchanged(r);
-    const settlement = await this.settleVideogenReservation(res.idempotency_key, mode, counted, reason, jobId, status, cost.estimated_total_cost, meta);
+    const settlement = await this.whileUnchanged(r, () => this.settleVideogenReservation(res.idempotency_key, mode, counted, reason, jobId, status, cost.estimated_total_cost, meta));
     return { action: 'resubmit', ambiguous: false, settlement, counted: mode === 'charged' ? reserved : mode === 'release' ? normalizeDecimal(0) : counted, reservedAmount: res.amount,
       why: `job ${jobId} falló (${String(st.error ?? 'sin detalle').slice(0, 120)}); conciliado ${settlement}` };
   }
@@ -494,11 +491,10 @@ export class ProviderReconcileService {
       return { action: 'wait', why: `Gamma todavía no informa los créditos de ${gid} (${detail})` };
     }
     if (!open) return { action: 'resubmit', ambiguous: false, settlement: 'already_settled', counted: null, reservedAmount, why: `generación ${gid} falló; ${detail}` };
-    await this.assertUnchanged(r);
-    const out = await this.ledger.settleMeasuredUsage(key, { gamma_credit: credits }, 'gamma_credits_measured', {
+    const out = await this.whileUnchanged(r, () => this.ledger.settleMeasuredUsage(key, { gamma_credit: credits }, 'gamma_credits_measured', {
       recordedBy: PROVIDER_RECONCILE_RECORDED_BY,
       metadata: this.meta(r, 'gamma_failed', { gammaGenerationId: gid, creditsDeducted: credits, evidence: detail.slice(0, 300) }),
-    });
+    }));
     return { action: 'resubmit', ambiguous: false, settlement: 'measured', counted: out.newTotal, reservedAmount, why: `generación ${gid} falló; ${detail}; liquidado USD ${out.newTotal}` };
   }
 
@@ -593,22 +589,39 @@ export class ProviderReconcileService {
   }
 
   /**
-   * Review I2: antes de cada escritura en el ledger, la parte tiene que seguir EXACTAMENTE como la vio el barrido
-   * (failed, mismo error, mismo intento y generación vigente). Si cambió (reapertura manual, otro tick, otro proceso
-   * durante un reload), no se liquida nada: el próximo tick re-evalúa. Junto con la cota de intento de pendingCharges,
-   * la reserva de un intento nuevo nunca se liquida acá.
+   * Review I2 + re-review m1: cada escritura (ledger o estado) corre con la fila de la parte tomada `FOR NO KEY UPDATE`
+   * (bloquea UPDATE / FOR UPDATE concurrentes —retryItem, el scheduler— pero no el FOR KEY SHARE de las FK del ledger,
+   * que la escritura de adentro necesita; con FOR UPDATE se trabaría contra sí mismo) y
+   * verificada EXACTAMENTE como la vio el barrido (failed, mismo error, mismo intento, generación vigente). Si cambió
+   * (reapertura manual, otro tick, otro proceso durante un reload) no se escribe nada (StaleRow) y el próximo tick
+   * re-evalúa; mientras dura la escritura, una reapertura concurrente (retryItem toma la misma fila FOR UPDATE) espera.
+   * Una escritura sobre la MISMA fila tiene que usar el `m` recibido (otra conexión se trabaría con este lock).
+   * Las escrituras del ledger que corren adentro (reconcile*, recordAdjustment, settleMeasuredUsage) solo tocan
+   * generation_cost_events, así que no pueden esperar un lock que tenga retryItem. lock_timeout corto: si la fila está
+   * tomada, este tick no espera (StaleRow → próximo tick). Junto con la cota de intento de pendingCharges, la reserva de
+   * un intento nuevo nunca se liquida acá.
    */
-  private async assertUnchanged(r: Row): Promise<void> {
-    const [cur] = await this.dataSource.query(
-      `select g.status, g.error, g.attempt_count, g.generation,
-              (select max(n.generation) from public.generation_item_runs n where n.job_id = g.job_id and n.item_key = g.item_key) as latest
-         from public.generation_item_runs g where g.id = $1`,
-      [r.id],
-    );
-    if (!cur || cur.status !== 'failed' || String(cur.error ?? '') !== String(r.error ?? '') || Number(cur.attempt_count) !== Number(r.attempt_count)
-      || Number(cur.latest) !== Number(cur.generation)) {
-      throw new StaleRow(`la parte ${r.item_key} cambió desde la lectura`);
-    }
+  private async whileUnchanged<T>(r: Row, fn: (m: { query: (sql: string, params?: any[]) => Promise<any> }) => Promise<T>): Promise<T> {
+    return this.dataSource.transaction(async (m) => {
+      await m.query(`set local lock_timeout = '5s'`);
+      let cur: any;
+      try {
+        [cur] = await m.query(
+          `select g.status, g.error, g.attempt_count, g.generation,
+                  (select max(n.generation) from public.generation_item_runs n where n.job_id = g.job_id and n.item_key = g.item_key) as latest
+             from public.generation_item_runs g where g.id = $1 for no key update of g`,
+          [r.id],
+        );
+      } catch (err) {
+        if (/lock timeout|lock_timeout|canceling statement due to lock/i.test(errText(err))) throw new StaleRow(`la parte ${r.item_key} está tomada`);
+        throw err;
+      }
+      if (!cur || cur.status !== 'failed' || String(cur.error ?? '') !== String(r.error ?? '') || Number(cur.attempt_count) !== Number(r.attempt_count)
+        || Number(cur.latest) !== Number(cur.generation)) {
+        throw new StaleRow(`la parte ${r.item_key} cambió desde la lectura`);
+      }
+      return fn(m);
+    });
   }
 
   /** Excepción explícita (punto 3): queda en el item (providerReconcile.declined + attention_reason) y en el log. */
@@ -656,11 +669,11 @@ export class ProviderReconcileService {
       let st: VideogenBatchJob;
       let cost: VideogenCostBreakdown;
       try {
-        st = await withTimeout(this.videogen().getVideoStatus(jobId), this.lookupMs(), `GET status ${jobId}`);
+        st = await withTimeout(this.videogen().getVideoStatus(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `GET status ${jobId}`);
         const status = String(st.status ?? '');
         const terminal = isJobFailed(status) || isJobCompleted(status) || status.toLowerCase() === 'completed_local';
         if (!terminal) continue;
-        cost = await withTimeout(this.videogen().getVideoCost(jobId), this.lookupMs(), `GET cost ${jobId}`);
+        cost = await withTimeout(this.videogen().getVideoCost(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `GET cost ${jobId}`);
       } catch {
         continue; // sin evidencia: sigue pendiente (contada como gasto); próximo tick
       }

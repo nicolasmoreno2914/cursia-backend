@@ -28,7 +28,8 @@ export const IN_FLIGHT_WINDOW_MS: Readonly<Record<string, number>> = Object.free
   openai: 120_000 + IN_FLIGHT_MARGIN_MS, // TTS
   anthropic: 120_000 + IN_FLIGHT_MARGIN_MS, // guion del audiolibro (AnthropicClient)
   gamma: 60_000 + IN_FLIGHT_MARGIN_MS, // createGeneration
-  // batchCreate de Videogen no tiene timeout propio: cota operativa (pasada, el envío se trata como ambiguo, igual que hoy).
+  // batchCreate de Videogen: en V2 el worker lo acota a VIDEOGEN_SUBMIT_TIMEOUT_MS (180 s por defecto, r62 N2); esta cota
+  // operativa queda holgadamente por encima (pasada, el envío se trata como ambiguo, igual que hoy).
   videogen: 10 * 60_000,
 });
 

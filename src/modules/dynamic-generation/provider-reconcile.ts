@@ -50,7 +50,10 @@ export const PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS = 600;
 export const PROVIDER_RECONCILE_MAX_REPOLLS = 3;
 /** Review I4: tope de consultas al proveedor del bucle d5 por tick (el tick es serial con el empaque automático). */
 export const PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK = 10;
-/** Timeout de cada GET al proveedor desde el barrido (las llamadas de VideogenService no tienen timeout propio). */
+/**
+ * Timeout de cada GET al proveedor desde el barrido: se pasa como opción por llamada a VideogenService (que sin ella no
+ * tiene timeout, para no cambiar V1) y además acota la espera con withTimeout (también para Gamma).
+ */
 export const PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS = 30_000;
 /** Regex POSIX gruesa del barrido (la decisión fina es providerReconcileDecision). */
 export const PROVIDER_RECONCILE_SQL_REGEX = '^(videogen_failed|video_timeout|ambiguous_video_submission|gamma_generation_failed|gamma_submit_ambiguous)';

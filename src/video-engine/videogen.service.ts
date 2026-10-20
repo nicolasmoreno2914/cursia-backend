@@ -74,23 +74,37 @@ function videogenDurationSeconds(j: any): number | null {
 }
 
 /**
- * r62 (N2, review I4): timeout HTTP del CLIENTE de Cursia hacia Videogen (Videogen no cambia). Antes ninguna llamada
- * tenía timeout: un GET colgado dejaba la parte `running` con la lease viva (bloqueo silencioso). Un POST que vence
- * sigue siendo un envío ambiguo (el worker ya lo trata así); un GET que vence es un error reintentable.
- * VIDEOGEN_HTTP_TIMEOUT_MS acota los GET (default 60 s); el POST de batch-create usa VIDEOGEN_SUBMIT_TIMEOUT_MS (180 s).
+ * r62 (N2): timeout HTTP OPCIONAL, por llamada, del cliente de Cursia hacia Videogen (Videogen no cambia). Solo lo pasan
+ * los llamadores V2 (dynamic-item-worker y el barrido de conciliación), que tratan un POST vencido como envío ambiguo y
+ * un GET vencido como error reintentable. SIN la opción, cada método hace exactamente el mismo `fetch` que antes (V1:
+ * video-worker.ts no cambia de comportamiento; re-review r62 (a)).
  */
-export const VIDEOGEN_GET_TIMEOUT_MS_DEFAULT = 60_000;
-export const VIDEOGEN_SUBMIT_TIMEOUT_MS_DEFAULT = 180_000;
-function timeoutFromEnv(key: string, dflt: number): number {
-  const n = Number(process.env[key]);
+export interface VideogenCallOptions {
+  /** Timeout de la llamada (ms). Ausente = sin timeout (comportamiento previo). */
+  timeoutMs?: number;
+}
+/** Defaults de los llamadores V2 (VIDEOGEN_HTTP_TIMEOUT_MS / VIDEOGEN_SUBMIT_TIMEOUT_MS los pisan). */
+export const VIDEOGEN_V2_GET_TIMEOUT_MS_DEFAULT = 60_000;
+export const VIDEOGEN_V2_SUBMIT_TIMEOUT_MS_DEFAULT = 180_000;
+function v2TimeoutFromEnv(key: string, dflt: number, env: Record<string, string | undefined>): number {
+  const n = Number(env[key]);
   return Number.isInteger(n) && n > 0 ? n : dflt;
 }
-async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number, what: string): Promise<Response> {
+/** Opciones de llamada de los llamadores V2. */
+export function videogenV2CallOptions(kind: 'get' | 'submit', env: Record<string, string | undefined> = process.env): VideogenCallOptions {
+  return kind === 'submit'
+    ? { timeoutMs: v2TimeoutFromEnv('VIDEOGEN_SUBMIT_TIMEOUT_MS', VIDEOGEN_V2_SUBMIT_TIMEOUT_MS_DEFAULT, env) }
+    : { timeoutMs: v2TimeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_V2_GET_TIMEOUT_MS_DEFAULT, env) };
+}
+/** Sin `timeoutMs` → `fetch(url, init)` tal cual (mismos argumentos que antes). Con él → AbortSignal.timeout. */
+async function videogenFetch(url: string, init: RequestInit, opts: VideogenCallOptions | undefined, what: string): Promise<Response> {
+  const ms = opts?.timeoutMs;
+  if (!(typeof ms === 'number' && Number.isFinite(ms) && ms > 0)) return fetch(url, init);
   try {
-    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
   } catch (err) {
     const name = err instanceof Error ? err.name : 'error';
-    throw new Error(`Videogen ${what}: error de red (${name}${name === 'TimeoutError' ? `, ${timeoutMs} ms` : ''})`);
+    throw new Error(`Videogen ${what}: error de red (${name}${name === 'TimeoutError' ? `, ${ms} ms` : ''})`);
   }
 }
 
@@ -121,19 +135,19 @@ export class VideogenService {
     }));
   }
 
-  async batchCreate(videos: VideogenVideoPayload[]): Promise<VideogenBatchResult> {
+  async batchCreate(videos: VideogenVideoPayload[], opts?: VideogenCallOptions): Promise<VideogenBatchResult> {
     const { apiKey, baseUrl } = this.getConfig();
 
     this.logger.log(`Submitting batch-create to Videogen: ${videos.length} videos`);
 
-    const response = await fetchWithTimeout(`${baseUrl}/api/external/videos/batch-create`, {
+    const response = await videogenFetch(`${baseUrl}/api/external/videos/batch-create`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({ videos }),
-    }, timeoutFromEnv('VIDEOGEN_SUBMIT_TIMEOUT_MS', VIDEOGEN_SUBMIT_TIMEOUT_MS_DEFAULT), 'batch-create');
+    }, opts, 'batch-create');
 
     const text = await response.text();
     this.logger.log(`Videogen batch-create response: HTTP ${response.status}`);
@@ -157,16 +171,16 @@ export class VideogenService {
     };
   }
 
-  async getBatchStatus(batchId: string): Promise<VideogenBatchStatus> {
+  async getBatchStatus(batchId: string, opts?: VideogenCallOptions): Promise<VideogenBatchStatus> {
     const { apiKey, baseUrl } = this.getConfig();
 
     const url = `${baseUrl}/api/external/videos/batches/${encodeURIComponent(batchId)}/status`;
     this.logger.log(`Polling Videogen batch status: ${batchId}`);
 
-    const response = await fetchWithTimeout(url, {
+    const response = await videogenFetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    }, timeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_GET_TIMEOUT_MS_DEFAULT), 'batch-status');
+    }, opts, 'batch-status');
 
     const text = await response.text();
     this.logger.log(`Videogen batch-status response: HTTP ${response.status}`);
@@ -191,16 +205,16 @@ export class VideogenService {
     };
   }
 
-  async getVideoStatus(jobId: string): Promise<VideogenBatchJob> {
+  async getVideoStatus(jobId: string, opts?: VideogenCallOptions): Promise<VideogenBatchJob> {
     const { apiKey, baseUrl } = this.getConfig();
 
     const url = `${baseUrl}/api/external/videos/${encodeURIComponent(jobId)}/status`;
     this.logger.log(`Polling Videogen video status: ${jobId}`);
 
-    const response = await fetchWithTimeout(url, {
+    const response = await videogenFetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    }, timeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_GET_TIMEOUT_MS_DEFAULT), 'video-status');
+    }, opts, 'video-status');
 
     const text = await response.text();
 
@@ -226,16 +240,16 @@ export class VideogenService {
    * endpoint acepta la misma API key vía DualAuthGuard (confirmado contra
    * el código de video-engine-ia).
    */
-  async getVideoCost(jobId: string): Promise<VideogenCostBreakdown> {
+  async getVideoCost(jobId: string, opts?: VideogenCallOptions): Promise<VideogenCostBreakdown> {
     const { apiKey, baseUrl } = this.getConfig();
 
     const url = `${baseUrl}/api/costs/videos/${encodeURIComponent(jobId)}`;
     this.logger.log(`Fetching Videogen real cost: ${jobId}`);
 
-    const response = await fetchWithTimeout(url, {
+    const response = await videogenFetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    }, timeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_GET_TIMEOUT_MS_DEFAULT), 'cost');
+    }, opts, 'cost');
 
     const text = await response.text();
 

@@ -14,6 +14,8 @@
 //   [O]   jobId solo en el sufijo del error (review I3): vivo → espera; completado → se adopta y re-poll; failed → conciliado
 //   [R]   carrera (review I2): la parte cambia durante la consulta → no se liquida nada (ni el intento nuevo)
 //   [T]   timeouts (review I4): GET de Gamma colgado acotado; tope de consultas d5 por tick; VideogenService con timeout
+//   [V1-legacy] sin opción por llamada, VideogenService es byte a byte el de origin/staging (V1 intacto; re-review (a))
+//   [R2]  la liquidación corre con la fila FOR UPDATE (re-review m1)
 //   [X]   runs históricos / anteriores al corte (review M1): ni el barrido ni la completitud los toman
 //   [G1]  Gamma fallido con créditos DEDUCIDOS (medidos por el worker) → reenvío sin consultar
 //   [G2]  Gamma fallido SIN créditos en el fallo → GET /generations/{id} informa credits.deducted → liquidado medido → reenvío
@@ -197,7 +199,7 @@ const CONTEXT = { nombre: 'Curso r62 N2', sector: 'Minería', pais: 'Chile', con
   videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' } };
 const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'VIDEOGEN_API_KEY', 'VIDEOGEN_API_URL', 'SUPER_ADMIN_EMAILS',
-  'GAMMA_API_KEY', 'GAMMA_API_BASE_URL', 'DYNAMIC_AUTO_HEAL_ENABLED', 'PROVIDER_RECONCILE_RUNS_SINCE', 'VIDEOGEN_HTTP_TIMEOUT_MS'];
+  'GAMMA_API_KEY', 'GAMMA_API_BASE_URL', 'DYNAMIC_AUTO_HEAL_ENABLED', 'PROVIDER_RECONCILE_RUNS_SINCE', 'VIDEOGEN_HTTP_TIMEOUT_MS', 'VIDEOGEN_SUBMIT_TIMEOUT_MS'];
 
 async function dbChecks() {
   const { Client } = require('pg');
@@ -645,11 +647,12 @@ async function dbChecks() {
     });
 
     // ═══ T — timeouts (review I4) ════════════════════════════════════════════
-    await check('[T] VideogenService (cliente de Cursia) corta un GET colgado con VIDEOGEN_HTTP_TIMEOUT_MS; el barrido corta un GET de Gamma colgado (espera, sin reenvío)', async () => {
+    await check('[T] VideogenService corta un GET colgado SOLO con la opción por llamada de V2 (videogenV2CallOptions / VIDEOGEN_HTTP_TIMEOUT_MS); el barrido corta un GET de Gamma colgado (espera, sin reenvío)', async () => {
+      const VS = L('video-engine/videogen.service.js');
       process.env.VIDEOGEN_HTTP_TIMEOUT_MS = '300';
       try {
         const t0 = Date.now();
-        let e = null; try { await videogen.getVideoStatus('vg-hang'); } catch (x) { e = x; }
+        let e = null; try { await videogen.getVideoStatus('vg-hang', VS.videogenV2CallOptions('get')); } catch (x) { e = x; }
         assert(e && /error de red \(TimeoutError/.test(e.message) && Date.now() - t0 < 5000, `timeout del cliente: ${e && e.message}`);
       } finally { delete process.env.VIDEOGEN_HTTP_TIMEOUT_MS; }
       const recon2 = new ProviderReconcileService(ds, runs, ledger, budget, { videogen, gamma: gammaClient, lookupTimeoutMs: 300 });
@@ -683,6 +686,60 @@ async function dbChecks() {
       }
       eq(total, 12, 'el resto en los ticks siguientes');
       await ledgerWithinAuthorized(C.runId);
+    });
+
+    await check('[V1-legacy] re-review (a): SIN opción, VideogenService hace el MISMO fetch que origin/staging (sin signal, mismos argumentos, errores de red sin envolver) y el worker V1 no pasa opciones', async () => {
+      const calls = [];
+      const prevFetch = global.fetch;
+      global.fetch = async (u, o) => { calls.push([String(u), o]); if (String(u).includes('vg-neterr')) throw new TypeError('fetch failed'); return prevFetch(u, o); };
+      try {
+        fakes.vg.jobs.set('vg-legacy', { statuses: ['completed_local'], cost: 0.9, breakdown: null });
+        process.env.VIDEOGEN_HTTP_TIMEOUT_MS = '1'; process.env.VIDEOGEN_SUBMIT_TIMEOUT_MS = '1'; // V1 los ignora
+        await videogen.getVideoStatus('vg-legacy');
+        await videogen.getVideoCost('vg-legacy');
+        await videogen.getBatchStatus('b-legacy').catch(() => null);
+        fakes.vg.plan.push({ kind: 'ok', jobId: 'vg-legacy-2', statuses: ['completed_local'] });
+        await videogen.batchCreate([{ title: 't', content_txt: 'x', chapter_number: 1, client_reference_id: 'r' }]);
+        const auth = `Bearer ${process.env.VIDEOGEN_API_KEY}`;
+        eq(calls.map(([u, o]) => [u.replace(fakes.base, ''), JSON.stringify(o)]), [
+          ['/api/external/videos/vg-legacy/status', JSON.stringify({ method: 'GET', headers: { Authorization: auth } })],
+          ['/api/costs/videos/vg-legacy', JSON.stringify({ method: 'GET', headers: { Authorization: auth } })],
+          ['/api/external/videos/batches/b-legacy/status', JSON.stringify({ method: 'GET', headers: { Authorization: auth } })],
+          ['/api/external/videos/batch-create', JSON.stringify({ method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: auth },
+            body: JSON.stringify({ videos: [{ title: 't', content_txt: 'x', chapter_number: 1, client_reference_id: 'r' }] }) })],
+        ], 'mismos argumentos de fetch que antes');
+        assert(calls.every(([, o]) => !('signal' in o)), 'sin AbortSignal en la ruta V1');
+        let e = null; try { await videogen.getVideoStatus('vg-neterr'); } catch (x) { e = x; }
+        assert(e instanceof TypeError && e.message === 'fetch failed', `error de red sin envolver: ${e && e.message}`);
+      } finally {
+        global.fetch = prevFetch; delete process.env.VIDEOGEN_HTTP_TIMEOUT_MS; delete process.env.VIDEOGEN_SUBMIT_TIMEOUT_MS;
+      }
+      const src = fs.readFileSync(path.join(REPO, 'src/workers/video-worker.ts'), 'utf8');
+      assert(/videogenService\.getBatchStatus\(batchId\)/.test(src) && /videogenService\.batchCreate\(videos\)/.test(src) && /videogenService\.getVideoCost\(j\.jobId\)/.test(src)
+        && !/videogenV2CallOptions|timeoutMs/.test(src), 'video-worker.ts (V1) llama sin opciones');
+      const v2 = fs.readFileSync(path.join(REPO, 'src/workers/dynamic-item-worker.ts'), 'utf8');
+      assert((v2.match(/videogenV2CallOptions\(/g) || []).length >= 4, 'el worker V2 pasa las opciones en sus 4 llamadas');
+    });
+    await check('[R2] re-review m1: la liquidación corre con la fila de la parte tomada FOR UPDATE: una reapertura concurrente espera (no se cuela entre la verificación y la escritura)', async () => {
+      const C = await videogenFailed('r62 lock', { jobId: 'vg-lock', error: 'render failed', cost: 0.5, breakdown: { render: 0.5 } });
+      const it = await latest(C.runId, `video:${C.c1}`);
+      let blocked = null;
+      const spy = Object.create(ledger);
+      spy.reconcileReservationAsChargedPartial = async (...a) => {
+        const { Client } = require('pg');
+        const c = new Client({ host: '127.0.0.1', port, user: 'postgres', database: DB });
+        await c.connect();
+        try {
+          await c.query(`set lock_timeout = '500ms'`);
+          await c.query(`update public.generation_item_runs set status = 'pending' where id = $1`, [it.id]);
+          blocked = false;
+        } catch (err) { blocked = /lock timeout/i.test(String(err.message)); } finally { await c.end(); }
+        return ledger.reconcileReservationAsChargedPartial(...a);
+      };
+      const recon3 = new ProviderReconcileService(ds, runs, spy, budget, { videogen, gamma: gammaClient });
+      const r = await recon3.sweep({ now: new Date(Date.now() + 5000), policy: P });
+      eq(blocked, true, 'la escritura concurrente sobre la parte quedó bloqueada durante la liquidación');
+      assert(r.resubmitted.some((x) => x.runId === C.runId && x.settlement === 'charged_partial'), JSON.stringify(r));
     });
 
     // ═══ X — runs anteriores al corte (review M1) ═══════════════════════════
