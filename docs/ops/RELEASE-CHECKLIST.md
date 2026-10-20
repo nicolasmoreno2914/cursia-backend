@@ -2,7 +2,7 @@
 
 Review r1 (I-2). Production deploys run on every push to `main`. The backend goes through `.github/workflows/deploy.yml` (rsync + `pm2 reload`). The frontend goes to Cloudflare Pages production.
 
-Neither deploy writes the backend `.env` or the Pages environment variables. Any switch that r58 added with a **safe-by-default** value changes production behaviour on the first promotion, unless someone decides it on purpose before the merge.
+Since r61 the backend deploy writes only a fixed list of V2 keys in the backend `.env` (V2 OFF by default; the full list and the promotion phases are in `docs/v2-production-promotion-runbook.md`). It never writes the switches below, and the frontend deploy never writes the Pages environment variables. Any switch that r58 added with a **safe-by-default** value changes production behaviour on the first promotion, unless someone decides it on purpose before the merge.
 
 `scripts/check-release-rollout-guard.js` reads `deploy.yml` and prints a **warning** (it does not fail) for each item below that the workflow does not set. The warning is a reminder that the item must be decided by hand. Production config and secrets are never changed by code or by the agent loop.
 

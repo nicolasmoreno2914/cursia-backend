@@ -340,7 +340,9 @@ async function pureChecks() {
     const yml = fs.readFileSync(path.join(REPO, '.github/workflows/deploy-staging.yml'), 'utf8');
     // R16 (#1): en staging el worker corre con node directo + kill_timeout (drenado ordenado).
     assert(yml.includes('ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js'), 'staging PM2');
-    assert(fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8').includes('ensure_pm2_process cursia-dynamic-provider-worker start:dynamic-provider-worker'), 'prod PM2');
+    // r61: producción arranca el worker con drenado desde scripts/ops/prod-release.sh (lo invoca deploy.yml).
+    assert(fs.readFileSync(path.join(REPO, 'scripts/ops/prod-release.sh'), 'utf8').includes('"cursia-dynamic-provider-worker dist/workers/dynamic-provider-worker.js"'), 'prod PM2');
+    assert(fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8').includes('bash scripts/ops/prod-release.sh install'), 'prod deploy.yml → prod-release.sh');
     const iMig = yml.indexOf('MIGRATION_ENV=staging node scripts/migrate-v21-finops.js');
     const iVer = yml.indexOf('MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js');
     assert(iMig > 0 && iVer > iMig, 'deploy-staging: migrate + verify FinOps');

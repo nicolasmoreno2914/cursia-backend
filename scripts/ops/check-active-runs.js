@@ -21,6 +21,12 @@
 // DEPLOY_FREEZE=true (entorno real o .env del directorio actual) bloquea
 // TODO deploy (exit 3), haya o no runs activos.
 //
+// r61 (producción, deploy.yml): --legacy agrega, SOLO INFORMATIVO, los jobs V1 del backend
+// (execution_mode backend_* / course_full_generation) activos y cuántos tienen lease vigente — el
+// reinicio de los workers V1 los interrumpe, como siempre pasó en producción. --legacy-block hace que
+// los jobs V1 con lease vigente BLOQUEEN (exit 2) igual que los runs dinámicos (opt-in del owner:
+// variable PROD_DEPLOY_BLOCK_ON_V1_JOBS=true). Sin estos flags la salida es la de siempre (staging).
+//
 // --force: solo reporta, siempre exit 0 (también ante un error de conexión).
 // Es el escape explícito (workflow_dispatch con force_deploy=yes).
 //
@@ -31,6 +37,7 @@
 // 3 = DEPLOY_FREEZE=true, 1 = error (no se pudo consultar → fail closed).
 //
 // Uso: node scripts/ops/check-active-runs.js [--json] [--force] [--no-env-file]
+//      [--legacy | --legacy-block]
 //      [--env-file <ruta>]   (default: ./.env si existe; solo agrega claves
 //      que el entorno real no tiene)
 // ══════════════════════════════════════════════════════════════════════════
@@ -40,15 +47,18 @@ const path = require('path');
 
 const ACTIVE_RUN_STATUSES = Object.freeze(['queued', 'running', 'retrying', 'waiting_external', 'pausing', 'cancelling']);
 const ACTIVE_PACKAGE_STATUSES = Object.freeze(['queued', 'running', 'retrying']);
+const ACTIVE_LEGACY_STATUSES = Object.freeze(['queued', 'running', 'retrying', 'waiting_external']);
 const MAX_LIST = 20;
 const EXIT = Object.freeze({ CLEAR: 0, ERROR: 1, BUSY: 2, FROZEN: 3 });
 
 function parseArgs(argv) {
-  const a = { json: false, force: false, envFile: undefined, help: false };
+  const a = { json: false, force: false, envFile: undefined, help: false, legacy: false, legacyBlock: false };
   for (let i = 0; i < argv.length; i++) {
     const x = argv[i];
     if (x === '--json') a.json = true;
     else if (x === '--force') a.force = true;
+    else if (x === '--legacy') a.legacy = true;
+    else if (x === '--legacy-block') { a.legacy = true; a.legacyBlock = true; }
     else if (x === '--no-env-file') a.envFile = null;
     else if (x === '--env-file') {
       a.envFile = argv[++i];
@@ -89,8 +99,9 @@ async function tableExists(query, qualified) {
  * Estado actual (solo lectura). `query(sql, params) → rows[]` es inyectable (tests sin base).
  * Sin las tablas V2 (base anterior a las migraciones) → nada activo, con nota.
  */
-async function collectActivity(query) {
+async function collectActivity(query, { legacy = false } = {}) {
   const out = { activeRuns: [], claimedItems: [], activePackages: [], pausedRuns: [], staleItems: 0, notes: [] };
+  if (legacy) out.legacy = { active: 0, leased: [] };
   const hasPj = await tableExists(query, 'public.production_jobs');
   const hasGir = await tableExists(query, 'public.generation_item_runs');
   if (!hasPj) {
@@ -136,12 +147,30 @@ async function collectActivity(query) {
   } else {
     out.notes.push('generation_item_runs no existe — sin items que revisar');
   }
+  if (legacy) {
+    const [l] = await query(
+      `select count(*)::int as n from public.production_jobs
+        where (execution_mode like 'backend\\_%' or execution_mode = 'course_full_generation')
+          and worker_status = any($1::text[]) and coalesce(status, '') <> 'cancelled'`,
+      [[...ACTIVE_LEGACY_STATUSES]],
+    );
+    out.legacy.active = l ? Number(l.n) : 0;
+    out.legacy.leased = await query(
+      `select id, course_id, execution_mode, worker_status from public.production_jobs
+        where (execution_mode like 'backend\\_%' or execution_mode = 'course_full_generation')
+          and worker_status = any($1::text[]) and coalesce(status, '') <> 'cancelled'
+          and lease_until is not null and lease_until > now()
+        order by updated_at desc nulls last limit $2`,
+      [[...ACTIVE_LEGACY_STATUSES], MAX_LIST],
+    );
+  }
   return out;
 }
 
 /** Decisión (pura). */
-function decide({ frozen, force, activity, error }) {
-  const busy = !!activity && (activity.activeRuns.length + activity.claimedItems.length + activity.activePackages.length) > 0;
+function decide({ frozen, force, activity, error, legacyBlock = false }) {
+  const legacyLeased = legacyBlock && activity && activity.legacy ? activity.legacy.leased.length : 0;
+  const busy = !!activity && (activity.activeRuns.length + activity.claimedItems.length + activity.activePackages.length + legacyLeased) > 0;
   let code;
   let verdict;
   if (error) {
@@ -177,6 +206,11 @@ function render(report) {
     for (const r of a.pausedRuns) L.push(`    - run ${r.id} (curso ${r.course_id}) ${r.reason || ''}`.trimEnd());
   }
   if (a.staleItems) L.push(`  (info) items running con lease vencido: ${a.staleItems} (los reclama el auto-healer)`);
+  if (a.legacy) {
+    L.push(`  ${report.legacyBlock ? '' : '(info) '}jobs V1 del backend activos: ${a.legacy.active} (con lease vigente: ${a.legacy.leased.length})` +
+      (report.legacyBlock ? ' — BLOQUEAN (PROD_DEPLOY_BLOCK_ON_V1_JOBS)' : ' — el reinicio de los workers V1 los interrumpe (comportamiento de siempre)'));
+    for (const r of a.legacy.leased) L.push(`    - job ${r.id} (curso ${r.course_id}) ${r.execution_mode} ${r.worker_status}`);
+  }
   for (const n of a.notes) L.push(`  nota: ${n}`);
   if (report.verdict === 'busy') L.push('  → deploy ABORTADO. Esperar a que terminen, o forzar: workflow_dispatch con force_deploy=yes.');
   if (report.verdict === 'frozen') L.push('  → deploy ABORTADO por DEPLOY_FREEZE. Forzar: workflow_dispatch con force_deploy=yes.');
@@ -188,17 +222,17 @@ function render(report) {
 const redact = (s) => String(s || '').replace(/postgres(ql)?:\/\/[^\s]+/gi, 'postgres://…').replace(/password[^\s,]*/gi, 'password=…').slice(0, 200);
 
 /** Corre la guardia completa con un `query` inyectable. → report (con `code`). */
-async function runGuard({ query, env = process.env, force = false }) {
+async function runGuard({ query, env = process.env, force = false, legacy = false, legacyBlock = false }) {
   const frozen = deployFrozen(env);
   let activity = null;
   let error = null;
   try {
-    activity = await collectActivity(query);
+    activity = await collectActivity(query, { legacy: legacy || legacyBlock });
   } catch (e) {
     error = redact((e && (e.code || e.message)) || e);
   }
-  const d = decide({ frozen, force, activity, error });
-  return { generatedAt: new Date().toISOString(), ...d, error, activity };
+  const d = decide({ frozen, force, activity, error, legacyBlock });
+  return { generatedAt: new Date().toISOString(), ...d, legacyBlock: !!legacyBlock, error, activity };
 }
 
 async function pgQueryRunner(env) {
@@ -226,7 +260,7 @@ async function main() {
     process.exit(EXIT.ERROR);
   }
   if (args.help) {
-    console.log('Uso: node scripts/ops/check-active-runs.js [--json] [--force] [--no-env-file] [--env-file <ruta>]');
+    console.log('Uso: node scripts/ops/check-active-runs.js [--json] [--force] [--legacy|--legacy-block] [--no-env-file] [--env-file <ruta>]');
     process.exit(EXIT.CLEAR);
   }
   const envPath = args.envFile === undefined ? path.resolve(process.cwd(), '.env') : args.envFile;
@@ -235,7 +269,7 @@ async function main() {
   let report;
   try {
     runner = await pgQueryRunner(env);
-    report = await runGuard({ query: runner.query, env, force: args.force });
+    report = await runGuard({ query: runner.query, env, force: args.force, legacy: args.legacy, legacyBlock: args.legacyBlock });
   } catch (e) {
     const d = decide({ frozen: deployFrozen(env), force: args.force, activity: null, error: redact((e && (e.code || e.message)) || e) });
     report = { generatedAt: new Date().toISOString(), ...d, error: redact((e && (e.code || e.message)) || e), activity: null };
@@ -247,6 +281,6 @@ async function main() {
   process.exit(report.code);
 }
 
-module.exports = { ACTIVE_RUN_STATUSES, ACTIVE_PACKAGE_STATUSES, EXIT, parseArgs, mergeEnvFile, deployFrozen, collectActivity, decide, render, runGuard };
+module.exports = { ACTIVE_RUN_STATUSES, ACTIVE_PACKAGE_STATUSES, ACTIVE_LEGACY_STATUSES, EXIT, parseArgs, mergeEnvFile, deployFrozen, collectActivity, decide, render, runGuard };
 // `node - < check-active-runs.js` (deploy-staging.yml): el módulo es `[stdin]` y require.main queda undefined.
 if (require.main === module || module.id === '[stdin]') main();
