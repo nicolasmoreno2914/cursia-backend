@@ -491,6 +491,9 @@ function makeWorld({ videoDelivery = 'youtube', videoMode = 'real', videogenScen
           if (videoDelivery) ip.videoDelivery = videoDelivery;
           return [{ owner_id: OWNER, video_mode: videoMode, input_payload: ip }];
         }
+        // r62 (review M1): gate global de cuota y turno FIFO (simulados por el mundo del check).
+        if (/r62:youtube_quota_gate/.test(sql)) { calls.gateQueries = (calls.gateQueries || 0) + 1; return [{ gate_until: yt.gateUntil || null }]; }
+        if (/r62:youtube_quota_rank/.test(sql)) return [{ n: yt.queueAhead || 0 }];
         if (/from public\.generation_item_runs/.test(sql)) return [{ output_summary: store.get(params[0]) ?? {} }];
         throw new Error('query no esperada: ' + sql);
       },
@@ -541,6 +544,15 @@ const transient = () => new YoutubeUploadTransportError('Fallo al subir video a 
 const initNetwork = () => new YoutubeUploadTransportError('No se pudo iniciar la subida a YouTube: fetch failed', 'init');
 const putNetwork = () => new YoutubeUploadTransportError('Fallo al subir video a YouTube: socket hang up', 'upload');
 
+// r62 (review M1): la espera de cuota = hasta la próxima medianoche PT (gate global) + turno FIFO; ya no youtubeQuotaRetrySeconds.
+function secondsToPacificMidnight() {
+  return Math.ceil((worker.nextPacificMidnight(new Date()).getTime() - Date.now()) / 1000);
+}
+function assertPacificWait(sec, msg, extra = 0) {
+  const want = secondsToPacificMidnight() + extra;
+  assert(typeof sec === 'number' && Math.abs(sec - want) <= 5, `${msg}: espera ${sec}, esperada ≈${want} (medianoche PT)`);
+}
+
 function assertCompleted(w, n, msg) {
   const done = w.calls.completeItem.find((c) => c.id === `ir-${n}`);
   assert(done, `${msg}: no completó`);
@@ -555,7 +567,9 @@ async function runWorkerChecks() {
       w.yt.uploadPlan = [new YoutubeQuotaException()];
       await worker.processItem(w.deps, makeItem(60));
       const f = w.calls.failItem[0];
-      assert(f && f.retryable === true && f.opts && f.opts.refundAttempt === true && f.opts.retryAfterSeconds === 7200, 'failItem: ' + JSON.stringify(f));
+      assert(f && f.retryable === true && f.opts && f.opts.refundAttempt === true, 'failItem: ' + JSON.stringify(f));
+      assertPacificWait(f.opts.retryAfterSeconds, 'r62 M1: espera hasta la medianoche PT');
+      eq(w.store.get('ir-60').youtubeQuotaBlockedUntil, worker.nextPacificMidnight(new Date()).toISOString(), 'gate registrado (medianoche PT)');
       assert(typeof w.store.get('ir-60').youtubeQuotaSince === 'string', 'youtubeQuotaSince guardado');
       eq(w.store.get('ir-60').youtubeQuotaWaits, 1, 'contador propio de esperas');
       // segunda espera: conserva el inicio, suma el contador
@@ -566,17 +580,48 @@ async function runWorkerChecks() {
       eq(w.calls.batchCreate, 1, 'sin re-envío');
     }));
 
-  await check('I2 cuota agotada durante 24 h → upload_failed (no reintentable, retry_upload manual) y el contador se reinicia', () =>
+  // r62 (d6): a las 24 h ya NO pasa a upload_failed + retry_upload manual: sigue esperando solo (con una alerta
+  // registrada una vez); recién agotada la espera larga (default 7 días) queda la excepción youtube_quota_exhausted.
+  await check('I2/r62 d6 cuota agotada 25 h → sigue esperando solo (retrying, refundAttempt) con ALERTA registrada una vez y visible en la vista; sin re-envío', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await worker.processItem(w.deps, makeItem(62));
+      const since = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+      w.store.set('ir-62', { ...w.store.get('ir-62'), youtubeQuotaSince: since });
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await w.reclaim(62);
+      let f = w.calls.failItem[w.calls.failItem.length - 1];
+      let os = w.store.get('ir-62');
+      assert(f.retryable === true && f.error.startsWith('youtube_blocked_quota: ') && f.opts && f.opts.refundAttempt === true, 'sigue esperando: ' + JSON.stringify(f));
+      assert(os.delivery === 'blocked_quota' && os.youtubeQuotaSince === since && typeof os.youtubeQuotaAlertAt === 'string', 'alerta: ' + JSON.stringify(os));
+      const alertAt = os.youtubeQuotaAlertAt;
+      const view = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'retrying', error: f.error, outputSummary: os, nextRetryAt: new Date().toISOString() });
+      eq([view.state, view.actions, view.alert && view.alert.code, view.alert && view.alert.since], ['blocked_quota', [], 'youtube_quota_long_wait', since], 'vista: espera con alerta, sin acción manual');
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await w.reclaim(62);
+      os = w.store.get('ir-62');
+      eq([os.youtubeQuotaAlertAt, os.delivery], [alertAt, 'blocked_quota'], 'la alerta se registra una sola vez');
+      f = w.calls.failItem[w.calls.failItem.length - 1];
+      assert(f.retryable === true, 'tercera espera también automática');
+      eq(w.calls.batchCreate, 1, 'sin re-envío a Videogen');
+    }));
+
+  await check('I2/r62 d6 cuota agotada durante TODA la espera larga (7 días) → excepción registrada youtube_quota_exhausted (no reintentable, D config, retry_upload) y el contador se reinicia', () =>
     withEnv(ENV, async () => {
       const w = makeWorld();
       w.yt.uploadPlan = [new YoutubeQuotaException()];
       await worker.processItem(w.deps, makeItem(61));
-      w.store.set('ir-61', { ...w.store.get('ir-61'), youtubeQuotaSince: new Date(Date.now() - 25 * 3600 * 1000).toISOString() });
+      w.store.set('ir-61', { ...w.store.get('ir-61'), youtubeQuotaSince: new Date(Date.now() - (7 * 24 + 1) * 3600 * 1000).toISOString() });
       w.yt.uploadPlan = [new YoutubeQuotaException()];
       await w.reclaim(61);
       const f = w.calls.failItem[w.calls.failItem.length - 1];
       const os = w.store.get('ir-61');
-      assert(f.retryable === false && f.error.startsWith('youtube_upload_failed: ') && /24 h/.test(f.error), 'failItem: ' + JSON.stringify(f));
+      assert(f.retryable === false && f.error.startsWith('youtube_quota_exhausted: ') && /7 días/.test(f.error), 'failItem: ' + JSON.stringify(f));
+      const FC = loadDist('modules/reliability/failure-classifier.js');
+      const v = FC.classifyFailure({ error: f.error, itemType: 'video', source: 'video_worker' });
+      eq([v.class, v.code, v.humanReason, v.adminAction, v.unclassified], ['D', 'youtube_quota_exhausted', 'config', 'resolve_youtube', false], 'excepción clasificada');
+      assert(typeof os.youtubeQuotaExhaustedAt === 'string', 'instante de la excepción registrado');
       assert(os.delivery === 'upload_failed' && os.youtubeQuotaSince === null && !os.youtubeUploadStartedAt, 'estado: ' + JSON.stringify(os));
       eq(D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: f.error, outputSummary: os }).actions, ['retry_upload'], 'acción manual');
       w.yt.uploadPlan = [];
@@ -584,6 +629,42 @@ async function runWorkerChecks() {
       assertCompleted(w, 61, 'retry manual tras 24 h');
       eq(w.calls.batchCreate, 1, 'sin re-envío a Videogen');
     }));
+
+  await check('r62 M1 gate GLOBAL de cuota: con el gate cerrado (otro curso agotó la cuota) NO se llama a YouTube; el item se reprograma al instante del gate + su turno FIFO (sin bucle); abierto → sube', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      const until = new Date(Date.now() + 3 * 3600 * 1000);
+      w.yt.gateUntil = until.toISOString();
+      w.yt.queueAhead = 2;
+      await worker.processItem(w.deps, makeItem(63));
+      const f = w.calls.failItem[w.calls.failItem.length - 1];
+      eq(w.calls.uploads.length, 0, 'ninguna subida antes de la reposición');
+      assert(f && f.retryable === true && f.error.startsWith('youtube_blocked_quota: ') && f.opts.refundAttempt === true, 'reprogramado: ' + JSON.stringify(f));
+      const want = Math.ceil((until.getTime() - Date.now()) / 1000) + 2 * worker.YOUTUBE_QUOTA_FIFO_SPACING_SECONDS;
+      assert(Math.abs(f.opts.retryAfterSeconds - want) <= 5, `espera = gate + turno: ${f.opts.retryAfterSeconds} vs ${want}`);
+      const os = w.store.get('ir-63');
+      eq([os.delivery, os.youtubeQuotaBlockedUntil, os.youtubeQuotaQueuePosition], ['blocked_quota', until.toISOString(), 3], 'gate y turno registrados');
+      // Re-claim antes de la hora (p.ej. un reclaim temprano): sigue sin subir — su propia marca manda aunque la consulta global falle.
+      w.yt.gateUntil = null;
+      await w.reclaim(63);
+      eq(w.calls.uploads.length, 0, 'su marca propia también frena');
+      // Pasada la hora (la marca quedó en el pasado) y gate abierto → sube y completa.
+      w.store.set('ir-63', { ...w.store.get('ir-63'), youtubeQuotaBlockedUntil: new Date(Date.now() - 1000).toISOString() });
+      w.yt.uploadPlan = [];
+      await w.reclaim(63);
+      assertCompleted(w, 63, 'tras la reposición');
+      eq(w.calls.batchCreate, 1, 'sin re-envío a Videogen');
+    }));
+
+  await check('r62 M1 nextPacificMidnight: 00:00 en America/Los_Angeles, estrictamente futura, con PST (08:00 UTC) y PDT (07:00 UTC)', () => {
+    const f = worker.nextPacificMidnight;
+    eq(f(new Date('2026-01-15T12:00:00Z')).toISOString(), '2026-01-16T08:00:00.000Z', 'PST');
+    eq(f(new Date('2026-07-15T12:00:00Z')).toISOString(), '2026-07-16T07:00:00.000Z', 'PDT');
+    eq(f(new Date('2026-07-16T06:59:59Z')).toISOString(), '2026-07-16T07:00:00.000Z', 'justo antes de medianoche PDT');
+    eq(f(new Date('2026-07-16T07:00:00Z')).toISOString(), '2026-07-17T07:00:00.000Z', 'en medianoche → la siguiente');
+    eq(f(new Date('2026-11-01T12:00:00Z')).toISOString(), '2026-11-02T08:00:00.000Z', 'día del cambio a PST');
+    eq(f(new Date('2026-03-08T12:00:00Z')).toISOString(), '2026-03-09T07:00:00.000Z', 'día del cambio a PDT');
+  });
 
   await check('M3 el marcador de subida se escribe DESPUÉS de bajar el MP4: durante la descarga no hay youtubeUploadStartedAt', () =>
     withEnv(ENV, async () => {
@@ -701,7 +782,7 @@ async function runWorkerChecks() {
     {
       label: 'cuota → blocked_quota (retrying con espera larga); re-claim → solo re-sube → completed',
       plan: [new YoutubeQuotaException()],
-      expect: { delivery: 'blocked_quota', retryable: true, errPrefix: 'youtube_blocked_quota: ', retryAfter: 7200 },
+      expect: { delivery: 'blocked_quota', retryable: true, errPrefix: 'youtube_blocked_quota: ', retryAfterPacific: true },
     },
     {
       label: '5xx ×3 en el mismo reclamo (paridad legacy: 3 intentos) → upload_failed retryable; re-claim → completed',
@@ -743,11 +824,18 @@ async function runWorkerChecks() {
         assert(f && f.retryable === t.expect.retryable && f.error.startsWith(t.expect.errPrefix), 'failItem: ' + JSON.stringify(f));
         assert(!f.error.includes('RAW-GOOGLE') && !f.error.includes(SECRET_TOKEN_MARKER), 'filtró texto crudo/token: ' + f.error);
         if (t.expect.retryAfter) eq(f.opts && f.opts.retryAfterSeconds, t.expect.retryAfter, 'espera de cuota');
+        if (t.expect.retryAfterPacific) assertPacificWait(f.opts && f.opts.retryAfterSeconds, 'espera de cuota (medianoche PT)');
         if (t.expect.uploadsFirst !== undefined) eq(w.calls.uploads.length, t.expect.uploadsFirst, 'intentos en el reclamo');
         // Retry (automático o explícito): solo la subida.
         const statusBefore = w.calls.getVideoStatus;
         w.yt.uploadPlan = [];
         if (t.breakTokenAfterRender) w.deps.youtube.getAccessToken = async () => 't';
+        // r62 (review M1): el retry de una espera de cuota llega cuando el gate venció (el scheduler lo reclama a esa hora).
+        if (t.expect.retryAfterPacific) {
+          const cur = w.store.get(`ir-${itemN}`);
+          assert(typeof cur.youtubeQuotaBlockedUntil === 'string', 'gate registrado');
+          w.store.set(`ir-${itemN}`, { ...cur, youtubeQuotaBlockedUntil: new Date(Date.now() - 1000).toISOString() });
+        }
         await w.reclaim(itemN);
         eq(w.calls.batchCreate, 1, 'batchCreate tras el retry (sin re-envío)');
         eq(w.calls.getVideoStatus, statusBefore, 'sin re-poll a Videogen');

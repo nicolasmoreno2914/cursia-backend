@@ -233,7 +233,9 @@ check('tabla: empaque (scope package) y restauración (R9/R10)', () => {
     const r = p(m);
     assert(r.class === cls && r.strategy === strategy && r.scope === 'package' && !r.unclassified, `${m}: ${JSON.stringify(r)}`);
   };
-  want('Error: PACKAGING_V3_CONTENT_MISSING: no se pudo descargar x', 'A', 'repackage');
+  // r62 (P, review I1): CONTENT_MISSING es determinista (contenido ausente en un set que no cambia) → reparación por item.
+  want('Error: PACKAGING_V3_CONTENT_MISSING: faltan 1 contenido(s): content:c1', 'B', 'repair_package');
+  want('Supabase Storage download failed: 503 Service Unavailable', 'A', 'repackage');
   want('fetch failed (descarga del artifact)', 'A', 'repackage');
   want('H5P_PACKAGE_INVALID: activity:c3 sin h5p.json', 'B', 'repair_package');
   want('QUIZ_V3_BANK_INVALID: x', 'B', 'repair_package');
