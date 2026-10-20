@@ -12,7 +12,7 @@
  * (default 52.428.800 = 50 MB, el tope del plan Free de Supabase y el valor por defecto del proyecto). El mismo valor
  * lo usa la proyección ANTES de generar (`package-size-projection.ts`), así un curso que no cabe se rechaza antes de
  * gastar y el worker nunca intenta una subida que daría 413. `PACKAGE_MBZ_MAX_BYTES` sigue siendo un tope propio del
- * `.mbz` (más bajo); nunca puede superar un `STORAGE_MAX_UPLOAD_BYTES` explícito.
+ * `.mbz` (más bajo); nunca puede superar `STORAGE_MAX_UPLOAD_BYTES` (explícito o el default).
  * Un valor inválido (no entero positivo) → `PACKAGE_SIZE_CONFIG_INVALID` (fail loud, nunca un límite adivinado).
  * Puro salvo el unzip en memoria del directorio central (no infla blobs).
  */
@@ -64,23 +64,20 @@ function parseBytes(name: string, raw: string | undefined): number | null {
   return Number(t);
 }
 
-/** r61 (Q-24): límite de subida del almacenamiento (explícito o el default de 50 MB). */
-export function storageUploadLimitFromEnv(env: Record<string, string | undefined> = process.env): number {
-  return parseBytes(STORAGE_MAX_UPLOAD_BYTES_ENV, env[STORAGE_MAX_UPLOAD_BYTES_ENV]) ?? DEFAULT_STORAGE_MAX_UPLOAD_BYTES;
-}
-
 /**
  * Límites desde el entorno. Lanza PACKAGE_SIZE_CONFIG_INVALID con un valor mal formado, warn > max o un
- * PACKAGE_MBZ_MAX_BYTES mayor que un STORAGE_MAX_UPLOAD_BYTES explícito. r61: el máximo nunca es null (default =
+ * PACKAGE_MBZ_MAX_BYTES mayor que STORAGE_MAX_UPLOAD_BYTES (explícito o default). r61: el máximo nunca es null (default =
  * límite de subida del almacenamiento).
  */
 export function packageSizeLimitsFromEnv(env: Record<string, string | undefined> = process.env): PackageSizeLimits {
   const storageExplicit = parseBytes(STORAGE_MAX_UPLOAD_BYTES_ENV, env[STORAGE_MAX_UPLOAD_BYTES_ENV]);
   const mbzMax = parseBytes(PACKAGE_MBZ_MAX_BYTES_ENV, env[PACKAGE_MBZ_MAX_BYTES_ENV]);
-  if (mbzMax !== null && storageExplicit !== null && mbzMax > storageExplicit) {
-    throw new Error(`${PACKAGE_SIZE_CONFIG_INVALID}: ${PACKAGE_MBZ_MAX_BYTES_ENV} (${mbzMax}) > ${STORAGE_MAX_UPLOAD_BYTES_ENV} (${storageExplicit})`);
+  const storage = storageExplicit ?? DEFAULT_STORAGE_MAX_UPLOAD_BYTES;
+  // Review r61 M1: el tope propio del .mbz nunca supera el límite de Storage, tampoco el default de 50 MB.
+  if (mbzMax !== null && mbzMax > storage) {
+    throw new Error(`${PACKAGE_SIZE_CONFIG_INVALID}: ${PACKAGE_MBZ_MAX_BYTES_ENV} (${mbzMax}) > ${STORAGE_MAX_UPLOAD_BYTES_ENV} (${storage}${storageExplicit === null ? ', default' : ''})`);
   }
-  const maxBytes = mbzMax ?? storageExplicit ?? DEFAULT_STORAGE_MAX_UPLOAD_BYTES;
+  const maxBytes = mbzMax ?? storage;
   const explicitWarn = parseBytes(PACKAGE_MBZ_WARN_BYTES_ENV, env[PACKAGE_MBZ_WARN_BYTES_ENV]);
   if (explicitWarn !== null && maxBytes !== null && explicitWarn > maxBytes) {
     throw new Error(`${PACKAGE_SIZE_CONFIG_INVALID}: ${PACKAGE_MBZ_WARN_BYTES_ENV} (${explicitWarn}) > ${PACKAGE_MBZ_MAX_BYTES_ENV} (${maxBytes})`);
@@ -131,7 +128,7 @@ export async function packageSizeBudget(mbz: Buffer, limits: PackageSizeLimits):
     error = `${PACKAGE_SIZE_LIMIT_EXCEEDED}: el paquete pesa ${stats.totalBytes} bytes (${mb(stats.totalBytes)}) y el límite de subida configurado es ` +
       `${limits.maxBytes} bytes (${mb(limits.maxBytes)}); no se sube. Lo más pesado: ${heavy}. Para entregarlo: un administrador sube el ` +
       `límite de subida de Supabase Storage (plan Pro o superior; Storage → Settings → «Upload file size limit») a ≥ ${mb(stats.totalBytes)} y ` +
-      `configura el mismo valor en ${STORAGE_MAX_UPLOAD_BYTES_ENV} del backend, y reintenta «Preparar paquete» (USD 0: el contenido ya está generado).`;
+      `pone el valor EXACTO en bytes del panel en ${STORAGE_MAX_UPLOAD_BYTES_ENV} del backend, y reintenta «Preparar paquete» (USD 0: el contenido ya está generado).`;
   } else if (limits.warnBytes !== null && stats.totalBytes > limits.warnBytes) {
     warnings.push(`${PACKAGE_SIZE_OVER_WARN}:${stats.totalBytes}:${limits.warnBytes}`);
   }

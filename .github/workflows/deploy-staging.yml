@@ -608,6 +608,10 @@ jobs:
                # el snapshot fijo no (0/13 en pruebas reales). OPENAI_TTS_MODEL pisa el default del código, así que
                # se fija acá (solo el .env de staging; producción no cambia).
                ensure_env_exact OPENAI_TTS_MODEL gpt-4o-mini-tts-2025-03-20
+               # r61 (Q-24): limite de subida de Supabase Storage en bytes (el panel de staging dice fileSizeLimit=200,
+               # verificado solo lectura 2026-10-20). 200000000 queda bajo el limite sea MB o MiB. Lo usan la
+               # proyeccion antes de generar y el worker de empaque antes de subir (default del codigo: 50 MB).
+               ensure_env_exact STORAGE_MAX_UPLOAD_BYTES 200000000
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 

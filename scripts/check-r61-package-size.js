@@ -11,6 +11,9 @@
  *   P6 startRun / previewStart: el gate corre ANTES de crear el run (orden en el código) y solo para runs nuevos
  *   P7 end-to-end in-process: check-commercial-finops con 50 MB → startRun rechaza el curso de 9 capítulos sin crear el run
  *   P8 mensajes del worker accionables y clasificados como config retenida
+ *   P9 in-process (resolveOrCreateRun): retomar el run activo nunca se bloquea; reabrir sobre el límite → 409 después de
+ *      PROVIDER_MODES_CONFLICT y antes de cualquier gate de gasto; con palabras medidas cortas el reabrir pasa
+ *   P10 el audiolibro escala con las palabras narrables (ratio 0,9/1,1 a 141 ppm); sin palabras, calibración #1353
  *
  * Uso: npm run build && node scripts/check-r61-package-size.js [dist] [--table]
  */
@@ -50,12 +53,13 @@ const REAL = { presentation: 'real', audio: 'real' };
 const MOCK = { presentation: 'mock', audio: 'mock' };
 
 (async () => {
-  await check('P1 modelo calibrado con #1353 (real 106,4 MB): esperado entre real y real+12 %, alto ≥ real', () => {
+  await check('P1 modelo calibrado con #1353 (111.561.795 B): esperado entre real y real+8 %, alto entre +20 % y +40 %', () => {
     const real = 111561795;
     const p = PJ.projectPackageSize(manifestItems(12, 3), REAL, { maxBytes: null });
-    eq(p.counts, { contentChapters: 12, chapters: 15, audiobookChapters: 12, presentations: 12 }, 'conteos');
-    assert(p.expectedBytes >= real && p.expectedBytes <= real * 1.12, `esperado ${PJ.mbText(p.expectedBytes)} vs real ${PJ.mbText(real)}`);
-    assert(p.highBytes >= p.expectedBytes, 'alto ≥ esperado');
+    eq(p.counts, { contentChapters: 12, chapters: 15, audiobookChapters: 12, presentations: 12, audiobookChaptersWithWords: 0 }, 'conteos');
+    console.log(`   #1353: real ${real} B · esperado ${p.expectedBytes} B (×${(p.expectedBytes / real).toFixed(3)}) · alto ${p.highBytes} B (×${(p.highBytes / real).toFixed(3)})`);
+    assert(p.expectedBytes >= real && p.expectedBytes <= real * 1.08, `esperado ${PJ.mbText(p.expectedBytes)} vs real ${PJ.mbText(real)}`);
+    assert(p.highBytes >= real * 1.2 && p.highBytes <= real * 1.4, `alto ${PJ.mbText(p.highBytes)}`);
     // El audiolibro domina (≈ 80 %), como en el paquete real (89,9 de 106,4 MB).
     assert(p.breakdown.audiobook / p.expectedBytes > 0.7, `audiolibro ${PJ.mbText(p.breakdown.audiobook)}`);
     eq(p.verdict, 'ok', 'sin límite = ok');
@@ -65,27 +69,34 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
   });
 
   const table = [];
-  await check('P2 S/M/L: con 50 MB todos los formatos con audiolibro real se rechazan antes de generar; con 300 MB todos caben (L en 200 MB solo avisa)', () => {
+  const LIMITS = [['50MiB', 50 * MB], ['200MB', 200000000], ['300MB', 300000000]];
+  await check('P2 S/M/L (bloqueo por el ALTO): 50 MiB bloquea todo; staging 200.000.000 B deja S/M y bloquea L; 300.000.000 B deja todo', () => {
     for (const code of CF.COURSE_FORMAT_CODES) {
       const f = CF.COURSE_FORMATS[code];
       const n = f.modules * f.chaptersPerModule;
       const row = { format: code, chapters: n };
-      for (const lim of [50, 200, 300]) {
-        const p = PJ.projectPackageSize(manifestItems(n, f.modules), REAL, { maxBytes: lim * MB });
+      for (const [label, lim] of LIMITS) {
+        const p = PJ.projectPackageSize(manifestItems(n, f.modules), REAL, { maxBytes: lim });
         row.expected = PJ.mbText(p.expectedBytes);
         row.high = PJ.mbText(p.highBytes);
-        row[`v${lim}`] = p.verdict;
+        row[label] = p.verdict;
       }
       table.push(row);
     }
     eq(table.map((r) => [r.format, r.chapters]), [['S', 9], ['M', 12], ['L', 20]], 'catálogo');
-    eq(table.map((r) => r.v50), ['over', 'over', 'over'], '50 MB');
-    eq(table.map((r) => r.v200), ['ok', 'ok', 'warn'], '200 MB (staging hoy)');
-    eq(table.map((r) => r.v300), ['ok', 'ok', 'ok'], '300 MB (recomendado)');
-    // El curso más chico que ya no cabe en 50 MB con audio real (capítulos de contenido).
+    eq(table.map((r) => r['50MiB']), ['over', 'over', 'over'], '50 MiB');
+    eq(table.map((r) => r['200MB']), ['ok', 'ok', 'over'], '200.000.000 B (staging)');
+    eq(table.map((r) => r['300MB']), ['ok', 'ok', 'ok'], '300.000.000 B (recomendado)');
+    // El curso más chico (capítulos de contenido, sin palabras) que ya no cabe en 50 MiB con audio real.
     let k = 1;
     while (PJ.projectPackageSize(manifestItems(k), REAL, { maxBytes: 50 * MB }).verdict !== 'over') k++;
-    eq(k, 6, 'primer tamaño sobre 50 MB');
+    eq(k, 5, 'primer tamaño bloqueado en 50 MiB');
+    // Aviso: el alto cabe pero el esperado está a < 10 % del límite.
+    const m = PJ.projectPackageSize(manifestItems(12), REAL, { maxBytes: null });
+    const near = PJ.projectPackageSize(manifestItems(12), REAL, { maxBytes: Math.max(m.highBytes, Math.ceil(m.expectedBytes / 0.9) - 1) });
+    eq(near.verdict, m.highBytes < m.expectedBytes / 0.9 ? 'warn' : 'ok', 'aviso cerca del límite');
+    const warnCase = PJ.projectPackageSize(manifestItems(12), REAL, { maxBytes: m.highBytes });
+    eq([warnCase.verdict, warnCase.warnings.length], m.expectedBytes > m.highBytes * 0.9 ? ['warn', 1] : ['ok', 0], 'alto justo en el límite');
     if (process.argv.includes('--table')) console.table(table);
   });
 
@@ -98,13 +109,12 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
 
   await check('P4 límite único: default 50 MB; STORAGE_MAX_UPLOAD_BYTES manda en worker y proyección; PACKAGE_MBZ_MAX_BYTES ≤ Storage', () => {
     eq(SZ.DEFAULT_STORAGE_MAX_UPLOAD_BYTES, 52428800, 'default = 50 MB de Supabase');
-    eq(SZ.storageUploadLimitFromEnv({}), 52428800, 'Storage sin variable');
     eq(SZ.packageSizeLimitsFromEnv({}).maxBytes, 52428800, 'worker sin variable');
     const env = { STORAGE_MAX_UPLOAD_BYTES: String(200 * MB) };
     eq(SZ.packageSizeLimitsFromEnv(env), { warnBytes: Math.floor(200 * MB * 0.9), maxBytes: 200 * MB }, 'worker con Storage 200 MB');
     eq(SZ.packageSizeLimitsFromEnv({ ...env, PACKAGE_MBZ_MAX_BYTES: String(100 * MB) }).maxBytes, 100 * MB, 'tope propio del .mbz más bajo');
-    eq(SZ.packageSizeLimitsFromEnv({ PACKAGE_MBZ_MAX_BYTES: String(100 * MB) }).maxBytes, 100 * MB, 'tope propio sin Storage explícito (compatibilidad)');
-    for (const bad of [{ ...env, PACKAGE_MBZ_MAX_BYTES: String(300 * MB) }, { STORAGE_MAX_UPLOAD_BYTES: '50MB' }, { STORAGE_MAX_UPLOAD_BYTES: '0' }]) {
+    eq(SZ.packageSizeLimitsFromEnv({ PACKAGE_MBZ_MAX_BYTES: String(40 * MB) }).maxBytes, 40 * MB, 'tope propio bajo el default');
+    for (const bad of [{ ...env, PACKAGE_MBZ_MAX_BYTES: String(300 * MB) }, { PACKAGE_MBZ_MAX_BYTES: String(100 * MB) }, { STORAGE_MAX_UPLOAD_BYTES: '50MB' }, { STORAGE_MAX_UPLOAD_BYTES: '0' }]) {
       let err = null;
       try { SZ.packageSizeLimitsFromEnv(bad); } catch (e) { err = e.message; }
       assert(err && err.startsWith('PACKAGE_SIZE_CONFIG_INVALID:'), `${JSON.stringify(bad)} → ${err}`);
@@ -113,61 +123,65 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
 
   const svc = Object.create(RunsService.prototype);
   const v3 = (n) => ({ rulesVersion: 3, manifest: { items: manifestItems(n) } });
-  const withEnv = (vars, fn) => {
+  const withEnv = async (vars, fn) => {
     const prev = {};
     for (const k of Object.keys(vars)) { prev[k] = process.env[k]; if (vars[k] === undefined) delete process.env[k]; else process.env[k] = vars[k]; }
-    try { return fn(); } finally { for (const k of Object.keys(prev)) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; } }
+    try { return await fn(); } finally { for (const k of Object.keys(prev)) { if (prev[k] === undefined) delete process.env[k]; else process.env[k] = prev[k]; } }
   };
   const clean = { STORAGE_MAX_UPLOAD_BYTES: undefined, PACKAGE_MBZ_MAX_BYTES: undefined, PACKAGE_MBZ_WARN_BYTES: undefined };
 
-  await check('P5 assertPackageSizeFits: 409 accionable sobre el límite; aviso con el alto; v1/v2 null; config inválida 409', () => {
-    withEnv(clean, () => {
+  await check('P5 assertPackageSizeFits: 409 accionable con el alto sobre el límite; v1/v2 null; config inválida 409', async () => {
+    await withEnv(clean, async () => {
       let body = null;
-      try { svc.assertPackageSizeFits(v3(12), REAL); } catch (e) { body = e.getResponse ? e.getResponse() : null; eq(e.getStatus(), 409, 'status'); }
+      try { await svc.assertPackageSizeFits(v3(12), REAL); } catch (e) { body = e.getResponse ? e.getResponse() : null; eq(e.getStatus(), 409, 'status'); }
       assert(body, 'debía rechazar M con 50 MB');
       eq(body.code, 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'código');
-      for (const needle of ['No se generó nada', 'STORAGE_MAX_UPLOAD_BYTES', 'Upload file size limit', 'plan Pro', 'audiolibro', '50.0 MB']) {
+      for (const needle of ['No se generó nada', 'STORAGE_MAX_UPLOAD_BYTES', 'Upload file size limit', 'plan Pro', 'audiolibro', '50.0 MB', 'Opciones', 'EXACTO', 'menos capítulos']) {
         assert(body.message.includes(needle), `mensaje sin «${needle}»: ${body.message}`);
       }
       eq(body.packageSize.verdict, 'over', 'proyección en el cuerpo');
-      eq(svc.assertPackageSizeFits({ rulesVersion: 2, manifest: { items: manifestItems(12) } }, REAL), null, 'v2 sin cambios');
-      eq(svc.assertPackageSizeFits(v3(3), REAL).verdict, 'ok', 'curso de 3 capítulos cabe en 50 MB');
-      eq(svc.assertPackageSizeFits(v3(12), MOCK).verdict, 'ok', 'M en mock cabe');
+      eq(await svc.assertPackageSizeFits({ rulesVersion: 2, manifest: { items: manifestItems(12) } }, REAL), null, 'v2 sin cambios');
+      eq((await svc.assertPackageSizeFits(v3(3), REAL)).verdict, 'ok', 'curso de 3 capítulos cabe en 50 MiB');
+      eq((await svc.assertPackageSizeFits(v3(12), MOCK)).verdict, 'ok', 'M en mock cabe');
     });
-    withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: String(200 * MB) }, () => {
-      const p = svc.assertPackageSizeFits(v3(20), REAL);
-      eq([p.verdict, p.warnings.length, p.limitBytes], ['warn', 1, 200 * MB], 'L con 200 MB: aviso visible, no bloquea');
-      assert(/^package_size_projected_high_over_limit:\d+:209715200$/.test(p.warnings[0]), p.warnings[0]);
-    });
-    withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: 'mucho' }, () => {
+    await withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: '200000000' }, async () => {
+      const p = await svc.assertPackageSizeFits(v3(12), REAL);
+      eq([p.verdict, p.limitBytes], ['ok', 200000000], 'M en staging cabe');
       let body = null;
-      try { svc.assertPackageSizeFits(v3(1), REAL); } catch (e) { body = e.getResponse(); }
+      try { await svc.assertPackageSizeFits(v3(20), REAL); } catch (e) { body = e.getResponse(); }
+      eq(body && body.code, 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'L en staging (200.000.000 B): el alto no cabe → 409');
+    });
+    await withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: 'mucho' }, async () => {
+      let body = null;
+      try { await svc.assertPackageSizeFits(v3(1), REAL); } catch (e) { body = e.getResponse(); }
       eq(body && body.code, 'PACKAGE_SIZE_CONFIG_INVALID', 'config inválida');
     });
   });
 
-  await check('P6 startRun / previewStart: el gate corre antes de crear el run, solo en runs nuevos; la vista previa devuelve packageSize', () => {
+  await check('P6 orden en el código: run nuevo → gate antes del presupuesto e insertRun; reabrir → después de PROVIDER_MODES_CONFLICT, antes del gasto; previewStart también para reabribles', () => {
     const src = fs.readFileSync(path.resolve(__dirname, '../src/modules/dynamic-generation/runs.service.ts'), 'utf8');
-    const start = src.slice(src.indexOf('  async startRun('), src.indexOf('  /** Prebrief: null si el curso no lo exige'));
-    const gate = start.indexOf('if (!(await this.findActiveRunRow(manifest.id))) this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));');
-    assert(gate > 0, 'startRun sin el gate');
-    assert(gate < start.indexOf('this.resolveOrCreateRun('), 'el gate debe ir antes de resolveOrCreateRun (antes de cualquier escritura)');
+    const ro = src.slice(src.indexOf('  private async resolveOrCreateRun('), src.indexOf('  private async resolveOrCreateRun(') + 9000);
+    const reopenGate = ro.indexOf('await this.assertPackageSizeFits(manifest, runSpendModes(latestVideoMode, frozenProviderModesOf(latest.input_payload)), latest.id);');
+    assert(reopenGate > ro.indexOf('code: PROVIDER_MODES_CONFLICT') && reopenGate > ro.indexOf('supersededConflict(latest.id') && reopenGate < ro.indexOf('this.enforceVideoGate(') && reopenGate < ro.indexOf('this.finopsPaidWorkGate(') && reopenGate < ro.indexOf('return this.reopenRun('), 'gate al reabrir mal ubicado');
+    const newGate = ro.indexOf('await this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));');
+    assert(newGate > ro.indexOf('await this.assertNoPreviousItems(manifest);') && newGate < ro.indexOf('this.finopsStartGate(') && newGate < ro.indexOf('this.insertRun('), 'gate de run nuevo mal ubicado');
+    assert(ro.indexOf('if (active) return this.existingRunOrConflict(') < reopenGate, 'el activo se devuelve antes de cualquier gate');
     const pv = src.slice(src.indexOf('  async previewStart('), src.indexOf('  /** Política + gasto del curso'));
-    const g2 = pv.indexOf('const packageSize = this.assertPackageSizeFits(');
+    assert(/!isActive\(latest\) && isReopenable\(latest\)\s*\? await this\.assertPackageSizeFits\(/.test(pv), 'previewStart: reabrible evaluado');
+    const g2 = pv.indexOf('const packageSize = await this.assertPackageSizeFits(');
     assert(g2 > 0 && g2 < pv.indexOf('this.finopsBudget.evaluateStart('), 'previewStart: gate antes del estimado');
-    assert(g2 > pv.indexOf('if (latest) {'), 'previewStart: un run existente se retoma sin re-evaluar el tamaño');
-    assert((pv.match(/packageSize/g) || []).length >= 3, 'previewStart devuelve packageSize (con y sin FinOps)');
+    assert((pv.match(/packageSize/g) || []).length >= 5, 'previewStart devuelve packageSize (reabrible, sin FinOps, con FinOps)');
   });
 
-  await check('P7 end-to-end in-process (check-commercial-finops, BD en memoria): con 50 MB startRun rechaza 9 capítulos reales sin crear el run; con 200 MB pasa', () => {
+  await check('P7 end-to-end in-process (check-commercial-finops, BD en memoria): con 50 MiB startRun rechaza los cursos reales sin crear el run; con 300.000.000 B pasa', () => {
     const script = path.resolve(__dirname, 'check-commercial-finops.js');
     const run = (lim) => spawnSync(process.execPath, [script, distRoot], { env: { ...process.env, STORAGE_MAX_UPLOAD_BYTES: String(lim) }, encoding: 'utf8', timeout: 300000 });
     const over = run(50 * MB);
     const out = `${over.stdout}\n${over.stderr}`;
     assert(over.status !== 0 && /startRun: PACKAGE_SIZE_PROJECTED_OVER_LIMIT: .*No se generó nada/.test(out), `esperaba el 409 de tamaño: ${out.slice(-600)}`);
     assert(!/budget_approval_required/.test(out.split('PACKAGE_SIZE_PROJECTED_OVER_LIMIT')[0].slice(-200)), 'el tamaño se evalúa antes del presupuesto');
-    const ok = run(200 * MB);
-    assert(ok.status === 0, `con 200 MB debía pasar: ${(ok.stdout + ok.stderr).slice(-600)}`);
+    const ok = run(300000000);
+    assert(ok.status === 0, `con 300.000.000 B debía pasar: ${(ok.stdout + ok.stderr).slice(-600)}`);
   });
 
   await check('P8 worker: mensaje de PACKAGE_SIZE_LIMIT_EXCEEDED accionable y clasificado como config retenida (USD 0 al reintentar)', async () => {
@@ -180,6 +194,66 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
     for (const needle of ['PACKAGE_SIZE_LIMIT_EXCEEDED:', 'STORAGE_MAX_UPLOAD_BYTES', 'Upload file size limit', 'Preparar paquete', 'USD 0']) assert(v.error.includes(needle), `sin «${needle}»: ${v.error}`);
     const r = FC.classifyFailure({ error: v.error, source: 'package_worker' });
     eq([r.class, r.strategy, r.humanReason], ['D', 'hold_for_human', 'config'], 'clasificación');
+  });
+
+  // P9: resolveOrCreateRun in-process con stubs (sin DB): solo lo que el método toca antes del gasto.
+  const items12 = manifestItems(12);
+  const manifest12 = { id: 77, rulesVersion: 3, manifest: { items: items12 } };
+  const REACHED = 'LLEGO_AL_GATE_DE_GASTO';
+  function stubbed({ active = null, latest = null, words = [] } = {}) {
+    const s = Object.create(RunsService.prototype);
+    s.findActiveRunRow = async () => active;
+    s.existingRunOrConflict = async (row) => ({ resumed: row.id });
+    s.findLatestRunRow = async () => latest;
+    s.loadContextRow = async () => ({ context_hash: 'h1', context: {} });
+    s.findSupersedingRun = async () => null;
+    s.dataSource = { query: async (sql) => (/audiobookPlan/.test(sql) ? words : []) };
+    s.logger = { warn() {}, log() {}, error() {} };
+    s.enforceVideoGate = async () => { throw new Error(REACHED); };
+    s.finopsPaidWorkGate = async () => { throw new Error(REACHED); };
+    s.reopenRun = async () => { throw new Error('NO_DEBE_REABRIR'); };
+    s.hasPreviousItems = async () => false;
+    s.assertNoPreviousItems = async () => {};
+    s.finopsStartGate = async () => { throw new Error(REACHED); };
+    return s;
+  }
+  const call = (s, providerModes = { presentation: 'real', audio: 'real' }) =>
+    s.resolveOrCreateRun(1, 'owner', 1, manifest12, {}, 'h1', 'mock', true, 'youtube', providerModes, {});
+  const codeOf = async (p) => { try { await p; return 'NO_THROW'; } catch (e) { return (e.getResponse && e.getResponse().code) || e.message; } };
+  const frozenReal = { videoMode: 'mock', providerModes: { presentation: 'real', audio: 'real' } };
+
+  await check('P9 in-process: retomar el run activo nunca se bloquea; reabrir sobre el límite → 409 (tras PROVIDER_MODES_CONFLICT, antes del gasto); run nuevo → 409 antes del presupuesto', async () => {
+    await withEnv(clean, async () => {
+      // Retomar: un M real con 50 MiB (proyección bloqueada) se devuelve igual.
+      eq(await call(stubbed({ active: { id: 'act', worker_status: 'running', input_payload: frozenReal } })), { resumed: 'act' }, 'retomar activo');
+      // Reabrir un run fallido de M real con 50 MiB → 409 de tamaño, sin llegar a ningún gate de gasto.
+      const failed = { id: 'r-old', worker_status: 'failed', input_payload: frozenReal };
+      eq(await codeOf(call(stubbed({ latest: failed }))), 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'reabrir sobre el límite');
+      // Modos distintos de los congelados → el conflicto de modos gana (M3).
+      eq(await codeOf(call(stubbed({ latest: failed }), { presentation: 'mock', audio: 'real' })), 'provider_modes_conflict', 'conflicto de modos primero');
+      // Run nuevo (sin runs previos) → 409 antes de finopsStartGate.
+      eq(await codeOf(call(stubbed())), 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'run nuevo sobre el límite');
+      // Reabrir con palabras medidas cortas (400 por capítulo ≈ 2,6 min) → cabe → sigue al gate de video.
+      const words = items12.filter((i) => i.type === 'audiobook_chapter').map((i) => ({ chapter_id: i.chapterId, words: '400' }));
+      eq(await codeOf(call(stubbed({ latest: failed, words }))), REACHED, 'reabrir con palabras medidas que caben');
+    });
+    await withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: '200000000' }, async () => {
+      eq(await codeOf(call(stubbed())), REACHED, 'run nuevo M con el límite de staging → sigue al presupuesto');
+    });
+  });
+
+  await check('P10 audiolibro por palabras: 2.800 palabras → ≈ 17,9 / 21,8 min; sin palabras → 21 / 25 min; mezcla por capítulo', () => {
+    const one = manifestItems(1);
+    const byWords = PJ.projectPackageSize(one, REAL, { maxBytes: null }, { chapterWords: { c0: 2800 } });
+    const none = PJ.projectPackageSize(one, REAL, { maxBytes: null });
+    const min = (b) => b / 6000 / 60;
+    assert(Math.abs(min(byWords.breakdown.audiobook) - (2800 * 0.9) / 141) < 0.01, `esperado ${min(byWords.breakdown.audiobook)}`);
+    eq(none.breakdown.audiobook, 21 * 60 * 6000, 'fallback esperado 21 min');
+    eq(byWords.counts.audiobookChaptersWithWords, 1, 'con palabras');
+    const hiW = PJ.projectPackageSize(one, REAL, { maxBytes: 1 }, { chapterWords: { c0: 2800 } });
+    assert(Math.abs(hiW.highBytes - hiW.expectedBytes - ((2800 * 0.2) / 141) * 60 * 6000 - (2.4 - 1.75 + 1.0 - 0.6 + 0.4 - 0.25 + 1.0) * MB) < 2, 'alto con ratio 1,1');
+    const mixed = PJ.projectPackageSize(manifestItems(2), REAL, { maxBytes: null }, { chapterWords: { c0: 1410, x: 99999 } });
+    eq(mixed.breakdown.audiobook, Math.round((1410 * 0.9 / 141 + 21) * 60 * 6000), 'un capítulo con palabras + uno sin');
   });
 
   console.log(`\n${passes} ok, ${failures} fallos`);

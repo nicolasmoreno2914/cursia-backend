@@ -934,9 +934,6 @@ export class RunsService {
     // los chequeos bajo advisory lock en insertRun/reopenRun/retryItem.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
-    // r61 (Q-24): un run NUEVO (o reabierto: vuelve a gastar) cuyo paquete no cabría en el límite de subida del
-    // almacenamiento se rechaza ANTES de gastar. Retomar el run activo de este Manifest nunca se bloquea.
-    if (!(await this.findActiveRunRow(manifest.id))) this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));
     // LOOP 8.1: alineado con el estudiante del Blueprint, DESPUÉS de los gates previos (mismos errores y mismo orden).
     const context = await this.contextAlignedWithFacts(courseId, manifest, rawContext);
     const contextHash = canonicalContextHash(context);
@@ -1061,13 +1058,18 @@ export class RunsService {
     const empty = { estimate: null, decision: null, reasons: [], paidRealProviders: [], approval: null, policy: null, estimateHash: null };
     const latest = await this.findLatestRunRow(manifest.id);
     if (latest) {
-      return { ...base, ...empty, existingRun: { id: latest.id, status: latest.worker_status, active: isActive(latest) } };
+      // Review r61 M2: un run reabrible (cancelado/fallido) vuelve a gastar al «Retomar» → el mismo 409 de tamaño que
+      // daría startRun al reabrirlo (con sus modos congelados y las palabras ya medidas). Un run activo se retoma siempre.
+      const packageSize = !isActive(latest) && isReopenable(latest)
+        ? await this.assertPackageSizeFits(manifest, runSpendModes(this.videoModeOf(latest), frozenProviderModesOf(latest.input_payload)), latest.id)
+        : null;
+      return { ...base, ...empty, existingRun: { id: latest.id, status: latest.worker_status, active: isActive(latest) }, ...(packageSize ? { packageSize } : {}) };
     }
     // Mismos 409/403 que startRun daría para un run nuevo, ANTES de ofrecer autorizar.
     const other = await this.findActiveRunOnOtherManifest(this.dataSource, courseId, manifest.id);
     if (other) throw this.otherActiveRunConflict(other, manifest);
     // r61 (Q-24): el mismo 409 de tamaño que daría startRun, ANTES de ofrecer autorizar (sin run: siempre aplica).
-    const packageSize = this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));
+    const packageSize = await this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));
     // LOOP 8.1: el mismo contexto (y hash) que congelaría startRun.
     const context = await this.contextAlignedWithFacts(courseId, manifest, rawContext);
     const contextHash = canonicalContextHash(context);
@@ -1536,6 +1538,9 @@ export class RunsService {
       // Fix wave (M5): un run reemplazado por uno creado desde él no se reabre.
       const superseding = await this.findSupersedingRun(this.dataSource, latest.id);
       if (superseding) throw this.supersededConflict(latest.id, superseding);
+      // r61 (Q-24, review M3): reabrir vuelve a gastar → el paquete debe caber (modos congelados del run + palabras ya
+      // medidas), DESPUÉS de los conflictos de contexto/modos y ANTES de cualquier gate de gasto o escritura.
+      await this.assertPackageSizeFits(manifest, runSpendModes(latestVideoMode, frozenProviderModesOf(latest.input_payload)), latest.id);
       // DN-1: reabrir re-encola los items cancelled; si alguno es un video sin
       // job de Videogen (envío NUEVO), aplica el gate de entrega (YouTube +
       // preflight) ANTES de escribir nada.
@@ -1571,6 +1576,9 @@ export class RunsService {
       return this.resolveOrCreateRun(courseId, ownerId, blueprintNumber, manifest, context, contextHash, videoMode, false, videoDelivery, providerModes, opts);
     }
     await this.assertNoPreviousItems(manifest);
+    // r61 (Q-24): un run NUEVO cuyo paquete podría no caber en el límite de subida del almacenamiento se rechaza ANTES
+    // de gastar (409 con las opciones). Retomar el run activo nunca llega acá (se devuelve arriba).
+    await this.assertPackageSizeFits(manifest, runSpendModes(videoMode, providerModes ?? null));
     // I1 (5C): un run NUEVO con video real requiere DYNAMIC_REAL_VIDEO_OWNERS (fail closed). Un run
     // 'real' ya activo se devuelve arriba sin pasar por acá (reanudar no se bloquea).
     // Fix round 1 (I1): un curso SIN videos arranca para cualquier owner (no hay Videogen que gastar).
@@ -5175,14 +5183,16 @@ export class RunsService {
 
   /**
    * r61 (Q-24): proyección del `.mbz` v3 contra el límite de subida configurado (STORAGE_MAX_UPLOAD_BYTES, default
-   * 50 MB; o PACKAGE_MBZ_MAX_BYTES) — el MISMO límite que aplica el worker de empaque antes de subir. Esperado sobre el
-   * límite → 409 PACKAGE_SIZE_PROJECTED_OVER_LIMIT con la acción; config inválida → 409 PACKAGE_SIZE_CONFIG_INVALID.
+   * 50 MB; o PACKAGE_MBZ_MAX_BYTES) — el MISMO límite que aplica el worker de empaque antes de subir. Tamaño ALTO sobre
+   * el límite → 409 PACKAGE_SIZE_PROJECTED_OVER_LIMIT con las opciones; config inválida → 409 PACKAGE_SIZE_CONFIG_INVALID.
    * v1/v2 (otro builder) → null, sin cambios.
    */
-  private assertPackageSizeFits(
+  private async assertPackageSizeFits(
     manifest: { rulesVersion: number; manifest: { items: ReadonlyArray<{ type: string; chapterId?: string | null }> } },
     modes: { presentation: 'mock' | 'real'; audio: 'mock' | 'real' },
-  ): PackageSizeProjection | null {
+    /** Run previo (reabrir): sus palabras narrables medidas escalan el audiolibro (misma base que el estimador). */
+    runId?: string | null,
+  ): Promise<PackageSizeProjection | null> {
     if (manifest.rulesVersion !== 3) return null;
     let limits;
     try {
@@ -5191,7 +5201,8 @@ export class RunsService {
       const message = err instanceof Error ? err.message : String(err);
       throw new ConflictException({ code: PACKAGE_SIZE_CONFIG_INVALID, message: `${message} — corrige la variable del backend; no se generó nada.` });
     }
-    const projection = projectPackageSize(manifest.manifest.items, modes, limits);
+    const chapterWords = runId ? await this.audiobookChapterWords(runId, manifest.manifest.items as RunManifestItem[]) : null;
+    const projection = projectPackageSize(manifest.manifest.items, modes, limits, { chapterWords });
     if (projection.verdict === 'over') {
       throw new ConflictException({ code: PACKAGE_SIZE_PROJECTED_OVER_LIMIT, message: projection.error, packageSize: projection });
     }
