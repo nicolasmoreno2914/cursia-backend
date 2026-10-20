@@ -33,7 +33,8 @@ dispara el owner (Nicolás), con su aprobación explícita.
 - la aserción `NODE_ENV=production` del `.env`;
 - los checks deterministas de staging que no necesitan Moodle;
 - el gate REL R1 con el frontend, **obligatorio**;
-- el drenado de los 3 workers dinámicos;
+- el drenado de los 3 workers dinámicos (r62 d11): SIGINT y `kill_timeout`. Ninguna llamada pagada en vuelo se corta en un deploy ni en un rollback;
+- el worker de IA hospedado (r62 d9), con variable propia y apagado por defecto;
 - flags V2 con defaults seguros;
 - el esquema V2 verificado con fail closed (nunca se migra desde acá);
 - presencia, estabilidad y sondas de la base después del deploy.
@@ -56,8 +57,10 @@ dispara el owner (Nicolás), con su aprobación explícita.
 | `DYNAMIC_MANIFEST_RULES_VERSION` / `DYNAMIC_ACTIVITY_TYPE_RULES` | no se tocan | **fija** `3` / `2` |
 | `DYNAMIC_VIDEO_DELIVERY`, `GAMMA_THEME_V21_*` | no se tocan | default si faltan (`youtube`, `default-light` / `default-dark`) |
 | `PRESENTATION_LIGHT_DEFAULT_SINCE`, `DYNAMIC_PREBRIEF_REQUIRED_SINCE` | no se tocan | instante del primer deploy con canario; después queda congelado |
-| `DYNAMIC_PROVIDER_WORKER_ENABLED`, `DYNAMIC_LLM_WORKER_ENABLED` | **fija** `false` | **fija** `true` solo con `PROD_V2_WORKERS_ENABLED=true` y sin `DYNAMIC_WORKERS_HOLD=true` |
-| `DYNAMIC_LLM_WORKER_SINCE` / `_CONCURRENCY` | no se tocan | default si faltan, solo con workers encendidos |
+| `DYNAMIC_PROVIDER_WORKER_ENABLED` | **fija** `false` | **fija** `true` solo con `PROD_V2_WORKERS_ENABLED=true` y sin `DYNAMIC_WORKERS_HOLD=true` |
+| `DYNAMIC_LLM_WORKER_ENABLED` | **fija** `false` | **fija** `true` solo si además `PROD_V2_LLM_WORKER_ENABLED=true`: va hospedado en el worker de proveedores |
+| `DYNAMIC_LLM_WORKER_SINCE` / `_CONCURRENCY` | no se tocan | instante de activación (default si falta) y concurrencia **fija** en `4`, solo con la IA encendida |
+| `DYNAMIC_WORKER_DRAIN_TIMEOUT_MS` | **fija** `270000` | Con la IA encendida: **fija** llamada LLM + 60 s (default 960000); el `kill_timeout` de PM2 es llamada + 90 s |
 | `OPENAI_TTS_MODEL` | **fija** `gpt-4o-mini-tts-2025-03-20` | ídem |
 | `FINOPS_INGEST_TOKEN` | desde el secret `FINOPS_INGEST_TOKEN_PRODUCTION`, sin imprimirse | ídem |
 | `DB_POOL_MAX`, `DB_POOL_MAX_WORKER`, `DB_POOL_IDLE_MS_WORKER` | solo si existe la variable `PROD_DB_POOL_*`; si no, aviso | ídem |
@@ -126,7 +129,8 @@ Settings → Environments → `production` (ya lo referencia `deploy.yml`):
 |---|---|---|
 | `DEPLOY_FREEZE` | vacío | `true` congela los deploys; el escape es un dispatch con `force_deploy=yes`. En el environment `production` congela solo producción; a nivel repo congela también staging. |
 | `PROD_V2_CANARY_OWNER` | vacío (V2 apagado) | UUID del owner canario (fase 3). |
-| `PROD_V2_WORKERS_ENABLED` | `false` | Con canario: worker de proveedores reales y worker de IA hospedado (**gasto**). |
+| `PROD_V2_WORKERS_ENABLED` | `false` | Con canario: worker de proveedores reales (Gamma, TTS) (**gasto**). |
+| `PROD_V2_LLM_WORKER_ENABLED` | `false` | r62 d9. Con canario y `PROD_V2_WORKERS_ENABLED=true`: worker de IA **hospedado** en `cursia-dynamic-provider-worker`. No suma proceso ni conexión al pooler. Las partes LLM de los runs nuevos (creados desde `DYNAMIC_LLM_WORKER_SINCE`) dejan de depender de una pestaña abierta. Requiere `ANTHROPIC_API_KEY` en el `.env` (si falta, no arranca y lo registra en el log). Sube el drenado de los workers dinámicos a la duración de una llamada (15 min + 90 s): un deploy puede esperar hasta ese tiempo si hay una llamada en vuelo. |
 | `PROD_V2_GENERAL_AVAILABILITY` | `false` | Único modo de permitir V2 con el allowlist vacío (fase 4, al final). |
 | `PROD_DB_POOL_MAX`, `PROD_DB_POOL_MAX_WORKER`, `PROD_DB_POOL_IDLE_MS_WORKER` | vacío (no se toca) | Tamaño del pool por proceso (§2, capacidad). |
 | `PROD_DEPLOY_BLOCK_ON_V1_JOBS` | `false` | Los jobs V1 con lease vigente bloquean el deploy (si no, solo se informan). |
@@ -270,8 +274,9 @@ select execution_mode, count(*) from public.production_jobs group by 1 order by 
 - `FINOPS_INGEST_TOKEN_PRODUCTION` cargado;
 - `FRONTEND_REPO_READ_TOKEN` cargado;
 - **`PROD_FE_GATE_REF`** = el commit de release o la rama del frontend que se promueve. Nunca el `main` V1 del frontend: el deploy falla en «Frontend del gate trae el ejecutor dinámico»;
-- en el VPS, `sudo pm2 jlist` (o `pm2 status`): anotar qué workers V1 se reinician en bucle hoy. El deploy los tolera con un aviso: mide 15 s antes de tocar nada. `cursia-video-worker` con `VIDEO_WORKER_ENABLED≠true` y `cursia-gamma-worker` sin `GAMMA_API_KEY` se **detienen** en vez de reiniciarse en bucle;
+- en el VPS, `sudo pm2 jlist` (o `pm2 status`): anotar qué workers V1 se reinician en bucle hoy. El deploy los tolera con un aviso: el **preflight** (por stdin, antes del rsync y sin tocar nada) mide 15 s, deja el resultado en `.release-preloop` e `install` lo usa (r62 m2). `cursia-video-worker` con `VIDEO_WORKER_ENABLED≠true` y `cursia-gamma-worker` sin `GAMMA_API_KEY` se **detienen** en vez de reiniciarse en bucle;
 - `NODE_ENV=production` como línea simple del `.env` (sin `export`). Si viene del ecosistema de PM2, el preflight falla a propósito (M9): agregar la línea;
+- lo mismo con `VIDEO_WORKER_ENABLED` y `GAMMA_API_KEY` (m7): el deploy los lee solo del `.env`. Si vienen del entorno de PM2, el worker se detendría aunque esté habilitado. Nest usa `envFilePath: '.env'`, así que es improbable, pero hay que confirmarlo;
 - ventana sin runs V1 largos (`jobList()` en la consola).
 
 **2.1 Merge.** El merge del PR de promoción a `main` dispara `deploy.yml`, en este orden:
@@ -355,6 +360,11 @@ En el log del paso «Install…» deben aparecer:
    - con el owner, `true`.
 3. Primer curso 1×1 **sin gasto de proveedores**: video mock y workers apagados. Debe llegar a prebrief, Blueprint y Manifest.
 4. Con aprobación de gasto (tope bajo): `PROD_V2_WORKERS_ENABLED=true` y redeploy. Luego un curso 1×1 real, empaquetarlo y restaurarlo en Moodle 4.5 o superior.
+4b. **OWNER-ACTION (d9).** Para que la generación no dependa de una pestaña abierta: `PROD_V2_LLM_WORKER_ENABLED=true` y redeploy. Requiere `ANTHROPIC_API_KEY` en el `.env` de producción.
+   - El log debe mostrar `DYNAMIC_LLM_WORKER_ENABLED: … → true`, el drenado `kill_timeout 990000 ms` y, en `pm2 logs cursia-dynamic-provider-worker`, «worker de IA hospedado».
+   - Solo toma runs creados desde ese deploy. En la consola, `llm_worker_presence` tiene que estar al día.
+   - Ese deploy recrea una vez los 3 workers dinámicos con el `kill_timeout` nuevo.
+   - Apagarlo: vaciar la variable y redeployar.
 5. Conciliar las reservas pendientes con los endpoints de conciliación de SUPER_ADMIN (`charged_partial` de r60). El ledger es append-only.
 
 **Rollback de la fase 3:**
@@ -392,6 +402,21 @@ En el log del paso «Install…» deben aparecer:
 - Es la release completa: código, `dist/` y **`node_modules`**, sin `.env`. Así el rollback no depende del registro de npm (M6). `dist.prev` sola no alcanzaría si cambian `package.json` o los scripts.
 - Un snapshot sin `node_modules` (por ejemplo, uno anterior a este fix) cae a `npm install --omit=dev`.
 - Volver a la V1 `pre-r61` **después** de que existan filas `dynamic_*` sigue sin ser el backout soportado (N1); primero el nivel 1b.
+
+**Drenado en deploy y rollback (r62 d11).**
+- Los 3 workers dinámicos se recargan con `pm2 reload`: SIGINT, el worker deja de reclamar y termina o devuelve los ítems en un punto sin gasto en el aire (`worker-drain.ts`). Lo mismo en el rollback, manual o automático.
+- PM2 espera el `kill_timeout`: 300 s, o llamada LLM + 90 s con la IA encendida. El tope interno de drenado queda siempre 30 s por debajo.
+- Los workers V1 se reinician como siempre (`pm2 restart` vía npm). Si `PROD_DEPLOY_BLOCK_ON_V1_JOBS` no está activa, los jobs V1 en curso solo se informan.
+- El auto-rollback registra antes los runs activos (`check-active-runs --legacy --force`, informativo, m6). No se bloquea, porque la release rota es la que estaría corriendo.
+
+**El rollback es solo de código (m5).**
+- No revierte los cambios del `.env` que hizo el install fallido: flags, `OPENAI_TTS_MODEL`, `PROD_DB_POOL_*`, `FINOPS`, drenado.
+- `.env.bak` guarda solo el **último** cambio.
+- Si la causa fue un valor del `.env` (por ejemplo, un pool que agota el pooler), el rollback la reproduce: corregir la variable y redeployar, o editar el `.env` a mano.
+
+**Cuándo hay auto-rollback (m3/m4).**
+- Hay auto-rollback ante cualquier fallo con el rsync ya iniciado, aunque haya fallado a mitad (árbol mezclado), **salvo** que el health check haya pasado.
+- Si el health pasó y solo falló «Mark release healthy» (por ejemplo, SSH), no se revierte una release sana. Queda `deploying <sha>`: re-correr el deploy o `mark-ok` a mano.
 
 **Permisos del `.env` (I3).**
 - Cada reescritura de una clave crea el temporal como copia del `.env` (`cp -p`, `umask 077`), así que el modo del archivo (por ejemplo, 0600) se conserva, y también el de `.env.bak`.
@@ -447,3 +472,5 @@ En el log del paso «Install…» deben aparecer:
 8. Versión de Moodle soportada (P11). `VIDEO_ENGINE_*` en el backend y en Pages (P12). Merge de `main` en `staging` (P13). Plan de migración del TTS antes del 2027-01-06 (P14). DN-1..DN-6 (P15).
 9. Correr la fase 1 (dry-run, DN-6, backup, apply y verify) desde un checkout del release.
 10. Aprobar y mergear la promoción (fase 2). Variable `PROD_V2_CANARY_OWNER` (fase 3). `PROD_V2_WORKERS_ENABLED` con la frase AUTORIZO (fase 3.4). Ampliación (fase 4).
+11. **d9:** `PROD_V2_LLM_WORKER_ENABLED=true` (fase 3.4b) con `ANTHROPIC_API_KEY` en el `.env`, para que la generación no dependa de una pestaña abierta. Aceptar que, con la IA encendida, un deploy espera hasta ≈16,5 min si hay una llamada LLM en vuelo.
+12. m1: aplicar en `deploy-staging.yml` el arreglo de permisos del `.env` (I3) después de #156. Queda fuera del alcance de esta rama.
