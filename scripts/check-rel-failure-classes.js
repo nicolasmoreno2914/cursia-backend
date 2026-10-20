@@ -508,7 +508,7 @@ check('fix round 2 (N7): cuota/saldo en español es configuración del proveedor
   expectVerdict('gamma_submit_failed: gamma POST /generations HTTP 400: saldo insuficiente', { class: 'D', strategy: 'wait_provider', provider: 'gamma' });
 });
 
-check('#583 (merge de staging): el reenvío automático ÚNICO de audio TTS incierto (≤ USD 0.10) es coherente con la clase C del clasificador', () => {
+check('#583 + r62: el reenvío automático ÚNICO de audio TTS incierto (peor caso dentro de lo autorizado) es coherente con la clase C del clasificador', () => {
   const msg = 'provider_reconciliation_required: openai — audio TTS pagado sin persistir. El proveedor pudo haber completado';
   for (const itemType of ['audio_welcome', 'audiobook_chapter']) {
     const r = expectVerdict(msg, { class: 'C', strategy: 'auto_resubmit_once', paidRisk: 'uncertain', adminAction: 'reconcile_provider', provider: 'openai' }, { itemType });
@@ -524,15 +524,20 @@ check('#583 (merge de staging): el reenvío automático ÚNICO de audio TTS inci
     expectVerdict(msg, { class: 'C', strategy: 'provider_check' }, { itemType });
     assert(FC.currentRecoveryOf(msg, itemType, {}) === 'denied', itemType);
   }
-  // Decisión A: el tope de USD 0.10 lo decide auto-heal con el ledger (misma función que usa el clasificador).
+  // r62 (cambio DELIBERADO de la decisión A): el tope fijo de USD 0,10 se reemplazó por el PEOR CASO contra lo autorizado
+  // (presupuesto de recuperación de la parte + saldo del run), que auto-heal evalúa con el ledger. Sigue UNA vez.
   const NOW = new Date('2026-10-02T12:00:00Z');
   const row = { status: 'failed', type: 'audiobook_chapter', error: msg, output_summary: {}, finished_at: new Date(NOW.getTime() - 600_000).toISOString() };
-  assert(AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD === 0.1 && AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS === 1, 'constantes de la decisión A');
-  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['openai'] }).heal === true, '≤ 0.10 → un reenvío');
-  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.1, providers: ['openai'] }).heal === true, '= 0.10 → un reenvío');
-  const over = AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.11, providers: ['openai'] });
-  assert(over.heal === false && over.reason === 'over_threshold', '> 0.10 → admin');
-  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['anthropic', 'openai'] }).heal === false, 'otro proveedor pendiente → admin');
+  const FITS = { budget: { fits: true, reason: null } };
+  assert(AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD === undefined && AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS === 1, 'constantes (sin tope fijo; una vez)');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['openai'] }, undefined, FITS).heal === true, 'entra → un reenvío');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.5, providers: ['openai'] }, undefined, FITS).heal === true, 'más de 0.10 pero dentro de lo autorizado → un reenvío');
+  const over = AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.11, providers: ['openai'] }, undefined, { budget: { fits: false, reason: 'run_budget' } });
+  assert(over.heal === false && over.reason === 'over_budget' && over.budgetReason === 'run_budget', 'fuera de lo autorizado → excepción');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['anthropic', 'openai'] }, undefined, FITS).heal === false, 'otro proveedor pendiente → admin');
+  // K6: con el reenvío usado o rechazado el veredicto deja de decir «reenvío automático».
+  expectVerdict(msg, { class: 'C', strategy: 'hold_for_human', humanReason: 'duplicate_charge' }, { itemType: 'audio_welcome', outputSummary: { ambiguousAudioResubmit: { rounds: 1 } } });
+  expectVerdict(msg, { class: 'C', strategy: 'hold_for_human', humanReason: 'budget' }, { itemType: 'audio_welcome', outputSummary: { ambiguousAudioResubmit: { declined: 'over_budget:run_budget' } } });
   // TTS incierto por trozos (N5) no es este caso (tts_failed, no provider_reconciliation_required): C reconcile.
   const t = v('tts_failed: chunk 3/4: HTTP 503', { itemType: 'audiobook_chapter' });
   assert(t.class === 'C' && t.adminAction === 'reconcile_provider' && FC.currentRecoveryOf('tts_failed: chunk 3/4: HTTP 503', 'audiobook_chapter', {}) !== 'ambiguous_audio_resubmit', 'tts_failed');

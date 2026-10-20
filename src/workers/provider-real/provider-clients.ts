@@ -138,8 +138,17 @@ export interface TtsCallResult {
   requestId: string | null;
 }
 
+/**
+ * r62 (K1, regla de ambigüedad acotada punto 1: PREVENIR antes que resolver). Los cuelgues del TTS de OpenAI observados
+ * terminan entre 125 y 172 s (phase-b-n1-tts-root-cause.md, #1510); con el corte en 120 s el cliente abortaba llamadas
+ * que OpenAI igual completaba y cobraba → resultado ambiguo. 210 s queda por encima de la cola observada con margen.
+ * Invariantes: < lease del worker de proveedores (300 s, PROVIDER_WORKER_MIN_LEASE_SECONDS) y < drenado (270 s);
+ * la ventana en vuelo de Q-21 (lease-takeover.ts, IN_FLIGHT_WINDOW_MS.openai) se deriva de este valor.
+ */
+export const OPENAI_TTS_TIMEOUT_MS = 210_000;
+
 export class OpenAiTtsClient {
-  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = callTimeoutMs(env, 120_000)) {
+  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = callTimeoutMs(env, OPENAI_TTS_TIMEOUT_MS)) {
     if (!apiKey || !apiKey.trim()) throw new ProviderCallError('openai', false, 'openai: OPENAI_API_KEY no configurada');
   }
 

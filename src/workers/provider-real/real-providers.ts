@@ -142,6 +142,16 @@ export function isDefinitiveRejection(err: unknown): boolean {
   return err instanceof ProviderCallError && err.status !== null && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 409;
 }
 
+/**
+ * r62 (K2, regla de ambigüedad acotada punto 4): el proveedor RESPONDIÓ con un error transitorio (429 o 5xx, con su
+ * cuerpo: p. ej. «HTTP 504: upstream request timeout»). Es un resultado CONOCIDO, no un timeout del cliente: OpenAI no
+ * cobra una respuesta de error, la reserva se libera y el intento se reintenta con backoff (clase A). 408/409 siguen
+ * siendo ambiguos (review previa: no prueban que no se procesó).
+ */
+export function isKnownTransientHttpError(err: unknown): boolean {
+  return err instanceof ProviderCallError && err.status !== null && (err.status === 429 || err.status >= 500);
+}
+
 export interface RealProviderDeps {
   scheduler: Pick<SchedulerService, 'completeItem' | 'failItem'> &
     Partial<Pick<SchedulerService, 'blockItemForBudget' | 'recordItemExternal' | 'heartbeatItem'>>;
@@ -848,6 +858,13 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
         await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
         if (ttsTracker) ttsTracker.inFlight = null;
       }
+      if (isKnownTransientHttpError(err)) {
+        // r62 (K2): respuesta de error del proveedor = sin cobro → se libera la reserva; los trozos anteriores de este
+        // intento quedaron cobrados y MEDIDOS (resultado conocido): el intento se reconoce y se reintenta (clase A).
+        await settlePaidCall(deps.finops, resKey, null, 'openai_tts_http_error_not_charged');
+        if (ttsTracker) ttsTracker.inFlight = null;
+        return await fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, true, { knownOutcome: true });
+      }
       return await fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
     if (ttsTracker && ttsTracker.inFlight) ttsTracker.inFlight.opId = res.requestId;
@@ -1310,8 +1327,15 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
           await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
           if (tracker) tracker.inFlight = null;
         }
+        const knownHttp = isKnownTransientHttpError(err);
+        if (knownHttp) {
+          // r62 (K2): respuesta de error del proveedor = sin cobro → se libera la reserva y se reintenta (clase A).
+          await settlePaidCall(deps.finops, resKey, null, 'openai_tts_http_error_not_charged');
+          if (tracker) tracker.inFlight = null;
+        }
         // «persisted k»: los k segmentos anteriores ya están guardados → ningún trozo pagado sin guardar (clase A).
-        await fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+        await fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, knownHttp ? true : e ? e.retryable : true,
+          knownHttp ? { knownOutcome: true } : {});
         return null;
       }
       if (tracker && tracker.inFlight) tracker.inFlight.opId = res.requestId;

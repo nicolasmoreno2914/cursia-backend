@@ -78,6 +78,12 @@ function world(cap = Infinity) {
         const [keyLike, tagLike, , exclude] = params;
         return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k)).length }];
       }
+      // r62: reservas desconocidas de UNA llamada (el próximo envío es el reenvío ambiguo único de la parte).
+      if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
+        const [keyLike, tagLike, , exclude] = params;
+        return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k))
+          .map(([k]) => ({ key: k, amount: String(UB) }));
+      }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
     },

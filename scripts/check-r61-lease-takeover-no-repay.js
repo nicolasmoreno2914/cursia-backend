@@ -111,6 +111,12 @@ function world() {
         const [keyLike, tagLike, , exclude] = params;
         return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k)).length }];
       }
+      // r62: reservas desconocidas de UNA llamada (el próximo envío es el reenvío ambiguo único de la parte).
+      if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
+        const [keyLike, tagLike, , exclude] = params;
+        return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k))
+          .map(([k]) => ({ key: k, amount: String(UB) }));
+      }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
     },
@@ -253,7 +259,7 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
       [false, false, true, true, true, false, false, false], 'priorAttemptMayBeInFlight');
     eq([LT.inFlightRemainingMs(ago(10_000), 60_000) > 49_000, LT.inFlightRemainingMs(ago(70_000), 60_000), LT.inFlightRemainingMs(null, 60_000), LT.inFlightRemainingMs(new Date(Date.now() + 3600_000).toISOString(), 60_000)],
       [true, 0, 0, 60_000], 'ventana (un reloj adelantado nunca la alarga)');
-    eq([LT.retryAfterSecondsFor(0), LT.retryAfterSecondsFor(1500), LT.IN_FLIGHT_WINDOW_MS.openai, LT.IN_FLIGHT_WINDOW_MS.gamma], [1, 3, 150_000, 90_000], 'retryAfter ≥ ventana');
+    eq([LT.retryAfterSecondsFor(0), LT.retryAfterSecondsFor(1500), LT.IN_FLIGHT_WINDOW_MS.openai, LT.IN_FLIGHT_WINDOW_MS.gamma], [1, 3, 240_000, 90_000], 'retryAfter ≥ ventana (r62: TTS 210 s + 30 s de margen)');
   });
 
   await check('LT5 cerco en proceso: tras el re-claim del MISMO proceso, la tarea vieja no escribe (latido/estado/complete/fail = no-op)', async () => {

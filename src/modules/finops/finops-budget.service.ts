@@ -7,7 +7,7 @@ import { EstimateItem, EstimateResult, RetryPolicy, estimateCost } from './estim
 import { usageModelPriorsV1 } from './usage-model';
 import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, runtimeGuard } from './budget';
 import { FinopsLedgerService } from './finops-ledger.service';
-import { BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE, decideRunSpend, RunSpendDecision } from './run-spend-guard';
+import { AmbiguousResendBudget, ambiguousResendBudget, BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE, decideRunSpend, RunSpendDecision } from './run-spend-guard';
 import {
   RUN_BUDGET_NOT_AUTHORIZED,
   RunBudgetDecision,
@@ -582,6 +582,8 @@ export class FinopsBudgetService {
    */
   async guardRunSpend(a: { runId: string; itemRunId: string | null; nextCost: number; authorizedBudget: number | null; pauseOnCap?: boolean; snapshot?: boolean }): Promise<{
     decision: RunSpendDecision; itemKey: string | null; paused: boolean; overspend?: number; runExpected?: number | null;
+    /** r62: lo gastado por la parte (ventana) y por el run que usó la decisión (null = llamada sin parte). */
+    itemSpent?: number | null; runSpent?: number;
   }> {
     const est = await this.runItemEstimates(a.runId);
     let itemKey: string | null = null;
@@ -655,7 +657,8 @@ export class FinopsBudgetService {
       console.error(`[spend-guard] run ${a.runId} item ${itemKey}: ${decision.reason} — ${'detail' in decision ? decision.detail : ''}`);
     }
     if (a.snapshot) {
-      return { decision, itemKey, paused, overspend: Math.max(0, Number(runSpentRow.t) - (decision.breakerThreshold ?? Infinity)), runExpected: est.total };
+      return { decision, itemKey, paused, overspend: Math.max(0, Number(runSpentRow.t) - (decision.breakerThreshold ?? Infinity)), runExpected: est.total,
+        itemSpent, runSpent: Number(runSpentRow.t) };
     }
     if (!decision.allow && (decision.reason === 'circuit_breaker' || (decision.reason === 'run_budget_cap' && a.pauseOnCap))) {
       // Re-review N2: el tope guarda cuánto hacía falta (gastado + esta llamada) → reanudar exige ampliar a eso.
@@ -749,6 +752,32 @@ export class FinopsBudgetService {
       code: 'run_paused', runId: row.job_id, paused: g.paused,
       message: (d.reason === 'circuit_breaker' ? 'Pausa automática por consumo anómalo: ' : 'Pausa automática: se alcanzó el presupuesto autorizado del run: ') + detail,
     };
+  }
+
+  /**
+   * r62 (regla de ambigüedad acotada, punto 3): ¿cabe UN reenvío de una llamada pagada ambigua de esta parte? Peor caso
+   * = lo ya gastado (incluye la reserva perdida, liquidada como cobrada) + la reserva nueva, contra el presupuesto de
+   * recuperación de la parte y el saldo autorizado del run. Solo lectura (snapshot: nunca pausa ni registra nada).
+   * `authorization: 'paid'` = proveedores pagados (solo ADMIN_APPROVED los cubre, como guardPaidSubmission);
+   * `'any'` = IA (la última autorización vigente, como el guard del worker de IA; BLOCKED = 0).
+   */
+  async ambiguousResendBudget(a: { runId: string; itemRunId: string; nextCost: number; authorization: 'paid' | 'any' }): Promise<AmbiguousResendBudget> {
+    let authorized: number | null;
+    if (a.authorization === 'paid') {
+      const b = await this.runPaidAuthorizedBudget(a.runId);
+      authorized = b === null ? null : Number(b);
+    } else {
+      const [authRow] = await this.dataSource.query(
+        `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
+        [a.runId],
+      );
+      authorized = !authRow ? null : authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
+    }
+    const g = await this.guardRunSpend({ runId: a.runId, itemRunId: a.itemRunId, nextCost: a.nextCost, authorizedBudget: null, snapshot: true });
+    return ambiguousResendBudget({
+      itemSpent: Number(g.itemSpent ?? 0), nextCost: a.nextCost, itemHardLimit: g.decision.itemHardLimit,
+      runSpent: Number(g.runSpent ?? 0), authorizedBudget: authorized,
+    });
   }
 
   /**

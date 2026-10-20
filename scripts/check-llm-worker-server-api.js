@@ -58,6 +58,12 @@ function fakeWorld(opts = {}) {
         const n = [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k)).length;
         return [{ n }];
       }
+      // r62: reservas desconocidas (sin liquidar) de UNA llamada → el próximo envío es el reenvío ambiguo de la parte.
+      if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
+        const [keyLike, tagLike, , exclude] = params;
+        return [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k))
+          .map(([k]) => ({ key: k, amount: '0.01' }));
+      }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...cps } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
     },
@@ -112,27 +118,33 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     assert(pending(w) === 2, 'dos reservas pendientes para conciliar');
     await a.close();
   });
-  await check('regla por llamada: un desconocido en la llamada A y otro en la B → cada una se reintenta una vez y la parte sigue', async () => {
+  // r62 (regla de ambigüedad acotada, punto 3 — cambio DELIBERADO de la regla Loop-4 «una vez por llamada»): nunca más de
+  // UN reenvío ambiguo por PARTE. El desconocido de A se reenvía una vez; un desconocido más (B) en la misma ventana deja
+  // la parte en revisión (excepción registrada) sin volver a pedir.
+  await check('r62 regla por parte: un desconocido en la llamada A → UN reenvío; otro desconocido en la B → revisión (nunca un 2.º reenvío ambiguo en la parte)', async () => {
     const a = await fakeAnthropic((p, n) => (n === 1 ? 'drop' : 'ok'));
     const w = fakeWorld(); const api = makeApi(w, a.url);
-    assert((await api('s', 'A')) === 'R:A' && (await api('s', 'B')) === 'R:B', 'ambas completas');
-    assert(a.st.requests.length === 4 && pending(w) === 2, `4 pedidos / 2 pendientes (${a.st.requests.length}/${pending(w)})`);
+    assert((await api('s', 'A')) === 'R:A', 'A completa con su reenvío único');
+    const e = await err(api('s', 'B'));
+    assert(e && e.pendingReview === true, 'B → revisión: ' + JSON.stringify(e));
+    assert(a.st.requests.length === 3 && pending(w) === 2, `3 pedidos / 2 pendientes (${a.st.requests.length}/${pending(w)})`);
     await a.close();
   });
   await check('I1: llamadas EN VUELO en paralelo no cuentan como desconocidas (huérfanas de un crash + 3 carriles nuevos)', async () => {
     const a = await fakeAnthropic(() => ({ holdMs: 300 }));
     const w = fakeWorld();
-    for (let i = 0; i < 3; i++) w.res.set(`reservation:llm:${ITEM.itemRunId}:g1:a1:llmw-main-orphan${i}-1-x`, { tag: `llmw-main-orphan${i}xxxxx-1-x`, settled: false });
+    // r62: con el tope de UN desconocido por parte, una sola huérfana (no tres): la exclusión de los carriles en vuelo es lo que se prueba.
+    for (let i = 0; i < 1; i++) w.res.set(`reservation:llm:${ITEM.itemRunId}:g1:a1:llmw-main-orphan${i}-1-x`, { tag: `llmw-main-orphan${i}xxxxx-1-x`, settled: false });
     const api = makeApi(w, a.url);
     const out = await Promise.all(['L1', 'L2', 'L3'].map((p) => err(api('s', p))));
     assert(out.every((x) => x === null), 'ningún carril fue a revisión: ' + JSON.stringify(out));
-    assert(pending(w) === 3, 'solo quedan las 3 huérfanas');
+    assert(pending(w) === 1, 'solo queda la huérfana');
     await a.close();
   });
-  await check('tope anti-loop: 4 desconocidos en total en la parte (llamadas distintas) → revisión', async () => {
+  await check('tope por parte (r62: LLM_UNKNOWN_ITEM_MAX = 2): 2 desconocidos en total en la parte (llamadas distintas) → revisión', async () => {
     const a = await fakeAnthropic(() => 'ok');
     const w = fakeWorld();
-    for (let i = 0; i < 4; i++) w.res.set(`reservation:llm:${ITEM.itemRunId}:g1:a1:o${i}`, { tag: `llmw-main-zzzz${i}-1-x`, settled: false });
+    for (let i = 0; i < 2; i++) w.res.set(`reservation:llm:${ITEM.itemRunId}:g1:a1:o${i}`, { tag: `llmw-main-zzzz${i}-1-x`, settled: false });
     const e = await err(makeApi(w, a.url)('s', 'nueva'));
     assert(e && e.pendingReview === true && a.st.requests.length === 0, 'revisión sin llamar');
     await a.close();

@@ -1,0 +1,729 @@
+#!/usr/bin/env node
+/* eslint-disable */
+// r62 (agente N1) — recuperación automática bajo la REGLA DE AMBIGÜEDAD ACOTADA (fix-common.md). Un caso por punto:
+//   K1/c1/d10  TTS de OpenAI vencido o ambiguo: timeout del cliente por encima de la cola observada; si igual vence →
+//              reserva liquidada como `charged` + `possible_duplicate` (actor system) y UN reenvío solo del segmento
+//              afectado, con el peor caso dentro del presupuesto de la parte y del saldo autorizado (sin tope fijo 0,10).
+//              Reproducción de #1510: el TTS vence → el curso termina solo, a lo sumo 1 reenvío, ledger ≤ autorizado.
+//   K2         un HTTP 5xx con cuerpo («504: upstream request timeout») no es un timeout del cliente: resultado conocido,
+//              reserva liberada, reintento con backoff (clase A).
+//   K6         el clasificador / currentRecovery / attention_reason dicen lo que de verdad pasa.
+//   c4         LLM con resultado desconocido (Anthropic): misma regla del punto 3 (un reenvío por parte, con presupuesto,
+//              reserva perdida liquidada como posible duplicado); Q-21 (hand-back + adopción tardía) sigue delante.
+//   d2         clase A sin gasto: ya no va a un humano por 5 rondas / 24 h → backoff largo hasta 72 h (alerta a las 48 h).
+//   d3         los dependientes se desbloquean solos cuando se resuelve la causa.
+//   d8         claim_payload_unavailable → regenerate_dependency automático (una vez, dentro del presupuesto).
+//   K3         kill switch / allow-list de FinOps revertidos → las partes frenadas se reabren solas.
+//
+// USD 0: proveedores FALSOS en 127.0.0.1 (test/e2e-v2/fakes.js) y PG16 descartable (puerto libre ≠ 5570). Correr con
+// netguard: NODE_OPTIONS=--require test/e2e-v2/netguard.js. Contra dist/ (npm run build).
+//
+// Usage: node scripts/check-r62-recovery.js [--pure-only] [path/to/dist]
+const fs = require('fs');
+const os = require('os');
+const net = require('net');
+const path = require('path');
+const crypto = require('crypto');
+const http = require('http');
+const { spawnSync } = require('child_process');
+
+const args = process.argv.slice(2);
+const PURE_ONLY = args.includes('--pure-only');
+const distArg = args.find((a) => !a.startsWith('--'));
+const REPO = path.resolve(__dirname, '..');
+const distRoot = path.resolve(process.cwd(), distArg || 'dist');
+function loadDist(rel) {
+  try {
+    return require(path.join(distRoot, rel));
+  } catch (err) {
+    console.error(`❌ No se pudo cargar ${rel} desde ${distRoot} (¿npm run build?): ${err.message}`);
+    process.exit(1);
+  }
+}
+require('reflect-metadata');
+const { Logger } = require('@nestjs/common');
+const AH = loadDist('modules/dynamic-generation/auto-heal.js');
+const FC = loadDist('modules/reliability/failure-classifier.js');
+const SG = loadDist('modules/finops/run-spend-guard.js');
+const AR = loadDist('modules/finops/ambiguous-resend.js');
+const SCH = loadDist('modules/reliability/spend-control-hold.js');
+const CPR = loadDist('modules/reliability/claim-payload-recovery.js');
+const PC = loadDist('workers/provider-real/provider-clients.js');
+const RP = loadDist('workers/provider-real/real-providers.js');
+const LT = loadDist('workers/lease-takeover.js');
+const SL = loadDist('workers/llm-executor/server-llm.js');
+const PW = loadDist('workers/dynamic-provider-worker.js');
+const WD = loadDist('workers/worker-drain.js');
+const RC = loadDist('modules/dynamic-generation/run-completion.js');
+const F = loadDist('modules/finops/index.js');
+const SM = loadDist('package/v3/synthetic-media.js');
+const { startStorage, startProviderFakes } = require(path.join(REPO, 'test/e2e-v2/fakes.js'));
+
+const SECRETS = {
+  GAMMA_API_KEY: 'sk-r62-gamma-SECRET-1a2b3c', OPENAI_API_KEY: 'sk-r62-openai-SECRET-4d5e6f',
+  ANTHROPIC_API_KEY: 'sk-r62-anthropic-SECRET-7a8b9c', VIDEOGEN_API_KEY: 'sk-r62-videogen-SECRET-0d1e2f',
+};
+const LOGS = [];
+const capLogger = { log: (m) => LOGS.push(String(m)), warn: (m) => LOGS.push(String(m)), error: (m) => LOGS.push(String(m)) };
+Logger.overrideLogger({ log: capLogger.log, warn: capLogger.warn, error: capLogger.error, debug: () => {}, verbose: () => {} });
+
+let passes = 0;
+let failures = 0;
+async function check(name, fn) {
+  try {
+    await fn();
+    passes++;
+    console.log(`✅ ${name}`);
+  } catch (err) {
+    failures++;
+    console.error(`❌ ${name}`);
+    console.error(`   ${err && err.stack ? err.stack.split('\n').slice(0, 6).join('\n   ') : err}`);
+  }
+}
+function assert(c, m) { if (!c) throw new Error(m); }
+function eq(a, b, m) {
+  const x = JSON.stringify(a);
+  const y = JSON.stringify(b);
+  if (x !== y) throw new Error(`${m}: esperado ${y}, encontrado ${x}`);
+}
+async function rejectsRe(p, re, msg, status) {
+  let err = null;
+  try { await p; } catch (e) { err = e; }
+  assert(err, `${msg}: no lanzó`);
+  const text = err.message + ' ' + JSON.stringify(err.getResponse ? err.getResponse() : '');
+  assert(re.test(text), `${msg}: mensaje inesperado "${text.slice(0, 600)}"`);
+  if (status !== undefined) assert(err.getStatus && err.getStatus() === status, `${msg}: status ${err.getStatus && err.getStatus()} (esperado ${status})`);
+  return err;
+}
+
+const RECON = 'provider_reconciliation_required: openai — llamada pagada enviada sin resultado liquidado:';
+const NOW = new Date('2026-10-19T15:20:00Z');
+const rowOf = (error, type = 'audiobook_chapter', o = {}) => ({
+  id: o.id || 'r62-item', status: 'failed', type, error, output_summary: o.os || {}, finished_at: new Date(NOW.getTime() - (o.secAgo ?? 300) * 1000).toISOString(),
+  failure_class: o.cls ?? null,
+});
+const FITS = { budget: { fits: true, reason: null } };
+const PENDING = { pendingUsd: 0.0735, providers: ['openai'], resendUsd: 0.0735 };
+
+// ════════════════════════════════════════════════════════════════════════════
+async function pureChecks() {
+  await check('K1 (punto 1, prevenir): el timeout del cliente TTS supera la cola observada (172 s) y queda por debajo del lease (300 s) y del drenado (270 s); la ventana en vuelo de Q-21 se deriva de él', () => {
+    assert(PC.OPENAI_TTS_TIMEOUT_MS > 172_000, `timeout ${PC.OPENAI_TTS_TIMEOUT_MS}`);
+    assert(PC.OPENAI_TTS_TIMEOUT_MS < PW.PROVIDER_WORKER_MIN_LEASE_SECONDS * 1000, 'debajo del lease del worker');
+    assert(PC.OPENAI_TTS_TIMEOUT_MS < WD.DEFAULT_DRAIN_TIMEOUT_MS, 'debajo del drenado');
+    eq(LT.IN_FLIGHT_WINDOW_MS.openai, PC.OPENAI_TTS_TIMEOUT_MS + LT.IN_FLIGHT_MARGIN_MS, 'ventana en vuelo = timeout + margen');
+    eq(PC.callTimeoutMs({}, PC.OPENAI_TTS_TIMEOUT_MS), PC.OPENAI_TTS_TIMEOUT_MS, 'default');
+    eq(PC.callTimeoutMs({ PROVIDER_CALL_TIMEOUT_MS: '999999' }, PC.OPENAI_TTS_TIMEOUT_MS), PC.OPENAI_TTS_TIMEOUT_MS, 'el env solo puede acortarlo');
+  });
+
+  await check('K1/d10 (punto 3): el peor caso (gastado con la reserva perdida + la reserva nueva) contra el presupuesto de la parte y el saldo del run — sin tope fijo de USD 0,10', () => {
+    assert(AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD === undefined, 'no hay tope fijo');
+    const ok = SG.ambiguousResendBudget({ itemSpent: 0.3, nextCost: 0.12, itemHardLimit: 0.5, runSpent: 10, authorizedBudget: 20 });
+    eq([ok.fits, ok.reason, Number(ok.worstItem.toFixed(4)), Number(ok.worstRun.toFixed(4))], [true, null, 0.42, 10.12], 'entra (aunque 0.12 > 0.10)');
+    eq(SG.ambiguousResendBudget({ itemSpent: 0.45, nextCost: 0.12, itemHardLimit: 0.5, runSpent: 1, authorizedBudget: 20 }).reason, 'item_recovery_budget', 'presupuesto de la parte');
+    eq(SG.ambiguousResendBudget({ itemSpent: 0.1, nextCost: 0.12, itemHardLimit: 0.5, runSpent: 19.95, authorizedBudget: 20 }).reason, 'run_budget', 'saldo del run');
+    eq(SG.ambiguousResendBudget({ itemSpent: 0, nextCost: 0.01, itemHardLimit: 0.5, runSpent: 0, authorizedBudget: null }).reason, 'no_authorization', 'sin autorización');
+    eq(SG.ambiguousResendBudget({ itemSpent: 0, nextCost: 0.01, itemHardLimit: null, runSpent: 0, authorizedBudget: 5 }).reason, 'no_item_estimate', 'sin estimado de la parte');
+    // La decisión: timeout del cliente → UN reenvío (antes `timeout_likely_charged` → admin); fuera del presupuesto → excepción.
+    const e = `${RECON} tts_failed: chunk 1/7: openai POST /audio/speech: error de red (TimeoutError)`;
+    const d = AH.ambiguousAudioResubmitDecision(rowOf(e, 'audio_welcome'), NOW, PENDING, undefined, FITS);
+    eq([d.heal, d.round, d.cause], [true, 1, 'timeout_presumed_charged'], 'timeout → reenvío único');
+    eq(AH.ambiguousAudioResubmitDecision(rowOf(e), NOW, PENDING, undefined, { budget: { fits: false, reason: 'run_budget' } }).reason, 'over_budget', 'fuera de lo autorizado');
+    eq(AH.ambiguousAudioResubmitDecision(rowOf(e, 'audiobook_chapter', { os: { ambiguousAudioResubmit: { rounds: 1 } } }), NOW, PENDING, undefined, FITS).reason, 'cap_reached', 'nunca más de uno por parte');
+    eq(AH.ambiguousAudioResubmitDecision(rowOf(e, 'video'), NOW, PENDING, undefined, FITS).reason, 'not_audio', 'video nunca');
+  });
+
+  await check('K1 (punto 3, ledger): la reserva perdida se liquida como cobrada con possible_duplicate, actor system y el motivo; repetir = no-op; un fallo de una reserva no tapa a las demás', async () => {
+    const calls = [];
+    const ledger = {
+      async reconcileReservationAsCharged(key, reason, o) {
+        calls.push({ key, reason, o });
+        if (key === 'boom') throw new Error('db caída');
+        return { reconciled: key !== 'done', alreadySettled: key === 'done', amount: '0.02', event: null };
+      },
+    };
+    const r = await AR.settleAmbiguousAsPossibleDuplicate(ledger, ['k1', 'k1', 'done', 'boom'], { provider: 'openai', cause: 'timeout_presumed_charged', itemRunId: 'ir', itemKey: 'audio_welcome:1' });
+    eq([r.settled, r.alreadySettled, r.failed.map((x) => x.key)], [['k1'], ['done'], ['boom']], 'resultado');
+    const c = calls[0];
+    eq([c.o.decidedBy, c.o.metadata.possibleDuplicate, c.o.metadata.auto, c.o.metadata.cause, c.o.metadata.rule], ['system', true, true, 'timeout_presumed_charged', 'r62_bounded_ambiguity'], 'metadata');
+    assert(/timeout presumido cobrado/.test(c.reason) && /posible duplicado/.test(c.reason), `motivo: ${c.reason}`);
+  });
+
+  await check('K2: «HTTP 504: upstream request timeout» (cuerpo de una respuesta) NO es un timeout del cliente; es un resultado conocido (reserva liberada, clase A) — TimeoutError / AbortSignal sí lo son', () => {
+    const body504 = 'openai POST /audio/speech HTTP 504: upstream request timeout';
+    assert(!AH.AMBIGUOUS_AUDIO_TIMEOUT_RE.test(body504), 'la regex no captura el cuerpo de un 5xx');
+    assert(AH.AMBIGUOUS_AUDIO_TIMEOUT_RE.test('openai POST /audio/speech: error de red (TimeoutError)') && AH.AMBIGUOUS_AUDIO_TIMEOUT_RE.test('The operation was aborted due to timeout'), 'formato de send() / AbortSignal');
+    const err504 = new PC.ProviderCallError('openai', true, body504, 504);
+    eq([RP.isKnownTransientHttpError(err504), RP.isKnownTransientHttpError(new PC.ProviderCallError('openai', true, 'x HTTP 429', 429)),
+      RP.isKnownTransientHttpError(new PC.ProviderCallError('openai', true, 'x HTTP 408', 408)), RP.isKnownTransientHttpError(new PC.ProviderCallError('openai', true, 'openai POST /audio/speech: error de red (TimeoutError)'))],
+    [true, true, false, false], '504/429 conocidos; 408 y red no');
+    // Con trozos anteriores ya cobrados y medidos, un 5xx con respuesta es A (gasto medido), no C.
+    const v = FC.classifyFailure({ error: `tts_failed: chunk 3/5: ${body504}`, itemType: 'audio_welcome', source: 'provider_worker' });
+    eq([v.class, v.strategy, v.paidRisk], ['A', 'retry_backoff', 'measured'], '5xx con cuerpo → A');
+    const net = FC.classifyFailure({ error: 'tts_failed: chunk 3/5: openai POST /audio/speech: error de red (TypeError)', itemType: 'audio_welcome', source: 'provider_worker' });
+    eq(net.class, 'C', 'un corte de red con trozos cobrados sigue siendo incierto');
+    const d = AH.autoHealDecision({ ...rowOf(`tts_failed: chunk 1/1: ${body504}`, 'audio_welcome', { secAgo: 3600 }) }, NOW);
+    eq([d.heal, d.kind], [true, 'A'], 'el auto-healer lo reintenta (backoff, sin tope de rondas que mande a un humano)');
+  });
+
+  await check('K6: la etiqueta refleja lo que pasa — incierto con reenvío pendiente = auto_resubmit_once / ambiguous_audio_resubmit; usado o rechazado = hold_for_human (duplicate_charge | budget)', () => {
+    const e = `${RECON} tts_failed: chunk 1/7 (persisted 0): The operation was aborted due to timeout`;
+    const v0 = FC.classifyFailure({ error: e, itemType: 'audiobook_chapter', source: 'provider_worker' });
+    eq([v0.class, v0.strategy, FC.currentRecoveryOf(e, 'audiobook_chapter', {})], ['C', 'auto_resubmit_once', 'ambiguous_audio_resubmit'], 'pendiente');
+    const v1 = FC.classifyFailure({ error: e, itemType: 'audiobook_chapter', source: 'provider_worker', outputSummary: { ambiguousAudioResubmit: { rounds: 1 } } });
+    eq([v1.strategy, v1.humanReason, FC.currentRecoveryOf(e, 'audiobook_chapter', { ambiguousAudioResubmit: { rounds: 1 } })], ['hold_for_human', 'duplicate_charge', 'denied'], 'usado');
+    const v2 = FC.classifyFailure({ error: e, itemType: 'audiobook_chapter', source: 'provider_worker', outputSummary: { ambiguousAudioResubmit: { declined: 'over_budget:run_budget' } } });
+    eq([v2.strategy, v2.humanReason], ['hold_for_human', 'budget'], 'rechazado por presupuesto');
+  });
+
+  await check('d2 (punto 4): clase A sin gasto — pasadas 5 rondas sigue con backoff largo (15 min…4 h); alerta a las 48 h; excepción recién a las 72 h; legacy conserva el tope', () => {
+    const P = AH.DEFAULT_AUTO_HEAL_POLICY;
+    const A = '❌ Falló después de 3 intentos: Error del servidor (503)';
+    eq(AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 5 } }, secAgo: 60 }), NOW, P).reason, 'backoff', 'ronda 6 espera');
+    const r6 = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 5 } }, secAgo: 1200 }), NOW, P);
+    eq([r6.heal, r6.round, r6.extended], [true, 6, true], 'ronda 6 extendida');
+    const r30 = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 20 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P);
+    eq([r30.heal, r30.round, !!r30.alert], [true, 31, false], 'ronda 31 (sin tope de rondas)');
+    const al = AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 49 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P);
+    eq([al.heal, al.alert], [true, true], 'alerta');
+    eq(AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 30, firstAt: new Date(NOW - 73 * 3600e3).toISOString() } }, secAgo: 5 * 3600 }), NOW, P).reason, 'recovery_window_exhausted', 'excepción a las 72 h');
+    eq(AH.autoHealDecision(rowOf(A, 'content', { os: { autoHeal: { rounds: 3 } }, secAgo: 3600 }), NOW, AH.LEGACY_AUTO_HEAL_POLICY).reason, 'cap_reached', 'legacy (kill-switch) sin cambios');
+    // Un A con riesgo de pago incierto nunca entra (los inciertos tienen su propia regla).
+    eq(AH.autoHealDecision(rowOf('prior_call_in_flight: x', 'audio_welcome', { os: { autoHeal: { rounds: 5 } }, secAgo: 3600 }), NOW, P).reason, 'not_allow_listed', 'incierto: no');
+  });
+
+  await check('K3: kill switch / allow-list de FinOps → D wait_provider (attention config) y currentRecovery spend_control_resume; nunca sobre un fallo con riesgo de pago', () => {
+    const msgs = [
+      ['finops_kill_switch: el interruptor de gasto del servidor (FINOPS_KILL_SWITCH) está activo: no se hacen llamadas pagadas nuevas (anthropic). No se hizo la llamada (sin gasto).', 'content', 'finops_kill_switch', 'anthropic'],
+      ['unexpected_error: finops_ledger_write_failed: la reserva tts/chunk0 — el interruptor de gasto del servidor (FINOPS_KILL_SWITCH) está activo: no se hacen llamadas pagadas nuevas (openai)', 'audio_welcome', 'finops_kill_switch', 'openai'],
+      ['provider_not_allowed: el proveedor gamma no está en FINOPS_PROVIDER_ALLOWLIST: no se llama. No se hizo la llamada (sin gasto).', 'presentation', 'provider_not_allowed', 'gamma'],
+    ];
+    const saved = process.env.DYNAMIC_COURSE_STRUCTURE;
+    process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    try {
+      for (const [m, type, code, provider] of msgs) {
+        eq(SCH.spendControlHoldOf(m, type), { code, provider }, `hold ${type}`);
+        const v = FC.classifyFailure({ error: m, itemType: type, source: type === 'content' ? 'browser_executor' : 'provider_worker' });
+        eq([v.class, v.strategy, v.humanReason, v.scope], ['D', 'wait_provider', 'config', 'run'], `veredicto ${type}`);
+        eq(FC.currentRecoveryOf(m, type, {}), 'spend_control_resume', `currentRecovery ${type}`);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.DYNAMIC_COURSE_STRUCTURE; else process.env.DYNAMIC_COURSE_STRUCTURE = saved;
+    }
+    eq(SCH.spendControlHoldOf('provider_reconciliation_required: openai — x (FINOPS_KILL_SWITCH)', 'audio_welcome'), null, 'con riesgo de pago: no');
+    eq(SCH.spendControlHoldOf('unattributed_ceiling_reached: techo', 'content'), null, 'techo sin atribuir: no (no lo dispara una parte)');
+  });
+
+  await check('d8: claim_payload_unavailable — dependencia completada después del fallo → reabrir gratis; dato inutilizable → regenerar la dependencia UNA vez; ya regenerada / contrato → excepción', () => {
+    const t0 = new Date('2026-10-19T10:00:00Z').toISOString();
+    const t1 = new Date('2026-10-19T10:05:00Z').toISOString();
+    const vi = (code, os = {}) => ({ type: 'video_interactions', chapter_id: 'ch1', error: `claim_payload_unavailable: ${code}: el video video:ch1 …`, output_summary: os, finished_at: t1 });
+    eq(CPR.claimPayloadDependencyKey(vi('VIDEO_YOUTUBE_ID_MISSING')), 'video:ch1', 'dependencia');
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_NOT_COMPLETED'), { item_key: 'video:ch1', status: 'running', generation: 1, finished_at: null }).action, 'wait', 'dependencia en curso → espera');
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_NOT_COMPLETED'), { item_key: 'video:ch1', status: 'completed', generation: 1, finished_at: t0 }).action, 'reopen', 'completada → reabrir');
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), { item_key: 'video:ch1', status: 'completed', generation: 1, finished_at: t0 }).action, 'regenerate_dependency', 'dato inutilizable → regenerar');
+    const regen = { item_key: 'video:ch1', status: 'completed', generation: 2, finished_at: t0, output_summary: { regeneration: { reason: CPR.CLAIM_PAYLOAD_DEPENDENCY_REASON } } };
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), regen), { action: 'exception', depKey: 'video:ch1', code: 'VIDEO_YOUTUBE_ID_MISSING', reason: 'already_regenerated' }, 'una sola vez');
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), { ...regen, finished_at: new Date('2026-10-19T10:30:00Z').toISOString() }).action, 'reopen', 'regenerada y completada después → reabrir');
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_NOT_COMPLETED', { claimPayloadRecovery: { reopens: 3 } }), { item_key: 'video:ch1', status: 'completed', generation: 1, finished_at: t0 }).reason, 'reopen_cap', 'anti-bucle');
+    eq(CPR.claimPayloadRecoveryDecision({ type: 'application_activity', chapter_id: 'ch1', error: 'claim_payload_unavailable: MISSING_APPLICATION_MINUTES: x', finished_at: t1 }, null).reason, 'contract', 'contrato → excepción');
+    const v = FC.classifyFailure({ error: vi('VIDEO_YOUTUBE_ID_MISSING').error, itemType: 'video_interactions', source: 'scheduler' });
+    eq([v.class, v.strategy], ['B', 'regenerate_dependency'], 'clasificador');
+  });
+
+  await llmChecks();
+}
+
+// ─── c4: worker de IA con un Anthropic falso y un ledger en memoria ─────────
+async function fakeAnthropic(plan) {
+  const st = { requests: 0 };
+  const srv = http.createServer(async (req, res) => {
+    for await (const _ of req) { /* body */ }
+    const n = ++st.requests;
+    const p = plan(n);
+    if (p === 'drop') { req.socket.destroy(); return; }
+    const sse = (ev, d) => `event: ${ev}\ndata: ${JSON.stringify({ type: ev, ...d })}\n\n`;
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.write(sse('message_start', { message: { id: `msg_${n}`, model: 'm', usage: { input_tokens: 10, output_tokens: 1 } } }));
+    res.write(sse('content_block_delta', { index: 0, delta: { type: 'text_delta', text: `R${n}` } }));
+    res.write(sse('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } }));
+    res.end(sse('message_stop', {}));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return { url: `http://127.0.0.1:${srv.address().port}`, st, close: () => new Promise((r) => { srv.closeAllConnections && srv.closeAllConnections(); srv.close(() => r()); }) };
+}
+const like = (pat) => new RegExp('^' + pat.split('%').map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
+function llmWorld(budgetFits) {
+  const w = { res: new Map(), cps: {}, store: new Map(), budgetCalls: [] };
+  const unknown = (v) => !v.settled || v.possibleDuplicate;
+  w.ds = {
+    async query(sql, params) {
+      if (sql.includes('as remaining_ms')) return [{ remaining_ms: 0 }];
+      if (sql.includes('count(*)::int as n')) {
+        const [keyLike, tagLike, , exclude] = params;
+        return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && unknown(v) && !exclude.includes(k)).length }];
+      }
+      if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
+        const [keyLike, tagLike, , exclude] = params;
+        return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k)).map(([k, v]) => ({ key: k, amount: String(v.amount) }));
+      }
+      if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps } }];
+      throw new Error('SQL inesperado: ' + sql.slice(0, 80));
+    },
+  };
+  w.finops = {
+    async recordCharge(i) { w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false, amount: 0.05 }); return {}; },
+    async recordAdjustment() { return {}; }, async recordZero() { return {}; },
+    async settleReservation(key, charge, reason) { const r = w.res.get(key); r.settled = true; r.reason = reason; r.charged = !!charge; return { finalInserted: !!charge, finalEvent: null }; },
+    async reconcileReservationAsCharged(key, reason, o) {
+      const r = w.res.get(key);
+      if (r.settled) return { reconciled: false, alreadySettled: true, amount: String(r.amount), event: null };
+      Object.assign(r, { settled: true, possibleDuplicate: o.metadata.possibleDuplicate === true, decidedBy: o.decidedBy, reason });
+      return { reconciled: true, alreadySettled: false, amount: String(r.amount), event: null };
+    },
+  };
+  w.budget = {
+    guardServerLlmCall: async () => null,
+    ambiguousResendBudget: async (a) => { w.budgetCalls.push(a); return { fits: budgetFits, reason: budgetFits ? null : 'item_recovery_budget', worstItem: 0.6, worstRun: 3 }; },
+  };
+  w.api = (url) => SL.createServerApi({
+    dataSource: w.ds, finops: w.finops, budget: w.budget,
+    checkpoints: { put: async (p, j) => { w.store.set(p, j); }, get: async (p) => (w.store.has(p) ? w.store.get(p) : null) },
+    recordCheckpoint: async (_id, e) => { Object.assign(w.cps, e); return true; },
+    apiKey: 'k', baseUrl: url, defaultModel: 'm', idleMs: 2000, totalMs: 5000,
+    logger: { log() {}, warn() {}, error() {} }, settleRetryDelaysMs: [0],
+  }, { itemRunId: '11111111-2222-4333-8444-555555555555', runId: 'run-1', itemKey: 'content:x', generation: 1, ownerId: 'o', artifactCourseId: '7', manifestId: 3, attempt: 1 }, () => ({ callRole: 'main', attempt: 1 }));
+  return w;
+}
+async function err(p) { try { return { v: await p }; } catch (e) { return { e }; } }
+
+async function llmChecks() {
+  await check('c4 (punto 3, Anthropic): resultado desconocido → peor caso dentro de lo autorizado → la reserva perdida se liquida como cobrada (possible_duplicate, system) y se reenvía UNA vez', async () => {
+    const a = await fakeAnthropic((n) => (n === 1 ? 'drop' : 'ok'));
+    const w = llmWorld(true);
+    const r = await err(w.api(a.url)('s', 'P'));
+    eq([r.v, a.st.requests, w.budgetCalls.length], ['R2', 2, 1], 'un reenvío');
+    const vals = [...w.res.values()];
+    eq(vals.map((x) => [x.possibleDuplicate === true, x.decidedBy || null, !!x.charged]), [[true, 'system', false], [false, null, true]], 'perdida → posible duplicado; el reenvío medido');
+    eq(w.budgetCalls[0].authorization, 'any', 'autorización de IA');
+    await a.close();
+  });
+  await check('c4: el peor caso NO entra → sin reenvío: la parte queda en revisión (llm_pending_review, humanReason budget) con la reserva intacta para conciliar', async () => {
+    const a = await fakeAnthropic((n) => (n === 1 ? 'drop' : 'ok'));
+    const w = llmWorld(false);
+    const r = await err(w.api(a.url)('s', 'P'));
+    assert(r.e && r.e.pendingReview && /no entra en el presupuesto autorizado/.test(r.e.msg), `revisión: ${JSON.stringify(r.e)}`);
+    eq([a.st.requests, [...w.res.values()].filter((x) => !x.settled).length], [1, 1], '0 reenvíos, reserva pendiente');
+    eq(FC.classifyFailure({ error: r.e.msg, source: 'server_executor' }).humanReason, 'budget', 'excepción de presupuesto');
+    await a.close();
+  });
+  await check('c4: nunca más de un reenvío ambiguo por parte — el reenvío vuelve a ser desconocido → revisión (sin un 3.er pedido)', async () => {
+    const a = await fakeAnthropic(() => 'drop');
+    const w = llmWorld(true);
+    const r = await err(w.api(a.url)('s', 'P'));
+    assert(r.e && r.e.pendingReview, 'revisión');
+    eq(a.st.requests, 2, 'original + UN reenvío');
+    eq(FC.classifyFailure({ error: r.e.msg, source: 'server_executor' }).humanReason, 'duplicate_charge', 'excepción de cobro duplicado');
+    await a.close();
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+function findPgBin() {
+  for (const d of [process.env.PG_BIN, '/opt/homebrew/opt/postgresql@16/bin', '/opt/homebrew/bin', '/usr/lib/postgresql/16/bin'].filter(Boolean)) {
+    const pg = path.join(d, 'postgres');
+    if (fs.existsSync(pg) && /\b16\./.test(spawnSync(pg, ['--version'], { encoding: 'utf8' }).stdout || '')) return d;
+  }
+  throw new Error('No encontré Postgres 16 (setear PG_BIN)');
+}
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => { const { port } = srv.address(); srv.close(() => ([5570, 8099].includes(port) ? freePort().then(resolve, reject) : resolve(port))); });
+  });
+}
+function cleanEnv(extra) {
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME, LANG: 'C', LC_ALL: 'C' };
+  for (const [k, v] of Object.entries(extra || {})) if (v !== undefined && v !== null) env[k] = String(v);
+  return env;
+}
+const OWNER = '11111111-2222-4333-8444-555555555555';
+const CONTEXT = { nombre: 'Curso r62', sector: 'Minería', pais: 'Chile', contexto: 'Planta', nivel: 'Intermedio', tono: 'cercano' };
+const PROVIDER_ENV_KEYS = ['GAMMA_API_KEY', 'GAMMA_THEME_V21_LIGHT_DEFAULT', 'GAMMA_THEME_V21_DARK_DEFAULT', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VIDEOGEN_API_KEY'];
+const ENV_KEYS = [
+  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION', 'DYNAMIC_VIDEO_DELIVERY',
+  'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPABASE_URL',
+  'SUPABASE_SERVICE_ROLE_KEY', 'GAMMA_API_BASE_URL', 'OPENAI_API_BASE_URL', 'ANTHROPIC_API_BASE_URL', 'DYNAMIC_ALLOW_VIDEO_PREVIEW', 'SUPER_ADMIN_EMAILS',
+  'FINOPS_KILL_SWITCH', 'FINOPS_PROVIDER_ALLOWLIST', ...PROVIDER_ENV_KEYS,
+];
+const READY_ENV = () => ({
+  GAMMA_API_KEY: SECRETS.GAMMA_API_KEY, GAMMA_THEME_V21_LIGHT_DEFAULT: 'theme-r62-light', GAMMA_THEME_V21_DARK_DEFAULT: 'theme-r62-dark',
+  OPENAI_API_KEY: SECRETS.OPENAI_API_KEY, ANTHROPIC_API_KEY: SECRETS.ANTHROPIC_API_KEY, VIDEOGEN_API_KEY: SECRETS.VIDEOGEN_API_KEY,
+});
+
+async function dbChecks() {
+  const { Client } = require('pg');
+  const { DataSource } = require('typeorm');
+  const snap = loadDist('modules/course-blueprints/blueprint-snapshot.js');
+  const { CourseBlueprintsService } = loadDist('modules/course-blueprints/course-blueprints.service.js');
+  const { GenerationManifestsService } = loadDist('modules/generation-manifests/generation-manifests.service.js');
+  const { RunsService } = loadDist('modules/dynamic-generation/runs.service.js');
+  const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
+  const { ArtifactsService } = loadDist('modules/artifacts/artifacts.service.js');
+  const { Artifact } = loadDist('modules/artifacts/entities/artifact.entity.js');
+  const T = loadDist('modules/dynamic-generation/item-transitions.js');
+  const ATT = loadDist('modules/reliability/attempt-log.js');
+
+  const pgBin = findPgBin();
+  const port = await freePort();
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursia-r62-n1-pg16-'));
+  const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cursia-r62-n1-cwd-'));
+  const ROLE = 'postgres.r62localtest01';
+  const DB = 'r62db';
+  let started = false;
+  const pg = (bin, a) => spawnSync(path.join(pgBin, bin), a, { env: cleanEnv(), encoding: 'utf8' });
+  const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+  let ds = null;
+  const storage = startStorage();
+  const fakes = startProviderFakes({ gammaKey: SECRETS.GAMMA_API_KEY, openaiKey: SECRETS.OPENAI_API_KEY, anthropicKey: SECRETS.ANTHROPIC_API_KEY, makePdf: SM.syntheticPdf, makeMp3: SM.syntheticMp3 });
+  try {
+    let r = pg('initdb', ['-D', dataDir, '-U', 'postgres', '--auth=trust', '-E', 'UTF8', '--locale=C']);
+    if (r.status !== 0) throw new Error('initdb falló: ' + r.stderr);
+    r = pg('pg_ctl', ['-D', dataDir, '-l', path.join(dataDir, 'server.log'), '-w', '-o', `-p ${port} -k ${dataDir} -c listen_addresses=127.0.0.1`, 'start']);
+    if (r.status !== 0) throw new Error('pg_ctl start falló: ' + r.stderr + r.stdout);
+    started = true;
+    console.log(`\nPostgres ${pgBin} en 127.0.0.1:${port}`);
+    const withClient = async (db, fn) => { const c = new Client({ host: '127.0.0.1', port, user: 'postgres', database: db }); await c.connect(); try { return await fn(c); } finally { await c.end(); } };
+    await withClient('postgres', async (c) => { await c.query(`create database ${DB}`); await c.query(`create role "${ROLE}" superuser login`); });
+    const localEnv = (extra) => ({ DB_HOST: '127.0.0.1', DB_PORT: port, DB_USER: ROLE, DB_PASS: 'x', DB_NAME: DB, DB_SSL: 'false', ...extra });
+    const runScript = (script, env) => {
+      const res = spawnSync(process.execPath, [path.join(REPO, script)], { cwd: tmpCwd, env: cleanEnv(env), encoding: 'utf8', timeout: 120000 });
+      return { code: res.status, out: (res.stdout || '') + (res.stderr || '') };
+    };
+    await withClient(DB, async (c) => {
+      for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql',
+        'supabase-migration-course-blueprints.sql', 'supabase-migration-generation-manifests.sql']) await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
+    });
+    { const res = runScript('scripts/migrate-production-jobs-constraints.js', localEnv({})); assert(res.code === 0, `constraints: ${res.out}`); }
+    await withClient(DB, async (c) => {
+      for (const f of ['supabase-migration-dynamic-generation.sql', 'supabase-migration-v21-blueprint-profiles.sql']) await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
+    });
+    for (const s of ['scripts/migrate-dynamic-generation-v2.js', 'scripts/migrate-invalidation.js', 'scripts/migrate-v21-manifest-v3.js',
+      'scripts/migrate-v21-finops.js', 'scripts/verify-v21-finops-schema.js', 'scripts/migrate-rel-recovery.js']) {
+      const res = runScript(s, localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(res.code === 0, `${s}: exit ${res.code}\n${res.out.slice(-2000)}`);
+    }
+    await new Promise((res) => storage.srv.listen(0, '127.0.0.1', res));
+    const storageUrl = `http://127.0.0.1:${storage.srv.address().port}`;
+    const urls = await fakes.listen();
+    for (const u of [storageUrl, urls.gammaUrl, urls.openaiUrl, urls.anthropicUrl]) assert(/^http:\/\/127\.0\.0\.1:\d+/.test(u), `fake fuera de loopback: ${u}`);
+
+    Object.assign(process.env, {
+      DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
+      DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'admin@cursia.test',
+      SUPABASE_URL: storageUrl, SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-local-only',
+      GAMMA_API_BASE_URL: urls.gammaUrl, OPENAI_API_BASE_URL: urls.openaiUrl, ANTHROPIC_API_BASE_URL: urls.anthropicUrl, ...READY_ENV(),
+    });
+    for (const k of ['DYNAMIC_V2_ALLOWED_OWNERS', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'FINOPS_KILL_SWITCH', 'FINOPS_PROVIDER_ALLOWLIST']) delete process.env[k];
+
+    ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [Artifact], synchronize: false });
+    await ds.initialize();
+    ATT.resetRelSchemaCache();
+    const blueprints = new CourseBlueprintsService(ds);
+    const manifests = new GenerationManifestsService(ds, blueprints);
+    const ledger = new F.FinopsLedgerService(ds);
+    const budget = new F.FinopsBudgetService(ds, ledger);
+    const runs = new RunsService(ds, manifests, {}, { async check() { return { ok: true }; } }, budget);
+    const sched = new SchedulerService(ds, runs);
+    const artifacts = new ArtifactsService(ds.getRepository(Artifact), { get: (k) => process.env[k] });
+
+    async function makeCourse(title, { videos = false } = {}) {
+      const [course] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, $2, 'dynamic') returning id`, [OWNER, title]);
+      const cid = course.id;
+      const m1 = crypto.randomUUID(); const c1 = crypto.randomUUID(); const c2 = crypto.randomUUID();
+      const s2 = snap.buildBlueprintSnapshotV2(
+        { id: cid, title, finalExam: true, activityEngine: 'h5p' },
+        [{ id: m1, position: 0, title: 'M1', objective: null, exam_enabled: true }],
+        [{ id: c1, module_id: m1, position: 0, title: 'Bombas', objective: null, video_enabled: videos, activity_enabled: true },
+          { id: c2, module_id: m1, position: 1, title: 'Válvulas', objective: null, video_enabled: false, activity_enabled: false }],
+      );
+      for (const m of s2.modules) {
+        await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cid, m.position, m.title]);
+        for (const c of m.chapters) {
+          await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled) values ($1, $2, $3, $4, $5, $6, $7)`,
+            [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled]);
+        }
+      }
+      await ds.query(
+        `insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
+         values ($1, 1, 2, $2::jsonb, $3, 0, 1, 2)`, [cid, snap.canonicalJsonV2(s2), snap.snapshotSha256V2(s2)]);
+      await manifests.getOrCreate(cid, OWNER, 1);
+      return { cid, c1, c2, m1 };
+    }
+    const itemRow = async (runId, key) => (await ds.query(`select * from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [runId, key]))[0];
+    const events = (where, p) => ds.query(`select *, amount::text as amount from public.generation_cost_events where ${where} order by created_at, id`, p);
+    const reservationsOf = async (itemRunId, provider) => {
+      const rows = await events(`item_run_id = $1 and provider = $2 and event_kind = 'CHARGE' and metadata->>'reservation' = 'true'`, [itemRunId, provider]);
+      for (const x of rows) x.adj = (await events(`corrects_event_id = $1`, [x.id]))[0] || null;
+      return rows;
+    };
+    const attempts = (id) => ds.query(`select * from public.generation_item_attempts where item_run_id = $1 order by created_at, id`, [id]);
+    async function seedDependency(runId, key, type, body, mime) {
+      const row = await itemRow(runId, key);
+      const p = `${OWNER}/dynamic/r62/${runId}/${key.replace(/[^A-Za-z0-9._-]/g, '_')}.${type}`;
+      storage.blobs.set(`cursia-artifacts/${p}`, Buffer.from(body));
+      await ds.query(
+        `insert into public.artifacts (owner_id, course_id, job_id, type, storage_provider, storage_bucket, storage_path, filename, mime_type, metadata, module_id, chapter_id, manifest_id, manifest_item_key, item_run_id)
+         values ($1, $2, $3, $4, 'supabase', 'cursia-artifacts', $5, 'f', $6, '{}'::jsonb, $7, $8, $9, $10, $11)`,
+        [OWNER, String(row.course_id), runId, type, p, mime, row.module_id, row.chapter_id, row.manifest_id, key, row.id]);
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [row.id]);
+    }
+    const CONTENT_MD = (t) => `# ${t}\n\nLa bomba de engranajes mueve el aceite a presión constante. El técnico revisa ruido, temperatura y caudal en cada turno.\n\n## Mantenimiento\n\nSe cambia el filtro y se registra la presión.`;
+    const SEC = (t, n) => `## ${t}\n\n` + Array.from({ length: n }, (_, i) => `El técnico revisa la bomba número ${i} y registra presión, caudal y temperatura en la planilla del turno.`).join(' ');
+    /** Capítulo de 3 bloques (≥ 3 segmentos de TTS): el reenvío tiene que tocar SOLO el segmento afectado. */
+    const LONG_MD = `# Bombas\n\n${SEC('Inspección', 34)}\n\n${SEC('Mantenimiento', 41)}\n\n${SEC('Registro', 49)}`;
+    async function freshRun(title, { videos = false, authorized = '500', c1Md = null } = {}) {
+      const K = await makeCourse(title, { videos });
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /^budget_approval_required/, `aprobación ${title}`, 409);
+      await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: authorized, approvedBy: 'admin@cursia.test' });
+      const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' })).run.id;
+      await seedDependency(rid, `content:${K.c1}`, 'dynamic_content_md', c1Md || CONTENT_MD('Bombas'), 'text/markdown');
+      await seedDependency(rid, `content:${K.c2}`, 'dynamic_content_md', CONTENT_MD('Válvulas'), 'text/markdown');
+      await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: 'Hola y bienvenida al curso de hidráulica de planta.' }), 'application/json');
+      return { ...K, rid };
+    }
+    const workerDeps = (over = {}) => ({
+      scheduler: sched, dataSource: ds, artifacts, logger: capLogger, executorId: 'r62-provider-worker', leaseSeconds: 120,
+      finops: ledger, budget, gammaPollMs: 20, gammaTimeoutMs: 3000, ...over,
+    });
+    const claimProvider = (runId, type) => sched.claimNextItem({ executorId: 'r62-provider-worker', types: [type], leaseSeconds: 120, runId });
+    const later = (mins) => new Date(Date.now() + mins * 60_000);
+    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400' };
+    const resubOf = (res, rid) => res.resubmitted.filter((x) => x.runId === rid);
+    const runSpent = async (rid) => Number((await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1`, [rid]))[0].t);
+    const paidAuthorized = async (rid) => Number(await budget.runPaidAuthorizedBudget(rid));
+
+    // ═══ K1 — reproducción de #1510 ═══════════════════════════════════════════
+    await check('K1 #1510: el TTS de un segmento del audiolibro VENCE (timeout del cliente) → el barrido lo resuelve solo: reserva perdida = charged + possible_duplicate (system), UN reenvío SOLO de ese segmento, completa; ledger ≤ autorizado; sin acción de admin', async () => {
+      const R = await freshRun('r62 #1510', { c1Md: LONG_MD });
+      const key = `audiobook_chapter:${R.c1}`;
+      const tts0 = fakes.st.tts.length;
+      const llm0 = fakes.st.llm.length;
+      // Primer segmento OK, el segundo se cuelga y el cliente corta por timeout (el pedido llegó entero a OpenAI).
+      fakes.plan.ttsFail = [undefined, 'hang'];
+      const item = await claimProvider(R.rid, 'audiobook_chapter');
+      assert(item && item.itemKey === key, `claim ${item && item.itemKey}`);
+      const thrown = await PW.processProviderItem(workerDeps({ env: FAST }), item).then(() => null, (e) => e);
+      fakes.plan.ttsFail = [];
+      let row = await itemRow(R.rid, key);
+      assert(thrown && /^provider_reconciliation_required: openai/.test(thrown.message), `timeout → reconciliación (${row.status}: ${row.error}; tts ${JSON.stringify(fakes.st.tts.slice(tts0))})`);
+      eq(row.status, 'failed', 'failed');
+      assert(/error de red \(TimeoutError\)/.test(row.error), `timeout del cliente: ${row.error}`);
+      eq(fakes.st.tts.length - tts0, 2, 'dos llamadas TTS (una OK, una vencida)');
+      const llmFirst = fakes.st.llm.length - llm0;
+      const pend = (await reservationsOf(row.id, 'openai')).filter((x) => !x.adj);
+      eq(pend.length, 1, 'una reserva pendiente (la del segmento vencido)');
+      // K6: mientras el servidor lo va a resolver solo, no es un humano: sin attention_reason ni acción de admin.
+      eq([row.failure_class, row.recovery_strategy, row.attention_reason], ['C', 'auto_resubmit_once', null], 'veredicto registrado');
+      eq(RC.adminActionFor(row, 'not_done', new Date()), null, 'sin acción de admin');
+      // Dentro de la espera: nada.
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: new Date() }), R.rid).length, 0, 'en espera');
+      const res = await runs.autoResubmitAmbiguousAudio({ now: later(3) });
+      eq(resubOf(res, R.rid).map((x) => x.itemKey), [key], 'UN reenvío automático');
+      row = await itemRow(R.rid, key);
+      const a = row.output_summary.ambiguousAudioResubmit;
+      eq([row.status, a.rounds, a.cause, a.budget && a.budget.fits, a.possibleDuplicateKeys], ['pending', 1, 'timeout_presumed_charged', true, [pend[0].idempotency_key]], 'reapertura registrada');
+      assert(a.budget.worstRun <= await paidAuthorized(R.rid) && a.budget.worstItem <= a.budget.itemHardLimit, `peor caso dentro de lo autorizado ${JSON.stringify(a.budget)}`);
+      const [adj] = await events(`corrects_event_id = $1`, [pend[0].id]);
+      eq([adj.metadata.possibleDuplicate, adj.metadata.decidedBy, adj.metadata.settlement, adj.metadata.cause, Number(adj.amount)],
+        [true, 'system', 'reconciled_as_charged', 'timeout_presumed_charged', 0], 'reserva perdida = cobrada (posible duplicado), sigue contada');
+      const last = (await attempts(row.id)).pop();
+      eq([last.outcome, last.actor, last.strategy_applied], ['reopened', 'system', 'ambiguous_audio_resubmit:timeout_presumed_charged'], 'log de intentos: system + motivo');
+      // El worker reenvía SOLO el segmento afectado (el primero ya estaba guardado) y completa.
+      const t1 = fakes.st.tts.length;
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audiobook_chapter'));
+      row = await itemRow(R.rid, key);
+      eq(row.status, 'completed', `completa (${row.error})`);
+      eq([fakes.st.tts.length - t1, row.output_summary.reusedSegments, fakes.st.llm.length - llm0], [row.output_summary.chunks - 1, 1, llmFirst], 'solo lo que faltaba; 0 LLM nuevas');
+      eq(fakes.st.tts.length - tts0, row.output_summary.chunks + 1, 'a lo sumo 1 llamada de más en total (el reenvío único)');
+      assert(await runSpent(R.rid) <= await paidAuthorized(R.rid), 'ledger ≤ autorizado');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(10) }), R.rid).length, 0, 'nada más que reenviar');
+      // El audio quedó entregado: ya no falta en el run ni pide ninguna acción de admin (el resto del curso es otra parte).
+      const dto = await runs.getRun(R.cid, OWNER, 1, R.rid);
+      assert(!dto.completion.missingComponents.includes(key) && !(dto.completion.adminActions || []).some((x) => x.itemKey === key), `completion ${JSON.stringify(dto.completion).slice(0, 400)}`);
+    });
+
+    await check('K1: el reenvío único vuelve a vencer → nunca un segundo reenvío: excepción (c) registrada (attention_reason duplicate_charge, reconcile_provider); total = 1 reenvío', async () => {
+      const R = await freshRun('r62 doble timeout');
+      const key = `audio_welcome:${R.cid}`;
+      fakes.plan.ttsFail = ['hang'];
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: FAST }), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required: openai/, '1.er timeout');
+      eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(3) }), R.rid).length, 1, 'reenvío único');
+      const t0 = fakes.st.tts.length;
+      fakes.plan.ttsFail = ['hang'];
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: FAST }), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required: openai/, '2.º timeout');
+      fakes.plan.ttsFail = [];
+      for (const m of [3, 60, 600]) {
+        eq(resubOf(await runs.autoResubmitAmbiguousAudio({ now: later(m) }), R.rid).length, 0, `sin 2.º reenvío (+${m} min)`);
+        eq((await runs.autoHealFailedItems({ now: later(m) })).reopened.filter((x) => x.runId === R.rid).length, 0, `auto-healer +${m} min`);
+      }
+      const row = await itemRow(R.rid, key);
+      eq([row.status, row.attention_reason, row.recovery_strategy], ['failed', 'duplicate_charge', 'hold_for_human'], 'excepción registrada');
+      eq(RC.adminActionFor(row, 'not_done', later(30)), { code: 'reconcile_provider', itemKey: key }, 'acción de admin');
+      eq(fakes.st.tts.length - t0, 1, 'una sola llamada del reenvío');
+      assert(await runSpent(R.rid) <= await paidAuthorized(R.rid), 'ledger ≤ autorizado');
+    });
+
+    await check('d10: el peor caso NO entra en el saldo autorizado → sin reenvío: excepción de presupuesto (declined over_budget:run_budget, attention_reason budget), 0 llamadas', async () => {
+      const R = await freshRun('r62 sin saldo');
+      fakes.plan.ttsFail = ['hang'];
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: FAST }), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required: openai/, 'timeout');
+      fakes.plan.ttsFail = [];
+      // El usuario autorizó justo lo ya gastado (con la reserva perdida): el reenvío lo superaría.
+      const [est] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run' order by created_at desc limit 1`, [R.rid]);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, approved_by, reason) values ($1, $2, $3, $4, 'ADMIN_APPROVED', 'admin@cursia.test', 'r62: saldo justo')`,
+        [R.rid, R.cid, est.id, String(await runSpent(R.rid))]);
+      const t0 = fakes.st.tts.length;
+      const res = await runs.autoResubmitAmbiguousAudio({ now: later(3) });
+      eq([resubOf(res, R.rid).length, res.skipped.filter((x) => x.runId === R.rid).map((x) => x.reason)], [0, ['over_budget:run_budget']], 'no se reenvía');
+      const row = await itemRow(R.rid, `audio_welcome:${R.cid}`);
+      eq([row.status, row.output_summary.ambiguousAudioResubmit.declined, row.attention_reason], ['failed', 'over_budget:run_budget', 'budget'], 'excepción de presupuesto');
+      eq(fakes.st.tts.length - t0, 0, '0 llamadas');
+      eq((await reservationsOf(row.id, 'openai')).filter((x) => !x.adj).length, 1, 'la reserva queda pendiente para un admin');
+    });
+
+    // ═══ K2 — 504 con cuerpo ═══════════════════════════════════════════════════
+    await check('K2: TTS «HTTP 504: upstream request timeout» → resultado conocido: reserva liberada, intento reconocido, reintentable (clase A, sin reconciliación); el reintento completa', async () => {
+      const R = await freshRun('r62 504');
+      const key = `audio_welcome:${R.cid}`;
+      fakes.plan.ttsFail = [{ status: 504, message: 'upstream request timeout' }];
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      let row = await itemRow(R.rid, key);
+      eq(row.status, 'retrying', `reintentable (${row.error})`);
+      assert(/^tts_failed: chunk 1\/\d+: openai POST \/audio\/speech HTTP 504: .*upstream request timeout/.test(row.error) && !/reconciliation/.test(row.error), row.error);
+      const resv = await reservationsOf(row.id, 'openai');
+      assert(resv.length >= 1 && resv.every((x) => x.adj && Number(x.adj.amount) + Number(x.amount) === 0), 'reservas liberadas (0 gasto)');
+      eq([row.failure_class, row.attention_reason], ['A', null], 'clase A, sin humano');
+      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      row = await itemRow(R.rid, key);
+      eq(row.status, 'completed', `completa (${row.error})`);
+    });
+
+    // ═══ d2 + d3 — agotamiento de clase A ═══════════════════════════════════════
+    const A_ERR = '❌ Falló después de 3 intentos: Error del servidor (503)';
+    const failAt = (id, error, secAgo, osSql = null) => ds.query(
+      `update public.generation_item_runs set status = 'failed', error = $2, worker_id = null, lease_until = null,
+              finished_at = now() - make_interval(secs => $3::int)${osSql ? `, output_summary = ${osSql}` : ''} where id = $1`, [id, error, secAgo]);
+    await check('d2 + d3: un A que ya agotó 5 rondas (antes → humano) se sigue reintentando con espera larga y sus dependientes se desbloquean solos; agotada la ventana de 72 h → excepción registrada', async () => {
+      const R = await freshRun('r62 clase A');
+      const key = `content:${R.c1}`;
+      const it = await itemRow(R.rid, key);
+      await failAt(it.id, A_ERR, 3600, `'{"autoHeal":{"rounds":5,"firstAt":"${new Date(Date.now() - 10 * 3600e3).toISOString()}"}}'::jsonb`);
+      await runs.tx((qr) => T.blockDependents(qr, R.rid, key));
+      const blocked = await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and status = 'blocked' and $2 = any(depends_on)`, [R.rid, key]);
+      assert(blocked.length > 0, 'hay dependientes bloqueados');
+      const r6 = await runs.autoHealFailedItems({ now: new Date() });
+      eq(r6.reopened.filter((x) => x.itemKey === key).map((x) => [x.round, !!x.extended]), [[6, true]], 'ronda 6 extendida');
+      const still = await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and status = 'blocked' and $2 = any(depends_on)`, [R.rid, key]);
+      eq(still.length, 0, 'd3: dependientes desbloqueados con la reapertura');
+      await failAt(it.id, A_ERR, 5 * 3600, `jsonb_set(output_summary, '{autoHeal,firstAt}', to_jsonb('${new Date(Date.now() - 73 * 3600e3).toISOString()}'::text))`);
+      const rx = await runs.autoHealFailedItems({ now: new Date() });
+      eq(rx.skipped.filter((x) => x.itemKey === key).map((x) => x.reason), ['recovery_window_exhausted'], 'ventana agotada');
+      const row = await itemRow(R.rid, key);
+      eq([row.status, row.attention_reason], ['failed', 'unrecoverable'], 'excepción registrada');
+      const dto = await runs.getRun(R.cid, OWNER, 1, R.rid);
+      assert((dto.completion.adminActions || []).some((x) => x.itemKey === key && x.code === 'retry_item'), 'acción humana visible al final');
+    });
+
+    // ═══ K3 — kill switch ═════════════════════════════════════════════════════
+    await check('K3: FINOPS_KILL_SWITCH frena las partes (0 gasto) → mientras sigue activo esperan; al revertirlo se reabren solas (system, sin rondas del auto-healer) y sus dependientes se desbloquean', async () => {
+      const R = await freshRun('r62 kill switch');
+      const wKey = `audio_welcome:${R.cid}`;
+      const cKey = `content:${R.c1}`;
+      process.env.FINOPS_KILL_SWITCH = 'true';
+      const t0 = fakes.st.tts.length;
+      try {
+        // Camino real del worker: la reserva se rechaza y no se llama a OpenAI.
+        await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+        let w = await itemRow(R.rid, wKey);
+        assert(/FINOPS_KILL_SWITCH/.test(String(w.error)), `frenado por el kill switch: ${w.status} ${w.error}`);
+        eq(fakes.st.tts.length - t0, 0, '0 llamadas');
+        await failAt(w.id, w.error, 60);
+        // Camino del navegador (mensaje de 04-api.js) en un content con dependientes.
+        const c = await itemRow(R.rid, cKey);
+        await failAt(c.id, 'finops_kill_switch: el interruptor de gasto del servidor (FINOPS_KILL_SWITCH) está activo: no se hacen llamadas pagadas nuevas (anthropic). No se hizo la llamada (sin gasto).', 60);
+        await runs.tx((qr) => T.blockDependents(qr, R.rid, cKey));
+        const s1 = await runs.autoResumeSpendControlHolds({ now: new Date() });
+        eq([s1.resumed.filter((x) => x.runId === R.rid).length, s1.waiting.filter((x) => x.runId === R.rid).map((x) => x.code).sort()], [0, ['finops_kill_switch', 'finops_kill_switch']], 'activo: esperan');
+        eq((await runs.autoHealFailedItems({ now: later(60) })).reopened.filter((x) => x.runId === R.rid).length, 0, 'el auto-healer no gasta rondas en esto');
+      } finally {
+        delete process.env.FINOPS_KILL_SWITCH;
+      }
+      const s2 = await runs.autoResumeSpendControlHolds({ now: new Date() });
+      eq(s2.resumed.filter((x) => x.runId === R.rid).map((x) => x.itemKey).sort(), [wKey, cKey].sort(), 'revertido: reabiertas solas');
+      const w = await itemRow(R.rid, wKey);
+      eq([w.status, w.output_summary.spendControlResume.count], ['pending', 1], 'reabierta');
+      const last = (await attempts(w.id)).pop();
+      eq([last.actor, last.strategy_applied], ['system', 'spend_control_resume:finops_kill_switch'], 'log: system + motivo');
+      const still = await ds.query(`select item_key from public.generation_item_runs where job_id = $1 and status = 'blocked' and $2 = any(depends_on)`, [R.rid, cKey]);
+      eq(still.length, 0, 'd3: dependientes desbloqueados');
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      eq((await itemRow(R.rid, wKey)).status, 'completed', 'la bienvenida completa');
+    });
+
+    // ═══ d8 — claim_payload_unavailable ═════════════════════════════════════════
+    await check('d8: claim_payload_unavailable de video_interactions — dependencia completada → reabre gratis; dato inutilizable → regenerate_dependency UNA vez (system, cascada) y una 2.ª vez → excepción', async () => {
+      const R = await freshRun('r62 claim', { videos: true });
+      const vKey = `video:${R.c1}`;
+      const iKey = `video_interactions:${R.c1}`;
+      const v = await itemRow(R.rid, vKey);
+      const iv = await itemRow(R.rid, iKey);
+      assert(v && iv, 'video + interacciones en el Manifest');
+      // 1) VIDEO_NOT_COMPLETED con el video ya completo (carrera) → reabrir.
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() - interval '1 minute' where id = $1`, [v.id]);
+      await failAt(iv.id, `claim_payload_unavailable: VIDEO_NOT_COMPLETED: el video ${vKey} no está completado`, 300);
+      const r1 = await runs.autoRecoverClaimPayloadUnavailable({ now: new Date() });
+      eq(r1.reopened, [iKey], 'reabierto');
+      let row = await itemRow(R.rid, iKey);
+      eq([row.status, row.output_summary.claimPayloadRecovery.reopens], ['pending', 1], 'pending');
+      eq((await attempts(row.id)).pop().actor, 'system', 'system');
+      // 2) dato inutilizable (sin youtubeId) → regenerar la dependencia una vez.
+      await failAt(iv.id, `claim_payload_unavailable: VIDEO_YOUTUBE_ID_MISSING: el video ${vKey} no tiene youtubeId`, 30);
+      await ds.query(`update public.generation_item_runs set finished_at = now() - interval '10 minutes' where id = $1`, [v.id]);
+      const r2 = await runs.autoRecoverClaimPayloadUnavailable({ now: new Date() });
+      eq([r2.regenerated, r2.exceptions], [[vKey], []], `regenerada la dependencia (${JSON.stringify(r2)})`);
+      const v2 = await itemRow(R.rid, vKey);
+      eq([Number(v2.generation), v2.output_summary.regeneration.reason, v2.status], [2, 'claim_payload_dependency', 'pending'], 'generación nueva del video');
+      const iv2 = await itemRow(R.rid, iKey);
+      assert(Number(iv2.generation) === 2 && iv2.status !== 'failed', `cascada: interacciones regeneradas (${iv2.generation} ${iv2.status})`);
+      eq((await attempts(v2.id)).pop().strategy_applied, 'regenerate_dependency:claim_payload', 'log: estrategia');
+      // 3) vuelve a faltar el dato sobre la generación nueva → no hay 2.ª regeneración: excepción.
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() - interval '10 minutes' where id = $1`, [v2.id]);
+      await failAt(iv2.id, `claim_payload_unavailable: VIDEO_YOUTUBE_ID_MISSING: el video ${vKey} no tiene youtubeId`, 30);
+      const r3 = await runs.autoRecoverClaimPayloadUnavailable({ now: new Date() });
+      eq([r3.regenerated, r3.exceptions.map((x) => x.reason)], [[], ['already_regenerated']], 'excepción');
+      row = await itemRow(R.rid, iKey);
+      eq([row.status, row.attention_reason, row.output_summary.claimPayloadRecovery.declined], ['failed', 'unrecoverable', 'already_regenerated'], 'excepción registrada');
+    });
+
+    assert(!LOGS.some((l) => Object.values(SECRETS).some((s) => l.includes(s))), 'ninguna clave en los logs');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    if (ds) await ds.destroy().catch(() => {});
+    await fakes.close().catch(() => {});
+    await new Promise((r) => storage.srv.close(() => r()));
+    if (started) pg('pg_ctl', ['-D', dataDir, '-m', 'immediate', '-w', 'stop']);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+    console.log('PG16 descartable destruido');
+  }
+}
+
+(async () => {
+  await pureChecks();
+  if (!PURE_ONLY) await dbChecks().catch((e) => { failures++; console.error(`❌ DB: ${e && e.stack ? e.stack : e}`); });
+  console.log(`\n${passes} ok, ${failures} fail`);
+  process.exit(failures ? 1 : 0);
+})();

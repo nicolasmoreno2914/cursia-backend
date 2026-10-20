@@ -5,6 +5,7 @@ import type { CallRole } from '../../modules/finops/finops-ledger.service';
 import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
 import { LlmStreamError, LlmStreamResult, streamMessage } from './anthropic-stream';
 import { inFlightRemainingMs, PRIOR_CALL_IN_FLIGHT, priorCallInFlightMessage, retryAfterSecondsFor } from '../lease-takeover';
+import { settleAmbiguousAsPossibleDuplicate } from '../../modules/finops/ambiguous-resend';
 
 /**
  * Loop 4 — `api()` del ejecutor cuando corre en el WORKER del backend (mismo contrato que `api()` de 04-api.js:
@@ -29,8 +30,12 @@ export const LLM_WORKER_CALL_TAG_PREFIX = 'llmw';
 export const LLM_PENDING_REVIEW = 'llm_pending_review';
 /** Máximo de resultados desconocidos de UNA MISMA llamada antes de dejar la parte en revisión (1 reintento automático). */
 export const LLM_UNKNOWN_MAX = 2;
-/** Tope anti-loop: desconocidos en total (cualquier llamada) en la ventana de la parte antes de dejarla en revisión. */
-export const LLM_UNKNOWN_ITEM_MAX = 4;
+/**
+ * Tope de desconocidos en total (cualquier llamada) en la ventana de la parte antes de dejarla en revisión.
+ * r62 (regla de ambigüedad acotada, punto 3): NUNCA más de un reenvío ambiguo por parte → el primer desconocido se
+ * reenvía una vez (si el peor caso entra en lo autorizado); cualquier desconocido más en la misma ventana → revisión.
+ */
+export const LLM_UNKNOWN_ITEM_MAX = 2;
 /** Prefijo del hash del pedido dentro del callTag de la reserva (identifica "la misma llamada" entre intentos y workers). */
 export const LLM_CALL_HASH_LEN = 12;
 export const LLM_WORKER_MAX_TOKENS_CAP = 16000;
@@ -55,6 +60,12 @@ export interface ServerLlmDeps {
     }>;
     /** FinOps atómico: pausa por el tope cuando la RESERVA se rechazó (el guard ya había permitido). */
     pauseRunBySystem?(runId: string, reason: string, detail: string, requiredUsd?: number | null): Promise<boolean>;
+    /**
+     * r62 (regla de ambigüedad acotada, punto 3): ¿el PEOR caso de reenviar una llamada ambigua (lo gastado por la parte,
+     * con la reserva perdida, + la reserva nueva) entra en el presupuesto de recuperación de la parte y en el saldo del
+     * run? Sin el método (harnesses previos) el reenvío único sigue como antes (lo acota el guard de cada llamada).
+     */
+    ambiguousResendBudget?(a: { runId: string; itemRunId: string; nextCost: number; authorization: 'paid' | 'any' }): Promise<{ fits: boolean; reason: string | null; worstItem: number; worstRun: number }>;
   };
   /** Guardado de respuestas (Storage). */
   checkpoints: {
@@ -123,7 +134,7 @@ export async function countUnknownCalls(ds: DataSource, itemRunId: string, since
     `select count(*)::int as n from public.generation_cost_events e
       where e.idempotency_key like $1 and e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'
         and (e.metadata->>'callTag') like $2 and e.created_at >= $3
-        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
+        and (${UNKNOWN_RESERVATION_SQL})
         and not (e.idempotency_key = any($4::text[]))`,
     [`reservation:llm:${itemRunId}:%`, tagLike, since.toISOString(), [...exclude]],
   );
@@ -149,6 +160,31 @@ export async function priorAttemptInFlightMs(ds: DataSource, itemRunId: string, 
   );
   const ms = r ? Number(r.remaining_ms) : 0;
   return Number.isFinite(ms) && ms > 0 ? Math.min(ms, windowMs) : 0;
+}
+
+/**
+ * r62: una reserva del worker es un resultado DESCONOCIDO si sigue sin liquidar, o si el sistema la liquidó como
+ * cobrada con la marca `possibleDuplicate` (regla de ambigüedad acotada): sigue contando para los topes de la parte.
+ */
+const UNKNOWN_RESERVATION_SQL = `not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
+             or exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id and a.event_kind = 'ADJUSTMENT'
+                         and coalesce(a.metadata->>'possibleDuplicate', '') = 'true')`;
+
+/**
+ * r62: reservas de ESTA llamada (mismo hash) que siguen sin liquidar en la ventana (resultados desconocidos que todavía
+ * nadie concilió). Si hay alguna, el próximo envío de la llamada es un REENVÍO AMBIGUO.
+ */
+export async function pendingUnknownReservations(ds: DataSource, itemRunId: string, since: Date, callHash: string, exclude: readonly string[] = []): Promise<Array<{ key: string; amount: number }>> {
+  const rows: Array<{ key: string; amount: string }> = await ds.query(
+    `select e.idempotency_key as key, e.amount::text as amount from public.generation_cost_events e
+      where e.idempotency_key like $1 and e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'
+        and (e.metadata->>'callTag') like $2 and e.created_at >= $3
+        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)
+        and not (e.idempotency_key = any($4::text[]))
+      order by e.created_at, e.id`,
+    [`reservation:llm:${itemRunId}:%`, `${LLM_WORKER_CALL_TAG_PREFIX}-%-${callHash.slice(0, LLM_CALL_HASH_LEN)}-%`, since.toISOString(), [...exclude]],
+  );
+  return rows.map((r) => ({ key: String(r.key), amount: Number(r.amount) || 0 }));
 }
 
 /** null = se puede (re)intentar; si no, el motivo de dejar la parte en revisión. */
@@ -260,6 +296,28 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
       if (unknownReason) {
         throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(unknownReason) } as ApiError;
+      }
+      // r62 (regla de ambigüedad acotada, punto 3): esta llamada ya tiene un resultado DESCONOCIDO (de este intento o de
+      // uno anterior: lease tomada / worker caído, pasada la ventana en vuelo de Q-21) → el envío que sigue es EL reenvío
+      // ambiguo de la parte. Solo si el peor caso entra en lo autorizado; antes, la reserva perdida se liquida como
+      // cobrada con la marca possible_duplicate (actor system). Si no entra → revisión (excepción registrada).
+      const priorUnknown = await pendingUnknownReservations(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
+      if (priorUnknown.length > 0) {
+        const nextCost = Math.max(...priorUnknown.map((u) => u.amount));
+        if (deps.budget.ambiguousResendBudget) {
+          const b = await deps.budget.ambiguousResendBudget({ runId: item.runId, itemRunId: item.itemRunId, nextCost, authorization: 'any' });
+          if (!b.fits) {
+            throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW,
+              msg: pendingReviewMessage(`el reenvío no entra en el presupuesto autorizado (${b.reason}; peor caso de la parte USD ${b.worstItem.toFixed(4)}, del run USD ${b.worstRun.toFixed(4)})`) } as ApiError;
+          }
+        }
+        if (deps.finops.reconcileReservationAsCharged) {
+          const settled = await settleAmbiguousAsPossibleDuplicate(deps.finops as Required<Pick<WorkerLedger, 'reconcileReservationAsCharged'>>, priorUnknown.map((u) => u.key), {
+            provider: 'anthropic', cause: 'unknown_result', itemRunId: item.itemRunId, itemKey: item.itemKey, runId: item.runId,
+          });
+          if (settled.failed.length) throw new Error(`no se pudo liquidar la reserva desconocida ${settled.failed[0].key}: ${settled.failed[0].error}`);
+        }
+        deps.logger.warn(`[llm-worker] ${item.itemKey}: reenvío ambiguo ÚNICO de la llamada ${hash.slice(0, 10)} (reserva perdida liquidada como posible duplicado, USD ${nextCost})`);
       }
       const deny = await deps.budget.guardServerLlmCall({ runId: item.runId, itemRunId: item.itemRunId, model: useModel, promptChars, maxTokens });
       if (deny) {

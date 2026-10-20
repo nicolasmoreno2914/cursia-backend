@@ -210,7 +210,7 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
           [`reservation:llm:${item.itemRunId}:%`, `${LLM_WORKER_CALL_TAG_PREFIX}-%`, win.since.toISOString()],
         );
         await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
-          llmPendingReview: { at: new Date().toISOString(), reason: 'unknown_limit', detail: msg.slice(0, 300), pendingReservations: pend.map((p: any) => p.idempotency_key) },
+          llmPendingReview: { at: new Date().toISOString(), reason: /presupuesto autorizado/.test(msg) ? 'resend_over_budget' : 'unknown_limit', detail: msg.slice(0, 300), pendingReservations: pend.map((p: any) => p.idempotency_key) },
         });
         await fail(msg.startsWith(LLM_PENDING_REVIEW) ? msg : `${LLM_PENDING_REVIEW}: ${msg}`, false);
         return 'failed';

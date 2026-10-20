@@ -14,6 +14,8 @@
 //     artifacts de la parte (cercado por worker_id + el cerco en proceso de abajo).
 // ─────────────────────────────────────────────────────────────────────────────
 
+import { OPENAI_TTS_TIMEOUT_MS } from './provider-real/provider-clients';
+
 /** Prefijo estable del error con el que B devuelve la parte (reanudable, sin gasto nuevo, sin consumir intento). */
 export const PRIOR_CALL_IN_FLIGHT = 'prior_call_in_flight';
 
@@ -25,7 +27,7 @@ export const IN_FLIGHT_MARGIN_MS = 30_000;
  * PROVIDER_CALL_TIMEOUT_MS solo puede ACORTAR esos timeouts, nunca alargarlos.
  */
 export const IN_FLIGHT_WINDOW_MS: Readonly<Record<string, number>> = Object.freeze({
-  openai: 120_000 + IN_FLIGHT_MARGIN_MS, // TTS
+  openai: OPENAI_TTS_TIMEOUT_MS + IN_FLIGHT_MARGIN_MS, // TTS (r62: 210 s + margen)
   anthropic: 120_000 + IN_FLIGHT_MARGIN_MS, // guion del audiolibro (AnthropicClient)
   gamma: 60_000 + IN_FLIGHT_MARGIN_MS, // createGeneration
   // batchCreate de Videogen no tiene timeout propio: cota operativa (pasada, el envío se trata como ambiguo, igual que hoy).

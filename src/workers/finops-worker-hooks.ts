@@ -15,7 +15,7 @@ import { usageModelPriorsV1 } from '../modules/finops/usage-model';
 import { llmCallUpperBoundUsage } from '../modules/finops/llm-usage-ingest';
 
 export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
-  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges' | 'recordReservationBatch'>>;
+  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges' | 'recordReservationBatch' | 'reconcileReservationAsCharged'>>;
 export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'> & Partial<Pick<FinopsBudgetService, 'pauseRunBySystem'>>;
 /** r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (el guard la precia con el catálogo). */
 export type GuardNextCall = { provider: string; service: string; product: string; usage: Record<string, number> };

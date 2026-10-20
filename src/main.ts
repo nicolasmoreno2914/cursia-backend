@@ -66,8 +66,13 @@ async function bootstrap() {
   const autoPackage = app.get(AutoPackageService);
   startAutoHealTimer(runsService, new Logger('DynamicAutoHeal'), process.env, [
     { name: 'reintento automático seguro', run: () => runsService.autoRetrySafeRejections() },
-    // #583 (decisión del usuario): UN reenvío automático de un audio con resultado incierto (≤ USD 0.10).
+    // #583 + r62 (regla de ambigüedad acotada): UN reenvío automático de un audio con resultado incierto (corte o
+    // timeout), con el peor caso dentro de lo autorizado (presupuesto de la parte + saldo del run).
     { name: 'reenvío de audio incierto', run: () => runsService.autoResubmitAmbiguousAudio() },
+    // r62 (K3): partes frenadas por el kill switch / la allow-list de FinOps → se reabren solas al revertirlo.
+    { name: 'reanudación tras control de gasto', run: () => runsService.autoResumeSpendControlHolds() },
+    // r62 (d8): claim incompleto por un dato de la dependencia → regenerate_dependency (una vez, dentro del presupuesto).
+    { name: 'claim incompleto (dependencia)', run: () => runsService.autoRecoverClaimPayloadUnavailable() },
     // REL CREDIT: sonda del proveedor tras crédito/cuota agotados (un canario por run y proveedor; legacy la apaga).
     { name: 'sonda de crédito del proveedor', run: () => runsService.autoProbeProviderCredit() },
     { name: 'empaque automático', run: () => autoPackage.sweep() },
