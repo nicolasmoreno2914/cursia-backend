@@ -57,6 +57,8 @@ export interface LlmWorkerDeps {
   llmMode?: 'real' | 'mock' | 'replay';
   /** Deploy: con drenaje pedido, la parte vuelve a la cola antes de su próxima llamada (review I3/M3). */
   drain?: { isDraining: boolean };
+  /** Solo pruebas (r61 M8): sustituye el ejecutor vendorizado; recibe el mismo `api` que el worker real. */
+  createRuntime?: typeof createExecutorRuntime;
 }
 
 const ROLES: readonly CallRole[] = ['main', 'validation_retry', 'continuation', 'context_summary_retry', 'fallback_template', 'provider_retry'];
@@ -95,7 +97,12 @@ export const LATE_CHECKPOINT_SQL =
                                      coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) || jsonb_build_object($2::text, $3::jsonb)),
           updated_at = now()
     where id = $1 and status in ('running', 'pending', 'retrying')
-      and not (coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) ? $2::text)
+      -- review I2: la clave falta, o la que hay es de una ventana anterior (anterior al reinicio vigente) y ya no se usa.
+      and (not (coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) ? $2::text)
+           or coalesce(case when output_summary->'llmCheckpoints'->$2::text->>'at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                            then (output_summary->'llmCheckpoints'->$2::text->>'at')::timestamptz end, '-infinity'::timestamptz)
+              < greatest(created_at, coalesce(nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz, created_at),
+                         coalesce(nullif(output_summary->>'llmCheckpointsResetAt', '')::timestamptz, '-infinity'::timestamptz)))
       and $4::timestamptz >= greatest(created_at, coalesce(nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz, created_at))
       and $4::timestamptz >= coalesce(nullif(output_summary->>'llmCheckpointsResetAt', '')::timestamptz, '-infinity'::timestamptz)
     returning id`;
@@ -155,13 +162,14 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
         return Array.isArray(list) && list.length > 0;
       },
       // r61 (Q-21): una llamada de otro intento puede seguir en vuelo hasta su timeout total (+ margen).
-      // Solo tras una TOMA de la lease (si el intento anterior falló por sí mismo, su llamada ya terminó).
-      priorInFlightWindowMs: priorAttemptMayBeInFlight(item) ? deps.totalMs + IN_FLIGHT_MARGIN_MS : 0,
+      // Review I1: señal DURABLE — en todo reintento (attempt > 1) se mira el ledger, sin depender del último error
+      // (una devolución por drenaje/pausa o una reapertura del auto-heal en medio lo borran). Primer intento: sin costo.
+      priorInFlightWindowMs: (Number(item.attempt) || 1) > 1 || priorAttemptMayBeInFlight(item) ? deps.totalMs + IN_FLIGHT_MARGIN_MS : 0,
     }, {
       itemRunId: item.itemRunId, runId: item.runId, itemKey: item.itemKey, attempt: Number(item.attempt) || 1, generation: Number((item as any).generation) || 1,
       ownerId, artifactCourseId: courseId, manifestId: (item as any).manifestId,
     }, roleOf);
-    const runtime = createExecutorRuntime({
+    const runtime = (deps.createRuntime ?? createExecutorRuntime)({
       api, ownerId, logger: deps.logger,
       artifactText: async (artifactId) => {
         // Solo artifacts del MISMO curso y del MISMO dueño del item.

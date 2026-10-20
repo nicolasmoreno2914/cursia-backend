@@ -139,7 +139,7 @@ function rowsOf(res: any): any[] {
 /**
  * El A zombi registra el id externo que el proveedor le devolvió (Gamma generationId / Videogen jobId) aunque ya no
  * sea el dueño de la parte. Cercado por el MARCADOR de envío de A (`externalSubmitStartedAt` idéntico): si un humano
- * pidió un reenvío (el marcador se archivó) o ya hay un id, no escribe nada. Nunca toca una parte completada. Con el id
+ * pidió un reenvío (el marcador se archivó) o ya hay un id, no escribe nada. Solo partes vivas (pending/retrying/running): nunca una completada, fallida (ya ambigua/en reconciliación) ni cancelada. Con el id
  * registrado, el próximo reclamante retoma por poll (gratis) y liquida la reserva de A en el terminal.
  */
 export async function adoptLateExternalId(
@@ -154,7 +154,7 @@ export async function adoptLateExternalId(
         set output_summary = jsonb_set(coalesce(output_summary, '{}'::jsonb), '{external}',
                                        coalesce(output_summary->'external', '{}'::jsonb) || $3::jsonb || jsonb_build_object('adoptedLate', true)),
             updated_at = now()
-      where id = $1 and status <> 'completed'
+      where id = $1 and status in ('pending', 'retrying', 'running')
         and output_summary->>'externalSubmitStartedAt' = $2
         and coalesce(output_summary->'external'->>$4, '') = ''
       returning id`,

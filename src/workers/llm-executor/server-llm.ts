@@ -242,19 +242,21 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
     const promptChars = JSON.stringify(body).length;
     for (;;) {
-      const stop = deps.shouldStop ? deps.shouldStop() : null;
-      if (stop) throw { fatal: true, handBack: stop, code: stop, msg: `${stop}: la parte vuelve a la cola antes de una llamada nueva` } as ApiError;
-      // r61 (Q-21): la MISMA llamada de otro intento (lease tomada) puede seguir en vuelo → nunca se reenvía. Si su
-      // guardado ya llegó (guardado tardío del worker anterior) se responde desde ahí; si no, la parte se devuelve.
+      // r61 (Q-21): la MISMA llamada de otro intento (lease tomada) puede seguir en vuelo → nunca se reenvía. Va ANTES de
+      // shouldStop (review I1): aun drenando, la parte se devuelve como prior_call_in_flight y la señal no se pierde. Con
+      // la ventana activa se relee el guardado justo antes de enviar aunque no haya nada en vuelo (review M1: el
+      // guardado tardío de A puede llegar entre la primera lectura y este punto, también en el `continue` del reintento).
       if (deps.priorInFlightWindowMs && deps.priorInFlightWindowMs > 0) {
         const left = await priorAttemptInFlightMs(deps.dataSource, item.itemRunId, win.since, hash, item.attempt, deps.priorInFlightWindowMs);
+        const again = await fromCheckpoint(await itemWindowStart(deps.dataSource, item.itemRunId));
+        if (again !== null) return again;
         if (left > 0) {
-          const again = await fromCheckpoint(await itemWindowStart(deps.dataSource, item.itemRunId));
-          if (again !== null) return again;
           deps.logger.warn(`[llm-worker] ${item.itemKey}: la llamada ${hash.slice(0, 10)} de un intento anterior sigue en vuelo — no se reenvía; la parte vuelve a la cola`);
           throw { fatal: true, handBack: PRIOR_CALL_IN_FLIGHT, code: PRIOR_CALL_IN_FLIGHT, retryAfterSeconds: retryAfterSecondsFor(left), msg: priorCallInFlightMessage('la llamada a la IA', left) } as ApiError;
         }
       }
+      const stop = deps.shouldStop ? deps.shouldStop() : null;
+      if (stop) throw { fatal: true, handBack: stop, code: stop, msg: `${stop}: la parte vuelve a la cola antes de una llamada nueva` } as ApiError;
       const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
       if (unknownReason) {
         throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(unknownReason) } as ApiError;

@@ -787,7 +787,10 @@ export class SchedulerService {
       await openItemAttempt(qr, row, { executorKind: executorKindFor(row.type, ownerId !== undefined), executorId });
       await markRunRunning(qr, job.id);
       try {
-        return await this.buildClaimedItem(qr, job, row);
+        const built = await this.buildClaimedItem(qr, job, row);
+        // r61 (Q-21, M10): previousError solo para los workers del servidor (el ejecutor del navegador no lo usa).
+        if (ownerId !== undefined && ownerId !== null) delete built.previousError;
+        return built;
       } catch (err) {
         if (!(err instanceof ClaimPayloadUnavailable)) throw err;
         await applyItemFailure(qr, row.id, `claim_payload_unavailable: ${err.message}`.slice(0, MAX_ERROR_LENGTH), false, null, false, false, { source: 'scheduler' });

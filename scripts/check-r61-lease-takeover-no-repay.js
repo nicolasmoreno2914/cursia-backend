@@ -24,6 +24,10 @@
 //   LT10 SQL real (PG16 descartable): guardado tardío (no pisa, respeta los reinicios, no en partes terminadas),
 //       adoptLateExternalId (cercado por marcador, nunca pisa un id ni una parte completada) y priorAttemptInFlightMs
 //       (solo OTROS intentos, mismo hash, sin liquidar, dentro de la ventana; reloj de la DB)
+//   LT11 processLlmItem de punta a punta (review M8/I1): A en vuelo; B reclama tras una devolución por drenaje
+//       (previousError=worker_draining) y C tras una reapertura del auto-heal (previousError=null) → ninguno reenvía
+//       (handed_back con grantAttempt/retryAfter, sin descartar guardados); A deja su guardado tardío; D completa
+//       desde él → 1 pedido, 1 cargo, 0 pendientes
 //
 // Usage: npm run build && node scripts/check-r61-lease-takeover-no-repay.js [dist]
 'use strict';
@@ -405,6 +409,67 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
     await fakes.close();
   }
 
+  await check('LT11 processLlmItem de punta a punta: B (tras drenaje) y C (tras reapertura del auto-heal) NO reenvían la llamada en vuelo de A; A deja guardado tardío; D completa desde él', async () => {
+    const a = await fakeAnthropic({ holdMs: 300 });
+    const w = world();
+    w.owner = 'w-A';
+    const base = w.ds.query;
+    w.ds = {
+      async query(sql, params) {
+        if (/select owner_id from public\.production_jobs/.test(sql)) return [{ owner_id: OWNER }];
+        if (sql === LW.LATE_CHECKPOINT_SQL) {
+          const [, hash, entry, sentAt] = params;
+          if (w.cps[hash]) return [];
+          w.cps[hash] = JSON.parse(entry); w.late.push({ hash, sentAt, from: w.cps[hash].lateFromAttempt });
+          return [{ id: IRID }];
+        }
+        if (/'\{llmCheckpoints\}'/.test(sql) && /worker_id = \$2/.test(sql)) {
+          if (params[1] !== w.owner) return [];
+          Object.assign(w.cps, JSON.parse(params[2]));
+          return [{ id: IRID }];
+        }
+        return base(sql, params);
+      },
+    };
+    const st = { failed: [], completed: [], recorded: [] };
+    const deps = (ex) => ({
+      scheduler: {
+        async heartbeatItem(_id, e) { return e === w.owner; },
+        async completeItem() { return true; },
+        async completeItemDetailed(_id, e, p) { if (e !== w.owner) return { ok: false, reason: 'lease_lost' }; st.completed.push({ ex: e, p }); return { ok: true }; },
+        async failItemDetailed(_id, e, msg, retryable, _o, opts) { st.failed.push({ ex: e, msg, retryable, opts: opts || null }); return { ok: true }; },
+        async recordItemExternal(_id, e, patch) { st.recorded.push({ ex: e, patch }); return true; },
+      },
+      dataSource: w.ds,
+      artifacts: { async uploadBufferArtifact() { return { id: 'art' }; }, async putStorageObject(i) { w.store.set(i.storagePath, i.buffer.toString('utf8')); }, async downloadStorageObject(_b, p) { return Buffer.from(w.store.get(p) || '', 'utf8'); } },
+      finops: w.finops, budget: w.budget, logger: { log() {}, warn() {}, error() {} },
+      executorId: ex, leaseSeconds: 300, heartbeatMs: 1e9, apiKey: 'k', baseUrl: a.url, defaultModel: 'm', idleMs: 3000, totalMs: 10000, llmMode: 'mock',
+      // Ejecutor falso: una llamada a la IA con el MISMO pedido en cada intento.
+      createRuntime: ({ api }) => ({
+        run: async () => ({ ok: true, artifacts: [], summary: { text: await api('s', 'P') } }),
+        mapError: (e) => ({ msg: (e && (e.msg || e.message)) || String(e), retryable: true }),
+        draftFailField: () => null,
+      }),
+    });
+    const item = (attempt, previousError) => ({ itemRunId: IRID, runId: RUN, itemKey: 'content:x', type: 'content', attempt, generation: 1, artifactCourseId: '7', manifestId: 3, idempotencyKey: 'idem', previousError });
+    const pA = LW.processLlmItem(deps('w-A'), item(1, null));
+    await tick(80);
+    // La lease de A vence; un reclamante B (no ejecutado aquí) la devolvió por drenaje → C ve previousError=worker_draining.
+    w.owner = 'w-C';
+    const rC = await LW.processLlmItem(deps('w-C'), item(3, 'worker_draining: el worker se reinicia'));
+    w.owner = 'w-D';
+    const rD = await LW.processLlmItem(deps('w-D'), item(4, null)); // reapertura del auto-heal: error = null
+    eq([rC, rD, a.st.requests], ['handed_back', 'handed_back', 1], 'tras drenaje y tras reapertura: devuelta, 0 pedidos nuevos');
+    assert(st.failed.every((f) => f.retryable && /^prior_call_in_flight:/.test(f.msg) && f.opts && f.opts.grantAttempt && f.opts.retryAfterSeconds >= 30), JSON.stringify(st.failed));
+    assert(!st.recorded.some((r) => r.patch && 'llmCheckpoints' in r.patch), `sin descartar guardados: ${JSON.stringify(st.recorded)}`);
+    const rA = await pA;
+    eq([rA, w.late.length, w.late[0] && w.late[0].from], ['abandoned', 1, 1], 'A: abandona y deja su guardado tardío');
+    w.owner = 'w-E';
+    const rE = await LW.processLlmItem(deps('w-E'), item(5, 'prior_call_in_flight: x'));
+    eq([rE, a.st.requests, w.finals.length, w.pending(), st.completed.length, st.completed[0] && st.completed[0].p.summary.text], ['completed', 1, 1, 0, 1, 'R1'], 'E completa desde el guardado: 1 pedido, 1 cargo, 0 pendientes');
+    await a.close();
+  });
+
   // ─── LT10 SQL real ─────────────────────────────────────────────────────────────────────────────────────────────
   await check('LT10 SQL real (PG16): guardado tardío, adoptLateExternalId y priorAttemptInFlightMs', async () => {
     const pgBin = findPgBin();
@@ -429,8 +494,12 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
       const late = async (hash, sentAt) => (await ds.query(LW.LATE_CHECKPOINT_SQL, [id, hash, JSON.stringify({ path: 'p-' + hash, at: new Date().toISOString(), lateFromAttempt: 1 }), sentAt])).length;
       const cps = async () => (await ds.query(`select output_summary->'llmCheckpoints' as c from public.generation_item_runs where id = $1`, [id]))[0].c;
       eq(await late('h1', ago(1000)), 1, 'agrega una clave nueva');
-      eq(await late('h0', ago(1000)), 0, 'nunca pisa una existente');
-      eq((await cps()).h0.path, 'p0', 'h0 intacto');
+      eq(await late('h0', ago(1000)), 1, 'una existente con fecha ilegible (la lectura la ignora) se reemplaza');
+      eq((await cps()).h0.path, 'p-h0', 'h0 reemplazada');
+      eq(await late('h1', ago(900)), 0, 'nunca pisa una existente de la ventana vigente');
+      await c.query(`update public.generation_item_runs set output_summary = jsonb_set(output_summary, '{llmCheckpoints,hS}', jsonb_build_object('path', 'old', 'at', (now() - interval '2 hours')::text)) where id = $1`, [id]);
+      eq(await late('hS', ago(1000)), 1, 'review I2: pisa una clave de una ventana ANTERIOR (ya ignorada por la lectura)');
+      eq((await cps()).hS.path, 'p-hS', 'hS reemplazada');
       await c.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('llmCheckpointsResetAt', $2::text) where id = $1`, [id, ago(500)]);
       eq(await late('h2', ago(1000)), 0, 'pedido anterior al último descarte → rechazado');
       eq(await late('h3', ago(100)), 1, 'pedido posterior al descarte → aceptado');
@@ -438,7 +507,7 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
       eq(await late('h4', ago(80)), 0, 'pedido anterior al reinicio de la ventana → rechazado');
       await c.query(`update public.generation_item_runs set status = 'completed' where id = $1`, [id]);
       eq(await late('h5', ago(1)), 0, 'parte completada → rechazado');
-      eq(Object.keys(await cps()).sort(), ['h0', 'h1', 'h3'], 'índice final');
+      eq(Object.keys(await cps()).sort(), ['h0', 'h1', 'h3', 'hS'], 'índice final');
 
       const vid = '33333333-2222-4333-8444-555555555555';
       const mk = ago(2000);
@@ -451,6 +520,8 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
       const gid = '44444444-2222-4333-8444-555555555555';
       await c.query(`insert into public.generation_item_runs (id, status, output_summary) values ($1, 'completed', $2::jsonb)`, [gid, JSON.stringify({ externalSubmitStartedAt: mk })]);
       eq(await LT.adoptLateExternalId(ds, gid, mk, 'gammaGenerationId', { gammaGenerationId: 'g' }), false, 'parte completada → nada');
+      await c.query(`update public.generation_item_runs set status = 'failed' where id = $1`, [gid]);
+      eq(await LT.adoptLateExternalId(ds, gid, mk, 'gammaGenerationId', { gammaGenerationId: 'g' }), false, 'review M4: parte fallida (ya ambigua/reconciliación) → nada');
 
       const body = SL.serverLlmRequestBody({ system: 's', user: 'P', defaultModel: 'm' }).body;
       const hash = SL.serverLlmRequestHash(body);
