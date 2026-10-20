@@ -221,7 +221,9 @@ function decide(component, base, arm, rubric, crit, tokenizer) {
   if (gate) {
     const t = tokenizer && tokenizer[arm.model];
     if (!t || !num(t.factor)) { pass.tokenizer = null; reasons.push('factor del tokenizer (count_tokens) faltante'); }
-    else { pass.tokenizer = t.factor <= crit.maxTokenizerFactor; if (!pass.tokenizer) reasons.push(`factor del tokenizer ${t.factor} > ${crit.maxTokenizerFactor}`); if (t.simulated) reasons.push('factor del tokenizer SIMULADO (dry-run)'); }
+    // Review r61 R4: un factor SIMULADO (dry-run) nunca habilita un GO.
+    else if (t.simulated) { pass.tokenizer = null; reasons.push(`factor del tokenizer SIMULADO (${t.factor}): falta medirlo con count_tokens real`); }
+    else { pass.tokenizer = t.factor <= crit.maxTokenizerFactor; if (!pass.tokenizer) reasons.push(`factor del tokenizer ${t.factor} > ${crit.maxTokenizerFactor}`); }
   }
   const r = rubric && rubric[component];
   if (r && num(r[arm.armId]) && num(r[base.armId])) {
@@ -267,7 +269,7 @@ async function runExperiment(o) {
   try {
     results.plan = planCost(cfg);
     const approvedUsd = o.real ? o.approvedBudgetUsd : (cfg.approvedBudgetUsd ?? 5);
-    guard = new BudgetGuard(approvedUsd, { label: o.real ? 'modelab-real' : 'modelab-dry-run', ledgerFile: o.ledgerFile || null });
+    guard = new BudgetGuard(approvedUsd, { label: o.real ? 'modelab-real' : 'modelab-dry-run', ledgerFile: o.ledgerFile || null, approvalNote: o.approvalNote || null, globalLedgerDir: o.globalLedgerDir || null, globalCapUsd: o.globalCapUsd ?? null });
     if (o.onResults) o.onResults(results, guard);
     if (o.real && guard.prior.spentUsd > 0 && !o.resume) {
       throw Object.assign(new Error(`ya hay ${guard.prior.spentUsd.toFixed(4)} USD gastados en ${o.ledgerFile}: relanzar con --resume (reutiliza lo pagado) o usar otro experimento`), { code: 'BUDGET_PRIOR_SPEND' });

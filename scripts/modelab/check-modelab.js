@@ -16,6 +16,10 @@
 //   ML13 (review I7/M3) regla go/no-go estricta con faltantes + compuerta del factor del tokenizer
 //   ML14 (review I8) `decide` offline sobre una corrida guardada (USD 0)
 //   ML15 (review I9) costo en frío: igual entre réplicas aunque la caché esté tibia
+//   ML16 (re-review R1) ledger real en ubicación fija compartida; tope duro de 10 USD sobre el TOTAL de experimentos
+//   ML17 (re-review R2) monto aprobado registrado; otro monto exige --approval-note (queda en el ledger)
+//   ML18 (re-review R3) 408/409 son transitorios (reintento con reserva), no rechazos
+//   ML19 (re-review R4) factor del tokenizer simulado ⇒ PENDING_TOKENIZER, nunca GO
 // Todo corre bajo la barrera de red del repo (review M6): un intento de red hace fallar el check.
 'use strict';
 const fs = require('fs');
@@ -27,7 +31,7 @@ const P = require('./lib/project');
 const RN = require('./lib/runner');
 const E = require('./lib/experiment');
 const CL = require('./lib/clients');
-const { BudgetGuard, assertPreflight, readLedger, ledgerPath } = require('./lib/budget');
+const { BudgetGuard, assertPreflight, readLedger, ledgerPath, realLedgerDir, GLOBAL_REAL_CAP_USD } = require('./lib/budget');
 const os = require('os');
 const NG = require(path.resolve(__dirname, '..', 'lib', 'netguard'));
 const BARRIER = NG.installNetworkBarrier({ label: 'check-modelab' });
@@ -119,7 +123,7 @@ const base = { model: 'claude-sonnet-4-6', max_tokens: 8000, system: 's', messag
     assert(!res.aborted, `abortado ${JSON.stringify(res.aborted)}`);
     const vi = res.components.find((c) => c.component === 'video_interactions');
     assert(vi.arms['B-s55'].completed === 2 && vi.arms['A-s46'].completed === 2, 'VI completados');
-    assert(['PENDING_RUBRIC', 'GO', 'NO_GO'].includes(vi.decisions['B-s55'].verdict), 'veredicto');
+    assert(vi.decisions['B-s55'].verdict === 'PENDING_TOKENIZER', `dry-run con factor simulado: ${vi.decisions['B-s55'].verdict}`);
     const armCalls = res.calls.filter((c) => c.phase === 'arm' && c.arm === 'C-h55');
     assert(armCalls.length && armCalls.every((c) => c.model === 'claude-haiku-5-5' && c.thinking === 'off'), 'C usa Haiku sin thinking');
     assert(res.calls.filter((c) => c.phase === 'dependencies').every((c) => c.model === 'claude-sonnet-4-6'), 'dependencias con el baseline');
@@ -286,6 +290,59 @@ const base = { model: 'claude-sonnet-4-6', max_tokens: 8000, system: 's', messag
     assert(warm.length && warm.every((c) => c.usdCold > c.usd), 'hay llamadas con caché tibia (el humo y la réplica anterior la calientan) y su costo en frío es mayor');
     near(runs[1].usdCold, runs[0].usdCold, 1e-9, 'el costo en frío es el mismo');
     assert(res.calls.every((c) => c.usdCold + 1e-12 >= c.usd), 'frío ≥ real');
+  });
+
+
+  await check('ML16 ledger real fijo y compartido; tope de 10 USD sobre el TOTAL', () => {
+    const d = path.join(TMP, 'ledger-dir');
+    assert(realLedgerDir({ MODELAB_LEDGER_DIR: d }) === d && fs.existsSync(d), 'MODELAB_LEDGER_DIR');
+    assert(realLedgerDir({}) === path.join(os.homedir(), 'cursia-test-env', 'work', 'modelab-ledger'), 'ubicación por defecto');
+    assert(GLOBAL_REAL_CAP_USD === 10, 'tope global 10');
+    const mk = (id, approved) => new BudgetGuard(approved, { ledgerFile: ledgerPath(d, id, 'real'), globalLedgerDir: d, globalCapUsd: GLOBAL_REAL_CAP_USD });
+    const g1 = mk('expA', 5); g1.settle(g1.reserve(4.8), 4.8);
+    const g2 = mk('expB', 5); g2.settle(g2.reserve(4.9), 4.9);
+    const g3 = mk('expC', 5);
+    assert(Math.abs(g3.globalPriorUsd - 9.7) < 1e-9, `total previo ${g3.globalPriorUsd}`);
+    let e = null; try { g3.reserve(0.5); } catch (x) { e = x; }
+    assert(e && e.code === 'BUDGET_EXCEEDED' && e.global, 'un 3.er experimento con su propio presupuesto choca el tope global');
+    g3.settle(g3.reserve(0.3), 0.3);
+    e = null; try { mk('expD', 5); } catch (x) { e = x; }
+    assert(e && e.code === 'BUDGET_GLOBAL_CAP_EXHAUSTED', 'tope global agotado → no arranca');
+    const src = fs.readFileSync(path.join(__dirname, 'modelab.js'), 'utf8');
+    assert(/const ledgerDir = real \? realLedgerDir\(\) : dir;/.test(src) && /globalCapUsd: real \? GLOBAL_REAL_CAP_USD/.test(src), 'el CLI real usa el ledger fijo y el tope global');
+  });
+
+  await check('ML17 monto aprobado registrado; cambiarlo exige --approval-note', () => {
+    const f = ledgerPath(TMP, 'ml17', 'real');
+    new BudgetGuard(5, { ledgerFile: f });
+    assert(readLedger(f).approvals.length === 1 && readLedger(f).approvedUsd === 5, '1.ª línea = aprobación');
+    new BudgetGuard(5, { ledgerFile: f }); // mismo monto: sin línea nueva
+    let e = null; try { new BudgetGuard(8, { ledgerFile: f }); } catch (x) { e = x; }
+    assert(e && e.code === 'BUDGET_APPROVAL_MISMATCH', 'otro monto sin nota → rechazo');
+    new BudgetGuard(8, { ledgerFile: f, approvalNote: 'Nicolás aprobó +3 USD el 2026-10-20' });
+    const L = readLedger(f);
+    assert(L.approvedUsd === 8 && L.approvals.length === 2 && /aprobó/.test(L.approvals[1].note) && L.approvals[1].previousApprovedUsd === 5, 'nota registrada');
+  });
+
+  await check('ML18 408/409 transitorios: reintento con reserva', async () => {
+    assert(CL.classifyError(408).cls === 'transient' && CL.classifyError(408).unknownSpend === true, '408');
+    assert(CL.classifyError(409).cls === 'transient' && CL.classifyError(409).unknownSpend === false, '409');
+    assert(CL.classifyError(400).cls === 'invalid_request' && CL.classifyError(401).cls === 'auth', '400/401');
+    const cfg = E.loadInput({ source: 'commercial-simulation', fixtureId: '1x1-sin-examenes' });
+    const g = new BudgetGuard(1);
+    const flaky = CL.createMockClient({ inject: (i) => (i === 1 ? { status: 408 } : i === 2 ? { status: 409 } : null) });
+    const r = await RN.runArm({ distRoot: DIST, feRoot: FE, cfg, select: [{ type: 'course_intro' }], arm: { id: 'A', model: 'claude-sonnet-4-6' }, client: flaky, guard: g, backoffMs: 0 });
+    const infra = r.calls.filter((c) => c.infra);
+    assert(r.res.ok && infra.length === 2 && infra[0].usd === infra[0].upperUsd && infra[1].usd === 0, `408 al peor caso, 409 sin cargo: ${JSON.stringify(infra.map((c) => [c.stopReason, c.usd]))}`);
+  });
+
+  await check('ML19 factor simulado ⇒ PENDING_TOKENIZER, nunca GO', () => {
+    const crit = JSON.parse(fs.readFileSync(path.join(__dirname, 'config/phase1.json'), 'utf8')).successCriteria;
+    const A = { armId: 'A', model: 'claude-sonnet-4-6', firstPassValidity: 0.9, hardFailures: 0, truncations: 0, refusals: 0, jsonInvalid: 0, usdPerValidItemCold: 0.1, answerLongestShare: null };
+    const B = { ...A, armId: 'B', model: 'claude-sonnet-5-5', usdPerValidItemCold: 0.08 };
+    const d = E.decide('x', A, B, { x: { A: 4, B: 4 } }, crit, { 'claude-sonnet-5-5': { factor: 1.3, simulated: true } });
+    assert(d.verdict === 'PENDING_TOKENIZER' && d.pass.tokenizer === null, `simulado: ${d.verdict}`);
+    assert(E.decide('x', A, B, { x: { A: 4, B: 4 } }, crit, { 'claude-sonnet-5-5': { factor: 1.3 } }).verdict === 'GO', 'medido real → GO');
   });
 
   await check('M6 barrera de red activa y sin intentos', async () => {

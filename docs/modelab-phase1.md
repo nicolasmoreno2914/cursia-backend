@@ -164,14 +164,16 @@ Las fixtures de replay del repo son sintéticas (LLM falso), así que no sirven 
 - **Costos:** salen del código de FinOps (`priceUsage`), con un catálogo del laboratorio que incluye los tramos de Haiku.
 - **Rúbrica:** se generan `judge-packets.jsonl`, con pares ciegos de etiqueta aleatoria y los nombres de modelo redactados, y `judge-key.json` aparte (con el componente de cada paquete). `modelab decide` aplica los puntajes **offline, a USD 0**, sobre la corrida guardada.
 - **Presupuesto (revisión r61, I1–I6):**
-  - **Ledger acumulado** `OUT/modelab-ledger-<experimento>-<modo>.jsonl`, append-only: `reserve` antes de cada intento y `settle` después. El presupuesto aprobado es **por experimento**: disponible = aprobado − todo lo gastado antes, y una reserva sin `settle` (caída a mitad de llamada) cuenta al peor caso. Con gasto previo, el modo real se niega a arrancar sin `--resume`; con `--resume` reutiliza a USD 0 las respuestas ya pagadas (`modelab-answers-*.jsonl`).
+  - **Ledger real fijo y compartido** (re-revisión R1): vive en `MODELAB_LEDGER_DIR` o, por defecto, en `~/cursia-test-env/work/modelab-ledger/`, con un archivo `modelab-ledger-<experimento>-real.jsonl` por experimento. El **tope duro de 10 USD aplica al TOTAL de todos los experimentos** de ese directorio: un experimento nuevo no reinicia el contador. `--out` solo guarda informes y respuestas. El dry-run usa un ledger propio en `--out`, porque su gasto es simulado.
+  - **Aprobación registrada** (R2): la primera línea del ledger de cada experimento guarda `approvedUsd`. Un `--approved-budget-usd` distinto se rechaza (`BUDGET_APPROVAL_MISMATCH`) salvo con `--approval-note="<motivo y quién aprobó>"`, y la nota queda en el ledger.
+  - **Ledger acumulado**, append-only: `reserve` antes de cada intento y `settle` después. El presupuesto aprobado es **por experimento**: disponible = aprobado − todo lo gastado antes, y una reserva sin `settle` (caída a mitad de llamada) cuenta al peor caso. Con gasto previo, el modo real se niega a arrancar sin `--resume`; con `--resume` reutiliza a USD 0 las respuestas ya pagadas (`modelab-answers-*.jsonl`).
   - **Chequeo previo:** proyección por evidencia (incluido el humo) × 1,25 ≤ disponible; si no, no se hace ninguna llamada.
   - **Cota por intento:** entrada estimada × 1,25 de holgura a precio de escritura de caché + `max_tokens`. Ante un error de red o 5xx, se asume el peor caso.
-  - **Sin reintentos automáticos del SDK** (`maxRetries: 0`). Los transitorios (429/529/5xx/red) se reintentan explícitamente, hasta 4 intentos con backoff, **cada intento con su reserva y su renglón**. Nunca se guardan como respuesta ni cuentan como falla del brazo; si se agotan, la corrida aborta (`INFRA_RETRIES_EXHAUSTED`).
+  - **Sin reintentos automáticos del SDK** (`maxRetries: 0`). Los transitorios (408/409/429/529/5xx/red; un 408 se cobra al peor caso) se reintentan explícitamente, hasta 4 intentos con backoff, **cada intento con su reserva y su renglón**. Nunca se guardan como respuesta ni cuentan como falla del brazo; si se agotan, la corrida aborta (`INFRA_RETRIES_EXHAUSTED`).
   - **4xx inesperado** (`invalid_request`, auth): aborta la corrida con el mensaje de la API (`ARM_REQUEST_REJECTED`). Nunca se convierte en una «falla dura» del brazo.
   - **Llamada de humo obligatoria** por (componente, brazo) ANTES de dependencias y brazos: el pedido real del componente adaptado al brazo, con `max_tokens` 32, reservado en el presupuesto. En la misma fase, `count_tokens` (gratis) mide el factor del tokenizer de cada brazo sobre esos pedidos.
   - **Informe siempre:** `runExperiment` nunca relanza; cualquier error queda en `aborted`, con el gasto, las llamadas y las respuestas hasta ese momento. SIGINT/SIGTERM escriben el informe parcial y salen con 130.
-- **Modo real:** exige `--real --approved-budget-usd=N --api-key-env=VAR --out=DIR` (el `--out` debe ser estable: ahí vive el ledger). El tope de 10 USD es **duro**: cambiarlo exige cambiar el código, no hay flag. El SDK va fijo a `https://api.anthropic.com`, y si `ANTHROPIC_BASE_URL` apunta a otro host se niega. Nunca lee `.env`.
+- **Modo real:** exige `--real --approved-budget-usd=N --api-key-env=VAR --out=DIR`. El `--out` debe ser estable porque ahí quedan los informes y las respuestas que usa `--resume`; el ledger va aparte, en su ubicación fija. El tope de 10 USD es **duro**: cambiarlo exige cambiar el código, no hay flag. El SDK va fijo a `https://api.anthropic.com`, y si `ANTHROPIC_BASE_URL` apunta a otro host se niega. Nunca lee `.env`.
 - **Sin red fuera del modo real:** todo comando offline y `check-modelab` corren bajo la barrera de red del repo (`scripts/lib/netguard.js`: sockets, fetch, http(s), tls, DNS, UDP).
 
 **Comandos:**
@@ -181,7 +183,7 @@ npm run build
 export CURSIA_FRONTEND_REPO=../fe   # fixtures H5P v2 del frontend
 
 # USD 0
-node scripts/modelab/check-modelab.js                         # autoverificación: 16 checks, bajo barrera de red
+node scripts/modelab/check-modelab.js                         # autoverificación: 20 checks, bajo barrera de red
 node scripts/modelab/modelab.js project  --out=OUT
 node scripts/modelab/modelab.js baseline --out=OUT
 node scripts/modelab/modelab.js plan
@@ -231,7 +233,7 @@ Esos quedan para la Fase 2: B y C solo en la revisión de forma, con un costo de
 **Regla go/no-go**, implementada en `decide()`:
 
 - **NO_GO** si falla cualquiera de los criterios deterministas (2–6), **o si falta** una métrica determinista. Un dato ausente nunca aprueba. La única excepción es el sesgo cuando ningún brazo tiene MC: ahí es «n/a».
-- **PENDING_TOKENIZER** si en Sonnet 5.5 falta el factor medido.
+- **PENDING_TOKENIZER** si en Sonnet 5.5 falta el factor medido o si el factor es **simulado** (dry-run). Un factor simulado nunca da GO (R4).
 - **PENDING_RUBRIC** si los deterministas pasan pero todavía no hay rúbrica.
 - **GO** solo si además la rúbrica cumple (1).
 - Los errores de infraestructura no son fallas del brazo: se reintentan o abortan la corrida.
@@ -261,5 +263,5 @@ Esos quedan para la Fase 2: B y C solo en la revisión de forma, con un costo de
 - **M2:** el tramo de Haiku 5.5 en la cota se elige con la estimación. En la Fase 1 ningún prompt se acerca a 100K.
 - **M7:** el juez LLM (Opus 5.5) no está implementado ni presupuestado. Si se implementa, debe pasar por `callThrough` y entrar en `planCost`.
 - **M9:** la regla «tool_choice forzado sin pensamiento» de Haiku 5.5 no tiene lint. Cursia no usa `tool_choice`.
-- **Ledger por directorio:** el ledger vive en `--out`. Otro `--out` empieza otro ledger; por eso el modo real exige un `--out` explícito y estable.
+- **Ledger real fijo** (resuelto en R1): el gasto real se acumula entre experimentos y directorios de salida. Borrar o mover `~/cursia-test-env/work/modelab-ledger/` (o cambiar `MODELAB_LEDGER_DIR`) reinicia el contador, así que no hay que hacerlo.
 - **Humo y caché:** el humo calienta la caché del prefijo. Por eso el ahorro se decide en frío.

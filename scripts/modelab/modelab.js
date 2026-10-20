@@ -11,8 +11,10 @@
 //        pedidos reales del ejecutor por componente; en --real cuenta tokens con count_tokens (GRATIS) por modelo
 //   node scripts/modelab/modelab.js run --real --approved-budget-usd=N --api-key-env=VAR --out=DIR [--resume] [--config=FILE]
 //        llamadas REALES (SDK oficial, sin reintentos automáticos, base URL fija). Exige presupuesto aprobado explícito
-//        (≤ 10 USD, tope duro en código), el NOMBRE de la variable con la clave y un --out estable (ahí vive el ledger
-//        acumulado del experimento). Nunca lee .env. Llamada de humo por brazo antes de gastar; aborta si la proyección ×
+//        (≤ 10 USD; el tope duro de 10 USD aplica además al TOTAL de todos los experimentos del ledger real fijo
+//        MODELAB_LEDGER_DIR o ~/cursia-test-env/work/modelab-ledger/), el NOMBRE de la variable con la clave y un --out
+//        estable (informes y respuestas para --resume). Cambiar el monto aprobado de un experimento exige
+//        --approval-note="<motivo>" (queda en el ledger). Nunca lee .env. Llamada de humo por brazo antes de gastar; aborta si la proyección ×
 //        margen no cabe en lo que QUEDA del presupuesto, en cualquier llamada cuya cota no quepa, ante un 4xx o tras
 //        reintentos transitorios agotados. Siempre escribe el informe (también al abortar o con Ctrl-C).
 //   node scripts/modelab/modelab.js decide --run=DIR/modelab-run.json --rubric=scores.json --judge-key=DIR/judge-key.json
@@ -30,7 +32,7 @@ const E = require('./lib/experiment');
 const CL = require('./lib/clients');
 const M = require('./lib/models');
 const RN = require('./lib/runner');
-const { BudgetGuard, ledgerPath } = require('./lib/budget');
+const { BudgetGuard, ledgerPath, realLedgerDir, GLOBAL_REAL_CAP_USD } = require('./lib/budget');
 const NG = require(path.resolve(__dirname, '..', 'lib', 'netguard'));
 const R = require('./lib/report');
 
@@ -135,7 +137,11 @@ async function cmdRun(a) {
   if (real && (!a.out || a.out === true)) throw new Error('modelab: el modo real exige --out=DIR estable (ahí vive el ledger acumulado del experimento)');
   const dir = outDir(a, real ? 'real' : 'dryrun');
   const mode = real ? 'real' : 'dry-run';
-  const ledgerFile = ledgerPath(dir, cfg.id, mode);
+  // Review r61 R1: el ledger REAL vive en una ubicación fija y compartida (MODELAB_LEDGER_DIR o
+  // ~/cursia-test-env/work/modelab-ledger/); el tope duro de 10 USD aplica al TOTAL de todos los experimentos de ese
+  // ledger. --out solo guarda informes y respuestas. El dry-run usa un ledger propio en --out (gasto simulado).
+  const ledgerDir = real ? realLedgerDir() : dir;
+  const ledgerFile = ledgerPath(ledgerDir, cfg.id, mode);
   const answersFile = path.join(dir, `modelab-answers-${cfg.id}-${mode}.jsonl`);
   let resume = null;
   if (a.resume) { resume = new Map(loadJsonl(answersFile).map((x) => [x.key, x])); console.log(`reanudación: ${resume.size} respuesta(s) ya pagadas en ${answersFile}`); }
@@ -158,6 +164,8 @@ async function cmdRun(a) {
   const t0 = Date.now();
   const res = await E.runExperiment({
     config: cfg, distRoot: DIST, feRoot: feRoot(), real, approvedBudgetUsd: approved, ledgerFile, resume,
+    approvalNote: typeof a['approval-note'] === 'string' ? a['approval-note'] : null,
+    globalLedgerDir: real ? ledgerDir : null, globalCapUsd: real ? GLOBAL_REAL_CAP_USD : null,
     onAnswer: (x) => fs.appendFileSync(answersFile, JSON.stringify(x) + '\n'),
     onResults: (r, g) => { live = r; liveGuard = g; },
     backoffMs: real ? 2000 : 0,

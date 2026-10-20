@@ -70,13 +70,15 @@ function createMockClient(o = {}) {
  * Clase de un error de la API (review r61 I5/I6):
  *   - invalid_request (400/404/413/422 y otros 4xx no listados) → el brazo/corrida ABORTA (nunca es una «falla del modelo»);
  *   - auth (401/403) → aborta;
- *   - transient (429, 529, 5xx, red/timeout = status 0) → reintento explícito acotado, cada intento con su reserva;
+ *   - transient (408, 409, 429, 529, 5xx, red/timeout = status 0) → reintento explícito acotado, cada intento con su reserva;
  *     NUNCA se guarda como respuesta ni cuenta como falla dura del brazo.
  * Gasto: 429/529 se rechazan antes de generar (sin cargo); 5xx / red / timeout = gasto DESCONOCIDO → cota superior.
  */
 function classifyError(status) {
   if (status === 401 || status === 403) return { cls: 'auth', unknownSpend: false };
-  if (status === 429 || status === 529) return { cls: 'transient', unknownSpend: false };
+  if (status === 429 || status === 529 || status === 409) return { cls: 'transient', unknownSpend: false };
+  // Review r61 R3: 408 (timeout del pedido) es transitorio; el servidor pudo haber generado → gasto desconocido.
+  if (status === 408) return { cls: 'transient', unknownSpend: true };
   if (status === 0 || status >= 500) return { cls: 'transient', unknownSpend: true };
   return { cls: 'invalid_request', unknownSpend: false };
 }
