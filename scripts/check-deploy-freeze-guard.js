@@ -94,9 +94,18 @@ async function workflowChecks() {
     assert(!JSON.stringify(wf.jobs.calibration || {}).includes('check-active-runs'), 'el job de calibración (sin deploy) no la necesita');
   });
 
-  await check('[WF] deploy.yml (producción) no cambia: sin la guardia de staging', () => {
-    const prod = fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8');
-    assert(!prod.includes('check-active-runs') && !prod.includes('force_deploy'), 'producción intacta');
+  // r61: producción porta la MISMA guardia (detalle en scripts/ci/check-prod-deploy-hardening.js).
+  await check('[WF] deploy.yml (producción, r61): primer paso DEPLOY_FREEZE idéntico; check-active-runs por stdin en VPS_PATH (base de producción) antes del rsync y de PM2, con --legacy; sin `|| true`', () => {
+    const prod = yaml.load(fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8'));
+    const ps = prod.jobs.deploy.steps;
+    eq([ps[0].env.DEPLOY_FREEZE, ps[0].env.FORCE_DEPLOY], [steps[0].env.DEPLOY_FREEZE, steps[0].env.FORCE_DEPLOY], 'misma guardia');
+    eq(prod.on.workflow_dispatch.inputs.force_deploy, wf.on.workflow_dispatch.inputs.force_deploy, 'mismo input force_deploy');
+    const iG = ps.findIndex((x) => typeof x.run === 'string' && x.run.includes('< scripts/ops/check-active-runs.js'));
+    const iR = ps.findIndex((x) => typeof x.run === 'string' && /\brsync -az/.test(x.run));
+    const iI = ps.findIndex((x) => typeof x.run === 'string' && /prod-release\.sh install/.test(x.run));
+    assert(iG > 0 && iG < iR && iR < iI, `orden guardia ${iG} rsync ${iR} install ${iI}`);
+    assert(/cd '\$DEPLOY_VPS_PATH' && node - \$LEGACY_ARG \$FORCE_ARG"/.test(ps[iG].run) && !/\|\|\s*true/.test(ps[iG].run), ps[iG].run);
+    assert(!/STAGING/.test(ps[iG].run + JSON.stringify(ps[iG].env)), 'nunca el directorio de staging');
   });
 }
 
@@ -107,6 +116,10 @@ function fakeQuery(state) {
     calls.push(sql);
     assert(!/\b(insert|update|delete|alter|create|drop|truncate)\b/i.test(sql), `solo lectura: ${sql.slice(0, 80)}`);
     if (/to_regclass/.test(sql)) return [{ ok: state.tables.includes(params[0]) }];
+    if (/course_full_generation/.test(sql)) {
+      const act = (state.legacy || []).filter((r) => params[0].includes(r.worker_status));
+      return /count\(\*\)/.test(sql) ? [{ n: act.length }] : act.filter((r) => r.leased);
+    }
     if (/dynamic_generation/.test(sql) && /= any\(\$1/.test(sql)) return state.runs.filter((r) => params[0].includes(r.worker_status));
     if (/dynamic_package/.test(sql)) return state.pkgs.filter((r) => params[0].includes(r.worker_status));
     if (/worker_status = 'paused'/.test(sql)) return state.paused;
@@ -136,7 +149,9 @@ async function pureChecks() {
   });
 
   await check('[PU] args y entorno: --json/--force/--env-file/--no-env-file; desconocido lanza; .env solo AGREGA claves (el entorno real gana); DEPLOY_FREEZE solo "true" (sin mayúsculas/espacios)', () => {
-    eq(G.parseArgs(['--json', '--force']), { json: true, force: true, envFile: undefined, help: false }, 'flags');
+    eq(G.parseArgs(['--json', '--force']), { json: true, force: true, envFile: undefined, help: false, legacy: false, legacyBlock: false }, 'flags');
+    eq([G.parseArgs(['--legacy']).legacy, G.parseArgs(['--legacy']).legacyBlock], [true, false], '--legacy');
+    eq([G.parseArgs(['--legacy-block']).legacy, G.parseArgs(['--legacy-block']).legacyBlock], [true, true], '--legacy-block');
     eq(G.parseArgs(['--no-env-file']).envFile, null, 'sin .env');
     eq(G.parseArgs(['--env-file', '/x/.env']).envFile, '/x/.env', 'ruta');
     let err = null; try { G.parseArgs(['--write']); } catch (e) { err = e; } assert(err && /desconocido/.test(err.message), 'rechaza args desconocidos');
@@ -178,6 +193,25 @@ async function pureChecks() {
     assert(!/secreto/.test(boom.error), 'error redactado');
     const frozen = await G.runGuard({ query: fakeQuery({ ...state, runs: [], pkgs: [], claimed: [] }), env: { DEPLOY_FREEZE: 'true' } });
     eq(frozen.code, 3, 'DEPLOY_FREEZE');
+  });
+
+  await check('[PU] r61 jobs V1 (--legacy): solo informan por defecto; --legacy-block hace que los que tienen lease vigente bloqueen; sin el flag no se consultan (staging igual)', async () => {
+    eq(G.ACTIVE_LEGACY_STATUSES, ['queued', 'running', 'retrying', 'waiting_external'], 'estados V1 activos');
+    const state = { tables: ALL_TABLES, runs: [], pkgs: [], paused: [], claimed: [], stale: 0,
+      legacy: [{ id: 'l1', course_id: 3, execution_mode: 'backend_audio', worker_status: 'running', leased: true }, { id: 'l2', worker_status: 'queued' }, { id: 'l3', worker_status: 'completed', leased: true }] };
+    const plain = fakeQuery(state);
+    const r0 = await G.runGuard({ query: plain, env: {} });
+    eq([r0.code, r0.activity.legacy, plain.calls.some((c) => /course_full_generation/.test(c))], [0, undefined, false], 'sin flag: ni se consulta');
+    const info = await G.runGuard({ query: fakeQuery(state), env: {}, legacy: true });
+    eq([info.code, info.verdict, info.activity.legacy.active, info.activity.legacy.leased.map((x) => x.id)], [0, 'clear', 2, ['l1']], '--legacy informa');
+    assert(/\(info\) jobs V1 del backend activos: 2 \(con lease vigente: 1\)/.test(G.render(info)) && /job l1 \(curso 3\) backend_audio running/.test(G.render(info)), G.render(info));
+    const block = await G.runGuard({ query: fakeQuery(state), env: {}, legacyBlock: true });
+    eq([block.code, block.verdict], [2, 'busy'], '--legacy-block bloquea');
+    assert(/BLOQUEAN/.test(G.render(block)), 'render bloqueante');
+    const forced = await G.runGuard({ query: fakeQuery(state), env: {}, legacyBlock: true, force: true });
+    eq([forced.code, forced.verdict], [0, 'busy_forced'], 'force');
+    const none = await G.runGuard({ query: fakeQuery({ ...state, legacy: [{ id: 'q', worker_status: 'queued' }] }), env: {}, legacyBlock: true });
+    eq(none.code, 0, 'en cola sin lease no bloquea');
   });
 
   await check('[PU] render: ids, estados y conteos; instrucciones para forzar; nunca emails/títulos', () => {
@@ -314,6 +348,25 @@ async function dbChecks() {
       fs.writeFileSync(path.join(cwd, '.env'), `DB_HOST=127.0.0.1\nDB_PORT=${port}\nDB_USER=guard_ro\nDB_PASS=x\nDB_NAME=postgres\n`);
       r = runStdin([], {}, cwd);
       eq(r.status, 0, 'conexión desde el .env del cwd (como en el VPS)');
+    });
+
+    await check('[PG] r61 --legacy / --legacy-block contra PG16: job V1 con lease vigente informa (0) o bloquea (2); sin lease o terminado no; base idéntica', async () => {
+      const id = await ins('backend_audio', 'running', { course: 77 });
+      await c.query(`update public.production_jobs set lease_until = now() + interval '5 minutes' where id = $1`, [id]);
+      await ins('backend_gamma', 'queued', { course: 78 });
+      const before = await snapshot();
+      let r = runStdin(['--no-env-file', '--json', '--legacy'], env, cwd);
+      const rep = JSON.parse(r.stdout);
+      eq([r.status, rep.activity.legacy.active >= 2, rep.activity.legacy.leased.map((x) => x.id)], [0, true, [id]], `info ${r.stderr}`);
+      r = runStdin(['--no-env-file', '--legacy-block'], env, cwd);
+      assert(r.status === 2 && /BLOQUEAN/.test(r.stdout) && r.stdout.includes(id), r.stdout);
+      eq(await snapshot(), before, 'la guardia no escribe (base idéntica)');
+      await c.query(`update public.production_jobs set lease_until = now() - interval '1 minute' where id = $1`, [id]);
+      eq(runStdin(['--no-env-file', '--legacy-block'], env, cwd).status, 0, 'lease vencido no bloquea');
+      eq(runStdin(['--no-env-file'], env, cwd).status, 0, 'sin flag (staging) no cambia');
+      await c.query(`update public.production_jobs set lease_until = now() + interval '5 minutes' where id = $1`, [id]);
+      await c.query(`update public.production_jobs set worker_status = 'completed', status = 'completed', lease_until = null where execution_mode like 'backend\\_%'`);
+      eq(runStdin(['--no-env-file', '--legacy-block'], env, cwd).status, 0, 'terminados no bloquean');
     });
   } finally {
     try { if (c) await c.end(); } catch {}
