@@ -598,7 +598,11 @@ function autonomousWork(snap) {
   for (const i of snap.items) {
     if (i.status !== 'failed' && i.status !== 'cancelled') continue;
     const rec = i.recovery || {};
-    const auto = AUTO_RECOVERY.has(rec.currentRecovery) && (rec.maxRounds === null || rec.maxRounds === undefined || Number(rec.round || 0) < Number(rec.maxRounds));
+    let auto = AUTO_RECOVERY.has(rec.currentRecovery) && (rec.maxRounds === null || rec.maxRounds === undefined || Number(rec.round || 0) < Number(rec.maxRounds));
+    // N2: con una cancelación de Videogen pedida y sin excepción registrada, la conciliación sigue sola (dos lecturas
+    // ≥ 10 min) aunque la vista de recuperación diga «manual» (hallazgo: la vista no lo refleja).
+    const pr = (i.outputSummary || {}).providerReconcile;
+    if (!auto && pr && pr.cancelRequestedAt && !rec.exceptionReason) { auto = true; i._viewSaysManualWhileReconciling = true; }
     // Excepción explícita registrada (exceptionReason): aunque el barrido siga vigilando el job, la parte espera a una persona.
     if (!auto || rec.exceptionReason) doomed.add(i.itemKey);
   }
