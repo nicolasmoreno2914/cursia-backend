@@ -1710,6 +1710,14 @@
     return backendApiRequest('/api/v1/courses/' + courseId + '/blueprints/' + n + '/manifest/invalidation-plan?fromRun=' + encodeURIComponent(fromRunId), { method: 'GET' });
   }
 
+  // r62 (I2): presupuesto de aplicar el plan desde {fromRun} (estimado, modo de autorización user|admin|none, monto,
+  // límites y la huella que exige «Autorizar y aplicar»: backendDynStartRun(courseId, n, {fromRun, estimateHash})).
+  function backendDynFromRunPreview(courseId, n, fromRunId) {
+    return backendApiRequest('/api/v1/courses/' + courseId + '/blueprints/' + n + '/manifest/runs/from-run-preview', {
+      method: 'POST', body: { fromRun: fromRunId }
+    });
+  }
+
   // F78-BE2: regenera un item como generación NUEVA (la anterior queda
   // intacta). confirmPaid → {confirmPaid:true} (booleano literal, exigido si
   // tiene costo: video en run real o cualquier item LLM). Fix wave (I2):
@@ -4193,6 +4201,7 @@
   window.backendCoherenceComputeRunReport   = backendCoherenceComputeRunReport;
   window.backendCoherenceUploadLlmFindings  = backendCoherenceUploadLlmFindings;
   window.backendDynInvalidationPlan         = backendDynInvalidationPlan;
+  window.backendDynFromRunPreview           = backendDynFromRunPreview;
   window.backendDynRegenerateItem           = backendDynRegenerateItem;
   window.backendDynRegenerateDryRun         = backendDynRegenerateDryRun;
   window.backendDynVideoUpgradePreview      = backendDynVideoUpgradePreview;

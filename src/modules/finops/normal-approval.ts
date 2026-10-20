@@ -47,7 +47,7 @@ export interface NormalApprovalPlan {
   /** true si el monto quedó por debajo del máximo del estimado por algún límite. */
   cappedByLimit: string | null;
   blockedBy: ApprovalLimitBlock[];
-  limits: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null };
+  limits: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; ownerMonthlyCap?: string | null };
 }
 
 function lim(v: DecimalLike | null | undefined, what: string): string | null {
@@ -141,7 +141,7 @@ export function planNormalApproval(input: {
     amount: withinPolicy ? amount : null,
     cappedByLimit: withinPolicy ? cappedByLimit : null,
     blockedBy,
-    limits: { maxCostPerRun: perRun, maxCostPerCourse: perCourse, monthlyCap: monthly },
+    limits: { maxCostPerRun: perRun, maxCostPerCourse: perCourse, monthlyCap: monthly, ownerMonthlyCap: ownerMonthly },
   };
 }
 
@@ -208,9 +208,12 @@ export function estimateFingerprint(input: {
   policyId: string | null;
   plan: Pick<NormalApprovalPlan, 'amount' | 'withinPolicy'>;
   courseSpent: string;
+  /** r62 (I2): plan de invalidación del run B (`fromRun`). Ausente = la huella de siempre (sin la clave). */
+  planSha?: string | null;
 }): string {
   const e = input.estimate;
   return createHash('sha256').update(canonical({
+    ...(input.planSha ? { planSha: input.planSha } : {}),
     v: 1,
     courseId: input.courseId,
     manifestId: input.manifestId,

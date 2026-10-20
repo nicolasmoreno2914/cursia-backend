@@ -394,7 +394,7 @@ const ENV_KEYS = [
          values ($1, 1, 2, $2::jsonb, $3, 0, 1, 2)`, [cid, snap.canonicalJsonV2(s2), snap.snapshotSha256V2(s2)]);
       const mf = await manifests.getOrCreate(cid, OWNER, 1);
       await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, 'ADMIN_APPROVAL')`,
-        [String(cid), JSON.stringify({ maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '1000000000' })]);
+        [String(cid), JSON.stringify({ maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '1000000000', ownerMonthlyCap: '1000000000' })]);
       return { cid, c1, c2, m1, manifest: mf.manifest };
     }
 
@@ -1019,7 +1019,9 @@ const ENV_KEYS = [
     /** Run REAL arrancado por el camino normal (estimado → aprobación de admin → start), con el content del cap. 1 listo. */
     async function freshRun(title) {
       const K = await confirmedCourse(title, { c2Video: false, c2Title: 'Válvulas' });
-      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /^budget_approval_required/, `aprobación ${title}`, 409);
+      // r62: con los cuatro topes (incl. ownerMonthlyCap) la política habilita la firma única (409 user_authorization_required, con estimateId);
+      // una aprobación de admin vigente del estimado sigue cubriendo el start (camino de este fixture).
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /^user_authorization_required/, `aprobación ${title}`, 409);
       await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
       const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
       await seedDependency(rid, `content:${K.c1}`, 'dynamic_content_md', CONTENT_MD('Bombas'), 'text/markdown');
