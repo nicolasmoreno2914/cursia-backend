@@ -53,6 +53,7 @@ function fakeWorld(opts = {}) {
   const like = (pat) => new RegExp('^' + pat.split('%').map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
   const ds = {
     async query(sql, params) {
+      if (sql.includes('select now() as db_now')) return [{ db_now: new Date().toISOString() }]; // r62 (I2-ter): reloj de la DB
       if (sql.includes('count(*)::int as n')) {
         const [keyLike, tagLike, , exclude] = params;
         const n = [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || v.possibleDuplicate) && !exclude.includes(k)).length;

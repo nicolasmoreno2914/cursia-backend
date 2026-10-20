@@ -76,6 +76,7 @@ function world(cap = Infinity) {
   w.committed = () => [...w.res.values()].filter((r) => !r.settled || (r.possibleDuplicate && !r.charged)).length * UB + w.finals.length * ACTUAL;
   w.ds = {
     async query(sql, params) {
+      if (sql.includes('select now() as db_now')) return [{ db_now: new Date().toISOString() }]; // r62 (I2-ter): reloj de la DB
       if (sql.includes('count(*)::int as n')) {
         const [keyLike, tagLike, , exclude] = params;
         return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || v.possibleDuplicate) && !exclude.includes(k)).length }];
