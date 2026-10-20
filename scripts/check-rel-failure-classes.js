@@ -425,7 +425,10 @@ check('preservación: todo lo que el auto-healer reabre es clase A en el clasifi
     assert(AH.isAutoHealDenied(err), `deny ${err}`);
     const r = v(err);
     assert((r.class === 'C' || r.class === 'D') || (r.class === 'A' && r.strategy === 'wait_provider'), `${err} denegado pero clasificado ${r.class}/${r.strategy}`);
-    assert(FC.currentRecoveryOf(err, 'video', {}) === 'denied', `currentRecovery deny ${err}`);
+    // r62 (N2): un envío de Videogen ambiguo SIN jobId lo toma la conciliación de proveedor (conservadora + 1 reenvío
+    // acotado por el presupuesto); el auto-healer sigue sin reabrirlo (deny-list).
+    const cur = FC.currentRecoveryOf(err, 'video', {});
+    assert(cur === 'denied' || (err === 'ambiguous_video_submission' && cur === 'provider_reconcile'), `currentRecovery deny ${err}: ${cur}`);
   }
   // Reintento seguro: mismo criterio que safeAutoRetryDecision.
   const safeVg = 'videogen_submit_rejected: Videogen rechazó el envío (HTTP 422)';

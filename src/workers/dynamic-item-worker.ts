@@ -14,6 +14,7 @@ import {
   VideogenBatchJob,
   isJobCompleted,
   isJobFailed,
+  videogenV2CallOptions,
 } from '../video-engine/videogen.service';
 import { videoScenesFromVideogen } from '../package/h5p/interactive-video/plan';
 import { YoutubeService } from '../youtube/youtube.service';
@@ -791,6 +792,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         submitInFlight = { jobId: null };
         let result;
         try {
+          // r62 (N2): timeout del cliente SOLO en V2 (un POST vencido es un envío ambiguo, como ya se trata abajo).
           result = await deps.videogen.batchCreate([
             {
               title: chapterTitle,
@@ -799,7 +801,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
               client_reference_id: item.idempotencyKey,
               external_metadata: { tts_model: dynamicVideogenTtsModel() },
             },
-          ]);
+          ], videogenV2CallOptions('submit'));
         } catch (err) {
           const why = err instanceof Error ? err.message : String(err);
           if (isVideogenDefinitiveRejection(err)) {
@@ -881,7 +883,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
 
       let status: VideogenBatchJob;
       try {
-        status = mode === 'mock' ? await mockPollVideoStatus(deps, item, jobId) : await deps.videogen.getVideoStatus(jobId);
+        status = mode === 'mock' ? await mockPollVideoStatus(deps, item, jobId) : await deps.videogen.getVideoStatus(jobId, videogenV2CallOptions('get'));
       } catch (err) {
         if (err instanceof LeaseLostError) return;
         throw err;
@@ -892,7 +894,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         let costError: string | null = null;
         if (mode === 'real') {
           try {
-            cost = (await deps.videogen.getVideoCost(jobId)).estimated_total_cost;
+            cost = (await deps.videogen.getVideoCost(jobId, videogenV2CallOptions('get'))).estimated_total_cost;
           } catch (err) {
             costError = err instanceof Error ? err.message : String(err);
             logger.warn(`Item ${item.itemKey}: no se pudo obtener el costo real de Videogen — ${costError}`);
@@ -1438,7 +1440,7 @@ async function publishYoutubeAndComplete(
     // falla reintentable y el re-claim retoma la publicación sin volver a pagar el render.
     let measured: number | null = null;
     try {
-      const m = (await deps.videogen.getVideoCost(videogenJobId)).estimated_total_cost;
+      const m = (await deps.videogen.getVideoCost(videogenJobId, videogenV2CallOptions('get'))).estimated_total_cost;
       if (typeof m === 'number' && Number.isFinite(m)) measured = m;
     } catch (err) {
       logger.warn(`Item ${item.itemKey}: el costo de Videogen sigue sin estar disponible — ${err instanceof Error ? err.message : String(err)}`);

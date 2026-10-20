@@ -1139,7 +1139,9 @@ const ENV_KEYS = [
     {
       const v = await latest(ramb, `video:${Camb.c2}`);
       await ds.query(`update public.generation_item_runs set status = 'failed', error = 'ambiguous_video_submission: TEXTO-TECNICO-SECRETO timeout', finished_at = now(),
-                        output_summary = (output_summary - 'external') || '{"externalSubmitStartedAt":"2026-10-01T00:00:00Z"}'::jsonb where id = $1`, [v.id]);
+                        output_summary = (output_summary - 'external') || '{"externalSubmitStartedAt":"2026-10-01T00:00:00Z"}'::jsonb
+                          -- r62 (N2): sin reserva que lo cuente, la conciliación de proveedor lo declina (excepción registrada) → admin.
+                          || jsonb_build_object('providerReconcile', jsonb_build_object('declined', 'ambiguous_without_reservation', 'declinedError', 'ambiguous_video_submission: TEXTO-TECNICO-SECRETO timeout')) where id = $1`, [v.id]);
       await ds.query(`update public.generation_item_runs set status = 'blocked' where id = $1`, [(await latest(ramb, `video_interactions:${Camb.c2}`)).id]);
       await recompute(ramb);
     }

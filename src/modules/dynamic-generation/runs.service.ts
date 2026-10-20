@@ -95,6 +95,8 @@ import {
   AmbiguousAudioPending,
   ambiguousAudioResubmitDecision,
 } from './auto-heal';
+// r62 (N2): conciliación automática de Videogen/Gamma con evidencia del proveedor + reenvío acotado.
+import { PROVIDER_RECONCILE_CODE, PROVIDER_RECONCILE_KEY, ProviderReconcileKind, providerReconcileDecision } from './provider-reconcile';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import {
   BUDGET_APPROVAL_REQUIRED,
@@ -2142,6 +2144,12 @@ export class RunsService {
       policy: AutoHealPolicy; now?: Date; safe?: boolean; ambiguousAudio?: boolean; maxUsd?: number;
       /** REL CREDIT: sonda del proveedor tras crédito/cuota agotados (canario) o reanudación del resto. */
       providerProbe?: { mode: 'canary' | 'resume'; provider: FailureProvider };
+      /**
+       * r62 (N2): reapertura del barrido de conciliación de proveedor (ProviderReconcileService) — la reserva ya quedó
+       * conciliada con la evidencia (o de forma conservadora) y el peor caso entra en el presupuesto. `resubmit` reenvía
+       * (resubmitVideo / resubmitProvider); `repoll` retoma el MISMO job. `state` = output_summary.providerReconcile.
+       */
+      providerReconcile?: { kind: ProviderReconcileKind; action: 'resubmit' | 'repoll'; ambiguous: boolean; expectError: string; state: Record<string, any> };
     },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
@@ -2156,7 +2164,12 @@ export class RunsService {
     if (auto?.providerProbe && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio)) {
       throw new BadRequestException('auto-heal: la sonda del proveedor nunca reenvía ni se combina con otro modo automático');
     }
-    if (auto && ((resubmitProvider && !auto.ambiguousAudio) || (resubmitVideo && !auto.safe))) {
+    // r62 (N2): la conciliación de proveedor reenvía solo en modo `resubmit` y con el flag del tipo de la parte.
+    if (auto?.providerReconcile && (auto.safe || auto.ambiguousAudio || auto.providerProbe ||
+      (auto.providerReconcile.action === 'repoll' ? resubmitVideo || resubmitProvider : resubmitVideo === resubmitProvider))) {
+      throw new BadRequestException('auto-heal: la conciliación de proveedor reenvía con UN flag (resubmit) o ninguno (repoll), sin otro modo automático');
+    }
+    if (auto && !auto.providerReconcile && ((resubmitProvider && !auto.ambiguousAudio) || (resubmitVideo && !auto.safe))) {
       throw new BadRequestException('auto-heal: nunca reenvía a un proveedor (resubmitVideo/resubmitProvider)');
     }
     // Fix round 1 (I2): un SUPER_ADMIN reintenta sobre el run del dueño real del curso (FinOps, YouTube
@@ -2355,6 +2368,14 @@ export class RunsService {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible', reason: d.reason });
         }
         autoMeta = { round: d.round, code: AMBIGUOUS_AUDIO_RESUBMIT_CODE, pendingUsd: d.pendingUsd };
+      } else if (auto && auto.providerReconcile) {
+        // r62 (N2): misma decisión que el barrido, con la fila bloqueada; el error tiene que ser el que se concilió.
+        const pr = auto.providerReconcile;
+        const d = providerReconcileDecision(target, auto.now ?? new Date(), auto.policy, { id: String(job.id), created_at: job.created_at ?? null });
+        if (d.heal === false || d.kind !== pr.kind || String(target.error ?? '') !== pr.expectError || (pr.ambiguous && !d.ambiguousAllowed)) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (provider_reconcile: ${d.heal === false ? d.reason : 'changed'})`, code: 'auto_heal_not_eligible' });
+        }
+        autoMeta = { round: d.round, code: PROVIDER_RECONCILE_CODE };
       } else if (auto && auto.safe) {
         // BE-B: reintento automático seguro (una vez; solo rechazos probados sin gasto).
         const d = safeAutoRetryDecision(target, auto.now ?? new Date(), auto.policy);
@@ -2432,7 +2453,9 @@ export class RunsService {
         }
         const err = target.error ?? '';
         const eligible = err.startsWith('videogen_failed') || err.startsWith('ambiguous_video_submission')
-          || err.startsWith('videogen_submit_rejected') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED);
+          || err.startsWith('videogen_submit_rejected') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED)
+          // r62 (N2): job que nunca termina (re-poll del auto-healer agotado), ya liquidado de forma conservadora.
+          || (!!auto?.providerReconcile && auto.providerReconcile.kind === 'videogen_stuck' && err.startsWith('video_timeout'));
         if (!eligible) {
           throw new BadRequestException(
             `resubmitVideo solo aplica cuando el último error es "videogen_failed", "ambiguous_video_submission", "videogen_submit_rejected" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,
@@ -2472,12 +2495,17 @@ export class RunsService {
                     -- conserva el valor previo; su reserva rechazada ya está liquidada (no bloquea).
                     -- #583: el reenvío automático de AUDIO incierto sí reconoce (como «Resolver cobro»): su reserva
                     -- pendiente queda en el ledger contada como gasto y el próximo intento puede llamar.
-                    'reconciliationAcknowledgedThroughAttempt', ${auto && !auto.ambiguousAudio ? `coalesce(output_summary->'reconciliationAcknowledgedThroughAttempt', '0'::jsonb)` : 'attempt_count'}
+                    -- r62 (N2): la conciliación de proveedor también reconoce: las reservas de los intentos hasta acá
+                    -- quedaron conciliadas con la evidencia (o conservadoras) antes de reabrir.
+                    'reconciliationAcknowledgedThroughAttempt', ${auto && !auto.ambiguousAudio && !auto.providerReconcile ? `coalesce(output_summary->'reconciliationAcknowledgedThroughAttempt', '0'::jsonb)` : 'attempt_count'}
                   ) || $4::jsonb)${resubmitSetSql}`
         : `(${previousErrorsExpr}) || $4::jsonb`;
       // R16 (#2): la reapertura automática queda registrada (auditoría) en la misma escritura.
       const nowIso = (auto?.now ?? new Date()).toISOString();
-      const entryExtra = autoMeta && auto?.providerProbe
+      const entryExtra = autoMeta && auto?.providerReconcile
+        ? { auto: true, providerReconcile: true, providerReconcileKind: auto.providerReconcile.kind, providerReconcileAction: auto.providerReconcile.action,
+            providerReconcileRound: autoMeta.round, possibleDuplicate: auto.providerReconcile.ambiguous, autoHealCode: autoMeta.code }
+        : autoMeta && auto?.providerProbe
         ? { auto: true, providerProbe: auto.providerProbe.mode, provider: auto.providerProbe.provider, providerProbeRound: autoMeta.round }
         : autoMeta && auto?.ambiguousAudio
         ? { auto: true, ambiguousAudioResubmit: true, ambiguousAudioResubmitRound: autoMeta.round, autoHealCode: autoMeta.code, pendingUsd: autoMeta.pendingUsd ?? null }
@@ -2487,7 +2515,11 @@ export class RunsService {
           ? { auto: true, autoHealRound: autoMeta.round, autoHealCode: autoMeta.code,
               ...(auto?.policy.classAware ? { autoHealClass: autoMeta.kind, autoHealStrategy: autoMeta.strategy } : {}) }
           : actorId !== ownerId ? { retriedBy: actorId } : {};
-      const topExtra = autoMeta && auto?.providerProbe
+      const topExtra = autoMeta && auto?.providerReconcile
+        // Un reenvío es un job NUEVO: el re-poll gratis del auto-healer vuelve a empezar (repoll conserva sus rondas).
+        ? { [PROVIDER_RECONCILE_KEY]: auto.providerReconcile.state,
+            ...(auto.providerReconcile.action === 'resubmit' ? { autoHeal: { rounds: 0, regenRounds: autoRegenRoundsOf(target.output_summary), lastAt: nowIso, resetBy: PROVIDER_RECONCILE_CODE } } : {}) }
+        : autoMeta && auto?.providerProbe
         ? (probeState ? { [PROVIDER_PROBE_KEY]: probeState } : {})
         : autoMeta && auto?.ambiguousAudio
         ? { ambiguousAudioResubmit: { rounds: autoMeta.round, lastAt: nowIso, pendingUsd: autoMeta.pendingUsd ?? null,
@@ -2507,7 +2539,7 @@ export class RunsService {
       // BE-B: el reintento seguro concede UN intento (un único reenvío; si vuelve a fallar, humano).
       // #583: el reenvío de audio incierto también concede UN intento (un único reenvío).
       // REL CREDIT: el canario concede UN intento (una sola llamada de prueba; fuera de las rondas del auto-healer).
-      const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerProbe?.mode === 'canary'
+      const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerReconcile || auto?.providerProbe?.mode === 'canary'
         ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       // Loop de costos (review C1): una reapertura MANUAL (dueño / admin) le da a la parte un presupuesto de recuperación
@@ -2537,9 +2569,11 @@ export class RunsService {
       }
       // REL R2: la reapertura queda en el log de intentos (misma transacción; no-op sin esquema).
       await recordItemReopened(qr, target.id, {
-        actor: auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
+        // r62 (N2): la conciliación de proveedor la decide el sistema (no el auto-healer por clase).
+        actor: auto?.providerReconcile ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
         // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
-        strategy: auto?.providerProbe ? (auto.providerProbe.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY)
+        strategy: auto?.providerReconcile ? `${PROVIDER_RECONCILE_CODE}_${auto.providerReconcile.action}:${auto.providerReconcile.kind}`
+          : auto?.providerProbe ? (auto.providerProbe.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY)
           : auto?.ambiguousAudio ? 'ambiguous_audio_resubmit' : auto?.safe ? 'safe_auto_retry'
           : auto && auto.policy.classAware && autoMeta?.strategy ? `auto_heal_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}`
           : auto ? 'auto_heal'
