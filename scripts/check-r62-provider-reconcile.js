@@ -700,15 +700,22 @@ async function dbChecks() {
       await overdueFail(V2m, 'vg-e1', ['processing']);
       const r0 = await sweepAt(5);
       eq(r0.declined.filter((x) => x.runId === V2m.runId).map((x) => x.reason), ['provider_stuck_no_cancel'], 'E1 declinado');
+      // La parte ya había usado reenvíos automáticos antes (contadores de la PARTE, no del error).
+      const e1 = await latest(V2m.runId, v2mkey);
+      await ds.query(`update public.generation_item_runs set output_summary = jsonb_set(jsonb_set(output_summary, '{providerReconcile,rounds}', '1'), '{providerReconcile,ambiguousRounds}', '1') where id = $1`, [e1.id]);
       await runs.retryItem(V2m.cid, OWNER, 1, V2m.runId, v2mkey, true, false, undefined, { email: 'admin@cursia.test' });
       const after = await latest(V2m.runId, v2mkey);
-      eq([after.status, after.output_summary.providerReconcile, after.output_summary.videogenLastStatus], ['pending', undefined, undefined], 'el reenvío de admin limpia el estado del error anterior');
+      const pr = after.output_summary.providerReconcile;
+      eq([after.status, pr.rounds, pr.ambiguousRounds, pr.declined, pr.declinedError, pr.cancelRequestedAt, pr.checks, after.output_summary.videogenLastStatus],
+        ['pending', 1, 1, undefined, undefined, undefined, undefined, undefined], 'm-n2: el reenvío de admin conserva rounds/ambiguousRounds y limpia solo el estado del error anterior');
+      eq(PR.providerReconcileDecision({ status: 'failed', type: 'video', error: 'ambiguous_video_submission: x', output_summary: { providerReconcile: pr }, finished_at: new Date(Date.now() - 600000) }, new Date(), P).reason,
+        'ambiguous_cap_reached', 'el tope de un reenvío ambiguo por parte sigue valiendo tras el reenvío manual');
       eq(L('modules/dynamic-generation/item-recovery-view.js').recoveryViewOf(after).exceptionReason, undefined, 'sin excepción vieja en la vista');
       // E2: job nuevo que queda encolado y vence. Se inyecta un estado viejo (excepción y confirmación de otro error).
       await overdueFail(V2m, 'vg-e2', ['queued']);
       const e2 = await latest(V2m.runId, v2mkey);
       await ds.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('providerReconcile', $2::jsonb) where id = $1`,
-        [e2.id, JSON.stringify({ declined: 'provider_stuck_no_cancel', declinedError: 'videogen_render_overdue: E1 viejo', cancelConfirm1At: new Date(Date.now() - 3600000).toISOString() })]);
+        [e2.id, JSON.stringify({ ...(e2.output_summary.providerReconcile || {}), declined: 'provider_stuck_no_cancel', declinedError: 'videogen_render_overdue: E1 viejo', cancelConfirm1At: new Date(Date.now() - 3600000).toISOString() })]);
       eq(L('modules/dynamic-generation/item-recovery-view.js').recoveryViewOf(await latest(V2m.runId, v2mkey)).exceptionReason, undefined, 'la vista ignora la excepción de otro error');
       let e = null; try { await runs.retryItem(V2m.cid, OWNER, 1, V2m.runId, v2mkey, true, false, undefined, { email: 'admin@cursia.test' }); } catch (x) { e = x; }
       assert(e && /resubmitVideo solo aplica/.test(e.message), `m1 con la excepción de otro error: rechazado (${e && e.message})`);

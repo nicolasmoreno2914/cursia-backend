@@ -915,6 +915,18 @@ export function publicVideoUpgradePreview(pv: VideoUpgradePreview): Omit<VideoUp
   return rest;
 }
 
+/**
+ * r62 (N2, re-review m-n1/m-n2): un reenvío MANUAL limpia el estado de conciliación del error anterior (excepción,
+ * cancelación, consultas) pero CONSERVA los contadores de la parte (`rounds`, `ambiguousRounds`): los topes de reenvío
+ * automático (2, de ellos 1 ambiguo) siguen valiendo después. Se aplica después del merge de la reapertura
+ * (`-` liga más fuerte que `||`, y `output_summary` es la fila previa al UPDATE).
+ */
+function manualResubmitReconcileSql(): string {
+  const st = `output_summary->'${PROVIDER_RECONCILE_KEY}'`;
+  return ` - '${PROVIDER_RECONCILE_KEY}' || case when ${st} is null then '{}'::jsonb else jsonb_build_object('${PROVIDER_RECONCILE_KEY}', ` +
+    `jsonb_strip_nulls(jsonb_build_object('rounds', ${st}->'rounds', 'ambiguousRounds', ${st}->'ambiguousRounds', 'keptByManualResubmit', true))) end`;
+}
+
 @Injectable()
 export class RunsService {
   private readonly logger = new Logger(RunsService.name);
@@ -2762,7 +2774,7 @@ export class RunsService {
         // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
         // r62 (N2, re-review m-n1): un reenvío MANUAL limpia el estado de conciliación del error anterior.
-        if (!auto) resubmitSetSql += ` - '${PROVIDER_RECONCILE_KEY}'`;
+        if (!auto) resubmitSetSql += manualResubmitReconcileSql();
       }
       if (resubmitVideo) {
         if (target.type !== 'video') {
@@ -2791,7 +2803,7 @@ export class RunsService {
         // r62 (N2, re-review m-n1): job nuevo → sin el último estado del anterior; un reenvío MANUAL limpia además el
         // estado de conciliación del error anterior (la automática lo reemplaza con el suyo).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince' - 'videogenLastStatus'`
-          + (auto ? '' : ` - '${PROVIDER_RECONCILE_KEY}'`);
+          + (auto ? '' : manualResubmitReconcileSql());
       }
 
       // REL CREDIT: toda reapertura borra el estado de la sonda (racha nueva); el canario lo vuelve a escribir abajo.
