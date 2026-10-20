@@ -276,6 +276,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     refine: ({ itemType }) => (itemType && WORKER_ITEM_TYPES.has(itemType) ? { paidRisk: 'uncertain' } : null),
   },
   { id: 'worker_draining', codes: ['worker_draining'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
+  // r61 (Q-21): devolución sin llamar mientras la llamada pagada del intento anterior (lease tomada) puede seguir en
+  // vuelo; pasada su ventana se decide por el ledger (reconciliación), nunca con un reenvío.
+  { id: 'prior_call_in_flight', codes: ['prior_call_in_flight'], class: 'A', strategy: 'retry_backoff', paidRisk: 'uncertain', rounds: 3 },
   // Piloto #1209: devolución por pausa del usuario (sin gasto); la retoma el reanudar, no el auto-heal.
   { id: 'run_paused', codes: ['run_paused'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'unexpected_error', codes: ['unexpected_error'], class: 'A', strategy: 'retry_backoff', rounds: 3 },

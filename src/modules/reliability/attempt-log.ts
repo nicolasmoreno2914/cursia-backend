@@ -103,7 +103,7 @@ export function workerVersion(env: Record<string, string | undefined> = process.
 /** Desenlace del intento según el código del fallo. */
 export function outcomeForFailure(code: string): AttemptOutcome {
   if (code === 'lease_expired') return 'lease_expired';
-  if (code === 'worker_draining' || code === 'run_paused') return 'drained'; // devoluciones sin gasto (deploy / pausa)
+  if (code === 'worker_draining' || code === 'run_paused' || code === 'prior_call_in_flight') return 'drained'; // devoluciones sin gasto (deploy / pausa)
   return 'failed';
 }
 

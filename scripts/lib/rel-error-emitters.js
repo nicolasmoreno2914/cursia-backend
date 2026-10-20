@@ -172,6 +172,8 @@ const FN_CODES = {
   notReady: { codes: ['provider_not_ready'], mention: 'PROVIDER_NOT_READY' },
   reconciliationMessage: { codes: ['provider_reconciliation_required'], mention: 'PROVIDER_RECONCILIATION_REQUIRED' },
   drainHandbackMessage: { codes: ['worker_draining'], mention: 'WORKER_DRAINING' },
+  // r61 (Q-21): devolución sin gasto mientras la llamada del intento anterior (lease tomada) puede seguir en vuelo.
+  priorCallInFlightMessage: { codes: ['prior_call_in_flight'], mention: 'PRIOR_CALL_IN_FLIGHT' },
   runPausedHandbackMessage: { codes: ['run_paused'], mention: 'RUN_PAUSED_HANDBACK' },
   itemRecoveryBudgetMessage: { codes: ['item_recovery_budget_exhausted'], mention: 'ITEM_RECOVERY_BUDGET_EXHAUSTED' },
   pendingReviewMessage: { codes: ['llm_pending_review'], mention: 'LLM_PENDING_REVIEW' },

@@ -4,6 +4,7 @@ import { pauseRunForCap, reservePaidCall, RunBudgetCapReached, serverLlmChargeIn
 import type { CallRole } from '../../modules/finops/finops-ledger.service';
 import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
 import { LlmStreamError, LlmStreamResult, streamMessage } from './anthropic-stream';
+import { inFlightRemainingMs, PRIOR_CALL_IN_FLIGHT, priorCallInFlightMessage, retryAfterSecondsFor } from '../lease-takeover';
 
 /**
  * Loop 4 — `api()` del ejecutor cuando corre en el WORKER del backend (mismo contrato que `api()` de 04-api.js:
@@ -62,6 +63,19 @@ export interface ServerLlmDeps {
   };
   /** Agrega entradas al índice de guardados del item (merge ATÓMICO bajo lease: hay llamadas en paralelo). */
   recordCheckpoint(itemRunId: string, entries: Record<string, { path: string; at: string }>): Promise<boolean>;
+  /**
+   * r61 (Q-21): guardado TARDÍO de una respuesta pagada cuando este worker ya perdió la parte (recordCheckpoint
+   * rechazado). Solo agrega la clave `hash` si todavía no existe (nunca pisa nada del intento nuevo) y si el pedido
+   * salió (`sentAt`) dentro de la ventana vigente de la parte. Así el reclamante nuevo responde desde el guardado
+   * en vez de volver a pagar la misma llamada. Sin el campo: comportamiento anterior (el guardado se pierde).
+   */
+  recordLateCheckpoint?(itemRunId: string, hash: string, entry: { path: string; at: string; lateFromAttempt: number }, sentAt: string): Promise<boolean>;
+  /**
+   * r61 (Q-21): ventana (ms) en la que una llamada de OTRO intento con el mismo hash, reservada y sin liquidar, todavía
+   * puede estar en vuelo → no se reenvía; la parte se devuelve (`prior_call_in_flight`, retryAfter ≥ lo que falta).
+   * Sin el campo (o ≤ 0) no se mira (comportamiento anterior). El worker lo fija a totalMs + margen.
+   */
+  priorInFlightWindowMs?: number;
   apiKey: string;
   baseUrl: string;
   defaultModel: string;
@@ -80,7 +94,7 @@ export interface ServerLlmDeps {
 }
 
 /** Error con la forma que espera el ejecutor (04-api.js). */
-type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean; handBack?: 'lease_lost' | 'worker_draining' };
+type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean; handBack?: 'lease_lost' | 'worker_draining' | typeof PRIOR_CALL_IN_FLIGHT; retryAfterSeconds?: number };
 
 /** HTTP que NO prueba que Anthropic no procesó el pedido (timeout de gateway): se trata como resultado desconocido. */
 const LLM_HTTP_AMBIGUOUS_STATUSES: readonly number[] = [408, 504];
@@ -114,6 +128,27 @@ export async function countUnknownCalls(ds: DataSource, itemRunId: string, since
     [`reservation:llm:${itemRunId}:%`, tagLike, since.toISOString(), [...exclude]],
   );
   return r ? Number(r.n) : 0;
+}
+
+/**
+ * r61 (Q-21): la llamada `hash` de OTRO intento de la parte (clave `…:a<n>:` distinta de la propia), reservada y sin
+ * liquidar, todavía puede estar en vuelo. Devuelve los ms que faltan (0 = nada en vuelo). La edad se mide con el
+ * reloj de la DB (created_at de la reserva vs now()), así dos workers con relojes distintos ven la misma ventana.
+ */
+export async function priorAttemptInFlightMs(ds: DataSource, itemRunId: string, since: Date, callHash: string, ownAttempt: number, windowMs: number): Promise<number> {
+  const [r] = await ds.query(
+    `select coalesce(max(extract(epoch from (e.created_at + make_interval(secs => $5::double precision) - now())) * 1000), 0)::float8 as remaining_ms
+       from public.generation_cost_events e
+      where e.idempotency_key like $1 and e.event_kind = 'CHARGE' and (e.metadata->>'reservation') = 'true'
+        and (e.metadata->>'callTag') like $2 and e.created_at >= $3
+        and e.idempotency_key not like $4
+        and e.created_at > now() - make_interval(secs => $5::double precision)
+        and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`,
+    [`reservation:llm:${itemRunId}:%`, `${LLM_WORKER_CALL_TAG_PREFIX}-%-${callHash.slice(0, LLM_CALL_HASH_LEN)}-%`, since.toISOString(),
+      `reservation:llm:${itemRunId}:g%:a${ownAttempt}:%`, windowMs / 1000],
+  );
+  const ms = r ? Number(r.remaining_ms) : 0;
+  return Number.isFinite(ms) && ms > 0 ? Math.min(ms, windowMs) : 0;
 }
 
 /** null = se puede (re)intentar; si no, el motivo de dejar la parte en revisión. */
@@ -189,22 +224,37 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     const role = roleOf(extraHeaders);
 
     // ── Punto de guardado: la misma llamada ya respondida en esta ventana de la parte → sin costo ni generación. ──
-    const win = await itemWindowStart(deps.dataSource, item.itemRunId);
-    const cp = win.checkpoints[hash];
-    if (cp && new Date(cp.at) >= win.since) {
+    const fromCheckpoint = async (w: { since: Date; checkpoints: Record<string, { path: string; at: string }> }): Promise<string | null> => {
+      const cp = w.checkpoints[hash];
+      if (!cp || !(new Date(cp.at) >= w.since)) return null;
       const raw = await deps.checkpoints.get(cp.path).catch(() => null);
       let saved: { text: string; usage: Record<string, number>; stopReason: string | null } | null = null;
       try { saved = raw ? JSON.parse(raw) : null; } catch { saved = null; } // guardado ilegible = no hay guardado (M2)
-      if (saved && typeof saved.text === 'string' && saved.text) {
-        if (metaOut) { metaOut.stopReason = saved.stopReason; metaOut.usage = { ...saved.usage }; metaOut.fromCheckpoint = true; }
-        deps.logger.log(`[llm-worker] ${item.itemKey}: respuesta desde el punto de guardado (${hash.slice(0, 10)}) — sin costo`);
-        return saved.text;
-      }
-    }
+      if (!saved || typeof saved.text !== 'string' || !saved.text) return null;
+      if (metaOut) { metaOut.stopReason = saved.stopReason; metaOut.usage = { ...saved.usage }; metaOut.fromCheckpoint = true; }
+      deps.logger.log(`[llm-worker] ${item.itemKey}: respuesta desde el punto de guardado (${hash.slice(0, 10)}) — sin costo`);
+      return saved.text;
+    };
+    const win = await itemWindowStart(deps.dataSource, item.itemRunId);
+    const cached = await fromCheckpoint(win);
+    if (cached !== null) return cached;
 
     // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
     const promptChars = JSON.stringify(body).length;
     for (;;) {
+      // r61 (Q-21): la MISMA llamada de otro intento (lease tomada) puede seguir en vuelo → nunca se reenvía. Va ANTES de
+      // shouldStop (review I1): aun drenando, la parte se devuelve como prior_call_in_flight y la señal no se pierde. Con
+      // la ventana activa se relee el guardado justo antes de enviar aunque no haya nada en vuelo (review M1: el
+      // guardado tardío de A puede llegar entre la primera lectura y este punto, también en el `continue` del reintento).
+      if (deps.priorInFlightWindowMs && deps.priorInFlightWindowMs > 0) {
+        const left = await priorAttemptInFlightMs(deps.dataSource, item.itemRunId, win.since, hash, item.attempt, deps.priorInFlightWindowMs);
+        const again = await fromCheckpoint(await itemWindowStart(deps.dataSource, item.itemRunId));
+        if (again !== null) return again;
+        if (left > 0) {
+          deps.logger.warn(`[llm-worker] ${item.itemKey}: la llamada ${hash.slice(0, 10)} de un intento anterior sigue en vuelo — no se reenvía; la parte vuelve a la cola`);
+          throw { fatal: true, handBack: PRIOR_CALL_IN_FLIGHT, code: PRIOR_CALL_IN_FLIGHT, retryAfterSeconds: retryAfterSecondsFor(left), msg: priorCallInFlightMessage('la llamada a la IA', left) } as ApiError;
+        }
+      }
       const stop = deps.shouldStop ? deps.shouldStop() : null;
       if (stop) throw { fatal: true, handBack: stop, code: stop, msg: `${stop}: la parte vuelve a la cola antes de una llamada nueva` } as ApiError;
       const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
@@ -237,6 +287,7 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         throw { fatal: true, runPaused: true, status: 409, code: 'run_paused', msg: 'run_paused: Pausa automática: se alcanzó el presupuesto autorizado del run: ' + e.detail } as ApiError;
       }
       notUnknown.add(resKey);
+      const sentAt = new Date().toISOString();
       let r: LlmStreamResult;
       try {
         r = await streamMessage({ apiKey: deps.apiKey, baseUrl: deps.baseUrl, body, idleMs: deps.idleMs, totalMs: deps.totalMs, fetchImpl: deps.fetchImpl });
@@ -285,7 +336,13 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
           const path = `${item.ownerId}/dynamic/${item.artifactCourseId}/${item.manifestId}/llm-checkpoints/${item.itemRunId}/${hash}.json`;
           await deps.checkpoints.put(path, JSON.stringify({ text: r.text, usage: r.usage, stopReason: r.stopReason, messageId: r.messageId }));
           const entry = { path, at: new Date().toISOString() };
-          await deps.recordCheckpoint(item.itemRunId, { [hash]: entry });
+          const owned = await deps.recordCheckpoint(item.itemRunId, { [hash]: entry });
+          if (!owned && deps.recordLateCheckpoint) {
+            // r61 (Q-21): la parte ya no es de este worker (lease tomada a mitad de la llamada). La respuesta YA se
+            // pagó: se deja como guardado tardío (solo si esa clave no existe) para que el reclamante nuevo no la pague otra vez.
+            const late = await deps.recordLateCheckpoint(item.itemRunId, hash, { ...entry, lateFromAttempt: item.attempt }, sentAt);
+            deps.logger.warn(`[llm-worker] ${item.itemKey}: lease perdida con la llamada ${hash.slice(0, 10)} en vuelo — guardado tardío ${late ? 'registrado' : 'rechazado'}`);
+          }
           win.checkpoints[hash] = entry;
         } catch (err) {
           deps.logger.warn(`[llm-worker] ${item.itemKey}: no se pudo guardar el punto de guardado: ${err instanceof Error ? err.message : String(err)}`);

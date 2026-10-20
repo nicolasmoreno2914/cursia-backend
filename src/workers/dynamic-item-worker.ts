@@ -63,6 +63,7 @@ import {
   videogenChargeInput,
 } from './finops-worker-hooks';
 import { MOCK_VIDEO_DURATION_SEC, VideoDuration, parseMp4DurationSec, plausibleSeconds, resolveVideoDuration } from './video-duration';
+import { adoptLateExternalId, IN_FLIGHT_WINDOW_MS, inFlightRemainingMs, priorAttemptMayBeInFlight, priorCallInFlightMessage, retryAfterSecondsFor } from './lease-takeover';
 import {
   DRAIN_HANDBACK_RETRY_SECONDS,
   DrainSignal,
@@ -625,6 +626,16 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       // Calibración #2: si hubo reserva previa al envío, sigue contando el gasto hasta el terminal del render.
       if (typeof item.outputSummary?.externalReservationKey === 'string') videoResKey = item.outputSummary.externalReservationKey;
     } else if (item.outputSummary?.externalSubmitStartedAt) {
+      // r61 (Q-21): el envío del intento anterior todavía puede estar en vuelo (lease tomada) → no se decide aún: la
+      // parte vuelve a la cola sin consumir intento; si ese worker recibe el job lo registra (adoptLateExternalId).
+      const left = priorAttemptMayBeInFlight(item) ? inFlightRemainingMs(String(item.outputSummary.externalSubmitStartedAt), IN_FLIGHT_WINDOW_MS.videogen) : 0;
+      if (left > 0) {
+        await scheduler.failItem(item.itemRunId, deps.executorId, priorCallInFlightMessage('el envío a Videogen', left), true, undefined, {
+          retryAfterSeconds: retryAfterSecondsFor(left), grantAttempt: true,
+        });
+        logger.warn(`Item ${item.itemKey} (run ${item.runId}): el envío a Videogen del intento anterior puede seguir en vuelo — devuelto sin reenviar`);
+        return;
+      }
       // Crash entre el submit y el registro del id — decisión manual (R3).
       await scheduler.failItem(item.itemRunId, deps.executorId, 'ambiguous_video_submission', false);
       return;
@@ -759,8 +770,9 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         }
       }
 
+      const submitMarker = new Date().toISOString();
       const marked = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
-        externalSubmitStartedAt: new Date().toISOString(),
+        externalSubmitStartedAt: submitMarker,
         ...(resKey ? { externalReservationKey: resKey } : {}),
         // Motor pedagógico Fase 2: qué diseño recibió Videogen (cabecera de content_txt).
         ...(item.pedagogy && item.pedagogy.generator === 'video' ? { pedagogySha256: item.pedagogy.textSha256 } : {}),
@@ -818,6 +830,13 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         external: { videogenBatchId: batchId, videogenJobId: jobId, mode },
       });
       if (!recorded) {
+        // r61 (Q-21): el id se registra igual, cercado por el marcador de ESTE envío (nunca pisa un id ni un reenvío
+        // pedido por un humano): el próximo reclamante retoma por poll (gratis) y liquida esta reserva en el terminal.
+        const adopted = await adoptLateExternalId(deps.dataSource as any, item.itemRunId, submitMarker, 'videogenJobId', { videogenBatchId: batchId, videogenJobId: jobId, mode }).catch(() => false);
+        if (adopted) {
+          logger.warn(`Item ${item.itemKey}: lease perdida tras someter a Videogen (job ${jobId}) — id registrado tarde para el próximo reclamante`);
+          return;
+        }
         // R3: la lease se perdió justo después de someter — el video YA EXISTE
         // en Videogen bajo esta idempotencyKey, pero este ejecutor perdió la
         // propiedad del item. El próximo reclamante verá

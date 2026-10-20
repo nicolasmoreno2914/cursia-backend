@@ -206,6 +206,11 @@ export interface ClaimedItem {
   generation: number;
   dependsOn: string[];
   attempt: number;
+  /**
+   * r61 (Q-21): motivo con el que terminó el intento anterior (`lease_expired` = la lease se tomó, y una llamada
+   * pagada de ese intento puede seguir en vuelo). null/ausente en el primer intento.
+   */
+  previousError?: string | null;
   outputSummary: Record<string, any>;
   context: { courseContext: Record<string, any>; contextHash: string };
   blueprint: {
@@ -473,7 +478,7 @@ function sameJson(a: any, b: any): boolean {
  */
 export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   // Loop 4: puntos de guardado y revisión de las partes del worker de IA.
-  'llmCheckpoints', 'llmPendingReview',
+  'llmCheckpoints', 'llmPendingReview', 'llmCheckpointsResetAt',
   'sourceVideoItemRunId', 'cascadeFromItemRunId', 'regeneration', 'invalidation',
   'upgradeId', 'videoUpgrade', 'videoUpgradeHistory', 'reusedVideogenJob', 'questionsOnly',
   'mode', 'videoMode', 'videoModeOriginal', 'external', 'externalReservationKey', 'externalSubmitStartedAt',
@@ -782,7 +787,10 @@ export class SchedulerService {
       await openItemAttempt(qr, row, { executorKind: executorKindFor(row.type, ownerId !== undefined), executorId });
       await markRunRunning(qr, job.id);
       try {
-        return await this.buildClaimedItem(qr, job, row);
+        const built = await this.buildClaimedItem(qr, job, row);
+        // r61 (Q-21, M10): previousError solo para los workers del servidor (el ejecutor del navegador no lo usa).
+        if (ownerId !== undefined && ownerId !== null) delete built.previousError;
+        return built;
       } catch (err) {
         if (!(err instanceof ClaimPayloadUnavailable)) throw err;
         await applyItemFailure(qr, row.id, `claim_payload_unavailable: ${err.message}`.slice(0, MAX_ERROR_LENGTH), false, null, false, false, { source: 'scheduler' });
@@ -2394,6 +2402,7 @@ export async function assembleClaimedItem(a: {
     generation: row.generation,
     dependsOn: deps,
     attempt: row.attempt_count,
+    previousError: typeof row.error === 'string' ? row.error.slice(0, 200) : null,
     outputSummary: row.output_summary ?? {},
     context: { courseContext: ctx.context, contextHash: ctx.context_hash },
     blueprint: {

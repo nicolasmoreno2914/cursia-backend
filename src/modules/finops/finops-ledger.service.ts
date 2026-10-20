@@ -141,6 +141,8 @@ export interface ItemPaidCharge {
   measurement_status: string;
   reservation: boolean;
   settled: boolean;
+  /** r61 (Q-21): alta de la fila (para la ventana en vuelo de una reserva enviada y sin liquidar). */
+  created_at?: string | Date | null;
 }
 
 export interface RecordResult {
@@ -1439,7 +1441,7 @@ export class FinopsLedgerService {
   async itemPaidCharges(itemRunId: string): Promise<ItemPaidCharge[]> {
     if (typeof itemRunId !== 'string' || !UUID_RE.test(itemRunId)) throw new FinopsError('INVALID_INPUT', 'itemRunId debe ser UUID');
     const rows = await this.dataSource.query(
-      `select e.idempotency_key, e.attempt, e.provider, e.external_operation_id, e.measurement_status,
+      `select e.idempotency_key, e.attempt, e.provider, e.external_operation_id, e.measurement_status, e.created_at,
               coalesce((e.metadata->>'reservation') = 'true', false) as reservation,
               exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id) as settled
          from public.generation_cost_events e

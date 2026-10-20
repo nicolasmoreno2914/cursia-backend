@@ -22,7 +22,7 @@ ok(D({ ok: false, retryable: true, draft, keepCheckpoints: 'true' }) === true, '
 ok(D(null) === true && D(undefined) === true, 'sin resultado → se descartan');
 // El worker usa el helper (no un borrado incondicional).
 const src = fs.readFileSync(path.join(REPO, 'src/workers/dynamic-llm-worker.ts'), 'utf8');
-ok(/if \(!draftSaved \|\| discardCheckpointsOnFailure\(result\)\) \{\s*await deps\.scheduler\.recordItemExternal\(item\.itemRunId, deps\.executorId, \{ llmCheckpoints: \{\} \}\)/.test(src), 'processLlmItem conserva los puntos de guardado solo con keepCheckpoints Y borrador subido (rev. I3)');
+ok(/if \(!draftSaved \|\| discardCheckpointsOnFailure\(result\)\) \{\s*await deps\.scheduler\.recordItemExternal\(item\.itemRunId, deps\.executorId, \{ llmCheckpoints: \{\}, llmCheckpointsResetAt: new Date\(\)\.toISOString\(\) \}\)/.test(src), 'processLlmItem conserva los puntos de guardado solo con keepCheckpoints Y borrador subido (rev. I3)');
 ok(src.indexOf('const draftSaved') > src.indexOf('opts[draftField] = await uploadArtifact'), 'la decisión se toma DESPUÉS de subir el borrador');
 // El ejecutor vendorizado declara la razón bank_rule y marca keepCheckpoints solo con ella.
 const ex = fs.readFileSync(path.join(REPO, 'vendor/dynamic-executor/45-dynamic-generation-executor.js'), 'utf8');
