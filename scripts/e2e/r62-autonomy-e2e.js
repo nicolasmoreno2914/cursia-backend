@@ -169,7 +169,7 @@ const SCENARIOS = [
   },
   {
     id: 'videogen_queued_cancel', what: 'Videogen: el primer job queda ENCOLADO para siempre; el cancel lo saca de la cola (failed, sin procesar)',
-    capMs: 45 * 60_000,
+    capMs: 50 * 60_000,
     setup(ctx) { videogenStuck(ctx, 'queued'); },
     verify: (ctx) => ({ stuckJob: ctx.S.vg && ctx.S.vg.job, cancelCalls: ctx.S.vg && ctx.S.vg.cancels, cancelledWhileQueued: !!(ctx.S.vg && ctx.S.vg.cancelledQueued) }),
   },
@@ -784,7 +784,9 @@ async function runScenario(S, sc) {
       let act = false;
       if (!w.pending) { stallSince = stallSince || Date.now(); if (Date.now() - stallSince > STALL_MS) act = `estancado: ${w.why}`; } else stallSince = null;
       if (!act && elapsed > CAP + rounds * 8 * 60_000) { act = `tope de tiempo (${Math.round(elapsed / 60000)} min) sin terminar: ${w.why}`; capHit = true; }
-      if (!act && quietMs > 10 * 60_000) act = `10 min sin ningún cambio: ${w.why}`;
+      // Con una cancelación de Videogen en confirmación (dos lecturas ≥ 10 min, N2) el silencio es esperado: 35 min.
+      const quietCap = snap.items.some((i) => ((i.outputSummary || {}).providerReconcile || {}).cancelRequestedAt) ? 35 * 60_000 : 10 * 60_000;
+      if (!act && quietMs > quietCap) act = `${Math.round(quietCap / 60000)} min sin ningún cambio: ${w.why}`;
       if (act) {
         if (rounds >= MAX_INTERVENTION_ROUNDS) { res.notes.push(`se abandona tras ${rounds} rondas de intervención: ${act}`); break; }
         rounds++;
