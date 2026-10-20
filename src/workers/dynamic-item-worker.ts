@@ -880,12 +880,13 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
       if (leaseLost) return;
       // R16 (#1): el job ya está persistido → re-pollearlo desde otro worker es gratis.
       if (await handBackIfDraining(deps, item, `mientras esperaba el render del job ${jobId} (se retoma sin reenviar)`)) return;
-      if (Date.now() - pollSince >= renderCapMs) {
-        await overdue();
-        return;
-      }
       if (Date.now() - startedAt > timeoutMs) {
         // R16 (#16): re-pollear un job persistido es gratis → dentro del tope de render no consume intentos.
+        // r62 (N2): pasado el tope (con el último estado leído no terminal) → vencido visible.
+        if (Date.now() - pollSince >= renderCapMs) {
+          await overdue();
+          return;
+        }
         await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true, undefined, { grantAttempt: true });
         return;
       }
@@ -897,7 +898,18 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         if (err instanceof LeaseLostError) return;
         throw err;
       }
-      lastStatus = String(status.status ?? '') || lastStatus;
+      // r62 (N2, review m3): el último estado viaja a los re-claims (mensaje del vencimiento).
+      const polled = String(status.status ?? '');
+      if (polled && polled !== lastStatus) {
+        lastStatus = polled;
+        await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { videogenLastStatus: polled }).catch(() => false);
+      }
+      // r62 (N2, review I2): el tope se aplica DESPUÉS de consultar: un job que terminó (bien o mal) se procesa aunque
+      // el tope ya haya pasado; solo vence con un estado no terminal.
+      if (!isDynamicVideoCompleted(status.status) && !isJobFailed(status.status) && Date.now() - pollSince >= renderCapMs) {
+        await overdue();
+        return;
+      }
 
       if (isDynamicVideoCompleted(status.status)) {
         let cost: number | null = null;

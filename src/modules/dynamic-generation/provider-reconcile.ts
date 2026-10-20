@@ -19,7 +19,7 @@
 // retryItem (bajo lock), la completitud del run y el clasificador (qué hace HOY el sistema).
 // ─────────────────────────────────────────────────────────────────────────────
 import { AutoHealPolicy, autoHealMaxRoundsFor, autoHealPolicyFromEnv, autoHealRoundsOf } from './auto-heal';
-import { VIDEOGEN_RENDER_OVERDUE, videogenMaxRenderMs } from './videogen-render-cap';
+import { PROVIDER_STUCK_NO_CANCEL, VIDEOGEN_RENDER_OVERDUE, videogenMaxRenderMs } from './videogen-render-cap';
 
 /** Clave del estado en output_summary. */
 export const PROVIDER_RECONCILE_KEY = 'providerReconcile';
@@ -212,6 +212,12 @@ export function providerReconcileDecision(
   now: Date,
   policy: AutoHealPolicy = autoHealPolicyFromEnv(process.env),
   run?: { id?: string | null; created_at?: Date | string | null } | null,
+  /**
+   * Review overdue I2: vigilancia gratis de un job declinado `provider_stuck_no_cancel` (el barrido sigue consultando su
+   * estado: si termina `completed` se entrega solo). Solo el barrido y su retryItem la piden; la completitud no (la
+   * excepción sigue visible mientras tanto).
+   */
+  opts?: { watch?: boolean },
 ): ProviderReconcileDecision {
   if (row.status !== 'failed') return { heal: false, reason: 'not_failed' };
   if (run && !providerReconcileRunEligible(run)) return { heal: false, reason: 'run_excluded' };
@@ -220,7 +226,8 @@ export function providerReconcileDecision(
   if (!kind) return { heal: false, reason: 'not_applicable' };
   const st = providerReconcileStateOf(os);
   // La excepción registrada vale para ESE error (un error nuevo la reemplaza: ver declinedError).
-  if (st.declined && String(st.declinedError ?? '') === String(row.error ?? '')) return { heal: false, reason: 'declined', kind };
+  const watching = !!opts?.watch && st.declined === PROVIDER_STUCK_NO_CANCEL;
+  if (st.declined && String(st.declinedError ?? '') === String(row.error ?? '') && !watching) return { heal: false, reason: 'declined', kind };
   const { rounds, ambiguousRounds } = providerReconcileRoundsOf(os);
   if (rounds >= PROVIDER_RECONCILE_MAX_RESUBMITS) return { heal: false, reason: 'cap_reached', kind };
   const ambiguousAllowed = ambiguousRounds < PROVIDER_RECONCILE_MAX_AMBIGUOUS_RESUBMITS;

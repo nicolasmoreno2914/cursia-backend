@@ -155,7 +155,8 @@ function startFakes() {
         const j = vg.jobs.get(m[1]);
         if (!j) return json(rs, 404, { error: 'not found' });
         const st = j.statuses.length > 1 ? j.statuses.shift() : j.statuses[0];
-        return json(rs, 200, { job_id: m[1], status: st, error: /fail/.test(st) ? j.error : null, download_url: 'http://127.0.0.1:1/fake.mp4', progress: 100, duration_seconds: 468 });
+        return json(rs, 200, { job_id: m[1], status: st, error: /fail/.test(st) ? j.error : null, download_url: 'http://127.0.0.1:1/fake.mp4',
+          progress: j.progress ?? (/completed/.test(st) ? 100 : 0), current_step: j.currentStep ?? null, duration_seconds: 468, scenes: j.scenes ?? null });
       }
       if (rq.method === 'POST' && (m = p.match(/^\/api\/videos\/([^/]+)\/cancel$/))) {
         vg.cancels = (vg.cancels || 0) + 1;
@@ -163,15 +164,19 @@ function startFakes() {
         const cur = j ? (j.statuses.length > 1 ? j.statuses[0] : j.statuses[0]) : null;
         if (!j || !['queued', 'processing'].includes(cur)) return json(rs, 400, { success: false, error: 'job_not_active' });
         // Igual que Videogen: un job encolado sale de la cola y queda failed (un job procesando seguiría vivo).
-        if (cur === 'queued') Object.assign(j, { statuses: ['failed'], error: 'Cancelado por el usuario', cost: 0, breakdown: { script: 0, images: 0, tts: 0 } });
+        if (cur === 'queued') Object.assign(j, { statuses: ['failed'], error: 'Cancelado por el usuario' });
+        // Carrera real de Videogen: el procesador tomó el job justo antes del cancel → queda `failed` en la DB pero sigue
+        // trabajando (escribe current_step y suma uso).
+        if (j.raceOnCancel) Object.assign(j, { currentStep: 'generating_images_and_audio', progress: 40, cost: 0.37, usageLogs: 5, breakdown: { script: 0.37 } });
         return json(rs, 200, { success: true, job_id: m[1] });
       }
       if (rq.method === 'GET' && (m = p.match(/^\/api\/costs\/videos\/([^/]+)$/))) {
         vg.costCalls++;
         const j = vg.jobs.get(m[1]);
         if (!j || j.cost === 'error') return json(rs, 503, { error: 'cost service unavailable' });
-        if (vg.onCost) { const h = vg.onCost; vg.onCost = null; return Promise.resolve(h(m[1])).then(() => json(rs, 200, { job_id: m[1], estimated_total_cost: j.cost, breakdown: j.breakdown })); }
-        return json(rs, 200, { job_id: m[1], estimated_total_cost: j.cost, breakdown: j.breakdown });
+        const body = () => ({ job_id: m[1], estimated_total_cost: j.cost, breakdown: j.breakdown, usage_logs: Array.from({ length: j.usageLogs ?? 0 }, (_, i) => ({ i })), scenes_count: j.scenes ? j.scenes.length : null });
+        if (vg.onCost) { const h = vg.onCost; vg.onCost = null; return Promise.resolve(h(m[1])).then(() => json(rs, 200, body())); }
+        return json(rs, 200, body());
       }
       if (rq.method === 'GET' && (m = p.match(/^\/gamma\/generations\/([^/]+)$/))) {
         gm.getCalls++;
@@ -516,7 +521,8 @@ async function dbChecks() {
     // Tope corto para la prueba: DYNAMIC_VIDEOGEN_MAX_RENDER_MS = 60 s; el job lleva 2 min en espera (videoPollSince).
     const CAP_MS = 60_000;
     const overdueFail = async (C, jobId, statuses) => {
-      fakes.vg.plan.push({ kind: 'ok', jobId, statuses: ['queued'], cost: 0.6, breakdown: { script: 0.4, images: 0.2 } });
+      // Un job que todavía no empezó no tiene costo ni uso (así lo informa Videogen: costo en vivo desde api_usage_logs).
+      fakes.vg.plan.push({ kind: 'ok', jobId, statuses: ['queued'], cost: 0, breakdown: { script: 0, images: 0, tts: 0 } });
       const s0 = await runVideo(C); // primer claim: envía y re-pollea gratis dentro del tope (video_timeout con grantAttempt)
       assert(s0.st.failed.some((f) => f.msg === 'video_timeout' && f.retryable), `dentro del tope: video_timeout gratis ${JSON.stringify(s0.st.failed)}`);
       fakes.vg.jobs.get(jobId).statuses = statuses;
@@ -571,13 +577,15 @@ async function dbChecks() {
       await ledgerWithinAuthorized(V2q.runId);
     });
     const V2f = await makeCourse('r62 job vencido que falla');
-    await check('[V2] job vencido que Videogen termina `failed` → conciliado con su costo (charged_partial) y UN reenvío (no ambiguo)', async () => {
-      await overdueFail(V2f, 'vg-stuck-f', ['failed']);
-      fakes.vg.jobs.get('vg-stuck-f').error = 'render: ffmpeg crashed';
-      const r = await sweepAt(5);
+    await check('[V2] job PROCESANDO declinado (provider_stuck_no_cancel) que después Videogen termina `failed` solo (sin cancel de Cursia) → la vigilancia lo concilia con su costo (charged_partial) y hace UN reenvío (no ambiguo)', async () => {
+      await overdueFail(V2f, 'vg-stuck-f', ['processing']);
+      const r0 = await sweepAt(5);
+      eq(r0.declined.filter((x) => x.runId === V2f.runId).map((x) => x.reason), ['provider_stuck_no_cancel'], JSON.stringify(r0));
+      Object.assign(fakes.vg.jobs.get('vg-stuck-f'), { statuses: ['failed'], error: 'render: ffmpeg crashed', cost: 0.6, breakdown: { script: 0.4, images: 0.2 } });
+      const r = await sweepAt(3600);
       eq(r.resubmitted.filter((x) => x.runId === V2f.runId).map((x) => [x.kind, x.settlement, x.ambiguous]), [['videogen_overdue', 'charged_partial', false]], JSON.stringify(r));
       const row = await latest(V2f.runId, `video:${V2f.c1}`);
-      eq([row.status, row.output_summary.providerReconcile.ambiguousRounds, row.output_summary.autoHeal.rounds], ['pending', 0, 0], 'reabierto');
+      eq([row.status, row.output_summary.providerReconcile.ambiguousRounds, row.output_summary.providerReconcile.declined, row.output_summary.autoHeal.rounds], ['pending', 0, undefined, 0], 'reabierto (la excepción se cierra sola)');
       await ledgerWithinAuthorized(V2f.runId);
     });
     const V2c = await makeCourse('r62 lookup caído');
@@ -594,6 +602,61 @@ async function dbChecks() {
         eq(fakes.vg.submits - sub0, 0, 'sin reenvío');
         eq((await latest(V2c.runId, v2ckey)).attention, 'duplicate_charge', 'attention_reason');
       } finally { fakes.vg.statusDown = false; }
+    });
+    const V2r = await makeCourse('r62 carrera cancel');
+    const v2rkey = `video:${V2r.c1}`;
+    await check('[V2] review overdue I1 — carrera: Videogen toma el job justo ANTES del cancel (queda failed pero sigue trabajando) → la lectura posterior difiere de la foto S0 → provider_stuck_no_cancel; nunca un reenvío ni un job nuevo, ni siquiera vigilando después', async () => {
+      await overdueFail(V2r, 'vg-race-c', ['queued']);
+      fakes.vg.jobs.get('vg-race-c').raceOnCancel = true;
+      const sub0 = fakes.vg.submits; const n0 = (await events(V2r.runId)).length;
+      // m1: mientras la conciliación todavía decide, el reenvío manual del admin no se acepta.
+      let e = null; try { await runs.retryItem(V2r.cid, OWNER, 1, V2r.runId, v2rkey, true, false, undefined, { email: 'admin@cursia.test' }); } catch (x) { e = x; }
+      assert(e && /resubmitVideo solo aplica/.test(e.message), `m1: resubmit de admin rechazado sin excepción registrada: ${e && e.message}`);
+      await sweepAt(5); // foto S0 + cancel
+      const st0 = (await latest(V2r.runId, v2rkey)).output_summary.providerReconcile;
+      eq([st0.cancelSnapshot.currentStep, st0.cancelSnapshot.cost, st0.cancelSnapshot.usageLogs], [null, 0, 0], 'foto S0 tomada antes del cancel');
+      const r = await sweepAt(5 + PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 30);
+      eq(r.declined.filter((x) => x.runId === V2r.runId).map((x) => x.reason), ['provider_stuck_no_cancel'], JSON.stringify(r));
+      for (const t of [3600, 7200]) {
+        const rw = await sweepAt(t);
+        eq(rw.resubmitted.filter((x) => x.runId === V2r.runId).length, 0, `vigilando a +${t}s: sin reenvío (un failed tras un cancel no prueba nada)`);
+      }
+      eq([fakes.vg.submits - sub0, (await events(V2r.runId)).length - n0], [0, 0], '0 jobs nuevos, 0 ajustes');
+      const view = L('modules/dynamic-generation/item-recovery-view.js').recoveryViewOf(await latest(V2r.runId, v2rkey));
+      eq([view.attentionReason, view.exceptionReason], ['duplicate_charge', 'provider_stuck_no_cancel'], 'm2: la vista muestra el motivo exacto');
+    });
+    const V2l = await makeCourse('r62 job tarde');
+    const v2lkey = `video:${V2l.c1}`;
+    await check('[V2] review overdue I2 — job PROCESANDO declinado (provider_stuck_no_cancel) que termina `completed` tarde → el barrido sigue vigilando gratis, lo re-pollea y el worker lo entrega (0 jobs nuevos, video ya pagado)', async () => {
+      await overdueFail(V2l, 'vg-late', ['processing']);
+      const r1 = await sweepAt(5);
+      eq(r1.declined.filter((x) => x.runId === V2l.runId).map((x) => x.reason), ['provider_stuck_no_cancel'], JSON.stringify(r1));
+      const r2 = await sweepAt(600);
+      eq([r2.resubmitted.filter((x) => x.runId === V2l.runId).length, r2.repolled.filter((x) => x.runId === V2l.runId).length], [0, 0], 'sigue procesando: solo vigila');
+      fakes.vg.jobs.get('vg-late').statuses = ['completed_local'];
+      fakes.vg.jobs.get('vg-late').cost = 0.97;
+      const r3 = await sweepAt(3600);
+      eq(r3.repolled.filter((x) => x.runId === V2l.runId).map((x) => x.kind), ['videogen_overdue'], JSON.stringify(r3));
+      const sub0 = fakes.vg.submits;
+      const s = await runVideo(V2l); // pasado el tope, pero consulta ANTES de vencer: completed → entrega
+      eq([s.st.completed.length, s.st.failed.length, fakes.vg.submits - sub0], [1, 0, 0], `entregado sin reenviar ${JSON.stringify(s.st.failed)} ${workerLog.errors.slice(-2).join(' | ')}`);
+      eq((await latest(V2l.runId, v2lkey)).status, 'completed', 'video completo');
+      await ledgerWithinAuthorized(V2l.runId);
+    });
+    await check('[V2] review overdue I2/m3 — el worker consulta ANTES de aplicar el tope: un job terminado pasado el tope se entrega; uno vivo vence con su último estado en el mensaje (videogenLastStatus persistido)', async () => {
+      const C = await makeCourse('r62 worker tope');
+      fakes.vg.plan.push({ kind: 'ok', jobId: 'vg-cap-w', statuses: ['processing'] });
+      await runVideo(C);
+      const row = await latest(C.runId, `video:${C.c1}`);
+      eq(row.output_summary.videogenLastStatus, 'processing', 'último estado persistido');
+      await ds.query(`update public.generation_item_runs set status = 'pending', output_summary = output_summary || jsonb_build_object('videoPollSince', $2::text) where id = $1`,
+        [row.id, new Date(Date.now() - 2 * CAP_MS).toISOString()]);
+      const s1 = await runVideo(C);
+      assert(s1.st.failed.length === 1 && /^videogen_render_overdue: .* sigue processing/.test(s1.st.failed[0].msg), `vence con el estado: ${JSON.stringify(s1.st.failed)}`);
+      fakes.vg.jobs.get('vg-cap-w').statuses = ['completed_local'];
+      await ds.query(`update public.generation_item_runs set status = 'pending', error = null where id = $1`, [row.id]);
+      const s2 = await runVideo(C);
+      eq([s2.st.completed.length, s2.st.failed.length], [1, 0], `terminado pasado el tope → se entrega ${JSON.stringify(s2.st.failed)}`);
     });
     delete process.env.DYNAMIC_VIDEOGEN_MAX_RENDER_MS;
 
@@ -905,7 +968,7 @@ async function dbChecks() {
     });
 
     await check('[L] en todos los runs: ledger ≤ autorizado; ningún ajuste de admin; todo ajuste automático lleva decidedBy=system', async () => {
-      for (const C of [V1, V2, V2q, V2f, V2c, G, G3, A1, A2, D]) {
+      for (const C of [V1, V2, V2q, V2f, V2c, V2r, V2l, G, G3, A1, A2, D]) {
         await ledgerWithinAuthorized(C.runId);
         await noAdminAdjustments(C.runId);
         for (const e of (await events(C.runId)).filter((x) => x.recorded_by === 'system_provider_reconcile')) eq(e.metadata.decidedBy, 'system', 'decidedBy');

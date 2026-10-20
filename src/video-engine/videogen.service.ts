@@ -23,6 +23,12 @@ export interface VideogenBatchJob {
    * status (campo opcional; los consumidores legacy lo ignoran). null/ausente = desconocida.
    */
   duration_seconds?: number | null;
+  /**
+   * r62 (N2): etapa actual (`current_step`) y cantidad de escenas que informa el status. Solo los usa la conciliación
+   * V2 (foto S0 al cancelar); los consumidores legacy los ignoran. null/ausente = no informado.
+   */
+  current_step?: string | null;
+  scenes_count?: number | null;
 }
 
 export interface VideogenBatchResult {
@@ -40,6 +46,9 @@ export interface VideogenCostBreakdown {
   job_id: string;
   estimated_total_cost: number;
   breakdown: Record<string, number> | null;
+  /** r62 (N2): cantidad de registros de uso (`usage_logs[]`) y escenas del job, si Videogen los informa (foto S0). */
+  usage_logs_count?: number | null;
+  scenes_count?: number | null;
 }
 
 const COMPLETED_STATUSES = new Set(['completed', 'done', 'success', 'finished']);
@@ -132,6 +141,8 @@ export class VideogenService {
       error: j.error ?? j.error_message ?? null,
       progress: j.progress != null ? Number(j.progress) : null,
       duration_seconds: videogenDurationSeconds(j),
+      current_step: typeof j.current_step === 'string' && j.current_step ? j.current_step : null,
+      scenes_count: Array.isArray(j.scenes) ? j.scenes.length : j.scenes_count != null && Number.isFinite(Number(j.scenes_count)) ? Number(j.scenes_count) : null,
     }));
   }
 
@@ -290,6 +301,10 @@ export class VideogenService {
       throw new Error(`Videogen cost lookup returned invalid estimated_total_cost for job ${jobId}`);
     }
 
-    return { job_id: jobId, estimated_total_cost: totalCost, breakdown: parsed.breakdown ?? null };
+    return {
+      job_id: jobId, estimated_total_cost: totalCost, breakdown: parsed.breakdown ?? null,
+      usage_logs_count: Array.isArray(parsed.usage_logs) ? parsed.usage_logs.length : null,
+      scenes_count: parsed.scenes_count != null && Number.isFinite(Number(parsed.scenes_count)) ? Number(parsed.scenes_count) : null,
+    };
   }
 }
