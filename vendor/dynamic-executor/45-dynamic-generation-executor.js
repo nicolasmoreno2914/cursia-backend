@@ -3591,11 +3591,17 @@ function _dynAssertSceneAnchored(d, checkpoints, scenes) {
     if (i > 0 && c.atSec - checkpoints[i - 1].atSec < C.minGapSec) throw _dynVideoPlanError('VIDEO_PLAN_INVARIANT', 'checkpoints ' + i + ' y ' + (i + 1) + ' a menos de ' + C.minGapSec + ' s');
   });
 }
-// Escenas que cubre un checkpoint (terminan después del inicio de su segmento y empiezan ≥ ε antes de atSec:
-// la escena que arranca en el mismo segundo del anclaje no cuenta); espejo de scenesForCheckpoint.
+// Escenas que cubre un checkpoint: las que TERMINAN (⌈fin⌉) en su segmento (inicio, atSec] — partición exacta,
+// también las de < 1 s (review M-2); espejo de scenesForCheckpoint.
 function dynScenesForCheckpoint(checkpoint, scenes) {
   var s0 = Array.isArray(checkpoint.segment) ? checkpoint.segment[0] : checkpoint.segmentStart;
-  return (scenes || []).filter(function (s) { return s.endSec > s0 + 0.5 && s.startSec + DYN_VIDEO_SCENE_RULES.anchorEpsilonSec <= checkpoint.atSec; });
+  return (scenes || []).filter(function (s) { var e = Math.ceil(s.endSec - 1e-6); return e > s0 && e <= checkpoint.atSec; });
+}
+// Review M-1: tiempos re-escalados por d/Σ (d = segundos enteros medidos) a la línea de tiempo del MP4; espejo de scaleVideoScenes.
+function dynScaleVideoScenes(durationSec, scenes) {
+  var f = durationSec / scenes[scenes.length - 1].endSec;
+  var at = function (x) { return Math.round(x * f * 1000) / 1000; };
+  return scenes.map(function (s) { return { order: s.order, startSec: at(s.startSec), endSec: at(s.endSec), narration: s.narration }; });
 }
 function dynPlanVideoCheckpoints(durationSec, scenes) {
   var even = dynPlanInteractionCheckpoints(durationSec);
@@ -3607,7 +3613,8 @@ function dynPlanVideoCheckpoints(durationSec, scenes) {
   var lo = C.noInteractionFirstSec;
   var hi = d - C.noInteractionLastSec;
   var cand = [];
-  scenes.forEach(function (s) {
+  var sc = dynScaleVideoScenes(d, scenes); // d = floor(duración), como el servidor
+  sc.forEach(function (s) {
     var b = Math.ceil(s.endSec - 1e-6);
     if (b >= lo && b <= hi && (!cand.length || b > cand[cand.length - 1])) cand.push(b);
   });
@@ -3639,8 +3646,8 @@ function dynPlanVideoCheckpoints(durationSec, scenes) {
   var picks = new Array(n);
   for (var q = n - 1, jj = end; q >= 0; q--) { picks[q] = cand[jj]; jj = par[q][jj]; }
   var out = picks.map(function (atSec, x) { return { index: x + 1, atSec: atSec, segment: [x === 0 ? 0 : picks[x - 1], atSec] }; });
-  _dynAssertSceneAnchored(d, out, scenes);
-  return { checkpoints: out, timelineSource: 'videogen_scenes' };
+  _dynAssertSceneAnchored(d, out, sc);
+  return { checkpoints: out, timelineSource: 'videogen_scenes', scenes: sc };
 }
 
 // EV6 IV avanzado — espejo de planReflectionPauses (backend interactive-video/plan.ts). Puro.
@@ -4848,7 +4855,8 @@ async function _dynRunVideoInteractions(item) {
   // #542 (I1): reglas anti-patrón de respuesta + valor sembrado del primer V/F.
   var biasOpts = { tfFirst: dynTfFirstTrue(item.itemKey), pedagogy: dynPedagogyBlock(item) };
   // r61 Q-04: con escenas, el prompt muestra el guion real del video por tramos (sin escenas: prompt de siempre).
-  if (anchored) biasOpts.videoScenes = claimScenes;
+  // (escenas re-escaladas a la duración medida: las mismas con las que se ancló el plan.)
+  if (anchored) biasOpts.videoScenes = vplan.scenes;
   var prompt = v2 ? dynVideoInteractionsPrompt(md.text, claimCheckpoints, reflPlan.reflections, biasOpts) : dynVideoInteractionsPrompt(md.text, claimCheckpoints, undefined, biasOpts);
   var recs = {};
   var res = await _dynV3JsonWithRetry(item, dynVideoInteractionsSys(), prompt, 4000, function (obj, attempt) {

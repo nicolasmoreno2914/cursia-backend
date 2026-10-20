@@ -1166,12 +1166,15 @@ var DYN_VIDEO_REFLECTION_LIMITS = { promptMax: 200, hintMax: 200 };
 // video por tramos y cada pregunta evalúa lo que la NARRACIÓN ya dijo en su tramo. Sin escenas: el prompt
 // de siempre, byte a byte.
 function _dynVideoSec(x) { return Math.round(x); }
+// Review M-4: la narración de Videogen no puede cerrar ni abrir los bloques del prompt (<<<X / X>>>).
+function _dynNeutralizePromptFence(t) { return String(t || '').replace(/<{3,}/g, '«').replace(/>{3,}/g, '»'); }
 function _dynVideoScenesHead(contentMd, cps, scenes) {
   var script = scenes.map(function (s) {
-    return 'Escena ' + s.order + ' [' + _dynVideoSec(s.startSec) + '–' + _dynVideoSec(s.endSec) + ' s]: ' + s.narration;
+    return 'Escena ' + s.order + ' [' + _dynVideoSec(s.startSec) + '–' + _dynVideoSec(s.endSec) + ' s]: ' + _dynNeutralizePromptFence(s.narration);
   }).join('\n');
   var cpLines = cps.map(function (c) {
-    var cov = scenes.filter(function (s) { return s.endSec > c.segmentStart + 0.5 && s.startSec + 1 <= c.atSec; });
+    // Misma partición que dynScenesForCheckpoint (escenas que TERMINAN en el tramo).
+    var cov = scenes.filter(function (s) { var e = Math.ceil(s.endSec - 1e-6); return e > c.segmentStart && e <= c.atSec; });
     var lastSc = cov.length ? cov[cov.length - 1] : null;
     var orders = cov.map(function (s) { return s.order; });
     var range = orders.length > 1 ? 'escenas ' + orders[0] + ' a ' + orders[orders.length - 1] : 'escena ' + (orders[0] !== undefined ? orders[0] : '?');

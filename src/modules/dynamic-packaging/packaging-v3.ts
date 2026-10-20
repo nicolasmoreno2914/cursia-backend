@@ -76,7 +76,7 @@ import {
   assessmentPackageSummary,
   assessmentPackageWarnings,
 } from '../../package/dynamic-mbz-builder-v3';
-import { h5pProfileVersion } from '../../package/h5p';
+import { h5pProfileVersion, planVideoCheckpoints } from '../../package/h5p';
 import { resolveAssessment } from '../../package/assessment';
 import { syntheticCoverPng, syntheticMp3, syntheticPdf } from '../../package/v3/synthetic-media';
 import { themeMismatch, validatePresentationArtifact } from '../../package/presentation';
@@ -797,9 +797,23 @@ export async function loadContentsV3(
     if (!Number.isFinite(dur) || dur <= 0) {
       throw new PackagingNotReadyError([`${ch.keys.video}:VIDEO_DURATION_MISSING`], `VIDEO_DURATION_MISSING: ${ch.keys.video} no tiene la duración medida del video.`);
     }
-    // r61 Q-04: escenas de Videogen guardadas con el video (mismo dato que leyó el claim de
-    // video_interactions desde el output_summary del item) → el plan se re-deriva igual.
-    return { youtubeId: check.videoId, durationSec: dur, ...(Array.isArray(data.videoScenes) ? { videoScenes: data.videoScenes } : {}) };
+    // r61 Q-04 (review M-6): las preguntas se colocan con el plan con el que se VALIDARON (v3Validation.timelineSource
+    // del item video_interactions), nunca con uno re-derivado distinto. Validadas ancladas → las escenas del video
+    // deben dar ese mismo plan anclado (si no, falla a la vista: regenerar las preguntas); validadas equidistantes
+    // (o antes de r61) → plan equidistante aunque el video traiga escenas.
+    const validatedSource = ch.keys.videoInteractions ? byItem.get(ch.keys.videoInteractions as string)?.outputSummary?.v3Validation?.timelineSource : undefined;
+    if (validatedSource === 'videogen_scenes') {
+      let ok = false;
+      try { ok = planVideoCheckpoints(dur, Array.isArray(data.videoScenes) ? data.videoScenes : null).timelineSource === 'videogen_scenes'; } catch { ok = false; }
+      if (!ok) {
+        throw new PackagingNotReadyError(
+          [`${ch.keys.videoInteractions}:VIDEO_TIMELINE_MISMATCH`],
+          `VIDEO_TIMELINE_MISMATCH: las preguntas de ${ch.keys.videoInteractions} se validaron ancladas a las escenas del video, pero ${ch.keys.video} ya no da ese plan; regenera las preguntas del video (no se mueven en silencio).`,
+        );
+      }
+      return { youtubeId: check.videoId, durationSec: dur, videoScenes: data.videoScenes };
+    }
+    return { youtubeId: check.videoId, durationSec: dur };
   };
 
   // Tareas en el MISMO orden que el loop secuencial de antes.

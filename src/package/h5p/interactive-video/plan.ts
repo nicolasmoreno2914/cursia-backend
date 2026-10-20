@@ -234,6 +234,20 @@ export interface VideoCheckpointPlan {
   timelineSource: VideoTimelineSource;
   /** Solo con even_spacing: por qué no se usaron las escenas. */
   timelineReason?: string;
+  /** Solo con videogen_scenes: las escenas re-escaladas a la duración medida (las que usa el plan y el prompt). */
+  scenes?: VideoScene[];
+}
+
+/**
+ * Review M-1: el MP4 real deriva respecto de Σ escenas (cada clip `-t` se redondea a frames y el AAC agrega
+ * relleno). Se re-escalan los tiempos por d/Σ (d = duración medida en segundos enteros) para que el fin de cada escena
+ * caiga donde termina en el video publicado. 3 decimales, misma aritmética en el espejo del navegador.
+ */
+export function scaleVideoScenes(durationSec: number, scenes: VideoScene[]): VideoScene[] {
+  const total = scenes[scenes.length - 1].endSec;
+  const f = durationSec / total;
+  const at = (x: number) => Math.round(x * f * 1000) / 1000;
+  return scenes.map((s) => ({ order: s.order, startSec: at(s.startSec), endSec: at(s.endSec), narration: s.narration }));
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -324,11 +338,15 @@ export function assertSceneAnchoredCheckpoints(durationSec: number, checkpoints:
 }
 
 /**
- * Escenas que cubre un checkpoint: terminan después del inicio de su segmento y empiezan ≥ ε antes de
- * atSec (la escena que arranca en el mismo segundo del anclaje — ⌈fin⌉ de la anterior — no cuenta).
+ * Escenas que cubre un checkpoint: las que TERMINAN (⌈fin⌉, el mismo redondeo del anclaje) dentro de su
+ * segmento (inicio, atSec]. Partición exacta: cada escena terminada antes de la última pausa pertenece a una
+ * sola pregunta, también las de < 1 s (review M-2).
  */
 export function scenesForCheckpoint(checkpoint: VideoCheckpoint, scenes: VideoScene[]): VideoScene[] {
-  return scenes.filter((s) => s.endSec > checkpoint.segment[0] + 0.5 && s.startSec + VIDEO_SCENE_RULES.anchorEpsilonSec <= checkpoint.atSec);
+  return scenes.filter((s) => {
+    const e = Math.ceil(s.endSec - 1e-6);
+    return e > checkpoint.segment[0] && e <= checkpoint.atSec;
+  });
 }
 
 /**
@@ -342,7 +360,8 @@ export function planVideoCheckpoints(durationSec: number, scenes?: unknown): Vid
   const d = videoPlanDurationSec(durationSec);
   const problem = videoScenesProblem(d, scenes);
   if (problem) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: problem };
-  const sc = scenes as VideoScene[];
+  // Se escala a d = floor(duración): el plan es función de los segundos enteros (claim, validación y .h5p coinciden).
+  const sc = scaleVideoScenes(d, scenes as VideoScene[]);
   const lo = R.noInteractionFirstSec;
   const hi = d - R.noInteractionLastSec;
   const cand: number[] = [];
@@ -391,5 +410,5 @@ export function planVideoCheckpoints(durationSec: number, scenes?: unknown): Vid
   }
   const out: VideoCheckpoint[] = picks.map((atSec, i) => ({ index: i + 1, atSec, segment: [i === 0 ? 0 : picks[i - 1], atSec] as [number, number] }));
   assertSceneAnchoredCheckpoints(d, out, sc);
-  return { checkpoints: out, timelineSource: 'videogen_scenes' };
+  return { checkpoints: out, timelineSource: 'videogen_scenes', scenes: sc };
 }

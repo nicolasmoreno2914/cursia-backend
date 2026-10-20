@@ -31,6 +31,11 @@ const ACT = load('package/h5p/interactive-video/activity.js');
 const V3 = load('modules/course-shell/v3-validation.js');
 const { VideogenService } = load('video-engine/videogen.service.js');
 const W = load('workers/dynamic-item-worker.js');
+const SCH = load('modules/dynamic-generation/scheduler.service.js');
+const RUNS = load('modules/dynamic-generation/runs.service.js');
+const fs = require('fs');
+const vm = require('vm');
+const { execFileSync } = require('child_process');
 
 let passes = 0;
 let failures = 0;
@@ -54,6 +59,9 @@ const RAW = DURS.map((d, i) => ({ scene_order: i + 1, narration: `Escena ${i + 1
 const SCENES = P.videoScenesFromVideogen(RAW).scenes;
 const D = Math.round(SCENES[SCENES.length - 1].endSec * 10) / 10;
 const YT = 'IdwOipZAeqY';
+// buildVideoActivity sin escenas con origin/staging 7138145 (dist compilado de ese commit, mismas entradas).
+const GOLDEN_SHA_V1 = 'fe950bbbea524dac0ad8b058def5097749acb0f488111372017549d603980a62';
+const GOLDEN_SHA_V2 = '2d1f1f97fe4aaa2605c933b4f63107fdbc5720ef466a7d82fd2f168cfe879b1a';
 
 function interactionsDoc(n, durationSec, extra) {
   return Object.assign({
@@ -96,17 +104,19 @@ async function main() {
     const p = P.planVideoCheckpoints(D, SCENES);
     eq(p.timelineSource, 'videogen_scenes', 'source');
     eq(p.checkpoints.length, even.length, 'cantidad');
-    const ends = SCENES.map((s) => Math.ceil(s.endSec - 1e-6));
+    // Fines de escena re-escalados a floor(d) (review M-1): son los que usa el plan.
+    const ends = p.scenes.map((s) => Math.ceil(s.endSec - 1e-6));
     p.checkpoints.forEach((c, i) => {
       assert(ends.includes(c.atSec), `atSec ${c.atSec} no es fin de escena`);
       assert(c.atSec >= 30 && c.atSec <= Math.floor(D) - 15, 'ventana');
       eq(c.segment, [i === 0 ? 0 : p.checkpoints[i - 1].atSec, c.atSec], 'segmento');
       if (i) assert(c.atSec - p.checkpoints[i - 1].atSec >= 20, 'gap');
-      const sc = P.scenesForCheckpoint(c, SCENES);
+      const sc = P.scenesForCheckpoint(c, p.scenes);
       assert(sc.length >= 1 && Math.ceil(sc[sc.length - 1].endSec - 1e-6) === c.atSec, 'la última escena cubierta termina en la pausa');
     });
-    P.assertSceneAnchoredCheckpoints(D, p.checkpoints, SCENES);
+    P.assertSceneAnchoredCheckpoints(D, p.checkpoints, p.scenes);
     eq(P.planVideoCheckpoints(D, SCENES), p, 'determinístico');
+    eq(P.planVideoCheckpoints(Math.floor(D) + 0.99, SCENES), p, 'función de los segundos enteros (claim crudo = validación/.h5p con floor)');
     // El ancla de la pregunta 1 es el fin de escena más cercano a su punto equidistante.
     const best = ends.filter((b) => b >= 30).reduce((a, b) => (Math.abs(b - even[0].atSec) < Math.abs(a - even[0].atSec) ? b : a));
     assert(Math.abs(p.checkpoints[0].atSec - even[0].atSec) <= Math.abs(best - even[0].atSec) + 45, 'cercano');
@@ -198,6 +208,8 @@ async function main() {
     const plainBuild = await ACT.buildVideoActivity(input);
     const nullBuild = await ACT.buildVideoActivity({ ...input, videoScenes: null });
     eq(plainBuild.sha256, nullBuild.sha256, 'null = sin escenas');
+    // Review M-5: sha dorado calculado con el dist de origin/staging 7138145 (antes de r61), mismas entradas.
+    eq([D, plainBuild.sha256], [601.7, GOLDEN_SHA_V1], 'sin escenas = bytes de origin/staging (v1)');
     eq(plainBuild.timelineSource, 'even_spacing', 'source sin escenas');
     const anchored = await ACT.buildVideoActivity({ ...input, videoScenes: SCENES });
     eq(anchored.timelineSource, 'videogen_scenes', 'source');
@@ -211,6 +223,105 @@ async function main() {
     const refl = P.planReflectionPauses(D, want).reflections;
     const adv = await ACT.buildVideoActivity({ ...input, ivAdvanced: true, videoScenes: SCENES, interactionsDoc: interactionsDoc(n, D, { schemaVersion: 2, reflections: refl.map((x) => ({ index: x.index, prompt: '¿Cómo lo aplicarías?' })) }) });
     eq(adv.reflections, refl, 'pausas');
+    const advEven = await ACT.buildVideoActivity({ ...input, ivAdvanced: true, interactionsDoc: interactionsDoc(n, D, { schemaVersion: 2, reflections: P.planReflectionPauses(D, P.planInteractionCheckpoints(D)).reflections.map((x) => ({ index: x.index, prompt: '¿Cómo lo aplicarías?' })) }) });
+    eq(advEven.sha256, GOLDEN_SHA_V2, 'sin escenas = bytes de origin/staging (ivAdvanced)');
+  });
+
+  await check('M-1 re-escalado d/Σ: con el MP4 1,5 s más largo que Σ escenas, los anclajes siguen el fin real de cada escena', () => {
+    const d = SCENES[SCENES.length - 1].endSec + 1.5;
+    const p = P.planVideoCheckpoints(d, SCENES);
+    eq(p.timelineSource, 'videogen_scenes', 'source');
+    const f = Math.floor(d) / SCENES[SCENES.length - 1].endSec;
+    eq(p.scenes.map((x) => x.endSec), SCENES.map((x) => Math.round(x.endSec * f * 1000) / 1000), 'escenas escaladas');
+    eq(p.scenes[p.scenes.length - 1].endSec, Math.floor(d), 'la última termina en floor(d)');
+    p.checkpoints.forEach((c) => assert(p.scenes.some((x) => c.atSec === Math.ceil(x.endSec - 1e-6)), `atSec ${c.atSec} = fin escalado`));
+    P.assertSceneAnchoredCheckpoints(d, p.checkpoints, p.scenes);
+  });
+
+  await check('M-2 cobertura: partición exacta por ⌈fin⌉ — toda escena terminada antes de la última pausa (también las de < 1 s) cae en UNA pregunta', () => {
+    const sc = P.videoScenesFromVideogen([62.4, 0.5, 57.1, 0.3, 40, 45, 38, 41, 44, 37, 39, 42, 36].map((x, i) => ({ scene_order: i + 1, narration: 's' + (i + 1), duration_seconds: x }))).scenes;
+    const d = sc[sc.length - 1].endSec;
+    const p = P.planVideoCheckpoints(d, sc);
+    eq(p.timelineSource, 'videogen_scenes', 'source');
+    const seen = new Map();
+    p.checkpoints.forEach((c) => P.scenesForCheckpoint(c, p.scenes).forEach((x) => seen.set(x.order, (seen.get(x.order) || 0) + 1)));
+    const last = p.checkpoints[p.checkpoints.length - 1].atSec;
+    p.scenes.filter((x) => Math.ceil(x.endSec - 1e-6) <= last).forEach((x) => eq(seen.get(x.order), 1, `escena ${x.order} cubierta una vez`));
+    assert(seen.get(2) === 1, 'la escena de 0,5 s entra al prompt');
+  });
+
+  await check('M-3 progress(): sin videoScenes (queda videoSceneCount); el resto del output_summary igual', () => {
+    eq(RUNS.progressOutputSummary({ a: 1, videoScenes: SCENES, videoScenesUnavailable: null }), { a: 1, videoScenesUnavailable: null, videoSceneCount: SCENES.length }, 'vista');
+    eq(RUNS.progressOutputSummary({ a: 1 }), { a: 1 }, 'sin escenas igual');
+    eq(RUNS.progressOutputSummary(null), {}, 'null');
+  });
+
+  await check('I-1 capacidad video-scenes-1: navegador sin la capacidad → claim de siempre aunque el video tenga escenas; worker del servidor o navegador con la capacidad → anclado', () => {
+    const OLD = ['pedagogy-brief-1', 'application-activity-1', 'guided-practice-1'];
+    eq(SCH.VIDEO_SCENES_FEATURE, 'video-scenes-1', 'nombre');
+    eq([SCH.executorAnchorsVideoScenes('owner', OLD), SCH.executorAnchorsVideoScenes('owner', [...OLD, 'video-scenes-1']), SCH.executorAnchorsVideoScenes(undefined, []), SCH.executorAnchorsVideoScenes('owner', undefined)], [false, true, true, false], 'negociación');
+    assert(SCH.SERVER_OWNED_SUMMARY_KEYS.includes('videoTimelinePinned'), 'el pin es del servidor');
+    const legacy = V3.videoClaimFacts({ videoItemKey: 'video:ch1', outputSummary: { youtubeVideoId: YT, durationSec: D, videoScenes: SCENES }, sceneAnchors: false });
+    eq(Object.keys(legacy.video), ['videoItemKey', 'youtubeId', 'durationSec', 'checkpoints'], 'claves de siempre');
+    eq(legacy.video.checkpoints, P.planInteractionCheckpoints(D), 'plan de siempre');
+  });
+
+  await check('I-1 regresión: el ejecutor de origin/staging (sin video-scenes-1) contra este BE completa SIN VIDEO_PLAN_MISMATCH; el validador del servidor (pin even_spacing) lo acepta; el ejecutor actual ancla', async () => {
+    const OLD_REV = '7138145';
+    const files = ['05-libro.js', '07-examenes.js', '08-downloads.js', '44-dynamic-prompt-builders.js', '45-dynamic-generation-executor.js', '46-dynamic-context-package.js'];
+    let oldSrc = null;
+    try {
+      oldSrc = files.map((f) => execFileSync('git', ['show', `${OLD_REV}:vendor/dynamic-executor/${f}`], { cwd: path.join(__dirname, '..'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+    } catch (e) {
+      console.log(`   ⚠️  sin el historial de git (${OLD_REV}): no se puede cargar el ejecutor anterior; solo se prueba el actual`);
+    }
+    const curSrc = files.map((f) => fs.readFileSync(path.join(__dirname, '..', 'vendor', 'dynamic-executor', f), 'utf8'));
+    const C1 = 'a1b2c3d4-0000-4000-8000-000000000001';
+    const M1 = 'a1b2c3d4-0000-4000-8000-00000000000a';
+    const MD = '# Fallas de presión\n\n## Señales\nUna respuesta lenta del actuador anticipa una pérdida de presión.';
+    const run = async (srcs, video) => {
+      const store = { md: MD };
+      const ctx = { console: { log() {}, warn() {}, error() {}, info() {} }, setTimeout, clearTimeout, setInterval, clearInterval, Promise, Date, Math, JSON };
+      ctx.window = ctx;
+      ctx.SB_USER = { id: 'user-1' };
+      ctx.fetch = async (url) => { if (!String(url).startsWith('mem://')) throw new Error('RED PROHIBIDA ' + url); const id = String(url).slice(6); return { ok: true, status: 200, text: async () => store[id], json: async () => JSON.parse(store[id]) }; };
+      ctx.artifactDownloadUrl = async (id) => ({ ok: true, url: 'mem://' + id });
+      ctx.api = async (system, user) => JSON.stringify({ checkpoints: interactionsDoc([...user.matchAll(/^- index (\d+) \(segundo/gm)].length, D).checkpoints });
+      vm.createContext(ctx);
+      srcs.forEach((src, i) => vm.runInContext(src, ctx, { filename: files[i] }));
+      const outline = [{ moduleNumber: 1, id: M1, title: 'Hidráulica', objective: null, chapters: [{ chapterNumber: 1, id: C1, title: 'Fallas', objective: 'Decidir.' }] }];
+      const item = {
+        itemRunId: 'ir-vi', runId: 'run-1', courseId: 1, artifactCourseId: 'c', manifestId: 7, itemKey: 'video_interactions:' + C1, type: 'video_interactions', rulesVersion: 3,
+        moduleId: M1, chapterId: C1, moduleNumber: 1, chapterNumber: 1, idempotencyKey: 'idem', generation: 1, dependsOn: ['video:' + C1, 'content:' + C1], attempt: 1, outputSummary: {},
+        context: { courseContext: { nombre: 'Curso', sector: 'Minería', pais: 'Chile', contexto: 'x', nivel: 'Intermedio', tono: 'Cercano', obj: 'x' }, contextHash: 'h' },
+        blueprint: { course: { id: 1, title: 'Curso' }, module: { id: M1, title: 'Hidráulica', objective: null, position: 1 }, chapter: { position: 1, videoEnabled: true, ...outline[0].chapters[0] }, moduleChapters: [], outline },
+        dependencyArtifacts: [{ itemKey: 'content:' + C1, artifactId: 'md', type: 'dynamic_content_md', storagePath: 'x' }],
+        claimPayload: { validatedArtifactType: 'dynamic_video_interactions_json', video: JSON.parse(JSON.stringify(video)) },
+      };
+      return ctx._dynRunItem(item);
+    };
+    const os = { youtubeVideoId: YT, durationSec: D, videoScenes: SCENES };
+    const legacyClaim = V3.videoClaimFacts({ videoItemKey: 'video:' + C1, outputSummary: os, sceneAnchors: false }).video;
+    const anchoredClaim = V3.videoClaimFacts({ videoItemKey: 'video:' + C1, outputSummary: os }).video;
+    const serverOk = (r, anchored) => {
+      const v = V3.validateV3ItemArtifact({ type: 'video_interactions', itemKey: 'video_interactions:' + C1, chapterId: C1, video: { videoItemKey: 'video:' + C1, durationSec: D, ...(anchored ? { videoScenes: SCENES } : {}) } }, r.artifacts[0].content);
+      assert(v.ok, JSON.stringify(v.errors));
+      return v.summary;
+    };
+    if (oldSrc) {
+      const r = await run(oldSrc, legacyClaim);
+      assert(r.ok === true, `ejecutor anterior falló: ${r.error}`);
+      eq(serverOk(r, false), { interactionCount: legacyClaim.checkpoints.length }, 'validado equidistante');
+      // Control: sin la negociación, el claim anclado lo dejaba retenido (el bug I-1).
+      const bad = await run(oldSrc, anchoredClaim);
+      assert(bad.ok === false && /VIDEO_PLAN_MISMATCH/.test(bad.error), 'control: ' + JSON.stringify(bad));
+    }
+    const rc = await run(curSrc, anchoredClaim);
+    assert(rc.ok === true, rc.error);
+    eq(rc.summary.timelineSource, 'videogen_scenes', 'ejecutor actual ancla');
+    eq(serverOk(rc, true).timelineSource, 'videogen_scenes', 'validado anclado');
+    const rl = await run(curSrc, legacyClaim);
+    assert(rl.ok === true && rl.summary.timelineSource === 'even_spacing', 'ejecutor actual con claim de siempre');
   });
 
   console.log(`\n${passes} ok, ${failures} fail`);

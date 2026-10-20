@@ -442,6 +442,11 @@ export function videoClaimFacts(input: {
   artifactMetadata?: Record<string, any> | null;
   /** EV6: Manifest con `features.ivAdvanced = 1` ⇒ también el plan de pausas de reflexión. */
   ivAdvanced?: boolean;
+  /**
+   * r61 Q-04 (review I-1): false = el executor no anuncia `video-scenes-1` (o el item quedó fijado en
+   * 'even_spacing') → plan y claim de siempre, aunque el video tenga escenas.
+   */
+  sceneAnchors?: boolean;
 }): VideoClaimFactsResult {
   const os = input.outputSummary ?? {};
   const md = input.artifactMetadata ?? {};
@@ -463,7 +468,7 @@ export function videoClaimFacts(input: {
   }
   try {
     // r61 Q-04: escenas de Videogen guardadas al completar el video (output_summary.videoScenes).
-    const vp = planVideoCheckpoints(durationSec, os.videoScenes ?? null);
+    const vp = planVideoCheckpoints(durationSec, input.sceneAnchors === false ? null : (os.videoScenes ?? null));
     const checkpoints = vp.checkpoints;
     // Sin escenas (videos anteriores, mock) el claim queda byte a byte el de siempre; con escenas que no
     // sirven se explica por qué (p.ej. timeline_duration_mismatch) y el plan es el equidistante.

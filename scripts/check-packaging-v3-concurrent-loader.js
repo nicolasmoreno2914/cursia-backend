@@ -340,7 +340,48 @@ async function main() {
   });
 }
 
-main().catch((err) => { failures++; console.error('❌ inesperado:', err && err.stack ? err.stack : err); }).then(() => {
+
+// r61 Q-04 (review M-6): el empaque coloca las preguntas con el plan con el que se VALIDARON (v3Validation.timelineSource).
+async function r61TimelineChecks() {
+  const IV = loadDist('package/h5p/interactive-video/plan.js');
+  const scenes = IV.videoScenesFromVideogen(Array.from({ length: 12 }, (_, i) => ({ scene_order: i + 1, narration: `escena ${i + 1}`, duration_seconds: PF.VIDEO_SECONDS / 12 }))).scenes;
+  const setup = (withScenes) => {
+    const f = realRunFixture('h5p');
+    if (withScenes) for (const [id, v] of f.files) {
+      if (typeof v !== 'string' || !v.includes('"videogenJobId"')) continue;
+      f.files.set(id, JSON.stringify({ ...JSON.parse(v), videoScenes: scenes }));
+    }
+    return f;
+  };
+  const load = async (f, validatedAnchored) => {
+    const byItem = await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest);
+    if (validatedAnchored) for (const it of byItem.values()) {
+      if (it.type === 'video_interactions') it.outputSummary = { ...(it.outputSummary || {}), v3Validation: { timelineSource: 'videogen_scenes' } };
+    }
+    const plan = PV3.buildPackagingPlanV3(f.manifest, f.fx.blueprint, { manifestId: 9001 });
+    return PK.loadContentsV3(fakeLoaders(f).L, plan, byItem, f.run, { familyId: 'aula-clara', mode: 'light' });
+  };
+  await check('r61 Q-04: video con escenas + preguntas validadas equidistantes (o anteriores a r61) → plan equidistante (sin videoScenes), .mbz idéntico al de siempre', async () => {
+    const base = await load(setup(false), false);
+    const pinned = await load(setup(true), false);
+    for (const v of pinned.contents.videos.values()) assert(!('videoScenes' in v), 'no pasa escenas: ' + JSON.stringify(v));
+    const mk = (contents) => B.buildDynamicMbzV3({ ...realRunFixture('h5p').fx, contents });
+    eq(sha((await mk(pinned.contents)).mbz), sha((await mk(base.contents)).mbz), 'sha del .mbz');
+  });
+  await check('r61 Q-04: preguntas validadas ancladas + video con escenas → las escenas llegan al builder (plan anclado)', async () => {
+    const r = await load(setup(true), true);
+    assert(r.contents.videos.size > 0, 'hay videos');
+    for (const v of r.contents.videos.values()) eq(v.videoScenes, scenes, 'escenas');
+  });
+  await check('r61 Q-04: preguntas validadas ancladas pero el video ya no da ese plan → PackagingNotReadyError VIDEO_TIMELINE_MISMATCH (nunca se mueven en silencio)', async () => {
+    let err = null;
+    try { await load(setup(false), true); } catch (e) { err = e; }
+    assert(err instanceof PT.PackagingNotReadyError && /^VIDEO_TIMELINE_MISMATCH: /.test(err.message), `vino ${err && err.message}`);
+    assert(err.missing.every((m) => /:VIDEO_TIMELINE_MISMATCH$/.test(m)), JSON.stringify(err.missing));
+  });
+}
+
+main().then(r61TimelineChecks).catch((err) => { failures++; console.error('❌ inesperado:', err && err.stack ? err.stack : err); }).then(() => {
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures > 0 ? 1 : 0);
 });
