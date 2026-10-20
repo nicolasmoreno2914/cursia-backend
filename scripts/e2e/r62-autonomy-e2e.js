@@ -798,8 +798,8 @@ async function runScenario(S, sc) {
     const dr = duplicateReport(calls);
     res.paidCalls = dr.paidCalls;
     res.duplicatePaid = dr.dup;
-    // «Esperados y registrados»: el ledger marcó possible_duplicate para ese proveedor; el resto, no registrados.
-    const pd = await S.q(`select provider, count(*)::int n from public.generation_cost_events where run_id = $1 and (metadata->>'possible_duplicate') = 'true' group by 1`, [ctx.runId]);
+    // «Esperados y registrados»: el ledger marcó possible_duplicate / possibleDuplicate (N2 / N1) para ese proveedor.
+    const pd = await S.q(`select provider, count(*)::int n from public.generation_cost_events where run_id = $1 and ((metadata->>'possible_duplicate') = 'true' or (metadata->>'possibleDuplicate') = 'true') group by 1`, [ctx.runId]);
     const left = Object.fromEntries(pd.map((x) => [x.provider, x.n]));
     const provOf = { anthropic: 'anthropic', openai_tts: 'openai', gamma: 'gamma', videogen: 'videogen' };
     for (const d of dr.dup) { const pv = provOf[d.kind]; d.registered = (left[pv] || 0) > 0; if (d.registered) left[pv]--; }
