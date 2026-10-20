@@ -36,7 +36,7 @@ import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecisio
 // r62 (N2): Videogen/Gamma que el barrido de conciliación todavía va a resolver solo (sin acción de admin).
 import { providerReconcilePending } from './provider-reconcile';
 import { spendControlHoldOf } from '../reliability/spend-control-hold';
-import { CLAIM_PAYLOAD_DEP_ALIVE, CLAIM_PAYLOAD_SWEEP_CEILING_MS, claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
+import { CLAIM_PAYLOAD_DEP_ALIVE, CLAIM_PAYLOAD_DEP_DEAD, CLAIM_PAYLOAD_SWEEP_CEILING_MS, claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -570,10 +570,13 @@ export function adminActionFor(
     // Viva / en vuelo (su propio estado) o fallida (su propia acción en este mismo run): nada acá. Cancelada / omitida u
     // otro terminal sin salida (re-review 3): la acción reaparece con el techo contado desde el fin de la dependencia.
     if (dep && (CLAIM_PAYLOAD_DEP_ALIVE.includes(dep.status) || dep.status === 'failed')) return null;
+    // Sin recuperación automática viva (dependencia cancelada / omitida, o el barrido ya la registró como no disponible):
+    // la acción es INMEDIATA (review lost_result); la espera del techo es solo para la recuperación que sigue en curso.
+    const depDead = (!!dep && CLAIM_PAYLOAD_DEP_DEAD.includes(dep.status)) || (r as any).attention_reason === 'dependency_unavailable';
     const ms = (v: unknown) => (v ? new Date(v as any).getTime() : NaN);
     const anchors = [ms(r.finished_at ?? r.updated_at), ms(dep?.finished_at)].filter((x) => Number.isFinite(x));
     const cpAt = anchors.length ? Math.max(...anchors) : NaN;
-    if (!Number.isFinite(cpAt) || now.getTime() < cpAt + CLAIM_PAYLOAD_SWEEP_CEILING_MS) return null;
+    if (!depDead && (!Number.isFinite(cpAt) || now.getTime() < cpAt + CLAIM_PAYLOAD_SWEEP_CEILING_MS)) return null;
   }
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
   // REL MVP: id (semilla del jitter) y clase registrada → misma decisión que el barrido y el lock.

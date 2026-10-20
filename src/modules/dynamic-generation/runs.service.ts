@@ -2557,6 +2557,7 @@ export class RunsService {
     let resubmitPriorReservations: { keys: string[]; providers: string[]; itemRunId: string } | null = null;
     // r62 (resultado pagado perdido): el intento que sigue reenvía algo ya cobrado → sus cargos llevan possible_duplicate.
     let lostResultResend = false;
+    let lostResultUnits: { lostChunks: number[]; lostLlm: number } = { lostChunks: [], lostLlm: 0 };
     const targetId = await this.tx(async (qr) => {
       // I1: lock del curso primero — este reintento puede reabrir el run.
       await this.lockCourseRuns(qr, courseId);
@@ -2666,7 +2667,7 @@ export class RunsService {
         }
         autoMeta = { round: d.round, code: AMBIGUOUS_AUDIO_RESUBMIT_CODE, pendingUsd: d.pendingUsd, cause: d.cause,
           resendUsd: pending.resendUsd ?? null, possibleDuplicateKeys: pending.keys ?? [] };
-        if (d.cause === 'lost_result') lostResultResend = true;
+        if (d.cause === 'lost_result') { lostResultResend = true; lostResultUnits = { lostChunks: pending.lostChunks ?? [], lostLlm: pending.lostLlm ?? 0 }; }
       } else if (auto && auto.providerReconcile) {
         // r62 (N2): misma decisión que el barrido, con la fila bloqueada; el error tiene que ser el que se concilió.
         const pr = auto.providerReconcile;
@@ -2770,7 +2771,7 @@ export class RunsService {
           providers: prev.providers, itemRunId: String(target.id),
         };
         // r62 (resultado pagado perdido): un reenvío explícito de algo YA cobrado marca su cargo nuevo como posible duplicado.
-        if ((prev.lostUsd ?? 0) > 0) lostResultResend = true;
+        if ((prev.lostUsd ?? 0) > 0) { lostResultResend = true; lostResultUnits = { lostChunks: prev.lostChunks ?? [], lostLlm: prev.lostLlm ?? 0 }; }
         // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
         // r62 (N2, re-review m-n1): un reenvío MANUAL limpia el estado de conciliación del error anterior.
@@ -2906,7 +2907,7 @@ export class RunsService {
                   max_attempts = attempt_count + $2::int,
                   -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
                   output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
-                    || case when $5::boolean then jsonb_build_object('${LOST_RESULT_RESEND_KEY}', jsonb_build_object('at', now(), 'afterAttempt', attempt_count, 'cause', 'lost_result'))
+                    || case when $5::boolean then jsonb_build_object('${LOST_RESULT_RESEND_KEY}', jsonb_build_object('at', now(), 'afterAttempt', attempt_count, 'cause', 'lost_result') || $6::jsonb)
                             else '{}'::jsonb end,
                   error = null,
                   next_retry_at = null,
@@ -2917,7 +2918,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(topExtra), lostResultResend],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(topExtra), lostResultResend, JSON.stringify(lostResultUnits)],
         ),
       );
       if (updated.length !== 1) {
@@ -3594,8 +3595,8 @@ export class RunsService {
     const pendingUsd = rows.reduce((t, r) => t + Number(r.amount || 0), 0);
     // r62 (resultado pagado perdido): cargos YA liquidados (no reservas) de intentos no reconocidos cuyo resultado no quedó
     // guardado en el item (bienvenida: nunca se guarda por trozo; audiolibro: fuera de sus segmentos / bloques guardados).
-    const lostRows: Array<{ provider: string; amount: string; op: string | null }> = await q.query(
-      `select e.provider, e.amount::text as amount, e.external_operation_id as op from public.generation_cost_events e
+    const lostRows: Array<{ provider: string; amount: string; op: string | null; chunk: string | null }> = await q.query(
+      `select e.provider, e.amount::text as amount, e.external_operation_id as op, e.metadata->>'chunk' as chunk from public.generation_cost_events e
         where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock'
           and e.provider in ('openai', 'anthropic')
           and not coalesce((e.metadata->>'reservation') = 'true', false)
@@ -3606,7 +3607,18 @@ export class RunsService {
     const lost = lostRows.filter((r) => !(r.op && persisted.has(String(r.op))));
     const lostUsd = lost.reduce((t, r) => t + Number(r.amount || 0), 0);
     let resendUsd = pendingUsd > 0 ? pendingUsd : lostUsd;
-    if (itemType === 'audio_welcome' && rows.length > 0) {
+    if (itemType === 'audio_welcome' && (rows.length > 0 || lostUsd > 0)) {
+      // La bienvenida repite la UNIDAD entera (sus trozos no se guardan por separado): la cota es la reserva completa de
+      // la unidad del último intento (todos sus trozos, enviados o no), nunca menos de lo incierto + lo ya cobrado.
+      const [unit] = await q.query(
+        `select coalesce(sum(e.amount), 0)::text as t from public.generation_cost_events e
+          where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock' and e.provider = 'openai'
+            and coalesce((e.metadata->>'reservation') = 'true', false)
+            and e.attempt = (select max(x.attempt) from public.generation_cost_events x
+                              where x.item_run_id = $1 and x.event_kind = 'CHARGE' and coalesce((x.metadata->>'reservation') = 'true', false)
+                                and coalesce(x.attempt, 0) > $2::int)`,
+        [itemRunId, ack],
+      );
       const [paid] = await q.query(
         `select coalesce(sum(e.amount), 0)::text as t from public.generation_cost_events e
           where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock' and e.provider = 'openai'
@@ -3614,7 +3626,7 @@ export class RunsService {
             and coalesce(e.attempt, 0) > $2::int`,
         [itemRunId, ack],
       );
-      resendUsd += Number(paid?.t ?? 0) || 0;
+      resendUsd = Math.max(pendingUsd + (Number(paid?.t ?? 0) || 0), Number(unit?.t ?? 0) || 0);
     }
     return {
       pendingUsd,
@@ -3623,6 +3635,8 @@ export class RunsService {
       resendUsd,
       lostUsd,
       lostProviders: [...new Set(lost.map((r) => String(r.provider)))].sort(),
+      lostChunks: [...new Set(lost.filter((r) => r.provider === 'openai' && r.chunk !== null && r.chunk !== undefined).map((r) => Number(r.chunk)))].filter((n) => Number.isFinite(n)).sort((a, b) => a - b),
+      lostLlm: lost.filter((r) => r.provider === 'anthropic').length,
     };
   }
 
