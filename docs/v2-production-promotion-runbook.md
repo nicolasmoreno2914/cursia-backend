@@ -59,7 +59,7 @@ dispara el owner (Nicolás), con su aprobación explícita.
 | `PRESENTATION_LIGHT_DEFAULT_SINCE`, `DYNAMIC_PREBRIEF_REQUIRED_SINCE` | no se tocan | instante del primer deploy con canario; después queda congelado |
 | `DYNAMIC_PROVIDER_WORKER_ENABLED` | **fija** `false` | **fija** `true` solo con `PROD_V2_WORKERS_ENABLED=true` y sin `DYNAMIC_WORKERS_HOLD=true` |
 | `DYNAMIC_LLM_WORKER_ENABLED` | **fija** `false` | **fija** `true` solo si además `PROD_V2_LLM_WORKER_ENABLED=true`: va hospedado en el worker de proveedores |
-| `DYNAMIC_LLM_WORKER_SINCE` / `_CONCURRENCY` | no se tocan | instante de activación (default si falta) y concurrencia **fija** en `4`, solo con la IA encendida |
+| `DYNAMIC_LLM_WORKER_SINCE` / `_CONCURRENCY` | no se tocan | Solo con la IA encendida. `SINCE`: instante nuevo en cada paso de apagado a encendido (así los runs creados mientras estuvo apagada siguen en el navegador); se conserva mientras siga encendida. `CONCURRENCY`: default `4`; un ajuste manual (1..6) se respeta. |
 | `DYNAMIC_WORKER_DRAIN_TIMEOUT_MS` | **fija** `270000` | Con la IA encendida: **fija** llamada LLM + 60 s (default 960000); el `kill_timeout` de PM2 es llamada + 90 s |
 | `OPENAI_TTS_MODEL` | **fija** `gpt-4o-mini-tts-2025-03-20` | ídem |
 | `FINOPS_INGEST_TOKEN` | desde el secret `FINOPS_INGEST_TOKEN_PRODUCTION`, sin imprimirse | ídem |
@@ -407,7 +407,11 @@ En el log del paso «Install…» deben aparecer:
 - Los 3 workers dinámicos se recargan con `pm2 reload`: SIGINT, el worker deja de reclamar y termina o devuelve los ítems en un punto sin gasto en el aire (`worker-drain.ts`). Lo mismo en el rollback, manual o automático.
 - PM2 espera el `kill_timeout`: 300 s, o llamada LLM + 90 s con la IA encendida. El tope interno de drenado queda siempre 30 s por debajo.
 - Los workers V1 se reinician como siempre (`pm2 restart` vía npm). Si `PROD_DEPLOY_BLOCK_ON_V1_JOBS` no está activa, los jobs V1 en curso solo se informan.
-- El auto-rollback registra antes los runs activos (`check-active-runs --legacy --force`, informativo, m6). No se bloquea, porque la release rota es la que estaría corriendo.
+- Antes de revertir, el auto-rollback consulta lo que está en vuelo (`check-active-runs --legacy --json`) y lo deja en el log (review r62 I2):
+  - **Si la consulta falla:** revierte igual, con aviso. El reload de los workers dinámicos drena.
+  - **Si hay runs activos pero ningún ítem reclamado:** revierte; los runs siguen con la release restaurada.
+  - **Si hay ítems en vuelo:** `drain-dynamic` detiene los 3 workers dinámicos con drenado (SIGINT + `kill_timeout`). Después vuelve a consultar y solo revierte si ya no queda nada reclamado.
+  - **Si sigue algo en vuelo, o si no se pudo drenar o confirmar:** **no** revierte y deja `::error Auto-rollback NO aplicado`. Los workers dinámicos quedan detenidos, sin gasto nuevo, con la release fallida. Revisar y correr `action=rollback`.
 
 **El rollback es solo de código (m5).**
 - No revierte los cambios del `.env` que hizo el install fallido: flags, `OPENAI_TTS_MODEL`, `PROD_DB_POOL_*`, `FINOPS`, drenado.

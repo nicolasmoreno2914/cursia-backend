@@ -69,8 +69,8 @@ compute_drain_timeouts() {
   local call
   DRAIN_KILL_TIMEOUT_MS=300000
   if [ "$(env_val DYNAMIC_LLM_WORKER_ENABLED)" = "true" ]; then
-    call=$(env_val DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS)
-    [[ "$call" =~ ^[0-9]{4,8}$ ]] || call=900000
+    # Misma lectura que readPositiveInt del worker (dynamic-llm-worker.ts): número finito > 0, floor; si no, 15 min.
+    call=$(node -e 'const v=Number(process.argv[1]);process.stdout.write(String(Number.isFinite(v)&&v>0?Math.floor(v):900000))' "$(env_val DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS)")
     if [ $((call + 90000)) -gt "$DRAIN_KILL_TIMEOUT_MS" ]; then DRAIN_KILL_TIMEOUT_MS=$((call + 90000)); fi
   fi
   DRAIN_TIMEOUT_MS=$((DRAIN_KILL_TIMEOUT_MS - 30000))
@@ -467,16 +467,21 @@ cmd_install() {
   # r62 d9: worker de IA HOSPEDADO en cursia-dynamic-provider-worker (como staging, sin un 12.º proceso ni otra
   # conexión al pooler): las partes LLM ya no dependen de una pestaña abierta. Variable propia, apagada por
   # defecto; requiere el worker de proveedores encendido (el anfitrión queda inactivo sin él).
-  local llm=false
+  local llm=false llm_before
+  llm_before=$(env_val DYNAMIC_LLM_WORKER_ENABLED)
   if [ "$CFG_PROD_V2_LLM_WORKER_ENABLED" = "true" ]; then
     if [ "$workers" = "true" ]; then llm=true
     else echo "⚠️  PROD_V2_LLM_WORKER_ENABLED=true sin el worker de proveedores encendido (canario + PROD_V2_WORKERS_ENABLED, sin DYNAMIC_WORKERS_HOLD): el worker de IA hospedado queda APAGADO"; fi
   fi
   ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED "$llm"
   if [ "$llm" = "true" ]; then
-    # Instante de activación: solo los runs creados desde acá van al worker (ninguno anterior cambia).
-    ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(now_utc)"
-    ensure_env_exact DYNAMIC_LLM_WORKER_CONCURRENCY 4
+    # Instante de activación: solo los runs creados desde acá van al worker (ninguno anterior cambia). Se fija de
+    # nuevo en cada transición apagado → encendido: un instante viejo le pasaría al worker los runs creados mientras
+    # estuvo apagado (que ya ejecuta el navegador). Encendido → encendido: se conserva.
+    if [ "$llm_before" = "true" ]; then ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(now_utc)"
+    else ensure_env_exact DYNAMIC_LLM_WORKER_SINCE "$(now_utc)"; fi
+    # Default 4 como staging; un ajuste manual (1..6) se respeta.
+    ensure_env_default_if_absent DYNAMIC_LLM_WORKER_CONCURRENCY 4
   fi
   compute_drain_timeouts
   ensure_env_exact DYNAMIC_WORKER_DRAIN_TIMEOUT_MS "$DRAIN_TIMEOUT_MS"
@@ -540,6 +545,21 @@ cmd_mark_ok() {
   echo "✓ release ${sha} marcada sana (base del próximo snapshot de rollback)"
 }
 
+# r62 (review I2): antes del auto-rollback con ítems en vuelo, los 3 workers dinámicos se DETIENEN con drenado
+# (SIGINT: dejan de reclamar; lo en vuelo termina o se devuelve en un punto sin gasto; PM2 espera su
+# kill_timeout). El workflow vuelve a consultar y solo revierte si ya no queda nada reclamado.
+cmd_drain_dynamic() {
+  local dir="$1" entry name
+  exec < /dev/null
+  cd "$dir" || die "no existe $dir"
+  compute_drain_timeouts
+  echo "━━━ Drenado de los workers dinámicos antes del rollback (kill_timeout hasta ${DRAIN_KILL_TIMEOUT_MS} ms) ━━━"
+  for entry in "${PROD_PROCESSES_DRAIN[@]}"; do
+    name="${entry%% *}"
+    if $PM2 describe "$name" > /dev/null 2>&1; then $PM2 stop "$name"; echo "  ⏸ ${name} drenado y detenido"; fi
+  done
+}
+
 cmd_rollback() {
   local dir="$1" prev
   exec < /dev/null
@@ -579,7 +599,8 @@ main() {
     install) cmd_install ;;
     mark-ok) [ $# -eq 2 ] || die "uso: mark-ok <dir> <sha|restored>"; cmd_mark_ok "$@" ;;
     rollback) [ $# -eq 1 ] || die "uso: rollback <dir>"; cmd_rollback "$1" ;;
-    *) die "subcomando desconocido: '${sub}' (preflight|snapshot|install|mark-ok|rollback)" ;;
+    drain-dynamic) [ $# -eq 1 ] || die "uso: drain-dynamic <dir>"; cmd_drain_dynamic "$1" ;;
+    *) die "subcomando desconocido: '${sub}' (preflight|snapshot|install|mark-ok|rollback|drain-dynamic)" ;;
   esac
 }
 

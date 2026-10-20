@@ -255,12 +255,72 @@ async function workflowChecks() {
     const ar = steps[iAr];
     eq(ar.if, "failure() && steps.sync.outcome != 'skipped' && steps.health.outcome != 'success' && vars.PROD_AUTO_ROLLBACK != 'false'", 'condición (m3: rsync a mitad; m4: no tras un health OK)');
     eq(steps[idx((x) => x.id === 'health', 'health')].name, 'Health check post-deploy', 'id health');
-    const iAct = ar.run.indexOf('< scripts/ops/check-active-runs.js');
-    assert(iAct > 0 && iAct < ar.run.indexOf('bash -s -- rollback') && /node - --legacy --force/.test(ar.run), 'm6: registra los runs activos (informativo) antes de restaurar');
+    const iAct = ar.run.indexOf('ACT=scripts/ops/check-active-runs.js');
+    assert(iAct > 0 && iAct < ar.run.indexOf('bash -s -- rollback') && /node - --legacy --json/.test(ar.run), 'm6/I2: consulta los runs activos antes de restaurar');
     assert(iAr > iSync && iAr > idx((x) => /mark-ok/.test(runOf(x)), 'mark-ok'), 'después del rsync y del mark-ok');
     assert(/bash -s -- rollback '\$DEPLOY_VPS_PATH'" < scripts\/ops\/prod-release\.sh/.test(ar.run) && /mark-ok '\$DEPLOY_VPS_PATH' restored/.test(ar.run) && /HEALTH_URL/.test(ar.run), ar.run);
     const notify = steps.find((x) => x.name === 'Notify on failure');
     assert(!/Apagar solo V2 sin tocar código: vaciar PROD_V2_CANARY_OWNER/.test(notify.run) && /V2 sigue encendido para el allowlist/.test(notify.run), 'M3');
+  });
+
+  await check('[WF] review r62 I2: auto-rollback EJECUTADO con ssh/curl falsos — consulta caída no aborta; sin ítems en vuelo revierte; con ítems drena y revierte; si tras drenar sigue algo en vuelo NO revierte y alerta', () => {
+    const ar = steps[idx((x) => /Auto-rollback/.test(x.name || ''), 'auto-rollback')];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'r62-autorb-'));
+    try {
+      const bin = path.join(dir, 'bin');
+      fs.mkdirSync(bin);
+      fs.mkdirSync(path.join(dir, 'scripts/ops'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'scripts/ops/check-active-runs.js'), '//');
+      fs.writeFileSync(path.join(dir, 'scripts/ops/prod-release.sh'), '#');
+      // ssh falso: registra el comando remoto; las consultas devuelven el escenario (n-ésima consulta → CHECKS[n]).
+      fs.writeFileSync(path.join(bin, 'ssh'), `#!/bin/sh
+for a; do last="$a"; done
+echo "$last" >> "$LOG"
+case "$last" in
+  *check-active-runs*|*"node - --legacy --json"*)
+    n=$(cat "$CNT" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$CNT"
+    eval "spec=\\\${CHECK_$n:-down}"
+    case "$spec" in
+      down) exit 255 ;;
+      clear) echo '{"verdict":"clear","activity":{"activeRuns":[],"claimedItems":[],"activePackages":[]}}'; exit 0 ;;
+      busy) echo '{"verdict":"busy","activity":{"activeRuns":[{"id":"r1","worker_status":"running"}],"claimedItems":[{"id":"i1","item_key":"content:x"}],"activePackages":[]}}'; exit 2 ;;
+      runs) echo '{"verdict":"busy","activity":{"activeRuns":[{"id":"r1","worker_status":"running"}],"claimedItems":[],"activePackages":[]}}'; exit 2 ;;
+    esac ;;
+  *drain-dynamic*) [ -n "$DRAIN_FAIL" ] && exit 1; exit 0 ;;
+esac
+exit 0
+`, { mode: 0o755 });
+      fs.writeFileSync(path.join(bin, 'curl'), '#!/bin/sh\necho \'{"status":"ok"}\'\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const runCase = (env) => {
+        const log = path.join(dir, `log-${Math.random().toString(36).slice(2)}`);
+        const cnt = path.join(dir, `cnt-${Math.random().toString(36).slice(2)}`);
+        const r = spawnSync('bash', ['-e', '-c', ar.run], { cwd: dir, encoding: 'utf8',
+          env: { PATH: `${bin}:${process.env.PATH}`, HOME: dir, LOG: log, CNT: cnt, DEPLOY_VPS_USER: 'u', DEPLOY_VPS_HOST: 'h', DEPLOY_VPS_PATH: '/srv/app', HEALTH_URL: 'http://x/health', ...env } });
+        const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n') : [];
+        const kinds = calls.map((c) => (/--json/.test(c) ? 'check' : /drain-dynamic/.test(c) ? 'drain' : /rollback/.test(c) ? 'rollback' : /mark-ok/.test(c) ? 'mark-ok' : c));
+        return { status: r.status, out: r.stdout + r.stderr, kinds };
+      };
+      let x = runCase({});
+      eq([x.status, x.kinds], [0, ['check', 'rollback', 'mark-ok']], `consulta caída → revierte igual: ${x.out}`);
+      assert(/No se pudo consultar los runs activos/.test(x.out), 'aviso visible');
+      x = runCase({ CHECK_1: 'clear' });
+      eq([x.status, x.kinds], [0, ['check', 'rollback', 'mark-ok']], 'nada activo');
+      x = runCase({ CHECK_1: 'runs' });
+      eq([x.status, x.kinds], [0, ['check', 'rollback', 'mark-ok']], 'runs activos sin ítems en vuelo → revierte (quedan registrados)');
+      assert(/activeRuns: r1 running/.test(x.out), 'registra los runs activos');
+      x = runCase({ CHECK_1: 'busy', CHECK_2: 'clear' });
+      eq([x.status, x.kinds], [0, ['check', 'drain', 'check', 'rollback', 'mark-ok']], `ítem en vuelo → drena → revierte: ${x.out}`);
+      assert(/claimedItems: i1 content:x/.test(x.out) && /se drenan los workers dinámicos/.test(x.out), 'registrado');
+      x = runCase({ CHECK_1: 'busy', CHECK_2: 'busy' });
+      eq([x.status, x.kinds], [1, ['check', 'drain', 'check']], 'sigue en vuelo tras drenar → NO revierte');
+      assert(/::error title=Auto-rollback NO aplicado::/.test(x.out), 'alerta clara');
+      x = runCase({ CHECK_1: 'busy', CHECK_2: 'down' });
+      eq([x.status, x.kinds], [1, ['check', 'drain', 'check']], 'no se puede confirmar tras drenar → NO revierte');
+      x = runCase({ CHECK_1: 'busy', DRAIN_FAIL: '1' });
+      eq([x.status, x.kinds], [1, ['check', 'drain']], 'drenado fallido → NO revierte');
+      assert(/No se pudo drenar/.test(x.out), x.out);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 
   await check('[WF] M5: el job rollback normaliza el dueño de VPS_PATH ANTES de restaurar', () => {
@@ -487,10 +547,38 @@ async function shellChecks() {
       eq([envMap(vps.app).DYNAMIC_LLM_WORKER_ENABLED, envMap(vps.app).DYNAMIC_WORKER_DRAIN_TIMEOUT_MS], ['false', '270000'], 'apagado');
       // Con el jlist en 300000 (fake) no se recrea nada: reload con drenado (SIGINT + kill_timeout).
       for (const n of PROD_NAMES.slice(8)) assert(r.calls.includes(`pm2 reload ${n} --update-env`) && !r.calls.includes(`pm2 delete ${n}`), `${n} reload`);
-      // Rollback con la IA encendida en el .env: también drena con el kill_timeout largo.
+      // review r62 I1: rollback EJECUTADO con la IA encendida en el .env → los 3 workers dinámicos se recrean con
+      // --kill-timeout 990000 (jlist en 300000) desde la release restaurada; nunca npm ni migraciones.
       fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\nDYNAMIC_LLM_WORKER_ENABLED=true\n');
-      const sh = fs.readFileSync(SH, 'utf8');
-      assert(/compute_drain_timeouts\n  detect_preexisting_loops\n  reload_all_processes rollback/.test(sh), 'rollback calcula el drenado antes de recargar');
+      writeRelease(path.join(vps.app, '.release-prev'), 'P');
+      fs.mkdirSync(path.join(vps.app, '.release-prev/node_modules'), { recursive: true });
+      fs.writeFileSync(path.join(vps.app, '.release-prev/.release-sha'), 'a1a1a1a\n');
+      r = runSh(vps, ['rollback', vps.app], { stdinScript: true });
+      eq(r.status, 0, r.out);
+      assert(/kill_timeout|990000/.test(r.calls.join(' ')), r.calls.join(' | '));
+      for (const n of PROD_NAMES.slice(8)) {
+        const script = `dist/workers/${n.replace(/^cursia-/, '')}.js`;
+        assert(r.calls.includes(`pm2 delete ${n}`) && r.calls.includes(`pm2 start ${script} --name ${n} --kill-timeout 990000`), `rollback ${n}: ${r.calls.join(' | ')}`);
+      }
+      assert(!r.calls.some((c) => /^npm |migrate-/.test(c)), 'sin npm ni migraciones');
+      eq(fs.readFileSync(path.join(vps.app, 'dist/main.js'), 'utf8'), '// release P\n', 'release restaurada');
+      // Y el drenado previo del auto-rollback (drain-dynamic) detiene los 3 con el kill_timeout de la release.
+      r = runSh(vps, ['drain-dynamic', vps.app], { stdinScript: true });
+      assert(r.status === 0 && /kill_timeout hasta 990000 ms/.test(r.out), r.out);
+      for (const n of PROD_NAMES.slice(8)) assert(r.calls.includes(`pm2 stop ${n}`), `drain ${n}`);
+      assert(!r.calls.some((c) => /pm2 (stop|restart|delete) cursia-(backend|content|video|audio|h5p|gamma|package|full)/.test(c)), 'drain-dynamic no toca V1');
+      for (const d of ['.release-prev', '.release-failed']) fs.rmSync(path.join(vps.app, d), { recursive: true, force: true });
+      for (const f of ['.release-state', '.release-sha']) fs.rmSync(path.join(vps.app, f), { force: true });
+      writeRelease(vps.app, 'A');
+      // review r62 minor: lectura del timeout igual a readPositiveInt (decimales / 9+ dígitos) y SINCE fresco al reencender.
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\nDYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS=1000000000.7\nDYNAMIC_LLM_WORKER_SINCE=2020-01-01T00:00:00Z\nDYNAMIC_LLM_WORKER_CONCURRENCY=2\n');
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true', llm: 'true' }) });
+      env = envMap(vps.app);
+      eq([r.status, env.DYNAMIC_WORKER_DRAIN_TIMEOUT_MS, env.DYNAMIC_LLM_WORKER_CONCURRENCY], [0, '1000060000', '2'], '10 dígitos como el worker; concurrencia manual respetada');
+      assert(env.DYNAMIC_LLM_WORKER_SINCE !== '2020-01-01T00:00:00Z', 'apagado → encendido: instante nuevo');
+      const since2 = env.DYNAMIC_LLM_WORKER_SINCE;
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true', llm: 'true' }) });
+      eq(envMap(vps.app).DYNAMIC_LLM_WORKER_SINCE, since2, 'encendido → encendido: se conserva');
       fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n');
     });
 

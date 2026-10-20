@@ -435,11 +435,34 @@ jobs:
           DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
           HEALTH_URL: ${{ secrets.HEALTH_URL }}
         run: |
-          # m6: queda registrado qué estaba en vuelo (informativo). El rollback NO lo corta: recarga los workers
-          # dinámicos con el MISMO drenado que el deploy (SIGINT, kill_timeout de la release; ninguna llamada pagada
-          # enviada se corta) y los V1 como siempre.
-          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
-            "cd '$DEPLOY_VPS_PATH' && node - --legacy --force" < scripts/ops/check-active-runs.js
+          # r62 (review I2): respeta lo que esté EN VUELO. Una falla al consultar NO aborta el rollback (el reload
+          # drena igual). Con ítems reclamados: drena (detiene los workers dinámicos con SIGINT + kill_timeout),
+          # vuelve a consultar y revierte solo si ya no queda nada en vuelo; si queda, NO revierte y alerta.
+          ACT=scripts/ops/check-active-runs.js
+          claimed() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const r=JSON.parse(s);process.stdout.write(String(r.activity?r.activity.claimedItems.length:-1))}catch(e){process.stdout.write("-1")}})'; }
+          if OUT=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+                "cd '$DEPLOY_VPS_PATH' && node - --legacy --json" < "$ACT"); then RC=0; else RC=$?; fi
+          N=$(printf '%s' "$OUT" | claimed)
+          echo "runs activos antes del rollback: rc=$RC, items en vuelo=$N"
+          printf '%s\n' "$OUT" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const a=JSON.parse(s).activity||{};for(const k of ["activeRuns","claimedItems","activePackages"])for(const r of a[k]||[])console.log("  "+k+": "+(r.id||"")+" "+(r.item_key||r.worker_status||""))}catch(e){console.log("  (sin detalle: "+String(s).slice(0,120).replace(/\s+/g," ")+")")}})'
+          if [ "$N" -gt 0 ] 2>/dev/null; then
+            echo "::warning::$N item(s) en vuelo: se drenan los workers dinámicos antes de revertir"
+            if ! ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+                "bash -s -- drain-dynamic '$DEPLOY_VPS_PATH'" < scripts/ops/prod-release.sh; then
+              echo "::error title=Auto-rollback NO aplicado::No se pudo drenar los workers dinámicos con $N item(s) en vuelo: no se revierte para no cortar llamadas pagadas. Revisar y correr action=rollback (runbook §4)."
+              exit 1
+            fi
+            if OUT=$(ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+                  "cd '$DEPLOY_VPS_PATH' && node - --legacy --json" < "$ACT"); then RC=0; else RC=$?; fi
+            N=$(printf '%s' "$OUT" | claimed)
+            if [ "$N" != "0" ]; then
+              echo "::error title=Auto-rollback NO aplicado::Tras el drenado quedan items en vuelo (n=$N, rc=$RC). No se revierte para no cortar llamadas pagadas: los workers dinámicos quedan DETENIDOS (sin gasto nuevo) con la release fallida. Revisar y correr action=rollback (runbook §4)."
+              exit 1
+            fi
+            echo "✓ drenado: nada en vuelo; se revierte"
+          elif [ "$N" = "-1" ]; then
+            echo "::warning::No se pudo consultar los runs activos (rc=$RC): se revierte igual; el reload de los workers dinámicos drena lo que esté en vuelo."
+          fi
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
             "bash -s -- rollback '$DEPLOY_VPS_PATH'" < scripts/ops/prod-release.sh
           sleep 20
