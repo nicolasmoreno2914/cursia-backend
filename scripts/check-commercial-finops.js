@@ -37,6 +37,9 @@ Logger.overrideLogger(false);
 const { applyFakeProviderEnv } = require('./lib/provider-test-env');
 const S = require('./lib/commercial-simulation');
 const CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/commercial-simulation/courses.json'), 'utf8'));
+// r61 (Q-24): este check simula cursos comerciales S/M/L con audio real (alto proyectado hasta ≈ 232 MiB); corre con el
+// límite recomendado para producción (300.000.000 B, plan Pro) para medir FinOps, no el bloqueo por tamaño.
+if (!process.env.STORAGE_MAX_UPLOAD_BYTES) process.env.STORAGE_MAX_UPLOAD_BYTES = '300000000';
 const OUT = process.env.T7_OUT_DIR || path.join(os.homedir(), 'cursia-test-env/work/r57/t7-out');
 
 let passes = 0; let failures = 0;

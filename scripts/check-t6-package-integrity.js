@@ -235,9 +235,10 @@ function bankInput() {
   });
 
   await check('I8 presupuesto de tamaño: entorno, veredictos, lo más pesado, códigos clasificados como config retenida', async () => {
-    eq(SZ.packageSizeLimitsFromEnv({}), { warnBytes: null, maxBytes: null }, 'sin variables = solo medir');
+    // r61 (Q-24): sin variables, el límite duro es el de subida del almacenamiento por defecto (50 MB), nunca «solo medir».
+    eq(SZ.packageSizeLimitsFromEnv({}), { warnBytes: 47185920, maxBytes: 52428800 }, 'sin variables = límite de Storage por defecto (50 MB)');
     eq(SZ.packageSizeLimitsFromEnv({ PACKAGE_MBZ_MAX_BYTES: '52428800' }), { warnBytes: 47185920, maxBytes: 52428800 }, 'aviso por defecto = 90 %');
-    eq(SZ.packageSizeLimitsFromEnv({ PACKAGE_MBZ_WARN_BYTES: '1000' }), { warnBytes: 1000, maxBytes: null }, 'solo aviso');
+    eq(SZ.packageSizeLimitsFromEnv({ PACKAGE_MBZ_WARN_BYTES: '1000' }), { warnBytes: 1000, maxBytes: 52428800 }, 'solo aviso (máximo = Storage por defecto)');
     for (const env of [{ PACKAGE_MBZ_MAX_BYTES: '50MB' }, { PACKAGE_MBZ_MAX_BYTES: '0' }, { PACKAGE_MBZ_WARN_BYTES: '-1' }, { PACKAGE_MBZ_WARN_BYTES: '20', PACKAGE_MBZ_MAX_BYTES: '10' }]) {
       let err = null;
       try { SZ.packageSizeLimitsFromEnv(env); } catch (e) { err = e.message; }
