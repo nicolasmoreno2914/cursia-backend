@@ -518,7 +518,10 @@ check('#583 + r62: el reenvío automático ÚNICO de audio TTS incierto (peor ca
     void r;
   }
   // Fuera de la regla: guion LLM (anthropic), video, presentación → C provider_check, nunca reenvío automático.
-  expectVerdict('provider_reconciliation_required: anthropic — guion pagado sin persistir', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
+  // r62 (E2E M, «resultado pagado perdido» — cambio DELIBERADO): el guion del audiolibro COBRADO y no guardado tiene el
+  // reenvío único acotado (auto_resubmit_once); un guion ENVIADO sin resultado (en el aire) sigue siendo provider_check.
+  expectVerdict('provider_reconciliation_required: anthropic — guion pagado sin persistir', { class: 'C', strategy: 'auto_resubmit_once' }, { itemType: 'audiobook_chapter' });
+  expectVerdict('provider_reconciliation_required: anthropic — llamada pagada enviada sin resultado liquidado', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
   assert(FC.currentRecoveryOf('provider_reconciliation_required: anthropic — x', 'audiobook_chapter', {}) === 'denied', 'anthropic');
   for (const itemType of ['video', 'presentation']) {
     expectVerdict(msg, { class: 'C', strategy: 'provider_check' }, { itemType });

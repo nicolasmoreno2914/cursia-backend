@@ -277,7 +277,6 @@ async function pureChecks() {
         eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, { dep: dd(5) }), null, `${st} reciente: dentro del techo`);
         eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, { dep: dd(40) })?.code, 'retry_item', `${st} hace 40 min: acción visible`);
         eq(CPR.claimPayloadRecoveryDecision(cpRow(1)[0], dd(1), 'mock'), { action: 'exception', depKey: 'video:ch1', code: 'VIDEO_YOUTUBE_ID_MISSING', reason: 'dependency_unavailable' }, `${st}: el barrido la registra como excepción`);
-        eq(RC.adminActionFor({ ...cpRow(1)[0], output_summary: { claimPayloadRecovery: { declined: 'dependency_unavailable' } } }, 'not_done', now, { dep: dd(1) })?.code, 'retry_item', `${st}: excepción registrada → acción inmediata`);
       }
       const vjob = { id: 'j', status: 'failed', worker_status: 'failed', input_payload: {} };
       const vm = { items: [{ key: 'video:ch1', type: 'video' }, { key: 'content:x', type: 'video_interactions' }], rulesVersion: 2 };
@@ -805,6 +804,55 @@ async function dbChecks() {
       eq(row.status, 'completed', `completa (${row.error})`);
     });
 
+    // ═══ E2E-M «resultado pagado perdido» (run_interrupt_resume, 2.ª vuelta) ═══════════
+    await check('E2E-M lost_result: TTS de bienvenida COBRADO y liquidado sin el MP3 subido (kill entre liquidar y subir) → el barrido reenvía UNA vez solo, el cobro nuevo queda registrado como posible duplicado (lost_result) y la parte completa; un 2.º perdido → excepción', async () => {
+      const R = await freshRun('r62 lost result');
+      const key = `audio_welcome:${R.cid}`;
+      const it = await itemRow(R.rid, key);
+      const H = loadDist('workers/finops-worker-hooks.js');
+      // Estado del kill: intento 1 con su cargo REAL liquidado (no reserva), ningún artifact.
+      await ledger.recordCharge(H.ttsChargeInput({ ownerId: OWNER, itemRunId: it.id, requestId: 'req_r62_lost_1', audioSeconds: 4, characters: 60,
+        model: 'gpt-4o-mini-tts-2025-03-20', generation: 1, chunk: 0, itemAttempt: 1 }));
+      await ds.query(`update public.generation_item_runs set status = 'retrying', attempt_count = 1, max_attempts = 3, error = 'lease_expired', next_retry_at = now() - interval '1 second' where id = $1`, [it.id]);
+      const t0 = fakes.st.tts.length;
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required: openai .*sin resultado persistido/, 'priorPaidBlock lo frena');
+      eq(fakes.st.tts.length - t0, 0, 'sin llamar todavía');
+      eq(AH.isLostPaidResultError((await itemRow(R.rid, key)).error), true, 'forma de resultado perdido');
+      const res = await runs.autoResubmitAmbiguousAudio({ now: later(3) });
+      eq(resubOf(res, R.rid).length, 1, 'UN reenvío automático');
+      let row = await itemRow(R.rid, key);
+      eq([row.output_summary.ambiguousAudioResubmit.cause, typeof row.output_summary.lostResultResend.afterAttempt], ['lost_result', 'number'], 'marca lost_result');
+      eq((await attempts(row.id)).pop().strategy_applied, 'ambiguous_audio_resubmit:lost_result', 'log: system + motivo');
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      row = await itemRow(R.rid, key);
+      eq(row.status, 'completed', `completa sola (${row.error})`);
+      eq(fakes.st.tts.length - t0, 1, 'una sola llamada (el reenvío)');
+      const charges = await events(`item_run_id = $1 and provider = 'openai' and event_kind = 'CHARGE' and coalesce(metadata->>'reservation','false') <> 'true'`, [row.id]);
+      eq(charges.length, 2, 'el cargo perdido + el del reenvío (registrado, no oculto)');
+      eq(charges.filter((c) => c.metadata.possibleDuplicate === true && c.metadata.lostResultResend === true).length, 1, 'el cobro nuevo = posible duplicado (lost_result)');
+      eq((await reservationsOf(row.id, 'openai')).filter((x) => !x.adj).length, 0, '0 reservas abiertas');
+      assert(await runSpent(R.rid) <= await paidAuthorized(R.rid), 'ledger ≤ autorizado');
+      // Ya hubo un reenvío por resultado perdido → otro perdido es excepción (nunca un 2.º reenvío).
+      eq(AH.ambiguousAudioResubmitDecision({ ...row, status: 'failed', error: row.output_summary.previousErrors.slice(-1)[0].error }, later(10), { pendingUsd: 0, providers: [], lostUsd: 0.01, lostProviders: ['openai'] }, undefined, FITS).reason, 'cap_reached', '2.º → excepción');
+    });
+
+    await check('E2E-M lost_result: el resubmitProvider MANUAL de un pagado ya liquidado marca su cobro nuevo como possible_duplicate', async () => {
+      const R = await freshRun('r62 lost manual');
+      const key = `audio_welcome:${R.cid}`;
+      const it = await itemRow(R.rid, key);
+      const H = loadDist('workers/finops-worker-hooks.js');
+      await ledger.recordCharge(H.ttsChargeInput({ ownerId: OWNER, itemRunId: it.id, requestId: 'req_r62_lost_m', audioSeconds: 4, characters: 60,
+        model: 'gpt-4o-mini-tts-2025-03-20', generation: 1, chunk: 0, itemAttempt: 1 }));
+      await ds.query(`update public.generation_item_runs set status = 'retrying', attempt_count = 1, max_attempts = 3, error = 'lease_expired', next_retry_at = now() - interval '1 second' where id = $1`, [it.id]);
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /sin resultado persistido/, 'frenado');
+      await runs.retryItem(R.cid, OWNER, 1, R.rid, key, false, true, undefined, { id: 'admin-1', email: 'admin@cursia.test' });
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      const row = await itemRow(R.rid, key);
+      eq(row.status, 'completed', `completa (${row.error})`);
+      const charges = await events(`item_run_id = $1 and provider = 'openai' and event_kind = 'CHARGE' and coalesce(metadata->>'reservation','false') <> 'true'`, [row.id]);
+      eq(charges.filter((c) => c.metadata.possibleDuplicate === true).length, 1, 'cobro nuevo marcado');
+    });
+
     // ═══ E2E-M — kill -9 alrededor del envío (TTS del audiolibro) ═════════════════
     await check('E2E-M TTS: kill -9 entre la reserva y el envío → la reserva del segmento (sin marca de envío) se libera sola y la parte completa; kill después del envío → cobrada (possible_duplicate) + reenvío único; 0 reservas abiertas', async () => {
       // (a) muere entre reservar y enviar: simulado con una reserva marcada `sendMarked` del intento 1 sin `paidCallsSent`.
@@ -952,6 +1000,24 @@ async function dbChecks() {
       eq([r3.regenerated, r3.exceptions.map((x) => x.reason)], [[], ['already_regenerated']], 'excepción');
       row = await itemRow(R.rid, iKey);
       eq([row.status, row.attention_reason, row.output_summary.claimPayloadRecovery.declined], ['failed', 'unrecoverable', 'already_regenerated'], 'excepción registrada');
+      // re-review 4 M1: dependencia CANCELADA → sin `declined` (se re-evalúa en cada tick), atención dependency_unavailable;
+      // si la dependencia revive y completa, la parte se reabre sola.
+      const R4 = await freshRun('r62 claim dep cancelada', { videos: true });
+      const v4 = await itemRow(R4.rid, `video:${R4.c1}`);
+      const i4 = await itemRow(R4.rid, `video_interactions:${R4.c1}`);
+      await ds.query(`update public.generation_item_runs set status = 'cancelled', finished_at = now() - interval '1 minute' where id = $1`, [v4.id]);
+      await failAt(i4.id, `claim_payload_unavailable: VIDEO_YOUTUBE_ID_MISSING: el video video:${R4.c1} no tiene youtubeId`, 30);
+      for (let t = 0; t < 2; t++) {
+        const rr = await runs.autoRecoverClaimPayloadUnavailable({ now: new Date() });
+        eq(rr.exceptions.filter((x) => x.reason === 'dependency_unavailable').length >= 1, true, `tick ${t}: excepción (re-evaluada)`);
+      }
+      let x4 = await itemRow(R4.rid, i4.item_key);
+      eq([x4.status, x4.attention_reason, !!(x4.output_summary.claimPayloadRecovery && x4.output_summary.claimPayloadRecovery.declined)], ['failed', 'dependency_unavailable', false], 'sin declined, atención explícita');
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where id = $1`, [v4.id]);
+      const rv = await runs.autoRecoverClaimPayloadUnavailable({ now: new Date() });
+      eq(rv.reopened.includes(i4.item_key), true, 'la dependencia revivió → reabierta sola');
+      x4 = await itemRow(R4.rid, i4.item_key);
+      eq([x4.status, x4.attention_reason], ['pending', null], 'reabierta (atención limpia)');
     });
 
     assert(!LOGS.some((l) => Object.values(SECRETS).some((s) => l.includes(s))), 'ninguna clave en los logs');

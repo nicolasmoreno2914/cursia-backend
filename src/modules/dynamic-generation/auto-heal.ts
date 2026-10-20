@@ -448,8 +448,17 @@ export const AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS = 1;
 export const AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS = 120;
 export const AMBIGUOUS_AUDIO_RESUBMIT_CODE = 'ambiguous_audio_resubmit';
 /** Regex POSIX gruesa del barrido (la decisión fina es ambiguousAudioResubmitDecision). */
-export const AMBIGUOUS_AUDIO_RESUBMIT_SQL_REGEX = `^${PROVIDER_RECONCILIATION_REQUIRED}: openai([^a-z0-9_]|$)`;
+export const AMBIGUOUS_AUDIO_RESUBMIT_SQL_REGEX = `^${PROVIDER_RECONCILIATION_REQUIRED}: (openai|anthropic)([^a-z0-9_]|$)`;
 const AMBIGUOUS_AUDIO_RESUBMIT_RE = new RegExp(`^${PROVIDER_RECONCILIATION_REQUIRED}: openai(?![a-z0-9_])`);
+/**
+ * r62 (E2E M, «resultado pagado perdido»): la llamada pagada se LIQUIDÓ (cargo real en el ledger) pero su resultado no
+ * quedó guardado (kill -9 entre liquidar y subir, o un fallo al subir): el intento siguiente lo frena priorPaidBlock con
+ * «… sin resultado persistido» / «… pagado sin persistir». OpenAI (TTS) y, en el audiolibro, Anthropic (guion por bloque).
+ */
+const LOST_RESULT_RE = new RegExp(`^${PROVIDER_RECONCILIATION_REQUIRED}: (openai|anthropic)(?![a-z0-9_]).*(sin resultado persistido|pagad[oa] sin persistir)`);
+export function isLostPaidResultError(error: string | null | undefined): boolean {
+  return LOST_RESULT_RE.test(String(error ?? ''));
+}
 /**
  * r59 / r62 (K2): TIMEOUT del CLIENTE, anclado al formato de `send()` en provider-clients.ts («error de red
  * (TimeoutError)») y al mensaje del AbortSignal («aborted due to timeout»). Nunca a un «timeout» cualquiera: el cuerpo
@@ -464,6 +473,7 @@ const AMBIGUOUS_AUDIO_DENY: readonly RegExp[] = Object.freeze(
 );
 
 /** Causa de la ambigüedad del audio (motivo en el ledger y en el log de intentos). */
+export type AmbiguousAudioCause = 'timeout_presumed_charged' | 'connection_cut' | 'lost_result';
 export function ambiguousAudioCause(error: string | null | undefined): 'timeout_presumed_charged' | 'connection_cut' {
   return AMBIGUOUS_AUDIO_TIMEOUT_RE.test(String(error ?? '')) ? 'timeout_presumed_charged' : 'connection_cut';
 }
@@ -486,6 +496,13 @@ export interface AmbiguousAudioPending {
    * guardados se reutilizan); bienvenida = todo lo del último intento (sus trozos no se guardan por separado).
    */
   resendUsd?: number;
+  /**
+   * r62 (resultado pagado perdido): cargos YA liquidados de intentos no reconocidos cuyo resultado no quedó guardado (USD)
+   * y sus proveedores. Con pendingUsd = 0 y lostUsd > 0 el caso es `lost_result`: no hay nada que liquidar; el reenvío
+   * vuelve a pagar eso (cota = lostUsd) y su cargo nuevo queda marcado como posible duplicado.
+   */
+  lostUsd?: number;
+  lostProviders?: string[];
 }
 
 /** r62: resultado de ambiguousResendBudget (finops/run-spend-guard.ts) para el reenvío de ESTE item. */
@@ -499,7 +516,7 @@ export interface AmbiguousAudioBudget {
 }
 
 export type AmbiguousAudioDecision =
-  | { heal: true; round: number; pendingUsd: number | null; cause: 'timeout_presumed_charged' | 'connection_cut' }
+  | { heal: true; round: number; pendingUsd: number | null; cause: AmbiguousAudioCause }
   | { heal: false; reason: AutoHealSkipReason | 'declined' | 'over_threshold' | 'over_budget' | 'not_audio'; retryAt?: Date; pendingUsd?: number | null; budgetReason?: string | null };
 
 /**
@@ -518,7 +535,9 @@ export function ambiguousAudioResubmitDecision(
   if (!row.type || !AMBIGUOUS_AUDIO_RESUBMIT_TYPES.includes(row.type)) return { heal: false, reason: 'not_audio' };
   const error = String(row.error ?? '').trim();
   if (!error) return { heal: false, reason: 'no_error' };
-  if (!AMBIGUOUS_AUDIO_RESUBMIT_RE.test(error)) return { heal: false, reason: 'not_allow_listed' };
+  const lostShape = isLostPaidResultError(error);
+  // El guion LLM (anthropic) entra SOLO como resultado pagado perdido (nada en el aire, el ledger lo sabe).
+  if (!AMBIGUOUS_AUDIO_RESUBMIT_RE.test(error) && !(lostShape && row.type === 'audiobook_chapter')) return { heal: false, reason: 'not_allow_listed' };
   if (AMBIGUOUS_AUDIO_DENY.some((re) => re.test(error))) return { heal: false, reason: 'denied' };
   const os = (row.output_summary ?? {}) as Record<string, any>;
   if (os.ambiguousAudioResubmit?.declined) return { heal: false, reason: 'declined' };
@@ -527,14 +546,20 @@ export function ambiguousAudioResubmitDecision(
   const failedAt = toDate(row.finished_at) ?? toDate(row.updated_at);
   if (failedAt && now.getTime() - failedAt.getTime() > policy.maxAgeHours * 3_600_000) return { heal: false, reason: 'too_old' };
   let pendingUsd: number | null = null;
+  let cause: AmbiguousAudioCause = ambiguousAudioCause(error);
   if (pending !== undefined) {
-    // Sin nada incierto, o con algo incierto de OTRO proveedor (p.ej. el guion LLM): no es este caso.
-    if (!pending || !(pending.pendingUsd > 0) || pending.providers.length === 0 || pending.providers.some((p) => p !== 'openai')) {
+    const lostOk = !!pending && !(pending.pendingUsd > 0) && (pending.lostUsd ?? 0) > 0 && lostShape
+      && (pending.lostProviders ?? []).length > 0
+      && (pending.lostProviders ?? []).every((p) => p === 'openai' || (p === 'anthropic' && row.type === 'audiobook_chapter'));
+    if (lostOk) {
+      cause = 'lost_result';
+    } else if (!pending || !(pending.pendingUsd > 0) || pending.providers.length === 0 || pending.providers.some((p) => p !== 'openai')) {
+      // Sin nada incierto, o con algo incierto de OTRO proveedor (p.ej. el guion LLM): no es este caso.
       return { heal: false, reason: 'missing_precondition', pendingUsd: pending ? pending.pendingUsd : null };
     }
     pendingUsd = pending.pendingUsd;
     const maxUsd = opts.maxUsd;
-    if (typeof maxUsd === 'number' && maxUsd >= 0 && Math.max(pendingUsd, pending.resendUsd ?? 0) > maxUsd) return { heal: false, reason: 'over_threshold', pendingUsd };
+    if (typeof maxUsd === 'number' && maxUsd >= 0 && Math.max(pendingUsd, pending.resendUsd ?? 0, pending.lostUsd ?? 0) > maxUsd) return { heal: false, reason: 'over_threshold', pendingUsd };
     // r62: el peor caso tiene que entrar en lo autorizado (presupuesto de la parte + saldo del run). Sin evaluación del
     // presupuesto el barrido nunca reenvía (falla cerrado): budget === null.
     if (opts.budget === null || (opts.budget && !opts.budget.fits)) {
@@ -545,7 +570,7 @@ export function ambiguousAudioResubmitDecision(
     const retryAt = new Date(failedAt.getTime() + AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS * 1000);
     if (now.getTime() < retryAt.getTime()) return { heal: false, reason: 'backoff', retryAt, pendingUsd };
   }
-  return { heal: true, round: rounds + 1, pendingUsd, cause: ambiguousAudioCause(error) };
+  return { heal: true, round: rounds + 1, pendingUsd, cause };
 }
 
 export function autoHealEnabled(env: Record<string, string | undefined> = process.env): boolean {

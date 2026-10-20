@@ -101,6 +101,7 @@ import {
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
 import { settleAmbiguousAsPossibleDuplicate } from '../finops/ambiguous-resend';
+import { LOST_RESULT_RESEND_KEY, persistedPaidOpIds } from './lost-result';
 import { spendBlockReason } from '../finops/spend-controls';
 import { SPEND_CONTROL_RESUME_STRATEGY, spendControlHoldOf } from '../reliability/spend-control-hold';
 import {
@@ -2288,6 +2289,8 @@ export class RunsService {
 
     // r62: reservas inciertas del intento previo a liquidar tras un reenvío explícito (resubmitProvider).
     let resubmitPriorReservations: { keys: string[]; providers: string[]; itemRunId: string } | null = null;
+    // r62 (resultado pagado perdido): el intento que sigue reenvía algo ya cobrado → sus cargos llevan possible_duplicate.
+    let lostResultResend = false;
     const targetId = await this.tx(async (qr) => {
       // I1: lock del curso primero — este reintento puede reabrir el run.
       await this.lockCourseRuns(qr, courseId);
@@ -2397,6 +2400,7 @@ export class RunsService {
         }
         autoMeta = { round: d.round, code: AMBIGUOUS_AUDIO_RESUBMIT_CODE, pendingUsd: d.pendingUsd, cause: d.cause,
           resendUsd: pending.resendUsd ?? null, possibleDuplicateKeys: pending.keys ?? [] };
+        if (d.cause === 'lost_result') lostResultResend = true;
       } else if (auto && auto.dependencyResolved) {
         // r62 (d8): misma decisión que el barrido, con las filas del run bloqueadas.
         const depKey = claimPayloadDependencyKey(target as ClaimPayloadRow);
@@ -2486,6 +2490,8 @@ export class RunsService {
         // possible_duplicate (después del commit), así nunca queda una reserva abierta con la parte completada.
         const prev = await this.ambiguousAudioPending(qr, target.id, target.output_summary, target.type);
         resubmitPriorReservations = { keys: prev.keys ?? [], providers: prev.providers, itemRunId: String(target.id) };
+        // r62 (resultado pagado perdido): un reenvío explícito de algo YA cobrado marca su cargo nuevo como posible duplicado.
+        if ((prev.lostUsd ?? 0) > 0) lostResultResend = true;
         // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
@@ -2599,7 +2605,9 @@ export class RunsService {
               set status = 'pending',
                   max_attempts = attempt_count + $2::int,
                   -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
-                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`},
+                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
+                    || case when $5::boolean then jsonb_build_object('${LOST_RESULT_RESEND_KEY}', jsonb_build_object('at', now(), 'afterAttempt', attempt_count, 'cause', 'lost_result'))
+                            else '{}'::jsonb end,
                   error = null,
                   next_retry_at = null,
                   worker_id = null,
@@ -2609,7 +2617,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(topExtra)],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(topExtra), lostResultResend],
         ),
       );
       if (updated.length !== 1) {
@@ -2921,6 +2929,14 @@ export class RunsService {
       const d = claimPayloadRecoveryDecision(r, dep ?? null, this.videoModeOf(r));
       try {
         if (d.action === 'wait') { out.waiting.push(r.item_key); continue; }
+        if (d.action === 'exception' && d.reason === 'dependency_unavailable') {
+          // r62 (re-review 4 M1): dependencia cancelada / omitida — SIN `declined` (el barrido la re-evalúa en cada tick y
+          // la reabre sola si la dependencia revive); queda la atención explícita y el log.
+          await this.recordAttention(r.id, 'dependency_unavailable');
+          out.exceptions.push({ itemKey: r.item_key, reason: d.reason });
+          this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) — la dependencia ${d.depKey} no está disponible (cancelada / omitida); se re-evalúa en cada tick`);
+          continue;
+        }
         if (d.action === 'exception') {
           await decline(r, d.reason, d.reason === 'contract' ? 'product_bug' : 'unrecoverable');
           if (d.reason === 'real_video_requires_review') {
@@ -3274,7 +3290,20 @@ export class RunsService {
       [itemRunId, ack],
     );
     const pendingUsd = rows.reduce((t, r) => t + Number(r.amount || 0), 0);
-    let resendUsd = pendingUsd;
+    // r62 (resultado pagado perdido): cargos YA liquidados (no reservas) de intentos no reconocidos cuyo resultado no quedó
+    // guardado en el item (bienvenida: nunca se guarda por trozo; audiolibro: fuera de sus segmentos / bloques guardados).
+    const lostRows: Array<{ provider: string; amount: string; op: string | null }> = await q.query(
+      `select e.provider, e.amount::text as amount, e.external_operation_id as op from public.generation_cost_events e
+        where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock'
+          and e.provider in ('openai', 'anthropic')
+          and not coalesce((e.metadata->>'reservation') = 'true', false)
+          and coalesce(e.attempt, 0) > $2::int`,
+      [itemRunId, ack],
+    );
+    const persisted = persistedPaidOpIds(outputSummary);
+    const lost = lostRows.filter((r) => !(r.op && persisted.has(String(r.op))));
+    const lostUsd = lost.reduce((t, r) => t + Number(r.amount || 0), 0);
+    let resendUsd = pendingUsd > 0 ? pendingUsd : lostUsd;
     if (itemType === 'audio_welcome' && rows.length > 0) {
       const [paid] = await q.query(
         `select coalesce(sum(e.amount), 0)::text as t from public.generation_cost_events e
@@ -3290,6 +3319,8 @@ export class RunsService {
       providers: [...new Set(rows.map((r) => String(r.provider)))].sort(),
       keys: rows.map((r) => String(r.key)),
       resendUsd,
+      lostUsd,
+      lostProviders: [...new Set(lost.map((r) => String(r.provider)))].sort(),
     };
   }
 
@@ -3313,7 +3344,7 @@ export class RunsService {
   private recoveryLedgerInstance: FinopsLedgerService | null = null;
 
   /** r62: la excepción queda registrada con un attention_reason explícito (no-op sin el esquema REL R2). */
-  private async recordAttention(itemRunId: string, reason: 'budget' | 'config' | 'duplicate_charge' | 'unrecoverable' | 'product_bug'): Promise<void> {
+  private async recordAttention(itemRunId: string, reason: 'budget' | 'config' | 'duplicate_charge' | 'unrecoverable' | 'product_bug' | 'dependency_unavailable'): Promise<void> {
     try {
       if (!(await relSchemaReady(this.dataSource))) return;
       await this.dataSource.query(`update public.generation_item_runs set attention_reason = $2 where id = $1 and status in ('failed', 'blocked')`, [itemRunId, reason]);
