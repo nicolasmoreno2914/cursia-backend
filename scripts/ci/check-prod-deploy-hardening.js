@@ -188,10 +188,13 @@ async function workflowChecks() {
     eq([...new Set(migr)].sort(), ['migrate-production-jobs-constraints.js', 'migrate-usage-events-costs.js'], 'solo las 2 migraciones de siempre');
     // El paso que calcula las claves produce base64 de JSON válido con la forma esperada.
     const pk = steps[idx((x) => x.id === 'pricing', 'pricing')];
-    const r = spawnSync('bash', ['-c', pk.run], { cwd: REPO, env: { PATH: process.env.PATH, GITHUB_OUTPUT: '/dev/stdout' }, encoding: 'utf8' });
+    // GITHUB_OUTPUT a un archivo temporal: en el runner de CI no hay /dev/stdout.
+    const ghOut = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'pricing-')), 'out');
+    fs.writeFileSync(ghOut, '');
+    const r = spawnSync('bash', ['-c', pk.run], { cwd: REPO, env: { PATH: process.env.PATH, GITHUB_OUTPUT: ghOut }, encoding: 'utf8' });
     eq(r.status, 0, `pricing: ${r.stderr}`);
     const P = require(path.join(REPO, 'scripts/prod/v2-schema-probes.js'));
-    const lines = Object.fromEntries(r.stdout.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+    const lines = Object.fromEntries(fs.readFileSync(ghOut, 'utf8').trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
     eq(P.decodeKeys(lines.seed, 'seed').length, require(path.join(REPO, 'src/modules/finops/pricing-seed.v1.json')).rows.length, 'seed completo');
     assert(P.decodeKeys(lines.proposal, 'proposal').length > 0, 'propuesta r60');
   });
