@@ -1042,14 +1042,19 @@ async function dbChecks() {
       const settleFails = (k) => k === 'settleReservation';
       // OpenAI TTS
       let c0 = counts();
+      // r62 (E2E M, «resultado pagado perdido» — cambio DELIBERADO): la bienvenida SUBE el MP3 antes de liquidar. Si la
+      // liquidación falla, el audio pagado ya está guardado: el reintento lo reutiliza y liquida la reserva (sin repago
+      // ni reconciliación humana).
       let item = await claimProvider(R.rid, 'audio_welcome');
-      await rejectsRe(PW.processProviderItem(workerDeps({ finops: faulty(ledger, settleFails) }), item), /^provider_reconciliation_required: openai/, 'TTS');
+      await PW.processProviderItem(workerDeps({ finops: faulty(ledger, settleFails) }), item);
       let row = await itemRow(R.rid, item.itemKey);
-      eq([row.status, delta(c0).tts], ['failed', 1], 'TTS: failed tras 1 llamada');
+      eq([row.status, delta(c0).tts, /finops_ledger_write_failed/.test(String(row.error))], ['retrying', 1, true], `TTS: reintentable tras 1 llamada (${row.error})`);
       eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false], 'TTS: reserva pendiente (cuenta en el presupuesto)');
-      await runs.retryItem(R.cid, OWNER, 1, R.rid, item.itemKey);
-      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required/, 'TTS retry común');
-      eq(delta(c0).tts, 1, 'TTS: 0 llamadas nuevas en el retry común');
+      await retryNow(row.id);
+      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
+      row = await itemRow(R.rid, item.itemKey);
+      eq([row.status, delta(c0).tts], ['completed', 1], 'TTS: el reintento reutiliza el MP3 subido (0 llamadas nuevas)');
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [true], 'TTS: la reserva quedó liquidada (cobrada, conservador)');
       // Anthropic (guion del audiolibro)
       c0 = counts();
       item = await claimProvider(R.rid, 'audiobook_chapter');
@@ -1083,15 +1088,12 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [row.id]);
       await sched.sweepExpiredLeases(R.rid);
       await retryNow(row.id);
-      // r61 (Q-21): el chunk enviado y sin liquidar puede seguir en vuelo → primero devuelta sin llamar; pasada la ventana, reconciliación.
+      // r62 (E2E M — cambio DELIBERADO): el MP3 pagado se subió ANTES de liquidar → el re-claim lo reutiliza y completa,
+      // con 0 llamadas nuevas y la reserva liquidada (antes: ventana en vuelo + reconciliación humana).
       await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
       row = await itemRow(R.rid, item.itemKey);
-      assert(row.status === 'retrying' && /^prior_call_in_flight/.test(row.error) && delta(c0).tts === 1, `devuelta en la ventana (${row.status} ${row.error})`);
-      await ageInFlightMarkers(row.id);
-      await retryNow(row.id);
-      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required/, 're-claim');
-      row = await itemRow(R.rid, item.itemKey);
-      eq([row.status, delta(c0).tts], ['failed', 1], 're-claim: reconciliación, 0 llamadas nuevas');
+      eq([row.status, delta(c0).tts], ['completed', 1], `re-claim: reutiliza el MP3 subido, 0 llamadas nuevas (${row.status} ${row.error})`);
+      eq((await reservationsOf(row.id, 'openai')).every((x) => x.settled), true, 're-claim: ninguna reserva abierta');
       // Variante: la liquidación SÍ quedó, pero el audio pagado no se pudo subir y la DB tampoco deja fallar el item.
       const c1 = counts();
       item = await claimProvider(R.rid, 'audiobook_chapter');

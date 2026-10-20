@@ -35,7 +35,7 @@ import {
 // cliente) si el peor caso entra en lo autorizado (presupuesto de recuperación de la parte + saldo del run). La decisión
 // (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa la misma función pura SIN ledger para informar qué hace hoy
 // el sistema.
-import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv, autoRecoveryEnabled } from '../dynamic-generation/auto-heal';
+import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv, autoRecoveryEnabled, isLostPaidResultError } from '../dynamic-generation/auto-heal';
 // r62 (N2): conciliación automática de Videogen/Gamma con la evidencia del proveedor (+ reenvío acotado).
 import { PROVIDER_RECONCILE_MAX_RESUBMITS, providerReconcileDecision } from '../dynamic-generation/provider-reconcile';
 import { spendControlHoldOf } from './spend-control-hold';
@@ -553,12 +553,14 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     // etiqueta refleja lo que pasa DE VERDAD: con su reenvío ya usado o rechazado (presupuesto) es una excepción para un
     // humano (hold_for_human), no «reenvío automático».
     refine: ({ error, itemType, outputSummary }) => {
-      if (!(/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error) && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter'))) return null;
+      // r62 (resultado pagado perdido): también el guion LLM del audiolibro cobrado y no guardado (un reenvío acotado).
+      const lostLlm = itemType === 'audiobook_chapter' && isLostPaidResultError(error);
+      if (!((/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error) || lostLlm) && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter'))) return null;
       const used = outputSummary?.ambiguousAudioResubmit;
       if (used && (used.declined || Number(used.rounds ?? 0) >= 1)) {
-        return { strategy: 'hold_for_human', provider: 'openai', rounds: 0, humanReason: /budget|presupuesto|over_threshold/i.test(String(used.declined ?? '')) ? 'budget' : 'duplicate_charge' };
+        return { strategy: 'hold_for_human', provider: lostLlm ? 'anthropic' : 'openai', rounds: 0, humanReason: /budget|presupuesto|over_threshold/i.test(String(used.declined ?? '')) ? 'budget' : 'duplicate_charge' };
       }
-      return { strategy: 'auto_resubmit_once', provider: 'openai' };
+      return { strategy: 'auto_resubmit_once', provider: lostLlm && !/^provider_reconciliation_required: openai/.test(error) ? 'anthropic' : 'openai' };
     },
     class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
   },

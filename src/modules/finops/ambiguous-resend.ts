@@ -13,7 +13,7 @@ export const POSSIBLE_DUPLICATE_ACTOR = 'system';
 export const POSSIBLE_DUPLICATE_RECORDED_BY = 'auto-recovery';
 
 /** Motivo de la ambigüedad (texto estable para el ledger y el log de intentos). */
-export type AmbiguityCause = 'timeout_presumed_charged' | 'connection_cut' | 'unknown_result' | 'manual_resubmit';
+export type AmbiguityCause = 'timeout_presumed_charged' | 'connection_cut' | 'unknown_result' | 'manual_resubmit' | 'lost_result';
 
 export interface PossibleDuplicateSettlement {
   settled: string[];
