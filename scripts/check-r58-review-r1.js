@@ -529,6 +529,8 @@ async function dbChecks() {
       assert(freshPath !== rebuiltPath && freshPath !== CANONICAL, 'ruta nueva');
       assert(storage.objects.get(objKey(freshPath)).equals(fresh), 'bytes del rebuild en la ruta nueva');
       eq(jr.output_summary.artifactId, rows[rows.length - 1].id, 'artifact del job = row nuevo');
+      // r62 review M3: el row nuevo lleva el checksum del servidor de los bytes del rebuild (lo exige el próximo reuse).
+      eq([rows[rows.length - 1].checksum_sha256, rows[rows.length - 1].storage_path], [sha(fresh), freshPath], 'checksum y ruta del row nuevo');
       assert(!postsDuring.some((c) => c.url.endsWith(encodeURIComponent(`${KEY}.mbz`)) || c.url.endsWith(encodeURIComponent(rebuiltPath.split('/').pop()))), 'ningún POST a las rutas referenciadas');
       assert(storage.objects.get(objKey(CANONICAL)).equals(DELIVERED) && storage.objects.get(objKey(rebuiltPath)).equals(builds[0]), 'objetos entregados intactos');
       const v = FC.classifyFailure({ error: 'PACKAGE_REUSE_VERIFY_UNAVAILABLE: x', source: 'package_worker' });

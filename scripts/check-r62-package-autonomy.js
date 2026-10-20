@@ -9,10 +9,14 @@
 //   [K4]  Storage falla al descargar el paquete existente para re-verificarlo → el job NO falla: reconstruye en una
 //         ruta NUEVA (`<clave>.<sha16>.mbz`), sin POST a la ruta referenciada.
 //   [d6]  cuota de YouTube: espera larga (7 días) con alerta a las 24 h; agotada → `youtube_quota_exhausted` (D config,
-//         resolve_youtube, nunca reabierto en silencio). El paquete final v3 exige hoy cada video en YouTube.
+//         resolve_youtube, nunca reabierto en silencio). Review M1: gate GLOBAL (medianoche PT) + turno FIFO, con el SQL
+//         real en PG16. El paquete final v3 exige hoy cada video en YouTube.
 //   [d14] DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS: default vacío en el código y ausente de ambos deploys (staging solo avisa);
 //         la herramienta de modo fábrica sigue funcionando si se define.
-//   [K5]  hold persistente de workers (DYNAMIC_WORKERS_HOLD) visible en el run (`RunDto.workersHold`: estado y motivo).
+//   [K5]  hold persistente de workers (DYNAMIC_WORKERS_HOLD) visible en el run (`RunDto.workersHold`: estado y motivo);
+//         review M2: al dueño solo estado + motivo genérico (sin variables ni procesos).
+//   Review I1: Storage 4xx / config, CONTENT_MISSING y ERR_BUFFER_TOO_LARGE nunca transitorios; `ensure` sin clasificar
+//         conserva el tope de 5 (c10). Review M3: el row del rebuild K4 es reutilizable (checksum = validatedSha256).
 //
 // Sin red (fetch prohibido salvo 127.0.0.1), USD 0. PG16 desechable en un puerto libre ≠ 5570 / 8099 para [d7] SQL
 // (si no hay PG16 → ese sub-caso falla: setear PG_BIN). Usage: npm run build && node scripts/check-r62-package-autonomy.js
@@ -163,6 +167,27 @@ const ON = { DYNAMIC_COURSE_STRUCTURE: 'true' }; // tick del auto-healer encendi
     eq([v.class, v.code, v.transient], ['D', 'MBZ_V3_VALIDATION_FAILED', false], 'BLOCKER determinista');
     eq(FC.classifyFailure({ source: 'package_worker', error: 'MBZ_V3_VALIDATION_FAILED: x' }).humanReason, 'product_bug', 'c11 sigue product_bug');
     eq(T('build falló (simulado)').transient, false, 'sin clasificar');
+    // r62 review I1: deterministas que antes eran A (y con r62 se habrían reintentado 72 h) → NO transitorios.
+    const det = [
+      ['PACKAGING_V3_CONTENT_MISSING: faltan 1 contenido(s): content:c1', 'B', 'PACKAGING_V3_CONTENT_MISSING', null],
+      ['ERR_BUFFER_TOO_LARGE: Cannot create a Buffer larger than 4294967296 bytes', 'D', 'ERR_BUFFER_TOO_LARGE', 'product_bug'],
+      ['Supabase Storage download failed: 404 {"error":"not_found","message":"Object not found"}', 'D', 'PACKAGE_STORAGE_NOT_FOUND', 'product_bug'],
+      ['Supabase Storage upload failed: 413 Payload too large', 'D', 'PACKAGE_STORAGE_TOO_LARGE', 'config'],
+      ['Supabase Storage upload failed: 403 new row violates row-level security policy', 'D', 'PACKAGE_STORAGE_FORBIDDEN', 'config'],
+      ['SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required to upload artifacts', 'D', 'PACKAGE_STORAGE_CONFIG', 'config'],
+    ];
+    for (const [m, cls, code, why] of det) {
+      const r = T(m);
+      const v = FC.classifyFailure({ source: 'package_worker', error: m });
+      eq([r.transient, r.class, r.code, v.humanReason, v.unclassified], [false, cls, code, why, false], `determinista: ${m}`);
+    }
+    // 5xx / 429 de Storage siguen transitorios; el restore no cambia (respaldo pre-r62).
+    for (const m of ['Supabase Storage download failed: 503 Service Unavailable', 'Supabase Storage upload failed: 429 Too Many Requests', 'HTTP 502 Bad Gateway']) eq(T(m).transient, true, m);
+    eq(FC.classifyFailure({ source: 'restore_worker', error: 'Supabase Storage download failed: 404' }).code, 'RESTORE_INFRA_UNKNOWN', 'restore sin cambios');
+    // `ensure`: solo lo clasificado A queda sin tope.
+    const APS = L('modules/dynamic-packaging/auto-package.service.js');
+    eq([APS.ensureErrorIsTransient(new Error('Connection terminated unexpectedly')), APS.ensureErrorIsTransient(new TypeError("Cannot read properties of undefined (reading 'x')")),
+      APS.ensureErrorIsTransient(new Error('Supabase Storage download failed: 404'))], [true, false, false], 'ensure: A vs sin clasificar / determinista');
     // Integración: el worker real (processItem) deja `output_summary.failure` en el UPDATE del fallo.
     const ds = fakeDataSource();
     const { deps } = workerDeps(ds, { uploadThrows: new Error('Supabase Storage upload failed: 503 Service Unavailable') });
@@ -211,14 +236,20 @@ const ON = { DYNAMIC_COURSE_STRUCTURE: 'true' }; // tick del auto-healer encendi
     eq([old.autoRetryPending, old.hardFailedSinceMark], [false, 3], 'jobs viejos sin registro: tope de siempre');
     // Transitorio de ensure (sin job): sin tope de rondas, espera creciente.
     const tr = await AP.loadAutoPackageState(qOf([]), runOf(hAgo(10), { count: 9, at: sAgo(4000).toISOString() }), NOW, ON, 3);
-    eq([tr.status, tr.autoRetryPending, tr.alert], ['none', true, AP.PACKAGE_TRANSIENT_RETRYING_ALERT], 'ensure: 9 transitorios siguen pendientes (antes: agotado en 5)');
+    eq([tr.status, tr.autoRetryPending, tr.alert], ['none', false, null], 'marca vieja sin `unclassified`: cuenta como NO clasificado → agotado en 5 (c10)');
+    const trA = await AP.loadAutoPackageState(qOf([]), runOf(hAgo(10), { count: 9, unclassified: 0, at: sAgo(4000).toISOString() }), NOW, ON, 3);
+    eq([trA.status, trA.autoRetryPending, trA.alert], ['none', true, AP.PACKAGE_TRANSIENT_RETRYING_ALERT], 'ensure: 9 transitorios A siguen pendientes (antes: agotado en 5)');
+    const trU = await AP.loadAutoPackageState(qOf([]), runOf(hAgo(10), { count: 9, unclassified: 5, at: sAgo(4000).toISOString() }), NOW, ON, 3);
+    eq([trU.autoRetryPending, trU.attentionReason], [false, AP.PACKAGE_ATTEMPTS_EXHAUSTED], 'ensure: 5 sin clasificar → tope de siempre');
   });
 
-  await check('[d7] barrido (SQL, PG16 desechable) ≡ estado: selecciona tras la espera creciente, no antes; 6 transitorios siguen candidatos; 3 deterministas o > 72 h no', async () => {
+  await check('[d7 + d6/M1] SQL real (PG16 desechable, LC_ALL=C): barrido ≡ estado (espera creciente; 6 transitorios siguen; 3 deterministas o > 72 h no) y gate global de cuota de YouTube + turno FIFO', async () => {
     const pgBin = findPgBin();
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'r62P-pg-'));
     const port = await freePort();
-    const pg = (bin, args) => spawnSync(path.join(pgBin, bin), args, { encoding: 'utf8' });
+    // r62 review M4: PG16 en macOS aborta («postmaster became multithreaded») sin un locale C.
+    const pgEnv = { ...process.env, LC_ALL: 'C', LANG: 'C' };
+    const pg = (bin, args) => spawnSync(path.join(pgBin, bin), args, { encoding: 'utf8', env: pgEnv });
     let started = false;
     const { Client } = require('pg');
     let c = null;
@@ -265,6 +296,20 @@ const ON = { DYNAMIC_COURSE_STRUCTURE: 'true' }; // tick del auto-healer encendi
         const st = await AP.loadAutoPackageState(q, (await q.query(`select * from public.production_jobs where id = $1`, [id]))[0], new Date(), ON, 3);
         eq(st.autoRetryPending, false, `estado ≡ SQL (${id === C ? 'C' : 'B'})`);
       }
+      // ── r62 review M1: gate GLOBAL de cuota de YouTube y turno FIFO, con el SQL real del worker ──
+      await c.query(`create table public.generation_item_runs (id uuid primary key default gen_random_uuid(), type text, status text, output_summary jsonb default '{}'::jsonb)`);
+      const ds = { query: async (sql, params) => (await c.query(sql, params)).rows };
+      eq(await IW.youtubeQuotaGateUntil(ds, new Date()), null, 'sin marcas: gate abierto');
+      const future = new Date(Date.now() + 5 * 3600 * 1000);
+      const ins = async (status, os) => (await c.query(`insert into public.generation_item_runs (type, status, output_summary) values ('video', $1, $2::jsonb) returning id`, [status, JSON.stringify(os)])).rows[0].id;
+      const v1 = await ins('retrying', { delivery: 'blocked_quota', youtubeQuotaSince: hAgo(5).toISOString(), youtubeQuotaBlockedUntil: future.toISOString() });
+      const v2 = await ins('retrying', { delivery: 'blocked_quota', youtubeQuotaSince: hAgo(3).toISOString(), youtubeQuotaBlockedUntil: future.toISOString() });
+      await ins('completed', { delivery: 'completed', youtubeQuotaBlockedUntil: new Date(Date.now() + 99 * 3600 * 1000).toISOString() }); // cerrado: no cuenta
+      await ins('retrying', { delivery: 'blocked_quota', youtubeQuotaBlockedUntil: 'basura' }); // marca inválida: ignorada
+      eq((await IW.youtubeQuotaGateUntil(ds, new Date())).toISOString(), future.toISOString(), 'gate = marca más lejana de un video abierto (de cualquier curso)');
+      eq(await IW.youtubeQuotaGateUntil(ds, new Date(future.getTime() + 1000)), null, 'vencido → abierto');
+      eq([await IW.youtubeQuotaQueueRank(ds, v1, hAgo(5).toISOString()), await IW.youtubeQuotaQueueRank(ds, v2, hAgo(3).toISOString()),
+        await IW.youtubeQuotaQueueRank(ds, '00000000-0000-4000-8000-000000000000', NOW.toISOString())], [0, 1, 2], 'turno FIFO por llegada (el nuevo, al final)');
     } finally {
       try { if (c) await c.end(); } catch {}
       if (started) pg('pg_ctl', ['-D', dataDir, '-m', 'immediate', '-w', 'stop']);
@@ -290,6 +335,17 @@ const ON = { DYNAMIC_COURSE_STRUCTURE: 'true' }; // tick del auto-healer encendi
     assert(uploads[0].storagePath !== canonical && uploads[0].upsert === false, 'nunca la ruta referenciada, upsert:false');
     eq(ds.state.completed[0].summary.reused, false, 'no reutilizado');
     assert(lg.calls.warn.some((m) => /^PACKAGE_REUSE_VERIFY_UNAVAILABLE:/.test(m)), 'aviso en el log');
+    // r62 review M3: el row nuevo es reutilizable en el próximo job: checksum = validatedSha256 = sha(bytes subidos), ruta variante.
+    eq(sha(uploads[0].buffer), sha(bytes), 'bytes subidos = build');
+    const newRow = { id: 'artifact-1', storageBucket: 'cursia-artifacts', storagePath: uploads[0].storagePath, checksumSha256: sha(uploads[0].buffer),
+      metadata: { ...uploads[0].metadata, validatedSha256: sha(uploads[0].buffer) } };
+    const EXP = { ownerId: 'owner-1', courseId: 'fc-1', manifestId: 1, runId: 'run-1', sourceIdsHash: h, qa: false };
+    eq(await RV.verifyReusableDynamicMbz({ downloadStorageObject: async () => uploads[0].buffer }, newRow, EXP, { requireValidated: true }), { ok: true }, 'row nuevo verificable (v3: validatedSha256 = checksum)');
+    eq(await RV.verifyReusableDynamicMbz({ downloadStorageObject: async () => uploads[0].buffer }, { ...newRow, metadata: { ...newRow.metadata, validatedSha256: 'f'.repeat(64) } }, EXP, { requireValidated: true }),
+      { ok: false, reason: 'not_validated' }, 'sin validatedSha256 igual al checksum no se reutiliza');
+    // v3: el upload del rebuild escribe validatedSha256 = sha256Hex(built.mbz), los mismos bytes que sube (código compilado).
+    const wsrc = fs.readFileSync(path.join(distRoot, 'workers/dynamic-package-worker.js'), 'utf8');
+    assert(/buffer: built\.mbz,[\s\S]{0,6000}validatedSha256: \(0, artifacts_service_[0-9]+\.sha256Hex\)\(built\.mbz\)/.test(wsrc), 'v3: validatedSha256 de los bytes subidos');
   });
 
   console.log('\n=== [d6] cuota de YouTube: espera larga con alerta, sin retry manual a las 24 h ===');
@@ -342,7 +398,16 @@ const ON = { DYNAMIC_COURSE_STRUCTURE: 'true' }; // tick del auto-healer encendi
     eq(WH.workersHoldViewOf(rows, {}).reason, 'provider_worker_disabled', 'worker apagado con partes abiertas');
     eq(WH.workersHoldViewOf([{ item_key: 'content:c1', type: 'content', status: 'pending' }], {}), null, 'apagado sin partes de proveedor: no afecta');
     const dist = fs.readFileSync(path.join(distRoot, 'modules/dynamic-generation/runs.service.js'), 'utf8');
-    assert(/workersHold: \(0, workers_hold_1\.workersHoldViewOf\)\(rows\)/.test(dist), 'RunDto.workersHold cableado en buildRunDto');
+    assert(/workersHold: \(0, workers_hold_1\.workersHoldViewOf\)\(rows, process\.env, \{ runOpen:/.test(dist), 'RunDto.workersHold cableado en buildRunDto');
+    eq(WH.workersHoldViewOf([], { DYNAMIC_WORKERS_HOLD: 'true' }, { runOpen: false }), null, 'run terminado sin partes esperando: sin ruido');
+    // r62 review M2: al dueño (no SUPER_ADMIN) solo estado + motivo genérico: ni variables ni procesos.
+    const OSR = L('modules/dynamic-generation/owner-safe-run.interceptor.js');
+    const red = OSR.redactRunPayloadForOwner({ run: { id: 'r', workersHold: v } });
+    eq(Object.keys(red.run.workersHold).sort(), ['affectedItemKeys', 'message', 'reason', 'state'], 'campos del dueño');
+    eq([red.run.workersHold.state, red.run.workersHold.reason, red.run.workersHold.affectedItemKeys], ['held', 'server_workers_paused', ['presentation:c1']], 'estado y motivo genérico');
+    const txt = JSON.stringify(red);
+    assert(!/DYNAMIC_|worker_on|dynamic-provider-worker|dynamic-llm-worker|pm2/.test(txt), 'sin nombres de variables ni de procesos: ' + txt);
+    eq(OSR.redactRunPayloadForOwner({ workersHold: null }).workersHold, null, 'null intacto');
   });
 
   console.log(`\n${passes} ✅ · ${failures} ❌`);

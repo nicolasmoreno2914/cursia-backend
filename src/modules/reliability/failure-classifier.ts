@@ -536,14 +536,19 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
 const PACKAGE_RULES: readonly Rule[] = Object.freeze([
   // Review r1 (I-1): PACKAGE_REUSE_VERIFY_UNAVAILABLE = Storage no dejó descargar el candidato a reuse (nunca se reconstruye
   // encima); PACKAGE_OBJECT_CONFLICT = carrera sobre una ruta ya referenciada (el reintento elige ruta nueva). Ambos A.
-  { id: 'package_transient', codes: ['PACKAGING_V3_CONTENT_MISSING', 'ERR_BUFFER_TOO_LARGE', 'package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
+  // r62 (P, review I1): PACKAGING_V3_CONTENT_MISSING (contenido ausente/vacío en un set de artifacts que no cambia entre
+  // reintentos) pasa a `package_component` (B, reparación por item) y ERR_BUFFER_TOO_LARGE (misma entrada, mismo tamaño) a
+  // `package_product` (D): ninguno se arregla reintentando y con r62 lo A se reintenta hasta 72 h.
+  { id: 'package_transient', codes: ['package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
   {
     id: 'package_component',
     codes: ['EXAM_BANK_INVALID', 'QUIZ_V3_BANK_INVALID', 'QUIZ_V3_EMPTY', 'QUIZ_V3_INVALID', 'H5P_ACTIVITY_PAYLOAD_INVALID', 'H5P_INPUT_INVALID',
       'H5P_BS_INVARIANT', 'H5P_DIALOG_CARDS_INVALID', 'VIDEO_INTRO_INVALID', 'VIDEO_YOUTUBE_ID_MISSING', 'VIDEO_DURATION_MISSING',
       'ACTIVITY_INTRO_INVALID', 'LIBRO_V3_INVALID', 'MODULE_INTRO_V3', 'COURSE_INTRO_V3', 'MODULE_INTRO_EXPECT_INVALID', 'SCORM_MANIFEST_INVALID',
       'ANSWER_LEAK', 'NUMBER_NOT_FROM_FACTS', 'SHELL_NUMBER_NOT_FROM_FACTS', 'EXAM_BANK_PLAN', 'EXAM_BANK_CONTEXT', 'VIDEO_PLAN_INVARIANT',
-      'VIDEO_DURATION_INVALID', 'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'PRESENTATION_CARD_SLIDE_COUNT'],
+      'VIDEO_DURATION_INVALID', 'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'PRESENTATION_CARD_SLIDE_COUNT',
+      // r62 (P, review I1a): determinista (ver package_transient).
+      'PACKAGING_V3_CONTENT_MISSING'],
     family: /^(H5P_PACKAGE_[A-Z0-9_]+|VIDEO_ACTIVITY_[A-Z0-9_]+)$/,
     class: 'B', strategy: 'repair_package', scope: 'package', rounds: 1,
   },
@@ -554,6 +559,8 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'CURSIA_IV_INLINE_SCRIPT_PKG', 'H5P_NOT_GRADABLE_IN_MOODLE', 'ACTIVITY_INTRO_THEME', 'GAMMA_THEME_CONFIG', 'FACTS_INVALID',
       'VIDEO_PACKAGE_FILENAME_INVALID', 'ACTIVITY_PACKAGE_FILENAME_INVALID', 'V3_VALIDATION_CONTEXT', 'PNG_ENCODE', 'PNG_UNSUPPORTED',
       'PACKAGE_BUILDER_ERROR',
+      // r62 (P, review I1b/c): buffer por encima de kMaxLength para la misma entrada; objeto de Storage inexistente (404/400).
+      'ERR_BUFFER_TOO_LARGE', 'PACKAGE_STORAGE_NOT_FOUND',
       // r57 T6: el validador encontró una parte de facts (presentación, video, actividad) ausente o de más en el .mbz.
       'MANIFEST_COVERAGE',
       // r19: los capítulos pasaron su validación pero el total queda bajo el piso de 25 min → un humano mira el diagnóstico.
@@ -582,10 +589,31 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
     // una persona sube el límite del almacenamiento / corrige la variable o reduce el curso (nunca se reintenta solo).
     // Review r1 (M): el artifact de un archivo de trabajo se borró / no es del dueño / no es practice_file → PRACTICE_FILE_MISSING.
     id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID', 'PRACTICE_FILE_MISSING',
-      'PACKAGE_SIZE_LIMIT_EXCEEDED', 'PACKAGE_SIZE_CONFIG_INVALID'],
+      'PACKAGE_SIZE_LIMIT_EXCEEDED', 'PACKAGE_SIZE_CONFIG_INVALID',
+      // r62 (P, review I1c): Storage rechaza por permisos (401/403, RLS), por tamaño (413) o falta su configuración.
+      'PACKAGE_STORAGE_FORBIDDEN', 'PACKAGE_STORAGE_TOO_LARGE', 'PACKAGE_STORAGE_CONFIG'],
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'config', adminAction: 'resolve_package_block',
   },
 ] as Rule[]);
+
+/**
+ * r62 (P, review I1c): fallos de Storage/config DETERMINISTAS del empaque → código D (precheck/config o producto).
+ * Formato real de artifacts.service.ts: `Supabase Storage (upload|download) failed: <status> …`.
+ */
+function packageStorageDeterministicCode(error: string): string | null {
+  const st = /\bStorage (?:upload|download|delete|list|sign)[a-z ]* failed: (\d{3})\b/i.exec(error);
+  const status = st ? Number(st[1]) : null;
+  if (status === 401 || status === 403 || /row-level security|\bpermission denied\b|\bunauthorized\b/i.test(error)) return 'PACKAGE_STORAGE_FORBIDDEN';
+  if (status === 413 || /payload too large|maximum allowed size/i.test(error)) return 'PACKAGE_STORAGE_TOO_LARGE';
+  if (status === 404 || status === 400 || /\bobject not found\b|\bnot_found\b|\bBucket not found\b/i.test(error)) return 'PACKAGE_STORAGE_NOT_FOUND';
+  if (/\b(?:SUPABASE_[A-Z_]+|STORAGE_[A-Z_]+)\b[^.]*\b(?:are|is) (?:required|missing|not (?:set|configured))|\bnot configured\b/i.test(error)) return 'PACKAGE_STORAGE_CONFIG';
+  return null;
+}
+/** r62 (P): transitorio del empaque — 5xx/429 (de Storage o HTTP), red y DB. */
+const PACKAGE_TRANSIENT_RE =
+  /\bStorage [a-z ]*failed: (?:5\d\d|429)\b|HTTP (?:5\d\d|429)\b|\btimeout\b|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|EPIPE|socket hang up|fetch failed|Connection terminated|too many clients|EMAXCONNSESSION|deadlock detected|could not serialize|database system is (?:starting up|shutting down)/i;
+/** Respaldo de la restauración (sin cambios de comportamiento pre-r62). */
+const RESTORE_TRANSIENT_RE = /download|timeout|ETIMEDOUT|ECONNRESET|fetch failed|HTTP 5\d\d|storage/i;
 
 /** Restauración en Moodle (scope package, R10). */
 const RESTORE_RULES: readonly Rule[] = Object.freeze([
@@ -809,8 +837,19 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
       const r = ruleFor(scoped, m[1]);
       if (r) return verdictOf(r, m[1], { ...ctxBase, code: m[1] }, {});
     }
-    // r62 (P, d7): + caídas de DB/red del worker (pool, conexión cortada, deadlock/serialización, 429) → transitorio A.
-    if (/download|timeout|ETIMEDOUT|ECONNRESET|fetch failed|HTTP 5\d\d|storage|ECONNREFUSED|EAI_AGAIN|EPIPE|socket hang up|Connection terminated|too many clients|EMAXCONNSESSION|deadlock detected|could not serialize|database system is (starting up|shutting down)|HTTP 429/i.test(error)) {
+    // r62 (P, review I1c): en el scope de PAQUETE, un 4xx de Storage o su falta de configuración NUNCA es transitorio
+    // (con r62 lo A se reintenta hasta 72 h). Se resuelve a un código D antes del respaldo transitorio.
+    if (scoped === PACKAGE_RULES) {
+      const sc = packageStorageDeterministicCode(error);
+      if (sc) {
+        const r = ruleFor(scoped, sc);
+        if (r) return verdictOf(r, sc, { ...ctxBase, code: sc }, {});
+      }
+    }
+    // r62 (P, d7 + review I1c): transitorio = 5xx/429 (también de Storage), red y DB del worker. En el paquete ya no
+    // alcanza con mencionar «download»/«storage» (eso era el respaldo pre-r62, que sigue igual para la restauración).
+    const transientRe = scoped === PACKAGE_RULES ? PACKAGE_TRANSIENT_RE : RESTORE_TRANSIENT_RE;
+    if (transientRe.test(error)) {
       const tc = scoped === PACKAGE_RULES ? 'package_transient' : 'RESTORE_INFRA_UNKNOWN';
       const r = ruleFor(scoped, tc);
       if (r) return verdictOf(r, tc, { ...ctxBase, code: tc }, {});

@@ -552,7 +552,8 @@ async function dbChecks() {
 
     await check('DB empaque: fallo transitorio / de build sin item → el reintento acotado de siempre (re-empaqueta)', async () => {
       const G = await completedRun('REL MVP transitorio');
-      await failedPkgJob(G, 'PACKAGING_V3_CONTENT_MISSING: el Storage no respondió (ETIMEDOUT)');
+      // r62 (P, review I1): un transitorio real de Storage (CONTENT_MISSING ahora es determinista → reparación por item).
+      await failedPkgJob(G, 'Supabase Storage download failed: 503 el Storage no respondió (ETIMEDOUT)');
       const n0 = pkgCalls.length;
       const out = await autoPkg.ensure(G.runId, 'sweep');
       eq(out.action, 'enqueued', 'reintento');

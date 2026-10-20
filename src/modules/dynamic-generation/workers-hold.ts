@@ -44,10 +44,13 @@ export function workersHoldActive(env: Record<string, string | undefined> = proc
 export function workersHoldViewOf(
   rows: ReadonlyArray<{ item_key: string; type: string; status: string }>,
   env: Record<string, string | undefined> = process.env,
+  /** r62 (review M2): run terminado y sin partes que esperen → no se muestra (ruido). Default: abierto. */
+  opts: { runOpen?: boolean } = {},
 ): WorkersHoldView | null {
   const affected = rows
     .filter((r) => PROVIDER_WORKER_ITEM_TYPES.includes(String(r.type)) && OPEN_STATUSES.has(String(r.status)))
     .map((r) => String(r.item_key));
+  if (opts.runOpen === false && affected.length === 0) return null;
   if (workersHoldActive(env)) {
     return {
       state: 'held',
@@ -71,4 +74,26 @@ export function workersHoldViewOf(
     };
   }
   return null;
+}
+
+/** Vista del hold para quien NO es SUPER_ADMIN (r62 review M2): estado, motivo genérico y partes del propio run. */
+export interface OwnerWorkersHoldView {
+  state: 'held';
+  reason: 'server_workers_paused';
+  affectedItemKeys: string[];
+  message: string;
+}
+
+/**
+ * r62 (review M2): al dueño nunca le llegan nombres de variables (`env`), de procesos (`workers`) ni la acción de operación
+ * (`resolution`): solo que el servidor tiene pausado el trabajo y qué partes de su run esperan. Pura; devuelve una copia.
+ */
+export function redactWorkersHoldForOwner(v: WorkersHoldView | null | undefined): OwnerWorkersHoldView | null {
+  if (!v || typeof v !== 'object') return null;
+  return {
+    state: 'held',
+    reason: 'server_workers_paused',
+    affectedItemKeys: Array.isArray(v.affectedItemKeys) ? [...v.affectedItemKeys] : [],
+    message: 'La generación en el servidor está pausada temporalmente por mantenimiento: las partes pendientes se retoman solas.',
+  };
 }

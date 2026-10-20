@@ -776,6 +776,7 @@ const ENV_KEYS = [
       try {
         eq(await recompute(runId), 'completed', 'completed');
         eq((await jobOf(runId)).output_summary.autoPackage.transient.count, 1, 'transitorio contado');
+        eq((await jobOf(runId)).output_summary.autoPackage.transient.unclassified, 0, 'r62 I1d: EMAXCONNSESSION es A (red/DB) → no cuenta contra el tope');
         assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'dentro de la espera no reintenta');
         await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient,at}', to_jsonb((now() - interval '10 minutes')::text)) where id = $1`, [runId]);
         eq((await autoPkg.sweep()).filter((o) => o.runId === runId).map((o) => o.reason), ['transient_error'], 'pasada la espera reintenta');
@@ -786,18 +787,42 @@ const ENV_KEYS = [
         await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient,at}', to_jsonb((now() - interval '9 minutes')::text)) where id = $1`, [runId]);
         assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'espera creciente (count 2 → 600 s)');
         // 8 transitorios (antes: agotado en 5) con la espera tope (1 h) cumplida → sigue reintentando solo, con alerta.
-        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient}', jsonb_build_object('count', 8, 'at', (now() - interval '61 minutes')::text)) where id = $1`, [runId]);
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient}', jsonb_build_object('count', 8, 'unclassified', 0, 'at', (now() - interval '61 minutes')::text)) where id = $1`, [runId]);
         dto = await runs.getRun(C.cid, OWNER, 1, runId);
         eq([dto.completion.state, dto.completion.packageJob.autoRetryPending, dto.completion.packageJob.alert, dto.completion.adminActions],
           ['packaging', true, 'package_transient_retrying', []], 'sin tope de rondas: sigue solo, con alerta');
         eq((await autoPkg.sweep()).filter((o) => o.runId === runId).map((o) => o.reason), ['transient_error'], 'el barrido lo sigue tomando');
         // Ventana larga agotada (marca de hace 73 h) → excepción explícita.
         await ds.query(`update public.production_jobs set output_summary = jsonb_set(jsonb_set(output_summary, '{autoPackage,eligibleAt}', to_jsonb((now() - interval '73 hours')::text)),
-          '{autoPackage,transient}', jsonb_build_object('count', 9, 'at', (now() - interval '2 hours')::text)) where id = $1`, [runId]);
+          '{autoPackage,transient}', jsonb_build_object('count', 9, 'unclassified', 0, 'at', (now() - interval '2 hours')::text)) where id = $1`, [runId]);
         assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'agotado: el barrido no lo toma');
         dto = await runs.getRun(C.cid, OWNER, 1, runId);
         eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob.attentionReason],
           ['needs_attention', [{ code: 'retry_package', reason: 'package_transient_exhausted' }], 'package_transient_exhausted'], 'agotado → excepción registrada con motivo');
+      } finally {
+        packaging.requestPackage = orig;
+      }
+    });
+
+    await check('[AP] r62 review I1d: error de `ensure` SIN clasificar (TypeError: bug) → cuenta contra el tope de 5 (c10), nunca 72 h; agotado → needs_attention + retry_package (package_attempts_exhausted)', async () => {
+      const C = await confirmedCourse('BE-B transitorio sin clasificar');
+      const runId = await seededRealRun(C);
+      const orig = packaging.requestPackage.bind(packaging);
+      packaging.requestPackage = async (...a) => { if (a[3] === runId) throw new TypeError("Cannot read properties of undefined (reading 'x')"); return orig(...a); };
+      try {
+        eq(await recompute(runId), 'completed', 'completed');
+        let ap = (await jobOf(runId)).output_summary.autoPackage;
+        eq([ap.transient.count, ap.transient.unclassified], [1, 1], 'contado como NO clasificado');
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient}', jsonb_build_object('count', 4, 'unclassified', 4, 'at', (now() - interval '2 hours')::text)) where id = $1`, [runId]);
+        eq((await autoPkg.sweep()).filter((o) => o.runId === runId).map((o) => o.reason), ['transient_error'], '4/5: reintenta');
+        ap = (await jobOf(runId)).output_summary.autoPackage;
+        eq(ap.transient.unclassified, 5, '5/5');
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient,at}', to_jsonb((now() - interval '2 hours')::text)) where id = $1`, [runId]);
+        assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'agotado: el barrido no lo toma');
+        eq((await autoPkg.ensure(runId, 'sweep')).reason, 'transient_exhausted', 'ensure tampoco');
+        const dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob.attentionReason, dto.completion.packageJob.alert],
+          ['needs_attention', [{ code: 'retry_package' }], 'package_attempts_exhausted', undefined], 'excepción del tope de siempre');
       } finally {
         packaging.requestPackage = orig;
       }

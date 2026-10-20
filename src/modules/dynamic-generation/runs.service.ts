@@ -5460,7 +5460,7 @@ export class RunsService {
       pauseInfo: isPausedRun(job) ? pauseInfoOf(job) : null,
       stopAfter: stopAfterView(job),
       packageHold: job.worker_status === 'completed' ? packageHoldOf(job) : null,
-      workersHold: workersHoldViewOf(rows),
+      workersHold: workersHoldViewOf(rows, process.env, { runOpen: !['completed', 'failed', 'cancelled', 'preview'].includes(String(job.worker_status)) }),
       serverExecuted: await this.serverExecutedOf(job, manifest),
       legacyFinalExamDeps: manifestHasLegacyFinalExamDeps(manifest.manifest.items),
     };
