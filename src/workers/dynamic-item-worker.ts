@@ -47,6 +47,7 @@ import {
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService, ITEM_RECOVERY_BUDGET_REASON, RUN_PAUSED_GUARD_REASON } from '../modules/finops/finops-budget.service';
 import { itemRecoveryBudgetMessage } from '../modules/finops/run-spend-guard';
+import { DYNAMIC_VIDEOGEN_MAX_RENDER_MS_DEFAULT, videogenMaxRenderMs, videogenRenderOverdueMessage } from '../modules/dynamic-generation/videogen-render-cap';
 import {
   RunBudgetCapReached,
   WorkerBudget,
@@ -227,10 +228,12 @@ export const VIDEO_DURATION_UNMEASURABLE = 'video_duration_unmeasurable';
 /**
  * R16 (#16): tope de reloj (desde el primer poll del job) durante el cual un
  * `video_timeout` NO consume intentos: re-pollear un job de Videogen ya
- * persistido es gratis. Pasado el tope vuelve a consumir (y el auto-healer
- * acota las rondas).
+ * persistido es gratis. r62 (N2): es el default del tope ÚNICO de render
+ * (DYNAMIC_VIDEOGEN_MAX_RENDER_MS, videogen-render-cap.ts): pasado el tope con el
+ * job vivo, la parte queda `failed` con `videogen_render_overdue` (antes seguía
+ * consumiendo intentos/rondas re-polleando el MISMO job, sin salida visible).
  */
-export const VIDEO_TIMEOUT_FREE_WALL_MS = 3 * 60 * 60_000;
+export const VIDEO_TIMEOUT_FREE_WALL_MS = DYNAMIC_VIDEOGEN_MAX_RENDER_MS_DEFAULT;
 
 /** R16 (#7): el video interactivo (video_interactions, solo v3) planifica sus preguntas con la duración medida. */
 export function videoRequiresMeasuredDuration(item: Pick<ClaimedItem, 'rulesVersion'>): boolean {
@@ -866,17 +869,24 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
     if (typeof pollSinceRaw !== 'string') {
       if (!(await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { videoPollSince: new Date(startedAt).toISOString() }))) return;
     }
+    // r62 (N2): tope único de render; el último estado informado viaja en el mensaje del vencimiento.
+    const renderCapMs = videogenMaxRenderMs();
+    let lastStatus: string | null = typeof item.outputSummary?.videogenLastStatus === 'string' ? item.outputSummary.videogenLastStatus : null;
+    const overdue = async (): Promise<void> => {
+      // Nunca un job nuevo con el viejo vivo: la parte queda failed (visible) y la conciliación decide.
+      await scheduler.failItem(item.itemRunId, deps.executorId, videogenRenderOverdueMessage(jobId, lastStatus, Date.now() - pollSince, renderCapMs), false);
+    };
     while (true) {
       if (leaseLost) return;
       // R16 (#1): el job ya está persistido → re-pollearlo desde otro worker es gratis.
       if (await handBackIfDraining(deps, item, `mientras esperaba el render del job ${jobId} (se retoma sin reenviar)`)) return;
+      if (Date.now() - pollSince >= renderCapMs) {
+        await overdue();
+        return;
+      }
       if (Date.now() - startedAt > timeoutMs) {
-        // R16 (#16): re-pollear un job persistido es gratis → dentro del tope de reloj no consume intentos.
-        if (Date.now() - pollSince < VIDEO_TIMEOUT_FREE_WALL_MS) {
-          await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true, undefined, { grantAttempt: true });
-        } else {
-          await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true);
-        }
+        // R16 (#16): re-pollear un job persistido es gratis → dentro del tope de render no consume intentos.
+        await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true, undefined, { grantAttempt: true });
         return;
       }
 
@@ -887,6 +897,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         if (err instanceof LeaseLostError) return;
         throw err;
       }
+      lastStatus = String(status.status ?? '') || lastStatus;
 
       if (isDynamicVideoCompleted(status.status)) {
         let cost: number | null = null;

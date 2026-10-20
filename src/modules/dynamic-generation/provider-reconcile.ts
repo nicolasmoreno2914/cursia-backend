@@ -19,6 +19,7 @@
 // retryItem (bajo lock), la completitud del run y el clasificador (qué hace HOY el sistema).
 // ─────────────────────────────────────────────────────────────────────────────
 import { AutoHealPolicy, autoHealMaxRoundsFor, autoHealPolicyFromEnv, autoHealRoundsOf } from './auto-heal';
+import { VIDEOGEN_RENDER_OVERDUE, videogenMaxRenderMs } from './videogen-render-cap';
 
 /** Clave del estado en output_summary. */
 export const PROVIDER_RECONCILE_KEY = 'providerReconcile';
@@ -40,8 +41,13 @@ export const PROVIDER_RECONCILE_BACKOFF_SECONDS = 120;
  * con un estado desconocido o vivo (review C1) es una excepción, nunca un reenvío.
  */
 export const PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS = 6 * 3600;
-/** Review C1: un job de Videogen todavía vivo se sigue consultando (sin reenviar) hasta este tope; después, excepción. */
-export const PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS = 12 * 3600;
+/**
+ * Review C1 + E2E r62: un job de Videogen todavía vivo se sigue consultando (sin reenviar) hasta el tope ÚNICO de render
+ * (DYNAMIC_VIDEOGEN_MAX_RENDER_MS, videogen-render-cap.ts, el mismo del worker), contado desde el primer poll del job.
+ */
+export function providerReconcileLiveJobMaxSeconds(env: Record<string, string | undefined> = process.env): number {
+  return videogenMaxRenderMs(env) / 1000;
+}
 /** Espera creciente entre consultas de un job vivo / un lookup caído (la última se repite). */
 export const PROVIDER_RECONCILE_RECHECK_SECONDS: readonly number[] = Object.freeze([120, 300, 600, 1200, 1800]);
 /** Review I1: un costo 0 solo libera la reserva tras DOS lecturas en 0 separadas por al menos esto. */
@@ -56,7 +62,7 @@ export const PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK = 10;
  */
 export const PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS = 30_000;
 /** Regex POSIX gruesa del barrido (la decisión fina es providerReconcileDecision). */
-export const PROVIDER_RECONCILE_SQL_REGEX = '^(videogen_failed|video_timeout|ambiguous_video_submission|gamma_generation_failed|gamma_submit_ambiguous)';
+export const PROVIDER_RECONCILE_SQL_REGEX = '^(videogen_failed|videogen_render_overdue|video_timeout|ambiguous_video_submission|gamma_generation_failed|gamma_submit_ambiguous)';
 /**
  * Review M1 — runs históricos que ningún mecanismo automático de r62 toca (directiva: «no se tocan los cursos
  * históricos»): corte por `production_jobs.created_at` (solo runs creados desde la activación; env
@@ -96,9 +102,9 @@ export function providerReconcileRunEligible(run: { id?: string | null; created_
  *  - `gamma_failed`: generación fallida con generationId (d13) → `credits.deducted`;
  *  - `gamma_ambiguous`: envío sin generationId (c3) → conservador.
  */
-export type ProviderReconcileKind = 'videogen_failed' | 'videogen_stuck' | 'videogen_orphan' | 'videogen_ambiguous' | 'gamma_failed' | 'gamma_ambiguous';
+export type ProviderReconcileKind = 'videogen_failed' | 'videogen_stuck' | 'videogen_overdue' | 'videogen_orphan' | 'videogen_ambiguous' | 'gamma_failed' | 'gamma_ambiguous';
 export const PROVIDER_RECONCILE_KINDS: readonly ProviderReconcileKind[] = Object.freeze(
-  ['videogen_failed', 'videogen_stuck', 'videogen_orphan', 'videogen_ambiguous', 'gamma_failed', 'gamma_ambiguous'] as ProviderReconcileKind[],
+  ['videogen_failed', 'videogen_stuck', 'videogen_overdue', 'videogen_orphan', 'videogen_ambiguous', 'gamma_failed', 'gamma_ambiguous'] as ProviderReconcileKind[],
 );
 /** Las que no tienen id del proveedor que consultar (siempre punto 3). */
 export const PROVIDER_RECONCILE_AMBIGUOUS_KINDS: readonly ProviderReconcileKind[] = Object.freeze(
@@ -106,7 +112,7 @@ export const PROVIDER_RECONCILE_AMBIGUOUS_KINDS: readonly ProviderReconcileKind[
 );
 /** Las de Videogen con jobId (estado + costo consultables). */
 export const PROVIDER_RECONCILE_VIDEOGEN_JOB_KINDS: readonly ProviderReconcileKind[] = Object.freeze(
-  ['videogen_failed', 'videogen_stuck', 'videogen_orphan'] as ProviderReconcileKind[],
+  ['videogen_failed', 'videogen_stuck', 'videogen_overdue', 'videogen_orphan'] as ProviderReconcileKind[],
 );
 
 /** Review I3: jobId del sufijo ANCLADO que agrega el worker (`… (job de Videogen <id>)`, dynamic-item-worker.ts). */
@@ -180,6 +186,8 @@ export function providerReconcileKindOf(
   const os = outputSummary ?? {};
   if (type === 'video') {
     if (/^videogen_failed\b/.test(e)) return hasVideogenJob(os) ? 'videogen_failed' : null;
+    // E2E r62: el worker dejó la parte failed al pasar el tope único de render con el job vivo.
+    if (new RegExp(`^${VIDEOGEN_RENDER_OVERDUE}\\b`).test(e)) return hasVideogenJob(os) ? 'videogen_overdue' : null;
     if (/^video_timeout\b/.test(e)) {
       // Solo cuando el re-poll gratis del auto-healer ya se agotó (antes, el auto-healer sigue esperando al job).
       return hasVideogenJob(os) && autoHealRoundsOf(os) >= autoHealMaxRoundsFor('video', policy) ? 'videogen_stuck' : null;
@@ -241,7 +249,7 @@ export function providerReconcilePending(row: ProviderReconcileRow, now: Date, t
   if (!(d.heal === true || (d.heal === false && d.reason === 'backoff'))) return false;
   const failedAt = toDate(row.finished_at) ?? toDate(row.updated_at);
   if (!failedAt) return true;
-  const horizon = Math.max(PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS, PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS) +
+  const horizon = Math.max(PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS, providerReconcileLiveJobMaxSeconds()) +
     PROVIDER_RECONCILE_BACKOFF_SECONDS + PROVIDER_RECONCILE_RECHECK_SECONDS[PROVIDER_RECONCILE_RECHECK_SECONDS.length - 1];
   return now.getTime() < failedAt.getTime() + horizon * 1000 + 3 * Math.max(0, tickMs);
 }

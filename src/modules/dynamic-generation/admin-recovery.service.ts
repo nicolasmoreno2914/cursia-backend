@@ -95,6 +95,11 @@ export function endpointForAction(a: RunAdminAction, ids: { courseId: number; bl
   const code: RunAdminActionCode = a.code;
   switch (code) {
     case 'retry_video_render':
+      // r62 (N2): job vencido que Videogen no puede detener → reenviar puede dar un render DOBLE pagado (aviso explícito).
+      if (a.reason === 'provider_stuck_no_cancel') {
+        return { method: 'POST', path: `${item}/retry`, body: { resubmitVideo: true },
+          note: 'provider_stuck_no_cancel: el job anterior de Videogen sigue procesando y no se puede cancelar; resubmitVideo (SUPER_ADMIN) puede producir un render DOBLE pagado (el anterior puede terminar y cobrar). Alternativa: esperar a que Videogen lo termine y reintentar sin reenviar.' };
+      }
       return { method: 'POST', path: `${item}/retry`, body: { resubmitVideo: true }, note: 'resubmitVideo (SUPER_ADMIN): nuevo render pagado, pasa por el gate de FinOps' };
     case 'reconcile_videogen':
       return {

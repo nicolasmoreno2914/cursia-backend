@@ -559,6 +559,11 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   if (err.includes(BUDGET_EXCEEDED) || /budget_approval_required/.test(err)) return { code: 'approve_budget', itemKey: key };
   if (r.type === 'video') {
     if (/^(videogen_failed|videogen_submit_rejected)/.test(err)) return { code: 'retry_video_render', itemKey: key };
+    // r62 (N2): job vencido (tope único de render). Si la conciliación lo declinó, el motivo viaja en la acción.
+    if (/^videogen_render_overdue/.test(err)) {
+      const declined = String(s.providerReconcile?.declined ?? '');
+      return { code: 'retry_video_render', itemKey: key, ...(declined ? { reason: declined } : {}) };
+    }
     if (err.startsWith('ambiguous_video_submission') || (!!s.externalSubmitStartedAt && !s.external?.videogenJobId)) {
       return { code: 'reconcile_videogen', itemKey: key };
     }

@@ -180,6 +180,8 @@ const FN_CODES = {
   durationUnmeasurableMessage: { codes: ['video_duration_unmeasurable'], mention: 'VIDEO_DURATION_UNMEASURABLE' },
   durationUnmeasuredMessage: { codes: ['video_duration_unmeasured'], mention: 'VIDEO_DURATION_UNMEASURED' },
   v3ValidationErrorMessage: { codes: ['v3_payload_invalid'], mention: 'V3_PAYLOAD_INVALID' },
+  // r62 (N2): job de Videogen vivo pasado el tope único de render (videogen-render-cap.ts).
+  videogenRenderOverdueMessage: { codes: ['videogen_render_overdue'], mention: 'VIDEOGEN_RENDER_OVERDUE' },
 };
 
 /**

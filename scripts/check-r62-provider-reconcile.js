@@ -7,8 +7,10 @@
 //   [PU]  decisión pura: casos, topes (2 reenvíos, 1 ambiguo), espera, excepción registrada, cursos históricos fuera
 //   [V1]  reproducción de #1510: el job falla ANTES del render (costo 0,5351) → charged_partial (system) → reenvío →
 //         render OK → video completo; video_interactions se reencola solo; 0 acciones de admin; intentos actor=system
-//   [V2]  job que nunca termina (review C1): mientras siga vivo NUNCA se reenvía (re-consulta con espera creciente);
-//         si termina `failed` → conciliado + reenvío; si no termina en 12 h → excepción; lookup caído 6 h → excepción
+//   [V2]  job que nunca termina (review C1 + E2E): dentro del tope único de render (DYNAMIC_VIDEOGEN_MAX_RENDER_MS) se
+//         espera gratis; pasado el tope el worker deja la parte failed (videogen_render_overdue, 0 jobs nuevos); procesando
+//         → excepción (c) provider_stuck_no_cancel con acción de admin y aviso; encolado → cancelación + evidencia +
+//         reenvío; termina failed → conciliado + reenvío; lookup caído 6 h → excepción
 //   [Z]   regla de liberación (review I1): 0 libera solo failed + desglose en 0 + sin etapas pagadas + 2 lecturas ≥10 min;
 //         0 con etapas pagadas → charged; informado > reserva → se cuenta todo (nunca de menos)
 //   [O]   jobId solo en el sufijo del error (review I3): vivo → espera; completado → se adopta y re-poll; failed → conciliado
@@ -104,6 +106,11 @@ async function pureChecks() {
     eq(PR.videogenJobIdFromError('ambiguous_video_submission: texto (job de Videogen x) y más'), null, 'solo al final');
     eq(PR.providerReconcileKindOf('video', 'ambiguous_video_submission: db (job de Videogen vg-1)', {}, AH.DEFAULT_AUTO_HEAL_POLICY), 'videogen_orphan', 'I3');
     eq(PR.PROVIDER_RECONCILE_AMBIGUOUS_KINDS.includes('videogen_stuck'), false, 'C1: un job con id nunca es «ambiguo»');
+    eq(PR.providerReconcileKindOf('video', 'videogen_render_overdue: el job de Videogen j sigue processing', { external: { videogenJobId: 'j' } }, AH.DEFAULT_AUTO_HEAL_POLICY), 'videogen_overdue', 'tope de render');
+    const RC = L('modules/dynamic-generation/videogen-render-cap.js');
+    eq([RC.videogenMaxRenderMs({}), RC.videogenMaxRenderMs({ DYNAMIC_VIDEOGEN_MAX_RENDER_MS: '60000' }), RC.videogenMaxRenderMs({ DYNAMIC_VIDEOGEN_MAX_RENDER_MS: 'x' })],
+      [3 * 3600 * 1000, 60000, 3 * 3600 * 1000], 'tope único de render configurable (default 3 h)');
+    eq(L('workers/dynamic-item-worker.js').VIDEO_TIMEOUT_FREE_WALL_MS, RC.DYNAMIC_VIDEOGEN_MAX_RENDER_MS_DEFAULT, 'un solo número en el worker y en la conciliación');
     eq(PR.gammaMeasuredCreditsOf('gamma_generation_failed: la generación g falló en Gamma (x) [créditos medidos: 40]. No se reenvía sola: regenera'), 40, 'medidos');
     eq(PR.gammaMeasuredCreditsOf('gamma_generation_failed: ... [Gamma no informó los créditos: cobro incierto]. No se reenvía sola'), null, 'sin medir');
     const E = (id, created_at) => PR.providerReconcileRunEligible({ id, created_at }, { PROVIDER_RECONCILE_RUNS_SINCE: '2026-10-20T00:00:00Z' });
@@ -124,7 +131,7 @@ async function pureChecks() {
 
 // ─── fakes HTTP (Videogen + Gamma) ─────────────────────────────────────────
 function startFakes() {
-  const vg = { submits: 0, statusCalls: 0, costCalls: 0, plan: [], jobs: new Map() };
+  const vg = { submits: 0, statusCalls: 0, costCalls: 0, cancels: 0, plan: [], jobs: new Map() };
   const gm = { getCalls: 0, gens: new Map() };
   const json = (rs, code, body) => { rs.writeHead(code, { 'content-type': 'application/json' }); rs.end(JSON.stringify(body)); };
   const srv = http.createServer((rq, rs) => {
@@ -149,6 +156,15 @@ function startFakes() {
         if (!j) return json(rs, 404, { error: 'not found' });
         const st = j.statuses.length > 1 ? j.statuses.shift() : j.statuses[0];
         return json(rs, 200, { job_id: m[1], status: st, error: /fail/.test(st) ? j.error : null, download_url: 'http://127.0.0.1:1/fake.mp4', progress: 100, duration_seconds: 468 });
+      }
+      if (rq.method === 'POST' && (m = p.match(/^\/api\/videos\/([^/]+)\/cancel$/))) {
+        vg.cancels = (vg.cancels || 0) + 1;
+        const j = vg.jobs.get(m[1]);
+        const cur = j ? (j.statuses.length > 1 ? j.statuses[0] : j.statuses[0]) : null;
+        if (!j || !['queued', 'processing'].includes(cur)) return json(rs, 400, { success: false, error: 'job_not_active' });
+        // Igual que Videogen: un job encolado sale de la cola y queda failed (un job procesando seguiría vivo).
+        if (cur === 'queued') Object.assign(j, { statuses: ['failed'], error: 'Cancelado por el usuario', cost: 0, breakdown: { script: 0, images: 0, tts: 0 } });
+        return json(rs, 200, { success: true, job_id: m[1] });
       }
       if (rq.method === 'GET' && (m = p.match(/^\/api\/costs\/videos\/([^/]+)$/))) {
         vg.costCalls++;
@@ -199,7 +215,8 @@ const CONTEXT = { nombre: 'Curso r62 N2', sector: 'Minería', pais: 'Chile', con
   videoMode: 'real', providerModes: { presentation: 'real', audio: 'real' } };
 const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'VIDEOGEN_API_KEY', 'VIDEOGEN_API_URL', 'SUPER_ADMIN_EMAILS',
-  'GAMMA_API_KEY', 'GAMMA_API_BASE_URL', 'DYNAMIC_AUTO_HEAL_ENABLED', 'PROVIDER_RECONCILE_RUNS_SINCE', 'VIDEOGEN_HTTP_TIMEOUT_MS', 'VIDEOGEN_SUBMIT_TIMEOUT_MS'];
+  'GAMMA_API_KEY', 'GAMMA_API_BASE_URL', 'DYNAMIC_AUTO_HEAL_ENABLED', 'PROVIDER_RECONCILE_RUNS_SINCE', 'VIDEOGEN_HTTP_TIMEOUT_MS', 'VIDEOGEN_SUBMIT_TIMEOUT_MS',
+  'DYNAMIC_VIDEOGEN_MAX_RENDER_MS'];
 
 async function dbChecks() {
   const { Client } = require('pg');
@@ -495,73 +512,90 @@ async function dbChecks() {
           external: { gammaGenerationId: gid, gammaThemeId: 't', themeFamily: 'f', themeMode: 'light', acceptedAtAttempt: attempt } })]);
       return it.id;
     };
-    // ═══ V2 — job que nunca termina (review C1) ═════════════════════════════
-    const stuckFail = async (C, jobId, statuses = ['processing']) => {
-      fakes.vg.plan.push({ kind: 'ok', jobId, statuses, cost: 0.6, breakdown: { script: 0.4, images: 0.2 } });
-      const s = await runVideo(C); // el poll corta por video_timeout (reintentable); el auto-healer lo re-pollea gratis
-      assert(s.st.failed.some((f) => f.msg === 'video_timeout'), `video_timeout ${JSON.stringify(s.st.failed)}`);
+    // ═══ V2 — job que nunca termina: tope ÚNICO de render (review C1 + E2E videogen_never_finishes) ═══════
+    // Tope corto para la prueba: DYNAMIC_VIDEOGEN_MAX_RENDER_MS = 60 s; el job lleva 2 min en espera (videoPollSince).
+    const CAP_MS = 60_000;
+    const overdueFail = async (C, jobId, statuses) => {
+      fakes.vg.plan.push({ kind: 'ok', jobId, statuses: ['queued'], cost: 0.6, breakdown: { script: 0.4, images: 0.2 } });
+      const s0 = await runVideo(C); // primer claim: envía y re-pollea gratis dentro del tope (video_timeout con grantAttempt)
+      assert(s0.st.failed.some((f) => f.msg === 'video_timeout' && f.retryable), `dentro del tope: video_timeout gratis ${JSON.stringify(s0.st.failed)}`);
+      fakes.vg.jobs.get(jobId).statuses = statuses;
       const row = await latest(C.runId, `video:${C.c1}`);
-      // El auto-healer ya agotó sus rondas de re-poll gratis (5): el job sigue «processing».
-      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout', finished_at = now() - interval '10 minutes',
-                        output_summary = output_summary || jsonb_build_object('autoHeal', jsonb_build_object('rounds', $2::int)) where id = $1`, [row.id, P.maxRounds]);
+      await ds.query(`update public.generation_item_runs set status = 'pending', output_summary = output_summary || jsonb_build_object('videoPollSince', $2::text) where id = $1`,
+        [row.id, new Date(Date.now() - 2 * CAP_MS).toISOString()]);
+      const sub0 = fakes.vg.submits;
+      const s = await runVideo(C); // pasado el tope con el job vivo → failed visible, nunca un job nuevo
+      eq([s.st.failed.map((f) => [f.msg.split(':')[0], f.retryable]), fakes.vg.submits - sub0], [[['videogen_render_overdue', false]], 0], `vencido ${JSON.stringify(s.st.failed)}`);
+      await ds.query(`update public.generation_item_runs set finished_at = now() - interval '5 minutes' where id = $1`, [row.id]);
       return row.id;
     };
+    process.env.DYNAMIC_VIDEOGEN_MAX_RENDER_MS = String(CAP_MS);
     const V2 = await makeCourse('r62 job eterno');
     const v2key = `video:${V2.c1}`;
-    await check('[V2] job atascado que SIGUE VIVO: nunca se reenvía ni se liquida; re-consulta con espera creciente; sin acción de admin mientras tanto', async () => {
-      await stuckFail(V2, 'vg-stuck-1');
-      const sub0 = fakes.vg.submits; const n0 = (await events(V2.runId)).length;
-      const r1 = await sweepAt(5);
-      eq([r1.resubmitted.length, r1.waiting.map((x) => x.itemKey)], [0, [v2key]], JSON.stringify(r1));
-      const st1 = (await latest(V2.runId, v2key)).output_summary.providerReconcile;
-      eq([st1.checks, Date.parse(st1.nextCheckAt) > Date.now() + 100 * 1000], [1, true], 'próxima consulta reprogramada');
-      const rIn = await sweepAt(60);
-      assert(rIn.skipped.some((x) => x.itemKey === v2key && x.reason === 'backoff'), `dentro de la espera no consulta: ${JSON.stringify(rIn)}`);
-      const r2 = await sweepAt(3600);
-      eq([r2.resubmitted.length, r2.waiting.length], [0, 1], 'sigue vivo → sigue esperando');
-      eq([fakes.vg.submits - sub0, (await events(V2.runId)).length - n0], [0, 0], '0 envíos, 0 ajustes con el job vivo');
-      eq((await latest(V2.runId, v2key)).status, 'failed', 'no se reabre');
-      eq(((await completionOf(V2)).adminActions || []).filter((a) => a.itemKey === v2key), [], 'el servidor lo sigue');
-    });
-    await check('[V2] el job atascado termina `failed` → recién ahí: conciliado con su costo (charged_partial) y UN reenvío (no ambiguo)', async () => {
-      fakes.vg.jobs.get('vg-stuck-1').statuses = ['failed'];
-      fakes.vg.jobs.get('vg-stuck-1').error = 'render: ffmpeg crashed';
-      const r = await sweepAt(3 * 3600);
-      eq(r.resubmitted.map((x) => [x.kind, x.settlement, x.ambiguous]), [['videogen_stuck', 'charged_partial', false]], JSON.stringify(r));
+    await check('[V2] job que sigue PROCESANDO pasado el tope único de render → el worker deja la parte failed (videogen_render_overdue, 0 jobs nuevos); el barrido deja la excepción (c) provider_stuck_no_cancel (sin cancelar ni reenviar); la acción de admin aparece con su motivo (no un 409 mudo)', async () => {
+      await overdueFail(V2, 'vg-stuck-1', ['processing']);
+      const sub0 = fakes.vg.submits; const can0 = fakes.vg.cancels; const n0 = (await events(V2.runId)).length;
+      const r = await sweepAt(5);
+      eq([r.resubmitted.length, r.declined.filter((x) => x.runId === V2.runId).map((x) => x.reason)], [0, ['provider_stuck_no_cancel']], JSON.stringify(r));
+      eq([fakes.vg.submits - sub0, fakes.vg.cancels - can0, (await events(V2.runId)).length - n0], [0, 0, 0], '0 envíos, 0 cancelaciones (no detienen un job activo), 0 ajustes');
       const row = await latest(V2.runId, v2key);
-      eq([row.status, row.output_summary.providerReconcile.ambiguousRounds, row.output_summary.autoHeal.rounds], ['pending', 0, 0], 'reabierto; re-poll gratis reiniciado');
+      eq([row.status, row.output_summary.providerReconcile.declined, row.attention], ['failed', 'provider_stuck_no_cancel', 'duplicate_charge'], 'excepción explícita (c)');
+      const comp = await completionOf(V2);
+      const act = (comp.adminActions || []).find((a) => a.itemKey === v2key);
+      eq([act && act.code, act && act.reason], ['retry_video_render', 'provider_stuck_no_cancel'], `acción con motivo: ${JSON.stringify(comp.adminActions)}`);
+      const AR = L('modules/dynamic-generation/admin-recovery.service.js');
+      assert(/DOBLE/.test(AR.endpointForAction(act, { courseId: V2.cid, blueprintNumber: 1, runId: V2.runId }).note), 'el endpoint avisa del posible render doble');
+      eq((await sweepAt(600)).declined.filter((x) => x.runId === V2.runId).length, 0, 'no se re-evalúa en cada tick');
+      // El reintento de admin ya no es un 409 (la parte está failed): reenvío explícito con aviso.
+      const it = await runs.retryItem(V2.cid, OWNER, 1, V2.runId, v2key, true, false, undefined, { email: 'admin@cursia.test' });
+      eq(it.status, 'pending', 'reintento de admin disponible');
       await ledgerWithinAuthorized(V2.runId);
     });
-    const V2b = await makeCourse('r62 job eterno 2');
-    const v2bkey = `video:${V2b.c1}`;
-    await check('[V2] un job que no termina en 12 h → excepción videogen_job_not_terminal (duplicate_charge), 0 reenvíos; la acción de admin aparece', async () => {
-      await stuckFail(V2b, 'vg-stuck-2');
-      const sub0 = fakes.vg.submits;
-      await sweepAt(5);
-      const r = await sweepAt(PR.PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS + 60);
-      eq([r.resubmitted.length, r.declined.map((x) => x.reason)], [0, ['videogen_job_not_terminal']], JSON.stringify(r));
-      eq(fakes.vg.submits - sub0, 0, 'sin reenvío');
-      const row = await latest(V2b.runId, v2bkey);
-      eq([row.status, row.output_summary.providerReconcile.declined, row.attention], ['failed', 'videogen_job_not_terminal', 'duplicate_charge'], 'excepción explícita');
-      assert(((await completionOf(V2b)).adminActions || []).some((a) => a.itemKey === v2bkey), 'acción de admin visible');
-      eq((await sweepAt(PR.PROVIDER_RECONCILE_LIVE_JOB_MAX_SECONDS + 600)).declined.length, 0, 'no se re-evalúa en cada tick');
-      await ledgerWithinAuthorized(V2b.runId);
+    const V2q = await makeCourse('r62 job encolado eterno');
+    const v2qkey = `video:${V2q.c1}`;
+    await check('[V2] job todavía ENCOLADO pasado el tope → cancelación (endpoint existente de Videogen) → se confirma el estado ≥10 min después → vía de evidencia (costo 0 confirmado: released) → reenvío; nunca un job nuevo con el viejo vivo', async () => {
+      await overdueFail(V2q, 'vg-queued-1', ['queued']);
+      const sub0 = fakes.vg.submits; const can0 = fakes.vg.cancels;
+      const r1 = await sweepAt(5);
+      eq([r1.resubmitted.filter((x) => x.runId === V2q.runId).length, fakes.vg.cancels - can0], [0, 1], `cancelación pedida ${JSON.stringify(r1)}`);
+      const r2 = await sweepAt(5 + 300);
+      eq(r2.resubmitted.filter((x) => x.runId === V2q.runId).length, 0, 'dentro de los 10 min no se decide');
+      const r3 = await sweepAt(5 + PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 30);
+      eq(r3.resubmitted.filter((x) => x.runId === V2q.runId).length, 0, 'primera lectura del costo 0');
+      const r4 = await sweepAt(5 + 2 * PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 60);
+      eq(r4.resubmitted.filter((x) => x.runId === V2q.runId).map((x) => [x.kind, x.settlement]), [['videogen_overdue', 'released']], JSON.stringify(r4));
+      eq([fakes.vg.submits - sub0, fakes.vg.cancels - can0], [0, 1], 'el barrido no envía; una sola cancelación');
+      fakes.vg.plan.push({ kind: 'ok', jobId: 'vg-queued-2', statuses: ['completed_local'], cost: 0.97 });
+      const s = await runVideo(V2q);
+      eq([s.st.completed.length, fakes.vg.submits - sub0], [1, 1], `un solo job nuevo, después del terminal del viejo ${JSON.stringify(s.st.failed)}`);
+      await ledgerWithinAuthorized(V2q.runId);
+    });
+    const V2f = await makeCourse('r62 job vencido que falla');
+    await check('[V2] job vencido que Videogen termina `failed` → conciliado con su costo (charged_partial) y UN reenvío (no ambiguo)', async () => {
+      await overdueFail(V2f, 'vg-stuck-f', ['failed']);
+      fakes.vg.jobs.get('vg-stuck-f').error = 'render: ffmpeg crashed';
+      const r = await sweepAt(5);
+      eq(r.resubmitted.filter((x) => x.runId === V2f.runId).map((x) => [x.kind, x.settlement, x.ambiguous]), [['videogen_overdue', 'charged_partial', false]], JSON.stringify(r));
+      const row = await latest(V2f.runId, `video:${V2f.c1}`);
+      eq([row.status, row.output_summary.providerReconcile.ambiguousRounds, row.output_summary.autoHeal.rounds], ['pending', 0, 0], 'reabierto');
+      await ledgerWithinAuthorized(V2f.runId);
     });
     const V2c = await makeCourse('r62 lookup caído');
     const v2ckey = `video:${V2c.c1}`;
     await check('[V2] lookup de estado caído con jobId → espera; a las 6 h excepción videogen_lookup_unavailable (no reenvío)', async () => {
-      await stuckFail(V2c, 'vg-down-1');
+      await overdueFail(V2c, 'vg-down-1', ['processing']);
       fakes.vg.statusDown = true;
       try {
         const sub0 = fakes.vg.submits;
         const r1 = await sweepAt(5);
-        eq([r1.resubmitted.length, r1.waiting.length], [0, 1], JSON.stringify(r1));
+        eq([r1.resubmitted.filter((x) => x.runId === V2c.runId).length, r1.waiting.filter((x) => x.runId === V2c.runId).length], [0, 1], JSON.stringify(r1));
         const r2 = await sweepAt(PR.PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS + 60);
-        eq([r2.resubmitted.length, r2.declined.map((x) => x.reason)], [0, ['videogen_lookup_unavailable']], JSON.stringify(r2));
+        eq([r2.resubmitted.filter((x) => x.runId === V2c.runId).length, r2.declined.filter((x) => x.runId === V2c.runId).map((x) => x.reason)], [0, ['videogen_lookup_unavailable']], JSON.stringify(r2));
         eq(fakes.vg.submits - sub0, 0, 'sin reenvío');
         eq((await latest(V2c.runId, v2ckey)).attention, 'duplicate_charge', 'attention_reason');
       } finally { fakes.vg.statusDown = false; }
     });
+    delete process.env.DYNAMIC_VIDEOGEN_MAX_RENDER_MS;
 
     // ═══ Z — regla de liberación (review I1) ═══════════════════════════════
     const videogenFailed = async (title, job) => {
@@ -871,7 +905,7 @@ async function dbChecks() {
     });
 
     await check('[L] en todos los runs: ledger ≤ autorizado; ningún ajuste de admin; todo ajuste automático lleva decidedBy=system', async () => {
-      for (const C of [V1, V2, V2b, V2c, G, G3, A1, A2, D]) {
+      for (const C of [V1, V2, V2q, V2f, V2c, G, G3, A1, A2, D]) {
         await ledgerWithinAuthorized(C.runId);
         await noAdminAdjustments(C.runId);
         for (const e of (await events(C.runId)).filter((x) => x.recorded_by === 'system_provider_reconcile')) eq(e.metadata.decidedBy, 'system', 'decidedBy');
