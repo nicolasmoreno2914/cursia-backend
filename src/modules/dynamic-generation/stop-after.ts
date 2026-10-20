@@ -197,6 +197,9 @@ export async function applyStopAfterInTx(
  * puede quitar la retención con DELETE como siempre. Ausente / vacía → ningún run cambia (default).
  * Se lee de `process.env` en cada llamada (sin caché). Una entrada que no es UUID ni `*` se ignora con aviso (la
  * lista nunca bloquea el arranque de un run).
+ * r62 (d14): es una herramienta de MODO FÁBRICA, apagada por defecto. Ni deploy.yml ni deploy-staging.yml la escriben
+ * (staging solo AVISA en el deploy si alguien la dejó a mano en el .env); en operación normal ningún run nace retenido
+ * y el empaque final se arma solo. Un run retenido así lo muestra en `stopAfter.setBy = system:default_hold_packaging`.
  */
 export const DEFAULT_HOLD_PACKAGING_OWNERS_ENV = 'DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS';
 export const DEFAULT_HOLD_PACKAGING_SET_BY = 'system:default_hold_packaging';

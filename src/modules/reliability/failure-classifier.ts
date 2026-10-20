@@ -471,6 +471,12 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'C', strategy: 'provider_check', paidRisk: 'none', provider: 'youtube', rounds: 1, adminAction: 'resolve_youtube',
   },
   { id: 'youtube_quota', codes: ['youtube_blocked_quota', 'wait_quota', 'blocked_quota'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'youtube', rounds: 3 },
+  // r62 (P, d6): la cuota siguió agotada durante TODA la espera larga (default 7 días, con alerta a las 24 h) → excepción
+  // registrada (sin gasto; el video ya está pagado): una persona revisa la cuota del canal y reintenta la subida.
+  {
+    id: 'youtube_quota_exhausted', codes: ['youtube_quota_exhausted'],
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+  },
   {
     id: 'youtube_auth',
     codes: ['youtube_blocked_auth', 'blocked_auth', 'reauth_required', 'reconnect_youtube', 'youtube_preflight_failed', 'needs_youtube_preflight',
@@ -803,7 +809,8 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
       const r = ruleFor(scoped, m[1]);
       if (r) return verdictOf(r, m[1], { ...ctxBase, code: m[1] }, {});
     }
-    if (/download|timeout|ETIMEDOUT|ECONNRESET|fetch failed|HTTP 5\d\d|storage/i.test(error)) {
+    // r62 (P, d7): + caídas de DB/red del worker (pool, conexión cortada, deadlock/serialización, 429) → transitorio A.
+    if (/download|timeout|ETIMEDOUT|ECONNRESET|fetch failed|HTTP 5\d\d|storage|ECONNREFUSED|EAI_AGAIN|EPIPE|socket hang up|Connection terminated|too many clients|EMAXCONNSESSION|deadlock detected|could not serialize|database system is (starting up|shutting down)|HTTP 429/i.test(error)) {
       const tc = scoped === PACKAGE_RULES ? 'package_transient' : 'RESTORE_INFRA_UNKNOWN';
       const r = ruleFor(scoped, tc);
       if (r) return verdictOf(r, tc, { ...ctxBase, code: tc }, {});

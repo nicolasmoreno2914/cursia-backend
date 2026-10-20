@@ -149,6 +149,7 @@ import { isSuperAdminEmail } from '../../auth/super-admin';
 import { RunCompletion, attachCarryChains, evaluateRunCompletion, loadPendingVideogenReservations, loadValidationCutoffs } from './run-completion';
 import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
 import { autoPackageEnabled, loadAutoPackageState } from '../dynamic-packaging/auto-package-state';
+import { WorkersHoldView, workersHoldViewOf } from './workers-hold';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
   isDispatchableRun,
@@ -355,6 +356,8 @@ export interface RunDto {
   stopAfter: StopAfterView | null;
   /** Empaque automático RETENIDO (run completado con holdPackaging): el paquete solo se arma por acción explícita. */
   packageHold: { heldAt: string | null; reason: string | null } | null;
+  /** r62 (K5): hold persistente de los workers del servidor (worker_off), con estado y motivo; null sin hold. */
+  workersHold: WorkersHoldView | null;
   /**
    * Loop 9: un worker de IA VIVO genera en el servidor TODAS las partes de IA de este run (presencia + instante de
    * activación, los mismos helpers del ruteo): la pestaña se puede cerrar. false si el worker no está o no las cubre.
@@ -5457,6 +5460,7 @@ export class RunsService {
       pauseInfo: isPausedRun(job) ? pauseInfoOf(job) : null,
       stopAfter: stopAfterView(job),
       packageHold: job.worker_status === 'completed' ? packageHoldOf(job) : null,
+      workersHold: workersHoldViewOf(rows),
       serverExecuted: await this.serverExecutedOf(job, manifest),
       legacyFinalExamDeps: manifestHasLegacyFinalExamDeps(manifest.manifest.items),
     };
@@ -5507,6 +5511,10 @@ export class RunsService {
       auto: pk.eligible && autoPackageEnabled(),
       blocked: pk.blocked ? { code: pk.blocked.code, message: pk.blocked.message, missing: pk.blocked.missing } : null,
       held: !!packageHoldOf(job),
+      // r62 (d7): excepción explícita / alerta / próximo reintento del empaque automático.
+      attentionReason: stale ? null : pk.attentionReason,
+      alert: stale ? null : pk.alert,
+      nextRetryAt: !stale && pk.nextRetryAt ? pk.nextRetryAt.toISOString() : null,
     }, { upgradeOnlyFailure, validationCutoffs, pendingVideogenReservations });
   }
 

@@ -565,17 +565,48 @@ async function runWorkerChecks() {
       eq(w.calls.batchCreate, 1, 'sin re-envío');
     }));
 
-  await check('I2 cuota agotada durante 24 h → upload_failed (no reintentable, retry_upload manual) y el contador se reinicia', () =>
+  // r62 (d6): a las 24 h ya NO pasa a upload_failed + retry_upload manual: sigue esperando solo (con una alerta
+  // registrada una vez); recién agotada la espera larga (default 7 días) queda la excepción youtube_quota_exhausted.
+  await check('I2/r62 d6 cuota agotada 25 h → sigue esperando solo (retrying, refundAttempt) con ALERTA registrada una vez y visible en la vista; sin re-envío', () =>
+    withEnv(ENV, async () => {
+      const w = makeWorld();
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await worker.processItem(w.deps, makeItem(62));
+      const since = new Date(Date.now() - 25 * 3600 * 1000).toISOString();
+      w.store.set('ir-62', { ...w.store.get('ir-62'), youtubeQuotaSince: since });
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await w.reclaim(62);
+      let f = w.calls.failItem[w.calls.failItem.length - 1];
+      let os = w.store.get('ir-62');
+      assert(f.retryable === true && f.error.startsWith('youtube_blocked_quota: ') && f.opts && f.opts.refundAttempt === true, 'sigue esperando: ' + JSON.stringify(f));
+      assert(os.delivery === 'blocked_quota' && os.youtubeQuotaSince === since && typeof os.youtubeQuotaAlertAt === 'string', 'alerta: ' + JSON.stringify(os));
+      const alertAt = os.youtubeQuotaAlertAt;
+      const view = D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'retrying', error: f.error, outputSummary: os, nextRetryAt: new Date().toISOString() });
+      eq([view.state, view.actions, view.alert && view.alert.code, view.alert && view.alert.since], ['blocked_quota', [], 'youtube_quota_long_wait', since], 'vista: espera con alerta, sin acción manual');
+      w.yt.uploadPlan = [new YoutubeQuotaException()];
+      await w.reclaim(62);
+      os = w.store.get('ir-62');
+      eq([os.youtubeQuotaAlertAt, os.delivery], [alertAt, 'blocked_quota'], 'la alerta se registra una sola vez');
+      f = w.calls.failItem[w.calls.failItem.length - 1];
+      assert(f.retryable === true, 'tercera espera también automática');
+      eq(w.calls.batchCreate, 1, 'sin re-envío a Videogen');
+    }));
+
+  await check('I2/r62 d6 cuota agotada durante TODA la espera larga (7 días) → excepción registrada youtube_quota_exhausted (no reintentable, D config, retry_upload) y el contador se reinicia', () =>
     withEnv(ENV, async () => {
       const w = makeWorld();
       w.yt.uploadPlan = [new YoutubeQuotaException()];
       await worker.processItem(w.deps, makeItem(61));
-      w.store.set('ir-61', { ...w.store.get('ir-61'), youtubeQuotaSince: new Date(Date.now() - 25 * 3600 * 1000).toISOString() });
+      w.store.set('ir-61', { ...w.store.get('ir-61'), youtubeQuotaSince: new Date(Date.now() - (7 * 24 + 1) * 3600 * 1000).toISOString() });
       w.yt.uploadPlan = [new YoutubeQuotaException()];
       await w.reclaim(61);
       const f = w.calls.failItem[w.calls.failItem.length - 1];
       const os = w.store.get('ir-61');
-      assert(f.retryable === false && f.error.startsWith('youtube_upload_failed: ') && /24 h/.test(f.error), 'failItem: ' + JSON.stringify(f));
+      assert(f.retryable === false && f.error.startsWith('youtube_quota_exhausted: ') && /7 días/.test(f.error), 'failItem: ' + JSON.stringify(f));
+      const FC = loadDist('modules/reliability/failure-classifier.js');
+      const v = FC.classifyFailure({ error: f.error, itemType: 'video', source: 'video_worker' });
+      eq([v.class, v.code, v.humanReason, v.adminAction, v.unclassified], ['D', 'youtube_quota_exhausted', 'config', 'resolve_youtube', false], 'excepción clasificada');
+      assert(typeof os.youtubeQuotaExhaustedAt === 'string', 'instante de la excepción registrado');
       assert(os.delivery === 'upload_failed' && os.youtubeQuotaSince === null && !os.youtubeUploadStartedAt, 'estado: ' + JSON.stringify(os));
       eq(D.deliveryViewOf({ strategy: 'youtube', itemStatus: 'failed', error: f.error, outputSummary: os }).actions, ['retry_upload'], 'acción manual');
       w.yt.uploadPlan = [];

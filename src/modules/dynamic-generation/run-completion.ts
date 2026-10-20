@@ -166,6 +166,12 @@ export interface RunCompletion {
     blocked?: { code: string; message: string | null };
     /** stop-after (review I3): el empaque automático está RETENIDO por el dueño (holdPackaging): solo acción explícita. */
     held?: boolean;
+    /** r62 (d7): motivo de la excepción registrada al agotarse el reintento automático. */
+    attentionReason?: string;
+    /** r62 (d7): alerta mientras se sigue reintentando solo. */
+    alert?: string;
+    /** r62 (d7): próximo reintento automático (ISO), solo con fallos transitorios. */
+    nextRetryAt?: string;
   } | null;
 }
 
@@ -184,6 +190,15 @@ export interface CompletionPackageInfo {
   blocked?: { code: string; message?: string | null; missing?: string[] } | null;
   /** stop-after (review I3): empaque automático retenido por el dueño. */
   held?: boolean;
+  /**
+   * r62 (d7): motivo explícito de la excepción cuando el reintento automático se agotó (`package_transient_exhausted`:
+   * fallos transitorios durante toda la ventana larga; `package_attempts_exhausted`: tope de fallos no transitorios).
+   */
+  attentionReason?: string | null;
+  /** r62 (d7): alerta visible mientras el servidor sigue reintentando solo (p.ej. `package_transient_retrying`). */
+  alert?: string | null;
+  /** r62 (d7): próximo reintento automático (ISO) con la espera creciente. */
+  nextRetryAt?: string | null;
 }
 
 /**
@@ -629,10 +644,11 @@ export function evaluateRunCompletion(
       for (const a of packageBlockActions(pkg.blocked, manifest)) push(a);
     } else if (st === 'failed' && !pending) {
       state = 'needs_attention';
-      push({ code: 'retry_package' });
+      // r62 (d7): la excepción de transitorios agotados lleva su motivo (el tope de fallos no transitorios, el de siempre).
+      push(pkg?.attentionReason === 'package_transient_exhausted' ? { code: 'retry_package', reason: pkg.attentionReason } : { code: 'retry_package' });
     } else if ((st === 'none' || st === 'stale') && !pending && pkg?.auto) {
       state = 'needs_attention';
-      push({ code: 'retry_package' });
+      push(pkg?.attentionReason === 'package_transient_exhausted' ? { code: 'retry_package', reason: pkg.attentionReason } : { code: 'retry_package' });
     } else state = 'packaging';
   } else if (nonPreviewMissing === 0 && previewComponents.length > 0) state = 'preview';
   else state = 'needs_attention';
@@ -655,6 +671,10 @@ export function evaluateRunCompletion(
           auto: !!pkg.auto,
           ...(pkg.blocked && !packageReady ? { blocked: { code: pkg.blocked.code, message: pkg.blocked.message ?? null } } : {}),
           ...(pkg.held && !packageReady ? { held: true } : {}),
+          // r62 (d7): solo cuando aplican (contrato previo intacto).
+          ...(pkg.attentionReason && !packageReady ? { attentionReason: pkg.attentionReason } : {}),
+          ...(pkg.alert && !packageReady ? { alert: pkg.alert } : {}),
+          ...(pkg.nextRetryAt && !packageReady && pkg.autoRetryPending ? { nextRetryAt: pkg.nextRetryAt } : {}),
         } }
       : {}),
   };

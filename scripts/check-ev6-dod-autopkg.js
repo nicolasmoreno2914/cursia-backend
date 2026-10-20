@@ -493,7 +493,8 @@ const ENV_KEYS = [
       await failPkg(jobs[2].id);
       dto = await runs.getRun(C.cid, OWNER, 1, runId);
       eq([dto.completion.state, dto.completion.complete, dto.completion.adminActions, dto.completion.packageJob],
-        ['needs_attention', false, [{ code: 'retry_package' }], { status: 'failed', autoRetryPending: false, auto: true }], 'agotado');
+        // r62 (d7): fallos NO transitorios (build sin clasificar) agotan el tope de siempre; el motivo queda explícito.
+        ['needs_attention', false, [{ code: 'retry_package' }], { status: 'failed', autoRetryPending: false, auto: true, attentionReason: 'package_attempts_exhausted' }], 'agotado');
       assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'agotado: el barrido no lo toma');
       eq((await autoPkg.ensure(runId)).reason, 'attempts_exhausted', 'ensure tampoco');
       eq((await pkgJobs(runId)).length, 3, 'sin jobs nuevos');
@@ -765,7 +766,9 @@ const ENV_KEYS = [
       eq((await pkgJobs(runId)).length, 1, 'sin jobs nuevos');
     });
 
-    await check('[AP] fix M1: error transitorio del empaque automático (sin job) → cuenta contra su tope con espera; agotado → needs_attention + retry_package', async () => {
+    // r62 (d7): el transitorio de `ensure` (DB/red, sin job) ya no tiene tope de rondas: espera creciente y alerta; el
+    // límite es la ventana larga (72 h desde la marca) y al agotarse queda la excepción explícita.
+    await check('[AP] fix M1 + r62 d7: error transitorio del empaque automático (sin job) → espera CRECIENTE sin tope de rondas (alerta desde 5); agotada la ventana larga → needs_attention + retry_package con motivo package_transient_exhausted', async () => {
       const C = await confirmedCourse('BE-B transitorio');
       const runId = await seededRealRun(C);
       const orig = packaging.requestPackage.bind(packaging);
@@ -777,11 +780,24 @@ const ENV_KEYS = [
         await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient,at}', to_jsonb((now() - interval '10 minutes')::text)) where id = $1`, [runId]);
         eq((await autoPkg.sweep()).filter((o) => o.runId === runId).map((o) => o.reason), ['transient_error'], 'pasada la espera reintenta');
         let dto = await runs.getRun(C.cid, OWNER, 1, runId);
-        eq([dto.completion.state, dto.completion.packageJob], ['packaging', { status: 'none', autoRetryPending: true, auto: true }], 'pendiente');
-        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient}', jsonb_build_object('count', 5, 'at', (now() - interval '1 hour')::text)) where id = $1`, [runId]);
+        eq([dto.completion.state, dto.completion.packageJob.status, dto.completion.packageJob.autoRetryPending, typeof dto.completion.packageJob.nextRetryAt],
+          ['packaging', 'none', true, 'string'], 'pendiente con próximo reintento');
+        // count 2 → espera 600 s: 10 min no alcanza, 11 sí.
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient,at}', to_jsonb((now() - interval '9 minutes')::text)) where id = $1`, [runId]);
+        assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'espera creciente (count 2 → 600 s)');
+        // 8 transitorios (antes: agotado en 5) con la espera tope (1 h) cumplida → sigue reintentando solo, con alerta.
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(output_summary, '{autoPackage,transient}', jsonb_build_object('count', 8, 'at', (now() - interval '61 minutes')::text)) where id = $1`, [runId]);
+        dto = await runs.getRun(C.cid, OWNER, 1, runId);
+        eq([dto.completion.state, dto.completion.packageJob.autoRetryPending, dto.completion.packageJob.alert, dto.completion.adminActions],
+          ['packaging', true, 'package_transient_retrying', []], 'sin tope de rondas: sigue solo, con alerta');
+        eq((await autoPkg.sweep()).filter((o) => o.runId === runId).map((o) => o.reason), ['transient_error'], 'el barrido lo sigue tomando');
+        // Ventana larga agotada (marca de hace 73 h) → excepción explícita.
+        await ds.query(`update public.production_jobs set output_summary = jsonb_set(jsonb_set(output_summary, '{autoPackage,eligibleAt}', to_jsonb((now() - interval '73 hours')::text)),
+          '{autoPackage,transient}', jsonb_build_object('count', 9, 'at', (now() - interval '2 hours')::text)) where id = $1`, [runId]);
         assert(!(await autoPkg.sweep()).some((o) => o.runId === runId), 'agotado: el barrido no lo toma');
         dto = await runs.getRun(C.cid, OWNER, 1, runId);
-        eq([dto.completion.state, dto.completion.adminActions], ['needs_attention', [{ code: 'retry_package' }]], 'agotado → acción visible');
+        eq([dto.completion.state, dto.completion.adminActions, dto.completion.packageJob.attentionReason],
+          ['needs_attention', [{ code: 'retry_package', reason: 'package_transient_exhausted' }], 'package_transient_exhausted'], 'agotado → excepción registrada con motivo');
       } finally {
         packaging.requestPackage = orig;
       }

@@ -4,11 +4,13 @@ import { PackagingService } from './packaging.service';
 import { RunsService } from '../dynamic-generation/runs.service';
 import {
   AUTO_PACKAGE_MAX_ATTEMPTS,
-  AUTO_PACKAGE_MAX_TRANSIENT,
   autoPackageEnabled,
   autoPackageMarkOf,
   findAutoPackageCandidates,
   loadAutoPackageState,
+  packageFailureIsTransient,
+  AUTO_PACKAGE_MAX_AGE_HOURS,
+  PACKAGE_TRANSIENT_EXHAUSTED,
 } from './auto-package-state';
 import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 import { classifyFailure } from '../reliability/failure-classifier';
@@ -117,20 +119,29 @@ export class AutoPackageService implements OnModuleInit {
       const state = await loadAutoPackageState(this.dataSource, run, new Date(), env, Number(run.rules_version ?? 3));
       // DoD follow-up (R8): el bloqueo cuenta como en el estado (un job final posterior lo deja atrás).
       if (state.blocked) return { action: 'skipped', runId, reason: `blocked:${state.blocked.code}` };
-      if (state.failedSinceMark >= AUTO_PACKAGE_MAX_ATTEMPTS) return { action: 'skipped', runId, reason: 'attempts_exhausted' };
-      if (mark.transient.count >= AUTO_PACKAGE_MAX_TRANSIENT) return { action: 'skipped', runId, reason: 'transient_exhausted' };
+      // r62 (d7): solo los fallos NO transitorios agotan los intentos; lo transitorio (Storage/DB/red) se reintenta con
+      // espera creciente hasta la ventana larga (el barrido deja de seleccionarlo y el estado lo marca como excepción).
+      if (state.hardFailedSinceMark >= AUTO_PACKAGE_MAX_ATTEMPTS) return { action: 'skipped', runId, reason: 'attempts_exhausted' };
+      if (source === 'sweep' && !state.autoRetryPending && !state.rebuildPending && state.attentionReason === PACKAGE_TRANSIENT_EXHAUSTED) {
+        this.logger.error(`empaque automático: run ${runId} — ${PACKAGE_TRANSIENT_EXHAUSTED}: fallos transitorios durante ${AUTO_PACKAGE_MAX_AGE_HOURS} h; queda la excepción registrada (retry_package)`);
+        return { action: 'skipped', runId, reason: 'transient_exhausted' };
+      }
+      if (state.alert) {
+        this.logger.warn(`ALERTA empaque automático: run ${runId} — ${state.alert} (${state.transientFailedSinceMark} job(s) y ${mark.transient.count} error(es) transitorios desde la marca); se sigue reintentando solo hasta ${AUTO_PACKAGE_MAX_AGE_HOURS} h`);
+      }
       // El barrido solo actúa sobre lo que el estado declara pendiente (misma regla que RunDto.completion).
       if (source === 'sweep' && !state.autoRetryPending && !state.rebuildPending) return { action: 'skipped', runId, reason: 'nothing_pending' };
       // REL MVP: el último paquete final falló por el contenido de un item → reparar ese item (o needs_attention).
       if (state.status === 'failed' && state.failedSinceMark > 0) {
         const [lastFailed] = await this.dataSource.query(
-          `select id, error_message from public.production_jobs
+          `select id, error_message, output_summary from public.production_jobs
             where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 and worker_status in ('failed', 'failed_retryable')
               and created_at >= $2::timestamptz
             order by created_at desc, id desc limit 1`,
           [runId, mark.eligibleAt.toISOString()],
         );
-        if (lastFailed?.error_message) {
+        // r62 (d7): un fallo registrado como transitorio por el worker nunca dispara una reparación ni un bloqueo.
+        if (lastFailed?.error_message && !packageFailureIsTransient(lastFailed.output_summary)) {
           const out = await this.repairOrBlock(runId, String(lastFailed.error_message), [], null, source);
           if (out) return out;
         }
