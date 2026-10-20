@@ -6,6 +6,7 @@
 // La atribución (owner/course/run/item) la deriva el ledger del item run o
 // del run — nunca de datos del cliente.
 // ─────────────────────────────────────────────────────────────────────────────
+import { stuckRenderResendMetadata } from '../modules/dynamic-generation/videogen-render-cap';
 import type { FinopsLedgerService, RecordResult, CallRole, RecordChargeInput, ItemPaidCharge } from '../modules/finops/finops-ledger.service';
 import type { FinopsBudgetService } from '../modules/finops/finops-budget.service';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED, RUN_BUDGET_NOT_AUTHORIZED } from '../modules/finops/run-budget';
@@ -70,6 +71,8 @@ export async function recordVideogenCharge(ledger: WorkerLedger, a: VideogenChar
 
 export function videogenChargeInput(a: VideogenChargeInput): RecordChargeInput {
   const role = videogenCallRoleOf(a.outputSummary);
+  // r62 (N2): render nuevo de un reenvío justificado sobre un job que Videogen no pudo detener → possible_duplicate.
+  const dup = stuckRenderResendMetadata(a.outputSummary) ?? {};
   const base = {
     itemRunId: a.itemRunId,
     ownerIdFromAuth: a.ownerId,
@@ -97,7 +100,7 @@ export function videogenChargeInput(a: VideogenChargeInput): RecordChargeInput {
       costSource: 'CALCULATED_FROM_USAGE',
       providerCalculatedAmount: String(a.cost),
       measurementStatus: 'final',
-      metadata: { costBasis: 'videogen.getVideoCost.estimated_total_cost' },
+      metadata: { ...dup, costBasis: 'videogen.getVideoCost.estimated_total_cost' },
     };
   }
   return {
@@ -106,7 +109,7 @@ export function videogenChargeInput(a: VideogenChargeInput): RecordChargeInput {
     mode: 'real',
     costSource: 'CALCULATED_FROM_USAGE',
     measurementStatus: 'pending',
-    metadata: { costBasis: 'pricing_catalog_provisional', pendingReason: (a.costError || 'cost_lookup_failed').slice(0, 300) },
+    metadata: { ...dup, costBasis: 'pricing_catalog_provisional', pendingReason: (a.costError || 'cost_lookup_failed').slice(0, 300) },
   };
 }
 
@@ -581,6 +584,8 @@ export interface PaidCallReservation {
   tag: string;
   /** Estimado conservador de la llamada (solo para la reserva). */
   estimate: { characters?: number; promptChars?: number; maxTokens?: number; model?: string };
+  /** r62 (N2): metadata extra de la reserva (p. ej. possible_duplicate de un reenvío sobre un render vivo). */
+  metadata?: Record<string, unknown> | null;
 }
 
 export function reservationKey(r: Pick<PaidCallReservation, 'kind' | 'itemRunId' | 'generation' | 'itemAttempt' | 'tag'>): string {
@@ -605,7 +610,7 @@ function reservationInput(r: PaidCallReservation): RecordChargeInput {
     pricingFallback: 'pending_zero' as const,
     recordedBy: r.kind === 'videogen' ? 'dynamic-item-worker' : 'dynamic-provider-worker',
   };
-  const meta = { reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: r.tag, generation: r.generation };
+  const meta = { ...(r.metadata ?? {}), reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: r.tag, generation: r.generation };
   switch (r.kind) {
     case 'tts': {
       const secs = Math.max(1, Math.ceil(((r.estimate.characters ?? 0) / TTS_CHARS_PER_SECOND_ESTIMATE) * PROVIDER_RESERVATION_MARGIN));
