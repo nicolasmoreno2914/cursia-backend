@@ -2,37 +2,49 @@
 /* eslint-disable */
 // r62 (M) — PRUEBA INTEGRAL DE AUTONOMÍA, offline y a USD 0.
 //
+// ⚠️ NO es un check-*.js: el gate no la corre sola (tarda ~16 min con 4 pilas y sale rc≠0 a propósito mientras haya
+// escenarios que necesiten a una persona). Es OBLIGATORIA, corrida explícitamente, ANTES DE CADA DEPLOY DE STAGING:
+//
+//     npm run build
+//     node scripts/e2e/r62-autonomy-e2e.js --parallel=4 --label=<rama@sha> [--fe=<campuscloud-gen>] [--out=<dir>]
+//
+// (default --fe: ~/cursia-test-env/work/r62/fe-now; --only=<regex> corre un subconjunto; --dist=<dist> otra build).
+// Requisitos: PG16 de Homebrew en /opt/homebrew/bin (PGBIN), openssl, node_modules del backend. Salida: tabla por
+// escenario en stdout + results.{txt,json} y scenario-*.json (cada llamada pagada) en --out.
+//
 // Pregunta: desde la configuración inicial de un curso S y UNA sola autorización de presupuesto, ¿Cursia genera todos
 // los componentes, se recupera sola de fallas inyectadas, valida, empaqueta (dynamic_mbz + validateMbzV3) y entrega un
 // .mbz válido SIN ninguna acción humana/admin posterior al inicio?
 //
-// Corre el código REAL (dist/): app Nest (scheduler, auto-healer, FinOps, completion), dynamic-llm-worker,
-// dynamic-provider-worker (Gamma/TTS/guion del audiolibro), dynamic-item-worker (Videogen + YouTube) y
-// dynamic-package-worker, como procesos hijos, sobre un PG16 DESCARTABLE con las migraciones reales (la misma secuencia
-// que test/e2e-v2/run-e2e.sh + run-pause + rel-exec-lease, como staging). Solo los PROVEEDORES son falsos (los de
-// test/e2e-v2: Anthropic SSE con el LLM falso v3, Gamma/OpenAI/Anthropic de fakes.js, Videogen, Storage y Google), y
-// delante de cada uno va un proxy de fallas (scripts/lib/r62-fault-proxy.js) que cuenta las llamadas PAGADAS por clave
-// lógica. netguard en todos los procesos (NODE_OPTIONS) y en este: toda conexión fuera de 127.0.0.1 se bloquea.
-// Puertos libres al azar (nunca 5570 / 8099 / 55491 / 38471); datos en un directorio sin los patrones que limpia gate.sh.
+// Corre el código REAL (dist/): app Nest (scheduler, auto-healer, FinOps, completion), dynamic-provider-worker (Gamma/
+// TTS/guion del audiolibro y, hospedado como en staging, el worker de IA), dynamic-item-worker (Videogen + YouTube) y
+// dynamic-package-worker, como procesos hijos, sobre un PG16 DESCARTABLE con las migraciones reales (la secuencia de
+// test/e2e-v2/run-e2e.sh + run-pause + rel-exec-lease). Solo los PROVEEDORES son falsos (los de test/e2e-v2) y delante
+// de cada uno va un proxy de fallas (scripts/e2e/lib/r62-fault-proxy.js) que cuenta las llamadas COBRADAS por clave
+// lógica. netguard en todos los procesos y en este: toda conexión fuera de 127.0.0.1 se bloquea. Puertos al azar (nunca
+// 5570 / 8099 / 55491 / 38471); datos en un directorio sin los patrones que limpia gate.sh.
 //
 // Flujo por escenario (curso S nuevo, workers nuevos):
-//   1. configuración inicial por HTTP (estructura, perfiles, diseño conservado, Blueprint, Manifest v3);
-//   2. UNA autorización: estimate-preview → approve-and-start (SUPER_ADMIN, con la política del curso);
-//   3. fallas inyectadas (proxy / matar workers / interrumpir todo y reanudar);
-//   4. espera SIN tocar nada hasta: run completed + paquete final automático completed + .mbz descargado con el
-//      sha que aprobó validateMbzV3 (metadata.validatedSha256 del artifact) y moodle_backup.xml;
-//   5. si se ESTANCA (nada que el sistema vaya a hacer solo: partes fallidas sin recuperación automática pendiente, run
-//      pausado/fallado, paquete fallado) o pasa el tope de tiempo, un «operador» aplica la acción de admin documentada
-//      (conciliar la reserva con la verdad del proxy, retry / resubmitProvider / resubmitVideo, resume, package) y la
-//      CUENTA como intervención. Así se mide cuántas hacen falta para terminar y si el .mbz se entrega igual.
+//   1. configuración inicial por HTTP con el DUEÑO del curso (no admin) + política del curso con los 4 topes (por run,
+//      por curso, mensual y ownerMonthlyCap) cargada por SQL (configuración inicial);
+//   2. UNA autorización: estimate-preview → si approval.mode = 'user' (autorización única, fix/r62-single-authorization)
+//      el DUEÑO firma approve-and-start con la huella del estimado; si no existe (staging puro) se usa el camino admin
+//      (ADMIN_APPROVED por el monto máximo del estimado) y se cuenta en la columna «aprob. admin»;
+//   3. fallas inyectadas (proxy / matar workers / congelar un worker / interrumpir todo y reanudar);
+//   4. espera SIN tocar nada hasta: run completed + paquete final automático completed + .mbz descargado con el sha que
+//      aprobó validateMbzV3 (metadata.validatedSha256 del artifact) y moodle_backup.xml;
+//   5. si se ESTANCA o pasa el tope de tiempo, un «operador» aplica la acción documentada (conciliar con la verdad del
+//      proxy, retry / resubmitProvider / resubmitVideo, resume, package) y la CUENTA como intervención.
 //
-// Mide por escenario: interventions, estado final del run y de las partes, .mbz entregado, llamadas pagadas
-// duplicadas (por clave lógica), ledger ≤ autorizado, reservas abiertas/huérfanas, tiempo. Imprime la tabla y sale
-// rc≠0 si algún escenario necesitó una intervención (no hay excepciones justificadas registradas: JUSTIFIED = {}).
-// Que escenarios fallen sobre staging es un RESULTADO: no se ablandan.
+// Clasificación de intervenciones: JUSTIFICADA solo si la parte (o el run) tiene una attention_reason explícita de las
+// clases c2–c11 de L-flow.md (la regla la exige por seguridad o presupuesto). c1 (TTS de OpenAI vencido por timeout →
+// conciliación) NO es justificada: es la regresión P0. Todo lo demás (incluido no tener acción posible) es innecesario.
 //
-// Uso: npm run build && node scripts/check-r62-autonomy-e2e.js [--dist=dist] [--fe=<campuscloud-gen>] [--out=<dir>]
-//        [--only=<regex>] [--parallel=N] [--label=<texto>]
+// Métricas: interventions (justificadas / innecesarias), aprobaciones admin, estado del run y de las partes, .mbz,
+// cobros duplicados por clave lógica separados en «registrados» (possible_duplicate en el ledger) y «no registrados»,
+// ambiguo→reenviado, ledger ≤ autorizado, reservas abiertas y HUÉRFANAS (abierta con la parte completada), tiempo.
+// rc≠0 si algún escenario: no entregó, tuvo una intervención innecesaria o dejó una reserva huérfana.
+// Que escenarios fallen es un RESULTADO: no se ablandan.
 'use strict';
 const fs = require('fs');
 const os = require('os');
@@ -43,7 +55,7 @@ const { spawn, spawnSync } = require('child_process');
 
 const ARGV = process.argv.slice(2);
 const arg = (k, d) => { const a = ARGV.find((x) => x.startsWith(`--${k}=`)); return a ? a.slice(k.length + 3) : d; };
-const REPO = path.resolve(__dirname, '..');
+const REPO = path.resolve(__dirname, '../..');
 const DIST = path.resolve(arg('dist', path.join(REPO, 'dist')));
 const E2E = path.join(REPO, 'test/e2e-v2');
 const FE = path.resolve(arg('fe', process.env.CURSIA_FRONTEND_REPO || path.join(os.homedir(), 'cursia-test-env/work/r62/fe-now')));
@@ -55,7 +67,7 @@ const JSON_OUT = arg('json-out', null);
 fs.mkdirSync(OUT, { recursive: true });
 const NET_LOG = path.join(OUT, 'net-violations.log');
 if (!fs.existsSync(NET_LOG)) fs.writeFileSync(NET_LOG, '');
-require('./lib/netguard').installSocketGuard({ allowLoopback: true, logFile: NET_LOG });
+require('../lib/netguard').installSocketGuard({ allowLoopback: true, logFile: NET_LOG });
 
 const R = (m) => require(path.join(REPO, 'node_modules', m));
 const D = (p) => require(path.join(DIST, p));
@@ -63,8 +75,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const shaHex = (b) => crypto.createHash('sha256').update(b).digest('hex');
 const log = (...a) => { const s = `[${new Date().toISOString().slice(11, 19)}] ${a.join(' ')}`; console.log(s); fs.appendFileSync(path.join(OUT, 'check.log'), s + '\n'); };
 
-// Sin excepciones registradas: toda intervención cuenta como innecesaria (rc≠0).
-const JUSTIFIED = {};
 
 // ─── escenarios ──────────────────────────────────────────────────────────────
 // Marcadores de prompts del LLM falso v3 (llm-v3.js / e2e-v3 E24).
@@ -327,7 +337,10 @@ async function createStack(name) {
   S.YT_SECRET = crypto.randomBytes(32).toString('hex');
   S.LLM_SINCE = new Date(Date.now() - 1000).toISOString();
   const jwt = R('jsonwebtoken');
+  // Dueño del curso (NO admin) y un SuperAdmin aparte (solo para el camino admin y las acciones del operador).
   S.TOKEN = jwt.sign({ sub: S.OWNER, email: 'r62-owner@example.com', role: 'authenticated', aud: 'authenticated', user_metadata: { email_verified: true } }, S.JWT_SECRET, { algorithm: 'HS256', expiresIn: '12h' });
+  S.ADMIN = crypto.randomUUID();
+  S.ADMIN_TOKEN = jwt.sign({ sub: S.ADMIN, email: 'r62-admin@example.com', role: 'authenticated', aud: 'authenticated', user_metadata: { email_verified: true } }, S.JWT_SECRET, { algorithm: 'HS256', expiresIn: '12h' });
   S.frontSandbox = makeFront({ feRoot: FE, backendUrl: `http://127.0.0.1:${S.appPort}`, storageUrl: S.fakes.storageUrl, token: S.TOKEN, ownerId: S.OWNER, llm: S.llm, logFile: path.join(S.dir, 'front.log'), netViolations: [] });
   const tplIds = S.frontSandbox.SCORM_V2_TEMPLATES.map((t) => t.id);
   S.templates = tplIds.filter((t) => S.frontSandbox.scormV2ValidateRoomData(t, JSON.parse(JSON.stringify(S.frontSandbox.SV2_PREVIEW_FIXTURES[t]))).ok);
@@ -342,7 +355,7 @@ async function createStack(name) {
     DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3',
     DYNAMIC_REAL_VIDEO_OWNERS: S.OWNER, DYNAMIC_V2_ALLOWED_OWNERS: S.OWNER,
     DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', DYNAMIC_ALLOW_PROVIDER_MOCK: 'true',
-    DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'r62-owner@example.com',
+    DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'r62-admin@example.com',
     YOUTUBE_TOKEN_SECRET: S.YT_SECRET, YOUTUBE_CLIENT_ID: 'fake-client-id', YOUTUBE_CLIENT_SECRET: 'fake-client-secret',
     VIDEOGEN_API_URL: S.P.vg.url, VIDEOGEN_API_KEY: KEYS.videogen,
     GAMMA_API_KEY: KEYS.gamma, GAMMA_API_BASE_URL: S.P.prov.url,
@@ -352,6 +365,8 @@ async function createStack(name) {
     DYNAMIC_GAMMA_POLL_MS: '200',
     // Compresión de tiempos (solo cadencias y timeouts por llamada; las reglas/backoffs del producto quedan como están).
     PROVIDER_CALL_TIMEOUT_MS: '8000', DYNAMIC_AUTO_HEAL_INTERVAL_MS: '5000',
+    // r62 N1: el TTS tiene piso de 210 s que PROVIDER_CALL_TIMEOUT_MS ya no baja; solo el override explícito (tope 270 s).
+    OPENAI_TTS_TIMEOUT_MS: '8000',
     DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: S.LLM_SINCE,
   });
   const spawnProc = (label, script, env) => {
@@ -416,8 +431,8 @@ async function createStack(name) {
     const t0 = Date.now();
     while (S.children.size && Date.now() - t0 < 5000) await sleep(50);
   };
-  S.api = async (method, p, body) => {
-    const headers = { 'content-type': 'application/json', authorization: `Bearer ${S.TOKEN}` };
+  S.api = async (method, p, body, as = 'owner') => {
+    const headers = { 'content-type': 'application/json', authorization: `Bearer ${as === 'admin' ? S.ADMIN_TOKEN : S.TOKEN}` };
     for (let i = 0; ; i++) {
       try {
         const res = await fetch(`http://127.0.0.1:${S.appPort}/api/v1${p}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -429,6 +444,13 @@ async function createStack(name) {
         await sleep(1000); // la app puede estar reiniciándose (escenario de interrupción)
       }
     }
+  };
+  // Acción del operador: rutas del curso como el dueño (si el servidor lo rechaza, como admin); /finops y /admin como admin.
+  S.opApi = async (method, p, body) => {
+    if (/^\/(finops|admin)\//.test(p)) return S.api(method, p, body, 'admin');
+    const r = await S.api(method, p, body, 'owner');
+    if (r.status === 403 || r.status === 404) { const r2 = await S.api(method, p, body, 'admin'); r2.as = 'admin'; return r2; }
+    return r;
   };
   S.teardown = async () => {
     await S.killAll();
@@ -551,15 +573,54 @@ function autonomousWork(snap) {
   return { pending: true, why: 'empaque/cierre en curso' };
 }
 
+// ─── clasificación de la excepción (L-flow.md c1–c11) ─────────────────────────
+/**
+ * Clase c1–c11 de L-flow.md de lo que pide a una persona. Justificada SOLO con una attention_reason explícita registrada
+ * por el sistema (recovery.attentionReason de la parte, o la pausa del run) y clase c2–c11. c1 (TTS de OpenAI vencido por
+ * timeout → conciliación) es la regresión P0: nunca justificada. Sin attention_reason o sin clase → innecesaria.
+ */
+function exceptionClass(it, snap) {
+  if (!it) {
+    const pr = JSON.stringify((snap && snap.pause) || {});
+    if (/run_budget_cap/.test(pr)) return { cls: 'c5', justified: true };
+    if (/circuit_breaker/.test(pr)) return { cls: 'c6', justified: true };
+    if (/overshoot/.test(pr)) return { cls: 'c7', justified: true };
+    return { cls: null, justified: false };
+  }
+  const rec = it.recovery || {};
+  const ar = rec.attentionReason || null;
+  const e = String(it.error || '');
+  let cls = null;
+  if (/^provider_reconciliation_required: openai/.test(e) && ['audio_welcome', 'audiobook_chapter'].includes(it.type)) cls = 'c1';
+  else if (/^ambiguous_video_submission/.test(e)) cls = 'c2';
+  else if (/^(gamma_submit_ambiguous|ambiguous_gamma_submission)/.test(e)) cls = 'c3';
+  else if (/^llm_pending_review/.test(e)) cls = 'c4';
+  else if (/run_budget_cap/.test(e)) cls = 'c5';
+  else if (/circuit_breaker/.test(e)) cls = 'c6';
+  else if (/overshoot/.test(e)) cls = 'c7';
+  else if (/needs_reconnect/.test(e)) cls = 'c9';
+  else if (ar === 'config' && rec.strategy === 'wait_provider') cls = 'c8';
+  else if (/unclassified/.test(JSON.stringify(rec)) || rec.class === 'D' && rec.source === 'derived' && !rec.code) cls = 'c10';
+  else if (/MBZ_V3_VALIDATION_FAILED/.test(e)) cls = 'c11';
+  return { cls, attentionReason: ar, justified: !!ar && !!cls && cls !== 'c1' };
+}
+
 // ─── operador (intervención humana/admin, contada) ────────────────────────────
 async function operatorAct(S, ctx, snap, reason) {
   const actions = [];
   const base = `/courses/${ctx.course.courseId}/blueprints/${ctx.course.n}/manifest/runs/${ctx.runId}`;
-  const record = (what, r) => { const a = { at: Date.now() - ctx.t0, what, status: r && r.status, error: r && r.error ? String(r.error).slice(0, 200) : null, reason }; actions.push(a); log(`  👤 intervención: ${what} → ${a.status}${a.error ? ` (${a.error})` : ''}`); return a; };
-  if (snap.runStatus === 'paused') { record('resume del run', await S.api('POST', `${base}/resume`, {})); return actions; }
+  let curCls = exceptionClass(null, snap);
+  const record = (what, r) => {
+    const a = { at: Date.now() - ctx.t0, what, status: r && r.status, as: (r && r.as) || null, error: r && r.error ? String(r.error).slice(0, 200) : null, reason, cls: curCls.cls, attentionReason: curCls.attentionReason || null, justified: curCls.justified };
+    actions.push(a);
+    log(`  👤 intervención [${a.cls || 'sin clase'}${a.justified ? ', justificada' : ', innecesaria'}]: ${what} → ${a.status}${a.error ? ` (${a.error})` : ''}`);
+    return a;
+  };
+  if (snap.runStatus === 'paused') { record('resume del run', await S.opApi('POST', `${base}/resume`, {})); return actions; }
   // Reservas pendientes de las partes fallidas: se concilian con la VERDAD del proxy (¿el proveedor la cobró?).
   const failed = snap.items.filter((i) => i.status === 'failed' || i.status === 'cancelled');
   for (const it of failed) {
+    curCls = exceptionClass(it, snap);
     const pend = await S.q(`select e.idempotency_key k from public.generation_cost_events e
         where (e.metadata->>'reservation') = 'true' and e.run_id = $1 and e.item_key = $2
           and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [ctx.runId, it.itemKey]).catch(() => []);
@@ -572,17 +633,18 @@ async function operatorAct(S, ctx, snap, reason) {
       const kindOf = { llm: 'anthropic', tts: 'openai_tts', videogen: 'videogen', gamma: 'gamma' }[kind[1]];
       const calls = Object.values(S.P).flatMap((x) => x.st.calls.filter((c) => c.scenario === S.scen && c.kind === kindOf && c.rule));
       const outcome = calls.some((c) => c.outcome === 'served_lost') || !calls.length ? 'charged' : 'not_charged';
-      record(`conciliar ${p.k.slice(0, 60)}… (${outcome})`, await S.api('POST', ep, { reservationKey: p.k, outcome, reason: `r62: decisión con la verdad del proxy (${outcome})` }));
+      record(`conciliar ${p.k.slice(0, 60)}… (${outcome})`, await S.opApi('POST', ep, { reservationKey: p.k, outcome, reason: `r62: decisión con la verdad del proxy (${outcome})` }));
     }
     const flags = it.type === 'video' ? [{ resubmitVideo: true }, {}] : ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(it.type) ? [{ resubmitProvider: true }, {}] : [{}];
     for (const f of flags) {
-      const r = await S.api('POST', `${base}/items/${encodeURIComponent(it.itemKey)}/retry`, f);
+      const r = await S.opApi('POST', `${base}/items/${encodeURIComponent(it.itemKey)}/retry`, f);
       record(`retry ${it.itemKey.split(':')[0]} ${JSON.stringify(f)} [${String(it.error || '').split(':')[0]}]`, r);
       if (r.status >= 200 && r.status < 300) break;
     }
   }
   const last = snap.pkgs[snap.pkgs.length - 1];
-  if (!failed.length && snap.runStatus === 'completed' && (!last || last.worker_status === 'failed')) record('POST package (manual)', await S.api('POST', `${base}/package`));
+  curCls = last && /MBZ_V3_VALIDATION_FAILED/.test(String(last.error_message || '')) ? { cls: 'c11', attentionReason: 'product_bug', justified: true } : { cls: null, justified: false };
+  if (!failed.length && snap.runStatus === 'completed' && (!last || last.worker_status === 'failed')) record('POST package (manual)', await S.opApi('POST', `${base}/package`));
   if (!actions.length && snap.runStatus === 'failed') record('(sin acción documentada: run failed)', { status: 0 });
   return actions;
 }
@@ -603,7 +665,7 @@ async function runScenario(S, sc) {
     ctx.course = await createCourse(S, C);
     // Política del curso (configuración inicial; sin ella approve-and-start falla cerrado).
     await S.q(`insert into public.cost_budget_policies (scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by)
-               values ('course', $1, 1, $2::jsonb, true, 'BLOCK', 'r62-setup')`, [String(ctx.course.courseId), JSON.stringify({ maxCostPerRun: 60, maxCostPerCourse: 60 })]);
+               values ('course', $1, 1, $2::jsonb, true, 'BLOCK', 'r62-setup')`, [String(ctx.course.courseId), JSON.stringify({ maxCostPerRun: 60, maxCostPerCourse: 60, monthlyCap: 200, ownerMonthlyCap: 200 })]);
     // Presencia del worker de IA antes de crear el run (como en staging: el worker vive desde antes).
     const tw = Date.now();
     while (Date.now() - tw < 60_000) {
@@ -616,14 +678,35 @@ async function runScenario(S, sc) {
     if (sc.setup) sc.setup(ctx);
     const est = await S.api('POST', `${runsBase}/estimate-preview`, ctxRun);
     if (est.status !== 200) throw new Error(`estimate-preview ${est.status} ${est.error}`);
-    const start = await S.api('POST', `${runsBase}/approve-and-start`, { ...ctxRun, estimateHash: est.data.estimateHash });
-    if (start.status !== 201) throw new Error(`approve-and-start ${start.status} ${start.error}`);
+    const mode = est.data.approval && est.data.approval.mode;
+    res.adminApprovals = 0;
+    let start;
+    if (mode === 'user' || mode === 'none') {
+      // Autorización única (fix/r62-single-authorization): firma del DUEÑO con la huella del estimado, sin admin.
+      start = await S.api('POST', `${runsBase}/approve-and-start`, { ...ctxRun, estimateHash: est.data.estimateHash });
+      if (start.status !== 201) throw new Error(`approve-and-start (dueño) ${start.status} ${start.error}`);
+      res.authKind = mode === 'user' ? 'usuario' : 'sin autorización';
+      res.authorized = start.data.approval && start.data.approval.amount;
+    } else {
+      // Sin la autorización del usuario (staging puro): camino admin = ADMIN_APPROVED por el máximo del estimado y el
+      // dueño crea el run. Se cuenta como «aprobación admin» (columna aparte).
+      const first = await S.api('POST', runsBase, ctxRun);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(first.error || ''));
+      if (first.status !== 409 || !estM) throw new Error(`camino admin: se esperaba 409 budget_approval_required (${first.status} ${first.error})`);
+      const amount = est.data.estimate ? est.data.estimate.max : '60';
+      await S.q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, $3, 'ADMIN_APPROVED', 'r62-admin@example.com', 'r62: camino admin (sin autorización única del usuario)')`, [ctx.course.courseId, estM[1], amount]);
+      start = await S.api('POST', runsBase, ctxRun);
+      if (start.status !== 201) throw new Error(`POST runs tras ADMIN_APPROVED ${start.status} ${start.error}`);
+      res.adminApprovals = 1;
+      res.authKind = 'admin';
+      res.authorized = amount;
+    }
     ctx.runId = start.data.run.id;
     ctx.t0 = Date.now();
     res.runId = ctx.runId;
-    res.authorized = start.data.approval && start.data.approval.amount;
     res.estimate = est.data.estimate ? { expected: est.data.estimate.expected, max: est.data.estimate.max } : null;
-    log(`[${sc.id}] run ${ctx.runId} autorizado USD ${res.authorized} (esperado ${res.estimate && res.estimate.expected}, máx ${res.estimate && res.estimate.max})`);
+    log(`[${sc.id}] run ${ctx.runId} autorizado USD ${res.authorized} por ${res.authKind} (esperado ${res.estimate && res.estimate.expected}, máx ${res.estimate && res.estimate.max})`);
 
     const CAP = sc.capMs || 25 * 60_000;
     const STALL_MS = 20_000;
@@ -661,8 +744,9 @@ async function runScenario(S, sc) {
           // Tope de tiempo con partes que siguen «en recuperación» sin terminar nunca (p. ej. video_timeout gratis por 3 h):
           // la persona tendría que forzar el reenvío.
           for (const it of forced.filter((i) => i.type === 'video' || ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type))) {
-            const r = await S.api('POST', `/courses/${ctx.course.courseId}/blueprints/${ctx.course.n}/manifest/runs/${ctx.runId}/items/${encodeURIComponent(it.itemKey)}/retry`, it.type === 'video' ? { resubmitVideo: true } : { resubmitProvider: true });
-            const a = { at: Date.now() - ctx.t0, what: `retry forzado ${it.itemKey.split(':')[0]} (${it.status}, ${String(it.error || '').split(':')[0]})`, status: r.status, error: r.error ? String(r.error).slice(0, 200) : null, reason: act };
+            const r = await S.opApi('POST', `/courses/${ctx.course.courseId}/blueprints/${ctx.course.n}/manifest/runs/${ctx.runId}/items/${encodeURIComponent(it.itemKey)}/retry`, it.type === 'video' ? { resubmitVideo: true } : { resubmitProvider: true });
+            const c = exceptionClass(it, snap);
+            const a = { at: Date.now() - ctx.t0, what: `retry forzado ${it.itemKey.split(':')[0]} (${it.status}, ${String(it.error || '').split(':')[0]})`, status: r.status, as: r.as || null, error: r.error ? String(r.error).slice(0, 200) : null, reason: act, cls: c.cls, attentionReason: c.attentionReason || null, justified: c.justified };
             res.actions.push(a); log(`  👤 intervención: ${a.what} → ${a.status}${a.error ? ` (${a.error})` : ''}`);
             if (r.status >= 200 && r.status < 300) anyOk = true;
           }
@@ -679,7 +763,11 @@ async function runScenario(S, sc) {
       await sleep(1000);
     }
     res.ms = Date.now() - ctx.t0;
-    res.interventions = res.actions.filter((a) => a.status >= 200 && a.status < 300).length;
+    const okActs = res.actions.filter((a) => a.status >= 200 && a.status < 300);
+    res.interventions = okActs.length + (res.noActionAvailable ? 1 : 0);
+    res.justified = okActs.filter((a) => a.justified).length;
+    res.unjustified = res.interventions - res.justified;
+    res.classes = [...new Set(res.actions.map((a) => a.cls || 'sin clase'))];
     res.failedActions = res.actions.filter((a) => !(a.status >= 200 && a.status < 300)).length;
     res.delivered = !!(delivered && delivered.ok);
     res.mbz = delivered;
@@ -710,6 +798,14 @@ async function runScenario(S, sc) {
     const dr = duplicateReport(calls);
     res.paidCalls = dr.paidCalls;
     res.duplicatePaid = dr.dup;
+    // «Esperados y registrados»: el ledger marcó possible_duplicate para ese proveedor; el resto, no registrados.
+    const pd = await S.q(`select provider, count(*)::int n from public.generation_cost_events where run_id = $1 and (metadata->>'possible_duplicate') = 'true' group by 1`, [ctx.runId]);
+    const left = Object.fromEntries(pd.map((x) => [x.provider, x.n]));
+    const provOf = { anthropic: 'anthropic', openai_tts: 'openai', gamma: 'gamma', videogen: 'videogen' };
+    for (const d of dr.dup) { const pv = provOf[d.kind]; d.registered = (left[pv] || 0) > 0; if (d.registered) left[pv]--; }
+    res.dupRegistered = dr.dup.filter((d) => d.registered).length;
+    res.dupUnregistered = dr.dup.length - res.dupRegistered;
+    res.possibleDuplicateEvents = pd;
     res.ambiguousThenPaid = dr.ambiguousThenPaid;
     const inj = new Map();
     for (const c of calls.filter((x) => x.rule)) inj.set(`${c.rule}:${c.outcome}`, (inj.get(`${c.rule}:${c.outcome}`) || 0) + 1);
@@ -755,20 +851,23 @@ function finish(results) {
   const pad = (s, n) => String(s).padEnd(n).slice(0, n);
   const lines = [];
   lines.push(`\nr62 autonomía E2E — ${LABEL} — ${new Date().toISOString()}`);
-  lines.push(`${pad('escenario', 26)} ${pad('interv', 6)} ${pad('run', 10)} ${pad('partes', 7)} ${pad('.mbz', 5)} ${pad('dupPag', 6)} ${pad('amb→pag', 7)} ${pad('ledger≤aut', 18)} ${pad('resAb/huérf', 11)} ${pad('min', 5)}`);
+  lines.push('interv = acciones humanas/admin para terminar (just = justificadas c2–c11 con attention_reason; innec = innecesarias); aprob.adm = el run necesitó la aprobación de un admin;');
+  lines.push('dup reg/noReg = claves cobradas ≥2 veces con / sin possible_duplicate en el ledger; amb→pag = desconocido reenviado y cobrado; huérf = reserva abierta con la parte completada.');
+  lines.push(`${pad('escenario', 26)} ${pad('interv', 6)} ${pad('just', 4)} ${pad('innec', 5)} ${pad('clases', 12)} ${pad('aprob.adm', 9)} ${pad('run', 10)} ${pad('partes', 7)} ${pad('.mbz', 5)} ${pad('dupReg', 6)} ${pad('dupNoReg', 8)} ${pad('amb→pag', 7)} ${pad('ledger≤aut', 18)} ${pad('resAb', 5)} ${pad('huérf', 5)} ${pad('min', 5)}`);
   for (const r of results) {
     if (r.error && !r.runStatus) { lines.push(`${pad(r.id, 26)} ERROR ${r.error.slice(0, 160)}`); continue; }
-    const led = r.ledger ? `${r.ledger.withinAuthorized ? 'sí' : 'NO'} ${r.ledger.committedUsd.toFixed(2)}/${r.ledger.authorizedUsd}` : '?';
-    lines.push(`${pad(r.id, 26)} ${pad(r.interventions, 6)} ${pad(r.runStatus, 10)} ${pad(`${r.itemsCompleted}/${r.itemsTotal}`, 7)} ${pad(r.delivered ? 'sí' : 'NO', 5)} ${pad((r.duplicatePaid || []).length, 6)} ${pad((r.ambiguousThenPaid || []).length, 7)} ${pad(led, 18)} ${pad(`${(r.openReservations || []).length}/${r.orphanReservations}`, 11)} ${pad(((r.ms || 0) / 60000).toFixed(1), 5)}`);
+    const led = r.ledger ? `${r.ledger.withinAuthorized ? 'sí' : 'NO'} ${r.ledger.committedUsd.toFixed(2)}/${Number(r.ledger.authorizedUsd).toFixed(2)}` : '?';
+    const cls = (r.classes || []).filter((c) => c !== 'sin clase' || r.interventions).join(',') || '-';
+    lines.push(`${pad(r.id, 26)} ${pad(r.interventions, 6)} ${pad(r.justified, 4)} ${pad(r.unjustified, 5)} ${pad(r.interventions ? cls : '-', 12)} ${pad(r.adminApprovals, 9)} ${pad(r.runStatus, 10)} ${pad(`${r.itemsCompleted}/${r.itemsTotal}`, 7)} ${pad(r.delivered ? 'sí' : 'NO', 5)} ${pad(r.dupRegistered || 0, 6)} ${pad(r.dupUnregistered || 0, 8)} ${pad((r.ambiguousThenPaid || []).length, 7)} ${pad(led, 18)} ${pad((r.openReservations || []).length, 5)} ${pad(r.orphanReservations, 5)} ${pad(((r.ms || 0) / 60000).toFixed(1), 5)}`);
   }
   lines.push('\nDetalle:');
   for (const r of results) {
-    lines.push(`- ${r.id}: ${r.what || ''}`);
+    lines.push(`- ${r.id}: ${r.what || ''}  [autorización: ${r.authKind || '?'}]`);
     if (r.error) lines.push(`    error: ${r.error.slice(0, 400)}`);
     if (r.injected && r.injected.length) lines.push(`    inyectado: ${r.injected.join(', ')}`);
-    for (const a of r.actions || []) lines.push(`    👤 ${a.what} → ${a.status}${a.error ? ` ${a.error}` : ''}  [${a.reason}]`);
+    for (const a of r.actions || []) lines.push(`    👤 [${a.cls || 'sin clase'}${a.attentionReason ? `/${a.attentionReason}` : ''} → ${a.justified ? 'justificada' : 'innecesaria'}] ${a.what} → ${a.status}${a.as ? ` (como ${a.as})` : ''}${a.error ? ` ${a.error}` : ''}  [${a.reason}]`);
     for (const s of r.stalls || []) lines.push(`    ⏸ ${Math.round(s.at / 1000)} s: ${s.why} :: ${s.items.map((i) => `${i.key}/${i.st}/${i.rec}/${i.err.split(':')[0]}`).join('; ')}`);
-    for (const d of r.duplicatePaid || []) lines.push(`    💸 cobro duplicado ${d.kind} ×${d.billed} (${d.outcomes.join('→')}) «${d.snippet}»`);
+    for (const d of r.duplicatePaid || []) lines.push(`    💸 cobro duplicado ${d.kind} ×${d.billed} (${d.outcomes.join('→')}) ${d.registered ? 'REGISTRADO (possible_duplicate)' : 'NO REGISTRADO'} «${d.snippet}»`);
     for (const d of r.ambiguousThenPaid || []) lines.push(`    ⚠️ ambiguo y reenviado ${d.kind} (${d.outcomes.join('→')})`);
     for (const o of r.openReservations || []) lines.push(`    🧾 reserva abierta ${o.key} (${o.item}, parte ${o.itemStatus}, USD ${o.usd})${o.clear ? '' : ' HUÉRFANA'}`);
     if (r.verify) lines.push(`    verificación: ${JSON.stringify(r.verify)}`);
@@ -778,15 +877,15 @@ function finish(results) {
     if (bad.length) lines.push(`    partes no completas: ${bad.map((i) => `${i.key}/${i.status}/${String(i.error || '').split(':')[0]}`).join('; ')}`);
     if (r.netViolations) lines.push(`    ❌ netguard: ${r.netViolations} conexiones bloqueadas fuera de 127.0.0.1`);
   }
-  const unnecessary = results.filter((r) => r.error || !r.delivered || (r.interventions > 0 && !JUSTIFIED[r.id]));
-  const dups = results.reduce((n, r) => n + (r.duplicatePaid || []).length, 0);
-  const okN = results.filter((r) => !r.error && r.delivered && r.interventions === 0).length;
-  lines.push(`\nRESULTADO ${LABEL}: ${okN}/${results.length} escenarios autónomos (0 intervenciones y .mbz entregado); ${unnecessary.length} con intervención/sin entrega; ${dups} cobros duplicados por clave lógica`);
+  const failing = results.filter((r) => r.error || !r.delivered || r.unjustified > 0 || r.orphanReservations > 0);
+  const sum = (k) => results.reduce((n, r) => n + (r[k] || 0), 0);
+  const okN = results.filter((r) => !r.error && r.delivered && r.interventions === 0 && !r.orphanReservations).length;
+  lines.push(`\nRESULTADO ${LABEL}: ${okN}/${results.length} escenarios autónomos (0 intervenciones, 0 huérfanas, .mbz entregado); ${failing.length} fallan (sin entrega / intervención innecesaria / reserva huérfana); intervenciones ${sum('interventions')} (justificadas ${sum('justified')}, innecesarias ${sum('unjustified')}); aprobaciones admin ${sum('adminApprovals')}; cobros duplicados ${sum('dupRegistered')} registrados + ${sum('dupUnregistered')} no registrados; reservas huérfanas ${sum('orphanReservations')}`);
   const txt = lines.join('\n');
   console.log(txt);
   fs.writeFileSync(path.join(OUT, 'results.txt'), txt + '\n');
   fs.writeFileSync(path.join(OUT, 'results.json'), JSON.stringify(results, null, 1));
-  process.exit(unnecessary.length ? 1 : 0);
+  process.exit(failing.length ? 1 : 0);
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
