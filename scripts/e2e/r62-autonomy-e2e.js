@@ -537,7 +537,9 @@ async function createCourse(S, C) {
 }
 
 // ─── observación ─────────────────────────────────────────────────────────────
-const AUTO_RECOVERY = new Set(['executor_retry', 'auto_heal', 'safe_auto_retry', 'ambiguous_audio_resubmit', 'auto_regenerate']);
+// CurrentRecovery automáticas del producto (failure-classifier.ts): con cualquiera de estas el sistema todavía va a actuar
+// solo (incluye provider_reconcile de N2, provider_probe y spend_control_resume, que no existen en 7138145).
+const AUTO_RECOVERY = new Set(['executor_retry', 'auto_heal', 'safe_auto_retry', 'ambiguous_audio_resubmit', 'auto_regenerate', 'provider_reconcile', 'provider_probe', 'spend_control_resume']);
 async function snapshot(S, ctx) {
   const run = await S.api('GET', `/courses/${ctx.course.courseId}/blueprints/${ctx.course.n}/manifest/runs/${ctx.runId}`);
   const [job] = await S.q(`select worker_status, output_summary from public.production_jobs where id = $1`, [ctx.runId]);
