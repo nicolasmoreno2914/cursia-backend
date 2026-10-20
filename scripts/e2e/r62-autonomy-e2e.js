@@ -88,6 +88,47 @@ const GAMMA_GET = (i) => i.method === 'GET' && /^\/generations\/[^/]+$/.test(i.p
 const LLM_POST = (i) => i.method === 'POST' && i.path === '/v1/messages';
 const VG_STATUS = (i) => i.method === 'GET' && /^\/api\/external\/videos\/[^/]+\/status$/.test(i.path);
 
+/**
+ * Videogen falso: el PRIMER job no termina nunca. Emula la semántica real de Videogen (video-engine-ia) en el proxy:
+ *  - 'processing': el procesador ya lo tomó (current_step/progress avanzan). POST /api/videos/{id}/cancel lo marca
+ *    `failed` en la DB pero NO lo detiene: las lecturas siguientes dicen failed y el progreso sigue cambiando.
+ *  - 'queued': nunca lo tomó (progress 0, sin etapa). El cancel lo marca `failed` y queda IGUAL (no procesa nada).
+ *  - un job ya inactivo (failed/completed) → 400 {error:'job_not_active'}.
+ * El resto de los jobs (reenvíos) siguen al falso de siempre (completan).
+ */
+function videogenStuck({ P, S }, mode) {
+  S.vg = { job: null, mode, cancelled: false, cancels: 0, polls: 0, submitsAfter: 0, cancelledQueued: false };
+  const v = S.vg;
+  P.vg.rule('vgSubmitAfter', (i) => { if (i.method === 'POST' && /batch-create$/.test(i.path) && v.job) v.submitsAfter++; return false; }, 'pass', { times: Infinity });
+  P.vg.rule('vgCancel', (i) => i.method === 'POST' && /^\/api\/videos\/[^/]+\/cancel$/.test(i.path), 'custom', {
+    times: Infinity,
+    fn: (i) => {
+      const id = decodeURIComponent(i.path.split('/')[3]);
+      v.cancels++;
+      if (id !== v.job) return { status: 400, body: { error: 'job_not_active' } };
+      if (v.cancelled) return { status: 400, body: { error: 'job_not_active' } };
+      v.cancelled = true;
+      if (mode === 'queued') v.cancelledQueued = true;
+      return { status: 200, body: { ok: true, job_id: id, status: 'failed' } };
+    },
+  });
+  P.vg.rule('vgStuck', (i) => {
+    if (!VG_STATUS(i)) return false;
+    const id = i.path.split('/')[4];
+    if (!v.job) v.job = id;
+    return id === v.job;
+  }, 'rewrite', {
+    times: Infinity,
+    fn: (j) => {
+      v.polls++;
+      const base = { ...j, download_url: null, duration_seconds: undefined, scenes_count: 6 };
+      if (mode === 'queued') return { ...base, status: v.cancelled ? 'failed' : 'queued', progress: 0, current_step: null, error: v.cancelled ? 'cancelled' : null };
+      // processing: el procesador sigue escribiendo aunque la DB diga failed.
+      return { ...base, status: v.cancelled ? 'failed' : 'processing', progress: Math.min(99, 40 + v.polls), current_step: `render_scene_${1 + (v.polls % 6)}`, error: v.cancelled ? 'cancelled' : null };
+    },
+  });
+}
+
 const SCENARIOS = [
   { id: 'baseline', what: 'sin fallas (control)', setup() {} },
   {
@@ -121,17 +162,16 @@ const SCENARIOS = [
     },
   },
   {
-    id: 'videogen_never_finishes', what: 'Videogen: el primer job nunca termina (processing para siempre)',
-    capMs: 12 * 60_000,
-    setup({ P, S }) {
-      S.stuckJob = null;
-      P.vg.rule('vgStuck', (i) => {
-        if (!VG_STATUS(i)) return false;
-        const id = i.path.split('/')[4];
-        if (!S.stuckJob) S.stuckJob = id;
-        return id === S.stuckJob;
-      }, 'rewrite', { times: Infinity, fn: (j) => ({ ...j, status: 'processing', progress: 50, download_url: null, duration_seconds: undefined }) });
-    },
+    id: 'videogen_never_finishes', what: 'Videogen: el primer job queda «processing» para siempre (el procesador lo tomó; un cancel no lo detiene)',
+    capMs: 30 * 60_000,
+    setup(ctx) { videogenStuck(ctx, 'processing'); },
+    verify: (ctx) => ({ stuckJob: ctx.S.vg && ctx.S.vg.job, cancelCalls: ctx.S.vg && ctx.S.vg.cancels, newSubmits: ctx.S.vg && ctx.S.vg.submitsAfter }),
+  },
+  {
+    id: 'videogen_queued_cancel', what: 'Videogen: el primer job queda ENCOLADO para siempre; el cancel lo saca de la cola (failed, sin procesar)',
+    capMs: 45 * 60_000,
+    setup(ctx) { videogenStuck(ctx, 'queued'); },
+    verify: (ctx) => ({ stuckJob: ctx.S.vg && ctx.S.vg.job, cancelCalls: ctx.S.vg && ctx.S.vg.cancels, cancelledWhileQueued: !!(ctx.S.vg && ctx.S.vg.cancelledQueued) }),
   },
   {
     id: 'gamma_error', what: 'Gamma: 500 en la 1.ª creación de presentación',
@@ -367,6 +407,8 @@ async function createStack(name) {
     PROVIDER_CALL_TIMEOUT_MS: '8000', DYNAMIC_AUTO_HEAL_INTERVAL_MS: '5000',
     // r62 N1: el TTS tiene piso de 210 s que PROVIDER_CALL_TIMEOUT_MS ya no baja; solo el override explícito (tope 270 s).
     OPENAI_TTS_TIMEOUT_MS: '8000',
+    // r62 N2: tope único de render de Videogen (default 3 h) comprimido para ver la escalada dentro de la corrida.
+    DYNAMIC_VIDEOGEN_MAX_RENDER_MS: '120000',
     DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: S.LLM_SINCE,
   });
   const spawnProc = (label, script, env) => {
@@ -557,7 +599,8 @@ function autonomousWork(snap) {
     if (i.status !== 'failed' && i.status !== 'cancelled') continue;
     const rec = i.recovery || {};
     const auto = AUTO_RECOVERY.has(rec.currentRecovery) && (rec.maxRounds === null || rec.maxRounds === undefined || Number(rec.round || 0) < Number(rec.maxRounds));
-    if (!auto) doomed.add(i.itemKey);
+    // Excepción explícita registrada (exceptionReason): aunque el barrido siga vigilando el job, la parte espera a una persona.
+    if (!auto || rec.exceptionReason) doomed.add(i.itemKey);
   }
   let grew = true;
   while (grew) {
@@ -592,6 +635,8 @@ function exceptionClass(it, snap) {
   const rec = it.recovery || {};
   const ar = rec.attentionReason || null;
   const e = String(it.error || '');
+  // Excepción registrada por la conciliación de proveedor (N2: output_summary.providerReconcile.declined) → clase c.
+  if (rec.exceptionReason) return { cls: `c:${rec.exceptionReason}`, attentionReason: ar, justified: !!ar };
   let cls = null;
   if (/^provider_reconciliation_required: openai/.test(e) && ['audio_welcome', 'audiobook_chapter'].includes(it.type)) cls = 'c1';
   else if (/^ambiguous_video_submission/.test(e)) cls = 'c2';
@@ -805,6 +850,10 @@ async function runScenario(S, sc) {
     const left = Object.fromEntries(pd.map((x) => [x.provider, x.n]));
     const provOf = { anthropic: 'anthropic', openai_tts: 'openai', gamma: 'gamma', videogen: 'videogen' };
     for (const d of dr.dup) { const pv = provOf[d.kind]; d.registered = (left[pv] || 0) > 0; if (d.registered) left[pv]--; }
+    // Un job de Videogen cancelado EN COLA nunca renderizó: su envío no es un cobro (Videogen cobra el render).
+    if (ctx.S.vg && ctx.S.vg.cancelledQueued) for (const d of dr.dup.filter((x) => x.kind === 'videogen')) { d.notBilled = 'el primer job se canceló en cola (sin render)'; }
+    dr.dup = dr.dup.filter((d) => !d.notBilled || (res.notes.push(`videogen: ${d.notBilled} — no se cuenta como cobro duplicado`), false));
+    res.duplicatePaid = dr.dup;
     res.dupRegistered = dr.dup.filter((d) => d.registered).length;
     res.dupUnregistered = dr.dup.length - res.dupRegistered;
     res.possibleDuplicateEvents = pd;

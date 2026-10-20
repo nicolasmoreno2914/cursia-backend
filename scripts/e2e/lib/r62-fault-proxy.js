@@ -69,6 +69,14 @@ function startFaultProxy(name, upstreamBase) {
         return done('rejected');
       }
       if (action === 'reset') { rq.socket.destroy(); return done('reset'); }
+      if (action === 'custom') {
+        // Emulación del proveedor SIN reenviar (p. ej. POST /api/videos/{id}/cancel de Videogen): fn(info) → {status, body}.
+        const out = rule.fn(info) || { status: 404, body: { error: 'not_found' } };
+        const buf = Buffer.from(JSON.stringify(out.body ?? {}));
+        rs.writeHead(out.status || 200, { 'content-type': 'application/json', 'content-length': String(buf.length) });
+        rs.end(buf);
+        return done('emulated');
+      }
       if (action === 'hang') { rec.outcome = 'hang'; rs.on('close', () => { rec.end = Date.now(); }); return; }
       // Reenvío al proveedor falso de atrás.
       const up = new URL(typeof upstreamBase === 'function' ? upstreamBase(info) : upstreamBase);
