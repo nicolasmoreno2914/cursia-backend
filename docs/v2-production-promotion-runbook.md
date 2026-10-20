@@ -99,7 +99,7 @@ Ambos son el mismo tipo de credencial y pueden tener el **mismo valor**. Se reco
 **Cómo los consumen los workflows** (verificado en r61):
 - `gate-core` clona con `https://x-access-token:${TOKEN}@github.com/...`. GitHub acepta un PAT como contraseña con cualquier usuario. Después reescribe el remote sin el token.
 - `deploy-staging.yml` y `deploy.yml` usan `actions/checkout` con `token:` y `persist-credentials: false`.
-- `deploy.yml` hace checkout de la rama `vars.PROD_FE_GATE_REF` (default `main`).
+- `deploy.yml` hace checkout de `vars.PROD_FE_GATE_REF`, que es **obligatoria** y no tiene default. El `main` del frontend es V1: no tiene `src/js/45-dynamic-generation-executor.js`, así que el gate fallaría. El deploy también verifica que ese archivo exista.
 
 **Alternativa: deploy key de solo lectura.**
 - Pasos: `ssh-keygen -t ed25519`; la clave pública va en `cursia` → Settings → Deploy keys, **sin** permiso de escritura; la privada va como secret.
@@ -113,6 +113,8 @@ Settings → Environments → `production` (ya lo referencia `deploy.yml`):
 **Recomendado:**
 - **Deployment branches:** solo `main`.
 - Opcional: **required reviewers**. Haría que cada push a `main` espere aprobación; es la puerta natural para la promoción.
+  - **Ojo:** el job `rollback` (y el auto-rollback, que es parte del job `deploy`) usa el mismo environment. Con reviewers, un rollback manual también espera la aprobación.
+  - Si eso no es aceptable, hay dos salidas: un environment aparte `production-rollback` sin reviewers, con copias de los secrets `VPS_*`/`HEALTH_URL` (cambiar `environment:` del job `rollback`; **GAP**, no cableado), o el rollback manual 2b del §4.
 
 **Secrets:**
 - Ya existen: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, `VPS_PATH`, `HEALTH_URL`.
@@ -128,7 +130,9 @@ Settings → Environments → `production` (ya lo referencia `deploy.yml`):
 | `PROD_V2_GENERAL_AVAILABILITY` | `false` | Único modo de permitir V2 con el allowlist vacío (fase 4, al final). |
 | `PROD_DB_POOL_MAX`, `PROD_DB_POOL_MAX_WORKER`, `PROD_DB_POOL_IDLE_MS_WORKER` | vacío (no se toca) | Tamaño del pool por proceso (§2, capacidad). |
 | `PROD_DEPLOY_BLOCK_ON_V1_JOBS` | `false` | Los jobs V1 con lease vigente bloquean el deploy (si no, solo se informan). |
-| `PROD_FE_GATE_REF` | `main` | Rama o commit del frontend contra el que corre el gate REL R1. En la promoción: el ref del frontend que se promueve. |
+| `PROD_FE_GATE_REF` | **ninguno (obligatoria)** | Rama o commit del frontend contra el que corre el gate REL R1: el frontend que se promueve (commit de release o `staging`). Después de la promoción del frontend puede pasar a `main`. Sin ella, todo deploy falla con instrucciones. |
+| `PROD_SKIP_STORAGE_POLICY_PROBE` | `false` | Solo si el apply se hizo con `--skip-storage-policies` (decisión P15). Las sondas de Storage pasan a ser un aviso, pero los uploads del ejecutor V2 darían 403. |
+| `PROD_AUTO_ROLLBACK` | activo | `false` desactiva el rollback automático tras un fallo **posterior** al rsync (install o health). En ese caso queda el estado `failed <sha>` y el rollback manual. |
 
 ### 1.3 Environment `production-v2-migrations`: OWNER-ACTION
 
@@ -166,7 +170,7 @@ Igual que en `docs/v2-production-migrations.md` §2b:
 | P6 | Propuesta de precios r60 verificada: 46 filas (`src/modules/finops/pricing-proposal.r60.json`). En staging ya están sembradas (sha `5757c0b73a2a6b8d`, LEDGER r61). | OWNER-ACTION + GAP | No la siembra ningún camino automático: el runner solo lee `pricing-seed.v1.json`. Ver la nota debajo de esta tabla. |
 | P7 | Política de presupuesto de producción (`cost_budget_policies`) | OWNER-ACTION + GAP | Sin ninguna fila, todo run V2 va a `ADMIN_APPROVAL`. Las sondas lo avisan como información. `staging-budget-policy.js` es solo para staging. Decidir los topes por run, por curso, mensual y por owner, y crear un script de producción equivalente (pequeño, con aprobación) o insertar la fila a mano después del backup. |
 | P8 | Techo diario no atribuido (`FINOPS_UNATTRIBUTED_DAILY_USD_GLOBAL` / `_PER_OWNER`), `FINOPS_KILL_SWITCH`, `FINOPS_PROVIDER_ALLOWLIST` | OWNER-ACTION | Decidir los valores y ponerlos a mano en el `.env` de producción: el deploy no los toca. |
-| P9 | Pool de la base y plan de Supabase | OWNER-ACTION | Con V2 en `main` hay 11 procesos × `DB_POOL_MAX` (default 5) = 55 clientes. Staging usa 2/1/1000 contra un pooler de 15 clientes. Fijar `PROD_DB_POOL_*` según el límite real del pooler de producción **antes** de la fase 2; `check-db-pool-capacity.js` sirve de guía. |
+| P9 | Pool de la base y plan de Supabase | OWNER-ACTION | Con V2 en `main` hay 11 procesos × `DB_POOL_MAX` (default 5) = 55 clientes. Staging usa 2/1/1000 contra un pooler de 15 clientes. Fijar `PROD_DB_POOL_*` según el límite real del pooler de producción **antes** de la fase 2; `check-db-pool-capacity.js` sirve de guía. El deploy solo **avisa** si falta (no lo exige, M7). En sesión con un tope bajo, los 3 procesos nuevos pueden dejar sin clientes a la API V1: decidirlo antes de la fase 2. |
 | P10 | Memoria del VPS | OWNER-ACTION | Los 3 workers dinámicos nuevos ocupan unos 128 MB de RSS cada uno, aunque no hagan nada (node directo, sin el wrapper npm). Revisar `free -m` antes de la fase 2: el VPS es compartido con staging (11 procesos) y Videogen. |
 | P11 | Moodle soportado | OWNER-ACTION | H5P Pack v3 necesita Moodle 4.5 o superior (Q-01/Q-02). Declararlo como requisito, o esperar el fix de compatibilidad. |
 | P12 | `VIDEO_ENGINE_ENABLED` / `VIDEO_ENGINE_ALLOWED_OWNERS` (backend `.env` y Cloudflare Pages) | OWNER-ACTION | Ver `docs/ops/RELEASE-CHECKLIST.md` §1. Sin decidir, se usa el default seguro: el video V1 queda cerrado. `check-release-rollout-guard.js` avisa en cada deploy. |
@@ -265,6 +269,9 @@ select execution_mode, count(*) from public.production_jobs group by 1 order by 
 - `PROD_DB_POOL_*` decididos (P9);
 - `FINOPS_INGEST_TOKEN_PRODUCTION` cargado;
 - `FRONTEND_REPO_READ_TOKEN` cargado;
+- **`PROD_FE_GATE_REF`** = el commit de release o la rama del frontend que se promueve. Nunca el `main` V1 del frontend: el deploy falla en «Frontend del gate trae el ejecutor dinámico»;
+- en el VPS, `sudo pm2 jlist` (o `pm2 status`): anotar qué workers V1 se reinician en bucle hoy. El deploy los tolera con un aviso: mide 15 s antes de tocar nada. `cursia-video-worker` con `VIDEO_WORKER_ENABLED≠true` y `cursia-gamma-worker` sin `GAMMA_API_KEY` se **detienen** en vez de reiniciarse en bucle;
+- `NODE_ENV=production` como línea simple del `.env` (sin `export`). Si viene del ecosistema de PM2, el preflight falla a propósito (M9): agregar la línea;
 - ventana sin runs V1 largos (`jobList()` en la consola).
 
 **2.1 Merge.** El merge del PR de promoción a `main` dispara `deploy.yml`, en este orden:
@@ -281,6 +288,14 @@ select execution_mode, count(*) from public.production_jobs group by 1 order by 
 11. `mark-ok`.
 
 Si algo falla **antes del rsync** (pasos 1 a 6), producción **no cambia**.
+
+Si algo falla **después** (pasos 9 o 10):
+- `install` deja el estado `failed <sha>`;
+- el paso **Auto-rollback** restaura `.release-prev/` (código y `node_modules`, sin npm y sin migrar);
+- verifica `/health` y marca sana la release restaurada;
+- el job queda en rojo igual.
+
+Con `PROD_AUTO_ROLLBACK=false` no se restaura nada; queda el rollback manual.
 
 **2.2 Seguimiento:**
 
@@ -364,16 +379,24 @@ En el log del paso «Install…» deben aparecer:
 
 | Nivel | Cuándo | Cómo | Toca el esquema |
 |---|---|---|---|
-| 1 Flags | Comportamiento V2, gasto | `PROD_V2_CANARY_OWNER` vacío más redeploy, o editar el `.env` (`DYNAMIC_COURSE_STRUCTURE=false`, `DYNAMIC_WORKERS_HOLD=true`, `FINOPS_KILL_SWITCH`) y `pm2 restart --update-env` | No |
-| 2 Código | Release rota | `workflow_dispatch action=rollback`: `.release-prev/` es la última release marcada sana; la fallida queda en `.release-failed/` | No (no migra) |
+| 1a Gasto | Cortar el gasto V2 | `PROD_V2_CANARY_OWNER` vacío más redeploy. **Solo** apaga los workers de proveedores y de IA; V2 sigue encendido para el allowlist. Sin deploy: `DYNAMIC_WORKERS_HOLD=true` y/o `FINOPS_KILL_SWITCH` en el `.env`, más `pm2 restart --update-env`. | No |
+| 1b V2 OFF | Comportamiento V2 | Editar el `.env`: `DYNAMIC_COURSE_STRUCTURE=false`, más `pm2 restart <los 11> --update-env`. El deploy no lo vuelve a encender sin canario: solo agrega `false` si falta. | No |
+| 2 Código | Release rota | Automático si el fallo fue después del rsync (`PROD_AUTO_ROLLBACK`). Manual: `workflow_dispatch action=rollback`. `.release-prev/` es la última release marcada sana; la fallida queda en `.release-failed/`, sin `node_modules`. Antes de restaurar, el job normaliza el dueño de `VPS_PATH`. | No (no migra) |
 | 2b Manual | Sin Actions | En el VPS, desde una **copia** del script (el rollback reescribe el árbol): `cp /var/www/cursia-backend/scripts/ops/prod-release.sh ~/prod-release.sh && bash ~/prod-release.sh rollback /var/www/cursia-backend`, verificar `/health` y luego `bash ~/prod-release.sh mark-ok /var/www/cursia-backend restored` | No |
 | 3 Esquema | Solo ante corrupción | PITR (P1), decisión del owner | Sí |
 
 **Mecánica del snapshot.**
 - `snapshot` copia la release actual a `.release-prev/` **solo** si su estado es `ok <sha>` o si es la primera vez, sin estado (`pre-r61`).
-- Un deploy que no llega a `mark-ok` deja el estado `deploying <sha>`, y el próximo snapshot **conserva** la última release sana.
+- Un deploy que no llega a `mark-ok` deja el estado `deploying <sha>` o `failed <sha>`, y el próximo snapshot **conserva** la última release sana.
 - El rsync del deploy excluye `.release-*`, así que nunca se borra.
-- Es la release completa (código y `dist/`, sin `node_modules` ni `.env`): `dist.prev` sola no alcanzaría si cambian `package.json` o los scripts.
+- Es la release completa: código, `dist/` y **`node_modules`**, sin `.env`. Así el rollback no depende del registro de npm (M6). `dist.prev` sola no alcanzaría si cambian `package.json` o los scripts.
+- Un snapshot sin `node_modules` (por ejemplo, uno anterior a este fix) cae a `npm install --omit=dev`.
+- Volver a la V1 `pre-r61` **después** de que existan filas `dynamic_*` sigue sin ser el backout soportado (N1); primero el nivel 1b.
+
+**Permisos del `.env` (I3).**
+- Cada reescritura de una clave crea el temporal como copia del `.env` (`cp -p`, `umask 077`), así que el modo del archivo (por ejemplo, 0600) se conserva, y también el de `.env.bak`.
+- Los valores pasan a `awk` por `ENVIRON`, no por argv: no quedan visibles en `/proc/*/cmdline` y las barras invertidas no se alteran.
+- **`deploy-staging.yml` hereda el patrón viejo** (`awk -v …> "$tmp"; mv`), así que el `.env` de staging puede quedar en 0644 tras una reescritura. No se cambió en r61 para no chocar con el PR #156 (agente I, mismas líneas). Pendiente: aplicar el mismo arreglo ahí. Mientras tanto, `chmod 600 .env` a mano en staging.
 
 ---
 
@@ -396,7 +419,7 @@ En el log del paso «Install…» deben aparecer:
 
 **Compensación en r61 (READY):** en cada deploy y rollback se verifican del lado del VPS:
 - la presencia de los 11 procesos;
-- una ventana de estabilidad de 45 s: un reinicio en la ventana hace fallar el deploy;
+- una ventana de estabilidad de 45 s: un reinicio en la ventana hace fallar el deploy, salvo para los workers V1 que ya se reiniciaban antes del deploy (aviso) y los deshabilitados por su flag (detenidos);
 - una sonda de la base de solo lectura con el `.env` real.
 
 **Pendiente (código de la app, con aprobación):**
@@ -419,7 +442,8 @@ En el log del paso «Install…» deben aparecer:
 4. Backup o PITR de la base (P1) y decisión sobre el backup de Storage (P2).
 5. Límite de Storage o espera de la externalización del audiolibro (P3). Cuota de YouTube (P4).
 6. Aprobar la siembra de las 46 filas de precios r60 en producción (P6). Política de presupuesto de producción (P7). Techos y kill switch de FinOps (P8).
-7. Pool de la base y plan del pooler: valores de `PROD_DB_POOL_*` (P9). Memoria del VPS (P10).
+7. Pool de la base y plan del pooler: valores de `PROD_DB_POOL_*` (P9). Memoria del VPS (P10). Revisar qué workers V1 se reinician en bucle hoy (Fase 2).
+7b. Variable **`PROD_FE_GATE_REF`** con el ref del frontend que se promueve (obligatoria). Decidir si los rollbacks necesitan un environment sin reviewers (§1.2).
 8. Versión de Moodle soportada (P11). `VIDEO_ENGINE_*` en el backend y en Pages (P12). Merge de `main` en `staging` (P13). Plan de migración del TTS antes del 2027-01-06 (P14). DN-1..DN-6 (P15).
 9. Correr la fase 1 (dry-run, DN-6, backup, apply y verify) desde un checkout del release.
 10. Aprobar y mergear la promoción (fase 2). Variable `PROD_V2_CANARY_OWNER` (fase 3). `PROD_V2_WORKERS_ENABLED` con la frase AUTORIZO (fase 3.4). Ampliación (fase 4).
