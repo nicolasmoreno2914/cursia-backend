@@ -117,6 +117,10 @@ async function pureChecks() {
     eq(PC.ttsTimeoutMs({ PROVIDER_CALL_TIMEOUT_MS: '8000' }).ms, PC.OPENAI_TTS_TIMEOUT_MS, 'el timeout genérico no lo acorta');
     eq(PC.ttsTimeoutMs({ PROVIDER_CALL_TIMEOUT_MS: '120000' }).ms, PC.OPENAI_TTS_TIMEOUT_MS, 'ni un 120 s heredado');
     eq(PC.ttsTimeoutMs({ OPENAI_TTS_TIMEOUT_MS: '400' }), { ms: 400, source: 'OPENAI_TTS_TIMEOUT_MS' }, 'override explícito');
+    // re-review m4: el override nunca supera lease − margen, y la ventana de takeover se deriva del timeout efectivo.
+    eq(PC.ttsTimeoutMs({ OPENAI_TTS_TIMEOUT_MS: '999999' }).ms, PC.OPENAI_TTS_TIMEOUT_MAX_MS, 'override acotado');
+    assert(PC.OPENAI_TTS_TIMEOUT_MAX_MS + LT.IN_FLIGHT_MARGIN_MS <= PW.PROVIDER_WORKER_MIN_LEASE_SECONDS * 1000, 'override + margen ≤ lease');
+    assert(LT.IN_FLIGHT_WINDOW_MS.openai >= PC.ttsTimeoutMs(process.env).ms + LT.IN_FLIGHT_MARGIN_MS, 'la ventana cubre el timeout efectivo de este proceso');
   });
 
   await check('K1/d10 (punto 3): el peor caso (gastado con la reserva perdida + la reserva nueva) contra el presupuesto de la parte y el saldo del run — sin tope fijo de USD 0,10', () => {
@@ -224,7 +228,8 @@ async function pureChecks() {
     eq(CPR.claimPayloadDependencyKey(vi('VIDEO_YOUTUBE_ID_MISSING')), 'video:ch1', 'dependencia');
     eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_NOT_COMPLETED'), { item_key: 'video:ch1', status: 'running', generation: 1, finished_at: null }).action, 'wait', 'dependencia en curso → espera');
     eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_NOT_COMPLETED'), { item_key: 'video:ch1', status: 'completed', generation: 1, finished_at: t0 }).action, 'reopen', 'completada → reabrir');
-    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), { item_key: 'video:ch1', status: 'completed', generation: 1, finished_at: t0 }).action, 'regenerate_dependency', 'dato inutilizable → regenerar');
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), { item_key: 'video:ch1', status: 'completed', generation: 1, finished_at: t0 }, 'mock').action, 'regenerate_dependency', 'dato inutilizable (video mock) → regenerar');
+    eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), { item_key: 'video:ch1', status: 'completed', generation: 1, finished_at: t0 }).reason, 'real_video_requires_review', 're-review m5: sin modo = real (falla cerrado)');
     const regen = { item_key: 'video:ch1', status: 'completed', generation: 2, finished_at: t0, output_summary: { regeneration: { reason: CPR.CLAIM_PAYLOAD_DEPENDENCY_REASON } } };
     eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), regen), { action: 'exception', depKey: 'video:ch1', code: 'VIDEO_YOUTUBE_ID_MISSING', reason: 'already_regenerated' }, 'una sola vez');
     eq(CPR.claimPayloadRecoveryDecision(vi('VIDEO_YOUTUBE_ID_MISSING'), { ...regen, finished_at: new Date('2026-10-19T10:30:00Z').toISOString() }).action, 'reopen', 'regenerada y completada después → reabrir');
@@ -264,6 +269,11 @@ async function pureChecks() {
       eq([a.state, a.autoRecovering, a.adminActions], ['needs_attention', true, []], 'A en espera → recuperándose solo');
       const k = RC.evaluateRunCompletion(job, row('finops_kill_switch: el interruptor de gasto del servidor (FINOPS_KILL_SWITCH) está activo (anthropic)'), m, null, { now });
       eq([k.autoRecovering, k.adminActions], [true, []], 'kill switch: sin retry_item, recuperándose solo');
+      // re-review m5: un claim incompleto sin resolver pasado el techo → la acción de admin aparece igual.
+      const cpRow = (minsAgo) => [{ id: 'i1', item_key: 'content:x', type: 'video_interactions', chapter_id: 'ch1', status: 'failed',
+        error: 'claim_payload_unavailable: VIDEO_YOUTUBE_ID_MISSING: x', output_summary: {}, finished_at: new Date(now.getTime() - minsAgo * 60_000).toISOString() }];
+      eq(RC.adminActionFor(cpRow(1)[0], 'not_done', now), null, 'claim incompleto reciente: el barrido lo resuelve');
+      eq(RC.adminActionFor(cpRow(31)[0], 'not_done', now)?.code, 'retry_item', 'pasado el techo de 30 min: acción visible');
       const d = RC.evaluateRunCompletion(job, row('contract_x: nope'), m, null, { now });
       eq([d.autoRecovering, d.adminActions.map((x) => x.code)], [undefined, ['retry_item']], 'falla para un humano: sin el flag');
       process.env.DYNAMIC_AUTO_HEAL_ENABLED = 'false';
@@ -309,7 +319,7 @@ function llmWorld(budgetFits, o = {}) {
       if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
         const [keyLike, tagLike, , exclude, includePd] = params;
         return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
-          .map(([k, v]) => ({ key: k, amount: String(v.amount), settled: !!v.settled, send_marked: !!v.sendMarked, created_at: new Date(Date.now() - 3600e3).toISOString() }));
+          .map(([k, v]) => ({ key: k, amount: String(v.amount), settled: !!v.settled, send_marked: !!v.sendMarked, created_at: new Date(v.at || Date.now() - 3600e3).toISOString() }));
       }
       if (sql.includes("'{llmSent}'")) { w.sent[params[2]] = params[3]; return [{ id: params[0] }]; }
       if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps }, sent: { ...w.sent } }];
@@ -317,7 +327,7 @@ function llmWorld(budgetFits, o = {}) {
     },
   };
   w.finops = {
-    async recordCharge(i) { w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false, amount: 0.05, sendMarked: !!i.metadata.sendMarked }); return {}; },
+    async recordCharge(i) { w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false, amount: 0.05, sendMarked: !!i.metadata.sendMarked, at: Date.now() }); return {}; },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },
     async settleReservation(key, charge, reason) { const r = w.res.get(key); r.settled = true; r.reason = reason; r.charged = !!charge; if (!charge) w.released.push({ key, reason }); return { finalInserted: !!charge, finalEvent: null }; },
     ...(o.noReconcile ? {} : {
@@ -397,6 +407,30 @@ async function llmChecks() {
     w.orphan('L9', 3);
     const r2 = await err(api('s', 'L9'));
     assert(r2.e && r2.e.pendingReview && /eventos ambiguos/.test(r2.e.msg), `segundo evento → revisión: ${JSON.stringify(r2.e)}`);
+    await a.close();
+  });
+  await check('I2-bis: evento = intento anterior O solapamiento — A desconocida → reenvío; B desconocida DESPUÉS en el mismo intento → revisión; respaldo max(4, carriles)', async () => {
+    const t = (ms) => new Date(Date.UTC(2026, 9, 20, 12, 0, 0) + ms);
+    eq(SL.countUnknownEvents([{ attempt: 1, createdAt: t(0) }, { attempt: 1, createdAt: t(5) }], 2, null), 1, 'un intento caído = 1 evento');
+    eq(SL.countUnknownEvents([{ attempt: 2, createdAt: t(0) }, { attempt: 2, createdAt: t(5) }], 2, t(10)), 1, 'solapadas en el intento actual = 1 evento');
+    eq(SL.countUnknownEvents([{ attempt: 2, createdAt: t(0) }, { attempt: 2, createdAt: t(20) }], 2, t(10)), 2, 'una nueva después de detectar la primera = 2.º evento');
+    eq(SL.countUnknownEvents([{ attempt: 1, createdAt: t(0) }, { attempt: 2, createdAt: t(20) }], 2, t(10)), 2, 'caído + nueva = 2 eventos');
+    eq([SL.llmUnknownItemMax(), SL.llmUnknownItemMax(6)], [4, 6], 'respaldo max(4, carriles)');
+    const a = await fakeAnthropic((n) => (n === 1 || n === 3 ? 'drop' : 'ok'));
+    const w = llmWorld(true);
+    const api = w.api(a.url);
+    eq((await err(api('s', 'A'))).v, 'R2', 'A: un reenvío');
+    const rb = await err(api('s', 'B'));
+    assert(rb.e && rb.e.pendingReview && /eventos ambiguos/.test(rb.e.msg), `B → revisión: ${JSON.stringify(rb.e)}`);
+    eq(a.st.requests, 3, 'B no se reenvía');
+    await a.close();
+  });
+  await check('re-review m3: markSent lanza (DB) → la reserva se LIBERA (never_sent), no se envía nada y no queda abierta', async () => {
+    const a = await fakeAnthropic(() => 'ok');
+    const w = llmWorld(true);
+    const r = await err(w.api(a.url, 1, { markSent: async () => { throw new Error('db caída'); } })('s', 'M'));
+    assert(r.e && r.e.fatal === false && /no se pudo registrar el envío/.test(r.e.msg), JSON.stringify(r.e));
+    eq([a.st.requests, [...w.res.values()].filter((x) => !x.settled).length, w.released.map((x) => x.reason)], [0, 0, ['llm_worker_never_sent']], '0 pedidos, 0 abiertas');
     await a.close();
   });
   await check('I3: falla cerrado — sin ambiguousResendBudget o sin reconcileReservationAsCharged nunca se reenvía (revisión, humanReason budget)', async () => {

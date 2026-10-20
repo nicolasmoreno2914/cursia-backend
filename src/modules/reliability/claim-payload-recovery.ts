@@ -18,6 +18,11 @@ export const CLAIM_PAYLOAD_UNAVAILABLE = 'claim_payload_unavailable';
 export const CLAIM_PAYLOAD_DEPENDENCY_REASON = 'claim_payload_dependency';
 export const CLAIM_PAYLOAD_DEPENDENCY_STRATEGY = 'regenerate_dependency:claim_payload';
 export const CLAIM_PAYLOAD_RESUME_STRATEGY = 'dependency_resolved:claim_payload';
+/**
+ * r62 (re-review m5): techo de la completitud — si el barrido no resolvió la parte (ni la reabrió ni la registró como
+ * excepción) dentro de este tiempo desde el fallo, la acción de admin aparece igual (p. ej. el barrido falla en cada tick).
+ */
+export const CLAIM_PAYLOAD_SWEEP_CEILING_MS = 30 * 60_000;
 /** Reaperturas gratuitas máximas de la parte tras resolverse su dependencia (anti-bucle). */
 export const CLAIM_PAYLOAD_MAX_REOPENS = 3;
 
@@ -71,12 +76,12 @@ function ms(v: Date | string | null | undefined): number {
 }
 
 /**
- * `videoMode`: modo de video del run. Review N1 I1: regenerar la dependencia SOLO con video `mock` (sin costo). Con video
+ * `videoMode`: modo de video del run (sin dato = `real`: falla cerrado, re-review m5). Review N1 I1: regenerar la dependencia SOLO con video `mock` (sin costo). Con video
  * REAL regenerar sería un render NUEVO pagado en Videogen sobre uno ya pagado (y la vía gratis —re-consultar el job,
  * re-medir el MP4 y re-subir a YouTube de forma idempotente— no está implementada acá): excepción explícita para un humano
  * (`real_video_requires_review`), nunca un repago automático.
  */
-export function claimPayloadRecoveryDecision(row: ClaimPayloadRow, dep: ClaimPayloadDependencyRow | null, videoMode: string = 'mock'): ClaimPayloadDecision {
+export function claimPayloadRecoveryDecision(row: ClaimPayloadRow, dep: ClaimPayloadDependencyRow | null, videoMode: string = 'real'): ClaimPayloadDecision {
   const code = claimPayloadCodeOf(row.error) ?? 'unknown';
   const depKey = claimPayloadDependencyKey(row);
   if (!depKey) return { action: 'exception', depKey: null, code, reason: 'contract' };

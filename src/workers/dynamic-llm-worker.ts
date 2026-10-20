@@ -158,6 +158,8 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
       },
       // r62 (E2E M): marca durable de envío bajo la lease (una reserva sin ella, de un intento caído, nunca salió).
       markSent: async (itemRunId, reservationKey, sentAt) => {
+        // r62 (re-review m2): una tarea vieja de este mismo proceso (cerco) nunca marca ni envía.
+        if (!isCurrentTask()) return false;
         const rows = await deps.dataSource.query(LLM_MARK_SENT_SQL, [itemRunId, deps.executorId, reservationKey, sentAt]);
         const list = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : rows;
         return Array.isArray(list) && list.length > 0;

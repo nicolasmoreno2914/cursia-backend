@@ -38,8 +38,13 @@ export const LLM_UNKNOWN_MAX = 2;
  * en la ventana de la parte → revisión. LLM_UNKNOWN_ITEM_MAX queda solo como tope anti-bucle de respaldo (por encima de
  * la concurrencia del worker: un crash con todos los carriles en vuelo nunca lo alcanza).
  */
-export const LLM_UNKNOWN_ITEM_MAX = 8;
-/** r62: eventos ambiguos (intentos con desconocidos) admitidos por ventana de la parte. */
+export const LLM_UNKNOWN_ITEM_MAX = 4;
+/** r62 (re-review I2-bis): tope de respaldo = max(4, carriles en paralelo de la parte). */
+export function llmUnknownItemMax(parallelCalls?: number | null): number {
+  const n = Math.floor(Number(parallelCalls ?? 0));
+  return Math.max(LLM_UNKNOWN_ITEM_MAX, Number.isFinite(n) && n > 0 ? n : 0);
+}
+/** r62: eventos ambiguos admitidos por ventana de la parte. */
 export const LLM_UNKNOWN_EVENT_MAX = 1;
 /** Prefijo del hash del pedido dentro del callTag de la reserva (identifica "la misma llamada" entre intentos y workers). */
 export const LLM_CALL_HASH_LEN = 12;
@@ -115,6 +120,8 @@ export interface ServerLlmDeps {
    * reservas no llevan `sendMarked` y se tratan como siempre (ambiguas).
    */
   markSent?(itemRunId: string, reservationKey: string, sentAt: string): Promise<boolean>;
+  /** r62 (I2-bis): llamadas en paralelo que el ejecutor puede hacer en una parte (tope de respaldo = max(4, esto)). */
+  maxParallelCalls?: number;
 }
 
 /** Error con la forma que espera el ejecutor (04-api.js). */
@@ -243,17 +250,44 @@ export async function pendingUnknownReservations(ds: DataSource, itemRunId: stri
 }
 
 /**
- * null = se puede (re)intentar; si no, el motivo de dejar la parte en revisión. r62 (I2): por LLAMADA (≤ 1 reenvío) y por
- * EVENTO (intentos distintos con desconocidos ≤ LLM_UNKNOWN_EVENT_MAX), con el tope total solo como respaldo anti-bucle.
+ * r62 (re-review I2-bis): EVENTOS ambiguos de la parte en su ventana. Un evento es:
+ *  - todas las desconocidas de UN intento anterior (caído / tomado: sus llamadas estaban en vuelo a la vez);
+ *  - en el intento actual, las que se SOLAPARON en el tiempo: creadas hasta el momento en que este proceso detectó su
+ *    primer desconocido (`firstUnknownAt`). Una desconocida creada DESPUÉS (p. ej. tras el reenvío de la primera) es un
+ *    evento NUEVO → la parte va a revisión.
+ * Sin `firstUnknownAt` (todavía no hubo desconocidos en este proceso) las del intento actual cuentan como un evento.
  */
-async function unknownLimitReached(ds: DataSource, itemRunId: string, since: Date, hash: string, exclude: readonly string[]): Promise<string | null> {
+export function countUnknownEvents(all: ReadonlyArray<Pick<UnknownReservation, 'attempt' | 'createdAt'>>, currentAttempt: number, firstUnknownAt: Date | null): number {
+  const prior = new Set(all.filter((u) => u.attempt !== currentAttempt).map((u) => u.attempt));
+  const cur = all.filter((u) => u.attempt === currentAttempt);
+  let curEvents = 0;
+  if (cur.length) {
+    if (!firstUnknownAt) curEvents = 1;
+    else {
+      const overlap = cur.some((u) => !u.createdAt || u.createdAt.getTime() <= firstUnknownAt.getTime());
+      const later = cur.some((u) => !!u.createdAt && u.createdAt.getTime() > firstUnknownAt.getTime());
+      curEvents = (overlap ? 1 : 0) + (later ? 1 : 0);
+    }
+  }
+  return prior.size + curEvents;
+}
+
+/**
+ * null = se puede (re)intentar; si no, el motivo de dejar la parte en revisión. r62 (I2 / I2-bis): por LLAMADA (≤ 1
+ * reenvío), por EVENTO (countUnknownEvents ≤ LLM_UNKNOWN_EVENT_MAX) y tope de respaldo max(4, carriles).
+ */
+async function unknownLimitReached(
+  ds: DataSource, itemRunId: string, since: Date, hash: string, exclude: readonly string[],
+  ctx: { attempt: number; firstUnknownAt: Date | null; maxParallelCalls?: number } = { attempt: 0, firstUnknownAt: null },
+): Promise<string | null> {
   const same = await countUnknownCalls(ds, itemRunId, since, hash, exclude);
   if (same >= LLM_UNKNOWN_MAX) return `${same} intentos de la misma llamada sin respuesta`;
   const all = await unknownReservations(ds, itemRunId, since, { exclude, includePossibleDuplicate: true });
-  const events = new Set(all.map((u) => u.attempt)).size;
-  if (events > LLM_UNKNOWN_EVENT_MAX) return `${events} eventos ambiguos (intentos con llamadas sin respuesta) en esta parte`;
+  const events = countUnknownEvents(all, ctx.attempt, ctx.firstUnknownAt);
+  if (events > LLM_UNKNOWN_EVENT_MAX) return `${events} eventos ambiguos (llamadas sin respuesta en momentos distintos) en esta parte`;
   const total = await countUnknownCalls(ds, itemRunId, since, undefined, exclude);
-  if (total >= LLM_UNKNOWN_ITEM_MAX) return `${total} llamadas sin respuesta en esta parte`;
+  const cap = llmUnknownItemMax(ctx.maxParallelCalls);
+  if (total >= cap) return `${total} llamadas sin respuesta en esta parte (tope ${cap})`;
   return null;
 }
 
@@ -334,6 +368,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
   // liquidación falló (quedan pendientes en el ledger para conciliar, pero la respuesta sí llegó).
   const notUnknown = new Set<string>();
   let neverSentChecked = false;
+  // r62 (I2-bis): instante en que ESTE proceso detectó su primer resultado desconocido (solapamiento de un evento).
+  let firstUnknownAt: Date | null = null;
+  const unknownCtx = () => ({ attempt: item.attempt, firstUnknownAt, maxParallelCalls: deps.maxParallelCalls });
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const api = async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>, cacheOpts?: { cachePrefix?: string }): Promise<string> {
     const { body, model: useModel, maxTokens } = serverLlmRequestBody({ system, user, maxTok, schema, model, defaultModel: deps.defaultModel, cacheOpts });
@@ -380,7 +417,7 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         neverSentChecked = true;
         await releaseNeverSentOrphans(deps, item, await itemWindowStart(deps.dataSource, item.itemRunId), [...notUnknown]);
       }
-      const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
+      const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown], unknownCtx());
       if (unknownReason) {
         throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(unknownReason) } as ApiError;
       }
@@ -442,10 +479,22 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       const sentAt = new Date().toISOString();
       // r62 (E2E M): marca DURABLE de envío justo antes del fetch. Si ya no somos dueños de la parte, no se envía y la
       // reserva se libera (nunca salió).
-      if (deps.markSent && !(await deps.markSent(item.itemRunId, resKey, sentAt))) {
-        await settlePaidCall(deps.finops, resKey, null, 'llm_worker_never_sent');
-        notUnknown.delete(resKey);
-        throw { fatal: true, handBack: 'lease_lost', code: 'lease_lost', msg: 'lease_lost: la parte ya no es de este worker; la llamada no se envió (reserva liberada)' } as ApiError;
+      if (deps.markSent) {
+        let marked = false;
+        try {
+          marked = await deps.markSent(item.itemRunId, resKey, sentAt);
+        } catch (err) {
+          // r62 (re-review m3): la marca no se pudo escribir (DB) → no se envía nada: la reserva se libera (never_sent),
+          // nunca queda abierta; la llamada se reintenta como un transitorio sin gasto.
+          await settlePaidCall(deps.finops, resKey, null, 'llm_worker_never_sent').catch(() => undefined);
+          notUnknown.delete(resKey);
+          throw { fatal: false, status: 0, msg: `Error de red: no se pudo registrar el envío (${err instanceof Error ? err.message : String(err)}); la llamada no salió` } as ApiError;
+        }
+        if (!marked) {
+          await settlePaidCall(deps.finops, resKey, null, 'llm_worker_never_sent');
+          notUnknown.delete(resKey);
+          throw { fatal: true, handBack: 'lease_lost', code: 'lease_lost', msg: 'lease_lost: la parte ya no es de este worker; la llamada no se envió (reserva liberada)' } as ApiError;
+        }
       }
       let r: LlmStreamResult;
       try {
@@ -481,7 +530,8 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         // presupuesto y en el contador de desconocidos).
         notUnknown.delete(resKey);
         deps.logger.warn(`[llm-worker] ${item.itemKey}: resultado DESCONOCIDO (${e.message}); reserva ${resKey} pendiente`);
-        const reason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown]);
+        if (!firstUnknownAt) firstUnknownAt = new Date();
+        const reason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown], unknownCtx());
         if (reason) {
           throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(reason) } as ApiError;
         }

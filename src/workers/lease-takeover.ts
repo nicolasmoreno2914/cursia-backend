@@ -14,7 +14,7 @@
 //     artifacts de la parte (cercado por worker_id + el cerco en proceso de abajo).
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { OPENAI_TTS_TIMEOUT_MS } from './provider-real/provider-clients';
+import { OPENAI_TTS_TIMEOUT_MS, ttsTimeoutMs } from './provider-real/provider-clients';
 
 /** Prefijo estable del error con el que B devuelve la parte (reanudable, sin gasto nuevo, sin consumir intento). */
 export const PRIOR_CALL_IN_FLIGHT = 'prior_call_in_flight';
@@ -27,7 +27,8 @@ export const IN_FLIGHT_MARGIN_MS = 30_000;
  * PROVIDER_CALL_TIMEOUT_MS solo puede ACORTAR esos timeouts, nunca alargarlos.
  */
 export const IN_FLIGHT_WINDOW_MS: Readonly<Record<string, number>> = Object.freeze({
-  openai: OPENAI_TTS_TIMEOUT_MS + IN_FLIGHT_MARGIN_MS, // TTS (r62: 210 s + margen)
+  // TTS (r62): derivada del timeout EFECTIVO del cliente (máx(210 s, OPENAI_TTS_TIMEOUT_MS acotado) + margen).
+  openai: Math.max(OPENAI_TTS_TIMEOUT_MS, ttsTimeoutMs(process.env).ms) + IN_FLIGHT_MARGIN_MS,
   anthropic: 120_000 + IN_FLIGHT_MARGIN_MS, // guion del audiolibro (AnthropicClient)
   gamma: 60_000 + IN_FLIGHT_MARGIN_MS, // createGeneration
   // batchCreate de Videogen: en V2 el worker lo acota a VIDEOGEN_SUBMIT_TIMEOUT_MS (180 s por defecto, r62 N2); esta cota
