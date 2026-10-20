@@ -36,7 +36,7 @@ Los `scripts/migrate-*.js` de staging **no cambiaron** (siguen exigiendo
 
 ## Plan fijo (qué se aplica y en qué orden)
 
-Mismo orden que `deploy-staging.yml`. Cada paso corre en **su propia
+Mismo orden relativo que `deploy-staging.yml` (r60: `scripts/check-r60-prod-migrations-cover-staging.js` exige que el plan cubra TODA migración que corre `deploy-staging.yml`). Cada paso corre en **su propia
 transacción**; el runner se detiene en el primer error (los pasos anteriores
 quedan commiteados — todos son idempotentes, se puede re-correr).
 
@@ -46,12 +46,25 @@ quedan commiteados — todos son idempotentes, se puede re-correr).
 | 1 | `supabase-migration-dynamic-course-structure.sql` | paso 3 |
 | 2 | `supabase-migration-course-blueprints.sql` | 4b |
 | 3 | `supabase-migration-v21-blueprint-profiles.sql` (V2.1 R3 — toggles de curso/capítulo, `course_profiles`; backfill de legado: cursos dinámicos existentes → `scorm`, sin examen final) | 4d2 |
-| 4 | `supabase-migration-generation-manifests.sql` | 4e |
-| 5 | `supabase-migration-dynamic-generation.sql` | 4h |
-| 6 | `supabase-migration-dynamic-generation-v2.sql` | 4h2 |
-| 7 | `supabase-migration-invalidation.sql` (Fase 8 — `carried_from_item_run_id`; ya integrado: `[included]`) | 4h3 |
-| 8 | `supabase-migration-v21-manifest-v3.sql` (V2.1 R4 — tipos y conteos rulesVersion 3; va después de la v2) | 4h4 |
-| 9 | `supabase-migration-storage-artifacts-policies.sql` | 4k |
+| 4 | `supabase-migration-pedagogy-profiles.sql` (r60: antes solo staging; después de v21-blueprint-profiles) | 4d6 |
+| 5 | `supabase-migration-practice-chapters.sql` (r60: antes solo staging) | 4d8 |
+| 6 | `supabase-migration-generation-manifests.sql` | 4e |
+| 7 | `supabase-migration-dynamic-generation.sql` | 4h |
+| 8 | `supabase-migration-dynamic-generation-v2.sql` | 4h2 |
+| 9 | `supabase-migration-invalidation.sql` (Fase 8 — `carried_from_item_run_id`; ya integrado: `[included]`) | 4h3 |
+| 10 | `supabase-migration-v21-manifest-v3.sql` (V2.1 R4 — tipos y conteos rulesVersion 3; va después de la v2) | 4h4 |
+| 11 | `supabase-migration-application-activities.sql` (r60: antes solo staging; después de manifest-v3, reescribe `cgm_counts_consistent`) | 4h5a |
+| 12 | `supabase-migration-guided-practice.sql` (r60: antes solo staging; después de application-activities) | 4h5a2 |
+| 13 | `supabase-migration-academic-context.sql` (r60: antes solo staging; después de pedagogy-profiles) | 4h5c |
+| 14 | `supabase-migration-prebrief.sql` (r60: antes solo staging) | 4h5e |
+| 15 | `supabase-migration-v21-finops.sql` | 4h6 |
+| 16 | `supabase-migration-v21-finops-rls.sql` | 4h8 |
+| 17 | `supabase-migration-ev6-h5p2.sql` | 4d4 |
+| 18 | `supabase-migration-rel-recovery.sql` | 4h11 |
+| 19 | `supabase-migration-rel-exec-lease.sql` | 4h13 |
+| 20 | `supabase-migration-run-pause.sql` | 4h15 |
+| 21 | `supabase-migration-llm-worker-presence.sql` | 4h16 |
+| 22 | `supabase-migration-storage-artifacts-policies.sql` | 4k |
 
 Después, en solo lectura: el CHECK de `production_jobs` al día, los 9
 `verify-*/audit-*` de V2/V2.1 en modo `production-readonly` y las 4 políticas de

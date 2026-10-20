@@ -71,14 +71,14 @@
    "contractVersion": null,
    "provider": "fake-e2e-llm",
    "model": "claude-sonnet-4-6",
-   "promptHash": "c9e418140c87fe3a9dc0e2ee8084bd9072b0805bc3bbbfa75d4537b54d8eae09",
-   "requestHash": "6f7964f9519b3a40e78929e6c0e748879dfb77b56bc1e7bfc39906d08452df98",
+   "promptHash": "fa14565429318740ceca2111f2b70cf1c791ba40d5510c62e4693314267c6e4f",
+   "requestHash": "95cfb4a67e697988fa797927fc1da0829dd085ed62552cfd38892b7fa94556b7",
    "inputHash": "9bde0b47887fe6371f8622320257c244584b021fc7364519429c8ed44401e002",
    "sanitizedResponse": {
     "text": "# Capítulo 1: Punto de equilibrio\n\n## 1.1 Fundamentos\n\nTexto del capítulo MARKCH-00000000-0000-4000-8000-f00000978101-A con ejemplos del sector.\n\n| Parámetro | Valor |\n|---|---|\n| Presión | 210 bar |\n\n■ Glosario del Capítulo: bomba, caudal.\n\n```json context_summary\n{\"summary\":\"Se cubrió Punto de equilibrio (A).\",\"concepts_introduced\":[\"Concepto clave de Punto de equilibrio\",\"Práctica de Punto de equilibrio\"],\"key_terms\":[\"Término de Punto de equilibrio\"]}\n```",
     "stopReason": "end_turn",
     "usage": {
-     "input_tokens": 1882,
+     "input_tokens": 1851,
      "output_tokens": 116
     },
     "redactions": 0

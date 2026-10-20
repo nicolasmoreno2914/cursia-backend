@@ -175,6 +175,18 @@ async function main() {
       eq(it.status, 'completed', `completa (${it.error})`);
       eq(fakes.st.tts.slice(t0).map((c) => c.model), ['tts-1'], 'el env pisa el default');
     });
+    await check('(a) r60: OPENAI_TTS_MODEL = alias exacto vuelve al snapshot (llamada, reserva y liquidación); OPENAI_TTS_ALLOW_ALIAS=true lo deja pasar', async () => {
+      let t0 = fakes.st.tts.length;
+      const { Wd, it } = await runWelcome({ ...ENV, OPENAI_TTS_MODEL: ALIAS });
+      eq(it.status, 'completed', `completa (${it.error})`);
+      eq(fakes.st.tts.slice(t0).map((c) => c.model), [SNAPSHOT], 'alias → snapshot en la llamada');
+      eq(Wd.ledgerInputs.map((x) => x.modelOrProduct), [SNAPSHOT, SNAPSHOT], 'reserva y liquidación con el modelo llamado');
+      t0 = fakes.st.tts.length;
+      const r2 = await runWelcome({ ...ENV, OPENAI_TTS_MODEL: ALIAS, OPENAI_TTS_ALLOW_ALIAS: 'true' });
+      eq(r2.it.status, 'completed', `completa (${r2.it.error})`);
+      eq(fakes.st.tts.slice(t0).map((c) => c.model), [ALIAS], 'ALLOW_ALIAS=true');
+      eq(r2.Wd.ledgerInputs.map((x) => x.modelOrProduct), [ALIAS, ALIAS], 'ledger = modelo llamado (alias)');
+    });
 
     // ── (b) ───────────────────────────────────────────────────────────────────────────────────────
     await check('(b) el seed tiene las 3 filas del snapshot, idénticas al alias salvo el modelo y source_ref', () => {
@@ -232,6 +244,10 @@ async function main() {
       eq(W.dynamicVideogenTtsModel({ DYNAMIC_VIDEOGEN_TTS_MODEL: '' }), SNAPSHOT, 'vacío');
       eq(W.dynamicVideogenTtsModel({ DYNAMIC_VIDEOGEN_TTS_MODEL: '   ' }), SNAPSHOT, 'espacios');
       eq(W.dynamicVideogenTtsModel({ DYNAMIC_VIDEOGEN_TTS_MODEL: 'tts-1' }), 'tts-1', 'env pisa');
+      // r60 (review I-2): el alias exacto vuelve al snapshot salvo OPENAI_TTS_ALLOW_ALIAS=true; OPENAI_TTS_MODEL no aplica acá.
+      eq(W.dynamicVideogenTtsModel({ DYNAMIC_VIDEOGEN_TTS_MODEL: ALIAS }), SNAPSHOT, 'alias → snapshot');
+      eq(W.dynamicVideogenTtsModel({ DYNAMIC_VIDEOGEN_TTS_MODEL: ALIAS, OPENAI_TTS_ALLOW_ALIAS: 'true' }), ALIAS, 'ALLOW_ALIAS=true');
+      eq(W.dynamicVideogenTtsModel({ OPENAI_TTS_MODEL: 'tts-1' }), SNAPSHOT, 'OPENAI_TTS_MODEL no pisa el modelo de Videogen');
     });
 
     const OWNER = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';

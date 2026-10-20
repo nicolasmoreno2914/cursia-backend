@@ -50,7 +50,9 @@ const TOOL_VERSION = 1;
 // (solo lectura): si alguna fila existente violaría el CHECK nuevo, se niega
 // sin aplicar NADA y reporta los valores ofensores. deploy.yml vuelve a correr
 // el mismo SQL en el merge (idempotente, misma lista).
-// Pasos 1..7: mismo orden que deploy-staging.yml (3, 4b, 4e, 4h, 4h2, 4h3, 4k).
+// Pasos: mismo orden relativo que deploy-staging.yml (3, 4b, 4d2, 4d6, 4d8, 4e, 4h, 4h2, 4h3, 4h4, 4h5a…4h5e, 4h6…).
+// r60: scripts/check-r60-prod-migrations-cover-staging.js exige que este plan cubra TODA migración que corre
+// deploy-staging.yml (y sus dependencias de orden), para que no vuelva a quedar atrás.
 // usage_events/cost_rates (migrate-usage-events-costs.js) no es V2: lo sigue
 // aplicando deploy.yml.
 const CONSTRAINTS_STEP = {
@@ -81,6 +83,21 @@ const MIGRATION_STEPS = [
     file: 'supabase-migration-v21-blueprint-profiles.sql',
     stagingStep: '4d2 (migrate-v21-blueprint-profiles.js)',
     summary: 'V2.1 R3: courses.final_exam_enabled/activity_engine, course_chapters.activity_enabled, course_blueprints schemaVersion 2, course_profiles append-only',
+  },
+  {
+    // r60 (gap «plan de migración incompleto»): el código de staging lo necesita (course_profiles kind pedagogy:
+    // pedagogy-db.ts). Requiere v21-blueprint-profiles (course_profiles_kind_check; el .sql falla visible sin ella).
+    id: 'pedagogy-profiles',
+    file: 'supabase-migration-pedagogy-profiles.sql',
+    stagingStep: '4d6 (migrate-pedagogy-profiles.js)',
+    summary: 'Motor pedagógico V1: course_profiles_kind_check admite pedagogy (idempotente: solo si falta)',
+  },
+  {
+    // r60: guarda schema_not_migrated_practice (v21-schema-guard.ts). Aditiva: columna con default 'content'.
+    id: 'practice-chapters',
+    file: 'supabase-migration-practice-chapters.sql',
+    stagingStep: '4d8 (migrate-practice-chapters.js)',
+    summary: "Motor de carga horaria: course_chapters.chapter_kind (default 'content') + CHECK content|practice",
   },
   {
     id: 'generation-manifests',
@@ -120,6 +137,35 @@ const MIGRATION_STEPS = [
     file: 'supabase-migration-v21-manifest-v3.sql',
     stagingStep: '4h4 (migrate-v21-manifest-v3.js)',
     summary: 'V2.1 R4: tipos v3 en gir_type_check/gir_type_scope/default scope, conteos v3 en course_generation_manifests, scorm_count >= 0',
+  },
+  {
+    // r60: guarda schema_not_migrated_application. DESPUÉS de v21-manifest-v3: reescribe cgm_counts_consistent.
+    id: 'application-activities',
+    file: 'supabase-migration-application-activities.sql',
+    stagingStep: '4h5a (migrate-application-activities.js)',
+    summary: 'Actividades de Aplicación: course_chapters.application_minutes + conteos del Manifest (cgm_counts_consistent reescrito)',
+  },
+  {
+    // r60: guarda schema_not_migrated_guided_practice. DESPUÉS de application-activities: reescribe cgm_counts_consistent.
+    id: 'guided-practice',
+    file: 'supabase-migration-guided-practice.sql',
+    stagingStep: '4h5a2 (migrate-guided-practice.js)',
+    summary: 'Práctica guiada: course_chapters.guided_practice_minutes + conteos del Manifest (cgm_counts_consistent reescrito)',
+  },
+  {
+    // r60: academic-db.ts (course_profiles kind academic, course_chapters.outcome_ids). DESPUÉS de pedagogy-profiles
+    // (el .sql falla visible si el CHECK no admite pedagogy).
+    id: 'academic-context',
+    file: 'supabase-migration-academic-context.sql',
+    stagingStep: '4h5c (migrate-academic-context.js)',
+    summary: 'Contexto académico: course_profiles_kind_check admite academic + course_chapters.outcome_ids (jsonb, CHECK)',
+  },
+  {
+    // r60: prebrief.service.ts. Tablas nuevas (create … if not exists) con FK a courses.
+    id: 'prebrief',
+    file: 'supabase-migration-prebrief.sql',
+    stagingStep: '4h5e (migrate-prebrief.js)',
+    summary: 'Prebrief pedagógico: course_prebrief_versions (inmutable por trigger) / course_prebrief_events / course_prebrief_pdfs',
   },
   {
     // V2.1 RF (FinOps): ledger append-only + catálogo de precios. Sin tablas ni
@@ -238,12 +284,6 @@ const EXCLUDED = [
   { file: 'supabase-migration-p2-content-worker.sql', reason: 'legacy (P2.1), ya aplicada en producción' },
   { file: 'supabase-migration-brand-extraction-execution-mode.sql', reason: 'legacy, no V2' },
   { file: 'supabase-migration-dashboard-course-costs.sql', reason: 'legacy, no V2' },
-  { file: 'supabase-migration-pedagogy-profiles.sql', reason: 'Motor pedagógico V1: SOLO staging en esta fase (deploy-staging.yml 4d6); se agrega al plan de producción cuando se decida el rollout' },
-  { file: 'supabase-migration-practice-chapters.sql', reason: 'Motor de carga horaria (capítulo de práctica): SOLO staging en esta fase (deploy-staging.yml); se agrega al plan de producción cuando se decida el rollout' },
-  { file: 'supabase-migration-application-activities.sql', reason: 'Fase 2 (Actividades de Aplicación): SOLO staging en esta fase (deploy-staging.yml); se agrega al plan de producción cuando se decida el rollout' },
-  { file: 'supabase-migration-guided-practice.sql', reason: 'Loop 9 B (Práctica guiada): SOLO staging en esta fase (deploy-staging.yml, después de las Actividades de Aplicación); se agrega al plan de producción cuando se decida el rollout' },
-  { file: 'supabase-migration-academic-context.sql', reason: 'Fase 3 (Contexto académico): SOLO staging en esta fase (deploy-staging.yml); se agrega al plan de producción cuando se decida el rollout' },
-  { file: 'supabase-migration-prebrief.sql', reason: 'Prebrief pedagógico: SOLO staging en esta fase (deploy-staging.yml); se agrega al plan de producción cuando se decida el rollout' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

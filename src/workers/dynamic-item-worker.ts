@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 import { createHash } from 'crypto';
+import { TTS_SNAPSHOT_MODEL, resolveTtsModel } from '../tts/tts-models';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
@@ -358,10 +359,10 @@ export function isVideogenDefinitiveRejection(err: unknown): boolean {
  * snapshot fijo no (staging 2026-10-19: 0 de 13 colgadas). DYNAMIC_VIDEOGEN_TTS_MODEL lo pisa.
  * Voz y proveedor quedan con los defaults de Videogen.
  */
-export const DYNAMIC_VIDEOGEN_TTS_MODEL_DEFAULT = 'gpt-4o-mini-tts-2025-03-20';
+export const DYNAMIC_VIDEOGEN_TTS_MODEL_DEFAULT = TTS_SNAPSHOT_MODEL;
+/** r60 (review I-2): el alias exacto en DYNAMIC_VIDEOGEN_TTS_MODEL vuelve al snapshot (salvo OPENAI_TTS_ALLOW_ALIAS=true). */
 export function dynamicVideogenTtsModel(env: Record<string, string | undefined> = process.env): string {
-  const v = env.DYNAMIC_VIDEOGEN_TTS_MODEL;
-  return typeof v === 'string' && v.trim() ? v.trim() : DYNAMIC_VIDEOGEN_TTS_MODEL_DEFAULT;
+  return resolveTtsModel(env.DYNAMIC_VIDEOGEN_TTS_MODEL, { OPENAI_TTS_ALLOW_ALIAS: env.OPENAI_TTS_ALLOW_ALIAS }).model;
 }
 
 interface RunHead {

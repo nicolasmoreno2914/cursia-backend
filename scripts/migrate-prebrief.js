@@ -24,7 +24,8 @@ function loadEnvFile(envPath) {
 // Cursia — Prebrief pedagógico: course_prebrief_versions / course_prebrief_events / course_prebrief_pdfs (tablas
 // nuevas, inmutables, con RLS y sin acceso para anon/authenticated). Ninguna tabla existente cambia. Aditiva,
 // idempotente y SOLO staging: la cablea deploy-staging.yml (nunca deploy.yml), DESPUÉS de migrate-academic-context.js.
-// Producción: fuera de alcance (no está en scripts/prod/migrate-v2-production.js).
+// Producción: este script es SOLO staging; en producción el mismo .sql lo aplica
+// scripts/prod/migrate-v2-production.js (paso propio, r60) con sus guardas y aprobación del owner.
 //
 // Guardarraíl de intención explícita: esta migración es solo para staging.
 // No se infiere nada de DB_HOST/DB_NAME — el operador tiene que

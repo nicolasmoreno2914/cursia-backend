@@ -27,7 +27,7 @@ import { mp3DurationSeconds } from '../package/audio/mp3-parser';
  *
  * Variables de entorno requeridas:
  *   OPENAI_API_KEY      → API key de OpenAI (en .env del servidor, nunca en frontend)
- *   OPENAI_TTS_MODEL    → Modelo (default: gpt-4o-mini-tts)
+ *   OPENAI_TTS_MODEL    → Modelo (default: gpt-4o-mini-tts-2025-03-20; el alias se normaliza salvo OPENAI_TTS_ALLOW_ALIAS=true)
  *   OPENAI_TTS_VOICE    → Voz (default: marin)
  *
  * Endpoints:

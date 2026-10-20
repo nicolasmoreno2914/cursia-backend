@@ -292,6 +292,7 @@ async function _dynRunContent(item) {
   if (!md || !md.trim()) {
     return { ok: false, error: 'contenido vacío tras generación', retryable: true };
   }
+  md = dynStripInternalNotes(md).text; // r60 Q-03
   var fname = (item.chapterId || item.itemRunId) + '_dynamic_content_md.md';
   return {
     ok: true,
@@ -991,6 +992,12 @@ async function _dynRunContentV2(item) {
   }
   // Language QA: el voseo sin otra lectura se corrige solo antes de verificar.
   ex.markdown = _dynLqaFixText(ex.markdown, courseContext);
+  // r60 Q-03 (review I-1): la nota interna se quita GRATIS antes de verificar (nunca dispara reparación ni reintento
+  // pagados); el lint INTERNAL_NOTE queda solo como respaldo para la nota incrustada en prosa.
+  var internalNotesRemoved = 0;
+  var stripped = dynStripInternalNotes(ex.markdown);
+  ex.markdown = stripped.text;
+  internalNotesRemoved += stripped.removed;
   // R14: veracidad + tuteo. Un reintento dirigido del capítulo completo; si persiste, falla visible.
   var truthHits = dynLintContentTruth(ex.markdown, courseContext);
   var truthRetried = false;
@@ -1030,6 +1037,9 @@ async function _dynRunContentV2(item) {
       return { ok: false, error: 'CONTENT_TRUTH_RETRY_INVALID: el reintento de veracidad no produjo un capítulo válido.', retryable: true };
     }
     exT.markdown = _dynLqaFixText(exT.markdown, courseContext);
+    var strippedT = dynStripInternalNotes(exT.markdown); // r60 Q-03: antes del lint, gratis
+    exT.markdown = strippedT.text;
+    internalNotesRemoved += strippedT.removed;
     var still = hardTruth(dynLintContentTruth(exT.markdown, courseContext));
     if (still.length) {
       return { ok: false, error: 'CONTENT_TRUTH: persisten ' + still.length + ' oraciones con datos no verificables, casos rotulados como reales o voseo tras el reintento dirigido: ' + still.slice(0, 3).map(function (h) { return '[' + h.code + '] ' + h.text.slice(0, 90); }).join(' | '), retryable: true };
@@ -1041,6 +1051,10 @@ async function _dynRunContentV2(item) {
   // #583 (M4): un solo formato de moneda en el curso (es-CO «$180.000»): el Markdown sale normalizado, así que
   // todo lo que se genera desde él (experiencia, video, actividad, banco con evidencia textual) lo cita igual.
   var contentMd = ex.markdown;
+  // r60 Q-03: una nota interna de producción nunca es texto para el estudiante (también tras la reparación parcial).
+  var internalNotes = dynStripInternalNotes(contentMd);
+  contentMd = internalNotes.text;
+  internalNotesRemoved += internalNotes.removed;
   var moneyNormalized = 0;
   if (dynCourseIsColombia(courseContext)) {
     var mn = dynNormalizeMoneyEsCo(contentMd);
@@ -1109,8 +1123,29 @@ async function _dynRunContentV2(item) {
     summary.contextSummaryErrors = summaryErrors.slice(0, 5);
   }
   if (moneyNormalized) summary.moneyNormalized = moneyNormalized;
+  if (internalNotesRemoved) summary.internalNotesRemoved = internalNotesRemoved;
   return { ok: true, artifacts: artifacts, summary: summary };
 }
+
+// ════ r60 Q-03 — notas internas de producción fuera del Libro Guía ════
+// El prompt viejo pedía «■■ Nota: actividad de apoyo, opcional, no subir a Moodle.» bajo cada Actividad de
+// Apoyo y llegaba al PDF del estudiante. El prompt V2 ya no lo pide; si el modelo la escribe igual, la línea
+// completa de la nota se quita (determinista, contada en el summary: nunca en silencio).
+// Review M-1: anclado a la forma completa de la nota («actividad de apoyo … (opcional) … no subir a Moodle»), no a
+// «no subir a Moodle» suelto: un curso que enseña Moodle puede decirlo con todo derecho.
+var _DYN_INTERNAL_NOTE_CORE = 'actividad(?:es)?\\s+de\\s+apoyo\\b[^\\n]{0,120}?\\bno\\s+subir\\s+a\\s+moodle\\b';
+var DYN_INTERNAL_NOTE_LINE_RE = new RegExp('^[ \\t>*_\\-\\u2022\\u25a0]*(?:nota|note)\\s*:?[^\\n]*?' + _DYN_INTERNAL_NOTE_CORE + '[^\\n]*$', 'i');
+var DYN_INTERNAL_NOTE_PHRASE_RE = new RegExp(_DYN_INTERNAL_NOTE_CORE, 'i');
+function dynStripInternalNotes(md) {
+  var removed = 0;
+  var lines = String(md == null ? '' : md).split('\n').filter(function (line) {
+    if (DYN_INTERNAL_NOTE_LINE_RE.test(line)) { removed++; return false; }
+    return true;
+  });
+  return { text: removed ? lines.join('\n') : String(md == null ? '' : md), removed: removed };
+}
+/** true si el texto conserva la frase interna «no subir a Moodle» (chequeo determinista del Libro). */
+function dynHasInternalNote(md) { return DYN_INTERNAL_NOTE_PHRASE_RE.test(String(md == null ? '' : md)); }
 
 // ════ R14 — veracidad del Libro Guía: detector de datos inventados y voseo ════
 // Una oración con un porcentaje sobre una población ("el 72% de los docentes"), o con un porcentaje
@@ -1246,6 +1281,7 @@ function dynLintContentTruth(text, courseContext, illustrative, noLang) {
     if (DYN_OUTDATED_CLAIM_RE.test(f) && !DYN_OUTDATED_HEDGE_RE.test(f) && !DYN_OUTDATED_NOT_AI_RE.test(f) && !DYN_OUTDATED_CONNECTIVITY_RE.test(f)) { hits.push({ code: 'OUTDATED_CLAIM', text: t200 }); special = true; }
     if (paisF && paisF.indexOf('espana') < 0 && DYN_FOREIGN_LAW_RE.test(f) && !DYN_FOREIGN_LAW_CONTEXT_RE.test(f)) { hits.push({ code: 'FOREIGN_LAW', text: t200 }); special = true; }
     if (DYN_CONTENT_NEUROMYTH_RE.test(f) && !DYN_NEUROMYTH_DEBUNK_RE.test(f)) { hits.push({ code: 'NEUROMYTH', text: t200 }); special = true; }
+    if (DYN_INTERNAL_NOTE_PHRASE_RE.test(f)) { hits.push({ code: 'INTERNAL_NOTE', text: t200 }); special = true; } // r60 Q-03
     // Además de los códigos especiales, la misma oración pasa por el chequeo de datos inventados / voseo.
     // Edu Phase A: en un worked_example los datos son hipotéticos y Cursia los rotula «Datos del caso
     // (ilustrativos)»: solo se omite la regla "N % de los <población>" (un dato del caso, p. ej. "18 % de
@@ -1319,6 +1355,7 @@ function _dynTruthHitLabel(code, hit) {
   if (code === 'REAL_LABEL') return 'caso ilustrativo rotulado como real: quita el rótulo «real», usa «Caso ilustrativo»';
   if (code === 'OUTDATED_CLAIM') return 'capacidad o limitación de la IA afirmada como permanente: dilo como "depende de la herramienta" (algunas buscan en la web o recuerdan conversaciones)';
   if (code === 'FOREIGN_LAW') return 'sigla o ley de otro país: usa el nombre oficial de la ley del país del curso (en Colombia, Ley 1581 de 2012 / Habeas Data)';
+  if (code === 'INTERNAL_NOTE') return 'nota interna de producción («no subir a Moodle»): no es texto para el estudiante, quítala';
   if (code === 'NEUROMYTH') return 'neuromito de los estilos VAK: no asignes formatos a "estudiantes visuales/auditivos/kinestésicos"; varía formatos por necesidad o accesibilidad';
   return 'dato/estudio/cifra no verificable, quítalo o preséntalo como hipotético';
 }

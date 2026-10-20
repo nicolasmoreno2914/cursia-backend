@@ -25,7 +25,8 @@ function loadEnvFile(envPath) {
 // (jsonb, null por defecto). Ninguna fila existente cambia (ningún Blueprint cambia). Aditiva, idempotente y SOLO
 // staging: la cablea deploy-staging.yml (nunca deploy.yml), paso 4h5c, DESPUÉS de migrate-pedagogy-profiles.js (exige el
 // CHECK de kind con 'pedagogy').
-// Producción: fuera de alcance de esta fase (no está en scripts/prod/migrate-v2-production.js).
+// Producción: este script es SOLO staging; en producción el mismo .sql lo aplica
+// scripts/prod/migrate-v2-production.js (paso propio, r60) con sus guardas y aprobación del owner.
 //
 // Guardarraíl de intención explícita: esta migración es solo para staging.
 // No se infiere nada de DB_HOST/DB_NAME — el operador tiene que

@@ -61,6 +61,7 @@ import {
   validateChapterAudioManifest,
 } from '../../package/audio';
 import { transcodeMp3Bitrate } from '../../tts/mp3-transcode.util';
+import { TTS_SNAPSHOT_MODEL, resolveTtsModel } from '../../tts/tts-models';
 import type { ThemeFamilyId, ThemeMode } from '../../modules/theme-engine/types';
 import {
   GuardNextCall,
@@ -119,7 +120,7 @@ export const GAMMA_NUM_CARDS = 10;
 // r59: se fija el snapshot. El alias `gpt-4o-mini-tts` se colgaba de forma intermitente (staging 2026-10-19:
 // 5 de 11 llamadas >60 s, terminaban a los 125–172 s y se cobraban); el snapshot fijo, 0 de 13. Mismo precio
 // que el alias (filas propias en pricing-seed.v1). OPENAI_TTS_MODEL sigue teniendo prioridad.
-export const TTS_MODEL_DEFAULT = 'gpt-4o-mini-tts-2025-03-20';
+export const TTS_MODEL_DEFAULT = TTS_SNAPSHOT_MODEL; // r60: una sola constante (src/tts/tts-models.ts)
 export const TTS_VOICE_DEFAULT = 'marin';
 export const TTS_TARGET_BITRATE_KBPS = 64;
 /** Envío a Gamma de resultado desconocido (5xx/red/timeout/sin id tras enviar): nunca se reenvía solo. */
@@ -762,7 +763,11 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
 
   const chunks = splitForTts(script);
   if (!chunks.length) await fail(deps, item, `AUDIO_SCRIPT_EMPTY: ${item.itemKey} no tiene texto para narrar`, false);
-  const model = trimmed(env, 'OPENAI_TTS_MODEL') || TTS_MODEL_DEFAULT;
+  // r60 (review I-2): misma regla que las rutas legacy — OPENAI_TTS_MODEL pisa el snapshot, salvo el alias exacto
+  // `gpt-4o-mini-tts` (se cuelga), que vuelve al snapshot salvo OPENAI_TTS_ALLOW_ALIAS=true. Reserva y ledger usan este modelo.
+  const ttsResolved = resolveTtsModel(undefined, env);
+  const model = ttsResolved.model;
+  if (ttsResolved.normalized) deps.logger.log(`[provider-real] ${item.itemKey}: OPENAI_TTS_MODEL=${ttsResolved.requested} → ${model} (alias inestable)`);
   const voice = trimmed(env, 'OPENAI_TTS_VOICE') || TTS_VOICE_DEFAULT;
   const tts = new OpenAiTtsClient(openaiKey, env);
   const parts: Buffer[] = [];
@@ -1000,7 +1005,11 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const scriptsDone = () => !!plan && plan.sections.every((_, i) => sectionDone(plan as PersistedAudiobookPlan, i));
   const needsLlm = !scriptsDone();
   const tracker = deps.tracker;
-  const model = trimmed(env, 'OPENAI_TTS_MODEL') || TTS_MODEL_DEFAULT;
+  // r60 (review I-2): misma regla que las rutas legacy — OPENAI_TTS_MODEL pisa el snapshot, salvo el alias exacto
+  // `gpt-4o-mini-tts` (se cuelga), que vuelve al snapshot salvo OPENAI_TTS_ALLOW_ALIAS=true. Reserva y ledger usan este modelo.
+  const ttsResolved = resolveTtsModel(undefined, env);
+  const model = ttsResolved.model;
+  if (ttsResolved.normalized) deps.logger.log(`[provider-real] ${item.itemKey}: OPENAI_TTS_MODEL=${ttsResolved.requested} → ${model} (alias inestable)`);
   const voice = trimmed(env, 'OPENAI_TTS_VOICE') || TTS_VOICE_DEFAULT;
   const scriptModel = trimmed(env, AUDIOBOOK_SCRIPT_MODEL_ENV) || AUDIOBOOK_SCRIPT_MODEL_DEFAULT;
 
