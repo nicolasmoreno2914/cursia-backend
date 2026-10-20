@@ -1545,7 +1545,8 @@
   // Fase 2: 'application-activity-1' = sabe generar items application_activity (sin ella, un run con Actividades
   // de Aplicación responde el mismo 409 visible: una pestaña vieja nunca lo deja a medias en silencio).
   // Loop 9 B: 'guided-practice-1' = sabe generar items guided_practice (práctica guiada); sin ella, mismo 409 visible.
-  var DYN_EXECUTOR_FEATURES = 'pedagogy-brief-1,application-activity-1,guided-practice-1';
+  // r61 Q-04: video-scenes-1 = sabe anclar las preguntas del video a las escenas de Videogen (claim video.videoScenes).
+  var DYN_EXECUTOR_FEATURES = 'pedagogy-brief-1,application-activity-1,guided-practice-1,video-scenes-1';
   function backendDynClaim(runId, executorId, types, leaseSeconds) {
     return backendApiRequest('/api/v1/dynamic-generation/claim?features=' + DYN_EXECUTOR_FEATURES, {
       method: 'POST',

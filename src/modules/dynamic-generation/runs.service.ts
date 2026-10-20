@@ -5585,7 +5585,7 @@ export class RunsService {
       nextRetryAt: toIso(r.next_retry_at),
       error: r.error ?? null,
       idempotencyKey: r.idempotency_key,
-      outputSummary: r.output_summary ?? {},
+      outputSummary: progressOutputSummary(r.output_summary),
       ...(delivery ? { delivery } : {}),
       recovery: recoveryViewOf(r),
       ...(costs ? { cost: costs.get(r.item_key) ?? { estimated: null, actual: '0', pending: '0', currency: 'USD' as const } } : {}),
@@ -5594,6 +5594,17 @@ export class RunsService {
       finishedAt: toIso(r.finished_at),
     };
   }
+}
+
+/**
+ * r61 Q-04 (review M-3): vista del output_summary para progress(): sin la línea de tiempo del video
+ * (`videoScenes`, hasta ~40 KB por video, la usan solo el claim y el empaquetado) — queda su cantidad.
+ */
+export function progressOutputSummary(os: Record<string, any> | null | undefined): Record<string, any> {
+  const o = os ?? {};
+  if (!Array.isArray(o.videoScenes)) return o;
+  const { videoScenes, ...rest } = o;
+  return { ...rest, videoSceneCount: videoScenes.length };
 }
 
 /** Loop 9 (fix M1): ¿el final del Manifest depende solo de los content aunque haya exámenes de módulo? (Manifest anterior). */

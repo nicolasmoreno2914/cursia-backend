@@ -537,7 +537,10 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'H5P_BS_INVARIANT', 'H5P_DIALOG_CARDS_INVALID', 'VIDEO_INTRO_INVALID', 'VIDEO_YOUTUBE_ID_MISSING', 'VIDEO_DURATION_MISSING',
       'ACTIVITY_INTRO_INVALID', 'LIBRO_V3_INVALID', 'MODULE_INTRO_V3', 'COURSE_INTRO_V3', 'MODULE_INTRO_EXPECT_INVALID', 'SCORM_MANIFEST_INVALID',
       'ANSWER_LEAK', 'NUMBER_NOT_FROM_FACTS', 'SHELL_NUMBER_NOT_FROM_FACTS', 'EXAM_BANK_PLAN', 'EXAM_BANK_CONTEXT', 'VIDEO_PLAN_INVARIANT',
-      'VIDEO_DURATION_INVALID', 'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'PRESENTATION_CARD_SLIDE_COUNT'],
+      'VIDEO_DURATION_INVALID', 'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'PRESENTATION_CARD_SLIDE_COUNT',
+      // r61 Q-04 (re-review I-2): las preguntas del video ya no caben en los segundos con que se validaron → el empaque
+      // automático regenera SOLO ese video_interactions (LLM, dentro del presupuesto del run) y re-empaqueta.
+      'VIDEO_TIMELINE_MISMATCH'],
     family: /^(H5P_PACKAGE_[A-Z0-9_]+|VIDEO_ACTIVITY_[A-Z0-9_]+)$/,
     class: 'B', strategy: 'repair_package', scope: 'package', rounds: 1,
   },

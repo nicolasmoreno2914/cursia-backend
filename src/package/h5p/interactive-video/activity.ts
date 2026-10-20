@@ -3,7 +3,7 @@
 import { createHash } from 'crypto';
 import { buildContentOnlyH5p } from '../package';
 import { buildInteractiveVideo } from '../types/interactive-video';
-import { DroppedReflection, ReflectionPause, VideoCheckpoint, planInteractionCheckpoints, videoPlanDurationSec } from './plan';
+import { DroppedReflection, ReflectionPause, VideoCheckpoint, VideoTimelineSource, planInteractionCheckpoints, videoPlanDurationSec } from './plan';
 import {
   VIDEO_INTERACTIONS_SCHEMA_VERSION_V2,
   VideoInteractionsDoc,
@@ -25,6 +25,19 @@ export interface BuildVideoActivityInput {
    * schemaVersion 2 → pausas de reflexión + remediación. Ausente/false ⇒ v1, bytes de siempre.
    */
   ivAdvanced?: boolean;
+  /**
+   * r61 Q-04: escenas de Videogen guardadas con el video (artifact `dynamic_video.videoScenes`). Con
+   * escenas utilizables las preguntas se colocan al final de la escena que cubren; sin ellas, el plan
+   * equidistante de siempre (bytes idénticos).
+   */
+  videoScenes?: unknown;
+  /**
+   * r61 Q-04 (re-review I-2): segundos con los que se validaron las preguntas (v3Validation.checkpointsAtSec). Si
+   * difieren del plan re-derivado se usan ESTOS (el empaquetado ya verificó que siguen cumpliendo el invariante).
+   */
+  checkpointsAtSec?: number[];
+  /** r61 Q-04: pausas de reflexión validadas (v3Validation.reflectionsAt); ver checkpointsAtSec. */
+  reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }>;
 }
 
 export interface VideoActivityBuild {
@@ -34,6 +47,11 @@ export interface VideoActivityBuild {
   maxScore: number;
   subContentIds: string[];
   checkpoints: VideoCheckpoint[];
+  /** r61 Q-04: origen de los segundos de las preguntas. */
+  timelineSource: VideoTimelineSource;
+  timelineReason?: string;
+  /** r61 Q-04 (I-2): los segundos salieron de la validación (difieren del plan re-derivado hoy). */
+  checkpointsFromValidation?: boolean;
   sha1: string;
   sha256: string;
   /** EV6 IV avanzado: pausas colocadas y descartadas (vacías en v1). */
@@ -54,8 +72,12 @@ export async function buildVideoActivity(input: BuildVideoActivityInput): Promis
   const advanced = input.ivAdvanced === true;
   const full = validateVideoInteractionsDocFull(input.interactionsDoc, {
     videoItemKey: input.itemKey,
-    durationSec,
+    // Review M-7: la duración MEDIDA cruda (el plan escala las escenas con ella); el .h5p usa la entera.
+    durationSec: input.durationSec,
+    ...(Array.isArray(input.checkpointsAtSec) ? { checkpointsAtSec: input.checkpointsAtSec } : {}),
+    ...(advanced && Array.isArray(input.reflectionsAt) ? { reflectionsAt: input.reflectionsAt } : {}),
     ...(advanced ? { schemaVersion: VIDEO_INTERACTIONS_SCHEMA_VERSION_V2 } : {}),
+    ...(input.videoScenes !== undefined && input.videoScenes !== null ? { videoScenes: input.videoScenes } : {}),
   });
   const plan = full.checkpoints;
   const doc = input.interactionsDoc as VideoInteractionsDoc;
@@ -94,6 +116,9 @@ export async function buildVideoActivity(input: BuildVideoActivityInput): Promis
     maxScore: built.maxScore,
     subContentIds: built.subContentIds,
     checkpoints: plan,
+    timelineSource: full.timelineSource,
+    ...(full.timelineReason !== undefined ? { timelineReason: full.timelineReason } : {}),
+    ...(full.checkpointsFromValidation ? { checkpointsFromValidation: true } : {}),
     sha1: createHash('sha1').update(h5p).digest('hex'),
     sha256: createHash('sha256').update(h5p).digest('hex'),
     ...(advanced ? { reflections: full.reflectionPlan.reflections, droppedReflections: full.reflectionPlan.droppedReflections } : {}),

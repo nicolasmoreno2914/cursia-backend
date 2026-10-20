@@ -24,7 +24,7 @@ import { GUIDED_PRACTICE_ARTIFACT_TYPE, GuidedPracticeAvoid, guidedPracticeSumma
  * Todo lo demás de v1/v2: sin cambios.
  */
 import { eduMetrics, validateEduFields, validateExperience, validatePedagogy, validateSimulatedDiagrams } from '../visual-components';
-import { H5pInputError, VideoPlanError, planInteractionCheckpoints, planReflectionPauses, validateVideoInteractionsDocFull } from '../../package/h5p';
+import { H5pInputError, VideoPlanError, VideoScene, VideoTimelineSource, planReflectionPauses, planVideoCheckpoints, validateVideoInteractionsDocFull } from '../../package/h5p';
 import type { ReflectionPlan } from '../../package/h5p';
 import type { VideoCheckpoint } from '../../package/h5p';
 import { H5pActivityTypeV2, ShellValidationError, activityTypeForChapter, validateH5pActivityPayload } from './activity-type';
@@ -92,7 +92,8 @@ export interface V3ItemValidationContext {
   /** module_intro: capítulos del módulo en orden del Manifest. */
   moduleChapterIds?: string[];
   /** video_interactions: video completado del capítulo. */
-  video?: { videoItemKey: string; durationSec: number } | null;
+  /** r61 Q-04: videoScenes solo cuando el claim ancló el plan a las escenas (mismo dato que el claim). */
+  video?: { videoItemKey: string; durationSec: number; videoScenes?: unknown } | null;
   /** Edu EV2: promptVersion que reporta el ejecutor (summary). La estructura educativa se exige solo a partir de v21-exp-4. */
   promptVersion?: string | null;
   /**
@@ -301,14 +302,24 @@ function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string
           videoItemKey: ctx.video.videoItemKey,
           durationSec: ctx.video.durationSec,
           ...(v2 ? { schemaVersion: 2 as const } : {}),
+          ...(ctx.video.videoScenes !== undefined ? { videoScenes: ctx.video.videoScenes } : {}),
         });
-        if (!v2) return { ok: true, errors: [], summary: { interactionCount: r.checkpoints.length } };
+        // r61 Q-04: solo se marca el plan anclado a escenas (el equidistante deja el summary de siempre).
+        const tl = {
+          ...(r.timelineSource === 'videogen_scenes' ? { timelineSource: r.timelineSource } : {}),
+          // Re-review I-2: los segundos con que se validaron (el empaquetado los usa tal cual; nunca re-deriva otros).
+          checkpointsAtSec: r.checkpoints.map((c) => c.atSec),
+        };
+        if (!v2) return { ok: true, errors: [], summary: { interactionCount: r.checkpoints.length, ...tl } };
         return {
           ok: true,
           errors: [],
           summary: {
             interactionCount: r.checkpoints.length,
+            ...tl,
             reflectionCount: r.reflectionPlan.reflections.length,
+            // r61 Q-04: las pausas validadas (el empaque las usa tal cual mientras sigan siendo válidas).
+            reflectionsAt: r.reflectionPlan.reflections.map((x) => ({ index: x.index, atSec: x.atSec, afterCheckpoint: x.afterCheckpoint })),
             droppedReflections: r.reflectionPlan.droppedReflections,
           },
         };
@@ -411,6 +422,14 @@ export interface VideoClaimFacts {
   checkpoints: VideoCheckpoint[];
   /** EV6 IV avanzado (solo con `ivAdvanced`): pausas de reflexión planificadas sobre la duración MEDIDA. */
   reflectionPlan?: ReflectionPlan;
+  /**
+   * r61 Q-04: 'videogen_scenes' = checkpoints al final de escenas reales del video (videoScenes viaja en
+   * el claim para el prompt y para que el ejecutor re-derive el plan); 'even_spacing' + motivo = había
+   * escenas pero no se pudieron usar; ausente = sin escenas (plan de siempre, claim de siempre).
+   */
+  timelineSource?: VideoTimelineSource;
+  timelineReason?: string;
+  videoScenes?: VideoScene[];
 }
 
 export type VideoClaimFactsResult = { ok: true; video: VideoClaimFacts } | { ok: false; code: string; message: string };
@@ -429,6 +448,11 @@ export function videoClaimFacts(input: {
   artifactMetadata?: Record<string, any> | null;
   /** EV6: Manifest con `features.ivAdvanced = 1` ⇒ también el plan de pausas de reflexión. */
   ivAdvanced?: boolean;
+  /**
+   * r61 Q-04 (review I-1): false = el executor no anuncia `video-scenes-1` (o el item quedó fijado en
+   * 'even_spacing') → plan y claim de siempre, aunque el video tenga escenas.
+   */
+  sceneAnchors?: boolean;
 }): VideoClaimFactsResult {
   const os = input.outputSummary ?? {};
   const md = input.artifactMetadata ?? {};
@@ -449,12 +473,22 @@ export function videoClaimFacts(input: {
     };
   }
   try {
-    const checkpoints = planInteractionCheckpoints(durationSec);
+    // r61 Q-04: escenas de Videogen guardadas al completar el video (output_summary.videoScenes).
+    const vp = planVideoCheckpoints(durationSec, input.sceneAnchors === false ? null : (os.videoScenes ?? null));
+    const checkpoints = vp.checkpoints;
+    // Sin escenas (videos anteriores, mock) el claim queda byte a byte el de siempre; con escenas que no
+    // sirven se explica por qué (p.ej. timeline_duration_mismatch) y el plan es el equidistante.
+    const timeline: Pick<VideoClaimFacts, 'timelineSource' | 'timelineReason' | 'videoScenes'> =
+      vp.timelineSource === 'videogen_scenes'
+        ? { timelineSource: vp.timelineSource, videoScenes: os.videoScenes as VideoScene[] }
+        : vp.timelineReason !== undefined && vp.timelineReason !== 'no_scene_data'
+          ? { timelineSource: vp.timelineSource, timelineReason: vp.timelineReason }
+          : {};
     if (input.ivAdvanced) {
       const reflectionPlan = planReflectionPauses(durationSec, checkpoints);
-      return { ok: true, video: { videoItemKey: input.videoItemKey, youtubeId, durationSec, checkpoints, reflectionPlan } };
+      return { ok: true, video: { videoItemKey: input.videoItemKey, youtubeId, durationSec, checkpoints, reflectionPlan, ...timeline } };
     }
-    return { ok: true, video: { videoItemKey: input.videoItemKey, youtubeId, durationSec, checkpoints } };
+    return { ok: true, video: { videoItemKey: input.videoItemKey, youtubeId, durationSec, checkpoints, ...timeline } };
   } catch (err) {
     if (err instanceof VideoPlanError) return { ok: false, code: err.code, message: err.message };
     throw err;

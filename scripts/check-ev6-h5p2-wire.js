@@ -484,7 +484,7 @@ const SRC = (bp) => ({ courseId: 777, blueprintId: 1, blueprintNumber: 1, bluepr
     const v2bad = await mkSvc(viItem, {}, docV2, 'video_interactions').prevalidateV3(runId, 'ex', ['a1'], OWNER, null);
     eq(v2bad.kind, 'invalid', 'v2 sin ivAdvanced se rechaza');
     const v1 = VF.makeInteractionsDoc(plan, { videoItemKey: `video:${chId}`, durationSec: DUR });
-    eq((await mkSvc(viItem, {}, v1, 'video_interactions').prevalidateV3(runId, 'ex', ['a1'], OWNER, null)).summary, { interactionCount: plan.length }, 'v1 legacy igual que siempre');
+    eq((await mkSvc(viItem, {}, v1, 'video_interactions').prevalidateV3(runId, 'ex', ['a1'], OWNER, null)).summary, { interactionCount: plan.length, checkpointsAtSec: plan.map((c) => c.atSec) }, 'v1 legacy igual que siempre (+ segundos validados, r61 Q-04 I-2)');
     // Claim
     const svc = Object.create(SchedulerService.prototype);
     const manifest2 = { rulesVersion: 3, features: { activityTypeRules: 2, ivAdvanced: 1 }, modules: [], items: [] };

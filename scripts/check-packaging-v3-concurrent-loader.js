@@ -340,7 +340,103 @@ async function main() {
   });
 }
 
-main().catch((err) => { failures++; console.error('❌ inesperado:', err && err.stack ? err.stack : err); }).then(() => {
+
+// r61 Q-04 (review M-6): el empaque coloca las preguntas con el plan con el que se VALIDARON (v3Validation.timelineSource).
+async function r61TimelineChecks() {
+  const IV = loadDist('package/h5p/interactive-video/plan.js');
+  const scenes = IV.videoScenesFromVideogen(Array.from({ length: 12 }, (_, i) => ({ scene_order: i + 1, narration: `escena ${i + 1}`, duration_seconds: PF.VIDEO_SECONDS / 12 }))).scenes;
+  const setup = (withScenes) => {
+    const f = realRunFixture('h5p');
+    if (withScenes) for (const [id, v] of f.files) {
+      if (typeof v !== 'string' || !v.includes('"videogenJobId"')) continue;
+      f.files.set(id, JSON.stringify({ ...JSON.parse(v), videoScenes: scenes }));
+    }
+    return f;
+  };
+  const load = async (f, validatedAnchored, atSec) => {
+    const byItem = await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest);
+    for (const it of byItem.values()) {
+      if (it.type !== 'video_interactions') continue;
+      const v = { ...(validatedAnchored ? { timelineSource: 'videogen_scenes' } : {}), ...(atSec ? { checkpointsAtSec: atSec } : {}) };
+      if (Object.keys(v).length) it.outputSummary = { ...(it.outputSummary || {}), v3Validation: v };
+    }
+    const plan = PV3.buildPackagingPlanV3(f.manifest, f.fx.blueprint, { manifestId: 9001 });
+    return PK.loadContentsV3(fakeLoaders(f).L, plan, byItem, f.run, { familyId: 'aula-clara', mode: 'light' });
+  };
+  await check('r61 Q-04: video con escenas + preguntas validadas equidistantes (o anteriores a r61) → plan equidistante (sin videoScenes), .mbz idéntico al de siempre', async () => {
+    const base = await load(setup(false), false);
+    const pinned = await load(setup(true), false);
+    for (const v of pinned.contents.videos.values()) assert(!('videoScenes' in v), 'no pasa escenas: ' + JSON.stringify(v));
+    const mk = (contents) => B.buildDynamicMbzV3({ ...realRunFixture('h5p').fx, contents });
+    eq(sha((await mk(pinned.contents)).mbz), sha((await mk(base.contents)).mbz), 'sha del .mbz');
+  });
+  await check('r61 Q-04: preguntas validadas ancladas + video con escenas → las escenas llegan al builder (plan anclado)', async () => {
+    const r = await load(setup(true), true);
+    assert(r.contents.videos.size > 0, 'hay videos');
+    for (const v of r.contents.videos.values()) eq(v.videoScenes, scenes, 'escenas');
+  });
+  const C = loadDist('modules/reliability/failure-classifier.js');
+  const AP = loadDist('modules/dynamic-packaging/auto-package.service.js');
+  const anchoredToday = IV.planVideoCheckpoints(PF.VIDEO_SECONDS, scenes).checkpoints.map((c) => c.atSec);
+  await check('r61 Q-04 re-review I-2: re-empaque tras un cambio de reglas/escalado (los segundos validados ya no son los que se re-derivan hoy) → usa los VALIDADOS, deja el aviso, arma el .mbz solo (sin hold)', async () => {
+    const validated = anchoredToday.map((a) => a + 2); // validados con otro escalado/regla: siguen cumpliendo el invariante
+    const f = setup(true);
+    const r = await load(f, true, validated);
+    for (const v of r.contents.videos.values()) eq(v.checkpointsAtSec, validated, 'segundos validados');
+    const keys = [...(await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest)).values()].filter((i) => i.type === 'video_interactions').map((i) => i.itemKey);
+    eq(r.warnings.filter((w) => w.startsWith('video_checkpoints_from_validation:')).sort(), keys.map((k) => `video_checkpoints_from_validation:${k}`).sort(), 'evento registrado por capítulo');
+    const built = await B.buildDynamicMbzV3({ ...realRunFixture('h5p').fx, contents: r.contents });
+    assert(built && built.mbz && built.mbz.length > 0, 'el .mbz se arma');
+    // Segundos validados = los de hoy → sin aviso (y el .mbz de siempre con el plan anclado).
+    const same = await load(setup(true), true, anchoredToday);
+    eq(same.warnings.filter((w) => w.startsWith('video_checkpoints_from_validation:')), [], 'sin aviso si coinciden');
+  });
+  await check('r61 Q-04 re-review I-2: segundos validados que ya no cumplen el invariante (otra cantidad de preguntas) → VIDEO_TIMELINE_MISMATCH clase B con el item a regenerar (auto-reparación, nunca hold_for_human)', async () => {
+    let err = null;
+    try { await load(setup(true), true, anchoredToday.slice(1)); } catch (e) { err = e; }
+    assert(err instanceof PT.PackagingNotReadyError && /^VIDEO_TIMELINE_MISMATCH: /.test(err.message), `vino ${err && err.message}`);
+    const v = C.classifyFailure({ source: 'package_worker', error: err.message });
+    eq([v.unclassified, v.class, v.rule], [false, 'B', 'package_component'], 'clase B reparable');
+    const f = setup(true);
+    const items = [...(await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest)).keys()];
+    const key = AP.packageBlockItemKey(err.message, err.missing, items);
+    assert(key && key.startsWith('video_interactions:'), `item a regenerar: ${key}`);
+  });
+  await check('r61 Q-04 duda 2 (ivAdvanced): pausas validadas que siguen sirviendo → se empaquetan ESAS (aviso); que ya no sirven → VIDEO_TIMELINE_MISMATCH nombrando el video_interactions (clase B, auto-reparación)', async () => {
+    const even = IV.planInteractionCheckpoints(PF.VIDEO_SECONDS);
+    const atSec = even.map((c) => c.atSec);
+    const today = IV.planReflectionPauses(PF.VIDEO_SECONDS, even).reflections;
+    const withRefl = async (refl) => {
+      const f = setup(false);
+      const byItem = await PK.resolveRunArtifactsV3(f.q, f.run.id, f.manifest);
+      for (const it of byItem.values()) if (it.type === 'video_interactions') it.outputSummary = { ...(it.outputSummary || {}), v3Validation: { checkpointsAtSec: atSec, reflectionsAt: refl } };
+      const plan = PV3.buildPackagingPlanV3(f.manifest, f.fx.blueprint, { manifestId: 9001 });
+      return { r: await PK.loadContentsV3(fakeLoaders(f).L, plan, byItem, f.run, { familyId: 'aula-clara', mode: 'light' }).catch((e) => ({ err: e })), items: [...byItem.keys()] };
+    };
+    const eqToday = await withRefl(today);
+    eq(eqToday.r.warnings.filter((w) => w.startsWith('video_checkpoints_from_validation:')), [], 'iguales: sin aviso');
+    for (const v of eqToday.r.contents.videos.values()) eq(v.reflectionsAt, today, 'pausas de siempre');
+    const moved = today.map((x) => ({ ...x, atSec: x.atSec + 2 }));
+    const mv = await withRefl(moved);
+    for (const v of mv.r.contents.videos.values()) eq(v.reflectionsAt, moved, 'pausas validadas');
+    assert(mv.r.warnings.some((w) => w.startsWith('video_checkpoints_from_validation:video_interactions:')), 'evento registrado');
+    const bad = await withRefl([{ ...today[0], atSec: even[today[0].afterCheckpoint - 1].atSec + 5 }]);
+    const err = bad.r.err;
+    assert(err instanceof PT.PackagingNotReadyError && /^VIDEO_TIMELINE_MISMATCH: .*pausas de reflexión/.test(err.message), `vino ${err && err.message}`);
+    const v = C.classifyFailure({ source: 'package_worker', error: err.message });
+    eq([v.unclassified, v.class, v.rule], [false, 'B', 'package_component'], 'clase B');
+    const key = AP.packageBlockItemKey(err.message, err.missing, bad.items);
+    assert(key && key.startsWith('video_interactions:'), `item: ${key}`);
+  });
+  await check('r61 Q-04: preguntas validadas ancladas pero el video ya no da ese plan → PackagingNotReadyError VIDEO_TIMELINE_MISMATCH (nunca se mueven en silencio)', async () => {
+    let err = null;
+    try { await load(setup(false), true); } catch (e) { err = e; }
+    assert(err instanceof PT.PackagingNotReadyError && /^VIDEO_TIMELINE_MISMATCH: /.test(err.message), `vino ${err && err.message}`);
+    assert(err.missing.every((m) => /:VIDEO_TIMELINE_MISMATCH$/.test(m)), JSON.stringify(err.missing));
+  });
+}
+
+main().then(r61TimelineChecks).catch((err) => { failures++; console.error('❌ inesperado:', err && err.stack ? err.stack : err); }).then(() => {
   console.log(`\n${passes} ok, ${failures} fail`);
   process.exit(failures > 0 ? 1 : 0);
 });

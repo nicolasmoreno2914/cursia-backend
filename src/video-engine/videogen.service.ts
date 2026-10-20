@@ -23,6 +23,12 @@ export interface VideogenBatchJob {
    * status (campo opcional; los consumidores legacy lo ignoran). null/ausente = desconocida.
    */
   duration_seconds?: number | null;
+  /**
+   * r61 Q-04: escenas del guion que escribió Videogen ([{scene_order, narration, duration_seconds}],
+   * GET /api/external/videos/:id/status, presentes desde que el audio está generado). Crudo: lo
+   * normaliza y acota videoScenesFromVideogen. null/ausente = sin línea de tiempo.
+   */
+  scenes?: unknown[] | null;
 }
 
 export interface VideogenBatchResult {
@@ -97,6 +103,7 @@ export class VideogenService {
       error: j.error ?? j.error_message ?? null,
       progress: j.progress != null ? Number(j.progress) : null,
       duration_seconds: videogenDurationSeconds(j),
+      scenes: Array.isArray(j?.scenes) ? j.scenes : null,
     }));
   }
 
