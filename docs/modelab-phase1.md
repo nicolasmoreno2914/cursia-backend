@@ -162,12 +162,17 @@ Las fixtures de replay del repo son sintéticas (LLM falso), así que no sirven 
   - idioma (`lqaSentenceFindings` del repo), inglés y marcadores editoriales;
   - USD por ítem válido.
 - **Costos:** salen del código de FinOps (`priceUsage`), con un catálogo del laboratorio que incluye los tramos de Haiku.
-- **Rúbrica:** se generan `judge-packets.jsonl`, con pares ciegos de etiqueta aleatoria, y `judge-key.json` aparte. `--rubric` importa los puntajes y produce las medias por componente × brazo.
-- **Presupuesto:**
-  - Un chequeo previo usa la proyección por evidencia × 1,25 y debe quedar ≤ lo aprobado; si no, no se hace ninguna llamada.
-  - Cada llamada reserva su cota superior: la entrada a precio de escritura de caché más `max_tokens`.
-  - Ante un error de red o 5xx, se asume el peor caso.
-- **Modo real:** exige `--real --approved-budget-usd=N --api-key-env=VAR`. Hay un tope duro de 10 USD salvo con `--allow-budget-over-10`. Nunca lee `.env`.
+- **Rúbrica:** se generan `judge-packets.jsonl`, con pares ciegos de etiqueta aleatoria y los nombres de modelo redactados, y `judge-key.json` aparte (con el componente de cada paquete). `modelab decide` aplica los puntajes **offline, a USD 0**, sobre la corrida guardada.
+- **Presupuesto (revisión r61, I1–I6):**
+  - **Ledger acumulado** `OUT/modelab-ledger-<experimento>-<modo>.jsonl`, append-only: `reserve` antes de cada intento y `settle` después. El presupuesto aprobado es **por experimento**: disponible = aprobado − todo lo gastado antes, y una reserva sin `settle` (caída a mitad de llamada) cuenta al peor caso. Con gasto previo, el modo real se niega a arrancar sin `--resume`; con `--resume` reutiliza a USD 0 las respuestas ya pagadas (`modelab-answers-*.jsonl`).
+  - **Chequeo previo:** proyección por evidencia (incluido el humo) × 1,25 ≤ disponible; si no, no se hace ninguna llamada.
+  - **Cota por intento:** entrada estimada × 1,25 de holgura a precio de escritura de caché + `max_tokens`. Ante un error de red o 5xx, se asume el peor caso.
+  - **Sin reintentos automáticos del SDK** (`maxRetries: 0`). Los transitorios (429/529/5xx/red) se reintentan explícitamente, hasta 4 intentos con backoff, **cada intento con su reserva y su renglón**. Nunca se guardan como respuesta ni cuentan como falla del brazo; si se agotan, la corrida aborta (`INFRA_RETRIES_EXHAUSTED`).
+  - **4xx inesperado** (`invalid_request`, auth): aborta la corrida con el mensaje de la API (`ARM_REQUEST_REJECTED`). Nunca se convierte en una «falla dura» del brazo.
+  - **Llamada de humo obligatoria** por (componente, brazo) ANTES de dependencias y brazos: el pedido real del componente adaptado al brazo, con `max_tokens` 32, reservado en el presupuesto. En la misma fase, `count_tokens` (gratis) mide el factor del tokenizer de cada brazo sobre esos pedidos.
+  - **Informe siempre:** `runExperiment` nunca relanza; cualquier error queda en `aborted`, con el gasto, las llamadas y las respuestas hasta ese momento. SIGINT/SIGTERM escriben el informe parcial y salen con 130.
+- **Modo real:** exige `--real --approved-budget-usd=N --api-key-env=VAR --out=DIR` (el `--out` debe ser estable: ahí vive el ledger). El tope de 10 USD es **duro**: cambiarlo exige cambiar el código, no hay flag. El SDK va fijo a `https://api.anthropic.com`, y si `ANTHROPIC_BASE_URL` apunta a otro host se niega. Nunca lee `.env`.
+- **Sin red fuera del modo real:** todo comando offline y `check-modelab` corren bajo la barrera de red del repo (`scripts/lib/netguard.js`: sockets, fetch, http(s), tls, DNS, UDP).
 
 **Comandos:**
 
@@ -176,7 +181,7 @@ npm run build
 export CURSIA_FRONTEND_REPO=../fe   # fixtures H5P v2 del frontend
 
 # USD 0
-node scripts/modelab/check-modelab.js                         # autoverificación: 8 checks
+node scripts/modelab/check-modelab.js                         # autoverificación: 16 checks, bajo barrera de red
 node scripts/modelab/modelab.js project  --out=OUT
 node scripts/modelab/modelab.js baseline --out=OUT
 node scripts/modelab/modelab.js plan
@@ -184,17 +189,18 @@ node scripts/modelab/modelab.js run --dry-run --out=OUT        # punta a punta, 
 
 # Fase 1, solo con autorización
 ANTHROPIC_API_KEY=... node scripts/modelab/modelab.js capture --real --api-key-env=ANTHROPIC_API_KEY --out=OUT   # count_tokens, gratis
-ANTHROPIC_API_KEY=... node scripts/modelab/modelab.js run --real --approved-budget-usd=5 --api-key-env=ANTHROPIC_API_KEY --out=OUT
-node scripts/modelab/modelab.js run --real ... --rubric=scores.json --judge-key=OUT/judge-key.json  # veredicto con la rúbrica
+ANTHROPIC_API_KEY=... node scripts/modelab/modelab.js run --real --approved-budget-usd=5 --api-key-env=ANTHROPIC_API_KEY --out=OUT   # humo + count_tokens + brazos
+ANTHROPIC_API_KEY=... node scripts/modelab/modelab.js run --real --approved-budget-usd=5 --api-key-env=ANTHROPIC_API_KEY --out=OUT --resume   # tras un aborto: reutiliza lo pagado
+node scripts/modelab/modelab.js decide --run=OUT/modelab-run.json --rubric=scores.json --judge-key=OUT/judge-key.json   # veredicto con la rúbrica, offline, USD 0
 ```
 
 ## 7. Plan de Fase 1
 
-Configuración: `scripts/modelab/config/phase1.json`. La proyección por evidencia es de USD 3,46; con el margen ×1,25 queda en 4,33. **Se pide aprobar USD 5.**
+Configuración: `scripts/modelab/config/phase1.json`. La proyección por evidencia es de **USD 3,68** (incluye USD 0,22 de llamadas de humo); con el margen ×1,25 queda en 4,60. **Se pide aprobar USD 5** (presupuesto por experimento, acumulado en el ledger).
 
 | Paso | Componente | Entrada | Muestra | Brazos | Réplicas | USD estimado |
 |---|---|---|---|---|---|---|
-| 0 | `count_tokens` de todos los pedidos del ejecutor (4.6 / 5.5 / H5.5) | M-sim | todos | — | — | **0** (gratis) |
+| 0 | Humo obligatorio por (componente, brazo), `max_tokens` 32, + `count_tokens` (gratis) del mismo pedido | M-sim, S | 1 pedido real por componente | A, B, C | — | 0,22 |
 | 1 | Dependencias congeladas (content × 5, course_plan × 2) | M-sim, S | — | A | 1 | 0,57 |
 | 2 | audiobook_chapter | M-sim | 2 capítulos | A, B, C | 2 | 1,08 |
 | 3 | video_interactions | M-sim | 2 capítulos | A, B, C | 2 | 0,83 |
@@ -202,7 +208,7 @@ Configuración: `scripts/modelab/config/phase1.json`. La proyección por evidenc
 | 5 | module_intro | M-sim | 3 módulos | A, B, C | 1 | 0,31 |
 | 6 | content | M-sim | 2 capítulos | A, B | 1 | 0,40 |
 | 7 | activity (H5P) | S | 1 capítulo | A, B, C | 2 | 0,15 |
-| | **Total** | | | | | **≈ 3,46** (tope 5) |
+| | **Total** | | | | | **≈ 3,68** (× 1,25 = 4,60; tope 5) |
 
 Fuera de la Fase 1, por costo y porque dependen de verificar primero los fixes del examen:
 
@@ -218,14 +224,17 @@ Esos quedan para la Fase 2: B y C solo en la revisión de forma, con un costo de
 1. Rúbrica media ≥ A − 0,25 (escala 1–5).
 2. Validez en primera pasada ≥ A − 5 puntos.
 3. Cero fallas duras nuevas (falla del ítem, truncado, refusal, JSON inválido).
-4. Ahorro ≥ 10 % por ítem válido.
+4. Ahorro ≥ 10 % por ítem válido, medido **en frío** (las lecturas de caché se reprecian como escritura). Así el estado de la caché entre réplicas, que el humo y la réplica anterior calientan, no decide el veredicto. El informe muestra el costo real y el costo en frío.
 5. El sesgo de largo de la correcta no sube más de 10 puntos.
+6. Solo Sonnet 5.5: factor del tokenizer medido con `count_tokens` en el humo ≤ 1,35.
 
 **Regla go/no-go**, implementada en `decide()`:
 
-- **NO_GO** si falla cualquiera de los criterios deterministas (2–5).
+- **NO_GO** si falla cualquiera de los criterios deterministas (2–6), **o si falta** una métrica determinista. Un dato ausente nunca aprueba. La única excepción es el sesgo cuando ningún brazo tiene MC: ahí es «n/a».
+- **PENDING_TOKENIZER** si en Sonnet 5.5 falta el factor medido.
 - **PENDING_RUBRIC** si los deterministas pasan pero todavía no hay rúbrica.
 - **GO** solo si además la rúbrica cumple (1).
+- Los errores de infraestructura no son fallas del brazo: se reintentan o abortan la corrida.
 
 **Rúbrica:**
 
@@ -236,7 +245,7 @@ Esos quedan para la Fase 2: B y C solo en la revisión de forma, con un costo de
 **Decisión por componente:**
 
 - Haiku 5.5 se adopta en los componentes con **GO**, después de implementar las precondiciones de §3.
-- Sonnet 5.5 se adopta solo si el `count_tokens` del paso 0 da un factor ≤ 1,35 **y** hay GO.
+- Sonnet 5.5 se adopta solo con GO, y el GO ya incluye la compuerta del factor ≤ 1,35.
 - Si el factor es > 1,35, Sonnet 5.5 no cumple el criterio de ahorro aunque la calidad empate. En ese caso se mantiene 4.6 hasta su retiro (no antes del 2027-02-17) y se reevalúa.
 
 ## 8. Límites de esta fase
@@ -245,3 +254,12 @@ Esos quedan para la Fase 2: B y C solo en la revisión de forma, con un costo de
 - Las proyecciones dependen del factor del tokenizer y de las tasas de reintento, que son supuestos.
 - Las entradas de la Fase 1 son sintéticas. Para usar el Blueprint exacto de #1510 hace falta exportar un snapshot (`source: "file"`); no se leyó la base de datos.
 - El truncado se estimó con promedios, no con p95: no hay distribución por llamada offline.
+
+### Menores abiertos de la revisión r61 (documentados, no bloquean la Fase 1)
+
+- **M1:** la cota de entrada sigue siendo una estimación (chars/4 × factor × 1,25 de holgura). Domina `max_tokens`, pero el tope no es exacto al centavo.
+- **M2:** el tramo de Haiku 5.5 en la cota se elige con la estimación. En la Fase 1 ningún prompt se acerca a 100K.
+- **M7:** el juez LLM (Opus 5.5) no está implementado ni presupuestado. Si se implementa, debe pasar por `callThrough` y entrar en `planCost`.
+- **M9:** la regla «tool_choice forzado sin pensamiento» de Haiku 5.5 no tiene lint. Cursia no usa `tool_choice`.
+- **Ledger por directorio:** el ledger vive en `--out`. Otro `--out` empieza otro ledger; por eso el modo real exige un `--out` explícito y estable.
+- **Humo y caché:** el humo calienta la caché del prefijo. Por eso el ahorro se decide en frío.

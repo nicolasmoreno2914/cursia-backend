@@ -8,42 +8,197 @@
   "frozenDependenciesArm": "A-s46",
   "runsPerArm": 2,
   "inputs": [
-    { "id": "M-sim", "source": "commercial-simulation", "fixtureId": "B-M", "_note": "M 3×4 sintético (cliente B de la simulación comercial)" },
-    { "id": "S-1510like", "source": "commercial-simulation", "fixtureId": "1x1-sin-examenes", "_note": "S 1×1 sin exámenes = configuración de la Fase B (#1510). No es el Blueprint exacto de #1510 (no se leyó la base); para congelar el real usar source:file con un snapshot exportado." }
+    {
+      "id": "M-sim",
+      "source": "commercial-simulation",
+      "fixtureId": "B-M",
+      "_note": "M 3×4 sintético (cliente B de la simulación comercial)"
+    },
+    {
+      "id": "S-1510like",
+      "source": "commercial-simulation",
+      "fixtureId": "1x1-sin-examenes",
+      "_note": "S 1×1 sin exámenes = configuración de la Fase B (#1510). No es el Blueprint exacto de #1510 (no se leyó la base); para congelar el real usar source:file con un snapshot exportado."
+    }
   ],
   "arms": [
-    { "id": "A-s46", "model": "claude-sonnet-4-6", "thinking": "off", "maxTokensFactor": 1, "_note": "producción hoy: sin thinking, sin effort (default high), max_tokens actuales" },
-    { "id": "B-s55", "model": "claude-sonnet-5-5", "thinking": "between_tools", "effort": "medium", "maxTokensFactor": 1.35, "maxTokensCap": 16000, "_note": "sin pensamiento previo (between_tools, effort ≤ high), max_tokens ×1,35 por el tokenizer (~+30 %), tope del worker 16000" },
-    { "id": "C-h55", "model": "claude-haiku-5-5", "thinking": "disabled", "effort": "medium", "maxTokensFactor": 1.35, "maxTokensCap": 16000, "_note": "thinking disabled (aceptado con effort ≤ high), solo componentes candidatos" }
+    {
+      "id": "A-s46",
+      "model": "claude-sonnet-4-6",
+      "thinking": "off",
+      "maxTokensFactor": 1,
+      "_note": "producción hoy: sin thinking, sin effort (default high), max_tokens actuales"
+    },
+    {
+      "id": "B-s55",
+      "model": "claude-sonnet-5-5",
+      "thinking": "between_tools",
+      "effort": "medium",
+      "maxTokensFactor": 1.35,
+      "maxTokensCap": 16000,
+      "_note": "sin pensamiento previo (between_tools, effort ≤ high), max_tokens ×1,35 por el tokenizer (~+30 %), tope del worker 16000"
+    },
+    {
+      "id": "C-h55",
+      "model": "claude-haiku-5-5",
+      "thinking": "disabled",
+      "effort": "medium",
+      "maxTokensFactor": 1.35,
+      "maxTokensCap": 16000,
+      "_note": "thinking disabled (aceptado con effort ≤ high), solo componentes candidatos"
+    }
   ],
   "components": [
-    { "component": "audiobook_chapter", "input": "M-sim", "chapters": [{ "m": 0, "c": 0 }, { "m": 1, "c": 1 }], "arms": ["A-s46", "B-s55", "C-h55"], "runs": 2 },
-    { "component": "video_interactions", "input": "M-sim", "chapters": [{ "m": 0, "c": 0 }, { "m": 1, "c": 1 }], "arms": ["A-s46", "B-s55", "C-h55"], "runs": 2 },
-    { "component": "course_intro", "input": "M-sim", "arms": ["A-s46", "B-s55", "C-h55"], "runs": 2 },
-    { "component": "module_intro", "input": "M-sim", "modules": [0, 1, 2], "arms": ["A-s46", "B-s55", "C-h55"], "runs": 1 },
-    { "component": "content", "input": "M-sim", "chapters": [{ "m": 0, "c": 1 }, { "m": 2, "c": 0 }], "arms": ["A-s46", "B-s55"], "runs": 1 },
-    { "component": "activity", "input": "S-1510like", "chapters": [{ "m": 0, "c": 0 }], "arms": ["A-s46", "B-s55", "C-h55"], "runs": 2 }
+    {
+      "component": "audiobook_chapter",
+      "input": "M-sim",
+      "chapters": [
+        {
+          "m": 0,
+          "c": 0
+        },
+        {
+          "m": 1,
+          "c": 1
+        }
+      ],
+      "arms": [
+        "A-s46",
+        "B-s55",
+        "C-h55"
+      ],
+      "runs": 2
+    },
+    {
+      "component": "video_interactions",
+      "input": "M-sim",
+      "chapters": [
+        {
+          "m": 0,
+          "c": 0
+        },
+        {
+          "m": 1,
+          "c": 1
+        }
+      ],
+      "arms": [
+        "A-s46",
+        "B-s55",
+        "C-h55"
+      ],
+      "runs": 2
+    },
+    {
+      "component": "course_intro",
+      "input": "M-sim",
+      "arms": [
+        "A-s46",
+        "B-s55",
+        "C-h55"
+      ],
+      "runs": 2
+    },
+    {
+      "component": "module_intro",
+      "input": "M-sim",
+      "modules": [
+        0,
+        1,
+        2
+      ],
+      "arms": [
+        "A-s46",
+        "B-s55",
+        "C-h55"
+      ],
+      "runs": 1
+    },
+    {
+      "component": "content",
+      "input": "M-sim",
+      "chapters": [
+        {
+          "m": 0,
+          "c": 1
+        },
+        {
+          "m": 2,
+          "c": 0
+        }
+      ],
+      "arms": [
+        "A-s46",
+        "B-s55"
+      ],
+      "runs": 1
+    },
+    {
+      "component": "activity",
+      "input": "S-1510like",
+      "chapters": [
+        {
+          "m": 0,
+          "c": 0
+        }
+      ],
+      "arms": [
+        "A-s46",
+        "B-s55",
+        "C-h55"
+      ],
+      "runs": 2
+    }
   ],
   "successCriteria": {
     "_source": "B-model-audit §6 (criterio de no inferioridad)",
     "rubricMaxDrop": 0.25,
     "firstPassMaxDrop": 0.05,
-    "minSavingPerValidItem": 0.10,
-    "answerBiasMaxRise": 0.10,
-    "noNewHardFailures": true
+    "minSavingPerValidItem": 0.1,
+    "answerBiasMaxRise": 0.1,
+    "noNewHardFailures": true,
+    "maxTokenizerFactor": 1.35,
+    "tokenizerGateModels": [
+      "claude-sonnet-5-5"
+    ],
+    "savingsBasis": "cold (lecturas de caché repreciadas como escritura; review r61 I9)"
   },
   "rubric": {
     "scale": "1–5 (1 = inaceptable, 3 = aceptable con correcciones menores, 5 = listo para entregar)",
     "judge": "humano experto (obligatorio en ≥ 20 % de los paquetes) + juez LLM opcional claude-opus-5-5 a ciegas; el juez se calibra contra el humano antes de usarse solo",
     "criteria": [
-      { "id": "exactitud", "text": "Exactitud conceptual: sin errores ni afirmaciones inventadas respecto del capítulo fuente" },
-      { "id": "profundidad", "text": "Profundidad adecuada al nivel y a las horas del capítulo" },
-      { "id": "pedagogia", "text": "Valor pedagógico: secuencia, claridad, retroalimentación útil" },
-      { "id": "situado", "text": "Ejemplos situados en el sector y país del curso" },
-      { "id": "instrucciones", "text": "Cumplimiento de las instrucciones del prompt (formato, cantidades, extensión)" },
-      { "id": "coherencia", "text": "Coherencia con el Blueprint y con el resto del curso (sin repetir otros capítulos)" },
-      { "id": "preguntas", "text": "Solo MC/V-F: preguntas sin pistas, distractores plausibles, correcta no delatada por el largo" },
-      { "id": "idioma", "text": "Español latinoamericano neutro, natural (narración del audiolibro: suena a clase hablada)" }
+      {
+        "id": "exactitud",
+        "text": "Exactitud conceptual: sin errores ni afirmaciones inventadas respecto del capítulo fuente"
+      },
+      {
+        "id": "profundidad",
+        "text": "Profundidad adecuada al nivel y a las horas del capítulo"
+      },
+      {
+        "id": "pedagogia",
+        "text": "Valor pedagógico: secuencia, claridad, retroalimentación útil"
+      },
+      {
+        "id": "situado",
+        "text": "Ejemplos situados en el sector y país del curso"
+      },
+      {
+        "id": "instrucciones",
+        "text": "Cumplimiento de las instrucciones del prompt (formato, cantidades, extensión)"
+      },
+      {
+        "id": "coherencia",
+        "text": "Coherencia con el Blueprint y con el resto del curso (sin repetir otros capítulos)"
+      },
+      {
+        "id": "preguntas",
+        "text": "Solo MC/V-F: preguntas sin pistas, distractores plausibles, correcta no delatada por el largo"
+      },
+      {
+        "id": "idioma",
+        "text": "Español latinoamericano neutro, natural (narración del audiolibro: suena a clase hablada)"
+      }
     ]
   }
 }

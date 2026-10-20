@@ -27,7 +27,7 @@ function echoNarrator() {
 
 async function runAudiobookChapter(o) {
   const A = require(path.join(o.distRoot, 'workers/provider-real/audio-scripts.js'));
-  const ctx = { distRoot: o.distRoot, arm: o.arm, client: o.client, guard: o.guard, calls: [] };
+  const ctx = { distRoot: o.distRoot, arm: o.arm, client: o.client, guard: o.guard, calls: [], sink: o.sink || null, tags: o.tags || {}, resume: o.resume || null, onAnswer: o.onAnswer || null, backoffMs: o.backoffMs };
   if (o.client.kind === 'mock') o.client.providerRef.provider = echoNarrator();
   const plan = A.planAudiobookSections(o.contentMarkdown);
   const input = { courseTitle: o.courseTitle, chapterNumber: o.chapterNumber, chapterTitle: o.chapterTitle, sector: o.sector || null, nivel: o.nivel || null, pais: o.pais || null, contentMarkdown: o.contentMarkdown };
@@ -35,7 +35,6 @@ async function runAudiobookChapter(o) {
   const llm = async (prompt, role) => {
     const body = { model: 'claude-sonnet-4-6', max_tokens: prompt.maxTokens, system: prompt.system, messages: [{ role: 'user', content: prompt.user }] };
     const { r } = await callThrough(ctx, body, { itemKey, componentType: 'audiobook_chapter', callRole: role, requestHash: sha(JSON.stringify(body)) });
-    if (r.error) throw Object.assign(new Error(`llm ${r.error.status}: ${r.error.message}`), { code: 'LLM_ERROR' });
     return { text: r.text, messageId: r.id || 'none', truncated: r.stopReason === 'max_tokens' };
   };
   const sections = [];
@@ -47,7 +46,10 @@ async function runAudiobookChapter(o) {
       sections.push(r);
       prev = r.text;
     } catch (e) {
-      if (e && e.code === 'BUDGET_EXCEEDED') throw e;
+      // Presupuesto, rechazo de la API, infraestructura y lint abortan la corrida (nunca son «fallas del guion»).
+      // Solo los errores de VALIDACIÓN del guion (AudioScriptError) cuentan contra el brazo; presupuesto, rechazo de la
+      // API, infraestructura, lint o un error inesperado abortan la corrida (nunca se degradan en silencio).
+      if (!(e instanceof A.AudioScriptError)) throw e;
       failures.push({ idx: s.idx, code: (e && e.code) || 'ERROR', message: String((e && e.message) || e).slice(0, 200) });
       prev = null;
     }

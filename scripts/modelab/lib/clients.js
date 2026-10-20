@@ -25,10 +25,16 @@ function createMockClient(o = {}) {
   return {
     kind: 'mock',
     providerRef: ref,
+    calls: 0,
     async call(adapted, original) {
+      this.calls++;
+      if (o.delayMs) await new Promise((ok) => setTimeout(ok, o.delayMs)); // solo pruebas (señales a mitad de corrida)
+      // Inyección de fallas para las pruebas (status HTTP simulado): mismo contrato de error que el cliente real.
+      const inj = o.inject ? o.inject(this.calls, adapted, original) : null;
+      if (inj) { const c = classifyError(inj.status); return { error: { status: inj.status, type: inj.type || null, cls: c.cls, message: inj.message || `simulado ${inj.status}` }, unknownSpend: c.unknownSpend, latencyMs: 0 }; }
       if (!ref.provider) throw new Error('modelab mock: sin proveedor falso (el driver no lo creó)');
       const r = ref.provider.respond(original);
-      if (!r || r.httpStatus || typeof r.text !== 'string') return { error: { status: (r && r.httpStatus) || 500, message: String((r && r.error) || 'fake error') } };
+      if (!r || r.httpStatus || typeof r.text !== 'string') { const st = (r && r.httpStatus) || 500; const c = classifyError(st); return { error: { status: st, cls: c.cls, message: String((r && r.error) || 'fake error') }, unknownSpend: c.unknownSpend }; }
       const f = factorOf(adapted.model);
       const meta = M.MODELS[adapted.model];
       const { sys, blocks } = promptText(adapted);
@@ -60,14 +66,36 @@ function createMockClient(o = {}) {
   };
 }
 
+/**
+ * Clase de un error de la API (review r61 I5/I6):
+ *   - invalid_request (400/404/413/422 y otros 4xx no listados) → el brazo/corrida ABORTA (nunca es una «falla del modelo»);
+ *   - auth (401/403) → aborta;
+ *   - transient (429, 529, 5xx, red/timeout = status 0) → reintento explícito acotado, cada intento con su reserva;
+ *     NUNCA se guarda como respuesta ni cuenta como falla dura del brazo.
+ * Gasto: 429/529 se rechazan antes de generar (sin cargo); 5xx / red / timeout = gasto DESCONOCIDO → cota superior.
+ */
+function classifyError(status) {
+  if (status === 401 || status === 403) return { cls: 'auth', unknownSpend: false };
+  if (status === 429 || status === 529) return { cls: 'transient', unknownSpend: false };
+  if (status === 0 || status >= 500) return { cls: 'transient', unknownSpend: true };
+  return { cls: 'invalid_request', unknownSpend: false };
+}
+
+const ANTHROPIC_API_BASE = 'https://api.anthropic.com';
+
 function createRealClient(o) {
   if (!o || !o.apiKeyEnv) throw new Error('modelab real: falta --api-key-env (nombre de la variable de entorno con la clave)');
   if (!/^[A-Z][A-Z0-9_]{2,64}$/.test(o.apiKeyEnv)) throw new Error('modelab real: --api-key-env debe ser un nombre de variable (MAYÚSCULAS)');
+  // Review r61 M8: el SDK respeta ANTHROPIC_BASE_URL; en modo real la clave solo viaja a la API oficial.
+  if (process.env.ANTHROPIC_BASE_URL && process.env.ANTHROPIC_BASE_URL.replace(/\/+$/, '') !== ANTHROPIC_API_BASE) {
+    throw new Error('modelab real: ANTHROPIC_BASE_URL está definida y no es https://api.anthropic.com; se niega a enviar la clave a otro host (desdefinirla)');
+  }
   const key = process.env[o.apiKeyEnv];
   if (!key || !key.trim()) throw new Error(`modelab real: la variable ${o.apiKeyEnv} no está definida en el entorno de esta corrida (no se lee .env)`);
   const SDK = require('@anthropic-ai/sdk');
   const Anthropic = SDK.default || SDK.Anthropic || SDK;
-  const sdk = new Anthropic({ apiKey: key, maxRetries: 2, timeout: 15 * 60 * 1000 });
+  // Review r61 I3: SIN reintentos automáticos del SDK (cada reintento se reserva y registra en callThrough).
+  const sdk = new Anthropic({ apiKey: key, baseURL: ANTHROPIC_API_BASE, maxRetries: 0, timeout: 15 * 60 * 1000 });
   return {
     kind: 'real',
     async call(adapted) {
@@ -77,8 +105,9 @@ function createRealClient(o) {
         return { text: M.responseText(msg.content), stopReason: msg.stop_reason || null, stopDetails: msg.stop_details || null, usage: msg.usage || {}, id: msg.id, latencyMs: Date.now() - t0 };
       } catch (e) {
         const status = e && typeof e.status === 'number' ? e.status : 0;
-        // 4xx definitivo: sin cargo. Otro error: el gasto es DESCONOCIDO → el runner lo reserva a la cota superior.
-        return { error: { status, message: String((e && e.message) || e).slice(0, 400) }, unknownSpend: !(status >= 400 && status < 500), latencyMs: Date.now() - t0 };
+        const c = classifyError(status);
+        const type = e && e.error && e.error.error && e.error.error.type ? e.error.error.type : null;
+        return { error: { status, type, cls: c.cls, message: String((e && e.message) || e).slice(0, 400) }, unknownSpend: c.unknownSpend, latencyMs: Date.now() - t0 };
       }
     },
     /** Gratis según https://platform.claude.com/docs/en/build-with-claude/token-counting («free to use»). */
@@ -90,4 +119,4 @@ function createRealClient(o) {
   };
 }
 
-module.exports = { createMockClient, createRealClient, CHARS_PER_TOKEN_46 };
+module.exports = { createMockClient, createRealClient, classifyError, CHARS_PER_TOKEN_46, ANTHROPIC_API_BASE };

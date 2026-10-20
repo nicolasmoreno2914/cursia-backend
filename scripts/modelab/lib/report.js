@@ -46,18 +46,22 @@ function renderCapture(o) {
 }
 
 function renderRun(o, cfg) {
-  const L = [`# MODELAB · corrida ${o.mode} · ${o.experiment}`, '', `Presupuesto: aprobado ${o.budget.approvedUsd} USD · gastado ${o.budget.spentUsd} · llamadas ${o.budget.calls}. Proyección previa (evidencia) ${f3(o.plan.totalUsd)} USD (× margen = ${f3(o.preflight.withMarginUsd)}).`];
-  if (o.mode === 'dry-run') L.push('', '> DRY-RUN: respuestas del LLM FALSO del E2E y uso SIMULADO (chars/4 × factor del tokenizer). Los costos y la calidad de esta tabla NO son de los modelos reales: demuestran el circuito completo (adaptación, lint, presupuesto, validadores, regla go/no-go).');
-  if (o.aborted) L.push('', `**ABORTADO**: ${o.aborted.message}`);
+  const b = o.budget || {};
+  const L = [`# MODELAB · corrida ${o.mode} · ${o.experiment}`, '', `Presupuesto del experimento: aprobado ${b.approvedUsd ?? '—'} USD · gastado antes ${b.priorSpentUsd ?? 0} · esta corrida ${b.spentUsd ?? 0} · total ${b.totalSpentUsd ?? '—'} · llamadas ${b.calls ?? 0}. Ledger: ${b.ledgerFile || '—'}.`];
+  if (o.plan) L.push(`Proyección previa (evidencia, incluye humo ${f3(o.plan.smokeUsd)}) ${f3(o.plan.totalUsd)} USD${o.preflight ? ` (× margen = ${f3(o.preflight.withMarginUsd)}; disponible ${f3(o.preflight.availableUsd)})` : ''}.`);
+  if (o.mode === 'dry-run') L.push('', '> DRY-RUN: respuestas del LLM FALSO del E2E y uso SIMULADO (chars/4 × factor del tokenizer). Los costos y la calidad de esta tabla NO son de los modelos reales: demuestran el circuito completo (humo, adaptación, lint, presupuesto con ledger, validadores, regla go/no-go).');
+  if (o.aborted) L.push('', `**ABORTADO (${o.aborted.code})**: ${o.aborted.message}`);
+  if (o.smoke && o.smoke.length) L.push('', `Humo: ${o.smoke.length} llamada(s) aceptadas por la API (${[...new Set(o.smoke.map((x) => x.arm))].join(', ')}). Factor del tokenizer medido (count_tokens): ${Object.entries(o.tokenizer || {}).map(([m, t]) => `${m} ${f3(t.factor)}${t.simulated ? ' (SIMULADO)' : ''}`).join(' · ') || '—'}.`);
   for (const c of o.components) {
-    L.push('', `## ${c.component} (${c.input}) — ${c.targets.length} ítem(s)`, '', '| Brazo | modelo | ítems | válidos | 1.ª pasada | reintentos/ítem | fallas duras | truncados | refusal | USD | USD/ítem válido | correcta más larga | repetición | idioma/100 or. | veredicto |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
+    L.push('', `## ${c.component} (${c.input}) — ${c.targets.length} ítem(s)`, '', '| Brazo | modelo | ítems | válidos | 1.ª pasada | reintentos/ítem | fallas duras | truncados | refusal | infra | USD | USD/ítem válido | USD/ítem válido EN FRÍO | correcta más larga | repetición | idioma/100 or. | veredicto |', '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|');
     for (const [id, a] of Object.entries(c.arms)) {
-      const d = c.decisions[id];
-      L.push(`| ${id} | ${a.model} | ${a.items} | ${a.completed} | ${pct(a.firstPassValidity)} | ${f2(a.retriesPerItem)} | ${a.hardFailures} | ${a.truncations} | ${a.refusals} | ${f3(a.usd)} | ${f3(a.usdPerValidItem)} | ${pct(a.answerLongestShare)} | ${f3(a.repetitionRatio)} | ${f2(a.languageHitsPer100Sentences)} | ${d ? d.verdict : 'baseline'} |`);
+      const d = c.decisions && c.decisions[id];
+      L.push(`| ${id} | ${a.model} | ${a.items} | ${a.completed} | ${pct(a.firstPassValidity)} | ${f2(a.retriesPerItem)} | ${a.hardFailures} | ${a.truncations} | ${a.refusals} | ${a.infraCalls ?? 0} | ${f3(a.usd)} | ${f3(a.usdPerValidItem)} | ${f3(a.usdPerValidItemCold)} | ${pct(a.answerLongestShare)} | ${f3(a.repetitionRatio)} | ${f2(a.languageHitsPer100Sentences)} | ${d ? d.verdict : 'baseline'} |`);
     }
-    for (const [id, d] of Object.entries(c.decisions)) if (d.reasons.length) L.push(`- ${id}: ${d.reasons.join('; ')}`);
+    for (const [id, d] of Object.entries(c.decisions || {})) if (d.reasons.length) L.push(`- ${id}: ${d.reasons.join('; ')}`);
   }
-  L.push('', '## Regla de decisión', '', `GO por componente si: rúbrica ≥ baseline − ${cfg.successCriteria.rubricMaxDrop}; validez de 1.ª pasada ≥ baseline − ${cfg.successCriteria.firstPassMaxDrop * 100} pts; 0 fallas duras nuevas (fallas, truncados, refusal, JSON inválido); ahorro ≥ ${cfg.successCriteria.minSavingPerValidItem * 100} % por ítem válido; sesgo de largo de la correcta no sube más de ${cfg.successCriteria.answerBiasMaxRise * 100} pts. Deterministas OK sin rúbrica = PENDING_RUBRIC.`);
+  const sc = cfg.successCriteria;
+  L.push('', '## Regla de decisión', '', `GO por componente si: rúbrica ≥ baseline − ${sc.rubricMaxDrop}; validez de 1.ª pasada ≥ baseline − ${sc.firstPassMaxDrop * 100} pts; 0 fallas duras nuevas (fallas, truncados, refusal, JSON inválido; los errores de infraestructura NO cuentan: abortan o se reintentan); ahorro ≥ ${sc.minSavingPerValidItem * 100} % por ítem válido EN FRÍO (lecturas de caché repreciadas como escritura: el estado de la caché entre réplicas no decide); sesgo de largo de la correcta no sube más de ${sc.answerBiasMaxRise * 100} pts; en ${(sc.tokenizerGateModels || []).join(', ') || '—'} el factor medido por count_tokens ≤ ${sc.maxTokenizerFactor}. Métrica determinista faltante = NO_GO; rúbrica faltante = PENDING_RUBRIC; factor faltante = PENDING_TOKENIZER.`);
   return L.join('\n') + '\n';
 }
 
