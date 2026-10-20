@@ -607,7 +607,7 @@ export function adminActionFor(
     if (/^(videogen_failed|videogen_submit_rejected)/.test(err)) return { code: 'retry_video_render', itemKey: key };
     // r62 (N2): job vencido (tope único de render). Si la conciliación lo declinó, el motivo viaja en la acción.
     if (/^videogen_render_overdue/.test(err)) {
-      const declined = String(s.providerReconcile?.declined ?? '');
+      const declined = String(s.providerReconcile?.declinedError ?? '') === err ? String(s.providerReconcile?.declined ?? '') : '';
       return { code: 'retry_video_render', itemKey: key, ...(declined ? { reason: declined } : {}) };
     }
     if (err.startsWith('ambiguous_video_submission') || (!!s.externalSubmitStartedAt && !s.external?.videogenJobId)) {

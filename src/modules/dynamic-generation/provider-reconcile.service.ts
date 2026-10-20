@@ -18,6 +18,7 @@ import {
   PROVIDER_RECONCILE_EXCLUDED_RUN_PREFIXES,
   PROVIDER_RECONCILE_KEY,
   PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS,
+  PROVIDER_RECONCILE_MAX_CANCEL_ATTEMPTS,
   PROVIDER_RECONCILE_MAX_REPOLLS,
   PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS,
   PROVIDER_RECONCILE_LOOKUP_TIMEOUT_MS,
@@ -208,7 +209,9 @@ export class ProviderReconcileService {
   // ── una parte ──────────────────────────────────────────────────────────────
 
   private async reconcileOne(r: Row, now: Date, policy: AutoHealPolicy, result: ProviderReconcileSweepResult): Promise<void> {
-    const watch = providerReconcileStateOf(r.output_summary).declined === PROVIDER_STUCK_NO_CANCEL;
+    // Re-review m-n1: la vigilancia es de la excepción de ESTE error (un reenvío produce un error nuevo).
+    const stNow = providerReconcileStateOf(r.output_summary);
+    const watch = stNow.declined === PROVIDER_STUCK_NO_CANCEL && String(stNow.declinedError ?? '') === String(r.error ?? '');
     const d = providerReconcileDecision(r, now, policy, { id: r.job_id, created_at: r.run_created_at }, { watch });
     if (d.heal === false) {
       result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
@@ -407,6 +410,14 @@ export class ProviderReconcileService {
         return { action: 'wait', recheck: true, why: `costo de ${jobId} no disponible para confirmar la cancelación (${errText(err)})` };
       }
       const s0 = (prevState.cancelSnapshot ?? null) as Record<string, unknown> | null;
+      const vgc = this.videogen();
+      const attempts = Math.max(1, Math.floor(Number(prevState.cancelAttempts ?? 1)) || 1);
+      if (s0 && /^(queued|pending|waiting)$/i.test(status) && sameSnapshot({ ...snap, status: 'failed' }, s0) && attempts < PROVIDER_RECONCILE_MAX_CANCEL_ATTEMPTS
+        && typeof vgc.cancelVideo === 'function') {
+        // Re-review I-n1: la cancelación anterior no tuvo efecto (POST vencido / 5xx antes de aplicar) y el job sigue
+        // encolado e idéntico a S0 → se vuelve a pedir, con la MISMA foto S0 y la marca persistida antes del POST.
+        return this.requestCancel(r, vgc, jobId, s0, now, attempts + 1);
+      }
       if (!isJobFailed(status) || !s0 || !sameSnapshot(snap, s0)) {
         return { action: 'decline', reason: PROVIDER_STUCK_NO_CANCEL, attention: 'duplicate_charge',
           why: `el job ${jobId} cambió después de la cancelación (estado ${status || 'sin estado'}; antes ${JSON.stringify(s0)}, ahora ${JSON.stringify(snap)}): ` +
@@ -434,16 +445,15 @@ export class ProviderReconcileService {
       const vg = this.videogen();
       if (queued && !cancelPending && typeof vg.cancelVideo === 'function') {
         // Encolado: la cancelación de Videogen lo saca de la cola (nunca empezó a gastar). Se confirma y se sigue por evidencia.
+        let s0: Record<string, unknown>;
         try {
           // Foto S0 ANTES del cancel (lo que se va a comparar después): estado/etapa/progreso/escenas + costo y uso.
           const c0 = await withTimeout(vg.getVideoCost(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `GET cost ${jobId}`);
-          const s0 = videogenSnapshot({ ...st, status: 'failed' }, c0);
-          const c = await withTimeout(vg.cancelVideo(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `POST cancel ${jobId}`);
-          await this.patchState(r, { cancelRequestedAt: now.toISOString(), cancelError: String(r.error ?? ''), cancelResult: c, cancelSnapshot: s0 });
-          return { action: 'wait', recheck: true, why: `job ${jobId} encolado pasado el tope de render: cancelación pedida` };
+          s0 = videogenSnapshot({ ...st, status: 'failed' }, c0);
         } catch (err) {
-          return { action: 'wait', recheck: true, why: `no se pudo cancelar el job ${jobId} (${errText(err)}); se reintenta` };
+          return { action: 'wait', recheck: true, why: `costo de ${jobId} no disponible para la foto S0 (${errText(err)}); no se cancela todavía` };
         }
+        return this.requestCancel(r, vg, jobId, s0, now, 1);
       }
       // Procesando (o sin cancelación efectiva): reenviar podría producir un doble render pagado → excepción (c).
       return { action: 'decline', reason: PROVIDER_STUCK_NO_CANCEL, attention: 'duplicate_charge',
@@ -494,6 +504,29 @@ export class ProviderReconcileService {
     const settlement = await this.whileUnchanged(r, () => this.settleVideogenReservation(res.idempotency_key, mode, counted, reason, jobId, status, cost.estimated_total_cost, meta));
     return { action: 'resubmit', ambiguous: false, settlement, counted: mode === 'charged' ? reserved : mode === 'release' ? normalizeDecimal(0) : counted, reservedAmount: res.amount,
       why: `job ${jobId} falló (${String(st.error ?? 'sin detalle').slice(0, 120)}); conciliado ${settlement}` };
+  }
+
+  /**
+   * Re-review I-n1: la marca de cancelación (cancelRequestedAt + cancelError + foto S0, y se borra cancelConfirm1At)
+   * se PERSISTE ANTES del POST. Si el POST vence, da 5xx o el procesador de Videogen aplica markFailed y después falla al
+   * responder, la marca ya está: el próximo `failed` pasa por la regla de las dos lecturas contra S0 (nunca un reenvío
+   * con una sola lectura). Si la marca no se pudo escribir (la fila cambió), no se cancela.
+   */
+  private async requestCancel(r: Row, vg: Partial<Pick<VideogenService, 'cancelVideo'>>, jobId: string, s0: Record<string, unknown>,
+    now: Date, attempt: number): Promise<Evidence> {
+    const marked = await this.patchState(r, {
+      cancelRequestedAt: now.toISOString(), cancelError: String(r.error ?? ''), cancelSnapshot: s0, cancelConfirm1At: null,
+      cancelAttempts: attempt, cancelResult: { pending: true },
+    });
+    if (!marked) throw new StaleRow(`la parte ${r.item_key} cambió antes de pedir la cancelación`);
+    try {
+      const c = await withTimeout(vg.cancelVideo!(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `POST cancel ${jobId}`);
+      await this.patchState(r, { cancelResult: c });
+      return { action: 'wait', recheck: true, why: `job ${jobId} encolado pasado el tope de render: cancelación pedida (intento ${attempt})` };
+    } catch (err) {
+      await this.patchState(r, { cancelResult: { error: errText(err) } });
+      return { action: 'wait', recheck: true, why: `la cancelación del job ${jobId} no respondió (${errText(err)}); la marca queda y se confirma contra S0` };
+    }
   }
 
   /** Liquidación de una reserva de Videogen según el modo (release / partial / charged / over). Idempotente. */
@@ -647,14 +680,16 @@ export class ProviderReconcileService {
   }
 
   /** Review M4: solo sobre la MISMA falla que se evaluó (mismo error e intento). */
-  private async patchState(r: Row, patch: Record<string, unknown>): Promise<void> {
-    await this.dataSource.query(
+  private async patchState(r: Row, patch: Record<string, unknown>): Promise<boolean> {
+    const res = await this.dataSource.query(
       `update public.generation_item_runs
           set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${PROVIDER_RECONCILE_KEY}',
                 coalesce(output_summary->'${PROVIDER_RECONCILE_KEY}', '{}'::jsonb) || $2::jsonb)
         where id = $1 and status = 'failed' and coalesce(error, '') = $3 and attempt_count = $4`,
       [r.id, JSON.stringify(patch), String(r.error ?? ''), r.attempt_count],
     );
+    // typeorm (pg) devuelve [filas, cantidad] en un UPDATE.
+    return Array.isArray(res) && typeof res[1] === 'number' ? res[1] > 0 : true;
   }
 
   /**

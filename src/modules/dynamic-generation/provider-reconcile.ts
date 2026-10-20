@@ -54,6 +54,8 @@ export const PROVIDER_RECONCILE_RECHECK_SECONDS: readonly number[] = Object.free
 export const PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS = 600;
 /** Review M3: re-poll de un job terminado bien (gratis): tope propio, no consume reenvíos. */
 export const PROVIDER_RECONCILE_MAX_REPOLLS = 3;
+/** Re-review I-n1: pedidos de cancelación por error (si el POST no tuvo efecto y el job sigue encolado e igual a S0). */
+export const PROVIDER_RECONCILE_MAX_CANCEL_ATTEMPTS = 3;
 /** Review I4: tope de consultas al proveedor del bucle d5 por tick (el tick es serial con el empaque automático). */
 export const PROVIDER_RECONCILE_D5_MAX_LOOKUPS_PER_TICK = 10;
 /**
@@ -226,7 +228,7 @@ export function providerReconcileDecision(
   if (!kind) return { heal: false, reason: 'not_applicable' };
   const st = providerReconcileStateOf(os);
   // La excepción registrada vale para ESE error (un error nuevo la reemplaza: ver declinedError).
-  const watching = !!opts?.watch && st.declined === PROVIDER_STUCK_NO_CANCEL;
+  const watching = !!opts?.watch && st.declined === PROVIDER_STUCK_NO_CANCEL && String(st.declinedError ?? '') === String(row.error ?? '');
   if (st.declined && String(st.declinedError ?? '') === String(row.error ?? '') && !watching) return { heal: false, reason: 'declined', kind };
   const { rounds, ambiguousRounds } = providerReconcileRoundsOf(os);
   if (rounds >= PROVIDER_RECONCILE_MAX_RESUBMITS) return { heal: false, reason: 'cap_reached', kind };

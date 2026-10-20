@@ -75,7 +75,9 @@ function withProviderProbe(r: Record<string, any>, v: ItemRecoveryView, now: Dat
 /** Vista de recuperación de una fila de generation_item_runs (`select *`). Pura salvo el reloj y el env (kill-switch). */
 export function recoveryViewOf(r: Record<string, any>, now: Date = new Date()): ItemRecoveryView {
   const v = withProviderProbe(r, baseRecoveryViewOf(r), now);
-  const declined = r.status === 'failed' ? r.output_summary?.providerReconcile?.declined : null;
+  // Re-review m-n1: solo la excepción del error ACTUAL.
+  const pr = r.output_summary?.providerReconcile;
+  const declined = r.status === 'failed' && pr && String(pr.declinedError ?? '') === String(r.error ?? '') ? pr.declined : null;
   return typeof declined === 'string' && declined ? { ...v, exceptionReason: declined } : v;
 }
 
