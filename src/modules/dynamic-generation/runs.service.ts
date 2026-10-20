@@ -2446,6 +2446,8 @@ export class RunsService {
         this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
         // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
+        // r62 (N2, re-review m-n1): un reenvío MANUAL limpia el estado de conciliación del error anterior.
+        if (!auto) resubmitSetSql += ` - '${PROVIDER_RECONCILE_KEY}'`;
       }
       if (resubmitVideo) {
         if (target.type !== 'video') {
@@ -2458,7 +2460,9 @@ export class RunsService {
           || (!!auto?.providerReconcile && auto.providerReconcile.kind === 'videogen_stuck' && err.startsWith('video_timeout'))
           // r62 (N2): job vencido (tope único de render): el automático tras una cancelación confirmada, o el de admin
           // SOLO con la excepción ya registrada (review overdue m1: nunca mientras la conciliación todavía decide/cancela).
-          || (err.startsWith('videogen_render_overdue') && (!!auto?.providerReconcile || !!target.output_summary?.providerReconcile?.declined));
+          || (err.startsWith('videogen_render_overdue') && (!!auto?.providerReconcile
+            // re-review m-n1: la excepción tiene que ser la de ESTE error (no la de un render anterior).
+            || (!!target.output_summary?.providerReconcile?.declined && String(target.output_summary?.providerReconcile?.declinedError ?? '') === err)));
         if (!eligible) {
           throw new BadRequestException(
             `resubmitVideo solo aplica cuando el último error es "videogen_failed", "ambiguous_video_submission", "videogen_submit_rejected" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,
@@ -2469,7 +2473,10 @@ export class RunsService {
             'archivando external/externalSubmitStartedAt en previousExternals y sometiendo un video nuevo',
         );
         // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
-        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
+        // r62 (N2, re-review m-n1): job nuevo → sin el último estado del anterior; un reenvío MANUAL limpia además el
+        // estado de conciliación del error anterior (la automática lo reemplaza con el suyo).
+        resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince' - 'videogenLastStatus'`
+          + (auto ? '' : ` - '${PROVIDER_RECONCILE_KEY}'`);
       }
 
       // REL CREDIT: toda reapertura borra el estado de la sonda (racha nueva); el canario lo vuelve a escribir abajo.

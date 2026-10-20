@@ -168,6 +168,9 @@ function startFakes() {
         // Carrera real de Videogen: el procesador tomó el job justo antes del cancel → queda `failed` en la DB pero sigue
         // trabajando (escribe current_step y suma uso).
         if (j.raceOnCancel) Object.assign(j, { currentStep: 'generating_images_and_audio', progress: 40, cost: 0.37, usageLogs: 5, breakdown: { script: 0.37 } });
+        // Videogen aplica markFailed y después la respuesta no llega (emitFailed lanza / red): vence o 5xx.
+        if (j.cancelResponse === 'hang') return;
+        if (j.cancelResponse === 500) return json(rs, 500, { error: 'emitFailed exploded' });
         return json(rs, 200, { success: true, job_id: m[1] });
       }
       if (rq.method === 'GET' && (m = p.match(/^\/api\/costs\/videos\/([^/]+)$/))) {
@@ -657,6 +660,64 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set status = 'pending', error = null where id = $1`, [row.id]);
       const s2 = await runVideo(C);
       eq([s2.st.completed.length, s2.st.failed.length], [1, 0], `terminado pasado el tope → se entrega ${JSON.stringify(s2.st.failed)}`);
+    });
+    const V2t = await makeCourse('r62 cancel sin respuesta');
+    const v2tkey = `video:${V2t.c1}`;
+    await check('[V2] re-review I-n1 — el POST de cancel VENCE pero Videogen canceló igual: la marca y la foto S0 quedaron ANTES del POST → ningún reenvío en ese tick ni con una sola lectura; recién tras las dos lecturas idénticas a S0', async () => {
+      await overdueFail(V2t, 'vg-cancel-hang', ['queued']);
+      fakes.vg.jobs.get('vg-cancel-hang').cancelResponse = 'hang';
+      const reconT = new ProviderReconcileService(ds, runs, ledger, budget, { videogen, gamma: gammaClient, lookupTimeoutMs: 300 });
+      const at = (sec) => reconT.sweep({ now: new Date(Date.now() + sec * 1000), policy: P });
+      const sub0 = fakes.vg.submits;
+      const r1 = await at(5);
+      eq(r1.resubmitted.filter((x) => x.runId === V2t.runId).length, 0, 'sin reenvío en el tick del cancel');
+      const st = (await latest(V2t.runId, v2tkey)).output_summary.providerReconcile;
+      assert(st.cancelRequestedAt && st.cancelSnapshot && st.cancelResult && /no respondió|sin respuesta|error/i.test(JSON.stringify(st.cancelResult)), `marca persistida aunque el POST venció: ${JSON.stringify(st)}`);
+      eq(fakes.vg.jobs.get('vg-cancel-hang').statuses, ['failed'], 'Videogen sí canceló');
+      const r2 = await at(5 + 120 + 5);
+      eq(r2.resubmitted.filter((x) => x.runId === V2t.runId).length, 0, 'un `failed` antes de los 10 min no alcanza');
+      const r3 = await at(5 + PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 30);
+      eq(r3.resubmitted.filter((x) => x.runId === V2t.runId).length, 0, 'primera lectura contra S0: todavía no');
+      const r4 = await at(5 + 2 * PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 60);
+      eq(r4.resubmitted.filter((x) => x.runId === V2t.runId).map((x) => [x.kind, x.settlement]), [['videogen_overdue', 'released']], `dos lecturas iguales a S0 ${JSON.stringify(r4)}`);
+      eq(fakes.vg.submits - sub0, 0, 'el barrido nunca envía');
+    });
+    const V2e = await makeCourse('r62 cancel 500 carrera');
+    await check('[V2] re-review I-n1 — el POST de cancel da 500 con la carrera (el procesador ya lo tenía): la marca quedó → la lectura difiere de S0 → provider_stuck_no_cancel, nunca un reenvío', async () => {
+      await overdueFail(V2e, 'vg-cancel-500', ['queued']);
+      Object.assign(fakes.vg.jobs.get('vg-cancel-500'), { cancelResponse: 500, raceOnCancel: true });
+      const sub0 = fakes.vg.submits;
+      const r1 = await sweepAt(5);
+      eq(r1.resubmitted.filter((x) => x.runId === V2e.runId).length, 0, 'sin reenvío');
+      const r2 = await sweepAt(5 + PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 30);
+      eq(r2.declined.filter((x) => x.runId === V2e.runId).map((x) => x.reason), ['provider_stuck_no_cancel'], JSON.stringify(r2));
+      for (const t of [3600, 7200]) eq((await sweepAt(t)).resubmitted.filter((x) => x.runId === V2e.runId).length, 0, `vigilando +${t}s`);
+      eq(fakes.vg.submits - sub0, 0, '0 jobs nuevos');
+    });
+    const V2m = await makeCourse('r62 estado por error');
+    const v2mkey = `video:${V2m.c1}`;
+    await check('[V2] re-review m-n1 — el estado de conciliación es del error ACTUAL: el reenvío de admin limpia la excepción vieja (y videogenLastStatus); el job nuevo encolado y vencido se CANCELA (no queda vigilado por la excepción anterior) y un cancelConfirm1At viejo se borra al pedir el cancel nuevo', async () => {
+      await overdueFail(V2m, 'vg-e1', ['processing']);
+      const r0 = await sweepAt(5);
+      eq(r0.declined.filter((x) => x.runId === V2m.runId).map((x) => x.reason), ['provider_stuck_no_cancel'], 'E1 declinado');
+      await runs.retryItem(V2m.cid, OWNER, 1, V2m.runId, v2mkey, true, false, undefined, { email: 'admin@cursia.test' });
+      const after = await latest(V2m.runId, v2mkey);
+      eq([after.status, after.output_summary.providerReconcile, after.output_summary.videogenLastStatus], ['pending', undefined, undefined], 'el reenvío de admin limpia el estado del error anterior');
+      eq(L('modules/dynamic-generation/item-recovery-view.js').recoveryViewOf(after).exceptionReason, undefined, 'sin excepción vieja en la vista');
+      // E2: job nuevo que queda encolado y vence. Se inyecta un estado viejo (excepción y confirmación de otro error).
+      await overdueFail(V2m, 'vg-e2', ['queued']);
+      const e2 = await latest(V2m.runId, v2mkey);
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('providerReconcile', $2::jsonb) where id = $1`,
+        [e2.id, JSON.stringify({ declined: 'provider_stuck_no_cancel', declinedError: 'videogen_render_overdue: E1 viejo', cancelConfirm1At: new Date(Date.now() - 3600000).toISOString() })]);
+      eq(L('modules/dynamic-generation/item-recovery-view.js').recoveryViewOf(await latest(V2m.runId, v2mkey)).exceptionReason, undefined, 'la vista ignora la excepción de otro error');
+      let e = null; try { await runs.retryItem(V2m.cid, OWNER, 1, V2m.runId, v2mkey, true, false, undefined, { email: 'admin@cursia.test' }); } catch (x) { e = x; }
+      assert(e && /resubmitVideo solo aplica/.test(e.message), `m1 con la excepción de otro error: rechazado (${e && e.message})`);
+      const can0 = fakes.vg.cancels;
+      await sweepAt(5);
+      eq(fakes.vg.cancels - can0, 1, 'E2 se cancela (no lo frena la vigilancia de E1)');
+      eq((await latest(V2m.runId, v2mkey)).output_summary.providerReconcile.cancelConfirm1At, null, 'cancelConfirm1At viejo borrado');
+      eq((await sweepAt(5 + PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 30)).resubmitted.filter((x) => x.runId === V2m.runId).length, 0, 'una sola lectura no alcanza');
+      eq((await sweepAt(5 + 2 * PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 60)).resubmitted.filter((x) => x.runId === V2m.runId).map((x) => x.settlement), ['released'], 'dos lecturas');
     });
     delete process.env.DYNAMIC_VIDEOGEN_MAX_RENDER_MS;
 
