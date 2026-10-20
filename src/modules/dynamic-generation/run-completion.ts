@@ -538,7 +538,11 @@ function isAmbiguousYoutube(r: CompletionRow): boolean {
 }
 
 /** Acción de admin para un item no hecho (null = el auto-healer lo toma o es un bloqueo por dependencia). */
-export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletionClass, now: Date, job?: CompletionJob | null): RunAdminAction | null {
+export function adminActionFor(
+  r: CompletionRow | undefined, cls: ItemCompletionClass, now: Date, job?: CompletionJob | null,
+  /** r62 (re-review m5-bis): fila vigente de la dependencia de un claim incompleto (si la hay). */
+  ctx?: { dep?: CompletionRow | null },
+): RunAdminAction | null {
   if (!r) return null;
   const key = r.item_key;
   const err = String(r.error ?? '');
@@ -558,11 +562,16 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   if (tickOn0 && autoRecoveryEnabled(process.env) && spendControlHoldOf(err, r.type)) return null;
   // r62 (M1): claim incompleto por el dato de la dependencia → lo resuelve el barrido (reapertura / regenerate_dependency)
   // hasta que lo registra como excepción (claimPayloadRecovery.declined).
-  {
-    // r62 (re-review m5): con techo (si el barrido no lo resolvió a tiempo, la acción aparece igual).
-    const cpAt = r.finished_at ? new Date(r.finished_at as any).getTime() : r.updated_at ? new Date(r.updated_at as any).getTime() : NaN;
-    const cpWithin = !Number.isFinite(cpAt) || now.getTime() < cpAt + CLAIM_PAYLOAD_SWEEP_CEILING_MS;
-    if (tickOn0 && cpWithin && autoRecoveryEnabled(process.env) && claimPayloadDependencyKey(r as any) && !s.claimPayloadRecovery?.declined) return null;
+  if (tickOn0 && autoRecoveryEnabled(process.env) && claimPayloadDependencyKey(r as any) && !s.claimPayloadRecovery?.declined) {
+    // r62 (re-review m5 / m5-bis): mientras la dependencia (video) no esté completada —viva, en vuelo o con su propia
+    // acción si falló— reintentar esta parte no sirve: sin acción acá. Completada, el barrido la reabre / regenera; el
+    // techo (el barrido falla en cada tick) se cuenta desde max(fallo de la parte, fin de la dependencia).
+    const dep = ctx?.dep ?? null;
+    if (dep && dep.status !== 'completed') return null;
+    const ms = (v: unknown) => (v ? new Date(v as any).getTime() : NaN);
+    const anchors = [ms(r.finished_at ?? r.updated_at), ms(dep?.finished_at)].filter((x) => Number.isFinite(x));
+    const cpAt = anchors.length ? Math.max(...anchors) : NaN;
+    if (!Number.isFinite(cpAt) || now.getTime() < cpAt + CLAIM_PAYLOAD_SWEEP_CEILING_MS) return null;
   }
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
   // REL MVP: id (semilla del jitter) y clase registrada → misma decisión que el barrido y el lock.
@@ -652,7 +661,8 @@ export function evaluateRunCompletion(
     const c = classes.get(it.key) as ItemCompletionClass;
     if (c === 'not_done' || c === 'unvalidated') {
       const row = rowsByKey.get(it.key);
-      const a = adminActionFor(row, c, now, job);
+      const depKey = row ? claimPayloadDependencyKey(row as any) : null;
+      const a = adminActionFor(row, c, now, job, depKey ? { dep: rowsByKey.get(depKey) ?? null } : undefined);
       push(a);
       if (!a && c === 'not_done' && row && row.status === 'failed') autoPending = true;
     }

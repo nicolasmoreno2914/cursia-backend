@@ -274,6 +274,18 @@ async function pureChecks() {
         error: 'claim_payload_unavailable: VIDEO_YOUTUBE_ID_MISSING: x', output_summary: {}, finished_at: new Date(now.getTime() - minsAgo * 60_000).toISOString() }];
       eq(RC.adminActionFor(cpRow(1)[0], 'not_done', now), null, 'claim incompleto reciente: el barrido lo resuelve');
       eq(RC.adminActionFor(cpRow(31)[0], 'not_done', now)?.code, 'retry_item', 'pasado el techo de 30 min: acción visible');
+      // re-review m5-bis: con la dependencia (video) viva / en vuelo o fallida → sin retry_item aunque pasen horas.
+      for (const st of ['pending', 'running', 'retrying', 'failed']) {
+        eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: { item_key: 'video:ch1', type: 'video', status: st, finished_at: null } }), null, `dependencia ${st}: sin acción`);
+      }
+      // Dependencia completada hace poco: el techo se cuenta desde su fin (no desde el fallo de la parte).
+      const depDone = (minsAgo) => ({ item_key: 'video:ch1', type: 'video', status: 'completed', finished_at: new Date(now.getTime() - minsAgo * 60_000).toISOString() });
+      eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: depDone(5) }), null, 'dependencia recién completada: dentro del techo');
+      eq(RC.adminActionFor(cpRow(180)[0], 'not_done', now, null, { dep: depDone(40) })?.code, 'retry_item', 'dependencia completada hace 40 min y sin resolver: acción visible');
+      const vjob = { id: 'j', status: 'failed', worker_status: 'failed', input_payload: {} };
+      const vm = { items: [{ key: 'video:ch1', type: 'video' }, { key: 'content:x', type: 'video_interactions' }], rulesVersion: 2 };
+      const ev = RC.evaluateRunCompletion(vjob, [...cpRow(180), { id: 'v1', item_key: 'video:ch1', type: 'video', status: 'running', output_summary: {}, finished_at: null }], vm, null, { now });
+      assert(!(ev.adminActions || []).some((x) => x.itemKey === 'content:x'), `evaluateRunCompletion pasa la dependencia: ${JSON.stringify(ev.adminActions)}`);
       const d = RC.evaluateRunCompletion(job, row('contract_x: nope'), m, null, { now });
       eq([d.autoRecovering, d.adminActions.map((x) => x.code)], [undefined, ['retry_item']], 'falla para un humano: sin el flag');
       process.env.DYNAMIC_AUTO_HEAL_ENABLED = 'false';
@@ -308,10 +320,13 @@ async function fakeAnthropic(plan) {
 const like = (pat) => new RegExp('^' + pat.split('%').map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
 function llmWorld(budgetFits, o = {}) {
   const w = { res: new Map(), cps: {}, sent: {}, store: new Map(), budgetCalls: [], released: [] };
+  // r62 (I2-ter): reloj de la DB desfasado respecto del worker (created_at y now() salen de la DB).
+  const dbClock = () => Date.now() + (o.dbSkewMs || 0);
   const unknown = (v) => !v.settled || v.possibleDuplicate;
   w.ds = {
     async query(sql, params) {
       if (sql.includes('as remaining_ms')) return [{ remaining_ms: 0 }];
+      if (sql.includes('select now() as db_now')) return [{ db_now: new Date(dbClock()).toISOString() }];
       if (sql.includes('count(*)::int as n')) {
         const [keyLike, tagLike, , exclude] = params;
         return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && unknown(v) && !exclude.includes(k)).length }];
@@ -327,7 +342,7 @@ function llmWorld(budgetFits, o = {}) {
     },
   };
   w.finops = {
-    async recordCharge(i) { w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false, amount: 0.05, sendMarked: !!i.metadata.sendMarked, at: Date.now() }); return {}; },
+    async recordCharge(i) { w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false, amount: 0.05, sendMarked: !!i.metadata.sendMarked, at: dbClock() }); return {}; },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },
     async settleReservation(key, charge, reason) { const r = w.res.get(key); r.settled = true; r.reason = reason; r.charged = !!charge; if (!charge) w.released.push({ key, reason }); return { finalInserted: !!charge, finalEvent: null }; },
     ...(o.noReconcile ? {} : {
@@ -424,6 +439,27 @@ async function llmChecks() {
     assert(rb.e && rb.e.pendingReview && /eventos ambiguos/.test(rb.e.msg), `B → revisión: ${JSON.stringify(rb.e)}`);
     eq(a.st.requests, 3, 'B no se reenvía');
     await a.close();
+  });
+  await check('re-review I2-ter: el solapamiento usa el reloj de la DB — con el worker atrasado o adelantado 5 s respecto de la DB, A desconocida → reenvío y B desconocida después → revisión igual', async () => {
+    for (const dbSkewMs of [5000, -5000]) {
+      const a = await fakeAnthropic((n) => (n === 1 || n === 3 ? 'drop' : 'ok'));
+      const w = llmWorld(true, { dbSkewMs });
+      const api = w.api(a.url);
+      eq((await err(api('s', 'A'))).v, 'R2', `skew ${dbSkewMs}: A un reenvío`);
+      const rb = await err(api('s', 'B'));
+      assert(rb.e && rb.e.pendingReview && /eventos ambiguos/.test(rb.e.msg), `skew ${dbSkewMs}: B → revisión: ${JSON.stringify(rb.e)}`);
+      eq(a.st.requests, 3, `skew ${dbSkewMs}: B no se reenvía`);
+      await a.close();
+    }
+    // Y dos llamadas solapadas siguen siendo UN evento con el reloj desfasado.
+    for (const dbSkewMs of [5000, -5000]) {
+      const a = await fakeAnthropic((n) => (n <= 2 ? 'drop' : 'ok'));
+      const w = llmWorld(true, { dbSkewMs });
+      const api = w.api(a.url);
+      const out = await Promise.all(['P1', 'P2'].map((p) => err(api('s', p))));
+      assert(out.every((x) => x.v && !x.e), `skew ${dbSkewMs}: solapadas sin revisión: ${JSON.stringify(out.map((x) => x.e))}`);
+      await a.close();
+    }
   });
   await check('re-review m3: markSent lanza (DB) → la reserva se LIBERA (never_sent), no se envía nada y no queda abierta', async () => {
     const a = await fakeAnthropic(() => 'ok');

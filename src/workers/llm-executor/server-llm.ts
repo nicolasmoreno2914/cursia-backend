@@ -273,6 +273,27 @@ export function countUnknownEvents(all: ReadonlyArray<Pick<UnknownReservation, '
 }
 
 /**
+ * r62 (re-review I2-ter): instante de detección con el reloj de la DB (el mismo de `created_at` de las reservas, como
+ * priorAttemptInFlightMs), nunca el del worker: con relojes desfasados el solapamiento se decidiría mal. Si la DB no
+ * responde, se usa el alta de la propia reserva desconocida (más eventos → revisión: falla cerrado).
+ */
+export async function dbNow(ds: DataSource, fallbackReservationKey?: string): Promise<Date> {
+  try {
+    const [r] = await ds.query(`select now() as db_now`);
+    const d = r && r.db_now ? new Date(r.db_now) : null;
+    if (d && Number.isFinite(d.getTime())) return d;
+  } catch { /* abajo */ }
+  if (fallbackReservationKey) {
+    try {
+      const [e] = await ds.query(`select created_at as db_now from public.generation_cost_events where idempotency_key = $1`, [fallbackReservationKey]);
+      const d = e && e.db_now ? new Date(e.db_now) : null;
+      if (d && Number.isFinite(d.getTime())) return d;
+    } catch { /* abajo */ }
+  }
+  return new Date(0);
+}
+
+/**
  * null = se puede (re)intentar; si no, el motivo de dejar la parte en revisión. r62 (I2 / I2-bis): por LLAMADA (≤ 1
  * reenvío), por EVENTO (countUnknownEvents ≤ LLM_UNKNOWN_EVENT_MAX) y tope de respaldo max(4, carriles).
  */
@@ -530,7 +551,7 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         // presupuesto y en el contador de desconocidos).
         notUnknown.delete(resKey);
         deps.logger.warn(`[llm-worker] ${item.itemKey}: resultado DESCONOCIDO (${e.message}); reserva ${resKey} pendiente`);
-        if (!firstUnknownAt) firstUnknownAt = new Date();
+        if (!firstUnknownAt) firstUnknownAt = await dbNow(deps.dataSource, resKey);
         const reason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown], unknownCtx());
         if (reason) {
           throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(reason) } as ApiError;
