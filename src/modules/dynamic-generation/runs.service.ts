@@ -100,6 +100,7 @@ import {
 } from './auto-heal';
 // r62 (N2): conciliación automática de Videogen/Gamma con evidencia del proveedor + reenvío acotado.
 import { PROVIDER_RECONCILE_CODE, PROVIDER_RECONCILE_KEY, ProviderReconcileKind, providerReconcileDecision } from './provider-reconcile';
+import { PROVIDER_STUCK_NO_CANCEL, STUCK_RENDER_RESEND, STUCK_RENDER_RESEND_KEY, VIDEOGEN_RENDER_OVERDUE } from './videogen-render-cap';
 import { FinopsBudgetService, StartBudgetEvaluation } from '../finops/finops-budget.service';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
 import { reservationHasConsultableId, settleAmbiguousAsPossibleDuplicate } from '../finops/ambiguous-resend';
@@ -261,6 +262,11 @@ export interface RunProgress extends StatusCounts {
 }
 
 export interface ItemRunDto {
+  /**
+   * r62 (N2): aviso para quien reintenta (p. ej. `stuck_render_resend`: el render anterior sigue vivo en Videogen y este
+   * reenvío puede pagar un render DOBLE). Solo en la respuesta de retryItem; el FE lo muestra.
+   */
+  warning?: string;
   id: string;
   itemKey: string;
   type: ManifestItemType;
@@ -2558,6 +2564,7 @@ export class RunsService {
     // r62 (resultado pagado perdido): el intento que sigue reenvía algo ya cobrado → sus cargos llevan possible_duplicate.
     let lostResultResend = false;
     let lostResultUnits: { lostChunks: number[]; lostLlm: number } = { lostChunks: [], lostLlm: 0 };
+    let stuckResendWarning: string | null = null;
     const targetId = await this.tx(async (qr) => {
       // I1: lock del curso primero — este reintento puede reabrir el run.
       await this.lockCourseRuns(qr, courseId);
@@ -2743,6 +2750,8 @@ export class RunsService {
       // del retry normal, para que el worker someta de nuevo en vez de
       // reutilizar/quedar envenenado por el marcador anterior.
       let resubmitSetSql = '';
+      // r62 (N2): reenvío de admin sobre un job vencido que Videogen no pudo detener → el render nuevo puede ser DOBLE.
+      let stuckResend: Record<string, unknown> | null = null;
       // V2.1 F2 fix round 1: reenvío EXPLÍCITO de una generación de Gamma cuyo envío quedó ambiguo o falló
       // en Gamma. Archiva el id/marcador (su reserva pendiente sigue en el ledger) y el worker pide una nueva.
       if (resubmitProvider) {
@@ -2796,6 +2805,14 @@ export class RunsService {
             `resubmitVideo solo aplica cuando el último error es "videogen_failed", "ambiguous_video_submission", "videogen_submit_rejected" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,
           );
         }
+        const prc = target.output_summary?.providerReconcile;
+        if (!auto && err.startsWith(VIDEOGEN_RENDER_OVERDUE) && prc?.declined === PROVIDER_STUCK_NO_CANCEL && String(prc?.declinedError ?? '') === err) {
+          // El cargo del render nuevo queda marcado possible_duplicate en el ledger (reserva y cargo final, ver
+          // stuckRenderResendMetadata en el worker).
+          stuckResend = { reason: STUCK_RENDER_RESEND, previousJobId: target.output_summary?.external?.videogenJobId ?? null, at: (auto?.now ?? new Date()).toISOString(), by: actorId };
+          stuckResendWarning = `${STUCK_RENDER_RESEND}: el render anterior de Videogen (${String(stuckResend.previousJobId ?? '?')}) sigue procesando y no se pudo cancelar; ` +
+            'este reenvío puede pagar un render DOBLE (el anterior puede terminar y cobrar). El cargo nuevo queda marcado possible_duplicate.';
+        }
         this.logger.warn(
           `retryItem: resubmitVideo=true para item "${itemKey}" (run ${job.id}) — error previo "${err}"; ` +
             'archivando external/externalSubmitStartedAt en previousExternals y sometiendo un video nuevo',
@@ -2804,6 +2821,7 @@ export class RunsService {
         // r62 (N2, re-review m-n1): job nuevo → sin el último estado del anterior; un reenvío MANUAL limpia además el
         // estado de conciliación del error anterior (la automática lo reemplaza con el suyo).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince' - 'videogenLastStatus'`
+          + (stuckResend ? '' : ` - '${STUCK_RENDER_RESEND_KEY}'`)
           + (auto ? '' : manualResubmitReconcileSql());
       }
 
@@ -2918,7 +2936,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(topExtra), lostResultResend, JSON.stringify(lostResultUnits)],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), lostResultResend, JSON.stringify(lostResultUnits)],
         ),
       );
       if (updated.length !== 1) {
@@ -2990,7 +3008,8 @@ export class RunsService {
       if (r.failed.length) this.logger.warn(`retryItem: no se pudo liquidar ${r.failed.map((f) => f.key).join(', ')} del intento previo de ${itemKey} (${r.failed[0].error}); siguen contadas como gasto`);
     }
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
-    return this.toItemDto(row, frozenDelivery);
+    const dto = this.toItemDto(row, frozenDelivery);
+    return stuckResendWarning ? { ...dto, warning: stuckResendWarning } : dto;
   }
 
   /** R16 (#2): último motivo logueado por item (evita repetir el mismo "no se reabre" en cada barrido). */

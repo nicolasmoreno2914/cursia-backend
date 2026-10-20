@@ -787,7 +787,10 @@ export function currentRecoveryOf(
   // #583: va ANTES de la deny-list (la deny-list describe justamente este caso incierto; la función de
   // auto-heal aplica su propia deny-list reducida).
   if (ambiguousAudioResubmitDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date()).heal) return 'ambiguous_audio_resubmit';
-  if (providerReconcileDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date()).heal) return 'provider_reconcile';
+  // r62 (N2, E2E): también mientras el barrido espera su próxima consulta (p. ej. confirmando un cancel con dos lecturas):
+  // el sistema está trabajando, no es «manual».
+  { const pd = providerReconcileDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date());
+    if (pd.heal === true || pd.reason === 'backoff') return 'provider_reconcile'; }
   const denied = AUTO_HEAL_DENY_PATTERNS.some((re) => re.test(e));
   const safe = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(e) && (!itemType || itemType === r.type));
   if (safe && !denied && safe.requires(os, e)) return 'safe_auto_retry';

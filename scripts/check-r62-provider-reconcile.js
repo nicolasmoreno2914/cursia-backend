@@ -558,6 +558,15 @@ async function dbChecks() {
       // El reintento de admin ya no es un 409 (la parte está failed): reenvío explícito con aviso.
       const it = await runs.retryItem(V2.cid, OWNER, 1, V2.runId, v2key, true, false, undefined, { email: 'admin@cursia.test' });
       eq(it.status, 'pending', 'reintento de admin disponible');
+      assert(typeof it.warning === 'string' && /^stuck_render_resend: .*DOBLE/.test(it.warning), `aviso en la respuesta de retryItem: ${it.warning}`);
+      eq((await latest(V2.runId, v2key)).output_summary.stuckRenderResend.reason, 'stuck_render_resend', 'marca del reenvío sobre un render vivo');
+      // E2E: el render nuevo (el job viejo sigue vivo) queda marcado possible_duplicate en la reserva y en el cargo final.
+      fakes.vg.plan.push({ kind: 'ok', jobId: 'vg-stuck-1-resend', statuses: ['completed_local'], cost: 0.97 });
+      const s = await runVideo(V2);
+      eq(s.st.completed.length, 1, `render nuevo completo ${JSON.stringify(s.st.failed)}`);
+      const fresh = (await events(V2.runId)).filter((e) => e.provider === 'videogen' && e.event_kind === 'CHARGE' && e.metadata.possible_duplicate === true);
+      eq(fresh.map((e) => [e.metadata.reservation === true, e.metadata.possibleDuplicateReason, e.metadata.previousVideogenJobId]).sort(),
+        [[false, 'stuck_render_resend', 'vg-stuck-1'], [true, 'stuck_render_resend', 'vg-stuck-1']], 'reserva y cargo final del render doble marcados possible_duplicate');
       await ledgerWithinAuthorized(V2.runId);
     });
     const V2q = await makeCourse('r62 job encolado eterno');
@@ -569,6 +578,22 @@ async function dbChecks() {
       eq([r1.resubmitted.filter((x) => x.runId === V2q.runId).length, fakes.vg.cancels - can0], [0, 1], `cancelación pedida ${JSON.stringify(r1)}`);
       const r2 = await sweepAt(5 + 300);
       eq(r2.resubmitted.filter((x) => x.runId === V2q.runId).length, 0, 'dentro de los 10 min no se decide');
+      // E2E: mientras confirma el cancel (dos lecturas), la vista dice que el sistema está trabajando, no «manual».
+      const vq = L('modules/dynamic-generation/item-recovery-view.js').recoveryViewOf(await latest(V2q.runId, v2qkey));
+      eq(vq.currentRecovery, 'provider_reconcile', 'currentRecovery durante la confirmación del cancel');
+      // Run detenido (todo listo salvo este video y sus preguntas): needs_attention SIN acciones, recuperándose solo.
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now(), output_summary = coalesce(output_summary, '{}'::jsonb) || '{"v3Validation":{"artifactType":"fixture"}}'::jsonb
+                      where job_id = $1 and item_key = $2`, [V2q.runId, `presentation:${V2q.c1}`]);
+      await ds.query(`update public.production_jobs set status = 'failed', worker_status = 'failed' where id = $1`, [V2q.runId]);
+      try {
+        const cq = await completionOf(V2q);
+        eq([cq.state, (cq.adminActions || []).length], ['needs_attention', 0], `sin acción de admin mientras confirma ${JSON.stringify(cq.adminActions)}`);
+        // autoRecovering (r62 N1) existe en la integración; en esta rama sola puede no estar.
+        const rcSrc = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/run-completion.ts'), 'utf8');
+        if (/autoRecovering/.test(rcSrc)) eq(cq.autoRecovering, true, 'autoRecovering del run durante la confirmación del cancel');
+      } finally {
+        await ds.query(`update public.production_jobs set status = 'running', worker_status = 'running' where id = $1`, [V2q.runId]);
+      }
       const r3 = await sweepAt(5 + PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 30);
       eq(r3.resubmitted.filter((x) => x.runId === V2q.runId).length, 0, 'primera lectura del costo 0');
       const r4 = await sweepAt(5 + 2 * PR.PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS + 60);

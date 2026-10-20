@@ -48,7 +48,7 @@ import {
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService, ITEM_RECOVERY_BUDGET_REASON, RUN_PAUSED_GUARD_REASON } from '../modules/finops/finops-budget.service';
 import { itemRecoveryBudgetMessage } from '../modules/finops/run-spend-guard';
-import { DYNAMIC_VIDEOGEN_MAX_RENDER_MS_DEFAULT, videogenMaxRenderMs, videogenRenderOverdueMessage } from '../modules/dynamic-generation/videogen-render-cap';
+import { DYNAMIC_VIDEOGEN_MAX_RENDER_MS_DEFAULT, stuckRenderResendMetadata, videogenMaxRenderMs, videogenRenderOverdueMessage } from '../modules/dynamic-generation/videogen-render-cap';
 import {
   RunBudgetCapReached,
   WorkerBudget,
@@ -770,6 +770,8 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           resKey = await reservePaidCall(deps.finops, {
             kind: 'videogen', ownerId: runHead.ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1,
             itemAttempt: item.attempt, tag: 'submit', estimate: {},
+            // r62 (N2): reenvío justificado sobre un render vivo (provider_stuck_no_cancel) → la reserva queda possible_duplicate.
+            metadata: stuckRenderResendMetadata(item.outputSummary),
           });
         } catch (e) {
           if (!(e instanceof RunBudgetCapReached)) throw e;

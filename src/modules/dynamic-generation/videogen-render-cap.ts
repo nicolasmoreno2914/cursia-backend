@@ -29,3 +29,18 @@ export function videogenRenderOverdueMessage(jobId: string, status: string | nul
     `(tope ${h(capMs)}, ${DYNAMIC_VIDEOGEN_MAX_RENDER_MS_ENV}). No se reenvía solo con el job vivo (posible render doble pagado); ` +
     `la conciliación lo cancela si sigue encolado o deja la excepción explícita.`;
 }
+
+/**
+ * r62 (N2, E2E): reenvío de admin justificado sobre `provider_stuck_no_cancel`. El render nuevo puede ser DOBLE (el
+ * anterior sigue vivo): retryItem deja `output_summary.stuckRenderResend` y el worker marca la reserva y el cargo final
+ * del job nuevo con `possible_duplicate` + este motivo.
+ */
+export const STUCK_RENDER_RESEND = 'stuck_render_resend';
+export const STUCK_RENDER_RESEND_KEY = 'stuckRenderResend';
+
+/** Metadata del ledger para el render nuevo de un reenvío sobre un job vivo (null si no aplica). */
+export function stuckRenderResendMetadata(outputSummary: Record<string, any> | null | undefined): Record<string, unknown> | null {
+  const s = outputSummary?.[STUCK_RENDER_RESEND_KEY];
+  if (!s || typeof s !== 'object' || s.reason !== STUCK_RENDER_RESEND) return null;
+  return { possible_duplicate: true, possibleDuplicateReason: STUCK_RENDER_RESEND, previousVideogenJobId: s.previousJobId ?? null, stuckResendBy: s.by ?? null };
+}
