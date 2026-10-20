@@ -612,6 +612,8 @@ jobs:
                # verificado solo lectura 2026-10-20). 200000000 queda bajo el limite sea MB o MiB. Lo usan la
                # proyeccion antes de generar y el worker de empaque antes de subir (default del codigo: 50 MB).
                ensure_env_exact STORAGE_MAX_UPLOAD_BYTES 200000000
+               # r61: el tope propio del .mbz debe ser <= STORAGE_MAX_UPLOAD_BYTES (si no, PACKAGE_SIZE_CONFIG_INVALID); se alinea al mismo valor.
+               ensure_env_exact PACKAGE_MBZ_MAX_BYTES 200000000
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
