@@ -147,6 +147,21 @@ async function pureChecks() {
     eq([F.BREAKER_RATIO, F.BREAKER_MIN_SLACK_USD], [1.5, 3], 'constantes del disyuntor intactas');
   });
 
+  await check('puro (M4): el deploy de staging registra UNA versión con el marcador de la semántica r62 (auditoría); idempotente', () => {
+    const SBP = require(path.join(REPO, 'scripts/staging-budget-policy.js'));
+    const cur = { scope: 'global', scope_id: null, version: 7, limits: { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCapStaging: '162' }, on_exceed: 'ADMIN_APPROVAL', require_human_approval_for_real_spend: true };
+    const p1 = SBP.withApprovalSemantics(cur, SBP.planPolicy(cur));
+    eq([p1.action, p1.semanticsOnly, p1.row.version, p1.row.limits.approvalSemantics], ['insert', true, 8, SBP.APPROVAL_SEMANTICS], 'versión de auditoría');
+    eq({ ...p1.row.limits, approvalSemantics: undefined }, { ...cur.limits, approvalSemantics: undefined }, 'límites iguales');
+    assert(/r62/.test(p1.row.created_by) && /autorización única/.test(p1.row.created_by), p1.row.created_by);
+    const after = { ...cur, version: 8, limits: p1.row.limits };
+    eq(SBP.withApprovalSemantics(after, SBP.planPolicy(after)).action, 'noop', 'idempotente');
+    const p2 = SBP.withApprovalSemantics(cur, SBP.planPolicy({ ...cur, limits: { ...cur.limits, maxCostPerRun: '10' } }));
+    eq([p2.action, p2.row.limits.approvalSemantics], ['insert', SBP.APPROVAL_SEMANTICS], 'una versión con cambio de límites lleva el marcador');
+    eq(SBP.withApprovalSemantics(null, SBP.planPolicy(null)).action, 'none', 'sin política no inventa');
+    eq(F.decideRunBudget({ estimate: est('2', '5', '9', { gamma: { min: '1', expected: '2', max: '4' } }), policy: rowPolicy(p1.row.limits), paidRealProviders: ['gamma'] }).decision, 'AUTO_WITHIN_POLICY', 'el marcador no cambia la decisión');
+  });
+
   await check('puro (d12): parsePolicyUpdate valida scope/scopeId/limits/onExceed/flag/reason; planPolicyUpdate = parche append-only (versión+1, null quita, noop, auditoría en created_by)', () => {
     const P = (b) => F.parsePolicyUpdate(b);
     throwsCode(() => P({ scope: 'institution', reason: 'motivo largo', limits: { maxCostPerRun: 1 } }), 'INVALID_INPUT', 'scope no soportado');
@@ -155,6 +170,13 @@ async function pureChecks() {
     throwsCode(() => P({ scope: 'global', scopeId: '1', reason: 'motivo largo', limits: { maxCostPerRun: 1 } }), 'INVALID_INPUT', 'global sin scopeId');
     throwsCode(() => P({ scope: 'global', reason: 'motivo largo', limits: { maxCostPerRun: -1 } }), 'INVALID_INPUT', 'negativo');
     throwsCode(() => P({ scope: 'global', reason: 'motivo largo', limits: { maxCostPerRun: 'mucho' } }), 'INVALID_INPUT', 'no decimal');
+    // Review I1: notación científica / NaN / Infinity / más de 10 decimales se rechazan; se guarda el decimal normalizado.
+    for (const v of [1e-20, 1e21, '1e3', NaN, Infinity, '0.12345678901', ' ', '1,5', '+3']) {
+      throwsCode(() => P({ scope: 'global', reason: 'motivo largo', limits: { maxCostPerRun: v } }), 'INVALID_INPUT', `valor ${String(v)}`);
+    }
+    eq(P({ scope: 'global', reason: 'motivo largo', limits: { maxCostPerRun: '106.50', maxCostPerCourse: 75.5, monthlyCap: '0162' } }).limits,
+      { maxCostPerRun: '106.5', maxCostPerCourse: '75.5', monthlyCap: '162' }, 'decimal normalizado (lo que el evaluador relee)');
+    for (const v of Object.values(P({ scope: 'global', reason: 'motivo largo', limits: { maxCostPerRun: '0.0000000001', maxCostPerCourse: 100000 } }).limits)) F.normalizeDecimal(v);
     throwsCode(() => P({ scope: 'global', reason: 'motivo largo', limits: { maxCostPerRun: '100001' } }), 'INVALID_INPUT', 'cota de cordura');
     throwsCode(() => P({ scope: 'global', reason: 'motivo largo', limits: { inventado: 1 } }), 'INVALID_INPUT', 'tope desconocido');
     throwsCode(() => P({ scope: 'global', reason: 'motivo largo', limits: { requireHumanApprovalForRealSpend: true } }), 'INVALID_INPUT', 'flag dentro de limits');
@@ -532,7 +554,7 @@ async function dbChecks() {
       const guards = Reflect.getMetadata('__guards__', FinopsAdminController) || [];
       assert(guards.includes(SuperAdminGuard), 'SuperAdminGuard en FinopsAdminController');
       const D = await makeCourse('Política por endpoint');
-      await rejectsRe(admin.updateBudgetPolicy({ scope: 'course', scopeId: String(D.cid), limits: { maxCostPerRun: -3 }, reason: 'negativo no' }, ADMIN), /maxCostPerRun: número inválido/, 'validación', 400);
+      await rejectsRe(admin.updateBudgetPolicy({ scope: 'course', scopeId: String(D.cid), limits: { maxCostPerRun: -3 }, reason: 'negativo no' }, ADMIN), /maxCostPerRun: decimal inválido/, 'validación', 400);
       await rejectsRe(admin.updateBudgetPolicy({ scope: 'course', scopeId: '999999', limits: EP, reason: 'curso inexistente' }, ADMIN), /no existe el curso/, 'curso', 404);
       await rejectsRe(admin.updateBudgetPolicy({ scope: 'course', scopeId: String(D.cid), limits: { maxCostPerRun: '5' }, reason: 'sin los tres topes' }, ADMIN), /necesita maxCostPerRun/, 'nueva sin topes', 400);
       const r1 = await admin.updateBudgetPolicy({ scope: 'course', scopeId: String(D.cid), limits: EP, reason: 'alta del cliente (r62)' }, ADMIN);
@@ -558,6 +580,117 @@ async function dbChecks() {
       eq([eff2.policy.version, eff2.singleUserAuthorization, eff2.caps.missing], [3, true, []], 'v3 → autorización única');
       await rejectsRe(admin.budgetPolicies('institution', '1'), /scope inválido/, 'GET scope', 400);
     });
+
+    // ════ Review r62: IDOR, carrera, TOCTOU del bind (M1), 409 de versión, I2 (fromRun) ════
+    await check('REVIEW IDOR: otra cuenta no puede previsualizar ni firmar el curso ajeno (404, sin run ni filas); la huella de un curso no sirve en otro (estimate_stale)', async () => {
+      const X = await makeCourse('IDOR');
+      await coursePolicy(X.cid, BIG);
+      const OTHER = { id: '99999999-2222-4333-8444-555555555555', email: 'otro@cliente.test' };
+      process.env.DYNAMIC_REAL_VIDEO_OWNERS = OWNER;
+      await rejectsRe(runs.previewStart(X.cid, OTHER, 1, NCTX), /./, 'preview ajeno', 404);
+      const pvX = await runs.previewStart(X.cid, USER, 1, NCTX);
+      await rejectsRe(runs.approveAndStart(X.cid, OTHER, 1, NCTX, pvX.estimateHash), /./, 'firma ajena', 404);
+      eq([await runCount(X.cid), (await authRows(X.cid)).length], [0, 0], 'sin run ni filas');
+      const Y = await makeCourse('Replay');
+      await coursePolicy(Y.cid, BIG);
+      await rejectsRe(runs.approveAndStart(Y.cid, USER, 1, NCTX, pvX.estimateHash), /estimate_stale/, 'replay a otro curso', 409);
+      eq(await runCount(Y.cid), 0, 'sin run Y');
+    });
+
+    await check('REVIEW M7 carrera: 8 «Autorizar y generar» en paralelo con un mes para ~2,5 máximos → arrancan los que entran (la firma no queda «vieja» por el gasto de los otros), el resto 409 budget_blocked con el límite mensual; nunca estimate_stale; el comprometido no supera el tope', async () => {
+      const N = 8;
+      const Ks = [];
+      for (let i = 0; i < N; i++) Ks.push(await makeCourse('Carrera ' + i));
+      await coursePolicy(Ks[0].cid, BIG);
+      const max = dec((await runs.previewStart(Ks[0].cid, USER, 1, NCTX)).estimate.max);
+      const m0 = await budget.monthCommitted();
+      const cap = (dec(m0.total) + max * 2.5).toFixed(6);
+      for (const [i, K] of Ks.entries()) {
+        await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, $2, $3::jsonb, 'ADMIN_APPROVAL')`,
+          [String(K.cid), i === 0 ? 2 : 1, JSON.stringify({ maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: cap })]);
+      }
+      const pvs = [];
+      for (const K of Ks) pvs.push(await runs.previewStart(K.cid, USER, 1, NCTX));
+      assert(pvs.every((p) => p.approval.mode === 'user' && p.approval.withinPolicy), 'todos firmables antes de la carrera');
+      const res = await Promise.allSettled(Ks.map((K, i) => runs.approveAndStart(K.cid, USER, 1, NCTX, pvs[i].estimateHash)));
+      const ok = res.filter((r) => r.status === 'fulfilled' && r.value.created);
+      const codes = res.filter((r) => r.status === 'rejected').map((r) => (r.reason.getResponse && r.reason.getResponse().code) || r.reason.message.slice(0, 60));
+      assert(ok.length === 2, `creados ${ok.length} (${codes.join(' | ')})`);
+      assert(codes.length === N - 2 && codes.every((c) => c === 'budget_blocked'), `rechazos: ${codes.join(' | ')}`);
+      const blocked = res.find((r) => r.status === 'rejected').reason.getResponse();
+      assert(blocked.blockedBy.some((b) => b.limit === 'monthlyCap'), JSON.stringify(blocked.blockedBy));
+      assert(dec((await budget.monthCommitted()).total) <= dec(cap) + 1e-9, 'comprometido ≤ tope');
+    });
+
+    await check('REVIEW M1: la política cambia ENTRE el preview y la tx (flag explícito de admin) → el bind relee la política en la tx y rechaza la firma (estimate_stale), sin run ni filas', async () => {
+      const T = await makeCourse('TOCTOU');
+      await coursePolicy(T.cid, BIG);
+      const pv = await runs.previewStart(T.cid, USER, 1, NCTX);
+      const orig = runs.normalPlan;
+      let once = true;
+      runs.normalPlan = async function (runner, ...rest) {
+        if (once && runner !== ds) {
+          once = false;
+          await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 2, $2::jsonb, 'ADMIN_APPROVAL')`,
+            [String(T.cid), JSON.stringify({ ...BIG, requireHumanApprovalForRealSpend: true })]);
+        }
+        return orig.call(this, runner, ...rest);
+      };
+      try {
+        await rejectsRe(runs.approveAndStart(T.cid, USER, 1, NCTX, pv.estimateHash), /estimate_stale.*(versión nueva|requiere un administrador)/, 'TOCTOU', 409);
+      } finally { runs.normalPlan = orig; }
+      eq([await runCount(T.cid), (await authRows(T.cid)).length], [0, 0], 'sin run ni filas');
+    });
+
+    await check('REVIEW d12: 409 policy_version_conflict ante una carrera de versiones (índice único); I1: un tope válido nunca deja la política ilegible', async () => {
+      const dup = new FinopsAdminController(ledger, { updatePolicy: async () => { throw Object.assign(new Error('duplicate key value violates unique constraint'), { code: '23505' }); } });
+      await rejectsRe(dup.updateBudgetPolicy({ scope: 'global', limits: BIG, reason: 'carrera' }, ADMIN), /policy_version_conflict/, 'carrera', 409);
+      const Z = await makeCourse('Poison');
+      await rejectsRe(admin.updateBudgetPolicy({ scope: 'course', scopeId: String(Z.cid), limits: { maxCostPerRun: 1e-20, maxCostPerCourse: '10', monthlyCap: '10' }, reason: 'notación científica' }, ADMIN), /decimal inválido/, '1e-20', 400);
+      const r = await admin.updateBudgetPolicy({ scope: 'course', scopeId: String(Z.cid), limits: { maxCostPerRun: 0.5, maxCostPerCourse: '1000.50', monthlyCap: '99999.9900' }, reason: 'decimales válidos' }, ADMIN);
+      eq([r.policy.limits.maxCostPerRun, r.policy.limits.maxCostPerCourse, r.policy.limits.monthlyCap], ['0.5', '1000.5', '99999.99'], 'normalizado');
+      const pv = await runs.previewStart(Z.cid, USER, 1, NCTX);
+      assert(pv.decision && pv.estimate, 'la política sigue legible (sin 503)');
+    });
+
+    await check('REVIEW I2: run B desde fromRun dentro de la política → preview con huella y monto (mode user); POST {fromRun} sin firma → 409 user_authorization_required; {fromRun, estimateHash} de un NO admin → run B con la firma AUTO_WITHIN_POLICY (planSha en el estimado) que cubre proveedores pagados; huella vieja → estimate_stale', async () => {
+      const Fr = await makeCourse('Run B firmado');
+      await coursePolicy(Fr.cid, BIG);
+      const pvA = await runs.previewStart(Fr.cid, USER, 1, NCTX);
+      const runAid = (await runs.approveAndStart(Fr.cid, USER, 1, NCTX, pvA.estimateHash)).run.id;
+      await ds.query(`update public.production_jobs set status = 'completed', worker_status = 'completed', finished_at = now() where id = $1`, [runAid]);
+      // Blueprint 2: un capítulo NUEVO (presentación + audiolibro nuevos = Gamma/TTS reales) y C2 renombrado.
+      const [m1] = await ds.query(`select id from public.course_modules where course_id = $1`, [Fr.cid]);
+      const chs = await ds.query(`select id, position, title, video_enabled, activity_enabled from public.course_chapters where course_id = $1 order by position`, [Fr.cid]);
+      const c3 = crypto.randomUUID();
+      const s2 = snap.buildBlueprintSnapshotV2({ id: Fr.cid, title: 'Run B firmado', finalExam: true, activityEngine: 'h5p' },
+        [{ id: m1.id, position: 0, title: 'M1', objective: null, exam_enabled: true }],
+        [...chs.map((c) => ({ id: c.id, module_id: m1.id, position: c.position, title: c.position === 1 ? 'C2 revisado' : c.title, objective: null, video_enabled: c.video_enabled, activity_enabled: c.activity_enabled })),
+          { id: c3, module_id: m1.id, position: 2, title: 'C3', objective: null, video_enabled: false, activity_enabled: false }]);
+      await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled) values ($1, $2, $3, 2, 'C3', false, false)`, [c3, Fr.cid, m1.id]);
+      await ds.query(`insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
+                      values ($1, 2, 2, $2::jsonb, $3, 1, 1, 3)`, [Fr.cid, snap.canonicalJsonV2(s2), snap.snapshotSha256V2(s2)]);
+      await manifests.getOrCreate(Fr.cid, OWNER, 2);
+      const pv = await runs.previewFromRun(Fr.cid, USER, 2, runAid);
+      eq([pv.existingRun, pv.decision, pv.approval.mode, pv.approval.userAuthorizationRequired, pv.approval.withinPolicy], [null, 'AUTO_WITHIN_POLICY', 'user', true, true], 'preview del run B');
+      assert(/^[0-9a-f]{64}$/.test(pv.estimateHash) && dec(pv.approval.amount) >= dec(pv.estimate.expected) && pv.planSha256, 'huella + monto + planSha');
+      assert(pv.paidRealProviders.length > 0, 'gasto pagado nuevo');
+      await rejectsRe(runs.startRun(Fr.cid, OWNER, 2, { fromRun: runAid }), /user_authorization_required/, 'sin firma', 409);
+      await rejectsRe(runs.startRun(Fr.cid, OWNER, 2, { fromRun: runAid, estimateHash: 'f'.repeat(64) }, { signer: USER }), /estimate_stale/, 'huella vieja', 409);
+      const res = await runs.startRun(Fr.cid, OWNER, 2, { fromRun: runAid, estimateHash: pv.estimateHash }, { signer: USER });
+      assert(res.created && res.invalidation && res.invalidation.fromRunId === runAid, 'run B creado');
+      const rows = await ds.query(`select a.id, a.run_id, a.decision, a.approved_by, a.reason, a.authorized_budget::text b, e.invalidation_plan_sha as sha
+                                     from public.cost_budget_authorizations a left join public.cost_estimates e on e.id = a.estimate_id
+                                    where a.course_id = $1 and (a.run_id = $2 or (a.run_id is null and a.reason = $3)) order by a.created_at, (a.run_id is not null)`,
+        [Fr.cid, res.run.id, `user_authorized_within_policy:${pv.estimateHash}`]);
+      eq(rows.map((x) => [x.decision, x.run_id === null, x.approved_by]), [['AUTO_WITHIN_POLICY', true, 'docente@cliente.test'], ['AUTO_WITHIN_POLICY', false, 'docente@cliente.test']], 'firma + vinculada');
+      eq(rows[1].reason, `bound_from:${rows[0].id}`, 'vinculada');
+      eq(dec(await budget.runPaidAuthorizedBudget(res.run.id)), dec(pv.approval.amount), 'cubre proveedores pagados del run B');
+      const again = await runs.startRun(Fr.cid, OWNER, 2, { fromRun: runAid, estimateHash: pv.estimateHash }, { signer: USER });
+      eq([again.created, again.run.id], [false, res.run.id], 'idempotente (mismo B, sin firmas nuevas)');
+      eq((await runs.previewFromRun(Fr.cid, USER, 2, runAid)).existingRun.id, res.run.id, 'preview con B existente');
+    });
+
   } finally {
     if (ds && ds.isInitialized) await ds.destroy().catch(() => {});
     for (const [k, v] of Object.entries(saved)) {

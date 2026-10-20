@@ -894,7 +894,7 @@ async function dbChecks() {
       setReady();
       const K = await makeCourse(title, { videos });
       const mode = videos ? 'real' : 'mock';
-      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode }), /^(budget_approval_required|user_authorization_required)/, `aprobación ${title}`, 409); // r62: con los 3 topes = firma única; la aprobación de admin del estimado sigue cubriendo
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode }), (await budget.policyFor(K.cid, OWNER)) ? /^user_authorization_required/ : /^budget_approval_required/, `aprobación ${title}`, 409); // r62: con política (la global de #583 tiene los 3 topes) = firma única; sin política = admin. La aprobación de admin del estimado sigue cubriendo
       await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
       const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: mode })).run.id;
       await seedDependency(rid, `content:${K.c1}`, 'dynamic_content_md', CONTENT_MD('Bombas'), 'text/markdown');
@@ -921,7 +921,7 @@ async function dbChecks() {
     async function freshLongWelcomeRun(title) {
       setReady();
       const K = await makeCourse(title, { videos: false });
-      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /^(budget_approval_required|user_authorization_required)/, `aprobación ${title}`, 409); // r62: con los 3 topes = firma única; la aprobación de admin del estimado sigue cubriendo
+      const e = await rejectsRe(runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), (await budget.policyFor(K.cid, OWNER)) ? /^user_authorization_required/ : /^budget_approval_required/, `aprobación ${title}`, 409); // r62: con política (la global de #583 tiene los 3 topes) = firma única; sin política = admin. La aprobación de admin del estimado sigue cubriendo
       await budget.adminAuthorize({ courseId: K.cid, estimateId: e.getResponse().estimateId, authorizedBudget: '500', approvedBy: 'admin@cursia.test' });
       const rid = (await runs.startRun(K.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' })).run.id;
       await seedDependency(rid, `course_intro:${K.cid}`, 'dynamic_course_intro_json', JSON.stringify({ welcome: LONG_WELCOME }), 'application/json');
@@ -1396,7 +1396,7 @@ async function dbChecks() {
       assert(r.status === 0 && /nueva versión con por generación 106, por curso 106 y mensual 162/.test(r.stdout), `1.ª corrida: ${r.stdout}${r.stderr}`);
       let rows = (await pols()).filter((x) => x.scope === 'global');
       const top = rows[rows.length - 1];
-      eq([top.version, top.limits, top.on_exceed, top.require_human_approval_for_real_spend], [g0 + 2, { maxCostPerRun: '106', maxCostPerCourse: '106', monthlyCapStaging: '162', maxCostPerProvider: { gamma: '4' } }, 'ADMIN_APPROVAL', true], 'versión nueva, resto igual');
+      eq([top.version, top.limits, top.on_exceed, top.require_human_approval_for_real_spend], [g0 + 2, { maxCostPerRun: '106', maxCostPerCourse: '106', approvalSemantics: 'r62_single_authorization', monthlyCapStaging: '162', maxCostPerProvider: { gamma: '4' } }, 'ADMIN_APPROVAL', true], 'versión nueva, resto igual');
       eq(rows[rows.length - 2].limits.maxCostPerRun, '10', 'la versión anterior no se toca (inmutable)');
       r = runPolicy(OWNER_STG);
       assert(r.status === 0 && /ya tiene los límites aprobados/.test(r.stdout), `2.ª corrida: ${r.stdout}${r.stderr}`);
@@ -1407,7 +1407,7 @@ async function dbChecks() {
       r = runPolicy(OWNER_STG);
       assert(r.status === 0, r.stderr);
       const own = (await pols()).filter((x) => x.scope === 'owner');
-      eq(own.map((x) => [x.version, x.limits, x.on_exceed]), [[1, { maxCostPerRun: 12, maxCostPerCourse: 30 }, 'BLOCK'], [2, { maxCostPerRun: 106, maxCostPerCourse: 106, monthlyCapStaging: '162' }, 'BLOCK']], 'owner versionado (tipo numérico conservado)');
+      eq(own.map((x) => [x.version, x.limits, x.on_exceed]), [[1, { maxCostPerRun: 12, maxCostPerCourse: 30 }, 'BLOCK'], [2, { maxCostPerRun: 106, maxCostPerCourse: 106, approvalSemantics: 'r62_single_authorization', monthlyCapStaging: '162' }, 'BLOCK']], 'owner versionado (tipo numérico conservado)');
       eq((await pols()).filter((x) => x.scope === 'global').length, rows.length, 'global intacta');
       // El presupuesto se sigue validando: la política nueva es la que ve el gate (sin aprobaciones automáticas).
       const pf = await budget.policyFor(999999, OWNER_STG);
@@ -1419,14 +1419,14 @@ async function dbChecks() {
       r = runPolicyEnv(OWNER_STG, T8ENV);
       assert(r.status === 0 && /nueva versión con por generación 110, por curso 110 y mensual 2500/.test(r.stdout), `T8 override: ${r.stdout}${r.stderr}`);
       let own2 = (await pols()).filter((x) => x.scope === 'owner');
-      eq([own2[own2.length - 1].version, own2[own2.length - 1].limits], [3, { maxCostPerRun: 110, maxCostPerCourse: 110, monthlyCapStaging: '2500' }], 'T8: versión nueva con los valores del .env');
+      eq([own2[own2.length - 1].version, own2[own2.length - 1].limits], [3, { maxCostPerRun: 110, maxCostPerCourse: 110, approvalSemantics: 'r62_single_authorization', monthlyCapStaging: '2500' }], 'T8: versión nueva con los valores del .env');
       r = runPolicyEnv(OWNER_STG, T8ENV);
       assert(r.status === 0 && /ya tiene los límites aprobados \(110 \/ 110 \/ 2500\)/.test(r.stdout), `T8 2.ª corrida: ${r.stdout}${r.stderr}`);
       eq((await pols()).filter((x) => x.scope === 'owner').length, own2.length, 'T8: idempotente con el override');
       // Sin las variables vuelve a los defaults (106/106/162): el código nunca sube ni baja los valores por sí solo.
       r = runPolicy(OWNER_STG);
       own2 = (await pols()).filter((x) => x.scope === 'owner');
-      eq([r.status, own2[own2.length - 1].limits], [0, { maxCostPerRun: 106, maxCostPerCourse: 106, monthlyCapStaging: '162' }], 'T8: sin override → defaults');
+      eq([r.status, own2[own2.length - 1].limits], [0, { maxCostPerRun: 106, maxCostPerCourse: 106, approvalSemantics: 'r62_single_authorization', monthlyCapStaging: '162' }], 'T8: sin override → defaults');
       r = runPolicyEnv(OWNER_STG, { STAGING_BUDGET_MONTHLY_CAP: '-1' });
       assert(r.status === 1 && /STAGING_BUDGET_MONTHLY_CAP inválido/.test(r.stderr), `T8 inválido: ${r.stderr}`);
       eq((await pols()).filter((x) => x.scope === 'owner').length, own2.length, 'T8: inválido no inserta');

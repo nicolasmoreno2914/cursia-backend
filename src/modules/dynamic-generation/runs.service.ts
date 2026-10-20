@@ -117,8 +117,8 @@ import {
 } from '../finops/run-budget';
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
-import { addDec, cmpDec, normalizeDecimal } from '../finops/decimal';
-import { runtimeGuard, SpentSoFar } from '../finops/budget';
+import { addDec, cmpDec, normalizeDecimal, subDec } from '../finops/decimal';
+import { BudgetPolicy, policySpendCaps, runtimeGuard, SpentSoFar } from '../finops/budget';
 import { MONTH_CAP_LOCK } from '../finops/finops-budget.service';
 import type { EstimateResult, MinExpMax } from '../finops/estimator';
 import { assertAssessmentProfileResolvableForRun } from '../course-profiles/assessment-preflight';
@@ -634,6 +634,30 @@ export interface NormalApprovalRequest {
    * 'admin' (default) = aprobación ADMIN_APPROVED de un SuperAdmin (fuera de la política / política que la exige).
    */
   kind?: 'admin' | 'user';
+  /** r62 (I2): run B desde un plan de invalidación: el plan que vio el usuario (si cambió → estimate_stale). */
+  planSha?: string | null;
+}
+
+/** r62 (I2): firma del usuario de un run B (`fromRun` + `estimateHash`). */
+export interface FromRunSignature {
+  estimateHash: string;
+  user: { id: string; email?: string | null };
+}
+
+/** r62 (I2): preview del presupuesto de aplicar un plan de invalidación (POST …/runs/from-run-preview). */
+export interface FromRunPreview {
+  fromRunId: string;
+  manifestId: number;
+  planSha256: string | null;
+  existingRun: { id: string } | null;
+  estimate: StartPreview['estimate'];
+  decision: string | null;
+  reasons: string[];
+  paidRealProviders: string[];
+  approval: StartPreview['approval'];
+  policy: StartPreview['policy'];
+  estimateHash: string | null;
+  _plan?: NormalApprovalPlan;
 }
 
 type FinopsGate = { evaluation: StartBudgetEvaluation; approval: any | null; normalApproval?: NormalApprovalRequest };
@@ -642,6 +666,27 @@ interface NormalPlanContext {
   spent: SpentSoFar;
   month: { spent: string; outstanding: string; total: string };
   plan: NormalApprovalPlan;
+  /** r62 (M1): política leída sobre el MISMO runner (en el bind, la tx del run). */
+  policy: (BudgetPolicy & { id: string }) | null;
+  /**
+   * r62 (M7): plan «firmable» de la autorización única = el mismo plan SIN el consumo del mes de los demás (tope por
+   * run y por curso, con el gasto de ESTE curso). La firma del usuario queda atada a ESTE monto y al estimado, no al gasto
+   * de otros cursos; el tope mensual se verifica aparte (signedPlanFits).
+   */
+  signedPlan: NormalApprovalPlan;
+}
+
+/**
+ * r62 (M7): ¿el plan real (con el mes de todos) todavía cubre el monto firmado? withinPolicy + remanente ≥ firmado.
+ * Si no: el límite que lo impide (budget_blocked con motivo, nunca un nuevo clic por un estimado «viejo»).
+ */
+export function signedPlanFits(real: NormalApprovalPlan, signedAmount: string | null, expected: string): { fits: boolean; blockedBy: NormalApprovalPlan['blockedBy'] } {
+  if (!real.withinPolicy) return { fits: false, blockedBy: real.blockedBy };
+  if (signedAmount === null) return { fits: false, blockedBy: real.blockedBy };
+  if (cmpDec(real.amount!, signedAmount) >= 0) return { fits: true, blockedBy: [] };
+  const lim = real.cappedByLimit || 'monthlyCap';
+  const lv = (real.limits as Record<string, string | null>)[lim] ?? null;
+  return { fits: false, blockedBy: [{ limit: lim, limitValue: lv, spent: normalizeDecimal(lv === null ? 0 : subDec(lv, real.amount!)), expected: normalizeDecimal(signedAmount), over: 'max' }] };
 }
 
 export function budgetBlockedConflict(blockedBy: NormalApprovalPlan['blockedBy'], preview?: unknown): ConflictException {
@@ -758,6 +803,11 @@ export function previewCounts(manifest: { manifest: { items: ReadonlyArray<{ typ
 }
 
 /** Preview sin los campos internos. */
+export function publicFromRunPreview(pv: FromRunPreview): Omit<FromRunPreview, '_plan'> {
+  const { _plan, ...rest } = pv;
+  return rest;
+}
+
 export function publicPreview(pv: StartPreview): Omit<StartPreview, '_plan' | '_evaluation'> {
   const { _plan, _evaluation, ...rest } = pv;
   return rest;
@@ -905,7 +955,7 @@ export class RunsService {
     blueprintNumber: number,
     courseContext: CourseContextDto | FromRunDto,
     /** Flujo normal (approveAndStart): aprobación a escribir en la tx del run nuevo. */
-    opts: { normalApproval?: NormalApprovalRequest } = {},
+    opts: { normalApproval?: NormalApprovalRequest; signer?: { id: string; email?: string | null } } = {},
   ): Promise<StartRunResult> {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
@@ -921,7 +971,10 @@ export class RunsService {
     const pb = await this.prebriefForNewRun(courseId, ownerId, blueprintNumber, manifest.id, verified);
     if (isFromRunRequest(courseContext)) {
       if (pb) await this.assertFromRunMatchesPrebrief(courseContext.fromRun, pb);
-      const r = await this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun);
+      // r62 (I2): «Autorizar y aplicar» = {fromRun, estimateHash} → firma del usuario dentro de la política.
+      const hash = (courseContext as FromRunDto).estimateHash;
+      const sig: FromRunSignature | null = typeof hash === 'string' ? { estimateHash: hash, user: opts.signer ?? { id: ownerId } } : null;
+      const r = await this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun, false, sig);
       if (pb && r.created) await this.prebrief!.recordGenerationStarted(courseId, pb.versionId, r.run.id, ownerId, 'fromRun');
       return r;
     }
@@ -1123,9 +1176,19 @@ export class RunsService {
     const userAuthorizationRequired = evaluation.decision === 'AUTO_WITHIN_POLICY' && !!evaluation.userAuthorizationRequired && !existing;
     const mode: 'user' | 'admin' | 'none' = required ? 'admin' : userAuthorizationRequired ? 'user' : 'none';
     const canApprove = isSuperAdminEmail(user.email);
+    // r62 (M7): la firma del usuario va por el plan firmable (sin el mes de los demás) y su huella también: otro curso
+    // que gasta entre el preview y el clic no la vuelve «vieja»; si el mes ya no cubre el monto → bloqueado con motivo.
+    let hashPlan: Pick<NormalApprovalPlan, 'amount' | 'withinPolicy'> = plan;
+    if (userAuthorizationRequired) {
+      hashPlan = { amount: np.signedPlan.amount, withinPolicy: np.signedPlan.withinPolicy };
+      const fit = signedPlanFits(plan, np.signedPlan.amount, evaluation.estimate.totals.expected);
+      plan = fit.fits
+        ? { ...np.signedPlan }
+        : { ...plan, withinPolicy: false, amount: null, cappedByLimit: null, blockedBy: fit.blockedBy };
+    }
     const estimateHash = estimateFingerprint({
       courseId, manifestId: manifest.id, manifestSha: manifest.sha256, contextHash, modes, estimate: evaluation.estimate,
-      policyId: evaluation.policyId, plan, courseSpent: normalizeDecimal(np.spent.course),
+      policyId: evaluation.policyId, plan: hashPlan, courseSpent: normalizeDecimal(np.spent.course),
     });
     const sum = estimateSummary(evaluation.estimate);
     return {
@@ -1170,7 +1233,11 @@ export class RunsService {
       estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider,
       ownerMonthSpent: ownerMonth ? ownerMonth.total : null,
     });
-    return { spent, month, plan };
+    const signedPlan = planNormalApproval({
+      estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: '0', providerSpent: spent.byProvider,
+      ownerMonthSpent: ownerMonth ? '0' : null,
+    });
+    return { spent, month, plan, policy, signedPlan };
   }
 
   /**
@@ -1293,6 +1360,110 @@ export class RunsService {
   }
 
   /**
+   * r62 (I2): presupuesto de aplicar el plan de invalidación desde `fromRunId` (run B), con la MISMA decisión que el
+   * apply: estimado del plan (REUSE = 0), política, plan de aprobación, modo de autorización (user | admin | none) y la
+   * huella (incluye planSha). Solo lectura. Si el run B de este par ya existe → `existingRun` (sin estimado).
+   */
+  async previewFromRun(courseId: number, user: { id: string; email?: string | null }, blueprintNumber: number, fromRunId: string,
+    manifestBIn?: ManifestDto): Promise<FromRunPreview> {
+    const ownerId = user.id;
+    assertDynamicOwnerAllowed(ownerId);
+    const manifestB = manifestBIn ?? (await this.manifests.get(courseId, ownerId, blueprintNumber));
+    const [rowA] = await this.dataSource.query(
+      `select * from public.production_jobs
+        where id = $1 and execution_mode = 'dynamic_generation' and course_id = $2 and owner_id = $3`,
+      [fromRunId, courseId, ownerId],
+    );
+    if (!rowA) throw new NotFoundException(`La ejecución de origen ${fromRunId} no existe para el curso #${courseId}`);
+    const bpNumberA = Number(rowA.input_payload?.blueprintNumber);
+    const manifestA = await this.manifests.getById(courseId, ownerId, bpNumberA, Number(rowA.input_payload?.manifestId));
+    try {
+      assertInvalidationRulesSupported(manifestA.rulesVersion, manifestB.rulesVersion);
+    } catch (err) {
+      throw new NotImplementedException({ code: INVALIDATION_V3_NOT_IMPLEMENTED, message: (err as Error).message });
+    }
+    if (manifestA.id === manifestB.id) {
+      throw new ConflictException(`La ejecución ${fromRunId} ya es del Manifest #${manifestB.id}: no hay cambio de estructura que aplicar. runId=${fromRunId}`);
+    }
+    const empty = { estimate: null, decision: null, reasons: [] as string[], paidRealProviders: [] as string[], approval: null, policy: null, estimateHash: null };
+    const [existingB] = await this.dataSource.query(
+      `select id, input_payload from public.production_jobs
+        where execution_mode = 'dynamic_generation' and input_payload->>'manifestId' = $1 order by created_at desc, id desc limit 1`,
+      [String(manifestB.id)],
+    );
+    if (existingB && existingB.input_payload?.fromRunId === rowA.id) {
+      return { fromRunId, manifestId: manifestB.id, planSha256: existingB.input_payload?.invalidationPlanSha256 ?? null, existingRun: { id: existingB.id }, ...empty };
+    }
+    if (!this.finopsBudget) return { fromRunId, manifestId: manifestB.id, planSha256: null, existingRun: null, ...empty };
+    const ctxA = await this.loadContextRow(rowA.id);
+    const videoMode = this.videoModeOf(rowA);
+    const [bpA, bpB] = await Promise.all([
+      this.manifests.blueprintOfForRules(courseId, ownerId, bpNumberA, manifestA.rulesVersion),
+      this.manifests.blueprintOfForRules(courseId, ownerId, blueprintNumber, manifestB.rulesVersion),
+    ]);
+    const { plan: invPlan } = await computePlanFromDb(this.dataSource, {
+      runA: rowA, manifestA, blueprintA: bpA.snapshot, manifestB, blueprintB: bpB.snapshot, contextHash: ctxA.context_hash,
+    });
+    const planActions: Record<string, string> = {};
+    for (const x of invPlan.actions) if (x.inTargetManifest) planActions[x.itemKey] = x.action;
+    const modes = runSpendModes(videoMode, frozenProviderModesOf(rowA.input_payload));
+    let evaluation: StartBudgetEvaluation;
+    let np: NormalPlanContext;
+    let existing: any | null = null;
+    try {
+      evaluation = await this.finopsBudget.evaluateStart({ courseId, ownerId, mode: modes, items: manifestB.manifest.items, actions: planActions });
+      np = await this.normalPlan(this.dataSource, courseId, ownerId, evaluation);
+      if (evaluation.decision === 'ADMIN_APPROVAL' || evaluation.userAuthorizationRequired) {
+        existing = await this.finopsBudget.findUnconsumedApproval(courseId, manifestB.id, evaluation.estimate.totals.expected);
+      }
+    } catch (err) {
+      throw this.finopsUnavailable(err);
+    }
+    let plan = np.plan;
+    if (evaluation.decision === 'BLOCK' && plan.withinPolicy) {
+      plan = { ...plan, withinPolicy: false, amount: null, cappedByLimit: null,
+        blockedBy: [{ limit: 'policy_block', limitValue: null, spent: normalizeDecimal(np.spent.course), expected: evaluation.estimate.totals.expected, over: 'expected' }] };
+    }
+    const required = evaluation.decision !== 'AUTO_WITHIN_POLICY' && !existing;
+    const userAuthorizationRequired = evaluation.decision === 'AUTO_WITHIN_POLICY' && !!evaluation.userAuthorizationRequired && !existing;
+    const mode: 'user' | 'admin' | 'none' = required ? 'admin' : userAuthorizationRequired ? 'user' : 'none';
+    let hashPlan: Pick<NormalApprovalPlan, 'amount' | 'withinPolicy'> = plan;
+    if (userAuthorizationRequired) {
+      hashPlan = { amount: np.signedPlan.amount, withinPolicy: np.signedPlan.withinPolicy };
+      const fit = signedPlanFits(plan, np.signedPlan.amount, evaluation.estimate.totals.expected);
+      plan = fit.fits ? { ...np.signedPlan } : { ...plan, withinPolicy: false, amount: null, cappedByLimit: null, blockedBy: fit.blockedBy };
+    }
+    const estimateHash = estimateFingerprint({
+      courseId, manifestId: manifestB.id, manifestSha: manifestB.sha256, contextHash: ctxA.context_hash, modes, estimate: evaluation.estimate,
+      policyId: evaluation.policyId, plan: hashPlan, courseSpent: normalizeDecimal(np.spent.course), planSha: invPlan.planSha256,
+    });
+    const sum = estimateSummary(evaluation.estimate);
+    return {
+      fromRunId,
+      manifestId: manifestB.id,
+      planSha256: invPlan.planSha256,
+      existingRun: null,
+      estimate: {
+        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
+        byProvider: sum.byProvider, byItemType: evaluation.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+        breakdown: estimateBreakdown(evaluation.estimate),
+      },
+      decision: evaluation.decision,
+      reasons: evaluation.reasons,
+      paidRealProviders: evaluation.paidRealProviders,
+      approval: {
+        required, canApprove: isSuperAdminEmail(user.email), withinPolicy: plan.withinPolicy, amount: plan.amount,
+        cappedByLimit: plan.cappedByLimit, blockedBy: plan.blockedBy,
+        existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
+        mode, userAuthorizationRequired,
+      },
+      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total },
+      estimateHash,
+      _plan: plan,
+    };
+  }
+
+  /**
    * Fase 8 (F8-BE, spec §4 paso 3): crea el run B sobre el Manifest destino
    * `manifest` (Mb, el de este Blueprint) aplicando en UNA transacción el plan
    * de invalidación calculado desde el run A (`fromRunId`):
@@ -1320,7 +1491,30 @@ export class RunsService {
     manifestB: ManifestDto,
     fromRunId: string,
     youtubePreflightPassed = false,
+    sig: FromRunSignature | null = null,
   ): Promise<StartRunResult> {
+    // r62 (I2): con la firma, el preview del plan se recalcula ahora con la MISMA huella; dentro de la política el run B
+    // nace con la autorización del usuario (fila AUTO_WITHIN_POLICY firmada), fuera → budget_blocked / el admin de siempre.
+    let userNa: NormalApprovalRequest | undefined;
+    if (sig && this.finopsBudget) {
+      const pv = await this.previewFromRun(courseId, sig.user, blueprintNumber, fromRunId, manifestB);
+      if (!pv.existingRun && pv.estimateHash !== null) {
+        if (pv.estimateHash !== sig.estimateHash) {
+          throw new ConflictException({
+            code: ESTIMATE_STALE,
+            message: `${ESTIMATE_STALE}: el costo estimado de aplicar los cambios cambió desde que lo viste; revisa el estimado nuevo. No se creó nada.`,
+            preview: publicFromRunPreview(pv),
+          });
+        }
+        if (pv.approval && pv.approval.userAuthorizationRequired) {
+          if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicFromRunPreview(pv));
+          userNa = {
+            approvedBy: String(sig.user.email || `user:${sig.user.id}`), fingerprint: sig.estimateHash, amount: pv._plan!.amount!,
+            expected: pv.estimate!.expected, max: pv.estimate!.max, result: null, kind: 'user', planSha: pv.planSha256,
+          };
+        }
+      }
+    }
     const [rowA] = await this.dataSource.query(
       `select * from public.production_jobs
         where id = $1 and execution_mode = 'dynamic_generation' and course_id = $2 and owner_id = $3`,
@@ -1440,10 +1634,16 @@ export class RunsService {
         // V2.1 RF-b: estimado del plan (REUSE = 0 incremental) + gate de presupuesto.
         const planActions: Record<string, string> = {};
         for (const a of plan.actions) if (a.inTargetManifest) planActions[a.itemKey] = a.action;
+        if (userNa && userNa.planSha !== plan.planSha256) {
+          throw new ConflictException({
+            code: ESTIMATE_STALE,
+            message: `${ESTIMATE_STALE}: el plan de cambios cambió desde que lo viste; revisa el estimado nuevo. No se creó nada.`,
+          });
+        }
         const budget = await this.finopsEvaluate({
           courseId, ownerId, manifestId: manifestB.id, items: manifestB.manifest.items,
           modes: runSpendModes(videoMode, frozenProviderModesOf(rowA.input_payload)), actions: planActions,
-          runner: qr, planSha: plan.planSha256,
+          runner: qr, planSha: plan.planSha256, normalApproval: userNa,
         });
 
         const invalidation = { fromRunId: rowA.id, planSha256: plan.planSha256, totals: plan.totals, plan };
@@ -1502,7 +1702,7 @@ export class RunsService {
       }
       if (!(err instanceof NeedsYoutubePreflight) || youtubePreflightPassed) throw err;
       await this.enforceVideoGate(ownerId, err.gate); // 409 si no pasa
-      return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifestB, fromRunId, true);
+      return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifestB, fromRunId, true, sig);
     }
 
     const job = await this.loadJobById(outcome.jobId);
@@ -4425,7 +4625,8 @@ export class RunsService {
       // de invalidación (planSha) no tiene UI de firma: sigue el camino de admin de siempre.
       const approval = await this.finopsBudget.findUnconsumedApproval(a.courseId, a.manifestId, evaluation.estimate.totals.expected, a.runner);
       if (!approval) {
-        throw new BudgetGateRejection(evaluation, userAuth && !a.planSha ? USER_AUTHORIZATION_REQUIRED : BUDGET_APPROVAL_REQUIRED, a.planSha ?? null);
+        // r62 (I2): también un run B (planSha) dentro de la política pide la firma del usuario («Autorizar y aplicar»).
+        throw new BudgetGateRejection(evaluation, userAuth ? USER_AUTHORIZATION_REQUIRED : BUDGET_APPROVAL_REQUIRED, a.planSha ?? null);
       }
       return { evaluation, approval };
     }
@@ -4503,8 +4704,23 @@ export class RunsService {
       const na = gate.normalApproval;
       await qr.query(`select pg_advisory_xact_lock(hashtext($1))`, [MONTH_CAP_LOCK]);
       const np = await this.normalPlan(qr, a.courseId, a.ownerId, gate.evaluation);
-      if (!np.plan.withinPolicy) throw budgetBlockedConflict(np.plan.blockedBy);
-      if (cmpDec(np.plan.amount!, na.amount) !== 0) {
+      if (na.kind === 'user') {
+        // r62 (M1): la política se relee en ESTA tx: si cambió (otra versión, flag explícito de admin, tope quitado),
+        // la firma del usuario ya no vale (la decisión de antes ya no es la vigente).
+        const pol = np.policy;
+        const caps = policySpendCaps(pol);
+        if (!pol || pol.id !== gate.evaluation.policyId || pol.requireHumanApprovalForRealSpend === true || caps.missing.length > 0) {
+          throw new ConflictException({
+            code: ESTIMATE_STALE,
+            message: `${ESTIMATE_STALE}: la política de presupuesto cambió mientras se autorizaba (${!pol ? 'sin política' : pol.id !== gate.evaluation.policyId ? 'versión nueva' : pol.requireHumanApprovalForRealSpend === true ? 'ahora requiere un administrador' : `falta ${caps.missing.join(', ')}`}); revisa el estimado nuevo. No se creó nada.`,
+          });
+        }
+        // r62 (M7): la firma está atada al estimado y a su monto, no al gasto de los demás: si el remanente (tope por run,
+        // por curso, mensual y del dueño) todavía cubre el monto firmado, arranca; si no, budget_blocked con el límite.
+        const fit = signedPlanFits(np.plan, na.amount, gate.evaluation.estimate.totals.expected);
+        if (!fit.fits) throw budgetBlockedConflict(fit.blockedBy);
+      } else if (!np.plan.withinPolicy) throw budgetBlockedConflict(np.plan.blockedBy);
+      if (na.kind !== 'user' && cmpDec(np.plan.amount!, na.amount) !== 0) {
         throw new ConflictException({
           code: ESTIMATE_STALE,
           message: `${ESTIMATE_STALE}: el monto a autorizar cambió (${na.amount} → ${np.plan.amount}) por gasto o aprobaciones nuevas; revisa el estimado nuevo. No se creó nada.`,

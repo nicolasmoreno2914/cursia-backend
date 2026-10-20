@@ -18,7 +18,7 @@ import {
   ValidationPipe,
 } from '@nestjs/common';
 import type { Response } from 'express';
-import { RunsService, YoutubeResolutionAction, publicPreview, publicVideoUpgradePreview } from './runs.service';
+import { RunsService, YoutubeResolutionAction, publicPreview, publicFromRunPreview, publicVideoUpgradePreview } from './runs.service';
 import { CourseContextDto } from './dto/course-context.dto';
 import { RetryItemDto } from './dto/executor.dto';
 import { parseRegenerateItemBody } from './dto/regenerate-item.dto';
@@ -72,9 +72,26 @@ export class RunsController {
       type: 'body',
       metatype: isFromRunRequest(body) ? FromRunDto : CourseContextDto,
     });
-    const result = await this.runs.startRun(courseId, user.id, number, dto);
+    // r62 (I2): {fromRun, estimateHash} = «Autorizar y aplicar»: la firma es de la identidad del JWT (nunca del body).
+    const result = await this.runs.startRun(courseId, user.id, number, dto, { signer: { id: user.id, email: user.email } });
     res.status(result.created ? 201 : 200);
     return result;
+  }
+
+  // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/from-run-preview
+  // r62 (I2): presupuesto de aplicar el plan de invalidación desde {fromRun}: estimado, decisión, modo de autorización
+  // (user | admin | none), monto, límites y la huella que exige «Autorizar y aplicar» (POST …/runs {fromRun, estimateHash}).
+  // Solo lectura.
+  @Post('from-run-preview')
+  @HttpCode(HttpStatus.OK)
+  async fromRunPreview(
+    @Param('courseId', ParseIntPipe) courseId: number,
+    @Param('number', ParseIntPipe) number: number,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+  ) {
+    const dto: FromRunDto = await START_BODY_PIPE.transform(body, { type: 'body', metatype: FromRunDto });
+    return publicFromRunPreview(await this.runs.previewFromRun(courseId, { id: user.id, email: user.email }, number, dto.fromRun));
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs

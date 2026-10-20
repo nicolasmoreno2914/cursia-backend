@@ -135,6 +135,35 @@ function planPolicy(current, target = DEFAULT_TARGET, createdBy = CREATED_BY) {
   };
 }
 
+/**
+ * r62 (review M4): desde r62 la columna require_human_approval_for_real_spend ya no fuerza admin por sí sola y una
+ * política con tope por run, por curso y mensual habilita la AUTORIZACIÓN ÚNICA del usuario. Ese cambio de semántica
+ * se deja AUDITADO en una versión de la política: el deploy de staging escribe (una vez) una versión con el marcador
+ * `limits.approvalSemantics` y un created_by que lo explica. Idempotente: con el marcador ya puesto, no hace nada más.
+ * Puro. → plan con el marcador (insert) | el mismo noop/none.
+ */
+const APPROVAL_SEMANTICS = 'r62_single_authorization';
+const SEMANTICS_CREATED_BY = 'staging-budget-policy r62: semántica de autorización única (tope por run + por curso + mensual → firma del usuario; admin solo si excede, sin topes o limits.requireHumanApprovalForRealSpend=true)';
+function withApprovalSemantics(current, plan) {
+  if (!current || plan.action === 'none') return plan;
+  if (plan.action === 'insert') {
+    if (plan.row.limits && plan.row.limits.approvalSemantics === APPROVAL_SEMANTICS) return plan;
+    return { ...plan, row: { ...plan.row, limits: { ...plan.row.limits, approvalSemantics: APPROVAL_SEMANTICS }, created_by: `${plan.row.created_by} · r62 autorización única` } };
+  }
+  const limits = current.limits && typeof current.limits === 'object' ? current.limits : {};
+  if (limits.approvalSemantics === APPROVAL_SEMANTICS) return plan;
+  return {
+    action: 'insert',
+    semanticsOnly: true,
+    row: {
+      scope: current.scope, scope_id: current.scope_id ?? null, version: Number(current.version) + 1,
+      limits: { ...limits, approvalSemantics: APPROVAL_SEMANTICS },
+      require_human_approval_for_real_spend: current.require_human_approval_for_real_spend, on_exceed: current.on_exceed,
+      created_by: SEMANTICS_CREATED_BY,
+    },
+  };
+}
+
 async function currentPolicy(c, ownerId) {
   const { rows } = await c.query(
     `select id, scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed
@@ -163,7 +192,7 @@ async function run(env, ownerId) {
     // Dos deploys a la vez nunca insertan dos versiones (además del índice único scope/scope_id/version).
     await c.query(`select pg_advisory_xact_lock(hashtext('cursia:staging-budget-policy'))`);
     const cur = await currentPolicy(c, ownerId);
-    const plan = planPolicy(cur, target, createdBy);
+    const plan = withApprovalSemantics(cur, planPolicy(cur, target, createdBy));
     if (plan.action === 'none') {
       console.log('⚠️  No hay política de presupuesto global (ni del owner de prueba) en staging: no se inventa una (el gate responde ADMIN_APPROVAL).');
       await c.query('rollback');
@@ -183,7 +212,8 @@ async function run(env, ownerId) {
       [r.scope, r.scope_id, r.version, JSON.stringify(r.limits), r.require_human_approval_for_real_spend, r.on_exceed, r.created_by],
     );
     await c.query('commit');
-    console.log(`+ Política de staging: nueva versión con por generación ${target.maxCostPerRun}, por curso ${target.maxCostPerCourse} y mensual ${target.monthly} (el resto igual)`);
+    if (plan.semanticsOnly) console.log('+ Política de staging: versión nueva SOLO para registrar la semántica r62 de autorización única (límites iguales)');
+    else console.log(`+ Política de staging: nueva versión con por generación ${target.maxCostPerRun}, por curso ${target.maxCostPerCourse} y mensual ${target.monthly} (el resto igual)`);
     console.log(`  antes:   ${fmt(cur)}`);
     console.log(`  después: ${fmt(rows[0])}`);
     return { ...plan, inserted: rows[0] };
@@ -222,7 +252,7 @@ async function main() {
   await run(process.env, ownerArg);
 }
 
-module.exports = { STAGING_MAX_COST_PER_RUN, STAGING_MAX_COST_PER_COURSE, STAGING_MONTHLY_CAP, BUDGET_ENV, targetFromEnv, planPolicy, refusal, dbProjectRef, CREATED_BY };
+module.exports = { APPROVAL_SEMANTICS, withApprovalSemantics, STAGING_MAX_COST_PER_RUN, STAGING_MAX_COST_PER_COURSE, STAGING_MONTHLY_CAP, BUDGET_ENV, targetFromEnv, planPolicy, refusal, dbProjectRef, CREATED_BY };
 if (require.main === module) {
   main().catch((err) => {
     console.error(`❌ staging-budget-policy: ${String((err && (err.code || err.message)) || err).slice(0, 200)}`);

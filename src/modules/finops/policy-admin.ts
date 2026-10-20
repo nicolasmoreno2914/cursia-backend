@@ -53,14 +53,23 @@ function bad(msg: string): never {
 
 function limitValue(v: unknown, what: string): string | null {
   if (v === null) return null;
+  // Review I1: solo decimales planos (texto o número cuyo texto lo sea). Un número JSON en notación científica (1e-20)
+  // o con más de 10 decimales se rechaza: guardado tal cual, el evaluador (normalizeDecimal) no lo lee y la política
+  // entera quedaría inservible (503 finops_unavailable para todo el scope).
   if (typeof v !== 'string' && typeof v !== 'number') bad(`${what}: debe ser un número/decimal en USD o null`);
-  if (typeof v === 'string' && !/^\d+(\.\d{1,10})?$/.test(v.trim())) bad(`${what}: decimal inválido (${String(v).slice(0, 40)})`);
-  if (typeof v === 'number' && (!Number.isFinite(v) || v < 0)) bad(`${what}: número inválido (${String(v)})`);
-  const n = normalizeDecimal(typeof v === 'string' ? v.trim() : v, what);
+  if (typeof v === 'number' && !Number.isFinite(v)) bad(`${what}: número inválido (${String(v)})`);
+  const txt = typeof v === 'string' ? v.trim() : String(v);
+  if (!/^\d+(\.\d{1,10})?$/.test(txt)) bad(`${what}: decimal inválido (${txt.slice(0, 40)}): usa un decimal plano en USD, p. ej. "106" o "75.50"`);
+  const n = normalizeDecimal(txt, what);
   if (cmpDec(n, 0) < 0) bad(`${what}: no puede ser negativo`);
   if (cmpDec(n, POLICY_LIMIT_SANITY_MAX) > 0) bad(`${what}: supera la cota de cordura de USD ${POLICY_LIMIT_SANITY_MAX}`);
-  // Se guarda como texto decimal exacto (igual que las políticas existentes con '106').
-  return typeof v === 'string' ? v.trim() : String(v);
+  // Se guarda el decimal NORMALIZADO (sin ceros de más), que es lo que el evaluador vuelve a leer.
+  return canonicalDecimal(n);
+}
+
+/** '106.5000000000' → '106.5'; '106.0000000000' → '106'. */
+export function canonicalDecimal(n: string): string {
+  return n.includes('.') ? n.replace(/0+$/, '').replace(/\.$/, '') : n;
 }
 
 /** Valida el cuerpo de POST /finops/budget-policies. Lanza FinopsError INVALID_INPUT con el motivo. */
