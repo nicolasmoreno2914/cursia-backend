@@ -15,6 +15,7 @@ import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
 import { WorkerBudget, WorkerLedger, blockWithoutGuard, recordProviderMock } from './finops-worker-hooks';
 import { processRealProviderItem } from './provider-real/real-providers';
+import { ttsTimeoutMs } from './provider-real/provider-clients';
 import type { CoverRasterizer } from './provider-real/pdf-cover';
 import {
   ALLOW_PROVIDER_MOCK_ENV,
@@ -323,7 +324,7 @@ async function bootstrap() {
   installDrainHandlers({ name: 'dynamic-provider-worker', logger, drain, active: unionOfActive(active, llmActive), close: () => app.close() });
   logger.log(
     `dynamic-provider-worker iniciado (executorId=${deps.executorId}, pollMs=${pollMs}, tipos=${PROVIDER_WORKER_TYPES.join(',')}, ` +
-      `drainTimeoutMs=${drainTimeoutMs()})`,
+      `drainTimeoutMs=${drainTimeoutMs()}, ttsTimeoutMs=${ttsTimeoutMs(process.env).ms} (${ttsTimeoutMs(process.env).source}))`,
   );
   // Loop 6: el worker de IA puede correr HOSPEDADO en este proceso (sin un 12.º proceso ni otra conexión al pooler).
   // Solo arranca con flag + instante de activación + API key; si no, el navegador sigue generando las partes largas.

@@ -2286,6 +2286,8 @@ export class RunsService {
       }
     }
 
+    // r62: reservas inciertas del intento previo a liquidar tras un reenvío explícito (resubmitProvider).
+    let resubmitPriorReservations: { keys: string[]; providers: string[]; itemRunId: string } | null = null;
     const targetId = await this.tx(async (qr) => {
       // I1: lock del curso primero — este reintento puede reabrir el run.
       await this.lockCourseRuns(qr, courseId);
@@ -2399,7 +2401,7 @@ export class RunsService {
         // r62 (d8): misma decisión que el barrido, con las filas del run bloqueadas.
         const depKey = claimPayloadDependencyKey(target as ClaimPayloadRow);
         const dep = depKey ? (items as any[]).find((i) => i.item_key === depKey) ?? null : null;
-        const d = claimPayloadRecoveryDecision(target as ClaimPayloadRow, dep);
+        const d = claimPayloadRecoveryDecision(target as ClaimPayloadRow, dep, this.videoModeOf(job));
         if (d.action !== 'reopen') {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (claim_payload: ${d.action})`, code: 'auto_heal_not_eligible', reason: d.action });
         }
@@ -2480,6 +2482,10 @@ export class RunsService {
           );
         }
         this.logger.warn(`retryItem: resubmitProvider=true para "${itemKey}" (run ${job.id}) — error previo "${err}"; archivando la generación anterior`);
+        // r62 (E2E M): todo reenvío liquida PRIMERO el intento previo — sus reservas inciertas quedan cobradas con la marca
+        // possible_duplicate (después del commit), así nunca queda una reserva abierta con la parte completada.
+        const prev = await this.ambiguousAudioPending(qr, target.id, target.output_summary, target.type);
+        resubmitPriorReservations = { keys: prev.keys ?? [], providers: prev.providers, itemRunId: String(target.id) };
         // R16 fix M3: el reenvío empieza una espera nueva (tope de reloj de los timeouts gratuitos).
         resubmitSetSql = ` - 'external' - 'externalSubmitStartedAt' - 'externalReservationKey' - 'gammaPollSince' - 'videoPollSince'`;
       }
@@ -2665,6 +2671,13 @@ export class RunsService {
       return target.id;
     });
 
+    const prior = resubmitPriorReservations as { keys: string[]; providers: string[]; itemRunId: string } | null;
+    if (prior && prior.keys.length) {
+      const r = await settleAmbiguousAsPossibleDuplicate(this.recoveryLedger(), prior.keys, {
+        provider: prior.providers.join(',') || 'unknown', cause: auto?.ambiguousAudio ? 'connection_cut' : 'manual_resubmit', itemRunId: prior.itemRunId, itemKey, runId: job.id,
+      }, auto ? 'system' : String(actorId));
+      if (r.failed.length) this.logger.warn(`retryItem: no se pudo liquidar ${r.failed.map((f) => f.key).join(', ')} del intento previo de ${itemKey} (${r.failed[0].error}); siguen contadas como gasto`);
+    }
     const [row] = await this.dataSource.query(`select * from public.generation_item_runs where id = $1`, [targetId]);
     return this.toItemDto(row, frozenDelivery);
   }
@@ -2863,8 +2876,8 @@ export class RunsService {
     const out = { candidates: 0, reopened: [] as string[], regenerated: [] as string[], waiting: [] as string[], exceptions: [] as Array<{ itemKey: string; reason: string }> };
     if (!policy.classAware) return out;
     const rows: Array<{ id: string; job_id: string; item_key: string; type: string; chapter_id: string | null; error: string | null; output_summary: Record<string, any> | null;
-      finished_at: Date; course_id: number; owner_id: string; blueprint_number: number }> = await this.dataSource.query(
-      `select g.id, g.job_id, g.item_key, g.type, g.chapter_id, g.error, g.output_summary, g.finished_at, pj.course_id, pj.owner_id, b.blueprint_number
+      finished_at: Date; course_id: number; owner_id: string; blueprint_number: number; input_payload: Record<string, any> | null }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.chapter_id, g.error, g.output_summary, g.finished_at, pj.course_id, pj.owner_id, b.blueprint_number, pj.input_payload
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
          join public.course_generation_manifests m on m.id = g.manifest_id
@@ -2905,11 +2918,14 @@ export class RunsService {
           `select item_key, status, generation, output_summary, finished_at from public.generation_item_runs
             where job_id = $1 and item_key = $2 order by generation desc limit 1`, [r.job_id, depKey])
         : [];
-      const d = claimPayloadRecoveryDecision(r, dep ?? null);
+      const d = claimPayloadRecoveryDecision(r, dep ?? null, this.videoModeOf(r));
       try {
         if (d.action === 'wait') { out.waiting.push(r.item_key); continue; }
         if (d.action === 'exception') {
           await decline(r, d.reason, d.reason === 'contract' ? 'product_bug' : 'unrecoverable');
+          if (d.reason === 'real_video_requires_review') {
+            this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) — video REAL: nunca se repaga un render automáticamente; queda para un admin (${d.code})`);
+          }
           this.logger.warn(`claim incompleto: ${r.item_key} (run ${r.job_id}) queda como excepción (${d.reason}, ${d.code})`);
           continue;
         }

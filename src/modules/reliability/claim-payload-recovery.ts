@@ -21,8 +21,14 @@ export const CLAIM_PAYLOAD_RESUME_STRATEGY = 'dependency_resolved:claim_payload'
 /** Reaperturas gratuitas máximas de la parte tras resolverse su dependencia (anti-bucle). */
 export const CLAIM_PAYLOAD_MAX_REOPENS = 3;
 
-/** Códigos internos (ClaimPayloadUnavailable.code) que dependen de OTRA parte: la dependencia es el video del capítulo. */
-const VIDEO_DEPENDENCY_CODE_RE = /^VIDEO_[A-Z0-9_]+$/;
+/**
+ * Códigos internos (ClaimPayloadUnavailable.code) que dependen de OTRA parte (el video del capítulo) — review N1 I1: solo
+ * datos de ENTREGA / MEDICIÓN o una carrera. `VIDEO_PLAN_INVARIANT` (bug determinista) y `VIDEO_DURATION_INVALID` (el
+ * video excede el máximo: regenerar lo repetiría) NO entran: son `product_bug` (excepción, sin regenerar).
+ */
+export const CLAIM_PAYLOAD_DEPENDENCY_CODES: readonly string[] = Object.freeze(['VIDEO_NOT_COMPLETED', 'VIDEO_YOUTUBE_ID_MISSING', 'VIDEO_DURATION_MISSING']);
+/** Mismo conjunto como regex (clasificador / vista). */
+export const CLAIM_PAYLOAD_DEPENDENCY_RE = /^claim_payload_unavailable:\s*(?:VIDEO_NOT_COMPLETED|VIDEO_YOUTUBE_ID_MISSING|VIDEO_DURATION_MISSING)\b/;
 
 export interface ClaimPayloadRow {
   type: string;
@@ -44,7 +50,7 @@ export type ClaimPayloadDecision =
   | { action: 'reopen'; depKey: string; code: string }
   | { action: 'regenerate_dependency'; depKey: string; code: string }
   | { action: 'wait'; depKey: string; code: string }
-  | { action: 'exception'; depKey: string | null; code: string; reason: 'contract' | 'already_regenerated' | 'reopen_cap' };
+  | { action: 'exception'; depKey: string | null; code: string; reason: 'contract' | 'already_regenerated' | 'reopen_cap' | 'real_video_requires_review' };
 
 /** Código interno del mensaje `claim_payload_unavailable: <CODE>: …` (null si no tiene la forma). */
 export function claimPayloadCodeOf(error: string | null | undefined): string | null {
@@ -56,7 +62,7 @@ export function claimPayloadCodeOf(error: string | null | undefined): string | n
 export function claimPayloadDependencyKey(row: ClaimPayloadRow): string | null {
   const code = claimPayloadCodeOf(row.error);
   if (!code || row.type !== 'video_interactions' || !row.chapter_id) return null;
-  return VIDEO_DEPENDENCY_CODE_RE.test(code) ? `video:${row.chapter_id}` : null;
+  return CLAIM_PAYLOAD_DEPENDENCY_CODES.includes(code) ? `video:${row.chapter_id}` : null;
 }
 
 function ms(v: Date | string | null | undefined): number {
@@ -64,7 +70,13 @@ function ms(v: Date | string | null | undefined): number {
   return (v instanceof Date ? v : new Date(v)).getTime();
 }
 
-export function claimPayloadRecoveryDecision(row: ClaimPayloadRow, dep: ClaimPayloadDependencyRow | null): ClaimPayloadDecision {
+/**
+ * `videoMode`: modo de video del run. Review N1 I1: regenerar la dependencia SOLO con video `mock` (sin costo). Con video
+ * REAL regenerar sería un render NUEVO pagado en Videogen sobre uno ya pagado (y la vía gratis —re-consultar el job,
+ * re-medir el MP4 y re-subir a YouTube de forma idempotente— no está implementada acá): excepción explícita para un humano
+ * (`real_video_requires_review`), nunca un repago automático.
+ */
+export function claimPayloadRecoveryDecision(row: ClaimPayloadRow, dep: ClaimPayloadDependencyRow | null, videoMode: string = 'mock'): ClaimPayloadDecision {
   const code = claimPayloadCodeOf(row.error) ?? 'unknown';
   const depKey = claimPayloadDependencyKey(row);
   if (!depKey) return { action: 'exception', depKey: null, code, reason: 'contract' };
@@ -80,5 +92,6 @@ export function claimPayloadRecoveryDecision(row: ClaimPayloadRow, dep: ClaimPay
   }
   if (dep.status !== 'completed') return { action: 'wait', depKey, code };
   if (regeneratedForThis) return { action: 'exception', depKey, code, reason: 'already_regenerated' };
+  if (videoMode !== 'mock') return { action: 'exception', depKey, code, reason: 'real_video_requires_review' };
   return { action: 'regenerate_dependency', depKey, code };
 }

@@ -13,7 +13,7 @@ export const POSSIBLE_DUPLICATE_ACTOR = 'system';
 export const POSSIBLE_DUPLICATE_RECORDED_BY = 'auto-recovery';
 
 /** Motivo de la ambigüedad (texto estable para el ledger y el log de intentos). */
-export type AmbiguityCause = 'timeout_presumed_charged' | 'connection_cut' | 'unknown_result';
+export type AmbiguityCause = 'timeout_presumed_charged' | 'connection_cut' | 'unknown_result' | 'manual_resubmit';
 
 export interface PossibleDuplicateSettlement {
   settled: string[];
@@ -26,16 +26,18 @@ export async function settleAmbiguousAsPossibleDuplicate(
   ledger: Pick<FinopsLedgerService, 'reconcileReservationAsCharged'>,
   keys: readonly string[],
   a: { provider: string; cause: AmbiguityCause; itemRunId: string; itemKey?: string | null; runId?: string | null },
+  /** Quién decide: `system` (automático) o el admin/dueño del reenvío explícito. */
+  decidedBy: string = POSSIBLE_DUPLICATE_ACTOR,
 ): Promise<PossibleDuplicateSettlement> {
   const out: PossibleDuplicateSettlement = { settled: [], alreadySettled: [], failed: [] };
   for (const key of [...new Set(keys)]) {
     try {
       const r = await ledger.reconcileReservationAsCharged(
         key,
-        `auto: ${a.cause === 'timeout_presumed_charged' ? 'timeout presumido cobrado' : a.cause === 'connection_cut' ? 'conexión cortada después del envío' : 'resultado desconocido'} ` +
-          `(${a.provider}); se cuenta como cobrada y se reenvía una sola vez — posible duplicado`,
+        `${decidedBy === POSSIBLE_DUPLICATE_ACTOR ? 'auto' : 'reenvío explícito'}: ${a.cause === 'timeout_presumed_charged' ? 'timeout presumido cobrado' : a.cause === 'connection_cut' ? 'conexión cortada después del envío' : a.cause === 'manual_resubmit' ? 'reenvío explícito de una operación incierta' : 'resultado desconocido'} ` +
+          `(${a.provider}); se cuenta como cobrada (posible duplicado) para el reenvío único`,
         {
-          decidedBy: POSSIBLE_DUPLICATE_ACTOR,
+          decidedBy,
           recordedBy: POSSIBLE_DUPLICATE_RECORDED_BY,
           metadata: { possibleDuplicate: true, auto: true, cause: a.cause, provider: a.provider, itemRunId: a.itemRunId,
             ...(a.itemKey ? { itemKey: a.itemKey } : {}), ...(a.runId ? { runId: a.runId } : {}), rule: 'r62_bounded_ambiguity' },

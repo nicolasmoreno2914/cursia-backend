@@ -682,34 +682,38 @@ async function dbChecks() {
       eq([man.audio.seconds, man.audio.infoFrameSeconds], [art.metadata.durationSeconds, art.metadata.durationSeconds], 'Info = frames');
     });
 
-    // r62 (K2, regla de ambigüedad acotada punto 4 — cambio DELIBERADO de la calibración #2): un HTTP 500 de OpenAI es una
-    // RESPUESTA conocida del proveedor (no cobra un error): la reserva se LIBERA, el intento queda reconocido y la parte se
-    // reintenta sola (A, backoff) reutilizando el guion pagado — sin reconciliación ni humano.
-    await check('DB audiolibro (r62 K2): TTS 500 tras el guion = resultado CONOCIDO → reserva liberada, reintentable (sin reconciliación); el reintento reutiliza el guion (0 LLM) y completa', async () => {
+    await check('DB audiolibro (calibración #2): TTS 500 tras el guion = gasto posible → RECONCILIACIÓN (no reintentable), reserva pendiente; un retry común NO vuelve a llamar; resubmitProvider explícito reutiliza el guion (0 LLM) y completa', async () => {
       fakes.plan.ttsFail = [500];
       const llm0 = fakes.st.llm.length;
       const tts0 = fakes.st.tts.length;
       const item = await claimProvider(runId, 'audiobook_chapter');
       assert(item && item.chapterId === C.c2, 'claim C2');
-      await PW.processProviderItem(workerDeps(), item);
+      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'reconciliación');
       let row = await itemRow(runId, item.itemKey);
-      eq(row.status, 'retrying', `estado ${row.status} ${row.error}`);
-      assert(/^tts_failed: chunk 1\/\d+ \(persisted 0\): openai POST \/audio\/speech HTTP 500/.test(row.error) && row.output_summary.audiobookSections && row.output_summary.audiobookSections['0'], `guion guardado + motivo (${row.error})`);
-      assert(!/reconciliation/.test(row.error), 'sin reconciliación');
+      eq(row.status, 'failed', `estado ${row.status} ${row.error}`);
+      assert(/tts_failed/.test(row.error) && row.output_summary.audiobookSections && row.output_summary.audiobookSections['0'], 'guion guardado + motivo');
       const resv = await reservationsOf(row.id, 'openai');
-      eq(resv.map((x) => x.settled), [true], 'reserva TTS liberada (no cobrada)');
+      eq(resv.map((x) => [x.measurement_status, x.settled]), [['pending', false]], 'reserva TTS pendiente (el presupuesto la cuenta)');
       assert(new RegExp(`^reservation:tts:${row.id}:g1:a1:seg_seg-0-0-[0-9a-f]{12}$`).test(resv[0].idempotency_key), `clave por segmento ${resv[0].idempotency_key}`);
-      eq(Number(row.output_summary.reconciliationAcknowledgedThroughAttempt), 1, 'intento reconocido (resultado conocido)');
+      assert(Number(resv[0].amount) > 0, 'reserva con monto estimado');
       const llmAfterFirst = fakes.st.llm.length;
       eq([llmAfterFirst - llm0, fakes.st.tts.length - tts0], [1, 1], 'una llamada LLM, un TTS');
-      eq(loadDist('modules/reliability/failure-classifier.js').classifyFailure({ error: row.error, itemType: 'audiobook_chapter', source: 'provider_worker' }).class, 'A', 'clase A');
-      await ds.query(`update public.generation_item_runs set next_retry_at = now() where id = $1`, [row.id]);
-      await PW.processProviderItem(workerDeps(), await claimProvider(runId, 'audiobook_chapter'));
+      // Retry común: el ledger delata la operación ambigua → 0 llamadas nuevas, sigue en reconciliación.
+      await runs.retryItem(C.cid, OWNER, 1, runId, item.itemKey);
+      const again = await claimProvider(runId, 'audiobook_chapter');
+      await rejectsRe(PW.processProviderItem(workerDeps(), again), /^provider_reconciliation_required/, 'retry común');
+      eq([fakes.st.llm.length, fakes.st.tts.length - tts0], [llmAfterFirst, 1], '0 llamadas en el retry común');
+      // Decisión humana explícita.
+      await runs.retryItem(C.cid, OWNER, 1, runId, item.itemKey, false, true);
+      const third = await claimProvider(runId, 'audiobook_chapter');
+      await PW.processProviderItem(workerDeps(), third);
       row = await itemRow(runId, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
-      eq(fakes.st.llm.length, llmAfterFirst, '0 llamadas LLM en el reintento (guion reutilizado)');
+      eq(fakes.st.llm.length, llmAfterFirst, '0 llamadas LLM en la reanudación (guion reutilizado)');
       eq((await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).length, 1, 'un solo cargo LLM');
-      eq((await reservationsOf(row.id, 'openai')).every((x) => x.settled), true, 'todas las reservas liquidadas');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [true, true], 'reserva ambigua (cobrada, posible duplicado) + la del nuevo intento liquidada');
     });
 
     await check('DB video (I2): el worker mide la duración desde el mvhd del MP4 que sube y la persiste ANTES de terminar la subida; artifact + summary con durationSource mp4_mvhd; video_interactions la usa', async () => {
@@ -809,7 +813,9 @@ async function dbChecks() {
       row = await itemRow(runA2, item.itemKey);
       eq([row.status, fakes.st.gammaPosts.length - posts0], ['completed', 2], 'nueva generación tras la decisión');
       eq((await finalCharges(`item_run_id = $1 and provider = 'gamma'`, [row.id])).length, 1, 'un cargo final (la nueva generación)');
-      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [false, true], 'reserva ambigua (queda) + la nueva liquidada');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'gamma')).map((x) => x.settled), [true, true], 'reserva ambigua (cobrada, posible duplicado) + la nueva liquidada');
     });
 
     await check('DB Gamma 4xx definitivo (429) → reserva LIBERADA (neto 0), marcador limpio, reintentable; conexión cortada tras enviar → ambiguo con reserva pendiente', async () => {
@@ -846,7 +852,9 @@ async function dbChecks() {
       await rejectsRe(PW.processProviderItem(workerDeps(), again), /tts_failed/, '400 definitivo');
       row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'failed', '400 no reintentable');
-      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [false, true], 'el 400 libera su reserva; la ambigua queda');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'openai')).map((x) => x.settled), [true, true], 'el 400 libera su reserva; la ambigua, cobrada (posible duplicado)');
       eq((await finalCharges(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin cargos finales');
     });
 
@@ -869,7 +877,9 @@ async function dbChecks() {
       row = await itemRow(runA2, item.itemKey);
       eq(row.status, 'completed', `completado (${row.error})`);
       eq((await finalCharges(`item_run_id = $1 and provider = 'anthropic'`, [row.id])).map((x) => x.measurement_status), ['final'], 'cargo medido del intento reconocido');
-      eq((await reservationsOf(row.id, 'anthropic')).find((x) => x.idempotency_key === `reservation:llm:${row.id}:g1:a1:sec0-main`).settled, false, 'la reserva ambigua queda (reconocida)');
+      // r62 (E2E M — cambio DELIBERADO): todo reenvío explícito liquida PRIMERO la reserva incierta del intento previo como
+      // cobrada (possible_duplicate, decidida por quien reenvía): sigue contando como gasto y nunca queda abierta.
+      eq((await reservationsOf(row.id, 'anthropic')).find((x) => x.idempotency_key === `reservation:llm:${row.id}:g1:a1:sec0-main`).settled, true, 'la reserva ambigua: cobrada (posible duplicado)');
       assert(fakes.st.llm.length - llm0 >= 2, 'la llamada ambigua + la nueva');
     });
 
@@ -912,7 +922,8 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set output_summary = output_summary || $2::jsonb where id = $1`,
         [id, JSON.stringify({ paidCallsSent: sent, ...(os.externalSubmitStartedAt ? { externalSubmitStartedAt: old } : {}) })]);
     };
-    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400' };
+    // r62 (M4): el TTS ya no se acorta con PROVIDER_CALL_TIMEOUT_MS (mínimo 210 s): su timeout de prueba va explícito.
+    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400' };
 
     // Review r2 (M8/N1): bienvenida LARGA (3 chunks de TTS) — la unidad se reserva completa y lo nunca enviado se libera.
     const LONG_WELCOME = Array.from({ length: 150 }, (_, i) => `Esta es la oración ${i + 1} de la bienvenida al curso de hidráulica de planta, pensada para técnicos de mantenimiento.`).join(' ');
@@ -1148,17 +1159,13 @@ async function dbChecks() {
       eq(pend.map((x) => x.provider), ['anthropic', 'gamma', 'openai'], 'las tres reservas quedan pendientes (el presupuesto las cuenta)');
     });
 
-    // r62 (K2 — cambio DELIBERADO): un 502 de OpenAI es una respuesta CONOCIDA (reserva liberada, reintentable), no ambigua.
-    await check('FAULT respuesta ambigua del proveedor: Gamma 200 sin generationId → ambiguo; r62: TTS 502 → resultado conocido (reserva liberada, reintentable, sin reconciliación); nunca un reenvío ciego', async () => {
+    await check('FAULT respuesta ambigua del proveedor: Gamma 200 sin generationId → ambiguo; TTS 502 → reconciliación; nunca un reenvío', async () => {
       const R = await freshRun('Fault ambiguo');
       const c0 = counts();
       fakes.plan.gammaPostFail = ['noid'];
       await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'presentation')), /^gamma_submit_ambiguous: .*sin generationId/, 'Gamma sin id');
       fakes.plan.ttsFail = [502];
-      await PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome'));
-      const w = await itemRow(R.rid, `audio_welcome:${R.cid}`);
-      eq([w.status, /^tts_failed: chunk 1\/\d+: openai POST \/audio\/speech HTTP 502/.test(w.error)], ['retrying', true], `TTS 502 (${w.error})`);
-      eq((await reservationsOf(w.id, 'openai')).every((x) => x.settled), true, 'reserva liberada');
+      await rejectsRe(PW.processProviderItem(workerDeps(), await claimProvider(R.rid, 'audio_welcome')), /^provider_reconciliation_required/, 'TTS 502');
       eq(delta(c0), { gamma: 1, tts: 1, llm: 0 }, 'sin reenvíos');
     });
 

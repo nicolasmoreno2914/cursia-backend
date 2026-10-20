@@ -32,7 +32,9 @@ import { isNonRealLlmMode } from '../artifacts/artifact-type-policy';
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
-import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, autoHealPolicyFromEnv, safeAutoRetryDecision } from './auto-heal';
+import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, autoHealPolicyFromEnv, autoRecoveryEnabled, safeAutoRetryDecision } from './auto-heal';
+import { spendControlHoldOf } from '../reliability/spend-control-hold';
+import { claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -151,6 +153,13 @@ export interface RunCompletion {
   /** Items completados pero de vista previa (mock). Orden del Manifest. */
   previewComponents: string[];
   adminActions: RunAdminAction[];
+  /**
+   * r62 (review N1 M1): `true` cuando el run quedaría en `needs_attention` sin ninguna acción humana porque TODO lo que
+   * falta lo está resolviendo el servidor solo (auto-heal con su espera, reenvío único acotado, control de gasto que
+   * espera a revertirse, claim incompleto…). El estado no cambia (el enum es el de siempre); el FE muestra
+   * «Recuperando automáticamente» en vez de «necesita atención».
+   */
+  autoRecovering?: boolean;
   /**
    * BE-B: estado del último job de paquete FINAL del run (solo cuando la generación está completa):
    * `none` (todavía no hay job), `queued`/`running`/`retrying` (armándose), `completed`, `failed`
@@ -524,6 +533,12 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
     return null; // bloqueado por una dependencia: la acción es la de la dependencia
   }
   if (r.status === 'cancelled') return null;
+  // r62 (M1): frenado por un control de gasto (kill switch / allow-list): el barrido lo reabre solo al revertirse.
+  const tickOn0 = autoHealEnabled(process.env);
+  if (tickOn0 && autoRecoveryEnabled(process.env) && spendControlHoldOf(err, r.type)) return null;
+  // r62 (M1): claim incompleto por el dato de la dependencia → lo resuelve el barrido (reapertura / regenerate_dependency)
+  // hasta que lo registra como excepción (claimPayloadRecovery.declined).
+  if (tickOn0 && autoRecoveryEnabled(process.env) && claimPayloadDependencyKey(r as any) && !s.claimPayloadRecovery?.declined) return null;
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
   // REL MVP: id (semilla del jitter) y clase registrada → misma decisión que el barrido y el lock.
   const ahRow = { id: r.id, status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null,
@@ -603,9 +618,16 @@ export function evaluateRunCompletion(
     seen.add(k);
     actions.push(a);
   };
+  // r62 (M1): partes que el servidor está recuperando solo (fallidas sin acción humana, o bloqueadas por una de ellas).
+  let autoPending = false;
   for (const it of manifest.items) {
     const c = classes.get(it.key) as ItemCompletionClass;
-    if (c === 'not_done' || c === 'unvalidated') push(adminActionFor(rowsByKey.get(it.key), c, now));
+    if (c === 'not_done' || c === 'unvalidated') {
+      const row = rowsByKey.get(it.key);
+      const a = adminActionFor(row, c, now);
+      push(a);
+      if (!a && c === 'not_done' && row && row.status === 'failed') autoPending = true;
+    }
   }
   if (previewComponents.some((k) => k.startsWith('video:')) && manifest.rulesVersion === 3) push({ code: 'generate_real_videos' });
   // V542 (G6): nunca se liberan solas (resultado incierto): una acción de admin por reserva.
@@ -639,6 +661,7 @@ export function evaluateRunCompletion(
 
   // §2.6: upgrade fallido de un run de vista previa → siempre recuperación (nunca «listo»).
   if (opts.upgradeOnlyFailure && state !== 'in_progress') state = 'needs_attention';
+  const autoRecovering = state === 'needs_attention' && actions.length === 0 && autoPending && autoHealEnabled(process.env);
 
   return {
     state,
@@ -648,6 +671,7 @@ export function evaluateRunCompletion(
     missingComponents,
     previewComponents,
     adminActions: actions,
+    ...(autoRecovering ? { autoRecovering: true } : {}),
     ...(generationComplete && pkg && pkg.status !== undefined
       ? { packageJob: {
           status: packageReady ? 'completed' : String(pkg.status ?? 'none'),

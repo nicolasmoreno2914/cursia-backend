@@ -64,6 +64,14 @@ async function check(name, fn) {
 const assert = (c, m) => { if (!c) throw new Error(m); };
 const eq = (a, b, m) => { const x = JSON.stringify(a); const y = JSON.stringify(b); if (x !== y) throw new Error(`${m}: esperado ${y}, encontrado ${x}`); };
 const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+/** r62 (G-rereview2 m-1): espera a una CONDICIÓN (polling con tope) en vez de un tiempo fijo de pared. */
+async function until(cond, what, maxMs = 10_000) {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > maxMs) throw new Error(`timeout esperando: ${what}`);
+    await tick(5);
+  }
+}
 const sse = (t, o) => `event: ${t}\ndata: ${JSON.stringify({ type: t, ...o })}\n\n`;
 const like = (pat) => new RegExp('^' + pat.split('%').map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/_/g, '.')).join('.*') + '$');
 async function err(p) { try { return { v: await p }; } catch (e) { return { e }; } }
@@ -93,7 +101,7 @@ async function fakeAnthropic(opts = {}) {
 }
 
 function world() {
-  const w = { owner: 'A', cps: {}, store: new Map(), res: new Map(), finals: [], late: [] };
+  const w = { owner: 'A', cps: {}, sent: {}, store: new Map(), res: new Map(), finals: [], late: [] };
   w.ds = {
     async query(sql, params) {
       if (sql.includes('as remaining_ms')) {
@@ -109,28 +117,37 @@ function world() {
       }
       if (sql.includes('count(*)::int as n')) {
         const [keyLike, tagLike, , exclude] = params;
-        return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k)).length }];
+        return [{ n: [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || v.possibleDuplicate) && !exclude.includes(k)).length }];
       }
       // r62: reservas desconocidas de UNA llamada (el próximo envío es el reenvío ambiguo único de la parte).
       if (sql.includes('e.idempotency_key as key, e.amount::text as amount')) {
-        const [keyLike, tagLike, , exclude] = params;
-        return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && !v.settled && !exclude.includes(k))
-          .map(([k]) => ({ key: k, amount: String(UB) }));
+        const [keyLike, tagLike, , exclude, includePd] = params;
+        return [...w.res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
+          .map(([k, v]) => ({ key: k, amount: String(UB), settled: !!v.settled, send_marked: !!v.sendMarked }));
       }
-      if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps } }];
+      // r62: marca durable de envío (LLM_MARK_SENT_SQL) del worker dueño de la parte.
+      if (sql.includes("'{llmSent}'")) { if (params[1] !== w.owner) return []; w.sent[params[2]] = params[3]; return [{ id: params[0] }]; }
+      if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...w.cps }, sent: { ...w.sent } }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
     },
   };
   w.finops = {
-    async recordCharge(i) { w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, settled: false, at: Date.now() }); return {}; },
+    async recordCharge(i) { w.res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false, at: Date.now() }); return {}; },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },
+    // r62 (I3): conciliación conservadora del reenvío ambiguo (obligatoria: sin ella el worker falla cerrado).
+    async reconcileReservationAsCharged(key, reason, o) {
+      const r = w.res.get(key);
+      if (!r || r.settled) return { reconciled: false, alreadySettled: true, amount: '0', event: null };
+      Object.assign(r, { settled: true, possibleDuplicate: !!(o && o.metadata && o.metadata.possibleDuplicate), reason });
+      return { reconciled: true, alreadySettled: false, amount: '1', event: null };
+    },
     async settleReservation(key, charge, reason) {
       const r = w.res.get(key); r.settled = true; r.reason = reason;
       if (charge) w.finals.push({ key, idem: charge.externalOperationId });
       return { finalInserted: !!charge, finalEvent: null };
     },
   };
-  w.budget = { guardServerLlmCall: async () => null, pauseRunBySystem: async () => true };
+  w.budget = { guardServerLlmCall: async () => null, ambiguousResendBudget: async () => ({ fits: true, reason: null, worstItem: 0, worstRun: 0 }), pauseRunBySystem: async () => true };
   w.api = (who, url, extra = {}) => {
     const attempt = who === 'A' ? 1 : 2;
     return SL.createServerApi({
@@ -211,10 +228,10 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
 (async () => {
   // ─── LLM ────────────────────────────────────────────────────────────────────────────────────────────────────────
   await check('LT1 LLM: A en vuelo + toma → B NO reenvía (prior_call_in_flight, 0 pedidos/reservas); A deja guardado tardío; B retoma de ahí → 1 pedido, 1 cargo real, 0 pendientes', async () => {
-    const a = await fakeAnthropic({ holdMs: 250 });
+    const a = await fakeAnthropic({ holdMs: 1500 });
     const w = world();
     const pA = err(w.api('A', a.url)('s', 'P'));
-    await tick(60);
+    await until(() => a.st.requests === 1, 'el pedido de A llegó a Anthropic');
     w.owner = 'B';
     const b1 = await err(w.api('B', a.url)('s', 'P'));
     assert(b1.e && b1.e.handBack === LT.PRIOR_CALL_IN_FLIGHT && b1.e.retryAfterSeconds >= 50 && /^prior_call_in_flight:/.test(b1.e.msg), `B devuelve: ${JSON.stringify(b1.e)}`);
@@ -245,12 +262,14 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
     w3.res.set(pendKey(hash), { tag: `llmw-main-${hash.slice(0, 12)}-1-deadbeef`, settled: false, at: Date.now() });
     w3.owner = 'B';
     const a2 = await fakeAnthropic({ holdMs: 0 });
-    const b1 = await err(w3.api('B', a2.url, { windowMs: 200 })('s', 'P'));
+    const b1 = await err(w3.api('B', a2.url, { windowMs: 5000 })('s', 'P'));
     assert(b1.e && b1.e.handBack === LT.PRIOR_CALL_IN_FLIGHT, `dentro de la ventana: devuelve (${JSON.stringify(b1.e)})`);
     eq(a2.st.requests, 0, 'dentro de la ventana: 0 pedidos');
-    await tick(230);
-    const b2 = await err(w3.api('B', a2.url, { windowMs: 200 })('s', 'P'));
-    eq([b2.v, a2.st.requests, w3.pending()], ['R1', 1, 1], 'pasada la ventana: UN pedido (regla de desconocido); la reserva perdida sigue pendiente para conciliar');
+    // Pasada la ventana: se fecha la reserva de A fuera de ella (sin depender del reloj de pared).
+    w3.res.get(pendKey(hash)).at = Date.now() - 60_000;
+    const b2 = await err(w3.api('B', a2.url, { windowMs: 5000 })('s', 'P'));
+    // r62: el reenvío único liquida PRIMERO la reserva perdida como cobrada (posible duplicado): ninguna queda abierta.
+    eq([b2.v, a2.st.requests, w3.pending(), [...w3.res.values()].filter((v) => v.possibleDuplicate).length], ['R1', 1, 0, 1], 'pasada la ventana: UN pedido (regla de desconocido); la reserva perdida queda cobrada como posible duplicado');
     await a2.close();
   });
 
@@ -416,7 +435,7 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
   }
 
   await check('LT11 processLlmItem de punta a punta: B (tras drenaje) y C (tras reapertura del auto-heal) NO reenvían la llamada en vuelo de A; A deja guardado tardío; D completa desde él', async () => {
-    const a = await fakeAnthropic({ holdMs: 300 });
+    const a = await fakeAnthropic({ holdMs: 1500 });
     const w = world();
     w.owner = 'w-A';
     const base = w.ds.query;
@@ -459,7 +478,7 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
     });
     const item = (attempt, previousError) => ({ itemRunId: IRID, runId: RUN, itemKey: 'content:x', type: 'content', attempt, generation: 1, artifactCourseId: '7', manifestId: 3, idempotencyKey: 'idem', previousError });
     const pA = LW.processLlmItem(deps('w-A'), item(1, null));
-    await tick(80);
+    await until(() => a.st.requests === 1, 'el pedido de A llegó a Anthropic');
     // La lease de A vence; un reclamante B (no ejecutado aquí) la devolvió por drenaje → C ve previousError=worker_draining.
     w.owner = 'w-C';
     const rC = await LW.processLlmItem(deps('w-C'), item(3, 'worker_draining: el worker se reinicia'));

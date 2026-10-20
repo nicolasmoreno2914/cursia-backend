@@ -37,6 +37,7 @@ import {
 // el sistema.
 import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv, autoRecoveryEnabled } from '../dynamic-generation/auto-heal';
 import { spendControlHoldOf } from './spend-control-hold';
+import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
 
 export type FailureClass = 'A' | 'B' | 'C' | 'D';
 export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
@@ -243,8 +244,8 @@ export const PROVIDER_CALL_RULE_IDS: readonly string[] = Object.freeze(Object.ke
  * guarda cada segmento apenas se paga y lo anota («chunk N/M (persisted J)» → N-1-J): con todos los
  * anteriores guardados el reintento solo sintetiza lo que falta (A, sin riesgo de pagar dos veces).
  */
-/** r62 (K2): mensaje de TTS con una RESPUESTA HTTP del proveedor (formato de classify() en provider-clients.ts). */
-const TTS_KNOWN_HTTP_RE = /\bopenai POST \/audio\/speech HTTP (?:429|5\d\d)\b/;
+/** r62 (K2, review C1): mensaje de TTS con un rechazo de admisión del proveedor (429/503/529; formato de classify()). */
+const TTS_KNOWN_HTTP_RE = /\bopenai POST \/audio\/speech HTTP (?:429|503|529)\b/;
 
 function ttsPaidChunks(error: string): number {
   const m = /chunk (\d+)\/(\d+)(?: \(persisted (\d+)\))?/.exec(error);
@@ -447,7 +448,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item',
     // r62 (d8): un claim incompleto por un DATO de la dependencia (video del capítulo) no es un contrato roto: B
     // `regenerate_dependency` (lo aplica solo el barrido autoRecoverClaimPayloadUnavailable, una vez y con presupuesto).
-    refine: ({ code, error }) => (code === 'claim_payload_unavailable' && /^claim_payload_unavailable:\s*VIDEO_[A-Z0-9_]+\b/.test(error)
+    refine: ({ code, error }) => (code === 'claim_payload_unavailable' && CLAIM_PAYLOAD_DEPENDENCY_RE.test(error)
       ? { class: 'B', strategy: 'regenerate_dependency', rounds: 1, humanReason: undefined, adminAction: undefined }
       : null),
   },
@@ -520,7 +521,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // ── TTS (OpenAI) ───────────────────────────────────────────────────────────
   {
     // Antes del primer trozo cobrado → A. Después de trozos ya cobrados (chunk N/M, N > 1) → C (user decision 1).
-    // r62 (K2, regla punto 4): con una RESPUESTA HTTP del proveedor (429/5xx con cuerpo; 408/409 siguen ambiguos) el resultado es
+    // r62 (K2, regla punto 4; review C1): con un RECHAZO DE ADMISIÓN del proveedor (429/503/529; el resto es ambiguo) el resultado es
     // CONOCIDO: el worker liberó la reserva de ese trozo y reconoció el intento (los trozos anteriores quedaron cobrados
     // y medidos en el ledger); repetirlo es gasto medido dentro del presupuesto de la parte → A (backoff), no C.
     id: 'tts_failed', codes: ['tts_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3,
@@ -734,7 +735,7 @@ export function currentRecoveryOf(
   // r62 (K3): frenado por un control de gasto → lo reabre solo el barrido al revertirse (si la recuperación está activa).
   if (spendControlHoldOf(e, itemType) && autoRecoveryEnabled(process.env)) return 'spend_control_resume';
   // r62 (d8): claim incompleto por el dato de la dependencia → regenerate_dependency automático (barrido propio).
-  if (/^claim_payload_unavailable:\s*VIDEO_[A-Z0-9_]+\b/.test(e) && itemType === 'video_interactions' && autoRecoveryEnabled(process.env)
+  if (CLAIM_PAYLOAD_DEPENDENCY_RE.test(e) && itemType === 'video_interactions' && autoRecoveryEnabled(process.env)
     && !os.claimPayloadRecovery?.declined) return 'auto_regenerate';
   // #583: va ANTES de la deny-list (la deny-list describe justamente este caso incierto; la función de
   // auto-heal aplica su propia deny-list reducida).

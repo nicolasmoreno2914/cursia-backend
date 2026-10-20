@@ -146,9 +146,22 @@ export interface TtsCallResult {
  * la ventana en vuelo de Q-21 (lease-takeover.ts, IN_FLIGHT_WINDOW_MS.openai) se deriva de este valor.
  */
 export const OPENAI_TTS_TIMEOUT_MS = 210_000;
+export const OPENAI_TTS_TIMEOUT_ENV = 'OPENAI_TTS_TIMEOUT_MS';
+
+/**
+ * r62 (review M4): timeout EFECTIVO del cliente TTS. `PROVIDER_CALL_TIMEOUT_MS` (acorta los demás proveedores) ya NO lo
+ * baja del mínimo de 210 s: un valor operativo genérico (p. ej. 8 s del E2E o un 120 s heredado) reintroduciría el
+ * timeout ambiguo de #1510. Solo `OPENAI_TTS_TIMEOUT_MS` explícito lo cambia (pruebas de fault injection / E2E); el
+ * worker lo loguea al arrancar.
+ */
+export function ttsTimeoutMs(env: Env): { ms: number; source: 'default' | 'OPENAI_TTS_TIMEOUT_MS' } {
+  const n = Number(env[OPENAI_TTS_TIMEOUT_ENV]);
+  if (Number.isInteger(n) && n > 0) return { ms: n, source: 'OPENAI_TTS_TIMEOUT_MS' };
+  return { ms: OPENAI_TTS_TIMEOUT_MS, source: 'default' };
+}
 
 export class OpenAiTtsClient {
-  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = callTimeoutMs(env, OPENAI_TTS_TIMEOUT_MS)) {
+  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = ttsTimeoutMs(env).ms) {
     if (!apiKey || !apiKey.trim()) throw new ProviderCallError('openai', false, 'openai: OPENAI_API_KEY no configurada');
   }
 

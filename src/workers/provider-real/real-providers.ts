@@ -143,13 +143,15 @@ export function isDefinitiveRejection(err: unknown): boolean {
 }
 
 /**
- * r62 (K2, regla de ambigüedad acotada punto 4): el proveedor RESPONDIÓ con un error transitorio (429 o 5xx, con su
- * cuerpo: p. ej. «HTTP 504: upstream request timeout»). Es un resultado CONOCIDO, no un timeout del cliente: OpenAI no
- * cobra una respuesta de error, la reserva se libera y el intento se reintenta con backoff (clase A). 408/409 siguen
- * siendo ambiguos (review previa: no prueban que no se procesó).
+ * r62 (K2, regla de ambigüedad acotada punto 4; review N1 C1): solo un RECHAZO DE ADMISIÓN del proveedor es un resultado
+ * CONOCIDO sin cobro: 429 (rate limit), 503 (servicio no disponible) y 529 (sobrecarga). La reserva se libera y el intento
+ * se reintenta con backoff (clase A). 500/502/504/524 —un gateway que corta mientras el upstream sigue trabajando, como
+ * los cuelgues de 125–172 s que OpenAI terminó y COBRÓ (phase-b-n1-tts-root-cause.md)— y 408/409 son AMBIGUOS: la
+ * reserva queda y van por la reconciliación con el reenvío único acotado de K1 (possible_duplicate).
  */
+export const TTS_KNOWN_NOT_CHARGED_STATUSES: readonly number[] = Object.freeze([429, 503, 529]);
 export function isKnownTransientHttpError(err: unknown): boolean {
-  return err instanceof ProviderCallError && err.status !== null && (err.status === 429 || err.status >= 500);
+  return err instanceof ProviderCallError && err.status !== null && TTS_KNOWN_NOT_CHARGED_STATUSES.includes(err.status);
 }
 
 export interface RealProviderDeps {
@@ -1315,9 +1317,12 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       // Calibración #2: reserva DURABLE del segmento antes de llamar (si falla, no se llama a OpenAI).
       const resKey = await reservePaidCall(deps.finops, {
         kind: 'tts', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
-        tag: `seg:${seg.key}`, estimate: { characters: seg.chars, model },
+        tag: `seg:${seg.key}`, estimate: { characters: seg.chars, model }, sendMarked: true,
       });
       if (tracker) tracker.inFlight = { provider: 'openai', key: resKey };
+      // r62 (E2E M): marca DURABLE de envío justo antes de llamar: si el worker muere entre la reserva y el envío, el
+      // próximo intento ve la reserva sin marca (`sendMarked` sin `paidCallsSent`) y la libera sola (nunca salió).
+      await markPaidCallSent(deps, item, resKey);
       let res;
       try {
         res = await tts.speech({ model, voice, input: seg.text });
@@ -1647,8 +1652,10 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
     isPersistedOutput: (r) => !r.reservation && !!r.external_operation_id && persisted.has(r.external_operation_id),
     // Gamma: el marcador de envío se escribe DESPUÉS de la reserva y ANTES de llamar. Una reserva de
     // Gamma sin marcador que la nombre = la llamada nunca se hizo → se libera.
-    isSubmitMarked: (key) => {
+    isSubmitMarked: (key, row) => {
       if (key.startsWith('reservation:gamma:')) return key === markedKey;
+      // r62 (E2E M): reserva con marca durable de envío (segmento del audiolibro) → enviada solo si tiene su marca.
+      if (row && row.send_marked) return !!(os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object' && os[PAID_CALLS_SENT_KEY][key]);
       // Review r2 (N1): reserva de unidad sin marcador de envío = nunca salió → liberable.
       if (isUnitReservationKey(key)) return !!(os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object' && os[PAID_CALLS_SENT_KEY][key]);
       return true;
