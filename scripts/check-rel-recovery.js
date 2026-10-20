@@ -260,7 +260,8 @@ async function dbChecks() {
       const prod = fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8');
       assert(/MIGRATION_ENV=staging node scripts\/migrate-rel-recovery\.js/.test(stg) && /MIGRATION_ENV=staging node scripts\/verify-rel-recovery-schema\.js/.test(stg), 'staging');
       assert(stg.indexOf('migrate-rel-recovery.js') > stg.indexOf('migrate-v21-finops.js'), 'después del ledger FinOps (vista de costos)');
-      assert(!/rel-recovery/.test(prod), 'deploy.yml (producción) no la corre');
+      // r61: deploy.yml sí corre el CHECK puro (check-rel-recovery.js --pure-only); lo prohibido es la migración/verify.
+      assert(!/(migrate|verify)-rel-recovery/.test(prod), 'deploy.yml (producción) no la corre');
       const plan = JSON.parse(spawnSync(process.execPath, [path.join(REPO, 'scripts/prod/migrate-v2-production.js'), '--plan-json'], { cwd: tmpCwd, env: cleanEnv({}), encoding: 'utf8' }).stdout);
       const st = plan.steps.find((s) => s.id === 'rel-recovery');
       assert(st && st.status === 'included' && st.transactional === true && st.file === 'supabase-migration-rel-recovery.sql', 'paso prod: ' + JSON.stringify(st));

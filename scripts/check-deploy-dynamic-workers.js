@@ -13,11 +13,12 @@
 //     - R16 (#1): en deploy-staging.yml los 3 workers dinámicos usan
 //       ensure_pm2_drain_worker (node dist/workers/<w>.js directo, kill_timeout
 //       300 s, reload; un proceso heredado de npm se recrea una vez) —
-//       ejecutado contra un pm2 falso. deploy.yml (producción) sigue igual.
-//     - deploy.yml == deploy.yml de origin/main + EXACTAMENTE las 2 líneas de
-//       los workers (nada más cambió). Base configurable con
-//       DEPLOY_YML_BASE_REF (default origin/main). Si la base ya las contiene
-//       (post-merge), la comparación es por identidad.
+//       ejecutado contra un pm2 falso.
+//     - r61: producción también drena. deploy.yml delega el lado VPS en
+//       scripts/ops/prod-release.sh (install/rollback), que recarga los 3 workers
+//       dinámicos con ensure_pm2_drain_worker (mismo cuerpo que staging) y el resto
+//       con ensure_pm2_process; que V1 siga igual que en origin/main lo prueba
+//       scripts/ci/check-prod-deploy-hardening.js (ejecutado con pm2 falso).
 //     - El script remoto (entre comillas simples) de ambos steps de deploy
 //       parsea con `bash -n` (una comilla simple suelta lo cortaría).
 //     - Staging: el bloque [0b] de flags es idempotente y solo imprime nombres
@@ -37,7 +38,7 @@ const path = require('path');
 const fs = require('fs');
 const net = require('net');
 const os = require('os');
-const { spawn, spawnSync, execFileSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 
 const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.resolve(process.cwd(), process.argv[2] || 'dist');
@@ -63,7 +64,7 @@ const WORKERS = [
     onEnv: { DYNAMIC_PROVIDER_WORKER_ENABLED: 'true' },
   },
 ];
-const PROD_ADDED_LINES = WORKERS.map((w) => `               ensure_pm2_process ${w.pm2} ${w.npm}`);
+const PROD_RELEASE_SH = 'scripts/ops/prod-release.sh';
 const OWNER = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
 const IPV4_RE = /\b(?!127\.0\.0\.1\b)(?:\d{1,3}\.){3}\d{1,3}\b/g;
 
@@ -184,23 +185,6 @@ function assertWorkersInStep(step, suffix, wfName, drain = false) {
 function bashSyntaxOk(script, label) {
   const r = spawnSync('bash', ['-n'], { input: script, encoding: 'utf8' });
   assert(r.status === 0, `${label}: bash -n falló:\n${r.stderr}`);
-}
-
-function gitShow(ref, rel) {
-  return execFileSync('git', ['show', `${ref}:${rel}`], { cwd: repoRoot, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-}
-function baseDeployYml() {
-  const ref = process.env.DEPLOY_YML_BASE_REF || 'origin/main';
-  try {
-    return { ref, text: gitShow(ref, PROD_WF) };
-  } catch (e) {
-    if (ref !== 'origin/main') throw new Error(`no se pudo leer ${PROD_WF} en ${ref}: ${e.message}`);
-    // Checkout superficial de CI: traer solo main.
-    execFileSync('git', ['fetch', '--no-tags', '--depth=1', 'origin', '+refs/heads/main:refs/remotes/origin/main'], {
-      cwd: repoRoot, stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    return { ref, text: gitShow(ref, PROD_WF) };
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -398,10 +382,24 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
   const prodText = readWf(PROD_WF);
   const stagingText = readWf(STAGING_WF);
 
-  await check('(a) deploy.yml: arranca/recarga cursia-dynamic-{item,package,provider}-worker con PM2 en el step de los workers', () => {
-    const step = pm2StepOf(prodText, 'deploy.yml');
-    const script = assertWorkersInStep(step, '', 'deploy.yml');
-    bashSyntaxOk(script, 'deploy.yml (script remoto)');
+  await check('(a) producción (r61): deploy.yml → scripts/ops/prod-release.sh install; cursia-dynamic-{item,package,provider}-worker con ensure_pm2_drain_worker (node directo + kill_timeout 300 s), mismo cuerpo que staging', () => {
+    assert(/cd '\$DEPLOY_VPS_PATH' && bash scripts\/ops\/prod-release\.sh install/.test(prodText), 'deploy.yml no delega en prod-release.sh install');
+    assert(!/ensure_pm2_process\s+cursia-/.test(prodText), 'deploy.yml no debe arrancar procesos inline (los arranca prod-release.sh)');
+    const sh = readWf(PROD_RELEASE_SH);
+    bashSyntaxOk(sh, PROD_RELEASE_SH);
+    const body = (txt, fn) => { const m = new RegExp(`${fn}\\(\\) \\{([\\s\\S]*?)\\n\\}`).exec(txt); assert(m, `falta ${fn}()`); return m[1]; };
+    const norm = (b) => b.split('\n').map((l) => l.trim()).filter(Boolean).join('\n').replace(/\$PM2/g, 'sudo pm2');
+    const stagingScript = remoteScriptOf(pm2StepOf(stagingText, 'deploy-staging.yml').text);
+    eq(norm(body(sh, 'ensure_pm2_drain_worker')), norm(body(stagingScript, 'ensure_pm2_drain_worker')), 'ensure_pm2_drain_worker = staging');
+    eq(norm(body(sh, 'ensure_pm2_process')), norm(body(stagingScript, 'ensure_pm2_process')), 'ensure_pm2_process = staging');
+    assert(sh.includes(`DRAIN_KILL_TIMEOUT_MS=${DRAIN_KILL_TIMEOUT_MS}`), 'kill_timeout 300 s');
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    for (const w of WORKERS) {
+      eq((sh.match(new RegExp(`"${w.pm2} dist/workers/${w.script.replace('.', '\\.')}"`, 'g')) || []).length, 1, `${w.pm2} en PROD_PROCESSES_DRAIN (una vez)`);
+      eq(pkg.scripts[w.npm], `node dist/workers/${w.script}`, `package.json ${w.npm}`);
+      assert(fs.existsSync(path.join(distRoot, 'workers', w.script)), `dist/workers/${w.script} no existe`);
+      assert(!new RegExp(`ensure_pm2_process\\s+${w.pm2}\\b|"${w.pm2} start:`).test(sh), `${w.pm2} no debe pasar por npm en producción`);
+    }
   });
 
   await check('(a) deploy-staging.yml: arranca/recarga los 3 workers dinámicos -staging con PM2 en el step de los workers (R16: node directo + kill_timeout 300 s)', () => {
@@ -465,36 +463,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     }
   });
 
-  await check(`(a) deploy.yml = base (origin/main) + EXACTAMENTE las ${PROD_ADDED_LINES.length} líneas de los workers dinámicos (ningún otro step cambió)`, () => {
-    const { ref, text: base } = baseDeployYml();
-    const cur = prodText.split('\n');
-    // M6 (integral-review): el único otro cambio permitido es quitar IPs de los
-    // COMENTARIOS (placeholder <VPS_HOST>); el host real sale del secret VPS_HOST.
-    const baseLines = base.split('\n').map((l) => (/^\s*#/.test(l) ? l.replace(IPV4_RE, '<VPS_HOST>') : l));
-    const baseHas = PROD_ADDED_LINES.every((l) => baseLines.includes(l));
-    if (baseHas) {
-      eq(cur.join('\n') === baseLines.join('\n'), true, `deploy.yml difiere de ${ref} (que ya incluye los workers)`);
-      return;
-    }
-    // V2.1 RF-b: la base puede traer ya un subconjunto de los workers (p.ej. item +
-    // package tras su merge): se quitan de la base y se re-insertan TODOS, en
-    // orden, justo después del full-worker.
-    const anchor = '               ensure_pm2_process cursia-full-worker start:full-worker';
-    const baseRest = baseLines.filter((l) => !PROD_ADDED_LINES.includes(l));
-    const idx = baseRest.indexOf(anchor);
-    assert(idx >= 0, `${ref}: no se encontró la línea del full-worker (ancla)`);
-    const expected = [...baseRest.slice(0, idx + 1), ...PROD_ADDED_LINES, ...baseRest.slice(idx + 1)];
-    if (cur.join('\n') !== expected.join('\n')) {
-      const diffAt = cur.findIndex((l, i) => l !== expected[i]);
-      throw new Error(
-        `deploy.yml no es ${ref} + las ${PROD_ADDED_LINES.length} líneas esperadas (primera diferencia en la línea ${diffAt + 1}: ` +
-          `got ${JSON.stringify(cur[diffAt])}, want ${JSON.stringify(expected[diffAt])})`,
-      );
-    }
-  });
-
   await check('(M6) deploy.yml / deploy-staging.yml sin IPs públicas versionadas (el host viene del secret VPS_HOST)', () => {
-    for (const [name, text] of [['deploy.yml', prodText], ['deploy-staging.yml', stagingText]]) {
+    for (const [name, text] of [['deploy.yml', prodText], ['deploy-staging.yml', stagingText], [PROD_RELEASE_SH, readWf(PROD_RELEASE_SH)]]) {
       const hits = text.split('\n').filter((l) => { IPV4_RE.lastIndex = 0; return IPV4_RE.test(l); });
       eq(hits, [], `${name}: líneas con IPv4`);
     }

@@ -1,23 +1,44 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# deploy.yml — CI/CD: push a main → deploy automático en VPS Contabo
+# deploy.yml — CI/CD de PRODUCCIÓN: push a main → deploy en el VPS Contabo.
+# r61: endurecido con los resguardos de deploy-staging.yml que aplican a producción.
+# Sigue sirviendo V1: los procesos y las migraciones de siempre no cambian; V2 queda
+# APAGADO salvo un canario explícito del owner. Runbook:
+# docs/v2-production-promotion-runbook.md.
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# REQUISITOS (GitHub → Settings → Secrets and variables → Actions):
+# SECRETS (GitHub → Settings → Secrets and variables → Actions; environment "production"
+# o repo):
+#   VPS_HOST, VPS_USER, VPS_SSH_KEY, VPS_PATH, HEALTH_URL   (los de siempre)
+#   FRONTEND_REPO_READ_TOKEN        PAT fine-grained SOLO LECTURA (Contents: Read) sobre
+#                                   nicolasmoreno2914/cursia — gate REL R1 del frontend.
+#                                   OBLIGATORIO en producción (sin él el deploy falla).
+#   FINOPS_INGEST_TOKEN_PRODUCTION  token de ingest FinOps de PRODUCCIÓN (≠ staging); viaja
+#                                   por stdin y se escribe en el .env sin imprimirse.
 #
-#   VPS_HOST        IP pública del VPS Contabo (<VPS_HOST>)
-#   VPS_USER        Usuario SSH (cursia)
-#   VPS_SSH_KEY     Clave privada SSH ed25519 del usuario cursia
-#   VPS_PATH        /var/www/cursia-backend
-#   HEALTH_URL      https://api.cursia.nomaddi.com/health
+# VARIABLES (environment "production" de preferencia; nunca secretos acá):
+#   DEPLOY_FREEZE=true              congela el deploy (escape: dispatch force_deploy=yes).
+#                                   A nivel repo congela TAMBIÉN staging.
+#   PROD_V2_CANARY_OWNER=<uuid>     enciende V2 SOLO para ese owner (vacío = V2 apagado).
+#   PROD_V2_WORKERS_ENABLED=true    con canario: enciende el worker de proveedores reales
+#                                   + el worker de IA hospedado (gasto). Default false.
+#   PROD_V2_GENERAL_AVAILABILITY=true  único modo de permitir V2 con allowlist vacía.
+#   PROD_DB_POOL_MAX / PROD_DB_POOL_MAX_WORKER / PROD_DB_POOL_IDLE_MS_WORKER
+#                                   pool por proceso (vacío = no se toca el .env).
+#   PROD_DEPLOY_BLOCK_ON_V1_JOBS=true  los jobs V1 con lease vigente también bloquean.
+#   PROD_FE_GATE_REF                rama/commit del frontend para el gate REL R1 (default main).
 #
-# ESTRATEGIA (una sola fase):
-#   1. Compilar TypeScript en el runner de GitHub (Ubuntu, Node 22).
-#   2. rsync de todo — incluido dist/ — al VPS con la clave SSH.
-#      Esto reemplaza cualquier dist/ antiguo (incluso si era de root),
-#      porque rsync crea los archivos como el usuario SSH (cursia).
-#   3. SSH al VPS: npm install --omit=dev, migraciones, pm2 reload.
-#      No se compila en el VPS → sin problema de permisos.
-#
+# ESTRATEGIA:
+#   0. Guardia DEPLOY_FREEZE (primer paso).
+#   1. Build + checks deterministas en el runner (sin Moodle) + gate REL R1 con frontend.
+#   2. Preflight en el VPS, ANTES del rsync (solo lectura; scripts por stdin):
+#      .env con NODE_ENV=production, V2 no abierto a todos, runs/empaques activos
+#      (check-active-runs.js) y esquema V2 COMPLETO + seed de precios (v2-schema-probes.js).
+#      El esquema NUNCA se migra desde acá: solo v2-production-migrations.yml.
+#   3. Snapshot de la release actual en .release-prev/ (rollback) → rsync → install
+#      (scripts/ops/prod-release.sh install): flags V2, npm, 2 migraciones de siempre,
+#      PM2 (workers dinámicos con drenado), presencia + estabilidad, sondas de la base.
+#   4. Health check HTTP → marca la release sana.
+#   Rollback: workflow_dispatch con action=rollback (restaura .release-prev/, sin migrar).
 # ══════════════════════════════════════════════════════════════════════════════
 
 name: Deploy to Contabo VPS
@@ -26,18 +47,85 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      action:
+        description: 'deploy = deploy normal | rollback = restaurar la release anterior (.release-prev) SIN migrar'
+        type: choice
+        options: ['deploy', 'rollback']
+        default: 'deploy'
+      # Escape EXPLÍCITO de la guardia de congelamiento (DEPLOY_FREEZE + runs/empaques activos).
+      # Solo por dispatch: un push nunca la saltea. No saltea el esquema ni los checks.
+      force_deploy:
+        description: 'yes = desplegar aunque DEPLOY_FREEZE=true o haya runs dinámicos / empaques activos (el deploy los interrumpe)'
+        type: choice
+        options: ['no', 'yes']
+        default: 'no'
 
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     name: Build & Deploy to VPS
+    if: github.event_name == 'push' || inputs.action == 'deploy' || inputs.action == ''
     runs-on: ubuntu-latest
     environment: production
 
     steps:
+      # Primer paso: nada corre antes.
+      - name: Deploy freeze guard (DEPLOY_FREEZE variable)
+        env:
+          DEPLOY_FREEZE: ${{ vars.DEPLOY_FREEZE }}
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy || 'no' }}
+        run: |
+          freeze="$(printf '%s' "$DEPLOY_FREEZE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          if [ "$freeze" = "true" ]; then
+            if [ "$FORCE_DEPLOY" = "yes" ]; then
+              echo "::warning::DEPLOY_FREEZE=true pero force_deploy=yes: el deploy sigue (forzado)."
+            else
+              echo "::error::DEPLOY_FREEZE=true: deploys a producción congelados. Forzar: workflow_dispatch con force_deploy=yes."
+              exit 1
+            fi
+          fi
+          echo "✓ sin DEPLOY_FREEZE (o forzado)"
+
+      - name: Resolve production V2 config (variables, validadas; sin secretos)
+        id: cfg
+        env:
+          CANARY: ${{ vars.PROD_V2_CANARY_OWNER }}
+          WORKERS: ${{ vars.PROD_V2_WORKERS_ENABLED }}
+          GA: ${{ vars.PROD_V2_GENERAL_AVAILABILITY }}
+          POOL_MAX: ${{ vars.PROD_DB_POOL_MAX }}
+          POOL_MAX_WORKER: ${{ vars.PROD_DB_POOL_MAX_WORKER }}
+          POOL_IDLE_WORKER: ${{ vars.PROD_DB_POOL_IDLE_MS_WORKER }}
+          BLOCK_V1: ${{ vars.PROD_DEPLOY_BLOCK_ON_V1_JOBS }}
+          FE_REF: ${{ vars.PROD_FE_GATE_REF }}
+        run: |
+          set -e
+          CANARY="$(printf '%s' "$CANARY" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          if [ -n "$CANARY" ] && ! printf '%s' "$CANARY" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+            echo "::error::PROD_V2_CANARY_OWNER no es un UUID"; exit 1
+          fi
+          b() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in true) echo true ;; ''|false) echo false ;; *) echo "::error::$2 debe ser true|false" >&2; return 1 ;; esac; }
+          WORKERS="$(b "$WORKERS" PROD_V2_WORKERS_ENABLED)"
+          GA="$(b "$GA" PROD_V2_GENERAL_AVAILABILITY)"
+          BLOCK_V1="$(b "$BLOCK_V1" PROD_DEPLOY_BLOCK_ON_V1_JOBS)"
+          for v in "$POOL_MAX" "$POOL_MAX_WORKER" "$POOL_IDLE_WORKER"; do
+            if [ -n "$v" ] && ! printf '%s' "$v" | grep -Eq '^[0-9]{1,6}$'; then echo "::error::PROD_DB_POOL_* debe ser un entero"; exit 1; fi
+          done
+          FE_REF="${FE_REF:-main}"
+          if ! printf '%s' "$FE_REF" | grep -Eq '^[A-Za-z0-9._/-]{1,100}$'; then echo "::error::PROD_FE_GATE_REF inválido"; exit 1; fi
+          if [ "$WORKERS" = "true" ] && [ -z "$CANARY" ]; then echo "::warning::PROD_V2_WORKERS_ENABLED=true sin PROD_V2_CANARY_OWNER: los workers de gasto quedan APAGADOS"; fi
+          {
+            echo "canary=$CANARY"; echo "workers=$WORKERS"; echo "ga=$GA"; echo "block_v1=$BLOCK_V1"; echo "fe_ref=$FE_REF"
+            echo "pool_max=$POOL_MAX"; echo "pool_max_worker=$POOL_MAX_WORKER"; echo "pool_idle_worker=$POOL_IDLE_WORKER"
+          } >> "$GITHUB_OUTPUT"
+          echo "V2 canario: ${CANARY:-(ninguno → V2 apagado)} · workers de gasto: $WORKERS · GA: $GA · bloquear por jobs V1: $BLOCK_V1 · FE gate ref: $FE_REF"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -61,83 +149,224 @@ jobs:
           fi
           echo "✅ dist/main.js OK — $(du -sh dist/ | cut -f1)"
 
+      # Checks deterministas: los de deploy-staging.yml SALVO los que necesitan el Moodle local
+      # (check-dynamic-package-worker-hardening, check-v21-packaging-v3: corren en el gate completo),
+      # + los de producción (r61). Ninguno usa red externa ni secretos.
+      - name: Check Generation Manifest determinism
+        run: node scripts/check-generation-manifest-determinism.js
+      - name: Check Packaging Plan determinism (Fase 5B.1)
+        run: node scripts/check-packaging-plan-determinism.js
+      - name: Check Packaging exam/video mapping by UUID (Fase 5B.1)
+        run: node scripts/check-packaging-exam-video-mapping.js
+      - name: Check dynamic video delivery (Fase 5B.2.A)
+        run: node scripts/check-dynamic-video-delivery.js
+      - name: Check dynamic video delivery by YouTube (DN-1)
+        run: node scripts/check-dynamic-youtube-delivery.js
+      - name: Check dynamic feature gating (Fase 9 — G1/G3/G4 + video real I1)
+        run: node scripts/check-dynamic-feature-gating.js
+      - name: Check deploy freeze guard (DEPLOY_FREEZE + runs/empaques activos; puro)
+        run: node scripts/check-deploy-freeze-guard.js --pure-only
+      - name: Check deploy workflows run the dynamic workers (HD-6)
+        run: node scripts/check-deploy-dynamic-workers.js
+      - name: Check production deploy hardening (r61; puro)
+        run: node scripts/ci/check-prod-deploy-hardening.js
+      - name: Check V2 production migration plan covers staging (r60)
+        run: node scripts/check-r60-prod-migrations-cover-staging.js
+      - name: Check release rollout guard (VIDEO_ENGINE_* sin decidir = aviso)
+        run: node scripts/check-release-rollout-guard.js
+      - name: Check V2 pre-acceptance guards (legacy audio 409, mock video no empaquetable)
+        run: node scripts/check-v2-acceptance-guards.js
+      - name: Check Coherence Engine rules/report (Fase 7)
+        run: node scripts/check-coherence-engine.js
+      - name: Check Invalidation plan by UUID (Fase 8)
+        run: node scripts/check-invalidation-plan.js
+      - name: Check Invalidation apply / packaging rules (Fase 8, puro)
+        run: node scripts/check-invalidation-apply.js
+      - name: Check V2.1 R3 Blueprint v2 + perfiles (puro)
+        run: node scripts/check-v21-blueprint-profiles.js --pure-only
+      - name: V2.1 Title Normalization (puro)
+        run: node scripts/check-v21-structure-titles.js --pure-only
+      - name: Check V2.1 R4 Manifest rulesVersion 3 (puro)
+        run: node scripts/check-v21-manifest-v3.js --pure-only
+      - name: Check V2.1 R5 invalidación v3 + coherencia v3 + auditorías v3 (puro)
+        run: node scripts/check-v21-invalidation-v3.js --pure-only
+      - name: Check V2.1 RF-b cableado FinOps (puro)
+        run: node scripts/check-v21-finops-wiring.js --pure-only
+      - name: Check V2.1 F2 proveedores reales contra fakes locales (puro)
+        run: node scripts/check-v21-providers.js --pure-only
+      - name: Check capacidad del pool de Postgres (puro)
+        run: node scripts/check-db-pool-capacity.js --pure-only
+      - name: Check V2.1 F1 perfiles (puro)
+        run: node scripts/check-v21-f1-profiles.js
+      - name: Check REL R2 log de intentos + columnas de recuperación (puro)
+        run: node scripts/check-rel-recovery.js --pure-only
+      - name: Check REL MVP recuperación por clase (A/B) + reparación del empaque (puro)
+        run: node scripts/check-rel-mvp-recovery.js --pure-only
+      - name: Check REL lease de ejecución del navegador por run (puro)
+        run: node scripts/check-rel-exec-lease.js --pure-only
+      - name: Check REL sonda del proveedor tras crédito/cuota agotados (puro)
+        run: node scripts/check-rel-provider-probe.js --pure-only
+      - name: Check r58 endurecimiento del pipeline (puro)
+        run: node scripts/check-r58-pipeline-hardening.js --pure-only
+
+      # REL R1 en PRODUCCIÓN: el gate del frontend es OBLIGATORIO (fail closed), a diferencia de staging.
+      - name: Require FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend, obligatorio en producción)
+        env:
+          FRONTEND_REPO_READ_TOKEN: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+        run: |
+          if [ -z "$FRONTEND_REPO_READ_TOKEN" ]; then
+            echo "::error title=REL R1 gate frontend::Falta el secret FRONTEND_REPO_READ_TOKEN (PAT fine-grained de solo lectura sobre nicolasmoreno2914/cursia; docs/v2-production-promotion-runbook.md §1). En producción el gate del frontend es obligatorio."
+            exit 1
+          fi
+          echo "✓ FRONTEND_REPO_READ_TOKEN presente"
+
+      - name: Checkout frontend para el gate REL R1
+        uses: actions/checkout@v4
+        with:
+          repository: nicolasmoreno2914/cursia
+          ref: ${{ steps.cfg.outputs.fe_ref }}
+          path: frontend-for-gate
+          token: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Check REL R1 clasificador central de fallos (backend + frontend, obligatorio)
+        run: node scripts/check-rel-failure-classes.js --require-fe --fe frontend-for-gate
+
+      - name: Pricing keys del seed v1 y de la propuesta r60 (para verificar la base)
+        id: pricing
+        run: |
+          node -e '
+            const P = require("./scripts/prod/v2-schema-probes.js");
+            const b = (x) => Buffer.from(JSON.stringify(x)).toString("base64");
+            const seed = P.pricingKeysOf(require("./src/modules/finops/pricing-seed.v1.json"));
+            const prop = P.pricingKeysOf(require("./src/modules/finops/pricing-proposal.r60.json"), { verifiedOnly: true });
+            console.log("seed=" + b(seed));
+            console.log("proposal=" + b(prop));
+            console.error("seed v1: " + seed.length + " filas (obligatorias) · propuesta r60 verificada: " + prop.length + " filas (informativas)");
+          ' >> "$GITHUB_OUTPUT"
+
       - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "$DEPLOY_VPS_HOST" >> ~/.ssh/known_hosts
+
+      # ANTES del rsync: si algo falla, nada del código nuevo llega al VPS. Solo lectura; los scripts viajan
+      # por stdin (versión de este commit) y usan el .env y el driver pg que ya están en el VPS.
+      - name: Preflight VPS (.env de producción con NODE_ENV=production + V2 no abierto a todos)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+          CANARY: ${{ steps.cfg.outputs.canary }}
+          GA: ${{ steps.cfg.outputs.ga }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "bash -s -- preflight '$DEPLOY_VPS_PATH' '$CANARY' '$GA'" < scripts/ops/prod-release.sh
+
+      # Aborta si hay runs dinámicos activos, items reclamados o empaques activos (exit 2), DEPLOY_FREEZE=true en
+      # el .env del VPS (exit 3) o la consulta falla (exit 1, fail closed). force_deploy=yes → solo reporta.
+      # Jobs V1 del backend: informativos (como siempre), o bloqueantes con PROD_DEPLOY_BLOCK_ON_V1_JOBS=true.
+      - name: Deploy freeze guard (no active dynamic runs / package jobs on the PRODUCTION database)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy || 'no' }}
+          BLOCK_V1: ${{ steps.cfg.outputs.block_v1 }}
+        run: |
+          FORCE_ARG=""
+          if [ "$FORCE_DEPLOY" = "yes" ]; then FORCE_ARG="--force"; fi
+          LEGACY_ARG="--legacy"
+          if [ "$BLOCK_V1" = "true" ]; then LEGACY_ARG="--legacy-block"; fi
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cd '$DEPLOY_VPS_PATH' && node - $LEGACY_ARG $FORCE_ARG" < scripts/ops/check-active-runs.js
+
+      # Fail closed: el código V2 contra un esquema viejo rompe también V1 (TypeORM 42703). El esquema se aplica
+      # SOLO con v2-production-migrations.yml (apply con aprobación del owner). force_deploy NO saltea esto.
+      - name: Verify V2 schema + pricing seed on the PRODUCTION database (read-only, fail closed)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+          SEED_KEYS: ${{ steps.pricing.outputs.seed }}
+          PROPOSAL_KEYS: ${{ steps.pricing.outputs.proposal }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cd '$DEPLOY_VPS_PATH' && node - --pricing-keys-b64 '$SEED_KEYS' --info-pricing-keys-b64 '$PROPOSAL_KEYS'" < scripts/prod/v2-schema-probes.js
 
       - name: Fix VPS file ownership (heals stale root-owned files from past manual deploys)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
         run: |
-          ssh -i ~/.ssh/deploy_key \
-              -o StrictHostKeyChecking=no \
-              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-              "sudo chown -R ${{ secrets.VPS_USER }}:${{ secrets.VPS_USER }} ${{ secrets.VPS_PATH }}"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "sudo chown -R '$DEPLOY_VPS_USER:$DEPLOY_VPS_USER' '$DEPLOY_VPS_PATH'"
 
+      - name: Snapshot current release for rollback (.release-prev)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "bash -s -- snapshot '$DEPLOY_VPS_PATH' '$DEPLOY_SHA'" < scripts/ops/prod-release.sh
+
+      # .release-* (snapshot de rollback, estado, sha) queda excluido: --delete nunca lo borra.
       - name: Sync source + dist to VPS
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
         run: |
           rsync -az --delete \
             --exclude '.git' \
             --exclude 'node_modules' \
             --exclude '.env' \
             --exclude '.env.*' \
-            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
-            ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH }}/"
+            --exclude '.release-*' \
+            --exclude 'frontend-for-gate' \
+            -e "ssh -i $HOME/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            ./ "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST:$DEPLOY_VPS_PATH/"
 
-      - name: Install prod deps + migrate + restart on VPS
+      - name: Install prod deps + flags + migrate (las 2 de siempre) + reload PM2 on VPS
+        env:
+          FINOPS_INGEST_TOKEN_PRODUCTION: ${{ secrets.FINOPS_INGEST_TOKEN_PRODUCTION }}
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+          CANARY: ${{ steps.cfg.outputs.canary }}
+          WORKERS: ${{ steps.cfg.outputs.workers }}
+          GA: ${{ steps.cfg.outputs.ga }}
+          POOL_MAX: ${{ steps.cfg.outputs.pool_max }}
+          POOL_MAX_WORKER: ${{ steps.cfg.outputs.pool_max_worker }}
+          POOL_IDLE_WORKER: ${{ steps.cfg.outputs.pool_idle_worker }}
+          DEPLOY_SHA: ${{ github.sha }}
         run: |
-          ssh -i ~/.ssh/deploy_key \
-              -o StrictHostKeyChecking=no \
-              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
-              'set -e
-               cd '"${{ secrets.VPS_PATH }}"'
+          # Línea 1 = secreto (nunca en argv ni en el log); luego KEY=VALUE no secretos (re-validados en el VPS).
+          printf '%s\n' "$FINOPS_INGEST_TOKEN_PRODUCTION" \
+            "PROD_V2_CANARY_OWNER=$CANARY" "PROD_V2_WORKERS_ENABLED=$WORKERS" "PROD_V2_GENERAL_AVAILABILITY=$GA" \
+            "PROD_DB_POOL_MAX=$POOL_MAX" "PROD_DB_POOL_MAX_WORKER=$POOL_MAX_WORKER" "PROD_DB_POOL_IDLE_MS_WORKER=$POOL_IDLE_WORKER" \
+            "DEPLOY_SHA=$DEPLOY_SHA" \
+          | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+              "cd '$DEPLOY_VPS_PATH' && bash scripts/ops/prod-release.sh install"
 
-               ensure_pm2_process() {
-                 local name="$1"
-                 local start_script="$2"
-                 if sudo pm2 describe "$name" > /dev/null 2>&1; then
-                   sudo pm2 restart "$name" --update-env
-                 else
-                   sudo pm2 start npm --name "$name" -- run "$start_script"
-                 fi
-               }
-
-               echo "━━━ [0/4] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
-               command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
-
-               echo "━━━ [1/4] Instalar dependencias de producción ━━━"
-               npm install --omit=dev
-
-               echo "━━━ [2/4] Alinear restricciones de production_jobs ━━━"
-               node scripts/migrate-production-jobs-constraints.js
-
-               echo "━━━ [3/4] Migrar usage_events y cost_rates ━━━"
-               node scripts/migrate-usage-events-costs.js
-
-               echo "━━━ [4/4] Recargar PM2 (zero-downtime) ━━━"
-               sudo pm2 reload cursia-backend --update-env || sudo pm2 restart cursia-backend --update-env
-               ensure_pm2_process cursia-content-worker start:content-worker
-               ensure_pm2_process cursia-video-worker start:video-worker
-               ensure_pm2_process cursia-audio-worker start:audio-worker
-               ensure_pm2_process cursia-h5p-worker start:h5p-worker
-               ensure_pm2_process cursia-gamma-worker start:gamma-worker
-               ensure_pm2_process cursia-package-worker start:package-worker
-               ensure_pm2_process cursia-full-worker start:full-worker
-               ensure_pm2_process cursia-dynamic-item-worker start:dynamic-item-worker
-               ensure_pm2_process cursia-dynamic-package-worker start:dynamic-package-worker
-               ensure_pm2_process cursia-dynamic-provider-worker start:dynamic-provider-worker
-               sudo pm2 save
-               sudo pm2 status
-
-               echo "✅ Deploy completado."'
-
+      # Liveness HTTP. La disponibilidad real (base + 11 procesos online y estables) ya la verificó el paso
+      # anterior en el VPS; un /health/ready HTTP queda como gap de la app (runbook §6).
       - name: Health check post-deploy
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
         run: |
           echo "Esperando 20 segundos para que NestJS inicialice…"
           sleep 20
           for i in 1 2 3 4 5; do
-            RESPONSE=$(curl -sf --max-time 15 "${{ secrets.HEALTH_URL }}" || echo "FAILED")
+            RESPONSE=$(curl -sf --max-time 15 "$HEALTH_URL" || echo "FAILED")
             if echo "$RESPONSE" | grep -q '"status":"ok"'; then
               echo "✅ Health check OK (intento $i): $RESPONSE"
               exit 0
@@ -148,11 +377,87 @@ jobs:
           echo "❌ Health check FALLÓ tras 5 intentos"
           exit 1
 
+      - name: Mark release healthy (base del próximo snapshot de rollback)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+          DEPLOY_SHA: ${{ github.sha }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "bash -s -- mark-ok '$DEPLOY_VPS_PATH' '$DEPLOY_SHA'" < scripts/ops/prod-release.sh
+
       - name: Notify on failure
         if: failure()
         run: |
-          echo "⚠️  El deploy falló. Último commit desplegado: $(git rev-parse --short HEAD)"
-          echo "Para rollback manual en VPS:"
-          echo "  ssh cursia@${{ secrets.VPS_HOST }}"
-          echo "  cd ${{ secrets.VPS_PATH }}"
-          echo "  git checkout HEAD~1 && npm install --omit=dev && pm2 restart cursia-backend"
+          echo "⚠️  El deploy de PRODUCCIÓN falló en el commit $(git rev-parse --short HEAD 2>/dev/null || echo '?')."
+          echo "Si falló ANTES del rsync (checks / preflight / guardia / esquema), producción NO cambió."
+          echo "Si falló después: Actions → «Deploy to Contabo VPS» → Run workflow → action=rollback"
+          echo "  (restaura .release-prev/ = la última release sana, sin migrar)."
+          echo "Apagar solo V2 sin tocar código: vaciar PROD_V2_CANARY_OWNER y redeployar, o editar el .env del VPS"
+          echo "  (docs/v2-production-promotion-runbook.md §Rollback)."
+
+  rollback:
+    name: Rollback to previous release (.release-prev, sin migraciones)
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'rollback'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout (scripts de este commit; el código restaurado sale del VPS)
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$DEPLOY_VPS_HOST" >> ~/.ssh/known_hosts
+
+      # Un rollback es el escape de emergencia: NO lo bloquean DEPLOY_FREEZE ni un run activo (se informa qué
+      # se interrumpe).
+      - name: Report active runs (informativo, no bloquea el rollback)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cd '$DEPLOY_VPS_PATH' && node - --legacy --force" < scripts/ops/check-active-runs.js
+
+      - name: Restore .release-prev on the VPS (npm install + PM2, sin migraciones)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "bash -s -- rollback '$DEPLOY_VPS_PATH'" < scripts/ops/prod-release.sh
+
+      - name: Health check post-rollback
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+        run: |
+          sleep 20
+          for i in 1 2 3 4 5; do
+            RESPONSE=$(curl -sf --max-time 15 "$HEALTH_URL" || echo "FAILED")
+            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
+              echo "✅ Health check OK (intento $i): $RESPONSE"
+              exit 0
+            fi
+            echo "⏳ Intento $i: backend no disponible aún ($RESPONSE), esperando 8s…"
+            sleep 8
+          done
+          echo "❌ Health check FALLÓ tras el rollback — intervención manual (runbook §Rollback)"
+          exit 1
+
+      - name: Mark restored release healthy
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH: ${{ secrets.VPS_PATH }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "bash -s -- mark-ok '$DEPLOY_VPS_PATH' restored" < scripts/ops/prod-release.sh
