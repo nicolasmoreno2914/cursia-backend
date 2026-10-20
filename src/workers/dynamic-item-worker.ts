@@ -15,6 +15,7 @@ import {
   isJobCompleted,
   isJobFailed,
 } from '../video-engine/videogen.service';
+import { videoScenesFromVideogen } from '../package/h5p/interactive-video/plan';
 import { YoutubeService } from '../youtube/youtube.service';
 import { YoutubeTokenService } from '../youtube/youtube-token.service';
 import {
@@ -926,6 +927,12 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         if (duration.durationSec === null) {
           logger.warn(`Item ${item.itemKey}: Videogen no informó la duración del video (durationSource=unknown)`);
         }
+        // r61 Q-04: escenas del guion de Videogen (narración + duración real del audio) → línea de
+        // tiempo para anclar las preguntas del video interactivo. Sin escenas → motivo explícito.
+        const timeline = videoTimelinePatch(status);
+        if (timeline.videoScenesUnavailable) {
+          logger.warn(`Item ${item.itemKey}: Videogen no informó escenas utilizables (${timeline.videoScenesUnavailable}) — las preguntas del video quedan equiespaciadas`);
+        }
         if (runHead.videoDelivery === 'youtube') {
           // 5B.2.A: con YouTube, completed_local es INTERMEDIO — se persiste
           // lo necesario para publicar (y reanudar sin Videogen) y se pasa a
@@ -936,6 +943,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
             videogenDownloadUrl: status.download_url ?? null,
             costUsd: cost,
             external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
+            ...timeline,
           });
           if (!recorded) {
             logger.warn(`Item ${item.itemKey}: lease perdida al registrar completed_local — se detiene sin publicar`);
@@ -945,7 +953,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           await runYoutubeDeliveryPhase(deps, item, runHead, phase, () => leaseLost);
           return;
         }
-        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost, duration);
+        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost, duration, timeline);
         return;
       }
       if (isJobFailed(status.status)) {
@@ -978,6 +986,18 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
   }
 }
 
+/** r61 Q-04: lo que se guarda de la línea de tiempo del video (una de las dos claves; la otra en null, sin restos de un job anterior). */
+export type VideoTimelinePatch = { videoScenes?: unknown[] | null; videoScenesUnavailable?: string | null };
+
+/**
+ * r61 Q-04: escenas de Videogen (status del job que se acaba de pollear) normalizadas y acotadas. Siempre
+ * del status vigente (un re-claim del mismo job obtiene las mismas escenas; un job nuevo, las suyas). Puro.
+ */
+export function videoTimelinePatch(status: { scenes?: unknown[] | null }): VideoTimelinePatch {
+  const r = videoScenesFromVideogen(status?.scenes ?? null);
+  return r.ok === true ? { videoScenes: r.scenes, videoScenesUnavailable: null } : { videoScenes: null, videoScenesUnavailable: r.reason };
+}
+
 async function completeVideoItem(
   deps: DynamicItemWorkerDeps,
   item: ClaimedItem,
@@ -987,6 +1007,7 @@ async function completeVideoItem(
   mode: 'mock' | 'real',
   cost: number | null,
   duration: VideoDuration,
+  timeline: VideoTimelinePatch = {},
 ): Promise<void> {
   if (videoRequiresMeasuredDuration(item) && duration.durationSec === null) {
     // R16 fix M2: como en la entrega YouTube, se mide gratis el MP4 ya renderizado (status.download_url).
@@ -1014,6 +1035,7 @@ async function completeVideoItem(
     chapterId: item.chapterId,
     itemKey: item.itemKey,
     idempotencyKey: item.idempotencyKey,
+    ...timeline,
   };
   // I1: path inmutable por intento (R23) — nunca sobreescribe un artifact ya
   // vinculado a un item completado por otro Manifest/ejecutor.
@@ -1041,6 +1063,7 @@ async function completeVideoItem(
     summary: {
       videogenJobId: jobId, mode, downloadUrl: status.download_url ?? null, costUsd: cost,
       external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
+      ...timeline,
     },
   });
   if (!ok) {
@@ -1472,6 +1495,9 @@ async function publishYoutubeAndComplete(
     delivery: 'youtube',
     youtubeVideoId,
     youtubeUrl,
+    // r61 Q-04: la misma línea de tiempo que quedó en el output_summary al terminar el render (la lee el
+    // empaquetado para colocar las preguntas igual que el claim de video_interactions).
+    ...(Array.isArray(summary.videoScenes) ? { videoScenes: summary.videoScenes } : {}),
   };
   const storagePath =
     `${runHead.ownerId}/dynamic/${item.artifactCourseId}/${item.manifestId}/dynamic_video/` +

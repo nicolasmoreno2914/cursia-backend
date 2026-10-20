@@ -488,6 +488,8 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'answerBiasRecheck',
   // REL CREDIT: estado de la sonda del proveedor (lo escribe solo el barrido / retryItem).
   'providerProbe',
+  // r61 Q-04: línea de tiempo del video (escenas de Videogen) que ancla las preguntas del video interactivo.
+  'videoScenes', 'videoScenesUnavailable',
 ]);
 
 /** r58 (I4-3): archivos de trabajo de UN capítulo en un perfil de evaluación (los del claim de la Actividad de Aplicación). */
@@ -1486,7 +1488,12 @@ export class SchedulerService {
         // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
         return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true } as const;
       }
-      ctx.video = { videoItemKey: vf.video.videoItemKey, durationSec: vf.video.durationSec };
+      ctx.video = {
+        videoItemKey: vf.video.videoItemKey,
+        durationSec: vf.video.durationSec,
+        // r61 Q-04: el servidor valida contra el MISMO plan anclado que recibió el ejecutor.
+        ...(vf.video.videoScenes ? { videoScenes: vf.video.videoScenes } : {}),
+      };
       // EV6 IV avanzado: schemaVersion 2 (pausas validadas contra la duración MEDIDA del video).
       if (ivAdvanced) ctx.videoInteractionsSchemaVersion = 2;
     }

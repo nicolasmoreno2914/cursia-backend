@@ -458,9 +458,9 @@ function makeItem(n, outputSummary = {}) {
 }
 
 /** Mundo en memoria: output_summary por item (merge real de mergeOutputSummary), llamadas y estado del item. */
-function makeWorld({ videoDelivery = 'youtube', videoMode = 'real' } = {}) {
+function makeWorld({ videoDelivery = 'youtube', videoMode = 'real', videogenScenes } = {}) {
   const store = new Map(); // itemRunId → output_summary
-  const calls = { batchCreate: 0, getVideoStatus: 0, failItem: [], completeItem: [], uploads: [], getConnection: 0, getAccessToken: 0 };
+  const calls = { batchCreate: 0, getVideoStatus: 0, failItem: [], completeItem: [], uploads: [], getConnection: 0, getAccessToken: 0, artifacts: [] };
   const yt = {
     connection: { userId: OWNER, status: 'active', scopes: 'youtube.upload,youtube.readonly' },
     tokenOk: true,
@@ -497,11 +497,12 @@ function makeWorld({ videoDelivery = 'youtube', videoMode = 'real' } = {}) {
     },
     artifacts: {
       getDownloadUrl: async (id) => ({ url: `https://fake-storage.local/${id}` }),
-      uploadJsonArtifact: async (p) => ({ id: `video-artifact-${p.storagePath}` }),
+      uploadJsonArtifact: async (p) => { calls.artifacts.push(p); return { id: `video-artifact-${p.storagePath}` }; },
     },
     videogen: {
       batchCreate: async (jobs) => { calls.batchCreate++; return { batch_id: 'b1', jobs: [{ job_id: `vg-${jobs[0].client_reference_id}` }] }; },
-      getVideoStatus: async (jobId) => { calls.getVideoStatus++; return { job_id: jobId, status: 'completed_local', download_url: `https://fake-videogen.local/download/${jobId}`, error: null }; },
+      // r61 Q-04: `scenes` como las expone GET /api/external/videos/:id/status de Videogen (solo si el mundo las trae).
+      getVideoStatus: async (jobId) => { calls.getVideoStatus++; return { job_id: jobId, status: 'completed_local', download_url: `https://fake-videogen.local/download/${jobId}`, error: null, ...(videogenScenes !== undefined ? { scenes: videogenScenes } : {}) }; },
       getVideoCost: async () => ({ estimated_total_cost: 0.94 }),
     },
     logger: { log() {}, warn() {}, error() {}, debug() {} },
@@ -798,6 +799,38 @@ async function runWorkerChecks() {
       eq([w.calls.uploads.length, w.calls.batchCreate], [1, 1], 'sin subidas ni envíos nuevos');
       const done = w.calls.completeItem.find((c) => c.id === 'ir-42');
       assert(done && done.out.summary.youtubeVideoId === 'dQw4w9WgXcQ', 'completed con el id confirmado');
+    }));
+
+  await check('W r61 Q-04: escenas de Videogen → output_summary.videoScenes normalizado (completed_local) + artifact dynamic_video.videoScenes; sobreviven a un fallo de subida y su re-claim; sin escenas → videoScenesUnavailable', () =>
+    withEnv(ENV, async () => {
+      const raw = [
+        { scene_order: 2, narration: '  La presión   baja cuando el filtro se tapa. ', duration_seconds: 41.25 },
+        { scene_order: 1, narration: 'Bienvenida al capítulo.', duration_seconds: 33.4 },
+        { scene_order: 3, narration: 'x'.repeat(900), duration_seconds: 38 },
+      ];
+      const w = makeWorld({ videogenScenes: raw });
+      w.yt.uploadPlan = [transient(), transient(), transient()];
+      await worker.processItem(w.deps, makeItem(61));
+      const os = w.store.get('ir-61');
+      eq(os.delivery, 'upload_failed', 'falló la subida');
+      eq(os.videoScenes.map((x) => [x.order, x.startSec, x.endSec]), [[1, 0, 33.4], [2, 33.4, 74.65], [3, 74.65, 112.65]], 'ordenadas y acumuladas');
+      eq(os.videoScenes[1].narration, 'La presión baja cuando el filtro se tapa.', 'narración normalizada');
+      assert(os.videoScenes[2].narration.length <= 360 && os.videoScenes[2].narration.endsWith('…'), 'narración acotada');
+      eq(os.videoScenesUnavailable, null, 'sin motivo');
+      await w.reclaim(61);
+      assertCompleted(w, 61, 're-claim');
+      const art = w.calls.artifacts.find((a) => a.type === 'dynamic_video');
+      eq(art.payload.videoScenes, os.videoScenes, 'el artifact lleva la misma línea de tiempo que el output_summary');
+      assert(!('videoScenes' in art.metadata), 'la metadata del artifact queda chica');
+      eq(w.calls.batchCreate, 1, 'un solo envío');
+      const w2 = makeWorld();
+      await worker.processItem(w2.deps, makeItem(62));
+      assertCompleted(w2, 62, 'sin escenas');
+      eq([w2.store.get('ir-62').videoScenes, w2.store.get('ir-62').videoScenesUnavailable], [null, 'no_scene_data'], 'motivo explícito');
+      assert(!('videoScenes' in w2.calls.artifacts.find((a) => a.type === 'dynamic_video').payload), 'artifact sin escenas');
+      const w3 = makeWorld({ videogenScenes: [{ scene_order: 1, narration: 'a', duration_seconds: null }] });
+      await worker.processItem(w3.deps, makeItem(63));
+      eq(w3.store.get('ir-63').videoScenesUnavailable, 'scene_duration_missing(1)', 'escena sin duración → no se usa la línea de tiempo');
     }));
 
   await check('W resolución authorize_reupload → exactamente UNA subida más → completed; 0 envíos a Videogen', () =>

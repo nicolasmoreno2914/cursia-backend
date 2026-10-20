@@ -722,7 +722,7 @@ export async function loadContentsV3(
     content?: string;
     experience?: unknown;
     presentation?: PresentationSlot;
-    video?: { youtubeId: string; durationSec: number };
+    video?: { youtubeId: string; durationSec: number; videoScenes?: unknown };
     videoInteractions?: unknown;
     activityPayload?: unknown;
     scormHtml?: string;
@@ -781,7 +781,7 @@ export async function loadContentsV3(
     return { value: { pdf, cover }, warnings: w };
   };
 
-  const loadVideo = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<{ youtubeId: string; durationSec: number }> => {
+  const loadVideo = async (ch: PackagingPlanV3['modules'][number]['chapters'][number]): Promise<{ youtubeId: string; durationSec: number; videoScenes?: unknown }> => {
     if (delivery !== 'youtube') {
       throw new PackagingNotReadyError(
         [`${ch.keys.video}:${V3_VIDEO_REQUIRES_YOUTUBE}`],
@@ -797,7 +797,9 @@ export async function loadContentsV3(
     if (!Number.isFinite(dur) || dur <= 0) {
       throw new PackagingNotReadyError([`${ch.keys.video}:VIDEO_DURATION_MISSING`], `VIDEO_DURATION_MISSING: ${ch.keys.video} no tiene la duración medida del video.`);
     }
-    return { youtubeId: check.videoId, durationSec: dur };
+    // r61 Q-04: escenas de Videogen guardadas con el video (mismo dato que leyó el claim de
+    // video_interactions desde el output_summary del item) → el plan se re-deriva igual.
+    return { youtubeId: check.videoId, durationSec: dur, ...(Array.isArray(data.videoScenes) ? { videoScenes: data.videoScenes } : {}) };
   };
 
   // Tareas en el MISMO orden que el loop secuencial de antes.
@@ -883,7 +885,7 @@ export async function loadContentsV3(
   const contentMd = new Map<string, string>();
   const experiences = new Map<string, unknown>();
   const presentations = new Map<string, { pdf: Buffer; cover: Buffer; mock?: boolean }>();
-  const videos = new Map<string, { youtubeId: string; durationSec: number }>();
+  const videos = new Map<string, { youtubeId: string; durationSec: number; videoScenes?: unknown }>();
   const videoInteractions = new Map<string, unknown>();
   const activities = new Map<string, ActivityContentV3>();
   const audiobookChapters = new Map<string, Buffer>();
@@ -911,7 +913,7 @@ export async function loadContentsV3(
         presentations.set(ch.chapterId, pres.value);
       }
       if (ch.keys.video) {
-        videos.set(ch.chapterId, slot.video as { youtubeId: string; durationSec: number });
+        videos.set(ch.chapterId, slot.video as { youtubeId: string; durationSec: number; videoScenes?: unknown });
         videoInteractions.set(ch.chapterId, slot.videoInteractions);
       }
       if (ch.keys.activity) {

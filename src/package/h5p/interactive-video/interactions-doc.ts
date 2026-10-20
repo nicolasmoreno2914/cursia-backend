@@ -21,7 +21,7 @@ import {
   checkPlainText,
   isPlainObject,
 } from '../types/common';
-import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, planInteractionCheckpoints, planReflectionPauses, videoPlanDurationSec } from './plan';
+import { REFLECTION_PAUSE_RULES, ReflectionPlan, VideoCheckpoint, VideoTimelineSource, planReflectionPauses, planVideoCheckpoints, videoPlanDurationSec } from './plan';
 
 export const VIDEO_INTERACTIONS_SCHEMA_VERSION = 1;
 /**
@@ -80,10 +80,18 @@ export interface VideoInteractionsExpectations {
    * Ausente ⇒ 1 (comportamiento de siempre: un documento v2 sin el marcador se rechaza).
    */
   schemaVersion?: 1 | 2;
+  /**
+   * r61 Q-04: línea de tiempo del video (escenas de Videogen guardadas con el item de video). Con
+   * escenas utilizables el plan se ancla a ellas (planVideoCheckpoints); ausente ⇒ plan equidistante.
+   */
+  videoScenes?: unknown;
 }
 
 export interface VideoInteractionsPlan {
   checkpoints: VideoCheckpoint[];
+  /** r61 Q-04: de dónde salen los segundos de los checkpoints. */
+  timelineSource: VideoTimelineSource;
+  timelineReason?: string;
   /** Vacío en schemaVersion 1. */
   reflectionPlan: ReflectionPlan;
 }
@@ -120,12 +128,15 @@ export function validateVideoInteractionsDocFull(doc: unknown, expect: VideoInte
 
   let plan: VideoCheckpoint[] | null = null;
   let planDur: number | null = null;
+  let timeline: { timelineSource: VideoTimelineSource; timelineReason?: string } = { timelineSource: 'even_spacing', timelineReason: 'no_scene_data' };
   try {
     planDur = videoPlanDurationSec(d.durationSec as number);
     if (expect.durationSec !== undefined && planDur !== videoPlanDurationSec(expect.durationSec)) {
       issues.add('durationSec', `debe coincidir con la duración real ${videoPlanDurationSec(expect.durationSec)} s (recibido ${planDur})`);
     }
-    plan = planInteractionCheckpoints(planDur);
+    const vp = planVideoCheckpoints(planDur, expect.videoScenes);
+    plan = vp.checkpoints;
+    timeline = vp.timelineReason !== undefined ? { timelineSource: vp.timelineSource, timelineReason: vp.timelineReason } : { timelineSource: vp.timelineSource };
   } catch (err) {
     issues.add('durationSec', (err as Error).message);
   }
@@ -193,7 +204,7 @@ export function validateVideoInteractionsDocFull(doc: unknown, expect: VideoInte
     }
   }
   issues.throwIfAny('VideoInteractions');
-  return { checkpoints: plan as VideoCheckpoint[], reflectionPlan };
+  return { checkpoints: plan as VideoCheckpoint[], reflectionPlan, ...timeline };
 }
 
 /** Mensaje de remediación por defecto (pregunta sin feedbackIncorrect). */

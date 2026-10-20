@@ -3550,6 +3550,99 @@ function dynPlanInteractionCheckpoints(durationSec) {
   return out;
 }
 
+// r61 Q-04 — espejo de planVideoCheckpoints (backend interactive-video/plan.ts). Puro.
+// Con la línea de tiempo del video (claim video.videoScenes: escenas de Videogen [{order, startSec, endSec,
+// narration}]) cada pregunta se ancla al FINAL de una escena: misma cantidad que el plan equidistante;
+// candidatos = ⌈fin de escena⌉ en [30, d − 15]; n crecientes, ≥ 20 s entre sí, que minimizan
+// Σ|candidato − atSec equidistante| (empates → el más temprano); segmento = [atSec anterior (0), atSec].
+// Sin escenas, escenas inconsistentes con la duración o sin candidatos → plan equidistante + motivo.
+var DYN_VIDEO_SCENE_RULES = { maxScenes: 100, narrationMax: 360, anchorEpsilonSec: 1, durationToleranceSec: 3, durationToleranceRatio: 0.03 };
+function _dynVideoScenesProblem(durationSec, scenes) {
+  var R = DYN_VIDEO_SCENE_RULES;
+  if (!Array.isArray(scenes) || !scenes.length) return 'no_scene_data';
+  if (scenes.length > R.maxScenes) return 'too_many_scenes(' + scenes.length + ')';
+  var prevEnd = 0;
+  var prevOrder = -Infinity;
+  for (var i = 0; i < scenes.length; i++) {
+    var s = scenes[i];
+    if (!_dynIsPlainObject(s)) return 'invalid_scene';
+    if (!Number.isInteger(s.order) || s.order <= prevOrder) return 'invalid_scene_order';
+    if (typeof s.startSec !== 'number' || typeof s.endSec !== 'number' || !isFinite(s.startSec) || !isFinite(s.endSec)) return 'invalid_scene_times';
+    if (Math.abs(s.startSec - prevEnd) > 0.001 || s.endSec <= s.startSec) return 'invalid_scene_times';
+    if (typeof s.narration !== 'string' || s.narration.length > R.narrationMax) return 'invalid_scene_narration';
+    prevEnd = s.endSec;
+    prevOrder = s.order;
+  }
+  var tol = Math.max(R.durationToleranceSec, durationSec * R.durationToleranceRatio);
+  if (Math.abs(prevEnd - durationSec) > tol) return 'timeline_duration_mismatch(' + prevEnd.toFixed(1) + 's≠' + durationSec + 's)';
+  return null;
+}
+function _dynAssertSceneAnchored(d, checkpoints, scenes) {
+  var C = DYN_VIDEO_CHECKPOINT_RULES;
+  var eps = DYN_VIDEO_SCENE_RULES.anchorEpsilonSec;
+  checkpoints.forEach(function (c, i) {
+    if (c.atSec < C.noInteractionFirstSec || c.atSec > d - C.noInteractionLastSec) throw _dynVideoPlanError('VIDEO_PLAN_INVARIANT', 'checkpoint ' + c.index + ' en ' + c.atSec + ' fuera de [' + C.noInteractionFirstSec + ', ' + (d - C.noInteractionLastSec) + ']');
+    var anchored = scenes.some(function (s, j) {
+      var nextStart = j + 1 < scenes.length ? scenes[j + 1].startSec : s.endSec;
+      return c.atSec >= s.endSec - eps && c.atSec <= nextStart + eps;
+    });
+    if (!anchored) throw _dynVideoPlanError('VIDEO_PLAN_INVARIANT', 'checkpoint ' + c.index + ' en ' + c.atSec + ' no está anclado al final de una escena');
+    if (c.atSec < c.segment[0] || c.atSec > c.segment[1]) throw _dynVideoPlanError('VIDEO_PLAN_INVARIANT', 'checkpoint ' + c.index + ' en ' + c.atSec + ' fuera de su segmento');
+    if (i > 0 && c.atSec - checkpoints[i - 1].atSec < C.minGapSec) throw _dynVideoPlanError('VIDEO_PLAN_INVARIANT', 'checkpoints ' + i + ' y ' + (i + 1) + ' a menos de ' + C.minGapSec + ' s');
+  });
+}
+// Escenas que cubre un checkpoint (terminan después del inicio de su segmento y empiezan ≥ ε antes de atSec:
+// la escena que arranca en el mismo segundo del anclaje no cuenta); espejo de scenesForCheckpoint.
+function dynScenesForCheckpoint(checkpoint, scenes) {
+  var s0 = Array.isArray(checkpoint.segment) ? checkpoint.segment[0] : checkpoint.segmentStart;
+  return (scenes || []).filter(function (s) { return s.endSec > s0 + 0.5 && s.startSec + DYN_VIDEO_SCENE_RULES.anchorEpsilonSec <= checkpoint.atSec; });
+}
+function dynPlanVideoCheckpoints(durationSec, scenes) {
+  var even = dynPlanInteractionCheckpoints(durationSec);
+  if (scenes === undefined || scenes === null) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'no_scene_data' };
+  var C = DYN_VIDEO_CHECKPOINT_RULES;
+  var d = dynVideoPlanDurationSec(durationSec);
+  var problem = _dynVideoScenesProblem(d, scenes);
+  if (problem) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: problem };
+  var lo = C.noInteractionFirstSec;
+  var hi = d - C.noInteractionLastSec;
+  var cand = [];
+  scenes.forEach(function (s) {
+    var b = Math.ceil(s.endSec - 1e-6);
+    if (b >= lo && b <= hi && (!cand.length || b > cand[cand.length - 1])) cand.push(b);
+  });
+  var n = even.length;
+  var m = cand.length;
+  var cost = [];
+  var par = [];
+  for (var i = 0; i < n; i++) {
+    cost.push([]);
+    par.push([]);
+    for (var j = 0; j < m; j++) {
+      cost[i][j] = Infinity;
+      par[i][j] = -1;
+      var own = Math.abs(cand[j] - even[i].atSec);
+      if (i === 0) { cost[i][j] = own; continue; }
+      var best = Infinity;
+      var bp = -1;
+      for (var p = 0; p < j; p++) {
+        if (cand[j] - cand[p] < C.minGapSec) break;
+        if (cost[i - 1][p] < best) { best = cost[i - 1][p]; bp = p; }
+      }
+      if (bp >= 0) { cost[i][j] = best + own; par[i][j] = bp; }
+    }
+  }
+  var end = -1;
+  var endCost = Infinity;
+  for (var k = 0; k < m; k++) if (cost[n - 1][k] < endCost) { endCost = cost[n - 1][k]; end = k; }
+  if (end < 0) return { checkpoints: even, timelineSource: 'even_spacing', timelineReason: 'insufficient_scene_boundaries(' + m + '<' + n + ')' };
+  var picks = new Array(n);
+  for (var q = n - 1, jj = end; q >= 0; q--) { picks[q] = cand[jj]; jj = par[q][jj]; }
+  var out = picks.map(function (atSec, x) { return { index: x + 1, atSec: atSec, segment: [x === 0 ? 0 : picks[x - 1], atSec] }; });
+  _dynAssertSceneAnchored(d, out, scenes);
+  return { checkpoints: out, timelineSource: 'videogen_scenes' };
+}
+
 // EV6 IV avanzado — espejo de planReflectionPauses (backend interactive-video/plan.ts). Puro.
 //   cantidad: 0 si d < 180 s, 1 si 180–299 s, 2 si ≥ 300 s; ranuras k1 = ⌈n/3⌉, k2 = ⌈2n/3⌉;
 //   la pausa j va en el punto medio entre los checkpoints kj y kj+1; una ranura que choca se
@@ -3590,7 +3683,8 @@ function dynPlanReflectionPauses(durationSec, checkpoints) {
   return { reflections: reflections, droppedReflections: droppedReflections };
 }
 
-// Espejo de validateVideoInteractionsDoc (R8). expect = {videoItemKey, durationSec, schemaVersion?}.
+// Espejo de validateVideoInteractionsDoc (R8). expect = {videoItemKey, durationSec, schemaVersion?, videoScenes?}
+// (r61 Q-04: videoScenes = línea de tiempo del claim → plan anclado a escenas; ausente → equidistante).
 // EV6: expect.schemaVersion 2 (Manifest ivAdvanced) exige además `reflections` en los index del plan
 // de pausas; sin él (o 1) es exactamente la validación de siempre (un documento v2 se rechaza).
 function dynValidateVideoInteractionsDoc(doc, expect) {
@@ -3607,7 +3701,7 @@ function dynValidateVideoInteractionsDoc(doc, expect) {
   try {
     var pd = dynVideoPlanDurationSec(doc.durationSec);
     if (expect.durationSec !== undefined && pd !== dynVideoPlanDurationSec(expect.durationSec)) issues.add('durationSec', 'debe coincidir con la duración real ' + dynVideoPlanDurationSec(expect.durationSec) + ' s (recibido ' + pd + ')');
-    plan = dynPlanInteractionCheckpoints(pd);
+    plan = dynPlanVideoCheckpoints(pd, expect.videoScenes).checkpoints;
   } catch (e) { issues.add('durationSec', (e && e.message) || String(e)); }
   if (plan && _dynH5pArray(issues, 'checkpoints', doc.checkpoints, plan.length, plan.length)) {
     doc.checkpoints.forEach(function (c, i) {
@@ -4706,15 +4800,26 @@ async function _dynRunVideoInteractions(item) {
   if (typeof durationSec !== 'number' || !claimCheckpoints) {
     return { ok: false, error: 'video_interactions: el claim no trae la duración real del video y/o el plan de checkpoints (contrato R11a)', retryable: false };
   }
-  // El plan del claim debe ser EXACTAMENTE el plan determinístico (R8).
-  var plan;
-  try { plan = dynPlanInteractionCheckpoints(durationSec); }
+  // r61 Q-04: línea de tiempo del video (escenas reales de Videogen) si el servidor ancló el plan a ella.
+  var claimTimeline = _dynClaimField(item, ['timelineSource']);
+  var claimScenes = _dynClaimField(item, ['videoScenes']);
+  if (claimTimeline !== undefined && claimTimeline !== 'videogen_scenes' && claimTimeline !== 'even_spacing') {
+    return { ok: false, error: 'video_interactions: timelineSource desconocido ' + JSON.stringify(claimTimeline), retryable: false };
+  }
+  // El plan del claim debe ser EXACTAMENTE el plan determinístico (R8; r61: anclado a escenas si las trae).
+  var vplan;
+  try { vplan = dynPlanVideoCheckpoints(durationSec, claimScenes); }
   catch (e) { return { ok: false, error: 'video_interactions: ' + ((e && e.message) || String(e)), retryable: false }; }
+  if (claimTimeline === 'videogen_scenes' && vplan.timelineSource !== 'videogen_scenes') {
+    return { ok: false, error: 'video_interactions: VIDEO_PLAN_MISMATCH — el claim ancla las preguntas a las escenas pero su línea de tiempo no es utilizable (' + vplan.timelineReason + ')', retryable: false };
+  }
+  var plan = vplan.checkpoints;
+  var anchored = vplan.timelineSource === 'videogen_scenes';
   var planMatches = plan.length === claimCheckpoints.length && plan.every(function (p, i) {
     var c = claimCheckpoints[i];
     return c.index === p.index && c.atSec === p.atSec && c.segmentStart === p.segment[0] && c.segmentEnd === p.segment[1];
   });
-  if (!planMatches) return { ok: false, error: 'video_interactions: VIDEO_PLAN_MISMATCH — los checkpoints del claim no coinciden con planInteractionCheckpoints(' + durationSec + ')', retryable: false };
+  if (!planMatches) return { ok: false, error: 'video_interactions: VIDEO_PLAN_MISMATCH — los checkpoints del claim no coinciden con ' + (anchored ? 'planVideoCheckpoints(' + durationSec + ', escenas)' : 'planInteractionCheckpoints(' + durationSec + ')'), retryable: false };
 
   // EV6 IV avanzado: el claim pide schemaVersion 2 (Manifest ivAdvanced) y trae el plan de pausas
   // (video.reflectionPlan). Se verifica contra el espejo del plan, igual que los checkpoints.
@@ -4742,6 +4847,8 @@ async function _dynRunVideoInteractions(item) {
   if (!md.ok) return md.result;
   // #542 (I1): reglas anti-patrón de respuesta + valor sembrado del primer V/F.
   var biasOpts = { tfFirst: dynTfFirstTrue(item.itemKey), pedagogy: dynPedagogyBlock(item) };
+  // r61 Q-04: con escenas, el prompt muestra el guion real del video por tramos (sin escenas: prompt de siempre).
+  if (anchored) biasOpts.videoScenes = claimScenes;
   var prompt = v2 ? dynVideoInteractionsPrompt(md.text, claimCheckpoints, reflPlan.reflections, biasOpts) : dynVideoInteractionsPrompt(md.text, claimCheckpoints, undefined, biasOpts);
   var recs = {};
   var res = await _dynV3JsonWithRetry(item, dynVideoInteractionsSys(), prompt, 4000, function (obj, attempt) {
@@ -4755,7 +4862,9 @@ async function _dynRunVideoInteractions(item) {
       doc.schemaVersion = 2;
       if (obj.reflections !== undefined || reflPlan.reflections.length) doc.reflections = obj.reflections;
     }
-    var v = dynValidateVideoInteractionsDoc(doc, v2 ? { videoItemKey: videoItemKey, durationSec: durationSec, schemaVersion: 2 } : { videoItemKey: videoItemKey, durationSec: durationSec });
+    var vexp = v2 ? { videoItemKey: videoItemKey, durationSec: durationSec, schemaVersion: 2 } : { videoItemKey: videoItemKey, durationSec: durationSec };
+    if (anchored) vexp.videoScenes = claimScenes;
+    var v = dynValidateVideoInteractionsDoc(doc, vexp);
     var errors = extra.map(function (k) { return '$: campo desconocido "' + k + '" (solo ' + allowed.map(function (x) { return '"' + x + '"'; }).join(' y ') + ')'; }).concat(v.errors);
     if (errors.length) return { ok: false, errors: errors };
     var bt = dynAnswerBiasTest(item, 'video_interactions', doc);
@@ -4768,7 +4877,7 @@ async function _dynRunVideoInteractions(item) {
   var polarityFixed = kept.polarityFixed || 0;
   dynAnswerBiasRemember(item, 'video_interactions', res.value);
   var a = _dynV3JsonArtifact(item, 'dynamic_video_interactions_json', res.value, item.chapterId);
-  var summary = Object.assign({ chapterId: item.chapterId, videoItemKey: videoItemKey, durationSec: durationSec, interactionCount: plan.length, interactionsSha256: a.sha, retried: res.retried, feedbackPolarityFixed: polarityFixed, promptVersion: DYN_V3_PROMPT_VERSIONS.video_interactions }, dynPedagogySummary(item));
+  var summary = Object.assign({ chapterId: item.chapterId, videoItemKey: videoItemKey, durationSec: durationSec, interactionCount: plan.length, interactionsSha256: a.sha, retried: res.retried, feedbackPolarityFixed: polarityFixed, promptVersion: DYN_V3_PROMPT_VERSIONS.video_interactions, timelineSource: vplan.timelineSource }, anchored ? {} : { timelineReason: _dynClaimField(item, ['timelineReason']) || vplan.timelineReason }, dynPedagogySummary(item));
   if (kept.answerBias) {
     var vFirst = _dynErrCodes(res.firstErrors);
     var vKept = _dynErrCodes(res.softWarnings);
