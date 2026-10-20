@@ -2414,7 +2414,7 @@ export class RunsService {
        * conciliada con la evidencia (o de forma conservadora) y el peor caso entra en el presupuesto. `resubmit` reenvía
        * (resubmitVideo / resubmitProvider); `repoll` retoma el MISMO job. `state` = output_summary.providerReconcile.
        */
-      providerReconcile?: { kind: ProviderReconcileKind; action: 'resubmit' | 'repoll'; ambiguous: boolean; expectError: string; state: Record<string, any> };
+      providerReconcile?: { kind: ProviderReconcileKind; action: 'resubmit' | 'repoll'; ambiguous: boolean; expectError: string; state: Record<string, any>; watch?: boolean };
       /** r62 (K3): el control de gasto (kill switch / allow-list) que frenó la parte ya no la frena → reapertura sola. */
       spendControlResume?: boolean;
       /** r62 (d8): la dependencia cuyo dato faltó en el claim (claim_payload_unavailable) ya se completó → reapertura sola. */
@@ -2658,7 +2658,7 @@ export class RunsService {
       } else if (auto && auto.providerReconcile) {
         // r62 (N2): misma decisión que el barrido, con la fila bloqueada; el error tiene que ser el que se concilió.
         const pr = auto.providerReconcile;
-        const d = providerReconcileDecision(target, auto.now ?? new Date(), auto.policy, { id: String(job.id), created_at: job.created_at ?? null });
+        const d = providerReconcileDecision(target, auto.now ?? new Date(), auto.policy, { id: String(job.id), created_at: job.created_at ?? null }, { watch: !!pr.watch });
         if (d.heal === false || d.kind !== pr.kind || String(target.error ?? '') !== pr.expectError || (pr.ambiguous && !d.ambiguousAllowed)) {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (provider_reconcile: ${d.heal === false ? d.reason : 'changed'})`, code: 'auto_heal_not_eligible' });
         }
@@ -2771,9 +2771,9 @@ export class RunsService {
           || err.startsWith('videogen_submit_rejected') || err.startsWith(PROVIDER_RECONCILIATION_REQUIRED)
           // r62 (N2): job que nunca termina (re-poll del auto-healer agotado), ya liquidado de forma conservadora.
           || (!!auto?.providerReconcile && auto.providerReconcile.kind === 'videogen_stuck' && err.startsWith('video_timeout'))
-          // r62 (N2): job vencido (tope único de render): reenvío de admin con aviso de posible render doble, o el
-          // automático tras una cancelación confirmada.
-          || err.startsWith('videogen_render_overdue');
+          // r62 (N2): job vencido (tope único de render): el automático tras una cancelación confirmada, o el de admin
+          // SOLO con la excepción ya registrada (review overdue m1: nunca mientras la conciliación todavía decide/cancela).
+          || (err.startsWith('videogen_render_overdue') && (!!auto?.providerReconcile || !!target.output_summary?.providerReconcile?.declined));
         if (!eligible) {
           throw new BadRequestException(
             `resubmitVideo solo aplica cuando el último error es "videogen_failed", "ambiguous_video_submission", "videogen_submit_rejected" o "${PROVIDER_RECONCILIATION_REQUIRED}"; "${itemKey}" falló con "${err}"`,

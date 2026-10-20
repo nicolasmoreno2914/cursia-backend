@@ -169,7 +169,9 @@ export class ProviderReconcileService {
           and g.error ~ $3
           -- la excepción ya registrada para ESTE error no se vuelve a mirar (un tope alcanzado sí se registra una vez)
           and not (coalesce(g.output_summary->'${PROVIDER_RECONCILE_KEY}', '{}'::jsonb) ? 'declined'
-                   and coalesce(g.output_summary->'${PROVIDER_RECONCILE_KEY}'->>'declinedError', '') = coalesce(g.error, ''))
+                   and coalesce(g.output_summary->'${PROVIDER_RECONCILE_KEY}'->>'declinedError', '') = coalesce(g.error, '')
+                   -- review overdue I2: un job declinado por no poder cancelarse se sigue vigilando gratis
+                   and coalesce(g.output_summary->'${PROVIDER_RECONCILE_KEY}'->>'declined', '') <> '${PROVIDER_STUCK_NO_CANCEL}')
         order by g.finished_at desc, g.id desc
         limit $4`,
       [now.toISOString(), windowSecs, PROVIDER_RECONCILE_SQL_REGEX, limit, providerReconcileRunsSince(),
@@ -206,10 +208,11 @@ export class ProviderReconcileService {
   // ── una parte ──────────────────────────────────────────────────────────────
 
   private async reconcileOne(r: Row, now: Date, policy: AutoHealPolicy, result: ProviderReconcileSweepResult): Promise<void> {
-    const d = providerReconcileDecision(r, now, policy, { id: r.job_id, created_at: r.run_created_at });
+    const watch = providerReconcileStateOf(r.output_summary).declined === PROVIDER_STUCK_NO_CANCEL;
+    const d = providerReconcileDecision(r, now, policy, { id: r.job_id, created_at: r.run_created_at }, { watch });
     if (d.heal === false) {
       result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
-      if (PROVIDER_RECONCILE_PERMANENT_SKIPS.includes(d.reason)) {
+      if (!watch && PROVIDER_RECONCILE_PERMANENT_SKIPS.includes(d.reason)) {
         await this.decline(r, d.reason, d.reason === 'ambiguous_cap_reached' ? 'duplicate_charge' : 'unrecoverable', now, result,
           `se agotaron los reenvíos automáticos de la parte (${PROVIDER_RECONCILE_MAX_RESUBMITS}, de ellos ${PROVIDER_RECONCILE_MAX_AMBIGUOUS_RESUBMITS} ambiguo)`);
       }
@@ -228,7 +231,7 @@ export class ProviderReconcileService {
       case 'videogen_stuck':
       case 'videogen_overdue':
       case 'videogen_orphan':
-        ev = await this.videogenEvidence(r, os, d.kind, pending, ageSecs, prevState, now);
+        ev = await this.videogenEvidence(r, os, d.kind, pending, ageSecs, prevState, now, watch);
         break;
       case 'gamma_failed':
         ev = await this.gammaEvidence(r, os, pending, ageSecs >= PROVIDER_RECONCILE_LOOKUP_GIVEUP_SECONDS);
@@ -327,7 +330,7 @@ export class ProviderReconcileService {
     try {
       await this.runs.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), r.job_id, r.item_key, resubmitVideo, resubmitProvider, {
         policy, now,
-        providerReconcile: { kind: d.kind, action: ev.action, ambiguous, expectError: String(r.error ?? ''), state },
+        providerReconcile: { kind: d.kind, action: ev.action, ambiguous, expectError: String(r.error ?? ''), state, ...(watch ? { watch: true } : {}) },
       });
     } catch (err) {
       const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
@@ -361,7 +364,7 @@ export class ProviderReconcileService {
    * con espera creciente y, pasado el tope, queda la excepción. Review I1: un costo 0 libera solo con evidencia fuerte.
    */
   private async videogenEvidence(r: Row, os: Record<string, any>, kind: ProviderReconcileKind, pending: PendingCharge[], ageSecs: number,
-    prevState: Record<string, any>, now: Date): Promise<Evidence> {
+    prevState: Record<string, any>, now: Date, watch = false): Promise<Evidence> {
     const jobId = String(videogenJobIdOf(os, r.error) ?? '');
     const resKey = typeof os.externalReservationKey === 'string' ? os.externalReservationKey : null;
     const res = resKey ? pending.find((p) => p.idempotency_key === resKey && p.reservation) ?? null : null;
@@ -382,9 +385,42 @@ export class ProviderReconcileService {
     }
     const cancelAt = Date.parse(String(prevState.cancelRequestedAt ?? ''));
     const cancelPending = Number.isFinite(cancelAt) && String(prevState.cancelError ?? '') === String(r.error ?? '');
-    if (cancelPending && now.getTime() - cancelAt < PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS * 1000) {
-      // Tras cancelar, el estado terminal se confirma con una lectura ≥ 10 min después (carrera cola → procesador).
-      return { action: 'wait', recheck: true, why: `cancelación del job ${jobId} pedida; se confirma el estado (${status || 'sin estado'})` };
+    if (watch && (!isJobFailed(status) || cancelPending)) {
+      // Vigilancia (excepción provider_stuck_no_cancel ya registrada): se sigue consultando gratis. Un `failed` después de
+      // un cancel no prueba nada (Videogen marca failed sin detener el procesador): solo `completed` lo resuelve.
+      return { action: 'wait', recheck: true, why: `vigilancia del job ${jobId}: sigue ${status || 'sin estado'} (excepción registrada; se entrega solo si termina)` };
+    }
+    let cancelConfirmed = false;
+    if (cancelPending) {
+      // Review overdue I1: tras cancelar, reenviar solo si DOS lecturas (la primera ≥ 10 min después del cancel, la segunda
+      // ≥ 10 min después de la primera) muestran `failed` y el job IDÉNTICO a la foto S0 tomada al cancelar (etapa,
+      // progreso, escenas, costo y registros de uso). Si el procesador lo tomó justo antes del cancel (Videogen marca
+      // failed pero no lo detiene), escribe current_step y/o suma uso → diferencia → excepción, nunca un reenvío.
+      if (now.getTime() - cancelAt < PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS * 1000) {
+        return { action: 'wait', recheck: true, why: `cancelación del job ${jobId} pedida; se confirma el estado (${status || 'sin estado'})` };
+      }
+      let snap: Record<string, unknown> | null = null;
+      try {
+        const c = await withTimeout(this.videogen().getVideoCost(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `GET cost ${jobId}`);
+        snap = videogenSnapshot(st, c);
+      } catch (err) {
+        return { action: 'wait', recheck: true, why: `costo de ${jobId} no disponible para confirmar la cancelación (${errText(err)})` };
+      }
+      const s0 = (prevState.cancelSnapshot ?? null) as Record<string, unknown> | null;
+      if (!isJobFailed(status) || !s0 || !sameSnapshot(snap, s0)) {
+        return { action: 'decline', reason: PROVIDER_STUCK_NO_CANCEL, attention: 'duplicate_charge',
+          why: `el job ${jobId} cambió después de la cancelación (estado ${status || 'sin estado'}; antes ${JSON.stringify(s0)}, ahora ${JSON.stringify(snap)}): ` +
+            'el procesador de Videogen lo tomó y la cancelación no lo detiene; reenviar podría producir un doble render pagado' };
+      }
+      const first = Date.parse(String(prevState.cancelConfirm1At ?? ''));
+      if (!Number.isFinite(first)) {
+        await this.patchState(r, { cancelConfirm1At: now.toISOString() });
+        return { action: 'wait', recheck: true, why: `job ${jobId} cancelado e igual a la foto S0 (1.ª lectura); se confirma con otra ≥ 10 min después` };
+      }
+      if (now.getTime() - first < PROVIDER_RECONCILE_ZERO_CONFIRM_SECONDS * 1000) {
+        return { action: 'wait', recheck: true, why: `job ${jobId} cancelado: esperando la 2.ª lectura` };
+      }
+      cancelConfirmed = true;
     }
     if (!isJobFailed(status)) {
       // Tope ÚNICO de render (el del worker), desde el primer poll del job.
@@ -399,8 +435,11 @@ export class ProviderReconcileService {
       if (queued && !cancelPending && typeof vg.cancelVideo === 'function') {
         // Encolado: la cancelación de Videogen lo saca de la cola (nunca empezó a gastar). Se confirma y se sigue por evidencia.
         try {
+          // Foto S0 ANTES del cancel (lo que se va a comparar después): estado/etapa/progreso/escenas + costo y uso.
+          const c0 = await withTimeout(vg.getVideoCost(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `GET cost ${jobId}`);
+          const s0 = videogenSnapshot({ ...st, status: 'failed' }, c0);
           const c = await withTimeout(vg.cancelVideo(jobId, { timeoutMs: this.lookupMs() }), this.lookupMs(), `POST cancel ${jobId}`);
-          await this.patchState(r, { cancelRequestedAt: now.toISOString(), cancelError: String(r.error ?? ''), cancelResult: c });
+          await this.patchState(r, { cancelRequestedAt: now.toISOString(), cancelError: String(r.error ?? ''), cancelResult: c, cancelSnapshot: s0 });
           return { action: 'wait', recheck: true, why: `job ${jobId} encolado pasado el tope de render: cancelación pedida` };
         } catch (err) {
           return { action: 'wait', recheck: true, why: `no se pudo cancelar el job ${jobId} (${errText(err)}); se reintenta` };
@@ -430,7 +469,11 @@ export class ProviderReconcileService {
     const reserved = normalizeDecimal(res.amount);
     const counted = normalizeDecimal(videogenCountedAmount(cost.estimated_total_cost, cost.breakdown ?? null));
     let mode: 'release' | 'partial' | 'charged' | 'over';
-    if (cmpDec(counted, 0) === 0) {
+    const s0 = (prevState.cancelSnapshot ?? null) as Record<string, any> | null;
+    if (cmpDec(counted, 0) === 0 && cancelConfirmed && s0 && s0.currentStep === null && Number(s0.cost) === 0 && Number(s0.usageLogs ?? 0) === 0) {
+      // Cancelado en la cola, confirmado dos veces idéntico a S0 (nunca empezó: sin etapa, sin costo, sin uso) → liberar.
+      mode = 'release';
+    } else if (cmpDec(counted, 0) === 0) {
       if (videogenZeroCostReleasable({ status, error: st.error ?? r.error, reportedCost: cost.estimated_total_cost, breakdown: cost.breakdown ?? null })) {
         // Dos lecturas en 0 separadas por ≥ 10 min (para ESTE error) antes de liberar.
         const seen = prevState.zeroCostSeenAt && String(prevState.nextCheckError ?? '') === String(r.error ?? '') ? Date.parse(String(prevState.zeroCostSeenAt)) : NaN;
@@ -715,4 +758,26 @@ export class ProviderReconcileService {
       this.logger.warn(`conciliación de reservas de Videogen: ${p.reservationKey} (run ${p.runId}) → ${settlement} (job ${jobId})`);
     }
   }
+}
+
+/**
+ * Review overdue I1 — foto comparable de un job de Videogen (status + costo). `status` se normaliza a `failed` en S0
+ * porque la foto se toma antes del cancel (el estado esperado después es `failed`); el resto tiene que quedar igual.
+ */
+function videogenSnapshot(st: VideogenBatchJob, c: VideogenCostBreakdown): Record<string, unknown> {
+  return {
+    status: String(st.status ?? '').toLowerCase(),
+    currentStep: st.current_step ?? null,
+    progress: st.progress ?? null,
+    scenes: st.scenes_count ?? c.scenes_count ?? null,
+    cost: Number(c.estimated_total_cost),
+    usageLogs: c.usage_logs_count ?? null,
+  };
+}
+
+/** Igualdad campo a campo (el jsonb de Postgres no conserva el orden de las claves). */
+function sameSnapshot(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  for (const k of keys) if (JSON.stringify(a[k] ?? null) !== JSON.stringify(b[k] ?? null)) return false;
+  return true;
 }
