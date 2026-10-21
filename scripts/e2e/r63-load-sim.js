@@ -6,13 +6,21 @@
 // proveedor SUPUESTOS; ver ~/cursia-test-env/work/r63/SC-design.md):
 //
 //  A. «código real» (--part=real): Postgres 16 DESECHABLE + el SchedulerService REAL (claim / failItem / barrido de
-//     leases / recomputeRunStatus), el loop real de los workers (runClaimLoop) y el ledger FinOps REAL (reservas antes
-//     de cada llamada falsa, liquidación / liberación, priorPaidOperations al re-reclamar). Cursos 1×2 (16 partes, todos
-//     los tipos v3) con tiempos ACELERADOS (×TIME_SCALE: 1 s real = TIME_SCALE s simulados). El cierre de una parte
-//     exitosa lo hace el harness con la misma transición que completeItem tras validar (la validación v3 de artifacts no
-//     se mide acá). Fallas inyectadas (5xx conocidos, cobros con falla, 429 de los límites falsos) y reinicio de los dos
-//     «procesos» de workers a mitad de corrida. El backoff del scheduler (30·2^n s reales) y el vencimiento de la lease
-//     se comprimen con el mismo factor (el harness reescribe next_retry_at / lease_until); todo lo demás es real.
+//     leases / recomputeRunStatus / topes / admisión), el loop real de los workers (runClaimLoop) y el ledger FinOps REAL
+//     (reservas antes de cada llamada falsa, liquidación / liberación, priorPaidOperations al re-reclamar). Cursos 1×2
+//     (16 partes, todos los tipos v3) con tiempos ACELERADOS (×TIME_SCALE). El cierre de una parte exitosa lo hace el
+//     harness con la misma transición que completeItem tras validar (la validación v3 de artifacts no se mide).
+//     Fallas: 5xx conocidos, cobros con falla, 429 de los límites falsos y dos tipos de caída de workers:
+//       · CONGELAMIENTO del proceso de proveedores + IA (dos veces): pierde la DB y la lease, sus llamadas siguen en el
+//         proveedor; al reconectarse liquida SU reserva y deja su resultado (Q-21 regla 3). El reclamante nuevo recorre
+//         la devolución Q-21 REAL: failItem(prior_call_in_flight, retryAfter = lo que falta de la ventana, grantAttempt)
+//         mientras la llamada anterior puede seguir en vuelo (H1), y después adopta el resultado tardío (0 llamadas).
+//       · CAÍDA DURA del worker de video: nada se liquida; pasada la ventana, la reserva se concilia con la evidencia de
+//         Videogen (GET status / costs: el camino automático real, r62 N2) y se adopta el job ya renderizado.
+//     Si una reserva de LLM/TTS sigue abierta pasada su ventana, la parte va a provider_reconciliation_required (como en
+//     la app) y un «recuperador» del harness (en lugar del auto-heal / el admin) la reabre recién cuando el intento
+//     anterior liquidó: se cuenta. El backoff y las ventanas se comprimen con el mismo factor. Cada parte simulada es UNA
+//     llamada con timeout 2·p50; su ventana = max(ventana Q-21 del tipo, 2·p50).
 //  B. «modelo» (--part=model): simulación de eventos discretos (tiempo virtual, sin DB) con cursos M 3×4 (112 partes,
 //     las cantidades y tiempos medidos de #1353) para estimar la capacidad: throughput por tipo, tiempo hasta el último
 //     curso, equidad, espera en cola; topologías actual / propuesta / escala y la cuota de YouTube.
@@ -282,6 +290,8 @@ async function runReal() {
   const WD = B.L('workers/worker-drain.js');
   const WH = B.L('workers/finops-worker-hooks.js');
   const QM = B.L('modules/dynamic-generation/scheduler-queue-metrics.js');
+  const FSC = B.L('modules/dynamic-generation/fair-scheduling.js');
+  const LT = B.L('workers/lease-takeover.js');
   const ALL = [...B.L('modules/generation-manifests/generation-manifest-builder.js').ALL_MANIFEST_ITEM_TYPES];
   const LLM_TYPES = ALL.filter((t) => CLASS_OF(t) === 'llm');
   const PROVIDER_TYPES = ['presentation', 'audio_welcome', 'audiobook_chapter'];
@@ -300,7 +310,11 @@ async function runReal() {
     const env = await B.startSimPg({ poolMax: 6, log: () => {} });
     Object.assign(process.env, conf.env);
     // La gracia de los topes (600 s reales por defecto) se comprime con el mismo factor que el resto de los tiempos.
-    if (conf.env.DYNAMIC_SCHEDULER_PROVIDER_CAPS) process.env.DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS = String(Math.ceil(600 / TIME_SCALE));
+    // Con topes, la ventana en vuelo de las partes barridas se comprime con el mismo factor (la mayor de Q-21: la de LLM).
+    if (conf.env.DYNAMIC_SCHEDULER_PROVIDER_CAPS) {
+      const w = FSC.inFlightWindowSecondsByType({});
+      process.env.DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS = String(Math.ceil(Math.max(...Object.keys(DUR).map((t) => Math.max(w[t] ?? 0, 2 * DUR[t].p50))) / TIME_SCALE));
+    }
     const rand = rng(SEED * 1000 + n);
     let t0Real = Date.now();
     const procs = [];
@@ -318,7 +332,9 @@ async function runReal() {
       const compressed = new Set();
       const ticker = setInterval(async () => {
         try {
-          const rows = await env.ds.query(`select id, attempt_count, next_retry_at, updated_at from public.generation_item_runs where status = 'retrying' and next_retry_at > now()`);
+          // Las devoluciones Q-21 (prior_call_in_flight) ya llegan con la ventana comprimida: no se vuelven a comprimir.
+          const rows = await env.ds.query(`select id, attempt_count, next_retry_at, updated_at from public.generation_item_runs
+                                            where status = 'retrying' and next_retry_at > now() and coalesce(error, '') not like 'prior_call_in_flight%'`);
           for (const r of rows) {
             const key = `${r.id}:${r.attempt_count}`;
             if (compressed.has(key)) continue;
@@ -330,8 +346,9 @@ async function runReal() {
       }, 25);
       // Proveedores falsos (estado compartido por todos los procesos): en vuelo por proveedor + verdad de cobro.
       const inflight = { anthropic: 0, gamma: 0, openai_tts: 0, videogen: 0 };
-      const truth = new Map(); // reservationKey → 'charged' | 'not_charged'
-      const counters = { calls: 0, http429: 0, known5xx: 0, chargedFail: 0, reconciled: 0, budgetCap: 0, lostOnKill: 0, claimMs: [] };
+      const maxInflight = { anthropic: 0, gamma: 0, openai_tts: 0, videogen: 0 }; // llamadas en vuelo REALES (incluidas las «zombi»)
+      const counters = { calls: 0, http429: 0, known5xx: 0, chargedFail: 0, handbacks: 0, lateResults: 0, adoptedLate: 0, videogenReconciled: 0,
+        humanReconciliation: 0, reopenedByRecovery: 0, budgetCap: 0, lostOnKill: 0, claimMs: [] };
       const reservationKind = (t) => (t === 'video' ? 'videogen' : t === 'presentation' ? 'gamma' : ['audio_welcome', 'audiobook_chapter'].includes(t) ? 'tts' : 'llm');
       const chargeFor = (kind, item, ownerId) => {
         const role = WH.providerCallRoleOf(item.attempt);
@@ -368,19 +385,51 @@ async function runReal() {
         procs.push(p);
         return p;
       }
+      // Ventana EN VUELO por tipo, comprimida al tiempo real de la simulación. En la simulación cada parte es UNA llamada
+      // (en la app real un audiolibro son varios segmentos, cada uno con su reserva y su ventana), así que la ventana es
+      // max(ventana Q-21 del tipo, duración máxima de la llamada simulada = 2·p50): una llamada nunca supera su ventana.
+      const simWindowS = (t) => Math.max(FSC.inFlightWindowSecondsByType({})[t], 2 * DUR[t].p50);
+      const windowMs = (t) => (simWindowS(t) * 1000) / TIME_SCALE;
+      const lateResult = new Map(); // itemRunId → resultado que dejó el intento anterior («zombi»): Q-21 regla 3
       async function processItem(p, svc, executorId, item) {
         const ownerId = ownerOfRun.get(item.runId);
         const kind = reservationKind(item.type);
         const prov = PROVIDER_OF(item.type);
-        // Q-21 / FinOps: cargos o reservas de intentos anteriores sin cerrar → se concilian con la evidencia del
-        // proveedor falso (como el GET de Gamma/Videogen; en LLM/TTS reales esto es la ventana Q-21 o un humano).
         if (item.attempt > 1) {
           const prior = await WH.priorPaidOperations(svc.ledger, item.itemRunId, { currentAttempt: item.attempt, acknowledgedThroughAttempt: 0 });
-          for (const r of [...prior.blocking, ...prior.releasable]) {
-            if (!r.reservation || r.settled) continue;
-            const charged = truth.get(r.idempotency_key) === 'charged';
-            await svc.ledger.settleReservation(r.idempotency_key, charged ? chargeFor(kind, { ...item, attempt: r.attempt }, ownerId) : null, 'r63-sim: conciliada con la evidencia del proveedor falso');
-            counters.reconciled++;
+          const pend = [...prior.blocking, ...prior.releasable].filter((r) => r.reservation && !r.settled);
+          if (pend.length && LT.priorAttemptMayBeInFlight(item)) {
+            // Q-21 real (real-providers.ts handBackPriorInFlight / dynamic-item-worker / server-llm): la llamada del intento
+            // anterior figura enviada y sin liquidar y todavía puede estar en vuelo → se devuelve la parte SIN llamar, con
+            // retryAfter = lo que falta de la ventana y sin consumir intento.
+            const sentAt = Math.min(...pend.map((r) => new Date(r.created_at).getTime()));
+            const left = LT.inFlightRemainingMs(new Date(sentAt), windowMs(item.type));
+            if (left > 0) {
+              counters.handbacks++;
+              await svc.sched.failItem(item.itemRunId, executorId, LT.priorCallInFlightMessage(`la llamada a ${prov}`, left * TIME_SCALE), true, undefined,
+                { retryAfterSeconds: LT.retryAfterSecondsFor(left), grantAttempt: true });
+              return;
+            }
+          }
+          for (const r of pend) {
+            // Pasada la ventana y todavía sin liquidar: solo pasa con la caída DURA del worker de video. Videogen tiene
+            // consulta de estado y costo (GET status / costs): la conciliación automática con esa evidencia es el camino
+            // real (provider-reconcile, r62 N2). LLM/TTS nunca llegan acá en esta simulación (su intento anterior sigue vivo
+            // y liquida solo); si llegaran, el camino real es reconciliación humana → se cuenta y la parte queda fallida.
+            if (kind !== 'videogen') {
+              counters.humanReconciliation++;
+              await svc.sched.failItem(item.itemRunId, executorId, `provider_reconciliation_required: ${prov} (sim)`, false);
+              return;
+            }
+            await svc.ledger.settleReservation(r.idempotency_key, chargeFor(kind, { ...item, attempt: r.attempt }, ownerId), 'r63-sim: Videogen GET status/costs (job ya renderizado)');
+            counters.videogenReconciled++;
+            lateResult.set(item.itemRunId, 'videogen_job');
+          }
+          if (lateResult.has(item.itemRunId)) {
+            // Se adopta el resultado del intento anterior (punto de guardado LLM / id externo Gamma-Videogen): 0 llamadas nuevas.
+            counters.adoptedLate++;
+            await B.simCompleteItem(svc.ds, item.itemRunId, executorId);
+            return;
           }
         }
         if (p.killed) return;
@@ -394,34 +443,49 @@ async function runReal() {
         // Límite del proveedor falso: exceso → 429 inmediato (conocido, sin cobro) → reserva liberada, reintento.
         if (inflight[prov] >= REAL_LIMITS[prov].maxConcurrent) {
           counters.http429++;
-          truth.set(key, 'not_charged');
           await svc.ledger.settleReservation(key, null, 'r63-sim: 429 (sin cobro)');
           await svc.sched.failItem(item.itemRunId, executorId, `provider_rate_limited: ${prov} 429 (sim)`, true);
           return;
         }
         inflight[prov]++; counters.calls++;
+        maxInflight[prov] = Math.max(maxInflight[prov], inflight[prov]);
         const roll = rand();
-        const dur = lognorm(rand, DUR[item.type].p50);
+        const dur = Math.min(lognorm(rand, DUR[item.type].p50), 2 * DUR[item.type].p50); // timeout de la llamada simulada
         const fail = roll < 0.04 ? 'known5xx' : roll < 0.05 ? 'chargedFail' : null;
         try {
           await sleepSim(fail ? dur * 0.3 : dur);
         } finally { inflight[prov]--; }
-        if (p.killed) { truth.set(key, rand() < 0.5 ? 'charged' : 'not_charged'); counters.lostOnKill++; return; } // caída: reserva pendiente
+        if (p.dead) { counters.lostOnKill++; return; } // caída DURA: el proceso no liquida nada (reserva pendiente)
+        // Proceso congelado (sin DB): la llamada ya terminó en el proveedor, pero no puede escribir hasta reconectarse.
+        if (p.frozenUntil && Date.now() < p.frozenUntil) await new Promise((r) => setTimeout(r, p.frozenUntil - Date.now()));
         if (fail === 'known5xx') {
-          counters.known5xx++; truth.set(key, 'not_charged');
+          counters.known5xx++;
           await svc.ledger.settleReservation(key, null, 'r63-sim: 5xx conocido (sin cobro)');
           await svc.sched.failItem(item.itemRunId, executorId, `provider_5xx: ${prov} (sim)`, true);
           return;
         }
-        truth.set(key, 'charged');
+        // El intento (aunque haya perdido la lease) liquida SU reserva: Q-21 regla 3, «la verdad del dinero».
         await svc.ledger.settleReservation(key, chargeFor(kind, item, ownerId), fail ? 'r63-sim: cobrado con falla' : 'r63-sim: ok');
         if (fail === 'chargedFail') { counters.chargedFail++; await svc.sched.failItem(item.itemRunId, executorId, `provider_failed_after_charge: ${prov} (sim)`, true); return; }
-        await B.simCompleteItem(svc.ds, item.itemRunId, executorId);
+        if (!(await B.simCompleteItem(svc.ds, item.itemRunId, executorId))) {
+          // Lease perdida (proceso congelado): no puede completar (cercado por worker_id); deja su resultado para el
+          // reclamante nuevo, que lo adopta sin volver a llamar (punto de guardado LLM / id externo).
+          counters.lateResults++;
+          lateResult.set(item.itemRunId, 'late');
+        }
       }
-      async function kill(p, delaySim) {
+      /**
+       * Falla de un proceso de workers. 'freeze' = el proceso deja de latir y de reclamar (colgado / red cortada con la
+       * DB) pero sus llamadas en vuelo siguen y terminan: es el caso de Q-21 (lease tomada con una llamada en vuelo).
+       * 'kill' = caída dura: lo que estaba en vuelo termina en el proveedor pero el proceso no liquida nada.
+       */
+      async function kill(p, mode) {
         p.killed = true;
-        p.drain.request('sim_kill');
-        const dead = procs.filter((x) => x === p).map((x) => x.name);
+        if (mode === 'kill') p.dead = true;
+        // Congelado: sin DB durante 15 min simulados (pierde la lease; sus llamadas en vuelo siguen en el proveedor).
+        if (mode === 'freeze') p.frozenUntil = Date.now() + (900 / TIME_SCALE) * 1000;
+        p.drain.request('sim_' + mode);
+        const dead = [p.name];
         // Lease «vencida» tras su duración (comprimida): el barrido del próximo claim la devuelve a la cola.
         setTimeout(async () => {
           await env.ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where status = 'running' and split_part(worker_id, ':', 1) = any($1::text[])`, [dead]).catch(() => {});
@@ -430,14 +494,34 @@ async function runReal() {
       let gen = 1;
       let pa = await spawnProc('video-worker', ['video'], gen);
       let pb = await spawnProc('provider-worker', ['provider', 'llm'], gen);
+      // Recuperación (en lugar del auto-heal / la acción del admin, que la simulación no corre): una parte que quedó en
+      // `provider_reconciliation_required` se reabre recién cuando TODAS sus reservas están cerradas (el intento anterior
+      // liquidó al reconectarse). Se cuenta como intervención de recuperación.
+      const healer = setInterval(async () => {
+        try {
+          const rows = await env.ds.query(
+            `update public.generation_item_runs g set status = 'retrying', next_retry_at = now(), max_attempts = g.max_attempts + 1, finished_at = null, updated_at = now()
+              where g.status = 'failed' and g.error like 'provider_reconciliation_required%' and g.job_id = any($1::uuid[])
+                and not exists (select 1 from public.generation_cost_events e where e.item_run_id = g.id and e.event_kind = 'CHARGE'
+                                  and (e.metadata->>'reservation') = 'true'
+                                  and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id))
+              returning g.job_id`, [runs.map((r) => r.runId)]);
+          const list = Array.isArray(rows[0]) ? rows[0] : rows;
+          for (const r of list) {
+            counters.reopenedByRecovery++;
+            await env.ds.query(`update public.production_jobs set status = 'running', worker_status = 'running', finished_at = null where id = $1 and worker_status = 'failed'`, [r.job_id]);
+          }
+        } catch {}
+      }, 100);
       // Métricas de cola muestreadas (solo lectura).
       const qsamples = [];
       const sampler = setInterval(async () => { try { const m = await QM.computeSchedulerQueueMetrics(env.ds); qsamples.push({ t: simNow(), queued: m.totals.queuedRuns, admitted: m.totals.admittedRuns, claimable: m.totals.claimableItems, oldest: Math.max(0, ...m.byType.map((x) => x.oldestReadyWaitSec || 0)) }); } catch {} }, 250);
       // Reinicios: el proceso de proveedor+IA al ~25 % de la corrida estimada, el de video al ~50 %.
       const estMakespanSim = Math.max(3000, n * 1300 / (conf.workers.provider || 1));
       const killers = [
-        setTimeout(async () => { await kill(pb); gen++; setTimeout(async () => { pb = await spawnProc('provider-worker', ['provider', 'llm'], gen); }, (60 / TIME_SCALE) * 1000); }, (0.25 * estMakespanSim / TIME_SCALE) * 1000),
-        setTimeout(async () => { await kill(pa); gen++; setTimeout(async () => { pa = await spawnProc('video-worker', ['video'], gen); }, (60 / TIME_SCALE) * 1000); }, (0.5 * estMakespanSim / TIME_SCALE) * 1000),
+        setTimeout(async () => { await kill(pb, 'freeze'); gen++; setTimeout(async () => { pb = await spawnProc('provider-worker', ['provider', 'llm'], gen); }, (60 / TIME_SCALE) * 1000); }, (0.25 * estMakespanSim / TIME_SCALE) * 1000),
+        setTimeout(async () => { await kill(pb, 'freeze'); gen++; setTimeout(async () => { pb = await spawnProc('provider-worker', ['provider', 'llm'], gen); }, (60 / TIME_SCALE) * 1000); }, (0.6 * estMakespanSim / TIME_SCALE) * 1000),
+        setTimeout(async () => { await kill(pa, 'kill'); gen++; setTimeout(async () => { pa = await spawnProc('video-worker', ['video'], gen); }, (60 / TIME_SCALE) * 1000); }, (0.5 * estMakespanSim / TIME_SCALE) * 1000),
       ];
       // Espera a que todos los runs terminen (o tope de tiempo real).
       const capRealMs = 20 * 60 * 1000;
@@ -446,7 +530,10 @@ async function runReal() {
       let maxAdmitted = 0;
       while (Date.now() - t0Real < capRealMs) {
         const rows = await env.ds.query(`select id, worker_status from public.production_jobs where id = any($1::uuid[])`, [runs.map((r) => r.runId)]);
-        for (const r of rows) if (['completed', 'preview', 'failed'].includes(r.worker_status) && !doneAt.has(r.id)) doneAt.set(r.id, { t: simNow(), status: r.worker_status });
+        for (const r of rows) {
+          if (['completed', 'preview', 'failed'].includes(r.worker_status)) { if (!doneAt.has(r.id) || doneAt.get(r.id).status !== r.worker_status) doneAt.set(r.id, { t: simNow(), status: r.worker_status }); }
+          else doneAt.delete(r.id); // reabierto por la recuperación
+        }
         const rp = await env.ds.query(`select type, count(*)::int n from public.generation_item_runs where status = 'running' group by type`);
         const byP = { anthropic: 0, gamma: 0, openai_tts: 0, videogen: 0 };
         for (const r of rp) byP[PROVIDER_OF(r.type)] += r.n;
@@ -454,11 +541,15 @@ async function runReal() {
         for (const k of Object.keys(byP)) maxRunningByProv[k] = Math.max(maxRunningByProv[k], byP[k]);
         const [adm] = await env.ds.query(`select count(*)::int n from public.production_jobs where execution_mode = 'dynamic_generation' and worker_status in ('running', 'retrying')`);
         maxAdmitted = Math.max(maxAdmitted, adm.n);
-        if (doneAt.size === runs.length) break;
+        if (doneAt.size === runs.length) {
+          const [pend] = await env.ds.query(`select count(*)::int n from public.generation_item_runs where job_id = any($1::uuid[]) and status = 'failed' and error like 'provider_reconciliation_required%'`, [runs.map((r) => r.runId)]);
+          if (pend.n === 0) break;
+        }
         await new Promise((r) => setTimeout(r, 40));
       }
       for (const t of killers) clearTimeout(t);
       clearInterval(sampler);
+      clearInterval(healer);
       for (const p of procs) p.drain.request('fin');
       await Promise.race([Promise.all(procs.flatMap((p) => p.loops)), new Promise((r) => setTimeout(r, 3000))]);
       clearInterval(ticker);
@@ -491,7 +582,7 @@ async function runReal() {
         itemsPerSimHour: times.length ? (itemsDb.filter((x) => x.status === 'completed').length / (Math.max(...times) / 3600)) : null,
         waitP50Sim: pct(waits, 50), waitP95Sim: pct(waits, 95), waitMaxSim: waits.length ? Math.max(...waits) : null,
         maxQueuedRuns: Math.max(0, ...qsamples.map((q) => q.queued)), maxAdmittedRuns: maxAdmitted, maxOldestReadyWaitSec: Math.max(0, ...qsamples.map((q) => q.oldest)),
-        maxRunningByProvider: maxRunningByProv, limits: Object.fromEntries(Object.entries(REAL_LIMITS).map(([k, v]) => [k, v.maxConcurrent])),
+        maxRunningByProvider: maxRunningByProv, maxInflightByProvider: maxInflight, limits: Object.fromEntries(Object.entries(REAL_LIMITS).map(([k, v]) => [k, v.maxConcurrent])),
         orphanReservations: orphans, runsOverAuthorized: overBudget, ledgerTotalUsd: ledger.reduce((a, l) => a + l.total, 0),
         attempts: itemsDb.reduce((a, x) => a + Number(x.attempt_count), 0), items: itemsDb.length,
         failedItems: itemsDb.filter((x) => x.status === 'failed').length,
