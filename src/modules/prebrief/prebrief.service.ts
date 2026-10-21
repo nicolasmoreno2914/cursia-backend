@@ -317,10 +317,16 @@ export class PrebriefService {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     await this.assertTablesReady(); // sin las tablas (entorno sin la migración) → 503 ANTES de congelar nada
-    await this.syncProfileOutcomes(courseId, ownerId);
+    // Review M-C: se valida sobre la vista previa (lo que se guardaría) ANTES de escribir nada: un NOT_READY o CHANGED no
+    // deja guardados el contexto ni los vínculos ni sube el contador.
     let draft = await this.draft(courseId, ownerId);
     if (!draft.readiness.ready) throw new ConflictException({ code: PREBRIEF_NOT_READY, message: `${PREBRIEF_NOT_READY}: la propuesta todavía no se puede preparar para aprobación.`, blockers: draft.readiness.blockers });
     if (draft.modelSha256 !== expectedModelSha) throw new ConflictException({ code: PREBRIEF_CHANGED, message: `${PREBRIEF_CHANGED}: la propuesta cambió desde que la revisaste; revisa la versión actualizada.`, modelSha256: draft.modelSha256 });
+    if (await this.syncProfileOutcomes(courseId, ownerId)) {
+      // Lo guardado es la misma vista previa: la huella no cambia (si cambiara, algo se movió en el medio).
+      draft = await this.draft(courseId, ownerId);
+      if (draft.modelSha256 !== expectedModelSha) throw new ConflictException({ code: PREBRIEF_CHANGED, message: `${PREBRIEF_CHANGED}: el diseño cambió mientras se preparaba la propuesta; revisa la versión actualizada.`, modelSha256: draft.modelSha256 });
+    }
     await this.invalidateIfStale(courseId, draft, user.id);
     const existing = (await this.versions(this.dataSource, courseId)).find((v) => v.model_sha256 === draft.modelSha256 && (v.status === 'ready' || v.status === 'approved'));
     if (existing) return { created: false, version: this.versionDto(existing) };

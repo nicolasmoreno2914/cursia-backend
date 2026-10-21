@@ -25,6 +25,9 @@
 //   OA14 plurales («leyes» ↔ «ley») vinculan; sinónimos (RCP / reanimación, infarto / ataque cardíaco) quedan ambiguos
 //   OA15 capítulo integrador vinculado a medias → aviso «quizá también trabaja», sin vínculo forzado
 //   OA16 guardar el perfil solo agrega; perfil vaciado → se quita lo del puente (no lo ajeno)
+//   OA17 el verbo inicial no cuenta solo: «Calcula el costo de la nómina» y «Aplica la normativa ambiental» → ambiguos
+//   OA18 stemmer: planea = planeación, costeo = costo; marco ≠ marca, medio ≠ media, cargo ≠ carga, informe ≠ información
+//   OA19 recall: un título corto entero dentro del resultado vincula; evidencia que no distingue dos resultados → revisión
 // Parte DB (Postgres 16 desechable; --pure-only la salta y lo dice):
 //   OD1 caso R1 exacto, curso sin documento: al guardar el perfil queda el contexto (RA1, RA2, CO1) sin subir el contador;
 //       «Usar este diseño» lo vincula solo (RA1 → Cap. 1, RA2 → Cap. 2, CO1 → ambos) con la misma huella; el perfil
@@ -36,8 +39,9 @@
 //   OD4 curso con documento: el comportamiento de siempre (sin versión nueva del contexto, sin vínculos nuevos)
 //   OD5 perfil y después documento: el documento reemplaza; los vínculos a ids del perfil que cambian de significado se
 //       quitan; los resultados del documento no se duplican
-//   OD6 Prebrief: GET /prebrief NO escribe (vista previa con contexto y vínculos); guardarlos da la misma huella del
-//       Prebrief; el Blueprint congelado lleva contexto y vínculos (sha verificado); después nada lo cambia
+//   OD6 Prebrief: GET /prebrief NO escribe; «Preparar» con huella vieja falla sin escribir nada (re-review M-C); con el
+//       curso listo, «Preparar» corre DE VERDAD con la huella de la vista previa y guarda contexto y vínculos; el
+//       Blueprint congelado los lleva (sha verificado); después nada lo cambia
 //   OD8 un resultado del perfil sin capítulo claro: advertencia «Requiere revisión», no bloquea el Prebrief
 //   OD9 quitar del perfil un resultado vinculado: el guardado no sube el contador; «Usar este diseño» con el contador de
 //       la interfaz no da 409 y devuelve el vigente
@@ -329,6 +333,41 @@ const sha = (ctx) => CP.profileSha256(CP.normalizeProfile('academic', ctx));
     eq([foreign.action, foreign.reason], ['skip', 'NO_PROFILE_OUTCOMES'], 'sin registro del puente no se quita nada ajeno');
   });
 
+  await check('OA17 el verbo inicial no cuenta solo (re-review I-A): «Calcula el costo de la nómina» y «Aplica la normativa ambiental» quedan ambiguos', () => {
+    const one = (lo, chapters) => A.planDocumentlessLinks(A.academicContextFromProfile(null, profileOf(lo), null).context, chapters);
+    const v2 = one({ do: ['Calcula el costo de la nómina'] }, [ch('a', 'Costo de ventas', 'Calcular el costo de ventas'), ch('b', 'Liquidación de la nómina', 'Liquidar la nómina y sus prestaciones'), ch('c', 'Impuestos', 'Declarar impuestos')]);
+    eq([v2.links, v2.ambiguous.map((x) => x.id)], [[], ['RA1']], 'nómina: no vincula con «Costo de ventas» por «calcular» + «costo»');
+    const v3 = one({ do: ['Aplica la normativa ambiental', 'Diseña un plan de residuos'] }, [ch('a', 'Aplicación de la normativa laboral', 'Aplicar el código laboral'), ch('b', 'Gestión ambiental', 'Diseñar un plan de manejo ambiental')]);
+    assert(!v3.links.some((l) => l.chapterId === 'a'), 'ambiental: no vincula con «normativa laboral»: ' + JSON.stringify(v3.links));
+    assert(v3.ambiguous.some((x) => x.text === 'Aplica la normativa ambiental'), 'ambiental: queda ambiguo');
+    const v1 = one({ do: ['Evalúa el riesgo de crédito de un cliente'] }, [ch('a', 'Evaluación del riesgo operativo', 'Evaluar el riesgo operativo de la empresa'), ch('b', 'Crédito y cartera', 'Otorgar crédito a clientes'), ch('c', 'Liquidez', 'Medir la liquidez')]);
+    assert(!v1.links.some((l) => l.chapterId === 'a'), 'crédito: no a «riesgo operativo» por el verbo: ' + JSON.stringify(v1.links));
+    eq(A.leadVerbStem('El estudiante será capaz de calcular el costo'), A.lightStem('calcular'), 'el verbo se encuentra después de «será capaz de»');
+  });
+
+  await check('OA18 stemmer (re-review M-A/M-B): planea = planeación = planear, costeo = costo; marco ≠ marca, medio ≠ media, cargo ≠ carga, informe ≠ información', () => {
+    const st = (w) => A.lightStem(w);
+    for (const [a, b] of [['planea', 'planeacion'], ['planear', 'planeacion'], ['costeo', 'costo']]) eq(st(a), st(b), `${a} = ${b}`);
+    for (const [a, b] of [['marco', 'marca'], ['medio', 'media'], ['cargo', 'carga'], ['puesto', 'puesta'], ['libro', 'libra'], ['informe', 'informacion']]) assert(st(a) !== st(b), `${a} ≠ ${b}`);
+    const one = (lo, chapters) => A.planDocumentlessLinks(A.academicContextFromProfile(null, profileOf(lo), null).context, chapters);
+    const n1 = one({ know: ['Explica el marco normativo de la publicidad'] }, [ch('a', 'Gestión de marca y publicidad digital', 'Posicionar la marca en redes'), ch('b', 'Investigación de mercados', 'Diseñar una encuesta'), ch('c', 'Precios', 'Fijar precios')]);
+    eq([n1.links, n1.ambiguous.map((x) => x.id)], [[], ['RA1']], 'marco normativo ≠ marca');
+    const n7 = one({ do: ['Elabora un informe de gestión'] }, [ch('a', 'Sistemas de información', 'Gestionar la información de la empresa'), ch('b', 'Redacción técnica', 'Redactar textos técnicos'), ch('c', 'Indicadores', 'Calcular indicadores de gestión')]);
+    assert(!n7.links.some((l) => l.chapterId === 'a'), 'informe ≠ «Sistemas de información»: ' + JSON.stringify(n7.links));
+  });
+
+  await check('OA19 recall (re-review I-B): un título corto que está entero en el resultado vincula; evidencia que no distingue entre dos resultados → revisión', () => {
+    const one = (lo, chapters) => A.planDocumentlessLinks(A.academicContextFromProfile(null, profileOf(lo), null).context, chapters);
+    const lg = one({ do: ['Analiza la cadena de suministro de una organización.', 'Planea la demanda con métodos cuantitativos sencillos.', 'Gestiona inventarios y almacenes con indicadores.'] },
+      [ch('l1', 'Fundamentos de la cadena de suministro', null), ch('l2', 'Planeación de la demanda', null), ch('l3', 'Gestión de inventarios', null), ch('l4', 'Transporte y distribución', null)]);
+    const L = linksOf(lg);
+    eq([L.l1, L.l2, L.l3], [['RA1'], ['RA2'], ['RA3']], 'cadena / planeación / inventarios');
+    eq(L.l4, undefined, 'transporte no encaja: revisión');
+    const mo = one({ do: ['Identifica los elementos del costo: materiales, mano de obra y costos indirectos', 'Calcula el costo de los materiales y de la mano de obra con métodos de valoración'] },
+      [ch('m1', 'Asignación de la mano de obra', null), ch('m2', 'Elementos del costo', null), ch('m3', 'Métodos de valoración de inventarios', null)]);
+    assert(!(linksOf(mo).m1 || []).length, '«mano de obra» está en los dos resultados: el capítulo no decide entre ellos: ' + JSON.stringify(linksOf(mo)));
+  });
+
   if (PURE_ONLY) console.log('\n(--pure-only: parte DB omitida)');
   else await dbChecks(doc);
 
@@ -415,6 +454,7 @@ async function dbChecks(doc) {
     const pedagogy = new PedagogyService(ds, coursesStub);
     const design = new CourseDesignService(ds, coursesStub, pedagogy);
     const prebrief = new PrebriefService(ds, coursesStub, design, blueprints, profiles);
+    const structure = new CourseStructureService(ds.getRepository(CourseModule), ds.getRepository(CourseChapter), coursesStub, ds, blueprints);
     const OWNER = '11111111-2222-4333-8444-555555555555';
     const counter = async (cid) => Number((await ds.query(`select structure_version_counter c from public.courses where id = $1`, [cid]))[0].c);
     const versions = async (cid, kind) => (await ds.query(`select version from public.course_profiles where course_id = $1 and kind = $2 order by version`, [cid, kind])).map((x) => Number(x.version));
@@ -547,43 +587,74 @@ async function dbChecks(doc) {
       eq([again.academicFromProfile.skipped, await versions(c.id, 'academic')], ['DOCUMENT_CONTEXT', [1, 2]], 'el documento sigue mandando');
     });
 
-    await check('OD6 Prebrief: GET sin escribir (vista previa con contexto y vínculos); guardar da la MISMA huella; Blueprint con contexto y vínculos (sha); después no cambia', async () => {
+    // Deja un curso listo para preparar el Prebrief como lo haría la interfaz: pedido completo, «Usar este diseño»
+    // (perfil + diseño aplicados, SIN «Vincular ahora»: los vínculos quedan solo en la vista previa) y datos confirmados.
+    const R1_BRIEF = { nombre: '[R1 · SINTÉTICO] Primeros auxilios básicos en el trabajo', obj: 'Brindar la primera respuesta ante una emergencia en el lugar de trabajo mientras llega la ayuda profesional',
+      sector: 'Seguridad y salud en el trabajo', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro', comp: R1.CO1 };
+    const makeReady = async (cid) => {
+      await ds.query(`update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), '{brief}', $2::jsonb, true) where id = $1`, [cid, JSON.stringify({ briefVersion: 1, fields: R1_BRIEF, updatedAt: '2026-10-21T00:00:00.000Z' })]);
+      let last = null;
+      for (let i = 0; i < 6; i++) {
+        const st = await prebrief.state(cid, OWNER);
+        if (st.draft.readiness.ready) return st;
+        const bl = st.draft.readiness.blockers || [];
+        last = bl.map((b) => `${b.code}: ${b.title}`);
+        if (bl.some((b) => b.code === 'pending_changes' || b.code === 'design_not_saved')) {
+          const card = await design.recommend(cid, OWNER, {});
+          if (card.profileChanged) await profiles.append(cid, OWNER, 'pedagogy', card.profile, card.profileVersion);
+          const c2 = await design.recommend(cid, OWNER, {});
+          await structure.applyDistribution(cid, OWNER, { expectedCounter: await counter(cid), proposalSha256: c2.design.proposalSha256 });
+          continue;
+        }
+        const doubts = bl.filter((b) => b.code === 'doubtful_data' && b.ref);
+        if (!doubts.length) break;
+        for (const b of doubts) await prebrief.confirm(cid, OWNER, { id: OWNER, email: null }, b.ref);
+      }
+      throw new Error('el curso no quedó listo: ' + JSON.stringify(last));
+    };
+
+    await check('OD6 Prebrief: GET sin escribir; «Preparar» valida ANTES de escribir (M-C) y, listo, prepara DE VERDAD con la huella vista; Blueprint con contexto y vínculos (sha); después no cambia', async () => {
       const c = await newCourse('Prebrief anterior');
       await legacyProfile(c.id, R1_PROFILE);
-      const ce0 = await counter(c.id);
-      const st = await prebrief.state(c.id, OWNER);
-      eq([await versions(c.id, 'academic'), await links(c.id).then((l) => l.map((x) => x[1])), await counter(c.id)], [[], [null, null], ce0], 'GET /prebrief no escribe (ni contexto, ni vínculos, ni contador)');
+      const st = await makeReady(c.id);
       const outs = st.draft.model.goals && st.draft.model.goals.outcomes;
       assert(Array.isArray(outs) && outs.length === 2 && outs.every((o) => o.chapters.length === 1), 'la vista previa ya no dice «Sin capítulo asignado»: ' + JSON.stringify(outs));
-      // Lo que se guarda («Usar este diseño» / «Preparar») es exactamente lo que se mostró: misma huella del Prebrief.
-      const fx = await design.fix(c.id, OWNER, 'link_outcomes', ce0);
-      eq([fx.linkedChapters, await versions(c.id, 'academic')], [2, [1]], 'guardado');
-      eq(await links(c.id), R1_LINKS, 'vínculos guardados');
+      const before = { links: (await links(c.id)).map((x) => x[1]), counter: await counter(c.id), ac: await versions(c.id, 'academic') };
+      assert(before.links.every((x) => x === null), 'los vínculos todavía son solo vista previa (el GET no escribe): ' + JSON.stringify(before.links));
       const st2 = await prebrief.state(c.id, OWNER);
-      eq(st2.draft.modelSha256, st.draft.modelSha256, 'misma huella del Prebrief antes y después de guardar (preparar no da PREBRIEF_CHANGED)');
-      // «Preparar» sobre la vista previa: con readiness lista, se prepara con la huella vista.
-      if (st2.draft.readiness && st2.draft.readiness.ready) {
-        const pr = await prebrief.prepare(c.id, OWNER, { id: OWNER, email: null }, st.draft.modelSha256).catch((e) => e);
-        assert(!(pr instanceof Error) || !/PREBRIEF_CHANGED/.test(String(pr.message)), 'preparar con la huella de la vista previa: ' + (pr && pr.message));
-      }
+      eq([st2.draft.modelSha256, await counter(c.id), await versions(c.id, 'academic')], [st.draft.modelSha256, before.counter, before.ac], 'dos GET: misma huella y nada escrito');
+      // M-C: con una huella vieja, «Preparar» falla SIN escribir nada (ni contexto, ni vínculos, ni contador).
+      const bad = await prebrief.prepare(c.id, OWNER, { id: OWNER, email: null }, 'f'.repeat(64)).then(() => null, (e) => e);
+      assert(bad && /PREBRIEF_CHANGED/.test(String(bad.message || (bad.getResponse && JSON.stringify(bad.getResponse())))), 'huella vieja → PREBRIEF_CHANGED: ' + (bad && bad.message));
+      eq({ links: (await links(c.id)).map((x) => x[1]), counter: await counter(c.id), ac: await versions(c.id, 'academic') }, before, 'el error no escribió nada');
+      // «Preparar» de verdad, con la huella que se vio en la vista previa.
+      const pr = await prebrief.prepare(c.id, OWNER, { id: OWNER, email: null }, st.draft.modelSha256);
+      assert(pr && pr.created === true && pr.version && pr.version.status === 'ready', 'preparado: ' + JSON.stringify(pr && { created: pr.created, status: pr.version && pr.version.status }));
+      eq(pr.version.modelSha256, st.draft.modelSha256, 'la versión preparada tiene la huella de la vista previa');
+      const contentLinks = (await links(c.id)).filter((x) => R1.chapters.some((r) => r.title === x[0]));
+      eq(contentLinks, R1_LINKS, '«Preparar» guardó los vínculos (el capítulo de práctica que agregó el diseño integra los del módulo)');
+      assert((await versions(c.id, 'academic')).length >= 1, 'y el contexto');
       const locked = await blueprints.lock(c.id, OWNER, await counter(c.id));
+      eq(locked.created, false, 'el Blueprint ya lo congeló «Preparar»');
       const bp = locked.blueprint;
+      eq(String(bp.id), String(pr.version.blueprintId ?? bp.id), 'el Blueprint de la versión');
       const snap = bp.snapshot;
       assert(snap.course.academicContext && snap.course.academicContext.outcomes.length === 2 && snap.course.academicContext.competencies.length === 1, 'el Blueprint congela el contexto');
-      eq(snap.modules[0].chapters.map((x) => x.outcomeIds), [['RA1', 'CO1'], ['RA2', 'CO1']], 'y los vínculos');
+      eq(snap.modules[0].chapters.filter((x) => x.kind !== 'practice').map((x) => x.outcomeIds), [['RA1', 'CO1'], ['RA2', 'CO1']], 'y los vínculos');
       const SNAP = loadDist('modules/course-blueprints/blueprint-snapshot.js');
       eq(SNAP.snapshotSha256V2(snap), String(bp.sha256), 'sha del Blueprint verificado');
       const row0 = (await ds.query(`select snapshot_sha256 sha, snapshot_json::text s from public.course_blueprints where id = $1`, [bp.id]))[0];
       eq(row0.sha.trim(), String(bp.sha256), 'el sha guardado es el del snapshot');
       // Nada lo cambia después: re-guardar el perfil, GET /prebrief, recomendar.
-      await profiles.append(c.id, OWNER, 'pedagogy', R1_PROFILE, (await profiles.getCurrent(c.id, OWNER, 'pedagogy')).version);
+      const acBefore = await versions(c.id, 'academic');
+      await profiles.append(c.id, OWNER, 'pedagogy', (await profiles.getCurrent(c.id, OWNER, 'pedagogy')).profile, (await profiles.getCurrent(c.id, OWNER, 'pedagogy')).version);
       await prebrief.state(c.id, OWNER);
       await design.recommend(c.id, OWNER, {});
       const again = await blueprints.lock(c.id, OWNER, await counter(c.id));
       eq([again.created, String(again.blueprint.id)], [false, String(bp.id)], 'el mismo Blueprint (idempotente por huella)');
       const row1 = (await ds.query(`select snapshot_sha256 sha, snapshot_json::text s from public.course_blueprints where id = $1`, [bp.id]))[0];
       eq(row1, row0, 'Blueprint congelado intacto');
-      eq(await versions(c.id, 'academic'), [1], 'sin versiones nuevas');
+      eq(await versions(c.id, 'academic'), acBefore, 'sin versiones nuevas');
     });
 
     await check('OD7 regresión: Blueprint congelado antes no cambia; propuesta lista/aprobada o producción en curso → no se toca nada', async () => {

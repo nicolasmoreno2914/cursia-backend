@@ -187,6 +187,8 @@ export const LINK_SHARED_MIN = 2;
 /** Un resultado se vincula también a otros capítulos que le encajan casi igual de bien (≥ 80 % del mejor). */
 export const LINK_NEAR_BEST = 0.8;
 export const LINK_MAX_CHAPTERS = 3;
+/** Sentido capítulo → resultado: parte del capítulo (ponderada) que aparece en el resultado. */
+export const LINK_COVERAGE_MIN = 0.6;
 /** Por debajo del umbral pero con un término discriminante en común: el capítulo «quizá también trabaja» ese resultado. */
 export const LINK_PARTIAL_MIN = 0.15;
 /** Palabras que no dicen de qué trata un resultado ni un capítulo. */
@@ -209,12 +211,23 @@ export function lightStem(token: string): string {
   let w = token;
   if (w.length > 4 && w.endsWith('yes')) w = w.slice(0, -2);
   else w = stemPlural(w);
+  // Review M-B: pares que solo difieren en el género son palabras distintas (marco ≠ marca, medio ≠ media…); «informe»
+  // (el documento) no es «información».
+  if (GENDER_PAIRS.has(w) || w === 'informe') return w;
   for (const suf of SUFFIXES) {
     if (w.endsWith(suf) && w.length - suf.length >= 4) { w = w.slice(0, -suf.length); break; }
   }
   if (w.length >= 5 && /[aeo]$/.test(w)) w = w.slice(0, -1);
+  // Review M-A: la «e» de -ear / -eo / -eación (planea / planear / planeación → «plan», costeo / costo → «cost»).
+  if (w.length >= 5 && w.endsWith('e')) w = w.slice(0, -1);
   return w;
 }
+
+/** Palabras cuyo masculino y femenino significan cosas distintas: se comparan enteras (sin quitar la vocal final). */
+const GENDER_PAIRS: ReadonlySet<string> = new Set([
+  'marco', 'marca', 'medio', 'media', 'cargo', 'carga', 'puesto', 'puesta', 'libro', 'libra', 'caso', 'casa', 'plazo', 'plaza',
+  'modo', 'moda', 'banco', 'banca', 'punto', 'punta', 'fondo', 'fonda', 'cuento', 'cuenta', 'manzano', 'manzana', 'derecho', 'derecha',
+]);
 
 /**
  * Raíces de los términos con contenido (sin palabras vacías ni genéricas). Los verbos de Bloom NO se descartan (review
@@ -228,6 +241,15 @@ export function conceptStems(text: string): Set<string> {
     out.add(lightStem(raw));
   }
   return out;
+}
+
+/** Raíz del verbo de Bloom con el que empieza el resultado (salta «El estudiante será capaz de…»), o null. */
+export function leadVerbStem(text: string): string | null {
+  if (bloomLevelOf(text) === null) return null;
+  for (const w of stripToAscii(text).split(' ').slice(0, 8)) {
+    if (w && bloomLevelOf(w) !== null) return lightStem(w);
+  }
+  return null;
 }
 
 export interface LinkChapterInput {
@@ -287,16 +309,36 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
   const plan = new Map<string, Set<string>>(open.map((c) => [c.id, new Set<string>()]));
 
   const scores: DocumentlessLinkPlan['scores'] = [];
-  const scoreOf = new Map<string, { score: number; shared: number; rare: boolean; need: number }>();
+  const scoreOf = new Map<string, { score: number; coverage: number; shared: number; rare: boolean; need: number; chNeed: number; terms: string[] }>();
+  const chTotal = chStems.map((cs) => [...cs].filter((t) => !ubiquitous(t)).reduce((a, t) => a + idf(t), 0));
+  const chCount = chStems.map((cs) => [...cs].filter((t) => !ubiquitous(t)).length);
+  const titleStems = chapters.map((c) => [...conceptStems(c.title)].filter((t) => !ubiquitous(t)));
+  const titleFull = new Map<string, boolean>();
   for (const o of ctx.outcomes) {
-    const os = [...conceptStems(o.text)].filter((t) => !ubiquitous(t));
+    // Review I-A: el verbo inicial del resultado («Calcula…», «Aplica…») no dice de qué trata: su raíz no cuenta sola.
+    const lead = leadVerbStem(o.text);
+    const all = conceptStems(o.text);
+    // Excepción: un TÍTULO de capítulo que está entero en el resultado, nominalizando su verbo («Planeación de la
+    // demanda» ⊂ «Planea la demanda…»), con al menos dos términos y uno que no es el verbo.
+    chapters.forEach((c, i) => {
+      const ts = titleStems[i];
+      titleFull.set(`${o.id}|${c.id}`, ts.length >= LINK_SHARED_MIN && ts.every((t) => all.has(t)) && ts.some((t) => t !== lead));
+    });
+    const os = [...conceptStems(o.text)].filter((t) => !ubiquitous(t) && t !== lead);
     const total = os.reduce((a, t) => a + idf(t), 0);
     chapters.forEach((c, i) => {
       let w = 0;
       let shared = 0;
       let hasRare = false;
-      for (const t of os) if (chStems[i].has(t)) { w += idf(t); shared++; if (rare(t)) hasRare = true; }
-      const s = { score: total > 0 ? round3(w / total) : 0, shared, rare: hasRare, need: Math.min(LINK_SHARED_MIN, os.length) };
+      const terms: string[] = [];
+      for (const t of os) if (chStems[i].has(t)) { w += idf(t); shared++; terms.push(t); if (rare(t)) hasRare = true; }
+      const s = {
+        terms,
+        score: total > 0 ? round3(w / total) : 0,
+        // Review I-B: qué parte del capítulo (título + objetivo) aparece en el resultado (un título corto dentro de un RA largo).
+        coverage: chTotal[i] > 0 ? round3(w / chTotal[i]) : 0,
+        shared, rare: hasRare, need: Math.min(LINK_SHARED_MIN, os.length), chNeed: Math.min(LINK_SHARED_MIN, chCount[i]),
+      };
       scoreOf.set(`${o.id}|${c.id}`, s);
       scores.push({ outcomeId: o.id, chapterId: c.id, score: s.score, shared });
     });
@@ -304,6 +346,12 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
   const reliable = (oid: string, cid: string) => {
     const s = scoreOf.get(`${oid}|${cid}`)!;
     return s.need > 0 && s.score >= LINK_SCORE_MIN && s.shared >= s.need && s.rare;
+  };
+  // Sentido capítulo → resultado: el capítulo está casi entero dentro del resultado, con los mismos términos discriminantes.
+  const covers = (oid: string, cid: string) => {
+    const s = scoreOf.get(`${oid}|${cid}`)!;
+    return titleFull.get(`${oid}|${cid}`) === true
+      || (s.chNeed >= LINK_SHARED_MIN && s.coverage >= LINK_COVERAGE_MIN && s.shared >= LINK_SHARED_MIN && s.rare);
   };
 
   // a) Cada resultado → el capítulo que mejor le encaja (y los que le encajan casi igual), si la coincidencia es confiable.
@@ -322,13 +370,38 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
       if (plan.has(r.c.id)) plan.get(r.c.id)!.add(o.id);
     }
   }
-  // b) Cada capítulo abierto sin resultado → el resultado que mejor le encaja, si la coincidencia es confiable.
+  // b) Cada capítulo abierto sin resultado → el resultado que mejor le encaja: coincidencia confiable en el sentido del
+  //    resultado o, si no, cobertura del capítulo dentro del resultado (review I-B). Un empate entre dos resultados no
+  //    decide nada: el capítulo queda para revisión.
   for (const c of open) {
     const set = plan.get(c.id)!;
     if (set.size) continue;
-    const best = ctx.outcomes.map((o) => ({ o, ...scoreOf.get(`${o.id}|${c.id}`)! })).filter((x) => reliable(x.o.id, c.id))
-      .sort((a, b) => b.score - a.score || b.shared - a.shared || cmpId(a.o.id, b.o.id))[0];
-    if (best) set.add(best.o.id);
+    const cand = ctx.outcomes.map((o) => ({ o, ...scoreOf.get(`${o.id}|${c.id}`)! }));
+    const rel = cand.filter((x) => reliable(x.o.id, c.id)).sort((a, b) => b.score - a.score || b.shared - a.shared || cmpId(a.o.id, b.o.id));
+    // Dos resultados que le encajan casi igual (p. ej. los dos nombran «mano de obra») no deciden nada: revisión.
+    if (rel.length > 1 && rel[1].score >= rel[0].score * LINK_NEAR_BEST) continue;
+    if (rel.length) { set.add(rel[0].o.id); continue; }
+    const byCov = cand.filter((x) => covers(x.o.id, c.id)).sort((a, b) => b.coverage - a.coverage || b.shared - a.shared || cmpId(a.o.id, b.o.id));
+    // Dos resultados que lo cubren igual de bien no deciden nada: queda para revisión.
+    if (byCov.length === 1 || (byCov.length > 1 && byCov[1].coverage < byCov[0].coverage)) set.add(byCov[0].o.id);
+  }
+  // Lo que vincula un capítulo con un resultado tiene que distinguirlo de los demás: si otro resultado comparte con el
+  // capítulo TODOS esos términos (p. ej. «mano de obra» en RA1 y RA2), la evidencia no decide → revisión.
+  for (const c of open) {
+    const set = plan.get(c.id)!;
+    for (const x of [...set]) {
+      const tx = scoreOf.get(`${x}|${c.id}`)!.terms;
+      if (!tx.length) continue;
+      if (ctx.outcomes.some((y) => y.id !== x && tx.every((t) => scoreOf.get(`${y.id}|${c.id}`)!.terms.includes(t)))) set.delete(x);
+    }
+  }
+  // Ambiguos: los resultados que no quedaron en ningún capítulo (ni los trabajaba uno antes).
+  const linkedNow = new Set([...plan.values()].flatMap((x) => [...x]));
+  for (let i = ambiguous.length - 1; i >= 0; i--) if (linkedNow.has(ambiguous[i].id)) ambiguous.splice(i, 1);
+  for (const o of ctx.outcomes) {
+    if (covered.has(o.id) || linkedNow.has(o.id) || ambiguous.some((a) => a.id === o.id)) continue;
+    const best = chapters.map((c) => ({ c, s: scoreOf.get(`${o.id}|${c.id}`)!.score })).sort((a, b) => b.s - a.s)[0];
+    ambiguous.push({ id: o.id, text: o.text, bestChapterId: best && best.s > 0 ? best.c.id : null, score: best ? best.s : 0 });
   }
   // c) Capítulos vinculados que también comparten un término discriminante con otro resultado (por debajo del umbral):
   //    se avisa («quizá también trabaja RAx»), nunca se vincula.
