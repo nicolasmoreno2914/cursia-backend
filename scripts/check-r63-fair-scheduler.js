@@ -21,6 +21,8 @@
 //   [F10] (H3) un run admitido estancado libera su lugar; con trabajo nuevo vuelve por la cola (no se pierde)
 //   [F11] (H1) tope presentation=2 + devolución Q-21 prior_call_in_flight: nunca más de 2 llamadas en vuelo
 //   [F12] (H2) ventanas = las de Q-21 y siguen el env; (H4) el claim por run prueba otro tipo libre; (H5) huella de config
+//   [F13] (N1) estancado que sigue running + reapertura real retryItem fuera del lock → nunca 2 ocupando con tope 1
+//   [F14] (N3) queuePosition en el orden de la política; gate de cuota de YouTube antes de re-admitir
 //
 // Usage: npm run build && node scripts/check-r63-fair-scheduler.js
 'use strict';
@@ -219,7 +221,15 @@ function setSched(vars) { for (const k of SCHED_ENV) delete process.env[k]; Obje
       eq(m.runs.find((r) => r.runId === a2.runId).admission, 'queued', 'el segundo de OA en cola');
     });
 
-    await check('[F10] H3 admisión: un run admitido ESTANCADO (sin partes en vuelo ni actividad) libera su lugar; cuando vuelve a tener trabajo entra por la cola; no se pierde', async () => {
+    // Paso del tiempo en la simulación: SOLO los instantes de eventos del EJECUTOR (claim / cierre / inicio del run). Nunca
+    // `updated_at`: las reaperturas reales (retryItem…) lo ponen en now() y la prueba tiene que verlo (N1).
+    const ageExecutorEvents = async (runId, interval) => {
+      await ds.query(`update public.production_jobs set started_at = now() - $2::interval where id = $1`, [runId, interval]);
+      await ds.query(`update public.generation_item_runs set claimed_at = claimed_at - $2::interval, finished_at = finished_at - $2::interval where job_id = $1`, [runId, interval]);
+    };
+    const occupyingCount = async () => (await ds.query(`select count(*)::int n from (${FS.occupyingRunsSql('$1')}) o`, [60]))[0].n;
+
+    await check('[F10] H3/N1 admisión: un run admitido ESTANCADO libera su lugar; la reapertura REAL (retryItem, updated_at=now) no lo re-admite: vuelve por la cola; no se pierde', async () => {
       await closeAll();
       setSched({ DYNAMIC_ADMISSION_ENABLED: 'true', DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS: '1', DYNAMIC_ADMISSION_STALL_SECONDS: '60' });
       const a = await mk(OA);
@@ -228,27 +238,84 @@ function setSched(vars) { for (const k of SCHED_ENV) delete process.env[k]; Obje
       // A queda esperando a un humano: su única parte falla (no reintentable) y el resto depende de ella.
       await sched.failItem(x.itemRunId, 'f10-a', 'validation_invalid: sim (espera a un humano)', false);
       const b = await mk(OB);
-      const [ra] = await ds.query(`select worker_status from public.production_jobs where id = $1`, [a.runId]);
-      if (ra.worker_status !== 'failed') {
-        assert(!(await sched.claimNextItem({ executorId: 'f10-b0', types: ['course_plan'], leaseSeconds: 60 })), 'A con actividad reciente todavía ocupa');
-      }
-      // Simulación del paso del tiempo (> DYNAMIC_ADMISSION_STALL_SECONDS sin actividad): A estancado → libera.
-      await ds.query(`update public.production_jobs set worker_status = 'running', status = 'running', started_at = now() - interval '2 hours' where id = $1`, [a.runId]);
-      await ds.query(`update public.generation_item_runs set updated_at = now() - interval '2 hours' where job_id = $1`, [a.runId]);
+      await ageExecutorEvents(a.runId, '2 hours');
+      await ds.query(`update public.production_jobs set worker_status = 'running', status = 'running' where id = $1`, [a.runId]);
       let m = await QM.computeSchedulerQueueMetrics(ds);
       eq(m.runs.find((r) => r.runId === a.runId).admission, 'stalled', 'A estancado (visible, no perdido)');
       const y = await sched.claimNextItem({ executorId: 'f10-b', types: ['course_plan'], leaseSeconds: 60 });
       assert(y && y.runId === b.runId, 'B entra en el lugar de A');
-      // Un humano reintenta la parte de A → A tiene trabajo otra vez, pero el lugar es de B → A en cola (posición 1).
-      await ds.query(`update public.generation_item_runs set status = 'pending', error = null, updated_at = now() - interval '2 hours' where id = $1`, [x.itemRunId]);
+      // Un humano reintenta la parte de A con el retryItem REAL (updated_at = now()).
+      await env.runs.retryItem(a.cid, a.ownerId, 1, a.runId, x.itemKey);
+      const [w] = await ds.query(`select status, updated_at > now() - interval '1 minute' as fresh from public.generation_item_runs where id = $1`, [x.itemRunId]);
+      eq([w.status, w.fresh], ['pending', true], 'reabierta con updated_at = now()');
+      for (let i = 0; i < 3; i++) { const g = await sched.claimNextItem({ executorId: `f10-w${i}`, types: ALL, leaseSeconds: 60 }); assert(!g || g.runId !== a.runId, 'el worker no le da partes a A sin lugar'); }
       const ra2 = await sched.claimNextItemDetailed({ runId: a.runId, executorId: 'f10-a2', types: ['course_plan'], leaseSeconds: 60 });
       eq([ra2.item, ra2.reason, ra2.queuePosition], [null, 'admission_queued', 1], 'A vuelve por la cola');
+      eq(await occupyingCount(), 1, 'nunca 2 ocupando con tope 1');
       m = await QM.computeSchedulerQueueMetrics(ds);
       eq([m.runs.find((r) => r.runId === a.runId).queuePosition, m.totals.admittedRuns], [1, 1], 'posición visible; 1 admitido');
       // B termina → A entra.
       await ds.query(`update public.production_jobs set worker_status = 'completed', status = 'completed' where id = $1`, [b.runId]);
       const z = await sched.claimNextItem({ executorId: 'f10-a3', types: ['course_plan'], leaseSeconds: 60 });
       assert(z && z.runId === a.runId, 'A re-admitido');
+    });
+
+    await check('[F13] N1 (re-review): run estancado que SIGUE running (otra parte esperando) + reapertura real retryItem → no se re-admite sin el lock (2 runs, tope 1)', async () => {
+      await closeAll();
+      setSched({ DYNAMIC_ADMISSION_ENABLED: 'true', DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS: '1', DYNAMIC_ADMISSION_STALL_SECONDS: '60' });
+      const a = await mk(OA);
+      await prereqsDone([a.runId], ['course_plan', 'course_intro', 'module_intro', 'audio_welcome']);
+      const c1 = await sched.claimNextItemDetailed({ runId: a.runId, executorId: 'f13-a', types: ['content'], leaseSeconds: 60 });
+      assert(c1.item, 'A admitido (content 1)');
+      // content 1 espera mucho (como la cuota de YouTube): retrying con next_retry_at lejano → el run sigue `running`.
+      await sched.failItem(c1.item.itemRunId, 'f13-a', 'youtube_blocked_quota: sim', true, undefined, { retryAfterSeconds: 86400, grantAttempt: true });
+      const c2 = await sched.claimNextItemDetailed({ runId: a.runId, executorId: 'f13-a', types: ['content'], leaseSeconds: 60 });
+      assert(c2.item, 'content 2');
+      await sched.failItem(c2.item.itemRunId, 'f13-a', 'validation_invalid: sim (espera a un humano)', false);
+      const [ra] = await ds.query(`select worker_status from public.production_jobs where id = $1`, [a.runId]);
+      eq(ra.worker_status, 'running', 'A sigue running (tiene una parte esperando)');
+      await ageExecutorEvents(a.runId, '2 hours');
+      const b = await mk(OB);
+      const yb = await sched.claimNextItem({ executorId: 'f13-b', types: ['course_plan'], leaseSeconds: 60 });
+      assert(yb && yb.runId === b.runId, 'B entra en el lugar de A (estancado)');
+      // Reapertura REAL fuera del lock (updated_at = now()).
+      await env.runs.retryItem(a.cid, a.ownerId, 1, a.runId, c2.item.itemKey);
+      for (let i = 0; i < 4; i++) {
+        const g = await sched.claimNextItem({ executorId: `f13-w${i}`, types: ALL, leaseSeconds: 60 });
+        assert(!g || g.runId !== a.runId, `el worker le dio a A ${g && g.itemKey} sin lugar`);
+        eq(await occupyingCount(), 1, 'nunca 2 ocupando con tope 1');
+      }
+      const r = await sched.claimNextItemDetailed({ runId: a.runId, executorId: 'f13-a2', types: ['content'], leaseSeconds: 60 });
+      eq([r.item, r.reason], [null, 'admission_queued'], 'A pasa por el lock y espera');
+    });
+
+    await check('[F14] N3: queuePosition sigue el orden de la política (owner_rr) y un run con solo la subida a YouTube bloqueada no se re-admite antes del gate de cuota', async () => {
+      await closeAll();
+      setSched({ DYNAMIC_SCHEDULER_POLICY: 'owner_rr', DYNAMIC_ADMISSION_ENABLED: 'true', DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS: '1', DYNAMIC_ADMISSION_STALL_SECONDS: '60' });
+      const x = await mk(OA);
+      const cx = await sched.claimNextItem({ executorId: 'f14-x', types: ['course_plan'], leaseSeconds: 60 });
+      assert(cx && cx.runId === x.runId, 'X (dueño A) admitido');
+      const a2 = await mk(OA); const b1 = await mk(OB); const c1 = await mk(OC);
+      const pos = async (run) => (await sched.claimNextItemDetailed({ runId: run.runId, executorId: 'f14-q', types: ['course_plan'], leaseSeconds: 60 })).queuePosition;
+      eq([await pos(b1), await pos(c1), await pos(a2)], [1, 2, 3], 'owner_rr: B y C (nunca servidos) antes que el 2.º de A');
+      const m = await QM.computeSchedulerQueueMetrics(ds);
+      eq([b1, c1, a2].map((r) => m.runs.find((y) => y.runId === r.runId).queuePosition), [1, 2, 3], 'métricas = claim');
+      // Gate de YouTube.
+      await closeAll();
+      setSched({ DYNAMIC_ADMISSION_ENABLED: 'true', DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS: '1', DYNAMIC_ADMISSION_STALL_SECONDS: '60' });
+      const y = await mk(OA);
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where job_id = $1 and type <> 'video'`, [y.runId]);
+      await ds.query(`update public.generation_item_runs set status = 'retrying', next_retry_at = now() - interval '1 second', error = 'youtube_blocked_quota: sim',
+                        output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('delivery', 'blocked_quota', 'youtubeQuotaBlockedUntil', to_char((now() + interval '1 hour') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'))
+                      where job_id = $1 and type = 'video'`, [y.runId]);
+      await ds.query(`update public.production_jobs set worker_status = 'running', status = 'running' where id = $1`, [y.runId]);
+      await ageExecutorEvents(y.runId, '2 hours');
+      eq(await occupyingCount(), 0, 'Y estancado (no ocupa)');
+      assert(!(await sched.claimNextItem({ executorId: 'f14-v', types: ['video'], leaseSeconds: 60 })), 'gate de cuota vigente → no se re-admite');
+      eq(await occupyingCount(), 0, 'sigue sin ocupar');
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('youtubeQuotaBlockedUntil', to_char((now() - interval '1 minute') at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')) where job_id = $1 and type = 'video'`, [y.runId]);
+      const v = await sched.claimNextItem({ executorId: 'f14-v2', types: ['video'], leaseSeconds: 60 });
+      assert(v && v.runId === y.runId, 'cuota repuesta → se re-admite');
     });
 
     await check('[F11] H1 tope presentation=2 + devolución Q-21 (prior_call_in_flight): nunca más de 2 llamadas en vuelo', async () => {
@@ -278,6 +345,16 @@ function setSched(vars) { for (const k of SCHED_ENV) delete process.env[k]; Obje
       }
       eq(inflight.size, 2, 'la fantasma + 1 nueva');
       eq((await QM.computeSchedulerQueueMetrics(ds)).caps.find((c) => c.key === 'type:presentation').occupied, 2, 'occupied = 2');
+      // N2: el barrido que deja `failed` una parte (lease vencida, sin gracias ni intentos) con la llamada en vuelo no
+      // libera el tope durante la ventana.
+      const live = await ds.query(`select id from public.generation_item_runs where type = 'presentation' and status = 'running' limit 1`);
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second', attempt_count = max_attempts,
+                        output_summary = coalesce(output_summary, '{}'::jsonb) || '{"leaseExpiryGrants": 6}'::jsonb where id = $1`, [live[0].id]);
+      await sched.sweepExpiredLeases();
+      const [fx] = await ds.query(`select status, error from public.generation_item_runs where id = $1`, [live[0].id]);
+      eq([fx.status, fx.error], ['failed', 'lease_expired'], 'barrida a failed');
+      assert(!(await sched.claimNextItem({ executorId: 'f11-n2', types: ['presentation'], leaseSeconds: 60 })), 'N2: la failed con la llamada en vuelo sigue ocupando');
+      eq((await QM.computeSchedulerQueueMetrics(ds)).caps.find((c) => c.key === 'type:presentation').occupied, 2, 'occupied = 2 (devuelta + failed en vuelo)');
       // Pasada la ventana (next_retry_at vencido), la devuelta deja de ocupar y vuelve a ser reclamable.
       inflight.delete(`A:${p1.itemRunId}`);
       await ds.query(`update public.generation_item_runs set next_retry_at = now() - interval '1 second' where id = $1`, [p1.itemRunId]);

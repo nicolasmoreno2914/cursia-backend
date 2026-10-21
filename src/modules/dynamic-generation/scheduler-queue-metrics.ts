@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { DISPATCHABLE_RUN_WORKER_STATUSES } from './item-transitions';
 import { claimablePredicate } from './scheduler.service';
 import { ALL_MANIFEST_ITEM_TYPES } from '../generation-manifests/generation-manifest-builder';
-import { ADMISSION_STALL_DEFAULT_SECONDS, FairSchedulingConfig, capGraceParams, capOccupancySql, fairSchedulingConfig, fairSchedulingFingerprint, occupyingRunsSql } from './fair-scheduling';
+import { ADMISSION_STALL_DEFAULT_SECONDS, FairSchedulingConfig, capGraceParams, admissionQueueSql, capOccupancySql, fairSchedulingConfig, fairSchedulingFingerprint, occupyingRunsSql } from './fair-scheduling';
 
 /**
  * r63 (SC) — métricas de la cola del scheduler de la generación dinámica (SOLO LECTURA).
@@ -72,7 +72,10 @@ export async function computeSchedulerQueueMetrics(q: Q, cfg: FairSchedulingConf
   // en la cola (`queued` sin empezar / `stalled` admitido pero estancado); misma posición que devuelve el claim.
   const stall = cfg.admission.enabled ? cfg.admission.stallSeconds : ADMISSION_STALL_DEFAULT_SECONDS;
   const occupying = new Set<string>((await q.query(occupyingRunsSql('$1'), [stall])).map((r: any) => String(r.id)));
-  let queuedPos = 0;
+  // N3: posición en el orden de la política (la misma que devuelve el claim con admission_queued).
+  const posOf = new Map<string, number>(cfg.admission.enabled
+    ? (await q.query(admissionQueueSql(cfg.policy, '$1', '$2'), [DISPATCHABLE_RUN_WORKER_STATUSES, stall])).map((r: any) => [String(r.id), Number(r.pos)])
+    : []);
   const runs = runRows.map((r) => {
     const ws = String(r.worker_status);
     const occ = occupying.has(String(r.id));
@@ -83,7 +86,7 @@ export async function computeSchedulerQueueMetrics(q: Q, cfg: FairSchedulingConf
       createdAt: r.created_at, startedAt: r.started_at, lastClaimedAt: r.last_claimed_at,
       waitSec: ws === 'queued' ? Math.round((new Date(now).getTime() - new Date(r.created_at).getTime()) / 1000) : null,
       admission,
-      ...(waiting && cfg.admission.enabled ? { queuePosition: ++queuedPos } : {}),
+      ...(waiting && posOf.has(String(r.id)) ? { queuePosition: posOf.get(String(r.id)) } : {}),
       items: r.items, completed: r.completed, running: r.running, failedOrBlocked: r.failed_or_blocked,
     };
   });

@@ -111,6 +111,8 @@ import {
   capOccupancySql,
   capsForTypes,
   occupyingRunsSql,
+  admissionQueueSql,
+  YOUTUBE_QUOTA_GATE_SQL,
   fairSchedulingConfig,
   lastServedSql,
   reportConfigErrorsOnce,
@@ -794,6 +796,7 @@ export class SchedulerService {
     let cancelledJob: any = null;
     let paused = false;
     let admissionQueued: { position: number } | null = null;
+    let admitting = false;
     let capped: CapRule | null = null;
     let unavailable: string | null = null;
     let leasedElsewhere: { expiresAt: string | null } | undefined;
@@ -827,18 +830,13 @@ export class SchedulerService {
           );
           const perOwner = sched.admission.maxActivePerOwner;
           if (Number(a.total) >= sched.admission.maxActiveRuns || (perOwner !== null && Number(a.mine) >= perOwner)) {
-            // Posición en la cola visible: runs despachables que tampoco ocupan lugar y llegaron antes (+1).
-            const [pos] = await qr.query(
-              `select count(*)::int as n from public.production_jobs pj
-                where pj.execution_mode = 'dynamic_generation' and pj.worker_status = any($1::text[])
-                  and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-                  and (pj.created_at, pj.id) < ($2::timestamptz, $3::uuid)
-                  and pj.id not in (select o.id from (${occupyingRunsSql('$4')}) o)`,
-              [DISPATCHABLE_RUN_WORKER_STATUSES, job.created_at, job.id, stall],
-            );
-            admissionQueued = { position: Number(pos.n) + 1 };
+            // N3: posición en la cola en el orden de la POLÍTICA (admissionQueueSql), la misma que muestran las métricas.
+            const [pos] = await qr.query(`select q.pos from (${admissionQueueSql(sched.policy, '$1', '$2')}) q where q.id = $3`,
+              [DISPATCHABLE_RUN_WORKER_STATUSES, stall, job.id]);
+            admissionQueued = { position: pos ? Number(pos.pos) : 1 };
             return null;
           }
+          admitting = true;
         }
       }
 
@@ -863,7 +861,7 @@ export class SchedulerService {
       }
 
       const [cand] = await qr.query(
-        `select g.id, g.type
+        `select g.id, g.type, g.output_summary->>'delivery' as delivery
            from public.generation_item_runs g
            join public.course_generation_manifests m on m.id = g.manifest_id
            left join lateral (
@@ -881,6 +879,13 @@ export class SchedulerService {
         [job.id, types, itemId ?? null],
       );
       if (!cand) return null;
+
+      // r63 (N3): un run que entra (o vuelve a entrar) por la admisión con una subida a YouTube bloqueada por cuota no se
+      // admite antes de que la cuota se reponga (gate global r62 P): ocuparía un lugar sin poder subir nada.
+      if (admitting && String(cand.type) === 'video' && cand.delivery === 'blocked_quota') {
+        const [gate] = await qr.query(`select (${YOUTUBE_QUOTA_GATE_SQL}) > now() as closed`);
+        if (gate && gate.closed === true) return null;
+      }
 
       // r63 (SC): topes de concurrencia (DYNAMIC_SCHEDULER_TYPE_CAPS / _PROVIDER_CAPS; sin configurar = nada). Un
       // advisory lock de TRANSACCIÓN por tope, en orden fijo de clave (sin deadlocks): el que entra cuenta los running

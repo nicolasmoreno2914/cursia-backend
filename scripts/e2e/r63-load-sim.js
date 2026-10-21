@@ -412,18 +412,19 @@ async function runReal() {
             }
           }
           for (const r of pend) {
-            // Pasada la ventana y todavía sin liquidar: solo pasa con la caída DURA del worker de video. Videogen tiene
-            // consulta de estado y costo (GET status / costs): la conciliación automática con esa evidencia es el camino
-            // real (provider-reconcile, r62 N2). LLM/TTS nunca llegan acá en esta simulación (su intento anterior sigue vivo
-            // y liquida solo); si llegaran, el camino real es reconciliación humana → se cuenta y la parte queda fallida.
-            if (kind !== 'videogen') {
+            // Pasada la ventana y todavía sin liquidar (caída dura del video, o el intento congelado sigue sin reconectar).
+            // Videogen (GET status / costs) y Gamma (GET /generations/{id}, credits.deducted) tienen consulta: la
+            // conciliación automática con esa evidencia es el camino real (provider-reconcile, r62 N2). TTS/LLM no tienen
+            // consulta: la parte va a provider_reconciliation_required (en la app la sigue el auto-heal —reenvío de audio
+            // incierto #583— o un admin); se cuenta y la reabre el «recuperador» del harness cuando la reserva se cierra.
+            if (kind !== 'videogen' && kind !== 'gamma') {
               counters.humanReconciliation++;
               await svc.sched.failItem(item.itemRunId, executorId, `provider_reconciliation_required: ${prov} (sim)`, false);
               return;
             }
-            await svc.ledger.settleReservation(r.idempotency_key, chargeFor(kind, { ...item, attempt: r.attempt }, ownerId), 'r63-sim: Videogen GET status/costs (job ya renderizado)');
+            await svc.ledger.settleReservation(r.idempotency_key, chargeFor(kind, { ...item, attempt: r.attempt }, ownerId), `r63-sim: ${kind} GET (evidencia del proveedor)`);
             counters.videogenReconciled++;
-            lateResult.set(item.itemRunId, 'videogen_job');
+            lateResult.set(item.itemRunId, `${kind}_job`);
           }
           if (lateResult.has(item.itemRunId)) {
             // Se adopta el resultado del intento anterior (punto de guardado LLM / id externo Gamma-Videogen): 0 llamadas nuevas.

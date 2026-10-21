@@ -247,7 +247,8 @@ export function capGraceParams(cfg: Pick<FairSchedulingConfig, 'capGraceByType'>
  * Partes que ocupan un tope (`typesParam` = tipos del tope; `wTypesParam`/`wSecsParam` = capGraceParams):
  *  - running (también con la lease vencida y sin barrer);
  *  - devueltas por Q-21 (`prior_call_in_flight…`) mientras su next_retry_at no llegó (= lo que falta de la ventana);
- *  - barridas por lease vencida durante la ventana en vuelo de su tipo, contada desde el barrido.
+ *  - barridas por lease vencida durante la ventana en vuelo de su tipo, contada desde el barrido — también las que el
+ *    barrido dejó `failed` (sin gracias ni intentos): su llamada puede seguir en vuelo igual (N2).
  * Mismo texto para el pre-filtro, el claim (bajo el lock del tope) y las métricas.
  */
 export function capOccupancySql(typesParam: string, wTypesParam: string, wSecsParam: string): string {
@@ -255,7 +256,7 @@ export function capOccupancySql(typesParam: string, wTypesParam: string, wSecsPa
            where g.type = any(${typesParam}::text[])
              and (g.status = 'running'
                   or (g.status in ('pending', 'retrying') and g.error like '${PRIOR_CALL_IN_FLIGHT}%' and g.next_retry_at > now())
-                  or (g.status in ('pending', 'retrying') and g.error = '${LEASE_EXPIRED}'
+                  or (g.status in ('pending', 'retrying', 'failed') and g.error = '${LEASE_EXPIRED}'
                       and g.updated_at > now() - make_interval(secs => coalesce(
                         (select w.s from unnest(${wTypesParam}::text[], ${wSecsParam}::int[]) as w(t, s) where w.t = g.type), 0))))`;
 }
@@ -263,8 +264,11 @@ export function capOccupancySql(typesParam: string, wTypesParam: string, wSecsPa
 /**
  * Runs que OCUPAN lugar de admisión (`stallParam` = segundos de DYNAMIC_ADMISSION_STALL_SECONDS):
  *  - cualquier run abierto (también pausado o recién reanudado en `queued`) con alguna parte running (en vuelo);
- *  - un run running/retrying con actividad en sus partes (updated_at: claim, latido, fallo, cierre) dentro del umbral.
- * Un run admitido sin partes running y sin actividad deja de ocupar (estancado) y vuelve a la cola cuando tenga trabajo.
+ *  - un run running/retrying con actividad DEL EJECUTOR dentro del umbral: inicio del run, claim (`claimed_at`) o cierre
+ *    (`finished_at`: completeItem / fallo terminal). NO cuenta `updated_at`: las reaperturas fuera del lock (retryItem,
+ *    auto-heal, provider-reconcile, resolveYoutubeUpload, desbloqueo de dependientes) lo tocan y re-admitirían un run
+ *    estancado sin pasar por el lock de admisión (N1). Esas rutas no tocan claimed_at y ponen finished_at = null.
+ * Un run admitido sin partes running y sin actividad del ejecutor deja de ocupar (estancado) y vuelve por la cola.
  */
 export function occupyingRunsSql(stallParam: string): string {
   return `select pj.id, pj.owner_id from public.production_jobs pj
@@ -273,9 +277,41 @@ export function occupyingRunsSql(stallParam: string): string {
              and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
              and (exists (select 1 from public.generation_item_runs r where r.job_id = pj.id and r.status = 'running')
                   or (pj.worker_status in ('running', 'retrying')
-                      and greatest(pj.started_at, (select max(a.updated_at) from public.generation_item_runs a where a.job_id = pj.id))
+                      and greatest(pj.started_at,
+                                   (select max(greatest(a.claimed_at, a.finished_at)) from public.generation_item_runs a where a.job_id = pj.id))
                           > now() - make_interval(secs => ${stallParam}::int)))`;
 }
+
+/**
+ * N3: posición en la cola de admisión en el ORDEN DE LA POLÍTICA (el mismo criterio que el claim global):
+ *  fifo = alta del run; run_rr = run servido hace más tiempo (max claimed_at, nulls first); owner_rr = dueño servido hace
+ *  más tiempo entre TODOS sus runs despachables, luego el alta. Solo entre los runs despachables que no ocupan lugar.
+ *  Aproximación documentada: el claim real ordena por clase de worker y solo entre runs con algo reclamable de esa clase.
+ *  Devuelve (id, pos). `statusesParam` = despachables, `stallParam` = umbral de estancado.
+ */
+export function admissionQueueSql(policy: SchedulerPolicy, statusesParam: string, stallParam: string): string {
+  const order = policy === 'owner_rr' ? 'lo.l asc nulls first, w.created_at, w.id'
+    : policy === 'run_rr' ? 'ls.l asc nulls first, w.created_at, w.id' : 'w.created_at, w.id';
+  return `with d as (
+            select pj.id, pj.owner_id, pj.created_at from public.production_jobs pj
+             where pj.execution_mode = 'dynamic_generation' and pj.worker_status = any(${statusesParam}::text[])
+               and coalesce(pj.status, '') not in ('cancelled', 'cancelling')),
+          ls as (select x.job_id, max(x.claimed_at) as l from public.generation_item_runs x where x.job_id in (select id from d) group by x.job_id),
+          lo as (select d.owner_id, max(ls.l) as l from d join ls on ls.job_id = d.id group by d.owner_id),
+          w as (select d.* from d where d.id not in (select o.id from (${occupyingRunsSql(stallParam)}) o))
+          select w.id, row_number() over (order by ${order})::int as pos
+            from w left join ls on ls.job_id = w.id left join lo on lo.owner_id is not distinct from w.owner_id`;
+}
+
+/**
+ * N3: gate GLOBAL de la cuota de YouTube (r62 P, mismo criterio que youtubeQuotaGateUntil de dynamic-item-worker.ts):
+ * el `youtubeQuotaBlockedUntil` más lejano de un video abierto. Un run estancado cuya única parte reclamable es la
+ * subida bloqueada por cuota NO se re-admite antes de ese instante (ocuparía un lugar sin poder subir nada).
+ */
+export const YOUTUBE_QUOTA_GATE_SQL = `select max((g.output_summary->>'youtubeQuotaBlockedUntil')::timestamptz) as gate_until
+  from public.generation_item_runs g
+ where g.type = 'video' and g.status in ('retrying', 'running', 'queued', 'pending')
+   and (g.output_summary->>'youtubeQuotaBlockedUntil') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'`;
 
 /** Clave del advisory lock de transacción de un tope / de la admisión (hashtextextended). */
 export const ADMISSION_LOCK_KEY = 'cursia:dynamic_generation:admission';
