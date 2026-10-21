@@ -23,6 +23,18 @@ export interface VideogenBatchJob {
    * status (campo opcional; los consumidores legacy lo ignoran). null/ausente = desconocida.
    */
   duration_seconds?: number | null;
+  /**
+   * r61 Q-04: escenas del guion que escribió Videogen ([{scene_order, narration, duration_seconds}],
+   * GET /api/external/videos/:id/status, presentes desde que el audio está generado). Crudo: lo
+   * normaliza y acota videoScenesFromVideogen. null/ausente = sin línea de tiempo.
+   */
+  scenes?: unknown[] | null;
+  /**
+   * r62 (N2): etapa actual (`current_step`) y cantidad de escenas que informa el status. Solo los usa la conciliación
+   * V2 (foto S0 al cancelar); los consumidores legacy los ignoran. null/ausente = no informado.
+   */
+  current_step?: string | null;
+  scenes_count?: number | null;
 }
 
 export interface VideogenBatchResult {
@@ -40,6 +52,9 @@ export interface VideogenCostBreakdown {
   job_id: string;
   estimated_total_cost: number;
   breakdown: Record<string, number> | null;
+  /** r62 (N2): cantidad de registros de uso (`usage_logs[]`) y escenas del job, si Videogen los informa (foto S0). */
+  usage_logs_count?: number | null;
+  scenes_count?: number | null;
 }
 
 const COMPLETED_STATUSES = new Set(['completed', 'done', 'success', 'finished']);
@@ -73,6 +88,41 @@ function videogenDurationSeconds(j: any): number | null {
   return null;
 }
 
+/**
+ * r62 (N2): timeout HTTP OPCIONAL, por llamada, del cliente de Cursia hacia Videogen (Videogen no cambia). Solo lo pasan
+ * los llamadores V2 (dynamic-item-worker y el barrido de conciliación), que tratan un POST vencido como envío ambiguo y
+ * un GET vencido como error reintentable. SIN la opción, cada método hace exactamente el mismo `fetch` que antes (V1:
+ * video-worker.ts no cambia de comportamiento; re-review r62 (a)).
+ */
+export interface VideogenCallOptions {
+  /** Timeout de la llamada (ms). Ausente = sin timeout (comportamiento previo). */
+  timeoutMs?: number;
+}
+/** Defaults de los llamadores V2 (VIDEOGEN_HTTP_TIMEOUT_MS / VIDEOGEN_SUBMIT_TIMEOUT_MS los pisan). */
+export const VIDEOGEN_V2_GET_TIMEOUT_MS_DEFAULT = 60_000;
+export const VIDEOGEN_V2_SUBMIT_TIMEOUT_MS_DEFAULT = 180_000;
+function v2TimeoutFromEnv(key: string, dflt: number, env: Record<string, string | undefined>): number {
+  const n = Number(env[key]);
+  return Number.isInteger(n) && n > 0 ? n : dflt;
+}
+/** Opciones de llamada de los llamadores V2. */
+export function videogenV2CallOptions(kind: 'get' | 'submit', env: Record<string, string | undefined> = process.env): VideogenCallOptions {
+  return kind === 'submit'
+    ? { timeoutMs: v2TimeoutFromEnv('VIDEOGEN_SUBMIT_TIMEOUT_MS', VIDEOGEN_V2_SUBMIT_TIMEOUT_MS_DEFAULT, env) }
+    : { timeoutMs: v2TimeoutFromEnv('VIDEOGEN_HTTP_TIMEOUT_MS', VIDEOGEN_V2_GET_TIMEOUT_MS_DEFAULT, env) };
+}
+/** Sin `timeoutMs` → `fetch(url, init)` tal cual (mismos argumentos que antes). Con él → AbortSignal.timeout. */
+async function videogenFetch(url: string, init: RequestInit, opts: VideogenCallOptions | undefined, what: string): Promise<Response> {
+  const ms = opts?.timeoutMs;
+  if (!(typeof ms === 'number' && Number.isFinite(ms) && ms > 0)) return fetch(url, init);
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(ms) });
+  } catch (err) {
+    const name = err instanceof Error ? err.name : 'error';
+    throw new Error(`Videogen ${what}: error de red (${name}${name === 'TimeoutError' ? `, ${ms} ms` : ''})`);
+  }
+}
+
 @Injectable()
 export class VideogenService {
   private readonly logger = new Logger(VideogenService.name);
@@ -97,22 +147,25 @@ export class VideogenService {
       error: j.error ?? j.error_message ?? null,
       progress: j.progress != null ? Number(j.progress) : null,
       duration_seconds: videogenDurationSeconds(j),
+      scenes: Array.isArray(j?.scenes) ? j.scenes : null,
+      current_step: typeof j.current_step === 'string' && j.current_step ? j.current_step : null,
+      scenes_count: Array.isArray(j.scenes) ? j.scenes.length : j.scenes_count != null && Number.isFinite(Number(j.scenes_count)) ? Number(j.scenes_count) : null,
     }));
   }
 
-  async batchCreate(videos: VideogenVideoPayload[]): Promise<VideogenBatchResult> {
+  async batchCreate(videos: VideogenVideoPayload[], opts?: VideogenCallOptions): Promise<VideogenBatchResult> {
     const { apiKey, baseUrl } = this.getConfig();
 
     this.logger.log(`Submitting batch-create to Videogen: ${videos.length} videos`);
 
-    const response = await fetch(`${baseUrl}/api/external/videos/batch-create`, {
+    const response = await videogenFetch(`${baseUrl}/api/external/videos/batch-create`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({ videos }),
-    });
+    }, opts, 'batch-create');
 
     const text = await response.text();
     this.logger.log(`Videogen batch-create response: HTTP ${response.status}`);
@@ -136,16 +189,16 @@ export class VideogenService {
     };
   }
 
-  async getBatchStatus(batchId: string): Promise<VideogenBatchStatus> {
+  async getBatchStatus(batchId: string, opts?: VideogenCallOptions): Promise<VideogenBatchStatus> {
     const { apiKey, baseUrl } = this.getConfig();
 
     const url = `${baseUrl}/api/external/videos/batches/${encodeURIComponent(batchId)}/status`;
     this.logger.log(`Polling Videogen batch status: ${batchId}`);
 
-    const response = await fetch(url, {
+    const response = await videogenFetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    });
+    }, opts, 'batch-status');
 
     const text = await response.text();
     this.logger.log(`Videogen batch-status response: HTTP ${response.status}`);
@@ -170,16 +223,16 @@ export class VideogenService {
     };
   }
 
-  async getVideoStatus(jobId: string): Promise<VideogenBatchJob> {
+  async getVideoStatus(jobId: string, opts?: VideogenCallOptions): Promise<VideogenBatchJob> {
     const { apiKey, baseUrl } = this.getConfig();
 
     const url = `${baseUrl}/api/external/videos/${encodeURIComponent(jobId)}/status`;
     this.logger.log(`Polling Videogen video status: ${jobId}`);
 
-    const response = await fetch(url, {
+    const response = await videogenFetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    });
+    }, opts, 'video-status');
 
     const text = await response.text();
 
@@ -199,22 +252,42 @@ export class VideogenService {
   }
 
   /**
+   * r62 (N2): cancelación de un job (`POST /api/videos/{id}/cancel`, endpoint EXISTENTE de Videogen con DualAuthGuard,
+   * la misma API key; Videogen no cambia). Solo la usa la conciliación V2 y solo para un job ENCOLADO: Videogen lo saca
+   * de la cola y lo marca failed. Para un job que ya está PROCESANDO no lo detiene (el procesador no consulta la
+   * cancelación y vuelve a escribir su progreso), así que el llamador nunca lo usa como prueba de que no hay render.
+   * `alreadyInactive` = Videogen respondió que el job ya no está activo (400 job_not_active).
+   */
+  async cancelVideo(jobId: string, opts?: VideogenCallOptions): Promise<{ cancelled: boolean; alreadyInactive: boolean }> {
+    const { apiKey, baseUrl } = this.getConfig();
+    const url = `${baseUrl}/api/videos/${encodeURIComponent(jobId)}/cancel`;
+    this.logger.log(`Cancelling Videogen job: ${jobId}`);
+    const response = await videogenFetch(url, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` } }, opts, 'cancel');
+    const text = await response.text();
+    let parsed: Record<string, any> = {};
+    try { parsed = JSON.parse(text); } catch { /* cuerpo no JSON */ }
+    if (response.ok) return { cancelled: true, alreadyInactive: false };
+    if (response.status === 400 && parsed?.error === 'job_not_active') return { cancelled: false, alreadyInactive: true };
+    throw new Error(`Videogen cancel failed (HTTP ${response.status}): ${String(parsed?.error ?? parsed?.message ?? text).slice(0, 200)}`);
+  }
+
+  /**
    * Costo real por video, calculado por Videogen a partir de sus logs de uso
    * reales (OpenAI texto/imágenes, voz, render, YouTube) — no una tarifa
    * configurada. Mismo baseUrl/apiKey que el resto de este servicio; el
    * endpoint acepta la misma API key vía DualAuthGuard (confirmado contra
    * el código de video-engine-ia).
    */
-  async getVideoCost(jobId: string): Promise<VideogenCostBreakdown> {
+  async getVideoCost(jobId: string, opts?: VideogenCallOptions): Promise<VideogenCostBreakdown> {
     const { apiKey, baseUrl } = this.getConfig();
 
     const url = `${baseUrl}/api/costs/videos/${encodeURIComponent(jobId)}`;
     this.logger.log(`Fetching Videogen real cost: ${jobId}`);
 
-    const response = await fetch(url, {
+    const response = await videogenFetch(url, {
       method: 'GET',
       headers: { Authorization: `Bearer ${apiKey}` },
-    });
+    }, opts, 'cost');
 
     const text = await response.text();
 
@@ -235,6 +308,10 @@ export class VideogenService {
       throw new Error(`Videogen cost lookup returned invalid estimated_total_cost for job ${jobId}`);
     }
 
-    return { job_id: jobId, estimated_total_cost: totalCost, breakdown: parsed.breakdown ?? null };
+    return {
+      job_id: jobId, estimated_total_cost: totalCost, breakdown: parsed.breakdown ?? null,
+      usage_logs_count: Array.isArray(parsed.usage_logs) ? parsed.usage_logs.length : null,
+      scenes_count: parsed.scenes_count != null && Number.isFinite(Number(parsed.scenes_count)) ? Number(parsed.scenes_count) : null,
+    };
   }
 }

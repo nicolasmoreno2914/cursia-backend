@@ -3,6 +3,7 @@ import { returningRows } from '../../common/db/returning-rows';
 import { latestGenerationPredicate } from './item-generations';
 import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from './run-completion';
 import { FailureSource, classifyFailure, currentRecoveryOf, extractFailureCode } from '../reliability/failure-classifier';
+import { PROVIDER_RECONCILE_AMBIGUOUS_KINDS, PROVIDER_RECONCILE_MAX_AMBIGUOUS_RESUBMITS, PROVIDER_RECONCILE_MAX_RESUBMITS, providerReconcileKindOf } from './provider-reconcile';
 import { AttemptOutcome, outcomeForFailure, recordItemFailure } from '../reliability/attempt-log';
 import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoHealPolicyFromEnv } from './auto-heal';
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
@@ -177,6 +178,11 @@ export function maxAutomaticRoundsToday(error: string, type: string | null | und
   const cur = currentRecoveryOf(error, type, outputSummary, failureClass);
   if (cur === 'safe_auto_retry') return SAFE_AUTO_RETRY_MAX_ROUNDS;
   if (cur === 'ambiguous_audio_resubmit') return AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS;
+  if (cur === 'provider_reconcile') {
+    // r62 (N2): un caso sin evidencia (ambiguo) tiene UN solo reenvío automático; con evidencia, hasta el tope.
+    const kind = providerReconcileKindOf(type, error, outputSummary);
+    return kind && PROVIDER_RECONCILE_AMBIGUOUS_KINDS.includes(kind) ? PROVIDER_RECONCILE_MAX_AMBIGUOUS_RESUBMITS : PROVIDER_RECONCILE_MAX_RESUBMITS;
+  }
   if (cur === 'auto_regenerate') return Math.max(0, Math.floor(autoHealPolicyFromEnv(process.env).regenMaxRounds ?? 0));
   return cur === 'auto_heal' ? autoHealMaxRoundsFor(type, autoHealPolicyFromEnv(process.env)) : 0;
 }

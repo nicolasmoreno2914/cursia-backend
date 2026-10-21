@@ -212,6 +212,8 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         if (f === 'drop') { st.tts.push({ ...req, failed: 'drop' }); return rq.socket.destroy(); }
         if (f === 'hang') { st.tts.push({ ...req, failed: 'hang' }); return hang(rq); }
         if (typeof f === 'number') { st.tts.push({ ...req, failed: f }); return json(f, { error: { message: `fake ${f}` } }); }
+        // r62: respuesta HTTP con un cuerpo propio (p. ej. { status: 504, message: 'upstream request timeout' }).
+        if (f && typeof f === 'object' && typeof f.status === 'number') { st.tts.push({ ...req, failed: f.status }); return json(f.status, { error: { message: String(f.message || `fake ${f.status}`) } }); }
         const rid = plan.ttsFixedRequestId || `req_f2_${++st.seq}`;
         st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format });
         // Ritmo medido de la voz real (≈141 ppm, r19 DIAG-A) → duración proporcional al texto (segundos enteros, ≥ 1); ttsSlow → el doble.

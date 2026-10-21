@@ -30,6 +30,17 @@ import { normalizeDecimal } from './decimal';
 import { SPEND_CONTROL_CODES } from './spend-controls';
 import { RUN_BUDGET_NOT_AUTHORIZED } from './run-budget';
 import { parseReconcileDecision, ReconcileDecision, ReconcileEvidence } from './reconcile-decision';
+import { POLICY_ADMIN_SCOPES, PolicyAdminScope, PolicyRow } from './policy-admin';
+
+/** r62: fila de política → JSON público del endpoint de admin (el flag explícito sale de limits, como policyFromRow). */
+export function publicPolicyRow(r: PolicyRow) {
+  const limits = (r.limits || {}) as Record<string, unknown>;
+  return {
+    id: r.id ?? null, scope: r.scope, scopeId: r.scope_id ?? null, version: Number(r.version), limits,
+    onExceed: r.on_exceed, requireHumanApprovalForRealSpend: limits.requireHumanApprovalForRealSpend === true,
+    legacyRequireHumanColumn: r.require_human_approval_for_real_spend, createdBy: r.created_by ?? null, createdAt: r.created_at ?? null,
+  };
+}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -315,6 +326,52 @@ export class FinopsAdminController {
         createdAt: row.created_at,
       };
     } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // ── r62 (d12): políticas de presupuesto (solo SuperAdmin: guard de la clase) ──────────────────────
+  // GET /api/v1/finops/budget-policies?scope=global|owner|course&scopeId= — versiones (append-only, más nueva primero).
+  @Get('budget-policies')
+  async budgetPolicies(@Query('scope') scope?: string, @Query('scopeId') scopeId?: string, @Query('limit') limit?: string) {
+    if (!scope || !(POLICY_ADMIN_SCOPES as readonly string[]).includes(scope)) throw new BadRequestException(`scope inválido: ${POLICY_ADMIN_SCOPES.join(' | ')}`);
+    if (scope === 'global' && scopeId) throw new BadRequestException('scope global no lleva scopeId');
+    if (scope === 'course' && !/^[1-9]\d{0,9}$/.test(String(scopeId || ''))) throw new BadRequestException('scopeId de un curso: id numérico');
+    if (scope === 'owner' && !UUID_RE.test(String(scopeId || ''))) throw new BadRequestException('scopeId de un dueño: UUID');
+    const n = limit === undefined ? 20 : Number(limit);
+    if (!Number.isInteger(n) || n < 1 || n > 100) throw new BadRequestException('limit: entero 1..100');
+    const versions = await this.budget.listPolicyVersions(scope as PolicyAdminScope, scope === 'global' ? null : String(scopeId).toLowerCase(), n);
+    return { scope, scopeId: scope === 'global' ? null : String(scopeId), versions: versions.map(publicPolicyRow) };
+  }
+
+  // GET /api/v1/finops/courses/:courseId/budget-policy — política vigente del curso (course > owner > global) y si
+  // un run nuevo arranca con la autorización única del usuario o necesita un admin (y por qué).
+  @Get('courses/:courseId/budget-policy')
+  async courseBudgetPolicy(@Param('courseId', ParseIntPipe) courseId: number) {
+    try {
+      const r = await this.budget.effectivePolicyForCourse(courseId);
+      return { ...r, policy: r.policy ? { id: r.policy.id, version: r.policy.version, limits: r.policy.limits, onExceed: r.policy.onExceed ?? null,
+        requireHumanApprovalForRealSpend: r.policy.requireHumanApprovalForRealSpend === true } : null };
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // POST /api/v1/finops/budget-policies — versión NUEVA de una política (append-only; nunca se edita una fila):
+  // {scope, scopeId?, limits? (parche: null quita un tope), onExceed?, requireHumanApprovalForRealSpend?, reason}.
+  // 200 {created:true, policy} | {created:false, policy: la vigente} si no cambia nada. Quién y por qué quedan en created_by.
+  @Post('budget-policies')
+  @HttpCode(HttpStatus.OK)
+  async updateBudgetPolicy(@Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
+    const actor = String(user?.email || user?.id || '').trim();
+    if (!actor) throw new BadRequestException('sin identidad del admin');
+    try {
+      const r = await this.budget.updatePolicy(body, actor);
+      return { created: r.created, policy: publicPolicyRow(r.policy) };
+    } catch (err) {
+      if ((err as { code?: string })?.code === '23505') {
+        throw new ConflictException({ code: 'policy_version_conflict', message: 'otra versión de esta política se creó a la vez; vuelve a leerla y reintenta' });
+      }
       throw finopsErrorToHttp(err);
     }
   }

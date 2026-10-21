@@ -62,6 +62,17 @@ do $$ begin
         or attention_reason in ('budget','config','duplicate_charge','unrecoverable','product_bug')) not valid;
     alter table public.generation_item_runs validate constraint gir_attention_reason_check;
   end if;
+  -- r62 (N1, re-review 4 M1): categoría de atención `dependency_unavailable` (la dependencia de un claim incompleto quedó
+  -- cancelada / omitida: el barrido la re-evalúa en cada tick y la reabre sola si revive). Idempotente: solo reescribe el
+  -- CHECK si todavía no admite el valor.
+  if exists (select 1 from pg_constraint where conname = 'gir_attention_reason_check'
+               and pg_get_constraintdef(oid) not like '%dependency_unavailable%') then
+    alter table public.generation_item_runs drop constraint gir_attention_reason_check;
+    alter table public.generation_item_runs
+      add constraint gir_attention_reason_check check (attention_reason is null
+        or attention_reason in ('budget','config','duplicate_charge','unrecoverable','product_bug','dependency_unavailable')) not valid;
+    alter table public.generation_item_runs validate constraint gir_attention_reason_check;
+  end if;
   if not exists (select 1 from pg_constraint where conname = 'gir_recovery_rounds_check') then
     alter table public.generation_item_runs
       add constraint gir_recovery_rounds_check check (recovery_round >= 0

@@ -35,6 +35,7 @@ const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 const target = require('../lib/v2-production-target');
 const pjConstraints = require('../lib/production-jobs-constraints');
+const schemaProbes = require('./v2-schema-probes');
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const TOOL_VERSION = 1;
@@ -435,7 +436,8 @@ function buildPlan(opts) {
     steps,
     verifications: VERIFY_SCRIPTS.map((f, i) => ({ order: i + 1, script: f, mode: 'V2_VERIFY_MODE=production-readonly' }))
       .concat([{ order: VERIFY_SCRIPTS.length + 1, script: '(interno) CHECK de production_jobs al día', mode: 'read-only' }])
-      .concat(opts.skipStoragePolicies ? [] : [{ order: VERIFY_SCRIPTS.length + 2, script: '(interno) políticas de storage.objects', mode: 'read-only' }]),
+      .concat(opts.skipStoragePolicies ? [] : [{ order: VERIFY_SCRIPTS.length + 2, script: '(interno) políticas de storage.objects', mode: 'read-only' }])
+      .concat([{ order: VERIFY_SCRIPTS.length + 3, script: '(interno) sondas de catálogo por paso (scripts/prod/v2-schema-probes.js, incl. los 6 pasos r60) + seed de precios v1', mode: 'read-only' }]),
     excluded: EXCLUDED,
     preconditions: [
       'Backup/PITR de producción verificado por el owner (CONFIRM_BACKUP_TAKEN=yes)',
@@ -727,6 +729,31 @@ async function verifyAll(tgt, opts) {
       }
     } finally {
       await client.end();
+    }
+  }
+  {
+    // r61: sondas de catálogo de TODOS los pasos incluidos en el plan (los 6 de r60 no tienen verify-* en modo
+    // production-readonly) + presencia de cada fila del seed de precios v1. Solo SELECT de catálogo.
+    const plan = buildPlan(opts);
+    const included = plan.steps.filter((s) => s.status === 'included').map((s) => s.id);
+    const steps = schemaProbes.PROBES.map((g) => g.step).filter((id) => included.includes(id));
+    const { loadPricingSeed } = require(path.join(REPO_ROOT, 'scripts/migrate-v21-finops.js'));
+    const pricingKeys = included.includes('v21-finops') ? schemaProbes.pricingKeysOf(loadPricingSeed()) : null;
+    const client = await connect(tgt);
+    let report;
+    try {
+      await target.beginReadOnlyTransaction(client);
+      console.log('\n── verify: sondas de catálogo por paso + seed de precios (read-only) ──');
+      report = await schemaProbes.runProbes(async (sql, params) => (await client.query(sql, params)).rows, {
+        steps, skipStorage: opts.skipStoragePolicies, pricingKeys,
+      });
+      console.log(schemaProbes.render(report).split('\n').map((l) => '  ' + l).join('\n'));
+    } finally {
+      await client.end();
+    }
+    if (!report.ok) {
+      console.error('❌ Sondas de catálogo: el esquema V2 está incompleto (ver «falta:» arriba).');
+      return { ok: false, results: [{ script: 'v2-schema-probes', exitCode: 1 }] };
     }
   }
   const results = runVerifyScripts(tgt, opts);

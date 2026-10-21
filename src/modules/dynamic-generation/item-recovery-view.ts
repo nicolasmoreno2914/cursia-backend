@@ -29,6 +29,12 @@ export interface ItemRecoveryView {
   currentRecovery: CurrentRecovery | null;
   /** recorded = columnas de R2; derived = clasificado en la lectura; none = sin fallo. */
   source: 'recorded' | 'derived' | 'none';
+  /**
+   * r62 (N2, review overdue m2): motivo EXACTO de la excepción registrada por la conciliación de proveedor
+   * (`output_summary.providerReconcile.declined`, p. ej. `provider_stuck_no_cancel`); `attentionReason` sigue siendo la
+   * causa de fondo del CHECK de la columna (p. ej. `duplicate_charge`). Ausente si no hay excepción.
+   */
+  exceptionReason?: string | null;
 }
 
 export interface ItemCostView {
@@ -68,7 +74,11 @@ function withProviderProbe(r: Record<string, any>, v: ItemRecoveryView, now: Dat
 
 /** Vista de recuperación de una fila de generation_item_runs (`select *`). Pura salvo el reloj y el env (kill-switch). */
 export function recoveryViewOf(r: Record<string, any>, now: Date = new Date()): ItemRecoveryView {
-  return withProviderProbe(r, baseRecoveryViewOf(r), now);
+  const v = withProviderProbe(r, baseRecoveryViewOf(r), now);
+  // Re-review m-n1: solo la excepción del error ACTUAL.
+  const pr = r.output_summary?.providerReconcile;
+  const declined = r.status === 'failed' && pr && String(pr.declinedError ?? '') === String(r.error ?? '') ? pr.declined : null;
+  return typeof declined === 'string' && declined ? { ...v, exceptionReason: declined } : v;
 }
 
 function baseRecoveryViewOf(r: Record<string, any>): ItemRecoveryView {

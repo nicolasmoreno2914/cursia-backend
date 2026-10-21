@@ -563,6 +563,14 @@ jobs:
                # solo generan sobre una propuesta aprobada (los anteriores no cambian; entran al flujo si preparan una
                # versión). Mismo patrón que arriba: se escribe solo si falta, así el instante queda congelado.
                ensure_env_default_if_absent DYNAMIC_PREBRIEF_REQUIRED_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+               # r62 (d14): DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS (modo fábrica, T8) NUNCA lo escribe el deploy: el default
+               # del código es vacío = ningún run retiene el empaque. Si alguien lo dejó a mano en el .env, se avisa (no se borra:
+               # es una herramienta de operación legítima) para que no retenga en silencio el paquete de cuentas reales.
+               if grep -Eq "^DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS=.+" .env; then
+                 echo "⚠ DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS definido en el .env de staging (modo fábrica): los runs NUEVOS de esos owners nacen con el empaque RETENIDO hasta liberarlo a mano — quitarlo para operación normal"
+               else
+                 echo "✓ DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS ausente (operación normal: ningún run retiene el empaque)"
+               fi
                if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
                  echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
                else

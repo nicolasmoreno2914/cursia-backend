@@ -1545,7 +1545,8 @@
   // Fase 2: 'application-activity-1' = sabe generar items application_activity (sin ella, un run con Actividades
   // de Aplicación responde el mismo 409 visible: una pestaña vieja nunca lo deja a medias en silencio).
   // Loop 9 B: 'guided-practice-1' = sabe generar items guided_practice (práctica guiada); sin ella, mismo 409 visible.
-  var DYN_EXECUTOR_FEATURES = 'pedagogy-brief-1,application-activity-1,guided-practice-1';
+  // r61 Q-04: video-scenes-1 = sabe anclar las preguntas del video a las escenas de Videogen (claim video.videoScenes).
+  var DYN_EXECUTOR_FEATURES = 'pedagogy-brief-1,application-activity-1,guided-practice-1,video-scenes-1';
   function backendDynClaim(runId, executorId, types, leaseSeconds) {
     return backendApiRequest('/api/v1/dynamic-generation/claim?features=' + DYN_EXECUTOR_FEATURES, {
       method: 'POST',
@@ -1707,6 +1708,14 @@
   // run de origen. El apply es backendDynStartRun(courseId, n, {fromRun}).
   function backendDynInvalidationPlan(courseId, n, fromRunId) {
     return backendApiRequest('/api/v1/courses/' + courseId + '/blueprints/' + n + '/manifest/invalidation-plan?fromRun=' + encodeURIComponent(fromRunId), { method: 'GET' });
+  }
+
+  // r62 (I2): presupuesto de aplicar el plan desde {fromRun} (estimado, modo de autorización user|admin|none, monto,
+  // límites y la huella que exige «Autorizar y aplicar»: backendDynStartRun(courseId, n, {fromRun, estimateHash})).
+  function backendDynFromRunPreview(courseId, n, fromRunId) {
+    return backendApiRequest('/api/v1/courses/' + courseId + '/blueprints/' + n + '/manifest/runs/from-run-preview', {
+      method: 'POST', body: { fromRun: fromRunId }
+    });
   }
 
   // F78-BE2: regenera un item como generación NUEVA (la anterior queda
@@ -4192,6 +4201,7 @@
   window.backendCoherenceComputeRunReport   = backendCoherenceComputeRunReport;
   window.backendCoherenceUploadLlmFindings  = backendCoherenceUploadLlmFindings;
   window.backendDynInvalidationPlan         = backendDynInvalidationPlan;
+  window.backendDynFromRunPreview           = backendDynFromRunPreview;
   window.backendDynRegenerateItem           = backendDynRegenerateItem;
   window.backendDynRegenerateDryRun         = backendDynRegenerateDryRun;
   window.backendDynVideoUpgradePreview      = backendDynVideoUpgradePreview;

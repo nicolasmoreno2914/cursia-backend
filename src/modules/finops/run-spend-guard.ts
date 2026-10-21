@@ -111,3 +111,56 @@ export const ITEM_RECOVERY_BUDGET_EXHAUSTED = 'item_recovery_budget_exhausted';
 export function itemRecoveryBudgetMessage(detail: string): string {
   return `${ITEM_RECOVERY_BUDGET_EXHAUSTED}: ${detail}. Se detiene solo esta parte (presupuesto de recuperación agotado); el resto del curso sigue.`;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// r62 (regla de ambigüedad acotada, punto 3) — ¿cabe UN reenvío de una llamada pagada con resultado ambiguo?
+//
+// Sin idempotencia ni consulta de estado (OpenAI TTS, Anthropic) el reenvío puede cobrar dos veces. Se acepta UNA
+// vez por parte solo si el PEOR caso entra en los límites que el usuario ya autorizó:
+//   - la reserva perdida ya está contada como gasto (liquidada como `charged` + `possible_duplicate`): itemSpent y
+//     runSpent la incluyen;
+//   - la reserva NUEVA (nextCost) se suma encima: itemSpent + nextCost ≤ presupuesto de recuperación de la parte y
+//     runSpent + nextCost ≤ saldo autorizado del run.
+// Puro. Reemplaza el tope fijo de USD 0,10 de #583.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type AmbiguousResendBudgetReason = 'item_recovery_budget' | 'run_budget' | 'no_authorization' | 'no_item_estimate';
+
+export interface AmbiguousResendBudgetInput {
+  /** Gastado por la parte en su ventana (incluye la reserva perdida). */
+  itemSpent: number;
+  /** Cota de la reserva del reenvío. */
+  nextCost: number;
+  /** Presupuesto de recuperación de la parte (itemHardLimit). null = sin estimado de la parte. */
+  itemHardLimit: number | null;
+  /** Gastado por el run (incluye la reserva perdida). */
+  runSpent: number;
+  /** Saldo autorizado del run. null = sin autorización vigente. */
+  authorizedBudget: number | null;
+}
+
+export interface AmbiguousResendBudget {
+  fits: boolean;
+  reason: AmbiguousResendBudgetReason | null;
+  itemSpent: number;
+  nextCost: number;
+  itemHardLimit: number | null;
+  runSpent: number;
+  authorizedBudget: number | null;
+  /** Peor caso de la parte y del run si se reenvía. */
+  worstItem: number;
+  worstRun: number;
+}
+
+export function ambiguousResendBudget(i: AmbiguousResendBudgetInput): AmbiguousResendBudget {
+  const nextCost = Math.max(0, Number(i.nextCost) || 0);
+  const worstItem = Math.max(0, Number(i.itemSpent) || 0) + nextCost;
+  const worstRun = Math.max(0, Number(i.runSpent) || 0) + nextCost;
+  const base = { itemSpent: i.itemSpent, nextCost, itemHardLimit: i.itemHardLimit, runSpent: i.runSpent, authorizedBudget: i.authorizedBudget, worstItem, worstRun };
+  // Falla cerrado: sin autorización o sin presupuesto de la parte no hay techo contra el cual acotar el duplicado.
+  if (i.authorizedBudget === null || !Number.isFinite(i.authorizedBudget)) return { ...base, fits: false, reason: 'no_authorization' };
+  if (i.itemHardLimit === null || !Number.isFinite(i.itemHardLimit)) return { ...base, fits: false, reason: 'no_item_estimate' };
+  if (worstItem > i.itemHardLimit + 1e-9) return { ...base, fits: false, reason: 'item_recovery_budget' };
+  if (worstRun > i.authorizedBudget + 1e-9) return { ...base, fits: false, reason: 'run_budget' };
+  return { ...base, fits: true, reason: null };
+}

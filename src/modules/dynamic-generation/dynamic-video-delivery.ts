@@ -479,6 +479,11 @@ export interface VideoDeliveryView {
   costKind: 'videogen' | 'none' | null;
   /** Próximo reintento automático (ISO) si el item está esperando (p.ej. cuota); si no, null. */
   nextRetryAt: string | null;
+  /**
+   * r62 (d6): solo en `blocked_quota` esperando: la espera por cuota ya pasó el umbral de alerta (24 h) y el sistema
+   * sigue reintentando solo. Ausente si no aplica (contrato previo intacto).
+   */
+  alert?: { code: 'youtube_quota_long_wait'; since: string | null; alertAt: string };
 }
 
 /**
@@ -535,7 +540,14 @@ export function deliveryViewOf(opts: {
     return view('ambiguous', err || 'La subida a YouTube quedó sin confirmar.', ['resolve_ambiguous']);
   }
   if (state === 'blocked_auth') return view('blocked_auth', blockDetail ?? (err || null), ['reconnect_youtube', 'retry_upload']);
-  if (state === 'blocked_quota') return view('blocked_quota', blockDetail ?? (err || null), failed ? ['retry_upload'] : []);
+  if (state === 'blocked_quota') {
+    const v = view('blocked_quota', blockDetail ?? (err || null), failed ? ['retry_upload'] : []);
+    // r62 (d6): espera larga con alerta visible (el worker registra `youtubeQuotaAlertAt` una vez, pasadas 24 h).
+    if (!failed && typeof os.youtubeQuotaAlertAt === 'string') {
+      v.alert = { code: 'youtube_quota_long_wait', since: typeof os.youtubeQuotaSince === 'string' ? os.youtubeQuotaSince : null, alertAt: os.youtubeQuotaAlertAt };
+    }
+    return v;
+  }
   if (state === 'upload_failed') return view('upload_failed', uploadDetail ?? (err || null), failed ? ['retry_upload'] : []);
   if (state === 'uploading_youtube') {
     return view('uploading_youtube', null, []);

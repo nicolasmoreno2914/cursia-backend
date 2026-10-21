@@ -12,16 +12,17 @@
  *  3. los bytes que hay HOY en Storage tienen ese sha256 (la carpeta del dueño es escribible por el dueño).
  * Si no → se reconstruye. Review r1 (I-1): el rebuild NUNCA sobrescribe un objeto que un artifact referencia
  * (bytes entregados): se escribe a `<clave>.<sha16 del build>.mbz` (ruta nueva, misma carpeta) y se crea un row
- * nuevo. Un fallo TRANSITORIO al descargar el candidato (`download_failed`) no es motivo para reconstruir: el job
- * falla con PACKAGE_REUSE_VERIFY_UNAVAILABLE (clase A, se reintenta). Un objeto inexistente (404/400) sí se
- * reconstruye (`object_missing`).
+ * nuevo. Un fallo TRANSITORIO al descargar el candidato (`download_failed`): r62 (K4) el candidato no se reutiliza y
+ * el job reconstruye en la ruta nueva (antes fallaba con PACKAGE_REUSE_VERIFY_UNAVAILABLE y terminaba en retry_package);
+ * como nada referenciado se pisa, es seguro y cuesta 0. Un objeto inexistente (404/400) también se reconstruye
+ * (`object_missing`).
  */
 import { createHash } from 'crypto';
 import { QA_INTERNAL_STORAGE_PREFIX } from './qa-package';
 
 /** Prefijo del aviso de log cuando un candidato a reuse se descarta (informativo: el job reconstruye, no falla). */
 export const PACKAGE_REUSE_REJECTED = 'PACKAGE_REUSE_REJECTED';
-/** Review r1 (I-1): no se pudo descargar un candidato para verificarlo (Storage transitorio) → reintento, nunca rebuild. */
+/** Review r1 (I-1): no se pudo descargar un candidato para verificarlo (Storage transitorio). r62 (K4): aviso de log; se reconstruye en una ruta nueva. */
 export const PACKAGE_REUSE_VERIFY_UNAVAILABLE = 'PACKAGE_REUSE_VERIFY_UNAVAILABLE';
 export const MBZ_ARTIFACT_BUCKET = 'cursia-artifacts';
 const QA_FILENAME_PREFIX = 'QA-VISTA-PREVIA-';

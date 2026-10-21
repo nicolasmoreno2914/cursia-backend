@@ -31,10 +31,15 @@ import {
   AUTO_HEAL_DENY_PATTERNS,
   SAFE_AUTO_RETRY_RULES,
 } from './auto-heal-rules';
-// #583 (decisión del usuario A, 2026-10-02): UN reenvío automático de un audio TTS incierto si lo pendiente
-// del item en el ledger es ≤ USD 0.10. La decisión (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa
-// la misma función pura SIN ledger para informar qué hace hoy el sistema.
-import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv } from '../dynamic-generation/auto-heal';
+// #583 + r62 (regla de ambigüedad acotada): UN reenvío automático de un audio TTS incierto (corte o timeout del
+// cliente) si el peor caso entra en lo autorizado (presupuesto de recuperación de la parte + saldo del run). La decisión
+// (con el ledger, bajo lock) vive en auto-heal.ts; acá se usa la misma función pura SIN ledger para informar qué hace hoy
+// el sistema.
+import { ambiguousAudioResubmitDecision, autoHealDecision, autoHealPolicyFromEnv, autoRecoveryEnabled, isLostPaidResultError } from '../dynamic-generation/auto-heal';
+// r62 (N2): conciliación automática de Videogen/Gamma con la evidencia del proveedor (+ reenvío acotado).
+import { PROVIDER_RECONCILE_MAX_RESUBMITS, providerReconcileDecision } from '../dynamic-generation/provider-reconcile';
+import { spendControlHoldOf } from './spend-control-hold';
+import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
 
 export type FailureClass = 'A' | 'B' | 'C' | 'D';
 export const FAILURE_CLASSES: readonly FailureClass[] = Object.freeze(['A', 'B', 'C', 'D']);
@@ -84,9 +89,11 @@ export type CurrentRecovery =
   | 'executor_retry' // retryable en el item (attempt_count < max_attempts): el scheduler lo reintenta
   | 'auto_heal' // allow-list del auto-healer (R16)
   | 'safe_auto_retry' // reintento automático seguro (EV6 DoD BE-B)
-  | 'ambiguous_audio_resubmit' // #583: UN reenvío automático de audio TTS incierto (≤ USD 0.10 pendiente, lo decide auto-heal con el ledger)
+  | 'ambiguous_audio_resubmit' // #583 + r62: UN reenvío automático de audio TTS incierto (peor caso dentro de lo autorizado, lo decide auto-heal con el ledger)
   | 'auto_regenerate' // REL MVP: clase B de un componente de la IA → el auto-healer lo regenera solo (≤ 2 rondas)
   | 'provider_probe' // REL CREDIT: crédito/cuota agotados → sonda del proveedor (canario) y reanudación sola (solo en la vista)
+  | 'provider_reconcile' // r62 (N2): Videogen/Gamma → conciliación con la evidencia del proveedor y reenvío acotado (provider-reconcile.ts)
+  | 'spend_control_resume' // r62 (K3): frenado por el kill switch / la allow-list de FinOps → se reabre solo al revertirlo
   | 'denied' // deny-list: nunca se reabre solo
   | 'manual'; // nada automático: humano (retry/regenerate)
 
@@ -240,6 +247,9 @@ export const PROVIDER_CALL_RULE_IDS: readonly string[] = Object.freeze(Object.ke
  * guarda cada segmento apenas se paga y lo anota («chunk N/M (persisted J)» → N-1-J): con todos los
  * anteriores guardados el reintento solo sintetiza lo que falta (A, sin riesgo de pagar dos veces).
  */
+/** r62 (K2, review C1): mensaje de TTS con un rechazo de admisión del proveedor (429/503/529; formato de classify()). */
+const TTS_KNOWN_HTTP_RE = /\bopenai POST \/audio\/speech HTTP (?:429|503|529)\b/;
+
 function ttsPaidChunks(error: string): number {
   const m = /chunk (\d+)\/(\d+)(?: \(persisted (\d+)\))?/.exec(error);
   return m ? Math.max(0, Number(m[1]) - 1 - (m[3] ? Number(m[3]) : 0)) : 0;
@@ -317,6 +327,8 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   {
     // Loop 4: segundo resultado desconocido de una parte del worker de IA → solo esa parte queda en revisión (el resto sigue).
     id: 'llm_pending_review', codes: ['llm_pending_review'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_item',
+    // r62: el reenvío ambiguo único no entraba en lo autorizado → la excepción es de presupuesto, no de cobro duplicado.
+    refine: ({ error }) => (/no entra en el presupuesto autorizado/.test(error) ? { humanReason: 'budget' } : null),
   },
   {
     // Piloto #1209: 524 — la respuesta se perdió pero el proveedor pudo cobrarla: reenviarla solo podría pagarla dos veces.
@@ -400,9 +412,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     id: 'gamma_generation_failed', codes: ['gamma_generation_failed'],
     class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'gamma', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
     // N4: anclado al SUFIJO que agrega el worker (real-providers.ts), nunca al texto de Gamma que va antes.
-    refine: ({ error }) => (/\[créditos medidos: \d+(?:\.\d+)?\]\. No se reenvía sola/.test(error)
+    // r62 (N2, d13): sin créditos medidos pero con generationId → el barrido consulta `credits.deducted` (provider_check).
+    refine: ({ error, outputSummary }) => (/\[créditos medidos: \d+(?:\.\d+)?\]\. No se reenvía sola/.test(error)
       ? { class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', rounds: 1, humanReason: undefined, adminAction: undefined }
-      : null),
+      : hasGammaId(outputSummary) ? { strategy: 'provider_check', rounds: PROVIDER_RECONCILE_MAX_RESUBMITS } : null),
   },
   {
     id: 'audio_invalid',
@@ -437,6 +450,11 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       'PEDAGOGY_BRIEF_INVALID'],
     family: /^(missing|ambiguous)_[a-z0-9_]+_artifact$/,
     class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item',
+    // r62 (d8): un claim incompleto por un DATO de la dependencia (video del capítulo) no es un contrato roto: B
+    // `regenerate_dependency` (lo aplica solo el barrido autoRecoverClaimPayloadUnavailable, una vez y con presupuesto).
+    refine: ({ code, error }) => (code === 'claim_payload_unavailable' && CLAIM_PAYLOAD_DEPENDENCY_RE.test(error)
+      ? { class: 'B', strategy: 'regenerate_dependency', rounds: 1, humanReason: undefined, adminAction: undefined }
+      : null),
   },
   { id: 'v3_validator_infra', codes: ['v3_validator_unavailable', 'v3_artifact_unreadable', 'V3_VALIDATION_CONTEXT'], class: 'A', strategy: 'retry_backoff', rounds: 2 },
 
@@ -453,7 +471,11 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   },
   // Decisión del usuario D4 (2026-10-02): render fallido con cobro incierto → política FinOps, nunca un reenvío
   // automático que duplique gasto. «El proveedor confirma que no cobró → puede reintentar» llega con R8.
-  { id: 'videogen_failed', codes: ['videogen_failed'], class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'videogen', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_video_render' },
+  // r62 (N2, d4): con jobId el barrido consulta estado + costo del job, concilia la reserva y reenvía acotado (provider_check).
+  { id: 'videogen_failed', codes: ['videogen_failed'], class: 'C', strategy: 'hold_for_human', paidRisk: 'uncertain', provider: 'videogen', rounds: 0, humanReason: 'duplicate_charge', adminAction: 'retry_video_render',
+    refine: ({ outputSummary }) => (hasVideogenJob(outputSummary) ? { strategy: 'provider_check', rounds: PROVIDER_RECONCILE_MAX_RESUBMITS } : null) },
+  // r62 (N2): job vivo pasado el tope único de render → la conciliación cancela (encolado) o deja la excepción (c).
+  { id: 'videogen_render_overdue', codes: ['videogen_render_overdue'], class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', provider: 'videogen', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'retry_video_render' },
   {
     id: 'provider_config',
     codes: ['videogen_not_configured', 'real_video_not_allowed', 'video_preview_not_allowed', 'PROVIDER_MODE_UNSET', 'provider_mode_unset',
@@ -471,6 +493,12 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     class: 'C', strategy: 'provider_check', paidRisk: 'none', provider: 'youtube', rounds: 1, adminAction: 'resolve_youtube',
   },
   { id: 'youtube_quota', codes: ['youtube_blocked_quota', 'wait_quota', 'blocked_quota'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'youtube', rounds: 3 },
+  // r62 (P, d6): la cuota siguió agotada durante TODA la espera larga (default 7 días, con alerta a las 24 h) → excepción
+  // registrada (sin gasto; el video ya está pagado): una persona revisa la cuota del canal y reintenta la subida.
+  {
+    id: 'youtube_quota_exhausted', codes: ['youtube_quota_exhausted'],
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+  },
   {
     id: 'youtube_auth',
     codes: ['youtube_blocked_auth', 'blocked_auth', 'reauth_required', 'reconnect_youtube', 'youtube_preflight_failed', 'needs_youtube_preflight',
@@ -507,21 +535,33 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // ── TTS (OpenAI) ───────────────────────────────────────────────────────────
   {
     // Antes del primer trozo cobrado → A. Después de trozos ya cobrados (chunk N/M, N > 1) → C (user decision 1).
+    // r62 (K2, regla punto 4; review C1): con un RECHAZO DE ADMISIÓN del proveedor (429/503/529; el resto es ambiguo) el resultado es
+    // CONOCIDO: el worker liberó la reserva de ese trozo y reconoció el intento (los trozos anteriores quedaron cobrados
+    // y medidos en el ledger); repetirlo es gasto medido dentro del presupuesto de la parte → A (backoff), no C.
     id: 'tts_failed', codes: ['tts_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3,
-    refine: ({ error }) => {
+    refine: ({ error, httpStatus }) => {
       const n = ttsPaidChunks(error);
+      if (n > 0 && httpStatus !== null && TTS_KNOWN_HTTP_RE.test(error)) return null;
       return n > 0 ? { class: 'C', strategy: 'auto_resubmit_once', rounds: 1, adminAction: 'reconcile_provider', humanReason: 'duplicate_charge', paidRisk: 'uncertain' } : null;
     },
   },
   {
     id: 'provider_reconciliation',
     codes: ['provider_reconciliation_required', 'confirm_paid_required', 'may_have_rendered_ack_required'],
-    // #583 (decisión A del usuario): TTS de OpenAI incierto en un item de audio → UN reenvío automático acotado
-    // (≤ USD 0.10 pendiente en el ledger, lo verifica auto-heal bajo lock); sigue siendo C (pago incierto).
-    refine: ({ error, itemType }) => (/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error)
-      && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter')
-      ? { strategy: 'auto_resubmit_once', provider: 'openai' }
-      : null),
+    // #583 + r62 (K6): TTS de OpenAI incierto en un item de audio (corte o timeout del cliente) → UN reenvío automático
+    // acotado (peor caso dentro de lo autorizado, lo verifica auto-heal bajo lock); sigue siendo C (pago incierto). La
+    // etiqueta refleja lo que pasa DE VERDAD: con su reenvío ya usado o rechazado (presupuesto) es una excepción para un
+    // humano (hold_for_human), no «reenvío automático».
+    refine: ({ error, itemType, outputSummary }) => {
+      // r62 (resultado pagado perdido): también el guion LLM del audiolibro cobrado y no guardado (un reenvío acotado).
+      const lostLlm = itemType === 'audiobook_chapter' && isLostPaidResultError(error);
+      if (!((/^provider_reconciliation_required: openai(?![a-z0-9_])/.test(error) || lostLlm) && (itemType === 'audio_welcome' || itemType === 'audiobook_chapter'))) return null;
+      const used = outputSummary?.ambiguousAudioResubmit;
+      if (used && (used.declined || Number(used.rounds ?? 0) >= 1)) {
+        return { strategy: 'hold_for_human', provider: lostLlm ? 'anthropic' : 'openai', rounds: 0, humanReason: /budget|presupuesto|over_threshold/i.test(String(used.declined ?? '')) ? 'budget' : 'duplicate_charge' };
+      }
+      return { strategy: 'auto_resubmit_once', provider: lostLlm && !/^provider_reconciliation_required: openai/.test(error) ? 'anthropic' : 'openai' };
+    },
     class: 'C', strategy: 'provider_check', paidRisk: 'uncertain', rounds: 1, humanReason: 'duplicate_charge', adminAction: 'reconcile_provider',
   },
 ] as Rule[]);
@@ -530,14 +570,22 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
 const PACKAGE_RULES: readonly Rule[] = Object.freeze([
   // Review r1 (I-1): PACKAGE_REUSE_VERIFY_UNAVAILABLE = Storage no dejó descargar el candidato a reuse (nunca se reconstruye
   // encima); PACKAGE_OBJECT_CONFLICT = carrera sobre una ruta ya referenciada (el reintento elige ruta nueva). Ambos A.
-  { id: 'package_transient', codes: ['PACKAGING_V3_CONTENT_MISSING', 'ERR_BUFFER_TOO_LARGE', 'package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
+  // r62 (P, review I1): PACKAGING_V3_CONTENT_MISSING (contenido ausente/vacío en un set de artifacts que no cambia entre
+  // reintentos) pasa a `package_component` (B, reparación por item) y ERR_BUFFER_TOO_LARGE (misma entrada, mismo tamaño) a
+  // `package_product` (D): ninguno se arregla reintentando y con r62 lo A se reintenta hasta 72 h.
+  { id: 'package_transient', codes: ['package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
   {
     id: 'package_component',
     codes: ['EXAM_BANK_INVALID', 'QUIZ_V3_BANK_INVALID', 'QUIZ_V3_EMPTY', 'QUIZ_V3_INVALID', 'H5P_ACTIVITY_PAYLOAD_INVALID', 'H5P_INPUT_INVALID',
       'H5P_BS_INVARIANT', 'H5P_DIALOG_CARDS_INVALID', 'VIDEO_INTRO_INVALID', 'VIDEO_YOUTUBE_ID_MISSING', 'VIDEO_DURATION_MISSING',
       'ACTIVITY_INTRO_INVALID', 'LIBRO_V3_INVALID', 'MODULE_INTRO_V3', 'COURSE_INTRO_V3', 'MODULE_INTRO_EXPECT_INVALID', 'SCORM_MANIFEST_INVALID',
       'ANSWER_LEAK', 'NUMBER_NOT_FROM_FACTS', 'SHELL_NUMBER_NOT_FROM_FACTS', 'EXAM_BANK_PLAN', 'EXAM_BANK_CONTEXT', 'VIDEO_PLAN_INVARIANT',
-      'VIDEO_DURATION_INVALID', 'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'PRESENTATION_CARD_SLIDE_COUNT'],
+      'VIDEO_DURATION_INVALID', 'VIDEO_TOO_SHORT_FOR_INTERACTIONS', 'PRESENTATION_CARD_SLIDE_COUNT',
+      // r61 Q-04 (re-review I-2): las preguntas del video ya no caben en los segundos con que se validaron → el empaque
+      // automático regenera SOLO ese video_interactions (LLM, dentro del presupuesto del run) y re-empaqueta.
+      'VIDEO_TIMELINE_MISMATCH',
+      // r62 (P, review I1a): determinista (ver package_transient).
+      'PACKAGING_V3_CONTENT_MISSING'],
     family: /^(H5P_PACKAGE_[A-Z0-9_]+|VIDEO_ACTIVITY_[A-Z0-9_]+)$/,
     class: 'B', strategy: 'repair_package', scope: 'package', rounds: 1,
   },
@@ -548,6 +596,8 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       'CURSIA_IV_INLINE_SCRIPT_PKG', 'H5P_NOT_GRADABLE_IN_MOODLE', 'ACTIVITY_INTRO_THEME', 'GAMMA_THEME_CONFIG', 'FACTS_INVALID',
       'VIDEO_PACKAGE_FILENAME_INVALID', 'ACTIVITY_PACKAGE_FILENAME_INVALID', 'V3_VALIDATION_CONTEXT', 'PNG_ENCODE', 'PNG_UNSUPPORTED',
       'PACKAGE_BUILDER_ERROR',
+      // r62 (P, review I1b/c): buffer por encima de kMaxLength para la misma entrada; objeto de Storage inexistente (404/400).
+      'ERR_BUFFER_TOO_LARGE', 'PACKAGE_STORAGE_NOT_FOUND',
       // r57 T6: el validador encontró una parte de facts (presentación, video, actividad) ausente o de más en el .mbz.
       'MANIFEST_COVERAGE',
       // r19: los capítulos pasaron su validación pero el total queda bajo el piso de 25 min → un humano mira el diagnóstico.
@@ -576,10 +626,31 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
     // una persona sube el límite del almacenamiento / corrige la variable o reduce el curso (nunca se reintenta solo).
     // Review r1 (M): el artifact de un archivo de trabajo se borró / no es del dueño / no es practice_file → PRACTICE_FILE_MISSING.
     id: 'package_precheck', codes: ['pending_video_omitted', 'preview_not_deliverable', 'qa_preview', 'owner_not_allowed', 'PRACTICE_FILE_INVALID', 'PRACTICE_FILE_MISSING',
-      'PACKAGE_SIZE_LIMIT_EXCEEDED', 'PACKAGE_SIZE_CONFIG_INVALID'],
+      'PACKAGE_SIZE_LIMIT_EXCEEDED', 'PACKAGE_SIZE_CONFIG_INVALID',
+      // r62 (P, review I1c): Storage rechaza por permisos (401/403, RLS), por tamaño (413) o falta su configuración.
+      'PACKAGE_STORAGE_FORBIDDEN', 'PACKAGE_STORAGE_TOO_LARGE', 'PACKAGE_STORAGE_CONFIG'],
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'config', adminAction: 'resolve_package_block',
   },
 ] as Rule[]);
+
+/**
+ * r62 (P, review I1c): fallos de Storage/config DETERMINISTAS del empaque → código D (precheck/config o producto).
+ * Formato real de artifacts.service.ts: `Supabase Storage (upload|download) failed: <status> …`.
+ */
+function packageStorageDeterministicCode(error: string): string | null {
+  const st = /\bStorage (?:upload|download|delete|list|sign)[a-z ]* failed: (\d{3})\b/i.exec(error);
+  const status = st ? Number(st[1]) : null;
+  if (status === 401 || status === 403 || /row-level security|\bpermission denied\b|\bunauthorized\b/i.test(error)) return 'PACKAGE_STORAGE_FORBIDDEN';
+  if (status === 413 || /payload too large|maximum allowed size/i.test(error)) return 'PACKAGE_STORAGE_TOO_LARGE';
+  if (status === 404 || status === 400 || /\bobject not found\b|\bnot_found\b|\bBucket not found\b/i.test(error)) return 'PACKAGE_STORAGE_NOT_FOUND';
+  if (/\b(?:SUPABASE_[A-Z_]+|STORAGE_[A-Z_]+)\b[^.]*\b(?:are|is) (?:required|missing|not (?:set|configured))|\bnot configured\b/i.test(error)) return 'PACKAGE_STORAGE_CONFIG';
+  return null;
+}
+/** r62 (P): transitorio del empaque — 5xx/429 (de Storage o HTTP), red y DB. */
+const PACKAGE_TRANSIENT_RE =
+  /\bStorage [a-z ]*failed: (?:5\d\d|429)\b|HTTP (?:5\d\d|429)\b|\btimeout\b|timed out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|EPIPE|socket hang up|fetch failed|Connection terminated|too many clients|EMAXCONNSESSION|deadlock detected|could not serialize|database system is (?:starting up|shutting down)/i;
+/** Respaldo de la restauración (sin cambios de comportamiento pre-r62). */
+const RESTORE_TRANSIENT_RE = /download|timeout|ETIMEDOUT|ECONNRESET|fetch failed|HTTP 5\d\d|storage/i;
 
 /** Restauración en Moodle (scope package, R10). */
 const RESTORE_RULES: readonly Rule[] = Object.freeze([
@@ -708,9 +779,18 @@ export function currentRecoveryOf(
 ): CurrentRecovery {
   const e = String(error ?? '').trim();
   const os = outputSummary ?? {};
+  // r62 (K3): frenado por un control de gasto → lo reabre solo el barrido al revertirse (si la recuperación está activa).
+  if (spendControlHoldOf(e, itemType) && autoRecoveryEnabled(process.env)) return 'spend_control_resume';
+  // r62 (d8): claim incompleto por el dato de la dependencia → regenerate_dependency automático (barrido propio).
+  if (CLAIM_PAYLOAD_DEPENDENCY_RE.test(e) && itemType === 'video_interactions' && autoRecoveryEnabled(process.env)
+    && !os.claimPayloadRecovery?.declined) return 'auto_regenerate';
   // #583: va ANTES de la deny-list (la deny-list describe justamente este caso incierto; la función de
   // auto-heal aplica su propia deny-list reducida).
   if (ambiguousAudioResubmitDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date()).heal) return 'ambiguous_audio_resubmit';
+  // r62 (N2, E2E): también mientras el barrido espera su próxima consulta (p. ej. confirmando un cancel con dos lecturas):
+  // el sistema está trabajando, no es «manual».
+  { const pd = providerReconcileDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os }, new Date());
+    if (pd.heal === true || pd.reason === 'backoff') return 'provider_reconcile'; }
   const denied = AUTO_HEAL_DENY_PATTERNS.some((re) => re.test(e));
   const safe = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(e) && (!itemType || itemType === r.type));
   if (safe && !denied && safe.requires(os, e)) return 'safe_auto_retry';
@@ -803,7 +883,19 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
       const r = ruleFor(scoped, m[1]);
       if (r) return verdictOf(r, m[1], { ...ctxBase, code: m[1] }, {});
     }
-    if (/download|timeout|ETIMEDOUT|ECONNRESET|fetch failed|HTTP 5\d\d|storage/i.test(error)) {
+    // r62 (P, review I1c): en el scope de PAQUETE, un 4xx de Storage o su falta de configuración NUNCA es transitorio
+    // (con r62 lo A se reintenta hasta 72 h). Se resuelve a un código D antes del respaldo transitorio.
+    if (scoped === PACKAGE_RULES) {
+      const sc = packageStorageDeterministicCode(error);
+      if (sc) {
+        const r = ruleFor(scoped, sc);
+        if (r) return verdictOf(r, sc, { ...ctxBase, code: sc }, {});
+      }
+    }
+    // r62 (P, d7 + review I1c): transitorio = 5xx/429 (también de Storage), red y DB del worker. En el paquete ya no
+    // alcanza con mencionar «download»/«storage» (eso era el respaldo pre-r62, que sigue igual para la restauración).
+    const transientRe = scoped === PACKAGE_RULES ? PACKAGE_TRANSIENT_RE : RESTORE_TRANSIENT_RE;
+    if (transientRe.test(error)) {
       const tc = scoped === PACKAGE_RULES ? 'package_transient' : 'RESTORE_INFRA_UNKNOWN';
       const r = ruleFor(scoped, tc);
       if (r) return verdictOf(r, tc, { ...ctxBase, code: tc }, {});
@@ -811,7 +903,23 @@ export function classifyFailure(input: FailureInput): FailureVerdict {
     return unclassifiedVerdict(extractFailureCode(error), httpStatus, 'package', 'none');
   }
 
-  return moneyFloor(classifyItem(input, error, ctxBase), error);
+  return spendControlWait(moneyFloor(classifyItem(input, error, ctxBase), error), error, itemType);
+}
+
+/**
+ * r62 (K3): punto de extensión mínimo. Una parte frenada por un control de gasto del servidor (kill switch / allow-list
+ * de proveedores; reliability/spend-control-hold.ts) ESPERA a que el operador lo revierta (D `wait_provider`, scope run,
+ * attention `config`): el barrido autoResumeSpendControlHolds la reabre sola en cuanto el control ya no la frena. Gana
+ * sobre el código de adelante (`unexpected_error: finops_ledger_write_failed: …`) y sobre el piso de dinero (el texto
+ * `provider_not_allowed` coincide con la deny-list), nunca sobre un fallo con riesgo de pago (spendControlHoldOf → null).
+ */
+function spendControlWait(v: FailureVerdict, error: string, itemType: string | null): FailureVerdict {
+  const hold = spendControlHoldOf(error, itemType);
+  if (!hold) return v;
+  return {
+    ...v, class: 'D', strategy: 'wait_provider', scope: 'run', provider: 'finops', targetRounds: 0, paidRisk: 'none',
+    humanReason: 'config', adminAction: 'retry_item', moneyFloor: undefined, unclassified: false,
+  };
 }
 
 /**

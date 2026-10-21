@@ -233,7 +233,9 @@ check('tabla: empaque (scope package) y restauración (R9/R10)', () => {
     const r = p(m);
     assert(r.class === cls && r.strategy === strategy && r.scope === 'package' && !r.unclassified, `${m}: ${JSON.stringify(r)}`);
   };
-  want('Error: PACKAGING_V3_CONTENT_MISSING: no se pudo descargar x', 'A', 'repackage');
+  // r62 (P, review I1): CONTENT_MISSING es determinista (contenido ausente en un set que no cambia) → reparación por item.
+  want('Error: PACKAGING_V3_CONTENT_MISSING: faltan 1 contenido(s): content:c1', 'B', 'repair_package');
+  want('Supabase Storage download failed: 503 Service Unavailable', 'A', 'repackage');
   want('fetch failed (descarga del artifact)', 'A', 'repackage');
   want('H5P_PACKAGE_INVALID: activity:c3 sin h5p.json', 'B', 'repair_package');
   want('QUIZ_V3_BANK_INVALID: x', 'B', 'repair_package');
@@ -425,7 +427,10 @@ check('preservación: todo lo que el auto-healer reabre es clase A en el clasifi
     assert(AH.isAutoHealDenied(err), `deny ${err}`);
     const r = v(err);
     assert((r.class === 'C' || r.class === 'D') || (r.class === 'A' && r.strategy === 'wait_provider'), `${err} denegado pero clasificado ${r.class}/${r.strategy}`);
-    assert(FC.currentRecoveryOf(err, 'video', {}) === 'denied', `currentRecovery deny ${err}`);
+    // r62 (N2): un envío de Videogen ambiguo SIN jobId lo toma la conciliación de proveedor (conservadora + 1 reenvío
+    // acotado por el presupuesto); el auto-healer sigue sin reabrirlo (deny-list).
+    const cur = FC.currentRecoveryOf(err, 'video', {});
+    assert(cur === 'denied' || (err === 'ambiguous_video_submission' && cur === 'provider_reconcile'), `currentRecovery deny ${err}: ${cur}`);
   }
   // Reintento seguro: mismo criterio que safeAutoRetryDecision.
   const safeVg = 'videogen_submit_rejected: Videogen rechazó el envío (HTTP 422)';
@@ -508,7 +513,7 @@ check('fix round 2 (N7): cuota/saldo en español es configuración del proveedor
   expectVerdict('gamma_submit_failed: gamma POST /generations HTTP 400: saldo insuficiente', { class: 'D', strategy: 'wait_provider', provider: 'gamma' });
 });
 
-check('#583 (merge de staging): el reenvío automático ÚNICO de audio TTS incierto (≤ USD 0.10) es coherente con la clase C del clasificador', () => {
+check('#583 + r62: el reenvío automático ÚNICO de audio TTS incierto (peor caso dentro de lo autorizado) es coherente con la clase C del clasificador', () => {
   const msg = 'provider_reconciliation_required: openai — audio TTS pagado sin persistir. El proveedor pudo haber completado';
   for (const itemType of ['audio_welcome', 'audiobook_chapter']) {
     const r = expectVerdict(msg, { class: 'C', strategy: 'auto_resubmit_once', paidRisk: 'uncertain', adminAction: 'reconcile_provider', provider: 'openai' }, { itemType });
@@ -518,21 +523,33 @@ check('#583 (merge de staging): el reenvío automático ÚNICO de audio TTS inci
     void r;
   }
   // Fuera de la regla: guion LLM (anthropic), video, presentación → C provider_check, nunca reenvío automático.
-  expectVerdict('provider_reconciliation_required: anthropic — guion pagado sin persistir', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
+  // r62 (E2E M, «resultado pagado perdido» — cambio DELIBERADO): el guion del audiolibro COBRADO y no guardado tiene el
+  // reenvío único acotado (auto_resubmit_once); un guion ENVIADO sin resultado (en el aire) sigue siendo provider_check.
+  expectVerdict('provider_reconciliation_required: anthropic — guion pagado sin persistir', { class: 'C', strategy: 'auto_resubmit_once' }, { itemType: 'audiobook_chapter' });
+  expectVerdict('provider_reconciliation_required: anthropic — llamada pagada enviada sin resultado liquidado', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
+  // review lost_result M1: la reserva ENVIADA y sin liquidar de un intento anterior (texto distinto de priorPaidBlock) no
+  // es un resultado perdido: el clasificador coincide con el barrido (provider_check, sin reenvío automático).
+  expectVerdict('provider_reconciliation_required: anthropic — operación pagada de un intento anterior enviada y sin liquidar. anthropic reservation:llm:x (intento 1).', { class: 'C', strategy: 'provider_check' }, { itemType: 'audiobook_chapter' });
+  expectVerdict('provider_reconciliation_required: anthropic — operación pagada de un intento anterior sin resultado persistido. anthropic msg_1 (intento 1).', { class: 'C', strategy: 'auto_resubmit_once' }, { itemType: 'audiobook_chapter' });
   assert(FC.currentRecoveryOf('provider_reconciliation_required: anthropic — x', 'audiobook_chapter', {}) === 'denied', 'anthropic');
   for (const itemType of ['video', 'presentation']) {
     expectVerdict(msg, { class: 'C', strategy: 'provider_check' }, { itemType });
     assert(FC.currentRecoveryOf(msg, itemType, {}) === 'denied', itemType);
   }
-  // Decisión A: el tope de USD 0.10 lo decide auto-heal con el ledger (misma función que usa el clasificador).
+  // r62 (cambio DELIBERADO de la decisión A): el tope fijo de USD 0,10 se reemplazó por el PEOR CASO contra lo autorizado
+  // (presupuesto de recuperación de la parte + saldo del run), que auto-heal evalúa con el ledger. Sigue UNA vez.
   const NOW = new Date('2026-10-02T12:00:00Z');
   const row = { status: 'failed', type: 'audiobook_chapter', error: msg, output_summary: {}, finished_at: new Date(NOW.getTime() - 600_000).toISOString() };
-  assert(AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD === 0.1 && AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS === 1, 'constantes de la decisión A');
-  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['openai'] }).heal === true, '≤ 0.10 → un reenvío');
-  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.1, providers: ['openai'] }).heal === true, '= 0.10 → un reenvío');
-  const over = AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.11, providers: ['openai'] });
-  assert(over.heal === false && over.reason === 'over_threshold', '> 0.10 → admin');
-  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['anthropic', 'openai'] }).heal === false, 'otro proveedor pendiente → admin');
+  const FITS = { budget: { fits: true, reason: null } };
+  assert(AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_USD === undefined && AH.AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS === 1, 'constantes (sin tope fijo; una vez)');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['openai'] }, undefined, FITS).heal === true, 'entra → un reenvío');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.5, providers: ['openai'] }, undefined, FITS).heal === true, 'más de 0.10 pero dentro de lo autorizado → un reenvío');
+  const over = AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.11, providers: ['openai'] }, undefined, { budget: { fits: false, reason: 'run_budget' } });
+  assert(over.heal === false && over.reason === 'over_budget' && over.budgetReason === 'run_budget', 'fuera de lo autorizado → excepción');
+  assert(AH.ambiguousAudioResubmitDecision(row, NOW, { pendingUsd: 0.04, providers: ['anthropic', 'openai'] }, undefined, FITS).heal === false, 'otro proveedor pendiente → admin');
+  // K6: con el reenvío usado o rechazado el veredicto deja de decir «reenvío automático».
+  expectVerdict(msg, { class: 'C', strategy: 'hold_for_human', humanReason: 'duplicate_charge' }, { itemType: 'audio_welcome', outputSummary: { ambiguousAudioResubmit: { rounds: 1 } } });
+  expectVerdict(msg, { class: 'C', strategy: 'hold_for_human', humanReason: 'budget' }, { itemType: 'audio_welcome', outputSummary: { ambiguousAudioResubmit: { declined: 'over_budget:run_budget' } } });
   // TTS incierto por trozos (N5) no es este caso (tts_failed, no provider_reconciliation_required): C reconcile.
   const t = v('tts_failed: chunk 3/4: HTTP 503', { itemType: 'audiobook_chapter' });
   assert(t.class === 'C' && t.adminAction === 'reconcile_provider' && FC.currentRecoveryOf('tts_failed: chunk 3/4: HTTP 503', 'audiobook_chapter', {}) !== 'ambiguous_audio_resubmit', 'tts_failed');

@@ -143,6 +143,8 @@ export interface ItemPaidCharge {
   settled: boolean;
   /** r61 (Q-21): alta de la fila (para la ventana en vuelo de una reserva enviada y sin liquidar). */
   created_at?: string | Date | null;
+  /** r62: la reserva usa la marca durable de envío (sin marca + intento caído = nunca salió → liberable). */
+  send_marked?: boolean;
 }
 
 export interface RecordResult {
@@ -960,7 +962,8 @@ export class FinopsLedgerService {
     originalKey: string,
     newAmount: DecimalLike,
     reason: string,
-    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean } = {},
+    // r62 (N2): `settlementLabel` = etiqueta explícita de la liquidación (p.ej. la conciliación conservadora del sistema).
+    opts: { recordedBy?: string; metadata?: Record<string, unknown>; settlement?: boolean; settlementLabel?: string } = {},
   ): Promise<{ inserted: boolean; event: CostEventRow | null; delta: string; previousTotal: string; newTotal: string }> {
     nonEmpty(originalKey, 'originalKey');
     nonEmpty(reason, 'reason');
@@ -1443,13 +1446,14 @@ export class FinopsLedgerService {
     const rows = await this.dataSource.query(
       `select e.idempotency_key, e.attempt, e.provider, e.external_operation_id, e.measurement_status, e.created_at,
               coalesce((e.metadata->>'reservation') = 'true', false) as reservation,
+              coalesce((e.metadata->>'sendMarked') = 'true', false) as send_marked,
               exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id) as settled
          from public.generation_cost_events e
         where e.item_run_id = $1 and e.event_kind = 'CHARGE' and e.billing_account <> 'mock'
         order by e.created_at, e.idempotency_key`,
       [itemRunId],
     );
-    return rows.map((r: any) => ({ ...r, attempt: Number(r.attempt), reservation: !!r.reservation, settled: !!r.settled }));
+    return rows.map((r: any) => ({ ...r, attempt: Number(r.attempt), reservation: !!r.reservation, settled: !!r.settled, send_marked: !!r.send_marked }));
   }
 
   // ─── evitado / estimaciones / autorizaciones ──────────────────────────────

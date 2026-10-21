@@ -3,6 +3,7 @@ import { Observable } from 'rxjs';
 import { map } from 'rxjs/operators';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import { redactCompletionForOwner } from './run-completion';
+import { redactWorkersHoldForOwner } from './workers-hold';
 
 /**
  * DoD follow-up (R3): las respuestas de RunsController (RunDto suelto o `{run: RunDto}`) llevan
@@ -19,6 +20,8 @@ export function redactRunPayloadForOwner(value: unknown, depth = 0): unknown {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
     if (k === 'completion' && v && typeof v === 'object' && !Array.isArray(v)) out[k] = redactCompletionForOwner(v as any);
+    // r62 (review M2): el hold de workers llega al dueño solo con estado y motivo genérico (sin variables ni procesos).
+    else if (k === 'workersHold' && v && typeof v === 'object' && !Array.isArray(v)) out[k] = redactWorkersHoldForOwner(v as any);
     else if (k === 'courseContext') out[k] = v; // nunca lleva `completion`
     // REL R2: `items[].cost` (costo del ledger por item) es solo para SUPER_ADMIN; el resto del item intacto.
     else if (k === 'items' && Array.isArray(v)) out[k] = v.map((it) => (it && typeof it === 'object' && !Array.isArray(it) && 'cost' in it ? withoutCost(it) : it));

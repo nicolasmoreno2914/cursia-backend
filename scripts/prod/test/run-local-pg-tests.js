@@ -26,6 +26,7 @@ const { Client } = require('pg');
 const REPO = path.resolve(__dirname, '..', '..', '..');
 const RUNNER = path.join(REPO, 'scripts/prod/migrate-v2-production.js');
 const HEALTH = path.join(REPO, 'scripts/ops/v2-health-report.js');
+const PROBES = path.join(REPO, 'scripts/prod/v2-schema-probes.js');
 const FIXTURE = path.join(__dirname, 'fixtures/legacy-baseline.sql');
 const FORBID = path.join(__dirname, 'fixtures/forbid-network.js');
 const PG_PORT = Number(process.env.V2_TEST_PG_PORT || 55481);
@@ -77,6 +78,7 @@ async function test(name, fn) {
   }
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
+function eq(a, b, msg) { const x = JSON.stringify(a); const y = JSON.stringify(b); if (x !== y) throw new Error(`${msg}: esperado ${y.slice(0, 400)}, encontrado ${x.slice(0, 400)}`); }
 
 // Entorno mínimo desde cero: NUNCA hereda DB_*, MIGRATION_ENV, CONFIRM_* del shell.
 function cleanEnv(extra) {
@@ -596,6 +598,79 @@ async function main() {
         }
       });
     });
+
+    // ── 7b. r61: sondas de catálogo (runner --verify-only + CLI por stdin de deploy.yml) ─────────
+    // Como en el VPS: `cd $VPS_PATH && node - <args> < scripts/prod/v2-schema-probes.js`, con el .env y node_modules del dir.
+    const probesDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursia-v2-probes-vps-'));
+    fs.symlinkSync(path.join(REPO, 'node_modules'), path.join(probesDir, 'node_modules'));
+    const probesStdin = (db, args = [], { port = PG_PORT } = {}) => {
+      fs.writeFileSync(path.join(probesDir, '.env'), ['NODE_ENV=production', 'DB_HOST=127.0.0.1', `DB_PORT=${port}`, 'DB_USER=postgres', 'DB_PASS=x', `DB_NAME=${db}`, 'DB_SSL=false'].join('\n') + '\n');
+      const r = spawnSync(process.execPath, ['-', ...args], { cwd: probesDir, env: cleanEnv(), input: fs.readFileSync(PROBES), encoding: 'utf8', timeout: 60000 });
+      return { code: r.status, out: (r.stdout || '') + (r.stderr || ''), stdout: r.stdout || '' };
+    };
+    const b64 = (x) => Buffer.from(JSON.stringify(x)).toString('base64');
+    const probesLib = require(PROBES);
+    const seedDoc = JSON.parse(fs.readFileSync(path.join(REPO, 'src/modules/finops/pricing-seed.v1.json'), 'utf8'));
+    const seedKeys = probesLib.pricingKeysOf(seedDoc);
+    const proposalKeys = probesLib.pricingKeysOf(JSON.parse(fs.readFileSync(path.join(REPO, 'src/modules/finops/pricing-proposal.r60.json'), 'utf8')), { verifiedOnly: true });
+    await test('r61 probes: cada paso del plan (salvo el builtin) tiene sondas y cada sonda r60 está declarada', async () => {
+      const runner = require(RUNNER);
+      const ids = [runner.CONSTRAINTS_STEP.id, ...runner.MIGRATION_STEPS.map((x) => x.id)];
+      eq(probesLib.PROBES.map((g) => g.step), ids, 'mismos pasos, mismo orden que el plan');
+      for (const id of probesLib.R60_STEPS) assert(ids.includes(id), `R60_STEPS: ${id} no está en el plan`);
+      for (const g of probesLib.PROBES) assert(g.probes.length > 0, `${g.step} sin sondas`);
+    });
+    await test('r61 probes CLI por stdin sobre la base migrada (+ seed v1): exit 0, COMPLETO, los 6 pasos r60 ✓, esquema intacto', async () => {
+      const before = await schemaDump(pgBin, 'prodlike');
+      const res = probesStdin('prodlike', ['--pricing-keys-b64', b64(seedKeys), '--info-pricing-keys-b64', b64(proposalKeys)]);
+      assert(res.code === 0 && /esquema V2: COMPLETO/.test(res.out), `exit ${res.code}\n${res.out}`);
+      for (const id of probesLib.R60_STEPS) assert(res.out.includes(`✓ ${id} [r60]`), `falta ✓ ${id}\n${res.out}`);
+      assert(new RegExp(`seed de precios: ${seedKeys.length}/${seedKeys.length}`).test(res.out), 'seed v1 completo');
+      assert(new RegExp(`\\(info\\) filas extra de precios: 0/${proposalKeys.length}`).test(res.out), 'propuesta r60 ausente = solo info');
+      assert(/cost_budget_policies vacía/.test(res.out), 'aviso de política de presupuesto');
+      assert(!/DB_PASS|password=x/.test(res.out), 'no imprime credenciales');
+      eq(await schemaDump(pgBin, 'prodlike'), before, 'solo lectura: esquema sin cambios');
+    });
+    await test('r61 probes CLI sobre base legacy (sin V2): exit 4, lista lo que falta de cada paso r60', async () => {
+      const res = probesStdin('cmpmain', ['--pricing-keys-b64', b64(seedKeys)]);
+      assert(res.code === 4 && /esquema V2: INCOMPLETO/.test(res.out), `exit ${res.code}\n${res.out}`);
+      for (const id of probesLib.R60_STEPS) assert(res.out.includes(`❌ ${id} [r60]`), `sin ❌ ${id}`);
+      assert(/falta: columna public\.course_chapters\.guided_practice_minutes/.test(res.out), 'detalle de lo que falta');
+      assert(new RegExp(`seed de precios: 0/${seedKeys.length}`).test(res.out), 'seed ausente');
+      assert(/v2-production-migrations\.yml/.test(res.out), 'indica el camino correcto (workflow protegido)');
+    });
+    await test('r61 probes CLI: fila del seed ausente → exit 4; base inaccesible → exit 1 (fail closed); args inválidos → 2', async () => {
+      const fake = [...seedKeys, ['openai', 'audio', 'modelo-inexistente', 'audio_seconds', 'v-test']];
+      const res = probesStdin('prodlike', ['--pricing-keys-b64', b64(fake)]);
+      assert(res.code === 4 && /falta: openai \/ audio \/ modelo-inexistente/.test(res.out), `exit ${res.code}\n${res.out}`);
+      const down = probesStdin('prodlike', [], { port: CLOSED_PORT });
+      assert(down.code === 1 && /fail closed/.test(down.out), `exit ${down.code}\n${down.out}`);
+      eq(probesStdin('prodlike', ['--pricing-keys-b64', 'no-es-base64-json']).code, 2, 'b64 inválido');
+      eq(probesStdin('prodlike', ['--bogus']).code, 2, 'flag desconocido');
+    });
+    await test('r61 runner --verify-only: falta UNA pieza de un paso r60 (guided_practice_minutes) → exit 5 y lo nombra; los verify-* viejos no lo verían', async () => {
+      await makeBaselineDb('probesgap');
+      const ap = run(RUNNER, APPLY_ARGS, overrideEnv('probesgap'));
+      assert(ap.code === 0, `apply exit ${ap.code}\n${ap.out}`);
+      await withClient('probesgap', (c) => c.query(`alter table public.course_chapters drop column guided_practice_minutes`));
+      const res = run(RUNNER, ['--verify-only', '--test-allow-local-target'], overrideEnv('probesgap', { CONFIRM_BACKUP_TAKEN: undefined }));
+      assert(res.code === 5 && /❌ guided-practice \[r60\]/.test(res.out) && /guided_practice_minutes/.test(res.out), `exit ${res.code}\n${res.out}`);
+      const cli = probesStdin('probesgap');
+      assert(cli.code === 4 && /❌ guided-practice/.test(cli.out), `cli exit ${cli.code}\n${cli.out}`);
+      // Re-aplicar (idempotente) repara la pieza y vuelve a verificar OK.
+      const re = run(RUNNER, APPLY_ARGS, overrideEnv('probesgap'));
+      assert(re.code === 0 && /APPLY \+ verificación read-only OK/.test(re.out), `re-apply exit ${re.code}\n${re.out}`);
+    });
+    await test('r61 runner --verify-only: una fila del seed v1 borrada → exit 5 (seed de precios incompleto)', async () => {
+      await withClient('probesgap', async (c) => {
+        await c.query(`alter table public.pricing_catalog disable trigger user`);
+        await c.query(`delete from public.pricing_catalog where ctid = (select ctid from public.pricing_catalog limit 1)`);
+        await c.query(`alter table public.pricing_catalog enable trigger user`);
+      });
+      const res = run(RUNNER, ['--verify-only', '--test-allow-local-target'], overrideEnv('probesgap', { CONFIRM_BACKUP_TAKEN: undefined }));
+      assert(res.code === 5 && new RegExp(`seed de precios: ${seedKeys.length - 1}/${seedKeys.length}`).test(res.out), `exit ${res.code}\n${res.out}`);
+    });
+    fs.rmSync(probesDir, { recursive: true, force: true });
 
     // ── 8. Stop en el primer error ───────────────────────────────────────
     await test('falla en el paso 2 → exit 4, paso 1 commiteado, paso 2 revertido entero, pasos 3+ no aplicados', async () => {

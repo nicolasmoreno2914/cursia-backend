@@ -201,7 +201,10 @@ export async function recordItemFailure(qr: Queryable, t: FailureTransition): Pr
   const v = t.verdict;
   const terminal = t.status === 'failed' || t.status === 'blocked';
   // attention_reason solo cuando el item quedó en manos de un humano (clase C/D terminal).
-  const attention = terminal && (v.class === 'C' || v.class === 'D') ? (v.humanReason ?? 'unrecoverable') : null;
+  // r62 (K6): un C cuyo único reenvío automático acotado todavía va a ocurrir (auto_resubmit_once con ronda disponible)
+  // no está en manos de un humano: sin attention_reason. Si el barrido lo rechaza, registra el motivo explícito.
+  const pendingAuto = v.strategy === 'auto_resubmit_once' && t.maxRoundsToday > 0;
+  const attention = terminal && (v.class === 'C' || v.class === 'D') && !pendingAuto ? (v.humanReason ?? 'unrecoverable') : null;
   // C1: el desenlace sale de la transición, nunca del código (que un ejecutor podría reportar).
   const outcome = t.outcome ?? 'failed';
   const reported = v.reportedCode ? String(v.reportedCode).slice(0, 64) : null;

@@ -15,8 +15,9 @@
 //   [M-6] Q7 no medido = pass null (neutral) y compareQualityReports no lo trata como «dejó de pasar».
 // Parte DB (default; PG16 desechable en puerto libre ≠ 5570 / 8099; Storage falso en memoria):
 //   [I-1] paquete entregado A (sin checksum, pre-r58) + job nuevo → los bytes de A quedan intactos y el rebuild va a una
-//         ruta NUEVA con un row nuevo; un job siguiente reutiliza el rebuild; Storage 503 al verificar → job fallido
-//         PACKAGE_REUSE_VERIFY_UNAVAILABLE (clase A), sin build ni upload; carrera sobre una ruta referenciada →
+//         ruta NUEVA con un row nuevo; un job siguiente reutiliza el rebuild; Storage 503 al verificar → (r62 K4) el job
+//         reconstruye en otra ruta nueva sin tocar A ni el rebuild anterior (antes: job fallido
+//         PACKAGE_REUSE_VERIFY_UNAVAILABLE); carrera sobre una ruta referenciada →
 //         PACKAGE_OBJECT_CONFLICT sin tocar el objeto; M-7: el claim de la Actividad de Aplicación lee el perfil de
 //         evaluación congelado al crear el run.
 //
@@ -504,22 +505,36 @@ async function dbChecks() {
       eq([buildN, storage.calls.filter((c) => c.method === 'POST').length, rows.length], [before, posts, 2], 'sin build / upload / row');
     });
 
-    await check('DB I-1 Storage 503 al verificar el candidato (download_failed) → job FALLIDO PACKAGE_REUSE_VERIFY_UNAVAILABLE (clase A, reintentable); sin build, sin upload, sin row; A y el rebuild intactos', async () => {
+    // r62 (K4): un fallo transitorio de Storage al verificar el candidato ya no hace FALLAR el job (antes:
+    // PACKAGE_REUSE_VERIFY_UNAVAILABLE → 5 rondas → retry_package manual). Como desde 26890be el rebuild nunca pisa un objeto
+    // referenciado, el job reconstruye en una ruta NUEVA (`<clave>.<sha16>.mbz`) y deja intactos A y el rebuild anterior.
+    await check('DB I-1/r62 K4 Storage 503 al verificar el candidato (download_failed) → el job NO falla: reconstruye en una ruta NUEVA (sha del build), row nuevo; A y el rebuild anterior intactos (ningún POST a sus rutas)', async () => {
       const before = buildN;
-      const posts = storage.calls.filter((c) => c.method === 'POST').length;
+      const rowsBefore = (await mbzRows()).length;
       storage.getStatus = 503;
       let jr;
+      let postsDuring;
+      const callsBefore = storage.calls.length;
       try {
         const job = await newJob();
         await W.processItem(deps, job);
         jr = await jobRow(job.id);
-      } finally { storage.getStatus = null; }
-      eq(jr.worker_status, 'failed', 'job fallido');
-      assert(/^PACKAGE_REUSE_VERIFY_UNAVAILABLE:/.test(jr.error_message), `código: ${jr.error_message}`);
-      const v = FC.classifyFailure({ error: jr.error_message, source: 'package_worker' });
-      eq([v.class, v.strategy], ['A', 'repackage'], 'clasificado reintentable');
-      eq([buildN, storage.calls.filter((c) => c.method === 'POST').length, (await mbzRows()).length], [before, posts, 2], 'sin build / upload / row');
-      assert(storage.objects.get(objKey(CANONICAL)).equals(DELIVERED) && storage.objects.get(objKey(rebuiltPath)).equals(builds[0]), 'objetos intactos');
+      } finally { storage.getStatus = null; postsDuring = storage.calls.slice(callsBefore).filter((c) => c.method === 'POST'); }
+      eq([jr.worker_status, jr.output_summary.reused], ['completed', false], 'job completado con un rebuild');
+      eq(buildN, before + 1, 'un build');
+      const rows = await mbzRows();
+      eq(rows.length, rowsBefore + 1, 'un row nuevo');
+      const fresh = builds[builds.length - 1];
+      const freshPath = RV.rebuildDynamicMbzPath(CANONICAL, sha(fresh));
+      assert(freshPath !== rebuiltPath && freshPath !== CANONICAL, 'ruta nueva');
+      assert(storage.objects.get(objKey(freshPath)).equals(fresh), 'bytes del rebuild en la ruta nueva');
+      eq(jr.output_summary.artifactId, rows[rows.length - 1].id, 'artifact del job = row nuevo');
+      // r62 review M3: el row nuevo lleva el checksum del servidor de los bytes del rebuild (lo exige el próximo reuse).
+      eq([rows[rows.length - 1].checksum_sha256, rows[rows.length - 1].storage_path], [sha(fresh), freshPath], 'checksum y ruta del row nuevo');
+      assert(!postsDuring.some((c) => c.url.endsWith(encodeURIComponent(`${KEY}.mbz`)) || c.url.endsWith(encodeURIComponent(rebuiltPath.split('/').pop()))), 'ningún POST a las rutas referenciadas');
+      assert(storage.objects.get(objKey(CANONICAL)).equals(DELIVERED) && storage.objects.get(objKey(rebuiltPath)).equals(builds[0]), 'objetos entregados intactos');
+      const v = FC.classifyFailure({ error: 'PACKAGE_REUSE_VERIFY_UNAVAILABLE: x', source: 'package_worker' });
+      eq([v.class, v.strategy], ['A', 'repackage'], 'el código sigue clasificado A (compatibilidad de logs/jobs viejos)');
     });
 
     await check('DB I-1 guarda de putStorageObject: ruta referenciada por un artifact con OTROS bytes → PACKAGE_OBJECT_CONFLICT sin sobrescribir; un objeto HUÉRFANO (sin row) sí se reemplaza; mismos bytes → se adoptan', async () => {

@@ -13,12 +13,16 @@
  *   maxCostPerItemType   estimado del run por item type
  *   maxCostPerCourse     gastado del curso + estimado del run
  *   maxCostPerProvider   gastado del curso en ese proveedor + estimado del run en ese proveedor
- * Gasto real con requireHumanApprovalForRealSpend (default true) ⇒ como mínimo
- * ADMIN_APPROVAL aunque todo esté dentro de los límites. Mock ⇒ siempre AUTO.
+ * r62 (autorización única, decisión del usuario 2026-10-19): con la política dentro de sus límites la decisión es
+ * AUTO_WITHIN_POLICY; un admin solo hace falta si la política lo pide EXPLÍCITAMENTE
+ * (`requireHumanApprovalForRealSpend === true`) o si no tiene ningún tope total (por run, por curso o mensual):
+ * una política sin tope no acota nada y no puede ser «dentro de la política». Antes el flag ausente valía true.
+ * Mock ⇒ siempre AUTO. Sin política ⇒ ADMIN_APPROVAL.
  */
 import { FinopsError } from './errors';
 import { addDec, cmpDec, subDec, normalizeDecimal, DecimalLike } from './decimal';
 import type { MinExpMax } from './estimator';
+import { pointsToProduction } from '../dynamic-generation/dynamic-video-delivery';
 
 export type BudgetDecision = 'AUTO_WITHIN_POLICY' | 'ADMIN_APPROVAL' | 'BLOCK';
 
@@ -33,7 +37,10 @@ export interface BudgetPolicy {
   id?: string | null;
   version?: number | null;
   limits: BudgetLimits;
-  /** Default true (HD-V21-19: en staging/desarrollo todo gasto real requiere aprobación humana). */
+  /**
+   * r62: true EXPLÍCITO ⇒ todo gasto real requiere un admin aunque entre en la política. Ausente/null/false ⇒ no.
+   * (En la DB el flag explícito vive en `limits.requireHumanApprovalForRealSpend`: ver `policyFromRow`.)
+   */
   requireHumanApprovalForRealSpend?: boolean | null;
   onExceed?: 'BLOCK' | 'ADMIN_APPROVAL' | null;
 }
@@ -56,6 +63,11 @@ export interface EvaluateBudgetInput {
   spentSoFar?: SpentSoFar | null;
   /** false = run mock/fake: siempre permitido. */
   realSpend: boolean;
+  /**
+   * r62: false = solo los límites (sin las reglas de admin: flag explícito / política sin topes). Lo usa el camino
+   * solo-LLM de decideRunBudget, que nunca exigió admin dentro de los límites. Default true.
+   */
+  humanApprovalRules?: boolean;
 }
 
 export interface EvaluateBudgetResult {
@@ -94,6 +106,47 @@ function checkLimit(
   }
   reasons.push(`${label}:expected_over_limit(expected=${expected},limit=${limit})`);
   return onExceed;
+}
+
+/**
+ * r62: topes que exige la autorización única (null = sin tope): por run, por curso, mensual de la plataforma y mensual
+ * POR CLIENTE (`ownerMonthlyCap`; decisión 2026-10-20: sin él una cuenta podría agotar el mes de las demás → admin).
+ * El mensual es `monthlyCap`; `monthlyCapStaging` solo cuenta como tal en STAGING (el proceso no apunta al proyecto de
+ * producción: `pointsToProduction`, el mismo detector que el escape de Videogen y el guard de URLs de proveedores).
+ * Fuera de staging sigue limitando (planNormalApproval lo aplica igual: fail-safe), pero no habilita la firma única.
+ */
+export const SINGLE_AUTHORIZATION_REQUIRED_CAPS = ['maxCostPerRun', 'maxCostPerCourse', 'monthlyCap', 'ownerMonthlyCap'] as const;
+
+export function policySpendCaps(policy: BudgetPolicy | null | undefined, opts: { production?: boolean } = {}): { present: string[]; missing: string[] } {
+  const l = ((policy && policy.limits) || {}) as Record<string, unknown>;
+  const has = (v: unknown) => v !== null && v !== undefined && v !== '';
+  const production = opts.production ?? pointsToProduction(process.env);
+  const monthly = has(l.monthlyCap) ? l.monthlyCap : production ? null : l.monthlyCapStaging;
+  const caps: Record<string, unknown> = { maxCostPerRun: l.maxCostPerRun, maxCostPerCourse: l.maxCostPerCourse, monthlyCap: monthly, ownerMonthlyCap: l.ownerMonthlyCap };
+  const present: string[] = [];
+  const missing: string[] = [];
+  for (const k of SINGLE_AUTHORIZATION_REQUIRED_CAPS) (has(caps[k]) ? present : missing).push(k);
+  return { present, missing };
+}
+
+/**
+ * r62: fila de `cost_budget_policies` → BudgetPolicy. La columna `require_human_approval_for_real_spend` es NOT NULL
+ * DEFAULT true desde V2.1 y nunca distinguió «lo pidió alguien» de «default» (todas las filas existentes la tienen en
+ * true), así que deja de forzar admin por sí sola. El pedido EXPLÍCITO de admin por política es
+ * `limits.requireHumanApprovalForRealSpend: true` (lo escribe el endpoint de admin de políticas junto con la columna).
+ * Default para las políticas existentes: con tope por run, por curso, mensual y mensual por cliente (ownerMonthlyCap) → autorización única del usuario; sin
+ * alguno de esos topes → admin (ver decideRunBudget).
+ */
+export function policyFromRow(r: { id: string; version: number | string; limits: Record<string, unknown> | null; require_human_approval_for_real_spend?: boolean | null; on_exceed: string | null }): BudgetPolicy & { id: string; legacyRequireHumanColumn: boolean | null } {
+  const limits = (r.limits || {}) as Record<string, unknown>;
+  return {
+    id: r.id,
+    version: Number(r.version),
+    limits: limits as BudgetLimits,
+    requireHumanApprovalForRealSpend: limits.requireHumanApprovalForRealSpend === true,
+    onExceed: (r.on_exceed as BudgetPolicy['onExceed']) ?? null,
+    legacyRequireHumanColumn: r.require_human_approval_for_real_spend ?? null,
+  };
 }
 
 const ZERO_EST: MinExpMax = { min: '0', expected: '0', max: '0' };
@@ -136,10 +189,14 @@ export function evaluateBudget(input: EvaluateBudgetInput): EvaluateBudgetResult
     decision = worst(decision, checkLimit(`maxCostPerItemType.${itemType}`, lim, 0, te, onExceed, reasons));
   }
 
-  const requireHuman = policy.requireHumanApprovalForRealSpend !== false;
-  if (requireHuman && decision === 'AUTO_WITHIN_POLICY') {
-    decision = 'ADMIN_APPROVAL';
-    reasons.push('real_spend_requires_human_approval');
+  if (decision === 'AUTO_WITHIN_POLICY' && input.humanApprovalRules !== false) {
+    if (policy.requireHumanApprovalForRealSpend === true) {
+      decision = 'ADMIN_APPROVAL';
+      reasons.push('real_spend_requires_human_approval');
+    } else if (policySpendCaps(policy).present.length === 0) {
+      decision = 'ADMIN_APPROVAL';
+      reasons.push('policy_without_spend_caps');
+    }
   }
   if (decision === 'AUTO_WITHIN_POLICY') reasons.push('within_policy');
   return { decision, reasons };

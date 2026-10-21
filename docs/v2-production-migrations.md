@@ -212,8 +212,12 @@ Notas:
   conexión a la DB, no reclaman jobs, no entran en loop de restart y salen con
   `0` ante SIGTERM. En el paso C, el `pm2 restart --update-env` de todos los
   procesos los activa. Lo prueba `scripts/check-deploy-dynamic-workers.js`
-  (workers compilados contra un Postgres falso + `deploy.yml` = `origin/main`
-  + exactamente esas 2 líneas; base configurable con `DEPLOY_YML_BASE_REF`).
+  (workers compilados contra un Postgres falso). **r61:** los 3 workers
+  dinámicos de producción se arrancan con drenado (`node dist/workers/…js`
+  directo, `kill_timeout` 300 s) desde `scripts/ops/prod-release.sh`, al que
+  delega `deploy.yml`; además `deploy.yml` VERIFICA el esquema V2 con
+  `scripts/prod/v2-schema-probes.js` antes del rsync y aborta si falta algo
+  (nunca migra V2). Ver `docs/v2-production-promotion-runbook.md`.
   - **Flag antes de A4 (M5):** nunca poner `DYNAMIC_COURSE_STRUCTURE=true`
     antes de que A4 termine en exit 0. Si pasa igual, los workers ya no entran
     en crash-loop: ante `42P01` (tabla V2 inexistente) loguean UN error claro
@@ -226,11 +230,11 @@ Notas:
     de `pm2 start npm` → ≈350 MB en total sin hacer nada. Revisar `free -m`
     en el VPS antes de B1. Si sobra poco: leer el flag antes de importar
     `AppModule`, o arrancar con `pm2 start dist/workers/…js` (sin npm).
-  - **Check estricto de `deploy.yml` (M7):** `check-deploy-dynamic-workers.js`
-    exige `deploy.yml` = `origin/main` + las 2 líneas (+ IPs de comentarios
-    reemplazadas por `<VPS_HOST>`). Cualquier cambio legítimo posterior de
-    `deploy.yml` (p. ej. un hotfix) necesita `DEPLOY_YML_BASE_REF=<ref>` o
-    actualizar el check; tras el merge, la comparación pasa a ser identidad.
+  - **Check de `deploy.yml` (M7, reemplazado en r61):** ya no se exige
+    `deploy.yml` = `origin/main` + 2 líneas. `scripts/ci/check-prod-deploy-hardening.js`
+    exige en cambio que cada proceso PM2 y cada migración del `deploy.yml` de
+    `origin/main` (V1) siga arrancándose igual, y ejecuta el lado VPS
+    (`prod-release.sh`) con pm2/npm falsos.
 
 ## Guardas (todas antes de conectar)
 
@@ -374,6 +378,20 @@ MIGRATION_ENV=production CONFIRM_PRODUCTION_REF=hriwbakbuypaiovvvkqh DB_SSL=true
   node scripts/prod/migrate-v2-production.js --env-file .env --verify-only
 ```
 
+r61: además de los 9 verify/audit y de los chequeos internos (CHECK de
+`production_jobs`, políticas de Storage), `--verify-only` corre las **sondas de
+catálogo** de `scripts/prod/v2-schema-probes.js` para TODOS los pasos incluidos
+en el plan — en particular los 6 de r60 (pedagogy-profiles, practice-chapters,
+application-activities, guided-practice, academic-context, prebrief), que no
+tienen verify-* en modo production-readonly — y la presencia de cada fila del
+seed de precios v1. Cualquier faltante → exit 5 con `falta: …`. Las mismas
+sondas, como CLI autocontenido por stdin, las corre `deploy.yml` en el VPS
+antes del rsync (fail closed):
+
+```bash
+cd /var/www/cursia-backend && node - < scripts/prod/v2-schema-probes.js   # 0 = completo, 4 = incompleto, 1 = error
+```
+
 ### Salida esperada de un apply correcto
 
 ```
@@ -505,7 +523,11 @@ No corre en CI (necesita Postgres); no es un `check-*.js`.
 - Políticas de Storage: `drop policy if exists cursia_artifacts_{insert,select,delete,update}_own_folder on storage.objects;`
   (solo si se decide explícitamente; rompe los uploads del ejecutor V2).
 - **Código — el backout soportado es FLAG OFF, no un revert.** Ver la
-  sección siguiente.
+  sección siguiente. r61: `deploy.yml` tiene además `workflow_dispatch
+  action=rollback`, que restaura la última release sana guardada en el VPS
+  (`.release-prev/`) **sin correr migraciones** (así no reaparece el 23514 de
+  N1); volver a la V1 pre-V2 con filas `dynamic_*` sigue sin ser el camino
+  soportado — primero flags OFF (`docs/v2-production-promotion-runbook.md` §4).
 
 ## Backout del código V2 en producción (re-review N1)
 

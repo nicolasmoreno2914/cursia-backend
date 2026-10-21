@@ -39,6 +39,7 @@ import { buildPackageQualityReport, courseQualityReportSummary, CourseQualityRep
 import { PACKAGE_REUSE_REJECTED, PACKAGE_REUSE_VERIFY_UNAVAILABLE, chooseDynamicMbzUploadPath, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
 import { sha256Hex } from '../modules/artifacts/artifacts.service';
 import { isNonRealLlmMode } from '../modules/artifacts/artifact-type-policy';
+import { classifyFailure } from '../modules/reliability/failure-classifier';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fase 5B.1 — B3: dynamic-package-worker. Reclama production_jobs con
@@ -178,8 +179,12 @@ async function firstVerifiedCandidate<T extends { id: string; storageBucket?: st
     if (v.ok === true) return c;
     // Review r1 (I-1): un fallo transitorio de Storage al verificar NO dispara un rebuild (que antes terminaba
     // pisando los bytes entregados): el job falla con un código clase A y se reintenta.
+    // r62 (K4): un fallo transitorio de Storage al descargar el candidato ya no hace fallar el job. Desde 26890be el
+    // rebuild nunca pisa un objeto referenciado (`chooseDynamicMbzUploadPath` → `<clave>.<sha16>.mbz`, upload con
+    // upsert:false): se descarta el candidato SIN tocarlo y se reconstruye en una ruta nueva (costo 0).
     if ((v as { reason: string }).reason === 'download_failed') {
-      throw new Error(`${PACKAGE_REUSE_VERIFY_UNAVAILABLE}: no se pudo descargar dynamic_mbz ${c.id} del run ${expected.runId} para verificarlo (Storage) — se reintenta, nunca se reconstruye encima`);
+      logger?.warn(`${PACKAGE_REUSE_VERIFY_UNAVAILABLE}: no se pudo descargar dynamic_mbz ${c.id} del run ${expected.runId} para verificarlo (Storage) — no se reutiliza; se reconstruye en una ruta nueva sin pisar el objeto existente`);
+      continue;
     }
     logger?.warn(`${PACKAGE_REUSE_REJECTED}:${(v as { reason: string }).reason} — dynamic_mbz ${c.id} del run ${expected.runId} no se reutiliza (se reconstruye)`);
   }
@@ -239,13 +244,25 @@ async function completeJob(dataSource: DataSource, jobId: string, workerId: stri
   return Array.isArray(result) && result.length > 0;
 }
 
+/**
+ * r62 (d7): clasificación del fallo de un job de paquete que el worker deja en `output_summary.failure`
+ * ({class, code, transient}). `transient` = clase A del clasificador de empaque (Storage, DB, red, carrera de ruta):
+ * el empaque automático lo reintenta con espera creciente sin consumir el tope de intentos. Un BLOCKER determinista
+ * (`MBZ_V3_VALIDATION_FAILED` y el resto de `package_product`, clase D / product_bug) nunca es transitorio.
+ */
+export function packageJobFailureRecord(message: string): { class: string; code: string; transient: boolean; at: string } {
+  const v = classifyFailure({ source: 'package_worker', error: String(message ?? '') });
+  return { class: v.class, code: v.code, transient: v.class === 'A' && !v.unclassified, at: new Date().toISOString() };
+}
+
 async function failJob(dataSource: DataSource, jobId: string, workerId: string, message: string): Promise<void> {
   await dataSource.query(
     `update public.production_jobs
         set status = 'failed', worker_status = 'failed', finished_at = now(),
-            lease_until = null, error_message = $3, updated_at = now()
+            lease_until = null, error_message = $3, updated_at = now(),
+            output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('failure', $4::jsonb)
       where id = $1 and worker_id = $2`,
-    [jobId, workerId, message],
+    [jobId, workerId, message, JSON.stringify(packageJobFailureRecord(message))],
   );
 }
 

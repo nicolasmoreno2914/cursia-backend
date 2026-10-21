@@ -14,7 +14,9 @@ import {
   VideogenBatchJob,
   isJobCompleted,
   isJobFailed,
+  videogenV2CallOptions,
 } from '../video-engine/videogen.service';
+import { videoScenesFromVideogen } from '../package/h5p/interactive-video/plan';
 import { YoutubeService } from '../youtube/youtube.service';
 import { YoutubeTokenService } from '../youtube/youtube-token.service';
 import {
@@ -46,6 +48,7 @@ import {
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService, ITEM_RECOVERY_BUDGET_REASON, RUN_PAUSED_GUARD_REASON } from '../modules/finops/finops-budget.service';
 import { itemRecoveryBudgetMessage } from '../modules/finops/run-spend-guard';
+import { DYNAMIC_VIDEOGEN_MAX_RENDER_MS_DEFAULT, stuckRenderResendMetadata, videogenMaxRenderMs, videogenRenderOverdueMessage } from '../modules/dynamic-generation/videogen-render-cap';
 import {
   RunBudgetCapReached,
   WorkerBudget,
@@ -172,10 +175,19 @@ export interface DynamicItemWorkerDeps {
   youtubeUploadMaxTries?: number;
   /** DN-1: backoff base entre esos intentos, en ms (intento n espera base·n). Default 2000 (legacy: 2 s, 4 s). */
   youtubeUploadRetryBaseMs?: number;
-  /** DN-1: espera antes del reintento automático tras cuota agotada, en segundos. Default 3600. */
+  /**
+   * DN-1: espera antes del reintento automático tras cuota agotada, en segundos. r62 (review M1): YA NO SE USA — la espera
+   * la fija el gate global de cuota (próxima medianoche PT + turno FIFO). Se conserva por compatibilidad de la config.
+   */
   youtubeQuotaRetrySeconds?: number;
-  /** DN-1 (review I2): tope TOTAL de espera por cuota (desde la primera), en segundos. Default 86400 (24 h). */
+  /**
+   * DN-1 (review I2): tope TOTAL de espera por cuota (desde la primera), en segundos. r62 (d6): default 604800 (7 días;
+   * antes 24 h → `upload_failed` + `retry_upload` manual). La cuota de YouTube se repone cada día y la subida no cuesta:
+   * el sistema sigue esperando solo; agotada la espera larga queda la excepción `youtube_quota_exhausted`.
+   */
   youtubeQuotaMaxWaitSeconds?: number;
+  /** r62 (d6): pasada esta espera por cuota (desde la primera), alerta visible (una vez) sin dejar de esperar. Default 86400 (24 h). */
+  youtubeQuotaAlertSeconds?: number;
   /**
    * V2.1 RF-b: ledger de costos (Videogen CALCULATED_FROM_USAGE / MOCK,
    * YouTube ZERO_BY_DESIGN + cuota). El bootstrap SIEMPRE lo cablea; opcional
@@ -226,10 +238,12 @@ export const VIDEO_DURATION_UNMEASURABLE = 'video_duration_unmeasurable';
 /**
  * R16 (#16): tope de reloj (desde el primer poll del job) durante el cual un
  * `video_timeout` NO consume intentos: re-pollear un job de Videogen ya
- * persistido es gratis. Pasado el tope vuelve a consumir (y el auto-healer
- * acota las rondas).
+ * persistido es gratis. r62 (N2): es el default del tope ÚNICO de render
+ * (DYNAMIC_VIDEOGEN_MAX_RENDER_MS, videogen-render-cap.ts): pasado el tope con el
+ * job vivo, la parte queda `failed` con `videogen_render_overdue` (antes seguía
+ * consumiendo intentos/rondas re-polleando el MISMO job, sin salida visible).
  */
-export const VIDEO_TIMEOUT_FREE_WALL_MS = 3 * 60 * 60_000;
+export const VIDEO_TIMEOUT_FREE_WALL_MS = DYNAMIC_VIDEOGEN_MAX_RENDER_MS_DEFAULT;
 
 /** R16 (#7): el video interactivo (video_interactions, solo v3) planifica sus preguntas con la duración medida. */
 export function videoRequiresMeasuredDuration(item: Pick<ClaimedItem, 'rulesVersion'>): boolean {
@@ -756,6 +770,8 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           resKey = await reservePaidCall(deps.finops, {
             kind: 'videogen', ownerId: runHead.ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1,
             itemAttempt: item.attempt, tag: 'submit', estimate: {},
+            // r62 (N2): reenvío justificado sobre un render vivo (provider_stuck_no_cancel) → la reserva queda possible_duplicate.
+            metadata: stuckRenderResendMetadata(item.outputSummary),
           });
         } catch (e) {
           if (!(e instanceof RunBudgetCapReached)) throw e;
@@ -790,6 +806,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         submitInFlight = { jobId: null };
         let result;
         try {
+          // r62 (N2): timeout del cliente SOLO en V2 (un POST vencido es un envío ambiguo, como ya se trata abajo).
           result = await deps.videogen.batchCreate([
             {
               title: chapterTitle,
@@ -798,7 +815,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
               client_reference_id: item.idempotencyKey,
               external_metadata: { tts_model: dynamicVideogenTtsModel() },
             },
-          ]);
+          ], videogenV2CallOptions('submit'));
         } catch (err) {
           const why = err instanceof Error ? err.message : String(err);
           if (isVideogenDefinitiveRejection(err)) {
@@ -864,26 +881,46 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
     if (typeof pollSinceRaw !== 'string') {
       if (!(await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { videoPollSince: new Date(startedAt).toISOString() }))) return;
     }
+    // r62 (N2): tope único de render; el último estado informado viaja en el mensaje del vencimiento.
+    const renderCapMs = videogenMaxRenderMs();
+    let lastStatus: string | null = typeof item.outputSummary?.videogenLastStatus === 'string' ? item.outputSummary.videogenLastStatus : null;
+    const overdue = async (): Promise<void> => {
+      // Nunca un job nuevo con el viejo vivo: la parte queda failed (visible) y la conciliación decide.
+      await scheduler.failItem(item.itemRunId, deps.executorId, videogenRenderOverdueMessage(jobId, lastStatus, Date.now() - pollSince, renderCapMs), false);
+    };
     while (true) {
       if (leaseLost) return;
       // R16 (#1): el job ya está persistido → re-pollearlo desde otro worker es gratis.
       if (await handBackIfDraining(deps, item, `mientras esperaba el render del job ${jobId} (se retoma sin reenviar)`)) return;
       if (Date.now() - startedAt > timeoutMs) {
-        // R16 (#16): re-pollear un job persistido es gratis → dentro del tope de reloj no consume intentos.
-        if (Date.now() - pollSince < VIDEO_TIMEOUT_FREE_WALL_MS) {
-          await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true, undefined, { grantAttempt: true });
-        } else {
-          await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true);
+        // R16 (#16): re-pollear un job persistido es gratis → dentro del tope de render no consume intentos.
+        // r62 (N2): pasado el tope (con el último estado leído no terminal) → vencido visible.
+        if (Date.now() - pollSince >= renderCapMs) {
+          await overdue();
+          return;
         }
+        await scheduler.failItem(item.itemRunId, deps.executorId, 'video_timeout', true, undefined, { grantAttempt: true });
         return;
       }
 
       let status: VideogenBatchJob;
       try {
-        status = mode === 'mock' ? await mockPollVideoStatus(deps, item, jobId) : await deps.videogen.getVideoStatus(jobId);
+        status = mode === 'mock' ? await mockPollVideoStatus(deps, item, jobId) : await deps.videogen.getVideoStatus(jobId, videogenV2CallOptions('get'));
       } catch (err) {
         if (err instanceof LeaseLostError) return;
         throw err;
+      }
+      // r62 (N2, review m3): el último estado viaja a los re-claims (mensaje del vencimiento).
+      const polled = String(status.status ?? '');
+      if (polled && polled !== lastStatus) {
+        lastStatus = polled;
+        await scheduler.recordItemExternal(item.itemRunId, deps.executorId, { videogenLastStatus: polled }).catch(() => false);
+      }
+      // r62 (N2, review I2): el tope se aplica DESPUÉS de consultar: un job que terminó (bien o mal) se procesa aunque
+      // el tope ya haya pasado; solo vence con un estado no terminal.
+      if (!isDynamicVideoCompleted(status.status) && !isJobFailed(status.status) && Date.now() - pollSince >= renderCapMs) {
+        await overdue();
+        return;
       }
 
       if (isDynamicVideoCompleted(status.status)) {
@@ -891,7 +928,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         let costError: string | null = null;
         if (mode === 'real') {
           try {
-            cost = (await deps.videogen.getVideoCost(jobId)).estimated_total_cost;
+            cost = (await deps.videogen.getVideoCost(jobId, videogenV2CallOptions('get'))).estimated_total_cost;
           } catch (err) {
             costError = err instanceof Error ? err.message : String(err);
             logger.warn(`Item ${item.itemKey}: no se pudo obtener el costo real de Videogen — ${costError}`);
@@ -926,6 +963,12 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         if (duration.durationSec === null) {
           logger.warn(`Item ${item.itemKey}: Videogen no informó la duración del video (durationSource=unknown)`);
         }
+        // r61 Q-04: escenas del guion de Videogen (narración + duración real del audio) → línea de
+        // tiempo para anclar las preguntas del video interactivo. Sin escenas → motivo explícito.
+        const timeline = videoTimelinePatch(status);
+        if (timeline.videoScenesUnavailable) {
+          logger.warn(`Item ${item.itemKey}: Videogen no informó escenas utilizables (${timeline.videoScenesUnavailable}) — las preguntas del video quedan equiespaciadas`);
+        }
         if (runHead.videoDelivery === 'youtube') {
           // 5B.2.A: con YouTube, completed_local es INTERMEDIO — se persiste
           // lo necesario para publicar (y reanudar sin Videogen) y se pasa a
@@ -936,6 +979,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
             videogenDownloadUrl: status.download_url ?? null,
             costUsd: cost,
             external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
+            ...timeline,
           });
           if (!recorded) {
             logger.warn(`Item ${item.itemKey}: lease perdida al registrar completed_local — se detiene sin publicar`);
@@ -945,7 +989,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
           await runYoutubeDeliveryPhase(deps, item, runHead, phase, () => leaseLost);
           return;
         }
-        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost, duration);
+        await completeVideoItem(deps, item, runHead, jobId, status, mode, cost, duration, timeline);
         return;
       }
       if (isJobFailed(status.status)) {
@@ -978,6 +1022,18 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
   }
 }
 
+/** r61 Q-04: lo que se guarda de la línea de tiempo del video (una de las dos claves; la otra en null, sin restos de un job anterior). */
+export type VideoTimelinePatch = { videoScenes?: unknown[] | null; videoScenesUnavailable?: string | null };
+
+/**
+ * r61 Q-04: escenas de Videogen (status del job que se acaba de pollear) normalizadas y acotadas. Siempre
+ * del status vigente (un re-claim del mismo job obtiene las mismas escenas; un job nuevo, las suyas). Puro.
+ */
+export function videoTimelinePatch(status: { scenes?: unknown[] | null }): VideoTimelinePatch {
+  const r = videoScenesFromVideogen(status?.scenes ?? null);
+  return r.ok === true ? { videoScenes: r.scenes, videoScenesUnavailable: null } : { videoScenes: null, videoScenesUnavailable: r.reason };
+}
+
 async function completeVideoItem(
   deps: DynamicItemWorkerDeps,
   item: ClaimedItem,
@@ -987,6 +1043,7 @@ async function completeVideoItem(
   mode: 'mock' | 'real',
   cost: number | null,
   duration: VideoDuration,
+  timeline: VideoTimelinePatch = {},
 ): Promise<void> {
   if (videoRequiresMeasuredDuration(item) && duration.durationSec === null) {
     // R16 fix M2: como en la entrega YouTube, se mide gratis el MP4 ya renderizado (status.download_url).
@@ -1014,6 +1071,7 @@ async function completeVideoItem(
     chapterId: item.chapterId,
     itemKey: item.itemKey,
     idempotencyKey: item.idempotencyKey,
+    ...timeline,
   };
   // I1: path inmutable por intento (R23) — nunca sobreescribe un artifact ya
   // vinculado a un item completado por otro Manifest/ejecutor.
@@ -1041,6 +1099,7 @@ async function completeVideoItem(
     summary: {
       videogenJobId: jobId, mode, downloadUrl: status.download_url ?? null, costUsd: cost,
       external: { durationSec: duration.durationSec, durationSource: duration.durationSource },
+      ...timeline,
     },
   });
   if (!ok) {
@@ -1157,25 +1216,120 @@ async function blockYoutubeDelivery(
   await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_${state}: ${detail}`, false);
 }
 
+/** r62 (d6): espera larga por cuota de YouTube (7 días) y umbral de la alerta (24 h). */
+export const YOUTUBE_QUOTA_MAX_WAIT_DEFAULT_SECONDS = 7 * 86400;
+export const YOUTUBE_QUOTA_ALERT_DEFAULT_SECONDS = 86400;
+/** r62 (d6): código de la excepción registrada cuando la cuota siguió agotada durante toda la espera larga. */
+export const YOUTUBE_QUOTA_EXHAUSTED = 'youtube_quota_exhausted';
+
+/** r62 (review M1): separación entre turnos de la cola FIFO cuando la cuota se repone (orden de llegada). */
+export const YOUTUBE_QUOTA_FIFO_SPACING_SECONDS = 60;
+
+/**
+ * r62 (review M1): la cuota de la YouTube Data API se repone a la medianoche del Pacífico (America/Los_Angeles). Próxima
+ * medianoche PT estrictamente posterior a `now` (PST = 08:00 UTC, PDT = 07:00 UTC; el cambio de horario es a las 2 am,
+ * nunca a medianoche). Pura.
+ */
+export function nextPacificMidnight(now: Date): Date {
+  const parts = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', year: 'numeric', month: '2-digit', day: '2-digit' })
+    .formatToParts(now)
+    .reduce<Record<string, string>>((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+  const y = Number(parts.year);
+  const m = Number(parts.month);
+  const d = Number(parts.day);
+  const ptHour = (t: Date) => Number(new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hour: '2-digit', hourCycle: 'h23' }).format(t));
+  for (const utcHour of [7, 8]) {
+    const cand = new Date(Date.UTC(y, m - 1, d + 1, utcHour, 0, 0));
+    if (ptHour(cand) === 0) return cand;
+  }
+  return new Date(Date.UTC(y, m - 1, d + 1, 8, 0, 0));
+}
+
+function isoDateOrNull(v: unknown): Date | null {
+  if (typeof v !== 'string' && !(v instanceof Date)) return null;
+  const d = new Date(v as any);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+/**
+ * r62 (review M1): GATE GLOBAL de la cuota (la cuota es del proyecto de GCP, compartida por todos los cursos). Instante
+ * más lejano registrado por un item de video todavía abierto (`youtubeQuotaBlockedUntil`) — si es futuro, NINGUNA
+ * subida se intenta antes. null = abierto. Un error de la consulta → null (lo registra el log; la propia marca del item
+ * sigue mandando en `publishYoutubeAndComplete`).
+ */
+export async function youtubeQuotaGateUntil(dataSource: Pick<DataSource, 'query'>, now: Date): Promise<Date | null> {
+  try {
+    const rows = await dataSource.query(
+      `select max((g.output_summary->>'youtubeQuotaBlockedUntil')::timestamptz) as gate_until
+         from public.generation_item_runs g
+        where g.type = 'video' and g.status in ('retrying', 'running', 'queued', 'pending')
+          and (g.output_summary->>'youtubeQuotaBlockedUntil') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+          /* r62:youtube_quota_gate */`,
+    );
+    const until = isoDateOrNull(Array.isArray(rows) ? rows[0]?.gate_until : null);
+    return until && until.getTime() > now.getTime() ? until : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * r62 (review M1): turno FIFO del item en la cola de cuota: cuántos videos abiertos en `blocked_quota` esperan desde
+ * antes (`youtubeQuotaSince`; empate por id). Cuando la cuota se repone se suben en orden de llegada.
+ */
+export async function youtubeQuotaQueueRank(dataSource: Pick<DataSource, 'query'>, itemRunId: string, since: string): Promise<number> {
+  try {
+    const rows = await dataSource.query(
+      `select count(*)::int as n
+         from public.generation_item_runs g
+        where g.type = 'video' and g.status = 'retrying' and g.id::text <> $1::text
+          and g.output_summary->>'delivery' = 'blocked_quota'
+          and (g.output_summary->>'youtubeQuotaSince') ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'
+          and ((g.output_summary->>'youtubeQuotaSince')::timestamptz < $2::timestamptz
+               or ((g.output_summary->>'youtubeQuotaSince')::timestamptz = $2::timestamptz and g.id::text < $1::text))
+          /* r62:youtube_quota_rank */`,
+      [itemRunId, since],
+    );
+    const n = Number(Array.isArray(rows) ? rows[0]?.n : 0);
+    return Number.isInteger(n) && n > 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Duración legible (h o días) para los mensajes de la cuota. */
+function waitLabel(sec: number): string {
+  return sec >= 2 * 86400 ? `${Math.round(sec / 86400)} días` : `${Math.round(sec / 3600)} h`;
+}
+
 /**
  * Cuota de YouTube (review DN-1 I2): la espera tiene contador y tope PROPIOS
  * (`youtubeQuotaSince`, `youtubeQuotaWaits` en output_summary) y NO consume
- * max_attempts del item (refundAttempt). Mientras no pasen
- * `youtubeQuotaMaxWaitSeconds` (24 h) desde la primera espera → `retrying`
- * con `next_retry_at` + `youtubeQuotaRetrySeconds`. Pasado el tope →
- * `upload_failed` (failed, reintento manual `retry_upload`) y el contador se
- * reinicia para el próximo intento manual.
+ * max_attempts del item (refundAttempt). Mientras no pase
+ * `youtubeQuotaMaxWaitSeconds` desde la primera espera → `retrying` con
+ * `next_retry_at` (antes `+ youtubeQuotaRetrySeconds`; ver r62 abajo).
+ * r62 (d6): el video ya está pagado y la subida no cuesta nada, así que la
+ * espera es LARGA (default 7 días: la cuota se repone cada día) y no termina en
+ * un `retry_upload` manual a las 24 h. r62 (review M1): sin reintento horario
+ * ciego — se registra `youtubeQuotaBlockedUntil` (medianoche PT), que actúa como
+ * gate GLOBAL, y el item vuelve en ese instante + su turno FIFO. Pasado `youtubeQuotaAlertSeconds` (24 h)
+ * se registra UNA alerta (`youtubeQuotaAlertAt`, log ALERTA) y se sigue
+ * esperando solo. Agotada la espera larga → excepción registrada
+ * `youtube_quota_exhausted` (D, config: `upload_failed` + `retry_upload`; el
+ * contador se reinicia para ese intento) — nunca un reintento silencioso eterno.
  */
-async function blockYoutubeQuota(deps: DynamicItemWorkerDeps, item: ClaimedItem, detail: string): Promise<void> {
+async function blockYoutubeQuota(deps: DynamicItemWorkerDeps, item: ClaimedItem, detail: string, gatedUntil?: Date): Promise<void> {
   const summary = await loadOutputSummary(deps.dataSource, item.itemRunId);
-  const nowIso = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
   const since: string = typeof summary.youtubeQuotaSince === 'string' ? summary.youtubeQuotaSince : nowIso;
   const waitedSec = Math.max(0, (Date.now() - new Date(since).getTime()) / 1000);
-  const maxWait = deps.youtubeQuotaMaxWaitSeconds ?? 86400;
+  const maxWait = deps.youtubeQuotaMaxWaitSeconds ?? YOUTUBE_QUOTA_MAX_WAIT_DEFAULT_SECONDS;
+  const alertAfter = deps.youtubeQuotaAlertSeconds ?? YOUTUBE_QUOTA_ALERT_DEFAULT_SECONDS;
   if (waitedSec >= maxWait) {
     const msg =
-      'YouTube siguió sin permitir subidas durante 24 h (cuota agotada). Reintenta la publicación más tarde: ' +
-      'el video ya está generado y no se vuelve a pagar.';
+      `YouTube siguió sin permitir subidas durante ${waitLabel(maxWait)} (cuota agotada). Revisa la cuota del canal y reintenta la ` +
+      'publicación: el video ya está generado y no se vuelve a pagar.';
     const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
       delivery: 'upload_failed',
       youtubeUploadStartedAt: null,
@@ -1183,27 +1337,48 @@ async function blockYoutubeQuota(deps: DynamicItemWorkerDeps, item: ClaimedItem,
       youtubeUploadFailedAt: nowIso,
       youtubeQuotaSince: null,
       youtubeQuotaWaits: 0,
+      youtubeQuotaAlertAt: null,
+      youtubeQuotaBlockedUntil: null,
+      youtubeQuotaExhaustedAt: nowIso,
     });
     if (!recorded) return;
-    deps.logger.warn(`Item ${item.itemKey}: cuota de YouTube agotada más de ${Math.round(maxWait / 3600)} h → upload_failed (retry manual)`);
-    await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_upload_failed: ${msg}`, false);
+    deps.logger.error(`Item ${item.itemKey}: ${YOUTUBE_QUOTA_EXHAUSTED} — cuota de YouTube agotada durante ${waitLabel(maxWait)} → excepción registrada (retry_upload)`);
+    await deps.scheduler.failItem(item.itemRunId, deps.executorId, `${YOUTUBE_QUOTA_EXHAUSTED}: ${msg}`, false);
     return;
   }
+  const waits = Number(summary.youtubeQuotaWaits ?? 0) + 1;
+  const prevAlert = typeof summary.youtubeQuotaAlertAt === 'string' ? summary.youtubeQuotaAlertAt : null;
+  const alertNow = !prevAlert && waitedSec >= alertAfter;
+  // r62 (review M1): la cuota se repone a la medianoche PT. Rechazo real de YouTube → gate hasta la próxima medianoche PT
+  // (o el gate global vigente, si es más lejano); item frenado por el gate → ese mismo instante. Turno FIFO por llegada.
+  const pacific = nextPacificMidnight(now);
+  const until = gatedUntil && gatedUntil.getTime() > pacific.getTime() ? gatedUntil : gatedUntil ?? pacific;
+  const rank = await youtubeQuotaQueueRank(deps.dataSource, item.itemRunId, since);
+  const retryAfterSeconds = Math.max(60, Math.ceil((until.getTime() - now.getTime()) / 1000)) + rank * YOUTUBE_QUOTA_FIFO_SPACING_SECONDS;
   const recorded = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
     delivery: 'blocked_quota',
     youtubeUploadStartedAt: null,
     youtubeBlockedAt: nowIso,
     youtubeBlockDetail: detail,
     youtubeQuotaSince: since,
-    youtubeQuotaWaits: Number(summary.youtubeQuotaWaits ?? 0) + 1,
+    youtubeQuotaWaits: waits,
+    youtubeQuotaAlertAt: alertNow ? nowIso : prevAlert,
+    youtubeQuotaBlockedUntil: until.toISOString(),
+    youtubeQuotaQueuePosition: rank + 1,
   });
   if (!recorded) {
     deps.logger.warn(`Item ${item.itemKey}: lease perdida al registrar blocked_quota`);
     return;
   }
-  deps.logger.warn(`Item ${item.itemKey}: entrega YouTube blocked_quota (espera ${Number(summary.youtubeQuotaWaits ?? 0) + 1})`);
+  if (alertNow) {
+    deps.logger.error(
+      `ALERTA Item ${item.itemKey}: la cuota de YouTube sigue agotada tras ${waitLabel(waitedSec)} — se sigue esperando solo ` +
+        `(próximo intento al reponerse la cuota, ${until.toISOString()}, turno ${rank + 1}) hasta ${waitLabel(maxWait)}`,
+    );
+  }
+  deps.logger.warn(`Item ${item.itemKey}: entrega YouTube blocked_quota (espera ${waits}; ${gatedUntil ? 'gate global' : 'rechazo de YouTube'} hasta ${until.toISOString()}, turno ${rank + 1})`);
   await deps.scheduler.failItem(item.itemRunId, deps.executorId, `youtube_blocked_quota: ${detail}`, true, undefined, {
-    retryAfterSeconds: deps.youtubeQuotaRetrySeconds ?? 3600,
+    retryAfterSeconds,
     refundAttempt: true,
   });
 }
@@ -1279,6 +1454,18 @@ async function publishYoutubeAndComplete(
     if (!publisher) {
       await scheduler.failItem(item.itemRunId, deps.executorId, 'youtube_publisher_not_configured', false);
       return;
+    }
+    // r62 (review M1): GATE GLOBAL de cuota — ninguna subida real antes de que la cuota se reponga (sin llamar a la API,
+    // sin bucle: el item se reprograma a ese instante + su turno FIFO). El publicador mock no gasta cuota.
+    if (runHead.videoMode !== 'mock') {
+      const now = new Date();
+      const own = isoDateOrNull(summary.youtubeQuotaBlockedUntil);
+      const global = await youtubeQuotaGateUntil(deps.dataSource, now);
+      const gate = [own, global].filter((d): d is Date => !!d && d.getTime() > now.getTime()).sort((a, b) => b.getTime() - a.getTime())[0];
+      if (gate) {
+        await blockYoutubeQuota(deps, item, YOUTUBE_QUOTA_BLOCK_DETAIL, gate);
+        return;
+      }
     }
 
     // DN-1: credenciales re-validadas JUSTO antes de subir (conexión activa,
@@ -1415,7 +1602,7 @@ async function publishYoutubeAndComplete(
     // falla reintentable y el re-claim retoma la publicación sin volver a pagar el render.
     let measured: number | null = null;
     try {
-      const m = (await deps.videogen.getVideoCost(videogenJobId)).estimated_total_cost;
+      const m = (await deps.videogen.getVideoCost(videogenJobId, videogenV2CallOptions('get'))).estimated_total_cost;
       if (typeof m === 'number' && Number.isFinite(m)) measured = m;
     } catch (err) {
       logger.warn(`Item ${item.itemKey}: el costo de Videogen sigue sin estar disponible — ${err instanceof Error ? err.message : String(err)}`);
@@ -1472,6 +1659,9 @@ async function publishYoutubeAndComplete(
     delivery: 'youtube',
     youtubeVideoId,
     youtubeUrl,
+    // r61 Q-04: la misma línea de tiempo que quedó en el output_summary al terminar el render (la lee el
+    // empaquetado para colocar las preguntas igual que el claim de video_interactions).
+    ...(Array.isArray(summary.videoScenes) ? { videoScenes: summary.videoScenes } : {}),
   };
   const storagePath =
     `${runHead.ownerId}/dynamic/${item.artifactCourseId}/${item.manifestId}/dynamic_video/` +
@@ -1596,7 +1786,8 @@ async function bootstrap() {
     youtubeUploadMaxTries: readPositiveInt('DYNAMIC_YOUTUBE_UPLOAD_MAX_TRIES', 3),
     youtubeUploadRetryBaseMs: readPositiveInt('DYNAMIC_YOUTUBE_UPLOAD_RETRY_BASE_MS', 2000),
     youtubeQuotaRetrySeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_RETRY_SECONDS', 3600),
-    youtubeQuotaMaxWaitSeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_MAX_WAIT_SECONDS', 86400),
+    youtubeQuotaMaxWaitSeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_MAX_WAIT_SECONDS', YOUTUBE_QUOTA_MAX_WAIT_DEFAULT_SECONDS),
+    youtubeQuotaAlertSeconds: readPositiveInt('DYNAMIC_YOUTUBE_QUOTA_ALERT_SECONDS', YOUTUBE_QUOTA_ALERT_DEFAULT_SECONDS),
     // V2.1 RF-b: ledger + runtime guard de presupuesto (siempre cableados en el proceso real).
     finops: app.get(FinopsLedgerService),
     budget: app.get(FinopsBudgetService),

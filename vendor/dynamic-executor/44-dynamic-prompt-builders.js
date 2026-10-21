@@ -1161,21 +1161,53 @@ function dynVideoInteractionsSys() {
 var DYN_VIDEO_REFLECTION_LIMITS = { promptMax: 200, hintMax: 200 };
 
 // opts (#542 I1, opcional): { tfFirst } → reglas anti-patrón de respuesta (sin opts: prompt de siempre).
+// r61 Q-04: opts.videoScenes (claim video.videoScenes, escenas reales de Videogen [{order, startSec, endSec,
+// narration}]; los checkpoints ya vienen anclados al final de una escena) → el prompt muestra el guion del
+// video por tramos y cada pregunta evalúa lo que la NARRACIÓN ya dijo en su tramo. Sin escenas: el prompt
+// de siempre, byte a byte.
+function _dynVideoSec(x) { return Math.round(x); }
+// Review M-4: la narración de Videogen no puede cerrar ni abrir los bloques del prompt (<<<X / X>>>).
+function _dynNeutralizePromptFence(t) { return String(t || '').replace(/<{3,}/g, '«').replace(/>{3,}/g, '»'); }
+function _dynVideoScenesHead(contentMd, cps, scenes) {
+  var script = scenes.map(function (s) {
+    return 'Escena ' + s.order + ' [' + _dynVideoSec(s.startSec) + '–' + _dynVideoSec(s.endSec) + ' s]: ' + _dynNeutralizePromptFence(s.narration);
+  }).join('\n');
+  var cpLines = cps.map(function (c) {
+    // Misma partición que dynScenesForCheckpoint (escenas que TERMINAN en el tramo).
+    var cov = scenes.filter(function (s) { var e = Math.ceil(s.endSec - 1e-6); return e > c.segmentStart && e <= c.atSec; });
+    var lastSc = cov.length ? cov[cov.length - 1] : null;
+    var orders = cov.map(function (s) { return s.order; });
+    var range = orders.length > 1 ? 'escenas ' + orders[0] + ' a ' + orders[orders.length - 1] : 'escena ' + (orders[0] !== undefined ? orders[0] : '?');
+    return '- index ' + c.index + ' (segundo ' + c.atSec + (lastSc ? ', justo al terminar la escena ' + lastSc.order : '') + '): lo narrado entre el segundo ' + c.segmentStart + ' y el ' + c.atSec + ' (' + range + ')' + (lastSc && orders.length > 1 ? '; de preferencia la escena ' + lastSc.order : '');
+  }).join('\n');
+  return 'El video tiene su PROPIO guion, narrado por escenas (no recorre el capítulo de forma pareja). Guion real del video (escena, tramo en segundos, narración):\n<<<GUION\n' + script + '\nGUION>>>'
+    + '\n\nTexto del capítulo (solo como referencia de términos, datos y contexto):\n<<<CAPITULO\n' + String(contentMd || '') + '\nCAPITULO>>>'
+    + '\n\nPuntos de pausa (fijos, cada uno al final de una escena; genera EXACTAMENTE una pregunta por cada uno, en este orden y con este index):\n' + cpLines
+    + '\n\nCada pregunta evalúa SOLO algo que la narración del video ya dijo en ESE tramo (las escenas indicadas): nunca algo de escenas posteriores ni algo que el video no narra, aunque esté en el capítulo.';
+}
+
 function dynVideoInteractionsPrompt(contentMd, checkpoints, reflections, opts) {
   if (Array.isArray(reflections)) return dynVideoInteractionsPromptV2(contentMd, checkpoints, reflections, opts);
   var L = DYN_VIDEO_INTERACTIONS_LIMITS;
   var cps = checkpoints || [];
-  var first = cps.length ? cps[0].segmentStart : 0;
-  var last = cps.length ? cps[cps.length - 1].segmentEnd : 0;
-  var span = Math.max(1, last - first);
-  var cpLines = cps.map(function (c) {
-    var from = Math.round(((c.segmentStart - first) / span) * 100);
-    var to = Math.round(((c.segmentEnd - first) / span) * 100);
-    return '- index ' + c.index + ' (segundo ' + c.atSec + '): conceptos del tramo que va aproximadamente del ' + from + '% al ' + to + '% del recorrido del capítulo';
-  }).join('\n');
-  return 'El recorrido audiovisual sigue el capítulo en orden, de principio a fin. Texto completo del capítulo:\n<<<CAPITULO\n' + String(contentMd || '') + '\nCAPITULO>>>'
-    + '\n\nPuntos de pausa (fijos; genera EXACTAMENTE una pregunta por cada uno, en este orden y con este index):\n' + cpLines
-    + '\n\nCada pregunta evalúa un concepto que el estudiante acaba de ver en ESE tramo del capítulo (no de tramos posteriores).'
+  var scenes = opts && Array.isArray(opts.videoScenes) && opts.videoScenes.length ? opts.videoScenes : null;
+  var head;
+  if (scenes) {
+    head = _dynVideoScenesHead(contentMd, cps, scenes);
+  } else {
+    var first = cps.length ? cps[0].segmentStart : 0;
+    var last = cps.length ? cps[cps.length - 1].segmentEnd : 0;
+    var span = Math.max(1, last - first);
+    var cpLines = cps.map(function (c) {
+      var from = Math.round(((c.segmentStart - first) / span) * 100);
+      var to = Math.round(((c.segmentEnd - first) / span) * 100);
+      return '- index ' + c.index + ' (segundo ' + c.atSec + '): conceptos del tramo que va aproximadamente del ' + from + '% al ' + to + '% del recorrido del capítulo';
+    }).join('\n');
+    head = 'El recorrido audiovisual sigue el capítulo en orden, de principio a fin. Texto completo del capítulo:\n<<<CAPITULO\n' + String(contentMd || '') + '\nCAPITULO>>>'
+      + '\n\nPuntos de pausa (fijos; genera EXACTAMENTE una pregunta por cada uno, en este orden y con este index):\n' + cpLines
+      + '\n\nCada pregunta evalúa un concepto que el estudiante acaba de ver en ESE tramo del capítulo (no de tramos posteriores).';
+  }
+  return head
     + ((opts && opts.pedagogy) || '')
     + '\n\nResponde SOLO con este JSON:\n'
     + '{"checkpoints": [\n'

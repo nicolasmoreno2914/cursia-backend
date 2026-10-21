@@ -32,7 +32,11 @@ import { isNonRealLlmMode } from '../artifacts/artifact-type-policy';
 import { frozenProviderModesOf, providerKindOfItemType } from './provider-modes';
 import { fallbackVideoModeOf, questionsBelongToVideo } from './video-upgrade';
 import { v3ValidatedArtifactTypes } from '../course-shell/v3-validation';
-import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, autoHealPolicyFromEnv, safeAutoRetryDecision } from './auto-heal';
+import { AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS, ambiguousAudioResubmitDecision, autoHealDecision, autoHealEnabled, autoHealIntervalMs, autoHealPolicyFromEnv, autoRecoveryEnabled, safeAutoRetryDecision } from './auto-heal';
+// r62 (N2): Videogen/Gamma que el barrido de conciliación todavía va a resolver solo (sin acción de admin).
+import { providerReconcilePending } from './provider-reconcile';
+import { spendControlHoldOf } from '../reliability/spend-control-hold';
+import { CLAIM_PAYLOAD_DEP_ALIVE, CLAIM_PAYLOAD_DEP_DEAD, CLAIM_PAYLOAD_SWEEP_CEILING_MS, claimPayloadDependencyKey } from '../reliability/claim-payload-recovery';
 import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 
 export type RunCompletionState = 'in_progress' | 'packaging' | 'complete' | 'preview' | 'needs_attention' | 'cancelled';
@@ -152,6 +156,13 @@ export interface RunCompletion {
   previewComponents: string[];
   adminActions: RunAdminAction[];
   /**
+   * r62 (review N1 M1): `true` cuando el run quedaría en `needs_attention` sin ninguna acción humana porque TODO lo que
+   * falta lo está resolviendo el servidor solo (auto-heal con su espera, reenvío único acotado, control de gasto que
+   * espera a revertirse, claim incompleto…). El estado no cambia (el enum es el de siempre); el FE muestra
+   * «Recuperando automáticamente» en vez de «necesita atención».
+   */
+  autoRecovering?: boolean;
+  /**
    * BE-B: estado del último job de paquete FINAL del run (solo cuando la generación está completa):
    * `none` (todavía no hay job), `queued`/`running`/`retrying` (armándose), `completed`, `failed`
    * (falló o no se pudo armar). `autoRetryPending`: el servidor lo va a reintentar solo. `auto`: el run
@@ -166,6 +177,12 @@ export interface RunCompletion {
     blocked?: { code: string; message: string | null };
     /** stop-after (review I3): el empaque automático está RETENIDO por el dueño (holdPackaging): solo acción explícita. */
     held?: boolean;
+    /** r62 (d7): motivo de la excepción registrada al agotarse el reintento automático. */
+    attentionReason?: string;
+    /** r62 (d7): alerta mientras se sigue reintentando solo. */
+    alert?: string;
+    /** r62 (d7): próximo reintento automático (ISO), solo con fallos transitorios. */
+    nextRetryAt?: string;
   } | null;
 }
 
@@ -184,6 +201,15 @@ export interface CompletionPackageInfo {
   blocked?: { code: string; message?: string | null; missing?: string[] } | null;
   /** stop-after (review I3): empaque automático retenido por el dueño. */
   held?: boolean;
+  /**
+   * r62 (d7): motivo explícito de la excepción cuando el reintento automático se agotó (`package_transient_exhausted`:
+   * fallos transitorios durante toda la ventana larga; `package_attempts_exhausted`: tope de fallos no transitorios).
+   */
+  attentionReason?: string | null;
+  /** r62 (d7): alerta visible mientras el servidor sigue reintentando solo (p.ej. `package_transient_retrying`). */
+  alert?: string | null;
+  /** r62 (d7): próximo reintento automático (ISO) con la espera creciente. */
+  nextRetryAt?: string | null;
 }
 
 /**
@@ -210,6 +236,9 @@ export interface CompletionJob {
   status?: string | null;
   worker_status?: string | null;
   input_payload?: any;
+  /** r62 (N2, review M1): id y alta del run (exclusión de runs históricos de la conciliación automática). */
+  id?: string | null;
+  created_at?: Date | string | null;
 }
 
 export interface CompletionRow {
@@ -509,7 +538,11 @@ function isAmbiguousYoutube(r: CompletionRow): boolean {
 }
 
 /** Acción de admin para un item no hecho (null = el auto-healer lo toma o es un bloqueo por dependencia). */
-export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletionClass, now: Date): RunAdminAction | null {
+export function adminActionFor(
+  r: CompletionRow | undefined, cls: ItemCompletionClass, now: Date, job?: CompletionJob | null,
+  /** r62 (re-review m5-bis): fila vigente de la dependencia de un claim incompleto (si la hay). */
+  ctx?: { dep?: CompletionRow | null },
+): RunAdminAction | null {
   if (!r) return null;
   const key = r.item_key;
   const err = String(r.error ?? '');
@@ -524,6 +557,27 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
     return null; // bloqueado por una dependencia: la acción es la de la dependencia
   }
   if (r.status === 'cancelled') return null;
+  // r62 (M1): frenado por un control de gasto (kill switch / allow-list): el barrido lo reabre solo al revertirse.
+  const tickOn0 = autoHealEnabled(process.env);
+  if (tickOn0 && autoRecoveryEnabled(process.env) && spendControlHoldOf(err, r.type)) return null;
+  // r62 (M1): claim incompleto por el dato de la dependencia → lo resuelve el barrido (reapertura / regenerate_dependency)
+  // hasta que lo registra como excepción (claimPayloadRecovery.declined).
+  if (tickOn0 && autoRecoveryEnabled(process.env) && claimPayloadDependencyKey(r as any) && !s.claimPayloadRecovery?.declined) {
+    // r62 (re-review m5 / m5-bis): mientras la dependencia (video) no esté completada —viva, en vuelo o con su propia
+    // acción si falló— reintentar esta parte no sirve: sin acción acá. Completada, el barrido la reabre / regenera; el
+    // techo (el barrido falla en cada tick) se cuenta desde max(fallo de la parte, fin de la dependencia).
+    const dep = ctx?.dep ?? null;
+    // Viva / en vuelo (su propio estado) o fallida (su propia acción en este mismo run): nada acá. Cancelada / omitida u
+    // otro terminal sin salida (re-review 3): la acción reaparece con el techo contado desde el fin de la dependencia.
+    if (dep && (CLAIM_PAYLOAD_DEP_ALIVE.includes(dep.status) || dep.status === 'failed')) return null;
+    // Sin recuperación automática viva (dependencia cancelada / omitida, o el barrido ya la registró como no disponible):
+    // la acción es INMEDIATA (review lost_result); la espera del techo es solo para la recuperación que sigue en curso.
+    const depDead = (!!dep && CLAIM_PAYLOAD_DEP_DEAD.includes(dep.status)) || (r as any).attention_reason === 'dependency_unavailable';
+    const ms = (v: unknown) => (v ? new Date(v as any).getTime() : NaN);
+    const anchors = [ms(r.finished_at ?? r.updated_at), ms(dep?.finished_at)].filter((x) => Number.isFinite(x));
+    const cpAt = anchors.length ? Math.max(...anchors) : NaN;
+    if (!depDead && (!Number.isFinite(cpAt) || now.getTime() < cpAt + CLAIM_PAYLOAD_SWEEP_CEILING_MS)) return null;
+  }
   // El auto-healer todavía lo va a reabrir (allow-list, dentro de su ventana): sin acción humana.
   // REL MVP: id (semilla del jitter) y clase registrada → misma decisión que el barrido y el lock.
   const ahRow = { id: r.id, status: r.status, type: r.type, error: r.error ?? null, output_summary: s, finished_at: r.finished_at ?? null, updated_at: r.updated_at ?? null,
@@ -545,12 +599,20 @@ export function adminActionFor(r: CompletionRow | undefined, cls: ItemCompletion
   const adCeilingOk = !adFailedAt || !Number.isFinite(adFailedAt.getTime()) ||
     now.getTime() < adFailedAt.getTime() + AMBIGUOUS_AUDIO_RESUBMIT_BACKOFF_SECONDS * 1000 + 3 * autoHealIntervalMs(process.env);
   if (tickOn && adCeilingOk && (ad.heal === true || (ad.heal === false && ad.reason === 'backoff'))) return null;
+  // r62 (N2): render/generación fallida con id del proveedor o envío ambiguo que el barrido concilia y reenvía solo
+  // (dentro de su techo: espera + consulta máxima + 3 ticks; si lo declina, la acción de admin aparece).
+  if (tickOn && providerReconcilePending(ahRow, now, autoHealIntervalMs(process.env), undefined, job ? { id: job.id ?? null, created_at: job.created_at ?? null } : null)) return null;
   if (err.includes(PROVIDER_RECONCILIATION_REQUIRED)) {
     return { code: r.type === 'video' ? 'reconcile_videogen' : 'reconcile_provider', itemKey: key };
   }
   if (err.includes(BUDGET_EXCEEDED) || /budget_approval_required/.test(err)) return { code: 'approve_budget', itemKey: key };
   if (r.type === 'video') {
     if (/^(videogen_failed|videogen_submit_rejected)/.test(err)) return { code: 'retry_video_render', itemKey: key };
+    // r62 (N2): job vencido (tope único de render). Si la conciliación lo declinó, el motivo viaja en la acción.
+    if (/^videogen_render_overdue/.test(err)) {
+      const declined = String(s.providerReconcile?.declinedError ?? '') === err ? String(s.providerReconcile?.declined ?? '') : '';
+      return { code: 'retry_video_render', itemKey: key, ...(declined ? { reason: declined } : {}) };
+    }
     if (err.startsWith('ambiguous_video_submission') || (!!s.externalSubmitStartedAt && !s.external?.videogenJobId)) {
       return { code: 'reconcile_videogen', itemKey: key };
     }
@@ -603,13 +665,27 @@ export function evaluateRunCompletion(
     seen.add(k);
     actions.push(a);
   };
+  // r62 (M1): partes que el servidor está recuperando solo (fallidas sin acción humana, o bloqueadas por una de ellas).
+  let autoPending = false;
   for (const it of manifest.items) {
     const c = classes.get(it.key) as ItemCompletionClass;
-    if (c === 'not_done' || c === 'unvalidated') push(adminActionFor(rowsByKey.get(it.key), c, now));
+    if (c === 'not_done' || c === 'unvalidated') {
+      const row = rowsByKey.get(it.key);
+      const depKey = row ? claimPayloadDependencyKey(row as any) : null;
+      const a = adminActionFor(row, c, now, job, depKey ? { dep: rowsByKey.get(depKey) ?? null } : undefined);
+      push(a);
+      if (!a && c === 'not_done' && row && row.status === 'failed') autoPending = true;
+    }
   }
   if (previewComponents.some((k) => k.startsWith('video:')) && manifest.rulesVersion === 3) push({ code: 'generate_real_videos' });
   // V542 (G6): nunca se liberan solas (resultado incierto): una acción de admin por reserva.
   for (const r of opts.pendingVideogenReservations ?? []) {
+    // r62 (N2, d5): la reserva del intento vigente de una parte que el barrido va a conciliar sola no es un paso de admin.
+    const owner = rowsByKey.get(r.itemKey);
+    if (owner && String(owner.id ?? '') === r.itemRunId && autoHealEnabled(process.env) &&
+      providerReconcilePending({ id: owner.id, status: owner.status, type: owner.type, error: owner.error ?? null, output_summary: os(owner),
+        finished_at: owner.finished_at ?? null, updated_at: owner.updated_at ?? null }, now, autoHealIntervalMs(process.env), undefined,
+        { id: job.id ?? null, created_at: job.created_at ?? null })) continue;
     push({ code: 'reconcile_videogen_reservation', itemKey: r.itemKey, reservationKey: r.reservationKey, amount: r.amount, attemptState: r.attemptState, mayHaveRendered: r.mayHaveRendered });
   }
 
@@ -629,16 +705,18 @@ export function evaluateRunCompletion(
       for (const a of packageBlockActions(pkg.blocked, manifest)) push(a);
     } else if (st === 'failed' && !pending) {
       state = 'needs_attention';
-      push({ code: 'retry_package' });
+      // r62 (d7): la excepción de transitorios agotados lleva su motivo (el tope de fallos no transitorios, el de siempre).
+      push(pkg?.attentionReason === 'package_transient_exhausted' ? { code: 'retry_package', reason: pkg.attentionReason } : { code: 'retry_package' });
     } else if ((st === 'none' || st === 'stale') && !pending && pkg?.auto) {
       state = 'needs_attention';
-      push({ code: 'retry_package' });
+      push(pkg?.attentionReason === 'package_transient_exhausted' ? { code: 'retry_package', reason: pkg.attentionReason } : { code: 'retry_package' });
     } else state = 'packaging';
   } else if (nonPreviewMissing === 0 && previewComponents.length > 0) state = 'preview';
   else state = 'needs_attention';
 
   // §2.6: upgrade fallido de un run de vista previa → siempre recuperación (nunca «listo»).
   if (opts.upgradeOnlyFailure && state !== 'in_progress') state = 'needs_attention';
+  const autoRecovering = state === 'needs_attention' && actions.length === 0 && autoPending && autoHealEnabled(process.env);
 
   return {
     state,
@@ -648,6 +726,7 @@ export function evaluateRunCompletion(
     missingComponents,
     previewComponents,
     adminActions: actions,
+    ...(autoRecovering ? { autoRecovering: true } : {}),
     ...(generationComplete && pkg && pkg.status !== undefined
       ? { packageJob: {
           status: packageReady ? 'completed' : String(pkg.status ?? 'none'),
@@ -655,6 +734,10 @@ export function evaluateRunCompletion(
           auto: !!pkg.auto,
           ...(pkg.blocked && !packageReady ? { blocked: { code: pkg.blocked.code, message: pkg.blocked.message ?? null } } : {}),
           ...(pkg.held && !packageReady ? { held: true } : {}),
+          // r62 (d7): solo cuando aplican (contrato previo intacto).
+          ...(pkg.attentionReason && !packageReady ? { attentionReason: pkg.attentionReason } : {}),
+          ...(pkg.alert && !packageReady ? { alert: pkg.alert } : {}),
+          ...(pkg.nextRetryAt && !packageReady && pkg.autoRetryPending ? { nextRetryAt: pkg.nextRetryAt } : {}),
         } }
       : {}),
   };
@@ -743,7 +826,7 @@ export async function loadCompletionInputs(q: Q, jobId: string): Promise<{
   manifest: CompletionManifest;
 } | null> {
   const [job] = await q.query(
-    `select id, status, worker_status, input_payload from public.production_jobs where id = $1`,
+    `select id, status, worker_status, input_payload, created_at from public.production_jobs where id = $1`,
     [jobId],
   );
   if (!job) return null;

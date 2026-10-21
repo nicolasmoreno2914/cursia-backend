@@ -92,7 +92,7 @@ async function pureChecks() {
     eq(AH.autoHealDecision(row(B_ERR, { type: 'activity' }), NOW, L).reason, 'not_allow_listed', 'legacy: B no se toca');
   });
 
-  await check('puro A: rondas 1..5 con espera exponencial y jitter ±20 % determinista; ronda 6 → tope', () => {
+  await check('puro A: rondas 1..5 con espera exponencial y jitter ±20 % determinista; r62: después fase extendida (15 min…4 h) hasta 72 h → excepción', () => {
     const base = [30, 60, 120, 240, 480];
     for (let r = 0; r < 5; r++) {
       const os = r ? { autoHeal: { rounds: r } } : {};
@@ -104,7 +104,19 @@ async function pureChecks() {
       const after = AH.autoHealDecision(row(A_ERR, { os, secAgo: Math.ceil(w) + 1 }), NOW, P);
       eq([after.heal, after.round, after.kind, after.strategy], [true, r + 1, 'A', 'retry_backoff'], `ronda ${r + 1}`);
     }
-    eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 5 } } }), NOW, P).reason, 'cap_reached', 'tope 5');
+    // r62 (d2, cambio DELIBERADO): la 6.ª ronda ya no va a un humano: espera larga (15 min ± 20 %) y sigue.
+    const w6 = AH.autoHealWaitSeconds(P.extendedBackoffSeconds, 0, P.jitterRatio, 'item-1:X');
+    assert(w6 >= 900 * 0.8 - 1e-9 && w6 <= 900 * 1.2 + 1e-9, `ronda 6: espera ${w6}`);
+    eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 5 } }, secAgo: Math.floor(w6) - 1 }), NOW, P).reason, 'backoff', 'ronda 6 antes de su espera larga');
+    const r6 = AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 5 } }, secAgo: Math.ceil(w6) + 1 }), NOW, P);
+    eq([r6.heal, r6.round, r6.extended], [true, 6, true], 'ronda 6 (extendida)');
+    // Ventana total: alerta desde las 48 h, excepción pasadas las 72 h (desde la primera ronda).
+    const firstAt = (h) => new Date(NOW.getTime() - h * 3600e3).toISOString();
+    const r48 = AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 12, firstAt: firstAt(50) } }, secAgo: 5 * 3600 }), NOW, P);
+    eq([r48.heal, r48.alert], [true, true], 'alerta a las 48 h');
+    eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 12, firstAt: firstAt(73) } }, secAgo: 5 * 3600 }), NOW, P).reason, 'recovery_window_exhausted', 'excepción a las 72 h');
+    // Sin fase extendida (legacy / kill-switch): el tope de siempre.
+    eq(AH.autoHealDecision(row(A_ERR, { os: { autoHeal: { rounds: 5 } } }), NOW, { ...P, extendedBackoffSeconds: [] }).reason, 'cap_reached', 'tope 5 sin fase extendida');
     // El jitter cambia entre items (no todos reintentan a la vez).
     const ws = new Set(['a', 'b', 'c', 'd', 'e', 'f'].map((s) => AH.autoHealWaitSeconds(P.backoffSeconds, 0, P.jitterRatio, s).toFixed(3)));
     assert(ws.size > 1, 'jitter por item');
@@ -382,7 +394,7 @@ async function dbChecks() {
       eq([last.outcome, last.actor, last.strategy_applied, last.recovery_round], ['reopened', 'auto_heal', 'auto_heal_retry:retry_backoff', 1], 'log de intentos');
     });
 
-    await check('DB A: rondas 2..5 cada una tras su espera (1, 2, 4, 8 min ± 20 %); la 6.ª no (tope) → marca «no elegible», fuera del SQL, y la acción humana aparece', async () => {
+    await check('DB A: rondas 2..5 cada una tras su espera (1, 2, 4, 8 min ± 20 %); r62: la 6.ª tras la espera larga (fase extendida); agotada la ventana de 72 h → excepción registrada (attention_reason) y la acción humana aparece', async () => {
       const it = await itemRow(C.runId, contentKey);
       const waits = [60, 120, 240, 480];
       for (let i = 0; i < 4; i++) {
@@ -391,15 +403,26 @@ async function dbChecks() {
         await failAt(it.id, A_ERR, Math.ceil(waits[i] * 1.2) + 2);
         eq((await heal(0)).reopened.filter((x) => x.itemKey === contentKey).map((x) => x.round), [i + 2], `ronda ${i + 2}`);
       }
-      await failAt(it.id, A_ERR, 3600);
+      // r62 (d2): la 6.ª ronda (fase extendida) no antes de su espera larga (≥ 12 min) y sí después (≤ 18 min).
+      await failAt(it.id, A_ERR, 600);
       let r = await heal(0);
-      eq(r.reopened.map((x) => x.itemKey).includes(contentKey), false, 'tope de 5');
-      eq(r.skipped.filter((x) => x.itemKey === contentKey).length, 0, 'ni siquiera candidato (tope A en el SQL)');
-      eq(AH.autoHealDecision({ ...(await itemRow(C.runId, contentKey)), finished_at: new Date(Date.now() - 3600e3) }, new Date(), P).reason, 'cap_reached', 'JS: tope');
-      eq((await itemRow(C.runId, contentKey)).status, 'failed', 'queda failed');
+      eq(r.reopened.map((x) => x.itemKey).includes(contentKey), false, 'ronda 6: antes de la espera larga');
+      await failAt(it.id, A_ERR, 3600);
+      r = await heal(0);
+      eq(r.reopened.filter((x) => x.itemKey === contentKey).map((x) => [x.round, !!x.extended]), [[6, true]], 'ronda 6 extendida');
+      const r6 = await itemRow(C.runId, contentKey);
+      assert(typeof r6.output_summary.autoHeal.firstAt === 'string', 'firstAt registrado');
+      // Ventana agotada (primera ronda hace 73 h) → excepción registrada, fuera del SQL, acción humana visible.
+      await failAt(it.id, A_ERR, 5 * 3600, `jsonb_set(output_summary, '{autoHeal,firstAt}', to_jsonb((now() - interval '73 hours')::text))`);
+      r = await heal(0);
+      eq(r.reopened.map((x) => x.itemKey).includes(contentKey), false, 'ventana agotada: no se reabre');
+      eq(r.skipped.filter((x) => x.itemKey === contentKey).map((x) => x.reason), ['recovery_window_exhausted'], 'motivo');
+      const ex = await itemRow(C.runId, contentKey);
+      eq([ex.status, ex.output_summary.autoHeal.ineligibleReason, ex.attention_reason], ['failed', 'recovery_window_exhausted', 'unrecoverable'], 'excepción registrada');
+      eq((await heal(0)).skipped.filter((x) => x.itemKey === contentKey).length, 0, 'ya no es candidato (marca «no elegible»)');
       const run = await runs.getRun(C.cid, OWNER, 1, C.runId);
       assert((run.completion.adminActions || []).some((a) => a.itemKey === contentKey), 'acción humana visible: ' + JSON.stringify(run.completion.adminActions));
-      eq((await attempts(it.id)).filter((a) => a.outcome === 'reopened' && a.actor === 'auto_heal').length, 5, '5 rondas en el log');
+      eq((await attempts(it.id)).filter((a) => a.outcome === 'reopened' && a.actor === 'auto_heal').length, 6, '6 rondas en el log');
     });
 
     // ═══ B ════════════════════════════════════════════════════════════════════
@@ -552,7 +575,8 @@ async function dbChecks() {
 
     await check('DB empaque: fallo transitorio / de build sin item → el reintento acotado de siempre (re-empaqueta)', async () => {
       const G = await completedRun('REL MVP transitorio');
-      await failedPkgJob(G, 'PACKAGING_V3_CONTENT_MISSING: el Storage no respondió (ETIMEDOUT)');
+      // r62 (P, review I1): un transitorio real de Storage (CONTENT_MISSING ahora es determinista → reparación por item).
+      await failedPkgJob(G, 'Supabase Storage download failed: 503 el Storage no respondió (ETIMEDOUT)');
       const n0 = pkgCalls.length;
       const out = await autoPkg.ensure(G.runId, 'sweep');
       eq(out.action, 'enqueued', 'reintento');

@@ -29,6 +29,7 @@
 //    pagarse: un re-claim no vuelve a pagar nada de lo guardado.
 //  - Las claves se leen del entorno en cada item y nunca se loguean.
 // ─────────────────────────────────────────────────────────────────────────────
+import { markLostResultResendCharge, persistedPaidOpIds, lostResultConsumeMark } from '../../modules/dynamic-generation/lost-result';
 import { createHash } from 'crypto';
 import type { Logger } from '@nestjs/common';
 import type { DataSource } from 'typeorm';
@@ -140,6 +141,18 @@ export function isDefinitiveRejection(err: unknown): boolean {
   // Review (minor): 408 (timeout del lado del proveedor) y 409 (conflicto: p.ej. ya existe) NO prueban
   // que el pedido no se procesó → ambiguos, nunca "sin gasto".
   return err instanceof ProviderCallError && err.status !== null && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 409;
+}
+
+/**
+ * r62 (K2, regla de ambigüedad acotada punto 4; review N1 C1): solo un RECHAZO DE ADMISIÓN del proveedor es un resultado
+ * CONOCIDO sin cobro: 429 (rate limit), 503 (servicio no disponible) y 529 (sobrecarga). La reserva se libera y el intento
+ * se reintenta con backoff (clase A). 500/502/504/524 —un gateway que corta mientras el upstream sigue trabajando, como
+ * los cuelgues de 125–172 s que OpenAI terminó y COBRÓ (phase-b-n1-tts-root-cause.md)— y 408/409 son AMBIGUOS: la
+ * reserva queda y van por la reconciliación con el reenvío único acotado de K1 (possible_duplicate).
+ */
+export const TTS_KNOWN_NOT_CHARGED_STATUSES: readonly number[] = Object.freeze([429, 503, 529]);
+export function isKnownTransientHttpError(err: unknown): boolean {
+  return err instanceof ProviderCallError && err.status !== null && TTS_KNOWN_NOT_CHARGED_STATUSES.includes(err.status);
 }
 
 export interface RealProviderDeps {
@@ -819,6 +832,20 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
   const unitKeys: string[] = [];
   const calledChunks = new Set<number>();
   let unitDone = false;
+  const deferredSettles: Array<{ key: string; charge: ReturnType<typeof ttsChargeInput> }> = [];
+  const settleDeferred = async () => {
+    while (deferredSettles.length) {
+      const d = deferredSettles[0];
+      await settlePaidCall(deps.finops, d.key, d.charge, 'openai_tts_measured');
+      deferredSettles.shift();
+      await consumeLostResultMark(deps, item, d.charge);
+    }
+  };
+  // Defensa (review I1): un fallo de resultado CONOCIDO (que reconoce el intento) exige lo cobrado ya liquidado.
+  const failKnown = async (message: string): Promise<never> => {
+    if (deferredSettles.length) throw new Error(`invariante r62: ${deferredSettles.length} trozo(s) cobrado(s) sin liquidar antes de reconocer el intento`);
+    return fail(deps, item, message, true, { knownOutcome: true });
+  };
   try {
   for (let i = 0; i < chunks.length; i++) {
     // R16 (#1): solo ANTES del primer chunk (nada pagado sin persistir). A mitad del audio
@@ -848,6 +875,17 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
         await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
         if (ttsTracker) ttsTracker.inFlight = null;
       }
+      if (isKnownTransientHttpError(err)) {
+        // r62 (K2): respuesta de error del proveedor = sin cobro → se libera la reserva; los trozos anteriores de este
+        // intento quedaron cobrados y MEDIDOS (resultado conocido): el intento se reconoce y se reintenta (clase A).
+        await settlePaidCall(deps.finops, resKey, null, 'openai_tts_http_error_not_charged');
+        if (ttsTracker) ttsTracker.inFlight = null;
+        // r62 (review lost_result I1): los trozos YA cobrados de este intento se liquidan ANTES de reconocer el intento
+        // (fail knownOutcome escribe el ack): nunca una reserva cobrada detrás del ack. Si la liquidación falla, se lanza
+        // (sin ack) y el intento queda en reconciliación con sus reservas visibles para el reenvío acotado.
+        await settleDeferred();
+        return await failKnown(`tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`);
+      }
       return await fail(deps, item, `tts_failed: chunk ${i + 1}/${chunks.length}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
     }
     if (ttsTracker && ttsTracker.inFlight) ttsTracker.inFlight.opId = res.requestId;
@@ -858,22 +896,28 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
       seconds = null;
     }
     // Cargo por x-request-id (idempotente: la misma operación = un solo cargo) + reserva a 0, atómico.
-    await settlePaidCall(deps.finops, resKey, ttsChargeInput({
+    // r62 (E2E M, «resultado pagado perdido» — minimizarlo): la liquidación se DIFIERE hasta que el MP3 quede subido
+    // (Storage + artifact). Un kill antes de subir deja las reservas pendientes y marcadas (ambiguo acotado de K1); uno
+    // después de subir lo completa priorPaidBlock reutilizando el artifact y liquidando lo pendiente. Toda salida que no
+    // sea un kill (falla conocida, error) liquida igual lo diferido (finally): el cargo nunca se pierde.
+    deferredSettles.push({ key: resKey, charge: markLostResultResendCharge(ttsChargeInput({
       ownerId, itemRunId: item.itemRunId, requestId: res.requestId, audioSeconds: seconds, characters: chunks[chunkIdx].length,
       model, generation: item.generation ?? 1, chunk: chunkIdx, itemAttempt: item.attempt,
-    }), 'openai_tts_measured');
+    }), item.outputSummary, item.attempt) });
     if (res.requestId) paidTtsOps.push(res.requestId);
     if (ttsTracker) {
       ttsTracker.inFlight = null;
       ttsTracker.unpersistedPaidOutput = { provider: 'openai', what: 'audio TTS pagado sin persistir', opIds: [...paidTtsOps] };
     }
-    if (seconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el chunk ${i + 1}/${chunks.length} de ${item.itemKey} no es un MP3 medible`, true, { knownOutcome: true });
+    if (seconds === null) { await settleDeferred(); await failKnown(`TTS_AUDIO_INVALID: el chunk ${i + 1}/${chunks.length} de ${item.itemKey} no es un MP3 medible`); }
     requestIds.push(res.requestId);
     // Mismo transcode que tts.service (64 kbps mono; sin ffmpeg → el original, como hoy).
     parts.push(await transcodeMp3Bitrate(res.audio, TTS_TARGET_BITRATE_KBPS));
   }
   unitDone = true;
   } finally {
+    // r62: una salida del bucle que no es un kill liquida lo ya cobrado (resultado conocido, aunque se pierda).
+    if (!unitDone) await settleDeferred().catch((e) => deps.logger.warn(`Item ${item.itemKey}: no se pudo liquidar un chunk cobrado (${e instanceof Error ? e.message : String(e)}); queda la reserva (se concilia al re-reclamar)`));
     // Reservas de chunks que NUNCA se enviaron (la unidad terminó antes): se liberan (sin gasto). Un chunk enviado
     // con resultado incierto conserva su reserva (conciliación), como siempre.
     if (!unitDone) {
@@ -895,11 +939,14 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     mp3 = concatMp3(parts);
     durationSeconds = mp3DurationSeconds(mp3);
   } catch (err) {
-    return fail(deps, item, `TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`, true, { knownOutcome: true });
+    await settleDeferred();
+    return failKnown(`TTS_AUDIO_INVALID: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (!deps.artifacts.uploadBufferArtifact) throw new Error('dynamic-provider-worker: artifacts sin uploadBufferArtifact (modo real)');
+  if (!deps.artifacts.uploadBufferArtifact) { await settleDeferred(); throw new Error('dynamic-provider-worker: artifacts sin uploadBufferArtifact (modo real)'); }
   const entity = item.chapterId ?? 'course';
-  const row = await deps.artifacts.uploadBufferArtifact({
+  let row: Awaited<ReturnType<NonNullable<typeof deps.artifacts.uploadBufferArtifact>>>;
+  try {
+  row = await deps.artifacts.uploadBufferArtifact({
     ownerId,
     courseId: item.artifactCourseId,
     jobId: item.runId,
@@ -915,6 +962,11 @@ export async function processRealAudio(deps: RealProviderDeps, item: ClaimedItem
     upsert: false,
   });
   if (ttsTracker) ttsTracker.unpersistedPaidOutput = null; // el audio pagado ya está en el Storage + artifact
+  } finally {
+    // Subido o no (error de Storage): lo cobrado queda registrado. Subido → ya no hay resultado pagado sin persistir: si
+    // la liquidación falla, el re-claim reutiliza el artifact y liquida lo pendiente (nunca reconciliación ni repago).
+    await settleDeferred();
+  }
   const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
     artifactIds: [row.id],
     summary: { mode: 'real', provider: 'openai', model, voice, durationSeconds, chunks: chunks.length, scriptSha256: sha256(script) },
@@ -970,6 +1022,12 @@ export interface PersistedSegment {
   bytes: number;
   words: number;
   chars: number;
+  /** r62: reserva del segmento y su medición (para liquidarla al reanudar si el worker murió entre guardar y liquidar). */
+  reservationKey?: string;
+  rawSeconds?: number | null;
+  model?: string;
+  segIndex?: number;
+  attempt?: number;
 }
 
 function validPlan(p: unknown): p is PersistedAudiobookPlan {
@@ -999,13 +1057,7 @@ function wpmOf(words: number, seconds: number): number {
 
 /** Operaciones pagadas cuyo resultado YA está guardado en el item (msg_… de bloques, x-request-id de segmentos) o se descartó a sabiendas. */
 export function persistedAudiobookOps(os: Record<string, any> | null | undefined): Set<string> {
-  const ids = new Set<string>();
-  for (const s of Object.values((os?.audiobookSections ?? {}) as Record<string, PersistedSectionScript>)) for (const m of s?.messageIds ?? []) if (m) ids.add(m);
-  for (const g of Object.values((os?.audioSegments ?? {}) as Record<string, PersistedSegment>)) if (g?.requestId) ids.add(g.requestId);
-  for (const list of Object.values((os?.audiobookExtensions ?? {}) as Record<string, PersistedExtension[]>)) for (const e of list ?? []) for (const m of e?.messageIds ?? []) if (m) ids.add(m);
-  // Descartados a sabiendas (segmento guardado corrupto, bloque repetido): resultado conocido, ya regenerado.
-  for (const d of Array.isArray(os?.audiobookDiscardedOps) ? os.audiobookDiscardedOps : []) if (typeof d === 'string' && d) ids.add(d);
-  return ids;
+  return persistedPaidOpIds(os);
 }
 
 /** Ampliación aceptada de un bloque (fix round 1, I1): output_summary.audiobookExtensions[idx][n]. */
@@ -1140,12 +1192,12 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     }
     if (tracker && tracker.inFlight) tracker.inFlight.opId = r.messageId;
     // Medición server-side (HD-V21-17): cargo por msg_… + reserva a 0, atómico. Error → reconciliación.
-    await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
+    { const lrCharge = markLostResultResendCharge(serverLlmChargeInput({
       ownerId, itemRunId: item.itemRunId, model: scriptModel, messageId: r.messageId, requestId: r.requestId, usage: r.usage,
       // r19 (#642): la condensación de un bloque largo es una corrección por validación (banda 85–110 %).
       callRole: role === 'continuation' ? 'continuation' : role === 'condense' ? 'validation_retry' : 'main',
       attempt: itemRole.attempt,
-    }), 'anthropic_measured');
+    }), item.outputSummary, item.attempt); await settlePaidCall(deps.finops, resKey, lrCharge, 'anthropic_measured'); await consumeLostResultMark(deps, item, lrCharge); }
     paidIds.push(r.messageId);
     if (tracker) {
       tracker.inFlight = null;
@@ -1298,9 +1350,12 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       // Calibración #2: reserva DURABLE del segmento antes de llamar (si falla, no se llama a OpenAI).
       const resKey = await reservePaidCall(deps.finops, {
         kind: 'tts', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
-        tag: `seg:${seg.key}`, estimate: { characters: seg.chars, model },
+        tag: `seg:${seg.key}`, estimate: { characters: seg.chars, model }, sendMarked: true,
       });
       if (tracker) tracker.inFlight = { provider: 'openai', key: resKey };
+      // r62 (E2E M): marca DURABLE de envío justo antes de llamar: si el worker muere entre la reserva y el envío, el
+      // próximo intento ve la reserva sin marca (`sendMarked` sin `paidCallsSent`) y la libera sola (nunca salió).
+      await markPaidCallSent(deps, item, resKey);
       let res;
       try {
         res = await tts.speech({ model, voice, input: seg.text });
@@ -1310,21 +1365,38 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
           await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
           if (tracker) tracker.inFlight = null;
         }
+        const knownHttp = isKnownTransientHttpError(err);
+        if (knownHttp) {
+          // r62 (K2): respuesta de error del proveedor = sin cobro → se libera la reserva y se reintenta (clase A).
+          await settlePaidCall(deps.finops, resKey, null, 'openai_tts_http_error_not_charged');
+          if (tracker) tracker.inFlight = null;
+        }
         // «persisted k»: los k segmentos anteriores ya están guardados → ningún trozo pagado sin guardar (clase A).
-        await fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
+        await fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, knownHttp ? true : e ? e.retryable : true,
+          knownHttp ? { knownOutcome: true } : {});
         return null;
       }
       if (tracker && tracker.inFlight) tracker.inFlight.opId = res.requestId;
       let rawSeconds: number | null = null;
       try { rawSeconds = mp3DurationSeconds(res.audio); } catch { rawSeconds = null; }
-      await settlePaidCall(deps.finops, resKey, ttsChargeInput({
-        ownerId, itemRunId: item.itemRunId, requestId: res.requestId, audioSeconds: rawSeconds, characters: seg.chars,
-        model, generation: item.generation ?? 1, chunk: k, itemAttempt: item.attempt,
-      }), 'openai_tts_measured');
-      if (tracker) {
-        tracker.inFlight = null;
-        tracker.unpersistedPaidOutput = { provider: 'openai', what: `segmento ${seg.key} del audiolibro pagado sin persistir`, opIds: res.requestId ? [res.requestId] : [] };
-      }
+      // r62 (E2E M, «resultado pagado perdido» — minimizarlo): el segmento se GUARDA (Storage + output_summary, con la
+      // clave de su reserva) ANTES de liquidar. Un kill entre guardar y liquidar deja la reserva pendiente con su segmento
+      // guardado: el próximo claim la liquida con el cargo medido (priorPaidBlock) y reutiliza el segmento, sin repagar.
+      // Las fallas CONOCIDAS de abajo (audio inválido, ritmo, duplicado) liquidan primero (resultado conocido y pagado).
+      let segSettled = false;
+      const settleSeg = async () => {
+        if (segSettled) return;
+        { const lrCharge = markLostResultResendCharge(ttsChargeInput({
+          ownerId, itemRunId: item.itemRunId, requestId: res.requestId, audioSeconds: rawSeconds, characters: seg.chars,
+          model, generation: item.generation ?? 1, chunk: k, itemAttempt: item.attempt,
+        }), item.outputSummary, item.attempt); await settlePaidCall(deps.finops, resKey, lrCharge, 'openai_tts_measured'); await consumeLostResultMark(deps, item, lrCharge); }
+        segSettled = true;
+        if (tracker) {
+          tracker.inFlight = null;
+          tracker.unpersistedPaidOutput = { provider: 'openai', what: `segmento ${seg.key} del audiolibro pagado sin persistir`, opIds: res.requestId ? [res.requestId] : [] };
+        }
+      };
+      if (rawSeconds === null) await settleSeg();
       if (rawSeconds === null) await fail(deps, item, `TTS_AUDIO_INVALID: el segmento ${k + 1}/${segs.length} (${seg.key}) de ${item.itemKey} no es un MP3 medible`, true, { knownOutcome: true });
       // r19 A4: el audiolibro va a 48 kbps mono (transcode existente; sin ffmpeg → el original, como hoy).
       const buf = await transcodeMp3Bitrate(res.audio, AUDIOBOOK_TARGET_BITRATE_KBPS);
@@ -1332,18 +1404,21 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       try {
         info = mp3FrameInfo(buf);
       } catch (err) {
+        await settleSeg();
         await fail(deps, item, `TTS_AUDIO_INVALID: el segmento ${seg.key} no es un MP3 válido tras el transcode (${err instanceof Error ? err.message : String(err)})`, true, { knownOutcome: true });
         return null;
       }
       const wpm = wpmOf(seg.words, info.seconds);
       if (seg.words >= AUDIOBOOK_WPM_MIN_WORDS && (wpm < AUDIOBOOK_WPM_MIN || wpm > AUDIOBOOK_WPM_MAX)) {
         // Voz ralentizada, relleno o bucle: el segmento NO se guarda como válido → el reintento lo regenera.
+        await settleSeg();
         await fail(deps, item, `AUDIO_WPM_OUT_OF_RANGE: el segmento ${seg.key} narra ${seg.words} palabras en ${info.seconds.toFixed(2)} s (${wpm} ppm; aceptado ${AUDIOBOOK_WPM_MIN}–${AUDIOBOOK_WPM_MAX})`, true, { knownOutcome: true });
         return null;
       }
       const audioSha = sha256(buf);
       const dup = Object.entries(segState).find(([key, g]) => key !== seg.key && g.audioSha === audioSha);
       if (dup) {
+        await settleSeg();
         await fail(deps, item, `AUDIOBOOK_SEGMENT_DUPLICATE: el audio del segmento ${seg.key} es idéntico al de ${dup[0]}`, true, { knownOutcome: true });
         return null;
       }
@@ -1354,9 +1429,15 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       segState[seg.key] = {
         sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, textSha: seg.textSha, audioSha, frames: info.frames, seconds: info.seconds,
         bitrateKbps: info.bitrateKbps, requestId: res.requestId, storagePath, bytes: buf.length, words: seg.words, chars: seg.chars,
+        // r62: para liquidar al reanudar si el worker murió entre guardar y liquidar.
+        reservationKey: resKey, rawSeconds, model, segIndex: k, attempt: item.attempt,
       };
       await record(deps, item, { audioSegments: segState });
-      if (tracker) tracker.unpersistedPaidOutput = null;
+      // r62 (review lost_result M4): guardado → nada en el aire. Si la liquidación falla, es un transitorio: el próximo
+      // claim liquida el segmento guardado con su medición (priorPaidBlock) sin gastar el único reenvío ambiguo.
+      if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; }
+      segSettled = false;
+      try { await settleSeg(); } finally { if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; } }
       parts.push(buf);
       manifestSegs.push({ key: seg.key, sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, words: seg.words, chars: seg.chars, textSha: seg.textSha,
         audioSha, frames: info.frames, seconds: info.seconds, bitrateKbps: info.bitrateKbps, requestId: res.requestId, storagePath });
@@ -1572,6 +1653,30 @@ export async function processRealProviderItem(deps: RealProviderDeps, item: Clai
   }
 }
 
+/**
+ * r62 (review lost_result, duda 3): la marca del reenvío por resultado perdido se CONSUME en el intento que de verdad
+ * reenvía (el primero que registra un cargo marcado), aunque no sea N+1 (p. ej. N+1 cayó antes de llegar al proveedor).
+ */
+async function consumeLostResultMark(deps: RealProviderDeps, item: ClaimedItem, charge: { metadata?: Record<string, unknown> | null } | null): Promise<void> {
+  const patch = lostResultConsumeMark(item.outputSummary, item.attempt, charge);
+  if (!patch) return;
+  item.outputSummary = { ...(item.outputSummary ?? {}), ...patch };
+  await record(deps, item, patch).catch((e) => deps.logger.warn(`Item ${item.itemKey}: no se pudo registrar el consumo de la marca lost_result (${e instanceof Error ? e.message : String(e)})`));
+}
+
+/** r62: reservas pendientes de intentos anteriores de un item cuyo audio YA quedó subido → cobradas (conservador). */
+async function settleUploadedUnitReservations(deps: RealProviderDeps, item: ClaimedItem): Promise<void> {
+  const l = deps.finops;
+  if (!l || !l.itemPaidCharges || typeof l.reconcileReservationAsCharged !== 'function') return;
+  const rows = await l.itemPaidCharges(item.itemRunId).catch(() => []);
+  for (const r of rows) {
+    if (!r.reservation || r.settled || r.attempt >= item.attempt) continue;
+    await l.reconcileReservationAsCharged(r.idempotency_key, 'auto: audio ya subido con la reserva sin liquidar (kill entre subir y liquidar); se cuenta su cota', {
+      decidedBy: 'system', recordedBy: 'auto-recovery', metadata: { auto: true, resultPersisted: true, rule: 'r62_lost_result' },
+    }).catch((e) => deps.logger.warn(`Item ${item.itemKey}: no se pudo liquidar ${r.idempotency_key} (${e instanceof Error ? e.message : String(e)})`));
+  }
+}
+
 /** Item bloqueado por una operación pagada previa sin resultado → true (ya quedó en reconciliación). */
 async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId: string): Promise<boolean> {
   // Sin ledger cableado, la configuración se valida primero; la reserva (antes de cualquier llamada)
@@ -1593,6 +1698,9 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
     if (prev) {
       const m = (prev.metadata ?? {}) as Record<string, any>;
       deps.logger.warn(`Item ${item.itemKey}: el audio ya estaba subido (artifact ${prev.id}) — se completa sin volver a llamar a OpenAI`);
+      // r62 (E2E M): el worker murió entre subir y liquidar → las reservas de esos trozos siguen pendientes: se liquidan
+      // como cobradas (conservador: su cota; el resultado existe, no es un duplicado) para no dejarlas abiertas.
+      await settleUploadedUnitReservations(deps, item);
       const ok = await deps.scheduler.completeItem(item.itemRunId, deps.executorId, {
         artifactIds: [prev.id],
         summary: {
@@ -1615,6 +1723,22 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
   // r19: bloques del guion y segmentos de TTS guardados = su operación pagada ya tiene resultado persistido
   // (se reutiliza, nunca se repaga); solo una operación SIN resultado guardado bloquea.
   const persisted = item.type === 'audiobook_chapter' ? persistedAudiobookOps(os) : new Set<string>();
+  // r62 (E2E M): un segmento GUARDADO cuya reserva quedó pendiente (kill entre guardar y liquidar) se liquida acá con su
+  // cargo medido (idempotente por x-request-id): su resultado existe, no hay nada ambiguo ni que repagar.
+  if (item.type === 'audiobook_chapter' && deps.finops.itemPaidCharges) {
+    const segs = Object.values((os.audioSegments ?? {}) as Record<string, PersistedSegment>).filter((g) => g && typeof g.reservationKey === 'string' && g.requestId);
+    if (segs.length) {
+      const open = new Set((await deps.finops.itemPaidCharges(item.itemRunId)).filter((r) => r.reservation && !r.settled).map((r) => r.idempotency_key));
+      for (const g of segs) {
+        if (!open.has(g.reservationKey as string)) continue;
+        const att = Number(g.attempt) || Number(/:a(\d+):/.exec(String(g.reservationKey))?.[1] ?? item.attempt);
+        await settlePaidCall(deps.finops, g.reservationKey as string, ttsChargeInput({
+          ownerId, itemRunId: item.itemRunId, requestId: g.requestId, audioSeconds: g.rawSeconds ?? null, characters: g.chars,
+          model: g.model || 'gpt-4o-mini-tts', generation: item.generation ?? 1, chunk: typeof g.segIndex === 'number' ? g.segIndex : g.partIdx, itemAttempt: att,
+        }), 'openai_tts_measured_on_resume');
+      }
+    }
+  }
   const markedKey = typeof os.externalReservationKey === 'string' ? os.externalReservationKey : null;
   const { blocking, releasable } = await priorPaidOperations(deps.finops, item.itemRunId, {
     currentAttempt: item.attempt,
@@ -1623,8 +1747,10 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
     isPersistedOutput: (r) => !r.reservation && !!r.external_operation_id && persisted.has(r.external_operation_id),
     // Gamma: el marcador de envío se escribe DESPUÉS de la reserva y ANTES de llamar. Una reserva de
     // Gamma sin marcador que la nombre = la llamada nunca se hizo → se libera.
-    isSubmitMarked: (key) => {
+    isSubmitMarked: (key, row) => {
       if (key.startsWith('reservation:gamma:')) return key === markedKey;
+      // r62 (E2E M): reserva con marca durable de envío (segmento del audiolibro) → enviada solo si tiene su marca.
+      if (row && row.send_marked) return !!(os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object' && os[PAID_CALLS_SENT_KEY][key]);
       // Review r2 (N1): reserva de unidad sin marcador de envío = nunca salió → liberable.
       if (isUnitReservationKey(key)) return !!(os[PAID_CALLS_SENT_KEY] && typeof os[PAID_CALLS_SENT_KEY] === 'object' && os[PAID_CALLS_SENT_KEY][key]);
       return true;
@@ -1648,9 +1774,12 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
   for (const r of releasable) await settlePaidCall(deps.finops, r.idempotency_key, null, 'reserved_without_submit_marker');
   if (!blocking.length) return false;
   const what = blocking.map((b) => `${b.provider} ${b.external_operation_id ?? b.idempotency_key} (intento ${b.attempt})`).join('; ');
+  // r62 (review lost_result M1): textos DISTINTOS — un cargo ya LIQUIDADO sin resultado guardado («sin resultado
+  // persistido», el caso lost_result) vs. una reserva ENVIADA y sin liquidar («sin liquidar», ambiguo de K1).
+  const pendingRes = blocking.some((b) => b.reservation && !b.settled);
   const msg = reconciliationMessage(
     blocking[0].provider,
-    'operación pagada de un intento anterior sin resultado persistido',
+    pendingRes ? 'operación pagada de un intento anterior enviada y sin liquidar' : 'operación pagada de un intento anterior sin resultado persistido',
     `${what}. No se llamó al proveedor en este intento.`,
   );
   deps.logger.error(`Item ${item.itemKey}: ${msg}`);

@@ -3857,10 +3857,16 @@ function reservationBookkeeping(ev) {
       const LLM_TYPES = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'exam', 'final_exam'];
       // Loop 6: instante de activación — el worker y el ruteo aplican solo a runs creados desde acá.
       const LLM_SINCE = new Date(Date.now() - 1000).toISOString();
+      const E24_CALL_TIMEOUT_MS = 150000;
+      const E24_IN_FLIGHT_WINDOW_MS = E24_CALL_TIMEOUT_MS + 30000; // IN_FLIGHT_MARGIN_MS (lease-takeover.ts)
       const wEnv = (id) => ({
         ...baseEnv(), DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: LLM_SINCE, ANTHROPIC_API_BASE_URL: fake.url, DYNAMIC_LLM_WORKER_ID: id,
         DYNAMIC_LLM_WORKER_POLL_MS: '300', DYNAMIC_LLM_WORKER_LEASE_SECONDS: '15', DYNAMIC_LLM_WORKER_HEARTBEAT_MS: '3000',
         DYNAMIC_LLM_WORKER_IDLE_MS: '30000', DYNAMIC_LLM_WORKER_CONCURRENCY: '2', DYNAMIC_LLM_WORKER_BACKOFF_MS: '20', DYNAMIC_WORKER_DRAIN_TIMEOUT_MS: '90000',
+        // r62 (gate E2E): timeout total de la llamada acotado (> la generación lenta de 105 s). La ventana en vuelo de Q-21
+        // (r61) es ese timeout + 30 s: con el default de 15 min, la toma de la parte con el solucionario colgado esperaba
+        // 930 s antes del reenvío ambiguo único y el run no cabía en los 15 min del test. Producción no cambia.
+        DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS: String(E24_CALL_TIMEOUT_MS),
       });
       const waitFor = async (label, fn, timeoutMs = 240000, everyMs = 500) => {
         const t0 = Date.now();
@@ -3872,6 +3878,9 @@ function reservationBookkeeping(ev) {
       const finished = async (runId) => q(`select item_key, type, status, worker_id, finished_at, error, output_summary, attempt_count, max_attempts from public.generation_item_runs where job_id = $1 order by item_key`, [runId]);
       const unsettledRes = async (itemRunId) => (await q(`select count(*)::int n from public.generation_cost_events e where e.idempotency_key like $1 and (e.metadata->>'reservation') = 'true'
           and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [`reservation:llm:${itemRunId}:%`]))[0].n;
+      // r62 (N1): ajustes possible_duplicate (actor system) sobre las reservas de una parte.
+      const pdAdj = async (itemRunId) => (await q(`select count(*)::int n from public.generation_cost_events a join public.generation_cost_events e on e.id = a.corrects_event_id
+          where e.idempotency_key like $1 and a.event_kind = 'ADJUSTMENT' and coalesce(a.metadata->>'possibleDuplicate', '') = 'true'`, [`reservation:llm:${itemRunId}:%`]))[0].n;
       const startRun = async (c, title) => {
         const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { nombre: title, ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
         ok(start.status === 201, `E24: run mock creado (${title})`, { s: start.status, e: start.error });
@@ -3950,16 +3959,18 @@ function reservationBookkeeping(ev) {
         const exp2Row = rows.find((i) => i.type === 'experience' && exp2.length && i.status === 'completed' && i.item_key.endsWith(c.mods[0].chapters[1].id));
         ok(exp2.length >= 2 && exp2[0].outcome === 'dropped' && exp2.some((r) => r.outcome === 'ok') && exp2Row, 'E24: resultado DESCONOCIDO (sin respuesta) → UN reintento automático → la experiencia se completó sin intervención', exp2.map((r) => r.outcome));
         const expItem = (await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c.runId, `experience:${c.mods[0].chapters[1].id}`]))[0];
-        eq(await unsettledRes(expItem.id), 1, 'E24: el desconocido quedó como UNA reserva pendiente (cuenta en el presupuesto; se concilia después)');
-        // Conciliación humana (SUPER_ADMIN) de las reservas del worker: listadas y conciliables, una sola vez.
+        // r62 (N1, regla de ambigüedad acotada, punto 3): antes del reenvío ÚNICO, la reserva perdida se liquida como cobrada
+        // (conservador: ya contaba como gasto) con la marca possible_duplicate y actor system → 0 reservas abiertas.
+        eq(await unsettledRes(expItem.id), 0, 'E24: el desconocido no quedó como reserva abierta (r62: liquidada antes del reenvío único)');
+        eq(await pdAdj(expItem.id), 1, 'E24: la reserva perdida quedó liquidada UNA vez como possible_duplicate por el sistema (sigue contando como gasto)');
+        // Conciliación humana (SUPER_ADMIN): lo que el sistema ya decidió no vuelve a la cola, y conciliarlo es un no-op.
         const wres = await api('GET', `/finops/llm-worker-reservations?runId=${c.runId}`);
         const wlist = (wres.data && wres.data.reservations) || [];
-        const expRes = wlist.find((r) => r.itemKey === `experience:${c.mods[0].chapters[1].id}`);
-        ok(wres.status === 200 && expRes && /^llmw-/.test(expRes.callTag || ''), 'E24: la reserva del desconocido aparece en la cola de conciliación del worker (SUPER_ADMIN)', { s: wres.status, n: wlist.length });
-        const rc1 = expRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: expRes.reservationKey, outcome: 'not_charged', reason: 'E2E: consola sin la request' }) : { status: 0 };
-        const rc2 = expRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: expRes.reservationKey, outcome: 'charged', reason: 'E2E: repetido' }) : { status: 0 };
-        ok(rc1.status === 200 && rc1.data.reconciled === true && rc2.status === 200 && rc2.data.alreadySettled === true && (await unsettledRes(expItem.id)) === 0,
-          'E24: conciliar la reserva del worker la cierra una sola vez (repetir = no-op)', { rc1: rc1.data, rc2: rc2.data });
+        ok(wres.status === 200 && !wlist.some((r) => r.itemKey === `experience:${c.mods[0].chapters[1].id}`), 'E24: la reserva ya liquidada como possible_duplicate NO aparece en la cola de conciliación del worker (SUPER_ADMIN)', { s: wres.status, n: wlist.length });
+        const expKey = (await q(`select e.idempotency_key k from public.generation_cost_events e where e.idempotency_key like $1 and (e.metadata->>'reservation') = 'true' order by e.created_at limit 1`, [`reservation:llm:${expItem.id}:%`]))[0];
+        const rc0 = expKey ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: expKey.k, outcome: 'not_charged', reason: 'E2E: humano sobre una decisión del sistema' }) : { status: 0 };
+        // r60 (I1): una decisión distinta sobre una reserva ya cerrada → 409 reservation_already_settled, sin tocar el ledger.
+        ok(rc0.status === 409 && (await pdAdj(expItem.id)) === 1 && (await unsettledRes(expItem.id)) === 0, 'E24: conciliar a mano una reserva ya liquidada por el sistema se rechaza (409) y nunca agrega un segundo ADJUSTMENT', { s: rc0.status, rc0: rc0.data, e: rc0.error });
         const bad = await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: 'reservation:llm-proxy:x', outcome: 'charged', reason: 'x' });
         eq(bad.status, 400, 'E24: el endpoint del worker rechaza reservas que no son del worker');
         const actAfter = reqs((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN')).length;
@@ -3967,6 +3978,11 @@ function reservationBookkeeping(ev) {
         const sol = reqs((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'));
         const aaRow = rows.find((i) => i.type === 'application_activity');
         ok(sol.length >= 2 && sol[0].outcome === 'held' && aaRow && aaRow.status === 'completed' && aaRow.worker_id === W2, 'E24: worker caído en vuelo → otro worker retomó la parte desde su punto de guardado y la completó', { sol: sol.map((r) => r.outcome), w: aaRow && aaRow.worker_id });
+        // r61 (Q-21) visto en el E2E: el reclamante NO reenvía la llamada colgada mientras puede seguir en vuelo (ventana =
+        // timeout + margen); pasada la ventana, reenvío ambiguo ÚNICO con la reserva perdida liquidada como posible duplicado.
+        const aaPd = aaRow ? await pdAdj((await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c.runId, aaRow.item_key]))[0].id) : -1;
+        const solGapMs = sol.length >= 2 ? sol[1].at - sol[0].at : -1;
+        ok(solGapMs >= E24_IN_FLIGHT_WINDOW_MS - 5000 && aaPd === 1, `E24: Q-21 — el solucionario colgado se reenvió recién pasada la ventana en vuelo (${Math.round(solGapMs / 1000)} s ≥ ${E24_IN_FLIGHT_WINDOW_MS / 1000} s) y UNA vez, con su reserva liquidada como posible duplicado`, { solGapMs, aaPd });
         // Loop 7 (O2): reparación parcial del Libro por el worker — 1 llamada corta en vez de reescribir el capítulo.
         const alin = rows.find((i) => i.type === 'content' && i.item_key.endsWith(c.mods[0].chapters[2].id));
         const alinFull = reqs((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Alineación de ejes"'));
@@ -4048,9 +4064,23 @@ function reservationBookkeeping(ev) {
         ok(!browserClaims2.some((x) => LLM_TYPES.includes(x.type)), 'E24b: durante el deploy (worker nuevo vivo) el navegador no tomó ninguna parte de IA (Loop 9: ni las cortas)', browserClaims2.map((x) => x.type));
         const f2 = await finished(c2.runId);
         const vib = f2.find((i) => i.type === 'experience' && i.item_key.endsWith(c2.mods[0].chapters[1].id));
-        ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 2,
-          'E24b: dos resultados desconocidos → SOLO esa parte queda en revisión (llm_pending_review) con las 2 reservas para conciliar', vib && { st: vib.status, e: (vib.error || '').slice(0, 160), pr: vib.output_summary && vib.output_summary.llmPendingReview });
+        ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 1,
+          'E24b: dos resultados desconocidos → SOLO esa parte queda en revisión (llm_pending_review) con la 2.ª reserva para conciliar (r62: la 1.ª ya liquidada possible_duplicate antes del reenvío único)', vib && { st: vib.status, e: (vib.error || '').slice(0, 160), pr: vib.output_summary && vib.output_summary.llmPendingReview });
         eq(reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"')).length, 2, 'E24b: tras el segundo desconocido la parte NO se volvió a generar');
+        if (vib) {
+          const vibId = (await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c2.runId, vib.item_key]))[0].id;
+          eq(await pdAdj(vibId), 1, 'E24b: el 1.er desconocido quedó liquidado como possible_duplicate (un solo reenvío ambiguo por parte)');
+          // Conciliación humana (SUPER_ADMIN) de la reserva que sí queda abierta: listada y conciliable, una sola vez.
+          const wres2 = await api('GET', `/finops/llm-worker-reservations?runId=${c2.runId}`);
+          const vibRes = ((wres2.data && wres2.data.reservations) || []).find((r) => r.itemKey === vib.item_key);
+          ok(wres2.status === 200 && vibRes && /^llmw-/.test(vibRes.callTag || '') && vibRes.reservationKey === vib.output_summary.llmPendingReview.pendingReservations[0],
+            'E24b: la reserva abierta de la parte en revisión aparece en la cola de conciliación del worker (SUPER_ADMIN)', { s: wres2.status, r: vibRes && vibRes.reservationKey });
+          const rv1 = vibRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: vibRes.reservationKey, outcome: 'not_charged', reason: 'E2E: consola sin la request' }) : { status: 0 };
+          const rv2 = vibRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: vibRes.reservationKey, outcome: 'not_charged', reason: 'E2E: repetido' }) : { status: 0 };
+          const rv3 = vibRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: vibRes.reservationKey, outcome: 'charged', reason: 'E2E: decisión inversa' }) : { status: 0 };
+          ok(rv1.status === 200 && rv1.data.reconciled === true && rv2.status === 200 && rv2.data.alreadySettled === true && rv3.status === 409 && (await unsettledRes(vibId)) === 0,
+            'E24b: conciliar la reserva del worker la cierra una sola vez (repetir = no-op; decisión inversa = 409, r60)', { rv1: rv1.data, rv2: rv2.data, rv3: rv3.status });
+        }
         const cav = f2.find((i) => i.type === 'content' && i.item_key.endsWith(c2.mods[0].chapters[2].id));
         const cavCalls = reqs((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"')).length;
         const cavSpent = (await q(`select coalesce(sum(amount),0)::float8 t from public.generation_cost_events where run_id = $1 and item_key = $2`, [c2.runId, cav.item_key]))[0].t;
@@ -4728,8 +4758,18 @@ function reservationBookkeeping(ev) {
         // hoja si el examen es un banco. Usuarios propios (p2b5_*), nunca los de la simulación de notas.
         if (quizForExhaust) {
           const p2Out = path.join(V3OUT, `moodle-${label}.p2exams.json`);
-          const p2 = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-p2-exams.php'), process.env.MOODLE_ROOT, String(courseid), p2Out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 300000 });
-          ok(!/warning|notice|deprecated/i.test(p2.stderr || '') && fs.existsSync(p2Out), `${label}: escenarios de evaluaciones (moodle-p2-exams.php) sin error de PHP`, (p2.stderr || p2.stdout || '').slice(-800));
+          // r62 (gate): el cron de completion (mtrace) escribe en stdout y el JSON va al archivo. Si el proceso no terminó por
+          // sí mismo (timeout de spawnSync / señal: p. ej. el equipo se suspendió en medio y el reloj de pared consumió los
+          // 300 s), no hay JSON: se reintenta UNA vez con usuarios nuevos (el script usa un sufijo aleatorio por corrida).
+          // Un error real de PHP (stderr, exit ≠ 0 con proceso terminado) nunca se reintenta.
+          const runP2 = () => { try { fs.rmSync(p2Out, { force: true }); } catch { /* no existía */ }
+            return spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-p2-exams.php'), process.env.MOODLE_ROOT, String(courseid), p2Out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 300000 }); };
+          let p2 = runP2();
+          const p2Killed = (r) => r.status === null || !!r.signal || (r.error && r.error.code === 'ETIMEDOUT');
+          const p2First = p2Killed(p2) ? { status: p2.status, signal: p2.signal, error: p2.error && p2.error.code } : null;
+          if (p2First) { console.log(`   ↻ ${label}: moodle-p2-exams.php no terminó (${JSON.stringify(p2First)}) — reintento único`); p2 = runP2(); }
+          ok(!/warning|notice|deprecated/i.test(p2.stderr || '') && fs.existsSync(p2Out), `${label}: escenarios de evaluaciones (moodle-p2-exams.php) sin error de PHP${p2First ? ' (tras 1 reintento por proceso cortado)' : ''}`,
+            { status: p2.status, signal: p2.signal, error: p2.error && p2.error.code, first: p2First, stderr: (p2.stderr || '').slice(-600), stdoutTail: (p2.stdout || '').slice(-200) });
           const p2o = fs.existsSync(p2Out) ? JSON.parse(fs.readFileSync(p2Out, 'utf8')) : { pass: false, failed: ['sin salida'], assertions: 0 };
           ok(p2.status === 0 && p2o.pass === true && p2o.assertions > 0, `${label}: ${p2o.assertions} aserciones de evaluaciones con intentos reales (revisión, página gated, completion del curso${Object.values(p2o.quizzes || {}).some((q) => q.mode === 'bank') ? ', sorteo por hoja' : ''})`, p2o.failed);
           const modes = Object.values(p2o.quizzes || {}).map((q) => q.mode);

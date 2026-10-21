@@ -98,7 +98,8 @@ function coverageFindings(stagingScripts, plan) {
 }
 
 const stagingYml = read('.github/workflows/deploy-staging.yml');
-const deployYml = read('.github/workflows/deploy.yml');
+// r61: el lado VPS de deploy.yml vive en scripts/ops/prod-release.sh (install); sus migraciones cuentan como de deploy.yml.
+const deployYml = read('.github/workflows/deploy.yml') + '\n' + read('scripts/ops/prod-release.sh');
 const prodWf = read('.github/workflows/v2-production-migrations.yml');
 const stagingScripts = workflowMigrations(stagingYml);
 const plan = { steps: runner.MIGRATION_STEPS, excluded: runner.buildPlan ? (runner.buildPlan({ values: {}, flags: new Set() }).excluded || []) : [] };

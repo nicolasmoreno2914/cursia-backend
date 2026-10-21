@@ -426,6 +426,18 @@ export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-1';
  * recibe el tipo: se le quita de los tipos del claim (el worker o una pestaña actualizada lo genera).
  */
 export const GUIDED_PRACTICE_FEATURE = 'guided-practice-1';
+/**
+ * r61 Q-04: el ejecutor sabe anclar las preguntas del video interactivo a las escenas de Videogen (claim
+ * `video.videoScenes`). Un ejecutor del navegador que no lo anuncia recibe el plan equidistante de siempre y el
+ * item queda fijado en `videoTimelinePinned: 'even_spacing'` (nunca VIDEO_PLAN_MISMATCH por desfase FE/BE).
+ * Los workers del servidor (sin ownerId) usan el vendor actual → siempre anclado.
+ */
+export const VIDEO_SCENES_FEATURE = 'video-scenes-1';
+
+/** r61 Q-04: el executor de este claim recibe el plan anclado a escenas. */
+export function executorAnchorsVideoScenes(ownerId: string | null | undefined, features: readonly string[] | undefined): boolean {
+  return ownerId === undefined || ownerId === null || (features ?? []).includes(VIDEO_SCENES_FEATURE);
+}
 
 /**
  * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
@@ -488,6 +500,8 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'answerBiasRecheck',
   // REL CREDIT: estado de la sonda del proveedor (lo escribe solo el barrido / retryItem).
   'providerProbe',
+  // r61 Q-04: línea de tiempo del video (escenas de Videogen) que ancla las preguntas del video interactivo.
+  'videoScenes', 'videoScenesUnavailable', 'videoTimelinePinned',
 ]);
 
 /** r58 (I4-3): archivos de trabajo de UN capítulo en un perfil de evaluación (los del claim de la Actividad de Aplicación). */
@@ -517,6 +531,12 @@ export function mergeOutputSummary(
   const merged = { ...(existing ?? {}) };
   for (const [k, v] of Object.entries(patch ?? {})) {
     if (v === undefined) continue;
+    // r62 (re-review m1): las marcas durables de envío solo CRECEN — se unen con las ya guardadas (bajo el lock de la
+    // fila), así una tarea con su copia en memoria nunca borra la marca que escribió otra tarea/proceso.
+    if (k === 'paidCallsSent' && isPlainObject(v) && existing && isPlainObject(existing.paidCallsSent)) {
+      merged.paidCallsSent = { ...existing.paidCallsSent, ...v };
+      continue;
+    }
     if (k === 'external' && existing && existing.external !== undefined && existing.external !== null) {
       const cur = existing.external;
       if (isPlainObject(cur) && isPlainObject(v)) {
@@ -638,7 +658,9 @@ export class SchedulerService {
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
       for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
-        const r = await this.claimInRun(opts.runId, executorId, claimTypes, leaseSeconds, opts.ownerId);
+        const r = await this.claimInRun(opts.runId, executorId, claimTypes, leaseSeconds, opts.ownerId, undefined, {
+          videoScenes: executorAnchorsVideoScenes(opts.ownerId, opts.executorFeatures),
+        });
         if (r.paused) return { item: null, reason: RUN_PAUSED_REASON };
         if (r.leasedElsewhere) return { item: null, reason: EXEC_LEASE_RUN_LEASED_ELSEWHERE, leaseExpiresAt: r.leasedElsewhere.expiresAt };
         if (r.item) return { item: r.item };
@@ -691,7 +713,9 @@ export class SchedulerService {
         return { item: null };
       }
       tried.push(cand.id);
-      const r = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id);
+      const r = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id, {
+        videoScenes: executorAnchorsVideoScenes(opts.ownerId, opts.executorFeatures),
+      });
       if (r.leasedElsewhere) leasedRuns.push(cand.job_id);
       if (r.item) return { item: r.item };
     }
@@ -714,6 +738,7 @@ export class SchedulerService {
     leaseSeconds: number,
     ownerId?: string,
     itemId?: string,
+    claimOpts: { videoScenes: boolean } = { videoScenes: true },
   ): Promise<{ item: ClaimedItem | null; unavailable: boolean; leasedElsewhere?: { expiresAt: string | null }; paused?: boolean }> {
     let cancelledJob: any = null;
     let paused = false;
@@ -787,7 +812,7 @@ export class SchedulerService {
       await openItemAttempt(qr, row, { executorKind: executorKindFor(row.type, ownerId !== undefined), executorId });
       await markRunRunning(qr, job.id);
       try {
-        const built = await this.buildClaimedItem(qr, job, row);
+        const built = await this.buildClaimedItem(qr, job, row, false, claimOpts);
         // r61 (Q-21, M10): previousError solo para los workers del servidor (el ejecutor del navegador no lo usa).
         if (ownerId !== undefined && ownerId !== null) delete built.previousError;
         return built;
@@ -1481,12 +1506,20 @@ export class SchedulerService {
     }
     if (g.type === 'video_interactions') {
       const ivAdvanced = manifest?.features?.ivAdvanced === 1;
-      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`, ivAdvanced);
+      // r61 Q-04 (review I-1): se valida contra el plan del claim (pin del item). Sin pin (claim anterior a r61) →
+      // el plan equidistante de siempre.
+      const anchored = (g as any).video_timeline_pinned === 'videogen_scenes';
+      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`, ivAdvanced, anchored);
       if (vf.ok === false) {
         // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
         return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true } as const;
       }
-      ctx.video = { videoItemKey: vf.video.videoItemKey, durationSec: vf.video.durationSec };
+      ctx.video = {
+        videoItemKey: vf.video.videoItemKey,
+        durationSec: vf.video.durationSec,
+        // r61 Q-04: el servidor valida contra el MISMO plan anclado que recibió el ejecutor.
+        ...(vf.video.videoScenes ? { videoScenes: vf.video.videoScenes } : {}),
+      };
       // EV6 IV avanzado: schemaVersion 2 (pausas validadas contra la duración MEDIDA del video).
       if (ivAdvanced) ctx.videoInteractionsSchemaVersion = 2;
     }
@@ -1529,6 +1562,7 @@ export class SchedulerService {
     const [g] = await this.dataSource.query(
       `select g.id, g.job_id, g.manifest_id, g.item_key, g.type, g.status, g.worker_id, g.chapter_id, g.module_id,
               g.output_summary -> 'answerBiasRecheck' ->> 'rejections' as answer_bias_rejections,
+              g.output_summary ->> 'videoTimelinePinned' as video_timeline_pinned,
               pj.owner_id, pj.course_id as job_course_id, pj.frontend_course_id, m.rules_version, m.manifest_json
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
@@ -1700,6 +1734,7 @@ export class SchedulerService {
     manifestId: number,
     videoItemKey: string,
     ivAdvanced = false,
+    sceneAnchors = true,
   ): Promise<ReturnType<typeof videoClaimFacts>> {
     const [v] = await q.query(
       `select d.id as video_item_run_id, d.output_summary, a.metadata
@@ -1712,7 +1747,11 @@ export class SchedulerService {
       [jobId, manifestId, videoItemKey],
     );
     if (!v) return { ok: false, code: 'VIDEO_NOT_COMPLETED', message: `el video ${videoItemKey} no está completado` };
-    const facts = videoClaimFacts({ videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata, ...(ivAdvanced ? { ivAdvanced: true } : {}) });
+    const facts = videoClaimFacts({
+      videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata,
+      ...(ivAdvanced ? { ivAdvanced: true } : {}),
+      ...(sceneAnchors ? {} : { sceneAnchors: false }),
+    });
     if (facts.ok) (facts as any).videoItemRunId = v.video_item_run_id;
     return facts;
   }
@@ -1777,7 +1816,7 @@ export class SchedulerService {
   }
 
   /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
-  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot, readOnly = false): Promise<ClaimPayloadV3 | undefined> {
+  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot, readOnly = false, claimOpts: { videoScenes: boolean } = { videoScenes: true }): Promise<ClaimPayloadV3 | undefined> {
     if (manifest.rulesVersion !== 3) return undefined;
     const validatedArtifactType = v3ValidatedArtifactType(row.type, mItem.variant ?? null);
     const out: ClaimPayloadV3 = { validatedArtifactType };
@@ -1872,9 +1911,20 @@ export class SchedulerService {
     }
     if (row.type === 'video_interactions') {
       const ivAdvanced = manifest.features?.ivAdvanced === 1;
-      const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`, ivAdvanced);
+      const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`, ivAdvanced, claimOpts.videoScenes);
       if (vf.ok === false) throw new ClaimPayloadUnavailable(vf.code, vf.message);
       out.video = vf.video;
+      // r61 Q-04 (review I-1): el plan con el que ESTE executor escribe las preguntas queda fijado en el item;
+      // complete y el empaquetado lo respetan (un ejecutor sin `video-scenes-1` → 'even_spacing', sin fallar).
+      if (!readOnly) {
+        const pinned = vf.video.timelineSource === 'videogen_scenes' ? 'videogen_scenes' : 'even_spacing';
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('videoTimelinePinned', $2::text)
+            where id = $1`,
+          [row.id, pinned],
+        );
+      }
       // EV6 IV avanzado: el ejecutor escribe video_interactions schemaVersion 2 (reflections en
       // los índices de video.reflectionPlan). Ausente = schemaVersion 1 (Manifests anteriores).
       if (ivAdvanced) out.videoInteractionsSchemaVersion = 2;
@@ -2174,7 +2224,7 @@ export class SchedulerService {
     }
   }
 
-  private async buildClaimedItem(qr: QueryRunner, job: any, row: any, readOnly = false): Promise<ClaimedItem> {
+  private async buildClaimedItem(qr: QueryRunner, job: any, row: any, readOnly = false, claimOpts: { videoScenes: boolean } = { videoScenes: true }): Promise<ClaimedItem> {
     const where = `Item ${row.item_key} (run ${job.id})`;
     const fail = (msg: string) => new InternalServerErrorException(`${where}: ${msg} (integridad rota)`);
 
@@ -2234,7 +2284,7 @@ export class SchedulerService {
         // (la que el predicado de claim exigió completed).
         [row.job_id, row.manifest_id, deps],
       ),
-      claimV3: (mItem) => this.buildClaimV3(qr, row, mItem, manifest, snapshot, readOnly),
+      claimV3: (mItem) => this.buildClaimV3(qr, row, mItem, manifest, snapshot, readOnly, claimOpts),
     });
   }
 

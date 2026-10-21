@@ -29,18 +29,57 @@ export const AUTO_PACKAGE_ENABLED_ENV = 'DYNAMIC_AUTO_PACKAGE_ENABLED';
  * la re-completitud sin confirmar) no cambia: lo gobiernan DYNAMIC_AUTO_PACKAGE_ENABLED y holdPackaging.
  */
 export const AUTO_REPACKAGE_ON_BUILDER_BUMP_ENV = 'DYNAMIC_AUTO_REPACKAGE_ON_BUILDER_BUMP';
-/** Intentos automáticos de paquete final por completitud del run (el primero + 2 reintentos). */
-export const AUTO_PACKAGE_MAX_ATTEMPTS = 3;
-/** Espera mínima entre un job de paquete fallido y el reintento automático. */
-export const AUTO_PACKAGE_RETRY_BACKOFF_SECONDS = 60;
-/** Ventana: un run marcado hace más que esto ya no se reintenta solo (queda para un admin). */
-export const AUTO_PACKAGE_MAX_AGE_HOURS = 72;
 /**
- * Fix round 1 (M1): errores TRANSITORIOS de `ensure` (DB/red, sin job creado): tope y espera propios
- * (`autoPackage.transient = {count, at}`), así un run trabado no se re-evalúa en cada tick.
+ * Intentos automáticos de paquete final por completitud del run (el primero + 2 reintentos) para fallos NO
+ * transitorios (error de build sin clasificar, bug del builder sin la reparación por item). r62 (d7): un job
+ * cuyo fallo el worker registró como TRANSITORIO (`output_summary.failure.transient`, clase A del clasificador:
+ * Storage, DB, red) no cuenta contra este tope — se reintenta con espera creciente hasta la ventana larga.
+ */
+export const AUTO_PACKAGE_MAX_ATTEMPTS = 3;
+/** Espera mínima entre un job de paquete fallido y el reintento automático (base de la espera creciente). */
+export const AUTO_PACKAGE_RETRY_BACKOFF_SECONDS = 60;
+/** r62 (d7): techo de la espera creciente entre reintentos automáticos (fallos de job y transitorios de `ensure`). */
+export const AUTO_PACKAGE_RETRY_BACKOFF_MAX_SECONDS = 3600;
+/**
+ * Ventana larga: un run marcado hace más que esto ya no se reintenta solo. Al agotarse con fallos transitorios
+ * la excepción queda explícita (`completion.packageJob.attentionReason = package_transient_exhausted`).
+ */
+export const AUTO_PACKAGE_MAX_AGE_HOURS = 72;
+/** r62 (d7): pasado esto desde la marca, un empaque que sigue reintentando transitorios levanta una alerta visible. */
+export const AUTO_PACKAGE_ALERT_HOURS = 24;
+/**
+ * Fix round 1 (M1): errores TRANSITORIOS de `ensure` (DB/red, sin job creado): espera propia
+ * (`autoPackage.transient = {count, at}`), así un run trabado no se re-evalúa en cada tick. r62 (d7): sin tope de
+ * rondas para lo CLASIFICADO A (red/DB) — la espera crece (300 s, 600 s, … hasta AUTO_PACKAGE_RETRY_BACKOFF_MAX_SECONDS) y el
+ * límite es la ventana larga. Review I1d: lo no clasificado (`transient.unclassified`, p.ej. un TypeError) conserva el tope
+ * `AUTO_PACKAGE_MAX_TRANSIENT` (c10), que también es el umbral de la alerta para lo clasificado.
  */
 export const AUTO_PACKAGE_MAX_TRANSIENT = 5;
 export const AUTO_PACKAGE_TRANSIENT_BACKOFF_SECONDS = 300;
+/** r62 (d7): motivos explícitos de la excepción del empaque automático (`completion.packageJob.attentionReason`). */
+export const PACKAGE_TRANSIENT_EXHAUSTED = 'package_transient_exhausted';
+export const PACKAGE_ATTEMPTS_EXHAUSTED = 'package_attempts_exhausted';
+/** r62 (d7): alerta (no bloquea): el empaque lleva más de AUTO_PACKAGE_ALERT_HOURS reintentando transitorios. */
+export const PACKAGE_TRANSIENT_RETRYING_ALERT = 'package_transient_retrying';
+
+/** r62 (d7): espera creciente `base · 2^(n-1)` con techo (n = fallos ya registrados; n ≤ 1 → base). Pura. */
+export function autoPackageBackoffSeconds(base: number, n: number, max = AUTO_PACKAGE_RETRY_BACKOFF_MAX_SECONDS): number {
+  const k = Math.max(0, Math.min(30, Math.floor(Number(n) || 0) - 1));
+  return Math.min(max, base * 2 ** k);
+}
+
+/**
+ * r62 (d7): ¿el job de paquete fallido quedó registrado por el worker como TRANSITORIO? Solo el campo que escribe
+ * el worker al fallar (`output_summary.failure.transient === true`); un job anterior a r62 (sin el campo) cuenta
+ * como no transitorio (comportamiento de siempre). Misma regla en SQL (`transientFailureSql`).
+ */
+export function packageFailureIsTransient(outputSummary: unknown): boolean {
+  return obj(obj(outputSummary).failure).transient === true;
+}
+
+function transientFailureSql(p: string): string {
+  return `coalesce(${p}.output_summary->'failure'->>'transient', '') = 'true'`;
+}
 /**
  * DoD follow-up (R2): el barrido corre en el tick del auto-healer. Con el tick apagado
  * (`DYNAMIC_AUTO_HEAL_ENABLED=false`) nadie reintenta ni re-arma solo → nada queda «pendiente» (el run
@@ -124,7 +163,7 @@ export interface AutoPackageBlock {
 export function autoPackageMarkOf(run: { output_summary?: unknown } | null | undefined): {
   eligibleAt: Date;
   blocked: AutoPackageBlock | null;
-  transient: { count: number; at: Date | null };
+  transient: { count: number; unclassified: number; at: Date | null };
   satisfiedJobId: string | null;
 } | null {
   const ap = obj(run?.output_summary).autoPackage;
@@ -142,10 +181,13 @@ export function autoPackageMarkOf(run: { output_summary?: unknown } | null | und
       }
     : null;
   const tc = Number(ap?.transient?.count ?? 0);
+  const count = Number.isInteger(tc) && tc > 0 ? tc : 0;
+  // r62 (review I1d): sin `unclassified` (marca anterior) todo el conteo es «no clasificado» (tope de siempre).
+  const uc = ap?.transient?.unclassified === undefined || ap?.transient?.unclassified === null ? count : Number(ap.transient.unclassified);
   return {
     eligibleAt,
     blocked,
-    transient: { count: Number.isInteger(tc) && tc > 0 ? tc : 0, at: dateOf(ap?.transient?.at) },
+    transient: { count, unclassified: Number.isInteger(uc) && uc > 0 ? Math.min(uc, count) : 0, at: dateOf(ap?.transient?.at) },
     satisfiedJobId: typeof ap?.satisfiedJobId === 'string' ? ap.satisfiedJobId : null,
   };
 }
@@ -170,6 +212,16 @@ export interface AutoPackageState {
   blocked: AutoPackageBlock | null;
   /** Compatibilidad: código del bloqueo. */
   blockedCode: string | null;
+  /** r62 (d7): fallidos desde la marca que NO son transitorios (los únicos que cuentan contra AUTO_PACKAGE_MAX_ATTEMPTS). */
+  hardFailedSinceMark: number;
+  /** r62 (d7): fallidos transitorios desde la marca (Storage/DB/red; sin tope de rondas, solo la ventana larga). */
+  transientFailedSinceMark: number;
+  /** r62 (d7): cuándo el barrido vuelve a intentarlo (espera creciente) — solo con un reintento pendiente. */
+  nextRetryAt: Date | null;
+  /** r62 (d7): alerta visible mientras se sigue reintentando solo (no bloquea). */
+  alert: string | null;
+  /** r62 (d7): motivo explícito cuando el reintento automático se agotó (excepción registrada). */
+  attentionReason: string | null;
 }
 
 /**
@@ -196,6 +248,9 @@ export async function loadAutoPackageState(
   const mark = autoPackageMarkOf(run);
   const sinceMark = mark ? finals.filter((j) => new Date(j.created_at).getTime() >= mark.eligibleAt.getTime()) : [];
   const failed = sinceMark.filter((j) => PACKAGE_JOB_FAILED_STATUSES.includes(j.worker_status));
+  // r62 (d7): solo los fallos NO transitorios cuentan contra el tope de intentos.
+  const hardFailed = failed.filter((j) => !packageFailureIsTransient(j.output_summary));
+  const transientFailed = failed.length - hardFailed.length;
   const lastFailureAt = failed.length ? dateOf(failed[0].finished_at) ?? dateOf(failed[0].updated_at) : null;
   const latest = finals[0] ?? null;
   let status = latest ? (PACKAGE_JOB_FAILED_STATUSES.includes(latest.worker_status) ? 'failed' : latest.worker_status) : 'none';
@@ -203,14 +258,36 @@ export async function loadAutoPackageState(
   if (blocked) status = 'failed';
   const eligible = !!mark && run.worker_status === 'completed';
   const withinWindow = !!mark && now.getTime() - mark.eligibleAt.getTime() <= AUTO_PACKAGE_MAX_AGE_HOURS * 3_600_000;
-  const capsOk = eligible && autoPackageEnabled(env) && !blocked && failed.length < AUTO_PACKAGE_MAX_ATTEMPTS &&
-    (mark?.transient.count ?? 0) < AUTO_PACKAGE_MAX_TRANSIENT;
+  // r62 (d7): sin tope de rondas para lo transitorio (jobs A y errores de `ensure`): el límite es la ventana larga.
+  // r62 (review I1d): lo transitorio de `ensure` NO clasificado A conserva su tope (c10: lo desconocido nunca es A).
+  const capsOk = eligible && autoPackageEnabled(env) && !blocked && hardFailed.length < AUTO_PACKAGE_MAX_ATTEMPTS &&
+    (mark?.transient.unclassified ?? 0) < AUTO_PACKAGE_MAX_TRANSIENT;
   // DoD follow-up (R2): sin el tick del barrido nadie reintenta ni re-arma: nada queda pendiente (salvo el
   // aviso post-commit de un run recién marcado, que encola sin el tick).
   const sweepOn = autoHealEnabled(env);
   const hookGrace = status === 'none' && !!mark && failed.length === 0 && (mark.transient.count ?? 0) === 0 &&
     now.getTime() - mark.eligibleAt.getTime() <= AUTO_PACKAGE_HOOK_GRACE_SECONDS * 1000;
   const autoRetryPending = (status === 'failed' || status === 'none') && capsOk && withinWindow && (sweepOn || hookGrace);
+  // r62 (d7): espera creciente, alerta y excepción explícita (mismas cuentas que el SQL del barrido).
+  const transientCount = mark?.transient.count ?? 0;
+  const classifiedTransientCount = transientCount - (mark?.transient.unclassified ?? 0);
+  // Solo lo clasificado transitorio (jobs A o errores de red/DB de `ensure`) cuenta para la alerta y la excepción larga.
+  const anyTransient = transientFailed > 0 || classifiedTransientCount > 0;
+  let nextRetryAt: Date | null = null;
+  // Solo con fallos transitorios (los demás conservan el contrato previo del estado).
+  if (autoRetryPending && anyTransient && status === 'failed' && lastFailureAt) {
+    nextRetryAt = new Date(lastFailureAt.getTime() + autoPackageBackoffSeconds(AUTO_PACKAGE_RETRY_BACKOFF_SECONDS, failed.length) * 1000);
+  } else if (autoRetryPending && anyTransient && status === 'none' && transientCount > 0 && mark?.transient.at) {
+    nextRetryAt = new Date(mark.transient.at.getTime() + autoPackageBackoffSeconds(AUTO_PACKAGE_TRANSIENT_BACKOFF_SECONDS, transientCount) * 1000);
+  }
+  const alert = autoRetryPending && anyTransient && !!mark &&
+    (now.getTime() - mark.eligibleAt.getTime() >= AUTO_PACKAGE_ALERT_HOURS * 3_600_000 || classifiedTransientCount >= AUTO_PACKAGE_MAX_TRANSIENT)
+    ? PACKAGE_TRANSIENT_RETRYING_ALERT : null;
+  let attentionReason: string | null = null;
+  if (eligible && autoPackageEnabled(env) && !blocked && !autoRetryPending && (status === 'failed' || status === 'none')) {
+    if (hardFailed.length >= AUTO_PACKAGE_MAX_ATTEMPTS || (mark?.transient.unclassified ?? 0) >= AUTO_PACKAGE_MAX_TRANSIENT) attentionReason = PACKAGE_ATTEMPTS_EXHAUSTED;
+    else if (!withinWindow && anyTransient) attentionReason = PACKAGE_TRANSIENT_EXHAUSTED;
+  }
   let rebuildPending = false;
   if (status === 'completed' && latest && mark && capsOk && sweepOn) {
     const builder = obj(latest.output_summary).builderVersion;
@@ -219,7 +296,10 @@ export async function loadAutoPackageState(
     const unconfirmed = new Date(latest.created_at).getTime() < mark.eligibleAt.getTime() && mark.satisfiedJobId !== latest.id;
     rebuildPending = builderChanged || (withinWindow && unconfirmed);
   }
-  return { status, autoRetryPending, rebuildPending, failedSinceMark: failed.length, lastFailureAt, eligible, blocked, blockedCode: blocked?.code ?? null };
+  return {
+    status, autoRetryPending, rebuildPending, failedSinceMark: failed.length, lastFailureAt, eligible, blocked, blockedCode: blocked?.code ?? null,
+    hardFailedSinceMark: hardFailed.length, transientFailedSinceMark: transientFailed, nextRetryAt, alert, attentionReason,
+  };
 }
 
 /**
@@ -266,23 +346,29 @@ export async function findAutoPackageCandidates(
          ) l on true
      )
      select c.id from c
+       left join lateral (
+         -- r62 (d7): fallidos finales desde la marca; solo los NO transitorios cuentan contra el tope de intentos y la
+         -- espera crece con el total de fallidos (misma regla que loadAutoPackageState).
+         select count(*)::int as failed,
+                count(*) filter (where not (${transientFailureSql('p')}))::int as hard_failed,
+                max(coalesce(p.finished_at, p.updated_at)) as last_failed_at
+           from public.production_jobs p
+          where p.execution_mode = 'dynamic_package' and p.input_payload->>'runId' = c.id::text
+            and p.worker_status = any($4::text[]) and p.created_at >= c.eligible_at
+            and ${isFinal}
+       ) f on true
       where not (c.ap ? 'blocked'
                  and jsonb_typeof(c.ap->'blocked') = 'object'
                  and (c.ap->'blocked'->>'code') is not null
                  and (c.ap->'blocked'->>'at')::timestamptz >= c.eligible_at
                  and (c.job_id is null or c.job_created <= (c.ap->'blocked'->>'at')::timestamptz))
         and (c.job_id is null or not (c.job_status = any($3::text[])))
-        and (select count(*) from public.production_jobs p
-              where p.execution_mode = 'dynamic_package' and p.input_payload->>'runId' = c.id::text
-                and p.worker_status = any($4::text[]) and p.created_at >= c.eligible_at
-                and ${isFinal}) < $5::int
-        and not exists (select 1 from public.production_jobs p
-                         where p.execution_mode = 'dynamic_package' and p.input_payload->>'runId' = c.id::text
-                           and p.worker_status = any($4::text[]) and p.created_at >= c.eligible_at
-                           and ${isFinal}
-                           and coalesce(p.finished_at, p.updated_at) > $1::timestamptz - make_interval(secs => $6::int))
-        and coalesce((c.ap->'transient'->>'count')::int, 0) < $8::int
-        and coalesce((c.ap->'transient'->>'at')::timestamptz, '-infinity'::timestamptz) <= $1::timestamptz - make_interval(secs => $9::int)
+        and f.hard_failed < $5::int
+        and (f.last_failed_at is null
+             or f.last_failed_at <= $1::timestamptz - make_interval(secs => least($8::int, $6::int * power(2, least(30, greatest(f.failed - 1, 0))))::int))
+        and coalesce((c.ap->'transient'->>'at')::timestamptz, '-infinity'::timestamptz) <= $1::timestamptz
+              - make_interval(secs => least($8::int, $9::int * power(2, least(30, greatest(coalesce((c.ap->'transient'->>'count')::int, 0) - 1, 0))))::int)
+        and coalesce((c.ap->'transient'->>'unclassified')::int, (c.ap->'transient'->>'count')::int, 0) < $14::int
         and coalesce((c.ap->'lastSkip'->>'at')::timestamptz, '-infinity'::timestamptz) <= $1::timestamptz - make_interval(secs => $12::int)
         and (
           ((c.job_id is null or c.job_status = any($4::text[])) and c.eligible_at > $1::timestamptz - make_interval(hours => $2::int))
@@ -294,9 +380,10 @@ export async function findAutoPackageCandidates(
       order by c.eligible_at desc
       limit $7`,
     [now.toISOString(), AUTO_PACKAGE_MAX_AGE_HOURS, [...PACKAGE_JOB_ACTIVE_STATUSES], [...PACKAGE_JOB_FAILED_STATUSES],
-      AUTO_PACKAGE_MAX_ATTEMPTS, AUTO_PACKAGE_RETRY_BACKOFF_SECONDS, limit, AUTO_PACKAGE_MAX_TRANSIENT,
+      // r62 (d7): $8 = techo de la espera creciente (antes, el tope de transitorios, que ya no existe).
+      AUTO_PACKAGE_MAX_ATTEMPTS, AUTO_PACKAGE_RETRY_BACKOFF_SECONDS, limit, AUTO_PACKAGE_RETRY_BACKOFF_MAX_SECONDS,
       AUTO_PACKAGE_TRANSIENT_BACKOFF_SECONDS, DYNAMIC_MBZ_BUILDER_VERSION_V3, DYNAMIC_MBZ_BUILDER_VERSION,
-      AUTO_PACKAGE_SKIP_BACKOFF_SECONDS, autoRepackageOnBuilderBump(env)],
+      AUTO_PACKAGE_SKIP_BACKOFF_SECONDS, autoRepackageOnBuilderBump(env), AUTO_PACKAGE_MAX_TRANSIENT],
   );
   return rows.map((r) => r.id);
 }

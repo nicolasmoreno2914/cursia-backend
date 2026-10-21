@@ -892,7 +892,10 @@ async function pureChecks() {
     ];
     for (const [ctx, text] of ok) eq(V(ctx, text).ok, true, `válido ${ctx.type}`);
     eq(V(ok[5][0], F.FINAL_GIFT).summary, { questionCount: 12 }, 'summary GIFT');
-    eq(V(ok[3][0], JSON.stringify(vdoc)).summary, { interactionCount: 5 }, 'summary video');
+    // r61 Q-04 (I-2): el summary guarda también los segundos validados, que el empaque reutiliza.
+    { const sv = V(ok[3][0], JSON.stringify(vdoc)).summary;
+      eq(sv.interactionCount, 5, 'summary video');
+      eq(Array.isArray(sv.checkpointsAtSec) && sv.checkpointsAtSec.length === 5, true, 'summary video: checkpointsAtSec (5)'); }
     // P3: why/apply se exigen desde v21-exp-6 (antes, la experiencia sin ellos sigue válida); métricas en el summary.
     const expCtx = (pv) => ({ type: 'experience', itemKey: 'experience:c1', chapterId: 'c1', promptVersion: pv });
     const plainExp = F.experienceFor('c1');

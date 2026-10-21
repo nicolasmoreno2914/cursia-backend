@@ -10,6 +10,7 @@ import { ResponseInterceptor } from './common/interceptors/response.interceptor'
 import { warnIfNearMissDynamicFlag } from './modules/features/dynamic-features';
 import { RunsService } from './modules/dynamic-generation/runs.service';
 import { startAutoHealTimer } from './modules/dynamic-generation/auto-heal';
+import { ProviderReconcileService } from './modules/dynamic-generation/provider-reconcile.service';
 import { AutoPackageService } from './modules/dynamic-packaging/auto-package.service';
 
 async function bootstrap() {
@@ -64,12 +65,20 @@ async function bootstrap() {
   // vez) y el barrido del empaque final automático (DYNAMIC_AUTO_PACKAGE_ENABLED=false lo apaga).
   const runsService = app.get(RunsService);
   const autoPackage = app.get(AutoPackageService);
+  const providerReconcile = app.get(ProviderReconcileService);
   startAutoHealTimer(runsService, new Logger('DynamicAutoHeal'), process.env, [
     { name: 'reintento automático seguro', run: () => runsService.autoRetrySafeRejections() },
-    // #583 (decisión del usuario): UN reenvío automático de un audio con resultado incierto (≤ USD 0.10).
+    // #583 + r62 (regla de ambigüedad acotada): UN reenvío automático de un audio con resultado incierto (corte o
+    // timeout), con el peor caso dentro de lo autorizado (presupuesto de la parte + saldo del run).
     { name: 'reenvío de audio incierto', run: () => runsService.autoResubmitAmbiguousAudio() },
+    // r62 (K3): partes frenadas por el kill switch / la allow-list de FinOps → se reabren solas al revertirlo.
+    { name: 'reanudación tras control de gasto', run: () => runsService.autoResumeSpendControlHolds() },
+    // r62 (d8): claim incompleto por un dato de la dependencia → regenerate_dependency (una vez, dentro del presupuesto).
+    { name: 'claim incompleto (dependencia)', run: () => runsService.autoRecoverClaimPayloadUnavailable() },
     // REL CREDIT: sonda del proveedor tras crédito/cuota agotados (un canario por run y proveedor; legacy la apaga).
     { name: 'sonda de crédito del proveedor', run: () => runsService.autoProbeProviderCredit() },
+    // r62 (N2): Videogen/Gamma con resultado conocido (o ambiguo) → conciliación con la evidencia + reenvío acotado.
+    { name: 'conciliación de proveedor', run: () => providerReconcile.sweep() },
     { name: 'empaque automático', run: () => autoPackage.sweep() },
   ]);
 }

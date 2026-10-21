@@ -9,6 +9,9 @@ import {
   autoPackageMarkOf,
   findAutoPackageCandidates,
   loadAutoPackageState,
+  packageFailureIsTransient,
+  AUTO_PACKAGE_MAX_AGE_HOURS,
+  PACKAGE_TRANSIENT_EXHAUSTED,
 } from './auto-package-state';
 import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 import { classifyFailure } from '../reliability/failure-classifier';
@@ -58,6 +61,15 @@ export function packageBlockItemKey(text: string, missing: readonly string[], it
     }
   }
   return best ? best.key : null;
+}
+
+/**
+ * r62 (review I1d): ¿un error de `ensure` (sin job creado) es una caída de red/DB? Misma regla que el worker: clase A
+ * del clasificador de empaque. Un error de programación (TypeError) o sin clasificar → false (tope de siempre, c10).
+ */
+export function ensureErrorIsTransient(err: unknown): boolean {
+  const v = classifyFailure({ source: 'package_worker', error: err instanceof Error ? err.message : String(err ?? '') });
+  return v.class === 'A' && !v.unclassified;
 }
 
 /** Código del rechazo del empaque (primer token en mayúsculas conocido o el código explícito). */
@@ -117,20 +129,30 @@ export class AutoPackageService implements OnModuleInit {
       const state = await loadAutoPackageState(this.dataSource, run, new Date(), env, Number(run.rules_version ?? 3));
       // DoD follow-up (R8): el bloqueo cuenta como en el estado (un job final posterior lo deja atrás).
       if (state.blocked) return { action: 'skipped', runId, reason: `blocked:${state.blocked.code}` };
-      if (state.failedSinceMark >= AUTO_PACKAGE_MAX_ATTEMPTS) return { action: 'skipped', runId, reason: 'attempts_exhausted' };
-      if (mark.transient.count >= AUTO_PACKAGE_MAX_TRANSIENT) return { action: 'skipped', runId, reason: 'transient_exhausted' };
+      // r62 (d7): solo los fallos NO transitorios agotan los intentos; lo transitorio (Storage/DB/red) se reintenta con
+      // espera creciente hasta la ventana larga (el barrido deja de seleccionarlo y el estado lo marca como excepción).
+      if (state.hardFailedSinceMark >= AUTO_PACKAGE_MAX_ATTEMPTS) return { action: 'skipped', runId, reason: 'attempts_exhausted' };
+      if (mark.transient.unclassified >= AUTO_PACKAGE_MAX_TRANSIENT) return { action: 'skipped', runId, reason: 'transient_exhausted' };
+      if (source === 'sweep' && !state.autoRetryPending && !state.rebuildPending && state.attentionReason === PACKAGE_TRANSIENT_EXHAUSTED) {
+        this.logger.error(`empaque automático: run ${runId} — ${PACKAGE_TRANSIENT_EXHAUSTED}: fallos transitorios durante ${AUTO_PACKAGE_MAX_AGE_HOURS} h; queda la excepción registrada (retry_package)`);
+        return { action: 'skipped', runId, reason: 'transient_exhausted' };
+      }
+      if (state.alert) {
+        this.logger.warn(`ALERTA empaque automático: run ${runId} — ${state.alert} (${state.transientFailedSinceMark} job(s) y ${mark.transient.count} error(es) transitorios desde la marca); se sigue reintentando solo hasta ${AUTO_PACKAGE_MAX_AGE_HOURS} h`);
+      }
       // El barrido solo actúa sobre lo que el estado declara pendiente (misma regla que RunDto.completion).
       if (source === 'sweep' && !state.autoRetryPending && !state.rebuildPending) return { action: 'skipped', runId, reason: 'nothing_pending' };
       // REL MVP: el último paquete final falló por el contenido de un item → reparar ese item (o needs_attention).
       if (state.status === 'failed' && state.failedSinceMark > 0) {
         const [lastFailed] = await this.dataSource.query(
-          `select id, error_message from public.production_jobs
+          `select id, error_message, output_summary from public.production_jobs
             where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 and worker_status in ('failed', 'failed_retryable')
               and created_at >= $2::timestamptz
             order by created_at desc, id desc limit 1`,
           [runId, mark.eligibleAt.toISOString()],
         );
-        if (lastFailed?.error_message) {
+        // r62 (d7): un fallo registrado como transitorio por el worker nunca dispara una reparación ni un bloqueo.
+        if (lastFailed?.error_message && !packageFailureIsTransient(lastFailed.output_summary)) {
           const out = await this.repairOrBlock(runId, String(lastFailed.error_message), [], null, source);
           if (out) return out;
         }
@@ -139,12 +161,14 @@ export class AutoPackageService implements OnModuleInit {
       const bp = run.blueprint_number == null ? NaN : Number(run.blueprint_number);
       if (!Number.isInteger(bp) || bp < 1) {
         // DoD follow-up (R8): no se puede resolver el Blueprint → cuenta como transitorio (tope + espera).
-        await this.recordTransient(runId);
+        // r62 (review I1d): no es una caída de red/DB → cuenta contra el tope de lo no clasificado.
+        await this.recordTransient(runId, false);
         return { action: 'skipped', runId, reason: 'manifest_unresolvable' };
       }
     } catch (err) {
       // DoD follow-up (R8): un error ANTES de pedir el paquete (lectura) también cuenta como transitorio.
-      await this.recordTransient(runId);
+      // r62 (review I1d): solo lo clasificado A (red/DB) queda sin tope; el resto, el tope de siempre (c10).
+      await this.recordTransient(runId, ensureErrorIsTransient(err));
       this.logger.warn(`empaque automático (${source}): run ${runId} no se pudo evaluar (${err instanceof Error ? err.message : String(err)}); lo retoma el barrido`);
       return { action: 'skipped', runId, reason: 'transient_error' };
     }
@@ -193,7 +217,8 @@ export class AutoPackageService implements OnModuleInit {
         return { action: 'blocked', runId, code };
       }
       // Fix round 1 (M1): error transitorio (DB, red) — cuenta contra su propio tope, con espera.
-      await this.recordTransient(runId);
+      // r62 (review I1d): sin tope solo si el clasificador lo da A; un bug (TypeError, sin clasificar) conserva el tope.
+      await this.recordTransient(runId, ensureErrorIsTransient(err));
       this.logger.warn(`empaque automático (${source}): run ${runId} falló (${err instanceof Error ? err.message : String(err)}); lo retoma el barrido`);
       return { action: 'skipped', runId, reason: 'transient_error' };
     }
@@ -288,14 +313,22 @@ export class AutoPackageService implements OnModuleInit {
     );
   }
 
-  /** Fix round 1 (M1): un transitorio más (tope + espera propios). Nunca lanza. */
-  private async recordTransient(runId: string): Promise<void> {
+  /**
+   * Fix round 1 (M1): un transitorio más (espera propia). Nunca lanza. r62 (review I1d): `count` (todos, para la espera
+   * creciente) y `unclassified` (los NO clasificados A, que conservan el tope AUTO_PACKAGE_MAX_TRANSIENT). Una marca
+   * anterior sin `unclassified` toma `count` (todo contaba contra el tope).
+   */
+  private async recordTransient(runId: string, classifiedTransient: boolean): Promise<void> {
     await this.dataSource.query(
       `update public.production_jobs
           set output_summary = jsonb_set(output_summary, '{autoPackage,transient}',
-                jsonb_build_object('count', coalesce((output_summary->'autoPackage'->'transient'->>'count')::int, 0) + 1, 'at', now()), true)
+                jsonb_build_object(
+                  'count', coalesce((output_summary->'autoPackage'->'transient'->>'count')::int, 0) + 1,
+                  'unclassified', coalesce((output_summary->'autoPackage'->'transient'->>'unclassified')::int,
+                                           (output_summary->'autoPackage'->'transient'->>'count')::int, 0) + $2::int,
+                  'at', now()), true)
         where id = $1 and jsonb_typeof(output_summary->'autoPackage') = 'object'`,
-      [runId],
+      [runId, classifiedTransient ? 0 : 1],
     ).catch(() => undefined);
   }
 

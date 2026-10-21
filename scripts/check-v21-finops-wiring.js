@@ -340,7 +340,9 @@ async function pureChecks() {
     const yml = fs.readFileSync(path.join(REPO, '.github/workflows/deploy-staging.yml'), 'utf8');
     // R16 (#1): en staging el worker corre con node directo + kill_timeout (drenado ordenado).
     assert(yml.includes('ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js'), 'staging PM2');
-    assert(fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8').includes('ensure_pm2_process cursia-dynamic-provider-worker start:dynamic-provider-worker'), 'prod PM2');
+    // r61: producción arranca el worker con drenado desde scripts/ops/prod-release.sh (lo invoca deploy.yml).
+    assert(fs.readFileSync(path.join(REPO, 'scripts/ops/prod-release.sh'), 'utf8').includes('"cursia-dynamic-provider-worker dist/workers/dynamic-provider-worker.js"'), 'prod PM2');
+    assert(fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8').includes('bash scripts/ops/prod-release.sh install'), 'prod deploy.yml → prod-release.sh');
     const iMig = yml.indexOf('MIGRATION_ENV=staging node scripts/migrate-v21-finops.js');
     const iVer = yml.indexOf('MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js');
     assert(iMig > 0 && iVer > iMig, 'deploy-staging: migrate + verify FinOps');
@@ -1259,9 +1261,11 @@ async function dbChecks() {
     const ADMIN = { id: OWNER, email: 'Admin@Cursia.test' };
     const NOT_ADMIN = { id: OWNER, email: 'owner@cursia.test' };
     const NCTX = { ...CONTEXT, videoMode: 'mock' }; // Gamma/TTS reales por default ⇒ requiere aprobación
+    // r62: estos checks prueban el flujo de APROBACIÓN DE ADMIN: la política lo pide explícitamente (con los tres topes,
+    // sin el flag, la decisión sería la autorización única del usuario: scripts/check-r62-single-authorization.js).
     const coursePolicy = (cid, limits, onExceed = 'ADMIN_APPROVAL') => ds.query(
       `insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, $3)`,
-      [String(cid), JSON.stringify(limits), onExceed]);
+      [String(cid), JSON.stringify({ ...limits, requireHumanApprovalForRealSpend: true }), onExceed]);
     const authRows = (cid) => ds.query(`select id, run_id, estimate_id, decision, approved_by, reason, authorized_budget::text as b from public.cost_budget_authorizations where course_id = $1 order by created_at, (run_id is not null), id`, [cid]);
     const N = await makeCourse('Curso normal');
     // Tope mensual holgado: el harness tiene runs vivos de checks anteriores con autorizaciones enormes (cuentan como comprometidas).
