@@ -217,7 +217,7 @@ export function lightStem(token: string): string {
   else w = stemPlural(w);
   // Review M-B: pares que solo difieren en el género son palabras distintas (marco ≠ marca, medio ≠ media…); «informe»
   // (el documento) no es «información».
-  if (GENDER_PAIRS.has(w) || w === 'informe') return w;
+  if (GENDER_PAIRS.has(w) || WHOLE_WORDS.has(w)) return w;
   for (const suf of SUFFIXES) {
     if (w.endsWith(suf) && w.length - suf.length >= 4) { w = w.slice(0, -suf.length); break; }
   }
@@ -226,6 +226,13 @@ export function lightStem(token: string): string {
   if (w.length >= 5 && w.endsWith('e')) w = w.slice(0, -1);
   return w;
 }
+
+/**
+ * Sustantivos concretos que el stemmer juntaría con una acción de otra familia: se comparan enteros. «informe» (el
+ * documento) ≠ «información»; «plano» (el dibujo) ≠ «plan» / «planear» (análisis de recall, ST10); «planta» (la fábrica
+ * o el vegetal) ≠ «plantear»; «clave» ≠ «clavar».
+ */
+const WHOLE_WORDS: ReadonlySet<string> = new Set(['informe', 'plano', 'planta', 'clave']);
 
 /** Palabras cuyo masculino y femenino significan cosas distintas: se comparan enteras (sin quitar la vocal final). */
 const GENDER_PAIRS: ReadonlySet<string> = new Set([

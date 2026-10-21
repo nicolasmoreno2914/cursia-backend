@@ -33,6 +33,7 @@
 //   OA22 cursos chicos: dos términos que no forman la misma frase en los dos textos no vinculan (E2, E6, E4); la frase sí (R1)
 //   OA23 evidencia mínima sin frase ni título incluido → «posible RAx», sin importar la cobertura (E1, E5)
 //   OA24 resultados de un término quedan visibles como «posible RAx»; «quizá también trabaja» en un capítulo ya vinculado
+//   OA25 stemmer: «planos» ≠ «plan» (ST10), «planta» ≠ «plantear», «clave» ≠ «clavar»
 // Parte DB (Postgres 16 desechable; --pure-only la salta y lo dice):
 //   OD1 caso R1 exacto, curso sin documento: al guardar el perfil queda el contexto (RA1, RA2, CO1) sin subir el contador;
 //       «Usar este diseño» lo vincula solo (RA1 → Cap. 1, RA2 → Cap. 2, CO1 → ambos) con la misma huella; el perfil
@@ -463,6 +464,15 @@ const sha = (ctx) => CP.profileSha256(CP.normalizeProfile('academic', ctx));
     const v = V.verifyDesign({ ...base, autoLink: { chapterIds: [], outcomeIds: [], preview: [], review: { outcomes: [], chapters: [], partial: [{ chapterId: 'x', title: 'Caso integrador', outcomeIds: ['RA1'], linked: true }, { chapterId: 'y', title: 'Lectura de planos', outcomeIds: ['RA2'], linked: false }] } } });
     const r = v.checks.find((x) => x.id === 'outcome_review');
     assert(r && /«Caso integrador» quizá también trabaja RA1/.test(r.detail) && /«Lectura de planos»: posible RA2/.test(r.detail), 'textos: ' + (r && r.detail));
+  });
+
+  await check('OA25 stemmer: «planos» ≠ «plan» (análisis de recall ST10), «planta» ≠ «plantear», «clave» ≠ «clavar»; plan = planear = planeación sigue', () => {
+    const st = (w) => A.lightStem(w);
+    for (const [a, b] of [['planos', 'plan'], ['plano', 'planear'], ['planta', 'plantear'], ['plantas', 'plantear'], ['clave', 'clavar']]) assert(st(a) !== st(b), `${a} ≠ ${b}: ${st(a)} / ${st(b)}`);
+    for (const [a, b] of [['plan', 'planear'], ['planea', 'planeacion'], ['planos', 'plano'], ['plantas', 'planta']]) eq(st(a), st(b), `${a} = ${b}`);
+    const st10 = runCase(['Elabora el plan de trabajo de la obra', 'Interpreta especificaciones técnicas de materiales', 'Controla el presupuesto de la obra'],
+      [['a', 'Planos de la obra'], ['b', 'Especificaciones de materiales'], ['c', 'Control presupuestal'], ['d', 'Seguridad en obra']]);
+    assert(!(st10.L.a || []).includes('RA1'), 'ST10: «Planos de la obra» no se vincula a «Elabora el plan de trabajo de la obra»: ' + JSON.stringify(st10.L));
   });
 
   if (PURE_ONLY) console.log('\n(--pure-only: parte DB omitida)');
