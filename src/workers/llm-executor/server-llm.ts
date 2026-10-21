@@ -3,7 +3,7 @@ import type { DataSource } from 'typeorm';
 import { pauseRunForCap, reservePaidCall, RunBudgetCapReached, serverLlmChargeInput, settlePaidCall, WorkerLedger } from '../finops-worker-hooks';
 import type { CallRole } from '../../modules/finops/finops-ledger.service';
 import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
-import { LlmStreamError, LlmStreamResult, streamMessage } from './anthropic-stream';
+import { LlmStreamError, LlmStreamResult, nonStreamMessage, streamMessage } from './anthropic-stream';
 import { inFlightRemainingMs, PRIOR_CALL_IN_FLIGHT, priorCallInFlightMessage, retryAfterSecondsFor } from '../lease-takeover';
 import { settleAmbiguousAsPossibleDuplicate } from '../../modules/finops/ambiguous-resend';
 
@@ -49,6 +49,36 @@ export const LLM_UNKNOWN_EVENT_MAX = 1;
 /** Prefijo del hash del pedido dentro del callTag de la reserva (identifica "la misma llamada" entre intentos y workers). */
 export const LLM_CALL_HASH_LEN = 12;
 export const LLM_WORKER_MAX_TOKENS_CAP = 16000;
+/**
+ * r64 (R1 #1567): la MISMA solicitud cortada a mitad del stream no se repite igual. Tras un corte, esa llamada se
+ * reenvía por el transporte sin streaming (respuesta entera o error HTTP conocido, sin cobro a medias); si esa vía
+ * tampoco entrega, la parte falla con este código en vez de quemar su presupuesto de recuperación en reintentos
+ * idénticos.
+ */
+export const LLM_OUTPUT_CUT_REPEATED = 'llm_output_cut_repeated';
+export type LlmTransport = 'stream' | 'nonstream';
+
+/**
+ * r64: ¿alguna llamada de esta parte ya se cortó a mitad del stream en su ventana actual (este intento o uno
+ * anterior, otro proceso incluido)? En R1 los cortes fueron de UNA parte (la principal y sus reintentos dirigidos):
+ * con un corte, toda la parte sigue sin streaming. Lee el ledger: el cargo conservador del corte
+ * (`metadata.streamCut`) o su ajuste (`llm_worker_stream_cut_conservative`). Ante un error de lectura responde
+ * `false` (el primer envío vuelve a ser por streaming; nunca bloquea).
+ */
+export async function priorStreamCut(ds: Pick<DataSource, 'query'>, itemRunId: string, since: Date): Promise<boolean> {
+  try {
+    const rows = await ds.query(
+      `select exists (select 1 from public.generation_cost_events
+         where item_run_id = $1 and created_at >= $2
+           and ((event_kind = 'CHARGE' and metadata ? 'streamCut')
+             or (event_kind = 'ADJUSTMENT' and metadata->>'reason' = 'llm_worker_stream_cut_conservative'))) as stream_cut_seen`,
+      [itemRunId, since],
+    );
+    return !!(rows && rows[0] && (rows[0].stream_cut_seen === true || rows[0].stream_cut_seen === 't'));
+  } catch {
+    return false;
+  }
+}
 
 export interface ServerLlmItem {
   itemRunId: string;
@@ -392,6 +422,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
   // r62 (I2-bis): instante en que ESTE proceso detectó su primer resultado desconocido (solapamiento de un evento).
   let firstUnknownAt: Date | null = null;
   const unknownCtx = () => ({ attempt: item.attempt, firstUnknownAt, maxParallelCalls: deps.maxParallelCalls });
+  // r64: llamadas (hash) de este proceso que ya se cortaron a mitad del stream; con una, la parte sigue sin streaming.
+  const cutCalls = new Map<string, { cuts: number; causes: string[] }>();
+  let streamCutSeen: boolean | null = null; // null = todavía no se miró el ledger de la parte
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const api = async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>, cacheOpts?: { cachePrefix?: string }): Promise<string> {
     const { body, model: useModel, maxTokens } = serverLlmRequestBody({ system, user, maxTok, schema, model, defaultModel: deps.defaultModel, cacheOpts });
@@ -413,6 +446,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     const win = await itemWindowStart(deps.dataSource, item.itemRunId);
     const cached = await fromCheckpoint(win);
     if (cached !== null) return cached;
+    // r64: transporte de ESTA llamada. Si ya se cortó por streaming (aquí o en un intento anterior), va sin streaming.
+    if (streamCutSeen === null) streamCutSeen = await priorStreamCut(deps.dataSource, item.itemRunId, win.since);
+    let transport: LlmTransport = streamCutSeen || cutCalls.size > 0 ? 'nonstream' : 'stream';
 
     // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
     const promptChars = JSON.stringify(body).length;
@@ -519,7 +555,8 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       }
       let r: LlmStreamResult;
       try {
-        r = await streamMessage({ apiKey: deps.apiKey, baseUrl: deps.baseUrl, body, idleMs: deps.idleMs, totalMs: deps.totalMs, fetchImpl: deps.fetchImpl });
+        const send = transport === 'nonstream' ? nonStreamMessage : streamMessage;
+        r = await send({ apiKey: deps.apiKey, baseUrl: deps.baseUrl, body, idleMs: deps.idleMs, totalMs: deps.totalMs, fetchImpl: deps.fetchImpl });
       } catch (e) {
         if (!(e instanceof LlmStreamError)) { notUnknown.delete(resKey); throw e; }
         const ambiguousHttp = e.kind === 'http' && LLM_HTTP_AMBIGUOUS_STATUSES.includes(e.extra.status ?? 0);
@@ -535,17 +572,32 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
           throw httpError(st, e.extra.body ?? e.message);
         }
         if (e.kind === 'cut') {
-          // Empezó y se cortó: Anthropic cobró lo generado. Se registra conservador (entrada exacta, salida = tope)
-          // y la parte lo reintenta como cualquier transitorio, dentro de su presupuesto.
+          // Empezó y se cortó: Anthropic cobró lo generado. Se registra conservador (entrada exacta, salida = tope).
+          // Lo recibido a medias NUNCA se usa (ni se completa a ciegas): la respuesta tiene que llegar entera y validarse.
           const u = e.extra.usage;
+          const cause = e.extra.cause || 'unknown_cut';
           notUnknown.delete(resKey); // sin message id no se puede liquidar: queda pendiente y cuenta como desconocida
           if (e.extra.messageId && u) {
-            await settlePaidCall(deps.finops, resKey, serverLlmChargeInput({
+            const charge = serverLlmChargeInput({
               ownerId: item.ownerId, itemRunId: item.itemRunId, model: useModel, messageId: e.extra.messageId, requestId: e.extra.requestId ?? null,
               usage: { ...u, output_tokens: Math.max(u.output_tokens, maxTokens) }, callRole: role.callRole, attempt: role.attempt,
-            }), 'llm_worker_stream_cut_conservative');
+            });
+            // r64: evidencia del corte en el ledger (antes se perdía: el log solo decía «se cortó»).
+            charge.metadata = { ...(charge.metadata || {}), streamCut: { callHash: hash.slice(0, LLM_CALL_HASH_LEN), transport, cause, partialChars: e.extra.partialChars ?? null, sawUsageDelta: !!e.extra.sawUsageDelta, receivedOutputTokens: u.output_tokens } };
+            await settlePaidCall(deps.finops, resKey, charge, 'llm_worker_stream_cut_conservative');
           }
-          throw { fatal: false, status: 0, msg: 'La respuesta de la IA se cortó antes de terminar. Reintentando…' } as ApiError;
+          const prev = cutCalls.get(hash) || { cuts: 0, causes: [] };
+          prev.cuts++; prev.causes.push(cause);
+          cutCalls.set(hash, prev);
+          deps.logger.warn(`[llm-worker] ${item.itemKey}: la respuesta de la llamada ${hash.slice(0, 10)} se cortó a mitad (${transport}; causa ${cause}; ${e.extra.partialChars ?? '?'} caracteres recibidos; message ${e.extra.messageId || '?'}; request ${e.extra.requestId || '?'}): ${e.message}`);
+          if (transport === 'stream') {
+            // r64: cambio de estrategia, no repetición: la MISMA solicitud por el transporte sin streaming, ya (dentro del
+            // mismo presupuesto: el guard de la parte y del run se vuelve a evaluar antes del envío).
+            transport = 'nonstream';
+            continue;
+          }
+          // Sin streaming no hay cortes a mitad; si llegara a pasar, no se insiste igual.
+          throw { fatal: true, status: 0, code: LLM_OUTPUT_CUT_REPEATED, msg: `${LLM_OUTPUT_CUT_REPEATED}: la respuesta de la IA se cortó ${prev.cuts} veces en la misma solicitud (${prev.causes.join(', ')}); no se repite igual` } as ApiError;
         }
         // Desconocido (sin respuesta, o timeout de gateway 408/504): la reserva queda PENDIENTE (cuenta en el
         // presupuesto y en el contador de desconocidos).
