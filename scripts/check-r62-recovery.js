@@ -671,7 +671,10 @@ async function dbChecks() {
     }
     const workerDeps = (over = {}) => ({
       scheduler: sched, dataSource: ds, artifacts, logger: capLogger, executorId: 'r62-provider-worker', leaseSeconds: 120,
-      finops: ledger, budget, gammaPollMs: 20, gammaTimeoutMs: 3000, ...over,
+      finops: ledger, budget, gammaPollMs: 20, gammaTimeoutMs: 3000,
+      // Rasterizador falso: el check no depende de que el runner tenga pdftoppm (poppler-utils), como en CI.
+      rasterizer: { async available() { return true; }, async firstPagePng() { return Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==', 'base64'); } },
+      ...over,
     });
     const claimProvider = (runId, type) => sched.claimNextItem({ executorId: 'r62-provider-worker', types: [type], leaseSeconds: 120, runId });
     const later = (mins) => new Date(Date.now() + mins * 60_000);
