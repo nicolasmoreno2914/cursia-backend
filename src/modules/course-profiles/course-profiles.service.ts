@@ -358,8 +358,10 @@ export class CourseProfilesService {
       // r63: los resultados y competencias del perfil pasan al contexto académico (ids estables, sin duplicar, el documento
       // manda), EN LA MISMA transacción. Sin IA. Los vínculos con los capítulos NO se escriben aquí: el contador de la
       // estructura no cambia (la interfaz encadena «guardar el perfil → vincular → aplicar» con el contador que tiene);
-      // los escribe «Usar este diseño» (design/fix link_outcomes, que ya ve la vista previa) o el Prebrief.
-      const academicFromProfile = kind === 'pedagogy' ? await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: false, link: false }) : undefined;
+      // los escribe «Usar este diseño» (design/fix link_outcomes, que ya ve la vista previa) o «Preparar» el Prebrief. Solo
+      // agrega (quitar resultados podaría vínculos y subiría el contador). Review M3: no escribe por encima de una propuesta
+      // preparada o aprobada (el cambio del perfil la deja vieja; al prepararla de nuevo se guarda).
+      const academicFromProfile = kind === 'pedagogy' ? await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: true, link: false }) : undefined;
       await qr.commitTransaction();
       return {
         created: true,

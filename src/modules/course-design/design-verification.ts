@@ -103,7 +103,7 @@ export interface VerificationInput {
      * r63 · Sin documento: lo que Cursia NO vincula porque no encontró una coincidencia confiable (nunca lo fuerza):
      * resultados sin un capítulo que los trabaje con claridad y capítulos de contenido sin un resultado que les encaje.
      */
-    review?: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[] };
+    review?: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[]; partial?: { chapterId: string; title: string; outcomeIds: string[] }[] };
   };
   /** Ids (del Manifest) de los capítulos que propone el diseño y todavía no existen (review L84 I3). */
   proposedChapterIds: string[];
@@ -230,15 +230,23 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     }
     // r63 · Casos ambiguos: Cursia no vincula sin una coincidencia confiable; el docente decide en el editor.
     const rv = input.autoLink.review;
-    if (rv && (rv.outcomes.length || rv.chapters.length)) {
+    const partial = rv && rv.partial ? rv.partial : [];
+    if (rv && (rv.outcomes.length || rv.chapters.length || partial.length)) {
       const parts = [
         rv.outcomes.length ? `${rv.outcomes.map((o) => o.id).join(', ')}: ningún capítulo lo trabaja con claridad` : '',
         rv.chapters.length ? `${list(rv.chapters.map((c) => c.title))}: no encaja con ningún resultado` : '',
+        // Review M2: un capítulo vinculado que además comparte términos con otro resultado (por debajo del umbral).
+        ...partial.slice(0, 3).map((p) => `«${p.title}» quizá también trabaja ${p.outcomeIds.join(', ')}`),
       ].filter(Boolean);
+      const what = [
+        rv.outcomes.length ? plural(rv.outcomes.length, 'resultado sin capítulo claro', 'resultados sin capítulo claro') : '',
+        rv.chapters.length ? plural(rv.chapters.length, 'capítulo sin resultado claro', 'capítulos sin resultado claro') : '',
+        partial.length ? plural(partial.length, 'capítulo con un vínculo dudoso', 'capítulos con vínculos dudosos') : '',
+      ].filter(Boolean).join(' y ');
       add({ id: 'outcome_review', area: 'outcomes', severity: 'warning',
-        title: `Requiere revisión: ${rv.outcomes.length ? plural(rv.outcomes.length, 'resultado sin capítulo claro', 'resultados sin capítulo claro') : ''}${rv.outcomes.length && rv.chapters.length ? ' y ' : ''}${rv.chapters.length ? plural(rv.chapters.length, 'capítulo sin resultado claro', 'capítulos sin resultado claro') : ''}`,
-        detail: `${parts.join('. ')}. Cursia no los vincula a la fuerza: vincúlalos en el editor o ajusta el título u objetivo del capítulo.`,
-        fix: { kind: 'editor', action: 'outcome_links', label: 'Vincular en el editor', targets: { chapterIds: rv.chapters.map((c) => c.chapterId) } } });
+        title: `Requiere revisión: ${what}`,
+        detail: `${parts.join('. ')}. Cursia no vincula sin una coincidencia clara: revísalo en el editor o ajusta el título u objetivo del capítulo.`,
+        fix: { kind: 'editor', action: 'outcome_links', label: 'Vincular en el editor', targets: { chapterIds: [...rv.chapters.map((c) => c.chapterId), ...partial.map((p) => p.chapterId)] } } });
     }
     for (const f of findings) {
       const severity: CheckSeverity = f.severity === 'critical' ? 'critical' : f.severity === 'warning' ? 'warning' : 'info';

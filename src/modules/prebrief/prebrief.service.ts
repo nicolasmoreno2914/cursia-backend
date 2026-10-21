@@ -10,7 +10,8 @@ import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { BRIEF_KEY, alignCourseContextWithSnapshot, parseBrief } from '../course-facts/course-facts';
 import { loadCurrentAcademicContext } from '../academic-context/academic-db';
-import { syncAcademicOutcomesFromProfile } from '../academic-context/profile-outcomes-db';
+import { planningOverlay, profileOutcomesBlockedBy, syncAcademicOutcomesFromProfile } from '../academic-context/profile-outcomes-db';
+import { hasDocuments } from '../academic-context/proposed-context';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
@@ -121,12 +122,15 @@ export class PrebriefService {
   }
 
   /**
-   * r63 · Antes de calcular la propuesta: los resultados del perfil pedagógico quedan en el contexto académico y los
-   * capítulos sin vínculos de un curso sin documento se vinculan (idempotente, sin IA). Nunca sobre una propuesta
-   * preparada o aprobada, ni mientras se produce el curso: esas no se invalidan solas.
+   * r63 · «Preparar»: guarda lo que el borrador mostró como vista previa (planningOverlay): los resultados del perfil en el
+   * contexto académico y los vínculos de un curso sin documento (idempotente, sin IA). El GET no escribe. Nunca sobre una
+   * propuesta preparada o aprobada, ni mientras se produce el curso.
    */
   private async syncProfileOutcomes(courseId: number, ownerId: string): Promise<boolean> {
     await this.loadCourse(courseId, ownerId);
+    // Review M5: con documento nunca hay nada que guardar: sin transacción ni lock.
+    const stored = await loadCurrentAcademicContext(this.dataSource, courseId).catch((err: any) => { if (err && err.code === '42P01') return null; throw err; });
+    if (stored && hasDocuments(stored.context)) return false;
     const qr = this.dataSource.createQueryRunner();
     try {
       await qr.connect();
@@ -155,11 +159,13 @@ export class PrebriefService {
   private async draftFrom(courseId: number, course: any, card: any): Promise<PrebriefDraft> {
     const q = this.dataSource;
     const meta = await this.metadata(q, courseId);
-    const facts = await loadCourseFacts(q, courseId);
+    // r63: lo mismo que ve «Cursia recomienda»: el contexto y los vínculos que se guardarán al preparar (sin escribir).
+    const overlay = await planningOverlay(q, courseId, { respectPrebrief: true }).catch((err: any) => { if (err && err.code === '42P01') return null; throw err; });
+    const facts = await loadCourseFacts(q, courseId, undefined, overlay && overlay.virtual ? overlay.academic : undefined);
     // Review BE-1 I3: un error de lectura NO se traga (un modelo distinto invalidaría para siempre una aprobación); solo una
     // base sin las tablas de perfiles (entornos viejos) cuenta como «sin datos».
     const missingTable = (err: any) => { if (err && err.code === '42P01') return null; throw err; };
-    const academic = await loadCurrentAcademicContext(q, courseId).catch(missingTable);
+    const academic = overlay && overlay.virtual ? overlay.academic : await loadCurrentAcademicContext(q, courseId).catch(missingTable);
     const pedagogy = await loadCurrentPedagogicalProfile(q, courseId).catch(missingTable);
     const format = await readCourseFormat(q, courseId);
     const origin = await readStructureOrigin(q as any, courseId);
@@ -248,13 +254,14 @@ export class PrebriefService {
   /** GET: estado completo (borrador + versiones + flujo). */
   async state(courseId: number, ownerId: string, card?: any) {
     await this.assertTablesReady();
-    if (!card) await this.syncProfileOutcomes(courseId, ownerId);
+    // r63: el GET no escribe. Una propuesta lista/aprobada que quedó vieja deja de proteger la vista previa: se recalcula.
+    const frozenBefore = !card && (await profileOutcomesBlockedBy(this.dataSource, courseId, true)) === 'PREBRIEF_FROZEN';
     // `card`: «Cursia recomienda» ya calculado en este mismo pedido (motivos y confirmaciones no lo cambian; es lo
     // más caro del borrador). Sin él se calcula.
     let draft = card ? await this.draftFrom(courseId, await this.loadCourse(courseId, ownerId), card) : await this.draft(courseId, ownerId);
     await this.invalidateIfStale(courseId, draft, ownerId);
     // r63: una propuesta que quedó vieja ya no protege nada: ahora sí se completan los resultados y vínculos.
-    if (!card && (await this.syncProfileOutcomes(courseId, ownerId))) draft = await this.draft(courseId, ownerId);
+    if (frozenBefore && (await profileOutcomesBlockedBy(this.dataSource, courseId, true)) !== 'PREBRIEF_FROZEN') draft = await this.draft(courseId, ownerId);
     const vs = await this.versions(this.dataSource, courseId);
     const meta = await this.metadata(this.dataSource, courseId);
     const latest = vs[0] || null;

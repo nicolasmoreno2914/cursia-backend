@@ -5,6 +5,7 @@ import { advanceStructureOriginIfUntouched } from '../course-structure/structure
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import type { AcademicContextV1 } from './academic-context';
+import { hasDocuments } from './proposed-context';
 import { StoredAcademicContext, loadCurrentAcademicContext } from './academic-db';
 import {
   DocumentlessLinkPlan,
@@ -59,20 +60,43 @@ export async function profileOutcomesBlockedBy(q: Q, courseId: number, respectPr
   return null;
 }
 
+export interface PlanningOverlay {
+  /** Contexto académico que quedaría vigente (el guardado si no cambia nada). */
+  academic: StoredAcademicContext | null;
+  /** true = algo de esto todavía no está guardado (contexto o vínculos): se guarda al usar el diseño o al preparar. */
+  virtual: boolean;
+  /** Vínculos de cada capítulo de contenido tal como quedarían (los guardados que siguen vigentes + los nuevos). */
+  links: Map<string, string[]> | null;
+}
+
 /**
- * Contexto académico EFECTIVO: el guardado o, si no hay ninguno, el que saldría del perfil pedagógico (sin guardarlo:
- * vista previa de la recomendación). `virtual: true` = todavía no está guardado (se guarda al usar el diseño).
+ * r63 · Lo que Cursia guardaría AHORA en la planificación académica (contexto desde el perfil + vínculos sin documento),
+ * SIN escribir nada: «Cursia recomienda» y el GET del Prebrief lo muestran; «Usar este diseño» (design/fix) y «Preparar»
+ * lo guardan con `syncAcademicOutcomesFromProfile` (mismo cálculo → mismo contexto, mismo sha, mismos vínculos).
+ * Con documento, bloqueado o sin la migración: lo guardado, tal cual.
  */
-export async function effectiveAcademicContext(q: Q, courseId: number, opts: { respectPrebrief: boolean }): Promise<{ academic: StoredAcademicContext | null; virtual: boolean }> {
+export async function planningOverlay(q: Q, courseId: number, opts: { respectPrebrief: boolean }): Promise<PlanningOverlay> {
   const stored = await loadCurrentAcademicContext(q, courseId);
-  if (stored) return { academic: stored, virtual: false };
-  if (await profileOutcomesBlockedBy(q, courseId, opts.respectPrebrief)) return { academic: null, virtual: false };
-  if (!(await academicKindSupported(q))) return { academic: null, virtual: false };
+  const asIs: PlanningOverlay = { academic: stored, virtual: false, links: null };
+  if (stored && hasDocuments(stored.context)) return asIs;
+  if (await profileOutcomesBlockedBy(q, courseId, opts.respectPrebrief)) return asIs;
+  if (!(await academicKindSupported(q))) return asIs;
   const ped = await loadCurrentPedagogicalProfile(q, courseId);
-  const r = academicContextFromProfile(null, ped ? ped.profile : null, await readProfileOutcomesRecord(q, courseId));
-  if (r.action !== 'create' || !r.context) return { academic: null, virtual: false };
-  const context = normalizeProfile('academic', r.context);
-  return { academic: { version: 0, context, sha256: profileSha256(context) }, virtual: true };
+  const r = academicContextFromProfile(stored ? stored.context : null, ped ? ped.profile : null, await readProfileOutcomesRecord(q, courseId), { allowRemovals: true });
+  let academic = stored;
+  let virtual = false;
+  if ((r.action === 'create' || r.action === 'update') && r.context) {
+    const context = normalizeProfile('academic', r.context);
+    const sha = profileSha256(context);
+    if (!stored || stored.sha256 !== sha) { academic = { version: (stored ? stored.version : 0) + 1, context, sha256: sha }; virtual = true; }
+  }
+  if (!academic || !isDocumentlessContext(academic.context)) return { academic, virtual, links: null };
+  const { plan, current, prunedAny } = await documentlessLinkPlanFor(q, courseId, academic.context);
+  const links = new Map<string, string[]>();
+  for (const [id, ids] of current) links.set(id, ids);
+  for (const l of plan.links) links.set(l.chapterId, l.suggested);
+  const changedLinks = plan.links.length > 0 || prunedAny;
+  return { academic, virtual: virtual || changedLinks, links };
 }
 
 /**
@@ -87,6 +111,10 @@ export async function academicKindSupported(q: Q): Promise<boolean> {
 export interface DocumentlessLinkCandidates {
   plan: DocumentlessLinkPlan;
   titles: Map<string, string>;
+  /** Vínculos guardados de cada capítulo de contenido que siguen siendo ids del contexto (los demás, podados). */
+  current: Map<string, string[]>;
+  /** Algún capítulo tiene guardados ids que el contexto ya no define (se podan al guardar). */
+  prunedAny: boolean;
 }
 
 /**
@@ -101,12 +129,15 @@ export async function documentlessLinkPlanFor(q: Q, courseId: number, ctx: Acade
     [courseId],
   );
   const pins = await loadDesignPins(q, courseId);
+  const known = new Set([...ctx.outcomes.map((o) => o.id), ...ctx.competencies.map((c) => c.id)]);
+  const current = new Map(rows.filter((r) => r.kind !== 'practice').map((r) => [r.id, (Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : []).filter((x) => known.has(x))] as [string, string[]]));
   const plan = planDocumentlessLinks(ctx, rows.filter((r) => r.kind !== 'practice').map((r) => ({
     id: r.id, title: r.title, objective: r.objective, description: r.description,
     outcomeIds: Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : [],
     eligible: !(pins[r.id] && pins[r.id].noLinks),
   })));
-  return { plan, titles: new Map(rows.map((r) => [r.id, r.title])) };
+  const prunedAny = rows.some((r) => Array.isArray(r.outcome_ids) && (r.outcome_ids as string[]).some((x) => !known.has(x)));
+  return { plan, titles: new Map(rows.map((r) => [r.id, r.title])), current, prunedAny };
 }
 
 /** Quita de course_chapters.outcome_ids los ids que `ctx` no define (sube el contador si cambió algo). */
@@ -140,6 +171,8 @@ export interface ProfileOutcomesSync {
   skipped: string | null;
   context: { action: 'none' | 'create' | 'update'; version: number | null; added: string[]; removed: string[]; duplicates: string[]; ignored: string[] };
   linked: { chapterId: string; title: string; outcomes: string[] }[];
+  /** Vínculos quitados porque el resultado salió del contexto (sube el contador: va en `structureVersionCounter`). */
+  pruned?: { chapterId: string; removed: string[] }[];
   ambiguous: { id: string; text: string }[];
   unmatchedChapters: { chapterId: string; title: string }[];
   structureVersionCounter: number | null;
@@ -155,7 +188,7 @@ export async function syncAcademicOutcomesFromProfile(
   qr: Q,
   courseId: number,
   ownerId: string,
-  opts: { respectPrebrief: boolean; link: boolean },
+  opts: { respectPrebrief: boolean; link: boolean; allowRemovals?: boolean },
 ): Promise<ProfileOutcomesSync> {
   const out: ProfileOutcomesSync = {
     skipped: null, context: { action: 'none', version: null, added: [], removed: [], duplicates: [], ignored: [] },
@@ -167,7 +200,8 @@ export async function syncAcademicOutcomesFromProfile(
   const current = await loadCurrentAcademicContext(qr, courseId);
   const ped = await loadCurrentPedagogicalProfile(qr, courseId);
   const record = await readProfileOutcomesRecord(qr, courseId);
-  const r = academicContextFromProfile(current ? current.context : null, ped ? ped.profile : null, record);
+  // Quitar resultados poda vínculos (sube el contador): solo donde se vincula (link) o si el llamador lo pide.
+  const r = academicContextFromProfile(current ? current.context : null, ped ? ped.profile : null, record, { allowRemovals: opts.allowRemovals ?? opts.link });
   out.context = { action: r.action === 'skip' ? 'none' : r.action, version: current ? current.version : null, added: r.added, removed: r.removed, duplicates: r.duplicates, ignored: r.ignored };
   if (r.action === 'skip') out.skipped = r.reason;
   let ctx: AcademicContextV1 | null = current ? current.context : null;
@@ -184,7 +218,10 @@ export async function syncAcademicOutcomesFromProfile(
         [courseId, version, JSON.stringify(next), sha, ownerId],
       );
       out.context.version = version;
-      if (r.removed.length) await pruneOutcomeLinksTo(qr, courseId, next);
+      if (r.removed.length) {
+        const pruned = await pruneOutcomeLinksTo(qr, courseId, next);
+        if (pruned.length) out.pruned = pruned;
+      }
     } else out.context.action = 'none';
     ctx = next;
   }
@@ -194,6 +231,7 @@ export async function syncAcademicOutcomesFromProfile(
       [courseId, [PROFILE_OUTCOMES_KEY], JSON.stringify(r.record)],
     );
   }
+  if (out.pruned) out.structureVersionCounter = Number((await qr.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]))[0].c);
   if (opts.link && ctx && isDocumentlessContext(ctx)) {
     const { plan, titles } = await documentlessLinkPlanFor(qr, courseId, ctx);
     const [c0] = await qr.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]);

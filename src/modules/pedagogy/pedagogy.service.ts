@@ -110,7 +110,7 @@ export class PedagogyService {
   async dryRunCourse(
     courseId: number,
     ownerId: string,
-    body: { profile?: unknown; activityTypeRules?: ActivityTypeRulesVersion; applyStructureAdjustments?: boolean; requirementDecisions?: DecisionOverrides; ignorePins?: boolean; academicOverride?: StoredAcademicContext | null },
+    body: { profile?: unknown; activityTypeRules?: ActivityTypeRulesVersion; applyStructureAdjustments?: boolean; requirementDecisions?: DecisionOverrides; ignorePins?: boolean; academicOverride?: StoredAcademicContext | null; chapterLinksOverride?: ReadonlyMap<string, string[]> },
   ): Promise<DryRunResult & { profileSource: 'request' | 'saved' | 'none'; savedProfileVersion: number }> {
     const course = await this.coursesService.findOne(courseId, ownerId); // 404 si no es suyo
     if (course.structureVersion !== 'dynamic') {
@@ -137,6 +137,10 @@ export class PedagogyService {
       [courseId],
     );
     // Fase 3: el contexto académico guardado entra al Blueprint en memoria igual que en el lock.
+    // r63: «Cursia recomienda» pasa los vínculos que quedarán al usar el diseño (vista previa, sin escribir).
+    if (body.chapterLinksOverride) {
+      for (const ch of chapters as any[]) if (body.chapterLinksOverride.has(String(ch.id))) ch.outcome_ids = body.chapterLinksOverride.get(String(ch.id))!.length ? [...body.chapterLinksOverride.get(String(ch.id))!] : null;
+    }
     // r63: «Cursia recomienda» pasa el contexto que saldría del perfil pedagógico cuando todavía no está guardado.
     const academic = body.academicOverride !== undefined ? body.academicOverride : await loadCurrentAcademicContext(this.dataSource, courseId);
     // LOOP 7 (A1 I2): datos del curso de la fuente única (los mismos que el lock).

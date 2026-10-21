@@ -1,7 +1,7 @@
 import { ACADEMIC_LIMITS, AcademicContextV1, Competency, LearningOutcome, emptyAcademicContext } from './academic-context';
 import { bloomLevelOf } from './bloom';
 import { hasDocuments } from './proposed-context';
-import { normTokens } from '../coherence/normalize';
+import { SPANISH_STOPWORDS, stemPlural, stripToAscii } from '../coherence/normalize';
 import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
 
 /**
@@ -24,8 +24,8 @@ import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
  *
  * 2. `planDocumentlessLinks` — vínculos capítulo ↔ resultado SIN documento (sin unidades que apoyen la coincidencia):
  *    similitud léxica determinista entre el resultado y el título + objetivo + descripción del capítulo, sobre raíces de
- *    5 letras (activación / activar, emergencia / emergencias) sin palabras vacías ni verbos de Bloom, ponderada por lo
- *    raro que es cada término entre los capítulos (IDF). Un vínculo exige puntaje ≥ LINK_SCORE_MIN y al menos
+ *    un stemmer liviano de español (activación / activar, emergencia / emergencias, leyes / ley) sin palabras vacías,
+ *    ponderada por lo raro que es cada término entre los capítulos (IDF: lo que está en todos no cuenta). Un vínculo exige puntaje ≥ LINK_SCORE_MIN y al menos
  *    LINK_SHARED_MIN términos en común; si un resultado no tiene ningún capítulo así, queda AMBIGUO («requiere
  *    revisión»): nunca se fuerza un vínculo. Las competencias son transversales por definición (sin documento no
  *    están atadas a una unidad): van a todos los capítulos de contenido que trabajan algún resultado.
@@ -109,7 +109,13 @@ export function academicContextFromProfile(
   current: AcademicContextV1 | null,
   profile: PedagogicalProfile | null,
   record: ProfileOutcomesRecord | null,
+  /**
+   * false = solo agrega (guardar el perfil: quitar resultados podaría vínculos y subiría el contador de la estructura a
+   * espaldas de la interfaz). Las remociones se aplican donde se vincula: «Usar este diseño» y «Preparar» el Prebrief.
+   */
+  opts: { allowRemovals?: boolean } = {},
 ): ProfileOutcomesResult {
+  const allowRemovals = opts.allowRemovals !== false;
   const { entries, duplicates } = profileEntries(profile);
   const none = (action: ProfileOutcomesAction, reason: ProfileOutcomesSkip | null, ignored: string[] = []): ProfileOutcomesResult => ({
     action, reason, context: current, record, added: [], removed: [], duplicates, ignored,
@@ -118,7 +124,9 @@ export function academicContextFromProfile(
     const have = new Set([...current!.outcomes.map((o) => normalizeOutcomeText(o.text)), ...current!.competencies.map((c) => normalizeOutcomeText(c.text))]);
     return none('skip', 'DOCUMENT_CONTEXT', entries.filter((e) => !have.has(e.key)).map((e) => e.text));
   }
-  if (!entries.length) return none('skip', 'NO_PROFILE_OUTCOMES');
+  // Perfil vaciado: lo que agregó el puente también se quita (si nadie lo editó); sin registro, no hay nada del puente.
+  const bridged = !!record && Object.keys(record.items).length > 0 && !!current;
+  if (!entries.length && !(allowRemovals && bridged)) return none('skip', 'NO_PROFILE_OUTCOMES');
 
   const base: AcademicContextV1 = current ? JSON.parse(JSON.stringify(current)) : emptyAcademicContext();
   const wanted = new Set(entries.map((e) => e.key));
@@ -129,7 +137,7 @@ export function academicContextFromProfile(
     const was = items[id];
     if (was === undefined) return false;
     if (normalizeOutcomeText(text) !== was) { delete items[id]; return false; } // editado en el contexto: ya no es del puente
-    if (wanted.has(was)) return false;
+    if (wanted.has(was) || !allowRemovals) return false;
     delete items[id];
     removed.push(id);
     return true;
@@ -171,15 +179,16 @@ export function academicContextFromProfile(
 
 // ── 2. Vínculos sin documento ──────────────────────────────────────────────────────────────────────────────
 
-export const LINKING_VERSION = 1 as const;
+export const LINKING_VERSION = 2 as const;
 /** Puntaje mínimo (contención ponderada del resultado en el capítulo) para un vínculo confiable. */
 export const LINK_SCORE_MIN = 0.3;
-/** Términos en común mínimos (salvo resultados de uno o dos términos). */
+/** Términos DISCRIMINANTES en común mínimos (salvo resultados de uno o dos términos). */
 export const LINK_SHARED_MIN = 2;
 /** Un resultado se vincula también a otros capítulos que le encajan casi igual de bien (≥ 80 % del mejor). */
 export const LINK_NEAR_BEST = 0.8;
 export const LINK_MAX_CHAPTERS = 3;
-const STEM_LEN = 5;
+/** Por debajo del umbral pero con un término discriminante en común: el capítulo «quizá también trabaja» ese resultado. */
+export const LINK_PARTIAL_MIN = 0.15;
 /** Palabras que no dicen de qué trata un resultado ni un capítulo. */
 const GENERIC = new Set([
   'estudiante', 'estudiantes', 'participante', 'participantes', 'aprendiz', 'capaz', 'forma', 'manera', 'propio', 'propia', 'adecuado', 'adecuada',
@@ -187,12 +196,36 @@ const GENERIC = new Set([
   'todo', 'toda', 'traves', 'partir', 'sera', 'poder', 'puede', 'pueden', 'curso', 'capitulo', 'modulo', 'tema', 'unidad', 'introduccion', 'conceptos', 'concepto',
 ]);
 
-/** Raíces de los términos con contenido (sin palabras vacías, genéricas ni verbos de Bloom). */
+/** Sufijos derivativos y verbales (de más largo a más corto). Lo que queda debe tener al menos 4 letras. */
+const SUFFIXES = ['amientos', 'imientos', 'amiento', 'imiento', 'aciones', 'iciones', 'idades', 'acion', 'icion', 'idad', 'mente', 'encia', 'ancia', 'ar', 'er', 'ir'];
+
+/**
+ * Raíz de una palabra (stemmer liviano de español, determinista). Plurales (-ces → z, -yes → y, -es tras r/l/n/d/j, -s),
+ * un sufijo derivativo o verbal (-ción, -miento, -idad, -encia, -ar/-er/-ir) y la vocal final: activación / activar /
+ * activa → «activ»; emergencia / emergencias → «emerg»; leyes / ley → «ley». Palabras distintas con el mismo prefijo no
+ * colisionan (contexto «context» ≠ contenido «contenid», comunidad «comun» ≠ comunicación «comunic», control ≠ contrato).
+ */
+export function lightStem(token: string): string {
+  let w = token;
+  if (w.length > 4 && w.endsWith('yes')) w = w.slice(0, -2);
+  else w = stemPlural(w);
+  for (const suf of SUFFIXES) {
+    if (w.endsWith(suf) && w.length - suf.length >= 4) { w = w.slice(0, -suf.length); break; }
+  }
+  if (w.length >= 5 && /[aeo]$/.test(w)) w = w.slice(0, -1);
+  return w;
+}
+
+/**
+ * Raíces de los términos con contenido (sin palabras vacías ni genéricas). Los verbos de Bloom NO se descartan (review
+ * I2: descartar «gestiona» y no «gestión» rompía la simetría; descartar también los sustantivos borraba temas como
+ * «costos» de «costear»): un verbo que aparece en todos los capítulos ya no cuenta por el IDF.
+ */
 export function conceptStems(text: string): Set<string> {
   const out = new Set<string>();
-  for (const t of normTokens(text)) {
-    if (t.length <= 2 || /^\d+$/.test(t) || GENERIC.has(t) || bloomLevelOf(t) !== null) continue;
-    out.add(t.length > STEM_LEN ? t.slice(0, STEM_LEN) : t);
+  for (const raw of stripToAscii(text).split(' ')) {
+    if (!raw || SPANISH_STOPWORDS.has(raw) || raw.length <= 2 || /^\d+$/.test(raw) || GENERIC.has(raw)) continue;
+    out.add(lightStem(raw));
   }
   return out;
 }
@@ -216,6 +249,8 @@ export interface DocumentlessLinkPlan {
   ambiguous: { id: string; text: string; bestChapterId: string | null; score: number }[];
   /** Capítulos elegibles sin vínculos que no encajan con ningún resultado (requieren revisión). */
   unmatchedChapterIds: string[];
+  /** Capítulos que se vinculan y además comparten términos con otros resultados por debajo del umbral (revisar). */
+  partial: { chapterId: string; outcomeIds: string[] }[];
   /** Puntajes resultado × capítulo (redondeados), para mostrar y probar. */
   scores: { outcomeId: string; chapterId: string; score: number; shared: number }[];
 }
@@ -228,13 +263,23 @@ export function isDocumentlessContext(ctx: AcademicContextV1 | null | undefined)
   return !!ctx && !hasDocuments(ctx) && ctx.units.length === 0;
 }
 
+/**
+ * Vínculos sin documento. Puntaje = contención del resultado en el capítulo, ponderada por IDF entre los capítulos de
+ * contenido: un término que aparece en TODOS los capítulos (el tema del curso: «seguridad», «obra») pesa 0 y no cuenta
+ * como término en común. Un vínculo exige puntaje ≥ LINK_SCORE_MIN y LINK_SHARED_MIN términos discriminantes en común.
+ * Ante la duda: ambiguo («requiere revisión»).
+ */
 export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChapterInput[]): DocumentlessLinkPlan {
   const chText = (c: LinkChapterInput) => [c.title, c.objective || '', c.description || ''].join(' ');
   const chStems = chapters.map((c) => conceptStems(chText(c)));
   const N = chapters.length;
   const df = new Map<string, number>();
   for (const s of chStems) for (const t of s) df.set(t, (df.get(t) || 0) + 1);
-  const idf = (t: string) => Math.log(1 + N / Math.max(1, df.get(t) || 0));
+  const dfOf = (t: string) => df.get(t) || 0;
+  const ubiquitous = (t: string) => N >= 2 && dfOf(t) >= N;
+  const idf = (t: string) => (ubiquitous(t) ? 0 : Math.log(1 + N / Math.max(1, dfOf(t))));
+  // Discriminante = no está en todos los capítulos (con un solo capítulo no hay con qué comparar: todo cuenta).
+  const rare = (t: string) => !ubiquitous(t);
   const known = new Set([...ctx.outcomes.map((o) => o.id), ...ctx.competencies.map((c) => c.id)]);
   const current = new Map(chapters.map((c) => [c.id, c.outcomeIds.filter((x) => known.has(x))]));
   const covered = new Set(chapters.flatMap((c) => current.get(c.id)!));
@@ -242,33 +287,33 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
   const plan = new Map<string, Set<string>>(open.map((c) => [c.id, new Set<string>()]));
 
   const scores: DocumentlessLinkPlan['scores'] = [];
-  const scoreOf = new Map<string, { score: number; shared: number }>();
+  const scoreOf = new Map<string, { score: number; shared: number; rare: boolean; need: number }>();
   for (const o of ctx.outcomes) {
-    const os = conceptStems(o.text);
-    const total = [...os].reduce((a, t) => a + idf(t), 0);
+    const os = [...conceptStems(o.text)].filter((t) => !ubiquitous(t));
+    const total = os.reduce((a, t) => a + idf(t), 0);
     chapters.forEach((c, i) => {
       let w = 0;
       let shared = 0;
-      for (const t of os) if (chStems[i].has(t)) { w += idf(t); shared++; }
-      const s = { score: total > 0 ? round3(w / total) : 0, shared };
+      let hasRare = false;
+      for (const t of os) if (chStems[i].has(t)) { w += idf(t); shared++; if (rare(t)) hasRare = true; }
+      const s = { score: total > 0 ? round3(w / total) : 0, shared, rare: hasRare, need: Math.min(LINK_SHARED_MIN, os.length) };
       scoreOf.set(`${o.id}|${c.id}`, s);
-      scores.push({ outcomeId: o.id, chapterId: c.id, ...s });
+      scores.push({ outcomeId: o.id, chapterId: c.id, score: s.score, shared });
     });
   }
   const reliable = (oid: string, cid: string) => {
     const s = scoreOf.get(`${oid}|${cid}`)!;
-    const o = ctx.outcomes.find((x) => x.id === oid)!;
-    return s.score >= LINK_SCORE_MIN && s.shared >= Math.min(LINK_SHARED_MIN, conceptStems(o.text).size);
+    return s.need > 0 && s.score >= LINK_SCORE_MIN && s.shared >= s.need && s.rare;
   };
 
   // a) Cada resultado → el capítulo que mejor le encaja (y los que le encajan casi igual), si la coincidencia es confiable.
   const ambiguous: DocumentlessLinkPlan['ambiguous'] = [];
   for (const o of ctx.outcomes) {
+    if (covered.has(o.id)) continue; // ya lo trabaja un capítulo (decisión anterior): no se agregan más
     const ranked = chapters.filter((c) => c.eligible || current.get(c.id)!.length)
       .map((c, i) => ({ c, i, ...scoreOf.get(`${o.id}|${c.id}`)! }))
       .sort((a, b) => b.score - a.score || b.shared - a.shared || a.i - b.i);
     const ok = ranked.filter((r) => reliable(o.id, r.c.id));
-    if (covered.has(o.id)) continue; // ya lo trabaja un capítulo (decisión anterior): no se agregan más
     if (!ok.length) {
       ambiguous.push({ id: o.id, text: o.text, bestChapterId: ranked.length && ranked[0].score > 0 ? ranked[0].c.id : null, score: ranked.length ? ranked[0].score : 0 });
       continue;
@@ -285,7 +330,19 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
       .sort((a, b) => b.score - a.score || b.shared - a.shared || cmpId(a.o.id, b.o.id))[0];
     if (best) set.add(best.o.id);
   }
-  // c) Competencias: transversales. Van a todos los capítulos abiertos que trabajan algún resultado (si el curso no
+  // c) Capítulos vinculados que también comparten un término discriminante con otro resultado (por debajo del umbral):
+  //    se avisa («quizá también trabaja RAx»), nunca se vincula.
+  const partial: DocumentlessLinkPlan['partial'] = [];
+  for (const c of open) {
+    const set = plan.get(c.id)!;
+    if (!set.size) continue;
+    const extra = ctx.outcomes.filter((o) => !set.has(o.id)).filter((o) => {
+      const s = scoreOf.get(`${o.id}|${c.id}`)!;
+      return s.rare && s.score >= LINK_PARTIAL_MIN;
+    }).map((o) => o.id);
+    if (extra.length) partial.push({ chapterId: c.id, outcomeIds: extra });
+  }
+  // d) Competencias: transversales. Van a todos los capítulos abiertos que trabajan algún resultado (si el curso no
   //    declara resultados, a todos los capítulos abiertos). Un capítulo sin resultado queda sin vínculos: se revisa.
   const unmatchedChapterIds = open.filter((c) => !plan.get(c.id)!.size && ctx.outcomes.length > 0).map((c) => c.id);
   for (const c of open) {
@@ -296,5 +353,5 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
   const links = open
     .map((c) => ({ chapterId: c.id, suggested: [...plan.get(c.id)!].sort(cmpId).slice(0, ACADEMIC_LIMITS.outcomeIdsPerItem) }))
     .filter((l) => l.suggested.length);
-  return { linkingVersion: LINKING_VERSION, links, ambiguous, unmatchedChapterIds, scores };
+  return { linkingVersion: LINKING_VERSION, links, ambiguous, unmatchedChapterIds, partial, scores };
 }

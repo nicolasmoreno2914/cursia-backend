@@ -9,7 +9,7 @@ import { PedagogyService } from '../pedagogy/pedagogy.service';
 import { emptyPedagogicalProfile, normalizePedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { loadCurrentAcademicContext } from '../academic-context/academic-db';
-import { documentlessLinkPlanFor, effectiveAcademicContext, syncAcademicOutcomesFromProfile } from '../academic-context/profile-outcomes-db';
+import { documentlessLinkPlanFor, planningOverlay, syncAcademicOutcomesFromProfile } from '../academic-context/profile-outcomes-db';
 import { isDocumentlessContext } from '../academic-context/profile-outcomes';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { isValidTargetHours } from '../study-time/target-hours';
@@ -137,14 +137,16 @@ export class CourseDesignService {
     // Review L83 M-7: solo una base sin la tabla de perfiles se trata como «sin contexto»; cualquier otro error se ve.
     // r63: sin contexto guardado, el que sale de los resultados del perfil pedagógico (vista previa: se guarda al usar el
     // diseño o al preparar el Prebrief). Nunca sobre una propuesta preparada/aprobada (no se invalida sola).
-    const eff = await effectiveAcademicContext(this.dataSource, courseId, { respectPrebrief: true }).catch((err) => {
-      if (err && (err as { code?: string }).code === '42P01') return { academic: null, virtual: false };
+    const eff = await planningOverlay(this.dataSource, courseId, { respectPrebrief: true }).catch((err) => {
+      if (err && (err as { code?: string }).code === '42P01') return { academic: null, virtual: false, links: null };
       throw err;
     });
     const academic = eff.academic;
     const academicOverride = eff.virtual ? academic : undefined;
+    // Vínculos tal como quedarán al usar el diseño (misma alineación antes y después: la vista previa no miente).
+    const chapterLinksOverride = eff.virtual && eff.links ? eff.links : undefined;
     const proposedHours = await loadProposedHours(this.dataSource, courseId);
-    const facts = await loadCourseFacts(this.dataSource, courseId);
+    const facts = await loadCourseFacts(this.dataSource, courseId, undefined, eff.virtual ? academic : undefined);
     const base: any = saved ? JSON.parse(JSON.stringify(saved.profile)) : emptyPedagogicalProfile();
     delete base.designRules;
 
@@ -224,7 +226,7 @@ export class CourseDesignService {
       hoursSource = 'adjusted';
       base.targetHours = adjust.targetHours;
     } else if (adjust.targetHours === 'auto' || typeof base.targetHours !== 'number') {
-      const probe = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile: normalizePedagogicalProfile({ ...base, targetHours: PROBE_TARGET_HOURS }), requirementDecisions: decisionOverrides, academicOverride });
+      const probe = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile: normalizePedagogicalProfile({ ...base, targetHours: PROBE_TARGET_HOURS }), requirementDecisions: decisionOverrides, academicOverride, chapterLinksOverride });
       const baseHours = probe.distribution ? probe.distribution.baseHours : probe.baseline.studyTime.courseEstimatedHours;
       proposal = proposeTargetHours(baseHours);
       base.targetHours = proposal.value;
@@ -246,7 +248,7 @@ export class CourseDesignService {
     }
 
     let profile = normalizePedagogicalProfile(base);
-    let dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile, requirementDecisions: decisionOverrides, academicOverride });
+    let dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile, requirementDecisions: decisionOverrides, academicOverride, chapterLinksOverride });
     const applied: { requirementId: string; text: string }[] = [];
     if (hoursRequirement && hoursSource === 'requirement') {
       applied.push({ requirementId: hoursRequirement.requirement.id, text: `Horas de trabajo del estudiante: ${String(base.targetHours).replace('.', ',')} h (el documento ${hoursRequirement.required ? 'pide' : 'sugiere'} ${requirementText(hoursRequirement.requirement)}).` });
@@ -266,7 +268,7 @@ export class CourseDesignService {
           if (cand === prefs.audiovisual) continue;
           const b2 = { ...base, designPreferences: { ...prefs, audiovisual: cand } };
           const p2 = normalizePedagogicalProfile(b2);
-          const d2 = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile: p2, requirementDecisions: decisionOverrides, academicOverride });
+          const d2 = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile: p2, requirementDecisions: decisionOverrides, academicOverride, chapterLinksOverride });
           // Review L86C M6: una prioridad que cumple los videos pero deja el diseño por encima de las horas no sirve.
           if (d2.distribution && meets(d2.distribution) && (d2.distribution.status !== 'minimum_exceeds_target' || dr.distribution.status === 'minimum_exceeds_target')) {
             cursiaAudiovisual = cand;
@@ -290,7 +292,7 @@ export class CourseDesignService {
       }
     }
     const live = await this.liveChapters(courseId);
-    const chapterOutcomes = new Map(live.map((r) => [r.id, r.outcomeIds]));
+    const chapterOutcomes = new Map(live.map((r) => [r.id, chapterLinksOverride && chapterLinksOverride.has(r.id) ? chapterLinksOverride.get(r.id)! : r.outcomeIds]));
     const linkDetail = academic && dist ? await autoLinkPlanDetailed(this.dataSource, courseId, academic.context) : null;
     const linkPlan = linkDetail ? linkDetail.plan : [];
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
@@ -586,7 +588,7 @@ export class CourseDesignService {
       }
       // r63: sin documento, los resultados del perfil pedagógico pasan al contexto académico (idempotente; con documento
       // no cambia nada). Es un pedido explícito («Usar este diseño» / «Vincular ahora»): no espera a otra vista.
-      await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: false, link: false });
+      await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: false, link: false, allowRemovals: true });
       const academic = await loadCurrentAcademicContext(qr, courseId);
       if (!academic) {
         await qr.rollbackTransaction();
@@ -603,11 +605,14 @@ export class CourseDesignService {
         );
         if (returningRows(res).length) { linked++; applied.push({ chapter: s.title, outcomes: s.suggested }); }
       }
-      let counter = expectedCounter;
+      // r63: quitar del contexto un resultado que salió del perfil pudo podar vínculos (y subir el contador): el contador
+      // que se devuelve es SIEMPRE el vigente, así la interfaz encadena lo siguiente («Aplicar diseño») sin 409.
+      const before = Number((await qr.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]))[0].c);
+      let counter = before;
       if (linked) {
         const n = await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter c`, [courseId]);
         counter = Number(returningRows(n)[0].c);
-        await advanceStructureOriginIfUntouched(qr, courseId, expectedCounter, counter);
+        await advanceStructureOriginIfUntouched(qr, courseId, before, counter);
       }
       await qr.commitTransaction();
       return { action, linkedChapters: linked, applied, structureVersionCounter: counter, contextVersion: academic.version };
@@ -720,13 +725,17 @@ export async function autoLinkPlan(q: Q, courseId: number, ctx: AcademicContextV
  */
 export async function autoLinkPlanDetailed(q: Q, courseId: number, ctx: AcademicContextV1): Promise<{
   plan: { chapterId: string; title: string; suggested: string[] }[];
-  review: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[] } | null;
+  review: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[]; partial: { chapterId: string; title: string; outcomeIds: string[] }[] } | null;
 }> {
   if (isDocumentlessContext(ctx)) {
     const { plan, titles } = await documentlessLinkPlanFor(q, courseId, ctx);
     return {
       plan: plan.links.map((l) => ({ chapterId: l.chapterId, title: titles.get(l.chapterId) || '', suggested: l.suggested })),
-      review: { outcomes: plan.ambiguous.map((a) => ({ id: a.id, text: a.text })), chapters: plan.unmatchedChapterIds.map((id) => ({ chapterId: id, title: titles.get(id) || '' })) },
+      review: {
+        outcomes: plan.ambiguous.map((a) => ({ id: a.id, text: a.text })),
+        chapters: plan.unmatchedChapterIds.map((id) => ({ chapterId: id, title: titles.get(id) || '' })),
+        partial: plan.partial.map((p) => ({ chapterId: p.chapterId, title: titles.get(p.chapterId) || '', outcomeIds: p.outcomeIds })),
+      },
     };
   }
   return { plan: await documentAutoLinkPlan(q, courseId, ctx), review: null };
