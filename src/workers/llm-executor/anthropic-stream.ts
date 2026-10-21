@@ -141,7 +141,7 @@ export async function streamMessage(req: StreamMessageRequest): Promise<LlmStrea
       } else if (ev.type === 'content_block_delta' && ev.delta && ev.delta.type === 'text_delta' && typeof ev.delta.text === 'string') {
         parts.push(ev.delta.text);
       } else if (ev.type === 'message_delta') {
-        if (ev.usage && typeof ev.usage === 'object') sawUsageDelta = true;
+        if (ev.usage && typeof ev.usage === 'object' && Number.isInteger(ev.usage.output_tokens) && ev.usage.output_tokens >= 0) sawUsageDelta = true;
         mergeUsage(usage, ev.usage);
         if (ev.delta && typeof ev.delta.stop_reason === 'string') stopReason = ev.delta.stop_reason;
       } else if (ev.type === 'message_stop') {
@@ -273,6 +273,7 @@ export async function nonStreamMessage(req: StreamMessageRequest): Promise<LlmSt
  * headers.get, text). Sin tope de encabezados ni de cuerpo propios: lo corta `signal` (el `totalMs` del llamador).
  * Keepalive TCP para que una conexión larga y muda no la cierre un intermediario por inactividad.
  */
+export const NODE_HTTP_CONNECT_TIMEOUT_MS = 10_000;
 export const nodeHttpFetch: typeof fetch = ((input: any, init: any = {}) => new Promise((resolve, reject) => {
   const url = new URL(String(input));
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -301,7 +302,16 @@ export const nodeHttpFetch: typeof fetch = ((input: any, init: any = {}) => new 
       body: null,
     } as any);
   });
-  req.on('socket', (sock: any) => { try { sock.setKeepAlive(true, 30_000); } catch { /* sin keepalive */ } });
+  // Review r64 (m1): como undici, una conexión que no se abre en 10 s es «nunca salió» (UND_ERR_CONNECT_TIMEOUT), no
+  // un desconocido de 15 min.
+  const connectTimer = setTimeout(() => req.destroy(Object.assign(new Error('connect timeout'), { code: 'UND_ERR_CONNECT_TIMEOUT' })), NODE_HTTP_CONNECT_TIMEOUT_MS);
+  req.on('socket', (sock: any) => {
+    try { sock.setKeepAlive(true, 30_000); } catch { /* sin keepalive */ }
+    const opened = () => clearTimeout(connectTimer);
+    if (sock.connecting === false && !(url.protocol === 'https:' && !sock.encrypted)) opened();
+    sock.once(url.protocol === 'https:' ? 'secureConnect' : 'connect', opened);
+  });
+  req.on('close', () => clearTimeout(connectTimer));
   req.on('error', fail);
   if (signal) {
     if (signal.aborted) { req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' })); }
