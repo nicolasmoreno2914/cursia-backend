@@ -4084,8 +4084,12 @@ function reservationBookkeeping(ev) {
         const cav = f2.find((i) => i.type === 'content' && i.item_key.endsWith(c2.mods[0].chapters[2].id));
         const cavCalls = reqs((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"')).length;
         const cavSpent = (await q(`select coalesce(sum(amount),0)::float8 t from public.generation_cost_events where run_id = $1 and item_key = $2`, [c2.runId, cav.item_key]))[0].t;
-        ok(cav && cav.status === 'failed' && /^item_recovery_budget_exhausted/.test(cav.error || ''), 'E24b: cortes repetidos → la parte agota su presupuesto de recuperación y se detiene SOLO ella', cav && { st: cav.status, e: (cav.error || '').slice(0, 200), calls: cavCalls, usd: cavSpent });
-        ok(cavCalls <= 12, `E24b: el gasto de la parte quedó acotado (${cavCalls} llamadas, USD ${cavSpent.toFixed(4)})`, { cavCalls, cavSpent });
+        // r64 (R1 #1567): el stream de esa parte se corta SIEMPRE (regla ×200) → ya no se repite igual: un solo corte cobrado y
+        // la MISMA solicitud sin streaming, que llega entera; la parte se completa sola (antes agotaba su presupuesto).
+        const cavReqs = fake.st.requests.filter((r) => r.text.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"'));
+        const cavCuts = (await q(`select count(*)::int n from public.generation_cost_events where run_id = $1 and item_key = $2 and event_kind = 'CHARGE' and metadata ? 'streamCut'`, [c2.runId, cav.item_key]))[0].n;
+        ok(cav && cav.status === 'completed', 'E24b (r64): cortes del stream en cada envío → la parte se recupera sola sin streaming (sin pedir a una persona)', cav && { st: cav.status, e: (cav.error || '').slice(0, 200) });
+        ok(cavReqs.filter((r) => r.stream).length === 1 && cavReqs.filter((r) => !r.stream).length >= 1 && cavCuts === 1, `E24b (r64): UN solo corte (stream) y la misma solicitud sin streaming — nunca la repetición idéntica (${cavCalls} llamadas, USD ${cavSpent.toFixed(4)})`, { stream: cavReqs.filter((r) => r.stream).length, nonstream: cavReqs.filter((r) => !r.stream).length, cavCuts });
         const lub = f2.filter((i) => i.item_key.endsWith(c2.mods[0].chapters[0].id));
         ok(lub.length > 0 && lub.every((i) => i.status === 'completed'), 'E24b: las partes INDEPENDIENTES (cap. 1) siguieron y se completaron', lub.map((i) => [i.item_key, i.status]));
         // Robustez (Storage): la subida falló una vez → la parte se reintentó desde su punto de guardado (sin volver a
@@ -4105,8 +4109,52 @@ function reservationBookkeeping(ev) {
           eq(dupA[0].n, 1, 'E24b: un solo artifact del capítulo (la subida fallida no dejó basura)');
         }
         const needsHuman = f2.filter((i) => i.status === 'failed');
-        eq(needsHuman.map((i) => (i.error || '').split(':')[0]).sort(), ['item_recovery_budget_exhausted', 'llm_pending_review'], 'E24b: solo 2 partes piden a una persona (los 2 casos inseguros inyectados); el resto, automático');
+        eq(needsHuman.map((i) => (i.error || '').split(':')[0]).sort(), ['llm_pending_review'], 'E24b: solo 1 parte pide a una persona (el doble resultado desconocido inyectado, inseguro de reenviar); los cortes del stream se recuperan solos (r64)');
         results.courses.E24b = { courseId: c2.courseId, runId: c2.runId, items: rows2.length, failed: needsHuman.map((i) => [i.item_key, (i.error || '').slice(0, 120)]), cavitationCalls: cavCalls, cavitationUsd: cavSpent };
+
+        // ── r64 · recuperación de R1 (#1567): el run terminó `failed` con UNA sola parte pendiente de una persona y el resto
+        // completo. El dueño reintenta SOLO esa parte (POST …/items/:itemKey/retry): se genera únicamente ella, ninguna
+        // parte completa se vuelve a pedir ni a cobrar, el run se cierra con todas sus partes y el paquete final se arma. ──
+        if (vib) {
+          const vibKey = vib.item_key;
+          const [st0] = await q(`select worker_status from public.production_jobs where id = $1`, [c2.runId]);
+          eq(st0 && st0.worker_status, 'failed', 'E24b-R1: el run quedó `failed` con una sola parte pendiente (el mismo estado que R1)');
+          const snapOthers = async () => q(`select item_key, status, attempt_count, generation, finished_at::text f from public.generation_item_runs where job_id = $1 and item_key <> $2 order by item_key, generation`, [c2.runId, vibKey]);
+          const evOthers = async () => (await q(`select count(*)::int n, coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1 and coalesce(item_key, '') <> $2`, [c2.runId, vibKey]))[0];
+          const others0 = await snapOthers();
+          const ev0 = await evOthers();
+          const nReq0 = fake.st.requests.length;
+          const pkgJobs0 = (await q(`select count(*)::int n from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1`, [c2.runId]))[0].n;
+          const rt = await api('POST', `${runsBase2}/items/${encodeURIComponent(vibKey)}/retry`, {});
+          ok(rt.status === 200 || rt.status === 201, 'E24b-R1: el dueño reintenta SOLO la parte pendiente (POST …/items/:itemKey/retry)', { s: rt.status, e: rt.error });
+          const endR1 = await waitFor('E24b-R1: run cerrado tras el reintento', async () => {
+            const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c2.runId]);
+            const rowsNow = await finished(c2.runId);
+            const vibNow = rowsNow.find((i) => i.item_key === vibKey);
+            return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) && vibNow && ['completed', 'failed'].includes(vibNow.status) ? j.worker_status : null;
+          }, 10 * 60 * 1000, 1000);
+          const rowsR1 = await finished(c2.runId);
+          ok(['completed', 'preview'].includes(endR1) && rowsR1.every((i) => i.status === 'completed'), `E24b-R1: tras el reintento TODAS las partes quedan completas y el run cierra (${endR1})`, rowsR1.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 160)]));
+          eq(await snapOthers(), others0, 'E24b-R1: ninguna parte ya completa se volvió a generar (mismo intento, generación y fin)');
+          const ev1 = await evOthers();
+          eq([ev1.n, ev1.t], [ev0.n, ev0.t], 'E24b-R1: ninguna parte ya completa volvió a gastar (eventos del ledger de las demás partes idénticos)');
+          const newReqs = fake.st.requests.slice(nReq0);
+          ok(newReqs.length >= 1 && newReqs.every((r) => r.text.includes('Genera la EXPERIENCIA del capítulo') && r.text.includes('CAPÍTULO: "Vibraciones en bombas"')),
+            `E24b-R1: las ${newReqs.length} llamadas nuevas a la IA son SOLO de la parte reintentada`, newReqs.map((r) => r.text.slice(0, 90)));
+          // El paquete: automático si el run quedó `completed`; con IA falsa el run es `preview` y se pide a mano (mismo builder).
+          if (endR1 === 'preview') {
+            const pk = await api('POST', `${runsBase2}/package`, {});
+            ok(pk.status === 200 || pk.status === 201 || pk.status === 202, 'E24b-R1: el paquete del run recuperado se puede pedir', { s: pk.status, e: pk.error });
+          }
+          const pkgR1 = await waitFor('E24b-R1: paquete del run recuperado', async () => {
+            const jobs = await q(`select id, worker_status, input_payload, output_summary, error_message from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c2.runId]);
+            return jobs.length > pkgJobs0 && ['completed', 'failed'].includes(jobs[jobs.length - 1].worker_status) ? jobs : null;
+          }, 5 * 60 * 1000, 1000);
+          const pjR1 = pkgR1[pkgR1.length - 1];
+          ok(pjR1.worker_status === 'completed' && pjR1.output_summary && pjR1.output_summary.artifactId, 'E24b-R1: el paquete final del run recuperado se armó y validó (validateMbzV3) sin regenerar nada más', { st: pjR1.worker_status, err: (pjR1.error_message || '').slice(0, 200) });
+          eq(await snapOthers(), others0, 'E24b-R1: el empaque tampoco regeneró ninguna parte');
+          results.courses.E24b.r1Recovery = { endState: endR1, newLlmCalls: newReqs.length, packageJob: pjR1.id, packageStatus: pjR1.worker_status };
+        }
 
         // ── Corrida 3 (Loop 6): un run ANTERIOR a la activación sigue entero en el navegador; el worker nunca lo toma ──
         const C3 = { key: 'E24c', title: '[E2E Worker IA E24c] Run anterior a la activación', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [

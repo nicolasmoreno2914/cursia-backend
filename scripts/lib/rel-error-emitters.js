@@ -204,7 +204,7 @@ const DYNAMIC_EMITTERS = {
   // Loop 4: fail() del worker de IA reenvía el mensaje de SUS callers: el texto del ejecutor (mismo código del
   // navegador, sección 4 --fe), run_paused / item_recovery_budget_exhausted / llm_pending_review (helpers con código)
   // y frases fijas (no se pudo subir el artifact, complete rechazado, unexpected_error).
-  'workers/dynamic-llm-worker.ts#msg': ['run_paused', 'worker_draining', 'llm_pending_review', 'item_recovery_budget_exhausted', 'artifact_upload_failed', 'complete_rejected', 'unexpected_error'],
+  'workers/dynamic-llm-worker.ts#msg': ['run_paused', 'worker_draining', 'llm_pending_review', 'item_recovery_budget_exhausted', 'llm_output_cut_repeated', 'artifact_upload_failed', 'complete_rejected', 'unexpected_error'],
   // Endpoint del ejecutor del navegador: el texto lo arma el ejecutor (sección 4, --fe).
   'modules/dynamic-generation/executor.controller.ts#dto.error': [],
   // Empaque: errMessage(err) de cualquier builder/validador → familias de PACKAGE (sección 3 del escaneo).

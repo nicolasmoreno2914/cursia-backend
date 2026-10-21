@@ -341,6 +341,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       ? { class: 'B', strategy: 'regenerate_split', rounds: 2, humanReason: undefined, adminAction: undefined }
       : null),
   },
+  // r64 (R1 #1567): la misma solicitud se cortó a mitad del stream y TAMPOCO entregó sin streaming → no se repite igual
+  // (el reintento idéntico solo quemaba el presupuesto de la parte). Excepción visible con su causa en el ledger.
+  { id: 'llm_output_cut_repeated', codes: ['llm_output_cut_repeated'], class: 'D', strategy: 'hold_for_human', provider: 'anthropic', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_item' },
   { id: 'llm_too_large', codes: ['llm_request_too_large', 'EXAM_BANK_PROMPT_TOO_LARGE'], class: 'B', strategy: 'regenerate_split', provider: 'anthropic', rounds: 2 },
   {
     id: 'output_truncated',

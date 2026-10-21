@@ -5,6 +5,8 @@
 //   - drop  : recibe el pedido y cierra la conexión SIN responder (resultado DESCONOCIDO);
 //   - cut   : empieza el stream (message_start + parte del texto) y corta (cobrado, incompleto);
 //   - hold  : recibe y no responde nunca (para matar al worker en vuelo).
+// r64: un pedido SIN streaming (`stream: false`) recibe el mensaje entero en JSON. `cut` solo existe en el stream
+// (una respuesta JSON no se corta a mitad: llega entera o falla); `drop`/`hold`/`slow` valen igual.
 'use strict';
 const http = require('http');
 const crypto = require('crypto');
@@ -42,6 +44,15 @@ function startAnthropicSseFake(llm) {
     }
     const id = `msg_sse_${++st.served}_${crypto.randomUUID().slice(0, 8)}`;
     rec.messageId = id;
+    if (body.stream !== true) {
+      if (action === 'slow' && rule.totalMs) await new Promise((r) => setTimeout(r, rule.totalMs));
+      const fullJ = String(out.text || '');
+      res.writeHead(200, { 'content-type': 'application/json', 'request-id': `req_json_${st.served}` });
+      res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: body.model, content: [{ type: 'text', text: fullJ }], stop_reason: out.stopReason || 'end_turn', stop_sequence: null,
+        usage: { input_tokens: Math.max(1, Math.ceil(raw.length / 4)), output_tokens: Math.max(1, Math.ceil(fullJ.length / 4)), cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
+      rec.outcome = 'ok'; rec.end = Date.now();
+      return;
+    }
     res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'request-id': `req_sse_${st.served}` });
     const send = (type, obj) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...obj })}\n\n`);
     const full = String(out.text || '');
