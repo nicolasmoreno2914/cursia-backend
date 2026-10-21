@@ -108,6 +108,7 @@ import {
   FairSchedulingConfig,
   candidateOrderBy,
   capLockKey,
+  capOccupancySql,
   capsForTypes,
   fairSchedulingConfig,
   lastServedSql,
@@ -674,7 +675,7 @@ export class SchedulerService {
         if (claimTypes.length === 0) return { item: null };
       }
       // r63 (SC): topes de concurrencia por tipo/proveedor (sin configurar = sin cambio).
-      claimTypes = (await this.typesUnderCaps(claimTypes, sched.caps)) as ItemType[];
+      claimTypes = (await this.typesUnderCaps(claimTypes, sched)) as ItemType[];
       if (claimTypes.length === 0) return { item: null };
       // M6: un item cuyo payload no se puede armar se marca failed dentro del
       // claim; se sigue con el próximo candidato en vez de devolver "nada".
@@ -703,7 +704,7 @@ export class SchedulerService {
     // null silencioso por "demasiados runs").
     await this.sweepExpiredLeases();
     // r63 (SC): topes por tipo/proveedor (pre-filtro sin lock; el autoritativo va en claimInRun) y admisión.
-    types = (await this.typesUnderCaps(types, sched.caps)) as ItemType[];
+    types = (await this.typesUnderCaps(types, sched)) as ItemType[];
     if (types.length === 0) return { item: null };
     const adm = await this.admissionRoom(sched);
     const served = lastServedSql(sched.policy, '$1', '$4');
@@ -863,13 +864,11 @@ export class SchedulerService {
       // r63 (SC): topes de concurrencia (DYNAMIC_SCHEDULER_TYPE_CAPS / _PROVIDER_CAPS; sin configurar = nada). Un
       // advisory lock de TRANSACCIÓN por tope, en orden fijo de clave (sin deadlocks): el que entra cuenta los running
       // ya confirmados y, si hay lugar, deja su parte running antes del commit → el tope nunca se supera entre procesos.
-      // Se cuentan TODAS las partes running (también con la lease vencida y sin barrer: su llamada puede seguir en vuelo).
+      // Se cuentan las running (también con la lease vencida y sin barrer) y las devueltas por lease vencida hace menos de
+      // capGraceSeconds: en los dos casos la llamada al proveedor puede seguir en vuelo (Q-21).
       for (const rule of capsForTypes(sched.caps, [String(cand.type)])) {
         await qr.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [capLockKey(rule)]);
-        const [c] = await qr.query(
-          `select count(*)::int as n from public.generation_item_runs where status = 'running' and type = any($1::text[])`,
-          [rule.types],
-        );
+        const [c] = await qr.query(capOccupancySql('$1', '$2'), [rule.types, sched.capGraceSeconds]);
         if (Number(c.n) >= rule.max) {
           capped = rule;
           return null;
@@ -918,16 +917,14 @@ export class SchedulerService {
    * r63 (SC): tipos de `types` cuyos topes (por tipo / proveedor) tienen lugar AHORA. Sin topes configurados para
    * estos tipos → `types` tal cual, sin tocar la DB (el comportamiento de siempre). Lectura sin lock: pre-filtro.
    */
-  private async typesUnderCaps(types: readonly string[], caps: readonly CapRule[]): Promise<string[]> {
-    const rules = capsForTypes(caps, types);
+  private async typesUnderCaps(types: readonly string[], sched: FairSchedulingConfig): Promise<string[]> {
+    const rules = capsForTypes(sched.caps, types);
     if (!rules.length) return [...types];
-    const rows: Array<{ type: string; n: number }> = await this.dataSource.query(
-      `select type, count(*)::int as n from public.generation_item_runs where status = 'running' and type = any($1::text[]) group by type`,
-      [[...new Set(rules.flatMap((r) => r.types))]],
-    );
-    const byType = new Map(rows.map((r) => [String(r.type), Number(r.n)]));
     const running: Record<string, number> = {};
-    for (const r of rules) running[r.key] = r.types.reduce((acc, t) => acc + (byType.get(t) ?? 0), 0);
+    for (const r of rules) {
+      const [c] = await this.dataSource.query(capOccupancySql('$1', '$2'), [r.types, sched.capGraceSeconds]);
+      running[r.key] = Number(c.n);
+    }
     return typesWithRoom(types, rules, running);
   }
 

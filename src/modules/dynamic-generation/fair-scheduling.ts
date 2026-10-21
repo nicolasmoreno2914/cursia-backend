@@ -9,6 +9,9 @@
  *                                         sistema (todos los procesos). Vacío (default) = sin tope (como siempre).
  *   - DYNAMIC_SCHEDULER_PROVIDER_CAPS     'gamma=3,openai_tts=2,videogen=2,anthropic=8' — ídem por proveedor
  *                                         (PROVIDERS_OF_TYPE). Vacío (default) = sin tope.
+ *   - DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS  (solo con topes) una parte cuya lease VENCIÓ hace menos de esto sigue
+ *                                         contando para su tope (su llamada al proveedor puede seguir en vuelo: Q-21).
+ *                                         Default 600 (la ventana de Videogen); 0 = solo las running.
  *   - DYNAMIC_ADMISSION_ENABLED           'true' prende el control de admisión (default apagado).
  *   - DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS   runs ADMITIDOS a la vez (worker_status running/retrying) — default 12.
  *   - DYNAMIC_ADMISSION_MAX_ACTIVE_PER_OWNER  ídem por dueño — default sin tope por dueño.
@@ -32,6 +35,8 @@ export const ADMISSION_ENABLED_ENV = 'DYNAMIC_ADMISSION_ENABLED';
 export const ADMISSION_MAX_ACTIVE_RUNS_ENV = 'DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS';
 export const ADMISSION_MAX_PER_OWNER_ENV = 'DYNAMIC_ADMISSION_MAX_ACTIVE_PER_OWNER';
 export const ADMISSION_DEFAULT_MAX_ACTIVE_RUNS = 12;
+export const CAP_INFLIGHT_GRACE_ENV = 'DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS';
+export const CAP_INFLIGHT_GRACE_DEFAULT_SECONDS = 600;
 /** Tope de cordura de cualquier límite configurable (un valor mayor es un error de configuración). */
 export const CAP_LIMIT_MAX = 1000;
 
@@ -62,6 +67,8 @@ export interface CapRule { key: string; types: string[]; max: number }
 export interface FairSchedulingConfig {
   policy: SchedulerPolicy;
   caps: CapRule[];
+  /** Segundos que una parte con la lease vencida (sweep → `lease_expired`) sigue contando para su tope. */
+  capGraceSeconds: number;
   admission: { enabled: false } | { enabled: true; maxActiveRuns: number; maxActivePerOwner: number | null };
   /** Valores inválidos (ignorados → default de siempre). */
   errors: string[];
@@ -114,6 +121,12 @@ export function fairSchedulingConfig(env: Env = process.env): FairSchedulingConf
     caps.push({ key: `provider:${p}`, types: Object.keys(PROVIDERS_OF_TYPE).filter((t) => PROVIDERS_OF_TYPE[t].includes(p)), max: n });
   }
   caps.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)); // orden fijo de los locks (sin deadlocks)
+  let capGraceSeconds = CAP_INFLIGHT_GRACE_DEFAULT_SECONDS;
+  const rawGrace = String(env[CAP_INFLIGHT_GRACE_ENV] ?? '').trim();
+  if (rawGrace) {
+    if (/^\d+$/.test(rawGrace) && Number(rawGrace) <= 3600) capGraceSeconds = Number(rawGrace);
+    else errors.push(`${CAP_INFLIGHT_GRACE_ENV}=${rawGrace} inválido (entero 0..3600); se usa ${CAP_INFLIGHT_GRACE_DEFAULT_SECONDS}`);
+  }
   const enabled = String(env[ADMISSION_ENABLED_ENV] ?? '').trim().toLowerCase() === 'true';
   let admission: FairSchedulingConfig['admission'] = { enabled: false };
   if (enabled) {
@@ -121,7 +134,7 @@ export function fairSchedulingConfig(env: Env = process.env): FairSchedulingConf
     const maxActivePerOwner = intIn(env[ADMISSION_MAX_PER_OWNER_ENV], ADMISSION_MAX_PER_OWNER_ENV, errors);
     admission = { enabled: true, maxActiveRuns, maxActivePerOwner };
   }
-  return { policy, caps, admission, errors };
+  return { policy, caps, capGraceSeconds, admission, errors };
 }
 
 /** Topes que alcanzan a alguno de estos tipos. */
@@ -167,6 +180,19 @@ export function lastServedSql(policy: SchedulerPolicy, statusesParam: string, ty
            from rs join public.production_jobs px on px.id = rs.job_id
           group by px.owner_id)`;
   return { with: `with ${rs}, ${os}`, joins: 'left join os on os.owner_id is not distinct from pj.owner_id' };
+}
+
+/**
+ * Partes que ocupan un tope: las running (también con la lease vencida y sin barrer) y las que el barrido devolvió por
+ * lease vencida hace menos de `graceParam` segundos (su llamada puede seguir en vuelo en el proveedor). `typesParam` =
+ * tipos del tope. Mismo texto para el pre-filtro, el claim (bajo el lock del tope) y las métricas.
+ */
+export function capOccupancySql(typesParam: string, graceParam: string): string {
+  return `select count(*)::int as n from public.generation_item_runs
+           where type = any(${typesParam}::text[])
+             and (status = 'running'
+                  or (status in ('pending', 'retrying') and error = 'lease_expired'
+                      and updated_at > now() - make_interval(secs => ${graceParam}::int)))`;
 }
 
 /** Clave del advisory lock de transacción de un tope / de la admisión (hashtextextended). */

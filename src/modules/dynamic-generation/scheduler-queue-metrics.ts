@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { DISPATCHABLE_RUN_WORKER_STATUSES } from './item-transitions';
 import { claimablePredicate } from './scheduler.service';
 import { ALL_MANIFEST_ITEM_TYPES } from '../generation-manifests/generation-manifest-builder';
-import { ADMITTED_RUN_WORKER_STATUSES, FairSchedulingConfig, fairSchedulingConfig } from './fair-scheduling';
+import { ADMITTED_RUN_WORKER_STATUSES, FairSchedulingConfig, capOccupancySql, fairSchedulingConfig } from './fair-scheduling';
 
 /**
  * r63 (SC) — métricas de la cola del scheduler de la generación dinámica (SOLO LECTURA).
@@ -84,12 +84,13 @@ export async function computeSchedulerQueueMetrics(q: Q, cfg: FairSchedulingConf
   const caps: Array<Record<string, unknown>> = [];
   for (const c of cfg.caps) {
     const [x] = await q.query(`select count(*)::int as n from public.generation_item_runs where status = 'running' and type = any($1::text[])`, [c.types]);
-    caps.push({ key: c.key, max: c.max, running: Number(x.n), types: c.types });
+    const [o] = await q.query(capOccupancySql('$1', '$2'), [c.types, cfg.capGraceSeconds]);
+    caps.push({ key: c.key, max: c.max, running: Number(x.n), occupied: Number(o.n), types: c.types });
   }
   return {
     version: SCHEDULER_QUEUE_METRICS_VERSION,
     generatedAt: now,
-    config: { policy: cfg.policy, caps: cfg.caps, admission: cfg.admission, configErrors: cfg.errors },
+    config: { policy: cfg.policy, caps: cfg.caps, capGraceSeconds: cfg.capGraceSeconds, admission: cfg.admission, configErrors: cfg.errors },
     totals: {
       dispatchableRuns: runs.filter((r) => r.workerStatus !== 'paused').length,
       admittedRuns: admittedCount,

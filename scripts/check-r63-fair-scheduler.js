@@ -7,7 +7,8 @@
 //   [F2] owner_rr: round-robin entre DUEÑOS, FIFO dentro de cada dueño (el dueño chico no espera al grande)
 //   [F3] run_rr: round-robin entre RUNS
 //   [F4] topes por tipo / proveedor: nunca más partes running que el tope, también con 3 «procesos» (3 DataSource) y
-//        30 claims en paralelo; al liberar, entra la siguiente; un tope de otro tipo no frena al resto
+//        30 claims en paralelo; al liberar, entra la siguiente; un tope de otro tipo no frena al resto; una parte con la
+//        lease vencida sigue ocupando su tope durante la gracia (Q-21: su llamada puede seguir en vuelo)
 //   [F5] admisión (flag): con tope 2 solo 2 runs empiezan; el 3.º espera (`admission_queued` para el navegador, el
 //        worker no lo mira) y entra cuando uno termina; 3 procesos en paralelo nunca admiten más de 2; tope por dueño;
 //        un run pausado libera su lugar
@@ -43,7 +44,7 @@ const eq = (a, b, m) => { const x = JSON.stringify(a); const y = JSON.stringify(
 const OA = '11111111-2222-4333-8444-555555555555';
 const OB = '22222222-3333-4444-8555-666666666666';
 const OC = '33333333-4444-4555-8666-777777777777';
-const SCHED_ENV = ['DYNAMIC_SCHEDULER_POLICY', 'DYNAMIC_SCHEDULER_TYPE_CAPS', 'DYNAMIC_SCHEDULER_PROVIDER_CAPS', 'DYNAMIC_ADMISSION_ENABLED',
+const SCHED_ENV = ['DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS', 'DYNAMIC_SCHEDULER_POLICY', 'DYNAMIC_SCHEDULER_TYPE_CAPS', 'DYNAMIC_SCHEDULER_PROVIDER_CAPS', 'DYNAMIC_ADMISSION_ENABLED',
   'DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS', 'DYNAMIC_ADMISSION_MAX_ACTIVE_PER_OWNER'];
 function setSched(vars) { for (const k of SCHED_ENV) delete process.env[k]; Object.assign(process.env, vars || {}); }
 
@@ -143,6 +144,20 @@ function setSched(vars) { for (const k of SCHED_ENV) delete process.env[k]; Obje
       const m = await QM.computeSchedulerQueueMetrics(ds);
       const cap = (k) => m.caps.find((c) => c.key === k);
       eq([cap('type:video').running, cap('type:video').max, cap('provider:gamma').running], [2, 2, 1], 'métricas de topes');
+      // Q-21: una parte cuya lease venció (barrido → lease_expired) sigue ocupando su tope durante la gracia (su llamada
+      // puede seguir en vuelo en el proveedor); con gracia 0 el lugar se libera al barrer.
+      const z = claimed.find((x) => x.type === 'presentation');
+      await ds.query(`update public.generation_item_runs set lease_until = now() - interval '1 second' where id = $1`, [z.itemRunId]);
+      await sched.sweepExpiredLeases();
+      const [zr] = await ds.query(`select status, error from public.generation_item_runs where id = $1`, [z.itemRunId]);
+      eq([zr.status, zr.error], ['retrying', 'lease_expired'], 'barrida');
+      await ds.query(`update public.generation_item_runs set next_retry_at = now() - interval '1 second' where status = 'retrying'`);
+      assert(!(await sched.claimNextItem({ executorId: 'f4-g1', types: ['presentation'], leaseSeconds: 60 })), 'gracia: el tope de Gamma sigue lleno');
+      eq((await QM.computeSchedulerQueueMetrics(ds)).caps.find((c) => c.key === 'provider:gamma').occupied, 1, 'occupied cuenta la parte en vuelo');
+      process.env.DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS = '0';
+      const g = await sched.claimNextItem({ executorId: 'f4-g2', types: ['presentation'], leaseSeconds: 60 });
+      assert(g && g.type === 'presentation', 'gracia 0: entra');
+      delete process.env.DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS;
     });
 
     await check('[F5] admisión: tope 2 global (3 procesos en paralelo), cola visible, entra al terminar otro; tope por dueño; pausado libera', async () => {
@@ -190,6 +205,7 @@ function setSched(vars) { for (const k of SCHED_ENV) delete process.env[k]; Obje
         DYNAMIC_ADMISSION_ENABLED: 'true', DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS: 'x' });
       eq([c.policy, c.caps.length, c.admission], ['fifo', 0, { enabled: true, maxActiveRuns: 12, maxActivePerOwner: null }], 'defaults');
       eq(c.errors.length, 4, `4 errores (${c.errors.join(' | ')})`);
+      eq([FS.fairSchedulingConfig({}).capGraceSeconds, FS.fairSchedulingConfig({ DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS: '9999' }).capGraceSeconds], [600, 600], 'gracia: default / inválida');
       const ok = FS.fairSchedulingConfig({ DYNAMIC_SCHEDULER_PROVIDER_CAPS: 'openai_tts=2' });
       eq(ok.caps.map((x) => [x.key, x.types, x.max]), [['provider:openai_tts', ['audio_welcome', 'audiobook_chapter'], 2]], 'TTS = bienvenida + audiolibro');
       const an = FS.fairSchedulingConfig({ DYNAMIC_SCHEDULER_PROVIDER_CAPS: 'anthropic=8' });
