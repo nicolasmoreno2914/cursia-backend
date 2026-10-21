@@ -9,9 +9,21 @@
  *                                         sistema (todos los procesos). Vacío (default) = sin tope (como siempre).
  *   - DYNAMIC_SCHEDULER_PROVIDER_CAPS     'gamma=3,openai_tts=2,videogen=2,anthropic=8' — ídem por proveedor
  *                                         (PROVIDERS_OF_TYPE). Vacío (default) = sin tope.
- *   - DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS  (solo con topes) una parte cuya lease VENCIÓ hace menos de esto sigue
- *                                         contando para su tope (su llamada al proveedor puede seguir en vuelo: Q-21).
- *                                         Default 600 (la ventana de Videogen); 0 = solo las running.
+ *   Con topes, ocupan lugar (Q-21: la llamada del intento anterior puede seguir en vuelo en el proveedor):
+ *     · las partes `running` (también con la lease vencida y sin barrer);
+ *     · las DEVUELTAS por Q-21 (`prior_call_in_flight…`) mientras su next_retry_at (= lo que falta de la ventana) no llegó;
+ *     · las barridas por lease vencida (`lease_expired`) durante la ventana EN VUELO de su tipo, contada desde el barrido
+ *       (conservador): la MISMA de Q-21 (lease-takeover.ts / dynamic-llm-worker.ts) y con sus variables de entorno —
+ *       LLM = DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS + 30 s; TTS = max(210 s, timeout TTS efectivo) + 30 s; guion del
+ *       audiolibro = 150 s; Gamma = 90 s; Videogen = 10 min (inFlightWindowSecondsByType).
+ *     DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS (opcional, operación/simulación) reemplaza esas ventanas por un valor.
+ *   - DYNAMIC_ADMISSION_STALL_SECONDS     un run admitido SIN partes running y sin actividad en sus partes durante esto
+ *                                         (esperando a un humano, navegador cerrado, cuota de YouTube…) deja de ocupar
+ *                                         lugar; cuando vuelve a tener trabajo, entra de nuevo por la cola. Default 1800.
+ *   Los runs PAUSADOS ocupan lugar mientras tengan partes running; reanudado, un run vuelve a pasar por el lock de
+ *   admisión en su próximo claim (si ya no ocupaba lugar).
+ *   IMPORTANTE (rollout): la API (claims del navegador, métricas) y los workers leen estas variables de SU entorno; deben
+ *   tener los mismos valores. Cada proceso registra al arrancar su configuración y su huella (logFairSchedulingConfig).
  *   - DYNAMIC_ADMISSION_ENABLED           'true' prende el control de admisión (default apagado).
  *   - DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS   runs ADMITIDOS a la vez (worker_status running/retrying) — default 12.
  *   - DYNAMIC_ADMISSION_MAX_ACTIVE_PER_OWNER  ídem por dueño — default sin tope por dueño.
@@ -26,6 +38,11 @@
  * se informa con logger.error (una vez por proceso y valor) y en las métricas de cola (`configErrors`).
  */
 
+import { IN_FLIGHT_MARGIN_MS, IN_FLIGHT_WINDOW_MS, PRIOR_CALL_IN_FLIGHT } from '../../workers/lease-takeover';
+import { OPENAI_TTS_TIMEOUT_MS, ttsTimeoutMs } from '../../workers/provider-real/provider-clients';
+
+const LEASE_EXPIRED = 'lease_expired'; // = item-transitions.LEASE_EXPIRED_ERROR (sin importar item-transitions acá)
+
 export type SchedulerPolicy = 'fifo' | 'owner_rr' | 'run_rr';
 export const SCHEDULER_POLICIES: readonly SchedulerPolicy[] = ['fifo', 'owner_rr', 'run_rr'];
 export const SCHEDULER_POLICY_ENV = 'DYNAMIC_SCHEDULER_POLICY';
@@ -36,7 +53,11 @@ export const ADMISSION_MAX_ACTIVE_RUNS_ENV = 'DYNAMIC_ADMISSION_MAX_ACTIVE_RUNS'
 export const ADMISSION_MAX_PER_OWNER_ENV = 'DYNAMIC_ADMISSION_MAX_ACTIVE_PER_OWNER';
 export const ADMISSION_DEFAULT_MAX_ACTIVE_RUNS = 12;
 export const CAP_INFLIGHT_GRACE_ENV = 'DYNAMIC_SCHEDULER_CAP_INFLIGHT_GRACE_SECONDS';
-export const CAP_INFLIGHT_GRACE_DEFAULT_SECONDS = 600;
+export const ADMISSION_STALL_ENV = 'DYNAMIC_ADMISSION_STALL_SECONDS';
+export const ADMISSION_STALL_DEFAULT_SECONDS = 1800;
+/** Mismo default que dynamic-llm-worker.ts (DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS = 15 min). */
+export const LLM_WORKER_CALL_TIMEOUT_ENV = 'DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS';
+export const LLM_WORKER_CALL_TIMEOUT_DEFAULT_MS = 15 * 60_000;
 /** Tope de cordura de cualquier límite configurable (un valor mayor es un error de configuración). */
 export const CAP_LIMIT_MAX = 1000;
 
@@ -45,6 +66,8 @@ export const ADMISSION_QUEUED_REASON = 'admission_queued' as const;
 
 /** worker_status de un run ADMITIDO (ya empezó). Un run `queued` todavía no ocupa lugar. */
 export const ADMITTED_RUN_WORKER_STATUSES: readonly string[] = ['running', 'retrying'];
+/** Runs que pueden ocupar lugar de admisión (los pausados, solo mientras tengan partes running). */
+export const OCCUPANCY_CANDIDATE_WORKER_STATUSES: readonly string[] = ['queued', 'running', 'retrying', 'paused'];
 
 /**
  * Proveedor(es) de cada tipo de parte para DYNAMIC_SCHEDULER_PROVIDER_CAPS. `audiobook_chapter` usa Anthropic (guion)
@@ -67,9 +90,9 @@ export interface CapRule { key: string; types: string[]; max: number }
 export interface FairSchedulingConfig {
   policy: SchedulerPolicy;
   caps: CapRule[];
-  /** Segundos que una parte con la lease vencida (sweep → `lease_expired`) sigue contando para su tope. */
-  capGraceSeconds: number;
-  admission: { enabled: false } | { enabled: true; maxActiveRuns: number; maxActivePerOwner: number | null };
+  /** Ventana en vuelo (s) por tipo: una parte barrida por lease vencida sigue ocupando su tope durante esto. */
+  capGraceByType: Record<string, number>;
+  admission: { enabled: false } | { enabled: true; maxActiveRuns: number; maxActivePerOwner: number | null; stallSeconds: number };
   /** Valores inválidos (ignorados → default de siempre). */
   errors: string[];
 }
@@ -121,20 +144,28 @@ export function fairSchedulingConfig(env: Env = process.env): FairSchedulingConf
     caps.push({ key: `provider:${p}`, types: Object.keys(PROVIDERS_OF_TYPE).filter((t) => PROVIDERS_OF_TYPE[t].includes(p)), max: n });
   }
   caps.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)); // orden fijo de los locks (sin deadlocks)
-  let capGraceSeconds = CAP_INFLIGHT_GRACE_DEFAULT_SECONDS;
+  let capGraceByType = inFlightWindowSecondsByType(env);
   const rawGrace = String(env[CAP_INFLIGHT_GRACE_ENV] ?? '').trim();
   if (rawGrace) {
-    if (/^\d+$/.test(rawGrace) && Number(rawGrace) <= 3600) capGraceSeconds = Number(rawGrace);
-    else errors.push(`${CAP_INFLIGHT_GRACE_ENV}=${rawGrace} inválido (entero 0..3600); se usa ${CAP_INFLIGHT_GRACE_DEFAULT_SECONDS}`);
+    if (/^\d+$/.test(rawGrace) && Number(rawGrace) <= 7200) {
+      const v = Number(rawGrace);
+      capGraceByType = Object.fromEntries(Object.keys(capGraceByType).map((t) => [t, v]));
+    } else errors.push(`${CAP_INFLIGHT_GRACE_ENV}=${rawGrace} inválido (entero 0..7200); se usan las ventanas de Q-21`);
   }
   const enabled = String(env[ADMISSION_ENABLED_ENV] ?? '').trim().toLowerCase() === 'true';
   let admission: FairSchedulingConfig['admission'] = { enabled: false };
   if (enabled) {
     const maxActiveRuns = intIn(env[ADMISSION_MAX_ACTIVE_RUNS_ENV], ADMISSION_MAX_ACTIVE_RUNS_ENV, errors) ?? ADMISSION_DEFAULT_MAX_ACTIVE_RUNS;
     const maxActivePerOwner = intIn(env[ADMISSION_MAX_PER_OWNER_ENV], ADMISSION_MAX_PER_OWNER_ENV, errors);
-    admission = { enabled: true, maxActiveRuns, maxActivePerOwner };
+    let stallSeconds = ADMISSION_STALL_DEFAULT_SECONDS;
+    const rawStall = String(env[ADMISSION_STALL_ENV] ?? '').trim();
+    if (rawStall) {
+      if (/^\d+$/.test(rawStall) && Number(rawStall) >= 1 && Number(rawStall) <= 7 * 86400) stallSeconds = Number(rawStall);
+      else errors.push(`${ADMISSION_STALL_ENV}=${rawStall} inválido (entero 1..604800); se usa ${ADMISSION_STALL_DEFAULT_SECONDS}`);
+    }
+    admission = { enabled: true, maxActiveRuns, maxActivePerOwner, stallSeconds };
   }
-  return { policy, caps, capGraceSeconds, admission, errors };
+  return { policy, caps, capGraceByType, admission, errors };
 }
 
 /** Topes que alcanzan a alguno de estos tipos. */
@@ -182,17 +213,68 @@ export function lastServedSql(policy: SchedulerPolicy, statusesParam: string, ty
   return { with: `with ${rs}, ${os}`, joins: 'left join os on os.owner_id is not distinct from pj.owner_id' };
 }
 
+function positiveIntEnv(env: Env, key: string, fallback: number): number {
+  const raw = Number(env[key]);
+  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback; // mismo criterio que readPositiveInt de los workers
+}
+
 /**
- * Partes que ocupan un tope: las running (también con la lease vencida y sin barrer) y las que el barrido devolvió por
- * lease vencida hace menos de `graceParam` segundos (su llamada puede seguir en vuelo en el proveedor). `typesParam` =
- * tipos del tope. Mismo texto para el pre-filtro, el claim (bajo el lock del tope) y las métricas.
+ * Ventana EN VUELO (segundos) por tipo de parte: la misma que usa Q-21 para devolver una parte sin llamar
+ * (IN_FLIGHT_WINDOW_MS de lease-takeover.ts y priorInFlightWindowMs de dynamic-llm-worker.ts), recalculada con ESTE env.
  */
-export function capOccupancySql(typesParam: string, graceParam: string): string {
-  return `select count(*)::int as n from public.generation_item_runs
-           where type = any(${typesParam}::text[])
-             and (status = 'running'
-                  or (status in ('pending', 'retrying') and error = 'lease_expired'
-                      and updated_at > now() - make_interval(secs => ${graceParam}::int)))`;
+export function inFlightWindowSecondsByType(env: Env = process.env): Record<string, number> {
+  const llm = positiveIntEnv(env, LLM_WORKER_CALL_TIMEOUT_ENV, LLM_WORKER_CALL_TIMEOUT_DEFAULT_MS) + IN_FLIGHT_MARGIN_MS;
+  const tts = Math.max(OPENAI_TTS_TIMEOUT_MS, ttsTimeoutMs(env as NodeJS.ProcessEnv).ms) + IN_FLIGHT_MARGIN_MS;
+  const script = IN_FLIGHT_WINDOW_MS.anthropic;
+  const ms: Record<string, number> = {};
+  for (const t of Object.keys(PROVIDERS_OF_TYPE)) {
+    ms[t] = t === 'video' ? IN_FLIGHT_WINDOW_MS.videogen
+      : t === 'presentation' ? IN_FLIGHT_WINDOW_MS.gamma
+        : t === 'audio_welcome' ? tts
+          : t === 'audiobook_chapter' ? Math.max(tts, script)
+            : llm;
+  }
+  return Object.fromEntries(Object.entries(ms).map(([t, v]) => [t, Math.ceil(v / 1000)]));
+}
+
+/** Parámetros de ventana para capOccupancySql: [tipos, segundos] en el mismo orden. */
+export function capGraceParams(cfg: Pick<FairSchedulingConfig, 'capGraceByType'>): [string[], number[]] {
+  const types = Object.keys(cfg.capGraceByType);
+  return [types, types.map((t) => cfg.capGraceByType[t])];
+}
+
+/**
+ * Partes que ocupan un tope (`typesParam` = tipos del tope; `wTypesParam`/`wSecsParam` = capGraceParams):
+ *  - running (también con la lease vencida y sin barrer);
+ *  - devueltas por Q-21 (`prior_call_in_flight…`) mientras su next_retry_at no llegó (= lo que falta de la ventana);
+ *  - barridas por lease vencida durante la ventana en vuelo de su tipo, contada desde el barrido.
+ * Mismo texto para el pre-filtro, el claim (bajo el lock del tope) y las métricas.
+ */
+export function capOccupancySql(typesParam: string, wTypesParam: string, wSecsParam: string): string {
+  return `select count(*)::int as n from public.generation_item_runs g
+           where g.type = any(${typesParam}::text[])
+             and (g.status = 'running'
+                  or (g.status in ('pending', 'retrying') and g.error like '${PRIOR_CALL_IN_FLIGHT}%' and g.next_retry_at > now())
+                  or (g.status in ('pending', 'retrying') and g.error = '${LEASE_EXPIRED}'
+                      and g.updated_at > now() - make_interval(secs => coalesce(
+                        (select w.s from unnest(${wTypesParam}::text[], ${wSecsParam}::int[]) as w(t, s) where w.t = g.type), 0))))`;
+}
+
+/**
+ * Runs que OCUPAN lugar de admisión (`stallParam` = segundos de DYNAMIC_ADMISSION_STALL_SECONDS):
+ *  - cualquier run abierto (también pausado o recién reanudado en `queued`) con alguna parte running (en vuelo);
+ *  - un run running/retrying con actividad en sus partes (updated_at: claim, latido, fallo, cierre) dentro del umbral.
+ * Un run admitido sin partes running y sin actividad deja de ocupar (estancado) y vuelve a la cola cuando tenga trabajo.
+ */
+export function occupyingRunsSql(stallParam: string): string {
+  return `select pj.id, pj.owner_id from public.production_jobs pj
+           where pj.execution_mode = 'dynamic_generation'
+             and pj.worker_status in ('queued', 'running', 'retrying', 'paused')
+             and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+             and (exists (select 1 from public.generation_item_runs r where r.job_id = pj.id and r.status = 'running')
+                  or (pj.worker_status in ('running', 'retrying')
+                      and greatest(pj.started_at, (select max(a.updated_at) from public.generation_item_runs a where a.job_id = pj.id))
+                          > now() - make_interval(secs => ${stallParam}::int)))`;
 }
 
 /** Clave del advisory lock de transacción de un tope / de la admisión (hashtextextended). */
@@ -207,4 +289,26 @@ export function reportConfigErrorsOnce(errors: readonly string[], log: (m: strin
     reported.add(e);
     log(`scheduler: configuración ignorada — ${e}`);
   }
+}
+
+/** Huella corta de la configuración efectiva (para comparar procesos en el log de arranque). */
+export function fairSchedulingFingerprint(cfg: FairSchedulingConfig): string {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { createHash } = require('crypto') as typeof import('crypto');
+  const norm = JSON.stringify({ p: cfg.policy, c: cfg.caps, g: cfg.capGraceByType, a: cfg.admission });
+  return createHash('sha256').update(norm).digest('hex').slice(0, 12);
+}
+
+/**
+ * H5 (rollout): cada proceso (API y workers) registra al arrancar su configuración de reparto y su huella. Si los
+ * procesos no muestran la MISMA huella, los topes / la admisión se aplican distinto según quién reclame.
+ */
+export function logFairSchedulingConfig(log: { log: (m: string) => void; error: (m: string) => void }, processName: string, env: Env = process.env): string {
+  const cfg = fairSchedulingConfig(env);
+  const fp = fairSchedulingFingerprint(cfg);
+  const adm = cfg.admission.enabled ? `on(max=${cfg.admission.maxActiveRuns}, porDueño=${cfg.admission.maxActivePerOwner ?? '-'}, estancado=${cfg.admission.stallSeconds}s)` : 'off';
+  log.log(`scheduler [${processName}]: política=${cfg.policy}, topes=${cfg.caps.map((c) => `${c.key}=${c.max}`).join(',') || 'ninguno'}, admisión=${adm}, huella=${fp} ` +
+    '(la API y todos los workers deben mostrar la MISMA huella)');
+  for (const e of cfg.errors) log.error(`scheduler [${processName}]: configuración ignorada — ${e}`);
+  return fp;
 }

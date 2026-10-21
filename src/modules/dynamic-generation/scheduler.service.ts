@@ -103,13 +103,14 @@ import {
 import {
   ADMISSION_LOCK_KEY,
   ADMISSION_QUEUED_REASON,
-  ADMITTED_RUN_WORKER_STATUSES,
   CapRule,
   FairSchedulingConfig,
   candidateOrderBy,
   capLockKey,
+  capGraceParams,
   capOccupancySql,
   capsForTypes,
+  occupyingRunsSql,
   fairSchedulingConfig,
   lastServedSql,
   reportConfigErrorsOnce,
@@ -465,6 +466,8 @@ export interface ClaimResult {
   item: ClaimedItem | null;
   /** r63 (SC): `admission_queued` = el run espera su turno de admisión (DYNAMIC_ADMISSION_ENABLED; cola visible). */
   reason?: typeof EXEC_LEASE_RUN_LEASED_ELSEWHERE | typeof RUN_PAUSED_REASON | typeof ADMISSION_QUEUED_REASON;
+  /** r63 (H6): con `admission_queued`, posición del run en la cola de producción (1 = el próximo). */
+  queuePosition?: number;
   leaseExpiresAt?: string | null;
 }
 
@@ -684,9 +687,16 @@ export class SchedulerService {
           videoScenes: executorAnchorsVideoScenes(opts.ownerId, opts.executorFeatures),
         }, sched);
         if (r.paused) return { item: null, reason: RUN_PAUSED_REASON };
-        if (r.admissionQueued) return { item: null, reason: ADMISSION_QUEUED_REASON };
+        if (r.admissionQueued) return { item: null, reason: ADMISSION_QUEUED_REASON, queuePosition: r.admissionQueued.position };
         if (r.leasedElsewhere) return { item: null, reason: EXEC_LEASE_RUN_LEASED_ELSEWHERE, leaseExpiresAt: r.leasedElsewhere.expiresAt };
         if (r.item) return { item: r.item };
+        // r63 (H4): un tope lleno (carrera con otro proceso) saca sus tipos y se prueba otro tipo libre del run.
+        if (r.capped) {
+          const full = r.capped;
+          claimTypes = claimTypes.filter((t) => !full.types.includes(t));
+          if (claimTypes.length === 0) break;
+          continue;
+        }
         if (!r.unavailable) break;
       }
       await this.reportMissingDependencies(opts.runId, opts.ownerId);
@@ -734,13 +744,13 @@ export class SchedulerService {
             and not (g.job_id = any($5::uuid[]))
             and ($6::timestamptz is null or pj.created_at >= $6::timestamptz)
             and ($7::int is null or m.rules_version = $7::int)
-            and ($8::boolean is not true or pj.worker_status <> 'queued'
+            and ($8::boolean is not true or pj.id = any($11::uuid[])
                  or ($9::int > 0 and not (coalesce(pj.owner_id, '') = any($10::text[]))))
             and ${claimablePredicate('g', '$4')}
           ${candidateOrderBy(sched.policy)}
           limit 1`,
         [DISPATCHABLE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns, opts.minRunCreatedAt ?? null, opts.onlyRulesVersion ?? null,
-          adm.enabled, adm.freeSlots, adm.ownersFull],
+          adm.enabled, adm.freeSlots, adm.ownersFull, adm.occupying],
       );
       if (!cand) {
         await this.reportMissingDependencies(null, opts.ownerId);
@@ -780,10 +790,10 @@ export class SchedulerService {
     itemId?: string,
     claimOpts: { videoScenes: boolean } = { videoScenes: true },
     sched: FairSchedulingConfig = fairSchedulingConfig({}),
-  ): Promise<{ item: ClaimedItem | null; unavailable: boolean; leasedElsewhere?: { expiresAt: string | null }; paused?: boolean; admissionQueued?: boolean; capped?: CapRule }> {
+  ): Promise<{ item: ClaimedItem | null; unavailable: boolean; leasedElsewhere?: { expiresAt: string | null }; paused?: boolean; admissionQueued?: { position: number }; capped?: CapRule }> {
     let cancelledJob: any = null;
     let paused = false;
-    let admissionQueued = false;
+    let admissionQueued: { position: number } | null = null;
     let capped: CapRule | null = null;
     let unavailable: string | null = null;
     let leasedElsewhere: { expiresAt: string | null } | undefined;
@@ -799,25 +809,36 @@ export class SchedulerService {
       if (isPausedRun(job)) { paused = true; return null; }
       if (!isDispatchableRun(job)) return null;
 
-      // r63 (SC): control de admisión (DYNAMIC_ADMISSION_ENABLED, apagado por defecto). Un run `queued` (todavía no
-      // empezó) solo recibe su primera parte si hay lugar. La decisión se serializa con un advisory lock de
-      // TRANSACCIÓN: el que admite marca el run running (markRunRunning, abajo) antes de soltarlo en el commit, así
-      // dos claims concurrentes nunca admiten más de maxActiveRuns. Antes del lease de ejecución: esperar admisión
-      // nunca toma el lease del run.
-      if (sched.admission.enabled && String(job.worker_status) === 'queued') {
-        await qr.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [ADMISSION_LOCK_KEY]);
-        const [a] = await qr.query(
-          `select count(*)::int as total,
-                  count(*) filter (where owner_id is not distinct from $1)::int as mine
-             from public.production_jobs
-            where execution_mode = 'dynamic_generation' and worker_status = any($2::text[])
-              and coalesce(status, '') not in ('cancelled', 'cancelling') and id <> $3`,
-          [job.owner_id ?? null, ADMITTED_RUN_WORKER_STATUSES, job.id],
-        );
-        const perOwner = sched.admission.maxActivePerOwner;
-        if (Number(a.total) >= sched.admission.maxActiveRuns || (perOwner !== null && Number(a.mine) >= perOwner)) {
-          admissionQueued = true;
-          return null;
+      // r63 (SC): control de admisión (DYNAMIC_ADMISSION_ENABLED, apagado por defecto). Un run que NO ocupa lugar
+      // (occupyingRunsSql: `queued` sin empezar, reanudado sin partes en vuelo, o admitido pero estancado) solo recibe una
+      // parte si hay lugar. Todo pasa por un advisory lock de TRANSACCIÓN: el que entra deja su parte running (y el run
+      // running) antes del commit, así dos claims concurrentes nunca admiten más de maxActiveRuns. Un run que ya ocupa
+      // lugar (partes en vuelo o actividad reciente) no se vuelve a evaluar. Antes del lease de ejecución: esperar
+      // admisión nunca toma el lease del run.
+      if (sched.admission.enabled) {
+        const stall = sched.admission.stallSeconds;
+        const [self] = await qr.query(`select count(*)::int as n from (${occupyingRunsSql('$2')}) o where o.id = $1`, [job.id, stall]);
+        if (Number(self.n) === 0) {
+          await qr.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [ADMISSION_LOCK_KEY]);
+          const [a] = await qr.query(
+            `select count(*)::int as total, count(*) filter (where o.owner_id is not distinct from $1)::int as mine
+               from (${occupyingRunsSql('$3')}) o where o.id <> $2`,
+            [job.owner_id ?? null, job.id, stall],
+          );
+          const perOwner = sched.admission.maxActivePerOwner;
+          if (Number(a.total) >= sched.admission.maxActiveRuns || (perOwner !== null && Number(a.mine) >= perOwner)) {
+            // Posición en la cola visible: runs despachables que tampoco ocupan lugar y llegaron antes (+1).
+            const [pos] = await qr.query(
+              `select count(*)::int as n from public.production_jobs pj
+                where pj.execution_mode = 'dynamic_generation' and pj.worker_status = any($1::text[])
+                  and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+                  and (pj.created_at, pj.id) < ($2::timestamptz, $3::uuid)
+                  and pj.id not in (select o.id from (${occupyingRunsSql('$4')}) o)`,
+              [DISPATCHABLE_RUN_WORKER_STATUSES, job.created_at, job.id, stall],
+            );
+            admissionQueued = { position: Number(pos.n) + 1 };
+            return null;
+          }
         }
       }
 
@@ -864,11 +885,11 @@ export class SchedulerService {
       // r63 (SC): topes de concurrencia (DYNAMIC_SCHEDULER_TYPE_CAPS / _PROVIDER_CAPS; sin configurar = nada). Un
       // advisory lock de TRANSACCIÓN por tope, en orden fijo de clave (sin deadlocks): el que entra cuenta los running
       // ya confirmados y, si hay lugar, deja su parte running antes del commit → el tope nunca se supera entre procesos.
-      // Se cuentan las running (también con la lease vencida y sin barrer) y las devueltas por lease vencida hace menos de
-      // capGraceSeconds: en los dos casos la llamada al proveedor puede seguir en vuelo (Q-21).
+      // Ocupan el tope las running, las devueltas por Q-21 (prior_call_in_flight) durante lo que falta de su ventana y las
+      // barridas por lease vencida durante la ventana en vuelo de su tipo: la llamada puede seguir en vuelo (capOccupancySql).
       for (const rule of capsForTypes(sched.caps, [String(cand.type)])) {
         await qr.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [capLockKey(rule)]);
-        const [c] = await qr.query(capOccupancySql('$1', '$2'), [rule.types, sched.capGraceSeconds]);
+        const [c] = await qr.query(capOccupancySql('$1', '$2', '$3'), [rule.types, ...capGraceParams(sched)]);
         if (Number(c.n) >= rule.max) {
           capped = rule;
           return null;
@@ -909,7 +930,7 @@ export class SchedulerService {
     if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
     return {
       item: claimed, unavailable: unavailable !== null, ...(leasedElsewhere ? { leasedElsewhere } : {}), ...(paused ? { paused: true } : {}),
-      ...(admissionQueued ? { admissionQueued: true } : {}), ...(capped ? { capped } : {}),
+      ...(admissionQueued ? { admissionQueued } : {}), ...(capped ? { capped } : {}),
     };
   }
 
@@ -922,7 +943,7 @@ export class SchedulerService {
     if (!rules.length) return [...types];
     const running: Record<string, number> = {};
     for (const r of rules) {
-      const [c] = await this.dataSource.query(capOccupancySql('$1', '$2'), [r.types, sched.capGraceSeconds]);
+      const [c] = await this.dataSource.query(capOccupancySql('$1', '$2', '$3'), [r.types, ...capGraceParams(sched)]);
       running[r.key] = Number(c.n);
     }
     return typesWithRoom(types, rules, running);
@@ -932,19 +953,14 @@ export class SchedulerService {
    * r63 (SC): lugar de admisión AHORA (pre-filtro del candidato global, sin lock). Apagado → sin restricción y sin
    * tocar la DB. `ownersFull` = dueños con su tope por dueño lleno (sus runs `queued` no se miran).
    */
-  private async admissionRoom(sched: FairSchedulingConfig): Promise<{ enabled: boolean; freeSlots: number; ownersFull: string[] }> {
-    if (!sched.admission.enabled) return { enabled: false, freeSlots: 0, ownersFull: [] };
-    const rows: Array<{ owner_id: string | null; n: number }> = await this.dataSource.query(
-      `select owner_id, count(*)::int as n from public.production_jobs
-        where execution_mode = 'dynamic_generation' and worker_status = any($1::text[])
-          and coalesce(status, '') not in ('cancelled', 'cancelling')
-        group by owner_id`,
-      [ADMITTED_RUN_WORKER_STATUSES],
-    );
-    const total = rows.reduce((acc, r) => acc + Number(r.n), 0);
+  private async admissionRoom(sched: FairSchedulingConfig): Promise<{ enabled: boolean; freeSlots: number; ownersFull: string[]; occupying: string[] }> {
+    if (!sched.admission.enabled) return { enabled: false, freeSlots: 0, ownersFull: [], occupying: [] };
+    const rows: Array<{ id: string; owner_id: string | null }> = await this.dataSource.query(occupyingRunsSql('$1'), [sched.admission.stallSeconds]);
+    const byOwner = new Map<string, number>();
+    for (const r of rows) byOwner.set(String(r.owner_id ?? ''), (byOwner.get(String(r.owner_id ?? '')) ?? 0) + 1);
     const per = sched.admission.maxActivePerOwner;
-    const ownersFull = per === null ? [] : rows.filter((r) => Number(r.n) >= per).map((r) => String(r.owner_id ?? ''));
-    return { enabled: true, freeSlots: Math.max(0, sched.admission.maxActiveRuns - total), ownersFull };
+    const ownersFull = per === null ? [] : [...byOwner.entries()].filter(([, n]) => n >= per).map(([o]) => o);
+    return { enabled: true, freeSlots: Math.max(0, sched.admission.maxActiveRuns - rows.length), ownersFull, occupying: rows.map((r) => r.id) };
   }
 
   /**

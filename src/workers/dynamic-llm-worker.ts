@@ -7,6 +7,7 @@ import { DataSource } from 'typeorm';
 import { AppModule } from '../app.module';
 import { holdIdleIfDynamicDisabled } from './dynamic-worker-gate';
 import { DrainSignal, awaitDrain, drainTimeoutMs, installDrainHandlers, runClaimLoop } from './worker-drain';
+import { logFairSchedulingConfig } from '../modules/dynamic-generation/fair-scheduling';
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, ItemType, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { V3_PAYLOAD_INVALID } from '../modules/course-shell/v3-validation';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
@@ -440,6 +441,7 @@ async function bootstrap() {
   const drain = new DrainSignal();
   const active = new Set<Promise<void>>();
   installDrainHandlers({ name: 'dynamic-llm-worker', logger, drain, active, close: () => app.close() });
+  logFairSchedulingConfig(logger, 'dynamic-llm-worker'); // r63 (H5)
   await runLlmWorkerLoop({ app, logger, drain, active, cfg });
 }
 

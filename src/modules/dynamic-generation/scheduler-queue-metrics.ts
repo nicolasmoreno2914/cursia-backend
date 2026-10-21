@@ -3,7 +3,7 @@ import { DataSource } from 'typeorm';
 import { DISPATCHABLE_RUN_WORKER_STATUSES } from './item-transitions';
 import { claimablePredicate } from './scheduler.service';
 import { ALL_MANIFEST_ITEM_TYPES } from '../generation-manifests/generation-manifest-builder';
-import { ADMITTED_RUN_WORKER_STATUSES, FairSchedulingConfig, capOccupancySql, fairSchedulingConfig } from './fair-scheduling';
+import { ADMISSION_STALL_DEFAULT_SECONDS, FairSchedulingConfig, capGraceParams, capOccupancySql, fairSchedulingConfig, fairSchedulingFingerprint, occupyingRunsSql } from './fair-scheduling';
 
 /**
  * r63 (SC) — métricas de la cola del scheduler de la generación dinámica (SOLO LECTURA).
@@ -68,33 +68,42 @@ export async function computeSchedulerQueueMetrics(q: Q, cfg: FairSchedulingConf
       order by pj.created_at, pj.id`,
     [[...DISPATCHABLE_RUN_WORKER_STATUSES, 'paused']],
   );
+  // Ocupan lugar de admisión: partes en vuelo o actividad reciente (occupyingRunsSql). El resto de los despachables espera
+  // en la cola (`queued` sin empezar / `stalled` admitido pero estancado); misma posición que devuelve el claim.
+  const stall = cfg.admission.enabled ? cfg.admission.stallSeconds : ADMISSION_STALL_DEFAULT_SECONDS;
+  const occupying = new Set<string>((await q.query(occupyingRunsSql('$1'), [stall])).map((r: any) => String(r.id)));
   let queuedPos = 0;
-  const admittedCount = runRows.filter((r) => ADMITTED_RUN_WORKER_STATUSES.includes(String(r.worker_status))).length;
   const runs = runRows.map((r) => {
-    const queued = String(r.worker_status) === 'queued';
+    const ws = String(r.worker_status);
+    const occ = occupying.has(String(r.id));
+    const admission = occ ? 'admitted' : ws === 'paused' ? 'paused' : ws === 'queued' ? 'queued' : 'stalled';
+    const waiting = admission === 'queued' || admission === 'stalled';
     return {
       runId: r.id, ownerId: r.owner_id, workerStatus: r.worker_status,
       createdAt: r.created_at, startedAt: r.started_at, lastClaimedAt: r.last_claimed_at,
-      waitSec: queued ? Math.round((new Date(now).getTime() - new Date(r.created_at).getTime()) / 1000) : null,
-      admission: ADMITTED_RUN_WORKER_STATUSES.includes(String(r.worker_status)) ? 'admitted' : queued ? 'queued' : String(r.worker_status),
-      ...(queued && cfg.admission.enabled ? { queuePosition: ++queuedPos } : {}),
+      waitSec: ws === 'queued' ? Math.round((new Date(now).getTime() - new Date(r.created_at).getTime()) / 1000) : null,
+      admission,
+      ...(waiting && cfg.admission.enabled ? { queuePosition: ++queuedPos } : {}),
       items: r.items, completed: r.completed, running: r.running, failedOrBlocked: r.failed_or_blocked,
     };
   });
+  const admittedCount = runs.filter((r) => r.admission === 'admitted').length;
   const caps: Array<Record<string, unknown>> = [];
   for (const c of cfg.caps) {
     const [x] = await q.query(`select count(*)::int as n from public.generation_item_runs where status = 'running' and type = any($1::text[])`, [c.types]);
-    const [o] = await q.query(capOccupancySql('$1', '$2'), [c.types, cfg.capGraceSeconds]);
+    const [o] = await q.query(capOccupancySql('$1', '$2', '$3'), [c.types, ...capGraceParams(cfg)]);
     caps.push({ key: c.key, max: c.max, running: Number(x.n), occupied: Number(o.n), types: c.types });
   }
   return {
     version: SCHEDULER_QUEUE_METRICS_VERSION,
     generatedAt: now,
-    config: { policy: cfg.policy, caps: cfg.caps, capGraceSeconds: cfg.capGraceSeconds, admission: cfg.admission, configErrors: cfg.errors },
+    // H5: es la configuración del proceso de la API; los workers deben tener la misma (comparar `fingerprint` con su log).
+    config: { process: 'api', fingerprint: fairSchedulingFingerprint(cfg), policy: cfg.policy, caps: cfg.caps, capGraceByType: cfg.capGraceByType, admission: cfg.admission, configErrors: cfg.errors },
     totals: {
       dispatchableRuns: runs.filter((r) => r.workerStatus !== 'paused').length,
       admittedRuns: admittedCount,
       queuedRuns: runs.filter((r) => r.admission === 'queued').length,
+      stalledRuns: runs.filter((r) => r.admission === 'stalled').length,
       pausedRuns: runs.filter((r) => r.workerStatus === 'paused').length,
       claimableItems: byType.reduce((a, t) => a + Number(t.claimable), 0),
       runningItems: byType.reduce((a, t) => a + Number(t.running), 0),

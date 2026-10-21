@@ -8624,7 +8624,10 @@ function dynExecutorStart(opts) {
     contextSummaryMissing: 0,
     // REL lease: otro equipo tiene el lease de ejecución del run ({ expiresAt }); este ejecutor no reclama
     // nada y espera (la UI muestra «Generando en otro dispositivo»). null = este ejecutor puede reclamar.
-    leasedElsewhere: null
+    leasedElsewhere: null,
+    // r63 (SC): el servidor tiene el run en la COLA de producción (control de admisión, `admission_queued`):
+    // { position } (1 = el próximo). No es un claim aceptado: el ejecutor no tiene el lease y solo espera.
+    admissionQueued: null
   };
 
   function emit() {
@@ -8956,6 +8959,23 @@ function dynExecutorStart(opts) {
         continue;
       }
       if (state.leasedElsewhere) { state.leasedElsewhere = null; emit(); }
+      // r63 (SC): el run espera su turno de admisión. NO es un claim aceptado (el servidor no dio el lease):
+      // no se marca heldRunLease; se muestra «En cola de producción (posición N)» y se vuelve a preguntar.
+      if (!item && claimRes.data && claimRes.data.reason === 'admission_queued') {
+        heldRunLease = false;
+        var qpos = Number(claimRes.data.queuePosition);
+        var qp = isFinite(qpos) && qpos > 0 ? Math.floor(qpos) : null;
+        if (!state.admissionQueued || state.admissionQueued.position !== qp) {
+          state.admissionQueued = { position: qp };
+          emit();
+        }
+        var terminalQ = await checkTerminal();
+        if (terminalQ) { stopped = true; state.status = terminalQ; emit(); return; }
+        if (stopped) return;
+        await _dynSleep(DYN_POLL_MAX_MS);
+        continue;
+      }
+      if (state.admissionQueued) { state.admissionQueued = null; emit(); }
       // Pausa del usuario (servidor = autoridad): no hay nada que reclamar hasta que el usuario la reanude. El
       // ejecutor se detiene (sin esperar ni reintentar); solo «Reanudar generación» lo vuelve a arrancar.
       if (!item && claimRes.data && claimRes.data.reason === 'run_paused') {

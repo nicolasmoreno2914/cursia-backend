@@ -12,6 +12,7 @@ import { RunsService } from './modules/dynamic-generation/runs.service';
 import { startAutoHealTimer } from './modules/dynamic-generation/auto-heal';
 import { ProviderReconcileService } from './modules/dynamic-generation/provider-reconcile.service';
 import { AutoPackageService } from './modules/dynamic-packaging/auto-package.service';
+import { logFairSchedulingConfig } from './modules/dynamic-generation/fair-scheduling';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -56,6 +57,8 @@ async function bootstrap() {
   const port = process.env.PORT || 3000;
   await app.listen(port);
   logger.log(`🚀 Cursia Backend running on http://localhost:${port}`);
+  // r63 (H5): configuración del reparto del scheduler y su huella (debe coincidir con la de los workers).
+  logFairSchedulingConfig(logger, 'api');
   logger.log(`   Health:  GET /health`);
   logger.log(`   API:     GET /api/v1`);
 

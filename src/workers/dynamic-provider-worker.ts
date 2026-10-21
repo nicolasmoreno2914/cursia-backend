@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 import { llmWorkerEnabled } from '../modules/dynamic-generation/llm-worker-routing';
+import { logFairSchedulingConfig } from '../modules/dynamic-generation/fair-scheduling';
 import { llmWorkerStartConfig, runLlmWorkerLoop } from './dynamic-llm-worker';
 import { createHash } from 'crypto';
 import { Logger } from '@nestjs/common';
@@ -344,6 +345,8 @@ async function bootstrap() {
       `drainTimeoutMs=${drainTimeoutMs()}, ttsTimeoutMs=${ttsTimeoutMs(process.env).ms} (${ttsTimeoutMs(process.env).source}), ` +
       `concurrency=${providerWorkerConcurrency()})`,
   );
+  // r63 (H5): configuración del reparto del scheduler y su huella (debe coincidir con la de la API).
+  logFairSchedulingConfig(logger, 'dynamic-provider-worker');
   // Loop 6: el worker de IA puede correr HOSPEDADO en este proceso (sin un 12.º proceso ni otra conexión al pooler).
   // Solo arranca con flag + instante de activación + API key; si no, el navegador sigue generando las partes largas.
   let llmLoop: Promise<void> = Promise.resolve();
