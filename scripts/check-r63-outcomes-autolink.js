@@ -23,11 +23,13 @@
 //   OA13 falsos positivos (review): prefijos que colisionan y términos de todo el curso («seguridad en obra», «gestión»,
 //        «empresa») no vinculan → ambiguo / capítulo para revisión
 //   OA14 plurales («leyes» ↔ «ley») vinculan; sinónimos (RCP / reanimación, infarto / ataque cardíaco) quedan ambiguos
-//   OA15 capítulo integrador vinculado a medias → aviso «quizá también trabaja», sin vínculo forzado
+//   OA15 capítulo integrador con coincidencia débil → «posible RAx», sin vínculo forzado
 //   OA16 guardar el perfil solo agrega; perfil vaciado → se quita lo del puente (no lo ajeno)
 //   OA17 el verbo inicial no cuenta solo: «Calcula el costo de la nómina» y «Aplica la normativa ambiental» → ambiguos
 //   OA18 stemmer: planea = planeación, costeo = costo; marco ≠ marca, medio ≠ media, cargo ≠ carga, informe ≠ información
 //   OA19 recall: un título corto entero dentro del resultado vincula; evidencia que no distingue dos resultados → revisión
+//   OA20 vínculo débil (solo el mínimo de términos, poca cobertura, sin título incluido): c14 de Costos → «posible RA6»
+//   OA21 títulos genéricos («Evaluación final», «Aplicación práctica»…) no vinculan por el verbo + un modificador; gerundios
 // Parte DB (Postgres 16 desechable; --pure-only la salta y lo dice):
 //   OD1 caso R1 exacto, curso sin documento: al guardar el perfil queda el contexto (RA1, RA2, CO1) sin subir el contador;
 //       «Usar este diseño» lo vincula solo (RA1 → Cap. 1, RA2 → Cap. 2, CO1 → ambos) con la misma huella; el perfil
@@ -46,6 +48,7 @@
 //   OD9 quitar del perfil un resultado vinculado: el guardado no sube el contador; «Usar este diseño» con el contador de
 //       la interfaz no da 409 y devuelve el vigente
 //   OD10 «Crear desde cero» (contexto propuesto sin unidades): vista previa, vínculos y ambiguo como advertencia
+//   OD11 «Preparar» con la propuesta no lista: NOT_READY sin escribir nada
 //   OD7 regresión: un Blueprint congelado ANTES (sin contexto) no cambia; con una propuesta lista/aprobada o una
 //       producción en curso no se toca nada automáticamente
 //
@@ -308,19 +311,21 @@ const sha = (ctx) => CP.profileSha256(CP.normalizeProfile('academic', ctx));
     eq([p2.links, p2.ambiguous.map((x) => x.id).sort()], [[], ['RA1', 'RA2']], 'sin sinónimos inventados: ambiguo');
   });
 
-  await check('OA15 capítulo integrador vinculado a medias: aviso «quizá también trabaja» (review M2), sin vínculo forzado', () => {
+  await check('OA15 capítulo integrador: coincidencia débil → «posible RAx» (review M2, re-review 3 I-C), sin vínculo forzado', () => {
     const ctx = A.academicContextFromProfile(null, profileOf({ do: ['Calcula los costos de producción de un producto', 'Determina el punto de equilibrio de la empresa'] }), null).context;
     const p = A.planDocumentlessLinks(ctx, [ch('c', 'Costos de producción', 'Clasificar los costos de producción'), ch('e', 'Punto de equilibrio', 'Calcular el punto de equilibrio'), ch('i', 'Caso integrador: punto de equilibrio con costos', 'Resolver un caso de punto de equilibrio')]);
     const L = linksOf(p);
     eq([L.c, L.e], [['RA1'], ['RA2']], 'cada resultado en su capítulo');
-    eq(L.i, ['RA2'], 'el integrador recibe el que le encaja casi igual');
-    assert(p.partial.some((x) => x.chapterId === 'i' && x.outcomeIds.includes('RA1')), 'y avisa que quizá también trabaja RA1: ' + JSON.stringify(p.partial));
-    assert(!p.links.some((l) => l.chapterId === 'i' && l.suggested.includes('RA1')), 'sin vincularlo');
+    // Re-review 3 I-C: el integrador comparte solo «punto» y «equilibrio» con RA2 y apenas un término con RA1 → coincidencia
+    // débil: no se vincula y queda «posible RA2» (requiere revisión).
+    eq(L.i, undefined, 'el integrador no se vincula con una coincidencia débil');
+    assert(p.partial.some((x) => x.chapterId === 'i' && x.outcomeIds.includes('RA2')), 'queda «posible RA2»: ' + JSON.stringify(p.partial));
+    assert(p.unmatchedChapterIds.includes('i'), 'y el capítulo queda para revisión');
     const v = V.verifyDesign({ status: 'within_tolerance', targetHours: 10, estimatedHours: 10, toleranceHours: 1, baseHours: 5, counts: { modules: 1, chapters: 3, contentChapters: 3, practiceChapters: 0, videoChapters: 3, activities: 3, applicationActivities: 3, evaluations: 2 },
       manifestErrors: [], approach: null, policyKind: null, audiovisual: 'recommended', pinnedChapters: 0, cost: null, preferences: { emphasis: 'balanced', applicationActivities: 'auto' }, proposedChapterIds: [], uncoveredContents: [], requiredEvaluations: [], uncoveredEvaluations: [],
       alignment: { available: true, outcomes: [], findings: [] }, autoLink: { chapterIds: [], outcomeIds: [], preview: [], review: { outcomes: [], chapters: [], partial: [{ chapterId: 'i', title: 'Caso integrador', outcomeIds: ['RA1'] }] } } });
     const r = v.checks.find((x) => x.id === 'outcome_review');
-    assert(r && r.severity === 'warning' && /quizá también trabaja RA1/.test(r.detail), 'aviso: ' + JSON.stringify(r));
+    assert(r && r.severity === 'warning' && /posible RA1/.test(r.detail), 'aviso: ' + JSON.stringify(r));
   });
 
   await check('OA16 guardar el perfil solo agrega (sin podar ni subir el contador); perfil vaciado: se quita lo del puente (review I4/M4)', () => {
@@ -366,6 +371,46 @@ const sha = (ctx) => CP.profileSha256(CP.normalizeProfile('academic', ctx));
     const mo = one({ do: ['Identifica los elementos del costo: materiales, mano de obra y costos indirectos', 'Calcula el costo de los materiales y de la mano de obra con métodos de valoración'] },
       [ch('m1', 'Asignación de la mano de obra', null), ch('m2', 'Elementos del costo', null), ch('m3', 'Métodos de valoración de inventarios', null)]);
     assert(!(linksOf(mo).m1 || []).length, '«mano de obra» está en los dos resultados: el capítulo no decide entre ellos: ' + JSON.stringify(linksOf(mo)));
+  });
+
+  await check('OA20 vínculo débil (re-review 3 I-C): en Costos (18 capítulos), «Informe de cantidades y costos» NO se vincula a RA6 y queda «posible RA6»', () => {
+    const RAc = ['Identificar los elementos del costo (materiales, mano de obra y costos indirectos) y su clasificación.',
+      'Calcular el costo de los materiales y de la mano de obra aplicando métodos de valoración de inventarios y la liquidación de la nómina.',
+      'Aplicar el sistema de costeo por órdenes de producción en una empresa manufacturera.', 'Aplicar el sistema de costeo por procesos con producción equivalente.',
+      'Analizar el punto de equilibrio y la relación costo-volumen-utilidad para tomar decisiones.', 'Elaborar un informe de costos que soporte una decisión gerencial.'];
+    const T = ['Concepto y objetivos de la contabilidad de costos', 'Elementos del costo', 'Clasificación de los costos', 'Estado de costo de productos vendidos',
+      'Métodos de valoración de inventarios (PEPS y promedio ponderado)', 'Control de materiales', 'Liquidación de nómina y prestaciones sociales', 'Asignación de la mano de obra',
+      'Costos indirectos de fabricación', 'Tasas predeterminadas', 'Hoja de costos por orden de producción', 'Análisis de variaciones', 'Producción equivalente',
+      'Informe de cantidades y costos', 'Costeo por departamentos', 'Margen de contribución', 'Punto de equilibrio', 'Toma de decisiones con información de costos'];
+    const ctx = A.academicContextFromProfile(null, profileOf({ do: RAc }), null).context;
+    const p = A.planDocumentlessLinks(ctx, T.map((t, i) => ch(`c${i + 1}`, t, null)));
+    const L = linksOf(p);
+    eq(L.c14, undefined, 'c14 sin vínculo (solo comparte «informe» y «costo», muy repetido, con RA6)');
+    assert(p.partial.some((x) => x.chapterId === 'c14' && x.outcomeIds.includes('RA6')), 'c14 queda «posible RA6»: ' + JSON.stringify(p.partial));
+    assert(p.unmatchedChapterIds.includes('c14'), 'y requiere revisión');
+    // Los vínculos correctos del corpus siguen (solo se pierde c14).
+    eq([L.c2, L.c3, L.c5, L.c11, L.c13, L.c17].map((x) => (x || []).filter((y) => y.startsWith('RA'))), [['RA1'], ['RA1'], ['RA2'], ['RA3'], ['RA4'], ['RA5']], 'los demás vínculos del corpus');
+  });
+
+  await check('OA21 títulos genéricos (re-review 3 I-D): «Evaluación final», «Aplicación práctica», «Práctica final», «Identificación inicial», «Diseño final» quedan ambiguos', () => {
+    const one = (lo, chapters) => A.planDocumentlessLinks(A.academicContextFromProfile(null, profileOf(lo), null).context, chapters);
+    const extra = [ch('z1', 'Normas de la empresa', 'Conocer las normas internas'), ch('z2', 'Comunicación con clientes', 'Atender a los clientes')];
+    for (const [ra, title] of [
+      ['Evalúa el producto final de la obra', 'Evaluación final'],
+      ['Evalúa el desempeño final del equipo de ventas', 'Evaluación final'],
+      ['Aplica técnicas de primeros auxilios en la práctica', 'Aplicación práctica'],
+      ['Practica la soldadura final de uniones', 'Práctica final'],
+      ['Identifica la etapa inicial de un incendio', 'Identificación inicial'],
+      ['Diseña la propuesta final de mejora', 'Diseño final'],
+    ]) {
+      const p = one({ do: [ra] }, [ch('g', title, null), ...extra]);
+      assert(!p.links.some((l) => l.chapterId === 'g'), `«${title}» no se vincula con «${ra}»: ` + JSON.stringify(p.links));
+      eq(p.ambiguous.map((x) => x.id), ['RA1'], `«${ra}» queda ambiguo`);
+    }
+    eq(A.lightStem('aplicando'), A.lightStem('aplicar'), 'el gerundio se reduce (aplicando = aplicar)');
+    // Un título con contenido además del verbo sí vincula («Planeación de la demanda»).
+    const ok = one({ do: ['Planea la demanda con métodos cuantitativos sencillos'] }, [ch('d', 'Planeación de la demanda', null), ...extra]);
+    eq(linksOf(ok).d, ['RA1'], 'la regla de título incluido sigue para títulos con contenido');
   });
 
   if (PURE_ONLY) console.log('\n(--pure-only: parte DB omitida)');
@@ -655,6 +700,17 @@ async function dbChecks(doc) {
       const row1 = (await ds.query(`select snapshot_sha256 sha, snapshot_json::text s from public.course_blueprints where id = $1`, [bp.id]))[0];
       eq(row1, row0, 'Blueprint congelado intacto');
       eq(await versions(c.id, 'academic'), acBefore, 'sin versiones nuevas');
+    });
+
+    await check('OD11 «Preparar» con la propuesta NO lista (NOT_READY): falla sin escribir nada (re-review 3 m3)', async () => {
+      const c = await newCourse('No listo');
+      await legacyProfile(c.id, R1_PROFILE);
+      const st = await prebrief.state(c.id, OWNER);
+      assert(!st.draft.readiness.ready, 'el curso no está listo (falta el pedido)');
+      const before = { links: (await links(c.id)).map((x) => x[1]), counter: await counter(c.id), ac: await versions(c.id, 'academic'), meta: (await ds.query(`select metadata from public.courses where id = $1`, [c.id]))[0].metadata };
+      const err = await prebrief.prepare(c.id, OWNER, { id: OWNER, email: null }, st.draft.modelSha256).then(() => null, (e) => e);
+      assert(err && /PREBRIEF_NOT_READY/.test(String(err.message || '')), 'NOT_READY: ' + (err && err.message));
+      eq({ links: (await links(c.id)).map((x) => x[1]), counter: await counter(c.id), ac: await versions(c.id, 'academic'), meta: (await ds.query(`select metadata from public.courses where id = $1`, [c.id]))[0].metadata }, before, 'nada escrito (contexto, vínculos, contador, metadata)');
     });
 
     await check('OD7 regresión: Blueprint congelado antes no cambia; propuesta lista/aprobada o producción en curso → no se toca nada', async () => {

@@ -196,10 +196,14 @@ const GENERIC = new Set([
   'estudiante', 'estudiantes', 'participante', 'participantes', 'aprendiz', 'capaz', 'forma', 'manera', 'propio', 'propia', 'adecuado', 'adecuada',
   'correcto', 'correcta', 'correctamente', 'adecuadamente', 'basico', 'basica', 'general', 'diferente', 'distinto', 'tipo', 'nivel', 'mismo', 'misma',
   'todo', 'toda', 'traves', 'partir', 'sera', 'poder', 'puede', 'pueden', 'curso', 'capitulo', 'modulo', 'tema', 'unidad', 'introduccion', 'conceptos', 'concepto',
+  // Re-review 3 I-D: modificadores de títulos de cierre o de práctica («Evaluación final», «Aplicación práctica»).
+  'final', 'finales', 'inicial', 'iniciales', 'practico', 'practica', 'practicos', 'practicas', 'aplicado', 'aplicada', 'aplicados', 'aplicadas',
+  'integrador', 'integradora', 'integradores', 'avanzado', 'avanzada', 'previo', 'previa', 'complementario', 'complementaria', 'introductorio', 'introductoria',
+  'fundamental', 'fundamentales', 'principal', 'principales', 'global', 'parcial', 'repaso', 'cierre',
 ]);
 
 /** Sufijos derivativos y verbales (de más largo a más corto). Lo que queda debe tener al menos 4 letras. */
-const SUFFIXES = ['amientos', 'imientos', 'amiento', 'imiento', 'aciones', 'iciones', 'idades', 'acion', 'icion', 'idad', 'mente', 'encia', 'ancia', 'ar', 'er', 'ir'];
+const SUFFIXES = ['amientos', 'imientos', 'amiento', 'imiento', 'aciones', 'iciones', 'idades', 'acion', 'icion', 'idad', 'mente', 'encia', 'ancia', 'iendo', 'ando', 'ar', 'er', 'ir'];
 
 /**
  * Raíz de una palabra (stemmer liviano de español, determinista). Plurales (-ces → z, -yes → y, -es tras r/l/n/d/j, -s),
@@ -322,7 +326,9 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
     // demanda» ⊂ «Planea la demanda…»), con al menos dos términos y uno que no es el verbo.
     chapters.forEach((c, i) => {
       const ts = titleStems[i];
-      titleFull.set(`${o.id}|${c.id}`, ts.length >= LINK_SHARED_MIN && ts.every((t) => all.has(t)) && ts.some((t) => t !== lead));
+      // Re-review 3 I-D: además del verbo (o su sustantivo: «Evaluación» = «Evalúa»), al menos un término con contenido (los
+      // modificadores genéricos como «final» o «práctica» ya no son términos).
+      titleFull.set(`${o.id}|${c.id}`, ts.length >= LINK_SHARED_MIN && ts.every((t) => all.has(t)) && ts.filter((t) => t !== lead).length >= 1);
     });
     const os = [...conceptStems(o.text)].filter((t) => !ubiquitous(t) && t !== lead);
     const total = os.reduce((a, t) => a + idf(t), 0);
@@ -385,6 +391,22 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
     // Dos resultados que lo cubren igual de bien no deciden nada: queda para revisión.
     if (byCov.length === 1 || (byCov.length > 1 && byCov[1].coverage < byCov[0].coverage)) set.add(byCov[0].o.id);
   }
+  // Re-review 3 I-C: un vínculo débil no pasa sin aviso. Solo el mínimo de términos en común, menos de LINK_COVERAGE_MIN
+  // del capítulo y sin título incluido → no se vincula: queda «posible RAx» (requiere revisión). Excepción: los términos
+  // en común son muy discriminantes (cada uno en un tercio de los capítulos o menos), como «cadena» y «emergencia» en R1.
+  const doubtful = new Map<string, string[]>();
+  for (const c of open) {
+    const set = plan.get(c.id)!;
+    for (const x of [...set]) {
+      const s = scoreOf.get(`${x}|${c.id}`)!;
+      if (titleFull.get(`${x}|${c.id}`) === true) continue;
+      const strong = s.terms.filter((t) => dfOf(t) <= Math.max(1, Math.floor(N / 3))).length;
+      if (s.shared <= LINK_SHARED_MIN && s.coverage < LINK_COVERAGE_MIN && strong < LINK_SHARED_MIN) {
+        set.delete(x);
+        doubtful.set(c.id, [...(doubtful.get(c.id) || []), x]);
+      }
+    }
+  }
   // Lo que vincula un capítulo con un resultado tiene que distinguirlo de los demás: si otro resultado comparte con el
   // capítulo TODOS esos términos (p. ej. «mano de obra» en RA1 y RA2), la evidencia no decide → revisión.
   for (const c of open) {
@@ -408,12 +430,13 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
   const partial: DocumentlessLinkPlan['partial'] = [];
   for (const c of open) {
     const set = plan.get(c.id)!;
-    if (!set.size) continue;
+    const dub = doubtful.get(c.id) || [];
+    if (!set.size) { if (dub.length) partial.push({ chapterId: c.id, outcomeIds: dub }); continue; }
     const extra = ctx.outcomes.filter((o) => !set.has(o.id)).filter((o) => {
       const s = scoreOf.get(`${o.id}|${c.id}`)!;
       return s.rare && s.score >= LINK_PARTIAL_MIN;
     }).map((o) => o.id);
-    if (extra.length) partial.push({ chapterId: c.id, outcomeIds: extra });
+    if (extra.length || dub.length) partial.push({ chapterId: c.id, outcomeIds: [...new Set([...dub, ...extra])].sort(cmpId) });
   }
   // d) Competencias: transversales. Van a todos los capítulos abiertos que trabajan algún resultado (si el curso no
   //    declara resultados, a todos los capítulos abiertos). Un capítulo sin resultado queda sin vínculos: se revisa.

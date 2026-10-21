@@ -236,7 +236,7 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
         rv.outcomes.length ? `${rv.outcomes.map((o) => o.id).join(', ')}: ningún capítulo lo trabaja con claridad` : '',
         rv.chapters.length ? `${list(rv.chapters.map((c) => c.title))}: no encaja con ningún resultado` : '',
         // Review M2: un capítulo vinculado que además comparte términos con otro resultado (por debajo del umbral).
-        ...partial.slice(0, 3).map((p) => `«${p.title}» quizá también trabaja ${p.outcomeIds.join(', ')}`),
+        ...partial.slice(0, 3).map((p) => `«${p.title}»: posible ${p.outcomeIds.join(', ')} (coincidencia débil, sin vincular)`),
       ].filter(Boolean);
       const what = [
         rv.outcomes.length ? plural(rv.outcomes.length, 'resultado sin capítulo claro', 'resultados sin capítulo claro') : '',
