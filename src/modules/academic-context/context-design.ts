@@ -11,6 +11,7 @@ import { DISTRIBUTOR_RULES } from '../study-time/distributor';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { ASSESSMENT_METHODS, AssessmentMethod } from '../pedagogy/vocabulary';
 import type { AcademicContextV1, FieldStatus, ThematicUnit, UnitContent } from './academic-context';
+import { isDocumentlessContext, planDocumentlessLinks } from './profile-outcomes';
 
 /**
  * Fase 3 · Loop 3.5 — Contexto académico → diseño (puro, determinista, sin proveedores).
@@ -497,6 +498,18 @@ export interface OutcomeLinkSuggestion {
  * tiene vínculos se conserva («keep»): la sugerencia nunca pisa una decisión del docente.
  */
 export function suggestOutcomeLinks(ctx: AcademicContextV1, chapters: ExistingChapterInput[]): OutcomeLinkSuggestion[] {
+  // r63: sin documento (ni unidades) los vínculos salen de la similitud con el capítulo, en los dos sentidos, con
+  // umbral y competencias transversales (profile-outcomes.ts). Con documento, exactamente lo de siempre.
+  if (isDocumentlessContext(ctx)) {
+    const plan = planDocumentlessLinks(ctx, chapters.map((c) => ({ id: c.id, title: c.title, objective: c.objective, description: c.description ?? null, outcomeIds: [...(c.outcomeIds ?? [])], eligible: true })));
+    const byId = new Map(plan.links.map((l) => [l.chapterId, l.suggested]));
+    return chapters.map((ch) => {
+      const current = [...(ch.outcomeIds ?? [])];
+      if (current.length) return { chapterId: ch.id, current, suggested: current, status: 'keep' as const };
+      const suggested = byId.get(ch.id) || [];
+      return { chapterId: ch.id, current, suggested, status: suggested.length ? ('inferred' as const) : ('none' as const) };
+    });
+  }
   // Dos niveles: coincidencia DIRECTA con el texto del resultado (manda) y, de respaldo, con el resultado + su unidad
   // (título y contenidos de la unidad que lo vincula).
   const targets = ctx.outcomes.map((o) => ({

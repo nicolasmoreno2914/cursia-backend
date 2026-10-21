@@ -4,7 +4,7 @@ import { LEARNING_TYPES } from './vocabulary';
 import { loadDesignPins } from '../course-design/design-pins';
 import { DecisionOverrides, requirementConstraintsForCourse } from '../academic-context/requirements/requirement-authority';
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
+import { StoredAcademicContext, academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
 import {
@@ -110,7 +110,7 @@ export class PedagogyService {
   async dryRunCourse(
     courseId: number,
     ownerId: string,
-    body: { profile?: unknown; activityTypeRules?: ActivityTypeRulesVersion; applyStructureAdjustments?: boolean; requirementDecisions?: DecisionOverrides; ignorePins?: boolean },
+    body: { profile?: unknown; activityTypeRules?: ActivityTypeRulesVersion; applyStructureAdjustments?: boolean; requirementDecisions?: DecisionOverrides; ignorePins?: boolean; academicOverride?: StoredAcademicContext | null },
   ): Promise<DryRunResult & { profileSource: 'request' | 'saved' | 'none'; savedProfileVersion: number }> {
     const course = await this.coursesService.findOne(courseId, ownerId); // 404 si no es suyo
     if (course.structureVersion !== 'dynamic') {
@@ -137,7 +137,8 @@ export class PedagogyService {
       [courseId],
     );
     // Fase 3: el contexto académico guardado entra al Blueprint en memoria igual que en el lock.
-    const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
+    // r63: «Cursia recomienda» pasa el contexto que saldría del perfil pedagógico cuando todavía no está guardado.
+    const academic = body.academicOverride !== undefined ? body.academicOverride : await loadCurrentAcademicContext(this.dataSource, courseId);
     // LOOP 7 (A1 I2): datos del curso de la fuente única (los mismos que el lock).
     const courseRef = plainCourseRefV2(row, academic ? academicBlueprintContext(academic.context, academic.sha256) : null);
     const errors = validateBlueprintInputV2(courseRef, modules, chapters);

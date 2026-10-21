@@ -10,6 +10,7 @@ import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { loadCourseFacts } from '../course-facts/course-facts-db';
 import { BRIEF_KEY, alignCourseContextWithSnapshot, parseBrief } from '../course-facts/course-facts';
 import { loadCurrentAcademicContext } from '../academic-context/academic-db';
+import { syncAcademicOutcomesFromProfile } from '../academic-context/profile-outcomes-db';
 import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
 import { emptyPedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
@@ -119,6 +120,29 @@ export class PrebriefService {
     return cov.available && !cov.stale ? { total: cov.total, covered: cov.covered } : null;
   }
 
+  /**
+   * r63 · Antes de calcular la propuesta: los resultados del perfil pedagógico quedan en el contexto académico y los
+   * capítulos sin vínculos de un curso sin documento se vinculan (idempotente, sin IA). Nunca sobre una propuesta
+   * preparada o aprobada, ni mientras se produce el curso: esas no se invalidan solas.
+   */
+  private async syncProfileOutcomes(courseId: number, ownerId: string): Promise<boolean> {
+    await this.loadCourse(courseId, ownerId);
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      await qr.query(`select id from public.courses where id = $1 for update`, [courseId]);
+      const r = await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: true, link: true });
+      await qr.commitTransaction();
+      return r.context.action !== 'none' || r.linked.length > 0;
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
   // ── Borrador ────────────────────────────────────────────────────────────────────────────────────────────────
 
   /** El Prebrief que se prepararía AHORA (mismos datos que ven Entendimos y Diseño). Solo lectura, USD 0. */
@@ -224,10 +248,13 @@ export class PrebriefService {
   /** GET: estado completo (borrador + versiones + flujo). */
   async state(courseId: number, ownerId: string, card?: any) {
     await this.assertTablesReady();
+    if (!card) await this.syncProfileOutcomes(courseId, ownerId);
     // `card`: «Cursia recomienda» ya calculado en este mismo pedido (motivos y confirmaciones no lo cambian; es lo
     // más caro del borrador). Sin él se calcula.
-    const draft = card ? await this.draftFrom(courseId, await this.loadCourse(courseId, ownerId), card) : await this.draft(courseId, ownerId);
+    let draft = card ? await this.draftFrom(courseId, await this.loadCourse(courseId, ownerId), card) : await this.draft(courseId, ownerId);
     await this.invalidateIfStale(courseId, draft, ownerId);
+    // r63: una propuesta que quedó vieja ya no protege nada: ahora sí se completan los resultados y vínculos.
+    if (!card && (await this.syncProfileOutcomes(courseId, ownerId))) draft = await this.draft(courseId, ownerId);
     const vs = await this.versions(this.dataSource, courseId);
     const meta = await this.metadata(this.dataSource, courseId);
     const latest = vs[0] || null;
@@ -283,6 +310,7 @@ export class PrebriefService {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     await this.assertTablesReady(); // sin las tablas (entorno sin la migración) → 503 ANTES de congelar nada
+    await this.syncProfileOutcomes(courseId, ownerId);
     let draft = await this.draft(courseId, ownerId);
     if (!draft.readiness.ready) throw new ConflictException({ code: PREBRIEF_NOT_READY, message: `${PREBRIEF_NOT_READY}: la propuesta todavía no se puede preparar para aprobación.`, blockers: draft.readiness.blockers });
     if (draft.modelSha256 !== expectedModelSha) throw new ConflictException({ code: PREBRIEF_CHANGED, message: `${PREBRIEF_CHANGED}: la propuesta cambió desde que la revisaste; revisa la versión actualizada.`, modelSha256: draft.modelSha256 });
