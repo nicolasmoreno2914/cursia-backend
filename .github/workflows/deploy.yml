@@ -24,6 +24,8 @@
 #   PROD_V2_LLM_WORKER_ENABLED=true con canario + PROD_V2_WORKERS_ENABLED: worker de IA HOSPEDADO en el
 #                                   worker de proveedores (las partes LLM no dependen de una pestaña
 #                                   abierta). Default false; el drenado sube a la duración de una llamada.
+#   PROD_STORAGE_MAX_BYTES=<bytes>  r63: STORAGE_MAX_UPLOAD_BYTES y PACKAGE_MBZ_MAX_BYTES del .env (default 300000000;
+#                                   el bucket de Supabase de producción debe permitirlo — runbook OWNER-ACTION).
 #   PROD_V2_GENERAL_AVAILABILITY=true  único modo de permitir V2 con allowlist vacía.
 #   PROD_DB_POOL_MAX / PROD_DB_POOL_MAX_WORKER / PROD_DB_POOL_IDLE_MS_WORKER
 #                                   pool por proceso (vacío = no se toca el .env).
@@ -113,8 +115,12 @@ jobs:
           BLOCK_V1: ${{ vars.PROD_DEPLOY_BLOCK_ON_V1_JOBS }}
           FE_REF: ${{ vars.PROD_FE_GATE_REF }}
           SKIP_STORAGE: ${{ vars.PROD_SKIP_STORAGE_POLICY_PROBE }}
+          STORAGE_MAX: ${{ vars.PROD_STORAGE_MAX_BYTES }}
         run: |
           set -e
+          # r63: tope de subida/.mbz (mismo valor para ambos; coherente con la proyección de tamaño de r61 Q-24).
+          STORAGE_MAX="$(printf '%s' "$STORAGE_MAX" | tr -d '[:space:]')"; STORAGE_MAX="${STORAGE_MAX:-300000000}"
+          if ! printf '%s' "$STORAGE_MAX" | grep -Eq '^[1-9][0-9]{6,11}$'; then echo "::error::PROD_STORAGE_MAX_BYTES debe ser un entero de bytes (>= 1000000)"; exit 1; fi
           CANARY="$(printf '%s' "$CANARY" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
           if [ -n "$CANARY" ] && ! printf '%s' "$CANARY" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
             echo "::error::PROD_V2_CANARY_OWNER no es un UUID"; exit 1
@@ -137,7 +143,7 @@ jobs:
           if [ "$LLM" = "true" ] && [ "$WORKERS" != "true" ]; then echo "::warning::PROD_V2_LLM_WORKER_ENABLED=true sin PROD_V2_WORKERS_ENABLED: el worker de IA va hospedado en el de proveedores y queda APAGADO"; fi
           if [ "$WORKERS" = "true" ] && [ -z "$CANARY" ]; then echo "::warning::PROD_V2_WORKERS_ENABLED=true sin PROD_V2_CANARY_OWNER: los workers de gasto quedan APAGADOS"; fi
           {
-            echo "canary=$CANARY"; echo "workers=$WORKERS"; echo "llm=$LLM"; echo "ga=$GA"; echo "block_v1=$BLOCK_V1"; echo "fe_ref=$FE_REF"; echo "skip_storage=$SKIP_STORAGE"
+            echo "canary=$CANARY"; echo "workers=$WORKERS"; echo "llm=$LLM"; echo "ga=$GA"; echo "block_v1=$BLOCK_V1"; echo "fe_ref=$FE_REF"; echo "skip_storage=$SKIP_STORAGE"; echo "storage_max=$STORAGE_MAX"
             echo "pool_max=$POOL_MAX"; echo "pool_max_worker=$POOL_MAX_WORKER"; echo "pool_idle_worker=$POOL_IDLE_WORKER"
           } >> "$GITHUB_OUTPUT"
           echo "V2 canario: ${CANARY:-(ninguno → V2 apagado)} · workers de gasto: $WORKERS · GA: $GA · bloquear por jobs V1: $BLOCK_V1 · FE gate ref: $FE_REF"
@@ -382,13 +388,14 @@ jobs:
           POOL_MAX_WORKER: ${{ steps.cfg.outputs.pool_max_worker }}
           POOL_IDLE_WORKER: ${{ steps.cfg.outputs.pool_idle_worker }}
           SKIP_STORAGE: ${{ steps.cfg.outputs.skip_storage }}
+          STORAGE_MAX: ${{ steps.cfg.outputs.storage_max }}
           DEPLOY_SHA: ${{ github.sha }}
         run: |
           # Línea 1 = secreto (nunca en argv ni en el log); luego KEY=VALUE no secretos (re-validados en el VPS).
           printf '%s\n' "$FINOPS_INGEST_TOKEN_PRODUCTION" \
             "PROD_V2_CANARY_OWNER=$CANARY" "PROD_V2_WORKERS_ENABLED=$WORKERS" "PROD_V2_LLM_WORKER_ENABLED=$LLM" "PROD_V2_GENERAL_AVAILABILITY=$GA" \
             "PROD_DB_POOL_MAX=$POOL_MAX" "PROD_DB_POOL_MAX_WORKER=$POOL_MAX_WORKER" "PROD_DB_POOL_IDLE_MS_WORKER=$POOL_IDLE_WORKER" \
-            "PROD_SKIP_STORAGE_POLICY_PROBE=$SKIP_STORAGE" "DEPLOY_SHA=$DEPLOY_SHA" \
+            "PROD_SKIP_STORAGE_POLICY_PROBE=$SKIP_STORAGE" "PROD_STORAGE_MAX_BYTES=$STORAGE_MAX" "DEPLOY_SHA=$DEPLOY_SHA" \
           | ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
               "cd '$DEPLOY_VPS_PATH' && bash scripts/ops/prod-release.sh install"
 

@@ -412,12 +412,13 @@ cmd_snapshot() {
   echo "deploying ${sha}" > .release-state
 }
 
-CFG_KEYS="PROD_V2_CANARY_OWNER PROD_V2_WORKERS_ENABLED PROD_V2_LLM_WORKER_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER PROD_SKIP_STORAGE_POLICY_PROBE DEPLOY_SHA"
+CFG_KEYS="PROD_V2_CANARY_OWNER PROD_V2_WORKERS_ENABLED PROD_V2_LLM_WORKER_ENABLED PROD_V2_GENERAL_AVAILABILITY PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER PROD_SKIP_STORAGE_POLICY_PROBE PROD_STORAGE_MAX_BYTES DEPLOY_SHA"
 cmd_install() {
   local fit="" line key val
   local CFG_PROD_V2_CANARY_OWNER="" CFG_PROD_V2_WORKERS_ENABLED=false CFG_PROD_V2_GENERAL_AVAILABILITY=false
   local CFG_PROD_DB_POOL_MAX="" CFG_PROD_DB_POOL_MAX_WORKER="" CFG_PROD_DB_POOL_IDLE_MS_WORKER="" CFG_DEPLOY_SHA=""
   local CFG_PROD_SKIP_STORAGE_POLICY_PROBE=false CFG_PROD_V2_LLM_WORKER_ENABLED=false
+  local CFG_PROD_STORAGE_MAX_BYTES=300000000
   IFS= read -r fit || true
   while IFS= read -r line; do
     [ -z "$line" ] && continue
@@ -432,6 +433,7 @@ cmd_install() {
   for key in PROD_DB_POOL_MAX PROD_DB_POOL_MAX_WORKER PROD_DB_POOL_IDLE_MS_WORKER; do
     val="CFG_${key}"; [ -z "${!val}" ] || [[ "${!val}" =~ ^[0-9]{1,6}$ ]] || die "${key} debe ser un entero"
   done
+  [[ "$CFG_PROD_STORAGE_MAX_BYTES" =~ ^[1-9][0-9]{6,11}$ ]] || die "PROD_STORAGE_MAX_BYTES debe ser un entero de bytes (>= 1000000)"
   [[ "$CFG_DEPLOY_SHA" =~ ^[0-9a-f]{7,40}$ ]] || die "DEPLOY_SHA inválido"
 
   assert_env_production
@@ -496,6 +498,10 @@ cmd_install() {
   if [ -n "$canary" ] && [ -z "$(env_val FINOPS_INGEST_TOKEN)" ]; then
     echo "⚠️  canario V2 sin FINOPS_INGEST_TOKEN: el ingest de uso del navegador queda rechazado (secret FINOPS_INGEST_TOKEN_PRODUCTION)"
   fi
+  # r63: sin esto el default de 50 MiB bloquea cursos con audio real de 5+ capítulos. Ambos al MISMO valor
+  # (PACKAGE_MBZ_MAX_BYTES no puede superar STORAGE_MAX_UPLOAD_BYTES; la proyección r61 Q-24 usa el mismo par).
+  ensure_env_exact STORAGE_MAX_UPLOAD_BYTES "$CFG_PROD_STORAGE_MAX_BYTES"
+  ensure_env_exact PACKAGE_MBZ_MAX_BYTES "$CFG_PROD_STORAGE_MAX_BYTES"
   local pk pv
   for pk in DB_POOL_MAX DB_POOL_MAX_WORKER DB_POOL_IDLE_MS_WORKER; do
     pv="CFG_PROD_${pk}"
