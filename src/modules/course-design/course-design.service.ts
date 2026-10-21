@@ -725,7 +725,7 @@ export async function autoLinkPlan(q: Q, courseId: number, ctx: AcademicContextV
  */
 export async function autoLinkPlanDetailed(q: Q, courseId: number, ctx: AcademicContextV1): Promise<{
   plan: { chapterId: string; title: string; suggested: string[] }[];
-  review: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[]; partial: { chapterId: string; title: string; outcomeIds: string[] }[] } | null;
+  review: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[]; partial: { chapterId: string; title: string; outcomeIds: string[]; linked: boolean }[] } | null;
 }> {
   if (isDocumentlessContext(ctx)) {
     const { plan, titles } = await documentlessLinkPlanFor(q, courseId, ctx);
@@ -734,7 +734,7 @@ export async function autoLinkPlanDetailed(q: Q, courseId: number, ctx: Academic
       review: {
         outcomes: plan.ambiguous.map((a) => ({ id: a.id, text: a.text })),
         chapters: plan.unmatchedChapterIds.map((id) => ({ chapterId: id, title: titles.get(id) || '' })),
-        partial: plan.partial.map((p) => ({ chapterId: p.chapterId, title: titles.get(p.chapterId) || '', outcomeIds: p.outcomeIds })),
+        partial: plan.partial.map((p) => ({ chapterId: p.chapterId, title: titles.get(p.chapterId) || '', outcomeIds: p.outcomeIds, linked: p.linked })),
       },
     };
   }

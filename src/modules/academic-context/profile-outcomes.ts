@@ -256,6 +256,24 @@ export function leadVerbStem(text: string): string | null {
   return null;
 }
 
+/** Raíces en orden (sin palabras vacías ni genéricas): para reconocer frases de dos términos. */
+export function conceptSeq(text: string): string[] {
+  const out: string[] = [];
+  for (const raw of stripToAscii(text).split(' ')) {
+    if (!raw || SPANISH_STOPWORDS.has(raw) || raw.length <= 2 || /^\d+$/.test(raw) || GENERIC.has(raw)) continue;
+    out.push(lightStem(raw));
+  }
+  return out;
+}
+
+/** ¿Dos de los términos en común forman la MISMA frase contigua (en el mismo orden) en los dos textos? */
+export function sharesBigram(a: string[], b: string[], terms: string[]): boolean {
+  const pairs = (q: string[]) => { const r = new Set<string>(); for (let i = 0; i + 1 < q.length; i++) r.add(`${q[i]}|${q[i + 1]}`); return r; };
+  const pa = pairs(a);
+  const pb = pairs(b);
+  return terms.some((x) => terms.some((y) => x !== y && pa.has(`${x}|${y}`) && pb.has(`${x}|${y}`)));
+}
+
 export interface LinkChapterInput {
   id: string;
   title: string;
@@ -276,7 +294,8 @@ export interface DocumentlessLinkPlan {
   /** Capítulos elegibles sin vínculos que no encajan con ningún resultado (requieren revisión). */
   unmatchedChapterIds: string[];
   /** Capítulos que se vinculan y además comparten términos con otros resultados por debajo del umbral (revisar). */
-  partial: { chapterId: string; outcomeIds: string[] }[];
+  /** `linked`: el capítulo ya trabaja otro resultado («quizá también trabaja RAx»); si no, «posible RAx» sin vincular. */
+  partial: { chapterId: string; outcomeIds: string[]; linked: boolean }[];
   /** Puntajes resultado × capítulo (redondeados), para mostrar y probar. */
   scores: { outcomeId: string; chapterId: string; score: number; shared: number }[];
 }
@@ -391,20 +410,25 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
     // Dos resultados que lo cubren igual de bien no deciden nada: queda para revisión.
     if (byCov.length === 1 || (byCov.length > 1 && byCov[1].coverage < byCov[0].coverage)) set.add(byCov[0].o.id);
   }
-  // Re-review 3 I-C: un vínculo débil no pasa sin aviso. Solo el mínimo de términos en común, menos de LINK_COVERAGE_MIN
-  // del capítulo y sin título incluido → no se vincula: queda «posible RAx» (requiere revisión). Excepción: los términos
-  // en común son muy discriminantes (cada uno en un tercio de los capítulos o menos), como «cadena» y «emergencia» en R1.
+  // Re-review 3/4 (I-C, I-E, I-F, m4) · Precisión ante todo: un vínculo con la evidencia MÍNIMA no se hace solo. Si el
+  // capítulo y el resultado comparten un solo término (resultados de un término: «Usa extintores») o exactamente dos que
+  // NO forman la misma frase en los dos textos (bigrama contiguo: «cadena de emergencia» sí; «línea … trabajo» no), y el
+  // título del capítulo no está entero en el resultado, no se vincula: queda «posible RAx» (requiere revisión).
   const doubtful = new Map<string, string[]>();
   for (const c of open) {
     const set = plan.get(c.id)!;
     for (const x of [...set]) {
-      const s = scoreOf.get(`${x}|${c.id}`)!;
       if (titleFull.get(`${x}|${c.id}`) === true) continue;
-      const strong = s.terms.filter((t) => dfOf(t) <= Math.max(1, Math.floor(N / 3))).length;
-      if (s.shared <= LINK_SHARED_MIN && s.coverage < LINK_COVERAGE_MIN && strong < LINK_SHARED_MIN) {
-        set.delete(x);
-        doubtful.set(c.id, [...(doubtful.get(c.id) || []), x]);
-      }
+      const sc = scoreOf.get(`${x}|${c.id}`)!;
+      if (sc.shared > LINK_SHARED_MIN) continue;
+      const o = ctx.outcomes.find((y) => y.id === x)!;
+      // Con la frase sola, el TÍTULO del capítulo no puede nombrar a otro resultado («Base de datos de PACIENTES» con
+      // «base de datos» de RA2 y «pacientes» de RA1): ahí la frase no decide.
+      const ci = chapters.indexOf(c);
+      const rival = ctx.outcomes.some((y) => y.id !== x && !set.has(y.id) && scoreOf.get(`${y.id}|${c.id}`)!.terms.some((t) => titleStems[ci].includes(t) && !sc.terms.includes(t)));
+      if (sc.shared === LINK_SHARED_MIN && !rival && sharesBigram(conceptSeq(o.text), conceptSeq(chText(c)), sc.terms)) continue;
+      set.delete(x);
+      doubtful.set(c.id, [...(doubtful.get(c.id) || []), x]);
     }
   }
   // Lo que vincula un capítulo con un resultado tiene que distinguirlo de los demás: si otro resultado comparte con el
@@ -431,12 +455,12 @@ export function planDocumentlessLinks(ctx: AcademicContextV1, chapters: LinkChap
   for (const c of open) {
     const set = plan.get(c.id)!;
     const dub = doubtful.get(c.id) || [];
-    if (!set.size) { if (dub.length) partial.push({ chapterId: c.id, outcomeIds: dub }); continue; }
+    if (!set.size) { if (dub.length) partial.push({ chapterId: c.id, outcomeIds: dub, linked: false }); continue; }
     const extra = ctx.outcomes.filter((o) => !set.has(o.id)).filter((o) => {
       const s = scoreOf.get(`${o.id}|${c.id}`)!;
       return s.rare && s.score >= LINK_PARTIAL_MIN;
     }).map((o) => o.id);
-    if (extra.length || dub.length) partial.push({ chapterId: c.id, outcomeIds: [...new Set([...dub, ...extra])].sort(cmpId) });
+    if (extra.length || dub.length) partial.push({ chapterId: c.id, outcomeIds: [...new Set([...dub, ...extra])].sort(cmpId), linked: true });
   }
   // d) Competencias: transversales. Van a todos los capítulos abiertos que trabajan algún resultado (si el curso no
   //    declara resultados, a todos los capítulos abiertos). Un capítulo sin resultado queda sin vínculos: se revisa.

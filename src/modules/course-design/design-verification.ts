@@ -103,7 +103,7 @@ export interface VerificationInput {
      * r63 · Sin documento: lo que Cursia NO vincula porque no encontró una coincidencia confiable (nunca lo fuerza):
      * resultados sin un capítulo que los trabaje con claridad y capítulos de contenido sin un resultado que les encaje.
      */
-    review?: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[]; partial?: { chapterId: string; title: string; outcomeIds: string[] }[] };
+    review?: { outcomes: { id: string; text: string }[]; chapters: { chapterId: string; title: string }[]; partial?: { chapterId: string; title: string; outcomeIds: string[]; linked?: boolean }[] };
   };
   /** Ids (del Manifest) de los capítulos que propone el diseño y todavía no existen (review L84 I3). */
   proposedChapterIds: string[];
@@ -236,7 +236,8 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
         rv.outcomes.length ? `${rv.outcomes.map((o) => o.id).join(', ')}: ningún capítulo lo trabaja con claridad` : '',
         rv.chapters.length ? `${list(rv.chapters.map((c) => c.title))}: no encaja con ningún resultado` : '',
         // Review M2: un capítulo vinculado que además comparte términos con otro resultado (por debajo del umbral).
-        ...partial.slice(0, 3).map((p) => `«${p.title}»: posible ${p.outcomeIds.join(', ')} (coincidencia débil, sin vincular)`),
+        // Re-review 4 m5: un capítulo ya vinculado que roza otro resultado «quizá también trabaja»; uno sin vínculo, «posible».
+        ...partial.slice(0, 3).map((p) => (p.linked ? `«${p.title}» quizá también trabaja ${p.outcomeIds.join(', ')}` : `«${p.title}»: posible ${p.outcomeIds.join(', ')} (coincidencia débil, sin vincular)`)),
       ].filter(Boolean);
       const what = [
         rv.outcomes.length ? plural(rv.outcomes.length, 'resultado sin capítulo claro', 'resultados sin capítulo claro') : '',

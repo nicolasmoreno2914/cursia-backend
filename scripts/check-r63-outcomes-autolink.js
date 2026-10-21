@@ -30,6 +30,9 @@
 //   OA19 recall: un título corto entero dentro del resultado vincula; evidencia que no distingue dos resultados → revisión
 //   OA20 vínculo débil (solo el mínimo de términos, poca cobertura, sin título incluido): c14 de Costos → «posible RA6»
 //   OA21 títulos genéricos («Evaluación final», «Aplicación práctica»…) no vinculan por el verbo + un modificador; gerundios
+//   OA22 cursos chicos: dos términos que no forman la misma frase en los dos textos no vinculan (E2, E6, E4); la frase sí (R1)
+//   OA23 evidencia mínima sin frase ni título incluido → «posible RAx», sin importar la cobertura (E1, E5)
+//   OA24 resultados de un término quedan visibles como «posible RAx»; «quizá también trabaja» en un capítulo ya vinculado
 // Parte DB (Postgres 16 desechable; --pure-only la salta y lo dice):
 //   OD1 caso R1 exacto, curso sin documento: al guardar el perfil queda el contexto (RA1, RA2, CO1) sin subir el contador;
 //       «Usar este diseño» lo vincula solo (RA1 → Cap. 1, RA2 → Cap. 2, CO1 → ambos) con la misma huella; el perfil
@@ -411,6 +414,55 @@ const sha = (ctx) => CP.profileSha256(CP.normalizeProfile('academic', ctx));
     // Un título con contenido además del verbo sí vincula («Planeación de la demanda»).
     const ok = one({ do: ['Planea la demanda con métodos cuantitativos sencillos'] }, [ch('d', 'Planeación de la demanda', null), ...extra]);
     eq(linksOf(ok).d, ['RA1'], 'la regla de título incluido sigue para títulos con contenido');
+  });
+
+  const runCase = (ras, chs) => {
+    const ctx = A.academicContextFromProfile(null, profileOf({ do: ras }), null).context;
+    const p = A.planDocumentlessLinks(ctx, chs.map(([id, title, objective]) => ch(id, title, objective || null)));
+    return { p, L: Object.fromEntries(p.links.map((l) => [l.chapterId, l.suggested.filter((x) => x.startsWith('RA'))])) };
+  };
+  const possible = (p, cid, rid) => p.partial.some((x) => x.chapterId === cid && x.outcomeIds.includes(rid) && x.linked === false);
+
+  await check('OA22 cursos chicos (re-review 4 I-E): dos términos sin formar la misma frase no vinculan → «posible RAx» (E2, E6); la frase sí (R1, «agua potable»)', () => {
+    const e2 = runCase(['Previene caídas con arnés y anclajes certificados', 'Registra la línea de producción y el trabajo diario del turno', 'Atiende emergencias con primeros auxilios'],
+      [['c1', 'Línea de vida y trabajo en alturas'], ['c2', 'Bitácora del turno'], ['c3', 'Primeros auxilios'], ['c4', 'Arnés y anclajes']]);
+    assert(!(e2.L.c1 || []).includes('RA2'), 'E2: «línea de vida» ≠ «línea de producción»: ' + JSON.stringify(e2.L));
+    assert(possible(e2.p, 'c1', 'RA2'), 'E2: c1 queda «posible RA2»: ' + JSON.stringify(e2.p.partial));
+    const e6 = runCase(['Mide parámetros fisicoquímicos del agua potable', 'Aplica el control estadístico de la calidad en la línea', 'Opera la planta de tratamiento', 'Desinfecta tanques'],
+      [['c1', 'Control de calidad del agua potable'], ['c2', 'Gráficos estadísticos de proceso'], ['c3', 'Operación de la planta'], ['c4', 'Desinfección de tanques'], ['c5', 'Normativa sanitaria']]);
+    eq(e6.L.c1, ['RA1'], 'E6: c1 → RA1 por «agua potable» (la misma frase en los dos)');
+    assert(e6.p.partial.some((x) => x.chapterId === 'c1' && x.outcomeIds.includes('RA2')), 'E6: RA2 («control … calidad») no se vincula y se avisa: ' + JSON.stringify(e6.p.partial));
+    const e4 = runCase(['Registra pacientes en la historia clínica', 'Calcula la base de datos estadísticos del índice de cotización'], [['c1', 'Base de datos de pacientes'], ['c2', 'Índice de cotización']]);
+    assert(!(e4.L.c1 || []).includes('RA2'), 'E4: «Base de datos de pacientes» no va a RA2 (el título nombra a RA1): ' + JSON.stringify(e4.L));
+    eq(A.sharesBigram(A.conceptSeq(R1.RA1), A.conceptSeq(R1.chapters[0].title + ' ' + R1.chapters[0].objective), ['caden', 'emerg']), true, 'R1: «cadena de emergencia» es la misma frase');
+  });
+
+  await check('OA23 evidencia mínima (re-review 4 I-F): exactamente dos términos, sin frase ni título incluido → no vincula, «posible RAx» (E1, E5)', () => {
+    for (const [name, ras, chs] of [
+      ['E1 (3 caps)', ['Aplica el costeo por procesos con producción equivalente', 'Analiza el punto de equilibrio', 'Elabora un informe de costos que soporte una decisión gerencial'], [['c1', 'Producción equivalente'], ['c2', 'Informe de cantidades y costos'], ['c3', 'Punto de equilibrio']]],
+      ['E1 (4 caps)', ['Aplica el costeo por procesos con producción equivalente', 'Analiza el punto de equilibrio y el margen de contribución', 'Elabora un informe de costos que soporte una decisión gerencial'], [['c1', 'Producción equivalente'], ['c2', 'Informe de cantidades y costos'], ['c3', 'Margen de contribución'], ['c4', 'Punto de equilibrio']]],
+    ]) {
+      const r = runCase(ras, chs);
+      eq(r.L.c2, undefined, `${name}: «Informe de cantidades y costos» no se vincula a RA3`);
+      assert(possible(r.p, 'c2', 'RA3'), `${name}: queda «posible RA3»`);
+    }
+    const e5 = runCase(['Ejecuta el mantenimiento correctivo de motores', 'Elabora el plan financiero de mantenimiento del edificio'], [['c1', 'Plan de mantenimiento de motores'], ['c2', 'Finanzas del edificio']]);
+    assert(!(e5.L.c1 || []).includes('RA2'), 'E5: «Plan de mantenimiento de motores» no va a «plan financiero de mantenimiento»: ' + JSON.stringify(e5.L));
+    assert(e5.p.partial.some((x) => x.chapterId === 'c1' && x.outcomeIds.includes('RA2')), 'E5: queda el aviso de RA2');
+  });
+
+  await check('OA24 resultados de un término (re-review 4 m4) no vinculan pero quedan visibles; «quizá también trabaja» en un capítulo vinculado (m5)', () => {
+    const v5 = runCase(['Practica la soldadura final de uniones', 'Interpreta planos'], [['a', 'Práctica final'], ['b', 'Soldadura de uniones'], ['c', 'Lectura de planos']]);
+    eq(v5.L.c, undefined, '«Interpreta planos» no se vincula solo por «planos»');
+    assert(possible(v5.p, 'c', 'RA2') && v5.p.ambiguous.some((x) => x.id === 'RA2'), 'queda «posible RA2» y RA2 ambiguo: ' + JSON.stringify(v5.p.partial));
+    const v7 = runCase(['Identifica la etapa inicial de un incendio', 'Usa extintores'], [['a', 'Identificación inicial'], ['b', 'Uso de extintores'], ['c', 'Evacuación']]);
+    eq(v7.L.b, undefined, '«Usa extintores» no se vincula solo por «extintores»');
+    assert(possible(v7.p, 'b', 'RA2'), 'queda «posible RA2»');
+    const base = { status: 'within_tolerance', targetHours: 10, estimatedHours: 10, toleranceHours: 1, baseHours: 5, counts: { modules: 1, chapters: 2, contentChapters: 2, practiceChapters: 0, videoChapters: 2, activities: 2, applicationActivities: 2, evaluations: 2 },
+      manifestErrors: [], approach: null, policyKind: null, audiovisual: 'recommended', pinnedChapters: 0, cost: null, preferences: { emphasis: 'balanced', applicationActivities: 'auto' }, proposedChapterIds: [], uncoveredContents: [], requiredEvaluations: [], uncoveredEvaluations: [], alignment: { available: true, outcomes: [], findings: [] } };
+    const v = V.verifyDesign({ ...base, autoLink: { chapterIds: [], outcomeIds: [], preview: [], review: { outcomes: [], chapters: [], partial: [{ chapterId: 'x', title: 'Caso integrador', outcomeIds: ['RA1'], linked: true }, { chapterId: 'y', title: 'Lectura de planos', outcomeIds: ['RA2'], linked: false }] } } });
+    const r = v.checks.find((x) => x.id === 'outcome_review');
+    assert(r && /«Caso integrador» quizá también trabaja RA1/.test(r.detail) && /«Lectura de planos»: posible RA2/.test(r.detail), 'textos: ' + (r && r.detail));
   });
 
   if (PURE_ONLY) console.log('\n(--pure-only: parte DB omitida)');
