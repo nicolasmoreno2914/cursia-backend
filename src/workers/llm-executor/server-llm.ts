@@ -51,16 +51,15 @@ export const LLM_CALL_HASH_LEN = 12;
 export const LLM_WORKER_MAX_TOKENS_CAP = 16000;
 /**
  * r64 (R1 #1567): la MISMA solicitud cortada a mitad del stream no se repite igual. Tras un corte, esa llamada se
- * reenvía por el transporte sin streaming (respuesta entera o error HTTP conocido, sin cobro a medias); si esa vía
- * tampoco entrega, la parte falla con este código en vez de quemar su presupuesto de recuperación en reintentos
- * idénticos.
+ * reenvía por el transporte sin streaming (respuesta entera o error HTTP conocido, sin cobro a medias). Este código es
+ * la guarda defensiva si un transporte sin streaming llegara a cortarse (hoy no ocurre: falla como HTTP/desconocido).
  */
 export const LLM_OUTPUT_CUT_REPEATED = 'llm_output_cut_repeated';
 export type LlmTransport = 'stream' | 'nonstream';
 
 /**
- * r64: ¿alguna llamada de esta parte ya se cortó a mitad del stream en su ventana actual (este intento o uno
- * anterior, otro proceso incluido)? En R1 los cortes fueron de UNA parte (la principal y sus reintentos dirigidos):
+ * r64: ¿alguna llamada de esta parte ya se cortó a mitad del stream desde `since` (este intento o uno anterior,
+ * otro proceso incluido; el worker pasa toda la historia de la fila)? En R1 los cortes fueron de UNA parte (la principal y sus reintentos dirigidos):
  * con un corte, toda la parte sigue sin streaming. Lee el ledger: el cargo conservador del corte
  * (`metadata.streamCut`) o su ajuste (`llm_worker_stream_cut_conservative`). Ante un error de lectura responde
  * `false` (el primer envío vuelve a ser por streaming; nunca bloquea).
@@ -447,7 +446,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     const cached = await fromCheckpoint(win);
     if (cached !== null) return cached;
     // r64: transporte de ESTA llamada. Si ya se cortó por streaming (aquí o en un intento anterior), va sin streaming.
-    if (streamCutSeen === null) streamCutSeen = await priorStreamCut(deps.dataSource, item.itemRunId, win.since);
+    // Toda la historia de ESTA fila (no solo la ventana vigente): un reintento manual reinicia el presupuesto, pero los
+    // cortes anteriores siguen siendo evidencia de que su stream falla (R1: la parte se reintenta sobre sus 5 cortes).
+    if (streamCutSeen === null) streamCutSeen = await priorStreamCut(deps.dataSource, item.itemRunId, new Date(0));
     let transport: LlmTransport = streamCutSeen || cutCalls.size > 0 ? 'nonstream' : 'stream';
 
     // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
@@ -578,9 +579,11 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
           const cause = e.extra.cause || 'unknown_cut';
           notUnknown.delete(resKey); // sin message id no se puede liquidar: queda pendiente y cuenta como desconocida
           if (e.extra.messageId && u) {
+            // Review r64 (m5): si llegó el `message_delta` (usage final), la salida real se conoce → se cobra la real; si no,
+            // conservador (salida = tope), como siempre.
             const charge = serverLlmChargeInput({
               ownerId: item.ownerId, itemRunId: item.itemRunId, model: useModel, messageId: e.extra.messageId, requestId: e.extra.requestId ?? null,
-              usage: { ...u, output_tokens: Math.max(u.output_tokens, maxTokens) }, callRole: role.callRole, attempt: role.attempt,
+              usage: e.extra.sawUsageDelta ? { ...u } : { ...u, output_tokens: Math.max(u.output_tokens, maxTokens) }, callRole: role.callRole, attempt: role.attempt,
             });
             // r64: evidencia del corte en el ledger (antes se perdía: el log solo decía «se cortó»).
             charge.metadata = { ...(charge.metadata || {}), streamCut: { callHash: hash.slice(0, LLM_CALL_HASH_LEN), transport, cause, partialChars: e.extra.partialChars ?? null, sawUsageDelta: !!e.extra.sawUsageDelta, receivedOutputTokens: u.output_tokens } };
@@ -596,7 +599,8 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
             transport = 'nonstream';
             continue;
           }
-          // Sin streaming no hay cortes a mitad; si llegara a pasar, no se insiste igual.
+          // Guarda defensiva: hoy el transporte sin streaming nunca devuelve `cut` (falla como HTTP o desconocido, con sus
+          // reglas). Si algún día lo hiciera, no se insiste igual: excepción explícita con las causas.
           throw { fatal: true, status: 0, code: LLM_OUTPUT_CUT_REPEATED, msg: `${LLM_OUTPUT_CUT_REPEATED}: la respuesta de la IA se cortó ${prev.cuts} veces en la misma solicitud (${prev.causes.join(', ')}); no se repite igual` } as ApiError;
         }
         // Desconocido (sin respuesta, o timeout de gateway 408/504): la reserva queda PENDIENTE (cuenta en el

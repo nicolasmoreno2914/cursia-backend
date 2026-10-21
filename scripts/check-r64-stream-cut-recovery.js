@@ -9,7 +9,7 @@ const http = require('http');
 const path = require('path');
 const distRoot = path.resolve(process.cwd(), process.argv[2] || 'dist');
 const { createServerApi, priorStreamCut, LLM_OUTPUT_CUT_REPEATED } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
-const { nonStreamMessage, streamMessage } = require(path.join(distRoot, 'workers/llm-executor/anthropic-stream.js'));
+const { nonStreamMessage, streamMessage, nodeHttpFetch } = require(path.join(distRoot, 'workers/llm-executor/anthropic-stream.js'));
 const { classifyFailure } = require(path.join(distRoot, 'modules/reliability/failure-classifier.js'));
 
 let passes = 0; let failures = 0;
@@ -42,8 +42,10 @@ async function fakeAnthropic(plan) {
     if (p && p.status) { res.writeHead(p.status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'fake ' + p.status } })); return; }
     const id = 'msg_' + st.reqs.length;
     if (!stream) {
+      if (p && p.delayMs) await new Promise((r) => setTimeout(r, p.delayMs));
       if (p === 'garbage') { res.writeHead(200, { 'content-type': 'application/json', 'request-id': 'req_' + st.reqs.length }); res.end('{"type":"mess'); return; }
       res.writeHead(200, { 'content-type': 'application/json', 'request-id': 'req_' + st.reqs.length });
+      if (res.destroyed || req.socket.destroyed) return;
       res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: body.model, content: [{ type: 'text', text: p === 'max_tokens' ? FULL.slice(0, 20) : FULL }],
         stop_reason: p === 'max_tokens' ? 'max_tokens' : 'end_turn', usage: { input_tokens: 100, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } }));
       return;
@@ -53,6 +55,7 @@ async function fakeAnthropic(plan) {
     res.write(sse('content_block_delta', { index: 0, delta: { type: 'text_delta', text: FULL.slice(0, 30) } }));
     if (p === 'cut') { await new Promise((r) => setTimeout(r, 40)); res.socket.destroy(); return; }
     if (p === 'cut_error') { res.end(sse('error', { error: { type: 'overloaded_error', message: 'Overloaded' } })); return; }
+    if (p === 'cut_after_delta') { res.write(sse('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 40 } })); await new Promise((r) => setTimeout(r, 40)); res.socket.destroy(); return; }
     if (p === 'no_stop') { res.end(sse('content_block_delta', { index: 0, delta: { type: 'text_delta', text: FULL.slice(30) } })); return; }
     res.write(sse('content_block_delta', { index: 0, delta: { type: 'text_delta', text: FULL.slice(30) } }));
     res.write(sse('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 40 } }));
@@ -205,6 +208,19 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     await a.close();
   });
 
+  await check('R1 real: el reintento MANUAL (presupuesto reiniciado) de una parte con cortes previos empieza sin streaming (mira toda la historia de la fila)', async () => {
+    const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : 'ok'));
+    const w = fakeWorld({ priorCut: true });
+    const seen = [];
+    const q0 = w.ds.query.bind(w.ds);
+    w.ds.query = async (sql, params) => { if (sql.includes('stream_cut_seen')) seen.push(params[1]); return q0(sql, params); };
+    const api = makeApi(w, a.url);
+    await api('s', 'r1-retry-manual', 5000);
+    assert(seen.length === 1 && new Date(seen[0]).getTime() === 0, 'la consulta mira desde el inicio de la fila, no desde el reinicio del presupuesto: ' + JSON.stringify(seen));
+    assert(a.st.reqs.length === 1 && a.st.reqs[0].stream === false, 'directo sin streaming');
+    await a.close();
+  });
+
   await check('sin streaming, un 529 del proveedor es CONOCIDO: la reserva se libera sin cobro y no se vuelve al stream', async () => {
     const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : { status: 529 }));
     const w = fakeWorld(); const api = makeApi(w, a.url);
@@ -260,6 +276,32 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     const a = await fakeAnthropic(() => 'cut');
     const e = await err(streamMessage({ apiKey: 'k', baseUrl: a.url, body: { model: 'm', max_tokens: 10, messages: [{ role: 'user', content: 'z' }] }, idleMs: 2000, totalMs: 5000 }));
     assert(e && e.kind === 'cut' && /^socket:/.test(e.extra.cause) && e.extra.partialChars === 30 && e.extra.sawUsageDelta === false && e.extra.messageId, JSON.stringify(e && e.extra));
+    await a.close();
+  });
+
+  await check('review I1: sin streaming (producción, sin fetchImpl) usa http de Node: una respuesta que tarda en mandar encabezados llega igual', async () => {
+    const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : { delayMs: 1500 }));
+    const r = await nonStreamMessage({ apiKey: 'k', baseUrl: a.url, body: { model: 'm', max_tokens: 10, messages: [{ role: 'user', content: 'lento' }] }, idleMs: 200, totalMs: 5000 });
+    assert(r.text === FULL && r.stopReason === 'end_turn' && r.messageId, 'llegó entera pese a idleMs=200 (no aplica sin streaming): ' + JSON.stringify(r).slice(0, 120));
+    assert(typeof nodeHttpFetch === 'function', 'transporte de Node exportado');
+    await a.close();
+  });
+
+  await check('review I1: sin streaming, el tope de pared (totalMs) corta y queda DESCONOCIDO (pudo cobrarse), nunca «sin costo»', async () => {
+    const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : { delayMs: 2500 }));
+    const e = await err(nonStreamMessage({ apiKey: 'k', baseUrl: a.url, body: { model: 'm', max_tokens: 10, messages: [{ role: 'user', content: 'muy-lento' }] }, idleMs: 200, totalMs: 600 }));
+    assert(e && e.kind === 'unknown' && e.extra.cause === 'timeout_total', 'desconocido por tope total: ' + (e && e.kind) + ' ' + (e && e.extra && e.extra.cause));
+    await a.close();
+  });
+
+  await check('review m5: si el corte llegó DESPUÉS del usage final, se cobra la salida real (no el tope)', async () => {
+    const a = await fakeAnthropic(({ stream }) => (stream ? 'cut_after_delta' : 'ok'));
+    const w = fakeWorld(); const api = makeApi(w, a.url);
+    await api('s', 'prompt-delta', 5000);
+    const cut = w.charges.find((c) => c.metadata && c.metadata.streamCut);
+    assert(cut && cut.metadata.streamCut.sawUsageDelta === true && cut.metadata.streamCut.receivedOutputTokens === 40, 'evidencia: ' + JSON.stringify(cut && cut.metadata.streamCut));
+    const out = JSON.stringify(cut.usage || cut);
+    assert(!/5000/.test(out), 'no se cobró el tope (5000) teniendo la salida real: ' + out.slice(0, 200));
     await a.close();
   });
 

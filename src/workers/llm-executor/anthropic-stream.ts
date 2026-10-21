@@ -213,7 +213,10 @@ export async function streamMessage(req: StreamMessageRequest): Promise<LlmStrea
  *  - `unknown`: salió y no llegó una respuesta legible (caída, timeout, cuerpo cortado) → pudo procesarse y cobrarse.
  */
 export async function nonStreamMessage(req: StreamMessageRequest): Promise<LlmStreamResult> {
-  const f = req.fetchImpl ?? fetch;
+  // Review r64 (I1): el fetch global de Node (undici) corta a los 300 s sin encabezados (`headersTimeout`), y una
+  // respuesta sin streaming no manda encabezados hasta terminar: una parte larga (16k tokens) caería en «desconocido».
+  // Sin `fetchImpl` (producción) va por http/https de Node, sin ese tope: solo vale `totalMs` (y keepalive TCP).
+  const f = req.fetchImpl ?? nodeHttpFetch;
   const ctrl = new AbortController();
   let timedOut = false;
   const total = setTimeout(() => { timedOut = true; ctrl.abort(); }, req.totalMs);
@@ -264,3 +267,45 @@ export async function nonStreamMessage(req: StreamMessageRequest): Promise<LlmSt
     clearTimeout(total);
   }
 }
+
+/**
+ * Review r64 (I1): POST mínimo con http/https de Node con la forma de `fetch` que usa `nonStreamMessage` (status, ok,
+ * headers.get, text). Sin tope de encabezados ni de cuerpo propios: lo corta `signal` (el `totalMs` del llamador).
+ * Keepalive TCP para que una conexión larga y muda no la cierre un intermediario por inactividad.
+ */
+export const nodeHttpFetch: typeof fetch = ((input: any, init: any = {}) => new Promise((resolve, reject) => {
+  const url = new URL(String(input));
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const mod = url.protocol === 'https:' ? require('https') : require('http');
+  const signal: AbortSignal | undefined = init.signal;
+  const body = typeof init.body === 'string' ? init.body : '';
+  const headers: Record<string, string> = { ...(init.headers || {}), 'content-length': String(Buffer.byteLength(body)) };
+  let settled = false;
+  const fail = (e: any) => { if (!settled) { settled = true; reject(e); } };
+  const req = mod.request({ method: init.method || 'POST', hostname: url.hostname, port: url.port || undefined, path: url.pathname + url.search, headers }, (res: any) => {
+    const chunks: Buffer[] = [];
+    let textP: Promise<string> | null = null;
+    const done = new Promise<string>((ok, ko) => {
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
+      res.on('error', ko);
+      res.on('aborted', () => ko(Object.assign(new Error('respuesta abortada'), { code: 'ECONNRESET' })));
+    });
+    done.catch(() => undefined);
+    settled = true;
+    resolve({
+      status: res.statusCode,
+      ok: res.statusCode >= 200 && res.statusCode < 300,
+      headers: { get: (k: string) => { const v = res.headers[String(k).toLowerCase()]; return Array.isArray(v) ? v.join(', ') : v ?? null; } },
+      text: () => (textP ??= done),
+      body: null,
+    } as any);
+  });
+  req.on('socket', (sock: any) => { try { sock.setKeepAlive(true, 30_000); } catch { /* sin keepalive */ } });
+  req.on('error', fail);
+  if (signal) {
+    if (signal.aborted) { req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' })); }
+    signal.addEventListener('abort', () => req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+  }
+  req.end(body);
+})) as any;
