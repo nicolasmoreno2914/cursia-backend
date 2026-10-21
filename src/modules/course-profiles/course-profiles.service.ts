@@ -1,12 +1,12 @@
 import { adoptCourseTitleIfPlaceholder } from '../course-facts/course-facts-db';
 import { ACTIVE_RUN_WORKER_STATUSES } from '../dynamic-generation/item-transitions';
 import { parseProposedHours } from '../course-design/design-pins';
-import { returningRows } from '../../common/db/returning-rows';
 import { DERIVED_FIELDS, DerivedField, FieldOwner, PEDAGOGY_DERIVATION_KEY, mergeDerivedProfile, parsePedagogyDerivation, pedagogyFieldOwners } from '../course-facts/course-facts';
 import { loadCurrentAcademicContext } from '../academic-context/academic-db';
+import { ProfileOutcomesSync, pruneOutcomeLinksTo, pruneProfileLinksReplacedByDocument, syncAcademicOutcomesFromProfile } from '../academic-context/profile-outcomes-db';
+import { hasDocuments } from '../academic-context/proposed-context';
 import { suggestProfileFromContext } from '../academic-context/context-design';
 import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
-import { advanceStructureOriginIfUntouched } from '../course-structure/structure-authority';
 import { PRACTICE_FILE_ATTACH_MISMATCH_CODE, practiceResourceAttachErrors } from '../artifacts/practice-file-attach';
 import {
   BadRequestException,
@@ -231,7 +231,7 @@ export class CourseProfilesService {
     kind: string,
     data: unknown,
     expectedVersion?: number,
-  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[]; derivedPedagogy?: PedagogyDerivationResult }> {
+  ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[]; derivedPedagogy?: PedagogyDerivationResult; academicFromProfile?: ProfileOutcomesSync }> {
     assertDynamicOwnerAllowed(ownerId); // allow-list V2 en toda escritura
     this.assertKind(kind);
     await this.loadCourse(courseId, ownerId);
@@ -315,11 +315,15 @@ export class CourseProfilesService {
       if (latest && latest.sha256 === sha) {
         // Review N6: re-guardar el mismo contexto también limpia vínculos rotos (p. ej. anteriores a la poda).
         const prunedSame = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
+        // r63: re-guardar el mismo perfil pedagógico también lleva sus resultados al contexto académico si faltaban
+        // (cursos anteriores), sin versión nueva del perfil. No toca una propuesta preparada o aprobada.
+        const syncSame = kind === 'pedagogy' ? await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: true, link: false }) : null;
+        const wrote = !!syncSame && (syncSame.context.action !== 'none' || syncSame.linked.length > 0);
         // El DTO se arma ANTES de confirmar (review N-M1): un fallo de integridad no deja la poda confirmada con un 500.
         const dto = this.toDto(latest, finalExam);
-        if (prunedSame.length) await qr.commitTransaction();
+        if (prunedSame.length || wrote) await qr.commitTransaction();
         else await qr.rollbackTransaction();
-        return { created: false, profile: dto, ...(prunedSame.length ? { prunedOutcomeLinks: prunedSame } : {}) };
+        return { created: false, profile: dto, ...(prunedSame.length ? { prunedOutcomeLinks: prunedSame } : {}), ...(wrote ? { academicFromProfile: syncSame! } : {}) };
       }
 
       const [row] = await qr.query(
@@ -332,6 +336,13 @@ export class CourseProfilesService {
       // roto (y el lock fallaría). En la MISMA transacción se quitan de los capítulos los ids que la versión nueva no
       // define; si cambió alguno, sube el counter de la estructura (las pestañas abiertas releen).
       const pruned = kind === 'academic' ? await this.pruneStaleOutcomeLinks(qr, courseId, profile as AcademicContextV1) : [];
+      // r63: un documento sobre un contexto sin documento: los vínculos a ids del perfil que cambian de significado se quitan.
+      if (kind === 'academic' && hasDocuments(profile as AcademicContextV1) && !(latest && hasDocuments(normalizeProfile('academic', typeof latest.data === 'string' ? JSON.parse(latest.data) : latest.data) as AcademicContextV1))) {
+        for (const p of await pruneProfileLinksReplacedByDocument(qr, courseId, profile as AcademicContextV1)) {
+          const prev = pruned.find((x) => x.chapterId === p.chapterId);
+          if (prev) prev.removed = [...prev.removed, ...p.removed]; else pruned.push(p);
+        }
+      }
       // LOOP 8.1: el documento es dueño del estudiante, los resultados y las horas del perfil pedagógico. Se derivan
       // EN LA MISMA transacción (sin botón «Usar en el perfil»), salvo que el docente los haya cambiado a mano.
       // Review L81 I1c: un dato igual a lo que proponía la versión ANTERIOR del documento también es del documento
@@ -344,12 +355,20 @@ export class CourseProfilesService {
         : undefined;
       // LOOP 9.2 (QA): el nombre del documento llega al curso apenas se guarda el contexto (antes de cualquier Blueprint).
       if (kind === 'academic') await adoptCourseTitleIfPlaceholder(qr, courseId);
+      // r63: los resultados y competencias del perfil pasan al contexto académico (ids estables, sin duplicar, el documento
+      // manda), EN LA MISMA transacción. Sin IA. Los vínculos con los capítulos NO se escriben aquí: el contador de la
+      // estructura no cambia (la interfaz encadena «guardar el perfil → vincular → aplicar» con el contador que tiene);
+      // los escribe «Usar este diseño» (design/fix link_outcomes, que ya ve la vista previa) o «Preparar» el Prebrief. Solo
+      // agrega (quitar resultados podaría vínculos y subiría el contador). Review M3: no escribe por encima de una propuesta
+      // preparada o aprobada (el cambio del perfil la deja vieja; al prepararla de nuevo se guarda).
+      const academicFromProfile = kind === 'pedagogy' ? await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: true, link: false }) : undefined;
       await qr.commitTransaction();
       return {
         created: true,
         profile: this.toDto(row, finalExam),
         ...(pruned.length ? { prunedOutcomeLinks: pruned } : {}),
         ...(derivedPedagogy ? { derivedPedagogy } : {}),
+        ...(academicFromProfile ? { academicFromProfile } : {}),
       };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
@@ -462,29 +481,7 @@ export class CourseProfilesService {
 
   /** Fase 3 (I1): quita de course_chapters.outcome_ids los ids que el contexto `ctx` no define. */
   private async pruneStaleOutcomeLinks(qr: QueryRunner, courseId: number, ctx: AcademicContextV1): Promise<{ chapterId: string; removed: string[] }[]> {
-    const rows: { id: string; ids: unknown }[] = await qr.query(
-      `select id, to_jsonb(ch) -> 'outcome_ids' as ids from public.course_chapters ch
-        where ch.course_id = $1 and jsonb_typeof(to_jsonb(ch) -> 'outcome_ids') = 'array'`,
-      [courseId],
-    );
-    const known = new Set([...ctx.outcomes.map((o) => o.id), ...ctx.competencies.map((c) => c.id)]);
-    const out: { chapterId: string; removed: string[] }[] = [];
-    for (const r of rows) {
-      const ids = Array.isArray(r.ids) ? (r.ids as string[]) : [];
-      const keep = ids.filter((x) => known.has(x));
-      if (keep.length === ids.length) continue;
-      await qr.query(`update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3`, [keep.length ? JSON.stringify(keep) : null, r.id, courseId]);
-      out.push({ chapterId: r.id, removed: ids.filter((x) => !known.has(x)) });
-    }
-    if (out.length) {
-      // Review L80 R2-M1: el contador nuevo sale del mismo UPDATE (append ya tiene la fila del curso FOR UPDATE).
-      const res = await qr.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter c`, [courseId]);
-      const before = Number(returningRows(res)[0].c) - 1;
-      // LOOP 8.0 (review L80 I2): quitar vínculos que el contexto nuevo ya no define es trabajo de Cursia, no del
-      // docente: una estructura de Cursia intacta lo sigue siendo (el documento nuevo la puede reemplazar sin preguntar).
-      await advanceStructureOriginIfUntouched(qr, courseId, before, before + 1);
-    }
-    return out;
+    return pruneOutcomeLinksTo(qr, courseId, ctx);
   }
 
   /**

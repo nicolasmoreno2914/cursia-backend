@@ -7,14 +7,15 @@ import { DESIGN_HOURS_KEY, parseProposedHours } from '../course-design/design-pi
 type Q = { query(sql: string, params?: any[]): Promise<any> };
 
 /** LOOP 8.1 · «Lo que sabemos del curso» leído de la base (sin ownership: el llamador ya lo verificó). */
-export async function loadCourseFacts(q: Q, courseId: number, courseRow?: any): Promise<CourseFacts> {
+export async function loadCourseFacts(q: Q, courseId: number, courseRow?: any, academicOverride?: { version: number; context: any } | null): Promise<CourseFacts> {
   const course = courseRow || (await q.query(`select id, title, institution_id, metadata from public.courses where id = $1`, [courseId]))[0];
   const meta = (course && course.metadata) || {};
   // Bases sin las migraciones de perfiles (entornos viejos): sin contexto ni perfil, como siempre.
   // Prebrief (review BE-2 I3): solo una base SIN las tablas cuenta como «sin datos»; cualquier otro error se propaga (un
   // error transitorio no puede cambiar lo que «sabemos del curso» ni invalidar una aprobación).
   const missingTable = (err: any) => { if (err && err.code === '42P01') return null; throw err; };
-  const academic = await loadCurrentAcademicContext(q, courseId).catch(missingTable);
+  // r63: la vista previa de la planificación (contexto que saldría del perfil, sin guardar) pasa su contexto.
+  const academic = academicOverride !== undefined ? academicOverride : await loadCurrentAcademicContext(q, courseId).catch(missingTable);
   const pedagogy = await loadCurrentPedagogicalProfile(q, courseId).catch(missingTable);
   return resolveCourseFacts({
     courseTitle: course ? course.title : null,
