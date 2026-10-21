@@ -7,6 +7,7 @@ import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { PilotMetricsService } from './pilot-metrics.service';
 import { LlmDiagnosticsService, LlmItemDiagnostics } from './llm-diagnostics.service';
+import { SchedulerQueueMetricsService } from './scheduler-queue-metrics';
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin de la generación dinámica (SOLO LECTURA).
@@ -22,7 +23,16 @@ export class AdminDynamicRunsController {
     private readonly videogen: VideogenReconciliationService,
     private readonly pilotMetrics: PilotMetricsService,
     private readonly llmDiagnostics: LlmDiagnosticsService,
+    private readonly queueMetrics: SchedulerQueueMetricsService,
   ) {}
+
+  // r63 (SC) — GET /api/v1/admin/dynamic-runs/scheduler-queue
+  // Profundidad y espera de la cola del scheduler por tipo, runs admitidos / en cola (con posición), uso de los topes y
+  // la configuración efectiva del reparto. SOLO LECTURA (transacción READ ONLY + ROLLBACK), sin proveedores.
+  @Get('scheduler-queue')
+  schedulerQueue() {
+    return this.queueMetrics.snapshot();
+  }
 
   // Loop 10 C2 — GET /api/v1/admin/dynamic-runs/:runId/pilot-metrics
   // Métricas del piloto del run (tiempos, costo, reintentos, recuperaciones, intervenciones manuales, uso del navegador,
