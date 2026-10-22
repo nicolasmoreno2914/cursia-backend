@@ -85,7 +85,7 @@ function sourceOf(type: string | null | undefined): FailureSource | null {
 
 /** ¿Espera de cuota de YouTube (r62/DN-1: blockYoutubeQuota)? */
 function youtubeQuotaWait(os: Record<string, any>, now: Date): Date | null {
-  const until = toDate(os?.youtubeQuotaBlockedUntil ?? null);
+  const until = toDate(os?.youtubeQuotaBlockedUntil ?? null) ?? toDate(os?.youtubeChannelLimitUntil ?? null);
   if (os?.delivery === 'blocked_quota' || (until && until.getTime() > now.getTime())) return until;
   return null;
 }
@@ -125,7 +125,11 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
   if (status === 'completed') return { state: 'completed', reason: null, nextRetryAt: null, automatic: false };
   if (status === 'retrying') {
     const quota = youtubeQuotaWait(os, now);
-    if (quota) return { state: 'waiting_external_quota', reason: 'youtube_quota', nextRetryAt: iso(next ?? quota), automatic: true };
+    if (quota) return { state: 'waiting_external_quota', reason: os.youtubeQuotaScope === 'channel' ? 'youtube_channel_limit' : 'youtube_quota', nextRetryAt: iso(next ?? quota), automatic: true };
+    // r67 (B4): blocked_auth no definitivo → espera la sonda automática (5 min / 30 min / 2 h), condición externa verificable.
+    if (os.delivery === 'blocked_auth' && os.youtubeAuthProbe) {
+      return { state: 'waiting_external_quota', reason: 'youtube_auth_probe', nextRetryAt: iso(next ?? toDate(os.youtubeAuthProbe?.nextProbeAt ?? null)), automatic: true };
+    }
     return { state: 'transient_failed', reason: error ? error.split(':')[0].slice(0, 64) : null, nextRetryAt: iso(next), automatic: true };
   }
   if (status === 'pending' || status === 'running') {

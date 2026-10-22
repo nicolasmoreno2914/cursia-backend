@@ -6702,10 +6702,21 @@ export class RunsService {
  * (`videoScenes`, hasta ~40 KB por video, la usan solo el claim y el empaquetado) — queda su cantidad.
  */
 export function progressOutputSummary(os: Record<string, any> | null | undefined): Record<string, any> {
-  const o = os ?? {};
+  const o = stripYoutubeSessionSecret(os ?? {});
   if (!Array.isArray(o.videoScenes)) return o;
   const { videoScenes, ...rest } = o;
   return { ...rest, videoSceneCount: videoScenes.length };
+}
+
+/**
+ * r67 (B3): la sesión resumable de YouTube (URL cifrada + iv) NUNCA sale en un DTO: solo su existencia y metadatos
+ * no sensibles (creación y tamaño).
+ */
+export function stripYoutubeSessionSecret(os: Record<string, any>): Record<string, any> {
+  if (!os || typeof os !== 'object' || !('youtubeSession' in os)) return os;
+  const { youtubeSession, ...rest } = os;
+  if (!youtubeSession || typeof youtubeSession !== 'object') return { ...rest, youtubeSession: null };
+  return { ...rest, youtubeSession: { present: true, createdAt: youtubeSession.createdAt ?? null, bytes: youtubeSession.bytes ?? null } };
 }
 
 /** Loop 9 (fix M1): ¿el final del Manifest depende solo de los content aunque haya exámenes de módulo? (Manifest anterior). */
