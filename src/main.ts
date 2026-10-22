@@ -73,6 +73,9 @@ async function bootstrap() {
     { name: 'reenvío de audio incierto', run: () => runsService.autoResubmitAmbiguousAudio() },
     // r62 (K3): partes frenadas por el kill switch / la allow-list de FinOps → se reabren solas al revertirlo.
     { name: 'reanudación tras control de gasto', run: () => runsService.autoResumeSpendControlHolds() },
+    // r65 (R4): una parte de IA que agotó su tope interno → UNA ronda extra (sin streaming, max_tokens × 1,5) si el saldo
+    // del run cubre su peor caso y no hay reservas abiertas; si vuelve a agotarlo, queda para el dueño / un humano.
+    { name: 'ronda extra por tope de la parte', run: () => runsService.autoExtendItemRecoveryBudget() },
     // r62 (d8): claim incompleto por un dato de la dependencia → regenerate_dependency (una vez, dentro del presupuesto).
     { name: 'claim incompleto (dependencia)', run: () => runsService.autoRecoverClaimPayloadUnavailable() },
     // REL CREDIT: sonda del proveedor tras crédito/cuota agotados (un canario por run y proveedor; legacy la apaga).

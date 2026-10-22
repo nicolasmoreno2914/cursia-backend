@@ -8,7 +8,7 @@ import { usageModelPriorsV1 } from './usage-model';
 import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, policyFromRow, policySpendCaps, runtimeGuard } from './budget';
 import { PolicyAdminScope, PolicyRow, parsePolicyUpdate, planPolicyUpdate } from './policy-admin';
 import { FinopsLedgerService } from './finops-ledger.service';
-import { AmbiguousResendBudget, ambiguousResendBudget, BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE, decideRunSpend, RunSpendDecision } from './run-spend-guard';
+import { AmbiguousResendBudget, ambiguousResendBudget, BREAKER_MIN_SLACK_USD, BREAKER_SLACK_SHARE, decideRunSpend, itemHardLimit, RunSpendDecision } from './run-spend-guard';
 import {
   RUN_BUDGET_NOT_AUTHORIZED,
   RunBudgetDecision,
@@ -856,6 +856,59 @@ export class FinopsBudgetService {
       itemSpent: Number(g.itemSpent ?? 0), nextCost: a.nextCost, itemHardLimit: g.decision.itemHardLimit,
       runSpent: Number(g.runSpent ?? 0), authorizedBudget: authorized,
     });
+  }
+
+  /**
+   * r65 (R2.4): peor caso de una parte en una ventana NUEVA de recuperación y si cabe en lo ya autorizado. Solo lectura.
+   *  - maxCostUsd = itemHardLimit (run-spend-guard) con los estimados de la parte (runItemEstimates) y la cota de su
+   *    llamada más grande (la mayor reserva de la parte en el run: igual que el guard, nunca el uso real);
+   *  - saldo del run = autorizado − gastado (ledger con reservas). Proveedores pagados: solo la autorización humana
+   *    (runPaidAuthorizedBudget, como guardPaidSubmission); IA: la última vigente (BLOCKED = 0, como el guard de IA);
+   *  - topes mensuales de la política (monthlyCap / ownerMonthlyCap): lo comprometido del mes + lo que la reapertura
+   *    agrega (0 si el run sigue vivo: su saldo ya está comprometido) tiene que caber.
+   * Nunca toca la autorización ni el tope del run: el reintento solo reinicia el tope INTERNO de la parte.
+   */
+  async ownerRetryBudget(a: { runId: string; itemKey: string; itemType: string; courseId: number; ownerId: string; runLive: boolean }, runner: Runner = this.dataSource): Promise<{
+    maxCostUsd: number | null; authorizedBudget: number | null; runSpent: number; runRemainingUsd: number | null; policyBlockedBy: string | null;
+  }> {
+    const est = await this.runItemEstimates(a.runId);
+    const ie = est.byKey.get(a.itemKey) ?? null;
+    const [lg] = await runner.query(
+      `select coalesce(max(amount) filter (where event_kind = 'CHARGE' and (metadata->>'reservation') = 'true'), 0)::text as largest
+         from public.generation_cost_events where run_id = $1 and item_key = $2 and billing_account <> 'user_key'`,
+      [a.runId, a.itemKey],
+    );
+    const maxCostUsd = ie ? itemHardLimit(ie.expected, ie.max, Number(lg?.largest ?? 0) || 0) : null;
+    let authorizedBudget: number | null;
+    if (paidProviderOfItemType(a.itemType)) {
+      const b = await this.runPaidAuthorizedBudget(a.runId, runner);
+      authorizedBudget = b === null ? null : Number(b);
+    } else {
+      const [authRow] = await runner.query(
+        `select decision, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`,
+        [a.runId],
+      );
+      authorizedBudget = !authRow ? null : authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
+    }
+    const runSpent = Number(await this.runActual(a.runId, runner));
+    const runRemainingUsd = authorizedBudget === null ? null : authorizedBudget - runSpent;
+    let policyBlockedBy: string | null = null;
+    if (maxCostUsd !== null) {
+      const policy = await this.policyFor(a.courseId, a.ownerId, runner);
+      const l = ((policy && policy.limits) || {}) as Record<string, any>;
+      const has = (v: unknown) => v !== null && v !== undefined && v !== '';
+      const extra = a.runLive ? 0 : maxCostUsd;
+      const monthly = has(l.monthlyCap) ? Number(l.monthlyCap) : has(l.monthlyCapStaging) ? Number(l.monthlyCapStaging) : null;
+      if (monthly !== null && Number.isFinite(monthly)) {
+        const m = await this.monthCommitted(runner);
+        if (Number(m.total) + extra > monthly + 1e-9) policyBlockedBy = 'monthlyCap';
+      }
+      if (!policyBlockedBy && has(l.ownerMonthlyCap) && Number.isFinite(Number(l.ownerMonthlyCap))) {
+        const om = await this.ownerMonthCommitted(a.ownerId, runner);
+        if (Number(om.total) + extra > Number(l.ownerMonthlyCap) + 1e-9) policyBlockedBy = 'ownerMonthlyCap';
+      }
+    }
+    return { maxCostUsd, authorizedBudget, runSpent, runRemainingUsd, policyBlockedBy };
   }
 
   /**
