@@ -273,12 +273,14 @@ export const AUDIO_SEGMENT_NO_STRATEGY_MAX_ROUNDS = 1;
  * r67 fix round 1 (F6): corte ÚNICO de activación de los comportamientos automáticos nuevos de r67 (reapertura del audio
  * por la allow-list nueva, escrituras del barrido para esos códigos, pasada de huérfanos, attention automático al
  * declinar). Solo aplican a runs con created_at ≥ corte. `R67_AUTO_RECOVERY_SINCE` (ISO) lo fija de forma explícita;
- * SIN la variable el corte es el ARRANQUE de este proceso: ningún run existente antes del arranque cambia de
- * comportamiento (R1-bis 7831fa67, #1353, #1510, #1567 quedan como estaban). Un reinicio sin la variable mueve el corte
- * hacia adelante (más conservador): en producción conviene fijarla en el deploy.
+ * SIN la variable el corte es la fecha FIJA de activación `R67_AUTO_RECOVERY_DEFAULT_SINCE` (posterior al run de
+ * R1-bis 7831fa67, 2026-10-22T15:48:20Z): ningún run existente cambia de comportamiento (R1-bis, #1353, #1510, #1567
+ * quedan como estaban) y, a diferencia de «el arranque del proceso», un deploy o reinicio NO mueve el corte: los runs
+ * en curso durante un deploy conservan la recuperación automática.
  */
 export const R67_AUTO_RECOVERY_SINCE_ENV = 'R67_AUTO_RECOVERY_SINCE';
-const R67_PROCESS_STARTED_AT = new Date();
+export const R67_AUTO_RECOVERY_DEFAULT_SINCE = '2026-10-23T00:00:00Z';
+const R67_PROCESS_STARTED_AT = new Date(R67_AUTO_RECOVERY_DEFAULT_SINCE);
 export function r67AutoRecoverySince(env: Record<string, string | undefined> = process.env): Date {
   const raw = String(env[R67_AUTO_RECOVERY_SINCE_ENV] ?? '').trim();
   const d = raw ? new Date(raw) : null;

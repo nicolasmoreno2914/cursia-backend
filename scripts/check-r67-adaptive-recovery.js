@@ -319,13 +319,14 @@ async function pureChecks() {
     }
   });
 
-  await check('F6 puro: corte ÚNICO R67_AUTO_RECOVERY_SINCE — un run anterior (R1-bis 7831fa67, 2026-10-22T15:48:20Z) se comporta como antes de r67 (no_allow_listed, 0 rondas); sin la variable el corte es el arranque del proceso', () => {
+  await check('F6 puro: corte ÚNICO R67_AUTO_RECOVERY_SINCE — un run anterior (R1-bis 7831fa67, 2026-10-22T15:48:20Z) se comporta como antes de r67 (no_allow_listed, 0 rondas); sin la variable el corte es la fecha fija de activación (posterior a R1-bis)', () => {
     const saved = process.env.R67_AUTO_RECOVERY_SINCE;
     try {
       delete process.env.R67_AUTO_RECOVERY_SINCE;
-      assert(AH.r67AutoRecoverySince().getTime() > Date.parse('2026-10-22T15:48:20Z'), 'sin variable: arranque del proceso (posterior a R1-bis)');
+      assert(AH.r67AutoRecoverySince().getTime() > Date.parse('2026-10-22T15:48:20Z'), 'sin variable: fecha fija de activación (posterior a R1-bis)');
       eq(AH.r67AutoRecoveryApplies('2026-10-22T15:48:20Z'), false, 'R1-bis fuera');
-      eq(AH.r67AutoRecoveryApplies(new Date(Date.now() + 1000)), true, 'run nuevo dentro');
+      eq(AH.r67AutoRecoveryApplies('2026-10-23T00:00:01Z'), true, 'run creado después de la fecha fija: dentro');
+      eq(AH.r67AutoRecoverySince().toISOString(), '2026-10-23T00:00:00.000Z', 'un reinicio/deploy NO mueve el corte (fecha fija)');
       process.env.R67_AUTO_RECOVERY_SINCE = '2026-10-23T00:00:00Z';
       const pre = row({ row: { run_created_at: '2026-10-22T15:48:20Z' } });
       eq(AH.autoHealDecision(pre, NOW).reason, 'not_allow_listed', 'reapertura: como antes de r67');
