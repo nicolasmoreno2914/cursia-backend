@@ -434,7 +434,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     // r67 (A2): la escalera de estrategias de re-síntesis de un segmento (instructions → split → speed si se soporta) se
     // agotó sin un ritmo aceptable: ninguna estrategia automática segura queda → humano, visible (attention unrecoverable).
     id: 'audio_strategies_exhausted', codes: ['AUDIO_STRATEGIES_EXHAUSTED'],
-    class: 'D', strategy: 'hold_for_human', paidRisk: 'measured', provider: 'openai', rounds: 0, humanReason: 'unrecoverable', adminAction: 'regenerate_item',
+    // r67 fix round 1 (F2): la acción humana es «reintentar» (reinicia la escalera SOLO del segmento que falló y conserva
+    // los segmentos aceptados), no regenerar (que repagaría todo el capítulo).
+    class: 'D', strategy: 'hold_for_human', paidRisk: 'measured', provider: 'openai', rounds: 0, humanReason: 'unrecoverable', adminAction: 'retry_item',
   },
   { id: 'audiobook_script_failed', codes: ['audiobook_script_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
 
@@ -797,6 +799,8 @@ export function currentRecoveryOf(
   outputSummary: Record<string, any> | null | undefined,
   /** Fix round 1 (I2): clase REGISTRADA al fallar (incluye la subida por errorCode); C/D nunca es auto-heal. */
   failureClass?: string | null,
+  /** r67 (F6): creación del run (corte de los automatismos de r67); ausente = sin dato. */
+  runCreatedAt?: Date | string | null,
 ): CurrentRecovery {
   const e = String(error ?? '').trim();
   const os = outputSummary ?? {};
@@ -818,7 +822,7 @@ export function currentRecoveryOf(
   if (denied) return 'denied';
   // REL MVP: la MISMA decisión del auto-healer con la política vigente (por clase, o R16 con el kill-switch);
   // sin fecha de fallo (sin espera) y con las rondas ya usadas del item.
-  const d = autoHealDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os, failure_class: failureClass ?? null }, new Date(), autoHealPolicyFromEnv(process.env));
+  const d = autoHealDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os, failure_class: failureClass ?? null, run_created_at: runCreatedAt }, new Date(), autoHealPolicyFromEnv(process.env));
   if (d.heal) return d.kind === 'B' ? 'auto_regenerate' : 'auto_heal';
   return 'manual';
 }

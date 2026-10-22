@@ -77,6 +77,8 @@ import {
   AutoHealPolicy,
   AutoHealSweepResult,
   AUTO_HEAL_PERMANENT_SKIPS,
+  r67AutoRecoveryApplies,
+  r67AutoRecoverySince,
   AutoHealKind,
   autoHealDecision,
   autoHealFirstAt,
@@ -2796,7 +2798,8 @@ export class RunsService {
         }
         autoMeta = { round: d.round, code: d.rule.code };
       } else if (auto) {
-        const d = autoHealDecision(target, auto.now ?? new Date(), auto.policy);
+        // r67 (F6): la misma decisión que el barrido, con la fecha del run (corte de los automatismos de r67).
+        const d = autoHealDecision({ ...target, run_created_at: job.created_at ?? null }, auto.now ?? new Date(), auto.policy);
         if (d.heal === false) {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (${d.reason})`, code: 'auto_heal_not_eligible' });
         }
@@ -3013,6 +3016,22 @@ export class RunsService {
       // puede recuperar. Las reaperturas automáticas (auto-heal) NO lo reinician: siguen dentro del mismo presupuesto.
       // r65 (R4): la ÚNICA excepción automática es la ronda extra por tope de la parte (marcada, una vez, con el saldo del
       // run cubriendo su peor caso). El tope y la autorización del RUN nunca se reinician.
+      // r67 fix round 1 (F2): un reintento HUMANO (dueño / admin) de una parte con la escalera agotada reinicia la
+      // escalera SOLO de los segmentos agotados (registro: quién, cuándo y la escalera anterior). Los segmentos aceptados
+      // (audioSegments) y los originales en cuarentena se conservan: el reintento no repaga nada de lo aceptado.
+      let r67LadderReset: Record<string, any> | null = null;
+      if (!auto && /^AUDIO_STRATEGIES_EXHAUSTED\b/.test(String(target.error ?? '')) && target.output_summary?.audioRetryStrategy
+        && typeof target.output_summary.audioRetryStrategy === 'object') {
+        const ladder: Record<string, any> = { ...target.output_summary.audioRetryStrategy };
+        const resets: any[] = Array.isArray(target.output_summary.audioLadderResets) ? [...target.output_summary.audioLadderResets] : [];
+        const at = new Date().toISOString();
+        for (const [segKey, st] of Object.entries(ladder)) {
+          if (!st || (st as any).exhausted !== true) continue;
+          resets.push({ at, by: String(actor?.email ?? actorId), actor: isSuperAdminEmail(actor?.email) ? 'admin' : 'owner', segKey, previous: st });
+          delete ladder[segKey];
+        }
+        r67LadderReset = { audioRetryStrategy: ladder, audioLadderResets: resets.slice(-20) };
+      }
       // r67 (A3): estado explícito de la reapertura (pending_retry) + historial acotado, en la MISMA escritura.
       const r67Reason = auto ? (auto.policy.classAware && autoMeta?.strategy ? `auto_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}` : 'auto') : 'manual_retry';
       const r67Recovery = nextRecoveryEntry(target.output_summary?.recovery, { state: 'pending_retry', reason: r67Reason.slice(0, 64), nextRetryAt: null, automatic: true },
@@ -3035,7 +3054,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery }), lostResultResend, JSON.stringify(lostResultUnits)],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery, ...(r67LadderReset ?? {}) }), lostResultResend, JSON.stringify(lostResultUnits)],
         ),
       );
       if (updated.length !== 1) {
@@ -3174,7 +3193,7 @@ export class RunsService {
                 ${finishedUsSql}::text as finished_us, pj.course_id, pj.owner_id, b.blueprint_number,
                 to_jsonb(g)->>'failure_class' as failure_class,
                 -- r67 (A3): motivo humano y próxima acción (huérfanos / next_retry_at visible).
-                to_jsonb(g)->>'attention_reason' as attention_reason, g.next_retry_at
+                to_jsonb(g)->>'attention_reason' as attention_reason, g.next_retry_at, pj.created_at as run_created_at
            from public.generation_item_runs g
            join public.production_jobs pj on pj.id = g.job_id
            join public.course_generation_manifests m on m.id = g.manifest_id
@@ -3246,12 +3265,13 @@ export class RunsService {
     void policy;
     const rows: any[] = await this.dataSource.query(
       `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.next_retry_at,
-              g.failure_class, g.attention_reason, g.recovery_round
+              g.failure_class, g.attention_reason, g.recovery_round, pj.created_at as run_created_at
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
         where pj.execution_mode = 'dynamic_generation'
-          -- r67 (PO): nunca toca datos HISTÓRICOS — solo runs creados desde el corte (R67_ORPHAN_SWEEP_SINCE) y vivos o
-          -- fallidos (failed / paused / running); cancelados, completados y preview quedan intactos.
+          -- r67 fix round 1 (F6): solo runs creados desde el corte ÚNICO de activación (R67_AUTO_RECOVERY_SINCE; sin la
+          -- variable, el arranque del proceso) y vivos o fallidos (failed / paused / running): los datos históricos y los
+          -- runs completados / cancelados / preview nunca se tocan.
           and pj.created_at >= $3::timestamptz
           and coalesce(pj.worker_status, '') in ('failed', 'paused', 'running')
           and g.status = 'failed' and g.attention_reason is null
@@ -3259,39 +3279,63 @@ export class RunsService {
           and (g.next_retry_at is null or g.next_retry_at < $1::timestamptz - interval '1 hour')
         order by g.finished_at desc nulls last, g.id
         limit $2`,
-      [now.toISOString(), Math.max(1, Math.floor(limit)), orphanSweepSince(process.env).toISOString()],
+      [now.toISOString(), Math.max(1, Math.floor(limit)), r67AutoRecoverySince(process.env).toISOString()],
     );
     const marked: string[] = [];
     for (const r of rows) {
       const v = recoveryStateOf(r, now);
       if (v.state !== 'failed_no_strategies') continue;
-      await this.recordAttention(r.id, 'unrecoverable');
       const entry = nextRecoveryEntry(r.output_summary?.recovery, v, now, { event: 'orphan_marked' });
-      await this.dataSource.query(
-        `update public.generation_item_runs
-            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('recovery', $2::jsonb), next_retry_at = null
-          where id = $1 and status = 'failed' and attention_reason = 'unrecoverable'`,
-        [r.id, JSON.stringify(entry)],
-      );
+      // r67 fix round 1 (F4): UNA escritura condicional (el error, el estado, «sin motivo» y «sigue huérfano» se
+      // re-verifican en el UPDATE): si otro barrido / un humano la tocó entre la lectura y acá, no se pisa nada.
+      const ok = await this.recordAttentionIf(r.id, 'unrecoverable', String(r.error ?? ''), entry, now);
+      if (!ok) continue;
       marked.push(r.id);
       this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) quedó sin estrategias automáticas (${v.reason}) → excepción visible (unrecoverable)`);
     }
     return marked;
   }
 
+  /**
+   * r67 fix round 1 (F4): attention_reason + estado de recuperación en UNA escritura condicional: solo si la parte sigue
+   * con el MISMO error, sin motivo, en failed/blocked y sin una próxima acción vigente. true = se escribió.
+   */
+  private async recordAttentionIf(itemRunId: string, reason: 'unrecoverable', expectedError: string, recovery: Record<string, any>, now: Date): Promise<boolean> {
+    try {
+      if (!(await relSchemaReady(this.dataSource))) return false;
+      const rows = returningRows(await this.dataSource.query(
+        `update public.generation_item_runs
+            set attention_reason = $2,
+                output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('recovery', $4::jsonb),
+                next_retry_at = null
+          where id = $1 and error = $3 and attention_reason is null and status in ('failed', 'blocked')
+            and (next_retry_at is null or next_retry_at <= $5::timestamptz)
+          returning id`,
+        [itemRunId, reason, expectedError, JSON.stringify(recovery), now.toISOString()],
+      ));
+      return rows.length === 1;
+    } catch (err) {
+      this.logger.warn(`no se pudo registrar attention_reason=${reason} de ${itemRunId}: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  }
+
   private async autoHealOne(
     r: { id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
       finished_at: Date; updated_at: Date | null; course_id: number; owner_id: string; blueprint_number: number; failure_class?: string | null;
-      attention_reason?: string | null; next_retry_at?: Date | string | null },
+      attention_reason?: string | null; next_retry_at?: Date | string | null; run_created_at?: Date | string | null },
     now: Date,
     policy: AutoHealPolicy,
     result: AutoHealSweepResult,
   ): Promise<void> {
     const d = autoHealDecision(r, now, policy);
+    // r67 fix round 1 (F6): las escrituras NUEVAS de r67 en el barrido (next_retry_at visible, excepción al declinar)
+    // solo para runs desde el corte de activación; un run anterior queda exactamente como antes de r67.
+    const r67 = r67AutoRecoveryApplies(r.run_created_at ?? null);
     if (d.heal === false) {
       result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason });
       // r67 (A3): espera visible — la próxima ronda queda en next_retry_at (estado pending_retry).
-      if (d.reason === 'backoff' && d.retryAt) {
+      if (r67 && d.reason === 'backoff' && d.retryAt) {
         const prevAt = r.next_retry_at ? new Date(r.next_retry_at as any).getTime() : NaN;
         if (prevAt !== d.retryAt.getTime()) {
           await this.dataSource.query(
@@ -3302,18 +3346,13 @@ export class RunsService {
       }
       // r67 (A3, huérfanos): el auto-heal decide «no elegible» / «rondas agotadas» y NINGÚN otro barrido la va a tomar
       // → excepción explícita (attention 'unrecoverable', estado failed_no_strategies), nunca un failed sin dueño.
-      if (AUTO_HEAL_PERMANENT_SKIPS.includes(d.reason) && !r.attention_reason) {
-        const v = recoveryStateOf({ ...r, attention_reason: null }, now);
+      if (r67 && AUTO_HEAL_PERMANENT_SKIPS.includes(d.reason) && !r.attention_reason) {
+        const v = recoveryStateOf({ ...r, attention_reason: null, next_retry_at: null }, now);
         if (v.state === 'failed_no_strategies') {
-          await this.recordAttention(r.id, 'unrecoverable');
           const entry = nextRecoveryEntry(r.output_summary?.recovery, { ...v, nextRetryAt: null }, now, { event: 'auto_heal_declined', skip: d.reason });
-          await this.dataSource.query(
-            `update public.generation_item_runs
-                set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('recovery', $2::jsonb), next_retry_at = null
-              where id = $1 and status = 'failed' and error = $3`,
-            [r.id, JSON.stringify(entry), r.error],
-          ).catch((e) => this.logger.warn(`auto-heal: no se pudo registrar el estado de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
-          this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) sin estrategias automáticas (${d.reason}) → excepción visible (unrecoverable)`);
+          if (await this.recordAttentionIf(r.id, 'unrecoverable', String(r.error ?? ''), entry, now)) {
+            this.logger.warn(`auto-heal: ${r.item_key} (run ${r.job_id}) sin estrategias automáticas (${d.reason}) → excepción visible (unrecoverable)`);
+          }
         }
       }
       // REL MVP: motivo permanente para ESTE error → marca (md5 del error) y el SQL deja de seleccionarlo
@@ -6487,6 +6526,8 @@ export class RunsService {
       `select * from public.generation_item_runs g where g.job_id = $1 and ${latestGenerationPredicate('g')}`,
       [job.id],
     );
+    // r67 (F6): la vista de recuperación usa la fecha del run (corte de los automatismos de r67).
+    for (const r of rows) r.run_created_at = job.created_at ?? null;
     const progress = await this.progress(job.id, manifest);
     if (rows.length !== progress.total) {
       throw new InternalServerErrorException(`La ejecución ${job.id}: ${rows.length} items vs ${progress.total} del Manifest`);
@@ -6739,11 +6780,3 @@ function pauseInfoOf(job: { output_summary?: unknown }): RunDto['pauseInfo'] {
 }
 
 
-/** r67 (PO): corte de la pasada de huérfanos — los runs creados antes nunca se tocan (datos históricos intactos). */
-export const R67_ORPHAN_SWEEP_SINCE = '2026-10-22T00:00:00Z';
-export const R67_ORPHAN_SWEEP_SINCE_ENV = 'R67_ORPHAN_SWEEP_SINCE';
-export function orphanSweepSince(env: Record<string, string | undefined> = process.env): Date {
-  const raw = String(env[R67_ORPHAN_SWEEP_SINCE_ENV] ?? '').trim();
-  const d = raw ? new Date(raw) : null;
-  return d && Number.isFinite(d.getTime()) ? d : new Date(R67_ORPHAN_SWEEP_SINCE);
-}

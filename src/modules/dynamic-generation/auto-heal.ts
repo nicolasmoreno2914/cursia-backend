@@ -183,6 +183,8 @@ export interface AutoHealRow {
   updated_at?: Date | string | null;
   /** REL R2: clase registrada al fallar (incluye la subida por errorCode); solo sube la severidad. */
   failure_class?: string | null;
+  /** r67 (F6): creación del run (corte de activación de los automatismos de r67). Ausente = sin dato. */
+  run_created_at?: Date | string | null;
 }
 
 // REL R1: las reglas (allow/deny/SQL/reintento seguro) viven en reliability/auto-heal-rules.ts (sin cambios).
@@ -259,8 +261,39 @@ const SEVERITY: Readonly<Record<string, number>> = Object.freeze({ A: 0, B: 1, C
 export const AUTO_HEAL_LEDGER_GUARDED_CODES: readonly string[] = Object.freeze(['lease_expired', 'worker_draining']);
 /** r67 (A3): códigos de audio de un segmento que la reapertura automática resuelve con la escalera A2. */
 export const AUDIO_SEGMENT_REGEN_CODES: readonly string[] = Object.freeze(['AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'TTS_AUDIO_INVALID']);
-/** r67 (A3): tope de rondas automáticas de esos códigos = largo de la escalera A2 (≤ 3). */
+/** r67 (A3): tope de rondas automáticas de AUDIO_WPM_OUT_OF_RANGE = largo de la escalera A2 (≤ 3). */
 export const AUDIO_SEGMENT_REGEN_MAX_ROUNDS = 3;
+/**
+ * r67 fix round 1 (F5): AUDIOBOOK_SEGMENT_DUPLICATE / TTS_AUDIO_INVALID no avanzan la escalera (no hay estrategia
+ * distinta que aplicarles) → a lo sumo UNA ronda automática; después, humano.
+ */
+export const AUDIO_SEGMENT_NO_STRATEGY_MAX_ROUNDS = 1;
+
+/**
+ * r67 fix round 1 (F6): corte ÚNICO de activación de los comportamientos automáticos nuevos de r67 (reapertura del audio
+ * por la allow-list nueva, escrituras del barrido para esos códigos, pasada de huérfanos, attention automático al
+ * declinar). Solo aplican a runs con created_at ≥ corte. `R67_AUTO_RECOVERY_SINCE` (ISO) lo fija de forma explícita;
+ * SIN la variable el corte es el ARRANQUE de este proceso: ningún run existente antes del arranque cambia de
+ * comportamiento (R1-bis 7831fa67, #1353, #1510, #1567 quedan como estaban). Un reinicio sin la variable mueve el corte
+ * hacia adelante (más conservador): en producción conviene fijarla en el deploy.
+ */
+export const R67_AUTO_RECOVERY_SINCE_ENV = 'R67_AUTO_RECOVERY_SINCE';
+const R67_PROCESS_STARTED_AT = new Date();
+export function r67AutoRecoverySince(env: Record<string, string | undefined> = process.env): Date {
+  const raw = String(env[R67_AUTO_RECOVERY_SINCE_ENV] ?? '').trim();
+  const d = raw ? new Date(raw) : null;
+  return d && Number.isFinite(d.getTime()) ? d : R67_PROCESS_STARTED_AT;
+}
+/**
+ * r67 (F6): ¿aplican los automatismos nuevos de r67 a un run creado en `runCreatedAt`? Sin dato (llamadas puras, vistas
+ * sin el run) → true; TODOS los caminos que escriben (barrido, lock de retryItem, fallo) pasan la fecha del run.
+ */
+export function r67AutoRecoveryApplies(runCreatedAt: Date | string | null | undefined, env: Record<string, string | undefined> = process.env): boolean {
+  if (runCreatedAt === null || runCreatedAt === undefined) return true;
+  const d = runCreatedAt instanceof Date ? runCreatedAt : new Date(runCreatedAt);
+  if (!Number.isFinite(d.getTime())) return false;
+  return d.getTime() >= r67AutoRecoverySince(env).getTime();
+}
 
 /** r67: ¿el fallo de audio quedó registrado por el worker como resultado CONOCIDO y liquidado (mismo código)? */
 export function audioFailureKnownAndSettled(error: string, os: Record<string, any>): boolean {
@@ -287,7 +320,8 @@ export function audioStrategiesLeftOf(error: string, os: Record<string, any>): n
 
 /** r67: tope de rondas de regeneración automática (clase B) para un tipo y código. */
 export function autoRegenMaxRoundsFor(type: string | null | undefined, code: string | null | undefined, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): number {
-  if (type === 'audiobook_chapter' && code && AUDIO_SEGMENT_REGEN_CODES.includes(code)) return AUDIO_SEGMENT_REGEN_MAX_ROUNDS;
+  if (type === 'audiobook_chapter' && code === 'AUDIO_WPM_OUT_OF_RANGE') return AUDIO_SEGMENT_REGEN_MAX_ROUNDS;
+  if (type === 'audiobook_chapter' && code && AUDIO_SEGMENT_REGEN_CODES.includes(code)) return AUDIO_SEGMENT_NO_STRATEGY_MAX_ROUNDS;
   return Math.max(0, Math.floor(policy.regenMaxRounds ?? 0));
 }
 
@@ -379,6 +413,8 @@ function classAwareDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy)
     const rounds = autoRegenRoundsOf(os);
     // r67 (A3): audio de un segmento → solo con resultado conocido y liquidado, y mientras le queden estrategias A2.
     if (row.type === 'audiobook_chapter' && AUDIO_SEGMENT_REGEN_CODES.includes(v.code)) {
+      // r67 (F6): un run anterior al corte se comporta como antes de r67 (estos códigos no se reabrían solos).
+      if (!r67AutoRecoveryApplies(row.run_created_at)) return { heal: false, reason: 'not_allow_listed', rule };
       if (!audioFailureKnownAndSettled(error, os)) return { heal: false, reason: 'not_allow_listed', rule };
       if (v.code === 'AUDIO_WPM_OUT_OF_RANGE' && audioStrategiesLeftOf(error, os) === 0) return { heal: false, reason: 'cap_reached', rule };
     }

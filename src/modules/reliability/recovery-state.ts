@@ -27,6 +27,7 @@ import {
 import { providerReconcileDecision } from '../dynamic-generation/provider-reconcile';
 import { classifyFailure, currentRecoveryOf, FailureSource } from './failure-classifier';
 import { providerProbeViewOf } from './provider-probe';
+import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
 
 export type RecoveryState =
   | 'completed'
@@ -68,6 +69,8 @@ export interface RecoveryRow {
   failure_class?: string | null;
   attention_reason?: string | null;
   recovery_round?: number | null;
+  /** r67 (F6): creación del run (corte de los automatismos de r67). */
+  run_created_at?: Date | string | null;
 }
 
 function toDate(v: Date | string | null | undefined): Date | null {
@@ -99,6 +102,7 @@ export function scheduledRetryAtOf(row: RecoveryRow, now: Date = new Date()): Da
   const r = {
     id: row.id ?? null, type: row.type ?? null, status: row.status, error: row.error ?? null, output_summary: row.output_summary ?? {},
     finished_at: row.finished_at ?? null, updated_at: row.updated_at ?? null, failure_class: row.failure_class ?? null,
+    run_created_at: row.run_created_at ?? null,
   };
   const policy = autoHealPolicyFromEnv(process.env);
   const times: Date[] = [];
@@ -145,7 +149,7 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
   }
   if (status !== 'failed') return { state: null, reason: null, nextRetryAt: null, automatic: false };
 
-  const cur = error ? currentRecoveryOf(error, row.type ?? null, os, row.failure_class ?? null) : 'manual';
+  const cur = error ? currentRecoveryOf(error, row.type ?? null, os, row.failure_class ?? null, row.run_created_at ?? null) : 'manual';
   // Una fecha persistida VENCIDA no cuenta como «programada» (ningún barrido la tomó): solo la decisión vigente.
   const at = scheduledRetryAtOf(row, now) ?? (next && next.getTime() > now.getTime() ? next : null);
   const attention = row.attention_reason ?? null;
@@ -160,10 +164,16 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     return { state: 'waiting_financial_reconciliation', reason: cur, nextRetryAt: iso(at), automatic: true };
   }
   if (cur === 'auto_heal' || cur === 'auto_regenerate' || cur === 'safe_auto_retry' || cur === 'spend_control_resume') {
-    // Con fecha de fallo y SIN ninguna acción programada (p. ej. pasó la ventana de recencia del barrido): la espera
-    // expiró → ya no hay estrategia automática (nunca un «pendiente» eterno). El control de gasto espera su reversión.
-    if (!at && toDate(row.finished_at ?? null) && cur !== 'spend_control_resume') {
-      return { state: 'failed_no_strategies', reason: 'recovery_window_expired', nextRetryAt: null, automatic: false };
+    // Espera EXPIRADA solo cuando el propio barrido que la tomaría lo dice explícitamente (auto-heal / reintento seguro:
+    // too_old o ventana total agotada). r67 fix round 1 (F3): el control de gasto (espera su reversión) y el claim
+    // incompleto de r62 d8 (lo resuelve su propio barrido, que registra la excepción al rendirse) nunca se marcan acá.
+    const claimPayload = CLAIM_PAYLOAD_DEPENDENCY_RE.test(error);
+    if (!at && toDate(row.finished_at ?? null) && cur !== 'spend_control_resume' && !claimPayload) {
+      const policy = autoHealPolicyFromEnv(process.env);
+      const r = { ...row, error, output_summary: os } as any;
+      const expired = [autoHealDecision(r, now, policy), safeAutoRetryDecision(r, now, policy)]
+        .some((d: any) => d.heal === false && (d.reason === 'too_old' || d.reason === 'recovery_window_exhausted'));
+      if (expired) return { state: 'failed_no_strategies', reason: 'recovery_window_expired', nextRetryAt: null, automatic: false };
     }
     return { state: 'pending_retry', reason: cur, nextRetryAt: iso(at), automatic: true };
   }

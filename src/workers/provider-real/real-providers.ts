@@ -1583,8 +1583,12 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
           st.next = nextAudioStrategy(st.tried, seg.textSha, model);
           st.exhausted = st.next === null;
           retryState[seg.key] = st;
-          await record(deps, item, { audioRetryStrategy: retryState, audioQuarantine: quarantine });
+          // r67 fix round 1 (F10): PRIMERO se liquida la reserva (cargo medido) y DESPUÉS se registra la cuarentena (con
+          // sus requestIds, que persistedPaidOpIds reconoce como resultado guardado). Un corte entre las dos deja un cargo
+          // liquidado sin registro → priorPaidBlock lo trata como resultado perdido (reconciliación / reenvío único),
+          // nunca una reserva SIN liquidar disfrazada de «guardada».
           await settleSeg();
+          await record(deps, item, { audioRetryStrategy: retryState, audioQuarantine: quarantine });
           // El original pagado quedó en cuarentena (resultado conocido y guardado): nada en el aire.
           if (tracker) tracker.unpersistedPaidOutput = null;
           const detail = `el segmento ${seg.key} narra ${seg.words} palabras en ${info.seconds.toFixed(2)} s (${wpm} ppm; aceptado ${AUDIOBOOK_WPM_MIN}–${AUDIOBOOK_WPM_MAX}; estrategia ${strat}; sin corrección local: ${problems.join(', ').slice(0, 200)})`;
