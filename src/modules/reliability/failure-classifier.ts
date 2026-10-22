@@ -430,6 +430,12 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     family: /^MP3_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'openai', rounds: 2,
   },
+  {
+    // r67 (A2): la escalera de estrategias de re-síntesis de un segmento (instructions → split → speed si se soporta) se
+    // agotó sin un ritmo aceptable: ninguna estrategia automática segura queda → humano, visible (attention unrecoverable).
+    id: 'audio_strategies_exhausted', codes: ['AUDIO_STRATEGIES_EXHAUSTED'],
+    class: 'D', strategy: 'hold_for_human', paidRisk: 'measured', provider: 'openai', rounds: 0, humanReason: 'unrecoverable', adminAction: 'regenerate_item',
+  },
   { id: 'audiobook_script_failed', codes: ['audiobook_script_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
 
   // ── Contrato y producto (D) ────────────────────────────────────────────────

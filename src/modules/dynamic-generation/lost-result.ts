@@ -14,6 +14,10 @@ export function persistedPaidOpIds(os: Record<string, any> | null | undefined): 
   for (const g of Object.values((os?.audioSegments ?? {}) as Record<string, any>)) if (g?.requestId) ids.add(String(g.requestId));
   for (const list of Object.values((os?.audiobookExtensions ?? {}) as Record<string, any[]>)) for (const e of list ?? []) for (const m of e?.messageIds ?? []) if (m) ids.add(String(m));
   for (const d of Array.isArray(os?.audiobookDiscardedOps) ? os!.audiobookDiscardedOps : []) if (typeof d === 'string' && d) ids.add(d);
+  // r67: partes pagadas de un split guardadas y originales fuera de ritmo en cuarentena: su resultado SÍ quedó guardado.
+  for (const m of Object.values((os?.audioSplitParts ?? {}) as Record<string, Record<string, any>>)) for (const x of Object.values(m ?? {})) if (x?.requestId) ids.add(String(x.requestId));
+  for (const list of Object.values((os?.audioQuarantine ?? {}) as Record<string, any[]>)) for (const q of Array.isArray(list) ? list : []) for (const r of q?.requestIds ?? []) if (r) ids.add(String(r));
+  for (const g of Object.values((os?.audioSegments ?? {}) as Record<string, any>)) for (const r of Array.isArray(g?.requestIds) ? g.requestIds : []) if (r) ids.add(String(r));
   return ids;
 }
 
