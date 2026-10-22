@@ -704,7 +704,7 @@ async function dbChecks() {
       await rejectsRe(PW.processProviderItem(workerDeps(), again), /^provider_reconciliation_required/, 'retry común');
       eq([fakes.st.llm.length, fakes.st.tts.length - tts0], [llmAfterFirst, 1], '0 llamadas en el retry común');
       // Decisión humana explícita.
-      await runs.retryItem(C.cid, OWNER, 1, runId, item.itemKey, false, true);
+      await runs.retryItem(C.cid, OWNER, 1, runId, item.itemKey, false, true, undefined, { email: 'admin@cursia.test' }); // r65: resubmitProvider = solo SUPER_ADMIN
       const third = await claimProvider(runId, 'audiobook_chapter');
       await PW.processProviderItem(workerDeps(), third);
       row = await itemRow(runId, item.itemKey);
@@ -804,8 +804,8 @@ async function dbChecks() {
       eq(fakes.st.gammaPosts.length - posts0, 1, 'NINGÚN reenvío automático');
       eq((await reservationsOf(row.id, 'gamma')).length, 1, 'reserva idempotente');
       // Decisión humana explícita: reenvío.
-      await rejectsRe(runs.retryItem(A2.cid, OWNER, 1, runA2, `audio_welcome:${A2.cid}`, false, true), /resubmitProvider solo aplica|Solo se puede reintentar/, 'audio sin reconciliación');
-      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
+      await rejectsRe(runs.retryItem(A2.cid, OWNER, 1, runA2, `audio_welcome:${A2.cid}`, false, true, undefined, { email: 'admin@cursia.test' }), /resubmitProvider solo aplica|Solo se puede reintentar/, 'audio sin reconciliación');
+      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true, undefined, { email: 'admin@cursia.test' }); // r65: resubmitProvider = solo SUPER_ADMIN
       row = await itemRow(runA2, item.itemKey);
       assert(!row.output_summary.externalSubmitStartedAt && row.output_summary.previousExternals.length >= 1 && row.output_summary.reconciliationAcknowledgedThroughAttempt >= 2, 'marcador archivado + reconocido');
       const third = await claimProvider(runA2, 'presentation');
@@ -847,7 +847,7 @@ async function dbChecks() {
       eq([row.status, fakes.st.tts.length - tts0], ['failed', 1], 'drop → reconciliación, 1 llamada');
       eq((await reservationsOf(row.id, 'openai')).map((x) => [x.settled, x.idempotency_key]), [[false, `reservation:tts:${row.id}:g1:a1:chunk0`]], 'reserva pendiente');
       fakes.plan.ttsFail = [400];
-      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
+      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true, undefined, { email: 'admin@cursia.test' }); // r65: resubmitProvider = solo SUPER_ADMIN
       const again = await claimProvider(runA2, 'audio_welcome');
       await rejectsRe(PW.processProviderItem(workerDeps(), again), /tts_failed/, '400 definitivo');
       row = await itemRow(runA2, item.itemKey);
@@ -871,7 +871,7 @@ async function dbChecks() {
       eq(resv.filter((x) => x.settled).map((x) => x.idempotency_key).sort(),
         [`reservation:llm:${row.id}:g1:a1:sec0-condense`, `reservation:llm:${row.id}:g1:a1:sec0-continuation`], 'unidad: continuación y condensación (nunca enviadas) liberadas');
       eq((await events(`item_run_id = $1 and provider = 'openai'`, [row.id])).length, 0, 'sin TTS');
-      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true);
+      await runs.retryItem(A2.cid, OWNER, 1, runA2, item.itemKey, false, true, undefined, { email: 'admin@cursia.test' }); // r65: resubmitProvider = solo SUPER_ADMIN
       const again = await claimProvider(runA2, 'audiobook_chapter');
       await PW.processProviderItem(workerDeps(), again);
       row = await itemRow(runA2, item.itemKey);

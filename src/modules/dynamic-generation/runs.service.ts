@@ -133,6 +133,7 @@ import {
   decideRunBudget,
   RUN_BUDGET_NOT_AUTHORIZED,
   pendingPaidRealProviders,
+  WORKER_PAID_ITEM_TYPES,
 } from '../finops/run-budget';
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
@@ -192,6 +193,13 @@ import {
 } from './stop-after';
 import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned, relSchemaReady } from '../reliability/attempt-log';
 import { FailureProvider } from '../reliability/failure-classifier';
+// r65: reintento seguro del dueño + ronda automática extra de una parte que agotó su tope (owner-retry.ts).
+import {
+  AUTO_BUDGET_EXTENSION_KEY, AUTO_BUDGET_EXTENSION_STRATEGY, BudgetScope, OWNER_RETRIES_KEY, OWNER_RETRY_ENFORCED_REASONS, OWNER_RETRY_MAX,
+  OWNER_RETRY_WINDOW_HOURS, OwnerRetryView,
+  autoBudgetExtensionOf, budgetScopeOf, isItemBudgetExhausted, itemFailureVerdict, nextOwnerRetries, ownerRetriesUsed, ownerRetryVerdict,
+} from './owner-retry';
+import { unknownReservations } from '../../workers/llm-executor/server-llm';
 import {
   PROVIDER_PROBE_KEY,
   PROVIDER_PROBE_MAX_HOURS,
@@ -295,6 +303,10 @@ export interface ItemRunDto {
   recovery: ItemRecoveryView;
   /** REL R2 (aditivo, solo en la vista del run): costo estimado / real / pendiente del item (ledger). Solo SUPER_ADMIN. */
   cost?: ItemCostView;
+  /** r65 (R1): alcance del motivo de presupuesto — 'item' (tope interno de la parte), 'run' (autorización del run) o null. */
+  budgetScope?: BudgetScope;
+  /** r65 (R2, solo en la vista del run e ítems failed): ¿el dueño puede reintentar la parte él mismo? (servidor = verdad). */
+  ownerRetry?: OwnerRetryView | null;
   createdAt: string;
   updatedAt: string;
   finishedAt: string | null;
@@ -2437,6 +2449,11 @@ export class RunsService {
       spendControlResume?: boolean;
       /** r62 (d8): la dependencia cuyo dato faltó en el claim (claim_payload_unavailable) ya se completó → reapertura sola. */
       dependencyResolved?: boolean;
+      /**
+       * r65 (R4): UNA ronda automática extra de una parte de IA que agotó su tope interno (item_recovery_budget_exhausted),
+       * con presupuesto de recuperación nuevo, solo si el saldo del run cubre su peor caso y no hay reservas abiertas.
+       */
+      budgetExtension?: boolean;
     },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
@@ -2450,6 +2467,10 @@ export class RunsService {
     // rechazo DEFINITIVO de Videogen sin gasto (videogen_submit_rejected), re-evaluado bajo lock.
     if (auto?.dependencyResolved && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.spendControlResume || auto.providerReconcile)) {
       throw new BadRequestException('auto-heal: la reapertura por dependencia resuelta nunca reenvía ni se combina con otro modo automático');
+    }
+    // r65 (R4): la ronda extra por tope de la parte nunca reenvía a un proveedor ni se combina con otro modo automático.
+    if (auto?.budgetExtension && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.spendControlResume || auto.providerReconcile || auto.dependencyResolved)) {
+      throw new BadRequestException('auto-heal: la ronda extra por tope de la parte nunca reenvía ni se combina con otro modo automático');
     }
     if (auto?.spendControlResume && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.providerReconcile)) {
       throw new BadRequestException('auto-heal: la reanudación tras un control de gasto nunca reenvía ni se combina con otro modo automático');
@@ -2468,6 +2489,13 @@ export class RunsService {
     // Fix round 1 (I2): un SUPER_ADMIN reintenta sobre el run del dueño real del curso (FinOps, YouTube
     // y ownership se evalúan contra ese dueño); queda registrado quién actuó.
     const actorId = actor?.id ?? ownerId;
+    // r65 fix round 1: un reenvío explícito a un proveedor (resubmitVideo / resubmitProvider) vuelve a pagar un trabajo
+    // externo ya enviado, posiblemente ambiguo → herramienta de recuperación de un SUPER_ADMIN (antes el dueño podía
+    // mandar {resubmitProvider:true} y re-pagar un envío ambiguo de Gamma/OpenAI). Los reenvíos automáticos (auto) siguen
+    // con sus propias reglas.
+    if (!auto && (resubmitProvider || resubmitVideo) && !isSuperAdminEmail(actor?.email)) {
+      throw adminRecoveryForbidden(resubmitVideo ? 'Volver a generar un video (con costo)' : 'Volver a pedir un trabajo pagado al proveedor (con costo)');
+    }
     if (!auto && actor) ownerId = await this.ownerForActor(courseId, ownerId, actor);
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
@@ -2565,6 +2593,10 @@ export class RunsService {
     let lostResultResend = false;
     let lostResultUnits: { lostChunks: number[]; lostLlm: number } = { lostChunks: [], lostLlm: 0 };
     let stuckResendWarning: string | null = null;
+    // r65 (R2.5): reintentos del dueño a registrar en la MISMA escritura de la reapertura (null = no es un reintento del dueño).
+    let ownerRetriesNext: Array<{ at: string; by: string }> | null = null;
+    // r65 (R4): marca de la ronda automática extra.
+    let budgetExtensionMark: Record<string, unknown> | null = null;
     const targetId = await this.tx(async (qr) => {
       // I1: lock del curso primero — este reintento puede reabrir el run.
       await this.lockCourseRuns(qr, courseId);
@@ -2627,6 +2659,37 @@ export class RunsService {
         throw new ConflictException(
           `Solo se puede reintentar un item en estado "failed" (o "blocked" por ${BUDGET_EXCEEDED}); "${itemKey}" está en "${target.status}"`,
         );
+      }
+      // r65 (R2): el reintento del DUEÑO (no SUPER_ADMIN) se re-evalúa con las filas bloqueadas (lock del curso + for
+      // update): reservas abiertas, resultado ambiguo, saldo del run para el peor caso de la parte, topes del mes y el
+      // límite de 2 reintentos en 24 h. Un motivo de dinero → 409 {code} sin cambiar nada. Dos clics simultáneos: el
+      // segundo espera el lock y ve la parte ya `pending` (409), así se consume UN reintento y se abre UNA ventana.
+      // r65 fix round 1: TODO reintento manual del dueño reinicia el tope de la parte (recoveryBudgetResetAt) → todos cuentan
+      // en ownerRetries y el límite de 2 en 24 h se aplica ANTES de la lista de códigos (también a un D fuera de la lista
+      // o a una parte bloqueada por presupuesto). Los actores no SUPER_ADMIN comparten el límite del dueño.
+      if (!auto && actor && !isSuperAdminEmail(actor.email) && (target.status === 'failed' || isBudgetBlocked(target))) {
+        const [fullRow] = await qr.query(`select * from public.generation_item_runs where id = $1`, [target.id]);
+        const now = new Date();
+        const conflict = (v: OwnerRetryView) => new ConflictException({
+          code: v.reason, ownerRetry: v,
+          message: `${v.reason}: el reintento de "${itemKey}" no se hizo (no se cambió nada).` +
+            (v.reason === 'owner_retry_limit' ? ' Ya usaste los reintentos de esta parte en las últimas 24 h; el equipo de Cursia la revisará.'
+              : v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached' ? ' El saldo autorizado no cubre el costo máximo de esta parte: hace falta ampliar la autorización.'
+                : v.reason === 'open_reservations' ? ' Hay un cobro de esta parte pendiente de confirmar; Cursia lo concilia antes de reintentar.'
+                  : ' Hay un cobro sin conciliar o un resultado ambiguo: el equipo de Cursia lo revisa.'),
+        });
+        const used = ownerRetriesUsed(fullRow?.output_summary, now);
+        if (used >= OWNER_RETRY_MAX) {
+          throw conflict({ allowed: false, reason: 'owner_retry_limit', maxCostUsd: null, retriesLeft: 0, windowHours: OWNER_RETRY_WINDOW_HOURS });
+        }
+        if (target.status === 'failed' && fullRow) {
+          const v = await this.ownerRetryOf(qr, { id: String(job.id), course_id: courseId, owner_id: ownerId, worker_status: locked.worker_status }, fullRow, now, { lockMonth: true });
+          if (v && !v.allowed && v.reason && (OWNER_RETRY_ENFORCED_REASONS.has(v.reason)
+            || (v.reason === 'paid_external_unreconciled' && (resubmitVideo || resubmitProvider)))) {
+            throw conflict(v);
+          }
+        }
+        ownerRetriesNext = nextOwnerRetries(fullRow?.output_summary, now, String(actorId));
       }
       // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
       // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
@@ -2700,6 +2763,24 @@ export class RunsService {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (spend_control: still_blocked)`, code: 'auto_heal_not_eligible', reason: 'still_blocked' });
         }
         autoMeta = { round: 0, code: hold.code, strategy: SPEND_CONTROL_RESUME_STRATEGY };
+      } else if (auto && auto.budgetExtension) {
+        // r65 (R4): misma decisión que el barrido, con las filas bloqueadas: tope de la parte agotado, sin la ronda ya
+        // usada, parte de IA (los proveedores pagados quedan como hoy), 0 reservas abiertas y el saldo del run (y los topes
+        // del mes) cubren su peor caso. El límite de reintentos del DUEÑO no aplica (es otro mecanismo).
+        const [fullRow] = await qr.query(`select * from public.generation_item_runs where id = $1`, [target.id]);
+        const why = !isItemBudgetExhausted(target.error) ? 'not_item_budget'
+          : autoBudgetExtensionOf(target.output_summary) ? 'already_extended'
+            : paidProviderOfItemType(target.type) ? 'paid_provider' : null;
+        const v = why || !fullRow ? null
+          : await this.ownerRetryOf(qr, { id: String(job.id), course_id: courseId, owner_id: ownerId, worker_status: locked.worker_status }, fullRow, auto.now ?? new Date(),
+            { lockMonth: true, ignoreLimit: true, extension: true });
+        const ok = !!v && v.allowed;
+        if (!ok) {
+          const reason = why ?? (v ? v.reason : 'finops_unavailable');
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (budget_extension: ${reason})`, code: 'auto_heal_not_eligible', reason });
+        }
+        budgetExtensionMark = { at: (auto.now ?? new Date()).toISOString(), round: 1, previousError: String(target.error ?? '').slice(0, 500), maxCostUsd: v!.maxCostUsd };
+        autoMeta = { round: 1, code: 'item_recovery_budget_exhausted', strategy: AUTO_BUDGET_EXTENSION_STRATEGY };
       } else if (auto && auto.safe) {
         // BE-B: reintento automático seguro (una vez; solo rechazos probados sin gasto).
         const d = safeAutoRetryDecision(target, auto.now ?? new Date(), auto.policy);
@@ -2865,6 +2946,8 @@ export class RunsService {
         ? { auto: true, dependencyResolved: true, autoHealCode: autoMeta.code, actor: 'system' }
         : autoMeta && auto?.spendControlResume
         ? { auto: true, spendControlResume: true, autoHealCode: autoMeta.code, actor: 'system' }
+        : autoMeta && auto?.budgetExtension
+        ? { auto: true, autoBudgetExtension: true, autoHealCode: autoMeta.code, actor: 'system' }
         : autoMeta && auto?.providerProbe
         ? { auto: true, providerProbe: auto.providerProbe.mode, provider: auto.providerProbe.provider, providerProbeRound: autoMeta.round }
         : autoMeta && auto?.ambiguousAudio
@@ -2885,6 +2968,8 @@ export class RunsService {
             reopens: Math.max(0, Math.floor(Number(target.output_summary?.claimPayloadRecovery?.reopens ?? 0)) || 0) + 1, lastAt: nowIso, lastCode: autoMeta.code } }
         : autoMeta && auto?.spendControlResume
         ? { spendControlResume: { count: Math.max(0, Math.floor(Number(target.output_summary?.spendControlResume?.count ?? 0)) || 0) + 1, lastAt: nowIso, lastCode: autoMeta.code } }
+        : autoMeta && auto?.budgetExtension
+        ? { [AUTO_BUDGET_EXTENSION_KEY]: budgetExtensionMark }
         : autoMeta && auto?.providerProbe
         ? (probeState ? { [PROVIDER_PROBE_KEY]: probeState } : {})
         : autoMeta && auto?.ambiguousAudio
@@ -2908,23 +2993,26 @@ export class RunsService {
                 lastAt: nowIso, lastCode: autoMeta.code, lastClass: autoMeta.kind, lastStrategy: autoMeta.strategy,
                 maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy), regenMaxRounds: auto!.policy.regenMaxRounds ?? 0 } }
             : { autoHeal: { rounds: autoMeta.round, lastAt: nowIso, lastCode: autoMeta.code, maxRounds: autoHealMaxRoundsFor(target.type, auto!.policy) } })
-          : {};
+          : ownerRetriesNext ? { [OWNER_RETRIES_KEY]: ownerRetriesNext } : {};
       // BE-B: el reintento seguro concede UN intento (un único reenvío; si vuelve a fallar, humano).
       // #583: el reenvío de audio incierto también concede UN intento (un único reenvío).
       // REL CREDIT: el canario concede UN intento (una sola llamada de prueba; fuera de las rondas del auto-healer).
-      const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerReconcile || auto?.providerProbe?.mode === 'canary'
+      // r65 (R4): la ronda extra por tope de la parte también concede UN intento (una sola vez; si vuelve a agotar, humano).
+      const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerReconcile || auto?.providerProbe?.mode === 'canary' || auto?.budgetExtension
         ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       // Loop de costos (review C1): una reapertura MANUAL (dueño / admin) le da a la parte un presupuesto de recuperación
       // NUEVO (recoveryBudgetResetAt: cuenta lo gastado desde ahora), así una parte detenida por presupuesto siempre se
       // puede recuperar. Las reaperturas automáticas (auto-heal) NO lo reinician: siguen dentro del mismo presupuesto.
+      // r65 (R4): la ÚNICA excepción automática es la ronda extra por tope de la parte (marcada, una vez, con el saldo del
+      // run cubriendo su peor caso). El tope y la autorización del RUN nunca se reinician.
       const updated = returningRows(
         await qr.query(
           `update public.generation_item_runs
               set status = 'pending',
                   max_attempts = attempt_count + $2::int,
                   -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
-                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
+                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto && !auto.budgetExtension ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
                     || case when $5::boolean then jsonb_build_object('${LOST_RESULT_RESEND_KEY}', jsonb_build_object('at', now(), 'afterAttempt', attempt_count, 'cause', 'lost_result') || $6::jsonb)
                             else '{}'::jsonb end,
                   error = null,
@@ -2946,10 +3034,11 @@ export class RunsService {
       await recordItemReopened(qr, target.id, {
         // r62 (regla 5): todo REENVÍO automático a un proveedor queda con actor `system` y su motivo (strategy); la
         // conciliación de proveedor (N2) también la decide el sistema.
-        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
+        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved || auto?.budgetExtension ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
         // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
         strategy: auto?.providerReconcile ? `${PROVIDER_RECONCILE_CODE}_${auto.providerReconcile.action}:${auto.providerReconcile.kind}`
           : auto?.dependencyResolved ? CLAIM_PAYLOAD_RESUME_STRATEGY
+          : auto?.budgetExtension ? AUTO_BUDGET_EXTENSION_STRATEGY
           : auto?.spendControlResume ? `${SPEND_CONTROL_RESUME_STRATEGY}:${autoMeta?.code ?? ''}`.slice(0, 64)
           : auto?.providerProbe ? (auto.providerProbe.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY)
           : auto?.ambiguousAudio ? `ambiguous_audio_resubmit:${autoMeta?.cause ?? 'connection_cut'}` : auto?.safe ? 'safe_auto_retry'
@@ -3353,6 +3442,84 @@ export class RunsService {
   }
 
   /**
+   * r65 (R4) — ronda automática EXTRA (una sola, sin humano) de una parte de IA que agotó su tope INTERNO
+   * (`item_recovery_budget_exhausted`, clase D `hold_for_human`, rounds 0 en el clasificador: no cambia). Mismo tick que el
+   * auto-healer. Condiciones (re-evaluadas bajo lock en retryItem auto.budgetExtension): 0 reservas abiertas de la parte,
+   * no es de un proveedor pagado (video / presentación / audio quedan como hoy), el saldo del run (y los topes del mes)
+   * cubren su peor caso (itemHardLimit), y la parte no tiene ya `output_summary.autoBudgetExtension`. Además la parte la
+   * tiene que ejecutar el worker de IA del SERVIDOR (flag + worker vivo que cubre su tipo para este run): solo ahí la ronda
+   * cambia de estrategia (sin streaming y max_tokens × 1,5, server-llm.ts); en el navegador sería la misma solicitud.
+   * Efecto: reabre SOLO esa parte con recoveryBudgetResetAt = now(), deja la marca {at, round: 1, previousError} y reabre el
+   * run si estaba `failed`. Si la ronda también agota el tope, la parte queda en hold_for_human (sin tercera ronda).
+   * Un rechazo (sin saldo, reservas abiertas…) deja un enfriamiento (autoBudgetExtensionSkip) y se re-evalúa después.
+   */
+  async autoExtendItemRecoveryBudget(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number } = {},
+  ): Promise<{ candidates: number; extended: Array<{ runId: string; itemKey: string }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const now = opts.now ?? new Date();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const out = { candidates: 0, extended: [] as Array<{ runId: string; itemKey: string }>, skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
+    if (!policy.classAware) return out; // kill-switch de la recuperación (DYNAMIC_AUTO_HEAL_POLICY=legacy)
+    if (!llmWorkerEnabled()) return out;
+    const rows: Array<{ id: string; job_id: string; item_key: string; type: string; error: string | null; course_id: number; owner_id: string; blueprint_number: number; run_created_at: Date }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.error, pj.course_id, pj.owner_id, b.blueprint_number, pj.created_at as run_created_at
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview', 'paused')
+          and g.status = 'failed'
+          and ${latestGenerationPredicate('g')}
+          and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+          and g.error like '%item_recovery_budget_exhausted%'
+          and not (g.type = any($4::text[]))
+          and not coalesce(g.output_summary ? '${AUTO_BUDGET_EXTENSION_KEY}', false)
+          and not (case when jsonb_typeof(g.output_summary->'autoBudgetExtensionSkip'->'untilMs') = 'number'
+                        then (g.output_summary->'autoBudgetExtensionSkip'->>'untilMs')::numeric > $5::numeric else false end)
+        order by g.finished_at desc, g.id desc
+        limit $3`,
+      [now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), limit,
+        [...WORKER_PAID_ITEM_TYPES], now.getTime()],
+    );
+    out.candidates = rows.length;
+    if (!rows.length) return out;
+    const coverage = await liveLlmWorkerCoverage(this.dataSource, now.getTime(), LLM_WORKER_PRESENCE_STRICT_SECONDS);
+    for (const r of rows) {
+      if (!isItemBudgetExhausted(r.error)) { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'not_item_budget' }); continue; }
+      // Cambio de estrategia obligatorio: solo el worker de IA del servidor la aplica (en el navegador sería la misma solicitud).
+      if (!routedTypesForRun(coverage, r.run_created_at).has(String(r.type))) { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'not_server_routed' }); continue; }
+      try {
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false, { policy, now, budgetExtension: true });
+        out.extended.push({ runId: r.job_id, itemKey: r.item_key });
+        this.logger.warn(`tope de la parte: ${r.item_key} (run ${r.job_id}) — ronda automática EXTRA (única) con presupuesto de recuperación nuevo, sin streaming y max_tokens × 1,5; error previo: ${String(r.error ?? '').slice(0, 200)}`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('autoBudgetExtensionSkip', jsonb_build_object('untilMs', $2::bigint, 'reason', $3::text))
+            where id = $1 and status = 'failed'`,
+          [r.id, now.getTime() + AUTO_HEAL_SKIP_COOLDOWN_SECONDS * 1000, code],
+        ).catch(() => undefined);
+        this.logger.warn(`tope de la parte: ${r.item_key} (run ${r.job_id}) sin ronda automática extra (${code}); queda para el dueño / un humano`);
+      }
+    }
+    if (out.extended.length || out.skipped.length) {
+      this.logger.log(`tope de la parte: candidatos ${out.candidates}, ronda extra ${out.extended.length}, omitidos ${out.skipped.length}`);
+    }
+    return out;
+  }
+
+  /**
    * REL CREDIT — sonda del proveedor tras crédito/cuota agotados (mismo tick que el auto-healer; ver
    * reliability/provider-probe.ts). Por cada run vigente con items `failed` por crédito/cuota de Anthropic u
    * OpenAI: a su hora reabre UN canario por (run, proveedor) con retryItem(auto.providerProbe canary) — un
@@ -3679,6 +3846,75 @@ export class RunsService {
   private recoveryLedgerInstance: FinopsLedgerService | null = null;
 
   /** r62: la excepción queda registrada con un attention_reason explícito (no-op sin el esquema REL R2). */
+  /**
+   * r65 (R2.2): reservas ABIERTAS de la parte (CHARGE de reserva sin ajuste ni liquidación) en TODA su generación vigente
+   * (desde la creación de la fila: una reserva sin conciliar de antes de un reinicio de presupuesto sigue siendo una duda).
+   * Las del worker de IA con unknownReservations (server-llm.ts, misma definición que el worker); el resto (proxy del
+   * navegador, proveedores) por item_run_id. Mock no cuenta (nunca se cobra).
+   */
+  private async openItemReservations(q: { query: (sql: string, params?: any[]) => Promise<any> }, r: { id: string; created_at?: Date | string | null }): Promise<number> {
+    const since = r.created_at ? new Date(r.created_at as any) : new Date(0);
+    const llmw = await unknownReservations(q as unknown as DataSource, String(r.id), since);
+    const [o] = await q.query(
+      `select count(*)::int as n from public.generation_cost_events e
+        where e.item_run_id = $1 and e.event_kind = 'CHARGE' and coalesce((e.metadata->>'reservation') = 'true', false)
+          and e.billing_account <> 'mock' and e.created_at >= $2 and e.idempotency_key not like 'reservation:llm:%'
+          and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`,
+      [r.id, since.toISOString()],
+    );
+    return llmw.length + (Number(o?.n ?? 0) || 0);
+  }
+
+  /** r65 (R2.3): ¿una parte de proveedor pagado tiene trabajo externo ya enviado o sin conciliar? (ante la duda, sí). */
+  private async paidExternalUnreconciled(q: { query: (sql: string, params?: any[]) => Promise<any> }, r: any): Promise<boolean> {
+    if (!paidProviderOfItemType(String(r.type))) return false;
+    const os = r.output_summary ?? {};
+    if (r.type === 'video' && videoRenderWasAttempted(r)) return true;
+    if (os.external || os.externalSubmitStartedAt || os.externalReservationKey) return true;
+    if (String(r.error ?? '').includes(PROVIDER_RECONCILIATION_REQUIRED)) return true;
+    if (r.type === 'audio_welcome' || r.type === 'audiobook_chapter') {
+      const p = await this.ambiguousAudioPending(q, String(r.id), os, r.type);
+      if ((p.pendingUsd ?? 0) > 0 || (p.lostUsd ?? 0) > 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * r65 (R2): veredicto del reintento del dueño para UNA fila (`select *` de generation_item_runs) sobre `q` (la conexión
+   * de la transacción del retry, con las filas bloqueadas, o el pool en la vista del run). null = sin FinOps (harness).
+   */
+  private async ownerRetryOf(
+    q: { query: (sql: string, params?: any[]) => Promise<any> }, job: { id: string; course_id: number; owner_id: string; worker_status?: string | null }, r: any, now: Date = new Date(),
+    /**
+     * r65 fix round 1: `ctx` = datos del run ya leídos (la vista del run los lee UNA vez); `lockMonth` toma MONTH_CAP_LOCK
+     * (dentro de la tx del retry); `ignoreLimit` = la ronda R4 (el límite del dueño no aplica); `extension` = la llamada
+     * siguiente reserva con max_tokens × 1,5 (R4 o su marca persistida; por defecto, la marca de la fila).
+     */
+    opts: { ctx?: Awaited<ReturnType<FinopsBudgetService['ownerRetryRunContext']>>; lockMonth?: boolean; ignoreLimit?: boolean; extension?: boolean } = {},
+  ): Promise<OwnerRetryView | null> {
+    if (!this.finopsBudget) return null;
+    const verdict = itemFailureVerdict(r);
+    const used = opts.ignoreLimit ? 0 : ownerRetriesUsed(r.output_summary, now);
+    if (r.status !== 'failed') {
+      return ownerRetryVerdict({ status: String(r.status), verdict, openReservations: 0, paidType: false, paidExternalUnreconciled: false, maxCostUsd: null, runRemainingUsd: null, policyBlockedBy: null, ownerRetriesUsed24h: used });
+    }
+    const openReservations = await this.openItemReservations(q, r);
+    const paidType = paidProviderOfItemType(String(r.type)) !== null;
+    const paidExternal = await this.paidExternalUnreconciled(q, r);
+    const ctx = opts.ctx ?? await this.finopsBudget.ownerRetryRunContext({
+      runId: String(job.id), courseId: Number(job.course_id), ownerId: String(job.owner_id),
+      runLive: ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')), lockMonth: !!opts.lockMonth,
+    }, q);
+    const b = await this.finopsBudget.ownerRetryBudget({
+      runId: String(job.id), itemKey: String(r.item_key), itemType: String(r.type),
+      extension: opts.extension ?? !!autoBudgetExtensionOf(r.output_summary),
+    }, ctx, q);
+    return ownerRetryVerdict({
+      status: String(r.status), verdict, openReservations, paidType, paidExternalUnreconciled: paidExternal,
+      maxCostUsd: b.maxCostUsd, runRemainingUsd: b.runRemainingUsd, policyBlockedBy: b.policyBlockedBy, ownerRetriesUsed24h: used,
+    });
+  }
+
   private async recordAttention(itemRunId: string, reason: 'budget' | 'config' | 'duplicate_charge' | 'unrecoverable' | 'product_bug' | 'dependency_unavailable'): Promise<void> {
     try {
       if (!(await relSchemaReady(this.dataSource))) return;
@@ -6165,6 +6401,28 @@ export class RunsService {
     const strategy = frozenVideoDeliveryOf(job.input_payload);
     const costs = await loadItemCosts(this.dataSource, job.id);
     const itemDtos = rows.map((r: any) => this.toItemDto(r, strategy, costs));
+    // r65 (R1/R2): alcance del motivo de presupuesto (con la pausa del run por su tope) y veredicto del reintento del
+    // dueño en cada ítem failed. Nunca rompe la lectura: un error deja ownerRetry null (el FE cae al comportamiento previo).
+    const pauseReason = isPausedRun(job) ? (job.output_summary?.pause?.reason ?? null) : null;
+    // r65 fix round 1: autorización, gasto, política y totales del mes UNA vez por request (no por parte fallida).
+    let runCtx: Awaited<ReturnType<FinopsBudgetService['ownerRetryRunContext']>> | undefined;
+    for (let i = 0; i < rows.length; i++) {
+      itemDtos[i].budgetScope = budgetScopeOf(rows[i], pauseReason);
+      if (rows[i].status !== 'failed') continue;
+      try {
+        if (!runCtx && this.finopsBudget) {
+          runCtx = await this.finopsBudget.ownerRetryRunContext({ runId: String(job.id), courseId: Number(job.course_id), ownerId: String(job.owner_id),
+            runLive: ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')) });
+        }
+        const v = await this.ownerRetryOf(this.dataSource, job, rows[i], new Date(), { ctx: runCtx });
+        itemDtos[i].ownerRetry = v;
+        // R2.4: sin saldo del run para el peor caso de la parte, el texto es el de ampliar la autorización.
+        if (v && (v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached')) itemDtos[i].budgetScope = 'run';
+      } catch (err) {
+        itemDtos[i].ownerRetry = null;
+        this.logger.warn(`ownerRetry: no se pudo evaluar ${rows[i].item_key} (run ${job.id}): ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     const completion = await this.completionOf(job, rows, manifest);
 
     return {
@@ -6333,6 +6591,7 @@ export class RunsService {
       outputSummary: progressOutputSummary(r.output_summary),
       ...(delivery ? { delivery } : {}),
       recovery: recoveryViewOf(r),
+      budgetScope: budgetScopeOf(r),
       ...(costs ? { cost: costs.get(r.item_key) ?? { estimated: null, actual: '0', pending: '0', currency: 'USD' as const } } : {}),
       createdAt: toIso(r.created_at),
       updatedAt: toIso(r.updated_at),

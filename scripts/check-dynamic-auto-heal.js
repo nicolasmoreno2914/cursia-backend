@@ -536,7 +536,7 @@ async function dbChecks() {
       const pres = await itemRow(C.runId, presKey);
       await failAt(pres.id, 'gamma_submit_ambiguous: sin confirmar', 60,
         `jsonb_build_object('external', jsonb_build_object('gammaGenerationId', 'gen_old'), 'externalSubmitStartedAt', '2026-09-30T00:00:00Z', 'gammaPollSince', '2026-09-30T00:00:00Z')`);
-      await runs.retryItem(C.cid, OWNER, 1, C.runId, presKey, false, true);
+      await runs.retryItem(C.cid, OWNER, 1, C.runId, presKey, false, true, undefined, { email: 'admin@cursia.test' }); // r65: resubmitProvider = solo SUPER_ADMIN
       let row = await itemRow(C.runId, presKey);
       eq([row.status, 'gammaPollSince' in row.output_summary, 'external' in row.output_summary, row.output_summary.previousExternals.length >= 1], ['pending', false, false, true], 'presentación');
       const vid = await itemRow(C.runId, `video:${C.c1}`);

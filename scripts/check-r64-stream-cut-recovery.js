@@ -8,7 +8,7 @@
 const http = require('http');
 const path = require('path');
 const distRoot = path.resolve(process.cwd(), process.argv[2] || 'dist');
-const { createServerApi, priorStreamCut, LLM_OUTPUT_CUT_REPEATED } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
+const { createServerApi, priorStreamCut, LLM_OUTPUT_CUT_REPEATED, LLM_WORKER_MAX_TOKENS_CAP, autoBudgetExtensionMaxTokens } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
 const { nonStreamMessage, streamMessage, nodeHttpFetch } = require(path.join(distRoot, 'workers/llm-executor/anthropic-stream.js'));
 const { classifyFailure } = require(path.join(distRoot, 'modules/reliability/failure-classifier.js'));
 
@@ -92,12 +92,13 @@ function fakeWorld(opts = {}) {
         return [...res.entries()].filter(([k, v]) => like(keyLike).test(k) && like(tagLike).test(v.tag) && (!v.settled || (includePd && v.possibleDuplicate)) && !exclude.includes(k))
           .map(([k, v]) => ({ key: k, amount: '0.01', settled: !!v.settled, send_marked: !!v.sendMarked, created_at: v.at ? new Date(v.at).toISOString() : null }));
       }
-      if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...cps } }];
+      // r65 (R4): auto_ext = la parte está en su ronda automática extra por tope agotado.
+      if (sql.includes('generation_item_runs')) return [{ since: new Date(0).toISOString(), cps: { ...cps }, auto_ext: !!opts.autoExt }];
       throw new Error('SQL inesperado: ' + sql.slice(0, 80));
     },
   };
   const finops = {
-    async recordCharge(i) { res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false, at: Date.now() }); return {}; },
+    async recordCharge(i) { res.set(i.idempotencyKey, { tag: i.metadata.callTag, sendMarked: !!i.metadata.sendMarked, settled: false, at: Date.now(), usage: i.usage }); return {}; },
     async recordAdjustment() { return {}; }, async recordZero() { return {}; },
     async reconcileReservationAsCharged(key, reason, o) {
       const r = res.get(key);
@@ -315,6 +316,27 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
   await check('clasificador: llm_output_cut_repeated es una excepción EXPLÍCITA (D, hold_for_human, causa en el mensaje), no un «unclassified»', async () => {
     const v = classifyFailure({ error: `${LLM_OUTPUT_CUT_REPEATED}: la respuesta de la IA se cortó 2 veces en la misma solicitud (socket:UND_ERR_SOCKET)`, itemType: 'activity' });
     assert(v && v.unclassified === false && v.class === 'D' && v.strategy === 'hold_for_human', JSON.stringify(v));
+  });
+
+  await check('r65 (R4): una parte en su ronda automática EXTRA (autoBudgetExtension) cambia de estrategia — sin streaming desde el primer envío y max_tokens × 1,5 (con tope); el guard y la reserva usan ese max_tokens; el hash del pedido cambia', async () => {
+    const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : 'ok'));
+    const w = fakeWorld({ autoExt: true }); const api = makeApi(w, a.url);
+    const text = await api('s', 'prompt-r65', 5000);
+    assert(text === FULL, 'llegó entera');
+    assert(a.st.reqs.length === 1 && a.st.reqs[0].stream === false, 'ningún envío por stream: ' + JSON.stringify(a.st.reqs.map((r) => r.stream)));
+    assert(a.st.reqs[0].body.max_tokens === 7500, 'max_tokens 5000 × 1,5 = 7500: ' + a.st.reqs[0].body.max_tokens);
+    assert(api.guards.length === 1 && api.guards[0].maxTokens === 7500, 'el guard recibe el max_tokens nuevo: ' + JSON.stringify(api.guards));
+    const resv = [...w.res.values()][0];
+    assert(resv && resv.usage && Number(resv.usage.output_tokens) === 7500, 'la reserva se acota con el max_tokens nuevo: ' + JSON.stringify(resv && resv.usage));
+    // Con tope: 12000 × 1,5 = 18000 → LLM_WORKER_MAX_TOKENS_CAP.
+    await api('s', 'prompt-r65-cap', 12000);
+    assert(a.st.reqs[1].body.max_tokens === LLM_WORKER_MAX_TOKENS_CAP && autoBudgetExtensionMaxTokens(12000) === LLM_WORKER_MAX_TOKENS_CAP, 'tope del worker: ' + a.st.reqs[1].body.max_tokens);
+    // Sin la marca: la misma llamada va por streaming y con su max_tokens (otro hash: otra solicitud).
+    const a2 = await fakeAnthropic(() => 'ok');
+    const w2 = fakeWorld(); const api2 = makeApi(w2, a2.url);
+    await api2('s', 'prompt-r65', 5000);
+    assert(a2.st.reqs[0].stream === true && a2.st.reqs[0].body.max_tokens === 5000, 'sin marca: stream y 5000');
+    await a.close(); await a2.close();
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'TODO OK'} (${passes} ✅, ${failures} ❌).`);

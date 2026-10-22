@@ -161,16 +161,27 @@ const LLM_HTTP_AMBIGUOUS_STATUSES: readonly number[] = [408, 504];
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
+/**
+ * r65 (R4): max_tokens de la ronda automática extra de una parte que agotó su tope (output_summary.autoBudgetExtension):
+ * ×1,5 del pedido (las salidas de R1 rondaban el tope de 5000), con el tope del worker.
+ */
+export function autoBudgetExtensionMaxTokens(maxTok?: number): number {
+  return Math.max(1, Math.min(LLM_WORKER_MAX_TOKENS_CAP, Math.ceil((maxTok || 4000) * 1.5)));
+}
+
 /** Ventana de la parte (igual que el presupuesto de recuperación): generación vigente desde su último reinicio. */
-export async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ since: Date; checkpoints: Record<string, { path: string; at: string }>; sent: Record<string, string> }> {
+export async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ since: Date; checkpoints: Record<string, { path: string; at: string }>; sent: Record<string, string>; autoBudgetExtension: boolean }> {
   const [r] = await ds.query(
     `select greatest(created_at, coalesce(nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz, created_at)) as since,
             coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) as cps,
-            coalesce(output_summary->'llmSent', '{}'::jsonb) as sent
+            coalesce(output_summary->'llmSent', '{}'::jsonb) as sent,
+            -- r65 (R4): la parte está en su ronda automática extra por tope agotado (cambio de estrategia).
+            coalesce(output_summary ? 'autoBudgetExtension', false) as auto_ext
        from public.generation_item_runs where id = $1`,
     [itemRunId],
   );
-  return { since: r ? new Date(r.since) : new Date(0), checkpoints: (r && r.cps) || {}, sent: (r && r.sent && typeof r.sent === 'object') ? r.sent : {} };
+  return { since: r ? new Date(r.since) : new Date(0), checkpoints: (r && r.cps) || {}, sent: (r && r.sent && typeof r.sent === 'object') ? r.sent : {},
+    autoBudgetExtension: !!r && (r.auto_ext === true || r.auto_ext === 't') };
 }
 
 /** r62: el SQL que inserta la marca de envío (merge atómico bajo la lease del worker). */
@@ -426,7 +437,14 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
   let streamCutSeen: boolean | null = null; // null = todavía no se miró el ledger de la parte
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const api = async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>, cacheOpts?: { cachePrefix?: string }): Promise<string> {
-    const { body, model: useModel, maxTokens } = serverLlmRequestBody({ system, user, maxTok, schema, model, defaultModel: deps.defaultModel, cacheOpts });
+    // r65 (R4): la ventana se lee ANTES de armar el pedido. Una parte en su ronda automática extra (tope de la parte
+    // agotado, output_summary.autoBudgetExtension) cambia de estrategia: sin streaming y max_tokens × 1,5 (con el tope del
+    // worker). El hash del pedido cambia (max_tokens es parte del body): es OTRA solicitud, sin punto de guardado previo
+    // (además, los guardados de antes del reinicio del presupuesto quedan fuera de la ventana). La reserva y el guard
+    // usan ese max_tokens nuevo (maxTokens sale del body).
+    const win = await itemWindowStart(deps.dataSource, item.itemRunId);
+    const extended = win.autoBudgetExtension === true;
+    const { body, model: useModel, maxTokens } = serverLlmRequestBody({ system, user, maxTok: extended ? autoBudgetExtensionMaxTokens(maxTok) : maxTok, schema, model, defaultModel: deps.defaultModel, cacheOpts });
     const hash = serverLlmRequestHash(body);
     const role = roleOf(extraHeaders);
 
@@ -442,14 +460,13 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       deps.logger.log(`[llm-worker] ${item.itemKey}: respuesta desde el punto de guardado (${hash.slice(0, 10)}) — sin costo`);
       return saved.text;
     };
-    const win = await itemWindowStart(deps.dataSource, item.itemRunId);
     const cached = await fromCheckpoint(win);
     if (cached !== null) return cached;
     // r64: transporte de ESTA llamada. Si ya se cortó por streaming (aquí o en un intento anterior), va sin streaming.
     // Toda la historia de ESTA fila (no solo la ventana vigente): un reintento manual reinicia el presupuesto, pero los
     // cortes anteriores siguen siendo evidencia de que su stream falla (R1: la parte se reintenta sobre sus 5 cortes).
     if (streamCutSeen === null) streamCutSeen = await priorStreamCut(deps.dataSource, item.itemRunId, new Date(0));
-    let transport: LlmTransport = streamCutSeen || cutCalls.size > 0 ? 'nonstream' : 'stream';
+    let transport: LlmTransport = extended || streamCutSeen || cutCalls.size > 0 ? 'nonstream' : 'stream';
 
     // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
     const promptChars = JSON.stringify(body).length;

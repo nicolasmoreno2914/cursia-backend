@@ -4125,6 +4125,19 @@ function reservationBookkeeping(ev) {
           const ev0 = await evOthers();
           const nReq0 = fake.st.requests.length;
           const pkgJobs0 = (await q(`select count(*)::int n from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1`, [c2.runId]))[0].n;
+          // ── r65 · el DUEÑO NO admin (mismo sub, email fuera de SUPER_ADMIN_EMAILS): el servidor le dice que esta parte
+          // (resultado ambiguo de la IA, llm_pending_review) no la puede reintentar él — reintentarla podría cobrar dos
+          // veces — y su POST …/retry se rechaza con 409 ambiguous_paid_result SIN cambiar nada. El reintento positivo del
+          // dueño (item_recovery_budget_exhausted con saldo) lo cubre scripts/check-r65-owner-retry.js (DB real). ──
+          const OWNER_NONADMIN = jwt.sign({ sub: OWNER, email: 'e2e-v3-owner-nonadmin@example.com', role: 'authenticated', aud: 'authenticated', user_metadata: { email_verified: true } }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+          const gNa = await api('GET', runsBase2, undefined, OWNER_NONADMIN);
+          const vibNa = gNa.status === 200 && gNa.data ? (gNa.data.items || []).find((i) => i.itemKey === vibKey) : null;
+          ok(!!vibNa && !!vibNa.ownerRetry && vibNa.ownerRetry.allowed === false && vibNa.ownerRetry.reason === 'ambiguous_paid_result' && vibNa.ownerRetry.windowHours === 24,
+            'E24b-R65: el dueño NO admin ve el veredicto del servidor (ownerRetry.allowed=false, ambiguous_paid_result) en la parte con resultado ambiguo', { s: gNa.status, or: vibNa && vibNa.ownerRetry });
+          const rtNa = await api('POST', `${runsBase2}/items/${encodeURIComponent(vibKey)}/retry`, {}, OWNER_NONADMIN);
+          const [vibNaRow] = await q(`select status, error from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [c2.runId, vibKey]);
+          ok(rtNa.status === 409 && /ambiguous_paid_result/.test(String(rtNa.error || '')) && vibNaRow && vibNaRow.status === 'failed' && fake.st.requests.length === nReq0,
+            'E24b-R65: el reintento del dueño NO admin de esa parte → 409 ambiguous_paid_result; la parte sigue failed y no hubo llamadas nuevas', { s: rtNa.status, e: rtNa.error, st: vibNaRow && vibNaRow.status });
           const rt = await api('POST', `${runsBase2}/items/${encodeURIComponent(vibKey)}/retry`, {});
           ok(rt.status === 200 || rt.status === 201, 'E24b-R1: el dueño reintenta SOLO la parte pendiente (POST …/items/:itemKey/retry)', { s: rt.status, e: rt.error });
           const endR1 = await waitFor('E24b-R1: run cerrado tras el reintento', async () => {
