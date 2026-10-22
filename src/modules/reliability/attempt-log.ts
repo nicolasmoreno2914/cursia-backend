@@ -13,7 +13,7 @@
 // - Solo REGISTRA. Ninguna decisión de recuperación lee estas columnas todavía (eso es R3).
 // ─────────────────────────────────────────────────────────────────────────────
 import { returningRows } from '../../common/db/returning-rows';
-import type { FailureVerdict } from './failure-classifier';
+import type { FailureVerdict, HumanReason } from './failure-classifier';
 
 export type AttemptOutcome = 'completed' | 'failed' | 'lease_expired' | 'drained' | 'abandoned' | 'reopened';
 export const ATTEMPT_OUTCOMES: readonly AttemptOutcome[] = Object.freeze(['completed', 'failed', 'lease_expired', 'drained', 'abandoned', 'reopened'] as AttemptOutcome[]);
@@ -164,6 +164,14 @@ export async function openItemAttempt(
 
 /** Complete: cierra el intento y limpia el último fallo del item (failure_class null = sin fallo). */
 export async function recordItemCompleted(qr: Queryable, itemRunId: string): Promise<void> {
+  // r67 (A3): una parte que pasó por una recuperación deja su estado final explícito (las demás no se tocan).
+  await qr.query(
+    `update public.generation_item_runs
+        set output_summary = output_summary || jsonb_build_object('recovery',
+              (output_summary->'recovery') || jsonb_build_object('state', 'completed', 'nextRetryAt', null, 'at', now()))
+      where id = $1 and jsonb_typeof(output_summary->'recovery') = 'object'`,
+    [itemRunId],
+  );
   if (!(await relSchemaReady(qr))) return;
   await qr.query(
     `update public.generation_item_runs
@@ -190,6 +198,18 @@ export interface FailureTransition {
   maxRoundsToday: number;
   /** Desenlace según la TRANSICIÓN (barrido → lease_expired, drain del worker → drained); default failed. */
   outcome?: AttemptOutcome;
+  /**
+   * r67 (A3, huérfanos): motivo humano FORZADO cuando la parte quedó `failed` sin ninguna recuperación automática
+   * programada y sin motivo (p. ej. clase B sin rondas): nunca un `failed` sin dueño.
+   */
+  attentionOverride?: HumanReason | null;
+}
+
+/** r67: attention_reason que corresponde a una transición de fallo (misma regla que recordItemFailure). */
+export function failureAttentionOf(status: string, v: FailureVerdict, maxRoundsToday: number): HumanReason | null {
+  const terminal = status === 'failed' || status === 'blocked';
+  const pendingAuto = v.strategy === 'auto_resubmit_once' && maxRoundsToday > 0;
+  return terminal && (v.class === 'C' || v.class === 'D') && !pendingAuto ? (v.humanReason ?? 'unrecoverable') : null;
 }
 
 /**
@@ -199,12 +219,11 @@ export interface FailureTransition {
 export async function recordItemFailure(qr: Queryable, t: FailureTransition): Promise<void> {
   if (!(await relSchemaReady(qr))) return;
   const v = t.verdict;
-  const terminal = t.status === 'failed' || t.status === 'blocked';
   // attention_reason solo cuando el item quedó en manos de un humano (clase C/D terminal).
   // r62 (K6): un C cuyo único reenvío automático acotado todavía va a ocurrir (auto_resubmit_once con ronda disponible)
   // no está en manos de un humano: sin attention_reason. Si el barrido lo rechaza, registra el motivo explícito.
-  const pendingAuto = v.strategy === 'auto_resubmit_once' && t.maxRoundsToday > 0;
-  const attention = terminal && (v.class === 'C' || v.class === 'D') && !pendingAuto ? (v.humanReason ?? 'unrecoverable') : null;
+  // r67 (A3): una parte A/B `failed` sin ninguna recuperación automática programada → 'unrecoverable' (attentionOverride).
+  const attention = failureAttentionOf(t.status, v, t.maxRoundsToday) ?? (t.status === 'failed' ? t.attentionOverride ?? null : null);
   // C1: el desenlace sale de la transición, nunca del código (que un ejecutor podría reportar).
   const outcome = t.outcome ?? 'failed';
   const reported = v.reportedCode ? String(v.reportedCode).slice(0, 64) : null;

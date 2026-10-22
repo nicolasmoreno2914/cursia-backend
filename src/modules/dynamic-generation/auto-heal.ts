@@ -45,6 +45,7 @@ import {
   SafeAutoRetryRule,
 } from '../reliability/auto-heal-rules';
 import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
+import { remainingAudioStrategies } from '../../package/audio/audiobook-policy';
 import { PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 // REL MVP: la decisión por clase usa el clasificador central (import circular seguro: solo se usa en llamadas).
 import { FailureSource, classifyFailure } from '../reliability/failure-classifier';
@@ -256,6 +257,40 @@ const SEVERITY: Readonly<Record<string, number>> = Object.freeze({ A: 0, B: 1, C
  * → provider_reconciliation_required). Cualquier otro A incierto queda para un humano.
  */
 export const AUTO_HEAL_LEDGER_GUARDED_CODES: readonly string[] = Object.freeze(['lease_expired', 'worker_draining']);
+/** r67 (A3): códigos de audio de un segmento que la reapertura automática resuelve con la escalera A2. */
+export const AUDIO_SEGMENT_REGEN_CODES: readonly string[] = Object.freeze(['AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'TTS_AUDIO_INVALID']);
+/** r67 (A3): tope de rondas automáticas de esos códigos = largo de la escalera A2 (≤ 3). */
+export const AUDIO_SEGMENT_REGEN_MAX_ROUNDS = 3;
+
+/** r67: ¿el fallo de audio quedó registrado por el worker como resultado CONOCIDO y liquidado (mismo código)? */
+export function audioFailureKnownAndSettled(error: string, os: Record<string, any>): boolean {
+  const code = String(error ?? '').split(':')[0].trim();
+  const known = String(os?.knownPaidFailure ?? '');
+  return !!code && known.split(':')[0].trim() === code;
+}
+
+/** r67: segmento citado en un error de audio («el segmento seg-2-0-efcc…»). */
+export function audioSegmentKeyOfError(error: string): string | null {
+  const m = /\b(seg-\d+-(?:x\d+-)?\d+-[0-9a-f]{12})\b/.exec(String(error ?? ''));
+  return m ? m[1] : null;
+}
+
+/** r67: estrategias de la escalera A2 que le quedan al segmento del error (null = no aplica / sin segmento). */
+export function audioStrategiesLeftOf(error: string, os: Record<string, any>): number | null {
+  const key = audioSegmentKeyOfError(error);
+  if (!key) return null;
+  const st = os?.audioRetryStrategy?.[key] ?? null;
+  const model = String(Object.values((os?.audioSegments ?? {}) as Record<string, any>).find((g) => g && g.model)?.model ?? 'gpt-4o-mini-tts');
+  if (st && st.exhausted === true) return 0;
+  return remainingAudioStrategies(st, null, model);
+}
+
+/** r67: tope de rondas de regeneración automática (clase B) para un tipo y código. */
+export function autoRegenMaxRoundsFor(type: string | null | undefined, code: string | null | undefined, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): number {
+  if (type === 'audiobook_chapter' && code && AUDIO_SEGMENT_REGEN_CODES.includes(code)) return AUDIO_SEGMENT_REGEN_MAX_ROUNDS;
+  return Math.max(0, Math.floor(policy.regenMaxRounds ?? 0));
+}
+
 /**
  * r19 (#642): códigos B de un item de WORKER que la reapertura regenera solos (clase B, regenerate_targeted,
  * regenMaxRounds). Solo las validaciones del GUION del audiolibro: el worker las marca con resultado CONOCIDO
@@ -265,7 +300,12 @@ export const AUTO_HEAL_LEDGER_GUARDED_CODES: readonly string[] = Object.freeze([
  * la deny-list; su único reenvío automático es el de #583), y el re-claim pasa por priorPaidBlock del worker.
  */
 export const AUTO_REGEN_WORKER_CODES: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  audiobook_chapter: Object.freeze(['AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SCRIPT_REPETITION', 'AUDIOBOOK_SECTION_TRUNCATED']),
+  audiobook_chapter: Object.freeze(['AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SCRIPT_REPETITION', 'AUDIOBOOK_SECTION_TRUNCATED',
+    // r67 (A3): causa verificada de R1-bis (`not_allow_listed`). Segmento de TTS con ritmo fuera de banda, audio duplicado
+    // o MP3 inválido: SOLO con resultado CONOCIDO y liquidado (el worker los marca knownOutcome: knownPaidFailure). Cada
+    // ronda pasa por los guards FinOps del worker (presupuesto de la parte, tope del run) y aplica la estrategia SIGUIENTE
+    // de la escalera A2 (output_summary.audioRetryStrategy); los segmentos ya guardados se reutilizan (nunca se repagan).
+    ...AUDIO_SEGMENT_REGEN_CODES]),
 });
 /** Estrategias B que la reapertura resuelve (regenerar el MISMO item); regenerate_dependency necesita otro item. */
 const AUTO_REGEN_STRATEGIES: readonly string[] = Object.freeze(['regenerate_targeted', 'regenerate_split']);
@@ -337,7 +377,12 @@ function classAwareDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy)
     if (!AUTO_REGEN_STRATEGIES.includes(strategy)) return { heal: false, reason: 'not_allow_listed' };
     const rule: AutoHealRule = { code: v.code, match: /^/, why: `clase B (${v.rule}): regenerar solo el componente` };
     const rounds = autoRegenRoundsOf(os);
-    if (rounds >= Math.max(0, Math.floor(policy.regenMaxRounds ?? 0))) return { heal: false, reason: 'cap_reached', rule };
+    // r67 (A3): audio de un segmento → solo con resultado conocido y liquidado, y mientras le queden estrategias A2.
+    if (row.type === 'audiobook_chapter' && AUDIO_SEGMENT_REGEN_CODES.includes(v.code)) {
+      if (!audioFailureKnownAndSettled(error, os)) return { heal: false, reason: 'not_allow_listed', rule };
+      if (v.code === 'AUDIO_WPM_OUT_OF_RANGE' && audioStrategiesLeftOf(error, os) === 0) return { heal: false, reason: 'cap_reached', rule };
+    }
+    if (rounds >= autoRegenMaxRoundsFor(row.type, v.code, policy)) return { heal: false, reason: 'cap_reached', rule };
     if (failedAt && now.getTime() - failedAt.getTime() > policy.maxAgeHours * 3_600_000) return { heal: false, reason: 'too_old', rule };
     if (failedAt) {
       const retryAt = new Date(failedAt.getTime() + autoHealWaitSeconds(policy.regenBackoffSeconds ?? [], rounds, ratio, `${seed}:B`) * 1000);
