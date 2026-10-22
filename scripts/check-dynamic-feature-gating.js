@@ -1026,7 +1026,9 @@ async function runWorkerProcess(script, env, { waitMs }) {
           await p;
           assert(state.targetUpdated, 'no reintentó el item');
         } else {
-          await rejects(p, ForbiddenException, /video real/i, 'debería ser 403 (video real no habilitado)');
+          // r65: con resubmitVideo un dueño que NO es SUPER_ADMIN cae antes en admin_recovery_only (reenviar trabajo pagado es
+          // de admin); sin resubmit, en «video real no habilitado». Los dos son 403 y ninguno toca la DB.
+          await rejects(p, ForbiddenException, m.resubmit ? /admin_recovery_only|video real/i : /video real/i, m.resubmit ? 'debería ser 403 (reenvío pagado solo admin / video real no habilitado)' : 'debería ser 403 (video real no habilitado)');
           assert(!state.targetUpdated && !state.runReopened, 'mutó DB pese al 403');
         }
       }));
