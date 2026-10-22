@@ -58,7 +58,7 @@ export type OwnerRetryReason =
 export interface OwnerRetryView {
   allowed: boolean;
   reason: OwnerRetryReason | null;
-  /** Peor caso de la parte en una ventana nueva (itemHardLimit), USD con 2 decimales (redondeo hacia arriba). */
+  /** Peor caso de la parte en una ventana nueva (itemHardLimit + una llamada), USD con 2 decimales (redondeo hacia arriba). */
   maxCostUsd: string | null;
   retriesLeft: number;
   windowHours: number;
@@ -73,8 +73,11 @@ export interface OwnerRetryView {
  *    reglas de siempre (re-poll y re-subida a YouTube gratis = dueño; volver a renderizar o pagar = solo admin:
  *    admin_recovery_only, resubmitVideo / resubmitProvider, gate de FinOps). Ver IMPL-REPORT r65.
  */
+// r65 fix round 1: `no_item_estimate` tampoco da 409 (las partes A/B sin línea de estimado — runs viejos — conservan su
+// reintento de siempre; el dueño no ve el botón nuevo). `paid_external_unreconciled` da 409 solo si el pedido trae
+// resubmitVideo / resubmitProvider (eso ya es solo de admin: admin_recovery_only antes de llegar acá).
 export const OWNER_RETRY_ENFORCED_REASONS: ReadonlySet<OwnerRetryReason> = new Set<OwnerRetryReason>([
-  'ambiguous_paid_result', 'open_reservations', 'no_item_estimate', 'run_budget_insufficient', 'policy_cap_reached', 'owner_retry_limit',
+  'ambiguous_paid_result', 'open_reservations', 'run_budget_insufficient', 'policy_cap_reached', 'owner_retry_limit',
 ]);
 
 function sourceOfType(type: string | null | undefined): 'video_worker' | 'provider_worker' | 'browser_executor' {
@@ -135,7 +138,7 @@ export interface OwnerRetryInput {
   paidType: boolean;
   /** Tipo de proveedor pagado con trabajo externo ya enviado o sin conciliar (o duda). */
   paidExternalUnreconciled: boolean;
-  /** itemHardLimit de la parte en una ventana nueva (null = sin estimado). */
+  /** Peor caso de la parte en una ventana nueva: itemHardLimit + una llamada (null = sin estimado). */
   maxCostUsd: number | null;
   /** Saldo del run: autorizado − gastado (null = sin autorización vigente). */
   runRemainingUsd: number | null;
@@ -151,20 +154,23 @@ export function ownerRetryVerdict(i: OwnerRetryInput): OwnerRetryView {
   const base = { maxCostUsd: max === null ? null : (Math.ceil(max * 100 - 1e-9) / 100).toFixed(2), retriesLeft, windowHours: OWNER_RETRY_WINDOW_HOURS };
   const no = (reason: OwnerRetryReason): OwnerRetryView => ({ ...base, allowed: false, reason });
   if (i.status !== 'failed') return no('not_failed');
-  // Proveedor pagado con trabajo externo ya enviado o una reserva abierta (p. ej. el render de un video_timeout que se
-  // re-pollea gratis, o un render fallido que habría que volver a pagar) → sin botón del dueño; lo siguen gobernando las
-  // reglas de siempre de esos tipos (re-poll / re-subida = dueño; volver a pagar = solo admin). Va antes que la
-  // ambigüedad: un video ambiguo ya es solo de admin por esas reglas.
-  if (i.paidType && (i.paidExternalUnreconciled || i.openReservations > 0)) return no('paid_external_unreconciled');
+  // r65 fix round 1: el límite de 2 reintentos en 24 h va ANTES de la lista de códigos (vale para todo reintento del
+  // dueño que reinicia el tope de la parte, también los de códigos fuera de la lista).
+  if (retriesLeft <= 0) return no('owner_retry_limit');
   const code = ownerRetryCodeEligibility(i.verdict);
+  // r65 fix round 1: la ambigüedad va ANTES que el trabajo externo pagado (gamma_submit_ambiguous,
+  // provider_reconciliation_required, videogen_failed… → ambiguous_paid_result, que el servidor rechaza al dueño).
   if (code === 'ambiguous_paid_result') return no(code);
+  // Proveedor pagado con trabajo externo ya enviado o una reserva abierta (p. ej. el render de un video_timeout que se
+  // re-pollea gratis) → sin botón del dueño; lo siguen gobernando las reglas de siempre de esos tipos (re-poll /
+  // re-subida = dueño; volver a pagar = solo admin).
+  if (i.paidType && (i.paidExternalUnreconciled || i.openReservations > 0)) return no('paid_external_unreconciled');
   // IA: una reserva abierta es un resultado desconocido → el dueño no reintenta (podría pagarla dos veces).
   if (i.openReservations > 0) return no('open_reservations');
   if (code !== 'ok') return no(code);
   if (max === null) return no('no_item_estimate');
   if (i.runRemainingUsd === null || i.runRemainingUsd + 1e-9 < max) return no('run_budget_insufficient');
   if (i.policyBlockedBy) return no('policy_cap_reached');
-  if (retriesLeft <= 0) return no('owner_retry_limit');
   return { ...base, allowed: true, reason: null };
 }
 

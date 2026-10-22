@@ -195,7 +195,8 @@ import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned, rel
 import { FailureProvider } from '../reliability/failure-classifier';
 // r65: reintento seguro del dueño + ronda automática extra de una parte que agotó su tope (owner-retry.ts).
 import {
-  AUTO_BUDGET_EXTENSION_KEY, AUTO_BUDGET_EXTENSION_STRATEGY, BudgetScope, OWNER_RETRIES_KEY, OWNER_RETRY_ENFORCED_REASONS, OwnerRetryView,
+  AUTO_BUDGET_EXTENSION_KEY, AUTO_BUDGET_EXTENSION_STRATEGY, BudgetScope, OWNER_RETRIES_KEY, OWNER_RETRY_ENFORCED_REASONS, OWNER_RETRY_MAX,
+  OWNER_RETRY_WINDOW_HOURS, OwnerRetryView,
   autoBudgetExtensionOf, budgetScopeOf, isItemBudgetExhausted, itemFailureVerdict, nextOwnerRetries, ownerRetriesUsed, ownerRetryVerdict,
 } from './owner-retry';
 import { unknownReservations } from '../../workers/llm-executor/server-llm';
@@ -2488,6 +2489,13 @@ export class RunsService {
     // Fix round 1 (I2): un SUPER_ADMIN reintenta sobre el run del dueño real del curso (FinOps, YouTube
     // y ownership se evalúan contra ese dueño); queda registrado quién actuó.
     const actorId = actor?.id ?? ownerId;
+    // r65 fix round 1: un reenvío explícito a un proveedor (resubmitVideo / resubmitProvider) vuelve a pagar un trabajo
+    // externo ya enviado, posiblemente ambiguo → herramienta de recuperación de un SUPER_ADMIN (antes el dueño podía
+    // mandar {resubmitProvider:true} y re-pagar un envío ambiguo de Gamma/OpenAI). Los reenvíos automáticos (auto) siguen
+    // con sus propias reglas.
+    if (!auto && (resubmitProvider || resubmitVideo) && !isSuperAdminEmail(actor?.email)) {
+      throw adminRecoveryForbidden(resubmitVideo ? 'Volver a generar un video (con costo)' : 'Volver a pedir un trabajo pagado al proveedor (con costo)');
+    }
     if (!auto && actor) ownerId = await this.ownerForActor(courseId, ownerId, actor);
     // G3 (fix wave / review I1): un retry es un entry point como cualquier
     // otro — requiere la allow-list de V2, antes de tocar manifest o run.
@@ -2656,20 +2664,32 @@ export class RunsService {
       // update): reservas abiertas, resultado ambiguo, saldo del run para el peor caso de la parte, topes del mes y el
       // límite de 2 reintentos en 24 h. Un motivo de dinero → 409 {code} sin cambiar nada. Dos clics simultáneos: el
       // segundo espera el lock y ve la parte ya `pending` (409), así se consume UN reintento y se abre UNA ventana.
-      if (!auto && actor && !isSuperAdminEmail(actor.email) && target.status === 'failed') {
+      // r65 fix round 1: TODO reintento manual del dueño reinicia el tope de la parte (recoveryBudgetResetAt) → todos cuentan
+      // en ownerRetries y el límite de 2 en 24 h se aplica ANTES de la lista de códigos (también a un D fuera de la lista
+      // o a una parte bloqueada por presupuesto). Los actores no SUPER_ADMIN comparten el límite del dueño.
+      if (!auto && actor && !isSuperAdminEmail(actor.email) && (target.status === 'failed' || isBudgetBlocked(target))) {
         const [fullRow] = await qr.query(`select * from public.generation_item_runs where id = $1`, [target.id]);
         const now = new Date();
-        const v = fullRow ? await this.ownerRetryOf(qr, { id: String(job.id), course_id: courseId, owner_id: ownerId, worker_status: locked.worker_status }, fullRow, now) : null;
-        if (v && !v.allowed && v.reason && OWNER_RETRY_ENFORCED_REASONS.has(v.reason)) {
-          throw new ConflictException({
-            code: v.reason, ownerRetry: v,
-            message: `${v.reason}: el reintento de "${itemKey}" no se hizo (no se cambió nada).` +
-              (v.reason === 'owner_retry_limit' ? ' Ya usaste los reintentos de esta parte en las últimas 24 h; el equipo de Cursia la revisará.'
-                : v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached' ? ' El saldo autorizado no cubre el costo máximo de esta parte: hace falta ampliar la autorización.'
+        const conflict = (v: OwnerRetryView) => new ConflictException({
+          code: v.reason, ownerRetry: v,
+          message: `${v.reason}: el reintento de "${itemKey}" no se hizo (no se cambió nada).` +
+            (v.reason === 'owner_retry_limit' ? ' Ya usaste los reintentos de esta parte en las últimas 24 h; el equipo de Cursia la revisará.'
+              : v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached' ? ' El saldo autorizado no cubre el costo máximo de esta parte: hace falta ampliar la autorización.'
+                : v.reason === 'open_reservations' ? ' Hay un cobro de esta parte pendiente de confirmar; Cursia lo concilia antes de reintentar.'
                   : ' Hay un cobro sin conciliar o un resultado ambiguo: el equipo de Cursia lo revisa.'),
-          });
+        });
+        const used = ownerRetriesUsed(fullRow?.output_summary, now);
+        if (used >= OWNER_RETRY_MAX) {
+          throw conflict({ allowed: false, reason: 'owner_retry_limit', maxCostUsd: null, retriesLeft: 0, windowHours: OWNER_RETRY_WINDOW_HOURS });
         }
-        if (v && v.allowed) ownerRetriesNext = nextOwnerRetries(fullRow.output_summary, now, String(actorId));
+        if (target.status === 'failed' && fullRow) {
+          const v = await this.ownerRetryOf(qr, { id: String(job.id), course_id: courseId, owner_id: ownerId, worker_status: locked.worker_status }, fullRow, now, { lockMonth: true });
+          if (v && !v.allowed && v.reason && (OWNER_RETRY_ENFORCED_REASONS.has(v.reason)
+            || (v.reason === 'paid_external_unreconciled' && (resubmitVideo || resubmitProvider)))) {
+            throw conflict(v);
+          }
+        }
+        ownerRetriesNext = nextOwnerRetries(fullRow?.output_summary, now, String(actorId));
       }
       // R16 (#2): la política del auto-healer se re-evalúa con la fila bloqueada (otro barrido, un retry
       // manual o un fallo nuevo pudieron cambiarla entre la lectura y este lock).
@@ -2752,8 +2772,9 @@ export class RunsService {
           : autoBudgetExtensionOf(target.output_summary) ? 'already_extended'
             : paidProviderOfItemType(target.type) ? 'paid_provider' : null;
         const v = why || !fullRow ? null
-          : await this.ownerRetryOf(qr, { id: String(job.id), course_id: courseId, owner_id: ownerId, worker_status: locked.worker_status }, fullRow, auto.now ?? new Date());
-        const ok = !!v && (v.allowed || v.reason === 'owner_retry_limit');
+          : await this.ownerRetryOf(qr, { id: String(job.id), course_id: courseId, owner_id: ownerId, worker_status: locked.worker_status }, fullRow, auto.now ?? new Date(),
+            { lockMonth: true, ignoreLimit: true, extension: true });
+        const ok = !!v && v.allowed;
         if (!ok) {
           const reason = why ?? (v ? v.reason : 'finops_unavailable');
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (budget_extension: ${reason})`, code: 'auto_heal_not_eligible', reason });
@@ -3862,20 +3883,32 @@ export class RunsService {
    * r65 (R2): veredicto del reintento del dueño para UNA fila (`select *` de generation_item_runs) sobre `q` (la conexión
    * de la transacción del retry, con las filas bloqueadas, o el pool en la vista del run). null = sin FinOps (harness).
    */
-  private async ownerRetryOf(q: { query: (sql: string, params?: any[]) => Promise<any> }, job: { id: string; course_id: number; owner_id: string; worker_status?: string | null }, r: any, now: Date = new Date()): Promise<OwnerRetryView | null> {
+  private async ownerRetryOf(
+    q: { query: (sql: string, params?: any[]) => Promise<any> }, job: { id: string; course_id: number; owner_id: string; worker_status?: string | null }, r: any, now: Date = new Date(),
+    /**
+     * r65 fix round 1: `ctx` = datos del run ya leídos (la vista del run los lee UNA vez); `lockMonth` toma MONTH_CAP_LOCK
+     * (dentro de la tx del retry); `ignoreLimit` = la ronda R4 (el límite del dueño no aplica); `extension` = la llamada
+     * siguiente reserva con max_tokens × 1,5 (R4 o su marca persistida; por defecto, la marca de la fila).
+     */
+    opts: { ctx?: Awaited<ReturnType<FinopsBudgetService['ownerRetryRunContext']>>; lockMonth?: boolean; ignoreLimit?: boolean; extension?: boolean } = {},
+  ): Promise<OwnerRetryView | null> {
     if (!this.finopsBudget) return null;
     const verdict = itemFailureVerdict(r);
-    const used = ownerRetriesUsed(r.output_summary, now);
+    const used = opts.ignoreLimit ? 0 : ownerRetriesUsed(r.output_summary, now);
     if (r.status !== 'failed') {
       return ownerRetryVerdict({ status: String(r.status), verdict, openReservations: 0, paidType: false, paidExternalUnreconciled: false, maxCostUsd: null, runRemainingUsd: null, policyBlockedBy: null, ownerRetriesUsed24h: used });
     }
     const openReservations = await this.openItemReservations(q, r);
     const paidType = paidProviderOfItemType(String(r.type)) !== null;
     const paidExternal = await this.paidExternalUnreconciled(q, r);
-    const b = await this.finopsBudget.ownerRetryBudget({
-      runId: String(job.id), itemKey: String(r.item_key), itemType: String(r.type), courseId: Number(job.course_id), ownerId: String(job.owner_id),
-      runLive: ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')),
+    const ctx = opts.ctx ?? await this.finopsBudget.ownerRetryRunContext({
+      runId: String(job.id), courseId: Number(job.course_id), ownerId: String(job.owner_id),
+      runLive: ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')), lockMonth: !!opts.lockMonth,
     }, q);
+    const b = await this.finopsBudget.ownerRetryBudget({
+      runId: String(job.id), itemKey: String(r.item_key), itemType: String(r.type),
+      extension: opts.extension ?? !!autoBudgetExtensionOf(r.output_summary),
+    }, ctx, q);
     return ownerRetryVerdict({
       status: String(r.status), verdict, openReservations, paidType, paidExternalUnreconciled: paidExternal,
       maxCostUsd: b.maxCostUsd, runRemainingUsd: b.runRemainingUsd, policyBlockedBy: b.policyBlockedBy, ownerRetriesUsed24h: used,
@@ -6371,11 +6404,17 @@ export class RunsService {
     // r65 (R1/R2): alcance del motivo de presupuesto (con la pausa del run por su tope) y veredicto del reintento del
     // dueño en cada ítem failed. Nunca rompe la lectura: un error deja ownerRetry null (el FE cae al comportamiento previo).
     const pauseReason = isPausedRun(job) ? (job.output_summary?.pause?.reason ?? null) : null;
+    // r65 fix round 1: autorización, gasto, política y totales del mes UNA vez por request (no por parte fallida).
+    let runCtx: Awaited<ReturnType<FinopsBudgetService['ownerRetryRunContext']>> | undefined;
     for (let i = 0; i < rows.length; i++) {
       itemDtos[i].budgetScope = budgetScopeOf(rows[i], pauseReason);
       if (rows[i].status !== 'failed') continue;
       try {
-        const v = await this.ownerRetryOf(this.dataSource, job, rows[i]);
+        if (!runCtx && this.finopsBudget) {
+          runCtx = await this.finopsBudget.ownerRetryRunContext({ runId: String(job.id), courseId: Number(job.course_id), ownerId: String(job.owner_id),
+            runLive: ACTIVE_RUN_WORKER_STATUSES.includes(String(job.worker_status ?? '')) });
+        }
+        const v = await this.ownerRetryOf(this.dataSource, job, rows[i], new Date(), { ctx: runCtx });
         itemDtos[i].ownerRetry = v;
         // R2.4: sin saldo del run para el peor caso de la parte, el texto es el de ampliar la autorización.
         if (v && (v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached')) itemDtos[i].budgetScope = 'run';

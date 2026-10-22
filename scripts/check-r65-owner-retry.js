@@ -291,12 +291,23 @@ async function dbChecks() {
       await failWith(it.id, budgetMsg());
       return itemOf(C, key);
     }
-    async function expectedMax(C, key) {
-      const est = await budget.runItemEstimates(C.runId);
-      const e = est.byKey.get(key);
-      const [lg] = await ds.query(`select coalesce(max(amount) filter (where event_kind = 'CHARGE' and (metadata->>'reservation') = 'true'), 0)::text as l from public.generation_cost_events where run_id = $1 and item_key = $2`, [C.runId, key]);
-      const hard = G.itemHardLimit(e.expected, e.max, Number(lg.l));
-      return { hard, str: (Math.ceil(hard * 100 - 1e-9) / 100).toFixed(2) };
+    // r65 fix round 1: gasto de la parte en su ventana vigente (desde el último reinicio del presupuesto).
+    async function windowSpent(C, key) {
+      const it = await itemOf(C, key);
+      const [r] = await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events
+         where run_id = $1 and item_key = $2 and billing_account <> 'user_key'
+           and created_at >= greatest($3::timestamptz, coalesce(nullif($4, '')::timestamptz, $3::timestamptz))`,
+        [C.runId, key, it.created_at, (it.output_summary && it.output_summary.recoveryBudgetResetAt) || '']);
+      return Number(r.t);
+    }
+    // Simula el PEOR caso real contra el guard: llamadas cuya reserva queda pendiente (cuenta la cota entera) hasta que
+    // el guard niega. Devuelve lo gastado en la ventana nueva.
+    async function burnUntilDenied(C, key, o = {}) {
+      const it = await itemOf(C, key);
+      let denial = null; let calls = 0;
+      for (let i = 0; i < 40 && !denial; i++) { const r = await proxyCall(it.id, { outcome: 'unknown', ...o }); if (r.denied) denial = r.denied; else calls++; }
+      assert(denial && denial.code === 'item_recovery_budget_exhausted', 'el guard terminó negando por el tope de la parte: ' + JSON.stringify(denial));
+      return { spent: await windowSpent(C, key), calls };
     }
     const setAuthorized = (C, amount) => ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, decision, approved_by, reason)
       values ($1, $2, $3, 'ADMIN_APPROVED', 'admin@cursia.test', 'r65: saldo del run')`, [C.runId, C.cid, amount]);
@@ -305,12 +316,12 @@ async function dbChecks() {
     // ── 1 · veredicto allowed + reintento del dueño ─────────────────────────────
     const A1 = await makeCourse('r65 dueño');
     const kA = `content:${A1.c1}`;
-    await check('1 · dueño con item_recovery_budget_exhausted, 0 reservas abiertas y saldo: allowed, maxCostUsd = tope de la parte; retryItem del dueño reabre, reinicia el tope de la parte y registra ownerRetries', async () => {
+    await check('1 · dueño con item_recovery_budget_exhausted, 0 reservas abiertas y saldo: allowed (maxCostUsd > 0; su peor caso real lo prueba fix1); retryItem del dueño reabre, reinicia el tope de la parte y registra ownerRetries', async () => {
       const row = await exhaust(A1, kA);
       const d = await dtoItem(A1, kA);
-      const exp = await expectedMax(A1, kA);
       assert(d.ownerRetry && d.ownerRetry.allowed === true && d.ownerRetry.reason === null, 'allowed: ' + JSON.stringify(d.ownerRetry));
-      eq([d.ownerRetry.maxCostUsd, d.ownerRetry.retriesLeft, d.ownerRetry.windowHours], [exp.str, 2, 24], 'maxCostUsd / retriesLeft / ventana');
+      assert(Number(d.ownerRetry.maxCostUsd) > 0, 'maxCostUsd: ' + d.ownerRetry.maxCostUsd);
+      eq([d.ownerRetry.retriesLeft, d.ownerRetry.windowHours], [2, 24], 'retriesLeft / ventana');
       eq(d.budgetScope, 'item', 'budgetScope');
       const before = await runSpent(A1);
       const it = await ownerRetry(A1, kA);
@@ -383,9 +394,65 @@ async function dbChecks() {
       await ds.query(`update public.generation_item_runs set status = 'failed', error = 'videogen_failed: render rechazado', finished_at = now(),
         output_summary = (coalesce(output_summary, '{}'::jsonb) - 'delivery' - 'external') || '{"externalSubmitStartedAt":"2026-10-01T00:00:00Z"}'::jsonb where id = $1`, [it.id]);
       const d = await dtoItem(A3, kv);
-      eq([d.ownerRetry.allowed, d.ownerRetry.reason], [false, 'paid_external_unreconciled'], 'veredicto');
+      // fix round 1: la ambigüedad va antes que el trabajo externo → videogen_failed (riesgo de cobro incierto) = ambiguous_paid_result.
+      eq([d.ownerRetry.allowed, d.ownerRetry.reason], [false, 'ambiguous_paid_result'], 'veredicto');
       await rejectsCode(ownerRetry(A3, kv), 'admin_recovery_only', 'retry del dueño');
       eq((await itemOf(A3, kv)).status, 'failed', 'sigue failed');
+      // Un re-poll GRATIS (video_timeout con su job de Videogen) sigue siendo del dueño: paid_external_unreconciled sin 409.
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout: el render sigue en proceso', finished_at = now(),
+        output_summary = (coalesce(output_summary, '{}'::jsonb) - 'delivery' - 'externalSubmitStartedAt') || '{"external":{"videogenJobId":"vg-job-r65"}}'::jsonb where id = $1`, [it.id]);
+      const d2 = await dtoItem(A3, kv);
+      eq([d2.ownerRetry.allowed, d2.ownerRetry.reason], [false, 'paid_external_unreconciled'], 'veredicto del re-poll');
+      eq((await ownerRetry(A3, kv)).status, 'pending', 're-poll del dueño permitido');
+    });
+
+    // ── fix round 1 · reenvíos explícitos = solo SUPER_ADMIN ──────────────────
+    await check('fix1 · el dueño NO puede reenviar a un proveedor (resubmitProvider / resubmitVideo → 403 admin_recovery_only); un envío ambiguo de Gamma da ambiguous_paid_result (409) al reintento simple', async () => {
+      const P = await makeCourse('r65 reenvío');
+      const pres = (await ds.query(`select * from public.generation_item_runs where job_id = $1 and type = 'presentation' order by item_key limit 1`, [P.runId]))[0];
+      assert(pres, 'el curso tiene una presentación');
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'gamma_submit_ambiguous: no sabemos si Gamma recibió el pedido', finished_at = now(),
+        output_summary = coalesce(output_summary, '{}'::jsonb) || '{"externalSubmitStartedAt":"2026-10-01T00:00:00Z"}'::jsonb where id = $1`, [pres.id]);
+      const d = await dtoItem(P, pres.item_key);
+      eq([d.ownerRetry.allowed, d.ownerRetry.reason], [false, 'ambiguous_paid_result'], 'veredicto (ambigüedad antes que el trabajo externo)');
+      const r1 = await rejectsCode(runs.retryItem(P.cid, OWNER, 1, P.runId, pres.item_key, false, true, undefined, OWNER_ACTOR), 'admin_recovery_only', 'resubmitProvider del dueño');
+      eq(r1.status, 403, 'HTTP 403');
+      const kv = `video:${P.c1}`;
+      await rejectsCode(runs.retryItem(P.cid, OWNER, 1, P.runId, kv, true, false, undefined, OWNER_ACTOR), 'admin_recovery_only', 'resubmitVideo del dueño');
+      await rejectsCode(ownerRetry(P, pres.item_key), 'ambiguous_paid_result', 'reintento simple del dueño');
+      eq((await itemOf(P, pres.item_key)).status, 'failed', 'nada cambió');
+      const ad = await runs.retryItem(P.cid, OWNER, 1, P.runId, pres.item_key, false, true, undefined, ADMIN_ACTOR);
+      eq(ad.status, 'pending', 'el SUPER_ADMIN sí reenvía');
+    });
+
+    // ── fix round 1 · el límite vale también fuera de la lista ────────────────
+    await check('fix1 · un D FUERA de la lista (sin botón, endpoint de siempre): el 3.er reintento del dueño en 24 h → 409 owner_retry_limit', async () => {
+      const L = await makeCourse('r65 límite fuera de lista');
+      const kL = `content:${L.c1}`;
+      const it = await itemOf(L, kL);
+      for (let n = 1; n <= 2; n++) {
+        await failWith(it.id, 'config rota: algo raro del ejecutor');
+        const d = await dtoItem(L, kL);
+        eq([d.ownerRetry.allowed, d.ownerRetry.reason], [false, 'failure_not_owner_retryable'], 'sin botón (' + n + ')');
+        eq((await ownerRetry(L, kL)).status, 'pending', 'el endpoint lo acepta como antes (' + n + ')');
+      }
+      await failWith(it.id, 'config rota: algo raro del ejecutor');
+      eq((await dtoItem(L, kL)).ownerRetry.reason, 'owner_retry_limit', 'el veredicto ya muestra el límite');
+      await rejectsCode(ownerRetry(L, kL), 'owner_retry_limit', '3.er reintento');
+      eq([(await itemOf(L, kL)).status, ((await itemOf(L, kL)).output_summary.ownerRetries || []).length], ['failed', 2], 'nada cambió');
+    });
+
+    // ── fix round 1 · maxCostUsd cubre el peor caso REAL del guard ─────────────
+    await check('fix1 · el peor caso real de una ventana nueva (llamadas pendientes hasta que el guard niega) ≤ maxCostUsd', async () => {
+      const S = await makeCourse('r65 peor caso');
+      const kS = `content:${S.c1}`;
+      await exhaust(S, kS);
+      const d = await dtoItem(S, kS);
+      assert(d.ownerRetry.allowed, JSON.stringify(d.ownerRetry));
+      await ownerRetry(S, kS);
+      const b = await burnUntilDenied(S, kS);
+      assert(b.calls >= 1 && b.spent <= Number(d.ownerRetry.maxCostUsd) + 1e-9, `gastado en la ventana USD ${b.spent.toFixed(4)} (${b.calls} llamadas) ≤ maxCostUsd ${d.ownerRetry.maxCostUsd}`);
+      console.log(`   peor caso: USD ${b.spent.toFixed(4)} en ${b.calls} llamadas; maxCostUsd ${d.ownerRetry.maxCostUsd}`);
     });
 
     // ── 6 · saldo del run insuficiente ─────────────────────────────────────────
@@ -470,6 +537,19 @@ async function dbChecks() {
         await exhaust(Bw, kBw);
         const s4 = await runs.autoExtendItemRecoveryBudget({ now: new Date() });
         assert(s4.skipped.some((x) => x.itemKey === kBw && x.reason === 'not_server_routed') && (await itemOf(Bw, kBw)).status === 'failed', 'navegador: ' + JSON.stringify(s4));
+        // fix round 1: el peor caso REAL de la ronda extra (llamadas con max_tokens × 1,5, pendientes, hasta que el guard
+        // niega) ≤ la marca maxCostUsd que se usó contra el saldo del run.
+        await ds.query(`insert into public.llm_worker_presence (worker_id, item_types, last_seen, since) values ('r65-w1', $1, now(), '2000-01-01T00:00:00Z')
+                        on conflict (worker_id) do update set last_seen = now()`, [['content']]);
+        LR.resetLlmWorkerPresenceCacheForTests && LR.resetLlmWorkerPresenceCacheForTests();
+        const W = await makeCourse('r65 R4 peor caso');
+        const kW = `content:${W.c1}`;
+        await exhaust(W, kW);
+        const s5 = await runs.autoExtendItemRecoveryBudget({ now: new Date() });
+        assert(s5.extended.some((x) => x.itemKey === kW), 'ronda extra: ' + JSON.stringify(s5));
+        const markW = (await itemOf(W, kW)).output_summary.autoBudgetExtension;
+        const bW = await burnUntilDenied(W, kW, { maxTokens: 12000 });
+        assert(bW.spent <= Number(markW.maxCostUsd) + 1e-9, `R4: gastado USD ${bW.spent.toFixed(4)} ≤ maxCostUsd ${markW.maxCostUsd}`);
       } finally {
         if (prevFlag === undefined) delete process.env.DYNAMIC_LLM_WORKER_ENABLED; else process.env.DYNAMIC_LLM_WORKER_ENABLED = prevFlag;
       }
@@ -502,6 +582,10 @@ async function dbChecks() {
       eq(OR.ownerRetryVerdict({ ...base, runRemainingUsd: null }).reason, 'run_budget_insufficient', 'sin autorización');
       eq(OR.ownerRetryVerdict({ ...base, policyBlockedBy: 'ownerMonthlyCap' }).reason, 'policy_cap_reached', 'tope mensual');
       eq(OR.ownerRetryVerdict({ ...base, ownerRetriesUsed24h: 1 }).retriesLeft, 1, 'queda 1');
+      eq(OR.ownerRetryVerdict({ ...base, ownerRetriesUsed24h: 2, verdict: v('Falló algo raro') }).reason, 'owner_retry_limit', 'el límite antes que la lista');
+      eq(OR.ownerRetryVerdict({ ...base, paidType: true, paidExternalUnreconciled: true, verdict: v('gamma_submit_ambiguous: x') }).reason, 'ambiguous_paid_result', 'ambigüedad antes que el trabajo externo');
+      eq(OR.ownerRetryVerdict({ ...base, paidType: true, paidExternalUnreconciled: true, verdict: v('video_timeout: x') }).reason, 'paid_external_unreconciled', 're-poll');
+      eq(OR.OWNER_RETRY_ENFORCED_REASONS.has('no_item_estimate'), false, 'no_item_estimate no da 409');
       eq(OR.ownerRetryVerdict({ ...base, status: 'pending' }).reason, 'not_failed', 'no failed');
       const now = new Date();
       eq(OR.ownerRetriesUsed({ ownerRetries: [{ at: new Date(now - 25 * 3600e3).toISOString() }, { at: new Date(now - 3600e3).toISOString() }] }, now), 1, 'solo las de 24 h');
