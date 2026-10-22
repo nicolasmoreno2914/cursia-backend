@@ -142,7 +142,8 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
   if (status !== 'failed') return { state: null, reason: null, nextRetryAt: null, automatic: false };
 
   const cur = error ? currentRecoveryOf(error, row.type ?? null, os, row.failure_class ?? null) : 'manual';
-  const at = scheduledRetryAtOf(row, now) ?? next;
+  // Una fecha persistida VENCIDA no cuenta como «programada» (ningún barrido la tomó): solo la decisión vigente.
+  const at = scheduledRetryAtOf(row, now) ?? (next && next.getTime() > now.getTime() ? next : null);
   const attention = row.attention_reason ?? null;
   const code = error ? classifyFailure({ source: sourceOf(row.type), itemType: row.type ?? null, error, outputSummary: os }).code : null;
   if (cur === 'provider_probe' || (providerProbeViewOf(row as any, now, autoRecoveryEnabled(process.env)))) {
