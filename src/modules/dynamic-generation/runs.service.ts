@@ -3236,7 +3236,7 @@ export class RunsService {
   }
 
   /**
-   * r67 (A3) — huérfanos: partes `failed` (generación vigente, run dinámico no cancelado) sin attention_reason cuya
+   * r67 (A3) — huérfanos (solo runs desde R67_ORPHAN_SWEEP_SINCE, en failed/paused/running): partes `failed` (generación vigente, run dinámico no cancelado) sin attention_reason cuya
    * próxima acción automática no existe o ya venció hace más de 1 h sin que ningún barrido la tomara → si el estado
    * derivado es `failed_no_strategies` (ninguna estrategia segura o espera expirada) → attention 'unrecoverable'.
    * Acotado (limit) e idempotente (solo filas sin motivo). Devuelve los ids marcados.
@@ -3250,14 +3250,16 @@ export class RunsService {
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
         where pj.execution_mode = 'dynamic_generation'
-          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling')
+          -- r67 (PO): nunca toca datos HISTÓRICOS — solo runs creados desde el corte (R67_ORPHAN_SWEEP_SINCE) y vivos o
+          -- fallidos (failed / paused / running); cancelados, completados y preview quedan intactos.
+          and pj.created_at >= $3::timestamptz
+          and coalesce(pj.worker_status, '') in ('failed', 'paused', 'running')
           and g.status = 'failed' and g.attention_reason is null
           and ${latestGenerationPredicate('g')}
           and (g.next_retry_at is null or g.next_retry_at < $1::timestamptz - interval '1 hour')
         order by g.finished_at desc nulls last, g.id
         limit $2`,
-      [now.toISOString(), Math.max(1, Math.floor(limit))],
+      [now.toISOString(), Math.max(1, Math.floor(limit)), orphanSweepSince(process.env).toISOString()],
     );
     const marked: string[] = [];
     for (const r of rows) {
@@ -6723,4 +6725,14 @@ function pauseInfoOf(job: { output_summary?: unknown }): RunDto['pauseInfo'] {
     detail: typeof p.detail === 'string' ? p.detail.slice(0, 500) : null,
     pausedAt: p.pausedAt ? String(p.pausedAt) : null,
   };
+}
+
+
+/** r67 (PO): corte de la pasada de huérfanos — los runs creados antes nunca se tocan (datos históricos intactos). */
+export const R67_ORPHAN_SWEEP_SINCE = '2026-10-22T00:00:00Z';
+export const R67_ORPHAN_SWEEP_SINCE_ENV = 'R67_ORPHAN_SWEEP_SINCE';
+export function orphanSweepSince(env: Record<string, string | undefined> = process.env): Date {
+  const raw = String(env[R67_ORPHAN_SWEEP_SINCE_ENV] ?? '').trim();
+  const d = raw ? new Date(raw) : null;
+  return d && Number.isFinite(d.getTime()) ? d : new Date(R67_ORPHAN_SWEEP_SINCE);
 }

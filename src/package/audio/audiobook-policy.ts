@@ -234,7 +234,11 @@ export function checkAudiobookCourseFloor(chapters: CourseFloorChapter[]): Cours
 export const AUDIOBOOK_WPM_TARGET = 165;
 /** r67: ritmo objetivo al corregir un segmento demasiado LENTO (< AUDIOBOOK_WPM_MIN). */
 export const AUDIOBOOK_WPM_TARGET_SLOW = 125;
-/** r67: límites del factor de atempo (fuera → re-síntesis; una desviación grande puede ser texto omitido, nunca se tapa). */
+/**
+ * r67: límites del factor de atempo (fuera → re-síntesis; una desviación grande puede ser texto omitido, nunca se tapa).
+ * Solo se usa el lado < 1 (frenar): un segmento lento nunca se acelera localmente (ver atempoPlanFor). MAX queda como cota
+ * de `atempoFilterChain`/documentación.
+ */
 export const AUDIOBOOK_ATEMPO_MIN = 0.85;
 export const AUDIOBOOK_ATEMPO_MAX = 1.15;
 /** r67: tolerancia de la duración corregida frente a la esperada (duración original / factor). */
@@ -249,17 +253,22 @@ export interface AtempoPlan {
   targetWpm: number;
   /** factor = objetivo / actual (< 1 frena, > 1 acelera). */
   factor: number;
-  /** ¿El factor cabe en [ATEMPO_MIN, ATEMPO_MAX]? */
+  /** ¿Se permite la corrección local? Solo segmentos RÁPIDOS con factor en [ATEMPO_MIN, 1). */
   withinLimits: boolean;
+  /** r67: segmento demasiado lento (< AUDIOBOOK_WPM_MIN): nunca se corrige localmente. */
+  slow: boolean;
 }
 
 /** r67: plan de corrección local para un ritmo medido fuera de banda; null si el ritmo está dentro de la banda. */
 export function atempoPlanFor(wpm: number): AtempoPlan | null {
   if (!(wpm > 0)) return null;
   if (wpm >= AUDIOBOOK_WPM_MIN && wpm <= AUDIOBOOK_WPM_MAX) return null;
-  const targetWpm = wpm > AUDIOBOOK_WPM_MAX ? AUDIOBOOK_WPM_TARGET : AUDIOBOOK_WPM_TARGET_SLOW;
+  const slow = wpm < AUDIOBOOK_WPM_MIN;
+  const targetWpm = slow ? AUDIOBOOK_WPM_TARGET_SLOW : AUDIOBOOK_WPM_TARGET;
   const factor = Math.round((targetWpm / wpm) * 1e6) / 1e6;
-  return { targetWpm, factor, withinLimits: factor >= AUDIOBOOK_ATEMPO_MIN && factor <= AUDIOBOOK_ATEMPO_MAX };
+  // r67 (decisión del PO): solo se FRENA localmente un segmento demasiado rápido (factor en [0,85; 1)). Un segmento
+  // demasiado LENTO (< 115) nunca se acelera: puede ser relleno/silencio o bucle y acelerarlo lo taparía → re-síntesis.
+  return { targetWpm, factor, slow, withinLimits: !slow && factor >= AUDIOBOOK_ATEMPO_MIN && factor < 1 };
 }
 
 /**

@@ -1540,7 +1540,8 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
           strategy: strat, attempt: item.attempt, rawSha, rawBytes: raw.length, rawSeconds, seconds: info.seconds, wpm,
           requestIds: [...requestIds], storagePath: qStored, ...(qError ? { storageError: qError } : {}), at: new Date().toISOString(),
         }];
-        // r67 (A1.2–A1.6): corrección local (USD 0) si el factor cabe en los límites y la verificación pasa.
+        // r67 (A1.2–A1.6): corrección local (USD 0) SOLO de un segmento rápido, si el factor cabe en [0,85; 1) y la
+        // verificación pasa. Un segmento lento va directo a la escalera de re-síntesis.
         const planA = atempoPlanFor(wpm);
         let problems: string[] = [];
         if (planA && planA.withinLimits) {
@@ -1573,7 +1574,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
             }
           }
         } else {
-          problems = [planA ? `ATEMPO_FACTOR_OUT_OF_LIMITS ${planA.factor}` : 'ATEMPO_NOT_APPLICABLE'];
+          problems = [!planA ? 'ATEMPO_NOT_APPLICABLE' : planA.slow ? `SLOW_SEGMENT_NO_LOCAL_CORRECTION ${wpm}` : `ATEMPO_FACTOR_OUT_OF_LIMITS ${planA.factor}`];
         }
         if (!correction) {
           // r67 (A2): sin corrección local → la PRÓXIMA síntesis usa otra estrategia (nunca la misma con el mismo texto).

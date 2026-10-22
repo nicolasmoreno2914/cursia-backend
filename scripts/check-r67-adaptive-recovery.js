@@ -173,14 +173,16 @@ async function pureChecks() {
     eq([AUD.AUDIOBOOK_WPM_TARGET, AUD.AUDIOBOOK_ATEMPO_MIN, AUD.AUDIOBOOK_ATEMPO_MAX, AUD.AUDIOBOOK_WPM_MIN, AUD.AUDIOBOOK_WPM_MAX], [165, 0.85, 1.15, 115, 175], 'constantes');
   });
 
-  await check('1 puro: ppm 176 / 181,06 / 186,5 → factor dentro de los límites (frena); 200 → 0,825 fuera; < 115 acelera hacia 125; dentro de banda → sin plan', () => {
+  await check('1 puro: ppm 176 / 181,06 / 186,5 → factor dentro de los límites (frena); 200 → 0,825 fuera; < 115 (lento) NUNCA se corrige localmente; dentro de banda → sin plan', () => {
     const f = (w) => AUD.atempoPlanFor(w);
     eq([f(176).factor, f(176).withinLimits], [Math.round((165 / 176) * 1e6) / 1e6, true], '176');
     eq([f(181.06).factor.toFixed(3), f(181.06).withinLimits], ['0.911', true], '181,06 (R1-bis) → 0,911');
     eq([f(186.5).withinLimits, f(186.5).factor < 1], [true, true], '186,5');
     eq([f(200).factor, f(200).withinLimits], [0.825, false], '200');
-    eq([f(110).targetWpm, f(110).factor > 1, f(110).withinLimits], [125, true, true], '110 → acelera');
-    eq([f(100).withinLimits], [false], '100 → 1,25 fuera');
+    // r67 (PO): un segmento LENTO nunca se acelera localmente (puede ser relleno/silencio) → escalera de re-síntesis.
+    eq([f(110).slow, f(110).withinLimits], [true, false], '110 → lento: sin corrección local');
+    eq([f(100).slow, f(100).withinLimits], [true, false], '100 → lento: sin corrección local');
+    eq(f(176).slow, false, 'rápido');
     eq([f(141), f(175), f(115)], [null, null, null], 'en banda');
     eq(AUD.atempoFilterChain(0.911), 'atempo=0.911', 'un filtro');
     eq(AUD.atempoFilterChain(0.3), 'atempo=0.5,atempo=0.6', 'encadenado < 0,5');
@@ -397,6 +399,9 @@ async function dbChecks() {
       GAMMA_API_KEY: SECRETS.GAMMA_API_KEY, GAMMA_THEME_V21_LIGHT_DEFAULT: 'theme-r67-light', GAMMA_THEME_V21_DARK_DEFAULT: 'theme-r67-dark',
       OPENAI_API_KEY: SECRETS.OPENAI_API_KEY, ANTHROPIC_API_KEY: SECRETS.ANTHROPIC_API_KEY, VIDEOGEN_API_KEY: SECRETS.VIDEOGEN_API_KEY,
     });
+    // r67 (PO): corte de la pasada de huérfanos = inicio de esta corrida (los runs de prueba son posteriores; el
+    // «histórico» se fecha 30 días antes).
+    process.env.R67_ORPHAN_SWEEP_SINCE = new Date(Date.now() - 60_000).toISOString();
     for (const k of ['DYNAMIC_V2_ALLOWED_OWNERS', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'FINOPS_KILL_SWITCH', 'FINOPS_PROVIDER_ALLOWLIST', 'DYNAMIC_AUTO_HEAL_POLICY']) delete process.env[k];
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [Artifact], synchronize: false });
@@ -627,6 +632,25 @@ async function dbChecks() {
       });
     }
 
+    await check('1/3 100 ppm (LENTO): sin corrección local (ni siquiera se invoca el retime: un relleno no se tapa) → directo a la escalera (instructions) → completa', async () => {
+      ffCtl('ok');
+      const R = await freshRun('r67 lento');
+      const st = paceFor({ k: 2, base: 100, instructions: 150, split: 150 });
+      const a0 = ffArgsLog().length;
+      const t0 = fakes.st.tts.length;
+      let row = await runAudio(R);
+      assert(row.status === 'retrying' && /SLOW_SEGMENT_NO_LOCAL_CORRECTION/.test(row.error) && /próxima estrategia: instructions/.test(row.error), row.error);
+      eq(ffArgsLog().length - a0, 0, 'el retime no se ejecutó');
+      eq(row.output_summary.audioCorrections ?? {}, {}, 'sin corrección');
+      const segKey = Object.keys(row.output_summary.audioQuarantine)[0];
+      assert(row.output_summary.audioQuarantine[segKey][0].wpm < 115, 'original lento en cuarentena');
+      row = await runAudio(R);
+      eq([row.status, row.error], ['completed', null], 'completa con instructions');
+      const by = callsBy(fakes.st.tts.slice(t0), st);
+      eq([by.tgtBase, by.tgtInstr], [1, 1], 'base + instructions');
+      await assertNoOrphans(R.rid, 'lento');
+    });
+
     await check('sin ffmpeg (inyección: retime/análisis → null) → sin corrección local, pasa a instructions (RETIME_UNAVAILABLE); nunca un éxito silencioso', async () => {
       const R = await freshRun('r67 sin ffmpeg');
       paceFor({ k: 2, base: 181, instructions: 150, split: 150 });
@@ -815,6 +839,36 @@ async function dbChecks() {
       eq((await runs.markOrphanFailedItems(later(26 * 60))).includes(row.id), false, 'idempotente');
       eq((await runs.autoHealFailedItems({ now: later(25 * 60) })).reopened.filter((x) => x.runId === R.rid).length, 0, 'sin reapertura');
       await assertNoOrphans(R.rid, 'tiempo');
+    });
+
+    // ═══ PO: datos históricos intactos ═══════════════════════════════════════════════════════════════════════
+    await check('PO histórico: la pasada de huérfanos NO toca runs creados antes del corte (R67_ORPHAN_SWEEP_SINCE) ni runs completed/cancelled/preview: la fila queda idéntica (sin updated_at)', async () => {
+      ffCtl('ok');
+      const snapRow = async (id) => JSON.stringify((await ds.query(`select to_jsonb(g) as j from public.generation_item_runs g where id = $1`, [id]))[0].j);
+      const orphanize = async (R) => {
+        paceFor({ k: 2, base: 230, instructions: 150, split: 150 });
+        const row = await runAudio(R);
+        eq(row.status, 'failed', 'failed');
+        // Huérfano «de antes de r67»: failed B sin próxima acción ni motivo (como el cap. 2 de R1-bis).
+        await ds.query(`update public.generation_item_runs set next_retry_at = null, attention_reason = null where id = $1`, [row.id]);
+        return row.id;
+      };
+      const old = await freshRun('r67 histórico', { maxAttempts: 1 });
+      const oldId = await orphanize(old);
+      await ds.query(`update public.production_jobs set created_at = now() - interval '30 days' where id = $1`, [old.rid]);
+      const done = await freshRun('r67 completado', { maxAttempts: 1 });
+      const doneId = await orphanize(done);
+      await ds.query(`update public.production_jobs set worker_status = 'completed', status = 'completed' where id = $1`, [done.rid]);
+      const fresh = await freshRun('r67 vigente', { maxAttempts: 1 });
+      const freshId = await orphanize(fresh);
+      const b0 = [await snapRow(oldId), await snapRow(doneId)];
+      const j0 = JSON.stringify((await ds.query(`select to_jsonb(p) as j from public.production_jobs p where id = $1`, [old.rid]))[0].j);
+      const marked = await runs.markOrphanFailedItems(later(25 * 60));
+      assert(!marked.includes(oldId) && !marked.includes(doneId), 'históricos / completados no se marcan');
+      eq([await snapRow(oldId), await snapRow(doneId)], b0, 'filas byte-idénticas (incluido updated_at)');
+      eq(JSON.stringify((await ds.query(`select to_jsonb(p) as j from public.production_jobs p where id = $1`, [old.rid]))[0].j), j0, 'run histórico intacto');
+      assert(marked.includes(freshId), 'el run vigente (después del corte) sí se marca');
+      eq((await itemRow(fresh.rid, fresh.key)).attention_reason, 'unrecoverable', 'vigente → unrecoverable');
     });
   } finally {
     fakes.plan.ttsPace = null;
