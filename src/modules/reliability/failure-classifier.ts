@@ -514,6 +514,18 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       'channel_unresolved', 'youtube_publisher_not_configured', 'oauth_failed'],
     class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
   },
+  // r67 (B4): blocked_auth NO definitivo (403 forbidden / sin reason): espera persistente con sonda 5 min / 30 min / 2 h
+  // (sin gasto: el render ya está pago); tras la 3.ª sonda fallida el worker emite `youtube_blocked_auth` (humano).
+  { id: 'youtube_auth_probe', codes: ['youtube_auth_probe'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'youtube', rounds: 3 },
+  // r67 (B3): subida sin confirmar CON sesión resumable guardada: se consulta el estado de la MISMA sesión (nunca se
+  // abre otra); acotado, después `ambiguous_youtube_upload` (humano).
+  { id: 'youtube_upload_unconfirmed', codes: ['youtube_upload_unconfirmed'], class: 'A', strategy: 'repoll_external', paidRisk: 'none', provider: 'youtube', rounds: 5 },
+  // r67 (B2): videos.insert rechazado con un 4xx que no es auth/cuota (invalidTitle, mediaBodyRequired, desconocido…):
+  // determinista, no se reintenta solo.
+  {
+    id: 'youtube_upload_rejected', codes: ['youtube_upload_rejected'],
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+  },
   {
     id: 'youtube_verify',
     codes: ['youtube_video_not_verified', 'video_not_unlisted', 'video_not_found', 'video_not_owned', 'video_id_invalid', 'youtube_invalid_url', 'video_lookup_failed'],

@@ -1,7 +1,21 @@
 import { BadRequestException, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { YoutubeService } from '../../youtube/youtube.service';
 import { YoutubeTokenService } from '../../youtube/youtube-token.service';
-import { YoutubeQuotaException, YoutubeUploadTransportError } from '../../youtube/youtube-upload.service';
+import {
+  isTransientRefreshFailure,
+  YoutubeQuotaException,
+  YoutubeSessionExpiredError,
+  YoutubeSessionMismatchError,
+  YoutubeSessionPersistError,
+  YoutubeUploadTransportError,
+} from '../../youtube/youtube-upload.service';
+import {
+  networkReasonOf,
+  parseGoogleErrorBody,
+  YoutubeApiErrorInfo,
+  youtubeErrorInfo,
+  youtubeErrorInfoOf,
+} from '../../youtube/youtube-api-error';
 import type { YoutubeConnection } from '../../youtube/entities/youtube-connection.entity';
 import {
   YOUTUBE_UPLOAD_PRIVACY,
@@ -111,7 +125,10 @@ export async function evaluateYoutubePreflight(
   return buildYoutubePreflightResult(checks, channel);
 }
 
-export type LightYoutubePreflightResult = { ok: true; connection: YoutubeConnection } | { ok: false; reason: YoutubePreflightReason };
+export type LightYoutubePreflightResult =
+  | { ok: true; connection: YoutubeConnection }
+  /** r67: `error` = la excepción del refresh (solo en token_refresh_failed) para decidir definitivo vs transitorio. */
+  | { ok: false; reason: YoutubePreflightReason; error?: unknown };
 
 /**
  * Preflight liviano del worker (inmediatamente antes de un envío NUEVO a
@@ -130,8 +147,8 @@ export async function lightYoutubePreflight(
     try {
       const t = await deps.getAccessToken(conn);
       if (typeof t !== 'string' || t.length === 0) return { ok: false, reason: 'token_refresh_failed' };
-    } catch {
-      return { ok: false, reason: 'token_refresh_failed' };
+    } catch (err) {
+      return { ok: false, reason: 'token_refresh_failed', error: err };
     }
   }
   if (!hasYoutubeUploadScope(conn.scopes)) return { ok: false, reason: 'missing_upload_scope' };
@@ -158,6 +175,30 @@ export async function fetchMyYoutubeChannel(accessToken: string, logger?: { warn
     title: typeof item.snippet?.title === 'string' ? item.snippet.title : null,
     thumbnail: typeof item.snippet?.thumbnails?.default?.url === 'string' ? item.snippet.thumbnails.default.url : null,
   };
+}
+
+ /**
+ * r67 (B4): sonda liviana del canal con error ESTRUCTURADO (channels.list mine=true, 1 unidad): `ok` con el id del
+ * canal, o el `reason` real de Google (quotaExceeded, insufficientPermissions, forbidden…). Nunca loguea el token.
+ */
+export async function probeYoutubeChannel(accessToken: string): Promise<{ ok: true; channelId: string } | { ok: false; youtube: YoutubeApiErrorInfo }> {
+  let res: Response;
+  try {
+    res = await fetch(YOUTUBE_CHANNELS_MINE_URL, { headers: { Authorization: `Bearer ${accessToken}` }, signal: AbortSignal.timeout(10_000) });
+  } catch (err) {
+    return { ok: false, youtube: youtubeErrorInfo('channel', { reason: networkReasonOf(err) }) };
+  }
+  let text = '';
+  try { text = await res.text(); } catch { /* ignore */ }
+  if (!res.ok) {
+    const p = parseGoogleErrorBody(text);
+    return { ok: false, youtube: youtubeErrorInfo('channel', { httpStatus: res.status, reason: p.reason ?? (p.nonJson ? 'non_json' : null), domain: p.domain, message: p.message }) };
+  }
+  let data: any = null;
+  try { data = JSON.parse(text); } catch { data = null; }
+  const item = Array.isArray(data?.items) ? data.items[0] : null;
+  if (!item || typeof item.id !== 'string' || !item.id) return { ok: false, youtube: youtubeErrorInfo('channel', { httpStatus: res.status, reason: 'channel_not_found' }) };
+  return { ok: true, channelId: item.id };
 }
 
 export const YOUTUBE_VIDEOS_URL = 'https://www.googleapis.com/youtube/v3/videos';
@@ -264,9 +305,125 @@ export function classifyYoutubeUploadError(err: unknown): YoutubeUploadErrorKind
   if (err instanceof UnauthorizedException) return 'auth';
   if (err instanceof BadRequestException) return 'download';
   if (err instanceof YoutubeUploadTransportError) {
-    if (err.phase === 'init') return 'transient';
+    // r67: el refresh transitorio (red/5xx/no-JSON) no creó nada → transitorio; la consulta de estado → ambigua.
+    if (err.phase === 'init' || err.phase === 'refresh') return 'transient';
+    if (err.phase === 'status') return 'ambiguous';
     if (typeof err.httpStatus === 'number' && err.httpStatus >= 500 && err.httpStatus <= 599) return 'transient';
     return 'ambiguous';
   }
   return 'ambiguous';
+}
+
+// ─── r67 (B2): clasificación FINA por el reason real del proveedor ──────────
+
+/**
+ * r67 (B2) — decisión por el `reason`/`domain` documentados (videos.insert y errores generales de la Data API; campo
+ * `error` del endpoint OAuth), NUNCA solo por el status HTTP:
+ *
+ * | reason / caso                                                      | kind              | quién           |
+ * |--------------------------------------------------------------------|-------------------|-----------------|
+ * | quotaExceeded (403)                                                 | quota_project     | espera (auto)   |
+ * | uploadLimitExceeded (400 doc; también 403)                          | quota_channel     | espera (auto)   |
+ * | rateLimitExceeded / userRateLimitExceeded                           | rate_limited      | backoff (auto)  |
+ * | refresh: invalid_grant / invalid_client / 401 / 4xx desconocido     | auth_definitive   | humano          |
+ * | refresh: red / timeout / 5xx / 429 / sin JSON / temporarily_unavail.| transient         | backoff (auto)  |
+ * | insufficientPermissions, youtubeSignupRequired, channel*, authent.* | permission        | humano          |
+ * |   forbiddenPrivacySetting, … o 403 con reason DESCONOCIDO           |                   |                 |
+ * | forbidden (403) o 401/403 SIN reason                                | auth_uncertain    | sonda 5m/30m/2h |
+ * | init: 5xx / 429 / red / sin Location                                | transient         | backoff (auto)  |
+ * | init: otro 4xx (invalidTitle, mediaBodyRequired, desconocido…)      | rejected          | humano          |
+ * | upload: 5xx explícito                                               | transient         | (status query)  |
+ * | upload/status: corte, timeout, 2xx sin id, otro 4xx                 | ambiguous         | status query o humano |
+ * | status: 404/410                                                     | session_expired   | worker decide   |
+ * Sin error estructurado (fakes viejos / errores locales) → la clasificación gruesa de siempre, con auth = humano.
+ */
+export type YoutubeFailureKind =
+  | 'quota_project'
+  | 'quota_channel'
+  | 'rate_limited'
+  | 'transient'
+  | 'auth_definitive'
+  | 'auth_uncertain'
+  | 'permission'
+  | 'rejected'
+  | 'session_expired'
+  | 'session_mismatch'
+  | 'session_persist'
+  | 'ambiguous'
+  | 'download';
+
+export interface YoutubeFailureDecision {
+  kind: YoutubeFailureKind;
+  /** Error estructurado (null si la excepción no lo trae). */
+  info: YoutubeApiErrorInfo | null;
+  /** ¿Necesita a un humano (no hay estrategia automática segura)? */
+  human: boolean;
+}
+
+export const YOUTUBE_PERMISSION_REASONS: readonly string[] = Object.freeze([
+  'insufficientPermissions', 'youtubeSignupRequired', 'channelClosed', 'channelNotFound', 'channelSuspended',
+  'authenticatedUserNotChannel', 'authenticatedUserAccountClosed', 'authenticatedUserAccountSuspended',
+  'accountDelegationForbidden', 'insufficientCapabilities', 'cmsUserAccountNotFound', 'forbiddenPrivacySetting',
+  'forbiddenLicenseSetting',
+]);
+const RATE_REASONS = ['rateLimitExceeded', 'userRateLimitExceeded'];
+const HUMAN_KINDS: readonly YoutubeFailureKind[] = ['auth_definitive', 'permission', 'rejected', 'session_mismatch'];
+
+function decision(kind: YoutubeFailureKind, info: YoutubeApiErrorInfo | null): YoutubeFailureDecision {
+  return { kind, info, human: HUMAN_KINDS.includes(kind) };
+}
+
+/** r67 (B2): decisión por reason para un error estructurado (pura). */
+export function classifyYoutubeErrorInfo(info: YoutubeApiErrorInfo): YoutubeFailureKind {
+  const reason = info.reason ?? '';
+  const st = info.httpStatus;
+  if (reason === 'quotaExceeded') return 'quota_project';
+  if (reason === 'uploadLimitExceeded') return 'quota_channel';
+  if (RATE_REASONS.includes(reason)) return 'rate_limited';
+  if (info.phase === 'refresh') return isTransientRefreshFailure(info) ? 'transient' : 'auth_definitive';
+  if (YOUTUBE_PERMISSION_REASONS.includes(reason)) return 'permission';
+  if (st === 401 || st === 403) {
+    if (reason === 'forbidden' || reason === '' || reason === 'authError' || reason === 'authorizationRequired') return 'auth_uncertain';
+    return 'permission';
+  }
+  if (info.phase === 'channel') {
+    if (reason === 'network' || reason === 'timeout' || reason === 'non_json' || (typeof st === 'number' && st >= 500)) return 'transient';
+    return 'auth_uncertain';
+  }
+  if (info.phase === 'status' && (st === 404 || st === 410)) return 'session_expired';
+  if (info.phase === 'init') {
+    if (st === null || st >= 500 || st === 429 || reason === 'no_location') return 'transient';
+    return 'rejected';
+  }
+  if (info.phase === 'upload' && typeof st === 'number' && st >= 500) return 'transient';
+  return 'ambiguous';
+}
+
+/**
+ * r67 (B2): clasificación fina de una excepción de `uploadFromUrl` (o del preflight). `contactedYoutube=false` = antes
+ * del primer contacto con YouTube (refresh / descarga): nunca es ambiguo.
+ */
+export function classifyYoutubeFailure(err: unknown, opts: { contactedYoutube: boolean }): YoutubeFailureDecision {
+  if (err instanceof YoutubeSessionPersistError) return decision('session_persist', null);
+  if (err instanceof YoutubeSessionMismatchError) return decision('session_mismatch', err.youtube);
+  if (err instanceof YoutubeSessionExpiredError) return decision('session_expired', err.youtube ?? null);
+  const info = youtubeErrorInfoOf(err);
+  if (info) {
+    const kind = classifyYoutubeErrorInfo(info);
+    if (!opts.contactedYoutube && kind === 'ambiguous') return decision('download', info);
+    return decision(kind, info);
+  }
+  const coarse = classifyYoutubeUploadError(err);
+  if (!opts.contactedYoutube) {
+    if (coarse === 'auth') return decision('auth_definitive', null);
+    if (coarse === 'quota') return decision('quota_project', null);
+    return decision(coarse === 'transient' ? 'transient' : 'download', null);
+  }
+  switch (coarse) {
+    case 'quota': return decision('quota_project', null);
+    case 'auth': return decision('auth_definitive', null);
+    case 'download': return decision('download', null);
+    case 'transient': return decision('transient', null);
+    default: return decision('ambiguous', null);
+  }
 }
