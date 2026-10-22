@@ -252,9 +252,9 @@ async function pureChecks() {
     eq([an.silences.length, an.silences[0], an.silences[1].end, an.peakDbfs], [2, { start: 1.5, end: 4 }, Infinity, -2.5], 'parser');
   });
 
-  await check('A3 puro: clasificador — AUDIO_STRATEGIES_EXHAUSTED = D unrecoverable (regenerate_item); AUDIO_WPM_OUT_OF_RANGE sigue B', () => {
+  await check('A3 puro: clasificador — AUDIO_STRATEGIES_EXHAUSTED = D unrecoverable (retry_item); AUDIO_WPM_OUT_OF_RANGE sigue B', () => {
     const v = FC.classifyFailure({ source: 'provider_worker', itemType: 'audiobook_chapter', error: 'AUDIO_STRATEGIES_EXHAUSTED: el segmento seg-2-0-efcc6108ef1e …' });
-    eq([v.class, v.humanReason, v.adminAction], ['D', 'unrecoverable', 'regenerate_item'], 'agotada');
+    eq([v.class, v.humanReason, v.adminAction], ['D', 'unrecoverable', 'retry_item'], 'agotada → reintentar (F2: reinicia solo el segmento)');
     eq(FC.classifyFailure({ source: 'provider_worker', itemType: 'audiobook_chapter', error: 'AUDIO_WPM_OUT_OF_RANGE: x' }).class, 'B', 'wpm');
   });
 
@@ -273,6 +273,9 @@ async function pureChecks() {
     for (const c of ['AUDIOBOOK_SEGMENT_DUPLICATE', 'TTS_AUDIO_INVALID']) {
       const e = `${c}: el segmento seg-1-0-aaaaaaaaaaaa x`;
       eq(AH.autoHealDecision(row({ row: { error: e }, os: { knownPaidFailure: e } }), NOW).heal, true, c);
+      // r67 fix round 1 (F5): sin estrategia distinta que aplicarles → a lo sumo UNA ronda automática.
+      eq(AH.autoHealDecision(row({ row: { error: e }, os: { knownPaidFailure: e, autoHeal: { regenRounds: 1 } } }), NOW).reason, 'cap_reached', `${c}: 1 ronda`);
+      eq(IT.maxAutomaticRoundsToday(e, 'audiobook_chapter', { knownPaidFailure: e }, 'B'), 1, `${c}: recovery_max_rounds 1`);
     }
     eq(IT.maxAutomaticRoundsToday(ERR, 'audiobook_chapter', row().output_summary, 'B'), 3, 'recovery_max_rounds = 3 (antes 0)');
     eq(AH.autoHealDecision(row({ os: { autoHeal: { regenRounds: 1 } } }), NOW).round, 2, 'ronda 2');
@@ -296,6 +299,41 @@ async function pureChecks() {
     eq(RS.runRecoveryStateOf([row({ row: { error: 'AUDIO_STRATEGIES_EXHAUSTED: x', attention_reason: 'unrecoverable' } }), { status: 'blocked' }], NOW).definitive, true, 'definitivo');
     const view = IRV.recoveryViewOf({ ...row(), failure_class: 'B', recovery_round: 0 }, NOW);
     eq(view.state.state, 'pending_retry', 'DTO');
+  });
+
+  await check('F3 puro: lo que OTRO barrido del tick va a tomar nunca queda failed_no_strategies (claim incompleto r62 d8, control de gasto, reintento seguro, reenvío ambiguo)', () => {
+    // Recuperación automática encendida (como en staging/producción: flag dinámico + política por clase).
+    const savedFlag = process.env.DYNAMIC_COURSE_STRUCTURE;
+    process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    try {
+    const old = new Date(NOW.getTime() - 40 * 60_000).toISOString();
+    const S = (r) => RS.recoveryStateOf({ status: 'failed', finished_at: old, output_summary: {}, ...r }, NOW);
+    const d8 = S({ type: 'video_interactions', error: 'claim_payload_unavailable: VIDEO_NOT_COMPLETED: el video del capítulo no está completado', failure_class: 'B' });
+    assert(d8.state !== 'failed_no_strategies', `d8 → ${d8.state}`);
+    const d8Old = S({ type: 'video_interactions', error: 'claim_payload_unavailable: VIDEO_YOUTUBE_ID_MISSING: x', failure_class: 'B', finished_at: new Date(NOW.getTime() - 30 * 3600e3).toISOString() });
+    assert(d8Old.state !== 'failed_no_strategies', `d8 viejo: su barrido registra la excepción al rendirse (${d8Old.state})`);
+    eq(S({ type: 'presentation', error: 'gamma_submit_failed: HTTP 400 bad request', failure_class: 'C' }).state, 'pending_retry', 'reintento seguro');
+    eq(S({ type: 'audiobook_chapter', error: 'provider_reconciliation_required: openai — llamada pagada enviada sin resultado liquidado: x' }).state, 'waiting_financial_reconciliation', 'reenvío ambiguo');
+    } finally {
+      if (savedFlag === undefined) delete process.env.DYNAMIC_COURSE_STRUCTURE; else process.env.DYNAMIC_COURSE_STRUCTURE = savedFlag;
+    }
+  });
+
+  await check('F6 puro: corte ÚNICO R67_AUTO_RECOVERY_SINCE — un run anterior (R1-bis 7831fa67, 2026-10-22T15:48:20Z) se comporta como antes de r67 (no_allow_listed, 0 rondas); sin la variable el corte es el arranque del proceso', () => {
+    const saved = process.env.R67_AUTO_RECOVERY_SINCE;
+    try {
+      delete process.env.R67_AUTO_RECOVERY_SINCE;
+      assert(AH.r67AutoRecoverySince().getTime() > Date.parse('2026-10-22T15:48:20Z'), 'sin variable: arranque del proceso (posterior a R1-bis)');
+      eq(AH.r67AutoRecoveryApplies('2026-10-22T15:48:20Z'), false, 'R1-bis fuera');
+      eq(AH.r67AutoRecoveryApplies(new Date(Date.now() + 1000)), true, 'run nuevo dentro');
+      process.env.R67_AUTO_RECOVERY_SINCE = '2026-10-23T00:00:00Z';
+      const pre = row({ row: { run_created_at: '2026-10-22T15:48:20Z' } });
+      eq(AH.autoHealDecision(pre, NOW).reason, 'not_allow_listed', 'reapertura: como antes de r67');
+      eq(IT.maxAutomaticRoundsToday(ERR, 'audiobook_chapter', pre.output_summary, 'B', '2026-10-22T15:48:20Z'), 0, 'recovery_max_rounds 0 (como R1-bis)');
+      eq(AH.autoHealDecision(row({ row: { run_created_at: '2026-10-23T01:00:00Z' } }), NOW).heal, true, 'después del corte sí');
+    } finally {
+      if (saved === undefined) delete process.env.R67_AUTO_RECOVERY_SINCE; else process.env.R67_AUTO_RECOVERY_SINCE = saved;
+    }
   });
 
   await check('15 puro (sin bucles): todo camino automático acotado — B audio ≤ 3 rondas, ventana 24 h; la escalera nunca repite; lost-result reconoce partes y cuarentena como resultado guardado', () => {
@@ -399,9 +437,9 @@ async function dbChecks() {
       GAMMA_API_KEY: SECRETS.GAMMA_API_KEY, GAMMA_THEME_V21_LIGHT_DEFAULT: 'theme-r67-light', GAMMA_THEME_V21_DARK_DEFAULT: 'theme-r67-dark',
       OPENAI_API_KEY: SECRETS.OPENAI_API_KEY, ANTHROPIC_API_KEY: SECRETS.ANTHROPIC_API_KEY, VIDEOGEN_API_KEY: SECRETS.VIDEOGEN_API_KEY,
     });
-    // r67 (PO): corte de la pasada de huérfanos = inicio de esta corrida (los runs de prueba son posteriores; el
+    // r67 (F6): corte de activación de los automatismos de r67 = inicio de esta corrida (los runs de prueba son posteriores; el
     // «histórico» se fecha 30 días antes).
-    process.env.R67_ORPHAN_SWEEP_SINCE = new Date(Date.now() - 60_000).toISOString();
+    process.env.R67_AUTO_RECOVERY_SINCE = new Date(Date.now() - 60_000).toISOString();
     for (const k of ['DYNAMIC_V2_ALLOWED_OWNERS', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'FINOPS_KILL_SWITCH', 'FINOPS_PROVIDER_ALLOWLIST', 'DYNAMIC_AUTO_HEAL_POLICY']) delete process.env[k];
 
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [Artifact], synchronize: false });
@@ -491,7 +529,7 @@ async function dbChecks() {
     /** Ritmo por estrategia del segmento objetivo (k = índice del segmento distinto que se vuelve rápido). */
     function paceFor(cfg) {
       const seen = [];
-      const st = { tgt: null };
+      const st = { tgt: null, cfg };
       fakes.plan.ttsPace = (req) => {
         const inp = norm(req.input);
         if (st.tgt === null && !req.instructions && !seen.includes(inp) && !(seen.length && seen.some((s) => s.includes(inp)))) {
@@ -499,8 +537,8 @@ async function dbChecks() {
           if (seen.length - 1 === cfg.k) st.tgt = inp;
         }
         if (st.tgt === null) return null;
-        if (inp === st.tgt) return req.instructions ? cfg.instructions : cfg.base;
-        if (st.tgt.includes(inp)) return cfg.split;
+        if (inp === st.tgt) return req.instructions ? st.cfg.instructions : st.cfg.base;
+        if (st.tgt.includes(inp)) return st.cfg.split;
         return null;
       };
       return st;
@@ -689,6 +727,33 @@ async function dbChecks() {
       for (const m of [5, 60, 600]) eq((await runs.autoHealFailedItems({ now: later(m) })).reopened.filter((x) => x.runId === R.rid).length, 0, `sin reapertura (+${m} min)`);
       eq(fakes.st.tts.length - t1, 0, 'sin llamadas');
       await assertNoOrphans(R.rid, 'agotada');
+      // r67 fix round 1 (F2): un reintento HUMANO reinicia la escalera SOLO del segmento agotado (con auditoría) y
+      // conserva los aceptados y la cuarentena → corrección local del segmento (aquí el TTS vuelve a 181 ppm) a costo 0
+      // para seg-0/seg-1.
+      const segsBefore = JSON.stringify(row.output_summary.audioSegments);
+      const quarBefore = JSON.stringify(row.output_summary.audioQuarantine);
+      await runs.retryItem(R.cid, OWNER, 1, R.rid, R.key);
+      row = await itemRow(R.rid, R.key);
+      const segKey = Object.keys(row.output_summary.audioLadderResets ? { [row.output_summary.audioLadderResets[0].segKey]: 1 } : {})[0];
+      assert(segKey, 'auditoría del reinicio');
+      const reset = row.output_summary.audioLadderResets[0];
+      eq([reset.by, reset.actor, reset.previous.exhausted, reset.previous.tried.length], [OWNER, 'owner', true, 3], 'quién / escalera anterior');
+      eq(row.output_summary.audioRetryStrategy[segKey], undefined, 'escalera del segmento reiniciada');
+      eq(JSON.stringify(row.output_summary.audioSegments), segsBefore, 'segmentos aceptados intactos');
+      eq(JSON.stringify(row.output_summary.audioQuarantine), quarBefore, 'cuarentena intacta');
+      st.cfg.base = 181;
+      const t2 = fakes.st.tts.length;
+      const ch0 = (await chargesOf(row.id)).length;
+      row = await runAudio(R);
+      eq([row.status, row.error], ['completed', null], 'completa tras el reintento humano');
+      const by2 = callsBy(fakes.st.tts.slice(t2), st);
+      eq([by2.tgtBase, by2.tgtInstr, by2.tgtSplit], [1, 0, 0], 'el segmento que falló: una síntesis base, corregida localmente');
+      assert(![...by2.other.keys()].some((k) => [...by.other.keys()].slice(0, 2).includes(k)), 'seg-0/seg-1: 0 llamadas TTS');
+      const chB = await chargesOf(row.id);
+      const perChunk2 = chB.reduce((m, x) => ((m[x.chunk] = (m[x.chunk] ?? 0) + 1), m), {});
+      eq([perChunk2['0'], perChunk2['1']], [1, 1], 'seg-0/seg-1: 0 cargos nuevos');
+      eq(chB.length - ch0, 1 + by2.other.size, 'un cargo nuevo por llamada nueva (el segmento corregido localmente + los que faltaban)');
+      assert(row.output_summary.audioCorrections[segKey], 'corrección local registrada');
     });
 
     // ═══ 10/11/2 — run failed → auto-heal reabre (B) → queued; dependiente desbloqueado; reanuda desde segmentos ═══
@@ -841,8 +906,82 @@ async function dbChecks() {
       await assertNoOrphans(R.rid, 'tiempo');
     });
 
+    // ═══ F6 — R1-bis preservado: run ANTERIOR al corte ═══════════════════════════════════════════════════════════
+    for (const pace of [181, 186.5]) {
+      await check(`F6 R1-bis (${pace} ppm): run anterior al corte con seg-0/seg-1 aceptados y seg-2 AUDIO_WPM_OUT_OF_RANGE (ineligibleMd5): ningún barrido del tick la toca (fila byte-idéntica, 0 TTS); un reintento HUMANO la corrige localmente (seg-0/seg-1 0 llamadas y 0 cargos)`, async () => {
+        const R = await freshRun(`r67 R1-bis ${pace}`, { maxAttempts: 1 });
+        const st = paceFor({ k: 2, base: pace, instructions: pace, split: pace });
+        let row = await runAudio(R, { audioTools: NO_FFMPEG_TOOLS }); // «antes de r67»: sin corrección local
+        assert(row.status === 'failed' && /^AUDIO_WPM_OUT_OF_RANGE/.test(row.error), row.error);
+        eq(Object.keys(row.output_summary.audioSegments).length, 2, 'seg-0 y seg-1 aceptados');
+        // Forma de R1-bis en staging (datos de antes de r67): sin estado r67, ineligibleMd5 marcado, sin próxima acción.
+        await ds.query(
+          `update public.generation_item_runs
+              set output_summary = (output_summary - 'recovery' - 'audioRetryStrategy' - 'audioQuarantine')
+                    || jsonb_build_object('autoHeal', jsonb_build_object('ineligibleMd5', md5(error), 'ineligibleReason', 'not_allowed_listed_pre_r67')),
+                  next_retry_at = null, attention_reason = null, recovery_max_rounds = 0
+            where id = $1`, [row.id]);
+        await ds.query(`update public.production_jobs set created_at = '2026-10-22T15:48:20Z' where id = $1`, [R.rid]);
+        const snap = async () => JSON.stringify((await ds.query(`select to_jsonb(g) as j from public.generation_item_runs g where id = $1`, [row.id]))[0].j);
+        const before = await snap();
+        const t0 = fakes.st.tts.length;
+        for (const m of [5, 60, 25 * 60]) {
+          await runs.autoHealFailedItems({ now: later(m) });
+          await runs.markOrphanFailedItems(later(m));
+          await runs.autoRetrySafeRejections({ now: later(m) }).catch(() => null);
+          await runs.autoResubmitAmbiguousAudio({ now: later(m) }).catch(() => null);
+          await runs.autoResumeSpendControlHolds({ now: later(m) }).catch(() => null);
+          await runs.autoExtendItemRecoveryBudget({ now: later(m) }).catch(() => null);
+          await runs.autoRecoverClaimPayloadUnavailable({ now: later(m) }).catch(() => null);
+          await runs.autoProbeProviderCredit({ now: later(m) }).catch(() => null);
+        }
+        eq(await snap(), before, 'fila byte-idéntica (sin reapertura, sin attention, sin updated_at)');
+        eq(fakes.st.tts.length - t0, 0, '0 llamadas TTS');
+        // Reintento humano explícito: sí funciona, con el camino nuevo (corrección local del seg-2 a costo 0).
+        ffCtl('ok');
+        const ch0 = await chargesOf(row.id);
+        await runs.retryItem(R.cid, OWNER, 1, R.rid, R.key);
+        row = await runAudio(R);
+        eq([row.status, row.error], ['completed', null], 'completa');
+        const by = callsBy(fakes.st.tts.slice(t0), st);
+        eq([by.tgtBase, by.tgtInstr, by.tgtSplit], [1, 0, 0], 'seg-2: una síntesis, corregida localmente');
+        assert(row.output_summary.audioCorrections && Object.keys(row.output_summary.audioCorrections).length === 1, 'corrección local');
+        const ch = await chargesOf(row.id);
+        const old01 = ch0.filter((x) => x.chunk === '0' || x.chunk === '1').length;
+        eq(ch.filter((x) => x.chunk === '0' || x.chunk === '1').length, old01, 'seg-0/seg-1: 0 cargos nuevos');
+        assert(![...by.other.keys()].length || [...by.other.values()].every((n) => n === 1), 'segmentos restantes una vez');
+        await assertNoOrphans(R.rid, `R1-bis ${pace}`);
+      });
+    }
+
+    // ═══ F10 — liquidar ANTES de registrar la cuarentena ═══════════════════════════════════════════════════════
+    await check('F10 fuera de banda sin corrección: la reserva del segmento se LIQUIDA antes de registrar su cuarentena (un corte entre ambos nunca deja una reserva abierta tratada como resultado guardado)', async () => {
+      ffCtl('ok');
+      const R = await freshRun('r67 orden F10');
+      paceFor({ k: 2, base: 230, instructions: 150, split: 150 });
+      const seen = [];
+      const watch = Object.create(sched);
+      watch.recordItemExternal = async (id, ex, patch, ...rest) => {
+        if (patch && patch.audioQuarantine && patch.audioRetryStrategy) {
+          const [{ n }] = await ds.query(
+            `select count(*)::int as n from public.generation_cost_events e where e.item_run_id = $1 and e.metadata->>'reservation' = 'true'
+               and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [id]);
+          seen.push(n);
+        }
+        return sched.recordItemExternal(id, ex, patch, ...rest);
+      };
+      const row = await runAudio(R, { scheduler: watch });
+      assert(row.status === 'retrying' && /^AUDIO_WPM_OUT_OF_RANGE/.test(row.error), row.error);
+      eq(seen, [0], 'al registrar la cuarentena no queda ninguna reserva abierta');
+      const persisted = LR.persistedPaidOpIds(row.output_summary);
+      const open = await ds.query(`select e.idempotency_key from public.generation_cost_events e where e.item_run_id = $1 and e.metadata->>'reservation' = 'true'
+         and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [row.id]);
+      eq(open.length, 0, 'sin reservas abiertas');
+      assert(persisted.size > 0, 'requestIds de la cuarentena reconocidos');
+    });
+
     // ═══ PO: datos históricos intactos ═══════════════════════════════════════════════════════════════════════
-    await check('PO histórico: la pasada de huérfanos NO toca runs creados antes del corte (R67_ORPHAN_SWEEP_SINCE) ni runs completed/cancelled/preview: la fila queda idéntica (sin updated_at)', async () => {
+    await check('PO histórico: la pasada de huérfanos NO toca runs creados antes del corte (R67_AUTO_RECOVERY_SINCE) ni runs completed/cancelled/preview: la fila queda idéntica (sin updated_at)', async () => {
       ffCtl('ok');
       const snapRow = async (id) => JSON.stringify((await ds.query(`select to_jsonb(g) as j from public.generation_item_runs g where id = $1`, [id]))[0].j);
       const orphanize = async (R) => {
