@@ -125,6 +125,16 @@ async function workflowChecks() {
     eq(s.run.replace(/a producción/g, 'a staging').replace(/ \(factory mode\)/, ''), st.run.replace(/ \(factory mode\)/, ''), 'mismo bash que staging');
   });
 
+  await check('[WF] r63: PROD_STORAGE_MAX_BYTES (variable del environment, default 300000000, validada) viaja al install; deploy.yml no fija nada por su cuenta', () => {
+    const s = steps[idx((x) => x.id === 'cfg', 'cfg')];
+    eq(bashStep(s.run, { FE_REF: 'staging' }).outputs.storage_max, '300000000', 'default 300 MB');
+    eq(bashStep(s.run, { FE_REF: 'staging', STORAGE_MAX: ' 400000000 ' }).outputs.storage_max, '400000000', 'variable del environment');
+    for (const bad of ['abc', '300MB', '0', '5', '1e9', '300000000;id']) eq(bashStep(s.run, { FE_REF: 'staging', STORAGE_MAX: bad }).status, 1, `rechaza ${bad}`);
+    const raw = fs.readFileSync(WF, 'utf8');
+    assert(/STORAGE_MAX: \$\{\{ vars\.PROD_STORAGE_MAX_BYTES \}\}/.test(raw), 'lee vars.PROD_STORAGE_MAX_BYTES');
+    assert(/"PROD_STORAGE_MAX_BYTES=\$STORAGE_MAX"/.test(raw) && /steps\.cfg\.outputs\.storage_max/.test(raw), 'pasa el valor validado al install');
+  });
+
   await check('[WF] variables V2 validadas en el runner (bash ejecutado): UUID, booleanos, enteros, ref del frontend; default seguro = V2 apagado', () => {
     const s = steps[idx((x) => x.id === 'cfg', 'cfg')];
     let r = bashStep(s.run, {});
@@ -458,7 +468,7 @@ function runSh(vps, args, { input = '', env = {}, stdinScript = false } = {}) {
 const cfgInput = (o = {}) => [o.token === undefined ? SECRET : o.token,
   `PROD_V2_CANARY_OWNER=${o.canary || ''}`, `PROD_V2_WORKERS_ENABLED=${o.workers || 'false'}`, `PROD_V2_LLM_WORKER_ENABLED=${o.llm || 'false'}`, `PROD_V2_GENERAL_AVAILABILITY=${o.ga || 'false'}`,
   `PROD_DB_POOL_MAX=${o.poolMax || ''}`, 'PROD_DB_POOL_MAX_WORKER=', 'PROD_DB_POOL_IDLE_MS_WORKER=',
-  `PROD_SKIP_STORAGE_POLICY_PROBE=${o.skipStorage || 'false'}`, `DEPLOY_SHA=${o.sha || 'abcdef1'}`, ...(o.extra || [])].join('\n') + '\n';
+  `PROD_SKIP_STORAGE_POLICY_PROBE=${o.skipStorage || 'false'}`, ...(o.storageMax === undefined ? [] : [`PROD_STORAGE_MAX_BYTES=${o.storageMax}`]), `DEPLOY_SHA=${o.sha || 'abcdef1'}`, ...(o.extra || [])].join('\n') + '\n';
 const envOf = (app) => fs.readFileSync(path.join(app, '.env'), 'utf8');
 const envMap = (app) => Object.fromEntries(envOf(app).split('\n').filter((l) => l.includes('=')).map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
 
@@ -719,6 +729,19 @@ async function shellChecks() {
       assert(!r.out.includes(SECRET), 'secreto no impreso');
       const sh = fs.readFileSync(SH, 'utf8');
       assert(!/awk -v v=/.test(sh) && /ENVIRON\["_V"\]/.test(sh), 'M1: el valor viaja por ENVIRON, no por awk -v');
+    });
+
+    await check('[SH] r63: install fija STORAGE_MAX_UPLOAD_BYTES y PACKAGE_MBZ_MAX_BYTES al mismo valor (default 300000000; configurable; idempotente; inválido falla)', () => {
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\nSTORAGE_MAX_UPLOAD_BYTES=52428800\n');
+      let r = runSh(vps, ['install'], { input: cfgInput() });
+      let m = envMap(vps.app);
+      eq([r.status, m.STORAGE_MAX_UPLOAD_BYTES, m.PACKAGE_MBZ_MAX_BYTES], [0, '300000000', '300000000'], 'default 300 MB (pisa 50 MiB)');
+      r = runSh(vps, ['install'], { input: cfgInput({ storageMax: '400000000' }) });
+      m = envMap(vps.app);
+      eq([r.status, m.STORAGE_MAX_UPLOAD_BYTES, m.PACKAGE_MBZ_MAX_BYTES], [0, '400000000', '400000000'], 'configurable');
+      eq((envOf(vps.app).match(/^(STORAGE_MAX_UPLOAD_BYTES|PACKAGE_MBZ_MAX_BYTES)=/gm) || []).length, 2, 'sin duplicar');
+      for (const bad of ['abc', '12', '1;id']) eq(runSh(vps, ['install'], { input: cfgInput({ storageMax: bad }) }).status, 1, `rechaza ${bad}`);
+      fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\n');
     });
 
     await check('[SH] M8: DYNAMIC_WORKERS_HOLD con comillas / CRLF / comentario sigue apagando los workers de gasto; M2: PROD_SKIP_STORAGE_POLICY_PROBE pasa --skip-storage-policies a las sondas', () => {

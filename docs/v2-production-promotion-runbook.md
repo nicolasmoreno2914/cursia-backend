@@ -135,8 +135,18 @@ Settings → Environments → `production` (ya lo referencia `deploy.yml`):
 | `PROD_DB_POOL_MAX`, `PROD_DB_POOL_MAX_WORKER`, `PROD_DB_POOL_IDLE_MS_WORKER` | vacío (no se toca) | Tamaño del pool por proceso (§2, capacidad). |
 | `PROD_DEPLOY_BLOCK_ON_V1_JOBS` | `false` | Los jobs V1 con lease vigente bloquean el deploy (si no, solo se informan). |
 | `PROD_FE_GATE_REF` | **ninguno (obligatoria)** | Rama o commit del frontend contra el que corre el gate REL R1: el frontend que se promueve (commit de release o `staging`). Después de la promoción del frontend puede pasar a `main`. Sin ella, todo deploy falla con instrucciones. |
+| `PROD_STORAGE_MAX_BYTES` | `300000000` | r63. Fija en el `.env` `STORAGE_MAX_UPLOAD_BYTES` y `PACKAGE_MBZ_MAX_BYTES` al mismo valor (con el default de 50 MiB un curso con audio real de 5 capítulos o más se bloquea antes de generar). La proyección de tamaño (r61 Q-24) y el bloqueo usan este mismo valor. Requiere la OWNER-ACTION de §1.2b. |
 | `PROD_SKIP_STORAGE_POLICY_PROBE` | `false` | Solo si el apply se hizo con `--skip-storage-policies` (decisión P15). Las sondas de Storage pasan a ser un aviso, pero los uploads del ejecutor V2 darían 403. |
 | `PROD_AUTO_ROLLBACK` | activo | `false` desactiva el rollback automático tras un fallo **posterior** al rsync (install o health). En ese caso queda el estado `failed <sha>` y el rollback manual. |
+
+### 1.2b Límite de Storage de producción a 300 MB: OWNER-ACTION
+
+El deploy fija `STORAGE_MAX_UPLOAD_BYTES` y `PACKAGE_MBZ_MAX_BYTES` en 300 MB (`PROD_STORAGE_MAX_BYTES`), pero el límite real de subida lo impone Supabase. El límite de Storage es del proyecto y solo se cambia en el dashboard:
+1. Supabase de **producción** → Storage → Settings → «Global file size limit»: 300 MB o más (en planes que lo permiten; si el plan no lo admite, subir de plan o bajar `PROD_STORAGE_MAX_BYTES` al máximo real).
+2. En el bucket de artifacts: «File size limit» del bucket en 300 MB o más (o sin límite propio).
+3. Si se cambia `PROD_STORAGE_MAX_BYTES`, mantener el límite de Supabase **igual o mayor**; si no, el `.mbz` pasa la proyección y recibe 413 al subir, después de gastar.
+
+Sin este paso el deploy es correcto pero los cursos grandes fallan al subir el paquete.
 
 ### 1.3 Environment `production-v2-migrations`: OWNER-ACTION
 
