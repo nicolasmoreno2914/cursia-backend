@@ -72,7 +72,7 @@ function cleanEnv(extra) {
 
 const OWNER = '11111111-2222-4333-8444-555555555555';
 const CONTEXT = { nombre: 'Curso de ejemplo', sector: 'Servicios', pais: 'Colombia', contexto: 'Empresa', nivel: 'Intermedio', tono: 'cercano' };
-const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION', 'DYNAMIC_VIDEO_DELIVERY',
+const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION', 'DYNAMIC_VIDEO_DELIVERY',
   'DYNAMIC_PROVIDER_WORKER_ENABLED', 'VIDEOGEN_API_KEY', 'SUPER_ADMIN_EMAILS', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
 const PROVIDER_OF = (type) => (type === 'video' ? 'videogen' : type === 'presentation' ? 'gamma' : /^audio/.test(type) ? 'openai' : 'anthropic');
 const MODEL_OF = { anthropic: 'claude-sonnet-4-6', openai: 'gpt-4o-mini-tts', gamma: 'gamma-generate', videogen: 'video' };
@@ -130,7 +130,7 @@ const MODEL_OF = { anthropic: 'claude-sonnet-4-6', openai: 'gpt-4o-mini-tts', ga
     }
     // Las migraciones que reescriben los CHECK del Manifest v3 corren DESPUÉS de migrate-v21-manifest-v3 (idempotentes).
     await withClient(DB, async (c) => { for (const f of ['supabase-migration-practice-chapters.sql', 'supabase-migration-application-activities.sql', 'supabase-migration-guided-practice.sql', 'supabase-migration-ev6-h5p2.sql']) await c.query(fs.readFileSync(path.join(REPO, f), 'utf8')); });
-    Object.assign(process.env, { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
+    Object.assign(process.env, { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
       DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', VIDEOGEN_API_KEY: 'fake-videogen-key-never-used-no-network', SUPER_ADMIN_EMAILS: 'admin@cursia.test',
       SUPABASE_URL: 'http://127.0.0.1:9', SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-local-only' });
     AL.resetRelSchemaCache(); EL.resetExecLeaseSchemaCache();

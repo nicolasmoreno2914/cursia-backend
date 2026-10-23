@@ -193,12 +193,14 @@ assert_v2_not_open_to_all() {
   dcs=$(env_val DYNAMIC_COURSE_STRUCTURE)
   allow=$(env_val DYNAMIC_V2_ALLOWED_OWNERS | tr -d '[:space:],')
   [ -n "$canary" ] && dcs=true && allow="$canary"
-  if [ "$dcs" = "true" ] && [ -z "$allow" ]; then
-    if [ "$ga" = "true" ]; then
-      echo "⚠️  V2 ENCENDIDO PARA TODOS LOS OWNERS (PROD_V2_GENERAL_AVAILABILITY=true, decisión del owner)"
-    else
-      die "DYNAMIC_COURSE_STRUCTURE=true con DYNAMIC_V2_ALLOWED_OWNERS vacío = V2 abierto a TODOS los owners. Fijar el allowlist (o PROD_V2_CANARY_OWNER), o PROD_V2_GENERAL_AVAILABILITY=true si es una decisión explícita."
-    fi
+  # Fail closed: el backend abre V2 a todos SOLO con la habilitación pública exacta (DYNAMIC_V2_GENERAL_AVAILABILITY,
+  # escrita desde PROD_V2_GENERAL_AVAILABILITY); con ella la allowlist ya no limita nada, así que se evalúa primero.
+  if [ "$dcs" = "true" ] && [ "$ga" = "true" ]; then
+    echo "⚠️  V2 ENCENDIDO PARA TODOS LOS OWNERS (PROD_V2_GENERAL_AVAILABILITY=true, decisión del owner; la allowlist no limita)"
+  elif [ "$dcs" = "true" ] && [ -z "$allow" ]; then
+    # Con el backend fail closed esto deja V2 cerrado para todos (no abierto), pero sigue siendo una configuración
+    # contradictoria: se aborta igual. Se conserva «abierto a TODOS» en el mensaje por compatibilidad con los checks.
+    die "DYNAMIC_COURSE_STRUCTURE=true con DYNAMIC_V2_ALLOWED_OWNERS vacío y sin habilitación pública: configuración contradictoria (antes = V2 abierto a TODOS; hoy el backend lo deja cerrado). Fijar el allowlist (o PROD_V2_CANARY_OWNER), o PROD_V2_GENERAL_AVAILABILITY=true si es una decisión explícita."
   elif [ "$dcs" = "true" ]; then
     echo "✓ V2 encendido SOLO para el allowlist ($(printf "%s" "$allow" | tr "," "\n" | grep -c . || true) owner(s))"
   else
@@ -443,7 +445,11 @@ cmd_install() {
   echo "━━━ [0a] Flags V2 de producción (defaults SEGUROS: V2 apagado salvo canario explícito) ━━━"
   local canary="$CFG_PROD_V2_CANARY_OWNER" workers=false
   if [ -n "$canary" ]; then
-    echo "  canario V2 configurado (PROD_V2_CANARY_OWNER): V2 SOLO para el allowlist"
+    if [ "$CFG_PROD_V2_GENERAL_AVAILABILITY" = "true" ]; then
+      echo "  canario V2 configurado (PROD_V2_CANARY_OWNER) + habilitación pública: V2 para TODOS (la allowlist no limita)"
+    else
+      echo "  canario V2 configurado (PROD_V2_CANARY_OWNER): V2 SOLO para el allowlist"
+    fi
     ensure_env_exact DYNAMIC_COURSE_STRUCTURE true
     ensure_env_list_contains DYNAMIC_V2_ALLOWED_OWNERS "$canary"
     ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3
@@ -458,6 +464,9 @@ cmd_install() {
     echo "  sin PROD_V2_CANARY_OWNER: V2 queda como esté en el .env (default: apagado)"
     ensure_env_default_if_absent DYNAMIC_COURSE_STRUCTURE false
   fi
+  # Fail closed: el backend solo abre V2 a todos con DYNAMIC_V2_GENERAL_AVAILABILITY=true, que sigue SIEMPRE a la
+  # decisión explícita PROD_V2_GENERAL_AVAILABILITY (false por defecto; una lista vacía ya no abre nada).
+  ensure_env_exact DYNAMIC_V2_GENERAL_AVAILABILITY "$CFG_PROD_V2_GENERAL_AVAILABILITY"
   if [ "$(env_val DYNAMIC_WORKERS_HOLD | tr '[:upper:]' '[:lower:]')" = "true" ]; then
     workers=false
     echo "⚠ DYNAMIC_WORKERS_HOLD=true: workers de proveedores y de IA quedan APAGADOS"

@@ -122,7 +122,9 @@ jobs:
           b() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" in true) echo true ;; ''|false) echo false ;; *) echo "::error::$2 debe ser true|false" >&2; return 1 ;; esac; }
           WORKERS="$(b "$WORKERS" PROD_V2_WORKERS_ENABLED)"
           LLM="$(b "$LLM" PROD_V2_LLM_WORKER_ENABLED)"
-          GA="$(b "$GA" PROD_V2_GENERAL_AVAILABILITY)"
+          # Fail closed: la habilitación pública abre V2 a TODOS; solo el valor EXACTO 'true' (sin normalizar mayúsculas
+          # ni espacios) la activa. Cualquier otro valor distinto de vacío/'false' es un error, nunca una apertura.
+          case "$GA" in true) GA=true ;; ''|false) GA=false ;; *) echo "::error::PROD_V2_GENERAL_AVAILABILITY debe ser exactamente true o false"; exit 1 ;; esac
           BLOCK_V1="$(b "$BLOCK_V1" PROD_DEPLOY_BLOCK_ON_V1_JOBS)"
           SKIP_STORAGE="$(b "$SKIP_STORAGE" PROD_SKIP_STORAGE_POLICY_PROBE)"
           for v in "$POOL_MAX" "$POOL_MAX_WORKER" "$POOL_IDLE_WORKER"; do

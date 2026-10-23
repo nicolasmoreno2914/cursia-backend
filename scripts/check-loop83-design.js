@@ -206,6 +206,7 @@ async function dbChecks() {
     });
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     delete process.env.ALLOW_UNOWNED_COURSES;
     process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
     process.env.DYNAMIC_ACTIVITY_TYPE_RULES = '2';

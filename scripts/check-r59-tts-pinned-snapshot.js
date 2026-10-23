@@ -251,7 +251,7 @@ async function main() {
     });
 
     const OWNER = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
-    const VENV = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_ALLOWED_OWNERS: undefined, DYNAMIC_REAL_VIDEO_OWNERS: OWNER, VIDEOGEN_API_KEY: 'k', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true', DYNAMIC_VIDEO_DELIVERY: undefined };
+    const VENV = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_ALLOWED_OWNERS: undefined, DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, VIDEOGEN_API_KEY: 'k', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true', DYNAMIC_VIDEO_DELIVERY: undefined };
     async function submitOnce() {
       const sent = [];
       const fails = [];

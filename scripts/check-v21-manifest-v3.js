@@ -777,6 +777,7 @@ async function dbChecks() {
     // V2.1 F2: el preflight de startRun exige claves/themeIds para Gamma/TTS reales (valores FALSOS, 0 red).
     require('./lib/provider-test-env').applyFakeProviderEnv();
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     delete process.env.ALLOW_UNOWNED_COURSES;
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
     await ds.initialize();

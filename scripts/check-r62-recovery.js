@@ -207,6 +207,7 @@ async function pureChecks() {
     ];
     const saved = process.env.DYNAMIC_COURSE_STRUCTURE;
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     try {
       for (const [m, type, code, provider] of msgs) {
         eq(SCH.spendControlHoldOf(m, type), { code, provider }, `hold ${type}`);
@@ -260,6 +261,7 @@ async function pureChecks() {
   await check('M1: run que el servidor está recuperando solo (sin acciones humanas) → completion.autoRecovering; con una acción humana o sin el tick, no', () => {
     const saved = process.env.DYNAMIC_COURSE_STRUCTURE;
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     try {
       const now = new Date();
       const job = { id: 'j', status: 'failed', worker_status: 'failed', input_payload: {} };
@@ -539,7 +541,7 @@ const OWNER = '11111111-2222-4333-8444-555555555555';
 const CONTEXT = { nombre: 'Curso r62', sector: 'Minería', pais: 'Chile', contexto: 'Planta', nivel: 'Intermedio', tono: 'cercano' };
 const PROVIDER_ENV_KEYS = ['GAMMA_API_KEY', 'GAMMA_THEME_V21_LIGHT_DEFAULT', 'GAMMA_THEME_V21_DARK_DEFAULT', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VIDEOGEN_API_KEY'];
 const ENV_KEYS = [
-  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION', 'DYNAMIC_VIDEO_DELIVERY',
+  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION', 'DYNAMIC_VIDEO_DELIVERY',
   'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPABASE_URL',
   'SUPABASE_SERVICE_ROLE_KEY', 'GAMMA_API_BASE_URL', 'OPENAI_API_BASE_URL', 'ANTHROPIC_API_BASE_URL', 'DYNAMIC_ALLOW_VIDEO_PREVIEW', 'SUPER_ADMIN_EMAILS',
   'FINOPS_KILL_SWITCH', 'FINOPS_PROVIDER_ALLOWLIST', ...PROVIDER_ENV_KEYS,
@@ -607,7 +609,7 @@ async function dbChecks() {
     for (const u of [storageUrl, urls.gammaUrl, urls.openaiUrl, urls.anthropicUrl]) assert(/^http:\/\/127\.0\.0\.1:\d+/.test(u), `fake fuera de loopback: ${u}`);
 
     Object.assign(process.env, {
-      DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
+      DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
       DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'admin@cursia.test',
       SUPABASE_URL: storageUrl, SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-local-only',
       GAMMA_API_BASE_URL: urls.gammaUrl, OPENAI_API_BASE_URL: urls.openaiUrl, ANTHROPIC_API_BASE_URL: urls.anthropicUrl, ...READY_ENV(),

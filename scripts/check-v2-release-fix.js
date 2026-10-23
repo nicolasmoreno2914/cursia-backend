@@ -147,7 +147,7 @@ function makeDeps({ videoMode = 'real' } = {}) {
 // DN-1: estos items son de runs `videogen_direct` (sin input_payload.videoDelivery) con video real:
 // desde DN-1 solo se envían con el permiso de staging DYNAMIC_ALLOW_VIDEOGEN_DIRECT=true (el camino
 // youtube y el bloqueo sin el permiso se prueban en check-dynamic-youtube-delivery.js).
-const ENV_ON = { [FLAG]: 'true', [ALLOW]: undefined, [REAL]: OWNER, VIDEOGEN_API_KEY: 'k', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true' };
+const ENV_ON = { [FLAG]: 'true', [ALLOW]: undefined, DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', [REAL]: OWNER, VIDEOGEN_API_KEY: 'k', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: 'true' };
 
 async function main() {
   stubFetch();
@@ -164,7 +164,9 @@ async function main() {
     const blocked = [
       { label: 'owner QUITADO de DYNAMIC_REAL_VIDEO_OWNERS (lista con otro owner)', env: { ...ENV_ON, [REAL]: OTHER } },
       { label: 'DYNAMIC_REAL_VIDEO_OWNERS vaciada (fail closed)', env: { ...ENV_ON, [REAL]: undefined } },
-      { label: 'owner fuera de DYNAMIC_V2_ALLOWED_OWNERS', env: { ...ENV_ON, [ALLOW]: OTHER } },
+      { label: 'owner fuera de DYNAMIC_V2_ALLOWED_OWNERS', env: { ...ENV_ON, [ALLOW]: OTHER, DYNAMIC_V2_GENERAL_AVAILABILITY: undefined } },
+      { label: 'lista vacía sin habilitación pública (fail closed)', env: { ...ENV_ON, DYNAMIC_V2_GENERAL_AVAILABILITY: undefined } },
+      { label: 'habilitación pública no exacta ("TRUE")', env: { ...ENV_ON, DYNAMIC_V2_GENERAL_AVAILABILITY: 'TRUE' } },
       { label: 'flag DYNAMIC_COURSE_STRUCTURE OFF con el worker todavía vivo', env: { ...ENV_ON, [FLAG]: undefined } },
       { label: 'lista inválida (error de config → fail closed)', env: { ...ENV_ON, [REAL]: 'no-es-uuid' } },
     ];
