@@ -539,7 +539,8 @@ export function deliveryViewOf(opts: {
   if (state === 'ambiguous' || (failed && err.startsWith('ambiguous_youtube_upload'))) {
     return view('ambiguous', err || 'La subida a YouTube quedó sin confirmar.', ['resolve_ambiguous']);
   }
-  if (state === 'blocked_auth') return view('blocked_auth', blockDetail ?? (err || null), ['reconnect_youtube', 'retry_upload']);
+  // r67 (B4): mientras espera la sonda automática (retrying) no se ofrece «reintentar»: el sistema lo hace solo.
+  if (state === 'blocked_auth') return view('blocked_auth', blockDetail ?? (err || null), opts.itemStatus === 'retrying' ? ['reconnect_youtube'] : ['reconnect_youtube', 'retry_upload']);
   if (state === 'blocked_quota') {
     const v = view('blocked_quota', blockDetail ?? (err || null), failed ? ['retry_upload'] : []);
     // r62 (d6): espera larga con alerta visible (el worker registra `youtubeQuotaAlertAt` una vez, pasadas 24 h).

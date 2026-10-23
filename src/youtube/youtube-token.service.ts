@@ -1,5 +1,10 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import * as crypto from 'crypto';
+import { networkReasonOf, parseGoogleErrorBody, YoutubeApiError, youtubeErrorInfo, youtubeErrorLogLine } from './youtube-api-error';
+
+/** r67 (B2): tope del refresh del token (antes sin timeout: un endpoint colgado colgaba la subida). */
+export const YOUTUBE_TOKEN_REFRESH_TIMEOUT_MS = 15_000;
+export const GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 
 /**
  * YoutubeTokenService — cifrado y gestión de tokens OAuth de YouTube.
@@ -17,6 +22,8 @@ import * as crypto from 'crypto';
 export class YoutubeTokenService implements OnModuleInit {
   private readonly logger = new Logger(YoutubeTokenService.name);
   private key!: Buffer;
+  /** r67 (B2): tope del refresh (configurable solo para las pruebas offline). */
+  refreshTimeoutMs = YOUTUBE_TOKEN_REFRESH_TIMEOUT_MS;
 
   onModuleInit(): void {
     const secret = process.env.YOUTUBE_TOKEN_SECRET;
@@ -102,38 +109,75 @@ export class YoutubeTokenService implements OnModuleInit {
     return decrypted.toString('utf8');
   }
 
+  /**
+   * r67 (B3): cifra un secreto de corta vida (la URL de una sesión resumable de YouTube, que es una capacidad) con
+   * el MISMO mecanismo AES-256-GCM de los refresh tokens. Nunca se loguea ni sale en DTOs.
+   */
+  encryptSecret(secret: string): { encrypted: string; iv: string } {
+    return this.encryptRefreshToken(secret);
+  }
+
+  decryptSecret(encrypted: string, iv: string): string {
+    return this.decryptRefreshToken(encrypted, iv);
+  }
+
   // ── Access token (solo en memoria) ────────────────────────────────
 
   /**
    * Obtiene un access_token fresco desde Google usando el refresh_token cifrado.
    * El access_token NUNCA se guarda en base de datos ni en logs.
    * TTL del access_token: ~1 hora (estándar de Google).
+   *
+   * r67 (B1/B2): todo fallo lanza `YoutubeApiError` con phase='refresh' y SOLO campos estructurados:
+   * - respuesta JSON de error → reason = campo `error` de OAuth (`invalid_grant`, `invalid_client`, …), httpStatus;
+   * - red / timeout (nuevo: 15 s) → reason `network` | `timeout`, httpStatus null;
+   * - cuerpo no JSON → reason `non_json`; 2xx sin access_token → reason `no_access_token`.
+   * La decisión (definitivo vs transitorio) la toma `classifyYoutubeFailure` (dynamic-youtube.ts), no este servicio.
    */
   async getAccessToken(encryptedRefreshToken: string, tokenIv: string): Promise<string> {
     const refreshToken = this.decryptRefreshToken(encryptedRefreshToken, tokenIv);
 
-    const resp = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id:     process.env.YOUTUBE_CLIENT_ID     ?? '',
-        client_secret: process.env.YOUTUBE_CLIENT_SECRET ?? '',
-        refresh_token: refreshToken,
-        grant_type:    'refresh_token',
-      }).toString(),
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(GOOGLE_OAUTH_TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          client_id:     process.env.YOUTUBE_CLIENT_ID     ?? '',
+          client_secret: process.env.YOUTUBE_CLIENT_SECRET ?? '',
+          refresh_token: refreshToken,
+          grant_type:    'refresh_token',
+        }).toString(),
+        signal: AbortSignal.timeout(this.refreshTimeoutMs),
+      });
+    } catch (err) {
+      const info = youtubeErrorInfo('refresh', { reason: networkReasonOf(err) });
+      this.logger.error(`Fallo al renovar access_token de YouTube (${youtubeErrorLogLine(info)})`);
+      throw new YoutubeApiError(info, `No se pudo renovar el token de YouTube: ${info.reason}`);
+    }
 
-    const data = (await resp.json()) as Record<string, unknown>;
+    let text = '';
+    try {
+      text = await resp.text();
+    } catch (err) {
+      const info = youtubeErrorInfo('refresh', { httpStatus: resp.status, reason: networkReasonOf(err) });
+      this.logger.error(`Fallo al renovar access_token de YouTube (${youtubeErrorLogLine(info)})`);
+      throw new YoutubeApiError(info, `No se pudo renovar el token de YouTube: ${info.reason}`);
+    }
+    let data: Record<string, unknown> | null = null;
+    try {
+      data = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      data = null;
+    }
 
-    if (!data['access_token']) {
-      // Log del error sin incluir tokens
-      this.logger.error(
-        `Fallo al renovar access_token de YouTube. HTTP ${resp.status}. ` +
-        `Error: ${data['error'] ?? 'unknown'}`,
-      );
-      throw new Error(
-        `No se pudo renovar el token de YouTube: ${data['error_description'] ?? data['error'] ?? 'error desconocido'}`,
-      );
+    if (!data || typeof data !== 'object' || !data['access_token']) {
+      const parsed = data ? parseGoogleErrorBody(text) : { reason: null, domain: null, message: null, nonJson: true };
+      const reason = !data ? 'non_json' : parsed.reason ?? (resp.ok ? 'no_access_token' : null);
+      const info = youtubeErrorInfo('refresh', { httpStatus: resp.status, reason, domain: parsed.domain, message: parsed.message });
+      // Log del error sin incluir tokens (solo campos estructurados)
+      this.logger.error(`Fallo al renovar access_token de YouTube. HTTP ${resp.status}. Error: ${reason ?? 'unknown'} (${youtubeErrorLogLine(info)})`);
+      throw new YoutubeApiError(info, `No se pudo renovar el token de YouTube: ${reason ?? 'error desconocido'}`);
     }
 
     return data['access_token'] as string;

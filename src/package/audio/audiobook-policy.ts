@@ -218,3 +218,242 @@ export function checkAudiobookCourseFloor(chapters: CourseFloorChapter[]): Cours
   }
   return { ...base, checked: true, sourceWords, belowFloor: false, warnings: [] };
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// r67 (A1/A2): recuperación ADAPTATIVA de un segmento con ritmo fuera de banda.
+// La banda aceptada (115–175 ppm) NO cambia. Antes, un segmento rápido (R1-bis: 181,1 y 186,5 ppm) se
+// re-sintetizaba igual 3 veces (mismo texto, modelo, voz, sin parámetros) y fallaba igual. Ahora:
+//  1. corrección LOCAL del ritmo (ffmpeg atempo sobre el MP3 crudo de OpenAI, USD 0) si el factor cabe en
+//     [ATEMPO_MIN, ATEMPO_MAX] y el resultado pasa la verificación de integridad;
+//  2. si no: escalera de re-síntesis con estrategias DISTINTAS que nunca se repiten (instructions → split → speed
+//     solo si el modelo lo soporta) y, agotada, falla definitiva visible (AUDIO_STRATEGIES_EXHAUSTED).
+// Puro: constantes y decisiones sobre números ya medidos.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** r67: ritmo objetivo al corregir un segmento demasiado RÁPIDO (> AUDIOBOOK_WPM_MAX). */
+export const AUDIOBOOK_WPM_TARGET = 165;
+/** r67: ritmo objetivo al corregir un segmento demasiado LENTO (< AUDIOBOOK_WPM_MIN). */
+export const AUDIOBOOK_WPM_TARGET_SLOW = 125;
+/**
+ * r67: límites del factor de atempo (fuera → re-síntesis; una desviación grande puede ser texto omitido, nunca se tapa).
+ * Solo se usa el lado < 1 (frenar): un segmento lento nunca se acelera localmente (ver atempoPlanFor). MAX queda como cota
+ * de `atempoFilterChain`/documentación.
+ */
+export const AUDIOBOOK_ATEMPO_MIN = 0.85;
+export const AUDIOBOOK_ATEMPO_MAX = 1.15;
+/** r67: tolerancia de la duración corregida frente a la esperada (duración original / factor). */
+export const AUDIO_RETIME_DURATION_TOLERANCE = 0.03;
+/** r67: silencio interno más largo admitido que el original no tenía (s). */
+export const AUDIO_INTERNAL_SILENCE_MAX_SECONDS = 2;
+/** r67: pico máximo (dBFS) — por encima se considera clipping. */
+export const AUDIO_PEAK_MAX_DBFS = -0.5;
+
+export interface AtempoPlan {
+  /** Ritmo objetivo (165 si rápido, 125 si lento). */
+  targetWpm: number;
+  /** factor = objetivo / actual (< 1 frena, > 1 acelera). */
+  factor: number;
+  /** ¿Se permite la corrección local? Solo segmentos RÁPIDOS con factor en [ATEMPO_MIN, 1). */
+  withinLimits: boolean;
+  /** r67: segmento demasiado lento (< AUDIOBOOK_WPM_MIN): nunca se corrige localmente. */
+  slow: boolean;
+}
+
+/** r67: plan de corrección local para un ritmo medido fuera de banda; null si el ritmo está dentro de la banda. */
+export function atempoPlanFor(wpm: number): AtempoPlan | null {
+  if (!(wpm > 0)) return null;
+  if (wpm >= AUDIOBOOK_WPM_MIN && wpm <= AUDIOBOOK_WPM_MAX) return null;
+  const slow = wpm < AUDIOBOOK_WPM_MIN;
+  const targetWpm = slow ? AUDIOBOOK_WPM_TARGET_SLOW : AUDIOBOOK_WPM_TARGET;
+  const factor = Math.round((targetWpm / wpm) * 1e6) / 1e6;
+  // r67 (decisión del PO): solo se FRENA localmente un segmento demasiado rápido (factor en [0,85; 1)). Un segmento
+  // demasiado LENTO (< 115) nunca se acelera: puede ser relleno/silencio o bucle y acelerarlo lo taparía → re-síntesis.
+  return { targetWpm, factor, slow, withinLimits: !slow && factor >= AUDIOBOOK_ATEMPO_MIN && factor < 1 };
+}
+
+/**
+ * r67: cadena de filtros atempo para un factor (ffmpeg admite 0,5–100 por filtro; fuera de [0,5; 2] se encadena).
+ * Con los límites actuales (0,85–1,15) siempre es un solo filtro; la cadena queda por robustez.
+ */
+export function atempoFilterChain(factor: number): string {
+  if (!(factor > 0) || !Number.isFinite(factor)) throw new Error(`factor de atempo inválido: ${factor}`);
+  const parts: string[] = [];
+  let f = factor;
+  while (f < 0.5) { parts.push('atempo=0.5'); f /= 0.5; }
+  while (f > 2) { parts.push('atempo=2'); f /= 2; }
+  parts.push(`atempo=${Number(f.toFixed(6))}`);
+  return parts.join(',');
+}
+
+/** r67 (A2): estrategias de re-síntesis, en orden. `base` = la síntesis original (primera vez). */
+export type AudioSynthStrategy = 'base' | 'instructions' | 'split' | 'speed';
+export const AUDIO_RETRY_LADDER: readonly AudioSynthStrategy[] = Object.freeze(['instructions', 'split', 'speed'] as AudioSynthStrategy[]);
+/** r67: instrucción de ritmo para gpt-4o-mini-tts (`instructions` NO funciona con tts-1/tts-1-hd). */
+export const AUDIO_PACE_INSTRUCTIONS = 'Narra a un ritmo pausado y claro, aproximadamente 150 palabras por minuto.';
+/** r67: velocidad de la estrategia `speed` (solo si el modelo la soporta de forma verificada). */
+export const AUDIO_SPEED_STRATEGY_VALUE = 0.9;
+
+/**
+ * r67: ¿el modelo respeta `speed`? La documentación oficial no lo confirma para gpt-4o-mini-tts (solo lo documenta en
+ * general, 0,25–4,0) → NO verificado → la estrategia `speed` se salta (spec A2.3). Un modelo tts-1/tts-1-hd sí lo
+ * documenta, pero ahí `instructions` no aplica: tampoco se usa en este pipeline.
+ */
+export function ttsModelSupportsSpeed(model: string): boolean {
+  void model;
+  return false;
+}
+
+/** r67: ¿el modelo soporta `instructions`? (gpt-4o-mini-tts sí; tts-1 / tts-1-hd no). */
+export function ttsModelSupportsInstructions(model: string): boolean {
+  return /^gpt-4o(-mini)?-tts/.test(String(model || ''));
+}
+
+/** Intento de una estrategia sobre un segmento (output_summary.audioRetryStrategy[segKey].tried[]). */
+export interface AudioStrategyTry {
+  strategy: AudioSynthStrategy;
+  /** sha del texto enviado (misma entrada + misma estrategia = falla determinista → no se repite). */
+  textSha: string;
+  attempt: number;
+  wpm: number | null;
+  outcome: 'wpm_out_of_range' | 'integrity_failed' | 'accepted';
+  at: string;
+}
+
+export interface AudioRetryState {
+  tried: AudioStrategyTry[];
+  /** Estrategia a aplicar en la próxima síntesis de este segmento (null = escalera agotada). */
+  next: AudioSynthStrategy | null;
+  exhausted: boolean;
+}
+
+/** r67: siguiente estrategia de la escalera que NO se probó con este mismo texto (null = agotada). */
+export function nextAudioStrategy(tried: ReadonlyArray<Pick<AudioStrategyTry, 'strategy' | 'textSha'>>, textSha: string, model: string): AudioSynthStrategy | null {
+  const done = new Set(tried.filter((t) => t.textSha === textSha).map((t) => t.strategy));
+  for (const s of AUDIO_RETRY_LADDER) {
+    if (done.has(s)) continue;
+    if (s === 'instructions' && !ttsModelSupportsInstructions(model)) continue;
+    if (s === 'speed' && !ttsModelSupportsSpeed(model)) continue;
+    return s;
+  }
+  return null;
+}
+
+/** r67: estrategia que corresponde a la próxima síntesis de un segmento (base si nunca falló con este texto). */
+export function currentAudioStrategy(state: AudioRetryState | null | undefined, textSha: string, model: string): AudioSynthStrategy | null {
+  const tried = (state?.tried ?? []).filter((t) => t.textSha === textSha);
+  if (!tried.length) return 'base';
+  return nextAudioStrategy(tried, textSha, model);
+}
+
+/** r67: estrategias que quedan para un segmento (para el tope de rondas del auto-heal). */
+export function remainingAudioStrategies(state: AudioRetryState | null | undefined, textSha: string | null, model: string): number {
+  const tried = (state?.tried ?? []).filter((t) => textSha === null || t.textSha === textSha);
+  const done = new Set(tried.map((t) => t.strategy));
+  return AUDIO_RETRY_LADDER.filter((s) => !done.has(s)
+    && !(s === 'instructions' && !ttsModelSupportsInstructions(model))
+    && !(s === 'speed' && !ttsModelSupportsSpeed(model))).length;
+}
+
+/**
+ * r67 (split): parte el texto de un segmento en 2 por oración, lo más parejo posible en palabras. Sin un límite de
+ * oración aprovechable, por palabras a la mitad. Nunca devuelve una parte vacía; la concatenación de las partes con
+ * un espacio reproduce el texto (normalizado por espacios).
+ */
+export function splitSegmentTextInTwo(text: string): [string, string] {
+  const t = String(text ?? '').trim().replace(/\s+/g, ' ');
+  const sentences = t.split(/(?<=[.!?…;:])\s+/).filter(Boolean);
+  const wc = (s: string) => (s ? s.split(' ').length : 0);
+  if (sentences.length >= 2) {
+    const total = wc(t);
+    let best = 1;
+    let bestDiff = Infinity;
+    let acc = 0;
+    for (let i = 1; i < sentences.length; i++) {
+      acc += wc(sentences[i - 1]);
+      const d = Math.abs(total - 2 * acc);
+      if (d < bestDiff) { bestDiff = d; best = i; }
+    }
+    return [sentences.slice(0, best).join(' '), sentences.slice(best).join(' ')];
+  }
+  const w = t.split(' ');
+  if (w.length < 2) throw new Error('splitSegmentTextInTwo: el segmento tiene menos de 2 palabras');
+  const h = Math.ceil(w.length / 2);
+  return [w.slice(0, h).join(' '), w.slice(h).join(' ')];
+}
+
+/** Medición mínima de un MP3 para la verificación de integridad (frames del pipeline). */
+export interface AudioMeasure {
+  frames: number;
+  seconds: number;
+  bitrateKbps: number | null;
+}
+
+/** Análisis acústico (ffmpeg silencedetect + astats). null = no se pudo analizar (sin ffmpeg / error). */
+export interface AudioAnalysis {
+  durationSeconds: number | null;
+  silences: Array<{ start: number; end: number }>;
+  peakDbfs: number | null;
+}
+
+export interface RetimeIntegrityInput {
+  factor: number;
+  /** Medición del original (ya en el bitrate del pipeline) y del corregido. */
+  original: AudioMeasure;
+  retimed: AudioMeasure | null;
+  analysisOriginal: AudioAnalysis | null;
+  analysisRetimed: AudioAnalysis | null;
+  /** Bitrate esperado del pipeline (48 kbps del audiolibro). */
+  kbps: number;
+  /** Palabras del segmento (re-medición del ritmo). */
+  words: number;
+}
+
+export interface RetimeIntegrityResult {
+  ok: boolean;
+  wpm: number | null;
+  expectedSeconds: number;
+  problems: string[];
+}
+
+const EDGE_EPS_S = 0.05;
+function internalSilences(a: AudioAnalysis, totalSeconds: number): Array<{ start: number; end: number }> {
+  return a.silences.filter((s) => s.start > EDGE_EPS_S && s.end < totalSeconds - EDGE_EPS_S && s.end - s.start > AUDIO_INTERNAL_SILENCE_MAX_SECONDS);
+}
+
+/**
+ * r67 (A1.5): verificación DURA del segmento corregido antes de aceptarlo. Todo debe cumplirse:
+ *  - MP3 parseable con frames de audio (medición del pipeline);
+ *  - duración ≈ original / factor (±3 %);
+ *  - ritmo re-medido dentro de 115–175;
+ *  - bitrate = el del pipeline;
+ *  - análisis acústico disponible (sin análisis no se acepta: nunca un éxito sin verificar);
+ *  - sin silencios internos > 2 s que el original no tuviera; sin clipping (pico ≤ −0,5 dBFS).
+ */
+export function evaluateRetimeIntegrity(x: RetimeIntegrityInput): RetimeIntegrityResult {
+  const problems: string[] = [];
+  const expectedSeconds = x.original.seconds / x.factor;
+  if (!x.retimed || !(x.retimed.frames > 0) || !(x.retimed.seconds > 0)) {
+    return { ok: false, wpm: null, expectedSeconds, problems: ['RETIME_UNPARSEABLE'] };
+  }
+  const r = x.retimed;
+  const wpm = Math.round((x.words / (r.seconds / 60)) * 10) / 10;
+  if (Math.abs(r.seconds - expectedSeconds) > AUDIO_RETIME_DURATION_TOLERANCE * expectedSeconds) {
+    problems.push(`RETIME_DURATION ${r.seconds.toFixed(2)} s vs ${expectedSeconds.toFixed(2)} s esperados`);
+  }
+  if (x.words >= AUDIOBOOK_WPM_MIN_WORDS && (wpm < AUDIOBOOK_WPM_MIN || wpm > AUDIOBOOK_WPM_MAX)) problems.push(`RETIME_WPM ${wpm}`);
+  if (r.bitrateKbps !== x.kbps) problems.push(`RETIME_BITRATE ${r.bitrateKbps ?? 'VBR'} != ${x.kbps}`);
+  if (!x.analysisRetimed || !x.analysisOriginal) {
+    problems.push('RETIME_ANALYSIS_UNAVAILABLE');
+  } else {
+    const before = internalSilences(x.analysisOriginal, x.original.seconds).length;
+    const after = internalSilences(x.analysisRetimed, r.seconds).length;
+    if (after > before) problems.push(`RETIME_NEW_INTERNAL_SILENCE ${after - before}`);
+    if (x.analysisRetimed.peakDbfs === null) problems.push('RETIME_PEAK_UNKNOWN');
+    else if (x.analysisRetimed.peakDbfs > AUDIO_PEAK_MAX_DBFS) problems.push(`RETIME_CLIPPING ${x.analysisRetimed.peakDbfs} dBFS`);
+    if (typeof x.analysisRetimed.durationSeconds === 'number'
+      && Math.abs(x.analysisRetimed.durationSeconds - r.seconds) > AUDIO_RETIME_DURATION_TOLERANCE * r.seconds) {
+      problems.push(`RETIME_DECODED_DURATION ${x.analysisRetimed.durationSeconds.toFixed(2)} s vs ${r.seconds.toFixed(2)} s por frames`);
+    }
+  }
+  return { ok: problems.length === 0, wpm, expectedSeconds, problems };
+}

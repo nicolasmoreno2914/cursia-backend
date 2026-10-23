@@ -172,9 +172,11 @@ export class OpenAiTtsClient {
   }
 
   /** POST /audio/speech — mismo body que TtsService (model, input, voice, response_format, instructions?). */
-  async speech(req: { model: string; voice: string; input: string; instructions?: string }): Promise<TtsCallResult> {
+  async speech(req: { model: string; voice: string; input: string; instructions?: string; speed?: number }): Promise<TtsCallResult> {
     const body: Record<string, unknown> = { model: req.model, input: req.input, voice: req.voice, response_format: 'mp3' };
     if (req.instructions) body.instructions = req.instructions;
+    // r67 (A2.3): `speed` solo lo manda la estrategia `speed`, que se salta mientras el modelo no lo soporte de forma verificada.
+    if (typeof req.speed === 'number' && req.speed >= 0.25 && req.speed <= 4) body.speed = req.speed;
     const res = await send('openai', 'POST /audio/speech', `${base(this.env, OPENAI_API_BASE_ENV, OPENAI_API_BASE_DEFAULT)}/audio/speech`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },

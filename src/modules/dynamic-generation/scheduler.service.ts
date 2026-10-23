@@ -45,7 +45,7 @@ import {
   requiredArtifactTypes,
   resolveRequiredArtifactTypesV3,
 } from '../dynamic-packaging/artifact-resolver';
-import { RunsService } from './runs.service';
+import { RunsService, stripYoutubeSessionSecret } from './runs.service';
 import { canonicalContextHash, sortKeysDeep } from './run-hash';
 import {
   ACTIVE_RUN_WORKER_STATUSES,
@@ -2453,7 +2453,8 @@ export async function assembleClaimedItem(a: {
     dependsOn: deps,
     attempt: row.attempt_count,
     previousError: typeof row.error === 'string' ? row.error.slice(0, 200) : null,
-    outputSummary: row.output_summary ?? {},
+    // r67 (B3): la sesión resumable de YouTube nunca sale en el item reclamado (el worker la lee de la DB).
+    outputSummary: stripYoutubeSessionSecret(row.output_summary ?? {}),
     context: { courseContext: ctx.context, contextHash: ctx.context_hash },
     blueprint: {
       course: { id: snapshot.course.id, title: snapshot.course.title },

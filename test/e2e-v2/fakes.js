@@ -215,11 +215,18 @@ function startProviderFakes({ gammaKey, openaiKey, anthropicKey, makePdf, makeMp
         // r62: respuesta HTTP con un cuerpo propio (p. ej. { status: 504, message: 'upstream request timeout' }).
         if (f && typeof f === 'object' && typeof f.status === 'number') { st.tts.push({ ...req, failed: f.status }); return json(f.status, { error: { message: String(f.message || `fake ${f.status}`) } }); }
         const rid = plan.ttsFixedRequestId || `req_f2_${++st.seq}`;
-        st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format });
+        // r67: también se registran instructions/speed y el texto (para contar llamadas por segmento / estrategia).
+        st.tts.push({ model: req.model, voice: req.voice, chars: String(req.input || '').length, requestId: rid, response_format: req.response_format,
+          instructions: req.instructions || null, speed: typeof req.speed === 'number' ? req.speed : null, input: String(req.input || '') });
         // Ritmo medido de la voz real (≈141 ppm, r19 DIAG-A) → duración proporcional al texto (segundos enteros, ≥ 1); ttsSlow → el doble.
         const slow = plan.ttsSlow > 0;
         if (slow) plan.ttsSlow--;
-        const secs = Math.max(1, Math.round(String(req.input || '').split(/\s+/).length / ttsWordsPerSecond)) * (slow ? 2 : 1);
+        // r67: plan.ttsPace(req) → ppm de ESTA respuesta (null/undefined = ritmo normal): reproduce voz rápida/lenta por estrategia.
+        const pace = typeof plan.ttsPace === 'function' ? plan.ttsPace(req) : null;
+        const words = String(req.input || '').split(/\s+/).length;
+        const secs = typeof pace === 'number' && pace > 0
+          ? Math.max(1, Math.round((words * 60) / pace))
+          : Math.max(1, Math.round(words / ttsWordsPerSecond)) * (slow ? 2 : 1);
         const same = plan.ttsSameAudio > 0;
         if (same) plan.ttsSameAudio--;
         rs.writeHead(200, { 'content-type': 'audio/mpeg', 'x-request-id': rid });

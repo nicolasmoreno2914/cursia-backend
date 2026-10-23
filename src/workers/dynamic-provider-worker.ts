@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import type { AudioTools } from '../tts/audio-retime';
 import { llmWorkerEnabled } from '../modules/dynamic-generation/llm-worker-routing';
 import { llmWorkerStartConfig, runLlmWorkerLoop } from './dynamic-llm-worker';
 import { createHash } from 'crypto';
@@ -163,6 +164,8 @@ export interface ProviderWorkerDeps {
   gammaTimeoutMs?: number;
   /** R16 (#1): señal de drenado del proceso; el modo real devuelve el item en puntos sin gasto en el aire. */
   drain?: DrainSignal | null;
+  /** r67 (A1): retime/análisis de audio inyectable (default: ffmpeg del PATH). */
+  audioTools?: AudioTools;
 }
 
 async function loadRunHead(
@@ -224,6 +227,7 @@ export async function processProviderItem(deps: ProviderWorkerDeps, item: Claime
         gammaPollMs: deps.gammaPollMs,
         gammaTimeoutMs: deps.gammaTimeoutMs,
         drain: deps.drain ?? null,
+        ...(deps.audioTools ? { audioTools: deps.audioTools } : {}),
       },
       item,
       head.ownerId,

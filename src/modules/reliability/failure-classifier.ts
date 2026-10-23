@@ -430,6 +430,14 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     family: /^MP3_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', paidRisk: 'measured', provider: 'openai', rounds: 2,
   },
+  {
+    // r67 (A2): la escalera de estrategias de re-síntesis de un segmento (instructions → split → speed si se soporta) se
+    // agotó sin un ritmo aceptable: ninguna estrategia automática segura queda → humano, visible (attention unrecoverable).
+    id: 'audio_strategies_exhausted', codes: ['AUDIO_STRATEGIES_EXHAUSTED'],
+    // r67 fix round 1 (F2): la acción humana es «reintentar» (reinicia la escalera SOLO del segmento que falló y conserva
+    // los segmentos aceptados), no regenerar (que repagaría todo el capítulo).
+    class: 'D', strategy: 'hold_for_human', paidRisk: 'measured', provider: 'openai', rounds: 0, humanReason: 'unrecoverable', adminAction: 'retry_item',
+  },
   { id: 'audiobook_script_failed', codes: ['audiobook_script_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
 
   // ── Contrato y producto (D) ────────────────────────────────────────────────
@@ -506,6 +514,18 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     id: 'youtube_auth',
     codes: ['youtube_blocked_auth', 'blocked_auth', 'reauth_required', 'reconnect_youtube', 'youtube_preflight_failed', 'needs_youtube_preflight',
       'channel_unresolved', 'youtube_publisher_not_configured', 'oauth_failed'],
+    class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
+  },
+  // r67 (B4): blocked_auth NO definitivo (403 forbidden / sin reason): espera persistente con sonda 5 min / 30 min / 2 h
+  // (sin gasto: el render ya está pago); tras la 3.ª sonda fallida el worker emite `youtube_blocked_auth` (humano).
+  { id: 'youtube_auth_probe', codes: ['youtube_auth_probe'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'youtube', rounds: 3 },
+  // r67 (B3): subida sin confirmar CON sesión resumable guardada: se consulta el estado de la MISMA sesión (nunca se
+  // abre otra); acotado, después `ambiguous_youtube_upload` (humano).
+  { id: 'youtube_upload_unconfirmed', codes: ['youtube_upload_unconfirmed'], class: 'A', strategy: 'repoll_external', paidRisk: 'none', provider: 'youtube', rounds: 5 },
+  // r67 (B2): videos.insert rechazado con un 4xx que no es auth/cuota (invalidTitle, mediaBodyRequired, desconocido…):
+  // determinista, no se reintenta solo.
+  {
+    id: 'youtube_upload_rejected', codes: ['youtube_upload_rejected'],
     class: 'D', strategy: 'hold_for_human', scope: 'provider', provider: 'youtube', rounds: 0, humanReason: 'config', adminAction: 'resolve_youtube',
   },
   {
@@ -779,6 +799,8 @@ export function currentRecoveryOf(
   outputSummary: Record<string, any> | null | undefined,
   /** Fix round 1 (I2): clase REGISTRADA al fallar (incluye la subida por errorCode); C/D nunca es auto-heal. */
   failureClass?: string | null,
+  /** r67 (F6): creación del run (corte de los automatismos de r67); ausente = sin dato. */
+  runCreatedAt?: Date | string | null,
 ): CurrentRecovery {
   const e = String(error ?? '').trim();
   const os = outputSummary ?? {};
@@ -800,7 +822,7 @@ export function currentRecoveryOf(
   if (denied) return 'denied';
   // REL MVP: la MISMA decisión del auto-healer con la política vigente (por clase, o R16 con el kill-switch);
   // sin fecha de fallo (sin espera) y con las rondas ya usadas del item.
-  const d = autoHealDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os, failure_class: failureClass ?? null }, new Date(), autoHealPolicyFromEnv(process.env));
+  const d = autoHealDecision({ status: 'failed', type: itemType ?? null, error: e, output_summary: os, failure_class: failureClass ?? null, run_created_at: runCreatedAt }, new Date(), autoHealPolicyFromEnv(process.env));
   if (d.heal) return d.kind === 'B' ? 'auto_regenerate' : 'auto_heal';
   return 'manual';
 }

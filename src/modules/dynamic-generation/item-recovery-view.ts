@@ -12,6 +12,7 @@ import { CurrentRecovery, FailureClass, classifyFailure, currentRecoveryOf } fro
 import { maxAutomaticRoundsToday } from './item-transitions';
 import { autoRecoveryEnabled } from './auto-heal';
 import { providerProbeViewOf } from '../reliability/provider-probe';
+import { RecoveryStateView, recoveryStateOf } from '../reliability/recovery-state';
 
 export interface ItemRecoveryView {
   /** Clase del último fallo (null = sin fallo). */
@@ -35,6 +36,12 @@ export interface ItemRecoveryView {
    * causa de fondo del CHECK de la columna (p. ej. `duplicate_charge`). Ausente si no hay excepción.
    */
   exceptionReason?: string | null;
+  /**
+   * r67 (A3): estado de la máquina de recuperación (completed | transient_failed | pending_retry | waiting_external_quota |
+   * waiting_financial_reconciliation | blocked_permanent | failed_no_strategies), su próxima acción automática y si el
+   * sistema la retoma solo. Derivado de la fila (las transiciones lo persisten además en output_summary.recovery).
+   */
+  state?: RecoveryStateView;
 }
 
 export interface ItemCostView {
@@ -74,7 +81,7 @@ function withProviderProbe(r: Record<string, any>, v: ItemRecoveryView, now: Dat
 
 /** Vista de recuperación de una fila de generation_item_runs (`select *`). Pura salvo el reloj y el env (kill-switch). */
 export function recoveryViewOf(r: Record<string, any>, now: Date = new Date()): ItemRecoveryView {
-  const v = withProviderProbe(r, baseRecoveryViewOf(r), now);
+  const v = { ...withProviderProbe(r, baseRecoveryViewOf(r), now), state: recoveryStateOf(r as any, now) };
   // Re-review m-n1: solo la excepción del error ACTUAL.
   const pr = r.output_summary?.providerReconcile;
   const declined = r.status === 'failed' && pr && String(pr.declinedError ?? '') === String(r.error ?? '') ? pr.declined : null;

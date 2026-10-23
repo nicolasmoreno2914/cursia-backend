@@ -548,9 +548,12 @@ const putNetwork = () => new YoutubeUploadTransportError('Fallo al subir video a
 function secondsToPacificMidnight() {
   return Math.ceil((worker.nextPacificMidnight(new Date()).getTime() - Date.now()) / 1000);
 }
-function assertPacificWait(sec, msg, extra = 0) {
-  const want = secondsToPacificMidnight() + extra;
-  assert(typeof sec === 'number' && Math.abs(sec - want) <= 5, `${msg}: espera ${sec}, esperada ≈${want} (medianoche PT)`);
+// r67 (B4): la hora de reposición de la cuota NO está en la documentación de la Data API (no se inventa): la espera
+// propia por un rechazo de cuota es una ventana creciente acotada (1 h, 3 h, 6 h, 12 h, luego 24 h). El gate global
+// (otro curso agotó la cuota) sigue mandando como en r62.
+function assertPacificWait(sec, msg, extra = 0, waits = 1) {
+  const want = worker.youtubeQuotaWindowSeconds(waits) + extra;
+  assert(typeof sec === 'number' && Math.abs(sec - want) <= 5, `${msg}: espera ${sec}, esperada ≈${want} (ventana r67 ${waits})`);
 }
 
 function assertCompleted(w, n, msg) {
@@ -568,8 +571,9 @@ async function runWorkerChecks() {
       await worker.processItem(w.deps, makeItem(60));
       const f = w.calls.failItem[0];
       assert(f && f.retryable === true && f.opts && f.opts.refundAttempt === true, 'failItem: ' + JSON.stringify(f));
-      assertPacificWait(f.opts.retryAfterSeconds, 'r62 M1: espera hasta la medianoche PT');
-      eq(w.store.get('ir-60').youtubeQuotaBlockedUntil, worker.nextPacificMidnight(new Date()).toISOString(), 'gate registrado (medianoche PT)');
+      assertPacificWait(f.opts.retryAfterSeconds, 'r67 B4: primera ventana (1 h)');
+      const gateAt = new Date(w.store.get('ir-60').youtubeQuotaBlockedUntil).getTime();
+      assert(Math.abs(gateAt - (Date.now() + 3600e3)) < 5000, 'gate registrado (≈ ahora + 1 h): ' + w.store.get('ir-60').youtubeQuotaBlockedUntil);
       assert(typeof w.store.get('ir-60').youtubeQuotaSince === 'string', 'youtubeQuotaSince guardado');
       eq(w.store.get('ir-60').youtubeQuotaWaits, 1, 'contador propio de esperas');
       // segunda espera: conserva el inicio, suma el contador
@@ -824,7 +828,7 @@ async function runWorkerChecks() {
         assert(f && f.retryable === t.expect.retryable && f.error.startsWith(t.expect.errPrefix), 'failItem: ' + JSON.stringify(f));
         assert(!f.error.includes('RAW-GOOGLE') && !f.error.includes(SECRET_TOKEN_MARKER), 'filtró texto crudo/token: ' + f.error);
         if (t.expect.retryAfter) eq(f.opts && f.opts.retryAfterSeconds, t.expect.retryAfter, 'espera de cuota');
-        if (t.expect.retryAfterPacific) assertPacificWait(f.opts && f.opts.retryAfterSeconds, 'espera de cuota (medianoche PT)');
+        if (t.expect.retryAfterPacific) assertPacificWait(f.opts && f.opts.retryAfterSeconds, 'espera de cuota (ventana r67)');
         if (t.expect.uploadsFirst !== undefined) eq(w.calls.uploads.length, t.expect.uploadsFirst, 'intentos en el reclamo');
         // Retry (automático o explícito): solo la subida.
         const statusBefore = w.calls.getVideoStatus;

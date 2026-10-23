@@ -4,8 +4,11 @@ import { latestGenerationPredicate } from './item-generations';
 import { evaluateRunCompletion, loadCompletionInputs, terminalStatusFor } from './run-completion';
 import { FailureSource, classifyFailure, currentRecoveryOf, extractFailureCode } from '../reliability/failure-classifier';
 import { PROVIDER_RECONCILE_AMBIGUOUS_KINDS, PROVIDER_RECONCILE_MAX_AMBIGUOUS_RESUBMITS, PROVIDER_RECONCILE_MAX_RESUBMITS, providerReconcileKindOf } from './provider-reconcile';
-import { AttemptOutcome, outcomeForFailure, recordItemFailure } from '../reliability/attempt-log';
-import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoHealPolicyFromEnv } from './auto-heal';
+import { AttemptOutcome, failureAttentionOf, outcomeForFailure, recordItemFailure } from '../reliability/attempt-log';
+import type { HumanReason } from '../reliability/failure-classifier';
+// r67 (A3): máquina de estados de recuperación (persistida en output_summary.recovery + next_retry_at).
+import { RecoveryStateView, recoveryStateOf, scheduledRetryAtOf } from '../reliability/recovery-state';
+import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoHealPolicyFromEnv, autoRegenMaxRoundsFor } from './auto-heal';
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 import { applyStopAfterInTx, holdsPackaging, packageHoldReason } from './stop-after';
 
@@ -149,7 +152,8 @@ export async function applyItemFailure(
               error = $2,
               updated_at = now()
         where id = $1 and status = 'running'
-        returning id, status, job_id, manifest_id, generation, item_key, type, output_summary`,
+        returning id, status, job_id, manifest_id, generation, item_key, type, output_summary, next_retry_at,
+                  (select pj.created_at from public.production_jobs pj where pj.id = job_id) as run_created_at`,
       [itemRunId, error, retryable, RETRY_BASE_SECONDS, RETRY_MAX_SECONDS, retryAfter, !!refundAttempt, !!grantAttempt],
     ),
   );
@@ -162,20 +166,64 @@ export async function applyItemFailure(
   // servidor (drain del worker); un mensaje del navegador siempre es `failed`. Nunca del errorCode reportado.
   const outcome: AttemptOutcome = meta?.outcome
     ?? (meta?.source === 'browser_executor' ? 'failed' : outcomeForFailure(extractFailureCode(error)));
+  const maxRoundsToday = maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null);
+  // r67 (A3): estado de recuperación explícito + próxima acción automática visible (next_retry_at también en `failed`)
+  // + sin huérfanos (failed sin acción programada ni motivo → attention 'unrecoverable').
+  const attentionOverride = await persistFailureRecoveryState(qr, row, error, verdict, maxRoundsToday);
   await recordItemFailure(qr, {
-    itemRunId: row.id, status: row.status, error, verdict, outcome,
-    maxRoundsToday: maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class),
+    itemRunId: row.id, status: row.status, error, verdict, outcome, maxRoundsToday, attentionOverride,
   });
   const blocked = row.status === 'failed' ? await blockDependents(qr, row.job_id, row.item_key) : [];
   return { id: row.id, status: row.status, blocked };
+}
+
+/** r67: entradas de historial de recuperación que se conservan por parte (output_summary.recovery.history). */
+export const RECOVERY_HISTORY_MAX = 20;
+
+/** r67: entrada de output_summary.recovery (estado + historial acotado). */
+export function nextRecoveryEntry(prev: Record<string, any> | null | undefined, v: RecoveryStateView, at: Date, extra: Record<string, unknown> = {}): Record<string, any> {
+  const history = Array.isArray(prev?.history) ? prev!.history.slice(-(RECOVERY_HISTORY_MAX - 1)) : [];
+  history.push({ at: at.toISOString(), state: v.state, reason: v.reason, ...(v.nextRetryAt ? { nextRetryAt: v.nextRetryAt } : {}), ...extra });
+  return { state: v.state, reason: v.reason, nextRetryAt: v.nextRetryAt, automatic: v.automatic, at: at.toISOString(), history };
+}
+
+async function persistFailureRecoveryState(
+  qr: QueryRunner,
+  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null; next_retry_at?: Date | string | null; run_created_at?: Date | string | null },
+  error: string,
+  verdict: ReturnType<typeof classifyFailure>,
+  maxRoundsToday: number,
+): Promise<HumanReason | null> {
+  const now = new Date();
+  const baseAttention = failureAttentionOf(row.status, verdict, maxRoundsToday);
+  const probe = {
+    id: row.id, type: row.type, status: row.status, error, output_summary: row.output_summary ?? {}, finished_at: now, updated_at: now,
+    failure_class: verdict.class, attention_reason: baseAttention, next_retry_at: row.next_retry_at ?? null, run_created_at: row.run_created_at ?? null,
+  };
+  const scheduled = row.status === 'failed' ? scheduledRetryAtOf(probe, now) : null;
+  // r67 fix round 1 (F3): «sin dueño» SOLO si el estado derivado es failed_no_strategies (ningún barrido del tick la
+  // tomará: auto-heal, reintento seguro, reenvío ambiguo, conciliación, sonda, control de gasto, claim incompleto…).
+  const orphan = row.status === 'failed' && !baseAttention
+    && recoveryStateOf({ ...probe, next_retry_at: scheduled }, now).state === 'failed_no_strategies';
+  const attentionOverride: HumanReason | null = orphan ? 'unrecoverable' : null;
+  const v = recoveryStateOf({ ...probe, attention_reason: baseAttention ?? attentionOverride, next_retry_at: row.status === 'failed' ? scheduled : row.next_retry_at ?? null }, now);
+  const entry = nextRecoveryEntry(row.output_summary?.recovery, v, now, { code: verdict.code, class: verdict.class });
+  await qr.query(
+    `update public.generation_item_runs
+        set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('recovery', $2::jsonb),
+            next_retry_at = case when status = 'failed' then $3::timestamptz else next_retry_at end
+      where id = $1`,
+    [row.id, JSON.stringify(entry), scheduled ? scheduled.toISOString() : null],
+  );
+  return attentionOverride;
 }
 
 /**
  * REL R2: rondas automáticas que el sistema hace HOY con este fallo una vez `failed` (auto-healer R16 o
  * reintento seguro BE-B, mismas reglas y topes que auto-heal.ts); 0 = solo humano. Informativo.
  */
-export function maxAutomaticRoundsToday(error: string, type: string | null | undefined, outputSummary: Record<string, any>, failureClass?: string | null): number {
-  const cur = currentRecoveryOf(error, type, outputSummary, failureClass);
+export function maxAutomaticRoundsToday(error: string, type: string | null | undefined, outputSummary: Record<string, any>, failureClass?: string | null, runCreatedAt?: Date | string | null): number {
+  const cur = currentRecoveryOf(error, type, outputSummary, failureClass, runCreatedAt);
   if (cur === 'safe_auto_retry') return SAFE_AUTO_RETRY_MAX_ROUNDS;
   if (cur === 'ambiguous_audio_resubmit') return AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS;
   if (cur === 'provider_reconcile') {
@@ -183,7 +231,8 @@ export function maxAutomaticRoundsToday(error: string, type: string | null | und
     const kind = providerReconcileKindOf(type, error, outputSummary);
     return kind && PROVIDER_RECONCILE_AMBIGUOUS_KINDS.includes(kind) ? PROVIDER_RECONCILE_MAX_AMBIGUOUS_RESUBMITS : PROVIDER_RECONCILE_MAX_RESUBMITS;
   }
-  if (cur === 'auto_regenerate') return Math.max(0, Math.floor(autoHealPolicyFromEnv(process.env).regenMaxRounds ?? 0));
+  // r67 (A3): el tope de B depende del código (audio de un segmento: largo de la escalera A2).
+  if (cur === 'auto_regenerate') return autoRegenMaxRoundsFor(type, extractFailureCode(error), autoHealPolicyFromEnv(process.env));
   return cur === 'auto_heal' ? autoHealMaxRoundsFor(type, autoHealPolicyFromEnv(process.env)) : 0;
 }
 
