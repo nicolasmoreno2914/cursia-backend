@@ -4314,14 +4314,32 @@ export class RunsService {
         resolution.youtubeVideoId = youtubeVideoId;
         resolution.verified = verified;
       }
+      // r67 fix round 2 (N1): la decisión humana cierra TODO el estado de la subida anterior (sesión, marca de PUT,
+      // protocolo, consultas de estado y sondas). Si quedara, las guardas F1/F9 volverían a declararla ambigua y la
+      // decisión «autorizar re-subida» nunca surtiría efecto. La copia de auditoría NO guarda la sesión (es un secreto).
       const next: Record<string, any> = {
         ...os,
         delivery: 'completed_local',
         youtubeUploadStartedAt: null,
+        youtubeSession: null,
+        youtubePutStartedAt: null,
+        youtubeUploadProtocol: null,
+        youtubeStatusChecks: null,
+        youtubeAuthProbe: null,
         youtubeResolution: resolution,
         previousYoutubeUploads: [
           ...(Array.isArray(os.previousYoutubeUploads) ? os.previousYoutubeUploads : []),
-          { youtubeUploadStartedAt: os.youtubeUploadStartedAt ?? null, error: target.error, resolvedAt: at, action },
+          {
+            youtubeUploadStartedAt: os.youtubeUploadStartedAt ?? null,
+            youtubePutStartedAt: os.youtubePutStartedAt ?? null,
+            hadSavedSession: !!os.youtubeSession,
+            uploadProtocol: os.youtubeUploadProtocol ?? null,
+            statusChecks: Array.isArray(os.youtubeStatusChecks) ? os.youtubeStatusChecks.length : os.youtubeStatusChecks ?? null,
+            lastDecision: os.youtubeDecision ?? null,
+            error: target.error,
+            resolvedAt: at,
+            action,
+          },
         ],
         previousErrors: [
           ...(Array.isArray(os.previousErrors) ? os.previousErrors : []),

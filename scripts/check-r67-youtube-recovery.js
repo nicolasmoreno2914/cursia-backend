@@ -931,6 +931,27 @@ async function dbChecks() {
       assertCounts(c0, { sessions: 1, videos: 0, bytes: 40_000, vg: 0 }, 'una sola sesión, ningún segundo PUT');
     });
 
+    await check('N1 ambiguo por F1 → el humano verifica el canal y «autoriza re-subida» → la decisión SÍ surte efecto: sesión vieja borrada (auditada sin secreto), exactamente 1 sesión nueva y 1 video', async () => {
+      resetGoogle();
+      const R = await freshRun('r67yt n1 reupload');
+      const c0 = counts();
+      G.putPlan = [{ cutAfter: 40_000 }];
+      G.statusPlan = ['reset'];
+      let row = await step(R);
+      eq(row.status, 'retrying', 'unconfirmed');
+      for (const s of G.sessions.values()) s.expired = true;
+      row = await step(R);
+      eq([row.status, row.output_summary.delivery], ['failed', 'ambiguous'], 'ambiguo (F1)');
+      await runs.resolveYoutubeUpload(R.cid, OWNER, 1, R.rid, R.vKey, 'authorize_reupload', undefined, { id: OWNER, email: 'owner@cursia.test' });
+      const after = await itemRow(R.rid, R.vKey);
+      eq([after.status, after.output_summary.youtubeSession, after.output_summary.youtubePutStartedAt, after.output_summary.youtubeUploadProtocol], ['pending', null, null, null], 'estado de la subida anterior cerrado');
+      const audit = (after.output_summary.previousYoutubeUploads || []).slice(-1)[0] || {};
+      assert(audit.hadSavedSession === true && audit.youtubePutStartedAt && !JSON.stringify(audit).includes('uriEnc'), 'auditoría sin secreto: ' + JSON.stringify(audit).slice(0, 200));
+      row = await step(R);
+      await assertCompletedOnce(R, 'tras autorizar');
+      assertCounts(c0, { sessions: 2, videos: 1, bytes: 40_000 + MP4.length, vg: 0 }, 'una sola sesión nueva, un solo video');
+    });
+
     await check('B3 sesión vencida (404) SIN bytes enviados (sesión creada, nunca empezó el PUT) → borra la sesión y abre UNA nueva; 1 video total', async () => {
       resetGoogle();
       const R = await freshRun('r67yt vencida sin bytes');
