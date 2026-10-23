@@ -1,0 +1,1625 @@
+{
+  "profileId": "CURSIA_H5P_PROFILE_V1",
+  "version": 1,
+  "mainLibraries": {
+    "H5P.InteractiveVideo": {
+      "machineName": "H5P.InteractiveVideo",
+      "majorVersion": 1,
+      "minorVersion": 27,
+      "patchVersion": 9
+    },
+    "H5P.QuestionSet": {
+      "machineName": "H5P.QuestionSet",
+      "majorVersion": 1,
+      "minorVersion": 20,
+      "patchVersion": 29
+    },
+    "H5P.MultiChoice": {
+      "machineName": "H5P.MultiChoice",
+      "majorVersion": 1,
+      "minorVersion": 16,
+      "patchVersion": 27
+    },
+    "H5P.TrueFalse": {
+      "machineName": "H5P.TrueFalse",
+      "majorVersion": 1,
+      "minorVersion": 8,
+      "patchVersion": 21
+    },
+    "H5P.SingleChoiceSet": {
+      "machineName": "H5P.SingleChoiceSet",
+      "majorVersion": 1,
+      "minorVersion": 11,
+      "patchVersion": 88
+    },
+    "H5P.DragText": {
+      "machineName": "H5P.DragText",
+      "majorVersion": 1,
+      "minorVersion": 10,
+      "patchVersion": 50
+    },
+    "H5P.Blanks": {
+      "machineName": "H5P.Blanks",
+      "majorVersion": 1,
+      "minorVersion": 14,
+      "patchVersion": 37
+    }
+  },
+  "contentLibrariesByMain": {
+    "H5P.InteractiveVideo": [
+      {
+        "machineName": "H5P.MultiChoice",
+        "majorVersion": 1,
+        "minorVersion": 16
+      },
+      {
+        "machineName": "H5P.TrueFalse",
+        "majorVersion": 1,
+        "minorVersion": 8
+      }
+    ],
+    "H5P.QuestionSet": [
+      {
+        "machineName": "H5P.MultiChoice",
+        "majorVersion": 1,
+        "minorVersion": 16
+      },
+      {
+        "machineName": "H5P.TrueFalse",
+        "majorVersion": 1,
+        "minorVersion": 8
+      }
+    ],
+    "H5P.MultiChoice": [],
+    "H5P.TrueFalse": [],
+    "H5P.SingleChoiceSet": [],
+    "H5P.DragText": [],
+    "H5P.Blanks": []
+  },
+  "libraries": [
+    {
+      "machineName": "FontAwesome",
+      "majorVersion": 4,
+      "minorVersion": 5,
+      "patchVersion": 4
+    },
+    {
+      "machineName": "H5P.AdvancedText",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 14
+    },
+    {
+      "machineName": "H5P.Audio",
+      "majorVersion": 1,
+      "minorVersion": 5,
+      "patchVersion": 29
+    },
+    {
+      "machineName": "H5P.Blanks",
+      "majorVersion": 1,
+      "minorVersion": 14,
+      "patchVersion": 37
+    },
+    {
+      "machineName": "H5P.CKEditor",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 24
+    },
+    {
+      "machineName": "H5P.Components",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 97
+    },
+    {
+      "machineName": "H5P.DragNBar",
+      "majorVersion": 1,
+      "minorVersion": 5,
+      "patchVersion": 26
+    },
+    {
+      "machineName": "H5P.DragNDrop",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 5
+    },
+    {
+      "machineName": "H5P.DragNResize",
+      "majorVersion": 1,
+      "minorVersion": 2,
+      "patchVersion": 6
+    },
+    {
+      "machineName": "H5P.DragQuestion",
+      "majorVersion": 1,
+      "minorVersion": 14,
+      "patchVersion": 22
+    },
+    {
+      "machineName": "H5P.DragText",
+      "majorVersion": 1,
+      "minorVersion": 10,
+      "patchVersion": 50
+    },
+    {
+      "machineName": "H5P.FontIcons",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 6
+    },
+    {
+      "machineName": "H5P.FreeTextQuestion",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 22
+    },
+    {
+      "machineName": "H5P.GoToQuestion",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 23
+    },
+    {
+      "machineName": "H5P.GuidedTour",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 6
+    },
+    {
+      "machineName": "H5P.IVHotspot",
+      "majorVersion": 1,
+      "minorVersion": 2,
+      "patchVersion": 26
+    },
+    {
+      "machineName": "H5P.Image",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 33
+    },
+    {
+      "machineName": "H5P.InteractiveVideo",
+      "majorVersion": 1,
+      "minorVersion": 27,
+      "patchVersion": 9
+    },
+    {
+      "machineName": "H5P.JoubelUI",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 45
+    },
+    {
+      "machineName": "H5P.Link",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 25
+    },
+    {
+      "machineName": "H5P.MarkTheWords",
+      "majorVersion": 1,
+      "minorVersion": 11,
+      "patchVersion": 24
+    },
+    {
+      "machineName": "H5P.MaterialDesignIcons",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 0
+    },
+    {
+      "machineName": "H5P.MultiChoice",
+      "majorVersion": 1,
+      "minorVersion": 16,
+      "patchVersion": 27
+    },
+    {
+      "machineName": "H5P.MultiMediaChoice",
+      "majorVersion": 0,
+      "minorVersion": 3,
+      "patchVersion": 77
+    },
+    {
+      "machineName": "H5P.Nil",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 14
+    },
+    {
+      "machineName": "H5P.OpenEndedQuestion",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 28
+    },
+    {
+      "machineName": "H5P.Question",
+      "majorVersion": 1,
+      "minorVersion": 5,
+      "patchVersion": 53
+    },
+    {
+      "machineName": "H5P.QuestionSet",
+      "majorVersion": 1,
+      "minorVersion": 20,
+      "patchVersion": 29
+    },
+    {
+      "machineName": "H5P.Questionnaire",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 11
+    },
+    {
+      "machineName": "H5P.SimpleMultiChoice",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 22
+    },
+    {
+      "machineName": "H5P.SingleChoiceSet",
+      "majorVersion": 1,
+      "minorVersion": 11,
+      "patchVersion": 88
+    },
+    {
+      "machineName": "H5P.Summary",
+      "majorVersion": 1,
+      "minorVersion": 10,
+      "patchVersion": 32
+    },
+    {
+      "machineName": "H5P.Table",
+      "majorVersion": 1,
+      "minorVersion": 2,
+      "patchVersion": 8
+    },
+    {
+      "machineName": "H5P.Text",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 24
+    },
+    {
+      "machineName": "H5P.TextUtilities",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 0
+    },
+    {
+      "machineName": "H5P.Transition",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 4
+    },
+    {
+      "machineName": "H5P.TrueFalse",
+      "majorVersion": 1,
+      "minorVersion": 8,
+      "patchVersion": 21
+    },
+    {
+      "machineName": "H5P.Video",
+      "majorVersion": 1,
+      "minorVersion": 6,
+      "patchVersion": 79
+    },
+    {
+      "machineName": "H5PEditor.ColorSelector",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 1
+    },
+    {
+      "machineName": "H5PEditor.DragQuestion",
+      "majorVersion": 1,
+      "minorVersion": 10,
+      "patchVersion": 27
+    },
+    {
+      "machineName": "H5PEditor.Duration",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 14
+    },
+    {
+      "machineName": "H5PEditor.InteractiveVideo",
+      "majorVersion": 1,
+      "minorVersion": 25,
+      "patchVersion": 11
+    },
+    {
+      "machineName": "H5PEditor.QuestionSetTextualEditor",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 18
+    },
+    {
+      "machineName": "H5PEditor.RadioGroup",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 4
+    },
+    {
+      "machineName": "H5PEditor.RangeList",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 13
+    },
+    {
+      "machineName": "H5PEditor.SelectToggleFields",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 1
+    },
+    {
+      "machineName": "H5PEditor.ShowWhen",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 9
+    },
+    {
+      "machineName": "H5PEditor.SingleChoiceSetTextualEditor",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 10
+    },
+    {
+      "machineName": "H5PEditor.SummaryTextualEditor",
+      "majorVersion": 1,
+      "minorVersion": 1,
+      "patchVersion": 12
+    },
+    {
+      "machineName": "H5PEditor.TableList",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 4
+    },
+    {
+      "machineName": "H5PEditor.Timecode",
+      "majorVersion": 1,
+      "minorVersion": 2,
+      "patchVersion": 14
+    },
+    {
+      "machineName": "H5PEditor.UrlField",
+      "majorVersion": 1,
+      "minorVersion": 2,
+      "patchVersion": 2
+    },
+    {
+      "machineName": "H5PEditor.VerticalTabs",
+      "majorVersion": 1,
+      "minorVersion": 3,
+      "patchVersion": 14
+    },
+    {
+      "machineName": "H5PEditor.Wizard",
+      "majorVersion": 1,
+      "minorVersion": 2,
+      "patchVersion": 17
+    },
+    {
+      "machineName": "Shepherd",
+      "majorVersion": 1,
+      "minorVersion": 0,
+      "patchVersion": 7
+    },
+    {
+      "machineName": "jQuery.ui",
+      "majorVersion": 1,
+      "minorVersion": 10,
+      "patchVersion": 22
+    }
+  ],
+  "closureByMain": {
+    "H5P.InteractiveVideo": {
+      "runtime": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.DragNBar",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 26
+        },
+        {
+          "machineName": "H5P.DragNDrop",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 5
+        },
+        {
+          "machineName": "H5P.DragNResize",
+          "majorVersion": 1,
+          "minorVersion": 2,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.InteractiveVideo",
+          "majorVersion": 1,
+          "minorVersion": 27,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.MultiChoice",
+          "majorVersion": 1,
+          "minorVersion": 16,
+          "patchVersion": 27
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.TrueFalse",
+          "majorVersion": 1,
+          "minorVersion": 8,
+          "patchVersion": 21
+        },
+        {
+          "machineName": "H5P.Video",
+          "majorVersion": 1,
+          "minorVersion": 6,
+          "patchVersion": 79
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ],
+      "full": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.AdvancedText",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 14
+        },
+        {
+          "machineName": "H5P.Audio",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 29
+        },
+        {
+          "machineName": "H5P.Blanks",
+          "majorVersion": 1,
+          "minorVersion": 14,
+          "patchVersion": 37
+        },
+        {
+          "machineName": "H5P.CKEditor",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 24
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.DragNBar",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 26
+        },
+        {
+          "machineName": "H5P.DragNDrop",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 5
+        },
+        {
+          "machineName": "H5P.DragNResize",
+          "majorVersion": 1,
+          "minorVersion": 2,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.DragQuestion",
+          "majorVersion": 1,
+          "minorVersion": 14,
+          "patchVersion": 22
+        },
+        {
+          "machineName": "H5P.DragText",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 50
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.FreeTextQuestion",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 22
+        },
+        {
+          "machineName": "H5P.GoToQuestion",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 23
+        },
+        {
+          "machineName": "H5P.GuidedTour",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.IVHotspot",
+          "majorVersion": 1,
+          "minorVersion": 2,
+          "patchVersion": 26
+        },
+        {
+          "machineName": "H5P.Image",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 33
+        },
+        {
+          "machineName": "H5P.InteractiveVideo",
+          "majorVersion": 1,
+          "minorVersion": 27,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Link",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 25
+        },
+        {
+          "machineName": "H5P.MarkTheWords",
+          "majorVersion": 1,
+          "minorVersion": 11,
+          "patchVersion": 24
+        },
+        {
+          "machineName": "H5P.MaterialDesignIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 0
+        },
+        {
+          "machineName": "H5P.MultiChoice",
+          "majorVersion": 1,
+          "minorVersion": 16,
+          "patchVersion": 27
+        },
+        {
+          "machineName": "H5P.MultiMediaChoice",
+          "majorVersion": 0,
+          "minorVersion": 3,
+          "patchVersion": 77
+        },
+        {
+          "machineName": "H5P.Nil",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 14
+        },
+        {
+          "machineName": "H5P.OpenEndedQuestion",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 28
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Questionnaire",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 11
+        },
+        {
+          "machineName": "H5P.SimpleMultiChoice",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 22
+        },
+        {
+          "machineName": "H5P.SingleChoiceSet",
+          "majorVersion": 1,
+          "minorVersion": 11,
+          "patchVersion": 88
+        },
+        {
+          "machineName": "H5P.Summary",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 32
+        },
+        {
+          "machineName": "H5P.Table",
+          "majorVersion": 1,
+          "minorVersion": 2,
+          "patchVersion": 8
+        },
+        {
+          "machineName": "H5P.Text",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 24
+        },
+        {
+          "machineName": "H5P.TextUtilities",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 0
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.TrueFalse",
+          "majorVersion": 1,
+          "minorVersion": 8,
+          "patchVersion": 21
+        },
+        {
+          "machineName": "H5P.Video",
+          "majorVersion": 1,
+          "minorVersion": 6,
+          "patchVersion": 79
+        },
+        {
+          "machineName": "H5PEditor.ColorSelector",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 1
+        },
+        {
+          "machineName": "H5PEditor.DragQuestion",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 27
+        },
+        {
+          "machineName": "H5PEditor.Duration",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 14
+        },
+        {
+          "machineName": "H5PEditor.InteractiveVideo",
+          "majorVersion": 1,
+          "minorVersion": 25,
+          "patchVersion": 11
+        },
+        {
+          "machineName": "H5PEditor.RadioGroup",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.RangeList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 13
+        },
+        {
+          "machineName": "H5PEditor.SelectToggleFields",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 1
+        },
+        {
+          "machineName": "H5PEditor.ShowWhen",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5PEditor.SingleChoiceSetTextualEditor",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 10
+        },
+        {
+          "machineName": "H5PEditor.SummaryTextualEditor",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 12
+        },
+        {
+          "machineName": "H5PEditor.TableList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.Timecode",
+          "majorVersion": 1,
+          "minorVersion": 2,
+          "patchVersion": 14
+        },
+        {
+          "machineName": "H5PEditor.UrlField",
+          "majorVersion": 1,
+          "minorVersion": 2,
+          "patchVersion": 2
+        },
+        {
+          "machineName": "H5PEditor.VerticalTabs",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 14
+        },
+        {
+          "machineName": "H5PEditor.Wizard",
+          "majorVersion": 1,
+          "minorVersion": 2,
+          "patchVersion": 17
+        },
+        {
+          "machineName": "Shepherd",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 7
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ]
+    },
+    "H5P.QuestionSet": {
+      "runtime": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.MultiChoice",
+          "majorVersion": 1,
+          "minorVersion": 16,
+          "patchVersion": 27
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.QuestionSet",
+          "majorVersion": 1,
+          "minorVersion": 20,
+          "patchVersion": 29
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.TrueFalse",
+          "majorVersion": 1,
+          "minorVersion": 8,
+          "patchVersion": 21
+        },
+        {
+          "machineName": "H5P.Video",
+          "majorVersion": 1,
+          "minorVersion": 6,
+          "patchVersion": 79
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ],
+      "full": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.MultiChoice",
+          "majorVersion": 1,
+          "minorVersion": 16,
+          "patchVersion": 27
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.QuestionSet",
+          "majorVersion": 1,
+          "minorVersion": 20,
+          "patchVersion": 29
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.TrueFalse",
+          "majorVersion": 1,
+          "minorVersion": 8,
+          "patchVersion": 21
+        },
+        {
+          "machineName": "H5P.Video",
+          "majorVersion": 1,
+          "minorVersion": 6,
+          "patchVersion": 79
+        },
+        {
+          "machineName": "H5PEditor.QuestionSetTextualEditor",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 18
+        },
+        {
+          "machineName": "H5PEditor.RadioGroup",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.RangeList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 13
+        },
+        {
+          "machineName": "H5PEditor.ShowWhen",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5PEditor.TableList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.VerticalTabs",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 14
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ]
+    },
+    "H5P.MultiChoice": {
+      "runtime": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.MultiChoice",
+          "majorVersion": 1,
+          "minorVersion": 16,
+          "patchVersion": 27
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ],
+      "full": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.MultiChoice",
+          "majorVersion": 1,
+          "minorVersion": 16,
+          "patchVersion": 27
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.RangeList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 13
+        },
+        {
+          "machineName": "H5PEditor.ShowWhen",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5PEditor.TableList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ]
+    },
+    "H5P.TrueFalse": {
+      "runtime": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.TrueFalse",
+          "majorVersion": 1,
+          "minorVersion": 8,
+          "patchVersion": 21
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ],
+      "full": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.TrueFalse",
+          "majorVersion": 1,
+          "minorVersion": 8,
+          "patchVersion": 21
+        },
+        {
+          "machineName": "H5PEditor.RadioGroup",
+          "majorVersion": 1,
+          "minorVersion": 1,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.ShowWhen",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ]
+    },
+    "H5P.SingleChoiceSet": {
+      "runtime": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.SingleChoiceSet",
+          "majorVersion": 1,
+          "minorVersion": 11,
+          "patchVersion": 88
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ],
+      "full": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.SingleChoiceSet",
+          "majorVersion": 1,
+          "minorVersion": 11,
+          "patchVersion": 88
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.RangeList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 13
+        },
+        {
+          "machineName": "H5PEditor.ShowWhen",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5PEditor.SingleChoiceSetTextualEditor",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 10
+        },
+        {
+          "machineName": "H5PEditor.TableList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.VerticalTabs",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 14
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ]
+    },
+    "H5P.DragText": {
+      "runtime": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.DragText",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 50
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ],
+      "full": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.DragText",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 50
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.RangeList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 13
+        },
+        {
+          "machineName": "H5PEditor.ShowWhen",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5PEditor.TableList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ]
+    },
+    "H5P.Blanks": {
+      "runtime": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Blanks",
+          "majorVersion": 1,
+          "minorVersion": 14,
+          "patchVersion": 37
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.TextUtilities",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 0
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ],
+      "full": [
+        {
+          "machineName": "FontAwesome",
+          "majorVersion": 4,
+          "minorVersion": 5,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5P.Blanks",
+          "majorVersion": 1,
+          "minorVersion": 14,
+          "patchVersion": 37
+        },
+        {
+          "machineName": "H5P.Components",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 97
+        },
+        {
+          "machineName": "H5P.FontIcons",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 6
+        },
+        {
+          "machineName": "H5P.JoubelUI",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 45
+        },
+        {
+          "machineName": "H5P.Question",
+          "majorVersion": 1,
+          "minorVersion": 5,
+          "patchVersion": 53
+        },
+        {
+          "machineName": "H5P.TextUtilities",
+          "majorVersion": 1,
+          "minorVersion": 3,
+          "patchVersion": 0
+        },
+        {
+          "machineName": "H5P.Transition",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "H5PEditor.RangeList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 13
+        },
+        {
+          "machineName": "H5PEditor.ShowWhen",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 9
+        },
+        {
+          "machineName": "H5PEditor.TableList",
+          "majorVersion": 1,
+          "minorVersion": 0,
+          "patchVersion": 4
+        },
+        {
+          "machineName": "jQuery.ui",
+          "majorVersion": 1,
+          "minorVersion": 10,
+          "patchVersion": 22
+        }
+      ]
+    }
+  }
+}

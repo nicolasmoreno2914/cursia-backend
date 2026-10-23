@@ -1,0 +1,65 @@
+import { CourseDesignModule } from '../course-design/course-design.module';
+import { PrebriefModule } from '../prebrief/prebrief.module';
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { GenerationItemRun } from './entities/generation-item-run.entity';
+import { RunsController } from './runs.controller';
+import { RunsService } from './runs.service';
+import { SchedulerService } from './scheduler.service';
+import { ExecutorController } from './executor.controller';
+import { GenerationManifestsModule } from '../generation-manifests/generation-manifests.module';
+import { AuthModule } from '../../auth/auth.module';
+import { AdminModule } from '../../admin/admin.module';
+import { YoutubeModule } from '../../youtube/youtube.module';
+import { DynamicYoutubeController } from './dynamic-youtube.controller';
+import { DynamicYoutubePreflightService } from './dynamic-youtube';
+import { ArtifactsModule } from '../artifacts/artifacts.module';
+import { ArtifactsService } from '../artifacts/artifacts.service';
+import { ArtifactsServiceTextReader, V3_ARTIFACT_TEXT_READER } from './v3-artifact-reader';
+import { FinopsModule } from '../finops/finops.module';
+import { AdminDynamicRunsController } from './admin-runs.controller';
+import { LlmDiagnosticsService } from './llm-diagnostics.service';
+import { AdminRecoveryService } from './admin-recovery.service';
+import { VideogenReconciliationService } from './videogen-reconciliation.service';
+import { ProviderReconcileService } from './provider-reconcile.service';
+import { PilotMetricsService } from './pilot-metrics.service';
+import { CoherenceModule } from '../coherence/coherence.module';
+
+/**
+ * Generación dinámica (Fase 5A): runs sobre un Generation Manifest. No
+ * importa ProductionJobsModule: la fila run de production_jobs se escribe
+ * con SQL propio (execution_mode='dynamic_generation'), sin tocar el
+ * servicio legacy.
+ */
+@Module({
+  imports: [
+    TypeOrmModule.forFeature([GenerationItemRun]),
+    GenerationManifestsModule, // expone GenerationManifestsService.get (ownership + dynamic + Manifest verificado)
+    AuthModule,                // expone SupabaseJwtGuard para el controlador
+    AdminModule,               // expone CostRatesService (estimate de costo de video, R17)
+    YoutubeModule,             // DN-1: YoutubeService/YoutubeTokenService (preflight, sin modificarlos)
+    ArtifactsModule,           // V2.1 R11a: lector de artifacts para validar items LLM v3 al completar
+    FinopsModule,              // V2.1 RF-b: estimado + gates de presupuesto (FinopsBudgetService)
+    CourseDesignModule,        // R68: GenerationDesignGate (sin diseño verificado no hay generación)
+    PrebriefModule,            // Prebrief: sin la versión aprobada y vigente no hay generación (ni estimado)
+    CoherenceModule,           // Loop 10 C2: batería de calidad en las métricas del piloto (solo lectura)
+  ],
+  controllers: [RunsController, ExecutorController, DynamicYoutubeController, AdminDynamicRunsController],
+  providers: [
+    RunsService,
+    AdminRecoveryService, // EV6 DoD BE-B: cola de recuperación de admin (solo lectura)
+    VideogenReconciliationService, // V542 (G6): conciliación explícita de reservas de Videogen (SUPER_ADMIN)
+    ProviderReconcileService, // r62 (N2): conciliación AUTOMÁTICA de Videogen/Gamma con evidencia + reenvío acotado
+    PilotMetricsService, // Loop 10 C2: métricas del piloto de un run (SUPER_ADMIN, solo lectura)
+    SchedulerService,
+    LlmDiagnosticsService,
+    DynamicYoutubePreflightService,
+    {
+      provide: V3_ARTIFACT_TEXT_READER,
+      useFactory: (artifacts: ArtifactsService) => new ArtifactsServiceTextReader(artifacts),
+      inject: [ArtifactsService],
+    },
+  ],
+  exports: [RunsService, SchedulerService, DynamicYoutubePreflightService, ProviderReconcileService],
+})
+export class DynamicGenerationModule {}

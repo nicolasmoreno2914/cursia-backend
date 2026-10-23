@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "Ετικέτα",
+      "description": "Ετικέτα/ επικεφαλίδα απάντησης - όταν ο χρήστης εξάγει όλες τις απαντήσεις"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "Ετικέτα μη υποστηριζόμενης εξαγωγής",
+      "default": "Η εξαγωγή δεν υποστηρίζεται για τη συσκευή σας"
+    },
+    {
+      "label": "Να συμπεριλαμβάνονται τα σχόλια στο έγγραφο που εξάγεται"
+    }
+  ]
+}

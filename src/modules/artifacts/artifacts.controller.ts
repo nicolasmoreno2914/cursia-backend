@@ -9,7 +9,12 @@ import {
   HttpCode,
   HttpStatus,
   UseGuards,
+  ParseUUIDPipe,
+  ForbiddenException,
+  NotFoundException,
 } from '@nestjs/common';
+import { isSuperAdminEmail } from '../../auth/super-admin';
+import { isAdminOnlyPackageArtifact } from '../dynamic-packaging/qa-package';
 import { ArtifactsService } from './artifacts.service';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
@@ -31,7 +36,7 @@ export class ArtifactsController {
     @Body() dto: CreateArtifactDto,
     @CurrentUser() user: AuthUser,
   ) {
-    const artifact = await this.artifactsService.create(dto, user.id);
+    const artifact = await this.artifactsService.createFromApi(dto, user.id);
     return { ok: true, data: artifact };
   }
 
@@ -51,7 +56,9 @@ export class ArtifactsController {
       type,
       jobId,
     });
-    return { ok: true, data: artifacts };
+    // EV6 DoD fix round 3 (N2): los .mbz QA / degradados NUEVOS no se listan a un no admin (ni su storagePath).
+    const admin = isSuperAdminEmail(user.email);
+    return { ok: true, data: admin ? artifacts : artifacts.filter((a) => !isAdminOnlyPackageArtifact(a)) };
   }
 
   /**
@@ -60,10 +67,12 @@ export class ArtifactsController {
    */
   @Get(':id')
   async findOne(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     const artifact = await this.artifactsService.findOne(id, user.id);
+    // EV6 DoD fix round 3 (N2): un .mbz QA / degradado NUEVO no existe para un no admin.
+    if (isAdminOnlyPackageArtifact(artifact) && !isSuperAdminEmail(user.email)) throw new NotFoundException(`Artifact ${id} not found`);
     return { ok: true, data: artifact };
   }
 
@@ -75,11 +84,20 @@ export class ArtifactsController {
    */
   @Get(':id/download-url')
   async getDownloadUrl(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
     @Query('expires') expires?: string,
   ) {
     const expiresIn = expires ? parseInt(expires, 10) : 3600;
+    // EV6 DoD fix round 2 (M4): un .mbz de QA / degradado NUEVO (metadata.packageKind) es solo de
+    // SUPER_ADMIN también por esta ruta genérica. Los .mbz anteriores (sin el campo) no cambian.
+    const artifact = await this.artifactsService.findOne(id, user.id);
+    if (isAdminOnlyPackageArtifact(artifact) && !isSuperAdminEmail(user.email)) {
+      throw new ForbiddenException({
+        code: 'admin_recovery_only',
+        message: 'admin_recovery_only: este paquete es una copia interna de control de calidad (no entregable); solo un administrador de Cursia puede descargarlo.',
+      });
+    }
     const result = await this.artifactsService.getDownloadUrl(
       id,
       user.id,
@@ -95,9 +113,10 @@ export class ArtifactsController {
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
-    await this.artifactsService.remove(id, user.id);
+    // DoD follow-up (R4): un .mbz QA / degradado NUEVO no existe para un no admin (404, igual que GET).
+    await this.artifactsService.remove(id, user.id, { allowAdminOnlyPackage: isSuperAdminEmail(user.email) });
   }
 }

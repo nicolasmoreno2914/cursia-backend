@@ -36,12 +36,19 @@ export class AllExceptionsFilter implements ExceptionFilter {
       ? exception.getResponse()
       : 'Internal server error';
 
-    const errorResponse = {
+    const errorResponse: Record<string, unknown> = {
       statusCode: status,
       timestamp: new Date().toISOString(),
       path: request.url,
       error: typeof message === 'string' ? message : (message as any).message || message,
     };
+    // R68 (piloto): datos estructurados del error que el cliente necesita para explicarlo (motivo del bloqueo de generación,
+    // críticos de Verificación; Prebrief: qué falta para prepararlo, qué cambió y la huella vigente). Solo estas claves.
+    if (message && typeof message === 'object') {
+      for (const k of ['code', 'reason', 'criticals', 'pendingChanges', 'blockers', 'diff', 'modelSha256']) {
+        if ((message as any)[k] !== undefined) errorResponse[k] = (message as any)[k];
+      }
+    }
 
     if (status >= 500) {
       this.logger.error(

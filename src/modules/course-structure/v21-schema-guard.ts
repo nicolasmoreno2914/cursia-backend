@@ -1,0 +1,175 @@
+import { Logger, ServiceUnavailableException } from '@nestjs/common';
+
+/**
+ * V2.1 — fix round 1 (review G2 I5): guarda de esquema de las rutas de
+ * estructura dinámica. El código V2.1 lee/escribe columnas que agrega
+ * `supabase-migration-v21-blueprint-profiles.sql` (R3). Si el código llega a
+ * una base sin esa migración (p.ej. producción antes de correr
+ * scripts/prod/migrate-v2-production.js), las rutas responden 503
+ * `schema_not_migrated_v21` con las columnas faltantes — nunca un 500 crudo
+ * "column … does not exist" ni una lectura a medias.
+ *
+ * El resultado POSITIVO se cachea por proceso (una vez migrado, no vuelve
+ * atrás); el negativo se re-consulta en cada request (la migración puede
+ * correr con el proceso vivo). `probeV21StructureSchema` también se llama al
+ * iniciar el módulo, solo para loguear fuerte.
+ */
+export const SCHEMA_NOT_MIGRATED_V21 = 'schema_not_migrated_v21';
+
+export const V21_STRUCTURE_COLUMNS: ReadonlyArray<{ table: string; column: string }> = [
+  { table: 'courses', column: 'final_exam_enabled' },
+  { table: 'courses', column: 'activity_engine' },
+  { table: 'course_chapters', column: 'activity_enabled' },
+  // Title Normalization: el detalle de módulos/capítulos (mismo archivo de migración).
+  { table: 'course_modules', column: 'description' },
+  { table: 'course_chapters', column: 'description' },
+];
+
+let verified = false;
+
+export function _resetV21SchemaGuardForTests(): void {
+  verified = false;
+}
+
+export async function missingV21StructureColumns(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<string[]> {
+  // TypeORM (DataSource/QueryRunner) devuelve el arreglo; un pg.Client, {rows}.
+  const res: any = await q.query(
+    `select table_name, column_name from information_schema.columns
+      where table_schema = 'public' and (table_name, column_name) in (${V21_STRUCTURE_COLUMNS.map((_, i) => `($${2 * i + 1}, $${2 * i + 2})`).join(', ')})`,
+    V21_STRUCTURE_COLUMNS.flatMap((c) => [c.table, c.column]),
+  );
+  const rows: Array<{ table_name: string; column_name: string }> = Array.isArray(res) ? res : res.rows;
+  const have = new Set(rows.map((r) => `${r.table_name}.${r.column_name}`));
+  return V21_STRUCTURE_COLUMNS.map((c) => `${c.table}.${c.column}`).filter((k) => !have.has(k));
+}
+
+export async function assertV21StructureSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (verified) return;
+  const missing = await missingV21StructureColumns(q);
+  if (missing.length > 0) {
+    throw new ServiceUnavailableException({
+      code: SCHEMA_NOT_MIGRATED_V21,
+      message:
+        `${SCHEMA_NOT_MIGRATED_V21}: la base no tiene la migración V2.1 R3 (supabase-migration-v21-blueprint-profiles.sql); ` +
+        `faltan ${missing.join(', ')}. Correr la migración (scripts/prod/migrate-v2-production.js en producción) antes de usar el editor.`,
+      missing,
+    });
+  }
+  verified = true;
+}
+
+/** Sonda de arranque: solo loguea (fuerte) — las rutas ya fallan con 503 por su cuenta. */
+export async function probeV21StructureSchema(q: { query(sql: string, params?: any[]): Promise<any> }, logger: Pick<Logger, 'error' | 'log'>): Promise<void> {
+  try {
+    const missing = await missingV21StructureColumns(q);
+    if (missing.length > 0) {
+      logger.error(`${SCHEMA_NOT_MIGRATED_V21}: faltan ${missing.join(', ')}; las rutas de estructura dinámica responderán 503 hasta migrar.`);
+    }
+  } catch (err) {
+    logger.error(`${SCHEMA_NOT_MIGRATED_V21}: no se pudo sondear el esquema al iniciar (${err instanceof Error ? err.message : String(err)})`);
+  }
+}
+
+// ── Motor de carga horaria: capítulo de práctica (course_chapters.chapter_kind) ──
+// La migración (supabase-migration-practice-chapters.sql) corre SOLO en staging. Sin ella, la lectura de la
+// estructura NO informa `kind` (el editor no ofrece la práctica) y una escritura con `kind` responde 503
+// `schema_not_migrated_practice` — nunca un 500 crudo. Positivo cacheado por proceso, como la guarda V2.1.
+export const SCHEMA_NOT_MIGRATED_PRACTICE = 'schema_not_migrated_practice';
+let practiceVerified = false;
+
+export function _resetPracticeSchemaGuardForTests(): void {
+  practiceVerified = false;
+}
+
+export async function assertPracticeChapterSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (practiceVerified) return;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'chapter_kind'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (!rows.length) {
+    throw new ServiceUnavailableException({
+      code: SCHEMA_NOT_MIGRATED_PRACTICE,
+      message: `${SCHEMA_NOT_MIGRATED_PRACTICE}: esta base no tiene el capítulo de práctica (course_chapters.chapter_kind); correr supabase-migration-practice-chapters.sql antes de usarlo.`,
+    });
+  }
+  practiceVerified = true;
+}
+
+// ── Fase 2: Actividades de Aplicación (course_chapters.application_minutes) ──
+// Misma regla que la práctica: la migración (supabase-migration-application-activities.sql) corre SOLO en
+// staging; sin ella la lectura no informa `applicationMinutes` y una escritura con la clave responde 503.
+export const SCHEMA_NOT_MIGRATED_APPLICATION = 'schema_not_migrated_application';
+let applicationVerified = false;
+
+export function _resetApplicationSchemaGuardForTests(): void {
+  applicationVerified = false;
+}
+
+export async function assertApplicationActivitySchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (applicationVerified) return;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'application_minutes'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (!rows.length) {
+    throw new ServiceUnavailableException({
+      code: SCHEMA_NOT_MIGRATED_APPLICATION,
+      message: `${SCHEMA_NOT_MIGRATED_APPLICATION}: esta base no tiene las Actividades de Aplicación (course_chapters.application_minutes); correr supabase-migration-application-activities.sql antes de usarlas.`,
+    });
+  }
+  applicationVerified = true;
+}
+
+// ── Loop 9 B: Práctica guiada (course_chapters.guided_practice_minutes) ──
+// Misma regla que las Actividades de Aplicación: la migración (supabase-migration-guided-practice.sql) corre SOLO en
+// staging; sin ella la lectura no informa `guidedPracticeMinutes` y una escritura con la clave responde 503.
+export const SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE = 'schema_not_migrated_guided_practice';
+let guidedPracticeVerified = false;
+
+export function _resetGuidedPracticeSchemaGuardForTests(): void {
+  guidedPracticeVerified = false;
+}
+
+/** ¿La base tiene la columna? (sin lanzar: para escribir la práctica guiada solo donde existe). */
+export async function hasGuidedPracticeSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<boolean> {
+  if (guidedPracticeVerified) return true;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'guided_practice_minutes'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (rows.length) guidedPracticeVerified = true;
+  return rows.length > 0;
+}
+
+export async function assertGuidedPracticeSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (await hasGuidedPracticeSchema(q)) return;
+  throw new ServiceUnavailableException({
+    code: SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE,
+    message: `${SCHEMA_NOT_MIGRATED_GUIDED_PRACTICE}: esta base no tiene los ejercicios guiados (course_chapters.guided_practice_minutes); correr supabase-migration-guided-practice.sql antes de usarla.`,
+  });
+}
+
+// Fase 3 · Contexto académico: la migración (supabase-migration-academic-context.sql) corre SOLO en staging; sin ella
+// la lectura no informa `outcomeIds` y una escritura con la clave responde 503.
+export const SCHEMA_NOT_MIGRATED_ACADEMIC = 'schema_not_migrated_academic';
+let academicVerified = false;
+
+export function _resetAcademicSchemaGuardForTests(): void {
+  academicVerified = false;
+}
+
+export async function assertAcademicContextSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (academicVerified) return;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'outcome_ids'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (!rows.length) {
+    throw new ServiceUnavailableException({
+      code: SCHEMA_NOT_MIGRATED_ACADEMIC,
+      message: `${SCHEMA_NOT_MIGRATED_ACADEMIC}: esta base no tiene el contexto académico (course_chapters.outcome_ids); correr supabase-migration-academic-context.sql antes de vincular resultados.`,
+    });
+  }
+  academicVerified = true;
+}

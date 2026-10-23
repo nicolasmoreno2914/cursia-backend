@@ -1,0 +1,485 @@
+.h5p-dialogcards .h5p-dialogcards-title p:first-child,
+.h5p-dialogcards .h5p-dialogcards-card-text-area p:first-child {
+  margin-top: 0;
+}
+.h5p-dialogcards .h5p-dialogcards-title  p:last-child,
+.h5p-dialogcards .h5p-dialogcards-card-text-area p:last-child {
+  margin-bottom: 0;
+}
+
+.h5p-dialogcards .h5p-dialogcards-title p,
+.h5p-dialogcards .h5p-dialogcards-card-text-area p {
+  font-size: inherit;
+  line-height: inherit;
+  margin: inherit;
+}
+
+.h5p-dialogcards .h5p-dialogcards-progress {
+  height: var(--h5p-theme-spacing-m);
+  line-height: var(--h5p-theme-spacing-m);
+  text-align: center;
+  margin: 0;
+  margin-left: auto;
+}
+
+.h5p-dialogcards-card-text-area {
+  outline: 0;
+}
+
+.h5p-dialogcards {
+  overflow: hidden;
+  position: relative;
+  background-color: var(--h5p-theme-ui-base);
+}
+
+.h5p-dialogcards .h5p-dialogcards-description > p {
+  margin: 0;
+  color: var(--h5p-theme-text-secondary);
+}
+
+.h5p-dialogcards .h5p-navigation .h5p-theme-retry {
+  grid-column: 3;
+  white-space: nowrap;
+}
+
+.h5p-dialogcards .h5p-dialogcards-cardwrap {
+  position: absolute;
+  left: 100%;
+  visibility: hidden;
+  width: 100%;
+  height: inherit;
+  box-sizing: border-box;
+  padding: var(--h5p-theme-spacing-l);
+  background-color: var(--h5p-theme-background);
+  transition: visibility 0s 0.3s, left 300ms;
+}
+.h5p-dialogcards .h5p-dialogcards-cardwrap.h5p-dialogcards-current {
+  visibility: visible;
+  left: 0;
+  transition: left 300ms;
+}
+.h5p-dialogcards .h5p-dialogcards-cardwrap.h5p-dialogcards-previous {
+  left: -100%;
+}
+
+.h5p-dialogcards .h5p-dialogcards-cardholder {
+  height: 100%;
+  margin: auto;
+  max-width: 32em;
+  transition: transform 0.2s ease-in-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .h5p-dialogcards .h5p-dialogcards-cardwrap,
+  .h5p-dialogcards .h5p-dialogcards-cardwrap.h5p-dialogcards-current,
+  .h5p-dialogcards .h5p-dialogcards-cardholder {
+    transition: none;
+  }
+}
+
+.h5p-dialogcards .h5p-dialogcards-mode-repetition .h5p-dialogcards-cardholder {
+  max-width: 40em;
+}
+
+.h5p-dialogcards .h5p-dialogcards-card-content {
+  padding: var(--h5p-theme-spacing-l) 0 0;
+}
+
+.h5p-dialogcards .h5p-dialogcards-card-footer {
+  container-type: inline-size;
+  margin-top: var(--h5p-theme-spacing-l);
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+}
+
+.h5p-dialogcards .h5p-dialogcards-cardwrap.h5p-dialogcards-mode-normal .h5p-dialogcards-card-footer {
+  justify-content: center;
+}
+
+.h5p-dialogcards .h5p-dialogcards-image-wrapper {
+  position: relative;
+}
+
+@media screen and (max-width: 800px) {
+  .h5p-dialogcards .h5p-dialogcards-card-footer {
+    gap: var(--h5p-theme-spacing-xs);
+    flex-direction: column;
+    width: 100%;
+    margin: var(--h5p-theme-spacing-m);
+    margin-left: auto;
+    margin-right: auto;
+  }
+
+  .h5p-dialogcards .h5p-dialogcards-card-footer > button {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .h5p-dialogcards .h5p-dialogcards-card-footer > .h5p-theme-primary-cta::before {
+    text-indent: calc(-0.5 * var(--h5p-theme-spacing-xs));
+  }
+
+  .h5p-dialogcards .h5p-dialogcards-card-footer > .h5p-theme-primary-cta:hover::before {
+    text-indent: calc(-0.5 * var(--h5p-theme-spacing-xs));
+  }
+}
+
+.h5p-dialogcards .h5p-dialogcards-image-wrapper > .h5p-dialogcards-image {
+  text-align: center;
+  max-height: 100%;
+  max-width: 100%;
+  vertical-align: bottom;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+.h5p-dialogcards .h5p-audio-inner.hide {
+  display: none;
+}
+
+.h5p-dialogcards .h5p-dialogcards-card-text-wrapper {
+  position: relative;
+  overflow: hidden;
+  padding: 0 var(--h5p-theme-spacing-l) var(--h5p-theme-spacing-l);
+}
+
+.h5p-dialogcards.h5p-text-scaling .h5p-dialogcards-card-text {
+  height: calc(var(--h5p-theme-spacing-xl)*1.5)
+}
+
+.h5p-dialogcards .h5p-dialogcards-audio-wrapper {
+  display: block;
+  margin: 0 auto;
+  margin-bottom: 0.5em;
+  width: var(--h5p-theme-spacing-xl);
+  height: var(--h5p-theme-spacing-xl);
+  line-height: unset;
+}
+
+.h5p-dialogcards .h5p-dialogcards-audio-wrapper.h5p-audio-not-supported {
+  width: 100%;
+  height: 100%;
+  color: red;
+  font-size: 1em;
+  text-align: center;
+}
+
+.h5p-dialogcards .h5p-dialogcards-audio-wrapper.h5p-audio-not-supported .h5p-audio-not-supported-icon {
+  width: 1.5em;
+  height: 1.5em;
+  padding: 0.25em;
+  margin: 0 auto 1em auto;
+  border: 2px red solid;
+  border-radius: 50%;
+}
+
+.h5p-dialogcards .h5p-dialogcards-audio-wrapper.h5p-audio-not-supported .h5p-audio-not-supported-icon span {
+  width: 100%;
+  height: 100%;
+  display: block;
+  background-image: url(2aecfafb6066a6b8c73d.svg);
+}
+
+.h5p-dialogcards .h5p-dialogcards-audio-wrapper.hide {
+  display: none;
+}
+
+.h5p-dialogcards .h5p-dialogcards-card-text-inner {
+  position: relative;
+  height: calc(100% - calc(2*(var(--h5p-theme-spacing-m))));
+  padding: var(--h5p-theme-spacing-s) var(--h5p-theme-spacing-m);
+}
+
+.h5p-dialogcards.h5p-text-scaling .h5p-dialogcards-card-text-inner {
+  box-sizing: border-box;
+}
+
+.h5p-dialogcards .h5p-dialogcards-card-text-inner-content {
+  width: 100%;
+  padding: 0 1em;
+  box-sizing: border-box;
+}
+
+.h5p-dialogcards .h5p-dialogcards-card-text {
+  display: inline-block;
+  margin: 0.5em 0;
+  height: 4.5em;
+  line-height: 1.5;
+  width: 100%;
+  color: var(--h5p-theme-text-primary);
+}
+
+.h5p-dialogcards .h5p-dialogcards-card-text.hide {
+  display: none;
+}
+
+.h5p-dialogcards .h5p-dialogcards-collapse {
+  transform: scale(0,1);
+}
+
+.h5p-dialogcards .h5p-dialogcards-endcomment {
+  font-size: 1em;
+  color: #666;
+  text-align: center;
+  margin: 0em 1em;
+}
+
+.h5p-dialogcards .h5p-dialogcards-middle {
+  display: table-cell;
+}
+.h5p-dialogcards .h5p-dialogcards-left {
+  text-align: left;
+}
+
+.h5p-dialogcards .h5p-dialogcards-round {
+  color: var(--h5p-theme-text-secondary);
+  font-weight: 400;
+  text-decoration: none solid rgb(153, 153, 153);
+  white-space: nowrap;
+}
+
+.h5p-dialogcards .h5p-dialogcards-round:last-child {
+  grid-column: 3;
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button {
+  border-radius: var(--h5p-theme-border-radius-medium);
+  background-size: cover;
+  font-weight: bold;
+  line-height: 1;
+  cursor: default;
+  margin: 0;
+  opacity: 0.4;
+
+  transition: all 0.1s linear 0s;
+  transition-property: text-indent, padding;
+}
+
+.h5p-dialogcards .h5p-dialogcards-button-hidden {
+  visibility: hidden;
+}
+
+.h5p-dialogcards .h5p-dialogcards-button-gone {
+  display: none;
+  visibility: hidden;
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button:hover {
+  background-color: unset;
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button:active {
+  background-color: var(--h5p-theme-ui-base);
+  box-shadow: none;
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button.h5p-dialogcards-quick-progression {
+  cursor: pointer;
+  opacity: 1;
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button.correct {
+  order: 3;
+  border: 2px solid var(--h5p-theme-feedback-correct-main);
+  color: var(--h5p-theme-feedback-correct-main);
+  text-decoration: none solid var(--h5p-theme-feedback-correct-main);
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button.correct:before {
+  font-family: 'h5p-theme';
+  content: "\e903";
+  font-weight: normal;
+}
+.h5p-dialogcards .h5p-theme-flip,
+.h5p-dialogcards .h5p-theme-results {
+  white-space: nowrap;
+  order: 2;
+}
+
+.h5p-dialogcards .h5p-theme-flip {
+  margin: 0;
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button.correct.h5p-dialogcards-quick-progression:hover,
+.h5p-dialogcards .h5p-dialogcards-answer-button.correct.h5p-dialogcards-quick-progression:focus-visible {
+  color: var(--h5p-theme-feedback-correct-secondary);
+  background-color: var(--h5p-theme-feedback-correct-main);
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button.incorrect {
+  order: 1;
+  border: 3px solid var(--h5p-theme-feedback-incorrect-main);
+  color: var(--h5p-theme-feedback-incorrect-main);
+  text-decoration: none solid var(--h5p-theme-feedback-incorrect-main);
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button.incorrect:before {
+  font-family: 'h5p-theme';
+  content: "\e902";
+  font-weight: normal;
+}
+
+.h5p-dialogcards .h5p-dialogcards-answer-button.incorrect.h5p-dialogcards-quick-progression:hover,
+.h5p-dialogcards .h5p-dialogcards-answer-button.incorrect.h5p-dialogcards-quick-progression:focus-visible {
+  color: var(--h5p-theme-feedback-incorrect-secondary);
+  background-color: var(--h5p-theme-feedback-incorrect-main);
+}
+
+.h5p-dialogcards .h5p-dialogcards-title-container {
+  position: relative;
+  display: flex;
+  align-items: center;
+  padding: var(--h5p-theme-spacing-m);
+  box-shadow: 0px 8px 20px 0px rgba(0, 0, 0, 0.05);
+  border-bottom: 1px solid var(--h5p-theme-stroke-1);
+  background-color: var(--h5p-theme-ui-base);
+  z-index: 1;
+  flex-direction: row;
+  flex: 2 1;
+  column-gap: var(--h5p-theme-spacing-m);
+}
+
+.h5p-dialogcards .h5p-dialogcards-title-wrapper {
+  flex: 1;
+}
+
+.h5p-dialogcards-title-inner .h5p-theme-question-description{
+  padding-left: var(--h5p-theme-spacing-m);
+}
+
+@media only screen and (max-width: 600px) {
+  .h5p-dialogcards .h5p-dialogcards-title-container {
+    flex-direction: column;
+  }
+  .h5p-dialogcards .h5p-dialogcards-progress{
+    margin-left: auto;
+    margin-right: auto;
+    margin-top: var(--h5p-theme-spacing-m);
+  }
+}
+
+/* Don't show on summary screen */
+.h5p-dialogcards:has(.h5p-dialogcards-summary-screen:not(.h5p-dialogcards-gone)) .h5p-dialogcards-title-container {
+  display: none;
+}
+
+.h5p-column-content.h5p-dialogcards .h5p-dialogcards-title-container {
+  margin: calc(-1*var(--h5p-theme-spacing-s)) calc(-1*var(--h5p-theme-spacing-s)) 0 calc(-1*var(--h5p-theme-spacing-s));
+}
+.h5p-column-content.h5p-dialogcards .h5p-navigation {
+  margin: 0 calc(-1*var(--h5p-theme-spacing-s)) calc(-1*var(--h5p-theme-spacing-s)) calc(-1*var(--h5p-theme-spacing-s));
+}
+
+.h5p-dialogcards .h5p-dialogcards-footer-button {
+  display: flex;
+}
+
+.h5p-dialogcards .joubel-tip-container {
+  position: absolute;
+  right: 0.5em;
+  top: 0.1em;
+  font-size: 1.2em;
+}
+
+.h5p-dialogcards .h5p-dialogcards-cardwrap-set {
+  margin: auto;
+  max-width: 32em;
+}
+
+.h5p-dialogcards .h5p-dialogcards-cardwrap-set:has(.h5p-dialogcards-summary-screen) {
+  max-width: unset;
+}
+
+.h5p-dialogcards .h5p-dialogcards-disabled {
+  display: none;
+}
+
+.h5p-course-presentation .h5p-element .h5p-dialogcards-outer-element .h5p-element-inner.h5p-dialogcards.h5p-text-scaling {
+  overflow-y: hidden;
+}
+
+/* Accessibility announcers, hidden from view */
+.h5p-dialogcards-card-side-announcer,
+.h5p-dialogcards-at-progress {
+  position: absolute;
+  height: 0;
+  width: 0;
+  overflow: hidden;
+}
+
+/* Hide question on the "summary" screen */
+.h5p-dialogcards:has(.h5p-dialogcards-summary-screen:not(.h5p-dialogcards-gone)) .h5p-dialogcards-title-container {
+  display: none;
+}
+
+.h5p-dialogcards .h5p-theme-results-list-container {
+  width: calc(100% - 2 * var(--h5p-theme-spacing-xl));
+
+  @media only screen and (max-width: 576px) {
+    width: initial;
+  }
+}
+
+.h5p-dialogcards-summary-screen .h5p-dialogcards-summary-message {
+  width: 100%;
+  margin-top: var(--h5p-theme-spacing-s);
+  text-align: center;
+  font-weight: bold;
+  color: var(--h5p-theme-text-primary);
+  font-size: var(--h5p-theme-font-size-l);
+}
+
+.h5p-dialogcards-summary-screen .h5p-dialogcards-summary-footer {
+  width: 100%;
+  margin-top: var(--h5p-theme-spacing-l);
+  padding-bottom: var(--h5p-theme-spacing-l);
+  display: flex;
+  flex-direction: row;
+  justify-content: center;
+  gap: var(--h5p-theme-spacing-s);
+}
+
+.h5p-dialogcards-summary-screen .h5p-dialogcards-summary-table-row-symbol.h5p-dialogcards-check:before {
+  font-family: 'h5p-theme';
+  content: "\e903";
+  color: var(--h5p-theme-feedback-correct-main);
+}
+
+.h5p-dialogcards-summary-screen .h5p-dialogcards-summary-table-row-symbol.h5p-dialogcards-times:before {
+  font-family: 'h5p-theme';
+  content: "\e902";
+  color: var(--h5p-theme-feedback-incorrect-main);
+}
+
+.h5p-dialogcards-summary-screen .h5p-theme-results-points {
+  display: flex;
+  gap: var(--h5p-theme-spacing-s);
+  justify-self: flex-end;
+
+  .h5p-dialogcards-summary-table-row-score {
+    display: inherit;
+  }
+}
+
+.h5p-dialogcards-gone {
+  display: none;
+  visibility: hidden;
+}
+
+.h5p-dialogcards-visibility-hidden {
+  visibility: hidden;
+}
+
+.button-tooltip {
+  background: #333e;
+  margin: auto;
+  padding: 5px;
+  position: absolute;
+  z-index: 1000;
+  font-size: 12px;
+  transform: translate(-50%, -70%);
+}
+

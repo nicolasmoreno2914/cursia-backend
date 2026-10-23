@@ -1,0 +1,127 @@
+{
+ "fixtureFileVersion": 1,
+ "synthetic": true,
+ "_comment": "SINTÉTICO (LLM falso del E2E, sin proveedor real). Una actividad H5P (capítulo 1.1) con sus dependencias (course_plan, content). Regenerar con scripts/record-replay-fixtures.js.",
+ "fixtures": [
+  {
+   "fixtureVersion": 1,
+   "componentType": "activity",
+   "itemKey": "activity:00000000-0000-4000-8000-f00000978101",
+   "callRole": "validation_retry",
+   "contractVersion": "v21-h5p-5",
+   "provider": "fake-e2e-llm",
+   "model": "claude-sonnet-4-6",
+   "promptHash": "8aab7f9216ad6f762b3f09eb72e49f7177df819d9e8150d64ce6e4d6ea9637fe",
+   "requestHash": "979b53ec70f7568a0718ca63f9372553b1c4ee737a146585bb8e2ec3948869e2",
+   "inputHash": "7dfc447322e3f981671641c64f780a72ec41c20a6806713ec5adb4ed5fbef20a",
+   "sanitizedResponse": {
+    "text": "{\"title\":\"Comprueba tu comprensión\",\"questions\":[{\"kind\":\"multichoice\",\"question\":\"¿Qué mide un manómetro en el circuito?\",\"answers\":[{\"text\":\"La presión del fluido\",\"correct\":true,\"feedback\":\"Bien.\"},{\"text\":\"El caudal total del fluido\",\"correct\":false},{\"text\":\"La viscosidad\",\"correct\":false},{\"text\":\"La temperatura\",\"correct\":false}]},{\"kind\":\"multichoice\",\"question\":\"¿Qué componente genera el caudal?\",\"answers\":[{\"text\":\"La bomba\",\"correct\":true},{\"text\":\"El filtro\",\"correct\":false},{\"text\":\"El estanque\",\"correct\":false},{\"text\":\"La manguera\",\"correct\":false}]},{\"kind\":\"multichoice\",\"question\":\"¿Qué indica un aceite oscuro y con olor a quemado?\",\"answers\":[{\"text\":\"Degradación térmica\",\"correct\":true},{\"text\":\"Aceite nuevo\",\"correct\":false},{\"text\":\"Nivel correcto del aceite\",\"correct\":false},{\"text\":\"Filtro limpio\",\"correct\":false}]},{\"kind\":\"truefalse\",\"question\":\"El bloqueo de energía se aplica antes de intervenir.\",\"correct\":true,\"feedbackCorrect\":\"Sí.\",\"feedbackWrong\":\"Siempre se bloquea antes.\"},{\"kind\":\"truefalse\",\"question\":\"Una fuga pequeña nunca afecta la presión del sistema.\",\"correct\":false,\"feedbackCorrect\":\"Correcto.\",\"feedbackWrong\":\"Toda fuga afecta la presión.\"}]}",
+    "stopReason": "end_turn",
+    "usage": {
+     "input_tokens": 1668,
+     "output_tokens": 301
+    },
+    "redactions": 0
+   },
+   "validatorVersion": "v3-validation@93e44e753f28",
+   "provenance": {
+    "source": "fake",
+    "provider": "fake-e2e-llm",
+    "driver": "offline-driver@1",
+    "courseConfig": "OD-1"
+   },
+   "synthetic": true,
+   "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  {
+   "fixtureVersion": 1,
+   "componentType": "activity",
+   "itemKey": "activity:00000000-0000-4000-8000-f00000978101",
+   "callRole": "main",
+   "contractVersion": "v21-h5p-5",
+   "provider": "fake-e2e-llm",
+   "model": "claude-sonnet-4-6",
+   "promptHash": "998d8dd39536fd2360fd1e118e585d26d1d42a0eb9996a2cb270ba37cdcd1e88",
+   "requestHash": "f68ed84ac49f12333f219169e2ec1c6b0b6d0f983324679fa69f55d6e83862f9",
+   "inputHash": "7dfc447322e3f981671641c64f780a72ec41c20a6806713ec5adb4ed5fbef20a",
+   "sanitizedResponse": {
+    "text": "{\"title\":\"Comprueba tu comprensión\",\"questions\":[{\"kind\":\"multichoice\",\"question\":\"¿Qué mide un manómetro en el circuito?\",\"answers\":[{\"text\":\"La presión del fluido\",\"correct\":true,\"feedback\":\"Bien.\"},{\"text\":\"El caudal total del fluido\",\"correct\":false},{\"text\":\"La viscosidad\",\"correct\":false},{\"text\":\"La temperatura\",\"correct\":false}]}]}",
+    "stopReason": "end_turn",
+    "usage": {
+     "input_tokens": 1609,
+     "output_tokens": 86
+    },
+    "redactions": 0
+   },
+   "validatorVersion": "v3-validation@93e44e753f28",
+   "provenance": {
+    "source": "fake",
+    "provider": "fake-e2e-llm",
+    "driver": "offline-driver@1",
+    "courseConfig": "OD-1"
+   },
+   "synthetic": true,
+   "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  {
+   "fixtureVersion": 1,
+   "componentType": "content",
+   "itemKey": "content:00000000-0000-4000-8000-f00000978101",
+   "callRole": "main",
+   "contractVersion": null,
+   "provider": "fake-e2e-llm",
+   "model": "claude-sonnet-4-6",
+   "promptHash": "fa14565429318740ceca2111f2b70cf1c791ba40d5510c62e4693314267c6e4f",
+   "requestHash": "95cfb4a67e697988fa797927fc1da0829dd085ed62552cfd38892b7fa94556b7",
+   "inputHash": "9bde0b47887fe6371f8622320257c244584b021fc7364519429c8ed44401e002",
+   "sanitizedResponse": {
+    "text": "# Capítulo 1: Punto de equilibrio\n\n## 1.1 Fundamentos\n\nTexto del capítulo MARKCH-00000000-0000-4000-8000-f00000978101-A con ejemplos del sector.\n\n| Parámetro | Valor |\n|---|---|\n| Presión | 210 bar |\n\n■ Glosario del Capítulo: bomba, caudal.\n\n```json context_summary\n{\"summary\":\"Se cubrió Punto de equilibrio (A).\",\"concepts_introduced\":[\"Concepto clave de Punto de equilibrio\",\"Práctica de Punto de equilibrio\"],\"key_terms\":[\"Término de Punto de equilibrio\"]}\n```",
+    "stopReason": "end_turn",
+    "usage": {
+     "input_tokens": 1851,
+     "output_tokens": 116
+    },
+    "redactions": 0
+   },
+   "validatorVersion": "v3-validation@93e44e753f28",
+   "provenance": {
+    "source": "fake",
+    "provider": "fake-e2e-llm",
+    "driver": "offline-driver@1",
+    "courseConfig": "OD-1"
+   },
+   "synthetic": true,
+   "createdAt": "2026-01-01T00:00:00.000Z"
+  },
+  {
+   "fixtureVersion": 1,
+   "componentType": "course_plan",
+   "itemKey": "course_plan:9781",
+   "callRole": "main",
+   "contractVersion": null,
+   "provider": "fake-e2e-llm",
+   "model": "claude-sonnet-4-6",
+   "promptHash": "91351289ca8b17c2087c55f9a0900b4298a9e58f053ed89dd2d4a55c61e47e9c",
+   "requestHash": "ba9d0eb86f0b276b9aae60bcec50dccc662f1c4e99a3d436dd02dabc4e0fa92f",
+   "inputHash": "4ae86b22cb2b11d4b6176b3a3a8118d3c573463088058e1424c467733ce16e57",
+   "sanitizedResponse": {
+    "text": "{\"modules\":{\"00000000-0000-4000-8000-e00000097811\":{\"summary\":\"Propósito del módulo 1: Módulo 1 (A).\"},\"00000000-0000-4000-8000-e00000097812\":{\"summary\":\"Propósito del módulo 2: Módulo 2 (A).\"}},\"chapters\":{\"00000000-0000-4000-8000-f00000978101\":{\"summary\":\"El capítulo 1 cubre Punto de equilibrio y avanza sobre lo anterior (A).\",\"concepts_introduced\":[\"Concepto clave de Punto de equilibrio\",\"Práctica de Punto de equilibrio\"],\"concepts_assumed\":[],\"key_terms\":[\"Término de Punto de equilibrio\"]},\"00000000-0000-4000-8000-f00000978102\":{\"summary\":\"El capítulo 2 cubre Bases de la contabilidad y avanza sobre lo anterior (A).\",\"concepts_introduced\":[\"Concepto clave de Bases de la contabilidad\",\"Práctica de Bases de la contabilidad\"],\"concepts_assumed\":[],\"key_terms\":[\"Término de Bases de la contabilidad\"]},\"00000000-0000-4000-8000-f00000978103\":{\"summary\":\"El capítulo 3 cubre Malas noticias y avanza sobre lo anterior (A).\",\"concepts_introduced\":[\"Concepto clave de Malas noticias\",\"Práctica de Malas noticias\"],\"concepts_assumed\":[],\"key_terms\":[\"Término de Malas noticias\"]},\"00000000-0000-4000-8000-f00000978104\":{\"summary\":\"El capítulo 4 cubre Incidentes de seguridad y avanza sobre lo anterior (A).\",\"concepts_introduced\":[\"Concepto clave de Incidentes de seguridad\",\"Práctica de Incidentes de seguridad\"],\"concepts_assumed\":[],\"key_terms\":[\"Término de Incidentes de seguridad\"]}}}",
+    "stopReason": "end_turn",
+    "usage": {
+     "input_tokens": 1250,
+     "output_tokens": 348
+    },
+    "redactions": 0
+   },
+   "validatorVersion": "v3-validation@93e44e753f28",
+   "provenance": {
+    "source": "fake",
+    "provider": "fake-e2e-llm",
+    "driver": "offline-driver@1",
+    "courseConfig": "OD-1"
+   },
+   "synthetic": true,
+   "createdAt": "2026-01-01T00:00:00.000Z"
+  }
+ ]
+}

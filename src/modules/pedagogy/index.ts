@@ -1,0 +1,17 @@
+/** Motor pedagógico V1 — API pública del módulo (lógica pura). */
+export * from './vocabulary';
+export * from './approach-registry';
+export * from './builtin-approaches';
+export * from './pedagogy-profile';
+export * from './design-rules';
+export * from './blueprint-design';
+export * from './pedagogical-blueprint';
+export * from './manifest-design';
+export * from './recommendation';
+export * from './dry-run';
+export * from './labels';
+export * from './pedagogy-db';
+export * from './generator-directives';
+export * from './learning-type';
+export * from './instructional-frameworks';
+export * from './learning-plan-directives';

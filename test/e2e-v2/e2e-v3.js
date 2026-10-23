@@ -1,0 +1,4888 @@
+/* eslint-disable */
+// Cursia V2.1 — R13: fase rulesVersion 3 del E2E local (sin gasto ni red externa).
+//
+// Corre DESPUÉS del E2E v2 (e2e.js) sobre el MISMO PG16 descartable (run-e2e.sh
+// con E2E_AFTER, ver run-e2e-v21.sh). App Nest real + workers reales (item,
+// provider, package) como procesos hijos con netguard; ejecutor REAL del
+// navegador (vm) con un LLM falso v3 (llm-v3.js); Videogen, Storage y Google
+// falsos en 127.0.0.1 (el video "se publica" con el id de YouTube real
+// IdwOipZAeqY y dura 468 s); Gamma/TTS en modo MOCK (fixtures R9/R10).
+//
+// Cursos (§R.1 adaptada): E1 (2 módulos, las 4 combinaciones V/A, aula-clara
+// light, 70, final ON, h5p) + re-empaque (tecnico/dark, 80); E2 (4 módulos,
+// oscuro-premium dark, 60, final OFF, scorm); E3 (2 módulos, tecnico dark, 80,
+// final ON, h5p). Luego restore de los 4 MBZ en el Moodle 4.5 local
+// (restore-and-inspect.sh + inspector PHP) y simulación de notas.
+//
+// Salida: $OUT/results-v3.json (+ MBZ, JSON de Moodle) para el QA de
+// navegador (browser-qa-v3.js) y el resumen (run-e2e-v21.sh).
+//
+// EV6 P2-B6 — evaluaciones como BANCOS (dynamic_exam_bank_json): E1 y E3 corren con el modo banco
+// del ejecutor ENCENDIDO solo dentro de esta prueba (override `S.front.DYN_EXAM_BANK_MODE_ENABLED =
+// true` sobre el vm, DESPUÉS de cargar 45; el frontend de producción trae la constante en false).
+// E2 y E4 siguen por GIFT (cobertura del camino de siempre). El LLM falso de bancos
+// (llm-exam-bank.js) inyecta una falla UNA vez → exactamente una reparación.
+//
+// EV6 H5P v2 (H4) — E5: curso con DYNAMIC_ACTIVITY_TYPE_RULES=2 (la app se REINICIA con ese env solo
+// para E5, después de E1–E4, que siguen con rules 0/1 y sus aserciones de siempre): capítulo «decidir…»
+// → Branching Scenario (respuesta inválida una vez → reintento dirigido), «Repaso» encendido por ser un
+// curso nuevo con H5P v2, IV avanzado (video de 468 s → 2 pausas de reflexión) → empaque → restore en
+// Moodle 4.5 → inspección. Necesita el frontend de H3 (fixtures/h5p2/fake-llm-h5p2.json); con un
+// frontend sin H5P v2, E2E_H5P2=auto (default) omite E5 (queda registrado) y E2E_H5P2=require falla.
+'use strict';
+const { keepTeacherDesign } = require('./design-approval');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const { spawn, spawnSync } = require('child_process');
+
+const REPO = process.env.REPO;
+const FE = process.env.FE_ROOT;
+const OUT = process.env.OUT;
+const HERE = __dirname;
+const R = (m) => require(path.join(REPO, 'node_modules', m));
+const jwt = R('jsonwebtoken');
+const JSZip = R('jszip');
+const { Client } = R('pg');
+const { startFakes, startProviderFakes } = require('./fakes');
+const { makeFront } = require('./front');
+const { createLlm } = require('./llm');
+const { createLlmV3 } = require('./llm-v3');
+const D = (p) => require(path.join(REPO, 'dist', p));
+const SHELL_TYPES = require(path.join(REPO, 'dist', 'modules/course-shell/index.js'));
+const PV = require('./providers');
+// EV6 H5P v2: fixtures del LLM falso del frontend H3 (null si el frontend no trae H5P v2).
+const H5P2_FIXTURE = path.join(FE, 'fixtures/h5p2/fake-llm-h5p2.json');
+const H5P2 = fs.existsSync(H5P2_FIXTURE) ? JSON.parse(fs.readFileSync(H5P2_FIXTURE, 'utf8')) : null;
+const H5P2_MODE = process.env.E2E_H5P2 || 'auto'; // auto | require | off
+
+const PGPORT = Number(process.env.PGPORT_T);
+const APP_PORT = Number(process.env.APP_PORT || 38471) + 7;
+const OWNER = crypto.randomUUID();
+const JWT_SECRET = crypto.randomBytes(32).toString('hex');
+const VIDEOGEN_KEY = 'fake-videogen-key-local-only';
+const YT_ID = 'IdwOipZAeqY';
+const V3OUT = path.join(OUT, 'v3');
+fs.mkdirSync(V3OUT, { recursive: true });
+const NET_LOG = path.join(V3OUT, 'net-violations.log');
+const MOODLE_SCRATCH = process.env.MOODLE_SCRATCH;
+// LOOP 7: restores de Moodle con la sesión del admin (como un restore web): los overrides del paquete se aplican.
+process.env.CURSIA_RESTORE_PHP = process.env.CURSIA_RESTORE_PHP || path.join(REPO, 'scripts/moodle/restore-as-admin.php');
+// V2.1 F2: `E2E_V3_ONLY=real-providers` corre SOLO arranque + workers + E4 (Gamma/TTS/LLM reales contra
+// fakes locales), sin E1–E3 ni restores de Moodle (para correrlo aparte cuando el Moodle local está ocupado).
+const ONLY_REAL_PROVIDERS = process.env.E2E_V3_ONLY === 'real-providers';
+// Loop 4: `E2E_V3_ONLY=llm-worker` corre SOLO arranque + workers + E24 (worker de IA del backend; iteración rápida).
+const ONLY_LLM_WORKER = process.env.E2E_V3_ONLY === 'llm-worker';
+// Claves FALSAS de los proveedores reales (Gamma/OpenAI/Anthropic): solo abren los fakes de 127.0.0.1.
+const PROVIDER_KEYS = { gamma: 'fake-gamma-key-e2e-local', openai: 'fake-openai-key-e2e-local', anthropic: 'fake-anthropic-key-e2e-local' };
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ─── resultados ───────────────────────────────────────────────────────────
+const results = { startedAt: new Date().toISOString(), owner: OWNER, steps: {}, assertions: [], timings: {}, mbz: {}, courses: {}, finops: {}, counters: {} };
+let curStep = 'setup';
+function ok(cond, msg, detail) {
+  const r = { step: curStep, ok: !!cond, msg };
+  if (!cond && detail !== undefined) r.detail = detail;
+  results.assertions.push(r);
+  console.log(`${cond ? '✅' : '❌'} [${curStep}] ${msg}${!cond && detail !== undefined ? '  ' + JSON.stringify(detail).slice(0, 1500) : ''}`);
+  return !!cond;
+}
+function eq(a, b, msg) { return ok(JSON.stringify(a) === JSON.stringify(b), msg, { got: a, want: b }); }
+// Solo para iterar en local: E2E_V3_STEPS=<regex> corre solo los pasos cuyo nombre coincide (el gate nunca lo define).
+const STEP_FILTER = process.env.E2E_V3_STEPS ? new RegExp(process.env.E2E_V3_STEPS) : null;
+async function step(name, fn, { fatal = true } = {}) {
+  if (STEP_FILTER && !STEP_FILTER.test(name)) { console.log(`(paso ${name} omitido por E2E_V3_STEPS)`); return; }
+  curStep = name;
+  console.log(`\n══════ ${name} ══════`);
+  const t0 = Date.now();
+  let threw = null;
+  try { await fn(); } catch (e) { threw = e; ok(false, `excepción: ${e && e.stack ? e.stack.split('\n').slice(0, 6).join(' | ') : e}`); }
+  const ms = Date.now() - t0;
+  results.timings[name] = ms;
+  const mine = results.assertions.filter((a) => a.step === name);
+  results.steps[name] = { pass: !threw && mine.every((a) => a.ok), assertions: mine.length, failed: mine.filter((a) => !a.ok).length, ms };
+  console.log(`── ${name}: ${results.steps[name].pass ? 'PASS' : 'FAIL'} (${mine.length} aserciones, ${ms} ms)`);
+  save();
+  if (threw && fatal) throw threw;
+}
+function save() { fs.writeFileSync(path.join(V3OUT, 'results-v3.json'), JSON.stringify(results, null, 2)); }
+
+// ─── procesos ───────────────────────────────────────────────────────────────
+const children = new Set();
+let FAKES;
+let PFAKES; // V2.1 F2: Gamma / OpenAI TTS / Anthropic falsos
+let PURLS;
+const YT_SECRET = crypto.randomBytes(32).toString('hex');
+function baseEnv() {
+  return {
+    PATH: process.env.PATH, HOME: process.env.HOME, LANG: 'C', LC_ALL: 'C',
+    NODE_ENV: 'production', NODE_PATH: path.join(REPO, 'node_modules'),
+    NODE_OPTIONS: `--require ${JSON.stringify(path.join(HERE, 'netguard.js'))} --require ${JSON.stringify(path.join(HERE, 'google-fake-redirect.js'))}`,
+    E2E_NET_LOG: NET_LOG, E2E_GOOGLE_FAKE_BASE: FAKES.googleUrl,
+    DB_HOST: '127.0.0.1', DB_PORT: String(PGPORT), DB_USER: 'postgres', DB_PASS: 'x', DB_NAME: 'v2db', DB_SSL: 'false',
+    SUPABASE_URL: FAKES.storageUrl, SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-key-local-only', SUPABASE_JWT_SECRET: JWT_SECRET,
+    DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3',
+    DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_V2_ALLOWED_OWNERS: OWNER,
+    // rulesVersion 3: worker de proveedor desplegado + mocks de Gamma/TTS permitidos (escape de no-producción).
+    DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', DYNAMIC_ALLOW_PROVIDER_MOCK: 'true',
+    // EV6 DoD (BE-A): SOLO en este sandbox — escape de QA para video de vista previa y el owner de la
+    // prueba como SUPER_ADMIN (E1–E3 terminan `preview` por Gamma/TTS mock: su paquete es QA, rotulado).
+    DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'e2e-v3-owner@example.com',
+    // Config de producción del video: entrega YouTube (sin DYNAMIC_VIDEO_DELIVERY ni el escape videogen_direct).
+    YOUTUBE_TOKEN_SECRET: YT_SECRET, YOUTUBE_CLIENT_ID: 'fake-client-id', YOUTUBE_CLIENT_SECRET: 'fake-client-secret',
+    VIDEOGEN_API_URL: FAKES.videogenUrl, VIDEOGEN_API_KEY: VIDEOGEN_KEY,
+    // V2.1 F2: proveedores REALES de Gamma/TTS/LLM apuntando a fakes en 127.0.0.1 (claves falsas).
+    GAMMA_API_KEY: PROVIDER_KEYS.gamma, GAMMA_API_BASE_URL: PURLS.gammaUrl,
+    GAMMA_THEME_V21_LIGHT_DEFAULT: 'e2e-theme-light', GAMMA_THEME_V21_DARK_DEFAULT: 'e2e-theme-dark',
+    OPENAI_API_KEY: PROVIDER_KEYS.openai, OPENAI_API_BASE_URL: PURLS.openaiUrl,
+    ANTHROPIC_API_KEY: PROVIDER_KEYS.anthropic, ANTHROPIC_API_BASE_URL: PURLS.anthropicUrl,
+    DYNAMIC_GAMMA_POLL_MS: '200',
+  };
+}
+function spawnProc(label, script, env) {
+  const logFile = path.join(V3OUT, `${label}.log`);
+  const fd = fs.openSync(logFile, 'a');
+  const ch = spawn(process.execPath, [path.join(REPO, 'dist', script)], { cwd: V3OUT, env, stdio: ['ignore', fd, fd] });
+  ch.label = label; ch.logFile = logFile; ch.exited = null;
+  ch.on('exit', (code, sig) => { ch.exited = { code, sig }; children.delete(ch); });
+  children.add(ch);
+  return ch;
+}
+async function stopProc(ch, timeoutMs = 20000) {
+  if (!ch || ch.exited) return ch && ch.exited;
+  ch.kill('SIGTERM');
+  const t0 = Date.now();
+  while (!ch.exited && Date.now() - t0 < timeoutMs) await sleep(100);
+  if (!ch.exited) { ch.kill('SIGKILL'); await sleep(300); }
+  return ch.exited;
+}
+async function startApp(extraEnv = {}, label = 'app-v3') {
+  const ch = spawnProc(label, 'main.js', { ...baseEnv(), ...extraEnv, PORT: String(APP_PORT) });
+  const t0 = Date.now();
+  while (Date.now() - t0 < 60000) {
+    if (ch.exited) throw new Error(`app terminó al arrancar: ${JSON.stringify(ch.exited)} (ver ${ch.logFile})`);
+    try { const r = await fetch(`http://127.0.0.1:${APP_PORT}/health`); if (r.ok) return ch; } catch {}
+    await sleep(250);
+  }
+  throw new Error('app no respondió /health en 60s');
+}
+
+// ─── HTTP ──────────────────────────────────────────────────────────────────
+// r58: como un token real de Supabase (email confirmado en user_metadata): el owner del e2e es SuperAdmin y el guard
+// exige identidad verificada (sin auth.users en el PG del e2e, decide el claim).
+const TOKEN = jwt.sign({ sub: OWNER, email: 'e2e-v3-owner@example.com', role: 'authenticated', aud: 'authenticated', user_metadata: { email_verified: true } }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '6h' });
+const BASE = `http://127.0.0.1:${APP_PORT}/api/v1`;
+async function api(method, p, body, token = TOKEN) {
+  const headers = { 'content-type': 'application/json' };
+  if (token) headers.authorization = `Bearer ${token}`;
+  const res = await fetch(BASE + p, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  let json = null;
+  try { json = await res.json(); } catch {}
+  return { status: res.status, data: json && json.data !== undefined ? json.data : null, error: json && (json.error || json.message), raw: json };
+}
+let db;
+const q = async (sql, params) => (await db.query(sql, params)).rows;
+
+// ─── Cursos de la matriz ───────────────────────────────────────────────────
+const CTX = { sector: 'Minería', pais: 'Chile', ciudad: 'Antofagasta', contexto: 'Técnicos de mantenimiento de planta concentradora', nivel: 'Intermedio', tono: 'cercano y técnico', obj: 'Formar técnicos que mantengan sistemas hidráulicos', comp: 'Diagnostica y mantiene sistemas hidráulicos' };
+const COURSES = [
+  { key: 'E1', title: '[E2E V2.1 E1] Hidráulica de planta', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: true, modules: [
+    { title: 'Fundamentos del circuito', objective: 'Comprender presión y caudal', exam: true, chapters: [
+      { title: 'Presión y caudal en planta', v: true, a: true, h5p: 'questionset' },
+      { title: 'Fluidos y contaminación del aceite', v: false, a: true, h5p: 'dragtext' },
+    ] },
+    { title: 'Componentes de potencia', objective: 'Seleccionar bombas y actuadores', exam: false, chapters: [
+      { title: 'Bombas de engranajes y paletas', v: true, a: false },
+      { title: 'Cilindros de doble efecto', v: false, a: false },
+    ] },
+  ] },
+  { key: 'E2', title: '[E2E V2.1 E2] Mantenimiento predictivo', theme: { themeFamily: 'oscuro-premium', mode: 'dark' }, passing: 60, finalExam: false, engine: 'scorm', examBank: false, modules: [
+    { title: 'Diagnóstico por síntomas', objective: 'Aislar la causa de una falla', exam: true, chapters: [{ title: 'Síntomas de falla en bombas', v: true, a: true }] },
+    { title: 'Análisis del aceite', objective: 'Interpretar un informe de aceite', exam: true, chapters: [
+      { title: 'Muestreo de aceite en terreno', v: false, a: true },
+      { title: 'Lectura del informe de laboratorio', v: false, a: false },
+    ] },
+    { title: 'Termografía aplicada', objective: 'Detectar puntos calientes', exam: true, chapters: [{ title: 'Puntos calientes en válvulas', v: true, a: false }] },
+    { title: 'Plan predictivo', objective: 'Armar un plan predictivo', exam: true, chapters: [
+      { title: 'Rutas de inspección', v: true, a: true },
+      { title: 'Indicadores de confiabilidad', v: false, a: true },
+    ] },
+  ] },
+  { key: 'E3', title: '[E2E V2.1 E3] Válvulas y control', theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, finalExam: true, engine: 'h5p', examBank: true, modules: [
+    { title: 'Válvulas direccionales', objective: 'Leer esquemas de válvulas', exam: true, chapters: [
+      { title: 'Esquemas de centros de válvula', v: true, a: true, h5p: 'blanks' },
+      { title: 'Solenoides y mando', v: false, a: false },
+    ] },
+    { title: 'Control de presión', objective: 'Ajustar válvulas de alivio', exam: true, chapters: [{ title: 'Válvulas de alivio y secuencia', v: false, a: true }] },
+  ] },
+];
+
+async function readStructure(courseId) {
+  const r = await api('GET', `/courses/${courseId}/modules`);
+  if (r.status !== 200) throw new Error(`GET modules ${r.status} ${r.error}`);
+  return r.data;
+}
+async function artifactsOfRun(runId) {
+  return q(`select a.id, a.type, a.status, a.storage_bucket, a.storage_path, a.item_run_id, a.metadata, g.item_key
+              from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 order by a.id`, [runId]);
+}
+async function itemRuns(runId) {
+  return q(`select id, item_key, type, status, worker_id, attempt_count, output_summary, chapter_id, module_id, error as error_message from public.generation_item_runs where job_id = $1 order by item_key`, [runId]);
+}
+async function waitRunTerminal(ctl, label, timeoutMs = 15 * 60 * 1000, runId = null) {
+  const t0 = Date.now();
+  let lastDb = 0;
+  while (Date.now() - t0 < timeoutMs) {
+    if (['completed', 'preview', 'failed', 'cancelled', 'fatal', 'stopped'].includes(ctl.state.status)) return ctl.state;
+    // EV6 DoD (BE-A): `preview` es terminal en el backend; un ejecutor del navegador anterior a la DoD no
+    // lo conoce y seguiría consultando → se lee el estado del run y se detiene al ejecutor (solo la prueba).
+    if (runId && Date.now() - lastDb > 2000) {
+      lastDb = Date.now();
+      const [r] = await q(`select worker_status from public.production_jobs where id = $1`, [runId]);
+      if (r && r.worker_status === 'preview') {
+        ctl.stop();
+        return { ...ctl.state, status: 'preview', stoppedByHarness: true };
+      }
+    }
+    await sleep(500);
+  }
+  throw new Error(`${label}: el ejecutor no terminó en ${timeoutMs} ms (estado ${JSON.stringify(ctl.state)})`);
+}
+async function waitItemsDone(runId, timeoutMs = 10 * 60 * 1000) {
+  const t0 = Date.now();
+  let items = [];
+  while (Date.now() - t0 < timeoutMs) {
+    items = await itemRuns(runId);
+    if (items.length && items.every((i) => ['completed', 'failed', 'blocked', 'cancelled'].includes(i.status))) return items;
+    await sleep(700);
+  }
+  return items;
+}
+
+/** Crea el curso por HTTP (estructura, toggles v3, perfiles), bloquea el Blueprint y crea el Manifest v3. */
+/** LOOP 8.1: versión vigente del perfil pedagógico (guardar el contexto académico lo deriva y sube la versión). */
+async function pedagogyVersion(courseId) {
+  const r = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+  return r.status === 200 && r.data ? Number(r.data.version) : 0;
+}
+
+async function createCourse(C, llm) {
+  const fc = crypto.randomUUID();
+  const c = await api('POST', '/courses/dynamic', { frontendCourseId: fc, title: C.title });
+  ok(c.status === 201, `${C.key}: POST /courses/dynamic → 201`, { s: c.status, e: c.error });
+  const courseId = Number(c.data.id);
+  // Fase 3: contexto académico guardado ANTES de crear los capítulos (los vínculos solo apuntan a un contexto guardado).
+  if (C.academic) {
+    const pa = await api('POST', `/courses/${courseId}/profiles/academic`, { data: C.academic, expectedVersion: 0 });
+    ok(pa.status === 201, `${C.key}: POST profiles/academic → 201`, { s: pa.status, e: pa.error });
+  }
+  let st = await readStructure(courseId);
+  let counter = st.structureVersionCounter;
+  for (const m of st.modules) counter = (await api('DELETE', `/courses/${courseId}/modules/${m.id}`, { expectedCounter: counter })).data.structureVersionCounter;
+  const setg = await api('PATCH', `/courses/${courseId}/structure-settings`, { finalExam: C.finalExam, activityEngine: C.engine, expectedCounter: counter });
+  ok(setg.status === 200 && setg.data.finalExam === C.finalExam && setg.data.activityEngine === C.engine, `${C.key}: PATCH structure-settings → finalExam ${C.finalExam}, motor ${C.engine}`, { s: setg.status, e: setg.error, d: setg.data });
+  counter = setg.data.structureVersionCounter;
+  for (const ms of C.modules) {
+    const cm = await api('POST', `/courses/${courseId}/modules`, { title: ms.title, objective: ms.objective, examEnabled: ms.exam, expectedCounter: counter });
+    if (cm.status !== 201) throw new Error(`POST module ${cm.status} ${cm.error}`);
+    counter = cm.data.structureVersionCounter;
+    const mid = cm.data.module.id;
+    const auto = cm.data.module.chapters || [];
+    for (let i = 0; i < ms.chapters.length; i++) {
+      const cs = ms.chapters[i];
+      // EV6 H5P v2: `cs.objective` explícito (p. ej. «Decidir…» → Branching Scenario con rules 2).
+      const body = { title: cs.title, objective: cs.objective || `Aplicar ${cs.title.toLowerCase()}`, videoEnabled: cs.v, activityEnabled: cs.a, expectedCounter: counter };
+      // Fase 2: capítulo de práctica y Actividad de Aplicación (minutos) cuando el escenario los pide.
+      if (cs.kind) body.kind = cs.kind;
+      if (cs.app) body.applicationMinutes = cs.app;
+      // Loop 9 B: práctica guiada del capítulo de contenido (minutos) cuando el escenario la pide.
+      if (cs.gp) body.guidedPracticeMinutes = cs.gp;
+      // Fase 3: descripción y vínculos a resultados del contexto académico.
+      if (cs.description) body.description = cs.description;
+      if (cs.outcomeIds) body.outcomeIds = cs.outcomeIds;
+      const isAuto = i === 0 && auto.length === 1;
+      const r = isAuto
+        ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
+        : await api('POST', `/courses/${courseId}/modules/${mid}/chapters`, body);
+      if (![200, 201].includes(r.status)) throw new Error(`capítulo "${cs.title}": ${r.status} ${r.error}`);
+      counter = r.data.structureVersionCounter;
+      // R13 fix round 1 (I5): cobertura DETERMINÍSTICA de los 3 tipos H5P calificables. El tipo sale
+      // del UUID del capítulo (R-012, FNV-1a); si no coincide con el pedido, se crea el capítulo de
+      // nuevo (UUID nuevo) y se borra el anterior, hasta que la rotación dé el tipo pedido.
+      if (cs.h5p) {
+        let curId = isAuto ? auto[0].id : r.data.chapter.id;
+        for (let tries = 0; SHELL_TYPES.activityTypeForChapter(curId) !== cs.h5p; tries++) {
+          if (tries > 60) throw new Error(`no se obtuvo un UUID con tipo ${cs.h5p} para "${cs.title}"`);
+          const nw = await api('POST', `/courses/${courseId}/modules/${mid}/chapters`, { ...body, expectedCounter: counter });
+          if (nw.status !== 201) throw new Error(`recrear capítulo: ${nw.status} ${nw.error}`);
+          counter = nw.data.structureVersionCounter;
+          const del = await api('DELETE', `/courses/${courseId}/modules/${mid}/chapters/${curId}`, { expectedCounter: counter });
+          if (del.status !== 200) throw new Error(`borrar capítulo: ${del.status} ${del.error}`);
+          counter = del.data.structureVersionCounter;
+          curId = nw.data.chapter.id;
+        }
+      }
+    }
+  }
+  st = await readStructure(courseId);
+  const mods = st.modules.map((m) => ({ id: m.id, title: m.title, exam: m.examEnabled, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title, v: !!x.videoEnabled, a: x.activityEnabled !== false, kind: x.kind || 'content', app: x.applicationMinutes ?? null, gp: x.guidedPracticeMinutes ?? null })) }));
+  eq(mods.map((m) => m.chapters.map((x) => `${x.kind}/${x.app}/${x.gp}`)), C.modules.map((m) => m.chapters.map((x) => `${x.kind || 'content'}/${x.app || null}/${x.gp || null}`)), `${C.key}: tipo de capítulo, minutos de Actividad de Aplicación y de práctica guiada persistidos`);
+  eq(mods.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), C.modules.map((m) => m.chapters.map((x) => `${x.v ? 'V+' : 'V-'}${x.a ? 'A+' : 'A-'}`)), `${C.key}: estructura viva con las combinaciones V/A pedidas`);
+  // Perfiles (append-only, fuera del Blueprint): evaluación y presentación.
+  const A = D('modules/course-profiles/course-profiles.js');
+  const assessment = { ...A.defaultAssessmentProfile({ finalExam: C.finalExam }), passingGrade: C.passing };
+  const pa = await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment });
+  ok(pa.status === 201, `${C.key}: POST profiles/assessment (passingGrade ${C.passing}) → 201`, { s: pa.status, e: pa.error });
+  const pp = await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { ...C.theme, brandSeed: null, themeVersion: 1 } });
+  ok(pp.status === 201, `${C.key}: POST profiles/presentation (${C.theme.themeFamily}/${C.theme.mode}) → 201`, { s: pp.status, e: pp.error });
+  // Motor pedagógico V1 (E6): perfil pedagógico ANTES del lock (el lock lo congela en el Blueprint).
+  if (C.pedagogy) {
+    // LOOP 8.1: con contexto académico guardado, el perfil ya se derivó (versión 1): se guarda sobre la vigente, como el panel.
+    const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: C.pedagogy, expectedVersion: await pedagogyVersion(courseId) });
+    ok(pg.status === 201 && pg.data.profile.designRules && pg.data.profile.designRules.engineVersion === 1, `${C.key}: POST profiles/pedagogy (${C.pedagogy.primaryApproach}) → 201 con reglas del servidor`, { s: pg.status, e: pg.error });
+  }
+  // R68: el docente conserva su estructura (video/Actividad fijados y sus horas) antes de aprobarla.
+  await keepTeacherDesign(api, courseId, C.key);
+  st = await readStructure(courseId);
+  const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+  ok(lock.status === 201 && lock.data.blueprint.snapshot && lock.data.blueprint.snapshot.schemaVersion === 2, `${C.key}: lock → Blueprint schemaVersion 2`, { s: lock.status, e: lock.error, sv: lock.data && lock.data.blueprint && lock.data.blueprint.snapshot && lock.data.blueprint.snapshot.schemaVersion });
+  const n = lock.data.blueprint.blueprintNumber;
+  const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+  ok(man.status === 201 && man.data.manifest.rulesVersion === 3, `${C.key}: POST manifest → 201 rulesVersion 3`, { s: man.status, e: man.error });
+  const manifest = man.data.manifest;
+  const M = manifest.manifest;
+  const chapters = mods.flatMap((m) => m.chapters);
+  const want = {
+    videos: chapters.filter((x) => x.v).length, activities: chapters.filter((x) => x.a).length, exams: mods.filter((m) => m.exam).length,
+  };
+  const contentChapters = chapters.filter((x) => x.kind !== 'practice').length;
+  eq([M.totals.videoCount, M.totals.activityCount, M.totals.examCount, M.totals.finalExamCount, M.totals.presentationCount, M.totals.audiobookChapterCount, M.totals.experienceCount],
+    [want.videos, want.activities, want.exams, C.finalExam ? 1 : 0, contentChapters, contentChapters, chapters.length], `${C.key}: totales del Manifest v3 (video/actividad/examen/final/Gamma/audiolibro/experiencia)`);
+  eq(M.totals.applicationActivityCount ?? 0, chapters.filter((x) => x.app).length, `${C.key}: totales del Manifest v3 (Actividades de Aplicación)`);
+  eq(M.totals.guidedPracticeCount ?? 0, chapters.filter((x) => x.gp).length, `${C.key}: totales del Manifest v3 (prácticas guiadas)`);
+  ok(M.items.filter((i) => i.type === 'activity').every((i) => i.variant === C.engine), `${C.key}: actividades con variant ${C.engine}`);
+  // mapas del LLM falso (títulos → UUID)
+  llm.st.courseId = courseId;
+  llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+  for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+  return { courseId, frontendCourseId: fc, n, manifest, mods, assessment };
+}
+
+// P2-B6: evaluaciones dentro del .mbz (lector del validador B5): banco ⇒ todos los slots aleatorios,
+// GIFT ⇒ todos fijos; una página «Respuestas explicadas» por quiz (con las explicaciones del banco);
+// la nota para docentes EXACTAMENTE una vez; y examChecksV3 (QUIZ_RANDOM / EXPLANATIONS_GATE /
+// ANSWER_LEAK) sin issues.
+async function assertExamPackage(label, buf, bank) {
+  const EV = D('package/v3/exam-validator-v3.js');
+  const EXPL = D('modules/course-shell/exam-explanations.js');
+  const pkg = await EV.readExamPackageV3(await JSZip.loadAsync(buf));
+  const quizzes = pkg.acts.filter((a) => a.modname === 'quiz');
+  const slots = quizzes.map((q) => ({ idnumber: q.idnumber, random: (q.actXml.match(/<question_set_reference\b/g) || []).length, fixed: (q.actXml.match(/<question_reference\b/g) || []).length }));
+  ok(quizzes.length > 0 && slots.every((x) => (bank ? x.random > 0 && x.fixed === 0 : x.fixed > 0 && x.random === 0)),
+    `${label}: ${quizzes.length} quiz(zes) con slots ${bank ? 'ALEATORIOS por hoja del banco (question_set_reference)' : 'FIJOS (GIFT)'}: ${slots.map((x) => `${x.idnumber} ${bank ? x.random : x.fixed}`).join(', ')}`, slots);
+  const pageOf = (q) => pkg.acts.find((a) => a.modname === 'page' && a.idnumber === EV.explanationsIdnumberFor(q.idnumber));
+  const badPages = quizzes.filter((q) => { const pg = pageOf(q); return !pg || !pg.content.trim() || (bank && !/Antes de intervenir se mide y se compara/.test(pg.content)); }).map((q) => q.idnumber);
+  ok(badPages.length === 0, `${label}: una página «Respuestas explicadas» por quiz${bank ? ' con las explicaciones del banco' : ''}`, badPages);
+  const plain = (h) => h.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#0?39;/g, "'").replace(/&amp;/g, '&').replace(/\s+/g, ' ');
+  const note = pkg.acts.filter((a) => a.modname === 'label' && plain(a.intro).includes(EXPL.EXAMS_TEACHER_NOTE_ATTEMPTS)).map((a) => a.idnumber);
+  ok(note.length === 1 && /^cv3:shell:(certificate_teacher|exams_teacher)$/.test(note[0]), `${label}: nota para docentes de «Respuestas explicadas» exactamente una vez (${note.join(', ')})`, note);
+  const issues = EV.examChecksV3(pkg);
+  eq(issues, [], `${label}: examChecksV3 (QUIZ_RANDOM / EXPLANATIONS_GATE / ANSWER_LEAK) sin issues`);
+}
+
+/** POST package + espera + descarga. */
+async function packageRun(label, courseId, n, runId) {
+  const t0 = Date.now();
+  const reqd = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs/${runId}/package`);
+  ok(reqd.status === 202 && reqd.data && reqd.data.jobId, `${label}: POST package → 202 {jobId}`, { s: reqd.status, e: reqd.error, d: reqd.raw });
+  if (!(reqd.data && reqd.data.jobId)) throw new Error(`${label}: sin job de empaque`);
+  let st = null;
+  while (Date.now() - t0 < 5 * 60 * 1000) {
+    st = await api('GET', `/courses/${courseId}/blueprints/${n}/manifest/runs/${runId}/package`);
+    if (st.data && ['completed', 'failed'].includes(st.data.status)) break;
+    await sleep(500);
+  }
+  const [job] = await q(`select id, worker_status, worker_id, output_summary, error_message from public.production_jobs where id = $1`, [reqd.data.jobId]);
+  ok(st && st.data && st.data.status === 'completed' && st.data.downloadUrl, `${label}: dynamic-package-worker v3 completó el job (validador §Q.8 sobre los bytes antes de subir)`, { st: st && st.data, err: job && job.error_message });
+  if (!(st && st.data && st.data.downloadUrl)) throw new Error(`${label}: empaque falló: ${job && job.error_message}`);
+  const buf = Buffer.from(await (await fetch(st.data.downloadUrl)).arrayBuffer());
+  const file = path.join(V3OUT, `${label}.mbz`);
+  fs.writeFileSync(file, buf);
+  results.mbz[label] = { file, bytes: buf.length, sha256: sha(buf), jobId: reqd.data.jobId, artifactId: st.data.artifactId, packagingMs: Date.now() - t0, summary: job.output_summary };
+  return { buf, file, job, status: st.data };
+}
+
+async function ledgerRows(where = 'true', params = []) {
+  return q(`select id, corrects_event_id, event_kind, cost_source, provider, operation, amount::float8 amount, billing_account, course_id, run_id, item_key, item_type, measurement_status,
+                  coalesce((metadata->>'reservation') = 'true', false) as reservation
+             from public.generation_cost_events where ${where}`, params);
+}
+
+// Calibración #2: cada llamada pagada deja una RESERVA (CHARGE pending) que se liquida a 0 con un ADJUSTMENT
+// en la misma transacción que su cargo final. Filas de reservas y de sus liquidaciones (netean 0).
+function reservationBookkeeping(ev) {
+  const resIds = new Set(ev.filter((e) => e.reservation).map((e) => e.id));
+  return ev.filter((e) => e.reservation || resIds.has(e.corrects_event_id));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+(async () => {
+  fs.writeFileSync(NET_LOG, '');
+  db = new Client({ host: '127.0.0.1', port: PGPORT, user: 'postgres', database: 'v2db' });
+  await db.connect();
+  FAKES = await startFakes({ tlsDir: process.env.TLS_DIR, videogenKey: VIDEOGEN_KEY });
+  {
+    const SMM = D('package/v3/synthetic-media.js');
+    PFAKES = startProviderFakes({ gammaKey: PROVIDER_KEYS.gamma, openaiKey: PROVIDER_KEYS.openai, anthropicKey: PROVIDER_KEYS.anthropic, makePdf: SMM.syntheticPdf, makeMp3: SMM.syntheticMp3 });
+    PURLS = await PFAKES.listen();
+  }
+  const g = FAKES.google;
+  g.fixedVideoId = YT_ID;
+  const frontNet = [];
+  let app, itemWorker, providerWorker, pkgWorker;
+  const S = {};
+  const llmBase = createLlm({ getFixtures: () => S.front.SV2_PREVIEW_FIXTURES, getSplit: (n) => S.front.dynExamQuestionSplit(n) });
+  // P2-B6: el fake de bancos valida cada respuesta con validateExamBank de B2 (dist) antes de devolverla.
+  const EXAM_BANK = D('modules/course-shell/exam-bank.js');
+  const llm = createLlmV3({ base: llmBase, examBankContract: EXAM_BANK, h5p2: H5P2 });
+  const claimLog = [];
+  function newFront(label) {
+    const f = makeFront({ feRoot: FE, backendUrl: `http://127.0.0.1:${APP_PORT}`, storageUrl: FAKES.storageUrl, token: TOKEN, ownerId: OWNER, llm, logFile: path.join(V3OUT, `front-${label}.log`), netViolations: frontNet });
+    const orig = f.backendDynClaim;
+    f.backendDynClaim = function (runId, executorId, types, lease) {
+      return orig(runId, executorId, types, lease).then((res) => {
+        const it = res && res.data && res.data.item;
+        if (it) claimLog.push({ label, itemKey: it.itemKey, type: it.type, types: [...types] });
+        return res;
+      });
+    };
+    return f;
+  }
+  const ledger0 = (await q(`select count(*)::int n from public.generation_cost_events`))[0].n;
+  results.finops.ledgerEventsBeforeV3 = ledger0;
+
+  try {
+    await step('v3-0-arranque', async () => {
+      app = await startApp();
+      const f = await api('GET', '/features');
+      eq(f.data, { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 3, dodContract: true, superAdmin: true }, 'GET /features → rulesVersion 3 activo (+ contrato DoD; el owner del sandbox es SUPER_ADMIN)');
+      S.front = newFront('v3');
+      const tplIds = S.front.SCORM_V2_TEMPLATES.map((t) => t.id);
+      S.templates = tplIds.filter((t) => S.front.scormV2ValidateRoomData(t, JSON.parse(JSON.stringify(S.front.SV2_PREVIEW_FIXTURES[t]))).ok);
+      ok(S.templates.length >= 2, `plantillas SCORM v2 con fixture válido: ${S.templates.join(', ')}`);
+      // Conexión YouTube del owner (refresh token cifrado con el AES-256-GCM real) + Google falso.
+      process.env.YOUTUBE_TOKEN_SECRET = YT_SECRET;
+      const { YoutubeTokenService } = D('youtube/youtube-token.service.js');
+      const tks = new YoutubeTokenService();
+      tks.onModuleInit();
+      const enc = tks.encryptRefreshToken('fake-refresh-token-v3');
+      await q(`insert into public.youtube_connections (user_id, user_email, channel_id, channel_title, encrypted_refresh_token, token_iv, scopes, status, connected_at)
+               values ($1, 'e2e-v3-owner@example.com', 'UCe2eV3Channel00000000000', 'Canal E2E v3', $2, $3, 'youtube.upload,youtube.readonly', 'active', now())`, [OWNER, enc.encrypted, enc.iv]);
+      g.refresh.set('fake-refresh-token-v3', 'fake-access-token-v3');
+      g.channels.set('fake-access-token-v3', { id: 'UCe2eV3Channel00000000000', title: 'Canal E2E v3 (fake)', thumb: 'https://yt3.fake/v3.jpg' });
+      const p1 = await api('GET', '/dynamic/youtube/preflight');
+      ok(p1.data && p1.data.ok === true, 'preflight YouTube con canal falso → ok', p1.data);
+    });
+
+    // FinOps: decisión AUTO para un run 100 % mock (antes de levantar los workers: nada lo ejecuta).
+    await step('v3-1-finops-gates', async () => {
+      const ctx0 = { nombre: '[E2E V2.1 E0] Run mock', ...CTX, scormTemplateIds: S.templates };
+      const C0 = { key: 'E0', title: ctx0.nombre, theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+        { title: 'Módulo mock', objective: 'Probar la decisión AUTO', exam: false, chapters: [{ title: 'Capítulo mock sin video', v: false, a: true }] }] };
+      const c0 = await createCourse(C0, llm);
+      const subs0 = FAKES.videogen.submissions.length;
+      const realProv = await api('POST', `/courses/${c0.courseId}/blueprints/${c0.n}/manifest/runs`, { ...ctx0, videoMode: 'mock' });
+      ok(realProv.status === 409 && /^budget_approval_required/.test(String(realProv.error)), 'E0: run con Gamma/TTS REALES (providerModes por defecto) sin aprobación → 409 budget_approval_required', { s: realProv.status, e: realProv.error });
+      const noRun = await q(`select count(*)::int n from public.production_jobs where course_id = $1 and execution_mode = 'dynamic_generation'`, [c0.courseId]);
+      eq(noRun[0].n, 0, 'E0: el 409 no creó ningún run');
+      const mock = await api('POST', `/courses/${c0.courseId}/blueprints/${c0.n}/manifest/runs`, { ...ctx0, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+      ok(mock.status === 201 && mock.data.run && mock.data.run.id, 'E0: run 100 % mock (video mock, Gamma/TTS mock) → 201 sin aprobación', { s: mock.status, e: mock.error });
+      const runId = mock.data.run.id;
+      const auth = await q(`select decision from public.cost_budget_authorizations where course_id = $1`, [c0.courseId]);
+      ok(auth.length >= 1 && auth.every((a) => a.decision === 'AUTO_WITHIN_POLICY'), 'E0: decisión de presupuesto AUTO_WITHIN_POLICY para el run mock', auth);
+      const est = await q(`select scope, run_id from public.cost_estimates where course_id = $1`, [c0.courseId]);
+      ok(est.some((e) => e.run_id === runId && e.scope === 'run'), 'E0: cost_estimates del run creado (scope run)', est);
+      const cancel = await api('POST', `/courses/${c0.courseId}/blueprints/${c0.n}/manifest/runs/${runId}/cancel`);
+      ok([200, 201].includes(cancel.status), 'E0: run mock cancelado (no se ejecuta)', { s: cancel.status, e: cancel.error });
+      eq(FAKES.videogen.submissions.length, subs0, 'E0: 0 llamadas a Videogen');
+      results.finops.e0 = { courseId: c0.courseId, runId, authorizations: auth.map((a) => a.decision) };
+    });
+
+    await step('v3-2-workers', async () => {
+      itemWorker = spawnProc('dynamic-item-worker', 'workers/dynamic-item-worker.js', {
+        ...baseEnv(), DYNAMIC_ITEM_WORKER_ID: 'e2e-v3-item-worker', DYNAMIC_ITEM_WORKER_POLL_MS: '400', DYNAMIC_ITEM_WORKER_VIDEO_POLL_MS: '300',
+        DYNAMIC_ITEM_WORKER_HEARTBEAT_MS: '5000', DYNAMIC_YOUTUBE_UPLOAD_RETRY_BASE_MS: '50', NODE_TLS_REJECT_UNAUTHORIZED: '0',
+      });
+      providerWorker = spawnProc('dynamic-provider-worker', 'workers/dynamic-provider-worker.js', { ...baseEnv(), DYNAMIC_PROVIDER_WORKER_ID: 'e2e-v3-provider-worker', DYNAMIC_PROVIDER_WORKER_POLL_MS: '400' });
+      pkgWorker = spawnProc('dynamic-package-worker', 'workers/dynamic-package-worker.js', { ...baseEnv(), DYNAMIC_PACKAGE_WORKER_ID: 'e2e-v3-package-worker', DYNAMIC_PACKAGE_WORKER_POLL_MS: '400' });
+      await sleep(2500);
+      ok(!itemWorker.exited && !providerWorker.exited && !pkgWorker.exited, '3 workers reales vivos (item, provider, package)', { i: itemWorker.exited, p: providerWorker.exited, k: pkgWorker.exited });
+    });
+
+    for (const C of (ONLY_REAL_PROVIDERS || ONLY_LLM_WORKER ? [] : COURSES)) {
+      await step(`v3-${C.key}-generacion`, async () => {
+        const c = await createCourse(C, llm);
+        S[C.key] = c;
+        const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
+        const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+        const subs0 = FAKES.videogen.submissions.length;
+        let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+        const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+        ok(start.status === 409 && /^budget_approval_required/.test(String(start.error)) && !!estM, `${C.key}: run con video real (Videogen) sin aprobación → 409 budget_approval_required con estimateId`, { s: start.status, e: start.error });
+        eq(FAKES.videogen.submissions.length, subs0, `${C.key}: el 409 no llamó a ningún proveedor`);
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e v3: aprobación del run (Videogen FALSO local)')`, [c.courseId, estM && estM[1]]);
+        start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+        ok(start.status === 201 && start.data.run.videoDelivery === 'youtube', `${C.key}: run creado (201), videoDelivery youtube, providerModes mock`, { s: start.status, e: start.error, d: start.data && start.data.run });
+        c.runId = start.data.run.id;
+        const [job] = await q(`select input_payload from public.production_jobs where id = $1`, [c.runId]);
+        const pm = job.input_payload.providerModes || {};
+        eq([pm.presentation, pm.audio], ['mock', 'mock'], `${C.key}: providerModes congelados en el run`);
+        llm.st.tag = 'A';
+        // P2-B6: override SOLO de la prueba (el `var` de 45 ya se evaluó en el vm; el ejecutor lo lee en cada item).
+        S.front.DYN_EXAM_BANK_MODE_ENABLED = C.examBank === true;
+        const t0 = Date.now();
+        const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        const stt = await waitRunTerminal(ctl, `${C.key} run`, undefined, c.runId);
+        const items = await waitItemsDone(c.runId);
+        results.timings[`${C.key}-run`] = Date.now() - t0;
+        // EV6 DoD: Gamma/TTS congelados en mock → el run termina `preview` (nunca `completed`).
+        ok(stt.status === 'preview' && stt.rulesVersion === 3, `${C.key}: ejecutor del navegador terminó (rulesVersion 3) con el run en vista previa`, stt);
+        ok(stt.failed === 0 && !stt.fatalError, `${C.key}: ejecutor sin items fallidos`, stt);
+        ok(llm.st.unknown.length === 0, `${C.key}: LLM falso sin prompts no reconocidos`, llm.st.unknown);
+        const keys = c.manifest.manifest.items.map((i) => i.key).sort();
+        eq(items.map((i) => i.item_key).sort(), keys, `${C.key}: item runs = items del Manifest v3 (por UUID)`);
+        ok(items.every((i) => i.status === 'completed'), `${C.key}: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 300)]));
+        const byType = (t) => items.filter((i) => i.type === t);
+        ok(byType('video').every((i) => i.worker_id === 'e2e-v3-item-worker'), `${C.key}: videos por el dynamic-item-worker real`);
+        ok([...byType('presentation'), ...byType('audio_welcome'), ...byType('audiobook_chapter')].every((i) => i.worker_id === 'e2e-v3-provider-worker'), `${C.key}: Gamma/TTS por el dynamic-provider-worker real (mock)`);
+        ok(items.filter((i) => !['video', 'presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type)).every((i) => /^browser-/.test(i.worker_id || '')), `${C.key}: items LLM por el ejecutor del navegador`);
+        for (const v of byType('video')) {
+          const os = v.output_summary || {};
+          ok(os.youtubeVideoId === YT_ID && os.delivery === 'completed' && os.external && os.external.durationSec === 468, `${C.key}: video ${v.chapter_id.slice(0, 8)} publicado (${YT_ID}), durationSec 468 del Videogen falso`, os);
+          // V2.1 F2 (I2): la duración final sale del mvhd del MP4 que se subió (fuente primaria).
+          ok(os.durationSec === 468 && os.durationSource === 'mp4_mvhd' && os.mp4Duration && os.mp4Duration.durationSource === 'mp4_mvhd', `${C.key}: video ${v.chapter_id.slice(0, 8)}: duración medida del mvhd del MP4 subido (468 s, mp4_mvhd)`, { d: os.durationSec, s: os.durationSource, m: os.mp4Duration });
+        }
+        const run = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
+        // EV6 DoD (BE-A): todos los items completados pero Gamma/TTS de vista previa → `preview`, nunca «Curso listo».
+        const cpl = run.data && run.data.completion;
+        ok(run.data && run.data.status === 'preview' && cpl && cpl.state === 'preview' && cpl.complete === false && cpl.generationComplete === false,
+          `${C.key}: GET run → preview (completion.state preview, complete false)`, run.data && { status: run.data.status, completion: cpl });
+        const provKeys = c.manifest.manifest.items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type)).map((i) => i.key).sort();
+        eq([...(cpl ? cpl.previewComponents : [])].sort(), provKeys, `${C.key}: componentes de vista previa = los ${provKeys.length} items de Gamma/TTS (los videos son reales)`);
+        c.items = items;
+        c.artifacts = await artifactsOfRun(c.runId);
+        // P2-B6: exam/final_exam → banco (E1, E3) o GIFT (E2): exactamente un artifact del tipo esperado por item.
+        {
+          const examItems = [...byType('exam'), ...byType('final_exam')];
+          const wantType = C.examBank ? 'dynamic_exam_bank_json' : 'dynamic_exam_gift';
+          const badExam = examItems.filter((i) => {
+            const t = c.artifacts.filter((a) => a.item_key === i.item_key && a.status !== 'disabled' && /^dynamic_exam_(bank_json|gift)$/.test(a.type)).map((a) => a.type);
+            return !(t.length === 1 && t[0] === wantType);
+          }).map((i) => [i.item_key, c.artifacts.filter((a) => a.item_key === i.item_key).map((a) => a.type)]);
+          ok(examItems.length > 0 && badExam.length === 0, `${C.key}: ${examItems.length} evaluaciones generadas como ${wantType}${C.examBank ? ' (modo banco, override de la prueba)' : ' (GIFT, modo banco apagado)'}`, badExam);
+          if (C.examBank) {
+            const badSum = examItems.filter((i) => {
+              const os = i.output_summary || {};
+              return !(os.evidenceChecked === true && os.bankSize >= os.slots && os.slots > 0 && os.correctLongestShare <= 0.3 && Array.isArray(os.perLeaf) && os.perLeaf.every((l) => l.kept >= l.floor));
+            }).map((i) => [i.item_key, i.output_summary]);
+            ok(badSum.length === 0, `${C.key}: resumen de cada banco (evidencia verificada, hojas ≥ piso, «correcta = la más larga» ≤ 30 %): ${examItems.map((i) => `${i.type} ${(i.output_summary || {}).bankSize}/${(i.output_summary || {}).slots}`).join(', ')}`, badSum);
+            c.examBankSummaries = examItems.map((i) => ({ itemKey: i.item_key, type: i.type, ...(i.output_summary || {}) }));
+          }
+        }
+        const mockArts = c.artifacts.filter((a) => ['dynamic_presentation', 'dynamic_audio_mp3'].includes(a.type));
+        ok(mockArts.length === byType('presentation').length + byType('audio_welcome').length + byType('audiobook_chapter').length && mockArts.every((a) => a.metadata && (a.metadata.mock === true || a.metadata.fixture === true)),
+          `${C.key}: artifacts de Gamma/TTS marcados mock (${mockArts.length})`, mockArts.map((a) => [a.item_key, a.metadata]));
+        results.courses[C.key] = { courseId: c.courseId, frontendCourseId: c.frontendCourseId, blueprintNumber: c.n, runId: c.runId, items: items.length, spec: C,
+          modules: c.mods, manifestItems: c.manifest.manifest.items.map((i) => ({ key: i.key, type: i.type, variant: i.variant || null })), manifestModules: c.manifest.manifest.modules,
+          features: c.manifest.manifest.features, assessment: c.assessment, examBank: C.examBank === true, examBankSummaries: c.examBankSummaries || [] };
+      });
+
+      await step(`v3-${C.key}-empaquetado`, async () => {
+        const c = S[C.key];
+        const P = await packageRun(C.key, c.courseId, c.n, c.runId);
+        const os = P.job.output_summary || {};
+        // EV6 DoD (BE-A): run de vista previa → paquete de QA (SUPER_ADMIN + escape del sandbox), rotulado y NO entregable.
+        ok(os.packageKind === 'qa_preview' && os.deliverable === false && P.status.packageKind === 'qa_preview' && P.status.deliverable === false &&
+          P.status.complete === false && /^QA-VISTA-PREVIA-/.test(String(P.status.downloadFilename || '')),
+          `${C.key}: paquete QA (qa_preview, deliverable false, complete false, QA-VISTA-PREVIA-…)`, { kind: os.packageKind, st: P.status });
+        {
+          const zq = await JSZip.loadAsync(P.buf);
+          const courseXml = await zq.file('course/course.xml').async('string');
+          ok(/<fullname>[^<]*\[QA — vista previa, no entregable\]<\/fullname>/.test(courseXml), `${C.key}: el nombre del curso lleva «[QA — vista previa, no entregable]»`);
+          const lbls = await Promise.all(Object.keys(zq.files).filter((f) => /activities\/label_\d+\/label\.xml$/.test(f)).map((f) => zq.file(f).async('string')));
+          ok(lbls.some((x) => /QA — vista previa, no entregable/.test(x) && /no es el curso final/.test(x)), `${C.key}: aviso visible «QA — vista previa, no entregable» en la bienvenida`);
+        }
+        const runDto = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
+        ok(runDto.data && runDto.data.completion && runDto.data.completion.packageReady === false && runDto.data.completion.state === 'preview',
+          `${C.key}: con el paquete QA el run sigue en vista previa (packageReady false)`, runDto.data && runDto.data.completion);
+        const TE = D('modules/theme-engine/index.js');
+        const wantTheme = TE.themeSha256(TE.resolveTheme({ ...C.theme, themeVersion: 1 }));
+        const BV = D('package/dynamic-mbz-builder-v3.js').DYNAMIC_MBZ_BUILDER_VERSION_V3;
+        ok(os.builderVersion === BV && os.rulesVersion === 3 && os.themeSource === 'profile' && os.themeSha256 === wantTheme, `${C.key}: builder ${BV}, tema del perfil ${C.theme.themeFamily}/${C.theme.mode} (themeSha256 = resolveTheme del perfil)`, { b: os.builderVersion, src: os.themeSource, t: os.themeSha256, want: wantTheme });
+        // EV6 T3: sin evaluación final no hay certificado y el worker lo avisa con EXACTAMENTE
+        // certificate_omitted:no_final_exam (intencional); con evaluación final ese aviso no existe.
+        const certOmitted = (w) => w && w.code === 'certificate_omitted' && w.detail === 'certificate_omitted:no_final_exam';
+        // r19 L: la DB del E2E no tiene la tabla `user_settings` (la gestiona Supabase), así que el paquete avisa
+        // libro_logo_source_unavailable:user_settings y usa el logo de Cursia; es el único aviso tolerado.
+        eq((os.warnings || []).filter((w) => !/mock/i.test(JSON.stringify(w)) && !(!C.finalExam && certOmitted(w)) && !/^libro_logo_source_unavailable:user_settings$/.test(String(w.detail || w.code || ''))), [], `${C.key}: 0 warnings del worker (salvo los avisos de fixtures mock de Gamma/TTS${C.finalExam ? '' : ' y certificate_omitted:no_final_exam'})`);
+        eq((os.warnings || []).filter(certOmitted).length, C.finalExam ? 0 : 1, `${C.key}: aviso certificate_omitted:no_final_exam ${C.finalExam ? 'ausente (hay evaluación final)' : 'presente (sin evaluación final)'}`);
+        results.courses[C.key].packageSummary = os;
+        await assertExamPackage(C.key, P.buf, C.examBank === true);
+        c.pkg = P;
+      });
+
+      if (C.key === 'E1') {
+        await step('v3-E1-reempaque-tema-y-nota', async () => {
+          const c = S.E1;
+          const itemsBefore = (await q(`select count(*)::int n from public.generation_item_runs where job_id = $1`, [c.runId]))[0].n;
+          const allItemsBefore = (await q(`select count(*)::int n from public.generation_item_runs`))[0].n;
+          const evBefore = await q(`select id from public.generation_cost_events`);
+          const subs0 = FAKES.videogen.submissions.length;
+          const callsBefore = llm.st.calls.length;
+          const A = D('modules/course-profiles/course-profiles.js');
+          const pa = await api('POST', `/courses/${c.courseId}/profiles/assessment`, { data: { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 80 } });
+          ok(pa.status === 201, 'E1: perfil de evaluación nuevo (passingGrade 80) → 201', { s: pa.status, e: pa.error });
+          const pp = await api('POST', `/courses/${c.courseId}/profiles/presentation`, { data: { themeFamily: 'tecnico', mode: 'dark', brandSeed: null, themeVersion: 1 } });
+          ok(pp.status === 201, 'E1: perfil de presentación nuevo (tecnico/dark) → 201', { s: pp.status, e: pp.error });
+          const pk = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}/package`);
+          ok(pk.data && pk.data.stale === true, 'E1: el paquete anterior queda stale (perfil nuevo)', pk.data);
+          const P = await packageRun('E1-repack', c.courseId, c.n, c.runId);
+          const os = P.job.output_summary || {};
+          const TE = D('modules/theme-engine/index.js');
+          const wantTheme = TE.themeSha256(TE.resolveTheme({ themeFamily: 'tecnico', mode: 'dark', themeVersion: 1 }));
+          ok(os.themeSha256 === wantTheme && os.themeSha256 !== results.mbz.E1.summary.themeSha256, 'E1-repack: tema tecnico/dark (themeSha256 nuevo = resolveTheme del perfil nuevo)', { got: os.themeSha256, want: wantTheme });
+          ok(os.assessmentProfileVersion !== results.mbz.E1.summary.assessmentProfileVersion || os.presentationProfileVersion !== results.mbz.E1.summary.presentationProfileVersion, 'E1-repack: versiones de perfil nuevas en el resumen del empaque', { a: [results.mbz.E1.summary.assessmentProfileVersion, os.assessmentProfileVersion], p: [results.mbz.E1.summary.presentationProfileVersion, os.presentationProfileVersion] });
+          eq((await q(`select count(*)::int n from public.generation_item_runs where job_id = $1`, [c.runId]))[0].n, itemsBefore, 'E1-repack: 0 item runs nuevos en el run');
+          eq((await q(`select count(*)::int n from public.generation_item_runs`))[0].n, allItemsBefore, 'E1-repack: 0 item runs nuevos en toda la DB');
+          eq(llm.st.calls.length, callsBefore, 'E1-repack: 0 llamadas al LLM');
+          eq(FAKES.videogen.submissions.length, subs0, 'E1-repack: 0 envíos a Videogen');
+          const before = new Set(evBefore.map((e) => e.id));
+          const newEv = (await q(`select id, event_kind, cost_source, operation, amount::float8 amount, provider from public.generation_cost_events`)).filter((e) => !before.has(e.id));
+          ok(newEv.length === 1 && newEv[0].event_kind === 'CHARGE' && newEv[0].cost_source === 'ZERO_BY_DESIGN' && newEv[0].amount === 0, 'E1-repack: único evento nuevo del ledger = CHARGE ZERO_BY_DESIGN del empaque (monto 0)', newEv);
+          ok(results.mbz['E1-repack'].sha256 !== results.mbz.E1.sha256, 'E1-repack: sha del MBZ distinto al del E1', [results.mbz.E1.sha256, results.mbz['E1-repack'].sha256]);
+          eq(os.sourceArtifactIds, results.mbz.E1.summary.sourceArtifactIds, 'E1-repack: MISMOS artifacts de contenido (sourceArtifactIds idénticos)');
+          ok(os.sourceIdsHash !== results.mbz.E1.summary.sourceIdsHash, 'E1-repack: clave de reuse distinta (tema/perfil forman parte de la clave)');
+          // Los .h5p de contenido no cambian con el tema (solo passPercentage de QS si aplica).
+          const z1 = await JSZip.loadAsync(S.E1.pkg.buf); const z2 = await JSZip.loadAsync(P.buf);
+          // M7: los ids de origen del resumen existen como artifacts ready del run, y los blobs de
+          // contenido (MP3, PDF, PNG de portada) son byte-idénticos entre los dos paquetes.
+          const runArts = await artifactsOfRun(c.runId);
+          const runIds = new Set(runArts.map((a) => a.id));
+          ok(os.sourceArtifactIds.length > 0 && os.sourceArtifactIds.every((id) => runIds.has(id)) && runArts.filter((a) => os.sourceArtifactIds.includes(a.id)).every((a) => a.status === 'ready'),
+            `E1-repack: los ${os.sourceArtifactIds.length} sourceArtifactIds son artifacts ready de ESTE run (cruce con la DB)`);
+          const blobs = async (z) => {
+            const fx = await z.file('files.xml').async('string');
+            const m = {};
+            for (const f of fx.match(/<file id="\d+">[\s\S]*?<\/file>/g) || []) {
+              // EV6 T3: la imagen de la insignia-certificado depende del TEMA (acento): se compara aparte.
+              if (/<component>badges<\/component>/.test(f)) continue;
+              const fnm = (/<filename>([^<]*)<\/filename>/.exec(f) || [])[1] || '';
+              // r19 L: el Libro Guía es un PDF que sigue el acento del TEMA → se compara aparte (cambia con el tema).
+              if (/^libro_guia_.*\.pdf$/.test(fnm)) { (m.libro = m.libro || new Set()).add(/<contenthash>(\w+)<\/contenthash>/.exec(f)[1]); continue; }
+              const ext = (/\.(mp3|pdf|png|h5p|html)$/.exec(fnm) || [])[1];
+              if (ext) (m[ext] = m[ext] || new Set()).add(/<contenthash>(\w+)<\/contenthash>/.exec(f)[1]);
+            }
+            return Object.fromEntries(Object.entries(m).map(([k, v]) => [k, [...v].sort()]));
+          };
+          const b1 = await blobs(z1); const b2 = await blobs(z2);
+          eq([b2.mp3, b2.pdf, b2.png], [b1.mp3, b1.pdf, b1.png], `E1-repack: MP3 (${(b1.mp3 || []).length}), PDF de Gamma (${(b1.pdf || []).length}) y PNG (${(b1.png || []).length}) byte-idénticos entre E1 y E1-repack`);
+          ok((b1.libro || []).length === 1 && (b2.libro || []).length === 1 && b1.libro[0] !== b2.libro[0], 'E1-repack: un Libro Guía PDF en cada paquete, regenerado con el tema nuevo', [b1.libro, b2.libro]);
+          // EV6 T3: la imagen de la insignia es función SOLO del tema: cambia con el tema nuevo y es
+          // exactamente la que renderiza ese tema (mismos bytes que courseBadgeImages(resolveTheme(perfil nuevo))).
+          const badgeBlobs = async (z) => {
+            const fx = await z.file('files.xml').async('string');
+            return Object.fromEntries((fx.match(/<file id="\d+">[\s\S]*?<\/file>/g) || []).filter((f) => /<component>badges<\/component>/.test(f))
+              .map((f) => [(/<filename>([^<]*)<\/filename>/.exec(f) || [])[1], /<contenthash>(\w+)<\/contenthash>/.exec(f)[1]]));
+          };
+          const g1 = await badgeBlobs(z1); const g2 = await badgeBlobs(z2);
+          const BADGE = D('package/v3/course-badge.js');
+          const sha1 = (b) => crypto.createHash('sha1').update(b).digest('hex');
+          const wantBadge = Object.fromEntries(BADGE.courseBadgeImages(TE.resolveTheme({ themeFamily: 'tecnico', mode: 'dark', themeVersion: 1 })).map((x) => [x.filename, sha1(x.png)]));
+          eq(Object.keys(g1).sort(), ['f1.png', 'f2.png', 'f3.png'], 'E1: imagen de la insignia-certificado (f1/f2/f3)');
+          eq(g2, wantBadge, 'E1-repack: imagen de la insignia = render determinístico del tema nuevo (tecnico/dark)');
+          ok(['f1.png', 'f2.png', 'f3.png'].every((n) => g1[n] && g1[n] !== g2[n]), 'E1-repack: la imagen de la insignia cambia con el tema (y solo ella entre los PNG)', { g1, g2 });
+          ok((b1.h5p || []).length > 0 && (b1.h5p || []).length === (b2.h5p || []).length, `E1-repack: misma cantidad de paquetes .h5p (${(b1.h5p || []).length}); cambian solo por passPercentage/tema`);
+          await assertExamPackage('E1-repack', P.buf, true);
+          results.courses.E1repack = { ...results.courses.E1, theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 80, packageSummary: os };
+        });
+      }
+    }
+
+    if (!ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER) await step('v3-finops', async () => {
+      const courseIds = COURSES.map((C) => S[C.key].courseId);
+      const ev = await ledgerRows('course_id = any($1::int[])', [courseIds]);
+      const bySrc = {};
+      ev.forEach((e) => { const k = `${e.provider}/${e.cost_source}/${e.operation}`; bySrc[k] = (bySrc[k] || 0) + 1; });
+      results.finops.ledgerV3 = bySrc;
+      const videoCount = COURSES.reduce((n, C) => n + C.modules.flatMap((m) => m.chapters).filter((x) => x.v).length, 0);
+      const nonVideo = ev.filter((e) => !['videogen', 'youtube'].includes(e.provider));
+      ok(nonVideo.length > 0 && nonVideo.every((e) => ['MOCK', 'ZERO_BY_DESIGN'].includes(e.cost_source) && e.amount === 0), 'ledger v3: todo evento que no es del video (Gamma/TTS/empaque) es MOCK o ZERO_BY_DESIGN con monto 0', nonVideo.filter((e) => !['MOCK', 'ZERO_BY_DESIGN'].includes(e.cost_source)));
+      const mockEv = ev.filter((e) => e.cost_source === 'MOCK');
+      const provItems = COURSES.reduce((n, C) => n + 1 + 2 * C.modules.flatMap((m) => m.chapters).length, 0);
+      eq(mockEv.length, provItems, `ledger v3: ${provItems} eventos MOCK (presentation + audio_welcome + audiobook_chapter, billing_account mock)`);
+      ok(mockEv.every((e) => e.billing_account === 'mock'), 'ledger v3: los MOCK con billing_account mock');
+      const zero = ev.filter((e) => e.cost_source === 'ZERO_BY_DESIGN' && e.operation === 'package.build');
+      eq(zero.length, COURSES.length + 1, `ledger v3: ${COURSES.length + 1} eventos ZERO_BY_DESIGN de empaque (uno por curso + el re-empaque de E1)`);
+      const yt = ev.filter((e) => e.provider === 'youtube');
+      ok(yt.length >= 1 && yt.every((e) => e.cost_source === 'ZERO_BY_DESIGN' && e.amount === 0), 'ledger v3: cuota de YouTube como ZERO_BY_DESIGN (monto 0)', yt);
+      const book = reservationBookkeeping(ev);
+      const bookIds = new Set(book.map((e) => e.id));
+      const resv = book.filter((e) => e.reservation);
+      ok(resv.every((r) => book.some((a) => a.corrects_event_id === r.id)) && Math.abs(book.reduce((a, e) => a + e.amount, 0)) < 1e-9,
+        'ledger v3 (calibración #2): toda reserva previa a una llamada pagada quedó liquidada (neto 0)', resv);
+      const vg = ev.filter((e) => e.provider === 'videogen' && !bookIds.has(e.id) && e.event_kind === 'CHARGE');
+      ok(vg.length === videoCount && vg.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && Math.abs(e.amount - 0.42) < 1e-9),
+        `ledger v3: ${videoCount} eventos de Videogen = el costo que devuelve el Videogen FALSO local (0.42, CALCULATED_FROM_USAGE, HD-V21-20); ninguno de un proveedor real`, vg);
+      const est = await q(`select course_id, scope, run_id from public.cost_estimates where course_id = any($1::int[])`, [courseIds]);
+      ok(COURSES.every((C) => est.some((e) => e.course_id === S[C.key].courseId && e.run_id === S[C.key].runId)), 'cost_estimates creados para los 3 runs', est);
+      const auth = await q(`select course_id, decision from public.cost_budget_authorizations where course_id = any($1::int[])`, [courseIds]);
+      ok(COURSES.every((C) => auth.some((a) => a.course_id === S[C.key].courseId && a.decision === 'ADMIN_APPROVED')), 'runs con video real: autorización ADMIN_APPROVED (HD-V21-19)', auth);
+      results.finops.authorizations = auth;
+      const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
+      ok(blocked === '', 'netguard (app + 3 workers): 0 conexiones fuera de 127.0.0.1 ⇒ 0 llamadas a proveedores reales', blocked.slice(0, 800));
+      eq(frontNet, [], 'navegador simulado: 0 fetch fuera de 127.0.0.1');
+      // R13 fix round 1 (I1): conteos MEDIDOS por proveedor. netguard registra cada conexión saliente
+      // fuera de 127.0.0.1 de la app y de los 3 workers (host + proceso); el navegador simulado registra
+      // cada fetch fuera de 127.0.0.1 / /api/proxy. Se clasifican por host de proveedor pagado.
+      const ng = PV.countNetguardLog(NET_LOG);
+      const fn = PV.countUrls(frontNet);
+      const attempts = PV.emptyCounts();
+      for (const k of PV.PROVIDERS) attempts[k] = ng.byProvider[k] + fn.byProvider[k];
+      results.frontNet = frontNet.slice();
+      results.counters = {
+        scope: 'fase v3: app Nest + dynamic-item/provider/package-worker (netguard) + ejecutor del navegador (vm)',
+        realAttemptsByProvider: attempts,
+        netguardBlockedTotal: ng.total,
+        netguardOtherHosts: ng.otherHosts,
+        frontBlockedTotal: fn.total,
+        fakeReached: {
+          anthropic_via_api_proxy_fake: llm.st.calls.length,
+          videogen_fake_submissions: FAKES.videogen.submissions.length,
+          google_fake_calls: g.calls.length,
+          google_fake_uploads: g.uploads.length,
+          gamma_mock_ledger: ev.filter((e) => e.provider === 'gamma' && e.cost_source === 'MOCK').length,
+          tts_mock_ledger: ev.filter((e) => e.provider === 'openai' && e.cost_source === 'MOCK').length,
+        },
+        fakeLlmInvalidFirst: llm.st.invalidSent,
+        fakeLlmRetriesSeen: llm.st.retriesSeen,
+      };
+      eq(attempts, PV.emptyCounts(), `intentos REALES medidos por proveedor (netguard + navegador simulado): ${JSON.stringify(attempts)}`);
+      ok(ev.filter((e) => ['gamma', 'openai'].includes(e.provider)).every((e) => e.cost_source === 'MOCK'), 'Gamma/TTS: todos los eventos del ledger son MOCK (ningún cliente real resuelto)');
+      const pwLog = fs.readFileSync(providerWorker.logFile, 'utf8');
+      ok(!/PROVIDER_NOT_WIRED_V21|provider_mock_not_allowed|PROVIDER_MODE_UNSET/.test(pwLog), 'dynamic-provider-worker: nunca tomó el camino real (sin PROVIDER_NOT_WIRED_V21 / modo no-mock en su log)');
+      eq(FAKES.videogen.submissions.length, videoCount, `Videogen FALSO: ${videoCount} envíos (uno por video; ninguno en los 409 ni en el re-empaque)`);
+      eq(g.uploads.length, videoCount, `Google FALSO: ${videoCount} subidas Unlisted`);
+      // Cobertura determinística (I5): los 3 tipos H5P calificables aparecen en E1+E3.
+      const types = [...new Set(['E1', 'E3'].flatMap((k) => results.courses[k].modules.flatMap((m) => m.chapters)).filter((x) => x.a).map((x) => SHELL_TYPES.activityTypeForChapter(x.id)))].sort();
+      eq(types, ['blanks', 'dragtext', 'questionset'], 'E1+E3: los 3 tipos H5P calificables (questionset, dragtext, blanks) por la rotación del UUID');
+      // Reintento dirigido: una respuesta inválida por tipo, una sola vez, y luego exactamente 1 reintento.
+      // P2-B6: el examen final de E1/E3 es un banco; la falla del banco (exam_bank) produce UNA reparación.
+      // La falla GIFT del examen final (final_exam → corrección) se comprueba en E4 (GIFT).
+      const kinds = ['experience', 'course_intro', 'module_intro', 'video_interactions', 'h5p_questionset', 'h5p_dragtext', 'h5p_blanks', 'exam_bank'];
+      eq(kinds.map((k) => llm.st.invalidSent[k] || 0), kinds.map(() => 1), `LLM falso: exactamente 1 respuesta inválida por cada uno de los ${kinds.length} tipos v3`);
+      eq(kinds.map((k) => llm.st.retriesSeen[k] || 0), kinds.map(() => 1), 'cada respuesta inválida produjo EXACTAMENTE 1 reintento dirigido (validation_retry / continuation) y luego pasó');
+      // P2-B6 (A2): bancos — falla inyectada una vez (más rechazos que la holgura de la hoja, BANKOPT),
+      // EXACTAMENTE una reparación con lo que falta, y el item que la recibió la registra (rechazos
+      // EVIDENCE + LENGTH_BIAS; con el pool de D2, ≥ 2 reparadas); ningún otro banco necesitó reparación.
+      // BANKOPT (caché): todo prompt de banco llegó como [fuente+cache_control, tarea+cache_control, tail].
+      const shapes = (llm.st.examBank && llm.st.examBank.blockShapes) || [];
+      ok(shapes.length > 0 && shapes.every((x) => JSON.stringify(x) === JSON.stringify(['ephemeral', 'ephemeral', null])), `bancos: ${shapes.length} prompts con cache_control en fuente y tarea`, shapes.slice(0, 5));
+      const bankCalls = llm.st.v3calls.filter((x) => /^(exam_bank|final_exam_bank|exam_bank_repair)$/.test(x.kind));
+      const repairs = bankCalls.filter((x) => x.kind === 'exam_bank_repair');
+      ok(repairs.length === 1 && (llm.st.examBank.faults || []).length === 1, `bancos: exam_bank_repair registrado UNA vez (${bankCalls.length} llamadas de banco al LLM falso, ${repairs.length} reparación)`, { repairs, faults: llm.st.examBank.faults });
+      const bankSums = COURSES.filter((C) => C.examBank).flatMap((C) => (results.courses[C.key].examBankSummaries || []).map((x) => ({ course: C.key, ...x })));
+      const repairedItems = bankSums.filter((x) => (x.repaired || 0) > 0 || ((x.calls || {}).continuation || 0) > 0);
+      // Exam-bank D2: la falla inyectada (6 > holgura 4) deja 2 por cubrir; la UNA reparación las pide con candidatas del pool.
+      ok(repairedItems.length === 1 && repairedItems[0].repaired >= 2 && repairedItems[0].poolCandidates >= 2 && repairedItems[0].calls.continuation === 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_EVIDENCE >= 1 && (repairedItems[0].rejectedByCode || {}).EXAM_BANK_LENGTH_BIAS >= 1 && repairedItems[0].evidenceByRef > 0,
+        `bancos: la reparación quedó en UN solo item (${repairedItems.map((x) => `${x.course} ${x.itemKey}`).join(', ')}): rechazos EVIDENCE + LENGTH_BIAS, ${repairedItems.length ? repairedItems[0].repaired : 0} preguntas reparadas (faltante 2 + pool) en 1 llamada; evidencia por marca [S#]`, repairedItems);
+      ok(bankSums.length === COURSES.filter((C) => C.examBank).reduce((n, C) => n + C.modules.filter((m) => m.exam).length + (C.finalExam ? 1 : 0), 0),
+        `bancos: ${bankSums.length} evaluaciones como banco en E1/E3 (todas las de esos cursos)`, bankSums.map((x) => x.itemKey));
+      results.counters.examBank = { calls: bankCalls.length, repairs: repairs.length, faults: llm.st.examBank.faults, items: bankSums.map((x) => ({ course: x.course, itemKey: x.itemKey, bankSize: x.bankSize, slots: x.slots, repaired: x.repaired, rejectedByCode: x.rejectedByCode, correctLongestShare: x.correctLongestShare })) };
+    }, { fatal: false });
+
+    // ═══ V2.1 F2: E4 — Gamma / TTS / guion LLM REALES contra fakes locales ═══
+    if (!ONLY_LLM_WORKER) await step('v3-E4-proveedores-reales', async () => {
+      const C = { key: 'E4', title: '[E2E V2.1 E4] Seguridad hidráulica (proveedores reales/fakes)', theme: { themeFamily: 'tecnico', mode: 'dark' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+        { title: 'Seguridad hidráulica', objective: 'Operar el circuito con seguridad', exam: true, chapters: [
+          { title: 'Bloqueo y etiquetado', v: true, a: true },
+          { title: 'Purgado de circuitos', v: false, a: false },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E4 = c;
+      const body = { nombre: C.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'real' }; // providerModes: default REAL
+      const calls0 = { g: PFAKES.st.gammaPosts.length, t: PFAKES.st.tts.length, l: PFAKES.st.llm.length, v: FAKES.videogen.submissions.length };
+      let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      ok(start.status === 409 && /^budget_approval_required/.test(String(start.error)) && !!estM, 'E4: Gamma/TTS/Videogen reales sin aprobación → 409 budget_approval_required (el preflight de proveedores pasó)', { s: start.status, e: start.error });
+      eq([PFAKES.st.gammaPosts.length, PFAKES.st.tts.length, PFAKES.st.llm.length, FAKES.videogen.submissions.length], [calls0.g, calls0.t, calls0.l, calls0.v], 'E4: el 409 no llamó a ningún proveedor');
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e v3 E4: aprobación (proveedores FALSOS locales)')`, [c.courseId, estM && estM[1]]);
+      start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      ok(start.status === 201 && start.data.run.videoDelivery === 'youtube', 'E4: run creado (201) tras ADMIN_APPROVED, entrega YouTube', { s: start.status, e: start.error });
+      c.runId = start.data.run.id;
+      const [job] = await q(`select input_payload from public.production_jobs where id = $1`, [c.runId]);
+      eq([job.input_payload.providerModes.presentation, job.input_payload.providerModes.audio], ['real', 'real'], 'E4: providerModes REAL congelados');
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false; // P2-B6: E4 cubre el camino GIFT (examen de módulo + final)
+      const finalGift0 = { inv: llm.st.invalidSent.final_exam || 0, ret: llm.st.retriesSeen.final_exam || 0 };
+      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+      const stt = await waitRunTerminal(ctl, 'E4 run', undefined, c.runId);
+      const items = await waitItemsDone(c.runId);
+      ok(stt.status === 'completed' && stt.failed === 0, 'E4: ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.length > 0 && items.every((i) => i.status === 'completed'), `E4: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 300)]));
+      // P2-B6: GIFT en E4 — la respuesta inválida del examen final GIFT (una vez por corrida) y su corrección.
+      eq([finalGift0.inv, finalGift0.ret, llm.st.invalidSent.final_exam || 0, llm.st.retriesSeen.final_exam || 0], [0, 0, 1, 1], 'E4: examen final GIFT — 1 respuesta inválida y EXACTAMENTE 1 corrección (continuation), luego pasó');
+      const e4Arts = await artifactsOfRun(c.runId);
+      const e4Exams = items.filter((i) => i.type === 'exam' || i.type === 'final_exam');
+      ok(e4Exams.length === 2 && e4Exams.every((i) => e4Arts.filter((a) => a.item_key === i.item_key && a.status !== 'disabled' && /^dynamic_exam_/.test(a.type)).map((a) => a.type).join() === 'dynamic_exam_gift'), 'E4: examen de módulo y final como GIFT (modo banco apagado)', e4Exams.map((i) => [i.item_key, e4Arts.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
+      const prov = items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type));
+      ok(prov.length === 5 && prov.every((i) => i.worker_id === 'e2e-v3-provider-worker' && i.output_summary && i.output_summary.mode === 'real'), 'E4: Gamma/TTS por el dynamic-provider-worker en modo REAL', prov.map((i) => [i.item_key, i.worker_id, i.output_summary && i.output_summary.mode]));
+      const arts = await artifactsOfRun(c.runId);
+      const provArts = arts.filter((a) => ['dynamic_presentation', 'dynamic_audio_mp3'].includes(a.type));
+      ok(provArts.length === 5 && provArts.every((a) => a.metadata && a.metadata.mode === 'real' && !a.metadata.mock && !a.metadata.fixture), 'E4: artifacts de Gamma/TTS reales (no mock)', provArts.map((a) => [a.item_key, a.metadata]));
+      const newGamma = PFAKES.st.gammaPosts.slice(calls0.g);
+      ok(newGamma.length === 2 && newGamma.every((b) => b.textOptions && b.textOptions.language === 'es-419' && b.themeId === 'e2e-theme-dark' && b.exportAs === 'pdf'),
+        'E4: Gamma falso recibió 2 generaciones (una por capítulo) con es-419 y el themeId de tecnico/dark', newGamma.map((b) => [b.textOptions, b.themeId]));
+      ok(PFAKES.st.llm.length - calls0.l >= 2, `E4: guion del audiolibro por el LLM server-side (fake Anthropic): ${PFAKES.st.llm.length - calls0.l} llamadas`);
+      ok(PFAKES.st.tts.length - calls0.t >= 3, `E4: OpenAI TTS falso: ${PFAKES.st.tts.length - calls0.t} llamadas (bienvenida + 2 capítulos)`);
+      eq(PFAKES.st.badAuth, [], 'E4: los fakes recibieron SU clave (0 rechazos)');
+      const vid = items.find((i) => i.type === 'video');
+      ok(vid && vid.output_summary.durationSource === 'mp4_mvhd' && vid.output_summary.durationSec === 468, 'E4: video con duración medida del mvhd (468 s)', vid && vid.output_summary);
+      // EV6 DoD (BE-A): camino real — todo real y validado → `completed`; sin paquete = «packaging»; con él = completo.
+      const runE4 = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
+      const c4 = runE4.data && runE4.data.completion;
+      // EV6 DoD (BE-B): al pasar a `completed` el servidor encola SOLO el paquete final (sin clic); según el
+      // ritmo del worker de empaquetado el run se lee `packaging` (armándose) o ya `complete`.
+      ok(runE4.data && runE4.data.status === 'completed' && c4 && ['packaging', 'complete'].includes(c4.state) && c4.generationComplete === true && c4.missingComponents.length === 0 && c4.previewComponents.length === 0,
+        'E4: run completed, completion = packaging/complete (generación completa; paquete automático)', runE4.data && { status: runE4.data.status, completion: c4 });
+      const autoJobs = await q(`select id, input_payload from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c.runId]);
+      ok(autoJobs.length === 1 && autoJobs[0].input_payload && autoJobs[0].input_payload.auto === true && !autoJobs[0].input_payload.packageKind,
+        'E4: el servidor encoló UN paquete final automático (input_payload.auto, sin packageKind)', autoJobs);
+      const P = await packageRun('E4', c.courseId, c.n, c.runId);
+      ok(autoJobs[0] && P.job.id === autoJobs[0].id, 'E4: POST …/package (botón manual) reusa el job automático (idempotente, nunca un segundo build)', { auto: autoJobs[0] && autoJobs[0].id, manual: P.job.id });
+      const os = P.job.output_summary || {};
+      ok(!os.packageKind && P.status.packageKind === 'final' && P.status.deliverable === true && P.status.complete === true && !/^QA-/.test(String(P.status.downloadFilename || '')),
+        'E4: paquete FINAL entregable (sin rótulo QA) y GET …/package complete:true', { kind: os.packageKind, st: P.status });
+      {
+        const z4 = await JSZip.loadAsync(P.buf);
+        const cx = await z4.file('course/course.xml').async('string');
+        ok(!/QA — vista previa/.test(cx), 'E4: el nombre del curso NO lleva el rótulo QA');
+      }
+      const runE4b = await api('GET', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}`);
+      const c4b = runE4b.data && runE4b.data.completion;
+      ok(c4b && c4b.state === 'complete' && c4b.packageReady === true && c4b.complete === true, 'E4: con el paquete final el curso queda COMPLETO (completion.state complete)', c4b);
+      eq((os.warnings || []).filter((w) => /mock/i.test(JSON.stringify(w))), [], 'E4: el empaque no usó ninguna fixture mock');
+      ok(Array.isArray(os.mockPresentationChapters) ? os.mockPresentationChapters.length === 0 : true, 'E4: 0 capítulos con presentación mock', os.mockPresentationChapters);
+      const z = await JSZip.loadAsync(P.buf);
+      const fx = await z.file('files.xml').async('string');
+      const names = [...fx.matchAll(/<filename>([^<]*)<\/filename>/g)].map((m) => m[1]);
+      ok(names.some((n) => /\.pdf$/.test(n)) && names.some((n) => /\.png$/.test(n)) && names.some((n) => /\.mp3$/.test(n)), 'E4: el MBZ lleva el PDF, la portada PNG y los MP3 de los fakes', names.filter((n) => /\.(pdf|png|mp3)$/.test(n)));
+      // Neto por CHARGE = monto + sus ADJUSTMENT (F2 fix round 1: Gamma reserva pendiente al aceptar y se liquida al terminar).
+      const ev = await q(`select c.provider, c.operation, c.cost_source, c.measurement_status, c.external_operation_id, c.recorded_by, c.item_key,
+                                 (c.amount + coalesce((select sum(a.amount) from public.generation_cost_events a where a.corrects_event_id = c.id), 0))::float8 amount
+                            from public.generation_cost_events c where c.course_id = $1 and c.event_kind = 'CHARGE'
+                             and coalesce(c.metadata->>'reservation', 'false') <> 'true'`, [c.courseId]);
+      const resvE4 = await q(`select c.provider, (c.amount + coalesce((select sum(a.amount) from public.generation_cost_events a where a.corrects_event_id = c.id), 0))::float8 net,
+                                     exists (select 1 from public.generation_cost_events a where a.corrects_event_id = c.id) settled
+                                from public.generation_cost_events c where c.course_id = $1 and c.event_kind = 'CHARGE' and (c.metadata->>'reservation') = 'true'`, [c.courseId]);
+      ok(resvE4.length >= 5 && resvE4.every((r) => r.settled && Math.abs(r.net) < 1e-9), 'E4 ledger (calibración #2): una reserva durable antes de CADA llamada pagada (Gamma / TTS / LLM / Videogen), toda liquidada a neto 0', resvE4);
+      const g = ev.filter((e) => e.provider === 'gamma');
+      ok(g.length === 2 && g.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && Math.abs(e.amount - 0.42) < 1e-9 && /^gen_f2_/.test(e.external_operation_id)), 'E4 ledger: Gamma = reserva al aceptar liquidada a credits.deducted × catálogo (neto 0.42, CALCULATED_FROM_USAGE, id = generationId)', g);
+      const t = ev.filter((e) => e.provider === 'openai');
+      ok(t.length >= 3 && t.every((e) => e.cost_source === 'CALCULATED_FROM_USAGE' && e.amount > 0 && /^req_f2_/.test(e.external_operation_id)), 'E4 ledger: TTS medido por segundos de audio (CALCULATED_FROM_USAGE, id = x-request-id)', t);
+      const l = ev.filter((e) => e.provider === 'anthropic' && e.recorded_by === 'dynamic-provider-worker');
+      ok(l.length >= 2 && l.every((e) => e.operation === 'llm.audiobook_script' && e.cost_source === 'CALCULATED_FROM_USAGE' && /^msg_f2_/.test(e.external_operation_id)), 'E4 ledger: guion LLM server-side medido (llm.audiobook_script, id = msg_…)', l);
+      ok(!ev.some((e) => e.cost_source === 'MOCK'), 'E4 ledger: ningún evento MOCK');
+      const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
+      ok(blocked === '', 'E4 netguard: 0 conexiones fuera de 127.0.0.1 (proveedores = fakes locales)', blocked.slice(0, 500));
+      results.courses.E4 = { courseId: c.courseId, runId: c.runId, items: items.length, spec: C };
+      results.counters.providerFakes = { gammaGenerations: PFAKES.st.gammaPosts.length, ttsCalls: PFAKES.st.tts.length, llmServerCalls: PFAKES.st.llm.length };
+    }, { fatal: false });
+
+    // ═══ EV6 H5P v2 (H4) — E5: rules 2 + «Repaso» + IV avanzado ═══
+    const RUN_E5 = !ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER && H5P2_MODE !== 'off' && (H5P2 || H5P2_MODE === 'require');
+    if (!ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER && !RUN_E5) {
+      results.h5p2 = { skipped: true, reason: H5P2_MODE === 'off' ? 'E2E_H5P2=off' : `el frontend no trae ${path.relative(FE, H5P2_FIXTURE)} (H5P v2 del frontend H3)` };
+      console.log(`\n(E5 H5P v2 omitido: ${results.h5p2.reason})`);
+    }
+    if (RUN_E5) await step('v3-E5-h5p2-generacion', async () => {
+      ok(!!H5P2, `E5: fixtures H5P v2 del frontend presentes (${path.relative(FE, H5P2_FIXTURE)})`);
+      if (!H5P2) throw new Error('E5 sin fixtures H5P v2 del frontend');
+      // La app vuelve a arrancar con H5P v2 SOLO para E5 (el env se lee al crear el curso y su primer Manifest).
+      await stopProc(app);
+      app = await startApp({ DYNAMIC_ACTIVITY_TYPE_RULES: '2' }, 'app-v3-h5p2');
+      const C = { key: 'E5', title: '[E2E EV6 E5] Decisiones de mantenimiento (H5P v2)', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: false, modules: [
+        { title: 'Decisiones en terreno', objective: 'Decidir intervenciones seguras', exam: true, chapters: [
+          { title: 'Intervenir una pala con baja presión', v: true, a: true, objective: 'Decidir cómo intervenir una pala hidráulica con baja presión' },
+          { title: 'Componentes del circuito', v: false, a: true, objective: 'Identificar los componentes del circuito hidráulico' },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E5 = c;
+      const st0 = await readStructure(c.courseId);
+      eq([st0.reviewCardsEnabled, st0.reviewCardsAvailable], [true, true], 'E5: curso NUEVO con H5P v2 → «Repaso» encendido y disponible (GET estructura)');
+      const M = c.manifest.manifest;
+      eq(M.features, { finalExam: true, activityEngine: 'h5p', activityTypeRules: 2, ivAdvanced: 1 }, 'E5: Manifest rules 2 (activityTypeRules 2 + ivAdvanced 1)');
+      const decideCh = c.mods[0].chapters[0].id;
+      const acts = M.items.filter((i) => i.type === 'activity');
+      eq(acts.map((i) => [i.chapterId === decideCh, i.h5pType]), [[true, 'branchingscenario'], [false, 'blanks']], 'E5: «decidir» → branchingscenario; «identificar» → blanks (rules 2)');
+      const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
+      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      ok(start.status === 409 && !!estM, 'E5: run con video real sin aprobación → 409 con estimateId', { s: start.status, e: start.error });
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e EV6 E5: aprobación (Videogen FALSO local)')`, [c.courseId, estM && estM[1]]);
+      start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      ok(start.status === 201, 'E5: run creado (201)', { s: start.status, e: start.error });
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E5';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const bs0 = { inv: llm.st.invalidSent.h5p_branchingscenario || 0, ret: llm.st.retriesSeen.h5p_branchingscenario || 0 };
+      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+      const stt = await waitRunTerminal(ctl, 'E5 run');
+      const items = await waitItemsDone(c.runId);
+      // EV6 DoD: el sandbox genera videos de vista previa (mock) → el run termina en `preview`, nunca `completed`
+      // (mismo criterio que E1–E3); el paquete que sigue es de QA (owner SUPER_ADMIN + escape del sandbox).
+      ok(stt.status === 'preview' && stt.failed === 0 && !stt.fatalError, 'E5: ejecutor del navegador terminó sin fallidos (run en vista previa: videos mock)', stt);
+      ok(items.every((i) => i.status === 'completed'), `E5: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
+      ok(llm.st.unknown.length === 0, 'E5: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      eq([bs0.inv, bs0.ret, llm.st.invalidSent.h5p_branchingscenario || 0, llm.st.retriesSeen.h5p_branchingscenario || 0], [0, 0, 1, 1], 'E5: caso ramificado — 1 respuesta inválida (BS_FORWARD_ONLY) y EXACTAMENTE 1 reintento dirigido, luego pasó');
+      const arts = await artifactsOfRun(c.runId);
+      const textOf = async (a) => { const r = await fetch(`${FAKES.storageUrl}/storage/v1/object/authenticated/${a.storage_bucket}/${a.storage_path}`); return r.ok ? r.text() : null; };
+      const bsArt = arts.find((a) => a.item_key === `activity:${decideCh}` && a.type === 'dynamic_h5p_params_json' && a.status !== 'disabled');
+      const bsDoc = bsArt ? JSON.parse((await textOf(bsArt)) || 'null') : null;
+      ok(bsDoc && bsDoc.type === 'branchingscenario' && bsDoc.data.decisions.length === 3 && bsDoc.data.endings.length === 3, 'E5: artifact de la actividad = branchingscenario (3 decisiones, 3 finales)', bsDoc && { type: bsDoc.type });
+      const viArt = arts.find((a) => a.item_key === `video_interactions:${decideCh}` && a.type === 'dynamic_video_interactions_json' && a.status !== 'disabled');
+      const viDoc = viArt ? JSON.parse((await textOf(viArt)) || 'null') : null;
+      ok(viDoc && viDoc.schemaVersion === 2 && Array.isArray(viDoc.reflections) && viDoc.reflections.length === 2, 'E5: video_interactions schemaVersion 2 con 2 reflexiones (video de 468 s)', viDoc && { v: viDoc.schemaVersion, r: viDoc.reflections && viDoc.reflections.length });
+      const viItem = items.find((i) => i.item_key === `video_interactions:${decideCh}`);
+      ok(viItem && viItem.output_summary && viItem.output_summary.reflectionCount === 2, 'E5: resumen del item video_interactions con reflectionCount 2 (validado contra la duración MEDIDA)', viItem && viItem.output_summary);
+      results.courses.E5 = { courseId: c.courseId, frontendCourseId: c.frontendCourseId, blueprintNumber: c.n, runId: c.runId, items: items.length, spec: C,
+        modules: c.mods, manifestItems: M.items.map((i) => ({ key: i.key, type: i.type, variant: i.variant || null, h5pType: i.h5pType || null })), manifestModules: M.modules,
+        features: M.features, assessment: c.assessment, examBank: false, examBankSummaries: [], decideChapterId: decideCh, bsAnswers: H5P2.branchingScenario.valid };
+    }, { fatal: false });
+    if (RUN_E5 && S.E5 && S.E5.runId) await step('v3-E5-h5p2-empaquetado', async () => {
+      const c = S.E5;
+      const P = await packageRun('E5', c.courseId, c.n, c.runId);
+      const os = P.job.output_summary || {};
+      const libs = (os.h5pPackages || []).map((p) => p.mainLibrary);
+      ok(libs.includes('H5P.BranchingScenario') && libs.filter((l) => l === 'H5P.Dialogcards').length === 2, 'E5: paquete con el Branching Scenario y un «Repaso» (Dialog Cards) por capítulo', libs);
+      // r55 (R7): todos los .h5p solo contenido → requisito del sitio (pack v3), cualquier rol restaura.
+      eq(P.status.restore && P.status.restore.as, 'site_library_pack', 'E5: GET …/package devuelve el requisito del sitio (Cursia H5P Library Pack v3)');
+      results.courses.E5.packageSummary = os;
+      results.courses.E5.reviewCardsChapterIds = (os.h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      // r55: BS y «Repaso» solo contenido; el IV v2 con pausas + remediación.
+      const z = await JSZip.loadAsync(P.buf);
+      const pkgOf = async (mainLibrary, keyPrefix) => {
+        const p = (os.h5pPackages || []).find((x) => x.mainLibrary === mainLibrary && (!keyPrefix || x.itemKey.startsWith(keyPrefix)));
+        return p ? JSZip.loadAsync(await z.file(`files/${p.sha1.slice(0, 2)}/${p.sha1}`).async('nodebuffer')) : null;
+      };
+      const H = D('package/h5p/index.js');
+      const bsz = await pkgOf('H5P.BranchingScenario');
+      const tops = bsz ? [...new Set(Object.keys(bsz.files).filter((n) => !bsz.files[n].dir && n !== 'h5p.json' && !n.startsWith('content/')).map((n) => n.split('/')[0]))].sort() : [];
+      // r55 (R7): solo contenido (las librerías del caso ramificado vienen del pack v3 del sitio).
+      ok(bsz && tops.length === 0, 'E5: el .h5p del caso ramificado es solo contenido (sin carpetas de librería)', tops);
+      const dcz = await pkgOf('H5P.Dialogcards');
+      ok(dcz && Object.keys(dcz.files).every((n) => n === 'h5p.json' || n.startsWith('content')), 'E5: el «Repaso» es solo contenido', dcz && Object.keys(dcz.files));
+      const ivz = await pkgOf('H5P.InteractiveVideo', `video:${c.mods[0].chapters[0].id}`);
+      const iv = ivz ? JSON.parse(await ivz.file('content/content.json').async('string')) : null;
+      const ints = iv ? iv.interactiveVideo.assets.interactions : [];
+      const pauses = ints.filter((i) => i.action.library === 'H5P.Text 1.1');
+      const qs = ints.filter((i) => i.action.library !== 'H5P.Text 1.1');
+      ok(pauses.length === 2 && pauses.every((p) => p.pause === true && /Pausa para pensar:/.test(p.action.params.text)), 'E5: IV v2 con 2 pausas de reflexión (H5P.Text, pausan el video)', pauses.map((p) => p.duration));
+      ok(qs.length > 0 && qs.every((x) => x.adaptivity && Number.isInteger(x.adaptivity.wrong.seekTo) && x.adaptivity.wrong.seekLabel === 'Volver a ver este tramo'), 'E5: cada pregunta del IV v2 con remediación (seekTo del plan, «Volver a ver este tramo»)', qs.map((x) => x.adaptivity));
+      // Para browser-h5p2.js: tramos de las pausas y, por pregunta, una respuesta INCORRECTA (texto visible).
+      const plain = (h) => String(h || '').replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim();
+      results.courses.E5.iv = {
+        chapterId: c.mods[0].chapters[0].id,
+        pauses: pauses.map((p) => ({ from: p.duration.from, to: p.duration.to })),
+        questions: qs.map((x) => {
+          const pr = x.action.params;
+          const wrongText = /^H5P\.TrueFalse /.test(x.action.library)
+            ? (String(pr.correct) === 'true' ? 'Falso' : 'Verdadero')
+            : plain(((pr.answers || []).find((a) => !a.correct) || {}).text);
+          return { from: x.duration.from, to: x.duration.to, seekTo: x.adaptivity.wrong.seekTo, library: x.action.library, wrongText };
+        }),
+      };
+    }, { fatal: false });
+
+    // ═══ Motor pedagógico V1 — E6: perfil pedagógico → Blueprint → Manifest con diseño → run 100 % mock → empaque ═══
+    // Prueba que los consumidores REALES (runs, scheduler, ejecutor del navegador, workers, empaque) toleran el
+    // diseño pedagógico (`course.pedagogy`, `design`, h5pType elegido por el diseño). Sin gasto: todo mock/falso.
+    if (RUN_E5) await step('v3-E6-pedagogia-generacion', async () => {
+      const PED = D('modules/pedagogy/index.js');
+      const MB = D('modules/generation-manifests/generation-manifest-builder.js');
+      const pedagogy = {
+        pedagogyProfileVersion: 1, primaryApproach: 'significativo', secondaryApproaches: ['experiencial'],
+        learner: { description: 'Técnicos de mantenimiento nuevos', ageGroup: 'adults', educationLevel: 'technical', priorKnowledge: 'none', experience: 'none' },
+        learningOutcomes: { know: ['Componentes del circuito hidráulico'], do: ['Verificar la presión'], competencies: [] },
+        learningModes: ['concepts'], experienceTypes: ['teacher_guided'], assessmentMethods: ['quizzes'], principles: [], origin: 'manual',
+      };
+      const C = { key: 'E6', title: '[E2E Pedagogía E6] Circuitos hidráulicos (significativo)', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', examBank: true, pedagogy, modules: [
+        { title: 'Fundamentos del circuito', objective: 'Relacionar los componentes del circuito hidráulico', exam: true, chapters: [
+          { title: 'Componentes y funciones', v: true, a: true, objective: 'Relacionar cada componente del circuito con su función' },
+          { title: 'Presión y caudal', v: false, a: true, objective: 'Explicar la relación entre presión y caudal' },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E6 = c;
+      const st6 = await readStructure(c.courseId);
+      eq(st6.liveMatchesCurrentBlueprint, true, 'E6: con perfil pedagógico, la estructura queda «confirmada» (liveMatchesCurrentBlueprint true, review I1)');
+      const bp = (await api('GET', `/courses/${c.courseId}/blueprints/${c.n}`)).data;
+      const snap = bp && (bp.snapshot || (bp.blueprint && bp.blueprint.snapshot));
+      ok(snap && snap.course.pedagogy && snap.course.pedagogy.approaches.map((a) => a.id).join('+') === 'significativo+experiencial', 'E6: Blueprint congela course.pedagogy (significativo + experiencial)', snap && snap.course.pedagogy);
+      ok(snap && snap.modules.every((m) => m.design && m.chapters.every((x) => x.design && x.design.sequence.length > 5)), 'E6: design en cada módulo y capítulo del Blueprint');
+      const M = c.manifest.manifest;
+      ok(M.features.pedagogy && M.features.pedagogy.engineVersion === 1, 'E6: Manifest con features.pedagogy', M.features);
+      // R68: el perfil congelado es el del escenario + las horas que eligió el docente para conservar su estructura.
+      const savedPed = (await api('GET', `/courses/${c.courseId}/profiles/pedagogy`)).data.profile;
+      // (el perfil guardado sin las reglas que el servidor deriva de él)
+      const frozenPed = Object.fromEntries(Object.entries(savedPed).filter(([k]) => k !== 'designRules'));
+      eq(MB.validateGenerationManifestV3(M, PED.applyPedagogyToSnapshot(snap, PED.deriveDesignRules(frozenPed)), M.source), [], 'E6: el Manifest guardado valida contra el diseño recalculado del perfil');
+      eq(bp && bp.sha256, M.source.blueprintSha256, 'E6: el Manifest apunta al Blueprint con diseño');
+      const acts = M.items.filter((i) => i.type === 'activity');
+      // significativo (0,6) + experiencial (0,4): tipos preferidos [arrastrar, preguntas, …]; «Explicar…» (objetivo) elige preguntas dentro del top-2.
+      const prefs = snap.modules[0].chapters[0].design.activity.preferredTypes;
+      eq(prefs.slice(0, 2), ['dragtext', 'questionset'], 'E6: tipos preferidos combinados (significativo + experiencial)');
+      ok(acts.length === 2 && acts.every((i) => prefs.slice(0, 2).includes(i.h5pType) && i.design && i.design.intent === 'relate') && acts[0].h5pType === 'dragtext', 'E6: actividades con tipo y diseño del enfoque (intención relacionar; tipos del top-2 del diseño)', acts.map((i) => [i.h5pType, i.design]));
+      ok(M.items.find((i) => i.type === 'video').design.style === 'concept_explainer', 'E6: video con estilo del enfoque (explicación de concepto)');
+      ok(M.items.filter((i) => i.type === 'exam').every((i) => i.design.examStyle === 'conceptual_relations'), 'E6: examen de módulo con estilo del enfoque');
+      // Fase 2: como E4, Videogen / Gamma / TTS / guion LLM por los workers REALES contra los fakes locales (el
+      // diseño tiene que llegar a la configuración final de cada proveedor), con la aprobación de presupuesto del
+      // sandbox. Ningún proveedor real: gasto 0.
+      const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
+      const body = { ...ctx, videoMode: 'real' }; // providerModes: default REAL (contra los fakes)
+      const calls0 = { g: PFAKES.st.gammaPosts.length, v: FAKES.videogen.submissions.length };
+      let start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      ok(start.status === 409 && !!estM, 'E6: run con video (Videogen falso) sin aprobación → 409 con estimateId', { s: start.status, e: start.error });
+      await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+               values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e pedagogía E6: aprobación (Videogen FALSO local)')`, [c.courseId, estM && estM[1]]);
+      start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, body);
+      ok(start.status === 201, 'E6: run creado (201)', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E6: run no creado: ${start.status} ${start.error}`);
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E6';
+      // Fase 2 (review M6): E6 corre el banco de preguntas (el camino por defecto en producción): el diseño tiene que
+      // llegar a cada parte del banco (task con caché, reparaciones). La rama GIFT la cubren E4 y test-50.
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = true;
+      // Fase 2 (review I2): un navegador con una versión anterior (no declara que aplica el brief) no puede reclamar
+      // un run con diseño: 409 rules_version_mismatch (pausa visible «recarga la página»), nada reclamado.
+      const old = await api('POST', '/dynamic-generation/claim', { runId: c.runId, executorId: 'e2e-old-tab', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam'], leaseSeconds: 60 });
+      const claimedOld = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab'`, [c.runId]);
+      ok(old.status === 409 && /rules_version_mismatch/.test(String(old.error)) && /diseño pedagógico/.test(String(old.error)) && claimedOld[0].n === 0,
+        'E6: ejecutor sin la capacidad pedagogy-brief-1 → 409 visible y ningún item reclamado', { s: old.status, e: old.error, n: claimedOld[0].n });
+      // Fase 2: se graba cada prompt que el ejecutor REAL manda al LLM falso, con el item que lo pidió.
+      const prompts = [];
+      const respond0 = llm.respond;
+      llm.respond = (b, h) => { prompts.push({ body: b, headers: h || {} }); return respond0(b, h); };
+      let stt;
+      try {
+        const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        stt = await waitRunTerminal(ctl, 'E6 run', undefined, c.runId);
+      } finally {
+        llm.respond = respond0;
+      }
+      const items = await waitItemsDone(c.runId);
+      ok(['preview', 'completed'].includes(stt.status) && stt.failed === 0 && !stt.fatalError, 'E6: ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.every((i) => i.status === 'completed'), `E6: los ${items.length} items completed (con diseño pedagógico en el Manifest)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
+      ok(llm.st.unknown.length === 0, 'E6: LLM falso sin prompts no reconocidos', llm.st.unknown);
+
+      // ── Fase 2: el diseño de cada trabajo llegó al prompt / configuración FINAL de su generador ──
+      const rules6 = M.features.activityTypeRules ?? null;
+      const briefs = new Map(M.items.map((it) => [it.key, PED.buildItemPedagogyBrief({ item: it, snapshot: snap, activityTypeRules: rules6 })]));
+      const runRows = await q(`select id, item_key, type, output_summary from public.generation_item_runs where job_id = $1`, [c.runId]);
+      const keyOfRun = new Map(runRows.map((r) => [r.id, r.item_key]));
+      const textOf = (b) => (b.messages || []).map((m) => (typeof m.content === 'string' ? m.content : (m.content || []).map((x) => x.text || '').join(''))).join('\n');
+      const hdr = (h, k) => (typeof h.get === 'function' ? h.get(k) : h[k]);
+      const byItem = new Map();
+      for (const p of prompts) {
+        const key = keyOfRun.get(hdr(p.headers, 'x-cursia-item-run-id'));
+        if (!key) continue;
+        if (!byItem.has(key)) byItem.set(key, []);
+        byItem.get(key).push({ role: hdr(p.headers, 'x-cursia-call-role') || 'main', text: textOf(p.body) });
+      }
+      const missing = [];
+      const reached = new Set();
+      for (const [key, calls] of byItem) {
+        const br = briefs.get(key);
+        const type = key.slice(0, key.indexOf(':'));
+        if (!br) { missing.push(`${key}: prompt LLM sin diseño (${type})`); continue; }
+        const want = br.text.replace(/^\n+/, '');
+        // Sin bloque a propósito: el reintento SOLO del sidecar del contenido y la pasada que iguala la longitud de las
+        // opciones GIFT (reparaciones de formato sobre un texto ya generado con el diseño; no escriben contenido nuevo).
+        const formatRepair = (x) => x.role === 'context_summary_retry' || /^Estas preguntas GIFT de selección múltiple/.test(x.text);
+        for (const call of calls.filter((x) => !formatRepair(x))) {
+          if (!call.text.includes(want)) missing.push(`${key} (${call.role}): el prompt no trae su diseño`);
+        }
+        reached.add(type);
+      }
+      eq(missing, [], 'E6: TODO prompt LLM del ejecutor real trae el diseño de SU item (reintentos y correcciones incluidos)');
+      eq([...reached].sort(), ['activity', 'content', 'course_intro', 'course_plan', 'exam', 'experience', 'final_exam', 'module_intro', 'video_interactions'], 'E6: generadores del navegador que recibieron diseño');
+      const sumMismatch = runRows.filter((r) => byItem.has(r.item_key) && r.output_summary && briefs.get(r.item_key) && r.output_summary.pedagogySha256 !== briefs.get(r.item_key).textSha256).map((r) => r.item_key);
+      eq(sumMismatch, [], 'E6: el summary de cada item registra la huella del diseño que recibió (pedagogySha256)');
+      const vg = FAKES.videogen.submissions.slice(calls0.v);
+      const vBrief = briefs.get(M.items.find((i) => i.type === 'video').key);
+      ok(vg.length === 1 && vg[0].content_txt.includes(vBrief.text) && vg[0].content_txt.indexOf(vBrief.text) < 200, 'E6: Videogen FALSO recibió el estilo del video en la cabecera del content_txt', vg.map((x) => x.content_txt.slice(0, 300)));
+      const gp = PFAKES.st.gammaPosts.slice(calls0.g);
+      const pBriefs = M.items.filter((i) => i.type === 'presentation').map((i) => briefs.get(i.key).text);
+      ok(gp.length === pBriefs.length && gp.every((b) => pBriefs.some((t) => String(b.additionalInstructions).endsWith(t)) && /^La diapositiva 1 es la portada/.test(b.additionalInstructions)),
+        'E6: Gamma FALSO recibió el enfoque de las diapositivas al final de additionalInstructions (las reglas de siempre primero)', gp.map((b) => String(b.additionalInstructions).slice(-200)));
+      const notConsumed = [...new Set(M.items.filter((i) => !briefs.get(i.key)).map((i) => i.type))].sort();
+      eq(notConsumed, ['audio_welcome', 'audiobook_chapter'], 'E6: los únicos trabajos sin diseño son los de audio (narran contenido ya diseñado)');
+      S.E6pedagogy = { llmCalls: prompts.length, itemsWithDesign: byItem.size, reached: [...reached].sort(), notConsumed };
+
+      const ev = await q(`select count(*)::int n, coalesce(sum(amount), 0)::float usd from public.generation_cost_events where course_id = $1 and event_kind = 'CHARGE' and cost_source <> 'ZERO_BY_DESIGN'`, [c.courseId]);
+      results.courses.E6 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, features: M.features,
+        activities: acts.map((i) => ({ key: i.key, h5pType: i.h5pType, design: i.design })), chargedEvents: ev[0], pedagogyPrompts: S.E6pedagogy };
+    }, { fatal: false });
+    if (RUN_E5 && S.E6 && S.E6.runId) await step('v3-E6-pedagogia-empaquetado', async () => {
+      const c = S.E6;
+      const P = await packageRun('E6', c.courseId, c.n, c.runId);
+      const os = P.job.output_summary || {};
+      const libs = (os.h5pPackages || []).map((p) => p.mainLibrary);
+      ok(libs.includes('H5P.DragText') || libs.includes('H5P.Blanks'), 'E6: el paquete trae las actividades del tipo elegido por el diseño pedagógico', libs);
+      results.courses.E6.packageSummary = { h5pPackages: (os.h5pPackages || []).map((p) => ({ itemKey: p.itemKey, mainLibrary: p.mainLibrary })) };
+    }, { fatal: false });
+
+    // ═══ Fase 2 · Actividades de Aplicación — E7: capítulo de contenido + capítulo de PRÁCTICA con actividad ═══
+    // Estructura → perfil (estudiante + resultados) → lock → Manifest con application_activity → run 100 % mock con el
+    // ejecutor REAL del navegador (dos pasadas: actividad + solucionario; una respuesta inválida → reintento dirigido)
+    // → empaque (página visible + PDF, solucionario OCULTO + PDF) → regenerar UNA actividad (solo ella) → reempaque.
+    if (RUN_E5) await step('v3-E7-aplicacion-generacion', async () => {
+      const AA = D('modules/course-shell/application-activity.js');
+      const pedagogy = {
+        pedagogyProfileVersion: 1, primaryApproach: 'competencias', secondaryApproaches: [],
+        learner: { description: 'Técnicos de mantenimiento con experiencia en planta', ageGroup: 'adults', educationLevel: 'technical', priorKnowledge: 'basic', experience: 'some' },
+        learningOutcomes: { know: ['Rangos de presión del circuito'], do: ['Inspeccionar un circuito hidráulico antes de liberarlo'], competencies: [] },
+        learningModes: ['practice'], experienceTypes: ['teacher_guided'], assessmentMethods: ['quizzes'], principles: [], origin: 'manual',
+      };
+      const C = { key: 'E7', title: '[E2E Aplicación E7] Inspección de circuitos hidráulicos', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', pedagogy, modules: [
+        { title: 'Inspección del circuito', objective: 'Inspeccionar el circuito hidráulico antes de liberarlo', exam: true, chapters: [
+          { title: 'Lectura de presión', v: false, a: true, app: 60, objective: 'Medir la presión del circuito en el puerto de prueba' },
+          // Loop 9 B: práctica guiada de 80 min (2 ejercicios de 40) en el capítulo de contenido sin Actividad de Aplicación.
+          { title: 'Ajuste de válvulas', v: false, a: true, gp: 80, objective: 'Ajustar la válvula de alivio al valor de placa' },
+          { title: 'Práctica integradora', v: false, a: false, kind: 'practice', app: 30, objective: 'Ejecutar la inspección completa del circuito' },
+        ] }] };
+      const c = await createCourse(C, llm);
+      S.E7 = c;
+      const M = c.manifest.manifest;
+      const [chContent, chPlain, chPractice] = c.mods[0].chapters.map((x) => x.id);
+      const apps = M.items.filter((i) => i.type === 'application_activity');
+      eq(apps.map((i) => [i.key, i.applicationMinutes]), [[`application_activity:${chContent}`, 60], [`application_activity:${chPractice}`, 30]], 'E7: Manifest con una Actividad de Aplicación por capítulo marcado (60 y 30 min)');
+      const ofPractice = M.items.filter((i) => i.chapterId === chPractice).map((i) => i.type).sort();
+      eq(ofPractice, ['application_activity', 'experience'], 'E7: el capítulo de práctica con actividad NO activa video, Gamma, audiolibro ni Libro');
+      eq(apps.find((i) => i.chapterId === chPractice).dependsOn.slice().sort(), [`content:${chContent}`, `content:${chPlain}`].sort(), 'E7: la actividad de la práctica depende de los contenidos del módulo');
+      const bp = (await api('GET', `/courses/${c.courseId}/blueprints/${c.n}`)).data;
+      const snap = bp && (bp.snapshot || (bp.blueprint && bp.blueprint.snapshot));
+      ok(snap && snap.course.applicationContext && snap.course.applicationContext.learningOutcomes.do[0] === pedagogy.learningOutcomes.do[0], 'E7: Blueprint congela applicationContext (estudiante + resultados)', snap && snap.course.applicationContext);
+      const mc = M.chapters ? M.chapters : M.modules.flatMap((m) => m.chapters);
+      ok(mc.find((x) => x.chapterId === chContent).applicationMinutes === 60 && mc.find((x) => x.chapterId === chPlain).applicationMinutes === undefined, 'E7: ManifestChapter.applicationMinutes solo donde hay actividad');
+      // Loop 9 B: práctica guiada SOLO en el capítulo de contenido que la pide, dependiendo de su content.
+      const gps = M.items.filter((i) => i.type === 'guided_practice');
+      // Fix round 2 (N1): además de su content, espera a las AA del módulo (para ver su caso y no repetirlo).
+      eq(gps.map((i) => [i.key, i.guidedPracticeMinutes, i.dependsOn]), [[`guided_practice:${chPlain}`, 80, [`content:${chPlain}`, `application_activity:${chContent}`, `application_activity:${chPractice}`]]], 'E7: Manifest con UNOS ejercicios guiados (80 min) en el capítulo de contenido, sobre su content y las AA del módulo');
+      ok(mc.find((x) => x.chapterId === chPlain).guidedPracticeMinutes === 80 && mc.find((x) => x.chapterId === chPractice).guidedPracticeMinutes === undefined, 'E7: ManifestChapter.guidedPracticeMinutes solo donde la hay (nunca en la práctica)');
+
+      const ctx = { nombre: C.title, ...CTX, scormTemplateIds: S.templates };
+      const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { ...ctx, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+      ok(start.status === 201, 'E7: run 100 % mock creado (201) sin aprobación', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E7: run no creado: ${start.status} ${start.error}`);
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E7';
+      // Review I3: una pestaña con la versión anterior (aplica el diseño pero no sabe generar Actividades de Aplicación)
+      // recibe el 409 visible «recarga la página» y no reclama nada (nunca deja el run a medias renovando el lease).
+      const old = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1', { runId: c.runId, executorId: 'e2e-old-tab-app', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam'], leaseSeconds: 60 });
+      const claimedOld = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-app'`, [c.runId]);
+      ok(old.status === 409 && /rules_version_mismatch/.test(String(old.error)) && /Actividades de Aplicación/.test(String(old.error)) && claimedOld[0].n === 0,
+        'E7: ejecutor sin la capacidad application-activity-1 → 409 visible y ningún item reclamado', { s: old.status, e: old.error, n: claimedOld[0].n });
+      // Loop 9 B: lo mismo con una pestaña que sabe generar Actividades de Aplicación pero no prácticas guiadas.
+      const oldGp = await api('POST', '/dynamic-generation/claim?features=pedagogy-brief-1,application-activity-1', { runId: c.runId, executorId: 'e2e-old-tab-gp', types: ['content', 'course_plan', 'course_intro', 'module_intro', 'experience', 'video_interactions', 'activity', 'exam', 'final_exam', 'application_activity', 'guided_practice'], leaseSeconds: 60 });
+      const claimedOldGp = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and worker_id = 'e2e-old-tab-gp'`, [c.runId]);
+      ok(oldGp.status === 409 && /ejercicios guiados/.test(String(oldGp.error)) && claimedOldGp[0].n === 0,
+        'E7: ejecutor sin la capacidad guided-practice-1 → 409 visible y ningún item reclamado (nunca recibe el tipo)', { s: oldGp.status, e: oldGp.error, n: claimedOldGp[0].n });
+      const prompts = [];
+      const respond0 = llm.respond;
+      llm.respond = (b, h) => { prompts.push(b); return respond0(b, h); };
+      let stt;
+      try {
+        const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        stt = await waitRunTerminal(ctl, 'E7 run', undefined, c.runId);
+      } finally {
+        llm.respond = respond0;
+      }
+      const items = await waitItemsDone(c.runId);
+      ok(['preview', 'completed'].includes(stt.status) && stt.failed === 0 && !stt.fatalError, 'E7: ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.every((i) => i.status === 'completed'), `E7: los ${items.length} items completed (con Actividades de Aplicación)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 400)]));
+      ok(llm.st.unknown.length === 0, 'E7: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      ok((llm.st.retriesSeen.application_activity || 0) >= 1, 'E7: la actividad inválida (pesos ≠ 100) pidió un reintento dirigido', llm.st.retriesSeen);
+      const textOf = (b) => (b.messages || []).map((m) => (typeof m.content === 'string' ? m.content : (m.content || []).map((x) => x.text || '').join(''))).join('\n');
+      const appPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN'));
+      ok(appPrompts.length >= 2 && appPrompts.every((t) => t.includes(pedagogy.learningOutcomes.do[0]) && t.includes(pedagogy.learner.description)), 'E7: el prompt de la actividad trae el estudiante y los resultados de aprendizaje congelados', appPrompts.length);
+      ok(appPrompts.some((t) => t.includes('para 30 minutos') && t.includes('CAPÍTULO DE PRÁCTICA')) && appPrompts.some((t) => t.includes('para 60 minutos') && !t.includes('CAPÍTULO DE PRÁCTICA')), 'E7: minutos y tipo de capítulo de cada actividad llegan a su prompt');
+      const arts = await q(`select g.item_key k, a.type t, a.metadata from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id
+                            where g.job_id = $1 and a.type = 'dynamic_application_json' order by g.item_key`, [c.runId]);
+      eq(arts.map((a) => a.k).sort(), apps.map((i) => i.key).sort(), 'E7: un artifact dynamic_application_json por actividad');
+      const sums = await q(`select item_key, output_summary from public.generation_item_runs where job_id = $1 and type = 'application_activity'`, [c.runId]);
+      const byKey = new Map(sums.map((r) => [r.item_key, r.output_summary]));
+      eq([byKey.get(`application_activity:${chContent}`).genre, byKey.get(`application_activity:${chPractice}`).genre, byKey.get(`application_activity:${chPractice}`).chapterKind], ['case_analysis', 'procedure', 'practice'], 'E7: las dos actividades no tienen la misma forma (género por capítulo) y la práctica se registra como tal');
+      eq([byKey.get(`application_activity:${chContent}`).minutes, byKey.get(`application_activity:${chPractice}`).minutes], [60, 30], 'E7: summary con los minutos del Manifest');
+      // Loop 9 B: la práctica guiada (una llamada + reintento dirigido por la respuesta modelo sin numerar).
+      ok((llm.st.retriesSeen.guided_practice || 0) >= 1, 'E7: la práctica guiada inválida (respuesta modelo sin numerar) pidió un reintento dirigido', llm.st.retriesSeen);
+      const gpPrompts = prompts.map(textOf).filter((t) => t.includes('Diseña los EJERCICIOS GUIADOS de este capítulo'));
+      ok(gpPrompts.length >= 1 && gpPrompts.every((t) => t.includes('EXACTAMENTE 2 ejercicios') && t.includes('~40 min') && t.includes('FORMATIVA y SIN NOTA') && t.includes('al menos 800 caracteres, al menos 5 consignas y respuesta modelo de al menos 1400')), 'E7: el prompt de los ejercicios guiados trae el plan de Cursia (2 × 40 min), sus pisos y es formativo', gpPrompts.length);
+      // Loop 9 B fix I5: el claim lleva el caso de la práctica del módulo (y los de sus AA ya completadas) para no repetirlo.
+      ok(gpPrompts.every((t) => t.includes('NO REPITAS estos casos del módulo') && t.includes('Capítulo de práctica del módulo: «Práctica integradora»') && (t.match(/- Actividad de Aplicación del módulo: /g) || []).length === 2), 'E7: el prompt de los ejercicios guiados trae la práctica y las 2 AA del módulo (ya completadas: dependsOn)', gpPrompts.length);
+      const gpArts = await q(`select g.item_key k from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and a.type = 'dynamic_guided_practice_json'`, [c.runId]);
+      eq(gpArts.map((a) => a.k), [`guided_practice:${chPlain}`], 'E7: un artifact dynamic_guided_practice_json');
+      const [gpSum] = await q(`select output_summary s from public.generation_item_runs where job_id = $1 and type = 'guided_practice' order by generation desc limit 1`, [c.runId]);
+      ok(gpSum && gpSum.s.exerciseCount === 2 && gpSum.s.minutes === 80 && gpSum.s.promptVersion === 'v21-gp-3' && gpSum.s.retried === true && gpSum.s.v3Validation, 'E7: summary de la práctica guiada (2 ejercicios, 80 min, reintentada) validado por el servidor', gpSum && gpSum.s);
+      // Loop 10 C1: ejercicios distintos (2 tipos) y huellas acotadas en el summary del servidor (para los capítulos siguientes).
+      const fps = (gpSum && gpSum.s.v3Validation && gpSum.s.v3Validation.fingerprints) || [];
+      ok(new Set(gpSum.s.kinds || []).size === 2 && fps.length === 2 && fps.every((f) => f.title && /^(?:[0-9a-f]{8}){1,64}$/.test(f.sig)) && fps[0].title !== fps[1].title,
+        'E7: los 2 ejercicios guiados son de tipos distintos y el servidor guarda sus huellas (título + firma ≤ 64 hashes)', gpSum && { kinds: gpSum.s.kinds, fps });
+      // Loop 9 B: + lo que necesita el restore en Moodle (moodle-E7): spec, perfiles y Manifest.
+      results.courses.E7 = { courseId: c.courseId, blueprintNumber: c.n, runId: c.runId, items: items.length, applicationsList: apps.map((i) => ({ key: i.key, minutes: i.applicationMinutes })), summaries: Object.fromEntries(byKey),
+        spec: C, modules: c.mods, assessment: c.assessment, manifestModules: M.modules, features: M.features, applications: apps.length, reviewCardsChapterIds: [], examBank: true,
+        guidedPractices: gps.map((i) => ({ key: i.key, minutes: i.guidedPracticeMinutes })) };
+      void AA;
+    }, { fatal: false });
+    if (RUN_E5 && S.E7 && S.E7.runId) await step('v3-E7-aplicacion-empaquetado-y-regeneracion', async () => {
+      const c = S.E7;
+      const [chContent, , chPractice] = c.mods[0].chapters.map((x) => x.id);
+      const pagesOf = async (buf) => {
+        const zip = await JSZip.loadAsync(buf);
+        const out = new Map();
+        for (const f of Object.keys(zip.files).filter((n) => /^activities\/page_\d+\/module\.xml$/.test(n))) {
+          const mx = await zip.file(f).async('string');
+          const idn = (/<idnumber>([^<]*)<\/idnumber>/.exec(mx) || [])[1] || '';
+          if (!/:(application(_solution)?|guided_practice)$/.test(idn)) continue;
+          const px = await zip.file(f.replace('module.xml', 'page.xml')).async('string');
+          out.set(idn, { visible: Number((/<visible>(\d)<\/visible>/.exec(mx) || [])[1]), content: px });
+        }
+        return out;
+      };
+      const P1 = await packageRun('E7', c.courseId, c.n, c.runId);
+      // Loop 9 B (moodle-E7): «Repaso» reales del paquete, para la secuencia esperada tras el restore.
+      if (results.courses.E7) results.courses.E7.reviewCardsChapterIds = ((P1.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      const pg = await pagesOf(P1.buf);
+      for (const ch of [chContent, chPractice]) {
+        const s = pg.get(`cv3:ch:${ch}:application`);
+        const t = pg.get(`cv3:ch:${ch}:application_solution`);
+        ok(s && s.visible === 1 && /\.pdf/.test(s.content) && !s.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: página del estudiante visible, con PDF y sin respuestas`, s && { visible: s.visible });
+        ok(t && t.visible === 0 && /\.pdf/.test(t.content) && t.content.includes('Verificar primero la presión'), `E7: ${ch === chPractice ? 'práctica' : 'contenido'}: solucionario docente OCULTO (visible 0) con respuestas y PDF`, t && { visible: t.visible });
+      }
+      ok(![...pg.keys()].some((k) => /:application(_solution)?$/.test(k) && k.includes(c.mods[0].chapters[1].id)), 'E7: el capítulo sin actividad no tiene páginas de aplicación');
+      // Loop 9 B: la práctica guiada es una página VISIBLE del capítulo, tras el texto, con la respuesta modelo; sus minutos cuentan.
+      const chPlainId = c.mods[0].chapters[1].id;
+      const gpPage = pg.get(`cv3:ch:${chPlainId}:guided_practice`);
+      ok(gpPage && gpPage.visible === 1 && /Respuesta modelo \(revísala después de intentarlo\)/.test(gpPage.content.replace(/&[a-z]+;/g, ' ')) && /Ejercicios guiados/.test(gpPage.content) && !/Solucionario/.test(gpPage.content),
+        'E7: página «Práctica guiada — <capítulo>» visible con la respuesta modelo (sin solucionario)', gpPage && { visible: gpPage.visible });
+      ok(![...pg.keys()].some((k) => /:guided_practice$/.test(k) && !k.includes(chPlainId)), 'E7: ninguna otra práctica guiada (ni en la práctica)');
+      // Horas: la tarjeta del diseño cuenta los 80 min de la práctica guiada en el capítulo y en «Práctica y repaso».
+      const card = await api('POST', `/courses/${c.courseId}/design/recommendation`, {});
+      const dch = card.data && card.data.design && card.data.design.modules.flatMap((m) => m.chapters);
+      const gpCh = dch && dch.find((x) => x.id === chPlainId);
+      const twin = dch && dch.find((x) => x.id === chContent);
+      ok(gpCh && gpCh.guidedPracticeMinutes === 80 && gpCh.guidedPracticePinned === true && twin && gpCh.hours >= 80 / 60 && card.data.design.counts.guidedPractices === 1,
+        'E7: horas — el diseño cuenta la práctica guiada (80 min) en su capítulo', gpCh && { gp: gpCh.guidedPracticeMinutes, h: gpCh.hours, counts: card.data.design.counts });
+
+      // Regenerar SOLO la actividad de la práctica: el plan no arrastra nada más.
+      const key = `application_activity:${chPractice}`;
+      const base = `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs/${c.runId}/items/${encodeURIComponent(key)}/regenerate`;
+      const dry = await api('POST', base, { dryRun: true });
+      ok(dry.status === 200 && dry.data.costKind === 'llm' && JSON.stringify(dry.data.affected.map((x) => [x.itemKey, x.action])) === JSON.stringify([[key, 'REGENERATE']]) && dry.data.blockers.length === 0,
+        'E7: dryRun de regenerar una actividad → solo esa actividad (LLM), sin trabas', { s: dry.status, e: dry.error, d: dry.data });
+      const noConfirm = await api('POST', base, {});
+      ok(noConfirm.status === 400 && /confirm_paid_required/.test(String(noConfirm.error)), 'E7: regenerar sin confirmPaid → 400 confirm_paid_required', { s: noConfirm.status, e: noConfirm.error });
+      const before = await q(`select item_key, max(generation)::int g from public.generation_item_runs where job_id = $1 group by item_key`, [c.runId]);
+      const regen = await api('POST', base, { confirmPaid: true });
+      ok(regen.status === 201 && regen.data.created === true, 'E7: regeneración creada (201)', { s: regen.status, e: regen.error });
+      const calls0 = llm.st.v3calls.length;
+      const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+      const stt = await waitRunTerminal(ctl, 'E7 regeneración', undefined, c.runId);
+      await waitItemsDone(c.runId);
+      ok(stt.failed === 0 && !stt.fatalError, 'E7: el ejecutor completó la regeneración', stt);
+      const after = await q(`select item_key, max(generation)::int g from public.generation_item_runs where job_id = $1 group by item_key`, [c.runId]);
+      const bumped = after.filter((r) => r.g !== (before.find((b) => b.item_key === r.item_key) || {}).g).map((r) => r.item_key);
+      eq(bumped, [key], 'E7: solo la actividad regenerada tiene una generación nueva');
+      const [latest] = await q(`select status from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [c.runId, key]);
+      eq(latest && latest.status, 'completed', 'E7: la generación nueva de la actividad quedó completed');
+      const kinds = llm.st.v3calls.slice(calls0).map((x) => x.kind);
+      ok(kinds.length >= 2 && kinds.every((k) => k === 'application_activity' || k === 'application_solution'), 'E7: la regeneración solo llamó al LLM para la actividad y su solucionario', kinds);
+      const P2 = await packageRun('E7-regen', c.courseId, c.n, c.runId);
+      const pg2 = await pagesOf(P2.buf);
+      ok(pg2.get(`cv3:ch:${chPractice}:application_solution`).visible === 0 && pg2.get(`cv3:ch:${chContent}:application`).visible === 1, 'E7: reempaque tras regenerar: páginas y solucionario oculto intactos');
+      results.courses.E7.regeneration = { key, dryRunAffected: dry.data.affected.map((x) => x.itemKey), llmCalls: kinds };
+    }, { fatal: false });
+
+
+    // ═══ Fase 3 · Contexto académico — E8: microcurrículo (DOCX real) → contexto → perfil → 64 h → diseño → Blueprint → Manifest ═══
+    // Sin proveedores: la extracción es determinista y el run no se ejecuta (un claim real comprueba el brief y se cancela).
+    if (RUN_E5) await step('v3-E8-contexto-academico-diseno', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const fc = crypto.randomUUID();
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: fc, title: '[E2E Contexto E8] Contabilidad de Costos' });
+      ok(cr.status === 201, 'E8: POST /courses/dynamic → 201', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // 1. Documento → extracción (sin guardar, sin proveedores)
+      const docx = await AF.fixture('consistent', 'docx');
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo-costos.docx', dataBase64: docx.toString('base64') }] });
+      ok(ex.status === 200 && ex.data.saved === false && ex.data.stats.providersCalled === 0, 'E8: extract → 200, determinista, sin guardar y sin proveedores', { s: ex.status, e: ex.error });
+      const draft = ex.data.draft;
+      eq([draft.identity.subjectName.value, draft.outcomes.length, draft.competencies.length, draft.units.length, draft.hours.total.value, draft.evaluation.length], ['Contabilidad de Costos', 6, 2, 5, 64, 5], 'E8: el contexto trae asignatura, 6 RA, 2 competencias, 5 unidades, 64 h y 5 evaluaciones');
+      eq([ex.data.validation.canProceed, ex.data.validation.counts], [true, { error: 0, warning: 0, missing: 0 }], 'E8: validación limpia');
+      eq((await q(`select count(*)::int n from public.course_profiles where course_id = $1`, [courseId]))[0].n, 0, 'E8: la extracción no guardó nada');
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E8: 0 conexiones fuera de 127.0.0.1 durante la extracción (netguard activo)');
+      const bad = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'foto.bin', dataBase64: Buffer.from([0, 1, 2, 3, 255]).toString('base64') }] });
+      ok(bad.status === 400 && /UNSUPPORTED_DOCUMENT/.test(String(bad.error)), 'E8: archivo no soportado → 400 UNSUPPORTED_DOCUMENT', { s: bad.status, e: bad.error });
+      const inc = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'inconsistente.pdf', dataBase64: (await AF.fixture('inconsistent', 'pdf')).toString('base64') }] });
+      ok(inc.status === 200 && inc.data.validation.issues.some((i) => i.message === 'El documento indica 64 horas, pero la suma de componentes reportada es 48 horas.'), 'E8: PDF inconsistente → advertencia de horas exacta (sin bloquear)', inc.data && inc.data.validation && inc.data.validation.counts);
+      // 2. Guardar (versionado) — sin contexto, vincular resultados responde 400. Un curso nuevo no trae módulos (el
+      //    esqueleto 1×1 lo arma el editor): se crea el primero, con su capítulo automático.
+      let st = await readStructure(courseId);
+      if (!st.modules.length) {
+        const c0 = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', examEnabled: true, expectedCounter: st.structureVersionCounter });
+        if (c0.status !== 201) throw new Error(`E8: primer módulo ${c0.status} ${c0.error}`);
+        st = await readStructure(courseId);
+      }
+      const [m0] = st.modules;
+      ok(m0 && m0.chapters.length === 1 && 'outcomeIds' in m0.chapters[0] && m0.chapters[0].outcomeIds === null, 'E8: el GET de la estructura informa outcomeIds (null) con la migración aplicada', m0 && m0.chapters[0]);
+      const pre = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${m0.chapters[0].id}`, { outcomeIds: ['RA1'], expectedCounter: st.structureVersionCounter });
+      ok(pre.status === 400 && /NO_ACADEMIC_CONTEXT/.test(String(pre.error)), 'E8: vincular sin contexto guardado → 400 NO_ACADEMIC_CONTEXT', { s: pre.status, e: pre.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: draft, expectedVersion: 0 });
+      ok(sv.status === 201 && sv.data.profile.version === 1 && sv.data.profile.academicValidation.canProceed === true, 'E8: POST profiles/academic → 201 (versión 1, con validación)', { s: sv.status, e: sv.error });
+      const again = await api('POST', `/courses/${courseId}/profiles/academic`, { data: draft });
+      ok(again.status === 200 && again.data.created === false, 'E8: guardar el mismo contexto es idempotente (200, sin versión nueva)', { s: again.status });
+      // 3. Diseño desde el contexto
+      const dz = await api('GET', `/courses/${courseId}/academic-context/design`);
+      ok(dz.status === 200 && dz.data.available === true && dz.data.providersCalled === 0, 'E8: GET design → 200', { s: dz.status, e: dz.error });
+      const sug = dz.data.profileSuggestion;
+      const prop = dz.data.structureProposal;
+      eq([sug.profile.targetHours, sug.profile.learningOutcomes.do.length, sug.approachHints], [64, 5, ['problemas']], 'E8: el contexto sugiere 64 h, 5 resultados de saber hacer y nombra ABP');
+      eq([prop.counts.modules, prop.counts.chapters, prop.counts.outcomesCovered], [5, 18, 6], 'E8: estructura propuesta 5 × 18 con los 6 RA vinculados');
+      // 4. Perfil pedagógico desde el contexto (+ el enfoque que elige el docente)
+      const profile = { ...sug.profile, primaryApproach: 'problemas', secondaryApproaches: [] };
+      // LOOP 8.1: guardar el contexto ya derivó el perfil (64 h y resultados); el docente elige el enfoque sobre la versión vigente.
+      const pv = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      ok(pv.status === 200 && pv.data.version === 1 && pv.data.profile.targetHours === 64 && pv.data.derivedFromAcademic && pv.data.derivedFromAcademic.untouched === true, 'E8: guardar el contexto derivó el perfil (64 h y resultados del documento)', { s: pv.status, v: pv.data && pv.data.version });
+      const pg = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile, expectedVersion: pv.data.version });
+      ok(pg.status === 201 && pg.data.profile.profile.targetHours === 64, 'E8: perfil pedagógico guardado con las 64 h y los resultados del documento', { s: pg.status, e: pg.error });
+      // 5. Estructura desde el microcurrículo (lo que hace el panel con la vía de 48), con descripción y vínculos
+      st = await readStructure(courseId);
+      let counter = st.structureVersionCounter;
+      for (let mi = 0; mi < prop.modules.length; mi++) {
+        const pm = prop.modules[mi];
+        let mod;
+        if (mi === 0) {
+          mod = st.modules[0];
+          const u = await api('PATCH', `/courses/${courseId}/modules/${mod.id}`, { title: pm.title, objective: pm.objective, description: pm.description || undefined, examEnabled: true, expectedCounter: counter });
+          counter = u.data.structureVersionCounter;
+          mod = { ...mod, chapters: mod.chapters };
+        } else {
+          const cm = await api('POST', `/courses/${courseId}/modules`, { title: pm.title, objective: pm.objective, examEnabled: true, expectedCounter: counter });
+          counter = cm.data.structureVersionCounter;
+          mod = cm.data.module;
+        }
+        for (let ci = 0; ci < pm.chapters.length; ci++) {
+          const pc = pm.chapters[ci];
+          const body = { title: pc.title, videoEnabled: pc.videoEnabled, activityEnabled: pc.activityEnabled, ...(pc.description ? { description: pc.description } : {}), ...(pc.outcomeIds.length ? { outcomeIds: pc.outcomeIds } : {}), expectedCounter: counter };
+          const auto = (mod.chapters || [])[0];
+          const r = ci === 0 && auto ? await api('PATCH', `/courses/${courseId}/modules/${mod.id}/chapters/${auto.id}`, body) : await api('POST', `/courses/${courseId}/modules/${mod.id}/chapters`, body);
+          if (![200, 201].includes(r.status)) throw new Error(`E8 capítulo ${pc.title}: ${r.status} ${r.error}`);
+          counter = r.data.structureVersionCounter;
+        }
+      }
+      st = await readStructure(courseId);
+      eq(st.modules.map((m) => m.chapters.length), [4, 4, 4, 3, 3], 'E8: estructura viva = la del microcurrículo');
+      eq(st.modules[4].chapters.map((c) => c.outcomeIds), [['RA5', 'RA6'], ['RA5'], ['RA5', 'RA6']], 'E8: vínculos persistidos y devueltos por el GET (orden canónico)');
+      const badLink = await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${st.modules[0].chapters[0].id}`, { outcomeIds: ['RA9'], expectedCounter: st.structureVersionCounter });
+      ok(badLink.status === 400 && /UNKNOWN_OUTCOME_REF/.test(String(badLink.error)), 'E8: vincular un resultado inexistente → 400 UNKNOWN_OUTCOME_REF', { s: badLink.status, e: badLink.error });
+      // 6. 64 h: dry-run del distribuidor con la estructura del documento → aplicar el diseño
+      const dr = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+      const dist = dr.data && dr.data.distribution;
+      ok(dr.status === 201 || dr.status === 200, 'E8: dry-run del curso → OK', { s: dr.status, e: dr.error });
+      ok(dist && dist.status === 'within_tolerance' && dist.targetHours === 64 && dist.materialized.manifestErrors.length === 0, 'E8: con el microcurrículo, 64 h quedan DENTRO de la tolerancia (la estructura 3 × 3 del baseline no alcanzaba)', dist && { status: dist.status, h: dist.estimatedHours, c: dist.counts });
+      ok(dr.data.pedagogical && dr.data.pedagogical.blueprint.course.academicContext && dr.data.pedagogical.blueprint.course.academicContext.outcomes.length === 6, 'E8: el Blueprint del dry-run lleva el contexto académico congelado');
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: dist.proposalSha256 });
+      ok([200, 201].includes(ap.status) && ap.data.addedChapters >= 1, 'E8: «Aplicar diseño» → estructura con la práctica y las Actividades de Aplicación del diseño', { s: ap.status, e: ap.error, d: ap.data });
+      st = await readStructure(courseId);
+      const linkedBefore = st.modules.flatMap((m) => m.chapters).filter((c) => Array.isArray(c.outcomeIds)).length;
+      eq(linkedBefore, 18, 'E8: «Aplicar diseño» no tocó los vínculos de los capítulos');
+      // 7. Lock → Blueprint con contexto y vínculos; Manifest válido
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      ok(lock.status === 201, 'E8: lock → 201', { s: lock.status, e: lock.error });
+      const snap = lock.data.blueprint.snapshot;
+      // LOOP 9.2 (QA): un nombre propio nunca se pisa al aplicar el diseño.
+      ok(!ap.data.adoptedTitle && snap.course.title === '[E2E Contexto E8] Contabilidad de Costos', 'E8: «Aplicar diseño» conserva el nombre propio del curso', { adopted: ap.data.adoptedTitle, t: snap.course.title });
+      {
+        // LOOP 9.2 (QA): un curso «Curso sin título» toma el nombre del documento al aplicar el diseño → Blueprint con nombre.
+        const cr2 = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: 'Curso sin título' });
+        const c2 = Number(cr2.data.id);
+        let s2 = await readStructure(c2);
+        if (!s2.modules.length) { await api('POST', `/courses/${c2}/modules`, { title: 'Módulo 1', examEnabled: true, expectedCounter: s2.structureVersionCounter }); s2 = await readStructure(c2); }
+        await api('POST', `/courses/${c2}/profiles/academic`, { data: draft, expectedVersion: 0 });
+        eq((await q(`select title from public.courses where id = $1`, [c2]))[0].title, 'Contabilidad de Costos', 'E8: guardar el contexto da nombre a un «Curso sin título» (antes de cualquier Blueprint)');
+        const d2 = (await api('POST', `/courses/${c2}/pedagogy/dry-run`, {})).data.distribution;
+        const a2 = await api('POST', `/courses/${c2}/modules/apply-distribution`, { expectedCounter: s2.structureVersionCounter, proposalSha256: d2.proposalSha256 });
+        s2 = await readStructure(c2);
+        const l2 = await api('POST', `/courses/${c2}/blueprints`, { expectedCounter: s2.structureVersionCounter });
+        eq([a2.status < 300, l2.status, l2.data && l2.data.blueprint.snapshot.course.title], [true, 201, 'Contabilidad de Costos'],
+          'E8: el Blueprint de un curso que empezó «Curso sin título» lleva el nombre del documento');
+        // Un curso anterior a este arreglo (contexto ya guardado, todavía sin nombre) lo toma al aplicar el diseño.
+        await q(`update public.courses set title = 'Curso sin título' where id = $1`, [c2]);
+        s2 = await readStructure(c2);
+        const d3 = (await api('POST', `/courses/${c2}/pedagogy/dry-run`, {})).data.distribution;
+        const a3 = await api('POST', `/courses/${c2}/modules/apply-distribution`, { expectedCounter: s2.structureVersionCounter, proposalSha256: d3.proposalSha256 });
+        eq([a3.status < 300, a3.data && a3.data.adoptedTitle], [true, 'Contabilidad de Costos'], 'E8: «Usar este diseño» también da nombre a un curso sin nombre propio');
+        // QA staging: «Crear» rellenó el nombre del pedido con el del documento («inferido»): vale el nombre leído del documento.
+        await q(`update public.courses set title = 'Curso sin título', metadata = coalesce(metadata, '{}'::jsonb) || jsonb_build_object('brief', jsonb_build_object('briefVersion', 1, 'updatedAt', now()::text, 'fields', jsonb_build_object('nombre', 'Contabilidad de Costos', 'inferidos', 'nombre'))) where id = $1`, [c2]);
+        s2 = await readStructure(c2);
+        const d4 = (await api('POST', `/courses/${c2}/pedagogy/dry-run`, {})).data.distribution;
+        const a4 = await api('POST', `/courses/${c2}/modules/apply-distribution`, { expectedCounter: s2.structureVersionCounter, proposalSha256: d4.proposalSha256 });
+        eq([a4.status < 300, a4.data && a4.data.adoptedTitle], [true, 'Contabilidad de Costos'], 'E8: con el nombre del pedido rellenado desde el documento («inferido») se adopta el nombre leído del documento');
+      }
+      const ac = snap.course.academicContext;
+      ok(ac && ac.outcomes.map((o) => o.id).join() === 'RA1,RA2,RA3,RA4,RA5,RA6' && ac.competencies.length === 2 && ac.contextSha256 === sv.data.profile.sha256, 'E8: Blueprint congela los resultados y competencias del contexto (con su huella)', ac && { o: ac.outcomes.length, sha: ac.contextSha256 });
+      eq(snap.modules.flatMap((m) => m.chapters).filter((c) => c.outcomeIds).length, 18, 'E8: Blueprint con los vínculos de los 18 capítulos del documento');
+      ok(snap.course.pedagogy && snap.course.targetHours === 64, 'E8: Blueprint con el diseño pedagógico y las 64 h');
+      const st2 = await readStructure(courseId);
+      ok(st2.liveMatchesCurrentBlueprint === true, 'E8: la estructura viva coincide con el Blueprint (el contexto entra igual en la comparación)');
+      const n = lock.data.blueprint.blueprintNumber;
+      const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+      ok(man.status === 201 && man.data.manifest.rulesVersion === 3, 'E8: Manifest v3 → 201', { s: man.status, e: man.error });
+      const M = man.data.manifest.manifest;
+      ok(M.totals.applicationActivityCount >= 18 && M.modules.length === 5, 'E8: Manifest con 5 módulos y las Actividades de Aplicación del diseño', M.totals);
+      // 8. El brief que el claim entregaría a cada generador (misma función que el scheduler, sobre el Blueprint y el
+      //    Manifest GUARDADOS). El claim real con el ejecutor del navegador lo prueba E8-mini (sin videos: este app de
+      //    prueba no publica en YouTube, requisito para crear runs con video).
+      const GD = D('modules/pedagogy/generator-directives.js');
+      const fe = M.items.find((i) => i.type === 'final_exam');
+      const fb = GD.buildItemPedagogyBrief({ item: fe, snapshot: snap, activityTypeRules: M.features && M.features.activityTypeRules });
+      ok(fb && /RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR/.test(fb.text) && fb.outcomes.join() === 'RA1,RA2,RA3,RA4,RA5,RA6' && fb.text.length <= 4000 && fb.directives.length > 0,
+        'E8: el examen final recibe el diseño pedagógico + los 6 resultados (≤ 4000 caracteres)', fb && { outcomes: fb.outcomes, len: fb.text.length });
+      const appItem = M.items.find((i) => i.type === 'application_activity' && snap.modules[1].chapters.some((c) => c.id === i.chapterId && c.outcomeIds));
+      const ab = GD.buildItemPedagogyBrief({ item: appItem, snapshot: snap, activityTypeRules: M.features && M.features.activityTypeRules });
+      ok(ab && ab.outcomes.join() === 'RA2' && /criterios de evaluación deben referirse a ellos/.test(ab.text), 'E8: la Actividad de Aplicación del módulo 2 recibe RA2 y la indicación de evidenciarlo', ab && ab.outcomes);
+      const pres = M.items.find((i) => i.type === 'presentation');
+      ok(!GD.buildItemPedagogyBrief({ item: pres, snapshot: snap }) || !/RESULTADOS DE APRENDIZAJE/.test(GD.buildItemPedagogyBrief({ item: pres, snapshot: snap }).text), 'E8: los proveedores (Gamma) no reciben el bloque de resultados');
+      // Review I1: una versión nueva del contexto que ya no define RA6 limpia los vínculos (misma transacción) y el
+      // curso se puede volver a confirmar (sin quedar trabado con un vínculo roto).
+      const v2 = JSON.parse(JSON.stringify(draft));
+      v2.outcomes = v2.outcomes.filter((o) => o.id !== 'RA6');
+      v2.units = v2.units.map((u) => ({ ...u, outcomeIds: u.outcomeIds.filter((x) => x !== 'RA6'), contents: u.contents.map((c) => ({ ...c, outcomeIds: c.outcomeIds.filter((x) => x !== 'RA6') })) }));
+      v2.evaluation = v2.evaluation.map((e) => ({ ...e, outcomeIds: e.outcomeIds.filter((x) => x !== 'RA6') }));
+      const sv2 = await api('POST', `/courses/${courseId}/profiles/academic`, { data: v2 });
+      ok(sv2.status === 201 && (sv2.data.prunedOutcomeLinks || []).length === 2 && sv2.data.prunedOutcomeLinks.every((p) => p.removed.join() === 'RA6'),
+        'E8: guardar una versión sin RA6 quita RA6 de los 2 capítulos que lo vinculaban', sv2.data && sv2.data.prunedOutcomeLinks);
+      await keepTeacherDesign(api, courseId, 'E8 relock'); // R68
+      const st3 = await readStructure(courseId);
+      ok(!st3.modules.flatMap((m) => m.chapters).some((c) => (c.outcomeIds || []).includes('RA6')) && st3.liveMatchesCurrentBlueprint === false, 'E8: sin vínculos rotos; el Blueprint confirmado ya no coincide (hay que reconfirmar)');
+      const relock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st3.structureVersionCounter });
+      ok(relock.status === 201 && relock.data.blueprint.snapshot.course.academicContext.outcomes.length === 5, 'E8: el curso se vuelve a confirmar con la versión nueva del contexto', { s: relock.status, e: relock.error });
+      results.courses.E8 = { courseId, blueprintNumber: n, hours: dist.estimatedHours, counts: dist.counts, outcomes: ac.outcomes.length, manifestTotals: M.totals, usd: dist.materialized.providers.estimateUsd.expected };
+    }, { fatal: false });
+
+    // E8-mini: curso chico desde su microcurrículo, generado de punta a punta con el ejecutor REAL del navegador (LLM falso):
+    // los resultados vinculados llegan a los prompts del contenido, la actividad y el examen; empaque OK.
+    if (RUN_E5) await step('v3-E8-contexto-academico-generacion', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const AC = D('modules/academic-context/index.js');
+      const ext = await AC.extractAcademicContext([{ name: 'mini.docx', data: await AF.fixture('mini', 'docx') }]);
+      const prop = AC.proposeStructureFromContext(ext.context);
+      const C = { key: 'E8m', title: '[E2E Contexto E8-mini] Inspección de circuitos hidráulicos', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', academic: ext.context,
+        modules: prop.modules.map((m) => ({ title: m.title, objective: m.objective, exam: true, chapters: m.chapters.map((c) => ({ title: c.title, v: false, a: true, objective: `Aplicar ${c.title.toLowerCase()}`, description: c.description || undefined, outcomeIds: c.outcomeIds })) })) };
+      const c = await createCourse(C, llm);
+      S.E8m = c;
+      const bp = (await api('GET', `/courses/${c.courseId}/blueprints/${c.n}`)).data;
+      const snap = bp && (bp.snapshot || (bp.blueprint && bp.blueprint.snapshot));
+      ok(snap && snap.course.academicContext && snap.modules[0].chapters[0].outcomeIds.join() === 'RA1,RA2', 'E8-mini: Blueprint con el contexto y los vínculos', snap && snap.modules[0].chapters[0].outcomeIds);
+      const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { nombre: C.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+      ok(start.status === 201, 'E8-mini: run 100 % mock creado', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E8-mini: run no creado: ${start.status} ${start.error}`);
+      c.runId = start.data.run.id;
+      llm.st.tag = 'E8m';
+      const prompts = [];
+      const respond0 = llm.respond;
+      llm.respond = (b, h) => { prompts.push(b); return respond0(b, h); };
+      let stt;
+      try {
+        const ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        stt = await waitRunTerminal(ctl, 'E8-mini run', undefined, c.runId);
+      } finally {
+        llm.respond = respond0;
+      }
+      const items = await waitItemsDone(c.runId);
+      ok(['preview', 'completed'].includes(stt.status) && stt.failed === 0 && !stt.fatalError, 'E8-mini: el ejecutor del navegador terminó sin fallidos', stt);
+      ok(items.every((i) => i.status === 'completed'), `E8-mini: los ${items.length} items completed`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, i.error_message && i.error_message.slice(0, 300)]));
+      ok(llm.st.unknown.length === 0, 'E8-mini: LLM falso sin prompts no reconocidos', llm.st.unknown);
+      const textOf = (b) => (b.messages || []).map((m) => (typeof m.content === 'string' ? m.content : (m.content || []).map((x) => x.text || '').join(''))).join('\n');
+      const all = prompts.map(textOf);
+      const withBlock = all.filter((t) => t.includes('RESULTADOS DE APRENDIZAJE QUE ESTE RECURSO DEBE EVIDENCIAR'));
+      ok(withBlock.length >= 6, `E8-mini: ${withBlock.length} prompts con el bloque de resultados (plan, contenido, actividades, exámenes)`, withBlock.length);
+      ok(withBlock.some((t) => /RA3 \(saber hacer · aplicar\): Ajustar la válvula de alivio/.test(t) && /evidencia observable/.test(t)), 'E8-mini: la actividad del capítulo de ajuste pide evidencia de RA3');
+      ok(withBlock.some((t) => /al menos una pregunta/.test(t) && t.includes('RA1') && t.includes('RA2')), 'E8-mini: el examen del módulo 1 cubre RA1 y RA2');
+      const allowed = new Set([...ext.context.outcomes.map((o) => o.id), ...ext.context.competencies.map((o) => o.id)]);
+      const mentioned = new Set(withBlock.flatMap((t) => [...t.matchAll(/^- ((?:RA|CO)\d+) \(/gm)].map((m) => m[1])));
+      ok(mentioned.size > 0 && [...mentioned].every((id) => allowed.has(id)), 'E8-mini: los prompts solo nombran resultados del contexto (ninguno inventado)', [...mentioned]);
+      const P = await packageRun('E8m', c.courseId, c.n, c.runId);
+      ok(P && P.buf && P.buf.length > 0, 'E8-mini: paquete .mbz construido (el contexto no cambia el empaque)');
+      results.courses.E8m = { courseId: c.courseId, runId: c.runId, items: items.length, promptsWithOutcomes: withBlock.length };
+    }, { fatal: false });
+
+
+    // ═══ Fase 4 · Coherence Engine — E9: alineación resultado → evidencia sobre el curso del E8 (DB real, sin proveedores) ═══
+    if (RUN_E5 && results.courses.E8) await step('v3-E9-coherencia-alineacion', async () => {
+      const courseId = results.courses.E8.courseId;
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const dr = async () => {
+        const r = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+        if (![200, 201].includes(r.status)) throw new Error(`E9: dry-run ${r.status} ${r.error}`);
+        return r.data;
+      };
+      const d0 = await dr();
+      const a0 = d0.alignment;
+      ok(a0 && a0.available === true && a0.ruleset === 'alignment-rules@1' && a0.outcomes.length === 7, 'E9: el dry-run del curso trae el mapa de alineación (5 RA de la versión 2 + 2 competencias)', a0 && a0.coverage);
+      // Review F4 I2: el flujo de Cursia no vincula competencias → advertencia transversal (A1c), nunca crítico.
+      ok(a0.findings.filter((f) => f.rule === 'A1c' && f.severity === 'warning').map((f) => f.outcomeIds[0]).join() === 'CO1,CO2' && !a0.findings.some((f) => f.rule === 'A1'),
+        'E9: las competencias sin capítulos → advertencia transversal A1c (el documento no las vincula), sin críticos A1', a0.findings.map((f) => f.rule + ':' + f.outcomeIds.join('+')));
+      const ra2 = a0.outcomes.find((o) => o.id === 'RA2');
+      ok(['instruction', 'practice', 'application', 'assessment'].every((k) => ra2.evidence.some((e) => e.kind === k)) && ra2.evidence.every((e) => /:/.test(e.itemKey)), 'E9: RA2 con evidencias tipadas (instrucción, práctica, aplicación, evaluación) del Manifest');
+      const pa = d0.distribution && d0.distribution.materialized.alignment;
+      ok(pa && pa.available === true && pa.outcomes.length === 7 && pa.counts.critical <= a0.counts.critical, 'E9: también la alineación del diseño propuesto (mismos resultados, sin más críticos)', pa && pa.counts);
+      ok(a0.thresholds.missingPracticeIsCritical === false && a0.thresholds.practiceMinutesForComplex === 95, 'E9: umbrales del enfoque guardado (problemas: práctica 0,7 → 95 min)', a0.thresholds);
+      // Caso incompleto: quitar los vínculos de un capítulo → A4; de todos los capítulos de RA4 → A1.
+      let st = await readStructure(courseId);
+      const m4 = st.modules[3];
+      let counter = st.structureVersionCounter;
+      for (const c of m4.chapters.filter((x) => Array.isArray(x.outcomeIds))) {
+        const u = await api('PATCH', `/courses/${courseId}/modules/${m4.id}/chapters/${c.id}`, { outcomeIds: null, expectedCounter: counter });
+        if (u.status !== 200) throw new Error(`E9: quitar vínculos ${u.status} ${u.error}`);
+        counter = u.data.structureVersionCounter;
+      }
+      const a1 = (await dr()).alignment;
+      ok(a1.findings.some((f) => f.rule === 'A1' && f.severity === 'critical' && f.outcomeIds[0] === 'RA4') && a1.findings.filter((f) => f.rule === 'A4').length >= 3,
+        'E9: sin vínculos en el módulo 4 → RA4 sin cobertura (crítico) y sus capítulos «no asociados a ningún resultado»', a1.findings.map((f) => f.rule + ':' + (f.outcomeIds[0] || f.chapterIds[0])));
+      // Caso pedagógico: el mismo curso con aprendizaje significativo cambia umbrales, severidades y sugerencias.
+      const ped = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      const sig = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...ped.profile, primaryApproach: 'significativo', secondaryApproaches: [] }, expectedVersion: ped.version });
+      ok(sig.status === 201, 'E9: perfil cambiado a aprendizaje significativo', { s: sig.status, e: sig.error });
+      const a2 = (await dr()).alignment;
+      ok(a2.thresholds.practiceMinutesForComplex === 70 && a2.thresholds.priorKnowledgeChecks === true && a2.approach.approaches[0].id === 'significativo', 'E9: significativo → 70 min para resultados complejos y control de conocimientos previos', a2.thresholds);
+      // Review F4 M8: aserción concreta. Las A6 se miden contra el umbral del enfoque vigente, y bajar el umbral nunca agrega A6.
+      const a6 = (r) => r.findings.filter((f) => f.rule === 'A6');
+      ok(a6(a1).every((f) => f.evidence.requiredMinutes === 95) && a6(a2).every((f) => f.evidence.requiredMinutes === 70) && a6(a2).length <= a6(a1).length && a2.reportSha256 !== a1.reportSha256,
+        'E9: cambiar el enfoque recalcula las advertencias de tiempo con el umbral nuevo (95 → 70 min)', { a1: a6(a1).length, a2: a6(a2).length });
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E9: 0 conexiones fuera de 127.0.0.1 (netguard activo)');
+      results.courses.E9 = { courseId, initial: a0.counts, incomplete: a1.counts, significativo: a2.counts };
+    }, { fatal: false });
+
+
+    // ═══ Fase 5 · Regeneración parcial — E10: vista previa del impacto de los cambios (DB real, sin proveedores, USD 0) ═══
+    if (RUN_E5 && results.courses.E8m) await step('v3-E10-impacto-de-cambios', async () => {
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const courseId = results.courses.E8m.courseId;
+      const jobs0 = (await q(`select count(*)::int n from public.production_jobs where course_id = $1`, [courseId]))[0].n;
+      const persisted = async () => (await q(`select (select count(*) from public.course_blueprints where course_id = $1)::int b,
+          (select count(*) from public.course_generation_manifests where course_id = $1)::int m,
+          (select count(*) from public.course_profiles where course_id = $1)::int p`, [courseId]))[0];
+      const persisted0 = await persisted();
+      const imp = async (body) => {
+        const r = await api('POST', `/courses/${courseId}/change-impact`, body || {});
+        if (r.status !== 200) throw new Error(`E10: change-impact ${r.status} ${r.error}`);
+        return r.data;
+      };
+      // Sin cambios: nada que regenerar, USD 0.
+      const d0 = await imp();
+      ok(d0.available === true && d0.fromRunId === results.courses.E8m.runId && d0.blueprintChanged === false && d0.impact.toRun.length === 0 && d0.impact.untouchedChapters === d0.impact.chapters.length,
+        'E10: curso generado sin cambios → todo intacto, nada que regenerar', d0.impact && d0.impact.totals);
+      // Cambiar UN capítulo: solo él (y lo que lo incluye).
+      let st = await readStructure(courseId);
+      const m0 = st.modules[0];
+      const ch = m0.chapters[1];
+      const u = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${ch.id}`, { title: `${ch.title} (revisado)`, expectedCounter: st.structureVersionCounter });
+      ok(u.status === 200, 'E10: editar el título de un capítulo', { s: u.status, e: u.error });
+      const d1 = await imp();
+      const c1 = d1.impact.chapters.find((x) => x.chapterId === ch.id);
+      ok(c1 && !c1.untouched && c1.regenerate.some((k) => k.startsWith('content:')) && d1.impact.untouchedChapters === d1.impact.chapters.length - 1,
+        'E10: solo el capítulo editado cambia; los demás quedan intactos', d1.impact.chapters.map((x) => [x.title, x.untouched]));
+      ok(d1.impact.toRun.every((k) => k.includes(ch.id) || /^(course_plan|course_intro|module_intro|exam|final_exam):/.test(k)), 'E10: fuera del capítulo solo lo que lo incluye (plan, intros, exámenes)', d1.impact.toRun);
+      ok(Number(d1.impact.cost.toRun.estimateUsd.expected) > 0 && d1.impact.dryRun === true && d1.impact.spendUsd === '0.00', 'E10: costo estimado de los cambios (simulado, USD 0 gastado)', d1.impact.cost.toRun.estimateUsd);
+      ok(d1.impact.estimatedChangeCostUsd === Number(d1.impact.cost.toRun.estimateUsd.expected).toFixed(2), 'E10: «Costo estimado de los cambios: USD X» = todo lo que se ejecutaría', d1.impact.estimatedChangeCostUsd);
+      // Cambio pedagógico de vista previa (sin guardar): qué depende de esa decisión.
+      const ped = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      const preview = { ...ped.profile, primaryApproach: 'significativo', secondaryApproaches: [] };
+      const d2 = await imp({ profile: preview });
+      ok(d2.impact.toRun.length > d1.impact.toRun.length && d2.impact.toRun.every((k) => (d2.impact.reasons[k] || []).length > 0), 'E10: cambiar el enfoque (vista previa) → más items, cada uno con su motivo', d2.impact.totals);
+      const pedAfter = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      ok(pedAfter.version === ped.version, 'E10: la vista previa no guardó el perfil');
+      // Review F5 I1: perfil inválido → 400 (no 500); run inexistente → 404.
+      const bad = await api('POST', `/courses/${courseId}/change-impact`, { profile: { ...ped.profile, targetHours: -3 }, applyDistribution: true });
+      ok(bad.status === 400, 'E10: perfil de vista previa inválido → 400', { s: bad.status, e: bad.error });
+      const bad2 = await api('POST', `/courses/${courseId}/change-impact`, { profile: { ...ped.profile, primaryApproach: 'no-existe' } });
+      ok(bad2.status === 400, 'E10: enfoque desconocido → 400', { s: bad2.status, e: bad2.error });
+      const nf = await api('POST', `/courses/${courseId}/change-impact`, { fromRunId: '99999999-9999-4999-8999-999999999999' });
+      ok(nf.status === 404, 'E10: run de origen inexistente → 404', { s: nf.status, e: nf.error });
+      ok((await q(`select count(*)::int n from public.production_jobs where course_id = $1`, [courseId]))[0].n === jobs0, 'E10: no se creó ningún run ni trabajo');
+      ok(JSON.stringify(await persisted()) === JSON.stringify(persisted0), 'E10: la vista previa no escribió Blueprints, Manifests ni perfiles', persisted0);
+      // Curso sin generar (E8): nada que conservar, costo del curso completo.
+      if (results.courses.E8) {
+        const r = await api('POST', `/courses/${results.courses.E8.courseId}/change-impact`, {});
+        ok(r.status === 200 && r.data.available === false && r.data.reason === 'NO_PREVIOUS_RUN' && Number(r.data.fullGeneration.estimateUsd.expected) > 0, 'E10: curso no generado → costo de generarlo completo', { s: r.status, d: r.data && r.data.reason });
+      }
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, 'E10: 0 conexiones fuera de 127.0.0.1 (netguard activo)');
+      results.courses.E10 = { courseId, unchanged: d0.impact.totals, oneChapter: { toRun: d1.impact.toRun.length, usd: d1.impact.cost.toRun.estimateUsd.expected }, approachPreview: { toRun: d2.impact.toRun.length } };
+    }, { fatal: false });
+
+    // LOOP 8.5 · Generación con proveedores FALSOS → empaque → impacto de un cambio → regeneración parcial → re-empaque.
+    // Compartido por E11 (endpoints de diseño de siempre) y E17 (flujo V2); deja results.courses[tag] y [tag + 'regen'].
+    const fullGenerationFlow = async (tag, { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra = {}, courseCtx = CTX }) => {
+      const DRY = D('modules/pedagogy/dry-run.js');
+      const usd = (plan) => (plan && plan.estimateUsd ? Number(plan.estimateUsd.expected) : null);
+      // 11. Generación completa con proveedores FALSOS (Videogen local, Gamma/TTS mock, LLM falso).
+      const mods = st.modules;
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      const ctx = { nombre: title, ...courseCtx, scormTemplateIds: S.templates };
+      const body = { ...ctx, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      let start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e ${tag}: aprobación del run (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest/runs`, body);
+      }
+      ok(start.status === 201, `${tag}: run creado (Videogen falso, Gamma/TTS mock)`, { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`${tag}: run no creado: ${start.status} ${start.error}`);
+      const runA = start.data.run.id;
+      llm.st.tag = tag;
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      let stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId: runA }), `${tag} run`, undefined, runA);
+      const itemsA = await waitItemsDone(runA);
+      ok(stt.failed === 0 && !stt.fatalError && itemsA.every((i) => i.status === 'completed'), `${tag}: los ${itemsA.length} items generados sin fallos`, itemsA.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
+      ok(llm.st.unknown.length === 0, `${tag}: LLM falso sin prompts no reconocidos`, llm.st.unknown);
+      eq(itemsA.map((i) => i.item_key).sort(), M.items.map((i) => i.key).sort(), `${tag}: items generados = items del Manifest`);
+
+      // 12. Empaque (.mbz) con solucionarios ocultos y prohibidos al estudiante.
+      const P1 = await packageRun(tag, courseId, n, runA);
+      const z1 = await JSZip.loadAsync(P1.buf);
+      const solDirs = [];
+      for (const f of Object.keys(z1.files).filter((x) => /^activities\/page_\d+\/module\.xml$/.test(x))) {
+        if (/:application_solution<\/idnumber>/.test(await z1.file(f).async('string'))) solDirs.push(f.replace('/module.xml', ''));
+      }
+      const solOk = await Promise.all(solDirs.map(async (d) => /<roleid>5<\/roleid>\s*<capability>mod\/page:view<\/capability>\s*<permission>-1000<\/permission>/.test(await z1.file(`${d}/roles.xml`).async('string'))));
+      ok(solDirs.length === apps.length && solOk.every(Boolean), `${tag}: ${solDirs.length} solucionarios con mod/page:view PROHIBIDO al estudiante`);
+
+      // 13. Impacto de un cambio (un capítulo) = lo que después se regenera de verdad.
+      const m0 = st.modules[0];
+      const ch = m0.chapters.find((c) => c.kind !== 'practice');
+      const newTitle = `${ch.title} (revisado)`;
+      let st2 = await readStructure(courseId);
+      const up = await api('PATCH', `/courses/${courseId}/modules/${m0.id}/chapters/${ch.id}`, { title: newTitle, expectedCounter: st2.structureVersionCounter });
+      ok(up.status === 200, `${tag}: el docente edita el título de un capítulo`, { s: up.status, e: up.error });
+      llm.st.chapterByTitle.set(newTitle, ch.id);
+      const imp = await api('POST', `/courses/${courseId}/change-impact`, {});
+      const I = imp.data && imp.data.impact;
+      // Cambia ESE capítulo y, por dependencia, las prácticas de SU módulo (integran los contenidos del módulo); nada más.
+      const practiceOfM0 = new Set(m0.chapters.filter((c) => c.kind === 'practice').map((c) => c.id));
+      const changedCh = I ? I.chapters.filter((c) => !c.untouched).map((c) => c.chapterId) : [];
+      ok(imp.status === 200 && imp.data.fromRunId === runA && changedCh.includes(ch.id) && changedCh.every((id) => id === ch.id || practiceOfM0.has(id)) && I.toRun.some((k) => k === `content:${ch.id}`) && Number(I.estimatedChangeCostUsd) > 0,
+        `${tag}: impacto: cambian ese capítulo y las prácticas de su módulo (dependen de él); nada más; costo estimado > 0`, I && { changed: changedCh.length, practiceInModule: practiceOfM0.size, toRun: I.toRun.length, usd: I.estimatedChangeCostUsd });
+      await keepTeacherDesign(api, courseId, `${tag} relock`); // R68
+      st2 = await readStructure(courseId);
+      const lock2 = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st2.structureVersionCounter });
+      const n2 = lock2.data.blueprint.blueprintNumber;
+      const man2 = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest`);
+      ok(lock2.status === 201 && man2.status === 201, `${tag}: nueva versión congelada (Blueprint + Manifest)`, { l: lock2.status, m: man2.status });
+      const plan = await api('GET', `/courses/${courseId}/blueprints/${n2}/manifest/invalidation-plan?fromRun=${runA}`);
+      const regen = plan.data.plan.actions.filter((a) => a.inTargetManifest && (a.action === 'REGENERATE' || a.action === 'GENERATE')).map((a) => a.itemKey).sort();
+      eq(regen, [...I.toRun, ...I.paidNew, ...I.paidRetry].sort(), `${tag}: el plan real de regeneración = el impacto previsto (mismos items)`);
+      eq(plan.data.costEstimate.estimatedChangeCostUsd, I.estimatedChangeCostUsd, `${tag}: «Generar solo lo que cambió» muestra el mismo costo que el impacto`);
+
+      // 14. Regeneración parcial real: solo los items del plan tienen una generación nueva.
+      let runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      const estB = /estimateId=([0-9a-f-]{36})/.exec(String(runB.error || ''));
+      if (runB.status === 409 && estB) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e ${tag}: regeneración parcial (LLM falso)')`, [courseId, estB[1]]);
+        runB = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      }
+      ok(runB.status === 201 && runB.data.invalidation && runB.data.invalidation.planSha256 === plan.data.plan.planSha256, `${tag}: regeneración parcial creada con el plan previsto (planSha256)`, { s: runB.status, e: runB.error });
+      const runBId = runB.data.run.id;
+      const calls0 = llm.st.v3calls.length;
+      stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n2, runId: runBId }), `${tag} regeneración`, undefined, runBId);
+      const itemsB = await waitItemsDone(runBId);
+      ok(stt.failed === 0 && !stt.fatalError, `${tag}: la regeneración parcial terminó sin fallos`, stt);
+      const generatedB = itemsB.filter((i) => i.status === 'completed' && !(i.output_summary && i.output_summary.carriedFrom)).map((i) => i.item_key);
+      ok(regen.every((k) => itemsB.some((i) => i.item_key === k && i.status === 'completed')), `${tag}: cada item del plan quedó regenerado`, regen.filter((k) => !itemsB.some((i) => i.item_key === k && i.status === 'completed')));
+      ok(llm.st.v3calls.length - calls0 > 0 && llm.st.v3calls.length - calls0 <= regen.length * 3, `${tag}: solo se llamó al LLM para lo que cambió (${llm.st.v3calls.length - calls0} llamadas para ${regen.length} items)`);
+      void generatedB;
+      const P2 = await packageRun(`${tag}-regen`, courseId, n2, runBId);
+      const z2 = await JSZip.loadAsync(P2.buf);
+      const titles = await Promise.all(Object.keys(z2.files).filter((x) => /^sections\/section_\d+\/section\.xml$/.test(x)).map((f) => z2.file(f).async('string')));
+      ok(titles.some((x) => x.includes(newTitle.replace(/&/g, '&amp;'))), `${tag}: el re-empaque lleva el capítulo editado`);
+      ok(fs.existsSync(NET_LOG) && fs.readFileSync(NET_LOG, 'utf8').length === net0, `${tag}: 0 conexiones fuera de 127.0.0.1 en todo el flujo (netguard)`);
+      const reviewIds = (P) => ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      const modsOf = async () => (await readStructure(courseId)).modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) }));
+      const modsB = await modsOf();
+      const modsA = modsB.map((m) => ({ ...m, chapters: m.chapters.map((x) => (x.id === ch.id ? { ...x, title: ch.title } : x)) }));
+      const info = (manifest, P, modules) => ({ courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: manifest.modules, features: manifest.features, applications: apps.length, reviewCardsChapterIds: reviewIds(P), modules });
+      results.courses[tag] = { ...info(M, P1, modsA), blueprintNumber: n, runId: runA, items: itemsA.length, hours: hoursFrozen, usd: usd(DRY.providerPlanFor(M)), ...extra };
+      results.courses[tag + 'regen'] = { ...info(man2.data.manifest.manifest, P2, modsB), blueprintNumber: n2, runId: runBId, regenerated: regen.length, usd: I.estimatedChangeCostUsd };
+      return { runA, itemsA, M2: man2.data.manifest.manifest, regen, I };
+    };
+
+    // ═══ LOOP 7 · E11 — FLUJO COMPLETO en un solo curso (solo mocks, USD 0): microcurrículo → contexto académico →
+    // enfoque → 64 h → «Cursia recomienda» → Ver diseño → Ajustar → nuevo diseño → Aplicar → Blueprint → Manifest →
+    // Actividades de Aplicación → coherencia → costo simulado → generación → empaque → impacto de un cambio →
+    // regeneración parcial (= el impacto previsto) → re-empaque → restauración en Moodle (abajo, con estudiante real).
+    if (RUN_E5) await step('v3-E11-flujo-completo', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const DRY = D('modules/pedagogy/dry-run.js');
+      const STI = D('modules/study-time/index.js');
+      const MIN = D('modules/study-time/manifest-input.js');
+      const usd = (plan) => (plan && plan.estimateUsd ? Number(plan.estimateUsd.expected) : null);
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const title = '[E2E Flujo completo E11] Contabilidad de Costos';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, 'E11: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+
+      // 1. Microcurrículo → contexto académico (determinista, sin proveedores) → guardado.
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0 && ex.data.validation.canProceed, 'E11: microcurrículo → contexto académico (0 proveedores)', { s: ex.status, e: ex.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201, 'E11: contexto académico guardado (versión 1)', { s: sv.status, e: sv.error });
+      const dz = (await api('GET', `/courses/${courseId}/academic-context/design`)).data;
+      const prop = dz.structureProposal;
+
+      // 2. Estructura del microcurrículo (lo que hace «Proponer estructura»).
+      let st = await readStructure(courseId);
+      let counter = st.structureVersionCounter;
+      for (const m of st.modules) counter = (await api('DELETE', `/courses/${courseId}/modules/${m.id}`, { expectedCounter: counter })).data.structureVersionCounter;
+      const setg = await api('PATCH', `/courses/${courseId}/structure-settings`, { finalExam: true, activityEngine: 'h5p', expectedCounter: counter });
+      counter = setg.data.structureVersionCounter;
+      for (const pm of prop.modules) {
+        const cm = await api('POST', `/courses/${courseId}/modules`, { title: pm.title, objective: pm.objective, examEnabled: true, expectedCounter: counter });
+        if (cm.status !== 201) throw new Error(`E11 módulo: ${cm.status} ${cm.error}`);
+        counter = cm.data.structureVersionCounter;
+        const auto = cm.data.module.chapters || [];
+        for (let ci = 0; ci < pm.chapters.length; ci++) {
+          const pc = pm.chapters[ci];
+          const body = { title: pc.title, objective: pc.objective || `Aplicar ${pc.title.toLowerCase()}`, videoEnabled: pc.videoEnabled, activityEnabled: pc.activityEnabled, ...(pc.description ? { description: pc.description } : {}), ...(pc.outcomeIds.length ? { outcomeIds: pc.outcomeIds } : {}), expectedCounter: counter };
+          const r = ci === 0 && auto.length === 1 ? await api('PATCH', `/courses/${courseId}/modules/${cm.data.module.id}/chapters/${auto[0].id}`, body) : await api('POST', `/courses/${courseId}/modules/${cm.data.module.id}/chapters`, body);
+          if (![200, 201].includes(r.status)) throw new Error(`E11 capítulo ${pc.title}: ${r.status} ${r.error}`);
+          counter = r.data.structureVersionCounter;
+        }
+      }
+      const A = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, 'E11: perfil de evaluación');
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E11: perfil de presentación');
+
+      // 3. Enfoque (el docente lo elige sobre la sugerencia del contexto) + 64 h.
+      const profile1 = { ...dz.profileSuggestion.profile, primaryApproach: 'competencias', secondaryApproaches: [], targetHours: 64 };
+      const pg1 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile1, expectedVersion: await pedagogyVersion(courseId) });
+      ok(pg1.status === 201, 'E11: enfoque competencias + 64 h guardados', { s: pg1.status, e: pg1.error });
+
+      // 4. «Cursia recomienda»: cada número sale del diseño materializado (Manifest), nunca de otra cuenta.
+      const card = (dr) => {
+        const d = dr.distribution;
+        const t = d.materialized.totals;
+        ok(d.materialized.manifestErrors.length === 0, 'E11: diseño materializado sin errores (DISTRIBUTION_MODEL_MISMATCH incluido)', d.materialized.manifestErrors);
+        eq([d.counts.chapters, d.counts.videoChapters, d.counts.applicationActivities, d.counts.evaluations, d.estimatedHours],
+          [t.experienceCount, t.videoCount, t.applicationActivityCount, t.examCount + t.finalExamCount, d.materialized.generableHours], 'E11: tarjeta = Manifest materializado (capítulos, videos, Actividades de Aplicación, evaluaciones, horas)');
+        ok(d.materialized.providers.byCategory && d.materialized.providers.assumptions.length >= 3 && Number(d.materialized.providers.estimateUsd.min) < Number(d.materialized.providers.estimateUsd.expected),
+          'E11: costo con rango, desglose y supuestos (estimación, no precio)', d.materialized.providers.byCategory);
+        return d;
+      };
+      const dr1 = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+      ok([200, 201].includes(dr1.status), 'E11: «Cursia recomienda» (dry-run) → OK', { s: dr1.status, e: dr1.error });
+      const d1 = card(dr1.data);
+      ok(d1.status === 'within_tolerance' && d1.targetHours === 64, `E11: 64 h dentro de la tolerancia (${d1.estimatedHours} h)`, { st: d1.status, h: d1.estimatedHours });
+
+      // 5. Ajustar (énfasis en profundidad) → nuevo diseño, distinto, con la misma garantía.
+      const profile2 = { ...profile1, designPreferences: { emphasis: 'depth' } };
+      const pg2 = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: profile2, expectedVersion: pg1.data.profile.version });
+      ok(pg2.status === 201, 'E11: «Ajustar» guardado (énfasis profundidad)', { s: pg2.status, e: pg2.error });
+      const dr2 = await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {});
+      const d2 = card(dr2.data);
+      ok(d2.proposalSha256 !== d1.proposalSha256 && d2.policy.kind === 'depth_first', 'E11: «Ajustar» produce un diseño nuevo (política de profundidad)', { p: d2.policy.kind });
+
+      // 6. Aplicar diseño: la huella vieja da 409; la nueva aplica.
+      st = await readStructure(courseId);
+      const stale = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: d1.proposalSha256 });
+      ok(stale.status === 409 && /PROPOSAL_CHANGED/.test(String(stale.error)), 'E11: aplicar el diseño anterior al «Ajustar» → 409 PROPOSAL_CHANGED', { s: stale.status, e: stale.error });
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: d2.proposalSha256 });
+      ok([200, 201].includes(ap.status), 'E11: «Aplicar diseño» → estructura con práctica y Actividades de Aplicación', { s: ap.status, e: ap.error });
+
+      // 7. Blueprint + Manifest congelados = lo que mostró la vista previa (preview = generación).
+      // R68: E11 usa los endpoints de diseño de siempre (la vista previa con «Ajustar» no guarda el perfil): el docente
+      // conserva el diseño aplicado antes de aprobarlo (sin cambios si ya coincide).
+      await keepTeacherDesign(api, courseId, 'E11');
+      st = await readStructure(courseId);
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      ok(lock.status === 201, 'E11: lock → Blueprint', { s: lock.status, e: lock.error });
+      const snap = lock.data.blueprint.snapshot;
+      const n = lock.data.blueprint.blueprintNumber;
+      const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+      ok(man.status === 201 && man.data.manifest.rulesVersion === 3, 'E11: Manifest v3', { s: man.status, e: man.error });
+      const M = man.data.manifest.manifest;
+      const hoursFrozen = STI.estimateCourseStudyTime(MIN.studyTimeInputFromManifest(M, snap)).courseEstimatedHours;
+      eq([M.totals.experienceCount, M.totals.videoCount, M.totals.applicationActivityCount, M.totals.examCount + M.totals.finalExamCount, hoursFrozen],
+        [d2.counts.chapters, d2.counts.videoChapters, d2.counts.applicationActivities, d2.counts.evaluations, d2.estimatedHours], 'E11: lo congelado = «Cursia recomienda» después de Ajustar (capítulos, videos, actividades, evaluaciones, horas)');
+      ok(Math.abs(usd(DRY.providerPlanFor(M)) - usd(d2.materialized.providers)) < 0.005, 'E11: costo del Manifest congelado = costo mostrado', { frozen: usd(DRY.providerPlanFor(M)), shown: usd(d2.materialized.providers) });
+      ok(snap.course.academicContext && snap.course.pedagogy && snap.course.targetHours === 64, 'E11: Blueprint con contexto académico, diseño pedagógico y 64 h');
+
+      // 8. Actividades de Aplicación: una por capítulo marcado, con sus minutos; ninguna en un capítulo sin marca.
+      const apps = M.items.filter((i) => i.type === 'application_activity');
+      const marked = M.modules.flatMap((m) => m.chapters).filter((c) => c.applicationMinutes !== undefined);
+      eq(apps.map((i) => i.chapterId).sort(), marked.map((c) => c.chapterId).sort(), `E11: ${apps.length} Actividades de Aplicación, una por capítulo marcado`);
+      ok(marked.some((c) => c.kind === 'practice'), 'E11: también en capítulos de práctica');
+
+      // 9. Coherencia del diseño congelado.
+      const co = (await api('POST', `/courses/${courseId}/pedagogy/dry-run`, {})).data.alignment;
+      ok(co && co.available === true && co.outcomes.length === 8 && co.counts.critical === 0, 'E11: coherencia: 6 RA + 2 competencias, 0 críticos', co && co.counts);
+
+      // 10. Costo simulado antes de generar = el del Manifest (USD 0 gastado).
+      const pre = await api('POST', `/courses/${courseId}/change-impact`, {});
+      ok(pre.status === 200 && pre.data.available === false && pre.data.reason === 'NO_PREVIOUS_RUN' && Math.abs(usd(pre.data.fullGeneration) - usd(DRY.providerPlanFor(M))) < 0.005,
+        'E11: sin generar aún → el impacto ofrece el costo de generarlo completo (= Manifest)', { s: pre.status, d: pre.data && pre.data.reason });
+
+      // 11–14. Generación, empaque, impacto, regeneración parcial y re-empaque (compartido con E17).
+      await fullGenerationFlow('E11', { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra: { adjust: { from: d1.proposalSha256, to: d2.proposalSha256 } } });
+    }, { fatal: false });
+
+    // ═══ LOOP 8.0 · E12 — el microcurrículo manda sobre la estructura (hallazgo O1), por HTTP real: la IA armó la
+    // estructura → el documento la reemplaza sin preguntar; con cambios del docente → 409 hasta confirmar.
+    if (RUN_E5) await step('v3-E12-microcurriculo-manda', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E12] Contabilidad de Costos' });
+      ok(cr.status === 201, 'E12: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // Esqueleto del editor (R8) y la propuesta de la IA tal como la aplica 48: 4 módulos con mutaciones sueltas.
+      let counter = (await readStructure(courseId)).structureVersionCounter;
+      const sk = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: counter });
+      counter = sk.data.structureVersionCounter;
+      let st = await readStructure(courseId);
+      ok(st.structureAuthority && st.structureAuthority.pristine === true && st.structureAuthority.replaceReasons.length === 0, 'E12: esqueleto vacío → reemplazable sin preguntar', st.structureAuthority);
+      counter = (await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}`, { title: 'IA módulo 1', objective: 'Objetivo propuesto por la IA', expectedCounter: counter })).data.structureVersionCounter;
+      for (let i = 2; i <= 4; i++) counter = (await api('POST', `/courses/${courseId}/modules`, { title: `IA módulo ${i}`, objective: 'Objetivo propuesto por la IA', expectedCounter: counter })).data.structureVersionCounter;
+      const badSrc = await api('POST', `/courses/${courseId}/modules/structure-origin`, { source: 'academic_context', expectedCounter: counter });
+      ok(badSrc.status === 400, 'E12: el cliente no puede declarar el origen «academic_context» (DTO)', { s: badSrc.status, e: badSrc.error });
+      const ro = await api('POST', `/courses/${courseId}/modules/structure-origin`, { source: 'ai_proposal', expectedCounter: counter });
+      ok(ro.status === 200 && ro.data.structureVersionCounter === counter, 'E12: origen IA registrado sin cambiar el contador', { s: ro.status, e: ro.error });
+      st = await readStructure(courseId);
+      eq([st.modules.length, st.structureAuthority.source, st.structureAuthority.untouched, st.structureAuthority.replaceReasons], [4, 'ai_proposal', true, []], 'E12: estructura de la IA intacta');
+      // Microcurrículo → contexto guardado → su estructura reemplaza a la de la IA, en una transacción.
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201, 'E12: contexto académico guardado (versión 1)', { s: sv.status, e: sv.error });
+      const prop = (await api('GET', `/courses/${courseId}/academic-context/design`)).data.structureProposal;
+      const noVer = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter });
+      ok(noVer.status === 400, 'E12: sin contextVersion → 400 (DTO)', { s: noVer.status });
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter, contextVersion: 1 });
+      ok(ap.status === 201 && ap.data.replaced.confirmed === false && ap.data.structureVersionCounter === counter + 1, 'E12: el microcurrículo reemplaza la estructura de la IA sin preguntar (un contador)', { s: ap.status, e: ap.error });
+      st = await readStructure(courseId);
+      eq([st.modules.length, st.modules.reduce((a, m) => a + m.chapters.length, 0), st.structureAuthority.source, st.structureAuthority.contextVersion], [prop.counts.modules, prop.counts.chapters, 'academic_context', 1], 'E12: forma y origen del documento');
+      eq(st.modules.flatMap((m) => m.chapters.map((c) => c.outcomeIds || [])), prop.modules.flatMap((m) => m.chapters.map((c) => c.outcomeIds)), 'E12: vínculos a resultados del documento');
+      ok(!st.modules.some((m) => /^IA /.test(m.title)), 'E12: no queda nada de la estructura de la IA');
+      // El docente edita → el documento ya no la pisa sin confirmación (409, nada cambia); con confirmación, sí.
+      const c0 = st.modules[0].chapters[0];
+      counter = (await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${c0.id}`, { title: 'Título del docente', expectedCounter: st.structureVersionCounter })).data.structureVersionCounter;
+      const nc = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter, contextVersion: 1 });
+      ok(nc.status === 409 && /^STRUCTURE_REPLACE_NEEDS_CONFIRMATION/.test(String(nc.error)), 'E12: con cambios del docente → 409 STRUCTURE_REPLACE_NEEDS_CONFIRMATION', { s: nc.status, e: nc.error });
+      st = await readStructure(courseId);
+      eq([st.structureVersionCounter, st.modules[0].chapters[0].title], [counter, 'Título del docente'], 'E12: el 409 no cambió nada');
+      const yc = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: counter, contextVersion: 1, confirmReplace: true });
+      ok(yc.status === 201 && yc.data.replaced.confirmed === true, 'E12: confirmado → reemplazada', { s: yc.status, e: yc.error });
+      // Review L80 M1: el origen solo lo escribe el backend de la estructura; un PATCH del curso no lo cambia.
+      const pm = await api('PATCH', `/courses/${courseId}`, { metadata: { structureOrigin: { source: 'ai_proposal', counter: 0 } } });
+      st = await readStructure(courseId);
+      ok(pm.status === 200 && st.structureAuthority.source === 'academic_context' && st.structureAuthority.untouched === true, 'E12: un PATCH del curso no cambia el origen de la estructura', { s: pm.status, a: st.structureAuthority });
+      results.courses.E12 = { courseId, modules: prop.counts.modules, chapters: prop.counts.chapters };
+    }, { fatal: false });
+
+    // ═══ LOOP 8.1 · E13 — una sola fuente de verdad + cargador único, por HTTP real (USD 0, sin proveedores).
+    if (RUN_E5) await step('v3-E13-fuente-unica', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E13] Contabilidad de Costos' });
+      ok(cr.status === 201, 'E13: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos' };
+      const bad = await api('PUT', `/courses/${courseId}/brief`, { ...brief, obj: 'x'.repeat(601) });
+      ok(bad.status === 400, 'E13: pedido inválido → 400 (DTO)', { s: bad.status });
+      const pb = await api('PUT', `/courses/${courseId}/brief`, brief);
+      ok(pb.status === 200 && pb.data.changed === true && pb.data.brief.fields.sector === 'Contabilidad', 'E13: PUT brief guarda lo que dijo el usuario', { s: pb.status, e: pb.error });
+      const gb = await api('GET', `/courses/${courseId}/brief`);
+      ok(gb.status === 200 && gb.data.brief.fields.obj === brief.obj, 'E13: GET brief', { s: gb.status });
+      let f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.topic.source === 'user' && f.data.educationLevel.value === 'technical' && f.data.document.present === false, 'E13: «Lo que sabemos» desde el pedido', { s: f.status, d: f.data && f.data.topic });
+      // Cargador único: extracción gratuita con calidad; lectura avanzada apagada en el gate (USD 0).
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      ok(ex.status === 200 && ex.data.quality && ex.data.quality.sufficient === true && ex.data.quality.advancedAvailable === false, 'E13: la extracción gratuita informa su calidad', { s: ex.status, q: ex.data && ex.data.quality });
+      const pdf = (await AF.fixture('consistent', 'pdf')).toString('base64');
+      const est = await api('POST', `/courses/${courseId}/academic-context/extract-advanced`, { files: [{ name: 'micro.pdf', dataBase64: pdf }], mode: 'estimate' });
+      ok(est.status === 200 && est.data.available === false && est.data.providersCalled === 0 && est.data.estimateUsd.max > 0, 'E13: lectura avanzada: estimación sin proveedor (apagada en este entorno)', { s: est.status, e: est.error });
+      const run = await api('POST', `/courses/${courseId}/academic-context/extract-advanced`, { files: [{ name: 'micro.pdf', dataBase64: pdf }], mode: 'run', acceptedMaxUsd: 99 });
+      ok(run.status === 409 && /^ADVANCED_DISABLED/.test(String(run.error)), 'E13: apagada → 409 ADVANCED_DISABLED (nunca llama al proveedor)', { s: run.status, e: run.error });
+      // Guardar el contexto deriva el perfil pedagógico solo (sin «Usar en el perfil»).
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201 && sv.data.derivedPedagogy && sv.data.derivedPedagogy.applied === true, 'E13: guardar el contexto deriva el perfil pedagógico', { s: sv.status, d: sv.data && sv.data.derivedPedagogy });
+      const pg = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      ok(pg.status === 200 && pg.data.profile.targetHours === 64 && pg.data.derivedFromAcademic && pg.data.derivedFromAcademic.untouched === true, 'E13: perfil con las 64 h del documento, marcado como derivado', { s: pg.status, d: pg.data && pg.data.derivedFromAcademic });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.outcomes.source === 'document' && f.data.targetHours.value === 64 && f.data.pedagogy.derivedFromDocument === true, 'E13: «Lo que sabemos» con el documento como dueño', { d: f.data && { o: f.data.outcomes.source, h: f.data.targetHours } });
+      // Las claves de la fuente única no se pisan con un PATCH del curso.
+      const pm = await api('PATCH', `/courses/${courseId}`, { metadata: { brief: { briefVersion: 1, fields: { obj: 'pisado' } } } });
+      const gb2 = await api('GET', `/courses/${courseId}/brief`);
+      ok(pm.status === 200 && gb2.data.brief.fields.obj === brief.obj, 'E13: un PATCH del curso no pisa el pedido', { s: pm.status });
+      results.courses.E13 = { courseId };
+    }, { fatal: false });
+
+    // ═══ LOOP 8.2 · E14 — «Lo que entendimos» sin documento: propuesta, edición y confirmación por HTTP real (USD 0:
+    // la interpretación del pedido corre en el cliente; aquí solo se guarda lo interpretado).
+    if (RUN_E5) await step('v3-E14-lo-que-entendimos', async () => {
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E14] Excel básico' });
+      ok(cr.status === 201, 'E14: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      const pb = await api('PUT', `/courses/${courseId}/brief`, { obj: 'Quiero un curso de Excel básico para estudiantes de Administración', contexto: 'Universitario — estudiantes de pregrado universitario, con rigor académico y pensamiento crítico', sector: 'Administración', pais: 'Colombia', inferidos: 'sector,pais' });
+      ok(pb.status === 200 && pb.data.brief.fields.inferidos === 'sector,pais', 'E14: el pedido guarda qué llenó Cursia', { s: pb.status, e: pb.error });
+      const proposal = { expectedVersion: 0, subjectName: 'Excel básico para la gestión', learnerProfile: 'Estudiantes de primeros semestres de Administración',
+        outcomes: ['Organiza datos de gestión en tablas con formato', 'Calcula indicadores con fórmulas y funciones', 'Explica cuándo usar cada tipo de gráfico'] };
+      const bad = await api('POST', `/courses/${courseId}/academic-context/proposal`, { ...proposal, outcomes: [] });
+      ok(bad.status === 400, 'E14: propuesta sin resultados → 400 (DTO)', { s: bad.status });
+      const sp = await api('POST', `/courses/${courseId}/academic-context/proposal`, proposal);
+      ok(sp.status === 200 && sp.data.created === true && sp.data.profile.version === 1 && sp.data.derivedPedagogy && sp.data.derivedPedagogy.applied === true, 'E14: propuesta guardada y perfil pedagógico derivado', { s: sp.status, e: sp.error });
+      let f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.document.present === false && f.data.document.proposed === true && f.data.outcomes.value.every((o) => o.origin === 'proposed') &&
+        f.data.title.source === 'inferred' && f.data.sector.source === 'inferred' && f.data.topic.source === 'user' && f.data.conflicts.length === 0, 'E14: «Lo que sabemos» = propuesto e inferido, sin documento', { d: f.data && { doc: f.data.document, t: f.data.title, s: f.data.sector } });
+      const stale = await api('POST', `/courses/${courseId}/academic-context/proposal`, proposal);
+      ok(stale.status === 409 && /^ACADEMIC_CHANGED/.test(String(stale.error)), 'E14: propuesta con versión vieja → 409', { s: stale.status, e: stale.error });
+      const ed = await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: 1, outcomes: [{ id: 'RA1', text: proposal.outcomes[0] }, { id: 'RA2', text: 'Calcula indicadores de gestión con funciones' }, { text: 'Diseña un tablero de control' }] });
+      ok(ed.status === 200 && ed.data.profile.version === 2, 'E14: editar resultados crea la versión 2', { s: ed.status, e: ed.error });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(JSON.stringify(f.data.outcomes.value.map((o) => [o.id, o.origin])) === JSON.stringify([['RA1', 'proposed'], ['RA2', 'user'], ['RA4', 'user']]), 'E14: ids conservados, orígenes por resultado', { o: f.data.outcomes.value });
+      const acc = await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: 2, accept: true, outcomes: f.data.outcomes.value.map((o) => ({ id: o.id, text: o.text })) });
+      ok(acc.status === 200 && acc.data.profile.version === 3, 'E14: «Sí, usar estos» confirma (versión 3)', { s: acc.status, e: acc.error });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.data.document.proposed === false && f.data.outcomes.value.every((o) => o.origin === 'user'), 'E14: confirmados = escritos por el docente', { d: f.data.document });
+      // El documento manda: sobre un contexto leído de un documento, la propuesta se rechaza.
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 3 });
+      ok(sv.status === 201, 'E14: el documento reemplaza la propuesta confirmada', { s: sv.status, e: sv.error });
+      const over = await api('POST', `/courses/${courseId}/academic-context/proposal`, { ...proposal, expectedVersion: 4 });
+      ok(over.status === 409 && /^DOCUMENT_CONTEXT/.test(String(over.error)), 'E14: propuesta sobre un documento → 409 DOCUMENT_CONTEXT', { s: over.status, e: over.error });
+      f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.data.document.present === true && f.data.outcomes.source === 'document' && f.data.targetHours.value === 64, 'E14: ahora todo viene del documento', { d: f.data && f.data.document });
+      results.courses.E14 = { courseId };
+    }, { fatal: false });
+
+    // ═══ LOOP 8.2.1 · E14b — PUT desde un NAVEGADOR real contra el backend completo (dist/main.js, su CORS real).
+    // Node no aplica CORS: sin este paso, PUT /brief y PUT /outcomes «pasaban» aunque en Chrome fallaban.
+    if (RUN_E5) await step('v3-E14b-navegador-put', async () => {
+      const { launchChrome } = require(path.join(REPO, 'scripts/lib/v21-cdp.js'));
+      const http = require('http');
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E14b] PUT desde el navegador' });
+      ok(cr.status === 201, 'E14b: curso dinámico creado', { s: cr.status });
+      const courseId = Number(cr.data.id);
+      const sp = await api('POST', `/courses/${courseId}/academic-context/proposal`, { expectedVersion: 0, subjectName: 'Excel básico', outcomes: ['Organiza datos en tablas', 'Calcula indicadores con funciones'] });
+      ok(sp.status === 200, 'E14b: propuesta guardada (POST)', { s: sp.status, e: sp.error });
+      const srv = await new Promise((r) => { const s = http.createServer((q, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>front</title>'); }); s.listen(0, '127.0.0.1', () => r(s)); });
+      let chrome = null;
+      try {
+        chrome = await launchChrome();
+        await chrome.navigate(`http://127.0.0.1:${srv.address().port}/`);
+        const r = await chrome.evaluate(`(async () => {
+          const h = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ${TOKEN}' };
+          const call = async (m, p, b) => { try { const x = await fetch(${JSON.stringify(BASE)} + p, { method: m, headers: h, body: JSON.stringify(b) }); return x.status; } catch (e) { return 'ERR:' + e.message; } };
+          return {
+            brief: await call('PUT', '/courses/${courseId}/brief', { obj: 'Excel básico', sector: 'Administración', pais: 'Colombia', inferidos: 'pais' }),
+            outcomes: await call('PUT', '/courses/${courseId}/academic-context/outcomes', { expectedVersion: 1, accept: true, outcomes: [{ id: 'RA1', text: 'Organiza datos en tablas' }, { id: 'RA2', text: 'Calcula indicadores con funciones' }] }),
+          };
+        })()`);
+        ok(r.brief === 200, 'E14b: PUT /brief desde Chrome (otro origen) responde 200', r);
+        ok(r.outcomes === 200, 'E14b: PUT /academic-context/outcomes desde Chrome (otro origen) responde 200', r);
+      } finally {
+        if (chrome) chrome.close();
+        srv.close();
+      }
+      const f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.data.sector.value === 'Administración' && f.data.country.source === 'inferred' && f.data.document.proposed === false && f.data.outcomes.value.every((o) => o.origin === 'user'),
+        'E14b: lo guardado desde el navegador está en «Lo que sabemos»', { d: f.data && { s: f.data.sector, c: f.data.country, p: f.data.document } });
+    }, { fatal: false });
+
+    // ═══ LOOP 8.3 · E15 — «Cursia recomienda» por HTTP real: recomendación → Ajustar → guardar → aplicar (huella) → lock →
+    // Manifest = tarjeta; video fijado respetado; «Liberar». USD 0 (nada se genera).
+    if (RUN_E5) await step('v3-E15-cursia-recomienda', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E15] Contabilidad de Costos' });
+      const courseId = Number(cr.data.id);
+      const m0 = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      ok(m0.status === 201, 'E15: esqueleto', { s: m0.status, e: m0.error });
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201, 'E15: microcurrículo guardado', { s: sv.status });
+      let st = await readStructure(courseId);
+      const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: sv.data.profile.version });
+      ok([200, 201].includes(aa.status), 'E15: estructura del documento', { s: aa.status, e: aa.error });
+      const r1 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r1.status === 200 && r1.data.hours.target === 64 && r1.data.hours.source === 'document' && r1.data.approach && r1.data.approach.source === 'recommended' && r1.data.preferences.audiovisual === 'recommended',
+        'E15: Cursia recomienda (64 h del documento, enfoque recomendado, audiovisual recomendado)', { s: r1.status, h: r1.data && r1.data.hours, a: r1.data && r1.data.approach });
+      ok(r1.data.design && r1.data.design.applicable && r1.data.design.manifestErrors.length === 0 && r1.data.cost && Number(r1.data.cost.expected) > 0 && r1.data.providersCalled === 0,
+        'E15: tarjeta aplicable, = Manifest materializado, con costo; 0 proveedores', { d: r1.data.design && r1.data.design.status });
+      const less = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'less' } });
+      const more = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'more' } });
+      ok(less.data.design.counts.videoChapters < r1.data.design.counts.videoChapters && r1.data.design.counts.videoChapters <= more.data.design.counts.videoChapters
+        && Math.abs(less.data.design.estimatedHours - 64) <= 3.5 && Math.abs(more.data.design.estimatedHours - 64) <= 3.5,
+        'E15: Menos < Recomendado ≤ Más video, las tres con 64 h', { l: less.data.design.counts.videoChapters, r: r1.data.design.counts.videoChapters, m: more.data.design.counts.videoChapters });
+      const bad = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'mucho' } });
+      ok(bad.status === 400, 'E15: Ajustar inválido → 400 (DTO)', { s: bad.status });
+      // «Usar este diseño» (Menos video): guardar el perfil efectivo → misma huella → aplicar → lock → Manifest = tarjeta.
+      const card = less.data;
+      const pv = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      const sp = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version });
+      ok(sp.status === 201, 'E15: perfil del diseño guardado', { s: sp.status, e: sp.error });
+      const r2 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r2.data.profileChanged === false && r2.data.design.proposalSha256 === card.design.proposalSha256, 'E15: guardado = la misma huella que la tarjeta', { a: r2.data.design.proposalSha256, b: card.design.proposalSha256 });
+      st = await readStructure(courseId);
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+      ok([200, 201].includes(ap.status), 'E15: aplicar el diseño', { s: ap.status, e: ap.error });
+      st = await readStructure(courseId);
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      const man = await api('POST', `/courses/${courseId}/blueprints/${lock.data.blueprint.blueprintNumber}/manifest`);
+      const T = man.data.manifest.manifest.totals;
+      const c = card.design.counts;
+      eq([T.experienceCount, T.videoCount, T.applicationActivityCount, T.examCount + T.finalExamCount], [c.chapters, c.videoChapters, c.applicationActivities, c.evaluations], 'E15: Manifest congelado = tarjeta «Cursia recomienda» (capítulos, videos, Actividades de Aplicación, evaluaciones)');
+      // Video fijado a mano en el editor → la recomendación lo respeta; «Liberar».
+      const ch = st.modules[0].chapters.find((x) => x.kind !== 'practice' && x.videoEnabled);
+      const pin = await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${ch.id}`, { videoEnabled: false, pinVideo: true, expectedCounter: st.structureVersionCounter });
+      ok(pin.status === 200 && pin.data.videoPinned === true, 'E15: video fijado por el docente', { s: pin.status, e: pin.error });
+      const r3 = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { audiovisual: 'more' } });
+      const ch3 = r3.data.design.modules[0].chapters.find((x) => x.id === ch.id);
+      ok(ch3 && ch3.videoEnabled === false && ch3.videoPinned === true && r3.data.pinnedChapters === 1, 'E15: «Más video» respeta lo fijado', { ch3 });
+      const cl = await api('POST', `/courses/${courseId}/design/pins/clear`, {});
+      ok(cl.status === 200 && cl.data.released === 1, 'E15: «Liberar»', { s: cl.status, d: cl.data });
+      results.courses.E15 = { courseId };
+    }, { fatal: false });
+
+    // ═══ LOOP 8.4 · E16 — verificación del diseño por HTTP real: hallazgos con «Corregir»; el automático vincula solo los
+    // capítulos sin vínculos y la verificación queda limpia. USD 0.
+    if (RUN_E5) await step('v3-E16-verificacion', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E16] Contabilidad de Costos' });
+      const courseId = Number(cr.data.id);
+      const m = await api('POST', `/courses/${courseId}/modules`, { title: 'Costos', expectedCounter: 0 });
+      ok(m.status === 201, 'E16: módulo', { s: m.status, e: m.error });
+      let st = await readStructure(courseId);
+      const mod = st.modules[0];
+      const first = mod.chapters[0];
+      let r = await api('PATCH', `/courses/${courseId}/modules/${mod.id}/chapters/${first.id}`, { title: 'Elementos del costo y su clasificación', expectedCounter: st.structureVersionCounter });
+      for (const title of ['Costo de materiales y mano de obra', 'Sistema de costeo por órdenes de producción']) {
+        st = await readStructure(courseId);
+        r = await api('POST', `/courses/${courseId}/modules/${mod.id}/chapters`, { title, objective: title, expectedCounter: st.structureVersionCounter });
+        ok(r.status === 201, `E16: capítulo «${title}»`, { s: r.status, e: r.error });
+      }
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      const v1 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      const ver = v1.data && v1.data.verification;
+      ok(v1.status === 200 && ver && ver.verificationVersion === 1 && Array.isArray(ver.checks), 'E16: la recomendación trae la verificación', { s: v1.status });
+      const areas = new Set(ver.checks.map((c) => c.area));
+      ok(['hours', 'outcomes', 'structure', 'activities', 'practice', 'audiovisual', 'evaluations', 'pedagogy', 'cost'].every((a) => areas.has(a)), 'E16: verifica horas, resultados, estructura, actividades, práctica, audiovisual, evaluaciones, pedagogía y costo', [...areas]);
+      const auto = ver.checks.find((c) => c.fix && c.fix.kind === 'auto');
+      ok(auto && auto.fix.action === 'link_outcomes', 'E16: capítulos sin vínculos → «Corregir» automático', ver.checks.filter((c) => c.severity !== 'ok').map((c) => c.title));
+      st = await readStructure(courseId);
+      const stale = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter + 3 });
+      ok(stale.status === 409, 'E16: contador viejo → 409', { s: stale.status });
+      const badA = await api('POST', `/courses/${courseId}/design/fix`, { action: 'borrar', expectedCounter: st.structureVersionCounter });
+      ok(badA.status === 400, 'E16: acción desconocida → 400 (DTO)', { s: badA.status });
+      const fx = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+      ok(fx.status === 200 && fx.data.linkedChapters >= 1 && fx.data.structureVersionCounter === st.structureVersionCounter + 1, 'E16: corregido (capítulos vinculados, contador +1)', { s: fx.status, d: fx.data });
+      const v2 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(!v2.data.verification.checks.some((c) => c.fix && c.fix.kind === 'auto'), 'E16: después de corregir no queda nada automático pendiente', v2.data.verification.checks.filter((c) => c.severity !== 'ok').map((c) => c.title));
+      results.courses.E16 = { courseId };
+    }, { fatal: false });
+
+    // ═══ R68 (piloto) · E18 — el SERVIDOR no genera un diseño sin verificación aprobable (API directa, sin la interfaz) ═══
+    if (RUN_E5) await step('v3-E18-r68-bloqueo-servidor', async () => {
+      const mkCourse = async (title, docText, videos = true) => {
+        const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+        const courseId = Number(cr.data.id);
+        let counter = 0;
+        for (let mi = 0; mi < 2; mi++) {
+          const m = await api('POST', `/courses/${courseId}/modules`, { title: `Módulo ${mi + 1} de seguridad eléctrica`, objective: 'Aplicar el procedimiento seguro', examEnabled: true, expectedCounter: counter });
+          if (m.status !== 201) throw new Error(`E18 módulo: ${m.status} ${m.error}`);
+          counter = m.data.structureVersionCounter;
+          const mid = m.data.module.id;
+          const auto = m.data.module.chapters || [];
+          for (let ci = 0; ci < 2; ci++) {
+            const body = { title: `Tema ${mi + 1}.${ci + 1} del bloqueo de energía`, objective: `Aplicar el paso ${ci + 1} del bloqueo y etiquetado`, videoEnabled: videos && ci === 0, expectedCounter: counter };
+            const c = ci === 0 && auto.length === 1
+              ? await api('PATCH', `/courses/${courseId}/modules/${mid}/chapters/${auto[0].id}`, body)
+              : await api('POST', `/courses/${courseId}/modules/${mid}/chapters`, body);
+            if (![200, 201].includes(c.status)) throw new Error(`E18 capítulo: ${c.status} ${c.error}`);
+            counter = c.data.structureVersionCounter;
+          }
+        }
+        // Configuración del curso (como cualquier curso v3): evaluación y presentación.
+        const AP = D('modules/course-profiles/course-profiles.js');
+        ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...AP.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } })).status === 201, `E18: perfil de evaluación (${title})`);
+        ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, `E18: perfil de presentación (${title})`);
+        if (docText) {
+          const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'requisitos (sintético).txt', dataBase64: Buffer.from(docText, 'utf8').toString('base64') }] });
+          ok(ex.status === 200, `E18: documento leído (${title})`, { s: ex.status, e: ex.error });
+          const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+          ok(sv.status === 201, `E18: contexto guardado (${title})`, { s: sv.status, e: sv.error });
+        }
+        return courseId;
+      };
+      const lockAndManifest = async (courseId) => {
+        const st = await readStructure(courseId);
+        const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+        const n = lock.data.blueprint.blueprintNumber;
+        const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+        ok(man.status === 201, `E18: Manifest del Blueprint ${n}`, { s: man.status, e: man.error });
+        return n;
+      };
+      const ctx = { nombre: '[E2E R68 E18] Bloqueo de generación', ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const expect409 = (r, reason, label) => {
+        const raw = r.raw || {};
+        ok(r.status === 409 && /GENERATION_NOT_VERIFIED/.test(String(r.error)) && (raw.reason === reason || JSON.stringify(raw).includes(`"reason":"${reason}"`)),
+          `E18: ${label} → 409 GENERATION_NOT_VERIFIED (${reason})`, { s: r.status, e: r.error, reason: raw.reason });
+      };
+      const runsBase = (id, n) => `/courses/${id}/blueprints/${n}/manifest/runs`;
+
+      // A · Verificación con un crítico que el docente no puede resolver con su estructura: el documento se contradice
+      // (2 y 3 evaluaciones parciales): Cursia no elige cuál manda. (LOOP 9: «2 videos por capítulo», que Cursia no puede
+      // producir, ya no es un crítico sin salida sino una excepción con motivo — lo prueba E20.)
+      const cA = await mkCourse('[E2E R68 E18-A] Crítico', 'El curso tendrá 2 evaluaciones parciales.\nSe realizarán 3 evaluaciones parciales.');
+      await keepTeacherDesign(api, cA, 'E18-A', { allowCritical: true });
+      const recA = await api('POST', `/courses/${cA}/design/recommendation`, {});
+      ok(recA.data.verification.blocking === true, 'E18-A: Verificación tiene un crítico (el documento se contradice)', recA.data.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+      const nA = await lockAndManifest(cA);
+      const rA = await api('POST', runsBase(cA, nA), ctx);
+      expect409(rA, 'critical', 'POST runs (API directa) con un crítico');
+      ok(Array.isArray(rA.raw && rA.raw.criticals) && rA.raw.criticals.some((c) => /evaluaci/i.test(c.title)), 'E18-A: la respuesta lista el crítico', rA.raw && rA.raw.criticals);
+      expect409(await api('POST', `${runsBase(cA, nA)}/estimate-preview`, ctx), 'critical', 'estimate-preview con un crítico');
+      expect409(await api('POST', `${runsBase(cA, nA)}/approve-and-start`, { ...ctx, estimateHash: 'a'.repeat(64) }), 'critical', 'approve-and-start con un crítico');
+
+      // B · Cambios recomendados sin aplicar (la estructura armada a mano, sin «Usar este diseño» ni decisiones del docente).
+      const cB = await mkCourse('[E2E R68 E18-B] Sin aplicar', null, false);
+      const nB = await lockAndManifest(cB);
+      expect409(await api('POST', runsBase(cB, nB), ctx), 'pending_changes', 'POST runs con cambios sin aplicar');
+
+      // C · Diseño verificado → pasa; después: estructura cambiada, Blueprint viejo.
+      // Sin videos: el gate pasa y la generación (mock) no necesita la entrega por YouTube de los cursos con video.
+      const cC = await mkCourse('[E2E R68 E18-C] Verificado', null, false);
+      await keepTeacherDesign(api, cC, 'E18-C');
+      const nC = await lockAndManifest(cC);
+      const pv = await api('POST', `${runsBase(cC, nC)}/estimate-preview`, ctx);
+      ok(pv.status === 200, 'E18-C: diseño verificado → el estimado de la generación pasa el gate (200)', { s: pv.status, e: pv.error });
+      // Review piloto C1: cambiar el perfil (horas) DESPUÉS de aprobar no avanza el contador de estructura, pero el Blueprint
+      // congeló otro diseño → 409 design_changed. Volver al perfil aprobado lo destraba (misma huella).
+      const curP = (await api('GET', `/courses/${cC}/profiles/pedagogy`)).data;
+      const verP = () => api('GET', `/courses/${cC}/profiles/pedagogy`).then((r) => (r.data && !r.data.isDefault ? Number(r.data.version) : 0));
+      const chg = await api('POST', `/courses/${cC}/profiles/pedagogy`, { data: { ...curP.profile, targetHours: (curP.profile.targetHours || 10) + 8 }, expectedVersion: await verP() });
+      ok(chg.status === 201, 'E18-C: el docente cambia las horas después de aprobar', { s: chg.status, e: chg.error });
+      expect409(await api('POST', runsBase(cC, nC), ctx), 'design_changed', 'POST runs con el perfil cambiado tras aprobar');
+      const back = await api('POST', `/courses/${cC}/profiles/pedagogy`, { data: curP.profile, expectedVersion: await verP() });
+      ok(back.status === 201, 'E18-C: vuelve a las horas aprobadas', { s: back.status, e: back.error });
+      const pvBack = await api('POST', `${runsBase(cC, nC)}/estimate-preview`, ctx);
+      ok(pvBack.status === 200, 'E18-C: con el diseño aprobado de nuevo, el gate pasa', { s: pvBack.status, e: pvBack.error });
+      let st = await readStructure(cC);
+      const ch = st.modules[0].chapters[0];
+      const ed = await api('PATCH', `/courses/${cC}/modules/${st.modules[0].id}/chapters/${ch.id}`, { title: 'Tema 1.1 editado después de aprobar', expectedCounter: st.structureVersionCounter });
+      ok(ed.status === 200, 'E18-C: el docente edita la estructura después de aprobarla', { s: ed.status, e: ed.error });
+      expect409(await api('POST', runsBase(cC, nC), ctx), 'structure_changed', 'POST runs con la estructura cambiada');
+      const nC2 = await lockAndManifest(cC);
+      expect409(await api('POST', runsBase(cC, nC), ctx), 'blueprint_not_current', 'POST runs con el Blueprint anterior');
+      const pv2 = await api('POST', `${runsBase(cC, nC2)}/estimate-preview`, ctx);
+      ok(pv2.status === 200, 'E18-C: re-aprobado → pasa de nuevo', { s: pv2.status, e: pv2.error });
+
+      // D · Frontend antiguo / jobs legacy: un curso V2 nunca se genera por fuera del flujo verificado.
+      for (const [p, body] of [['/jobs/content', { courseId: String(cA) }], ['/jobs/full', { courseId: String(cA), options: { generateAudio: false } }], ['/jobs/videos', { courseId: String(cC) }]]) {
+        const r = await api('POST', p, body);
+        ok(r.status === 409 && /v2_course_legacy_generation_disabled/.test(String(r.error)), `E18-D: ${p} con un curso V2 → 409 v2_course_legacy_generation_disabled`, { s: r.status, e: r.error });
+      }
+
+      // Nada se creó: ni runs ni jobs para estos cursos.
+      const made = await q(`select count(*)::int n from public.production_jobs where course_id = any($1::bigint[]) or frontend_course_id = any($2::text[])`, [[cA, cB, cC], [String(cA), String(cB), String(cC)]]);
+      ok(made[0].n === 0, 'E18: no se creó ninguna generación ni job para cursos sin verificación aprobable', made[0]);
+    });
+
+    // ═══ Prebrief pedagógico · E19 — propuesta versionada, PDF, aprobación, barrera del servidor y generación MOCK sobre lo
+    // aprobado. Formato M (3 × 4, 40–44 h) frente a un documento que exige 4 × 5 y 64 h: excepciones con motivo. USD 0. ═══
+    if (RUN_E5) await step('v3-E19-prebrief', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const { PDFParse } = require('pdf-parse');
+      const pdfTextOf = async (buf) => { const p = new PDFParse({ data: new Uint8Array(buf) }); try { return (await p.getText()).text.replace(/\s+/g, ' '); } finally { await p.destroy().catch(() => {}); } };
+      const getPdf = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, type: r.headers.get('content-type'), disp: r.headers.get('content-disposition'), buf: Buffer.from(await r.arrayBuffer()) }; };
+      const title = '[E2E Prebrief E19] Contabilidad de Costos';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, 'E19: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // Pedido del curso (el contexto de generación que se aprueba).
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro' };
+      ok((await api('PUT', `/courses/${courseId}/brief`, brief)).status === 200, 'E19: pedido guardado');
+      // Microcurrículo sintético + requisito «4 módulos × 5 capítulos».
+      const docText = AF.toText('consistent').toString('utf8') + '\nEl curso tendrá 4 módulos con 5 capítulos cada uno.\n';
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo-sintetico.txt', dataBase64: Buffer.from(docText, 'utf8').toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0, 'E19: documento leído (0 proveedores)', { s: ex.status, e: ex.error });
+      ok((await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 })).status === 201, 'E19: contexto académico guardado');
+      // Estructura 3 × 4 con capítulos vinculados a los resultados (la arma el docente, como en «Avanzado»).
+      const TITLES = [
+        ['Fundamentos y elementos del costo', [['Elementos del costo y su clasificación', ['RA1']], ['Estado de costo de productos vendidos', ['RA1']], ['Valoración de inventarios de materiales', ['RA2']], ['Liquidación de nómina y mano de obra', ['RA2']]]],
+        ['Costeo por órdenes y por procesos', [['Costos indirectos de fabricación', ['RA3']], ['Hoja de costos por orden de producción', ['RA3']], ['Producción equivalente en costeo por procesos', ['RA4']], ['Informe de cantidades y costos por procesos', ['RA4']]]],
+        ['Análisis de costos para decidir', [['Margen de contribución', ['RA5']], ['Punto de equilibrio y relación costo-volumen-utilidad', ['RA5']], ['Toma de decisiones con información de costos', ['RA6']], ['Informe de costos para una decisión gerencial', ['RA6']]]],
+      ];
+      let counter = 0;
+      for (const [mt, chs] of TITLES) {
+        const m = await api('POST', `/courses/${courseId}/modules`, { title: mt, objective: `Aplicar ${mt.toLowerCase()}`, examEnabled: true, expectedCounter: counter });
+        if (m.status !== 201) throw new Error(`E19 módulo: ${m.status} ${m.error}`);
+        counter = m.data.structureVersionCounter;
+        const auto = m.data.module.chapters || [];
+        for (let ci = 0; ci < chs.length; ci++) {
+          const body = { title: chs[ci][0], objective: `Aplicar ${chs[ci][0].toLowerCase()} en una empresa`, videoEnabled: ci === 0, outcomeIds: chs[ci][1], expectedCounter: counter };
+          const c = ci === 0 && auto.length === 1 ? await api('PATCH', `/courses/${courseId}/modules/${m.data.module.id}/chapters/${auto[0].id}`, body) : await api('POST', `/courses/${courseId}/modules/${m.data.module.id}/chapters`, body);
+          if (![200, 201].includes(c.status)) throw new Error(`E19 capítulo: ${c.status} ${c.error}`);
+          counter = c.data.structureVersionCounter;
+        }
+      }
+      const AP = D('modules/course-profiles/course-profiles.js');
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...AP.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } })).status === 201, 'E19: perfil de evaluación');
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E19: perfil de presentación');
+
+      // Formato M: alternativa (S y L no aplican), meta 42 h (punto medio), decisión de la institución.
+      const fm = await api('PUT', `/courses/${courseId}/format`, { code: 'M' });
+      ok(fm.status === 200 && fm.data.format.code === 'M', 'E19: formato M seleccionado', { s: fm.status, e: fm.error });
+      ok((await api('PUT', `/courses/${courseId}/format`, { code: 'XL' })).status === 400, 'E19: formato inexistente → 400');
+      ok((await api('PUT', `/courses/${courseId}/format`, { code: ['S', 'M'] })).status === 400, 'E19: nunca dos formatos a la vez → 400');
+      // «Usar este diseño» (lo que hace la interfaz): perfil, vínculos y cambios recomendados, hasta que quede estable.
+      const useDesign = async (label) => {
+        for (let i = 0; i < 8; i++) {
+          const card = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+          const pending = Math.max((card.design.changes || []).length, card.design.modules.reduce((n, m) => n + m.chapters.filter((c) => c.proposed).length, 0));
+          const auto = card.verification.checks.some((c) => c.id === 'outcome_links');
+          if (!card.profileChanged && !pending && !auto) return card;
+          const st = await readStructure(courseId);
+          if (card.profileChanged) {
+            const pv = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+            const r = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv && !pv.isDefault ? Number(pv.version) : 0 });
+            if (r.status !== 201) throw new Error(`${label}: perfil ${r.status} ${r.error}`);
+          } else if (auto) {
+            const r = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+            if (r.status !== 200) throw new Error(`${label}: vínculos ${r.status} ${r.error}`);
+          } else {
+            const r = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+            if (![200, 201].includes(r.status)) throw new Error(`${label}: aplicar ${r.status} ${r.error}`);
+          }
+        }
+        throw new Error(`${label}: el diseño no quedó estable`);
+      };
+      const card = await useDesign('E19');
+      ok(card.hours.target === 42, 'E19: meta de horas = punto medio del formato M (42 h)', card.hours);
+      const fmtCheck = card.verification.checks.find((c) => c.id === 'format');
+      ok(fmtCheck && fmtCheck.severity === 'ok', 'E19: Verificación: la estructura respeta el formato M (prácticas fuera del N×M)', fmtCheck);
+      ok(!card.verification.blocking, 'E19: verificación sin críticos', card.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+
+      // Prebrief (borrador): excepciones visibles y sin motivo → no se puede preparar.
+      let S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.status === 'draft' && S0.draft.readiness.ready === false, 'E19: borrador no preparable todavía', S0.draft.readiness);
+      const exKeys = S0.draft.model.exceptions.map((e) => e.requirementKey);
+      ok(exKeys.length >= 1 && S0.draft.model.exceptions.some((e) => /4 × 5/.test(e.requirementText)), 'E19: excepción «4 × 5» del documento frente al formato M', S0.draft.model.exceptions);
+      // LOOP 9.2: una excepción cubierta por otra de la misma limitación no pide su propio motivo.
+      const ownKeys = S0.draft.model.exceptions.filter((e) => !(e.coveredBy && exKeys.includes(e.coveredBy))).map((e) => e.requirementKey);
+      ok(JSON.stringify(S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').map((b) => b.ref).sort()) === JSON.stringify(ownKeys.sort()), 'E19: cada excepción pide su motivo (una sola vez por limitación)');
+      ok(S0.draft.model.duration.format && S0.draft.model.duration.format.code === 'M' && S0.draft.model.structure.origin === 'format', 'E19: «Formato M · Configuración seleccionada»');
+      const prep0 = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      ok(prep0.status === 409 && prep0.raw && prep0.raw.code === 'PREBRIEF_NOT_READY', 'E19: preparar sin motivos → 409 PREBRIEF_NOT_READY', { s: prep0.status, e: prep0.error });
+      ok((await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: exKeys[0], reason: 'corto' })).status === 400, 'E19: motivo demasiado corto → 400');
+      for (const k of exKeys) {
+        const r = await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: k, reason: 'La institución prioriza una duración menor para el piloto.' });
+        ok(r.status === 200, `E19: motivo de la excepción ${k}`, { s: r.status, e: r.error });
+      }
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      // Datos dudosos (si los hubiera) se confirman explícitamente.
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${courseId}/prebrief/confirmations`, { confirmKey: b.ref });
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.draft.readiness.ready === true, 'E19: con los motivos, la propuesta se puede preparar', S0.draft.readiness.blockers);
+      const docTxt = JSON.stringify(S0.draft.document);
+      ok(!/USD|costo estimado|Gamma|Videogen|OpenAI/i.test(docTxt), 'E19: el documento no tiene costos ni proveedores');
+      const dpdf = await getPdf(`/courses/${courseId}/prebrief/draft.pdf`);
+      ok(dpdf.status === 200 && /application\/pdf/.test(dpdf.type) && /BORRADOR/i.test(await pdfTextOf(dpdf.buf)), 'E19: PDF del borrador (marca BORRADOR)', { s: dpdf.status });
+
+      // Antes de aprobar: la barrera no deja ni estimar ni generar (API directa, approve-and-start).
+      const prep = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      ok(prep.status === 201 && prep.data.version.version === 1 && prep.data.version.status === 'ready', 'E19: v1 preparada (Listo para aprobación)', { s: prep.status, e: prep.error });
+      const again = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      ok(again.status === 200 && again.data.version.version === 1, 'E19: preparar de nuevo la misma huella es idempotente (sigue v1)');
+      const n1 = prep.data.version.blueprintNumber;
+      ok((await api('POST', `/courses/${courseId}/blueprints/${n1}/manifest`)).status === 201, 'E19: Manifest del Blueprint congelado por la v1');
+      const runsBase = `/courses/${courseId}/blueprints/${n1}/manifest/runs`;
+      const ctxLie = { nombre: 'OTRO NOMBRE', ...CTX, sector: 'Sector inventado', tono: 'SUSURRADO', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const expect409 = (r, reason, label) => ok(r.status === 409 && r.raw && r.raw.reason === reason, `E19: ${label} → 409 ${reason}`, { s: r.status, e: r.error, reason: r.raw && r.raw.reason });
+      expect409(await api('POST', runsBase, ctxLie), 'prebrief_not_approved', 'POST runs sin aprobar');
+      expect409(await api('POST', `${runsBase}/estimate-preview`, ctxLie), 'prebrief_not_approved', 'costo (estimate-preview) sin aprobar');
+      expect409(await api('POST', `${runsBase}/approve-and-start`, { ...ctxLie, estimateHash: 'a'.repeat(64) }), 'prebrief_not_approved', 'approve-and-start sin aprobar');
+      const rpdf = await getPdf(`/courses/${courseId}/prebrief/versions/1/pdf?variant=ready`);
+      const rtxt = await pdfTextOf(rpdf.buf);
+      ok(rpdf.status === 200 && /PENDIENTE DE APROBACIÓN/i.test(rtxt) && /Versión 1/.test(rtxt) && /v1_para-aprobacion\.pdf/.test(rpdf.disp || ''), 'E19: PDF v1 «para aprobación»', { s: rpdf.status, d: rpdf.disp });
+
+      // Aprobación: huella equivocada, sin confirmar, sin nombre → rechazadas; la buena se registra.
+      const v1sha = prep.data.version.modelSha256;
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: 'f'.repeat(64), name: 'María Gómez', role: 'Coordinadora académica', confirm: true })).status === 409, 'E19: aprobar con otra huella → 409');
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: 'María Gómez', role: 'Coordinadora académica', confirm: false })).status === 400, 'E19: aprobar sin confirmar → 400');
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: '', role: 'Coordinadora académica', confirm: true })).status === 400, 'E19: aprobar sin nombre → 400');
+      const apv = await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: 'María Gómez', role: 'Coordinadora académica', confirm: true });
+      ok(apv.status === 200 && apv.data.version.status === 'approved' && apv.data.version.approval.name === 'María Gómez', 'E19: v1 APROBADA (nombre, cargo, usuario, fecha, huella)', { s: apv.status, e: apv.error });
+      const [arow] = await q(`select approval, model_sha256 from public.course_prebrief_versions where course_id = $1 and version = 1`, [courseId]);
+      ok(arow.approval.userId === OWNER && arow.approval.role === 'Coordinadora académica' && arow.approval.modelSha256 === arow.model_sha256 && !!arow.approval.at, 'E19: la aprobación guarda usuario, cargo, fecha y huella', arow.approval);
+      const apdf = await getPdf(`/courses/${courseId}/prebrief/versions/1/pdf?variant=approved`);
+      const atxt = await pdfTextOf(apdf.buf);
+      ok(apdf.status === 200 && /Aprobado por: María Gómez/.test(atxt) && /Cargo: Coordinadora académica/.test(atxt), 'E19: PDF v1 APROBADO (quién y cargo)');
+      let immut = null; try { await q(`update public.course_prebrief_versions set model_json = '{}'::jsonb where course_id = $1`, [courseId]); } catch (e) { immut = e; }
+      ok(immut && /PREBRIEF_VERSION_IMMUTABLE/.test(immut.message), 'E19: la versión aprobada es inmutable en la base (trigger)');
+
+      // Costo DESPUÉS de aprobar; el contexto del run es el APROBADO aunque el navegador mande otro.
+      const pv = await api('POST', `${runsBase}/estimate-preview`, ctxLie);
+      ok(pv.status === 200, 'E19: con la propuesta aprobada, se muestra el costo (estimate-preview 200)', { s: pv.status, e: pv.error });
+      const mods = (await readStructure(courseId)).modules;
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of mods) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      let start = await api('POST', runsBase, ctxLie);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        // Autorización del gasto (FinOps): el administrador autoriza el run (proveedores FALSOS locales, USD 0).
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E19: autorización de producción (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', runsBase, ctxLie);
+      }
+      ok(start.status === 201, 'E19: run MOCK creado sobre la v1 aprobada', { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E19: run no creado: ${start.status} ${start.error}`);
+      const runA = start.data.run.id;
+      const [ctxRow] = await q(`select context from public.generation_run_contexts where job_id = $1`, [runA]);
+      const approvedCtx = S0.draft.model.generationContext;
+      eq(['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => ctxRow.context[k]), ['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => approvedCtx[k]), 'E19: el run congeló EXACTAMENTE el contexto aprobado (no el del navegador)');
+      ok(ctxRow.context.tono !== 'SUSURRADO' && ctxRow.context.sector !== 'Sector inventado', 'E19: el contexto inventado por el navegador se ignoró');
+      const ev = await api('GET', `/courses/${courseId}/prebrief/events`);
+      ok(ev.data.some((e) => e.type === 'generation_started' && e.version === 1 && e.payload.runId === runA), 'E19: historial: generación iniciada con la v1');
+      // Review BE-2 I1: durante la producción sobre la propuesta aprobada, el tema y la evaluación no cambian.
+      const presNow = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data;
+      const lockTry = await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'tecnico', mode: 'dark', brandSeed: null, themeVersion: 1 }, expectedVersion: presNow && !presNow.isDefault ? Number(presNow.version) : 0 });
+      ok(lockTry.status === 409 && lockTry.raw && lockTry.raw.code === 'PROFILE_LOCKED_DURING_PRODUCTION', 'E19: cambiar el tema durante la producción → 409 (bloqueado)', { s: lockTry.status, e: lockTry.error });
+      llm.st.tag = 'E19';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n1, runId: runA }), 'E19 run', undefined, runA);
+      const itemsA = await waitItemsDone(runA);
+      ok(stt.failed === 0 && !stt.fatalError && itemsA.every((i) => i.status === 'completed'), `E19: generación MOCK completa (${itemsA.length} items, proveedores falsos)`, itemsA.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 160)]));
+      const [manRow] = await q(`select m.blueprint_id, b.snapshot_sha256 from public.course_generation_manifests m join public.course_blueprints b on b.id = m.blueprint_id
+         join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [runA]);
+      const [vRow] = await q(`select blueprint_id, blueprint_sha256 from public.course_prebrief_versions where course_id = $1 and version = 1`, [courseId]);
+      ok(manRow && Number(manRow.blueprint_id) === Number(vRow.blueprint_id) && manRow.snapshot_sha256 === vRow.blueprint_sha256, 'E19: lo generado usa el Blueprint EXACTO de la versión aprobada', { manRow, vRow });
+
+      // Review BE-1 C1: un PATCH del curso no puede borrar el flujo de propuesta ni falsificar motivos o confirmaciones.
+      const pm = await api('PATCH', `/courses/${courseId}`, { metadata: { approvalFlow: null, requirementExceptionReasons: {}, courseFormat: null, otra: 1 } });
+      ok(pm.status === 200, 'E19: PATCH del curso con metadata', { s: pm.status, e: pm.error });
+      const [meta1] = await q(`select metadata from public.courses where id = $1`, [courseId]);
+      ok(meta1.metadata.approvalFlow === 'prebrief' && meta1.metadata.courseFormat && meta1.metadata.courseFormat.code === 'M' && Object.keys(meta1.metadata.requirementExceptionReasons || {}).length >= 1,
+        'E19: el PATCH no borra el flujo de propuesta, el formato ni los motivos (claves protegidas)', meta1.metadata);
+      // Cambios después de aprobar → la aprobación se invalida y el servidor bloquea (datos de producción, motivo, horas…).
+      const nb = await api('PUT', `/courses/${courseId}/brief`, { ...brief, tono: 'formal y académico' });
+      ok(nb.status === 200, 'E19: el docente cambia el tono después de aprobar');
+      const S1 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      const v1 = S1.versions.find((v) => v.version === 1);
+      ok(v1.status === 'invalidated' && v1.invalidationDiff.some((l) => /tono/.test(l)), 'E19: v1 INVALIDADA con la diferencia («Datos del curso para producir: tono»)', v1);
+      expect409(await api('POST', runsBase, ctxLie), 'prebrief_stale', 'POST runs con la propuesta obsoleta');
+      // Review BE-1 I2: regenerar un item (gasto nuevo) con la aprobación obsoleta → bloqueado; el estimado de video también.
+      const itemKey0 = itemsA.find((i) => /^content:/.test(i.item_key)).item_key;
+      expect409(await api('POST', `${runsBase}/${runA}/items/${encodeURIComponent(itemKey0)}/regenerate`, { confirmPaid: true }), 'prebrief_stale', 'regenerar un item con la propuesta obsoleta');
+      expect409(await api('GET', `${runsBase}/estimate`), 'prebrief_stale', 'estimado de video con la propuesta obsoleta');
+      ok((await api('POST', `/courses/${courseId}/prebrief/versions/1/approve`, { expectedModelSha: v1sha, name: 'María Gómez', role: 'Coordinadora académica', confirm: true })).status === 409, 'E19: volver a aprobar la v1 invalidada → 409');
+      // v2 con el tono nuevo; la v1 no se puede aprobar (no es la última); la regeneración hereda el contexto viejo → bloqueada.
+      const S2 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      const p2 = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S2.draft.modelSha256 });
+      ok(p2.status === 201 && p2.data.version.version === 2, 'E19: v2 preparada', { s: p2.status, e: p2.error });
+      const ap2 = await api('POST', `/courses/${courseId}/prebrief/versions/2/approve`, { expectedModelSha: p2.data.version.modelSha256, name: 'María Gómez', role: 'Coordinadora académica', confirm: true });
+      ok(ap2.status === 200, 'E19: v2 aprobada', { s: ap2.status, e: ap2.error });
+      const n2 = p2.data.version.blueprintNumber;
+      if (n2 !== n1) await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest`);
+      const regen = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, { fromRun: runA });
+      ok(regen.status === 409 && regen.raw && ['context_mismatch', 'prebrief_stale'].includes(regen.raw.reason), 'E19: regeneración fromRun con el contexto de la v1 → 409 (no se genera sobre otro contexto)', { s: regen.status, e: regen.error, r: regen.raw && regen.raw.reason });
+      // Motivo de excepción cambiado → la v2 queda obsoleta.
+      await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: exKeys[0], reason: 'La institución decidió otra duración por calendario académico.' });
+      expect409(await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, ctxLie), 'prebrief_stale', 'POST runs tras cambiar un motivo de excepción');
+      // Estructura cambiada → el gate de diseño ya lo bloquea antes (R68) y la v2 queda invalidada.
+      const st2 = await readStructure(courseId);
+      await api('PATCH', `/courses/${courseId}/modules/${st2.modules[0].id}/chapters/${st2.modules[0].chapters[0].id}`, { title: 'Elementos del costo (revisado)', expectedCounter: st2.structureVersionCounter });
+      const r3 = await api('POST', `/courses/${courseId}/blueprints/${n2}/manifest/runs`, ctxLie);
+      ok(r3.status === 409 && /GENERATION_NOT_VERIFIED/.test(String(r3.error)), 'E19: estructura cambiada tras aprobar → 409', { s: r3.status, r: r3.raw && r3.raw.reason });
+      const S3 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S3.versions.find((v) => v.version === 2).status === 'invalidated', 'E19: v2 invalidada por los cambios');
+      // Legacy: nunca por fuera del flujo.
+      const lg = await api('POST', '/jobs/content', { courseId: String(courseId) });
+      ok(lg.status === 409 && /v2_course_legacy_generation_disabled/.test(String(lg.error)), 'E19: endpoint legacy → 409', { s: lg.status });
+      // Historial completo y de solo inserción.
+      const evAll = (await api('GET', `/courses/${courseId}/prebrief/events`)).data;
+      const ev2 = evAll.map((e) => e.type);
+      for (const t of ['format_selected', 'exception_reason', 'prepared', 'pdf_generated', 'approved', 'generation_started', 'invalidated']) ok(ev2.includes(t), `E19: historial registra «${t}»`);
+      // QA staging: UPDATE … RETURNING devuelve [filas, cantidad] con TypeORM; sin returningRows aparecían eventos «superseded»
+      // falsos (sin versión) en cada preparación y los de una versión perdían su id.
+      const versionEvents = ['superseded', 'prepared', 'approved', 'invalidated', 'changes_requested', 'withdrawn'];
+      const orphan = evAll.filter((e) => versionEvents.includes(e.type) && (e.version === null || e.version === undefined));
+      ok(orphan.length === 0, 'E19: todo evento de una versión lleva su versión (sin «superseded» falsos)', orphan.map((e) => e.type));
+      ok(ev2.filter((t) => t === 'superseded').length <= ev2.filter((t) => t === 'prepared').length, 'E19: «superseded» solo cuando una versión se reemplaza', ev2);
+      let del = null; try { await q(`delete from public.course_prebrief_events where course_id = $1`, [courseId]); } catch (e) { del = e; }
+      ok(del && /PREBRIEF_APPEND_ONLY/.test(del.message), 'E19: el historial no se puede borrar');
+      // Review BE-1 I1: el empaque usa los perfiles APROBADOS: cambiar el tema después de aprobar bloquea el paquete del run.
+      const pres = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data;
+      const verPres = pres && !pres.isDefault ? Number(pres.version) : 0;
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: null, themeVersion: 1 }, expectedVersion: verPres })).status === 201, 'E19: el docente cambia el tema después de aprobar');
+      const pk = await api('POST', `/courses/${courseId}/blueprints/${n1}/manifest/runs/${runA}/package`, {});
+      ok(pk.status === 409 && pk.raw && pk.raw.code === 'PREBRIEF_PROFILES_CHANGED', 'E19: empaque con el tema cambiado → 409 PREBRIEF_PROFILES_CHANGED', { s: pk.status, e: pk.error });
+      // Review BE-1 I4: un curso con historial de propuesta se puede borrar (la cascada borra su historial).
+      const cdel = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E Prebrief E19] Curso para borrar' });
+      const cdelId = Number(cdel.data.id);
+      const fs0 = await api('PUT', `/courses/${cdelId}/format`, { code: 'S' });
+      ok(fs0.status === 200 && fs0.data.format.code === 'S', 'E19: elegir formato en un curso nuevo (sin perfil pedagógico) funciona', { s: fs0.status, e: fs0.error });
+      const pf = (await api('GET', `/courses/${cdelId}/profiles/pedagogy`)).data;
+      ok(pf && pf.profile && pf.profile.targetHours === 21, 'E19: el formato S fija la meta en 21 h (punto medio)', pf && pf.profile && pf.profile.targetHours);
+      const [evN] = await q(`select count(*)::int n from public.course_prebrief_events where course_id = $1`, [cdelId]);
+      const dl = await api('DELETE', `/courses/${cdelId}`);
+      const [evN2] = await q(`select count(*)::int n from public.course_prebrief_events where course_id = $1`, [cdelId]);
+      ok(evN.n >= 1 && [200, 204].includes(dl.status) && evN2.n === 0, 'E19: borrar un curso con historial de propuesta funciona (cascada)', { before: evN.n, s: dl.status, e: dl.error, after: evN2.n });
+      results.courses.E19 = { courseId, runId: runA };
+    }, { fatal: false });
+
+    // ═══ LOOP 9 · E20 — PILOT READINESS: el caso del piloto de punta a punta por HTTP real (USD 0, proveedores FALSOS):
+    // microcurrículo (64 h · 4 × 5 · 2 videos por capítulo · 1 Actividad de Aplicación por módulo · 3 parciales + final) →
+    // «Lo que entendimos» (sin RA inventados; el valor de partida no es «decisión») → requisitos → Formato M (choca con el
+    // documento) → «Cursia recomienda» → Verificación (excepciones explícitas, incluida la que Cursia no puede producir) →
+    // propuesta → PDF → aprobación → CONTRATO: cada dato que cambia el producto invalida la aprobación, R68 bloquea, una versión
+    // nueva se aprueba y recién ahí se puede seguir → generación MOCK → Blueprint = propuesta → Manifest = Blueprint → empaque →
+    // Moodle (restore, permisos y notas) → permisos de otro usuario.
+    if (RUN_E5) await step('v3-E20-pilot-readiness', async () => {
+      const T = (label) => `E20: ${label}`;
+      const title = '[E2E Pilot E20] Seguridad y Salud en el Trabajo para Supervisores';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, T('curso dinámico creado'), { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // Pedido: lo que el usuario escribió; «¿Para quién?» y el nivel quedaron en su valor de partida (inferidos).
+      const brief = { nombre: 'Seguridad y Salud en el Trabajo para Supervisores', obj: 'Curso de seguridad y salud en el trabajo para supervisores de planta.', sector: 'Seguridad y Salud en el Trabajo', pais: 'Colombia',
+        contexto: 'Universitario — estudiantes de pregrado universitario, con rigor académico y pensamiento crítico', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro', inferidos: 'contexto,nivel,pais,tono' };
+      ok((await api('PUT', `/courses/${courseId}/brief`, brief)).status === 200, T('pedido guardado'));
+      const docText = [
+        'MICROCURRÍCULO', 'Asignatura: Seguridad y Salud en el Trabajo para Supervisores', 'Programa: Tecnología en Gestión de la Seguridad y Salud en el Trabajo', 'Modalidad: Virtual',
+        'Intensidad horaria total: 64 horas', '', '1. Descripción', 'La asignatura forma a supervisores de planta para identificar peligros, evaluar riesgos y liderar la prevención de accidentes.', '',
+        '2. Perfil del estudiante', 'Supervisores y líderes de turno de empresas manufactureras, con experiencia operativa y formación técnica básica en seguridad.', '',
+        'Conocimientos previos', '- Procesos productivos básicos', '- Uso de equipos de protección personal', '',
+        '3. Objetivo general', 'Desarrollar en los supervisores la capacidad de gestionar los riesgos laborales de su área y liderar una cultura preventiva.', '',
+        '4. Resultados de aprendizaje',
+        'RA1. Identificar los peligros presentes en un área de trabajo industrial y clasificarlos por tipo.',
+        'RA2. Evaluar los riesgos laborales con una matriz de valoración y priorizar controles.',
+        'RA3. Aplicar la jerarquía de controles para reducir la exposición a riesgos críticos.',
+        'RA4. Investigar incidentes y accidentes con un método de análisis de causas.',
+        'RA5. Liderar acciones de prevención y comunicación del riesgo con el equipo de trabajo.', '',
+        '5. Estructura del curso', 'El curso tendrá 4 módulos con 5 capítulos cada uno.', 'Cada capítulo debe incluir 2 videos.', 'Cada módulo incluye 1 Actividad de Aplicación.', '',
+        '6. Evaluación', 'El curso tendrá 3 evaluaciones parciales y 1 evaluación final.', '',
+        '7. Bibliografía', '- Organización Internacional del Trabajo (2019). Seguridad y salud en el centro del futuro del trabajo. OIT. Capítulo 3, páginas 45-60.', '- Decreto 1072 de 2015, artículo 2.2.4.6.8.', '',
+      ].join('\n');
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo-e20.txt', dataBase64: Buffer.from(docText, 'utf8').toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0, T('documento leído sin proveedores (USD 0)'), { s: ex.status, e: ex.error });
+      eq(ex.data.draft.outcomes.map((o) => o.id), ['RA1', 'RA2', 'RA3', 'RA4', 'RA5'], T('«Lo que entendimos»: 5 resultados; la sección «5. Estructura del curso» no se suma como RA6 (P1-1)'));
+      ok((await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 })).status === 201, T('contexto académico guardado'));
+      // Requisitos explícitos (con su cita), sin inventar: bibliografía, artículos y páginas no son requisitos.
+      const rv = (await api('GET', `/courses/${courseId}/academic-context/requirements`)).data;
+      const reqs = (rv && rv.items || []).filter((r) => r.applies && r.obligation === 'required');
+      const has = (kind, value, extra) => reqs.some((r) => r.kind === kind && r.value === value && Object.entries(extra || {}).every(([k, v]) => JSON.stringify(r[k]) === JSON.stringify(v)));
+      ok(has('target_hours', 64) && has('modules', 4) && has('chapters', 5) && has('videos', 2) && has('application_activities', 1) && has('evaluations', 3, { evaluationType: 'partial' }) && has('evaluations', 1, { evaluationType: 'final' }),
+        T('requisitos: 64 h, 4 módulos, 5 capítulos por módulo, 2 videos por capítulo, 1 Actividad de Aplicación por módulo («incluye», P1-3), 3 parciales + final'), reqs.map((r) => `${r.kind}=${r.value}${r.evaluationType ? ':' + r.evaluationType : ''}`));
+      ok(!reqs.some((r) => [3, 45, 60, 2015].includes(r.value) && r.kind === 'chapters'), T('capítulos de un libro, páginas y artículos NO son requisitos'), reqs.map((r) => `${r.kind}=${r.value}`));
+      // «Lo que entendimos»: el documento manda sin preguntar (el «Universitario» de partida no era una decisión) y el nivel
+      // de partida es de Cursia, no «tu pedido» (P1-2 / P1-4).
+      const facts = (await api('GET', `/courses/${courseId}/facts`)).data;
+      ok(facts.educationLevel.value === 'technical' && facts.educationLevel.source === 'document' && !facts.conflicts.some((c) => c.field === 'educationLevel'),
+        T('nivel educativo del documento, sin pregunta falsa («elegiste Universitario»)'), { lvl: facts.educationLevel, conflicts: facts.conflicts });
+      // LOOP 9.2: con conocimientos previos en el documento (exigidos), el dato sale del documento (no el «sin conocimientos» de partida).
+      eq([facts.priorKnowledge.source, facts.priorKnowledge.value, facts.documentPrerequisites, facts.documentPrerequisitesKind], ['document', 'basic', ['Procesos productivos básicos', 'Uso de equipos de protección personal'], 'required'], T('conocimientos previos: los del documento mandan sobre el de partida (exigidos)'));
+
+      // Formato M (3 × 4, 40–44 h): decisión de la institución que choca con el documento (4 × 5, 64 h).
+      const fm = await api('PUT', `/courses/${courseId}/format`, { code: 'M' });
+      ok(fm.status === 200 && fm.data.format.code === 'M', T('Formato M elegido'));
+      // Estructura 3 × 4 (lo que la propuesta de estructura arma con el formato elegido, P1-6), con los resultados vinculados.
+      const TIT = [
+        ['Identificación de peligros', [['Peligros físicos y mecánicos', ['RA1']], ['Peligros químicos y biológicos', ['RA1']], ['Matriz de valoración de riesgos', ['RA2']], ['Priorización de controles', ['RA2']]]],
+        ['Control de riesgos', [['Jerarquía de controles', ['RA3']], ['Controles de ingeniería en planta', ['RA3']], ['Equipos de protección personal', ['RA3']], ['Investigación de incidentes', ['RA4']]]],
+        ['Liderazgo preventivo', [['Análisis de causas', ['RA4']], ['Comunicación del riesgo', ['RA5']], ['Cultura preventiva en el turno', ['RA5']], ['Plan de prevención del área', ['RA5']]]],
+      ];
+      let counter = 0;
+      for (const [mt, chs] of TIT) {
+        const m = await api('POST', `/courses/${courseId}/modules`, { title: mt, objective: `Aplicar ${mt.toLowerCase()} en planta`, examEnabled: true, expectedCounter: counter });
+        if (m.status !== 201) throw new Error(`E20 módulo: ${m.status} ${m.error}`);
+        counter = m.data.structureVersionCounter;
+        const auto = m.data.module.chapters || [];
+        for (let ci = 0; ci < chs.length; ci++) {
+          const body = { title: chs[ci][0], objective: `Aplicar ${chs[ci][0].toLowerCase()} en el área de trabajo`, videoEnabled: true, outcomeIds: chs[ci][1], expectedCounter: counter };
+          const c = ci === 0 && auto.length === 1 ? await api('PATCH', `/courses/${courseId}/modules/${m.data.module.id}/chapters/${auto[0].id}`, body) : await api('POST', `/courses/${courseId}/modules/${m.data.module.id}/chapters`, body);
+          if (![200, 201].includes(c.status)) throw new Error(`E20 capítulo: ${c.status} ${c.error}`);
+          counter = c.data.structureVersionCounter;
+        }
+      }
+      const AP = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...AP.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, T('perfil de evaluación'));
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, T('perfil de presentación'));
+      const useDesign = async (label) => {
+        for (let i = 0; i < 8; i++) {
+          const card = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+          const pending = Math.max((card.design.changes || []).length, card.design.modules.reduce((n, m) => n + m.chapters.filter((c) => c.proposed).length, 0));
+          const autoFix = card.verification.checks.some((c) => c.id === 'outcome_links');
+          if (!card.profileChanged && !pending && !autoFix) return card;
+          const st = await readStructure(courseId);
+          if (card.profileChanged) {
+            const pv = (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+            const r = await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv && !pv.isDefault ? Number(pv.version) : 0 });
+            if (r.status !== 201) throw new Error(`${label}: perfil ${r.status} ${r.error}`);
+          } else if (autoFix) {
+            const r = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+            if (r.status !== 200) throw new Error(`${label}: vínculos ${r.status} ${r.error}`);
+          } else {
+            const r = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+            if (![200, 201].includes(r.status)) throw new Error(`${label}: aplicar ${r.status} ${r.error}`);
+          }
+        }
+        throw new Error(`${label}: el diseño no quedó estable`);
+      };
+      const card = await useDesign('E20');
+      const sev = (kind, et) => {
+        const r = (card.requirements.items || []).find((x) => x.applies && x.kind === kind && (!et || x.evaluationType === et));
+        const c = r && card.verification.checks.find((k) => k.id === `requirement:${r.id}`);
+        return c ? `${c.severity}|${c.title}` : null;
+      };
+      ok(card.hours.target === 42 && !card.verification.blocking, T('«Cursia recomienda»: Formato M (meta 42 h) y Verificación sin críticos'), card.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+      ok(/^warning\|Requisito no cubierto por Cursia/.test(sev('videos')), T('2 videos por capítulo (Cursia produce uno) → requisito no cubierto, explícito; no un crítico sin salida (P0-2)'), sev('videos'));
+      ok(/^warning\|Excepción/.test(sev('modules')) && /^warning\|Excepción/.test(sev('target_hours')), T('4 módulos y 64 h → excepciones (el Formato M es decisión de la institución)'), [sev('modules'), sev('target_hours')]);
+      ok(/^ok\|/.test(sev('evaluations', 'partial')) && /^ok\|/.test(sev('evaluations', 'final')), T('3 parciales + final: se cumplen (un parcial por módulo del Formato M y la final)'), [sev('evaluations', 'partial'), sev('evaluations', 'final')]);
+      ok(sev('application_activities') && !/^critical/.test(sev('application_activities')), T('1 Actividad de Aplicación por módulo («incluye»: lectura de confianza media): visible, sin crítico'), sev('application_activities'));
+
+      // Propuesta: no se prepara sin el motivo de CADA excepción (también la de lo que Cursia no puede producir).
+      let S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.status === 'draft', T('propuesta en borrador'));
+      const exKeys = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').map((b) => b.ref);
+      ok(exKeys.length >= 3 && exKeys.some((k) => /^videos/.test(k)), T('la propuesta pide el motivo de cada excepción, incluida la de los videos'), exKeys);
+      for (const k of exKeys) ok((await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: k, reason: 'La institución aprueba el Formato M con un video por capítulo para el piloto.' })).status === 200, T(`motivo guardado: ${k}`));
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${courseId}/prebrief/confirmations`, { confirmKey: b.ref });
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.draft.readiness.ready, T('propuesta lista para preparar'), S0.draft.readiness.blockers);
+      const learnerRows = JSON.stringify(S0.draft.document.sections.find((s) => s.id === 'audience'));
+      ok(/Técnico \/ tecnológico/.test(learnerRows) && /Procesos productivos básicos/.test(learnerRows) && !/"value":"(none|basic|intermediate|advanced|technical|university)"/.test(learnerRows) && !/rigor académico y pensamiento crítico/.test(learnerRows),
+        T('Público objetivo para personas: nivel y previos con rótulo y origen, previos del documento, sin códigos ni texto interno (P1-9)'), learnerRows.slice(0, 400));
+      const exDoc = S0.draft.model.exceptions.find((e) => /^videos/.test(e.requirementKey));
+      ok(exDoc && exDoc.reason && exDoc.capability === true && /^Cursia contempla 1 video por capítulo de contenido/.test(exDoc.appliedText), T('«Excepciones al documento»: la de los videos (no cubierta por Cursia) con la aceptación de la institución y lo que Cursia contempla'), exDoc);
+
+      const getPdfE20 = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, disp: r.headers.get('content-disposition'), buf: Buffer.from(await r.arrayBuffer()) }; };
+      const prepareApprove = async (label) => {
+        const s = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+        if (!s.draft.readiness.ready) throw new Error(`${label}: no está lista: ${JSON.stringify(s.draft.readiness.blockers)}`);
+        const p = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: s.draft.modelSha256 });
+        if (![200, 201].includes(p.status)) throw new Error(`${label}: preparar ${p.status} ${p.error}`);
+        const v = p.data.version;
+        await api('POST', `/courses/${courseId}/blueprints/${v.blueprintNumber}/manifest`);
+        const a = await api('POST', `/courses/${courseId}/prebrief/versions/${v.version}/approve`, { expectedModelSha: v.modelSha256, name: 'Coordinación Académica Demo', role: 'Directora académica', confirm: true });
+        if (a.status !== 200) throw new Error(`${label}: aprobar ${a.status} ${a.error}`);
+        return a.data.version;
+      };
+      let ver = await prepareApprove('E20 v1');
+      ok(ver.status === 'approved' && ver.version === 1, T('v1 preparada y APROBADA'));
+      ok((await api('GET', `/courses/${courseId}/prebrief`)).data.approvalFlow === true, T('preparar la propuesta deja el curso en el flujo (la generación exige la versión aprobada)'));
+      const fingerprints = [ver.modelSha256];
+      const pdf1 = await getPdfE20(`/courses/${courseId}/prebrief/versions/1/pdf?variant=approved`);
+      ok(pdf1.status === 200 && pdf1.buf.slice(0, 5).toString() === '%PDF-' && /v1_aprobado\.pdf/.test(pdf1.disp || ''), T('PDF de la v1 aprobada'), { s: pdf1.status, d: pdf1.disp });
+      const fingerprint1 = ver.modelSha256;
+
+      // ═══ CONTRATO: después de aprobar, cada dato que cambia el producto invalida la aprobación; R68 bloquea; una versión
+      // nueva se aprueba y recién ahí se puede seguir. Nunca se genera algo distinto de lo aprobado.
+      const runsBaseOf = (n) => `/courses/${courseId}/blueprints/${n}/manifest/runs`;
+      const ctxRun = { nombre: brief.nombre, sector: brief.sector, pais: brief.pais, contexto: brief.contexto, nivel: brief.nivel, tono: brief.tono, obj: brief.obj, scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const BLOCK = ['prebrief_stale', 'prebrief_not_approved', 'design_changed', 'structure_changed', 'pending_changes', 'stale_blueprint', 'blueprint_mismatch'];
+      const pedNow = async () => (await api('GET', `/courses/${courseId}/profiles/pedagogy`)).data;
+      const acNow = async () => (await api('GET', `/courses/${courseId}/profiles/academic`)).data;
+      const firstChapter = async () => { const st = await readStructure(courseId); const m = st.modules[0]; return { st, m, c: m.chapters.find((x) => x.kind !== 'practice') }; };
+      // LOOP 9.1 (F): también el nombre del curso y el enfoque pedagógico (además de los 14 de LOOP 9).
+      let ped0 = null;
+      const must2xx = (r, what) => { if (!r || r.status < 200 || r.status >= 300) throw new Error(`E20 ${what}: ${r && r.status} ${r && r.error}`); return r; };
+      const MUT = [
+        ['nombre', async () => { must2xx(await api('PUT', `/courses/${courseId}/brief`, { ...brief, nombre: `${brief.nombre} (versión corta)` }), 'cambiar el nombre'); },
+          async () => { must2xx(await api('PUT', `/courses/${courseId}/brief`, brief), 'restaurar el nombre'); }],
+        ['enfoque', async () => {
+          const p = await pedNow(); ped0 = { primaryApproach: p.profile.primaryApproach || null, secondaryApproaches: p.profile.secondaryApproaches || [] };
+          const next = ped0.primaryApproach === 'problemas' ? 'experiencial' : 'problemas';
+          must2xx(await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, primaryApproach: next, secondaryApproaches: ped0.secondaryApproaches.filter((x) => x !== next) }, expectedVersion: Number(p.version) }), 'cambiar el enfoque');
+        }, async () => {
+          const p = await pedNow();
+          must2xx(await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, ...ped0 }, expectedVersion: Number(p.version) }), 'restaurar el enfoque');
+        }],
+        ['tono', async () => { await api('PUT', `/courses/${courseId}/brief`, { ...brief, tono: 'formal y técnico' }); }, async () => { await api('PUT', `/courses/${courseId}/brief`, brief); }],
+        ['horas', async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, targetHours: 40 }, expectedVersion: Number(p.version) }); },
+          async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, targetHours: 42 }, expectedVersion: Number(p.version) }); }],
+        ['estructura (título de capítulo)', async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { title: `${c.title} (revisado)`, expectedCounter: st.structureVersionCounter }); },
+          async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { title: c.title.replace(/ \(revisado\)$/, ''), expectedCounter: st.structureVersionCounter }); }],
+        ['resultados', async () => { const a = await acNow(); await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: Number(a.version), outcomes: a.profile.outcomes.map((o, i) => ({ id: o.id, text: i === 0 ? `${o.text} Incluye zonas de carga.` : o.text })), accept: true }); },
+          async () => { const a = await acNow(); await api('PUT', `/courses/${courseId}/academic-context/outcomes`, { expectedVersion: Number(a.version), outcomes: a.profile.outcomes.map((o) => ({ id: o.id, text: o.text.replace(/ Incluye zonas de carga\.$/, '') })), accept: true }); }],
+        ['estudiante', async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, learner: { ...p.profile.learner, description: 'Supervisores de planta con más de cinco años de experiencia.' } }, expectedVersion: Number(p.version) }); },
+          null],
+        ['nivel', async () => { const p = await pedNow(); await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: { ...p.profile, learner: { ...p.profile.learner, educationLevel: 'professional' } }, expectedVersion: Number(p.version) }); }, null],
+        ['requisitos (motivo de una excepción)', async () => { await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: exKeys[0], reason: 'Otro motivo: la coordinación pide reducir la carga del piloto.' }); }, null],
+        ['formato S/M/L', async () => { await api('PUT', `/courses/${courseId}/format`, { code: 'L' }); }, async () => { await api('PUT', `/courses/${courseId}/format`, { code: 'M' }); }],
+        ['videos', async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { videoEnabled: !c.videoEnabled, expectedCounter: st.structureVersionCounter }); },
+          async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { videoEnabled: !c.videoEnabled, expectedCounter: st.structureVersionCounter }); }],
+        ['actividades', async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { activityEnabled: !c.activityEnabled, expectedCounter: st.structureVersionCounter }); },
+          async () => { const { st, m, c } = await firstChapter(); await api('PATCH', `/courses/${courseId}/modules/${m.id}/chapters/${c.id}`, { activityEnabled: !c.activityEnabled, expectedCounter: st.structureVersionCounter }); }],
+        ['sector', async () => { await api('PUT', `/courses/${courseId}/brief`, { ...brief, sector: 'Gestión industrial' }); }, async () => { await api('PUT', `/courses/${courseId}/brief`, brief); }],
+        ['tema (presentación)', async () => { const pr = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data; await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: null, themeVersion: 1 }, expectedVersion: Number(pr.version) }); },
+          async () => { const pr = (await api('GET', `/courses/${courseId}/profiles/presentation`)).data; await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 }, expectedVersion: Number(pr.version) }); }],
+        ['evaluación final', async () => { const st = await readStructure(courseId); await api('PATCH', `/courses/${courseId}/structure-settings`, { finalExam: false, expectedCounter: st.structureVersionCounter }); },
+          async () => { const st = await readStructure(courseId); await api('PATCH', `/courses/${courseId}/structure-settings`, { finalExam: true, expectedCounter: st.structureVersionCounter }); }],
+        ['evaluación (nota mínima)', async () => { const a = (await api('GET', `/courses/${courseId}/profiles/assessment`)).data; await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...a.profile, passingGrade: 75 }, expectedVersion: Number(a.version) }); },
+          async () => { const a = (await api('GET', `/courses/${courseId}/profiles/assessment`)).data; await api('POST', `/courses/${courseId}/profiles/assessment`, { data: { ...a.profile, passingGrade: 70 }, expectedVersion: Number(a.version) }); }],
+      ];
+      for (const [label, mutate, revert] of MUT) {
+        const before = (await api('GET', `/courses/${courseId}/prebrief`)).data.current;
+        await mutate();
+        const s1 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+        const latest = s1.versions[0];
+        const stale = latest.version === before.version && latest.status === 'invalidated' && latest.invalidationReason === 'design_changed' && (latest.invalidationDiff || []).length > 0;
+        // Un cambio de estructura que Cursia todavía no aplicó al diseño (p. ej. apagar el video de un capítulo en el editor)
+        // no cambia la propuesta hasta «Usar este diseño»; mientras tanto R68 NO deja generar (la estructura viva ≠ Blueprint).
+        const pendingOnly = !stale && latest.status === 'approved';
+        ok(stale || pendingOnly, T(`contrato · ${label}: ${stale ? `cambiar después de aprobar invalida la v${before.version} (con lo que cambió)` : 'cambio sin aplicar al diseño: la aprobación no cubre lo que se generaría'}`), { status: latest.status, reason: latest.invalidationReason, diff: latest.invalidationDiff });
+        const r = await api('POST', `${runsBaseOf(before.blueprintNumber)}/estimate-preview`, ctxRun);
+        const g = await api('POST', runsBaseOf(before.blueprintNumber), ctxRun);
+        ok(r.status === 409 && g.status === 409 && BLOCK.includes(g.raw && g.raw.reason), T(`contrato · ${label}: R68 bloquea el costo y la generación (409)`), { r: [r.status, r.raw && r.raw.reason], g: [g.status, g.raw && g.raw.reason, g.error] });
+        if (stale) ok((await api('POST', `/courses/${courseId}/prebrief/versions/${before.version}/approve`, { expectedModelSha: before.modelSha256, name: 'Coordinación Académica Demo', role: 'Directora académica', confirm: true })).status === 409, T(`contrato · ${label}: la versión invalidada ya no se puede aprobar`));
+        if (revert) await revert();
+        const sR = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+        if (!stale) {
+          // Deshacer el cambio sin aplicar: la estructura vuelve a ser la aprobada y la aprobación vigente sigue cubriéndola.
+          const r2 = await api('POST', `${runsBaseOf(before.blueprintNumber)}/estimate-preview`, ctxRun);
+          ok(sR.status === 'approved' && sR.current.version === before.version && r2.status === 200, T(`contrato · ${label}: deshecho, la versión aprobada vuelve a cubrir exactamente lo que se genera`), { st: sR.status, r2: [r2.status, r2.raw && r2.raw.reason] });
+          continue;
+        }
+        ok(sR.status === 'draft' && sR.versions[0].status === 'invalidated', T(`contrato · ${label}: deshacer el cambio NO revive la aprobación (hace falta una versión nueva)`));
+        if (label === 'formato S/M/L' || label === 'estructura (título de capítulo)' || label === 'videos' || label === 'actividades') await useDesign(`E20 ${label}`);
+        ver = await prepareApprove(`E20 ${label}`);
+        ok(ver.status === 'approved' && ver.version === before.version + 1, T(`contrato · ${label}: nueva versión v${ver.version} aprobada`));
+        fingerprints.push(ver.modelSha256);
+      }
+      const S1 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S1.versions.filter((v) => v.status === 'approved').length === 1 && S1.current.version === ver.version, T('una sola versión aprobada vigente; las anteriores invalidadas'), S1.versions.map((v) => `v${v.version}:${v.status}`));
+      ok(S1.current.modelSha256 === ver.modelSha256 && S1.draft.modelSha256 === ver.modelSha256 && fingerprints.length >= 8, T(`huella capturada en cada aprobación (${fingerprints.length}); la vigente = el borrador actual`), { fingerprints: fingerprints.length });
+      ok(fingerprint1 === fingerprints[0], T('la huella de la v1 es la que se aprobó'));
+
+      // Generación MOCK sobre la versión vigente: contexto, Blueprint y Manifest = lo aprobado.
+      const n = ver.blueprintNumber;
+      const runsBase = runsBaseOf(n);
+      const pvw = await api('POST', `${runsBase}/estimate-preview`, ctxRun);
+      ok(pvw.status === 200, T('con la versión aprobada vigente, el costo se muestra (200)'), { s: pvw.status, e: pvw.error });
+      const st = await readStructure(courseId);
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of st.modules) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      let start = await api('POST', runsBase, { ...ctxRun, tono: 'SUSURRADO', sector: 'Inventado' });
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E20: autorización (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', runsBase, { ...ctxRun, tono: 'SUSURRADO', sector: 'Inventado' });
+      }
+      ok(start.status === 201, T('run MOCK creado sobre la versión aprobada vigente'), { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E20: run no creado: ${start.status} ${start.error}`);
+      const runId = start.data.run.id;
+      const [ctxRow] = await q(`select context from public.generation_run_contexts where job_id = $1`, [runId]);
+      const approvedCtx = S1.current.model ? S1.current.model.generationContext : (await api('GET', `/courses/${courseId}/prebrief/versions/${ver.version}`)).data.model.generationContext;
+      eq(['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => ctxRow.context[k]), ['nombre', 'sector', 'pais', 'tono', 'obj'].map((k) => approvedCtx[k]), T('el run congeló el contexto APROBADO (el del navegador se ignora)'));
+      llm.st.tag = 'E20';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId }), 'E20 run', undefined, runId);
+      const items = await waitItemsDone(runId);
+      ok(stt.failed === 0 && !stt.fatalError && items.every((i) => i.status === 'completed'), T(`generación MOCK completa (${items.length} items, proveedores falsos, USD 0)`), items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 160)]));
+      const [manRow] = await q(`select m.id, m.blueprint_id, m.manifest_json as manifest, b.snapshot_sha256 from public.course_generation_manifests m join public.course_blueprints b on b.id = m.blueprint_id
+         join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [runId]);
+      const [vRow] = await q(`select blueprint_id, blueprint_sha256 from public.course_prebrief_versions where course_id = $1 and version = $2`, [courseId, ver.version]);
+      ok(manRow && Number(manRow.blueprint_id) === Number(vRow.blueprint_id) && manRow.snapshot_sha256 === vRow.blueprint_sha256, T('Blueprint generado = Blueprint de la propuesta aprobada'), { manRow: manRow && { b: manRow.blueprint_id, s: manRow.snapshot_sha256 }, vRow });
+      const M = typeof manRow.manifest === 'string' ? JSON.parse(manRow.manifest) : manRow.manifest;
+      const Mm = M.manifest || M;
+      const verModel = (await api('GET', `/courses/${courseId}/prebrief/versions/${ver.version}`)).data.model;
+      eq([Mm.modules.length, Mm.totals.videoCount, Mm.totals.applicationActivityCount], [verModel.structure.modules.length, verModel.structure.modules.reduce((a, m) => a + m.chapters.filter((c) => c.video).length, 0), verModel.structure.modules.reduce((a, m) => a + m.chapters.filter((c) => !!c.applicationMinutes).length, 0)],
+        T('Manifest = Blueprint = propuesta (módulos, videos, Actividades de Aplicación)'));
+      eq(items.map((i) => i.item_key).sort(), Mm.items.map((i) => i.key).sort(), T('items generados = items del Manifest'));
+      // Empaque + Moodle (restore, permisos y notas): lo hace el bloque Moodle de este E2E.
+      const P = await packageRun('E20', courseId, n, runId);
+      // Loop 6 · Bloque 5: batería de calidad del run terminado (solo lectura). Con el LLM falso el texto es de plantilla:
+      // se exige lo estructural (nada perdido, nada fuera del Manifest, evaluaciones que cubren sus capítulos) y se guarda
+      // el reporte completo como línea base de la E2E.
+      const qr = await api('GET', `/courses/${courseId}/blueprints/${n}/manifest/runs/${runId}/quality`);
+      const qc = (id) => qr.data && qr.data.checks && qr.data.checks.find((c) => c.id === id);
+      ok(qr.status === 200 && qr.data.version === 'quality-battery-v1' && qr.data.checks.length === 9 && qc('Q9') && qc('Q9').blocking === false, T('batería de calidad: 200 con los 9 checks (Q9 ejercicios guiados, informativo)'), { s: qr.status, e: qr.error });
+      ok(qc('Q1') && qc('Q1').metric === 1 && qc('Q1').pass, T('batería: nada perdido (cada parte tiene su artifact)'), qc('Q1'));
+      ok(qc('Q8') && !qc('Q8').findings.some((f) => f.code === 'Q8_ARTIFACT_WITHOUT_ITEM'), T('batería: ningún artifact fuera del Manifest'), qc('Q8') && qc('Q8').findings.slice(0, 3));
+      ok(qc('Q6') && !qc('Q6').findings.some((f) => f.code === 'Q6_CHAPTER_NOT_ASSESSED'), T('batería: cada capítulo de un módulo con examen tiene preguntas'), qc('Q6') && qc('Q6').findings.slice(0, 3));
+      const qr2 = await api('GET', `/courses/${courseId}/blueprints/${n}/manifest/runs/${runId}/quality`);
+      eq(JSON.stringify(qr2.data.summary), JSON.stringify(qr.data.summary), T('batería: determinística (mismo run ⇒ mismo reporte)'));
+      results.qualityBatteryE20 = qr.data && { pass: qr.data.pass, summary: qr.data.summary, findings: qr.data.checks.map((c) => [c.id, c.findings.length]) };
+      const apps = Mm.items.filter((i) => i.type === 'application_activity');
+      const reviewIds = ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length));
+      results.courses.E20 = { courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: Mm.modules, features: Mm.features, applications: apps.length, reviewCardsChapterIds: reviewIds,
+        modules: st.modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) })), blueprintNumber: n, runId, items: items.length, prebriefVersions: S1.versions.length };
+      // Permisos: otro usuario no ve ni aprueba la propuesta ni su PDF.
+      const OTHER = jwt.sign({ sub: crypto.randomUUID(), email: 'e2e-otro@example.com', role: 'authenticated', aud: 'authenticated' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+      const o1 = await api('GET', `/courses/${courseId}/prebrief`, undefined, OTHER);
+      const o2 = await api('POST', `/courses/${courseId}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Intruso', role: 'Nadie', confirm: true }, OTHER);
+      const o3 = await fetch(BASE + `/courses/${courseId}/prebrief/versions/${ver.version}/pdf`, { headers: { authorization: `Bearer ${OTHER}` } });
+      ok([403, 404].includes(o1.status) && [403, 404].includes(o2.status) && [403, 404].includes(o3.status), T('otro usuario: ni ver, ni aprobar, ni descargar el PDF (403/404)'), [o1.status, o2.status, o3.status]);
+    }, { fatal: false });
+
+    // ═══ Cierre · E22 — LOS 32 CASOS OBLIGATORIOS (Fase 9 del loop del nuevo flujo de creación), uno por uno, por HTTP real
+    // contra el backend con proveedores FALSOS (USD 0). Cada caso deja su fila (descripción, esperado, real, PASS/FAIL) en
+    // v3/casos32.json. El piloto «Atención a víctimas de violencia sexual» (DOCX real) recorre el flujo completo hasta la
+    // generación MOCK, el empaque, Moodle y R68.
+    if (RUN_E5) await step('v3-E22-casos32', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const { PDFParse } = require('pdf-parse');
+      const pdfTextOf = async (buf) => { const p = new PDFParse({ data: new Uint8Array(buf) }); try { return (await p.getText()).text.replace(/\s+/g, ' '); } finally { await p.destroy().catch(() => {}); } };
+      const getPdf = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, buf: Buffer.from(await r.arrayBuffer()) }; };
+      const CASES = [];
+      const caso = (n, desc, expected, pass, actual) => {
+        const real = typeof actual === 'string' ? actual : JSON.stringify(actual === undefined ? null : actual).slice(0, 400);
+        CASES.push({ caso: n, descripcion: desc, esperado: expected, real, resultado: pass ? 'PASS' : 'FAIL' });
+        ok(!!pass, `C${String(n).padStart(2, '0')} ${desc} — ${expected}`, actual);
+        results.cases32 = CASES;
+        fs.writeFileSync(path.join(V3OUT, 'casos32.json'), JSON.stringify(CASES, null, 2));
+      };
+      const tryCase = async (n, desc, expected, fn) => {
+        try { const r = await fn(); caso(n, desc, expected, r.pass, r.actual); } catch (e) { caso(n, desc, expected, false, `excepción: ${e && e.message}`); }
+      };
+      const brief = (nombre) => ({ nombre, obj: `Aprender ${nombre.toLowerCase()} en el trabajo`, sector: 'Educación', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro' });
+      const newCourse = async (title) => {
+        const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+        if (cr.status !== 201) throw new Error(`curso no creado: ${cr.status} ${cr.error}`);
+        const id = Number(cr.data.id);
+        await api('POST', `/courses/${id}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+        await api('PUT', `/courses/${id}/brief`, brief(title.replace(/^\[[^\]]+\]\s*/, '')));
+        const A = D('modules/course-profiles/course-profiles.js');
+        await api('POST', `/courses/${id}/profiles/assessment`, { data: { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } });
+        await api('POST', `/courses/${id}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } });
+        return id;
+      };
+      const importDoc = async (id, name, buf) => {
+        const ex = await api('POST', `/courses/${id}/academic-context/extract`, { files: [{ name, dataBase64: buf.toString('base64') }] });
+        if (ex.status !== 200) throw new Error(`extracción: ${ex.status} ${ex.error}`);
+        const sv = await api('POST', `/courses/${id}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+        if (sv.status !== 201) throw new Error(`contexto: ${sv.status} ${sv.error}`);
+        return { ex: ex.data, cv: sv.data.profile.version };
+      };
+      const opts = async (id) => (await api('GET', `/courses/${id}/design/structure-options`)).data;
+      const preview = async (id, m, c, format) => (await api('POST', `/courses/${id}/design/structure-preview`, { modules: m, chaptersPerModule: c, ...(format ? { format } : {}) })).data;
+      const apply = async (id, cv, choice, shape, extra = {}) => {
+        if (choice === 'format') { const fr = await api('PUT', `/courses/${id}/format`, { code: extra.format }); if (fr.status !== 200) throw new Error(`formato: ${fr.status} ${fr.error}`); }
+        else if (!extra.keepFormat && (await api('GET', `/courses/${id}/format`)).data.format) { const fr = await api('PUT', `/courses/${id}/format`, { code: null }); if (fr.status !== 200) throw new Error(`quitar formato: ${fr.status} ${fr.error}`); }
+        const st = await readStructure(id);
+        const r = await api('POST', `/courses/${id}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: cv, choice, ...(shape ? { shape } : {}), confirmReplace: true });
+        if (![200, 201].includes(r.status)) throw new Error(`apply ${choice}: ${r.status} ${r.error}`);
+        return r.data;
+      };
+      const contentShape = async (id) => (await readStructure(id)).modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length);
+      const rec = async (id) => (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      const check = (card, re) => card.verification.checks.find((c) => re.test(c.title));
+      const useDesign = async (id) => {
+        let card = await rec(id);
+        const pv = await api('GET', `/courses/${id}/profiles/pedagogy`);
+        if (card.profileChanged) await api('POST', `/courses/${id}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version });
+        await api('POST', `/courses/${id}/design/hours-origin`, { proposed: card.hours.source === 'proposed' ? card.hours.target : null });
+        if (card.verification.checks.some((c) => c.id === 'outcome_links')) { const st = await readStructure(id); await api('POST', `/courses/${id}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter }); }
+        card = await rec(id);
+        const st = await readStructure(id);
+        const ap = await api('POST', `/courses/${id}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+        if (![200, 201].includes(ap.status)) throw new Error(`apply-distribution: ${ap.status} ${ap.error}`);
+        return rec(id);
+      };
+      const pbState = async (id) => (await api('GET', `/courses/${id}/prebrief`)).data;
+      const settle = async (id, reason) => {
+        let S0 = await pbState(id);
+        for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'exception_reason')) await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: reason || 'La institución acepta esta diferencia para la validación de cierre.' });
+        S0 = await pbState(id);
+        for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${id}/prebrief/confirmations`, { confirmKey: b.ref });
+        return pbState(id);
+      };
+      const prepareApprove = async (id) => {
+        const S0 = await settle(id);
+        if (!S0.draft.readiness.ready) throw new Error(`propuesta no lista: ${JSON.stringify(S0.draft.readiness.blockers).slice(0, 300)}`);
+        const prep = await api('POST', `/courses/${id}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        if (![200, 201].includes(prep.status)) throw new Error(`preparar: ${prep.status} ${prep.error}`);
+        const ver = prep.data.version;
+        await api('POST', `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest`);
+        const apv = await api('POST', `/courses/${id}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Validación de cierre', role: 'Coordinación académica', confirm: true });
+        if (![200, 201].includes(apv.status)) throw new Error(`aprobar: ${apv.status} ${apv.error}`);
+        return ver;
+      };
+      const verStatus = async (id, v) => ((await pbState(id)).versions || []).find((x) => x.version === v);
+      const docText = (lines) => Buffer.from(lines.join('\n'), 'utf8');
+      const doc4x5 = () => {
+        const temas = ['Peligros', 'Riesgos', 'Controles', 'Incidentes'];
+        const l = ['MICROCURRÍCULO', 'Asignatura: Seguridad industrial', 'Modalidad: Virtual', 'Intensidad horaria total: 40 horas', '', '1. Descripción', 'La asignatura desarrolla la gestión de la seguridad en plantas industriales.', '',
+          '2. Resultados de aprendizaje', 'RA1. Identificar peligros del área de trabajo.', 'RA2. Aplicar controles de riesgo en planta.', '', '3. Estructura del curso',
+          'El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 5 capítulos de contenido.', '', '4. Contenidos', 'Unidad | Contenidos | Horas | RA'];
+        temas.forEach((t, i) => l.push(`Unidad ${i + 1}: ${t} en planta | ${[1, 2, 3, 4, 5].map((c) => `${t}: tema ${c}`).join('; ')} | 10 | RA${i < 2 ? 1 : 2}`));
+        return docText(l);
+      };
+      const doc3x3 = () => {
+        const temas = ['Inventarios', 'Compras', 'Despachos'];
+        const l = ['MICROCURRÍCULO', 'Asignatura: Logística de almacén', 'Modalidad: Virtual', 'Intensidad horaria total: 30 horas', '', '1. Descripción', 'La asignatura desarrolla la gestión de un almacén.', '',
+          '2. Resultados de aprendizaje', 'RA1. Controlar el inventario del almacén.', 'RA2. Organizar compras y despachos.', '', '3. Estructura del curso',
+          'El curso tendrá exactamente 3 módulos. Cada módulo tendrá exactamente 3 capítulos de contenido.', '', '4. Contenidos', 'Unidad | Contenidos | Horas | RA'];
+        temas.forEach((t, i) => l.push(`Unidad ${i + 1}: ${t} | ${[1, 2, 3].map((c) => `${t}: tema ${c}`).join('; ')} | 10 | RA${i === 0 ? 1 : 2}`));
+        return docText(l);
+      };
+      const PILOT_DOCX = fs.readFileSync(path.join(REPO, 'scripts/fixtures/microcurriculum/atencion-violencia-sexual-2x2.docx'));
+
+      // ── C01 Crear desde cero ──
+      await tryCase(1, 'Crear desde cero', 'Sin documento: Cursia no inventa requisitos ni excepciones; la estructura se arma y el diseño se calcula', async () => {
+        const id = await newCourse('[Cierre C01] Excel desde cero');
+        const o = await opts(id);
+        let st = await readStructure(id);
+        await api('POST', `/courses/${id}/modules/${st.modules[0].id}/chapters`, { title: 'Fórmulas básicas', expectedCounter: st.structureVersionCounter });
+        st = await readStructure(id);
+        await api('POST', `/courses/${id}/modules`, { title: 'Tablas y gráficos', expectedCounter: st.structureVersionCounter });
+        st = await readStructure(id);
+        await api('POST', `/courses/${id}/modules/${st.modules[1].id}/chapters`, { title: 'Tablas dinámicas', expectedCounter: st.structureVersionCounter });
+        const card = await rec(id);
+        const reqChecks = card.verification.checks.filter((c) => /^requirement:/.test(c.id));
+        const shape = await contentShape(id);
+        return { pass: o.hasDocumentContents === false && o.document === null && o.contextVersion === null && !!card.design && reqChecks.length === 0 && shape.length === 2,
+          actual: { hasDocumentContents: o.hasDocumentContents, contextVersion: o.contextVersion, requisitos: reqChecks.length, forma: shape, horasDiseño: card.design && card.design.estimatedHours } };
+      });
+
+      // ── C02 / C03 / C04 Importar DOCX, PDF y pegar texto: el mismo lector, el mismo resultado ──
+      const reads = {};
+      for (const [n, label, name, fmt] of [[2, 'Importar DOCX', 'microcurriculo.docx', 'docx'], [3, 'Importar PDF', 'microcurriculo.pdf', 'pdf'], [4, 'Pegar texto', 'informacion-pegada.txt', 'txt']]) {
+        await tryCase(n, label, 'El documento se lee sin proveedores: 5 unidades, 18 contenidos, 6 resultados, 64 horas', async () => {
+          const id = await newCourse(`[Cierre C0${n}] Contabilidad de Costos`);
+          const { ex } = await importDoc(id, name, await AF.fixture('consistent', fmt));
+          const o = await opts(id);
+          const r = { providers: ex.stats.providersCalled, unidades: o.document && o.document.modules, contenidos: o.contentsCount, forma: o.document && o.document.shape, horas: o.requirements.hours, resultados: (ex.draft.outcomes || []).length };
+          reads[fmt] = r;
+          return { pass: r.providers === 0 && r.unidades === 5 && r.contenidos === 18 && JSON.stringify(r.horas) === '["64 horas"]' && r.resultados === 6, actual: r };
+        });
+      }
+
+      // ── C05 Documento con estructura ──
+      let c45 = null;
+      await tryCase(5, 'Documento con estructura', 'Se detecta la estructura obligatoria (4 × 5) y «Cursia recomienda» es esa forma, con su motivo', async () => {
+        const id = await newCourse('[Cierre C05] Seguridad industrial 4 × 5');
+        const { cv } = await importDoc(id, 'seguridad.txt', doc4x5());
+        c45 = { id, cv };
+        const o = await opts(id);
+        return { pass: o.requirements.modules.length > 0 && o.requirements.chapters.length > 0 && o.recommended.modules === 4 && o.recommended.chaptersPerModule === 5 && o.recommended.reason === 'Es la estructura que exige el documento.',
+          actual: { requisitos: o.requirements, recomendada: o.recommended } };
+      });
+
+      // ── C06 Documento sin estructura ──
+      let costos = null;
+      await tryCase(6, 'Documento sin estructura', 'Ninguna forma elegida genera excepción de estructura (el documento no la exige)', async () => {
+        const id = await newCourse('[Cierre C06] Contabilidad de Costos sin estructura');
+        const { cv } = await importDoc(id, 'microcurriculo.docx', await AF.fixture('consistent', 'docx'));
+        costos = { id, cv };
+        const o = await opts(id);
+        const pv = await preview(id, 3, 4);
+        await apply(id, cv, 'custom', { modules: 3, chaptersPerModule: 4 });
+        const card = await rec(id);
+        const structExc = card.verification.checks.filter((c) => /^Excepción al requisito del documento: .*(módulo|capítulo|estructura)/.test(c.title));
+        return { pass: o.requirements.modules.length === 0 && o.requirements.chapters.length === 0 && o.requirements.structure.length === 0 && pv.differences.length === 0 && structExc.length === 0,
+          actual: { requisitosEstructura: [o.requirements.modules, o.requirements.chapters, o.requirements.structure], diferencias: pv.differences, excepcionesEstructura: structExc.map((c) => c.title) } };
+      });
+
+      // ── C07 Documento con horas ──
+      await tryCase(7, 'Documento con horas', 'Se leen las 64 h; un formato fuera de rango (S) avisa la diferencia antes de aplicar', async () => {
+        const o = await opts(costos.id);
+        const pvS = await preview(costos.id, 3, 3, 'S');
+        const pvM = await preview(costos.id, 3, 4, 'M');
+        return { pass: JSON.stringify(o.requirements.hours) === '["64 horas"]' && pvS.differences.some((d) => d.text === 'El documento establece 64 horas y el Formato S es de 20–22 horas.') && pvM.differences.some((d) => d.kind === 'hours'),
+          actual: { horas: o.requirements.hours, S: pvS.differences.map((d) => d.text), M: pvM.differences.map((d) => d.text) } };
+      });
+
+      // ── Piloto «Atención a víctimas de violencia sexual» (DOCX real) para C08–C12 y C27–C32 ──
+      const pilotId = await newCourse('[Cierre piloto] Atención Integral en Salud a Víctimas de Violencia Sexual');
+      const pilot = await importDoc(pilotId, 'microcurriculo_atencion_victimas_violencia_sexual_2x2.docx', PILOT_DOCX);
+      const pOpts = await opts(pilotId);
+      await apply(pilotId, pilot.cv, 'cursia', { modules: pOpts.recommended.modules, chaptersPerModule: pOpts.recommended.chaptersPerModule });
+      const pCard = await useDesign(pilotId);
+      const pShape = await contentShape(pilotId);
+      ok(pilot.ex.stats.providersCalled === 0, 'Piloto: DOCX leído sin proveedores', pilot.ex.stats);
+
+      // ── C08 Documento con módulos y capítulos ──
+      await tryCase(8, 'Documento con módulos y capítulos', 'Piloto: 2 módulos × 2 capítulos de contenido detectados, recomendados y aplicados (las prácticas aparte)', async () => {
+        const st = await readStructure(pilotId);
+        const practice = st.modules.map((m) => m.chapters.filter((c) => c.kind === 'practice').length);
+        const okReq = ['Requisito del documento: 2 módulos', 'Requisito del documento: 2 capítulos de contenido por módulo', 'Requisito del documento: 1 capítulo de práctica por módulo'].every((t) => pCard.verification.checks.some((c) => c.title === t && c.severity === 'ok'));
+        return { pass: JSON.stringify(pOpts.requirements.modules) === '["2 módulos"]' && pOpts.recommended.modules === 2 && pOpts.recommended.chaptersPerModule === 2 && JSON.stringify(pShape) === '[2,2]' && practice.every((n) => n === 1) && okReq,
+          actual: { requisitos: pOpts.requirements, recomendada: pOpts.recommended, contenido: pShape, practicas: practice } };
+      });
+
+      // ── C09 Documento con videos ──
+      await tryCase(9, 'Documento con videos', 'Piloto: «2 videos por capítulo» y «8 videos» quedan como «Requisito no cubierto por Cursia» (1 video por capítulo de contenido; nunca se promete 2)', async () => {
+        const nc = pCard.verification.checks.filter((c) => /^Requisito no cubierto por Cursia: /.test(c.title)).map((c) => c.title).sort();
+        const vids = pCard.design.modules.flatMap((m) => m.chapters).filter((c) => c.kind !== 'practice' && c.videoEnabled).length;
+        const met = pCard.verification.checks.some((c) => /video/.test(c.title) && c.severity === 'ok' && /^Requisito del documento/.test(c.title));
+        return { pass: JSON.stringify(nc) === JSON.stringify(['Requisito no cubierto por Cursia: 2 videos por capítulo de contenido', 'Requisito no cubierto por Cursia: 8 videos']) && vids === 4 && !met,
+          actual: { noCubiertos: nc, videosDelDiseño: vids, algunVideoComoCumplido: met } };
+      });
+
+      // ── C10 Documento con Actividades de Aplicación ──
+      await tryCase(10, 'Documento con Actividades de Aplicación', 'Piloto: 2 Actividades de Aplicación, 1 por módulo en el capítulo de práctica, cumplidas', async () => {
+        const t = ['Requisito del documento: 2 Actividades de Aplicación', 'Requisito del documento: 1 Actividad de Aplicación por módulo, en el capítulo de práctica'];
+        const st = await readStructure(pilotId);
+        const aa = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.kind));
+        return { pass: t.every((x) => pCard.verification.checks.some((c) => c.title === x && c.severity === 'ok')) && aa.every((k) => k.length === 1 && k[0] === 'practice'), actual: { checks: t.map((x) => !!check(pCard, new RegExp('^' + x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '$'))), aaPorModulo: aa } };
+      });
+
+      // ── C11 Documento con evaluaciones ──
+      await tryCase(11, 'Documento con evaluaciones', 'Piloto: 2 evaluaciones parciales y 1 final, cumplidas', async () => {
+        const t = ['Requisito del documento: 2 evaluaciones parciales', 'Requisito del documento: 1 evaluación final'];
+        return { pass: t.every((x) => pCard.verification.checks.some((c) => c.title === x && c.severity === 'ok')) && pCard.design.counts.evaluations === 3, actual: { evaluaciones: pCard.design.counts.evaluations, checks: t.map((x) => (pCard.verification.checks.find((c) => c.title === x) || {}).severity) } };
+      });
+
+      // ── C12 Documento con requisitos imposibles para Cursia ──
+      await tryCase(12, 'Documento con requisitos imposibles para Cursia', 'La propuesta no se prepara hasta que la institución acepta la diferencia; queda registrada como «No cubierto / Excepción aceptada»', async () => {
+        const S0 = await pbState(pilotId);
+        const blocker = S0.draft.readiness.blockers.find((b) => b.code === 'exception_reason');
+        const prep0 = await api('POST', `/courses/${pilotId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        const S1 = await settle(pilotId, 'La institución acepta un video por capítulo de contenido para el piloto.');
+        const ex = S1.draft.model.exceptions.filter((e) => e.capability);
+        const texts = ex.map((e) => e.requirementText).sort();
+        return { pass: !!blocker && prep0.status === 409 && S1.draft.readiness.ready === true && JSON.stringify(texts) === JSON.stringify(['2 videos por capítulo de contenido', '8 videos']) && ex.every((e) => e.reason || e.coveredBy) && ex.every((e) => /1 video por capítulo de contenido/.test(e.appliedText)),
+          actual: { bloqueo: blocker && blocker.title, prepararSinAceptar: prep0.status, listaTrasAceptar: S1.draft.readiness.ready, excepciones: ex.map((e) => [e.requirementText, e.appliedText, !!e.reason, e.coveredBy || null]) } };
+      });
+
+      // ── C13 / C14 / C15 / C16 S, M, L y Personalizado (sobre el documento de 18 contenidos) ──
+      const costosHours0 = (await api('GET', `/courses/${costos.id}/profiles/pedagogy`)).data.profile.targetHours ?? null;
+      for (const [n, code, shape] of [[13, 'S', [3, 3]], [14, 'M', [3, 4]], [15, 'L', [4, 5]]]) {
+        await tryCase(n, code, `Formato ${code} → ${shape[0]} × ${shape[1]} capítulos de contenido; los 18 contenidos cubiertos sin duplicar; el formato queda guardado (uno solo)`, async () => {
+          await apply(costos.id, costos.cv, 'format', { modules: shape[0], chaptersPerModule: shape[1] }, { format: code });
+          const live = await contentShape(costos.id);
+          const card = await rec(costos.id);
+          const cov = check(card, /^Contenidos del documento: /);
+          const fmt = (await api('GET', `/courses/${costos.id}/format`)).data.format;
+          return { pass: JSON.stringify(live) === JSON.stringify(Array(shape[0]).fill(shape[1])) && cov && cov.title === 'Contenidos del documento: 18 de 18 en el diseño' && fmt && fmt.code === code,
+            actual: { forma: live, cobertura: cov && cov.title, formato: fmt && fmt.code } };
+        });
+      }
+      await tryCase(16, 'Personalizado', 'Personalizada 2 × 5: con un formato elegido el servidor exige quitarlo antes (409); quitarlo devuelve las horas que tenía el curso; forma exacta, 18 de 18, elección «personalizada»', async () => {
+        const pedBefore = (await api('GET', `/courses/${costos.id}/profiles/pedagogy`)).data.profile.targetHours;
+        let st0 = await readStructure(costos.id);
+        const still = await api('POST', `/courses/${costos.id}/modules/apply-academic-structure`, { expectedCounter: st0.structureVersionCounter, contextVersion: costos.cv, choice: 'custom', shape: { modules: 2, chaptersPerModule: 5 }, confirmReplace: true });
+        const clr = await api('PUT', `/courses/${costos.id}/format`, { code: null });
+        const pedAfter = (await api('GET', `/courses/${costos.id}/profiles/pedagogy`)).data.profile.targetHours;
+        await apply(costos.id, costos.cv, 'custom', { modules: 2, chaptersPerModule: 5 });
+        const hoursExc = (await rec(costos.id)).verification.checks.some((c) => /^Excepción al requisito del documento: 64 horas/.test(c.title) && /elegiste 63|elegiste 21|elegiste 42/.test(String(c.detail)));
+        if (!(still.status === 409 && /FORMAT_STILL_SET/.test(String(still.error)) && clr.status === 200 && pedBefore === 63 && (pedAfter ?? null) === costosHours0 && !hoursExc)) {
+          return { pass: false, actual: { sinQuitarFormato: [still.status, still.error], quitar: clr.status, horasConFormatoL: pedBefore, horasTrasQuitar: pedAfter, horasAntesDeLosFormatos: costosHours0, excepcionDeHorasDelFormato: hoursExc } };
+        }
+        const live = await contentShape(costos.id);
+        const card = await rec(costos.id);
+        const fmt = (await api('GET', `/courses/${costos.id}/format`)).data.format;
+        const o = await opts(costos.id);
+        return { pass: JSON.stringify(live) === '[5,5]' && check(card, /^Contenidos del documento: 18 de 18/) && !fmt && o.current.choice === 'custom',
+          actual: { forma: live, formato: fmt, eleccion: o.current.choice } };
+      });
+
+      // ── C17 Documento 4×5 → usuario 3×4 ──
+      await tryCase(17, 'Documento 4×5 → usuario 3×4', 'La diferencia se avisa antes; al aplicar: los 20 contenidos en 12 capítulos, excepción de la institución (no crítico)', async () => {
+        const pv = await preview(c45.id, 3, 4);
+        await apply(c45.id, c45.cv, 'custom', { modules: 3, chaptersPerModule: 4 });
+        const card = await rec(c45.id);
+        const exc = card.verification.checks.filter((c) => /^Excepción al requisito del documento/.test(c.title)).map((c) => c.title);
+        const crit = card.verification.checks.filter((c) => c.severity === 'critical').map((c) => c.title);
+        return { pass: pv.differences.some((d) => d.text === 'El documento establece 4 módulos y has seleccionado 3 módulos.') && pv.coverage.assigned === 20 && JSON.stringify(await contentShape(c45.id)) === '[4,4,4]'
+          && exc.some((t) => /4 módulos/.test(t)) && crit.length === 0 && check(card, /^Contenidos del documento: 20 de 20/),
+          actual: { diferencias: pv.differences.map((d) => d.text), excepciones: exc, criticos: crit } };
+      });
+
+      // ── C18 Documento 3×3 → usuario 4×3 ──
+      let c33 = null;
+      await tryCase(18, 'Documento 3×3 → usuario 4×3', 'Los 9 contenidos en 12 capítulos (3 de profundización, sin inventar contenido); excepción «3 módulos»', async () => {
+        const id = await newCourse('[Cierre C18] Logística 3 × 3');
+        const { cv } = await importDoc(id, 'logistica.txt', doc3x3());
+        c33 = { id, cv };
+        const pv = await preview(id, 4, 3);
+        await apply(id, cv, 'custom', { modules: 4, chaptersPerModule: 3 });
+        const card = await rec(id);
+        const st = await readStructure(id);
+        const prof = st.modules.flatMap((m) => m.chapters).filter((c) => /^Profundización/.test(c.title)).length;
+        return { pass: pv.coverage.total === 9 && pv.coverage.assigned === 9 && pv.coverage.duplicated === 0 && JSON.stringify(await contentShape(id)) === '[3,3,3,3]' && prof === 3
+          && card.verification.checks.some((c) => /^Excepción al requisito del documento: 3 módulos/.test(c.title)) && check(card, /^Contenidos del documento: 9 de 9/),
+          actual: { cobertura: pv.coverage, profundizacion: prof, excepciones: card.verification.checks.filter((c) => /^Excepción/.test(c.title)).map((c) => c.title) } };
+      });
+
+      // ── C19 Documento + excepción ──
+      await tryCase(19, 'Documento + excepción', 'La propuesta pide el motivo; con el motivo, queda lista y la excepción aparece con su motivo', async () => {
+        const S0 = await pbState(c45.id);
+        const need = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason').map((b) => b.title);
+        const S1 = await settle(c45.id, 'La institución organiza el curso en 3 módulos por su calendario académico.');
+        const ex = S1.draft.model.exceptions.map((e) => [e.requirementText, !!(e.reason || e.coveredBy)]);
+        return { pass: need.some((t) => /4 módulos/.test(t)) && S1.draft.readiness.blockers.every((b) => b.code !== 'exception_reason') && ex.length > 0 && ex.every((e) => e[1]),
+          actual: { pedidos: need, excepciones: ex, lista: S1.draft.readiness.ready } };
+      });
+
+      // ── C20 Documento + contenido omitido: debe bloquearse ──
+      await tryCase(20, 'Documento + contenido omitido', 'Borrar un capítulo con contenidos → «Contenido no cubierto» crítico; preparar la propuesta → 409; «Incluirlos» lo resuelve', async () => {
+        let st = await readStructure(c33.id);
+        const victim = st.modules[0].chapters.find((c) => c.kind !== 'practice' && !/^Profundización/.test(c.title));
+        await api('DELETE', `/courses/${c33.id}/modules/${st.modules[0].id}/chapters/${victim.id}`, { expectedCounter: st.structureVersionCounter });
+        const card = await rec(c33.id);
+        const cc = card.verification.checks.find((c) => c.id === 'contents');
+        const S0 = await settle(c33.id, 'La institución organiza el curso en 4 módulos.');
+        const prep = await api('POST', `/courses/${c33.id}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        st = await readStructure(c33.id);
+        const fx = await api('POST', `/courses/${c33.id}/design/fix`, { action: 'cover_contents', expectedCounter: st.structureVersionCounter });
+        const after = (await rec(c33.id)).verification.checks.find((c) => c.id === 'contents');
+        return { pass: cc.severity === 'critical' && /^Contenido no cubierto/.test(cc.title) && card.verification.blocking === true && prep.status === 409 && fx.status === 200 && after.severity === 'ok',
+          actual: { verificacion: [cc.severity, cc.title], preparar: prep.status, incluir: fx.status, despues: [after.severity, after.title] } };
+      });
+
+      // ── C21 / C22 / C23 Cambios después de aprobar: invalidan (R68) ──
+      const r68 = await newCourse('[Cierre C21-23] Contabilidad de Costos R68');
+      const r68ctx = await importDoc(r68, 'microcurriculo.docx', await AF.fixture('consistent', 'docx'));
+      await apply(r68, r68ctx.cv, 'custom', { modules: 3, chaptersPerModule: 4 });
+      await useDesign(r68);
+      const runsOf = (id, n) => `/courses/${id}/blueprints/${n}/manifest/runs`;
+      const ctxRun = { nombre: 'Contabilidad de Costos', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro', obj: 'Calcular costos', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      await tryCase(21, 'Cambio de horas después de aprobar', 'La versión aprobada queda invalidada y producir se bloquea (409)', async () => {
+        const v = await prepareApprove(r68);
+        const pv = await api('GET', `/courses/${r68}/profiles/pedagogy`);
+        const sv = await api('POST', `/courses/${r68}/profiles/pedagogy`, { data: { ...pv.data.profile, targetHours: 50 }, expectedVersion: Number(pv.data.version) });
+        const vs = await verStatus(r68, v.version);
+        const run = await api('POST', runsOf(r68, v.blueprintNumber), ctxRun);
+        return { pass: sv.status === 201 && vs.status === 'invalidated' && run.status === 409, actual: { guardarHoras: [sv.status, sv.error], version: v.version, estado: vs.status, motivo: vs.invalidationReason, diferencias: vs.invalidationDiff, producir: [run.status, run.raw && run.raw.reason] } };
+      });
+      await tryCase(22, 'Cambio de estructura después de aprobar', 'Invalida la aprobación y el servidor bloquea producir (R68); deshacer el cambio no la revive', async () => {
+        await useDesign(r68);
+        const v = await prepareApprove(r68);
+        let st = await readStructure(r68);
+        const c0 = st.modules[0].chapters[0];
+        await api('PATCH', `/courses/${r68}/modules/${st.modules[0].id}/chapters/${c0.id}`, { title: `${c0.title} (cambio)`, expectedCounter: st.structureVersionCounter });
+        const vs = await verStatus(r68, v.version);
+        const run = await api('POST', runsOf(r68, v.blueprintNumber), ctxRun);
+        st = await readStructure(r68);
+        const undo = await api('PATCH', `/courses/${r68}/modules/${st.modules[0].id}/chapters/${c0.id}`, { title: c0.title, expectedCounter: st.structureVersionCounter });
+        const vs2 = await verStatus(r68, v.version);
+        const run2 = await api('POST', runsOf(r68, v.blueprintNumber), ctxRun);
+        return { pass: vs.status === 'invalidated' && run.status === 409 && undo.status === 200 && vs2.status === 'invalidated' && run2.status === 409, actual: { estado: vs.status, producir: [run.status, run.raw && run.raw.reason], deshacer: undo.status, trasDeshacer: vs2.status, producirTrasDeshacer: run2.status } };
+      });
+      await tryCase(23, 'Cambio de resultado', 'Cambiar un resultado de aprendizaje después de aprobar invalida la aprobación', async () => {
+        const v = await prepareApprove(r68);
+        const a = (await api('GET', `/courses/${r68}/profiles/academic`)).data;
+        const outs = (a.profile.outcomes || a.profile.learningOutcomes || []).map((o, i) => ({ id: o.id, text: i === 0 ? `${o.text} Incluye costos de servicios.` : o.text }));
+        const r = await api('PUT', `/courses/${r68}/academic-context/outcomes`, { expectedVersion: Number(a.version), outcomes: outs });
+        const vs = await verStatus(r68, v.version);
+        return { pass: [200, 201].includes(r.status) && vs.status === 'invalidated', actual: { guardar: r.status, estado: vs.status, diferencias: vs.invalidationDiff } };
+      });
+
+      // ── C24 Cambio de video fijado: debe respetarse ──
+      await tryCase(24, 'Cambio de video fijado', 'Un video que la institución fija (quita) en un capítulo se respeta en la recomendación y al usar el diseño', async () => {
+        let st = await readStructure(r68);
+        const m = st.modules[0];
+        const ch = m.chapters.find((x) => x.kind !== 'practice' && x.videoEnabled);
+        const pin = await api('PATCH', `/courses/${r68}/modules/${m.id}/chapters/${ch.id}`, { videoEnabled: false, pinVideo: true, expectedCounter: st.structureVersionCounter });
+        const card = await rec(r68);
+        const inCard = card.design.modules.flatMap((x) => x.chapters).find((x) => x.id === ch.id);
+        await useDesign(r68);
+        st = await readStructure(r68);
+        const live = st.modules.flatMap((x) => x.chapters).find((x) => x.id === ch.id);
+        return { pass: pin.status === 200 && inCard && inCard.videoEnabled === false && inCard.videoPinned === true && live.videoEnabled === false, actual: { fijar: pin.status, recomendacion: inCard && [inCard.videoEnabled, inCard.videoPinned], trasUsar: live.videoEnabled } };
+      });
+
+      // ── C25 Curso existente: no romperlo ──
+      await tryCase(25, 'Curso existente', 'Un curso armado antes de este paso (sin elección) sigue igual: opciones, diseño y propuesta funcionan; su propuesta no gana filas nuevas', async () => {
+        const id = await newCourse('[Cierre C25] Curso anterior al paso Estructura');
+        const { cv } = await importDoc(id, 'microcurriculo.docx', await AF.fixture('consistent', 'docx'));
+        const st = await readStructure(id);
+        const old = await api('POST', `/courses/${id}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: cv });
+        const o = await opts(id);
+        const card = await rec(id);
+        const S0 = await pbState(id);
+        const rows = S0.draft.document.sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows).map((r) => r.label);
+        return { pass: [200, 201].includes(old.status) && o.current.choice === null && !!card.design && !('selected' in S0.draft.model.structure) && rows.includes('Organización') && !rows.includes('Diseño seleccionado'),
+          actual: { aplicar: old.status, eleccion: o.current.choice, filas: rows } };
+      });
+
+      // ── C26 «Continuar con el curso»: reconstruir el estado ──
+      await tryCase(26, '«Continuar con el curso»', 'Al volver, el servidor devuelve la misma elección, forma y propuesta (el paso «Estructura» se reconstruye)', async () => {
+        const o = await opts(costos.id);
+        const S1 = await pbState(costos.id);
+        const S2 = await pbState(costos.id);
+        const live = await contentShape(costos.id);
+        return { pass: o.current.choice === 'custom' && JSON.stringify(o.current.shape) === JSON.stringify(live) && S1.draft.modelSha256 === S2.draft.modelSha256 && S1.draft.model.structure.selected.choice === 'custom',
+          actual: { eleccion: o.current, forma: live, huellaEstable: S1.draft.modelSha256 === S2.draft.modelSha256 } };
+      });
+
+      // ── Piloto: propuesta, PDF, aprobación, Blueprint, Manifest, generación MOCK ──
+      await tryCase(27, 'Prebrief', 'Piloto: «Diseño seleccionado», 4 de 4 contenidos, excepción de videos con su motivo; sin textos técnicos', async () => {
+        const S0 = await pbState(pilotId);
+        const rows = S0.draft.document.sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows);
+        const row = (l) => (rows.find((r) => r.label === l) || {}).value || '';
+        const strs = [];
+        const walk = (x, k) => { if (typeof x === 'string') { if (!/^(t|origin|id|n|kind|where|code|ref)$/.test(k || '')) strs.push(x); } else if (Array.isArray(x)) x.forEach((v) => walk(v, k)); else if (x && typeof x === 'object') for (const kk of Object.keys(x)) walk(x[kk], kk); };
+        walk(S0.draft.document);
+        const tech = strs.filter((s) => /\b(RQ\d+|none|null|undefined|sha256|contentMap|structureOrigin|requirement:)\b/.test(s));
+        const vidEx = S0.draft.model.exceptions.filter((e) => /video/.test(e.requirementText));
+        return { pass: /2 módulos × 2 capítulos de contenido.* · Exigida por el documento$/.test(row('Diseño seleccionado')) && vidEx.length === 2 && S0.draft.model.exceptions.length === 2 && row('Contenidos del documento') === 'Los 4 contenidos del documento están en el diseño, cada uno en un capítulo.' && tech.length === 0 && vidEx.length >= 1 && S0.draft.readiness.ready,
+          actual: { diseño: row('Diseño seleccionado'), contenidos: row('Contenidos del documento'), textosTecnicos: tech.slice(0, 3), excepcionesVideo: vidEx.map((e) => [e.requirementText, e.appliedText, !!(e.reason || e.coveredBy)]) } };
+      });
+      let pVer = null;
+      await tryCase(28, 'PDF', 'Piloto: el PDF (borrador, para aprobación y aprobado) sale de la misma propuesta: diseño seleccionado, no cubierto y quién aprobó', async () => {
+        const d = await getPdf(`/courses/${pilotId}/prebrief/draft.pdf`);
+        const dt = await pdfTextOf(d.buf);
+        pVer = await prepareApprove(pilotId);
+        const a = await getPdf(`/courses/${pilotId}/prebrief/versions/${pVer.version}/pdf?variant=approved`);
+        const at = await pdfTextOf(a.buf);
+        const need = ['Diseño seleccionado', 'Exigida por el documento', 'Los 4 contenidos del documento están en el diseño', '2 videos por capítulo de contenido', '8 videos', 'Requisito no cubierto por Cursia'];
+        const i = dt.indexOf('2 videos por capítulo de contenido');
+        return { pass: d.status === 200 && /BORRADOR/i.test(dt) && need.every((t) => dt.includes(t)) && /no cubiert|excepci[oó]n aceptada|Aceptación de la institución/i.test(dt) && a.status === 200 && /Aprobado por: Validación de cierre/.test(at) && need.every((t) => at.includes(t)),
+          actual: { borrador: [d.status, need.map((t) => dt.includes(t))], aprobado: [a.status, /Aprobado por: Validación de cierre/.test(at), need.map((t) => at.includes(t))], textoVideos: i >= 0 ? dt.slice(Math.max(0, i - 120), i + 220) : null } };
+      });
+      await tryCase(29, 'Blueprint', 'Piloto: el Blueprint congelado es lo aprobado: 2 × 2 de contenido + 1 práctica por módulo, 4 videos (1 por capítulo de contenido), misma huella que la versión aprobada', async () => {
+        const [bp] = await q(`select b.snapshot_json, b.snapshot_sha256, v.blueprint_sha256 from public.course_blueprints b join public.course_prebrief_versions v on v.blueprint_id = b.id where v.course_id = $1 and v.version = $2`, [pilotId, pVer.version]);
+        const snap = typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json;
+        const kindOf = (c) => (c.kind === 'practice' ? 'practice' : 'content');
+        const shape = snap.modules.map((m) => m.chapters.filter((c) => kindOf(c) === 'content').length);
+        const practice = snap.modules.map((m) => m.chapters.filter((c) => kindOf(c) === 'practice').length);
+        const videos = snap.modules.flatMap((m) => m.chapters).filter((c) => kindOf(c) === 'content' && (c.video_enabled === true || c.videoEnabled === true)).length;
+        return { pass: JSON.stringify(shape) === '[2,2]' && JSON.stringify(practice) === '[1,1]' && videos === 4 && bp.snapshot_sha256 === bp.blueprint_sha256, actual: { contenido: shape, practicas: practice, videos, huella: bp.snapshot_sha256 === bp.blueprint_sha256 } };
+      });
+      let pRun = null;
+      await tryCase(30, 'Manifest', 'Piloto: el Manifest = Blueprint (2 módulos, 4 videos, 2 Actividades de Aplicación); la generación MOCK produce exactamente sus items', async () => {
+        const runsBase = runsOf(pilotId, pVer.blueprintNumber);
+        const ctxP = { nombre: 'Atención Integral en Salud a Víctimas de Violencia Sexual', sector: 'Salud', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro', obj: 'Atención inicial segura', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+        const st = await readStructure(pilotId);
+        llm.st.courseId = pilotId;
+        llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+        for (const m of st.modules) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+        // El botón real del piloto: costo → «Autorizar y generar» (approve-and-start con la huella del estimado), sin atajos.
+        // Política de presupuesto del curso (la del piloto: USD 60); sin política, approve-and-start falla cerrado.
+        await q(`insert into public.cost_budget_policies (scope, scope_id, version, limits, require_human_approval_for_real_spend, on_exceed, created_by)
+                 values ('course', $1, 1, $2::jsonb, true, 'BLOCK', 'e2e-cierre')`, [String(pilotId), JSON.stringify({ maxCostPerRun: 60, maxCostPerCourse: 60 })]);
+        const est = await api('POST', `${runsBase}/estimate-preview`, ctxP);
+        if (est.status !== 200) throw new Error(`estimado: ${est.status} ${est.error}`);
+        const start = await api('POST', `${runsBase}/approve-and-start`, { ...ctxP, estimateHash: est.data.estimateHash });
+        if (start.status !== 201) throw new Error(`approve-and-start: ${start.status} ${start.error}`);
+        pRun = start.data.run.id;
+        llm.st.tag = 'E22';
+        S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+        const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId: pilotId, blueprintNumber: pVer.blueprintNumber, runId: pRun }), 'E22 piloto', undefined, pRun);
+        const items = await waitItemsDone(pRun);
+        const [manRow] = await q(`select m.manifest_json as manifest from public.course_generation_manifests m join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [pRun]);
+        const Mf = typeof manRow.manifest === 'string' ? JSON.parse(manRow.manifest) : manRow.manifest;
+        const Mm = Mf.manifest || Mf;
+        const vids = Mm.items.filter((i) => /^video:/.test(i.key)).length;
+        const apps = Mm.items.filter((i) => i.type === 'application_activity').length;
+        const h5p = Mm.items.filter((i) => i.type === 'activity').length;
+        const P = await packageRun('E22', pilotId, pVer.blueprintNumber, pRun);
+        const A22 = D('modules/course-profiles/course-profiles.js');
+        results.courses.E22 = { courseId: pilotId, spec: { passing: 70, engine: 'h5p' }, assessment: { ...A22.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 }, manifestModules: Mm.modules, features: Mm.features, applications: apps,
+          reviewCardsChapterIds: ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length)),
+          modules: st.modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) })), blueprintNumber: pVer.blueprintNumber, runId: pRun, items: items.length };
+        return { pass: stt.failed === 0 && !stt.fatalError && items.every((i) => i.status === 'completed') && Mm.modules.length === 2 && vids === 4 && apps === 2 && h5p === 4 && !!start.data.run
+          && JSON.stringify(items.map((i) => i.item_key).sort()) === JSON.stringify(Mm.items.map((i) => i.key).sort()),
+          actual: { aprobarYGenerar: start.status, items: items.length, fallidos: stt.failed, modulos: Mm.modules.length, videos: vids, actividadesH5P: h5p, actividadesAplicacion: apps } };
+      });
+      await tryCase(31, 'R68 vía API', 'Piloto: cambiar el motivo de la excepción de videos después de aprobar invalida la aprobación y la API bloquea producir y estimar', async () => {
+        const key = (await pbState(pilotId)).draft.model.exceptions.find((e) => e.capability && !e.coveredBy).requirementKey;
+        await api('PUT', `/courses/${pilotId}/prebrief/exception-reasons`, { requirementKey: key, reason: 'Otro motivo: la institución prefiere un solo video por capítulo de contenido.' });
+        const vs = await verStatus(pilotId, pVer.version);
+        const runsBase = runsOf(pilotId, pVer.blueprintNumber);
+        const r1 = await api('POST', runsBase, ctxRun);
+        const r2 = await api('POST', `${runsBase}/estimate-preview`, ctxRun);
+        return { pass: vs.status === 'invalidated' && r1.status === 409 && r2.status === 409, actual: { estado: vs.status, producir: [r1.status, r1.raw && r1.raw.reason], estimar: [r2.status, r2.raw && r2.raw.reason] } };
+      });
+      await tryCase(32, 'Intento de bypass del frontend', 'El servidor bloquea: approve-and-start sin aprobación vigente, aprobar con otra huella y otro usuario sobre el curso', async () => {
+        const runsBase = runsOf(pilotId, pVer.blueprintNumber);
+        const b1 = await api('POST', `${runsBase}/approve-and-start`, { ...ctxRun, estimateHash: 'a'.repeat(64) });
+        const S0 = await pbState(pilotId);
+        const prep = await api('POST', `/courses/${pilotId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+        const b2 = await api('POST', `/courses/${pilotId}/prebrief/versions/${prep.data.version.version}/approve`, { expectedModelSha: 'f'.repeat(64), name: 'Intruso con otra huella', role: 'Coordinación académica', confirm: true });
+        const OTHER = jwt.sign({ sub: crypto.randomUUID(), email: 'e2e-cierre-otro@example.com', role: 'authenticated', aud: 'authenticated' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+        const b3 = await api('POST', `/courses/${pilotId}/prebrief/versions/${prep.data.version.version}/approve`, { expectedModelSha: prep.data.version.modelSha256, name: 'Intruso de otra cuenta', role: 'Coordinación académica', confirm: true }, OTHER);
+        const b4 = await api('POST', `/courses/${pilotId}/modules/apply-academic-structure`, { expectedCounter: 0, contextVersion: pilot.cv, choice: 'custom', shape: { modules: 9, chaptersPerModule: 9 } }, OTHER);
+        const b5 = await api('GET', `/courses/${pilotId}/design/structure-options`, undefined, OTHER);
+        return { pass: b1.status === 409 && b2.status === 409 && [403, 404].includes(b3.status) && [403, 404].includes(b4.status) && [403, 404].includes(b5.status),
+          actual: { approveAndStart: [b1.status, b1.raw && b1.raw.reason], otraHuella: b2.status, otroUsuarioAprobar: b3.status, otroUsuarioEstructura: b4.status, otroUsuarioOpciones: b5.status } };
+      });
+
+      const passN = CASES.filter((c) => c.resultado === 'PASS').length;
+      eq([CASES.length, passN], [32, 32], 'Fase 9: 32/32 casos obligatorios PASS');
+      // Sin proveedores reales: la red de la prueba solo habla con 127.0.0.1 (netguard) y el piloto usó proveedores falsos.
+      ok(pilot.ex.stats.providersCalled === 0, 'Cierre: lectura del piloto con 0 proveedores');
+    }, { fatal: false });
+
+    // ═══ E23 · Prueba del Formato M con el microcurrículo PDF REAL «Atención Integral en Salud a Víctimas de Violencia
+    // Sexual», tratado como lo entregaría un cliente (tablas con columnas que desbordan, pies de página, rangos de horas,
+    // textos cortados por el borde de la página). USD 0: lectura sin IA, proveedores falsos, se detiene ANTES de
+    // «Autorizar y generar» (solo el estimado). Mide: lectura → requisitos → Formato M → contenidos 12/12 → capacidad de
+    // video honesta (no cubierto + alternativa) → propuesta/PDF → aprobación → Blueprint/Manifest → R68 → costo.
+    if (RUN_E5) await step('v3-E23-formato-m-pdf', async () => {
+      const { PDFParse } = require('pdf-parse');
+      const pdfTextOf = async (buf) => { const p = new PDFParse({ data: new Uint8Array(buf) }); try { return (await p.getText()).text.replace(/\s+/g, ' '); } finally { await p.destroy().catch(() => {}); } };
+      const getPdf = async (p) => { const r = await fetch(BASE + p, { headers: { authorization: `Bearer ${TOKEN}` } }); return { status: r.status, buf: Buffer.from(await r.arrayBuffer()) }; };
+      const REP = { checks: [] };
+      const rec23 = (id, desc, pass, actual) => {
+        REP.checks.push({ id, descripcion: desc, resultado: pass ? 'PASS' : 'FAIL', real: actual === undefined ? null : actual });
+        ok(!!pass, `E23 ${id} ${desc}`, actual);
+        fs.writeFileSync(path.join(V3OUT, 'formato-m.json'), JSON.stringify(REP, null, 2));
+      };
+      const PDF_M = fs.readFileSync(path.join(REPO, 'scripts/fixtures/microcurriculum/microcurriculo-m-atencion-violencia-sexual.pdf'));
+      const TITLE = 'Atención Integral en Salud a Víctimas de Violencia Sexual';
+      // 1. Curso nuevo con el título provisional de «Crear» (el documento lo reemplaza).
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: 'Nuevo curso' });
+      const id = Number(cr.data.id);
+      await api('POST', `/courses/${id}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      const A = D('modules/course-profiles/course-profiles.js');
+      await api('POST', `/courses/${id}/profiles/assessment`, { data: { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 } });
+      await api('POST', `/courses/${id}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } });
+      REP.courseId = id;
+      // Lo que la pantalla «Crear» guarda como pedido del curso (país por defecto; nivel y tono que la institución confirma).
+      await api('PUT', `/courses/${id}/brief`, { pais: 'Colombia', nivel: 'Intermedio — conoce lo esencial', tono: 'cercano y claro' });
+
+      // 2. Lectura del PDF (el mismo endpoint que «Importar microcurrículo»).
+      const ex = await api('POST', `/courses/${id}/academic-context/extract`, { files: [{ name: 'Microcurriculo_M_Atencion_Integral_Victimas_Violencia_Sexual.pdf', dataBase64: PDF_M.toString('base64') }] });
+      eq(ex.status, 200, 'E23: el PDF se lee', ex.error);
+      const ctx = ex.data.draft;
+      // Los requisitos leídos valen cuando la institución usa ESTOS datos (se guarda el contexto, como «Usar estos datos»).
+      const sv = await api('POST', `/courses/${id}/profiles/academic`, { data: ctx, expectedVersion: 0 });
+      eq(sv.status, 201, 'E23: contexto guardado', sv.error);
+      const cv = sv.data.profile.version;
+      const reqView = (await api('GET', `/courses/${id}/academic-context/requirements`)).data;
+      const reqs = (reqView && reqView.items) || [];
+      REP.lectura = {
+        nombre: ctx.identity.subjectName.value, nivel: ctx.identity.educationLevel.value && ctx.identity.educationLevel.value.text,
+        publico: ctx.learner.profile.value, objetivo: ctx.identity.generalObjective.value, metodologia: ctx.methodology.value,
+        horas: { valor: ctx.hours.total.value, rango: ctx.hours.total.range || null, estado: ctx.hours.total.status },
+        resultados: ctx.outcomes.map((o) => ({ id: o.id, texto: o.text, revisar: o.review || null })),
+        competencias: ctx.competencies.map((o) => o.id),
+        unidades: ctx.units.map((u) => ({ id: u.id, titulo: u.title, horas: u.hours, contenidos: u.contents.map((c) => c.text) })),
+        evaluaciones: ctx.evaluation.map((e) => ({ instrumento: e.instrument, resultados: e.outcomeIds })),
+        conflictos: ctx.conflicts.map((c) => c.path),
+        requisitos: reqs.map((r) => ({ clave: r.key, modo: r.mode, valor: r.value, valorMax: r.valorMax ?? r.valueMax ?? null, obligacion: r.obligation, activo: r.active, cita: r.source && r.source.quote })),
+      };
+      rec23('L1', 'Lectura sin proveedores', ex.data.stats.providersCalled === 0, ex.data.stats);
+      rec23('L2', 'Nombre, nivel, público y objetivo del documento (el público completo, no el cortado de la ficha)',
+        ctx.identity.subjectName.value === TITLE && ctx.identity.educationLevel.value.level === 'university' && /escenarios asistenciales/.test(ctx.learner.profile.value || '') && !ctx.learner.profile.review && /^Fortalecer en el estudiante/.test(ctx.identity.generalObjective.value || ''),
+        { nombre: ctx.identity.subjectName.value, publico: (ctx.learner.profile.value || '').slice(0, 160), revisar: ctx.learner.profile.review || null });
+      rec23('L3', 'RA1–RA5 con su numeración original; el encabezado de la tabla no es un resultado; cada uno pide confirmar su texto cortado',
+        JSON.stringify(ctx.outcomes.map((o) => o.id)) === '["RA1","RA2","RA3","RA4","RA5"]' && /^Reconocer los conceptos/.test(ctx.outcomes[0].text) && /^Resolver situaciones/.test(ctx.outcomes[4].text) && ctx.outcomes.every((o) => !!o.review),
+        ctx.outcomes.map((o) => [o.id, o.text.slice(0, 40), !!o.review]));
+      rec23('L4', 'CO1–CO5', JSON.stringify(ctx.competencies.map((o) => o.id)) === '["CO1","CO2","CO3","CO4","CO5"]', ctx.competencies.map((o) => o.id));
+      rec23('L5', 'Metodología = enfoque pedagógico + metodología del documento (sin el pie de página)',
+        /^Aprendizaje significativo/.test(ctx.methodology.value || '') && /Cada capítulo combina/.test(ctx.methodology.value || '') && !/Página \d/.test(ctx.methodology.value || ''), (ctx.methodology.value || '').slice(0, 200));
+      rec23('L6', 'Horas 40–44 conservadas como RANGO (meta de diseño 42, nunca 44)',
+        ctx.hours.total.range && ctx.hours.total.range.min === 40 && ctx.hours.total.range.max === 44 && ctx.hours.total.value === 42, ctx.hours.total);
+      const contents = ctx.units.flatMap((u) => u.contents);
+      rec23('L7', 'Tabla de capítulos reconstruida: 3 módulos × 4 contenidos (12), con títulos completos y sin la columna de recursos',
+        ctx.units.length === 3 && ctx.units.every((u) => u.contents.length === 4) && contents.every((c) => !/videos?|H5P|\|/.test(c.text)) && contents[0].text === 'Conceptos fundamentales sobre violencia sexual y respuesta en salud' && contents[11].text === 'Resolución de situaciones clínicas simuladas y respuesta segura',
+        ctx.units.map((u) => [u.title, u.hours, u.contents.map((c) => c.text)]));
+      rec23('L8', 'Evaluaciones: 3 parciales + 1 final con sus RA', ctx.evaluation.length === 4 && JSON.stringify(ctx.evaluation.map((e) => e.outcomeIds)) === '[["RA1","RA2"],["RA3"],["RA4","RA5"],["RA1","RA2","RA3","RA4","RA5"]]', ctx.evaluation.map((e) => [e.instrument, e.outcomeIds]));
+      rec23('L9', 'Sin contradicciones falsas (pie de página, ficha cortada, enfoque + metodología)', ctx.conflicts.length === 0, ctx.conflicts);
+      // 3. Requisitos del documento: los 8 institucionales + horas, activos y obligatorios; nada inventado.
+      const R = (k) => reqs.filter((r) => r.key === k && r.active && r.obligation === 'required');
+      const want = [['target_hours@course', 'range', 40, 44], ['modules@course', 'exact', 3], ['chapters@module·each:content', 'exact', 4], ['videos@chapter·each:content', 'exact', 2], ['videos@course', 'exact', 24],
+        ['activities@course', 'exact', 12], ['activities@chapter·each:content', 'exact', 1], ['application_activities@course', 'exact', 3], ['application_activities@module·each:practice', 'exact', 1],
+        ['evaluations@course#partial', 'exact', 3], ['evaluations@course#final', 'exact', 1]];
+      const missing = want.filter(([k, mode, v, vmax]) => !R(k).some((r) => r.mode === mode && r.value === v && (vmax === undefined || r.valueMax === vmax)));
+      rec23('R1', 'Requisitos detectados: 3 módulos, 4 cap./módulo, 3×4, 40–44 h, 2 videos/cap., 24 videos, 12 H5P (1/cap.), 3 AA (1/módulo), 3 parciales, 1 final',
+        missing.length === 0 && reqs.some((r) => r.key === 'structure@structure:content' && r.active), { faltan: missing.map((m) => m[0]), total: reqs.length });
+      const bogus = reqs.filter((r) => r.active && ((r.key === 'videos@course' && r.value !== 24) || (/^videos@chapter/.test(r.key) && r.value !== 2) || /@subject:/.test(r.key)));
+      rec23('R2', 'Nada inventado: ni «varias asignaturas», ni «2 videos en el curso», ni el «1 video» de la nota de implementación', bogus.length === 0 && reqView.multiCourse !== true && ex.data.requirements.multiCourse !== true,
+        { inventados: bogus.map((r) => [r.key, r.value, r.source && r.source.quote]), varias: reqView.multiCourse });
+      rec23('R3', 'Las Actividades de Aplicación del documento van en el espacio de aplicación (capítulo de práctica)', reqs.some((r) => r.key === 'application_activities@module·each:practice' && r.active), reqs.filter((r) => r.kind === 'application_activities').map((r) => r.key));
+
+      const facts = (await api('GET', `/courses/${id}/facts`)).data;
+      rec23('F1', 'El título del curso se adopta del documento; horas como rango con meta', facts.title.value === TITLE && facts.targetHoursRange && facts.targetHoursRange.min === 40 && facts.targetHoursRange.max === 44,
+        { titulo: facts.title.value, horas: facts.targetHours, rango: facts.targetHoursRange || null });
+
+      // 4. «¿Cómo quieres estructurar tu curso?» → Formato M.
+      const o = (await api('GET', `/courses/${id}/design/structure-options`)).data;
+      REP.estructura = { documento: o.document, contenidos: o.contentsCount, requisitos: o.requirements, recomendada: o.recommended };
+      rec23('S1', 'El documento trae 12 contenidos en 3 × 4 y exige esa estructura; «Cursia recomienda» la misma',
+        o.contentsCount === 12 && o.document && JSON.stringify(o.document.shape) === '[4,4,4]' && o.recommended.modules === 3 && o.recommended.chaptersPerModule === 4, REP.estructura);
+      const pvM = (await api('POST', `/courses/${id}/design/structure-preview`, { modules: 3, chaptersPerModule: 4, format: 'M' })).data;
+      rec23('S2', 'Vista previa del Formato M: sin diferencias con el documento; 12 de 12 contenidos asignados, 0 duplicados',
+        pvM.differences.length === 0 && pvM.coverage.total === 12 && pvM.coverage.assigned === 12 && pvM.coverage.duplicated === 0, { diferencias: pvM.differences, cobertura: pvM.coverage });
+      const fr = await api('PUT', `/courses/${id}/format`, { code: 'M' });
+      let st = await readStructure(id);
+      const ap = await api('POST', `/courses/${id}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: cv, choice: 'format', shape: { modules: 3, chaptersPerModule: 4 }, confirmReplace: true });
+      st = await readStructure(id);
+      const shape = st.modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length);
+      const [meta] = await q(`select metadata -> 'contentMap' as cm, metadata -> 'structureOrigin' as so, metadata -> 'courseFormat' as f from public.courses where id = $1`, [id]);
+      const cm = typeof meta.cm === 'string' ? JSON.parse(meta.cm) : meta.cm;
+      const mapped = Object.values((cm && cm.chapters) || {}).flat();
+      const trace = st.modules.map((m) => ({ modulo: m.title, capitulos: m.chapters.filter((c) => c.kind !== 'practice').map((c) => ({ titulo: c.title, contenidos: ((cm && cm.chapters) || {})[c.id] || [] })) }));
+      REP.trazabilidad = trace;
+      rec23('S3', 'Formato M aplicado: 3 × 4 capítulos de contenido; cada contenido del documento en su capítulo (Documento → módulo → capítulo → contenido)',
+        fr.status === 200 && [200, 201].includes(ap.status) && JSON.stringify(shape) === '[4,4,4]' && mapped.length === 12 && new Set(mapped).size === 12 && trace.every((m) => m.capitulos.every((c) => c.contenidos.length === 1)),
+        { formato: [fr.status, meta.f && (typeof meta.f === 'string' ? JSON.parse(meta.f) : meta.f).code], aplicar: ap.status, forma: shape, asignados: mapped.length, unicos: new Set(mapped).size });
+
+      // 5. Diseño (Cursia recomienda + Verificación).
+      let card = (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      const pv = await api('GET', `/courses/${id}/profiles/pedagogy`);
+      // Igual que «Usar este diseño» del frontend: primero lo que decidió el docente y lo que eligió Cursia para cumplir el documento.
+      const rqa = card.requirements && card.requirements.authority;
+      if (rqa && rqa.decisions) await api('POST', `/courses/${id}/design/requirement-decisions`, { audiovisual: rqa.decisions.audiovisual, applicationActivities: rqa.decisions.applicationActivities, cursiaAudiovisual: rqa.cursiaAudiovisual || null });
+      if (card.profileChanged) await api('POST', `/courses/${id}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version });
+      await api('POST', `/courses/${id}/design/hours-origin`, { proposed: card.hours.source === 'proposed' ? card.hours.target : null });
+      if (card.verification.checks.some((c) => c.id === 'outcome_links')) { const s0 = await readStructure(id); await api('POST', `/courses/${id}/design/fix`, { action: 'link_outcomes', expectedCounter: s0.structureVersionCounter }); }
+      card = (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      st = await readStructure(id);
+      const ad = await api('POST', `/courses/${id}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+      card = (await api('POST', `/courses/${id}/design/recommendation`, {})).data;
+      st = await readStructure(id);
+      const checks = card.verification.checks.map((c) => ({ titulo: c.title, severidad: c.severity }));
+      REP.verificacion = checks;
+      REP.diseño = { horas: card.design.estimatedHours, conteos: card.design.counts, forma: st.modules.map((m) => m.chapters.map((c) => c.kind)),
+        meta: card.hours, preferencias: card.profile && card.profile.designPreferences, estado: card.design.status };
+      const sev = (t) => (card.verification.checks.find((c) => c.title === t) || {}).severity;
+      const okTitles = ['Requisito del documento: 3 módulos', 'Requisito del documento: 4 capítulos de contenido por módulo', 'Requisito del documento: 12 actividades interactivas', 'Requisito del documento: 3 Actividades de Aplicación', 'Requisito del documento: 3 evaluaciones parciales', 'Requisito del documento: 1 evaluación final'];
+      rec23('V1', 'Verificación: estructura, H5P, Actividades de Aplicación y evaluaciones cumplidas', [200, 201].includes(ad.status) && okTitles.every((t) => sev(t) === 'ok'), { aplicarDiseño: ad.status, checks });
+      const nc = card.verification.checks.filter((c) => /^Requisito no cubierto por Cursia: /.test(c.title)).map((c) => c.title).sort();
+      const vids = card.design.modules.flatMap((m) => m.chapters).filter((c) => c.kind !== 'practice' && c.videoEnabled).length;
+      rec23('V2', 'Videos: «2 videos por capítulo» y «24 videos» = «Requisito no cubierto por Cursia»; el diseño tiene 12 (1 por capítulo); nunca se promete 2',
+        ['Requisito no cubierto por Cursia: 2 videos por capítulo de contenido', 'Requisito no cubierto por Cursia: 24 videos'].every((t) => nc.includes(t)) && vids === 12 && !card.verification.checks.some((c) => /video/.test(c.title) && c.severity === 'ok' && /^Requisito del documento/.test(c.title)),
+        { noCubiertos: nc, videosDiseño: vids });
+      // Horas: el documento pide 40–44 h; con lo que fija (12 capítulos de 1 video + 1 H5P, 3 Actividades de Aplicación) la
+      // producción de Cursia equivale a menos. Honesto: «Requisito no cubierto por Cursia» con las horas reales y una
+      // alternativa; nunca «cumplido», nunca rellenar, nunca culpar a la institución por haber elegido el Formato M.
+      const hc = card.verification.checks.find((c) => /40–44 horas/.test(c.title));
+      const inRange = card.design.estimatedHours >= 40 && card.design.estimatedHours <= 44;
+      REP.horasDiseño = { estimadas: card.design.estimatedHours, check: hc && { titulo: hc.title, detalle: hc.detail, propuesta: hc.capability && hc.capability.proposal } };
+      rec23('V3', 'Horas: si el diseño no llega a 40–44 h se dice como «Requisito no cubierto por Cursia» con las horas reales y una alternativa (sin culpar a la elección del Formato M)',
+        inRange ? hc && hc.severity === 'ok' : (hc && hc.title === 'Requisito no cubierto por Cursia: 40–44 horas' && /≈ \d+(,\d)? horas de trabajo del estudiante/.test(hc.detail) && !/que armaste|que elegiste/.test(hc.detail)
+          // Agotar capacidades: Cursia ya llevó las Actividades permitidas a su máximo y ofrece la alternativa que sí llega (con números).
+          && /^Cursia ya llevó a sus niveles máximos/.test(hc.capability.proposal) && /Actividad de Aplicación de 90 min en cada uno de los 12 capítulos de contenido llevaría el curso a ≈ 4[0-4](,\d)? horas\./.test(hc.capability.proposal) && /lo decide la institución/.test(hc.capability.proposal)),
+        REP.horasDiseño);
+      // «Cursia recomienda» no contradice el documento ni el Formato M elegido: nunca «agregar módulos / capítulos».
+      const recs = card.design.recommendations || [];
+      rec23('V5', '«Cursia recomienda» no contradice el documento ni el formato (no propone agregar módulos ni capítulos)', !recs.some((r) => /agregar \d+ m[oó]dulo|cap[ií]tulos m[aá]s/i.test(r)), recs);
+      const fc = card.verification.checks.find((c) => c.id === 'format');
+      rec23('V6', 'Formato M: la estructura sí; las horas del diseño fuera de 40–44 se avisan (no se marca «cumple»)', card.design.estimatedHours >= 40 && card.design.estimatedHours <= 44 ? fc && fc.severity === 'ok' : (fc && fc.severity === 'warning' && /fuera del Formato M/.test(fc.title) && /la estructura sí es la del Formato M/.test(fc.detail || '')), fc);
+      const addMods = card.verification.checks.filter((c) => (c.fix && /add_modules/.test(c.fix.action || '')) || /hacen falta más módulos|Agregar módulos/.test(`${c.detail || ''} ${(c.fix && c.fix.label) || ''}`));
+      rec23('V7', 'Verificación no ofrece «Agregar módulos» ni otra salida que contradiga el documento o el Formato M', addMods.length === 0, addMods.map((c) => [c.title, c.detail, c.fix]));
+      const aaPractice = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.kind));
+      rec23('V4', 'Cada módulo: su Actividad de Aplicación en el capítulo de práctica (no una práctica vacía)', aaPractice.every((k) => k.length === 1 && k[0] === 'practice'), aaPractice);
+      // Agotar capacidades dentro del documento: las 3 Actividades (1 por módulo, en la práctica) en el nivel máximo (120 min).
+      const aaMin = st.modules.map((m) => m.chapters.filter((c) => c.applicationMinutes).map((c) => c.applicationMinutes));
+      rec23('V4b', 'Horas fuera de alcance: las Actividades de Aplicación que permite el documento usan el nivel máximo (120 min), sin agregar otras',
+        aaMin.every((k) => k.length === 1 && k[0] === 120) && card.design.counts.applicationActivities === 3, { aaMin, horas: card.design.estimatedHours });
+
+      // 6. Propuesta: la alternativa de Cursia para los videos; la institución la acepta (decisión explícita).
+      let S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
+      const vidBlockers = S0.draft.readiness.blockers.filter((b) => b.code === 'exception_reason');
+      REP.alternativa = S0.draft.model.exceptions.filter((e) => e.capability).map((e) => ({ requisito: e.requirementText, aplicado: e.appliedText, propuesta: e.proposal || null }));
+      // Loop 9 B (fix 2a): con ejercicios guiados > 30 % del trabajo estimado, la institución también acepta esa proporción
+      // (o elige «Ejercicios guiados: Ninguno»): su propuesta dice el porcentaje y la salida, no «Proponemos…».
+      const isGuidedShare = (e) => /^Ejercicios guiados: /.test(e.requirementText || '');
+      rec23('P1', 'La propuesta no se prepara sin la decisión de la institución sobre los videos (y sobre la proporción de ejercicios guiados si supera el 30 %), y Cursia propone una alternativa con lo que sí produce',
+        vidBlockers.length >= 1 && S0.draft.model.exceptions.filter((e) => e.capability && /video/.test(e.requirementText)).every((e) => typeof e.proposal === 'string' && /1 video/.test(e.proposal) && /presentaci/i.test(e.proposal))
+          && S0.draft.model.exceptions.filter((e) => e.capability && !isGuidedShare(e)).every((e) => typeof e.proposal === 'string' && /^(Proponemos|Cursia ya llevó)/.test(e.proposal))
+          && S0.draft.model.exceptions.filter((e) => e.capability && isGuidedShare(e)).every((e) => typeof e.proposal === 'string'
+            && /^Aceptar que \d+ % del trabajo estimado del estudiante sean ejercicios guiados/.test(e.proposal) && /Ninguno/.test(e.proposal)
+            && /de trabajo estimado del estudiante \(modelo de tiempo de Cursia\), (3[1-9]|[4-9]\d) %$/.test(e.requirementText)),
+        REP.alternativa);
+      // Lo mismo que envía «Usar la alternativa de Cursia» en la interfaz (la sugerencia del bloqueo), que cabe en el motivo.
+      rec23('P1b', 'Cada «Usar la alternativa de Cursia» cabe en el motivo (≤ 500 caracteres) y el de horas declara la carga real',
+        vidBlockers.every((b) => typeof b.suggestion === 'string' && b.suggestion.length <= 500)
+          && vidBlockers.filter((b) => /^target_hours@/.test(b.ref)).every((b) => /^Se acepta declarar la carga real que estima Cursia para 40–44 horas: \d+(,\d)? horas/.test(b.suggestion)),
+        vidBlockers.map((b) => [b.ref, b.suggestion && b.suggestion.length, b.suggestion]));
+      for (const b of vidBlockers) {
+        const put = await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: b.suggestion });
+        if (![200, 201].includes(put.status)) throw new Error(`motivo de ${b.ref}: ${put.status} ${put.error}`);
+      }
+      S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${id}/prebrief/confirmations`, { confirmKey: b.ref });
+      S0 = (await api('GET', `/courses/${id}/prebrief`)).data;
+      const rows = S0.draft.document.sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows);
+      const row = (l) => (rows.find((r) => r.label === l) || {}).value || '';
+      const strs = [];
+      const walk = (x, k) => { if (typeof x === 'string') { if (!/^(t|origin|id|n|kind|where|code|ref)$/.test(k || '')) strs.push(x); } else if (Array.isArray(x)) x.forEach((v) => walk(v, k)); else if (x && typeof x === 'object') for (const kk of Object.keys(x)) walk(x[kk], kk); };
+      walk(S0.draft.document);
+      const tech = strs.filter((s) => /\b(RQ\d+|none|null|undefined|NaN|sha256|contentMap|structureOrigin|requirement:|@course|@chapter)\b/.test(s));
+      REP.prebrief = { listo: S0.draft.readiness.ready, bloqueos: S0.draft.readiness.blockers, diseño: row('Diseño seleccionado'), contenidos: row('Contenidos del documento'), excepciones: S0.draft.model.exceptions.map((e) => [e.requirementText, e.appliedText, e.reason]) };
+      rec23('P2', 'Prebrief: Formato M elegido por la institución, 12 de 12 contenidos, excepción de videos con su motivo, sin textos técnicos',
+        S0.draft.readiness.ready && /Formato M elegido por la institución/.test(row('Diseño seleccionado')) && /3 módulos × 4 capítulos de contenido/.test(row('Diseño seleccionado')) && /12 contenidos del documento/.test(row('Contenidos del documento')) && tech.length === 0 && S0.draft.model.course.title === TITLE,
+        { ...REP.prebrief, textosTecnicos: tech.slice(0, 5) });
+      const d = await getPdf(`/courses/${id}/prebrief/draft.pdf`);
+      const dt = await pdfTextOf(d.buf);
+      const need = [TITLE, 'Formato M', 'Diseño seleccionado', '2 videos por capítulo de contenido', '24 videos', 'Requisito no cubierto por Cursia', 'RA1', 'RA5', '40–44'];
+      REP.pdf = { status: d.status, bytes: d.buf.length, contiene: Object.fromEntries(need.map((t) => [t, dt.includes(t)])) };
+      fs.writeFileSync(path.join(V3OUT, 'formato-m-prebrief-borrador.pdf'), d.buf);
+      rec23('P3', 'PDF del Prebrief: nombre, Formato M, requisitos, «Requisito no cubierto por Cursia», RA y rango de horas; sin textos técnicos',
+        d.status === 200 && need.every((t) => dt.includes(t)) && !/\b(RQ\d+|undefined|null|NaN|none)\b/.test(dt) && !/RA\d \| /.test(dt), REP.pdf);
+
+      // 7. Aprobación de prueba → Blueprint → Manifest.
+      const prep = await api('POST', `/courses/${id}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      const ver = prep.data.version;
+      const man = await api('POST', `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest`);
+      const apv = await api('POST', `/courses/${id}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Prueba Formato M', role: 'Coordinación académica', confirm: true });
+      const a = await getPdf(`/courses/${id}/prebrief/versions/${ver.version}/pdf?variant=approved`);
+      fs.writeFileSync(path.join(V3OUT, 'formato-m-prebrief-aprobado.pdf'), a.buf);
+      rec23('A1', 'Aprobación de prueba: versión aprobada, PDF aprobado con quién aprobó', [200, 201].includes(prep.status) && [200, 201].includes(apv.status) && a.status === 200 && /Aprobado por: Prueba Formato M/.test(await pdfTextOf(a.buf)), { preparar: prep.status, aprobar: apv.status, version: ver.version });
+      const [bp] = await q(`select b.snapshot_json, b.snapshot_sha256, v.blueprint_sha256, v.model_json from public.course_blueprints b join public.course_prebrief_versions v on v.blueprint_id = b.id where v.course_id = $1 and v.version = $2`, [id, ver.version]);
+      const snap = typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json;
+      const kindOf = (c) => (c.kind === 'practice' ? 'practice' : 'content');
+      const bShape = snap.modules.map((m) => m.chapters.filter((c) => kindOf(c) === 'content').length);
+      const bVideos = snap.modules.flatMap((m) => m.chapters).filter((c) => kindOf(c) === 'content' && (c.video_enabled === true || c.videoEnabled === true)).length;
+      const bTitles = snap.modules.flatMap((m) => m.chapters).filter((c) => kindOf(c) === 'content').map((c) => c.title);
+      REP.blueprint = { forma: bShape, videos: bVideos, titulos: bTitles, huellaIgual: bp.snapshot_sha256 === bp.blueprint_sha256 };
+      rec23('B1', 'Blueprint = lo aprobado: 3 × 4 de contenido, 12 videos (1 por capítulo), los 12 títulos del documento, misma huella',
+        JSON.stringify(bShape) === '[4,4,4]' && bVideos === 12 && bp.snapshot_sha256 === bp.blueprint_sha256 && contents.every((c) => bTitles.includes(c.text)), REP.blueprint);
+      const mf = (await api('GET', `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest`)).data;
+      const Mm = (mf && (mf.manifest || mf)) || {};
+      const items = Mm.items || [];
+      REP.manifest = { construir: man.status, modulos: (Mm.modules || []).length, videos: items.filter((i) => /^video:/.test(i.key)).length, h5p: items.filter((i) => i.type === 'activity').length,
+        aa: items.filter((i) => i.type === 'application_activity').length, examenes: items.filter((i) => /exam/.test(i.type || '')).map((i) => i.type) };
+      rec23('M1', 'Manifest = Blueprint: 3 módulos, 12 videos, 12 H5P, 3 Actividades de Aplicación, exámenes de módulo + final',
+        [200, 201].includes(man.status) && REP.manifest.modulos === 3 && REP.manifest.videos === 12 && REP.manifest.h5p === 12 && REP.manifest.aa === 3, REP.manifest);
+
+      // 8. Costo (solo estimado) — sin «Autorizar y generar».
+      const runsBase = `/courses/${id}/blueprints/${ver.blueprintNumber}/manifest/runs`;
+      const ctxP = { nombre: TITLE, sector: 'Salud', pais: 'Colombia', contexto: 'Universitario', nivel: 'Intermedio', tono: 'cercano y claro', obj: 'Atención inicial segura', scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const est = await api('POST', `${runsBase}/estimate-preview`, ctxP);
+      REP.costo = est.status === 200 ? { crudo: JSON.stringify(est.data).slice(0, 1500) } : { error: [est.status, est.error] };
+      rec23('C1', 'Costo estimado y máximo calculados sin ejecutar nada', est.status === 200, REP.costo);
+      const runs0 = await q(`select count(*)::int n from public.production_jobs where (input_payload->>'courseId')::int = $1`, [id]);
+      rec23('C2', 'Ninguna generación iniciada (0 runs)', runs0[0].n === 0, runs0[0]);
+
+      // 9. R68: cada cambio relevante después de aprobar invalida la aprobación y el servidor bloquea producir.
+      const verStatus = async (v) => ((await api('GET', `/courses/${id}/prebrief`)).data.versions || []).find((x) => x.version === v);
+      const reapprove = async () => {
+        let S = (await api('GET', `/courses/${id}/prebrief`)).data;
+        for (const b of S.draft.readiness.blockers.filter((x) => x.code === 'exception_reason')) await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: 'La institución acepta la alternativa propuesta por Cursia.' });
+        S = (await api('GET', `/courses/${id}/prebrief`)).data;
+        for (const b of S.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${id}/prebrief/confirmations`, { confirmKey: b.ref });
+        S = (await api('GET', `/courses/${id}/prebrief`)).data;
+        const cur = (S.versions || []).find((x) => x.status === 'approved' && x.modelSha256 === S.draft.modelSha256);
+        if (cur) return cur;
+        const p2 = await api('POST', `/courses/${id}/prebrief/versions`, { expectedModelSha: S.draft.modelSha256 });
+        if (![200, 201].includes(p2.status)) throw new Error(`preparar: ${p2.status} ${p2.error} ${JSON.stringify(S.draft.readiness.blockers).slice(0, 300)}`);
+        await api('POST', `/courses/${id}/blueprints/${p2.data.version.blueprintNumber}/manifest`);
+        const a2 = await api('POST', `/courses/${id}/prebrief/versions/${p2.data.version.version}/approve`, { expectedModelSha: p2.data.version.modelSha256, name: 'Prueba Formato M', role: 'Coordinación académica', confirm: true });
+        if (![200, 201].includes(a2.status)) throw new Error(`aprobar: ${a2.status} ${a2.error}`);
+        return p2.data.version;
+      };
+      const blocked = async (v) => {
+        const r1 = await api('POST', `/courses/${id}/blueprints/${v.blueprintNumber}/manifest/runs`, ctxP);
+        const r2 = await api('POST', `/courses/${id}/blueprints/${v.blueprintNumber}/manifest/runs/estimate-preview`, ctxP);
+        return [r1.status, r2.status];
+      };
+      REP.r68 = [];
+      const r68 = async (label, change, undo) => {
+        const v = await reapprove();
+        const before = (await verStatus(v.version)).status;
+        const cs = await change();
+        const vs = await verStatus(v.version);
+        const b = await blocked(v);
+        if (undo) await undo();
+        const res = { cambio: label, antes: before, guardar: cs, despues: vs.status, producirYEstimar: b };
+        REP.r68.push(res);
+        return before === 'approved' && vs.status === 'invalidated' && b.every((s) => s === 409);
+      };
+      const sOf = async () => readStructure(id);
+      const r68ok = [];
+      r68ok.push(await r68('estructura (título de un capítulo)', async () => { const s1 = await sOf(); const ch = s1.modules[0].chapters[0]; return (await api('PATCH', `/courses/${id}/modules/${s1.modules[0].id}/chapters/${ch.id}`, { title: `${ch.title} (cambio)`, expectedCounter: s1.structureVersionCounter })).status; },
+        async () => { const s1 = await sOf(); const ch = s1.modules[0].chapters[0]; await api('PATCH', `/courses/${id}/modules/${s1.modules[0].id}/chapters/${ch.id}`, { title: ch.title.replace(/ \(cambio\)$/, ''), expectedCounter: s1.structureVersionCounter }); }));
+      r68ok.push(await r68('horas', async () => { const p0 = await api('GET', `/courses/${id}/profiles/pedagogy`); return (await api('POST', `/courses/${id}/profiles/pedagogy`, { data: { ...p0.data.profile, targetHours: 43 }, expectedVersion: Number(p0.data.version) })).status; },
+        async () => { const p0 = await api('GET', `/courses/${id}/profiles/pedagogy`); await api('POST', `/courses/${id}/profiles/pedagogy`, { data: { ...p0.data.profile, targetHours: 42 }, expectedVersion: Number(p0.data.version) }); }));
+      r68ok.push(await r68('video de un capítulo', async () => { const s1 = await sOf(); const ch = s1.modules[1].chapters.find((c) => c.kind !== 'practice' && c.videoEnabled); return (await api('PATCH', `/courses/${id}/modules/${s1.modules[1].id}/chapters/${ch.id}`, { videoEnabled: false, pinVideo: true, expectedCounter: s1.structureVersionCounter })).status; },
+        async () => { const s1 = await sOf(); const ch = s1.modules[1].chapters.find((c) => c.kind !== 'practice' && !c.videoEnabled); await api('PATCH', `/courses/${id}/modules/${s1.modules[1].id}/chapters/${ch.id}`, { videoEnabled: true, pinVideo: false, expectedCounter: s1.structureVersionCounter }); }));
+      r68ok.push(await r68('resultado de aprendizaje', async () => { const ac = (await api('GET', `/courses/${id}/profiles/academic`)).data; const outs = ac.profile.outcomes.map((x, i) => ({ id: x.id, text: i === 0 ? `${x.text} (ajuste)` : x.text })); return (await api('PUT', `/courses/${id}/academic-context/outcomes`, { expectedVersion: Number(ac.version), outcomes: outs })).status; }));
+      r68ok.push(await r68('motivo de la excepción de videos', async () => { const k = (await api('GET', `/courses/${id}/prebrief`)).data.draft.model.exceptions.find((e) => e.capability && !e.coveredBy).requirementKey; return (await api('PUT', `/courses/${id}/prebrief/exception-reasons`, { requirementKey: k, reason: 'Otro motivo: un solo video por capítulo sin recurso complementario.' })).status; }));
+      r68ok.push(await r68('nombre del curso', async () => (await api('PUT', `/courses/${id}/brief`, { nombre: `${TITLE} (v2)`, pais: 'Colombia', nivel: 'Intermedio — conoce lo esencial', tono: 'cercano y claro' })).status));
+      r68ok.push(await r68('formato (M → L)', async () => (await api('PUT', `/courses/${id}/format`, { code: 'L' })).status,
+        async () => { await api('PUT', `/courses/${id}/format`, { code: null }); await api('PUT', `/courses/${id}/format`, { code: 'M' }); }));
+      rec23('R68', 'R68: estructura, horas, video, resultado, excepción, nombre y formato invalidan la aprobación y el servidor bloquea producir y estimar (409)', r68ok.every(Boolean), REP.r68);
+      REP.casosPass = REP.checks.filter((c) => c.resultado === 'PASS').length;
+      REP.casosTotal = REP.checks.length;
+      fs.writeFileSync(path.join(V3OUT, 'formato-m.json'), JSON.stringify(REP, null, 2));
+    }, { fatal: false });
+
+    // ═══ Fase 2/3 · E21 — «¿Cómo quieres estructurar tu curso?» + redistribución segura por HTTP real (USD 0, proveedores
+    // FALSOS): documento de 5 unidades (18 contenidos) → forma personalizada 3 × 4 → cada contenido en un solo capítulo
+    // (trazabilidad) → borrar un capítulo = «Contenido no cubierto» (crítico, bloquea) → «Incluirlos» → diseño → propuesta
+    // → aprobación → Blueprint/Manifest = lo aprobado → generación MOCK → empaque → Moodle → R68 bloquea un cambio posterior.
+    if (RUN_E5) await step('v3-E21-estructura-redistribucion', async () => {
+      const T = (label) => `E21: ${label}`;
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const title = '[E2E Estructura E21] Contabilidad de Costos 3 × 4';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, T('curso dinámico creado'), { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos', tono: 'cercano y claro' };
+      ok((await api('PUT', `/courses/${courseId}/brief`, brief)).status === 200, T('pedido guardado'));
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0, T('documento leído (0 proveedores)'), { s: ex.status, e: ex.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201, T('contexto académico guardado'), { s: sv.status, e: sv.error });
+      const contextVersion = sv.data.profile.version;
+      const A = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, T('perfil de evaluación'));
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, T('perfil de presentación'));
+
+      // Paso «Estructura»: lo que encontró Cursia, lo que recomienda y los formatos (solo lectura).
+      const op = await api('GET', `/courses/${courseId}/design/structure-options`);
+      ok(op.status === 200 && op.data.providersCalled === 0 && op.data.hasDocumentContents && op.data.contentsCount === 18, T('opciones de estructura (18 contenidos del documento)'), { s: op.status, e: op.error });
+      eq([op.data.document.shape, op.data.recommended.modules, op.data.recommended.chaptersPerModule, op.data.formats.map((f) => `${f.code}:${f.modules}x${f.chaptersPerModule}`)],
+        [[4, 4, 4, 3, 3], 5, 3, ['S:3x3', 'M:3x4', 'L:4x5']], T('documento 5 unidades; Cursia recomienda un módulo por unidad (sin inventar capítulos); S/M/L son alternativas'));
+      const pv1 = await api('POST', `/courses/${courseId}/design/structure-preview`, { modules: 3, chaptersPerModule: 4 });
+      ok(pv1.status === 200 && pv1.data.differences.length === 0 && pv1.data.coverage.total === 18 && pv1.data.coverage.assigned === 18 && pv1.data.coverage.duplicated === 0 && pv1.data.plan.length === 3 && pv1.data.plan.every((m) => m.chapters.length === 4),
+        T('vista previa 3 × 4: los 18 contenidos en 12 capítulos, sin duplicados; sin diferencias (el documento no exige una forma)'), pv1.data);
+      const pvS = await api('POST', `/courses/${courseId}/design/structure-preview`, { modules: 3, chaptersPerModule: 3, format: 'S' });
+      eq(pvS.data.differences.map((d) => d.text), ['El documento establece 64 horas y el Formato S es de 20–22 horas.'], T('el Formato S se aparta de las horas del documento: se dice antes de elegir'));
+      const badPv = await api('POST', `/courses/${courseId}/design/structure-preview`, { modules: 0, chaptersPerModule: 4 });
+      ok(badPv.status === 400, T('forma inválida → 400'), badPv.status);
+
+      // «Usar esta estructura» (personalizada 3 × 4): redistribución con trazabilidad.
+      let st = await readStructure(courseId);
+      const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, shape: { modules: 3, chaptersPerModule: 4 }, choice: 'custom' });
+      ok([200, 201].includes(aa.status) && aa.data.replaced.choice === 'custom' && aa.data.replaced.notes.some((t) => /ninguno se pierde ni se repite/.test(t)), T('estructura personalizada aplicada (con su nota de cobertura)'), { s: aa.status, e: aa.error, r: aa.data && aa.data.replaced });
+      st = await readStructure(courseId);
+      eq(st.modules.map((m) => m.chapters.length), [4, 4, 4], T('3 módulos × 4 capítulos'));
+      const [meta] = await q(`select metadata -> 'contentMap' as cm, metadata -> 'structureOrigin' as so from public.courses where id = $1`, [courseId]);
+      const cm = typeof meta.cm === 'string' ? JSON.parse(meta.cm) : meta.cm;
+      const so = typeof meta.so === 'string' ? JSON.parse(meta.so) : meta.so;
+      const liveIds = new Set(st.modules.flatMap((m) => m.chapters.map((c) => c.id)));
+      const mapped = Object.values(cm.chapters).flat();
+      ok(cm.contextVersion === contextVersion && Object.keys(cm.chapters).every((id) => liveIds.has(id)) && mapped.length === 18 && new Set(mapped).size === 18 && so.choice === 'custom',
+        T('trazabilidad guardada: cada uno de los 18 contenidos → un capítulo vivo; elección «personalizada» en el origen'), { cm, so });
+      let rec = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      const contentsCheck = (r) => r.data.verification.checks.find((c) => c.id === 'contents');
+      eq([contentsCheck(rec).severity, contentsCheck(rec).title], ['ok', 'Contenidos del documento: 18 de 18 en el diseño'], T('verificación: 18 de 18 contenidos'));
+
+      // Borrar un capítulo en el editor → sus contenidos quedan sin cubrir: crítico (nunca en silencio) y la propuesta no se prepara.
+      st = await readStructure(courseId);
+      const victim = st.modules[1].chapters[1];
+      const del = await api('DELETE', `/courses/${courseId}/modules/${st.modules[1].id}/chapters/${victim.id}`, { expectedCounter: st.structureVersionCounter });
+      ok([200, 204].includes(del.status), T('capítulo borrado en el editor'), { s: del.status, e: del.error });
+      rec = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      const cc = contentsCheck(rec);
+      ok(cc.severity === 'critical' && /^Contenido no cubierto: /.test(cc.title) && cc.fix && cc.fix.action === 'cover_contents' && rec.data.verification.blocking === true,
+        T('«Contenido no cubierto» (crítico, bloquea) con «Incluirlos en un capítulo»'), cc);
+      const pb0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(pb0.draft.readiness.blockers.some((b) => b.code === 'critical' && /Contenido no cubierto/.test(b.title)), T('la propuesta no se puede preparar con contenido sin cubrir'), pb0.draft.readiness.blockers.map((b) => b.title));
+      st = await readStructure(courseId);
+      const fx = await api('POST', `/courses/${courseId}/design/fix`, { action: 'cover_contents', expectedCounter: st.structureVersionCounter });
+      ok(fx.status === 200 && fx.data.coveredContents >= 1, T('«Incluirlos en un capítulo»: los contenidos vuelven a un capítulo vecino'), { s: fx.status, d: fx.data });
+      const stale = await api('POST', `/courses/${courseId}/design/fix`, { action: 'cover_contents', expectedCounter: st.structureVersionCounter });
+      ok(stale.status === 409, T('con un contador viejo → 409 (concurrencia)'), stale.status);
+      rec = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      eq(contentsCheck(rec).severity, 'ok', T('cobertura completa otra vez'));
+
+      // «Cursia recomienda» dentro de la forma elegida → «Usar este diseño» (igual que el cliente).
+      const card = rec.data;
+      const pvp = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      if (card.profileChanged) ok((await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pvp.data.version })).status === 201, T('perfil del diseño guardado'));
+      await api('POST', `/courses/${courseId}/design/hours-origin`, { proposed: card.hours.source === 'proposed' ? card.hours.target : null });
+      if (card.verification.checks.some((c) => c.id === 'outcome_links')) {
+        st = await readStructure(courseId);
+        await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+      }
+      const card2 = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+      st = await readStructure(courseId);
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card2.design.proposalSha256 });
+      ok([200, 201].includes(ap.status), T('diseño aplicado'), { s: ap.status, e: ap.error });
+      st = await readStructure(courseId);
+      eq(st.modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length), [4, 3, 4], T('la forma elegida se conserva (Cursia no agrega ni quita capítulos de contenido)'));
+      const card3 = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+      const pend = (card3.design.changes || []).map((c) => `${c.type}: ${c.detail}`);
+      ok(pend.length === 0, T('el diseño aplicado es un punto fijo (sin cambios pendientes)'), { pend, status: card3.design.status || (card3.hours && card3.hours.status), proposed: (card3.design.modules || []).flatMap((m) => m.chapters.filter((c) => c.proposed).map((c) => c.title)) });
+
+      // Propuesta → aprobación (motivos de excepción y confirmaciones si las hay).
+      let S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'exception_reason')) await api('PUT', `/courses/${courseId}/prebrief/exception-reasons`, { requirementKey: b.ref, reason: 'La institución acepta esta diferencia para la prueba E21.' });
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      for (const b of S0.draft.readiness.blockers.filter((x) => x.code === 'doubtful_data')) await api('POST', `/courses/${courseId}/prebrief/confirmations`, { confirmKey: b.ref });
+      S0 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(S0.draft.readiness.ready, T('propuesta lista para preparar'), S0.draft.readiness.blockers);
+      const rows = S0.draft.document.sections.find((x) => x.id === 'structure').blocks.filter((b) => b.t === 'kv').flatMap((b) => b.rows);
+      const row = (l) => (rows.find((r) => r.label === l) || {}).value || '';
+      eq([S0.draft.model.structure.selected, S0.draft.model.structure.contents], [{ choice: 'custom', label: 'Elegida por la institución' }, { total: 18, covered: 18 }], T('modelo: forma elegida por la institución; 18 de 18 contenidos'));
+      ok(/^3 módulos · 11 capítulos de contenido.* · Elegida por la institución$/.test(row('Diseño seleccionado')), T('propuesta: «Diseño seleccionado … · Elegida por la institución»'), row('Diseño seleccionado'));
+      eq(row('Contenidos del documento'), 'Los 18 contenidos del documento están en el diseño, cada uno en un capítulo.', T('propuesta: los 18 contenidos del documento están en el diseño'));
+      ok(!/contentMap|structureOrigin|custom|undefined|null/.test(JSON.stringify(rows)), T('sin texto técnico en la propuesta'));
+      const prep = await api('POST', `/courses/${courseId}/prebrief/versions`, { expectedModelSha: S0.draft.modelSha256 });
+      ok(prep.status === 201, T('propuesta preparada'), { s: prep.status, e: prep.error });
+      const ver = prep.data.version;
+      await api('POST', `/courses/${courseId}/blueprints/${ver.blueprintNumber}/manifest`);
+      const apv = await api('POST', `/courses/${courseId}/prebrief/versions/${ver.version}/approve`, { expectedModelSha: ver.modelSha256, name: 'Coordinación Académica E21', role: 'Directora académica', confirm: true });
+      ok(apv.status === 200 || apv.status === 201, T('propuesta aprobada'), { s: apv.status, e: apv.error });
+      const n = ver.blueprintNumber;
+      const [bp] = await q(`select snapshot_json from public.course_blueprints where course_id = $1 and blueprint_number = $2`, [courseId, n]);
+      const snap = typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json;
+      eq(snap.modules.map((m) => m.chapters.filter((c) => c.kind !== 'practice').length), [4, 3, 4], T('Blueprint = la forma aprobada'));
+
+      // Generación MOCK sobre lo aprobado → empaque → Moodle.
+      const runsBase = `/courses/${courseId}/blueprints/${n}/manifest/runs`;
+      const ctxRun = { nombre: brief.nombre, sector: brief.sector, pais: brief.pais, contexto: brief.contexto, nivel: brief.nivel, tono: 'cercano y claro', obj: brief.obj, scormTemplateIds: S.templates, videoMode: 'real', providerModes: { presentation: 'mock', audio: 'mock' } };
+      llm.st.courseId = courseId;
+      llm.st.chapterByTitle.clear(); llm.st.moduleByTitle.clear(); llm.st.moduleOfChapter.clear();
+      for (const m of st.modules) { llm.st.moduleByTitle.set(m.title, m.id); for (const x of m.chapters) { llm.st.chapterByTitle.set(x.title, x.id); llm.st.moduleOfChapter.set(x.id, m.id); } }
+      let start = await api('POST', runsBase, ctxRun);
+      const estM = /estimateId=([0-9a-f-]{36})/.exec(String(start.error || ''));
+      if (start.status === 409 && estM) {
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E21: autorización (proveedores FALSOS locales)')`, [courseId, estM[1]]);
+        start = await api('POST', runsBase, ctxRun);
+      }
+      ok(start.status === 201, T('run MOCK sobre la versión aprobada'), { s: start.status, e: start.error });
+      if (start.status !== 201) throw new Error(`E21: run no creado: ${start.status} ${start.error}`);
+      const runId = start.data.run.id;
+      llm.st.tag = 'E21';
+      S.front.DYN_EXAM_BANK_MODE_ENABLED = false;
+      const stt = await waitRunTerminal(S.front.dynExecutorStart({ courseId, blueprintNumber: n, runId }), 'E21 run', undefined, runId);
+      const items = await waitItemsDone(runId);
+      ok(stt.failed === 0 && !stt.fatalError && items.every((i) => i.status === 'completed'), T(`generación MOCK completa (${items.length} items, USD 0)`), items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
+      const [manRow] = await q(`select m.manifest_json as manifest from public.course_generation_manifests m join public.production_jobs j on (j.input_payload->>'manifestId')::int = m.id where j.id = $1`, [runId]);
+      const Mf = typeof manRow.manifest === 'string' ? JSON.parse(manRow.manifest) : manRow.manifest;
+      const Mm = Mf.manifest || Mf;
+      eq(Mm.modules.length, 3, T('Manifest = Blueprint (3 módulos)'));
+      eq(items.map((i) => i.item_key).sort(), Mm.items.map((i) => i.key).sort(), T('items generados = items del Manifest'));
+      const P = await packageRun('E21', courseId, n, runId);
+      results.courses.E21 = { courseId, spec: { passing: 70, engine: 'h5p' }, assessment, manifestModules: Mm.modules, features: Mm.features, applications: Mm.items.filter((i) => i.type === 'application_activity').length,
+        reviewCardsChapterIds: ((P.job.output_summary || {}).h5pPackages || []).filter((p) => /^review_cards:/.test(p.itemKey)).map((p) => p.itemKey.slice('review_cards:'.length)),
+        modules: st.modules.map((m) => ({ id: m.id, title: m.title, chapters: m.chapters.map((x) => ({ id: x.id, title: x.title })) })), blueprintNumber: n, runId, items: items.length };
+
+      // R68: un cambio de estructura después de aprobar invalida la aprobación y bloquea producir (también por la API).
+      st = await readStructure(courseId);
+      const ch0 = st.modules[0].chapters[0];
+      await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${ch0.id}`, { title: `${ch0.title} (cambio)`, expectedCounter: st.structureVersionCounter });
+      const blocked = await api('POST', runsBase, ctxRun);
+      const BLOCK = ['prebrief_stale', 'structure_changed', 'pending_changes', 'blueprint_not_current'];
+      ok(blocked.status === 409 && blocked.raw && BLOCK.includes(blocked.raw.reason), T('R68: cambio posterior → producir bloqueado por el servidor (409)'), { s: blocked.status, e: blocked.error, reason: blocked.raw && blocked.raw.reason });
+      const blockedEst = await api('POST', `${runsBase}/estimate-preview`, ctxRun);
+      ok(blockedEst.status === 409 && blockedEst.raw && BLOCK.includes(blockedEst.raw.reason), T('R68: tampoco el costo por la API directa'), { s: blockedEst.status, reason: blockedEst.raw && blockedEst.raw.reason });
+      const S2 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      const v1 = (S2.versions || []).find((v) => v.version === ver.version);
+      ok(v1 && v1.status === 'invalidated', T('la aprobación quedó invalidada'), v1 && v1.status);
+      // Deshacer el cambio no revive la versión invalidada (Fase 16).
+      st = await readStructure(courseId);
+      await api('PATCH', `/courses/${courseId}/modules/${st.modules[0].id}/chapters/${ch0.id}`, { title: ch0.title, expectedCounter: st.structureVersionCounter });
+      const S3 = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok((S3.versions || []).find((v) => v.version === ver.version).status === 'invalidated' && !(S3.versions || []).some((v) => v.status === 'approved'), T('deshacer el cambio NO revive la aprobación invalidada'), (S3.versions || []).map((v) => [v.version, v.status]));
+      const OTHER = jwt.sign({ sub: crypto.randomUUID(), email: 'e2e-otro21@example.com', role: 'authenticated', aud: 'authenticated' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+      const o1 = await api('GET', `/courses/${courseId}/design/structure-options`, undefined, OTHER);
+      const o2 = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: 0, contextVersion, shape: { modules: 2, chaptersPerModule: 2 }, choice: 'custom' }, OTHER);
+      ok([403, 404].includes(o1.status) && [403, 404].includes(o2.status), T('otro usuario: ni ver las opciones ni cambiar la estructura (403/404)'), [o1.status, o2.status]);
+    }, { fatal: false });
+
+    // ═══ Fase 2.1 · E21b — documento que EXIGE 4 × 5 → la institución elige 3 × 4: la diferencia se dice antes, queda como
+    // «Excepción al requisito del documento» con motivo obligatorio; volver a «según el documento» no deja excepción.
+    if (RUN_E5) await step('v3-E21b-documento-vs-diseno', async () => {
+      const T = (label) => `E21b: ${label}`;
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title: '[E2E E21b] Seguridad industrial 4 × 5' });
+      const courseId = Number(cr.data.id);
+      await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      // Documento con sección de contenidos por unidad (lo que el extractor reconoce) y estructura obligatoria 4 × 5.
+      const temas = ['Peligros', 'Riesgos', 'Controles', 'Incidentes'];
+      const lines = ['MICROCURRÍCULO', 'Asignatura: Seguridad industrial', 'Modalidad: Virtual', 'Intensidad horaria total: 40 horas', '',
+        '1. Descripción', 'La asignatura desarrolla la gestión de la seguridad en plantas industriales.', '',
+        '2. Resultados de aprendizaje', 'RA1. Identificar peligros del área de trabajo.', 'RA2. Aplicar controles de riesgo en planta.', '',
+        '3. Estructura del curso', 'El curso tendrá exactamente 4 módulos. Cada módulo tendrá exactamente 5 capítulos de contenido.', '',
+        '4. Contenidos', 'Unidad | Contenidos | Horas | RA'];
+      temas.forEach((t, mi) => lines.push(`Unidad ${mi + 1}: ${t} en planta | ${[1, 2, 3, 4, 5].map((ci) => `${t}: tema ${ci}`).join('; ')} | 10 | RA${mi < 2 ? 1 : 2}`));
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'seguridad.txt', dataBase64: Buffer.from(lines.join('\n'), 'utf8').toString('base64') }] });
+      ok(ex.status === 200, T('documento leído'), { s: ex.status, e: ex.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      const contextVersion = sv.data.profile.version;
+      const op = (await api('GET', `/courses/${courseId}/design/structure-options`)).data;
+      eq([op.document && op.document.shape, op.recommended.modules, op.recommended.chaptersPerModule, op.recommended.reason, op.contentsCount], [[5, 5, 5, 5], 4, 5, 'Es la estructura que exige el documento.', 20], T('el documento exige 4 × 5: Cursia recomienda esa forma'));
+      const pv = (await api('POST', `/courses/${courseId}/design/structure-preview`, { modules: 3, chaptersPerModule: 4 })).data;
+      ok(pv.differences.some((d) => d.text === 'El documento establece 4 módulos y has seleccionado 3 módulos.') && pv.differences.some((d) => /5 capítulos de contenido por módulo y has seleccionado 4 capítulos de contenido por módulo\.$/.test(d.text))
+        && pv.coverage.assigned === 20 && pv.coverage.duplicated === 0, T('vista previa 3 × 4: «El documento establece 4 módulos y has seleccionado 3» y los 20 contenidos cubiertos'), pv);
+      let st = await readStructure(courseId);
+      const badDoc = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, shape: { modules: 3, chaptersPerModule: 4 }, choice: 'document' });
+      const badFmt = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, shape: { modules: 3, chaptersPerModule: 4 }, choice: 'format' });
+      ok(badDoc.status === 400 && /INVALID_CHOICE/.test(String(badDoc.error)) && badFmt.status === 400 && /FORMAT_CHOICE_MISMATCH/.test(String(badFmt.error)), T('elección incoherente → 400 (según el documento con forma; formato sin guardarlo)'), [badDoc.status, badDoc.error, badFmt.status, badFmt.error]);
+      const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, shape: { modules: 3, chaptersPerModule: 4 }, choice: 'custom' });
+      ok([200, 201].includes(aa.status), T('forma personalizada aplicada'), { s: aa.status, e: aa.error });
+      const rec = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+      const exc = rec.verification.checks.filter((c) => /^Excepción al requisito del documento/.test(c.title)).map((c) => c.title);
+      ok(exc.some((t) => /4 módulos/.test(t)), T('verificación: «Excepción al requisito del documento: 4 módulos» (decisión de la institución, no un conflicto)'), rec.verification.checks.filter((c) => c.severity !== 'ok').map((c) => `${c.severity} ${c.title}`));
+      ok(!rec.verification.checks.some((c) => c.severity === 'critical' && /m[oó]dulos|cap[ií]tulos/.test(c.title)), T('sin críticos de estructura (no bloquea automáticamente)'),
+        rec.verification.checks.filter((c) => c.severity === 'critical').map((c) => ({ id: c.id, title: c.title, detail: c.detail })));
+      ok(rec.verification.checks.find((c) => c.id === 'contents').severity === 'ok', T('los 20 contenidos siguen cubiertos en 3 × 4'));
+      const pb = (await api('GET', `/courses/${courseId}/prebrief`)).data;
+      ok(pb.draft.readiness.blockers.some((b) => b.code === 'exception_reason' && /4 módulos/.test(b.title)), T('la propuesta pide el motivo de la excepción antes de aprobar'), pb.draft.readiness.blockers.map((b) => b.title));
+      // Volver a «Según el documento»: sin excepción de estructura.
+      st = await readStructure(courseId);
+      const back = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion, choice: 'document', confirmReplace: true });
+      ok([200, 201].includes(back.status), T('«Según el documento» aplicado'), { s: back.status, e: back.error });
+      const rec2 = (await api('POST', `/courses/${courseId}/design/recommendation`, {})).data;
+      ok(!rec2.verification.checks.some((c) => /^Excepción al requisito del documento: 4 módulos/.test(c.title)), T('según el documento: la estructura cumple (sin excepción)'), rec2.verification.checks.filter((c) => c.severity !== 'ok').map((c) => c.title));
+    }, { fatal: false });
+
+    // ═══ LOOP 8.5 · E17 — flujo DEFINITIVO de Cursia V2 por HTTP real, en el orden de la pantalla: pedido → microcurrículo →
+    // «Lo que entendimos» (facts) → «Cursia recomienda» → Ajustar → «Usar este diseño» (perfil, horas, vínculos, aplicar) →
+    // verificación → «Aprobar» (Blueprint) → Manifest = tarjeta → generación con proveedores FALSOS → Actividades de
+    // Aplicación → empaque → regeneración parcial → re-empaque → Moodle (restore, permisos, notas). USD 0.
+    if (RUN_E5) await step('v3-E17-flujo-v2-definitivo', async () => {
+      const AF = require(path.join(REPO, 'scripts/lib/academic-fixtures.js'));
+      const DRY = D('modules/pedagogy/dry-run.js');
+      const STI = D('modules/study-time/index.js');
+      const MIN = D('modules/study-time/manifest-input.js');
+      const usd = (plan) => (plan && plan.estimateUsd ? Number(plan.estimateUsd.expected) : null);
+      const net0 = fs.existsSync(NET_LOG) ? fs.readFileSync(NET_LOG, 'utf8').length : 0;
+      const title = '[E2E Flujo V2 E17] Contabilidad de Costos';
+      const cr = await api('POST', '/courses/dynamic', { frontendCourseId: crypto.randomUUID(), title });
+      ok(cr.status === 201, 'E17: curso dinámico creado', { s: cr.status, e: cr.error });
+      const courseId = Number(cr.data.id);
+      // El cliente asegura el esqueleto mínimo (1 módulo, 1 capítulo) al abrir el curso, igual que en E15.
+      const sk = await api('POST', `/courses/${courseId}/modules`, { title: 'Módulo 1', expectedCounter: 0 });
+      ok(sk.status === 201, 'E17: esqueleto del curso', { s: sk.status, e: sk.error });
+
+      // Paso 1 · el pedido (lo que escribe el docente) + el microcurrículo.
+      const brief = { nombre: 'Contabilidad de Costos', obj: 'Calcular y controlar los costos de producción', sector: 'Contabilidad', pais: 'Colombia', contexto: 'Técnico / Tecnólogo — formación técnica', nivel: 'Básico — sin conocimientos previos' };
+      const pb = await api('PUT', `/courses/${courseId}/brief`, brief);
+      ok(pb.status === 200, 'E17: pedido guardado', { s: pb.status, e: pb.error });
+      const ex = await api('POST', `/courses/${courseId}/academic-context/extract`, { files: [{ name: 'microcurriculo.docx', dataBase64: (await AF.fixture('consistent', 'docx')).toString('base64') }] });
+      ok(ex.status === 200 && ex.data.stats.providersCalled === 0, 'E17: microcurrículo leído (0 proveedores)', { s: ex.status, e: ex.error });
+      const sv = await api('POST', `/courses/${courseId}/profiles/academic`, { data: ex.data.draft, expectedVersion: 0 });
+      ok(sv.status === 201 && sv.data.derivedPedagogy && sv.data.derivedPedagogy.applied === true, 'E17: contexto guardado; el perfil pedagógico se deriva solo', { s: sv.status });
+
+      // Paso 2 · «Lo que entendimos»: lo que sabe Cursia, con su origen.
+      const f = await api('GET', `/courses/${courseId}/facts`);
+      ok(f.status === 200 && f.data.outcomes.source === 'document' && f.data.targetHours.value === 64 && f.data.targetHours.source === 'document' && f.data.document.present === true,
+        'E17: «Lo que entendimos»: resultados y 64 h del documento', { o: f.data && f.data.outcomes.source, h: f.data && f.data.targetHours });
+      let st = await readStructure(courseId);
+      const aa = await api('POST', `/courses/${courseId}/modules/apply-academic-structure`, { expectedCounter: st.structureVersionCounter, contextVersion: sv.data.profile.version });
+      ok([200, 201].includes(aa.status), 'E17: «Diseñar el curso» → estructura del microcurrículo', { s: aa.status, e: aa.error });
+
+      // Configuración del curso (evaluación y presentación) antes de diseñar: la revisión no cambia después.
+      const A = D('modules/course-profiles/course-profiles.js');
+      const assessment = { ...A.defaultAssessmentProfile({ finalExam: true }), passingGrade: 70 };
+      ok((await api('POST', `/courses/${courseId}/profiles/assessment`, { data: assessment })).status === 201, 'E17: perfil de evaluación');
+      ok((await api('POST', `/courses/${courseId}/profiles/presentation`, { data: { themeFamily: 'aula-clara', mode: 'light', brandSeed: null, themeVersion: 1 } })).status === 201, 'E17: perfil de presentación');
+
+      // Paso 3 · «Cursia recomienda»: el docente no decide módulos, capítulos, práctica, audiovisual ni cómo llegar a las horas.
+      const r1 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r1.status === 200 && r1.data.providersCalled === 0 && r1.data.hours.target === 64 && r1.data.hours.source === 'document' && r1.data.approach && r1.data.approach.source === 'recommended'
+        && r1.data.preferences.audiovisual === 'recommended' && r1.data.design.applicable, 'E17: Cursia recomienda (64 h del documento, enfoque y audiovisual recomendados, aplicable)', { s: r1.status, e: r1.error });
+      // Ajustar: «Más aplicación» (la meta explícita de 64 h no se toca; nada de video para inflar horas).
+      const r2 = await api('POST', `/courses/${courseId}/design/recommendation`, { adjust: { emphasis: 'application' } });
+      const card = r2.data;
+      ok(r2.status === 200 && card.hours.target === 64 && card.design.status === 'within_tolerance' && card.design.counts.videoChapters <= r1.data.design.counts.videoChapters,
+        'E17: Ajustar «Más aplicación»: mismas 64 h, sin más video', { st: card.design && card.design.status, v: [r1.data.design.counts.videoChapters, card.design && card.design.counts.videoChapters] });
+      const ver0 = card.verification;
+      ok(ver0 && ver0.blocking === false, 'E17: verificación sin bloqueos antes de usar el diseño', ver0 && ver0.checks.filter((c) => c.severity === 'critical').map((c) => c.title));
+
+      // «Usar este diseño» — lo mismo que hace el cliente (52-v2-design.js v2dUse).
+      const pv = await api('GET', `/courses/${courseId}/profiles/pedagogy`);
+      const sp = card.profileChanged ? await api('POST', `/courses/${courseId}/profiles/pedagogy`, { data: card.profile, expectedVersion: pv.data.version }) : { status: 201 };
+      ok(sp.status === 201, 'E17: perfil del diseño guardado', { s: sp.status, e: sp.error });
+      const ho = await api('POST', `/courses/${courseId}/design/hours-origin`, { proposed: card.hours.source === 'proposed' ? card.hours.target : null });
+      ok(ho.status === 200, 'E17: origen de las horas registrado', { s: ho.status, e: ho.error });
+      if (ver0.checks.some((c) => c.id === 'outcome_links')) {
+        st = await readStructure(courseId);
+        const fx = await api('POST', `/courses/${courseId}/design/fix`, { action: 'link_outcomes', expectedCounter: st.structureVersionCounter });
+        ok(fx.status === 200 && fx.data.linkedChapters >= 1, 'E17: vinculación automática mostrada en la verificación, aplicada', { s: fx.status, d: fx.data });
+      }
+      const r3 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      ok(r3.data.profileChanged === false && r3.data.design.proposalSha256 === card.design.proposalSha256, 'E17: lo guardado = la misma huella que la tarjeta', { a: r3.data.design.proposalSha256, b: card.design.proposalSha256 });
+      st = await readStructure(courseId);
+      const ap = await api('POST', `/courses/${courseId}/modules/apply-distribution`, { expectedCounter: st.structureVersionCounter, proposalSha256: card.design.proposalSha256 });
+      ok([200, 201].includes(ap.status), 'E17: diseño aplicado', { s: ap.status, e: ap.error });
+
+      // Paso 4 · «Revisar y generar»: la estructura aplicada = la tarjeta; la verificación sigue limpia.
+      st = await readStructure(courseId);
+      const chs = st.modules.flatMap((m) => m.chapters);
+      eq([chs.length, chs.filter((c) => c.kind === 'practice').length, chs.filter((c) => c.videoEnabled).length, chs.filter((c) => c.applicationMinutes).length],
+        [card.design.counts.chapters, card.design.counts.practiceChapters, card.design.counts.videoChapters, card.design.counts.applicationActivities], 'E17: estructura aplicada = tarjeta (capítulos, práctica, video, Actividades de Aplicación)');
+      // Capítulo por capítulo (review L85-1 M6): título, tipo, video y minutos de Actividad en el mismo orden; evaluaciones por módulo.
+      const shape = (mods) => mods.map((m) => ({ exam: !!m.examEnabled, chapters: m.chapters.map((c) => [c.title, c.kind === 'practice' ? 'practice' : 'content', !!c.videoEnabled, c.applicationMinutes || null]) }));
+      const cardShape = shape(card.design.modules);
+      eq(shape(st.modules), cardShape, 'E17: estructura aplicada = tarjeta, capítulo por capítulo');
+      const r4 = await api('POST', `/courses/${courseId}/design/recommendation`, {});
+      eq(shape(r4.data.design.modules), cardShape, 'E17: «Revisar y generar» muestra la estructura aplicada, capítulo por capítulo');
+      ok(r4.data.verification && r4.data.verification.blocking === false && !r4.data.verification.checks.some((c) => c.fix && c.fix.kind === 'auto') && r4.data.design.changes.length === 0,
+        'E17: revisión: verificación sin bloqueos, sin correcciones automáticas pendientes y sin cambios por aplicar', r4.data.verification && r4.data.verification.checks.filter((c) => c.severity !== 'ok' && c.severity !== 'info').map((c) => c.title));
+      eq([r4.data.design.counts.chapters, r4.data.design.counts.videoChapters, r4.data.design.counts.applicationActivities, r4.data.design.counts.evaluations, r4.data.design.estimatedHours],
+        [card.design.counts.chapters, card.design.counts.videoChapters, card.design.counts.applicationActivities, card.design.counts.evaluations, card.design.estimatedHours], 'E17: lo que muestra «Revisar y generar» = la tarjeta usada');
+      // «Aprobar y continuar»: Blueprint + Manifest = la tarjeta (capítulos, videos, actividades, evaluaciones, horas, costo).
+      st = await readStructure(courseId);
+      const lock = await api('POST', `/courses/${courseId}/blueprints`, { expectedCounter: st.structureVersionCounter });
+      ok(lock.status === 201, 'E17: aprobado → Blueprint', { s: lock.status, e: lock.error });
+      const snap = lock.data.blueprint.snapshot;
+      const n = lock.data.blueprint.blueprintNumber;
+      const man = await api('POST', `/courses/${courseId}/blueprints/${n}/manifest`);
+      ok(man.status === 201 && man.data.manifest.rulesVersion === 3, 'E17: Manifest v3', { s: man.status, e: man.error });
+      const M = man.data.manifest.manifest;
+      const hoursFrozen = STI.estimateCourseStudyTime(MIN.studyTimeInputFromManifest(M, snap)).courseEstimatedHours;
+      const c = card.design.counts;
+      const bySnapPos = (xs) => [...xs].sort((a, b) => a.position - b.position);
+      eq(shape(bySnapPos(snap.modules).map((m) => ({ ...m, chapters: bySnapPos(m.chapters) }))), cardShape, 'E17: Blueprint congelado = tarjeta, capítulo por capítulo');
+      eq([M.totals.experienceCount, M.totals.videoCount, M.totals.applicationActivityCount, M.totals.examCount + M.totals.finalExamCount, hoursFrozen],
+        [c.chapters, c.videoChapters, c.applicationActivities, c.evaluations, card.design.estimatedHours], 'E17: Manifest congelado = tarjeta «Cursia recomienda» (capítulos, videos, actividades, evaluaciones, horas)');
+      ok(Math.abs(usd(DRY.providerPlanFor(M)) - Number(card.cost.expected)) < 0.005, 'E17: costo del Manifest = costo de la tarjeta', { frozen: usd(DRY.providerPlanFor(M)), shown: card.cost.expected });
+      const apps = M.items.filter((i) => i.type === 'application_activity');
+      ok(apps.length === c.applicationActivities && apps.length > 0, `E17: ${apps.length} Actividades de Aplicación en el Manifest`);
+
+      // Generación (mock) → empaque → impacto → regeneración parcial → re-empaque; Moodle después (restore, permisos, notas).
+      // Contexto del propio curso (el pedido), no el del curso de otros escenarios.
+      const courseCtx = { sector: brief.sector, pais: brief.pais, contexto: brief.contexto, nivel: brief.nivel, obj: brief.obj, comp: 'Calcula y controla los costos de producción', tono: 'cercano y claro', ciudad: '' };
+      await fullGenerationFlow('E17', { courseId, title, n, st, M, apps, assessment, hoursFrozen, net0, extra: { v2: true }, courseCtx });
+    }, { fatal: false });
+
+    // ═══ Loop 4 · E24: worker de IA del backend para las partes LARGAS (sin Cloudflare, sin depender del navegador) ═══
+    if (RUN_E5 || ONLY_LLM_WORKER) await step('v3-E24-worker-ia', async () => {
+      const { startAnthropicSseFake } = require('./anthropic-sse-fake');
+      const fake = await startAnthropicSseFake(llm);
+      const W1 = 'e2e-llm-worker-1';
+      const W2 = 'e2e-llm-worker-2';
+      const W3 = 'e2e-llm-worker-3';
+      const W4 = 'e2e-llm-worker-4';
+      const LONG = ['content', 'application_activity', 'experience', 'final_exam'];
+      // Loop 9: el worker cubre TODAS las partes de IA v3 (también las cortas); el navegador solo de respaldo.
+      const LLM_TYPES = ['course_plan', 'course_intro', 'module_intro', 'content', 'experience', 'video_interactions', 'activity', 'application_activity', 'exam', 'final_exam'];
+      // Loop 6: instante de activación — el worker y el ruteo aplican solo a runs creados desde acá.
+      const LLM_SINCE = new Date(Date.now() - 1000).toISOString();
+      const E24_CALL_TIMEOUT_MS = 150000;
+      const E24_IN_FLIGHT_WINDOW_MS = E24_CALL_TIMEOUT_MS + 30000; // IN_FLIGHT_MARGIN_MS (lease-takeover.ts)
+      const wEnv = (id) => ({
+        ...baseEnv(), DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: LLM_SINCE, ANTHROPIC_API_BASE_URL: fake.url, DYNAMIC_LLM_WORKER_ID: id,
+        DYNAMIC_LLM_WORKER_POLL_MS: '300', DYNAMIC_LLM_WORKER_LEASE_SECONDS: '15', DYNAMIC_LLM_WORKER_HEARTBEAT_MS: '3000',
+        DYNAMIC_LLM_WORKER_IDLE_MS: '30000', DYNAMIC_LLM_WORKER_CONCURRENCY: '2', DYNAMIC_LLM_WORKER_BACKOFF_MS: '20', DYNAMIC_WORKER_DRAIN_TIMEOUT_MS: '90000',
+        // r62 (gate E2E): timeout total de la llamada acotado (> la generación lenta de 105 s). La ventana en vuelo de Q-21
+        // (r61) es ese timeout + 30 s: con el default de 15 min, la toma de la parte con el solucionario colgado esperaba
+        // 930 s antes del reenvío ambiguo único y el run no cabía en los 15 min del test. Producción no cambia.
+        DYNAMIC_LLM_WORKER_CALL_TIMEOUT_MS: String(E24_CALL_TIMEOUT_MS),
+      });
+      const waitFor = async (label, fn, timeoutMs = 240000, everyMs = 500) => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < timeoutMs) { const v = await fn(); if (v) return v; await sleep(everyMs); }
+        const st = typeof CURRENT_RUN === 'string' ? (await q(`select item_key, status, worker_id, left(error, 300) e from public.generation_item_runs where job_id = $1 and status <> 'completed' order by item_key`, [CURRENT_RUN])) : [];
+        throw new Error(`E24: ${label} — no ocurrió en ${timeoutMs} ms; partes: ${JSON.stringify(st).slice(0, 3000)}`);
+      };
+      const reqs = (pred) => fake.st.requests.filter((r) => pred(r.text));
+      const finished = async (runId) => q(`select item_key, type, status, worker_id, finished_at, error, output_summary, attempt_count, max_attempts from public.generation_item_runs where job_id = $1 order by item_key`, [runId]);
+      const unsettledRes = async (itemRunId) => (await q(`select count(*)::int n from public.generation_cost_events e where e.idempotency_key like $1 and (e.metadata->>'reservation') = 'true'
+          and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [`reservation:llm:${itemRunId}:%`]))[0].n;
+      // r62 (N1): ajustes possible_duplicate (actor system) sobre las reservas de una parte.
+      const pdAdj = async (itemRunId) => (await q(`select count(*)::int n from public.generation_cost_events a join public.generation_cost_events e on e.id = a.corrects_event_id
+          where e.idempotency_key like $1 and a.event_kind = 'ADJUSTMENT' and coalesce(a.metadata->>'possibleDuplicate', '') = 'true'`, [`reservation:llm:${itemRunId}:%`]))[0].n;
+      const startRun = async (c, title) => {
+        const start = await api('POST', `/courses/${c.courseId}/blueprints/${c.n}/manifest/runs`, { nombre: title, ...CTX, scormTemplateIds: S.templates, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } });
+        ok(start.status === 201, `E24: run mock creado (${title})`, { s: start.status, e: start.error });
+        if (start.status !== 201) throw new Error(`E24: run no creado ${start.status} ${start.error}`);
+        return start.data.run.id;
+      };
+      let w1 = null; let w2 = null; let w3 = null; let w4 = null; let w5 = null;
+      let CURRENT_RUN = null;
+      try {
+        await stopProc(app);
+        app = await startApp({ DYNAMIC_LLM_WORKER_ENABLED: 'true', DYNAMIC_LLM_WORKER_SINCE: LLM_SINCE }, 'app-v3-llmw');
+        // Loop 6: el worker 1 corre HOSPEDADO en un dynamic-provider-worker (como en staging: sin un proceso más).
+        w1 = spawnProc('llm-worker-1', 'workers/dynamic-provider-worker.js', { ...wEnv(W1), DYNAMIC_PROVIDER_WORKER_ID: 'e2e-provider-hosting-llm-1', DYNAMIC_PROVIDER_WORKER_POLL_MS: '400' });
+
+        // ── Corrida 1: generación >100 s, navegador cerrado, desconocido (1 reintento), worker caído, idempotencia ──
+        const C = { key: 'E24', title: '[E2E Worker IA E24] Mantenimiento de bombas centrífugas', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+          { title: 'Bombas de proceso', objective: 'Mantener bombas centrífugas de proceso', exam: true, chapters: [
+            { title: 'Inspección de bombas centrífugas', v: false, a: true, app: 60, objective: 'Inspeccionar una bomba centrífuga antes de liberarla' },
+            { title: 'Sellos mecánicos', v: false, a: true, objective: 'Diagnosticar fugas en sellos mecánicos' },
+            { title: 'Alineación de ejes', v: false, a: false, objective: 'Alinear el eje de la bomba con el motor' },
+          ] }] };
+        llm.st.tag = 'E24';
+        const c = await createCourse(C, llm);
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 1 COMPLETO: "Inspección de bombas centrífugas"'), 'slow', 1, 105000);
+        fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Sellos mecánicos"'), 'drop', 1);
+        fake.rule((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'), 'hold', 1);
+        // Loop 7 (O2): el Libro de «Alineación de ejes» llega con UNA oración con un dato inventado → reparación parcial.
+        const FAB24 = 'Según una encuesta interna de FEDUCC 2024, el 67% de los técnicos no alinea el eje antes del arranque.';
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Alineación de ejes"') && !t.includes('CORRECCIÓN OBLIGATORIA'), 'transform', 1, 0,
+          (txt) => txt.replace(/(\n\n)([^\n#|]{40,}?\.)(\s)/, `$1$2 ${FAB24}$3`));
+        c.runId = await startRun(c, C.title);
+        CURRENT_RUN = c.runId;
+        S.front.DYN_EXAM_BANK_MODE_ENABLED = true;
+        // Loop 9: como en staging (el worker vive desde mucho antes que cualquier run), el navegador arranca con el worker de
+        // IA YA anunciado: si no, el primer claim (course_plan) podía ganarle al primer latido y caer en el respaldo.
+        await waitFor('worker 1 anunciado con todas las partes de IA', async () => {
+          const [p] = await q(`select item_types from public.llm_worker_presence where worker_id = $1 and last_seen > now() - interval '60 seconds'`, [W1]);
+          return p && LLM_TYPES.every((t) => (p.item_types || []).includes(t));
+        }, 120000, 300);
+        const claims0 = claimLog.length;
+        let ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        // El navegador DESAPARECE apenas el worker tomó el Libro Guía.
+        await waitFor('el worker tomó un Libro Guía', async () => (await finished(c.runId)).some((i) => i.type === 'content' && i.worker_id === W1));
+        ctl.stop();
+        const browserGoneAt = Date.now();
+        await waitFor('Libros Guía completos sin navegador', async () => (await finished(c.runId)).filter((i) => i.type === 'content').every((i) => i.status === 'completed'), 300000);
+        // Worker caído EN VUELO: la 2.ª pasada de la Actividad (solucionario) quedó colgada → kill -9.
+        await waitFor('solucionario en vuelo', async () => fake.st.requests.some((r) => r.action === 'hold'), 300000);
+        const actBefore = reqs((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN')).length;
+        const longDoneWhileGone = (await finished(c.runId)).filter((i) => LONG.includes(i.type) && i.status === 'completed').map((i) => i.item_key);
+        w1.kill('SIGKILL');
+        await waitFor('worker 1 muerto', async () => !!w1.exited, 10000, 100);
+        await sleep(16000); // vence la lease (15 s)
+        w2 = spawnProc('llm-worker-2', 'workers/dynamic-llm-worker.js', wEnv(W2));
+        const browserBackAt = Date.now();
+        ctl = S.front.dynExecutorStart({ courseId: c.courseId, blueprintNumber: c.n, runId: c.runId });
+        const stt = await waitRunTerminal(ctl, 'E24 run', 15 * 60 * 1000, c.runId);
+        const items = await waitItemsDone(c.runId);
+        const rows = await finished(c.runId);
+        ok(items.every((i) => i.status === 'completed'), `E24: las ${items.length} partes completas (navegador + worker de IA)`, items.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error_message || '').slice(0, 200)]));
+        const longRows = rows.filter((i) => LONG.includes(i.type));
+        ok(longRows.length >= 7 && longRows.every((i) => [W1, W2].includes(i.worker_id)), 'E24: las partes LARGAS (Libro Guía, Actividad, SCORM, examen final) las generó el worker de IA', longRows.map((i) => [i.item_key, i.worker_id]));
+        const llmRows = rows.filter((i) => LLM_TYPES.includes(i.type));
+        ok(llmRows.length >= 13 && llmRows.every((i) => [W1, W2].includes(i.worker_id)) && ['course_intro', 'module_intro', 'activity', 'exam'].every((t) => llmRows.some((i) => i.type === t)),
+          'E24: Loop 9 — TODAS las partes de IA (también las cortas: presentación del curso y del módulo, actividades, examen de módulo) las generó el worker', llmRows.map((i) => [i.item_key, i.worker_id]));
+        const browserClaims = claimLog.slice(claims0);
+        eq(browserClaims.map((x) => x.type), [], 'E24: con el worker de IA vivo el navegador no reclamó NINGUNA parte (el servidor se las filtra todas)');
+        // Loop 9 (A3): el final depende de los exámenes de módulo → los evita aunque lo genere el worker (sin memoria del navegador).
+        const fin1 = rows.find((i) => i.type === 'final_exam');
+        ok(fin1 && fin1.output_summary && fin1.output_summary.externalStems > 0 && fin1.output_summary.externalStemsSource === 'dependencies' && fin1.output_summary.externalStemsUnreadable === 0,
+          'E24: el examen final (worker) recibió las preguntas del examen de módulo como dependencias (externalStems > 0)', fin1 && { n: fin1.output_summary.externalStems, src: fin1.output_summary.externalStemsSource, unread: fin1.output_summary.externalStemsUnreadable });
+        const r105 = fake.st.requests.find((r) => r.action === 'slow');
+        ok(r105 && r105.outcome === 'ok' && r105.end - r105.at >= 100000, `E24: generación de ${r105 ? Math.round((r105.end - r105.at) / 1000) : '?'} s (>100 s) completa por streaming directo — sin 524`, r105 && { outcome: r105.outcome, ms: r105.end - r105.at });
+        ok(longDoneWhileGone.filter((k) => k.startsWith('content:')).length === 3, 'E24: con el navegador CERRADO el worker terminó los 3 Libros Guía (y siguió con lo demás)', { longDoneWhileGone, gone: browserGoneAt, back: browserBackAt });
+        const exp2 = reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Sellos mecánicos"'));
+        const exp2Row = rows.find((i) => i.type === 'experience' && exp2.length && i.status === 'completed' && i.item_key.endsWith(c.mods[0].chapters[1].id));
+        ok(exp2.length >= 2 && exp2[0].outcome === 'dropped' && exp2.some((r) => r.outcome === 'ok') && exp2Row, 'E24: resultado DESCONOCIDO (sin respuesta) → UN reintento automático → la experiencia se completó sin intervención', exp2.map((r) => r.outcome));
+        const expItem = (await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c.runId, `experience:${c.mods[0].chapters[1].id}`]))[0];
+        // r62 (N1, regla de ambigüedad acotada, punto 3): antes del reenvío ÚNICO, la reserva perdida se liquida como cobrada
+        // (conservador: ya contaba como gasto) con la marca possible_duplicate y actor system → 0 reservas abiertas.
+        eq(await unsettledRes(expItem.id), 0, 'E24: el desconocido no quedó como reserva abierta (r62: liquidada antes del reenvío único)');
+        eq(await pdAdj(expItem.id), 1, 'E24: la reserva perdida quedó liquidada UNA vez como possible_duplicate por el sistema (sigue contando como gasto)');
+        // Conciliación humana (SUPER_ADMIN): lo que el sistema ya decidió no vuelve a la cola, y conciliarlo es un no-op.
+        const wres = await api('GET', `/finops/llm-worker-reservations?runId=${c.runId}`);
+        const wlist = (wres.data && wres.data.reservations) || [];
+        ok(wres.status === 200 && !wlist.some((r) => r.itemKey === `experience:${c.mods[0].chapters[1].id}`), 'E24: la reserva ya liquidada como possible_duplicate NO aparece en la cola de conciliación del worker (SUPER_ADMIN)', { s: wres.status, n: wlist.length });
+        const expKey = (await q(`select e.idempotency_key k from public.generation_cost_events e where e.idempotency_key like $1 and (e.metadata->>'reservation') = 'true' order by e.created_at limit 1`, [`reservation:llm:${expItem.id}:%`]))[0];
+        const rc0 = expKey ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: expKey.k, outcome: 'not_charged', reason: 'E2E: humano sobre una decisión del sistema' }) : { status: 0 };
+        // r60 (I1): una decisión distinta sobre una reserva ya cerrada → 409 reservation_already_settled, sin tocar el ledger.
+        ok(rc0.status === 409 && (await pdAdj(expItem.id)) === 1 && (await unsettledRes(expItem.id)) === 0, 'E24: conciliar a mano una reserva ya liquidada por el sistema se rechaza (409) y nunca agrega un segundo ADJUSTMENT', { s: rc0.status, rc0: rc0.data, e: rc0.error });
+        const bad = await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: 'reservation:llm-proxy:x', outcome: 'charged', reason: 'x' });
+        eq(bad.status, 400, 'E24: el endpoint del worker rechaza reservas que no son del worker');
+        const actAfter = reqs((t) => t.includes('Diseña la ACTIVIDAD DE APLICACIÓN')).length;
+        eq(actAfter, actBefore, 'E24: tras la caída del worker, la 1.ª pasada de la Actividad NO se volvió a generar ni a cobrar (punto de guardado)');
+        const sol = reqs((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'));
+        const aaRow = rows.find((i) => i.type === 'application_activity');
+        ok(sol.length >= 2 && sol[0].outcome === 'held' && aaRow && aaRow.status === 'completed' && aaRow.worker_id === W2, 'E24: worker caído en vuelo → otro worker retomó la parte desde su punto de guardado y la completó', { sol: sol.map((r) => r.outcome), w: aaRow && aaRow.worker_id });
+        // r61 (Q-21) visto en el E2E: el reclamante NO reenvía la llamada colgada mientras puede seguir en vuelo (ventana =
+        // timeout + margen); pasada la ventana, reenvío ambiguo ÚNICO con la reserva perdida liquidada como posible duplicado.
+        const aaPd = aaRow ? await pdAdj((await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c.runId, aaRow.item_key]))[0].id) : -1;
+        const solGapMs = sol.length >= 2 ? sol[1].at - sol[0].at : -1;
+        ok(solGapMs >= E24_IN_FLIGHT_WINDOW_MS - 5000 && aaPd === 1, `E24: Q-21 — el solucionario colgado se reenvió recién pasada la ventana en vuelo (${Math.round(solGapMs / 1000)} s ≥ ${E24_IN_FLIGHT_WINDOW_MS / 1000} s) y UNA vez, con su reserva liquidada como posible duplicado`, { solGapMs, aaPd });
+        // Loop 7 (O2): reparación parcial del Libro por el worker — 1 llamada corta en vez de reescribir el capítulo.
+        const alin = rows.find((i) => i.type === 'content' && i.item_key.endsWith(c.mods[0].chapters[2].id));
+        const alinFull = reqs((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Alineación de ejes"'));
+        const repairs = reqs((t) => t.includes('Responde SOLO con JSON: {"replacements"') && t.includes('Alineación de ejes'));
+        ok(alin && alin.status === 'completed' && alin.output_summary && alin.output_summary.partialRepair && alin.output_summary.partialRepair.sentences === 1 && alinFull.length === 1 && repairs.length === 1 && repairs[0].maxTokens === 2000,
+          'E24: dato inventado en el Libro → reparación PARCIAL (1 llamada corta de 2000 tokens), sin reescribir el capítulo', { st: alin && alin.status, pr: alin && alin.output_summary && alin.output_summary.partialRepair, full: alinFull.length, repairs: repairs.length });
+        const alinMd = await q(`select a.storage_bucket, a.storage_path from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and g.item_key = $2 and a.type = 'dynamic_content_md'`, [c.runId, alin && alin.item_key]);
+        const alinText = alinMd[0] ? await (await fetch(`${FAKES.storageUrl}/storage/v1/object/authenticated/${alinMd[0].storage_bucket}/${alinMd[0].storage_path}`)).text() : '';
+        ok(alinText && !alinText.includes('FEDUCC') && alinText.includes('como ejemplo hipotético'), 'E24: el capítulo guardado ya no tiene el dato inventado y conserva el resto', { len: alinText.length });
+        const dupArts = await q(`select g.item_key, a.type, count(*)::int n from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 group by 1, 2 having count(*) > 1`, [c.runId]);
+        eq(dupArts, [], 'E24: idempotencia — un solo artifact por parte y tipo');
+        const dupCharges = await q(`select external_operation_id, count(*)::int n from public.generation_cost_events where run_id = $1 and provider = 'anthropic' and event_kind = 'CHARGE'
+            and coalesce((metadata->>'reservation') = 'true', false) = false group by 1 having count(*) > 1`, [c.runId]);
+        eq(dupCharges, [], 'E24: idempotencia — un solo cargo por respuesta de Anthropic');
+        // Se cobra lo que Anthropic GENERÓ: respuestas completas y streams cortados a mitad (cobro conservador).
+        const okIds = new Set(fake.st.requests.filter((r) => r.messageId && ['ok', 'cut', 'client_gone'].includes(r.outcome)).map((r) => r.messageId));
+        const charged = await q(`select external_operation_id id from public.generation_cost_events where run_id = $1 and provider = 'anthropic' and event_kind = 'CHARGE'
+            and coalesce((metadata->>'reservation') = 'true', false) = false and external_operation_id like 'msg_sse_%'`, [c.runId]);
+        ok(charged.length > 0 && charged.every((r) => okIds.has(r.id)), `E24: cada cargo corresponde a una respuesta que el proveedor falso realmente generó (${charged.length} cargos)`);
+        const cost1 = (await q(`select coalesce(sum(amount),0)::float8 t from public.generation_cost_events where run_id = $1 and provider = 'anthropic'`, [c.runId]))[0].t;
+        results.courses.E24 = { courseId: c.courseId, runId: c.runId, items: items.length, anthropicUsd: cost1, requests: fake.st.requests.map((r) => ({ action: r.action, outcome: r.outcome, ms: r.end ? r.end - r.at : null })), status: stt.status, humanInterventions: rows.filter((i) => i.status !== 'completed').length };
+
+        // ── Corrida 2: pausa/reanudar, drenaje (deploy), desconocido ×2 → revisión, presupuesto agotado; el resto sigue ──
+        const C2 = { key: 'E24b', title: '[E2E Worker IA E24b] Confiabilidad de bombas', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Fallas de bombas', objective: 'Diagnosticar fallas de bombas', exam: false, chapters: [
+            { title: 'Lubricación de rodamientos', v: false, a: false, objective: 'Lubricar rodamientos según el plan' },
+            { title: 'Vibraciones en bombas', v: false, a: false, objective: 'Interpretar vibraciones de una bomba' },
+            { title: 'Cavitación en la succión', v: false, a: false, objective: 'Prevenir la cavitación en la succión' },
+          ] }] };
+        llm.st.tag = 'E24b';
+        const c2 = await createCourse(C2, llm);
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 1 COMPLETO: "Lubricación de rodamientos"'), 'slow', 1, 12000);
+        fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"'), 'drop', 2);
+        fake.rule((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"'), 'cut', 200);
+        // Robustez: la PRIMERA subida de un capítulo del Libro hecha por el worker falla (Storage 500) una vez.
+        const failedBefore = FAKES.storage.failedUploads.length;
+        FAKES.storage.failUploads.push({ match: (p) => /\/dynamic_content_md\//.test(p) && /-w\.md$/.test(p), times: 1 });
+        c2.runId = await startRun(c2, C2.title);
+        CURRENT_RUN = c2.runId;
+        const runsBase2 = `/courses/${c2.courseId}/blueprints/${c2.n}/manifest/runs/${c2.runId}`;
+        let ctl2 = S.front.dynExecutorStart({ courseId: c2.courseId, blueprintNumber: c2.n, runId: c2.runId });
+        // PAUSA con el Libro Guía del cap. 1 en vuelo (12 s): nadie toma partes nuevas ni gasta; reanudar sigue.
+        await waitFor('Libro del cap. 1 en vuelo', async () => fake.st.requests.some((r) => r.action === 'slow' && r.text.includes('Lubricación de rodamientos')), 120000);
+        const pz = await api('POST', `${runsBase2}/pause`, {});
+        ok(pz.status === 200 || pz.status === 201, 'E24b: pausa del usuario aceptada', { s: pz.status, e: pz.error });
+        await sleep(15000);
+        const nPaused = fake.st.requests.length;
+        await sleep(8000);
+        eq(fake.st.requests.length, nPaused, 'E24b: con el run PAUSADO el worker no hace llamadas nuevas a la IA');
+        const claimedWhilePaused = (await finished(c2.runId)).filter((i) => i.status === 'running');
+        eq(claimedWhilePaused.length, 0, 'E24b: con el run pausado no queda ninguna parte en curso (la que estaba en vuelo terminó o volvió a la cola)');
+        const rz = await api('POST', `${runsBase2}/resume`, {});
+        ok(rz.status === 200 || rz.status === 201, 'E24b: reanudar aceptado', { s: rz.status, e: rz.error });
+        // Para el drenaje: la experiencia del cap. 1 (aún no pedida: depende del Libro y el run estuvo pausado) tarda 20 s.
+        const lubExpReqs0 = reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Lubricación de rodamientos"')).length;
+        fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Lubricación de rodamientos"'), 'slow', 1, 20000);
+        ctl2.stop();
+        ctl2 = S.front.dynExecutorStart({ courseId: c2.courseId, blueprintNumber: c2.n, runId: c2.runId });
+        eq(lubExpReqs0, 0, 'E24b: la parte usada para el drenaje no se había pedido antes de reanudar');
+        // DRENAJE (deploy): SIGTERM con trabajo en vuelo → termina lo que tiene y sale; otro worker sigue.
+        await waitFor('trabajo en vuelo del worker 2', async () => fake.st.requests.some((r) => r.action === 'slow' && r.outcome === 'pending' && r.text.includes('CAPÍTULO: "Lubricación de rodamientos"') && r.text.includes('Genera la EXPERIENCIA del capítulo'))
+          && (await finished(c2.runId)).some((i) => i.status === 'running' && i.worker_id === W2), 120000, 200);
+        const drainingKeys = (await finished(c2.runId)).filter((i) => i.status === 'running' && i.worker_id === W2).map((i) => i.item_key);
+        // Deploy real (pm2 reload): el proceso NUEVO arranca y se anuncia antes de drenar el viejo.
+        const claims2 = claimLog.length;
+        // Review r2 (m4): el worker 3 es el que prueba el camino REAL hasta el paquete final (E24e, E24s): declara su override
+        // (la IA falsa local) como proveedor real. Los demás workers NO llevan el flag → su texto queda llmMode=mock (E24g lo verifica).
+        w3 = spawnProc('llm-worker-3', 'workers/dynamic-llm-worker.js', { ...wEnv(W3), ANTHROPIC_BASE_URL_IS_REAL_PROVIDER: 'true' });
+        await waitFor('worker 3 anunciado', async () => (await q(`select 1 from public.llm_worker_presence where worker_id = $1 and not draining`, [W3])).length > 0, 60000, 200);
+        w2.kill('SIGTERM');
+        await waitFor('worker 2 drenado', async () => !!w2.exited, 120000, 200);
+        const afterDrain = await finished(c2.runId);
+        const presW2 = await q(`select draining from public.llm_worker_presence where worker_id = $1`, [W2]);
+        ok(presW2.length === 1 && presW2[0].draining === true, 'E24b: el worker drenado queda marcado como drenando (su latido envejece solo; cubre el arranque del nuevo)', presW2);
+        ok(drainingKeys.every((k) => { const r = afterDrain.find((i) => i.item_key === k); return r && r.status !== 'running'; }), 'E24b: drenaje — lo que el worker tenía en vuelo terminó o volvió a la cola antes de salir (nada quedó colgado)', { drainingKeys, exited: w2.exited });
+        await waitRunTerminal(ctl2, 'E24b run', 15 * 60 * 1000, c2.runId).catch(() => null);
+        const rows2 = await waitItemsDone(c2.runId);
+        const browserClaims2 = claimLog.slice(claims2);
+        ok(!browserClaims2.some((x) => LLM_TYPES.includes(x.type)), 'E24b: durante el deploy (worker nuevo vivo) el navegador no tomó ninguna parte de IA (Loop 9: ni las cortas)', browserClaims2.map((x) => x.type));
+        const f2 = await finished(c2.runId);
+        const vib = f2.find((i) => i.type === 'experience' && i.item_key.endsWith(c2.mods[0].chapters[1].id));
+        ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 1,
+          'E24b: dos resultados desconocidos → SOLO esa parte queda en revisión (llm_pending_review) con la 2.ª reserva para conciliar (r62: la 1.ª ya liquidada possible_duplicate antes del reenvío único)', vib && { st: vib.status, e: (vib.error || '').slice(0, 160), pr: vib.output_summary && vib.output_summary.llmPendingReview });
+        eq(reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"')).length, 2, 'E24b: tras el segundo desconocido la parte NO se volvió a generar');
+        if (vib) {
+          const vibId = (await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c2.runId, vib.item_key]))[0].id;
+          eq(await pdAdj(vibId), 1, 'E24b: el 1.er desconocido quedó liquidado como possible_duplicate (un solo reenvío ambiguo por parte)');
+          // Conciliación humana (SUPER_ADMIN) de la reserva que sí queda abierta: listada y conciliable, una sola vez.
+          const wres2 = await api('GET', `/finops/llm-worker-reservations?runId=${c2.runId}`);
+          const vibRes = ((wres2.data && wres2.data.reservations) || []).find((r) => r.itemKey === vib.item_key);
+          ok(wres2.status === 200 && vibRes && /^llmw-/.test(vibRes.callTag || '') && vibRes.reservationKey === vib.output_summary.llmPendingReview.pendingReservations[0],
+            'E24b: la reserva abierta de la parte en revisión aparece en la cola de conciliación del worker (SUPER_ADMIN)', { s: wres2.status, r: vibRes && vibRes.reservationKey });
+          const rv1 = vibRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: vibRes.reservationKey, outcome: 'not_charged', reason: 'E2E: consola sin la request' }) : { status: 0 };
+          const rv2 = vibRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: vibRes.reservationKey, outcome: 'not_charged', reason: 'E2E: repetido' }) : { status: 0 };
+          const rv3 = vibRes ? await api('POST', '/finops/llm-worker-reservations/reconcile', { reservationKey: vibRes.reservationKey, outcome: 'charged', reason: 'E2E: decisión inversa' }) : { status: 0 };
+          ok(rv1.status === 200 && rv1.data.reconciled === true && rv2.status === 200 && rv2.data.alreadySettled === true && rv3.status === 409 && (await unsettledRes(vibId)) === 0,
+            'E24b: conciliar la reserva del worker la cierra una sola vez (repetir = no-op; decisión inversa = 409, r60)', { rv1: rv1.data, rv2: rv2.data, rv3: rv3.status });
+        }
+        const cav = f2.find((i) => i.type === 'content' && i.item_key.endsWith(c2.mods[0].chapters[2].id));
+        const cavCalls = reqs((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"')).length;
+        const cavSpent = (await q(`select coalesce(sum(amount),0)::float8 t from public.generation_cost_events where run_id = $1 and item_key = $2`, [c2.runId, cav.item_key]))[0].t;
+        // r64 (R1 #1567): el stream de esa parte se corta SIEMPRE (regla ×200) → ya no se repite igual: un solo corte cobrado y
+        // la MISMA solicitud sin streaming, que llega entera; la parte se completa sola (antes agotaba su presupuesto).
+        const cavReqs = fake.st.requests.filter((r) => r.text.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"'));
+        const cavCuts = (await q(`select count(*)::int n from public.generation_cost_events where run_id = $1 and item_key = $2 and event_kind = 'CHARGE' and metadata ? 'streamCut'`, [c2.runId, cav.item_key]))[0].n;
+        ok(cav && cav.status === 'completed', 'E24b (r64): cortes del stream en cada envío → la parte se recupera sola sin streaming (sin pedir a una persona)', cav && { st: cav.status, e: (cav.error || '').slice(0, 200) });
+        ok(cavReqs.filter((r) => r.stream).length === 1 && cavReqs.filter((r) => !r.stream).length >= 1 && cavCuts === 1, `E24b (r64): UN solo corte (stream) y la misma solicitud sin streaming — nunca la repetición idéntica (${cavCalls} llamadas, USD ${cavSpent.toFixed(4)})`, { stream: cavReqs.filter((r) => r.stream).length, nonstream: cavReqs.filter((r) => !r.stream).length, cavCuts });
+        const lub = f2.filter((i) => i.item_key.endsWith(c2.mods[0].chapters[0].id));
+        ok(lub.length > 0 && lub.every((i) => i.status === 'completed'), 'E24b: las partes INDEPENDIENTES (cap. 1) siguieron y se completaron', lub.map((i) => [i.item_key, i.status]));
+        // Robustez (Storage): la subida falló una vez → la parte se reintentó desde su punto de guardado (sin volver a
+        // pedirle el capítulo a la IA) y quedó con UN solo artifact.
+        const failedPaths = FAKES.storage.failedUploads.slice(failedBefore);
+        ok(failedPaths.length === 1, 'E24b: una subida del Libro hecha por el worker falló (Storage 500 inyectado)', failedPaths);
+        if (failedPaths.length === 1) {
+          const dir = failedPaths[0].replace(/^[^/]+\//, '').replace(/\/[^/]+$/, '');
+          const [art] = await q(`select g.item_key, g.status, g.chapter_id from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where a.storage_path like $1 || '/%' and a.type = 'dynamic_content_md'`, [dir]);
+          const chTitle = art && C2.modules[0].chapters[c2.mods[0].chapters.findIndex((x) => x.id === art.chapter_id)].title;
+          const chNum = art && (c2.mods[0].chapters.findIndex((x) => x.id === art.chapter_id) + 1);
+          const genCalls = art ? reqs((t) => t.includes(`Genera el CAPÍTULO ${chNum} COMPLETO: "${chTitle}"`)).length : -1;
+          ok(art && art.status === 'completed', 'E24b: tras la falla de Storage la parte se completó sola (reintento automático)', art);
+          ok(genCalls >= 1 && genCalls === reqs((t) => t.includes(`Genera el CAPÍTULO ${chNum} COMPLETO: "${chTitle}"`) && !/RECHAZADA/.test(t)).length && (chTitle !== 'Lubricación de rodamientos' ? genCalls === 1 : true),
+            'E24b: el reintento tras la falla de Storage NO volvió a generar el capítulo (respuesta desde el punto de guardado)', { chTitle, genCalls });
+          const dupA = await q(`select count(*)::int n from public.artifacts a join public.generation_item_runs g on g.id = a.item_run_id where g.job_id = $1 and g.item_key = $2 and a.type = 'dynamic_content_md'`, [c2.runId, art && art.item_key]);
+          eq(dupA[0].n, 1, 'E24b: un solo artifact del capítulo (la subida fallida no dejó basura)');
+        }
+        const needsHuman = f2.filter((i) => i.status === 'failed');
+        eq(needsHuman.map((i) => (i.error || '').split(':')[0]).sort(), ['llm_pending_review'], 'E24b: solo 1 parte pide a una persona (el doble resultado desconocido inyectado, inseguro de reenviar); los cortes del stream se recuperan solos (r64)');
+        results.courses.E24b = { courseId: c2.courseId, runId: c2.runId, items: rows2.length, failed: needsHuman.map((i) => [i.item_key, (i.error || '').slice(0, 120)]), cavitationCalls: cavCalls, cavitationUsd: cavSpent };
+
+        // ── r64 · recuperación de R1 (#1567): el run terminó `failed` con UNA sola parte pendiente de una persona y el resto
+        // completo. El dueño reintenta SOLO esa parte (POST …/items/:itemKey/retry): se genera únicamente ella, ninguna
+        // parte completa se vuelve a pedir ni a cobrar, el run se cierra con todas sus partes y el paquete final se arma. ──
+        if (vib) {
+          const vibKey = vib.item_key;
+          const [st0] = await q(`select worker_status from public.production_jobs where id = $1`, [c2.runId]);
+          eq(st0 && st0.worker_status, 'failed', 'E24b-R1: el run quedó `failed` con una sola parte pendiente (el mismo estado que R1)');
+          const snapOthers = async () => q(`select item_key, status, attempt_count, generation, finished_at::text f from public.generation_item_runs where job_id = $1 and item_key <> $2 order by item_key, generation`, [c2.runId, vibKey]);
+          const evOthers = async () => (await q(`select count(*)::int n, coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1 and coalesce(item_key, '') <> $2`, [c2.runId, vibKey]))[0];
+          const others0 = await snapOthers();
+          const ev0 = await evOthers();
+          const nReq0 = fake.st.requests.length;
+          const pkgJobs0 = (await q(`select count(*)::int n from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1`, [c2.runId]))[0].n;
+          // ── r65 · el DUEÑO NO admin (mismo sub, email fuera de SUPER_ADMIN_EMAILS): el servidor le dice que esta parte
+          // (resultado ambiguo de la IA, llm_pending_review) no la puede reintentar él — reintentarla podría cobrar dos
+          // veces — y su POST …/retry se rechaza con 409 ambiguous_paid_result SIN cambiar nada. El reintento positivo del
+          // dueño (item_recovery_budget_exhausted con saldo) lo cubre scripts/check-r65-owner-retry.js (DB real). ──
+          const OWNER_NONADMIN = jwt.sign({ sub: OWNER, email: 'e2e-v3-owner-nonadmin@example.com', role: 'authenticated', aud: 'authenticated', user_metadata: { email_verified: true } }, JWT_SECRET, { algorithm: 'HS256', expiresIn: '1h' });
+          const gNa = await api('GET', runsBase2, undefined, OWNER_NONADMIN);
+          const vibNa = gNa.status === 200 && gNa.data ? (gNa.data.items || []).find((i) => i.itemKey === vibKey) : null;
+          ok(!!vibNa && !!vibNa.ownerRetry && vibNa.ownerRetry.allowed === false && vibNa.ownerRetry.reason === 'ambiguous_paid_result' && vibNa.ownerRetry.windowHours === 24,
+            'E24b-R65: el dueño NO admin ve el veredicto del servidor (ownerRetry.allowed=false, ambiguous_paid_result) en la parte con resultado ambiguo', { s: gNa.status, or: vibNa && vibNa.ownerRetry });
+          const rtNa = await api('POST', `${runsBase2}/items/${encodeURIComponent(vibKey)}/retry`, {}, OWNER_NONADMIN);
+          const [vibNaRow] = await q(`select status, error from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [c2.runId, vibKey]);
+          ok(rtNa.status === 409 && /ambiguous_paid_result/.test(String(rtNa.error || '')) && vibNaRow && vibNaRow.status === 'failed' && fake.st.requests.length === nReq0,
+            'E24b-R65: el reintento del dueño NO admin de esa parte → 409 ambiguous_paid_result; la parte sigue failed y no hubo llamadas nuevas', { s: rtNa.status, e: rtNa.error, st: vibNaRow && vibNaRow.status });
+          const rt = await api('POST', `${runsBase2}/items/${encodeURIComponent(vibKey)}/retry`, {});
+          ok(rt.status === 200 || rt.status === 201, 'E24b-R1: el dueño reintenta SOLO la parte pendiente (POST …/items/:itemKey/retry)', { s: rt.status, e: rt.error });
+          const endR1 = await waitFor('E24b-R1: run cerrado tras el reintento', async () => {
+            const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c2.runId]);
+            const rowsNow = await finished(c2.runId);
+            const vibNow = rowsNow.find((i) => i.item_key === vibKey);
+            return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) && vibNow && ['completed', 'failed'].includes(vibNow.status) ? j.worker_status : null;
+          }, 10 * 60 * 1000, 1000);
+          const rowsR1 = await finished(c2.runId);
+          ok(['completed', 'preview'].includes(endR1) && rowsR1.every((i) => i.status === 'completed'), `E24b-R1: tras el reintento TODAS las partes quedan completas y el run cierra (${endR1})`, rowsR1.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 160)]));
+          eq(await snapOthers(), others0, 'E24b-R1: ninguna parte ya completa se volvió a generar (mismo intento, generación y fin)');
+          const ev1 = await evOthers();
+          eq([ev1.n, ev1.t], [ev0.n, ev0.t], 'E24b-R1: ninguna parte ya completa volvió a gastar (eventos del ledger de las demás partes idénticos)');
+          const newReqs = fake.st.requests.slice(nReq0);
+          ok(newReqs.length >= 1 && newReqs.every((r) => r.text.includes('Genera la EXPERIENCIA del capítulo') && r.text.includes('CAPÍTULO: "Vibraciones en bombas"')),
+            `E24b-R1: las ${newReqs.length} llamadas nuevas a la IA son SOLO de la parte reintentada`, newReqs.map((r) => r.text.slice(0, 90)));
+          // El paquete: automático si el run quedó `completed`; con IA falsa el run es `preview` y se pide a mano (mismo builder).
+          if (endR1 === 'preview') {
+            const pk = await api('POST', `${runsBase2}/package`, {});
+            ok(pk.status === 200 || pk.status === 201 || pk.status === 202, 'E24b-R1: el paquete del run recuperado se puede pedir', { s: pk.status, e: pk.error });
+          }
+          const pkgR1 = await waitFor('E24b-R1: paquete del run recuperado', async () => {
+            const jobs = await q(`select id, worker_status, input_payload, output_summary, error_message from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c2.runId]);
+            return jobs.length > pkgJobs0 && ['completed', 'failed'].includes(jobs[jobs.length - 1].worker_status) ? jobs : null;
+          }, 5 * 60 * 1000, 1000);
+          const pjR1 = pkgR1[pkgR1.length - 1];
+          ok(pjR1.worker_status === 'completed' && pjR1.output_summary && pjR1.output_summary.artifactId, 'E24b-R1: el paquete final del run recuperado se armó y validó (validateMbzV3) sin regenerar nada más', { st: pjR1.worker_status, err: (pjR1.error_message || '').slice(0, 200) });
+          eq(await snapOthers(), others0, 'E24b-R1: el empaque tampoco regeneró ninguna parte');
+          results.courses.E24b.r1Recovery = { endState: endR1, newLlmCalls: newReqs.length, packageJob: pjR1.id, packageStatus: pjR1.worker_status };
+        }
+
+        // ── Corrida 3 (Loop 6): un run ANTERIOR a la activación sigue entero en el navegador; el worker nunca lo toma ──
+        const C3 = { key: 'E24c', title: '[E2E Worker IA E24c] Run anterior a la activación', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Sellado de bombas', objective: 'Sellar bombas de proceso', exam: false, chapters: [
+            { title: 'Juntas de expansión', v: false, a: false, objective: 'Instalar juntas de expansión en la succión' },
+          ] }] };
+        llm.st.tag = 'E24c';
+        const c3 = await createCourse(C3, llm);
+        // Review I1: el plan del curso es del worker y no depende de nada → el run tiene que NACER anterior a la
+        // activación (un trigger temporal de la base de la E2E fecha el INSERT), sin ventana en la que el worker lo vea.
+        await q(`create or replace function e2e_backdate_run() returns trigger language plpgsql as $f$ begin if new.execution_mode = 'dynamic_generation' then new.created_at := '${LLM_SINCE}'::timestamptz - interval '1 hour'; end if; return new; end $f$`);
+        await q(`create trigger e2e_backdate_run_trg before insert on public.production_jobs for each row execute function e2e_backdate_run()`);
+        try { c3.runId = await startRun(c3, C3.title); } finally {
+          await q(`drop trigger if exists e2e_backdate_run_trg on public.production_jobs`);
+          await q(`drop function if exists e2e_backdate_run()`);
+        }
+        CURRENT_RUN = c3.runId;
+        const [c3row] = await q(`select created_at from public.production_jobs where id = $1`, [c3.runId]);
+        ok(new Date(c3row.created_at).getTime() < new Date(LLM_SINCE).getTime(), 'E24c: el run nació antes de la activación', c3row);
+        const fakeBefore = fake.st.requests.length;
+        const claims3 = claimLog.length;
+        const ctl3 = S.front.dynExecutorStart({ courseId: c3.courseId, blueprintNumber: c3.n, runId: c3.runId });
+        await waitRunTerminal(ctl3, 'E24c run', 10 * 60 * 1000, c3.runId).catch(() => null);
+        const rows3 = await finished(c3.runId);
+        const long3 = rows3.filter((i) => LONG.includes(i.type) || i.type === 'course_plan');
+        ok(rows3.length > 0 && rows3.every((i) => i.status === 'completed'), 'E24c: el run anterior a la activación se completa', rows3.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
+        ok(long3.length >= 2 && long3.every((i) => ![W1, W2, W3, W4].includes(i.worker_id)), 'E24c: sus partes LARGAS las generó el navegador (el worker de IA no toma runs anteriores a la activación)', long3.map((i) => [i.item_key, i.worker_id]));
+        ok(claimLog.slice(claims3).some((x) => LONG.includes(x.type)) && claimLog.slice(claims3).some((x) => x.type === 'course_plan') && claimLog.slice(claims3).some((x) => x.type === 'course_intro'),
+          'E24c: el servidor le dejó al navegador las partes de IA (largas, cortas y el plan) de ese run, sin colgarse esperando al worker');
+        eq(fake.st.requests.slice(fakeBefore).filter((r) => r.text.includes('Juntas de expansión')).length, 0, 'E24c: ninguna llamada del worker de IA para el run anterior');
+
+        // ── Corrida 4 (robustez): presupuesto GLOBAL del run agotado → pausa segura sin gastar; nada queda colgado ──
+        const C4 = { key: 'E24d', title: '[E2E Worker IA E24d] Presupuesto agotado', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Operación de bombas', objective: 'Operar bombas de proceso', exam: false, chapters: [
+            { title: 'Arranque de bombas', v: false, a: false, objective: 'Arrancar una bomba centrífuga con seguridad' },
+          ] }] };
+        llm.st.tag = 'E24d';
+        const c4 = await createCourse(C4, llm);
+        c4.runId = await startRun(c4, C4.title);
+        CURRENT_RUN = c4.runId;
+        // El ledger de autorizaciones es append-only: una autorización NUEVA (la vigente es la última) baja el tope a USD 0,01.
+        await q(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, currency, policy_id, decision, approved_by, reason)
+                 select run_id, course_id, estimate_id, 0.01, currency, policy_id, 'ADMIN_APPROVED', 'e2e-admin', 'E2E E24d: presupuesto agotado'
+                   from public.cost_budget_authorizations where run_id = $1 order by created_at desc, id desc limit 1`, [c4.runId]);
+        const fakeBefore4 = fake.st.requests.length;
+        const ctl4 = S.front.dynExecutorStart({ courseId: c4.courseId, blueprintNumber: c4.n, runId: c4.runId });
+        await waitFor('run E24d pausado por el tope', async () => { const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c4.runId]); return j && j.worker_status === 'paused'; }, 120000, 300);
+        ctl4.stop();
+        const [j4] = await q(`select worker_status, output_summary->'pause' p from public.production_jobs where id = $1`, [c4.runId]);
+        ok(j4.worker_status === 'paused' && /cap|tope|budget/i.test(JSON.stringify(j4.p || {})), 'E24d: presupuesto global agotado → el run se pausa solo (pausa segura, reanudable)', j4);
+        await sleep(3000);
+        eq(fake.st.requests.slice(fakeBefore4).filter((r) => r.text.includes('Arranque de bombas') || r.text.includes('Operación de bombas')).length, 0, 'E24d: ninguna llamada pagada del worker con el presupuesto agotado');
+        const running4 = (await finished(c4.runId)).filter((i) => i.status === 'running');
+        eq(running4.length, 0, 'E24d: ninguna parte queda en curso (devueltas a la cola, sin consumir intentos)');
+
+        // ── Corrida 5 (Loop 9 · E24-nobrowser): NINGÚN navegador. El worker de IA genera todas las partes de IA, los workers
+        // de proveedores/video lo suyo, el run termina, el paquete final automático se arma y valida (validateMbzV3) solo. ──
+        const C5 = { key: 'E24e', title: '[E2E Worker IA E24e] Sin navegador: curso completo', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+          { title: 'Puesta en marcha de bombas', objective: 'Poner en marcha bombas centrífugas con seguridad', exam: true, chapters: [
+            { title: 'Cebado de la bomba', v: true, a: true, app: 60, objective: 'Cebar una bomba centrífuga antes del arranque' },
+            { title: 'Arranque y parada', v: false, a: true, objective: 'Arrancar y detener la bomba siguiendo el procedimiento' },
+          ] }] };
+        llm.st.tag = 'E24e';
+        const c5 = await createCourse(C5, llm);
+        const body5 = { nombre: C5.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'real' }; // Gamma/TTS/Videogen REALES contra los fakes locales
+        let st5 = await api('POST', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs`, body5);
+        const est5 = /estimateId=([0-9a-f-]{36})/.exec(String(st5.error || ''));
+        ok(st5.status === 409 && !!est5, 'E24e: proveedores reales sin aprobación → 409 budget_approval_required', { s: st5.status, e: st5.error });
+        await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                 values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E24e: aprobación (proveedores FALSOS locales)')`, [c5.courseId, est5 && est5[1]]);
+        st5 = await api('POST', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs`, body5);
+        ok(st5.status === 201, 'E24e: run creado tras ADMIN_APPROVED', { s: st5.status, e: st5.error });
+        c5.runId = st5.data.run.id;
+        CURRENT_RUN = c5.runId;
+        const claims5 = claimLog.length;
+        // Loop 9 (A4): el run dice que lo genera el servidor (worker de IA vivo que cubre todas sus partes de IA).
+        const r5a = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}`);
+        eq(r5a.data && r5a.data.serverExecuted, true, 'E24e: run.serverExecuted = true (la pantalla puede decir «puedes cerrar esta pestaña»)');
+        eq(r5a.data && r5a.data.legacyFinalExamDeps, false, 'E24e: Manifest nuevo (el final depende de los exámenes de módulo): sin aviso de estructura anterior');
+        // Ningún dynExecutorStart: solo los workers del servidor.
+        const done5 = await waitFor('run E24e terminado sin navegador', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c5.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 15 * 60 * 1000, 1000);
+        const rows5 = await finished(c5.runId);
+        ok(done5 === 'completed', `E24e: el run terminó \`completed\` sin ningún navegador abierto (${done5})`, rows5.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+        ok(rows5.length > 0 && rows5.every((i) => i.status === 'completed'), `E24e: las ${rows5.length} partes completas`, rows5.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status]));
+        const llm5 = rows5.filter((i) => LLM_TYPES.includes(i.type));
+        eq([...new Set(llm5.map((i) => i.type))].sort(), [...LLM_TYPES].sort(), 'E24e: el curso tiene TODOS los tipos de parte de IA (incluidas las interacciones del video y el examen de módulo)');
+        ok(llm5.every((i) => i.worker_id === W3 && i.output_summary && i.output_summary.generatedBy === 'llm-worker'), 'E24e: cada parte de IA la generó el worker de IA', llm5.map((i) => [i.item_key, i.worker_id]));
+        // Fix M3: acá no hay ejecutor del navegador (0 claims por construcción); que el servidor NO le entrega partes de IA a
+        // un navegador ABIERTO lo prueba la corrida 1 (ejecutor corriendo, 0 claims). Acá la prueba es worker_id/generatedBy.
+        eq(claimLog.slice(claims5).length, 0, 'E24e: sin ejecutor del navegador abierto en toda la corrida');
+        const fin5 = rows5.find((i) => i.type === 'final_exam');
+        ok(fin5 && fin5.output_summary.externalStems > 0 && fin5.output_summary.externalStemsSource === 'dependencies', 'E24e: el examen final evitó las preguntas del examen de módulo (externalStems > 0, desde las dependencias)', fin5 && fin5.output_summary);
+        // Empaquetado automático (sin clic): el job del paquete final se arma y valida (validateMbzV3 antes de subir).
+        const pkg5 = await waitFor('paquete final automático de E24e', async () => {
+          const jobs = await q(`select id, worker_status, input_payload, output_summary, error_message from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c5.runId]);
+          return jobs.length && ['completed', 'failed'].includes(jobs[jobs.length - 1].worker_status) ? jobs : null;
+        }, 5 * 60 * 1000, 1000);
+        const pj5 = pkg5[pkg5.length - 1];
+        ok(pkg5.length === 1 && pj5.input_payload.auto === true && pj5.worker_status === 'completed' && pj5.output_summary && pj5.output_summary.artifactId,
+          'E24e: el servidor encoló y COMPLETÓ el paquete final automático (validado con validateMbzV3 por el package worker)', pkg5.map((j) => ({ st: j.worker_status, auto: j.input_payload && j.input_payload.auto, err: (j.error_message || '').slice(0, 300) })));
+        const r5 = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}`);
+        const comp5 = r5.data && r5.data.completion;
+        ok(comp5 && comp5.state === 'complete' && comp5.packageReady === true && comp5.complete === true, 'E24e: el curso queda COMPLETO (completion.state complete) sin intervención ni pestaña', comp5);
+        const pst5 = await api('GET', `/courses/${c5.courseId}/blueprints/${c5.n}/manifest/runs/${c5.runId}/package`);
+        ok(pst5.data && pst5.data.status === 'completed' && pst5.data.deliverable === true && pst5.data.downloadUrl, 'E24e: paquete final entregable descargable', pst5.data);
+        if (pst5.data && pst5.data.downloadUrl) {
+          const buf5 = Buffer.from(await (await fetch(pst5.data.downloadUrl)).arrayBuffer());
+          const z5 = await JSZip.loadAsync(buf5);
+          ok(!!z5.file('moodle_backup.xml') && !!z5.file('files.xml'), `E24e: el .mbz (${buf5.length} bytes) es un backup de Moodle`);
+          results.mbz.E24e = { bytes: buf5.length, sha256: sha(buf5), jobId: pj5.id };
+        }
+        results.courses.E24e = { courseId: c5.courseId, runId: c5.runId, items: rows5.length, llmParts: llm5.length, browserClaims: claimLog.slice(claims5).length, externalStems: fin5 && fin5.output_summary.externalStems, packageJob: pj5.id };
+
+        // ── Corrida 5s (stop_after_item, 2026-10-14): «detener después de» del SERVIDOR con el worker de IA real y la IA falsa,
+        // sin navegador. Al completarse el examen de módulo el run se pausa en la MISMA transacción (el final nunca se
+        // reclama); reanudar → el final se genera y el run termina con el empaque RETENIDO (holdPackaging: ningún job);
+        // liberar la retención (acción explícita) → UN paquete automático. Las partes completas nunca se tocan. ──
+        {
+          const C7 = { key: 'E24s', title: '[E2E Worker IA E24s] Detener después del examen', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'h5p', modules: [
+            { title: 'Lubricación de bombas', objective: 'Lubricar bombas centrífugas', exam: true, chapters: [
+              { title: 'Aceites para rodamientos', v: false, a: false, objective: 'Elegir el aceite de un rodamiento' },
+              { title: 'Intervalos de relubricación', v: false, a: false, objective: 'Planificar la relubricación' },
+            ] }] };
+          llm.st.tag = 'E24s';
+          const c7 = await createCourse(C7, llm);
+          const body7 = { nombre: C7.title, ...CTX, scormTemplateIds: S.templates, videoMode: 'real' };
+          let st7 = await api('POST', `/courses/${c7.courseId}/blueprints/${c7.n}/manifest/runs`, body7);
+          const est7 = /estimateId=([0-9a-f-]{36})/.exec(String(st7.error || ''));
+          if (st7.status === 409 && est7) {
+            await q(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, decision, approved_by, reason)
+                     values ($1, $2, 1000, 'ADMIN_APPROVED', 'e2e-admin@cursia.test', 'e2e E24s: aprobación (proveedores FALSOS locales)')`, [c7.courseId, est7[1]]);
+            st7 = await api('POST', `/courses/${c7.courseId}/blueprints/${c7.n}/manifest/runs`, body7);
+          }
+          ok(st7.status === 201, 'E24s: run creado (proveedores falsos locales, sin navegador)', { s: st7.status, e: st7.error });
+          c7.runId = st7.data.run.id;
+          CURRENT_RUN = c7.runId;
+          const R7 = `/courses/${c7.courseId}/blueprints/${c7.n}/manifest/runs/${c7.runId}`;
+          const [ex7] = await q(`select item_key from public.generation_item_runs where job_id = $1 and type = 'exam'`, [c7.runId]);
+          const [fi7] = await q(`select item_key from public.generation_item_runs where job_id = $1 and type = 'final_exam'`, [c7.runId]);
+          const bad7 = await api('PUT', `${R7}/stop-after`, { itemKeys: ['exam:no-existe'], holdPackaging: true });
+          eq(bad7.status, 404, 'E24s: una parte que no existe en el run → 404');
+          const badBody7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [ex7.item_key], holdPackaging: 'true' });
+          eq(badBody7.status, 400, 'E24s: holdPackaging que no es booleano → 400');
+          // Review M6: sin carrera con el worker — se pausa, se configura y se reanuda (el examen todavía no se generó).
+          const pz7 = await api('POST', `${R7}/pause`);
+          eq(pz7.status, 200, 'E24s: pausa previa a la configuración');
+          const ex7Before = (await q(`select status from public.generation_item_runs where job_id = $1 and item_key = $2`, [c7.runId, ex7.item_key]))[0];
+          ok(ex7Before.status !== 'completed', 'E24s: el examen de módulo todavía no estaba completo al configurar', ex7Before);
+          const set7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [ex7.item_key], holdPackaging: true });
+          ok(set7.status === 200 && set7.data && set7.data.stopAfter && set7.data.stopAfter.itemKeys[0] === ex7.item_key && set7.data.stopAfter.holdPackaging === true && set7.data.stopAfter.firedAt === null,
+            'E24s: PUT stop-after → la config queda en el run (por run, sin tocar DYNAMIC_AUTO_PACKAGE_ENABLED)', { s: set7.status, e: set7.error, sa: set7.data && set7.data.stopAfter });
+          const rz7 = await api('POST', `${R7}/resume`);
+          eq(rz7.status, 200, 'E24s: reanudar tras configurar');
+          const fakeBefore7 = fake.st.requests.length;
+          const paused7 = await waitFor('run E24s pausado por stop_after_item', async () => {
+            const [j] = await q(`select worker_status, output_summary from public.production_jobs where id = $1`, [c7.runId]);
+            return j && ['paused', 'completed', 'failed', 'cancelled', 'preview'].includes(j.worker_status) ? j : null;
+          }, 15 * 60 * 1000, 300);
+          const pause7 = paused7.output_summary && paused7.output_summary.pause;
+          ok(paused7.worker_status === 'paused' && pause7 && pause7.reason === 'stop_after_item' && pause7.pausedBy === 'system:stop_after_item' && paused7.output_summary.stopAfter.firedItemKey === ex7.item_key,
+            'E24s: el examen de módulo se completó (worker de IA) → el SERVIDOR pausó el run (reason stop_after_item), sin navegador', { ws: paused7.worker_status, pause: pause7, sa: paused7.output_summary && paused7.output_summary.stopAfter });
+          await sleep(4000); // margen: un worker que sondea cada 300 ms habría reclamado algo
+          const rowsP7 = await finished(c7.runId);
+          const exRow7 = rowsP7.find((i) => i.item_key === ex7.item_key);
+          const fiRow7 = rowsP7.find((i) => i.item_key === fi7.item_key);
+          ok(exRow7.status === 'completed' && fiRow7.status === 'pending' && fiRow7.attempt_count === 0,
+            'E24s: el examen final NUNCA se reclamó (pending, 0 intentos) aunque sus dependencias estaban completas', { ex: [exRow7.status], fin: [fiRow7.status, fiRow7.attempt_count] });
+          const claimedAfter7 = await q(`select item_key from public.generation_item_runs where job_id = $1 and claimed_at > $2::timestamptz`, [c7.runId, pause7.pausedAt]);
+          eq(claimedAfter7.map((x) => x.item_key), [], 'E24s: ninguna parte se reclamó después de la pausa del servidor');
+          const isFinal7 = (t) => /EXAM_BANK_FINAL_CHAPTER|evaluación FINAL del curso|EXAMEN FINAL/.test(t) && C7.modules[0].chapters.some((ch) => t.includes(ch.title));
+          const finalReqsPaused7 = fake.st.requests.length;
+          eq(fake.st.requests.slice(fakeBefore7).filter((r) => isFinal7(r.text)).length, 0, 'E24s: 0 llamadas de IA del examen final mientras está pausado');
+          const g7 = await api('GET', R7);
+          ok(g7.data && g7.data.paused === true && g7.data.pauseInfo && g7.data.pauseInfo.automatic === true && g7.data.pauseInfo.reason === 'stop_after_item' && g7.data.stopAfter.firedAt,
+            'E24s: GET → paused, pauseInfo automático stop_after_item, stopAfter.firedAt', g7.data && { p: g7.data.pauseInfo, sa: g7.data.stopAfter });
+          // Regresión: una parte completa nunca se vuelve a generar ni se toca (config sobre una parte completa → 409).
+          const done7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [ex7.item_key], holdPackaging: true });
+          ok(done7.status === 409 && /already_completed|ya están completas/.test(JSON.stringify(done7.raw || {})), 'E24s: stop-after sobre una parte YA completa → 409 (nunca la regenera)', { s: done7.status, e: done7.error });
+          // Volver a configurar solo la retención del empaque (sin detener) para que siga vigente tras el disparo.
+          const hold7 = await api('PUT', `${R7}/stop-after`, { itemKeys: [], holdPackaging: true });
+          ok(hold7.status === 200 && hold7.data.stopAfter.holdPackaging === true && hold7.data.stopAfter.itemKeys.length === 0, 'E24s: retener solo el empaque (itemKeys vacío + holdPackaging)', { s: hold7.status, e: hold7.error });
+          const fp7 = async () => (await q(`select item_key, status, generation, attempt_count, max_attempts, md5(coalesce(output_summary::text, '')) os, updated_at::text u
+                                              from public.generation_item_runs where job_id = $1 and status = 'completed' order by item_key`, [c7.runId]));
+          const before7 = await fp7();
+          const res7 = await api('POST', `${R7}/resume`);
+          eq(res7.status, 200, 'E24s: reanudar (acción explícita) → 200');
+          const end7 = await waitFor('run E24s terminado', async () => {
+            const [j] = await q(`select worker_status, output_summary from public.production_jobs where id = $1`, [c7.runId]);
+            return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j : null;
+          }, 15 * 60 * 1000, 500);
+          const after7 = await finished(c7.runId);
+          ok(end7.worker_status === 'completed' && after7.every((i) => i.status === 'completed'), `E24s: tras reanudar el examen final se generó y el run terminó \`completed\` (${end7.worker_status})`, after7.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+          ok(fake.st.requests.slice(finalReqsPaused7).filter((r) => isFinal7(r.text)).length > 0, 'E24s: el detector de llamadas del examen final no es vacío (tras reanudar sí las ve)');
+          const stillSame7 = (await fp7()).filter((r) => before7.some((b) => b.item_key === r.item_key));
+          eq(stillSame7, before7, 'E24s: las partes que ya estaban completas quedaron INTACTAS (estado, generación, intentos, salida, updated_at)');
+          const gens7 = await q(`select count(*)::int n from public.generation_item_runs where job_id = $1 and generation > 1`, [c7.runId]);
+          eq(gens7[0].n, 0, 'E24s: ninguna parte se regeneró (sin generaciones nuevas)');
+          const ap7 = end7.output_summary && end7.output_summary.autoPackage;
+          ok(ap7 && ap7.held && !ap7.eligibleAt, 'E24s: holdPackaging → el run completo queda con autoPackage.held (sin la marca eligibleAt)', ap7);
+          await sleep(6000);
+          const pk7 = await q(`select id from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1`, [c7.runId]);
+          eq(pk7.length, 0, 'E24s: completar el run NO encoló ningún paquete (empaque automático retenido para ESTE run)');
+          const g7b = await api('GET', R7);
+          // Tras el disparo se reconfiguró SOLO la retención (itemKeys vacío) → motivo package_hold (review M2).
+          ok(g7b.data && g7b.data.packageHold && g7b.data.packageHold.reason === 'package_hold' && g7b.data.completion.packageJob && g7b.data.completion.packageJob.held === true && g7b.data.completion && g7b.data.completion.generationComplete === true && g7b.data.completion.packageJob && g7b.data.completion.packageJob.auto === false,
+            'E24s: GET → packageHold visible; completion: generación completa y empaque NO automático (solo por acción explícita)', g7b.data && { h: g7b.data.packageHold, c: g7b.data.completion });
+          const rel7 = await api('POST', `${R7}/package-hold/release`);
+          eq(rel7.status, 200, 'E24s: liberar la retención (acción explícita) → 200');
+          const pkg7 = await waitFor('paquete final de E24s tras liberar la retención', async () => {
+            const jobs = await q(`select id, worker_status, input_payload from public.production_jobs where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 order by created_at`, [c7.runId]);
+            return jobs.length && ['completed', 'failed'].includes(jobs[jobs.length - 1].worker_status) ? jobs : null;
+          }, 5 * 60 * 1000, 1000);
+          ok(pkg7.length === 1 && pkg7[0].input_payload.auto === true && pkg7[0].worker_status === 'completed', 'E24s: liberada la retención → UN paquete automático, completado', pkg7.map((j) => [j.worker_status, j.input_payload && j.input_payload.auto]));
+          const rel7b = await api('POST', `${R7}/package-hold/release`);
+          eq(rel7b.status, 409, 'E24s: liberar dos veces → 409 (sin segundo paquete)');
+          results.courses.E24s = { courseId: c7.courseId, runId: c7.runId, items: after7.length, pausedAt: pause7 && pause7.pausedAt, packageJob: pkg7[0] && pkg7[0].id };
+        }
+
+        // ── Corrida 6 (Loop 9 fix I2 · configuración de STAGING): worker de IA HOSPEDADO en dynamic-provider-worker, pool de 1
+        // conexión (DB_POOL_MAX_WORKER=1), 4 partes en paralelo. ≥ 4 partes en vuelo más largas que la lease → los latidos
+        // las sostienen (sin leaseLost); drenaje (SIGTERM) con ≥ 3 en vuelo → se devuelven sin reservas desconocidas ni
+        // llm_pending_review, y otro worker termina el run. ──
+        w3.kill('SIGTERM');
+        await waitFor('worker 3 detenido', async () => !!w3.exited, 120000, 200);
+        const W5 = 'e2e-llm-worker-5';
+        const stagingEnv = (id) => ({ ...wEnv(id), DYNAMIC_LLM_WORKER_CONCURRENCY: '4', DB_POOL_MAX_WORKER: '1', DB_POOL_IDLE_MS_WORKER: '1000' });
+        w4 = spawnProc('llm-worker-4', 'workers/dynamic-provider-worker.js', { ...stagingEnv(W4), DYNAMIC_PROVIDER_WORKER_ID: 'e2e-provider-hosting-llm-4', DYNAMIC_PROVIDER_WORKER_POLL_MS: '400' });
+        await waitFor('worker 4 (hospedado, staging) anunciado', async () => (await q(`select 1 from public.llm_worker_presence where worker_id = $1 and not draining and last_seen > now() - interval '30 seconds'`, [W4])).length > 0, 120000, 300);
+        const C6 = { key: 'E24f', title: '[E2E Worker IA E24f] Config staging: 4 en paralelo', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: false, engine: 'h5p', modules: [
+          { title: 'Mantenimiento de motores', objective: 'Mantener motores eléctricos', exam: false, chapters: [
+            { title: 'Rodamientos de motores', v: false, a: false, objective: 'Revisar rodamientos de un motor' },
+            { title: 'Aislamiento de bobinados', v: false, a: false, objective: 'Medir el aislamiento de un bobinado' },
+            { title: 'Ventilación del motor', v: false, a: false, objective: 'Asegurar la ventilación de un motor' },
+            { title: 'Alineación del acople', v: false, a: false, objective: 'Alinear el acople motor-bomba' },
+          ] }] };
+        llm.st.tag = 'E24f';
+        const c6 = await createCourse(C6, llm);
+        const isExp6 = (t) => t.includes('Genera la EXPERIENCIA del capítulo') && C6.modules[0].chapters.some((ch) => t.includes(`CAPÍTULO: "${ch.title}"`));
+        fake.rule(isExp6, 'slow', 4, 25000); // 25 s > lease de 15 s: solo los latidos las mantienen
+        c6.runId = await startRun(c6, C6.title);
+        CURRENT_RUN = c6.runId;
+        const inflight6 = await waitFor('≥ 4 experiencias en vuelo a la vez en el worker hospedado', async () => {
+          const pend = fake.st.requests.filter((r) => r.action === 'slow' && r.outcome === 'pending' && isExp6(r.text));
+          const run = (await finished(c6.runId)).filter((i) => i.status === 'running' && i.worker_id === W4);
+          return pend.length >= 4 && run.length >= 4 ? run : null;
+        }, 300000, 200);
+        await sleep(18000); // más que la lease (15 s): sin latidos se perderían
+        const held6 = await q(`select item_key, status, worker_id, lease_until > now() as alive from public.generation_item_runs where job_id = $1 and status = 'running'`, [c6.runId]);
+        ok(held6.length >= 4 && held6.every((i) => i.worker_id === W4 && i.alive) && inflight6.length >= 4,
+          'E24f: 4 partes en paralelo con 1 conexión de pool: los latidos renuevan la lease pasada su duración (ninguna se pierde)', held6);
+        // Drenaje (deploy) con ≥ 3 en vuelo.
+        const draining6 = (await finished(c6.runId)).filter((i) => i.status === 'running' && i.worker_id === W4).map((i) => i.item_key);
+        ok(draining6.length >= 3, `E24f: ${draining6.length} partes en vuelo al pedir el drenaje`, draining6);
+        w4.kill('SIGTERM');
+        await waitFor('worker 4 drenado', async () => !!w4.exited, 150000, 200);
+        const after6 = await finished(c6.runId);
+        ok(after6.every((i) => i.status !== 'running'), 'E24f: drenaje — nada quedó en curso (terminó o volvió a la cola)', after6.filter((i) => i.status === 'running').map((i) => i.item_key));
+        ok(!after6.some((i) => /^llm_pending_review/.test(i.error || '') || (i.output_summary && i.output_summary.llmPendingReview)), 'E24f: drenaje sin partes en revisión (llm_pending_review)');
+        const unk6 = (await q(`select count(*)::int n from public.generation_cost_events e where e.run_id = $1 and (e.metadata->>'reservation') = 'true'
+            and not exists (select 1 from public.generation_cost_events a where a.corrects_event_id = e.id)`, [c6.runId]))[0].n;
+        eq(unk6, 0, 'E24f: drenaje sin reservas desconocidas (todas liquidadas)');
+        const leaseLost6 = fs.readFileSync(w4.logFile, 'utf8').split('\n').filter((l) => /: abandoned\b|lease_lost/.test(l));
+        eq(leaseLost6, [], 'E24f: el worker hospedado nunca perdió una lease (sin abandoned)');
+        // Otro worker (GIFT forzado: corrida 7) termina el run.
+        w5 = spawnProc('llm-worker-5', 'workers/dynamic-llm-worker.js', { ...wEnv(W5), DYNAMIC_LLM_WORKER_EXAM_BANK: 'off' });
+        const done6 = await waitFor('run E24f terminado', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c6.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 10 * 60 * 1000, 1000);
+        const rows6 = await finished(c6.runId);
+        ok(['completed', 'preview'].includes(done6) && rows6.every((i) => i.status === 'completed'), `E24f: el run se completa tras el drenaje (${done6})`, rows6.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 160)]));
+        results.courses.E24f = { courseId: c6.courseId, runId: c6.runId, inFlight: held6.length, drained: draining6.length, unsettled: unk6 };
+
+        // ── Corrida 7 (Loop 9 fix M4): en el worker, actividad variante SCORM y exámenes GIFT (modo banco apagado), sin navegador ──
+        const C7 = { key: 'E24g', title: '[E2E Worker IA E24g] SCORM y GIFT en el worker', theme: { themeFamily: 'aula-clara', mode: 'light' }, passing: 70, finalExam: true, engine: 'scorm', modules: [
+          { title: 'Seguridad eléctrica', objective: 'Trabajar con seguridad eléctrica', exam: true, chapters: [
+            { title: 'Bloqueo de energía', v: false, a: true, objective: 'Bloquear la energía antes de intervenir' },
+            { title: 'Equipos de protección', v: false, a: true, objective: 'Elegir el equipo de protección adecuado' },
+          ] }] };
+        llm.st.tag = 'E24g';
+        const c7 = await createCourse(C7, llm);
+        c7.runId = await startRun(c7, C7.title);
+        CURRENT_RUN = c7.runId;
+        const claims7 = claimLog.length;
+        const done7 = await waitFor('run E24g terminado sin navegador', async () => {
+          const [j] = await q(`select worker_status from public.production_jobs where id = $1`, [c7.runId]);
+          return j && ['completed', 'preview', 'failed', 'cancelled'].includes(j.worker_status) ? j.worker_status : null;
+        }, 10 * 60 * 1000, 1000);
+        const rows7 = await finished(c7.runId);
+        ok(['completed', 'preview'].includes(done7) && rows7.every((i) => i.status === 'completed'), `E24g: run completo sin navegador (${done7})`, rows7.filter((i) => i.status !== 'completed').map((i) => [i.item_key, i.status, (i.error || '').slice(0, 200)]));
+        const arts7 = await artifactsOfRun(c7.runId);
+        const acts7 = rows7.filter((i) => i.type === 'activity');
+        // La variante SCORM no tiene validador de servidor (solo la h5p): se comprueba que el worker la generó con sus artifacts.
+        ok(acts7.length === 2 && acts7.every((i) => i.worker_id === W5 && i.output_summary && i.output_summary.generatedBy === 'llm-worker' && arts7.some((a) => a.item_key === i.item_key)),
+          'E24g: las actividades variante SCORM las generó el worker (con su paquete)', acts7.map((i) => [i.item_key, i.worker_id, arts7.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
+        const exams7 = rows7.filter((i) => i.type === 'exam' || i.type === 'final_exam');
+        ok(exams7.length === 2 && exams7.every((i) => i.worker_id === W5 && arts7.filter((a) => a.item_key === i.item_key && /^dynamic_exam_/.test(a.type)).map((a) => a.type).join() === 'dynamic_exam_gift'),
+          'E24g: examen de módulo y final como GIFT en el worker (DYNAMIC_LLM_WORKER_EXAM_BANK=off)', exams7.map((i) => [i.item_key, i.worker_id, arts7.filter((a) => a.item_key === i.item_key).map((a) => a.type)]));
+        eq(claimLog.slice(claims7).length, 0, 'E24g: sin ejecutor del navegador');
+        // Review r2 (m4) / R2: worker 5 apunta a la IA falsa SIN ANTHROPIC_BASE_URL_IS_REAL_PROVIDER → todo su texto es mock
+        // y el run nunca puede ser final (vista previa).
+        const llm7 = rows7.filter((i) => LLM_TYPES.includes(i.type) && i.worker_id === W5);
+        ok(llm7.length > 0 && llm7.every((i) => i.output_summary && i.output_summary.llmMode === 'mock') && done7 === 'preview',
+          'E24g: override sin el flag de proveedor real → llmMode=mock en cada parte del worker y run en vista previa (R2)', { done7, m: llm7.map((i) => [i.item_key, i.output_summary && i.output_summary.llmMode]) });
+        results.courses.E24g = { courseId: c7.courseId, runId: c7.runId, items: rows7.length, status: done7 };
+      } finally {
+        for (const w of [w1, w2, w3, w4, w5]) if (w && !w.exited) await stopProc(w, 30000);
+        await fake.close();
+        await stopProc(app);
+        app = await startApp();
+      }
+    }, { fatal: false });
+
+    // ═══ Moodle: restore + inspección + simulación de notas (4 MBZ) ═══
+    const MOODLE_JOBS = ONLY_REAL_PROVIDERS || ONLY_LLM_WORKER ? [] : [['E1', 'E1'], ['E1-repack', 'E1repack'], ['E2', 'E2'], ['E3', 'E3']];
+    // EV6 H5P v2: E5 entra al mismo restore + inspección (con los «Repaso» del paquete).
+    if (results.mbz.E5) MOODLE_JOBS.push(['E5', 'E5']);
+    // LOOP 7 · E11: el curso del flujo completo y su re-empaque tras la regeneración parcial.
+    if (results.mbz.E11 && results.courses.E11) MOODLE_JOBS.push(['E11', 'E11']);
+    if (results.mbz['E11-regen'] && results.courses.E11regen) MOODLE_JOBS.push(['E11-regen', 'E11regen']);
+    // LOOP 8.5 · E17: el flujo V2 definitivo y su re-empaque.
+    if (results.mbz.E17 && results.courses.E17) MOODLE_JOBS.push(['E17', 'E17']);
+    if (results.mbz['E17-regen'] && results.courses.E17regen) MOODLE_JOBS.push(['E17-regen', 'E17regen']);
+    // LOOP 9 · E20: el curso del piloto (propuesta aprobada tras el contrato) → restore, permisos y notas en Moodle.
+    if (results.mbz.E20 && results.courses.E20) MOODLE_JOBS.push(['E20', 'E20']);
+    // Fase 2/3 · E21: el curso con la estructura personalizada (contenidos redistribuidos) → restore, permisos y notas.
+    if (results.mbz.E21 && results.courses.E21) MOODLE_JOBS.push(['E21', 'E21']);
+    // Cierre · E22: el piloto «Atención a víctimas de violencia sexual» (generación MOCK) → restore, permisos y notas.
+    if (results.mbz.E22 && results.courses.E22) MOODLE_JOBS.push(['E22', 'E22']);
+    // Loop 9 B · E7: el curso con Actividades de Aplicación y práctica guiada → restore, secuencia, permisos y notas.
+    if (results.mbz.E7 && results.courses.E7 && results.courses.E7.manifestModules) MOODLE_JOBS.push(['E7', 'E7']);
+    const SHELL = D('modules/course-shell/index.js');
+    const AS = D('package/assessment/index.js');
+    const { mp3DurationSeconds } = D('package/audio/mp3-parser.js');
+    const { formatDurationEs } = D('package/audio/format-duration.js');
+    const PHP = process.env.PHP_BIN;
+    const PHPINI = process.env.MOODLE_PHPINI;
+    const kindOf = (idn) => (/:video$/.test(idn) ? 'video' : /:activity$/.test(idn) ? 'activity' : /^cv3:exam:/.test(idn) ? 'exam' : idn === 'cv3:final_exam' ? 'finalExam' : null);
+    results.moodle = {};
+    if (!ONLY_REAL_PROVIDERS && !ONLY_LLM_WORKER) await step('moodle-preflight-h5p', async () => {
+      const pf = spawnSync(process.execPath, [path.join(REPO, 'scripts/h5p-preflight-moodle.js'), process.env.MOODLE_ROOT, PHPINI], { encoding: 'utf8', env: { ...process.env, PHP_BIN: PHP } });
+      ok(pf.status === 0, 'preflight de librerías H5P del sitio vs CURSIA_H5P_PROFILE_V1 (h5p-preflight-moodle.js) pasa', (pf.stdout + pf.stderr).slice(-800));
+    }, { fatal: false });
+    for (const [label, ckey] of MOODLE_JOBS) {
+      await step(`moodle-${label}`, async () => {
+        const info = results.courses[ckey];
+        const mbz = results.mbz[label];
+        const rs = spawnSync(path.join(MOODLE_SCRATCH, 'restore-and-inspect.sh'), [mbz.file], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        fs.writeFileSync(path.join(V3OUT, `moodle-${label}.restore.log`), `${rs.stdout}\n--- stderr ---\n${rs.stderr}`);
+        ok(rs.status === 0, `${label}: restore-and-inspect.sh exit 0`, rs.stderr.slice(-600));
+        const courseid = Number((/Restored course id: (\d+)/.exec(rs.stderr) || [])[1]);
+        ok(courseid > 0, `${label}: curso Moodle restaurado #${courseid}`);
+        const cliWarn = rs.stderr.split('\n').filter((l) => /warning|notice|debug|deprecated|exception/i.test(l));
+        eq(cliWarn, [], `${label}: salida del CLI de restore sin warnings/notices`);
+        const inPath = path.join(V3OUT, `moodle-${label}.in.json`);
+        const outPath = path.join(V3OUT, `moodle-${label}.json`);
+        fs.writeFileSync(inPath, JSON.stringify({ moodleRoot: process.env.MOODLE_ROOT, courseid, mbz: mbz.file }));
+        const ins = spawnSync(PHP, ['-c', PHPINI, path.join(REPO, 'scripts/moodle/v21-packaging-v3-inspect.php'), inPath, outPath], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        ok(ins.status === 0 && !/warning|notice|deprecated/i.test(ins.stderr || ''), `${label}: inspector PHP sin error`, (ins.stderr || '').slice(0, 600));
+        const o = JSON.parse(fs.readFileSync(outPath, 'utf8'));
+        results.moodle[label] = { courseid, warnings: (o.precheck.warnings || []).length + (o.precheck.errors || []).length + (o.restoreLogLines || []).length + (o.restoreDbLogWarnings || []).length + cliWarn.length };
+        eq(o.precheck, { warnings: [], errors: [] }, `${label}: precheck 0 warnings / 0 errors`);
+        eq(o.restoreStatus, 1000, `${label}: restore_controller status 1000 (FINISHED_OK)`);
+        eq([o.restoreLogFound, o.restoreLogLines, o.restoreDbLogWarnings], [true, [], []], `${label}: log del restore y backup_logs sin warnings`);
+        // Estructura por UUID (idnumber cv3:…) = Manifest + chapterSlotSequence (orden del ensamblador).
+        const M = { modules: info.manifestModules, features: info.features };
+        // EV6: una sección por capítulo (la presentación del módulo arriba del primero), una por
+        // evaluación de módulo, la evaluación final y, ÚLTIMO, el cierre del curso.
+        const want = [];
+        // UX r18 (problema 1): hero de bienvenida primero (bajo el encabezado de Moodle), foro de avisos al final.
+        want.push([0, ['cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start', 'cv3:shell:forum']]);
+        want.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:audiobook', 'cv3:shell:route_start']]); // #583: sin libro_card
+        const secOfCh = {}; const secOfExam = {}; const firstSecOfMod = {};
+        let sn = 2;
+        // EV6 P2-B4: sin evaluación final (= sin certificado) la nota oculta para docentes de «Respuestas
+        // explicadas» abre la PRIMERA sección de evaluación; cada quiz va seguido de su página.
+        let examsTeacherNote = !M.features.finalExam;
+        for (const mod of M.modules) {
+          mod.chapters.forEach((ch, ci) => {
+            const ids = ci === 0 ? [`cv3:module_intro:${mod.moduleId}`] : [];
+            // EV6 H5P v2: los «Repaso» salen de los paquetes H5P del empaque (vacío en E1–E4: secuencia de siempre).
+            const reviewSet = new Set(info.reviewCardsChapterIds || []);
+            // LOOP 7: capítulos de práctica y Actividades de Aplicación (página + solucionario) en su lugar.
+            // Loop 9 B: y la práctica guiada (página visible tras el texto del capítulo de contenido).
+            for (const s of SHELL.chapterSlotSequence({ videoEnabled: ch.videoEnabled, activityEnabled: ch.activityEnabled, reviewCards: reviewSet.has(ch.chapterId), practice: ch.kind === 'practice', application: ch.applicationMinutes !== undefined, guidedPractice: ch.guidedPracticeMinutes !== undefined })) {
+              const role = s.startsWith('label:') ? s.slice(6) : s === 'video_h5p' ? 'video' : s;
+              ids.push(`cv3:ch:${ch.chapterId}:${role}`);
+            }
+            // EV6 fix 1 (I1): sin examen no hay module_next (el cierre del último capítulo es el siguiente paso).
+            if (ci === 0) firstSecOfMod[mod.moduleId] = sn;
+            secOfCh[ch.chapterId] = sn;
+            want.push([sn++, ids]);
+          });
+          if (mod.examEnabled) {
+            secOfExam[mod.moduleId] = sn;
+            const ids = [`cv3:exam_info:${mod.moduleId}`, `cv3:exam:${mod.moduleId}`, `cv3:exam_explanations:${mod.moduleId}`, `cv3:module_next:${mod.moduleId}`];
+            if (examsTeacherNote) ids.unshift('cv3:shell:exams_teacher');
+            examsTeacherNote = false;
+            want.push([sn++, ids]);
+          }
+        }
+        const finalSec = M.features.finalExam ? sn : null;
+        if (M.features.finalExam) want.push([sn++, ['cv3:final_exam_info', 'cv3:final_exam', 'cv3:final_exam_explanations', 'cv3:final_exam_next']]);
+        const closingSec = sn;
+        // EV6 T3: + label oculto para docentes (activar la insignia-certificado) al final del cierre;
+        // fix round 1b: el certificado existe SOLO con evaluación final.
+        want.push([closingSec, M.features.finalExam ? ['cv3:shell:closing', 'cv3:shell:certificate_teacher'] : ['cv3:shell:closing']]);
+        eq((o.badges || []).length, M.features.finalExam ? 1 : 0, `${label}: insignia-certificado ${M.features.finalExam ? 'presente (hay evaluación final)' : 'ausente (sin evaluación final)'}`);
+        eq(o.sections.map((s) => [s.section, s.cms.map((c) => c.idnumber)]), want, `${label}: secciones × actividades por UUID = orden del ensamblador de capítulo (una sección por capítulo / evaluación)`);
+        const secIdx = (idn) => o.sections.findIndex((s) => s.cms.some((c) => c.idnumber === idn));
+        ok(secIdx('cv3:shell:closing') === o.sections.length - 1 && (!M.features.finalExam || secIdx('cv3:final_exam') < secIdx('cv3:shell:closing')),
+          `${label}: el cierre del curso es la última sección y va DESPUÉS de la evaluación final`, o.sections.map((s) => s.name));
+        eq(o.courseFormat, { format: 'topics', coursedisplay: 1 }, `${label}: formato topics, una sección por página (coursedisplay = 1)`);
+        const cms = o.sections.flatMap((s) => s.cms);
+        const cm = Object.fromEntries(cms.map((c) => [c.idnumber, c]));
+        // Sin video/actividad fantasma: V− sin primer/video; A− sin instrucción/actividad; y ningún label de esos capítulos las menciona.
+        const chFlags = M.modules.flatMap((m) => m.chapters);
+        const phantom = [];
+        for (const ch of chFlags) {
+          const mine = cms.filter((c) => c.idnumber && c.idnumber.startsWith(`cv3:ch:${ch.chapterId}:`));
+          if (!ch.videoEnabled && mine.some((c) => /:(video|video_primer)$/.test(c.idnumber))) phantom.push(`${ch.chapterId}: video`);
+          if (!ch.activityEnabled && mine.some((c) => /:(activity|activity_instruction)$/.test(c.idnumber))) phantom.push(`${ch.chapterId}: actividad`);
+        }
+        eq(phantom, [], `${label}: 0 videos/actividades fantasma (V−/A− sin slots)`);
+        const rsv = AS.resolveAssessment(info.assessment && label !== 'E1-repack' ? info.assessment : { ...info.assessment, passingGrade: 80 }, { hasFinalExam: M.features.finalExam, activityEngine: M.features.activityEngine });
+        const passing = label === 'E1-repack' ? 80 : info.spec.passing;
+        results.moodle[label].passing = passing;
+        // gradepass/grademax/categoría/completion por ítem calificable
+        const graded = cms.filter((c) => kindOf(c.idnumber));
+        const bad = [];
+        for (const c of graded) {
+          const k = rsv.kinds[kindOf(c.idnumber)];
+          const it = o.items.find((i) => i.idnumber === c.idnumber);
+          if (!it) { bad.push(`${c.idnumber}: sin grade item`); continue; }
+          if (it.gradepass !== passing || k.passingGrade !== passing) bad.push(`${c.idnumber}: gradepass ${it.gradepass} ≠ ${passing}`);
+          if (it.grademax !== 100 || it.grademin !== 0) bad.push(`${c.idnumber}: rango ${it.grademin}–${it.grademax}`);
+          if (it.category !== AS.ASSESSMENT_CATEGORY_NAMES[k.category]) bad.push(`${c.idnumber}: categoría ${it.category}`);
+          // r55 (R5/R6): completion al RECIBIR nota (completionpassgrade 0); el gradepass del ítem es informativo.
+          if (!(c.completion === 2 && String(c.completiongradeitemnumber) === '0' && c.completionpassgrade === 0)) bad.push(`${c.idnumber}: completion ${c.completion}/${c.completiongradeitemnumber}/${c.completionpassgrade}`);
+        }
+        eq(bad, [], `${label}: ${graded.length} ítems calificables con gradepass ${passing}, 0–100, categoría y completion al recibir nota`);
+        const wantW = M.features.finalExam ? [30, 50, 20] : [40, 60];
+        eq(o.categories.filter((x) => x.depth === 2).map((x) => x.weight), wantW, `${label}: categorías ponderadas ${wantW.join('/')}`);
+        const top = o.categories.find((x) => x.depth === 1);
+        eq([top.aggregation, o.courseItem.grademax], [10, 100], `${label}: curso con media ponderada (aggregation 10), total sobre 100`);
+        // r55 (R3): UN criterio de nota (tipo 6) = gradepass del ítem del curso; ningún criterio de actividad.
+        eq(o.criteria.map((x) => [x.criteriatype, x.gradepass]), [[6, passing]], `${label}: completion del curso = solo el criterio de nota ${passing} (sin criterios de actividad)`);
+        eq(o.courseItem.gradepass, passing, `${label}: gradepass del ítem del curso = criterio de nota`);
+        const quizzes = Object.entries(o.quizzes);
+        ok(quizzes.length === M.modules.filter((m) => m.examEnabled).length + (M.features.finalExam ? 1 : 0) && quizzes.every(([id, qz]) => qz.attempts === rsv.kinds[kindOf(id)].attempts && qz.sumgrades === 100 && qz.maxmarkSum === 100 && qz.slots > 0),
+          `${label}: quizzes con intentos del perfil (${quizzes.map(([, qz]) => qz.attempts).join(',')}) y Σ maxmark = 100`, o.quizzes);
+        const h5ps = Object.entries(o.h5ps);
+        const deployBad = h5ps.filter(([, h]) => !(h.deploy.h5pid && !h.deploy.exception && h.deploy.messages.length === 0)).map(([id, h]) => [id, h.deploy]);
+        eq(deployBad, [], `${label}: los ${h5ps.length} H5P despliegan con las librerías del sitio (preflight OK)`);
+        const scorms = Object.keys(o.scorms);
+        eq(scorms.length, info.spec.engine === 'scorm' ? chFlags.filter((x) => x.activityEnabled).length : 0, `${label}: SCORM restaurados = actividades del motor scorm`);
+        // Archivos: audio (con duración medida en el label), Libro, Gamma (portada + PDF).
+        const zip = await JSZip.loadAsync(fs.readFileSync(mbz.file));
+        const blobByHash = async (h) => { const f = zip.file(`files/${h.slice(0, 2)}/${h}`); return f ? f.async('nodebuffer') : null; };
+        const aw = (cm['cv3:shell:audio_welcome'] || { files: [] }).files.find((f) => /\.mp3$/.test(f.name));
+        const ab = (cm['cv3:shell:audiobook'] || { files: [] }).files.find((f) => /\.mp3$/.test(f.name));
+        const lb = (cm['cv3:shell:libro'] || { files: [] }).files.find((f) => /^libro_guia_.*\.pdf$/.test(f.name));
+        // r19 L (3.13.0): el Libro Guía restaurado es un PDF real (application/pdf, firma %PDF-).
+        if (lb) { const lbb = await blobByHash(lb.hash); ok(lb.mime === 'application/pdf' && lbb && lbb.subarray(0, 5).toString() === '%PDF-', `${label}: el Libro Guía restaurado es un PDF`, { mime: lb.mime }); }
+        ok(aw && ab && lb, `${label}: audio de bienvenida, audiolibro y Libro Guía restaurados`, { aw, ab, lb });
+        // LOOP 7 (A4 I1/I2): con un ESTUDIANTE y un DOCENTE reales en el curso restaurado: el estudiante ve su Actividad
+        // de Aplicación y NO el solucionario — tampoco si un docente lo muestra por error (override PROHIBIT); el docente sí.
+        if (info.applications) {
+          const vPath = path.join(V3OUT, `moodle-${label}.app.json`);
+          const vr = spawnSync(PHP, ['-c', PHPINI, path.join(REPO, 'scripts/moodle/v21-application-visibility.php'), inPath, vPath], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 });
+          ok(vr.status === 0, `${label}: chequeo de visibilidad con usuarios reales sin error`, (vr.stderr || '').slice(-400));
+          const v = JSON.parse(fs.readFileSync(vPath, 'utf8'));
+          const bad = v.pages.filter((p) => {
+            const sol = /:application_solution$/.test(p.idnumber);
+            return JSON.stringify([p.visible, p.studentVisible, p.studentCanView, p.teacherVisible]) !== JSON.stringify(sol ? [0, false, false, true] : [1, true, true, true]) || p.files.length !== 1;
+          }).map((p) => p.idnumber);
+          eq([v.pages.length, bad], [2 * info.applications, []], `${label}: ${info.applications} Actividades de Aplicación visibles al estudiante con su PDF; solucionarios ocultos`);
+          const leak = v.shownByMistake.filter((x) => !(x.visible === 1 && x.studentOverride === -1000 && !x.studentHasView && !x.studentCanOpen && x.teacherCanOpen)).map((x) => x.idnumber);
+          eq([v.shownByMistake.length, leak], [info.applications, []], `${label}: solucionario mostrado por error → el estudiante NO puede abrirlo ni su PDF; el docente sí`);
+        }
+        const labels = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-v3-labels.php'), process.env.MOODLE_ROOT, String(courseid)], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        const L = JSON.parse((labels.stdout || '{}').split('\n').find((l) => l.startsWith('{')) || '{}');
+        ok(labels.status === 0 && L.labels, `${label}: textos de labels leídos de la DB`, (labels.stderr || '').slice(0, 300));
+        // Guiones suaves (&shy;) que el shell inserta en palabras largas: no son parte del texto que se busca.
+        const text = (idn) => ((L.labels || {})[idn] || '').replace(/<[^>]+>/g, ' ').replace(/&shy;|\u00ad/g, '').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ');
+        if (aw && ab) {
+          const awS = mp3DurationSeconds(await blobByHash(aw.hash));
+          const abS = mp3DurationSeconds(await blobByHash(ab.hash));
+          ok(text('cv3:shell:audio_welcome').includes(formatDurationEs(awS)), `${label}: el label del audio de bienvenida muestra la duración MEDIDA (${formatDurationEs(awS)})`, text('cv3:shell:audio_welcome').slice(0, 300));
+          ok(text('cv3:shell:audiobook').includes(formatDurationEs(abS)), `${label}: el label del audiolibro muestra la duración total MEDIDA (${formatDurationEs(abS)})`, text('cv3:shell:audiobook').slice(0, 300));
+          results.moodle[label].audio = { welcomeSec: awS, audiobookSec: abS };
+        }
+        const pres = cms.filter((c) => /:presentation$/.test(c.idnumber));
+        // Motor de carga horaria: los capítulos de práctica no tienen presentación.
+        const contentFlags = chFlags.filter((c) => c.kind !== 'practice');
+        ok(pres.length === contentFlags.length && pres.every((c) => JSON.stringify(c.files.map((f) => f.mime).sort()) === JSON.stringify(['application/pdf', 'image/png'])), `${label}: ${contentFlags.length} tarjetas Gamma con portada PNG + PDF`, pres.map((c) => c.files.map((f) => f.mime)));
+        // Cifras del shell = Manifest (facts).
+        const nCh = chFlags.length; const nV = chFlags.filter((x) => x.videoEnabled).length; const nA = chFlags.filter((x) => x.activityEnabled).length;
+        const nEval = M.modules.filter((m) => m.examEnabled).length + (M.features.finalExam ? 1 : 0);
+        const w = text('cv3:shell:welcome');
+        const num = (re) => { const m = re.exec(w); return m ? Number(m[1]) : null; };
+        const got = { modules: num(/(\d+)\s+módulos?/), chapters: num(/(\d+)\s+capítulos?/), videos: num(/(\d+)\s+videos? interactivos?/), activities: num(/(\d+)\s+actividad(?:es)? prácticas?/), evaluations: num(/(\d+)\s+evaluaci(?:ón|ones)/) };
+        eq(got, { modules: M.modules.length, chapters: nCh, videos: nV || null, activities: nA || null, evaluations: nEval || null }, `${label}: cifras de la bienvenida = Manifest (módulos, capítulos, videos, actividades, evaluaciones)`);
+        // ningún label de capítulo V−/A− menciona el recurso apagado
+        const mention = [];
+        for (const ch of chFlags) {
+          const t = Object.entries(L.labels || {}).filter(([k]) => k.startsWith(`cv3:ch:${ch.chapterId}:`)).map(([, v]) => v.replace(/<[^>]+>/g, ' ')).join(' ').toLowerCase();
+          if (!ch.videoEnabled && /\bvideo\b/.test(t)) mention.push(`${ch.chapterId.slice(0, 8)} menciona video`);
+          if (!ch.activityEnabled && /actividad (práctica|interactiva)/.test(t)) mention.push(`${ch.chapterId.slice(0, 8)} menciona actividad`);
+        }
+        eq(mention, [], `${label}: ningún label de capítulo menciona un video/actividad apagado`);
+        // M4: la ruta de aprendizaje lista, por capítulo, exactamente sus recursos (V/A).
+        const route = text('cv3:shell:route');
+        const titleOf = Object.fromEntries(info.modules.flatMap((m) => m.chapters).map((x) => [x.id, x.title]));
+        const routeBad = [];
+        for (const ch of chFlags) {
+          const t0 = route.indexOf(titleOf[ch.chapterId]);
+          if (t0 < 0) { routeBad.push(`${ch.chapterId.slice(0, 8)}: no está en la ruta`); continue; }
+          const rest = route.slice(t0 + titleOf[ch.chapterId].length);
+          const seg = rest.slice(0, Math.max(0, rest.search(/Capítulo \d|Módulo \d|Evaluación|Examen/)) || rest.length);
+          if (/video interactivo/.test(seg) !== ch.videoEnabled) routeBad.push(`${titleOf[ch.chapterId]}: video ${ch.videoEnabled}`);
+          if (/actividad práctica/.test(seg) !== ch.activityEnabled) routeBad.push(`${titleOf[ch.chapterId]}: actividad ${ch.activityEnabled}`);
+        }
+        eq(routeBad, [], `${label}: la ruta de aprendizaje lista por capítulo exactamente video/actividad según sus flags`);
+        // Edu EV3: los botones de navegación quedan como URLs reales de Moodle tras restaurar
+        // (tokens decodificados por el restore): actividad, evaluación y sección siguiente.
+        const hrefs = (idn) => Array.from(((L.labels || {})[idn] || '').matchAll(/href="([^"]+)"/g), (m) => m[1]);
+        const ctaBad = [];
+        for (const [idn, html] of Object.entries(L.labels || {})) if (/cursia-cta:|\$@[A-Z]/.test(html)) ctaBad.push(`${idn}: marcador o token sin resolver`);
+        for (const ch of chFlags) {
+          if (!ch.activityEnabled) continue;
+          const hs = hrefs(`cv3:ch:${ch.chapterId}:activity_instruction`);
+          // UX r18 (problema 4): SCORM se abre aparte → «Iniciar actividad» con enlace a la actividad; H5P va embebida
+          // justo debajo → la instrucción NO lleva enlace a la actividad y el intro de la actividad conserva su
+          // respaldo «Ábrela en su propia página →» (enlace real a /mod/h5pactivity/view.php tras restaurar).
+          const actCm = cms.find((c) => c.idnumber === `cv3:ch:${ch.chapterId}:activity`);
+          if (actCm && actCm.modname === 'h5pactivity') {
+            if (hs.some((h) => /\/mod\/h5pactivity\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: «Iniciar actividad» hacia la actividad H5P que ya está embebida (${hs.join(' ')})`);
+            if (!hrefs(`cv3:ch:${ch.chapterId}:activity`).some((h) => /\/mod\/h5pactivity\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: el intro de la actividad H5P perdió el respaldo «Ábrela en su propia página»`);
+          } else if (!hs.some((h) => /\/mod\/scorm\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${ch.chapterId.slice(0, 8)}: «Iniciar actividad» sin enlace a la actividad (${hs.join(' ')})`);
+        }
+        // EV6: cada botón de sección → /course/section.php?id=<id REAL de la sección destino> (exactamente uno).
+        const sidOf = (num) => (o.sections.find((x) => x.section === num) || {}).id;
+        const secLinks = (idn) => hrefs(idn).map((h) => /\/course\/section\.php\?id=(\d+)$/.exec(h)).filter(Boolean).map((m) => Number(m[1]));
+        const navWant = { 'cv3:shell:start': firstSecOfMod[M.modules[0].moduleId], 'cv3:shell:route_start': firstSecOfMod[M.modules[0].moduleId] };
+        M.modules.forEach((m, mi) => {
+          if (m.examEnabled && !hrefs(`cv3:exam_info:${m.moduleId}`).some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push(`${m.moduleId.slice(0, 8)}: «Presentar evaluación» sin enlace al cuestionario`);
+          const nm = M.modules[mi + 1];
+          const after = nm ? firstSecOfMod[nm.moduleId] : finalSec ?? closingSec;
+          if (m.examEnabled) navWant[`cv3:module_next:${m.moduleId}`] = after;
+          m.chapters.forEach((ch, ci) => {
+            const nc = m.chapters[ci + 1];
+            navWant[`cv3:ch:${ch.chapterId}:closing`] = nc ? secOfCh[nc.chapterId] : m.examEnabled ? secOfExam[m.moduleId] : after;
+          });
+        });
+        if (M.features.finalExam) {
+          if (!hrefs('cv3:final_exam_info').some((h) => /\/mod\/quiz\/view\.php\?id=\d+$/.test(h))) ctaBad.push('evaluación final sin enlace');
+          navWant['cv3:final_exam_next'] = closingSec;
+        }
+        for (const [idn, num] of Object.entries(navWant)) {
+          const got = secLinks(idn);
+          if (!(got.length === 1 && sidOf(num) && got[0] === sidOf(num))) ctaBad.push(`${idn}: botón de sección ${JSON.stringify(got)} ≠ sección ${num} (id ${sidOf(num)})`);
+        }
+        for (const idn of Object.keys(L.labels || {})) if (!(idn in navWant) && secLinks(idn).length) ctaBad.push(`${idn}: enlace de sección fuera de un botón de navegación`);
+        for (const m of M.modules) if (!m.examEnabled && (`cv3:module_next:${m.moduleId}` in (L.labels || {}))) ctaBad.push(`${m.moduleId.slice(0, 8)}: module_next en un módulo sin examen (botón duplicado)`);
+        // Fix 1 (I1): ninguna sección tiene dos botones al mismo destino.
+        const dupNav = [];
+        for (const sec of o.sections) {
+          const seen = {};
+          for (const c of sec.cms) for (const t of new Set(secLinks(c.idnumber))) (seen[t] = seen[t] || []).push(c.idnumber);
+          for (const [t, ids] of Object.entries(seen)) if (ids.length > 1) dupNav.push(`sección ${sec.section} → ${t}: ${ids.join(', ')}`);
+        }
+        eq(dupNav, [], `${label}: ninguna sección repite un botón al mismo destino`);
+        eq(ctaBad, [], `${label}: botones de navegación (actividad, evaluación, ${Object.keys(navWant).length} botones de sección — uno por cierre de capítulo) enlazan a la URL real de su destino tras el restore`);
+        // ── simulación de notas por la API de Moodle ──
+        const plan = { pass: {}, fail: {}, mixed: {} };
+        const gradedList = graded.map((c) => ({ idnumber: c.idnumber, modname: c.modname, kind: kindOf(c.idnumber) }));
+        gradedList.forEach((c, i) => {
+          plan.pass[c.idnumber] = passing;              // exactamente la nota aprobatoria → COMPLETE_PASS
+          plan.fail[c.idnumber] = passing - 1;          // un punto abajo → COMPLETE_FAIL
+          plan.mixed[c.idnumber] = i % 2 === 0 ? 100 : 0; // 0 y 100 (bordes del rango)
+        });
+        const simIn = path.join(V3OUT, `moodle-${label}.sim.in.json`);
+        const simOut = path.join(V3OUT, `moodle-${label}.sim.json`);
+        fs.writeFileSync(simIn, JSON.stringify({ moodleRoot: process.env.MOODLE_ROOT, courseid, grades: plan }));
+        const sim = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-v3-grades.php'), simIn, simOut], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        ok(sim.status === 0 && !/warning|notice|deprecated/i.test(sim.stderr || ''), `${label}: simulación de notas (PHP) sin error`, (sim.stderr || sim.stdout || '').slice(-800));
+        const so = JSON.parse(fs.readFileSync(simOut, 'utf8'));
+        const catOf = (idn) => rsv.kinds[kindOf(idn)].category;
+        const weights = Object.fromEntries(rsv.categories.map((x) => [x.key, x.weight]));
+        const expectTotal = (who) => {
+          const byCat = {};
+          gradedList.forEach((c) => { (byCat[catOf(c.idnumber)] = byCat[catOf(c.idnumber)] || []).push(plan[who][c.idnumber]); });
+          let num2 = 0; let den = 0;
+          for (const [k, arr] of Object.entries(byCat)) { const mean = arr.reduce((a, b) => a + b, 0) / arr.length; num2 += (weights[k] || 0) * mean; den += weights[k] || 0; }
+          return num2 / den;
+        };
+        // P2-B1 (EV6 Fase 2 — exámenes): un quiz (exam/finalExam) con completionattemptsexhausted =
+        // (attempts > 0) ya NO completa solo con la nota — reprobar con intentos REALES sin agotar
+        // queda INCOMPLETE(0), no COMPLETE_FAIL(3) (ver P2-design.md §1). moodle-v3-grades.php escribe
+        // la nota a mano (grade_update), nunca toma un intento real, así que un quiz reprobado aquí
+        // nunca agota attempts y se queda INCOMPLETE; H5P/SCORM (video/activity) no dependen de
+        // intentos agotados y siguen yendo directo a COMPLETE_FAIL bajo la nota aprobatoria.
+        const isQuizKind = (idn) => { const k = kindOf(idn); return k === 'exam' || k === 'finalExam'; };
+        for (const who of ['pass', 'fail', 'mixed']) {
+          const r = so.sim[who];
+          const badG = gradedList.filter((c) => r.grades[c.idnumber] !== plan[who][c.idnumber] || r.grades[c.idnumber] < 0 || r.grades[c.idnumber] > 100).map((c) => [c.idnumber, r.grades[c.idnumber]]);
+          eq(badG, [], `${label} [${who}]: notas registradas en 0–100 = las simuladas`);
+          // r55 (R5/R6): H5P/SCORM se completan al recibir nota (PASS/FAIL según su gradepass informativo); un quiz
+          // con nota escrita y SIN intentos reales queda INCOMPLETE(0) (completionminattempts = intentos), aprobado o no.
+          const wantState = (c) => (isQuizKind(c.idnumber) && rsv.kinds[kindOf(c.idnumber)].attempts > 0 ? 0 : plan[who][c.idnumber] >= passing ? 2 : 3);
+          const badS = gradedList.filter((c) => r.states[c.idnumber] !== wantState(c)).map((c) => [c.idnumber, r.states[c.idnumber], plan[who][c.idnumber]]);
+          eq(badS, [], `${label} [${who}]: H5P/SCORM COMPLETE_PASS(2) / COMPLETE_FAIL(3) según la nota ${passing} / quiz INCOMPLETE(0) sin usar sus intentos reales (r55)`);
+          const et = expectTotal(who);
+          ok(r.courseTotal !== null && Math.abs(r.courseTotal - et) < 0.01, `${label} [${who}]: total ponderado del curso ${r.courseTotal} ≈ ${et.toFixed(2)}`, { got: r.courseTotal, want: et });
+          // r55 (R3): curso completo ⇔ nota final ≥ mínimo (criterio único de nota), en los tres perfiles de notas.
+          ok(r.courseComplete === (r.courseTotal >= passing), `${label} [${who}]: curso completo (${r.courseComplete}) ⇔ nota final ${r.courseTotal} ≥ ${passing}`, r);
+          if (who === 'pass') ok(r.courseComplete === true, `${label} [pass]: curso completo (nota final = mínimo)`, r);
+          if (who === 'fail') ok(r.courseComplete === false, `${label} [fail]: curso NO completo`, r);
+          // EV6 P2-B5: «Respuestas explicadas» — una página por quiz; disponible SOLO si su quiz está aprobado
+          // (con notas escritas nunca se agotan intentos: reprobado = INCOMPLETE → bloqueada).
+          const pages = Object.entries(r.pages || {});
+          const nQuiz = gradedList.filter((c) => isQuizKind(c.idnumber)).length;
+          // r55 (R6): sin intentos reales ningún quiz llega a completo → ninguna página visible, aprobado o no.
+          const badP = pages.filter(([, p]) => p.uservisible !== false).map(([id, p]) => [id, p, r.states[p.quiz]]);
+          ok(pages.length === nQuiz && badP.length === 0, `${label} [${who}]: ${pages.length} página(s) «Respuestas explicadas» ocultas mientras no se usen los intentos (r55)`, { pages: r.pages, badP });
+        }
+        results.moodle[label].sim = so.sim;
+        // P2-B1: la nota sola nunca basta para reprobar un quiz (arriba, INCOMPLETE). Para probar que
+        // COMPLETE_FAIL(3) SIGUE siendo alcanzable, un usuario dedicado agota intentos REALES
+        // (mod_quiz_generator, como simulate-b1.php) sobre el primer quiz calificable del curso.
+        const quizForExhaust = gradedList.find((c) => isQuizKind(c.idnumber));
+        if (quizForExhaust) {
+          const exIn = path.join(V3OUT, `moodle-${label}.quizexhaust.in.json`);
+          const exOut = path.join(V3OUT, `moodle-${label}.quizexhaust.json`);
+          fs.writeFileSync(exIn, JSON.stringify({ moodleRoot: process.env.MOODLE_ROOT, courseid, idnumber: quizForExhaust.idnumber }));
+          const exr = spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-v3-quiz-exhaust.php'), exIn, exOut], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+          ok(exr.status === 0 && !/warning|notice|deprecated/i.test(exr.stderr || ''), `${label}: agotar intentos REALES de ${quizForExhaust.idnumber} (PHP) sin error`, (exr.stderr || exr.stdout || '').slice(-800));
+          const exo = JSON.parse(fs.readFileSync(exOut, 'utf8'));
+          eq(exo.completionstate, 3, `${label}: ${quizForExhaust.idnumber} con sus ${exo.attemptsConfigured} intentos REALES agotados y reprobados → COMPLETE_FAIL(3) (P2-B1)`, exo);
+          ok(exo.courseComplete === false, `${label}: curso NO completo tras agotar intentos reales de ${quizForExhaust.idnumber}`, exo);
+        }
+        // EV6 P2-B5: evaluaciones que certifican con intentos REALES (moodle-p2-exams.php): revisión solo
+        // con nota tras un intento reprobado, «Respuestas explicadas» bloqueada → disponible al agotar (o
+        // al aprobar; con intentos ilimitados solo al aprobar), curso completo solo aprobando, sorteo por
+        // hoja si el examen es un banco. Usuarios propios (p2b5_*), nunca los de la simulación de notas.
+        if (quizForExhaust) {
+          const p2Out = path.join(V3OUT, `moodle-${label}.p2exams.json`);
+          // r62 (gate): el cron de completion (mtrace) escribe en stdout y el JSON va al archivo. Si el proceso no terminó por
+          // sí mismo (timeout de spawnSync / señal: p. ej. el equipo se suspendió en medio y el reloj de pared consumió los
+          // 300 s), no hay JSON: se reintenta UNA vez con usuarios nuevos (el script usa un sufijo aleatorio por corrida).
+          // Un error real de PHP (stderr, exit ≠ 0 con proceso terminado) nunca se reintenta.
+          const runP2 = () => { try { fs.rmSync(p2Out, { force: true }); } catch { /* no existía */ }
+            return spawnSync(PHP, ['-c', PHPINI, path.join(HERE, 'moodle-p2-exams.php'), process.env.MOODLE_ROOT, String(courseid), p2Out], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, timeout: 300000 }); };
+          let p2 = runP2();
+          const p2Killed = (r) => r.status === null || !!r.signal || (r.error && r.error.code === 'ETIMEDOUT');
+          const p2First = p2Killed(p2) ? { status: p2.status, signal: p2.signal, error: p2.error && p2.error.code } : null;
+          if (p2First) { console.log(`   ↻ ${label}: moodle-p2-exams.php no terminó (${JSON.stringify(p2First)}) — reintento único`); p2 = runP2(); }
+          ok(!/warning|notice|deprecated/i.test(p2.stderr || '') && fs.existsSync(p2Out), `${label}: escenarios de evaluaciones (moodle-p2-exams.php) sin error de PHP${p2First ? ' (tras 1 reintento por proceso cortado)' : ''}`,
+            { status: p2.status, signal: p2.signal, error: p2.error && p2.error.code, first: p2First, stderr: (p2.stderr || '').slice(-600), stdoutTail: (p2.stdout || '').slice(-200) });
+          const p2o = fs.existsSync(p2Out) ? JSON.parse(fs.readFileSync(p2Out, 'utf8')) : { pass: false, failed: ['sin salida'], assertions: 0 };
+          ok(p2.status === 0 && p2o.pass === true && p2o.assertions > 0, `${label}: ${p2o.assertions} aserciones de evaluaciones con intentos reales (revisión, página gated, completion del curso${Object.values(p2o.quizzes || {}).some((q) => q.mode === 'bank') ? ', sorteo por hoja' : ''})`, p2o.failed);
+          const modes = Object.values(p2o.quizzes || {}).map((q) => q.mode);
+          ok(modes.length > 0 && modes.every((m) => m === 'bank' || m === 'gift'), `${label}: quizzes todo-aleatorio (banco) o todo-fijo (GIFT): ${modes.join(',')}`, p2o.quizzes);
+          // P2-B6: E1/E1-repack/E3 son bancos (sorteo por hoja con intentos reales); E2 sigue GIFT.
+          const wantMode = info.examBank ? 'bank' : 'gift';
+          ok(modes.length > 0 && modes.every((m) => m === wantMode), `${label}: todas las evaluaciones restauradas en modo ${wantMode} (${info.examBank ? 'banco generado por el ejecutor real' : 'GIFT'})`, p2o.quizzes);
+          results.moodle[label].p2exams = { pass: p2o.pass, assertions: p2o.assertions, quizzes: p2o.quizzes, steps: p2o.steps };
+        }
+        // ── EV6 H5P v2 (E5): BS calificado y criterio; «Repaso» sin nota, por vista, fuera de los criterios ──
+        if (label === 'E5') {
+          const bsIdn = `cv3:ch:${info.decideChapterId}:activity`;
+          const bsH = o.h5ps[bsIdn];
+          ok(bsH && bsH.deploy.h5pid && bsH.deploy.library === 'H5P.BranchingScenario 1.10' && bsH.grade === 100 && bsH.enabletracking === 1, `${label}: el caso ramificado despliega (H5P.BranchingScenario 1.10, paquete solo contenido + pack v3 del sitio) y califica sobre 100`, bsH);
+          const bsItem = o.items.find((i) => i.idnumber === bsIdn);
+          ok(bsItem && bsItem.gradepass === 70 && bsItem.grademax === 100, `${label}: BS con ítem de calificación (aprobación 70, máximo 100)`, bsItem);
+          ok(!o.criteria.some((x) => x.criteriatype === 4), `${label}: BS cuenta en la nota final pero no es criterio (r55: solo el criterio de nota)`, o.criteria);
+          const reviews = cms.filter((c) => /:review_cards$/.test(c.idnumber));
+          eq(reviews.length, (info.reviewCardsChapterIds || []).length, `${label}: ${reviews.length} «Repaso» restaurados (uno por capítulo del paquete)`);
+          const badR = reviews.filter((c) => {
+            const h = o.h5ps[c.idnumber];
+            return !(c.completion === 2 && c.completionview === 1 && c.completionpassgrade === 0 && h && h.grade === 0 && h.enabletracking === 0
+              && h.deploy.h5pid && h.deploy.library === 'H5P.Dialogcards 1.9' && !o.items.some((i) => i.idnumber === c.idnumber));
+          }).map((c) => [c.idnumber, c.completion, c.completionview, o.h5ps[c.idnumber]]);
+          eq(badR, [], `${label}: cada «Repaso» = Dialog Cards 1.9 desplegado, grade 0, sin tracking, sin ítem de calificación, completion por vista`);
+          ok(!o.criteria.some((x) => reviews.some((r) => r.idnumber === x.idnumber)), `${label}: ningún «Repaso» es criterio de completion del curso`, o.criteria);
+          ok(!Object.values((L.labels || {})).some((h) => /Repaso[^<]{0,40}calificab/i.test(h)), `${label}: ningún texto presenta el «Repaso» como calificable`);
+          results.moodle[label].h5p2 = { bs: bsIdn, reviews: reviews.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber })) };
+        }
+        results.moodle[label].cms = cms.map((c) => ({ cmid: c.cmid, idnumber: c.idnumber, modname: c.modname, visible: c.visible }));
+        // EV6 (browser QA): una página por sección → el QA recorre /course/section.php?id=<id>.
+        results.moodle[label].sections = o.sections.map((x) => ({ section: x.section, id: x.id, name: x.name, cmids: x.cms.map((c) => c.cmid) }));
+      }, { fatal: false });
+    }
+
+    await step('v3-red-final', async () => {
+      const blocked = fs.readFileSync(NET_LOG, 'utf8').trim();
+      ok(blocked === '', 'netguard: 0 conexiones fuera de 127.0.0.1 en toda la fase v3', blocked.slice(0, 500));
+    }, { fatal: false });
+  } catch (e) {
+    console.error('ABORT', e && e.stack);
+    results.aborted = String(e && e.message);
+  } finally {
+    for (const ch of [...children]) await stopProc(ch);
+    await FAKES.close().catch(() => {});
+    if (PFAKES) await PFAKES.close().catch(() => {});
+    await db.end().catch(() => {});
+    results.finishedAt = new Date().toISOString();
+    results.pass = !results.aborted && Object.values(results.steps).every((s) => s.pass) && results.assertions.every((a) => a.ok);
+    results.totals = { assertions: results.assertions.length, failed: results.assertions.filter((a) => !a.ok).length };
+    save();
+    console.log(`\nE2E V2.1 (rulesVersion 3): ${results.pass ? 'PASS' : 'FAIL'} — ${results.totals.assertions} aserciones, ${results.totals.failed} fallidas`);
+    process.exit(results.pass ? 0 : 1);
+  }
+})();

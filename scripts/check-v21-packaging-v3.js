@@ -1,0 +1,1639 @@
+#!/usr/bin/env node
+/* eslint-disable */
+// Cursia V2.1 — R12: empaque v3 (PURO). Sin DB, sin red, sin proveedores.
+// Corre contra los módulos COMPILADOS de dist/ (npm run build antes).
+//
+//  - plan v3: cada item del Manifest en exactamente un lugar; fail loud ante Manifest roto;
+//  - builder v3 sobre fixtures: 2 módulos × las 4 combinaciones video/actividad,
+//    examen final on/off, motor h5p y scorm, tema claro y oscuro, portadas mock;
+//  - validador v3 (§Q.8) en verde para toda la matriz y ROJO ante cada mutación;
+//  - estructura por UUID (idnumber cv3:…) = plan + chapterSlotSequence;
+//  - determinismo con reloj fijo (mismo proceso y otro TZ);
+//  - cambio de tema / de nota mínima = paquete nuevo con los MISMOS contenidos;
+//  - fail loud (contenido faltante, H5P no calificable, tipo H5P ajeno a la rotación,
+//    categoría ponderada vacía, perfil inaplicable, cifra en un intro);
+//  - guarda de mocks (R-007), tema por perfil/legacy/default, clave de reuse v3;
+//  - worker v3 con dependencias falsas: fixtures de proveedor mock fluyen, un run real
+//    con mocks falla, restore-first, cambio de perfil = paquete nuevo, evento ZERO_BY_DESIGN.
+//
+// Usage: node scripts/check-v21-packaging-v3.js [path/to/dist]
+
+const path = require('path');
+const crypto = require('crypto');
+const { spawnSync } = require('child_process');
+const JSZip = require('jszip');
+
+const ROOT = path.resolve(__dirname, '..');
+const distRoot = path.resolve(process.cwd(), process.argv[2] || path.join(ROOT, 'dist'));
+function loadDist(rel) {
+  try {
+    return require(path.join(distRoot, rel));
+  } catch (err) {
+    console.error(`❌ No se pudo cargar ${rel} desde ${distRoot} (¿npm run build?): ${err.message}`);
+    process.exit(1);
+  }
+}
+require('reflect-metadata');
+global.fetch = async (u) => { throw new Error(`NETWORK FORBIDDEN in check: ${u}`); };
+
+const B = loadDist('package/dynamic-mbz-builder-v3.js');
+const V = loadDist('package/v3/mbz-validator-v3.js');
+const PV3 = loadDist('modules/dynamic-packaging/packaging-plan-v3.js');
+const PK = loadDist('modules/dynamic-packaging/packaging-v3.js');
+const G = loadDist('modules/dynamic-packaging/packaging-guards.js');
+const MEDIA = loadDist('package/v3/synthetic-media.js');
+const PNG = loadDist('package/v3/png-downscale.js');
+const PRES = loadDist('package/presentation/index.js');
+const TE = loadDist('modules/theme-engine/index.js');
+const VC = loadDist('modules/visual-components/index.js');
+const AUDIO = loadDist('package/audio/index.js');
+const SHELL = loadDist('modules/course-shell/index.js');
+const PROF = loadDist('modules/course-profiles/course-profiles.js');
+const THEME = loadDist('modules/theme-engine/index.js');
+const A = loadDist('package/assessment/index.js');
+const H5P = loadDist('package/h5p/index.js');
+const MA = loadDist('package/v3/moodle-activities-v3.js');
+const W = loadDist('workers/dynamic-package-worker.js');
+const PF = require('./lib/v21-packaging-fixtures');
+const SF = require('./lib/v21-shell-fixtures');
+
+let passes = 0;
+let failures = 0;
+async function check(name, fn) {
+  try {
+    await fn();
+    passes++;
+    console.log(`✅ ${name}`);
+  } catch (err) {
+    failures++;
+    console.error(`❌ ${name}\n   ${err && err.stack ? err.stack.split('\n').slice(0, 4).join('\n   ') : err}`);
+  }
+}
+function assert(c, m) { if (!c) throw new Error(m); }
+function eq(a, b, m) { assert(JSON.stringify(a) === JSON.stringify(b), `${m}: got ${JSON.stringify(a)}, want ${JSON.stringify(b)}`); }
+async function rejects(p, re, m) {
+  let e = null;
+  try { await p; } catch (x) { e = x; }
+  assert(e, `${m}: no lanzó`);
+  assert(re.test(e.message), `${m}: mensaje inesperado "${e.message.slice(0, 300)}"`);
+  return e;
+}
+function throwsSync(fn, re, m) {
+  let e = null;
+  try { fn(); } catch (x) { e = x; }
+  assert(e, `${m}: no lanzó`);
+  assert(re.test(e.message), `${m}: mensaje inesperado "${e.message.slice(0, 300)}"`);
+}
+const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
+
+async function build(o) {
+  const input = PF.packagingInput(distRoot, o);
+  if (o.level) input.level = o.level;
+  const r = await B.buildDynamicMbzV3(input);
+  return { input, r };
+}
+async function validate(r) {
+  return V.validateMbzV3(r.mbz, r.expectations);
+}
+
+async function mutate(mbz, edits) {
+  const z = await JSZip.loadAsync(mbz);
+  for (const [file, fn] of Object.entries(edits)) {
+    const cur = await z.file(file).async('string');
+    const next = await fn(cur);
+    if (next === cur) throw new Error(`la mutación de ${file} no cambió nada`);
+    z.file(file, next);
+  }
+  return z.generateAsync({ type: 'nodebuffer' });
+}
+
+async function actDirs(mbz) {
+  const z = await JSZip.loadAsync(mbz);
+  const mb = await z.file('moodle_backup.xml').async('string');
+  const acts = [];
+  const contents = /<contents>([\s\S]*?)<\/contents>/.exec(mb)[1];
+  for (const b of contents.match(/<activity>[\s\S]*?<\/activity>/g)) {
+    const dir = /<directory>(.*?)<\/directory>/.exec(b)[1];
+    const mod = await z.file(`${dir}/module.xml`).async('string');
+    acts.push({
+      dir,
+      modname: /<modulename>(.*?)<\/modulename>/.exec(b)[1],
+      section: Number(/<sectionid>(.*?)<\/sectionid>/.exec(b)[1]),
+      idnumber: /<idnumber>(.*?)<\/idnumber>/.exec(mod)[1],
+    });
+  }
+  return { z, acts };
+}
+
+const expectedSequence = (input) => PF.expectedSequence(distRoot, input);
+
+const MATRIX = [
+  { id: 'h5p-final-light', engine: 'h5p', finalExam: true, theme: { themeFamily: 'aula-clara', mode: 'light' } },
+  { id: 'scorm-nofinal-dark', engine: 'scorm', finalExam: false, theme: { themeFamily: 'oscuro-premium', mode: 'dark' }, realAudio: true },
+  { id: 'h5p-nofinal-dark-mock-cleansafe', engine: 'h5p', finalExam: false, theme: { themeFamily: 'tecnico', mode: 'dark' }, mockPresentations: true, level: 'clean_safe' },
+  { id: 'scorm-final-light', engine: 'scorm', finalExam: true, theme: { themeFamily: 'institucional', mode: 'light' } },
+];
+
+(async () => {
+  // ── Plan ──────────────────────────────────────────────────────────────────
+  await check('plan v3: cada item del Manifest en exactamente un lugar; EV6: secciones 0, 1, una por capítulo / evaluación, evaluación final, cierre', async () => {
+    const { manifest, blueprint } = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
+    const plan = PV3.buildPackagingPlanV3(manifest, blueprint, { manifestId: 7 });
+    // Fixture: módulo 1 (2 capítulos, con examen), módulo 2 (2 capítulos, sin examen), examen final.
+    eq(plan.sections.map((s) => [s.sectionNum, s.kind]), [[0, 'shell'], [1, 'route_and_book'], [2, 'chapter'], [3, 'chapter'], [4, 'module_exam'], [5, 'chapter'], [6, 'chapter'], [7, 'final_exam'], [8, 'closing']], 'secciones');
+    const chs = plan.modules.flatMap((m) => m.chapters);
+    eq(plan.sections.filter((s) => s.kind === 'chapter').map((s) => [s.chapterId, s.title]), chs.map((c) => [c.chapterId, `Módulo ${c.moduleNumber} · Capítulo ${c.chapterNumber}: ${c.title}`]), 'títulos de las secciones de capítulo');
+    eq(chs.map((c) => c.sectionNum), [2, 3, 5, 6], 'sección de cada capítulo');
+    eq(plan.modules.map((m) => [m.firstSectionNum, m.examSectionNum]), [[2, 4], [5, null]], 'primera sección y sección de evaluación por módulo');
+    eq(plan.sections.find((s) => s.kind === 'module_exam').title, 'Módulo 1 · Evaluación', 'título de la evaluación del módulo');
+    eq([plan.finalExamSectionNum, plan.closingSectionNum, plan.sections[plan.sections.length - 1].title], [7, 8, 'Cierre del curso'], 'evaluación final ANTES del cierre; el cierre es la última sección');
+    const nf = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: false });
+    const pnf = PV3.buildPackagingPlanV3(nf.manifest, nf.blueprint);
+    eq([pnf.sections.map((s) => s.kind).slice(-2), pnf.finalExamSectionNum, pnf.closingSectionNum], [['chapter', 'closing'], null, 7], 'sin examen final: el cierre sigue al último capítulo');
+    const keys = new Set([
+      ...Object.values(plan.keys).filter(Boolean),
+      ...plan.modules.flatMap((m) => [...Object.values(m.keys).filter(Boolean), ...m.chapters.flatMap((c) => Object.values(c.keys).filter(Boolean))]),
+    ]);
+    eq([...keys].sort(), manifest.items.map((i) => i.key).sort(), 'items consumidos');
+    eq(PV3.packagingPlanV3Sha256(plan), PV3.packagingPlanV3Sha256(PV3.buildPackagingPlanV3(manifest, blueprint, { manifestId: 7 })), 'plan determinístico');
+  });
+  await check('plan v3 falla fuerte: item faltante, item extra, sha del Blueprint distinto, Manifest v1', async () => {
+    const { manifest, blueprint } = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true });
+    const m1 = JSON.parse(JSON.stringify(manifest));
+    m1.items = m1.items.filter((i) => i.type !== 'audiobook_chapter' || i !== m1.items.find((x) => x.type === 'audiobook_chapter'));
+    throwsSync(() => PV3.buildPackagingPlanV3(m1, blueprint), /PACKAGING_PLAN_V3_INVALID: falta el item audiobook_chapter:/, 'faltante');
+    const m2 = JSON.parse(JSON.stringify(manifest));
+    m2.items.push({ ...m2.items.find((i) => i.type === 'content'), key: 'content:intruso' });
+    throwsSync(() => PV3.buildPackagingPlanV3(m2, blueprint), /sin lugar en el paquete: content:intruso/, 'extra');
+    const bp = JSON.parse(JSON.stringify(blueprint));
+    bp.course.title += ' (editado)';
+    throwsSync(() => PV3.buildPackagingPlanV3(manifest, bp), /blueprintSha256 no coincide/, 'sha');
+    throwsSync(() => PV3.buildPackagingPlanV3({ ...manifest, rulesVersion: 1 }, blueprint), /rulesVersion 3/, 'v1');
+  });
+
+  // ── Matriz: build + validador + estructura ────────────────────────────────
+  const built = {};
+  for (const cfg of MATRIX) {
+    await check(`[${cfg.id}] build v3 + validador §Q.8 sin hallazgos`, async () => {
+      const { input, r } = await build(cfg);
+      built[cfg.id] = { input, r };
+      const v = await validate(r);
+      assert(v.ok, `hallazgos: ${JSON.stringify(v.issues.slice(0, 5))}`);
+      const c = r.summary.counts;
+      eq([c.modules, c.chapters, c.videos, c.activities, c.finalExam], [2, 4, 2, 2, cfg.finalExam], 'conteos');
+      eq(v.stats.graded, 2 + 2 + 1 + (cfg.finalExam ? 1 : 0), 'ítems calificables (2 videos + 2 actividades + examen + final)');
+      eq(v.stats.h5p, cfg.engine === 'h5p' ? 4 : 2, 'h5pactivity');
+    });
+    await check(`[${cfg.id}] estructura por UUID: idnumbers por sección = Manifest + chapterSlotSequence`, async () => {
+      const { input, r } = built[cfg.id];
+      const { acts } = await actDirs(r.mbz);
+      const got = [];
+      for (const a of acts) {
+        let row = got.find((x) => x[0] === a.section);
+        if (!row) got.push((row = [a.section, []]));
+        row[1].push(a.idnumber);
+      }
+      eq(got, expectedSequence(input), 'secuencia');
+      const modOf = Object.fromEntries(acts.map((a) => [a.idnumber, a.modname]));
+      for (const ch of input.manifest.modules.flatMap((m) => m.chapters)) {
+        if (ch.videoEnabled) eq(modOf[`cv3:ch:${ch.chapterId}:video`], 'h5pactivity', 'video = h5pactivity');
+        if (ch.activityEnabled) eq(modOf[`cv3:ch:${ch.chapterId}:activity`], cfg.engine === 'h5p' ? 'h5pactivity' : 'scorm', 'actividad');
+      }
+    });
+  }
+
+  // P2-B1 (EV6 Fase 2 — exámenes): cada quiz_*/quiz.xml (examen de módulo y examen final) de TODA la
+  // matriz lleva exactamente los 8 campos de revisión de QUIZ_REVIEW_V3 y, con el perfil por defecto
+  // (intentos 3), completionattemptsexhausted 1.
+  await check('P2-B1 + r55 (R6): todo quiz.xml de la matriz tiene la política de revisión, completionminattempts = attempts_number y attemptsexhausted 0', async () => {
+    let quizzes = 0;
+    for (const cfg of MATRIX) {
+      const { z, acts } = await actDirs(built[cfg.id].r.mbz);
+      for (const a of acts.filter((x) => x.modname === 'quiz')) {
+        const x = await z.file(`${a.dir}/quiz.xml`).async('string');
+        for (const [field, want] of Object.entries(MA.QUIZ_REVIEW_V3)) {
+          const got = new RegExp(`<${field}>(\\d+)</${field}>`).exec(x)?.[1];
+          eq(Number(got), want, `${cfg.id} ${a.idnumber}: ${field}`);
+        }
+        const attempts = Number(/<attempts_number>(\d+)<\/attempts_number>/.exec(x)[1]);
+        const exhausted = /<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(x)[1];
+        const minAtt = /<completionminattempts>(\d+)<\/completionminattempts>/.exec(x)[1];
+        // r55 (R6): completo solo tras usar todos los intentos; sin la regla «aprobar o agotar».
+        eq(exhausted, '0', `${cfg.id} ${a.idnumber}: completionattemptsexhausted`);
+        eq(minAtt, String(attempts), `${cfg.id} ${a.idnumber}: completionminattempts vs attempts_number ${attempts}`);
+        const mx = await z.file(`${a.dir}/module.xml`).async('string');
+        eq(['completion', 'completiongradeitemnumber', 'completionpassgrade'].map((t) => new RegExp(`<${t}>([^<]*)</${t}>`).exec(mx)[1]), ['2', '0', '0'], `${cfg.id} ${a.idnumber}: completion por nota, sin nota aprobatoria`);
+        quizzes++;
+      }
+    }
+    assert(quizzes >= MATRIX.filter((c) => c.finalExam).length + MATRIX.length, `se revisaron ${quizzes} quizzes`);
+  });
+
+  // P2-B1 acceptance A1: `attempts: { exam: 0 }` → completionattemptsexhausted 0 solo en el examen de
+  // módulo (intentos ilimitados nunca se agotan); el examen final, con el perfil por defecto, sigue en 1.
+  await check('P2-B1 + r55: attempts.exam = 0 (ilimitado) → completionminattempts 0 y «Respuestas explicadas» del módulo OCULTA sin availability; el final (3) se completa a los 3 intentos', async () => {
+    const defaults = PROF.defaultAssessmentProfile({ finalExam: true });
+    const profile = { ...defaults, attempts: { ...defaults.attempts, exam: 0 } };
+    const { r } = await build({ engine: 'h5p', finalExam: true, profile });
+    const v = await validate(r);
+    assert(v.ok, `hallazgos: ${JSON.stringify(v.issues.slice(0, 5))}`);
+    const { z, acts } = await actDirs(r.mbz);
+    const moduleExam = acts.find((a) => /^cv3:exam:/.test(a.idnumber));
+    const finalExam = acts.find((a) => a.idnumber === 'cv3:final_exam');
+    const examXml = await z.file(`${moduleExam.dir}/quiz.xml`).async('string');
+    const finalXml = await z.file(`${finalExam.dir}/quiz.xml`).async('string');
+    eq(/<attempts_number>(\d+)<\/attempts_number>/.exec(examXml)[1], '0', 'examen de módulo: intentos ilimitados');
+    eq(/<completionattemptsexhausted>(\d+)<\/completionattemptsexhausted>/.exec(examXml)[1], '0', 'examen de módulo: sin regla de agotar');
+    eq(/<completionminattempts>(\d+)<\/completionminattempts>/.exec(examXml)[1], '0', 'examen de módulo: sin mínimo de intentos');
+    eq(/<attempts_number>(\d+)<\/attempts_number>/.exec(finalXml)[1], '3', 'examen final: intentos del perfil sin tocar');
+    eq(/<completionminattempts>(\d+)<\/completionminattempts>/.exec(finalXml)[1], '3', 'examen final: completo a los 3 intentos');
+    const expl = acts.find((a) => /^cv3:exam_explanations:/.test(a.idnumber));
+    const ex = await z.file(`${expl.dir}/module.xml`).async('string');
+    eq(['visible', 'visibleold', 'availability'].map((t) => new RegExp(`<${t}>([^<]*)</${t}>`).exec(ex)[1]), ['0', '0', '$@NULL@$'], 'explicaciones del módulo ilimitado: ocultas, sin availability');
+    const fexpl = acts.find((a) => a.idnumber === 'cv3:final_exam_explanations');
+    const fx = await z.file(`${fexpl.dir}/module.xml`).async('string');
+    eq(/<visible>([^<]*)<\/visible>/.exec(fx)[1], '1', 'explicaciones del final: visibles con availability');
+    const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
+    const tx = await z.file(`${teacher.dir}/label.xml`).async('string');
+    assert(tx.includes('intentos ilimitados no abren solas'), 'nota para docentes de intentos ilimitados');
+  });
+
+  // Aceptación staging V2.1: el Visual System prohíbe franjas laterales (border-left/right > 1px como acento).
+  // Se escanea TODO texto del paquete: XML de actividades/labels (HTML escapado), Libro, blobs de texto.
+  await check('Visual System: ningún HTML del paquete v3 usa franja lateral (border-left/right > 1px), en toda la matriz', async () => {
+    const STRIPE = /border-(?:left|right)(?:-width)?\s*:\s*(?:[2-9]|\d{2,})(?:\.\d+)?px/i;
+    const hits = [];
+    for (const cfg of MATRIX) {
+      const z = await JSZip.loadAsync(built[cfg.id].r.mbz);
+      for (const name of Object.keys(z.files)) {
+        const f = z.files[name];
+        if (f.dir) continue;
+        const buf = await f.async('nodebuffer');
+        if (buf.subarray(0, 2).toString('latin1') === 'PK' || buf.subarray(0, 4).toString('latin1') === '%PDF') continue;
+        const txt = buf.toString('utf8');
+        const m = STRIPE.exec(txt);
+        if (m) hits.push(`${cfg.id}:${name}: …${txt.slice(Math.max(0, m.index - 60), m.index + 40).replace(/\s+/g, ' ')}…`);
+      }
+    }
+    eq(hits.slice(0, 6), [], 'franjas laterales encontradas');
+    // r19 (L1, 3.13.0): el Libro Guía ya no es HTML (era la tarjeta de módulo con padding, review I3): es un PDF.
+    const lib = await JSZip.loadAsync(built['h5p-final-light'].r.mbz);
+    const fxl = await lib.file('files.xml').async('string');
+    assert(!fxl.includes('libro_guia_completo.html') && /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(fxl), 'Libro Guía en PDF (sin HTML)');
+  });
+
+  await check('[h5p-final-light] H5P: activity type por UUID del capítulo (R-012), paquetes content-only del perfil, sin SingleChoiceSet', async () => {
+    const { input, r } = built['h5p-final-light'];
+    const acts = r.summary.h5pPackages.filter((p) => p.itemKey.startsWith('activity:'));
+    const LIB = { questionset: 'H5P.QuestionSet', dragtext: 'H5P.DragText', blanks: 'H5P.Blanks' };
+    for (const p of acts) {
+      const chapterId = p.itemKey.slice('activity:'.length);
+      eq(p.mainLibrary, LIB[SHELL.activityTypeForChapter(chapterId)], `tipo de ${p.itemKey}`);
+      // EV5-C: Manifest legacy (sin h5pType) ⇒ el resolvedor único da exactamente el hash.
+      eq(SHELL.resolveActivityType(input.manifest.items.find((i) => i.key === p.itemKey)), SHELL.activityTypeForChapter(chapterId), `resolver legacy ${p.itemKey}`);
+      assert(p.mainLibrary !== 'H5P.SingleChoiceSet', 'SCS nunca calificable (R-011)');
+    }
+    assert(r.summary.h5pPackages.filter((p) => p.mainLibrary === 'H5P.InteractiveVideo').length === 2, 'dos IV');
+    void input;
+  });
+
+  await check('[h5p-final-light] portada Gamma reducida (≤ 1600 px, UX r18) y PDF/PNG en el filearea intro del label de la tarjeta', async () => {
+    const { r } = built['h5p-final-light'];
+    const { z, acts } = await actDirs(r.mbz);
+    const files = await z.file('files.xml').async('string');
+    const pres = acts.filter((a) => /:presentation$/.test(a.idnumber));
+    eq(pres.length, 4, 'una tarjeta por capítulo');
+    for (const a of pres) {
+      const ctx = /contextid="(\d+)"/.exec(await z.file(`${a.dir}/label.xml`).async('string'))[1];
+      const mine = files.match(/<file id="\d+">[\s\S]*?<\/file>/g).filter((f) => f.includes(`<contextid>${ctx}</contextid>`));
+      const png = mine.find((f) => /portada\.png/.test(f));
+      const pdf = mine.find((f) => /presentacion\.pdf/.test(f));
+      assert(png && pdf && /<filearea>intro<\/filearea>/.test(png) && /<component>mod_label<\/component>/.test(pdf), `archivos de ${a.idnumber}`);
+      const h = /<contenthash>(\w+)<\/contenthash>/.exec(png)[1];
+      const dims = PRES.pngDimensions(await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer'));
+      // UX r18 (problema 3): tope 1600 px (antes 640: borrosa a DPR 2); el fixture trae una portada más ancha.
+      eq([dims.width, dims.height], [1600, 900], 'portada reducida');
+    }
+    eq(r.summary.warnings, [], 'sin avisos');
+  });
+
+  await check('[scorm-nofinal-dark] SCORM: scoes del imsmanifest real, completion solo por nota (R6), whatgrade/maxattempt del perfil', async () => {
+    const { r } = built['scorm-nofinal-dark'];
+    const { z, acts } = await actDirs(r.mbz);
+    const sc = acts.filter((a) => a.modname === 'scorm');
+    eq(sc.length, 2, 'dos SCORM');
+    for (const a of sc) {
+      const x = await z.file(`${a.dir}/scorm.xml`).async('string');
+      assert(/<maxgrade>100<\/maxgrade>/.test(x) && /<whatgrade>0<\/whatgrade>/.test(x) && /<maxattempt>0<\/maxattempt>/.test(x), 'campos de evaluación');
+      assert(/<completionstatusrequired>\$@NULL@\$<\/completionstatusrequired>/.test(x), 'sin regla de estado');
+      assert(/<identifier>cap\d+_org<\/identifier>/.test(x) && /<identifier>item_1<\/identifier>/.test(x), 'ids del manifiesto');
+    }
+  });
+
+  await check('[h5p-final-light] Libro Guía v3 (r19: PDF real): prefacios, capítulos, bibliografía, una marca de agua por página', async () => {
+    const { input, r } = built['h5p-final-light'];
+    const { z, acts } = await actDirs(r.mbz);
+    const libro = acts.find((a) => a.idnumber === 'cv3:shell:libro');
+    const ctx = /contextid="(\d+)"/.exec(await z.file(`${libro.dir}/resource.xml`).async('string'))[1];
+    const files = await z.file('files.xml').async('string');
+    const f = files.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((x) => x.includes(`<contextid>${ctx}</contextid>`) && /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(x));
+    assert(f && f.includes('<mimetype>application/pdf</mimetype>'), 'PDF application/pdf en el contexto del recurso');
+    const h = /<contenthash>(\w+)<\/contenthash>/.exec(f)[1];
+    const pdf = await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer');
+    assert(pdf.subarray(0, 5).toString('latin1') === '%PDF-' && /%%EOF\s*$/.test(pdf.subarray(-16).toString('latin1')), '%PDF-…%%EOF');
+    const pdfjs = await import(require.resolve('pdfjs-dist/legacy/build/pdf.mjs', { paths: [ROOT] }));
+    const d = await pdfjs.getDocument({ data: new Uint8Array(pdf), verbosity: 0, isOffscreenCanvasSupported: false }).promise;
+    let text = '';
+    for (let p = 1; p <= d.numPages; p++) {
+      const pg = await d.getPage(p);
+      const ol = await pg.getOperatorList();
+      // r19 fix 1 (i): marca de agua en toda página + logo a opacidad plena solo en la portada (detalle en check-r19-libro-pdf).
+      eq(ol.fnArray.filter((fn) => fn === pdfjs.OPS.paintImageXObject).length, p === 1 ? 2 : 1, `página ${p}: marca de agua (+ logo de portada en la 1)`);
+      text += (await pg.getTextContent()).items.map((i) => i.str).join(' ') + '\n';
+    }
+    eq(d.numPages, r.summary.libro.pageCount, 'páginas');
+    assert(text.includes('Al terminar este módulo podrás') && text.includes('Bibliografía general del curso'), 'prefacio + bibliografía');
+    assert(text.includes('Visible Learning') && text.includes('(2009)'), 'entradas de bibliografía (verificadas)');
+    for (const m of input.manifest.modules) for (const c of m.chapters) assert(text.includes(`Capítulo ${c.chapterNumber}`), `capítulo ${c.chapterNumber}`);
+    const words = r.expectations.facts.libro.wordCount;
+    assert(words > 100, 'palabras medidas');
+  });
+
+  await check('[h5p-final-light] audio: MP3 de bienvenida y audiolibro ensamblado (R10) en el intro de sus labels, duraciones medidas', async () => {
+    const { input, r } = built['h5p-final-light'];
+    const f = r.expectations.facts;
+    eq(Math.abs(f.audio.welcomeSeconds - AUDIO.mp3DurationSeconds(input.contents.audioWelcome)) < 1e-9, true, 'bienvenida medida');
+    const sum = [...input.contents.audiobookChapters.values()].reduce((s, b) => s + AUDIO.mp3DurationSeconds(b), 0);
+    assert(Math.abs(f.audio.audiobookSeconds - sum) < 1e-6, 'audiolibro = suma de partes');
+  });
+
+  // ── Determinismo ──────────────────────────────────────────────────────────
+  await check('título de capítulo > 200 caracteres (InteractiveVideo + actividad H5P): el paquete se genera, el título H5P queda ≤ 200 sin cortar palabras y sigue identificable', async () => {
+    const H = loadDist('package/h5p/index.js');
+    const LONG = 'Comercialización y distribución de productos agrícolas Canales de comercialización, análisis de costos y precios, identificación de mercados locales y regionales, logística de transporte y almacenamiento poscosecha para pequeños productores';
+    assert(LONG.length > 200 && LONG.length <= 255, `fixture ${LONG.length}`);
+    const t = H.h5pTitle(LONG);
+    assert(t.length <= 200 && t.endsWith('…'), `h5pTitle: ${t.length}`);
+    assert(t.startsWith('Comercialización y distribución de productos agrícolas'), 'identificable');
+    const body = t.slice(0, -1);
+    assert(LONG.startsWith(body) && [' ', ','].includes(LONG[body.length]), `no corta palabras: "${body.slice(-20)}|${LONG.slice(body.length, body.length + 5)}"`);
+    eq(H.h5pTitle('  Título   corto  '), 'Título corto', 'corto: solo normaliza espacios');
+    eq(H.h5pTitle('x'.repeat(250)).length <= 200, true, 'sin espacios: corta igual');
+    const { r } = await build({ engine: 'h5p', finalExam: true, courseId: 671, chapterTitles: [LONG],
+      modules: [{ examEnabled: true, chapters: [{ video: true, activity: true }] }] });
+    assert(r && r.mbz && r.mbz.length > 0, 'MBZ generado');
+    const v = await validate(r);
+    assert(v.ok, `validador: ${JSON.stringify(v.issues.slice(0, 5))}`);
+  });
+
+  await check('determinismo: mismos insumos + reloj fijo → mismos bytes (dos veces y en otro TZ)', async () => {
+    const a = (await build(MATRIX[0])).r.mbz;
+    const b = (await build(MATRIX[0])).r.mbz;
+    eq(sha(a), sha(b), 'mismo proceso');
+    const code = `const PF=require(${JSON.stringify(path.join(__dirname, 'lib/v21-packaging-fixtures.js'))});` +
+      `const B=require(${JSON.stringify(path.join(distRoot, 'package/dynamic-mbz-builder-v3.js'))});` +
+      `B.buildDynamicMbzV3(PF.packagingInput(${JSON.stringify(distRoot)},${JSON.stringify(MATRIX[0])})).then(r=>{process.stdout.write(require('crypto').createHash('sha256').update(r.mbz).digest('hex'))}).catch(e=>{console.error(e);process.exit(1)})`;
+    const out = spawnSync(process.execPath, ['-e', code], { env: { ...process.env, TZ: 'Pacific/Kiritimati' }, encoding: 'utf8' });
+    assert(out.status === 0, `child: ${out.stderr}`);
+    eq(out.stdout, sha(a), 'otro TZ');
+    const c = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, MATRIX[0]), ts: 1790500001 });
+    assert(sha(c.mbz) !== sha(a), 'otro reloj → otros bytes (el ts está en el paquete)');
+  });
+
+  // ── Tema / nota mínima: paquete nuevo, mismos contenidos ─────────────────
+  await check('cambio de tema → paquete distinto con los MISMOS artifacts de contenido (H5P idénticos, sin regenerar)', async () => {
+    const base = built['h5p-final-light'].r;
+    const other = (await build({ ...MATRIX[0], theme: { themeFamily: 'editorial', mode: 'light' } })).r;
+    assert(sha(base.mbz) !== sha(other.mbz), 'bytes distintos');
+    assert(base.summary.themeSha256 !== other.summary.themeSha256, 'themeSha distinto');
+    eq(other.summary.h5pPackages.map((p) => p.sha1), base.summary.h5pPackages.map((p) => p.sha1), 'mismos .h5p');
+    assert((await validate(other)).ok, 'valida');
+    const k = (t) => PK.packageReuseHashV3({ builderVersion: '3.0.0', manifestSha256: 'm', sourceArtifactIds: ['b', 'a'], themeSha256: t, assessmentProfileSha256: 'p', h5pProfileVersion: 1, vcRendererVersion: 'r', moodleVersion: '4.1' });
+    assert(k(base.summary.themeSha256) !== k(other.summary.themeSha256), 'clave de reuse distinta');
+  });
+  await check('cambio de passingGrade (70→80) → paquete distinto: gradepass 80 y passPercentage del QuestionSet = 80, sin contenidos nuevos', async () => {
+    const p = PROF.defaultAssessmentProfile({ finalExam: true });
+    p.passingGrade = 80;
+    const { r } = await build({ ...MATRIX[0], profile: p });
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    eq(r.expectations.resolved.kinds.activity.passingGrade, 80, 'perfil');
+    assert(sha(r.mbz) !== sha(built['h5p-final-light'].r.mbz), 'bytes distintos');
+    const { z } = await actDirs(r.mbz);
+    const qs = r.summary.h5pPackages.find((x) => x.mainLibrary === 'H5P.QuestionSet');
+    if (qs) {
+      const blob = await z.file(`files/${qs.sha1.slice(0, 2)}/${qs.sha1}`).async('nodebuffer');
+      const content = JSON.parse(await (await JSZip.loadAsync(blob)).file('content/content.json').async('string'));
+      eq(content.passPercentage, 80, 'passPercentage');
+    }
+    const grades = await z.file('gradebook.xml').async('string');
+    assert(/<gradepass>80\.00000<\/gradepass>/.test(grades), 'gradepass del curso 80');
+    // el validador con el perfil VIEJO rechaza el paquete nuevo
+    const stale = await V.validateMbzV3(r.mbz, built['h5p-final-light'].r.expectations);
+    assert(!stale.ok && stale.issues.some((i) => i.code === 'GRADEPASS'), 'GRADEPASS contra el perfil viejo');
+  });
+
+  // ── Validador: cada mutación se detecta ──────────────────────────────────
+  const base = built['h5p-final-light'];
+  const { z: bz, acts: bacts } = await actDirs(base.r.mbz);
+  const noVideoCh = base.input.manifest.modules.flatMap((m) => m.chapters).find((c) => !c.videoEnabled);
+  const find = (re) => bacts.find((a) => re.test(a.idnumber));
+  await check('Edu EV3: cada botón queda resuelto al token de su destino (actividad del capítulo, evaluación, sección siguiente)', async () => {
+    const intro = async (a) => bz.file(`${a.dir}/label.xml`).async('string');
+    const secOf = new Map(bacts.map((a) => [a.idnumber, a.section]));
+    for (let i = 0; i < bacts.length; i++) {
+      const a = bacts[i];
+      const x = await intro(a).catch(() => '');
+      assert(!x.includes('cursia-cta://'), `${a.idnumber}: marcador sin resolver`);
+      if (/:activity_instruction$/.test(a.idnumber)) {
+        const next = bacts[i + 1];
+        const mid = /_(\d+)$/.exec(next.dir)[1];
+        // UX r18 (problema 4): SCORM → botón a la actividad; H5P (embebida justo debajo) → sin botón.
+        if (next.modname === 'scorm') assert(x.includes(`$@SCORMVIEWBYID*${mid}@$`), `${a.idnumber}: el botón no apunta a ${next.idnumber}`);
+        else assert(next.modname === 'h5pactivity' && !/VIEWBYID\*\d+@\$/.test(x) && !x.includes('Iniciar actividad'), `${a.idnumber}: botón «Iniciar actividad» hacia ${next.idnumber}, que ya está embebida`);
+      }
+      if (/^cv3:(exam_info:|final_exam_info)/.test(a.idnumber)) {
+        const mid = /_(\d+)$/.exec(bacts[i + 1].dir)[1];
+        assert(bacts[i + 1].modname === 'quiz' && x.includes(`$@QUIZVIEWBYID*${mid}@$`), `${a.idnumber}: el botón no apunta a su evaluación`);
+      }
+    }
+    const sectionLinks = async (a) => Array.from((await intro(a)).matchAll(/\$@COURSESECTIONBYID\*(\d+)@\$/g), (m) => Number(m[1]));
+    const M = base.input.manifest;
+    const firstCh = (mod) => secOf.get(`cv3:ch:${mod.chapters[0].chapterId}:opening`);
+    const nexts = bacts.filter((a) => /^cv3:module_next:/.test(a.idnumber));
+    // Fix 1 (I1): module_next SOLO en módulos con examen (sin examen, el cierre del capítulo es el paso siguiente).
+    assert(nexts.length === M.modules.filter((m) => m.examEnabled).length && M.modules.some((m) => !m.examEnabled), `module_next ${nexts.length}`);
+    for (const mod of M.modules.filter((m) => !m.examEnabled)) assert(!find(new RegExp(`^cv3:module_next:${mod.moduleId}$`)), `module_next en el módulo sin examen ${mod.moduleId}`);
+    const dup = {};
+    for (const a of bacts.filter((x) => x.modname === 'label')) for (const t of new Set(await sectionLinks(a))) (dup[`${a.section}→${t}`] = dup[`${a.section}→${t}`] || []).push(a.idnumber);
+    eq(Object.entries(dup).filter(([, ids]) => ids.length > 1), [], 'ninguna sección con dos botones al mismo destino');
+    const finalSec = secOf.get('cv3:final_exam');
+    const closingSec = secOf.get('cv3:shell:closing');
+    // EV6: el cierre es la ÚLTIMA sección y va después de la evaluación final.
+    assert(Number.isInteger(finalSec) && finalSec < closingSec && Math.max(...bacts.map((a) => a.section)) === closingSec, `evaluación final (${finalSec}) antes del cierre (${closingSec}), cierre al final`);
+    for (const [i, mod] of M.modules.entries()) {
+      if (!mod.examEnabled) continue;
+      const a = nexts.find((x) => x.idnumber === `cv3:module_next:${mod.moduleId}`);
+      const want = M.modules[i + 1] ? firstCh(M.modules[i + 1]) : finalSec;
+      eq(await sectionLinks(a), [want], `${a.idnumber}: botón → sección ${want}`);
+    }
+    eq(await sectionLinks(find(/^cv3:shell:start$/)), [firstCh(M.modules[0])], '«Comenzar el curso» → sección del capítulo 1');
+    eq(await sectionLinks(find(/^cv3:shell:route_start$/)), [firstCh(M.modules[0])], '«Comenzar con el capítulo 1» → sección del capítulo 1');
+    eq(await sectionLinks(find(/^cv3:final_exam_next$/)), [closingSec], 'evaluación final → cierre');
+    // Cada cierre de capítulo: exactamente UN botón de sección, al paso siguiente real.
+    const chapters = M.modules.flatMap((mod, mi) => mod.chapters.map((ch, ci) => ({ mod, mi, ch, ci })));
+    for (const { mod, mi, ch, ci } of chapters) {
+      const a = find(new RegExp(`^cv3:ch:${ch.chapterId}:closing$`));
+      const nextCh = mod.chapters[ci + 1];
+      const want = nextCh ? secOf.get(`cv3:ch:${nextCh.chapterId}:opening`)
+        : mod.examEnabled ? secOf.get(`cv3:exam:${mod.moduleId}`)
+          : M.modules[mi + 1] ? firstCh(M.modules[mi + 1])
+            : Number.isInteger(finalSec) ? finalSec : closingSec;
+      eq(await sectionLinks(a), [want], `${a.idnumber}: un solo botón → sección ${want}`);
+      assert(a.section === secOf.get(`cv3:ch:${ch.chapterId}:opening`), `${a.idnumber}: el cierre está en la sección de su capítulo`);
+    }
+  });
+  const cases = [
+    ['GRADEPASS', () => {
+      const a = find(/:activity$/);
+      return { [`${a.dir}/grades.xml`]: (x) => x.replace('<gradepass>70.00000</gradepass>', '<gradepass>60.00000</gradepass>') };
+    }],
+    ['GRADEMAX', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/grades.xml`]: (x) => x.replace('<grademax>100.00000</grademax>', '<grademax>50.00000</grademax>') };
+    }],
+    // r55 (R5): un ítem evaluativo con nota aprobatoria exigida (o sin completion por nota, o sin tracking) → COMPLETION.
+    ['COMPLETION', () => {
+      const a = find(/:video$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace('<completionpassgrade>0</completionpassgrade>', '<completionpassgrade>1</completionpassgrade>') };
+    }],
+    ['COMPLETION', () => {
+      const a = find(/:activity$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace('<completiongradeitemnumber>0</completiongradeitemnumber>', '<completiongradeitemnumber>$@NULL@$</completiongradeitemnumber>') };
+    }],
+    ['COMPLETION', () => {
+      const a = find(/:video$/);
+      return { [`${a.dir}/h5pactivity.xml`]: (x) => x.replace('<enabletracking>1</enabletracking>', '<enabletracking>0</enabletracking>') };
+    }],
+    ['COMPLETION', () => {
+      const a = find(/^cv3:final_exam$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace('<completionpassgrade>0</completionpassgrade>', '<completionpassgrade>1</completionpassgrade>') };
+    }],
+    // r55 (R1): lo pedagógico con ítem de calificación → PEDAGOGICAL (+ ADDON para el «Repaso»).
+    ['PEDAGOGICAL', () => {
+      const a = find(/^cv3:shell:welcome$/);
+      const v = find(/:video$/);
+      return { [`${a.dir}/grades.xml`]: async () => (await bz.file(`${v.dir}/grades.xml`).async('string')) };
+    }],
+    ['CATEGORIES', () => ({ 'gradebook.xml': (x) => x.replace('<aggregationcoef>30.00000</aggregationcoef>', '<aggregationcoef>35.00000</aggregationcoef>') })],
+    // r55 (R3/R8): invariantes del criterio de nota del curso (independientes del perfil).
+    ['GRADE_CRITERION', () => ({ 'completion.xml': (x) => x.replace(/  <course_completion_criteria id="1">[\s\S]*?<\/course_completion_criteria>\n/, '') })],
+    ['GRADE_CRITERION', () => ({ 'completion.xml': (x) => x.replace('<gradepass>70.00000</gradepass>', '<gradepass>60.00000</gradepass>') })],
+    ['GRADE_CRITERION', () => ({ 'gradebook.xml': (x) => x.replace(/(<itemtype>course<\/itemtype>[\s\S]*?<gradepass>)70\.00000/, '$165.00000') })],
+    ['GRADE_CRITERION', () => ({ 'completion.xml': (x) => x.replace(/(  <course_completion_criteria id="1">[\s\S]*?<\/course_completion_criteria>\n)/, '$1$1') })],
+    ['GRADE_CRITERION_CERT', () => ({ 'completion.xml': (x) => x.replace(/  <course_completion_criteria id="1">[\s\S]*?<\/course_completion_criteria>\n/, '') })],
+    ['CRITERIA_ACTIVITY', () => {
+      const a = find(/^cv3:final_exam$/);
+      const mid = /_(\d+)$/.exec(a.dir)[1];
+      return { 'completion.xml': (x) => x.replace('  <course_completion_aggr_methd', `  <course_completion_criteria id="9">\n    <course>1</course>\n    <criteriatype>4</criteriatype>\n    <module>quiz</module>\n    <moduleinstance>${mid}</moduleinstance>\n    <courseinstanceshortname>$@NULL@$</courseinstanceshortname>\n    <enrolperiod>$@NULL@$</enrolperiod>\n    <timeend>$@NULL@$</timeend>\n    <gradepass>$@NULL@$</gradepass>\n    <role>$@NULL@$</role>\n    <roleshortname>$@NULL@$</roleshortname>\n    <course_completion_crit_completions>\n    </course_completion_crit_completions>\n  </course_completion_criteria>\n  <course_completion_aggr_methd`) };
+    }],
+    ['COURSE_COMPLETION', () => ({ 'completion.xml': (x) => x.replace('<method>1</method>', '<method>2</method>') })],
+    ['COURSE_COMPLETION', () => ({ 'completion.xml': (x) => x.replace('<criteriatype>6</criteriatype>', '<criteriatype>2</criteriatype>') })],
+    ['RESOURCE_DISABLED', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:synthesis`);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('&lt;span class=&quot;nolink&quot;&gt;', '&lt;span class=&quot;nolink&quot;&gt;Mira el video antes de seguir. ') };
+    }],
+    ['NUMBER_NOT_FROM_FACTS', () => {
+      const a = find(/^cv3:shell:methodology$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('Cómo vas a aprender&lt;/span&gt;', 'Cómo vas a aprender en 97 semanas&lt;/span&gt;') };
+    }],
+    ['CLEAN_SAFE', () => {
+      const a = find(/^cv3:shell:route$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/font-size:18px/, 'font-size:12px') };
+    }],
+    ['TOKEN_INVALID', () => {
+      // #583 (builder 3.11.0): la tarjeta del Libro Guía ya no es un label; el token mal tipado va en «Comenzar».
+      const a = find(/^cv3:shell:route_start$/);
+      const forum = find(/^cv3:shell:forum$/);
+      const mid = /forum_(\d+)/.exec(forum.dir)[1];
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*\d+@\$/, `$@RESOURCEVIEWBYID*${mid}@$`) };
+    }],
+    // V542 I2: el .h5p vive SOLO en `package`; moverlo a otro filearea deja la actividad sin paquete.
+    ['H5P_FILES', () => ({ 'files.xml': (x) => x.replace(/<filearea>package<\/filearea>\n    <itemid>0<\/itemid>\n    <filepath>\/<\/filepath>\n    <filename>cursia-video/, '<filearea>content</filearea>\n    <itemid>0</itemid>\n    <filepath>/</filepath>\n    <filename>cursia-video') })],
+    ['AUDIO_DURATION', () => {
+      const a = find(/^cv3:shell:audio_welcome$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/Duración: \d+ min \d+ s/, 'Duración: 0 min 59 s') };
+    }],
+    ['STRUCTURE', () => {
+      const a = find(/^cv3:shell:welcome$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace('<idnumber>cv3:shell:welcome</idnumber>', '<idnumber>cv3:shell:forum</idnumber>') };
+    }],
+  ];
+  // Fix round 1 (G6 M6/M8): códigos que antes no tenían una mutación que los hiciera fallar.
+  cases.push(
+    ['COURSE_GRADEPASS', () => ({ 'gradebook.xml': (x) => x.replace('<gradepass>70.00000</gradepass>', '<gradepass>65.00000</gradepass>') })],
+    ['TRANSITION_DISABLED_RESOURCE', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:closing`);
+      return { [`${a.dir}/label.xml`]: (x) => {
+        const at = x.indexOf('cvc-transition');
+        const sp = x.indexOf('&lt;span class=&quot;nolink&quot;&gt;', at) + '&lt;span class=&quot;nolink&quot;&gt;'.length;
+        return x.slice(0, sp) + 'Ahora mira el video. ' + x.slice(sp);
+      } };
+    }],
+    ['STRUCTURE', () => {
+      const a = find(/^cv3:shell:competencies$/);
+      const forum = find(/^cv3:shell:forum$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/contextid="\d+"/, () => `contextid="${forumCtx}"`) };
+    }],
+    // EV4b: el recorrido «En este capítulo» no puede prometer un video que el capítulo no tiene.
+    ['TRANSITION_DISABLED_RESOURCE', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:opening`);
+      // P3: el recorrido se titula «Tu recorrido en este capítulo».
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('Tu recorrido en este capítulo', 'Tu recorrido en este capítulo con video') };
+    }],
+    // P3: el riel «Dónde estás» del cierre no nombra recursos que no sean capítulos o la evaluación del módulo.
+    ['TRANSITION_DISABLED_RESOURCE', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:closing`);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('Dónde estás · ', 'Dónde estás (con video) · ') };
+    }],
+    ['NUMBER_NOT_FROM_FACTS', () => {
+      const a = bacts.find((x) => x.idnumber === `cv3:ch:${noVideoCh.chapterId}:opening`);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/ min&lt;\/span&gt;/, ' min · 917 minutos más&lt;/span&gt;') };
+    }],
+    // Edu EV3: botones de navegación mal resueltos o con cifras inventadas.
+    ['TOKEN_INVALID', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*\d+@\$/, '$@COURSESECTIONBYID*99@$') };
+    }],
+    ['TOKEN_INVALID', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*(\d+)@\$/, 'cursia-cta://section/$1') };
+    }],
+    ['TOKEN_INVALID', () => {
+      // UX r18 (problema 4): el paquete base es H5P y su instrucción de práctica ya no lleva botón (la actividad va
+      // embebida); el marcador «siguiente» sin resolver se prueba en el botón de la evaluación del módulo.
+      const a = find(/^cv3:exam_info:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@QUIZVIEWBYID\*\d+@\$/, 'cursia-cta://next-exam') };
+    }],
+    ['NUMBER_NOT_FROM_FACTS', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace('continúa por aquí.', 'continúa por aquí en 97 minutos.') };
+    }],
+    ['STRUCTURE', () => {
+      const a = find(/^cv3:module_next:/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace(/<idnumber>cv3:module_next:[^<]+<\/idnumber>/, '<idnumber>cv3:module_next:no-existe</idnumber>') };
+    }],
+    // EV6: botón de capítulo a una sección real pero equivocada; layout de una sola página; secciones renombradas/movidas.
+    ['NAVIGATION', () => {
+      const a = find(/^cv3:ch:[^:]+:closing$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/\$@COURSESECTIONBYID\*\d+@\$/, '$@COURSESECTIONBYID*0@$') };
+    }],
+    ['NAVIGATION', () => {
+      const a = find(/^cv3:ch:[^:]+:closing$/);
+      return { [`${a.dir}/label.xml`]: (x) => x.replace(/(\$@COURSESECTIONBYID\*\d+@\$)/, '$1&quot; data-x=&quot;$1') };
+    }],
+    ['SECTIONS', () => ({ 'course/course.xml': (x) => x.replace('<name>coursedisplay</name><value>1</value>', '<name>coursedisplay</name><value>0</value>') })],
+    // Fix 1 (I2): «evaluación final» en el cuerpo (síntesis, LLM) del último capítulo del curso — solo
+    // el label de cierre (botón determinístico «Ir a la evaluación final →») puede nombrarla.
+    ['RESOURCE_DISABLED', () => {
+      const M = base.input.manifest;
+      const lastMod = M.modules[M.modules.length - 1];
+      const lastCh = lastMod.chapters[lastMod.chapters.length - 1];
+      assert(!lastMod.examEnabled && M.features.finalExam, 'fixture: último módulo sin examen y con examen final');
+      const a = find(new RegExp(`^cv3:ch:${lastCh.chapterId}:synthesis$`));
+      return { [`${a.dir}/label.xml`]: (x) => {
+        const sp = x.indexOf('&lt;span class=&quot;nolink&quot;&gt;') + '&lt;span class=&quot;nolink&quot;&gt;'.length;
+        return x.slice(0, sp) + 'Prepárate para la evaluación final. ' + x.slice(sp);
+      } };
+    }],
+    ['SECTIONS', () => ({ 'sections/section_7/section.xml': (x) => x.replace('<name>Evaluación final</name>', '<name>Cierre del curso</name>') })],
+    ['SECTIONS', () => {
+      const a = find(/^cv3:shell:closing$/);
+      return { 'moodle_backup.xml': (x) => x.replace(`<moduleid>${/_(\d+)$/.exec(a.dir)[1]}</moduleid>\n        <sectionid>8</sectionid>`, `<moduleid>${/_(\d+)$/.exec(a.dir)[1]}</moduleid>\n        <sectionid>7</sectionid>`) };
+    }],
+    ['STRUCTURE', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/inforef.xml`]: (x) => x.replace(/(<grade_itemref>\s*<grade_item><id>)(\d+)/, (m, pre, id) => `${pre}${Number(id) + 999}`) };
+    }],
+    // P2-B1 (EV6 Fase 2): un campo de revisión alterado → QUIZ_REVIEW.
+    ['QUIZ_REVIEW', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<reviewcorrectness>16</reviewcorrectness>', '<reviewcorrectness>4352</reviewcorrectness>') };
+    }],
+    // QUIZFB: retroalimentación global con otra nota mínima, o sin ella → QUIZ_FEEDBACK; sin el bit I → QUIZ_REVIEW.
+    ['QUIZ_FEEDBACK', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<mingrade>70.00000</mingrade>', '<mingrade>50.00000</mingrade>') };
+    }],
+    ['QUIZ_FEEDBACK', () => {
+      const a = find(/^cv3:final_exam$/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace(/<feedbacks>[\s\S]*?<\/feedbacks>/, '<feedbacks></feedbacks>') };
+    }],
+    ['QUIZ_REVIEW', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<reviewoverallfeedback>4368</reviewoverallfeedback>', '<reviewoverallfeedback>16</reviewoverallfeedback>') };
+    }],
+    // r55 (R6): la regla «aprobar o agotar» encendida → QUIZ_COMPLETION.
+    ['QUIZ_COMPLETION', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<completionattemptsexhausted>0</completionattemptsexhausted>', '<completionattemptsexhausted>1</completionattemptsexhausted>') };
+    }],
+    // completionminattempts ≠ intentos (el fixture base tiene attempts_number 3) → QUIZ_COMPLETION.
+    ['QUIZ_COMPLETION', () => {
+      const a = find(/^cv3:exam:/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<completionminattempts>3</completionminattempts>', '<completionminattempts>1</completionminattempts>') };
+    }],
+    // intentos ≠ perfil (no se cambia el método ni los intentos del perfil) → QUIZ_COMPLETION.
+    ['QUIZ_COMPLETION', () => {
+      const a = find(/^cv3:final_exam$/);
+      return { [`${a.dir}/quiz.xml`]: (x) => x.replace('<attempts_number>3</attempts_number>', '<attempts_number>0</attempts_number>') };
+    }],
+    // r55 (R6): «Respuestas explicadas» abierta por otra vía (aprobar con intentos restantes, e=2) → EXPLANATIONS_GATE.
+    ['EXPLANATIONS_GATE', () => {
+      const a = find(/^cv3:exam_explanations:/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace(/"e":3\}/, '"e":2}') };
+    }],
+    ['EXPLANATIONS_GATE', () => {
+      const a = find(/^cv3:final_exam_explanations$/);
+      return { [`${a.dir}/module.xml`]: (x) => x.replace(/<availability>[^<]*<\/availability>/, '<availability>$@NULL@$</availability>') };
+    }],
+  );
+  await check('validador (fix 1, I1): dos botones de la MISMA sección al MISMO destino → NAVIGATION «misma sección»', async () => {
+    // route_start (sección 1) movido a la sección 0, junto a start: los dos llevan al capítulo 1.
+    const a = find(/^cv3:shell:route_start$/);
+    const mid = /_(\d+)$/.exec(a.dir)[1];
+    const bad = await mutate(base.r.mbz, { 'moodle_backup.xml': (x) => x.replace(`<moduleid>${mid}</moduleid>\n        <sectionid>1</sectionid>`, `<moduleid>${mid}</moduleid>\n        <sectionid>0</sectionid>`) });
+    const v = await V.validateMbzV3(bad, base.r.expectations);
+    assert(v.issues.some((i) => i.code === 'NAVIGATION' && /llevan a la misma sección/.test(i.message) && /cv3:shell:start/.test(i.where) && /cv3:shell:route_start/.test(i.where)), JSON.stringify(v.issues.slice(0, 5)));
+  });
+  // UX r18 fix 1 (M3): con SCORM el botón «Iniciar actividad» se conserva y su marcador queda resuelto al SCORM
+  // siguiente; devolverlo a `cursia-cta://next-activity` → TOKEN_INVALID (el paquete H5P ya no tiene ese botón).
+  await check('[scorm-nofinal-dark] «Iniciar actividad» conservado y resuelto al SCORM; marcador next-activity sin resolver → TOKEN_INVALID', async () => {
+    const sb = built['scorm-nofinal-dark'];
+    const { z: sz, acts: sacts } = await actDirs(sb.r.mbz);
+    const instr = sacts.filter((a) => /:activity_instruction$/.test(a.idnumber));
+    assert(instr.length > 0, 'hay prácticas SCORM');
+    for (const a of instr) {
+      const next = sacts[sacts.indexOf(a) + 1];
+      const x = await sz.file(`${a.dir}/label.xml`).async('string');
+      const mid = /_(\d+)$/.exec(next.dir)[1];
+      assert(next.modname === 'scorm' && x.includes(`$@SCORMVIEWBYID*${mid}@$`) && x.includes('Iniciar actividad →') && !x.includes('cursia-cta://'), `${a.idnumber}: botón al SCORM ${next.idnumber}`);
+    }
+    const bad = await mutate(sb.r.mbz, { [`${instr[0].dir}/label.xml`]: (x) => x.replace(/\$@SCORMVIEWBYID\*\d+@\$/, () => 'cursia-cta://next-activity') });
+    const v = await V.validateMbzV3(bad, sb.r.expectations);
+    assert(!v.ok && v.issues.some((i) => i.code === 'TOKEN_INVALID' && i.where === instr[0].idnumber), JSON.stringify(v.issues.slice(0, 4)));
+  });
+  const forumAct = find(/^cv3:shell:forum$/);
+  const forumCtx = /contextid="(\d+)"/.exec(await bz.file(`${forumAct.dir}/forum.xml`).async('string'))[1];
+  for (const [code, mk] of cases) {
+    await check(`validador detecta ${code}`, async () => {
+      const bad = await mutate(base.r.mbz, mk());
+      const v = await V.validateMbzV3(bad, base.r.expectations);
+      assert(!v.ok && v.issues.some((i) => i.code === code), `esperaba ${code}, hallazgos: ${JSON.stringify(v.issues.slice(0, 4))}`);
+    });
+  }
+  // ── P3: la actividad del capítulo va enmarcada con el tono de su módulo ─────
+  await check('P3: intro de la actividad (H5P y SCORM) enmarcada con el tono del módulo; clases del cargador y del QA intactas', async () => {
+    for (const cfg of MATRIX) {
+      const { r } = built[cfg.id];
+      const z = await JSZip.loadAsync(r.mbz);
+      const { acts } = await actDirs(r.mbz);
+      const theme = TE.resolveTheme(cfg.theme);
+      const ground = theme.personality.plate ? theme.color.bg : theme.color.surface;
+      for (const ch of r.expectations.facts.chapters.filter((c) => c.activityEnabled)) {
+        const a = acts.find((x) => x.idnumber === `cv3:ch:${ch.id}:activity`);
+        const xml = await z.file(`${a.dir}/${a.modname}.xml`).async('string');
+        const intro = /<intro>([\s\S]*?)<\/intro>/.exec(xml)[1].replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+        const mt = VC.moduleTone(theme, TE.moduleColor(theme, ch.moduleNumber - 1), ground);
+        assert(intro.includes('class="cvc-act-h"') && intro.includes(`background-color:${mt.soft}`) && intro.includes(`color:${mt.ink}`) && (intro.includes(`Práctica del capítulo ${ch.number} · Responde aquí`) || intro.includes(`Práctica calificada del capítulo ${ch.number}</span>`)), `${cfg.id} cap ${ch.number}: marco del módulo`);
+        if (a.modname === 'h5pactivity') assert(['cursia-iv', 'cursia-iv-inline', 'cursia-iv-fallback', 'cursia-iv-open'].every((c) => intro.includes(`class="${c}`)) && intro.includes('data-cursia-src='), `${cfg.id} cap ${ch.number}: clases del cargador`);
+      }
+    }
+  });
+  // ── EV6 T3: certificado nativo (insignia de curso) ─────────────────────────
+  await check('EV6 T3: insignia-certificado en toda la matriz (badges.xml, setting badges=1, imagen f1/f2/f3, examen final como criterio, panel del cierre)', async () => {
+    for (const cfg of MATRIX) {
+      const { r } = built[cfg.id];
+      const z = await JSZip.loadAsync(r.mbz);
+      const bx = await z.file('badges.xml').async('string');
+      if (!cfg.finalExam) {
+        // Fix round 1b (decisión M5): sin evaluación final no hay certificado (ni insignia, ni imagen,
+        // ni setting, ni panel, ni label para docentes) y el resumen lo avisa.
+        assert(!/<badge id/.test(bx), `${cfg.id}: sin insignia`);
+        assert(/<name>badges<\/name>\n      <value>0<\/value>/.test(await z.file('moodle_backup.xml').async('string')), `${cfg.id}: setting badges = 0`);
+        assert(!(await z.file('files.xml').async('string')).includes('<component>badges</component>'), `${cfg.id}: sin imagen`);
+        const { acts } = await actDirs(r.mbz);
+        const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+        assert(!/BADGESVIEWBYID|certificad/i.test(lx), `${cfg.id}: el cierre no promete certificado`);
+        assert(!acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher'), `${cfg.id}: sin label docente`);
+        assert(r.summary.warnings.includes('certificate_omitted:no_final_exam'), `${cfg.id}: aviso certificate_omitted:no_final_exam`);
+        continue;
+      }
+      const title = r.expectations.facts.course.title;
+      assert(bx.includes(`<name>Certificado: ${title}</name>`), `${cfg.id}: nombre`);
+      // r55 (R4): la descripción enuncia la regla REAL (nota final ≥ mínimo, por pesos), nunca «aprobar todas…».
+      const c = r.expectations.facts.counts;
+      const kinds = [c.activities ? 'las actividades prácticas' : null, c.videos ? 'los videos interactivos' : null, c.exams ? 'las evaluaciones de módulo' : null, 'la evaluación final'].filter(Boolean);
+      const list = `${kinds.slice(0, -1).join(', ')} y ${kinds[kinds.length - 1]}`;
+      const repaso = (c.reviewCards ?? 0) > 0 ? '; las actividades de repaso no cuentan en la nota' : '';
+      const desc = `Otorgado al aprobar el curso «${title}»: obtener una calificación final igual o superior a 70/100, calculada con ${list} según sus pesos${repaso}.`;
+      assert(bx.includes(`<description>${desc}</description>`), `${cfg.id}: descripción`);
+      assert(!/aprobar todas|todas las actividades/.test(bx), `${cfg.id}: sin «aprobar todas»`);
+      for (const t of ['<type>2</type>', '<courseid>1</courseid>', '<status>1</status>', '<notification>0</notification>', '<language>es</language>', '<issuername>Cursia</issuername>', '<name>course_1</name>', '<value>1</value>']) assert(bx.includes(t), `${cfg.id}: ${t}`);
+      assert(/%badgename%/.test(bx), `${cfg.id}: %badgename%`);
+      const mb = await z.file('moodle_backup.xml').async('string');
+      assert(/<level>root<\/level>\n      <name>badges<\/name>\n      <value>1<\/value>/.test(mb), `${cfg.id}: setting badges`);
+      const fx = await z.file('files.xml').async('string');
+      for (const [fn, size] of [['f1.png', 100], ['f2.png', 35], ['f3.png', 512]]) {
+        const f = fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((x) => x.includes('<component>badges</component>') && x.includes(`<filename>${fn}</filename>`));
+        assert(f && f.includes('<contextid>2</contextid>') && f.includes('<filearea>badgeimage</filearea>') && f.includes('<itemid>1</itemid>'), `${cfg.id}: ${fn} en files.xml`);
+        const h = /<contenthash>(\w+)<\/contenthash>/.exec(f)[1];
+        const png = await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer');
+        eq([png.readUInt32BE(16), png.readUInt32BE(20), png[25]], [size, size, 6], `${cfg.id}: ${fn} RGBA ${size}px`);
+      }
+      const { acts } = await actDirs(r.mbz);
+      const closing = acts.find((a) => a.idnumber === 'cv3:shell:closing');
+      const lx = await z.file(`${closing.dir}/label.xml`).async('string');
+      assert(lx.includes('$@BADGESVIEWBYID*1@$') && lx.includes('Tu certificado') && lx.includes('Ver mi certificado →'), `${cfg.id}: panel del cierre`);
+      const want = 'Cuando tu calificación final del curso llegue a 70/100 o más, Moodle te otorga el certificado del curso (puede tardar unos minutos en aparecer). Lo encuentras en tu perfil, en Insignias.';
+      assert(lx.includes(want), `${cfg.id}: texto del panel`);
+      assert(lx.includes(`Apruebas el curso con una calificación final igual o superior a 70/100, calculada con ${list} según sus pesos${repaso}.`), `${cfg.id}: regla de aprobación en el cierre`);
+      // Fix 0b: label oculto para docentes, justo después del cierre, en la misma sección.
+      const teacher = acts.find((a) => a.idnumber === 'cv3:shell:certificate_teacher');
+      assert(teacher && teacher.section === closing.section && acts.indexOf(teacher) === acts.indexOf(closing) + 1, `${cfg.id}: label docente tras el cierre`);
+      const tm = await z.file(`${teacher.dir}/module.xml`).async('string');
+      assert(tm.includes('<visible>0</visible>') && tm.includes('<visibleold>0</visibleold>'), `${cfg.id}: label docente oculto`);
+      const tx = await z.file(`${teacher.dir}/label.xml`).async('string');
+      for (const t of ['Para docentes: activa el certificado del curso', 'Moodle deja la insignia desactivada al restaurar.', `Entra a Insignias → «Certificado: ${title}» → «Habilitar acceso».`, 'Solo se hace una vez.', 'Abrir las insignias del curso →', '$@BADGESVIEWBYID*1@$',
+        'El curso se aprueba solo por la calificación final', 'marcar a mano una actividad como completada no lo aprueba', 'cron']) {
+        assert(tx.includes(t.replace(/"/g, '&quot;')), `${cfg.id}: label docente «${t}»`);
+      }
+      const hidden = [];
+      for (const a of acts) if ((await z.file(`${a.dir}/module.xml`).async('string')).includes('<visible>0</visible>')) hidden.push(a.idnumber);
+      eq(hidden, ['cv3:shell:certificate_teacher'], `${cfg.id}: único módulo oculto`);
+      // r55 (R3): la completion del curso es SOLO el criterio de nota (la insignia lo hereda).
+      const comp = await z.file('completion.xml').async('string');
+      eq([...comp.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], `${cfg.id}: único criterio = nota del curso`);
+    }
+    // Imagen determinística y con los colores del tema (acento en el centro de la medalla).
+    const t = { color: { accent: '#1D4ED8', accentStrong: '#1E3A8A', textOnAccent: '#FFFFFF' } };
+    const BADGE = loadDist('package/v3/course-badge.js');
+    const a1 = BADGE.renderCourseBadgePng(t, 512);
+    assert(a1.equals(BADGE.renderCourseBadgePng(t, 512)), 'determinismo de la imagen');
+    assert(!a1.equals(BADGE.renderCourseBadgePng({ color: { ...t.color, accent: '#B91C1C' } }, 512)), 'la imagen cambia con el acento');
+    eq(BADGE.courseBadgeName('x'.repeat(400)).length <= 255, true, 'nombre ≤ 255');
+  });
+  // r55 (R3): las banderas guardadas del perfil ya no cambian la completion: SIEMPRE un único criterio de nota.
+  for (const [what, cc] of [
+    ['requireExams=false', { requireAllChapterActivities: true, requireExams: false, requireCourseGradePass: true }],
+    ['todo apagado', { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: false }],
+    ['requireCourseGradePass=false (perfil viejo)', { requireAllChapterActivities: true, requireExams: true, requireCourseGradePass: false }],
+  ]) {
+    await check(`r55 (R3): perfil con ${what} → completion = SOLO el criterio de nota (70), sin criterios de actividad; descripción y panel = regla real`, async () => {
+      const input = PF.packagingInput(distRoot, MATRIX[0]);
+      input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+      input.assessmentProfile.courseCompletion = cc;
+      const r = await B.buildDynamicMbzV3(input);
+      const v = await validate(r);
+      assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+      const { z, acts } = await actDirs(r.mbz);
+      const comp = await z.file('completion.xml').async('string');
+      eq([...comp.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], 'solo tipo 6');
+      assert(comp.includes('<gradepass>70.00000</gradepass>'), 'gradepass 70');
+      const title = r.expectations.facts.course.title;
+      assert((await z.file('badges.xml').async('string')).includes(`<description>Otorgado al aprobar el curso «${title}»: obtener una calificación final igual o superior a 70/100`), 'descripción');
+      const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+      assert(lx.includes('Cuando tu calificación final del curso llegue a 70/100 o más'), 'panel');
+    });
+  }
+  await check('r55 (R3): override por tipo bajo el mínimo del curso (práctica 50, exámenes 60, curso 80) → el criterio de nota usa 80 y cada ítem conserva su gradepass informativo', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.passingGrade = 80;
+    input.assessmentProfile.overrides = { activity: 50, video: 50, exam: 60, finalExam: 60 };
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    const { z, acts } = await actDirs(r.mbz);
+    const comp = await z.file('completion.xml').async('string');
+    eq([...comp.matchAll(/<criteriatype>(\d+)<\/criteriatype>/g)].map((m) => m[1]), ['6'], 'solo tipo 6');
+    assert(comp.includes('<gradepass>80.00000</gradepass>'), 'criterio de nota = 80');
+    assert(/<itemtype>course<\/itemtype>[\s\S]*?<gradepass>80\.00000<\/gradepass>/.test(await z.file('gradebook.xml').async('string')), 'ítem del curso = 80');
+    const vid = acts.find((a) => /:video$/.test(a.idnumber));
+    assert((await z.file(`${vid.dir}/grades.xml`).async('string')).includes('<gradepass>50.00000</gradepass>'), 'video: gradepass informativo 50');
+    const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+    assert(lx.includes('igual o superior a 80/100') && lx.includes('llegue a 80/100'), 'textos con la nota del curso (80)');
+  });
+  await check('review r1 (M3/M2/I2/M4): práctica con peso 0 → la regla no la nombra y su tarjeta no dice «cuenta en tu nota final»; nota de referencia; restaurar como curso nuevo / «Sobrescribir configuración del curso»; override en dos pasos; ningún texto del shell dice «aprobar todas»', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.categoryWeights = { practice: 0, moduleExams: 70, finalExam: 30 };
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    const { z, acts } = await actDirs(r.mbz);
+    const label = async (idn) => z.file(`${acts.find((a) => a.idnumber === idn).dir}/label.xml`).async('string');
+    const closing = await label('cv3:shell:closing');
+    assert(closing.includes('calculada con las evaluaciones de módulo y la evaluación final según sus pesos'), `regla sin la práctica (peso 0): ${/Apruebas el curso[^<]*/.exec(closing)}`);
+    assert(!/actividades prácticas|videos interactivos/.test(closing), 'no nombra categorías de peso 0');
+    const instr = acts.filter((a) => /:activity_instruction$/.test(a.idnumber));
+    assert(instr.length > 0, 'hay tarjetas de actividad');
+    for (const a of instr) {
+      const t = await z.file(`${a.dir}/label.xml`).async('string');
+      assert(t.includes('Nota de referencia: 70/100 · no bloquea tu aprobación') && !t.includes('cuenta en tu nota final') && !t.includes('Nota mínima'), `tarjeta ${a.idnumber}`);
+    }
+    const teacher = await label('cv3:shell:certificate_teacher');
+    assert(teacher.includes('Restaura el paquete como un curso nuevo') && teacher.includes('«Sobrescribir configuración del curso: Sí»'), 'nota docente: restaurar como curso nuevo / sobrescribir configuración');
+    assert(teacher.includes('hazlo en dos pasos, primero márcala como no completada y después como completada'), 'nota docente: override en dos pasos');
+    // Pesos normales: la tarjeta sí dice que cuenta en la nota final.
+    const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, MATRIX[0]));
+    const d0 = await actDirs(r0.mbz);
+    const i0 = d0.acts.find((a) => /:activity_instruction$/.test(a.idnumber));
+    assert((await d0.z.file(`${i0.dir}/label.xml`).async('string')).includes('no bloquea tu aprobación; cuenta en tu nota final'), 'práctica con peso > 0');
+    // Texto determinístico del shell (labels cv3:shell:* y tarjetas/cierres de capítulo, en toda la matriz): nunca «aprobar todas».
+    for (const cfg of MATRIX) {
+      const rr = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, cfg));
+      const dd = await actDirs(rr.mbz);
+      for (const a of dd.acts.filter((x) => /^cv3:shell:|:activity_instruction$|:closing$/.test(x.idnumber))) {
+        const f = dd.z.file(`${a.dir}/label.xml`) || dd.z.file(`${a.dir}/page.xml`);
+        if (!f) continue;
+        const t = await f.async('string');
+        assert(!/aprobar todas|apruebes todas|debes aprobar (cada|todas)/i.test(t), `${cfg.id} ${a.idnumber}: «aprobar todas»`);
+      }
+    }
+  });
+  await check('EV6 T3: sin evaluación final (aunque el perfil exija todo lo demás o nada) → sin certificado y aviso certificate_omitted:no_final_exam', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[1]);
+    input.assessmentProfile = JSON.parse(JSON.stringify(input.assessmentProfile));
+    input.assessmentProfile.courseCompletion = { requireAllChapterActivities: false, requireExams: false, requireCourseGradePass: false };
+    const r = await B.buildDynamicMbzV3(input);
+    const v = await validate(r);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 3)));
+    assert(r.summary.warnings.includes('certificate_omitted:no_final_exam'), 'aviso');
+    const { z, acts } = await actDirs(r.mbz);
+    assert(!/<badge id/.test(await z.file('badges.xml').async('string')), 'sin insignia');
+    assert(/<name>badges<\/name>\n      <value>0<\/value>/.test(await z.file('moodle_backup.xml').async('string')), 'setting badges = 0');
+    assert(!(await z.file('files.xml').async('string')).includes('<component>badges</component>'), 'sin imagen');
+    const lx = await z.file(`${acts.find((a) => a.idnumber === 'cv3:shell:closing').dir}/label.xml`).async('string');
+    assert(!/BADGESVIEWBYID|certificado/i.test(lx), 'sin panel');
+    assert(!acts.some((a) => a.idnumber === 'cv3:shell:certificate_teacher'), 'sin label docente');
+  });
+  {
+    const certCases = [
+      ['setting badges = 0', () => ({ 'moodle_backup.xml': (x) => x.replace(/(<name>badges<\/name>\n      <value>)1/, '$10') })],
+      ['sin insignia', () => ({ 'badges.xml': (x) => x.replace(/<badge id[\s\S]*<\/badge>/, '') })],
+      ['criterio de curso con otro id', () => ({ 'badges.xml': (x) => x.replace('<name>course_1</name>', '<name>course_2</name>') })],
+      ['insignia inactiva', () => ({ 'badges.xml': (x) => x.replace('<status>1</status>', '<status>0</status>') })],
+      ['descripción con otra nota mínima', () => ({ 'badges.xml': (x) => x.replace('igual o superior a 70/100', 'igual o superior a 60/100') })],
+      ['descripción que exige aprobar todas las actividades (regla vieja)', () => ({ 'badges.xml': (x) => x.replace(/<description>[^<]*<\/description>/, '<description>Otorgado al completar el curso: aprobar todas las actividades prácticas y la evaluación final.</description>') })],
+      ['panel que no enuncia la regla real', () => {
+        const a = find(/^cv3:shell:closing$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Cuando tu calificación final del curso llegue a 70/100 o más', 'Cuando apruebes todas las actividades prácticas') };
+      }],
+      ['label docente sin la regla de aprobación', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('El curso se aprueba solo por la calificación final', 'El curso se aprueba') };
+      }],
+      ['label docente sin la nota de diagnóstico', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Si no ves la insignia', 'Si no aparece') };
+      }],
+      ['falta f3.png', () => ({ 'files.xml': (x) => x.replace('<filename>f3.png</filename>', '<filename>f9.png</filename>') })],
+      ['contexto del curso = contexto de sistema', () => ({ 'moodle_backup.xml': (x) => x.replace('<original_course_contextid>2</original_course_contextid>', '<original_course_contextid>1</original_course_contextid>') })],
+      ['imagen con otro itemid', () => ({ 'files.xml': (x) => x.replace(/(<filearea>badgeimage<\/filearea>\n    <itemid>)1/, '$17') })],
+      ['label docente visible para estudiantes', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<visible>0</visible>', '<visible>1</visible>') };
+      }],
+      ['label docente sin «Habilitar acceso»', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.replace('Habilitar acceso', 'Activar') };
+      }],
+      ['otro módulo oculto', () => {
+        const a = find(/^cv3:shell:welcome$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<visible>1</visible>', '<visible>0</visible>') };
+      }],
+      ['falta el label docente', () => {
+        const a = find(/^cv3:shell:certificate_teacher$/);
+        return { [`${a.dir}/module.xml`]: (x) => x.replace('<idnumber>cv3:shell:certificate_teacher</idnumber>', '<idnumber>cv3:shell:otro</idnumber>') };
+      }],
+      ['cierre sin enlace a la insignia', () => {
+        const a = find(/^cv3:shell:closing$/);
+        return { [`${a.dir}/label.xml`]: (x) => x.split('$@BADGESVIEWBYID*1@$').join('#') };
+      }],
+    ];
+    for (const [what, mk] of certCases) {
+      await check(`validador detecta CERTIFICATE: ${what}`, async () => {
+        const bad = await mutate(base.r.mbz, mk());
+        const v = await V.validateMbzV3(bad, base.r.expectations);
+        assert(!v.ok && v.issues.some((i) => i.code === 'CERTIFICATE'), `esperaba CERTIFICATE, hallazgos: ${JSON.stringify(v.issues.slice(0, 4))}`);
+      });
+    }
+    await check('validador detecta CERTIFICATE: insignia en un curso SIN evaluación final (fix round 1b)', async () => {
+      const nf = built['scorm-nofinal-dark'].r;
+      const bxWith = await (await JSZip.loadAsync(base.r.mbz)).file('badges.xml').async('string');
+      const bad = await mutate(nf.mbz, { 'badges.xml': () => bxWith });
+      const v = await V.validateMbzV3(bad, nf.expectations);
+      assert(!v.ok && v.issues.some((i) => i.code === 'CERTIFICATE' && /sin evaluación final/.test(i.message)), JSON.stringify(v.issues.slice(0, 4)));
+    });
+    await check('validador detecta TOKEN_INVALID: $@BADGESVIEWBYID@$ que no apunta al curso del backup', async () => {
+      const a = find(/^cv3:shell:closing$/);
+      const bad = await mutate(base.r.mbz, { [`${a.dir}/label.xml`]: (x) => x.split('$@BADGESVIEWBYID*1@$').join('$@BADGESVIEWBYID*7@$') });
+      const v = await V.validateMbzV3(bad, base.r.expectations);
+      assert(v.issues.some((i) => i.code === 'TOKEN_INVALID' && /BADGESVIEWBYID\*7/.test(i.message)), JSON.stringify(v.issues.slice(0, 4)));
+    });
+  }
+  await check('validador detecta H5P_LIBRARIES (dependencia fuera del perfil) y FILES_INTEGRITY (blob alterado)', async () => {
+    const z = await JSZip.loadAsync(base.r.mbz);
+    const pkg = base.r.summary.h5pPackages[0];
+    const blobPath = `files/${pkg.sha1.slice(0, 2)}/${pkg.sha1}`;
+    const inner = await JSZip.loadAsync(await z.file(blobPath).async('nodebuffer'));
+    const hj = JSON.parse(await inner.file('h5p.json').async('string'));
+    hj.preloadedDependencies.push({ machineName: 'H5P.Intruso', majorVersion: 9, minorVersion: 9 });
+    inner.file('h5p.json', JSON.stringify(hj));
+    const nb = await inner.generateAsync({ type: 'nodebuffer' });
+    const nh = crypto.createHash('sha1').update(nb).digest('hex');
+    z.remove(blobPath);
+    z.file(`files/${nh.slice(0, 2)}/${nh}`, nb);
+    const fx = (await z.file('files.xml').async('string')).split(pkg.sha1).join(nh).split(`<filesize>${pkg.bytes}</filesize>`).join(`<filesize>${nb.length}</filesize>`);
+    z.file('files.xml', fx);
+    const v1 = await V.validateMbzV3(await z.generateAsync({ type: 'nodebuffer' }), base.r.expectations);
+    assert(v1.issues.some((i) => i.code === 'H5P_LIBRARIES' && /H5P.Intruso/.test(i.message)), JSON.stringify(v1.issues.slice(0, 3)));
+    const z2 = await JSZip.loadAsync(base.r.mbz);
+    z2.file(blobPath, Buffer.from('corrupto'));
+    const v2 = await V.validateMbzV3(await z2.generateAsync({ type: 'nodebuffer' }), base.r.expectations);
+    assert(v2.issues.some((i) => i.code === 'FILES_INTEGRITY'), 'blob alterado');
+  });
+  // Reescribe un blob del paquete (re-hash + files.xml) para mutar archivos, no solo XML.
+  async function rewriteBlob(mbz, pickHash, fn) {
+    const z = await JSZip.loadAsync(mbz);
+    const fx0 = await z.file('files.xml').async('string');
+    const h = pickHash(fx0);
+    const p0 = `files/${h.slice(0, 2)}/${h}`;
+    const oldBuf = await z.file(p0).async('nodebuffer');
+    const nb = await fn(oldBuf);
+    const nh = crypto.createHash('sha1').update(nb).digest('hex');
+    z.remove(p0);
+    z.file(`files/${nh.slice(0, 2)}/${nh}`, nb);
+    const fx = fx0.split(h).join(nh).split(`<filesize>${oldBuf.length}</filesize>`).join(`<filesize>${nb.length}</filesize>`);
+    z.file('files.xml', fx);
+    return z.generateAsync({ type: 'nodebuffer' });
+  }
+  await check('validador detecta LIBRO (r19: PDF truncado / no PDF) y H5P_LIBRARIES por rol (G6 M7: actividad con otra librería, video que no es IV)', async () => {
+    const libroHash = (fx) => /<contenthash>(\w+)<\/contenthash>/.exec(fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((b) => /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(b)))[1];
+    for (const edit of [(b) => b.subarray(0, b.length - 64), () => Buffer.from('<!DOCTYPE html><html><body>libro</body></html>')]) {
+      const bad = await rewriteBlob(base.r.mbz, libroHash, async (b) => edit(b));
+      const v = await V.validateMbzV3(bad, base.r.expectations);
+      assert(v.issues.some((i) => i.code === 'LIBRO'), JSON.stringify(v.issues.slice(0, 3)));
+    }
+    const swapMain = (lib) => async (b) => {
+      const inner = await JSZip.loadAsync(b);
+      const hj = JSON.parse(await inner.file('h5p.json').async('string'));
+      hj.mainLibrary = lib;
+      inner.file('h5p.json', JSON.stringify(hj));
+      return inner.generateAsync({ type: 'nodebuffer' });
+    };
+    const act = base.r.summary.h5pPackages.find((p) => p.itemKey.startsWith('activity:'));
+    const other = ['H5P.QuestionSet', 'H5P.DragText', 'H5P.Blanks'].find((l) => l !== act.mainLibrary);
+    for (const [pkg, lib, re] of [[act, other, /R-012/], [act, 'H5P.SingleChoiceSet', /R-011/], [base.r.summary.h5pPackages.find((p) => p.mainLibrary === 'H5P.InteractiveVideo'), 'H5P.QuestionSet', /H5P.InteractiveVideo/]]) {
+      const bad = await rewriteBlob(base.r.mbz, () => pkg.sha1, swapMain(lib));
+      const v = await V.validateMbzV3(bad, base.r.expectations);
+      assert(v.issues.some((i) => i.code === 'H5P_LIBRARIES' && re.test(i.message)), `${lib}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+  });
+  void bz;
+
+
+  // ── Fix round 1 (review G6) ───────────────────────────────────────────────
+  await check('fix G6 I1: predicado único de mock (metadata o cuerpo); reproducción del review: run real + flag solo en el cuerpo → falla fuerte', async () => {
+    const run = { id: 'r', input_payload: { providerModes: { presentation: 'real', audio: 'real' } } };
+    const mk = (key, type, mime) => ({ itemKey: key, type: key.split(':')[0], outputSummary: {}, artifacts: [{ itemKey: key, artifactId: key + '-a', type, metadata: {}, mimeType: mime, storageBucket: 'b', storagePath: 'o/x' }] });
+    const byItem = new Map();
+    for (const [k, t, m] of [['course_intro:1', 'dynamic_course_intro_json', 'application/json'], ['audio_welcome:1', 'dynamic_audio_mp3', 'application/json'], ['presentation:c1', 'dynamic_presentation', 'application/json'], ['audiobook_chapter:c1', 'dynamic_audio_mp3', 'application/json'], ['module_intro:m1', 'dynamic_module_intro_json'], ['content:c1', 'dynamic_content_md'], ['experience:c1', 'dynamic_experience_json']]) byItem.set(k, mk(k, t, m));
+    PK.assertRunArtifactsPackageable(run, byItem); // metadata limpia: la guarda previa pasa…
+    const plan = { keys: { courseIntro: 'course_intro:1', audioWelcome: 'audio_welcome:1', finalExam: null }, modules: [{ moduleId: 'm1', keys: { moduleIntro: 'module_intro:m1', exam: null }, chapters: [{ chapterId: 'c1', keys: { content: 'content:c1', experience: 'experience:c1', presentation: 'presentation:c1', audiobookChapter: 'audiobook_chapter:c1', video: null, activity: null } }] }] };
+    const L = (body) => ({ loadText: async (a) => (a.type === 'dynamic_presentation' ? JSON.stringify({ ...body, slideCount: 3 }) : a.type === 'dynamic_audio_mp3' ? JSON.stringify({ ...body, durationSeconds: 5 }) : '{}'), loadBytes: async () => { throw new Error('bytes'); }, loadStorageBytes: async () => { throw new Error('storage'); } });
+    for (const body of [{ fixture: true }, { mock: true }, { mode: 'mock' }]) {
+      await rejects(PK.loadContentsV3(L(body), plan, byItem, run, { familyId: 'aula-clara', mode: 'light' }), /MOCK_ARTIFACT_IN_REAL_RUN/, `…pero el cargador rechaza el cuerpo ${JSON.stringify(body)}`);
+    }
+    // metadata.mode='mock' también es señal (ahora la guarda previa lo ve)
+    const bm = new Map([['presentation:c1', { itemKey: 'presentation:c1', type: 'presentation', outputSummary: {}, artifacts: [{ itemKey: 'presentation:c1', artifactId: 'p', type: 'dynamic_presentation', metadata: { mode: 'mock' } }] }]]);
+    throwsSync(() => PK.assertRunArtifactsPackageable(run, bm), /MOCK_ARTIFACT_IN_REAL_RUN/, 'metadata.mode=mock');
+    assert(PK.isMockSignaled({ metadata: {} }, { fixture: true }) && PK.isMockSignaled({ metadata: { fixture: true } }) && !PK.isMockSignaled({ metadata: {} }, { mode: 'real' }), 'predicado');
+    // audio JSON sin marcas en un run real: tampoco se materializa
+    const L2 = { loadText: async (a) => (a.type === 'dynamic_audio_mp3' ? '{"durationSeconds":5}' : a.type === 'dynamic_presentation' ? '{"schemaVersion":1}' : '{}'), loadBytes: async () => Buffer.from('{"fixture":true}'), loadStorageBytes: async () => { throw new Error('x'); } };
+    await rejects(PK.loadContentsV3(L2, plan, byItem, run, { familyId: 'aula-clara', mode: 'light' }), /PACKAGING_V3/, 'JSON de audio en run real');
+    // run mock pero fixture sin datos → falla (G6 M3), nunca un valor inventado
+    const runMock = { id: 'r', input_payload: { providerModes: { presentation: 'mock', audio: 'mock' } } };
+    const L3 = { loadText: async (a) => (a.type === 'dynamic_presentation' ? '{"fixture":true}' : a.type === 'dynamic_audio_mp3' ? '{"fixture":true,"durationSeconds":5}' : '{}'), loadBytes: async () => { throw new Error('x'); }, loadStorageBytes: async () => { throw new Error('x'); } };
+    await rejects(PK.loadContentsV3(L3, plan, byItem, runMock, { familyId: 'aula-clara', mode: 'light' }), /sin slideCount válido/, 'fixture sin slideCount');
+  });
+  await check('fix G6 I2: storage path — dot-segments, backslashes, %-encoding, absolutos, vacíos y otro dueño se rechazan ANTES de descargar', async () => {
+    const OWN = '8a1b2c3d-0000-4000-8000-000000000001';
+    const bad = [
+      `${OWN}/../victim/f.pdf`, `${OWN}/./f.pdf`, `${OWN}/a/../../victim/f.pdf`, `${OWN}\\..\\victim\\f.pdf`, `${OWN}/..\\victim/f.pdf`,
+      `${OWN}/%2e%2e/victim/f.pdf`, `${OWN}/%2E%2E/victim`, `${OWN}%2f..%2fvictim/f.pdf`, `${OWN}/a%2fb.pdf`, `/${OWN}/f.pdf`, `${OWN}//f.pdf`,
+      `${OWN}/f.pdf/`, '', `victim/${OWN}/f.pdf`, `${OWN}x/f.pdf`, `${OWN}/a b.pdf`, `${OWN}/f\u0000.pdf`,
+    ];
+    for (const p of bad) throwsSync(() => PK.assertOwnerStoragePath(OWN, p), /STORAGE_PATH_INVALID|no pertenece al dueño/, `rechaza ${JSON.stringify(p)}`);
+    eq(PK.assertOwnerStoragePath(OWN, `${OWN}/dynamic/9/presentation/cap-1.pdf`), [OWN, 'dynamic', '9', 'presentation', 'cap-1.pdf'], 'válido');
+    // ArtifactsService.downloadStorageObject: valida antes de fetch y arma la URL por segmentos
+    const { ArtifactsService } = loadDist('modules/artifacts/artifacts.service.js');
+    const svc = new ArtifactsService({}, { get: (k) => ({ SUPABASE_URL: 'https://sb.example', SUPABASE_SERVICE_ROLE_KEY: 'k' })[k] });
+    const urls = [];
+    const saved = global.fetch;
+    global.fetch = async (u) => { urls.push(String(u)); return { ok: true, arrayBuffer: async () => new ArrayBuffer(2) }; };
+    try {
+      // el servicio valida la FORMA (el dueño lo exige el cargador del empaque)
+      for (const p of bad.filter((x) => !x.startsWith('victim/') && !x.startsWith(`${OWN}x/`))) await rejects(svc.downloadStorageObject('cursia-artifacts', p), /STORAGE_PATH_INVALID/, `service rechaza ${JSON.stringify(p)}`);
+      await rejects(svc.downloadStorageObject('../x', `${OWN}/f.pdf`), /STORAGE_PATH_INVALID: bucket/, 'bucket');
+      eq(urls, [], 'ningún fetch con un path inválido');
+      await svc.downloadStorageObject('cursia-artifacts', `${OWN}/d/f.pdf`);
+      eq(urls, [`https://sb.example/storage/v1/object/authenticated/cursia-artifacts/${OWN}/d/f.pdf`], 'URL');
+    } finally {
+      global.fetch = saved;
+    }
+    // el cargador real aplica el mismo control
+    const Lr = PK.artifactsServiceLoadersV3({ downloadStorageObject: async () => Buffer.from('x'), getDownloadUrl: async () => ({}) }, OWN);
+    await rejects(Lr.loadStorageBytes('cursia-artifacts', `${OWN}/../victim/f.pdf`), /STORAGE_PATH_INVALID/, 'loader');
+  });
+  await check('fix G6 M2: Libro sin links javascript:/data: ni atributos inyectados; links http(s)/mailto/# se conservan', async () => {
+    const LB = loadDist('package/v3/libro-v3.js');
+    eq(LB.sanitizeMarkdownLinks('[a](javascript:alert(1)) [b](https://x.org/p) [c](a"onmouseover="alert(1)) [d](#cap-2) [e](mailto:a@b.co) [f](data:text/html,x)'),
+      'a) [b](https://x.org/p) c) [d](#cap-2) [e](mailto:a@b.co) f', 'sanitizado (el `)` sobrante queda como texto inerte)');
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    const [c1] = input.contents.contentMd.keys();
+    input.contents.contentMd.set(c1, input.contents.contentMd.get(c1) + '\n\nVer [esto](javascript:alert(1)) y [aquello](x"onmouseover="alert(2)).');
+    const r = await B.buildDynamicMbzV3(input);
+    const z = await JSZip.loadAsync(r.mbz);
+    // r19 (L1): el Libro es un PDF — ninguna anotación de enlace con javascript:/data: ni texto con el payload.
+    const fx = await z.file('files.xml').async('string');
+    const h = /<contenthash>(\w+)<\/contenthash>/.exec(fx.match(/<file id="\d+">[\s\S]*?<\/file>/g).find((b) => /<filename>libro_guia_[a-z0-9_]+\.pdf<\/filename>/.test(b)))[1];
+    const pdf = await z.file(`files/${h.slice(0, 2)}/${h}`).async('nodebuffer');
+    const pdfjs = await import(require.resolve('pdfjs-dist/legacy/build/pdf.mjs', { paths: [ROOT] }));
+    const d = await pdfjs.getDocument({ data: new Uint8Array(pdf), verbosity: 0 }).promise;
+    let text = '';
+    const urls = [];
+    for (let p = 1; p <= d.numPages; p++) {
+      const pg = await d.getPage(p);
+      text += (await pg.getTextContent()).items.map((i) => i.str).join(' ');
+      for (const a of await pg.getAnnotations()) if (a.url || a.unsafeUrl) urls.push(a.url || a.unsafeUrl);
+    }
+    assert(/Ver\s*esto\)?\s*y\s*aquello/.test(text), `el texto de los links inseguros queda como texto: ${(/Ver.{0,40}/.exec(text) || [''])[0]}`);
+    assert(!/javascript:|onmouseover/i.test(text) && !urls.some((u) => /^(javascript|data):|onmouseover/i.test(u)), `sin javascript:/onmouseover en el Libro: ${JSON.stringify(urls)}`);
+  });
+  await check('F1 (I3): categoría ponderada vacía → prepareV3Package normaliza (sin fallar) y lo registra; tema sin perfil ni paleta → presentation_profile_defaulted', async () => {
+    const { manifest } = SF.buildCourse(distRoot, { courseId: 641, finalExam: false, engine: 'h5p', modules: [{ examEnabled: true, chapters: [{ video: false, activity: false }] }] });
+    const R = loadDist('modules/dynamic-packaging/artifact-resolver.js');
+    const rows = [];
+    for (const it of manifest.items) for (const t of R.requiredArtifactTypesV3(it.type, it.variant)) {
+      rows.push({ item_key: it.key, item_run_id: `g-${it.key}`, gir_status: 'completed', gir_type: it.type, output_summary: {}, artifact_id: `${it.key}-${t}`, artifact_type: t, storage_bucket: 'b', storage_path: 'o/p', mime_type: 'application/json', artifact_status: null, metadata: {} });
+    }
+    const q = { query: async (sql) => {
+      if (/generation_item_runs/.test(sql)) return rows;
+      if (/course_profiles/.test(sql)) return [];
+      if (/from public\.courses where id/.test(sql)) return [{ metadata: {} }];
+      if (/production_jobs/.test(sql)) return [{ id: 'r', owner_id: 'o', execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: {} }];
+      if (/to_regclass/.test(sql)) return [{ bp: true, us: true, inst: true }]; // r19 L3: fuentes presentes, sin logo → Cursia sin aviso
+      if (/from public\.user_settings/.test(sql)) return [];
+      throw new Error(sql);
+    } };
+    const prep = await PK.prepareV3Package(q, 'r', { id: 1, sha256: 's', manifest }, 641, '4.1');
+    eq(prep.resolved.categories.map((c) => [c.key, c.weight]), [['moduleExams', 100]], 'práctica vacía → exámenes 100');
+    eq(prep.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false, coursePassingGrade: 70 }, 'resumen');
+    eq(prep.profileWarnings, ['presentation_profile_defaulted', 'assessment_weights_normalized:practice=40,moduleExams=60->moduleExams=100'], 'avisos');
+    eq(prep.profiles.theme.source, 'default_v3', 'sin perfil ni paleta');
+  });
+
+  // ── Fail loud del builder ─────────────────────────────────────────────────
+  await check('builder falla fuerte: contenido faltante lista las keys del Manifest', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    const [first] = input.contents.presentations.keys();
+    input.contents.presentations.delete(first);
+    input.contents.audiobookChapters.delete(first);
+    await rejects(B.buildDynamicMbzV3(input), new RegExp(`PACKAGING_V3_CONTENT_MISSING: faltan 2 contenido\\(s\\): presentation:${first}, audiobook_chapter:${first}`), 'faltantes');
+  });
+  await check('builder falla fuerte: SingleChoiceSet (R-011) y tipo H5P fuera de la rotación por UUID (R-012)', async () => {
+    const input = PF.packagingInput(distRoot, MATRIX[0]);
+    const [chId, act] = [...input.contents.activities.entries()][0];
+    input.contents.activities.set(chId, { variant: 'h5p', payload: SF.h5pPayload('singlechoiceset') });
+    await rejects(B.buildDynamicMbzV3(input), /H5P_ACTIVITY_PAYLOAD_INVALID: .*H5P_TYPE_NOT_GRADABLE/, 'SCS');
+    const wrong = ['questionset', 'dragtext', 'blanks'].find((t) => t !== SHELL.activityTypeForChapter(chId));
+    const p2 = SF.h5pPayload(wrong);
+    p2.data.itemKey = `activity:${chId}`;
+    input.contents.activities.set(chId, { variant: 'h5p', payload: p2 });
+    await rejects(B.buildDynamicMbzV3(input), /ACTIVITY_TYPE_MISMATCH/, 'tipo ajeno');
+    void act;
+    throwsSync(() => H5P.assertH5pGradableInMoodle('H5P.SingleChoiceSet'), /H5P_NOT_GRADABLE_IN_MOODLE/, 'assert SCS');
+  });
+  await check('builder falla fuerte: categoría ponderada vacía, perfil inaplicable (pesos de final / intentos h5p)', async () => {
+    const { snapshot, manifest } = SF.buildCourse(distRoot, {
+      courseId: 611, finalExam: false, engine: 'h5p',
+      modules: [{ examEnabled: true, chapters: [{ video: false, activity: false }, { video: false, activity: false }] }],
+    });
+    const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: false });
+    input.manifest = manifest;
+    input.blueprint = snapshot;
+    // contenidos del curso "desnudo" a partir de los de 2 capítulos del fixture
+    const src = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: false });
+    const chs = manifest.modules[0].chapters;
+    const srcIds = [...src.contents.contentMd.keys()];
+    for (const k of ['contentMd', 'experiences', 'presentations', 'audiobookChapters']) {
+      input.contents[k] = new Map(chs.map((c, i) => {
+        const v = src.contents[k].get(srcIds[i]);
+        return [c.chapterId, k === 'experiences' ? { ...v, chapterId: c.chapterId } : v];
+      }));
+    }
+    input.contents.videos = new Map(); input.contents.videoInteractions = new Map(); input.contents.activities = new Map();
+    input.contents.moduleIntros = new Map([[manifest.modules[0].moduleId, SF.moduleIntroFixture(manifest, 0)]]);
+    input.contents.examGift = new Map([[manifest.modules[0].moduleId, PF.moduleGift(1)]]);
+    // F1 (I3): la categoría vacía ya no falla — su peso se redistribuye y el paquete valida.
+    const rn = await B.buildDynamicMbzV3(input);
+    assert((await validate(rn)).ok, 'práctica vacía (peso 40) → normalizado, empaqueta y valida');
+    eq(rn.summary.assessment, { weightsNormalized: true, originalWeights: { practice: 40, moduleExams: 60 }, weights: { moduleExams: 100 }, emptyCategories: ['practice'], withoutGrades: false, coursePassingGrade: 70 }, 'resumen normalizado');
+    const okProfile = PROF.defaultAssessmentProfile({ finalExam: false });
+    okProfile.categoryWeights = { practice: 0, moduleExams: 100 };
+    const r = await B.buildDynamicMbzV3({ ...input, assessmentProfile: okProfile });
+    assert((await validate(r)).ok, 'con peso 0 en práctica el curso desnudo empaqueta y valida');
+    eq(r.summary.assessment.weightsNormalized, false, 'peso 0 → no hubo que normalizar');
+    const bad = PF.packagingInput(distRoot, MATRIX[0]);
+    bad.assessmentProfile = PROF.defaultAssessmentProfile({ finalExam: false });
+    await rejects(B.buildDynamicMbzV3(bad), /ASSESSMENT_PROFILE_INVALID: .*WEIGHTS_FINAL_EXAM_MISMATCH/, 'pesos sin final');
+    const att = PF.packagingInput(distRoot, MATRIX[0]);
+    att.assessmentProfile.attempts.activity = 2;
+    await rejects(B.buildDynamicMbzV3(att), /ASSESSMENT_UNENFORCEABLE/, 'intentos en h5p');
+  });
+  // V542 fix round 1 (C1): la regla de cifras es la MISMA en lint de la intro, gate de render y validador —
+  // solo las cifras que cuentan la estructura/duración del curso salen de facts; normas y plazos del contenido se muestran.
+  await check('V542 C1 extremo a extremo: «Ley 1480 de 2011» y «15 días hábiles» en las intros validan, se renderizan y se empaquetan (validateMbzV3 limpio); «6 semanas» fuera de facts se rechaza en el lint, en el render y en el validador', async () => {
+    const LAW = 'Aplicar la Ley 1480 de 2011 y responder dentro de los 15 días hábiles que fija la norma.';
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    const ci = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
+    eq(SHELL.validateCourseIntroV3(ci).errors || [], [], 'intro del curso válida');
+    i.contents.courseIntro = ci;
+    const [mid] = i.contents.moduleIntros.keys();
+    const mi = { ...i.contents.moduleIntros.get(mid) };
+    mi.presentation = `${mi.presentation} El Decreto 1074 de 2015 regula la garantía.`;
+    i.contents.moduleIntros.set(mid, mi);
+    const r = await B.buildDynamicMbzV3(i);
+    const v = await V.validateMbzV3(r.mbz, r.expectations);
+    assert(v.ok, JSON.stringify(v.issues.slice(0, 4)));
+    const z = await JSZip.loadAsync(r.mbz);
+    let txt = '';
+    for (const n of Object.keys(z.files).filter((x) => /label_\d+\/label\.xml$/.test(x))) txt += await z.file(n).async('string');
+    assert(txt.includes('Ley 1480 de 2011') && txt.includes('15 días hábiles') && txt.includes('Decreto 1074 de 2015'), 'las cifras de contenido se ven en los labels');
+    // «6 semanas»: lint de la intro, gate de render y validador.
+    const bad = { ...ci, competencies: ['Completar el curso en 6 semanas de estudio guiado.', ...ci.competencies.slice(1)] };
+    assert((SHELL.validateCourseIntroV3(bad).errors || []).some((e) => e.code === 'DIGIT_IN_TEXT'), 'lint: 6 semanas');
+    const i2 = PF.packagingInput(distRoot, MATRIX[0]);
+    i2.contents.courseIntro = bad;
+    await rejects(B.buildDynamicMbzV3(i2), /DIGIT_IN_TEXT|COURSE_INTRO/, 'builder: 6 semanas');
+    const facts = r.expectations.facts;
+    let threw = null;
+    try { SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Completarás todo en 997 semanas. Ley 1480 de 2011.</span></p></div>' }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']); } catch (e) { threw = e; }
+    assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS: .*997/.test(threw.message) && !/1480|2011/.test(threw.message.split(':').pop()), `gate: ${threw && threw.message}`);
+    SHELL.assertShellNumbers({ name: 'Qué aprenderás', html: '<div><p><span class="nolink">Ley 1480 de 2011, 15 días hábiles.</span></p></div>' }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']);
+    // Fix round 2 (N1): sin la prosa (plantilla pura), las mismas cifras NO salen de facts.
+    let strict = null;
+    try { SHELL.assertShellNumbers({ name: 'Plantilla', html: '<div><p><span class="nolink">Ley 1480 de 2011.</span></p></div>' }, facts); } catch (e) { strict = e; }
+    assert(strict && /1480/.test(strict.message), 'plantilla estricta');
+    const { z: zz, acts } = await actDirs(r.mbz);
+    const comp = acts.find((a) => a.idnumber === 'cv3:shell:competencies') || acts.find((a) => /^cv3:shell:/.test(a.idnumber));
+    const x = await zz.file(`${comp.dir}/label.xml`).async('string');
+    zz.file(`${comp.dir}/label.xml`, x.replace('Ley 1480 de 2011', 'Ley 1480 de 2011 en 997 semanas'));
+    const v2 = await V.validateMbzV3(await zz.generateAsync({ type: 'nodebuffer' }), r.expectations);
+    assert(v2.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /997/.test(e.message) && !/1480/.test(e.message)), `validador: ${JSON.stringify(v2.issues.slice(0, 4))}`);
+  });
+
+  // V542 fix round 2 (N1): el texto de PLANTILLA de los labels del shell sigue estricto (toda cifra ∈ facts); solo
+  // la prosa LLM de las intros admite cifras de contenido.
+  await check('V542 N1: plantilla estricta — «Preguntas: 997», «Duración estimada: 997 h», «997 min», «Intentos: 997», «Nota mínima de esta evaluación: 997 de 100», «calificación final de 997/100» → NUMBER_NOT_FROM_FACTS; «Ley 1480 de 2011» en la prosa pasa', async () => {
+    const LAW = 'Aplicar la Ley 1480 de 2011 y responder dentro de los 15 días hábiles que fija la norma.';
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    i.contents.courseIntro = { ...i.contents.courseIntro, competencies: [LAW, ...i.contents.courseIntro.competencies.slice(1)] };
+    const r = await B.buildDynamicMbzV3(i);
+    eq(r.expectations.shellProseByLabel['cv3:shell:competencies'][0], LAW, 'shellProseByLabel: la competencia va en SU label');
+    assert(!r.expectations.shellProseByLabel['cv3:shell:welcome'].includes(LAW), 'y no en otro label');
+    eq((await V.validateMbzV3(r.mbz, r.expectations)).issues, [], 'base con la Ley en la prosa: limpio');
+    const { acts } = await actDirs(r.mbz);
+    const dirOf = (re) => acts.find((a) => re.test(a.idnumber)).dir;
+    const examInfo = dirOf(/^cv3:exam_info:/);
+    const cases = [
+      ['Preguntas: 997', examInfo, (x) => x.replace(/(Preguntas:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['Intentos: 997', examInfo, (x) => x.replace(/(Intentos:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['Nota mínima de esta evaluación: 997 de 100', examInfo, (x) => x.replace(/(Nota mínima de esta evaluación:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$1997')],
+      ['calificación final de 997/100', examInfo, (x) => x.replace('calificación final de 70/100 o más', 'calificación final de 997/100 o más')],
+      ['997 min (audiolibro)', dirOf(/^cv3:shell:audiobook$/), (x) => x.replace(/Duración total: \d+ min/, 'Duración total: 997 min')],
+      // En un label CON prosa LLM (bienvenida): la cifra de plantilla sigue estricta.
+      ['Duración estimada: 997 h (bienvenida)', dirOf(/^cv3:shell:welcome$/), (x) => x.replace('&lt;/span&gt;', ' Duración estimada: 997 h&lt;/span&gt;')],
+      ['Ley 997 en la competencia: la prosa mutada ya no es la del builder', dirOf(/^cv3:shell:competencies$/), (x) => x.replace('Ley 1480 de 2011', 'Ley 1480 de 2011 en 997 min')],
+    ];
+    for (const [what, dir, fn] of cases) {
+      const v = await V.validateMbzV3(await mutate(r.mbz, { [`${dir}/label.xml`]: fn }), r.expectations);
+      assert(v.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /997/.test(e.message) && !/1480|2011/.test(e.message)), `${what}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+    // Render gate: la misma regla.
+    const facts = r.expectations.facts;
+    for (const t of ['Preguntas: 997', 'Duración estimada: 997 h', 'Duración: 997 min 58 s', 'Intentos: 997', 'Nota mínima para aprobar: 997 de 100', 'Lección 997']) {
+      let threw = null;
+      try { SHELL.assertShellNumbers({ name: 'x', html: `<div><p><span class="nolink">${t}</span></p></div>` }, facts, r.expectations.shellProseByLabel['cv3:shell:competencies']); } catch (e) { threw = e; }
+      assert(threw && /997/.test(threw.message), `gate: ${t}`);
+    }
+    // Intro lint: abreviaturas de duración.
+    for (const t of ['Completa el curso en 997 h de estudio.', 'Dedica 30 min por día.', 'Son 40 hs de práctica.', 'Unas 2 hrs bastan.']) {
+      assert(SHELL.lintShellProse(t).some((h) => h.code === 'DIGIT_IN_TEXT'), `lint: ${t}`);
+    }
+  });
+
+  // V542 fix round 3 (N1): la prosa se acota POR LABEL — la de un módulo nunca habilita cifras en otro label.
+  await check('V542 N1 cruzado: el módulo 2 dice «Ley 1480 de 2011» y la plantilla del módulo 1 muestra «Intentos: 2011» → rechazado por el validador y por el gate de render (prosa acotada por label)', async () => {
+    const i = PF.packagingInput(distRoot, MATRIX[0]);
+    const mids = [...i.contents.moduleIntros.keys()];
+    assert(mids.length >= 2, 'fixture con 2 módulos');
+    const m2 = { ...i.contents.moduleIntros.get(mids[1]) };
+    m2.presentation = `${m2.presentation} Aplica la Ley 1480 de 2011 en este módulo.`;
+    i.contents.moduleIntros.set(mids[1], m2);
+    const r = await B.buildDynamicMbzV3(i);
+    eq((await V.validateMbzV3(r.mbz, r.expectations)).issues, [], 'base limpia (la Ley en la prosa del módulo 2)');
+    const by = r.expectations.shellProseByLabel;
+    assert(by[`cv3:module_intro:${mids[1]}`].some((t) => t.includes('Ley 1480 de 2011')) && !by[`cv3:module_intro:${mids[0]}`].some((t) => t.includes('2011')), 'prosa por módulo');
+    const { acts } = await actDirs(r.mbz);
+    const dirOf = (idn) => acts.find((a) => a.idnumber === idn).dir;
+    const m1Intro = dirOf(`cv3:module_intro:${mids[0]}`);
+    const examInfo = acts.find((a) => a.idnumber.startsWith('cv3:exam_info:')).dir;
+    for (const [what, dir, fn] of [
+      ['module_intro del módulo 1 (label CON prosa propia)', m1Intro, (x) => x.replace('&lt;/span&gt;', ' Intentos: 2011&lt;/span&gt;')],
+      ['exam_info del módulo 1 (plantilla sin prosa)', examInfo, (x) => x.replace(/(Intentos:&lt;\/span&gt;&lt;\/strong&gt;&lt;span class=&quot;nolink&quot;&gt; )\d+/, '$12011')],
+      ['competencias del curso', dirOf('cv3:shell:competencies'), (x) => x.replace('&lt;/span&gt;', ' Intentos: 2011&lt;/span&gt;')],
+    ]) {
+      const v = await V.validateMbzV3(await mutate(r.mbz, { [`${dir}/label.xml`]: fn }), r.expectations);
+      assert(v.issues.some((e) => e.code === 'NUMBER_NOT_FROM_FACTS' && /2011/.test(e.message)), `${what}: ${JSON.stringify(v.issues.slice(0, 3))}`);
+    }
+    // Gate de render: con la prosa del módulo 1 (la suya) se rechaza; la del módulo 2 la habilitaría (por eso se acota).
+    const facts = r.expectations.facts;
+    const html = '<div><p><span class="nolink">Módulo 1: presentación. Intentos: 2011</span></p></div>';
+    let threw = null;
+    try { SHELL.assertShellNumbers({ name: 'Módulo 1: presentación', html }, facts, by[`cv3:module_intro:${mids[0]}`]); } catch (e) { threw = e; }
+    assert(threw && /SHELL_NUMBER_NOT_FROM_FACTS.*2011/.test(threw.message), `gate módulo 1: ${threw && threw.message}`);
+    SHELL.assertShellNumbers({ name: 'control', html }, facts, by[`cv3:module_intro:${mids[1]}`]); // control: la prosa del OTRO módulo sí lo dejaría pasar
+    // El render real del módulo 1 con «Intentos: 2011» metido en la plantilla falla (moduleIntroLabel pasa SU prosa).
+    const mf = facts.modules.find((m) => m.id === mids[0]) || facts.modules[0];
+    const lbl = SHELL.moduleIntroLabel(mf, i.contents.moduleIntros.get(mids[0]), facts, THEME.resolveTheme({ themeFamily: 'aula-clara', mode: 'light' }));
+    let threw2 = null;
+    try { SHELL.assertShellNumbers({ name: lbl.name, html: lbl.html.replace('</span>', ' Intentos: 2011</span>') }, facts, by[`cv3:module_intro:${mids[0]}`]); } catch (e) { threw2 = e; }
+    assert(threw2 && /2011/.test(threw2.message), 'gate sobre el render real del módulo 1');
+  });
+
+  await check('builder falla fuerte: cifra en un intro del LLM, duración del video ≠ documento, token inválido', async () => {
+    const i1 = PF.packagingInput(distRoot, MATRIX[0]);
+    i1.contents.courseIntro = { ...i1.contents.courseIntro, closing: 'Completaste los 4 capítulos del curso.' };
+    await rejects(B.buildDynamicMbzV3(i1), /COURSE_INTRO_INVALID|DIGIT_IN_TEXT/, 'dígito');
+    const i2 = PF.packagingInput(distRoot, MATRIX[0]);
+    const [vid] = i2.contents.videos.keys();
+    i2.contents.videos.set(vid, { youtubeId: PF.YOUTUBE_ID, durationSec: 600 });
+    await rejects(B.buildDynamicMbzV3(i2), /H5P_INPUT_INVALID\(VideoInteractions\)|durationSec/, 'duración');
+    throwsSync(() => B.assertTokensV3('<a href="$@QUIZVIEWBYID*5@$">x</a>', new Map([[5, 'label']]), 'x'), /MBZ_V3_TOKEN_INVALID/, 'token');
+    // Edu EV3: marcador sin resolver, sección inexistente o sin lista de secciones → fallo fuerte.
+    throwsSync(() => B.assertTokensV3('<a href="cursia-cta://next-exam">x</a>', new Map(), 'x', new Set([1])), /MBZ_V3_TOKEN_INVALID.*cursia-cta sin resolver/, 'marcador');
+    throwsSync(() => B.assertTokensV3('<a href="$@COURSESECTIONBYID*9@$">x</a>', new Map(), 'x', new Set([1, 2])), /MBZ_V3_TOKEN_INVALID/, 'sección inexistente');
+    throwsSync(() => B.assertTokensV3('<a href="$@COURSESECTIONBYID*1@$">x</a>', new Map(), 'x'), /MBZ_V3_TOKEN_INVALID/, 'sin secciones');
+    B.assertTokensV3('<a href="$@COURSESECTIONBYID*1@$">x</a><a href="$@QUIZVIEWBYID*5@$">y</a>', new Map([[5, 'quiz']]), 'x', new Set([1]));
+  });
+
+  // ── Guardas, tema, clave ─────────────────────────────────────────────────
+  await check('guarda R-007: artifact simulado en run real → MOCK_ARTIFACT_IN_REAL_RUN; run congelado en mock → pasa', async () => {
+    const byItem = new Map([['presentation:x', { itemKey: 'presentation:x', type: 'presentation', outputSummary: {}, artifacts: [{ itemKey: 'presentation:x', artifactId: 'a1', type: 'dynamic_presentation', metadata: { mock: true, fixture: true } }] }]]);
+    throwsSync(() => PK.assertRunArtifactsPackageable({ id: 'r', input_payload: { providerModes: { presentation: 'real', audio: 'real' } } }, byItem), /MOCK_ARTIFACT_IN_REAL_RUN/, 'real');
+    throwsSync(() => PK.assertRunArtifactsPackageable({ id: 'r', input_payload: {} }, byItem), /MOCK_ARTIFACT_IN_REAL_RUN/, 'sin modos');
+    PK.assertRunArtifactsPackageable({ id: 'r', input_payload: { providerModes: { presentation: 'mock', audio: 'real' } } }, byItem);
+  });
+  await check('tema del paquete (F1/I4): perfil > paleta del curso (cualquier curso) > default v3 aula-clara/light', async () => {
+    const prof = { themeFamily: 'vibrante', mode: 'light', brandSeed: { accent: '#AA3366' }, themeVersion: 1 };
+    eq(PK.resolvePackagingTheme({ presentationProfile: prof, v2Migrated: true, legacyPaletteId: 'ocean' }).source, 'profile', 'perfil');
+    const leg = PK.resolvePackagingTheme({ presentationProfile: null, v2Migrated: true, legacyPaletteId: 'ocean' });
+    eq(leg.source, 'palette', 'paleta');
+    eq(leg.input, { themeFamily: 'oscuro-premium', mode: 'dark', brandSeed: THEME.brandSeedFromLegacyPalette(THEME.LEGACY_PALETTES.find((p) => p.id === 'ocean')), themeVersion: 1 }, 'oscuro → oscuro-premium/dark + seed');
+    eq(PK.resolvePackagingTheme({ presentationProfile: null, v2Migrated: false, legacyPaletteId: 'ocean' }), leg, 'no migrado → también la paleta (I4)');
+    eq(PK.resolvePackagingTheme({ presentationProfile: null, legacyPaletteId: 'blanco-corp' }).input.themeFamily, 'aula-clara', 'claro → aula-clara');
+    eq(PK.resolvePackagingTheme({ presentationProfile: null, legacyPaletteId: null }), { source: 'default_v3', input: { themeFamily: 'aula-clara', mode: 'light', themeVersion: 1 } }, 'sin paleta → default');
+    eq(PK.profileWarningsV3({ source: 'default_v3' }, A.resolveAssessment(PROF.defaultAssessmentProfile({ finalExam: true }), { hasFinalExam: true, itemCounts: { practice: 1, moduleExams: 1, finalExam: 1 } })), ['presentation_profile_defaulted'], 'aviso del default');
+    eq(PK.profileWarningsV3({ source: 'palette' }, A.resolveAssessment(PROF.defaultAssessmentProfile({ finalExam: true }), { hasFinalExam: true, itemCounts: { practice: 1, moduleExams: 1, finalExam: 1 } })), [], 'paleta → sin aviso');
+    throwsSync(() => PK.resolvePackagingTheme({ presentationProfile: null, v2Migrated: true, legacyPaletteId: 'inexistente' }), /THEME_INVALID/, 'paleta desconocida');
+    eq(PK.legacyPaletteIdOf({ pal: { id: 'berry' } }), 'berry', 'metadata.pal.id');
+  });
+  await check('clave de reuse v3: independiente del orden de ids; cambia con cada componente', async () => {
+    const baseK = { builderVersion: '3.0.0', manifestSha256: 'm', sourceArtifactIds: ['b', 'a'], themeSha256: 't', assessmentProfileSha256: 'p', h5pProfileVersion: 1, vcRendererVersion: 'r', moodleVersion: '4.1' };
+    const k0 = PK.packageReuseHashV3(baseK);
+    eq(PK.packageReuseHashV3({ ...baseK, sourceArtifactIds: ['a', 'b'] }), k0, 'orden');
+    for (const [f, v] of [['builderVersion', '3.0.1'], ['manifestSha256', 'm2'], ['sourceArtifactIds', ['a']], ['themeSha256', 't2'], ['assessmentProfileSha256', 'p2'], ['h5pProfileVersion', 2], ['vcRendererVersion', 'r2'], ['moodleVersion', '4.5'], ['libroBrandSha256', 'logo2']]) {
+      assert(PK.packageReuseHashV3({ ...baseK, [f]: v }) !== k0, `cambia con ${f}`);
+    }
+    assert(B.DYNAMIC_MBZ_BUILDER_VERSION_V3 === '3.16.0' && loadDist('package/dynamic-mbz-builder.js').DYNAMIC_MBZ_BUILDER_VERSION === '1.3.0', 'versión v3 propia; v1/v2 intacta');
+  });
+
+  // ── Medios ────────────────────────────────────────────────────────────────
+  await check('medios sintéticos (solo mocks) y reducción de portada: PDF de N páginas, MP3 medible, PNG 16-bit intacto con aviso', async () => {
+    for (const n of [1, 7, 12]) eq(PRES.pdfPageCount(MEDIA.syntheticPdf(n)), n, `pdf ${n}`);
+    const mp3 = MEDIA.syntheticMp3(45);
+    assert(Math.abs(AUDIO.mp3DurationSeconds(mp3) - 45) < 0.03, 'mp3 45 s');
+    AUDIO.assembleAudiobook([{ chapterId: 'a', chapterNumber: 1, mp3 }, { chapterId: 'b', chapterNumber: 2, mp3: MEDIA.syntheticMp3(3) }]);
+    const small = MEDIA.syntheticCoverPng(300, 200, '#123456');
+    eq(PNG.downscaleCoverPng(small).reason, 'already_small', 'chica');
+    const big = PNG.downscaleCoverPng(MEDIA.syntheticCoverPng(2000, 1000, '#123456'));
+    eq([big.width, big.height, big.downscaled], [1600, 800, true], 'grande (UX r18: tope 1600 px)');
+    const dec = PNG.decodePng(big.png);
+    eq([dec.pixels[0], dec.pixels[1], dec.pixels[2]], [0x12, 0x34, 0x56], 'color preservado');
+    const png16 = Buffer.from(small);
+    png16[24] = 16; // bit depth del IHDR (el CRC queda mal, pero el decoder corta antes)
+    const r16 = PNG.downscaleCoverPng(png16);
+    assert(!r16.downscaled && /PNG_UNSUPPORTED/.test(r16.reason), 'formato no soportado → intacto con motivo');
+    eq(MA.quizMaxMarks(3), ['33.3333333', '33.3333333', '33.3333334'], 'maxmarks suman 100');
+  });
+
+  // ── Worker v3 (dependencias falsas) ──────────────────────────────────────
+  await workerChecks();
+
+  // ── v1/v2 intactos ────────────────────────────────────────────────────────
+  await check('v1/v2 byte-idénticos: check-dynamic-video-delivery (sha fijado) y check-packaging-plan-determinism pasan', async () => {
+    for (const s of ['check-dynamic-video-delivery.js', 'check-packaging-plan-determinism.js']) {
+      const r = spawnSync(process.execPath, [path.join(__dirname, s), distRoot], { encoding: 'utf8', cwd: ROOT });
+      assert(r.status === 0, `${s} falló:\n${(r.stdout + r.stderr).split('\n').filter((l) => /❌/.test(l)).slice(0, 5).join('\n')}`);
+    }
+  });
+
+  console.log(`\n${passes} ok, ${failures} fallos`);
+  process.exit(failures ? 1 : 0);
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
+
+// ═══ Worker v3 con fakes ═══════════════════════════════════════════════════
+async function workerChecks() {
+  const fx = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 621 });
+  const manifest = fx.manifest;
+  const RUN_ID = '11111111-1111-4111-8111-111111111111';
+  const OWNER = 'owner-1';
+  // Artifacts del run: contenido real de los fixtures; presentación y audio como FIXTURES de R4 (sin bytes).
+  const artifacts = new Map(); // id -> {content, meta, mime}
+  const rows = [];
+  let n = 0;
+  const addArt = (item, type, content, meta = {}, mime = 'application/json') => {
+    const id = `art-${String(++n).padStart(3, '0')}`;
+    artifacts.set(id, { content, meta, mime });
+    rows.push({ item_key: item.key, item_run_id: `gir-${item.key}`, gir_status: 'completed', gir_type: item.type, output_summary: {}, artifact_id: id, artifact_type: type, storage_bucket: 'cursia-artifacts', storage_path: `${OWNER}/x/${id}`, mime_type: mime, artifact_status: null, metadata: meta });
+  };
+  const byChapter = (item) => item.chapterId;
+  for (const item of manifest.items) {
+    const ch = byChapter(item);
+    switch (item.type) {
+      case 'course_plan': addArt(item, 'dynamic_course_plan_json', '{}'); break;
+      case 'course_intro': addArt(item, 'dynamic_course_intro_json', JSON.stringify(fx.contents.courseIntro)); break;
+      case 'module_intro': addArt(item, 'dynamic_module_intro_json', JSON.stringify(fx.contents.moduleIntros.get(item.moduleId))); break;
+      case 'content':
+        addArt(item, 'dynamic_content_md', fx.contents.contentMd.get(ch), {}, 'text/markdown');
+        addArt(item, 'dynamic_context_package_json', '{}');
+        break;
+      case 'experience': addArt(item, 'dynamic_experience_json', JSON.stringify(fx.contents.experiences.get(ch))); break;
+      case 'presentation': addArt(item, 'dynamic_presentation', JSON.stringify({ fixture: true, provider: 'gamma', mode: 'mock', itemKey: item.key, chapterId: ch, slideCount: 7, pdfUrl: null, coverPngUrl: null }), { fixture: true, mock: true }); break;
+      case 'audio_welcome':
+      case 'audiobook_chapter': addArt(item, 'dynamic_audio_mp3', JSON.stringify({ fixture: true, provider: 'tts', mode: 'mock', durationSeconds: item.type === 'audio_welcome' ? 45 : 160 }), { fixture: true, mock: true }); break;
+      case 'video': addArt(item, 'dynamic_video', JSON.stringify({ mode: 'real', delivery: 'youtube', videogenJobId: `vg-${ch}`, youtubeVideoId: PF.YOUTUBE_ID, youtubeUrl: `https://www.youtube.com/watch?v=${PF.YOUTUBE_ID}`, durationSec: PF.VIDEO_SECONDS })); break;
+      case 'video_interactions': addArt(item, 'dynamic_video_interactions_json', JSON.stringify(fx.contents.videoInteractions.get(ch))); break;
+      case 'activity': addArt(item, 'dynamic_h5p_params_json', JSON.stringify(fx.contents.activities.get(ch).payload)); break;
+      case 'exam': addArt(item, 'dynamic_exam_gift', fx.contents.examGift.get(item.moduleId), {}, 'text/plain'); break;
+      case 'final_exam': addArt(item, 'dynamic_exam_gift', fx.contents.finalExamGift, {}, 'text/plain'); break;
+      default: throw new Error(`tipo sin fixture ${item.type}`);
+    }
+  }
+
+  function harness({ providerModes, profiles = [], stripMockMetadata = false, courseMetadata = {}, llmMockTypes = null, forceFinal = false } = {}) {
+    let rowsFor = stripMockMetadata ? rows.map((r) => ({ ...r, metadata: {} })) : rows;
+    // r58 (AU1 R2): artifacts de texto de IA marcados como LLM simulado (metadata.llmMode = mock).
+    if (llmMockTypes) rowsFor = rowsFor.map((r) => (llmMockTypes.includes(r.artifact_type) ? { ...r, metadata: { ...(r.metadata || {}), llmMode: 'mock' } } : r));
+    const state = { completed: [], failed: [], uploads: [], ledger: [], dynamicMbz: [], storage: new Map() };
+    const runRow = { id: RUN_ID, owner_id: OWNER, execution_mode: 'dynamic_generation', worker_status: 'completed', status: 'completed', input_payload: { videoMode: 'real', videoDelivery: 'youtube', ...(providerModes ? { providerModes } : {}) } };
+    const ds = {
+      async query(sql, params) {
+        if (/set status = 'completed'/.test(sql)) { state.completed.push(JSON.parse(params[2])); return [{ id: params[0] }]; }
+        if (/set status = 'failed'/.test(sql)) { state.failed.push(params[2]); return []; }
+        if (/set lease_until = now\(\)/.test(sql)) return [{ id: params[0] }];
+        if (/from public\.course_profiles/.test(sql)) return profiles;
+        if (/from public\.courses where id = \$1/.test(sql)) return [{ metadata: courseMetadata }];
+        if (/generation_item_runs/.test(sql)) return rowsFor;
+        if (/from public\.production_jobs where id = \$1/.test(sql)) return [runRow];
+        // r19 (L3): marca del Libro Guía — sin tablas de marca en el fake → logo de Cursia, sin avisos.
+        if (/to_regclass/.test(sql)) return [{ bp: true, us: true, inst: true }]; // r19 L3: fuentes presentes, sin logo → Cursia sin aviso
+      if (/from public\.user_settings/.test(sql)) return [];
+        throw new Error(`SQL no esperado en el fake: ${sql.slice(0, 80)}`);
+      },
+    };
+    const deps = {
+      dataSource: ds,
+      artifacts: {
+        async findAll(owner, f) { return f.type === 'dynamic_mbz' ? state.dynamicMbz : []; },
+        // r58 (AU1 R1): como ArtifactsService — el row lleva bucket, ruta y checksum de los bytes; el reuse los descarga.
+        async uploadBufferArtifact(i) {
+          const a = { id: `mbz-${state.uploads.length + 1}`, metadata: i.metadata, storageBucket: 'cursia-artifacts', storagePath: i.storagePath, checksumSha256: require('crypto').createHash('sha256').update(i.buffer).digest('hex') };
+          state.uploads.push(i); state.dynamicMbz.push(a); state.storage.set(i.storagePath, i.buffer); return a;
+        },
+        async downloadStorageObject(bucket, p) { const b = state.storage.get(p); if (!b) throw new Error(`404 ${bucket}/${p}`); return b; },
+      },
+      manifests: { async getById() { return { id: 9001, sha256: 'manifest-sha', manifest }; } },
+      blueprints: {
+        async getByNumber() { throw new Error('v3 no debe usar getByNumber (501 BLUEPRINT_V2_REQUIRES_RULES_V3)'); },
+        async getByNumberAnySchema() { return { schemaVersion: 2, snapshot: fx.blueprint }; },
+      },
+      buildPlan: () => { throw new Error('v3 no usa el plan v1/v2'); },
+      resolveArtifacts: () => { throw new Error('v3 no usa el resolver v1/v2'); },
+      loadText: () => { throw new Error('v3 no usa loadText v1/v2'); },
+      parseVideo: () => { throw new Error('v3 no usa parseVideo v1/v2'); },
+      buildMbz: () => { throw new Error('v3 no usa el builder v1/v2'); },
+      logger: { log() {}, warn() {}, error() {} },
+      workerId: 'w1',
+      leaseSeconds: 600,
+      heartbeatMs: 3600000,
+      finops: { async recordZero(e) { state.ledger.push(e); return { inserted: true }; } },
+      loadersV3: () => ({
+        loadText: async (a) => artifacts.get(a.artifactId).content,
+        loadBytes: async () => { throw new Error('los audios del fixture son mock (JSON)'); },
+        loadStorageBytes: async () => { throw new Error('las presentaciones del fixture son mock'); },
+      }),
+      nowSeconds: () => 1790600000,
+    };
+    // EV6 DoD (BE-A): un run con Gamma/TTS mock es de vista previa → su paquete es QA (lo declara el job,
+    // como lo encola PackagingService para un SUPER_ADMIN con el escape); un run real → paquete final.
+    const qa = !forceFinal && !!providerModes && (providerModes.presentation === 'mock' || providerModes.audio === 'mock');
+    const job = { id: 'job-1', owner_id: OWNER, course_id: manifest.source.courseId, frontend_course_id: null, worker_status: 'running', status: 'running', input_payload: { runId: RUN_ID, manifestId: 9001, blueprintNumber: 1, ...(qa ? { packageKind: 'qa_preview' } : {}) }, output_summary: {}, attempt_count: 1, max_attempts: 3 };
+    return { deps, job, state };
+  }
+
+  await check('worker v3: run congelado en mock para Gamma/TTS → las fixtures fluyen (medios sintéticos), valida, sube y registra ZERO_BY_DESIGN', async () => {
+    const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.failed, [], 'sin fallos');
+    eq(h.state.uploads.length, 1, 'un upload');
+    const s = h.state.completed[0];
+    eq([s.builderVersion, s.rulesVersion, s.reused, s.themeSource], [B.DYNAMIC_MBZ_BUILDER_VERSION_V3, 3, false, 'default_v3'], 'resumen');
+    // F1 (I4): sin perfil ni paleta guardada → aviso visible en el resumen del paquete.
+    assert((s.warnings || []).some((w) => w.code === 'presentation_profile_defaulted'), `aviso presentation_profile_defaulted: ${JSON.stringify(s.warnings)}`);
+    eq(s.assessment && s.assessment.weightsNormalized, false, 'F1 (I3): curso completo → sin normalizar');
+    eq(s.mockProviderItems.length, manifest.items.filter((i) => ['presentation', 'audio_welcome', 'audiobook_chapter'].includes(i.type)).length, 'fixtures materializadas');
+    eq(h.state.ledger.map((e) => [e.kind, e.externalId, e.attributionRunId]), [['package', 'job-1', RUN_ID]], 'ZERO_BY_DESIGN');
+    const up = h.state.uploads[0];
+    // EV6 DoD: paquete QA → archivo QA-VISTA-PREVIA-<clave>.mbz (nunca adopta el path de un paquete sin rótulo).
+    // Fix round 3 (N2): bajo el prefijo interno (fuera de la carpeta del dueño).
+    assert(up.storagePath.startsWith(`qa-internal/${OWNER}/`) && up.storagePath.endsWith(`/QA-VISTA-PREVIA-${s.sourceIdsHash}.mbz`) && up.upsert === false, `path direccionado por la clave: ${up.storagePath}`);
+    eq([s.packageKind, s.deliverable], ['qa_preview', false], 'resumen QA');
+    const z = await JSZip.loadAsync(up.buffer);
+    assert(z.file('moodle_backup.xml'), 'es un .mbz');
+    // restore-first: el mismo job otra vez reutiliza el .mbz subido
+    h.state.completed.length = 0;
+    await W.processItem(h.deps, h.job);
+    eq([h.state.uploads.length, h.state.completed[0].reused, h.state.completed[0].artifactId], [1, true, 'mbz-1'], 'reuse');
+    eq(h.state.dynamicMbz[0].metadata.validatedSha256, h.state.dynamicMbz[0].checksumSha256, 'r58 R1: metadata.validatedSha256 = checksum de los bytes validados');
+    // r58 (AU1 R1): bytes reemplazados en Storage (carpeta escribible por el dueño) → NO se reutiliza: se reconstruye.
+    {
+      const path0 = h.state.uploads[0].storagePath;
+      const orig = h.state.storage.get(path0);
+      h.state.storage.set(path0, Buffer.from('FORGED'));
+      h.state.completed.length = 0;
+      await W.processItem(h.deps, h.job);
+      eq([h.state.uploads.length, h.state.completed[0].reused, h.state.uploads[1].replaceUnverifiedOnConflict], [2, false, true], 'r58 R1: bytes forjados → rebuild con replaceUnverifiedOnConflict');
+      h.state.storage.set(path0, orig);
+      h.state.uploads.pop(); h.state.dynamicMbz.pop();
+      // Sin validatedSha256 (no pasó por validateMbzV3) → tampoco se reutiliza.
+      const meta0 = h.state.dynamicMbz[0].metadata;
+      h.state.dynamicMbz[0].metadata = { ...meta0, validatedSha256: undefined };
+      h.state.completed.length = 0;
+      await W.processItem(h.deps, h.job);
+      eq([h.state.uploads.length, h.state.completed[0].reused], [2, false], 'r58 R1: sin validatedSha256 → rebuild');
+      h.state.uploads.pop(); h.state.dynamicMbz.pop();
+      h.state.dynamicMbz[0].metadata = meta0;
+      h.state.completed.length = 0;
+      await W.processItem(h.deps, h.job);
+      eq([h.state.uploads.length, h.state.completed[0].reused, h.state.completed[0].artifactId], [1, true, 'mbz-1'], 'r58 R1: el verificado se vuelve a reutilizar');
+    }
+    assert((h.state.completed[0].warnings || []).some((w) => w.code === 'presentation_profile_defaulted'), 'el aviso también en el paquete reutilizado');
+    // un perfil de evaluación nuevo (nota 80) = clave nueva = paquete nuevo, sin artifacts nuevos
+    const p80 = PROF.defaultAssessmentProfile({ finalExam: true });
+    p80.passingGrade = 80;
+    const h2 = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, profiles: [{ kind: 'assessment', version: 2, data: p80 }] });
+    h2.state.dynamicMbz.push(...h.state.dynamicMbz);
+    await W.processItem(h2.deps, h2.job);
+    const s2 = h2.state.completed[0];
+    assert(s2.sourceIdsHash !== s.sourceIdsHash && s2.reused === false, 'clave nueva, build nuevo');
+    eq(s2.sourceArtifactIds, s.sourceArtifactIds, 'mismos artifacts de origen');
+    eq(s2.assessmentProfileVersion, 2, 'versión del perfil');
+  });
+  await check('F1 (I4) worker v3: sin perfil pero con la paleta guardada en el curso → tema de la paleta, sin aviso de default', async () => {
+    const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, courseMetadata: { paletteId: 'blanco-corp' } });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.failed, [], 'sin fallos');
+    const s = h.state.completed[0];
+    eq(s.themeSource, 'palette', 'fuente');
+    assert(!(s.warnings || []).some((w) => w.code === 'presentation_profile_defaulted'), 'sin aviso de default');
+    const expected = THEME.themeSha256(THEME.resolveTheme(THEME.presentationProfileFromPaletteId('blanco-corp')));
+    eq(s.themeSha256, expected, 'tema = aula-clara/light + seed de blanco-corp');
+  });
+  await check('T6 (r57) worker v3: presupuesto de tamaño — sin límites solo informa; sobre el aviso, aviso visible; sobre el límite, PACKAGE_SIZE_LIMIT_EXCEEDED ANTES de subir', async () => {
+    const h0 = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    h0.deps.packageSizeLimits = () => ({ warnBytes: null, maxBytes: null });
+    await W.processItem(h0.deps, h0.job);
+    eq(h0.state.failed, [], 'sin límites: sin fallos');
+    const s0 = h0.state.completed[0];
+    eq(s0.size.totalBytes, h0.state.uploads[0].buffer.length, 'tamaño informado = bytes subidos');
+    assert(s0.size.largest.length > 0 && s0.size.uncompressedBytes > 0 && s0.size.maxBytes === undefined, `size: ${JSON.stringify(s0.size).slice(0, 200)}`);
+    assert(!(s0.warnings || []).some((w) => w.code === 'package_size_over_warn'), 'sin aviso de tamaño');
+    const total = s0.size.totalBytes;
+    const hw = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    hw.deps.packageSizeLimits = () => ({ warnBytes: total - 1, maxBytes: total });
+    await W.processItem(hw.deps, hw.job);
+    eq([hw.state.failed.length, hw.state.uploads.length], [0, 1], 'sobre el aviso: sube igual');
+    assert((hw.state.completed[0].warnings || []).some((w) => w.detail === `package_size_over_warn:${total}:${total - 1}`), `aviso: ${JSON.stringify(hw.state.completed[0].warnings)}`);
+    eq([hw.state.completed[0].size.maxBytes, hw.state.completed[0].size.warnBytes], [total, total - 1], 'límites en el resumen');
+    const hx = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    hx.deps.packageSizeLimits = () => ({ warnBytes: null, maxBytes: total - 1 });
+    await W.processItem(hx.deps, hx.job);
+    eq(hx.state.uploads.length, 0, 'sobre el límite: SIN upload');
+    assert(hx.state.failed.length === 1 && /^PACKAGE_SIZE_LIMIT_EXCEEDED: el paquete pesa \d+ bytes/.test(hx.state.failed[0]), `falla: ${hx.state.failed[0]}`);
+  });
+  await check('r58 R2 worker v3: texto de IA simulado (metadata.llmMode=mock) → paquete QA con llmNonRealItems; como FINAL → preview_not_deliverable sin build ni upload', async () => {
+    const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, llmMockTypes: ['dynamic_content_md'] });
+    await W.processItem(h.deps, h.job);
+    eq([h.state.failed.length, h.state.uploads.length], [0, 1], 'QA empaqueta');
+    const s = h.state.completed[0];
+    const contentKeys = manifest.items.filter((i) => i.type === 'content').map((i) => i.key).sort();
+    eq([s.packageKind, s.llmNonRealItems], ['qa_preview', contentKeys], 'resumen QA declara los items no reales');
+    const hf = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, llmMockTypes: ['dynamic_content_md'], forceFinal: true });
+    await W.processItem(hf.deps, hf.job);
+    eq(hf.state.uploads.length, 0, 'sin upload');
+    assert(hf.state.failed.length === 1 && /^preview_not_deliverable:/.test(hf.state.failed[0]) && /texto de IA simulado\/reproducido/.test(hf.state.failed[0]) && hf.state.failed[0].includes(contentKeys[0]),
+      `falla: ${hf.state.failed[0]}`);
+    // Sin marca LLM el resumen QA no cambia (regresión).
+    const h0 = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+    await W.processItem(h0.deps, h0.job);
+    eq('llmNonRealItems' in h0.state.completed[0], false, 'sin llmNonRealItems');
+  });
+  await check('worker v3: run REAL con fixtures de proveedor → falla MOCK_ARTIFACT_IN_REAL_RUN antes de construir o subir', async () => {
+    const h = harness({ providerModes: { presentation: 'real', audio: 'real' } });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.uploads.length, 0, 'sin upload');
+    assert(h.state.failed.length === 1 && /MOCK_ARTIFACT_IN_REAL_RUN/.test(h.state.failed[0]), `falla: ${h.state.failed[0]}`);
+  });
+  await check('worker v3: perfil de evaluación inaplicable al run (pesos sin final) → falla fuerte, sin upload', async () => {
+    const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, profiles: [{ kind: 'assessment', version: 3, data: PROF.defaultAssessmentProfile({ finalExam: false }) }] });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.uploads.length, 0, 'sin upload');
+    assert(/ASSESSMENT_PROFILE_INVALID.*WEIGHTS_FINAL_EXAM_MISMATCH/.test(h.state.failed[0] || ''), `falla: ${h.state.failed[0]}`);
+  });
+  await check('fix G6 I1 (worker): run REAL cuyas fixtures perdieron la marca en metadata (solo el cuerpo dice fixture) → MOCK_ARTIFACT_IN_REAL_RUN, sin upload', async () => {
+    const h = harness({ providerModes: { presentation: 'real', audio: 'real' }, stripMockMetadata: true });
+    await W.processItem(h.deps, h.job);
+    eq(h.state.uploads.length, 0, 'sin upload');
+    assert(h.state.failed.length === 1 && /MOCK_ARTIFACT_IN_REAL_RUN/.test(h.state.failed[0]), `falla: ${h.state.failed[0]}`);
+    const hm = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, stripMockMetadata: true });
+    await W.processItem(hm.deps, hm.job);
+    eq([hm.state.failed.length, hm.state.uploads.length], [0, 1], 'el mismo cuerpo en un run mock sí empaqueta');
+  });
+}

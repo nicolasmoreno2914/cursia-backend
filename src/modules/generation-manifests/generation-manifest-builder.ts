@@ -1,0 +1,1873 @@
+import { createHash } from 'crypto';
+import type {
+  ActivityEngine,
+  AnyBlueprintSnapshot,
+  BlueprintSnapshotV1,
+  BlueprintSnapshotV2,
+} from '../course-blueprints/blueprint-snapshot';
+import { chapterKindOf } from '../course-blueprints/blueprint-snapshot';
+import {
+  ActivityTypeRulesVersion,
+  GradedH5pActivityType,
+  chooseActivityTypesV1,
+} from './activity-type-rules';
+import { chooseActivityTypesV2 } from './activity-type-rules-v2';
+import { isApplicationMinutes } from '../study-time/application-tiers';
+import { isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
+import { sortedCanonicalJson } from '../coherence/canonical-json';
+import { ManifestFeaturesPedagogy, manifestFeaturesPedagogy, manifestItemDesign } from '../pedagogy/manifest-design';
+import { allowedPedagogicalTypes, choosePedagogicalActivityTypes } from '../pedagogy/pedagogical-blueprint';
+
+/**
+ * rulesVersion por defecto (y el único que existía hasta 5B.2.B/Fase 6). La
+ * versión que efectivamente crea `POST …/manifest` sale de config
+ * (`DYNAMIC_MANIFEST_RULES_VERSION`, ver manifest-rules-config.ts); esta
+ * constante queda como el default y como el valor de los Manifests v1.
+ */
+export const MANIFEST_RULES_VERSION = 1;
+export const MANIFEST_SCHEMA_VERSION = 1;
+
+/** rulesVersion soportados por este builder/validador (spec v2 §3). */
+export type ManifestRulesVersion = 1 | 2 | 3;
+export const SUPPORTED_RULES_VERSIONS: readonly ManifestRulesVersion[] = [1, 2, 3];
+/**
+ * rulesVersion que procesa el builder/validador "legacy" (v1/v2, byte-idéntico
+ * a antes de V2.1). rulesVersion 3 tiene su propio builder/validador
+ * (`buildGenerationManifestV3` / `validateGenerationManifestV3`).
+ */
+const LEGACY_RULES_VERSIONS: readonly ManifestRulesVersion[] = [1, 2];
+
+export type ManifestItemType =
+  | 'content'
+  | 'scorm'
+  | 'video'
+  | 'exam'
+  // rulesVersion 2 (5B.2.B + Fase 6):
+  | 'course_plan'
+  | 'course_intro'
+  | 'module_intro'
+  // rulesVersion 3 (V2.1, audit §N.2):
+  | 'experience'
+  | 'presentation'
+  | 'video_interactions'
+  | 'activity'
+  // Fase 2 · Actividades de Aplicación (solo en capítulos con applicationMinutes):
+  | 'application_activity'
+  // Loop 9 B · Práctica guiada (solo capítulos de CONTENIDO con guidedPracticeMinutes):
+  | 'guided_practice'
+  | 'audiobook_chapter'
+  | 'audio_welcome'
+  | 'final_exam';
+
+export type ManifestItemScope = 'chapter' | 'module' | 'course';
+
+/** Tipos de item por rulesVersion (v1 queda exactamente como antes). */
+export const MANIFEST_ITEM_TYPES_V1: readonly ManifestItemType[] = ['content', 'scorm', 'video', 'exam'];
+export const MANIFEST_ITEM_TYPES_V2: readonly ManifestItemType[] = [
+  'content', 'scorm', 'video', 'exam', 'course_plan', 'course_intro', 'module_intro',
+];
+/**
+ * rulesVersion 3 (V2.1, audit §N.2): sin `scorm` (pasa a `activity` con
+ * `variant`), + experience, presentation, video_interactions, activity,
+ * audiobook_chapter, audio_welcome y final_exam. Orden = orden canónico de
+ * aparición.
+ */
+export const MANIFEST_ITEM_TYPES_V3: readonly ManifestItemType[] = [
+  'course_plan', 'course_intro', 'audio_welcome', 'module_intro',
+  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter',
+  'exam', 'final_exam',
+];
+/** Tipos que solo existen en rulesVersion 3. */
+export const V3_ONLY_ITEM_TYPES: readonly ManifestItemType[] = [
+  'experience', 'presentation', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter', 'audio_welcome', 'final_exam',
+];
+/** Todos los tipos que existen en algún rulesVersion soportado. */
+export const ALL_MANIFEST_ITEM_TYPES: readonly ManifestItemType[] = [...MANIFEST_ITEM_TYPES_V2, ...V3_ONLY_ITEM_TYPES];
+
+/** Scope de cada tipo (spec v2 §3 + audit §N.2); en v1 solo existen chapter y module. */
+export function scopeOfItemType(type: ManifestItemType): ManifestItemScope {
+  if (type === 'course_plan' || type === 'course_intro' || type === 'audio_welcome' || type === 'final_exam') return 'course';
+  if (type === 'exam' || type === 'module_intro') return 'module';
+  return 'chapter';
+}
+
+export function itemTypesForRulesVersion(rv: number): readonly ManifestItemType[] {
+  if (rv === 3) return MANIFEST_ITEM_TYPES_V3;
+  return rv === 2 ? MANIFEST_ITEM_TYPES_V2 : MANIFEST_ITEM_TYPES_V1;
+}
+
+/** Variante del item `activity` (solo rulesVersion 3) = `course.activityEngine` del Blueprint v2. */
+export type ActivityVariant = ActivityEngine;
+
+export interface ManifestSource {
+  courseId: number;
+  blueprintId: number;
+  blueprintNumber: number;
+  blueprintSha256: string;
+}
+
+export interface ManifestChapter {
+  chapterId: string;
+  position: number;
+  chapterNumber: number;
+  videoEnabled: boolean;
+  /** Solo rulesVersion 3 (ausente en v1/v2: su forma canónica no cambia). */
+  activityEnabled?: boolean;
+  /**
+   * Motor de carga horaria: SOLO en capítulos de práctica (v3). Sin la clave = capítulo de contenido (sha de
+   * siempre). Un capítulo de práctica solo produce experience (+ activity), apoyados en los content del módulo.
+   */
+  kind?: 'practice';
+  /** Fase 2: minutos de la Actividad de Aplicación, SOLO en capítulos que la tienen (sin la clave: sha de siempre). */
+  applicationMinutes?: number;
+  /** Loop 9 B: minutos de la práctica guiada, SOLO en capítulos de contenido que la tienen (sin la clave: sha de siempre). */
+  guidedPracticeMinutes?: number;
+}
+
+export interface ManifestModule {
+  moduleId: string;
+  position: number;
+  moduleNumber: number;
+  examEnabled: boolean;
+  chapters: ManifestChapter[];
+}
+
+/**
+ * Item del Manifest. `moduleId`/`moduleNumber` son null SOLO en items de
+ * scope 'course' (rulesVersion 2: course_plan, course_intro); en v1 nunca.
+ */
+export interface ManifestItem {
+  key: string;
+  type: ManifestItemType;
+  scope: ManifestItemScope;
+  moduleId: string | null;
+  chapterId: string | null;
+  moduleNumber: number | null;
+  chapterNumber: number | null;
+  dependsOn: string[];
+  /** Solo en items `activity` de rulesVersion 3 ('h5p' | 'scorm'); ningún otro item lo tiene. */
+  variant?: ActivityVariant;
+  /**
+   * EV5-C: tipo H5P congelado de un item `activity` variant 'h5p', SOLO en
+   * Manifests con `features.activityTypeRules = 1` (reglas por objetivo,
+   * activity-type-rules.ts). Ausente = rotación por hash (`activityTypeForChapter`).
+   */
+  h5pType?: GradedH5pActivityType | 'branchingscenario';
+  /**
+   * Motor pedagógico V1: diseño pedagógico del item (lo lee su generador). SOLO en Manifests v3
+   * de Blueprints con `course.pedagogy`; ausente = Manifest de siempre (sha intacto).
+   */
+  design?: Record<string, unknown>;
+  /** Fase 2: SOLO en items `application_activity` — minutos de trabajo del estudiante (30/60/90/120). */
+  applicationMinutes?: number;
+  /** Loop 9 B: SOLO en items `guided_practice` — minutos de la práctica guiada (40/60/80/120). */
+  guidedPracticeMinutes?: number;
+}
+
+/** Solo rulesVersion 3: flags de curso del Blueprint v2 que cambian el conjunto de items. */
+export interface ManifestFeatures {
+  finalExam: boolean;
+  activityEngine: ActivityEngine;
+  /**
+   * EV5-C: marcador de las reglas de tipo de actividad. Ausente = Manifest
+   * legacy (tipo h5p por hash del UUID); 1 = cada activity h5p lleva `h5pType`
+   * (chooseActivityTypesV1). El canonical lo escribe solo si está presente:
+   * los sha de los Manifests existentes no cambian.
+   */
+  activityTypeRules?: 1 | 2;
+  /**
+   * EV6 H5P v2: IV avanzado (video_interactions schemaVersion 2: pausas de reflexión +
+   * remediación). Presente (= 1) SOLO junto con activityTypeRules = 2 — un único
+   * interruptor de H5P v2 (ruling Q2). Ausente = schemaVersion 1, bytes de siempre.
+   */
+  ivAdvanced?: 1;
+  /**
+   * Motor pedagógico V1: el Blueprint trae diseño pedagógico. Con esta clave cada item lleva
+   * `design` y cada activity h5p lleva `h5pType` elegido por el diseño (choosePedagogicalActivityTypes,
+   * dentro de los tipos que admite activityTypeRules). Ausente = Manifest de siempre.
+   */
+  pedagogy?: ManifestFeaturesPedagogy;
+}
+
+/**
+ * Totales. Los tres conteos de v2 existen SOLO en Manifests rulesVersion 2
+ * (en v1 están ausentes: la forma canónica de v1 no cambia).
+ */
+export interface ManifestTotals {
+  moduleCount: number;
+  chapterCount: number;
+  contentCount: number;
+  /** v1/v2 siempre; ausente en v3 (no hay items `scorm`: activityCount + variant). */
+  scormCount?: number;
+  videoCount: number;
+  examCount: number;
+  coursePlanCount?: number;
+  courseIntroCount?: number;
+  moduleIntroCount?: number;
+  // rulesVersion 3:
+  experienceCount?: number;
+  presentationCount?: number;
+  videoInteractionsCount?: number;
+  activityCount?: number;
+  audiobookChapterCount?: number;
+  audioWelcomeCount?: number;
+  finalExamCount?: number;
+  totalJobs: number;
+  /** Fase 2: SOLO si el Manifest tiene Actividades de Aplicación (va después de totalJobs; sin ella, sha de siempre). */
+  applicationActivityCount?: number;
+  /** Loop 9 B: SOLO si el Manifest tiene prácticas guiadas (después de applicationActivityCount; sin ella, sha de siempre). */
+  guidedPracticeCount?: number;
+}
+
+/**
+ * Manifest con `manifestSchemaVersion: 1` (la forma JSON), para cualquier
+ * rulesVersion soportado. El nombre se conserva por compatibilidad: "V1" es
+ * el schema, no las reglas.
+ */
+export interface GenerationManifestV1 {
+  manifestSchemaVersion: 1;
+  rulesVersion: ManifestRulesVersion;
+  source: ManifestSource;
+  /** Solo rulesVersion 3. */
+  features?: ManifestFeatures;
+  modules: ManifestModule[];
+  items: ManifestItem[];
+  totals: ManifestTotals;
+}
+
+export interface ManifestValidationError {
+  code: string;
+  message: string;
+  key?: string;
+}
+
+/**
+ * Builds the canonical, deterministic Generation Manifest V1 from a
+ * Blueprint snapshot. Pure function: reads only `snapshot` and `source`,
+ * no clock, no randomness, no DB. Rules V1 (see design spec §2.2):
+ * content + scorm per chapter (always), video iff `videoEnabled`, exam
+ * (module-level) iff `examEnabled` — no course-level items in V1.
+ *
+ * Canonical item order: by module (position) -> by chapter (position) ->
+ * content, scorm, video; the module's exam item after all its chapters.
+ * `dependsOn` for `exam:<moduleId>` lists the module's `content:*` keys in
+ * chapter order.
+ *
+ * Input arrays (`snapshot.modules`, `.chapters`) are never mutated — sorted
+ * copies are made instead.
+ */
+/**
+ * rulesVersion 2 (spec `2026-09-25-cursia-v2-rules-v2-and-context-package-design.md` §3),
+ * además de todo lo de v1:
+ *  - `course_plan:<courseId>` (scope course, sin deps) y
+ *    `course_intro:<courseId>` (scope course, deps [course_plan]) al inicio;
+ *  - `module_intro:<moduleId>` (scope module, deps [course_plan]) al inicio de
+ *    cada módulo, antes de sus capítulos;
+ *  - `content:<chapterId>` depende de `course_plan`.
+ *  Orden canónico v2: course_plan, course_intro, luego por módulo:
+ *  module_intro → capítulos (content, scorm, video) → exam.
+ *  Totales v2 += coursePlanCount, courseIntroCount, moduleIntroCount.
+ * Con `rulesVersion` 1 (default) el resultado es byte-idéntico al de antes.
+ */
+export function coursePlanKey(courseId: number): string {
+  return `course_plan:${courseId}`;
+}
+export function courseIntroKey(courseId: number): string {
+  return `course_intro:${courseId}`;
+}
+export function moduleIntroKey(moduleId: string): string {
+  return `module_intro:${moduleId}`;
+}
+
+export function buildGenerationManifest(
+  snapshotIn: AnyBlueprintSnapshot,
+  source: ManifestSource,
+  opts?: { rulesVersion?: ManifestRulesVersion; activityTypeRules?: ActivityTypeRulesVersion; legacyFinalExamDeps?: boolean },
+): GenerationManifestV1 {
+  const rulesVersion: ManifestRulesVersion = opts?.rulesVersion ?? 1;
+  if (!SUPPORTED_RULES_VERSIONS.includes(rulesVersion)) {
+    throw new Error(`buildGenerationManifest: rulesVersion no soportado: ${String(rulesVersion)}`);
+  }
+  if (rulesVersion === 3) {
+    return buildGenerationManifestV3(snapshotIn as BlueprintSnapshotV2, source, { activityTypeRules: opts?.activityTypeRules ?? 0, legacyFinalExamDeps: opts?.legacyFinalExamDeps === true });
+  }
+  if ((opts?.activityTypeRules ?? 0) !== 0) {
+    // Las reglas de tipo de actividad solo existen en rulesVersion 3 (items activity).
+    throw new Error(`buildGenerationManifest: activityTypeRules ${String(opts?.activityTypeRules)} requiere rulesVersion 3`);
+  }
+  if ((snapshotIn as any)?.schemaVersion !== 1) {
+    // v1/v2 nunca procesan un Blueprint v2: perderían en silencio activityEnabled/finalExam.
+    throw new Error(
+      `${BLUEPRINT_SCHEMA_MISMATCH}: rulesVersion ${rulesVersion} requiere un Blueprint snapshot schemaVersion 1 ` +
+        `(recibido ${String((snapshotIn as any)?.schemaVersion)})`,
+    );
+  }
+  const snapshot = snapshotIn as BlueprintSnapshotV1;
+  const v2 = rulesVersion === 2;
+  const planKey = coursePlanKey(source.courseId);
+  const modulesSorted = [...snapshot.modules].sort((a, b) => a.position - b.position);
+  let chapterNumber = 0;
+  const modules: ManifestModule[] = [];
+  const items: ManifestItem[] = [];
+
+  if (v2) {
+    const courseBase = { scope: 'course' as const, moduleId: null, chapterId: null, moduleNumber: null, chapterNumber: null };
+    items.push({ key: planKey, type: 'course_plan', ...courseBase, dependsOn: [] });
+    items.push({ key: courseIntroKey(source.courseId), type: 'course_intro', ...courseBase, dependsOn: [planKey] });
+  }
+
+  modulesSorted.forEach((m, mi) => {
+    const moduleNumber = mi + 1;
+    const chaptersSorted = [...m.chapters].sort((a, b) => a.position - b.position);
+    const chapters: ManifestChapter[] = [];
+    const contentKeys: string[] = [];
+
+    if (v2) {
+      items.push({
+        key: moduleIntroKey(m.id),
+        type: 'module_intro',
+        scope: 'module',
+        moduleId: m.id,
+        chapterId: null,
+        moduleNumber,
+        chapterNumber: null,
+        dependsOn: [planKey],
+      });
+    }
+
+    for (const c of chaptersSorted) {
+      chapterNumber += 1;
+      chapters.push({
+        chapterId: c.id,
+        position: c.position,
+        chapterNumber,
+        videoEnabled: !!c.videoEnabled,
+      });
+
+      const base = {
+        scope: 'chapter' as const,
+        moduleId: m.id,
+        chapterId: c.id,
+        moduleNumber,
+        chapterNumber,
+      };
+      const contentKey = `content:${c.id}`;
+      contentKeys.push(contentKey);
+
+      items.push({ key: contentKey, type: 'content', ...base, dependsOn: v2 ? [planKey] : [] });
+      items.push({ key: `scorm:${c.id}`, type: 'scorm', ...base, dependsOn: [contentKey] });
+      if (c.videoEnabled) {
+        items.push({ key: `video:${c.id}`, type: 'video', ...base, dependsOn: [contentKey] });
+      }
+    }
+
+    modules.push({
+      moduleId: m.id,
+      position: m.position,
+      moduleNumber,
+      examEnabled: !!m.examEnabled,
+      chapters,
+    });
+
+    if (m.examEnabled) {
+      items.push({
+        key: `exam:${m.id}`,
+        type: 'exam',
+        scope: 'module',
+        moduleId: m.id,
+        chapterId: null,
+        moduleNumber,
+        chapterNumber: null,
+        dependsOn: [...contentKeys],
+      });
+    }
+  });
+
+  const count = (t: ManifestItemType) => items.filter((i) => i.type === t).length;
+  const totals: ManifestTotals = v2
+    ? {
+        moduleCount: modules.length,
+        chapterCount: chapterNumber,
+        contentCount: count('content'),
+        scormCount: count('scorm'),
+        videoCount: count('video'),
+        examCount: count('exam'),
+        coursePlanCount: count('course_plan'),
+        courseIntroCount: count('course_intro'),
+        moduleIntroCount: count('module_intro'),
+        totalJobs: items.length,
+      }
+    : {
+        moduleCount: modules.length,
+        chapterCount: chapterNumber,
+        contentCount: count('content'),
+        scormCount: count('scorm'),
+        videoCount: count('video'),
+        examCount: count('exam'),
+        totalJobs: items.length,
+      };
+
+  return {
+    manifestSchemaVersion: 1,
+    rulesVersion,
+    source: {
+      courseId: source.courseId,
+      blueprintId: source.blueprintId,
+      blueprintNumber: source.blueprintNumber,
+      blueprintSha256: source.blueprintSha256,
+    },
+    modules,
+    items,
+    totals,
+  };
+}
+
+/**
+ * Independently validates a Generation Manifest against the Blueprint
+ * snapshot it claims to derive from. Does NOT call `buildGenerationManifest`
+ * — it walks the snapshot itself and recomputes the expected item set,
+ * totals, and structure, then diffs against `m`. Returns ALL errors found
+ * (never stops at the first one).
+ */
+/**
+ * Codes beyond the invariants listed in design spec §2.8 / the task brief,
+ * added here and documented per the task's binding decisions:
+ *  - VERSION_MISMATCH: `manifestSchemaVersion` or `rulesVersion` isn't the
+ *    single value this validator (and the current builder) supports.
+ *  - MODULES_MISMATCH: the manifest's `modules` mirror (ids, positions,
+ *    numbers, `examEnabled`/`videoEnabled` flags) doesn't match the
+ *    snapshot it claims to derive from.
+ *  - UNKNOWN_MODULE: an `exam` item (or any item) references a `moduleId`
+ *    that doesn't exist in the snapshot at all (distinct from
+ *    UNKNOWN_CHAPTER, which is chapter-scoped).
+ *  - WRONG_DEPENDENCIES: an item's `dependsOn` doesn't equal (order-
+ *    sensitive) the exact expected edge for its type, derived independently
+ *    from the snapshot: `content` -> `[]`; `scorm:X`/`video:X` ->
+ *    `[content:X]`; `exam:M` -> `content:*` keys of M's chapters in
+ *    position order. This is a stronger check than DANGLING_DEPENDENCY
+ *    (which only asks "does this key exist anywhere in the manifest") — it
+ *    catches a misdirected edge to a key that does exist (e.g.
+ *    `scorm:X.dependsOn=[content:Y]`), and a cycle between two existing
+ *    keys (e.g. `content:A.dependsOn=[scorm:A]`,
+ *    `scorm:A.dependsOn=[content:A]`), which DANGLING_DEPENDENCY alone
+ *    cannot see since every key involved is present. With the exact edge
+ *    enforced per item, a cycle is structurally impossible to pass
+ *    validation: `content` items are the only ones every edge points to,
+ *    and they are the only items required to have zero outgoing edges, so
+ *    nothing content depends on (per this check) can ever depend back on
+ *    it.
+ */
+export function validateGenerationManifest(
+  m: GenerationManifestV1,
+  snapshot: AnyBlueprintSnapshot,
+  source: ManifestSource,
+): ManifestValidationError[] {
+  // rulesVersion 3 con su Blueprint v2 → validador v3 independiente.
+  if (m.rulesVersion === 3 && (snapshot as any)?.schemaVersion === 2) {
+    return validateGenerationManifestV3(m, snapshot as BlueprintSnapshotV2, source);
+  }
+  // Cualquier otra combinación pasa por el validador v1/v2 de siempre
+  // (byte-idéntico para un snapshot v1); si el schema del Blueprint no es el
+  // que exige el rulesVersion, se antepone BLUEPRINT_SCHEMA_MISMATCH.
+  const legacy = validateGenerationManifestLegacy(m, snapshot as BlueprintSnapshotV1, source);
+  const wantsV2Snapshot = m.rulesVersion === 3;
+  const isV2Snapshot = (snapshot as any)?.schemaVersion === 2;
+  if (wantsV2Snapshot !== isV2Snapshot) {
+    return [
+      {
+        code: BLUEPRINT_SCHEMA_MISMATCH,
+        message:
+          `rulesVersion ${m.rulesVersion} requiere un Blueprint snapshot schemaVersion ${wantsV2Snapshot ? 2 : 1}, ` +
+          `recibido schemaVersion ${String((snapshot as any)?.schemaVersion)}`,
+      },
+      ...legacy,
+    ];
+  }
+  return legacy;
+}
+
+function validateGenerationManifestLegacy(
+  m: GenerationManifestV1,
+  snapshot: BlueprintSnapshotV1,
+  source: ManifestSource,
+): ManifestValidationError[] {
+  const errors: ManifestValidationError[] = [];
+
+  // Despacho por rulesVersion (spec v2 §3): v1 se valida exactamente como
+  // antes; v2 agrega los items de scope curso/módulo y la arista
+  // content → course_plan. Un rulesVersion no soportado es VERSION_MISMATCH y
+  // el resto se valida con las reglas v1 (igual que antes de v2).
+  const rv: ManifestRulesVersion = m.rulesVersion === 2 ? 2 : 1;
+  const v2 = rv === 2;
+  if (!LEGACY_RULES_VERSIONS.includes(m.rulesVersion)) {
+    errors.push({
+      code: 'VERSION_MISMATCH',
+      message: `rulesVersion esperado 1 o 2, encontrado ${m.rulesVersion}`,
+    });
+  }
+  const knownTypes = itemTypesForRulesVersion(rv);
+  const planKey = coursePlanKey(source.courseId);
+  const expectedCourseKeys = new Map<string, ManifestItemType>(
+    v2 ? [[planKey, 'course_plan'], [courseIntroKey(source.courseId), 'course_intro']] : [],
+  );
+  const expectedModuleIntroKeys = new Set<string>();
+  if (m.manifestSchemaVersion !== 1) {
+    errors.push({
+      code: 'VERSION_MISMATCH',
+      message: `manifestSchemaVersion esperado 1, encontrado ${m.manifestSchemaVersion}`,
+    });
+  }
+
+  if (
+    m.source.courseId !== source.courseId ||
+    m.source.blueprintId !== source.blueprintId ||
+    m.source.blueprintNumber !== source.blueprintNumber ||
+    m.source.blueprintSha256 !== source.blueprintSha256
+  ) {
+    errors.push({
+      code: 'SOURCE_MISMATCH',
+      message: `source del manifest no coincide con el source esperado (courseId/blueprintId/blueprintNumber/blueprintSha256)`,
+    });
+  }
+
+  // --- Recompute the expected structure from the snapshot (independent of
+  // whatever `m` claims) ---
+  const modulesSorted = [...snapshot.modules].sort((a, b) => a.position - b.position);
+  const expectedModules = new Map<
+    string,
+    { position: number; moduleNumber: number; examEnabled: boolean }
+  >();
+  const expectedChapters = new Map<
+    string,
+    { moduleId: string; position: number; chapterNumber: number; videoEnabled: boolean }
+  >();
+  const expectedContentKeys = new Set<string>();
+  const expectedScormKeys = new Set<string>();
+  const expectedVideoKeys = new Set<string>();
+  const expectedExamKeys = new Set<string>();
+  const moduleChapterOrder = new Map<string, string[]>(); // moduleId -> chapterIds in position order
+
+  let chapterNumber = 0;
+  modulesSorted.forEach((mod, mi) => {
+    const moduleNumber = mi + 1;
+    expectedModules.set(mod.id, {
+      position: mod.position,
+      moduleNumber,
+      examEnabled: !!mod.examEnabled,
+    });
+    const chaptersSorted = [...mod.chapters].sort((a, b) => a.position - b.position);
+    const chapterIds: string[] = [];
+    for (const c of chaptersSorted) {
+      chapterNumber += 1;
+      expectedChapters.set(c.id, {
+        moduleId: mod.id,
+        position: c.position,
+        chapterNumber,
+        videoEnabled: !!c.videoEnabled,
+      });
+      chapterIds.push(c.id);
+      expectedContentKeys.add(`content:${c.id}`);
+      expectedScormKeys.add(`scorm:${c.id}`);
+      if (c.videoEnabled) expectedVideoKeys.add(`video:${c.id}`);
+    }
+    moduleChapterOrder.set(mod.id, chapterIds);
+    if (mod.examEnabled) expectedExamKeys.add(`exam:${mod.id}`);
+    if (v2) expectedModuleIntroKeys.add(moduleIntroKey(mod.id));
+  });
+
+  // --- FIX M4: canonical order ---
+  // `items[]` must appear in canonical order (design spec §2.3): module
+  // (position) -> chapter (position) -> content, scorm, video; the module's
+  // `exam` after all of its chapters. Computed independently from the
+  // snapshot (never from `m.items` itself) — includes only the keys the
+  // snapshot says SHOULD exist; unknown/extra items in `m.items` are simply
+  // skipped for this check (they're already caught by the other checks
+  // above/below) so a single stray item can't mask a genuine ordering bug
+  // in the rest of the array.
+  const canonicalOrderKeys: string[] = [...expectedCourseKeys.keys()];
+  modulesSorted.forEach((mod) => {
+    if (v2) canonicalOrderKeys.push(moduleIntroKey(mod.id));
+    const chaptersSorted = [...mod.chapters].sort((a, b) => a.position - b.position);
+    for (const c of chaptersSorted) {
+      canonicalOrderKeys.push(`content:${c.id}`);
+      canonicalOrderKeys.push(`scorm:${c.id}`);
+      if (c.videoEnabled) canonicalOrderKeys.push(`video:${c.id}`);
+    }
+    if (mod.examEnabled) canonicalOrderKeys.push(`exam:${mod.id}`);
+  });
+  const canonicalIndex = new Map<string, number>();
+  canonicalOrderKeys.forEach((k, idx) => canonicalIndex.set(k, idx));
+
+  const orderedIndices: number[] = [];
+  for (const item of m.items) {
+    const idx = canonicalIndex.get(item.key);
+    if (idx !== undefined) orderedIndices.push(idx);
+  }
+  for (let i = 1; i < orderedIndices.length; i++) {
+    if (orderedIndices[i] <= orderedIndices[i - 1]) {
+      errors.push({
+        code: 'ORDER_MISMATCH',
+        message:
+          'items no está en el orden canónico esperado (módulo → capítulo → content/scorm/video; exam al final de su módulo)',
+      });
+      break;
+    }
+  }
+
+  // `modules[].chapters` must also be in position-sorted order.
+  for (const mm of m.modules) {
+    for (let i = 1; i < mm.chapters.length; i++) {
+      if (mm.chapters[i].position <= mm.chapters[i - 1].position) {
+        errors.push({
+          code: 'ORDER_MISMATCH',
+          message: `módulo ${mm.moduleId}: chapters no está en orden ascendente de position`,
+          key: mm.moduleId,
+        });
+        break;
+      }
+    }
+  }
+
+  // --- modules[] mirror check ---
+  if (m.modules.length !== expectedModules.size) {
+    errors.push({
+      code: 'MODULES_MISMATCH',
+      message: `cantidad de módulos en el manifest (${m.modules.length}) no coincide con el snapshot (${expectedModules.size})`,
+    });
+  }
+  for (const mm of m.modules) {
+    const expected = expectedModules.get(mm.moduleId);
+    if (!expected) {
+      errors.push({
+        code: 'MODULES_MISMATCH',
+        message: `moduleId ${mm.moduleId} no existe en el snapshot`,
+        key: mm.moduleId,
+      });
+      continue;
+    }
+    if (
+      mm.position !== expected.position ||
+      mm.moduleNumber !== expected.moduleNumber ||
+      mm.examEnabled !== expected.examEnabled
+    ) {
+      errors.push({
+        code: 'MODULES_MISMATCH',
+        message: `módulo ${mm.moduleId} no coincide con el snapshot (position/moduleNumber/examEnabled)`,
+        key: mm.moduleId,
+      });
+    }
+    const expectedChapterIds = moduleChapterOrder.get(mm.moduleId) ?? [];
+    if (mm.chapters.length !== expectedChapterIds.length) {
+      errors.push({
+        code: 'MODULES_MISMATCH',
+        message: `módulo ${mm.moduleId}: cantidad de capítulos no coincide con el snapshot`,
+        key: mm.moduleId,
+      });
+    }
+    for (const mc of mm.chapters) {
+      const expectedChapter = expectedChapters.get(mc.chapterId);
+      if (!expectedChapter || expectedChapter.moduleId !== mm.moduleId) {
+        errors.push({
+          code: 'MODULES_MISMATCH',
+          message: `capítulo ${mc.chapterId} no pertenece al módulo ${mm.moduleId} según el snapshot`,
+          key: mc.chapterId,
+        });
+        continue;
+      }
+      if (
+        mc.position !== expectedChapter.position ||
+        mc.chapterNumber !== expectedChapter.chapterNumber ||
+        mc.videoEnabled !== expectedChapter.videoEnabled
+      ) {
+        errors.push({
+          code: 'MODULES_MISMATCH',
+          message: `capítulo ${mc.chapterId} no coincide con el snapshot (position/chapterNumber/videoEnabled)`,
+          key: mc.chapterId,
+        });
+      }
+    }
+  }
+
+  // --- items[] checks ---
+  const keyCounts = new Map<string, number>();
+  for (const item of m.items) {
+    keyCounts.set(item.key, (keyCounts.get(item.key) ?? 0) + 1);
+  }
+  for (const [key, cnt] of keyCounts) {
+    if (cnt > 1) {
+      errors.push({ code: 'DUPLICATE_KEY', message: `key duplicada: ${key} (${cnt} veces)`, key });
+    }
+  }
+
+  const presentKeys = new Set(m.items.map((i) => i.key));
+  const presentContentKeys = new Set<string>();
+  const presentScormKeys = new Set<string>();
+  const presentVideoKeys = new Set<string>();
+  const presentExamKeys = new Set<string>();
+  const presentCourseKeys = new Set<string>();
+  const presentModuleIntroKeys = new Set<string>();
+
+  for (const item of m.items) {
+    const isKnown = knownTypes.includes(item.type);
+    // Solo en v2 los tipos nuevos tienen reglas propias; en v1 un tipo v2 es
+    // UNKNOWN_TYPE y sigue el camino de "capítulo" exactamente como antes.
+    const isCourseType = isKnown && (item.type === 'course_plan' || item.type === 'course_intro');
+    const isModuleIntro = isKnown && item.type === 'module_intro';
+    const isModuleScoped = item.type === 'exam' || isModuleIntro;
+    const itemModuleId = item.moduleId ?? '';
+
+    // --- FIX I1: per-item identity/consistency checks, independent of
+    // whether the referenced moduleId/chapterId actually exist (those are
+    // handled separately below). Each check is computed from the item's
+    // own claimed fields, so a swapped/forged id or number is caught even
+    // when every key involved is otherwise present in the manifest. ---
+    if (!isKnown) {
+      errors.push({
+        code: 'UNKNOWN_TYPE',
+        message: `item ${item.key}: type desconocido: ${String(item.type)}`,
+        key: item.key,
+      });
+    } else {
+      const expectedKey = isCourseType
+        ? `${item.type}:${source.courseId}`
+        : isModuleScoped
+          ? `${item.type}:${item.moduleId}`
+          : `${item.type}:${item.chapterId}`;
+      if (item.key !== expectedKey) {
+        errors.push({
+          code: 'KEY_MISMATCH',
+          message: `item ${item.key}: key esperada ${expectedKey} según type/${isCourseType ? 'courseId' : isModuleScoped ? 'moduleId' : 'chapterId'}`,
+          key: item.key,
+        });
+      }
+
+      const expectedScope = scopeOfItemType(item.type);
+      if (item.scope !== expectedScope) {
+        errors.push({
+          code: 'SCOPE_MISMATCH',
+          message: `item ${item.key}: scope esperado '${expectedScope}' para type=${item.type}, encontrado '${item.scope}'`,
+          key: item.key,
+        });
+      }
+
+      if (isCourseType) {
+        // Scope curso: sin módulo ni capítulo (identidad = el curso del source).
+        for (const [field, value] of [
+          ['moduleId', item.moduleId],
+          ['chapterId', item.chapterId],
+          ['moduleNumber', item.moduleNumber],
+          ['chapterNumber', item.chapterNumber],
+        ] as const) {
+          if (value !== null) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: ${field} esperado null para un item de scope course, encontrado ${value}`,
+              key: item.key,
+            });
+          }
+        }
+      } else {
+        const expectedModuleForItem = expectedModules.get(itemModuleId);
+        if (expectedModuleForItem && item.moduleNumber !== expectedModuleForItem.moduleNumber) {
+          errors.push({
+            code: 'NUMBERING_MISMATCH',
+            message: `item ${item.key}: moduleNumber esperado ${expectedModuleForItem.moduleNumber} para moduleId ${item.moduleId}, encontrado ${item.moduleNumber}`,
+            key: item.key,
+          });
+        }
+
+        if (isModuleScoped) {
+          if (item.chapterId !== null) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: chapterId esperado null para un item de tipo ${item.type}, encontrado ${item.chapterId}`,
+              key: item.key,
+            });
+          }
+          if (item.chapterNumber !== null) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: chapterNumber esperado null para un item de tipo ${item.type}, encontrado ${item.chapterNumber}`,
+              key: item.key,
+            });
+          }
+        } else {
+          const expectedChapterForItem = item.chapterId ? expectedChapters.get(item.chapterId) : undefined;
+          if (expectedChapterForItem && item.chapterNumber !== expectedChapterForItem.chapterNumber) {
+            errors.push({
+              code: 'NUMBERING_MISMATCH',
+              message: `item ${item.key}: chapterNumber esperado ${expectedChapterForItem.chapterNumber} para chapterId ${item.chapterId}, encontrado ${item.chapterNumber}`,
+              key: item.key,
+            });
+          }
+        }
+      }
+    }
+
+    if (item.type === 'exam') {
+      const expectedModule = expectedModules.get(itemModuleId);
+      if (!expectedModule) {
+        errors.push({
+          code: 'UNKNOWN_MODULE',
+          message: `exam ${item.key} referencia un moduleId inexistente en el snapshot: ${item.moduleId}`,
+          key: item.key,
+        });
+      } else if (!expectedModule.examEnabled) {
+        errors.push({
+          code: 'EXAM_NOT_ENABLED',
+          message: `exam ${item.key} existe pero el módulo ${item.moduleId} tiene examEnabled=false`,
+          key: item.key,
+        });
+      }
+      presentExamKeys.add(item.key);
+    } else if (isModuleIntro) {
+      if (!expectedModules.has(itemModuleId)) {
+        errors.push({
+          code: 'UNKNOWN_MODULE',
+          message: `module_intro ${item.key} referencia un moduleId inexistente en el snapshot: ${item.moduleId}`,
+          key: item.key,
+        });
+      }
+      presentModuleIntroKeys.add(item.key);
+    } else if (isCourseType) {
+      presentCourseKeys.add(item.key);
+    } else {
+      // content | scorm | video: chapter-scoped
+      const expectedChapter = item.chapterId ? expectedChapters.get(item.chapterId) : undefined;
+      if (!item.chapterId || !expectedChapter) {
+        errors.push({
+          code: 'UNKNOWN_CHAPTER',
+          message: `item ${item.key} referencia un chapterId inexistente en el snapshot: ${item.chapterId}`,
+          key: item.key,
+        });
+      } else {
+        if (expectedChapter.moduleId !== item.moduleId) {
+          errors.push({
+            code: 'CHAPTER_MODULE_MISMATCH',
+            message: `item ${item.key}: capítulo ${item.chapterId} pertenece al módulo ${expectedChapter.moduleId}, no a ${item.moduleId}`,
+            key: item.key,
+          });
+        }
+        if (item.type === 'video' && !expectedChapter.videoEnabled) {
+          errors.push({
+            code: 'VIDEO_NOT_ENABLED',
+            message: `video ${item.key} existe pero el capítulo ${item.chapterId} tiene videoEnabled=false`,
+            key: item.key,
+          });
+        }
+      }
+      if (item.type === 'content') presentContentKeys.add(item.key);
+      if (item.type === 'scorm') presentScormKeys.add(item.key);
+      if (item.type === 'video') presentVideoKeys.add(item.key);
+    }
+
+    for (const dep of item.dependsOn) {
+      if (!presentKeys.has(dep)) {
+        errors.push({
+          code: 'DANGLING_DEPENDENCY',
+          message: `item ${item.key} depende de una key inexistente: ${dep}`,
+          key: item.key,
+        });
+      }
+    }
+
+    // --- exact edges (independent of whether the dep key even exists) ---
+    // The DAG has exactly one edge shape per rule (content -> [];
+    // scorm:X/video:X -> [content:X]; exam:M -> content keys of M's
+    // chapters in position order) — computed here from the snapshot, not
+    // from `item` itself beyond identifying which chapter/module it claims
+    // to belong to. Because every expected edge points strictly from a
+    // non-content item to a content item, and content items always expect
+    // `[]`, no cycle can ever satisfy this check: a cycle (e.g.
+    // content:A.dependsOn=[scorm:A] / scorm:A.dependsOn=[content:A]) is
+    // caught here as WRONG_DEPENDENCIES on the content item alone (expects
+    // []), independent of anything else being wrong.
+    // v2: content/course_intro/module_intro -> [course_plan:<courseId>] y
+    // course_plan -> []. Sigue siendo acíclico: course_plan es la única
+    // raíz, no depende de nada, y todo lo demás apunta "hacia" content o
+    // hacia course_plan.
+    let expectedDeps: string[] | undefined;
+    if (item.type === 'content') {
+      expectedDeps = v2 ? [planKey] : [];
+    } else if (item.type === 'scorm' || item.type === 'video') {
+      if (item.chapterId) expectedDeps = [`content:${item.chapterId}`];
+    } else if (item.type === 'exam') {
+      const chapterIds = moduleChapterOrder.get(itemModuleId);
+      if (chapterIds) expectedDeps = chapterIds.map((cid) => `content:${cid}`);
+    } else if (isKnown && item.type === 'course_plan') {
+      expectedDeps = [];
+    } else if (isKnown && (item.type === 'course_intro' || item.type === 'module_intro')) {
+      expectedDeps = [planKey];
+    }
+    if (expectedDeps) {
+      const same =
+        item.dependsOn.length === expectedDeps.length &&
+        item.dependsOn.every((dep, idx) => dep === expectedDeps![idx]);
+      if (!same) {
+        errors.push({
+          code: 'WRONG_DEPENDENCIES',
+          message: `item ${item.key}: dependsOn esperado ${JSON.stringify(expectedDeps)}, encontrado ${JSON.stringify(item.dependsOn)}`,
+          key: item.key,
+        });
+      }
+    }
+  }
+
+  // --- missing items (recounted from the snapshot) ---
+  for (const [key, type] of expectedCourseKeys) {
+    if (!presentCourseKeys.has(key)) {
+      errors.push({ code: type === 'course_plan' ? 'MISSING_COURSE_PLAN' : 'MISSING_COURSE_INTRO', message: `falta el item ${key}`, key });
+    }
+  }
+  for (const key of expectedModuleIntroKeys) {
+    if (!presentModuleIntroKeys.has(key)) {
+      errors.push({ code: 'MISSING_MODULE_INTRO', message: `falta el item ${key}`, key });
+    }
+  }
+  for (const key of expectedContentKeys) {
+    if (!presentContentKeys.has(key)) {
+      errors.push({ code: 'MISSING_CONTENT', message: `falta el item ${key}`, key });
+    }
+  }
+  for (const key of expectedScormKeys) {
+    if (!presentScormKeys.has(key)) {
+      errors.push({ code: 'MISSING_SCORM', message: `falta el item ${key}`, key });
+    }
+  }
+  for (const key of expectedVideoKeys) {
+    if (!presentVideoKeys.has(key)) {
+      errors.push({ code: 'MISSING_VIDEO', message: `falta el item ${key}`, key });
+    }
+  }
+  for (const key of expectedExamKeys) {
+    if (!presentExamKeys.has(key)) {
+      errors.push({ code: 'MISSING_EXAM', message: `falta el item ${key}`, key });
+    }
+  }
+
+  // --- totals recount ---
+  const v1Jobs = expectedContentKeys.size + expectedScormKeys.size + expectedVideoKeys.size + expectedExamKeys.size;
+  const expectedTotals: ManifestTotals = v2
+    ? {
+        moduleCount: expectedModules.size,
+        chapterCount: expectedChapters.size,
+        contentCount: expectedContentKeys.size,
+        scormCount: expectedScormKeys.size,
+        videoCount: expectedVideoKeys.size,
+        examCount: expectedExamKeys.size,
+        coursePlanCount: 1,
+        courseIntroCount: 1,
+        moduleIntroCount: expectedModuleIntroKeys.size,
+        totalJobs: v1Jobs + expectedCourseKeys.size + expectedModuleIntroKeys.size,
+      }
+    : {
+        moduleCount: expectedModules.size,
+        chapterCount: expectedChapters.size,
+        contentCount: expectedContentKeys.size,
+        scormCount: expectedScormKeys.size,
+        videoCount: expectedVideoKeys.size,
+        examCount: expectedExamKeys.size,
+        totalJobs: v1Jobs,
+      };
+  (Object.keys(expectedTotals) as (keyof ManifestTotals)[]).forEach((field) => {
+    if (m.totals[field] !== expectedTotals[field]) {
+      errors.push({
+        code: 'TOTALS_MISMATCH',
+        message: `totals.${field} esperado ${expectedTotals[field]}, encontrado ${m.totals[field]}`,
+      });
+    }
+  });
+  if (m.items.length !== m.totals.totalJobs) {
+    errors.push({
+      code: 'TOTALS_MISMATCH',
+      message: `totals.totalJobs (${m.totals.totalJobs}) no coincide con items.length (${m.items.length})`,
+    });
+  }
+
+  return errors;
+}
+
+/**
+ * Canonical serialization: rebuilds the manifest object with a fixed key
+ * order (matching how `buildGenerationManifest` constructs its literals) so
+ * that a manifest round-tripped through Postgres `jsonb` — which reorders
+ * object keys but preserves array order — produces the identical string
+ * and hash.
+ */
+export function canonicalManifestJson(m: GenerationManifestV1): string {
+  if (m.rulesVersion === 3) return canonicalManifestJsonV3(m);
+  const canonical: GenerationManifestV1 = {
+    // FIX M1: copy the manifest's own values through instead of hardcoding
+    // 1 — a stored manifest whose rulesVersion/manifestSchemaVersion drifted
+    // (e.g. tampered or from a future rules generation) must survive
+    // canonicalization unchanged, so `validateGenerationManifest` can catch
+    // it as VERSION_MISMATCH on the read path. For any manifest actually
+    // produced by `buildGenerationManifest` today, both are still 1, so the
+    // pinned acceptance-fixture hash is unaffected.
+    manifestSchemaVersion: m.manifestSchemaVersion,
+    rulesVersion: m.rulesVersion,
+    source: {
+      courseId: m.source.courseId,
+      blueprintId: m.source.blueprintId,
+      blueprintNumber: m.source.blueprintNumber,
+      blueprintSha256: m.source.blueprintSha256,
+    },
+    modules: m.modules.map((mod) => ({
+      moduleId: mod.moduleId,
+      position: mod.position,
+      moduleNumber: mod.moduleNumber,
+      examEnabled: mod.examEnabled,
+      chapters: mod.chapters.map((c) => ({
+        chapterId: c.chapterId,
+        position: c.position,
+        chapterNumber: c.chapterNumber,
+        videoEnabled: c.videoEnabled,
+      })),
+    })),
+    items: m.items.map((i) => ({
+      key: i.key,
+      type: i.type,
+      scope: i.scope,
+      moduleId: i.moduleId,
+      chapterId: i.chapterId,
+      moduleNumber: i.moduleNumber,
+      chapterNumber: i.chapterNumber,
+      dependsOn: [...i.dependsOn],
+    })),
+    // v1: exactamente las claves de siempre (el hash fijado no cambia). v2:
+    // + los tres conteos nuevos, antes de totalJobs.
+    totals:
+      m.rulesVersion === 2
+        ? {
+            moduleCount: m.totals.moduleCount,
+            chapterCount: m.totals.chapterCount,
+            contentCount: m.totals.contentCount,
+            scormCount: m.totals.scormCount,
+            videoCount: m.totals.videoCount,
+            examCount: m.totals.examCount,
+            coursePlanCount: m.totals.coursePlanCount,
+            courseIntroCount: m.totals.courseIntroCount,
+            moduleIntroCount: m.totals.moduleIntroCount,
+            totalJobs: m.totals.totalJobs,
+          }
+        : {
+            moduleCount: m.totals.moduleCount,
+            chapterCount: m.totals.chapterCount,
+            contentCount: m.totals.contentCount,
+            scormCount: m.totals.scormCount,
+            videoCount: m.totals.videoCount,
+            examCount: m.totals.examCount,
+            totalJobs: m.totals.totalJobs,
+          },
+  };
+  return JSON.stringify(canonical);
+}
+
+export function manifestSha256(m: GenerationManifestV1): string {
+  return createHash('sha256').update(canonicalManifestJson(m), 'utf8').digest('hex');
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// rulesVersion 3 (Cursia V2.1 — R4, audit §N.1/§N.2 + DECISIONES VIGENTES).
+//
+// Entrada: Blueprint snapshot schemaVersion 2 (R3). Todo lo de arriba (v1/v2)
+// queda byte-idéntico: v3 tiene su propio builder, validador y canonical.
+//
+// Items v3 (key / scope / existe cuando / dependsOn exacto):
+//   course_plan:<courseId>        course  siempre            []
+//   course_intro:<courseId>       course  siempre            [course_plan]
+//   audio_welcome:<courseId>      course  siempre            [course_intro]
+//   module_intro:<m>              module  siempre            [course_plan]
+//   content:<ch>                  chapter siempre            [course_plan]
+//   experience:<ch>               chapter siempre            [content:<ch>]
+//   presentation:<ch>             chapter siempre (Gamma)    [content:<ch>]
+//   video:<ch>                    chapter videoEnabled       [content:<ch>]
+//   video_interactions:<ch>       chapter videoEnabled       [video:<ch>, content:<ch>]
+//   activity:<ch>  (+variant)     chapter activityEnabled    [content:<ch>]
+//   audiobook_chapter:<ch>        chapter siempre            [content:<ch>]
+//   Capítulo de PRÁCTICA (kind 'practice', motor de carga horaria): SOLO experience:<ch> y, si activityEnabled,
+//   activity:<ch>; ambos con dependsOn = los content de los capítulos de CONTENIDO del módulo, en orden (se apoyan
+//   en sus resúmenes). Sin content, presentation, video ni audiobook_chapter, y fuera de exam/final_exam.
+//   exam:<m>                      module  examEnabled        content del módulo, en orden
+//   final_exam:<courseId>         course  course.finalExam   todos los content, en orden + los exam:<m>, en orden
+//                                                            (Loop 9: el final recibe los bancos de módulo como
+//                                                            dependencias; Manifests anteriores: solo los content)
+// Orden canónico: course_plan, course_intro, audio_welcome; por módulo:
+// module_intro → por capítulo (content, experience, presentation, video,
+// video_interactions, activity, audiobook_chapter) → exam; al final final_exam.
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Código de error cuando el schemaVersion del Blueprint no es el que exige el rulesVersion. */
+export const BLUEPRINT_SCHEMA_MISMATCH = 'BLUEPRINT_SCHEMA_MISMATCH';
+
+export function audioWelcomeKey(courseId: number): string {
+  return `audio_welcome:${courseId}`;
+}
+export function finalExamKey(courseId: number): string {
+  return `final_exam:${courseId}`;
+}
+
+/** Tipos por capítulo de v3, en orden canónico. */
+const V3_CHAPTER_TYPES_IN_ORDER = [
+  'content', 'experience', 'presentation', 'video', 'video_interactions', 'activity', 'application_activity', 'guided_practice', 'audiobook_chapter',
+] as const;
+
+function assertV2Snapshot(snapshot: any, where: string): asserts snapshot is BlueprintSnapshotV2 {
+  if (!snapshot || snapshot.schemaVersion !== 2) {
+    throw new Error(
+      `${BLUEPRINT_SCHEMA_MISMATCH}: ${where}: rulesVersion 3 requiere un Blueprint snapshot schemaVersion 2 ` +
+        `(recibido ${String(snapshot?.schemaVersion)})`,
+    );
+  }
+}
+
+/**
+ * Builder v3. Función pura (sin clock/random/DB); no muta la entrada. Los
+ * flags nuevos NO se coercionan: un Blueprint v2 mal formado (activityEnabled
+ * no boolean, engine desconocido) tira en vez de apagar actividades en silencio.
+ */
+export function buildGenerationManifestV3(
+  snapshot: BlueprintSnapshotV2,
+  source: ManifestSource,
+  opts?: {
+    activityTypeRules?: ActivityTypeRulesVersion;
+    /**
+     * Loop 9: SOLO para reconstruir un Manifest guardado ANTES de que el examen final dependiera de los exámenes de
+     * módulo (verificación de determinismo de una fila existente): final_exam con dependsOn = solo los content.
+     */
+    legacyFinalExamDeps?: boolean;
+  },
+): GenerationManifestV1 {
+  assertV2Snapshot(snapshot, 'buildGenerationManifestV3');
+  const activityTypeRules = opts?.activityTypeRules ?? 0;
+  if (activityTypeRules !== 0 && activityTypeRules !== 1 && activityTypeRules !== 2) {
+    throw new Error(`buildGenerationManifestV3: activityTypeRules inválido: ${JSON.stringify(activityTypeRules)} (0 | 1 | 2)`);
+  }
+  const course = snapshot.course;
+  if (typeof course?.finalExam !== 'boolean') {
+    throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.finalExam debe ser boolean (fue ${JSON.stringify(course?.finalExam)})`);
+  }
+  if (course.activityEngine !== 'h5p' && course.activityEngine !== 'scorm') {
+    throw new Error(`BLUEPRINT_V2_INVALID_INPUT: course.activityEngine inválido: ${JSON.stringify(course.activityEngine)}`);
+  }
+  const variant: ActivityVariant = course.activityEngine;
+  // EV5-C: con el marcador, el tipo h5p de cada actividad se decide y congela acá.
+  // EV6 H5P v2: con el marcador 2, reglas v2 (decide → branchingscenario, tope y balance propios).
+  // Motor pedagógico V1: con diseño pedagógico el tipo lo elige el diseño (dentro de los tipos admitidos).
+  const pedagogyFeature = manifestFeaturesPedagogy(snapshot);
+  const chosenTypes: Map<string, { type: GradedH5pActivityType | 'branchingscenario' }> | null = pedagogyFeature
+    ? choosePedagogicalActivityTypes(snapshot, activityTypeRules)
+    : activityTypeRules === 1 ? chooseActivityTypesV1(snapshot) : activityTypeRules === 2 ? chooseActivityTypesV2(snapshot) : null;
+  const planKey = coursePlanKey(source.courseId);
+  const introKey = courseIntroKey(source.courseId);
+  const courseBase = { scope: 'course' as const, moduleId: null, chapterId: null, moduleNumber: null, chapterNumber: null };
+
+  const items: ManifestItem[] = [
+    { key: planKey, type: 'course_plan', ...courseBase, dependsOn: [] },
+    { key: introKey, type: 'course_intro', ...courseBase, dependsOn: [planKey] },
+    { key: audioWelcomeKey(source.courseId), type: 'audio_welcome', ...courseBase, dependsOn: [introKey] },
+  ];
+  const modules: ManifestModule[] = [];
+  const allContentKeys: string[] = [];
+  const allExamKeys: string[] = [];
+  let chapterNumber = 0;
+
+  const modulesSorted = [...snapshot.modules].sort((a, b) => a.position - b.position);
+  modulesSorted.forEach((m, mi) => {
+    const moduleNumber = mi + 1;
+    items.push({
+      key: moduleIntroKey(m.id), type: 'module_intro', scope: 'module',
+      moduleId: m.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [planKey],
+    });
+    const chapters: ManifestChapter[] = [];
+    const contentKeys: string[] = [];
+    const sortedChapters = [...m.chapters].sort((a, b) => a.position - b.position);
+    // Motor de carga horaria: la práctica se apoya en los content de los capítulos de CONTENIDO del módulo.
+    const moduleContentKeys = sortedChapters.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    // Loop 9 B (fix N1): los ejercicios guiados esperan a las Actividades de Aplicación del módulo (para no repetir su caso).
+    // Sin ciclo: una AA depende solo de content (nunca de guided_practice).
+    const moduleAppKeys = sortedChapters.filter((c) => isApplicationMinutes((c as { applicationMinutes?: unknown }).applicationMinutes)).map((c) => `application_activity:${c.id}`);
+    for (const c of sortedChapters) {
+      if (typeof c.activityEnabled !== 'boolean') {
+        throw new Error(`BLUEPRINT_V2_INVALID_INPUT: chapter ${c.id} sin activityEnabled boolean`);
+      }
+      chapterNumber += 1;
+      const videoEnabled = !!c.videoEnabled;
+      const practice = chapterKindOf(c) === 'practice';
+      if (practice && (videoEnabled || moduleContentKeys.length === 0)) {
+        throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo de práctica ${c.id} no puede tener video y su módulo necesita un capítulo de contenido`);
+      }
+      // Fase 2: Actividad de Aplicación (minutos del Blueprint; ausente = sin actividad).
+      const appMin = (c as { applicationMinutes?: unknown }).applicationMinutes;
+      if (appMin !== undefined && !isApplicationMinutes(appMin)) {
+        throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo ${c.id} tiene applicationMinutes inválido (${JSON.stringify(appMin)})`);
+      }
+      const application = isApplicationMinutes(appMin) ? appMin : null;
+      // Loop 9 B: práctica guiada (solo contenido; ausente = sin práctica guiada).
+      const gpMin = (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes;
+      if (gpMin !== undefined && (!isGuidedPracticeMinutes(gpMin) || practice)) {
+        throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo ${c.id} tiene guidedPracticeMinutes inválido (${JSON.stringify(gpMin)}${practice ? '; es de práctica' : ''})`);
+      }
+      const guided = isGuidedPracticeMinutes(gpMin) ? gpMin : null;
+      chapters.push({
+        chapterId: c.id, position: c.position, chapterNumber, videoEnabled, activityEnabled: c.activityEnabled,
+        ...(practice ? { kind: 'practice' as const } : {}),
+        ...(application !== null ? { applicationMinutes: application } : {}),
+        ...(guided !== null ? { guidedPracticeMinutes: guided } : {}),
+      });
+      const base = { scope: 'chapter' as const, moduleId: m.id, chapterId: c.id, moduleNumber, chapterNumber };
+      if (practice) {
+        items.push({ key: `experience:${c.id}`, type: 'experience', ...base, dependsOn: [...moduleContentKeys] });
+        if (c.activityEnabled) {
+          const h5pType = variant === 'h5p' && chosenTypes ? chosenTypes.get(c.id)?.type : undefined;
+          if (chosenTypes && variant === 'h5p' && !h5pType) {
+            throw new Error(`buildGenerationManifestV3: sin tipo h5p para la actividad del capítulo ${c.id}`);
+          }
+          items.push({ key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [...moduleContentKeys], variant, ...(h5pType ? { h5pType } : {}) });
+        }
+        if (application !== null) {
+          items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [...moduleContentKeys], applicationMinutes: application });
+        }
+        continue;
+      }
+      const contentKey = `content:${c.id}`;
+      contentKeys.push(contentKey);
+      allContentKeys.push(contentKey);
+      items.push({ key: contentKey, type: 'content', ...base, dependsOn: [planKey] });
+      items.push({ key: `experience:${c.id}`, type: 'experience', ...base, dependsOn: [contentKey] });
+      items.push({ key: `presentation:${c.id}`, type: 'presentation', ...base, dependsOn: [contentKey] });
+      if (videoEnabled) {
+        items.push({ key: `video:${c.id}`, type: 'video', ...base, dependsOn: [contentKey] });
+        items.push({
+          key: `video_interactions:${c.id}`, type: 'video_interactions', ...base,
+          dependsOn: [`video:${c.id}`, contentKey],
+        });
+      }
+      if (c.activityEnabled) {
+        const h5pType = variant === 'h5p' && chosenTypes ? chosenTypes.get(c.id)?.type : undefined;
+        if (chosenTypes && variant === 'h5p' && !h5pType) {
+          throw new Error(`buildGenerationManifestV3: sin tipo h5p para la actividad del capítulo ${c.id}`);
+        }
+        items.push({
+          key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [contentKey], variant,
+          ...(h5pType ? { h5pType } : {}),
+        });
+      }
+      if (application !== null) {
+        items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [contentKey], applicationMinutes: application });
+      }
+      if (guided !== null) {
+        items.push({ key: `guided_practice:${c.id}`, type: 'guided_practice', ...base, dependsOn: [contentKey, ...moduleAppKeys], guidedPracticeMinutes: guided });
+      }
+      items.push({ key: `audiobook_chapter:${c.id}`, type: 'audiobook_chapter', ...base, dependsOn: [contentKey] });
+    }
+    modules.push({ moduleId: m.id, position: m.position, moduleNumber, examEnabled: !!m.examEnabled, chapters });
+    if (m.examEnabled) {
+      items.push({
+        key: `exam:${m.id}`, type: 'exam', scope: 'module',
+        moduleId: m.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [...contentKeys],
+      });
+      allExamKeys.push(`exam:${m.id}`);
+    }
+  });
+  if (course.finalExam) {
+    // Loop 9 (#542 sin navegador): el final depende también de los exámenes de módulo → recibe sus bancos como
+    // dependencias y evita repetir sus preguntas aunque lo genere el worker (un contexto nuevo por parte).
+    const finalDeps = opts?.legacyFinalExamDeps === true ? [...allContentKeys] : [...allContentKeys, ...allExamKeys];
+    items.push({ key: finalExamKey(source.courseId), type: 'final_exam', ...courseBase, dependsOn: finalDeps });
+  }
+  if (pedagogyFeature) {
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      const design = manifestItemDesign(snapshot, it.type, it.moduleId, it.chapterId);
+      if (design) items[i] = { ...it, design };
+    }
+  }
+
+  const count = (t: ManifestItemType) => items.filter((i) => i.type === t).length;
+  return {
+    manifestSchemaVersion: 1,
+    rulesVersion: 3,
+    source: {
+      courseId: source.courseId,
+      blueprintId: source.blueprintId,
+      blueprintNumber: source.blueprintNumber,
+      blueprintSha256: source.blueprintSha256,
+    },
+    features: {
+      finalExam: course.finalExam,
+      activityEngine: course.activityEngine,
+      ...(activityTypeRules === 1 ? { activityTypeRules: 1 as const } : {}),
+      ...(activityTypeRules === 2 ? { activityTypeRules: 2 as const, ivAdvanced: 1 as const } : {}),
+      ...(pedagogyFeature ? { pedagogy: pedagogyFeature } : {}),
+    },
+    modules,
+    items,
+    totals: totalsV3From({
+      moduleCount: modules.length,
+      chapterCount: chapterNumber,
+      contentCount: count('content'),
+      videoCount: count('video'),
+      examCount: count('exam'),
+      coursePlanCount: count('course_plan'),
+      courseIntroCount: count('course_intro'),
+      moduleIntroCount: count('module_intro'),
+      experienceCount: count('experience'),
+      presentationCount: count('presentation'),
+      videoInteractionsCount: count('video_interactions'),
+      activityCount: count('activity'),
+      audiobookChapterCount: count('audiobook_chapter'),
+      audioWelcomeCount: count('audio_welcome'),
+      finalExamCount: count('final_exam'),
+      totalJobs: items.length,
+      applicationActivityCount: count('application_activity'),
+      guidedPracticeCount: count('guided_practice'),
+    }),
+  };
+}
+
+/** Totales v3 en orden de claves canónico (sin scormCount). */
+function totalsV3From(t: ManifestTotals): ManifestTotals {
+  return {
+    moduleCount: t.moduleCount,
+    chapterCount: t.chapterCount,
+    contentCount: t.contentCount,
+    videoCount: t.videoCount,
+    examCount: t.examCount,
+    coursePlanCount: t.coursePlanCount,
+    courseIntroCount: t.courseIntroCount,
+    moduleIntroCount: t.moduleIntroCount,
+    experienceCount: t.experienceCount,
+    presentationCount: t.presentationCount,
+    videoInteractionsCount: t.videoInteractionsCount,
+    activityCount: t.activityCount,
+    audiobookChapterCount: t.audiobookChapterCount,
+    audioWelcomeCount: t.audioWelcomeCount,
+    finalExamCount: t.finalExamCount,
+    totalJobs: t.totalJobs,
+    // Fase 2: la clave existe SOLO con actividades (los Manifests sin ellas conservan su forma y su sha).
+    ...(t.applicationActivityCount ? { applicationActivityCount: t.applicationActivityCount } : {}),
+    // Loop 9 B: ídem con las prácticas guiadas.
+    ...(t.guidedPracticeCount ? { guidedPracticeCount: t.guidedPracticeCount } : {}),
+  };
+}
+
+/** Fase 2: claves opcionales de totals v3 (después de totalJobs; solo si son > 0). */
+export const MANIFEST_TOTALS_OPTIONAL_KEYS_V3: readonly (keyof ManifestTotals)[] = ['applicationActivityCount', 'guidedPracticeCount'];
+
+/** Claves exactas de totals en v3 (orden canónico). */
+export const MANIFEST_TOTALS_KEYS_V3: readonly (keyof ManifestTotals)[] = [
+  'moduleCount', 'chapterCount', 'contentCount', 'videoCount', 'examCount',
+  'coursePlanCount', 'courseIntroCount', 'moduleIntroCount',
+  'experienceCount', 'presentationCount', 'videoInteractionsCount', 'activityCount',
+  'audiobookChapterCount', 'audioWelcomeCount', 'finalExamCount', 'totalJobs',
+];
+
+/** Canonical v3: claves en orden fijo; `variant` solo si el item lo trae (el validador exige que solo `activity` lo tenga). */
+export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
+  const canonical = {
+    manifestSchemaVersion: m.manifestSchemaVersion,
+    rulesVersion: m.rulesVersion,
+    source: {
+      courseId: m.source.courseId,
+      blueprintId: m.source.blueprintId,
+      blueprintNumber: m.source.blueprintNumber,
+      blueprintSha256: m.source.blueprintSha256,
+    },
+    // EV5-C: activityTypeRules / h5pType solo si están presentes (sha legacy intacto).
+    features: {
+      finalExam: m.features?.finalExam,
+      activityEngine: m.features?.activityEngine,
+      ...(m.features?.activityTypeRules !== undefined ? { activityTypeRules: m.features.activityTypeRules } : {}),
+      ...(m.features?.ivAdvanced !== undefined ? { ivAdvanced: m.features.ivAdvanced } : {}),
+      ...(m.features?.pedagogy !== undefined ? { pedagogy: JSON.parse(sortedCanonicalJson(m.features.pedagogy)) } : {}),
+    },
+    modules: m.modules.map((mod) => ({
+      moduleId: mod.moduleId,
+      position: mod.position,
+      moduleNumber: mod.moduleNumber,
+      examEnabled: mod.examEnabled,
+      chapters: mod.chapters.map((c) => ({
+        chapterId: c.chapterId,
+        position: c.position,
+        chapterNumber: c.chapterNumber,
+        videoEnabled: c.videoEnabled,
+        activityEnabled: c.activityEnabled,
+        ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
+        ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
+        ...(c.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
+      })),
+    })),
+    items: m.items.map((i) => ({
+      key: i.key,
+      type: i.type,
+      scope: i.scope,
+      moduleId: i.moduleId,
+      chapterId: i.chapterId,
+      moduleNumber: i.moduleNumber,
+      chapterNumber: i.chapterNumber,
+      dependsOn: [...i.dependsOn],
+      ...(i.variant !== undefined ? { variant: i.variant } : {}),
+      ...(i.h5pType !== undefined ? { h5pType: i.h5pType } : {}),
+      // Motor pedagógico V1: claves del diseño ordenadas (independiente del orden de jsonb).
+      ...(i.design !== undefined ? { design: JSON.parse(sortedCanonicalJson(i.design)) } : {}),
+      ...(i.applicationMinutes !== undefined ? { applicationMinutes: i.applicationMinutes } : {}),
+      ...(i.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: i.guidedPracticeMinutes } : {}),
+    })),
+    // Se copian TODAS las claves que traiga (en orden v3 primero, luego
+    // cualquier extra como scormCount) para que el validador vea un totals
+    // adulterado en vez de que la canonicalización lo esconda.
+    totals: (() => {
+      const out: Record<string, unknown> = {};
+      for (const k of MANIFEST_TOTALS_KEYS_V3) out[k] = (m.totals as any)?.[k];
+      for (const k of Object.keys(m.totals ?? {}).sort()) if (!(k in out)) out[k] = (m.totals as any)[k];
+      return out;
+    })(),
+  };
+  return JSON.stringify(canonical);
+}
+
+interface ExpectedItemV3 {
+  key: string;
+  type: ManifestItemType;
+  scope: ManifestItemScope;
+  moduleId: string | null;
+  chapterId: string | null;
+  moduleNumber: number | null;
+  chapterNumber: number | null;
+  dependsOn: string[];
+  variant?: ActivityVariant;
+  /** Fase 2: solo en application_activity. */
+  applicationMinutes?: number;
+  /** Loop 9 B: solo en guided_practice. */
+  guidedPracticeMinutes?: number;
+}
+
+/**
+ * Validador v3 independiente: recalcula desde el snapshot v2 (NO llama al
+ * builder) el conjunto exacto de items, aristas, orden, variant y totales,
+ * y devuelve TODOS los errores. Códigos (además de los de v1/v2):
+ *  - BLUEPRINT_SCHEMA_MISMATCH: el snapshot no es schemaVersion 2.
+ *  - FEATURES_MISMATCH: `features` no refleja course.finalExam/activityEngine.
+ *  - ACTIVITY_NOT_ENABLED / FINAL_EXAM_NOT_ENABLED: item presente con el toggle OFF
+ *    (VIDEO_NOT_ENABLED también cubre video_interactions).
+ *  - WRONG_VARIANT: activity sin variant o distinto de course.activityEngine.
+ *  - UNEXPECTED_VARIANT: un item que no es activity trae `variant`.
+ *  - UNEXPECTED_ITEM: key de un tipo v3 válido que el snapshot no produce por otra razón.
+ *  - MISSING_<TYPE>: p. ej. MISSING_EXPERIENCE, MISSING_AUDIOBOOK_CHAPTER, MISSING_FINAL_EXAM.
+ * EV5-C (tipo de actividad por objetivo):
+ *  - FEATURES_MISMATCH también si `features.activityTypeRules` no es ausente o 1.
+ *  - MISSING_H5P_TYPE: marcador 1 y una activity h5p sin `h5pType`.
+ *  - WRONG_H5P_TYPE: marcador 1 y `h5pType` ≠ el recalculado (chooseActivityTypesV1).
+ *  - UNEXPECTED_H5P_TYPE: `h5pType` sin marcador, o en un item que no es activity h5p.
+ */
+export function validateGenerationManifestV3(
+  m: GenerationManifestV1,
+  snapshot: BlueprintSnapshotV2,
+  source: ManifestSource,
+): ManifestValidationError[] {
+  const errors: ManifestValidationError[] = [];
+  if (!snapshot || (snapshot as any).schemaVersion !== 2) {
+    return [{
+      code: BLUEPRINT_SCHEMA_MISMATCH,
+      message: `rulesVersion 3 requiere un Blueprint snapshot schemaVersion 2, recibido ${String((snapshot as any)?.schemaVersion)}`,
+    }];
+  }
+  if (m.rulesVersion !== 3) {
+    errors.push({ code: 'VERSION_MISMATCH', message: `rulesVersion esperado 3, encontrado ${m.rulesVersion}` });
+  }
+  if (m.manifestSchemaVersion !== 1) {
+    errors.push({ code: 'VERSION_MISMATCH', message: `manifestSchemaVersion esperado 1, encontrado ${m.manifestSchemaVersion}` });
+  }
+  if (
+    m.source?.courseId !== source.courseId ||
+    m.source?.blueprintId !== source.blueprintId ||
+    m.source?.blueprintNumber !== source.blueprintNumber ||
+    m.source?.blueprintSha256 !== source.blueprintSha256
+  ) {
+    errors.push({
+      code: 'SOURCE_MISMATCH',
+      message: 'source del manifest no coincide con el source esperado (courseId/blueprintId/blueprintNumber/blueprintSha256)',
+    });
+  }
+  const finalExam = snapshot.course.finalExam === true;
+  const engine = snapshot.course.activityEngine;
+  if (m.features?.finalExam !== finalExam || m.features?.activityEngine !== engine) {
+    errors.push({
+      code: 'FEATURES_MISMATCH',
+      message: `features esperado ${JSON.stringify({ finalExam, activityEngine: engine })}, encontrado ${JSON.stringify(m.features ?? null)}`,
+    });
+  }
+  const rulesMarker = (m.features as any)?.activityTypeRules;
+  if (rulesMarker !== undefined && rulesMarker !== 1 && rulesMarker !== 2) {
+    errors.push({
+      code: 'FEATURES_MISMATCH',
+      message: `features.activityTypeRules debe estar ausente o ser 1 o 2, encontrado ${JSON.stringify(rulesMarker)}`,
+    });
+  }
+  // EV6 H5P v2: ivAdvanced = 1 exactamente cuando activityTypeRules = 2.
+  const ivAdvanced = (m.features as any)?.ivAdvanced;
+  if ((rulesMarker === 2) !== (ivAdvanced === 1) || (ivAdvanced !== undefined && ivAdvanced !== 1)) {
+    errors.push({
+      code: 'FEATURES_MISMATCH',
+      message: `features.ivAdvanced debe ser 1 con activityTypeRules=2 y estar ausente si no (encontrado ${JSON.stringify(ivAdvanced ?? null)}, reglas ${JSON.stringify(rulesMarker ?? null)})`,
+    });
+  }
+  // Motor pedagógico V1: features.pedagogy refleja course.pedagogy del Blueprint (o falta en ambos).
+  const wantPedagogy = manifestFeaturesPedagogy(snapshot);
+  const gotPedagogy = (m.features as any)?.pedagogy;
+  if (sortedCanonicalJson(wantPedagogy ?? null) !== sortedCanonicalJson(gotPedagogy ?? null)) {
+    errors.push({
+      code: 'FEATURES_MISMATCH',
+      message: `features.pedagogy esperado ${JSON.stringify(wantPedagogy ?? null)}, encontrado ${JSON.stringify(gotPedagogy ?? null)}`,
+    });
+  }
+  // Recalculado desde el snapshot (módulo puro de reglas, no el builder). Con diseño pedagógico,
+  // el tipo lo decide el diseño (dentro de los tipos que admite activityTypeRules).
+  let expectedH5pTypes: Map<string, { type: string }> | null = null;
+  if (wantPedagogy) {
+    if (rulesMarker === undefined || rulesMarker === 1 || rulesMarker === 2) {
+      expectedH5pTypes = choosePedagogicalActivityTypes(snapshot, rulesMarker);
+    }
+  } else {
+    expectedH5pTypes = rulesMarker === 1 ? chooseActivityTypesV1(snapshot) : rulesMarker === 2 ? chooseActivityTypesV2(snapshot) : null;
+  }
+  const allowedH5p = wantPedagogy ? (allowedPedagogicalTypes(rulesMarker) as readonly string[]) : null;
+
+  // --- Recalcular lo esperado desde el snapshot ---
+  const planKey = `course_plan:${source.courseId}`;
+  const introKey = `course_intro:${source.courseId}`;
+  const expected: ExpectedItemV3[] = [];
+  const course = (type: ManifestItemType, dependsOn: string[]): ExpectedItemV3 => ({
+    key: `${type}:${source.courseId}`, type, scope: 'course',
+    moduleId: null, chapterId: null, moduleNumber: null, chapterNumber: null, dependsOn,
+  });
+  expected.push(course('course_plan', []));
+  expected.push(course('course_intro', [planKey]));
+  expected.push(course('audio_welcome', [introKey]));
+
+  const chapterInfo = new Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number; guidedPracticeMinutes?: number }>();
+  const moduleInfo = new Map<string, { examEnabled: boolean }>();
+  const expectedModules: ManifestModule[] = [];
+  const allContent: string[] = [];
+  const allExams: string[] = [];
+  let chNum = 0;
+  const mods = [...snapshot.modules].sort((a, b) => a.position - b.position);
+  mods.forEach((mod, idx) => {
+    const moduleNumber = idx + 1;
+    moduleInfo.set(mod.id, { examEnabled: !!mod.examEnabled });
+    expected.push({
+      key: `module_intro:${mod.id}`, type: 'module_intro', scope: 'module',
+      moduleId: mod.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [planKey],
+    });
+    const modContent: string[] = [];
+    const mirrorChapters: ManifestChapter[] = [];
+    const sortedCh = [...mod.chapters].sort((a, b) => a.position - b.position);
+    const modContentAll = sortedCh.filter((c) => chapterKindOf(c) === 'content').map((c) => `content:${c.id}`);
+    const modAppAll = sortedCh.filter((c) => isApplicationMinutes((c as { applicationMinutes?: unknown }).applicationMinutes)).map((c) => `application_activity:${c.id}`);
+    for (const c of sortedCh) {
+      chNum += 1;
+      const videoOn = !!c.videoEnabled;
+      const activityOn = c.activityEnabled === true;
+      const practice = chapterKindOf(c) === 'practice';
+      // Fase 2: minutos de la Actividad de Aplicación (un valor fuera de los niveles no produce item: lo marca el validador del Blueprint).
+      const appRaw = (c as { applicationMinutes?: unknown }).applicationMinutes;
+      const appMin = isApplicationMinutes(appRaw) ? appRaw : undefined;
+      // Loop 9 B: práctica guiada SOLO en capítulos de contenido (un valor inválido o en práctica no produce item).
+      const gpRaw = (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes;
+      const gpMin = !practice && isGuidedPracticeMinutes(gpRaw) ? gpRaw : undefined;
+      chapterInfo.set(c.id, { moduleId: mod.id, videoEnabled: videoOn, activityEnabled: activityOn, ...(appMin !== undefined ? { applicationMinutes: appMin } : {}), ...(gpMin !== undefined ? { guidedPracticeMinutes: gpMin } : {}) });
+      mirrorChapters.push({
+        chapterId: c.id, position: c.position, chapterNumber: chNum, videoEnabled: videoOn, activityEnabled: activityOn,
+        ...(practice ? { kind: 'practice' as const } : {}),
+        ...(appMin !== undefined ? { applicationMinutes: appMin } : {}),
+        ...(gpMin !== undefined ? { guidedPracticeMinutes: gpMin } : {}),
+      });
+      const ch = (type: ManifestItemType, dependsOn: string[], variant?: ActivityVariant): ExpectedItemV3 => ({
+        key: `${type}:${c.id}`, type, scope: 'chapter', moduleId: mod.id, chapterId: c.id,
+        moduleNumber, chapterNumber: chNum, dependsOn, ...(variant ? { variant } : {}),
+      });
+      if (practice) {
+        // Motor de carga horaria: capítulo de práctica = experience (+ activity) sobre los content del módulo.
+        expected.push(ch('experience', [...modContentAll]));
+        if (activityOn) expected.push(ch('activity', [...modContentAll], engine));
+        if (appMin !== undefined) expected.push({ ...ch('application_activity', [...modContentAll]), applicationMinutes: appMin });
+        continue;
+      }
+      const content = `content:${c.id}`;
+      modContent.push(content);
+      allContent.push(content);
+      for (const type of V3_CHAPTER_TYPES_IN_ORDER) {
+        if (type === 'content') expected.push(ch(type, [planKey]));
+        else if (type === 'video' || type === 'video_interactions') {
+          if (!videoOn) continue;
+          expected.push(ch(type, type === 'video' ? [content] : [`video:${c.id}`, content]));
+        } else if (type === 'activity') {
+          if (activityOn) expected.push(ch(type, [content], engine));
+        } else if (type === 'application_activity') {
+          if (appMin !== undefined) expected.push({ ...ch(type, [content]), applicationMinutes: appMin });
+        } else if (type === 'guided_practice') {
+          if (gpMin !== undefined) expected.push({ ...ch(type, [content, ...modAppAll]), guidedPracticeMinutes: gpMin });
+        } else expected.push(ch(type, [content]));
+      }
+    }
+    expectedModules.push({ moduleId: mod.id, position: mod.position, moduleNumber, examEnabled: !!mod.examEnabled, chapters: mirrorChapters });
+    if (mod.examEnabled) {
+      expected.push({
+        key: `exam:${mod.id}`, type: 'exam', scope: 'module',
+        moduleId: mod.id, chapterId: null, moduleNumber, chapterNumber: null, dependsOn: [...modContent],
+      });
+      allExams.push(`exam:${mod.id}`);
+    }
+  });
+  // Loop 9: el final depende de los content Y de los exam:<m> (en orden). Un Manifest guardado antes (solo los content)
+  // sigue siendo válido: sus runs en curso y su empaque no cambian (legacyFinalDeps).
+  if (finalExam) expected.push(course('final_exam', [...allContent, ...allExams]));
+  const legacyFinalDeps = [...allContent];
+  const expectedByKey = new Map(expected.map((e) => [e.key, e]));
+
+  // --- modules[] (espejo, con activityEnabled) ---
+  if (JSON.stringify(canonicalModules(m.modules ?? [])) !== JSON.stringify(canonicalModules(expectedModules))) {
+    errors.push({
+      code: 'MODULES_MISMATCH',
+      message: 'modules del manifest no coincide con el snapshot (ids/position/numeración/examEnabled/videoEnabled/activityEnabled u orden)',
+    });
+  }
+
+  // --- items ---
+  const keyCounts = new Map<string, number>();
+  for (const it of m.items) keyCounts.set(it.key, (keyCounts.get(it.key) ?? 0) + 1);
+  for (const [key, cnt] of keyCounts) {
+    if (cnt > 1) errors.push({ code: 'DUPLICATE_KEY', message: `key duplicada: ${key} (${cnt} veces)`, key });
+  }
+  const presentKeys = new Set(m.items.map((i) => i.key));
+
+  for (const it of m.items) {
+    const exp = expectedByKey.get(it.key);
+    if (!MANIFEST_ITEM_TYPES_V3.includes(it.type)) {
+      errors.push({ code: 'UNKNOWN_TYPE', message: `item ${it.key}: type desconocido en rulesVersion 3: ${String(it.type)}`, key: it.key });
+    } else if (!exp) {
+      errors.push(unexpectedItemError(it, source, chapterInfo, moduleInfo, finalExam));
+    } else {
+      if (it.type !== exp.type) {
+        errors.push({ code: 'KEY_MISMATCH', message: `item ${it.key}: type esperado ${exp.type}, encontrado ${it.type}`, key: it.key });
+      }
+      if (it.scope !== exp.scope) {
+        errors.push({ code: 'SCOPE_MISMATCH', message: `item ${it.key}: scope esperado '${exp.scope}', encontrado '${it.scope}'`, key: it.key });
+      }
+      if ((it.moduleId ?? null) !== exp.moduleId || (it.chapterId ?? null) !== exp.chapterId) {
+        errors.push({
+          code: 'CHAPTER_MODULE_MISMATCH',
+          message: `item ${it.key}: moduleId/chapterId esperados ${exp.moduleId}/${exp.chapterId}, encontrados ${it.moduleId}/${it.chapterId}`,
+          key: it.key,
+        });
+      }
+      if (it.moduleNumber !== exp.moduleNumber || it.chapterNumber !== exp.chapterNumber) {
+        errors.push({
+          code: 'NUMBERING_MISMATCH',
+          message: `item ${it.key}: moduleNumber/chapterNumber esperados ${exp.moduleNumber}/${exp.chapterNumber}, encontrados ${it.moduleNumber}/${it.chapterNumber}`,
+          key: it.key,
+        });
+      }
+      const deps = Array.isArray(it.dependsOn) ? it.dependsOn : [];
+      const sameDeps = (want: readonly string[]) => deps.length === want.length && deps.every((d, i) => d === want[i]);
+      if (!sameDeps(exp.dependsOn) && !(exp.type === 'final_exam' && sameDeps(legacyFinalDeps))) {
+        errors.push({
+          code: 'WRONG_DEPENDENCIES',
+          message: `item ${it.key}: dependsOn esperado ${JSON.stringify(exp.dependsOn)}, encontrado ${JSON.stringify(it.dependsOn)}`,
+          key: it.key,
+        });
+      }
+      // Motor pedagógico V1: `design` recalculado desde el Blueprint (o ausente sin pedagogía).
+      const wantDesign = wantPedagogy ? manifestItemDesign(snapshot, exp.type, exp.moduleId, exp.chapterId) : undefined;
+      const gotDesign = (it as any).design;
+      if (wantDesign === undefined && gotDesign !== undefined) {
+        errors.push({ code: 'UNEXPECTED_DESIGN', message: `item ${it.key}: trae design pero ${wantPedagogy ? 'su tipo no lleva diseño' : 'el Blueprint no tiene diseño pedagógico'}`, key: it.key });
+      } else if (wantDesign !== undefined && gotDesign === undefined) {
+        errors.push({ code: 'MISSING_DESIGN', message: `item ${it.key}: falta design (el Blueprint tiene diseño pedagógico)`, key: it.key });
+      } else if (wantDesign !== undefined && sortedCanonicalJson(wantDesign) !== sortedCanonicalJson(gotDesign)) {
+        errors.push({ code: 'WRONG_DESIGN', message: `item ${it.key}: design no coincide con el diseño pedagógico del Blueprint`, key: it.key });
+      }
+    }
+    if (it.type === 'activity') {
+      if (it.variant !== engine) {
+        errors.push({
+          code: 'WRONG_VARIANT',
+          message: `item ${it.key}: variant esperado '${engine}' (course.activityEngine), encontrado ${JSON.stringify(it.variant)}`,
+          key: it.key,
+        });
+      }
+    } else if (it.variant !== undefined) {
+      errors.push({ code: 'UNEXPECTED_VARIANT', message: `item ${it.key}: solo los items activity llevan variant`, key: it.key });
+    }
+    // Fase 2: applicationMinutes SOLO en application_activity y igual al del capítulo del Blueprint.
+    const gotApp = (it as any).applicationMinutes;
+    if (it.type === 'application_activity') {
+      const wantApp = exp?.applicationMinutes;
+      if (exp && gotApp !== wantApp) {
+        errors.push({ code: 'WRONG_APPLICATION_MINUTES', message: `item ${it.key}: applicationMinutes esperado ${JSON.stringify(wantApp ?? null)}, encontrado ${JSON.stringify(gotApp ?? null)}`, key: it.key });
+      }
+    } else if (gotApp !== undefined) {
+      errors.push({ code: 'UNEXPECTED_APPLICATION_MINUTES', message: `item ${it.key}: solo los items application_activity llevan applicationMinutes`, key: it.key });
+    }
+    // Loop 9 B: guidedPracticeMinutes SOLO en guided_practice y igual al del capítulo del Blueprint.
+    const gotGp = (it as any).guidedPracticeMinutes;
+    if (it.type === 'guided_practice') {
+      const wantGp = exp?.guidedPracticeMinutes;
+      if (exp && gotGp !== wantGp) {
+        errors.push({ code: 'WRONG_GUIDED_PRACTICE_MINUTES', message: `item ${it.key}: guidedPracticeMinutes esperado ${JSON.stringify(wantGp ?? null)}, encontrado ${JSON.stringify(gotGp ?? null)}`, key: it.key });
+      }
+    } else if (gotGp !== undefined) {
+      errors.push({ code: 'UNEXPECTED_GUIDED_PRACTICE_MINUTES', message: `item ${it.key}: solo los items guided_practice llevan guidedPracticeMinutes`, key: it.key });
+    }
+    const h5pType = (it as any).h5pType;
+    const isH5pActivity = it.type === 'activity' && it.variant === 'h5p';
+    if (allowedH5p && isH5pActivity && h5pType !== undefined && !allowedH5p.includes(h5pType)) {
+      errors.push({ code: 'WRONG_H5P_TYPE', message: `item ${it.key}: h5pType ${JSON.stringify(h5pType)} no admitido con activityTypeRules=${JSON.stringify(rulesMarker ?? null)}`, key: it.key });
+    }
+    if (expectedH5pTypes && isH5pActivity) {
+      const want = it.chapterId ? expectedH5pTypes.get(it.chapterId)?.type : undefined;
+      if (h5pType === undefined) {
+        errors.push({ code: 'MISSING_H5P_TYPE', message: `item ${it.key}: con activityTypeRules=${rulesMarker} la actividad h5p debe llevar h5pType (${JSON.stringify(want ?? null)})`, key: it.key });
+      } else if (h5pType !== want) {
+        errors.push({
+          code: 'WRONG_H5P_TYPE',
+          message: `item ${it.key}: h5pType esperado ${JSON.stringify(want ?? null)} (reglas por objetivo), encontrado ${JSON.stringify(h5pType)}`,
+          key: it.key,
+        });
+      }
+    } else if (h5pType !== undefined) {
+      errors.push({
+        code: 'UNEXPECTED_H5P_TYPE',
+        message: expectedH5pTypes
+          ? `item ${it.key}: solo las actividades h5p llevan h5pType`
+          : `item ${it.key}: h5pType sin features.activityTypeRules (Manifest legacy: el tipo sale del hash)`,
+        key: it.key,
+      });
+    }
+    for (const dep of Array.isArray(it.dependsOn) ? it.dependsOn : []) {
+      if (!presentKeys.has(dep)) {
+        errors.push({ code: 'DANGLING_DEPENDENCY', message: `item ${it.key} depende de una key inexistente: ${dep}`, key: it.key });
+      }
+    }
+  }
+
+  // --- faltantes ---
+  for (const e of expected) {
+    if (!presentKeys.has(e.key)) {
+      errors.push({ code: `MISSING_${e.type.toUpperCase()}`, message: `falta el item ${e.key}`, key: e.key });
+    }
+  }
+
+  // --- orden canónico (solo entre las keys esperadas presentes) ---
+  const rank = new Map(expected.map((e, i) => [e.key, i]));
+  const seen = m.items.map((i) => rank.get(i.key)).filter((r): r is number => r !== undefined);
+  if (seen.some((r, i) => i > 0 && r <= seen[i - 1])) {
+    errors.push({
+      code: 'ORDER_MISMATCH',
+      message: 'items no está en el orden canónico v3 (curso → por módulo: intro → capítulos → exam → final_exam)',
+    });
+  }
+
+  // --- totales (claves exactas v3) ---
+  const cnt = (t: ManifestItemType) => expected.filter((e) => e.type === t).length;
+  const expectedTotals = totalsV3From({
+    moduleCount: expectedModules.length,
+    chapterCount: chNum,
+    contentCount: cnt('content'),
+    videoCount: cnt('video'),
+    examCount: cnt('exam'),
+    coursePlanCount: cnt('course_plan'),
+    courseIntroCount: cnt('course_intro'),
+    moduleIntroCount: cnt('module_intro'),
+    experienceCount: cnt('experience'),
+    presentationCount: cnt('presentation'),
+    videoInteractionsCount: cnt('video_interactions'),
+    activityCount: cnt('activity'),
+    audiobookChapterCount: cnt('audiobook_chapter'),
+    audioWelcomeCount: cnt('audio_welcome'),
+    finalExamCount: cnt('final_exam'),
+    totalJobs: expected.length,
+    applicationActivityCount: cnt('application_activity'),
+    guidedPracticeCount: cnt('guided_practice'),
+  });
+  const totals: Record<string, unknown> = (m.totals as any) ?? {};
+  for (const k of [...MANIFEST_TOTALS_KEYS_V3, ...MANIFEST_TOTALS_OPTIONAL_KEYS_V3]) {
+    if (totals[k] !== (expectedTotals as any)[k]) {
+      errors.push({ code: 'TOTALS_MISMATCH', message: `totals.${k} esperado ${(expectedTotals as any)[k]}, encontrado ${totals[k]}` });
+    }
+  }
+  for (const k of Object.keys(totals)) {
+    if (!MANIFEST_TOTALS_KEYS_V3.includes(k as keyof ManifestTotals) && !MANIFEST_TOTALS_OPTIONAL_KEYS_V3.includes(k as keyof ManifestTotals) && totals[k] !== undefined) {
+      errors.push({ code: 'TOTALS_MISMATCH', message: `totals.${k} no existe en rulesVersion 3` });
+    }
+  }
+  if (m.items.length !== totals.totalJobs) {
+    errors.push({ code: 'TOTALS_MISMATCH', message: `totals.totalJobs (${totals.totalJobs}) no coincide con items.length (${m.items.length})` });
+  }
+  return errors;
+}
+
+function canonicalModules(mods: ManifestModule[]): unknown {
+  return mods.map((mm) => ({
+    moduleId: mm.moduleId,
+    position: mm.position,
+    moduleNumber: mm.moduleNumber,
+    examEnabled: mm.examEnabled,
+    chapters: (mm.chapters ?? []).map((c) => ({
+      chapterId: c.chapterId,
+      position: c.position,
+      chapterNumber: c.chapterNumber,
+      videoEnabled: c.videoEnabled,
+      activityEnabled: c.activityEnabled,
+      ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
+      ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
+      ...(c.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
+    })),
+  }));
+}
+
+/** Clasifica un item presente que el snapshot no produce (toggle OFF, entidad inexistente, key mal armada). */
+function unexpectedItemError(
+  it: ManifestItem,
+  source: ManifestSource,
+  chapterInfo: Map<string, { moduleId: string; videoEnabled: boolean; activityEnabled: boolean; applicationMinutes?: number; guidedPracticeMinutes?: number }>,
+  moduleInfo: Map<string, { examEnabled: boolean }>,
+  finalExam: boolean,
+): ManifestValidationError {
+  const scope = scopeOfItemType(it.type);
+  const entity = it.key.slice(it.key.indexOf(':') + 1);
+  const keyType = it.key.slice(0, Math.max(0, it.key.indexOf(':')));
+  if (keyType !== it.type) {
+    return { code: 'KEY_MISMATCH', message: `item ${it.key}: la key no corresponde a type=${it.type}`, key: it.key };
+  }
+  if (scope === 'course') {
+    if (it.type === 'final_exam' && entity === String(source.courseId) && !finalExam) {
+      return { code: 'FINAL_EXAM_NOT_ENABLED', message: `${it.key} existe pero course.finalExam=false`, key: it.key };
+    }
+    return { code: 'KEY_MISMATCH', message: `item ${it.key}: key esperada ${it.type}:${source.courseId}`, key: it.key };
+  }
+  if (scope === 'module') {
+    const mod = moduleInfo.get(entity);
+    if (!mod) return { code: 'UNKNOWN_MODULE', message: `${it.key} referencia un módulo inexistente en el snapshot`, key: it.key };
+    if (it.type === 'exam' && !mod.examEnabled) {
+      return { code: 'EXAM_NOT_ENABLED', message: `${it.key} existe pero el módulo tiene examEnabled=false`, key: it.key };
+    }
+    return { code: 'UNEXPECTED_ITEM', message: `${it.key} no corresponde al snapshot`, key: it.key };
+  }
+  const ch = chapterInfo.get(entity);
+  if (!ch) return { code: 'UNKNOWN_CHAPTER', message: `${it.key} referencia un capítulo inexistente en el snapshot`, key: it.key };
+  if ((it.type === 'video' || it.type === 'video_interactions') && !ch.videoEnabled) {
+    return { code: 'VIDEO_NOT_ENABLED', message: `${it.key} existe pero el capítulo tiene videoEnabled=false`, key: it.key };
+  }
+  if (it.type === 'activity' && !ch.activityEnabled) {
+    return { code: 'ACTIVITY_NOT_ENABLED', message: `${it.key} existe pero el capítulo tiene activityEnabled=false`, key: it.key };
+  }
+  if (it.type === 'application_activity' && ch.applicationMinutes === undefined) {
+    return { code: 'APPLICATION_NOT_ENABLED', message: `${it.key} existe pero el capítulo no tiene Actividad de Aplicación`, key: it.key };
+  }
+  if (it.type === 'guided_practice' && ch.guidedPracticeMinutes === undefined) {
+    return { code: 'GUIDED_PRACTICE_NOT_ENABLED', message: `${it.key} existe pero el capítulo no tiene práctica guiada (o es de práctica)`, key: it.key };
+  }
+  return { code: 'UNEXPECTED_ITEM', message: `${it.key} no corresponde al snapshot`, key: it.key };
+}

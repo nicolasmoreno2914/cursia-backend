@@ -14,6 +14,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  BadRequestException,
 } from '@nestjs/common';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
@@ -35,12 +36,13 @@ export class AdminDashboardController {
     @Query('from') fromStr?: string,
     @Query('to') toStr?: string,
   ) {
+    // FinOps P0: período [from, to) en UTC (instantes ISO 8601). Default: últimos 30 días.
     const now = new Date();
-    const defaultFrom = new Date(now);
-    defaultFrom.setDate(now.getDate() - 30);
-
-    const from = fromStr ? new Date(fromStr) : defaultFrom;
+    const from = fromStr ? new Date(fromStr) : new Date(now.getTime() - 30 * 24 * 3600 * 1000);
     const to   = toStr   ? new Date(toStr)   : now;
+    if (!Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime()) || from.getTime() > to.getTime()) {
+      throw new BadRequestException('from/to deben ser fechas ISO 8601 válidas y from ≤ to');
+    }
 
     return this.dashboardService.getSummary(from, to);
   }

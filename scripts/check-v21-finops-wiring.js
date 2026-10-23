@@ -1,0 +1,1477 @@
+#!/usr/bin/env node
+/* eslint-disable */
+// Cursia V2.1 — RF-b: cableado FinOps (proxy LLM → ingest, workers → ledger,
+// estimador + gates de presupuesto en runs.service, runtime guard).
+//
+// Parte pura (siempre; CI la corre con --pure-only):
+//   - items del estimador desde el Manifest (mock excluye items de worker),
+//     proveedores pagados reales, decisión de presupuesto (mock AUTO, pagado
+//     real → ADMIN_APPROVAL, BLOCK por política, LLM nunca BLOCK);
+//   - REUSE → incremental 0 (incrementalCostForPlan sobre el estimado);
+//   - rol/intento de un reenvío de Videogen, mensaje budget_exceeded, cuota YouTube;
+//   - ingest HTTP real (Nest + guard): env ausente → 503, token malo → 401,
+//     body con la forma del proxy → 200; campos del cliente como `amount` → 400.
+// Parte DB (default; PG16 desechable, puerto libre ≠ 5570, dir temporal que se
+// destruye): esquema real (legacy + Fases + v2 + invalidación + R3 + R4 +
+// FinOps por sus scripts de migración), RunsService / SchedulerService /
+// FinopsLedgerService / FinopsBudgetService / workers COMPILADOS con fakes de
+// Videogen, YouTube y proveedores (0 llamadas reales, 0 red).
+//
+// Usage: node scripts/check-v21-finops-wiring.js [--pure-only] [path/to/dist]
+
+const fs = require('fs');
+const os = require('os');
+const net = require('net');
+const path = require('path');
+const crypto = require('crypto');
+const { spawnSync } = require('child_process');
+
+const args = process.argv.slice(2);
+const PURE_ONLY = args.includes('--pure-only');
+const distArg = args.find((a) => !a.startsWith('--'));
+const REPO = path.resolve(__dirname, '..');
+const distRoot = path.resolve(process.cwd(), distArg || 'dist');
+
+function loadDist(rel) {
+  const abs = path.join(distRoot, rel);
+  try {
+    return require(abs);
+  } catch (err) {
+    console.error(`❌ No se pudo cargar el módulo compilado en ${abs}`);
+    console.error(`   (¿corriste "npm run build" antes? — dist/ no se versiona)`);
+    console.error(`   ${err.message}`);
+    process.exit(1);
+  }
+}
+
+require('reflect-metadata');
+const F = loadDist('modules/finops/index.js');
+const H = loadDist('workers/finops-worker-hooks.js');
+const VD = loadDist('workers/video-duration.js');
+
+let passes = 0;
+let failures = 0;
+async function check(name, fn) {
+  try {
+    await fn();
+    passes++;
+    console.log(`✅ ${name}`);
+  } catch (err) {
+    failures++;
+    console.error(`❌ ${name}`);
+    console.error(`   ${err && err.stack ? err.stack.split('\n').slice(0, 6).join('\n   ') : err}`);
+  }
+}
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+function eq(a, b, msg) {
+  const x = JSON.stringify(a);
+  const y = JSON.stringify(b);
+  if (x !== y) throw new Error(`${msg}: esperado ${y}, encontrado ${x}`);
+}
+async function rejectsRe(p, re, msg, status) {
+  let err = null;
+  try { await p; } catch (e) { err = e; }
+  assert(err, `${msg}: no lanzó`);
+  const text = err.message + ' ' + JSON.stringify(err.getResponse ? err.getResponse() : '');
+  assert(re.test(text), `${msg}: mensaje inesperado "${text}"`);
+  if (status !== undefined) assert(err.getStatus && err.getStatus() === status, `${msg}: status ${err.getStatus && err.getStatus()} (esperado ${status})`);
+  return err;
+}
+const dec = (x) => Number(x);
+const near = (a, b) => Math.abs(dec(a) - dec(b)) < 1e-9;
+
+// ════════════════════════════════════════════════════════════════════════════
+// Parte pura
+// ════════════════════════════════════════════════════════════════════════════
+const V3_ITEMS = [
+  { key: 'course_plan:c', type: 'course_plan', moduleId: null, chapterId: null },
+  { key: 'audio_welcome:c', type: 'audio_welcome', moduleId: null, chapterId: null },
+  { key: 'content:ch1', type: 'content', moduleId: 'm1', chapterId: 'ch1' },
+  { key: 'presentation:ch1', type: 'presentation', moduleId: 'm1', chapterId: 'ch1' },
+  { key: 'video:ch1', type: 'video', moduleId: 'm1', chapterId: 'ch1' },
+  { key: 'video_interactions:ch1', type: 'video_interactions', moduleId: 'm1', chapterId: 'ch1' },
+  { key: 'audiobook_chapter:ch1', type: 'audiobook_chapter', moduleId: 'm1', chapterId: 'ch1' },
+  { key: 'exam:m1', type: 'exam', moduleId: 'm1', chapterId: null },
+];
+
+function seedCatalog() {
+  const seed = JSON.parse(fs.readFileSync(path.join(REPO, 'src/modules/finops/pricing-seed.v1.json'), 'utf8'));
+  return seed.rows.map((r, i) => ({ id: `seed-${i}`, ...r }));
+}
+
+async function pureChecks() {
+  const catalog = seedCatalog();
+  const estimate = (items, rp) => F.estimateCost({ items, catalog, usageModel: F.usageModelPriorsV1(), retryPolicy: rp || { maxRetries: 1 } });
+
+  await check('puro (flujo normal): planNormalApproval — dentro de la política ⇒ monto = min(max, lo que queda de run/curso/mes); esperado sobre un límite ⇒ bloqueado nombrando el límite; sin política ⇒ bloqueado; límites por proveedor', () => {
+    const est = { totals: { min: '3', expected: '5', max: '13', byProvider: { gamma: { min: '1', expected: '2', max: '4' } }, byItemType: {} } };
+    const pol = (limits) => ({ limits, onExceed: 'ADMIN_APPROVAL', requireHumanApprovalForRealSpend: true });
+    let p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }), courseSpent: '0', monthSpent: '30.6' });
+    eq([p.withinPolicy, dec(p.amount), p.cappedByLimit, p.blockedBy], [true, 10, 'maxCostPerRun', []], 'acotado por maxCostPerRun');
+    eq(dec(p.limits.monthlyCap), 50, 'monthlyCapStaging se lee como límite mensual');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '100', maxCostPerCourse: '15', monthlyCap: '50' }), courseSpent: '8', monthSpent: '0' });
+    eq([p.withinPolicy, dec(p.amount), p.cappedByLimit], [true, 7, 'maxCostPerCourse'], 'lo que queda del curso');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '100', monthlyCap: '50' }), courseSpent: '0', monthSpent: '46' });
+    eq([p.withinPolicy, p.amount, p.blockedBy.map((b) => b.limit)], [false, null, ['monthlyCap']], 'mes agotado ⇒ bloqueado');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '4' }), courseSpent: '0', monthSpent: '0' });
+    eq([p.withinPolicy, p.blockedBy[0].limit, dec(p.blockedBy[0].limitValue)], [false, 'maxCostPerRun', 4], 'esperado > por run');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '1' } }), courseSpent: '0', monthSpent: '0' });
+    eq(p.blockedBy.map((b) => [b.limit, b.over]), [['maxCostPerProvider.gamma', 'expected']], 'por proveedor');
+    // Review I1: lo ya gastado en el proveedor cuenta, y el MÁXIMO del proveedor debe entrar (una autorización total no lo acota).
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '9' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
+    eq(p.blockedBy.map((b) => [b.limit, b.over, dec(b.spent)]), [['maxCostPerProvider.gamma', 'max', 6]], 'gastado + max > límite');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '10' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
+    eq(p.withinPolicy, true, 'gastado + max ≤ límite');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ monthlyCap: '50' }), courseSpent: '0', monthSpent: '50' });
+    eq([p.withinPolicy, p.blockedBy[0].limit], [false, 'monthlyCap'], 'mes justo agotado ⇒ bloqueado (nunca monto 0)');
+    const est0 = { totals: { min: '0', expected: '0', max: '1', byProvider: {}, byItemType: {} } };
+    p = F.planNormalApproval({ estimate: est0, policy: pol({ maxCostPerCourse: '5' }), courseSpent: '5', monthSpent: '0' });
+    eq([p.withinPolicy, p.blockedBy[0].limit, dec(p.blockedBy[0].limitValue)], [false, 'maxCostPerCourse', 5], 'remanente 0 ⇒ nombra el límite que lo acotó');
+    p = F.planNormalApproval({ estimate: est, policy: pol({}), courseSpent: '0', monthSpent: '0' });
+    eq([p.withinPolicy, dec(p.amount), p.cappedByLimit], [true, 13, null], 'sin límites ⇒ el max');
+    p = F.planNormalApproval({ estimate: est, policy: null, courseSpent: '0', monthSpent: '0' });
+    eq([p.withinPolicy, p.blockedBy.map((b) => b.limit)], [false, ['no_budget_policy']], 'sin política');
+  });
+
+  await check('puro (flujo normal): huella del estimado cambia con Manifest / totales / gasto / monto; categorías por proveedor; SuperAdmin solo por SUPER_ADMIN_EMAILS', () => {
+    const e = { estimatorVersion: 'e1', usageModelVersion: 'u1', pricingVersions: ['b', 'a'], totals: { min: '1', expected: '2', max: '3' } };
+    const base = { courseId: 1, manifestId: 10, manifestSha: 's', contextHash: 'h', modes: { video: 'mock' }, estimate: e, policyId: 'p', plan: { amount: '3', withinPolicy: true }, courseSpent: '0' };
+    const h = F.estimateFingerprint(base);
+    assert(/^[0-9a-f]{64}$/.test(h), 'sha256 hex');
+    eq(F.estimateFingerprint({ ...base, estimate: { ...e, pricingVersions: ['a', 'b'] } }), h, 'orden de versiones irrelevante');
+    for (const [k, v] of [['manifestId', 11], ['manifestSha', 't'], ['contextHash', 'x'], ['courseSpent', '1'], ['policyId', 'q'], ['plan', { amount: '2', withinPolicy: true }],
+      ['estimate', { ...e, totals: { ...e.totals, expected: '2.5' } }], ['modes', { video: 'real' }]]) {
+      assert(F.estimateFingerprint({ ...base, [k]: v }) !== h, `cambia con ${k}`);
+    }
+    const cats = F.estimateCategories({ anthropic: { min: '1', expected: '1', max: '1' }, gamma: { min: '2', expected: '2', max: '2' }, videogen: { min: '1', expected: '1', max: '1' },
+      youtube: { min: '0', expected: '0', max: '0' }, openai: { min: '0.5', expected: '0.5', max: '0.5' }, other: { min: '0.1', expected: '0.1', max: '0.1' } });
+    eq(Object.fromEntries(Object.entries(cats).map(([k, v]) => [k, dec(v.expected)])), { content: 1, presentations: 2, videos: 1, audio: 0.5, other: 0.1 }, 'categorías');
+    const sa = loadDist('auth/super-admin.js');
+    eq([sa.isSuperAdminEmail('A@x.com', { SUPER_ADMIN_EMAILS: ' a@x.com , b@y.com' }), sa.isSuperAdminEmail('c@x.com', { SUPER_ADMIN_EMAILS: 'a@x.com' }),
+      sa.isSuperAdminEmail('a@x.com', {}), sa.isSuperAdminEmail('', { SUPER_ADMIN_EMAILS: 'a@x.com' })], [true, false, false, false], 'SuperAdmin');
+  });
+
+  await check('puro: items del estimador — mock excluye items de worker pagado; real los incluye; acciones del plan respetadas', () => {
+    const mock = F.estimateItemsForRun(V3_ITEMS, 'mock');
+    eq(mock.map((x) => x.itemKey), ['course_plan:c', 'content:ch1', 'video_interactions:ch1', 'exam:m1'], 'mock');
+    const real = F.estimateItemsForRun(V3_ITEMS, 'real', { 'video:ch1': 'REUSE' });
+    eq(real.length, V3_ITEMS.length, 'real');
+    eq(real.find((x) => x.itemKey === 'video:ch1').action, 'REUSE', 'acción');
+    eq(real.find((x) => x.itemKey === 'content:ch1').action, 'GENERATE', 'default');
+    eq(F.paidRealProviders(real, 'real'), ['gamma', 'openai'], 'video REUSE no es gasto');
+    eq(F.paidRealProviders(F.estimateItemsForRun(V3_ITEMS, 'real'), 'real'), ['gamma', 'openai', 'videogen'], 'todos');
+    eq(F.paidRealProviders(F.estimateItemsForRun(V3_ITEMS, 'real'), 'mock'), [], 'mock nunca paga');
+  });
+
+  await check('puro (merge R5): modos de gasto POR proveedor — video mock + providerModes real ⇒ Gamma/TTS se estiman y exigen aprobación; providerModes ausentes ⇒ real (fail safe)', () => {
+    const modes = F.runSpendModes('mock', { presentation: 'real', audio: 'real' });
+    eq(modes, { video: 'mock', presentation: 'real', audio: 'real' }, 'modos');
+    const items = F.estimateItemsForRun(V3_ITEMS, modes);
+    assert(!items.some((x) => x.itemType === 'video') && items.some((x) => x.itemType === 'presentation'), 'video excluido, Gamma incluido');
+    eq(F.paidRealProviders(items, modes), ['gamma', 'openai'], 'proveedores reales');
+    eq(F.runSpendModes('real', null), { video: 'real', presentation: 'real', audio: 'real' }, 'sin providerModes → real');
+    eq(F.paidRealProviders(F.estimateItemsForRun(V3_ITEMS, F.runSpendModes('mock', { presentation: 'mock', audio: 'mock' })), F.runSpendModes('mock', { presentation: 'mock', audio: 'mock' })), [], 'todo mock');
+  });
+
+  await check('puro: decisión — mock/solo-LLM sin política → AUTO; pagado real → ADMIN_APPROVAL aunque la política lo permita; BLOCK por política; LLM sobre maxCostPerRun → ADMIN_APPROVAL (nunca BLOCK)', () => {
+    const estMock = estimate(F.estimateItemsForRun(V3_ITEMS, 'mock'));
+    const estReal = estimate(F.estimateItemsForRun(V3_ITEMS, 'real'));
+    eq(F.decideRunBudget({ estimate: estMock, policy: null, paidRealProviders: [] }).decision, 'AUTO_WITHIN_POLICY', 'mock sin política');
+    const lax = { limits: { maxCostPerRun: '1000' }, requireHumanApprovalForRealSpend: false, onExceed: 'BLOCK' };
+    const r1 = F.decideRunBudget({ estimate: estReal, policy: lax, paidRealProviders: ['videogen'] });
+    eq(r1.decision, 'ADMIN_APPROVAL', 'pagado real con política laxa');
+    assert(r1.reasons.some((r) => r.startsWith('paid_real_provider_requires_admin_approval')), 'razón');
+    eq(F.decideRunBudget({ estimate: estReal, policy: null, paidRealProviders: ['videogen'] }).decision, 'ADMIN_APPROVAL', 'sin política');
+    const tight = { limits: { maxCostPerRun: '0.000001' }, onExceed: 'BLOCK' };
+    eq(F.decideRunBudget({ estimate: estReal, policy: tight, paidRealProviders: ['videogen'] }).decision, 'BLOCK', 'pagado real sobre el límite → BLOCK');
+    const llm = F.decideRunBudget({ estimate: estMock, policy: tight, paidRealProviders: [] });
+    eq(llm.decision, 'ADMIN_APPROVAL', 'solo LLM sobre maxCostPerRun');
+    assert(llm.reasons.includes('llm_only_block_downgraded_to_admin_approval'), 'razón LLM');
+    eq(F.decideRunBudget({ estimate: estMock, policy: lax, paidRealProviders: [] }).decision, 'AUTO_WITHIN_POLICY', 'LLM dentro de la política');
+    assert(F.approvalCovers('1000', estReal) && !F.approvalCovers('0.0001', estReal), 'approvalCovers');
+  });
+
+  await check('puro: REUSE → incremental 0 (evitado = estimado vigente sin historia; historical actual con historia); GENERATE → incremental = wouldCost', () => {
+    const est = estimate(F.estimateItemsForRun(V3_ITEMS, 'real', { 'content:ch1': 'REUSE', 'video:ch1': 'REUSE', 'exam:m1': 'REGENERATE' }));
+    eq([est.totals.byItemType.content, est.totals.byItemType.video].map((x) => x.expected), [F.normalizeDecimal(0), F.normalizeDecimal(0)], 'estimado: REUSE suma 0');
+    const hist = { 'ir-video': [{ id: 'e1', event_kind: 'CHARGE', amount: '0.9700000000' }, { id: 'e2', event_kind: 'ADJUSTMENT', amount: '0.0300000000' }] };
+    const r = F.incrementalCostForPlan([
+      { itemKey: 'content:ch1', action: 'REUSE', fromItemRunId: 'ir-content' },
+      { itemKey: 'video:ch1', action: 'REUSE', fromItemRunId: 'ir-video' },
+      { itemKey: 'exam:m1', action: 'REGENERATE' },
+    ], est.lines, hist);
+    const by = Object.fromEntries(r.actions.map((a) => [a.itemKey, a]));
+    eq(by['content:ch1'].incremental.expected, F.normalizeDecimal(0), 'REUSE content incremental');
+    eq(by['video:ch1'].incremental.expected, F.normalizeDecimal(0), 'REUSE video incremental');
+    eq([by['video:ch1'].basis, by['video:ch1'].avoided], ['historical_actual', F.normalizeDecimal('1')], 'evitado histórico (CHARGE + ADJUSTMENT)');
+    eq(by['content:ch1'].basis, 'current_estimate', 'sin historia → estimado vigente');
+    assert(dec(by['exam:m1'].incremental.expected) > 0, 'REGENERATE cuesta');
+    eq(r.totals.incremental.expected, by['exam:m1'].incremental.expected, 'total incremental = solo el REGENERATE');
+  });
+
+  await check('puro: reenvío de Videogen = retry pagado (provider_retry, attempt = reenvíos + 1); mensaje budget_exceeded; cuota de YouTube configurable (default 1600, sin verificar)', () => {
+    eq(H.videogenCallRoleOf({}), { callRole: 'main', attempt: 1 }, 'primer job');
+    eq(H.videogenCallRoleOf({ previousExternals: [{}, {}] }), { callRole: 'provider_retry', attempt: 3 }, 'dos reenvíos');
+    const m = H.budgetExceededMessage({ reason: 'budget_exceeded', committed: '2', authorizedBudget: '1' });
+    assert(m.startsWith('budget_exceeded:') && /sin gasto/.test(m), 'prefijo estable');
+    eq(H.youtubeInsertQuotaUnits({}), 1600, 'default');
+    eq(H.youtubeInsertQuotaUnits({ YOUTUBE_QUOTA_VIDEOS_INSERT_UNITS: '100' }), 100, 'override');
+    let threw = false;
+    try { H.youtubeInsertQuotaUnits({ YOUTUBE_QUOTA_VIDEOS_INSERT_UNITS: 'x' }); } catch { threw = true; }
+    assert(threw, 'valor inválido → error');
+  });
+
+  await check('puro: ingest HTTP real (Nest + FinopsIngestTokenGuard): env ausente → 503; token malo → 401; body del proxy → 200 (subject del JWT, nunca montos); campo de cliente → 400', async () => {
+    const { NestFactory } = require('@nestjs/core');
+    const { Module, Logger } = require('@nestjs/common');
+    Logger.overrideLogger(false);
+    const { FinopsIngestController } = loadDist('modules/finops/finops.controller.js');
+    const calls = [];
+    const fakeLedger = {
+      async recordCharge(input) {
+        calls.push(input);
+        return { inserted: true, event: { id: 'ev-1', idempotency_key: 'anthropic:msg:' + input.externalOperationId, item_run_id: null, amount: '0.0100000000', currency: 'USD' } };
+      },
+    };
+    class IngestTestModule {}
+    Module({ controllers: [FinopsIngestController], providers: [{ provide: F.FinopsLedgerService, useValue: fakeLedger }, F.FinopsIngestTokenGuard] })(IngestTestModule);
+    const app = await NestFactory.create(IngestTestModule, { logger: false });
+    app.setGlobalPrefix('api/v1');
+    await app.listen(0, '127.0.0.1');
+    const url = `http://127.0.0.1:${app.getHttpServer().address().port}/api/v1/finops/ingest/llm-usage`;
+    const saved = process.env.FINOPS_INGEST_TOKEN;
+    const post = (token, body) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', ...(token ? { 'x-cursia-finops-token': token } : {}) }, body: JSON.stringify(body) });
+    // Forma EXACTA que postea functions/api/proxy.js (frontend).
+    const proxyBody = {
+      subject: '11111111-2222-4333-8444-555555555555', itemRunId: '00000000-0000-4000-8000-00000000abcd', callRole: 'main', attempt: 1,
+      model: 'claude-sonnet-4-6', messageId: 'msg_http_1', requestId: 'req_1',
+      usage: { input_tokens: 10, output_tokens: 20, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, billingAccount: 'user_key',
+    };
+    try {
+      delete process.env.FINOPS_INGEST_TOKEN;
+      eq((await post('x', proxyBody)).status, 503, 'env ausente');
+      process.env.FINOPS_INGEST_TOKEN = 'secreto-correcto';
+      eq((await post('secreto-malo', proxyBody)).status, 401, 'token malo');
+      eq((await post(null, proxyBody)).status, 401, 'sin token');
+      const ok = await post('secreto-correcto', proxyBody);
+      eq(ok.status, 200, 'token correcto');
+      eq(calls.length, 1, 'un recordCharge');
+      eq([calls[0].ownerIdFromAuth, calls[0].itemRunId, calls[0].billingAccount, calls[0].recordedBy], [proxyBody.subject, proxyBody.itemRunId, 'user_key', 'llm-proxy'], 'traducción');
+      eq((await post('secreto-correcto', { ...proxyBody, amount: 999 })).status, 400, 'monto del cliente');
+      eq((await post('secreto-correcto', { ...proxyBody, courseId: 7 })).status, 400, 'atribución del cliente');
+      eq(calls.length, 1, 'rechazos sin cargo');
+    } finally {
+      if (saved === undefined) delete process.env.FINOPS_INGEST_TOKEN; else process.env.FINOPS_INGEST_TOKEN = saved;
+      await app.close();
+    }
+  });
+
+  await check('puro: duración de video (R11a) — mvhd v0/v1 (caja largesize, free antes de moov), truncado/sin mvhd → null; ISO 8601; prioridad Videogen > mvhd > YouTube > unknown; VideogenService pasa duration_seconds', () => {
+    const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n >>> 0); return b; };
+    const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; };
+    const box = (type, payload) => Buffer.concat([u32(8 + payload.length), Buffer.from(type, 'latin1'), payload]);
+    const bigBox = (type, payload) => Buffer.concat([u32(1), Buffer.from(type, 'latin1'), u64(16 + payload.length), payload]);
+    const mvhd0 = (ts, dur) => box('mvhd', Buffer.concat([Buffer.from([0, 0, 0, 0]), u32(0), u32(0), u32(ts), u32(dur), Buffer.alloc(80)]));
+    const mvhd1 = (ts, dur) => box('mvhd', Buffer.concat([Buffer.from([1, 0, 0, 0]), u64(0), u64(0), u32(ts), u64(dur), Buffer.alloc(80)]));
+    const ftyp = box('ftyp', Buffer.from('isom\0\0\0\0isommp41', 'latin1'));
+    const mp4v0 = Buffer.concat([ftyp, box('moov', Buffer.concat([mvhd0(1000, 468000), box('trak', Buffer.alloc(16))])), box('mdat', Buffer.alloc(32))]);
+    eq(VD.parseMp4DurationSec(new Uint8Array(mp4v0)), 468, 'v0');
+    const mp4v1 = Buffer.concat([ftyp, box('free', Buffer.alloc(10)), bigBox('moov', mvhd1(90000, 468 * 90000 + 30000))]);
+    eq(VD.parseMp4DurationSec(new Uint8Array(mp4v1)), 468, 'v1 + largesize + free (redondeo)');
+    eq(VD.parseMp4DurationSec(new Uint8Array(Buffer.concat([ftyp, box('mdat', Buffer.alloc(8))]))), null, 'sin moov');
+    eq(VD.parseMp4DurationSec(new Uint8Array(Buffer.concat([ftyp, box('moov', box('trak', Buffer.alloc(4)))]))), null, 'sin mvhd');
+    eq(VD.parseMp4DurationSec(new Uint8Array(mp4v0.subarray(0, mp4v0.length - 60))), null, 'truncado');
+    eq(VD.parseMp4DurationSec(new Uint8Array(Buffer.concat([ftyp, box('moov', mvhd0(0, 5))]))), null, 'timescale 0');
+    eq([VD.parseIso8601DurationSec('PT7M48S'), VD.parseIso8601DurationSec('PT1H'), VD.parseIso8601DurationSec('P0DT0H0M5S'), VD.parseIso8601DurationSec('PT'), VD.parseIso8601DurationSec('7:48')],
+      [468, 3600, 5, null, null], 'ISO 8601');
+    eq(VD.resolveVideoDuration({ videogenStatus: { duration_seconds: 468.4 }, mp4Bytes: new Uint8Array(mp4v1), youtubeContentDetailsDuration: 'PT1M' }), { durationSec: 468, durationSource: 'videogen_status' }, 'prioridad 1');
+    eq(VD.resolveVideoDuration({ videogenStatus: { status: 'completed' }, mp4Bytes: new Uint8Array(mp4v0), youtubeContentDetailsDuration: 'PT1M' }), { durationSec: 468, durationSource: 'mp4_mvhd' }, 'prioridad 2');
+    eq(VD.resolveVideoDuration({ videogenStatus: {}, youtubeContentDetailsDuration: 'PT7M48S' }), { durationSec: 468, durationSource: 'youtube_content_details' }, 'prioridad 3');
+    eq(VD.resolveVideoDuration({ videogenStatus: { duration: 0 } }), { durationSec: null, durationSource: 'unknown' }, 'ninguna');
+    eq(VD.MOCK_VIDEO_DURATION_SEC, 468, 'fixture IdwOipZAeqY');
+    const { VideogenService } = loadDist('video-engine/videogen.service.js');
+    const svc = new VideogenService();
+    eq(svc.parseJobs([{ job_id: 'j', status: 'completed', duration_seconds: 468 }, { job_id: 'k', status: 'completed' }]).map((j) => j.duration_seconds), [468, null], 'parseJobs');
+  });
+
+  // Copia EXACTA de PRICED_MODELS de functions/api/proxy.js (frontend). Si cambia allá, cambia acá.
+  const PROXY_PRICED_MODELS = [
+    'claude-haiku-4-5', 'claude-haiku-4-5-20251001', 'claude-opus-4-8', 'claude-opus-5',
+    'claude-sonnet-4-20250514', 'claude-sonnet-4-5', 'claude-sonnet-4-6', 'claude-sonnet-5',
+  ];
+  await check('puro (fix C1): el seed precia EXACTAMENTE la allowlist del proxy (incl. Haiku 4.5 y Sonnet 4 fechados del selector); un id desconocido → PRICING_MISSING', () => {
+    const seedModels = [...new Set(catalog.filter((r) => r.provider === 'anthropic').map((r) => r.product_or_model))].sort();
+    eq(seedModels, [...PROXY_PRICED_MODELS].sort(), 'seed anthropic == allowlist del proxy');
+    const usage = { input_tokens: 1000, output_tokens: 1000, cache_write_tokens: 100, cache_read_tokens: 100 };
+    for (const model of PROXY_PRICED_MODELS) {
+      const r = F.priceUsage(usage, catalog, { provider: 'anthropic', service: 'messages', product: model });
+      assert(dec(r.amount) > 0, `${model} sin precio`);
+    }
+    const haiku = F.priceUsage({ input_tokens: 1e6, output_tokens: 1e6 }, catalog, { provider: 'anthropic', service: 'messages', product: 'claude-haiku-4-5-20251001' });
+    const sonnet4 = F.priceUsage({ input_tokens: 1e6, output_tokens: 1e6 }, catalog, { provider: 'anthropic', service: 'messages', product: 'claude-sonnet-4-20250514' });
+    eq([dec(haiku.amount), dec(sonnet4.amount)], [6, 18], 'precios públicos (1/5 y 3/15 por 1M)');
+    assert(catalog.filter((r) => ['claude-haiku-4-5-20251001', 'claude-sonnet-4-20250514'].includes(r.product_or_model)).every((r) => r.verified === false), 'marcados verified:false');
+    let code = null;
+    try { F.priceUsage(usage, catalog, { provider: 'anthropic', service: 'messages', product: 'claude-unknown-9' }); } catch (e) { code = e.code; }
+    eq(code, 'PRICING_MISSING', 'id desconocido');
+  });
+
+  await check('puro (fix I3): duración de Videogen solo con unidad explícita y en 5..7200 s — segundos OK, ms convertidos, `duration` sin unidad / fuera de rango / basura → null', () => {
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 468 }), 468, 'segundos');
+    eq(VD.durationFromVideogenStatus({ duration_sec: '468.4' }), 468, 'segundos (string)');
+    eq(VD.durationFromVideogenStatus({ duration_ms: 468000 }), 468, 'ms → s');
+    eq(VD.durationFromVideogenStatus({ durationMs: 468000 }), 468, 'ms camelCase');
+    eq(VD.durationFromVideogenStatus({ duration: 468000 }), null, '`duration` sin unidad');
+    eq(VD.durationFromVideogenStatus({ duration: 468 }), null, '`duration` sin unidad (aunque parezca s)');
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 468000 }), null, 'segundos fuera de rango (eran ms)');
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 3 }), null, '< 5 s');
+    eq(VD.durationFromVideogenStatus({ duration_seconds: 'abc' }), null, 'basura');
+    eq(VD.durationFromVideogenStatus({ duration_ms: 468 }), null, 'ms fuera de rango (0.5 s)');
+    eq(VD.resolveVideoDuration({ videogenStatus: { duration: 468000 } }), { durationSec: null, durationSource: 'unknown' }, 'resolve → unknown');
+    eq(VD.parseIso8601DurationSec('PT10H'), null, 'ISO fuera de rango');
+    const { VideogenService } = loadDist('video-engine/videogen.service.js');
+    const svc = new VideogenService();
+    eq(svc.parseJobs([{ job_id: 'a', duration: 468 }, { job_id: 'b', duration_ms: 468000 }, { job_id: 'c', duration_seconds: 468 }]).map((j) => j.duration_seconds), [null, 468, 468], 'parseJobs');
+  });
+
+  await check('puro: cableado — deploy/PM2 del worker de proveedores, migración FinOps en deploy-staging y run-e2e.sh, CI corre este check', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'));
+    eq(pkg.scripts['start:dynamic-provider-worker'], 'node dist/workers/dynamic-provider-worker.js', 'npm script');
+    const yml = fs.readFileSync(path.join(REPO, '.github/workflows/deploy-staging.yml'), 'utf8');
+    // R16 (#1): en staging el worker corre con node directo + kill_timeout (drenado ordenado).
+    assert(yml.includes('ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js'), 'staging PM2');
+    // r61: producción arranca el worker con drenado desde scripts/ops/prod-release.sh (lo invoca deploy.yml).
+    assert(fs.readFileSync(path.join(REPO, 'scripts/ops/prod-release.sh'), 'utf8').includes('"cursia-dynamic-provider-worker dist/workers/dynamic-provider-worker.js"'), 'prod PM2');
+    assert(fs.readFileSync(path.join(REPO, '.github/workflows/deploy.yml'), 'utf8').includes('bash scripts/ops/prod-release.sh install'), 'prod deploy.yml → prod-release.sh');
+    const iMig = yml.indexOf('MIGRATION_ENV=staging node scripts/migrate-v21-finops.js');
+    const iVer = yml.indexOf('MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js');
+    assert(iMig > 0 && iVer > iMig, 'deploy-staging: migrate + verify FinOps');
+    const iItemWorker = yml.indexOf('ensure_pm2_drain_worker cursia-dynamic-item-worker-staging');
+    assert(iItemWorker > 0 && iMig < iItemWorker, 'la migración corre antes de recargar los workers');
+    assert(yml.includes('node scripts/check-v21-finops-wiring.js --pure-only'), 'CI');
+    const iRls = yml.indexOf('MIGRATION_ENV=staging node scripts/migrate-v21-finops-rls.js');
+    const iRlsV = yml.indexOf('MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js');
+    assert(iRls > iVer && iRlsV > iRls, 'deploy-staging: RLS después del ledger (fix C2)');
+    const setup = fs.readFileSync(path.join(REPO, 'test/e2e-v2/setup-schema.js'), 'utf8');
+    assert(setup.indexOf('supabase-migration-v21-finops-rls.sql') > setup.indexOf("'supabase-migration-v21-finops.sql'"), 'E2E setup-schema aplica la RLS');
+    const sh = fs.readFileSync(path.join(REPO, 'test/e2e-v2/run-e2e.sh'), 'utf8');
+    assert(sh.indexOf('migrate-v21-finops.js') > sh.indexOf('migrate-v21-manifest-v3.js'), 'run-e2e.sh siembra precios');
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Parte DB: Postgres 16 desechable
+// ════════════════════════════════════════════════════════════════════════════
+function findPgBin() {
+  const cands = [process.env.PG_BIN, '/opt/homebrew/opt/postgresql@16/bin', '/opt/homebrew/bin', '/usr/lib/postgresql/16/bin'].filter(Boolean);
+  for (const d of cands) {
+    const pg = path.join(d, 'postgres');
+    if (!fs.existsSync(pg)) continue;
+    const v = spawnSync(pg, ['--version'], { encoding: 'utf8' }).stdout || '';
+    if (/\b16\./.test(v)) return d;
+  }
+  throw new Error('No encontré Postgres 16 (setear PG_BIN)');
+}
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => (port === 5570 ? freePort().then(resolve, reject) : resolve(port)));
+    });
+  });
+}
+function cleanEnv(extra) {
+  const env = { PATH: process.env.PATH, HOME: process.env.HOME, LANG: 'C', LC_ALL: 'C' };
+  for (const [k, v] of Object.entries(extra || {})) if (v !== undefined && v !== null) env[k] = String(v);
+  return env;
+}
+
+const OWNER = '11111111-2222-4333-8444-555555555555';
+const ATTACKER = '99999999-8888-4777-8666-555555555555';
+const CONTEXT = { nombre: 'Curso RF-b', sector: 'Salud', pais: 'Chile', contexto: 'x', nivel: 'Básico', tono: 'Formal' };
+// Run MOCK completo: video mock + providerModes mock (R5: el default de Gamma/TTS es real).
+const MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } };
+const ENV_KEYS = [
+  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
+  'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'VIDEOGEN_API_KEY', 'ALLOW_UNOWNED_COURSES', 'FINOPS_INGEST_TOKEN',
+  'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS', 'DYNAMIC_ALLOW_VIDEO_PREVIEW',
+];
+// EV6 DoD (BE-A): la recuperación PAGA de un video (reenvío / render nuevo) es de SUPER_ADMIN.
+const RECOVERY_ADMIN = { email: 'admin@cursia.test' };
+
+async function dbChecks() {
+  const { Client } = require('pg');
+  const { DataSource } = require('typeorm');
+  const { NestFactory } = require('@nestjs/core');
+  const { Module, Logger } = require('@nestjs/common');
+  Logger.overrideLogger(false);
+  const snap = loadDist('modules/course-blueprints/blueprint-snapshot.js');
+  const { CourseBlueprintsService } = loadDist('modules/course-blueprints/course-blueprints.service.js');
+  const { GenerationManifestsService } = loadDist('modules/generation-manifests/generation-manifests.service.js');
+  const { RunsService } = loadDist('modules/dynamic-generation/runs.service.js');
+  const { SchedulerService } = loadDist('modules/dynamic-generation/scheduler.service.js');
+  const { FinopsIngestController, FinopsAdminController, FinopsLlmReservationController } = loadDist('modules/finops/finops.controller.js');
+  const itemWorker = loadDist('workers/dynamic-item-worker.js');
+  const providerWorker = loadDist('workers/dynamic-provider-worker.js');
+
+  const pgBin = findPgBin();
+  const port = await freePort();
+  assert(port !== 5570, 'puerto 5570 prohibido');
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursia-v21-rfb-pg16-'));
+  const tmpCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'cursia-v21-rfb-cwd-'));
+  const ROLE = 'postgres.rfblocaltest01';
+  const DB = 'rfbdb';
+  let started = false;
+  const pg = (bin, a) => spawnSync(path.join(pgBin, bin), a, { env: cleanEnv(), encoding: 'utf8' });
+  const saved = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+  let ds = null;
+  let app = null;
+  try {
+    let r = pg('initdb', ['-D', dataDir, '-U', 'postgres', '--auth=trust', '-E', 'UTF8', '--locale=C']);
+    if (r.status !== 0) throw new Error('initdb falló: ' + r.stderr);
+    r = pg('pg_ctl', ['-D', dataDir, '-l', path.join(dataDir, 'server.log'), '-w', '-o', `-p ${port} -k ${dataDir} -c listen_addresses=127.0.0.1`, 'start']);
+    if (r.status !== 0) throw new Error('pg_ctl start falló: ' + r.stderr + r.stdout);
+    started = true;
+    console.log(`\nPostgres ${pgBin} en 127.0.0.1:${port} (data ${dataDir})`);
+
+    const withClient = async (db, fn) => {
+      const c = new Client({ host: '127.0.0.1', port, user: 'postgres', database: db });
+      await c.connect();
+      try { return await fn(c); } finally { await c.end(); }
+    };
+    await withClient('postgres', async (c) => {
+      await c.query(`create database ${DB}`);
+      await c.query(`create role "${ROLE}" superuser login`);
+    });
+    const localEnv = (extra) => ({ DB_HOST: '127.0.0.1', DB_PORT: port, DB_USER: ROLE, DB_PASS: 'x', DB_NAME: DB, DB_SSL: 'false', ...extra });
+    const runScript = (script, env) => {
+      const res = spawnSync(process.execPath, [path.join(REPO, script)], { cwd: tmpCwd, env: cleanEnv(env), encoding: 'utf8', timeout: 120000 });
+      return { code: res.status, out: (res.stdout || '') + (res.stderr || '') };
+    };
+    // Esquema real de staging: baseline legacy + Fases 1..5 + v2 + invalidación + R3 + R4 + FinOps.
+    await withClient(DB, async (c) => {
+      for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql',
+        'supabase-migration-course-blueprints.sql', 'supabase-migration-generation-manifests.sql']) {
+        await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
+      }
+    });
+    for (const s of ['scripts/migrate-production-jobs-constraints.js']) {
+      const res = runScript(s, localEnv({}));
+      assert(res.code === 0, `${s}: exit ${res.code}\n${res.out}`);
+    }
+    await withClient(DB, async (c) => {
+      for (const f of ['supabase-migration-dynamic-generation.sql', 'supabase-migration-v21-blueprint-profiles.sql']) {
+        await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
+      }
+    });
+    for (const s of ['scripts/migrate-dynamic-generation-v2.js', 'scripts/migrate-invalidation.js', 'scripts/migrate-v21-manifest-v3.js',
+      'scripts/migrate-v21-finops.js', 'scripts/verify-v21-finops-schema.js']) {
+      const res = runScript(s, localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(res.code === 0, `${s}: exit ${res.code}\n${res.out.slice(-2000)}`);
+    }
+
+    await check('DB RLS (fix C2): con roles anon/authenticated y el GRANT ALL por defecto de Supabase, la migración (2×, idempotente) habilita RLS y revoca todo; `SET ROLE authenticated`/`anon` no puede SELECT/INSERT en las 6 tablas FinOps ni course_profiles; el backend (dueño) sí; verify verde', async () => {
+      const TABLES = ['pricing_catalog', 'generation_cost_events', 'cost_estimates', 'cost_budget_policies', 'cost_budget_authorizations', 'cost_avoidance_events', 'course_profiles'];
+      await withClient(DB, async (c) => {
+        // Roles de cliente de Supabase (el baseline legacy puede haberlos creado ya: el cluster es compartido por la DB).
+        for (const r of ['anon', 'authenticated']) {
+          await c.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${r}') then create role ${r} nologin; end if; end $$`);
+        }
+        // Default de Supabase: ALL sobre las tablas de public para los roles cliente.
+        await c.query(`grant usage on schema public to anon, authenticated; grant all on all tables in schema public to anon, authenticated`);
+      });
+      const pre = runScript('scripts/verify-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(pre.code !== 0 && /sin ROW LEVEL SECURITY/.test(pre.out), `verify antes de migrar debería fallar:\n${pre.out}`);
+      const g = runScript('scripts/migrate-v21-finops-rls.js', localEnv({}));
+      assert(g.code !== 0 && /MIGRATION_ENV no es "staging"/.test(g.out), 'guard MIGRATION_ENV');
+      const gp = runScript('scripts/migrate-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging', DB_USER: 'postgres.hriwbakbuypaiovvvkqh' }));
+      assert(gp.code !== 0 && /PRODUCCIÓN/.test(gp.out), 'guard producción');
+      for (let i = 0; i < 2; i++) {
+        const res = runScript('scripts/migrate-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging' }));
+        assert(res.code === 0, `rls corrida ${i + 1}: ${res.out}`);
+      }
+      const v = runScript('scripts/verify-v21-finops-rls.js', localEnv({ MIGRATION_ENV: 'staging' }));
+      assert(v.code === 0 && /RLS V2.1 FinOps verificado/.test(v.out), `verify: ${v.out}`);
+      await withClient(DB, async (c) => {
+        for (const t of TABLES) {
+          const rel = (await c.query(`select relrowsecurity from pg_class where relname = $1 and relnamespace = 'public'::regnamespace`, [t])).rows[0];
+          assert(rel && rel.relrowsecurity === true, `${t} sin RLS`);
+          for (const role of ['authenticated', 'anon']) {
+            for (const sql of [`select * from public.${t} limit 1`, `insert into public.${t} default values`]) {
+              await c.query('begin');
+              let code = null;
+              try { await c.query(`set local role ${role}`); await c.query(sql); } catch (e) { code = e.code; }
+              await c.query('rollback');
+              eq(code, '42501', `${role}: ${sql}`);
+            }
+          }
+          await c.query(`select * from public.${t} limit 1`); // backend (dueño): OK
+        }
+        // Aun con un GRANT accidental, RLS sin policies no deja ver filas.
+        await c.query('begin');
+        await c.query(`grant select on public.pricing_catalog to authenticated`);
+        await c.query(`set local role authenticated`);
+        const n = (await c.query(`select count(*)::int n from public.pricing_catalog`)).rows[0].n;
+        await c.query('rollback');
+        eq(n, 0, 'RLS sin policies → 0 filas visibles');
+      });
+    });
+
+    process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
+    delete process.env.ALLOW_UNOWNED_COURSES;
+    process.env.DYNAMIC_REAL_VIDEO_OWNERS = OWNER;
+    process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';
+    // V2.1 F2: un run v3 con videos exige entrega YouTube al crearse (409 v3_requires_youtube_delivery);
+    // los checks de ledger del worker de Videogen de este archivo prueban la rama videogen_direct, así que
+    // startRunT reescribe la entrega congelada DESPUÉS de crear el run (fixture; ver startRunT).
+    process.env.DYNAMIC_VIDEO_DELIVERY = 'youtube';
+    // V2.1 F2: preflight de proveedores reales (Gamma/TTS/LLM) — claves y themeIds FALSOS, 0 red.
+    require('./lib/provider-test-env').applyFakeProviderEnv();
+    process.env.DYNAMIC_ALLOW_VIDEOGEN_DIRECT = 'true';
+    process.env.VIDEOGEN_API_KEY = 'fake-key-never-used-no-network';
+    process.env.DYNAMIC_PROVIDER_WORKER_ENABLED = 'true'; // R5: sin él, runs v3 con Gamma/TTS → 501
+    process.env.DYNAMIC_ALLOW_PROVIDER_MOCK = 'true';     // R5: providerModes mock (escape de no-producción)
+    process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW = 'true';     // EV6 DoD: videoMode mock solo con el escape de QA
+    process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test'; // EV6 DoD: recuperación paga de videos = SUPER_ADMIN
+
+    ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
+    await ds.initialize();
+    const blueprints = new CourseBlueprintsService(ds);
+    const manifests = new GenerationManifestsService(ds, blueprints);
+    const ledger = new F.FinopsLedgerService(ds);
+    const budget = new F.FinopsBudgetService(ds, ledger);
+    const ytOk = { async check() { return { ok: true }; } };
+    const runs = new RunsService(ds, manifests, {}, ytOk, budget);
+    /** startRun + (fixture F2) entrega congelada → videogen_direct para los checks de ledger del worker de Videogen. */
+    const startRunT = async (...a) => {
+      const res = await runs.startRun(...a);
+      if (res && res.run && res.run.id) {
+        await ds.query(`update public.production_jobs set input_payload = input_payload || '{"videoDelivery":"videogen_direct"}'::jsonb where id = $1`, [res.run.id]);
+      }
+      return res;
+    };
+    const sched = new SchedulerService(ds, runs);
+    const admin = new FinopsAdminController(ledger, budget);
+    const ADMIN_USER = { id: 'admin-1', email: 'admin@cursia.test' };
+
+    /** Curso dinámico con Blueprint v2 (2 capítulos: el 1º con video y actividad) y Manifest v3. */
+    async function makeCourse(title) {
+      const [course] = await ds.query(`insert into public.courses (owner_id, title, structure_version) values ($1, $2, 'dynamic') returning id`, [OWNER, title]);
+      const cid = course.id;
+      const m1 = crypto.randomUUID();
+      const c1 = crypto.randomUUID();
+      const c2 = crypto.randomUUID();
+      const s2 = snap.buildBlueprintSnapshotV2(
+        { id: cid, title, finalExam: true, activityEngine: 'h5p' },
+        [{ id: m1, position: 0, title: 'M1', objective: null, exam_enabled: true }],
+        [{ id: c1, module_id: m1, position: 0, title: 'C1', objective: null, video_enabled: true, activity_enabled: true },
+          { id: c2, module_id: m1, position: 1, title: 'C2', objective: null, video_enabled: true, activity_enabled: false }],
+      );
+      for (const m of s2.modules) {
+        await ds.query(`insert into public.course_modules (id, course_id, position, title) values ($1, $2, $3, $4)`, [m.id, cid, m.position, m.title]);
+        for (const c of m.chapters) {
+          await ds.query(`insert into public.course_chapters (id, course_id, module_id, position, title, video_enabled, activity_enabled)
+                          values ($1, $2, $3, $4, $5, $6, $7)`, [c.id, cid, m.id, c.position, c.title, c.videoEnabled, c.activityEnabled]);
+        }
+      }
+      await ds.query(
+        `insert into public.course_blueprints (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256, structure_counter_at_lock, module_count, chapter_count)
+         values ($1, 1, 2, $2::jsonb, $3, 0, 1, 2)`, [cid, snap.canonicalJsonV2(s2), snap.snapshotSha256V2(s2)]);
+      const res = await manifests.getOrCreate(cid, OWNER, 1);
+      eq(res.manifest.rulesVersion, 3, 'Manifest v3');
+      return { cid, c1, c2, m1, manifest: res.manifest };
+    }
+    const itemRow = async (runId, key) => (await ds.query(`select * from public.generation_item_runs where job_id = $1 and item_key = $2 order by generation desc limit 1`, [runId, key]))[0];
+    const events = (where, p) => ds.query(`select *, amount::text as amount from public.generation_cost_events where ${where} order by created_at, id`, p);
+    const { mergeOutputSummary } = loadDist('modules/dynamic-generation/scheduler.service.js');
+    /** recordItemExternal de un scheduler falso que SÍ persiste (mismo merge que el real). */
+    const patchSummary = async (id, patch) => {
+      const [r] = await ds.query(`select output_summary from public.generation_item_runs where id = $1`, [id]);
+      const m = mergeOutputSummary(r.output_summary || {}, patch);
+      if (!m.ok) return false;
+      await ds.query(`update public.generation_item_runs set output_summary = $2::jsonb where id = $1`, [id, JSON.stringify(m.merged)]);
+      return true;
+    };
+
+    // ── Ingest HTTP con el ledger real ──────────────────────────────────
+    class IngestDbModule {}
+    Module({ controllers: [FinopsIngestController, FinopsLlmReservationController], providers: [{ provide: F.FinopsLedgerService, useValue: ledger }, { provide: F.FinopsBudgetService, useValue: budget }, F.FinopsIngestTokenGuard] })(IngestDbModule);
+    app = await NestFactory.create(IngestDbModule, { logger: false });
+    app.setGlobalPrefix('api/v1');
+    await app.listen(0, '127.0.0.1');
+    const ingestUrl = `http://127.0.0.1:${app.getHttpServer().address().port}/api/v1/finops/ingest/llm-usage`;
+    process.env.FINOPS_INGEST_TOKEN = 'tok-rfb';
+    const ingest = async (body) => {
+      const res = await fetch(ingestUrl, { method: 'POST', headers: { 'content-type': 'application/json', 'x-cursia-finops-token': 'tok-rfb' }, body: JSON.stringify(body) });
+      return { status: res.status, body: await res.json() };
+    };
+    const postIngest = async (pathSuffix, body) => {
+      const res = await fetch(ingestUrl.replace(/llm-usage$/, pathSuffix), { method: 'POST', headers: { 'content-type': 'application/json', 'x-cursia-finops-token': 'tok-rfb' }, body: JSON.stringify(body) });
+      return { status: res.status, body: await res.json() };
+    };
+    const llmBody = (over) => ({
+      subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', messageId: 'msg_x', requestId: 'req_x',
+      usage: { input_tokens: 1000, output_tokens: 2000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }, billingAccount: 'cursia', ...over,
+    });
+
+    // ════ A: run MOCK → AUTO, sin aprobación ════════════════════════════
+    const A = await makeCourse('Curso mock');
+    let runA = null;
+    await check('DB gate: run MOCK → AUTO_WITHIN_POLICY sin aprobación; estimado (sin items de worker) guardado con run_id + autorización AUTO vinculada', async () => {
+      const res = await startRunT(A.cid, OWNER, 1, MOCK_CTX);
+      eq(res.created, true, 'creado');
+      runA = res.run.id;
+      const auths = await ds.query(`select decision, authorized_budget::text as b, estimate_id from public.cost_budget_authorizations where run_id = $1`, [runA]);
+      eq(auths.map((x) => x.decision), ['AUTO_WITHIN_POLICY'], 'autorización AUTO');
+      const [est] = await ds.query(`select * from public.cost_estimates where run_id = $1 and scope = 'run'`, [runA]);
+      assert(est && est.id === auths[0].estimate_id, 'estimado del run vinculado');
+      const types = new Set(est.lines.map((l) => l.itemType));
+      for (const t of ['video', 'presentation', 'audio_welcome', 'audiobook_chapter']) assert(!types.has(t), `mock no estima ${t}`);
+      assert(types.has('content') && dec(est.totals.expected) > 0, 'LLM estimado');
+      eq(dec(auths[0].b), dec(est.totals.max), 'authorized = max del estimado');
+    });
+
+    await check('DB gate (merge R5): video MOCK pero Gamma/TTS en su default REAL → 409 budget_approval_required (el modo de video no decide el gasto de proveedores)', async () => {
+      const P = await makeCourse('Curso providers reales');
+      const err = await rejectsRe(startRunT(P.cid, OWNER, 1, { ...CONTEXT, videoMode: 'mock' }), /budget_approval_required/, 'providers reales', 409);
+      eq(err.getResponse().paidRealProviders, ['gamma', 'openai'], 'proveedores');
+    });
+
+    // ════ B: run REAL → 409 hasta aprobación ═════════════════════════════
+    const Bc = await makeCourse('Curso real');
+    let runB = null;
+    let rejectedEstimateId = null;
+    await check('DB gate: run REAL sin aprobación → 409 budget_approval_required con estimateId + totales; nada creado; estimado guardado sin run', async () => {
+      const err = await rejectsRe(startRunT(Bc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'real sin aprobación', 409);
+      const body = err.getResponse();
+      rejectedEstimateId = body.estimateId;
+      assert(/estimateId=[0-9a-f-]{36}/.test(body.message) && /totalsJson=/.test(body.message), 'el mensaje (aplanado por el filtro global) lleva estimateId y totales');
+      eq(body.paidRealProviders, ['gamma', 'openai', 'videogen'], 'proveedores');
+      assert(dec(body.estimate.expected) > 0 && dec(body.estimate.max) >= dec(body.estimate.expected), 'totales');
+      eq((await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [Bc.cid]))[0].n, 0, 'sin run');
+      const [est] = await ds.query(`select run_id, scope, manifest_id from public.cost_estimates where id = $1`, [rejectedEstimateId]);
+      eq([est.run_id, est.scope, est.manifest_id], [null, 'run', Bc.manifest.id], 'estimado guardado');
+    });
+
+    await check('DB gate: aprobación de admin (POST /finops/courses/:id/authorizations) → startRun continúa; la aprobación queda vinculada al run y consumida', async () => {
+      await rejectsRe(admin.authorize(A.cid, { estimateId: rejectedEstimateId, authorizedBudget: '100' }, ADMIN_USER), /no es del curso/, 'estimado de otro curso', 400);
+      await rejectsRe(admin.authorize(Bc.cid, { estimateId: rejectedEstimateId, authorizedBudget: '100', amount: 1 }, ADMIN_USER), /campo no permitido/, 'campo extra', 400);
+      const a = await admin.authorize(Bc.cid, { estimateId: rejectedEstimateId, authorizedBudget: '100', reason: 'test' }, ADMIN_USER);
+      eq([a.decision, a.approvedBy, a.runId, dec(a.authorizedBudget)], ['ADMIN_APPROVED', 'admin@cursia.test', null, 100], 'fila de aprobación');
+      const res = await startRunT(Bc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' });
+      eq(res.created, true, 'run real creado');
+      runB = res.run.id;
+      const bound = await ds.query(`select decision, estimate_id, approved_by, reason, authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1`, [runB]);
+      eq(bound.map((x) => [x.decision, x.estimate_id, x.approved_by, dec(x.b)]), [['ADMIN_APPROVED', rejectedEstimateId, 'admin@cursia.test', 100]], 'vinculada');
+      eq(await budget.findUnconsumedApproval(Bc.cid, Bc.manifest.id, '0'), null, 'consumida');
+    });
+
+    // ════ Workers: Videogen (fake) ════════════════════════════════════════
+    const workerLog = { log() {}, warn() {}, error(m) { workerLog.errors.push(m); }, errors: [] };
+    function fakeScheduler() {
+      const st = { failed: [], completed: [], blocked: [], externals: [] };
+      return {
+        st,
+        async heartbeatItem() { return true; },
+        async recordItemExternal(_id, _e, patch) { st.externals.push(patch); return true; },
+        async failItem(id, _e, msg, retryable, _code, opts) { st.failed.push({ id, msg, retryable, opts }); return true; },
+        async completeItem(id, _e, payload) { st.completed.push({ id, payload }); return true; },
+        async blockItemForBudget(id, _e, msg) { st.blocked.push({ id, msg }); return true; },
+      };
+    }
+    function fakeVideogen(cost) {
+      const st = { submits: 0 };
+      return {
+        st,
+        async batchCreate() { st.submits++; return { batch_id: 'b_' + st.submits, jobs: [{ job_id: `vg_job_${st.submits}_${crypto.randomUUID().slice(0, 8)}` }] }; },
+        async getVideoStatus(id) { return { job_id: id, status: 'completed', download_url: 'https://fake-videogen.invalid/x.mp4', progress: 100, error: null }; },
+        async getVideoCost() { if (cost instanceof Error) throw cost; return { estimated_total_cost: cost }; },
+      };
+    }
+    const claimedVideo = async (runId, chapterId, over) => {
+      const row = await itemRow(runId, `video:${chapterId}`);
+      return {
+        itemRunId: row.id, runId, itemKey: row.item_key, type: 'video', idempotencyKey: row.idempotency_key, attempt: 1,
+        chapterId, chapterNumber: 1, manifestId: row.manifest_id, artifactCourseId: String(row.course_id), generation: 1,
+        blueprint: { course: { id: row.course_id, title: 'Curso' }, chapter: { title: 'C1' } },
+        dependencyArtifacts: [{ type: 'dynamic_content_md', artifactId: 'content-art' }], outputSummary: {}, ...over,
+      };
+    };
+    const workerDeps = (scheduler, videogen) => ({
+      scheduler, dataSource: ds, videogen, logger: workerLog, executorId: 'w-rfb', leaseSeconds: 60, heartbeatMs: 600000,
+      videoTimeoutMin: 1, videoPollMs: 5, mockScenario: 'success', mockResolvePolls: 1,
+      artifacts: { async getDownloadUrl() { return { url: 'data:text/plain,Contenido%20del%20capitulo' }; }, async uploadJsonArtifact() { return { id: 'art-video' }; } },
+      finops: ledger, budget,
+    });
+
+    // Calibración #2: reserva durable antes del envío, liquidada contra UN cargo por job al terminar.
+    const finalChargesW = (where, params) => events(`${where} and event_kind = 'CHARGE' and coalesce(metadata->>'reservation', 'false') <> 'true'`, params);
+    let videoEvent = null;
+    await check('DB worker Videogen (fake, presupuesto autorizado) → continúa: 1 envío y CHARGE CALCULATED_FROM_USAGE con el costo de Videogen, atribuido server-side (curso/run/item/capítulo)', async () => {
+      const s = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runB, Bc.c1));
+      eq([vg.st.submits, s.st.completed.length, s.st.blocked.length, s.st.failed.length], [1, 1, 0, 0], `envío/complete (${JSON.stringify(s.st.failed)})`);
+      const row = await itemRow(runB, `video:${Bc.c1}`);
+      const evs = await finalChargesW(`item_run_id = $1`, [row.id]);
+      eq(evs.length, 1, 'un cargo final');
+      const all = await events(`item_run_id = $1`, [row.id]);
+      eq(all.map((x) => x.event_kind).sort(), ['ADJUSTMENT', 'CHARGE', 'CHARGE'], 'reserva + su liquidación + cargo del job');
+      assert(near(all.reduce((a, x) => a + Number(x.amount), 0), 0.97), 'neto = costo de Videogen');
+      videoEvent = evs[0];
+      eq([videoEvent.cost_source, videoEvent.operation, videoEvent.provider, videoEvent.billing_account, videoEvent.billable, videoEvent.measurement_status],
+        ['CALCULATED_FROM_USAGE', 'videogen.render', 'videogen', 'cursia', true, 'final'], 'evento');
+      assert(near(videoEvent.amount, 0.97), `monto ${videoEvent.amount}`);
+      eq([videoEvent.course_id, videoEvent.run_id, videoEvent.item_key, videoEvent.chapter_id, videoEvent.owner_id], [Bc.cid, runB, `video:${Bc.c1}`, Bc.c1, OWNER], 'atribución');
+      eq(videoEvent.metadata.amountBasis, 'provider_calculated', 'base del monto');
+      eq(s.st.completed[0].payload.summary.external, { durationSec: null, durationSource: 'unknown' }, 'Videogen real sin duración → null + unknown');
+      assert(videoEvent.idempotency_key.startsWith('videogen:job:vg_job_1_'), 'clave por job');
+    });
+
+    await check('DB idempotencia: el mismo job de Videogen registrado dos veces (poll repetido / re-claim) → 1 solo CHARGE', async () => {
+      const again = await H.recordVideogenCharge(ledger, { ownerId: OWNER, itemRunId: videoEvent.item_run_id, jobId: videoEvent.external_operation_id, mode: 'real', cost: 0.97 });
+      eq(again.inserted, false, 'no insertó');
+      eq((await events(`external_operation_id = $1`, [videoEvent.external_operation_id])).length, 1, 'una fila');
+    });
+
+    await check('DB retry: reenvío con job NUEVO → 2 CHARGE (el 2º provider_retry/attempt 2) y aparece en retriesPaid', async () => {
+      const r2 = await H.recordVideogenCharge(ledger, {
+        ownerId: OWNER, itemRunId: videoEvent.item_run_id, jobId: 'vg_job_resubmit_1', mode: 'real', cost: 0.95,
+        outputSummary: { previousExternals: [{ external: { videogenJobId: videoEvent.external_operation_id } }] },
+      });
+      eq([r2.inserted, r2.event.call_role, r2.event.attempt], [true, 'provider_retry', 2], 'retry');
+      eq((await finalChargesW(`item_run_id = $1`, [videoEvent.item_run_id])).length, 2, 'dos cargos (sin contar la reserva liquidada)');
+      const byRun = await ledger.costsByRun(runB);
+      eq(byRun.retriesPaid.events, 1, 'retriesPaid');
+      assert(near(byRun.retriesPaid.total, 0.95), 'monto del retry');
+    });
+
+    await check('DB pendiente: costo de Videogen no disponible → CHARGE pendiente con precio de catálogo; la medición llega → ADJUSTMENT (append); repetir = no-op', async () => {
+      const r = await H.recordVideogenCharge(ledger, { ownerId: OWNER, itemRunId: videoEvent.item_run_id, jobId: 'vg_job_pending_1', mode: 'real', cost: null, costError: 'HTTP 503' });
+      eq([r.event.measurement_status, r.event.cost_source, r.event.metadata.costBasis], ['pending', 'CALCULATED_FROM_USAGE', 'pricing_catalog_provisional'], 'pendiente');
+      assert(near(r.event.amount, 0.94), `provisional = catálogo (${r.event.amount})`);
+      const adj = await H.settleVideogenPending(ledger, 'vg_job_pending_1', 1.1);
+      eq(adj.inserted, true, 'ajuste');
+      assert(near(adj.delta, 0.16), `delta ${adj.delta}`);
+      eq((await H.settleVideogenPending(ledger, 'vg_job_pending_1', 1.1)).inserted, false, 'no-op');
+      const [orig] = await events(`idempotency_key = 'videogen:job:vg_job_pending_1'`, []);
+      assert(near(orig.amount, 0.94) && orig.measurement_status === 'pending', 'el original no se editó');
+    });
+
+    await check('DB worker Videogen: costo no disponible al terminar → CHARGE pendiente desde el worker (el item completa igual)', async () => {
+      const s = fakeScheduler();
+      const vg = fakeVideogen(new Error('costs endpoint 503'));
+      await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runB, Bc.c2));
+      eq([vg.st.submits, s.st.completed.length], [1, 1], 'completó');
+      const row = await itemRow(runB, `video:${Bc.c2}`);
+      const [ev] = await finalChargesW(`item_run_id = $1`, [row.id]);
+      eq([ev.measurement_status, ev.metadata.pendingReason], ['pending', 'costs endpoint 503'], 'pendiente');
+    });
+
+    await check('DB mock: render de Videogen en run mock → MOCK a 0, no facturable', async () => {
+      const row = await itemRow(runA, `video:${A.c1}`);
+      const r = await H.recordVideogenCharge(ledger, { ownerId: OWNER, itemRunId: row.id, jobId: `mock_${row.idempotency_key}`, mode: 'mock', cost: null });
+      eq([r.event.cost_source, r.event.amount, r.event.billing_account, r.event.billable], ['MOCK', F.normalizeDecimal(0), 'mock', false], 'mock');
+    });
+
+    await check('DB YouTube: subida → ZERO_BY_DESIGN + 1600 unidades de cuota, idempotente por videoId; package → ZERO_BY_DESIGN atribuido al run, idempotente por job', async () => {
+      const row = await itemRow(runB, `video:${Bc.c1}`);
+      const y1 = await H.recordYoutubeUpload(ledger, { ownerId: OWNER, itemRunId: row.id, videoId: 'yt_abc123XYZ', mode: 'real' });
+      const y2 = await H.recordYoutubeUpload(ledger, { ownerId: OWNER, itemRunId: row.id, videoId: 'yt_abc123XYZ', mode: 'real' });
+      eq([y1.inserted, y2.inserted, y1.event.cost_source, y1.event.amount, dec(y1.event.quota_units), y1.event.operation],
+        [true, false, 'ZERO_BY_DESIGN', F.normalizeDecimal(0), 1600, 'youtube.upload'], 'youtube');
+      const pkgJob = crypto.randomUUID();
+      const p1 = await H.recordPackageBuild(ledger, { ownerId: OWNER, packageJobId: pkgJob, runId: runB });
+      const p2 = await H.recordPackageBuild(ledger, { ownerId: OWNER, packageJobId: pkgJob, runId: runB });
+      eq([p1.inserted, p2.inserted, p1.event.cost_source, p1.event.operation, p1.event.course_id, p1.event.run_id, p1.event.item_run_id],
+        [true, false, 'ZERO_BY_DESIGN', 'package.build', Bc.cid, runB, null], 'package');
+      // FinOps P0 (2026-10-16): un worker del SERVIDOR (executorAuthorization 'server_worker') que registra para un run
+      // cuyo dueño no coincide conserva course_id/run_id (owner_id = dueño del run, el ejecutor en metadata) — antes
+      // quedaba sin atribuir y fuera del tope. Un no dueño por HTTP (proxy) sigue sin atribuir / rechazado
+      // (check-finops-p0-ledger-truth.js [AT]).
+      const px = await H.recordPackageBuild(ledger, { ownerId: ATTACKER, packageJobId: crypto.randomUUID(), runId: runB });
+      eq([px.event.course_id, px.event.run_id, px.event.owner_id, px.event.metadata.executorOwnerId, px.event.metadata.attributionRejectReason],
+        [Bc.cid, runB, OWNER, ATTACKER, undefined], 'worker del servidor: run ajeno se atribuye al run (ejecutor en metadata)');
+      const pxHttp = await ledger.recordZero({ kind: 'package', externalId: crypto.randomUUID(), ownerIdFromAuth: ATTACKER, attributionRunId: runB, mode: 'real', recordedBy: 'check' });
+      eq([pxHttp.event.course_id, pxHttp.event.run_id, pxHttp.event.metadata.attributionRejectReason, pxHttp.event.metadata.unattributedReason],
+        [null, null, 'owner_mismatch', 'owner_mismatch'], 'sin ejecutor de servidor: run ajeno no se atribuye');
+    });
+
+    await check('DB presupuesto excedido → item `blocked` con budget_exceeded ANTES del envío (0 envíos, 0 cargos nuevos)', async () => {
+      // Nuevo presupuesto TOTAL del run (append) por debajo de lo ya gastado.
+      const [runEst] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [runB]);
+      const a = await admin.authorize(Bc.cid, { estimateId: runEst.id, authorizedBudget: '0.5' }, ADMIN_USER);
+      eq(a.runId, runB, 'autorización del run');
+      const before = (await events(`run_id = $1`, [runB])).length;
+      const s = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      const item = await claimedVideo(runB, Bc.c1, { itemKey: `video:${Bc.c1}`, outputSummary: {} });
+      await itemWorker.processItem(workerDeps(s, vg), item);
+      eq([vg.st.submits, s.st.blocked.length, s.st.completed.length], [0, 1, 0], 'bloqueado sin enviar');
+      assert(s.st.blocked[0].msg.startsWith('budget_exceeded:'), s.st.blocked[0].msg);
+      assert(!s.st.externals.some((p) => p.externalSubmitStartedAt), 'sin marcador de envío');
+      eq((await events(`run_id = $1`, [runB])).length, before, 'sin cargos nuevos');
+    });
+
+    await check('DB scheduler real: blockItemForBudget → item blocked + dependientes blocked; retryItem lo reanuda tras ampliar la autorización', async () => {
+      await ds.query(`update public.generation_item_runs set status = 'completed' where job_id = $1 and type in ('course_plan','course_intro','content')`, [runB]);
+      const claimed = await sched.claimNextItem({ executorId: 'w-real', types: ['video'], leaseSeconds: 60 });
+      assert(claimed && claimed.runId === runB, 'reclamó un video del run real');
+      eq(await sched.blockItemForBudget(claimed.itemRunId, 'w-real', 'budget_exceeded: prueba'), true, 'bloqueó');
+      const row = await itemRow(runB, claimed.itemKey);
+      assert(row.status === 'blocked' && row.error.startsWith('budget_exceeded') && row.worker_id === null, `fila ${row.status} ${row.error}`);
+      const dependents = await ds.query(`select item_key, status from public.generation_item_runs where job_id = $1 and $2 = any(depends_on)`, [runB, claimed.itemKey]);
+      assert(dependents.length > 0 && dependents.every((d) => d.status === 'blocked'), `dependientes ${JSON.stringify(dependents)}`);
+      const [runEst] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [runB]);
+      await admin.authorize(Bc.cid, { estimateId: runEst.id, authorizedBudget: '200' }, ADMIN_USER);
+      // EV6 DoD (fix round 1, C2): un video frenado por presupuesto ANTES de enviarse nunca renderizó → el dueño lo reanuda.
+      const retried = await runs.retryItem(Bc.cid, OWNER, 1, runB, claimed.itemKey, false, false, undefined, { email: 'owner@cursia.test' });
+      eq(retried.status, 'pending', 'reanudado');
+      const after = await ds.query(`select status from public.generation_item_runs where job_id = $1 and $2 = any(depends_on)`, [runB, claimed.itemKey]);
+      assert(after.every((d) => d.status === 'pending'), 'dependientes desbloqueados');
+      const g = await budget.guardPaidSubmission({ runId: runB, itemRunId: row.id, itemType: 'video' });
+      // Loop de costos: con el presupuesto del run ampliado, el tope del RUN ya no frena; si la parte reclamada ya
+      // gastó en pruebas anteriores más de su presupuesto de recuperación, la que frena es ESA regla (por parte).
+      assert(g.allow || g.reason === 'item_recovery_budget_exhausted', 'guard con el presupuesto ampliado: ' + g.reason);
+      assert(!['no_authorization', 'budget_exceeded'].includes(g.reason), 'no es el tope del run');
+    });
+
+    await check('DB worker de proveedores: mock → evento MOCK a 0; real sin presupuesto → blocked budget_exceeded antes de la llamada (nunca PROVIDER_NOT_WIRED sin guard)', async () => {
+      const pA = await itemRow(runA, `presentation:${A.c1}`);
+      const s = fakeScheduler();
+      const deps = { scheduler: s, dataSource: ds, logger: workerLog, executorId: 'p-rfb', leaseSeconds: 60, finops: ledger, budget,
+        artifacts: { async uploadJsonArtifact() { return { id: 'art-pres' }; } } };
+      const item = { itemRunId: pA.id, runId: runA, itemKey: pA.item_key, type: 'presentation', idempotencyKey: pA.idempotency_key, chapterId: A.c1, chapterNumber: 1, manifestId: pA.manifest_id, artifactCourseId: String(A.cid), attempt: 1 };
+      await providerWorker.processProviderItem(deps, item);
+      await providerWorker.processProviderItem(deps, item);
+      const evs = await events(`item_run_id = $1`, [pA.id]);
+      eq(evs.map((e) => [e.cost_source, e.amount, e.provider]), [['MOCK', F.normalizeDecimal(0), 'gamma']], 'un evento MOCK (idempotente)');
+      // Real: el run B tiene 200 autorizado; un run real SIN autorización (curso C, fila de run inyectada) bloquea.
+      const pB = await itemRow(runB, `presentation:${Bc.c1}`);
+      const [runEst] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [runB]);
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, estimate_id, authorized_budget, decision, reason)
+                      values ($1, $2, $3, 0, 'BLOCKED', 'test: presupuesto revocado')`, [runB, Bc.cid, runEst.id]);
+      const s2 = fakeScheduler();
+      await providerWorker.processProviderItem({ ...deps, scheduler: s2 }, { ...item, itemRunId: pB.id, runId: runB, itemKey: pB.item_key, chapterId: Bc.c1 });
+      eq([s2.st.blocked.length, s2.st.failed.length], [1, 0], 'bloqueado, no fallado');
+      assert(/budget_exceeded: no_authorization/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
+    });
+
+    await check('DB worker (pausa, review I1): run PAUSADO con la parte ya reclamada → el worker de proveedores y el de video la DEVUELVEN (retryable, sin consumir intento) sin llamar ni cobrar; nunca la bloquean por presupuesto', async () => {
+      const [prev] = await ds.query(`select worker_status, status from public.production_jobs where id = $1`, [runB]);
+      await ds.query(`update public.production_jobs set worker_status = 'paused', status = 'paused' where id = $1`, [runB]);
+      try {
+        const before = (await events(`run_id = $1`, [runB])).length;
+        const pB = await itemRow(runB, `presentation:${Bc.c1}`);
+        const sp = fakeScheduler();
+        const pdeps = { scheduler: sp, dataSource: ds, logger: workerLog, executorId: 'p-pause', leaseSeconds: 60, finops: ledger, budget,
+          artifacts: { async uploadJsonArtifact() { return { id: 'art-pres' }; } } };
+        await providerWorker.processProviderItem(pdeps, { itemRunId: pB.id, runId: runB, itemKey: pB.item_key, type: 'presentation', idempotencyKey: pB.idempotency_key, chapterId: Bc.c1, chapterNumber: 1, manifestId: pB.manifest_id, artifactCourseId: String(Bc.cid), attempt: 1 });
+        eq([sp.st.blocked.length, sp.st.failed.length], [0, 1], 'devuelto, no bloqueado');
+        eq([sp.st.failed[0].retryable, sp.st.failed[0].opts && sp.st.failed[0].opts.grantAttempt, /^run_paused:/.test(sp.st.failed[0].msg)], [true, true, true], sp.st.failed[0].msg);
+        const sv = fakeScheduler();
+        const vg = fakeVideogen(1.5);
+        await itemWorker.processItem(workerDeps(sv, vg), await claimedVideo(runB, Bc.c2));
+        eq([vg.st.submits, sv.st.blocked.length, sv.st.failed.length], [0, 0, 1], 'video: sin envío, devuelto');
+        eq([sv.st.failed[0].retryable, sv.st.failed[0].opts && sv.st.failed[0].opts.grantAttempt, /^run_paused:/.test(sv.st.failed[0].msg)], [true, true, true], sv.st.failed[0].msg);
+        eq((await events(`run_id = $1`, [runB])).length, before, 'sin cargos ni reservas nuevas');
+      } finally {
+        await ds.query(`update public.production_jobs set worker_status = $2, status = $3 where id = $1`, [runB, prev.worker_status, prev.status]);
+      }
+    });
+
+    await check('DB FinOps ATÓMICO (2026-10-14): Videogen — guard que deja pasar + reserva rechazada por el tope del run (×1,25 del render) → 0 envíos, parte devuelta sin consumir intento (run_paused), run pausado (run_budget_cap), sin reservas pendientes', async () => {
+      const VC = await makeCourse('Videogen tope atómico');
+      // Run REAL (videos reales): aprobación de admin con el estimado del 409, como el run B.
+      const e409 = await rejectsRe(startRunT(VC.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'pide aprobación', 409);
+      await admin.authorize(VC.cid, { estimateId: e409.getResponse().estimateId, authorizedBudget: '100', reason: 'test tope atómico' }, ADMIN_USER);
+      const vRun = (await startRunT(VC.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, currency, decision, approved_by, reason) values ($1, $2, 0.0001, 'USD', 'ADMIN_APPROVED', 'admin@cursia.test', 'tope mínimo (prueba)')`, [vRun, VC.cid]);
+      const sv = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      const permissive = { async guardPaidSubmission() { return { allow: true, decision: 'ALLOW', committed: '0', remaining: '9', reason: 'test', authorizedBudget: '9' }; }, pauseRunBySystem: (...a) => budget.pauseRunBySystem(...a) };
+      await itemWorker.processItem({ ...workerDeps(sv, vg), budget: permissive }, await claimedVideo(vRun, VC.c1));
+      eq([vg.st.submits, sv.st.blocked.length, sv.st.failed.length], [0, 0, 1], 'sin envío, devuelto');
+      eq([sv.st.failed[0].retryable, sv.st.failed[0].opts && sv.st.failed[0].opts.grantAttempt, /^run_paused:/.test(sv.st.failed[0].msg)], [true, true, true], sv.st.failed[0].msg);
+      const run = (await ds.query(`select worker_status, output_summary->'pause' p from public.production_jobs where id = $1`, [vRun]))[0];
+      eq([run.worker_status, run.p && run.p.reason], ['paused', 'run_budget_cap'], 'run pausado por el tope');
+      eq((await events(`run_id = $1 and (metadata->>'reservation') = 'true'`, [vRun])).length, 0, 'ninguna reserva insertada');
+    });
+
+    // ════ LLM ingest: atribución, idempotencia, precios ═══════════════════
+    await check('DB ingest: itemRunId de OTRO owner en la metadata del cliente → NO se atribuye a la víctima (queda llm.unattributed del autenticado)', async () => {
+      const victimItem = await itemRow(runB, `content:${Bc.c1}`);
+      const r = await ingest(llmBody({ subject: ATTACKER, itemRunId: victimItem.id, messageId: 'msg_attack_1' }));
+      eq([r.status, r.body.attributed], [200, false], 'ingest');
+      const [ev] = await events(`idempotency_key = 'anthropic:msg:msg_attack_1'`, []);
+      eq([ev.owner_id, ev.course_id, ev.run_id, ev.item_run_id, ev.operation, ev.metadata.attributionRejectReason],
+        [ATTACKER, null, null, null, 'llm.unattributed', 'owner_mismatch'], 'no atribuido');
+      const victim = await ledger.costsByCourse(Bc.cid);
+      assert(!victim.byItemType.some((g) => g.key === 'content'), 'no aparece en el curso de la víctima');
+      const own = await ingest(llmBody({ itemRunId: victimItem.id, messageId: 'msg_own_1' }));
+      eq([own.status, own.body.attributed], [200, true], 'el dueño sí se atribuye');
+      const dup = await ingest(llmBody({ itemRunId: victimItem.id, messageId: 'msg_own_1' }));
+      eq([dup.status, dup.body.inserted], [200, false], 'misma respuesta dos veces → 1 fila');
+      const noItem = await ingest(llmBody({ messageId: 'msg_noitem_1' }));
+      eq([noItem.status, noItem.body.attributed], [200, false], 'sin itemRunId se acepta');
+    });
+
+    await check('DB precios: un precio nuevo NO cambia el monto histórico; el cargo nuevo usa el precio nuevo', async () => {
+      const [before] = await events(`idempotency_key = 'anthropic:msg:msg_own_1'`, []);
+      for (const [meter, price] of [['input_tokens', '30'], ['output_tokens', '150']]) {
+        await ds.query(
+          `insert into public.pricing_catalog (provider, service, product_or_model, meter, unit_size, unit_price, currency, pricing_version, effective_from, source, verified)
+           values ('anthropic', 'messages', 'claude-sonnet-4-6', $1, 1000000, $2, 'USD', 'anthropic-rfb-test', now() - interval '1 second', 'contract', false)`,
+          [meter, price]);
+      }
+      const r = await ingest(llmBody({ messageId: 'msg_after_price' }));
+      eq(r.status, 200, 'ingest');
+      const [after] = await events(`idempotency_key = 'anthropic:msg:msg_own_1'`, []);
+      eq(after.amount, before.amount, 'histórico intacto');
+      eq(after.pricing_snapshot, before.pricing_snapshot, 'snapshot intacto');
+      const [nw] = await events(`idempotency_key = 'anthropic:msg:msg_after_price'`, []);
+      eq(dec(nw.amount), (1000 * 30 + 2000 * 150) / 1e6, 'nuevo precio');
+      assert(nw.pricing_snapshot.pricing_versions.includes('anthropic-rfb-test'), 'snapshot con la versión nueva');
+    });
+
+    // Curso/run propio (sin el gasto artificial de las pruebas anteriores sobre runB): el guard de gasto por parte
+    // (loop de costos) frenaría con razón una parte que ya gastó decenas de veces lo esperado.
+    const PR = await makeCourse('Proxy reserva');
+    const prRun = (await startRunT(PR.cid, OWNER, 1, MOCK_CTX)).run.id;
+    // ════ Piloto #1209: reserva del proxy LLM ANTES de llamar a Anthropic ═══════════
+    await check('DB proxy-reserva: reserva (CHARGE pending, cota chars/2,5 + max_tokens, atribuida) → el usage con callId la LIQUIDA atómico (cargo exacto + reserva a 0); repetir = sin doble cargo', async () => {
+      const it = await itemRow(prRun, `content:${PR.c1}`);
+      const callId = crypto.randomUUID();
+      const resBody = { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 30000, maxTokens: 8000, billingAccount: 'cursia' };
+      const r = await postIngest('llm-reservation', resBody);
+      eq([r.status, r.body.reserved, r.body.inserted, r.body.attributed], [200, true, true, true], 'reservada');
+      const [ev] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + callId]);
+      eq([ev.measurement_status, ev.metadata.reservation, ev.usage.cache_write_tokens, ev.usage.output_tokens, ev.item_run_id], ['pending', true, 12000, 8000, it.id], 'fila de reserva (entrada como cota: escritura de caché, precio = máx. con entrada)');
+      eq(dec(ev.amount), (12000 * 30 + 8000 * 150) / 1e6, 'monto conservador con el precio vigente (chars/2,5; máx. entre entrada y escritura de caché)');
+      const again = await postIngest('llm-reservation', resBody);
+      eq([again.status, again.body.inserted], [200, false], 'reserva idempotente por callId');
+      const totalBefore = dec((await ledger.costsByRun(prRun)).totals.total);
+      const s1 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_proxy_res_1', callId, usage: { input_tokens: 9000, output_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
+      eq([s1.status, s1.body.settled, s1.body.finalInserted, s1.body.alreadySettled], [200, true, true, false], 'liquidada');
+      const exact = (9000 * 30 + 1200 * 150) / 1e6;
+      eq(dec(s1.body.amount), exact, 'cargo exacto');
+      const totalAfter = dec((await ledger.costsByRun(prRun)).totals.total);
+      assert(Math.abs(totalAfter - (totalBefore - dec(ev.amount) + exact)) < 1e-9, `total: reserva reemplazada por el exacto (${totalBefore} → ${totalAfter})`);
+      const s2 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_proxy_res_1', callId, usage: { input_tokens: 9000, output_tokens: 1200, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
+      eq([s2.status, s2.body.finalInserted, s2.body.alreadySettled], [200, false, true], 'reenvío: sin doble cargo');
+      eq(dec((await ledger.costsByRun(prRun)).totals.total), totalAfter, 'total sin cambios');
+    });
+
+    await check('DB proxy-reserva: respuesta PERDIDA (524 / Worker terminado / navegador fuera) → la reserva queda PENDIENTE y cuenta en el gasto del run; conciliación explícita (cobrada / no cobrada)', async () => {
+      const it = await itemRow(prRun, `content:${PR.c1}`);
+      const ids = [crypto.randomUUID(), crypto.randomUUID()];
+      const t0 = (await ledger.costsByRun(prRun)).totals;
+      let reserved = 0;
+      for (const callId of ids) {
+        const r = await postIngest('llm-reservation', { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 2, model: 'claude-sonnet-4-6', callId, promptChars: 3000, maxTokens: 4000, billingAccount: 'cursia' });
+        reserved += dec(r.body.amount);
+      }
+      const t1 = (await ledger.costsByRun(prRun)).totals;
+      assert(Math.abs(dec(t1.total) - dec(t0.total) - reserved) < 1e-9, 'las reservas cuentan en el total del run (presupuesto)');
+      eq(t1.pending_events - t0.pending_events, 2, 'aparecen como pendientes');
+      await ledger.reconcileReservationAsCharged('reservation:llm-proxy:' + ids[0], 'consola Anthropic: cobrada', { decidedBy: 'admin@cursia.test' });
+      await ledger.reconcileReservationAsNotCharged('reservation:llm-proxy:' + ids[1], 'consola Anthropic: sin cobro', { decidedBy: 'admin@cursia.test' });
+      const t2 = (await ledger.costsByRun(prRun)).totals;
+      eq(t2.pending_events, t0.pending_events, 'sin pendientes tras conciliar');
+      assert(Math.abs(dec(t2.total) - dec(t0.total) - reserved / 2) < 1e-9, 'la cobrada sigue contada; la no cobrada a 0');
+    });
+
+    await check('DB proxy-reserva: rechazo definitivo de Anthropic (429/529…) → /release la lleva a 0 (idempotente); un estado incierto (400/502/524) → 400 y la reserva sigue pendiente', async () => {
+      const callId = crypto.randomUUID();
+      await postIngest('llm-reservation', { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 300, maxTokens: 100, billingAccount: 'cursia' });
+      for (const st of [400, 502, 524]) {
+        const bad = await postIngest('llm-reservation/release', { callId, providerStatus: st });
+        eq(bad.status, 400, `status ${st} no libera`);
+      }
+      const [still] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + callId]);
+      eq((await ds.query(`select count(*)::int n from public.generation_cost_events where corrects_event_id = $1`, [still.id]))[0].n, 0, 'sigue pendiente');
+      const rel = await postIngest('llm-reservation/release', { callId, providerStatus: 429, requestId: 'req_429' });
+      eq([rel.status, rel.body.released, rel.body.alreadySettled], [200, true, false], 'liberada');
+      const rel2 = await postIngest('llm-reservation/release', { callId, providerStatus: 429 });
+      eq([rel2.status, rel2.body.released, rel2.body.alreadySettled], [200, false, true], 'idempotente');
+      const [adj] = await ds.query(`select amount::text as a, metadata from public.generation_cost_events where corrects_event_id = $1`, [still.id]);
+      assert(Math.abs(dec(still.amount) + dec(adj.a)) < 1e-9 && /provider_rejected_429:req_429/.test(JSON.stringify(adj.metadata)), 'ajuste a 0 con el motivo');
+      const late = await ingest(llmBody({ messageId: 'msg_after_release', callId }));
+      eq([late.status, late.body.alreadySettled], [200, true], 'un usage tardío tras liberar: se registra el cargo, la reserva no se toca de nuevo');
+    });
+
+    await check('DB proxy-reserva (review I2): pendientes LISTADAS para el admin (por curso/run); conciliar cobrada/no cobrada (motivo obligatorio); un usage tardío tras «cobrada» NO agrega un segundo cargo', async () => {
+      const it = await itemRow(prRun, `content:${PR.c1}`);
+      const ids = [crypto.randomUUID(), crypto.randomUUID()];
+      for (const callId of ids) await postIngest('llm-reservation', { subject: OWNER, itemRunId: it.id, callRole: 'main', attempt: 3, model: 'claude-sonnet-4-6', callId, promptChars: 3000, maxTokens: 2000, billingAccount: 'cursia' });
+      const list = (await admin.llmProxyReservations(undefined, prRun)).reservations;
+      for (const callId of ids) assert(list.some((r) => r.callId === callId && r.itemKey === `content:${PR.c1}` && r.maxTokens === 2000), 'listada ' + callId);
+      const byCourse = (await admin.llmProxyReservations(String(PR.cid))).reservations;
+      assert(byCourse.some((r) => r.callId === ids[0]), 'filtro por curso');
+      await rejectsRe(admin.reconcileLlmProxyReservation(ids[0], { outcome: 'charged' }, ADMIN_USER), /reason/, 'motivo obligatorio', 400);
+      await rejectsRe(admin.reconcileLlmProxyReservation(ids[0], { outcome: 'maybe', reason: 'x' }, ADMIN_USER), /outcome/, 'outcome', 400);
+      const c = await admin.reconcileLlmProxyReservation(ids[0], { outcome: 'charged', reason: 'consola: cobrada' }, ADMIN_USER);
+      eq([c.reconciled, c.alreadySettled], [true, false], 'cobrada');
+      const n = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'not_charged', reason: 'consola: sin cobro' }, ADMIN_USER);
+      eq([n.reconciled, n.alreadySettled], [true, false], 'no cobrada');
+      const again = await admin.reconcileLlmProxyReservation(ids[1], { outcome: 'not_charged', reason: 'x' }, ADMIN_USER);
+      eq(again.alreadySettled, true, 'repetir = no-op');
+      // r60 (I1): la decisión inversa → 409 reservation_already_settled (antes: 200 alreadySettled).
+      await rejectsRe(admin.reconcileLlmProxyReservation(ids[1], { outcome: 'charged', reason: 'x' }, ADMIN_USER), /reservation_already_settled/, 'inversa → 409', 409);
+      const left = (await admin.llmProxyReservations(undefined, prRun)).reservations;
+      assert(!left.some((r) => ids.includes(r.callId)), 'ya no pendientes');
+      const t0 = dec((await ledger.costsByRun(prRun)).totals.total);
+      const late = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_charged', callId: ids[0] }));
+      eq([late.status, late.body.finalInserted, late.body.alreadySettled], [200, false, true], 'sin cargo extra');
+      eq(dec((await ledger.costsByRun(prRun)).totals.total), t0, 'total intacto (sin doble conteo)');
+      // Usage tardío MAYOR que lo reservado tras «cobrada» → gana el real (la reserva va a 0): nunca de menos.
+      const big = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_big', callId: ids[0], usage: { input_tokens: 500000, output_tokens: 200000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }));
+      eq([big.status, big.body.finalInserted], [200, true], 'real mayor → se registra');
+      const [resv] = await events(`idempotency_key = $1`, ['reservation:llm-proxy:' + ids[0]]);
+      const [net] = await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where id = $1 or corrects_event_id = $1`, [resv.id]);
+      assert(Math.abs(dec(net.t)) < 1e-9, 'reserva neta 0');
+      eq(dec((await ledger.costsByRun(prRun)).totals.total), t0 - dec(resv.amount) + dec(big.body.amount), 'total = real (sin doble conteo)');
+      const late2 = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_late_after_notcharged', callId: ids[1] }));
+      eq([late2.status, late2.body.finalInserted], [200, true], 'tras «no cobrada», un usage real sí se registra (nunca de menos)');
+    });
+
+    await check('DB proxy-reserva (review minors): callId repetido con la reserva ya cerrada → 400 (el proxy no llama); callId + measurement → 400', async () => {
+      const callId = crypto.randomUUID();
+      const body = { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId, promptChars: 30, maxTokens: 10, billingAccount: 'cursia' };
+      eq((await postIngest('llm-reservation', body)).status, 200, 'reserva');
+      eq((await postIngest('llm-reservation', body)).status, 200, 'reintento del mismo POST mientras sigue abierta = idempotente');
+      await postIngest('llm-reservation/release', { callId, providerStatus: 429 });
+      eq((await postIngest('llm-reservation', body)).status, 400, 'cerrada → no cubre una llamada nueva');
+      const bad = await ingest(llmBody({ messageId: 'msg_cid_meas', callId: crypto.randomUUID(), measurement: 'correction' }));
+      eq(bad.status, 400, 'callId + measurement');
+    });
+
+    await check('DB proxy-reserva: usage con callId SIN reserva (proxy/ledger viejo) → camino de siempre (1 cargo); body inválido / sin token → rechazado', async () => {
+      const r = await ingest(llmBody({ messageId: 'msg_no_res', callId: crypto.randomUUID() }));
+      eq([r.status, r.body.inserted], [200, true], 'cargo normal');
+      const bad = await postIngest('llm-reservation', { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId: 'no-uuid', promptChars: 1, maxTokens: 1, billingAccount: 'cursia' });
+      eq(bad.status, 400, 'callId inválido');
+      const extra = await postIngest('llm-reservation', { subject: OWNER, callRole: 'main', attempt: 1, model: 'claude-sonnet-4-6', callId: crypto.randomUUID(), promptChars: 1, maxTokens: 1, billingAccount: 'cursia', amount: 0 });
+      eq(extra.status, 400, 'campo no permitido');
+      const noTok = await fetch(ingestUrl.replace(/llm-usage$/, 'llm-reservation'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+      assert(noTok.status === 401 || noTok.status === 403, 'sin token → rechazado ' + noTok.status);
+    });
+
+    await check('DB ingest (fix C1/I2): ids fechados del selector (Haiku 4.5 / Sonnet 4) → 200 con precio; id sin precio → 202, CHARGE a 0 pendiente (pricingMissing), nunca perdido; al cargar el precio → ADJUSTMENT y el pendiente se limpia', async () => {
+      const h = await ingest(llmBody({ model: 'claude-haiku-4-5-20251001', messageId: 'msg_haiku_dated', usage: { input_tokens: 1000000, output_tokens: 1000000 } }));
+      const s4 = await ingest(llmBody({ model: 'claude-sonnet-4-20250514', messageId: 'msg_sonnet4_dated', usage: { input_tokens: 1000000, output_tokens: 1000000 } }));
+      eq([h.status, dec(h.body.amount), s4.status, dec(s4.body.amount)], [200, 6, 200, 18], 'fechados con precio');
+      const victimItem = await itemRow(runB, `content:${Bc.c1}`);
+      const u = await ingest(llmBody({ model: 'claude-new-model-x', itemRunId: victimItem.id, messageId: 'msg_unpriced_1', usage: { input_tokens: 1000000, output_tokens: 2000000 } }));
+      eq([u.status, u.body.inserted, u.body.pricingMissing, u.body.measurementStatus, u.body.amount, u.body.attributed], [202, true, true, 'pending', F.normalizeDecimal(0), true], 'registrado pendiente');
+      const [ev] = await events(`idempotency_key = 'anthropic:msg:msg_unpriced_1'`, []);
+      eq([ev.metadata.pricingMissing, ev.metadata.pricingError.code, ev.pricing_snapshot], [true, 'PRICING_MISSING', null], 'metadata');
+      const dup = await ingest(llmBody({ model: 'claude-new-model-x', itemRunId: victimItem.id, messageId: 'msg_unpriced_1', usage: { input_tokens: 1000000, output_tokens: 2000000 } }));
+      eq([dup.status, dup.body.inserted, dup.body.pricingMissing], [202, false, true], 'reenvío idempotente (sigue pendiente)');
+      const before = await ledger.costsByRun(runB);
+      assert(before.totals.pending_events >= 1, 'aparece en pendientes');
+      await ds.query(
+        `insert into public.pricing_catalog (provider, service, product_or_model, meter, unit_size, unit_price, currency, pricing_version, effective_from, source, verified)
+         values ('anthropic','messages','claude-new-model-x','input_tokens',1000000,2,'USD','anthropic-newx','2026-01-01T00:00:00Z','contract',false),
+                ('anthropic','messages','claude-new-model-x','output_tokens',1000000,10,'USD','anthropic-newx','2026-01-01T00:00:00Z','contract',false)`);
+      const adj = await ledger.repricePendingCharge('anthropic:msg:msg_unpriced_1');
+      eq([adj.inserted, dec(adj.delta)], [true, 22], 'ADJUSTMENT = precio real');
+      eq((await ledger.repricePendingCharge('anthropic:msg:msg_unpriced_1')).inserted, false, 'repetir = no-op');
+      const after = await ledger.costsByRun(runB);
+      eq(after.totals.pending_events, before.totals.pending_events - 1, 'el pendiente corregido ya no cuenta (fix M5)');
+    });
+
+    // ════ Consultas ══════════════════════════════════════════════════════
+    await check('DB consultas: estimado vs actual por run; costsByCourse con byChapter/byItemType/byProvider/retriesPaid/avoided/estimatedVsActual; rollup por owner', async () => {
+      const byRun = await ledger.costsByRun(runB);
+      const eva = byRun.estimatedVsActual;
+      assert(eva && eva.estimate_id && dec(eva.est_expected) > 0, `estimado del run: ${JSON.stringify(eva)}`);
+      const actual = dec(eva.actual);
+      assert(actual > 0 && Math.abs(actual - dec(byRun.totals.total)) < 1e-9, 'actual = ledger del run');
+      assert(actual !== dec(eva.est_expected), 'diferencia estimado vs actual visible');
+      const c = await ledger.costsByCourse(Bc.cid);
+      for (const k of ['byChapter', 'byItemType', 'byProvider', 'retriesPaid', 'avoided', 'estimatedVsActual']) assert(k in c, `falta ${k}`);
+      assert(c.byChapter.some((g) => g.key === Bc.c1), 'byChapter');
+      assert(c.byProvider.some((g) => g.key === 'videogen'), 'byProvider');
+      const o = await admin.ownerCosts(OWNER);
+      assert(o.ownerId === OWNER && o.byCourse.length >= 1, 'rollup por owner');
+    });
+
+    await check('DB regeneración dryRun: incremental {min,esperado,max} y evitado por item afectado (video STALE_NO_AUTO = costo real histórico); sin escribir estimados', async () => {
+      await ds.query(`update public.generation_item_runs set status = 'completed' where job_id = $1 and item_key in ($2, $3)`, [runA, `content:${A.c1}`, `video:${A.c1}`]);
+      const nEst = (await ds.query(`select count(*)::int n from public.cost_estimates`))[0].n;
+      const dry = await runs.regenerateItem(A.cid, OWNER, 1, runA, `content:${A.c1}`, { dryRun: true });
+      assert(dry.dryRun && dry.cost, 'dryRun con costo');
+      const by = Object.fromEntries(dry.cost.byItem.map((x) => [x.itemKey, x]));
+      const content = by[`content:${A.c1}`];
+      assert(content && content.action === 'REGENERATE' && dec(content.incrementalCost.min) > 0 &&
+        dec(content.incrementalCost.min) <= dec(content.incrementalCost.expected) && dec(content.incrementalCost.expected) <= dec(content.incrementalCost.max), `content ${JSON.stringify(content)}`);
+      const video = by[`video:${A.c1}`];
+      eq([video.action, video.avoidedBasis, video.avoided, video.incrementalCost.expected], ['STALE_NO_AUTO', 'historical_actual', F.normalizeDecimal(0), F.normalizeDecimal(0)], 'video (mock: histórico 0)');
+      assert(near(dry.cost.incrementalCost.expected, dry.cost.byItem.reduce((s, x) => s + dec(x.incrementalCost.expected), 0)), 'total = suma por item');
+      eq((await ds.query(`select count(*)::int n from public.cost_estimates`))[0].n, nEst, 'dryRun no escribe');
+    });
+
+    await check('DB regeneración real (apply): video real sin presupuesto del run → 409 budget_approval_required con estimado (scope regeneration, run_id); tras autorizarlo → se regenera', async () => {
+      const key = `video:${Bc.c2}`;
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where job_id = $1 and item_key = $2`, [runB, key]);
+      // La última autorización del run es BLOCKED (test anterior) → presupuesto null.
+      const err = await rejectsRe(runs.regenerateItem(Bc.cid, OWNER, 1, runB, key, { confirmPaid: true }), /budget_approval_required/, 'sin presupuesto', 409);
+      const estimateId = err.getResponse().estimateId;
+      const [est] = await ds.query(`select scope, run_id from public.cost_estimates where id = $1`, [estimateId]);
+      eq([est.scope, est.run_id], ['regeneration', runB], 'estimado de la regeneración');
+      eq((await itemRow(runB, key)).generation, 1, 'no se creó la generación 2');
+      await admin.authorize(Bc.cid, { estimateId, authorizedBudget: '300' }, ADMIN_USER);
+      const res = await runs.regenerateItem(Bc.cid, OWNER, 1, runB, key, { confirmPaid: true });
+      eq([res.created, res.costKind, res.item.generation], [true, 'videogen', 2], 'regenerado');
+    });
+
+    await check('DB duración (R11a): run MOCK videogen_direct → Videogen mock devuelve 468 y se persiste en output_summary.external + payload/metadata del artifact dynamic_video', async () => {
+      const s = fakeScheduler();
+      const uploads = [];
+      const deps = workerDeps(s, fakeVideogen(0));
+      deps.artifacts = { ...deps.artifacts, async uploadJsonArtifact(i) { uploads.push(i); return { id: 'art-video-mock' }; } };
+      // En mock el worker usa su Videogen interno (mockPollVideoStatus lee/escribe output_summary por el scheduler).
+      const row = await itemRow(runA, `video:${A.c2}`);
+      s.recordItemExternal = async (id, _e, patch) => { await patchSummary(id, patch); return true; };
+      await itemWorker.processItem(deps, await claimedVideo(runA, A.c2));
+      eq([s.st.completed.length, s.st.failed.length], [1, 0], `completó (${JSON.stringify(s.st.failed)})`);
+      eq(s.st.completed[0].payload.summary.external, { durationSec: 468, durationSource: 'videogen_status' }, 'external');
+      eq([uploads[0].payload.durationSec, uploads[0].metadata.durationSec, uploads[0].metadata.durationSource], [468, 468, 'videogen_status'], 'artifact');
+      const [ev] = await events(`item_run_id = $1`, [row.id]);
+      eq([ev.cost_source, ev.amount], ['MOCK', F.normalizeDecimal(0)], 'ledger MOCK');
+    });
+
+    await check('DB duración (R11a): run MOCK con entrega YouTube → la duración queda en external al terminar el render y viaja al artifact final (publicador mock, sin red)', async () => {
+      await ds.query(`update public.production_jobs set input_payload = input_payload || '{"videoDelivery":"youtube"}'::jsonb where id = $1`, [runA]);
+      try {
+        const s = fakeScheduler();
+        const uploads = [];
+        s.recordItemExternal = async (id, _e, patch) => patchSummary(id, patch);
+        const deps = workerDeps(s, fakeVideogen(0));
+        deps.artifacts = { ...deps.artifacts, async uploadJsonArtifact(i) { uploads.push(i); return { id: 'art-video-yt' }; } };
+        const row = await itemRow(runA, `video:${A.c1}`);
+        await itemWorker.processItem(deps, await claimedVideo(runA, A.c1));
+        eq([s.st.completed.length, s.st.failed.length], [1, 0], `completó (${JSON.stringify(s.st.failed)})`);
+        const [db] = await ds.query(`select output_summary from public.generation_item_runs where id = $1`, [row.id]);
+        eq([db.output_summary.external.durationSec, db.output_summary.external.durationSource, !!db.output_summary.external.youtubeVideoId], [468, 'videogen_status', true], 'external en la DB');
+        eq([uploads[0].payload.durationSec, uploads[0].metadata.durationSec, uploads[0].payload.delivery], [468, 468, 'youtube'], 'artifact final');
+        const yt = await events(`item_run_id = $1 and provider = 'youtube'`, [row.id]);
+        eq(yt.map((e) => [e.cost_source, dec(e.quota_units)]), [['MOCK', 1600]], 'cuota de YouTube (mock)');
+      } finally {
+        await ds.query(`update public.production_jobs set input_payload = input_payload || '{"videoDelivery":"videogen_direct"}'::jsonb where id = $1`, [runA]);
+      }
+    });
+
+    // ════ I1: AUTO_WITHIN_POLICY nunca cubre proveedores pagados reales ═════
+    const E = await makeCourse('Curso I1');
+    let runE = null;
+    await check('DB I1 setup: run real E con aprobación ADMIN justa, gasto que la agota y una autorización AUTO_WITHIN_POLICY enorme posterior', async () => {
+      const err = await rejectsRe(startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'pide aprobación', 409);
+      const b = err.getResponse();
+      await admin.authorize(E.cid, { estimateId: b.estimateId, authorizedBudget: b.estimate.expected }, ADMIN_USER);
+      runE = (await startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' })).run.id;
+      const it = await itemRow(runE, `content:${E.c1}`);
+      const r = await ingest(llmBody({ itemRunId: it.id, messageId: 'msg_e_big', usage: { input_tokens: 1000000, output_tokens: 5000000 } }));
+      eq(r.status, 200, 'gasto LLM');
+      await ds.query(`insert into public.cost_budget_authorizations (run_id, course_id, authorized_budget, decision, reason)
+                      values ($1, $2, 99999, 'AUTO_WITHIN_POLICY', 'test I1: AUTO enorme')`, [runE, E.cid]);
+      eq(await budget.runAuthorizedBudget(runE), F.normalizeDecimal(99999), 'la AUTO es la última autorización');
+      eq(dec(await budget.runPaidAuthorizedBudget(runE)), dec(b.estimate.expected), 'para proveedores pagados solo cuenta la ADMIN');
+    });
+
+    await check('DB I1 workers: el guard de Videogen y el de proveedores bloquean (budget_exceeded) aunque haya AUTO de sobra', async () => {
+      const s = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runE, E.c1));
+      eq([vg.st.submits, s.st.blocked.length], [0, 1], 'Videogen bloqueado');
+      const p = await itemRow(runE, `presentation:${E.c1}`);
+      const s2 = fakeScheduler();
+      await providerWorker.processProviderItem({ scheduler: s2, dataSource: ds, logger: workerLog, executorId: 'p-e', leaseSeconds: 60, finops: ledger, budget,
+        artifacts: { async uploadJsonArtifact() { return { id: 'x' }; } } },
+      { itemRunId: p.id, runId: runE, itemKey: p.item_key, type: 'presentation', idempotencyKey: p.idempotency_key, chapterId: E.c1, chapterNumber: 1, manifestId: p.manifest_id, artifactCourseId: String(E.cid), attempt: 1 });
+      eq(s2.st.blocked.length, 1, 'proveedor bloqueado');
+      assert(/budget_exceeded/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
+    });
+
+    await check('DB M3 (fix round 2): worker de Videogen / proveedores en run REAL SIN guard de presupuesto → item bloqueado (budget_exceeded: finops_unavailable), 0 envíos (fail closed)', async () => {
+      const s = fakeScheduler();
+      const vg = fakeVideogen(0.97);
+      const deps = { ...workerDeps(s, vg) };
+      delete deps.budget;
+      await itemWorker.processItem(deps, await claimedVideo(runE, E.c2));
+      eq([vg.st.submits, s.st.blocked.length, s.st.completed.length], [0, 1, 0], 'Videogen sin guard');
+      assert(/^budget_exceeded: finops_unavailable: /.test(s.st.blocked[0].msg), s.st.blocked[0].msg);
+      const p = await itemRow(runE, `presentation:${E.c2}`);
+      const s2 = fakeScheduler();
+      await providerWorker.processProviderItem({ scheduler: s2, dataSource: ds, logger: workerLog, executorId: 'p-m3', leaseSeconds: 60, finops: ledger,
+        artifacts: { async uploadJsonArtifact() { throw new Error('no debería subir'); } } },
+      { itemRunId: p.id, runId: runE, itemKey: p.item_key, type: 'presentation', idempotencyKey: p.idempotency_key, chapterId: E.c2, chapterNumber: 2, manifestId: p.manifest_id, artifactCourseId: String(E.cid), attempt: 1 });
+      eq([s2.st.blocked.length, s2.st.failed.length], [1, 0], 'proveedor sin guard');
+      assert(/finops_unavailable/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
+    });
+
+    await check('DB I1 regenerate: video real con solo AUTO de sobra → 409 budget_approval_required (sin generación nueva)', async () => {
+      const key = `video:${E.c1}`;
+      await ds.query(`update public.generation_item_runs set status = 'completed', finished_at = now() where job_id = $1 and item_key = $2`, [runE, key]);
+      await rejectsRe(runs.regenerateItem(E.cid, OWNER, 1, runE, key, { confirmPaid: true }), /budget_approval_required/, 'regenerate', 409);
+      eq((await itemRow(runE, key)).generation, 1, 'sin generación 2');
+    });
+
+    await check('DB I1 retry: video fallido sin job y resubmitVideo → 409 budget_approval_required con estimado (scope regeneration) y el item sigue failed', async () => {
+      const key = `video:${E.c2}`;
+      await ds.query(`update public.generation_item_runs set status = 'failed', error = 'video_timeout' where job_id = $1 and item_key = $2`, [runE, key]);
+      // EV6 DoD (fix round 1, C2): sin render previo (video_timeout sin job) el dueño reintenta → el gate de FinOps de siempre.
+      const err = await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key), /budget_approval_required/, 'retry', 409);
+      const [est] = await ds.query(`select scope, run_id from public.cost_estimates where id = $1`, [err.getResponse().estimateId]);
+      eq([est.scope, est.run_id], ['regeneration', runE], 'estimado');
+      await ds.query(`update public.generation_item_runs set error = 'videogen_failed: x',
+                        output_summary = output_summary || '{"external":{"videogenJobId":"vg_old","mode":"real"}}'::jsonb
+                      where job_id = $1 and item_key = $2`, [runE, key]);
+      // EV6 DoD (BE-A): el REENVÍO de un render fallido es recuperación de admin (403 al dueño); el admin pasa al gate de FinOps.
+      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, true), /admin_recovery_only/, 'resubmit del dueño', 403);
+      await rejectsRe(runs.retryItem(E.cid, OWNER, 1, runE, key, true, false, undefined, RECOVERY_ADMIN), /budget_approval_required/, 'resubmitVideo', 409);
+      eq((await itemRow(runE, key)).status, 'failed', 'sigue failed');
+    });
+
+    await check('DB I1 reopen: run real cancelado con videos/proveedores por enviar → 409; con aprobación ADMIN del run (POST authorizations {runId}) → se reabre', async () => {
+      await runs.cancelRun(E.cid, OWNER, 1, runE);
+      await rejectsRe(startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_approval_required/, 'reopen', 409);
+      await rejectsRe(admin.authorize(E.cid, { runId: runE, estimateId: crypto.randomUUID(), authorizedBudget: '1' }, ADMIN_USER), /exactamente uno/, 'runId y estimateId', 400);
+      const a = await admin.authorize(E.cid, { runId: runE, authorizedBudget: '100000' }, ADMIN_USER);
+      eq([a.runId, a.decision, a.estimateId], [runE, 'ADMIN_APPROVED', null], 'aprobación del run');
+      const res = await startRunT(E.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' });
+      eq([res.reopened, res.run.id], [true, runE], 'reabierto');
+    });
+
+    await check('DB gate BLOCK: política del curso con maxCostPerRun mínimo y on_exceed BLOCK → 409 budget_blocked para un run real (sin salida por aprobación)', async () => {
+      const Cc = await makeCourse('Curso bloqueado');
+      await ds.query(`insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, 'BLOCK')`,
+        [String(Cc.cid), JSON.stringify({ maxCostPerRun: '0.0001' })]);
+      await rejectsRe(startRunT(Cc.cid, OWNER, 1, { ...CONTEXT, videoMode: 'real' }), /budget_blocked/, 'bloqueado', 409);
+      // Mock con la misma política: el LLM sobre el límite pide aprobación (nunca BLOCK).
+      await rejectsRe(startRunT(Cc.cid, OWNER, 1, MOCK_CTX), /budget_approval_required/, 'LLM sobre el límite', 409);
+    });
+
+    // ════ Flujo NORMAL de aprobación (UI): preview + «Autorizar y generar» ════
+    process.env.SUPER_ADMIN_EMAILS = 'admin@cursia.test';
+    const ADMIN = { id: OWNER, email: 'Admin@Cursia.test' };
+    const NOT_ADMIN = { id: OWNER, email: 'owner@cursia.test' };
+    const NCTX = { ...CONTEXT, videoMode: 'mock' }; // Gamma/TTS reales por default ⇒ requiere aprobación
+    // r62: estos checks prueban el flujo de APROBACIÓN DE ADMIN: la política lo pide explícitamente (con los tres topes,
+    // sin el flag, la decisión sería la autorización única del usuario: scripts/check-r62-single-authorization.js).
+    const coursePolicy = (cid, limits, onExceed = 'ADMIN_APPROVAL') => ds.query(
+      `insert into public.cost_budget_policies (scope, scope_id, version, limits, on_exceed) values ('course', $1, 1, $2::jsonb, $3)`,
+      [String(cid), JSON.stringify({ ...limits, requireHumanApprovalForRealSpend: true }), onExceed]);
+    const authRows = (cid) => ds.query(`select id, run_id, estimate_id, decision, approved_by, reason, authorized_budget::text as b from public.cost_budget_authorizations where course_id = $1 order by created_at, (run_id is not null), id`, [cid]);
+    const N = await makeCourse('Curso normal');
+    // Tope mensual holgado: el harness tiene runs vivos de checks anteriores con autorizaciones enormes (cuentan como comprometidas).
+    await coursePolicy(N.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000', monthlyCap: '1000000000' });
+    let pvN = null;
+    await check('DB flujo normal: preview = estimado COMPLETO (totales, familias, tipos), conteos del Manifest, aprobación requerida, canApprove por SUPER_ADMIN_EMAILS; no escribe nada', async () => {
+      const before = (await ds.query(`select count(*)::int n from public.cost_estimates where course_id = $1`, [N.cid]))[0].n;
+      pvN = await runs.previewStart(N.cid, ADMIN, 1, NCTX);
+      eq([pvN.existingRun, pvN.decision, pvN.approval.required, pvN.approval.canApprove, pvN.approval.withinPolicy], [null, 'ADMIN_APPROVAL', true, true, true], 'decisión');
+      assert(dec(pvN.estimate.expected) > 0 && dec(pvN.estimate.max) >= dec(pvN.estimate.expected), 'totales');
+      assert(dec(pvN.estimate.byCategory.presentations.expected) > 0 && dec(pvN.estimate.byCategory.audio.expected) > 0 && dec(pvN.estimate.byCategory.content.expected) > 0, 'familias');
+      eq(dec(pvN.estimate.byCategory.videos.expected), 0, 'videos de vista previa ⇒ 0');
+      eq([pvN.counts.modules, pvN.counts.chapters, pvN.counts.videos, pvN.counts.moduleExams, pvN.counts.finalExam], [1, 2, 2, 1, true], 'conteos');
+      eq(dec(pvN.approval.amount), dec(pvN.estimate.max), 'monto = max (límites holgados)');
+      assert(/^[0-9a-f]{64}$/.test(pvN.estimateHash), 'huella');
+      eq((await runs.previewStart(N.cid, NOT_ADMIN, 1, NCTX)).approval.canApprove, false, 'otro email no aprueba');
+      eq((await ds.query(`select count(*)::int n from public.cost_estimates where course_id = $1`, [N.cid]))[0].n, before, 'sin escrituras');
+      eq((await authRows(N.cid)).length, 0, 'sin aprobaciones');
+    });
+
+    await check('DB flujo normal: sin rol → 403 approval_forbidden; huella vieja → 409 estimate_stale con el estimado nuevo; nada creado', async () => {
+      await rejectsRe(runs.approveAndStart(N.cid, NOT_ADMIN, 1, NCTX, pvN.estimateHash), /approval_forbidden/, 'sin rol', 403);
+      const err = await rejectsRe(runs.approveAndStart(N.cid, ADMIN, 1, NCTX, 'f'.repeat(64)), /estimate_stale/, 'huella vieja', 409);
+      eq(err.getResponse().preview.estimateHash, pvN.estimateHash, 'devuelve el estimado vigente');
+      assert(!('_plan' in err.getResponse().preview) && !('_evaluation' in err.getResponse().preview), 'sin internos');
+      eq((await authRows(N.cid)).length, 0, 'sin aprobaciones');
+      eq((await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [N.cid]))[0].n, 0, 'sin run');
+    });
+
+    let runN = null;
+    await check('DB flujo normal: «Autorizar y generar» → aprobación ADMIN_APPROVED persistida (email del JWT, monto del servidor, huella en reason) + run creado que la consume y la vincula', async () => {
+      const res = await runs.approveAndStart(N.cid, ADMIN, 1, NCTX, pvN.estimateHash);
+      eq([res.created, dec(res.approval.amount)], [true, dec(pvN.approval.amount)], 'creado');
+      runN = res.run.id;
+      const rows = await authRows(N.cid);
+      eq(rows.map((r) => [r.decision, r.run_id === null, r.approved_by]), [['ADMIN_APPROVED', true, 'Admin@Cursia.test'], ['ADMIN_APPROVED', false, 'Admin@Cursia.test']], 'aprobación + vinculación');
+      eq(rows[0].reason, `ui_normal_approval:${pvN.estimateHash}`, 'huella en reason');
+      eq([dec(rows[0].b), dec(rows[1].b)], [dec(pvN.approval.amount), dec(pvN.approval.amount)], 'monto del servidor');
+      eq(rows[1].estimate_id, rows[0].estimate_id, 'estimado aprobado vinculado al run');
+      eq(rows[1].reason, `bound_from:${rows[0].id}`, 'consumida');
+      const [job] = await ds.query(`select course_id, input_payload->>'manifestId' as m from public.production_jobs where id = $1`, [runN]);
+      eq([Number(job.course_id), Number(job.m)], [N.cid, N.manifest.id], 'run del curso y Manifest correctos');
+      eq(await budget.findUnconsumedApproval(N.cid, N.manifest.id, '0'), null, 'nada sin consumir');
+    });
+
+    await check('DB flujo normal: doble clic / reintento → devuelve el MISMO run, sin aprobaciones nuevas; preview con run existente ⇒ existingRun', async () => {
+      const n0 = (await authRows(N.cid)).length;
+      const again = await runs.approveAndStart(N.cid, ADMIN, 1, NCTX, pvN.estimateHash);
+      eq([again.created, again.run.id], [false, runN], 'mismo run');
+      eq((await authRows(N.cid)).length, n0, 'sin aprobaciones nuevas');
+      const pv = await runs.previewStart(N.cid, ADMIN, 1, NCTX);
+      eq([pv.existingRun && pv.existingRun.id, pv.estimate, pv.estimateHash], [runN, null, null], 'existingRun');
+    });
+
+    await check('DB flujo normal: dos clics simultáneos → UN run y UNA aprobación consumida (advisory lock + índice de run activo)', async () => {
+      const Q = await makeCourse('Curso doble clic');
+      await coursePolicy(Q.cid, { maxCostPerRun: '1000' });
+      const pv = await runs.previewStart(Q.cid, ADMIN, 1, NCTX);
+      const rs = await Promise.allSettled([runs.approveAndStart(Q.cid, ADMIN, 1, NCTX, pv.estimateHash), runs.approveAndStart(Q.cid, ADMIN, 1, NCTX, pv.estimateHash)]);
+      const ok = rs.filter((r) => r.status === 'fulfilled').map((r) => r.value.run.id);
+      assert(ok.length >= 1 && new Set(ok).size === 1, `un solo run (${JSON.stringify(rs.map((r) => r.status === 'rejected' ? String(r.reason && r.reason.message) : 'ok'))})`);
+      eq((await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [Q.cid]))[0].n, 1, 'un run');
+      const rows = await authRows(Q.cid);
+      eq(rows.filter((r) => r.run_id === null).length, 1, 'una sola aprobación de UI');
+      eq(await budget.findUnconsumedApproval(Q.cid, Q.manifest.id, '0'), null, 'consumida');
+    });
+
+    await check('DB flujo normal: gasto nuevo del curso tras el preview ⇒ la huella queda vieja (409 estimate_stale); con la huella nueva sí aprueba', async () => {
+      const G = await makeCourse('Curso gasto cambia');
+      await coursePolicy(G.cid, { maxCostPerRun: '1000', maxCostPerCourse: '1000' });
+      const pv = await runs.previewStart(G.cid, ADMIN, 1, NCTX);
+      await ds.query(`insert into public.generation_cost_events (course_id, event_kind, operation, provider, idempotency_key, amount, cost_source, billing_account, billable, recorded_by)
+                      values ($1, 'CHARGE', 'llm.x', 'anthropic', $2, 0.5, 'CALCULATED_FROM_USAGE', 'cursia', true, 't')`, [G.cid, `test-normal-${G.cid}`]);
+      await rejectsRe(runs.approveAndStart(G.cid, ADMIN, 1, NCTX, pv.estimateHash), /estimate_stale/, 'gasto cambió', 409);
+      const pv2 = await runs.previewStart(G.cid, ADMIN, 1, NCTX);
+      assert(pv2.estimateHash !== pv.estimateHash, 'huella nueva');
+      eq((await runs.approveAndStart(G.cid, ADMIN, 1, NCTX, pv2.estimateHash)).created, true, 'con la huella nueva');
+    });
+
+    await check('DB flujo normal: esperado sobre maxCostPerRun (on_exceed ADMIN_APPROVAL) o sobre el mes ⇒ 409 budget_blocked nombrando el límite; nada creado (no sube límites)', async () => {
+      const K = await makeCourse('Curso sobre límite');
+      await coursePolicy(K.cid, { maxCostPerRun: '0.0001' });
+      const pv = await runs.previewStart(K.cid, ADMIN, 1, NCTX);
+      eq([pv.approval.withinPolicy, pv.approval.blockedBy.map((b) => b.limit)], [false, ['maxCostPerRun']], 'preview bloqueado');
+      const err = await rejectsRe(runs.approveAndStart(K.cid, ADMIN, 1, NCTX, pv.estimateHash), /budget_blocked.*maxCostPerRun/, 'bloqueado', 409);
+      eq(err.getResponse().blockedBy[0].limit, 'maxCostPerRun', 'límite nombrado');
+      const M = await makeCourse('Curso mes agotado');
+      await coursePolicy(M.cid, { maxCostPerRun: '1000', monthlyCap: '0.0001' });
+      const pvm = await runs.previewStart(M.cid, ADMIN, 1, NCTX);
+      await rejectsRe(runs.approveAndStart(M.cid, ADMIN, 1, NCTX, pvm.estimateHash), /budget_blocked.*monthlyCap/, 'mes', 409);
+      for (const c of [K.cid, M.cid]) {
+        eq((await authRows(c)).length, 0, 'sin aprobaciones');
+        eq((await ds.query(`select count(*)::int n from public.production_jobs where course_id = $1`, [c]))[0].n, 0, 'sin run');
+      }
+    });
+
+    await check('DB flujo normal: monto acotado por el límite por run (max > límite ≥ esperado) — la aprobación nunca supera la política', async () => {
+      const L = await makeCourse('Curso acotado');
+      const pv0 = await runs.previewStart(L.cid, ADMIN, 1, NCTX); // sin política del curso: la global (si hay) o ninguna
+      assert(pv0.estimate, 'estimado');
+      const mid = ((dec(pv0.estimate.expected) + dec(pv0.estimate.max)) / 2).toFixed(6);
+      await coursePolicy(L.cid, { maxCostPerRun: mid });
+      const pv = await runs.previewStart(L.cid, ADMIN, 1, NCTX);
+      eq([pv.approval.withinPolicy, pv.approval.cappedByLimit, dec(pv.approval.amount)], [true, 'maxCostPerRun', dec(mid)], 'acotado');
+      const res = await runs.approveAndStart(L.cid, ADMIN, 1, NCTX, pv.estimateHash);
+      const [bound] = await ds.query(`select authorized_budget::text as b from public.cost_budget_authorizations where run_id = $1`, [res.run.id]);
+      eq(dec(bound.b), dec(mid), 'presupuesto del run = límite');
+    });
+
+    await check('DB flujo normal: una aprobación de más de 24 h sin usar ya no se reutiliza (vence)', async () => {
+      const V = await makeCourse('Curso aprobación vieja');
+      const [est] = await ds.query(`insert into public.cost_estimates (scope, owner_id, course_id, manifest_id, estimator_version, usage_model_version, currency, pricing_versions, lines, totals, created_by)
+        select scope, owner_id, $1, $2, estimator_version, usage_model_version, currency, pricing_versions, lines, totals, created_by from public.cost_estimates where course_id = $3 limit 1 returning id`,
+        [V.cid, V.manifest.id, N.cid]);
+      await ds.query(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, currency, decision, approved_by, reason, created_at)
+                      values ($1, $2, 1000, 'USD', 'ADMIN_APPROVED', 'x@y', 'old', now() - interval '25 hours')`, [V.cid, est.id]);
+      eq(await budget.findUnconsumedApproval(V.cid, V.manifest.id, '0'), null, 'vencida');
+      await ds.query(`insert into public.cost_budget_authorizations (course_id, estimate_id, authorized_budget, currency, decision, approved_by, reason, created_at)
+                      values ($1, $2, 1000, 'USD', 'ADMIN_APPROVED', 'x@y', 'fresh', now() - interval '1 hour')`, [V.cid, est.id]);
+      const fresh = await budget.findUnconsumedApproval(V.cid, V.manifest.id, '0');
+      assert(fresh && fresh.approved_by === 'x@y', 'la de 1 h sí está vigente');
+    });
+
+    await check('DB flujo normal (review I2): si el run no se puede crear, la aprobación TAMPOCO queda (misma tx) — otro run activo del curso ⇒ 409 en el preview, sin escrituras', async () => {
+      const O = await makeCourse('Curso con otro run');
+      await coursePolicy(O.cid, { maxCostPerRun: '1000' });
+      const pv = await runs.previewStart(O.cid, ADMIN, 1, NCTX);
+      // Otro Manifest del mismo curso con un run activo (Blueprint 2) aparece DESPUÉS del preview.
+      await ds.query(`insert into public.production_jobs (course_id, owner_id, execution_mode, status, worker_status, input_payload)
+                      values ($1, $2, 'dynamic_generation', 'processing', 'running', $3::jsonb)`, [O.cid, OWNER, JSON.stringify({ manifestId: 999999 })]).catch(() => null);
+      const n0 = (await authRows(O.cid)).length;
+      let err = null;
+      try { await runs.approveAndStart(O.cid, ADMIN, 1, NCTX, pv.estimateHash); } catch (e) { err = e; }
+      assert(err, 'no debe iniciar con otro run activo');
+      eq((await authRows(O.cid)).length, n0, 'sin aprobación colgada');
+    });
+
+    await check('DB flujo normal (review I4): tope mensual compartido — dos cursos aprobados a la vez no se reparten dos veces el remanente (lock global + comprometido de runs vivos)', async () => {
+      const X = await makeCourse('Curso mes X');
+      const Y = await makeCourse('Curso mes Y');
+      const pvx0 = await runs.previewStart(X.cid, ADMIN, 1, NCTX);
+      const e = dec(pvx0.estimate.expected);
+      const m = dec(pvx0.estimate.max);
+      // Tope mensual que alcanza para UNO (monto = max) pero no para dos (el esperado del segundo ya no entra).
+      const month = (await budget.monthCommitted()).total;
+      const cap = (dec(month) + m + e / 2).toFixed(6);
+      for (const c of [X.cid, Y.cid]) await coursePolicy(c, { maxCostPerRun: '1000', monthlyCap: cap });
+      const [px, py] = [await runs.previewStart(X.cid, ADMIN, 1, NCTX), await runs.previewStart(Y.cid, ADMIN, 1, NCTX)];
+      eq([px.approval.withinPolicy, py.approval.withinPolicy], [true, true], 'cada uno por separado entra');
+      const rs = await Promise.allSettled([runs.approveAndStart(X.cid, ADMIN, 1, NCTX, px.estimateHash), runs.approveAndStart(Y.cid, ADMIN, 1, NCTX, py.estimateHash)]);
+      const ok = rs.filter((r) => r.status === 'fulfilled');
+      eq(ok.length, 1, `uno solo (${JSON.stringify(rs.map((r) => r.status === 'rejected' ? String(r.reason && r.reason.message).slice(0, 60) : 'ok'))})`);
+      const loser = rs.find((r) => r.status === 'rejected');
+      assert(/budget_blocked|estimate_stale/.test(String(loser.reason && loser.reason.message)), 'el otro: bloqueado/obsoleto');
+      const committed = await budget.monthCommitted();
+      assert(dec(committed.total) <= dec(cap) + 1e-9, `comprometido ${committed.total} ≤ tope ${cap}`);
+      const losers = [X.cid, Y.cid].filter((c) => !ok.some((r) => Number(r.value.run.course_id ?? 0) === c));
+      const totalUi = (await ds.query(`select count(*)::int n from public.cost_budget_authorizations where course_id = any($1::int[]) and reason like 'ui_normal_approval:%'`, [[X.cid, Y.cid]]))[0].n;
+      eq(totalUi, 1, 'una sola aprobación de UI entre los dos');
+    });
+
+    await check('DB flujo normal (review I3/I5): aprobación de admin vigente (p.ej. calibración) ⇒ el preview no pide aprobar (existing) y el owner sin rol inicia por el camino normal; approve-and-start nunca la reutiliza con otro monto', async () => {
+      const Z = await makeCourse('Curso con aprobación previa');
+      await coursePolicy(Z.cid, { maxCostPerRun: '1000' });
+      const err = await rejectsRe(startRunT(Z.cid, OWNER, 1, NCTX), /budget_approval_required/, 'sin aprobación', 409);
+      await admin.authorize(Z.cid, { estimateId: err.getResponse().estimateId, authorizedBudget: '999' }, ADMIN_USER);
+      const pv = await runs.previewStart(Z.cid, NOT_ADMIN, 1, NCTX);
+      eq([pv.approval.required, dec(pv.approval.existing.amount)], [false, 999], 'existing ⇒ no requiere');
+      const res = await runs.startRun(Z.cid, OWNER, 1, NCTX);
+      eq(res.created, true, 'owner sin rol inicia (consume la aprobación de admin)');
+      eq((await ds.query(`select count(*)::int n from public.cost_budget_authorizations where course_id = $1 and reason like 'ui_normal_approval:%'`, [Z.cid]))[0].n, 0, 'sin aprobación de UI');
+    });
+
+    await check('DB flujo normal (review I5): sin FinOps → preview de un run solo-mock sin estimado (camino normal); con proveedores pagados → 503 finops_unavailable', async () => {
+      const noFin = new RunsService(ds, manifests, {}, ytOk);
+      const W = await makeCourse('Curso sin finops');
+      const pv = await noFin.previewStart(W.cid, ADMIN, 1, MOCK_CTX);
+      eq([pv.existingRun, pv.estimate, pv.approval], [null, null, null], 'mock sin FinOps');
+      await rejectsRe(noFin.previewStart(W.cid, ADMIN, 1, NCTX), /finops_unavailable/, 'pagados sin FinOps', 503);
+    });
+  } finally {
+    if (app) await app.close().catch(() => {});
+    if (ds && ds.isInitialized) await ds.destroy().catch(() => {});
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+    if (started) pg('pg_ctl', ['-D', dataDir, '-m', 'immediate', '-w', 'stop']);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.rmSync(tmpCwd, { recursive: true, force: true });
+    console.log('PG16 descartable destruido');
+  }
+}
+
+(async () => {
+  await pureChecks();
+  if (PURE_ONLY) {
+    console.log('ℹ️  --pure-only: parte DB (PG16 desechable) NO ejecutada');
+  } else {
+    try {
+      await dbChecks();
+    } catch (err) {
+      failures++;
+      console.error(`❌ setup de la parte DB falló: ${err && err.stack ? err.stack : err}`);
+    }
+  }
+  console.log(`\n${passes} ok, ${failures} fail`);
+  process.exit(failures > 0 ? 1 : 0);
+})();

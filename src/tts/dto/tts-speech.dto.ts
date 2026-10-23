@@ -13,7 +13,7 @@ export class TtsSpeechDto {
   @MaxLength(50)
   voice?: string;
 
-  /** Modelo OpenAI TTS (default: gpt-4o-mini-tts) */
+  /** Modelo OpenAI TTS (default: snapshot gpt-4o-mini-tts-2025-03-20; el alias gpt-4o-mini-tts se normaliza al snapshot — r60) */
   @IsOptional()
   @IsString()
   @MaxLength(80)
@@ -33,4 +33,16 @@ export class TtsSpeechDto {
   @IsString()
   @MaxLength(300)
   instructions?: string;
+
+  /**
+   * Opcional: curso para el que se sintetiza (id numérico de `courses` o UUID
+   * del frontend). Si es un curso V2 (structure_version='dynamic') → 409
+   * `v2_course_legacy_audio_disabled:` antes de llamar a OpenAI. Sin este campo
+   * el endpoint sigue siendo un proxy sin contexto de curso (comportamiento
+   * legacy intacto).
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(80)
+  courseId?: string;
 }

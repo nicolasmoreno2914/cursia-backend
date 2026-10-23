@@ -12,6 +12,13 @@ import { ProductionStep } from '../modules/production-jobs/entities/production-s
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { Institution } from '../modules/institutions/entities/institution.entity';
 import { BrandProfile } from '../modules/brand-profiles/entities/brand-profile.entity';
+import { CourseModule as CourseModuleEntity } from '../modules/course-structure/entities/course-module.entity';
+import { CourseChapter } from '../modules/course-structure/entities/course-chapter.entity';
+import { CourseBlueprint } from '../modules/course-blueprints/entities/course-blueprint.entity';
+import { CourseGenerationManifest } from '../modules/generation-manifests/entities/course-generation-manifest.entity';
+import { GenerationItemRun } from '../modules/dynamic-generation/entities/generation-item-run.entity';
+
+import { dbPoolConfig } from './db-pool-config';
 
 @Module({
   imports: [
@@ -25,7 +32,7 @@ import { BrandProfile } from '../modules/brand-profiles/entities/brand-profile.e
         username: config.get<string>('DB_USER', 'postgres'),
         password: config.get<string>('DB_PASS', 'postgres'),
         database: config.get<string>('DB_NAME', 'orbia'),
-        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark, ProductionJob, ProductionStep, Artifact, Institution, BrandProfile],
+        entities: [Course, CourseVersion, YoutubeConnection, UsageEvent, CostRate, TraditionalCostBenchmark, ProductionJob, ProductionStep, Artifact, Institution, BrandProfile, CourseModuleEntity, CourseChapter, CourseBlueprint, CourseGenerationManifest, GenerationItemRun],
         synchronize: config.get<string>('NODE_ENV', 'development') === 'development',
         logging: config.get<string>('DB_LOGGING', 'false') === 'true',
         ssl: config.get<string>('DB_SSL', 'false') === 'true'
@@ -38,12 +45,14 @@ import { BrandProfile } from '../modules/brand-profiles/entities/brand-profile.e
         // `extra` reduce conexiones idle que Supabase puede cortar del lado servidor.
         retryAttempts: 10,
         retryDelay: 3000,
+        // V2.1 calibración #2: tamaño del pool POR PROCESO (api vs worker), configurable por
+        // entorno; sin variables = los valores de siempre (max 5, idle 20 s). Ver db-pool-config.ts.
         extra: {
-          max: 5,
+          max: dbPoolConfig().max,
           min: 0,
           keepAlive: true,
           keepAliveInitialDelayMillis: 10000,
-          idleTimeoutMillis: 20000,
+          idleTimeoutMillis: dbPoolConfig().idleTimeoutMillis,
           connectionTimeoutMillis: 10000,
         },
       }),

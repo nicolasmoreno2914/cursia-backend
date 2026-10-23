@@ -52,6 +52,18 @@ export class Artifact {
   @Column({ type: 'jsonb', nullable: true, default: '{}' })
   metadata: Record<string, any>;
 
+  @Column({ name: 'module_id', type: 'uuid', nullable: true })
+  moduleId: string;
+
+  @Column({ name: 'chapter_id', type: 'uuid', nullable: true })
+  chapterId: string;
+
+  @Column({ type: 'text', nullable: true })
+  status: string; // ready | stale | disabled — null para artifacts legacy sin este concepto
+
+  @Column({ name: 'generated_with_version_id', nullable: true })
+  generatedWithVersionId: number;
+
   @Column({ name: 'expires_at', type: 'timestamptz', nullable: true })
   expiresAt: Date;
 

@@ -1,0 +1,193 @@
+// Cursia V2.1 / R8 — actividad de video interactivo (H5P.InteractiveVideo en
+// mod_h5pactivity core) a partir del plan determinístico + `video_interactions`.
+import { createHash } from 'crypto';
+import { buildContentOnlyH5p } from '../package';
+import { buildInteractiveVideo } from '../types/interactive-video';
+import { DroppedReflection, ReflectionPause, VideoCheckpoint, VideoTimelineSource, planInteractionCheckpoints, videoPlanDurationSec } from './plan';
+import {
+  VIDEO_INTERACTIONS_SCHEMA_VERSION_V2,
+  VideoInteractionsDoc,
+  checkpointRemediation,
+  checkpointToChoiceInput,
+  validateVideoInteractionsDocFull,
+} from './interactions-doc';
+
+export interface BuildVideoActivityInput {
+  /** item_key del video (`video:<ch>`); también semilla de los subContentId UUID. */
+  itemKey: string;
+  title: string;
+  youtubeId: string;
+  /** Duración REAL del video (artifact de Videogen), no la del LLM. */
+  durationSec: number;
+  interactionsDoc: VideoInteractionsDoc | unknown;
+  /**
+   * EV6 IV avanzado (Manifest `features.ivAdvanced = 1`): exige `video_interactions`
+   * schemaVersion 2 → pausas de reflexión + remediación. Ausente/false ⇒ v1, bytes de siempre.
+   */
+  ivAdvanced?: boolean;
+  /**
+   * r61 Q-04: escenas de Videogen guardadas con el video (artifact `dynamic_video.videoScenes`). Con
+   * escenas utilizables las preguntas se colocan al final de la escena que cubren; sin ellas, el plan
+   * equidistante de siempre (bytes idénticos).
+   */
+  videoScenes?: unknown;
+  /**
+   * r61 Q-04 (re-review I-2): segundos con los que se validaron las preguntas (v3Validation.checkpointsAtSec). Si
+   * difieren del plan re-derivado se usan ESTOS (el empaquetado ya verificó que siguen cumpliendo el invariante).
+   */
+  checkpointsAtSec?: number[];
+  /** r61 Q-04: pausas de reflexión validadas (v3Validation.reflectionsAt); ver checkpointsAtSec. */
+  reflectionsAt?: Array<{ index: number; atSec: number; afterCheckpoint: number }>;
+}
+
+export interface VideoActivityBuild {
+  /** `.h5p` solo contenido (bytes determinísticos). */
+  h5p: Buffer;
+  interactionCount: number;
+  maxScore: number;
+  subContentIds: string[];
+  checkpoints: VideoCheckpoint[];
+  /** r61 Q-04: origen de los segundos de las preguntas. */
+  timelineSource: VideoTimelineSource;
+  timelineReason?: string;
+  /** r61 Q-04 (I-2): los segundos salieron de la validación (difieren del plan re-derivado hoy). */
+  checkpointsFromValidation?: boolean;
+  sha1: string;
+  sha256: string;
+  /** EV6 IV avanzado: pausas colocadas y descartadas (vacías en v1). */
+  reflections?: ReflectionPause[];
+  droppedReflections?: DroppedReflection[];
+}
+
+/**
+ * Valida el documento del LLM contra el plan (misma duración, mismo itemKey) y
+ * construye el `.h5p` con R7 `buildInteractiveVideo`. Falla fuerte ante cualquier desvío.
+ */
+export async function buildVideoActivity(input: BuildVideoActivityInput): Promise<VideoActivityBuild> {
+  if (!input || typeof input !== 'object') throw new Error('VIDEO_ACTIVITY_INVALID: input debe ser un objeto');
+  const durationSec = videoPlanDurationSec(input.durationSec);
+  // Primero el plan de la duración REAL: un video corto falla con VIDEO_TOO_SHORT_FOR_INTERACTIONS
+  // antes de mirar el documento del LLM.
+  planInteractionCheckpoints(durationSec);
+  const advanced = input.ivAdvanced === true;
+  const full = validateVideoInteractionsDocFull(input.interactionsDoc, {
+    videoItemKey: input.itemKey,
+    // Review M-7: la duración MEDIDA cruda (el plan escala las escenas con ella); el .h5p usa la entera.
+    durationSec: input.durationSec,
+    ...(Array.isArray(input.checkpointsAtSec) ? { checkpointsAtSec: input.checkpointsAtSec } : {}),
+    ...(advanced && Array.isArray(input.reflectionsAt) ? { reflectionsAt: input.reflectionsAt } : {}),
+    ...(advanced ? { schemaVersion: VIDEO_INTERACTIONS_SCHEMA_VERSION_V2 } : {}),
+    ...(input.videoScenes !== undefined && input.videoScenes !== null ? { videoScenes: input.videoScenes } : {}),
+  });
+  const plan = full.checkpoints;
+  const doc = input.interactionsDoc as VideoInteractionsDoc;
+  const built = buildInteractiveVideo({
+    itemKey: input.itemKey,
+    title: input.title,
+    youtubeId: input.youtubeId,
+    durationSec,
+    interactions: doc.checkpoints.map((c, i) => ({
+      ...checkpointToChoiceInput(c),
+      atSec: plan[i].atSec,
+      ...(advanced ? { remediation: checkpointRemediation(c, plan[i], full.reflectionPlan.reflections) } : {}),
+    })),
+    ...(advanced
+      ? {
+          reflections: full.reflectionPlan.reflections.map((r, i) => {
+            const d = doc.reflections![i];
+            return { index: r.index, atSec: r.atSec, prompt: d.prompt, ...(d.hint !== undefined ? { hint: d.hint } : {}) };
+          }),
+        }
+      : {}),
+  });
+  if (built.maxScore !== plan.length || built.subContentIds.length !== plan.length) {
+    throw new Error(`VIDEO_ACTIVITY_INVARIANT: maxScore ${built.maxScore} / subContentIds ${built.subContentIds.length} ≠ ${plan.length}`);
+  }
+  const h5p = await buildContentOnlyH5p({
+    mainLibrary: built.mainLibrary,
+    content: built.content,
+    title: built.title,
+    language: 'es',
+    ...(built.extraDependencies ? { extraDependencies: built.extraDependencies } : {}),
+  });
+  return {
+    h5p,
+    interactionCount: plan.length,
+    maxScore: built.maxScore,
+    subContentIds: built.subContentIds,
+    checkpoints: plan,
+    timelineSource: full.timelineSource,
+    ...(full.timelineReason !== undefined ? { timelineReason: full.timelineReason } : {}),
+    ...(full.checkpointsFromValidation ? { checkpointsFromValidation: true } : {}),
+    sha1: createHash('sha1').update(h5p).digest('hex'),
+    sha256: createHash('sha256').update(h5p).digest('hex'),
+    ...(advanced ? { reflections: full.reflectionPlan.reflections, droppedReflections: full.reflectionPlan.droppedReflections } : {}),
+  };
+}
+
+// ── Archivos en el MBZ ────────────────────────────────────────────────────
+
+export const H5P_PACKAGE_MIMETYPE = 'application/zip.h5p';
+
+export interface H5pActivityFileEntry {
+  component: 'mod_h5pactivity';
+  filearea: 'package' | 'intro';
+  itemid: 0;
+  filepath: '/';
+  filename: string;
+  /** SHA-1 hex (contenthash del filepool de Moodle). */
+  contenthash: string;
+  filesize: number;
+  mimetype: string;
+  /** Ruta del blob dentro del .mbz: files/<hash[0..2]>/<hash>. */
+  blobPath: string;
+}
+
+/**
+ * Las DOS entradas de files.xml que necesita un video inline (R12 las emite):
+ * el mismo `.h5p` (mismo hash, un solo blob) en `package` (el reproductor de
+ * view.php) y en `intro` (el iframe embed.php del intro). Ambas en el contexto
+ * del módulo. El blob se escribe una sola vez en files/<hh>/<hash>.
+ */
+export function videoActivityFileEntries(input: { packageFilename: string; h5p: Buffer }): [H5pActivityFileEntry, H5pActivityFileEntry] {
+  if (!input || !Buffer.isBuffer(input.h5p) || input.h5p.length === 0) {
+    throw new Error('VIDEO_ACTIVITY_FILES_INVALID: h5p debe ser un Buffer no vacío');
+  }
+  if (typeof input.packageFilename !== 'string' || !/^[a-z0-9][a-z0-9._-]{0,120}\.h5p$/.test(input.packageFilename)) {
+    throw new Error(`VIDEO_ACTIVITY_FILES_INVALID: packageFilename ${JSON.stringify(input.packageFilename)}`);
+  }
+  const contenthash = createHash('sha1').update(input.h5p).digest('hex');
+  const base = {
+    component: 'mod_h5pactivity' as const,
+    itemid: 0 as const,
+    filepath: '/' as const,
+    filename: input.packageFilename,
+    contenthash,
+    filesize: input.h5p.length,
+    mimetype: H5P_PACKAGE_MIMETYPE,
+    blobPath: `files/${contenthash.slice(0, 2)}/${contenthash}`,
+  };
+  return [
+    { ...base, filearea: 'package' },
+    { ...base, filearea: 'intro' },
+  ];
+}
+
+/** Ajustes Moodle de la actividad de video (§K, R0): nota 0–100, aprobación 70, completion por nota aprobatoria. */
+export const VIDEO_ACTIVITY_MOODLE_SETTINGS = Object.freeze({
+  /**
+   * Máscara de DESHABILITADOS de H5PCore (FRAME 1 | DOWNLOAD 2 | EMBED 4 | COPYRIGHT 8) = 15:
+   * sin barra de acciones, sin "Reuse"/descarga ni "Embed" (§K.3 "sin descarga"). Es lo que guarda
+   * el formulario de Moodle con las casillas desmarcadas. OJO: 0 significa "mostrar todo".
+   */
+  displayoptions: 15,
+  grade: 100,
+  gradepass: 70,
+  grademethod: 1,
+  enabletracking: 1,
+  reviewmode: 1,
+  completion: 2,
+  completiongradeitemnumber: 0,
+  completionpassgrade: 1,
+  showdescription: 1,
+});

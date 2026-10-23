@@ -1,0 +1,304 @@
+{
+  "semantics": [
+    {
+      "label": "Introducción al Examen",
+      "fields": [
+        {
+          "label": "Mostrar introducción"
+        },
+        {
+          "label": "Título",
+          "description": "Este título será mostrado arriba del texto introductorio."
+        },
+        {
+          "label": "Texto introductorio",
+          "description": "Este texto será mostrado antes de que inicie el examen."
+        },
+        {
+          "label": "Texto botón Comenzar",
+          "default": "Comenzar Examen"
+        },
+        {
+          "label": "Imagen de Fondo",
+          "description": "Una imagen de fondo opcional para la introducción."
+        },
+        {
+          "label": "Alternative text",
+          "description": "If the browser can't load the image this text will be displayed instead. Also used by \"text-to-speech\" readers."
+        }
+      ]
+    },
+    {
+      "label": "Indicador del Progreso",
+      "description": "Question set progress indicator style. Will be Textual if backwards navigation is disabled.",
+      "options": [
+        {
+          "label": "Textual"
+        },
+        {
+          "label": "Puntos"
+        }
+      ]
+    },
+    {
+      "label": "Porcentaje aprobatorio",
+      "description": "Porcentaje del puntaje total requerido para pasar el examen."
+    },
+    {
+      "label": "Preguntas",
+      "widgets": [
+        {
+          "label": "Predeterminado"
+        },
+        {
+          "label": "Textual"
+        }
+      ],
+      "entity": "pregunta",
+      "field": {
+        "label": "Tipo de pregunta",
+        "description": "Librería para esta pregunta."
+      }
+    },
+    {
+      "label": "Textos de interfaz en examen",
+      "fields": [
+        {
+          "label": "Botón de Retroceso",
+          "default": "Pregunta anterior"
+        },
+        {
+          "label": "Back button label",
+          "default": "Previous"
+        },
+        {
+          "label": "Botón Siguiente",
+          "default": "Pregunta siguiente"
+        },
+        {
+          "label": "Next button label",
+          "default": "Next"
+        },
+        {
+          "label": "Botón Terminar",
+          "default": "Terminar"
+        },
+        {
+          "label": "Botón Enviar",
+          "default": "Submit"
+        },
+        {
+          "label": "Texto del Progreso",
+          "description": "Texto usado si progreso textual es seleccionado.",
+          "default": "Pregunta: @current de @total preguntas"
+        },
+        {
+          "label": "Etiqueta para saltar a una pregunta dada",
+          "description": "Usted debe usar el reemplazable '%d' en sustitución del número de la pregunta, y %total en lugar de cantidad total de preguntas.",
+          "default": "Pregunta %d de %total"
+        },
+        {
+          "label": "Question heading",
+          "default": "Pregunta"
+        },
+        {
+          "label": "Progreso para Lector de texto en voz alta",
+          "description": "Puede usar @current y @total como variables de preguntas",
+          "default": "Pregunta @current de @total"
+        },
+        {
+          "label": "Texto de pregunta no contestada",
+          "default": "No contestada"
+        },
+        {
+          "label": "Texto de pregunta contestada",
+          "default": "Contestada"
+        },
+        {
+          "label": "Texto de pregunta actual",
+          "default": "Pregunta actual"
+        },
+        {
+          "label": "Etiqueta de navegación para lectores de pantalla",
+          "default": "Preguntas"
+        },
+        {
+          "label": "Instruction for navigating question set with screenreader",
+          "default": "Choose question to display"
+        }
+      ]
+    },
+    {
+      "label": "Deshabilitar navegación hacia atrás",
+      "description": "Esta opción solamente le permitirá mover hacia adelante en Conjunto de Preguntas"
+    },
+    {
+      "label": "Barajear preguntas",
+      "description": "Habilitar para aleatorizar el orden de preguntas mostradas."
+    },
+    {
+      "label": "Número de preguntas a mostrar:",
+      "description": "Crear un lote aleatorizado de preguntas a partir del total."
+    },
+    {
+      "label": "Examen terminado",
+      "fields": [
+        {
+          "label": "Mostrar resultados"
+        },
+        {
+          "label": "Mostrar botón Solución"
+        },
+        {
+          "label": "Mostrar botón Reintentar"
+        },
+        {
+          "label": "Mensaje para Sin resultados",
+          "description": "Texto mostrado en página final cuando está deshabilitado el \"Mostrar resultados\"",
+          "default": "Terminado"
+        },
+        {
+          "label": "Results heading",
+          "default": "Results",
+          "description": "This heading will be displayed at the end of the quiz when the user has answered all questions."
+        },
+        {
+          "label": "Amount correct heading",
+          "description": "Header to show the final score to the user on the end screen",
+          "default": "@finals of @totals correct"
+        },
+        {
+          "label": "Anunciador del puntaje",
+          "description": "Esta etiqueta será usada para anunciar el puntaje final al usuario en la pantalla final",
+          "default": "Usted obtuvo @finals de @totals puntos"
+        },
+        {
+          "label": "Score heading",
+          "description": "Header for the score part of the results table",
+          "default": "Score"
+        },
+        {
+          "label": "Retroalimentación Global",
+          "fields": [
+            {
+              "widgets": [
+                {
+                  "label": "Predeterminado"
+                }
+              ],
+              "label": "Definir retroalimentación personalizada para cualquier rango de puntaje",
+              "description": "Haz clic en el botón \"Agregar rango\" para agregar tantos rangos como necesites. Ejemplo: 0-20% puntuación mala, 21-91% puntuación media, 91-100% puntuación excelente!",
+              "entity": "rango",
+              "field": {
+                "fields": [
+                  {
+                    "label": "Rango de Puntaje"
+                  },
+                  {},
+                  {
+                    "label": "Retroalimentación para rango definido de puntaje",
+                    "placeholder": "Complete la retroalimentación"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "label": "Retroalimentación Antigua",
+          "fields": [
+            {
+              "label": "Felicitación examen aprobado",
+              "description": "Este texto será mostrado arriba del puntaje si el usuario ha aprobado exitosamente el examen."
+            },
+            {
+              "label": "Comentario para Aprobado",
+              "description": "Este comentario será mostrado después del puntaje si el usuario ha aprobado exitosamente el examen."
+            },
+            {
+              "label": "Título para examen reprobado",
+              "description": "Este texto será mostrado arriba del puntaje si el usuario ha reprobado el examen."
+            },
+            {
+              "label": "Comentario para Reprobado",
+              "description": "Este comentario será mostrado después del puntaje si el usuario ha reprobado el examen."
+            }
+          ]
+        },
+        {
+          "label": "Etiqueta botón Solución",
+          "default": "Mostrar solución",
+          "description": "Texto para el botón de Solución."
+        },
+        {
+          "label": "Etiqueta botón Reintentar",
+          "default": "Reintentar",
+          "description": "Texto para el botón Reintentar."
+        },
+        {
+          "label": "Texto botón Terminar",
+          "default": "Terminar"
+        },
+        {
+          "label": "Texto del botón Enviar",
+          "default": "Enviar"
+        },
+        {
+          "label": "Mostrar video antes de resultados del examen"
+        },
+        {
+          "label": "Botón habilitar saltar video"
+        },
+        {
+          "label": "Etiqueta botón Saltar video",
+          "default": "Saltar video"
+        },
+        {
+          "label": "Video para aprobado",
+          "description": "Este video será reproducido si el usuario ha aprobado exitosamente el examen."
+        },
+        {
+          "label": "Video para reprobado",
+          "description": "Este video será reproducido si el usuario reprueba el examen."
+        }
+      ]
+    },
+    {
+      "label": "Behavioural settings",
+      "fields": [
+        {
+          "label": "Botones Mostrar \"Comprobar\"",
+          "description": "Esta opción determina si el botón para \"Comprobar\" será mostrado para todas las preguntas."
+        },
+        {
+          "label": "Anular el botón \"Mostrar Solución\"",
+          "description": "Esta opción determina si el botón \"Mostrar Solución\" será mostrado en todas las preguntas, desactivado para todas, o configurado para cada pregunta individualmente.",
+          "options": [
+            {
+              "label": "Habilitado"
+            },
+            {
+              "label": "Deshabilitado"
+            }
+          ]
+        },
+        {
+          "label": "Anular el botón de \"Reintentar\"",
+          "description": "Esta opción determina si el botón \"Reintentar\" será mostrado para todas las preguntas, deshabilitado para todas, o configurado para cada pregunta individualmente.",
+          "options": [
+            {
+              "label": "Habilitado"
+            },
+            {
+              "label": "Deshabilitado"
+            }
+          ]
+        },
+        {
+          "label": "Imagen de fondo",
+          "description": "Una imagen de fondo opcional para el Conjunto de preguntas."
+        }
+      ]
+    }
+  ]
+}

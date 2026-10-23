@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "תווית",
+      "description": "תווית/כותר לתשובה כאשר המשתמש מייצא את כל התשובות"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "תווית לא נתמכת בייצוא",
+      "default": "ייצוא לא נתמך על מכשירך"
+    },
+    {
+      "label": "כולל הערות במסמך המיוצא"
+    }
+  ]
+}

@@ -1,0 +1,894 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# deploy-staging.yml — CI/CD: push a staging → deploy automático a la instancia
+# de staging, en el MISMO VPS que producción pero en directorio/puerto/procesos
+# pm2 completamente separados. Nunca toca los procesos ni el directorio de
+# producción (cursia-backend en VPS_PATH) — ver deploy.yml para ese workflow.
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# REQUISITOS ADICIONALES (GitHub → Settings → Secrets and variables → Actions),
+# sobre los que ya existen para producción (VPS_HOST, VPS_USER, VPS_SSH_KEY):
+#
+#   VPS_PATH_STAGING     Directorio staging en el VPS, ej. /var/www/cursia-backend-staging
+#   HEALTH_URL_STAGING   URL de health check de staging, ej. https://api-staging.cursia.nomaddi.com/health
+#
+# El puerto y las credenciales de Supabase de staging viven en el .env propio
+# de VPS_PATH_STAGING en el VPS (nunca se sincronizan por rsync — ver el paso
+# de sync abajo, que excluye .env igual que el workflow de producción). Ese
+# .env se crea UNA sola vez a mano en el VPS; los deploys siguientes lo dejan
+# intacto.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+
+name: Deploy to Staging (Contabo VPS)
+
+on:
+  push:
+    branches: [staging]
+  # Calibración V2.1 (#2): con calibration_action ≠ none el dispatch corre SOLO el job
+  # `calibration` (sin rsync / npm / migraciones / reinicio de los 11 procesos). Un push o un
+  # dispatch con none despliega, y todo deploy deja DYNAMIC_PROVIDER_WORKER_ENABLED=true
+  # (staging operativo para generar cursos completos; worker_off lo apaga y queda apagado aunque haya deploys
+  # — DYNAMIC_WORKERS_HOLD — hasta un worker_on).
+  workflow_dispatch:
+    inputs:
+      calibration_action:
+        description: 'none = deploy normal; otra = acción de calibración V2.1 en staging SIN deploy'
+        type: choice
+        options: ['none', 'report', 'preflight', 'policy', 'authorize', 'reconcile_charged_dry', 'reconcile_charged', 'worker_on', 'worker_off', 'titles_dry', 'titles_apply', 'failures_report']
+        default: 'none'
+      calibration_course_id:
+        description: 'Id numérico del curso (authorize / report / reconcile_charged[_dry]; opcional en titles_dry/titles_apply/failures_report)'
+        type: string
+        default: ''
+      # T8 (factory mode): escape EXPLÍCITO de la guardia de congelamiento (DEPLOY_FREEZE + runs/empaques activos).
+      # Solo por dispatch: un push nunca la saltea. Ver docs/ops/FACTORY-MODE.md.
+      force_deploy:
+        description: 'yes = desplegar aunque DEPLOY_FREEZE=true o haya runs dinámicos / empaques activos (el deploy los interrumpe)'
+        type: choice
+        options: ['no', 'yes']
+        default: 'no'
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build & Deploy to Staging
+    if: github.event_name == 'push' || inputs.calibration_action == 'none' || inputs.calibration_action == ''
+    runs-on: ubuntu-latest
+    environment: staging
+
+    steps:
+      # T8 (factory mode): DEPLOY_FREEZE=true (variable del repo o del environment staging) congela TODO deploy;
+      # solo un workflow_dispatch con force_deploy=yes pasa. Primer paso: nada corre antes.
+      - name: Deploy freeze guard (DEPLOY_FREEZE variable)
+        env:
+          DEPLOY_FREEZE: ${{ vars.DEPLOY_FREEZE }}
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy || 'no' }}
+        run: |
+          freeze="$(printf '%s' "$DEPLOY_FREEZE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          if [ "$freeze" = "true" ]; then
+            if [ "$FORCE_DEPLOY" = "yes" ]; then
+              echo "::warning::DEPLOY_FREEZE=true pero force_deploy=yes: el deploy sigue (forzado)."
+            else
+              echo "::error::DEPLOY_FREEZE=true: deploys a staging congelados (factory mode). Forzar: workflow_dispatch con force_deploy=yes."
+              exit 1
+            fi
+          fi
+          echo "✓ sin DEPLOY_FREEZE (o forzado)"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install all dependencies (including devDeps for tsc)
+        run: npm ci
+
+      - name: Compile TypeScript on runner
+        run: npm run build
+
+      - name: Verify dist/main.js
+        run: |
+          if [ ! -f dist/main.js ]; then
+            echo "❌ dist/main.js no encontrado."
+            exit 1
+          fi
+          echo "✅ dist/main.js OK — $(du -sh dist/ | cut -f1)"
+
+      - name: Check Generation Manifest determinism
+        run: node scripts/check-generation-manifest-determinism.js
+
+      - name: Check Packaging Plan determinism (Fase 5B.1)
+        run: node scripts/check-packaging-plan-determinism.js
+
+      - name: Check Packaging exam/video mapping by UUID (Fase 5B.1)
+        run: node scripts/check-packaging-exam-video-mapping.js
+
+      - name: Check dynamic video delivery (Fase 5B.2.A)
+        run: node scripts/check-dynamic-video-delivery.js
+
+      - name: Check dynamic video delivery by YouTube (DN-1)
+        run: node scripts/check-dynamic-youtube-delivery.js
+
+      - name: Check dynamic-package-worker hardening (review-it2 fix wave)
+        run: node scripts/check-dynamic-package-worker-hardening.js
+
+      - name: Check dynamic feature gating (Fase 9 — G1/G3/G4 + video real I1)
+        run: node scripts/check-dynamic-feature-gating.js
+
+      - name: Check T8 deploy freeze guard (DEPLOY_FREEZE + runs/empaques activos; puro, la parte PG16 corre local)
+        run: node scripts/check-deploy-freeze-guard.js --pure-only
+
+      - name: Check deploy workflows run the dynamic workers (HD-6)
+        run: node scripts/check-deploy-dynamic-workers.js
+
+      - name: Check V2 pre-acceptance guards (legacy audio 409, mock video no empaquetable)
+        run: node scripts/check-v2-acceptance-guards.js
+
+      - name: Check Coherence Engine rules/report (Fase 7)
+        run: node scripts/check-coherence-engine.js
+
+      - name: Check Invalidation plan by UUID (Fase 8)
+        run: node scripts/check-invalidation-plan.js
+
+      - name: Check Invalidation apply / packaging rules (Fase 8, puro)
+        run: node scripts/check-invalidation-apply.js
+
+      - name: Check V2.1 R3 Blueprint v2 + perfiles (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-blueprint-profiles.js --pure-only
+      - name: V2.1 Title Normalization (puro)
+        run: node scripts/check-v21-structure-titles.js --pure-only
+
+      - name: Check V2.1 R4 Manifest rulesVersion 3 (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-manifest-v3.js --pure-only
+
+      - name: Check V2.1 R5 invalidación v3 + coherencia v3 + auditorías v3 (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-invalidation-v3.js --pure-only
+
+      - name: Check V2.1 RF-b cableado FinOps (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-finops-wiring.js --pure-only
+
+      - name: Check V2.1 F2 proveedores reales Gamma/TTS contra fakes locales + preflight v3 + duración mvhd (puro; la parte PG16 corre local)
+        run: node scripts/check-v21-providers.js --pure-only
+
+      - name: Check V2.1 R12 empaque v3 (builder + validador §Q.8 + worker con fakes; puro, la restauración en Moodle corre local)
+        run: node scripts/check-v21-packaging-v3.js
+
+      - name: Check capacidad del pool de Postgres de staging (EMAXCONNSESSION, calibración #2; puro)
+        run: node scripts/check-db-pool-capacity.js --pure-only
+
+      - name: Check V2.1 F1 perfiles (pesos normalizados / curso sin nota, 409 al arrancar, paleta → presentación; puro)
+        run: node scripts/check-v21-f1-profiles.js
+
+      # REL R1 (I3, ruling conservador): el gate de códigos del BACKEND corre siempre y falla cerrado. La parte
+      # del FRONTEND (repo privado nicolasmoreno2914/cursia, rama staging) corre solo si existe el secret
+      # FRONTEND_REPO_READ_TOKEN (PAT fine-grained de solo lectura; agregarlo es decisión del owner): sin él se
+      # omite con un aviso visible y el deploy de staging NO se rompe. La obligatoriedad (--require-fe) vive en
+      # la regresión E2E (test/e2e-v2/run-e2e-v21.sh), que corre con el frontend presente y bloquea el merge.
+      - name: Detect FRONTEND_REPO_READ_TOKEN (REL R1 gate frontend)
+        id: fe_gate
+        env:
+          FRONTEND_REPO_READ_TOKEN: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+        run: |
+          if [ -n "$FRONTEND_REPO_READ_TOKEN" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::warning title=REL R1 gate frontend OMITIDO::Falta el secret FRONTEND_REPO_READ_TOKEN: el gate de códigos del ejecutor del navegador NO corre en este deploy (sí en la regresión E2E). El gate del backend corre igual."
+          fi
+
+      - name: Checkout frontend (staging) para el gate REL R1
+        if: steps.fe_gate.outputs.present == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: nicolasmoreno2914/cursia
+          ref: staging
+          path: frontend-for-gate
+          token: ${{ secrets.FRONTEND_REPO_READ_TOKEN }}
+          persist-credentials: false
+
+      - name: Check REL R1 clasificador central de fallos (tabla A/B/C/D + gate de códigos emitidos; backend siempre, frontend si hay token)
+        env:
+          FE_GATE_PRESENT: ${{ steps.fe_gate.outputs.present }}
+        run: |
+          if [ "$FE_GATE_PRESENT" = "true" ]; then
+            node scripts/check-rel-failure-classes.js --require-fe --fe frontend-for-gate
+          else
+            echo "::warning title=REL R1 gate frontend OMITIDO::solo se verifica el backend (sin FRONTEND_REPO_READ_TOKEN)"
+            node scripts/check-rel-failure-classes.js
+          fi
+
+      - name: Check REL R2 log de intentos + columnas de recuperación (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-recovery.js --pure-only
+
+      - name: Check REL MVP recuperación por clase (A/B) + reparación del empaque (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-mvp-recovery.js --pure-only
+
+      - name: Check REL lease de ejecución del navegador por run (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-exec-lease.js --pure-only
+
+      - name: Check REL sonda del proveedor tras crédito/cuota agotados (puro; la parte PG16 corre local)
+        run: node scripts/check-rel-provider-probe.js --pure-only
+
+      - name: Check r58 endurecimiento del pipeline (tipos del servidor, reuse verificado, procedencia LLM, URLs base en prod; puro, la parte PG16 corre local)
+        run: node scripts/check-r58-pipeline-hardening.js --pure-only
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      # T8 (factory mode): ANTES del rsync (nada del código nuevo llega al VPS) — consulta de SOLO LECTURA con el
+      # .env y el driver pg que ya están en el VPS; el script viaja por stdin (versión de este commit). Aborta si hay
+      # runs dinámicos activos, items reclamados o empaques activos (exit 2), DEPLOY_FREEZE=true en el .env del VPS
+      # (exit 3) o la consulta falla (exit 1, fail closed). force_deploy=yes → solo reporta.
+      - name: Deploy freeze guard (no active dynamic runs / package jobs on the staging VPS)
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH_STAGING: ${{ secrets.VPS_PATH_STAGING }}
+          FORCE_DEPLOY: ${{ github.event_name == 'workflow_dispatch' && inputs.force_deploy || 'no' }}
+        run: |
+          FORCE_ARG=""
+          if [ "$FORCE_DEPLOY" = "yes" ]; then FORCE_ARG="--force"; fi
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cd '$DEPLOY_VPS_PATH_STAGING' && node - $FORCE_ARG" < scripts/ops/check-active-runs.js
+
+      - name: Fix VPS staging file ownership (heals stale root-owned files)
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+              "sudo mkdir -p ${{ secrets.VPS_PATH_STAGING }} && sudo chown -R ${{ secrets.VPS_USER }}:${{ secrets.VPS_USER }} ${{ secrets.VPS_PATH_STAGING }}"
+
+      - name: Sync source + dist to VPS (staging path only — nunca toca VPS_PATH de producción)
+        run: |
+          rsync -az --delete \
+            --exclude '.git' \
+            --exclude 'node_modules' \
+            --exclude '.env' \
+            --exclude '.env.*' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            ./ "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:${{ secrets.VPS_PATH_STAGING }}/"
+
+      - name: Install prod deps + migrate + restart staging processes on VPS
+        env:
+          # V2.1 FinOps: secreto del environment "staging" de GitHub. Viaja por stdin
+          # (nunca en argv ni en el log) y se escribe en el .env de staging sin imprimirse.
+          FINOPS_INGEST_TOKEN_STAGING: ${{ secrets.FINOPS_INGEST_TOKEN_STAGING }}
+          # El script de abajo NO usa expresiones ${{ }}: GitHub limita a ~21000 caracteres un `run`
+          # que las contiene (el workflow se rechaza sin correr). Los valores entran por env.
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH_STAGING: ${{ secrets.VPS_PATH_STAGING }}
+        run: |
+          printf "%s\n" "$FINOPS_INGEST_TOKEN_STAGING" | ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+              'set -e
+               cd '"$DEPLOY_VPS_PATH_STAGING"'
+               IFS= read -r _FIT || true
+
+               if [ ! -f .env ]; then
+                 echo "❌ Falta .env en '"$DEPLOY_VPS_PATH_STAGING"' — créalo a mano una sola vez"
+                 echo "   (PORT distinto al de producción + credenciales del proyecto de Supabase de staging)."
+                 exit 1
+               fi
+
+               if grep -q "^NODE_ENV=production" .env; then
+                 echo "✓ NODE_ENV=production en el .env de staging"
+               else
+                 echo "✗ El .env de staging NO tiene NODE_ENV=production — TypeORM synchronize quedaría activo y borraría columnas (I5, Fase 5A)."
+                 exit 1
+               fi
+
+               # Fase 9 (flag-gating): V2 va detrás de flags de entorno que viven en
+               # el .env del VPS (no se sincroniza). Idempotente: solo AGREGA lo que
+               # falta; nunca imprime valores del .env, solo nombres de clave.
+               #
+               # NOTA de comillas: todo este bloque remoto viaja como UN string entre
+               # comillas SIMPLES dentro del paso de GitHub Actions (para poder pegar
+               # el secret VPS_PATH_STAGING a mitad de camino) — un caracter comilla
+               # simple literal en cualquier punto de acá ABAJO cortaría ese string a
+               # la mitad. Por eso, en vez de $(quote) o patrones tipo *"*, *#* con
+               # comillas simples, se arman los caracteres delicados (CR, comilla
+               # simple, comilla doble) con printf + código octal.
+               _Q_CR=$(printf "\015")
+               _Q_SQ=$(printf "\047")
+               _Q_DQ=$(printf "\042")
+               _Q_TAB=$(printf "\011")
+               # M3/M5 (review, fix wave): el valor de una línea KEY=... puede venir
+               # entrecomillado (KEY="true"), con un comentario al final (KEY=true #
+               # nota) o con CRLF (checkout/edición en Windows) — "pelamos" eso antes
+               # de comparar, para no dar un falso "apagado manual" ni un falso
+               # "ya incluye el owner" que en realidad dotenv nunca vería.
+               _flags_strip_value() {
+                 # arg 1: el valor crudo tras "KEY="; stdout: pelado de CRLF, comentario
+                 # final fuera de comillas y comillas simples/dobles que envuelven TODO.
+                 local v
+                 v="$1"
+                 v="${v%"$_Q_CR"}"
+                 case "$v" in
+                   "$_Q_DQ"*"$_Q_DQ"|"$_Q_SQ"*"$_Q_SQ") ;; # entrecomillado completo: no recortar un # de adentro
+                   *) v="${v%%#*}" ;;
+                 esac
+                 # rtrim de espacios que pudieran quedar antes de un comentario recortado
+                 while [ "${v: -1}" = " " ] || [ "${v: -1}" = "$_Q_TAB" ]; do v="${v%?}"; done
+                 case "$v" in
+                   "$_Q_DQ"*"$_Q_DQ") v="${v#"$_Q_DQ"}"; v="${v%"$_Q_DQ"}" ;;
+                   "$_Q_SQ"*"$_Q_SQ") v="${v#"$_Q_SQ"}"; v="${v%"$_Q_SQ"}" ;;
+                 esac
+                 printf "%s" "$v"
+               }
+               ensure_env_flag_true() {
+                 local key="$1"
+                 if grep -q "^${key}=" .env; then
+                   local raw val
+                   raw=$(grep "^${key}=" .env | tail -n 1)
+                   val=$(_flags_strip_value "${raw#${key}=}")
+                   if [ "$val" = "true" ]; then
+                     echo "✓ ${key} presente en el .env de staging"
+                   else
+                     echo "⚠️  ${key} está en el .env de staging con un valor distinto de true — se respeta (apagado manual); V2 queda OFF"
+                   fi
+                 else
+                   printf "\n%s=true\n" "$key" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                 fi
+               }
+               ensure_env_list_contains() {
+                 local key="$1"
+                 local item="$2"
+                 local count
+                 count=$(grep -c "^${key}=" .env || true)
+                 if [ "$count" -eq 0 ]; then
+                   printf "\n%s=%s\n" "$key" "$item" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                   return 0
+                 fi
+                 if [ "$count" -gt 1 ]; then
+                   echo "⚠️  ${key} aparece más de una vez en el .env de staging — no se toca automáticamente (dotenv usaría la última línea; revisar a mano)"
+                   return 0
+                 fi
+                 local raw val
+                 raw=$(grep "^${key}=" .env)
+                 val="${raw#${key}=}"
+                 case "$val" in
+                   *"$_Q_CR")
+                     echo "⚠️  ${key} termina en CRLF — no se toca automáticamente (normalizar el archivo a LF a mano)"
+                     return 0
+                     ;;
+                 esac
+                 case "$val" in
+                   *"$_Q_DQ"*|*"$_Q_SQ"*|*"#"*)
+                     echo "⚠️  ${key} tiene comillas o un comentario en su valor — no se toca automáticamente (agregar el owner a mano si falta)"
+                     return 0
+                     ;;
+                 esac
+                 if printf "%s" "$val" | tr "," "\n" | grep -qix "$item"; then
+                   echo "✓ ${key} ya incluye el owner de prueba de staging"
+                   return 0
+                 fi
+                 # M4 (review, fix wave): reescritura atómica. awk arma el archivo
+                 # completo en un tmp EN EL MISMO directorio (mismo filesystem → el
+                 # mv final es un rename atómico, nunca deja .env truncado a mitad de
+                 # escritura); se valida (no vacío, mismas líneas que el original)
+                 # ANTES de reemplazar, y se conserva un .env.bak (rsync ya excluye
+                 # .env.* — no se sincroniza nunca a otro lado).
+                 local tmp new_line before_lines after_lines
+                 tmp=".env.flags.tmp.$$"
+                 new_line="${raw},${item}"
+                 awk -v old="$raw" -v new="$new_line" "!d && \$0 == old { \$0 = new; d = 1 } { print }" .env > "$tmp"
+                 if [ ! -s "$tmp" ]; then
+                   echo "❌ ${key}: la reescritura del .env salió vacía — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 # awk (no wc -l): wc -l cuenta SALTOS de línea, no líneas — un .env
+                 # sin newline final (EOF sin \n, caso real en algunos VPS) daría un
+                 # falso "cambió de líneas" y abortaría un edit válido. awk cuenta
+                 # registros (NR), coherente con cómo el propio awk de arriba escribió
+                 # "$tmp" (siempre termina cada línea con \n al hacer print).
+                 before_lines=$(awk "END{print NR}" .env)
+                 after_lines=$(awk "END{print NR}" "$tmp")
+                 if [ "$before_lines" != "$after_lines" ]; then
+                   echo "❌ ${key}: la reescritura del .env cambió de $before_lines a $after_lines líneas — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 cp .env .env.bak
+                 mv "$tmp" .env
+                 echo "+ owner de prueba de staging agregado a ${key} (backup: .env.bak)"
+               }
+
+               # Pre-aceptación V2: valor por defecto de staging SOLO si la clave no
+               # existe (nunca pisa un valor puesto a mano; imprime solo el nombre).
+               ensure_env_default_if_absent() {
+                 local key="$1"
+                 local value="$2"
+                 if grep -q "^${key}=" .env; then
+                   echo "✓ ${key} ya presente en el .env de staging — no se toca"
+                 else
+                   printf "\n%s=%s\n" "$key" "$value" >> .env
+                   echo "+ ${key} agregado al .env de staging"
+                 fi
+               }
+
+               # V2.1 aceptación rv3 (autorizado por Nicolás, 2026-09-26): fija una
+               # clave NO secreta a un valor exacto (reemplaza la línea existente o la
+               # agrega). Imprime SOLO esa clave antes/después. Reescritura atómica
+               # con validación y .env.bak, igual que ensure_env_list_contains.
+               ensure_env_exact() {
+                 local key="$1"
+                 local value="$2"
+                 local count
+                 count=$(grep -c "^${key}=" .env || true)
+                 if [ "$count" -eq 0 ]; then
+                   printf "\n%s=%s\n" "$key" "$value" >> .env
+                   echo "+ ${key}: (ausente) → ${value}"
+                   return 0
+                 fi
+                 if [ "$count" -gt 1 ]; then
+                   echo "❌ ${key} aparece más de una vez en el .env de staging — no se toca (revisar a mano)"
+                   return 1
+                 fi
+                 local raw before tmp before_lines after_lines
+                 raw=$(grep "^${key}=" .env)
+                 before=$(_flags_strip_value "${raw#${key}=}")
+                 if [ "$before" = "$value" ]; then
+                   echo "✓ ${key}: ya vale ${value} — no se toca"
+                   return 0
+                 fi
+                 tmp=".env.flags.tmp.$$"
+                 awk -v old="$raw" -v new="${key}=${value}" "!d && \$0 == old { \$0 = new; d = 1 } { print }" .env > "$tmp"
+                 before_lines=$(awk "END{print NR}" .env)
+                 after_lines=$(awk "END{print NR}" "$tmp")
+                 if [ ! -s "$tmp" ] || [ "$before_lines" != "$after_lines" ] || [ "$(grep -c "^${key}=${value}\$" "$tmp")" != "1" ]; then
+                   echo "❌ ${key}: la reescritura del .env no validó — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 cp .env .env.bak
+                 mv "$tmp" .env
+                 echo "+ ${key}: ${before} → ${value} (backup: .env.bak)"
+               }
+
+               # ── V2.1 FinOps (staging) ──────────────────────────────────────────
+               # Aislamiento: este deploy SOLO lee/escribe el .env de STAGING. Nunca
+               # lee el .env de producción ni copia claves desde producción.
+               # Valor de una clave en el .env de staging (última línea, pelado); vacío si no está.
+               _env_val() {
+                 local f="$1"
+                 local k="$2"
+                 local raw
+                 raw=$(grep "^${k}=" "$f" 2>/dev/null | tail -n 1 || true)
+                 [ -n "$raw" ] && _flags_strip_value "${raw#${k}=}"
+                 return 0
+               }
+               # Secreto que llega por stdin desde un secret de GitHub: se escribe sin imprimirlo.
+               ensure_env_secret() {
+                 local key="$1"
+                 local value="$2"
+                 local count cur tmp
+                 if [ -z "$value" ]; then echo "✗ ${key}: sin valor (falta el secret de GitHub) — no se toca"; return 0; fi
+                 count=$(grep -c "^${key}=" .env || true)
+                 if [ "$count" -gt 1 ]; then echo "❌ ${key} aparece más de una vez en el .env — no se toca"; return 1; fi
+                 cur=$(_env_val .env "$key")
+                 if [ "$cur" = "$value" ]; then echo "✓ ${key}: sin cambios"; return 0; fi
+                 if [ "$count" -eq 0 ]; then
+                   printf "\n%s=%s\n" "$key" "$value" >> .env
+                   echo "+ ${key}: configurado"
+                   return 0
+                 fi
+                 tmp=".env.flags.tmp.$$"
+                 awk -v k="$key" -v v="$value" "BEGIN{p=k \"=\"} index(\$0,p)==1 {print p v; next} {print}" .env > "$tmp"
+                 if [ ! -s "$tmp" ] || [ "$(awk "END{print NR}" .env)" != "$(awk "END{print NR}" "$tmp")" ]; then
+                   echo "❌ ${key}: la reescritura del .env no validó — se aborta sin tocar .env"
+                   rm -f "$tmp"
+                   return 1
+                 fi
+                 cp .env .env.bak
+                 mv "$tmp" .env
+                 echo "+ ${key}: actualizado (backup: .env.bak)"
+               }
+
+               ensure_pm2_process() {
+                 local name="$1"
+                 local start_script="$2"
+                 if sudo pm2 describe "$name" > /dev/null 2>&1; then
+                   sudo pm2 restart "$name" --update-env
+                 else
+                   sudo pm2 start npm --name "$name" -- run "$start_script"
+                 fi
+               }
+
+               # R16 (#1): workers dinámicos con drenado ordenado. Corren con node directo (la señal de PM2 llega a
+               # Node, no a un wrapper npm) y kill_timeout de 300 s: al recargar, PM2 manda SIGINT y espera a que el
+               # worker deje de reclamar y termine o devuelva sus items (tope interno 270 s) antes de matarlo.
+               # Un proceso heredado (npm run, kill_timeout 1,6 s) se recrea UNA vez; los deploys siguientes recargan.
+               # pm2 jlist ilegible (exit 2 del helper) → no se recrea nada: se recarga el proceso existente.
+               DRAIN_KILL_TIMEOUT_MS=300000
+               ensure_pm2_drain_worker() {
+                 local name="$1"
+                 local script="$2"
+                 local rc=0
+                 if sudo pm2 describe "$name" > /dev/null 2>&1; then
+                   sudo pm2 jlist | node scripts/pm2-drain-config.js check "$name" "$script" "$DRAIN_KILL_TIMEOUT_MS" || rc=$?
+                   if [ "$rc" = "1" ]; then
+                     sudo pm2 delete "$name"
+                     sudo pm2 start "$script" --name "$name" --kill-timeout "$DRAIN_KILL_TIMEOUT_MS"
+                   else
+                     [ "$rc" = "0" ] || echo "⚠️ ${name}: no se pudo leer pm2 jlist (rc=${rc}); se recarga sin recrear"
+                     sudo pm2 reload "$name" --update-env
+                   fi
+                 else
+                   sudo pm2 start "$script" --name "$name" --kill-timeout "$DRAIN_KILL_TIMEOUT_MS"
+                 fi
+               }
+
+               echo "━━━ [0/6] Verificar poppler-utils (pdftoppm — portadas de Gamma) ━━━"
+               command -v pdftoppm > /dev/null 2>&1 || sudo apt-get install -y poppler-utils
+
+               echo "━━━ [0b] Flags V2 de staging (DYNAMIC_COURSE_STRUCTURE, DYNAMIC_REAL_VIDEO_OWNERS, DYNAMIC_V2_ALLOWED_OWNERS, DYNAMIC_VIDEO_DELIVERY, DYNAMIC_MANIFEST_RULES_VERSION) ━━━"
+               ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE
+               # Owner de prueba de staging (un id, no un secreto) habilitado para video real (Videogen).
+               ensure_env_list_contains DYNAMIC_REAL_VIDEO_OWNERS aa2fa9a1-afb1-4b01-8646-94a0cb272b57
+               # Pre-aceptación V2 (decisión del owner): V2 solo para el owner de prueba,
+               # entrega de video por YouTube y reglas de Manifest v2 (estos dos últimos
+               # solo si faltan). DYNAMIC_COHERENCE_LLM NO se agrega (queda OFF).
+               ensure_env_list_contains DYNAMIC_V2_ALLOWED_OWNERS aa2fa9a1-afb1-4b01-8646-94a0cb272b57
+               ensure_env_default_if_absent DYNAMIC_VIDEO_DELIVERY youtube
+               # Aceptación rv3 de V2.1 (autorizado por Nicolás, 2026-09-26): reglas v3 en
+               # staging. Revertir = cambiar este 3 por 2 (los runs existentes conservan
+               # su rulesVersion congelado). El worker de proveedores se fija en [0c].
+               ensure_env_exact DYNAMIC_MANIFEST_RULES_VERSION 3
+               # EV6 H5P v2 (decisión 5 aprobada por Nicolás, 2026-09-30; validación 2026-10-01): reglas de
+               # actividad 2 en staging (objetivo «decidir» → Branching Scenario, IV avanzado, «Repaso» en
+               # cursos nuevos). Revertir = 0 (los runs existentes conservan su marcador congelado).
+               ensure_env_exact DYNAMIC_ACTIVITY_TYPE_RULES 2
+               # V542 (G2, decisión EV6 n.º 3): cursos NUEVOS sin diseño guardado en Aula Clara (claro). Solo
+               # los creados desde el PRIMER deploy de este cambio: el instante se calcula en el VPS y, como solo
+               # se escribe si falta, queda congelado en los deploys siguientes. Los anteriores conservan el
+               # tema de su paleta. Sin la variable el default claro está APAGADO.
+               ensure_env_default_if_absent PRESENTATION_LIGHT_DEFAULT_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+               # Prebrief pedagógico (2026-10-08): los cursos dinámicos creados DESDE el primer deploy de este cambio
+               # solo generan sobre una propuesta aprobada (los anteriores no cambian; entran al flujo si preparan una
+               # versión). Mismo patrón que arriba: se escribe solo si falta, así el instante queda congelado.
+               ensure_env_default_if_absent DYNAMIC_PREBRIEF_REQUIRED_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+               # r62 (d14): DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS (modo fábrica, T8) NUNCA lo escribe el deploy: el default
+               # del código es vacío = ningún run retiene el empaque. Si alguien lo dejó a mano en el .env, se avisa (no se borra:
+               # es una herramienta de operación legítima) para que no retenga en silencio el paquete de cuentas reales.
+               if grep -Eq "^DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS=.+" .env; then
+                 echo "⚠ DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS definido en el .env de staging (modo fábrica): los runs NUEVOS de esos owners nacen con el empaque RETENIDO hasta liberarlo a mano — quitarlo para operación normal"
+               else
+                 echo "✓ DYNAMIC_DEFAULT_HOLD_PACKAGING_OWNERS ausente (operación normal: ningún run retiene el empaque)"
+               fi
+               if grep -q "^DYNAMIC_COHERENCE_LLM=" .env; then
+                 echo "⚠️  DYNAMIC_COHERENCE_LLM está en el .env de staging — no se toca (la decisión de pre-aceptación es dejarlo OFF)"
+               else
+                 echo "✓ DYNAMIC_COHERENCE_LLM ausente (OFF)"
+               fi
+
+               echo "━━━ [0c] V2.1: FinOps + proveedores (solo el .env de STAGING) ━━━"
+               ensure_env_secret FINOPS_INGEST_TOKEN "${_FIT:-}"
+               # Worker de proveedores reales (Gamma/TTS): ENCENDIDO de forma permanente en staging
+               # (autorizado por Nicolás, 2026-09-29: staging debe generar cursos completos desde la
+               # UI). El gasto sigue bajo los gates FinOps (aprobación, límites por run/curso, guard
+               # previo a cada llamada pagada). Apagado de emergencia: dispatch worker_off (dura
+               # hasta el próximo deploy; para dejarlo apagado, cambiar este true por false).
+               # r58 (AU3 §J2): worker_off es PERSISTENTE — deja DYNAMIC_WORKERS_HOLD en true en el .env y el deploy
+               # lo respeta (los workers de proveedores y de IA quedan apagados) hasta un worker_on explícito.
+               _DYN_WORKERS=true
+               if grep -q "^DYNAMIC_WORKERS_HOLD=true$" .env; then
+                 _DYN_WORKERS=false
+                 echo "⚠ DYNAMIC_WORKERS_HOLD activo (worker_off persistente): workers de proveedores y de IA quedan APAGADOS"
+               fi
+               ensure_env_exact DYNAMIC_PROVIDER_WORKER_ENABLED "$_DYN_WORKERS"
+               # Gamma V2.1: temas por defecto (ids públicos de Gamma, no secretos), elegidos del
+               # listado real de la cuenta (GET /themes). Solo si faltan: un valor puesto a mano gana.
+               ensure_env_default_if_absent GAMMA_THEME_V21_LIGHT_DEFAULT default-light
+               ensure_env_default_if_absent GAMMA_THEME_V21_DARK_DEFAULT default-dark
+               # Calibración #2 (EMAXCONNSESSION): pooler de Supabase en modo sesión = 15 clientes.
+               # API 2 + 10 workers de polling x 1 = 12 teóricos; headroom 3 (migración del deploy,
+               # preflight/admin, report). Ver src/database/db-pool-config.ts y check-db-pool-capacity.js.
+               ensure_env_exact DB_POOL_MAX 2
+               ensure_env_exact DB_POOL_MAX_WORKER 1
+               ensure_env_exact DB_POOL_IDLE_MS_WORKER 1000
+               # Loop 6: worker de IA de las partes largas, HOSPEDADO en cursia-dynamic-provider-worker-staging (sin un
+               # proceso ni una conexión más: 12 + 3 = 15). Solo toma runs creados desde DYNAMIC_LLM_WORKER_SINCE (se fija en
+               # el primer deploy que lo trae; un valor puesto a mano gana): ningún run anterior (#1209 incluido) cambia.
+               # Apagado de emergencia: cambiar este true por false y desplegar (el navegador vuelve a todas las partes).
+               ensure_env_exact DYNAMIC_LLM_WORKER_ENABLED "$_DYN_WORKERS"
+               ensure_env_default_if_absent DYNAMIC_LLM_WORKER_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+               # Loop 9: el worker de IA genera TODAS las partes de IA (también las cortas): 4 partes en paralelo
+               # dentro del mismo proceso (tope 6 en el worker). Sin un proceso ni una conexión más (la cuenta del
+               # pooler no cambia: cada parte usa la conexión del proceso anfitrión).
+               ensure_env_exact DYNAMIC_LLM_WORKER_CONCURRENCY 4
+               # r59: el alias gpt-4o-mini-tts se cuelga ~45 % de las veces desde 2026-10-15/16 (2–3 min, y se cobra);
+               # el snapshot fijo no (0/13 en pruebas reales). OPENAI_TTS_MODEL pisa el default del código, así que
+               # se fija acá (solo el .env de staging; producción no cambia).
+               ensure_env_exact OPENAI_TTS_MODEL gpt-4o-mini-tts-2025-03-20
+               # r61 (Q-24): limite de subida de Supabase Storage en bytes (el panel de staging dice fileSizeLimit=200,
+               # verificado solo lectura 2026-10-20). 200000000 queda bajo el limite sea MB o MiB. Lo usan la
+               # proyeccion antes de generar y el worker de empaque antes de subir (default del codigo: 50 MB).
+               ensure_env_exact STORAGE_MAX_UPLOAD_BYTES 200000000
+               # r61: el tope propio del .mbz debe ser <= STORAGE_MAX_UPLOAD_BYTES (si no, PACKAGE_SIZE_CONFIG_INVALID); se alinea al mismo valor.
+               ensure_env_exact PACKAGE_MBZ_MAX_BYTES 200000000
+               # Las claves de proveedores de staging se cargan en staging (secrets de staging);
+               # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
+
+               echo "━━━ [1/6] Instalar dependencias de producción ━━━"
+               npm install --omit=dev
+
+               echo "━━━ [2/6] Alinear restricciones de production_jobs (staging) ━━━"
+               node scripts/migrate-production-jobs-constraints.js
+
+               echo "━━━ [3/6] Aplicar modelo de estructura dinámica de cursos (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-dynamic-course-structure.js
+
+               echo "━━━ [4/6] Verificar esquema de estructura dinámica de cursos (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-dynamic-course-structure-schema.js
+
+               echo "━━━ [4b] Blueprints: migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-course-blueprints.js
+
+               echo "━━━ [4c] Blueprints: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-course-blueprints-schema.js
+
+               echo "━━━ [4d] Blueprints: auditoría de datos (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/audit-course-blueprints.js
+
+               echo "━━━ [4d2] V2.1 R3: toggles de Blueprint v2 + course_profiles — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-blueprint-profiles.js
+
+               echo "━━━ [4d3] V2.1 R3: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-blueprint-profiles-schema.js
+
+               echo "━━━ [4d4] EV6 H5P v2: ajuste «Repaso» del Blueprint (courses.review_cards_enabled) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-ev6-h5p2.js
+
+               echo "━━━ [4d5] EV6 H5P v2: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-ev6-h5p2-schema.js
+
+               echo "━━━ [4d6] Motor pedagógico V1: course_profiles.kind admite pedagogy — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-pedagogy-profiles.js
+
+               echo "━━━ [4d7] Motor pedagógico V1: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-pedagogy-profiles-schema.js
+
+               echo "━━━ [4d8] Motor de carga horaria: capítulo de práctica (course_chapters.chapter_kind) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-practice-chapters.js
+
+               echo "━━━ [4d9] Motor de carga horaria: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-practice-chapters-schema.js
+
+               echo "━━━ [4e] Generation Manifests: migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-generation-manifests.js
+
+               echo "━━━ [4f] Generation Manifests: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-generation-manifests-schema.js
+
+               echo "━━━ [4g] Generation Manifests: auditoría (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/audit-generation-manifests.js
+
+               echo "━━━ [4h] Dynamic Generation: migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-dynamic-generation.js
+
+               echo "━━━ [4h2] Dynamic Generation: migración rulesVersion 2 (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-dynamic-generation-v2.js
+
+               echo "━━━ [4h3] Invalidación (Fase 8): generation_item_runs.carried_from_item_run_id (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-invalidation.js
+
+               echo "━━━ [4h4] V2.1 R4: Manifest rulesVersion 3 — tipos de item v3 + conteos v3 (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-manifest-v3.js
+
+               echo "━━━ [4h5] V2.1 R4: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-manifest-v3-schema.js
+
+               echo "━━━ [4h5a] Actividades de Aplicación: course_chapters.application_minutes + conteos del Manifest — migración (staging, DESPUÉS de manifest-v3: reescribe cgm_counts_consistent) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-application-activities.js
+
+               echo "━━━ [4h5b] Actividades de Aplicación: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-application-activities-schema.js
+
+               echo "━━━ [4h5a2] Práctica guiada: course_chapters.guided_practice_minutes + conteos del Manifest — migración (staging, DESPUÉS de Actividades de Aplicación: reescribe cgm_counts_consistent) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-guided-practice.js
+
+               echo "━━━ [4h5a3] Práctica guiada: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-guided-practice-schema.js
+
+               echo "━━━ [4h5c] Contexto académico: course_profiles kind academic + course_chapters.outcome_ids — migración (staging, DESPUÉS de pedagogy-profiles) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-academic-context.js
+
+               echo "━━━ [4h5d] Contexto académico: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-academic-context-schema.js
+
+               echo "━━━ [4h5e] Prebrief pedagógico: course_prebrief_versions/events/pdfs — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-prebrief.js
+
+               echo "━━━ [4h5f] Prebrief pedagógico: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-prebrief-schema.js
+
+               echo "━━━ [4h6] V2.1 RF: ledger FinOps (tablas append-only + seed de precios) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-finops.js
+
+               echo "━━━ [4h7] V2.1 RF: verificación de esquema FinOps (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-finops-schema.js
+
+               echo "━━━ [4h8] V2.1 RF-b: RLS + REVOKE anon/authenticated en FinOps y course_profiles (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-v21-finops-rls.js
+
+               echo "━━━ [4h9] V2.1 RF-b: verificación de RLS (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-v21-finops-rls.js
+
+               echo "━━━ [4h10] #583: límite por generación de staging = 15 USD (nueva versión de la política vigente, solo staging, idempotente) ━━━"
+               # Decisión del usuario (2026-10-02). Solo staging: nunca en deploy.yml ni en el migrador de producción.
+               # El presupuesto aprobado de cada run se sigue validando antes del gasto (aprobación + runtime guard).
+               MIGRATION_ENV=staging node scripts/staging-budget-policy.js aa2fa9a1-afb1-4b01-8646-94a0cb272b57
+
+               echo "━━━ [4h11] REL R2: log de intentos + columnas de recuperación por item (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-rel-recovery.js
+
+               echo "━━━ [4h12] REL R2: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-rel-recovery-schema.js
+
+               echo "━━━ [4h13] REL lease de ejecución del navegador por run (production_jobs.executor_lease_*) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-rel-exec-lease.js
+
+               echo "━━━ [4h14] REL lease de ejecución: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-rel-exec-lease-schema.js
+
+               echo "━━━ [4h15] Pausa real de un run: índice único de run activo con paused (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-run-pause.js
+
+               echo "━━━ [4h16] Loop 4: presencia de los workers de IA (llm_worker_presence) (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-llm-worker-presence.js
+
+               echo "━━━ [4i] Dynamic Generation: verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-dynamic-generation-schema.js
+
+               echo "━━━ [4j] Dynamic Generation: auditoría (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/audit-dynamic-generation.js
+
+               echo "━━━ [4k] Storage: políticas RLS mínimas de cursia-artifacts (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-storage-artifacts-policies.js
+
+               echo "━━━ [4k2] EV6 DoD: políticas VIVAS de Storage — nada de qa-internal/ para roles de cliente, bucket privado (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-ev6-storage-policies.js
+
+               echo "━━━ [5/6] Migrar usage_events y cost_rates (staging) ━━━"
+               node scripts/migrate-usage-events-costs.js
+
+               echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
+               ensure_pm2_process cursia-backend-staging start:prod
+               ensure_pm2_process cursia-content-worker-staging start:content-worker
+               ensure_pm2_process cursia-video-worker-staging start:video-worker
+               ensure_pm2_process cursia-audio-worker-staging start:audio-worker
+               ensure_pm2_process cursia-h5p-worker-staging start:h5p-worker
+               ensure_pm2_process cursia-gamma-worker-staging start:gamma-worker
+               ensure_pm2_process cursia-package-worker-staging start:package-worker
+               ensure_pm2_process cursia-full-worker-staging start:full-worker
+               ensure_pm2_drain_worker cursia-dynamic-item-worker-staging dist/workers/dynamic-item-worker.js
+               ensure_pm2_drain_worker cursia-dynamic-package-worker-staging dist/workers/dynamic-package-worker.js
+               ensure_pm2_drain_worker cursia-dynamic-provider-worker-staging dist/workers/dynamic-provider-worker.js
+               # Loop 4: el worker de IA (dist/workers/dynamic-llm-worker.js) NO se levanta todavía: un 12.º proceso supera el
+               # cupo de clientes del pooler de staging (15; ver check-db-pool-capacity). Activarlo es una decisión aparte
+               # (cupo del pooler + DYNAMIC_LLM_WORKER_ENABLED en API y worker), con aprobación del usuario.
+               sudo pm2 save
+               sudo pm2 status
+               echo "━━━ Loop 6: arranque del worker de IA hospedado (líneas del log, sin secretos) ━━━"
+               sleep 15
+               sudo pm2 logs cursia-dynamic-provider-worker-staging --lines 400 --nostream 2>/dev/null | grep -E "dynamic-llm-worker iniciado|worker de IA hospedado" | tail -3 || true
+
+               echo "━━━ [6b] Fase 5A: preflight (solo lectura, staging) ━━━"
+               MIGRATION_ENV=staging node scripts/preflight-dynamic-generation.js
+
+               echo "━━━ [6b2] V2.1: preflight de proveedores + FinOps (solo lectura, informativo) ━━━"
+               MIGRATION_ENV=staging PREFLIGHT_GAMMA_THEMES=1 node scripts/preflight-v21-providers.js || true
+
+               echo "━━━ [6b3] LOOP 8.6C: nginx de staging — 40 MB solo en la lectura de documentos ━━━"
+               # Solo el bloque server de api-staging (produccion queda intacta); copia, nginx -t y recarga sin cortes.
+               sudo python3 scripts/staging-nginx-extract-limit.py api-staging.cursia.nomaddi.com 40m
+
+               echo "━━━ [6c] Estabilidad PM2 staging (ventana de 45 s) ━━━"
+               PM2_BEFORE=$(sudo pm2 jlist | node scripts/pm2-staging-stability.js snapshot)
+               sleep 45
+               sudo pm2 jlist | node scripts/pm2-staging-stability.js compare "$PM2_BEFORE"
+
+               echo "✅ Deploy a staging completado."'
+
+      - name: Health check post-deploy
+        run: |
+          echo "Esperando 20 segundos para que NestJS inicialice…"
+          sleep 20
+          for i in 1 2 3 4 5; do
+            RESPONSE=$(curl -sf --max-time 15 "${{ secrets.HEALTH_URL_STAGING }}" || echo "FAILED")
+            if echo "$RESPONSE" | grep -q '"status":"ok"'; then
+              echo "✅ Health check OK (intento $i): $RESPONSE"
+              exit 0
+            fi
+            echo "⏳ Intento $i: staging no disponible aún ($RESPONSE), esperando 8s…"
+            sleep 8
+          done
+          echo "❌ Health check FALLÓ tras 5 intentos"
+          exit 1
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "⚠️  El deploy de STAGING falló. Último commit: $(git rev-parse --short HEAD)"
+          echo "Esto NO afecta producción — cursia-backend sigue corriendo con su propio código."
+
+  calibration:
+    name: Calibration control (staging, SIN deploy)
+    if: github.event_name == 'workflow_dispatch' && inputs.calibration_action != 'none' && inputs.calibration_action != ''
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Validate inputs
+        env:
+          CAL_ACTION: ${{ inputs.calibration_action }}
+          CAL_COURSE: ${{ inputs.calibration_course_id }}
+        run: |
+          case "$CAL_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off|titles_dry|titles_apply|failures_report) ;; *) echo "❌ action inválida"; exit 1 ;; esac
+          case "$CAL_COURSE" in "") ;; *[!0-9]*) echo "❌ course_id debe ser numérico"; exit 1 ;; esac
+          if { [ "$CAL_ACTION" = authorize ] || [ "$CAL_ACTION" = report ] || [ "$CAL_ACTION" = reconcile_charged ] || [ "$CAL_ACTION" = reconcile_charged_dry ]; } && [ -z "$CAL_COURSE" ]; then
+            echo "❌ action=$CAL_ACTION necesita course_id"; exit 1
+          fi
+          echo "Calibración V2.1 (staging): acción=$CAL_ACTION curso=${CAL_COURSE:-(ninguno)}"
+
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "${{ secrets.VPS_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Run calibration action on the staging VPS (sin deploy)
+        env:
+          CAL_ACTION: ${{ inputs.calibration_action }}
+          CAL_COURSE: ${{ inputs.calibration_course_id }}
+        run: |
+          printf "%s\n%s\n" "$CAL_ACTION" "$CAL_COURSE" | ssh -i ~/.ssh/deploy_key \
+              -o StrictHostKeyChecking=no \
+              "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" \
+              'set -e
+               cd '"${{ secrets.VPS_PATH_STAGING }}"'
+               IFS= read -r _ACTION || true
+               IFS= read -r _COURSE || true
+               case "$_ACTION" in report|preflight|policy|authorize|reconcile_charged_dry|reconcile_charged|worker_on|worker_off|titles_dry|titles_apply|failures_report) ;; *) echo "❌ acción inválida"; exit 1 ;; esac
+               case "$_COURSE" in "") ;; *[!0-9]*) echo "❌ curso inválido"; exit 1 ;; esac
+               if [ ! -f .env ] || [ ! -f scripts/staging-v21-calibration.js ]; then
+                 echo "❌ staging sin .env o sin el script (desplegá primero)"; exit 1
+               fi
+               case "$_ACTION" in
+                 policy) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js policy ;;
+                 authorize) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js authorize "$_COURSE" ;;
+                 report) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js report "$_COURSE" ;;
+                 reconcile_charged_dry) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js reconcile_charged_dry "$_COURSE" ;;
+                 reconcile_charged) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js reconcile_charged "$_COURSE"
+                   MIGRATION_ENV=staging node scripts/staging-v21-calibration.js report "$_COURSE" ;;
+                 preflight) MIGRATION_ENV=staging node scripts/preflight-v21-providers.js ;;
+                 titles_dry) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js titles_dry "$_COURSE" ;;
+                 titles_apply) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js titles_apply "$_COURSE" ;;
+                 failures_report) MIGRATION_ENV=staging node scripts/staging-v21-calibration.js failures_report "$_COURSE" ;;
+                 worker_on|worker_off)
+                   _MODE=on; [ "$_ACTION" = worker_off ] && _MODE=off
+                   MIGRATION_ENV=staging node scripts/staging-v21-calibration.js worker "$_MODE"
+                   sudo pm2 restart cursia-dynamic-provider-worker-staging --update-env
+                   sudo pm2 restart cursia-backend-staging --update-env
+                   sleep 8
+                   sudo pm2 jlist | node -e "let s=\"\";process.stdin.on(\"data\",d=>s+=d).on(\"end\",()=>{const l=JSON.parse(s).filter(p=>/-staging$/.test(p.name));for(const p of l)console.log(p.name.padEnd(44)+p.pm2_env.status+\" restarts=\"+p.pm2_env.restart_time);if(l.some(p=>p.pm2_env.status!==\"online\"))process.exit(1)})"
+                   MIGRATION_ENV=staging node scripts/preflight-v21-providers.js
+                   ;;
+               esac
+               echo "✅ Acción de calibración terminada (sin deploy)."'

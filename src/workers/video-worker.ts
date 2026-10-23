@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import { createLegacyPaidClaimGate } from './legacy-paid-job-gate';
 import { Logger, UnauthorizedException } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
@@ -608,6 +609,7 @@ async function bootstrap() {
   process.on('SIGINT',  () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
+  const legacyPaidGate = createLegacyPaidClaimGate(logger, 'video-worker');
   logger.log(
     `Video worker started (workerId=${workerId}, pollMs=${pollMs}, concurrency=${concurrency}, ` +
     `leaseSeconds=${leaseSeconds}, dryRun=${dryRun}, realVideogenEnabled=${realVideogenEnabled}, ` +
@@ -1396,7 +1398,8 @@ async function bootstrap() {
 
   while (!shuttingDown) {
     while (!shuttingDown && activeJobs.size < concurrency) {
-      let claimed = await jobsService.claimNextBackendVideoJob(workerId, leaseSeconds);
+      // r58: jobs NUEVOS solo con el kill switch v1 abierto; el polling de renders ya enviados sigue (no gasta).
+      let claimed = legacyPaidGate() ? await jobsService.claimNextBackendVideoJob(workerId, leaseSeconds) : null;
       if (!claimed) {
         claimed = await jobsService.claimNextBackendVideoPollingJob(workerId, leaseSeconds);
       }

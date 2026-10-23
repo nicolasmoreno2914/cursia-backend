@@ -1,0 +1,48 @@
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  OneToMany,
+  Index,
+} from 'typeorm';
+import { CourseChapter } from './course-chapter.entity';
+
+@Entity('course_modules')
+export class CourseModule {
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @Index()
+  @Column({ name: 'course_id' })
+  courseId: number;
+
+  @Column()
+  position: number;
+
+  @Column({ type: 'text' })
+  title: string;
+
+  @Column({ type: 'text', nullable: true })
+  objective: string;
+
+  /** Title Normalization: detalle/alcance (el título queda breve, ≤ 80). */
+  @Column({ type: 'text', nullable: true })
+  description: string | null;
+
+  @Column({ name: 'exam_enabled', default: true })
+  examEnabled: boolean;
+
+  @Column({ default: 'draft' })
+  status: string; // draft | locked
+
+  @CreateDateColumn({ name: 'created_at' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ name: 'updated_at' })
+  updatedAt: Date;
+
+  @OneToMany(() => CourseChapter, (chapter) => chapter.module)
+  chapters: CourseChapter[];
+}

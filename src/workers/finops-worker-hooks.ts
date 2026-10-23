@@ -1,0 +1,795 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// Cursia V2.1 — RF-b: ganchos de los workers hacia el ledger de costos
+// (audit §W.2/§W.4, HD-V21-20). Todos idempotentes por el ID externo:
+//   videogen:job:<jobId> · youtube:video:<videoId> · package:<jobId> ·
+//   gamma:gen:<id> · openai:req:<id>
+// La atribución (owner/course/run/item) la deriva el ledger del item run o
+// del run — nunca de datos del cliente.
+// ─────────────────────────────────────────────────────────────────────────────
+import { stuckRenderResendMetadata } from '../modules/dynamic-generation/videogen-render-cap';
+import type { FinopsLedgerService, RecordResult, CallRole, RecordChargeInput, ItemPaidCharge } from '../modules/finops/finops-ledger.service';
+import type { FinopsBudgetService } from '../modules/finops/finops-budget.service';
+import { BUDGET_EXCEEDED, PROVIDER_RECONCILIATION_REQUIRED, RUN_BUDGET_NOT_AUTHORIZED } from '../modules/finops/run-budget';
+import { costIdempotencyKey } from '../modules/finops/idempotency';
+import { llmIngestToChargeInput } from '../modules/finops/llm-usage-ingest';
+import { usageModelPriorsV1 } from '../modules/finops/usage-model';
+import { llmCallUpperBoundUsage } from '../modules/finops/llm-usage-ingest';
+
+export type WorkerLedger = Pick<FinopsLedgerService, 'recordCharge' | 'recordAdjustment' | 'recordZero'> &
+  Partial<Pick<FinopsLedgerService, 'settleMeasuredUsage' | 'settleReservation' | 'itemPaidCharges' | 'recordReservationBatch' | 'reconcileReservationAsCharged'>>;
+export type WorkerBudget = Pick<FinopsBudgetService, 'guardPaidSubmission'> & Partial<Pick<FinopsBudgetService, 'pauseRunBySystem'>>;
+/** r19 fix round 1 (I5): uso estimado de LA llamada que se va a hacer (el guard la precia con el catálogo). */
+export type GuardNextCall = { provider: string; service: string; product: string; usage: Record<string, number> };
+
+/**
+ * YouTube Data API `videos.insert` = 1600 unidades de cuota por subida.
+ * NO VERIFICADO contra la documentación vigente de cuotas de YouTube Data
+ * API v3 (audit §W.2 [I]): configurable con YOUTUBE_QUOTA_VIDEOS_INSERT_UNITS.
+ */
+export const YOUTUBE_VIDEOS_INSERT_QUOTA_DEFAULT = 1600;
+export const YOUTUBE_QUOTA_ENV = 'YOUTUBE_QUOTA_VIDEOS_INSERT_UNITS';
+
+export function youtubeInsertQuotaUnits(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[YOUTUBE_QUOTA_ENV];
+  if (raw === undefined || raw === '') return YOUTUBE_VIDEOS_INSERT_QUOTA_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) throw new Error(`${YOUTUBE_QUOTA_ENV} inválido (${raw}): entero >= 0`);
+  return n;
+}
+
+/**
+ * Un reenvío de un video con job NUEVO (retryItem resubmitVideo archiva el
+ * job anterior en output_summary.previousExternals) es un retry pagado:
+ * attempt = reenvíos + 1, call_role provider_retry.
+ */
+export function videogenCallRoleOf(outputSummary: Record<string, any> | null | undefined): { callRole: CallRole; attempt: number } {
+  const prev = Array.isArray(outputSummary?.previousExternals) ? outputSummary!.previousExternals.length : 0;
+  return prev > 0 ? { callRole: 'provider_retry', attempt: prev + 1 } : { callRole: 'main', attempt: 1 };
+}
+
+export interface VideogenChargeInput {
+  ownerId: string;
+  itemRunId: string;
+  jobId: string;
+  mode: 'mock' | 'real';
+  /** `estimated_total_cost` de getVideoCost (null si la consulta falló). */
+  cost: number | null;
+  costError?: string | null;
+  outputSummary?: Record<string, any> | null;
+}
+
+/**
+ * Cargo de un render de Videogen (una fila por job):
+ * - mock → MOCK, monto 0;
+ * - real con costo → CALCULATED_FROM_USAGE con el monto calculado por Videogen (HD-V21-20);
+ * - real sin costo → CALCULATED_FROM_USAGE provisional (1 render × pricing_catalog),
+ *   measurement_status='pending'; se corrige con settleVideogenPending (ADJUSTMENT).
+ */
+export async function recordVideogenCharge(ledger: WorkerLedger, a: VideogenChargeInput): Promise<RecordResult> {
+  return ledger.recordCharge(videogenChargeInput(a));
+}
+
+export function videogenChargeInput(a: VideogenChargeInput): RecordChargeInput {
+  const role = videogenCallRoleOf(a.outputSummary);
+  // r62 (N2): render nuevo de un reenvío justificado sobre un job que Videogen no pudo detener → possible_duplicate.
+  const dup = stuckRenderResendMetadata(a.outputSummary) ?? {};
+  const base = {
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    provider: 'videogen',
+    service: 'render',
+    modelOrProduct: 'video',
+    operation: 'videogen.render',
+    usage: { video_render: 1 },
+    usageUnit: 'video_render',
+    externalOperationId: a.jobId,
+    idempotency: { kind: 'videogen' as const, parts: { jobId: a.jobId } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    recordedBy: 'dynamic-item-worker',
+  };
+  if (a.mode === 'mock') {
+    return { ...base, billingAccount: 'mock', mode: 'mock', costSource: 'MOCK', metadata: { fixture: true } };
+  }
+  if (typeof a.cost === 'number' && Number.isFinite(a.cost) && a.cost >= 0) {
+    return {
+      ...base,
+      billingAccount: 'cursia',
+      mode: 'real',
+      costSource: 'CALCULATED_FROM_USAGE',
+      providerCalculatedAmount: String(a.cost),
+      measurementStatus: 'final',
+      metadata: { ...dup, costBasis: 'videogen.getVideoCost.estimated_total_cost' },
+    };
+  }
+  return {
+    ...base,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    metadata: { ...dup, costBasis: 'pricing_catalog_provisional', pendingReason: (a.costError || 'cost_lookup_failed').slice(0, 300) },
+  };
+}
+
+/**
+ * Terminal de un render (calibración #2): el cargo del job ya existe `pending` desde la
+ * aceptación (reserva liquidada) → con el costo medido se liquida (ADJUSTMENT); sin fila
+ * previa (runs anteriores a este cambio) se inserta. Nunca traga errores del ledger.
+ */
+export async function finalizeVideogenCharge(ledger: WorkerLedger, a: VideogenChargeInput): Promise<'recorded' | 'settled' | 'still_pending' | 'already_final'> {
+  const r = await ledger.recordCharge(videogenChargeInput(a));
+  if (r.inserted) return 'recorded';
+  if (r.event?.measurement_status !== 'pending') return 'already_final';
+  if (!(a.mode === 'real' && typeof a.cost === 'number' && Number.isFinite(a.cost) && a.cost >= 0)) return 'still_pending';
+  await settleVideogenPending(ledger, a.jobId, a.cost);
+  return 'settled';
+}
+
+/**
+ * Medición llegada para un cargo pendiente de Videogen → liquidación (ADJUSTMENT
+ * append; con delta 0 si coincide con el provisional — el pendiente se resuelve igual).
+ */
+export async function settleVideogenPending(ledger: WorkerLedger, jobId: string, cost: number) {
+  if (!(typeof cost === 'number' && Number.isFinite(cost) && cost >= 0)) throw new Error(`costo de Videogen inválido: ${String(cost)}`);
+  return ledger.recordAdjustment(costIdempotencyKey('videogen', { jobId }), String(cost), 'videogen_cost_measured', {
+    recordedBy: 'dynamic-item-worker',
+    metadata: { costBasis: 'videogen.getVideoCost.estimated_total_cost' },
+    settlement: true,
+  });
+}
+
+/** Subida a YouTube: ZERO_BY_DESIGN + unidades de cuota (MOCK en runs mock). */
+export async function recordYoutubeUpload(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; videoId: string; mode: 'mock' | 'real'; quotaUnits?: number },
+): Promise<RecordResult> {
+  return ledger.recordZero({
+    kind: 'youtube',
+    externalId: a.videoId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    itemRunId: a.itemRunId,
+    quotaUnits: a.quotaUnits ?? youtubeInsertQuotaUnits(),
+    mode: a.mode,
+    recordedBy: 'dynamic-item-worker',
+    metadata: { quotaUnitsVerified: false },
+  });
+}
+
+/** Build de un paquete: ZERO_BY_DESIGN, idempotente por el id del job de paquete, atribuido al run. */
+export async function recordPackageBuild(
+  ledger: WorkerLedger,
+  a: { ownerId: string; packageJobId: string; runId: string | null },
+): Promise<RecordResult> {
+  return ledger.recordZero({
+    kind: 'package',
+    externalId: a.packageJobId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    attributionRunId: a.runId,
+    mode: 'real',
+    recordedBy: 'package-worker',
+  });
+}
+
+/** Item de proveedor (presentation / audio_*) en modo mock → evento MOCK a 0. */
+export async function recordProviderMock(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; itemType: string; externalId: string },
+): Promise<RecordResult> {
+  const isGamma = a.itemType === 'presentation';
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    provider: isGamma ? 'gamma' : 'openai',
+    service: isGamma ? 'generations' : 'audio.speech',
+    modelOrProduct: isGamma ? 'gamma-generate' : 'gpt-4o-mini-tts',
+    usage: {},
+    externalOperationId: a.externalId,
+    idempotency: isGamma
+      ? { kind: 'gamma', parts: { generationId: a.externalId } }
+      : { kind: 'openai_tts', parts: { requestId: a.externalId } },
+    billingAccount: 'mock',
+    mode: 'mock',
+    costSource: 'MOCK',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: { fixture: true },
+  });
+}
+
+// ─── V2.1 F2: cargos REALES de Gamma, OpenAI TTS y el LLM server-side ─────────
+
+/** Rol/intento de una llamada de proveedor según el intento del item (reintento del item = provider_retry). */
+export function providerCallRoleOf(itemAttempt: number | null | undefined): { callRole: CallRole; attempt: number } {
+  const n = Number.isInteger(itemAttempt) && (itemAttempt as number) >= 1 ? (itemAttempt as number) : 1;
+  return n > 1 ? { callRole: 'provider_retry', attempt: n } : { callRole: 'main', attempt: 1 };
+}
+
+/**
+ * Generación de Gamma (una fila por generationId, idempotente):
+ * `credits.deducted` × precio por crédito del catálogo → CALCULATED_FROM_USAGE
+ * (audit §W.2). Sin créditos informados → CHARGE a 0 `pending` (se concilia con
+ * `credits.remaining`); precio faltante → pending_zero (nunca se pierde el cargo).
+ */
+export async function recordGammaCharge(
+  ledger: WorkerLedger,
+  a: {
+    ownerId: string;
+    itemRunId: string;
+    generationId: string;
+    creditsDeducted: number | null;
+    creditsRemaining: number | null;
+    failed?: boolean;
+    itemAttempt?: number;
+  },
+): Promise<RecordResult> {
+  return ledger.recordCharge(gammaChargeInput(a));
+}
+
+export function gammaChargeInput(a: Parameters<typeof recordGammaCharge>[1]): RecordChargeInput {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const measured = typeof a.creditsDeducted === 'number' && Number.isFinite(a.creditsDeducted) && a.creditsDeducted >= 0;
+  return {
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    provider: 'gamma',
+    service: 'generations',
+    modelOrProduct: 'gamma-generate',
+    operation: 'gamma.generate',
+    usage: measured ? { gamma_credit: a.creditsDeducted as number } : {},
+    usageUnit: 'gamma_credit',
+    externalOperationId: a.generationId,
+    idempotency: { kind: 'gamma', parts: { generationId: a.generationId } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: measured ? 'final' : 'pending',
+    pricingFallback: 'pending_zero',
+    outcome: a.failed ? (measured && (a.creditsDeducted as number) > 0 ? 'failed_charged' : 'failed_uncharged') : 'succeeded',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: {
+      costBasis: 'gamma.credits.deducted x pricing_catalog',
+      creditsRemaining: a.creditsRemaining,
+      ...(measured ? {} : { pendingReason: 'gamma_credits_not_reported' }),
+    },
+  };
+}
+
+/**
+ * Un chunk de OpenAI TTS: la API devuelve audio sin `usage` → se mide la
+ * DURACIÓN del audio devuelto (segundos, del MP3 real) × snapshot de precios
+ * (CALCULATED_FROM_USAGE; nunca "real" desde caracteres). Idempotente por
+ * `x-request-id`; sin él, fallback determinístico por item/generación/chunk/intento.
+ */
+export async function recordTtsCharge(
+  ledger: WorkerLedger,
+  a: {
+    ownerId: string;
+    itemRunId: string;
+    requestId: string | null;
+    /** Segundos medidos del MP3 devuelto; null si el audio no se pudo medir → cargo `pending` (nunca se pierde). */
+    audioSeconds: number | null;
+    characters: number;
+    model: string;
+    generation: number;
+    chunk: number;
+    itemAttempt?: number;
+  },
+): Promise<RecordResult> {
+  return ledger.recordCharge(ttsChargeInput(a));
+}
+
+export function ttsChargeInput(a: Parameters<typeof recordTtsCharge>[1]): RecordChargeInput {
+  const measured = typeof a.audioSeconds === 'number' && Number.isFinite(a.audioSeconds) && a.audioSeconds > 0;
+  const role = providerCallRoleOf(a.itemAttempt);
+  return {
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    provider: 'openai',
+    service: 'audio.speech',
+    modelOrProduct: a.model,
+    usage: measured ? { audio_seconds: (Math.round((a.audioSeconds as number) * 1000) / 1000).toFixed(3) } : {},
+    usageUnit: 'audio_seconds',
+    externalOperationId: a.requestId,
+    idempotency: a.requestId
+      ? { kind: 'openai_tts', parts: { requestId: a.requestId } }
+      : { kind: 'openai_tts', parts: { itemRunId: a.itemRunId, generation: a.generation, chunk: a.chunk, attempt: role.attempt } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: measured ? 'final' : 'pending',
+    pricingFallback: 'pending_zero',
+    recordedBy: 'dynamic-provider-worker',
+    // `characters` va solo como dato (el monto sale de los segundos medidos).
+    metadata: {
+      costBasis: 'measured_audio_seconds x pricing_catalog',
+      characters: a.characters,
+      chunk: a.chunk,
+      ...(measured ? {} : { pendingReason: 'tts_audio_not_measurable' }),
+    },
+  };
+}
+
+/**
+ * Llamada LLM server-side (guion del audiolibro): usage de la respuesta de
+ * Anthropic × snapshot → CALCULATED_FROM_USAGE, idempotente por `msg_…`
+ * (misma traducción que el ingest del proxy, HD-V21-17).
+ */
+export async function recordServerLlmCharge(
+  ledger: WorkerLedger,
+  a: {
+    ownerId: string;
+    itemRunId: string;
+    model: string;
+    messageId: string;
+    requestId: string | null;
+    usage: { input_tokens: number; output_tokens: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number };
+    callRole: CallRole;
+    attempt: number;
+  },
+): Promise<RecordResult> {
+  return ledger.recordCharge(serverLlmChargeInput(a));
+}
+
+export function serverLlmChargeInput(a: Parameters<typeof recordServerLlmCharge>[1]): RecordChargeInput {
+  const input = llmIngestToChargeInput({
+    subject: a.ownerId,
+    itemRunId: a.itemRunId,
+    callRole: a.callRole,
+    attempt: a.attempt,
+    model: a.model,
+    messageId: a.messageId,
+    requestId: a.requestId,
+    usage: {
+      input_tokens: a.usage.input_tokens,
+      output_tokens: a.usage.output_tokens,
+      cache_creation_input_tokens: a.usage.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: a.usage.cache_read_input_tokens ?? 0,
+    },
+    billingAccount: 'cursia',
+    mode: 'real',
+  });
+  return { ...input, executorAuthorization: 'server_worker', recordedBy: 'dynamic-provider-worker', metadata: { ...(input.metadata || {}), serverSide: true } };
+}
+
+// ─── V2.1 F2 fix round 1: reservas PENDIENTES (gasto posible no medido todavía) ──
+// Regla: toda llamada pagada que PUDO cobrarse deja una fila CHARGE en el ledger
+// en el mismo momento en que se sabe (aceptación, o envío ambiguo), con
+// `measurement_status='pending'` y un monto ESTIMADO (usage model p90 × catálogo;
+// `metadata.estimatedPending=true`). `ESTIMATED` no existe en el ledger (§W.2):
+// el costo es CALCULATED_FROM_USAGE provisional y se liquida con un ADJUSTMENT
+// cuando llega la medición. Así `runActual` (y el runtime guard) la cuentan
+// aunque el item quede en timeout, reintento o bloqueado.
+
+function priorP90(operation: string, meter: string): number {
+  const op = usageModelPriorsV1().operations[operation];
+  const v = Number(op?.meters?.[meter]?.p90);
+  if (!Number.isFinite(v) || v <= 0) throw new Error(`usage model sin p90 para ${operation}.${meter}`);
+  return v;
+}
+
+/** Créditos estimados de una generación de Gamma para la reserva (p90 del usage model). */
+export function gammaEstimatedCredits(): number {
+  return priorP90('gamma.generate', 'gamma_credit');
+}
+
+/**
+ * Reserva PENDIENTE de una generación de Gamma, apenas Gamma la acepta (id =
+ * generationId) o cuando el envío fue ambiguo (id sintético por intento).
+ * Idempotente por la clave `gamma:gen:<id>`.
+ */
+export async function recordGammaPending(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; generationId: string; itemAttempt?: number; ambiguous?: boolean; reason?: string },
+): Promise<RecordResult> {
+  return ledger.recordCharge(gammaPendingInput(a));
+}
+
+export function gammaPendingInput(a: Parameters<typeof recordGammaPending>[1]): RecordChargeInput {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const credits = gammaEstimatedCredits();
+  return {
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    provider: 'gamma',
+    service: 'generations',
+    modelOrProduct: 'gamma-generate',
+    operation: 'gamma.generate',
+    usage: { gamma_credit: credits },
+    usageUnit: 'gamma_credit',
+    externalOperationId: a.ambiguous ? null : a.generationId,
+    idempotency: { kind: 'gamma', parts: { generationId: a.generationId } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    pricingFallback: 'pending_zero',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: {
+      estimatedPending: true,
+      costBasis: 'usage_model_p90 x pricing_catalog (provisional)',
+      ...(a.ambiguous ? { ambiguous: true } : {}),
+      ...(a.reason ? { pendingReason: a.reason.slice(0, 300) } : {}),
+    },
+  };
+}
+
+/**
+ * Terminal de una generación de Gamma: si ya existe la reserva pendiente, se
+ * liquida con los créditos medidos (ADJUSTMENT); si no existe (p.ej. generación
+ * anterior a este cambio), se registra el CHARGE medido directamente. Sin
+ * créditos informados, la reserva queda pendiente (nunca se borra).
+ */
+export async function settleGammaCharge(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; generationId: string; creditsDeducted: number | null; creditsRemaining: number | null; failed?: boolean; itemAttempt?: number },
+): Promise<'final_recorded' | 'settled' | 'still_pending' | 'already_final'> {
+  const r = await recordGammaCharge(ledger, a);
+  if (r.inserted) return 'final_recorded';
+  const pending = r.event?.measurement_status === 'pending' && r.event?.metadata?.estimatedPending === true;
+  if (!pending) return 'already_final';
+  const measured = typeof a.creditsDeducted === 'number' && Number.isFinite(a.creditsDeducted) && a.creditsDeducted >= 0;
+  if (!measured) return 'still_pending';
+  if (!ledger.settleMeasuredUsage) throw new Error('ledger sin settleMeasuredUsage');
+  await ledger.settleMeasuredUsage(costIdempotencyKey('gamma', { generationId: a.generationId }), { gamma_credit: a.creditsDeducted as number }, 'gamma_credits_measured', {
+    recordedBy: 'dynamic-provider-worker',
+    metadata: { creditsRemaining: a.creditsRemaining, failed: !!a.failed },
+  });
+  return 'settled';
+}
+
+/** ~15 caracteres de texto por segundo de voz (≈150 palabras/min): estimado de la reserva de TTS. */
+export const TTS_CHARS_PER_SECOND_ESTIMATE = 15;
+/**
+ * Margen de la RESERVA previa de proveedores no-LLM (FinOps atómico, evidencia 2026-10-14 en el ledger de staging:
+ * cargo real / reserva llegó a 1,21 en TTS (66 de 223) y 1,18 en Videogen (28 de 51)) → la reserva es ×1,25 del estimado.
+ */
+export const PROVIDER_RESERVATION_MARGIN = 1.25;
+
+/**
+ * Reserva PENDIENTE de un chunk de TTS cuyo resultado se desconoce (timeout /
+ * red / 5xx DESPUÉS de enviar): la clave es la determinística por item /
+ * generación / chunk / intento (sin x-request-id), así que cada intento acotado
+ * del item suma su propia reserva.
+ */
+export async function recordTtsReservation(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; characters: number; model: string; generation: number; chunk: number; itemAttempt?: number; reason: string },
+): Promise<RecordResult> {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const secs = Math.max(1, Math.ceil(a.characters / TTS_CHARS_PER_SECOND_ESTIMATE));
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    provider: 'openai',
+    service: 'audio.speech',
+    modelOrProduct: a.model,
+    usage: { audio_seconds: secs },
+    usageUnit: 'audio_seconds',
+    externalOperationId: null,
+    idempotency: { kind: 'openai_tts', parts: { itemRunId: a.itemRunId, generation: a.generation, chunk: a.chunk, attempt: role.attempt } },
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    pricingFallback: 'pending_zero',
+    outcome: 'failed_charged',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: { estimatedPending: true, ambiguous: true, characters: a.characters, chunk: a.chunk, pendingReason: a.reason.slice(0, 300) },
+  });
+}
+
+/**
+ * Reserva PENDIENTE de una llamada LLM server-side sin respuesta medible
+ * (timeout / red / 5xx después de enviar, o respuesta sin id/usage): input
+ * estimado del prompt (≈3 caracteres/token) y output = max_tokens (cota).
+ */
+export async function recordLlmReservation(
+  ledger: WorkerLedger,
+  a: { ownerId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number; role: 'main' | 'continuation'; generation: number; itemAttempt?: number; reason: string },
+): Promise<RecordResult> {
+  const role = providerCallRoleOf(a.itemAttempt);
+  const synthetic = `unmeasured-${a.itemRunId}-g${a.generation}-a${role.attempt}-${a.role}`;
+  return ledger.recordCharge({
+    itemRunId: a.itemRunId,
+    ownerIdFromAuth: a.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    provider: 'anthropic',
+    service: 'messages',
+    modelOrProduct: a.model,
+    usage: llmCallUpperBoundUsage(a.promptChars, a.maxTokens),
+    usageUnit: 'output_tokens',
+    externalOperationId: null,
+    idempotency: { kind: 'anthropic', parts: { messageId: synthetic } },
+    callRole: a.role === 'continuation' ? 'continuation' : 'main',
+    attempt: role.attempt,
+    billingAccount: 'cursia',
+    mode: 'real',
+    costSource: 'CALCULATED_FROM_USAGE',
+    measurementStatus: 'pending',
+    pricingFallback: 'pending_zero',
+    outcome: 'failed_charged',
+    recordedBy: 'dynamic-provider-worker',
+    metadata: { llmUpperBound: true, estimatedPending: true, ambiguous: true, serverSide: true, pendingReason: a.reason.slice(0, 300) },
+  });
+}
+
+/** Mensaje del item bloqueado por presupuesto (prefijo estable `budget_exceeded:`). */
+export function budgetExceededMessage(r: { reason: string; committed: string; authorizedBudget: string | null }): string {
+  return (
+    `${BUDGET_EXCEEDED}: ${r.reason} (comprometido ${r.committed} USD, autorizado ${r.authorizedBudget ?? 'ninguno'}). ` +
+    'No se envió nada al proveedor (sin gasto). Un administrador puede ampliar la autorización del run ' +
+    '(POST /api/v1/finops/courses/:courseId/authorizations) y reintentar esta parte.'
+  );
+}
+
+/** Mensaje estable del item bloqueado por falta del guard de presupuesto (prefijo `finops_unavailable:`). */
+export const FINOPS_GUARD_MISSING_ITEM_ERROR =
+  'finops_unavailable: el control de presupuesto (runtime guard) no está configurado en este worker, así que no se envió ' +
+  'nada al proveedor pagado (sin gasto). Corrige la configuración del worker y reintenta esta parte.';
+
+/**
+ * RF-b fix round 2 (M3): bloquea (visible, reanudable con retry) un item de gasto
+ * real cuando falta el guard. Con un scheduler sin blockItemForBudget (fakes) →
+ * failItem no reintentable. Nunca envía nada.
+ */
+export async function blockWithoutGuard(
+  scheduler: { blockItemForBudget?: (id: string, e: string, d: string) => Promise<boolean>; failItem: (id: string, e: string, m: string, r: boolean) => Promise<boolean> },
+  itemRunId: string,
+  executorId: string,
+  provider: string,
+): Promise<void> {
+  const msg = `${FINOPS_GUARD_MISSING_ITEM_ERROR} (proveedor: ${provider})`;
+  if (typeof scheduler.blockItemForBudget === 'function') {
+    await scheduler.blockItemForBudget(itemRunId, executorId, `budget_exceeded: ${msg}`);
+  } else {
+    await scheduler.failItem(itemRunId, executorId, msg, false);
+  }
+}
+
+// ─── V2.1 calibración (#2): protocolo de llamada pagada ───────────────────────
+//   reserva DURABLE → llamada → resultado → liquidación DURABLE (atómica).
+// - Si la reserva no se puede escribir, la llamada NO se hace (provider_calls = 0).
+// - Si el proveedor pudo aceptar/completar y después falla la persistencia o la
+//   liquidación, NO hay reintento automático: el item queda en reconciliación.
+// - Nunca se ignora un error del ledger (ni reserva, ni liquidación, ni cargo).
+
+/** Prefijo estable del estado de reconciliación de un item (resultado externo ambiguo). */
+export { PROVIDER_RECONCILIATION_REQUIRED };
+
+export type PaidCallKind = 'tts' | 'llm' | 'gamma' | 'videogen';
+
+export interface PaidCallReservation {
+  kind: PaidCallKind;
+  ownerId: string;
+  itemRunId: string;
+  generation: number;
+  itemAttempt: number;
+  /** Identifica la llamada dentro del intento (p.ej. `chunk0`, `main`, `continuation`, `submit`). */
+  tag: string;
+  /** Estimado conservador de la llamada (solo para la reserva). */
+  estimate: { characters?: number; promptChars?: number; maxTokens?: number; model?: string };
+  /**
+   * r62 (E2E M): la llamada escribe una marca DURABLE de envío antes de salir. Una reserva así, de un intento caído y SIN
+   * marca, nunca salió y se libera sola; sin el flag (reservas anteriores) se trata como siempre (ambigua).
+   */
+  sendMarked?: boolean;
+  /** r62 (N2): metadata extra de la reserva (p. ej. possible_duplicate de un reenvío sobre un render vivo). */
+  metadata?: Record<string, unknown> | null;
+}
+
+export function reservationKey(r: Pick<PaidCallReservation, 'kind' | 'itemRunId' | 'generation' | 'itemAttempt' | 'tag'>): string {
+  const safeTag = String(r.tag).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 64);
+  return `reservation:${r.kind}:${r.itemRunId}:g${r.generation}:a${r.itemAttempt}:${safeTag}`;
+}
+
+function reservationInput(r: PaidCallReservation): RecordChargeInput {
+  const role = providerCallRoleOf(r.itemAttempt);
+  const base = {
+    itemRunId: r.itemRunId,
+    ownerIdFromAuth: r.ownerId,
+    executorAuthorization: 'server_worker' as const,
+    idempotencyKey: reservationKey(r),
+    externalOperationId: null,
+    callRole: role.callRole,
+    attempt: role.attempt,
+    billingAccount: 'cursia' as const,
+    mode: 'real' as const,
+    costSource: 'CALCULATED_FROM_USAGE' as const,
+    measurementStatus: 'pending' as const,
+    pricingFallback: 'pending_zero' as const,
+    recordedBy: r.kind === 'videogen' ? 'dynamic-item-worker' : 'dynamic-provider-worker',
+  };
+  const meta = { ...(r.metadata ?? {}), reservation: true, estimatedPending: true, reservedBeforeCall: true, callTag: r.tag, generation: r.generation, ...(r.sendMarked ? { sendMarked: true } : {}) };
+  switch (r.kind) {
+    case 'tts': {
+      const secs = Math.max(1, Math.ceil(((r.estimate.characters ?? 0) / TTS_CHARS_PER_SECOND_ESTIMATE) * PROVIDER_RESERVATION_MARGIN));
+      return { ...base, provider: 'openai', service: 'audio.speech', modelOrProduct: r.estimate.model || 'gpt-4o-mini-tts',
+        usage: { audio_seconds: secs }, usageUnit: 'audio_seconds', metadata: { ...meta, characters: r.estimate.characters ?? null } };
+    }
+    case 'llm':
+      return { ...base, provider: 'anthropic', service: 'messages', modelOrProduct: r.estimate.model || 'claude-sonnet-4-6',
+        usage: llmCallUpperBoundUsage(r.estimate.promptChars ?? 0, r.estimate.maxTokens ?? 1),
+        usageUnit: 'output_tokens', callRole: r.tag === 'continuation' ? 'continuation' : role.callRole, metadata: { ...meta, serverSide: true, llmUpperBound: true } };
+    case 'gamma':
+      return { ...base, provider: 'gamma', service: 'generations', modelOrProduct: 'gamma-generate', operation: 'gamma.generate',
+        usage: { gamma_credit: gammaEstimatedCredits() }, usageUnit: 'gamma_credit', metadata: meta };
+    case 'videogen':
+      return { ...base, provider: 'videogen', service: 'render', modelOrProduct: 'video', operation: 'videogen.render',
+        usage: { video_render: PROVIDER_RESERVATION_MARGIN }, usageUnit: 'video_render', metadata: meta };
+    default:
+      throw new Error(`reserva de tipo desconocido: ${String((r as any).kind)}`);
+  }
+}
+
+// FinOps P0: todo lo que arma este archivo lo registra un worker del SERVIDOR que reclamó la parte (de confianza):
+// `executorAuthorization: 'server_worker'` conserva course_id/run_id aunque el owner que pasa no coincida con el del run
+// (y el tope del run sigue aplicando). El proxy del navegador nunca lo setea (llm-usage-ingest).
+/** Error de ledger que impide seguir (nunca se traga). */
+export class LedgerWriteFailed extends Error {
+  constructor(what: string, cause: unknown) {
+    super(`finops_ledger_write_failed: ${what} — ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'LedgerWriteFailed';
+  }
+}
+
+function requireLedger(ledger: WorkerLedger | null | undefined, what: string): WorkerLedger {
+  if (!ledger) throw new LedgerWriteFailed(what, 'ledger FinOps no configurado en el worker');
+  return ledger;
+}
+
+/** Reserva DURABLE antes de la llamada. Si falla, lanza (y la llamada no se hace). Devuelve la clave. */
+export async function reservePaidCall(ledger: WorkerLedger | null | undefined, r: PaidCallReservation): Promise<string> {
+  const l = requireLedger(ledger, `la reserva ${r.kind}/${r.tag}`);
+  try {
+    await l.recordCharge(reservationInput(r));
+  } catch (err) {
+    // FinOps atómico: la reserva excedería el presupuesto autorizado del run → no se llama al proveedor (0 gasto).
+    if (err && (err as { code?: string }).code === 'RUN_BUDGET_CAP') {
+      const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
+      throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_CAP:\s*/, ''), Number(d.requiredUsd ?? NaN));
+    }
+    throwIfRunBudgetNotAuthorized(err);
+    throw new LedgerWriteFailed(`la reserva ${r.kind}/${r.tag}`, err);
+  }
+  return reservationKey(r);
+}
+
+/**
+ * Reserva de una UNIDAD pagada completa (todas o ninguna, atómico contra el tope del run; review I4). Un ledger sin
+ * reservas por lote (fakes de pruebas antiguas) reserva una por una. → claves en el mismo orden.
+ */
+export async function reservePaidCalls(ledger: WorkerLedger | null | undefined, rs: PaidCallReservation[]): Promise<string[]> {
+  const l = requireLedger(ledger, `la unidad de ${rs.length} reservas`);
+  if (!rs.length) return [];
+  if (!l.recordReservationBatch) {
+    const keys: string[] = [];
+    for (const r of rs) keys.push(await reservePaidCall(l, r));
+    return keys;
+  }
+  try {
+    await l.recordReservationBatch(rs.map(reservationInput));
+  } catch (err) {
+    if (err && (err as { code?: string }).code === 'RUN_BUDGET_CAP') {
+      const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
+      throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_CAP:\s*/, ''), Number(d.requiredUsd ?? NaN));
+    }
+    throwIfRunBudgetNotAuthorized(err);
+    throw new LedgerWriteFailed(`la unidad de ${rs.length} reservas`, err);
+  }
+  return rs.map(reservationKey);
+}
+
+/**
+ * FinOps atómico (2026-10-14): la reserva se rechazó porque el run excedería su presupuesto autorizado (verificado
+ * en la MISMA transacción que la inserción, serializado por run). Nada se llamó ni se cobró. El worker pausa el run
+ * (`run_budget_cap`, misma pausa que el guard) y devuelve la parte a la cola sin consumir intento.
+ */
+export class RunBudgetCapReached extends Error {
+  constructor(
+    readonly runId: string,
+    readonly detail: string,
+    readonly requiredUsd: number,
+    /** r58 H4: 'run_budget_not_authorized' = el run no tiene NINGUNA autorización (mismo manejo: pausa + devolución). */
+    readonly reason: 'run_budget_cap' | 'run_budget_not_authorized' = 'run_budget_cap',
+  ) {
+    super(`${reason}: ${detail}`);
+    this.name = 'RunBudgetCapReached';
+  }
+}
+
+/** r58 H4: FinopsError RUN_BUDGET_NOT_AUTHORIZED de la reserva → RunBudgetCapReached('run_budget_not_authorized'). */
+function throwIfRunBudgetNotAuthorized(err: unknown): void {
+  if (!err || (err as { code?: string }).code !== 'RUN_BUDGET_NOT_AUTHORIZED') return;
+  const d = ((err as { details?: Record<string, unknown> }).details ?? {}) as Record<string, unknown>;
+  throw new RunBudgetCapReached(String(d.runId ?? ''), (err as Error).message.replace(/^RUN_BUDGET_NOT_AUTHORIZED:\s*/, ''), NaN, RUN_BUDGET_NOT_AUTHORIZED);
+}
+
+/** Pausa el run por el tope (idempotente: si ya estaba pausado no cambia nada). Sin pausa cableada → no hace nada. */
+export async function pauseRunForCap(budget: { pauseRunBySystem?: FinopsBudgetService['pauseRunBySystem'] } | null | undefined, e: RunBudgetCapReached): Promise<boolean> {
+  if (!budget || !budget.pauseRunBySystem || !e.runId) return false;
+  return budget.pauseRunBySystem(e.runId, e.reason, e.detail, Number.isFinite(e.requiredUsd) ? e.requiredUsd : null);
+}
+
+/** Liquidación DURABLE: cargo final (idempotente por la operación del proveedor) + reserva a 0, atómico. */
+export async function settlePaidCall(
+  ledger: WorkerLedger | null | undefined,
+  key: string,
+  finalCharge: RecordChargeInput | null,
+  reason: string,
+): Promise<{ finalInserted: boolean; finalEvent: any }> {
+  const l = requireLedger(ledger, `la liquidación ${key}`);
+  if (!l.settleReservation) throw new LedgerWriteFailed(`la liquidación ${key}`, 'ledger sin settleReservation');
+  try {
+    const r = await l.settleReservation(key, finalCharge, reason);
+    return { finalInserted: r.finalInserted, finalEvent: r.finalEvent };
+  } catch (err) {
+    throw new LedgerWriteFailed(`la liquidación ${key}`, err);
+  }
+}
+
+/**
+ * Detección DURABLE al reclamar un item real: cargos/reservas de intentos
+ * ANTERIORES (no reconocidos por un humano) = una operación pagada cuyo resultado
+ * no quedó persistido → el item va a reconciliación y NO se vuelve a llamar.
+ * - una reserva liquidada no cuenta (su cargo final es otra fila, que sí cuenta);
+ * - `releasableKey`: reserva sin marcador de envío (Gamma/Videogen) = la llamada
+ *   nunca se hizo → se libera en vez de bloquear;
+ * - `skipProviders`: proveedores cuyo resultado sí quedó persistido/reanudable;
+ * - `isPersistedOutput`: r19, una operación puntual cuyo resultado sí quedó guardado.
+ */
+export async function priorPaidOperations(
+  ledger: WorkerLedger | null | undefined,
+  itemRunId: string,
+  opts: {
+    currentAttempt: number;
+    acknowledgedThroughAttempt: number;
+    skipProviders?: string[];
+    isSubmitMarked?: (key: string, row: ItemPaidCharge) => boolean;
+    /** r19: cargo cuyo resultado YA quedó guardado en el item (bloque del guion / segmento del audiolibro) → no bloquea. */
+    isPersistedOutput?: (row: ItemPaidCharge) => boolean;
+  },
+): Promise<{ blocking: ItemPaidCharge[]; releasable: ItemPaidCharge[] }> {
+  const l = requireLedger(ledger, 'la consulta de cargos previos del item');
+  if (!l.itemPaidCharges) throw new LedgerWriteFailed('la consulta de cargos previos del item', 'ledger sin itemPaidCharges');
+  let rows: ItemPaidCharge[];
+  try {
+    rows = await l.itemPaidCharges(itemRunId);
+  } catch (err) {
+    throw new LedgerWriteFailed('la consulta de cargos previos del item', err);
+  }
+  const skip = new Set(opts.skipProviders ?? []);
+  const prior = rows.filter((r) => r.attempt < opts.currentAttempt && r.attempt > opts.acknowledgedThroughAttempt && !skip.has(r.provider));
+  const releasable: ItemPaidCharge[] = [];
+  const blocking: ItemPaidCharge[] = [];
+  for (const r of prior) {
+    if (r.reservation && r.settled) continue;
+    if (opts.isPersistedOutput && opts.isPersistedOutput(r)) continue;
+    if (r.reservation && opts.isSubmitMarked && !opts.isSubmitMarked(r.idempotency_key, r)) releasable.push(r);
+    else blocking.push(r);
+  }
+  return { blocking, releasable };
+}
+
+export function reconciliationMessage(provider: string, what: string, detail: string): string {
+  return (
+    `${PROVIDER_RECONCILIATION_REQUIRED}: ${provider} — ${what}. ${detail.slice(0, 400)} ` +
+    'El proveedor pudo haber completado (y cobrado) la operación: quedó reservada en el ledger y NO se reintenta sola. ' +
+    'Revisa la cuenta del proveedor y resuelve explícitamente (retry con resubmitProvider/resubmitVideo=true).'
+  );
+}

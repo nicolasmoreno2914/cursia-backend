@@ -1,0 +1,510 @@
+{
+  "semantics": [
+    {
+      "label": "Editor for interaktiv video",
+      "fields": [
+        {
+          "label": "Last opp video",
+          "fields": [
+            {
+              "label": "Legg til ein video",
+              "description": "Vel videoen du vil bruke. Du kan legge til ei videolenke eller laste opp videofiler. Det er mogleg å legge til fleire videoversjonar med forskjellig oppløysing. For å sikre maksimal støtte i nettlesarane bør du legge til i alle fall ein versjon i WebM- og ein i MP4-format."
+            },
+            {
+              "label": "Valmoglegheiter for startbilete (ikkje støtta for YouTube-videoar)",
+              "fields": [
+                {
+                  "label": "Tittel på den interaktive videoen",
+                  "default": "Interaktiv video",
+                  "description": "Blir brukt i oppsummeringar, statistikkar osv."
+                },
+                {
+                  "label": "Skjul tittel på startskjerm"
+                },
+                {
+                  "label": "Kort beskriving (valfri)",
+                  "description": "Viser ei kort beskriving på startskjermen. Fungerer ikkje for YouTube-videoar."
+                },
+                {
+                  "label": "Plakat (valfri)",
+                  "description": "Bilete som blir vist før videoen blir spelt av. Fungerer ikkje for YouTube-videoar."
+                }
+              ]
+            },
+            {
+              "label": "Tekstspor (ikkje støtta for YouTube-videoar)",
+              "fields": [
+                {
+                  "label": "Tilgjengelege tekstspor",
+                  "entity": "Tekstspor",
+                  "field": {
+                    "label": "Spor",
+                    "fields": [
+                      {
+                        "label": "Namn på tekstspor",
+                        "description": "Blir brukt viss det er fleire tekstspor og brukar må velje eitt av dei. Døme: \"Nynorsk\" kan vere namn på eit tekstspor med tekst på nynorsk.",
+                        "default": "Teksting"
+                      },
+                      {
+                        "label": "Type tekstspor",
+                        "options": [
+                          {
+                            "label": "Undertekstar"
+                          },
+                          {
+                            "label": "Teksting for høyrselshemma"
+                          },
+                          {
+                            "label": "Beskrivingar for skjermlesar"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Kjeldespråk",
+                        "description": "Må vere ein gyldig BCP 47-språktagg. Dersom \"Undertekstar\" er valt, må du definere språket i tekstsporet."
+                      },
+                      {
+                        "label": "Tekstfil (WebVTT-fil)"
+                      }
+                    ]
+                  }
+                },
+                {
+                  "label": "Standard tekstspor",
+                  "description": "Dersom dette feltet står tomt eller ikkje samsvarer med eit tilgjengeleg tekstspor, blir det første tekstsporet brukt."
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "label": "Legg til interaktive element",
+          "fields": [
+            {
+              "field": {
+                "fields": [
+                  {
+                    "label": "Visningstid"
+                  },
+                  {
+                    "label": "Sett videoen på pause"
+                  },
+                  {
+                    "label": "Vis som",
+                    "description": "Vel du <b>Knapp</b> , må brukaren trykke på ein knapp for å få vist innhaldet. Vel du <b>Plakat</b>, blir innhaldet vist automatisk.",
+                    "options": [
+                      {
+                        "label": "Knapp"
+                      },
+                      {
+                        "label": "Plakat"
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Vis som knapp på små skjermar"
+                  },
+                  {
+                    "label": "Tittel",
+                    "description": "Tekst ved sida av interaksjonsikonet."
+                  },
+                  {},
+                  {},
+                  {},
+                  {},
+                  {},
+                  {},
+                  {
+                    "label": "Tilpassing",
+                    "fields": [
+                      {
+                        "label": "Handling dersom alle svara er rette",
+                        "fields": [
+                          {
+                            "label": "Gå til",
+                            "description": "Skriv inn tidskode i formatet M:SS"
+                          },
+                          {
+                            "label": "Tillat brukar å velje bort aktivitet og heller halde fram med å sjå video"
+                          },
+                          {
+                            "label": "Melding"
+                          },
+                          {
+                            "label": "Namn på \"Gå til\"-knapp"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Handling ved feil svar",
+                        "fields": [
+                          {
+                            "label": "Gå til",
+                            "description": "Legg inn tidskode i formatet M:SS"
+                          },
+                          {
+                            "label": "Tillat brukar å velje bort aktivitet og heller halde fram å sjå videoen"
+                          },
+                          {
+                            "label": "Melding"
+                          },
+                          {
+                            "label": "Namn på \"Gå til\"-knapp"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Krev rett svar på alt før brukar får gå vidare",
+                        "description": "Du får best funksjonalitet om du vel \"Deaktiver navigering framover i video\" saman med denne innstillinga."
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Visuelle effektar",
+                    "fields": [
+                      {
+                        "label": "Bakgrunnsfarge"
+                      },
+                      {
+                        "label": "Skygge",
+                        "description": "Legg på ein svak skygge rundt interaksjonsfeltet. Deaktiver om du vil ha heilt gjennomsiktige interaksjonsfelt."
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Ved klikk gå til",
+                    "fields": [
+                      {
+                        "label": "Type",
+                        "options": [
+                          {
+                            "label": "Tidskode"
+                          },
+                          {
+                            "label": "Ei anna side (URL)"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Gå til",
+                        "description": "Tidspunktet i videoen som brukar blir send til når hen trykker på hotspoten. Legg inn tidskode i format M:SS."
+                      },
+                      {
+                        "label": "URL",
+                        "fields": [
+                          {
+                            "label": "Protokoll",
+                            "options": [
+                              {
+                                "label": "http://"
+                              },
+                              {
+                                "label": "https://"
+                              },
+                              {
+                                "label": "(sti på dette domenet)"
+                              },
+                              {
+                                "label": "annan"
+                              }
+                            ]
+                          },
+                          {
+                            "label": "URL"
+                          }
+                        ]
+                      },
+                      {
+                        "label": "Vis som klikkbar",
+                        "description": "Dersom du vel dette, blir det lagt på ei kantlinje og eit ikon som viser at elementet er klikkbart."
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            {},
+            {}
+          ]
+        },
+        {
+          "label": "Oppsummeringsoppgåve",
+          "fields": [
+            {},
+            {
+              "label": "Visningstidspunkt",
+              "description": "Antal sekund før videoen sluttar."
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "Oppgåveinnstillingar",
+      "fields": [
+        {
+          "label": "Start på",
+          "description": "Legg inn tidskode i formatet M:SS"
+        },
+        {
+          "label": "Slå på automatisk avspeling",
+          "description": "Videoen startar automatisk."
+        },
+        {
+          "label": "Køyr video i loop",
+          "description": "Slå på for å køyre videoen i loop."
+        },
+        {
+          "label": "Deactivate auto-pause",
+          "description": "Prevents video from pausing automatically if video gets hidden."
+        },
+        {
+          "label": "Overstyr \"Vis svar\"-knapp",
+          "description": "Dette valet avgjer om \"Vis svar\"-knappen skal visast for alle oppgåvene, skjulast for alle oppgåvene eller konfigurerast individuelt for kvar oppgåve.",
+          "options": [
+            {
+              "label": "Aktivert"
+            },
+            {
+              "label": "Deaktivert"
+            }
+          ]
+        },
+        {
+          "label": "Overstyr \"Prøv igjen\"-knapp",
+          "description": "Dette valet avgjer om \"Prøv igjen\"-knappen skal visast for alle oppgåvene, skjulast for alle oppgåvene eller konfigurerast individuelt for kvar oppgåve.",
+          "options": [
+            {
+              "label": "Aktivert"
+            },
+            {
+              "label": "Deaktivert"
+            }
+          ]
+        },
+        {
+          "label": "Vis bokmerkemeny når interaktiv video blir opna",
+          "description": "Denne funksjonen er ikkje tilgjengeleg på iPad dersom videoen er henta frå YouTube."
+        },
+        {
+          "label": "Vis knapp for å spole tilbake 10 sekund"
+        },
+        {
+          "label": "Deaktiver navigering",
+          "description": "Avgrens moglegheiter for videonavigering på ein av følgande måtar.",
+          "options": [
+            {
+              "label": "Inga avgrensing"
+            },
+            {
+              "label": "Framover"
+            },
+            {
+              "label": "Framover og bakover"
+            }
+          ]
+        },
+        {
+          "label": "Deaktiver lyd",
+          "description": "Vel for å slå av lyden og hindre brukar i å slå han på."
+        }
+      ]
+    },
+    {
+      "label": "Tilpass",
+      "fields": [
+        {
+          "label": "Interaksjonstittel",
+          "default": "Interaksjon"
+        },
+        {
+          "label": "Namn på \"Spel av\"-knapp",
+          "default": "Spel av"
+        },
+        {
+          "label": "Namn på \"Pause\"-knapp",
+          "default": "Pause"
+        },
+        {
+          "label": "Namn på \"Slå av lyd\"-knapp",
+          "default": "Lyd er på. Slå av lyd."
+        },
+        {
+          "label": "Namn på \"Lyd på\"-knapp",
+          "default": "Lyd er av. Slå på lyd."
+        },
+        {
+          "label": "Namn på \"Videokvalitet\"-knapp",
+          "default": "Videokvalitet"
+        },
+        {
+          "label": "Namn på \"Teksting\"-knapp",
+          "default": "Teksting"
+        },
+        {
+          "label": "Namn på \"Lukk\"-knapp",
+          "default": "Lukk"
+        },
+        {
+          "label": "Namn på \"Fullskjerm\"-knapp",
+          "default": "Fullskjerm"
+        },
+        {
+          "label": "Namn på \"Avslutt fullskjerm\"-knapp",
+          "default": "Avslutt fullskjerm"
+        },
+        {
+          "label": "Tittel for oppsummering",
+          "default": "Oppsummering"
+        },
+        {
+          "label": "Namn på \"Bokmerke\"-knapp",
+          "default": "Bokmerke"
+        },
+        {
+          "label": "Namn på \"Legg til innsendingsside\"-knapp",
+          "default": "Innsendingsside"
+        },
+        {
+          "label": "Standardnamn på knapp \"Gå vidare\"-knapp for å hoppe vidare basert på svaret brukar har gitt",
+          "default": "Hald fram"
+        },
+        {
+          "label": "Namn på \"Hald fram\"-knapp",
+          "default": "Hald fram"
+        },
+        {
+          "label": "Namn på \"Fleire avspelingsval\"-knapp",
+          "default": "Fleire avspelingsval"
+        },
+        {
+          "label": "Angi avspelingstempo",
+          "default": "Avspelingstempo"
+        },
+        {
+          "label": "Spol 10 sekund tilbake",
+          "default": "Spol 10 sekund tilbake"
+        },
+        {
+          "label": "Tekst for \"Navigasjon er deaktivert\"",
+          "default": "Navigasjon er deaktivert"
+        },
+        {
+          "label": "Tekst for melding om at framovernavigering er deaktivert",
+          "default": "Framovernavigering er deaktivert"
+        },
+        {
+          "label": "Tekst for melding om at lyd er deaktivert",
+          "default": "Lyd er deaktivert"
+        },
+        {
+          "label": "Beskjed om at brukar må svare korrekt på oppgåva for hen kan halde fram",
+          "default": "Du må svare korrekt på alle spørsmåla før du kan gå vidare."
+        },
+        {
+          "label": "Namn på \"Tilbake\"-knapp",
+          "default": "Tilbake"
+        },
+        {
+          "label": "Tidsbruk oppgitt i timar",
+          "default": "Timar"
+        },
+        {
+          "label": "Tidsbruk oppgitt i minutt",
+          "default": "Minutt"
+        },
+        {
+          "label": "Tidsbruk oppgitt i sekund",
+          "default": "Sekund"
+        },
+        {
+          "label": "Meldingstekst om tidsbruk så langt",
+          "default": "Tidsbruk så langt:"
+        },
+        {
+          "label": "Tekst for total tidsbruk",
+          "default": "Total tidsbruk:"
+        },
+        {
+          "label": "Tekst som forklarer at eit namngitt interaktivt element har dukka opp",
+          "default": "Interaktivt element har dukka opp:"
+        },
+        {
+          "label": "Tekst som forklarer at fleire interaktive element har dukka opp",
+          "default": "Fleire interaktive element har dukka opp."
+        },
+        {
+          "label": "Melding om at video er sett på pause",
+          "default": "Videoen er sett på pause"
+        },
+        {
+          "label": "Tekst for \"Innhald\"",
+          "default": "Innhald"
+        },
+        {
+          "label": "Melding om antal spørsmål brukar har svart på (@answered blir erstatta med talet på besvarte spørsmål)",
+          "default": "Du har svart på @answered spørsmål"
+        },
+        {
+          "label": "Tittel på innsendingsside",
+          "default": "Du har svart på @answered spørsmål",
+          "description": "@answered blir erstatta med antal spørsmål brukar har svart på."
+        },
+        {
+          "label": "Informasjon på innsendingssida når \"Send inn\"-knapp er deaktivert",
+          "default": "Du har svart på @answered spørsmål. Vel \"Send inn\" for å levere svara dine.",
+          "description": "@answered blir erstatta med antal spørsmål brukar har svart på."
+        },
+        {
+          "label": "Tekst på innsendingsside når \"Send inn\"-knapp er deaktivert",
+          "default": "Du har svart på @answered spørsmål.",
+          "description": "@answered blir erstatta med antal spørsmål brukar har svart på."
+        },
+        {
+          "label": "Melding på innsendingssida når brukar ikkje har svart på nokon spørsmål i det heile",
+          "default": "Du har ikkje svart på nokon spørsmål."
+        },
+        {
+          "label": "Melding på innsendingssida om at svar er nødvendig",
+          "default": "Du må svare på minst eitt spørsmål før du kan sende inn svara dine."
+        },
+        {
+          "label": "\"Send inn\"-knapp på innsendingsside",
+          "default": "Send inn svar"
+        },
+        {
+          "label": "Melding når svar er sende inn",
+          "default": "Svara dine er sende inn!"
+        },
+        {
+          "label": "Tittel for tabellrad på innsendingssida: Poengsum",
+          "default": "Poengsum"
+        },
+        {
+          "label": "Submit screen question label",
+          "default": "Question"
+        },
+        {
+          "label": "Innsendingsside: Poengsum for svara brukar har gitt",
+          "default": "svart på"
+        },
+        {
+          "label": "Innsendingsside: Oppsummering av ei rad, med poengsum (for skjermlesarar)",
+          "default": "Du fekk @score av @total poeng for @question, som kom etter @minutes minutt and @seconds sekund."
+        },
+        {
+          "label": "Innsendingsside: oppsummering av ei rad, utan poengsum (for skjermlesarar)",
+          "default": "Du har svart på @question, som kom etter @minutes minutt and @seconds sekund."
+        },
+        {
+          "label": "Framdriftslinje for videoavspeling",
+          "default": "Videoframdrift"
+        },
+        {
+          "label": "Tekst som beskriv korleis du opprettar interaktive element",
+          "default": "Spel av video for å begynne å lage interaktive element"
+        }
+      ]
+    }
+  ]
+}

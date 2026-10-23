@@ -4,27 +4,35 @@ import { ValidationPipe, Logger } from '@nestjs/common';
 import helmet from 'helmet';
 import * as express from 'express';
 import { AppModule } from './app.module';
+import { corsOptions } from './common/cors-options';
 import { AllExceptionsFilter } from './common/filters/http-exception.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
+import { warnIfNearMissDynamicFlag } from './modules/features/dynamic-features';
+import { RunsService } from './modules/dynamic-generation/runs.service';
+import { startAutoHealTimer } from './modules/dynamic-generation/auto-heal';
+import { ProviderReconcileService } from './modules/dynamic-generation/provider-reconcile.service';
+import { AutoPackageService } from './modules/dynamic-packaging/auto-package.service';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
+  warnIfNearMissDynamicFlag(logger);
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
+  // CORS (src/common/cors-options.ts: única definición, con la prueba de navegador check-cors-methods.js).
+  // Piloto: ANTES de los parsers del cuerpo — un cuerpo demasiado grande (413) o mal formado (400) corta la cadena en el
+  // parser y, sin la cabecera CORS, el navegador solo ve «Failed to fetch» en vez del mensaje del servidor.
+  app.enableCors(corsOptions(process.env));
+
   // Body size limit — 9 chapters of libro guía can exceed the 100KB default
+  // LOOP 8.6B · la lectura de documentos (base64 en JSON) admite hasta 25 MB de archivos: límite propio SOLO en esas dos
+  // rutas (25 MB × 4/3 del base64 + margen); el resto de la API sigue en 10 MB. Va antes del parser general: un cuerpo
+  // ya leído no se vuelve a leer.
+  app.use(/^\/api\/v1\/courses\/\d+\/academic-context\/(extract|extract-advanced)\/?$/, express.json({ limit: '36mb' }));
   app.use(express.json({ limit: '10mb' }));
   app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
   // Security
   app.use(helmet());
-
-  // CORS
-  app.enableCors({
-    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*',
-    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: false,
-  });
 
   // Global validation pipe
   app.useGlobalPipes(
@@ -50,6 +58,32 @@ async function bootstrap() {
   logger.log(`🚀 Cursia Backend running on http://localhost:${port}`);
   logger.log(`   Health:  GET /health`);
   logger.log(`   API:     GET /api/v1`);
+
+  // R16 (#2): auto-healer de items dinámicos fallidos por errores transitorios. Solo en la API (los
+  // workers cargan el mismo AppModule y no barren). Apagado con DYNAMIC_AUTO_HEAL_ENABLED=false.
+  // EV6 DoD BE-B: el mismo tick corre el reintento automático SEGURO (rechazos definitivos sin gasto, una
+  // vez) y el barrido del empaque final automático (DYNAMIC_AUTO_PACKAGE_ENABLED=false lo apaga).
+  const runsService = app.get(RunsService);
+  const autoPackage = app.get(AutoPackageService);
+  const providerReconcile = app.get(ProviderReconcileService);
+  startAutoHealTimer(runsService, new Logger('DynamicAutoHeal'), process.env, [
+    { name: 'reintento automático seguro', run: () => runsService.autoRetrySafeRejections() },
+    // #583 + r62 (regla de ambigüedad acotada): UN reenvío automático de un audio con resultado incierto (corte o
+    // timeout), con el peor caso dentro de lo autorizado (presupuesto de la parte + saldo del run).
+    { name: 'reenvío de audio incierto', run: () => runsService.autoResubmitAmbiguousAudio() },
+    // r62 (K3): partes frenadas por el kill switch / la allow-list de FinOps → se reabren solas al revertirlo.
+    { name: 'reanudación tras control de gasto', run: () => runsService.autoResumeSpendControlHolds() },
+    // r65 (R4): una parte de IA que agotó su tope interno → UNA ronda extra (sin streaming, max_tokens × 1,5) si el saldo
+    // del run cubre su peor caso y no hay reservas abiertas; si vuelve a agotarlo, queda para el dueño / un humano.
+    { name: 'ronda extra por tope de la parte', run: () => runsService.autoExtendItemRecoveryBudget() },
+    // r62 (d8): claim incompleto por un dato de la dependencia → regenerate_dependency (una vez, dentro del presupuesto).
+    { name: 'claim incompleto (dependencia)', run: () => runsService.autoRecoverClaimPayloadUnavailable() },
+    // REL CREDIT: sonda del proveedor tras crédito/cuota agotados (un canario por run y proveedor; legacy la apaga).
+    { name: 'sonda de crédito del proveedor', run: () => runsService.autoProbeProviderCredit() },
+    // r62 (N2): Videogen/Gamma con resultado conocido (o ambiguo) → conciliación con la evidencia + reenvío acotado.
+    { name: 'conciliación de proveedor', run: () => providerReconcile.sweep() },
+    { name: 'empaque automático', run: () => autoPackage.sweep() },
+  ]);
 }
 
 bootstrap();

@@ -13,6 +13,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import * as JSZip from 'jszip';
 import { createHash } from 'crypto';
+import { h5pTitle } from './h5p/types/common';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -457,7 +458,8 @@ export class MbzBuilderService {
 
     async function buildH5PZip(hvpJsonObj: Record<string, any>, capNameStr: string): Promise<Uint8Array> {
       const meta = {
-        title: capNameStr, language: 'es', mainLibrary: 'H5P.InteractiveVideo',
+        // Mismo límite que el builder v3: un título de capítulo largo (hasta 255) no puede romper el H5P.
+        title: h5pTitle(capNameStr), language: 'es', mainLibrary: 'H5P.InteractiveVideo',
         embedTypes: ['div'], license: 'U',
         preloadedDependencies: [
           { machineName: 'H5P.InteractiveVideo', majorVersion: 1, minorVersion: 27 },

@@ -1,0 +1,523 @@
+import { assertApplicationActivitySchema, assertGuidedPracticeSchema } from '../course-structure/v21-schema-guard';
+import { ConflictException, Injectable, InternalServerErrorException, Logger, NotFoundException } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { returningRows } from '../../common/db/returning-rows';
+import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import { AnyBlueprintDto, BlueprintDto, CourseBlueprintsService } from '../course-blueprints/course-blueprints.service';
+import {
+  BLUEPRINT_SCHEMA_MISMATCH,
+  GenerationManifestV1,
+  MANIFEST_SCHEMA_VERSION,
+  ManifestRulesVersion,
+  ManifestSource,
+  ManifestTotals,
+  ManifestValidationError,
+  buildGenerationManifest,
+  canonicalManifestJson,
+  manifestSha256,
+  validateGenerationManifest,
+} from './generation-manifest-builder';
+import { activityTypeRulesForNextManifest, readActivityTypeRulesConfig, readManifestRulesVersionConfig } from './manifest-rules-config';
+import type { ActivityTypeRulesVersion } from './activity-type-rules';
+
+export interface ManifestDto {
+  id: number;
+  courseId: number;
+  blueprintId: number;
+  blueprintNumber: number;
+  rulesVersion: number;
+  manifestSchemaVersion: number;
+  manifest: GenerationManifestV1;
+  sha256: string;
+  blueprintSha256: string;
+  totals: ManifestTotals;
+  createdAt: string;
+  createdBy: string | null;
+}
+
+function toIso(v: Date | string): string {
+  return (v instanceof Date ? v : new Date(v)).toISOString();
+}
+
+function describeErrors(errors: ManifestValidationError[]): string {
+  const codes = [...new Set(errors.map((e) => e.code))].join(', ');
+  const detail = errors.slice(0, 5).map((e) => `${e.code}: ${e.message}`).join('; ');
+  return `[${codes}] ${detail}${errors.length > 5 ? ` (+${errors.length - 5} más)` : ''}`;
+}
+
+/**
+ * EV5-C: marcador `features.activityTypeRules` de una fila guardada (ausente =
+ * 0 = legacy/hash). Cualquier otro valor es integridad rota → 500 (nunca se
+ * interpreta como 0).
+ */
+/**
+ * Loop 9: ¿el Manifest guardado es ANTERIOR a que el examen final dependiera de los exámenes de módulo? (su final_exam
+ * depende solo de content aunque el Manifest tenga items exam). Se reconstruye igual para verificar su determinismo:
+ * una fila existente nunca cambia ni deja de ser válida.
+ */
+function storedLegacyFinalExamDeps(row: any): boolean {
+  const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
+  const items: any[] = Array.isArray(stored?.items) ? stored.items : [];
+  const fin = items.find((i) => i && i.type === 'final_exam');
+  if (!fin || !items.some((i) => i && i.type === 'exam')) return false;
+  return !(Array.isArray(fin.dependsOn) ? fin.dependsOn : []).some((d: unknown) => String(d).startsWith('exam:'));
+}
+
+function storedActivityTypeRules(row: any): ActivityTypeRulesVersion {
+  const stored = typeof row?.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row?.manifest_json;
+  return activityTypeRulesValue(stored?.features?.activityTypeRules, row?.id);
+}
+
+/**
+ * Valor crudo del marcador (jsonb → number | null). Solo acepta el número 0/1
+ * de JS o ausente (null/undefined → 0). Un string (p.ej. "1") o cualquier otra
+ * cosa es integridad rota → 500 explícito; nunca se interpreta con JSON.parse.
+ */
+function activityTypeRulesValue(raw: unknown, id: unknown): ActivityTypeRulesVersion {
+  if (raw === undefined || raw === null) return 0;
+  if (raw === 0 || raw === 1 || raw === 2) return raw;
+  throw new InternalServerErrorException(
+    `Generation Manifest #${String(id)}: features.activityTypeRules guardado inválido (${JSON.stringify(raw)})`,
+  );
+}
+
+function sourceOf(bp: AnyBlueprintDto): ManifestSource {
+  return {
+    courseId: bp.courseId,
+    blueprintId: bp.id,
+    blueprintNumber: bp.blueprintNumber,
+    blueprintSha256: bp.sha256,
+  };
+}
+
+/**
+ * Generation Manifest (Fase 4): qué trabajos hay que generar para un
+ * Blueprint congelado. Solo escribe en `course_generation_manifests`; nunca
+ * toca production_jobs/artifacts/courses/course_blueprints/estructura viva.
+ *
+ * Ownership + `dynamic` + lectura verificada del Blueprint se delegan en
+ * `CourseBlueprintsService.getByNumber` (404 ajeno/inexistente, 400 legacy);
+ * el builder recibe solo el snapshot del Blueprint.
+ */
+@Injectable()
+export class GenerationManifestsService {
+  private readonly logger = new Logger(GenerationManifestsService.name);
+
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly blueprints: CourseBlueprintsService,
+  ) {
+    // I4 (review-rv2, mismo criterio que M6 de It.2 con DYNAMIC_VIDEO_DELIVERY):
+    // este servicio vive en AppModule (API + workers legacy) y lo instancia
+    // también el dynamic-package-worker — un typo en DYNAMIC_MANIFEST_RULES_VERSION
+    // NO puede tumbar el boot de todo eso. La validación ruidosa y sin fallback
+    // es lazy: configuredRulesVersion() lanza en cada uso de las rutas dynamic
+    // que dependen de la config (crear un Manifest, leer "el Manifest actual").
+    // Acá solo se deja el error bien visible en el log de arranque.
+    // Review EV5-C (7): cada config en su propio try, para que un valor inválido
+    // en una no esconda el error de la otra en el log de arranque.
+    for (const read of [readManifestRulesVersionConfig, readActivityTypeRulesConfig]) {
+      try {
+        read();
+      } catch (err) {
+        this.logger.error(
+          `${err instanceof Error ? err.message : String(err)} — las rutas dynamic que crean/leen el Manifest ` +
+            'configurado van a fallar hasta corregirlo; el resto del backend arranca normal',
+        );
+      }
+    }
+  }
+
+  /** rulesVersion configurado (DYNAMIC_MANIFEST_RULES_VERSION, default 1); lanza si es inválido (fail loud en uso). */
+  configuredRulesVersion(): ManifestRulesVersion {
+    return readManifestRulesVersionConfig();
+  }
+
+  /** EV5-C: reglas de tipo de actividad para Manifests v3 NUEVOS (DYNAMIC_ACTIVITY_TYPE_RULES, default 0); lanza si es inválido. */
+  configuredActivityTypeRules(): ActivityTypeRulesVersion {
+    return readActivityTypeRulesConfig();
+  }
+
+  /**
+   * Get-or-create idempotente. La idempotencia la garantiza la base con
+   * UNIQUE(blueprint_id, rules_version) + ON CONFLICT DO NOTHING: dos POST
+   * concurrentes producen una sola fila; el perdedor lee la del ganador.
+   */
+  async getOrCreate(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+  ): Promise<{ created: boolean; manifest: ManifestDto }> {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    const rulesVersion = this.configuredRulesVersion();
+    const bp = await this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion);
+    const source = sourceOf(bp);
+    // EV5-C: reglas de tipo de actividad (solo v3). Ruling del dueño: los
+    // cursos existentes conservan el tipo por hash PARA SIEMPRE. Por eso el
+    // marcador se hereda del Manifest v3 más reciente del CURSO (cualquier
+    // versión de Blueprint, incluida la fila de este mismo Blueprint si ya
+    // existe); solo un curso sin ningún Manifest v3 previo lee la config
+    // DYNAMIC_ACTIVITY_TYPE_RULES. Así una versión nueva del Blueprint de un
+    // curso legacy nunca adopta las reglas por objetivo (ni regenera sus
+    // actividades por activity_type_changed). La fila existente de ESTE
+    // Blueprint se verifica igual más abajo con su marcador guardado.
+    // ROLLBACK: volver DYNAMIC_ACTIVITY_TYPE_RULES a 0 solo afecta a los cursos
+    // creados DESPUÉS (su primer Manifest v3); los cursos que ya tienen un
+    // Manifest con reglas 1 las conservan en todas sus versiones siguientes.
+    const activityTypeRules: ActivityTypeRulesVersion = rulesVersion === 3 ? await this.activityTypeRulesForNewRow(courseId) : 0;
+    const m = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules });
+
+    const errors = validateGenerationManifest(m, bp.snapshot, source);
+    if (errors.length > 0) {
+      // Bug del builder: nunca se persiste un Manifest inválido.
+      throw new InternalServerErrorException(
+        `Generation Manifest inválido para el Blueprint v${bp.blueprintNumber} del curso #${courseId} ` +
+          `(no se guardó): ${describeErrors(errors)}`,
+      );
+    }
+
+    const canonical = canonicalManifestJson(m);
+    const sha = manifestSha256(m);
+    const t = m.totals;
+
+    // v1: exactamente el INSERT de siempre (no depende de la migración v2).
+    // v2: además las columnas de conteo v2 (supabase-migration-dynamic-
+    // generation-v2.sql); sin esa migración el CHECK cgm_counts_consistent
+    // viejo rechaza el total (falla fuerte, nunca un Manifest v2 a medias).
+    const inserted = returningRows(
+      rulesVersion === 3
+        ? await this.insertV3(courseId, bp.id, bp.sha256, canonical, sha, t, ownerId)
+        : rulesVersion === 2
+        ? await this.dataSource.query(
+            `insert into public.course_generation_manifests
+               (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
+                manifest_sha256, blueprint_sha256, module_count, chapter_count, content_count,
+                scorm_count, video_count, exam_count, total_jobs, created_by,
+                course_plan_count, course_intro_count, module_intro_count)
+             values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+             on conflict (blueprint_id, rules_version) do nothing
+             returning *`,
+            [courseId, bp.id, rulesVersion, MANIFEST_SCHEMA_VERSION, canonical, sha, bp.sha256,
+              t.moduleCount, t.chapterCount, t.contentCount, t.scormCount, t.videoCount, t.examCount,
+              t.totalJobs, ownerId, t.coursePlanCount, t.courseIntroCount, t.moduleIntroCount],
+          )
+        : await this.dataSource.query(
+            `insert into public.course_generation_manifests
+               (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
+                manifest_sha256, blueprint_sha256, module_count, chapter_count, content_count,
+                scorm_count, video_count, exam_count, total_jobs, created_by)
+             values ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             on conflict (blueprint_id, rules_version) do nothing
+             returning *`,
+            [courseId, bp.id, rulesVersion, MANIFEST_SCHEMA_VERSION, canonical, sha, bp.sha256,
+              t.moduleCount, t.chapterCount, t.contentCount, t.scormCount, t.videoCount, t.examCount,
+              t.totalJobs, ownerId],
+          ),
+    );
+    if (inserted.length === 1) {
+      return { created: true, manifest: this.toDto(inserted[0], bp) };
+    }
+
+    const existing = await this.findRow(courseId, bp.id, rulesVersion);
+    if (!existing) {
+      // ON CONFLICT sin fila visible después: no debería ocurrir (el UNIQUE
+      // solo choca con filas commiteadas o en curso que luego se commitean).
+      throw new InternalServerErrorException(
+        `Generation Manifest del Blueprint v${bp.blueprintNumber} (curso #${courseId}): ` +
+          'el insert chocó con el UNIQUE pero no se encontró la fila existente',
+      );
+    }
+    // EV5-C: el Manifest ya guardado conserva sus reglas de tipo de actividad
+    // (ruling: los existentes no adoptan las reglas nuevas; legacy = hash). Si la
+    // config actual difiere del marcador guardado, el determinismo se verifica
+    // reconstruyendo con el marcador guardado, nunca con la config.
+    let expectedSha = sha;
+    const storedRules = rulesVersion === 3 ? storedActivityTypeRules(existing) : 0;
+    const legacyFinalExamDeps = rulesVersion === 3 && storedLegacyFinalExamDeps(existing);
+    if (storedRules !== activityTypeRules || legacyFinalExamDeps) {
+      const rebuilt = buildGenerationManifest(bp.snapshot, source, { rulesVersion, activityTypeRules: storedRules, legacyFinalExamDeps });
+      expectedSha = manifestSha256(rebuilt);
+    }
+    if (existing.manifest_sha256 !== expectedSha) {
+      throw new InternalServerErrorException(
+        `Generation Manifest no determinístico: el guardado #${existing.id} del Blueprint v${bp.blueprintNumber} ` +
+          `(curso #${courseId}, rulesVersion ${rulesVersion}, activityTypeRules ${storedRules}) tiene sha256 ` +
+          `${existing.manifest_sha256} pero el recién calculado es ${expectedSha}`,
+      );
+    }
+    return { created: false, manifest: this.toDto(existing, bp) };
+  }
+
+  /**
+   * Lee el Manifest de un Blueprint para `rulesVersion` (default: el
+   * configurado, DYNAMIC_MANIFEST_RULES_VERSION); 404 si no se creó.
+   */
+  async get(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    rulesVersion: ManifestRulesVersion = this.configuredRulesVersion(),
+  ): Promise<ManifestDto> {
+    const bp = await this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion);
+    const row = await this.findRow(courseId, bp.id, rulesVersion);
+    if (!row) {
+      throw new NotFoundException(
+        `El Blueprint v${bp.blueprintNumber} del curso #${courseId} no tiene Generation Manifest ` +
+          `(rulesVersion ${rulesVersion}); créalo con POST`,
+      );
+    }
+    return this.toDto(row, bp);
+  }
+
+  /**
+   * Verifica acceso al Blueprint (404 ajeno/inexistente, 400 legacy) SIN
+   * depender de DYNAMIC_MANIFEST_RULES_VERSION. Lo usan los endpoints con
+   * runId cuando el run no existe, para responder 404 del run sin leer "el
+   * Manifest actual" de la config (fix wave review-rv2).
+   */
+  async assertBlueprintAccessible(courseId: number, ownerId: string, blueprintNumber: number): Promise<void> {
+    // V2.1 (R4): acceso = ownership + dynamic + existencia, sin importar el
+    // schemaVersion del Blueprint (un run v3 tiene Blueprint v2).
+    await this.blueprints.getByNumberAnySchema(courseId, ownerId, blueprintNumber);
+  }
+
+  /**
+   * V2.1 (R4): Blueprint para un rulesVersion. v1/v2 → `getByNumber` (igual
+   * que antes: un Blueprint v2 da 501 BLUEPRINT_V2_REQUIRES_RULES_V3). v3 →
+   * cualquier schema, pero exige schemaVersion 2: un Blueprint v1 (lockeado
+   * antes de pasar la config a 3) da 409 BLUEPRINT_SCHEMA_MISMATCH con la
+   * acción (re-lockear) — nunca se arma un Manifest v3 sin los toggles v2.
+   */
+  private async blueprintForRules(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    rulesVersion: ManifestRulesVersion,
+  ): Promise<AnyBlueprintDto> {
+    if (rulesVersion !== 3) return this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+    const bp = await this.blueprints.getByNumberAnySchema(courseId, ownerId, blueprintNumber);
+    if (bp.schemaVersion !== 2) {
+      throw new ConflictException({
+        code: BLUEPRINT_SCHEMA_MISMATCH,
+        message:
+          `${BLUEPRINT_SCHEMA_MISMATCH}: el Blueprint v${bp.blueprintNumber} del curso #${courseId} es schemaVersion ` +
+          `${bp.schemaVersion} y DYNAMIC_MANIFEST_RULES_VERSION=3 requiere schemaVersion 2. Congelá (lock) un Blueprint ` +
+          'nuevo con la config actual para generar con las reglas v3.',
+      });
+    }
+    return bp;
+  }
+
+  /**
+   * EV5-C: marcador para una fila v3 nueva = el del Manifest v3 más reciente
+   * del curso (`features.activityTypeRules ?? 0`); sin Manifest v3 previo →
+   * config (lanza si es inválida). Un curso con Manifests nunca lee la config.
+   */
+  private async activityTypeRulesForNewRow(courseId: number): Promise<ActivityTypeRulesVersion> {
+    // LOOP 7: fuente única (también la usan el dry-run, «Aplicar diseño» y el impacto de cambios).
+    try {
+      // El servicio de Manifests trabaja sobre su propia tabla: no hace falta comprobar que exista.
+      return await activityTypeRulesForNextManifest(this.dataSource, courseId, process.env, { tableKnownToExist: true });
+    } catch (err) {
+      throw new InternalServerErrorException((err as Error).message);
+    }
+  }
+
+  /** INSERT v3: columnas de conteo v2 + v3 (supabase-migration-v21-manifest-v3.sql); scorm_count = 0. */
+  private async insertV3(
+    courseId: number,
+    blueprintId: number,
+    blueprintSha: string,
+    canonical: string,
+    sha: string,
+    t: ManifestTotals,
+    ownerId: string,
+  ): Promise<any> {
+    // Fase 2: la columna application_activity_count solo se escribe con actividades (una base sin la migración
+    // sigue aceptando los Manifests de siempre; con actividades y sin migración → 503, nunca un 500 crudo).
+    const apps = t.applicationActivityCount ?? 0;
+    if (apps > 0) await assertApplicationActivitySchema(this.dataSource);
+    // Loop 9 B: ídem con guided_practice_count (con prácticas guiadas y sin migración → 503).
+    const gps = t.guidedPracticeCount ?? 0;
+    if (gps > 0) await assertGuidedPracticeSchema(this.dataSource);
+    const extraCols = `${apps > 0 ? ', application_activity_count' : ''}${gps > 0 ? ', guided_practice_count' : ''}`;
+    const extraVals = [...(apps > 0 ? [apps] : []), ...(gps > 0 ? [gps] : [])];
+    const extraPh = extraVals.map((_, k) => `, $${24 + k}`).join('');
+    return this.dataSource.query(
+      `insert into public.course_generation_manifests
+         (course_id, blueprint_id, rules_version, manifest_schema_version, manifest_json,
+          manifest_sha256, blueprint_sha256, module_count, chapter_count, content_count,
+          scorm_count, video_count, exam_count, total_jobs, created_by,
+          course_plan_count, course_intro_count, module_intro_count,
+          experience_count, presentation_count, video_interactions_count, activity_count,
+          audiobook_chapter_count, audio_welcome_count, final_exam_count${extraCols})
+       values ($1, $2, 3, $3, $4::jsonb, $5, $6, $7, $8, $9, 0, $10, $11, $12, $13, $14, $15, $16,
+               $17, $18, $19, $20, $21, $22, $23${extraPh})
+       on conflict (blueprint_id, rules_version) do nothing
+       returning *`,
+      [courseId, blueprintId, MANIFEST_SCHEMA_VERSION, canonical, sha, blueprintSha,
+        t.moduleCount, t.chapterCount, t.contentCount, t.videoCount, t.examCount, t.totalJobs, ownerId,
+        t.coursePlanCount, t.courseIntroCount, t.moduleIntroCount,
+        t.experienceCount, t.presentationCount, t.videoInteractionsCount, t.activityCount,
+        t.audiobookChapterCount, t.audioWelcomeCount, t.finalExamCount, ...extraVals],
+    );
+  }
+
+  /**
+   * Fase 7/8: Blueprint verificado (ownership + `dynamic` + hash) de un
+   * número, para quien ya tiene el Manifest y necesita el snapshot
+   * (coherencia, plan de invalidación). Mismos 404/400 que `get`.
+   */
+  async blueprintOf(courseId: number, ownerId: string, blueprintNumber: number): Promise<BlueprintDto> {
+    return this.blueprints.getByNumber(courseId, ownerId, blueprintNumber);
+  }
+
+  /**
+   * V2.1 (R5): Blueprint verificado para el rulesVersion de un Manifest
+   * (invalidación, coherencia). v1/v2 → igual que `blueprintOf` (un
+   * Blueprint v2 da 501). v3 → exige schemaVersion 2 (409
+   * BLUEPRINT_SCHEMA_MISMATCH si no), mismas reglas que al crear el Manifest.
+   */
+  async blueprintOfForRules(
+    courseId: number,
+    ownerId: string,
+    blueprintNumber: number,
+    rulesVersion: number,
+  ): Promise<AnyBlueprintDto> {
+    return this.blueprintForRules(courseId, ownerId, blueprintNumber, rulesVersion as ManifestRulesVersion);
+  }
+
+  /**
+   * Lee un Manifest concreto por id (el congelado en un run:
+   * input_payload.manifestId), verificando que sea de ESE Blueprint/curso y
+   * del dueño (mismas garantías que `get`). Así un run v1 sigue legible
+   * aunque la config pase a crear Manifests v2 (y viceversa). 404 si no es de
+   * este Blueprint.
+   */
+  async getById(courseId: number, ownerId: string, blueprintNumber: number, manifestId: number): Promise<ManifestDto> {
+    // V2.1 (R4): cualquier schema; toDto valida el par (rulesVersion, schema)
+    // y un Manifest v1/v2 sobre un Blueprint v2 (imposible por construcción)
+    // sería BLUEPRINT_SCHEMA_MISMATCH → 500 de integridad.
+    const bp = await this.blueprints.getByNumberAnySchema(courseId, ownerId, blueprintNumber);
+    const id = Number(manifestId);
+    const [row] = Number.isInteger(id)
+      ? await this.dataSource.query(
+          `select * from public.course_generation_manifests
+            where id = $1 and blueprint_id = $2 and course_id = $3`,
+          [id, bp.id, courseId],
+        )
+      : [];
+    if (!row) {
+      throw new NotFoundException(
+        `El Generation Manifest #${manifestId} no pertenece al Blueprint v${bp.blueprintNumber} del curso #${courseId}`,
+      );
+    }
+    return this.toDto(row, bp);
+  }
+
+  private async findRow(courseId: number, blueprintId: number, rulesVersion: ManifestRulesVersion): Promise<any | undefined> {
+    const [row] = await this.dataSource.query(
+      `select * from public.course_generation_manifests
+        where blueprint_id = $1 and course_id = $2 and rules_version = $3`,
+      [blueprintId, courseId, rulesVersion],
+    );
+    return row;
+  }
+
+  /**
+   * Lectura verificada (ambos caminos, incluso el recién insertado): el jsonb
+   * de Postgres reordena claves, así que se re-canonicaliza y se exige
+   * sha256(canonical) = manifest_sha256; además se re-valida contra el
+   * snapshot del Blueprint y se comparan las columnas de conteo. Cualquier
+   * discrepancia → 500 explícito (nunca se devuelve un Manifest corrupto).
+   */
+  private toDto(row: any, bp: AnyBlueprintDto): ManifestDto {
+    const where = `Generation Manifest #${row.id} (Blueprint v${bp.blueprintNumber}, curso #${bp.courseId})`;
+    const stored = typeof row.manifest_json === 'string' ? JSON.parse(row.manifest_json) : row.manifest_json;
+
+    let canonical: string;
+    try {
+      canonical = canonicalManifestJson(stored as GenerationManifestV1);
+    } catch (err) {
+      throw new InternalServerErrorException(
+        `${where}: manifest_json guardado no tiene la forma esperada (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+    const manifest: GenerationManifestV1 = JSON.parse(canonical);
+    const actualSha = manifestSha256(manifest);
+    if (actualSha !== row.manifest_sha256) {
+      throw new InternalServerErrorException(
+        `${where}: integridad rota — sha256 del manifest_json guardado (${actualSha}) ` +
+          `no coincide con manifest_sha256 (${row.manifest_sha256})`,
+      );
+    }
+
+    if (row.blueprint_id !== bp.id || row.blueprint_sha256 !== bp.sha256) {
+      throw new InternalServerErrorException(
+        `${where}: blueprint_id/blueprint_sha256 guardados no coinciden con el Blueprint leído`,
+      );
+    }
+
+    // FIX M1: las columnas rules_version/manifest_schema_version deben
+    // coincidir con lo que dice el propio manifest_json (ahora que
+    // canonicalManifestJson ya no las hardcodea a 1) — una discrepancia acá
+    // es integridad rota, igual que el sha256.
+    if (
+      row.rules_version !== manifest.rulesVersion ||
+      row.manifest_schema_version !== manifest.manifestSchemaVersion
+    ) {
+      throw new InternalServerErrorException(
+        `${where}: columnas rules_version/manifest_schema_version (${row.rules_version}/${row.manifest_schema_version}) ` +
+          `no coinciden con manifest_json (${manifest.rulesVersion}/${manifest.manifestSchemaVersion})`,
+      );
+    }
+
+    const errors = validateGenerationManifest(manifest, bp.snapshot, sourceOf(bp));
+    if (errors.length > 0) {
+      throw new InternalServerErrorException(
+        `${where}: el Manifest guardado no es válido contra el snapshot del Blueprint: ${describeErrors(errors)}`,
+      );
+    }
+
+    const t = manifest.totals;
+    const cols = [row.module_count, row.chapter_count, row.content_count, row.scorm_count,
+      row.video_count, row.exam_count, row.total_jobs];
+    const fromJson = [t.moduleCount, t.chapterCount, t.contentCount, t.scormCount,
+      t.videoCount, t.examCount, t.totalJobs];
+    // v2: columnas de conteo nuevas (ausentes antes de la migración v2 → 0,
+    // que es lo que declara un Manifest v1).
+    cols.push(row.course_plan_count ?? 0, row.course_intro_count ?? 0, row.module_intro_count ?? 0);
+    fromJson.push(t.coursePlanCount ?? 0, t.courseIntroCount ?? 0, t.moduleIntroCount ?? 0);
+    // v3 (R4): scorm_count = 0 (no hay items scorm) + columnas v3 (0 en v1/v2).
+    if (manifest.rulesVersion === 3) fromJson[3] = t.scormCount ?? 0;
+    cols.push(row.experience_count ?? 0, row.presentation_count ?? 0, row.video_interactions_count ?? 0,
+      row.activity_count ?? 0, row.audiobook_chapter_count ?? 0, row.audio_welcome_count ?? 0, row.final_exam_count ?? 0,
+      // Fase 2: ausente antes de la migración de actividades → 0 (lo que declara un Manifest sin actividades).
+      row.application_activity_count ?? 0,
+      // Loop 9 B: ausente antes de la migración de práctica guiada → 0.
+      row.guided_practice_count ?? 0);
+    fromJson.push(t.experienceCount ?? 0, t.presentationCount ?? 0, t.videoInteractionsCount ?? 0,
+      t.activityCount ?? 0, t.audiobookChapterCount ?? 0, t.audioWelcomeCount ?? 0, t.finalExamCount ?? 0,
+      t.applicationActivityCount ?? 0, t.guidedPracticeCount ?? 0);
+    if (cols.some((v, i) => v !== fromJson[i])) {
+      throw new InternalServerErrorException(
+        `${where}: columnas de conteo [${cols.join(',')}] no coinciden con totals del manifest [${fromJson.join(',')}]`,
+      );
+    }
+
+    return {
+      id: row.id,
+      courseId: row.course_id,
+      blueprintId: row.blueprint_id,
+      blueprintNumber: bp.blueprintNumber,
+      rulesVersion: row.rules_version,
+      manifestSchemaVersion: row.manifest_schema_version,
+      manifest,
+      sha256: row.manifest_sha256,
+      blueprintSha256: row.blueprint_sha256,
+      totals: { ...t },
+      createdAt: toIso(row.created_at),
+      createdBy: row.created_by ?? null,
+    };
+  }
+}

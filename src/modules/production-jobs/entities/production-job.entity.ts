@@ -100,6 +100,10 @@ export class ProductionJob {
   @Column({ name: 'content_snapshot_artifact_id', type: 'uuid', nullable: true })
   contentSnapshotArtifactId: string;
 
+  @Index()
+  @Column({ name: 'blueprint_version_id', nullable: true })
+  blueprintVersionId: number;
+
   /** Opciones del pipeline: generateVideos, maxVideoChapters, etc. */
   @Column({ type: 'jsonb', nullable: true, default: '{}' })
   options: Record<string, any>;

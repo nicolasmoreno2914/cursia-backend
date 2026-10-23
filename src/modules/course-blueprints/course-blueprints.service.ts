@@ -1,0 +1,658 @@
+import { CHAPTER_TITLE_TOO_LONG, MODULE_TITLE_TOO_LONG, STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
+import { academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+  ConflictException,
+  NotImplementedException,
+} from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import type { QueryRunner } from 'typeorm';
+import { returningRows } from '../../common/db/returning-rows';
+import { assembleLockSnapshotV2, loadLockRows } from './lock-snapshot';
+import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
+import { loadCurrentPedagogicalProfile } from '../pedagogy/pedagogy-db';
+import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
+import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
+import {
+  BlueprintSnapshotV1,
+  BlueprintSnapshotV2,
+  RawChapterRow,
+  RawChapterRowV2,
+  RawModuleRow,
+  buildBlueprintSnapshot,
+  buildBlueprintSnapshotV2,
+  canonicalJson,
+  canonicalJsonV2,
+  recanonicalizeBlueprintSnapshotV2,
+  snapshotSha256,
+  snapshotSha256V2,
+  validateBlueprintInput,
+  validateBlueprintInputV2,
+} from './blueprint-snapshot';
+import {
+  blueprintSchemaVersionForRules,
+  readConfiguredRulesVersion,
+} from '../generation-manifests/manifest-rules-config';
+
+export interface BlueprintSummaryDto {
+  id: number;
+  courseId: number;
+  blueprintNumber: number;
+  schemaVersion: number;
+  sha256: string;
+  structureCounterAtLock: number;
+  moduleCount: number;
+  chapterCount: number;
+  lockedAt: string;
+  lockedBy: string | null;
+  isCurrent: boolean;
+}
+
+export interface BlueprintDto {
+  id: number;
+  courseId: number;
+  blueprintNumber: number;
+  schemaVersion: number;
+  snapshot: BlueprintSnapshotV1;
+  sha256: string;
+  structureCounterAtLock: number;
+  moduleCount: number;
+  chapterCount: number;
+  lockedAt: string;
+  lockedBy: string | null;
+}
+
+/**
+ * V2.1 (R3): Blueprint con snapshot schemaVersion 2. `BlueprintDto` (v1)
+ * queda tal cual para los consumidores v1 (Manifest v1/v2, coherencia,
+ * invalidación, empaque); esos piden `getByNumber`, que rechaza un v2 con
+ * 501 explícito en vez de pasarles una forma que no esperan.
+ */
+export interface BlueprintDtoV2 extends Omit<BlueprintDto, 'schemaVersion' | 'snapshot'> {
+  schemaVersion: 2;
+  snapshot: BlueprintSnapshotV2;
+}
+
+export type AnyBlueprintDto = BlueprintDto | BlueprintDtoV2;
+
+export const BLUEPRINT_V2_REQUIRES_RULES_V3 = 'BLUEPRINT_V2_REQUIRES_RULES_V3';
+
+export interface CurrentBlueprintInfo {
+  id: number;
+  number: number;
+  lockedAt: string;
+  sha256: string;
+  /** V2.1: 1 | 2 — para comparar la estructura viva con el builder correcto. */
+  schemaVersion: number;
+}
+
+const OWNERSHIP_FILTER = `(owner_id = $2 or ($3 = true and owner_id is null))`;
+const BLUEPRINT_NUMBER_UNIQUE = 'course_blueprints_course_number_key';
+
+function allowUnownedCourses(): boolean {
+  return process.env.ALLOW_UNOWNED_COURSES === 'true';
+}
+
+function toIso(v: Date | string): string {
+  return (v instanceof Date ? v : new Date(v)).toISOString();
+}
+
+function isBlueprintNumberConflict(err: any): boolean {
+  const e = err?.driverError ?? err;
+  return (err?.code === '23505' || e?.code === '23505') &&
+    (err?.constraint === BLUEPRINT_NUMBER_UNIQUE || e?.constraint === BLUEPRINT_NUMBER_UNIQUE);
+}
+
+/** Title Normalization: errores de títulos > STRUCTURE_TITLE_MAX (módulos y capítulos), con ids. */
+export function structureTitleErrors(
+  modules: Array<{ id: string; title: string; position?: number }>,
+  chapters: Array<{ id: string; title: string; module_id?: string; position?: number }>,
+): Array<{ code: string; path: string; message: string }> {
+  const out: Array<{ code: string; path: string; message: string }> = [];
+  // Numeración visible (módulos por position, capítulos global por módulo+position) para un mensaje accionable.
+  const mods = [...modules].sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0));
+  const modNum = new Map(mods.map((m, i) => [m.id, i + 1]));
+  const chs = [...chapters].sort((a, b) => (modNum.get(a.module_id ?? '') ?? 0) - (modNum.get(b.module_id ?? '') ?? 0) || Number(a.position ?? 0) - Number(b.position ?? 0));
+  const short = (t: string) => { const s = String(t ?? '').trim(); return s.length > 40 ? `${s.slice(0, 40)}…` : s; };
+  for (const m of mods) {
+    const n = String(m.title ?? '').trim().length;
+    if (n > STRUCTURE_TITLE_MAX) {
+      out.push({ code: MODULE_TITLE_TOO_LONG, path: `modules[${m.id}].title`, message: `el título del módulo ${modNum.get(m.id)} («${short(m.title)}») tiene ${n} caracteres (máximo ${STRUCTURE_TITLE_MAX})` });
+    }
+  }
+  chs.forEach((c, i) => {
+    const n = String(c.title ?? '').trim().length;
+    if (n > STRUCTURE_TITLE_MAX) {
+      out.push({ code: CHAPTER_TITLE_TOO_LONG, path: `chapters[${c.id}].title`, message: `el título del capítulo ${i + 1} («${short(c.title)}») tiene ${n} caracteres (máximo ${STRUCTURE_TITLE_MAX})` });
+    }
+  });
+  return out;
+}
+
+@Injectable()
+export class CourseBlueprintsService {
+  constructor(private readonly dataSource: DataSource) {}
+
+  /**
+   * Confirma ("lockea") la estructura viva como un Blueprint inmutable.
+   *
+   * Todo en UNA transacción sobre la conexión del queryRunner:
+   * `FOR UPDATE` sobre la fila del curso (con el mismo filtro de ownership
+   * que Fase 2) serializa locks concurrentes; el segundo ve el `current`
+   * recién commiteado con el mismo hash y devuelve `created:false`.
+   * `blueprint_number` = max+1 bajo ese lock; el UNIQUE
+   * (course_id, blueprint_number) es solo el respaldo → 409.
+   * `structure_version_counter` NO se toca (crear un Blueprint no es una
+   * edición de estructura).
+   */
+  async lock(
+    courseId: number,
+    ownerId: string,
+    expectedCounter: number,
+  ): Promise<{ created: boolean; blueprint: AnyBlueprintDto }> {
+    assertDynamicOwnerAllowed(ownerId); // release-fix I4: allow-list V2 en toda escritura
+    // V2.1 (R3): schemaVersion 2 SOLO con DYNAMIC_MANIFEST_RULES_VERSION=3.
+    // Config inválida → lanza acá (fail loud), antes de abrir la transacción.
+    const schemaVersion = blueprintSchemaVersionForRules(readConfiguredRulesVersion());
+    if (schemaVersion === 2) return this.lockV2(courseId, ownerId, expectedCounter);
+    const qr: QueryRunner = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+
+      const [course] = await qr.query(
+        `select id, title, structure_version, structure_version_counter, current_blueprint_id
+           from public.courses
+          where id = $1 and ${OWNERSHIP_FILTER}
+          for update`,
+        [courseId, ownerId, allowUnownedCourses()],
+      );
+      if (!course) {
+        await qr.rollbackTransaction();
+        throw new NotFoundException(`Course #${courseId} not found`);
+      }
+      if (course.structure_version !== 'dynamic') {
+        await qr.rollbackTransaction();
+        throw new BadRequestException(
+          `El curso #${courseId} es "${course.structure_version}" — esta API solo admite cursos "dynamic".`,
+        );
+      }
+
+      const modules: RawModuleRow[] = await qr.query(
+        `select id, position, title, objective, exam_enabled from public.course_modules where course_id = $1`,
+        [courseId],
+      );
+      const chapters: RawChapterRow[] = await qr.query(
+        `select id, module_id, position, title, objective, video_enabled from public.course_chapters where course_id = $1`,
+        [courseId],
+      );
+
+      if (course.structure_version_counter !== expectedCounter) {
+        await qr.rollbackTransaction();
+        // El filtro global (AllExceptionsFilter) reduce cualquier body de
+        // HttpException a { error: <string> } — currentCounter/structure acá
+        // se pierden en el cliente real. El texto del mensaje es la única
+        // información que llega, así que tiene que ser autocontenido; el
+        // cliente reconcilia con un GET en vez de leer `structure`.
+        throw new ConflictException(
+          `La estructura del curso #${courseId} cambió desde que se leyó: ` +
+            `expectedCounter=${expectedCounter}, actual=${course.structure_version_counter}. ` +
+            'Vuelve a leer la estructura (GET) antes de reintentar el lock.',
+        );
+      }
+
+      const courseRef = { id: course.id, title: course.title };
+      // validateBlueprintInput ANTES de build: build tira en capítulos
+      // huérfanos (guard de último recurso); acá los queremos como 400.
+      const errors = validateBlueprintInput(courseRef, modules, chapters);
+      if (errors.length > 0) {
+        await qr.rollbackTransaction();
+        // Igual que el 409: el filtro global colapsa el body de la excepción
+        // a { error: <string> } (ver AllExceptionsFilter.catch — usa
+        // `message.message` cuando getResponse() es un objeto), así que el
+        // `errors` array nunca llega al cliente si no está también dentro
+        // del mensaje. Lo embebemos como texto humano-legible y dejamos
+        // `errors` en la excepción igual (inofensivo, útil si algo lee
+        // getResponse() directamente, p.ej. tests).
+        const detail = errors.map((e) => e.message).join('; ');
+        throw new BadRequestException({
+          message: `La estructura no cumple las validaciones para crear un Blueprint: ${detail}`,
+          errors,
+        });
+      }
+
+      const snapshot = buildBlueprintSnapshot(courseRef, modules, chapters);
+      const canonical = canonicalJson(snapshot);
+      const sha = snapshotSha256(snapshot);
+
+      if (course.current_blueprint_id != null) {
+        const [cur] = await qr.query(
+          `select * from public.course_blueprints where id = $1 and course_id = $2`,
+          [course.current_blueprint_id, courseId],
+        );
+        if (cur && cur.schema_version === 1 && cur.snapshot_sha256 === sha) {
+          await qr.rollbackTransaction();
+          return { created: false, blueprint: this.toDto(cur) };
+        }
+      }
+
+      const chapterCount = snapshot.modules.reduce((n, m) => n + m.chapters.length, 0);
+      const [{ next }] = await qr.query(
+        `select coalesce(max(blueprint_number), 0) + 1 as next from public.course_blueprints where course_id = $1`,
+        [courseId],
+      );
+      const [row] = await qr.query(
+        `insert into public.course_blueprints
+           (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256,
+            structure_counter_at_lock, module_count, chapter_count, locked_by)
+         values ($1, $2, 1, $3::jsonb, $4, $5, $6, $7, $8)
+         returning *`,
+        [courseId, Number(next), canonical, sha, course.structure_version_counter,
+          snapshot.modules.length, chapterCount, ownerId],
+      );
+
+      const updated = returningRows(await qr.query(
+        `update public.courses set current_blueprint_id = $1 where id = $2 returning id`,
+        [row.id, courseId],
+      ));
+      if (updated.length !== 1) {
+        throw new Error(`lock: no se pudo apuntar current_blueprint_id del curso #${courseId}`);
+      }
+
+      await qr.commitTransaction();
+      // El snapshot devuelto es el canonicalJson persistido, re-parseado (no
+      // el objeto en memoria ni el jsonb, que Postgres reordena).
+      return { created: true, blueprint: this.toDto(row, canonical) };
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      if (isBlueprintNumberConflict(err)) {
+        throw new ConflictException({ message: 'Otro lock en curso, reintenta' });
+      }
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
+  /**
+   * Lock v2 (V2.1): misma transacción, mismos 404/400/409 y misma
+   * idempotencia que `lock`, pero lee los toggles nuevos
+   * (courses.final_exam_enabled / activity_engine,
+   * course_chapters.activity_enabled) y persiste `schema_version = 2`. Los
+   * perfiles de tema y evaluación NO entran: no se leen acá.
+   *
+   * Motor pedagógico V1: el perfil pedagógico VIGENTE (si existe y no está
+   * vacío) se convierte en reglas y su diseño se congela en el snapshot
+   * (`course.pedagogy` + `design` por módulo y capítulo). Los toggles del
+   * docente NO se tocan (las sugerencias de estructura solo las muestra el
+   * dry-run). Sin perfil: snapshot y sha de siempre.
+   */
+  private async lockV2(
+    courseId: number,
+    ownerId: string,
+    expectedCounter: number,
+  ): Promise<{ created: boolean; blueprint: BlueprintDtoV2 }> {
+    const qr: QueryRunner = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+
+      const [course] = await qr.query(
+        `select id, title, structure_version, structure_version_counter, current_blueprint_id,
+                final_exam_enabled, activity_engine,
+                (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled
+           from public.courses
+          where id = $1 and ${OWNERSHIP_FILTER}
+          for update`,
+        [courseId, ownerId, allowUnownedCourses()],
+      );
+      if (!course) {
+        await qr.rollbackTransaction();
+        throw new NotFoundException(`Course #${courseId} not found`);
+      }
+      if (course.structure_version !== 'dynamic') {
+        await qr.rollbackTransaction();
+        throw new BadRequestException(
+          `El curso #${courseId} es "${course.structure_version}" — esta API solo admite cursos "dynamic".`,
+        );
+      }
+
+      const { modules, chapters } = await loadLockRows(qr, courseId);
+
+      if (course.structure_version_counter !== expectedCounter) {
+        await qr.rollbackTransaction();
+        throw new ConflictException(
+          `La estructura del curso #${courseId} cambió desde que se leyó: ` +
+            `expectedCounter=${expectedCounter}, actual=${course.structure_version_counter}. ` +
+            'Vuelve a leer la estructura (GET) antes de reintentar el lock.',
+        );
+      }
+
+      // Perfil pedagógico (diseño + horas objetivo) y contexto académico vigentes → el Blueprint (lock-snapshot.ts,
+      // misma composición que la vista previa del impacto de los cambios).
+      const assembled = await assembleLockSnapshotV2(qr, course, { modules, chapters });
+      if (assembled.errors.length > 0) {
+        await qr.rollbackTransaction();
+        const detail = assembled.errors.map((e) => e.message).join('; ');
+        throw new BadRequestException({
+          message: `La estructura no cumple las validaciones para crear un Blueprint: ${detail}`,
+          errors: assembled.errors,
+        });
+      }
+      // Title Normalization: un Blueprint nunca congela un título de módulo/capítulo > 80
+      // (cursos anteriores al cambio: se corrigen en el editor o con la migración de títulos).
+      const longTitles = structureTitleErrors(modules, chapters);
+      if (longTitles.length > 0) {
+        await qr.rollbackTransaction();
+        throw new BadRequestException({
+          code: longTitles[0].code,
+          message: `${longTitles[0].code}: ${longTitles.map((e) => e.message).join('; ')}`,
+          errors: longTitles,
+        });
+      }
+
+      const snapshot = assembled.snapshot as BlueprintSnapshotV2;
+      const canonical = canonicalJsonV2(snapshot);
+      const sha = snapshotSha256V2(snapshot);
+
+      if (course.current_blueprint_id != null) {
+        const [cur] = await qr.query(
+          `select * from public.course_blueprints where id = $1 and course_id = $2`,
+          [course.current_blueprint_id, courseId],
+        );
+        if (cur && cur.schema_version === 2 && cur.snapshot_sha256 === sha) {
+          await qr.rollbackTransaction();
+          return { created: false, blueprint: this.toDtoV2(cur) };
+        }
+      }
+
+      const chapterCount = snapshot.modules.reduce((n, m) => n + m.chapters.length, 0);
+      const [{ next }] = await qr.query(
+        `select coalesce(max(blueprint_number), 0) + 1 as next from public.course_blueprints where course_id = $1`,
+        [courseId],
+      );
+      const [row] = await qr.query(
+        `insert into public.course_blueprints
+           (course_id, blueprint_number, schema_version, snapshot_json, snapshot_sha256,
+            structure_counter_at_lock, module_count, chapter_count, locked_by)
+         values ($1, $2, 2, $3::jsonb, $4, $5, $6, $7, $8)
+         returning *`,
+        [courseId, Number(next), canonical, sha, course.structure_version_counter,
+          snapshot.modules.length, chapterCount, ownerId],
+      );
+
+      const updated = returningRows(await qr.query(
+        `update public.courses set current_blueprint_id = $1 where id = $2 returning id`,
+        [row.id, courseId],
+      ));
+      if (updated.length !== 1) {
+        throw new Error(`lock: no se pudo apuntar current_blueprint_id del curso #${courseId}`);
+      }
+
+      await qr.commitTransaction();
+      return { created: true, blueprint: this.toDtoV2(row, canonical) };
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      if (isBlueprintNumberConflict(err)) {
+        throw new ConflictException({ message: 'Otro lock en curso, reintenta' });
+      }
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
+  async list(courseId: number, ownerId: string): Promise<BlueprintSummaryDto[]> {
+    const course = await this.loadReadableCourse(courseId, ownerId);
+    const rows = await this.dataSource.query(
+      `select id, course_id, blueprint_number, schema_version, snapshot_sha256,
+              structure_counter_at_lock, module_count, chapter_count, locked_at, locked_by
+         from public.course_blueprints
+        where course_id = $1
+        order by blueprint_number desc`,
+      [courseId],
+    );
+    return rows.map((r: any) => ({
+      id: r.id,
+      courseId: r.course_id,
+      blueprintNumber: r.blueprint_number,
+      schemaVersion: r.schema_version,
+      sha256: r.snapshot_sha256,
+      structureCounterAtLock: r.structure_counter_at_lock,
+      moduleCount: r.module_count,
+      chapterCount: r.chapter_count,
+      lockedAt: toIso(r.locked_at),
+      lockedBy: r.locked_by ?? null,
+      isCurrent: course.current_blueprint_id != null && r.id === course.current_blueprint_id,
+    }));
+  }
+
+  async getCurrent(courseId: number, ownerId: string): Promise<AnyBlueprintDto> {
+    const course = await this.loadReadableCourse(courseId, ownerId);
+    if (course.current_blueprint_id == null) {
+      throw new NotFoundException(`El curso #${courseId} no tiene un Blueprint confirmado`);
+    }
+    const [row] = await this.dataSource.query(
+      `select * from public.course_blueprints where id = $1 and course_id = $2`,
+      [course.current_blueprint_id, courseId],
+    );
+    if (!row) throw new NotFoundException(`El curso #${courseId} no tiene un Blueprint confirmado`);
+    return this.toAnyDto(row);
+  }
+
+  /**
+   * Fase 7 (coherencia estructural "en vivo"): snapshot de la estructura VIVA
+   * (módulos y capítulos actuales) SIN crear un Blueprint. Ownership + `dynamic`
+   * como las lecturas (404/400). Una estructura que todavía no valida (p.ej.
+   * un capítulo sin módulo) → 400 con el detalle.
+   */
+  async liveSnapshot(courseId: number, ownerId: string): Promise<BlueprintSnapshotV1> {
+    // R16 (rendimiento): ownership + `dynamic` + curso + módulos + capítulos en UNA
+    // sentencia (antes 4 idas y vueltas, llamadas en cada render del editor por el
+    // chequeo de coherencia). Mismas columnas y tipos que las filas de antes.
+    const [row] = await this.dataSource.query(
+      `select c.id, c.title, c.structure_version,
+              coalesce((select json_agg(json_build_object('id', m.id, 'position', m.position, 'title', m.title,
+                                                          'objective', m.objective, 'exam_enabled', m.exam_enabled))
+                          from public.course_modules m where m.course_id = c.id), '[]'::json) as modules,
+              coalesce((select json_agg(json_build_object('id', ch.id, 'module_id', ch.module_id, 'position', ch.position,
+                                                          'title', ch.title, 'objective', ch.objective, 'video_enabled', ch.video_enabled))
+                          from public.course_chapters ch where ch.course_id = c.id), '[]'::json) as chapters
+         from public.courses c
+        where c.id = $1 and ${OWNERSHIP_FILTER}`,
+      [courseId, ownerId, allowUnownedCourses()],
+    );
+    if (!row) throw new NotFoundException(`Course #${courseId} not found`);
+    if (row.structure_version !== 'dynamic') {
+      throw new BadRequestException(
+        `El curso #${courseId} es "${row.structure_version}" — esta API solo admite cursos "dynamic".`,
+      );
+    }
+    const asRows = (v: unknown): any[] => {
+      const parsed = typeof v === 'string' ? JSON.parse(v) : v;
+      return Array.isArray(parsed) ? parsed : [];
+    };
+    const modules: RawModuleRow[] = asRows(row.modules);
+    const chapters: RawChapterRow[] = asRows(row.chapters);
+    const courseRef = { id: row.id, title: row.title };
+    const errors = validateBlueprintInput(courseRef, modules, chapters);
+    if (errors.length > 0) {
+      throw new BadRequestException({
+        message: `La estructura actual no se puede evaluar todavía: ${errors.map((e) => e.message).join('; ')}`,
+        errors,
+      });
+    }
+    return buildBlueprintSnapshot(courseRef, modules, chapters);
+  }
+
+  /**
+   * Para consumidores v1 (Manifest v1/v2, coherencia, invalidación, empaque):
+   * un Blueprint schemaVersion 2 → 501 `BLUEPRINT_V2_REQUIRES_RULES_V3`
+   * (nunca se les pasa una forma que no esperan). La API pública de lectura
+   * usa `getByNumberAnySchema`.
+   */
+  async getByNumber(courseId: number, ownerId: string, n: number): Promise<BlueprintDto> {
+    const dto = await this.getByNumberAnySchema(courseId, ownerId, n);
+    if (dto.schemaVersion !== 1) {
+      throw new NotImplementedException(
+        `${BLUEPRINT_V2_REQUIRES_RULES_V3}: el Blueprint v${n} del curso #${courseId} es schemaVersion ` +
+          `${dto.schemaVersion} y solo lo procesan las reglas v3 (Manifest rulesVersion 3); este consumidor es v1/v2.`,
+      );
+    }
+    return dto;
+  }
+
+  /** Lectura de un Blueprint de cualquier schemaVersion (v1 o v2), verificada por sha. */
+  async getByNumberAnySchema(courseId: number, ownerId: string, n: number): Promise<AnyBlueprintDto> {
+    await this.loadReadableCourse(courseId, ownerId);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new BadRequestException('El número de Blueprint debe ser un entero ≥ 1');
+    }
+    const [row] = await this.dataSource.query(
+      `select * from public.course_blueprints where course_id = $1 and blueprint_number = $2`,
+      [courseId, n],
+    );
+    if (!row) throw new NotFoundException(`Blueprint v${n} no existe en el curso #${courseId}`);
+    return this.toAnyDto(row);
+  }
+
+  /**
+   * Resumen del Blueprint vigente para `GET /courses/:id/modules` (Task 4).
+   * NO verifica ownership ni `dynamic`: el caller ya lo hizo con su propio
+   * chequeo antes de llamar (no duplicar la query ni el 404/400).
+   */
+  async currentInfo(courseId: number): Promise<CurrentBlueprintInfo | null> {
+    const [row] = await this.dataSource.query(
+      `select b.id, b.blueprint_number, b.locked_at, b.snapshot_sha256, b.schema_version
+         from public.courses c join public.course_blueprints b
+           on b.id = c.current_blueprint_id and b.course_id = c.id
+        where c.id = $1`,
+      [courseId],
+    );
+    if (!row) return null;
+    return {
+      id: row.id,
+      number: row.blueprint_number,
+      lockedAt: toIso(row.locked_at),
+      sha256: row.snapshot_sha256,
+      schemaVersion: Number(row.schema_version),
+    };
+  }
+
+  /**
+   * Ownership + `dynamic` para las lecturas, con una query propia (nunca
+   * `CoursesService.findOne`, que abre otra conexión y joinea
+   * `course_versions`). 404 no revela si el curso existe.
+   */
+  private async loadReadableCourse(
+    courseId: number,
+    ownerId: string,
+  ): Promise<{ id: number; structure_version: string; current_blueprint_id: number | null }> {
+    const [course] = await this.dataSource.query(
+      `select id, structure_version, current_blueprint_id
+         from public.courses
+        where id = $1 and ${OWNERSHIP_FILTER}`,
+      [courseId, ownerId, allowUnownedCourses()],
+    );
+    if (!course) throw new NotFoundException(`Course #${courseId} not found`);
+    if (course.structure_version !== 'dynamic') {
+      throw new BadRequestException(
+        `El curso #${courseId} es "${course.structure_version}" — esta API solo admite cursos "dynamic".`,
+      );
+    }
+    return course;
+  }
+
+  /**
+   * `canonical` = el string exacto que se insertó (camino de creación).
+   * Sin él (lecturas / idempotente) se reconstruye el orden canónico desde
+   * el jsonb — Postgres reordena las claves de los objetos jsonb — y se
+   * verifica contra `snapshot_sha256`: si no coincide se falla fuerte en vez
+   * de devolver un snapshot que no es el que se hasheó.
+   */
+  private toAnyDto(row: any): AnyBlueprintDto {
+    const v = Number(row.schema_version);
+    if (v === 2) return this.toDtoV2(row);
+    if (v === 1) return this.toDto(row);
+    throw new Error(`Blueprint #${row.id}: schema_version ${row.schema_version} no soportado`);
+  }
+
+  /** Igual que `toDto` pero para snapshots schemaVersion 2 (sha v2, re-canonicalizado por el builder v2). */
+  private toDtoV2(row: any, canonical?: string): BlueprintDtoV2 {
+    let snapshot: BlueprintSnapshotV2;
+    if (canonical !== undefined) {
+      snapshot = JSON.parse(canonical);
+    } else {
+      snapshot = recanonicalizeBlueprintSnapshotV2(row.snapshot_json);
+      if (snapshotSha256V2(snapshot) !== row.snapshot_sha256) {
+        throw new Error(
+          `Blueprint #${row.id}: el snapshot guardado no coincide con su sha256 (integridad rota)`,
+        );
+      }
+      snapshot = JSON.parse(canonicalJsonV2(snapshot));
+    }
+    return {
+      id: row.id,
+      courseId: row.course_id,
+      blueprintNumber: row.blueprint_number,
+      schemaVersion: 2,
+      snapshot,
+      sha256: row.snapshot_sha256,
+      structureCounterAtLock: row.structure_counter_at_lock,
+      moduleCount: row.module_count,
+      chapterCount: row.chapter_count,
+      lockedAt: toIso(row.locked_at),
+      lockedBy: row.locked_by ?? null,
+    };
+  }
+
+  private toDto(row: any, canonical?: string): BlueprintDto {
+    let snapshot: BlueprintSnapshotV1;
+    if (canonical !== undefined) {
+      snapshot = JSON.parse(canonical);
+    } else {
+      snapshot = this.recanonicalize(row.snapshot_json);
+      if (snapshotSha256(snapshot) !== row.snapshot_sha256) {
+        throw new Error(
+          `Blueprint #${row.id}: el snapshot guardado no coincide con su sha256 (integridad rota)`,
+        );
+      }
+      snapshot = JSON.parse(canonicalJson(snapshot));
+    }
+    return {
+      id: row.id,
+      courseId: row.course_id,
+      blueprintNumber: row.blueprint_number,
+      schemaVersion: row.schema_version,
+      snapshot,
+      sha256: row.snapshot_sha256,
+      structureCounterAtLock: row.structure_counter_at_lock,
+      moduleCount: row.module_count,
+      chapterCount: row.chapter_count,
+      lockedAt: toIso(row.locked_at),
+      lockedBy: row.locked_by ?? null,
+    };
+  }
+
+  /**
+   * Re-arma un snapshot v1 leído de jsonb con el orden de claves canónico,
+   * pasándolo de nuevo por `buildBlueprintSnapshot` (única fuente del orden).
+   */
+  private recanonicalize(stored: any): BlueprintSnapshotV1 {
+    const s = typeof stored === 'string' ? JSON.parse(stored) : stored;
+    if (!s || s.schemaVersion !== 1) {
+      throw new Error(`Blueprint con schemaVersion no soportado: ${s?.schemaVersion}`);
+    }
+    const modules: RawModuleRow[] = [];
+    const chapters: RawChapterRow[] = [];
+    for (const m of s.modules) {
+      modules.push({ id: m.id, position: m.position, title: m.title, objective: m.objective, exam_enabled: m.examEnabled });
+      for (const c of m.chapters) {
+        chapters.push({ id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective, video_enabled: c.videoEnabled });
+      }
+    }
+    return buildBlueprintSnapshot({ id: s.course.id, title: s.course.title }, modules, chapters);
+  }
+}

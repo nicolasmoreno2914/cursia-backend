@@ -1,5 +1,7 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import Anthropic from '@anthropic-ai/sdk';
+import { FinopsLedgerService } from '../finops/finops-ledger.service';
+import { assertDirectCallAllowed, recordDirectAnthropicCall } from '../finops/direct-call-ledger';
 
 export interface ExtractedBrand {
   colors: {
@@ -67,12 +69,16 @@ export class BrandExtractionService {
   private readonly client = new Anthropic();
   private readonly model = process.env.BRAND_EXTRACTION_MODEL || 'claude-opus-4-8';
 
+  constructor(@Optional() private readonly ledger?: FinopsLedgerService) {}
+
   /**
    * Extrae el brand kit de un PDF de manual de marca con Claude (multimodal).
    * Nunca devuelve colores vacíos: completa huecos con SAFE_DEFAULTS y lo
    * registra en warnings para la revisión humana.
    */
-  async extractFromPdf(pdfBuffer: Buffer): Promise<ExtractedBrand> {
+  async extractFromPdf(pdfBuffer: Buffer, ctx: { ownerId?: string | null; brandProfileId?: string | null } = {}): Promise<ExtractedBrand> {
+    // r58: kill switch / allow-list de proveedores ANTES de llamar (esta llamada directa no reserva).
+    assertDirectCallAllowed('anthropic');
     const response = await this.client.messages.create({
       model: this.model,
       max_tokens: 4096,
@@ -104,6 +110,13 @@ export class BrandExtractionService {
           ],
         },
       ],
+    });
+
+    // FinOps P0: el gasto (Cursia) queda en el ledger ANTES de interpretar la respuesta (un rechazo también se cobra).
+    await recordDirectAnthropicCall(this.ledger, this.logger, {
+      ownerId: ctx.ownerId, model: (response as { model?: string }).model || this.model, messageId: response.id, usage: response.usage as any,
+      operation: 'llm.brand_extraction', recordedBy: 'brand-extraction', unattributedReason: 'brand_extraction',
+      metadata: ctx.brandProfileId ? { brandProfileId: ctx.brandProfileId } : {},
     });
 
     if (response.stop_reason === 'refusal') {

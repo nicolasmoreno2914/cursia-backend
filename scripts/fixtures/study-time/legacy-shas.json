@@ -1,0 +1,1008 @@
+{
+ "_note": "sha de Blueprint/Manifest/perfil calculados con el código de staging ANTERIOR a targetHours (cursia-backend ec2fb5b). Sin targetHours el código nuevo debe dar exactamente estos valores. Loop 9: manifestSha256 actualizados SOLO por el dependsOn del examen final (+ exam:<m>); verificado con el builder en modo legacy (mismos sha de antes).",
+ "cases": [
+  {
+   "structure": "rcp",
+   "profile": "none",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcp",
+   "profile": "none",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcp",
+   "profile": "empty",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcp",
+   "profile": "empty",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcp",
+   "profile": "competencias",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "c957f5394a88bb35ae0c892b8cb889d83a34841bc47dcaee6d63ed48fab82302",
+    "manifestSha256": "0a66fccd7a64da91925134881d35dfa7fb8130e1af733a4dd4eb679aa8891349"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "competencias",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "c957f5394a88bb35ae0c892b8cb889d83a34841bc47dcaee6d63ed48fab82302",
+    "manifestSha256": "30bd6a8c5d891f14ed6559d8e8427e7e44a5ceda3634e510a1914ad1619edf35"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "problemas",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "7e43dd407b7f8b23827a37ed824c2c666560b2827739dfccc9b4e725c41881b4",
+    "manifestSha256": "d4fbc0d9aa1636649ed5f93da730b6e2ad67f6f55a0845ddf7e5df6135514cc0"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "problemas",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "7e43dd407b7f8b23827a37ed824c2c666560b2827739dfccc9b4e725c41881b4",
+    "manifestSha256": "261a31d8a746529665270b25cc6d05f32059d8b209fe83dcd8a8577b6c8d0232"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "c579158ce5dbf64b12d00dd6c86b0bb8fec119b65d0357cce52d3ff73ceebf61",
+    "manifestSha256": "51012b9de2c005601b31bd246cc300a2bf82101d117bbd6caa1191a5182ce09e"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "c579158ce5dbf64b12d00dd6c86b0bb8fec119b65d0357cce52d3ff73ceebf61",
+    "manifestSha256": "0c92b6cfe7f04cf94696d1b08b5b82e701277e9900b8585f689877ee298a32da"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "816787629bce9ce80db98ceaabf550577fedb9fdf730f1b5d0f139ed4bbcb3ae"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "e696a6d7c137ad30fa844425c89ebd1f3a35e040a4ab723686b20d8a67666228"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "43bda4df7550f32c4407fa9cc5a42e2f51529e6ed9c8dccb00e56a8e72038e02",
+    "manifestSha256": "f7091ffd1d4ab87187a48c3b3a7a2dfef6a0320df3bd04ce7c2ae15a0a01b24d"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "43bda4df7550f32c4407fa9cc5a42e2f51529e6ed9c8dccb00e56a8e72038e02",
+    "manifestSha256": "92964e1d9269c6cebd731f5769231efe1973d0fe9898fd18b88a4ec043120ce4"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a2ebd68dd9865c9b62beeb6f1babb24a0e606805b1d4032f3c087cfdbaae6a57",
+    "manifestSha256": "c4e88dd70bc1c8f52aeb78114679bd587f301edb21b7b2334c732c44bb138b44"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a2ebd68dd9865c9b62beeb6f1babb24a0e606805b1d4032f3c087cfdbaae6a57",
+    "manifestSha256": "c54fff744703ca612fa1ef3d5db07015ba11a2bbe653ac2096d15b154b6ef96c"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "8829c14a9c06e133f93ea4f86c9c52b88cf7cb64ff2dc7c3513460d5c299ec9f",
+    "manifestSha256": "8088b164a785b290e079ab6cdca6121d64556e470b1d0bc0496b37651feae8e8"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "8829c14a9c06e133f93ea4f86c9c52b88cf7cb64ff2dc7c3513460d5c299ec9f",
+    "manifestSha256": "d7b17d36e95e729932749314518822bb6be6a2a1f9de0cfa675385f54174a43f"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "4f309f23c153fe7cfe88b0dba9fb94f7cbd34ae6082b2dff682f48d2f8d960fd"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "816787629bce9ce80db98ceaabf550577fedb9fdf730f1b5d0f139ed4bbcb3ae"
+   }
+  },
+  {
+   "structure": "rcp",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "03090598288865a5c700434087f8ace57744cef49e99fcbcd1a6d9d956934f07",
+    "manifestSha256": "75f5651f63ab2c40b8e391263072af1e471ac4731e7fce991857e45430c3a72e"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "e696a6d7c137ad30fa844425c89ebd1f3a35e040a4ab723686b20d8a67666228"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "none",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "none",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "empty",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "empty",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "competencias",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "4dee02ac6594ff42b7246cf71c3318f00e2bb976d7b380d9f9c1b8cf5b94e527",
+    "manifestSha256": "95f82c46089543fef49f33b2ee6f7d2e449b449f1fb9d5037cfeeeb9878da2f4"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "competencias",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "4dee02ac6594ff42b7246cf71c3318f00e2bb976d7b380d9f9c1b8cf5b94e527",
+    "manifestSha256": "942b597f3c1e36ca37bba9c9881a5da5dc5104bbfb30984d526a4fb44fcb3739"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "problemas",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "4f08a00d5798ef3e76cb8b268e1ab91d918d8a3de628012f71848c429724577c",
+    "manifestSha256": "993ba5d19390882717f9a3a9c944205f5c6e0c1395eac8fee4047cdf7c9557f2"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "problemas",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "4f08a00d5798ef3e76cb8b268e1ab91d918d8a3de628012f71848c429724577c",
+    "manifestSha256": "c6b3b03bd85dd0e19549d0d95690a5f3cf2f9b411f190200b5e294c3574c09c1"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "fc52c6739a8e93b5860be47cc09e1ce93a3e774767542c54ad91230851f52ae6",
+    "manifestSha256": "8e7632ffc7590357be6ab151d617b939d2318b4a3fa00faece7f2b4ea9842b97"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "fc52c6739a8e93b5860be47cc09e1ce93a3e774767542c54ad91230851f52ae6",
+    "manifestSha256": "d1c402266fda001f04b8de8403ad54f3d324f2487f4025d1018396c6d242c2b3"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "816787629bce9ce80db98ceaabf550577fedb9fdf730f1b5d0f139ed4bbcb3ae"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "e696a6d7c137ad30fa844425c89ebd1f3a35e040a4ab723686b20d8a67666228"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "43bda4df7550f32c4407fa9cc5a42e2f51529e6ed9c8dccb00e56a8e72038e02",
+    "manifestSha256": "f7091ffd1d4ab87187a48c3b3a7a2dfef6a0320df3bd04ce7c2ae15a0a01b24d"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "43bda4df7550f32c4407fa9cc5a42e2f51529e6ed9c8dccb00e56a8e72038e02",
+    "manifestSha256": "92964e1d9269c6cebd731f5769231efe1973d0fe9898fd18b88a4ec043120ce4"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "cfb13a727faab7ce1d5c4825e3b7006001137fab6b7451cf914ec802d066d2b4",
+    "manifestSha256": "ccfba82e133a452d05746e3e2e3ff010bc1004569cb65b7bd319399e23b89faa"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "cfb13a727faab7ce1d5c4825e3b7006001137fab6b7451cf914ec802d066d2b4",
+    "manifestSha256": "2c724a255c57a24466fb2179591749635a0537442759097a90f02825ba60e5e4"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "8829c14a9c06e133f93ea4f86c9c52b88cf7cb64ff2dc7c3513460d5c299ec9f",
+    "manifestSha256": "8088b164a785b290e079ab6cdca6121d64556e470b1d0bc0496b37651feae8e8"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "8829c14a9c06e133f93ea4f86c9c52b88cf7cb64ff2dc7c3513460d5c299ec9f",
+    "manifestSha256": "d7b17d36e95e729932749314518822bb6be6a2a1f9de0cfa675385f54174a43f"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "ec664cda2a6548ec76eaf927b0598c363cb528abba43e20a6702874bd7e8cd85"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "816787629bce9ce80db98ceaabf550577fedb9fdf730f1b5d0f139ed4bbcb3ae"
+   }
+  },
+  {
+   "structure": "rcpReview",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "21e0472599c9de15049ad55aba042b73a737cba1741554e62f550f7b7495d4e4",
+    "manifestSha256": "8b234667eeba9ba5dd9c99b8d2e1861596a10816fd727f0ffb9df492f71e20ca"
+   },
+   "pedagogical": {
+    "blueprintSha256": "481b476d99012da00f5954c17c88fdc4c979b0d2128f4799aa97296560c5357d",
+    "manifestSha256": "e696a6d7c137ad30fa844425c89ebd1f3a35e040a4ab723686b20d8a67666228"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "none",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "none",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "empty",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "empty",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "competencias",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "0e5f867bd63e0de87dc167754885069a1188a26a28054c52b3b8c2a64f7d9003",
+    "manifestSha256": "d71304591f42e9dde42d17dd96a3e1d94042b1cde82989d0cf161873481fa420"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "competencias",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "0e5f867bd63e0de87dc167754885069a1188a26a28054c52b3b8c2a64f7d9003",
+    "manifestSha256": "c6f757b4d37bf3acfa4259bf83b8b480b83a9bd46201ddf24507e6b113838b0b"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "problemas",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "35dfdf66942ddb4dcab35f7bbbb8af64535963e839120a2fd3e0f0390339aae5",
+    "manifestSha256": "e827efed435ac8e6ea03cc5b0332a99415c14cc1cdf150e957bc9d41ff0731ad"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "problemas",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "35dfdf66942ddb4dcab35f7bbbb8af64535963e839120a2fd3e0f0390339aae5",
+    "manifestSha256": "cb8759dc453cf392e07e983ca6a3224878c0cdaff76c72d6b1dea08878f0fcdf"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "786114bf22b1999d98c16249fd4e73178d534ba1a9e7a94b4493d3fd7bad11cd",
+    "manifestSha256": "dbe127ddb8329cb34e12061e6a591394185be03bc9a7c01a54d3216c0ef57373"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "786114bf22b1999d98c16249fd4e73178d534ba1a9e7a94b4493d3fd7bad11cd",
+    "manifestSha256": "0fb7db5b06a542872468978c6a2623fd3f826f2969986386c9fde17e0e64adae"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "2279e9ac2b09fd4077e27d1b5f912f679766f77485f509066bfe90c0d599628b",
+    "manifestSha256": "0895cd4534aedc243981b149294428f44c7f1a09bd4f6e167b7ac251224e5f87"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "2279e9ac2b09fd4077e27d1b5f912f679766f77485f509066bfe90c0d599628b",
+    "manifestSha256": "8313aecf4460bfa689bf5e7065e412799187a7f98c21299a8210ab4e5c2211c3"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "cee519e622b93ede52346ccebbe2c7c4cfbbd2ba1f8b301744af603e6a1cbd36",
+    "manifestSha256": "e3607f5df920919440c6e530718eaec377a3c012a899842c963fcb4da233df72"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "cee519e622b93ede52346ccebbe2c7c4cfbbd2ba1f8b301744af603e6a1cbd36",
+    "manifestSha256": "26dcc255381adba6eca1b6d99d0f33992b83ce4299a0958d1609d51389e359b5"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "f7a11a8bdf0749f905c458ee8de742825529621946d588cd22e63f771a179978",
+    "manifestSha256": "3192280276e3a8c38ff289d1148b97cfdb93407b12a86de327d029a865c3dc76"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "f7a11a8bdf0749f905c458ee8de742825529621946d588cd22e63f771a179978",
+    "manifestSha256": "18eccf5ebe8f04240bb5edb59360abae715a7a4413d49e472e13bea67fa68d92"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "464bb534538f85a5155c3109c2b04b2e077cccdf1920f08a8839657c27153339",
+    "manifestSha256": "1e5100f7895c5aa9e8a104a59831e56b7127b68ad7a0935d100fcc99f5225d08"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "464bb534538f85a5155c3109c2b04b2e077cccdf1920f08a8839657c27153339",
+    "manifestSha256": "c7b3482054d3ee9f870c8ccc206a8a1995fbe42e6cc5d9c579f3639fbbdfe0a2"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "787f6fa998d63b6971f885aed6d4feb26960c164820af88ee70bce2a1b47490f"
+   },
+   "pedagogical": {
+    "blueprintSha256": "2279e9ac2b09fd4077e27d1b5f912f679766f77485f509066bfe90c0d599628b",
+    "manifestSha256": "0895cd4534aedc243981b149294428f44c7f1a09bd4f6e167b7ac251224e5f87"
+   }
+  },
+  {
+   "structure": "rcpToggles",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "2c1b8c037064bf73fada4285568f6e7cd660249fa898a135c9303c18f218fc93",
+    "manifestSha256": "8eed76d220d32c0b0e2603607825c252913a246383cb896a58b7aa21878dbf9a"
+   },
+   "pedagogical": {
+    "blueprintSha256": "2279e9ac2b09fd4077e27d1b5f912f679766f77485f509066bfe90c0d599628b",
+    "manifestSha256": "8313aecf4460bfa689bf5e7065e412799187a7f98c21299a8210ab4e5c2211c3"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "none",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "none",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "empty",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "empty",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": null
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "competencias",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "ea0813a98faff7290f4b183fc996662e0d59653bd4ba7c46c6d343eb1c8402b7",
+    "manifestSha256": "91d01a92de0b63cf4e670496cd1bbc59e090a15ed3d9acbb479b1061b3673b10"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "competencias",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "ea0813a98faff7290f4b183fc996662e0d59653bd4ba7c46c6d343eb1c8402b7",
+    "manifestSha256": "6a693a0c46d55a362cd47f300fe8359a6385309affb20ed32324576441139afe"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "problemas",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "d04099a0e0d6a68b86ef4a90629071b0df3ad2513b504bfb7e19e5336a463126",
+    "manifestSha256": "b2ece24fe5a20e604c8d8f79fe982b0582d05dcfa4867d28aeb9225222c78726"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "problemas",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "d04099a0e0d6a68b86ef4a90629071b0df3ad2513b504bfb7e19e5336a463126",
+    "manifestSha256": "cc46b0f8e6a52f508af29c5eff5f98084c1d88572a72369100e4600a4f9655b4"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "8c620ad83a58abe9bcac01e7be5ed365246a15943ec952f665383c4f5303a7f0",
+    "manifestSha256": "ea337f36cf5e661cc5695ce36bee7aa555651abeda72e9c50b29c2ac8e8509ad"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "8c620ad83a58abe9bcac01e7be5ed365246a15943ec952f665383c4f5303a7f0",
+    "manifestSha256": "27298b3b5f483ac2f15655dba699d5b02282691e054a3ec6d2cf3796ffaee3d6"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a0f7edcab3c8659177d8de523701c6d5b15c870dd1b6b5e0973596d6cd48a6a6",
+    "manifestSha256": "b4f0c65c31155ac0245dccb05c1e9e47c390fd8c8f257731a314b0918d51b73c"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a0f7edcab3c8659177d8de523701c6d5b15c870dd1b6b5e0973596d6cd48a6a6",
+    "manifestSha256": "432d0973d9c3fd61c6155efdbf03f5a1ed788bb770900b55683d6035d8d4da96"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "67617686eab0992f3abd7dd041f4de26cb1f6f9a128ddd005109440db9d47b7c",
+    "manifestSha256": "9099e398f638a6e2f1827bd39d5562da7e14a9a051f520b2a624426dae5a4459"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "67617686eab0992f3abd7dd041f4de26cb1f6f9a128ddd005109440db9d47b7c",
+    "manifestSha256": "b4a1f3d110d47b449127928886dcebcfe0fbd319dc2c632f0daf81846252a4c3"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "f15122bc6424d9d38e3466a89593313b8038cc15bc7cc05da53dc25728e37011",
+    "manifestSha256": "6ac6e3c176e45f2e8b7bd7fc44c88bbd52c68b0285aa4e05f4089ee61cb75c74"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "competencias+experiencial",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "f15122bc6424d9d38e3466a89593313b8038cc15bc7cc05da53dc25728e37011",
+    "manifestSha256": "ecedaa209416d372ebf973f68365208b99a3a8bfaee3880ac952c474c486cc34"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a17c184d9f899242b8e85cb8e1a755f8daded0b0ad8f51d6d4e303281bf4b80c",
+    "manifestSha256": "67130fb79298d67520817dea77575969cb3a2cda9862dea978acc65cdc366f85"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "problemas+significativo+autodirigido",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a17c184d9f899242b8e85cb8e1a755f8daded0b0ad8f51d6d4e303281bf4b80c",
+    "manifestSha256": "ceb5cf89ef6066eef1cf8c32a3ea156f9452ce79a0060a1da0f70cd07836e63b"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 1,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "391daf368915f991643b78ce60608fe818ddf5d69e127ea4d0ff809d88ea7812"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a0f7edcab3c8659177d8de523701c6d5b15c870dd1b6b5e0973596d6cd48a6a6",
+    "manifestSha256": "b4f0c65c31155ac0245dccb05c1e9e47c390fd8c8f257731a314b0918d51b73c"
+   }
+  },
+  {
+   "structure": "rcpScorm",
+   "profile": "novatos-significativo",
+   "activityTypeRules": 2,
+   "baseline": {
+    "blueprintSha256": "4859c92e6bda773dc13c625e63e15f76e5ab016f9b990c2f27034f3f45ea3828",
+    "manifestSha256": "63b7eab85633b303790737fac7dce7294b9a7622ea178c423750052681e04b1b"
+   },
+   "pedagogical": {
+    "blueprintSha256": "a0f7edcab3c8659177d8de523701c6d5b15c870dd1b6b5e0973596d6cd48a6a6",
+    "manifestSha256": "432d0973d9c3fd61c6155efdbf03f5a1ed788bb770900b55683d6035d8d4da96"
+   }
+  }
+ ],
+ "profileSha256": {
+  "empty": "a4904f84c4b020ec9c945ace791daf72bda156b76e4f0131288ba801319824ad",
+  "competencias": "fb9514d4488c9c5f93adcc83517150c658406982ce17ae4a4c961167c7e9ac3b",
+  "problemas": "9a054e818da0ae773b0c424e59d42e9ef45d2ac8eab76fdab2056db83262818a",
+  "experiencial": "a89c1a88b8e3441b1f3fb794fd2601b7d6a17222dd219bb241f1e7fc1aafef2b",
+  "significativo": "316aafec058f87e22c674f6ef4de60401000a53178ab0a0b5207117775d1931e",
+  "autodirigido": "eabff19558b861885bc45556609e468221899d7c231e08f58833d201408caaca",
+  "competencias+experiencial": "e74cbc7888698ed8af7264cf7288d15cf266cc2280fa28b5be01fbc07997e673",
+  "problemas+significativo+autodirigido": "90b8c203f87870293cbf53c0e357d4cc37b987403c5de17e4d090e1aca9ad67d",
+  "novatos-significativo": "316aafec058f87e22c674f6ef4de60401000a53178ab0a0b5207117775d1931e"
+ }
+}

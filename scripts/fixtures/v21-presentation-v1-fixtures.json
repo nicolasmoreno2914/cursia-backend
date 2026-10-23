@@ -1,0 +1,115 @@
+{
+  "schemaVersion": 1,
+  "source": "V1 MBZ (scratchpad/v21audit/mbz/files.xml) — 9 capítulos, hashes SHA1 de Moodle",
+  "note": "No incluye los blobs reales (serían decenas de MB). Los checks los leen desde scratch/v21audit/mbz/files/<h[:2]>/<h> cuando existen, y caen a fixtures sintéticas si no.",
+  "chapters": {
+    "1": {
+      "pdf": {
+        "sha1": "ead7c2791098d094e636764c6fa3067a684d335c",
+        "bytes": 1320942,
+        "filename": "cap1_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "01390aafe2717d76825fc26234340c1fe4bb3994",
+        "bytes": 795123,
+        "filename": "cap1_portada.png"
+      }
+    },
+    "2": {
+      "pdf": {
+        "sha1": "4bfad1ec3ad9a39ee4a56dcb5cef9283ee7ad004",
+        "bytes": 1864941,
+        "filename": "cap2_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "c9910a784a7226366e118d29ccdc0f1c27cb66e8",
+        "bytes": 729558,
+        "filename": "cap2_portada.png"
+      }
+    },
+    "3": {
+      "pdf": {
+        "sha1": "a281c7ee54193d4b7c12afaf24b32e8de3398ec0",
+        "bytes": 1273889,
+        "filename": "cap3_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "1b9dc4b6df343c5ffed465b9c4706d93b3cb9a6c",
+        "bytes": 788221,
+        "filename": "cap3_portada.png"
+      }
+    },
+    "4": {
+      "pdf": {
+        "sha1": "66504720f3e7da50f46c674969f607be2aa715c3",
+        "bytes": 900026,
+        "filename": "cap4_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "cb6ab426e9689a7b00317d0b04c31a9c1c5f8a2d",
+        "bytes": 740608,
+        "filename": "cap4_portada.png"
+      }
+    },
+    "5": {
+      "pdf": {
+        "sha1": "df9dad1e1175ad3f8133aa3a06bf1c4071fffb57",
+        "bytes": 1734024,
+        "filename": "cap5_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "864938d435abbef8e51643bf5b7e6178cc2d2506",
+        "bytes": 999263,
+        "filename": "cap5_portada.png"
+      }
+    },
+    "6": {
+      "pdf": {
+        "sha1": "b5545d060f4a66ee8191fd314ee9b17fd8f05d78",
+        "bytes": 1240526,
+        "filename": "cap6_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "0aed97f528bb83fd90874a4d6a28f33f8bc70079",
+        "bytes": 984609,
+        "filename": "cap6_portada.png"
+      }
+    },
+    "7": {
+      "pdf": {
+        "sha1": "92554c4164ca9ad03faa2c0e9f28bc9302385ff4",
+        "bytes": 757178,
+        "filename": "cap7_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "b5fdf2a4bdcd3da2e3af1dffde6e609ea0417b85",
+        "bytes": 953730,
+        "filename": "cap7_portada.png"
+      }
+    },
+    "8": {
+      "pdf": {
+        "sha1": "8f66f6af1f67c5bd32a8bf993713794a92e9e1e3",
+        "bytes": 1771322,
+        "filename": "cap8_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "d573cf718d45a6611abfdeb28506bc1cc27c0482",
+        "bytes": 1121735,
+        "filename": "cap8_portada.png"
+      }
+    },
+    "9": {
+      "pdf": {
+        "sha1": "7eb87b0e9d4b43b428c63f7aea3b03b03146e7b0",
+        "bytes": 1336580,
+        "filename": "cap9_presentacion.pdf"
+      },
+      "cover": {
+        "sha1": "761d32208ebec0137120a2fcf7ee47ac0fa7ae04",
+        "bytes": 1237535,
+        "filename": "cap9_portada.png"
+      }
+    }
+  }
+}

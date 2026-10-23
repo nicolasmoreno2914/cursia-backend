@@ -1,0 +1,22 @@
+{
+  "semantics": [
+    {
+      "label": "Etiketa",
+      "description": "Erantzunaren etiketa/goiburua erabiltzaileak erantzun guztiak esportatzen dituenean"
+    },
+    {
+      "label": "Placeholder text",
+      "description": "Example value or other placeholder text. Should not be used to replace the description of the input field."
+    },
+    {
+      "label": "Index"
+    },
+    {
+      "label": "Esportazioak onartzen ez duen etiketa",
+      "default": "Zure gailuan esportazioa ez da onartzen"
+    },
+    {
+      "label": "Sartu iruzkinak esportatutako dokumentuan"
+    }
+  ]
+}

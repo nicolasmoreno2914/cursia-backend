@@ -9,6 +9,9 @@ import {
 } from '@nestjs/common';
 import { Response } from 'express';
 import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
+import { CurrentUser } from '../auth/current-user.decorator';
+import { AuthUser } from '../auth/auth.types';
+import { decideVideoEngineAccess } from './video-engine-access';
 
 /**
  * Proxy seguro hacia Video Engine IA.
@@ -33,7 +36,17 @@ export class VideoEngineController {
   async proxyRequest(
     @Body() body: { action: string; payload?: Record<string, unknown> },
     @Res() res: Response,
+    @CurrentUser() user?: AuthUser,
   ): Promise<void> {
+    // r58: rol (SuperAdmin / VIDEO_ENGINE_ALLOWED_OWNERS) + VIDEO_ENGINE_ENABLED para renders reales + kill switch,
+    // ANTES de mirar la configuración o llamar a Videogen (dry-run sigue abierto a todo usuario autenticado).
+    const access = decideVideoEngineAccess({ action: body?.action, payload: body?.payload ?? null, user });
+    if (access.allow === false) {
+      const deny = access as Extract<typeof access, { allow: false }>;
+      this.logger.warn(`[VideoEngine] ${deny.code} action=${String(body?.action ?? '').slice(0, 32)} user=${user?.id ?? '-'}`);
+      res.status(deny.status).json({ error: deny.message, code: deny.code });
+      return;
+    }
     const veApiKey  = (process.env.VIDEOGEN_API_KEY  ?? '').trim();
     const veBaseUrl = (process.env.VIDEOGEN_API_URL ?? '').replace(/\/$/, '');
 
@@ -171,7 +184,7 @@ export class VideoEngineController {
       const msg = (e as Error).message ?? 'Error de red';
       this.logger.error(`Video Engine network error [${action}]: ${msg}`);
       res.status(HttpStatus.BAD_GATEWAY).json({
-        error: 'Error de red hacia Video Engine: ' + msg,
+        error: 'Error de red hacia Video Engine.',
       });
       return;
     }

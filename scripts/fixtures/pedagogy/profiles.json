@@ -1,0 +1,59 @@
+{
+  "description": "Perfiles pedagógicos de prueba (motor pedagógico V1). Mismo estudiante en todos: auxiliares de enfermería adultos, nivel técnico, conocimientos básicos, algo de experiencia.",
+  "learner": { "description": "Auxiliares de enfermería de planta hospitalaria", "ageGroup": "adults", "educationLevel": "technical", "priorKnowledge": "basic", "experience": "some" },
+  "outcomes": {
+    "know": ["Los eslabones de la cadena de supervivencia"],
+    "do": ["Reconocer un paro y activar el código azul", "Realizar compresiones de alta calidad", "Usar el DEA"],
+    "competencies": ["Actuar con seguridad en una reanimación básica en equipo"]
+  },
+  "profiles": {
+    "competencias": { "primaryApproach": "competencias", "secondaryApproaches": [] },
+    "problemas": { "primaryApproach": "problemas", "secondaryApproaches": [] },
+    "experiencial": { "primaryApproach": "experiencial", "secondaryApproaches": [] },
+    "significativo": { "primaryApproach": "significativo", "secondaryApproaches": [] },
+    "autodirigido": { "primaryApproach": "autodirigido", "secondaryApproaches": [] },
+    "competencias+experiencial": { "primaryApproach": "competencias", "secondaryApproaches": ["experiencial"] },
+    "problemas+significativo+autodirigido": { "primaryApproach": "problemas", "secondaryApproaches": ["significativo", "autodirigido"] },
+    "novatos-significativo": { "primaryApproach": "significativo", "secondaryApproaches": [], "learner": { "description": "Estudiantes de primer semestre", "ageGroup": "teens", "educationLevel": "secondary", "priorKnowledge": "none", "experience": "none" } }
+  },
+  "wizardAnswers": {
+    "rcp-practico": {
+      "q1": { "description": "Auxiliares de enfermería de planta", "ageGroup": "adults", "educationLevel": "technical", "priorKnowledge": "basic", "experience": "some" },
+      "q2": { "know": ["Cadena de supervivencia"], "do": ["Compresiones de alta calidad", "Uso del DEA", "Activar código azul"], "competencies": ["Reanimación básica en equipo"] },
+      "q3": ["practice", "real_application"],
+      "q4": ["practice_experimentation"],
+      "q5": ["practical_exercises", "products_evidence"],
+      "q6": { "answer": "no" }
+    },
+    "casos-retos": {
+      "q1": { "ageGroup": "adults", "priorKnowledge": "intermediate", "experience": "extensive" },
+      "q2": { "know": [], "do": ["Resolver situaciones clínicas"], "competencies": [] },
+      "q3": ["problems", "inquiry"],
+      "q4": ["challenges"],
+      "q5": ["cases"],
+      "q6": { "answer": "unsure" }
+    },
+    "conceptos-novatos": {
+      "q1": { "ageGroup": "teens", "educationLevel": "secondary", "priorKnowledge": "none", "experience": "none" },
+      "q2": { "know": ["Anatomía básica del corazón", "Qué es un paro cardiorrespiratorio"], "do": [], "competencies": [] },
+      "q3": ["concepts"],
+      "q4": ["teacher_guided"],
+      "q5": ["quizzes"],
+      "q6": { "answer": "no" }
+    },
+    "autonomos-expertos": {
+      "q1": { "ageGroup": "adults", "educationLevel": "professional", "priorKnowledge": "advanced", "experience": "extensive" },
+      "q3": ["inquiry"],
+      "q4": ["autonomous"],
+      "q5": ["self_reflection"],
+      "q6": { "answer": "no" }
+    },
+    "vacio": {},
+    "prioriza-experiencial": {
+      "q3": ["concepts"],
+      "q4": ["teacher_guided"],
+      "q5": ["quizzes"],
+      "q6": { "answer": "yes", "approaches": ["experiencial"], "principles": ["Aprender haciendo con simulación"] }
+    }
+  }
+}

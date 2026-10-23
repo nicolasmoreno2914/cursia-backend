@@ -1,0 +1,2496 @@
+import { learningPlanExperienceRequirements } from '../pedagogy/learning-plan-directives';
+import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
+import { lqaIsLanguageCourse } from '../language-qa/language-qa';
+import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
+import { GUIDED_PRACTICE_DISTINCT, GUIDED_PRACTICE_SCHEMA_VERSION, GuidedPracticeAvoid, GuidedPracticePreviousExercise } from '../course-shell/guided-practice';
+export type { GuidedPracticeAvoid } from '../course-shell/guided-practice';
+import { guidedPracticeExercisePlan } from '../study-time/guided-practice-tiers';
+import {
+  BadRequestException,
+  ConflictException,
+  Inject,
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+  NotFoundException,
+  Optional,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { createHash } from 'crypto';
+import { DataSource } from 'typeorm';
+import type { QueryRunner } from 'typeorm';
+import { returningRows } from '../../common/db/returning-rows';
+import {
+  AnyBlueprintSnapshot,
+  BlueprintSnapshotV1,
+  RawChapterRow,
+  RawModuleRow,
+  buildBlueprintSnapshot,
+  recanonicalizeBlueprintSnapshotV2,
+  snapshotSha256,
+  snapshotSha256V2,
+} from '../course-blueprints/blueprint-snapshot';
+import {
+  ALL_MANIFEST_ITEM_TYPES,
+  GenerationManifestV1,
+  ManifestItemType,
+  V3_ONLY_ITEM_TYPES,
+  canonicalManifestJson,
+  manifestSha256,
+  validateGenerationManifest,
+} from '../generation-manifests/generation-manifest-builder';
+import {
+  EXAM_ARTIFACT_TYPES_V3,
+  missingRoleLabelV3,
+  requiredArtifactTypes,
+  resolveRequiredArtifactTypesV3,
+} from '../dynamic-packaging/artifact-resolver';
+import { RunsService, stripYoutubeSessionSecret } from './runs.service';
+import { canonicalContextHash, sortKeysDeep } from './run-hash';
+import {
+  ACTIVE_RUN_WORKER_STATUSES,
+  DISPATCHABLE_RUN_WORKER_STATUSES,
+  isDispatchableRun,
+  isPausedRun,
+  applyItemFailure,
+  blockDependents,
+  isActiveRun,
+  isCancelledLike,
+  markRunRunning,
+  recomputeRunStatus,
+  sweepRunExpiredLeases,
+} from './item-transitions';
+import { latestGenerationPredicate } from './item-generations';
+import { LLM_MODE_INVALID, combineLlmModes, isNonRealLlmMode } from '../artifacts/artifact-type-policy';
+import { artifactOutputIdentity } from '../invalidation/invalidation-apply';
+import {
+  FINAL_EXAM_QUESTION_RANGE,
+  ActivityTypeSource,
+  H5pActivityType,
+  H5pActivityTypeV2,
+  V3_PAYLOAD_INVALID,
+  VideoClaimFacts,
+  resolveActivityType,
+  resolveActivityTypeWithSource,
+  EXAM_BANK_ARTIFACT_TYPE,
+  ExamBankClaimFacts,
+  examBankClaimFacts,
+  examChaptersFromManifest,
+  v3ValidatedArtifactType,
+  v3ValidatedArtifactTypes,
+  v3ValidationErrorMessage,
+  validateV3ItemArtifact,
+  v3LanguageErrors,
+  videoClaimFacts,
+} from '../course-shell';
+import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
+import { ItemPedagogyBrief, buildItemPedagogyBrief } from '../pedagogy/generator-directives';
+import { ANSWER_BIAS_POOL_ITEM_TYPES, AnswerBiasPool, answerBiasPoolFrom } from '../quality/answer-bias-pool';
+import { VIDEO_MC_COURSE_BIAS_CODE, videoMcCourseRecheck } from '../quality/answer-length-bias';
+import {
+  APPLICATION_DRAFT_ARTIFACT_TYPE, EXAM_BANK_DRAFT_ARTIFACT_TYPE, ITEM_DRAFT_SUMMARY_KEYS,
+  clearApplicationDraft, clearExamBankDraft, recordApplicationDraft, recordExamBankDraft,
+} from './exam-bank-draft';
+import { FailureSource, classifyFailure, isValidFailureCode } from '../reliability/failure-classifier';
+import { executorKindFor, openItemAttempt, recordItemCompleted, recordItemFailure } from '../reliability/attempt-log';
+import {
+  EXEC_LEASE_RUN_LEASED_ELSEWHERE,
+  acquireRunExecLease,
+  execLeaseSchemaReady,
+  refreshRunExecLease,
+  releaseRunExecLease,
+} from '../reliability/execution-lease';
+
+export type ItemType = ManifestItemType;
+
+/** content/scorm/video/exam (v1) + course_plan/course_intro/module_intro (rulesVersion 2). */
+const ALL_ITEM_TYPES: readonly ItemType[] = ALL_MANIFEST_ITEM_TYPES;
+export const MIN_LEASE_SECONDS = 15;
+export const MAX_LEASE_SECONDS = 3600;
+export const DEFAULT_LEASE_SECONDS = 120;
+const MAX_ERROR_LENGTH = 4000;
+const MAX_EXECUTOR_ID_LENGTH = 200;
+/**
+ * Reintentos del claim global SOLO por carreras (candidato elegido sin lock
+ * que otro tomó antes de bloquear su run). No limita cuántos runs se miran:
+ * el candidato se elige entre TODOS los runs elegibles en una sola consulta.
+ */
+const GLOBAL_CLAIM_RACE_RETRIES = 50;
+/**
+ * Tipos que puede reclamar el camino navegador (ownerId); video solo el worker.
+ * rulesVersion 2 (spec v2 §3): course_plan, course_intro y module_intro son
+ * items LLM del ejecutor del navegador, igual que content/scorm/exam.
+ */
+export const BROWSER_CLAIMABLE_TYPES: ItemType[] = [
+  'content', 'scorm', 'exam', 'course_plan', 'course_intro', 'module_intro',
+  // V2.1 rulesVersion 3 (R4): items LLM del ejecutor del navegador (activity en sus dos variantes).
+  'experience', 'video_interactions', 'activity', 'final_exam',
+  // Fase 2: Actividad de Aplicación (actividad + solucionario, texto LLM del navegador).
+  'application_activity',
+  // Loop 9 B: práctica guiada del capítulo (solo un ejecutor que anuncia GUIDED_PRACTICE_FEATURE la recibe).
+  'guided_practice',
+];
+/**
+ * V2.1 rulesVersion 3 (R4): items de PROVEEDOR que solo reclama el worker del
+ * backend (nunca el navegador): video (Videogen, dynamic-item-worker, como
+ * siempre), presentation (Gamma) y audio_welcome / audiobook_chapter (TTS),
+ * estos tres en dynamic-provider-worker.
+ */
+export const WORKER_ONLY_TYPES: readonly ItemType[] = ['video', 'presentation', 'audio_welcome', 'audiobook_chapter'];
+/** Tipos v3 que reclama el camino navegador (un claim con alguno = ejecutor v3). */
+const V3_BROWSER_ITEM_TYPES: readonly ItemType[] = V3_ONLY_ITEM_TYPES.filter((t) => BROWSER_CLAIMABLE_TYPES.includes(t));
+/** Tipos que solo existen en Manifests rulesVersion 2 (M3: un claim del navegador sin ninguno = ejecutor v1-only). */
+const V2_ONLY_ITEM_TYPES: readonly ItemType[] = ['course_plan', 'course_intro', 'module_intro'];
+
+/**
+ * Predicado de "item reclamable" (spec §3.4, condición 6, R16), compartido
+ * por el claim por run y el global. `typesParam` = placeholder del array de
+ * tipos. Dependencias literales del Manifest, resueltas contra la generación
+ * VIGENTE (la más alta) de cada clave dentro del mismo run (F78-BE2: una
+ * regeneración, generation 2, depende de los items vigentes del run; sin
+ * regeneraciones es idéntico a "misma generation"):
+ * - ninguna dependencia vigente en estado distinto de `completed`
+ *   (NOT EXISTS literal por clave);
+ * - y TODAS las claves de depends_on existen como fila: una dependencia
+ *   ausente nunca vuelve reclamable al dependiente (se reporta con
+ *   logger.error vía reportMissingDependencies).
+ */
+function claimablePredicate(g: string, typesParam: string): string {
+  return `${g}.status in ('pending', 'retrying')
+            and (${g}.next_retry_at is null or ${g}.next_retry_at <= now())
+            and (${g}.lease_until is null or ${g}.lease_until < now())
+            and ${g}.type = any(${typesParam}::text[])
+            and not exists (
+              select 1 from public.generation_item_runs d
+               where d.job_id = ${g}.job_id and d.manifest_id = ${g}.manifest_id
+                 and d.item_key = any(${g}.depends_on) and d.status <> 'completed'
+                 and ${latestGenerationPredicate('d')})
+            and not exists (
+              select 1 from unnest(${g}.depends_on) as dk(key)
+               where not exists (
+                 select 1 from public.generation_item_runs d2
+                  where d2.job_id = ${g}.job_id and d2.manifest_id = ${g}.manifest_id
+                    and d2.item_key = dk.key))`;
+}
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export interface ClaimedItem {
+  itemRunId: string;
+  runId: string;
+  courseId: number;
+  /** courses.metadata.courseId congelado en el run (puede ser null). */
+  frontendCourseId: string | null;
+  /**
+   * Valor que el ejecutor debe usar como `artifacts.course_id` al subir los
+   * artifacts de este item (R4: el id de frontend; si el curso no tiene,
+   * el id numérico como texto). completeItem solo vincula artifacts con este
+   * course_id.
+   */
+  artifactCourseId: string;
+  manifestId: number;
+  blueprintId: number;
+  blueprintNumber: number;
+  itemKey: string;
+  type: ItemType;
+  /** rulesVersion del Manifest del item (contrato R2: el ejecutor despacha por esto). */
+  rulesVersion: number;
+  /** V2.1 (R4): solo en items `activity` de rulesVersion 3 — 'h5p' | 'scorm' (course.activityEngine congelado). */
+  variant?: 'h5p' | 'scorm';
+  /** null solo en items de scope course (rulesVersion 2: course_plan, course_intro). */
+  moduleId: string | null;
+  chapterId: string | null;
+  /** null solo en items de scope course. */
+  moduleNumber: number | null;
+  chapterNumber: number | null;
+  idempotencyKey: string;
+  generation: number;
+  dependsOn: string[];
+  attempt: number;
+  /**
+   * r61 (Q-21): motivo con el que terminó el intento anterior (`lease_expired` = la lease se tomó, y una llamada
+   * pagada de ese intento puede seguir en vuelo). null/ausente en el primer intento.
+   */
+  previousError?: string | null;
+  outputSummary: Record<string, any>;
+  context: { courseContext: Record<string, any>; contextHash: string };
+  blueprint: {
+    course: { id: number; title: string };
+    /** null solo en items de scope course (rulesVersion 2). */
+    /** `description` (Title Normalization): detalle/alcance; el título es breve. null si no tiene. */
+    module: { id: string; title: string; objective: string | null; description: string | null; position: number } | null;
+    chapter: { id: string; title: string; objective: string | null; description: string | null; position: number; videoEnabled: boolean } | null;
+    /**
+     * Capítulos del módulo del item, en orden del Manifest (para exam:
+     * exactamente los que evalúa). Vacío en items de scope course.
+     */
+    moduleChapters: Array<{ id: string; title: string; objective: string | null; description: string | null; chapterNumber: number; kind?: 'practice' }>;
+    /**
+     * R18: outline del curso COMPLETO (todos los módulos, en orden del
+     * Manifest), con numeración global — para que los builders dynamic
+     * puedan reproducir la línea "Estructura: N módulos · M capítulos" +
+     * listado por módulo/capítulo de `ctx()` legacy sin leer la estructura
+     * viva (condición 1: se arma acá, del snapshot congelado del Blueprint +
+     * numeración del Manifest, igual que `moduleChapters`).
+     */
+    outline: Array<{
+      moduleNumber: number;
+      id: string;
+      title: string;
+      /**
+       * Objetivo del snapshot congelado (null si no tiene). Contrato R2 punto
+       * 5: el plan de conceptos y el Context Package lo usan; los prompts v1
+       * no lo leen (sin cambio de comportamiento en v1).
+       */
+      objective: string | null;
+      description: string | null;
+      /** Motor de carga horaria: `kind: 'practice'` SOLO en capítulos de práctica (los de contenido no la llevan). */
+      chapters: Array<{ chapterNumber: number; id: string; title: string; objective: string | null; description: string | null; kind?: 'practice' }>;
+    }>;
+  };
+  dependencyArtifacts: Array<{ itemKey: string; artifactId: string; type: string; storagePath: string }>;
+  /**
+   * V2.1 R11a: `claimPayload`, solo items de rulesVersion 3 validados por el
+   * servidor (nombres alineados con `_dynClaimField` del ejecutor R11b). Dice
+   * qué artifact se valida al completar y trae los datos que el ejecutor NO
+   * decide: tipo H5P de la rotación (activity h5p), plan de checkpoints +
+   * youtubeId/duración medida del video (video_interactions), rango de
+   * preguntas (final_exam), capítulos exactos del journey (module_intro).
+   * Las salidas de las dependencias (content md + Context Package, video…)
+   * siguen llegando en `dependencyArtifacts`, como en v2.
+   */
+  claimPayload?: ClaimPayloadV3;
+  /**
+   * Motor pedagógico Fase 2: indicaciones del diseño pedagógico para el generador de ESTE item
+   * (generator-directives.ts). Solo en items cuyo Manifest trae `design`; ausente = prompt de siempre.
+   */
+  pedagogy?: ItemPedagogyBrief;
+}
+
+export interface ClaimPayloadV3 {
+  /** Artifact cuyo contenido valida el servidor al completar (null = solo roles). */
+  validatedArtifactType: string | null;
+  activityType?: H5pActivityTypeV2;
+  /**
+   * EV5-C: 'manifest' = `activityType` congelado en el Manifest (h5pType,
+   * reglas por objetivo): el ejecutor debe confiar en él. 'rotation' = hash del
+   * UUID de siempre (Manifest legacy): el ejecutor conserva su chequeo local.
+   */
+  activityTypeSource?: ActivityTypeSource;
+  video?: VideoClaimFacts;
+  finalExam?: { minQuestions: number; maxQuestions: number };
+  /** EV6 P2: contrato del banco (`dynamic_exam_bank_json`) para exam / final_exam. */
+  examBank?: ExamBankClaimFacts;
+  moduleChapterIds?: string[];
+  chapterId?: string;
+  /**
+   * P3 (fix I3): capacidades del schema de la experiencia que este backend acepta. El ejecutor del navegador
+   * usa el prompt v21-exp-6 (why/apply) SOLO si ve `eduFields: true`; si falta (backend anterior), se
+   * comporta como v21-exp-5 y no manda why/apply. Así el orden de deploy FE/BE no rompe la generación.
+   */
+  experienceFeatures?: { eduFields: boolean };
+  /** EV6 IV avanzado: 2 si el Manifest declara `features.ivAdvanced = 1` (ausente = 1). */
+  videoInteractionsSchemaVersion?: 2;
+  /**
+   * #583 (I2): capacidades del payload h5p que este backend acepta. El ejecutor pide el DragText móvil
+   * (texto corto + `distractors`) SOLO si ve `dragTextDistractors: true`; con un backend anterior (que
+   * rechazaría el campo) sigue con el prompt de siempre. El orden de deploy FE/BE no rompe la generación.
+   */
+  activityFeatures?: { dragTextDistractors: boolean };
+  /**
+   * T6 (r57): señales de patrón de respuesta (#542) de los items `video_interactions` / `activity` YA completados del run
+   * (generación vigente, sin el propio item). El ejecutor siembra con ellas su acumulado del run: la prueba de sesgo
+   * ve el curso entero aunque cada item lo genere un proceso distinto. Ausente = ninguno completado todavía.
+   */
+  answerBiasPool?: AnswerBiasPool;
+  /**
+   * Motor de carga horaria: experience/activity de un CAPÍTULO DE PRÁCTICA. El ejecutor arma la página y la
+   * actividad desde los capítulos de contenido del módulo (`sourceChapterIds`, en orden; sus content llegan en
+   * dependencyArtifacts), sin teoría nueva. Ausente = capítulo de contenido de siempre.
+   */
+  practice?: { sourceChapterIds: string[] };
+  /**
+   * Fase 2: Actividad de Aplicación. `minutes` = nivel del Manifest (la actividad se dimensiona con él);
+   * `context` = estudiante + resultados de aprendizaje CONGELADOS en el Blueprint (null si el perfil no los define).
+   */
+  application?: {
+    minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string;
+    /** r58 (I4-3): archivos de trabajo adjuntos del capítulo (solo si hay). */
+    practiceFiles?: Array<{ title: string; filename: string; instructions: string; relation: string }>;
+  };
+  /**
+   * Loop 9 B: práctica guiada del capítulo de contenido. `minutes` = nivel del Manifest; `exercises` = plan de Cursia
+   * (ids E1.. y minutos de cada ejercicio, que el ejecutor copia tal cual); `context` = estudiante + resultados
+   * congelados (null si el Blueprint no los trae).
+   */
+  guidedPractice?: {
+    minutes: number; schemaVersion: number; exercises: { id: string; minutes: number }[]; context: unknown;
+    /**
+     * Fix I5: lo que los ejercicios guiados NO deben repetir: los títulos de los capítulos de práctica del módulo y los
+     * casos de sus Actividades de Aplicación ya completadas (título, taller, nombres propios). Loop 10 C1-b: y las
+     * huellas de los ejercicios guiados ya completados de otros capítulos del run (`previousExercises`, acotadas).
+     * Ausente = nada que evitar.
+     */
+    avoid?: GuidedPracticeAvoid;
+  };
+}
+
+
+/**
+ * Fix I5 (puro, para el claim y los tests): títulos de los capítulos de práctica del módulo del capítulo y los casos de
+ * las Actividades de Aplicación completadas (output_summary.v3Validation). null = nada que evitar.
+ */
+export function guidedPracticeAvoidOf(
+  manifest: { modules: { chapters: { chapterId: string; kind?: string }[] }[] }, snapshot: unknown, chapterId: string, aaSummaries: unknown[],
+  /** Loop 10 C1-b: output_summary de los guided_practice YA completados del run ({ chapterId, summary }), otro capítulo. */
+  previousGuided: { chapterId: string | null; summary: unknown }[] = [],
+): GuidedPracticeAvoid | null {
+  const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === chapterId));
+  if (!mm) return null;
+  const titles = new Map<string, string>();
+  for (const m of ((snapshot as any)?.modules || []) as any[]) for (const c of (m.chapters || []) as any[]) if (c && typeof c.id === 'string') titles.set(c.id, String(c.title || ''));
+  const practiceChapterTitles = mm.chapters.filter((c) => c.kind === 'practice').map((c) => titles.get(c.chapterId) || '').filter(Boolean);
+  const applicationCases = aaSummaries.map((x) => {
+    const v = (x && typeof x === 'object' ? (x as any).v3Validation : null) || {};
+    return { title: typeof v.title === 'string' ? v.title : null, workshopTitle: typeof v.workshopTitle === 'string' ? v.workshopTitle : null,
+      names: Array.isArray(v.caseNames) ? v.caseNames.filter((n: unknown) => typeof n === 'string').slice(0, 8) : [] };
+  }).filter((c) => c.title || c.workshopTitle || c.names.length);
+  const previousExercises = guidedPracticePreviousOf(chapterId, previousGuided);
+  if (!practiceChapterTitles.length && !applicationCases.length && !previousExercises.length) return null;
+  return { practiceChapterTitles, applicationCases, ...(previousExercises.length ? { previousExercises } : {}) };
+}
+
+/**
+ * Loop 10 C1-b (puro): huellas de los ejercicios guiados de OTROS capítulos del run (output_summary.v3Validation.
+ * fingerprints, que escribe el servidor al validar). Acotado a GUIDED_PRACTICE_DISTINCT.previousMax ejercicios y a
+ * firmas bien formadas de ≤ signatureMax hashes; un summary sin huellas (anterior al Loop 10) no aporta nada.
+ */
+export function guidedPracticePreviousOf(chapterId: string, previousGuided: { chapterId: string | null; summary: unknown }[]): GuidedPracticePreviousExercise[] {
+  const D = GUIDED_PRACTICE_DISTINCT;
+  const out: GuidedPracticePreviousExercise[] = [];
+  for (const p of previousGuided || []) {
+    if (!p || !p.chapterId || p.chapterId === chapterId) continue;
+    const v = (p.summary && typeof p.summary === 'object' ? (p.summary as any).v3Validation : null) || {};
+    for (const f of Array.isArray(v.fingerprints) ? v.fingerprints : []) {
+      if (out.length >= D.previousMax) return out;
+      if (!f || typeof f !== 'object' || typeof f.title !== 'string' || typeof f.sig !== 'string') continue;
+      if (!/^(?:[0-9a-f]{8})*$/.test(f.sig)) continue;
+      out.push({ chapterId: p.chapterId, title: f.title.slice(0, 90), sig: f.sig.slice(0, D.signatureMax * 8) });
+    }
+  }
+  return out;
+}
+
+/**
+ * V2.1 R11a: el payload de un item v3 no se puede armar por un dato de su
+ * dependencia (p.ej. video sin youtubeId o sin duración medida). El claim lo
+ * marca `failed` (no reintentable: reintentar no cambia el dato) en la misma
+ * transacción, en vez de entregar un item sin datos o reintentarlo en bucle.
+ */
+class ClaimPayloadUnavailable extends Error {
+  constructor(public readonly code: string, message: string) {
+    super(`${code}: ${message}`);
+  }
+}
+
+/** Loop 9 (B-extra-1): minutos de la práctica guiada del capítulo según el Manifest congelado (item guided_practice), o null. */
+function guidedMinutesOfChapter(manifest: GenerationManifestV1, chapterId: string | null | undefined): number | null {
+  if (!chapterId) return null;
+  const it = (manifest.items || []).find((i: any) => i.type === 'guided_practice' && i.chapterId === chapterId) as any;
+  return it && typeof it.guidedPracticeMinutes === 'number' ? it.guidedPracticeMinutes : null;
+}
+
+export interface ClaimOptions {
+  runId?: string;
+  executorId: string;
+  types: ItemType[];
+  leaseSeconds: number;
+  /** Presente → camino navegador: solo runs de ese dueño. Ausente → worker interno. */
+  ownerId?: string;
+  /** Camino navegador: capacidades que declara el ejecutor (query `features`), p. ej. PEDAGOGY_BRIEF_FEATURE. */
+  executorFeatures?: string[];
+  /** Worker interno (Loop 6): solo runs creados desde este instante (ISO), p. ej. la activación del worker de IA. */
+  minRunCreatedAt?: string;
+  /**
+   * Loop 9 (fix M5): worker interno — solo items de Manifests con este rulesVersion. El worker de IA reclama solo v3:
+   * los runs v1/v2 (scorm solo del navegador) siguen enteros en el navegador, como siempre.
+   */
+  onlyRulesVersion?: number;
+}
+
+/** Motor pedagógico Fase 2: el ejecutor del navegador aplica `ClaimedItem.pedagogy` a sus prompts. */
+export const PEDAGOGY_BRIEF_FEATURE = 'pedagogy-brief-1';
+/** Fase 2: el ejecutor del navegador sabe generar items `application_activity` (actividad + solucionario). */
+export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-1';
+/**
+ * Loop 9 B: el ejecutor sabe generar items `guided_practice` (práctica guiada). Un ejecutor que no lo anuncia NUNCA
+ * recibe el tipo: se le quita de los tipos del claim (el worker o una pestaña actualizada lo genera).
+ */
+export const GUIDED_PRACTICE_FEATURE = 'guided-practice-1';
+/**
+ * r61 Q-04: el ejecutor sabe anclar las preguntas del video interactivo a las escenas de Videogen (claim
+ * `video.videoScenes`). Un ejecutor del navegador que no lo anuncia recibe el plan equidistante de siempre y el
+ * item queda fijado en `videoTimelinePinned: 'even_spacing'` (nunca VIDEO_PLAN_MISMATCH por desfase FE/BE).
+ * Los workers del servidor (sin ownerId) usan el vendor actual → siempre anclado.
+ */
+export const VIDEO_SCENES_FEATURE = 'video-scenes-1';
+
+/** r61 Q-04: el executor de este claim recibe el plan anclado a escenas. */
+export function executorAnchorsVideoScenes(ownerId: string | null | undefined, features: readonly string[] | undefined): boolean {
+  return ownerId === undefined || ownerId === null || (features ?? []).includes(VIDEO_SCENES_FEATURE);
+}
+
+/**
+ * REL lease de ejecución: resultado del claim con el motivo cuando no se entrega nada por el lease
+ * del run (otro ejecutor del navegador lo tiene vigente). `item: null` sin `reason` = nada reclamable.
+ */
+/** Claim de un run pausado por el usuario: nada que hacer hasta que el usuario lo reanude (resumeRun). */
+export const RUN_PAUSED_REASON = 'run_paused' as const;
+
+export interface ClaimResult {
+  item: ClaimedItem | null;
+  reason?: typeof EXEC_LEASE_RUN_LEASED_ELSEWHERE | typeof RUN_PAUSED_REASON;
+  leaseExpiresAt?: string | null;
+}
+
+/** Resultado de una operación sobre un item reclamado (el endpoint lo devuelve tal cual, 200). */
+export interface ItemOpResult {
+  ok: boolean;
+  reason?: string;
+  /** V2.1 R11a: códigos del validador server-side (reason = v3_payload_invalid). */
+  errors?: string[];
+}
+
+/** Rechazo de guard dentro de una transacción: provoca rollback y se devuelve como {ok:false, reason}. */
+class GuardRejection extends Error {
+  constructor(public readonly reason: string) {
+    super(reason);
+  }
+}
+
+function isPlainObject(v: any): v is Record<string, any> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+function sameJson(a: any, b: any): boolean {
+  return JSON.stringify(sortKeysDeep(a)) === JSON.stringify(sortKeysDeep(b));
+}
+
+/**
+ * Merge top-level de `patch` sobre `existing` (output_summary). La clave
+ * `external` (ids de proveedores externos, R3/R15) nunca se sobreescribe con
+ * un valor distinto: si ambos son objetos se permite AGREGAR claves nuevas
+ * (p.ej. batchId y luego videoId) pero no cambiar una existente; si no son
+ * objetos deben ser iguales.
+ */
+/**
+ * EV6 T5 B2 (m-11): claves de `output_summary` que escribe SOLO el servidor (procedencia de las
+ * preguntas, upgrade de video, modo/entrega del video, validación, invalidación). El ejecutor del
+ * NAVEGADOR (POST …/items/:id/complete, con ownerId) nunca las puede fijar ni pisar: se descartan
+ * de su `summary` antes de mezclar. Los workers internos del servidor (sin ownerId) no pasan por acá.
+ */
+export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
+  // Loop 4: puntos de guardado y revisión de las partes del worker de IA.
+  'llmCheckpoints', 'llmPendingReview', 'llmCheckpointsResetAt',
+  'sourceVideoItemRunId', 'cascadeFromItemRunId', 'regeneration', 'invalidation',
+  'upgradeId', 'videoUpgrade', 'videoUpgradeHistory', 'reusedVideogenJob', 'questionsOnly',
+  'mode', 'videoMode', 'videoModeOriginal', 'external', 'externalReservationKey', 'externalSubmitStartedAt',
+  'delivery', 'youtubeVideoId', 'youtubeUrl', 'youtubeUploadStartedAt', 'videogenStatus', 'videogenDownloadUrl',
+  'videoIdentity', 'v3Validation', 'artifactIds',
+  // r58 (I4-1): rechazos del re-chequeo de sesgo de las MC de video (lo escribe solo el servidor al fallar el item).
+  'answerBiasRecheck',
+  // REL CREDIT: estado de la sonda del proveedor (lo escribe solo el barrido / retryItem).
+  'providerProbe',
+  // r61 Q-04: línea de tiempo del video (escenas de Videogen) que ancla las preguntas del video interactivo.
+  'videoScenes', 'videoScenesUnavailable', 'videoTimelinePinned',
+]);
+
+/** r58 (I4-3): archivos de trabajo de UN capítulo en un perfil de evaluación (los del claim de la Actividad de Aplicación). */
+export function practiceFilesOfProfile(profile: unknown, chapterId: string): Array<{ title: string; filename: string; instructions: string; relation: string }> {
+  const list: any[] = Array.isArray((profile as any)?.practiceResources) ? (profile as any).practiceResources : [];
+  return list
+    .filter((r) => r && r.chapterId === chapterId && typeof r?.source?.filename === 'string')
+    .slice(0, 10)
+    .map((r) => ({ title: String(r.title ?? '').slice(0, 160), filename: String(r.source.filename), instructions: String(r.instructions ?? '').slice(0, 400), relation: r.relation === 'chapter' ? 'chapter' : 'application' }));
+}
+
+/** `summary` del ejecutor del navegador sin las claves del servidor (y la lista de las descartadas). */
+export function stripServerOwnedSummaryKeys(summary: Record<string, any>): { summary: Record<string, any>; dropped: string[] } {
+  const out: Record<string, any> = {};
+  const dropped: string[] = [];
+  for (const [k, v] of Object.entries(summary ?? {})) {
+    if (SERVER_OWNED_SUMMARY_KEYS.includes(k)) dropped.push(k);
+    else out[k] = v;
+  }
+  return { summary: out, dropped };
+}
+
+export function mergeOutputSummary(
+  existing: Record<string, any>,
+  patch: Record<string, any>,
+): { ok: true; merged: Record<string, any> } | { ok: false; reason: string } {
+  const merged = { ...(existing ?? {}) };
+  for (const [k, v] of Object.entries(patch ?? {})) {
+    if (v === undefined) continue;
+    // r62 (re-review m1): las marcas durables de envío solo CRECEN — se unen con las ya guardadas (bajo el lock de la
+    // fila), así una tarea con su copia en memoria nunca borra la marca que escribió otra tarea/proceso.
+    if (k === 'paidCallsSent' && isPlainObject(v) && existing && isPlainObject(existing.paidCallsSent)) {
+      merged.paidCallsSent = { ...existing.paidCallsSent, ...v };
+      continue;
+    }
+    if (k === 'external' && existing && existing.external !== undefined && existing.external !== null) {
+      const cur = existing.external;
+      if (isPlainObject(cur) && isPlainObject(v)) {
+        for (const [ek, ev] of Object.entries(v)) {
+          if (ek in cur && !sameJson(cur[ek], ev)) return { ok: false, reason: 'external_conflict' };
+        }
+        merged.external = { ...cur, ...v };
+        continue;
+      }
+      if (!sameJson(cur, v)) return { ok: false, reason: 'external_conflict' };
+      continue;
+    }
+    merged[k] = v;
+  }
+  return { ok: true, merged: JSON.parse(JSON.stringify(merged)) };
+}
+
+/**
+ * Scheduler por item de la generación dinámica (Fase 5A, Task 3; spec
+ * §3.3–§3.9, §7 condiciones 1–6; rulings R2, R3, R12–R15).
+ *
+ * - Claim: por run, UNA transacción: fila del run FOR UPDATE (mismo orden
+ *   de locks que cancel/retry/reopen de Task 2 → sin deadlocks), barrido de
+ *   leases vencidos del run, y selección FOR UPDATE SKIP LOCKED de un item
+ *   pending/retrying con backoff vencido, tipo permitido y TODAS sus
+ *   dependencias (depends_on literal del Manifest, mismo manifest_id +
+ *   generation) en `completed`. Orden: created_at, luego posición del item
+ *   en manifest_json.items (orden del Manifest; la siembra inserta todo en
+ *   una sola sentencia, así que created_at empata dentro de un run), luego id.
+ *   Los claims concurrentes sobre el mismo run se serializan en el lock del
+ *   run (cada uno toma un item distinto); el claim global (worker, sin runId)
+ *   elige el item candidato entre TODOS los runs elegibles sin tomar locks y
+ *   luego lo re-selecciona bajo el lock de su run (siempre run → item, R16).
+ * - El payload (ClaimedItem) se arma DENTRO de la transacción del claim desde
+ *   el backend: contexto congelado (generation_run_contexts, hash
+ *   verificado), porción del snapshot del Blueprint leída por
+ *   (blueprint_id, course_id) y re-verificada (R2, sin métodos de Fase 3
+ *   con owner), numeración del Manifest (hash verificado) y artifacts
+ *   vinculados de las dependencias. Si algo no verifica → 500 y el claim se
+ *   deshace (nunca se entrega un item con datos no verificados).
+ * - complete/fail/heartbeat/recordExternal (R14): exigen status='running',
+ *   worker_id = executorId y run no cancelado; si no → {ok:false, reason}.
+ * - Tras complete/fail/sweep se recalcula el estado del run (R12).
+ *
+ * `ownerId` presente = camino navegador (JWT): todo se restringe a runs de
+ * ese dueño. Ausente = worker interno.
+ */
+/** Title Normalization: descripción del snapshot (v2 con texto) o null (v1 / sin descripción). */
+function descOf(x: unknown): string | null {
+  const d = (x as { description?: unknown } | null)?.description;
+  return typeof d === 'string' && d.trim() ? d : null;
+}
+
+@Injectable()
+export class SchedulerService {
+  private readonly logger = new Logger(SchedulerService.name);
+
+  constructor(
+    private readonly dataSource: DataSource,
+    private readonly runs: RunsService,
+    /** V2.1 R11a: lector de artifacts para validar items LLM v3 (ausente → un item v3 validable no se completa). */
+    @Optional() @Inject(V3_ARTIFACT_TEXT_READER) private readonly v3Reader?: V3ArtifactTextReader,
+  ) {}
+
+  // ── claim ────────────────────────────────────────────────────────────────
+
+  async claimNextItem(opts: ClaimOptions): Promise<ClaimedItem | null> {
+    return (await this.claimNextItemDetailed(opts)).item;
+  }
+
+  /**
+   * Igual que claimNextItem, con el motivo de un claim del NAVEGADOR rechazado por el lease de
+   * ejecución del run (`run_leased_elsewhere` + vencimiento). Los workers internos (sin ownerId)
+   * nunca pasan por el lease.
+   */
+  async claimNextItemDetailed(opts: ClaimOptions): Promise<ClaimResult> {
+    const executorId = this.checkExecutorId(opts.executorId);
+    let types = this.checkTypes(opts.types);
+    // Loop 9 B: un ejecutor del navegador que no anuncia la práctica guiada nunca recibe el tipo (defensa en profundidad:
+    // uno anterior ni siquiera lo pide; el run con prácticas guiadas lo rechaza abajo con el 409 visible).
+    if (opts.ownerId !== undefined && opts.ownerId !== null && !(opts.executorFeatures ?? []).includes(GUIDED_PRACTICE_FEATURE)) {
+      types = types.filter((t) => t !== 'guided_practice');
+    }
+    const leaseSeconds = this.clampLease(opts.leaseSeconds);
+    if (opts.ownerId !== undefined && opts.ownerId !== null) {
+      // Defensa en profundidad (R16): el camino navegador (ownerId) nunca
+      // reclama tipos fuera de content/scorm/exam, aunque el DTO lo deje pasar.
+      const bad = types.filter((t) => !BROWSER_CLAIMABLE_TYPES.includes(t));
+      if (bad.length > 0) {
+        throw new BadRequestException(`browser_type_not_allowed: el navegador no puede reclamar items ${bad.join(', ')}`);
+      }
+    }
+
+    if (opts.runId) {
+      if (!UUID_RE.test(opts.runId)) throw new BadRequestException('runId inválido');
+      let claimTypes: ItemType[] = types;
+      if (opts.ownerId !== undefined && opts.ownerId !== null) {
+        await this.assertBrowserTypesMatchRun(opts.runId, opts.ownerId, types);
+        await this.assertExecutorAppliesPedagogy(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
+        await this.assertExecutorGeneratesApplication(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
+        await this.assertExecutorGeneratesGuidedPractice(opts.runId, opts.ownerId, opts.executorFeatures ?? []);
+        // Loop 4: con el worker de IA habilitado Y vivo, las partes LARGAS que cubre las genera el servidor (no el navegador).
+        // Loop 6: solo en runs creados desde la activación (DYNAMIC_LLM_WORKER_SINCE); los anteriores siguen como siempre.
+        // Review I2: el instante es el que PUBLICA cada worker vivo en su latido (no el env del API).
+        if (llmWorkerEnabled()) {
+          const coverage = await liveLlmWorkerCoverage(this.dataSource);
+          if (coverage.length) {
+            // Fix M5 (Loop 9): el worker de IA solo reclama runs v3 → un run v1/v2 nunca se rutea (el navegador sigue con todo).
+            const [runRow] = await this.dataSource.query(
+              `select pj.created_at, (select m.rules_version from public.generation_item_runs g join public.course_generation_manifests m on m.id = g.manifest_id
+                                        where g.job_id = pj.id limit 1) as rules_version
+                 from public.production_jobs pj where pj.id = $1`, [opts.runId]);
+            const routed = runRow && Number(runRow.rules_version) === 3 ? routedTypesForRun(coverage, runRow.created_at) : new Set<string>();
+            if (routed.size) claimTypes = browserEffectiveTypes(types, routed);
+          }
+        }
+        if (claimTypes.length === 0) return { item: null };
+      }
+      // M6: un item cuyo payload no se puede armar se marca failed dentro del
+      // claim; se sigue con el próximo candidato en vez de devolver "nada".
+      for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
+        const r = await this.claimInRun(opts.runId, executorId, claimTypes, leaseSeconds, opts.ownerId, undefined, {
+          videoScenes: executorAnchorsVideoScenes(opts.ownerId, opts.executorFeatures),
+        });
+        if (r.paused) return { item: null, reason: RUN_PAUSED_REASON };
+        if (r.leasedElsewhere) return { item: null, reason: EXEC_LEASE_RUN_LEASED_ELSEWHERE, leaseExpiresAt: r.leasedElsewhere.expiresAt };
+        if (r.item) return { item: r.item };
+        if (!r.unavailable) break;
+      }
+      await this.reportMissingDependencies(opts.runId, opts.ownerId);
+      return { item: null };
+    }
+
+    // Global (worker, R16). Orden de locks: el candidato se ELIGE sin tomar
+    // ningún lock (lectura simple sobre TODOS los runs elegibles, mismo
+    // predicado que el claim por run, sin tope de runs); después
+    // claimInRun bloquea la fila del run (FOR UPDATE) y re-selecciona ESE item
+    // con el predicado completo FOR UPDATE SKIP LOCKED — siempre run → item,
+    // igual que cancel/retry/reopen. Si el item se esfumó (lo tomó otro, se
+    // canceló el run…) se prueba el siguiente candidato. Los reintentos solo
+    // se consumen en carreras; al agotarlos se registra un warn (nunca un
+    // null silencioso por "demasiados runs").
+    await this.sweepExpiredLeases();
+    const tried: string[] = [];
+    // REL lease: runs cuyo lease de ejecución tiene otro ejecutor del navegador (solo camino navegador).
+    const leasedRuns: string[] = [];
+    for (let attempt = 0; attempt < GLOBAL_CLAIM_RACE_RETRIES; attempt++) {
+      const [cand] = await this.dataSource.query(
+        `select g.id, g.job_id
+           from public.generation_item_runs g
+           join public.production_jobs pj on pj.id = g.job_id
+           join public.course_generation_manifests m on m.id = g.manifest_id
+           left join lateral (
+             select e.ord
+               from jsonb_array_elements(m.manifest_json->'items') with ordinality as e(it, ord)
+              where e.it->>'key' = g.item_key
+              limit 1
+           ) mo on true
+          where pj.execution_mode = 'dynamic_generation'
+            and pj.worker_status = any($1::text[])
+            and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+            and ($2::text is null or pj.owner_id = $2)
+            and not (g.id = any($3::uuid[]))
+            and not (g.job_id = any($5::uuid[]))
+            and ($6::timestamptz is null or pj.created_at >= $6::timestamptz)
+            and ($7::int is null or m.rules_version = $7::int)
+            and ${claimablePredicate('g', '$4')}
+          order by g.created_at, mo.ord nulls last, g.id
+          limit 1`,
+        [DISPATCHABLE_RUN_WORKER_STATUSES, opts.ownerId ?? null, tried, types, leasedRuns, opts.minRunCreatedAt ?? null, opts.onlyRulesVersion ?? null],
+      );
+      if (!cand) {
+        await this.reportMissingDependencies(null, opts.ownerId);
+        return { item: null };
+      }
+      tried.push(cand.id);
+      const r = await this.claimInRun(cand.job_id, executorId, types, leaseSeconds, opts.ownerId, cand.id, {
+        videoScenes: executorAnchorsVideoScenes(opts.ownerId, opts.executorFeatures),
+      });
+      if (r.leasedElsewhere) leasedRuns.push(cand.job_id);
+      if (r.item) return { item: r.item };
+    }
+    this.logger.warn(
+      `claim global: ${GLOBAL_CLAIM_RACE_RETRIES} candidatos seguidos se esfumaron por carreras ` +
+        `(executor ${executorId}, tipos ${types.join(',')}); se devuelve null y el próximo poll reintenta`,
+    );
+    return { item: null };
+  }
+
+  /**
+   * Claim dentro de UN run, en una transacción: fila del run FOR UPDATE →
+   * barrido de leases del run → item FOR UPDATE SKIP LOCKED con el predicado
+   * completo (si `itemId` viene del claim global, solo ese item).
+   */
+  private async claimInRun(
+    runId: string,
+    executorId: string,
+    types: ItemType[],
+    leaseSeconds: number,
+    ownerId?: string,
+    itemId?: string,
+    claimOpts: { videoScenes: boolean } = { videoScenes: true },
+  ): Promise<{ item: ClaimedItem | null; unavailable: boolean; leasedElsewhere?: { expiresAt: string | null }; paused?: boolean }> {
+    let cancelledJob: any = null;
+    let paused = false;
+    let unavailable: string | null = null;
+    let leasedElsewhere: { expiresAt: string | null } | undefined;
+    const claimed = await this.runs.tx(async (qr) => {
+      const job = await this.lockRun(qr, runId, ownerId, 'update');
+      if (!job) return null;
+      if (isCancelledLike(job)) {
+        cancelledJob = job;
+        return null;
+      }
+      // Pausa del usuario (servidor = autoridad): un run pausado no entrega partes nuevas a NADIE
+      // (navegador, workers, auto-recovery). Solo resumeRun (acción explícita) lo vuelve a despachar.
+      if (isPausedRun(job)) { paused = true; return null; }
+      if (!isDispatchableRun(job)) return null;
+
+      // REL lease de ejecución (solo camino navegador): con la fila del run ya bloqueada, se toma o
+      // renueva el lease del run (libre, vencido o ya de este executorId) — aunque después no haya
+      // nada reclamable (un ejecutor ocioso que sondea lo conserva). Si otro ejecutor lo tiene vigente,
+      // no se entrega nada. Los workers del servidor (ownerId ausente) nunca pasan por acá.
+      if (ownerId !== undefined && ownerId !== null && (await execLeaseSchemaReady(qr))) {
+        const lease = await acquireRunExecLease(qr, job.id, executorId, leaseSeconds);
+        if (!lease.ok) {
+          leasedElsewhere = { expiresAt: lease.expiresAt };
+          return null;
+        }
+      }
+
+      if ((await sweepRunExpiredLeases(qr, job.id)) > 0) {
+        await recomputeRunStatus(qr, job.id);
+        // stop-after (review M1): el recálculo pudo pausar (o cerrar) el run → se relee antes de entregar nada.
+        const [now] = await qr.query(`select status, worker_status from public.production_jobs where id = $1`, [job.id]);
+        if (now && isPausedRun(now)) { paused = true; return null; }
+        if (!now || !isDispatchableRun(now)) return null;
+      }
+
+      const [cand] = await qr.query(
+        `select g.id
+           from public.generation_item_runs g
+           join public.course_generation_manifests m on m.id = g.manifest_id
+           left join lateral (
+             select e.ord
+               from jsonb_array_elements(m.manifest_json->'items') with ordinality as e(it, ord)
+              where e.it->>'key' = g.item_key
+              limit 1
+           ) mo on true
+          where g.job_id = $1
+            and ($3::uuid is null or g.id = $3)
+            and ${claimablePredicate('g', '$2')}
+          order by g.created_at, mo.ord nulls last, g.id
+          limit 1
+          for update of g skip locked`,
+        [job.id, types, itemId ?? null],
+      );
+      if (!cand) return null;
+
+      const [row] = returningRows(
+        await qr.query(
+          `update public.generation_item_runs
+              set status = 'running', worker_id = $2, claimed_at = now(),
+                  lease_until = now() + make_interval(secs => $3::int),
+                  attempt_count = attempt_count + 1, next_retry_at = null, updated_at = now()
+            where id = $1 and status in ('pending', 'retrying')
+            returning *`,
+          [cand.id, executorId, leaseSeconds],
+        ),
+      );
+      if (!row) throw new InternalServerErrorException(`No se pudo reclamar el item ${cand.id} (fila no actualizada)`);
+      // REL R2: el intento se abre en la MISMA transacción del claim (no-op sin el esquema de R2).
+      await openItemAttempt(qr, row, { executorKind: executorKindFor(row.type, ownerId !== undefined), executorId });
+      await markRunRunning(qr, job.id);
+      try {
+        const built = await this.buildClaimedItem(qr, job, row, false, claimOpts);
+        // r61 (Q-21, M10): previousError solo para los workers del servidor (el ejecutor del navegador no lo usa).
+        if (ownerId !== undefined && ownerId !== null) delete built.previousError;
+        return built;
+      } catch (err) {
+        if (!(err instanceof ClaimPayloadUnavailable)) throw err;
+        await applyItemFailure(qr, row.id, `claim_payload_unavailable: ${err.message}`.slice(0, MAX_ERROR_LENGTH), false, null, false, false, { source: 'scheduler' });
+        await recomputeRunStatus(qr, job.id);
+        unavailable = `${row.item_key}: ${err.message}`;
+        return null;
+      }
+    });
+    if (unavailable) {
+      this.logger.error(`Item ${unavailable} — marcado failed en el claim (dato de una dependencia ausente; no se inventa)`);
+    }
+    if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
+    return { item: claimed, unavailable: unavailable !== null, ...(leasedElsewhere ? { leasedElsewhere } : {}), ...(paused ? { paused: true } : {}) };
+  }
+
+  /**
+   * REL lease: liberación explícita del lease de ejecución del run por su titular (el navegador al
+   * cerrar la página; best-effort — el vencimiento es la garantía). Nunca toca items ni el acceso.
+   */
+  async releaseRunExecutionLease(runId: string, executorId: string, ownerId: string): Promise<{ ok: true; released: boolean }> {
+    executorId = this.checkExecutorId(executorId);
+    if (!UUID_RE.test(String(runId))) throw new BadRequestException('runId inválido');
+    if (!(await execLeaseSchemaReady(this.dataSource))) return { ok: true, released: false };
+    return { ok: true, released: await releaseRunExecLease(this.dataSource, runId, executorId, ownerId) };
+  }
+
+  /**
+   * Motor pedagógico Fase 2 (review I2): un run con diseño pedagógico (Manifest con features.pedagogy) solo lo
+   * ejecuta un navegador que aplica el brief del claim. Una pestaña con una versión anterior de Cursia lo
+   * ignoraría y generaría (y pagaría) cada recurso sin el enfoque, en silencio. Se rechaza ANTES de reclamar
+   * nada, con el mismo 409 rules_version_mismatch que esa versión ya muestra como pausa visible («recarga la
+   * página»). Runs sin pedagogía: sin cambios.
+   */
+  private async assertExecutorAppliesPedagogy(runId: string, ownerId: string, features: string[]): Promise<void> {
+    if (features.includes(PEDAGOGY_BRIEF_FEATURE)) return;
+    const [row] = await this.dataSource.query(
+      `select (m.manifest_json->'features'->'pedagogy') is not null as pedagogy,
+              -- Fase 3 (review M6): un Blueprint con contexto académico también entrega brief (resultados por item).
+              (b.snapshot_json->'course'->'academicContext') is not null as academic
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+         left join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    if (!row || (row.pedagogy !== true && row.academic !== true)) return;
+    const what = row.pedagogy === true ? 'diseño pedagógico' : 'resultados de aprendizaje vinculados';
+    const message =
+      `rules_version_mismatch: la ejecución ${runId} tiene ${what} y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no lo aplica a los recursos. Recarga la página para continuar; con esta versión el ' +
+      `curso se generaría sin ${row.pedagogy === true ? 'el enfoque pedagógico elegido' : 'los resultados de aprendizaje'}.`;
+    throw new ConflictException({ message, code: 'executor_outdated_pedagogy', runId });
+  }
+
+  /**
+   * Fase 2 (review I3): un run con Actividades de Aplicación solo lo ejecuta un navegador que sabe generarlas. Una
+   * pestaña con una versión anterior reclamaría todo lo demás, renovaría el lease exclusivo del run y dejaría los
+   * items application_activity en pending para siempre (el curso nunca termina, sin error, y otro dispositivo no
+   * puede tomar la ejecución). Se rechaza ANTES de reclamar nada con el 409 visible «recarga la página».
+   */
+  private async assertExecutorGeneratesApplication(runId: string, ownerId: string, features: string[]): Promise<void> {
+    if (features.includes(APPLICATION_ACTIVITY_FEATURE)) return;
+    const [row] = await this.dataSource.query(
+      `select coalesce(m.manifest_json->'items', '[]'::jsonb) @> '[{"type":"application_activity"}]'::jsonb as application
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    if (!row || row.application !== true) return;
+    const message =
+      `rules_version_mismatch: la ejecución ${runId} tiene Actividades de Aplicación y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no sabe generarlas. Recarga la página para continuar; con esta versión el curso no podría terminar.';
+    throw new ConflictException({ message, code: 'executor_outdated_application', runId });
+  }
+
+  /**
+   * Loop 9 B: igual que las Actividades de Aplicación — un run con ejercicios guiados solo lo ejecuta un navegador que
+   * sabe generarlos (si no, reclamaría todo lo demás, renovaría el lease exclusivo y esos items quedarían en pending
+   * para siempre). 409 visible «recarga la página» ANTES de reclamar nada.
+   */
+  private async assertExecutorGeneratesGuidedPractice(runId: string, ownerId: string, features: string[]): Promise<void> {
+    if (features.includes(GUIDED_PRACTICE_FEATURE)) return;
+    const [row] = await this.dataSource.query(
+      `select coalesce(m.manifest_json->'items', '[]'::jsonb) @> '[{"type":"guided_practice"}]'::jsonb as guided
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    if (!row || row.guided !== true) return;
+    const message =
+      `rules_version_mismatch: la ejecución ${runId} tiene ejercicios guiados y este navegador ejecuta una versión ` +
+      'anterior de Cursia que no sabe generarlos. Recarga la página para continuar; con esta versión el curso no podría terminar.';
+    throw new ConflictException({ message, code: 'executor_outdated_guided_practice', runId });
+  }
+
+  /**
+   * M3 (review-rv2): un ejecutor del navegador que solo conoce tipos v1
+   * (frontend viejo en caché, o uno que no pudo leer el rulesVersion del run)
+   * reclamando un run rulesVersion 2 nunca encontraría nada reclamable
+   * (content depende de course_plan) y el run quedaría estancado SIN error.
+   * Se rechaza con 409 `rules_version_mismatch` (mensaje visible en la UI /
+   * consola) en vez de devolver `null` en silencio. Solo el camino navegador
+   * (ownerId): el worker interno reclama `video` y no se ve afectado.
+   */
+  private async assertBrowserTypesMatchRun(runId: string, ownerId: string, types: ItemType[]): Promise<void> {
+    // V2.1 (R4): un ejecutor v3 (reclama algún tipo v3) no se restringe acá.
+    if (types.some((t) => V3_BROWSER_ITEM_TYPES.includes(t))) return;
+    const claimsV2 = types.some((t) => V2_ONLY_ITEM_TYPES.includes(t));
+    const [row] = await this.dataSource.query(
+      `select m.rules_version
+         from public.production_jobs pj
+         join public.course_generation_manifests m on m.id::text = pj.input_payload->>'manifestId'
+        where pj.id = $1 and pj.execution_mode = 'dynamic_generation' and pj.owner_id = $2`,
+      [runId, ownerId],
+    );
+    const rulesVersion = row ? Number(row.rules_version) : null;
+    // R4: un ejecutor v1/v2 sobre un run v3 nunca reclamaría experience/activity/…
+    // (el run quedaría estancado sin error) → mismo 409 rules_version_mismatch.
+    if (rulesVersion === 3) {
+      const message =
+        `rules_version_mismatch: la ejecución ${runId} es rulesVersion=3 (V2.1: experiencias, actividades, ` +
+        `presentaciones y audio) y este ejecutor no reclama tipos de rulesVersion 3 (${types.join(', ')}). ` +
+        'Recarga la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
+      throw new ConflictException({ message, code: 'rules_version_mismatch', rulesVersion, runId });
+    }
+    if (claimsV2) return;
+    if (rulesVersion === 2) {
+      const message =
+        `rules_version_mismatch: la ejecución ${runId} es rulesVersion=2 (plan de conceptos, introducciones y ` +
+        `Context Package) y este ejecutor solo reclama tipos de rulesVersion 1 (${types.join(', ')}). ` +
+        'Recarga la página para usar el generador actualizado; con este ejecutor el curso no avanzaría.';
+      throw new ConflictException({ message, code: 'rules_version_mismatch', rulesVersion, runId });
+    }
+  }
+
+  // ── heartbeat / complete / fail / external ───────────────────────────────
+
+  async heartbeatItem(itemRunId: string, executorId: string, leaseSeconds: number, ownerId?: string): Promise<boolean> {
+    return (await this.heartbeatItemDetailed(itemRunId, executorId, leaseSeconds, ownerId)).ok;
+  }
+
+  async heartbeatItemDetailed(
+    itemRunId: string,
+    executorId: string,
+    leaseSeconds: number,
+    ownerId?: string,
+  ): Promise<ItemOpResult> {
+    executorId = this.checkExecutorId(executorId);
+    if (!UUID_RE.test(String(itemRunId))) return { ok: false, reason: 'not_found' };
+    const rows = returningRows(
+      await this.dataSource.query(
+        `update public.generation_item_runs g
+            set lease_until = now() + make_interval(secs => $3::int), updated_at = now()
+          where g.id = $1 and g.status = 'running' and g.worker_id = $2
+            and exists (
+              select 1 from public.production_jobs pj
+               where pj.id = g.job_id and pj.execution_mode = 'dynamic_generation'
+                 and pj.worker_status = any($4::text[])
+                 and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+                 and ($5::text is null or pj.owner_id = $5))
+          returning g.id, g.job_id`,
+        [itemRunId, executorId, this.clampLease(leaseSeconds), ACTIVE_RUN_WORKER_STATUSES, ownerId ?? null],
+      ),
+    );
+    if (rows.length === 1) {
+      // REL lease: el latido del titular renueva el lease de ejecución del run (solo si sigue siendo suyo).
+      if (ownerId !== undefined && ownerId !== null && (await execLeaseSchemaReady(this.dataSource))) {
+        await refreshRunExecLease(this.dataSource, rows[0].job_id, executorId, this.clampLease(leaseSeconds));
+      }
+      return { ok: true };
+    }
+    return { ok: false, reason: await this.diagnose(itemRunId, executorId, ownerId) };
+  }
+
+  async completeItem(
+    itemRunId: string,
+    executorId: string,
+    output: { artifactIds: string[]; summary: Record<string, any> },
+    ownerId?: string,
+  ): Promise<boolean> {
+    return (await this.completeItemDetailed(itemRunId, executorId, output, ownerId)).ok;
+  }
+
+  /**
+   * R13/R14: vincula los artifacts (ya subidos por el ejecutor) y completa el
+   * item en UNA transacción. Solo se vinculan artifacts del dueño del run,
+   * con course_id = artifactCourseId y todavía sin item_run_id; si no se
+   * vinculan TODOS → rollback y {ok:false, reason:'artifacts_not_linkable'}
+   * (un artifact subido por un lease perdido queda huérfano, R13).
+   */
+  /**
+   * V2.1 fix round 1 (I3): identidad del video vigente (última generación de
+   * `video:<ch>` del run, que tiene que estar completed) para las
+   * interacciones de ese capítulo: `{identity, itemRunId, generation,
+   * artifactIds}`. `identity` = artifactOutputIdentity (storage paths): una
+   * fila carried conserva la identidad; un video regenerado la cambia. Sin
+   * video completado → 409 (unas interacciones sin video no se completan).
+   */
+  private async consumedVideoIdentity(qr: QueryRunner, jobId: string, item: any): Promise<Record<string, any>> {
+    const videoKey = `video:${item.chapter_id}`;
+    const [v] = await qr.query(
+      `select g.id, g.generation, g.status from public.generation_item_runs g
+        where g.job_id = $1 and g.item_key = $2 and ${latestGenerationPredicate('g')}`,
+      [jobId, videoKey],
+    );
+    if (!v || v.status !== 'completed') {
+      throw new ConflictException({
+        message: `video_not_completed: ${item.item_key} no se completa sin ${videoKey} completado (estado ${v?.status ?? 'inexistente'})`,
+        code: 'video_not_completed',
+      });
+    }
+    const arts: any[] = await qr.query(
+      `select id, type, storage_bucket as bucket, storage_path as path from public.artifacts
+        where item_run_id = $1 and coalesce(status, 'ready') <> 'disabled' order by id`,
+      [v.id],
+    );
+    const identity = artifactOutputIdentity(arts);
+    if (!identity) {
+      throw new ConflictException({
+        message: `video_not_completed: ${videoKey} (item run ${v.id}) no tiene artifacts; no se puede registrar la identidad del video`,
+        code: 'video_not_completed',
+      });
+    }
+    return { identity, itemRunId: v.id, generation: Number(v.generation), artifactIds: arts.map((a) => a.id) };
+  }
+
+  async completeItemDetailed(
+    itemRunId: string,
+    executorId: string,
+    output: { artifactIds: string[]; summary: Record<string, any> },
+    ownerId?: string,
+  ): Promise<ItemOpResult> {
+    executorId = this.checkExecutorId(executorId);
+    const ids = [...new Set((output?.artifactIds ?? []).map(String))];
+    if (ids.length === 0) return { ok: false, reason: 'no_artifacts' };
+    if (ids.some((id) => !UUID_RE.test(id))) return { ok: false, reason: 'invalid_artifact_id' };
+    const summaryIn = output?.summary ?? {};
+    if (!isPlainObject(summaryIn)) return { ok: false, reason: 'invalid_summary' };
+    // r58 (AU1 R2): `llmMode` lo decide el servidor (abajo, con la metadata de los artifacts); lo que declara el
+    // ejecutor solo cuenta como una declaración más (puede degradar la procedencia, nunca subirla a real).
+    const { llmMode: claimedLlmMode, ...rawSummary } = summaryIn as Record<string, any>;
+    // m-11: el ejecutor del navegador (ownerId presente) nunca fija claves del servidor.
+    let summary: Record<string, any> = rawSummary;
+    if (ownerId !== undefined) {
+      const st = stripServerOwnedSummaryKeys(rawSummary);
+      summary = st.summary;
+      if (st.dropped.length) this.logger.warn(`completeItem ${itemRunId}: el ejecutor envió claves del servidor (descartadas): ${st.dropped.join(', ')}`);
+    }
+
+    // V2.1 R11a: items LLM de rulesVersion 3 → el servidor valida el contenido
+    // del artifact ANTES de aceptar (fuera de la transacción: la descarga no
+    // retiene locks). Inválido → el item falla reintentable con los códigos
+    // del validador (nunca se acepta en silencio). v1/v2: no aplica.
+    const pre = await this.prevalidateV3(itemRunId, executorId, ids, ownerId, typeof summary.promptVersion === 'string' ? summary.promptVersion : null);
+    if (pre.kind === 'invalid') {
+      // Fix bank-guard-minors (N-R4): un rechazo del validador del servidor es una falla VALIDADA, no
+      // transitoria: para exam/final_exam borra el borrador del banco (null explícito; no-op para otros tipos),
+      // así un ejecutor con reglas viejas no reanuda una y otra vez una pregunta que el servidor rechaza.
+      // O2b: ídem el borrador de la actividad de aplicación (no-op para otros tipos).
+      const failed = await this.failItemDetailed(itemRunId, executorId, pre.message, pre.retryable, ownerId, { examBankDraftArtifactId: null, applicationDraftArtifactId: null, ...(pre.answerBiasRejection ? { answerBiasRejection: true } : {}) });
+      return failed.ok ? { ok: false, reason: V3_PAYLOAD_INVALID, errors: pre.codes } : failed;
+    }
+    const validationPatch =
+      pre.kind === 'valid'
+        ? { v3Validation: { artifactType: pre.artifactType, artifactId: pre.artifactId, contentSha256: pre.contentSha256, ...pre.summary } }
+        : {};
+
+    return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
+      if (pre.kind === 'valid') {
+        // El artifact validado sigue siendo el mismo objeto (misma ruta) al completar.
+        const [a] = await qr.query(`select storage_bucket, storage_path from public.artifacts where id = $1`, [pre.artifactId]);
+        if (!a || a.storage_bucket !== pre.storageBucket || a.storage_path !== pre.storagePath) {
+          throw new GuardRejection('artifact_changed_after_validation');
+        }
+      }
+      // r58 (I4-1): las señales de sesgo que entran al acumulado del curso son las del SERVIDOR (nunca las declaradas).
+      const biasPatch = pre.kind === 'valid' && pre.answerBiasSignals
+        ? { answerBias: { ...(isPlainObject(summary.answerBias) ? summary.answerBias : {}), signals: pre.answerBiasSignals } }
+        : {};
+      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...biasPatch, ...validationPatch, artifactIds: ids });
+      if (merged.ok === false) throw new GuardRejection(merged.reason);
+
+      // Spec §3.3 / R16: un artifact por item y rol (type). Se rechaza antes
+      // del UPDATE; el índice único parcial uq_artifacts_item_run_type es la
+      // red de seguridad (23505 → mismo rechazo, rollback de todo).
+      const dupTypes = await qr.query(
+        `select type from public.artifacts where id = any($1::uuid[]) group by type having count(*) > 1`,
+        [ids],
+      );
+      if (dupTypes.length > 0) throw new GuardRejection('duplicate_artifact_type');
+
+      let linked: any[];
+      try {
+        linked = returningRows(
+          await qr.query(
+            `update public.artifacts
+                set manifest_id = $2, manifest_item_key = $3, item_run_id = $4, module_id = $5, chapter_id = $6,
+                    status = 'ready', generated_with_version_id = $7, updated_at = now()
+              where id = any($1::uuid[]) and owner_id = $8 and course_id = $9 and item_run_id is null
+              returning id`,
+            [ids, item.manifest_id, item.item_key, item.id, item.module_id, item.chapter_id, item.blueprint_id,
+              job.owner_id, this.artifactCourseId(job)],
+          ),
+        );
+      } catch (err) {
+        const code = (err as any)?.code ?? (err as any)?.driverError?.code;
+        if (code === '23505') throw new GuardRejection('duplicate_artifact_type');
+        throw err;
+      }
+      if (linked.length !== ids.length) throw new GuardRejection('artifacts_not_linkable');
+
+      // r58 (AU1 R2): procedencia del texto de IA del item = la peor de lo declarado (resumen + metadata.llmMode
+      // de cada artifact vinculado). Solo se escribe si NO es real (mock | replay): un item real queda con el
+      // output_summary de siempre. Un valor desconocido → rechazo (nunca se lo trata como real).
+      const llmRows: Array<{ llm_mode: string | null }> = await qr.query(
+        `select metadata->>'llmMode' as llm_mode from public.artifacts where id = any($1::uuid[])`,
+        [ids],
+      );
+      const llm = combineLlmModes([claimedLlmMode, ...(Array.isArray(llmRows) ? llmRows : []).map((r) => r?.llm_mode)]);
+      if (llm.ok === false) throw new GuardRejection(LLM_MODE_INVALID);
+      if (isNonRealLlmMode(llm.mode)) merged.merged.llmMode = llm.mode;
+      else delete (merged.merged as Record<string, unknown>).llmMode;
+
+      // M1 (review-rv2): en rulesVersion 2 un item solo se completa con TODOS
+      // sus roles obligatorios (misma tabla que el resolver de empaquetado:
+      // content → md + Context Package; course_plan → plan json; intros → su
+      // md; scorm/exam/video como v1). Si falta alguno → 409 con los tipos
+      // faltantes y rollback (el item sigue running, nada queda vinculado):
+      // un item completado a medias ya no se puede reintentar. v1 intacto.
+      const [mrow] = await qr.query(
+        `select rules_version from public.course_generation_manifests where id = $1`,
+        [item.manifest_id],
+      );
+      const itemRulesVersion = mrow ? Number(mrow.rules_version) : null;
+      if (itemRulesVersion === 2 || itemRulesVersion === 3) {
+        // V2.1 (R4): v3 usa su tabla de roles; activity según el variant del
+        // item en el Manifest congelado. Sin tabla para el tipo → 409 (nunca
+        // se completa un item v3 sin saber qué debía producir).
+        const linkedTypes = new Set<string>(
+          (await qr.query(`select type from public.artifacts where id = any($1::uuid[])`, [ids])).map((r: any) => r.type),
+        );
+        let required: string[];
+        if (itemRulesVersion === 3) {
+          const variant = await this.manifestItemVariant(qr, item.manifest_id, item.item_key);
+          // EV6 P2: exam/final_exam → banco JSON o GIFT (exactamente uno).
+          const v3r = resolveRequiredArtifactTypesV3(item.type, variant, linkedTypes);
+          if (v3r && v3r.ok === false) {
+            throw new ConflictException({
+              message:
+                `EXAM_ARTIFACT_AMBIGUOUS: el item ${item.item_key} (${item.type}) subió más de un artifact de examen ` +
+                `(${v3r.types.join(', ')}); debe ser exactamente uno`,
+              code: 'EXAM_ARTIFACT_AMBIGUOUS',
+              missing: [],
+            });
+          }
+          const v3 = v3r?.types;
+          if (!v3) {
+            throw new ConflictException({
+              message:
+                `missing_required_artifacts: el item ${item.item_key} (${item.type}, rulesVersion 3) no tiene roles de ` +
+                `artifact definidos${item.type === 'activity' ? ` para variant=${JSON.stringify(variant)}` : ''}; no se completa`,
+              code: 'missing_required_artifacts',
+              missing: [],
+            });
+          }
+          required = v3;
+        } else {
+          required = requiredArtifactTypes(2, item.type) ?? [];
+        }
+        const missingTypes: string[] = required.filter((t) => !linkedTypes.has(t))
+          .map((t) => (itemRulesVersion === 3 ? missingRoleLabelV3(item.type, t) : t));
+        // El resumen del capítulo (dynamic_context_summary_json) es opcional,
+        // pero su ausencia tiene que quedar MARCADA (output_summary.
+        // contextSummary='missing', mismo invariante que la auditoría [4j]):
+        // nunca un content v2 sin resumen y sin marca.
+        if (
+          item.type === 'content' &&
+          !linkedTypes.has('dynamic_context_summary_json') &&
+          merged.merged.contextSummary !== 'missing'
+        ) {
+          missingTypes.push('dynamic_context_summary_json (o la marca contextSummary="missing")');
+        }
+        if (missingTypes.length > 0) {
+          throw new ConflictException({
+            message:
+              `missing_required_artifacts: el item ${item.item_key} (${item.type}, rulesVersion ${itemRulesVersion}) no se puede completar ` +
+              `sin sus artifacts obligatorios; faltan: ${missingTypes.join(', ')}`,
+            code: 'missing_required_artifacts',
+            missing: missingTypes,
+          });
+        }
+        if (item.type === 'content' && Number(item.generation) > 1) {
+          await this.assertRegeneratedContextPackage(qr, item, merged.merged);
+        }
+        // V2.1 fix round 1 (review G2 I3): las interacciones registran la
+        // identidad del video CONTRA el que se generaron (generación vigente
+        // de video:<ch> en este run al completar). La invalidación compara
+        // contra ESTO, nunca contra el video actual.
+        if (itemRulesVersion === 3 && item.type === 'video_interactions') {
+          merged.merged.videoIdentity = await this.consumedVideoIdentity(qr, job.id, item);
+        }
+      }
+
+      // BANKOPT fix round 1 (M4): el borrador del banco solo sirve entre intentos; al completar se quita
+      // (O2b: también el de la actividad de aplicación).
+      if (merged.merged && typeof merged.merged === 'object') for (const k of ITEM_DRAFT_SUMMARY_KEYS) delete (merged.merged as Record<string, unknown>)[k];
+      const done = returningRows(
+        await qr.query(
+          `update public.generation_item_runs
+              set status = 'completed', finished_at = now(), lease_until = null, next_retry_at = null,
+                  error = null, output_summary = $3::jsonb, updated_at = now()
+            where id = $1 and status = 'running' and worker_id = $2
+            returning id`,
+          [item.id, executorId, JSON.stringify(merged.merged)],
+        ),
+      );
+      if (done.length !== 1) throw new GuardRejection('not_running');
+      await recordItemCompleted(qr, item.id);
+      await recomputeRunStatus(qr, job.id);
+    });
+  }
+
+  async failItem(
+    itemRunId: string,
+    executorId: string,
+    error: string,
+    retryable: boolean,
+    ownerId?: string,
+    /** errorCode (REL R1): código explícito opcional del worker; solo clasificación. */
+    opts?: { retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean; errorCode?: string | null },
+  ): Promise<boolean> {
+    return (await this.failItemDetailed(itemRunId, executorId, error, retryable, ownerId, opts)).ok;
+  }
+
+  /**
+   * retryable y quedan intentos → `retrying` con backoff; si no → `failed` +
+   * dependientes transitivos `blocked` (condición 6). Recalcula el run (R12).
+   */
+  async failItemDetailed(
+    itemRunId: string,
+    executorId: string,
+    error: string,
+    retryable: boolean,
+    ownerId?: string,
+    /**
+     * examBankDraftArtifactId: id = borrador nuevo; null = borrar el anterior (falla sin faltante); ausente = conservar.
+     * applicationDraftArtifactId (O2b): mismo contrato para application_activity.
+     * errorCode (REL R1): código explícito del emisor; solo se registra (clasificación), nunca cambia la transición.
+     */
+    opts?: {
+      retryAfterSeconds?: number; refundAttempt?: boolean; grantAttempt?: boolean;
+      examBankDraftArtifactId?: string | null; applicationDraftArtifactId?: string | null; errorCode?: string | null;
+      /** r58 (I4-1): el rechazo vino del re-chequeo de sesgo de video del servidor → se cuenta en output_summary.answerBiasRecheck. */
+      answerBiasRejection?: boolean;
+    },
+  ): Promise<ItemOpResult> {
+    executorId = this.checkExecutorId(executorId);
+    const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
+    return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
+      // BANKOPT (1e): borrador del banco de un examen incompleto (validado; si no corresponde, se ignora).
+      // Fix round 4 (R4): el borrador anterior se borra SOLO con `examBankDraftArtifactId: null` explícito
+      // (el ejecutor lo manda ante una falla de reglas del banco SIN faltante, N2). Un fail transitorio (error
+      // de red/LLM, subida fallida, 409 al completar, borrador que no se pudo subir) llega sin el campo y lo
+      // conserva: un intento interrumpido no es una falla nueva.
+      const d = await recordExamBankDraft(qr, item, job.owner_id, opts?.examBankDraftArtifactId ?? null, !!retryable);
+      if (d.recorded === false && opts?.examBankDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador del banco ignorado (${d.reason})`);
+      if (d.recorded === false && opts?.examBankDraftArtifactId === null) await clearExamBankDraft(qr, item);
+      // O2b: borrador de la actividad de aplicación (actividad validada; solucionario fallido). Mismas guardas.
+      const ad = await recordApplicationDraft(qr, item, job.owner_id, opts?.applicationDraftArtifactId ?? null, !!retryable);
+      if (ad.recorded === false && opts?.applicationDraftArtifactId) this.logger.warn(`failItem ${item.id}: borrador de la actividad ignorado (${ad.reason})`);
+      if (ad.recorded === false && opts?.applicationDraftArtifactId === null) await clearApplicationDraft(qr, item);
+      if (opts?.answerBiasRejection === true) {
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('answerBiasRecheck',
+                    jsonb_build_object('rejections', coalesce((output_summary -> 'answerBiasRecheck' ->> 'rejections')::int, 0) + 1))
+            where id = $1`,
+          [item.id],
+        );
+      }
+      // Loop de costos (review I2): conceder el intento por una devolución `run_paused` solo si el run está pausado.
+      const grant = opts?.grantAttempt === true && (!msg.startsWith('run_paused') || isPausedRun(job));
+      const t = await applyItemFailure(
+        qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, grant,
+        { errorCode: isValidFailureCode(opts?.errorCode) ? opts!.errorCode : null, source: failureSourceFor(item.type, ownerId) },
+      );
+      if (!t) throw new GuardRejection('not_running');
+      await recomputeRunStatus(qr, job.id);
+    });
+  }
+
+  /**
+   * V2.1 RF-b — runtime guard de presupuesto: un item `running` cuyo envío
+   * pagado superaría el presupuesto autorizado del run pasa a `blocked` con
+   * error `budget_exceeded: …` (visible, sin gasto: se llama ANTES del envío).
+   * Sus dependientes transitivos también quedan `blocked`. Se reanuda con
+   * retryItem tras ampliar la autorización (POST /finops/courses/:id/authorizations).
+   */
+  async blockItemForBudget(itemRunId: string, executorId: string, detail: string, ownerId?: string): Promise<boolean> {
+    executorId = this.checkExecutorId(executorId);
+    const raw = String(detail ?? '').trim();
+    const msg = (raw.startsWith('budget_exceeded') ? raw : `budget_exceeded: ${raw || 'presupuesto agotado'}`).slice(0, MAX_ERROR_LENGTH);
+    const res = await this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
+      const rows = returningRows(
+        await qr.query(
+          `update public.generation_item_runs
+              set status = 'blocked', error = $2, worker_id = null, lease_until = null, next_retry_at = null,
+                  finished_at = null, updated_at = now()
+            where id = $1 and status = 'running'
+            returning id`,
+          [item.id, msg],
+        ),
+      );
+      if (rows.length !== 1) throw new GuardRejection('not_running');
+      // REL R2: runtime guard de presupuesto = fallo D (budget), registrado en la misma transacción.
+      await recordItemFailure(qr, {
+        itemRunId: item.id, status: 'blocked', error: msg, maxRoundsToday: 0,
+        verdict: classifyFailure({ error: msg, itemType: item.type, source: failureSourceFor(item.type, ownerId) }),
+      });
+      await blockDependents(qr, job.id, item.item_key);
+      await recomputeRunStatus(qr, job.id);
+    });
+    return res.ok;
+  }
+
+  async recordItemExternal(
+    itemRunId: string,
+    executorId: string,
+    patch: Record<string, any>,
+    ownerId?: string,
+  ): Promise<boolean> {
+    return (await this.recordItemExternalDetailed(itemRunId, executorId, patch, ownerId)).ok;
+  }
+
+  /**
+   * R15: merge top-level de `patch` en output_summary bajo FOR UPDATE con los
+   * guards de R14; nunca cambia un `external` existente por otro distinto
+   * (→ {ok:false, reason:'external_conflict'}). Usado por el worker de video
+   * (R3) para persistir externalSubmitStartedAt y los ids de Videogen.
+   */
+  async recordItemExternalDetailed(
+    itemRunId: string,
+    executorId: string,
+    patch: Record<string, any>,
+    ownerId?: string,
+  ): Promise<ItemOpResult> {
+    executorId = this.checkExecutorId(executorId);
+    if (!isPlainObject(patch)) return { ok: false, reason: 'invalid_patch' };
+    // M5: si el run ya está cancelado, solo se permite un merge EXCLUSIVAMENTE
+    // de `external` (los ids de Videogen) — nunca `externalSubmitStartedAt` ni
+    // ningún otro campo. Esto evita que un video ya sometido (dinero real
+    // gastado) quede huérfano solo porque el cancel ganó la carrera contra el
+    // registro del id; el item igual queda cancelado por reconcileCancellation,
+    // pero el id sobrevive para que un futuro reopen lo vea como
+    // 'ambiguous_video_submission' recuperable en vez de perderlo en logs.
+    const patchKeys = Object.keys(patch);
+    const allowCancelled = patchKeys.length === 1 && patchKeys[0] === 'external';
+    return this.guardedItemOp(itemRunId, executorId, ownerId, 'share', async (qr, _job, item) => {
+      const merged = mergeOutputSummary(item.output_summary ?? {}, patch);
+      if (merged.ok === false) throw new GuardRejection(merged.reason);
+      const rows = returningRows(
+        await qr.query(
+          `update public.generation_item_runs set output_summary = $3::jsonb, updated_at = now()
+            where id = $1 and status = 'running' and worker_id = $2 returning id`,
+          [item.id, executorId, JSON.stringify(merged.merged)],
+        ),
+      );
+      if (rows.length !== 1) throw new GuardRejection('not_running');
+    }, allowCancelled);
+  }
+
+  // ── V2.1 R11a: validación server-side de items LLM v3 ─────────────────────
+
+  /**
+   * Lectura sin locks del item + su artifact validable; descarga y valida.
+   * - 'skip': no aplica (no v3, tipo sin validación de contenido, o el
+   *   estado/artifacts no son completables → la transacción de completeItem
+   *   devuelve el motivo de siempre: not_running, lease_lost,
+   *   artifacts_not_linkable, missing_required_artifacts…).
+   * - 'invalid': el contenido no pasa el validador (o falta un dato medido de
+   *   la dependencia, p.ej. la duración del video → no reintentable).
+   * - 'valid': ok; la transacción re-verifica que el artifact no cambió.
+   */
+  /** Language QA: el run es de un curso de idiomas o de lengua/literatura (contexto congelado del run). */
+  private async isLanguageCourseRun(jobId: string): Promise<boolean> {
+    const [row] = await this.dataSource.query(`select context from public.generation_run_contexts where job_id = $1`, [jobId]);
+    const ctx = row ? (typeof row.context === 'string' ? JSON.parse(row.context) : row.context) : null;
+    return lqaIsLanguageCourse(ctx);
+  }
+
+  /** Language QA del capítulo: el dynamic_content_md subido en este complete (si hay exactamente uno). */
+  private async contentLanguageErrors(g: any, artifactIds: string[]): Promise<{ path: string; code: string; message: string }[]> {
+    const artifactCourse = g.frontend_course_id ?? String(g.job_course_id);
+    const rows = await this.dataSource.query(
+      `select id, type, storage_bucket, storage_path from public.artifacts
+        where id = any($1::uuid[]) and type = 'dynamic_content_md' and owner_id = $2 and course_id = $3 and item_run_id is null`,
+      [artifactIds, g.owner_id, artifactCourse],
+    );
+    if (rows.length !== 1) return [];
+    let text: string;
+    try {
+      text = await (this.v3Reader as V3ArtifactTextReader).readText({
+        id: rows[0].id, ownerId: g.owner_id, itemKey: g.item_key, itemRunId: g.id, type: rows[0].type,
+        storageBucket: rows[0].storage_bucket, storagePath: rows[0].storage_path,
+      });
+    } catch (err) {
+      throw new ServiceUnavailableException(`v3_artifact_unreadable: no se pudo leer dynamic_content_md (${rows[0].id}) de ${g.item_key} para validar el idioma: ` + (err instanceof Error ? err.message : String(err)));
+    }
+    return v3LanguageErrors(text);
+  }
+
+  /**
+   * r58 (I1): contexto del validador v3 de un item (lo que exige el Manifest congelado), separado de prevalidateV3 sin
+   * cambios. Las lecturas pasan por métodos de la instancia (loadExamChapterMd, guidedPracticeAvoidFor, loadVideoFacts,
+   * manifestBlueprintSnapshot): el driver offline los da en memoria y valida con EXACTAMENTE este contexto.
+   */
+  private async v3ValidationContext(
+    g: { id?: string; job_id: string; manifest_id: number; item_key: string; type: string; chapter_id: string | null; module_id: string | null; owner_id: string },
+    mItem: any,
+    manifest: any,
+    o: { promptVersion: string | null; artifactType: string; languageCourse: boolean },
+  ): Promise<{ kind: 'ctx'; ctx: Parameters<typeof validateV3ItemArtifact>[0] } | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean }> {
+    const { promptVersion, artifactType, languageCourse } = o;
+    const ctx: Parameters<typeof validateV3ItemArtifact>[0] = {
+      type: g.type,
+      variant: mItem.variant ?? null,
+      itemKey: g.item_key,
+      chapterId: g.chapter_id ?? null,
+      chapterNumber: mItem.chapterNumber ?? null,
+      promptVersion,
+      artifactType,
+      languageCourse,
+    };
+    if (g.type === 'exam' || g.type === 'final_exam') {
+      // EV6 P2: el plan del banco sale de los capítulos del Manifest congelado.
+      ctx.examChapters = examChaptersFromManifest(manifest, g.type, g.module_id ?? mItem.moduleId ?? null);
+      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && ctx.examChapters.length === 0) {
+        throw new InternalServerErrorException(`v3_validation_context: el ${g.type} ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
+      }
+      if (artifactType === EXAM_BANK_ARTIFACT_TYPE && this.v3Reader) {
+        // Fix 1 (I1): la evidencia se verifica YA contra el dynamic_content_md vigente de cada capítulo
+        // (dependencias completadas del item): una evidencia falsa falla el item (reintentable, el
+        // ejecutor repara) en vez de trabar el empaque más tarde.
+        ctx.examChapterMd = await this.loadExamChapterMd(g, ctx.examChapters.map((c) => c.id));
+      }
+    }
+    if (g.type === 'activity') {
+      // EV5-C: tipo esperado del Manifest congelado del run (h5pType o, legacy, hash).
+      const rules = manifest?.features?.activityTypeRules;
+      ctx.expectedActivityType = resolveActivityType({ ...mItem, chapterId: g.chapter_id ?? mItem.chapterId ?? null }, { activityTypeRules: rules });
+      // EV6 H5P v2: el validador acepta branchingscenario solo con el marcador 2 del Manifest congelado.
+      if (rules !== undefined && rules !== null) ctx.activityTypeRules = rules;
+    }
+    if (g.type === 'experience' && mItem.design && typeof mItem.design.framework === 'string') {
+      // T2 (r57): requisitos del marco instruccional del Manifest congelado (solo capítulos de contenido; los de
+      // práctica tienen su propia forma). Mismo cálculo que el brief del claim (learningPlanExperienceRequirements).
+      const mc = (manifest.modules ?? []).flatMap((m: any) => m.chapters ?? []).find((c: any) => c.chapterId === g.chapter_id);
+      if (mc && mc.kind !== 'practice') {
+        const reqs = learningPlanExperienceRequirements(mItem.design);
+        if (reqs.length) ctx.experienceRequirements = reqs;
+      }
+    }
+    if (g.type === 'application_activity') {
+      // Fase 2: los minutos salen del item del Manifest congelado (nunca del ejecutor).
+      ctx.applicationMinutes = typeof mItem.applicationMinutes === 'number' ? mItem.applicationMinutes : null;
+      if (ctx.applicationMinutes === null) {
+        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin applicationMinutes en el Manifest; no se completa sin validar`);
+      }
+    }
+    if (g.type === 'guided_practice') {
+      // Loop 9 B: los minutos salen del item del Manifest congelado (nunca del ejecutor).
+      ctx.guidedPracticeMinutes = typeof mItem.guidedPracticeMinutes === 'number' ? mItem.guidedPracticeMinutes : null;
+      if (ctx.guidedPracticeMinutes === null) {
+        throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin guidedPracticeMinutes en el Manifest; no se completa sin validar`);
+      }
+      // Fix N1: el choque duro con los casos del módulo (práctica + AA) lo verifica el servidor, con el Blueprint del run.
+      const snap = await this.manifestBlueprintSnapshot(g.manifest_id);
+      ctx.guidedPracticeAvoid = await this.guidedPracticeAvoidFor(this.dataSource, g.job_id, g.manifest_id, manifest, snap, g.chapter_id);
+    }
+    if (g.type === 'module_intro') {
+      const mod = (manifest.modules ?? []).find((m: any) => m.moduleId === g.module_id);
+      ctx.moduleChapterIds = mod ? mod.chapters.map((c: any) => c.chapterId) : [];
+      if (ctx.moduleChapterIds.length === 0) {
+        throw new InternalServerErrorException(`v3_validation_context: el module_intro ${g.item_key} no tiene capítulos en el Manifest; no se completa sin validar`);
+      }
+    }
+    if (g.type === 'video_interactions') {
+      const ivAdvanced = manifest?.features?.ivAdvanced === 1;
+      // r61 Q-04 (review I-1): se valida contra el plan del claim (pin del item). Sin pin (claim anterior a r61) →
+      // el plan equidistante de siempre.
+      const anchored = (g as any).video_timeline_pinned === 'videogen_scenes';
+      const vf = await this.loadVideoFacts(this.dataSource, g.job_id, g.manifest_id, `video:${g.chapter_id}`, ivAdvanced, anchored);
+      if (vf.ok === false) {
+        // M6: reintentable — si el video se regenera, un claim nuevo trae el plan vigente.
+        return { kind: 'invalid', message: `${V3_PAYLOAD_INVALID}: ${vf.code}: ${vf.message}`, codes: [vf.code], retryable: true } as const;
+      }
+      ctx.video = {
+        videoItemKey: vf.video.videoItemKey,
+        durationSec: vf.video.durationSec,
+        // r61 Q-04: el servidor valida contra el MISMO plan anclado que recibió el ejecutor.
+        ...(vf.video.videoScenes ? { videoScenes: vf.video.videoScenes } : {}),
+      };
+      // EV6 IV avanzado: schemaVersion 2 (pausas validadas contra la duración MEDIDA del video).
+      if (ivAdvanced) ctx.videoInteractionsSchemaVersion = 2;
+    }
+    return { kind: 'ctx', ctx } as const;
+  }
+
+  /** Blueprint congelado (snapshot_json) del Manifest; null si no existe. */
+  private async manifestBlueprintSnapshot(manifestId: number): Promise<any> {
+    const [bp] = await this.dataSource.query(
+      `select b.snapshot_json from public.course_generation_manifests m
+         join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
+        where m.id = $1`,
+      [manifestId],
+    );
+    return bp ? (typeof bp.snapshot_json === 'string' ? JSON.parse(bp.snapshot_json) : bp.snapshot_json) : null;
+  }
+
+  private async prevalidateV3(
+    itemRunId: string,
+    executorId: string,
+    artifactIds: string[],
+    ownerId?: string,
+    promptVersion: string | null = null,
+  ): Promise<
+    | { kind: 'skip' }
+    | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean; answerBiasRejection?: true }
+    | {
+        kind: 'valid';
+        /** r58 (I4-1): señales de sesgo calculadas por el SERVIDOR (video_interactions); reemplazan las del ejecutor. */
+        answerBiasSignals?: { k: 'video_interactions'; ranks: Array<{ m: number; r: number }>; tf: boolean[] };
+        artifactType: string;
+        artifactId: string;
+        storageBucket: string;
+        storagePath: string;
+        contentSha256: string;
+        summary: Record<string, unknown>;
+      }
+  > {
+    if (!UUID_RE.test(String(itemRunId))) return { kind: 'skip' };
+    const [g] = await this.dataSource.query(
+      `select g.id, g.job_id, g.manifest_id, g.item_key, g.type, g.status, g.worker_id, g.chapter_id, g.module_id,
+              g.output_summary -> 'answerBiasRecheck' ->> 'rejections' as answer_bias_rejections,
+              g.output_summary ->> 'videoTimelinePinned' as video_timeline_pinned,
+              pj.owner_id, pj.course_id as job_course_id, pj.frontend_course_id, m.rules_version, m.manifest_json
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id = $2)`,
+      [itemRunId, ownerId ?? null],
+    );
+    if (!g || Number(g.rules_version) !== 3 || g.status !== 'running' || g.worker_id !== executorId) return { kind: 'skip' };
+    const manifest = typeof g.manifest_json === 'string' ? JSON.parse(g.manifest_json) : g.manifest_json;
+    const mItem = (manifest?.items ?? []).find((i: any) => i && i.key === g.item_key);
+    if (!mItem) {
+      // M5 (fail closed): un item v3 running sin su entrada del Manifest es integridad rota.
+      throw new InternalServerErrorException(`v3_validation_context: el item ${g.item_key} no está en su Manifest congelado; no se completa sin validar`);
+    }
+    const languageCourse = await this.isLanguageCourseRun(g.job_id);
+    // Language QA (piloto): el capítulo (Markdown) no tiene otra validación de contenido en el servidor, pero su idioma sí.
+    if (g.type === 'content' && !languageCourse && this.v3Reader) {
+      const lang = await this.contentLanguageErrors(g, artifactIds);
+      if (lang.length) {
+        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, lang), codes: ['LANGUAGE_NOT_NEUTRAL'], retryable: true };
+      }
+    }
+    const validatedTypes = v3ValidatedArtifactTypes(g.type, mItem.variant ?? null);
+    if (validatedTypes.length === 0) return { kind: 'skip' };
+    const artifactCourse = g.frontend_course_id ?? String(g.job_course_id);
+
+    // EV6 P2: exam/final_exam suben EXACTAMENTE uno de banco | GIFT; ambos → inválido (reintentable).
+    if (g.type === 'exam' || g.type === 'final_exam') {
+      const examTypes: any[] = await this.dataSource.query(
+        `select distinct type from public.artifacts
+          where id = any($1::uuid[]) and type = any($2::text[]) and owner_id = $3 and course_id = $4 and item_run_id is null`,
+        [artifactIds, [...EXAM_ARTIFACT_TYPES_V3], g.owner_id, artifactCourse],
+      );
+      if (examTypes.length > 1) {
+        const errors = [{ path: '$', code: 'EXAM_ARTIFACT_AMBIGUOUS', message: `se subieron ${examTypes.map((r) => r.type).sort().join(' y ')}; debe ser exactamente uno` }];
+        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, errors), codes: ['EXAM_ARTIFACT_AMBIGUOUS'], retryable: true };
+      }
+    }
+
+    const rows = await this.dataSource.query(
+      `select id, type, storage_bucket, storage_path from public.artifacts
+        where id = any($1::uuid[]) and type = any($2::text[]) and owner_id = $3 and course_id = $4 and item_run_id is null`,
+      [artifactIds, validatedTypes, g.owner_id, artifactCourse],
+    );
+    if (rows.length !== 1) return { kind: 'skip' };
+    const art = rows[0];
+    const artifactType: string = art.type;
+    if (!this.v3Reader) {
+      throw new InternalServerErrorException(
+        `v3_validator_unavailable: el item ${g.item_key} (${g.type}, rulesVersion 3) exige validar ${artifactType} en el servidor ` +
+          'y no hay lector de artifacts configurado; no se completa sin validar',
+      );
+    }
+
+    const built = await this.v3ValidationContext(g, mItem, manifest, { promptVersion, artifactType, languageCourse });
+    if (built.kind === 'invalid') return built;
+    const ctx = built.ctx;
+
+    let text: string;
+    try {
+      text = await this.v3Reader.readText({
+        id: art.id,
+        ownerId: g.owner_id,
+        itemKey: g.item_key,
+        itemRunId: g.id,
+        type: art.type,
+        storageBucket: art.storage_bucket,
+        storagePath: art.storage_path,
+      });
+    } catch (err) {
+      // No es un problema del contenido: el item sigue running y el ejecutor puede reintentar completar.
+      throw new ServiceUnavailableException(
+        `v3_artifact_unreadable: no se pudo leer ${artifactType} (${art.id}) del item ${g.item_key} para validarlo: ` +
+          (err instanceof Error ? err.message : String(err)),
+      );
+    }
+    const r = validateV3ItemArtifact(ctx, text);
+    if (!r.ok) {
+      return {
+        kind: 'invalid',
+        message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, r.errors),
+        codes: [...new Set(r.errors.map((e) => e.code))].sort(),
+        retryable: true,
+      };
+    }
+    // r58 (I4-1): re-chequeo del sesgo «la correcta es la más larga» de las MC de video del CURSO con señales persistidas
+    // (los demás videos completados del run) y las del item calculadas acá. Un rechazo reintentable; después, aceptación
+    // blanda registrada (mismo camino de reparación que el ejecutor). Sin pool → solo se registran las señales.
+    let answerBiasSignals: { k: 'video_interactions'; ranks: Array<{ m: number; r: number }>; tf: boolean[] } | undefined;
+    const extraSummary: Record<string, unknown> = {};
+    if (g.type === 'video_interactions') {
+      let doc: unknown = null;
+      try { doc = JSON.parse(text); } catch { doc = null; }
+      const pool = await this.answerBiasPoolFor(this.dataSource, g.job_id, g.manifest_id, g.item_key);
+      const prior = Number.parseInt(String(g.answer_bias_rejections ?? '0'), 10) || 0;
+      const v = videoMcCourseRecheck(doc, pool, prior);
+      if (v.action === 'reject') {
+        const errors = [{ path: '$.checkpoints', code: VIDEO_MC_COURSE_BIAS_CODE, message: v.message as string }];
+        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, errors), codes: [VIDEO_MC_COURSE_BIAS_CODE], retryable: true, answerBiasRejection: true };
+      }
+      answerBiasSignals = v.signals;
+      if (v.action === 'soft_accept') extraSummary.answerBiasCourse = { ...v.course, accepted: 'soft', rejections: prior, fixPaths: v.fixPaths };
+    }
+    return {
+      ...(answerBiasSignals ? { answerBiasSignals } : {}),
+      kind: 'valid',
+      artifactType,
+      artifactId: art.id,
+      storageBucket: art.storage_bucket,
+      storagePath: art.storage_path,
+      // M7: huella del contenido validado; el empaque (R12) verifica que el objeto descargado coincida.
+      contentSha256: createHash('sha256').update(text, 'utf8').digest('hex'),
+      summary: { ...((r.summary ?? {}) as Record<string, unknown>), ...extraSummary },
+    };
+  }
+
+  /**
+   * EV6 P2 fix 1 (I1): Markdown vigente de los capítulos de un examen (dynamic_content_md de la
+   * generación vigente completada de `content:<chapterId>` en este run). Falta alguno → 409
+   * (el examen depende de todos sus content; nunca se valida contra un capítulo ausente).
+   */
+  private async loadExamChapterMd(
+    g: { job_id: string; manifest_id: number; item_key: string; owner_id: string },
+    chapterIds: string[],
+  ): Promise<Map<string, string>> {
+    const keys = chapterIds.map((id) => `content:${id}`);
+    const rows: any[] = await this.dataSource.query(
+      `select d.item_key, d.id as item_run_id, a.id, a.type, a.storage_bucket, a.storage_path
+         from public.generation_item_runs d
+         join public.artifacts a on a.item_run_id = d.id and a.type = 'dynamic_content_md' and a.status is distinct from 'disabled'
+        where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[])
+          and d.status = 'completed' and ${latestGenerationPredicate('d')}
+        order by d.item_key, a.created_at desc, a.id`,
+      [g.job_id, g.manifest_id, keys],
+    );
+    const out = new Map<string, string>();
+    for (const r of rows) {
+      const chapterId = String(r.item_key).slice('content:'.length);
+      if (out.has(chapterId)) continue;
+      try {
+        out.set(
+          chapterId,
+          await (this.v3Reader as V3ArtifactTextReader).readText({
+            id: r.id, ownerId: g.owner_id, itemKey: r.item_key, itemRunId: r.item_run_id, type: r.type,
+            storageBucket: r.storage_bucket, storagePath: r.storage_path,
+          }),
+        );
+      } catch (err) {
+        throw new ServiceUnavailableException(
+          `v3_artifact_unreadable: no se pudo leer dynamic_content_md de ${r.item_key} para validar la evidencia de ${g.item_key}: ` +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    }
+    const missing = chapterIds.filter((id) => !out.has(id));
+    if (missing.length) {
+      throw new ConflictException({
+        message: `exam_content_missing: ${g.item_key} no se valida sin el dynamic_content_md vigente de ${missing.map((id) => `content:${id}`).join(', ')}`,
+        code: 'exam_content_missing',
+      });
+    }
+    return out;
+  }
+
+  /** Datos del video completado (vigente) del capítulo: output_summary + metadata de su dynamic_video. */
+  private async loadVideoFacts(
+    q: { query: (sql: string, params?: any[]) => Promise<any[]> },
+    jobId: string,
+    manifestId: number,
+    videoItemKey: string,
+    ivAdvanced = false,
+    sceneAnchors = true,
+  ): Promise<ReturnType<typeof videoClaimFacts>> {
+    const [v] = await q.query(
+      `select d.id as video_item_run_id, d.output_summary, a.metadata
+         from public.generation_item_runs d
+         left join public.artifacts a on a.item_run_id = d.id and a.type = 'dynamic_video'
+        where d.job_id = $1 and d.manifest_id = $2 and d.item_key = $3 and d.status = 'completed'
+          and ${latestGenerationPredicate('d')}
+        order by a.created_at desc nulls last
+        limit 1`,
+      [jobId, manifestId, videoItemKey],
+    );
+    if (!v) return { ok: false, code: 'VIDEO_NOT_COMPLETED', message: `el video ${videoItemKey} no está completado` };
+    const facts = videoClaimFacts({
+      videoItemKey, outputSummary: v.output_summary, artifactMetadata: v.metadata,
+      ...(ivAdvanced ? { ivAdvanced: true } : {}),
+      ...(sceneAnchors ? {} : { sceneAnchors: false }),
+    });
+    if (facts.ok) (facts as any).videoItemRunId = v.video_item_run_id;
+    return facts;
+  }
+
+  /**
+   * r58 (I4-3): archivos de trabajo del capítulo (título, archivo, consigna) del perfil de evaluación del run.
+   * Review r1 (M-7): el perfil CONGELADO al crear el run — la última versión (append-only) con created_at ≤ la creación del
+   * run —, nunca uno editado después. El perfil de evaluación no se congela en el Blueprint ni en el Manifest (el
+   * pedagógico sí, en el lock); su punto de congelamiento es startRun, que lo valida (assertAssessmentProfileResolvableForRun).
+   * Un archivo agregado o quitado después no cambia lo que la actividad nombra; si el paquete (perfil vigente) ya no lo
+   * trae, el informe de calidad lo marca (PRACTICE_FILE_REFERENCE_UNKNOWN, MAJOR).
+   */
+  private async practiceFilesForChapter(q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, chapterId: string | null): Promise<Array<{ title: string; filename: string; instructions: string; relation: string }>> {
+    if (!chapterId) return [];
+    const [p] = await q.query(
+      `select p.data from public.course_profiles p join public.production_jobs j on j.course_id = p.course_id
+        where j.id = $1 and p.kind = 'assessment' and p.created_at <= j.created_at order by p.version desc limit 1`,
+      [jobId],
+    );
+    return practiceFilesOfProfile(p ? (typeof p.data === 'string' ? JSON.parse(p.data) : p.data) : null, chapterId);
+  }
+
+  /** T6 (r57): acumulado del curso para la prueba de sesgo de respuesta (señales de los items completados del run). */
+  private async answerBiasPoolFor(q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, manifestId: number, itemKey: string): Promise<AnswerBiasPool | null> {
+    const rows = await q.query(
+      `select d.item_key, d.output_summary -> 'answerBias' as answer_bias from public.generation_item_runs d
+        where d.job_id = $1 and d.manifest_id = $2 and d.type = any($3::text[]) and d.item_key <> $4 and d.status = 'completed'
+          and ${latestGenerationPredicate('d')}
+        order by d.item_key`,
+      [jobId, manifestId, [...ANSWER_BIAS_POOL_ITEM_TYPES], itemKey],
+    );
+    const parse = (v: unknown) => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return null; } };
+    return answerBiasPoolFrom(rows.map((r: any) => ({ itemKey: String(r.item_key), summary: { answerBias: parse(r.answer_bias) } })), itemKey);
+  }
+
+  /** Fix I5/N1: casos del módulo que los ejercicios guiados no repiten (los mismos en el claim y al validar). */
+  private async guidedPracticeAvoidFor(
+    q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, manifestId: number, manifest: any, snapshot: unknown, chapterId: string,
+  ): Promise<GuidedPracticeAvoid | null> {
+    const mm = (manifest?.modules || []).find((m: any) => (m.chapters || []).some((c: any) => c.chapterId === chapterId));
+    const aaKeys: string[] = mm ? mm.chapters.filter((c: any) => c.applicationMinutes !== undefined).map((c: any) => `application_activity:${c.chapterId}`) : [];
+    const aaRows = aaKeys.length
+      ? await q.query(
+        `select d.output_summary from public.generation_item_runs d
+          where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[]) and d.status = 'completed' and ${latestGenerationPredicate('d')}
+          order by d.item_key`,
+        [jobId, manifestId, aaKeys],
+      )
+      : [];
+    // Loop 10 C1-b: ejercicios guiados YA completados de otros capítulos del MISMO run (generación vigente).
+    const gpRows = await q.query(
+      `select d.chapter_id::text as chapter_id, d.output_summary from public.generation_item_runs d
+        where d.job_id = $1 and d.manifest_id = $2 and d.type = 'guided_practice' and d.item_key <> $3 and d.status = 'completed'
+          and ${latestGenerationPredicate('d')}
+        order by d.item_key`,
+      [jobId, manifestId, `guided_practice:${chapterId}`],
+    );
+    const parse = (v: unknown) => { try { return typeof v === 'string' ? JSON.parse(v) : v; } catch { return null; } };
+    return guidedPracticeAvoidOf(manifest, snapshot, chapterId,
+      aaRows.map((r: any) => parse(r.output_summary)),
+      gpRows.map((r: any) => ({ chapterId: r.chapter_id ?? null, summary: parse(r.output_summary) })));
+  }
+
+  /** Bloque `claimPayload` del ClaimedItem (solo rulesVersion 3 y tipos validados por el servidor). */
+  private async buildClaimV3(qr: QueryRunner, row: any, mItem: any, manifest: GenerationManifestV1, snapshot?: AnyBlueprintSnapshot, readOnly = false, claimOpts: { videoScenes: boolean } = { videoScenes: true }): Promise<ClaimPayloadV3 | undefined> {
+    if (manifest.rulesVersion !== 3) return undefined;
+    const validatedArtifactType = v3ValidatedArtifactType(row.type, mItem.variant ?? null);
+    const out: ClaimPayloadV3 = { validatedArtifactType };
+    switch (row.type) {
+      case 'course_intro':
+      case 'exam':
+      case 'final_exam':
+      case 'experience':
+      case 'module_intro':
+      case 'video_interactions':
+      case 'activity':
+      case 'application_activity':
+      case 'guided_practice':
+        break;
+      default:
+        return undefined;
+    }
+    if (row.type === 'experience') {
+      out.chapterId = row.chapter_id;
+      out.experienceFeatures = { eduFields: true };
+    }
+    if (row.type === 'application_activity') {
+      // Fase 2: minutos (nivel del diseño), tipo de capítulo y contexto congelado (estudiante + resultados).
+      const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
+      const mc = mm?.chapters.find((c) => c.chapterId === row.chapter_id);
+      if (typeof mItem.applicationMinutes !== 'number') throw new ClaimPayloadUnavailable('MISSING_APPLICATION_MINUTES', `${row.item_key} sin applicationMinutes en el Manifest`);
+      out.chapterId = row.chapter_id;
+      out.application = {
+        minutes: mItem.applicationMinutes,
+        chapterKind: mc?.kind === 'practice' ? 'practice' : 'content',
+        schemaVersion: APPLICATION_ACTIVITY_SCHEMA_VERSION,
+        // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
+        context: (snapshot as any)?.course?.applicationContext ?? null,
+        // O2b: anuncia que el fail acepta `applicationDraftArtifactId` (borrador de la actividad entre intentos).
+        draftArtifactType: APPLICATION_DRAFT_ARTIFACT_TYPE,
+      };
+      // r58 (I4-3): archivos de trabajo del capítulo para que la actividad los nombre tal cual (sin otra llamada a la IA).
+      // Review r1 (M-7): del perfil congelado al crear el run (no el vivo). Sin archivos → el claim queda como antes.
+      if (row.job_id) {
+        const files = await this.practiceFilesForChapter(qr, row.job_id, row.chapter_id);
+        if (files.length) out.application.practiceFiles = files;
+      }
+    }
+    if (row.type === 'guided_practice') {
+      // Loop 9 B: minutos (nivel del diseño) y el plan de ejercicios de Cursia (ids y minutos que el ejecutor copia).
+      if (typeof mItem.guidedPracticeMinutes !== 'number') throw new ClaimPayloadUnavailable('MISSING_GUIDED_PRACTICE_MINUTES', `${row.item_key} sin guidedPracticeMinutes en el Manifest`);
+      out.chapterId = row.chapter_id;
+      out.guidedPractice = {
+        minutes: mItem.guidedPracticeMinutes,
+        schemaVersion: GUIDED_PRACTICE_SCHEMA_VERSION,
+        exercises: guidedPracticeExercisePlan(mItem.guidedPracticeMinutes),
+        // El Blueprint congelado del run (el claim ya verificó su sha); nunca el perfil vivo.
+        context: (snapshot as any)?.course?.applicationContext ?? null,
+      };
+      // Fix I5/N1: no repetir el caso de la práctica del módulo ni de sus Actividades de Aplicación (el item depende de
+      // ellas: al reclamarse ya están completadas).
+      const avoid = await this.guidedPracticeAvoidFor(qr, row.job_id, row.manifest_id, manifest, snapshot, row.chapter_id);
+      if (avoid) out.guidedPractice.avoid = avoid;
+    }
+    if (row.type === 'experience' || row.type === 'activity' || row.type === 'application_activity') {
+      const mm = manifest.modules.find((m) => m.chapters.some((c) => c.chapterId === row.chapter_id));
+      const mc = mm?.chapters.find((c) => c.chapterId === row.chapter_id);
+      if (mm && mc?.kind === 'practice') {
+        out.practice = { sourceChapterIds: mm.chapters.filter((c) => c.kind !== 'practice').map((c) => c.chapterId) };
+      }
+    }
+    if (row.type === 'final_exam') {
+      out.finalExam = { minQuestions: FINAL_EXAM_QUESTION_RANGE.min, maxQuestions: FINAL_EXAM_QUESTION_RANGE.max };
+    }
+    if (row.type === 'exam' || row.type === 'final_exam') {
+      // EV6 P2: plan del banco (el mismo que valida completeItem). Sin capítulos → sin bloque (el GIFT sigue aceptado).
+      const facts = examBankClaimFacts(manifest as any, row.type, row.module_id ?? mItem.moduleId ?? null);
+      // BANKOPT (1e): anuncia que el fail acepta `examBankDraftArtifactId` (borrador entre intentos).
+      if (facts) out.examBank = { ...facts, draftArtifactType: EXAM_BANK_DRAFT_ARTIFACT_TYPE };
+    }
+    if (row.type === 'module_intro') {
+      const mod = manifest.modules.find((m) => m.moduleId === row.module_id);
+      out.moduleChapterIds = mod ? mod.chapters.map((c) => c.chapterId) : [];
+    }
+    if (row.type === 'activity' && mItem.variant === 'h5p') {
+      const r = resolveActivityTypeWithSource({ ...mItem, chapterId: row.chapter_id }, { activityTypeRules: manifest.features?.activityTypeRules });
+      if (r) {
+        out.activityType = r.type;
+        out.activityTypeSource = r.source;
+      }
+      out.activityFeatures = { dragTextDistractors: true };
+    }
+    // (Solo filas reales de un run: job_id + manifest_id; los harnesses que arman un claim sin run no consultan.)
+    if ((row.type === 'video_interactions' || (row.type === 'activity' && mItem.variant === 'h5p')) && row.job_id && row.manifest_id != null) {
+      const pool = await this.answerBiasPoolFor(qr, row.job_id, row.manifest_id, row.item_key);
+      if (pool) out.answerBiasPool = pool;
+    }
+    if (row.type === 'video_interactions') {
+      const ivAdvanced = manifest.features?.ivAdvanced === 1;
+      const vf = await this.loadVideoFacts(qr, row.job_id, row.manifest_id, `video:${row.chapter_id}`, ivAdvanced, claimOpts.videoScenes);
+      if (vf.ok === false) throw new ClaimPayloadUnavailable(vf.code, vf.message);
+      out.video = vf.video;
+      // r61 Q-04 (review I-1): el plan con el que ESTE executor escribe las preguntas queda fijado en el item;
+      // complete y el empaquetado lo respetan (un ejecutor sin `video-scenes-1` → 'even_spacing', sin fallar).
+      if (!readOnly) {
+        const pinned = vf.video.timelineSource === 'videogen_scenes' ? 'videogen_scenes' : 'even_spacing';
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('videoTimelinePinned', $2::text)
+            where id = $1`,
+          [row.id, pinned],
+        );
+      }
+      // EV6 IV avanzado: el ejecutor escribe video_interactions schemaVersion 2 (reflections en
+      // los índices de video.reflectionPlan). Ausente = schemaVersion 1 (Manifests anteriores).
+      if (ivAdvanced) out.videoInteractionsSchemaVersion = 2;
+      // EV6 T5 fix round 3 (I-4): procedencia explícita — estas preguntas se construyen con ESTA
+      // generación del video (cualquier camino: generación inicial, «Regenerar», upgrade).
+      const src = (vf as any).videoItemRunId;
+      // Diagnóstico (claimPreview, review I1): solo lectura → nunca registra la procedencia (no es un claim real).
+      if (!readOnly && typeof src === 'string' && src) {
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('sourceVideoItemRunId', $2::text)
+            where id = $1`,
+          [row.id, src],
+        );
+      }
+    }
+    return out;
+  }
+
+  // ── sweep ────────────────────────────────────────────────────────────────
+
+  /**
+   * `running` con lease_until < now() → failItem(retryable) con
+   * 'lease_expired' (el intento ya se contó en el claim; la idempotency_key
+   * no cambia; R16: hasta LEASE_EXPIRY_FREE_GRANTS leases vencidos por item
+   * se compensan con un intento extra, ver sweepRunExpiredLeases). Con runId: ese run (esperando su lock). Sin runId: todos los
+   * runs con leases vencidos, una transacción por run, saltando runs cuyo
+   * lock está tomado (los barre el próximo claim/lectura). Devuelve cuántos
+   * items transicionó.
+   */
+  async sweepExpiredLeases(runId?: string): Promise<number> {
+    let jobIds: string[];
+    if (runId) {
+      if (!UUID_RE.test(runId)) throw new BadRequestException('runId inválido');
+      jobIds = [runId];
+    } else {
+      const rows = await this.dataSource.query(
+        `select distinct job_id from public.generation_item_runs
+          where status = 'running' and lease_until < now()
+          order by job_id`,
+      );
+      jobIds = rows.map((r: any) => r.job_id);
+    }
+
+    let total = 0;
+    for (const jobId of jobIds) {
+      let cancelledJob: any = null;
+      total += await this.runs.tx(async (qr) => {
+        const job = await this.lockRun(qr, jobId, undefined, runId ? 'update' : 'update-skip');
+        if (!job) return 0;
+        if (isCancelledLike(job)) {
+          cancelledJob = job;
+          return 0;
+        }
+        if (!isActiveRun(job)) return 0;
+        const n = await sweepRunExpiredLeases(qr, job.id);
+        if (n > 0) await recomputeRunStatus(qr, job.id);
+        return n;
+      });
+      if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
+    }
+    return total;
+  }
+
+  // ── internals ────────────────────────────────────────────────────────────
+
+  /**
+   * F78-BE2: el Context Package de un content REGENERADO (generation > 1) se
+   * reconstruye en el navegador desde los inputs congelados del run
+   * (outline del Blueprint + contexto + course_plan vigente, ver
+   * dynBuildContextPackage en 46-dynamic-context-package.js): con el MISMO
+   * course_plan (misma storage_path) tiene que dar el MISMO
+   * contextPackageSha256 que la generación anterior. Si difiere, el ejecutor
+   * usó otros inputs → 409 `context_package_mismatch` y rollback (el item
+   * sigue running; nunca se completa con un paquete divergente en silencio).
+   * Si el plan cambió, o falta el dato en alguna de las dos generaciones, no
+   * se compara (no hay base para afirmar que deban coincidir).
+   */
+  private async assertRegeneratedContextPackage(qr: QueryRunner, item: any, summary: Record<string, any>): Promise<void> {
+    const fromId = item.output_summary?.regeneration?.fromItemRunId;
+    if (!fromId) return;
+    const [prev] = await qr.query(`select output_summary from public.generation_item_runs where id = $1`, [fromId]);
+    const prevSha = prev?.output_summary?.contextPackageSha256;
+    const newSha = summary?.contextPackageSha256;
+    const prevPlan = prev?.output_summary?.coursePlanArtifactId;
+    const newPlan = summary?.coursePlanArtifactId;
+    if (!prevSha || !newSha || !prevPlan || !newPlan) return;
+    const plans: Array<{ id: string; storage_bucket: string; storage_path: string }> = await qr.query(
+      `select id, storage_bucket, storage_path from public.artifacts where id = any($1::uuid[])`,
+      [[...new Set([String(prevPlan), String(newPlan)])]],
+    );
+    const pathOf = (id: string) => {
+      const r = plans.find((p) => p.id === id);
+      return r ? `${r.storage_bucket}/${r.storage_path}` : null;
+    };
+    const a = pathOf(String(prevPlan));
+    const b = pathOf(String(newPlan));
+    if (!a || !b || a !== b) return;
+    if (prevSha !== newSha) {
+      throw new ConflictException({
+        message:
+          `context_package_mismatch: el content regenerado ${item.item_key} (generation ${item.generation}) trae un Context Package ` +
+          `(${String(newSha).slice(0, 12)}…) distinto al de la generación ${prev ? 'anterior' : '?'} (${String(prevSha).slice(0, 12)}…) ` +
+          'con el mismo course_plan: el paquete se debe reconstruir desde los inputs congelados del run',
+        code: 'context_package_mismatch',
+      });
+    }
+  }
+
+  /**
+   * Operación sobre un item reclamado con los guards de R14, en una
+   * transacción: fila del run bloqueada primero ('update' si la operación
+   * cambia el run, 'share' si no), después el item FOR UPDATE. Run cancelado
+   * → reconciliado (R9) y {ok:false,'run_cancelled'}.
+   */
+  private async guardedItemOp(
+    itemRunId: string,
+    executorId: string,
+    ownerId: string | undefined,
+    runLock: 'update' | 'share',
+    fn: (qr: QueryRunner, job: any, item: any) => Promise<void>,
+    /**
+     * M5: si true y el run está cancelado, no rechaza — sigue adelante con
+     * `fn` (usado únicamente por el merge external-only de
+     * recordItemExternalDetailed). El run sigue reconciliándose después
+     * (items no terminales → cancelled), pero el patch ya quedó persistido.
+     */
+    allowCancelled = false,
+  ): Promise<ItemOpResult> {
+    if (!UUID_RE.test(String(itemRunId))) return { ok: false, reason: 'not_found' };
+    const [head] = await this.dataSource.query(
+      `select g.job_id from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id = $2)`,
+      [itemRunId, ownerId ?? null],
+    );
+    if (!head) return { ok: false, reason: 'not_found' };
+
+    let cancelledJob: any = null;
+    let result: ItemOpResult;
+    try {
+      result = await this.runs.tx(async (qr) => {
+        const job = await this.lockRun(qr, head.job_id, ownerId, runLock);
+        if (!job) throw new GuardRejection('not_found');
+        if (isCancelledLike(job)) {
+          cancelledJob = job;
+          if (!allowCancelled) throw new GuardRejection('run_cancelled');
+        } else if (!isActiveRun(job)) {
+          throw new GuardRejection('run_not_active');
+        }
+        const [item] = await qr.query(`select * from public.generation_item_runs where id = $1 for update`, [itemRunId]);
+        if (!item) throw new GuardRejection('not_found');
+        if (item.status !== 'running') throw new GuardRejection('not_running');
+        if (item.worker_id !== executorId) throw new GuardRejection('lease_lost');
+        await fn(qr, job, item);
+        // REL lease: complete / fail del titular renuevan el lease de ejecución del run (misma transacción,
+        // fila del run bloqueada FOR UPDATE; si el run quedó terminal, el trigger de la migración lo suelta).
+        if (runLock === 'update' && ownerId !== undefined && ownerId !== null && (await execLeaseSchemaReady(qr))) {
+          await refreshRunExecLease(qr, job.id, executorId, DEFAULT_LEASE_SECONDS, true);
+        }
+        return { ok: true };
+      });
+    } catch (err) {
+      if (!(err instanceof GuardRejection)) throw err;
+      result = { ok: false, reason: err.reason };
+    }
+    if (cancelledJob) await this.runs.reconcileCancellation(cancelledJob);
+    return result;
+  }
+
+  /**
+   * R16: un item pending/retrying con una clave de depends_on sin fila
+   * (integridad rota: la siembra copia el Manifest completo) nunca es
+   * reclamable; se registra con logger.error en cada claim vacío para que no
+   * quede atascado en silencio. Solo lectura, sin locks.
+   */
+  private async reportMissingDependencies(runId: string | null, ownerId?: string): Promise<void> {
+    const rows = await this.dataSource.query(
+      `select g.job_id, g.item_key,
+              array(select dk.key from unnest(g.depends_on) as dk(key)
+                     where not exists (select 1 from public.generation_item_runs d2
+                                        where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
+                                          and d2.item_key = dk.key)) as missing
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+        where g.status in ('pending', 'retrying')
+          and pj.execution_mode = 'dynamic_generation'
+          and pj.worker_status = any($1::text[])
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and ($2::uuid is null or g.job_id = $2)
+          and ($3::text is null or pj.owner_id = $3)
+          and exists (select 1 from unnest(g.depends_on) as dk(key)
+                       where not exists (select 1 from public.generation_item_runs d2
+                                          where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
+                                            and d2.item_key = dk.key))
+        limit 50`,
+      [DISPATCHABLE_RUN_WORKER_STATUSES, runId, ownerId ?? null],
+    );
+    for (const r of rows) {
+      this.logger.error(
+        `Item ${r.item_key} (run ${r.job_id}) NO reclamable: dependencia(s) sin fila en generation_item_runs ` +
+          `(${(r.missing ?? []).join(', ')}) — integridad rota, requiere intervención`,
+      );
+    }
+  }
+
+  private async lockRun(
+    qr: QueryRunner,
+    runId: string,
+    ownerId: string | undefined,
+    mode: 'update' | 'update-skip' | 'share',
+  ): Promise<any | null> {
+    const lock = mode === 'share' ? 'for share' : mode === 'update-skip' ? 'for update skip locked' : 'for update';
+    const [job] = await qr.query(
+      `select * from public.production_jobs
+        where id = $1 and execution_mode = 'dynamic_generation' and ($2::text is null or owner_id = $2)
+        ${lock}`,
+      [runId, ownerId ?? null],
+    );
+    return job ?? null;
+  }
+
+  /** Motivo de un heartbeat rechazado (solo diagnóstico; sin locks). */
+  private async diagnose(itemRunId: string, executorId: string, ownerId?: string): Promise<string> {
+    const [r] = await this.dataSource.query(
+      `select g.status, g.worker_id, pj.status as job_status, pj.worker_status as job_worker_status
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id = $2)`,
+      [itemRunId, ownerId ?? null],
+    );
+    if (!r) return 'not_found';
+    if (isCancelledLike({ status: r.job_status, worker_status: r.job_worker_status })) return 'run_cancelled';
+    if (!isActiveRun({ status: r.job_status, worker_status: r.job_worker_status })) return 'run_not_active';
+    if (r.status !== 'running') return 'not_running';
+    if (r.worker_id !== executorId) return 'lease_lost';
+    return 'rejected';
+  }
+
+  private artifactCourseId(job: any): string {
+    return job.frontend_course_id ?? String(job.course_id);
+  }
+
+  private checkExecutorId(executorId: string): string {
+    const v = typeof executorId === 'string' ? executorId.trim() : '';
+    if (!v || v.length > MAX_EXECUTOR_ID_LENGTH) {
+      throw new BadRequestException(`executorId inválido (1..${MAX_EXECUTOR_ID_LENGTH} caracteres)`);
+    }
+    return v;
+  }
+
+  private checkTypes(types: ItemType[]): ItemType[] {
+    // Tipos de v1 y v2 se aceptan siempre: un tipo que no existe en el
+    // Manifest del run simplemente no matchea ningún item.
+    if (!Array.isArray(types) || types.length === 0 || types.some((t) => !ALL_ITEM_TYPES.includes(t))) {
+      throw new BadRequestException(`types debe ser un subconjunto no vacío de ${ALL_ITEM_TYPES.join(', ')}`);
+    }
+    return [...new Set(types)];
+  }
+
+  private clampLease(leaseSeconds: number): number {
+    const n = Number.isFinite(Number(leaseSeconds)) ? Math.floor(Number(leaseSeconds)) : DEFAULT_LEASE_SECONDS;
+    return Math.min(MAX_LEASE_SECONDS, Math.max(MIN_LEASE_SECONDS, n));
+  }
+
+  /**
+   * Payload del item reclamado, armado SOLO desde el backend (condición 1):
+   * contexto congelado + Manifest + snapshot del Blueprint verificados +
+   * artifacts de las dependencias. Cualquier inconsistencia → 500 (y el
+   * claim se deshace porque corre dentro de su transacción).
+   */
+  /**
+   * Diagnóstico (SUPER_ADMIN, 2026-10-14): el payload EXACTO que recibiría un worker al reclamar `itemKey` (generación
+   * vigente) — mismo buildClaimedItem — en una transacción READ ONLY (nunca toca el item ni el run). Sirve para
+   * reproducir localmente, a USD 0, una parte con sus puntos de guardado (los prompts y sus hashes coinciden).
+   * Difiere de un claim real solo en `attempt` (el real es attempt_count+1) y en la lease; ninguno entra a los prompts.
+   * `dependencyArtifacts` lista las dependencias COMPLETAS (igual que el claim real). Sin escrituras (readOnly).
+   */
+  async claimPreview(runId: string, itemKey: string): Promise<ClaimedItem> {
+    if (!UUID_RE.test(String(runId))) throw new BadRequestException('runId inválido');
+    const qr = this.dataSource.createQueryRunner();
+    await qr.connect();
+    try {
+      await qr.startTransaction();
+      await qr.query('set transaction read only');
+      const [job] = await qr.query(`select * from public.production_jobs where id = $1 and execution_mode = 'dynamic_generation'`, [runId]);
+      if (!job) throw new NotFoundException(`Run ${runId} no encontrado`);
+      const [row] = await qr.query(
+        `select * from public.generation_item_runs g where g.job_id = $1 and g.item_key = $2 order by g.generation desc limit 1`,
+        [runId, itemKey],
+      );
+      if (!row) throw new NotFoundException(`Parte ${itemKey} no encontrada en el run ${runId}`);
+      return await this.buildClaimedItem(qr, job, row, true);
+    } finally {
+      if (qr.isTransactionActive) await qr.rollbackTransaction().catch(() => undefined);
+      await qr.release().catch(() => undefined);
+    }
+  }
+
+  private async buildClaimedItem(qr: QueryRunner, job: any, row: any, readOnly = false, claimOpts: { videoScenes: boolean } = { videoScenes: true }): Promise<ClaimedItem> {
+    const where = `Item ${row.item_key} (run ${job.id})`;
+    const fail = (msg: string) => new InternalServerErrorException(`${where}: ${msg} (integridad rota)`);
+
+    // Contexto congelado (condición 2).
+    const [ctx] = await qr.query(
+      `select context, context_hash from public.generation_run_contexts where job_id = $1`,
+      [job.id],
+    );
+    if (!ctx) throw fail('el run no tiene contexto congelado');
+    if (canonicalContextHash(ctx.context) !== ctx.context_hash) throw fail('el contexto no coincide con su context_hash');
+    const payloadHash = job.input_payload?.contextHash;
+    if (payloadHash && payloadHash !== ctx.context_hash) throw fail('input_payload.contextHash ≠ context_hash');
+
+    // Manifest (hash verificado).
+    const [mrow] = await qr.query(`select * from public.course_generation_manifests where id = $1`, [row.manifest_id]);
+    if (!mrow) throw fail('el Manifest no existe');
+    if (mrow.course_id !== row.course_id || mrow.blueprint_id !== row.blueprint_id) {
+      throw fail('el Manifest no corresponde al curso/Blueprint del item');
+    }
+    let manifest: GenerationManifestV1;
+    try {
+      const stored = typeof mrow.manifest_json === 'string' ? JSON.parse(mrow.manifest_json) : mrow.manifest_json;
+      manifest = JSON.parse(canonicalManifestJson(stored));
+    } catch (err) {
+      throw fail(`manifest_json ilegible (${err instanceof Error ? err.message : String(err)})`);
+    }
+    if (manifestSha256(manifest) !== mrow.manifest_sha256) throw fail('sha256 del Manifest no coincide');
+
+    // Blueprint por (blueprint_id, course_id) + recanonicalización (R2).
+    const [bp] = await qr.query(
+      `select id, course_id, blueprint_number, snapshot_json, snapshot_sha256
+         from public.course_blueprints where id = $1 and course_id = $2`,
+      [row.blueprint_id, row.course_id],
+    );
+    if (!bp) throw fail('el Blueprint no existe');
+    // V2.1 (R4): Blueprint schemaVersion 2 (runs v3) con su propio builder/sha.
+    const snapshot: AnyBlueprintSnapshot = this.recanonicalizeAnySnapshot(bp.snapshot_json, fail);
+    const bpSha = snapshot.schemaVersion === 2 ? snapshotSha256V2(snapshot) : snapshotSha256(snapshot);
+    if (bpSha !== bp.snapshot_sha256) throw fail('sha256 del snapshot del Blueprint no coincide');
+    if (mrow.blueprint_sha256 !== bp.snapshot_sha256) throw fail('blueprint_sha256 del Manifest ≠ snapshot del Blueprint');
+    const source = {
+      courseId: bp.course_id,
+      blueprintId: bp.id,
+      blueprintNumber: bp.blueprint_number,
+      blueprintSha256: bp.snapshot_sha256,
+    };
+    return assembleClaimedItem({
+      job, row, ctx, manifest, snapshot, source, blueprintNumber: bp.blueprint_number, artifactCourseId: this.artifactCourseId(job), fail,
+      loadDependencyArtifacts: (deps) => qr.query(
+        `select d.item_key, a.id, a.type, a.storage_path
+           from public.generation_item_runs d
+           join public.artifacts a on a.item_run_id = d.id
+          where d.job_id = $1 and d.manifest_id = $2 and d.item_key = any($3::text[])
+            and d.status = 'completed' and ${latestGenerationPredicate('d')}
+          order by array_position($3::text[], d.item_key), a.created_at, a.id`,
+        // F78-BE2: artifacts de la generación VIGENTE de cada dependencia
+        // (la que el predicado de claim exigió completed).
+        [row.job_id, row.manifest_id, deps],
+      ),
+      claimV3: (mItem) => this.buildClaimV3(qr, row, mItem, manifest, snapshot, readOnly, claimOpts),
+    });
+  }
+
+  /**
+   * Re-arma el snapshot v1 leído de jsonb en orden canónico pasándolo por
+   * buildBlueprintSnapshot (única fuente del orden) — misma técnica que
+   * CourseBlueprintsService.recanonicalize (privado, owner-scoped: no se usa
+   * desde el camino del worker, R2).
+   */
+  private recanonicalizeAnySnapshot(stored: any, fail: (msg: string) => Error): AnyBlueprintSnapshot {
+    const s = typeof stored === 'string' ? JSON.parse(stored) : stored;
+    if (s && s.schemaVersion === 2) {
+      try {
+        return recanonicalizeBlueprintSnapshotV2(s);
+      } catch (err) {
+        throw fail(`snapshot v2 del Blueprint inválido (${err instanceof Error ? err.message : String(err)})`);
+      }
+    }
+    return this.recanonicalizeSnapshot(s, fail);
+  }
+
+  /** `variant` del item en el Manifest congelado (solo activity v3); null si no tiene. */
+  private async manifestItemVariant(qr: QueryRunner, manifestId: number, itemKey: string): Promise<string | null> {
+    const [r] = await qr.query(
+      `select e.it->>'variant' as variant
+         from public.course_generation_manifests m,
+              jsonb_array_elements(m.manifest_json->'items') as e(it)
+        where m.id = $1 and e.it->>'key' = $2
+        limit 1`,
+      [manifestId, itemKey],
+    );
+    return r?.variant ?? null;
+  }
+
+  private recanonicalizeSnapshot(stored: any, fail: (msg: string) => Error): BlueprintSnapshotV1 {
+    const s = typeof stored === 'string' ? JSON.parse(stored) : stored;
+    if (!s || s.schemaVersion !== 1 || !Array.isArray(s.modules)) throw fail('snapshot del Blueprint con forma no soportada');
+    const modules: RawModuleRow[] = [];
+    const chapters: RawChapterRow[] = [];
+    for (const m of s.modules) {
+      modules.push({ id: m.id, position: m.position, title: m.title, objective: m.objective, exam_enabled: m.examEnabled });
+      for (const c of m.chapters ?? []) {
+        chapters.push({ id: c.id, module_id: m.id, position: c.position, title: c.title, objective: c.objective, video_enabled: c.videoEnabled });
+      }
+    }
+    try {
+      return buildBlueprintSnapshot({ id: s.course?.id, title: s.course?.title }, modules, chapters);
+    } catch (err) {
+      throw fail(`snapshot del Blueprint inválido (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+}
+
+/**
+ * r58 (I1): la parte PURA de buildClaimedItem — del contexto, Manifest y Blueprint ya leídos y verificados (hash) al
+ * ClaimedItem, con las mismas comprobaciones de integridad y en el mismo orden. El claim real (scheduler) y el driver
+ * offline de componentes (scripts/lib/offline-driver.js) usan ESTA función: mismo payload, sin DB en el driver. Las
+ * dependencias y el bloque v3 llegan por callback para conservar el orden original de lecturas y errores.
+ */
+export async function assembleClaimedItem(a: {
+  job: any;
+  row: any;
+  ctx: { context: any; context_hash: string };
+  manifest: GenerationManifestV1;
+  snapshot: AnyBlueprintSnapshot;
+  source: { courseId: number; blueprintId: number; blueprintNumber: number; blueprintSha256: string };
+  blueprintNumber: number;
+  artifactCourseId: string;
+  fail: (msg: string) => Error;
+  loadDependencyArtifacts: (deps: string[]) => Promise<any[]>;
+  claimV3: (mItem: any) => Promise<ClaimPayloadV3 | undefined>;
+}): Promise<ClaimedItem> {
+  const { job, row, ctx, manifest, snapshot, source, fail } = a;
+  const errors = validateGenerationManifest(manifest, snapshot, source);
+  if (errors.length > 0) throw fail(`Manifest inválido contra el Blueprint: ${errors.slice(0, 3).map((e) => e.code).join(', ')}`);
+
+  const mItem = manifest.items.find((i) => i.key === row.item_key);
+  if (
+    !mItem ||
+    mItem.type !== row.type ||
+    (mItem.moduleId ?? null) !== (row.module_id ?? null) ||
+    (mItem.chapterId ?? null) !== (row.chapter_id ?? null) ||
+    !sameJson(mItem.dependsOn, row.depends_on ?? [])
+  ) {
+    throw fail('el item no coincide con su entrada del Manifest');
+  }
+  // rulesVersion 2: items de scope course (course_plan, course_intro) no
+  // tienen módulo ni capítulo — module/chapter null y moduleChapters vacío.
+  // Cualquier otro item exige su módulo (como siempre).
+  const courseScope = mItem.scope === 'course';
+  if (courseScope && (row.module_id !== null || row.chapter_id !== null)) {
+    throw fail('item de scope course con module_id/chapter_id');
+  }
+  const mModule = courseScope ? null : manifest.modules.find((m) => m.moduleId === row.module_id);
+  const sModule = courseScope ? null : snapshot.modules.find((m) => m.id === row.module_id);
+  if (!courseScope && (!mModule || !sModule)) throw fail('módulo ausente en Manifest/Blueprint');
+  const sChapter = row.chapter_id && sModule ? sModule.chapters.find((c) => c.id === row.chapter_id) : null;
+  if (row.chapter_id && !sChapter) throw fail('capítulo ausente en el Blueprint');
+  const moduleChapters = !mModule
+    ? []
+    : mModule.chapters.map((mc) => {
+        const sc = sModule!.chapters.find((c) => c.id === mc.chapterId);
+        if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
+        return { id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), chapterNumber: mc.chapterNumber, ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
+      });
+
+  // Outline del curso completo (R18), en el mismo orden en que el Manifest
+  // enumera sus módulos (manifest.modules ya está en orden de moduleNumber
+  // — ver generation-manifest-builder.ts), resuelto contra el snapshot
+  // congelado del Blueprint (misma fuente que moduleChapters arriba).
+  const outline = manifest.modules.map((mm) => {
+    const sm = snapshot.modules.find((m) => m.id === mm.moduleId);
+    if (!sm) throw fail(`módulo ${mm.moduleId} del Manifest ausente en el Blueprint`);
+    return {
+      moduleNumber: mm.moduleNumber,
+      id: sm.id,
+      title: sm.title,
+      objective: sm.objective ?? null,
+      description: descOf(sm),
+      chapters: mm.chapters.map((mc) => {
+        const sc = sm.chapters.find((c) => c.id === mc.chapterId);
+        if (!sc) throw fail(`capítulo ${mc.chapterId} del Manifest ausente en el Blueprint`);
+        return { chapterNumber: mc.chapterNumber, id: sc.id, title: sc.title, objective: sc.objective ?? null, description: descOf(sc), ...(mc.kind === 'practice' ? { kind: 'practice' as const } : {}) };
+      }),
+    };
+  });
+
+  const deps: string[] = row.depends_on ?? [];
+  const depArtifacts = deps.length === 0 ? [] : await a.loadDependencyArtifacts(deps);
+
+  const v3 = await a.claimV3(mItem);
+
+  // Motor pedagógico Fase 2: el diseño del item (Manifest validado arriba contra el Blueprint) → brief del generador.
+  // Fase 3: también con contexto académico congelado (los resultados que el item debe evidenciar van en el brief).
+  let pedagogy: ItemPedagogyBrief | null = null;
+  if (snapshot.schemaVersion === 2 && ((mItem as any).design !== undefined || (snapshot as any).course?.academicContext !== undefined)) {
+    try {
+      pedagogy = buildItemPedagogyBrief({ item: mItem as any, snapshot, activityTypeRules: (manifest as any).features?.activityTypeRules ?? null });
+    } catch (err) {
+      // Determinista (p. ej. un valor del diseño congelado sin texto de generador): el item falla visible y no
+      // reintentable en el claim, en vez de trabar el run con un 500 en cada claim (review M8).
+      throw new ClaimPayloadUnavailable('PEDAGOGY_DIRECTIVE_UNKNOWN', `no se pudo armar el brief pedagógico de ${row.item_key} (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+
+  return {
+    itemRunId: row.id,
+    runId: job.id,
+    courseId: row.course_id,
+    frontendCourseId: job.frontend_course_id ?? null,
+    artifactCourseId: a.artifactCourseId,
+    manifestId: row.manifest_id,
+    blueprintId: row.blueprint_id,
+    blueprintNumber: a.blueprintNumber,
+    itemKey: row.item_key,
+    type: row.type,
+    rulesVersion: manifest.rulesVersion,
+    // V2.1 (R4): solo items activity de rulesVersion 3.
+    ...(mItem.variant !== undefined ? { variant: mItem.variant } : {}),
+    moduleId: row.module_id ?? null,
+    chapterId: row.chapter_id ?? null,
+    moduleNumber: mItem.moduleNumber ?? null,
+    chapterNumber: mItem.chapterNumber ?? null,
+    idempotencyKey: row.idempotency_key,
+    generation: row.generation,
+    dependsOn: deps,
+    attempt: row.attempt_count,
+    previousError: typeof row.error === 'string' ? row.error.slice(0, 200) : null,
+    // r67 (B3): la sesión resumable de YouTube nunca sale en el item reclamado (el worker la lee de la DB).
+    outputSummary: stripYoutubeSessionSecret(row.output_summary ?? {}),
+    context: { courseContext: ctx.context, contextHash: ctx.context_hash },
+    blueprint: {
+      course: { id: snapshot.course.id, title: snapshot.course.title },
+      module: sModule
+        ? { id: sModule.id, title: sModule.title, objective: sModule.objective ?? null, description: descOf(sModule), position: sModule.position }
+        : null,
+      chapter: sChapter
+        ? {
+            id: sChapter.id,
+            title: sChapter.title,
+            objective: sChapter.objective ?? null,
+            description: descOf(sChapter),
+            position: sChapter.position,
+            videoEnabled: sChapter.videoEnabled,
+            // Loop 9 (B-extra-1): el capítulo tiene práctica guiada propia → el Libro no pide además «Actividades de Apoyo».
+            ...(guidedMinutesOfChapter(manifest, row.chapter_id) !== null ? { guidedPracticeMinutes: guidedMinutesOfChapter(manifest, row.chapter_id) } : {}),
+          }
+        : null,
+      moduleChapters,
+      outline,
+    },
+    dependencyArtifacts: depArtifacts.map((a: any) => ({
+      itemKey: a.item_key,
+      artifactId: a.id,
+      type: a.type,
+      storagePath: a.storage_path,
+    })),
+    ...(v3 ? { claimPayload: v3 } : {}),
+    ...(pedagogy ? { pedagogy } : {}),
+  };
+}
+
+/** REL R1: origen de un fallo según quién ejecuta el item (navegador = ownerId presente). */
+function failureSourceFor(type: string, ownerId: string | undefined): FailureSource {
+  if (ownerId !== undefined) return 'browser_executor';
+  if (type === 'video') return 'video_worker';
+  if (type === 'presentation' || type === 'audio_welcome' || type === 'audiobook_chapter') return 'provider_worker';
+  return 'server_executor';
+}

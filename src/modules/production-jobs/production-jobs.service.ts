@@ -21,6 +21,8 @@ import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { EventsService } from '../../events/events.service';
+import { assertLegacyAudioAllowed, assertLegacyGenerationAllowed } from './legacy-audio-guard';
+import { assertClientMayPatchJob } from './client-patch-guard';
 
 /** Pasos estándar del pipeline (matching CP_STEP_DEFS en 31-course-production.js) */
 const STANDARD_STEPS = [
@@ -468,6 +470,15 @@ export class ProductionJobsService implements OnModuleInit {
     return this.stepRepo.save(step);
   }
 
+  /**
+   * 409 `v2_course_legacy_audio_disabled:` si `rawCourseId` es un curso V2
+   * (structure_version='dynamic') del owner. Usado por toda ruta/worker que
+   * pueda producir audio legacy (OpenAI TTS). Ver legacy-audio-guard.ts.
+   */
+  async assertLegacyAudioAllowedForCourse(ownerId: string, rawCourseId: unknown): Promise<void> {
+    await assertLegacyAudioAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, rawCourseId);
+  }
+
   // ── CREATE ──────────────────────────────────────────────────────────────────
 
   async create(dto: CreateJobDto, ownerId: string): Promise<ProductionJob> {
@@ -508,6 +519,7 @@ export class ProductionJobsService implements OnModuleInit {
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
     }
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
 
     const sanitizedPayload = this.sanitizePayload({
       courseId: dto.courseId,
@@ -608,6 +620,7 @@ export class ProductionJobsService implements OnModuleInit {
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
     }
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
 
     const sanitizedPayload = this.sanitizePayload({
       courseId: dto.courseId,
@@ -1147,6 +1160,7 @@ export class ProductionJobsService implements OnModuleInit {
     if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
     if (job.executionMode !== 'backend_videos') return { ok: false, reason: 'not_a_video_job' };
     if (this.isCancelledLike(job)) return { ok: false, reason: 'job_cancelled' };
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), userId, job.frontendCourseId ?? job.courseId); // R68
 
     const allowedStatuses = ['failed_recoverable', 'failed'];
     if (!allowedStatuses.includes(job.status)) {
@@ -1221,6 +1235,8 @@ export class ProductionJobsService implements OnModuleInit {
     if (!dto.courseId) {
       throw new BadRequestException('courseId is required');
     }
+    // Decisión del owner (V2): un curso dynamic nunca genera audio legacy → 409 antes de todo.
+    await this.assertLegacyAudioAllowedForCourse(ownerId, dto.courseId);
 
     const sanitizedPayload = this.sanitizePayload({
       courseId: dto.courseId,
@@ -1540,6 +1556,7 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreateH5PJobDto,
   ): Promise<H5PJobCreatedResponse> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
     if (!dto.contentSnapshotArtifactId) {
       throw new BadRequestException('contentSnapshotArtifactId is required');
     }
@@ -1846,6 +1863,7 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreateGammaJobDto,
   ): Promise<GammaJobCreatedResponse> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
     if (!dto.contentSnapshotArtifactId) {
       throw new BadRequestException('contentSnapshotArtifactId is required');
     }
@@ -2141,6 +2159,7 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreatePackageJobDto,
   ): Promise<PackageJobCreatedResponse> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
     if (!dto.contentSnapshotArtifactId) throw new BadRequestException('contentSnapshotArtifactId is required');
 
     const rawCourseId    = dto.courseId;
@@ -2726,6 +2745,7 @@ export class ProductionJobsService implements OnModuleInit {
 
   async update(id: string, dto: UpdateJobDto, ownerId: string): Promise<ProductionJob> {
     const job = await this.findOne(id, ownerId);
+    assertClientMayPatchJob(job.executionMode);
 
     if (this.isCancelledLike(job)) {
       return job;
@@ -2753,7 +2773,8 @@ export class ProductionJobsService implements OnModuleInit {
     ownerId: string,
   ): Promise<ProductionStep> {
     // Verify ownership
-    await this.findOne(jobId, ownerId);
+    const owned = await this.findOne(jobId, ownerId);
+    assertClientMayPatchJob(owned.executionMode);
 
     // Find existing step or create
     let step = await this.stepRepo.findOne({
@@ -2781,6 +2802,12 @@ export class ProductionJobsService implements OnModuleInit {
     dto: CreateFullCourseJobDto,
   ): Promise<{ ok: true; jobId: string; status: string; workerStatus: string; executionMode: string; currentStep: string; resumed?: boolean }> {
     if (!dto.courseId) throw new BadRequestException('courseId is required');
+    // Decisión del owner (V2): el job maestro genera audio legacy salvo
+    // generateAudio=false → con un curso dynamic, 409 antes de crear nada.
+    if ((dto.options as Record<string, any> | undefined)?.generateAudio !== false) {
+      await this.assertLegacyAudioAllowedForCourse(ownerId, dto.courseId);
+    }
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), ownerId, dto.courseId); // R68
 
     const rawCourseId    = dto.courseId;
     const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
@@ -3018,6 +3045,12 @@ export class ProductionJobsService implements OnModuleInit {
     if (job.ownerId !== userId) return { ok: false, reason: 'forbidden' };
     if (job.executionMode !== 'course_full_generation') return { ok: false, reason: 'not_a_full_course_job' };
     if (this.isCancelledLike(job)) return { ok: false, reason: 'job_cancelled' };
+    // Decisión del owner (V2): reencolar el job maestro volvería a generar audio legacy.
+    if ((job.inputPayload?.options as Record<string, any> | undefined)?.generateAudio !== false) {
+      await this.assertLegacyAudioAllowedForCourse(userId, job.frontendCourseId ?? job.courseId);
+    }
+    // R68: reencolar un job legacy de un curso V2 también es generar fuera del flujo verificado.
+    await assertLegacyGenerationAllowed((sql, params) => this.dataSource.query(sql, params), userId, job.frontendCourseId ?? job.courseId);
 
     const retryableStatuses = ['failed_retryable', 'failed', 'needs_reconnect', 'blocked_quota', 'failed_recoverable'];
     if (!retryableStatuses.includes(job.status)) {

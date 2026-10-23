@@ -1,0 +1,46 @@
+import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
+import { Observable } from 'rxjs';
+import { map } from 'rxjs/operators';
+import { isSuperAdminEmail } from '../../auth/super-admin';
+import { redactCompletionForOwner } from './run-completion';
+import { redactWorkersHoldForOwner } from './workers-hold';
+
+/**
+ * DoD follow-up (R3): las respuestas de RunsController (RunDto suelto o `{run: RunDto}`) llevan
+ * `completion`; a quien NO es SUPER_ADMIN se le quita el texto de admin del bloqueo del paquete
+ * (`redactCompletionForOwner`) y (REL R2) el costo por item (`items[].cost`). Un SUPER_ADMIN recibe el detalle completo. Recorre solo objetos planos y
+ * arrays, con profundidad acotada; nunca muta la respuesta original.
+ */
+export function redactRunPayloadForOwner(value: unknown, depth = 0): unknown {
+  if (depth > 4 || value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map((v) => redactRunPayloadForOwner(v, depth + 1));
+  if (value instanceof Date || Buffer.isBuffer(value)) return value;
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k === 'completion' && v && typeof v === 'object' && !Array.isArray(v)) out[k] = redactCompletionForOwner(v as any);
+    // r62 (review M2): el hold de workers llega al dueño solo con estado y motivo genérico (sin variables ni procesos).
+    else if (k === 'workersHold' && v && typeof v === 'object' && !Array.isArray(v)) out[k] = redactWorkersHoldForOwner(v as any);
+    else if (k === 'courseContext') out[k] = v; // nunca lleva `completion`
+    // REL R2: `items[].cost` (costo del ledger por item) es solo para SUPER_ADMIN; el resto del item intacto.
+    else if (k === 'items' && Array.isArray(v)) out[k] = v.map((it) => (it && typeof it === 'object' && !Array.isArray(it) && 'cost' in it ? withoutCost(it) : it));
+    else if (k === 'items') out[k] = v;
+    else out[k] = redactRunPayloadForOwner(v, depth + 1);
+  }
+  return out;
+}
+
+function withoutCost(item: Record<string, unknown>): Record<string, unknown> {
+  const { cost: _cost, ...rest } = item;
+  return rest;
+}
+
+@Injectable()
+export class OwnerSafeRunInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<unknown> {
+    const req = context.switchToHttp().getRequest<{ user?: { email?: string | null } }>();
+    const admin = isSuperAdminEmail(req?.user?.email ?? null);
+    return next.handle().pipe(map((data) => (admin ? data : redactRunPayloadForOwner(data))));
+  }
+}

@@ -1,0 +1,275 @@
+{
+  "semantics": [
+    {
+      "label": "Butonul de verificare a răspunsului",
+      "default": "Verifică"
+    },
+    {
+      "label": "Butonul de trimitere a răspunsului",
+      "default": "Trimite"
+    },
+    {
+      "label": "Butonul de reîncercare",
+      "default": "Reîncearcă"
+    },
+    {
+      "label": "Textul de explicare a punctajului",
+      "default": "Răspunsurile corecte aduc +1 punct. Răspunsurile incorecte scad cu -1 punct. Punctajul minim posibil este 0."
+    },
+    {
+      "fields": [
+        {
+          "label": "Setări",
+          "fields": [
+            {
+              "label": "Imagine de fundal",
+              "description": "Opțional. Selectați o imagine pentru a o folosi ca fundal pentru sarcina de tip glisare și plasare."
+            },
+            {
+              "label": "Dimensiunea sarcinii",
+              "description": "Specificați cât de mare (în px) ar trebui să fie zona de joc."
+            }
+          ]
+        },
+        {
+          "label": "Sarcină",
+          "description": "Începeți prin a plasa zonele de plasare.<br />Apoi, plasați elementele glisabile și bifați zonele de plasare corespunzătoare.<br />În final, editați din nou zona de plasare și bifați răspunsurile corecte.",
+          "fields": [
+            {
+              "label": "Elemente",
+              "entity": "element",
+              "field": {
+                "label": "Element",
+                "fields": [
+                  {
+                    "description": "Alegeți tipul de conținut pe care doriți să-l adăugați."
+                  },
+                  {},
+                  {},
+                  {},
+                  {},
+                  {
+                    "label": "Selectați zonele de plasare"
+                  },
+                  {
+                    "label": "Opacitate fundal",
+                    "description": "Reducerea opacității poate duce la un contrast insuficient și poate face conținutul inaccesibil."
+                  },
+                  {
+                    "label": "Număr infinit de instanțe ale elementului",
+                    "description": "Clonează acest element astfel încât să poată fi glisat în mai multe zone de plasare."
+                  }
+                ]
+              }
+            },
+            {
+              "label": "Zone de plasare",
+              "entity": "Zonă de plasare",
+              "field": {
+                "label": "Zonă de plasare",
+                "fields": [
+                  {
+                    "label": "Etichetă",
+                    "description": "Eticheta este folosită de tehnologiile asistive."
+                  },
+                  {
+                    "label": "Afișează eticheta"
+                  },
+                  {},
+                  {},
+                  {},
+                  {},
+                  {
+                    "label": "Selectați elementele corecte"
+                  },
+                  {
+                    "label": "Opacitate fundal",
+                    "description": "Reducerea opacității poate duce la un contrast insuficient și poate face conținutul inaccesibil."
+                  },
+                  {
+                    "label": "Indicii și feedback",
+                    "fields": [
+                      {
+                        "label": "Text indiciu"
+                      },
+                      {
+                        "label": "Mesaj afișat la potrivire corectă",
+                        "description": "Mesajul va apărea sub sarcină la apăsarea butonului „verifică” dacă elementul glisabil corect este potrivit."
+                      },
+                      {
+                        "label": "Mesaj afișat la potrivire incorectă",
+                        "description": "Mesajul va apărea sub sarcină la apăsarea butonului „verifică” dacă potrivirea este incorectă."
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Această zonă de plasare poate conține un singur element",
+                    "description": "Asigurați-vă că există un singur răspuns corect pentru această zonă de plasare"
+                  },
+                  {
+                    "label": "Activează alinierea automată",
+                    "description": "Va alinia automat toate elementele glisabile plasate în această zonă."
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "Feedback general",
+      "fields": [
+        {
+          "widgets": [
+            {
+              "label": "Implicit"
+            }
+          ],
+          "label": "Definiți feedback personalizat pentru orice interval de punctaj",
+          "description": "Apăsați butonul „Adaugă interval” pentru a adăuga câte intervale aveți nevoie. Exemplu: 0-20% Punctaj slab, 21-91% Punctaj mediu, 91-100% Punctaj excelent!",
+          "entity": "range",
+          "field": {
+            "fields": [
+              {
+                "label": "Interval de punctaj"
+              },
+              {},
+              {
+                "label": "Feedback pentru intervalul de punctaj definit",
+                "placeholder": "Completați feedback-ul"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "Setări de comportament",
+      "description": "Aceste opțiuni vă vor permite să controlați cum se comportă sarcina.",
+      "fields": [
+        {
+          "label": "Activează „Reîncearcă”"
+        },
+        {
+          "label": "Activează butonul „Verifică”"
+        },
+        {
+          "label": "Acordă un singur punct pentru întreaga sarcină",
+          "description": "Dezactivați pentru a acorda un punct pentru fiecare element glisabil care este plasat corect."
+        },
+        {
+          "label": "Aplică penalizări",
+          "description": "Aplicați penalizări pentru elementele plasate în zonele de plasare greșite. Aceasta trebuie activată atunci când același/aceleași element(e) pot fi plasate în mai multe zone de plasare, sau dacă există o singură zonă de plasare. Dacă aceasta nu este activată, cursanții pot potrivi toate elementele cu toate zonele de plasare și vor primi întotdeauna punctaj maxim."
+        },
+        {
+          "label": "Activează explicația punctajului",
+          "description": "Afișează o explicație a punctajului utilizatorului atunci când își verifică răspunsurile (dacă opțiunea 'Aplică penalizări' a fost selectată)."
+        },
+        {
+          "label": "Opacitatea fundalului pentru elementele glisabile",
+          "description": "Dacă acest câmp este setat, va suprascrie opacitatea setată pe toate elementele glisabile. Acesta ar trebui să fie un număr între 0 și 100, unde 0 înseamnă transparență totală și 100 înseamnă fără transparență."
+        },
+        {
+          "label": "Evidențierea zonei de plasare",
+          "description": "Alegeți când să evidențiați zonele de plasare.",
+          "options": [
+            {
+              "label": "La glisare"
+            },
+            {
+              "label": "Întotdeauna"
+            },
+            {
+              "label": "Niciodată"
+            }
+          ]
+        },
+        {
+          "label": "Spațiere pentru alinierea automată (în px)"
+        },
+        {
+          "label": "Activează modul Ecran complet",
+          "description": "Bifați această opțiune pentru a activa butonul de ecran complet."
+        },
+        {
+          "label": "Afișează punctele obținute",
+          "description": "Afișează punctele câștigate pentru fiecare răspuns. Nu este disponibil când opțiunea 'Acordă un singur punct pentru întreaga sarcină' este activată."
+        },
+        {
+          "label": "Show Title",
+          "description": "Uncheck this option if you do not want this title to be displayed. The title will only be displayed in summaries, statistics etc."
+        },
+        {
+          "label": "Show drag handles (new look and feel only)",
+          "description": "Toggles the visibility of drag handles used to move elements on the canvas."
+        }
+      ]
+    },
+    {
+      "label": "Localizare",
+      "fields": [
+        {
+          "label": "Etichetă ecran complet",
+          "default": "Ecran complet"
+        },
+        {
+          "label": "Etichetă ieșire din ecran complet",
+          "default": "Ieșire din ecran complet"
+        }
+      ]
+    },
+    {
+      "label": "Prefix element glisabil",
+      "default": "Element glisabil {num} din {total}."
+    },
+    {
+      "label": "Sufix element glisabil",
+      "default": "Plasat în zona de plasare {num}."
+    },
+    {
+      "label": "Prefix zonă de plasare",
+      "default": "Zonă de plasare {num} din {total}."
+    },
+    {
+      "label": "Etichetă fără selecție de zonă de plasare",
+      "default": "Nicio zonă de plasare."
+    },
+    {
+      "label": "Etichetă pentru butonul de afișare a indiciului",
+      "default": "Arată indiciu."
+    },
+    {
+      "label": "Etichetă pentru indiciu disponibil",
+      "default": "Indiciu disponibil"
+    },
+    {
+      "label": "Etichetă pentru răspuns corect",
+      "default": "Răspuns corect"
+    },
+    {
+      "label": "Etichetă pentru răspuns incorect",
+      "default": "Răspuns greșit"
+    },
+    {
+      "label": "Antet pentru panoul care conține feedback pentru răspunsurile corecte/incorecte",
+      "default": "Feedback"
+    },
+    {
+      "label": "Reprezentarea textuală a barei de scor pentru cei care folosesc un cititor de ecran",
+      "default": "Ai obținut :num din :total puncte"
+    },
+    {
+      "label": "Reprezentarea textuală a butonului de explicație a punctajului",
+      "default": "Arată explicația punctajului"
+    },
+    {
+      "label": "Etichetă pentru tehnologia asistivă a butonului „Verifică”",
+      "default": "Verifică răspunsurile. Răspunsurile vor fi marcate ca fiind corecte, incorecte sau fără răspuns."
+    },
+    {
+      "label": "Etichetă pentru tehnologia asistivă a butonului „Reîncearcă”",
+      "default": "Reîncearcă sarcina. Resetează toate răspunsurile și reia sarcina de la început."
+    }
+  ]
+}

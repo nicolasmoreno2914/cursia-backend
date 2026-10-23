@@ -1,0 +1,370 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// REL — sonda del proveedor tras quedarse sin CRÉDITO / CUOTA (reanudación sin clic).
+//
+// Caso real (#616, staging 2026-10-03): la key de Anthropic de staging se quedó sin crédito
+// («Your credit balance is too low», HTTP 400). Los items quedaron D / `wait_provider` / scope provider
+// (failure-classifier.ts) y nada los reabría: aun con el crédito recargado, el curso no seguía sin un
+// clic en «Continuar generación».
+//
+// Regla (decisión del usuario, brief CREDIT):
+//  - SOLO crédito/cuota agotados de Anthropic («credit balance is too low», billing, «Sin disponibilidad
+//    de generación» del proxy del navegador) y OpenAI (`insufficient_quota`): el proveedor confirma que no
+//    generó ni cobró nada (4xx definitivo: la reserva del ledger se liberó). NUNCA auth / key inválida /
+//    configuración (humano), NUNCA video, Gamma ni YouTube;
+//  - por (run, proveedor) a lo sumo UN item canario reabierto a la vez; la primera sonda 5 min después del
+//    fallo, luego 10, 20, 40 y 60 min (tope), con jitter (+0…20 %, nunca antes de la espera), acotado a
+//    ~24 h desde el primer fallo de la racha (después: needs_attention como hoy). Nunca con el run
+//    cancelado / cancelándose ni detenido por el usuario;
+//  - canario OK → se reabren los demás items del run que esperan al mismo proveedor (y sus dependientes);
+//    canario falla otra vez por crédito → la próxima sonda con la espera siguiente. Cada sonda concede UN
+//    intento y no consume las rondas del auto-healer (autoHeal.rounds / regenRounds);
+//  - la reapertura es la de siempre (RunsService.retryItem, modo `providerProbe`): locks, gate de FinOps
+//    en simulación, y en el claim el runtime guard + el chequeo del ledger del worker;
+//  - kill-switch: DYNAMIC_AUTO_HEAL_POLICY=legacy (política sin `classAware`).
+// Estado: output_summary.providerProbe (clave del servidor; el navegador no la puede escribir).
+// Puro (sin I/O).
+// ─────────────────────────────────────────────────────────────────────────────
+import { AUTO_HEAL_WORKER_ITEM_TYPES, AutoHealPolicy } from '../dynamic-generation/auto-heal';
+import { FailureProvider, FailureSource, classifyFailure } from './failure-classifier';
+
+export const PROVIDER_PROBE_STRATEGY = 'provider_probe';
+export const PROVIDER_PROBE_RESUME_STRATEGY = 'provider_probe_resume';
+/** Clave del servidor en output_summary. */
+export const PROVIDER_PROBE_KEY = 'providerProbe';
+/** Espera antes de la sonda n (índice n; el último valor se repite): 5, 10, 20, 40, 60 min. */
+export const PROVIDER_PROBE_WAITS_SECONDS: readonly number[] = Object.freeze([300, 600, 1200, 2400, 3600]);
+/** Jitter SOLO hacia arriba (+0…20 %): la sonda nunca sale antes de su espera. */
+export const PROVIDER_PROBE_JITTER_RATIO = 0.2;
+/** Tope de la racha desde el primer fallo por crédito (después: needs_attention como hoy). */
+export const PROVIDER_PROBE_MAX_HOURS = 24;
+/**
+ * Un canario reabierto que sigue `pending` sin que nadie lo reclame (p.ej. un item del navegador con el
+ * ejecutor pausado por OTRA parte) deja de contar como «en vuelo» pasado este tiempo: la próxima sonda
+ * puede elegir otro. Un pendiente sin reclamar no llama a nadie (no gasta).
+ */
+export const PROVIDER_PROBE_STALL_SECONDS = 1800;
+/** Tras un rechazo de la reapertura (FinOps, run reemplazado…): ese item no es canario por 30 min. */
+export const PROVIDER_PROBE_SKIP_SECONDS = 1800;
+export const PROVIDER_PROBE_PROVIDERS: readonly FailureProvider[] = Object.freeze(['anthropic', 'openai'] as FailureProvider[]);
+/** Nunca: video (Videogen/YouTube) ni presentaciones (Gamma). */
+const NEVER_PROBED_TYPES: readonly string[] = Object.freeze(['video', 'presentation']);
+
+/** Crédito / cuota / facturación agotados (texto del proveedor o del proxy del navegador). */
+const CREDIT_RE =
+  /credit balance|insufficient_quota|exceeded your current quota|\bquota\b|\bcuota\b|\bsaldo\b|\bcredits?\b|cr[eé]ditos?\b|\bbalance\b|billing|facturaci[oó]n|payment required|\bHTTP 402\b|Sin disponibilidad de generaci[oó]n/i;
+/** Autenticación / key / permisos: siempre humano, aunque el texto mencione crédito. */
+const AUTH_RE =
+  /\bHTTP 40[13]\b|\b40[13] (?:Unauthorized|Forbidden)\b|unauthori[sz]ed|forbidden|invalid[_ ]api[_ ]key|invalid x-api-key|authentication|api key no configurada|permission|No tienes acceso/i;
+/** Filtro GRUESO del barrido (POSIX, case-insensitive). La decisión fina es providerCreditWaitOf. */
+export const PROVIDER_PROBE_SQL_REGEX =
+  'credit|balance|insufficient_quota|quota|cuota|saldo|cr[eé]dito|billing|facturaci[oó]n|payment required|HTTP 402|sin disponibilidad de generaci[oó]n';
+/** Detenido por el usuario (el ejecutor del navegador lo reporta así): el run está pausado a mano. */
+export const USER_STOPPED_SQL_REGEX = '^(user_stopped|generaci[oó]n detenida por el usuario)';
+const USER_STOPPED_RE = /^(?:user_stopped\b|Generaci[oó]n detenida por el usuario)/i;
+
+/** Reglas del clasificador cuyo veredicto de crédito puede sondearse (todas sin gasto confirmado). */
+const PROBE_RULES: ReadonlySet<string> = new Set([
+  'llm_config', 'audiobook_script_failed', 'tts_failed', 'llm_transient', 'unexpected_error', 'provider_config',
+]);
+
+export interface ProviderProbeRow {
+  id: string;
+  item_key?: string | null;
+  type?: string | null;
+  status: string;
+  error: string | null;
+  output_summary: Record<string, any> | null;
+  finished_at?: Date | string | null;
+  updated_at?: Date | string | null;
+  claimed_at?: Date | string | null;
+  /** Clase REGISTRADA al fallar (R2). Una C (pago incierto) nunca se sondea. */
+  failure_class?: string | null;
+}
+
+/** Estado persistido en output_summary.providerProbe. */
+export interface ProviderProbeState {
+  provider: FailureProvider;
+  /** Primer fallo por crédito de la racha (tope de ~24 h). */
+  firstFailedAt?: string;
+  /** Sondas ya hechas en el run para este proveedor cuando se escribió (la del canario incluida). */
+  runRound?: number;
+  /** Sondas en las que ESTE item fue el canario. */
+  rounds?: number;
+  /** Este item se reabrió como canario en este instante (en vuelo hasta que termine). */
+  canaryAt?: string;
+  lastProbeAt?: string;
+  /** Próxima sonda del grupo (vista de recuperación). */
+  nextProbeAt?: string;
+  /** Rechazo de la reapertura: no es canario hasta este instante (ms). */
+  skipUntilMs?: number;
+  lastSkipReason?: string;
+}
+
+function toDate(v: Date | string | null | undefined): Date | null {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isFinite(d.getTime()) ? d : null;
+}
+
+function fnv1a(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function sourceOfType(type: string | null | undefined): FailureSource | null {
+  if (!type) return null;
+  if (type === 'video') return 'video_worker';
+  return AUTO_HEAL_WORKER_ITEM_TYPES.includes(type) ? 'provider_worker' : 'browser_executor';
+}
+
+/** Kill-switch: la sonda solo corre con la política por clase (DYNAMIC_AUTO_HEAL_POLICY=legacy la apaga). */
+export function providerProbeEnabled(policy: AutoHealPolicy): boolean {
+  return !!policy.classAware;
+}
+
+export function providerProbeStateOf(outputSummary: Record<string, any> | null | undefined): ProviderProbeState | null {
+  const s = outputSummary?.[PROVIDER_PROBE_KEY];
+  if (!s || typeof s !== 'object' || Array.isArray(s)) return null;
+  if (!PROVIDER_PROBE_PROVIDERS.includes(s.provider)) return null;
+  return s as ProviderProbeState;
+}
+
+/**
+ * ¿Este item `failed` espera a un proveedor que se quedó sin crédito/cuota? → el proveedor, o null.
+ * Exige el veredicto del MENSAJE (hecho del emisor): D / wait_provider / scope provider de Anthropic u
+ * OpenAI con texto de crédito y sin texto de auth. Un errorCode del navegador solo (mensaje de otra cosa)
+ * nunca alcanza. Una clase C registrada (trozos de TTS ya pagados, reconciliación) nunca.
+ */
+export function providerCreditWaitOf(row: ProviderProbeRow): FailureProvider | null {
+  if (row.status !== 'failed') return null;
+  const error = String(row.error ?? '').trim();
+  if (!error) return null;
+  if (row.type && NEVER_PROBED_TYPES.includes(row.type)) return null;
+  if (String(row.failure_class ?? '') === 'C') return null;
+  if (!CREDIT_RE.test(error) || AUTH_RE.test(error)) return null;
+  const v = classifyFailure({ source: sourceOfType(row.type), itemType: row.type ?? null, error, outputSummary: row.output_summary ?? {} });
+  if (v.unclassified || v.class !== 'D' || v.scope !== 'provider') return null;
+  if (v.paidRisk === 'uncertain' || (v.paidUnits ?? 0) > 0) return null;
+  if (!PROBE_RULES.has(v.rule)) return null;
+  // llm_config agrupa crédito, auth y configuración del proxy: solo el código de crédito.
+  if (v.rule === 'llm_config' && v.code !== 'llm_credit_exhausted') return null;
+  if (v.rule === 'provider_config' && v.code !== 'insufficient_quota') return null;
+  if (v.rule !== 'llm_config' && v.rule !== 'provider_config' && !(v.strategy === 'wait_provider' && v.providerConfigIssue)) return null;
+  const provider = v.provider ?? null;
+  return provider && PROVIDER_PROBE_PROVIDERS.includes(provider) ? provider : null;
+}
+
+/** Espera (s) antes de la sonda `round` (0 = la primera), con jitter determinista +0…20 %. */
+export function providerProbeWaitSeconds(round: number, seed: string): number {
+  const list = PROVIDER_PROBE_WAITS_SECONDS;
+  const base = list[Math.min(Math.max(0, round), list.length - 1)];
+  const u = fnv1a(`${seed}:${round}`) / 0xffffffff;
+  return base * (1 + PROVIDER_PROBE_JITTER_RATIO * u);
+}
+
+export type ProviderProbeAction =
+  /** Nada que sondear (sin items esperando). */
+  | 'none'
+  /** Esperando la próxima sonda (nextProbeAt). */
+  | 'wait'
+  /** Toca reabrir el canario. */
+  | 'probe'
+  /** Un canario sigue en vuelo: no se reabre otro. */
+  | 'in_flight'
+  /** El canario (o una reapertura) terminó bien: reabrir el resto. */
+  | 'resume'
+  /** Pasaron ~24 h desde el primer fallo: needs_attention como hoy. */
+  | 'exhausted'
+  /** El usuario detuvo la generación: nunca se sondea. */
+  | 'paused';
+
+export interface ProviderProbePlan {
+  provider: FailureProvider;
+  action: ProviderProbeAction;
+  /** Items `failed` que esperan a este proveedor (ids). */
+  waitingIds: string[];
+  /** Canario a reabrir (action 'probe'). */
+  canaryId: string | null;
+  /** Canario en vuelo (action 'in_flight'). */
+  inFlightId: string | null;
+  /** Items completados con estado de sonda (prueba de que el proveedor volvió). */
+  successIds: string[];
+  /** Sondas ya hechas en el run para este proveedor. */
+  round: number;
+  nextProbeAt: Date | null;
+  streakStartAt: Date | null;
+  deadlineAt: Date | null;
+}
+
+const IN_FLIGHT_STATUSES: readonly string[] = Object.freeze(['pending', 'retrying', 'running']);
+
+/**
+ * Fix round 1 (M2): la última sonda (recortada al tope de ~24 h) se ejecuta aunque el barrido llegue un poco
+ * después del tope; pasado este margen sin sondear, la racha vence igual.
+ */
+export const PROVIDER_PROBE_FINAL_GRACE_SECONDS = 3600;
+
+function failedAtOf(r: ProviderProbeRow, now: Date): Date {
+  return toDate(r.finished_at) ?? toDate(r.updated_at) ?? now;
+}
+
+/**
+ * Fix round 1 (M1): estado de sonda VIGENTE de una fila para `provider`. En un item `failed`, un estado cuya
+ * racha ya venció antes de ESTE fallo (fallo más nuevo que firstFailedAt + ~24 h) es de una racha anterior:
+ * se ignora (el fallo nuevo empieza otra racha, con sus propias rondas).
+ */
+export function effectiveProbeStateOf(r: ProviderProbeRow, provider: FailureProvider, now: Date = new Date()): ProviderProbeState | null {
+  const s = providerProbeStateOf(r.output_summary);
+  if (!s || s.provider !== provider) return null;
+  if (r.status === 'failed') {
+    const first = toDate(s.firstFailedAt);
+    if (first && failedAtOf(r, now).getTime() > first.getTime() + PROVIDER_PROBE_MAX_HOURS * 3_600_000 + PROVIDER_PROBE_FINAL_GRACE_SECONDS * 1000) return null;
+  }
+  return s;
+}
+
+/**
+ * Plan de sondas de UN run (filas de la generación vigente con crédito agotado, con estado de sonda, o
+ * detenidas por el usuario). `seed` = id del run (jitter determinista por run y proveedor). Puro: el
+ * barrido lo usa para decidir y retryItem lo re-evalúa con las filas BLOQUEADAS.
+ */
+export function planProviderProbes(rows: readonly ProviderProbeRow[], now: Date, seed: string): ProviderProbePlan[] {
+  const waitingBy = new Map<FailureProvider, ProviderProbeRow[]>();
+  for (const r of rows) {
+    const p = providerCreditWaitOf(r);
+    if (!p) continue;
+    if (!waitingBy.has(p)) waitingBy.set(p, []);
+    waitingBy.get(p)!.push(r);
+  }
+  const providers = new Set<FailureProvider>(waitingBy.keys());
+  for (const r of rows) {
+    const s = providerProbeStateOf(r.output_summary);
+    if (s) providers.add(s.provider);
+  }
+  const paused = rows.some((r) => r.status === 'failed' && USER_STOPPED_RE.test(String(r.error ?? '').trim()));
+  const out: ProviderProbePlan[] = [];
+  const MAX_MS = PROVIDER_PROBE_MAX_HOURS * 3_600_000;
+  for (const provider of [...providers].sort()) {
+    const waiting = waitingBy.get(provider) ?? [];
+    const eff = (r: ProviderProbeRow) => effectiveProbeStateOf(r, provider, now);
+    const withState = rows.filter((r) => eff(r) !== null);
+    const successIds = withState.filter((r) => r.status === 'completed').map((r) => String(r.id));
+    const firstOf = (r: ProviderProbeRow) => toDate(eff(r)?.firstFailedAt) ?? failedAtOf(r, now);
+    // M1: la racha sale SOLO de los items dentro de su propia ventana (un item vencido de una racha vieja no
+    // arrastra a un fallo nuevo al «exhausted»).
+    const active = waiting.filter((r) => now.getTime() - firstOf(r).getTime() <= MAX_MS + PROVIDER_PROBE_FINAL_GRACE_SECONDS * 1000);
+    const streakStartAt = active.length ? new Date(Math.min(...active.map((r) => firstOf(r).getTime()))) : null;
+    const sameStreak = (r: ProviderProbeRow) => {
+      if (!streakStartAt) return false;
+      const f = toDate(eff(r)?.firstFailedAt);
+      return !f || f.getTime() >= streakStartAt.getTime() - 1000;
+    };
+    const round = withState.filter(sameStreak)
+      .reduce((m, r) => Math.max(m, Math.floor(Number(eff(r)?.runRound ?? 0)) || 0), 0);
+    const base: ProviderProbePlan = {
+      provider, action: 'none', waitingIds: waiting.map((r) => String(r.id)), canaryId: null, inFlightId: null, successIds,
+      round, nextProbeAt: null, streakStartAt, deadlineAt: null,
+    };
+    // I2 (fix round 1): detenido por el usuario gana SIEMPRE — ni canario ni reanudación (la prueba de éxito se
+    // conserva y la reanudación ocurre cuando el usuario retome).
+    if (paused && (waiting.length || successIds.length)) {
+      out.push({ ...base, action: 'paused' });
+      continue;
+    }
+    // El proveedor volvió (el canario —o una reapertura de un humano— terminó bien): se reabre el resto.
+    if (successIds.length) {
+      out.push({ ...base, action: 'resume' });
+      continue;
+    }
+    if (!waiting.length) {
+      out.push(base);
+      continue;
+    }
+    if (!streakStartAt) {
+      out.push({ ...base, action: 'exhausted' });
+      continue;
+    }
+    const deadlineAt = new Date(streakStartAt.getTime() + MAX_MS);
+    const lastFailAt = new Date(Math.max(...active.map((r) => failedAtOf(r, now).getTime())));
+    let nextProbeAt = new Date(lastFailAt.getTime() + providerProbeWaitSeconds(round, `${seed}:${provider}`) * 1000);
+    if (nextProbeAt.getTime() > deadlineAt.getTime()) nextProbeAt = deadlineAt;
+    const plan: ProviderProbePlan = { ...base, deadlineAt, nextProbeAt };
+    const inFlight = withState.find((r) => {
+      if (!IN_FLIGHT_STATUSES.includes(r.status)) return false;
+      const canaryAt = toDate(eff(r)!.canaryAt);
+      if (!canaryAt) return false;
+      // Pendiente sin reclamar desde la reapertura por más de PROVIDER_PROBE_STALL_SECONDS: no cuenta.
+      const claimedAt = toDate(r.claimed_at);
+      const neverClaimed = r.status === 'pending' && (!claimedAt || claimedAt.getTime() < canaryAt.getTime());
+      return !(neverClaimed && now.getTime() - canaryAt.getTime() > PROVIDER_PROBE_STALL_SECONDS * 1000);
+    });
+    if (inFlight) {
+      out.push({ ...plan, action: 'in_flight', inFlightId: String(inFlight.id), nextProbeAt: null });
+      continue;
+    }
+    // M2: la sonda que tocaba (incluida la última, recortada al tope) corre una vez aunque el barrido llegue
+    // después del tope (dentro del margen); vence cuando ya se hizo o pasó el margen.
+    const lastProbeAt = withState.filter(sameStreak)
+      .reduce<number | null>((m, r) => { const t = toDate(eff(r)?.lastProbeAt)?.getTime() ?? null; return t === null ? m : Math.max(m ?? t, t); }, null);
+    const dueDone = lastProbeAt !== null && lastProbeAt >= nextProbeAt.getTime();
+    if (now.getTime() > deadlineAt.getTime() && (dueDone || now.getTime() > deadlineAt.getTime() + PROVIDER_PROBE_FINAL_GRACE_SECONDS * 1000)) {
+      out.push({ ...plan, action: 'exhausted', nextProbeAt: null });
+      continue;
+    }
+    if (now.getTime() < nextProbeAt.getTime()) {
+      out.push({ ...plan, action: 'wait' });
+      continue;
+    }
+    const pickable = active.filter((r) => {
+      const skip = Number(eff(r)?.skipUntilMs ?? 0);
+      return !(Number.isFinite(skip) && skip > now.getTime());
+    });
+    if (!pickable.length) {
+      out.push({ ...plan, action: 'wait' });
+      continue;
+    }
+    // Canario: primero un item del SERVIDOR (no depende de que haya un navegador abierto; el último que falló).
+    // Solo navegador (I1, fix round 1): el culpable de la pausa fatal del ejecutor (45: state.fatalItem = el PRIMER
+    // fallo no reintentable): el canario anterior que volvió a fallar (su re-falla es el primer fallo de esa
+    // reanudación), y si no hubo, el que falló PRIMERO. Reabrirlo es lo que reanuda al ejecutor pausado.
+    const isWorker = (r: ProviderProbeRow) => !!r.type && AUTO_HEAL_WORKER_ITEM_TYPES.includes(r.type);
+    const workers = pickable.filter(isWorker);
+    let canary: ProviderProbeRow;
+    if (workers.length) {
+      canary = [...workers].sort((a, b) => (failedAtOf(b, now).getTime() - failedAtOf(a, now).getTime()) || String(a.id).localeCompare(String(b.id)))[0];
+    } else {
+      const canaryMs = (r: ProviderProbeRow) => toDate(eff(r)?.canaryAt)?.getTime() ?? -1;
+      const prevCanaries = pickable.filter((r) => canaryMs(r) >= 0);
+      canary = prevCanaries.length
+        ? [...prevCanaries].sort((a, b) => (canaryMs(b) - canaryMs(a)) || String(a.id).localeCompare(String(b.id)))[0]
+        : [...pickable].sort((a, b) => (failedAtOf(a, now).getTime() - failedAtOf(b, now).getTime()) || String(a.id).localeCompare(String(b.id)))[0];
+    }
+    out.push({ ...plan, action: 'probe', canaryId: String(canary.id) });
+  }
+  return out;
+}
+
+/**
+ * Vista de recuperación de UN item (sin el resto del run): ¿la sonda lo está esperando? → la próxima sonda
+ * (la persistida por el barrido, o la primera estimada desde el fallo) y el tope. null = no aplica (vencido,
+ * no es crédito, kill-switch): la vista sigue como hoy.
+ */
+export function providerProbeViewOf(row: ProviderProbeRow, now: Date, enabled: boolean): { provider: FailureProvider; nextProbeAt: Date; deadlineAt: Date } | null {
+  if (!enabled) return null;
+  const provider = providerCreditWaitOf(row);
+  if (!provider) return null;
+  const s = effectiveProbeStateOf(row, provider, now);
+  const failedAt = toDate(row.finished_at) ?? toDate(row.updated_at) ?? now;
+  const first = toDate(s ? s.firstFailedAt : null) ?? failedAt;
+  const deadlineAt = new Date(first.getTime() + PROVIDER_PROBE_MAX_HOURS * 3_600_000);
+  if (now.getTime() > deadlineAt.getTime()) return null;
+  const persisted = s ? toDate(s.nextProbeAt) : null;
+  const nextProbeAt = persisted && persisted.getTime() >= failedAt.getTime()
+    ? persisted
+    : new Date(failedAt.getTime() + PROVIDER_PROBE_WAITS_SECONDS[0] * 1000);
+  return { provider, nextProbeAt, deadlineAt };
+}

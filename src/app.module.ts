@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { PROVIDER_BASE_URL_GUARD, assertProviderBaseUrlsSafe } from './config/provider-base-url-guard';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { DatabaseModule } from './database/database.module';
@@ -17,6 +18,22 @@ import { ContentGenerationModule } from './modules/content-generation/content-ge
 import { PackageModule } from './package/package.module';
 import { InstitutionsModule } from './modules/institutions/institutions.module';
 import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.module';
+import { CourseSetupModule } from './modules/course-setup/course-setup.module';
+import { CourseStructureModule } from './modules/course-structure/course-structure.module';
+import { CourseBlueprintsModule } from './modules/course-blueprints/course-blueprints.module';
+import { GenerationManifestsModule } from './modules/generation-manifests/generation-manifests.module';
+import { DynamicGenerationModule } from './modules/dynamic-generation/dynamic-generation.module';
+import { DynamicPackagingModule } from './modules/dynamic-packaging/dynamic-packaging.module';
+import { FeaturesModule } from './modules/features/features.module';
+import { CoherenceModule } from './modules/coherence/coherence.module';
+import { InvalidationModule } from './modules/invalidation/invalidation.module';
+import { CourseProfilesModule } from './modules/course-profiles/course-profiles.module';
+import { PedagogyModule } from './modules/pedagogy/pedagogy.module';
+import { AcademicContextModule } from './modules/academic-context/academic-context.module';
+import { CourseFactsModule } from './modules/course-facts/course-facts.module';
+import { CourseDesignModule } from './modules/course-design/course-design.module';
+import { PrebriefModule } from './modules/prebrief/prebrief.module';
+import { FinopsModule } from './modules/finops/finops.module';
 
 @Module({
   imports: [
@@ -39,8 +56,29 @@ import { BrandProfilesModule } from './modules/brand-profiles/brand-profiles.mod
     PackageModule,
     InstitutionsModule,
     BrandProfilesModule,
+    CourseSetupModule,
+    CourseStructureModule,
+    CourseBlueprintsModule,
+    GenerationManifestsModule,
+    DynamicGenerationModule,
+    DynamicPackagingModule,
+    FeaturesModule,
+    CoherenceModule,
+    InvalidationModule,
+    CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment / pedagogy / academic)
+    PedagogyModule, // Motor pedagógico V1: catálogo, «No estoy seguro», dry-run (sin escrituras ni proveedores)
+    CourseFactsModule, // LOOP 8.1: pedido del curso + «Lo que sabemos del curso» (fuente única)
+    CourseDesignModule, // LOOP 8.3: «Cursia recomienda»
+    PrebriefModule, // Prebrief pedagógico: propuesta versionada, aprobación y PDF
+    AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
+    FinopsModule,
   ],
   controllers: [AppController],
-  providers: [AppService],
+  providers: [
+    AppService,
+    // r58 (AU1 R3): en producción, una URL base de proveedor no oficial impide arrancar (la API y TODOS los
+    // workers cargan AppModule). Corre al inicializar el módulo, con el .env ya volcado en process.env.
+    { provide: PROVIDER_BASE_URL_GUARD, useFactory: () => (assertProviderBaseUrlsSafe(process.env), true) },
+  ],
 })
 export class AppModule {}

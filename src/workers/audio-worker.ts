@@ -1,10 +1,13 @@
 import 'reflect-metadata';
+import { createLegacyPaidClaimGate } from './legacy-paid-job-gate';
 import { Logger } from '@nestjs/common';
+import { isLegacyAudioBlockedForJob } from '../modules/production-jobs/legacy-audio-guard';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from '../app.module';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
 import { Artifact } from '../modules/artifacts/entities/artifact.entity';
 import { TtsService } from '../tts/tts.service';
+import { resolveTtsModel } from '../tts/tts-models';
 import {
   ProductionJobsService,
   AudioWorkerProgressSummary,
@@ -420,7 +423,9 @@ async function uploadMp3Artifact(
 // Core job handler
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function handleAudioJob(
+// Exportado (acceptance fix): check-v2-acceptance-guards.js lo ejecuta con
+// proveedores espiados para probar providerCalls = 0 en un curso V2.
+export async function handleAudioJob(
   job: ProductionJob,
   jobsService: ProductionJobsService,
   artifactsService: ArtifactsService,
@@ -441,11 +446,25 @@ async function handleAudioJob(
   const generateAudiobook = options.generateAudiobook    !== false;
   const audiobookOptional = options.audiobookOptional    !== false;
   const voice = options.voice || process.env.OPENAI_TTS_VOICE || 'marin';
-  const model = options.model || process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts';
+  // r60 Q-22: el modelo que se llama de verdad (snapshot fijo; el alias exacto se normaliza) — el mismo que
+  // tts.service usa y el que se registra en eventos/artifacts.
+  const ttsModel = resolveTtsModel(options.model);
+  const model = ttsModel.model;
+  if (ttsModel.normalized) logger.log(`[AudioWorker] Job ${job.id}: modelo TTS ${ttsModel.requested} → ${model}`);
 
   const rawCourseId = job.frontendCourseId || String(job.courseId ?? 'unknown');
   const apiKey = (process.env.OPENAI_API_KEY ?? '').trim();
   const parentJobId = job.inputPayload?.metadata?.parentJobId ?? null;
+
+  // Decisión del owner (V2): un curso dynamic nunca genera audio legacy. Un
+  // job encolado antes de la regla (o por un camino no guardado) se falla NO
+  // reintentable ANTES de cualquier llamada a OpenAI o artifact.
+  const v2Blocked = await isLegacyAudioBlockedForJob(job, jobsService);
+  if (v2Blocked) {
+    logger.warn(`[AudioWorker] Job ${jobId}: ${v2Blocked}`);
+    await jobsService.failAudioWorkerJob(jobId, workerId, v2Blocked, false);
+    return;
+  }
 
   let leaseLost = false;
   let finalized = false;
@@ -892,12 +911,13 @@ async function bootstrap() {
   process.on('SIGINT',  () => void shutdown('SIGINT'));
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
+  const legacyPaidGate = createLegacyPaidClaimGate(logger, 'audio-worker');
   logger.log(
     `Audio worker started (workerId=${workerId}, pollMs=${pollMs}, leaseSeconds=${leaseSeconds}, dryRun=${dryRun})`,
   );
 
   while (!shuttingDown) {
-    const claimed = await jobsService.claimNextBackendAudioJob(workerId, leaseSeconds);
+    const claimed = legacyPaidGate() ? await jobsService.claimNextBackendAudioJob(workerId, leaseSeconds) : null;
 
     if (!claimed) {
       idlePolls += 1;
@@ -927,7 +947,7 @@ async function bootstrap() {
         parentJobId: claimed.inputPayload?.metadata?.parentJobId ?? null,
         component: 'audio',
         provider: 'openai_tts',
-        model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts',
+        model: resolveTtsModel(undefined).model,
         mode: 'dry_run',
         costType: 'mock_zero',
         estimatedCostUsd: 0,
@@ -982,10 +1002,14 @@ async function bootstrap() {
   }
 }
 
-bootstrap().catch((error) => {
-  const logger = new Logger('AudioWorker');
-  logger.error(
-    `Fatal audio worker bootstrap error: ${error instanceof Error ? error.stack || error.message : String(error)}`,
-  );
-  process.exit(1);
-});
+// Mismo patrón que dynamic-item-worker: pm2 lo ejecuta como entrypoint
+// (require.main === module); importarlo desde un check no arranca el loop.
+if (require.main === module) {
+  bootstrap().catch((error) => {
+    const logger = new Logger('AudioWorker');
+    logger.error(
+      `Fatal audio worker bootstrap error: ${error instanceof Error ? error.stack || error.message : String(error)}`,
+    );
+    process.exit(1);
+  });
+}

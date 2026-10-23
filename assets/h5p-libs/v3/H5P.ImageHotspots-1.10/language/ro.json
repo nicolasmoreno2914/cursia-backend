@@ -1,0 +1,98 @@
+{
+  "semantics": [
+    {
+      "label": "Imagine de fundal",
+      "description": "Imaginea afișată pe fundal."
+    },
+    {
+      "label": "Text alternativ pentru imaginea de fundal",
+      "description": "Dacă browserul nu poate încărca imaginea, acest text va fi afișat în schimb. De asemenea, este folosit de tehnologiile asistive."
+    },
+    {
+      "label": "Pictogramă punct activ",
+      "options": [
+        {
+          "label": "Pictogramă predefinită"
+        },
+        {
+          "label": "Imagine încărcată"
+        }
+      ]
+    },
+    {
+      "label": "Pictogramă predefinită",
+      "description": "Utilizarea unei pictograme predefinite pentru punctul activ.",
+      "options": [
+        {
+          "label": "Plus"
+        },
+        {
+          "label": "Minus"
+        },
+        {
+          "label": "X (Închide)"
+        },
+        {
+          "label": "Bifă"
+        },
+        {
+          "label": "Întrebare"
+        },
+        {
+          "label": "Informații"
+        },
+        {
+          "label": "Exclamare"
+        }
+      ]
+    },
+    {
+      "label": "Imagine încărcată",
+      "description": "Folosiți propria imagine pentru pictograma punctului activ.<br />Se recomandă o imagine de 75px pe 75px."
+    },
+    {
+      "label": "Culoare punct activ",
+      "description": "Culoarea punctelor active"
+    },
+    {
+      "entity": "hotspot",
+      "label": "Puncte active",
+      "field": {
+        "label": "Punct activ",
+        "fields": [
+          {
+            "label": "Poziție punct activ",
+            "description": "Apăsați pe miniatura imaginii pentru a plasa punctul activ"
+          },
+          {
+            "label": "Acoperă întreaga imagine de fundal",
+            "description": "Când utilizatorul apasă pe punctul activ, fereastra pop-up va acoperi întreaga imagine de fundal"
+          },
+          {
+            "label": "Antet",
+            "description": "Antet opțional pentru fereastra pop-up. Acesta este utilizat de tehnologiile asistive."
+          },
+          {
+            "label": "Conținut pop-up",
+            "field": {
+              "label": "Element de conținut"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "label": "Etichetă punct activ pentru tehnologii asistive",
+      "default": "Punct activ #num",
+      "description": "Va ajuta la anunțarea elementului punct activ la care s-a navigat, dacă nu este specificat un antet pentru un punct activ. #num poate fi folosit pentru a înlocui numărul punctului activ."
+    },
+    {
+      "label": "Etichetă buton de închidere pentru tehnologii asistive",
+      "default": "Închide"
+    },
+    {
+      "label": "Etichetă pentru tehnologii asistive care indică faptul că punctul activ conține Audio/Video",
+      "default": "Conține Audio/Video"
+    }
+  ]
+}

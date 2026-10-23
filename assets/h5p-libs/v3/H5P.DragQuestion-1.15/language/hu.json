@@ -1,0 +1,275 @@
+{
+  "semantics": [
+    {
+      "label": "Válasz ellenőrzése gomb",
+      "default": "Ellenőrzés"
+    },
+    {
+      "label": "Válasz leadása gomb",
+      "default": "Leadás"
+    },
+    {
+      "label": "Újra gomb",
+      "default": "Újra"
+    },
+    {
+      "label": "Pontszámmagyarázó szöveg",
+      "default": "A helyes válaszok +1 pontot érnek. A helytelen válaszok -1 pontot érnek. Az elérhető legalacsonyabb pontszám 0."
+    },
+    {
+      "fields": [
+        {
+          "label": "Beállítások",
+          "fields": [
+            {
+              "label": "Háttérkép",
+              "description": "Opcionális. Válassza ki a háttérként használni kívánt képet a fogd és vidd feladathoz."
+            },
+            {
+              "label": "Feladat mérete",
+              "description": "Adja meg, hogy mekkora legyen a játéktér (px-ben)."
+            }
+          ]
+        },
+        {
+          "label": "Feladat",
+          "description": "Kezdje az elhelyezési zónák megadásával!<br />Ezután hozza létre a mozgatható elemeket, és azoknál adja meg a helyes elhelyezési zónákat!<br />Végül térjen vissza az elhelyezési zónák beállításaihoz, és ott is adja meg a helyes válaszokat!",
+          "fields": [
+            {
+              "label": "Elemek",
+              "entity": "elem",
+              "field": {
+                "label": "Elem",
+                "fields": [
+                  {
+                    "description": "Válassza ki a hozzáadni kívánt tartalom típusát!"
+                  },
+                  {},
+                  {},
+                  {},
+                  {},
+                  {
+                    "label": "Válassza ki az elhelyezési zónákat"
+                  },
+                  {
+                    "label": "Háttér átlátszósága",
+                    "description": "Az átlátszóság csökkentése ronthat a kontraszton, ami a tartalmat nehezen olvashatóvá teheti."
+                  },
+                  {
+                    "label": "Végtelen számú elem példány",
+                    "description": "Az elem klónozása, hogy az több elhelyezési zónánál felhasználható legyen."
+                  }
+                ]
+              }
+            },
+            {
+              "label": "Elhelyezési zónák",
+              "entity": "Elhelyezési zóna",
+              "field": {
+                "label": "Elhelyezési zóna",
+                "fields": [
+                  {
+                    "label": "Címke",
+                    "description": "A címkét a támogató-segítő eszközök használják."
+                  },
+                  {
+                    "label": "Címke mutatása"
+                  },
+                  {},
+                  {},
+                  {},
+                  {},
+                  {
+                    "label": "Válassza ki a helyes elemeket"
+                  },
+                  {
+                    "label": "Háttér átlátszósága",
+                    "description": "Az átlátszóság csökkentése ronthat a kontraszton, ami a tartalmat nehezen olvashatóvá teheti."
+                  },
+                  {
+                    "label": "Segítségek és visszajelzés",
+                    "fields": [
+                      {
+                        "label": "Segítség szövege"
+                      },
+                      {
+                        "label": "A helyes elhelyezésnél megjelenő üzenet",
+                        "description": "Az üzenet a feladat alatt jelenik meg az „ellenőrzés”-kor, ha a jó helyre került az elem."
+                      },
+                      {
+                        "label": "A helytelen elhelyezésnél megjelenő üzenet",
+                        "description": "Az üzenet a feladat alatt jelenik meg az „ellenőrzés”-kor, ha az elhelyezés rossz."
+                      }
+                    ]
+                  },
+                  {
+                    "label": "Ez az elhelyezési csak egy elemet tartalmazhat",
+                    "description": "Győződjön meg róla, hogy csak egy helyes válasz van erre a zónára"
+                  },
+                  {
+                    "label": "Automatikus igazítás engedélyezése",
+                    "description": "Automatikusan beigazítja az összes húzható elemet ennél a zónánál."
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "Globális visszajelzés",
+      "fields": [
+        {
+          "widgets": [
+            {
+              "label": "Alapértelmezett"
+            }
+          ],
+          "label": "Egyéni visszajelzés megadása tetszőleges eredmény intervallumokra",
+          "description": "Kattintson az \"Új intervallum\" gombra további intervallumok hozzáadásához. Például: 0-20% Rossz eredmény, 21-91% Átlagos eredmény, 91-100% Kimagasló eredmény!",
+          "entity": "intervallum",
+          "field": {
+            "fields": [
+              {
+                "label": "Eredmény intervallum"
+              },
+              {},
+              {
+                "label": "Visszajelzés az adott eredmény intervallumnál",
+                "placeholder": "Adja meg a visszajelzést"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "label": "Viselkedési beállítások",
+      "description": "Ezek a beállításokkal szabályozható a feladat viselkedése.",
+      "fields": [
+        {
+          "label": "\"Újra\" engedélyezve"
+        },
+        {
+          "label": "\"Ellenőrzés\" engedélyezve"
+        },
+        {
+          "label": "Egy pont jár a teljes feladatért",
+          "description": "Kikapcsolása esetén minden megfelelően elhelyezett húzható elemért egy pont jár."
+        },
+        {
+          "label": "Büntetőpont alkalmazása",
+          "description": "Pontlevonás a nem a megfelelő zónába helyezett elemekért. Ezt be kell kapcsolni, ha ugyanaz(ok) az elem(ek) több zónába is elhelyezhető(k), vagy ha csak egy elhelyezési zóna van. Ha ez nincs bekapcsolva, a tanulók az összes elemet az összes zónához elhelyezhetik, és mindig max pontszámot kapnak."
+        },
+        {
+          "label": "Pontszámmagyarázat engedélyezve",
+          "description": "Egy pontszámmagyarázat megjelenítése a felhasználónak, amikor a válaszait ellenőrzi (ha a \"Büntetőpont alkalmazása\" opció be van kapcsolva)."
+        },
+        {
+          "label": "Mozgatható elemek háttérének átlátszósága",
+          "description": "Beállítása esetén a megadott érték felülírja az összes mozgatható elem átlátszóságát. Az értéknek 0 és 100 közötti számnak kell lennie, ahol a 0 a teljesen átlátszó, a 100 pedig az egyáltalán nem átlátszó"
+        },
+        {
+          "label": "Elhelyezési zóna kiemelése",
+          "description": "Válassza ki, mikor emelje ki az elhelyezési zónákat.",
+          "options": [
+            {
+              "label": "Mozgatáskor"
+            },
+            {
+              "label": "Mindig"
+            },
+            {
+              "label": "Soha"
+            }
+          ]
+        },
+        {
+          "label": "Távolság az automatikus beigazításhoz (px-ben)"
+        },
+        {
+          "label": "Teljes képernyő engedélyezve",
+          "description": "Jelölje be ezt az opciót a teljes képernyős gomb engedélyezéséhez."
+        },
+        {
+          "label": "Pontszámok mutatása",
+          "description": "Az egyes válaszokért kapott pontok megjelenítése. Nem elérhető, ha az \"Egy pont jár a teljes feladatért\" beállítás használatban van."
+        },
+        {
+          "label": "Show Title",
+          "description": "Uncheck this option if you do not want this title to be displayed. The title will only be displayed in summaries, statistics etc."
+        },
+        {
+          "label": "Show drag handles (new look and feel only)",
+          "description": "Toggles the visibility of drag handles used to move elements on the canvas."
+        }
+      ]
+    },
+    {
+      "label": "Lokalizáció",
+      "fields": [
+        {
+          "label": "Teljes képernyő címke",
+          "default": "Teljes képernyő"
+        },
+        {
+          "label": "Kilépés a teljes képernyőből címke",
+          "default": "Kilépés a teljes képernyőből"
+        }
+      ]
+    },
+    {
+      "label": "Mozgatható előtagja",
+      "default": "{total}/{num} mozgatható."
+    },
+    {
+      "label": "Mozgatható utótagja",
+      "default": "{num}. zónába helyezve."
+    },
+    {
+      "label": "Elhelyezési zóna előtagja",
+      "default": "{total}/{num} elhelyezési zóna."
+    },
+    {
+      "label": "Nincs elhelyezési zóna kijelölve címke",
+      "default": "Nincs elhelyezési zóna."
+    },
+    {
+      "label": "Címke a segítség megjelenítése gombhoz",
+      "default": "Segítség mutatása."
+    },
+    {
+      "label": "Címke a rendelkezésre álló segítségről",
+      "default": "Segítség elérhető"
+    },
+    {
+      "label": "Címke a helyes válaszhoz",
+      "default": "Helyes válasz"
+    },
+    {
+      "label": "Címke a helytelen válaszhoz",
+      "default": "Helytelen válasz"
+    },
+    {
+      "label": "A helyes/helytelen válaszokkal kapcsolatos visszajelzéseket tartalmazó panel fejléce",
+      "default": "Visszajelzés"
+    },
+    {
+      "label": "A pontszámjelző sáv szöveges megjelenítése a szövegfelolvasót használók számára",
+      "default": "Elért pontszám: :num / :total"
+    },
+    {
+      "label": "A pontszám magyarázata gomb szöveges megjelenítése",
+      "default": "Pontszámmagyarázat mutatása"
+    },
+    {
+      "label": "\"Ellenőrzés\" gomb címkéje támogató-segítő eszközöknek",
+      "default": "Válaszok ellenőrzése. A válaszokat helyesnek, helytelennek vagy megválaszolatlannak jelöli."
+    },
+    {
+      "label": "\"Újra\" gomb címkéje támogató-segítő eszközöknek",
+      "default": "Feladat újrapróbálása. Minden válasz visszaállítása és a feladat újrakezdése."
+    }
+  ]
+}

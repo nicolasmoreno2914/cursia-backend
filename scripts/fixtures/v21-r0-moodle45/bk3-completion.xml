@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<course_completion>
+  <course_completion_criteria id="1">
+    <course>128</course>
+    <criteriatype>4</criteriatype>
+    <module>scorm</module>
+    <moduleinstance>4602</moduleinstance>
+    <courseinstanceshortname>$@NULL@$</courseinstanceshortname>
+    <enrolperiod>$@NULL@$</enrolperiod>
+    <timeend>$@NULL@$</timeend>
+    <gradepass>$@NULL@$</gradepass>
+    <role>$@NULL@$</role>
+    <roleshortname>$@NULL@$</roleshortname>
+    <course_completion_crit_completions>
+    </course_completion_crit_completions>
+  </course_completion_criteria>
+  <course_completion_aggr_methd id="1">
+    <course>128</course>
+    <criteriatype>$@NULL@$</criteriatype>
+    <method>1</method>
+    <value>$@NULL@$</value>
+  </course_completion_aggr_methd>
+</course_completion>
