@@ -1043,6 +1043,7 @@ async function dbChecks() {
     process.env.DYNAMIC_VIDEO_DELIVERY = 'youtube'; // V2.1 F2: v3 con videos exige YouTube (también en mock)
     process.env.DYNAMIC_ALLOW_VIDEO_PREVIEW = 'true'; // EV6 DoD (BE-A): videoMode mock solo con el escape de QA
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     delete process.env.ALLOW_UNOWNED_COURSES;
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [], synchronize: false });
     await ds.initialize();

@@ -8,8 +8,11 @@ import { readConfiguredRulesVersion } from '../generation-manifests/manifest-rul
  * - `DYNAMIC_COURSE_STRUCTURE`: SOLO el string exacto `'true'` activa V2.
  *   Ausente / cualquier otro valor → OFF (default de producción).
  * - `DYNAMIC_V2_ALLOWED_OWNERS`: UUIDs de owner separados por coma.
- *   Flag OFF → nadie; flag ON + lista vacía/ausente → todos (staging);
- *   flag ON + lista → solo esos owners.
+ *   Flag OFF → nadie; flag ON + lista → solo esos owners. FAIL CLOSED (lanzamiento V2):
+ *   flag ON + lista vacía/ausente → NADIE (antes: todos).
+ * - `DYNAMIC_V2_GENERAL_AVAILABILITY`: SOLO el string exacto `'true'` abre V2 a TODO owner
+ *   registrado (habilitación pública explícita, independiente de la lista del canario). No cambia
+ *   aprobación ni presupuesto: los topes por owner se siguen aplicando en el backend.
  * - `DYNAMIC_REAL_VIDEO_OWNERS`: UUIDs de owner que pueden iniciar runs con
  *   `videoMode: 'real'` (Videogen pago). FAIL CLOSED: ausente/vacía → nadie.
  * - `DYNAMIC_REAL_VIDEO_ALL_OWNERS` (EV6 DoD): SOLO el string exacto `'true'`
@@ -30,6 +33,7 @@ import { readConfiguredRulesVersion } from '../generation-manifests/manifest-rul
  */
 export const DYNAMIC_FLAG_ENV = 'DYNAMIC_COURSE_STRUCTURE';
 export const DYNAMIC_ALLOWED_OWNERS_ENV = 'DYNAMIC_V2_ALLOWED_OWNERS';
+export const GENERAL_AVAILABILITY_ENV = 'DYNAMIC_V2_GENERAL_AVAILABILITY';
 export const REAL_VIDEO_OWNERS_ENV = 'DYNAMIC_REAL_VIDEO_OWNERS';
 export const COHERENCE_LLM_ENV = 'DYNAMIC_COHERENCE_LLM';
 export const REAL_VIDEO_ALL_OWNERS_ENV = 'DYNAMIC_REAL_VIDEO_ALL_OWNERS';
@@ -136,7 +140,8 @@ export function validateDynamicFeatureConfig(env: Env = process.env): void {
 export function isDynamicAllowedForOwner(ownerId: string, env: Env = process.env): boolean {
   if (!isDynamicCourseStructureEnabled(env)) return false;
   const allowed = parseOwnerList(DYNAMIC_ALLOWED_OWNERS_ENV, env);
-  if (!allowed.length) return true;
+  // Lanzamiento V2: una lista vacía NUNCA abre V2 a todos; solo la habilitación pública explícita.
+  if (env[GENERAL_AVAILABILITY_ENV] === 'true') return true;
   return allowed.includes(String(ownerId ?? '').toLowerCase());
 }
 

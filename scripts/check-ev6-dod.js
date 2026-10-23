@@ -104,7 +104,7 @@ const QA_MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentati
 const ADMIN = { id: OWNER, email: 'Admin@Cursia.test' };
 const OWNER_NOT_ADMIN = { id: OWNER, email: 'owner@cursia.test' };
 const ENV_KEYS = [
-  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
+  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'VIDEOGEN_API_KEY', 'ALLOW_UNOWNED_COURSES',
   'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS', 'DYNAMIC_ALLOW_VIDEO_PREVIEW',
   'DYNAMIC_REAL_VIDEO_ALL_OWNERS',
@@ -180,6 +180,7 @@ const ENV_KEYS = [
 
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     delete process.env.ALLOW_UNOWNED_COURSES;
     delete process.env.DYNAMIC_REAL_VIDEO_ALL_OWNERS;
     // Fase B: los runs de vista previa de este check se crean por el camino QA (escape explícito);

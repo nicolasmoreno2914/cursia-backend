@@ -394,7 +394,7 @@ const CONTEXT = { nombre: 'Curso RF-b', sector: 'Salud', pais: 'Chile', contexto
 // Run MOCK completo: video mock + providerModes mock (R5: el default de Gamma/TTS es real).
 const MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } };
 const ENV_KEYS = [
-  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
+  'DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'VIDEOGEN_API_KEY', 'ALLOW_UNOWNED_COURSES', 'FINOPS_INGEST_TOKEN',
   'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'SUPER_ADMIN_EMAILS', 'DYNAMIC_ALLOW_VIDEO_PREVIEW',
 ];
@@ -521,6 +521,7 @@ async function dbChecks() {
 
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     delete process.env.ALLOW_UNOWNED_COURSES;
     process.env.DYNAMIC_REAL_VIDEO_OWNERS = OWNER;
     process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';

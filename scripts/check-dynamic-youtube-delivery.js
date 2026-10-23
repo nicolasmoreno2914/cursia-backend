@@ -538,7 +538,7 @@ function makeWorld({ videoDelivery = 'youtube', videoMode = 'real', videogenScen
   return { deps, calls, yt, store, reclaim };
 }
 
-const ENV = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_ALLOWED_OWNERS: undefined, DYNAMIC_REAL_VIDEO_OWNERS: OWNER, VIDEOGEN_API_KEY: 'k', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: undefined };
+const ENV = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_ALLOWED_OWNERS: undefined, DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, VIDEOGEN_API_KEY: 'k', DYNAMIC_ALLOW_VIDEOGEN_DIRECT: undefined };
 const { UnauthorizedException, BadRequestException } = require('@nestjs/common');
 const transient = () => new YoutubeUploadTransportError('Fallo al subir video a YouTube: HTTP 503', 'upload', 503);
 const initNetwork = () => new YoutubeUploadTransportError('No se pudo iniciar la subida a YouTube: fetch failed', 'init');

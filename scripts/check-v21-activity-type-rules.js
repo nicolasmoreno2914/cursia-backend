@@ -427,7 +427,7 @@ async function main() {
       },
     };
   }
-  const gcEnv = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_ALLOWED_OWNERS: undefined, DYNAMIC_MANIFEST_RULES_VERSION: '3' };
+  const gcEnv = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_ALLOWED_OWNERS: undefined, DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3' };
   const legacy = B.buildGenerationManifest(bpSnap, srcFor(3), { rulesVersion: 3 });
   const withRules = B.buildGenerationManifest(bpSnap, srcFor(3), { rulesVersion: 3, activityTypeRules: 1 });
   const noMarker = (m) => m.features.activityTypeRules === undefined && m.items.every((i) => i.h5pType === undefined);

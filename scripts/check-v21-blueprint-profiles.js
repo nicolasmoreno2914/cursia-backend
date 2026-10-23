@@ -522,6 +522,7 @@ async function dbChecks() {
     // ── Servicios compilados contra la DB real ────────────────────────────
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     delete process.env.DYNAMIC_MANIFEST_RULES_VERSION;
     delete process.env.ALLOW_UNOWNED_COURSES;
     ds = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'postgres', database: DB, entities: [CourseModule, CourseChapter], synchronize: false });
@@ -764,11 +765,13 @@ async function dbChecks() {
     });
     await check('DB perfiles: escritura con owner fuera de la allow-list V2 → 403', async () => {
       process.env.DYNAMIC_V2_ALLOWED_OWNERS = OTHER;
+      delete process.env.DYNAMIC_V2_GENERAL_AVAILABILITY; // la lista del canario solo decide sin habilitación pública
       try {
         await rejectsRe(profilesSvc.append(cid, OWNER, 'presentation', profiles.defaultPresentationProfile()), /./, 'allow-list', 403);
         await rejectsRe(structure.updateSettings(cid, OWNER, { finalExam: true, expectedCounter: await counter() }), /./, 'allow-list settings', 403);
       } finally {
         delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+        process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
       }
     });
   } finally {

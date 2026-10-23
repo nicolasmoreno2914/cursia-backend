@@ -80,6 +80,30 @@ async function workflowChecks() {
     eq(wf.permissions, { contents: 'read' }, 'permisos mínimos');
   });
 
+  await check('[WF] fail closed: PROD_V2_GENERAL_AVAILABILITY solo con el valor EXACTO true abre V2 a todos; TRUE/" true"/yes/1 → error, nunca apertura', () => {
+    const step = wf.jobs.deploy.steps.find((st) => st.id === 'cfg');
+    assert(step && typeof step.run === 'string', 'paso cfg');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wf-ga-'));
+    const run = (ga) => {
+      const out = path.join(tmp, `out-${Math.random().toString(36).slice(2)}`);
+      fs.writeFileSync(out, '');
+      const r = spawnSync('bash', ['-c', step.run], { encoding: 'utf8', env: { PATH: process.env.PATH, GITHUB_OUTPUT: out, GA: ga, FE_REF: 'staging', CANARY: '', WORKERS: '', LLM: '', POOL_MAX: '', POOL_MAX_WORKER: '', POOL_IDLE_WORKER: '', BLOCK_V1: '', SKIP_STORAGE: '' } });
+      const m = /^ga=(.*)$/m.exec(fs.readFileSync(out, 'utf8'));
+      return { status: r.status, ga: m ? m[1] : null };
+    };
+    try {
+      eq(run('true'), { status: 0, ga: 'true' }, 'true exacto');
+      eq(run(''), { status: 0, ga: 'false' }, 'vacía → false');
+      eq(run('false'), { status: 0, ga: 'false' }, 'false');
+      for (const v of ['TRUE', 'True', ' true', 'true ', 'yes', '1', 'on']) {
+        const r = run(v);
+        assert(r.status !== 0 && r.ga === null, `"${v}" debe fallar sin escribir ga: ${JSON.stringify(r)}`);
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   await check('[WF] jobs deploy / rollback: environment production y condiciones EXCLUSIVAS (un push solo despliega)', () => {
     eq(Object.keys(wf.jobs).sort(), ['deploy', 'rollback'], 'jobs');
     eq([wf.jobs.deploy.environment, wf.jobs.rollback.environment], ['production', 'production'], 'environment');
@@ -604,8 +628,19 @@ async function shellChecks() {
       r = runSh(vps, ['preflight', vps.app], { stdinScript: true });
       assert(r.status === 1 && /abierto a TODOS/.test(r.out), `preflight: ${r.out}`);
       eq(runSh(vps, ['preflight', vps.app, OWNER], { stdinScript: true }).status, 0, 'preflight con canario (allowlist que el deploy va a escribir)');
+      assert(!/^DYNAMIC_V2_GENERAL_AVAILABILITY=true$/m.test(envOf(vps.app)), 'sin decisión GA el backend nunca queda abierto a todos');
       r = runSh(vps, ['install'], { input: cfgInput({ ga: 'true' }) });
       assert(r.status === 0 && /TODOS LOS OWNERS/.test(r.out), r.out);
+      // Fail closed (lanzamiento V2): el backend solo abre V2 a todos con la habilitación pública explícita en el .env.
+      assert(/^DYNAMIC_V2_GENERAL_AVAILABILITY=true$/m.test(envOf(vps.app)), `GA explícita escrita en el .env: ${envOf(vps.app)}`);
+      // Canario + habilitación pública: el backend abre a TODOS (la allowlist no limita) y el deploy lo dice así.
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, ga: 'true' }) });
+      assert(r.status === 0 && /TODOS LOS OWNERS/.test(r.out) && !/SOLO para el allowlist/.test(r.out), r.out);
+      assert(/^DYNAMIC_V2_GENERAL_AVAILABILITY=true$/m.test(envOf(vps.app)), 'GA con canario');
+      // Volver a GA=false (decisión explícita) cierra la apertura pública en el .env.
+      r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER }) });
+      assert(r.status === 0 && /SOLO para el allowlist/.test(r.out), r.out);
+      assert(/^DYNAMIC_V2_GENERAL_AVAILABILITY=false$/m.test(envOf(vps.app)), `GA vuelve a false: ${envOf(vps.app)}`);
     });
 
     await check('[SH] NODE_ENV≠production o sin .env → falla sin tocar nada (install y preflight por stdin); config inválida → falla', () => {

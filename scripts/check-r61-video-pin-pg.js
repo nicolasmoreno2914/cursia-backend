@@ -84,7 +84,7 @@ const MOCK_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation:
 // vieja que reanuda manda el mismo cuerpo que congeló el run: video de vista previa + proveedores reales.
 const RESUME_CTX = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation: 'real', audio: 'real' } };
 
-const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
+const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION',
   'DYNAMIC_VIDEO_DELIVERY', 'ALLOW_UNOWNED_COURSES', 'DYNAMIC_PROVIDER_WORKER_ENABLED', 'DYNAMIC_ALLOW_PROVIDER_MOCK', 'DYNAMIC_ALLOW_VIDEO_PREVIEW',
   'VIDEOGEN_API_KEY', 'DYNAMIC_ALLOW_VIDEOGEN_DIRECT', 'SUPER_ADMIN_EMAILS'];
 
@@ -154,6 +154,7 @@ const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_ALLOWED_OWNERS', 'DYNA
 
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
     delete process.env.DYNAMIC_V2_ALLOWED_OWNERS;
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     delete process.env.ALLOW_UNOWNED_COURSES;
     process.env.DYNAMIC_REAL_VIDEO_OWNERS = OWNER;
     process.env.DYNAMIC_MANIFEST_RULES_VERSION = '3';

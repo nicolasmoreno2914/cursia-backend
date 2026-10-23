@@ -11,7 +11,8 @@
 //      de Nest; las rutas legacy no cambian. Con el flag ON llegan al
 //      controller.
 //  G3  DYNAMIC_V2_ALLOWED_OWNERS (UUIDs separados por coma): OFF → nadie;
-//      ON + vacía → todos; ON + lista → solo esos owners (403 al resto) en
+//      ON + vacía → NADIE (fail closed, lanzamiento V2); ON + lista → solo esos owners (403 al resto);
+//      DYNAMIC_V2_GENERAL_AVAILABILITY='true' exacto → todos (habilitación pública explícita) en
 //      crear/buscar curso dynamic, iniciar/reabrir run y pedir paquete.
 //      Entradas inválidas → falla ruidosa SOLO en caminos dynamic.
 //  I1  DYNAMIC_REAL_VIDEO_OWNERS (fail closed): sin lista → nadie inicia un
@@ -198,6 +199,7 @@ const FLAG = 'DYNAMIC_COURSE_STRUCTURE';
 const ALLOW = 'DYNAMIC_V2_ALLOWED_OWNERS';
 const REAL = 'DYNAMIC_REAL_VIDEO_OWNERS';
 const COH_LLM = 'DYNAMIC_COHERENCE_LLM';
+const GA = 'DYNAMIC_V2_GENERAL_AVAILABILITY';
 const OWNER_A = 'aa2fa9a1-afb1-4b01-8646-94a0cb272b57';
 const OWNER_B = '11111111-2222-4333-8444-555555555555';
 const OWNER_C = '99999999-8888-4777-8666-555555555555';
@@ -219,7 +221,7 @@ async function withEnv(vars, fn) {
     }
   }
 }
-const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [REAL]: undefined, [COH_LLM]: undefined, DYNAMIC_MANIFEST_RULES_VERSION: undefined,
+const ENV_CLEAN = { [FLAG]: undefined, [ALLOW]: undefined, [GA]: undefined, [REAL]: undefined, [COH_LLM]: undefined, DYNAMIC_MANIFEST_RULES_VERSION: undefined,
   DYNAMIC_ALLOW_VIDEO_PREVIEW: undefined, DYNAMIC_REAL_VIDEO_ALL_OWNERS: undefined, SUPER_ADMIN_EMAILS: undefined };
 // EV6 DoD (BE-A): `videoMode:'mock'` exige el escape de QA; estos casos (que prueban la allow-list) lo setean.
 const PREVIEW_ESCAPE = { DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true' };
@@ -425,28 +427,33 @@ async function runWorkerProcess(script, env, { waitMs }) {
     features._resetNearMissFlagWarningForTests();
   });
 
-  await check('G3 matriz resolveDynamicFeatures: off / on+vacía / on+listado / on+no listado', () => {
+  await check('G3 matriz resolveDynamicFeatures: off / on+vacía (fail closed) / habilitación pública / on+listado / on+no listado', () => {
     const r = features.resolveDynamicFeatures;
     eq(r(OWNER_A, {}).dynamicCourseStructure, false, 'off');
     eq(r(OWNER_A, { [ALLOW]: OWNER_A }).dynamicCourseStructure, false, 'off aunque esté listado');
-    eq(r(OWNER_A, { [FLAG]: 'true' }).dynamicCourseStructure, true, 'on + sin lista');
-    eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: '  ' }).dynamicCourseStructure, true, 'on + lista vacía');
+    eq(r(OWNER_A, { [FLAG]: 'true' }).dynamicCourseStructure, false, 'on + sin lista → nadie (fail closed)');
+    eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: '  ' }).dynamicCourseStructure, false, 'on + lista vacía → nadie (fail closed)');
+    eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: ' , ' }).dynamicCourseStructure, false, 'on + lista solo con comas → nadie');
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true' }).dynamicCourseStructure, true, 'habilitación pública explícita → todos');
+    eq(r(OWNER_C, { [FLAG]: 'true', [GA]: 'true', [ALLOW]: OWNER_A }).dynamicCourseStructure, true, 'habilitación pública: independiente de la lista del canario');
+    for (const v of ['TRUE', 'True', '1', 'yes', ' true', 'true ']) eq(r(OWNER_A, { [FLAG]: 'true', [GA]: v }).dynamicCourseStructure, false, `GA "${v}" no exacto → nadie`);
+    eq(r(OWNER_A, { [GA]: 'true' }).dynamicCourseStructure, false, 'habilitación pública con el flag OFF → nadie');
     eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: `${OWNER_B}, ${OWNER_A.toUpperCase()}` }).dynamicCourseStructure, true, 'on + listado (case-insensitive, espacios)');
     eq(r(OWNER_C, { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}` }).dynamicCourseStructure, false, 'on + no listado');
   });
 
   await check('I1 matriz realVideo (fail closed): sin lista → nadie; listado → sí; no listado → no; requiere V2 habilitada', () => {
     const r = features.resolveDynamicFeatures;
-    eq(r(OWNER_A, { [FLAG]: 'true' }).realVideo, false, 'lista real ausente');
-    eq(r(OWNER_A, { [FLAG]: 'true', [REAL]: '' }).realVideo, false, 'lista real vacía');
-    eq(r(OWNER_A, { [FLAG]: 'true', [REAL]: `,${OWNER_A}` }).realVideo, true, 'listado (entrada vacía tolerada)');
-    eq(r(OWNER_B, { [FLAG]: 'true', [REAL]: OWNER_A }).realVideo, false, 'no listado');
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true' }).realVideo, false, 'lista real ausente');
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true', [REAL]: '' }).realVideo, false, 'lista real vacía');
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true', [REAL]: `,${OWNER_A}` }).realVideo, true, 'listado (entrada vacía tolerada)');
+    eq(r(OWNER_B, { [FLAG]: 'true', [GA]: 'true', [REAL]: OWNER_A }).realVideo, false, 'no listado');
     eq(r(OWNER_A, { [REAL]: OWNER_A }).realVideo, false, 'flag OFF');
     eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: OWNER_B, [REAL]: OWNER_A }).realVideo, false, 'V2 no permitida para el owner');
     // EV6 DoD (BE-A): DYNAMIC_REAL_VIDEO_ALL_OWNERS=true (solo el string exacto) → todo owner con V2 es elegible.
-    eq(r(OWNER_B, { [FLAG]: 'true', [REAL]: OWNER_A, DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, true, 'ALL_OWNERS: no listado elegible');
-    eq(r(OWNER_C, { [FLAG]: 'true', DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, true, 'ALL_OWNERS sin lista');
-    for (const v of ['TRUE', 'True', '1', ' true']) eq(r(OWNER_B, { [FLAG]: 'true', DYNAMIC_REAL_VIDEO_ALL_OWNERS: v }).realVideo, false, `ALL_OWNERS "${v}" no activa`);
+    eq(r(OWNER_B, { [FLAG]: 'true', [GA]: 'true', [REAL]: OWNER_A, DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, true, 'ALL_OWNERS: no listado elegible');
+    eq(r(OWNER_C, { [FLAG]: 'true', [GA]: 'true', DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, true, 'ALL_OWNERS sin lista');
+    for (const v of ['TRUE', 'True', '1', ' true']) eq(r(OWNER_B, { [FLAG]: 'true', [GA]: 'true', DYNAMIC_REAL_VIDEO_ALL_OWNERS: v }).realVideo, false, `ALL_OWNERS "${v}" no activa`);
     eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: OWNER_B, DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, false, 'ALL_OWNERS no salta la allow-list V2');
     eq(r(OWNER_A, { DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }).realVideo, false, 'ALL_OWNERS con flag OFF');
   });
@@ -457,7 +464,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
     assert(err instanceof features.DynamicFeatureConfigError, `esperaba DynamicFeatureConfigError, fue ${err}`);
     assert(/DYNAMIC_V2_ALLOWED_OWNERS/.test(err.message) && /no-es-uuid/.test(err.message), err.message);
     err = null;
-    try { features.resolveDynamicFeatures(OWNER_A, { [FLAG]: 'true', [REAL]: 'xyz' }); } catch (e) { err = e; }
+    try { features.resolveDynamicFeatures(OWNER_A, { [FLAG]: 'true', [GA]: 'true', [REAL]: 'xyz' }); } catch (e) { err = e; }
     assert(err instanceof features.DynamicFeatureConfigError && /DYNAMIC_REAL_VIDEO_OWNERS/.test(err.message), `real inválida: ${err}`);
     // Flag OFF: la lista ni se parsea (legacy/boot nunca se ven afectados).
     eq(features.resolveDynamicFeatures(OWNER_A, { [ALLOW]: 'basura' }), { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false }, 'off ignora lista inválida');
@@ -465,14 +472,14 @@ async function runWorkerProcess(script, env, { waitMs }) {
 
   await check('F78-BE2 matriz coherenceLlm (fail closed): solo "true" exacto y solo con V2 permitida', () => {
     const r = features.resolveDynamicFeatures;
-    eq(r(OWNER_A, { [FLAG]: 'true' }).coherenceLlm, false, 'env ausente');
-    eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: '' }).coherenceLlm, false, 'env vacío');
-    eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: 'true' }).coherenceLlm, true, 'true + V2 sin lista');
-    for (const v of ['TRUE', 'True', '1', 'yes', 'on', ' true']) eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: v }).coherenceLlm, false, `valor "${v}" no activa`);
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true' }).coherenceLlm, false, 'env ausente');
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true', [COH_LLM]: '' }).coherenceLlm, false, 'env vacío');
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true', [COH_LLM]: 'true' }).coherenceLlm, true, 'true + V2 sin lista');
+    for (const v of ['TRUE', 'True', '1', 'yes', 'on', ' true']) eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true', [COH_LLM]: v }).coherenceLlm, false, `valor "${v}" no activa`);
     eq(r(OWNER_A, { [COH_LLM]: 'true' }).coherenceLlm, false, 'flag V2 OFF');
     eq(r(OWNER_C, { [FLAG]: 'true', [ALLOW]: OWNER_A, [COH_LLM]: 'true' }).coherenceLlm, false, 'owner fuera de la allow-list V2');
     eq(r(OWNER_A, { [FLAG]: 'true', [ALLOW]: OWNER_A, [COH_LLM]: 'true' }).coherenceLlm, true, 'owner en la allow-list V2');
-    eq(r(OWNER_A, { [FLAG]: 'true', [COH_LLM]: 'true' }).realVideo, false, 'coherenceLlm no habilita video real');
+    eq(r(OWNER_A, { [FLAG]: 'true', [GA]: 'true', [COH_LLM]: 'true' }).realVideo, false, 'coherenceLlm no habilita video real');
   });
 
   await check('G1 set de rutas: los 11 controllers dynamic (incl. Coherence/Invalidation, Fase 7/8, YouTube preflight DN-1 y V2.1 R3 settings/profiles) + solo POST /courses/dynamic de CoursesController', () => {
@@ -573,7 +580,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
 
     // EV6 DoD BE-B: la cola de recuperación es SUPER_ADMIN (SuperAdminGuard): el usuario de prueba es admin acá.
     await check('G1 flag ON: todas las rutas dynamic llegan al controller (nunca 404 del gate)', () =>
-      withEnv({ ...ENV_CLEAN, [FLAG]: 'true', SUPER_ADMIN_EMAILS: 'test@example.com' }, async () => {
+      withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [GA]: 'true', SUPER_ADMIN_EMAILS: 'test@example.com' }, async () => {
         for (const r of dynamicRoutes) {
           serviceCalls.length = 0;
           const res = await call(base, r.method, r.path, { user: OWNER_A });
@@ -614,7 +621,9 @@ async function runWorkerProcess(script, env, { waitMs }) {
     const i4Matrix = [
       { label: 'ON + no listado → 403', env: { [FLAG]: 'true', [ALLOW]: OWNER_B }, status: 403 },
       { label: 'ON + listado → 201', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}` }, status: 201 },
-      { label: 'ON + lista vacía (staging) → 201', env: { [FLAG]: 'true' }, status: 201 },
+      { label: 'ON + lista vacía (fail closed) → 403', env: { [FLAG]: 'true' }, status: 403 },
+      { label: 'ON + habilitación pública explícita → 201', env: { [FLAG]: 'true', [GA]: 'true' }, status: 201 },
+      { label: 'ON + habilitación pública no exacta ("TRUE") → 403', env: { [FLAG]: 'true', [GA]: 'TRUE' }, status: 403 },
       { label: 'ON + lista inválida → 500 nombrando la variable', env: { [FLAG]: 'true', [ALLOW]: 'nope' }, status: 500 },
     ];
     for (const m of i4Matrix) {
@@ -634,18 +643,19 @@ async function runWorkerProcess(script, env, { waitMs }) {
     const featureMatrix = [
       { label: 'flag OFF', env: {}, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
       { label: 'flag OFF aunque esté en ambas listas', env: { [ALLOW]: OWNER_A, [REAL]: OWNER_A, [COH_LLM]: 'true' }, user: OWNER_A, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
-      { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1 } },
-      { label: 'ON + lista vacía + coherencia IA', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: true, manifestRulesVersion: 1 } },
+      { label: 'ON + lista vacía (fail closed)', env: { [FLAG]: 'true', [COH_LLM]: 'true', DYNAMIC_REAL_VIDEO_ALL_OWNERS: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
+      { label: 'ON + habilitación pública explícita', env: { [FLAG]: 'true', [GA]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1 } },
+      { label: 'ON + habilitación pública + coherencia IA', env: { [FLAG]: 'true', [GA]: 'true', [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: true, manifestRulesVersion: 1 } },
       { label: 'ON + listado + real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_A, want: { dynamicCourseStructure: true, realVideo: true, coherenceLlm: false, manifestRulesVersion: 1 } },
       { label: 'ON + listado sin real', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}`, [REAL]: OWNER_A }, user: OWNER_B, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1 } },
       { label: 'ON + no listado', env: { [FLAG]: 'true', [ALLOW]: OWNER_A, [REAL]: OWNER_C, [COH_LLM]: 'true' }, user: OWNER_C, want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false } },
       // V2.1 fix round 1 (review G2 I4): el editor muestra los toggles V2.1 solo con rulesVersion 3.
-      { label: 'ON + reglas v3 (DYNAMIC_MANIFEST_RULES_VERSION=3)', env: { [FLAG]: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 3 } },
+      { label: 'ON + reglas v3 (DYNAMIC_MANIFEST_RULES_VERSION=3)', env: { [FLAG]: 'true', [GA]: 'true', DYNAMIC_MANIFEST_RULES_VERSION: '3' }, user: OWNER_C, want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 3 } },
     ];
     // EV6 DoD BE-B: la respuesta HTTP agrega `dodContract: true` y `superAdmin` (mismo chequeo del servidor).
     for (const m of featureMatrix) m.want = { ...m.want, dodContract: true, superAdmin: false };
     featureMatrix.push(
-      { label: 'BE-B: SUPER_ADMIN → superAdmin:true (sin lista de admins en la respuesta)', env: { [FLAG]: 'true', SUPER_ADMIN_EMAILS: 'otro@cursia.test, TEST@example.com' }, user: OWNER_C,
+      { label: 'BE-B: SUPER_ADMIN → superAdmin:true (sin lista de admins en la respuesta)', env: { [FLAG]: 'true', [GA]: 'true', SUPER_ADMIN_EMAILS: 'otro@cursia.test, TEST@example.com' }, user: OWNER_C,
         want: { dynamicCourseStructure: true, realVideo: false, coherenceLlm: false, manifestRulesVersion: 1, dodContract: true, superAdmin: true } },
       { label: 'BE-B: flag OFF también informa el contrato DoD y superAdmin', env: { SUPER_ADMIN_EMAILS: 'test@example.com' }, user: OWNER_A,
         want: { dynamicCourseStructure: false, realVideo: false, coherenceLlm: false, dodContract: true, superAdmin: true } },
@@ -662,7 +672,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
       await withEnv(ENV_CLEAN, async () => {
         eq((await call(base, 'GET', '/api/v1/features')).status, 401, 'sin auth');
       });
-      await withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [REAL]: 'xx' }, async () => {
+      await withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [GA]: 'true', [REAL]: 'xx' }, async () => {
         const res = await call(base, 'GET', '/api/v1/features', { user: OWNER_A });
         eq(res.status, 500, 'lista real inválida');
         assert(/DYNAMIC_REAL_VIDEO_OWNERS/.test(JSON.stringify(res.json)), JSON.stringify(res.json));
@@ -675,7 +685,8 @@ async function runWorkerProcess(script, env, { waitMs }) {
   // ── Enforcement en servicios (entry points con ownerId) ────────────────────
   const allowMatrix = [
     { label: 'flag OFF', env: {}, owner: OWNER_A, allowed: false },
-    { label: 'ON + lista vacía', env: { [FLAG]: 'true' }, owner: OWNER_C, allowed: true },
+    { label: 'ON + lista vacía (fail closed)', env: { [FLAG]: 'true' }, owner: OWNER_C, allowed: false },
+    { label: 'ON + habilitación pública explícita', env: { [FLAG]: 'true', [GA]: 'true' }, owner: OWNER_C, allowed: true },
     { label: 'ON + listado', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}` }, owner: OWNER_A, allowed: true },
     { label: 'ON + no listado', env: { [FLAG]: 'true', [ALLOW]: `${OWNER_B},${OWNER_A}` }, owner: OWNER_C, allowed: false },
   ];
@@ -685,7 +696,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
   // EXISTENTE devuelto por POST /courses/dynamic (idempotente) y le atribuía la paleta global.
   // El endpoint informa `created` para que el cliente distinga.
   await check('POST /courses/dynamic informa created:true solo al crear; un curso existente → created:false', () =>
-    withEnv({ ...ENV_CLEAN, [FLAG]: 'true' }, async () => {
+    withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [GA]: 'true' }, async () => {
       const found = { id: 7, title: 'T', structureVersion: 'dynamic' };
       const qb = (hit) => { const q = { where: () => q, andWhere: () => q, orderBy: () => q, getOne: async () => (hit ? found : null) }; return q; };
       const repoHit = { createQueryBuilder: () => qb(true) };
@@ -760,10 +771,10 @@ async function runWorkerProcess(script, env, { waitMs }) {
       }));
   }
   const cohLlmMatrix = [
-    { label: 'V2 permitida sin DYNAMIC_COHERENCE_LLM → 403', env: { [FLAG]: 'true' }, owner: OWNER_A, allowed: false },
-    { label: 'DYNAMIC_COHERENCE_LLM=TRUE (no exacto) → 403', env: { [FLAG]: 'true', [COH_LLM]: 'TRUE' }, owner: OWNER_A, allowed: false },
+    { label: 'V2 permitida sin DYNAMIC_COHERENCE_LLM → 403', env: { [FLAG]: 'true', [GA]: 'true' }, owner: OWNER_A, allowed: false },
+    { label: 'DYNAMIC_COHERENCE_LLM=TRUE (no exacto) → 403', env: { [FLAG]: 'true', [GA]: 'true', [COH_LLM]: 'TRUE' }, owner: OWNER_A, allowed: false },
     { label: 'owner fuera de la allow-list V2 → 403', env: { [FLAG]: 'true', [ALLOW]: OWNER_B, [COH_LLM]: 'true' }, owner: OWNER_A, allowed: false },
-    { label: 'V2 + DYNAMIC_COHERENCE_LLM=true → permitido', env: { [FLAG]: 'true', [COH_LLM]: 'true' }, owner: OWNER_A, allowed: true },
+    { label: 'V2 + DYNAMIC_COHERENCE_LLM=true → permitido', env: { [FLAG]: 'true', [GA]: 'true', [COH_LLM]: 'true' }, owner: OWNER_A, allowed: true },
   ];
   for (const m of cohLlmMatrix) {
     await check(`F78-BE2 CoherenceService.mergeLlm (llm-findings) — ${m.label}`, () =>
@@ -896,7 +907,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
     contextHash = hashOf.canonicalContextHash(hashOf.normalizeCourseContext(CONTEXT));
     return { svc, state };
   }
-  const REAL_ON = { [FLAG]: 'true' };
+  const REAL_ON = { [FLAG]: 'true', [GA]: 'true' };
   const realMatrix = [
     { label: 'lista real ausente + real → 403', env: REAL_ON, owner: OWNER_A, mode: 'real', scenario: 'new', ok: false },
     { label: 'lista real vacía + real → 403', env: { ...REAL_ON, [REAL]: '' }, owner: OWNER_A, mode: 'real', scenario: 'new', ok: false },
@@ -936,7 +947,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
       }));
   }
   await check('I1 lista real inválida + real → 500 ruidoso; + mock → no afecta', () =>
-    withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [REAL]: 'zz', ...PREVIEW_ESCAPE }, async () => {
+    withEnv({ ...ENV_CLEAN, [FLAG]: 'true', [GA]: 'true', [REAL]: 'zz', ...PREVIEW_ESCAPE }, async () => {
       const a = runsServiceFor('new', 'real');
       await rejects(a.svc.startRun(1, OWNER_A, 1, { ...CONTEXT, videoMode: 'real' }), InternalServerErrorException, /DYNAMIC_REAL_VIDEO_OWNERS/, 'real');
       assert(!a.state.created, 'creó');
@@ -1059,7 +1070,7 @@ async function runWorkerProcess(script, env, { waitMs }) {
       assert(r.termExit && r.termExit.code === 0, `SIGTERM: ${JSON.stringify(r.termExit)}`);
     });
     await check(`G4 ${script} flag ON: arranca como hoy (intenta conectar a la DB)`, async () => {
-      const r = await runWorkerProcess(script, { [FLAG]: 'true' }, { waitMs: 4000 });
+      const r = await runWorkerProcess(script, { [FLAG]: 'true', [GA]: 'true' }, { waitMs: 4000 });
       assert(!/el worker no reclama jobs/.test(r.output), 'no debería quedar inactivo');
       assert(r.connectionsAfterWait > 0, `no intentó conectar a la DB:\n${r.output}`);
     });

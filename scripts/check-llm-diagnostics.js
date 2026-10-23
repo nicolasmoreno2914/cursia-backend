@@ -61,7 +61,7 @@ const OWNER = '11111111-2222-4333-8444-555555555555';
 const OTHER = '99999999-2222-4333-8444-555555555555';
 const CONTEXT = { nombre: 'Curso diagnóstico', sector: 'Minería', pais: 'Chile', contexto: 'Planta', nivel: 'Intermedio', tono: 'cercano' };
 
-const ENV_KEYS2 = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION', 'DYNAMIC_VIDEO_DELIVERY',
+const ENV_KEYS2 = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY', 'DYNAMIC_REAL_VIDEO_OWNERS', 'DYNAMIC_MANIFEST_RULES_VERSION', 'DYNAMIC_VIDEO_DELIVERY',
   'DYNAMIC_PROVIDER_WORKER_ENABLED', 'VIDEOGEN_API_KEY', 'SUPER_ADMIN_EMAILS', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
 
 async function dbChecks() {
@@ -114,7 +114,7 @@ async function dbChecks() {
       assert(res.code === 0, `${s}: exit ${res.code}\n${res.out.slice(-2000)}`);
     }
     await new Promise((res) => storage.srv.listen(0, '127.0.0.1', res));
-    Object.assign(process.env, { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
+    Object.assign(process.env, { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
       DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', VIDEOGEN_API_KEY: 'fake-videogen-key-never-used-no-network', SUPER_ADMIN_EMAILS: 'admin@cursia.test',
       SUPABASE_URL: `http://127.0.0.1:${storage.srv.address().port}`, SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-local-only' });
     AL.resetRelSchemaCache(); EL.resetExecLeaseSchemaCache();
