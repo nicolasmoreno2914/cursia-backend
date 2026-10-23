@@ -743,8 +743,8 @@ export async function processRealPresentation(deps: RealProviderDeps, item: Clai
   const baseDir = storageBase(item, ownerId, 'dynamic_presentation');
   const pdfPath = `${baseDir}/a${item.attempt}.pdf`;
   const coverPath = `${baseDir}/a${item.attempt}.cover.png`;
-  await deps.artifacts.putStorageObject({ storagePath: pdfPath, buffer: pdf, mimeType: 'application/pdf', upsert: false, adoptExistingOnConflict: true });
-  await deps.artifacts.putStorageObject({ storagePath: coverPath, buffer: cover, mimeType: 'image/png', upsert: false, adoptExistingOnConflict: true });
+  await deps.artifacts.putStorageObject({ ownerId, storagePath: pdfPath, buffer: pdf, mimeType: 'application/pdf', upsert: false, adoptExistingOnConflict: true });
+  await deps.artifacts.putStorageObject({ ownerId, storagePath: coverPath, buffer: cover, mimeType: 'image/png', upsert: false, adoptExistingOnConflict: true });
 
   const artifact: PresentationArtifact = {
     schemaVersion: PRESENTATION_ARTIFACT_SCHEMA_VERSION as 1,
@@ -1488,7 +1488,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
         if (strat === 'split') {
           if (!deps.artifacts.putStorageObject) throw new Error('dynamic-provider-worker: artifacts sin putStorageObject (modo real)');
           const partPath = `${segBase}/split/${seg.key}.p${p}.a${item.attempt}.mp3`;
-          await deps.artifacts.putStorageObject({ storagePath: partPath, buffer: r.audio, mimeType: 'audio/mpeg', upsert: false });
+          await deps.artifacts.putStorageObject({ ownerId, storagePath: partPath, buffer: r.audio, mimeType: 'audio/mpeg', upsert: false });
           splitParts[seg.key] = { ...(splitParts[seg.key] ?? {}), [pk]: {
             segTextSha: seg.textSha, textSha: pieceSha, audioSha: sha256(r.audio), storagePath: partPath, requestId: r.requestId, reservationKey: resKey,
             rawSeconds: pieceSeconds, chars: piece.length, model, segIndex: k, attempt: item.attempt,
@@ -1530,7 +1530,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
         let qError: string | null = null;
         try {
           if (!deps.artifacts.putStorageObject) throw new Error('artifacts sin putStorageObject');
-          await deps.artifacts.putStorageObject({ storagePath: qPath, buffer: raw, mimeType: 'audio/mpeg', upsert: false });
+          await deps.artifacts.putStorageObject({ ownerId, storagePath: qPath, buffer: raw, mimeType: 'audio/mpeg', upsert: false });
           qStored = qPath;
         } catch (err) {
           qError = (err instanceof Error ? err.message : String(err)).slice(0, 200);
@@ -1611,7 +1611,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       if (!deps.artifacts.putStorageObject) throw new Error('dynamic-provider-worker: artifacts sin putStorageObject (modo real)');
       // Ruta por intento: nunca choca con un objeto de un intento anterior del mismo segmento.
       const storagePath = `${segBase}/${seg.key}.a${item.attempt}.mp3`;
-      await deps.artifacts.putStorageObject({ storagePath, buffer: buf, mimeType: 'audio/mpeg', upsert: false });
+      await deps.artifacts.putStorageObject({ ownerId, storagePath, buffer: buf, mimeType: 'audio/mpeg', upsert: false });
       const requestId = requestIds[requestIds.length - 1] ?? null;
       segState[seg.key] = {
         sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, textSha: seg.textSha, audioSha, frames: info.frames, seconds: info.seconds,

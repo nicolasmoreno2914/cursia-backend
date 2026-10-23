@@ -132,6 +132,20 @@ export function clampSignedUrlSeconds(n: number): number {
   return Number.isFinite(n) ? Math.min(Math.max(Math.floor(n), 60), 7 * 24 * 3600) : 3600;
 }
 
+function storagePathNotOwned(): ForbiddenException {
+  return new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
+}
+
+/**
+ * B2 (hotfix de producción #93 portado a V2): la ruta se valida ANTES de escribir en Storage con la service role,
+ * que ignora RLS. Sin esto, `create()` rechazaba la fila pero el objeto ya había quedado escrito: un `courseId` o un
+ * nombre con `..`, `%2e`, `\`, otro bucket o la carpeta de otro usuario plantaban un archivo fuera de la carpeta del
+ * dueño. Mismo criterio que `create()` (`storagePathOwnedBy`, sin fixtures `mock/…`: nunca se escriben).
+ */
+export function assertWritableStoragePath(ownerId: string, bucket: string, storagePath: unknown): void {
+  if (!storagePathOwnedBy(ownerId, bucket, storagePath)) throw storagePathNotOwned();
+}
+
 export function isStorageDuplicateResponse(status: number, body: string): boolean {
   if (status === 409) return true;
   if (status !== 400) return false;
@@ -239,9 +253,7 @@ export class ArtifactsService {
     // `qa-internal/<dueño>/…` que escribe el backend). Antes cualquier ruta ajena quedaba registrada y después se
     // firmaba / borraba con la service role (lectura y borrado entre cuentas).
     const bucket = dto.storage_bucket ?? 'cursia-artifacts';
-    if (!storagePathOwnedBy(ownerId, bucket, dto.storage_path)) {
-      throw new ForbiddenException({ code: 'storage_path_not_owned', message: 'storage_path_not_owned: el archivo debe estar en tu carpeta del bucket de artifacts.' });
-    }
+    assertWritableStoragePath(ownerId, bucket, dto.storage_path);
     const artifact = this.artifactRepo.create({
       ownerId,
       courseId:        dto.course_id ?? null,
@@ -269,6 +281,8 @@ export class ArtifactsService {
     if (!supabaseUrl || !serviceKey) {
       throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side artifact upload');
     }
+    // B2 (#93): validar ANTES de escribir con la service role.
+    assertWritableStoragePath(input.ownerId, bucket, input.storagePath);
 
     const body = JSON.stringify(input.payload, null, 2);
     const sizeBytes = Buffer.byteLength(body);
@@ -345,7 +359,7 @@ export class ArtifactsService {
    * adopción de un objeto inmutable preexistente que `uploadBufferArtifact`.
    */
   async putStorageObject(
-    input: Pick<UploadBufferArtifactInput, 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict' | 'replaceUnverifiedOnConflict'>,
+    input: Pick<UploadBufferArtifactInput, 'ownerId' | 'storagePath' | 'buffer' | 'mimeType' | 'storageBucket' | 'upsert' | 'adoptExistingOnConflict' | 'replaceUnverifiedOnConflict'>,
   ): Promise<{ sizeBytes: number; adopted: boolean; sha256: string | null }> {
     const supabaseUrl = this.config.get<string>('SUPABASE_URL');
     const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
@@ -354,6 +368,8 @@ export class ArtifactsService {
     if (!supabaseUrl || !serviceKey) {
       throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for server-side artifact upload');
     }
+    // B2 (#93): validar ANTES de escribir con la service role (también la usa uploadBufferArtifact).
+    assertWritableStoragePath(input.ownerId, bucket, input.storagePath);
 
     const encodedPath = input.storagePath
       .split('/')

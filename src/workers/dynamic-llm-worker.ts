@@ -142,7 +142,7 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
       apiKey: deps.apiKey, baseUrl: deps.baseUrl, defaultModel: deps.defaultModel, idleMs: deps.idleMs, totalMs: deps.totalMs, fetchImpl: deps.fetchImpl,
       shouldStop: () => (leaseLost() ? 'lease_lost' : deps.drain && deps.drain.isDraining ? 'worker_draining' : null),
       checkpoints: {
-        put: async (path, json) => { await deps.artifacts.putStorageObject({ storagePath: path, buffer: Buffer.from(json, 'utf8'), mimeType: 'application/json', upsert: true }); },
+        put: async (path, json) => { await deps.artifacts.putStorageObject({ ownerId, storagePath: path, buffer: Buffer.from(json, 'utf8'), mimeType: 'application/json', upsert: true }); },
         get: async (path) => (await deps.artifacts.downloadStorageObject('cursia-artifacts', path)).toString('utf8'),
       },
       recordCheckpoint: async (itemRunId, entries) => {

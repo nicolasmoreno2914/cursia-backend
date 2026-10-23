@@ -506,6 +506,7 @@ export class CoherenceService {
     const storagePath = `${job.owner_id}/dynamic/${artifactCourseId}/${manifest.id}/coherence/${job.id}/${file}`;
     const buffer = Buffer.from(JSON.stringify(report, null, 2));
     const put = await this.artifacts.putStorageObject({
+      ownerId: String(job.owner_id),
       storagePath,
       buffer,
       mimeType: 'application/json',
