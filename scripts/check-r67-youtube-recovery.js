@@ -542,7 +542,7 @@ async function dbChecks() {
     await new Promise((res) => storage.srv.listen(0, '127.0.0.1', res));
     const storageUrl = `http://127.0.0.1:${storage.srv.address().port}`;
     Object.assign(process.env, {
-      DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
+      DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
       DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'admin@cursia.test',
       SUPABASE_URL: storageUrl, SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-local-only', VIDEOGEN_API_KEY: 'sk-r67yt-videogen-fake',
       // Proveedores de los OTROS items (que el harness da por completados): claves FALSAS y bases a un puerto muerto

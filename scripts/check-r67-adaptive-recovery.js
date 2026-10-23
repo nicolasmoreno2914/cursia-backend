@@ -305,6 +305,7 @@ async function pureChecks() {
     // Recuperación automática encendida (como en staging/producción: flag dinámico + política por clase).
     const savedFlag = process.env.DYNAMIC_COURSE_STRUCTURE;
     process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    process.env.DYNAMIC_V2_GENERAL_AVAILABILITY = 'true'; // fail closed: sin lista, V2 solo con habilitación pública explícita
     try {
     const old = new Date(NOW.getTime() - 40 * 60_000).toISOString();
     const S = (r) => RS.recoveryStateOf({ status: 'failed', finished_at: old, output_summary: {}, ...r }, NOW);
@@ -431,7 +432,7 @@ async function dbChecks() {
     for (const u of [storageUrl, urls.gammaUrl, urls.openaiUrl, urls.anthropicUrl]) assert(/^http:\/\/127\.0\.0\.1:\d+/.test(u), `fake fuera de loopback: ${u}`);
 
     Object.assign(process.env, {
-      DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
+      DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_V2_GENERAL_AVAILABILITY: 'true', DYNAMIC_REAL_VIDEO_OWNERS: OWNER, DYNAMIC_MANIFEST_RULES_VERSION: '3', DYNAMIC_VIDEO_DELIVERY: 'youtube',
       DYNAMIC_PROVIDER_WORKER_ENABLED: 'true', DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: 'admin@cursia.test',
       SUPABASE_URL: storageUrl, SUPABASE_SERVICE_ROLE_KEY: 'fake-service-role-local-only',
       GAMMA_API_BASE_URL: urls.gammaUrl, OPENAI_API_BASE_URL: urls.openaiUrl, ANTHROPIC_API_BASE_URL: urls.anthropicUrl,
