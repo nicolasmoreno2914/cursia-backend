@@ -916,19 +916,46 @@ async function dbChecks() {
       await assertNoOrphans(R, 'consultas agotadas');
     });
 
-    await check('B3 sesión vencida (404) sin videoId confirmado → borra la sesión y abre UNA nueva (subida completa); el video viejo nunca existió → 1 video total', async () => {
+    await check('B3/F1 sesión vencida (404) DESPUÉS de enviar bytes → AMBIGUO humano (la subida pudo completarse del lado de Google): NUNCA una sesión nueva ni un segundo video', async () => {
       resetGoogle();
-      const R = await freshRun('r67yt vencida');
+      const R = await freshRun('r67yt vencida con bytes');
       const c0 = counts();
       G.putPlan = [{ cutAfter: 40_000 }];
       G.statusPlan = ['reset'];
       let row = await step(R);
       eq(row.status, 'retrying', 'unconfirmed');
+      assert(row.output_summary.youtubePutStartedAt, 'hubo PUT de bytes');
       for (const s of G.sessions.values()) s.expired = true;
       row = await step(R);
-      await assertCompletedOnce(R, 'tras vencer');
+      eq([row.status, row.output_summary.delivery], ['failed', 'ambiguous'], 'ambiguo humano, sin re-subir');
+      assertCounts(c0, { sessions: 1, videos: 0, bytes: 40_000, vg: 0 }, 'una sola sesión, ningún segundo PUT');
+    });
+
+    await check('B3 sesión vencida (404) SIN bytes enviados (sesión creada, nunca empezó el PUT) → borra la sesión y abre UNA nueva; 1 video total', async () => {
+      resetGoogle();
+      const R = await freshRun('r67yt vencida sin bytes');
+      const c0 = counts();
+      G.putPlan = [{ cutAfter: 40_000 }];
+      G.statusPlan = ['reset'];
+      let row = await step(R);
+      eq(row.status, 'retrying', 'unconfirmed');
+      // Emula «la sesión se guardó y el proceso murió antes del primer PUT»: sin marca de bytes (el fake nunca creó el video).
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary - 'youtubePutStartedAt' where id = $1`, [R.vId]);
+      for (const s of G.sessions.values()) s.expired = true;
+      row = await step(R);
+      await assertCompletedOnce(R, 'tras vencer sin bytes');
       assert(row.output_summary.youtubeSessionExpiredAt, 'vencimiento registrado');
       assertCounts(c0, { sessions: 2, videos: 1, bytes: 40_000 + MP4.length, vg: 0 }, 'total');
+    });
+
+    await check('F9 marca de PUT presente pero sesión ilegible y youtubeUploadStartedAt limpio → AMBIGUO humano (nunca una subida nueva)', async () => {
+      resetGoogle();
+      const R = await freshRun('r67yt sesion ilegible');
+      await ds.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('youtubePutStartedAt', now()::text, 'youtubeSession', jsonb_build_object('uriEnc', 'roto', 'iv', 'x'), 'youtubeUploadProtocol', 'r67_resumable') - 'youtubeUploadStartedAt' where id = $1`, [R.vId]);
+      const c0 = counts();
+      const row = await step(R);
+      eq([row.status, row.output_summary.delivery], ['failed', 'ambiguous'], 'ambiguo humano');
+      assertCounts(c0, { sessions: 0, videos: 0, bytes: 0, vg: 0 }, 'nada enviado');
     });
 
     await check('B3 marcador VIEJO (sin protocolo r67, sin sesión) → sigue siendo ambiguo humano (nunca re-sube sola); marcador r67 sin sesión ni bytes → sesión nueva segura', async () => {

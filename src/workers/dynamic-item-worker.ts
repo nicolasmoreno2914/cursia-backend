@@ -1649,7 +1649,10 @@ async function publishYoutubeAndComplete(
     // r67 (B3): salvo que haya una sesión resumable guardada (se consulta su estado antes de enviar nada) o que el
     // marcador sea del protocolo r67 SIN bytes enviados (el primer PUT solo ocurre con la sesión ya persistida: si no
     // hay sesión ni `youtubePutStartedAt`, YouTube no recibió ningún byte y no puede existir el video).
-    if (summary.youtubeUploadStartedAt || saved) {
+    // r67 fix round 1 (F9): también cuenta como «pudo haber bytes en YouTube» un PUT marcado o una sesión guardada que no
+    // se puede leer, aunque `youtubeUploadStartedAt` se haya limpiado: sin sesión legible, eso es AMBIGUO (humano).
+    const rawSessionPresent = !!summary.youtubeSession;
+    if (summary.youtubeUploadStartedAt || saved || summary.youtubePutStartedAt || rawSessionPresent) {
       const resumeOk = resumable && !!saved;
       const noBytesSent = resumable && !saved && summary.youtubeUploadProtocol === YOUTUBE_UPLOAD_PROTOCOL_R67 && !summary.youtubePutStartedAt;
       if (!resumeOk && !noBytesSent) {
@@ -1862,8 +1865,15 @@ async function publishYoutubeAndComplete(
           return;
         }
         if (d.kind === 'session_expired') {
-          // r67 (B3): sesión vencida (404/410). Subida NUEVA solo sin videoId confirmado (acá nunca lo hay) y si el
-          // estado previo no era un ambiguo sin sesión (este camino siempre tiene sesión). Se borra la sesión vieja.
+          // r67 fix round 1 (F1): si alguna vez empezó un PUT de bytes en esta sesión, la subida pudo completarse del lado de
+          // Google con la respuesta perdida; con la sesión vencida ya no se puede confirmar → AMBIGUO (humano), NUNCA una
+          // sesión nueva (sería un video duplicado). Solo sin bytes enviados la sesión vencida abre una nueva.
+          if (summary.youtubePutStartedAt) {
+            await failAmbiguous(deps, item, 'la sesión de subida a YouTube venció después de haber enviado bytes: el video pudo crearse y no se puede confirmar (revisar el canal antes de reintentar)', youtubeDecisionPatch({ ...d, human: true }, err, null));
+            return;
+          }
+          // r67 (B3): sesión vencida (404/410) sin bytes enviados. Subida NUEVA solo sin videoId confirmado (acá nunca lo
+          // hay). Se borra la sesión vieja.
           const ok = await scheduler.recordItemExternal(item.itemRunId, deps.executorId, {
             youtubeSession: null,
             youtubePutStartedAt: null,
