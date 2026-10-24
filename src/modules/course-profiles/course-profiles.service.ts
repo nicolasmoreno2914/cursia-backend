@@ -253,7 +253,7 @@ export class CourseProfilesService {
       if (prebriefTables?.present) {
         const [busy] = await qr.query(
           `select 1 as x from public.production_jobs j
-             join public.course_prebrief_events e on e.course_id = j.course_id and e.type = 'generation_started' and e.payload ->> 'runId' = j.id::text
+             join public.course_prebrief_events e on e.course_id::text = j.course_id::text and e.type = 'generation_started' and e.payload ->> 'runId' = j.id::text
             where j.course_id = $1 and j.execution_mode = 'dynamic_generation' and j.worker_status = any($2::text[]) limit 1`,
           [courseId, ACTIVE_RUN_WORKER_STATUSES],
         );
