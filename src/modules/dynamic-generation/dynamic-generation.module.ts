@@ -23,6 +23,7 @@ import { AdminRecoveryService } from './admin-recovery.service';
 import { VideogenReconciliationService } from './videogen-reconciliation.service';
 import { ProviderReconcileService } from './provider-reconcile.service';
 import { PilotMetricsService } from './pilot-metrics.service';
+import { SchedulerQueueMetricsService } from './scheduler-queue-metrics';
 import { CoherenceModule } from '../coherence/coherence.module';
 
 /**
@@ -50,6 +51,7 @@ import { CoherenceModule } from '../coherence/coherence.module';
     AdminRecoveryService, // EV6 DoD BE-B: cola de recuperación de admin (solo lectura)
     VideogenReconciliationService, // V542 (G6): conciliación explícita de reservas de Videogen (SUPER_ADMIN)
     ProviderReconcileService, // r62 (N2): conciliación AUTOMÁTICA de Videogen/Gamma con evidencia + reenvío acotado
+    SchedulerQueueMetricsService, // r63 (SC): métricas de la cola del scheduler (SUPER_ADMIN, solo lectura)
     PilotMetricsService, // Loop 10 C2: métricas del piloto de un run (SUPER_ADMIN, solo lectura)
     SchedulerService,
     LlmDiagnosticsService,
