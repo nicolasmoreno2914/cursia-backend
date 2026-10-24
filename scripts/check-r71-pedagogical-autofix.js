@@ -25,6 +25,11 @@
 //   AD4 deshacer todo restaura los vínculos y el pedido originales (sector incluido); el contador sube una vez
 //   AD5 lo del docente manda: sector escrito no se pisa; un dato completado en línea queda como del docente (no inferido)
 //   AD6 contador viejo → 409; propuesta lista/aprobada → no se cambia sola (skipped PREBRIEF_FROZEN)
+//   AD7 rendimiento con 150 ms por consulta (base remota): GET /prebrief < 1,5 s
+//   AD8 conexiones (incidente de producción r71): con el caché, GET /prebrief usa a lo sumo las conexiones simultáneas que
+//       sin caché (1) y responde igual; /prebrief + /modules concurrentes con el pool de producción (5) y un tope de
+//       clientes chico (rol con CONNECTION LIMIT, rechaza al instante como el pooler) → 0 errores; una anticipada rota no
+//       rompe la petición
 //
 // Uso: node scripts/check-r71-pedagogical-autofix.js [--pure-only] [path/to/dist]
 'use strict';
@@ -206,10 +211,48 @@ const applyPlan = (chapters, plan) => chapters.map((c) => { const ch = plan.chan
     });
     const n = log.length; await fake.query('select v from t where id = $1', [7]); await fake.query('select v from t where id = $1', [7]);
     eq(log.length, n + 2, 'fuera del ámbito no hay caché');
-    // Lectura anticipada: la segunda petición pide en paralelo lo que la primera leyó (curso / usuario).
-    log.length = 0;
-    await C.withRequestReadCache(fake, 't', { course: 8, owner: 'u' }, async () => { await fake.query('select w from t where id = $1 and o = $2', [8, 'u']); });
-    eq(log.includes('select v from t where id = $1'), true, 'anticipada con el curso nuevo');
+    // Lectura anticipada (fix r71 conexiones): la primera lectura de la segunda petición lleva consigo, en UN viaje y por
+    // la MISMA conexión, lo que la primera petición leyó (curso / usuario). Nunca una conexión extra.
+    {
+      C.resetRequestReadCacheTemplates();
+      const trips = []; let open = 0; let peak = 0; let failBatch = false;
+      const run = async (text, params) => { await new Promise((r) => setTimeout(r, 5)); return { rows: [{ text, params: params || null }] }; };
+      const fk = {
+        query: async (sql, params) => { open++; peak = Math.max(peak, open); try { trips.push([sql]); return (await run(sql, params)).rows; } finally { open--; } },
+        createQueryRunner() {
+          return { connect: async () => { open++; peak = Math.max(peak, open); return { query: async (text) => { const parts = text.split('\n;\n'); trips.push(parts); if (failBatch) throw new Error('relation does not exist'); return parts.length > 1 ? Promise.all(parts.map((t) => run(t))) : run(text); } }; },
+            release: async () => { open--; }, query: async () => [] };
+        },
+      };
+      await C.withRequestReadCache(fk, 'pf', { course: 7, owner: 'u' }, async () => {
+        await fk.query('select a from t where id = $1', [7]);
+        await fk.query("select b from t where o = $1 and k = $2 and f = $3 and n = $4", ['u', "it's", true, null]);
+        await fk.query('select d from t where id = $1 -- comentario al final', [7]);
+        await fk.query('select c from t where x = $1', [{ no: 'objeto' }]); // depende de algo leído: no se anticipa
+      });
+      trips.length = 0; peak = 0;
+      let got;
+      await C.withRequestReadCache(fk, 'pf', { course: 8, owner: 'u' }, async () => {
+        const a = await fk.query('select a from t where id = $1', [8]);
+        const b = await fk.query("select b from t where o = $1 and k = $2 and f = $3 and n = $4", ['u', "it's", true, null]);
+        got = [a[0].text, b[0].text];
+      });
+      eq(trips, [["select a from t where id = '8'", "select b from t where o = 'u' and k = 'it''s' and f = 'true' and n = NULL", "select d from t where id = '8' -- comentario al final"]], 'un viaje con las anticipadas (curso nuevo, literales escapados, comentario final sin tragarse el «;»)');
+      eq(got, trips[0].slice(0, 2), 'cada lectura recibe su resultado');
+      eq(peak, 1, 'una sola conexión a la vez');
+      // El viaje combinado falla (p. ej. falta una tabla): el código no ve el error; cada lectura va sola, como sin caché.
+      trips.length = 0; peak = 0; failBatch = true;
+      await C.withRequestReadCache(fk, 'pf', { course: 9, owner: 'u' }, async () => {
+        const a = await fk.query('select a from t where id = $1', [9]);
+        eq(a[0].text, 'select a from t where id = $1', 'la lectura sola, con parámetros');
+      });
+      failBatch = false;
+      eq(trips.length, 2, 'combinado (falló) + la lectura sola');
+      eq(peak, 1, 'tampoco al fallar hay dos conexiones');
+      eq(C.inlineParams("select 'a$1' x, \"c$1\" from t where id = $1 -- $2\n and y = $2::jsonb", [3, '{"k":1}']), "select 'a$1' x, \"c$1\" from t where id = '3' -- $2\n and y = '{\"k\":1}'::jsonb", 'reemplaza solo fuera de literales y comentarios');
+      for (const bad of ['select $$x$$', "select E'\\n' where a = $1", 'select 1; select 2', 'select $2', 'select $1']) eq(C.inlineParams(bad, bad === 'select $1' ? [{}] : [1]), null, `no combina «${bad}»`);
+      eq(C.inlineParams('select $1', ['a\\b']), "select  E'a\\\\b'", 'barra invertida como E-string');
+    }
     eq(C.metadataProjection("select metadata -> 'designPins' as pins from public.courses where id = $1"), [['designPins', 'pins']], 'reconoce la proyección');
     eq(C.metadataProjection('select metadata, title from public.courses where id = $1'), null, 'otra consulta no');
   });
@@ -520,6 +563,94 @@ async function dbChecks(ctx1672) {
       if (process.env.R71_PROFILE) console.log(sqls.slice(0, nState).map((q) => `     ${q}`).join('\n'));
       if (process.env.CURSIA_READ_CACHE !== 'off') assert(ms < 1500, `GET /prebrief tardó ${ms} ms (objetivo < 1500)`);
       if (process.env.CURSIA_READ_CACHE !== 'off') assert(msPrep < 7000, `POST /prebrief/versions tardó ${msPrep} ms (objetivo < 7000: dos verificaciones + congelar el Blueprint + la versión, en transacción)`);
+    });
+
+    await check('AD8 conexiones: con el caché, GET /prebrief usa a lo sumo las conexiones simultáneas de sin caché (1); /prebrief + /modules concurrentes con pool de producción (5) y un tope de clientes chico → 0 errores', async () => {
+      // Incidente r71 en producción: GET /prebrief concurrente con GET /modules → 500 en 1–2,6 s. La lectura anticipada
+      // abría hasta 3 conexiones EXTRA por petición; con pool 5 por proceso, el pooler de Supabase en modo sesión rechaza
+      // de inmediato los clientes de más (EMAXCONNSESSION). Aquí: un rol con CONNECTION LIMIT chico hace de pooler (rechaza
+      // al instante, código 53300) y el DataSource usa el pool por defecto de producción (sin PROD_DB_POOL_MAX → 5).
+      const c = await replica('[R71] Conexiones');
+      await useDesign(c.id);
+      await design.fix(c.id, OWNER, 'autofix', await counter(c.id));
+      const LIMIT = Number(process.env.R71_CONN_LIMIT || 3); // 2 peticiones concurrentes (1 conexión c/u) + 1 de margen
+      await ds.query(`drop role if exists r71lim`);
+      await ds.query(`create role r71lim login bypassrls connection limit ${LIMIT}`);
+      for (const sch of (await ds.query(`select nspname from pg_namespace where nspname not like 'pg\\_%' and nspname <> 'information_schema'`)).map((r) => r.nspname)) {
+        await ds.query(`grant usage on schema "${sch}" to r71lim`);
+        await ds.query(`grant select, insert, update, delete on all tables in schema "${sch}" to r71lim`);
+        await ds.query(`grant usage, select on all sequences in schema "${sch}" to r71lim`);
+        await ds.query(`grant execute on all functions in schema "${sch}" to r71lim`);
+      }
+      const { dbPoolConfig } = loadDist('database/db-pool-config.js');
+      const poolMax = dbPoolConfig({}, '/srv/dist/main.js').max;
+      eq(poolMax, 5, 'pool por defecto de producción');
+      const ds2 = new DataSource({ type: 'postgres', host: '127.0.0.1', port, username: 'r71lim', database: DB, entities: [CourseModule, CourseChapter], synchronize: false,
+        extra: { max: poolMax, min: 0, idleTimeoutMillis: 20000, connectionTimeoutMillis: 10000 } });
+      await ds2.initialize();
+      const PgClient = require('pg').Client;
+      const origQ = PgClient.prototype.query;
+      const prevCache = process.env.CURSIA_READ_CACHE;
+      try {
+        const stub2 = { async findOne(id, ownerId) {
+          const [row] = await ds2.query(`select id, title, structure_version, structure_version_counter from public.courses where id = $1 and owner_id = $2`, [id, ownerId]);
+          if (!row) throw new NotFoundException(`Course #${id} not found`);
+          return { id: row.id, title: row.title, structureVersion: row.structure_version, structureVersionCounter: row.structure_version_counter };
+        } };
+        const profiles2 = new CourseProfilesService(ds2, stub2);
+        const blueprints2 = new CourseBlueprintsService(ds2);
+        const pedagogy2 = new PedagogyService(ds2, stub2);
+        const design2 = new CourseDesignService(ds2, stub2, pedagogy2);
+        const prebrief2 = new PrebriefService(ds2, stub2, design2, blueprints2, profiles2);
+        const structure2 = new CourseStructureService(ds2.getRepository(CourseModule), ds2.getRepository(CourseChapter), stub2, ds2, blueprints2);
+        // Conexiones del pool en uso a la vez (checkout → release).
+        const pool = ds2.driver.master;
+        let out = 0; let peak = 0;
+        pool.on('acquire', () => { out++; if (out > peak) peak = out; });
+        pool.on('release', () => { out--; });
+        const lat = Number(process.env.R71_DB_LATENCY_MS || 150);
+        PgClient.prototype.query = function (q, ...rest) { const self = this; return new Promise((r) => setTimeout(r, lat)).then(() => origQ.call(self, q, ...rest)); };
+        const settle = () => new Promise((r) => setTimeout(r, lat * 4)); // nada en vuelo de una petición anterior
+        const alone = async (fn) => { await settle(); peak = out; const t = Date.now(); let err = null; let res = null; try { res = await fn(); } catch (e) { err = e; } const ms = Date.now() - t; const p = peak; await settle(); return { ms, peak: Math.max(p, peak), err, res }; };
+        await alone(() => prebrief2.state(c.id, OWNER)); // aprende las lecturas de la petición
+        process.env.CURSIA_READ_CACHE = 'off';
+        const off = await alone(() => prebrief2.state(c.id, OWNER));
+        if (prevCache === undefined) delete process.env.CURSIA_READ_CACHE; else process.env.CURSIA_READ_CACHE = prevCache;
+        const on = await alone(() => prebrief2.state(c.id, OWNER));
+        console.log(`   conexiones simultáneas máx. por GET /prebrief: sin caché ${off.peak} (${off.ms} ms) · con caché ${on.peak} (${on.ms} ms${on.err ? ' · ERROR ' + String(on.err.message).slice(0, 80) : ''})`);
+        // Lo que hace «Paso 5 · Propuesta» al abrir: GET /prebrief y GET /modules a la vez, varias veces.
+        const errs = [];
+        let pairPeak = 0;
+        for (let i = 0; i < 6; i++) {
+          await settle(); peak = out;
+          const rs = await Promise.allSettled([prebrief2.state(c.id, OWNER), structure2.getStructure(c.id, OWNER)]);
+          pairPeak = Math.max(pairPeak, peak);
+          rs.forEach((r, k) => { if (r.status === 'rejected') errs.push(`${i}:${k ? 'modules' : 'prebrief'}: ${String(r.reason && r.reason.message).slice(0, 90)}`); });
+        }
+        console.log(`   /prebrief + /modules ×6 (tope ${LIMIT} clientes, pool ${poolMax}): ${12 - errs.length}/12 OK · conexiones simultáneas máx. ${pairPeak}`);
+        assert(!off.err, 'sin caché falló: ' + (off.err && off.err.message));
+        assert(!on.err, 'con caché falló: ' + (on.err && on.err.message));
+        assert(on.peak <= off.peak, `con caché usa ${on.peak} conexiones simultáneas; sin caché ${off.peak}`);
+        assert(on.peak <= 1, `con caché usa ${on.peak} conexiones simultáneas (objetivo 1)`);
+        eq(on.res, off.res, 'con caché (lectura combinada) la respuesta es idéntica a sin caché');
+        // Una anticipada que ya no funciona (tabla borrada) no rompe la petición: la lectura va sola y se re-aprende.
+        const { withRequestReadCache } = loadDist('common/db/request-read-cache.js');
+        await ds.query(`create table if not exists public.r71_tmp (course_id int, v text)`);
+        await ds.query(`grant select on public.r71_tmp to r71lim`);
+        const readCourse = () => ds2.query(`select id from public.courses where id = $1`, [c.id]);
+        await withRequestReadCache(ds2, 'r71.tmp', { course: c.id, owner: OWNER }, async () => [await readCourse(), await ds2.query(`select v from public.r71_tmp where course_id = $1`, [c.id])]);
+        await ds.query(`drop table public.r71_tmp`);
+        await settle(); peak = out;
+        const first = await withRequestReadCache(ds2, 'r71.tmp', { course: c.id, owner: OWNER }, readCourse).catch((e) => e);
+        assert(Array.isArray(first) && first[0] && first[0].id === c.id, 'la lectura del curso no debe fallar por una anticipada rota: ' + (first && first.message));
+        assert(peak <= 1, `fallback con ${peak} conexiones`);
+        eq(errs, [], 'errores con /prebrief + /modules concurrentes');
+        assert(pairPeak <= 2, `el par usa ${pairPeak} conexiones (objetivo 2: una por petición)`);
+      } finally {
+        PgClient.prototype.query = origQ;
+        if (prevCache === undefined) delete process.env.CURSIA_READ_CACHE; else process.env.CURSIA_READ_CACHE = prevCache;
+        await ds2.destroy().catch(() => {});
+      }
     });
 
     await check('AD6 contador viejo → 409; propuesta preparada → no se cambia sola', async () => {
