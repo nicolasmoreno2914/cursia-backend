@@ -72,15 +72,21 @@ const HEADINGS: ReadonlyArray<[SectionKey, RegExp]> = [
   ['subject', /^(nombre (de la|del) (asignatura|curso|espacio academico|materia|modulo|unidad de aprendizaje)|asignatura|nombre del curso|espacio academico|materia|curso|unidad de aprendizaje)$/],
   ['program', /^(programa( academico| de formacion)?|carrera|programa al que pertenece)$/],
   ['level', /^(nivel( de formacion| academico| educativo)?|tipo de formacion)$/],
-  ['semester', /^(semestre|periodo academico|ciclo|ubicacion en el plan de estudios)$/],
+  ['semester', /^(semestre|periodo academico|ciclo|ubicacion en el plan de estudios|grado( escolar)?)$/],
   ['learner', /^(perfil (del|de los|de las) (estudiantes?|participantes?|aprendices?)|poblacion objetivo|publico objetivo|dirigido a|perfil de ingreso|destinatarios)$/],
   // LOOP 9.2: «Prerrequisitos» se escribe con doble r (antes solo se reconocía «prerequisitos»).
   ['prior', /^(pre-?r?requisitos?|requisitos previos|conocimientos previos|co-?requisitos?|saberes previos)$/],
-  ['generalObjective', /^(objetivo general|proposito( del curso| de formacion| de la asignatura)?|objetivo del curso)$/],
+  // r70: también «Propósitos de formación» / «Propósito formativo» (plural y adjetivo).
+  ['generalObjective', /^(objetivo general|propositos?( del curso| de formacion| formativos?| de la asignatura)?|objetivo del curso)$/],
   ['specificObjectives', /^(objetivos especificos|objetivos de aprendizaje)$/],
-  ['outcomes', /^(resultados de aprendizaje( esperados| del curso| de la asignatura| previstos)?|resultados esperados|logros de aprendizaje|logros esperados)$/],
-  ['competencies', /^(competencias( especificas| genericas| a desarrollar| profesionales| transversales| del curso)?|competencia( especifica| general)?)$/],
-  ['contents', /^(contenidos?( tematicos?| programaticos?| del curso| de la asignatura| minimos)?|unidades( tematicas| de aprendizaje)?|temario|ejes tematicos|plan tematico|estructura tematica|programa tematico|contenido programatico)$/],
+  // r70: microcurrículos escolares y de formación para el trabajo: la sección se titula con una PREGUNTA («¿Qué aprenderá
+  // el estudiante al finalizar el curso?», «¿Qué será capaz de hacer…?») o con «Desempeños» / «Logros» / «Indicadores de
+  // logro». (keyOf quita «¿?¡!».)
+  ['outcomes', /^(resultados de aprendizaje( esperados| del curso| de la asignatura| previstos)?|resultados esperados|logros( de aprendizaje| esperados| del curso)?|desempenos( esperados| de aprendizaje| del curso)?|indicadores de (logro|desempeno)s?|que (aprendera|aprenderan|lograra|lograran|sabra|sabran|podra|podran|sera capaz|seran capaces|habra aprendido|habran aprendido)\b.*)$/],
+  // r70: «Unidad de competencia» / «Unidades de competencia» (formato por competencias, SENA y colegios).
+  ['competencies', /^(competencias( especificas| genericas| a desarrollar| profesionales| transversales| del curso)?|competencia( especifica| general)?|unidad(es)? de competencias?)$/],
+  // r70: «Distribución temática (y duración)», «Temas», «Unidades temáticas y contenidos».
+  ['contents', /^(contenidos?( tematicos?| programaticos?| del curso| de la asignatura| minimos)?|unidades( tematicas| de aprendizaje)?( y (contenidos|duracion|horas))?|temario|ejes tematicos|plan tematico|estructura tematica|programa tematico|contenido programatico|distribucion tematica( y (duracion|horas|intensidad horaria))?|distribucion de (contenidos|unidades|temas)|temas( del curso| principales)?)$/],
   ['hoursTotal', /^(intensidad horaria total|horas totales|total de horas|numero total de horas)$/],
   ['hoursWeekly', /^(intensidad horaria semanal|horas semanales|horas por semana|intensidad semanal)$/],
   ['hours', /^(intensidad horaria|carga horaria|distribucion (de|del) (tiempo|las horas|horas)|distribucion horaria|tiempo de dedicacion|duracion( total)?( y distribucion horaria| y distribucion de (las )?horas)?|horas de trabajo( del estudiante)?)$/],
@@ -95,7 +101,7 @@ const HEADINGS: ReadonlyArray<[SectionKey, RegExp]> = [
   ['methodology', /^(metodologia( de ensenanza| del curso| de la asignatura)?|estrategias? (metodologicas?|didacticas?|pedagogicas?)|metodologia y estrategias didacticas|enfoque pedagogico( y metodologia| y didactico)?|enfoque metodologico|metodologia y enfoque( pedagogico)?|enfoque y metodologia)$/],
   ['constraints', /^(restricciones( institucionales)?|lineamientos( institucionales)?|condiciones( institucionales)?|requisitos institucionales|consideraciones institucionales)$/],
   ['description', /^(descripcion( del curso| de la asignatura| general)?|justificacion|presentacion( del curso| de la asignatura)?)$/],
-  ['additional', /^(observaciones|informacion adicional|notas|modalidad|codigo( de la asignatura)?|area( de formacion)?|componente de formacion)$/],
+  ['additional', /^(observaciones|informacion adicional|notas|modalidad|codigo( de la asignatura)?|area( de formacion)?|componente de formacion|nivel de referencia|orientacion (curricular|pedagogica))$/],
 ];
 
 /** Claves de un solo valor (el valor va en la misma línea, en la celda vecina o en la línea siguiente). */
@@ -122,7 +128,11 @@ function normKey(s: string): string {
 }
 
 function keyOf(text: string): SectionKey | null {
-  const k = normKey(text);
+  // r70: un encabezado en forma de pregunta («¿Qué aprenderá…?») se compara sin los signos.
+  // r70: «8 horas de trabajo del estudiante» es un VALOR (normKey le quitaba el «8 » como si fuera una numeración y quedaba
+  // el rótulo «horas de trabajo del estudiante»): una cifra seguida de horas nunca es un encabezado.
+  if (/^\s*\d{1,4}(?:[.,]\d{1,2})?\s*(?:-|–|—|a)?\s*(?:\d{1,4}(?:[.,]\d{1,2})?\s*)?(?:horas?|hrs?\.?|h)\b/i.test(text)) return null;
+  const k = normKey(text.replace(/[¿?¡!]/g, ''));
   if (!k || k.length > 70) return null;
   for (const [key, re] of HEADINGS) if (re.test(k)) return key;
   return null;
@@ -132,10 +142,27 @@ function keyOf(text: string): SectionKey | null {
  * Rótulos de columna de una tabla (sin tildes, minúsculas). Una fila hecha SOLO de estos rótulos es el encabezado de la
  * tabla («Código | Resultado de aprendizaje», «Evaluación | Momento | Resultados principales»), nunca un dato.
  */
-const COLUMN_LABEL_RE = /^(?:codigo|cod\.?|n[°º.o]?|nro\.?|numero|item|#|id|elemento|definicion|descripcion|detalle|nombre|titulo|resultados?(?: de aprendizaje| esperados?| principales| asociados| que evalua)?|competencias?(?: asociadas?)?|ra|co|unidad(?:es)?(?: tematicas?)?|modulos?|capitulos?|temas?|subtemas?|contenidos?(?: principal(?:es)?| tematicos?)?|recursos?(?: previstos| didacticos)?|actividad(?:es)?(?: de aprendizaje)?|horas?(?: de trabajo(?: del estudiante)?| totales| presenciales| autonomas)?|semanas?|sesion(?:es)?|fecha|momento|evaluacion(?:es)?|instrumento|tipo|criterios?(?: de evaluacion)?|evidencias?(?: de aprendizaje)?|porcentaje|peso|ponderacion|%|valor|observaciones|duracion|intensidad horaria|creditos|producto|estrategias?(?: didacticas?)?)$/;
+const COLUMN_LABEL_RE = /^(?:codigo|cod\.?|n[°º.o]?|nro\.?|numero|item|#|id|elemento|definicion|descripcion|detalle|nombre|titulo|resultados?(?: de aprendizaje| esperados?| principales| asociados| que evalua)?|competencias?(?: asociadas?)?|ra|co|unidad(?:es)?(?: tematicas?)?|modulos?|capitulos?|temas?|subtemas?|contenidos?(?: principal(?:es)?| tematicos?)?|recursos?(?: previstos| didacticos)?|actividad(?:es)?(?: de aprendizaje)?|horas?(?: de trabajo(?: del estudiante)?| totales| presenciales| autonomas)?|hor|hrs?\.?|semanas?|sesion(?:es)?|fecha|momento|evaluacion(?:es)?|instrumento|tipo|criterios?(?: de evaluacion)?|evidencias?(?: de aprendizaje)?|porcentaje|peso|ponderacion|%|valor|observaciones|duracion|intensidad horaria|creditos|producto|estrategias?(?: didacticas?)?)$/;
+
+/**
+ * r70 · Rótulo de columna partido en dos líneas por el ancho de la celda («Hor» / «as»): la línea suelta que sigue al
+ * encabezado de la tabla y completa uno de sus rótulos es parte del encabezado, no un dato.
+ */
+export function isHeaderFragment(header: { cells?: string[] } | null, l: { text: string; cells?: string[] }): boolean {
+  if (!header || !header.cells || l.cells) return false;
+  const t = l.text.trim();
+  if (!t || t.length > 14 || /\d/.test(t) || t.split(/\s+/).length > 2) return false;
+  return header.cells.some((c) => {
+    const k = normKey(c);
+    return !!k && (COLUMN_LABEL_RE.test(normKey(`${c}${t}`)) || COLUMN_LABEL_RE.test(normKey(`${c} ${t}`))) && !COLUMN_LABEL_RE.test(normKey(t));
+  });
+}
 
 /** ¿La fila (celdas o texto) es el encabezado de una tabla? Todas sus celdas son rótulos de columna (≥ 2 celdas). */
 export function isColumnHeaderRow(l: { text: string; cells?: string[] }): boolean {
+  // r70: una celda con cifras («60 horas», «10») es un dato, nunca un rótulo (normKey le quitaba «60 » como si fuera una
+  // numeración y «Duración | 60 horas» se tomaba por el encabezado de una tabla: se perdía el total de horas).
+  if (l.cells && l.cells.some((c) => /\d/.test(c))) return false;
   const cells = (l.cells && l.cells.length ? l.cells : null)?.map((c) => normKey(c)).filter(Boolean);
   if (cells && cells.length >= 2) return cells.every((c) => COLUMN_LABEL_RE.test(c));
   // Sin celdas (lectura plana): «Código Resultado de aprendizaje» = 2 rótulos seguidos. Se parte en rótulos conocidos.
@@ -305,7 +332,9 @@ class DocExtraction {
   readonly ctx: AcademicContextV1 = emptyAcademicContext();
   readonly notes: ExtractionNote[] = [];
   readonly found = new Set<string>();
-  private rawOutcomes: { code: number | null; item: Item; inferredFrom: string | null }[] = [];
+  private rawOutcomes: { code: number | null; item: Item; inferredFrom: string | null; split?: boolean }[] = [];
+  /** r70: «Unidad de competencia» (un párrafo): respaldo declarado del objetivo general si el documento no lo trae. */
+  private competencyUnit: { text: string; lines: SourceLine[]; heading: string } | null = null;
   private rawCompetencies: { code: number | null; item: Item }[] = [];
   /** Horas por módulo / unidad de una tabla de distribución horaria («Módulo 1 | 13–15 h»), por número de módulo. */
   private unitHours: { index: number; value: number; line: SourceLine }[] = [];
@@ -361,6 +390,7 @@ class DocExtraction {
     for (const s of sections) this.parse(s);
     this.applyUnitHours();
     this.finishOutcomes(sections);
+    this.inferObjective();
     this.inferHours();
     this.inferLevel();
   }
@@ -381,13 +411,18 @@ class DocExtraction {
     // La sección abierta por una fila «clave | valor» de una ficha: la fila siguiente de esa misma ficha con otro rótulo
     // («Requisito audiovisual | …») es otro dato, no la continuación del anterior.
     let curFromRow = false;
+    let headerRow: SourceLine | null = null; // r70: el encabezado de tabla de la línea anterior (rótulos partidos)
     for (let li = 0; li < lines.length; li++) {
       const l = lines[li];
+      const prevHeader = headerRow;
+      headerRow = null;
+      if (isHeaderFragment(prevHeader, l)) continue;
       if (l.cells) {
         // Encabezado de una tabla («Código | Resultado de aprendizaje»): no es un dato ni una clave; la tabla sigue en la
         // sección abierta (sus parsers lo reconocen y lo saltan).
         if (isColumnHeaderRow(l)) {
           if (cur) { cur.lines.push(l); curFromRow = false; }
+          headerRow = l;
           continue;
         }
         const cells0 = (l.cells ?? []).map(collapse);
@@ -530,6 +565,16 @@ class DocExtraction {
         return;
       }
       case 'additional': {
+        // r70: una nota con su texto en línea que sigue en las líneas de abajo («Orientación curricular: propuesta … tomando
+        // como» / «referencia los estándares…») es UN dato, no un dato por línea.
+        if (s.inline && s.lines.length && !/[.;:!?]$/.test(s.inline.trim())) {
+          const its = this.items(s);
+          if (its.length) {
+            this.pushListField('additionalInfo', `${s.heading}: ${clip(its[0].text, ACADEMIC_LIMITS.text - s.heading.length - 2).text}`, its[0].lines[0], label);
+            for (const it of its.slice(1)) this.pushListField('additionalInfo', it.text, it.lines[0], label);
+            return;
+          }
+        }
         const v = this.singleValue(s);
         if (v) this.pushListField('additionalInfo', `${s.heading}: ${clip(v.text, ACADEMIC_LIMITS.text - s.heading.length - 2).text}`, v.line, label);
         for (const l of s.lines.slice(v && !s.inline ? 1 : 0)) this.pushListField('additionalInfo', l.text, l, label);
@@ -553,15 +598,28 @@ class DocExtraction {
       case 'specificObjectives':
         for (const it of this.items(s)) {
           const m = OUTCOME_CODE_RE.exec(it.text);
-          this.rawOutcomes.push({ code: m ? Number(m[2]) : null, item: { ...it, text: m ? it.text.slice(m[0].length) : it.text }, inferredFrom: s.key === 'specificObjectives' ? s.heading : null });
+          const inferredFrom = s.key === 'specificObjectives' ? s.heading : null;
+          // r70: un párrafo sin códigos («Al finalizar el curso, el estudiante estará en capacidad de comprender…,
+          // presentarse… e identificar…») enumera varias capacidades: cada una es un resultado (inferido, con su regla).
+          const parts = m || it.lines.some((l) => l.cells) ? null : splitProseOutcomes(it.text);
+          if (parts) {
+            for (const p of parts) this.rawOutcomes.push({ code: null, item: { text: p, lines: it.lines }, inferredFrom, split: true });
+            continue;
+          }
+          this.rawOutcomes.push({ code: m ? Number(m[2]) : null, item: { ...it, text: m ? it.text.slice(m[0].length) : it.text }, inferredFrom });
         }
         return;
-      case 'competencies':
-        for (const it of this.items(s)) {
+      case 'competencies': {
+        const its = this.items(s);
+        if (/^unidad(es)? de competencias?$/.test(normKey(s.heading)) && its.length === 1 && its[0].text.length >= 40 && !this.competencyUnit) {
+          this.competencyUnit = { text: its[0].text, lines: its[0].lines, heading: s.heading };
+        }
+        for (const it of its) {
           const m = COMPETENCY_CODE_RE.exec(it.text);
           this.rawCompetencies.push({ code: m ? Number(m[2]) : null, item: { ...it, text: m ? it.text.slice(m[0].length) : it.text } });
         }
         return;
+      }
       case 'contents':
         return this.parseContents(s);
       case 'hours':
@@ -678,6 +736,12 @@ class DocExtraction {
       const section = o.inferredFrom ?? SECTION_LABEL.outcomes;
       const sources = o.item.lines.slice(0, ACADEMIC_LIMITS.sourcesPerItem).map((l) => this.src(l, section));
       const review = cutReview(o.item.lines, text);
+      if (o.split) {
+        const basis = o.inferredFrom
+          ? `el documento no trae «resultados de aprendizaje»; cada capacidad que enumeran sus «${o.inferredFrom}» se tomó como un resultado`
+          : 'el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado';
+        return { id: ids[i], text, level, domain: outcomeDomainOf(level), status: 'inferred', sources, basis: basis.slice(0, ACADEMIC_LIMITS.basis), ...(review ? { review } : {}) };
+      }
       return o.inferredFrom
         ? { id: ids[i], text, level, domain: outcomeDomainOf(level), status: 'inferred', sources, basis: `el documento no trae «resultados de aprendizaje»; se usan sus «${o.inferredFrom}»`.slice(0, ACADEMIC_LIMITS.basis), ...(review ? { review } : {}) }
         : { id: ids[i], text, level, domain: outcomeDomainOf(level), status: 'found', sources, ...(review ? { review } : {}) };
@@ -716,12 +780,81 @@ class DocExtraction {
       const target = cur ? cur.contents : loose;
       for (const part of splitContentCell(t)) target.push({ text: part, lines: [l] });
     };
+    // r70 · Tabla con encabezado («Unidad temática | Contenidos principales | Horas») cuyas filas NO dicen «Unidad N»
+    // («1. Hello! Getting to Know You | Saludos, … | 10»): la columna del encabezado dice qué celda es la unidad, cuál sus
+    // contenidos y cuál sus horas. La celda partida en varias líneas continúa la fila; la fila TOTAL cierra la tabla y el
+    // texto que sigue (una nota al pie de la tabla) va a «Información adicional», no a los temas de la última unidad.
+    let cols: { unit: number; contents: number; hours: number; width: number } | null = null;
+    let rowUnit: (typeof units)[number] | null = null;
+    let tableEnded = false;
+    const after: SourceLine[] = [];
+    const colsOf = (h: string[]) => {
+      // «Tema(s)» es la columna de los contenidos, nunca la de la unidad.
+      const unit = h.findIndex((x) => /^(unidad(es)?( tematicas?| de aprendizaje)?|modulos?|ejes?( tematicos?)?|bloques?( tematicos?)?|capitulos?)$/.test(x));
+      const contents = h.findIndex((x, j) => j !== unit && /^(contenidos?|temas?|subtemas?|descripcion|detalle)\b/.test(x));
+      const hours = h.findIndex((x) => /^(hor|horas?|hrs?\.?|h|duracion|intensidad horaria)\b/.test(x));
+      // Solo si las filas NO dicen «Unidad N» (esas tablas las lee el lector de siempre).
+      return unit >= 0 && !hasUnitWords ? { unit, contents, hours, width: h.length } : null;
+    };
+    const isTotal = (t: string) => /^(total|subtotal|totales)\b/i.test(stripAccents(t.trim()));
     for (const l of lines) {
+      if (isColumnHeaderRow(l) && l.cells) {
+        cols = colsOf(l.cells.map((c) => normKey(c)));
+        rowUnit = null;
+        continue;
+      }
+      if (tableEnded && !l.cells) { after.push(l); continue; }
+      if (rowUnit && !l.cells) {
+        const t = collapse(l.text);
+        if (isTotal(t)) {
+          tableEnded = true;
+          const th = /(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:h|horas?)?\s*$/i.exec(t);
+          if (th) this.totalFromTable(num(th[1]), l);
+          continue;
+        }
+        const last = rowUnit.contents[rowUnit.contents.length - 1];
+        // Continuación de la celda: empieza en minúscula o la celda anterior no terminó la frase.
+        if (last && (/^[a-záéíóúñü(]/.test(t) || !/[.;:!?]$/.test(last.text))) {
+          last.text = `${last.text} ${t}`;
+          last.lines.push(l);
+          continue;
+        }
+        // Tabla sin columna de contenidos: la línea en minúscula continúa el título de la unidad.
+        if (!last && /^[a-záéíóúñü(]/.test(t)) { rowUnit.title = collapse(`${rowUnit.title} ${t}`); continue; }
+        tableEnded = true;
+        after.push(l);
+        continue;
+      }
       if (l.cells) {
         // Tabla de contenidos: | Unidad 1: título | temas | 12 h | RA1 |. Las filas de encabezado se saltan.
         const cells = l.cells.map(collapse);
         if (cells.every((c) => !c || /^(unidad(es)?|contenidos?|temas?|horas?|resultados?( de aprendizaje)?|ra|semana|n[°º.]?)$/i.test(stripAccents(c)))) continue;
         const ui = cells.findIndex((c) => UNIT_RE.test(c));
+        // Una fila con las columnas del encabezado (no una tabla anidada de una sola celda).
+        if (ui < 0 && cols && cells.length >= 2 && cells.length >= cols.width - 1 && cells[cols.unit]) {
+          if (isTotal(cells.find(Boolean) || '')) {
+            tableEnded = true;
+            const hc = cells.slice(1).reverse().find((c) => /^\d{1,4}(?:[.,]\d{1,2})?\s*(?:h|horas?)?$/i.test(c));
+            if (hc) this.totalFromTable(num(hc), l);
+            continue;
+          }
+          tableEnded = false;
+          const r = refsOf(cells[cols.unit].replace(/^\s*(?:[0-9]{1,2}|[ivxlc]{1,6})[.)\-–]\s+/i, ''));
+          const { text: title, hours: inTitle } = takeHours(r.rest);
+          const hc = cols.hours >= 0 ? cells[cols.hours] : undefined;
+          const hs = hc ? hoursSpanOf(hc) ?? hoursSpanOf(`${hc} h`) : null;
+          cur = { title: title || cells[cols.unit], hours: inTitle ?? (hs ? hs.value : null), line: l, contents: [], refs: r.ids };
+          units.push(cur);
+          rowUnit = cur;
+          const rest = cells.filter((_c, j) => j !== cols!.unit && j !== cols!.hours);
+          for (const c of rest) {
+            const rc = refsOf(c);
+            cur.refs.push(...rc.ids);
+            if (rc.rest) for (const part of splitContentCell(rc.rest)) cur.contents.push({ text: part, lines: [l] });
+          }
+          continue;
+        }
+        rowUnit = null;
         if (ui >= 0) {
           const m = UNIT_RE.exec(cells[ui])!;
           const { text: title, hours } = takeHours(m[2] || cells[ui]);
@@ -740,6 +873,11 @@ class DocExtraction {
         continue;
       }
       const text = l.text.replace(BULLET_RE, '');
+      if (cols && isTotal(text)) {
+        const th = /(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:h|horas?)?\s*$/i.exec(collapse(text));
+        if (th) this.totalFromTable(num(th[1]), l);
+        continue;
+      }
       const um = hasUnitWords ? UNIT_RE.exec(text) : null;
       const tm = !um && hasSub ? TOP_RE.exec(l.text) : null;
       if (um || (tm && !SUB_RE.test(l.text))) {
@@ -753,7 +891,17 @@ class DocExtraction {
       const sm = hasSub ? SUB_RE.exec(l.text) : null;
       pushContent(sm ? sm[3] : l.text, l);
     }
+    // Nota al pie de la tabla («Orientación curricular: …»): un párrafo de «Información adicional».
+    if (after.length) {
+      for (const it of this.items({ ...s, inline: null, lines: after })) this.pushListField('additionalInfo', it.text, it.lines[0], SECTION_LABEL.additional);
+    }
     this.emitUnits(s, units, loose);
+  }
+
+  /** r70 · Fila «TOTAL | 60» de la tabla de unidades: el total de horas del documento (si ya estaba, suma la fuente). */
+  private totalFromTable(value: number, l: SourceLine): void {
+    if (!(value > 0 && value <= 5000)) return;
+    this.ctx.hours.total = this.setTotalHours(value, null, this.src(l, SECTION_LABEL.hours));
   }
 
   /**
@@ -916,7 +1064,9 @@ class DocExtraction {
       if (colon > 0) entries.push({ label: l.text.slice(0, colon), text: l.text.slice(colon + 1), line: l, key: 'hours' });
       else if (HOURS_RE.test(l.text) || /^\s*\d{1,4}(?:[.,]\d{1,2})?\s*$/.test(l.text)) {
         // Sin etiqueta propia («48 horas» debajo de «Total de horas»): manda el encabezado de la sección.
-        const label = collapse(l.text.replace(HOURS_RE, '').replace(/^\s*\d{1,4}(?:[.,]\d{1,2})?\s*$/, ''));
+        // r70: «8 horas de trabajo del estudiante» (la cifra primero): lo que sigue califica las horas, no es su rótulo.
+        const lead = /^\s*\d{1,4}(?:[.,]\d{1,2})?\s*(?:horas?|hrs?\.?|h)\b/i.test(l.text);
+        const label = lead ? '' : collapse(l.text.replace(HOURS_RE, '').replace(/^\s*\d{1,4}(?:[.,]\d{1,2})?\s*$/, ''));
         entries.push({ label: label || s.heading, text: l.text, line: l, key: label ? 'hours' : s.key });
       }
     }
@@ -1066,6 +1216,15 @@ class DocExtraction {
     }
   }
 
+  /** r70: sin «objetivo general», la «Unidad de competencia» del documento (un párrafo) lo cubre — declarado como inferido. */
+  private inferObjective(): void {
+    const id = this.ctx.identity;
+    const cu = this.competencyUnit;
+    if (id.generalObjective.status !== 'missing' || !cu) return;
+    const { text } = clip(cu.text, ACADEMIC_LIMITS.text);
+    id.generalObjective = { status: 'inferred', value: text, sources: [this.src(cu.lines[0], SECTION_LABEL.competencies)], basis: `el documento no trae «objetivo general»; se usa su «${clip(cu.heading, 60).text}»`.slice(0, ACADEMIC_LIMITS.basis) };
+  }
+
   private inferLevel(): void {
     const id = this.ctx.identity;
     if (id.educationLevel.status !== 'missing' || id.program.value === null) return;
@@ -1122,6 +1281,48 @@ function withReview<T>(f: Field<T>, text: string, review: string | null): Field<
   // Solo si el valor guardado es el cortado (no si otra fuente ya trajo el texto completo).
   if (typeof f.value !== 'string' || collapse(f.value) !== collapse(text)) return f;
   return { ...f, review };
+}
+
+/**
+ * r70 · Párrafo de resultados sin códigos → una capacidad por elemento de la enumeración. Solo si el párrafo la anuncia
+ * («estará en capacidad de», «será capaz de», «podrá», «logrará»…) y la enumeración da ≥ 2 elementos que empiezan con un
+ * verbo en infinitivo («comprender…», «presentarse…»). «formular y responder preguntas» queda junto (un verbo solo se
+ * une al siguiente); lo que no empieza con verbo («objetos, lugares y actividades») sigue al elemento anterior.
+ * Nada se reescribe: el texto de cada resultado es el del documento (con mayúscula inicial y sin el punto final).
+ */
+const PROSE_LEAD_RE = /^(?:[^.;]{0,160}?\b)(?:estar[aá]n? en (?:capacidad|condiciones) de|ser[aá] capaz de|ser[aá]n capaces de|podr[aá]n?|lograr[aá]n?|habr[aá]n? desarrollado (?:la capacidad|las habilidades) de)\s+/i;
+const NOT_VERBS = new Set(['lugar', 'hogar', 'escolar', 'familiar', 'mujer', 'poder', 'deber', 'placer', 'militar', 'popular', 'particular', 'bienestar', 'par', 'mar', 'nivel', 'similar', 'regular', 'singular', 'titular', 'auxiliar', 'celular', 'modular', 'molecular', 'muscular', 'vocabular', 'solar', 'polar', 'lunar', 'dolar', 'azar', 'altar', 'collar', 'ejemplar', 'alrededor', 'menor', 'mayor', 'mejor', 'peor', 'interior', 'exterior', 'anterior', 'posterior', 'superior', 'inferior']);
+const isInfinitive = (w: string) => {
+  const k = stripAccents(w).toLowerCase().replace(/[^a-zñ]/g, '');
+  if (!/^[a-zñ]{2,}(?:ar|er|ir)(?:se|lo|la|los|las|le|les)?$/.test(k)) return false;
+  return !NOT_VERBS.has(k) && !NOT_VERBS.has(k.replace(/(?:se|lo|la|los|las|le|les)$/, ''));
+};
+export function splitProseOutcomes(text: string): string[] | null {
+  const t = collapse(text);
+  const lead = PROSE_LEAD_RE.exec(t);
+  if (!lead) return null;
+  const body = t.slice(lead[0].length).replace(/[.;:\s]+$/, '')
+    .replace(/,?\s+as[ií] como(?: tambi[eé]n)?\s+/gi, ', ')
+    .replace(/,?\s+adem[aá]s de\s+/gi, ', ');
+  const toks = body.split(/(\s*;\s*|\s*,\s*(?:y\s+|e\s+)?|\s+(?:y|e)\s+)/);
+  const out: string[] = [];
+  let cur = toks[0] || '';
+  if (!isInfinitive(cur.split(/\s+/)[0] || '')) return null;
+  for (let i = 1; i < toks.length; i += 2) {
+    const sep = toks[i];
+    const seg = toks[i + 1] || '';
+    const first = seg.split(/\s+/)[0] || '';
+    if (isInfinitive(first) && cur.trim().split(/\s+/).length > 1) {
+      out.push(cur);
+      cur = seg;
+    } else {
+      cur = `${cur}${sep}${seg}`;
+    }
+  }
+  out.push(cur);
+  const items = out.map((x) => collapse(x)).filter(Boolean);
+  if (items.length < 2 || items.some((x) => x.split(/\s+/).length < 2)) return null;
+  return items.map((x) => x.charAt(0).toUpperCase() + x.slice(1));
 }
 
 function takeHours(text: string): { text: string; hours: number | null } {
