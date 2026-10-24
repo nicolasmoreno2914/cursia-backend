@@ -698,7 +698,7 @@ export class SchedulerService {
           where pj.execution_mode = 'dynamic_generation'
             and pj.worker_status = any($1::text[])
             and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-            and ($2::text is null or pj.owner_id = $2)
+            and ($2::text is null or pj.owner_id::text = $2)
             and not (g.id = any($3::uuid[]))
             and not (g.job_id = any($5::uuid[]))
             and ($6::timestamptz is null or pj.created_at >= $6::timestamptz)
@@ -977,7 +977,7 @@ export class SchedulerService {
                where pj.id = g.job_id and pj.execution_mode = 'dynamic_generation'
                  and pj.worker_status = any($4::text[])
                  and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
-                 and ($5::text is null or pj.owner_id = $5))
+                 and ($5::text is null or pj.owner_id::text = $5))
           returning g.id, g.job_id`,
         [itemRunId, executorId, this.clampLease(leaseSeconds), ACTIVE_RUN_WORKER_STATUSES, ownerId ?? null],
       ),
@@ -1567,7 +1567,7 @@ export class SchedulerService {
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
          join public.course_generation_manifests m on m.id = g.manifest_id
-        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id = $2)`,
+        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id::text = $2)`,
       [itemRunId, ownerId ?? null],
     );
     if (!g || Number(g.rules_version) !== 3 || g.status !== 'running' || g.worker_id !== executorId) return { kind: 'skip' };
@@ -1767,7 +1767,7 @@ export class SchedulerService {
   private async practiceFilesForChapter(q: { query: (sql: string, params?: any[]) => Promise<any[]> }, jobId: string, chapterId: string | null): Promise<Array<{ title: string; filename: string; instructions: string; relation: string }>> {
     if (!chapterId) return [];
     const [p] = await q.query(
-      `select p.data from public.course_profiles p join public.production_jobs j on j.course_id = p.course_id
+      `select p.data from public.course_profiles p join public.production_jobs j on j.course_id::text = p.course_id::text
         where j.id = $1 and p.kind = 'assessment' and p.created_at <= j.created_at order by p.version desc limit 1`,
       [jobId],
     );
@@ -2058,7 +2058,7 @@ export class SchedulerService {
     const [head] = await this.dataSource.query(
       `select g.job_id from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
-        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id = $2)`,
+        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id::text = $2)`,
       [itemRunId, ownerId ?? null],
     );
     if (!head) return { ok: false, reason: 'not_found' };
@@ -2115,7 +2115,7 @@ export class SchedulerService {
           and pj.worker_status = any($1::text[])
           and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
           and ($2::uuid is null or g.job_id = $2)
-          and ($3::text is null or pj.owner_id = $3)
+          and ($3::text is null or pj.owner_id::text = $3)
           and exists (select 1 from unnest(g.depends_on) as dk(key)
                        where not exists (select 1 from public.generation_item_runs d2
                                           where d2.job_id = g.job_id and d2.manifest_id = g.manifest_id
@@ -2140,7 +2140,7 @@ export class SchedulerService {
     const lock = mode === 'share' ? 'for share' : mode === 'update-skip' ? 'for update skip locked' : 'for update';
     const [job] = await qr.query(
       `select * from public.production_jobs
-        where id = $1 and execution_mode = 'dynamic_generation' and ($2::text is null or owner_id = $2)
+        where id = $1 and execution_mode = 'dynamic_generation' and ($2::text is null or owner_id::text = $2)
         ${lock}`,
       [runId, ownerId ?? null],
     );
@@ -2153,7 +2153,7 @@ export class SchedulerService {
       `select g.status, g.worker_id, pj.status as job_status, pj.worker_status as job_worker_status
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
-        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id = $2)`,
+        where g.id = $1 and pj.execution_mode = 'dynamic_generation' and ($2::text is null or pj.owner_id::text = $2)`,
       [itemRunId, ownerId ?? null],
     );
     if (!r) return 'not_found';

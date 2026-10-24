@@ -1964,7 +1964,7 @@ export class RunsService {
     const rows = await this.dataSource.query(
       `select pj.* from public.production_jobs pj
          join public.course_generation_manifests m
-           on m.id::text = pj.input_payload->>'manifestId' and m.course_id = pj.course_id
+           on m.id::text = pj.input_payload->>'manifestId' and m.course_id::text = pj.course_id::text
          join public.course_blueprints b on b.id = m.blueprint_id and b.course_id = m.course_id
         where pj.execution_mode = 'dynamic_generation'
           and pj.course_id = $1 and pj.owner_id = $2 and b.blueprint_number = $3

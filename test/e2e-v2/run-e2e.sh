@@ -64,6 +64,13 @@ rm -rf "$DATA"
 "$PGBIN/psql" -h 127.0.0.1 -p $PORT -U postgres -d v2db -qc 'create role "postgres.e2elocaltest" superuser login' || exit 4
 export NODE_PATH="$REPO/node_modules" BUILD_DIR="$REPO/dist"
 (cd "$HERE" && NODE_ENV=production node "$HERE/setup-schema.js" base) || exit 5
+# r69: E2E_PROD_COLUMN_TYPES=1 → tipos legacy de PRODUCCIÓN (Orbia) en la DB descartable, antes de las
+# migraciones V2 (como las recibió producción): production_jobs.course_id text, owner_id uuid; artifacts.owner_id uuid.
+if [ "${E2E_PROD_COLUMN_TYPES:-0}" = "1" ]; then
+  "$PGBIN/psql" -h 127.0.0.1 -p $PORT -U postgres -d v2db -v ON_ERROR_STOP=1 -qc \
+    'alter table public.production_jobs alter column course_id type text using course_id::text, alter column owner_id type uuid using owner_id::uuid; alter table public.artifacts alter column owner_id type uuid using owner_id::uuid' || exit 5
+  echo "tipos de columnas de producción aplicados (E2E_PROD_COLUMN_TYPES=1)"
+fi
 DB_HOST=127.0.0.1 DB_PORT=$PORT DB_USER=postgres DB_PASS=x DB_NAME=v2db DB_SSL=false \
   node "$REPO/scripts/migrate-production-jobs-constraints.js" > "$OUT/migrate-jobs.log" 2>&1 || { cat "$OUT/migrate-jobs.log"; exit 6; }
 (cd "$HERE" && node "$HERE/setup-schema.js" sql) || exit 7
