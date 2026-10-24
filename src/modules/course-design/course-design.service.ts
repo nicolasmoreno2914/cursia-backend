@@ -33,6 +33,13 @@ import { DistributionResult } from '../study-time/distributor';
 import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto, RequirementDecisionsDto } from './dto/recommend.dto';
 import { COURSE_FORMATS, COURSE_FORMAT_CODES, CourseFormatCode, formatDef, formatFit, readCourseFormat } from '../prebrief/course-formats';
+import { randomUUID } from 'crypto';
+import { profileOutcomesBlockedBy } from '../academic-context/profile-outcomes-db';
+import { BRIEF_KEY, BRIEF_VERSION, normalizeBriefFields, parseBrief } from '../course-facts/course-facts';
+import { sortOutcomeIds } from '../academic-context/blueprint-academic';
+import {
+  AUTOFIX_KEY, AutofixChange, AutofixChapter, AutofixInput, AutofixPlan, AutofixRecord, AutofixState, declinedKeys, inferSector, parseAutofixState, planAutofix,
+} from './pedagogical-autofix';
 
 /** Prioridad audiovisual por defecto de V2 (sin preferencia guardada). */
 export const DEFAULT_AUDIOVISUAL = 'recommended' as const;
@@ -295,6 +302,8 @@ export class CourseDesignService {
     const chapterOutcomes = new Map(live.map((r) => [r.id, chapterLinksOverride && chapterLinksOverride.has(r.id) ? chapterLinksOverride.get(r.id)! : r.outcomeIds]));
     const linkDetail = academic && dist ? await autoLinkPlanDetailed(this.dataSource, courseId, academic.context) : null;
     const linkPlan = linkDetail ? linkDetail.plan : [];
+    // r71 · «Cursia optimizó tu curso»: lo que corregiría ahora (vista previa, sin escribir) y lo ya corregido.
+    const autofix = dist ? await this.autofixPreview(this.dataSource, courseId, academic ? academic.context : null, facts.sector && facts.sector.value ? String(facts.sector.value) : null, chapterLinksOverride) : null;
     const savedComparable = saved ? JSON.stringify(normalizePedagogicalProfile(Object.fromEntries(Object.entries(saved.profile as any).filter(([k]) => k !== 'designRules')))) : null;
     const approachDef = profile.primaryApproach ? registry.get(profile.primaryApproach) : null;
     const providers = dist && dist.materialized ? dist.materialized.providers : null;
@@ -434,6 +443,7 @@ export class CourseDesignService {
       // Review L83 M-1: solo los fijados que el diseño usa (capítulos de contenido que existen).
       pinnedChapters,
       verification,
+      autofix,
       design: dist
         ? {
           status: dist.status,
@@ -572,9 +582,14 @@ export class CourseDesignService {
    *   link_outcomes — vincula a sus resultados los capítulos que NO tienen vínculos propios (la misma sugerencia del
    *   contexto académico; un capítulo con vínculos se conserva siempre). Una transacción, con el contador de la estructura.
    */
-  async fix(courseId: number, ownerId: string, action: string, expectedCounter: number) {
+  async fix(courseId: number, ownerId: string, action: string, expectedCounter: number, extra: { changeIds?: string[]; outcomeId?: string; chapterId?: string; field?: string; value?: string } = {}) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
+    // r71 · «Cursia optimizó tu curso» y las acciones en línea de la propuesta (paso 5).
+    if (action === 'autofix') return this.autofix(courseId, ownerId, expectedCounter);
+    if (action === 'autofix_undo') return this.autofixUndo(courseId, expectedCounter, extra.changeIds);
+    if (action === 'link_outcome') return this.linkOutcome(courseId, expectedCounter, String(extra.outcomeId || ''), String(extra.chapterId || ''));
+    if (action === 'context_field') return this.setContextField(courseId, String(extra.field || ''), extra.value);
     if (action !== 'link_outcomes' && action !== 'cover_contents') throw new BadRequestException(`Acción desconocida: ${JSON.stringify(action)}`);
     if (action === 'cover_contents') return this.coverContents(courseId, expectedCounter, await loadCurrentAcademicContext(this.dataSource, courseId));
     const qr = this.dataSource.createQueryRunner();
@@ -616,6 +631,209 @@ export class CourseDesignService {
       }
       await qr.commitTransaction();
       return { action, linkedChapters: linked, applied, structureVersionCounter: counter, contextVersion: academic.version };
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
+  // ── r71 · «Cursia optimizó tu curso» (autocorrección pedagógica) ──────────────────────────────────────────────
+
+  /** Una transacción con el contador de la estructura (el mismo contrato que «Corregir»: 409 si cambió). */
+  private async withCounter<T>(courseId: number, expectedCounter: number, fn: (qr: Q, counter: number) => Promise<T>): Promise<T> {
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      const [course] = await qr.query(`select structure_version_counter c from public.courses where id = $1 for update`, [courseId]);
+      if (Number(course.c) !== expectedCounter) {
+        await qr.rollbackTransaction();
+        throw new ConflictException({ code: 'STRUCTURE_CHANGED', message: 'STRUCTURE_CHANGED: la estructura cambió; vuelve a verla antes de corregir.' });
+      }
+      const out = await fn(qr, expectedCounter);
+      await qr.commitTransaction();
+      return out;
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
+  private async bumpCounter(q: Q, courseId: number): Promise<number> {
+    const before = Number((await q.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]))[0].c);
+    const n = await q.query(`update public.courses set structure_version_counter = structure_version_counter + 1 where id = $1 returning structure_version_counter c`, [courseId]);
+    const counter = Number(returningRows(n)[0].c);
+    await advanceStructureOriginIfUntouched(q as any, courseId, before, counter);
+    return counter;
+  }
+
+  /** Lo que lee la autocorrección (módulos, capítulos con sus vínculos, desvinculados a propósito, lo deshecho). */
+  private async autofixInput(q: Q, courseId: number, ctx: AcademicContextV1 | null, sector: string | null, linksOverride?: Map<string, string[]>): Promise<{ input: AutofixInput; state: AutofixState }> {
+    const mods: any[] = await q.query(`select id, position, title, objective, description from public.course_modules where course_id = $1 order by position`, [courseId]);
+    const rows: any[] = await q.query(
+      `select id, module_id, position, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind
+         from public.course_chapters ch where course_id = $1`,
+      [courseId],
+    );
+    const pins = await loadDesignPins(q, courseId);
+    const state = await loadAutofixState(q, courseId);
+    const lexical = ctx ? new Map((await autoLinkPlan(q, courseId, ctx)).map((p) => [p.chapterId, p.suggested])) : new Map<string, string[]>();
+    const chapters: AutofixChapter[] = rows.map((r) => ({
+      id: r.id, moduleId: r.module_id, position: Number(r.position), title: String(r.title || ''), objective: r.objective, description: r.description,
+      kind: r.kind === 'practice' ? 'practice' : 'content',
+      outcomeIds: linksOverride && linksOverride.has(r.id) ? [...linksOverride.get(r.id)!] : Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : [],
+      ...(pins[r.id] && pins[r.id].noLinks ? { noLinks: true } : {}),
+    }));
+    // Lo que Cursia aplicó y el docente cambió después por otra vía (editor, «Lo que entendimos»): es decisión suya.
+    const declined = declinedKeys(state);
+    const byId = new Map(chapters.map((c) => [c.id, c]));
+    for (const r of appliedRecords(state)) {
+      if (r.kind === 'context_field' && r.target.field === 'sector' && sector !== r.after) declined.add(r.id);
+      const ch = r.target.chapterId ? byId.get(r.target.chapterId) : null;
+      if (r.target.chapterId && JSON.stringify(ch ? ch.outcomeIds : null) !== JSON.stringify(r.after)) {
+        declined.add(r.id); declined.add(`chapter:${r.target.chapterId}`); declined.add(`competency:${r.target.chapterId}`);
+      }
+    }
+    return {
+      state,
+      input: {
+        ctx, chapters, lexical, declined, context: { sector },
+        modules: mods.map((m) => ({ id: m.id, position: Number(m.position), title: String(m.title || ''), objective: m.objective, description: m.description })),
+        hasDocument: !!ctx && Array.isArray(ctx.documents) && ctx.documents.length > 0,
+      },
+    };
+  }
+
+  /**
+   * Vista previa (sin escribir) para «Cursia recomienda» y la propuesta: lo que Cursia corregiría ahora, lo que propone,
+   * lo que ya corrigió (con «Deshacer») y las sugerencias para las acciones en línea del paso 5.
+   */
+  async autofixPreview(q: Q, courseId: number, ctx: AcademicContextV1 | null, sector: string | null, linksOverride?: Map<string, string[]>) {
+    const { input, state } = await this.autofixInput(q, courseId, ctx, sector, linksOverride);
+    const plan = planAutofix(input);
+    // Sugerencias aunque el docente haya deshecho el cambio (la acción en línea es SU decisión).
+    const open = planAutofix({ ...input, declined: new Set() });
+    const mods = new Map(input.modules.map((m) => [m.id, m.title]));
+    return {
+      pending: plan.changes.length,
+      changes: plan.changes,
+      proposals: plan.proposals,
+      suggestions: { ...open.suggestions, ...plan.suggestions },
+      applied: appliedRecords(state),
+      chapters: input.chapters.filter((c) => c.kind === 'content')
+        .sort((a, b) => (input.modules.findIndex((m) => m.id === a.moduleId) - input.modules.findIndex((m) => m.id === b.moduleId)) || a.position - b.position)
+        .map((c) => ({ id: c.id, title: c.title, moduleTitle: mods.get(c.moduleId) || '' })),
+      contextSuggestions: { sector: sector ? null : ((inferSector(ctx) || { value: null }).value as string | null) },
+    };
+  }
+
+  /** Aplica lo que se deduce con evidencia, de una vez, con su registro (idempotente; nunca pisa al docente). */
+  private async autofix(courseId: number, ownerId: string, expectedCounter: number) {
+    return this.withCounter(courseId, expectedCounter, async (qr, counter0) => {
+      // Una propuesta preparada/aprobada o una producción en curso no se cambian solas (se invalidarían sin pedirlo).
+      const blocked = await profileOutcomesBlockedBy(qr, courseId, true);
+      if (blocked) return { action: 'autofix' as const, skipped: blocked, applied: [] as AutofixChange[], proposals: [], structureVersionCounter: counter0 };
+      await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: false, link: false, allowRemovals: true });
+      const academic = await loadCurrentAcademicContext(qr, courseId);
+      const facts = await loadCourseFacts(qr, courseId);
+      const { input, state } = await this.autofixInput(qr, courseId, academic ? academic.context : null, facts.sector && facts.sector.value ? String(facts.sector.value) : null);
+      const plan: AutofixPlan = planAutofix(input);
+      const applied: AutofixChange[] = [];
+      for (const ch of plan.changes) {
+        if (ch.target.chapterId) {
+          // Solo si el capítulo sigue como lo vio el plan (nada de otra pestaña se pisa).
+          const res = await qr.query(
+            `update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3 and coalesce(outcome_ids, '[]'::jsonb) = $4::jsonb returning id`,
+            [JSON.stringify(ch.after), ch.target.chapterId, courseId, JSON.stringify(ch.before || [])],
+          );
+          if (returningRows(res).length) applied.push(ch);
+        } else if (ch.kind === 'context_field' && ch.target.field) {
+          if (await writeBriefField(qr, courseId, ch.target.field, String(ch.after), { inferred: true, onlyIfEmpty: true })) applied.push(ch);
+        }
+      }
+      // r63: la sincronización pudo subir el contador; el que se devuelve es SIEMPRE el vigente.
+      let counter = Number((await qr.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]))[0].c);
+      if (applied.some((c) => c.target.chapterId)) counter = await this.bumpCounter(qr, courseId);
+      const batchId = applied.length ? randomUUID() : null;
+      if (applied.length) {
+        const at = new Date().toISOString();
+        await writeAutofixState(qr, courseId, { ...state, changes: [...state.changes, ...applied.map((c): AutofixRecord => ({ ...c, batchId: batchId!, at, status: 'applied' }))] });
+      }
+      return { action: 'autofix' as const, batchId, applied, proposals: plan.proposals, suggestions: plan.suggestions, structureVersionCounter: counter };
+    });
+  }
+
+  /** «Deshacer»: vuelve al valor anterior SOLO si nadie lo cambió después; lo deshecho no se vuelve a aplicar. */
+  private async autofixUndo(courseId: number, expectedCounter: number, changeIds?: string[]) {
+    return this.withCounter(courseId, expectedCounter, async (qr, counter0) => {
+      const state = await loadAutofixState(qr, courseId);
+      const want = changeIds && changeIds.length ? new Set(changeIds) : null;
+      const targets = appliedRecords(state).filter((r) => !want || want.has(r.id));
+      const reverted: string[] = [];
+      const changed: string[] = [];
+      const now = new Date().toISOString();
+      const next: AutofixRecord[] = [];
+      for (const r of targets) {
+        let ok = false;
+        if (r.target.chapterId) {
+          const before = Array.isArray(r.before) ? r.before : [];
+          const res = await qr.query(
+            `update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3 and coalesce(outcome_ids, '[]'::jsonb) = $4::jsonb returning id`,
+            [before.length ? JSON.stringify(before) : null, r.target.chapterId, courseId, JSON.stringify(r.after)],
+          );
+          ok = returningRows(res).length > 0;
+        } else if (r.kind === 'context_field' && r.target.field) {
+          ok = await writeBriefField(qr, courseId, r.target.field, null, { inferred: false, onlyIfValue: String(r.after) });
+        }
+        (ok ? reverted : changed).push(r.id);
+        // Lo que el docente cambió después también queda como decisión suya (Cursia no lo vuelve a tocar).
+        next.push({ ...r, status: ok ? 'reverted' : 'superseded', revertedAt: now });
+      }
+      let counter = counter0;
+      if (targets.some((r, i) => r.target.chapterId && next[i].status === 'reverted')) counter = await this.bumpCounter(qr, courseId);
+      if (next.length) await writeAutofixState(qr, courseId, { ...state, changes: [...state.changes, ...next] });
+      return { action: 'autofix_undo' as const, reverted, changed, structureVersionCounter: counter };
+    });
+  }
+
+  /** Acción en línea del paso 5: el docente vincula UN resultado (o competencia) a UN capítulo. Solo agrega. */
+  private async linkOutcome(courseId: number, expectedCounter: number, outcomeId: string, chapterId: string) {
+    return this.withCounter(courseId, expectedCounter, async (qr, counter0) => {
+      const academic = await loadCurrentAcademicContext(qr, courseId);
+      const known = academic ? [...academic.context.outcomes.map((o) => o.id), ...academic.context.competencies.map((c) => c.id)] : [];
+      if (!known.includes(outcomeId)) throw new BadRequestException({ code: 'UNKNOWN_OUTCOME', message: `UNKNOWN_OUTCOME: el curso no tiene el resultado ${JSON.stringify(outcomeId)}.` });
+      const [row] = await qr.query(`select to_jsonb(ch) -> 'outcome_ids' as outcome_ids from public.course_chapters ch where id::text = $1 and course_id = $2`, [chapterId, courseId]);
+      if (!row) throw new BadRequestException({ code: 'UNKNOWN_CHAPTER', message: 'UNKNOWN_CHAPTER: el capítulo no es de este curso.' });
+      const cur: string[] = Array.isArray(row.outcome_ids) ? row.outcome_ids : [];
+      if (cur.includes(outcomeId)) return { action: 'link_outcome' as const, linked: false, chapterId, outcomeIds: cur, structureVersionCounter: counter0 };
+      const next = sortOutcomeIds([...cur, outcomeId]);
+      await qr.query(`update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3`, [JSON.stringify(next), chapterId, courseId]);
+      const counter = await this.bumpCounter(qr, courseId);
+      return { action: 'link_outcome' as const, linked: true, chapterId, outcomeIds: next, structureVersionCounter: counter };
+    });
+  }
+
+  /** Acción en línea del paso 5: el docente completa un dato del curso que falta (queda como dato suyo, no inferido). */
+  private async setContextField(courseId: number, field: string, value: string | undefined) {
+    if (!['sector', 'pais', 'ciudad', 'tono'].includes(field)) throw new BadRequestException(`Dato desconocido: ${JSON.stringify(field)}`);
+    const v = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!v || v.length > 255) throw new BadRequestException('value: escribe el dato (hasta 255 caracteres).');
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      await qr.query(`select id from public.courses where id = $1 for update`, [courseId]);
+      await writeBriefField(qr, courseId, field, v, { inferred: false });
+      // Si Cursia lo había inferido, el valor del docente lo reemplaza: ese cambio deja de poder deshacerse.
+      const state = await loadAutofixState(qr, courseId);
+      const sup = appliedRecords(state).filter((r) => r.kind === 'context_field' && r.target.field === field);
+      if (sup.length) await writeAutofixState(qr, courseId, { ...state, changes: [...state.changes, ...sup.map((r): AutofixRecord => ({ ...r, status: 'superseded', revertedAt: new Date().toISOString() }))] });
+      await qr.commitTransaction();
+      return { action: 'context_field' as const, field, value: v };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       throw err;
@@ -862,4 +1080,51 @@ function designForRequirements(
 function missingProfilesTable(err: any): null {
   if (err && err.code === '42P01') return null;
   throw err;
+}
+
+// ── r71 · registro de la autocorrección y escritura de un dato del pedido ─────────────────────────────────────────
+
+const AUTOFIX_MAX_RECORDS = 600;
+
+export async function loadAutofixState(q: Q, courseId: number): Promise<AutofixState> {
+  const [row] = await q.query(`select metadata -> '${AUTOFIX_KEY}' as s from public.courses where id = $1`, [courseId]);
+  const v = row ? (typeof row.s === 'string' ? JSON.parse(row.s) : row.s) : null;
+  return parseAutofixState(v);
+}
+
+async function writeAutofixState(q: Q, courseId: number, state: AutofixState): Promise<void> {
+  const changes = state.changes.slice(-AUTOFIX_MAX_RECORDS);
+  await q.query(
+    `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
+    [courseId, [AUTOFIX_KEY], JSON.stringify({ autofixVersion: state.autofixVersion, changes })],
+  );
+}
+
+/** Lo que sigue aplicado (el último registro de cada cambio es «aplicado»), en el orden en que se aplicó. */
+export function appliedRecords(state: AutofixState): AutofixRecord[] {
+  const last = new Map<string, AutofixRecord>();
+  for (const c of state.changes) { last.delete(c.id); last.set(c.id, c); }
+  return [...last.values()].filter((c) => c.status === 'applied');
+}
+
+/**
+ * Un dato del pedido del curso (courses.metadata.brief). `inferred` lo marca como inferido por Cursia («inferidos»);
+ * `onlyIfEmpty` no pisa un valor existente; `onlyIfValue` solo lo cambia si todavía tiene ese valor (deshacer). value null = quitarlo.
+ */
+async function writeBriefField(q: Q, courseId: number, field: string, value: string | null, opts: { inferred: boolean; onlyIfEmpty?: boolean; onlyIfValue?: string }): Promise<boolean> {
+  const [row] = await q.query(`select metadata -> '${BRIEF_KEY}' as b from public.courses where id = $1`, [courseId]);
+  const prev = parseBrief(row ? (typeof row.b === 'string' ? JSON.parse(row.b) : row.b) : null);
+  const fields: Record<string, string> = { ...((prev ? prev.fields : {}) as Record<string, string>) };
+  if (opts.onlyIfEmpty && fields[field]) return false;
+  if (opts.onlyIfValue !== undefined && fields[field] !== opts.onlyIfValue) return false;
+  const inferred = new Set(String(fields.inferidos || '').split(',').map((x) => x.trim()).filter(Boolean));
+  if (value) fields[field] = value; else delete fields[field];
+  if (opts.inferred && value) inferred.add(field); else inferred.delete(field);
+  if (inferred.size) fields.inferidos = [...inferred].join(','); else delete fields.inferidos;
+  const brief = { briefVersion: BRIEF_VERSION, fields: normalizeBriefFields(fields), updatedAt: new Date().toISOString() };
+  await q.query(
+    `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
+    [courseId, [BRIEF_KEY], JSON.stringify(brief)],
+  );
+  return true;
 }
