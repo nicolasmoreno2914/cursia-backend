@@ -62,12 +62,32 @@ export class HoursOriginDto {
 
 /** LOOP 8.4 · «Corregir» automático de la verificación. */
 export class DesignFixDto {
-  @IsIn(['link_outcomes', 'cover_contents'])
-  action: 'link_outcomes' | 'cover_contents';
+  /**
+   * r71 · autofix = «Cursia optimizó tu curso» (lo que se deduce con evidencia, con su registro); autofix_undo = «Deshacer»
+   * (changeIds; sin ellos, todo lo aplicado); link_outcome = el docente vincula UN resultado a UN capítulo (acción en línea
+   * de la propuesta); context_field = el docente completa un dato del curso que falta (acción en línea).
+   */
+  @IsIn(['link_outcomes', 'cover_contents', 'autofix', 'autofix_undo', 'link_outcome', 'context_field'])
+  action: 'link_outcomes' | 'cover_contents' | 'autofix' | 'autofix_undo' | 'link_outcome' | 'context_field';
 
   @IsInt()
   @Min(0)
   expectedCounter: number;
+
+  @IsOptional() @IsArray() @ArrayMaxSize(200) @IsString({ each: true }) @MaxLength(80, { each: true })
+  changeIds?: string[];
+
+  @IsOptional() @IsString() @MaxLength(40)
+  outcomeId?: string;
+
+  @IsOptional() @IsString() @MaxLength(40)
+  chapterId?: string;
+
+  @IsOptional() @IsIn(['sector', 'pais', 'ciudad', 'tono'])
+  field?: 'sector' | 'pais' | 'ciudad' | 'tono';
+
+  @IsOptional() @IsString() @MaxLength(255)
+  value?: string;
 }
 
 /** Fase 2/3 · POST /courses/:courseId/design/structure-preview — vista previa de una forma (no aplica nada). */

@@ -22,7 +22,7 @@ import { lqaFindings, lqaHitLabel } from '../language-qa/language-qa';
 import { COURSE_FORMATS, COURSE_FORMAT_CODES, COURSE_FORMAT_CATALOG_VERSION, CourseFormatCode, formatDef, isCourseFormatCode, readCourseFormat, writeCourseFormat } from './course-formats';
 import { PrebriefModel, StoredExceptionReason, buildPrebriefModel, diffModels, documentVerbatimTexts, isDocumentVerbatim, prebriefModelSha } from './prebrief-model';
 import { PrebriefDocument, PrebriefDocumentMeta, PrebriefStatus, approvalStateTexts, buildPrebriefDocument, documentSha, documentTexts } from './prebrief-document';
-import { PrebriefReadiness, prebriefReadiness } from './prebrief-readiness';
+import { PrebriefReadiness, prebriefReadiness, withInlineActions } from './prebrief-readiness';
 import { DoubtfulItem, doubtfulItems } from './plausibility';
 import { renderPrebriefPdf } from './prebrief-pdf';
 import { unmappedCharCount } from '../../package/v3/libro-v3';
@@ -212,7 +212,7 @@ export class PrebriefService {
     const language: string[] = [];
     const verbatim = documentVerbatimTexts(model);
     for (const t of documentTexts(document)) if (!isDocumentVerbatim(t, verbatim)) for (const h of lqaFindings(t, 3)) language.push(`${lqaHitLabel(h)} en «${t.slice(0, 80)}»`);
-    const readiness = prebriefReadiness(model, card, doubts, language);
+    const readiness = withInlineActions(prebriefReadiness(model, card, doubts, language), card && card.autofix);
     const checks: any[] = (card && card.verification && card.verification.checks) || [];
     return {
       model, modelSha256: prebriefModelSha(model), document, documentSha256: documentSha(document), readiness, doubts,
@@ -275,6 +275,8 @@ export class PrebriefService {
       draft: {
         model: draft.model, modelSha256: draft.modelSha256, document: draft.document, documentSha256: draft.documentSha256,
         readiness: draft.readiness, verification: draft.verification,
+        // r71 · «Cursia optimizó tu curso»: lo aplicado (con «Deshacer») y lo que Cursia propone y decide el docente.
+        autofix: draft.card && draft.card.autofix ? { pending: draft.card.autofix.pending, applied: draft.card.autofix.applied, proposals: draft.card.autofix.proposals } : null,
         stateTexts: approvalStateTexts({ status: 'draft', version: null, date: null, fingerprint: draft.modelSha256, approval: null }),
         matchesLatest: !!latest && latest.model_sha256 === draft.modelSha256,
         diffFromLatest: latest && latest.model_sha256 !== draft.modelSha256 ? diffModels(latest.model_json, draft.model) : [],

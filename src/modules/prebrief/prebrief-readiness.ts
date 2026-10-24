@@ -37,6 +37,15 @@ export interface PrebriefBlocker {
   suggestion?: string;
   /** Alternativa que propone Cursia para el requisito no cubierto (con lo que ya produce). */
   proposal?: string;
+  /** r71: resultados del hallazgo crítico (alineación). */
+  outcomeIds?: string[];
+  /**
+   * r71 · Acción en línea (sin ir a otra pantalla): vincular el resultado al capítulo que propone Cursia (el docente puede
+   * elegir otro), o completar un dato del curso con la sugerencia de Cursia.
+   */
+  inline?: { kind: 'link_outcome'; outcomeId: string; chapterId: string | null; chapterTitle: string | null };
+  /** r71: datos del curso que faltan (context_incomplete), con la sugerencia de Cursia si la hay y si se completan aquí. */
+  fields?: { key: string; label: string; editable: boolean; suggestion: string | null }[];
 }
 
 /** Nombre, para el docente, de cada dato del curso que pide la propuesta (nunca la clave interna). */
@@ -45,9 +54,36 @@ const CONTEXT_FIELD_LABEL: Record<string, string> = {
   nivel: 'el conocimiento previo del estudiante', tono: 'el tono del contenido', obj: 'el objetivo', comp: 'las competencias',
 };
 
+/** r71: datos que se completan en línea en la propuesta (los demás tienen su control en «Lo que entendimos»). */
+const INLINE_CONTEXT_FIELDS = ['sector', 'pais', 'ciudad', 'tono'];
+const CONTEXT_FIELD_INPUT_LABEL: Record<string, string> = { nombre: 'Nombre del curso', sector: 'Sector', pais: 'País', ciudad: 'Ciudad', contexto: 'Contexto educativo', nivel: 'Conocimiento previo', tono: 'Tono del contenido' };
+
 export interface PrebriefReadiness {
   ready: boolean;
   blockers: PrebriefBlocker[];
+  /** r71: correcciones confiables que Cursia todavía no aplicó (la interfaz las aplica sola y vuelve a verificar). */
+  autofixPending?: number;
+  /** r71: capítulos de contenido para elegir otro destino en «Vincular a…». */
+  chapters?: { id: string; title: string; moduleTitle: string }[];
+}
+
+/**
+ * r71 · Cada bloqueo que Cursia no resuelve sola trae su acción en línea (nunca un callejón sin salida): el resultado sin
+ * capítulo, «Vincular a <capítulo que propone Cursia>»; el dato que falta, su campo con la sugerencia de Cursia.
+ */
+export function withInlineActions(r: PrebriefReadiness, autofix: { pending: number; suggestions: Record<string, { chapterId: string; chapterTitle: string } | null>; chapters: { id: string; title: string; moduleTitle: string }[]; contextSuggestions: { sector: string | null } } | null | undefined): PrebriefReadiness {
+  if (!autofix) return r;
+  const blockers = r.blockers.map((b) => {
+    if (b.code === 'critical' && b.outcomeIds && b.outcomeIds.length === 1 && /^alignment:/.test(String(b.ref || ''))) {
+      const sug = autofix.suggestions[b.outcomeIds[0]];
+      return { ...b, inline: { kind: 'link_outcome' as const, outcomeId: b.outcomeIds[0], chapterId: sug ? sug.chapterId : null, chapterTitle: sug ? sug.chapterTitle : null } };
+    }
+    if (b.code === 'context_incomplete' && b.fields) {
+      return { ...b, fields: b.fields.map((f) => ({ ...f, suggestion: f.key === 'sector' ? autofix.contextSuggestions.sector : f.suggestion })) };
+    }
+    return b;
+  });
+  return { ...r, blockers, autofixPending: autofix.pending, chapters: autofix.chapters };
 }
 
 export function prebriefReadiness(model: PrebriefModel, card: any, doubts: DoubtfulItem[], languageFindings: string[]): PrebriefReadiness {
@@ -61,7 +97,7 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
   if (!model.structure.totals.chapters) b.push({ code: 'no_structure', title: 'El curso todavía no tiene módulos ni capítulos.', where: 'design' });
   if (design.applicable !== true) b.push({ code: 'design_not_applicable', title: 'El diseño no se puede preparar así: revísalo en «Diseño».', where: 'design' });
   for (const c of (v.checks || []) as any[]) {
-    if (c.severity === 'critical' && !c.summary) b.push({ code: 'critical', title: String(c.title), detail: c.detail ? String(c.detail) : undefined, where: 'design', ref: String(c.id) });
+    if (c.severity === 'critical' && !c.summary) b.push({ code: 'critical', title: String(c.title), detail: c.detail ? String(c.detail) : undefined, where: 'design', ref: String(c.id), ...(Array.isArray(c.outcomeIds) && c.outcomeIds.length ? { outcomeIds: c.outcomeIds.map(String) } : {}) });
   }
   const proposed = (design.modules || []).reduce((n: number, m: any) => n + (m.chapters || []).filter((c: any) => c.proposed).length, 0);
   const pending = Math.max((design.changes || []).length, proposed);
@@ -100,7 +136,8 @@ export function prebriefReadiness(model: PrebriefModel, card: any, doubts: Doubt
       detail: `El documento pide ${e.requirementText}; el diseño tiene ${e.appliedText}.`, where: 'reason', ref: e.requirementKey });
   }
   const missing = missingContextFields(model);
-  if (missing.length) b.push({ code: 'context_incomplete', title: `Faltan datos del curso: ${missing.map((k) => CONTEXT_FIELD_LABEL[k] || k).join(', ')}.`, where: 'understood' });
+  if (missing.length) b.push({ code: 'context_incomplete', title: `Faltan datos del curso: ${missing.map((k) => CONTEXT_FIELD_LABEL[k] || k).join(', ')}.`, where: 'understood',
+    fields: missing.map((k) => ({ key: k, label: CONTEXT_FIELD_INPUT_LABEL[k] || k, editable: INLINE_CONTEXT_FIELDS.includes(k), suggestion: null })) });
   for (const f of languageFindings.slice(0, 5)) b.push({ code: 'language', title: `Texto que no está en español neutro: ${f}`, where: 'understood' });
   return { ready: b.length === 0, blockers: b };
 }
