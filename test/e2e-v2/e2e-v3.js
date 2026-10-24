@@ -2210,7 +2210,7 @@ function reservationBookkeeping(ev) {
       }
 
       // Nada se creó: ni runs ni jobs para estos cursos.
-      const made = await q(`select count(*)::int n from public.production_jobs where course_id = any($1::bigint[]) or frontend_course_id = any($2::text[])`, [[cA, cB, cC], [String(cA), String(cB), String(cC)]]);
+      const made = await q(`select count(*)::int n from public.production_jobs where course_id::text = any($1::text[]) or frontend_course_id = any($2::text[])`, [[String(cA), String(cB), String(cC)], [String(cA), String(cB), String(cC)]]);
       ok(made[0].n === 0, 'E18: no se creó ninguna generación ni job para cursos sin verificación aprobable', made[0]);
     });
 

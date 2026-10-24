@@ -491,8 +491,8 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
       // solo si falta → congelado después).
       'ensure_env_default_if_absent PRESENTATION_LIGHT_DEFAULT_SINCE "$(date -u +%Y-%m-%dT%H:%M:%SZ)"',
       'ensure_env_flag_true DYNAMIC_COURSE_STRUCTURE',
-      // r61 (Q-24): límite de subida de Storage de staging (200 MB del panel), valor EXACTO en bytes.
-      'ensure_env_exact STORAGE_MAX_UPLOAD_BYTES 200000000',
+      // r61 (Q-24) / r69: límite de subida de Storage de staging, alineado con producción (300000000), valor EXACTO en bytes.
+      'ensure_env_exact STORAGE_MAX_UPLOAD_BYTES 300000000',
     ]) assert(block.includes(needle), `falta: ${needle}`);
     assert(!/(ensure_\w+|printf[^\n]*>>\s*\.env)[^\n]*DYNAMIC_COHERENCE_LLM/.test(block), 'DYNAMIC_COHERENCE_LLM no debe escribirse');
     // 2026-09-29 (autorizado por Nicolás): staging queda operativo, el deploy deja el worker ENCENDIDO.
