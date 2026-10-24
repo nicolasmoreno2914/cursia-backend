@@ -25,7 +25,7 @@ dispara el owner (Nicolás), con su aprobación explícita.
 | `scripts/prod/v2-schema-probes.js` | READY | Sondas de catálogo de solo lectura para **todos** los pasos del plan, incluidos los 6 de r60, y presencia de cada fila del seed de precios v1. El runner las usa en `--verify-only`; `deploy.yml` las corre por stdin antes del rsync. |
 | `check-active-runs.js --legacy / --legacy-block` | READY | Informa de los jobs V1 del backend en curso. Con `PROD_DEPLOY_BLOCK_ON_V1_JOBS=true`, los que tienen lease vigente bloquean el deploy. |
 | `gate-core.yml` en PRs a `main` y `release/**` | READY | Sin `CURSIA_FE_READ_TOKEN`, un PR de promoción falla de entrada. En PRs a staging sigue terminando BLOCKED (exit 3, también rojo). |
-| Endpoint HTTP `/health/ready` (DB + workers + cola) | **GAP** (código de la app, fuera de r61/J) | Hoy `/health` solo indica que el proceso está vivo. El deploy compensa del lado del VPS: presencia de los 11 procesos, ventana de estabilidad y sonda de DB. Un monitor externo sigue sin poder ver si el servicio está listo. |
+| Endpoint HTTP `/health/ready` (DB + workers + cola) | **GAP** (código de la app, fuera de r61/J) | Hoy `/health` solo indica que el proceso está vivo. El deploy compensa del lado del VPS: presencia de los 12 procesos, ventana de estabilidad y sonda de DB. Un monitor externo sigue sin poder ver si el servicio está listo. |
 
 `deploy.yml` endurecido incluye:
 - la guardia `DEPLOY_FREEZE` y el input `force_deploy`;
@@ -321,7 +321,7 @@ gh run list --workflow=deploy.yml --limit=1        # completed / success
 En el log del paso «Install…» deben aparecer:
 - `✓ V2 apagado`;
 - `+ OPENAI_TTS_MODEL`;
-- la presencia `✓` de los 11 procesos;
+- la presencia `✓` de los 12 procesos;
 - la estabilidad de 45 s;
 - `esquema V2: COMPLETO`.
 
@@ -336,7 +336,7 @@ En el log del paso «Install…» deben aparecer:
 - `GET /api/v1/features` → `dynamicCourseStructure:false`.
 
 **2.5 En el VPS:**
-- `sudo pm2 status`: los 11 procesos de producción online;
+- `sudo pm2 status`: los 12 procesos de producción online (incluido `cursia-brand-worker`);
 - `cat /var/www/cursia-backend/.release-state` → `ok <sha>`.
 
 **Rollback de la fase 2:**
@@ -380,7 +380,7 @@ En el log del paso «Install…» deben aparecer:
 **Rollback de la fase 3:**
 - **Nivel 1, segundos:**
   1. Vaciar `PROD_V2_CANARY_OWNER` y redeployar. Los workers de gasto vuelven a `false`; `DYNAMIC_COURSE_STRUCTURE` queda en `true` con el allowlist del owner. Para apagar V2 del todo, editar el `.env`: `DYNAMIC_COURSE_STRUCTURE=false`.
-  2. O, sin deploy: en el VPS, `DYNAMIC_WORKERS_HOLD=true` y/o `DYNAMIC_COURSE_STRUCTURE=false`, y después `sudo pm2 restart <los 11> --update-env`.
+  2. O, sin deploy: en el VPS, `DYNAMIC_WORKERS_HOLD=true` y/o `DYNAMIC_COURSE_STRUCTURE=false`, y después `sudo pm2 restart <los 12> --update-env`.
   3. Gasto: `FINOPS_KILL_SWITCH`.
 - **Nivel 2:** `action=rollback`. Vuelve a la release V2 anterior; la V1 solo con las advertencias de N1.
 
@@ -400,7 +400,7 @@ En el log del paso «Install…» deben aparecer:
 | Nivel | Cuándo | Cómo | Toca el esquema |
 |---|---|---|---|
 | 1a Gasto | Cortar el gasto V2 | `PROD_V2_CANARY_OWNER` vacío más redeploy. **Solo** apaga los workers de proveedores y de IA; V2 sigue encendido para el allowlist. Sin deploy: `DYNAMIC_WORKERS_HOLD=true` y/o `FINOPS_KILL_SWITCH` en el `.env`, más `pm2 restart --update-env`. | No |
-| 1b V2 OFF | Comportamiento V2 | Editar el `.env`: `DYNAMIC_COURSE_STRUCTURE=false`, más `pm2 restart <los 11> --update-env`. El deploy no lo vuelve a encender sin canario: solo agrega `false` si falta. | No |
+| 1b V2 OFF | Comportamiento V2 | Editar el `.env`: `DYNAMIC_COURSE_STRUCTURE=false`, más `pm2 restart <los 12> --update-env`. El deploy no lo vuelve a encender sin canario: solo agrega `false` si falta. | No |
 | 2 Código | Release rota | Automático si el fallo fue después del rsync (`PROD_AUTO_ROLLBACK`). Manual: `workflow_dispatch action=rollback`. `.release-prev/` es la última release marcada sana; la fallida queda en `.release-failed/`, sin `node_modules`. Antes de restaurar, el job normaliza el dueño de `VPS_PATH`. | No (no migra) |
 | 2b Manual | Sin Actions | En el VPS, desde una **copia** del script (el rollback reescribe el árbol): `cp /var/www/cursia-backend/scripts/ops/prod-release.sh ~/prod-release.sh && bash ~/prod-release.sh rollback /var/www/cursia-backend`, verificar `/health` y luego `bash ~/prod-release.sh mark-ok /var/www/cursia-backend restored` | No |
 | 3 Esquema | Solo ante corrupción | PITR (P1), decisión del owner | Sí |
@@ -457,7 +457,7 @@ En el log del paso «Install…» deben aparecer:
 - No hay Sentry, Prometheus ni alertas.
 
 **Compensación en r61 (READY):** en cada deploy y rollback se verifican del lado del VPS:
-- la presencia de los 11 procesos;
+- la presencia de los 12 procesos;
 - una ventana de estabilidad de 45 s: un reinicio en la ventana hace fallar el deploy, salvo para los workers V1 que ya se reiniciaban antes del deploy (aviso) y los deshabilitados por su flag (detenidos);
 - una sonda de la base de solo lectura con el `.env` real.
 
