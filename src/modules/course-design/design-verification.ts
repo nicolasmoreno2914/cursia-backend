@@ -39,6 +39,8 @@ export interface DesignCheck {
   fix?: CheckFix;
   /** Resumen de un área cuyos problemas ya se listan uno por uno: no suma en los contadores. */
   summary?: true;
+  /** r71: resultados/competencias del hallazgo de alineación (la propuesta ofrece «Vincular a…» en línea). */
+  outcomeIds?: string[];
   /** Requisito no cubierto / proporción que la institución debe aceptar (R68: sin su aceptación no se genera). */
   capability?: { requirementKey: string; requirementText: string; produces: string; proposal?: string; coveredBy?: { requirementKey: string; requirementText: string } };
 }
@@ -251,7 +253,7 @@ export function verifyDesign(input: VerificationInput): DesignVerification {
     }
     for (const f of findings) {
       const severity: CheckSeverity = f.severity === 'critical' ? 'critical' : f.severity === 'warning' ? 'warning' : 'info';
-      add({ id: `alignment:${f.id}`, area: 'outcomes', severity, title: f.message, detail: f.suggestion, fix: fixForFinding(f, input) });
+      add({ id: `alignment:${f.id}`, area: 'outcomes', severity, title: f.message, detail: f.suggestion, fix: fixForFinding(f, input), ...(f.outcomeIds.length ? { outcomeIds: [...f.outcomeIds] } : {}) });
     }
   }
 

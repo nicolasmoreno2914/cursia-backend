@@ -47,10 +47,12 @@ export class CourseDesignController {
   }
 
   // POST /api/v1/courses/:courseId/design/fix  body { action: 'link_outcomes', expectedCounter } → «Corregir» automático (LOOP 8.4)
+  // r71: action 'autofix' («Cursia optimizó tu curso»), 'autofix_undo' { changeIds? }, 'link_outcome' { outcomeId, chapterId },
+  // 'context_field' { field, value }.
   @Post('fix')
   @HttpCode(200)
   fix(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: DesignFixDto, @CurrentUser() user: AuthUser) {
-    return this.service.fix(courseId, user.id, dto.action, dto.expectedCounter);
+    return this.service.fix(courseId, user.id, dto.action, dto.expectedCounter, dto);
   }
 
   // POST /api/v1/courses/:courseId/design/pins/clear → «Liberar»: lo fijado a mano vuelve a decidirlo Cursia

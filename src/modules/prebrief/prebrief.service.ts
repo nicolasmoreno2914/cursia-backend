@@ -1,4 +1,5 @@
 import { returningRows } from '../../common/db/returning-rows';
+import { withRequestReadCache } from '../../common/db/request-read-cache';
 import { BadRequestException, ConflictException, HttpException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { DataSource } from 'typeorm';
@@ -22,7 +23,7 @@ import { lqaFindings, lqaHitLabel } from '../language-qa/language-qa';
 import { COURSE_FORMATS, COURSE_FORMAT_CODES, COURSE_FORMAT_CATALOG_VERSION, CourseFormatCode, formatDef, isCourseFormatCode, readCourseFormat, writeCourseFormat } from './course-formats';
 import { PrebriefModel, StoredExceptionReason, buildPrebriefModel, diffModels, documentVerbatimTexts, isDocumentVerbatim, prebriefModelSha } from './prebrief-model';
 import { PrebriefDocument, PrebriefDocumentMeta, PrebriefStatus, approvalStateTexts, buildPrebriefDocument, documentSha, documentTexts } from './prebrief-document';
-import { PrebriefReadiness, prebriefReadiness } from './prebrief-readiness';
+import { PrebriefReadiness, prebriefReadiness, withInlineActions } from './prebrief-readiness';
 import { DoubtfulItem, doubtfulItems } from './plausibility';
 import { renderPrebriefPdf } from './prebrief-pdf';
 import { unmappedCharCount } from '../../package/v3/libro-v3';
@@ -150,7 +151,12 @@ export class PrebriefService {
   // ── Borrador ────────────────────────────────────────────────────────────────────────────────────────────────
 
   /** El Prebrief que se prepararía AHORA (mismos datos que ven Entendimos y Diseño). Solo lectura, USD 0. */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async draft(courseId: number, ownerId: string): Promise<PrebriefDraft> {
+    return withRequestReadCache(this.dataSource, 'prebrief.draft', { course: courseId, owner: ownerId }, () => this.draftUncached(courseId, ownerId));
+  }
+
+  private async draftUncached(courseId: number, ownerId: string): Promise<PrebriefDraft> {
     const course = await this.loadCourse(courseId, ownerId);
     const card = await this.design.recommend(courseId, ownerId, {} as any);
     return this.draftFrom(courseId, course, card);
@@ -212,7 +218,7 @@ export class PrebriefService {
     const language: string[] = [];
     const verbatim = documentVerbatimTexts(model);
     for (const t of documentTexts(document)) if (!isDocumentVerbatim(t, verbatim)) for (const h of lqaFindings(t, 3)) language.push(`${lqaHitLabel(h)} en «${t.slice(0, 80)}»`);
-    const readiness = prebriefReadiness(model, card, doubts, language);
+    const readiness = withInlineActions(prebriefReadiness(model, card, doubts, language), card && card.autofix);
     const checks: any[] = (card && card.verification && card.verification.checks) || [];
     return {
       model, modelSha256: prebriefModelSha(model), document, documentSha256: documentSha(document), readiness, doubts,
@@ -252,7 +258,12 @@ export class PrebriefService {
   }
 
   /** GET: estado completo (borrador + versiones + flujo). */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async state(courseId: number, ownerId: string, card?: any) {
+    return withRequestReadCache(this.dataSource, 'prebrief.state', { course: courseId, owner: ownerId }, () => this.stateUncached(courseId, ownerId, card));
+  }
+
+  private async stateUncached(courseId: number, ownerId: string, card?: any) {
     await this.assertTablesReady();
     // r63: el GET no escribe. Una propuesta lista/aprobada que quedó vieja deja de proteger la vista previa: se recalcula.
     const frozenBefore = !card && (await profileOutcomesBlockedBy(this.dataSource, courseId, true)) === 'PREBRIEF_FROZEN';
@@ -275,6 +286,8 @@ export class PrebriefService {
       draft: {
         model: draft.model, modelSha256: draft.modelSha256, document: draft.document, documentSha256: draft.documentSha256,
         readiness: draft.readiness, verification: draft.verification,
+        // r71 · «Cursia optimizó tu curso»: lo aplicado (con «Deshacer») y lo que Cursia propone y decide el docente.
+        autofix: draft.card && draft.card.autofix ? { pending: draft.card.autofix.pending, applied: draft.card.autofix.applied, proposals: draft.card.autofix.proposals } : null,
         stateTexts: approvalStateTexts({ status: 'draft', version: null, date: null, fingerprint: draft.modelSha256, approval: null }),
         matchesLatest: !!latest && latest.model_sha256 === draft.modelSha256,
         diffFromLatest: latest && latest.model_sha256 !== draft.modelSha256 ? diffModels(latest.model_json, draft.model) : [],
@@ -313,7 +326,12 @@ export class PrebriefService {
    * confirmados, excepciones con motivo, español neutro) y la MISMA huella que vio el usuario. Congela el Blueprint
    * (idempotente) y guarda la versión con su PDF. Idempotente: la misma huella devuelve la versión vigente.
    */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async prepare(courseId: number, ownerId: string, user: { id: string; email?: string | null }, expectedModelSha: string) {
+    return withRequestReadCache(this.dataSource, 'prebrief.prepare', { course: courseId, owner: ownerId }, () => this.prepareUncached(courseId, ownerId, user, expectedModelSha));
+  }
+
+  private async prepareUncached(courseId: number, ownerId: string, user: { id: string; email?: string | null }, expectedModelSha: string) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     await this.assertTablesReady(); // sin las tablas (entorno sin la migración) → 503 ANTES de congelar nada
@@ -380,7 +398,12 @@ export class PrebriefService {
   }
 
   /** Aprobar: la última versión, lista, con la huella vigente, sin críticos; quién = el usuario de la sesión. */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async approve(courseId: number, ownerId: string, user: { id: string; email?: string | null }, n: number, body: { expectedModelSha: string; name: string; role: string; confirm: boolean }) {
+    return withRequestReadCache(this.dataSource, 'prebrief.approve', { course: courseId, owner: ownerId }, () => this.approveUncached(courseId, ownerId, user, n, body));
+  }
+
+  private async approveUncached(courseId: number, ownerId: string, user: { id: string; email?: string | null }, n: number, body: { expectedModelSha: string; name: string; role: string; confirm: boolean }) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     const name = String(body.name || '').replace(/\s+/g, ' ').trim();

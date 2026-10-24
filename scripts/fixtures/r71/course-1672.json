@@ -1,0 +1,378 @@
+{
+ "source": "staging #1672 «Inglés Básico – Grado Sexto» (GET /courses/1672/modules, 2026-10-24); sin datos personales",
+ "structureVersionCounter": 5,
+ "modules": [
+  {
+   "id": "1d5addca-a903-49b5-a9ce-8925a12ccbde",
+   "position": 0,
+   "title": "Hello! Getting to Know You",
+   "objective": "Presentarse y proporcionar información personal.",
+   "description": "También incluye contenidos de: My Family and Friends.",
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "d5c34b29-cf55-400f-b3a3-5eccd49170aa",
+     "position": 0,
+     "title": "Saludos, presentaciones, alfabeto, números, información personal y verbo to be.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": [
+      "RA2"
+     ]
+    },
+    {
+     "id": "24330687-7b05-4b07-b132-459d476b4694",
+     "position": 1,
+     "title": "Familia, descripciones físicas, personalidad, pronombres y adjetivos posesivos.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "94f66f20-d525-4542-941f-fd1ce73521b3",
+     "position": 2,
+     "title": "Profundización 1: Hello! Getting to Know You",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "a983c567-2eac-4a3d-8f43-f39c4fd9c42f",
+     "position": 3,
+     "title": "Profundización 2: Hello! Getting to Know You",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "c11872e1-c4e9-4cbb-ba9c-b0e643012dd5",
+     "position": 4,
+     "title": "Profundización 3: Hello! Getting to Know You",
+     "objective": null,
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "c0b2c12f-a983-4d11-9951-e348024327cc",
+     "position": 5,
+     "title": "Práctica integradora: Hello! Getting to Know You",
+     "objective": "Aplicar lo aprendido en «Hello! Getting to Know You» en una situación completa",
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "practice",
+     "applicationMinutes": 120,
+     "outcomeIds": null
+    }
+   ]
+  },
+  {
+   "id": "f17bdd22-1026-4a70-9c54-f15d7ad3ce85",
+   "position": 1,
+   "title": "My School and My World",
+   "objective": "Identificar personas, objetos, lugares y actividades; Comunicarse mediante oraciones sencillas en situaciones familiares y escolares; Describir rutinas y preferencias.",
+   "description": "También incluye contenidos de: My Daily Routine.",
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "4aa706e6-e7e9-4469-8145-7eabc0db42fc",
+     "position": 0,
+     "title": "Objetos escolares, asignaturas, lugares, preposiciones y there is / there are.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 60,
+     "outcomeIds": [
+      "RA3",
+      "RA4"
+     ]
+    },
+    {
+     "id": "1c9eabab-4fd0-48af-bd35-277ceb265894",
+     "position": 1,
+     "title": "Rutinas, horarios, días de la semana, presente simple y adverbios de frecuencia.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": [
+      "RA8"
+     ]
+    },
+    {
+     "id": "eca4df5b-16fc-44a0-9e12-7990f8508ea0",
+     "position": 2,
+     "title": "Profundización 1: My School and My World",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "90a91535-a33d-490d-b18a-dfaf2f320434",
+     "position": 3,
+     "title": "Profundización 2: My School and My World",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "c2b3fc32-ce0e-46d2-bcd3-6dad06fe5c69",
+     "position": 4,
+     "title": "Profundización 3: My School and My World",
+     "objective": null,
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "a0f032b0-ecc7-4120-a279-10a840768751",
+     "position": 5,
+     "title": "Práctica integradora: My School and My World",
+     "objective": "Aplicar lo aprendido en «My School and My World» en una situación completa",
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "practice",
+     "applicationMinutes": 120,
+     "outcomeIds": null
+    }
+   ]
+  },
+  {
+   "id": "53de1fa3-fc6e-4bcc-bfc8-3ae74c0f7bdb",
+   "position": 2,
+   "title": "My Likes and Hobbies",
+   "objective": "Describir rutinas y preferencias.",
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "6a873c32-1167-480c-b010-8aa0acb89b43",
+     "position": 0,
+     "title": "Gustos, preferencias, deportes, actividades de tiempo libre y like, love",
+     "objective": null,
+     "description": "Gustos, preferencias, deportes, actividades de tiempo libre y like, love, don’t like y can.",
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 60,
+     "outcomeIds": [
+      "RA8"
+     ]
+    },
+    {
+     "id": "8ee29aea-fa33-4d4b-890b-6df9ec1d5db0",
+     "position": 1,
+     "title": "Profundización 1: My Likes and Hobbies",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "97b704af-6980-4c5f-af95-35637f44147b",
+     "position": 2,
+     "title": "Profundización 2: My Likes and Hobbies",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "e9d270b3-c8d3-4980-bc08-043a51b9cf7c",
+     "position": 3,
+     "title": "Profundización 3: My Likes and Hobbies",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "ed19a6e6-3937-40a5-9d3d-22ef685dee8a",
+     "position": 4,
+     "title": "Profundización 4: My Likes and Hobbies",
+     "objective": null,
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "45ed00e0-2734-4958-a85f-c942ebdc886a",
+     "position": 5,
+     "title": "Práctica integradora: My Likes and Hobbies",
+     "objective": "Aplicar lo aprendido en «My Likes and Hobbies» en una situación completa",
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "practice",
+     "applicationMinutes": null,
+     "outcomeIds": null
+    }
+   ]
+  },
+  {
+   "id": "78d4c3f0-a680-4abe-9b84-ea76b3d147b4",
+   "position": 3,
+   "title": "Let’s Communicate!",
+   "objective": "Reconocer vocabulario fundamental; Comprender textos cortos; Desarrollar habilidades iniciales de comprensión auditiva, lectura, escritura y expresión oral en inglés.",
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "789fab14-3f84-40dd-8bcb-668ff5390187",
+     "position": 0,
+     "title": "Integración de vocabulario, comprensión de textos, diálogos",
+     "objective": null,
+     "description": "Integración de vocabulario, comprensión de textos, diálogos, descripciones y producción de mensajes sencillos.",
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 60,
+     "outcomeIds": [
+      "RA5",
+      "RA6",
+      "RA9"
+     ]
+    },
+    {
+     "id": "31a5579c-89f8-417f-ab07-525233ffaca5",
+     "position": 1,
+     "title": "Profundización 1: Let’s Communicate!",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "418c0aa2-833f-40aa-93ce-7c62318f7851",
+     "position": 2,
+     "title": "Profundización 2: Let’s Communicate!",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "83b5580c-252a-474e-b352-bc7e8d21db18",
+     "position": 3,
+     "title": "Profundización 3: Let’s Communicate!",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "24f35a19-801d-402f-9342-9bb02dc6b0c7",
+     "position": 4,
+     "title": "Profundización 4: Let’s Communicate!",
+     "objective": null,
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": 90,
+     "outcomeIds": null
+    },
+    {
+     "id": "14f16513-b20e-45aa-89c3-d4165f30ae0c",
+     "position": 5,
+     "title": "Práctica integradora: Let’s Communicate!",
+     "objective": "Aplicar lo aprendido en «Let’s Communicate!» en una situación completa",
+     "description": null,
+     "videoEnabled": false,
+     "activityEnabled": true,
+     "kind": "practice",
+     "applicationMinutes": null,
+     "outcomeIds": null
+    }
+   ]
+  }
+ ],
+ "readinessBefore": {
+  "ready": false,
+  "blockers": [
+   {
+    "code": "critical",
+    "title": "El resultado RA1 («Comprender y utilizar expresiones básicas en inglés relacionadas con su vida cotidiana») no está cubierto por ningún capítulo.",
+    "detail": "Vincúlalo a los capítulos que lo trabajan o agrega un capítulo que lo desarrolle.",
+    "where": "design",
+    "ref": "alignment:AL001"
+   },
+   {
+    "code": "critical",
+    "title": "El resultado RA7 («Formular y responder preguntas básicas») no está cubierto por ningún capítulo.",
+    "detail": "Vincúlalo a los capítulos que lo trabajan o agrega un capítulo que lo desarrolle.",
+    "where": "design",
+    "ref": "alignment:AL002"
+   },
+   {
+    "code": "context_incomplete",
+    "title": "Faltan datos del curso: el sector.",
+    "where": "understood"
+   }
+  ]
+ },
+ "generationContext": {
+  "nombre": "Inglés Básico – Grado Sexto",
+  "pais": "Colombia",
+  "contexto": "Bachillerato — estudiantes de secundaria y media",
+  "nivel": "Básico — sin conocimientos previos",
+  "tono": "Conversacional y cercano, como un mentor con ejemplos cotidianos"
+ }
+}
