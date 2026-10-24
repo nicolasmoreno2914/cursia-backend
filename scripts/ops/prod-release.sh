@@ -23,8 +23,9 @@
 #       SEGUROS (V2 apagado salvo canario explícito), npm install, las 2 migraciones de
 #       siempre de producción (constraints de production_jobs + usage_events; las de V2 van
 #       SOLO por v2-production-migrations.yml), recarga PM2 (V1 igual que antes; los 3
-#       workers dinámicos con drenado), presencia + ventana de estabilidad de los 11
-#       procesos y conectividad a la base (sondas de solo lectura).
+#       workers dinámicos con drenado; el worker de marca con node directo + kill_timeout),
+#       presencia + ventana de estabilidad de los 12 procesos y conectividad a la base
+#       (sondas de solo lectura).
 #
 #   mark-ok <dir> <sha|restored>                     (por stdin)
 #       state = "ok <sha>" (lo llama el workflow DESPUÉS del health check; «restored» = la
@@ -55,9 +56,17 @@ PROD_PROCESSES_DRAIN=(
   "cursia-dynamic-package-worker dist/workers/dynamic-package-worker.js"
   "cursia-dynamic-provider-worker dist/workers/dynamic-provider-worker.js"
 )
+# Worker de extracción de marca (brand kit): node directo (la señal llega a Node: SIGINT → termina el job en curso y
+# sale) con kill_timeout FIJO, independiente del drenado de V2 (no lo detiene drain-dynamic). El job tiene lease
+# (BRAND_WORKER_LEASE_S, 300 s): si PM2 lo mata igual, otro worker lo reclama al vencer. Antes este proceso no lo
+# recargaba el deploy → nunca tomaba DB_POOL_MAX_WORKER / DB_POOL_IDLE_MS_WORKER (EMAXCONNSESSION del pooler).
+PROD_PROCESSES_NODE=(
+  "cursia-brand-worker dist/workers/brand-extraction-worker.js"
+)
+BRAND_KILL_TIMEOUT_MS=300000
 PROD_ALL_NAMES=(cursia-backend cursia-content-worker cursia-video-worker cursia-audio-worker cursia-h5p-worker
   cursia-gamma-worker cursia-package-worker cursia-full-worker cursia-dynamic-item-worker
-  cursia-dynamic-package-worker cursia-dynamic-provider-worker)
+  cursia-dynamic-package-worker cursia-dynamic-provider-worker cursia-brand-worker)
 # R16 (#1): kill_timeout de los workers dinámicos (drenado interno 270 s < 300 s).
 DRAIN_KILL_TIMEOUT_MS=300000
 DRAIN_TIMEOUT_MS=270000
@@ -305,6 +314,8 @@ detect_preexisting_loops() {
     n="${entry%% *}"
     [ -n "$(legacy_disabled_reason "$n")" ] || names+=("$n")
   done
+  # El worker de marca nunca lo recargaba el deploy: un bucle previo suyo tampoco debe tumbar el deploy.
+  for entry in "${PROD_PROCESSES_NODE[@]}"; do names+=("${entry%% *}"); done
   [ "${#names[@]}" -gt 0 ] || return 0
   a=$(pm2_check snapshot "${names[@]}") || return 0
   sleep "$PRELOOP_WINDOW_S"
@@ -343,6 +354,24 @@ reload_all_processes() {
       else $PM2 start "$arg" --name "$name" --kill-timeout "$DRAIN_KILL_TIMEOUT_MS"; fi
     else
       ensure_pm2_drain_worker "$name" "$arg"
+    fi
+  done
+  for entry in "${PROD_PROCESSES_NODE[@]}"; do
+    name="${entry%% *}"; arg="${entry#* }"
+    if [ ! -f "$arg" ]; then
+      echo "⚠️ ${name}: ${arg} no existe en esta release — se detiene"
+      if $PM2 describe "$name" > /dev/null 2>&1; then $PM2 stop "$name" || true; fi
+      STOPPED_NAMES+=("$name")
+    elif [ "$mode" = "rollback" ] && [ ! -f scripts/pm2-drain-config.js ]; then
+      if $PM2 describe "$name" > /dev/null 2>&1; then $PM2 reload "$name" --update-env
+      else $PM2 start "$arg" --name "$name" --kill-timeout "$BRAND_KILL_TIMEOUT_MS"; fi
+    else
+      # Mismo ensure_pm2_drain_worker (proceso heredado npm run / kill_timeout corto → se recrea UNA vez), con el
+      # kill_timeout propio del worker de marca en vez del de V2.
+      local v2_kill="$DRAIN_KILL_TIMEOUT_MS"
+      DRAIN_KILL_TIMEOUT_MS="$BRAND_KILL_TIMEOUT_MS"
+      ensure_pm2_drain_worker "$name" "$arg"
+      DRAIN_KILL_TIMEOUT_MS="$v2_kill"
     fi
   done
   $PM2 save
