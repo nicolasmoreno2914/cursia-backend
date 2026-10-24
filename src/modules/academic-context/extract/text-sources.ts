@@ -376,8 +376,10 @@ export function dropRepeatedPageFurniture(lines: SourceLine[], pages: number): S
   };
   // El número de página cambia en cada página («Curso X · Página 3», «3 de 10»): se compara sin él. Solo el número que
   // acompaña a «página» o a «de N», o el que cierra/abre la línea separado del resto (nunca cifras del cuerpo).
-  const furnitureKey = (t: string) =>
-    t.toLowerCase()
+  // r70: también el número de página pegado al final del pie con un espacio simple («Microcurrículo · Inglés 6 · 60 horas
+  // 1» / «… 2»): solo si es exactamente el número de ESA página.
+  const furnitureKey = (l: SourceLine) =>
+    (l.page !== null && l.page !== undefined ? l.text.replace(new RegExp(`\\s${l.page}$`), ' #') : l.text).toLowerCase()
       .replace(/\bp[aá]g(?:ina)?\.?\s*\d{1,4}(?:\s*(?:de|\/)\s*\d{1,4})?/g, 'página #')
       .replace(/\b\d{1,4}\s*(?:de|\/)\s*\d{1,4}\b/g, '# de #')
       .replace(/(?:^|\s[|·—–-]\s|\s{2,})\d{1,4}$/, ' #')
@@ -385,7 +387,7 @@ export function dropRepeatedPageFurniture(lines: SourceLine[], pages: number): S
   const pagesBy = new Map<string, Set<number>>();
   for (const l of lines) {
     if (!edge.has(l) || bullet.test(l.text) || l.text.length > 120) continue;
-    const k = furnitureKey(l.text);
+    const k = furnitureKey(l);
     if (!pagesBy.has(k)) pagesBy.set(k, new Set());
     pagesBy.get(k)!.add(l.page ?? 0);
   }
@@ -393,7 +395,7 @@ export function dropRepeatedPageFurniture(lines: SourceLine[], pages: number): S
   return lines.filter((l) => {
     if (pageNum(l)) return false;
     if (pages < 2 || !edge.has(l) || bullet.test(l.text)) return true;
-    const set = pagesBy.get(furnitureKey(l.text));
+    const set = pagesBy.get(furnitureKey(l));
     return !set || set.size < need;
   });
 }
