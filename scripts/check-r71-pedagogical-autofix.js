@@ -180,6 +180,40 @@ const applyPlan = (chapters, plan) => chapters.map((c) => { const ch = plan.chan
     eq(rd.blockers.map((b) => [b.code, b.outcomeIds || null, (b.fields || []).map((f) => f.key)]), [['critical', ['RA1'], []], ['context_incomplete', null, ['sector']]], 'readiness con resultados y campos');
   });
 
+  await check('AF7 caché de lecturas por petición: una lectura por consulta, copias independientes, escrituras invalidan, metadata en una sola lectura, nada fuera del ámbito', async () => {
+    const C = loadDist('common/db/request-read-cache.js');
+    C.resetRequestReadCacheTemplates();
+    const log = [];
+    let meta = { a: { x: 1 }, b: 'v' };
+    const fake = { query: async (sql, params) => { log.push(sql); if (/^select metadata from/.test(sql)) return [{ metadata: JSON.parse(JSON.stringify(meta)) }]; if (/^update/.test(sql)) { meta = { a: { x: 2 }, b: 'v' }; return [[], 1]; } return [{ v: params && params[0], o: { n: 1 } }]; }, createQueryRunner() { return { query: async () => [], startTransaction: async () => {}, release: async () => {} }; } };
+    await C.withRequestReadCache(fake, 't', { course: 7, owner: 'u' }, async () => {
+      const r1 = await fake.query('select v from t where id = $1', [7]);
+      r1[0].o.n = 99;
+      const r2 = await fake.query('select v from t where id = $1', [7]);
+      eq(r2[0].o.n, 1, 'copias independientes');
+      eq(log.filter((q) => q.startsWith('select v')).length, 1, 'una lectura');
+      const m1 = await fake.query("select metadata -> 'a' as aa, metadata -> 'z' as zz from public.courses where id = $1", [7]);
+      const m2 = await fake.query("select metadata -> 'b' as bb from public.courses where id = $1", [7]);
+      eq([m1, m2], [[{ aa: { x: 1 }, zz: null }], [{ bb: 'v' }]], 'proyección de metadata');
+      eq(log.filter((q) => q.startsWith('select metadata')).length, 1, 'metadata en una lectura');
+      await fake.query('update public.courses set metadata = $2 where id = $1', [7, '{}']);
+      const m3 = await fake.query("select metadata -> 'a' as aa from public.courses where id = $1", [7]);
+      eq(m3[0].aa, { x: 2 }, 'después de escribir se vuelve a leer');
+      const qr = fake.createQueryRunner(); await qr.startTransaction(); await qr.release();
+      const sv = () => log.filter((q) => q.startsWith('select v')).length;
+      const n = sv(); await fake.query('select v from t where id = $1', [7]);
+      eq(sv(), n + 1, 'un QueryRunner con transacción invalida al soltarse');
+    });
+    const n = log.length; await fake.query('select v from t where id = $1', [7]); await fake.query('select v from t where id = $1', [7]);
+    eq(log.length, n + 2, 'fuera del ámbito no hay caché');
+    // Lectura anticipada: la segunda petición pide en paralelo lo que la primera leyó (curso / usuario).
+    log.length = 0;
+    await C.withRequestReadCache(fake, 't', { course: 8, owner: 'u' }, async () => { await fake.query('select w from t where id = $1 and o = $2', [8, 'u']); });
+    eq(log.includes('select v from t where id = $1'), true, 'anticipada con el curso nuevo');
+    eq(C.metadataProjection("select metadata -> 'designPins' as pins from public.courses where id = $1"), [['designPins', 'pins']], 'reconoce la proyección');
+    eq(C.metadataProjection('select metadata, title from public.courses where id = $1'), null, 'otra consulta no');
+  });
+
   if (PURE_ONLY) {
     console.log('\n(--pure-only: la parte DB NO corrió)');
   } else {
@@ -443,6 +477,49 @@ async function dbChecks(ctx1672) {
       const again2 = await design.fix(c3.id, OWNER, 'autofix', await counter(c3.id));
       eq(again2.applied.map((x) => x.id), [], 'lo cambiado por el docente se respeta');
       eq(new Map(await links(c3.id)).get('Profundización 1: Let’s Communicate!'), ['RA5'], 'vínculo del docente intacto');
+    });
+
+    await check('AD7 rendimiento: con 150 ms por consulta (base remota), GET /prebrief de la réplica de #1672 < 1,5 s y «Preparar» rápido', async () => {
+      const c = await replica('[R71] Rendimiento');
+      await useDesign(c.id);
+      await design.fix(c.id, OWNER, 'autofix', await counter(c.id));
+      await prebrief.state(c.id, OWNER); // calienta (require, JIT)
+      const prof = new Map();
+      const wrap = (obj, name, label) => { const orig = obj[name]; obj[name] = async function (...a) { const t = Date.now(); try { return await orig.apply(this, a); } finally { const e = prof.get(label) || { n: 0, ms: 0 }; e.n++; e.ms += Date.now() - t; prof.set(label, e); } }; return () => { obj[name] = orig; }; };
+      const undo = [
+        wrap(Object.getPrototypeOf(design), 'recommend', 'design.recommend'),
+        wrap(Object.getPrototypeOf(pedagogy), 'dryRunCourse', 'pedagogy.dryRunCourse'),
+        wrap(Object.getPrototypeOf(design), 'autofixPreview', 'design.autofixPreview'),
+        wrap(ds, 'query', 'db.query'),
+      ];
+      // Todas las consultas que llegan al driver (DataSource, QueryRunner, repositorios), con su texto (para el perfil).
+      const PgClient = require('pg').Client;
+      const origQ = PgClient.prototype.query;
+      const sqls = [];
+      const lat = Number(process.env.R71_DB_LATENCY_MS || 150); // latencia simulada por consulta (pooler remoto de Supabase)
+      PgClient.prototype.query = function (q, ...rest) {
+        const text = typeof q === 'string' ? q : q && q.text;
+        sqls.push(String(Date.now() - (globalThis.__r71t0 || 0)).padStart(5) + ' ' + String(text || '').replace(/\s+/g, ' ').slice(0, 100));
+        if (!lat) return origQ.call(this, q, ...rest);
+        const self = this;
+        return new Promise((r) => setTimeout(r, lat)).then(() => origQ.call(self, q, ...rest));
+      };
+      undo.push(() => { PgClient.prototype.query = origQ; });
+      const t0 = Date.now(); globalThis.__r71t0 = t0;
+      const st = await prebrief.state(c.id, OWNER);
+      const ms = Date.now() - t0;
+      const nState = sqls.length;
+      const t1 = Date.now(); globalThis.__r71t0 = t1;
+      const prep = await prebrief.prepare(c.id, OWNER, { id: OWNER }, st.draft.modelSha256);
+      const msPrep = Date.now() - t1;
+      undo.forEach((u) => u());
+      eq(prep.version.status, 'ready', 'preparada');
+      console.log(`   POST /prebrief/versions: ${msPrep} ms · consultas: ${sqls.length - nState}`);
+      if (process.env.R71_PROFILE === '2') console.log(sqls.slice(nState).map((q) => `     ${q}`).join('\n'));
+      console.log(`   GET /prebrief: ${ms} ms (latencia simulada ${lat} ms/consulta) · consultas al driver: ${nState} · ` + [...prof].map(([k, v]) => `${k} ×${v.n} ${v.ms} ms`).join(' · '));
+      if (process.env.R71_PROFILE) console.log(sqls.slice(0, nState).map((q) => `     ${q}`).join('\n'));
+      if (process.env.CURSIA_READ_CACHE !== 'off') assert(ms < 1500, `GET /prebrief tardó ${ms} ms (objetivo < 1500)`);
+      if (process.env.CURSIA_READ_CACHE !== 'off') assert(msPrep < 7000, `POST /prebrief/versions tardó ${msPrep} ms (objetivo < 7000: dos verificaciones + congelar el Blueprint + la versión, en transacción)`);
     });
 
     await check('AD6 contador viejo → 409; propuesta preparada → no se cambia sola', async () => {

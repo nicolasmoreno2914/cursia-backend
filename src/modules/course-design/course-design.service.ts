@@ -34,6 +34,7 @@ import { ConflictException } from '@nestjs/common';
 import { DesignAdjustDto, RecommendDesignDto, RequirementDecisionsDto } from './dto/recommend.dto';
 import { COURSE_FORMATS, COURSE_FORMAT_CODES, CourseFormatCode, formatDef, formatFit, readCourseFormat } from '../prebrief/course-formats';
 import { randomUUID } from 'crypto';
+import { withRequestReadCache } from '../../common/db/request-read-cache';
 import { profileOutcomesBlockedBy } from '../academic-context/profile-outcomes-db';
 import { BRIEF_KEY, BRIEF_VERSION, normalizeBriefFields, parseBrief } from '../course-facts/course-facts';
 import { sortOutcomeIds } from '../academic-context/blueprint-academic';
@@ -130,7 +131,12 @@ export class CourseDesignService {
     }
   }
 
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async recommend(courseId: number, ownerId: string, dto: RecommendDesignDto) {
+    return withRequestReadCache(this.dataSource, 'design.recommend', { course: courseId, owner: ownerId }, () => this.recommendUncached(courseId, ownerId, dto));
+  }
+
+  private async recommendUncached(courseId: number, ownerId: string, dto: RecommendDesignDto) {
     await this.loadCourse(courseId, ownerId);
     const adjust: DesignAdjustDto = (dto && dto.adjust) || {};
     if (adjust.targetHours !== undefined && adjust.targetHours !== 'auto' && !isValidTargetHours(adjust.targetHours)) {

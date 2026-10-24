@@ -1,4 +1,5 @@
 import { returningRows } from '../../common/db/returning-rows';
+import { withRequestReadCache } from '../../common/db/request-read-cache';
 import { BadRequestException, ConflictException, HttpException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { createHash } from 'crypto';
 import { DataSource } from 'typeorm';
@@ -150,7 +151,12 @@ export class PrebriefService {
   // ── Borrador ────────────────────────────────────────────────────────────────────────────────────────────────
 
   /** El Prebrief que se prepararía AHORA (mismos datos que ven Entendimos y Diseño). Solo lectura, USD 0. */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async draft(courseId: number, ownerId: string): Promise<PrebriefDraft> {
+    return withRequestReadCache(this.dataSource, 'prebrief.draft', { course: courseId, owner: ownerId }, () => this.draftUncached(courseId, ownerId));
+  }
+
+  private async draftUncached(courseId: number, ownerId: string): Promise<PrebriefDraft> {
     const course = await this.loadCourse(courseId, ownerId);
     const card = await this.design.recommend(courseId, ownerId, {} as any);
     return this.draftFrom(courseId, course, card);
@@ -252,7 +258,12 @@ export class PrebriefService {
   }
 
   /** GET: estado completo (borrador + versiones + flujo). */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async state(courseId: number, ownerId: string, card?: any) {
+    return withRequestReadCache(this.dataSource, 'prebrief.state', { course: courseId, owner: ownerId }, () => this.stateUncached(courseId, ownerId, card));
+  }
+
+  private async stateUncached(courseId: number, ownerId: string, card?: any) {
     await this.assertTablesReady();
     // r63: el GET no escribe. Una propuesta lista/aprobada que quedó vieja deja de proteger la vista previa: se recalcula.
     const frozenBefore = !card && (await profileOutcomesBlockedBy(this.dataSource, courseId, true)) === 'PREBRIEF_FROZEN';
@@ -315,7 +326,12 @@ export class PrebriefService {
    * confirmados, excepciones con motivo, español neutro) y la MISMA huella que vio el usuario. Congela el Blueprint
    * (idempotente) y guarda la versión con su PDF. Idempotente: la misma huella devuelve la versión vigente.
    */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async prepare(courseId: number, ownerId: string, user: { id: string; email?: string | null }, expectedModelSha: string) {
+    return withRequestReadCache(this.dataSource, 'prebrief.prepare', { course: courseId, owner: ownerId }, () => this.prepareUncached(courseId, ownerId, user, expectedModelSha));
+  }
+
+  private async prepareUncached(courseId: number, ownerId: string, user: { id: string; email?: string | null }, expectedModelSha: string) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     await this.assertTablesReady(); // sin las tablas (entorno sin la migración) → 503 ANTES de congelar nada
@@ -382,7 +398,12 @@ export class PrebriefService {
   }
 
   /** Aprobar: la última versión, lista, con la huella vigente, sin críticos; quién = el usuario de la sesión. */
+  // r71 (rendimiento): las lecturas de la petición se comparten (ver request-read-cache.ts).
   async approve(courseId: number, ownerId: string, user: { id: string; email?: string | null }, n: number, body: { expectedModelSha: string; name: string; role: string; confirm: boolean }) {
+    return withRequestReadCache(this.dataSource, 'prebrief.approve', { course: courseId, owner: ownerId }, () => this.approveUncached(courseId, ownerId, user, n, body));
+  }
+
+  private async approveUncached(courseId: number, ownerId: string, user: { id: string; email?: string | null }, n: number, body: { expectedModelSha: string; name: string; role: string; confirm: boolean }) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     const name = String(body.name || '').replace(/\s+/g, ' ').trim();
