@@ -1,0 +1,1475 @@
+{
+ "source": "producción #87 «Inglés Básico – Grado Sexto» (solo GET: /courses/87, /modules, /brief, /profiles/academic, /profiles/pedagogy, /prebrief, /prebrief/events; 2026-10-25). Sin emails, ids de dueño ni institución.",
+ "structureVersionCounter": 5,
+ "modules": [
+  {
+   "id": "6fef9a22-6546-4254-bf10-9654c75b0c4e",
+   "position": 0,
+   "title": "Hello! Getting to Know You",
+   "objective": "Presentarse y proporcionar información personal.",
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "bd0c0237-8780-4d69-ba6b-7281ad9a9a3a",
+     "position": 0,
+     "title": "Saludos, presentaciones, alfabeto, números, información personal y verbo to be.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": null,
+     "guidedPracticeMinutes": null,
+     "outcomeIds": [
+      "RA2"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "c667b14f-569f-4735-b6b2-aaa16352b01a",
+   "position": 1,
+   "title": "My Family and Friends",
+   "objective": null,
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "5ff4d7ca-9f1e-485f-8f27-458d37e5de59",
+     "position": 0,
+     "title": "Familia, descripciones físicas, personalidad, pronombres y adjetivos posesivos.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": null,
+     "guidedPracticeMinutes": null,
+     "outcomeIds": null
+    }
+   ]
+  },
+  {
+   "id": "159a2335-7fae-43d2-8dad-31a0ba6d4947",
+   "position": 2,
+   "title": "My School and My World",
+   "objective": "Identificar personas, objetos, lugares y actividades; Comunicarse mediante oraciones sencillas en situaciones familiares y escolares.",
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "81ebec46-9da9-4841-ba6e-1a280de75109",
+     "position": 0,
+     "title": "Objetos escolares, asignaturas, lugares, preposiciones y there is / there are.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": null,
+     "guidedPracticeMinutes": null,
+     "outcomeIds": [
+      "RA3",
+      "RA4"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "c3b741c1-3efe-4627-ba3e-e33bfd96c0ee",
+   "position": 3,
+   "title": "My Daily Routine",
+   "objective": "Describir rutinas y preferencias.",
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "13bdb98f-ccd2-448a-bca0-432e1eb0418e",
+     "position": 0,
+     "title": "Rutinas, horarios, días de la semana, presente simple y adverbios de frecuencia.",
+     "objective": null,
+     "description": null,
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": null,
+     "guidedPracticeMinutes": null,
+     "outcomeIds": [
+      "RA8"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "5ce56794-7809-499d-bcf8-bba11c190137",
+   "position": 4,
+   "title": "My Likes and Hobbies",
+   "objective": "Describir rutinas y preferencias.",
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "2150599b-49e7-4c9d-bb6b-4b8b271e6c01",
+     "position": 0,
+     "title": "Gustos, preferencias, deportes, actividades de tiempo libre y like, love",
+     "objective": null,
+     "description": "Gustos, preferencias, deportes, actividades de tiempo libre y like, love, don’t like y can.",
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": null,
+     "guidedPracticeMinutes": null,
+     "outcomeIds": [
+      "RA8"
+     ]
+    }
+   ]
+  },
+  {
+   "id": "9d07c527-6b62-4e74-8b4b-652fc68163ea",
+   "position": 5,
+   "title": "Let’s Communicate!",
+   "objective": "Reconocer vocabulario fundamental; Comprender textos cortos; Desarrollar habilidades iniciales de comprensión auditiva, lectura, escritura y expresión oral en inglés.",
+   "description": null,
+   "examEnabled": true,
+   "chapters": [
+    {
+     "id": "662edb12-10a5-461c-baf5-33695f9200e3",
+     "position": 0,
+     "title": "Integración de vocabulario, comprensión de textos, diálogos",
+     "objective": null,
+     "description": "Integración de vocabulario, comprensión de textos, diálogos, descripciones y producción de mensajes sencillos.",
+     "videoEnabled": true,
+     "activityEnabled": true,
+     "kind": "content",
+     "applicationMinutes": null,
+     "guidedPracticeMinutes": null,
+     "outcomeIds": [
+      "RA5",
+      "RA6",
+      "RA9"
+     ]
+    }
+   ]
+  }
+ ],
+ "brief": {
+  "nombre": "Inglés Básico – Grado Sexto",
+  "sector": "Educación",
+  "pais": "Colombia",
+  "contexto": "Universitario — estudiantes de pregrado universitario, con rigor académico y pensamiento crítico",
+  "nivel": "Básico — sin conocimientos previos",
+  "tono": "Conversacional y cercano, como un mentor con ejemplos cotidianos",
+  "inferidos": "tono,pais,contexto,nivel,nombre,sector"
+ },
+ "academic": {
+  "academicContextVersion": 1,
+  "documents": [
+   {
+    "id": "D1",
+    "name": "Microcurriculo_Ingles_Grado_6.pdf",
+    "mediaType": "application/pdf",
+    "sha256": "0bc7a712ca9c846e7f85beb6707aecdce571ee0ed7e0c988c646dabc62eff12a",
+    "bytes": 73118,
+    "pages": 2,
+    "characters": 2640,
+    "extractor": {
+     "id": "cursia-academic-extractor",
+     "version": 1
+    }
+   }
+  ],
+  "identity": {
+   "subjectName": {
+    "status": "found",
+    "value": "Inglés Básico – Grado Sexto",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Asignatura",
+      "page": 1,
+      "line": 4,
+      "excerpt": "Nombre del curso | Inglés Básico – Grado Sexto"
+     }
+    ]
+   },
+   "program": {
+    "status": "missing",
+    "value": null,
+    "sources": []
+   },
+   "educationLevel": {
+    "status": "found",
+    "value": {
+     "text": "Educación Básica Secundaria",
+     "level": "secondary"
+    },
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Nivel",
+      "page": 1,
+      "line": 6,
+      "excerpt": "Nivel educativo | Educación Básica Secundaria"
+     }
+    ]
+   },
+   "generalObjective": {
+    "status": "inferred",
+    "value": "Comprender y utilizar estructuras gramaticales, vocabulario y expresiones básicas del idioma inglés para comunicarse de manera sencilla en situaciones cotidianas, escolares y familiares, mediante la comprensión y producción de mensajes orales y escritos, fortaleciendo progresivamente las cuatro habilidades lingüísticas: listening, speaking, reading y writing.",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Competencias",
+      "page": 1,
+      "line": 20,
+      "excerpt": "Comprender y utilizar estructuras gramaticales, vocabulario y expresiones básicas del idioma inglés"
+     }
+    ],
+    "basis": "el documento no trae «objetivo general»; se usa su «3. Unidad de competencia»"
+   },
+   "description": {
+    "status": "missing",
+    "value": null,
+    "sources": []
+   }
+  },
+  "learner": {
+   "profile": {
+    "status": "missing",
+    "value": null,
+    "sources": []
+   },
+   "priorKnowledge": {
+    "status": "missing",
+    "value": null,
+    "sources": []
+   }
+  },
+  "outcomes": [
+   {
+    "id": "RA1",
+    "text": "Comprender y utilizar expresiones básicas en inglés relacionadas con su vida cotidiana",
+    "level": "understand",
+    "domain": "know",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 12,
+      "excerpt": "Al finalizar el curso, el estudiante estará en capacidad de comprender y utilizar expresiones básicas"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 13,
+      "excerpt": "en inglés relacionadas con su vida cotidiana, presentarse y proporcionar información personal,"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 14,
+      "excerpt": "identificar personas, objetos, lugares y actividades, así como comunicarse mediante oraciones"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 15,
+      "excerpt": "sencillas en situaciones familiares y escolares."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA2",
+    "text": "Presentarse y proporcionar información personal",
+    "level": null,
+    "domain": "know",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 12,
+      "excerpt": "Al finalizar el curso, el estudiante estará en capacidad de comprender y utilizar expresiones básicas"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 13,
+      "excerpt": "en inglés relacionadas con su vida cotidiana, presentarse y proporcionar información personal,"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 14,
+      "excerpt": "identificar personas, objetos, lugares y actividades, así como comunicarse mediante oraciones"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 15,
+      "excerpt": "sencillas en situaciones familiares y escolares."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA3",
+    "text": "Identificar personas, objetos, lugares y actividades",
+    "level": "remember",
+    "domain": "know",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 12,
+      "excerpt": "Al finalizar el curso, el estudiante estará en capacidad de comprender y utilizar expresiones básicas"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 13,
+      "excerpt": "en inglés relacionadas con su vida cotidiana, presentarse y proporcionar información personal,"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 14,
+      "excerpt": "identificar personas, objetos, lugares y actividades, así como comunicarse mediante oraciones"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 15,
+      "excerpt": "sencillas en situaciones familiares y escolares."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA4",
+    "text": "Comunicarse mediante oraciones sencillas en situaciones familiares y escolares",
+    "level": null,
+    "domain": "know",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 12,
+      "excerpt": "Al finalizar el curso, el estudiante estará en capacidad de comprender y utilizar expresiones básicas"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 13,
+      "excerpt": "en inglés relacionadas con su vida cotidiana, presentarse y proporcionar información personal,"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 14,
+      "excerpt": "identificar personas, objetos, lugares y actividades, así como comunicarse mediante oraciones"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 15,
+      "excerpt": "sencillas en situaciones familiares y escolares."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA5",
+    "text": "Reconocer vocabulario fundamental",
+    "level": "remember",
+    "domain": "know",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 16,
+      "excerpt": "Además, podrá reconocer vocabulario fundamental, comprender textos cortos, formular y responder"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 17,
+      "excerpt": "preguntas básicas, describir rutinas y preferencias, y desarrollar habilidades iniciales de comprensión"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 18,
+      "excerpt": "auditiva, lectura, escritura y expresión oral en inglés."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA6",
+    "text": "Comprender textos cortos",
+    "level": "understand",
+    "domain": "know",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 16,
+      "excerpt": "Además, podrá reconocer vocabulario fundamental, comprender textos cortos, formular y responder"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 17,
+      "excerpt": "preguntas básicas, describir rutinas y preferencias, y desarrollar habilidades iniciales de comprensión"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 18,
+      "excerpt": "auditiva, lectura, escritura y expresión oral en inglés."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA7",
+    "text": "Formular y responder preguntas básicas",
+    "level": "create",
+    "domain": "do",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 16,
+      "excerpt": "Además, podrá reconocer vocabulario fundamental, comprender textos cortos, formular y responder"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 17,
+      "excerpt": "preguntas básicas, describir rutinas y preferencias, y desarrollar habilidades iniciales de comprensión"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 18,
+      "excerpt": "auditiva, lectura, escritura y expresión oral en inglés."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA8",
+    "text": "Describir rutinas y preferencias",
+    "level": "understand",
+    "domain": "know",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 16,
+      "excerpt": "Además, podrá reconocer vocabulario fundamental, comprender textos cortos, formular y responder"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 17,
+      "excerpt": "preguntas básicas, describir rutinas y preferencias, y desarrollar habilidades iniciales de comprensión"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 18,
+      "excerpt": "auditiva, lectura, escritura y expresión oral en inglés."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   },
+   {
+    "id": "RA9",
+    "text": "Desarrollar habilidades iniciales de comprensión auditiva, lectura, escritura y expresión oral en inglés",
+    "level": "create",
+    "domain": "do",
+    "status": "inferred",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 16,
+      "excerpt": "Además, podrá reconocer vocabulario fundamental, comprender textos cortos, formular y responder"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 17,
+      "excerpt": "preguntas básicas, describir rutinas y preferencias, y desarrollar habilidades iniciales de comprensión"
+     },
+     {
+      "documentId": "D1",
+      "section": "Resultados de aprendizaje",
+      "page": 1,
+      "line": 18,
+      "excerpt": "auditiva, lectura, escritura y expresión oral en inglés."
+     }
+    ],
+    "basis": "el documento describe en un párrafo lo que el estudiante será capaz de hacer: cada capacidad que enumera se tomó como un resultado"
+   }
+  ],
+  "competencies": [
+   {
+    "id": "CO1",
+    "text": "Comprender y utilizar estructuras gramaticales, vocabulario y expresiones básicas del idioma inglés para comunicarse de manera sencilla en situaciones cotidianas, escolares y familiares, mediante la comprensión y producción de mensajes orales y escritos, fortaleciendo progresivamente las cuatro habilidades lingüísticas: listening, speaking, reading y writing.",
+    "status": "found",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Competencias",
+      "page": 1,
+      "line": 20,
+      "excerpt": "Comprender y utilizar estructuras gramaticales, vocabulario y expresiones básicas del idioma inglés"
+     },
+     {
+      "documentId": "D1",
+      "section": "Competencias",
+      "page": 1,
+      "line": 21,
+      "excerpt": "para comunicarse de manera sencilla en situaciones cotidianas, escolares y familiares, mediante la"
+     },
+     {
+      "documentId": "D1",
+      "section": "Competencias",
+      "page": 1,
+      "line": 22,
+      "excerpt": "comprensión y producción de mensajes orales y escritos, fortaleciendo progresivamente las cuatro"
+     },
+     {
+      "documentId": "D1",
+      "section": "Competencias",
+      "page": 1,
+      "line": 23,
+      "excerpt": "habilidades lingüísticas: listening, speaking, reading y writing."
+     }
+    ]
+   }
+  ],
+  "units": [
+   {
+    "id": "U1",
+    "title": "Hello! Getting to Know You",
+    "hours": 10,
+    "outcomeIds": [],
+    "contents": [
+     {
+      "id": "U1.1",
+      "text": "Saludos, presentaciones, alfabeto, números, información personal y verbo to be.",
+      "outcomeIds": [],
+      "status": "found",
+      "sources": [
+       {
+        "documentId": "D1",
+        "section": "Contenidos",
+        "page": 1,
+        "line": 27,
+        "excerpt": "1. Hello! Getting to Know You | Saludos, presentaciones, alfabeto, números, información | 10"
+       }
+      ]
+     }
+    ],
+    "status": "found",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Contenidos",
+      "page": 1,
+      "line": 27,
+      "excerpt": "1. Hello! Getting to Know You | Saludos, presentaciones, alfabeto, números, información | 10"
+     }
+    ]
+   },
+   {
+    "id": "U2",
+    "title": "My Family and Friends",
+    "hours": 10,
+    "outcomeIds": [],
+    "contents": [
+     {
+      "id": "U2.1",
+      "text": "Familia, descripciones físicas, personalidad, pronombres y adjetivos posesivos.",
+      "outcomeIds": [],
+      "status": "found",
+      "sources": [
+       {
+        "documentId": "D1",
+        "section": "Contenidos",
+        "page": 2,
+        "line": 32,
+        "excerpt": "2. My Family and Friends | Familia, descripciones físicas, personalidad, pronombres y | 10"
+       }
+      ]
+     }
+    ],
+    "status": "found",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Contenidos",
+      "page": 2,
+      "line": 32,
+      "excerpt": "2. My Family and Friends | Familia, descripciones físicas, personalidad, pronombres y | 10"
+     }
+    ]
+   },
+   {
+    "id": "U3",
+    "title": "My School and My World",
+    "hours": 10,
+    "outcomeIds": [],
+    "contents": [
+     {
+      "id": "U3.1",
+      "text": "Objetos escolares, asignaturas, lugares, preposiciones y there is / there are.",
+      "outcomeIds": [],
+      "status": "found",
+      "sources": [
+       {
+        "documentId": "D1",
+        "section": "Contenidos",
+        "page": 2,
+        "line": 34,
+        "excerpt": "3. My School and My World | Objetos escolares, asignaturas, lugares, preposiciones y | 10"
+       }
+      ]
+     }
+    ],
+    "status": "found",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Contenidos",
+      "page": 2,
+      "line": 34,
+      "excerpt": "3. My School and My World | Objetos escolares, asignaturas, lugares, preposiciones y | 10"
+     }
+    ]
+   },
+   {
+    "id": "U4",
+    "title": "My Daily Routine",
+    "hours": 10,
+    "outcomeIds": [],
+    "contents": [
+     {
+      "id": "U4.1",
+      "text": "Rutinas, horarios, días de la semana, presente simple y adverbios de frecuencia.",
+      "outcomeIds": [],
+      "status": "found",
+      "sources": [
+       {
+        "documentId": "D1",
+        "section": "Contenidos",
+        "page": 2,
+        "line": 36,
+        "excerpt": "4. My Daily Routine | Rutinas, horarios, días de la semana, presente simple y | 10"
+       }
+      ]
+     }
+    ],
+    "status": "found",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Contenidos",
+      "page": 2,
+      "line": 36,
+      "excerpt": "4. My Daily Routine | Rutinas, horarios, días de la semana, presente simple y | 10"
+     }
+    ]
+   },
+   {
+    "id": "U5",
+    "title": "My Likes and Hobbies",
+    "hours": 10,
+    "outcomeIds": [],
+    "contents": [
+     {
+      "id": "U5.1",
+      "text": "Gustos, preferencias, deportes, actividades de tiempo libre y like, love, don’t like y can.",
+      "outcomeIds": [],
+      "status": "found",
+      "sources": [
+       {
+        "documentId": "D1",
+        "section": "Contenidos",
+        "page": 2,
+        "line": 38,
+        "excerpt": "5. My Likes and Hobbies | Gustos, preferencias, deportes, actividades de tiempo libre y | 10"
+       }
+      ]
+     }
+    ],
+    "status": "found",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Contenidos",
+      "page": 2,
+      "line": 38,
+      "excerpt": "5. My Likes and Hobbies | Gustos, preferencias, deportes, actividades de tiempo libre y | 10"
+     }
+    ]
+   },
+   {
+    "id": "U6",
+    "title": "Let’s Communicate!",
+    "hours": 10,
+    "outcomeIds": [],
+    "contents": [
+     {
+      "id": "U6.1",
+      "text": "Integración de vocabulario, comprensión de textos, diálogos, descripciones y producción de mensajes sencillos.",
+      "outcomeIds": [],
+      "status": "found",
+      "sources": [
+       {
+        "documentId": "D1",
+        "section": "Contenidos",
+        "page": 2,
+        "line": 40,
+        "excerpt": "6. Let’s Communicate! | Integración de vocabulario, comprensión de textos, diálogos, | 10"
+       }
+      ]
+     }
+    ],
+    "status": "found",
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Contenidos",
+      "page": 2,
+      "line": 40,
+      "excerpt": "6. Let’s Communicate! | Integración de vocabulario, comprensión de textos, diálogos, | 10"
+     }
+    ]
+   }
+  ],
+  "hours": {
+   "total": {
+    "status": "found",
+    "value": 60,
+    "sources": [
+     {
+      "documentId": "D1",
+      "section": "Intensidad horaria",
+      "page": 1,
+      "line": 8,
+      "excerpt": "Duración | 60 horas"
+     },
+     {
+      "documentId": "D1",
+      "section": "Intensidad horaria",
+      "page": 2,
+      "line": 42,
+      "excerpt": "TOTAL 60"
+     }
+    ]
+   },
+   "weekly": {
+    "status": "missing",
+    "value": null,
+    "sources": []
+   },
+   "weeks": {
+    "status": "missing",
+    "value": null,
+    "sources": []
+   },
+   "credits": {
+    "status": "missing",
+    "value": null,
+    "sources": []
+   },
+   "components": []
+  },
+  "evaluation": [],
+  "bibliography": [],
+  "methodology": {
+   "status": "missing",
+   "value": null,
+   "sources": []
+  },
+  "constraints": {
+   "status": "missing",
+   "value": null,
+   "sources": []
+  },
+  "additionalInfo": {
+   "status": "found",
+   "value": [
+    "Área de formación: Lengua Extranjera – Inglés",
+    "Grado: Sexto (6.º)",
+    "Nivel de referencia: A1 inicial (MCER), como punto de partida hacia la meta prevista para el ciclo 6.º–7.º",
+    "Orientación curricular: propuesta formativa de iniciación en inglés para grado sexto, tomando como referencia los estándares de competencias en lenguas extranjeras de Colombia y el MCER. El nivel de dominio final dependerá del diagnóstico inicial y de la evidencia de desempeño del estudiante."
+   ],
+   "sources": [
+    {
+     "documentId": "D1",
+     "section": "Información adicional",
+     "page": 1,
+     "line": 5,
+     "excerpt": "Área de formación | Lengua Extranjera – Inglés"
+    },
+    {
+     "documentId": "D1",
+     "section": "Semestre",
+     "page": 1,
+     "line": 7,
+     "excerpt": "Grado | Sexto (6.º)"
+    },
+    {
+     "documentId": "D1",
+     "section": "Información adicional",
+     "page": 1,
+     "line": 9,
+     "excerpt": "Nivel de referencia | A1 inicial (MCER), como punto de partida hacia la meta prevista para el ciclo 6.º–7.º"
+    },
+    {
+     "documentId": "D1",
+     "section": "Información adicional",
+     "page": 2,
+     "line": 43,
+     "excerpt": "propuesta formativa de iniciación en inglés para grado sexto, tomando como"
+    }
+   ]
+  },
+  "conflicts": []
+ },
+ "pedagogy": {
+  "pedagogyProfileVersion": 1,
+  "primaryApproach": null,
+  "secondaryApproaches": [],
+  "learner": {
+   "description": null,
+   "ageGroup": null,
+   "educationLevel": "secondary",
+   "priorKnowledge": null,
+   "experience": null
+  },
+  "learningOutcomes": {
+   "know": [
+    "Comprender y utilizar expresiones básicas en inglés relacionadas con su vida cotidiana",
+    "Presentarse y proporcionar información personal",
+    "Identificar personas, objetos, lugares y actividades",
+    "Comunicarse mediante oraciones sencillas en situaciones familiares y escolares",
+    "Reconocer vocabulario fundamental",
+    "Comprender textos cortos",
+    "Describir rutinas y preferencias"
+   ],
+   "do": [
+    "Formular y responder preguntas básicas",
+    "Desarrollar habilidades iniciales de comprensión auditiva, lectura, escritura y expresión oral en inglés"
+   ],
+   "competencies": [
+    "Comprender y utilizar estructuras gramaticales, vocabulario y expresiones básicas del idioma inglés para comunicarse de manera sencilla en situaciones cotidianas, escolares y familiares, mediante la comprensión y producción de mensajes orales y escritos, fortaleciendo progresivamente las cuatro habilidades lingüísticas: listening, speaking, reading y writing."
+   ]
+  },
+  "learningModes": [],
+  "experienceTypes": [],
+  "assessmentMethods": [],
+  "principles": [],
+  "origin": "manual",
+  "targetHours": 60
+ },
+ "autofixState": {
+  "changes": [
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "cover:RA1",
+    "kind": "cover_outcome",
+    "after": [
+     "RA1"
+    ],
+    "title": "RA1 ahora se desarrolla en «Profundización 1: Let’s Communicate!»",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "RA1 («Comprender y utilizar expresiones básicas en inglés relacionadas con su vida cotidiana») no estaba en ningún capítulo. El módulo «Let’s Communicate!» es el que más se relaciona con él («expresiones», «inglés», comunicación, vocabulario) y este capítulo no tenía resultados.",
+    "status": "applied",
+    "target": {
+     "chapterId": "631d7e5e-adaa-4186-a998-19e700f1a9f1",
+     "outcomeIds": [
+      "RA1"
+     ],
+     "moduleTitle": "Let’s Communicate!",
+     "chapterTitle": "Profundización 1: Let’s Communicate!"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "cover:RA7",
+    "kind": "cover_outcome",
+    "after": [
+     "RA7"
+    ],
+    "title": "RA7 ahora se desarrolla en «Profundización 2: Let’s Communicate!»",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "RA7 («Formular y responder preguntas básicas») no estaba en ningún capítulo. El módulo «Let’s Communicate!» es el que más se relaciona con él (interacción oral) y este capítulo no tenía resultados.",
+    "status": "applied",
+    "target": {
+     "chapterId": "dc0dc40f-364e-47ad-9d92-ce341e9ee2b5",
+     "outcomeIds": [
+      "RA7"
+     ],
+     "moduleTitle": "Let’s Communicate!",
+     "chapterTitle": "Profundización 2: Let’s Communicate!"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:77db1cd6-ce4f-4b43-b0b1-149fa94a9857",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA2"
+    ],
+    "title": "«Familia, descripciones físicas, personalidad, pronombres y adjetivos …» → RA2",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "El documento no le asigna un resultado propio: trabaja los resultados de su módulo «Hello! Getting to Know You».",
+    "status": "applied",
+    "target": {
+     "chapterId": "77db1cd6-ce4f-4b43-b0b1-149fa94a9857",
+     "outcomeIds": [
+      "RA2"
+     ],
+     "moduleTitle": "Hello! Getting to Know You",
+     "chapterTitle": "Familia, descripciones físicas, personalidad, pronombres y adjetivos posesivos."
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:da52e09b-6d7d-4f04-afdc-56e853975cb0",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA2"
+    ],
+    "title": "«Profundización 1: Hello! Getting to Know You» → RA2",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «Hello! Getting to Know You»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "da52e09b-6d7d-4f04-afdc-56e853975cb0",
+     "outcomeIds": [
+      "RA2"
+     ],
+     "moduleTitle": "Hello! Getting to Know You",
+     "chapterTitle": "Profundización 1: Hello! Getting to Know You"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:0760fd74-40d7-44b3-a183-ea74eeac3947",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA2"
+    ],
+    "title": "«Profundización 2: Hello! Getting to Know You» → RA2",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «Hello! Getting to Know You»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "0760fd74-40d7-44b3-a183-ea74eeac3947",
+     "outcomeIds": [
+      "RA2"
+     ],
+     "moduleTitle": "Hello! Getting to Know You",
+     "chapterTitle": "Profundización 2: Hello! Getting to Know You"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:dec18db6-4fbb-4adf-a3c9-7b44d5c35e6c",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA2"
+    ],
+    "title": "«Profundización 3: Hello! Getting to Know You» → RA2",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «Hello! Getting to Know You»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "dec18db6-4fbb-4adf-a3c9-7b44d5c35e6c",
+     "outcomeIds": [
+      "RA2"
+     ],
+     "moduleTitle": "Hello! Getting to Know You",
+     "chapterTitle": "Profundización 3: Hello! Getting to Know You"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:83357440-a939-4f22-bd93-ee1379adabac",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA3",
+     "RA4",
+     "RA8"
+    ],
+    "title": "«Profundización 1: My School and My World» → RA3, RA4, RA8",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «My School and My World»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "83357440-a939-4f22-bd93-ee1379adabac",
+     "outcomeIds": [
+      "RA3",
+      "RA4",
+      "RA8"
+     ],
+     "moduleTitle": "My School and My World",
+     "chapterTitle": "Profundización 1: My School and My World"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:d1246bde-34e4-4fb2-ba18-d6ad4a38196b",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA3",
+     "RA4",
+     "RA8"
+    ],
+    "title": "«Profundización 2: My School and My World» → RA3, RA4, RA8",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «My School and My World»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "d1246bde-34e4-4fb2-ba18-d6ad4a38196b",
+     "outcomeIds": [
+      "RA3",
+      "RA4",
+      "RA8"
+     ],
+     "moduleTitle": "My School and My World",
+     "chapterTitle": "Profundización 2: My School and My World"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:c6e3269d-7ad9-480e-a0a9-bdaff8e040d4",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA3",
+     "RA4",
+     "RA8"
+    ],
+    "title": "«Profundización 3: My School and My World» → RA3, RA4, RA8",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «My School and My World»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "c6e3269d-7ad9-480e-a0a9-bdaff8e040d4",
+     "outcomeIds": [
+      "RA3",
+      "RA4",
+      "RA8"
+     ],
+     "moduleTitle": "My School and My World",
+     "chapterTitle": "Profundización 3: My School and My World"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:d32afc78-eb11-43b7-8133-bd36e5dfa9bc",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA8"
+    ],
+    "title": "«Profundización 1: My Likes and Hobbies» → RA8",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «My Likes and Hobbies»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "d32afc78-eb11-43b7-8133-bd36e5dfa9bc",
+     "outcomeIds": [
+      "RA8"
+     ],
+     "moduleTitle": "My Likes and Hobbies",
+     "chapterTitle": "Profundización 1: My Likes and Hobbies"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:094c1c56-3b85-4b7e-b53d-4d7602f81139",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA8"
+    ],
+    "title": "«Profundización 2: My Likes and Hobbies» → RA8",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «My Likes and Hobbies»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "094c1c56-3b85-4b7e-b53d-4d7602f81139",
+     "outcomeIds": [
+      "RA8"
+     ],
+     "moduleTitle": "My Likes and Hobbies",
+     "chapterTitle": "Profundización 2: My Likes and Hobbies"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:d1a24e3d-6998-4af9-b5bb-31647415cbe1",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA8"
+    ],
+    "title": "«Profundización 3: My Likes and Hobbies» → RA8",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «My Likes and Hobbies»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "d1a24e3d-6998-4af9-b5bb-31647415cbe1",
+     "outcomeIds": [
+      "RA8"
+     ],
+     "moduleTitle": "My Likes and Hobbies",
+     "chapterTitle": "Profundización 3: My Likes and Hobbies"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:902e8c21-5f68-4177-908c-d01ec30c0a3a",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA8"
+    ],
+    "title": "«Profundización 4: My Likes and Hobbies» → RA8",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «My Likes and Hobbies»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "902e8c21-5f68-4177-908c-d01ec30c0a3a",
+     "outcomeIds": [
+      "RA8"
+     ],
+     "moduleTitle": "My Likes and Hobbies",
+     "chapterTitle": "Profundización 4: My Likes and Hobbies"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:d92d31a4-e120-4e8b-b0d1-2e64078da043",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA5",
+     "RA6",
+     "RA9"
+    ],
+    "title": "«Profundización 3: Let’s Communicate!» → RA5, RA6, RA9",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «Let’s Communicate!»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "d92d31a4-e120-4e8b-b0d1-2e64078da043",
+     "outcomeIds": [
+      "RA5",
+      "RA6",
+      "RA9"
+     ],
+     "moduleTitle": "Let’s Communicate!",
+     "chapterTitle": "Profundización 3: Let’s Communicate!"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "chapter:90101e6d-8085-4bde-99aa-eaf627a92354",
+    "kind": "chapter_outcomes",
+    "after": [
+     "RA5",
+     "RA6",
+     "RA9"
+    ],
+    "title": "«Profundización 4: Let’s Communicate!» → RA5, RA6, RA9",
+    "before": [],
+    "origin": "cursia-autofix",
+    "reason": "Profundiza el módulo «Let’s Communicate!»: trabaja los resultados de ese módulo.",
+    "status": "applied",
+    "target": {
+     "chapterId": "90101e6d-8085-4bde-99aa-eaf627a92354",
+     "outcomeIds": [
+      "RA5",
+      "RA6",
+      "RA9"
+     ],
+     "moduleTitle": "Let’s Communicate!",
+     "chapterTitle": "Profundización 4: Let’s Communicate!"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   },
+   {
+    "at": "2026-10-25T14:19:01.723Z",
+    "id": "context:sector",
+    "kind": "context_field",
+    "after": "Educación",
+    "title": "Sector del curso: Educación (inferido, editable)",
+    "before": null,
+    "origin": "cursia-autofix",
+    "reason": "Faltaba el sector; el documento indica «Nivel educativo: Educación Básica Secundaria».",
+    "status": "applied",
+    "target": {
+     "field": "sector"
+    },
+    "batchId": "34d3073c-f5ad-4ee2-b2ae-61f472747de7"
+   }
+  ],
+  "autofixVersion": 1
+ },
+ "readinessProd": {
+  "ready": false,
+  "blockers": [
+   {
+    "code": "critical",
+    "title": "El resultado RA1 («Comprender y utilizar expresiones básicas en inglés relacionadas con su vida cotidiana») no está cubierto por ningún capítulo.",
+    "detail": "Vincúlalo a los capítulos que lo trabajan o agrega un capítulo que lo desarrolle.",
+    "where": "design",
+    "ref": "alignment:AL001",
+    "outcomeIds": [
+     "RA1"
+    ],
+    "inline": {
+     "kind": "link_outcome",
+     "outcomeId": "RA1",
+     "chapterId": "662edb12-10a5-461c-baf5-33695f9200e3",
+     "chapterTitle": "Integración de vocabulario, comprensión de textos, diálogos"
+    }
+   },
+   {
+    "code": "critical",
+    "title": "El resultado RA7 («Formular y responder preguntas básicas») no está cubierto por ningún capítulo.",
+    "detail": "Vincúlalo a los capítulos que lo trabajan o agrega un capítulo que lo desarrolle.",
+    "where": "design",
+    "ref": "alignment:AL002",
+    "outcomeIds": [
+     "RA7"
+    ],
+    "inline": {
+     "kind": "link_outcome",
+     "outcomeId": "RA7",
+     "chapterId": "662edb12-10a5-461c-baf5-33695f9200e3",
+     "chapterTitle": "Integración de vocabulario, comprensión de textos, diálogos"
+    }
+   },
+   {
+    "code": "pending_changes",
+    "title": "Hay 36 cambios recomendados sin aplicar: usa «Usar este diseño» en «Diseño».",
+    "where": "design"
+   },
+   {
+    "code": "doubtful_data",
+    "title": "Resultado de aprendizaje por confirmar: parece un fragmento incompleto.",
+    "where": "confirm",
+    "ref": "164fd962a45a99c5da87a6fa3e21b24a",
+    "text": "Reconocer vocabulario fundamental",
+    "detail": "RA5"
+   },
+   {
+    "code": "doubtful_data",
+    "title": "Resultado de aprendizaje por confirmar: parece un fragmento incompleto.",
+    "where": "confirm",
+    "ref": "944cc3cd348d8fe72a7649ac69b65d36",
+    "text": "Comprender textos cortos",
+    "detail": "RA6"
+   }
+  ],
+  "autofixPending": 0,
+  "chapters": [
+   {
+    "id": "bd0c0237-8780-4d69-ba6b-7281ad9a9a3a",
+    "title": "Saludos, presentaciones, alfabeto, números, información personal y verbo to be.",
+    "moduleTitle": "Hello! Getting to Know You"
+   },
+   {
+    "id": "5ff4d7ca-9f1e-485f-8f27-458d37e5de59",
+    "title": "Familia, descripciones físicas, personalidad, pronombres y adjetivos posesivos.",
+    "moduleTitle": "My Family and Friends"
+   },
+   {
+    "id": "81ebec46-9da9-4841-ba6e-1a280de75109",
+    "title": "Objetos escolares, asignaturas, lugares, preposiciones y there is / there are.",
+    "moduleTitle": "My School and My World"
+   },
+   {
+    "id": "13bdb98f-ccd2-448a-bca0-432e1eb0418e",
+    "title": "Rutinas, horarios, días de la semana, presente simple y adverbios de frecuencia.",
+    "moduleTitle": "My Daily Routine"
+   },
+   {
+    "id": "2150599b-49e7-4c9d-bb6b-4b8b271e6c01",
+    "title": "Gustos, preferencias, deportes, actividades de tiempo libre y like, love",
+    "moduleTitle": "My Likes and Hobbies"
+   },
+   {
+    "id": "662edb12-10a5-461c-baf5-33695f9200e3",
+    "title": "Integración de vocabulario, comprensión de textos, diálogos",
+    "moduleTitle": "Let’s Communicate!"
+   }
+  ]
+ },
+ "verificationCountsProd": {
+  "criticals": 2,
+  "warnings": 2
+ },
+ "formatEvents": [
+  {
+   "type": "format_selected",
+   "payload": {
+    "to": "L",
+    "from": null
+   },
+   "at": "2026-10-25T14:18:47.432Z"
+  },
+  {
+   "type": "format_selected",
+   "payload": {
+    "to": null,
+    "from": "L"
+   },
+   "at": "2026-10-25T14:19:28.480Z"
+  }
+ ],
+ "metadata": {
+  "contentMap": {
+   "at": "2026-10-25T14:19:31.546Z",
+   "version": 1,
+   "chapters": {
+    "13bdb98f-ccd2-448a-bca0-432e1eb0418e": [
+     "U4.1"
+    ],
+    "2150599b-49e7-4c9d-bb6b-4b8b271e6c01": [
+     "U5.1"
+    ],
+    "5ff4d7ca-9f1e-485f-8f27-458d37e5de59": [
+     "U2.1"
+    ],
+    "662edb12-10a5-461c-baf5-33695f9200e3": [
+     "U6.1"
+    ],
+    "81ebec46-9da9-4841-ba6e-1a280de75109": [
+     "U3.1"
+    ],
+    "bd0c0237-8780-4d69-ba6b-7281ad9a9a3a": [
+     "U1.1"
+    ]
+   },
+   "contentsSha": "d9421749c8a3f5676cd302fae8fd4ceb929e06e0861297bc45f4d36dc9c0a525",
+   "contextVersion": 1
+  },
+  "structureOrigin": {
+   "at": "2026-10-25T14:19:31.349Z",
+   "shape": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+   ],
+   "choice": "cursia",
+   "source": "academic_context",
+   "counter": 5,
+   "contextVersion": 1
+  },
+  "documentRequirements": {
+   "entries": [
+    {
+     "at": "2026-10-25T14:17:49.805Z",
+     "key": "2b133430f99d7a73d6b9082871a7b8e6",
+     "documents": [
+      {
+       "id": "D1",
+       "name": "Microcurriculo_Ingles_Grado_6.pdf",
+       "sha256": "0bc7a712ca9c846e7f85beb6707aecdce571ee0ed7e0c988c646dabc62eff12a"
+      }
+     ],
+     "extraction": {
+      "groups": [],
+      "subjects": [],
+      "conflicts": [],
+      "multiCourse": false,
+      "ignoredCount": 1,
+      "requirements": [],
+      "requirementsVersion": 1
+     },
+     "extractorVersion": 1
+    }
+   ],
+   "version": 1
+  }
+ }
+}

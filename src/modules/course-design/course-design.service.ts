@@ -1,7 +1,7 @@
 import { contentCoverage, contentMapIsStale, documentContents, readContentMap, writeContentMap } from '../academic-context/content-coverage';
 import { documentStructureShape, isValidShape, proposeShapedStructureFromContext } from '../academic-context/context-design';
 import { recommendShape, shapeDifferences, structuralRequirements } from './structure-options';
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Optional } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { CoursesService } from '../courses/courses.service';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
@@ -39,8 +39,11 @@ import { profileOutcomesBlockedBy } from '../academic-context/profile-outcomes-d
 import { BRIEF_KEY, BRIEF_VERSION, normalizeBriefFields, parseBrief } from '../course-facts/course-facts';
 import { sortOutcomeIds } from '../academic-context/blueprint-academic';
 import {
-  AUTOFIX_KEY, AutofixChange, AutofixChapter, AutofixInput, AutofixPlan, AutofixRecord, AutofixState, declinedKeys, inferSector, parseAutofixState, planAutofix,
+  AUTOFIX_KEY, AutofixChange, CourseQuestion, AutofixChapter, AutofixInput, AutofixPlan, AutofixRecord, AutofixState, IMPROVED_OUTCOME_BASIS, addedLinks, appliedRecords, declinedKeys,
+  designChangesSummary, inferSector, liveAutofixState, parseAutofixState, planAutofix, priorKnowledgeQuestion,
 } from './pedagogical-autofix';
+import { CourseProfilesService } from '../course-profiles/course-profiles.service';
+import { PRIOR_KNOWLEDGE_LEVELS } from '../pedagogy/vocabulary';
 
 /** Prioridad audiovisual por defecto de V2 (sin preferencia guardada). */
 export const DEFAULT_AUDIOVISUAL = 'recommended' as const;
@@ -59,6 +62,8 @@ export class CourseDesignService {
     private readonly dataSource: DataSource,
     private readonly coursesService: CoursesService,
     private readonly pedagogy: PedagogyService,
+    // r72: opcional (los checks construyen el servicio a mano); sin él se usa uno propio con la misma base.
+    @Optional() private profilesSvc?: CourseProfilesService,
   ) {}
 
   /**
@@ -432,6 +437,24 @@ export class CourseDesignService {
         format: fmt && fmtFit ? { label: fmt.label, modules: fmt.modules, chaptersPerModule: fmt.chaptersPerModule, hoursMin: fmt.hoursMin, hoursMax: fmt.hoursMax, ...fmtFit, designHours: dist ? dist.estimatedHours : null } : null,
       })
       : null;
+    // r72 · Lo que falta decidir se responde en la misma pantalla: «¿Qué sabe ya el estudiante?» con la sugerencia de
+    // Cursia (la verificación sigue diciendo por qué importa), y los cambios del diseño recomendado sin aplicar, con su
+    // huella, para aplicarlos en línea desde la propuesta (son cambios reales del distribuidor, no se recalculan en bucle).
+    if (autofix && verification) {
+      const p2 = verification.checks.find((c) => c.fix && c.fix.kind === 'understood' && c.fix.action === 'learner');
+      if (p2) {
+        const [b] = await this.dataSource.query(`select metadata -> 'brief' -> 'fields' ->> 'nivel' as nivel from public.courses where id = $1`, [courseId]);
+        const lvl = academic && academic.context.identity.educationLevel && academic.context.identity.educationLevel.status !== 'missing' && academic.context.identity.educationLevel.value ? academic.context.identity.educationLevel.value.text : null;
+        const q = priorKnowledgeQuestion({ courseName: facts.title && facts.title.value ? String(facts.title.value) : null, suggestion: facts.priorKnowledge && facts.priorKnowledge.value ? String(facts.priorKnowledge.value) : null, briefLevel: b && b.nivel ? String(b.nivel) : null, educationLevel: lvl });
+        (p2 as any).question = q;
+        autofix.questions = [q];
+      }
+    }
+    if (autofix && dist) {
+      const proposedN = dist.modules.reduce((n, m) => n + m.chapters.filter((c) => c.proposed).length, 0);
+      const total = Math.max(dist.changes.length, proposedN);
+      if (total) autofix.designApply = { proposalSha256: dist.proposalSha256, total, summary: designChangesSummary(dist.changes, { target: profile.targetHours ?? null, estimated: dist.estimatedHours }), profileChanged: savedComparable !== JSON.stringify(profile) };
+    }
     return {
       designVersion: 1,
       providersCalled: 0,
@@ -588,14 +611,16 @@ export class CourseDesignService {
    *   link_outcomes — vincula a sus resultados los capítulos que NO tienen vínculos propios (la misma sugerencia del
    *   contexto académico; un capítulo con vínculos se conserva siempre). Una transacción, con el contador de la estructura.
    */
-  async fix(courseId: number, ownerId: string, action: string, expectedCounter: number, extra: { changeIds?: string[]; outcomeId?: string; chapterId?: string; field?: string; value?: string } = {}) {
+  async fix(courseId: number, ownerId: string, action: string, expectedCounter: number, extra: { changeIds?: string[]; outcomeId?: string; chapterId?: string; field?: string; value?: string; proposalId?: string; text?: string } = {}) {
     assertDynamicOwnerAllowed(ownerId);
     await this.loadCourse(courseId, ownerId);
     // r71 · «Cursia optimizó tu curso» y las acciones en línea de la propuesta (paso 5).
     if (action === 'autofix') return this.autofix(courseId, ownerId, expectedCounter);
-    if (action === 'autofix_undo') return this.autofixUndo(courseId, expectedCounter, extra.changeIds);
+    if (action === 'autofix_undo') return this.autofixUndo(courseId, ownerId, expectedCounter, extra.changeIds);
     if (action === 'link_outcome') return this.linkOutcome(courseId, expectedCounter, String(extra.outcomeId || ''), String(extra.chapterId || ''));
-    if (action === 'context_field') return this.setContextField(courseId, String(extra.field || ''), extra.value);
+    if (action === 'context_field') return this.setContextField(courseId, ownerId, String(extra.field || ''), extra.value);
+    // r72 · aceptar una propuesta de Cursia (ajuste de contenido, competencia faltante) con un clic.
+    if (action === 'accept_proposal') return this.acceptProposal(courseId, ownerId, expectedCounter, String(extra.proposalId || ''), extra.chapterId, extra.text);
     if (action !== 'link_outcomes' && action !== 'cover_contents') throw new BadRequestException(`Acción desconocida: ${JSON.stringify(action)}`);
     if (action === 'cover_contents') return this.coverContents(courseId, expectedCounter, await loadCurrentAcademicContext(this.dataSource, courseId));
     const qr = this.dataSource.createQueryRunner();
@@ -645,7 +670,13 @@ export class CourseDesignService {
     }
   }
 
-  // ── r71 · «Cursia optimizó tu curso» (autocorrección pedagógica) ──────────────────────────────────────────────
+  // ── r71 / r72 · «Cursia optimizó tu curso» (autocorrección pedagógica) ──────────────────────────────────────────
+
+  /** r72: el servicio de perfiles (versionado del contexto académico y del perfil pedagógico), inyectado o propio. */
+  private get profiles(): CourseProfilesService {
+    if (!this.profilesSvc) this.profilesSvc = new CourseProfilesService(this.dataSource, this.coursesService);
+    return this.profilesSvc;
+  }
 
   /** Una transacción con el contador de la estructura (el mismo contrato que «Corregir»: 409 si cambió). */
   private async withCounter<T>(courseId: number, expectedCounter: number, fn: (qr: Q, counter: number) => Promise<T>): Promise<T> {
@@ -677,14 +708,19 @@ export class CourseDesignService {
     return counter;
   }
 
+  private async currentCounter(courseId: number): Promise<number> {
+    return Number((await this.dataSource.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]))[0].c);
+  }
+
   /** Lo que lee la autocorrección (módulos, capítulos con sus vínculos, desvinculados a propósito, lo deshecho). */
-  private async autofixInput(q: Q, courseId: number, ctx: AcademicContextV1 | null, sector: string | null, linksOverride?: Map<string, string[]>): Promise<{ input: AutofixInput; state: AutofixState }> {
+  private async autofixInput(q: Q, courseId: number, ctx: AcademicContextV1 | null, sector: string | null, linksOverride?: Map<string, string[]>): Promise<{ input: AutofixInput; state: AutofixState; live: AutofixState }> {
     const mods: any[] = await q.query(`select id, position, title, objective, description from public.course_modules where course_id = $1 order by position`, [courseId]);
     const rows: any[] = await q.query(
       `select id, module_id, position, title, objective, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind
          from public.course_chapters ch where course_id = $1`,
       [courseId],
     );
+    const [course] = await q.query(`select title from public.courses where id = $1`, [courseId]);
     const pins = await loadDesignPins(q, courseId);
     const state = await loadAutofixState(q, courseId);
     const lexical = ctx ? new Map((await autoLinkPlan(q, courseId, ctx)).map((p) => [p.chapterId, p.suggested])) : new Map<string, string[]>();
@@ -694,22 +730,23 @@ export class CourseDesignService {
       outcomeIds: linksOverride && linksOverride.has(r.id) ? [...linksOverride.get(r.id)!] : Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : [],
       ...(pins[r.id] && pins[r.id].noLinks ? { noLinks: true } : {}),
     }));
-    // Lo que Cursia aplicó y el docente cambió después por otra vía (editor, «Lo que entendimos»): es decisión suya.
-    const declined = declinedKeys(state);
-    const byId = new Map(chapters.map((c) => [c.id, c]));
-    for (const r of appliedRecords(state)) {
-      if (r.kind === 'context_field' && r.target.field === 'sector' && sector !== r.after) declined.add(r.id);
-      const ch = r.target.chapterId ? byId.get(r.target.chapterId) : null;
-      if (r.target.chapterId && JSON.stringify(ch ? ch.outcomeIds : null) !== JSON.stringify(r.after)) {
-        declined.add(r.id); declined.add(`chapter:${r.target.chapterId}`); declined.add(`competency:${r.target.chapterId}`);
-      }
-    }
+    // r72 · El registro frente a lo que hay hoy: lo que el docente cambió después por otra vía (editor, «Lo que
+    // entendimos») es decisión suya; lo que apunta a un capítulo que ya no existe (la estructura se reemplazó) es OBSOLETO:
+    // ni se muestra como mejora vigente ni cuenta como «deshecho» (antes, en producción #87, RA1/RA7 quedaban sin corregir
+    // y el resumen mostraba 16 mejoras sobre «Profundización» que ya no existían).
+    const live = liveAutofixState(state, {
+      chapters: new Map(chapters.map((c) => [c.id, c.outcomeIds])),
+      sector,
+      outcomes: ctx ? new Map<string, string>([...ctx.outcomes.map((o) => [o.id, o.text] as [string, string]), ...ctx.competencies.map((c) => [c.id, c.text] as [string, string])]) : null,
+    });
     return {
       state,
+      live,
       input: {
-        ctx, chapters, lexical, declined, context: { sector },
+        ctx, chapters, lexical, declined: declinedKeys(live), context: { sector },
         modules: mods.map((m) => ({ id: m.id, position: Number(m.position), title: String(m.title || ''), objective: m.objective, description: m.description })),
         hasDocument: !!ctx && Array.isArray(ctx.documents) && ctx.documents.length > 0,
+        course: { name: course ? String(course.title || '') : null },
       },
     };
   }
@@ -719,7 +756,7 @@ export class CourseDesignService {
    * lo que ya corrigió (con «Deshacer») y las sugerencias para las acciones en línea del paso 5.
    */
   async autofixPreview(q: Q, courseId: number, ctx: AcademicContextV1 | null, sector: string | null, linksOverride?: Map<string, string[]>) {
-    const { input, state } = await this.autofixInput(q, courseId, ctx, sector, linksOverride);
+    const { input, live } = await this.autofixInput(q, courseId, ctx, sector, linksOverride);
     const plan = planAutofix(input);
     // Sugerencias aunque el docente haya deshecho el cambio (la acción en línea es SU decisión).
     const open = planAutofix({ ...input, declined: new Set() });
@@ -729,29 +766,74 @@ export class CourseDesignService {
       changes: plan.changes,
       proposals: plan.proposals,
       suggestions: { ...open.suggestions, ...plan.suggestions },
-      applied: appliedRecords(state),
+      applied: appliedRecords(live),
       chapters: input.chapters.filter((c) => c.kind === 'content')
         .sort((a, b) => (input.modules.findIndex((m) => m.id === a.moduleId) - input.modules.findIndex((m) => m.id === b.moduleId)) || a.position - b.position)
         .map((c) => ({ id: c.id, title: c.title, moduleTitle: mods.get(c.moduleId) || '' })),
       contextSuggestions: { sector: sector ? null : ((inferSector(ctx) || { value: null }).value as string | null) },
+      /** r72: preguntas cortas que se responden en la misma pantalla (conocimientos previos), con la sugerencia de Cursia. */
+      questions: [] as CourseQuestion[],
+      /** r72: el diseño recomendado sin aplicar (cambios reales del distribuidor) y su huella, para aplicarlo en línea. */
+      designApply: null as null | { proposalSha256: string; total: number; summary: string[]; profileChanged: boolean },
     };
+  }
+
+  /** r72 · Escribe registros nuevos del autofix (en su propia transacción, serializada con el curso). */
+  private async appendAutofixRecords(courseId: number, records: AutofixRecord[]): Promise<void> {
+    if (!records.length) return;
+    const qr = this.dataSource.createQueryRunner();
+    try {
+      await qr.connect();
+      await qr.startTransaction();
+      await qr.query(`select id from public.courses where id = $1 for update`, [courseId]);
+      const state = await loadAutofixState(qr, courseId);
+      await writeAutofixState(qr, courseId, { ...state, changes: [...state.changes, ...records] });
+      await qr.commitTransaction();
+    } catch (err) {
+      if (qr.isTransactionActive) await qr.rollbackTransaction();
+      throw err;
+    } finally {
+      await qr.release();
+    }
+  }
+
+  /**
+   * r72 · Cambios del contexto académico (redacción precisada de un resultado, competencia aceptada o «Deshacer» de
+   * ellos) por el camino de siempre: una versión nueva del contexto (deriva el perfil pedagógico, conserva ids y vínculos).
+   * `edit` devuelve el contexto nuevo o null si ya no corresponde (otro cambio lo tocó). 409 → no se aplica (null).
+   */
+  private async editAcademic(courseId: number, ownerId: string, edit: (ctx: AcademicContextV1) => AcademicContextV1 | null): Promise<boolean> {
+    const academic = await loadCurrentAcademicContext(this.dataSource, courseId);
+    if (!academic) return false;
+    const next = edit(JSON.parse(JSON.stringify(academic.context)));
+    if (!next) return false;
+    try {
+      await this.profiles.append(courseId, ownerId, 'academic', next, academic.version);
+      return true;
+    } catch (err) {
+      if (err instanceof ConflictException) return false;
+      throw err;
+    }
   }
 
   /** Aplica lo que se deduce con evidencia, de una vez, con su registro (idempotente; nunca pisa al docente). */
   private async autofix(courseId: number, ownerId: string, expectedCounter: number) {
-    return this.withCounter(courseId, expectedCounter, async (qr, counter0) => {
+    const res = await this.withCounter(courseId, expectedCounter, async (qr, counter0) => {
       // Una propuesta preparada/aprobada o una producción en curso no se cambian solas (se invalidarían sin pedirlo).
       const blocked = await profileOutcomesBlockedBy(qr, courseId, true);
-      if (blocked) return { action: 'autofix' as const, skipped: blocked, applied: [] as AutofixChange[], proposals: [], structureVersionCounter: counter0 };
+      if (blocked) return { action: 'autofix' as const, skipped: blocked, applied: [] as AutofixChange[], proposals: [], structureVersionCounter: counter0, wordings: [] as AutofixChange[], batchId: null as string | null };
       await syncAcademicOutcomesFromProfile(qr, courseId, ownerId, { respectPrebrief: false, link: false, allowRemovals: true });
       const academic = await loadCurrentAcademicContext(qr, courseId);
       const facts = await loadCourseFacts(qr, courseId);
       const { input, state } = await this.autofixInput(qr, courseId, academic ? academic.context : null, facts.sector && facts.sector.value ? String(facts.sector.value) : null);
       const plan: AutofixPlan = planAutofix(input);
       const applied: AutofixChange[] = [];
+      const wordings: AutofixChange[] = [];
       for (const ch of plan.changes) {
+        if (ch.kind === 'outcome_wording') { wordings.push(ch); continue; } // va por el contexto académico (después)
         if (ch.target.chapterId) {
-          // Solo si el capítulo sigue como lo vio el plan (nada de otra pestaña se pisa).
+          // Solo si el capítulo sigue como lo vio el plan (nada de otra pestaña se pisa). Los cambios del mismo capítulo
+          // se encadenan: el «antes» de cada uno es el «después» del anterior.
           const res = await qr.query(
             `update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3 and coalesce(outcome_ids, '[]'::jsonb) = $4::jsonb returning id`,
             [JSON.stringify(ch.after), ch.target.chapterId, courseId, JSON.stringify(ch.before || [])],
@@ -764,34 +846,75 @@ export class CourseDesignService {
       // r63: la sincronización pudo subir el contador; el que se devuelve es SIEMPRE el vigente.
       let counter = Number((await qr.query(`select structure_version_counter c from public.courses where id = $1`, [courseId]))[0].c);
       if (applied.some((c) => c.target.chapterId)) counter = await this.bumpCounter(qr, courseId);
-      const batchId = applied.length ? randomUUID() : null;
+      const batchId = applied.length || wordings.length ? randomUUID() : null;
       if (applied.length) {
         const at = new Date().toISOString();
         await writeAutofixState(qr, courseId, { ...state, changes: [...state.changes, ...applied.map((c): AutofixRecord => ({ ...c, batchId: batchId!, at, status: 'applied' }))] });
       }
-      return { action: 'autofix' as const, batchId, applied, proposals: plan.proposals, suggestions: plan.suggestions, structureVersionCounter: counter };
+      return { action: 'autofix' as const, batchId, applied, proposals: plan.proposals, suggestions: plan.suggestions, structureVersionCounter: counter, wordings, skipped: undefined as string | undefined };
     });
+    const { wordings, ...out } = res;
+    if (res.skipped || !wordings.length) return out;
+    // r72 · Redacción precisada: una versión nueva del contexto académico con el resultado mejorado (estado «inferido»,
+    // las fuentes del documento intactas); el original completo queda en el registro para «Deshacer».
+    const originals = new Map<string, any>();
+    const done = await this.editAcademic(courseId, ownerId, (ctx) => {
+      let changed = false;
+      for (const w of wordings) {
+        const o = ctx.outcomes.find((x) => x.id === w.target.outcomeId);
+        if (!o || o.text !== w.before || o.status === 'provided') continue;
+        originals.set(o.id, JSON.parse(JSON.stringify(o)));
+        o.text = String(w.after);
+        o.status = 'inferred';
+        o.basis = IMPROVED_OUTCOME_BASIS;
+        changed = true;
+      }
+      return changed ? ctx : null;
+    });
+    if (done) {
+      const at = new Date().toISOString();
+      const recs = wordings.filter((w) => originals.has(String(w.target.outcomeId))).map((w): AutofixRecord => ({ ...w, batchId: out.batchId!, at, status: 'applied', beforeOutcome: originals.get(String(w.target.outcomeId)) }));
+      await this.appendAutofixRecords(courseId, recs);
+      out.applied = [...out.applied, ...recs.map(({ batchId, at: _at, status, beforeOutcome, ...c }) => c as AutofixChange)];
+    }
+    out.structureVersionCounter = await this.currentCounter(courseId);
+    if (!out.applied.length) out.batchId = null;
+    return out;
   }
 
   /** «Deshacer»: vuelve al valor anterior SOLO si nadie lo cambió después; lo deshecho no se vuelve a aplicar. */
-  private async autofixUndo(courseId: number, expectedCounter: number, changeIds?: string[]) {
-    return this.withCounter(courseId, expectedCounter, async (qr, counter0) => {
+  private async autofixUndo(courseId: number, ownerId: string, expectedCounter: number, changeIds?: string[]) {
+    const res = await this.withCounter(courseId, expectedCounter, async (qr, counter0) => {
       const state = await loadAutofixState(qr, courseId);
+      const rows: any[] = await qr.query(`select id, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids from public.course_chapters ch where course_id = $1`, [courseId]);
+      const cur = new Map(rows.map((r) => [String(r.id), { links: Array.isArray(r.outcome_ids) ? (r.outcome_ids as string[]) : [], description: r.description as string | null }]));
+      const live = liveAutofixState(state, { chapters: new Map([...cur].map(([k, v]) => [k, v.links])) });
       const want = changeIds && changeIds.length ? new Set(changeIds) : null;
-      const targets = appliedRecords(state).filter((r) => !want || want.has(r.id));
+      // Del más nuevo al más viejo: cada vínculo agregado se quita del estado en que quedó.
+      const targets = appliedRecords(live).filter((r) => !want || want.has(r.id)).reverse();
       const reverted: string[] = [];
       const changed: string[] = [];
       const now = new Date().toISOString();
       const next: AutofixRecord[] = [];
+      const academic: AutofixRecord[] = [];
+      let chapterReverted = false;
       for (const r of targets) {
+        if (r.kind === 'outcome_wording' || r.kind === 'competency_added') { academic.push(r); continue; }
         let ok = false;
         if (r.target.chapterId) {
-          const before = Array.isArray(r.before) ? r.before : [];
-          const res = await qr.query(
-            `update public.course_chapters set outcome_ids = $1::jsonb, updated_at = now() where id = $2 and course_id = $3 and coalesce(outcome_ids, '[]'::jsonb) = $4::jsonb returning id`,
-            [before.length ? JSON.stringify(before) : null, r.target.chapterId, courseId, JSON.stringify(r.after)],
-          );
-          ok = returningRows(res).length > 0;
+          const c = cur.get(r.target.chapterId);
+          const added = addedLinks(r);
+          if (c && added.every((x) => c.links.includes(x))) {
+            // r72 · Se quitan SOLO los vínculos que agregó Cursia (lo que el capítulo tenía, o agregó después otra mejora, queda).
+            const after = c.links.filter((x) => !added.includes(x));
+            const restoreDesc = r.kind === 'content_adjustment' && r.beforeDescription !== undefined && c.description === (r as any).afterDescription;
+            const resq = await qr.query(
+              `update public.course_chapters set outcome_ids = $1::jsonb${restoreDesc ? ', description = $5' : ''}, updated_at = now() where id = $2 and course_id = $3 and coalesce(outcome_ids, '[]'::jsonb) = $4::jsonb returning id`,
+              [after.length ? JSON.stringify(after) : null, r.target.chapterId, courseId, JSON.stringify(c.links), ...(restoreDesc ? [r.beforeDescription] : [])],
+            );
+            ok = returningRows(resq).length > 0;
+            if (ok) { c.links = after; if (restoreDesc) c.description = r.beforeDescription ?? null; chapterReverted = true; }
+          }
         } else if (r.kind === 'context_field' && r.target.field) {
           ok = await writeBriefField(qr, courseId, r.target.field, null, { inferred: false, onlyIfValue: String(r.after) });
         }
@@ -800,10 +923,32 @@ export class CourseDesignService {
         next.push({ ...r, status: ok ? 'reverted' : 'superseded', revertedAt: now });
       }
       let counter = counter0;
-      if (targets.some((r, i) => r.target.chapterId && next[i].status === 'reverted')) counter = await this.bumpCounter(qr, courseId);
+      if (chapterReverted) counter = await this.bumpCounter(qr, courseId);
       if (next.length) await writeAutofixState(qr, courseId, { ...state, changes: [...state.changes, ...next] });
-      return { action: 'autofix_undo' as const, reverted, changed, structureVersionCounter: counter };
+      return { action: 'autofix_undo' as const, reverted, changed, structureVersionCounter: counter, academic };
     });
+    const { academic, ...out } = res;
+    if (!academic.length) return out;
+    // r72 · Redacción y competencia: vuelven a como estaban (el resultado del documento con su texto, origen y cita), solo si
+    // nadie las cambió después.
+    const ok = new Set<string>();
+    await this.editAcademic(courseId, ownerId, (ctx) => {
+      for (const r of academic) {
+        if (r.kind === 'outcome_wording') {
+          const i = ctx.outcomes.findIndex((x) => x.id === r.target.outcomeId);
+          if (i >= 0 && ctx.outcomes[i].text === r.after && r.beforeOutcome) { ctx.outcomes[i] = JSON.parse(JSON.stringify(r.beforeOutcome)); ok.add(r.id); }
+        } else if (r.kind === 'competency_added') {
+          const i = ctx.competencies.findIndex((x) => x.id === r.target.outcomeId && x.text === r.after);
+          if (i >= 0) { ctx.competencies.splice(i, 1); ok.add(r.id); }
+        }
+      }
+      return ok.size ? ctx : null;
+    });
+    const now = new Date().toISOString();
+    await this.appendAutofixRecords(courseId, academic.map((r) => ({ ...r, status: ok.has(r.id) ? 'reverted' as const : 'superseded' as const, revertedAt: now })));
+    for (const r of academic) (ok.has(r.id) ? out.reverted : out.changed).push(r.id);
+    out.structureVersionCounter = await this.currentCounter(courseId);
+    return out;
   }
 
   /** Acción en línea del paso 5: el docente vincula UN resultado (o competencia) a UN capítulo. Solo agrega. */
@@ -823,8 +968,68 @@ export class CourseDesignService {
     });
   }
 
-  /** Acción en línea del paso 5: el docente completa un dato del curso que falta (queda como dato suyo, no inferido). */
-  private async setContextField(courseId: number, field: string, value: string | undefined) {
+  /**
+   * r72 · El docente acepta una propuesta de Cursia con un clic: un ajuste de contenido (agregar el tema del resultado al
+   * capítulo elegido y vincularlo) o la competencia propuesta (con su texto, editable). Queda en el registro: se deshace.
+   */
+  private async acceptProposal(courseId: number, ownerId: string, expectedCounter: number, proposalId: string, chapterId?: string, text?: string) {
+    const academic0 = await loadCurrentAcademicContext(this.dataSource, courseId);
+    const facts0 = await loadCourseFacts(this.dataSource, courseId);
+    const { input } = await this.autofixInput(this.dataSource, courseId, academic0 ? academic0.context : null, facts0.sector && facts0.sector.value ? String(facts0.sector.value) : null);
+    const p = planAutofix({ ...input, declined: new Set() }).proposals.find((x) => x.id === proposalId);
+    if (!p) throw new BadRequestException({ code: 'UNKNOWN_PROPOSAL', message: `UNKNOWN_PROPOSAL: Cursia ya no propone ${JSON.stringify(proposalId)} (el curso cambió): vuelve a verlo.` });
+    if (p.kind === 'content_adjustment') {
+      const target = chapterId || p.chapterId;
+      return this.withCounter(courseId, expectedCounter, async (qr) => {
+        const [row] = await qr.query(`select id, title, description, to_jsonb(ch) -> 'outcome_ids' as outcome_ids, to_jsonb(ch) ->> 'chapter_kind' as kind from public.course_chapters ch where id::text = $1 and course_id = $2`, [target, courseId]);
+        if (!row || row.kind === 'practice') throw new BadRequestException({ code: 'UNKNOWN_CHAPTER', message: 'UNKNOWN_CHAPTER: elige un capítulo de contenido de este curso.' });
+        const before: string[] = Array.isArray(row.outcome_ids) ? row.outcome_ids : [];
+        const after = sortOutcomeIds([...new Set([...before, p.outcomeId])]);
+        const desc = `${row.description ? `${String(row.description).replace(/\s+$/, '')} ` : ''}Incluye: ${p.topic}.`;
+        await qr.query(`update public.course_chapters set outcome_ids = $1::jsonb, description = $2, updated_at = now() where id = $3 and course_id = $4`, [JSON.stringify(after), desc.slice(0, 2000), row.id, courseId]);
+        const counter = await this.bumpCounter(qr, courseId);
+        const state = await loadAutofixState(qr, courseId);
+        const rec: AutofixRecord = { id: `${p.id}@${row.id}`, kind: 'content_adjustment', origin: 'cursia-autofix', batchId: randomUUID(), at: new Date().toISOString(), status: 'applied',
+          title: `«${String(row.title).slice(0, 70)}» ahora incluye «${p.topic}» (${p.outcomeId})`, reason: `Aceptaste la propuesta de Cursia: ningún capítulo trabajaba ${p.outcomeId}.`,
+          target: { chapterId: row.id, chapterTitle: row.title, outcomeIds: after }, before, after, added: after.filter((x) => !before.includes(x)), beforeDescription: row.description ?? null };
+        (rec as any).afterDescription = desc.slice(0, 2000);
+        await writeAutofixState(qr, courseId, { ...state, changes: [...state.changes, rec] });
+        return { action: 'accept_proposal' as const, accepted: p.id, applied: [rec], structureVersionCounter: counter };
+      });
+    }
+    if (p.kind === 'missing_competency') {
+      const value = String(text || p.text || '').replace(/\s+/g, ' ').trim();
+      if (value.length < 10) throw new BadRequestException('text: escribe la competencia (al menos 10 caracteres).');
+      if ((await this.currentCounter(courseId)) !== expectedCounter) throw new ConflictException({ code: 'STRUCTURE_CHANGED', message: 'STRUCTURE_CHANGED: la estructura cambió; vuelve a verla antes de corregir.' });
+      let id = 'CO1';
+      const ok = await this.editAcademic(courseId, ownerId, (ctx) => {
+        if (ctx.competencies.length) return null;
+        id = 'CO1';
+        ctx.competencies.push({ id, text: value, status: 'provided', sources: [] } as any);
+        return ctx;
+      });
+      if (!ok) throw new ConflictException({ code: 'ACADEMIC_CHANGED', message: 'ACADEMIC_CHANGED: el curso ya tiene una competencia o el contexto cambió: vuelve a verlo.' });
+      const rec: AutofixRecord = { id: `${p.id}:${id}`, kind: 'competency_added', origin: 'cursia-autofix', batchId: randomUUID(), at: new Date().toISOString(), status: 'applied',
+        title: `Competencia ${id}: «${value.slice(0, 110)}»`, reason: 'La propuso Cursia a partir del documento y la aceptaste.', target: { outcomeId: id }, before: null, after: value };
+      await this.appendAutofixRecords(courseId, [rec]);
+      return { action: 'accept_proposal' as const, accepted: p.id, applied: [rec], structureVersionCounter: await this.currentCounter(courseId) };
+    }
+    throw new BadRequestException({ code: 'USE_LINK_OUTCOME', message: 'USE_LINK_OUTCOME: esta propuesta se resuelve vinculando el resultado a un capítulo (link_outcome).' });
+  }
+
+  /** Acción en línea: el docente completa un dato del curso que falta (queda como dato suyo, no inferido). */
+  private async setContextField(courseId: number, ownerId: string, field: string, value: string | undefined) {
+    if (field === 'priorKnowledge') {
+      // r72 · «¿Qué sabe ya el estudiante?»: la respuesta del docente va a su perfil pedagógico (la misma que «Lo que
+      // entendimos» → Estudiante); la verificación deja de pedirla.
+      const v = String(value || '').trim();
+      if (!(PRIOR_KNOWLEDGE_LEVELS as readonly string[]).includes(v)) throw new BadRequestException(`value: uno de ${PRIOR_KNOWLEDGE_LEVELS.join(', ')}.`);
+      const cur = await this.profiles.getCurrent(courseId, ownerId, 'pedagogy').catch(() => null);
+      const base: any = cur ? JSON.parse(JSON.stringify(cur.profile)) : emptyPedagogicalProfile();
+      base.learner = { ...(base.learner || {}), priorKnowledge: v };
+      await this.profiles.append(courseId, ownerId, 'pedagogy', base, cur ? cur.version : 0);
+      return { action: 'context_field' as const, field, value: v };
+    }
     if (!['sector', 'pais', 'ciudad', 'tono'].includes(field)) throw new BadRequestException(`Dato desconocido: ${JSON.stringify(field)}`);
     const v = String(value || '').replace(/\s+/g, ' ').trim();
     if (!v || v.length > 255) throw new BadRequestException('value: escribe el dato (hasta 255 caracteres).');
@@ -1106,12 +1311,7 @@ async function writeAutofixState(q: Q, courseId: number, state: AutofixState): P
   );
 }
 
-/** Lo que sigue aplicado (el último registro de cada cambio es «aplicado»), en el orden en que se aplicó. */
-export function appliedRecords(state: AutofixState): AutofixRecord[] {
-  const last = new Map<string, AutofixRecord>();
-  for (const c of state.changes) { last.delete(c.id); last.set(c.id, c); }
-  return [...last.values()].filter((c) => c.status === 'applied');
-}
+export { appliedRecords };
 
 /**
  * Un dato del pedido del curso (courses.metadata.brief). `inferred` lo marca como inferido por Cursia («inferidos»);

@@ -66,9 +66,11 @@ export class DesignFixDto {
    * r71 · autofix = «Cursia optimizó tu curso» (lo que se deduce con evidencia, con su registro); autofix_undo = «Deshacer»
    * (changeIds; sin ellos, todo lo aplicado); link_outcome = el docente vincula UN resultado a UN capítulo (acción en línea
    * de la propuesta); context_field = el docente completa un dato del curso que falta (acción en línea).
+   * r72 · accept_proposal { proposalId, chapterId?, text? } = el docente acepta una propuesta de Cursia (ajuste de contenido,
+   * competencia faltante); context_field con field 'priorKnowledge' = responde «¿Qué sabe ya el estudiante?».
    */
-  @IsIn(['link_outcomes', 'cover_contents', 'autofix', 'autofix_undo', 'link_outcome', 'context_field'])
-  action: 'link_outcomes' | 'cover_contents' | 'autofix' | 'autofix_undo' | 'link_outcome' | 'context_field';
+  @IsIn(['link_outcomes', 'cover_contents', 'autofix', 'autofix_undo', 'link_outcome', 'context_field', 'accept_proposal'])
+  action: 'link_outcomes' | 'cover_contents' | 'autofix' | 'autofix_undo' | 'link_outcome' | 'context_field' | 'accept_proposal';
 
   @IsInt()
   @Min(0)
@@ -83,11 +85,17 @@ export class DesignFixDto {
   @IsOptional() @IsString() @MaxLength(40)
   chapterId?: string;
 
-  @IsOptional() @IsIn(['sector', 'pais', 'ciudad', 'tono'])
-  field?: 'sector' | 'pais' | 'ciudad' | 'tono';
+  @IsOptional() @IsIn(['sector', 'pais', 'ciudad', 'tono', 'priorKnowledge'])
+  field?: 'sector' | 'pais' | 'ciudad' | 'tono' | 'priorKnowledge';
 
   @IsOptional() @IsString() @MaxLength(255)
   value?: string;
+
+  @IsOptional() @IsString() @MaxLength(80)
+  proposalId?: string;
+
+  @IsOptional() @IsString() @MaxLength(600)
+  text?: string;
 }
 
 /** Fase 2/3 · POST /courses/:courseId/design/structure-preview — vista previa de una forma (no aplica nada). */

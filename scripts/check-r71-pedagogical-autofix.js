@@ -98,7 +98,11 @@ const applyPlan = (chapters, plan) => chapters.map((c) => { const ch = plan.chan
     eq([sector.id, sector.after, sector.before], ['context:sector', 'Educación', null], 'sector');
     assert(/Educación Básica Secundaria/.test(sector.reason), 'evidencia del sector: ' + sector.reason);
     eq(plan.proposals, [], 'sin propuestas: todo se resolvió con evidencia');
-    const again = P.planAutofix({ ctx: ctx1672, modules: modulesOf(FX), chapters: applyPlan(chapters, plan), context: { sector: 'Educación' }, hasDocument: true });
+    // r72: RA5 «Reconocer vocabulario fundamental» y RA6 «Comprender textos cortos» se precisan (texto original guardado).
+    eq(plan.changes.filter((c) => c.kind === 'outcome_wording').map((c) => c.target.outcomeId), ['RA5', 'RA6'], 'r72: redacción precisada');
+    const ctxW = clone(ctx1672);
+    for (const w of plan.changes.filter((c) => c.kind === 'outcome_wording')) ctxW.outcomes.find((o) => o.id === w.target.outcomeId).text = w.after;
+    const again = P.planAutofix({ ctx: ctxW, modules: modulesOf(FX), chapters: applyPlan(chapters, plan), context: { sector: 'Educación' }, hasDocument: true });
     eq([again.changes.length, again.proposals.length], [0, 0], 'idempotente');
   });
 
@@ -125,8 +129,12 @@ const applyPlan = (chapters, plan) => chapters.map((c) => { const ch = plan.chan
     assert(!p1.changes.some((c) => c.kind === 'competency') && !p1.proposals.some((x) => x.kind === 'competency'), 'nada de competencias');
     const noPractice = chaptersOf(FX).filter((c) => c.kind !== 'practice');
     const p2 = P.planAutofix({ ctx: ctx1672, modules: modulesOf(FX), chapters: noPractice, context: { sector: 'Educación' }, hasDocument: true });
-    eq(p2.proposals.filter((x) => x.kind === 'competency').map((x) => [x.id, x.chapterId]), [['competency:CO1', null]], 'propuesta, sin vínculo forzado');
-    assert(!p2.changes.some((c) => c.kind === 'competency'), 'ningún cambio de competencias');
+    // r72 (cambio intencional, caso producción #87): sin prácticas, CO1 —la única competencia, agrupa todos los RA— se
+    // AGREGA al capítulo de cada módulo que más resultados integra (nunca quita vínculos); ya no queda como propuesta.
+    eq(p2.proposals.filter((x) => x.kind === 'competency'), [], 'sin propuesta');
+    const coCh = p2.changes.filter((c) => c.kind === 'competency');
+    eq(coCh.length, 4, 'un capítulo por módulo');
+    for (const c of coCh) { assert(c.after.includes('CO1'), 'CO1'); for (const id of c.before) assert(c.after.includes(id), 'no quita'); }
   });
 
   await check('AF4 resultado sin capítulo plausible → propuesta (no un cambio); sin capítulo libre → «Vincular a…»', async () => {
@@ -135,14 +143,16 @@ const applyPlan = (chapters, plan) => chapters.map((c) => { const ch = plan.chan
     const plan = P.planAutofix({ ctx, modules: modulesOf(FX), chapters: chaptersOf(FX), context: { sector: 'Educación' }, hasDocument: true });
     assert(!plan.changes.some((c) => (c.after || []).includes && c.after.includes('RA10')), 'RA10 no se vincula solo');
     const pr = plan.proposals.find((x) => x.outcomeId === 'RA10');
-    assert(pr && pr.kind === 'uncovered_outcome' && /agrega un capítulo/.test(pr.detail), 'propuesta: ' + JSON.stringify(pr));
-    eq(pr.chapterId, null, 'sin capítulo plausible');
-    // Módulo plausible pero sin capítulos libres: propuesta con el capítulo del módulo (el docente decide).
+    // r72: sin relación, la propuesta es un ajuste de CONTENIDO (agregar el tema a un capítulo, un clic), nunca un vínculo.
+    assert(pr && pr.kind === 'content_adjustment' && pr.topic === 'Inventarios de bodega con hojas de cálculo' && pr.chapterId, 'propuesta: ' + JSON.stringify(pr));
+    // r72 (cambio intencional, caso producción #87): módulo plausible pero sin capítulos libres → RA1 es transversal y se
+    // AGREGA a los capítulos con relación justificada, sin quitar sus vínculos.
     const full = chaptersOf(FX).map((c) => (c.kind === 'content' && !c.outcomeIds.length ? { ...c, outcomeIds: ['RA2'] } : c));
     const p2 = P.planAutofix({ ctx: ctx1672, modules: modulesOf(FX), chapters: full, context: { sector: 'Educación' }, hasDocument: true });
-    const ra1 = p2.proposals.find((x) => x.outcomeId === 'RA1');
-    assert(ra1 && ra1.chapterTitle === 'Integración de vocabulario, comprensión de textos, diálogos', 'propuesta «Vincular a…»: ' + JSON.stringify(ra1));
-    assert(!p2.changes.some((c) => c.kind === 'cover_outcome'), 'sin cambio');
+    const add = p2.changes.filter((c) => c.kind === 'cover_outcome' && c.id.startsWith('cover:RA1@'));
+    assert(add.length >= 1 && add.every((c) => c.before.every((x) => c.after.includes(x)) && c.added.join() === 'RA1'), 'RA1 agregado: ' + JSON.stringify(add.map((c) => [c.target.chapterTitle, c.before, c.after])));
+    assert(add.some((c) => c.target.chapterTitle === 'Integración de vocabulario, comprensión de textos, diálogos'), 'al capítulo de «Let’s Communicate!»');
+    assert(!p2.proposals.some((x) => x.outcomeId === 'RA1'), 'sin propuesta');
   });
 
   await check('AF5 lo del docente manda: vínculos, desvinculados a propósito, sector escrito y lo deshecho', async () => {
@@ -405,7 +415,7 @@ async function dbChecks(ctx1672) {
       const fx = await design.fix(c.id, OWNER, 'autofix', c0);
       FE.autofixResponse = fx;
       FE.optimized = await prebrief.state(c.id, OWNER);
-      assert(fx.batchId && fx.applied.length === 20, 'aplicó 20 mejoras: ' + fx.applied.length);
+      assert(fx.batchId && fx.applied.length === 22, 'aplicó 22 mejoras (r72: + RA5/RA6 precisados): ' + fx.applied.length);
       eq(fx.structureVersionCounter, c0 + 1, 'el contador sube una vez');
       const after = await prebrief.draft(c.id, OWNER);
       eq(codes(after.readiness), [], 'sin bloqueos: ' + JSON.stringify(after.readiness.blockers.map((b) => b.title)));
@@ -420,7 +430,7 @@ async function dbChecks(ctx1672) {
       eq([facts.sector.value, facts.sector.source], ['Educación', 'inferred'], '«Lo que entendimos»: inferido');
       const card = await design.recommend(c.id, OWNER, {});
       eq(card.verification.counts.critical, 0, 'verificación sin críticos');
-      eq(card.autofix.applied.length, 20, 'el resumen «Cursia optimizó tu curso» viene del servidor');
+      eq(card.autofix.applied.length, 22, 'el resumen «Cursia optimizó tu curso» viene del servidor');
       assert(card.verification.counts.warning < 16, `menos advertencias que en staging (16): ${card.verification.counts.warning}`);
       const st = await prebrief.state(c.id, OWNER);
       const prep = await prebrief.prepare(c.id, OWNER, { id: OWNER, email: 'qa@example.test' }, st.draft.modelSha256);
@@ -471,7 +481,7 @@ async function dbChecks(ctx1672) {
       await design.fix(c.id, OWNER, 'autofix', c0);
       const c1 = await counter(c.id);
       const u = await design.fix(c.id, OWNER, 'autofix_undo', c1);
-      eq([u.reverted.length, u.changed.length, u.structureVersionCounter], [20, 0, c1 + 1], 'todo deshecho, una subida del contador');
+      eq([u.reverted.length, u.changed.length, u.structureVersionCounter], [22, 0, c1 + 1], 'todo deshecho, una subida del contador');
       eq(await links(c.id), l0, 'vínculos originales');
       eq(await brief(c.id), b0, 'pedido original (sin sector)');
       const d = await prebrief.draft(c.id, OWNER);

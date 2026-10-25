@@ -287,7 +287,7 @@ export class PrebriefService {
         model: draft.model, modelSha256: draft.modelSha256, document: draft.document, documentSha256: draft.documentSha256,
         readiness: draft.readiness, verification: draft.verification,
         // r71 · «Cursia optimizó tu curso»: lo aplicado (con «Deshacer») y lo que Cursia propone y decide el docente.
-        autofix: draft.card && draft.card.autofix ? { pending: draft.card.autofix.pending, applied: draft.card.autofix.applied, proposals: draft.card.autofix.proposals } : null,
+        autofix: draft.card && draft.card.autofix ? { pending: draft.card.autofix.pending, applied: draft.card.autofix.applied, proposals: draft.card.autofix.proposals, questions: draft.card.autofix.questions || [], chapters: draft.card.autofix.chapters, designApply: draft.card.autofix.designApply || null } : null,
         stateTexts: approvalStateTexts({ status: 'draft', version: null, date: null, fingerprint: draft.modelSha256, approval: null }),
         matchesLatest: !!latest && latest.model_sha256 === draft.modelSha256,
         diffFromLatest: latest && latest.model_sha256 !== draft.modelSha256 ? diffModels(latest.model_json, draft.model) : [],
