@@ -4,10 +4,12 @@ import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { loadCourseFacts } from './course-facts-db';
 import {
   BRIEF_KEY,
-  BRIEF_VERSION,
+  BriefConflict,
   CourseBrief,
   CourseFacts,
-  normalizeBriefFields,
+  briefForClient,
+  briefPatchFromBody,
+  mergeBrief,
   parseBrief,
 } from './course-facts';
 import { PutBriefDto } from './dto/put-brief.dto';
@@ -37,33 +39,39 @@ export class CourseFactsService {
 
   async getBrief(courseId: number, ownerId: string): Promise<{ brief: CourseBrief | null }> {
     const row = await this.courseRow(this.dataSource, courseId, ownerId);
-    return { brief: parseBrief(row.metadata ? row.metadata[BRIEF_KEY] : null) };
+    return { brief: briefForClient(parseBrief(row.metadata ? row.metadata[BRIEF_KEY] : null)) };
   }
 
-  async putBrief(courseId: number, ownerId: string, dto: PutBriefDto): Promise<{ brief: CourseBrief; changed: boolean }> {
+  /**
+   * r73 UX-10: guarda un PARCHE por campo (mergeBrief): nunca reemplaza el pedido completo, nunca borra un dato que no
+   * venga en `clear`, y un dato que el servidor cambió después de `baseRevision` se queda (vuelve en `conflicts`).
+   */
+  async putBrief(courseId: number, ownerId: string, dto: PutBriefDto): Promise<{ brief: CourseBrief; changed: boolean; conflicts: BriefConflict[] }> {
     assertDynamicOwnerAllowed(ownerId);
+    let patch;
+    try { patch = briefPatchFromBody(dto as unknown as Record<string, unknown>); } catch (err: any) { throw new BadRequestException(String(err && err.message)); }
     const qr = this.dataSource.createQueryRunner();
     try {
       await qr.connect();
       await qr.startTransaction();
       const row = await this.courseRow(qr, courseId, ownerId, true);
       const prev = parseBrief(row.metadata ? row.metadata[BRIEF_KEY] : null);
-      if (dto.expectedUpdatedAt !== undefined && prev && prev.updatedAt !== dto.expectedUpdatedAt) {
+      // Formato anterior (sin baseRevision): la pestaña vieja sigue recibiendo 409 como en 8.1.
+      if (patch.baseRevision === null && dto.expectedUpdatedAt !== undefined && prev && prev.updatedAt !== dto.expectedUpdatedAt) {
         await qr.rollbackTransaction();
-        throw new ConflictException({ code: 'BRIEF_CHANGED', brief: prev, message: 'BRIEF_CHANGED: el pedido del curso cambió en otra pestaña o equipo; vuelve a leerlo antes de guardar.' });
+        throw new ConflictException({ code: 'BRIEF_CHANGED', brief: briefForClient(prev), message: 'BRIEF_CHANGED: el pedido del curso cambió en otra pestaña o equipo; vuelve a leerlo antes de guardar.' });
       }
-      const fields = normalizeBriefFields(dto as Record<string, unknown>);
-      if (prev && JSON.stringify(prev.fields) === JSON.stringify(fields)) {
+      const res = mergeBrief(prev, patch, new Date().toISOString());
+      if (!res.changed) {
         await qr.rollbackTransaction();
-        return { brief: prev, changed: false };
+        return { brief: briefForClient(res.brief) as CourseBrief, changed: false, conflicts: res.conflicts };
       }
-      const brief: CourseBrief = { briefVersion: BRIEF_VERSION, fields, updatedAt: new Date().toISOString() };
       await qr.query(
         `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
-        [courseId, [BRIEF_KEY], JSON.stringify(brief)],
+        [courseId, [BRIEF_KEY], JSON.stringify(res.brief)],
       );
       await qr.commitTransaction();
-      return { brief, changed: true };
+      return { brief: briefForClient(res.brief) as CourseBrief, changed: true, conflicts: res.conflicts };
     } catch (err) {
       if (qr.isTransactionActive) await qr.rollbackTransaction();
       throw err;
