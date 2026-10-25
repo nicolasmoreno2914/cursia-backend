@@ -172,7 +172,8 @@ export class PedagogyService {
         activityTypeRules: atr,
         applyStructureAdjustments: body.applyStructureAdjustments,
         // Fase 4: dato del contexto que no vive en el Blueprint (sugerencia P2 del Coherence Engine).
-        alignment: { priorKnowledgeDeclared: academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },
+        // r72: también cuenta lo que respondió el docente (perfil pedagógico → estudiante → «Lo que ya sabe»).
+        alignment: { priorKnowledgeDeclared: (profile && (profile as any).learner && (profile as any).learner.priorKnowledge) ? true : academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },
         // LOOP 8.3: lo que el docente fijó a mano (el mismo mapa que usa «Aplicar diseño»: misma propuesta, misma huella).
         designPins,
         requirementConstraints,

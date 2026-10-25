@@ -1,3 +1,4 @@
+import { observableLevelOf } from '../academic-context/bloom';
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { GenerationManifestV1, ManifestItem } from '../generation-manifests/generation-manifest-builder';
 import { itemOutcomeIds } from '../academic-context/alignment-brief';
@@ -242,8 +243,10 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
 
   const outcomes = new Map<string, OutcomeAlignment>();
   for (const o of ctx.outcomes) {
-    const performance = isPerformanceLevel(o.level as any);
-    outcomes.set(o.id, { id: o.id, text: o.text, level: o.level, domain: o.domain, performance, complex: o.level === 'analyze' || o.level === 'evaluate' || o.level === 'create', chapterIds: [], evidence: [], minutes: { instruction: 0, check: 0, practice: 0, application: 0, assessmentItems: 0 }, status: 'uncovered' });
+    // r72: un nivel guardado como null (léxico anterior, p. ej. «Presentarse…», «Comunicarse…») se vuelve a leer del texto.
+    const level = o.level ?? observableLevelOf(o.text);
+    const performance = isPerformanceLevel(level as any);
+    outcomes.set(o.id, { id: o.id, text: o.text, level, domain: o.domain, performance, complex: level === 'analyze' || level === 'evaluate' || level === 'create', chapterIds: [], evidence: [], minutes: { instruction: 0, check: 0, practice: 0, application: 0, assessmentItems: 0 }, status: 'uncovered' });
   }
   for (const c of ctx.competencies) {
     outcomes.set(c.id, { id: c.id, text: c.text, level: null, domain: 'competency', performance: true, complex: true, chapterIds: [], evidence: [], minutes: { instruction: 0, check: 0, practice: 0, application: 0, assessmentItems: 0 }, status: 'uncovered' });
