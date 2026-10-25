@@ -129,6 +129,7 @@ const ENV_KEYS = [
   const { VideogenReconciliationService } = L('modules/dynamic-generation/videogen-reconciliation.service.js');
   const { PilotMetricsService } = L('modules/dynamic-generation/pilot-metrics.service.js');
   const { LlmDiagnosticsService } = L('modules/dynamic-generation/llm-diagnostics.service.js');
+  const { SchedulerQueueMetricsService } = L('modules/dynamic-generation/scheduler-queue-metrics.js');
   const FWH = L('workers/finops-worker-hooks.js');
   const { FeaturesController } = L('modules/features/features.controller.js');
   const { ArtifactsService } = L('modules/artifacts/artifacts.service.js');
@@ -1153,7 +1154,7 @@ const ENV_KEYS = [
     const jwt = require('jsonwebtoken');
     const moduleRef = await Test.createTestingModule({
       controllers: [AdminDynamicRunsController, FeaturesController],
-      providers: [{ provide: AdminRecoveryService, useValue: recovery }, { provide: VideogenReconciliationService, useValue: new VideogenReconciliationService(ds, ledger) }, { provide: PilotMetricsService, useValue: new PilotMetricsService(ds) }, { provide: LlmDiagnosticsService, useValue: {} }],
+      providers: [{ provide: AdminRecoveryService, useValue: recovery }, { provide: VideogenReconciliationService, useValue: new VideogenReconciliationService(ds, ledger) }, { provide: PilotMetricsService, useValue: new PilotMetricsService(ds) }, { provide: LlmDiagnosticsService, useValue: {} }, { provide: SchedulerQueueMetricsService, useValue: {} }],
     }).compile();
     app = moduleRef.createNestApplication({ logger: false });
     app.useGlobalFilters(new AllExceptionsFilter());

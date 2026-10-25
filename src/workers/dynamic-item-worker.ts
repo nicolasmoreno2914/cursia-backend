@@ -73,6 +73,7 @@ import {
   videogenChargeInput,
 } from './finops-worker-hooks';
 import { MOCK_VIDEO_DURATION_SEC, VideoDuration, parseMp4DurationSec, plausibleSeconds, resolveVideoDuration } from './video-duration';
+import { logFairSchedulingConfig } from '../modules/dynamic-generation/fair-scheduling';
 import { adoptLateExternalId, IN_FLIGHT_WINDOW_MS, inFlightRemainingMs, priorAttemptMayBeInFlight, priorCallInFlightMessage, retryAfterSecondsFor } from './lease-takeover';
 import {
   DRAIN_HANDBACK_RETRY_SECONDS,
@@ -2166,6 +2167,8 @@ async function bootstrap() {
   };
   const pollMs = readPositiveInt('DYNAMIC_ITEM_WORKER_POLL_MS', 5000);
   const concurrency = readPositiveInt('DYNAMIC_ITEM_WORKER_CONCURRENCY', 1);
+  // r63 (H5): configuración del reparto del scheduler y su huella (debe coincidir con la de la API).
+  logFairSchedulingConfig(logger, 'dynamic-item-worker');
 
   // R16 (#1 + #15): drenado ordenado con SIGINT/SIGTERM (deja de reclamar, los items en vuelo terminan o se
   // devuelven en un punto seguro, tope DYNAMIC_WORKER_DRAIN_TIMEOUT_MS) y un error de claim nunca tumba el proceso.

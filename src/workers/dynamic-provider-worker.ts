@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import type { AudioTools } from '../tts/audio-retime';
 import { llmWorkerEnabled } from '../modules/dynamic-generation/llm-worker-routing';
+import { logFairSchedulingConfig } from '../modules/dynamic-generation/fair-scheduling';
 import { llmWorkerStartConfig, runLlmWorkerLoop } from './dynamic-llm-worker';
 import { createHash } from 'crypto';
 import { Logger } from '@nestjs/common';
@@ -286,6 +287,23 @@ export async function runProviderOnce(deps: ProviderWorkerDeps): Promise<'claime
   return 'claimed';
 }
 
+export const PROVIDER_WORKER_CONCURRENCY_ENV = 'DYNAMIC_PROVIDER_WORKER_CONCURRENCY';
+/** r63 (SC): tope duro de partes de proveedor en paralelo en UN proceso (cada una comparte la conexión del pool). */
+export const PROVIDER_WORKER_MAX_CONCURRENCY = 4;
+/**
+ * r63 (SC): partes de proveedor (Gamma/TTS) en paralelo en este proceso. Sin definir → 1 (el serial de siempre). Un
+ * valor inválido es un error de configuración: lanza al arrancar (nunca arranca con otra concurrencia en silencio).
+ */
+export function providerWorkerConcurrency(env: Record<string, string | undefined> = process.env): number {
+  const raw = String(env[PROVIDER_WORKER_CONCURRENCY_ENV] ?? '').trim();
+  if (!raw) return 1;
+  const n = /^\d+$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isInteger(n) || n < 1 || n > PROVIDER_WORKER_MAX_CONCURRENCY) {
+    throw new Error(`${PROVIDER_WORKER_CONCURRENCY_ENV} inválido: "${raw}" (entero 1..${PROVIDER_WORKER_MAX_CONCURRENCY}, o sin definir = 1)`);
+  }
+  return n;
+}
+
 /** Lease mínima del worker de proveedores: > timeout de una llamada (120 s) + margen. */
 export const PROVIDER_WORKER_MIN_LEASE_SECONDS = 300;
 
@@ -328,8 +346,11 @@ async function bootstrap() {
   installDrainHandlers({ name: 'dynamic-provider-worker', logger, drain, active: unionOfActive(active, llmActive), close: () => app.close() });
   logger.log(
     `dynamic-provider-worker iniciado (executorId=${deps.executorId}, pollMs=${pollMs}, tipos=${PROVIDER_WORKER_TYPES.join(',')}, ` +
-      `drainTimeoutMs=${drainTimeoutMs()}, ttsTimeoutMs=${ttsTimeoutMs(process.env).ms} (${ttsTimeoutMs(process.env).source}))`,
+      `drainTimeoutMs=${drainTimeoutMs()}, ttsTimeoutMs=${ttsTimeoutMs(process.env).ms} (${ttsTimeoutMs(process.env).source}), ` +
+      `concurrency=${providerWorkerConcurrency()})`,
   );
+  // r63 (H5): configuración del reparto del scheduler y su huella (debe coincidir con la de la API).
+  logFairSchedulingConfig(logger, 'dynamic-provider-worker');
   // Loop 6: el worker de IA puede correr HOSPEDADO en este proceso (sin un 12.º proceso ni otra conexión al pooler).
   // Solo arranca con flag + instante de activación + API key; si no, el navegador sigue generando las partes largas.
   let llmLoop: Promise<void> = Promise.resolve();
@@ -344,11 +365,12 @@ async function bootstrap() {
     }
     else logger.error(`worker de IA hospedado NO arranca: ${llmCfg.reason}`);
   }
-  // Serial (concurrency 1), como antes.
+  // Serial (concurrency 1) por defecto, como antes. r63 (SC): DYNAMIC_PROVIDER_WORKER_CONCURRENCY lo sube (tope
+  // PROVIDER_WORKER_MAX_CONCURRENCY); los topes por proveedor (DYNAMIC_SCHEDULER_PROVIDER_CAPS) se aplican en el claim.
   const providerLoop = runClaimLoop<ClaimedItem>({
     name: 'dynamic-provider-worker',
     logger,
-    concurrency: 1,
+    concurrency: providerWorkerConcurrency(),
     pollMs,
     drain,
     active,
