@@ -36,7 +36,7 @@ import { COURSE_FORMATS, COURSE_FORMAT_CODES, CourseFormatCode, formatDef, forma
 import { randomUUID } from 'crypto';
 import { withRequestReadCache } from '../../common/db/request-read-cache';
 import { profileOutcomesBlockedBy } from '../academic-context/profile-outcomes-db';
-import { BRIEF_KEY, BRIEF_VERSION, normalizeBriefFields, parseBrief } from '../course-facts/course-facts';
+import { BRIEF_KEY, BRIEF_VALUE_FIELDS, BriefValueField, mergeBrief, parseBrief } from '../course-facts/course-facts';
 import { sortOutcomeIds } from '../academic-context/blueprint-academic';
 import {
   AUTOFIX_KEY, AutofixChange, CourseQuestion, AutofixChapter, AutofixInput, AutofixPlan, AutofixRecord, AutofixState, IMPROVED_OUTCOME_BASIS, addedLinks, appliedRecords, declinedKeys,
@@ -1311,7 +1311,7 @@ async function writeAutofixState(q: Q, courseId: number, state: AutofixState): P
   );
 }
 
-export { appliedRecords };
+export { appliedRecords, writeBriefField };
 
 /**
  * Un dato del pedido del curso (courses.metadata.brief). `inferred` lo marca como inferido por Cursia («inferidos»);
@@ -1323,14 +1323,19 @@ async function writeBriefField(q: Q, courseId: number, field: string, value: str
   const fields: Record<string, string> = { ...((prev ? prev.fields : {}) as Record<string, string>) };
   if (opts.onlyIfEmpty && fields[field]) return false;
   if (opts.onlyIfValue !== undefined && fields[field] !== opts.onlyIfValue) return false;
-  const inferred = new Set(String(fields.inferidos || '').split(',').map((x) => x.trim()).filter(Boolean));
-  if (value) fields[field] = value; else delete fields[field];
-  if (opts.inferred && value) inferred.add(field); else inferred.delete(field);
-  if (inferred.size) fields.inferidos = [...inferred].join(','); else delete fields.inferidos;
-  const brief = { briefVersion: BRIEF_VERSION, fields: normalizeBriefFields(fields), updatedAt: new Date().toISOString() };
+  if (!(BRIEF_VALUE_FIELDS as string[]).includes(field)) return false;
+  const k = field as BriefValueField;
+  const t = value ? value.replace(/\s+/g, ' ').trim() : '';
+  // r73 UX-10: mismo merge por campo que PUT /brief (sube revision y fieldRev[campo]: un cliente con una base vieja
+  // ve el conflicto en vez de pisar este dato).
+  const res = mergeBrief(prev, {
+    baseRevision: null, set: t ? { [k]: t } : {}, clear: t ? [] : [k],
+    inferredAdd: opts.inferred && t ? [k] : [], inferredRemove: opts.inferred && t ? [] : [k], legacyInferidos: null,
+  }, new Date().toISOString());
+  if (!res.changed) return true;
   await q.query(
     `update public.courses set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), $2::text[], $3::jsonb, true) where id = $1`,
-    [courseId, [BRIEF_KEY], JSON.stringify(brief)],
+    [courseId, [BRIEF_KEY], JSON.stringify(res.brief)],
   );
   return true;
 }
