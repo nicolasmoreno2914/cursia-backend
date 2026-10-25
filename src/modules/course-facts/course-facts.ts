@@ -13,6 +13,7 @@ import { createHash } from 'crypto';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { ASSESSMENT_METHODS } from '../pedagogy/vocabulary';
+import { classifyEducation, STAGE_LEVEL, stageOfContexto, type EducationProfile } from './education-level';
 
 // ── Pedido del curso (brief) ──────────────────────────────────────────────────────────────────────────────
 
@@ -53,14 +54,14 @@ export function parseBrief(v: unknown): CourseBrief | null {
 
 // Valores de la pantalla Datos (chips) → vocabulario del motor pedagógico.
 const strip = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-/** «Universitario — estudiantes de pregrado…» → 'university'. Desconocido / «Otro» → null. */
-export function educationLevelFromBrief(contexto: string | undefined): 'secondary' | 'technical' | 'university' | 'professional' | null {
-  const s = strip(String(contexto || '')).trim();
-  if (/^bachillerato/.test(s)) return 'secondary';
-  if (/^tecnico/.test(s)) return 'technical';
-  if (/^(universitario|posgrado)/.test(s)) return 'university';
-  if (/^corporativo/.test(s)) return 'professional';
-  return null;
+/**
+ * «Universitario — estudiantes de pregrado…» → 'university'. Desconocido / «Otro» → null.
+ * r73 (UX-9): también los textos por etapa («Educación Básica Primaria/Secundaria», «Educación Media», «Tecnólogo»…) y
+ * un «Otro» que nombra el nivel («estudiantes de grado 6»).
+ */
+export function educationLevelFromBrief(contexto: string | undefined): 'basic' | 'secondary' | 'technical' | 'university' | 'professional' | null {
+  const st = stageOfContexto(contexto);
+  return st ? STAGE_LEVEL[st] : null;
 }
 /** «Básico — sin conocimientos previos» → 'none'; «Intermedio…» → 'intermediate'; «Avanzado…» → 'advanced'. */
 export function priorKnowledgeFromBrief(nivel: string | undefined): 'none' | 'intermediate' | 'advanced' | null {
@@ -277,6 +278,11 @@ export interface CourseFacts {
   };
   institutionId: string | null;
   conflicts: FactConflict[];
+  /**
+   * r73 (UX-9): nivel educativo que dice el curso (documento o nombre: grado, edades, etapa) y su coherencia con el
+   * contexto del pedido: corregir (si lo puso Cursia), avisar (si lo eligió el docente) o preguntar (sin señales).
+   */
+  educationProfile: EducationProfile;
 }
 
 export interface FactsInput {
@@ -422,9 +428,23 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const docLevel = ctx ? found(ctx.identity.educationLevel) : null;
   const briefLevel = educationLevelFromBrief(b.contexto);
   const pedLevel = ped && ped.learner ? ped.learner.educationLevel : null;
+  // r73 (UX-9): la etapa que dice el curso (documento: grado, «Educación Básica Secundaria»…; o el nombre: «Grado Sexto»).
+  const educationProfile = classifyEducation({
+    brief: b as any, academic: ctx, courseTitle: input.courseTitle,
+    userProfileLevel: owners.educationLevel === 'user' ? pedLevel : null,
+  });
+  const det = educationProfile.detected;
   const educationLevel = owners.educationLevel === 'user'
     ? fact<string>(pedLevel, 'profile')
-    : first<string>(fact(docLevel && docLevel.level, 'document'), fact(pedLevel, 'profile'), fact(briefLevel, briefSource('contexto')));
+    : first<string>(
+      fact(docLevel && docLevel.level, 'document'),
+      fact(det && det.source === 'document' ? det.level : null, 'document'),
+      fact(pedLevel, 'profile'),
+      // Lo que eligió el usuario manda sobre el nombre; el nombre, sobre el valor de partida (inferido).
+      fact(briefSource('contexto') === 'user' ? briefLevel : null, 'user'),
+      fact(det && det.source === 'name' ? det.level : null, 'inferred'),
+      fact(briefLevel, briefSource('contexto')),
+    );
   // LOOP 9 (P1-4): un nivel que el usuario no eligió (el valor de partida de «Crear», marcado como inferido) no choca con el
   // documento: el documento manda sin preguntar.
   if (owners.educationLevel !== 'user' && briefSource('contexto') === 'user' && docLevel && docLevel.level && briefLevel && docLevel.level !== briefLevel) {
@@ -510,6 +530,7 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     },
     institutionId: input.institutionId,
     conflicts,
+    educationProfile,
   };
 }
 
@@ -530,8 +551,7 @@ const PRIOR_TEXT: Readonly<Record<string, string>> = Object.freeze({
 });
 /** Texto del contexto educativo → nivel (mismo vocabulario que LEVEL_TEXT, ida y vuelta sin pérdida). */
 export function contextLevelOf(contexto: string | undefined): string | null {
-  const s = strip(String(contexto || '')).trim();
-  if (/^educacion basica/.test(s)) return 'basic';
+  // r73: «Educación Básica Secundaria — …» es secundaria (antes caía en 'basic' por el prefijo «educación básica»).
   return educationLevelFromBrief(contexto);
 }
 /** Texto del nivel de conocimiento → previos (ida y vuelta sin pérdida con PRIOR_TEXT). */
