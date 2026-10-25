@@ -43,7 +43,9 @@ export interface PrebriefBlocker {
    * r71 · Acción en línea (sin ir a otra pantalla): vincular el resultado al capítulo que propone Cursia (el docente puede
    * elegir otro), o completar un dato del curso con la sugerencia de Cursia.
    */
-  inline?: { kind: 'link_outcome'; outcomeId: string; chapterId: string | null; chapterTitle: string | null };
+  inline?: { kind: 'link_outcome'; outcomeId: string; chapterId: string | null; chapterTitle: string | null }
+    /** r72 · los cambios del diseño recomendado se aplican desde la propuesta (misma huella que «Usar este diseño»). */
+    | { kind: 'apply_design'; proposalSha256: string; total: number; summary: string[]; profileChanged: boolean };
   /** r71: datos del curso que faltan (context_incomplete), con la sugerencia de Cursia si la hay y si se completan aquí. */
   fields?: { key: string; label: string; editable: boolean; suggestion: string | null }[];
 }
@@ -71,12 +73,16 @@ export interface PrebriefReadiness {
  * r71 · Cada bloqueo que Cursia no resuelve sola trae su acción en línea (nunca un callejón sin salida): el resultado sin
  * capítulo, «Vincular a <capítulo que propone Cursia>»; el dato que falta, su campo con la sugerencia de Cursia.
  */
-export function withInlineActions(r: PrebriefReadiness, autofix: { pending: number; suggestions: Record<string, { chapterId: string; chapterTitle: string } | null>; chapters: { id: string; title: string; moduleTitle: string }[]; contextSuggestions: { sector: string | null } } | null | undefined): PrebriefReadiness {
+export function withInlineActions(r: PrebriefReadiness, autofix: { pending: number; suggestions: Record<string, { chapterId: string; chapterTitle: string } | null>; chapters: { id: string; title: string; moduleTitle: string }[]; contextSuggestions: { sector: string | null }; designApply?: { proposalSha256: string; total: number; summary: string[]; profileChanged: boolean } | null } | null | undefined): PrebriefReadiness {
   if (!autofix) return r;
   const blockers = r.blockers.map((b) => {
     if (b.code === 'critical' && b.outcomeIds && b.outcomeIds.length === 1 && /^alignment:/.test(String(b.ref || ''))) {
       const sug = autofix.suggestions[b.outcomeIds[0]];
       return { ...b, inline: { kind: 'link_outcome' as const, outcomeId: b.outcomeIds[0], chapterId: sug ? sug.chapterId : null, chapterTitle: sug ? sug.chapterTitle : null } };
+    }
+    if (b.code === 'pending_changes' && autofix.designApply) {
+      const d = autofix.designApply;
+      return { ...b, inline: { kind: 'apply_design' as const, proposalSha256: d.proposalSha256, total: d.total, summary: d.summary, profileChanged: d.profileChanged } };
     }
     if (b.code === 'context_incomplete' && b.fields) {
       return { ...b, fields: b.fields.map((f) => ({ ...f, suggestion: f.key === 'sector' ? autofix.contextSuggestions.sector : f.suggestion })) };

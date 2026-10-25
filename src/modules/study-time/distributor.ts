@@ -417,6 +417,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // horas y el resto del diseño compensa). Lo fijado por el docente manda; la práctica nunca lleva video.
   const initialVideo = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.videoEnabled] as const)));
   const initialActivity = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.activityEnabled] as const)));
+  /** r72 · Capítulo de profundización que creó Cursia (propuesto o ya aplicado, con el título que le puso Cursia). */
+  const isCursiaDeepening = (c: { proposed?: boolean; kind: string; title: string }) => c.kind === 'content' && (!!c.proposed || /^Profundizaci[oó]n \d+: /.test(String(c.title || '')));
   const avFor = (contentIndex: number, contentCount: number, proposedDeepening: boolean): boolean => {
     if (av === 'more') return true;
     if (proposedDeepening) return false;
@@ -431,7 +433,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
       const content = m.chapters.filter((c) => c.kind === 'content');
       content.forEach((c, i) => {
         const pin = pinnedVideo(c.id);
-        c.videoEnabled = pin !== undefined ? pin : avFor(i, content.length, false);
+        c.videoEnabled = pin !== undefined ? pin : avFor(i, content.length, isCursiaDeepening(c));
       });
       for (const c of m.chapters) if (c.kind === 'practice') c.videoEnabled = false;
     }
@@ -588,7 +590,9 @@ function distributeCore(input: DistributorInput): DistributionResult {
         content.forEach((c, i) => {
           if (pinnedVideo(c.id) !== undefined) return;
           // La profundización que propone Cursia sigue la regla de 8.3 (sin video con «Recomendado»).
-          const v = reqVideo !== null ? reqVideo : avFor(i, content.length, !!c.proposed);
+          // r72: también la que ya se aplicó (sigue llamándose «Profundización N: <módulo>»): antes, al aplicarla dejaba de ser
+          // «propuesta», la regla le ponía video y la siguiente pasada recomendaba otros ~30 cambios (#87: 36 → 31 → 0).
+          const v = reqVideo !== null ? reqVideo : avFor(i, content.length, !!c.proposed || isCursiaDeepening(c));
           if (c.videoEnabled !== v) { c.videoEnabled = v; changed = true; }
         });
       }

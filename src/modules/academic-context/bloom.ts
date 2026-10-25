@@ -69,3 +69,27 @@ export function isPerformanceLevel(level: BloomLevel | null): boolean {
 export function bloomRank(level: BloomLevel | null): number {
   return level === null ? -1 : ORDER.indexOf(level);
 }
+
+/**
+ * r72 · Verbos observables de desempeño comunicativo (idiomas, expresión oral y escrita) que el léxico de Bloom no trae.
+ * Solo para reconocer que un resultado SÍ empieza con un verbo observable (regla A7 de la alineación): no cambia el nivel
+ * que la extracción guarda ni la clasificación de capítulos (las huellas de los diseños existentes no cambian).
+ */
+const OBSERVABLE_EXTRA: ReadonlyMap<string, BloomLevel> = new Map<string, BloomLevel>(
+  ['presentar', 'comunicar', 'expresar', 'desenvolver', 'interactuar', 'participar', 'dialogar', 'conversar', 'escribir', 'leer', 'hablar', 'escuchar', 'pronunciar', 'responder', 'preguntar', 'narrar', 'exponer']
+    .map((v) => [v, 'apply' as BloomLevel]),
+);
+/** Forma pronominal o con enclítico («presentarse», «comunicarse», «expresarlo») → el infinitivo (nunca «clase», «base»). */
+function withoutEnclitic(w: string): string {
+  const m = w.match(/^(.+?(?:ar|er|ir))(?:se|me|te|nos|os|lo|la|le|los|las|les)$/);
+  return m ? m[1] : w;
+}
+/** Nivel de un resultado para la alineación: el de Bloom; si no, el del verbo inicial sin enclítico o comunicativo. */
+export function observableLevelOf(text: string): BloomLevel | null {
+  const direct = bloomLevelOf(text);
+  if (direct) return direct;
+  const t = strip(String(text || '')).replace(/^[\s¿¡"«(\-–—•*]+/, '').replace(LEAD_RE, '');
+  const first = t.split(/[^a-zñ]+/).filter(Boolean)[0] || '';
+  const base = withoutEnclitic(first);
+  return FORMS.get(base) || OBSERVABLE_EXTRA.get(base) || OBSERVABLE_EXTRA.get(first) || null;
+}

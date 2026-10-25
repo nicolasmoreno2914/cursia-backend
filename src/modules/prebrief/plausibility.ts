@@ -57,6 +57,22 @@ export function confirmKeyOf(kind: DoubtKind, text: string): string {
 
 const words = (t: string) => (String(t || '').match(/[\p{L}\p{N}]+/gu) || []).length;
 
+/** r72 · Termina en un artículo, preposición o conjunción: el texto se cortó («Identificar los tipos de»). */
+const TRAILING_CONNECTOR_RE = /(^|\s)(de|del|la|el|los|las|lo|y|e|o|u|en|para|con|a|al|que|un|una|por|sus|su|se|sobre|entre|como)\s*[.;:,]?\s*$/iu;
+const SHORT_STOP = new Set(['el', 'la', 'los', 'las', 'lo', 'un', 'una', 'de', 'del', 'y', 'o', 'en', 'a', 'al', 'con', 'para', 'por', 'que', 'su', 'sus', 'se']);
+/**
+ * r72 · Un enunciado corto pero COMPLETO: verbo en infinitivo + al menos un término («Reconocer vocabulario fundamental»,
+ * «Comprender textos cortos»). Tiene intención académica clara: no es un fragmento (antes se pedía confirmarlo como si
+ * el documento estuviera cortado). Que le falte contexto se resuelve precisándolo (autocorrección), no como duda.
+ */
+export function isCompleteShortStatement(t: string): boolean {
+  const ws = String(t || '').replace(/[.;:]+\s*$/, '').split(/\s+/).filter(Boolean);
+  if (ws.length < 2) return false;
+  const v = ws[0].normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  if (!/^[a-zñ]{3,}(ar|er|ir)(se)?$/.test(v)) return false;
+  return ws.slice(1).some((w) => !SHORT_STOP.has(w.toLowerCase()) && /\p{L}{3,}/u.test(w));
+}
+
 /** Motivo de duda de UN texto (null = plausible). */
 export function doubtOf(kind: DoubtKind, text: string): DoubtReason | null {
   const t = String(text || '').trim();
@@ -65,7 +81,8 @@ export function doubtOf(kind: DoubtKind, text: string): DoubtReason | null {
   if (BIB_RE.test(t) || (BIB_MARKERS_RE.test(t) && YEAR_RE.test(t))) return 'bibliography';
   const n = words(t);
   const min = kind === 'evaluation' ? 2 : kind === 'learner' ? 3 : 4;
-  if (n < min) return 'fragment';
+  if (kind !== 'evaluation' && n >= 2 && TRAILING_CONNECTOR_RE.test(t)) return 'fragment';
+  if (n < min && !((kind === 'outcome' || kind === 'competency' || kind === 'objective') && isCompleteShortStatement(t))) return 'fragment';
   const max = kind === 'objective' || kind === 'learner' ? 120 : 70;
   if (n > max) return 'too_long';
   return null;
