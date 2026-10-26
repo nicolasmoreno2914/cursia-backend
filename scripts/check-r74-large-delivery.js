@@ -38,7 +38,10 @@ const ROOT = path.resolve(__dirname, '..');
 const dist = path.join(ROOT, 'dist');
 const L = (r) => require(path.join(dist, r));
 const arg = (k) => (process.argv.find((a) => a.startsWith(`--${k}=`)) || '').slice(k.length + 3);
-const SIZES = (arg('sizes') || '30,60,120').split(',').map(Number);
+// Sin --sizes (gate-core corre `node check-r74-large-delivery.js dist`): SMOKE rápido — 30 capítulos con medios CHICOS y un
+// almacenamiento de 40 MiB, así el mismo camino (en línea + autocontenido por partes + cortes) corre en segundos.
+const SMOKE = !arg('sizes');
+const SIZES = SMOKE ? [30] : arg('sizes').split(',').map(Number);
 const BASE = arg('base');
 const MOODLE = process.argv.includes('--moodle') || process.argv.includes('--moodle-only');
 // --moodle-only: solo D8 sobre los archivos ya armados en --out (result.json de una corrida anterior).
@@ -72,7 +75,9 @@ const validateMain = (mbz, b) => VAL.validateMbzV3(mbz, {
   builderVersion: b.expectations.builderVersion, moodleMinimum: b.expectations.moodleMinimum, internalVocabularyExempt: b.expectations.internalVocabularyExempt,
   internalVocabularyUserTexts: b.expectations.internalVocabularyUserTexts, ...(b.expectations.audiobookLinks ? { audiobookLinks: b.expectations.audiobookLinks } : {}),
 });
-const LIMITS = DP.deliveryLimitsFromEnv(STORAGE, {});
+const LIMITS_REAL = DP.deliveryLimitsFromEnv(STORAGE, {});
+const DELIVERY_STORAGE = SMOKE ? 40 * 1024 * 1024 : STORAGE;
+const LIMITS = DP.deliveryLimitsFromEnv(DELIVERY_STORAGE, {});
 const ctxFor = (n, input, store, extra = {}) => ({
   jobId: '00000000-0000-4000-8000-0000000000aa', ownerId: 'owner-r74', courseId: `c${n}`, manifestId: 9001, runId: `run-${n}`, sourceIdsHash: `src${n}`,
   storagePrefix: `owner-r74/dynamic/c${n}/9001`, qa: false, limits: LIMITS, publicMediaBase: BASE_URL, buildInput: input, build: B.buildDynamicMbzV3,
@@ -132,11 +137,11 @@ async function zipIntegrity(buf) {
     const modes = { presentation: 'real', audio: 'real' };
     const old = PJ.projectPackageSize(items, modes, { maxBytes: STORAGE });
     eq([old.verdict, (old.expectedBytes / MB).toFixed(1), (old.highBytes / MB).toFixed(1)], ['over', '277.9', '344.5'], 'el bloqueo de hoy (#87, mismas cifras que producción)');
-    const p = PJ.projectPackageSize(items, modes, { maxBytes: STORAGE }, { delivery: LIMITS, moduleOfChapter: moduleOf });
+    const p = PJ.projectPackageSize(items, modes, { maxBytes: STORAGE }, { delivery: LIMITS_REAL, moduleOfChapter: moduleOf });
     eq([p.verdict, p.error, p.delivery.mode, p.delivery.verdict], ['ok', null, 'audio_apart', 'ok'], '#87 con plan de entrega');
-    assert(p.delivery.mainHighBytes < 100 * MB && p.delivery.partHighBytes.every((b) => b <= LIMITS.partMaxBytes), JSON.stringify(p.delivery));
+    assert(p.delivery.mainHighBytes < 100 * MB && p.delivery.partHighBytes.every((b) => b <= LIMITS_REAL.partMaxBytes), JSON.stringify(p.delivery));
     evidence.projection87 = { expectedMiB: +(p.expectedBytes / MB).toFixed(1), highMiB: +(p.highBytes / MB).toFixed(1), delivery: p.delivery };
-    const small = PJ.projectPackageSize(items.slice(0, 26), modes, { maxBytes: STORAGE }, { delivery: LIMITS, moduleOfChapter: moduleOf });
+    const small = PJ.projectPackageSize(items.slice(0, 26), modes, { maxBytes: STORAGE }, { delivery: LIMITS_REAL, moduleOfChapter: moduleOf });
     eq(small.delivery.mode, 'single', 'un curso chico sigue en un archivo');
     const tiny = PJ.projectPackageSize(items, modes, { maxBytes: 20 * MB }, { delivery: DP.deliveryLimitsFromEnv(20 * MB, {}), moduleOfChapter: moduleOf });
     assert(tiny.verdict === 'over' && /main_over_storage/.test(tiny.error), 'sin entrega posible → bloquea');
@@ -152,7 +157,7 @@ async function zipIntegrity(buf) {
         const b = await BB.buildDynamicMbzV3(V.packagingInput(BASE, opts));
         eq(sha256(a.mbz), sha256(b.mbz), `${shape}: sha256 idéntico al builder de staging`);
         assert(!a.audiobookParts && !a.audiobookSegments && !a.summary.audiobookDelivery, `${shape}: sin entrega aparte`);
-        assert(S.estimateSingleBytes(V.packagingInput(dist, opts)) <= LIMITS.partMaxBytes, `${shape}: el worker lo arma en un archivo`);
+        assert(S.estimateSingleBytes(V.packagingInput(dist, opts)) <= LIMITS_REAL.partMaxBytes, `${shape}: el worker lo arma en un archivo`);
       }
     });
   }
@@ -166,14 +171,14 @@ async function zipIntegrity(buf) {
     let result;
     const ev = (evidence.courses[n] = {});
     await check(`D4 ${n} capítulos: recomendado UN .mbz (audiolibro en línea) + autocontenido validado, cada archivo ≤ su tope, nada perdido frente a la referencia`, async () => {
-      input = R.largeCourseInput(dist, n);
+      input = R.largeCourseInput(dist, n, SMOKE ? { minutesPerChapter: 4, coverPx: 300 } : {});
       store = R.memoryStore();
       const est = S.estimateSingleBytes(input);
       assert(est > LIMITS.partMaxBytes, `${n}: debía no caber en un archivo (${est})`);
       result = await S.deliverSplitV3(ctxFor(n, input, store));
       eq(result.mode, 'linked', 'modo');
       const linked = result.primary.built.mbz;
-      assert(linked.length <= STORAGE, 'recomendado ≤ almacenamiento');
+      assert(linked.length <= DELIVERY_STORAGE, 'recomendado ≤ almacenamiento');
       const shape = await mbzShape(linked);
       eq(shape.mp3.map((f) => f.name), ['audio_bienvenida.mp3'], 'el recomendado no trae el audiolibro adentro (solo la bienvenida)');
       eq(Object.keys(result.primary.built.expectations.audiobookLinks).length, result.media.length, 'una dirección por segmento');
@@ -181,7 +186,7 @@ async function zipIntegrity(buf) {
         assert(m.url.startsWith(`${BASE_URL}/api/v1/media/`) && !/[?&]token=|Signature|Expires/.test(m.url), m.url);
         assert(m.bytes <= LIMITS.partMaxBytes, 'MP3 en línea ≤ parte');
       }
-      for (const f of result.selfContained.files) assert(f.bytes <= (f.role === 'main' ? STORAGE : LIMITS.partMaxBytes), `${f.filename} ${f.bytes}`);
+      for (const f of result.selfContained.files) assert(f.bytes <= (f.role === 'main' ? DELIVERY_STORAGE : LIMITS.partMaxBytes), `${f.filename} ${f.bytes}`);
       fs.writeFileSync(path.join(dir, 'recomendado.mbz'), linked);
       for (const f of result.selfContained.files) {
         const row = store.rows.find((x) => x.id === f.artifactId);
@@ -219,7 +224,7 @@ async function zipIntegrity(buf) {
       eq(reusedRun.selfContained.files.map((f) => [f.filename, f.sha256]), result.selfContained.files.map((f) => [f.filename, f.sha256]), 'mismos archivos');
       const cuts = [];
       // Todos los cortes hasta 30 capítulos; en los más grandes, el primero, uno del medio y el último (cada corte rearma todo).
-      const ks = n <= 30 ? Array.from({ length: total }, (_, k) => k) : [...new Set([0, Math.floor(total / 2), total - 1])];
+      const ks = n <= 30 && !SMOKE ? Array.from({ length: total }, (_, k) => k) : [...new Set([0, Math.floor(total / 2), total - 1])];
       for (const k of ks) {
         const s2 = R.memoryStore({ failAfterUploads: k });
         let crashed = false;
@@ -285,7 +290,7 @@ async function zipIntegrity(buf) {
   });
 
   await check('D7b sin PUBLIC_MEDIA_BASE_URL: la entrega es solo autocontenida (principal = dynamic_mbz) y sigue siendo válida', async () => {
-    const input = R.largeCourseInput(dist, 60, { minutesPerChapter: 21 });
+    const input = SMOKE ? R.largeCourseInput(dist, 30, { minutesPerChapter: 4, coverPx: 300 }) : R.largeCourseInput(dist, 60, { minutesPerChapter: 21 });
     const store = R.memoryStore();
     const r = await S.deliverSplitV3(ctxFor('60b', input, store, { publicMediaBase: null }));
     eq([r.mode, r.media.length], ['parts', 0], 'modo');
