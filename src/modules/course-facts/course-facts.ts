@@ -13,6 +13,7 @@ import { createHash } from 'crypto';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import type { PedagogicalProfile } from '../pedagogy/pedagogy-profile';
 import { ASSESSMENT_METHODS } from '../pedagogy/vocabulary';
+import { classifyEducation, STAGE_LEVEL, stageOfContexto, type EducationProfile } from './education-level';
 
 // ── Pedido del curso (brief) ──────────────────────────────────────────────────────────────────────────────
 
@@ -30,7 +31,18 @@ export interface CourseBrief {
   briefVersion: typeof BRIEF_VERSION;
   fields: Partial<Record<BriefField, string>>;
   updatedAt: string;
+  /**
+   * r73 UX-10: revisión del pedido (sube en CADA escritura: la del usuario y la de Cursia). Ausente en pedidos
+   * anteriores = 0. El cliente la manda como `baseRevision` al guardar (concurrencia optimista POR CAMPO).
+   */
+  revision?: number;
+  /** r73 UX-10: revisión en que cambió cada dato por última vez (su valor o su marca «inferido»). Ausente = 0. */
+  fieldRev?: Partial<Record<BriefValueField, number>>;
 }
+
+/** Los datos del pedido con valor propio (todo menos «inferidos», que es la marca de cuáles llenó Cursia). */
+export type BriefValueField = Exclude<BriefField, 'inferidos'>;
+export const BRIEF_VALUE_FIELDS = BRIEF_FIELDS.filter((k) => k !== 'inferidos') as BriefValueField[];
 
 /** Texto limpio (colapsa espacios); vacío → se omite. Nunca recorta: el DTO ya validó los máximos. */
 export function normalizeBriefFields(input: Partial<Record<string, unknown>>): Partial<Record<BriefField, string>> {
@@ -48,19 +60,163 @@ export function parseBrief(v: unknown): CourseBrief | null {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
   if (o.briefVersion !== BRIEF_VERSION || !o.fields || typeof o.fields !== 'object') return null;
-  return { briefVersion: BRIEF_VERSION, fields: normalizeBriefFields(o.fields as Record<string, unknown>), updatedAt: typeof o.updatedAt === 'string' ? o.updatedAt : '' };
+  const out: CourseBrief = { briefVersion: BRIEF_VERSION, fields: normalizeBriefFields(o.fields as Record<string, unknown>), updatedAt: typeof o.updatedAt === 'string' ? o.updatedAt : '' };
+  // r73 UX-10: revisión por pedido y por dato. Los pedidos anteriores no las traen (cuentan como 0) y se leen igual que antes.
+  if (isRev(o.revision)) out.revision = o.revision;
+  if (o.fieldRev && typeof o.fieldRev === 'object' && !Array.isArray(o.fieldRev)) {
+    const src = o.fieldRev as Record<string, unknown>;
+    const fr: Partial<Record<BriefValueField, number>> = {};
+    for (const k of BRIEF_VALUE_FIELDS) if (isRev(src[k])) fr[k] = src[k] as number;
+    out.fieldRev = fr;
+  }
+  return out;
+}
+const isRev = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+
+// ── r73 UX-10 · Guardar el pedido sin pisar datos más nuevos (merge por campo) ───────────────────────────────────
+//
+// Antes, PUT /brief REEMPLAZABA el pedido completo con lo que tuviera el formulario del navegador: un formulario viejo
+// (localStorage de otra sesión) con un campo vacío borraba un dato que Cursia había inferido en el servidor (caso #87:
+// el sector «Educación» desapareció al abrir el curso). Ahora el pedido se guarda como un PARCHE por campo:
+//
+//   Formato nuevo (cliente con `baseRevision`):
+//     { baseRevision: n, set: { campo: valor }, clear: [campo…], inferred: { add: [campo…], remove: [campo…] } }
+//     - Solo se tocan los campos mandados: un campo que el usuario no tocó NUNCA cambia en el servidor.
+//     - `clear` es la ÚNICA forma de borrar un dato (decisión explícita del usuario); un texto vacío = «no mandado».
+//     - Conflicto: si el servidor cambió ese campo DESPUÉS de `baseRevision` (fieldRev[campo] > baseRevision), se queda
+//       el valor del servidor y el campo vuelve en `conflicts` (con el valor de cada lado); el cliente se reconcilia con
+//       el pedido devuelto y lo avisa. Un cambio del usuario solo gana si el campo no cambió desde su base.
+//     - Un valor mandado por el usuario deja de ser «inferido» salvo que venga en `inferred.add` (lo dedujo Cursia en el
+//       navegador, p. ej. el sector del documento).
+//   Formato anterior (cliente sin `baseRevision`, campos sueltos en la raíz): compatibilidad que NO borra nada:
+//     - un campo con texto se guarda; un campo vacío o ausente = «no mandado» (antes lo borraba);
+//     - solo `clear: [campo…]` borra (también se acepta en este formato);
+//     - el `inferidos` del cliente solo decide la marca de los campos que ese mismo pedido manda con texto: los inferidos
+//       del servidor (p. ej. el sector del autofix r71) se conservan;
+//     - `expectedUpdatedAt` sigue dando 409 BRIEF_CHANGED si el pedido cambió (como en 8.1).
+//   Escritores del servidor (writeBriefField: autofix «context_field», «Completar el dato», deshacer) usan este mismo
+//   merge sin base: también suben la revisión y el fieldRev del campo, así un cliente con una base vieja ve el conflicto.
+
+export interface BriefPatch {
+  /** null = cliente anterior o escritor del servidor (sin concurrencia por campo). */
+  baseRevision: number | null;
+  set: Partial<Record<BriefValueField, string>>;
+  clear: BriefValueField[];
+  inferredAdd: BriefValueField[];
+  inferredRemove: BriefValueField[];
+  /** Formato anterior: la lista «inferidos» que mandó el cliente (solo cuenta para los campos que manda con texto). */
+  legacyInferidos: BriefValueField[] | null;
+}
+export interface BriefConflict { field: BriefValueField; server: string | null; client: string | null }
+export interface BriefMergeResult { brief: CourseBrief; changed: boolean; conflicts: BriefConflict[]; applied: BriefValueField[] }
+
+const isValueField = (k: unknown): k is BriefValueField => typeof k === 'string' && (BRIEF_VALUE_FIELDS as string[]).includes(k);
+const cleanText = (v: unknown) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim() : '');
+const inferredList = (s: unknown): BriefValueField[] => [...new Set(String(s || '').split(',').map((x) => x.trim()).filter(isValueField))];
+
+/**
+ * Cuerpo del PUT → parche validado. Lanza Error (el servicio lo vuelve 400) si un dato es desconocido, no es texto o
+ * excede su máximo. El mismo dato en `set` y en `clear` → error (no se adivina cuál quiso el usuario).
+ */
+export function briefPatchFromBody(body: Record<string, unknown>): BriefPatch {
+  const b = body || {};
+  const hasBase = b.baseRevision !== undefined && b.baseRevision !== null;
+  if (hasBase && !isRev(b.baseRevision)) throw new Error('baseRevision: entero ≥ 0.');
+  const set: Partial<Record<BriefValueField, string>> = {};
+  const putVal = (k: string, v: unknown, where: string) => {
+    if (!isValueField(k)) throw new Error(`${where}: dato desconocido «${k}».`);
+    if (v !== undefined && v !== null && typeof v !== 'string') throw new Error(`${where}.${k}: debe ser texto.`);
+    const t = cleanText(v);
+    if (t.length > BRIEF_MAX[k]) throw new Error(`${where}.${k}: hasta ${BRIEF_MAX[k]} caracteres.`);
+    if (t) set[k] = t; // vacío = «no mandado» (para borrar está `clear`)
+  };
+  for (const k of BRIEF_VALUE_FIELDS) if (b[k] !== undefined) putVal(k, b[k], 'campo'); // formato anterior
+  if (b.set !== undefined && b.set !== null) {
+    if (typeof b.set !== 'object' || Array.isArray(b.set)) throw new Error('set: objeto { dato: texto }.');
+    for (const [k, v] of Object.entries(b.set as Record<string, unknown>)) putVal(k, v, 'set');
+  }
+  const list = (v: unknown, where: string): BriefValueField[] => {
+    if (v === undefined || v === null) return [];
+    if (!Array.isArray(v) || v.length > BRIEF_FIELDS.length) throw new Error(`${where}: lista de datos.`);
+    for (const k of v) if (!isValueField(k)) throw new Error(`${where}: dato desconocido «${String(k)}».`);
+    return [...new Set(v as BriefValueField[])];
+  };
+  const clear = list(b.clear, 'clear');
+  for (const k of clear) if (set[k] !== undefined) throw new Error(`«${k}» viene en set y en clear a la vez.`);
+  let inferredAdd: BriefValueField[] = [];
+  let inferredRemove: BriefValueField[] = [];
+  if (b.inferred !== undefined && b.inferred !== null) {
+    const inf = b.inferred as Record<string, unknown>;
+    if (typeof inf !== 'object' || Array.isArray(inf)) throw new Error('inferred: { add: [...], remove: [...] }.');
+    inferredAdd = list(inf.add, 'inferred.add');
+    inferredRemove = list(inf.remove, 'inferred.remove').filter((k) => !inferredAdd.includes(k));
+  }
+  const legacyInferidos = !hasBase && typeof b.inferidos === 'string' ? inferredList(b.inferidos) : null;
+  return { baseRevision: hasBase ? (b.baseRevision as number) : null, set, clear, inferredAdd, inferredRemove, legacyInferidos };
+}
+
+/** Aplica el parche sobre el pedido vigente (puro). Sin cambios reales → changed:false y el pedido tal cual. */
+export function mergeBrief(prev: CourseBrief | null, patch: BriefPatch, nowIso: string): BriefMergeResult {
+  const fields: Partial<Record<BriefField, string>> = { ...(prev ? prev.fields : {}) };
+  const fieldRev: Partial<Record<BriefValueField, number>> = { ...((prev && prev.fieldRev) || {}) };
+  const rev0 = prev && isRev(prev.revision) ? prev.revision : 0;
+  const nextRev = rev0 + 1;
+  const inferred0 = inferredList(fields.inferidos);
+  const inf = new Set<BriefValueField>(inferred0);
+  const conflicts: BriefConflict[] = [];
+  const applied: BriefValueField[] = [];
+  const conflict = (k: BriefValueField) => patch.baseRevision !== null && (fieldRev[k] || 0) > patch.baseRevision;
+  const touch = (k: BriefValueField) => { if (!applied.includes(k)) applied.push(k); };
+
+  const valueKeys = [...new Set<BriefValueField>([...(Object.keys(patch.set) as BriefValueField[]), ...patch.clear])];
+  for (const k of valueKeys) {
+    const next = patch.clear.includes(k) ? null : (patch.set[k] as string);
+    if (conflict(k)) {
+      if ((fields[k] ?? null) !== next) conflicts.push({ field: k, server: fields[k] ?? null, client: next });
+      continue;
+    }
+    if (next === null) {
+      if (fields[k] !== undefined || inf.has(k)) { delete fields[k]; inf.delete(k); touch(k); }
+      continue;
+    }
+    const wantInf = patch.inferredAdd.includes(k) || (patch.legacyInferidos ? patch.legacyInferidos.includes(k) : false);
+    if (fields[k] !== next) { fields[k] = next; touch(k); }
+    if (inf.has(k) !== wantInf) { if (wantInf) inf.add(k); else inf.delete(k); touch(k); }
+  }
+  // Solo la marca «inferido» de un dato cuyo valor no se manda (p. ej. el usuario confirma lo que dedujo Cursia).
+  for (const k of [...patch.inferredAdd, ...patch.inferredRemove]) {
+    if (valueKeys.includes(k) || fields[k] === undefined) continue;
+    const want = patch.inferredAdd.includes(k);
+    if (inf.has(k) === want || conflict(k)) continue; // con conflicto se queda lo del servidor
+    if (want) inf.add(k); else inf.delete(k);
+    touch(k);
+  }
+
+  if (!applied.length) return { brief: prev || { briefVersion: BRIEF_VERSION, fields: {}, updatedAt: '', revision: 0, fieldRev: {} }, changed: false, conflicts, applied };
+  // Orden estable de «inferidos»: los que ya estaban y luego los nuevos; solo de datos que tienen valor.
+  const order = [...inferred0, ...BRIEF_VALUE_FIELDS.filter((k) => !inferred0.includes(k))];
+  const infStr = order.filter((k) => inf.has(k) && fields[k] !== undefined).join(',');
+  if (infStr) fields.inferidos = infStr; else delete fields.inferidos;
+  for (const k of applied) fieldRev[k] = nextRev;
+  const brief: CourseBrief = { briefVersion: BRIEF_VERSION, fields: normalizeBriefFields(fields as Record<string, unknown>), updatedAt: nowIso, revision: nextRev, fieldRev };
+  return { brief, changed: true, conflicts, applied };
+}
+
+/** Lo que devuelve la API: siempre con `revision` y `fieldRev` (0 / {} en pedidos anteriores a UX-10). */
+export function briefForClient(b: CourseBrief | null): CourseBrief | null {
+  return b ? { ...b, revision: isRev(b.revision) ? b.revision : 0, fieldRev: b.fieldRev || {} } : null;
 }
 
 // Valores de la pantalla Datos (chips) → vocabulario del motor pedagógico.
 const strip = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
-/** «Universitario — estudiantes de pregrado…» → 'university'. Desconocido / «Otro» → null. */
-export function educationLevelFromBrief(contexto: string | undefined): 'secondary' | 'technical' | 'university' | 'professional' | null {
-  const s = strip(String(contexto || '')).trim();
-  if (/^bachillerato/.test(s)) return 'secondary';
-  if (/^tecnico/.test(s)) return 'technical';
-  if (/^(universitario|posgrado)/.test(s)) return 'university';
-  if (/^corporativo/.test(s)) return 'professional';
-  return null;
+/**
+ * «Universitario — estudiantes de pregrado…» → 'university'. Desconocido / «Otro» → null.
+ * r73 (UX-9): también los textos por etapa («Educación Básica Primaria/Secundaria», «Educación Media», «Tecnólogo»…) y
+ * un «Otro» que nombra el nivel («estudiantes de grado 6»).
+ */
+export function educationLevelFromBrief(contexto: string | undefined): 'basic' | 'secondary' | 'technical' | 'university' | 'professional' | null {
+  const st = stageOfContexto(contexto);
+  return st ? STAGE_LEVEL[st] : null;
 }
 /** «Básico — sin conocimientos previos» → 'none'; «Intermedio…» → 'intermediate'; «Avanzado…» → 'advanced'. */
 export function priorKnowledgeFromBrief(nivel: string | undefined): 'none' | 'intermediate' | 'advanced' | null {
@@ -277,6 +433,11 @@ export interface CourseFacts {
   };
   institutionId: string | null;
   conflicts: FactConflict[];
+  /**
+   * r73 (UX-9): nivel educativo que dice el curso (documento o nombre: grado, edades, etapa) y su coherencia con el
+   * contexto del pedido: corregir (si lo puso Cursia), avisar (si lo eligió el docente) o preguntar (sin señales).
+   */
+  educationProfile: EducationProfile;
 }
 
 export interface FactsInput {
@@ -422,9 +583,23 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
   const docLevel = ctx ? found(ctx.identity.educationLevel) : null;
   const briefLevel = educationLevelFromBrief(b.contexto);
   const pedLevel = ped && ped.learner ? ped.learner.educationLevel : null;
+  // r73 (UX-9): la etapa que dice el curso (documento: grado, «Educación Básica Secundaria»…; o el nombre: «Grado Sexto»).
+  const educationProfile = classifyEducation({
+    brief: b as any, academic: ctx, courseTitle: input.courseTitle,
+    userProfileLevel: owners.educationLevel === 'user' ? pedLevel : null,
+  });
+  const det = educationProfile.detected;
   const educationLevel = owners.educationLevel === 'user'
     ? fact<string>(pedLevel, 'profile')
-    : first<string>(fact(docLevel && docLevel.level, 'document'), fact(pedLevel, 'profile'), fact(briefLevel, briefSource('contexto')));
+    : first<string>(
+      fact(docLevel && docLevel.level, 'document'),
+      fact(det && det.source === 'document' ? det.level : null, 'document'),
+      fact(pedLevel, 'profile'),
+      // Lo que eligió el usuario manda sobre el nombre; el nombre, sobre el valor de partida (inferido).
+      fact(briefSource('contexto') === 'user' ? briefLevel : null, 'user'),
+      fact(det && det.source === 'name' ? det.level : null, 'inferred'),
+      fact(briefLevel, briefSource('contexto')),
+    );
   // LOOP 9 (P1-4): un nivel que el usuario no eligió (el valor de partida de «Crear», marcado como inferido) no choca con el
   // documento: el documento manda sin preguntar.
   if (owners.educationLevel !== 'user' && briefSource('contexto') === 'user' && docLevel && docLevel.level && briefLevel && docLevel.level !== briefLevel) {
@@ -510,6 +685,7 @@ export function resolveCourseFacts(input: FactsInput): CourseFacts {
     },
     institutionId: input.institutionId,
     conflicts,
+    educationProfile,
   };
 }
 
@@ -530,8 +706,7 @@ const PRIOR_TEXT: Readonly<Record<string, string>> = Object.freeze({
 });
 /** Texto del contexto educativo → nivel (mismo vocabulario que LEVEL_TEXT, ida y vuelta sin pérdida). */
 export function contextLevelOf(contexto: string | undefined): string | null {
-  const s = strip(String(contexto || '')).trim();
-  if (/^educacion basica/.test(s)) return 'basic';
+  // r73: «Educación Básica Secundaria — …» es secundaria (antes caía en 'basic' por el prefijo «educación básica»).
   return educationLevelFromBrief(contexto);
 }
 /** Texto del nivel de conocimiento → previos (ida y vuelta sin pérdida con PRIOR_TEXT). */

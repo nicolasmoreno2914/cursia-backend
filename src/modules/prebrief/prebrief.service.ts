@@ -219,6 +219,13 @@ export class PrebriefService {
     const verbatim = documentVerbatimTexts(model);
     for (const t of documentTexts(document)) if (!isDocumentVerbatim(t, verbatim)) for (const h of lqaFindings(t, 3)) language.push(`${lqaHitLabel(h)} en «${t.slice(0, 80)}»`);
     const readiness = withInlineActions(prebriefReadiness(model, card, doubts, language), card && card.autofix);
+    // r73 (UX-9, decisión del owner): sin un nivel educativo confirmado la propuesta no queda lista; Cursia nunca asume
+    // «Universitario» (ni otro nivel) para producir. La pregunta se responde en «Lo que entendimos».
+    if (facts && facts.educationProfile && facts.educationProfile.action === 'ask') {
+      readiness.blockers.push({ code: 'education_level', where: 'understood',
+        title: 'Confirma para quién es el curso: el tono y la dificultad de todo el contenido dependen del nivel educativo.' });
+      readiness.ready = false;
+    }
     const checks: any[] = (card && card.verification && card.verification.checks) || [];
     return {
       model, modelSha256: prebriefModelSha(model), document, documentSha256: documentSha(document), readiness, doubts,
