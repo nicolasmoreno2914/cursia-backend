@@ -205,6 +205,8 @@ async function dbChecks(prodTypes) {
     });
     await check(`${tag} [I] header ≠ institución del curso → 409 institution_mismatch (D-13); en B el CREADOR solo ve (CONSULTA)`, async () => {
       eq((await api('GET', `/api/v1/courses/${cA}`, 'CRE', null, { 'x-cursia-institution': INST_B })).body.code, 'institution_mismatch', '409');
+      // R75-E23: el SA (sin membresía en A) con el header de otra institución no recibe 409: abre el curso.
+      eq((await api('GET', `/api/v1/courses/${cA}`, 'SA', null, { 'x-cursia-institution': INST_B })).status, 200, 'SA con header ajeno');
       eq((await api('GET', `/api/v1/courses/${cB}`, 'CRE')).status, 200, 'view B');
       eq((await api('PATCH', `/api/v1/courses/${cB}`, 'CRE', { description: 'x' })).status, 403, 'edit B');
     });
