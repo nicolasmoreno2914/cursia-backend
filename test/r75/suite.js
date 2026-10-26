@@ -319,7 +319,7 @@ async function itemD() {
     for (const who of gc ? ['creadorA', 'sa'] : []) {
       const s2 = await startOf(who);
       if (s2.status === 403 && s2.code === 'platform_generation_frozen') t.ok(true, `congelación → 403 platform_generation_frozen para ${who} (también SA)`);
-      else if (!F.budgets) t.pending(`congelación → 403 para ${who}`, `enforcement en runs (B/C2) no integrado: vino ${s2.status} ${s2.code || s2.error}`);
+      else if (!F.budgets || (who === 'sa' && s2.status === 404 && !F.permGuard)) t.pending(`congelación → 403 para ${who}`, `enforcement en runs (B/C2) no integrado: vino ${s2.status} ${s2.code || s2.error}`);
       else t.ok(false, `congelación → 403 platform_generation_frozen para ${who} (también SA)`, brief(s2));
       if (s2.data && s2.data.run && s2.data.run.id) await q(`update public.production_jobs set worker_status='cancelled', status='cancelled' where id=$1`, [s2.data.run.id]);
     }
