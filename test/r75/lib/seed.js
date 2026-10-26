@@ -97,4 +97,14 @@ async function seedArtifact(course, owner, extra = {}) {
   return insertRow('artifacts', { owner_id: owner.id, course_id: String(course.id), type: 'mbz_final', storage_path: `${owner.id}/r75/${crypto.randomUUID()}.mbz`, filename: `r75-${MARK}.mbz`, mime_type: 'application/zip', size_bytes: 10, ...extra });
 }
 
-module.exports = { MARK, insertRow, seedIdentities, seedInstitutions, seedMemberships, seedSuspension, seedCourse, seedRun, seedLegacyJob, seedArtifact };
+/** Miembro DESCARTABLE (CONSULTA) de `inst`: para las rutas de la matriz que modifican o quitan a un miembro (no tocar consultaA). */
+async function seedSacrificialMember(inst, createdBy) {
+  const u = U('sacrificio', `qa-r75-sacrificio-${crypto.randomUUID().slice(0, 8)}@example.com`);
+  await q(`insert into auth.users (id, email, email_confirmed_at, raw_user_meta_data) values ($1, $2, now(), '{}')`, [u.id, u.email]);
+  if (await columnExists('authorized_users', 'user_id')) await q(`insert into public.authorized_users (email, is_admin, user_id) values ($1, false, $2)`, [u.email, u.id]);
+  else await q(`insert into public.authorized_users (email, is_admin) values ($1, false)`, [u.email]);
+  await insertRow('institution_memberships', { institution_id: inst.id, user_id: u.id, role: 'CONSULTA', status: 'active', created_by: createdBy.id });
+  return u;
+}
+
+module.exports = { MARK, insertRow, seedSacrificialMember, seedIdentities, seedInstitutions, seedMemberships, seedSuspension, seedCourse, seedRun, seedLegacyJob, seedArtifact };

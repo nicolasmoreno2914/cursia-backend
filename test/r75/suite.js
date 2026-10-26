@@ -47,6 +47,11 @@ async function detect() {
     userBudgets: await env.tableExists('user_budgets'),
     reservations: await env.tableExists('budget_reservations'),
     authUid: await env.columnExists('authorized_users', 'user_id'),
+    // C2 (runs.service: userBudget en la vista previa, H5, 409 previo) va DESPUÉS del merge de r74: sin él, lo que depende
+    // de C2 queda PENDIENTE (nunca PASS).
+    c2: (() => { try { return /userBudgetPreview/.test(fs.readFileSync(path.join(env.REPO, 'src/modules/dynamic-generation/runs.service.ts'), 'utf8')); } catch { return false; } })(),
+    // runs.controller con @RequirePermission (SA y miembros sobre cursos ajenos en /manifest/runs*): mismo paso secuenciado.
+    runsAuthz: (() => { try { return /RequirePermission/.test(fs.readFileSync(path.join(env.REPO, 'src/modules/dynamic-generation/runs.controller.ts'), 'utf8')); } catch { return false; } })(),
     accessMigration: fs.existsSync(path.join(env.REPO, 'scripts', 'migrate-r75-access.js')) || (fs.existsSync(path.join(env.REPO, 'supabase-migration-r75-access.sql')) && (await env.tableExists('institution_memberships'))),
   };
   console.log('capacidades detectadas:', JSON.stringify(F));
@@ -163,7 +168,11 @@ async function itemB() {
     for (const [k, role] of roles) {
       const allowed = MATRIX[role].includes(r.perm.permission);
       let base = fx.A;
-      if (allowed && (r.method === 'DELETE' || /delete|cancel/.test(r.route))) {
+      if (allowed && /\/members\/:userId/.test(r.route)) {
+        // Rutas que modifican / quitan a un miembro: sobre un miembro descartable, nunca sobre consultaA (lo usan (b)–(k)).
+        const m = await seed.seedSacrificialMember(I.A, U.sa);
+        base = { ...fx.A, userId: m.id };
+      } else if (allowed && (r.method === 'DELETE' || /delete|cancel/.test(r.route))) {
         const c = await seed.seedCourse(U.creadorA, I.A, `sacrificio r75 ${r.handler}`);
         base = { ...fx.A, course: c.id };
       }
@@ -326,7 +335,7 @@ async function itemD() {
     for (const who of gc ? ['creadorA', 'sa'] : []) {
       const s2 = await startOf(who);
       if (s2.status === 403 && s2.code === 'platform_generation_frozen') t.ok(true, `congelación → 403 platform_generation_frozen para ${who} (también SA)`);
-      else if (!F.budgets || (who === 'sa' && s2.status === 404 && !F.permGuard)) t.pending(`congelación → 403 para ${who}`, `enforcement en runs (B/C2) no integrado: vino ${s2.status} ${s2.code || s2.error}`);
+      else if (!F.budgets || (who === 'sa' && s2.status === 404 && (!F.permGuard || !F.runsAuthz))) t.pending(`congelación → 403 para ${who}`, `enforcement en runs (B/C2) no integrado: vino ${s2.status} ${s2.code || s2.error}`);
       else t.ok(false, `congelación → 403 platform_generation_frozen para ${who} (también SA)`, brief(s2));
       if (s2.data && s2.data.run && s2.data.run.id) await q(`update public.production_jobs set worker_status='cancelled', status='cancelled' where id=$1`, [s2.data.run.id]);
     }
@@ -375,7 +384,9 @@ async function itemE() {
   for (let i = 0; i < N; i++) courses.push(await buildCourse('creadorA', I.A, `r75 concurrencia ${i}`));
   const pv = await api('POST', `/courses/${courses[0].id}/blueprints/${courses[0].n}/manifest/runs/estimate-preview`, { token: TK.creadorA, body: D_FIELDS, headers: { 'X-Cursia-Institution': I.A.id } });
   const ub = pv.data && pv.data.userBudget;
-  const e = []; S.UserBudgetGate(ub, e); t.ok(pv.status === 200 && !e.length, 'estimate-preview trae userBudget (02 §E.1)', { ...brief(pv), e });
+  const e = []; S.UserBudgetGate(ub, e);
+  if (!F.c2 && pv.status === 200 && ub === undefined) { t.pending('estimate-preview trae userBudget (02 §E.1)', 'C2 (runs.service) se integra después del merge de r74'); return; }
+  t.ok(pv.status === 200 && !e.length, 'estimate-preview trae userBudget (02 §E.1)', { ...brief(pv), e });
   const req = Number(ub && ub.requiredUsd);
   if (!(req > 0)) { t.pending('reserva concurrente', `requiredUsd no positivo (${ub && ub.requiredUsd}): sin costo no hay reserva que probar`); return; }
   const limit = (req * 2.5).toFixed(10);
@@ -559,8 +570,11 @@ async function itemK() {
   const mine = await api('POST', p, { token: TK.creadorA, body: D_FIELDS, headers: { 'X-Cursia-Institution': I.A.id }, raw: true });
   t.ok(mine.status === 200, 'estimate-preview del dueño → 200', brief(mine));
   const ms = mine.data && mine.data.policy ? mine.data.policy.monthSpent : undefined;
-  t.ok(ms === null || ms === undefined, `policy.monthSpent NO llega a quien no es SA (D-25/H5); vino ${JSON.stringify(ms)}`, mine.data && mine.data.policy);
-  if (!(ms === null || ms === undefined)) finding('P1', 'k', `H5 abierto: estimate-preview expone el gasto global del mes (${JSON.stringify(ms)}) a un no-SA`, `POST /api/v1${p} como creadorA`);
+  if (!F.c2 && !(ms === null || ms === undefined)) {
+    t.pending('policy.monthSpent NO llega a quien no es SA (D-25/H5)', `H5 sigue abierto hasta C2 (runs.service, después de r74): vino ${JSON.stringify(ms)}`);
+    finding('P1', 'k', `H5 abierto (preexistente, se cierra con C2 tras r74): estimate-preview expone el gasto global del mes (${JSON.stringify(ms)}) a un no-SA`, `POST /api/v1${p} como creadorA`);
+  } else t.ok(ms === null || ms === undefined, `policy.monthSpent NO llega a quien no es SA (D-25/H5); vino ${JSON.stringify(ms)}`, mine.data && mine.data.policy);
+  if (F.c2 && !(ms === null || ms === undefined)) finding('P1', 'k', `H5 abierto: estimate-preview expone el gasto global del mes (${JSON.stringify(ms)}) a un no-SA`, `POST /api/v1${p} como creadorA`);
   const sa = await api('POST', p, { token: TK.sa, body: D_FIELDS });
   if (sa.status === 200) t.ok(sa.data.policy && sa.data.policy.monthSpent !== null && sa.data.policy.monthSpent !== undefined, 'el SA sí ve policy.monthSpent', sa.data.policy);
   else t.pending('SA ve monthSpent', `estimate-preview como SA → ${sa.status} ${sa.code || ''} (el SA aún no actúa sobre cursos ajenos en esta ruta)`);
