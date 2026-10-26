@@ -559,11 +559,19 @@ async function main() {
     const { AllExceptionsFilter } = L('common/filters/http-exception.filter.js');
     const { ResponseInterceptor } = L('common/interceptors/response.interceptor.js');
     // Puerto de permisos FALSO (en lugar de PermissionService de B): spend.view = ADMIN_INSTITUCIONAL activo en ESA institución.
+    // r75 (integración, P0): devuelve una DECISIÓN con la forma de PermissionService de B ({allowed, …}), NO un booleano:
+    // un rechazo es un objeto «truthy» y antes abría el gasto a cualquiera (B → 200). [INST] lo cubre por HTTP.
     const fakePermissions = { async can(actor, permission, institutionId) {
-      if (permission !== 'spend.view') return false;
+      const deny = { allowed: false, code: 'permission_denied', httpStatus: 403, permission, institutionId, reason: 'fake' };
+      if (permission !== 'spend.view') return deny;
       const [m] = await ds.query(`select 1 from public.institution_memberships where user_id = $1 and institution_id = $2 and status = 'active' and role = 'ADMIN_INSTITUCIONAL'`, [actor.id, institutionId]);
-      return !!m;
+      return m ? { allowed: true, via: 'role', permission, institutionId, role: 'ADMIN_INSTITUCIONAL' } : deny;
     } };
+    await check('[P0] permissionAllowed: solo {allowed:true} (o true) permite; {allowed:false}, objetos sin allowed, null y undefined NIEGAN', async () => {
+      const { permissionAllowed } = L('modules/budgets/budget-common.js');
+      const got = [true, { allowed: true }, { allowed: false, code: 'permission_denied' }, {}, null, undefined, false, 'yes', { allowed: 'true' }].map(permissionAllowed);
+      assert(JSON.stringify(got) === JSON.stringify([true, true, false, false, false, false, false, false, false]), JSON.stringify(got));
+    });
     // B registra su PermissionService con el token compartido R75_PERMISSION_SERVICE; acá un ModuleRef falso lo devuelve.
     const accessWithPort = new BudgetAccessService(ds, { get: (token) => (token === 'R75_PERMISSION_SERVICE' ? fakePermissions : undefined) });
     const requestsHttp = new BudgetRequestsService(ds, P.read, P.gate, accessWithPort, P.audit, P.ledger);

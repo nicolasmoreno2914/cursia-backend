@@ -169,7 +169,18 @@ export type BudgetPermission = 'generations.start' | 'generations.retry' | 'spen
 
 export interface BudgetPermissionPort {
   /** ¿`actor` tiene `permission` en `institutionId`? (resolución de 01 §2.3; el SA ya pasa por fuera). */
-  can(actor: { id: string; email: string | null }, permission: BudgetPermission, institutionId: string): Promise<boolean>;
+  // PermissionService (B) devuelve una DECISIÓN `{ allowed, … }`, no un booleano: leerla SIEMPRE con permissionAllowed().
+  can(actor: { id: string; email: string | null }, permission: BudgetPermission, institutionId: string): Promise<boolean | { allowed: boolean }>;
+}
+
+/**
+ * r75 (integración, P0): el resultado de `can()` es un objeto `{ allowed, … }` (PermissionDecision de B). Un objeto es
+ * «truthy» aunque sea un rechazo → usarlo como booleano abría el gasto por institución y el acceso a solicitudes y
+ * presupuesto a cualquiera. Solo `allowed === true` (o un `true` literal de un puerto booleano) permite.
+ */
+export function permissionAllowed(result: unknown): boolean {
+  if (result === true) return true;
+  return !!result && typeof result === 'object' && (result as { allowed?: unknown }).allowed === true;
 }
 
 export function rbacMode(env: NodeJS.ProcessEnv = process.env): 'off' | 'shadow' | 'enforce' {

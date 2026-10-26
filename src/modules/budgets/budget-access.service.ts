@@ -3,7 +3,7 @@ import { ModuleRef } from '@nestjs/core';
 import { DataSource } from 'typeorm';
 import { R75_PERMISSION_SERVICE } from '../access/access.tokens';
 import { isSuperAdminEmail } from '../../auth/super-admin';
-import { BudgetActor, BudgetPermission, BudgetPermissionPort, UUID_RE, permissionDenied, rbacMode } from './budget-common';
+import { BudgetActor, BudgetPermission, BudgetPermissionPort, UUID_RE, permissionAllowed, permissionDenied, rbacMode } from './budget-common';
 
 /**
  * r75 (Agente C) — autorización de las rutas de presupuesto/gasto que NO son solo de SuperAdmin.
@@ -50,7 +50,7 @@ export class BudgetAccessService {
     const port = this.port;
     if (port) {
       if (!out.institutionId) throw new NotFoundException({ code: 'course_not_found', message: 'Curso no encontrado' }); // huérfano: solo SA
-      if (await port.can({ id: actor.id, email: actor.email }, permission, out.institutionId)) return out;
+      if (permissionAllowed(await port.can({ id: actor.id, email: actor.email }, permission, out.institutionId))) return out;
       throw permissionDenied(permission);
     }
     if (rbacMode() === 'off' && out.ownerId && out.ownerId.toLowerCase() === actor.id) return out;
@@ -63,6 +63,6 @@ export class BudgetAccessService {
     if (actor.superAdmin) return true;
     const port = this.port;
     if (!port) return false;
-    return port.can({ id: actor.id, email: actor.email }, 'spend.view', institutionId);
+    return permissionAllowed(await port.can({ id: actor.id, email: actor.email }, 'spend.view', institutionId));
   }
 }
