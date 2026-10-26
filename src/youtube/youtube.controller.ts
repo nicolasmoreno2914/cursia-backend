@@ -22,6 +22,7 @@ import { AuthUser } from '../auth/auth.types';
 import { YoutubeService } from './youtube.service';
 import { YoutubeTokenService } from './youtube-token.service';
 import { YoutubeUploadService } from './youtube-upload.service';
+import { Public } from '../modules/authz/public.decorator';
 
 /**
  * Endpoints de YouTube OAuth.
@@ -34,6 +35,24 @@ import { YoutubeUploadService } from './youtube-upload.service';
  *   4. Google llama GET /oauth/callback?code=...&state=...
  *   5. Backend guarda conexión y redirige al frontend
  */
+/**
+ * r75 (H9): el `error` de Google y el mensaje de la excepción se reflejaban tal cual en la query del redirect al
+ * frontend (texto arbitrario controlado por quien arma la URL del callback). Ahora solo viajan códigos fijos.
+ */
+const GOOGLE_OAUTH_ERRORS = new Set(['access_denied', 'cancelled', 'invalid_request', 'invalid_scope', 'server_error', 'temporarily_unavailable', 'unauthorized_client', 'consent_required', 'interaction_required', 'login_required']);
+export function youtubeOauthErrorCode(raw: unknown): string {
+  const v = String(raw ?? '').trim().toLowerCase();
+  return GOOGLE_OAUTH_ERRORS.has(v) ? v : 'oauth_error';
+}
+export function youtubeCallbackFailureCode(err: unknown): string {
+  if (err instanceof BadRequestException) {
+    const m = String((err as Error).message ?? '').toLowerCase();
+    if (m.includes('state')) return 'invalid_state';
+    return 'callback_rejected';
+  }
+  return 'callback_failed';
+}
+
 @Controller('youtube')
 export class YoutubeController {
   private readonly logger = new Logger(YoutubeController.name);
@@ -69,6 +88,7 @@ export class YoutubeController {
    * NO requiere JWT (es una redirección de Google, no del frontend).
    */
   @Get('oauth/callback')
+  @Public() // r75: redirección de Google, protegida por el `state` de un solo uso
   async handleCallback(
     @Query('code')  code: string  | undefined,
     @Query('state') state: string | undefined,
@@ -79,8 +99,8 @@ export class YoutubeController {
 
     // ── El usuario denegó el acceso o hubo error en Google ──────────
     if (error || !code || !state) {
-      const reason = error ?? 'cancelled';
-      this.logger.warn(`OAuth callback denegado o incompleto: ${reason}`);
+      const reason = youtubeOauthErrorCode(error ?? 'cancelled');
+      this.logger.warn(`OAuth callback denegado o incompleto: ${String(error ?? 'cancelled').slice(0, 80)}`);
       return res.redirect(
         `${frontendUrl}?youtube_error=${encodeURIComponent(reason)}`,
       );
@@ -93,8 +113,9 @@ export class YoutubeController {
     } catch (err) {
       const msg = (err as Error).message ?? 'error_desconocido';
       this.logger.error(`OAuth callback fallido: ${msg}`);
+      // r75 (H9): el mensaje interno ya no se refleja en la URL del frontend (solo un código fijo).
       return res.redirect(
-        `${frontendUrl}?youtube_error=${encodeURIComponent(msg)}`,
+        `${frontendUrl}?youtube_error=${encodeURIComponent(youtubeCallbackFailureCode(err))}`,
       );
     }
   }

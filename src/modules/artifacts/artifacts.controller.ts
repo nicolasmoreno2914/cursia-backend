@@ -20,11 +20,15 @@ import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { ArtifactAccessService } from '../authz/artifact-access.service';
 
 @Controller('artifacts')
 @UseGuards(SupabaseJwtGuard)
 export class ArtifactsController {
-  constructor(private readonly artifactsService: ArtifactsService) {}
+  constructor(
+    private readonly artifactsService: ArtifactsService,
+    private readonly artifactAccess: ArtifactAccessService,
+  ) {}
 
   /**
    * POST /api/v1/artifacts
@@ -36,6 +40,8 @@ export class ArtifactsController {
     @Body() dto: CreateArtifactDto,
     @CurrentUser() user: AuthUser,
   ) {
+    // r75 B1 (H8b): course_id / job_id / metadata del body validados contra el dueño antes de registrar nada.
+    await this.artifactAccess.assertClientCreateRefs(dto, user.id);
     const artifact = await this.artifactsService.createFromApi(dto, user.id);
     return { ok: true, data: artifact };
   }

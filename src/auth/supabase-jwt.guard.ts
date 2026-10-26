@@ -20,6 +20,48 @@ const adminVerifiedCache = new Map<string, number>();
 let authUsersUnreadableLogged = false;
 export function resetAdminVerifiedCacheForTests(): void { adminVerifiedCache.clear(); authUsersUnreadableLogged = false; }
 
+/** r75: marca del token ya verificado en este request (ver canActivate). */
+const VERIFIED_TOKEN_KEY = '__cursiaVerifiedJwt';
+let issMismatchWarned = false;
+
+/**
+ * r75 (H9): validación de `aud` / `iss`, compatible con los tokens existentes.
+ *  - `aud`: si viene, tiene que incluir la audiencia esperada (`SUPABASE_JWT_AUDIENCE`, default `authenticated`): un
+ *    token de otra audiencia firmado con el mismo secreto no entra. Sin `aud` → se acepta salvo
+ *    `SUPABASE_JWT_REQUIRE_AUD=true` (Supabase siempre lo emite; algunos harness locales no).
+ *  - `iss`: con `SUPABASE_JWT_ISSUER` configurado tiene que coincidir exactamente (recomendado:
+ *    `<SUPABASE_URL>/auth/v1`); sin él solo se avisa si no coincide con `SUPABASE_URL` (no rechaza: evita un corte total
+ *    si el SUPABASE_URL del servidor es un alias).
+ *  - `role`: `anon` / `service_role` nunca son sesiones de usuario.
+ * Puro → null = ok; si no, el motivo (solo para el log del servidor; el cliente ve el 401 genérico de siempre).
+ */
+export function jwtClaimProblem(payload: Record<string, any>, env: NodeJS.ProcessEnv = process.env): string | null {
+  const expectedAud = String(env.SUPABASE_JWT_AUDIENCE ?? 'authenticated').trim() || 'authenticated';
+  const aud = payload.aud;
+  if (aud === undefined || aud === null || aud === '') {
+    if (/^(1|true|yes|on)$/i.test(String(env.SUPABASE_JWT_REQUIRE_AUD ?? '').trim())) return 'sin aud';
+  } else {
+    const auds = Array.isArray(aud) ? aud.map(String) : [String(aud)];
+    if (!auds.includes(expectedAud)) return `aud inesperado (${auds.join(',').slice(0, 60)})`;
+  }
+  const iss = payload.iss;
+  const explicitIss = String(env.SUPABASE_JWT_ISSUER ?? '').trim().replace(/\/+$/, '');
+  if (explicitIss) {
+    if (String(iss ?? '').trim().replace(/\/+$/, '') !== explicitIss) return `iss inesperado (${String(iss ?? '').slice(0, 80)})`;
+  } else if (iss !== undefined && iss !== null && iss !== '') {
+    // Sin SUPABASE_JWT_ISSUER no se rechaza (SUPABASE_URL del servidor puede ser un alias del proyecto): solo se avisa
+    // una vez si no coincide, para que el operador fije SUPABASE_JWT_ISSUER.
+    const base = String(env.SUPABASE_URL ?? '').trim().replace(/\/+$/, '');
+    if (base && String(iss).replace(/\/+$/, '') !== `${base}/auth/v1` && !issMismatchWarned) {
+      issMismatchWarned = true;
+      new Logger('SupabaseJwtGuard').warn(`iss del JWT (${String(iss).slice(0, 80)}) ≠ SUPABASE_URL/auth/v1: fija SUPABASE_JWT_ISSUER para validarlo`);
+    }
+  }
+  const role = payload.role;
+  if (role === 'anon' || role === 'service_role') return `role ${role} no es una sesión de usuario`;
+  return null;
+}
+
 /** Caché del JWKS remoto — una sola instancia por proceso para evitar re-fetch en cada request */
 let _jwksCache: ReturnType<typeof createRemoteJWKSet> | null = null;
 
@@ -76,6 +118,10 @@ export class SupabaseJwtGuard implements CanActivate {
       throw new UnauthorizedException('Token de acceso requerido');
     }
 
+    // r75: AccountAccessGuard (APP_GUARD, corre antes que este guard de ruta) ya verificó ESTE mismo token en este
+    // request → no se repite la verificación (mismo resultado; ahorra el JWKS / el HMAC y la lectura de auth.users).
+    if ((req as any).user && (req as any)[VERIFIED_TOKEN_KEY] === token) return true;
+
     // ── 2. Verificar token ──────────────────────────────────────────
     // Modo A: HS256 simétrico (SUPABASE_JWT_SECRET configurado — proyectos legacy)
     // Modo B: ES256 asimétrico via JWKS (SUPABASE_URL configurado — proyectos nuevos)
@@ -104,6 +150,12 @@ export class SupabaseJwtGuard implements CanActivate {
     if (!payload.sub) {
       throw new UnauthorizedException('Token sin identificador de usuario');
     }
+    // r75 (H9): audiencia / emisor. Supabase emite aud='authenticated' e iss='<SUPABASE_URL>/auth/v1'.
+    const claimProblem = jwtClaimProblem(payload as Record<string, any>);
+    if (claimProblem) {
+      this.logger.warn(`token rechazado: ${claimProblem}`);
+      throw new UnauthorizedException('Token inválido o expirado');
+    }
 
     const user: AuthUser = {
       id:    payload.sub,
@@ -125,6 +177,7 @@ export class SupabaseJwtGuard implements CanActivate {
 
     // ── 4. Adjuntar al request ──────────────────────────────────────
     (req as any).user = user;
+    (req as any)[VERIFIED_TOKEN_KEY] = token;
     return true;
   }
 }

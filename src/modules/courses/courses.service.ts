@@ -1,3 +1,4 @@
+import { allowUnownedCourses } from '../authz/unowned-courses'; // r75 D-26 (H4)
 import { DESIGN_HOURS_KEY, DESIGN_PINS_KEY } from '../course-design/design-pins';
 import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
 import { BRIEF_KEY, PEDAGOGY_DERIVATION_KEY } from '../course-facts/course-facts';
@@ -45,7 +46,7 @@ export class CoursesService {
 
   // ── Leer flag de compatibilidad desde env ─────────────────────────────────
   private get allowUnowned(): boolean {
-    return process.env.ALLOW_UNOWNED_COURSES === 'true';
+    return allowUnownedCourses();
   }
 
   // ── CREATE ────────────────────────────────────────────────────────────────

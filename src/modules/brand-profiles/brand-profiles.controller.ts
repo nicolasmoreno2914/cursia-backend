@@ -7,6 +7,7 @@ import {
   HttpCode,
   HttpStatus,
   UseGuards,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { BrandProfilesService } from './brand-profiles.service';
 import { CreateBrandProfileDto } from './dto/create-brand-profile.dto';
@@ -27,7 +28,7 @@ export class BrandProfilesController {
   @Post('institutions/:institutionId/brand-profiles')
   @HttpCode(HttpStatus.CREATED)
   async createManual(
-    @Param('institutionId') institutionId: string,
+    @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
     @Body() dto: CreateBrandProfileDto,
     @CurrentUser() user: AuthUser,
   ) {
@@ -47,7 +48,7 @@ export class BrandProfilesController {
   @Post('institutions/:institutionId/brand-profiles/upload')
   @HttpCode(HttpStatus.CREATED)
   async upload(
-    @Param('institutionId') institutionId: string,
+    @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
     @Body() body: { sourceArtifactId: string; name?: string },
     @CurrentUser() user: AuthUser,
   ) {
@@ -65,7 +66,7 @@ export class BrandProfilesController {
    */
   @Get('institutions/:institutionId/brand-profiles/active')
   async findActive(
-    @Param('institutionId') institutionId: string,
+    @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
     @CurrentUser() user: AuthUser,
   ) {
     const profile = await this.brandProfilesService.findActive(
@@ -81,7 +82,7 @@ export class BrandProfilesController {
    */
   @Get('institutions/:institutionId/brand-profiles')
   async findAllVersions(
-    @Param('institutionId') institutionId: string,
+    @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
     @CurrentUser() user: AuthUser,
   ) {
     const profiles = await this.brandProfilesService.findAllVersions(
@@ -92,7 +93,7 @@ export class BrandProfilesController {
   }
 
   @Get('brand-profiles/:id')
-  async findOne(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+  async findOne(@Param('id', new ParseUUIDPipe()) id: string, @CurrentUser() user: AuthUser) {
     const profile = await this.brandProfilesService.findOne(id, user.id);
     return { ok: true, data: profile };
   }
@@ -100,7 +101,7 @@ export class BrandProfilesController {
   /** POST /api/v1/brand-profiles/:id/confirm — confirmación humana (Fase 2). */
   @Post('brand-profiles/:id/confirm')
   async confirm(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @Body() dto: ConfirmBrandProfileDto,
     @CurrentUser() user: AuthUser,
   ) {
@@ -109,7 +110,7 @@ export class BrandProfilesController {
   }
 
   @Post('brand-profiles/:id/reject')
-  async reject(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+  async reject(@Param('id', new ParseUUIDPipe()) id: string, @CurrentUser() user: AuthUser) {
     const profile = await this.brandProfilesService.reject(id, user.id);
     return { ok: true, data: profile };
   }

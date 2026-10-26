@@ -72,3 +72,71 @@ export function decideVideoEngineAccess(
   }
   return { allow: true, dryRun: false };
 }
+
+// ─── r75 B1 (H3): el job_id / batch_id de status y batch-status es del que pregunta ─────────────────────────────────
+//
+// Antes (review r1 I-2) el id de Videogen actuaba como capacidad: CUALQUIER usuario autenticado podía consultar el
+// estado (con `download_url`) de los renders de otros, con la clave compartida. Ahora el id tiene que estar ligado al
+// usuario en el servidor; si no, 404 `video_engine_not_found` (no revela si existe). Fuentes de propiedad:
+//   1. Registro del propio proxy: cada create / batch-create REAL que pasa por `POST /video-engine` deja una fila
+//      `usage_events` con `event_type = 'server.video_engine_render'` (solo el servidor la escribe: `POST /events`
+//      rechaza los tipos `server.*`) y los ids devueltos por Videogen en `metadata`.
+//   2. V2: `generation_item_runs.output_summary.external.videogenJobId|videogenBatchId` de un run del usuario.
+//   3. Legacy (video-worker): `production_jobs.output_summary.videogenJobs[].jobId` / `batchId` de un job del usuario.
+// SuperAdmin: cualquier id (soporte). Renders reales enviados ANTES de este cambio por el v1 del navegador no tienen
+// registro (1): su estado deja de consultarse por esta ruta (riesgo aceptado: hoy los renders reales requieren SA o
+// VIDEO_ENGINE_ALLOWED_OWNERS, y VIDEO_ENGINE_ENABLED está apagado por defecto).
+export const VIDEO_ENGINE_RENDER_EVENT = 'server.video_engine_render';
+export const VIDEO_ENGINE_NOT_FOUND = 'video_engine_not_found';
+
+export type VideoEngineQuery = (sql: string, params?: unknown[]) => Promise<any[]>;
+
+/** Ids devueltos por Videogen en un create / batch-create (job_id, batch_id, jobs[].job_id, videos[].job_id). */
+export function videoEngineIdsFromResponse(parsed: unknown): { jobIds: string[]; batchId: string | null } {
+  const o = (parsed && typeof parsed === 'object' ? parsed : {}) as Record<string, any>;
+  const ids = new Set<string>();
+  const push = (v: unknown) => { if (typeof v === 'string' && VIDEO_ENGINE_ID_RE.test(v)) ids.add(v); else if (typeof v === 'number') ids.add(String(v)); };
+  push(o.job_id);
+  push(o.id);
+  for (const list of [o.jobs, o.videos]) if (Array.isArray(list)) for (const j of list) if (j && typeof j === 'object') { push((j as any).job_id); push((j as any).id); }
+  const batch = typeof o.batch_id === 'string' && VIDEO_ENGINE_ID_RE.test(o.batch_id) ? o.batch_id : null;
+  return { jobIds: [...ids].slice(0, 500), batchId: batch };
+}
+
+export async function recordVideoEngineRender(query: VideoEngineQuery, userId: string, action: string, parsed: unknown): Promise<void> {
+  const { jobIds, batchId } = videoEngineIdsFromResponse(parsed);
+  if (!jobIds.length && !batchId) return;
+  await query(
+    `insert into public.usage_events (user_id, event_type, metadata) values ($1, $2, $3::jsonb)`,
+    [userId, VIDEO_ENGINE_RENDER_EVENT, JSON.stringify({ source: 'video_engine_proxy', action, jobIds, batchId })],
+  );
+}
+
+/** ¿El render `id` (job o batch) es de `userId`? Lecturas con `::text` en ambos lados (deriva de tipos de prod). */
+export async function videoEngineIdOwnedBy(query: VideoEngineQuery, userId: string, kind: 'job' | 'batch', id: string): Promise<boolean> {
+  if (!userId || !id || !VIDEO_ENGINE_ID_RE.test(id)) return false;
+  const tryQ = async (sql: string, params: unknown[]): Promise<boolean> => {
+    try {
+      const rows = await query(sql, params);
+      return Array.isArray(rows) && rows.length > 0;
+    } catch {
+      return false; // tabla / columna ausente en esta base → esa fuente no aplica
+    }
+  };
+  const registry = kind === 'job'
+    ? `select 1 from public.usage_events where user_id::text = $1 and event_type = '${VIDEO_ENGINE_RENDER_EVENT}' and (metadata->'jobIds') ? $2 limit 1`
+    : `select 1 from public.usage_events where user_id::text = $1 and event_type = '${VIDEO_ENGINE_RENDER_EVENT}' and metadata->>'batchId' = $2 limit 1`;
+  if (await tryQ(registry, [userId, id])) return true;
+  const v2Key = kind === 'job' ? 'videogenJobId' : 'videogenBatchId';
+  if (await tryQ(
+    `select 1 from public.generation_item_runs g join public.production_jobs pj on pj.id::text = g.job_id::text
+      where pj.owner_id::text = $1 and (g.output_summary->'external'->>'${v2Key}' = $2 or g.output_summary->>'${v2Key}' = $2) limit 1`,
+    [userId, id],
+  )) return true;
+  const legacy = kind === 'job'
+    ? `select 1 from public.production_jobs pj where pj.owner_id::text = $1
+         and jsonb_typeof(pj.output_summary->'videogenJobs') = 'array'
+         and exists (select 1 from jsonb_array_elements(pj.output_summary->'videogenJobs') e where e->>'jobId' = $2 or e->>'job_id' = $2) limit 1`
+    : `select 1 from public.production_jobs pj where pj.owner_id::text = $1 and pj.output_summary->>'batchId' = $2 limit 1`;
+  return tryQ(legacy, [userId, id]);
+}

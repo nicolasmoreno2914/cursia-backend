@@ -2,6 +2,7 @@ import { Controller, Get, UseGuards } from '@nestjs/common';
 import { SupabaseJwtGuard } from './supabase-jwt.guard';
 import { CurrentUser } from './current-user.decorator';
 import { AuthUser } from './auth.types';
+import { AllowInactiveAccount } from '../modules/authz/public.decorator';
 
 @Controller('auth')
 export class AuthController {
@@ -12,6 +13,7 @@ export class AuthController {
    */
   @Get('me')
   @UseGuards(SupabaseJwtGuard)
+  @AllowInactiveAccount() // r75: responde aunque la cuenta no esté autorizada / esté suspendida
   me(@CurrentUser() user: AuthUser) {
     return {
       id: user.id,

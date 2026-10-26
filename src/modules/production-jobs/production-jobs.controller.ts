@@ -10,6 +10,7 @@ import {
   HttpStatus,
   UseGuards,
   ServiceUnavailableException,
+  ParseUUIDPipe,
 } from '@nestjs/common';
 import { ProductionJobsService } from './production-jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
@@ -163,7 +164,7 @@ export class ProductionJobsController {
    */
   @Get(':id')
   async findOne(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     const job = await this.jobsService.findOne(id, user.id);
@@ -176,7 +177,7 @@ export class ProductionJobsController {
    */
   @Patch(':id')
   async update(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @Body() dto: UpdateJobDto,
     @CurrentUser() user: AuthUser,
   ) {
@@ -190,7 +191,7 @@ export class ProductionJobsController {
    */
   @Patch(':id/steps/:stepKey')
   async updateStep(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @Param('stepKey') stepKey: string,
     @Body() dto: UpdateStepDto,
     @CurrentUser() user: AuthUser,
@@ -228,7 +229,7 @@ export class ProductionJobsController {
   @Post(':id/requeue')
   @HttpCode(HttpStatus.OK)
   async requeue(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     assertLegacyPaidJobsEnabled('videos/requeue');
@@ -252,7 +253,7 @@ export class ProductionJobsController {
   @Post(':id/retry')
   @HttpCode(HttpStatus.OK)
   async retryFullCourseJob(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     assertLegacyPaidJobsEnabled('full/retry');
@@ -266,7 +267,7 @@ export class ProductionJobsController {
   @Post(':id/cancel')
   @HttpCode(HttpStatus.OK)
   async cancelJob(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @Body('reason') reason: string | undefined,
     @CurrentUser() user: AuthUser,
   ) {
