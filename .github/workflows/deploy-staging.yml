@@ -647,6 +647,9 @@ jobs:
                ensure_env_exact CURSIA_USER_BUDGETS enforce
                # r75 Fase 2: cuentas QA sintéticas (qa-r75-*@example.com, creadas en staging por POST /admin/users) con V2
                # para probar Propuesta / aprobación / estimado por rol. Ids de staging, no secretos. Sin video real.
+               # r75 Fase 2: el estimado («Autorizar y generar») de las cuentas QA, sin video real, necesita la vista previa
+               # simulada (videoMode mock, USD 0). Escape de QA de staging (EV6 DoD); producción no lo tiene.
+               ensure_env_exact DYNAMIC_ALLOW_VIDEO_PREVIEW true
                for qa_owner in c9742efe-f45a-4389-b305-09b7bac3e709 21b19a6a-6e39-4313-ac34-afaecbeefdf8 1706ff10-1157-4fa5-9e11-6e42bc9b1133 \
                                7aa4981f-b9ed-41ce-8859-53f2eb0383f0 34ed5dde-2950-4b8e-910e-c91c77ef4dd5 3bd4e919-e8d3-4c3e-9f13-737e4c2113b9 \
                                8e642f8d-1db2-40b8-86eb-1540a57ce7fe; do
