@@ -109,6 +109,9 @@ const BROWSER_PROBE = (api) => `(async () => {
       const m = /var headers = \{([^}]*)\}/.exec(fs.readFileSync(fe, 'utf8'));
       assert(m, 'cabeceras de backendApiRequest');
       const sent = [...m[1].matchAll(/'([A-Za-z-]+)'\s*:/g)].map((x) => x[1]);
+      // r75 (R75-E14): cabeceras agregadas después del literal (headers['X-…'] = …) también pasan por el preflight.
+      for (const x of fs.readFileSync(fe, 'utf8').matchAll(/headers\['([A-Za-z-]+)'\]\s*=/g)) sent.push(x[1]);
+      assert(sent.includes('X-Cursia-Institution') || !/X-Cursia-Institution/.test(fs.readFileSync(fe, 'utf8')), 'el cliente manda X-Cursia-Institution: se cruza con CORS');
       for (const h of sent) assert(C.CORS_ALLOWED_HEADERS.map((x) => x.toLowerCase()).includes(h.toLowerCase()), `cabecera «${h}» del cliente no permitida por CORS`);
     } else console.log('   (sin CURSIA_FRONTEND_REPO: no se cruzan las cabeceras del cliente)');
     // QA staging (Prebrief): el nombre del PDF viaja en Content-Disposition; el navegador solo la deja leer si se expone.

@@ -67,6 +67,7 @@ S.MeContext = (c, e, p = 'MeContext') => at(e, p, (v) => {
   v.oneOf(c.rbacMode, ['off', 'shadow', 'enforce']); v.oneOf(c.budgetsMode, ['off', 'shadow', 'enforce']);
   if (v.arr(c.memberships)) c.memberships.forEach((m, i) => S.Membership(m, e, `${p}.memberships[${i}]`));
   v.uuidN(c.defaultInstitutionId);
+  v.bool(c.institutionHeader); // R75-E14: el CORS acepta X-Cursia-Institution
   if (c.budgetsMode === 'off' && c.budget !== null) e.push(`${p}: budget debe ser null con budgetsMode=off`);
   if (c.budget !== null) S.UserBudgetSummary(c.budget, e, p + '.budget');
 });
