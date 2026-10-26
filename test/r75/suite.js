@@ -190,7 +190,8 @@ async function itemB() {
   }
   // SA: permitido en cualquier institución (sin membresía).
   const saR = scoped.filter((r) => r.method === 'GET').slice(0, 10);
-  for (const r of saR) { const res = await api('GET', fill(r.route, fx.A), { token: TK.sa }); t.ok(!isAuthzDeny(res) || res.status === 404 && res.code !== 'not_a_member' && !/permission/.test(String(res.code)), `SA accede a ${r.route} sin membresía`, brief(res)); }
+  const AUTHZ_CODES = ['permission_denied', 'not_a_member', 'institution_mismatch', 'account_not_authorized', 'account_suspended'];
+  for (const r of saR) { const res = await api('GET', fill(r.route, fx.A), { token: TK.sa }); t.ok(!AUTHZ_CODES.includes(res.code) && res.status !== 500, `SA accede a ${r.route} sin membresía (sin denegación de authz)`, brief(res)); }
   console.log(`  (b) ${scoped.length} rutas × ${roles.length} roles: ${denyOk} denegaciones y ${allowOk} permisos correctos`);
 }
 
@@ -379,7 +380,10 @@ async function itemE() {
   const rejected = res.filter((r) => r.status === 409 && r.code === 'user_budget_insufficient');
   const [rv] = await q(`select count(*)::int n from public.budget_reservations where user_id = $1`, [U.creadorA.id]);
   for (const r of started) if (r.data && r.data.run && r.data.run.id) await q(`update public.production_jobs set worker_status='cancelled', status='cancelled' where id=$1`, [r.data.run.id]).catch(() => {});
-  if (rv.n === 0 && rejected.length === 0) {
+  const err5 = res.filter((r) => r.status >= 500);
+  t.ok(err5.length === 0, `ningún arranque concurrente termina en 5xx (vinieron ${err5.length}/${N})`, res.map(brief));
+  if (err5.length) finding('P1', 'e', `${err5.length}/${N} arranques concurrentes → 500 «timeout exceeded when trying to connect» (pool de PG agotado: DB_POOL_MAX=${process.env.R75_DB_POOL_MAX || '5, default API'}; con 20 no pasa)`, `${N} × POST …/manifest/runs en paralelo, mismo usuario, cursos distintos; ver app.log`);
+  if (rv.n === 0 && rejected.length === 0 && err5.length === 0) {
     t.pending('reserva concurrente al arrancar', `el arranque de runs aún no reserva presupuesto (C2, runs.service, después de r74): ${started.length}/${N} arrancaron sin reserva`);
     finding('P1', 'e', `con CURSIA_USER_BUDGETS=enforce y disponible para 2,5 runs arrancaron ${started.length}/${N} sin reserva (falta C2)`, 'POST …/manifest/runs ×6 en paralelo como creadorA');
     return;
@@ -391,8 +395,6 @@ async function itemE() {
   t.ok(sum.n === started.length, 'una reserva por run arrancado', { reservas: sum.n, runs: started.length });
   const me = await api('GET', '/me/budget', { token: TK.creadorA });
   t.ok(me.status === 200 && Number(me.data.availableUsd) >= -1e-9, `/me/budget: disponible ≥ 0 (${me.data && me.data.availableUsd})`, brief(me));
-  const fivehundred = res.filter((r) => r.status >= 500);
-  if (fivehundred.length) finding('P1', 'e', `${fivehundred.length}/${N} arranques concurrentes → 500 «timeout exceeded when trying to connect» (pool de PG agotado mientras se espera MONTH_CAP_LOCK, ahora global en todo arranque; DB_POOL_MAX=${process.env.R75_DB_POOL_MAX || '5 (default API)'})`, `${N} × POST …/manifest/runs en paralelo del mismo usuario, cursos distintos`);
   const ins = rejected[0];
   if (ins) t.ok(ins.json && ins.json.requiredUsd && ins.json.availableUsd !== undefined && ins.json.canRequest === true, '409 user_budget_insufficient incluye requiredUsd/availableUsd/canRequest', ins.json);
   // Usuario en USD 0 (regla 6): no arranca; puede solicitar.
