@@ -297,6 +297,14 @@ async function itemD() {
     try { gc = await buildCourse('creadorA', I.A, 'r75 suspensión de generación'); } catch (e) { t.pending('arranque con generación suspendida', `curso con Manifest: ${e.message}`); }
     const startOf = (who) => api('POST', `/courses/${gc.id}/blueprints/${gc.n}/manifest/runs`, { token: TK[who], body: D_FIELDS, headers: { 'X-Cursia-Institution': I.A.id } });
     if (gc) {
+      // Orden de 01 §5.2 (pre-tx): permiso → suspensión/congelación → estimado → presupuesto. Con USD 0 tiene que ganar la suspensión.
+      const st0 = await startOf('creadorA');
+      if (F.budgets) {
+        t.ok(st0.status === 403 && st0.code === 'generation_suspended', 'orden: con USD 0 y generación suspendida → 403 generation_suspended (no el 409 de presupuesto)', brief(st0));
+        if (st0.code && /^user_budget/.test(st0.code)) finding('P2', 'd', `suspensión de generación evaluada DESPUÉS del presupuesto: el suspendido ve «${st0.code}» y se le ofrece «Solicitar autorización»`, `POST …/manifest/runs con generación suspendida y USD 0`);
+        const sb = await api('PUT', `/admin/users/${U.creadorA.id}/budget`, { token: TK.sa, body: { monthlyAmountUsd: '50.0000000000', effectiveMonth: new Date().toISOString().slice(0, 7), reason: 'QA r75 (d)' } });
+        t.ok(sb.status === 200, 'SA asigna USD 50 a creadorA para aislar la suspensión del presupuesto', brief(sb));
+      }
       const st = await startOf('creadorA');
       if (st.status === 403 && st.code === 'generation_suspended') t.ok(true, 'arranque con generación suspendida → 403 generation_suspended');
       else if (!F.budgets) t.pending('arranque con generación suspendida → 403', `enforcement en runs (B/C2) no integrado: vino ${st.status} ${st.code || st.error}`);
@@ -317,6 +325,7 @@ async function itemD() {
     }
     r = await api('PUT', '/admin/platform/generation-freeze', { token: TK.sa, body: { enabled: false, reason: 'QA r75' } });
     t.ok(r.status === 200, 'SA descongela', brief(r));
+    if (F.budgets) await api('PUT', `/admin/users/${U.creadorA.id}/budget`, { token: TK.sa, body: { monthlyAmountUsd: '0.0000000000', effectiveMonth: new Date().toISOString().slice(0, 7), reason: 'QA r75 (d) fin' } });
     const nsa = await api('PUT', '/admin/platform/generation-freeze', { token: TK.adminA, body: { enabled: true, reason: 'x' } });
     t.ok(nsa.status === 403, 'un admin institucional no congela la plataforma', brief(nsa));
   } else t.pending('suspensión de generación / congelación', 'endpoints SA de A no integrados');
@@ -382,6 +391,8 @@ async function itemE() {
   t.ok(sum.n === started.length, 'una reserva por run arrancado', { reservas: sum.n, runs: started.length });
   const me = await api('GET', '/me/budget', { token: TK.creadorA });
   t.ok(me.status === 200 && Number(me.data.availableUsd) >= -1e-9, `/me/budget: disponible ≥ 0 (${me.data && me.data.availableUsd})`, brief(me));
+  const fivehundred = res.filter((r) => r.status >= 500);
+  if (fivehundred.length) finding('P1', 'e', `${fivehundred.length}/${N} arranques concurrentes → 500 «timeout exceeded when trying to connect» (pool de PG agotado mientras se espera MONTH_CAP_LOCK, ahora global en todo arranque; DB_POOL_MAX=${process.env.R75_DB_POOL_MAX || '5 (default API)'})`, `${N} × POST …/manifest/runs en paralelo del mismo usuario, cursos distintos`);
   const ins = rejected[0];
   if (ins) t.ok(ins.json && ins.json.requiredUsd && ins.json.availableUsd !== undefined && ins.json.canRequest === true, '409 user_budget_insufficient incluye requiredUsd/availableUsd/canRequest', ins.json);
   // Usuario en USD 0 (regla 6): no arranca; puede solicitar.
@@ -389,6 +400,7 @@ async function itemE() {
   const s0 = await api('POST', `/courses/${c0.id}/blueprints/${c0.n}/manifest/runs`, { token: TK.usd0, body: D_FIELDS, headers: { 'X-Cursia-Institution': I.A.id } });
   t.ok(s0.status === 409 && ['user_budget_not_assigned', 'user_budget_insufficient'].includes(s0.code), 'usuario nuevo (USD 0) → 409 user_budget_not_assigned', brief(s0));
   const br = await api('POST', '/budget-requests', { token: TK.usd0, body: { courseId: c0.id, amountUsd: req.toFixed(10), reason: 'QA r75' }, headers: { 'X-Cursia-Institution': I.A.id } });
+  if (br.status === 404 && br.code === 'course_not_found' && !F.permGuard) { t.pending('solicitudes de autorización', 'POST /budget-requests en RBAC enforce exige el puerto de permisos de B2 (sin él, 404 cerrado)'); return; }
   const be = []; S.BudgetRequest(br.data, be); t.ok((br.status === 201 || br.status === 200) && !be.length, 'usd0 crea una solicitud de autorización', { ...brief(br), be });
   const dup = await api('POST', '/budget-requests', { token: TK.usd0, body: { courseId: c0.id, amountUsd: '1.0000000000', reason: 'dup' }, headers: { 'X-Cursia-Institution': I.A.id } });
   t.ok(dup.status === 409 && dup.code === 'budget_request_duplicate', 'segunda solicitud pendiente del mismo curso → 409 budget_request_duplicate', brief(dup));
@@ -439,7 +451,7 @@ async function itemG() {
   const held = async () => Number((await api('GET', '/me/budget', { token: TK.creadorB })).data.heldUsd);
   const h0 = await held();
   for (const [st, want] of [['running', 3], ['paused', 3], ['needs_reconnect', 3], ['completed', 0], ['cancelled', 0], ['failed', 0]]) {
-    await q(`update public.production_jobs set worker_status = $1, status = $1 where id = $2`, [st, run.id]);
+    await q(`update public.production_jobs set worker_status = $1::text, status = $1::text where id = $2`, [st, run.id]);
     const h = await held();
     t.ok(Math.abs(h - (h0 - 3) - want) < 1e-6, `run ${st}: retenido del run = ${want} (autorizado 4 − gastado 1${want ? '' : ', terminal → 0'})`, { held: h, base: h0 - 3 });
   }

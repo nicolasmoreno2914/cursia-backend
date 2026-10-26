@@ -64,6 +64,7 @@ function appEnv(fakes, extra = {}) {
     DYNAMIC_AUTO_HEAL_ENABLED: 'false', DYNAMIC_AUTO_PACKAGE_ENABLED: 'false',
     CURSIA_ACCOUNT_GUARD: 'enforce', CURSIA_RBAC_MODE: 'enforce', CURSIA_USER_BUDGETS: 'enforce',
     PORT: String(APP_PORT),
+    ...(process.env.R75_DB_POOL_MAX ? { DB_POOL_MAX: process.env.R75_DB_POOL_MAX } : {}),
     ...extra,
   };
 }
