@@ -34,6 +34,9 @@ import { CourseFactsModule } from './modules/course-facts/course-facts.module';
 import { CourseDesignModule } from './modules/course-design/course-design.module';
 import { PrebriefModule } from './modules/prebrief/prebrief.module';
 import { FinopsModule } from './modules/finops/finops.module';
+import { AuthzModule } from './modules/authz/authz.module';
+import { AccessModule } from './modules/access/access.module';
+import { BudgetsModule } from './modules/budgets/budgets.module';
 
 @Module({
   imports: [
@@ -63,6 +66,9 @@ import { FinopsModule } from './modules/finops/finops.module';
     DynamicGenerationModule,
     DynamicPackagingModule,
     FeaturesModule,
+    // r75 (B): AccountAccessGuard (APP_GUARD) DESPUÉS de DynamicFeatureGuard (FeaturesModule) → una ruta V2 apagada
+    // sigue dando su 404 nativo. Flags CURSIA_ACCOUNT_GUARD / CURSIA_RBAC_MODE (default off). Assert de arranque D-26.
+    AuthzModule,
     CoherenceModule,
     InvalidationModule,
     CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment / pedagogy / academic)
@@ -72,6 +78,8 @@ import { FinopsModule } from './modules/finops/finops.module';
     PrebriefModule, // Prebrief pedagógico: propuesta versionada, aprobación y PDF
     AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
     FinopsModule,
+    AccessModule, // r75 (A): instituciones multi-miembro, membresías, usuarios SA, suspensiones, auditoría, /me/context
+    BudgetsModule, // r75 (C): presupuesto mensual por usuario, solicitudes y gasto por institución (CURSIA_USER_BUDGETS)
   ],
   controllers: [AppController],
   providers: [

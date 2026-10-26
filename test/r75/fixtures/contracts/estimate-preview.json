@@ -1,0 +1,83 @@
+{
+  "_nota": "Solo los campos que r75 agrega (02 §E.1); el resto de la respuesta de estimate-preview no cambia. policy.monthSpent es null para quien no es SA (D-25).",
+  "POST …/runs/estimate-preview#suficiente_no_sa": {
+    "status": 200,
+    "body": {
+      "data": {
+        "userBudget": {
+          "mode": "enforce",
+          "month": "2026-10",
+          "availableUsd": "14.8750000000",
+          "requiredUsd": "9.2000000000",
+          "sufficient": true,
+          "canRequest": true,
+          "payerUserId": "0a000000-0000-4000-8000-000000000003"
+        },
+        "policy": {
+          "monthSpent": null
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST …/runs/estimate-preview#insuficiente_no_sa": {
+    "status": 200,
+    "body": {
+      "data": {
+        "userBudget": {
+          "mode": "enforce",
+          "month": "2026-10",
+          "availableUsd": "0.0000000000",
+          "requiredUsd": "9.2000000000",
+          "sufficient": false,
+          "canRequest": true,
+          "payerUserId": "0a000000-0000-4000-8000-000000000003"
+        },
+        "policy": {
+          "monthSpent": null
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST …/runs/estimate-preview#superadmin": {
+    "status": 200,
+    "body": {
+      "data": {
+        "userBudget": {
+          "mode": "enforce",
+          "month": "2026-10",
+          "availableUsd": "50.0000000000",
+          "requiredUsd": "9.2000000000",
+          "sufficient": true,
+          "canRequest": true,
+          "payerUserId": "0a000000-0000-4000-8000-000000000001"
+        },
+        "policy": {
+          "monthSpent": "312.4400000000"
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST …/runs/estimate-preview#budgets_off": {
+    "status": 200,
+    "body": {
+      "data": {
+        "userBudget": {
+          "mode": "off",
+          "month": "2026-10",
+          "availableUsd": "14.8750000000",
+          "requiredUsd": "9.2000000000",
+          "sufficient": true,
+          "canRequest": false,
+          "payerUserId": "0a000000-0000-4000-8000-000000000003"
+        },
+        "policy": {
+          "monthSpent": null
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

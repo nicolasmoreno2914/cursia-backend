@@ -1,0 +1,30 @@
+{
+  "GET /admin/platform/controls": {
+    "status": 200,
+    "body": {
+      "data": {
+        "generationFreeze": {
+          "enabled": false,
+          "reason": null,
+          "updatedAt": "2026-10-26T11:45:00.000Z",
+          "updatedBy": "0a000000-0000-4000-8000-000000000001"
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "PUT /admin/platform/generation-freeze": {
+    "status": 200,
+    "body": {
+      "data": {
+        "generationFreeze": {
+          "enabled": true,
+          "reason": "QA r75: congelación de prueba",
+          "updatedAt": "2026-10-26T11:45:00.000Z",
+          "updatedBy": "0a000000-0000-4000-8000-000000000001"
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

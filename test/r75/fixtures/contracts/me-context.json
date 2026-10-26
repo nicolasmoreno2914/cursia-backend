@@ -1,0 +1,420 @@
+{
+  "GET /me/context#superadmin": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000001",
+          "email": "qa-r75-superadmin@example.com"
+        },
+        "superAdmin": true,
+        "account": {
+          "authorized": true,
+          "status": "active",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [],
+        "defaultInstitutionId": null,
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "0.0000000000",
+          "spentUsd": "0.0000000000",
+          "heldUsd": "0.0000000000",
+          "availableUsd": "0.0000000000",
+          "pendingRequests": 0
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#creador_multi_institucion": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000003",
+          "email": "qa-r75-creador-a@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": true,
+          "status": "active",
+          "mustChangePassword": true
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "name": "QA r75 Institución A",
+            "kind": "organization",
+            "role": "CREADOR",
+            "status": "active",
+            "permissions": [
+              "courses.view",
+              "courses.create",
+              "courses.edit",
+              "proposals.review",
+              "generations.start",
+              "generations.retry",
+              "exports.download"
+            ]
+          },
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000b",
+            "name": "QA r75 Institución B",
+            "kind": "organization",
+            "role": "CONSULTA",
+            "status": "active",
+            "permissions": [
+              "courses.view"
+            ]
+          }
+        ],
+        "defaultInstitutionId": "1b000000-0000-4000-8000-00000000000a",
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "25.0000000000",
+          "spentUsd": "4.1250000000",
+          "heldUsd": "6.0000000000",
+          "availableUsd": "14.8750000000",
+          "pendingRequests": 1
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#admin_institucional": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000002",
+          "email": "qa-r75-admin-inst-a@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": true,
+          "status": "active",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "name": "QA r75 Institución A",
+            "kind": "organization",
+            "role": "ADMIN_INSTITUCIONAL",
+            "status": "active",
+            "permissions": [
+              "courses.view",
+              "courses.create",
+              "courses.edit",
+              "courses.delete",
+              "proposals.review",
+              "generations.retry",
+              "exports.download",
+              "spend.view",
+              "roles.manage"
+            ]
+          }
+        ],
+        "defaultInstitutionId": "1b000000-0000-4000-8000-00000000000a",
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "0.0000000000",
+          "spentUsd": "0.0000000000",
+          "heldUsd": "0.0000000000",
+          "availableUsd": "0.0000000000",
+          "pendingRequests": 0
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#aprobador": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000004",
+          "email": "qa-r75-aprobador-a@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": true,
+          "status": "active",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "name": "QA r75 Institución A",
+            "kind": "organization",
+            "role": "APROBADOR_ACADEMICO",
+            "status": "active",
+            "permissions": [
+              "courses.view",
+              "proposals.review",
+              "proposals.approve",
+              "exports.download"
+            ]
+          }
+        ],
+        "defaultInstitutionId": "1b000000-0000-4000-8000-00000000000a",
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "0.0000000000",
+          "spentUsd": "0.0000000000",
+          "heldUsd": "0.0000000000",
+          "availableUsd": "0.0000000000",
+          "pendingRequests": 0
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#consulta": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000005",
+          "email": "qa-r75-consulta-a@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": true,
+          "status": "active",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "name": "QA r75 Institución A",
+            "kind": "organization",
+            "role": "CONSULTA",
+            "status": "active",
+            "permissions": [
+              "courses.view"
+            ]
+          }
+        ],
+        "defaultInstitutionId": "1b000000-0000-4000-8000-00000000000a",
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "0.0000000000",
+          "spentUsd": "0.0000000000",
+          "heldUsd": "0.0000000000",
+          "availableUsd": "0.0000000000",
+          "pendingRequests": 0
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#suspendido": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000007",
+          "email": "qa-r75-suspendido@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": true,
+          "status": "suspended",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "name": "QA r75 Institución A",
+            "kind": "organization",
+            "role": "CREADOR",
+            "status": "active",
+            "permissions": [
+              "courses.view",
+              "courses.create",
+              "courses.edit",
+              "proposals.review",
+              "generations.start",
+              "generations.retry",
+              "exports.download"
+            ]
+          }
+        ],
+        "defaultInstitutionId": "1b000000-0000-4000-8000-00000000000a",
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "0.0000000000",
+          "spentUsd": "0.0000000000",
+          "heldUsd": "0.0000000000",
+          "availableUsd": "0.0000000000",
+          "pendingRequests": 0
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#no_autorizado": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-0000000000ee",
+          "email": "qa-r75-sin-acceso@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": false,
+          "status": "not_authorized",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [],
+        "defaultInstitutionId": null,
+        "budget": null
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#generacion_suspendida_y_congelada": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000003",
+          "email": "qa-r75-creador-a@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": true,
+          "status": "active",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": true,
+          "platformFrozen": true
+        },
+        "rbacMode": "enforce",
+        "budgetsMode": "enforce",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "name": "QA r75 Institución A",
+            "kind": "organization",
+            "role": "CREADOR",
+            "status": "active",
+            "permissions": [
+              "courses.view",
+              "courses.create",
+              "courses.edit",
+              "proposals.review",
+              "generations.start",
+              "generations.retry",
+              "exports.download"
+            ]
+          }
+        ],
+        "defaultInstitutionId": "1b000000-0000-4000-8000-00000000000a",
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "25.0000000000",
+          "spentUsd": "4.1250000000",
+          "heldUsd": "6.0000000000",
+          "availableUsd": "14.8750000000",
+          "pendingRequests": 1
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/context#modos_off": {
+    "status": 200,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-000000000003",
+          "email": "qa-r75-creador-a@example.com"
+        },
+        "superAdmin": false,
+        "account": {
+          "authorized": true,
+          "status": "active",
+          "mustChangePassword": false
+        },
+        "generation": {
+          "suspended": false,
+          "platformFrozen": false
+        },
+        "rbacMode": "off",
+        "budgetsMode": "off",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-0000000000ff",
+            "name": "Espacio de qa-r75-creador-a@example.com",
+            "kind": "personal",
+            "role": "ADMIN_INSTITUCIONAL",
+            "status": "active",
+            "permissions": [
+              "courses.view",
+              "courses.create",
+              "courses.edit",
+              "courses.delete",
+              "proposals.review",
+              "generations.retry",
+              "exports.download",
+              "spend.view",
+              "roles.manage",
+              "proposals.approve",
+              "generations.start"
+            ]
+          }
+        ],
+        "defaultInstitutionId": "1b000000-0000-4000-8000-0000000000ff",
+        "budget": null
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

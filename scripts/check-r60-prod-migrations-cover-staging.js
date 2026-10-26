@@ -28,6 +28,15 @@ const APPLIED_BY_DEPLOY_YML = {
 };
 // El PASO 0 del runner (builtin) es el SQL de esta migración (scripts/lib/production-jobs-constraints.js).
 const BUILTIN_STEP0 = 'migrate-production-jobs-constraints.js';
+// r75: migraciones que staging corre pero producción NO recibe hasta la aprobación EXPLÍCITA del owner. Cada una debe
+// estar en EXCLUDED con el motivo «r75: staging-only hasta aprobación del owner» (su .sql y su script) y NO en el plan.
+// `sql: null` = el script no aplica un .sql propio (el backfill escribe datos con SQL inline).
+const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
+  'migrate-r75-access.js': { sql: 'supabase-migration-r75-access.sql' },
+  'migrate-r75-budgets.js': { sql: 'supabase-migration-r75-budgets.sql' },
+  'migrate-r75-backfill.js': { sql: null },
+};
+const STAGING_ONLY_REASON = /^r75: staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).
 const ORDER_EXCEPTIONS = {
   'supabase-migration-ev6-h5p2.sql': 'courses.review_cards_enabled: columna aditiva independiente (nullable, default false); producción la aplica después de FinOps desde EV6',
@@ -73,6 +82,18 @@ function coverageFindings(stagingScripts, plan) {
   for (const script of stagingScripts) {
     if (script === BUILTIN_STEP0) continue;
     if (APPLIED_BY_DEPLOY_YML[script]) continue;
+    const so = STAGING_ONLY_UNTIL_OWNER_APPROVAL[script];
+    if (so) {
+      const exScript = excluded.get(`scripts/${script}`);
+      if (!exScript || !STAGING_ONLY_REASON.test(exScript)) errs.push(`${script}: staging-only r75 pero falta en EXCLUDED con el motivo «r75: staging-only hasta aprobación del owner»`);
+      if (so.sql) {
+        if (sqlOfScript(script) !== so.sql) errs.push(`${script}: se esperaba que aplique ${so.sql} (aplica ${sqlOfScript(script)})`);
+        const exSql = excluded.get(so.sql);
+        if (!exSql || !STAGING_ONLY_REASON.test(exSql)) errs.push(`${so.sql}: staging-only r75 pero falta en EXCLUDED con el motivo «r75: staging-only hasta aprobación del owner»`);
+        if (planFiles.includes(so.sql)) errs.push(`${so.sql}: staging-only r75 pero está en el plan de producción`);
+      }
+      continue;
+    }
     const sql = sqlOfScript(script);
     if (!sql) { errs.push(`${script}: no se pudo determinar su .sql (debe nombrar exactamente un supabase-migration-*.sql)`); continue; }
     stagingSql.push({ script, sql });
@@ -163,6 +184,14 @@ check('(e) autoprueba: quitar un paso o invertir una dependencia SÍ se detecta'
   const b = steps.findIndex((s) => s.id === 'academic-context');
   [steps[a], steps[b]] = [steps[b], steps[a]];
   assert(coverageFindings(stagingScripts, { ...plan, steps }).some((e) => /orden distinto/.test(e)), 'no detectó el orden invertido');
+});
+
+check('r75: las migraciones staging-only están en EXCLUDED con su motivo, fuera del plan, y quitarlas de EXCLUDED se detecta', () => {
+  const r75 = stagingScripts.filter((s) => STAGING_ONLY_UNTIL_OWNER_APPROVAL[s]);
+  if (!r75.length) return; // deploy-staging.yml todavía no las corre
+  const stripped = { steps: plan.steps, excluded: plan.excluded.filter((e) => !/r75/.test(e.file)) };
+  assert(coverageFindings(r75, stripped).some((e) => /staging-only r75/.test(e)), 'no detectó la falta en EXCLUDED');
+  for (const s of r75) { const so = STAGING_ONLY_UNTIL_OWNER_APPROVAL[s]; if (so.sql) assert(!plan.steps.some((x) => x.file === so.sql), `${so.sql} en el plan`); }
 });
 
 console.log(`\n${passes} ok, ${failures} fail`);

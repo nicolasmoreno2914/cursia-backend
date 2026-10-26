@@ -20,11 +20,18 @@ import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { ArtifactAccessService, signedUrlSecondsFor } from '../authz/artifact-access.service';
+import { Access } from '../authz/access.decorator';
+import type { AccessContext } from '../authz/access-context';
+import { AuthenticatedOnly, RequirePermission } from '../authz/require-permission.decorator';
 
 @Controller('artifacts')
 @UseGuards(SupabaseJwtGuard)
 export class ArtifactsController {
-  constructor(private readonly artifactsService: ArtifactsService) {}
+  constructor(
+    private readonly artifactsService: ArtifactsService,
+    private readonly artifactAccess: ArtifactAccessService,
+  ) {}
 
   /**
    * POST /api/v1/artifacts
@@ -32,10 +39,13 @@ export class ArtifactsController {
    */
   @Post()
   @HttpCode(HttpStatus.CREATED)
+  @AuthenticatedOnly('registra un objeto de la carpeta propia (course_id / job_id validados contra el dueño, H8b)')
   async create(
     @Body() dto: CreateArtifactDto,
     @CurrentUser() user: AuthUser,
   ) {
+    // r75 B1 (H8b): course_id / job_id / metadata del body validados contra el dueño antes de registrar nada.
+    await this.artifactAccess.assertClientCreateRefs(dto, user.id);
     const artifact = await this.artifactsService.createFromApi(dto, user.id);
     return { ok: true, data: artifact };
   }
@@ -45,6 +55,7 @@ export class ArtifactsController {
    * Lista artifacts del usuario. Filtros opcionales: course_id, type, job_id.
    */
   @Get()
+  @AuthenticatedOnly('lista los artifacts propios (owner_id = actor)')
   async findAll(
     @CurrentUser() user: AuthUser,
     @Query('course_id') courseId?: string,
@@ -66,11 +77,13 @@ export class ArtifactsController {
    * Metadata de un artifact.
    */
   @Get(':id')
+  @RequirePermission('courses.view', { artifact: 'param:id' })
   async findOne(
     @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    const artifact = await this.artifactsService.findOne(id, user.id);
+    const artifact = await this.artifactsService.findOne(id, access.effectiveOwnerId);
     // EV6 DoD fix round 3 (N2): un .mbz QA / degradado NUEVO no existe para un no admin.
     if (isAdminOnlyPackageArtifact(artifact) && !isSuperAdminEmail(user.email)) throw new NotFoundException(`Artifact ${id} not found`);
     return { ok: true, data: artifact };
@@ -83,26 +96,26 @@ export class ArtifactsController {
    * para que el frontend genere la URL con su propio SDK.
    */
   @Get(':id/download-url')
+  @RequirePermission('exports.download', { artifact: 'param:id' })
   async getDownloadUrl(
     @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Query('expires') expires?: string,
   ) {
-    const expiresIn = expires ? parseInt(expires, 10) : 3600;
+    // r75 (D-15): para un miembro que no es el dueño, 300 s por defecto y 3600 s como máximo; el dueño, como hoy.
+    const expiresIn = signedUrlSecondsFor(access, expires);
     // EV6 DoD fix round 2 (M4): un .mbz de QA / degradado NUEVO (metadata.packageKind) es solo de
     // SUPER_ADMIN también por esta ruta genérica. Los .mbz anteriores (sin el campo) no cambian.
-    const artifact = await this.artifactsService.findOne(id, user.id);
+    const artifact = await this.artifactsService.findOne(id, access.effectiveOwnerId);
     if (isAdminOnlyPackageArtifact(artifact) && !isSuperAdminEmail(user.email)) {
       throw new ForbiddenException({
         code: 'admin_recovery_only',
         message: 'admin_recovery_only: este paquete es una copia interna de control de calidad (no entregable); solo un administrador de Cursia puede descargarlo.',
       });
     }
-    const result = await this.artifactsService.getDownloadUrl(
-      id,
-      user.id,
-      isNaN(expiresIn) ? 3600 : expiresIn,
-    );
+    // Se firma con el owner_id REAL del artifact (su carpeta); el permiso ya lo verificó el guard.
+    const result = await this.artifactsService.getDownloadUrl(id, access.effectiveOwnerId, expiresIn);
     return { ok: true, data: result };
   }
 
@@ -112,6 +125,7 @@ export class ArtifactsController {
    */
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
+  @AuthenticatedOnly('borra solo un artifact propio (owner_id = actor; QA de otros: solo SA)')
   async remove(
     @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,

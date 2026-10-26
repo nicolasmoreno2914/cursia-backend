@@ -3,6 +3,7 @@ import {
   Body,
   ConflictException,
   Controller,
+  ForbiddenException,
   Get,
   HttpCode,
   HttpStatus,
@@ -31,6 +32,33 @@ import { SPEND_CONTROL_CODES } from './spend-controls';
 import { RUN_BUDGET_NOT_AUTHORIZED } from './run-budget';
 import { parseReconcileDecision, ReconcileDecision, ReconcileEvidence } from './reconcile-decision';
 import { POLICY_ADMIN_SCOPES, PolicyAdminScope, PolicyRow } from './policy-admin';
+import { USER_BUDGET_EXHAUSTED, USER_BUDGET_INSUFFICIENT } from './user-budget-gate';
+import { SuperAdminOnly } from '../authz/require-permission.decorator';
+import { TokenAuthenticated } from '../authz/public.decorator';
+
+/** r75: código HTTP estable del presupuesto por usuario (02 §F). */
+export const USER_BUDGET_INSUFFICIENT_HTTP = 'user_budget_insufficient';
+export const USER_BUDGET_NOT_ASSIGNED_HTTP = 'user_budget_not_assigned';
+
+/**
+ * r75: FinopsError USER_BUDGET_* → 409 con los datos que la UI necesita («Solicitar autorización»). Montos como string
+ * decimal. `user_budget_not_assigned` cuando el usuario no tiene ningún presupuesto en el mes (límite 0 sin ajustes).
+ */
+export function userBudgetConflict(err: FinopsError): ConflictException {
+  const d = (err.details ?? {}) as Record<string, unknown>;
+  const code = d.notAssigned === true ? USER_BUDGET_NOT_ASSIGNED_HTTP : USER_BUDGET_INSUFFICIENT_HTTP;
+  const body: Record<string, unknown> = {
+    code,
+    message: err.message.replace(/^USER_BUDGET_(EXHAUSTED|INSUFFICIENT):\s*/, ''),
+    requiredUsd: d.requiredUsd ?? null,
+    availableUsd: d.availableUsd ?? null,
+    payerUserId: d.payerUserId ?? null,
+    canRequest: true,
+  };
+  if (d.estimateId) body.estimateId = d.estimateId;
+  if (d.runId) body.runId = d.runId;
+  return new ConflictException(body);
+}
 
 /** r62: fila de política → JSON público del endpoint de admin (el flag explícito sale de limits, como policyFromRow). */
 export function publicPolicyRow(r: PolicyRow) {
@@ -125,6 +153,8 @@ export function finopsErrorToHttp(err: unknown): unknown {
     if (err.code === 'ESTIMATE_NOT_FOUND') return new NotFoundException({ code: err.code, message: err.message });
     // FinOps P0: reserva de una parte de un run ajeno → 409 con código estable (el proxy no llama al proveedor).
     if (err.code === 'ATTRIBUTION_REJECTED') return new ConflictException({ code: 'attribution_rejected', message: err.message });
+    // r75: presupuesto mensual del usuario (arranque, ampliación o llamada sin run) → 409 user_budget_insufficient.
+    if (err.code === USER_BUDGET_EXHAUSTED || err.code === USER_BUDGET_INSUFFICIENT) return userBudgetConflict(err);
     // r58 H4: reserva pagada de un run sin ninguna autorización → 409 con código estable (el proxy no llama).
     if (err.code === 'RUN_BUDGET_NOT_AUTHORIZED') return new ConflictException({ code: RUN_BUDGET_NOT_AUTHORIZED, message: err.message });
     // r58: controles de gasto del servidor → 409 con código estable (el proxy no llama y el navegador no reintenta).
@@ -142,6 +172,7 @@ export function finopsErrorToHttp(err: unknown): unknown {
  * V2.1 RF-a — ingest server-to-server del proxy LLM (RF-b lo cablea).
  * Sin JWT de usuario: autenticado por secreto compartido (FinopsIngestTokenGuard).
  */
+@TokenAuthenticated() // r75: server-to-server con x-cursia-finops-token (sin JWT de usuario)
 @Controller('finops/ingest')
 @UseGuards(FinopsIngestTokenGuard)
 export class FinopsIngestController {
@@ -199,6 +230,7 @@ export class FinopsIngestController {
  * Piloto #1209 (2026-10-11): reserva del proxy LLM ANTES de llamar a Anthropic (server-to-server, mismo token).
  * Si no se puede registrar, el proxy no llama (nunca hay gasto sin registro).
  */
+@TokenAuthenticated() // r75: server-to-server con x-cursia-finops-token (sin JWT de usuario)
 @Controller('finops/ingest')
 @UseGuards(FinopsIngestTokenGuard)
 export class FinopsLlmReservationController {
@@ -218,6 +250,11 @@ export class FinopsLlmReservationController {
       // Review M5: el reintento del MISMO POST (timeout del proxy) no vuelve a pasar por el guard (ya está reservada).
       const already = await this.ledger.reservationSettled(llmProxyReservationKey(parsed.callId));
       if ((parsed.mode ?? 'real') === 'real' && already === null) {
+        // r75 (02 §E.5): cuenta no autorizada / suspendida, generación suspendida o plataforma congelada → 403 estable
+        // (el proxy no llama). Lo implementan A/B (SubjectSpendAccess); sin registrar → sin cambio. Aplica también a BYOK.
+        const access = typeof this.budget.getSubjectSpendAccess === 'function' ? this.budget.getSubjectSpendAccess() : null;
+        const denied = access ? await access.denialFor(parsed.subject) : null;
+        if (denied) throw new ForbiddenException({ code: denied.code, message: denied.message });
         const deny = await this.budget.guardLlmProxyCall({
           subject: parsed.subject, itemRunId: parsed.itemRunId ?? null, model: parsed.model,
           promptChars: parsed.promptChars, maxTokens: parsed.maxTokens, billingAccount: parsed.billingAccount,
@@ -272,6 +309,7 @@ export class FinopsLlmReservationController {
 }
 
 /** V2.1 RF-a — lecturas administrativas (mismo guard que /admin/dashboard). */
+@SuperAdminOnly() // r75: lecturas y acciones FinOps de administración = solo SuperAdmin
 @Controller('finops')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class FinopsAdminController {
@@ -292,8 +330,11 @@ export class FinopsAdminController {
   ) {
     const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
     for (const k of Object.keys(b)) {
-      if (!['estimateId', 'runId', 'authorizedBudget', 'reason'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
+      if (!['estimateId', 'runId', 'authorizedBudget', 'reason', 'extendUserBudget'].includes(k)) throw new BadRequestException(`campo no permitido: ${k}`);
     }
+    // r75 (02 §E.4): extendUserBudget solo con runId (amplía el presupuesto del iniciador con un ajuste auditado).
+    if (b.extendUserBudget !== undefined && typeof b.extendUserBudget !== 'boolean') throw new BadRequestException('extendUserBudget debe ser boolean');
+    if (b.extendUserBudget === true && typeof b.runId !== 'string') throw new BadRequestException('extendUserBudget solo aplica con runId');
     // RF-b fix M9: {runId} (sin estimateId) = presupuesto TOTAL de un run existente.
     if ((typeof b.estimateId === 'string') === (typeof b.runId === 'string')) {
       throw new BadRequestException('exactamente uno de estimateId | runId es obligatorio');
@@ -312,7 +353,7 @@ export class FinopsAdminController {
         reason: (b.reason as string | undefined) ?? null,
       };
       const row = typeof b.runId === 'string'
-        ? await this.budget.adminAuthorizeRun({ ...common, runId: b.runId })
+        ? await this.budget.adminAuthorizeRun({ ...common, runId: b.runId, extendUserBudget: b.extendUserBudget === true, actorId: user?.id ?? null })
         : await this.budget.adminAuthorize({ ...common, estimateId: b.estimateId as string });
       return {
         id: row.id,

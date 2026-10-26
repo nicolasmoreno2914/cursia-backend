@@ -5,6 +5,7 @@ import { AuthUser } from '../../auth/auth.types';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { DynamicYoutubePreflightService } from './dynamic-youtube';
 import type { YoutubePreflightResult } from './dynamic-video-delivery';
+import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
 /**
  * DN-1 — preflight de YouTube del flujo V2 (paso "YouTube" de la UI, solo si
@@ -22,6 +23,7 @@ export class DynamicYoutubeController {
   constructor(private readonly preflight: DynamicYoutubePreflightService) {}
 
   @Get('preflight')
+  @AuthenticatedOnly("preflight de la conexión YouTube propia")
   async getPreflight(@CurrentUser() user: AuthUser): Promise<YoutubePreflightResult> {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB o Google).
     assertDynamicOwnerAllowed(user.id);

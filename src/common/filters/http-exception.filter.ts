@@ -48,6 +48,20 @@ export class AllExceptionsFilter implements ExceptionFilter {
       for (const k of ['code', 'reason', 'criticals', 'pendingChanges', 'blockers', 'diff', 'modelSha256']) {
         if ((message as any)[k] !== undefined) errorResponse[k] = (message as any)[k];
       }
+      // r75 (02 §B/§C/§E): campos del contrato de permisos y presupuestos. Solo valores PRIMITIVOS acotados (nunca
+      // objetos: así no se cuela nada más del error): qué permiso faltó, a qué usuario se refiere, montos en USD
+      // (string decimal o número), quién paga, si puede pedir autorización y el estimado persistido.
+      const R75_KEYS: Record<string, 'string' | 'boolean' | 'amount'> = {
+        permission: 'string', userId: 'string', requiredUsd: 'amount', availableUsd: 'amount',
+        payerUserId: 'string', canRequest: 'boolean', estimateId: 'string',
+      };
+      for (const [k, kind] of Object.entries(R75_KEYS)) {
+        const v = (message as any)[k];
+        if (v === undefined || v === null) continue;
+        if (kind === 'boolean' && typeof v === 'boolean') errorResponse[k] = v;
+        else if (kind === 'string' && typeof v === 'string' && v.length <= 120) errorResponse[k] = v;
+        else if (kind === 'amount' && ((typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && /^-?\d{1,12}(\.\d{1,10})?$/.test(v)))) errorResponse[k] = v;
+      }
     }
 
     if (status >= 500) {

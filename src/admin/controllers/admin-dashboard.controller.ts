@@ -19,7 +19,9 @@ import {
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
 import { AdminDashboardService } from '../services/admin-dashboard.service';
+import { SuperAdminOnly } from '../../modules/authz/require-permission.decorator';
 
+@SuperAdminOnly()
 @Controller('admin/dashboard')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class AdminDashboardController {

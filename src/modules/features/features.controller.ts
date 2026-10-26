@@ -4,6 +4,8 @@ import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { DynamicFeatures, resolveDynamicFeatures, toHttpConfigError } from './dynamic-features';
 import { isSuperAdminEmail } from '../../auth/super-admin';
+import { AllowInactiveAccount } from '../authz/public.decorator';
+import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
 /**
  * EV6 DoD BE-B: además de los flags por usuario, el contrato que el frontend necesita conocer:
@@ -14,6 +16,7 @@ import { isSuperAdminEmail } from '../../auth/super-admin';
  */
 export type FeaturesResponse = DynamicFeatures & { dodContract: true; superAdmin: boolean };
 
+@AuthenticatedOnly('flags del propio usuario')
 @Controller('features')
 @UseGuards(SupabaseJwtGuard)
 export class FeaturesController {
@@ -21,6 +24,7 @@ export class FeaturesController {
   // para el usuario autenticado. Nunca gateado por el flag (con el flag OFF
   // responde todo false). Lista de owners inválida con el flag ON → 500 ruidoso.
   @Get()
+  @AllowInactiveAccount() // r75: el FE lo lee al cargar, también con la cuenta sin acceso
   get(@CurrentUser() user: AuthUser): FeaturesResponse {
     try {
       return { ...resolveDynamicFeatures(user.id), dodContract: true, superAdmin: isSuperAdminEmail(user.email) };

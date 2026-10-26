@@ -21,7 +21,7 @@ import { CreateFullCourseJobDto } from './dto/create-full-course-job.dto';
 import { UpdateJobDto } from './dto/update-job.dto';
 import { UpdateStepDto } from './dto/update-step.dto';
 import { EventsService } from '../../events/events.service';
-import { assertLegacyAudioAllowed, assertLegacyGenerationAllowed } from './legacy-audio-guard';
+import { assertCourseRefNotForeign, assertLegacyAudioAllowed, assertLegacyGenerationAllowed } from './legacy-audio-guard';
 import { assertClientMayPatchJob } from './client-patch-guard';
 
 /** Pasos estándar del pipeline (matching CP_STEP_DEFS en 31-course-production.js) */
@@ -484,6 +484,7 @@ export class ProductionJobsService implements OnModuleInit {
   async create(dto: CreateJobDto, ownerId: string): Promise<ProductionJob> {
     // course_id from frontend can be numeric (backend ID) or UUID string (frontend ID)
     const rawCourseId = dto.course_id ?? null;
+    await assertCourseRefNotForeign((sql, params) => this.dataSource.query(sql, params), ownerId, rawCourseId); // r75 H8a
     const numericCourseId = rawCourseId ? parseInt(rawCourseId, 10) : NaN;
 
     const job = this.jobRepo.create({

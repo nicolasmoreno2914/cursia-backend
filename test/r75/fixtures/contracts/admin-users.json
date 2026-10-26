@@ -1,0 +1,302 @@
+{
+  "GET /admin/users": {
+    "status": 200,
+    "body": {
+      "data": {
+        "items": [
+          {
+            "id": "0a000000-0000-4000-8000-000000000001",
+            "email": "qa-r75-superadmin@example.com",
+            "fullName": null,
+            "authorized": true,
+            "accountStatus": "active",
+            "generationSuspended": false,
+            "superAdmin": true,
+            "lastSignInAt": "2026-10-25T22:10:00.000Z",
+            "createdAt": "2026-10-21T10:00:00.000Z",
+            "memberships": [],
+            "budget": {
+              "month": "2026-10",
+              "limitUsd": "0.0000000000",
+              "spentUsd": "0.0000000000",
+              "heldUsd": "0.0000000000",
+              "availableUsd": "0.0000000000",
+              "pendingRequests": 0
+            }
+          },
+          {
+            "id": "0a000000-0000-4000-8000-000000000003",
+            "email": "qa-r75-creador-a@example.com",
+            "fullName": "Creador A (QA)",
+            "authorized": true,
+            "accountStatus": "active",
+            "generationSuspended": false,
+            "superAdmin": false,
+            "lastSignInAt": "2026-10-25T22:10:00.000Z",
+            "createdAt": "2026-10-21T10:00:00.000Z",
+            "memberships": [
+              {
+                "institutionId": "1b000000-0000-4000-8000-00000000000a",
+                "name": "QA r75 Institución A",
+                "role": "CREADOR",
+                "status": "active"
+              },
+              {
+                "institutionId": "1b000000-0000-4000-8000-00000000000b",
+                "name": "QA r75 Institución B",
+                "role": "CONSULTA",
+                "status": "active"
+              }
+            ],
+            "budget": {
+              "month": "2026-10",
+              "limitUsd": "25.0000000000",
+              "spentUsd": "4.1250000000",
+              "heldUsd": "6.0000000000",
+              "availableUsd": "14.8750000000",
+              "pendingRequests": 1
+            }
+          },
+          {
+            "id": "0a000000-0000-4000-8000-000000000007",
+            "email": "qa-r75-suspendido@example.com",
+            "fullName": null,
+            "authorized": true,
+            "accountStatus": "suspended",
+            "generationSuspended": false,
+            "superAdmin": false,
+            "lastSignInAt": "2026-10-25T22:10:00.000Z",
+            "createdAt": "2026-10-21T10:00:00.000Z",
+            "memberships": [
+              {
+                "institutionId": "1b000000-0000-4000-8000-00000000000a",
+                "name": "QA r75 Institución A",
+                "role": "CREADOR",
+                "status": "active"
+              }
+            ],
+            "budget": {
+              "month": "2026-10",
+              "limitUsd": "0.0000000000",
+              "spentUsd": "0.0000000000",
+              "heldUsd": "0.0000000000",
+              "availableUsd": "0.0000000000",
+              "pendingRequests": 0
+            }
+          }
+        ],
+        "total": 3
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/users#invite": {
+    "status": 201,
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-0000000000a1",
+          "email": "qa-r75-nuevo@example.com",
+          "fullName": null,
+          "authorized": true,
+          "accountStatus": "active",
+          "generationSuspended": false,
+          "superAdmin": false,
+          "lastSignInAt": null,
+          "createdAt": "2026-10-21T10:00:00.000Z",
+          "memberships": [
+            {
+              "institutionId": "1b000000-0000-4000-8000-00000000000a",
+              "name": "QA r75 Institución A",
+              "role": "CONSULTA",
+              "status": "active"
+            }
+          ],
+          "budget": {
+            "month": "2026-10",
+            "limitUsd": "0.0000000000",
+            "spentUsd": "0.0000000000",
+            "heldUsd": "0.0000000000",
+            "availableUsd": "0.0000000000",
+            "pendingRequests": 0
+          }
+        },
+        "invited": true
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/users#temp_password": {
+    "status": 201,
+    "headers": {
+      "Cache-Control": "no-store"
+    },
+    "body": {
+      "data": {
+        "user": {
+          "id": "0a000000-0000-4000-8000-0000000000a2",
+          "email": "qa-r75-temporal@example.com",
+          "fullName": null,
+          "authorized": true,
+          "accountStatus": "active",
+          "generationSuspended": false,
+          "superAdmin": false,
+          "lastSignInAt": null,
+          "createdAt": "2026-10-21T10:00:00.000Z",
+          "memberships": [],
+          "budget": {
+            "month": "2026-10",
+            "limitUsd": "0.0000000000",
+            "spentUsd": "0.0000000000",
+            "heldUsd": "0.0000000000",
+            "availableUsd": "0.0000000000",
+            "pendingRequests": 0
+          }
+        },
+        "tempPassword": "EJEMPLO-no-es-real-1234",
+        "invited": false
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /admin/users/:userId": {
+    "status": 200,
+    "body": {
+      "data": {
+        "id": "0a000000-0000-4000-8000-000000000003",
+        "email": "qa-r75-creador-a@example.com",
+        "fullName": "Creador A (QA)",
+        "authorized": true,
+        "accountStatus": "active",
+        "generationSuspended": false,
+        "superAdmin": false,
+        "lastSignInAt": "2026-10-25T22:10:00.000Z",
+        "createdAt": "2026-10-21T10:00:00.000Z",
+        "memberships": [
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "name": "QA r75 Institución A",
+            "role": "CREADOR",
+            "status": "active"
+          },
+          {
+            "institutionId": "1b000000-0000-4000-8000-00000000000b",
+            "name": "QA r75 Institución B",
+            "role": "CONSULTA",
+            "status": "active"
+          }
+        ],
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "25.0000000000",
+          "spentUsd": "4.1250000000",
+          "heldUsd": "6.0000000000",
+          "availableUsd": "14.8750000000",
+          "pendingRequests": 1
+        },
+        "suspensions": [
+          {
+            "id": "6a000000-0000-4000-8000-000000000001",
+            "kind": "generation",
+            "reason": "QA r75: prueba de suspensión",
+            "createdBy": "0a000000-0000-4000-8000-000000000001",
+            "createdAt": "2026-10-26T11:00:00.000Z",
+            "liftedBy": "0a000000-0000-4000-8000-000000000001",
+            "liftedAt": "2026-10-26T11:30:00.000Z"
+          }
+        ],
+        "recentRuns": [
+          {
+            "runId": "2c000000-0000-4000-8000-000000000001",
+            "courseId": 4242,
+            "status": "running",
+            "startedAt": "2026-10-26T09:00:00.000Z"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/users/:userId/authorize": {
+    "status": 200,
+    "body": {
+      "data": {
+        "id": "0a000000-0000-4000-8000-0000000000a3",
+        "email": "qa-r75-registrado@example.com",
+        "fullName": null,
+        "authorized": true,
+        "accountStatus": "active",
+        "generationSuspended": false,
+        "superAdmin": false,
+        "lastSignInAt": null,
+        "createdAt": "2026-10-21T10:00:00.000Z",
+        "memberships": [],
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "0.0000000000",
+          "spentUsd": "0.0000000000",
+          "heldUsd": "0.0000000000",
+          "availableUsd": "0.0000000000",
+          "pendingRequests": 0
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/users/:userId/repair": {
+    "status": 200,
+    "body": {
+      "data": {
+        "id": "0a000000-0000-4000-8000-0000000000a2",
+        "email": "qa-r75-temporal@example.com",
+        "fullName": null,
+        "authorized": true,
+        "accountStatus": "active",
+        "generationSuspended": false,
+        "superAdmin": false,
+        "lastSignInAt": null,
+        "createdAt": "2026-10-21T10:00:00.000Z",
+        "memberships": [],
+        "budget": {
+          "month": "2026-10",
+          "limitUsd": "0.0000000000",
+          "spentUsd": "0.0000000000",
+          "heldUsd": "0.0000000000",
+          "availableUsd": "0.0000000000",
+          "pendingRequests": 0
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/users/:userId/suspensions": {
+    "status": 201,
+    "body": {
+      "data": {
+        "id": "6a000000-0000-4000-8000-000000000001",
+        "kind": "account",
+        "reason": "QA r75: prueba de suspensión",
+        "createdBy": "0a000000-0000-4000-8000-000000000001",
+        "createdAt": "2026-10-26T11:00:00.000Z",
+        "liftedBy": null,
+        "liftedAt": null
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "DELETE /admin/users/:userId/suspensions/:kind": {
+    "status": 200,
+    "body": {
+      "data": {
+        "id": "6a000000-0000-4000-8000-000000000001",
+        "kind": "account",
+        "reason": "QA r75: prueba de suspensión",
+        "createdBy": "0a000000-0000-4000-8000-000000000001",
+        "createdAt": "2026-10-26T11:00:00.000Z",
+        "liftedBy": "0a000000-0000-4000-8000-000000000001",
+        "liftedAt": "2026-10-26T12:00:00.000Z"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

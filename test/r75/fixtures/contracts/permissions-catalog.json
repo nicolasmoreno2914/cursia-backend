@@ -1,0 +1,133 @@
+{
+  "GET /permissions/catalog": {
+    "status": 200,
+    "body": {
+      "data": {
+        "roles": [
+          "ADMIN_INSTITUCIONAL",
+          "CREADOR",
+          "APROBADOR_ACADEMICO",
+          "CONSULTA"
+        ],
+        "permissions": [
+          {
+            "key": "courses.view",
+            "label": "Ver cursos",
+            "sensitive": false,
+            "grantable": true
+          },
+          {
+            "key": "courses.create",
+            "label": "Crear cursos",
+            "sensitive": false,
+            "grantable": true
+          },
+          {
+            "key": "courses.edit",
+            "label": "Editar cursos",
+            "sensitive": false,
+            "grantable": true
+          },
+          {
+            "key": "courses.delete",
+            "label": "Eliminar cursos",
+            "sensitive": true,
+            "grantable": true
+          },
+          {
+            "key": "proposals.review",
+            "label": "Revisar propuestas (preparar, pedir ajustes, retirar)",
+            "sensitive": false,
+            "grantable": true
+          },
+          {
+            "key": "proposals.approve",
+            "label": "Aprobar propuestas",
+            "sensitive": true,
+            "grantable": true
+          },
+          {
+            "key": "generations.start",
+            "label": "Iniciar generaciones (gasta presupuesto)",
+            "sensitive": true,
+            "grantable": true
+          },
+          {
+            "key": "generations.retry",
+            "label": "Reintentar / reanudar generaciones",
+            "sensitive": true,
+            "grantable": true
+          },
+          {
+            "key": "exports.download",
+            "label": "Descargar / exportar (.mbz, PDF, artifacts)",
+            "sensitive": true,
+            "grantable": true
+          },
+          {
+            "key": "spend.view",
+            "label": "Consultar gastos de la institución",
+            "sensitive": true,
+            "grantable": true
+          },
+          {
+            "key": "roles.manage",
+            "label": "Administrar roles y miembros de la institución",
+            "sensitive": true,
+            "grantable": true
+          },
+          {
+            "key": "budgets.manage",
+            "label": "Administrar presupuestos",
+            "sensitive": true,
+            "grantable": false
+          },
+          {
+            "key": "users.suspend",
+            "label": "Suspender usuarios",
+            "sensitive": true,
+            "grantable": false
+          },
+          {
+            "key": "generations.suspend",
+            "label": "Suspender generaciones",
+            "sensitive": true,
+            "grantable": false
+          }
+        ],
+        "matrix": {
+          "ADMIN_INSTITUCIONAL": [
+            "courses.view",
+            "courses.create",
+            "courses.edit",
+            "courses.delete",
+            "proposals.review",
+            "generations.retry",
+            "exports.download",
+            "spend.view",
+            "roles.manage"
+          ],
+          "CREADOR": [
+            "courses.view",
+            "courses.create",
+            "courses.edit",
+            "proposals.review",
+            "generations.start",
+            "generations.retry",
+            "exports.download"
+          ],
+          "APROBADOR_ACADEMICO": [
+            "courses.view",
+            "proposals.review",
+            "proposals.approve",
+            "exports.download"
+          ],
+          "CONSULTA": [
+            "courses.view"
+          ]
+        }
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}
