@@ -28,7 +28,8 @@
           "heldUsd": "0.0000000000",
           "availableUsd": "0.0000000000",
           "pendingRequests": 0
-        }
+        },
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -89,7 +90,8 @@
           "heldUsd": "6.0000000000",
           "availableUsd": "14.8750000000",
           "pendingRequests": 1
-        }
+        },
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -142,7 +144,8 @@
           "heldUsd": "0.0000000000",
           "availableUsd": "0.0000000000",
           "pendingRequests": 0
-        }
+        },
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -190,7 +193,8 @@
           "heldUsd": "0.0000000000",
           "availableUsd": "0.0000000000",
           "pendingRequests": 0
-        }
+        },
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -235,7 +239,8 @@
           "heldUsd": "0.0000000000",
           "availableUsd": "0.0000000000",
           "pendingRequests": 0
-        }
+        },
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -286,7 +291,8 @@
           "heldUsd": "0.0000000000",
           "availableUsd": "0.0000000000",
           "pendingRequests": 0
-        }
+        },
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -313,7 +319,8 @@
         "budgetsMode": "enforce",
         "memberships": [],
         "defaultInstitutionId": null,
-        "budget": null
+        "budget": null,
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -364,7 +371,8 @@
           "heldUsd": "6.0000000000",
           "availableUsd": "14.8750000000",
           "pendingRequests": 1
-        }
+        },
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
@@ -412,7 +420,8 @@
           }
         ],
         "defaultInstitutionId": "1b000000-0000-4000-8000-0000000000ff",
-        "budget": null
+        "budget": null,
+        "institutionHeader": true
       },
       "timestamp": "2026-10-26T12:00:00.000Z"
     }
