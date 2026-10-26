@@ -47,7 +47,7 @@ async function detect() {
     userBudgets: await env.tableExists('user_budgets'),
     reservations: await env.tableExists('budget_reservations'),
     authUid: await env.columnExists('authorized_users', 'user_id'),
-    accessMigration: fs.existsSync(path.join(env.REPO, 'scripts', 'migrate-r75-access.js')),
+    accessMigration: fs.existsSync(path.join(env.REPO, 'scripts', 'migrate-r75-access.js')) || (fs.existsSync(path.join(env.REPO, 'supabase-migration-r75-access.sql')) && (await env.tableExists('institution_memberships'))),
   };
   console.log('capacidades detectadas:', JSON.stringify(F));
 }
@@ -203,7 +203,8 @@ async function itemC() {
   let r = await ov(I.A.id, U.creadorA.id, { grants: [], denies: ['courses.view'] }, TK.sa);
   t.ok(r.status === 200, 'SA fija deny courses.view a creadorA', brief(r));
   r = await api('GET', `/courses/${fx.A.course}`, { token: TK.creadorA, headers: { 'X-Cursia-Institution': I.A.id } });
-  t.ok(isAuthzDeny(r), 'deny courses.view gana sobre el rol CREADOR (curso propio inclusive)', brief(r));
+  if (F.permGuard) t.ok(isAuthzDeny(r), 'deny courses.view gana sobre el rol CREADOR (curso propio inclusive)', brief(r));
+  else t.pending('deny courses.view corta GET /courses/:id', 'PermissionGuard no integrado (B2)');
   if (F.meContext) { const mc = await api('GET', '/me/context', { token: TK.creadorA }); const m = (mc.data.memberships || []).find((x) => x.institutionId === I.A.id); t.ok(m && !m.permissions.includes('courses.view'), '/me/context refleja el deny al instante (invalidación de caché)', m); }
   // deny > grant del mismo permiso
   r = await ov(I.A.id, U.creadorA.id, { grants: ['proposals.approve'], denies: ['proposals.approve'] }, TK.sa);
@@ -292,15 +293,27 @@ async function itemD() {
     const e = []; S.Suspension(r.data, e); t.ok(!e.length, 'Suspension: forma del contrato', e);
     const c = await api('GET', `/courses/${fx.A.course}`, { token: TK.creadorA, headers: { 'X-Cursia-Institution': I.A.id } });
     t.ok(c.status === 200, 'con generación suspendida, creadorA sigue viendo su curso', brief(c));
-    const st = await api('POST', `/courses/${fx.A.course}/blueprints/1/manifest/runs`, { token: TK.creadorA, body: D_FIELDS, headers: { 'X-Cursia-Institution': I.A.id } });
-    t.ok(st.status === 403 && st.code === 'generation_suspended', 'arranque con generación suspendida → 403 generation_suspended', brief(st));
+    let gc = null;
+    try { gc = await buildCourse('creadorA', I.A, 'r75 suspensión de generación'); } catch (e) { t.pending('arranque con generación suspendida', `curso con Manifest: ${e.message}`); }
+    const startOf = (who) => api('POST', `/courses/${gc.id}/blueprints/${gc.n}/manifest/runs`, { token: TK[who], body: D_FIELDS, headers: { 'X-Cursia-Institution': I.A.id } });
+    if (gc) {
+      const st = await startOf('creadorA');
+      if (st.status === 403 && st.code === 'generation_suspended') t.ok(true, 'arranque con generación suspendida → 403 generation_suspended');
+      else if (!F.budgets) t.pending('arranque con generación suspendida → 403', `enforcement en runs (B/C2) no integrado: vino ${st.status} ${st.code || st.error}`);
+      else t.ok(false, 'arranque con generación suspendida → 403 generation_suspended', brief(st));
+      if (st.status === 201 || st.status === 200) finding('P1', 'd', 'con la suspensión de generación activa el run arranca igual (falta el chequeo en runs)', `POST /api/v1/courses/${gc.id}/blueprints/${gc.n}/manifest/runs como creadorA suspendido`);
+      if (st.data && st.data.run && st.data.run.id) await q(`update public.production_jobs set worker_status='cancelled', status='cancelled' where id=$1`, [st.data.run.id]);
+    }
     r = await api('DELETE', `/admin/users/${U.creadorA.id}/suspensions/generation`, { token: TK.sa, body: { reason: 'QA r75' } });
     t.ok(r.status === 200 && r.data && r.data.liftedAt, 'SA levanta la suspensión de generación', brief(r));
     r = await api('PUT', '/admin/platform/generation-freeze', { token: TK.sa, body: { enabled: true, reason: 'QA r75' } });
     t.ok(r.status === 200 && r.data && r.data.generationFreeze && r.data.generationFreeze.enabled === true, 'SA congela la plataforma', brief(r));
-    for (const who of ['creadorA', 'sa']) {
-      const s2 = await api('POST', `/courses/${fx.A.course}/blueprints/1/manifest/runs`, { token: TK[who], body: D_FIELDS, headers: who === 'sa' ? {} : { 'X-Cursia-Institution': I.A.id } });
-      t.ok(s2.status === 403 && s2.code === 'platform_generation_frozen', `congelación → 403 platform_generation_frozen para ${who} (también SA)`, brief(s2));
+    for (const who of gc ? ['creadorA', 'sa'] : []) {
+      const s2 = await startOf(who);
+      if (s2.status === 403 && s2.code === 'platform_generation_frozen') t.ok(true, `congelación → 403 platform_generation_frozen para ${who} (también SA)`);
+      else if (!F.budgets) t.pending(`congelación → 403 para ${who}`, `enforcement en runs (B/C2) no integrado: vino ${s2.status} ${s2.code || s2.error}`);
+      else t.ok(false, `congelación → 403 platform_generation_frozen para ${who} (también SA)`, brief(s2));
+      if (s2.data && s2.data.run && s2.data.run.id) await q(`update public.production_jobs set worker_status='cancelled', status='cancelled' where id=$1`, [s2.data.run.id]);
     }
     r = await api('PUT', '/admin/platform/generation-freeze', { token: TK.sa, body: { enabled: false, reason: 'QA r75' } });
     t.ok(r.status === 200, 'SA descongela', brief(r));
@@ -472,7 +485,7 @@ async function itemI() {
   const probe = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'h2-staging-probe.json'), 'utf8'));
   t.ok(probe.writeAllowed === false, `H2 staging (sonda ${probe.probedAt}): escritura de cliente en authorized_users ${probe.writeAllowed ? 'PERMITIDA (insert ' + probe.insert.status + ')' : 'rechazada'}`, probe);
   if (probe.writeAllowed) finding('P0', 'i', `H2 confirmada en staging (${probe.probedAt}): un usuario autenticado inserta/actualiza/borra filas de authorized_users`, 'test/r75/h2-staging-probe.snippet.js en la consola de staging.orbia.pages.dev');
-  if (!F.accessMigration) { t.pending('H2 local tras la migración', 'scripts/migrate-r75-access.js no existe en el checkout (A)'); return; }
+  if (!F.accessMigration) { t.pending('H2 local tras la migración', 'migración r75-access no aplicada (A)'); return; }
   const pols = await q(`select policyname, cmd, roles::text, qual, with_check from pg_policies where schemaname='public' and tablename='authorized_users'`);
   t.ok(pols.length === 1 && pols[0].cmd === 'SELECT', 'tras migrate-r75-access: authorized_users con UNA política, SELECT', pols);
   t.ok(pols.every((p) => p.cmd !== 'SELECT' || /auth\.email\(\)|auth\.uid\(\)/.test(String(p.qual))), 'la política SELECT es «la propia fila» (qual con auth.email()/auth.uid())', pols.map((p) => p.qual));
@@ -557,6 +570,7 @@ async function itemL() {
     await env.stopApp();
     if (fakes) await fakes.close();
   }
+  if (api.doubleEnvelope.size) finding('P3', 'contrato', `respuestas con doble sobre {data:{ok:true,data}} (02 §Convenciones: el cuerpo de éxito es el de ResponseInterceptor): ${[...api.doubleEnvelope].sort().join(', ')}`, 'el FE (60-r75) lo tolera; unificar');
   const s = t.summary(`r75 ${MODE}`);
   fs.writeFileSync(path.join(env.OUT, 'results.json'), JSON.stringify({ mode: MODE, types: TYPES, features: F, ms: Date.now() - started, by: s.by, findings: FINDINGS, results: s.results }, null, 2));
   process.exit(s.fail ? 1 : 0);

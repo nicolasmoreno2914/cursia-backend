@@ -39,12 +39,18 @@ async function api(method, p, { token, body, headers = {}, raw = false } = {}) {
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch {}
+  let data = json && json.data !== undefined ? json.data : null;
+  // Doble sobre {data:{ok:true,data}} (algunos controllers devuelven {ok:true,data} y el interceptor lo envuelve otra vez):
+  // se desenvuelve como hace el FE (60-r75-access-client unwrap) y se cuenta para el reporte.
+  let doubleEnvelope = false;
+  if (data && typeof data === 'object' && !Array.isArray(data) && data.ok === true && 'data' in data && Object.keys(data).length <= 3) { data = data.data; doubleEnvelope = true; api.doubleEnvelope.add(`${method} ${p.split('?')[0].replace(/[0-9a-f-]{36}|\b\d+\b/g, ':id')}`); }
   return {
-    status: res.status, headers: Object.fromEntries(res.headers.entries()),
-    data: json && json.data !== undefined ? json.data : null, code: json && json.code, error: json && (json.error || json.message), json, text: raw ? text : undefined,
+    status: res.status, headers: Object.fromEntries(res.headers.entries()), doubleEnvelope,
+    data, code: json && json.code, error: json && (json.error || json.message), json, text: raw ? text : undefined,
   };
 }
 
+api.doubleEnvelope = new Set();
 let app = null;
 function appEnv(fakes, extra = {}) {
   return {
