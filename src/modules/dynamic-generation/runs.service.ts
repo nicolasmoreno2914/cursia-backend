@@ -711,7 +711,24 @@ export interface FromRunPreview {
   approval: StartPreview['approval'];
   policy: StartPreview['policy'];
   estimateHash: string | null;
+  /** r75 (Agente C, aditivo): presupuesto mensual de quien pagaría el run. */
+  userBudget?: UserBudgetPreview | null;
   _plan?: NormalApprovalPlan;
+}
+
+/**
+ * r75 (Agente C, 02 §E.1, aditivo): presupuesto mensual por usuario en la vista previa del estimado. `requiredUsd` = lo
+ * que se autorizaría (el monto de la aprobación si hace falta una; si no, `estimate.totals.max`). `mode: 'off'` →
+ * `availableUsd: null` y `sufficient: true` (sin control por usuario).
+ */
+export interface UserBudgetPreview {
+  mode: 'off' | 'shadow' | 'enforce';
+  month: string | null;
+  availableUsd: string | null;
+  requiredUsd: string | null;
+  sufficient: boolean;
+  canRequest: boolean;
+  payerUserId: string;
 }
 
 type FinopsGate = { evaluation: StartBudgetEvaluation; approval: any | null; normalApproval?: NormalApprovalRequest };
@@ -812,8 +829,11 @@ export interface StartPreview {
     userAuthorizationRequired: boolean;
   } | null;
   /** r62: + ownerMonthlyCap (tope mensual de la cuenta) y lo comprometido por la cuenta este mes (null sin ese tope). */
-  policy: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; ownerMonthlyCap?: string | null; courseSpent: string; monthSpent: string; ownerMonthSpent?: string | null } | null;
+  /** r75 (H5, D-25): `monthSpent` = gasto GLOBAL de la plataforma en el mes → solo para el SuperAdmin; al resto, null. */
+  policy: { maxCostPerRun: string | null; maxCostPerCourse: string | null; monthlyCap: string | null; ownerMonthlyCap?: string | null; courseSpent: string; monthSpent: string | null; ownerMonthSpent?: string | null } | null;
   estimateHash: string | null;
+  /** r75 (Agente C, aditivo): presupuesto mensual de quien pagaría el run (02 §E.1). */
+  userBudget?: UserBudgetPreview | null;
   /**
    * r61 (Q-24): tamaño proyectado del `.mbz` contra el límite de subida del almacenamiento (solo v3, run nuevo).
    * `verdict: 'over'` nunca llega acá: la vista previa responde 409 PACKAGE_SIZE_PROJECTED_OVER_LIMIT.
@@ -863,6 +883,19 @@ export function previewCounts(manifest: { manifest: { items: ReadonlyArray<{ typ
 export function publicFromRunPreview(pv: FromRunPreview): Omit<FromRunPreview, '_plan'> {
   const { _plan, ...rest } = pv;
   return rest;
+}
+
+/** r75 (02 §E.1): lo que se autorizaría = monto de la aprobación (admin / firma del usuario) o el máximo del estimado. */
+export function previewRequiredUsd(mode: 'user' | 'admin' | 'none', amount: string | null, existing: { authorized_budget?: unknown } | null, max: string): string {
+  if (existing && existing.authorized_budget !== undefined && existing.authorized_budget !== null) return normalizeDecimal(String(existing.authorized_budget));
+  if ((mode === 'admin' || mode === 'user') && amount) return normalizeDecimal(amount);
+  return normalizeDecimal(max);
+}
+
+/** r75 H5: el `spent` del tope mensual GLOBAL (monthlyCap) es gasto de toda la plataforma → solo para el SuperAdmin. */
+export function redactBlockedByForNonAdmin<T extends { limit: string; spent?: unknown }>(blockedBy: T[] | null | undefined, superAdmin: boolean): T[] | null | undefined {
+  if (superAdmin || !Array.isArray(blockedBy)) return blockedBy;
+  return blockedBy.map((b) => (b.limit === 'monthlyCap' ? { ...b, spent: null } : b));
 }
 
 export function publicPreview(pv: StartPreview): Omit<StartPreview, '_plan' | '_evaluation'> {
@@ -1277,14 +1310,16 @@ export class RunsService {
         withinPolicy: plan.withinPolicy,
         amount: plan.amount,
         cappedByLimit: plan.cappedByLimit,
-        blockedBy: plan.blockedBy,
+        blockedBy: redactBlockedByForNonAdmin(plan.blockedBy, canApprove),
         existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
         mode,
         userAuthorizationRequired,
       },
-      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
+      // r75 H5 (D-25): el gasto global del mes solo lo ve el SuperAdmin.
+      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: canApprove ? np.month.total : null, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
       estimateHash,
       packageSize,
+      userBudget: await this.userBudgetPreview(ownerId, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
       _plan: plan,
       _evaluation: evaluation,
     } as StartPreview;
@@ -1522,12 +1557,14 @@ export class RunsService {
       paidRealProviders: evaluation.paidRealProviders,
       approval: {
         required, canApprove: isSuperAdminEmail(user.email), withinPolicy: plan.withinPolicy, amount: plan.amount,
-        cappedByLimit: plan.cappedByLimit, blockedBy: plan.blockedBy,
+        cappedByLimit: plan.cappedByLimit, blockedBy: redactBlockedByForNonAdmin(plan.blockedBy, isSuperAdminEmail(user.email)),
         existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
         mode, userAuthorizationRequired,
       },
-      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: np.month.total, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
+      // r75 H5 (D-25): el gasto global del mes solo lo ve el SuperAdmin.
+      policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: isSuperAdminEmail(user.email) ? np.month.total : null, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
       estimateHash,
+      userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
       _plan: plan,
     };
   }
@@ -1905,6 +1942,8 @@ export class RunsService {
       courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, modes: runSpendModes(videoMode, providerModes ?? null),
       normalApproval: opts.normalApproval,
     });
+    // r75 (Agente C): presupuesto mensual del usuario (lectura optimista; el chequeo autoritativo va en bindRun).
+    await this.assertUserBudgetPreTx(budget, { courseId, ownerId, manifestId: manifest.id });
 
     let jobId: string;
     try {
@@ -2274,6 +2313,8 @@ export class RunsService {
       if (!isPausedRun(locked)) {
         throw new ConflictException({ message: `La ejecución ${job.id} no está pausada (${locked.worker_status}); no hay nada que reanudar`, code: 'run_not_paused' });
       }
+      // r75: un run pausado sigue reteniendo; reanudarlo exige que quien PAGA no esté suspendido (otro miembro tampoco).
+      await this.assertUserBudgetOnReopen(qr, job.id, false);
       await qr.query(
         `update public.production_jobs
             set status = 'queued', worker_status = 'queued',
@@ -2616,6 +2657,8 @@ export class RunsService {
       if (isCancelledLike(locked)) {
         throw new ConflictException(`La ejecución ${job.id} está cancelada; no se pueden reintentar items`);
       }
+      // r75 (D-20): el reintento se carga al iniciador; si reabre un run terminado, lo que vuelve a retener tiene que entrar.
+      await this.assertUserBudgetOnReopen(qr, job.id, ['failed', 'completed', 'preview'].includes(String(locked.worker_status ?? '')));
       // Pausa del usuario: ningún mecanismo AUTOMÁTICO (auto-healer, sondas de proveedor, audio ambiguo) toca un run
       // pausado. Un reintento manual del usuario sí reabre el item, pero el run sigue pausado (no lo despacha).
       if (auto && isPausedRun(locked)) {
@@ -5423,6 +5466,55 @@ export class RunsService {
    * Rechazo → BudgetGateRejection (el caller guarda el estimado FUERA de su tx y
    * responde 409 con el estimateId para que un admin lo autorice).
    */
+  // ─── r75 (Agente C): presupuesto mensual por usuario (rebasar después del merge de r74) ─────────────────────────
+
+  /** Gate de presupuestos registrado por BudgetsModule (cualquier modo), o null (sin módulo / sin FinOps). */
+  private userBudgetGate() {
+    const f = this.finopsBudget as (FinopsBudgetService & { registeredUserBudgetGate?: () => any }) | undefined;
+    return f && typeof f.registeredUserBudgetGate === 'function' ? f.registeredUserBudgetGate() : null;
+  }
+
+  /** `userBudget` de la vista previa (solo lectura; el chequeo autoritativo es el de la tx de bindRun). */
+  private async userBudgetPreview(payerUserId: string, requiredUsd: string): Promise<UserBudgetPreview> {
+    const g = this.userBudgetGate();
+    const mode = g ? g.mode() : 'off';
+    if (!g || mode === 'off') {
+      return { mode: 'off', month: null, availableUsd: null, requiredUsd, sufficient: true, canRequest: false, payerUserId };
+    }
+    const a = await g.availability(this.dataSource, payerUserId);
+    const sufficient = cmpDec(requiredUsd, a.available) <= 0;
+    return { mode, month: a.month, availableUsd: a.available, requiredUsd, sufficient, canRequest: !sufficient, payerUserId };
+  }
+
+  /**
+   * 01 §5.2 «pre-tx»: con enforce y el disponible (lectura optimista) por debajo de lo que se autorizaría, 409
+   * user_budget_insufficient SIN crear nada, con el estimado persistido (estimateId) para «Solicitar autorización».
+   */
+  private async assertUserBudgetPreTx(gate: FinopsGate | null, a: { courseId: number; ownerId: string; manifestId: number; planSha?: string | null }): Promise<void> {
+    const g = this.userBudgetGate();
+    if (!g || g.mode() !== 'enforce' || !gate || !this.finopsBudget) return;
+    const required = normalizeDecimal(gate.normalApproval?.amount ?? gate.approval?.authorized_budget ?? gate.evaluation.estimate.totals.max);
+    const av = await g.availability(this.dataSource, a.ownerId);
+    if (cmpDec(required, av.available) <= 0) return;
+    const est = await this.finopsBudget.recordEstimate({
+      scope: 'run', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: null, invalidationPlanSha: a.planSha ?? null,
+      estimate: gate.evaluation.estimate,
+    });
+    throw new ConflictException({
+      code: av.assigned ? 'user_budget_insufficient' : 'user_budget_not_assigned',
+      message: `tu presupuesto disponible del mes (USD ${Number(av.available).toFixed(2)}) no alcanza para esta generación (USD ${Number(required).toFixed(2)}); no se creó nada. estimateId=${est.id}`,
+      requiredUsd: required, availableUsd: av.available, payerUserId: a.ownerId, canRequest: true, estimateId: est.id,
+    });
+  }
+
+  /** D-20: reanudar / reintentar carga al iniciador; reabrir un run terminal tiene que entrar en su disponible. */
+  private async assertUserBudgetOnReopen(qr: { query: (sql: string, params?: any[]) => Promise<any> }, runId: string, reopensTerminal: boolean): Promise<void> {
+    const g = this.userBudgetGate();
+    if (!g) return;
+    await g.assertPayerMaySpend(qr, runId);
+    if (reopensTerminal && g.mode() !== 'off') await g.assertRunReopenFits(qr, runId);
+  }
+
   private async finopsEvaluate(a: {
     courseId: number;
     ownerId: string;
@@ -6142,6 +6234,8 @@ export class RunsService {
               `completo es regeneración (Fase 8). runId=${jobId}`,
           );
         }
+        // r75 (D-20): reabrir carga al iniciador (controles de A + disponible para lo que vuelve a retener).
+        await this.assertUserBudgetOnReopen(qr, jobId, true);
 
         const items: Array<{ id: string; item_key: string; status: ItemRunStatus; depends_on: string[]; output_summary: Record<string, any> | null }> =
           await qr.query(

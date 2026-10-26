@@ -506,6 +506,38 @@ async function main() {
       setMode('enforce');
     });
 
+    // ── [RUNS] integración runs.service (commit C2, rebasar después de r74) ──────────────────────────────────────
+    await check('[RUNS] estimate-preview: userBudget aditivo (disponible, requerido = authorized del arranque, sufficient) y H5: policy.monthSpent null para quien no es SA (el SA lo ve)', async () => {
+      if (typeof P.runs.userBudgetPreview !== 'function') { console.log('   (sin la integración C2: se omite)'); return; }
+      const U5 = '11111111-2222-4333-8444-555555555555';
+      const cid = await makeCourse(U5, 'RUNS preview', instA.id);
+      const ctx = { ...CONTEXT, videoMode: 'mock', providerModes: { presentation: 'mock', audio: 'mock' } };
+      const pv = await P.runs.previewStart(cid, { id: U5, email: 'u5@x.test' }, 1, ctx);
+      assert(pv.userBudget && pv.userBudget.mode === 'enforce' && pv.userBudget.availableUsd === '0.0000000000' && pv.userBudget.sufficient === false && pv.userBudget.canRequest === true, 'userBudget: ' + JSON.stringify(pv.userBudget));
+      eq(pv.policy ? pv.policy.monthSpent : null, null, 'monthSpent oculto');
+      // Pre-tx: 409 sin crear nada, con estimateId persistido para «Solicitar autorización».
+      let e = null; try { await start(P, cid, U5); } catch (x) { e = x; }
+      const b = bodyOf(e);
+      eq([e && e.getStatus(), b && b.code, b && b.payerUserId], [409, 'user_budget_not_assigned', U5], 'pre-tx 409');
+      assert(b.estimateId && (await count(`select count(*) n from public.cost_estimates where id = $1 and run_id is null`, [b.estimateId])) === 1, 'estimado persistido');
+      eq(await count(`select count(*) n from public.production_jobs where course_id = $1`, [cid]), 0, 'sin run');
+      const req = await P.requests.create(userActor(U5), { courseId: cid, estimateId: b.estimateId, amountUsd: b.requiredUsd, reason: 'para este curso' });
+      await P.requests.approve(saActor, req.id, { approvedAmountUsd: b.requiredUsd });
+      const pv2 = await P.runs.previewStart(cid, { id: U5, email: 'u5@x.test' }, 1, ctx);
+      eq([pv2.userBudget.sufficient, pv2.userBudget.requiredUsd], [true, b.requiredUsd], 'tras aprobar: alcanza');
+      const res = await start(P, cid, U5);
+      eq((await runAuth(res.run.id)).b, b.requiredUsd, 'requiredUsd = authorized_budget real');
+      const pvSa = await P.runs.previewStart(cid, { id: U5, email: SA_EMAIL }, 1, ctx).catch((x) => x);
+      assert(!(pvSa instanceof Error) || /run/i.test(String(pvSa.message)), 'preview SA');
+      // Retry / reanudar con el iniciador suspendido → 403 (nadie gasta a su nombre).
+      await ds.query(`update public.production_jobs set worker_status = 'paused', status = 'paused', output_summary = output_summary || '{"pause":{"reason":"user"}}'::jsonb where id = $1`, [res.run.id]);
+      const [sus] = await ds.query(`insert into public.user_suspensions (user_id, kind, reason, created_by) values ($1, 'generation', 'QA', $2) returning id`, [U5, SA]);
+      let e2 = null; try { await P.runs.resumeRun(cid, U5, 1, res.run.id, { id: U5, email: 'u5@x.test' }); } catch (x) { e2 = x; }
+      eq(bodyOf(e2) && bodyOf(e2).code, 'generation_suspended', 'reanudar con el iniciador suspendido');
+      await ds.query(`update public.user_suspensions set lifted_at = now(), lifted_by = $2 where id = $1`, [sus.id, SA]);
+      await cancelRun(res.run.id);
+    });
+
     // ── [SHADOW] ────────────────────────────────────────────────────────────────────────────────────────────────
     await check('[SHADOW] shadow: un usuario sin presupuesto ARRANCA (se aplica la regla vieja), la reserva se escribe igual y queda auditado budget.shadow_insufficient', async () => {
       setMode('shadow');
