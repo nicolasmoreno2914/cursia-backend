@@ -1,0 +1,228 @@
+{
+  "GET /me/budget": {
+    "status": 200,
+    "body": {
+      "data": {
+        "month": "2026-10",
+        "limitUsd": "25.0000000000",
+        "spentUsd": "4.1250000000",
+        "heldUsd": "6.0000000000",
+        "availableUsd": "14.8750000000",
+        "pendingRequests": 1,
+        "reservations": [
+          {
+            "id": "5f000000-0000-4000-8000-000000000001",
+            "userId": "0a000000-0000-4000-8000-000000000003",
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "courseId": 4242,
+            "runId": "2c000000-0000-4000-8000-000000000001",
+            "kind": "start",
+            "amountUsd": "10.0000000000",
+            "liveHeldUsd": "6.0000000000",
+            "status": "active",
+            "periodMonth": "2026-10",
+            "createdAt": "2026-10-26T09:00:00.000Z"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /me/budget#usd_0": {
+    "status": 200,
+    "body": {
+      "data": {
+        "month": "2026-10",
+        "limitUsd": "0.0000000000",
+        "spentUsd": "0.0000000000",
+        "heldUsd": "0.0000000000",
+        "availableUsd": "0.0000000000",
+        "pendingRequests": 0,
+        "reservations": []
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /admin/budgets": {
+    "status": 200,
+    "body": {
+      "data": {
+        "items": [
+          {
+            "month": "2026-10",
+            "limitUsd": "25.0000000000",
+            "spentUsd": "4.1250000000",
+            "heldUsd": "6.0000000000",
+            "availableUsd": "14.8750000000",
+            "pendingRequests": 1,
+            "userId": "0a000000-0000-4000-8000-000000000003",
+            "email": "qa-r75-creador-a@example.com"
+          },
+          {
+            "month": "2026-10",
+            "limitUsd": "0.0000000000",
+            "spentUsd": "0.0000000000",
+            "heldUsd": "0.0000000000",
+            "availableUsd": "0.0000000000",
+            "pendingRequests": 0,
+            "userId": "0a000000-0000-4000-8000-000000000005",
+            "email": "qa-r75-consulta-a@example.com"
+          }
+        ],
+        "total": 2
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /admin/users/:userId/budget": {
+    "status": 200,
+    "body": {
+      "data": {
+        "month": "2026-10",
+        "limitUsd": "25.0000000000",
+        "spentUsd": "4.1250000000",
+        "heldUsd": "6.0000000000",
+        "availableUsd": "14.8750000000",
+        "pendingRequests": 1,
+        "userId": "0a000000-0000-4000-8000-000000000003",
+        "versions": [
+          {
+            "id": "7b000000-0000-4000-8000-000000000001",
+            "kind": "recurring",
+            "effectiveMonth": "2026-10",
+            "amountUsd": "20.0000000000",
+            "version": 1,
+            "reason": "Asignación inicial QA",
+            "createdBy": "0a000000-0000-4000-8000-000000000001",
+            "createdAt": "2026-10-21T10:05:00.000Z",
+            "sourceRequestId": null
+          },
+          {
+            "id": "7b000000-0000-4000-8000-000000000002",
+            "kind": "month_adjustment",
+            "effectiveMonth": "2026-10",
+            "amountUsd": "5.0000000000",
+            "version": 1,
+            "reason": "Solicitud aprobada",
+            "createdBy": "0a000000-0000-4000-8000-000000000001",
+            "createdAt": "2026-10-24T10:05:00.000Z",
+            "sourceRequestId": "4e000000-0000-4000-8000-000000000000"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "PUT /admin/users/:userId/budget": {
+    "status": 200,
+    "body": {
+      "data": {
+        "month": "2026-10",
+        "limitUsd": "25.0000000000",
+        "spentUsd": "4.1250000000",
+        "heldUsd": "6.0000000000",
+        "availableUsd": "14.8750000000",
+        "pendingRequests": 1,
+        "userId": "0a000000-0000-4000-8000-000000000003",
+        "versions": [
+          {
+            "id": "7b000000-0000-4000-8000-000000000001",
+            "kind": "recurring",
+            "effectiveMonth": "2026-10",
+            "amountUsd": "20.0000000000",
+            "version": 1,
+            "reason": "Asignación inicial QA",
+            "createdBy": "0a000000-0000-4000-8000-000000000001",
+            "createdAt": "2026-10-21T10:05:00.000Z",
+            "sourceRequestId": null
+          },
+          {
+            "id": "7b000000-0000-4000-8000-000000000002",
+            "kind": "month_adjustment",
+            "effectiveMonth": "2026-10",
+            "amountUsd": "5.0000000000",
+            "version": 1,
+            "reason": "Solicitud aprobada",
+            "createdBy": "0a000000-0000-4000-8000-000000000001",
+            "createdAt": "2026-10-24T10:05:00.000Z",
+            "sourceRequestId": "4e000000-0000-4000-8000-000000000000"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/users/:userId/budget-adjustments": {
+    "status": 200,
+    "body": {
+      "data": {
+        "month": "2026-10",
+        "limitUsd": "25.0000000000",
+        "spentUsd": "4.1250000000",
+        "heldUsd": "6.0000000000",
+        "availableUsd": "14.8750000000",
+        "pendingRequests": 1,
+        "userId": "0a000000-0000-4000-8000-000000000003",
+        "versions": [
+          {
+            "id": "7b000000-0000-4000-8000-000000000001",
+            "kind": "recurring",
+            "effectiveMonth": "2026-10",
+            "amountUsd": "20.0000000000",
+            "version": 1,
+            "reason": "Asignación inicial QA",
+            "createdBy": "0a000000-0000-4000-8000-000000000001",
+            "createdAt": "2026-10-21T10:05:00.000Z",
+            "sourceRequestId": null
+          },
+          {
+            "id": "7b000000-0000-4000-8000-000000000002",
+            "kind": "month_adjustment",
+            "effectiveMonth": "2026-10",
+            "amountUsd": "5.0000000000",
+            "version": 1,
+            "reason": "Solicitud aprobada",
+            "createdBy": "0a000000-0000-4000-8000-000000000001",
+            "createdAt": "2026-10-24T10:05:00.000Z",
+            "sourceRequestId": "4e000000-0000-4000-8000-000000000000"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /admin/budget-reservations": {
+    "status": 200,
+    "body": {
+      "data": [
+        {
+          "id": "5f000000-0000-4000-8000-000000000001",
+          "userId": "0a000000-0000-4000-8000-000000000003",
+          "institutionId": "1b000000-0000-4000-8000-00000000000a",
+          "courseId": 4242,
+          "runId": "2c000000-0000-4000-8000-000000000001",
+          "kind": "start",
+          "amountUsd": "10.0000000000",
+          "liveHeldUsd": "6.0000000000",
+          "status": "active",
+          "periodMonth": "2026-10",
+          "createdAt": "2026-10-26T09:00:00.000Z"
+        },
+        {
+          "id": "5f000000-0000-4000-8000-000000000002",
+          "userId": "0a000000-0000-4000-8000-000000000003",
+          "institutionId": "1b000000-0000-4000-8000-00000000000a",
+          "courseId": 4242,
+          "runId": "2c000000-0000-4000-8000-000000000002",
+          "kind": "start",
+          "amountUsd": "4.5000000000",
+          "liveHeldUsd": "0.0000000000",
+          "status": "settled",
+          "periodMonth": "2026-10",
+          "createdAt": "2026-10-26T09:00:00.000Z"
+        }
+      ],
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

@@ -1,0 +1,351 @@
+{
+  "_nota": "Cuerpo REAL de AllExceptionsFilter (src/common/filters/http-exception.filter.ts): {statusCode,timestamp,path,error,code,...}. OJO: hoy el filtro solo deja pasar code/reason/criticals/pendingChanges/blockers/diff/modelSha256; los extras (permission, requiredUsd, availableUsd, payerUserId, canRequest, estimateId, userId) deben agregarse a esa lista o se pierden (hallazgo E-C1).",
+  "account_not_authorized": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Tu cuenta no tiene acceso a Cursia.",
+      "code": "account_not_authorized"
+    }
+  },
+  "account_suspended": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Tu cuenta está suspendida.",
+      "code": "account_suspended"
+    }
+  },
+  "access_context_missing": {
+    "status": 500,
+    "body": {
+      "statusCode": 500,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Error interno de permisos.",
+      "code": "access_context_missing"
+    }
+  },
+  "not_a_member": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No perteneces a esta institución.",
+      "code": "not_a_member"
+    }
+  },
+  "institution_required": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Elige una institución.",
+      "code": "institution_required"
+    }
+  },
+  "institution_mismatch": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Este curso pertenece a otra institución.",
+      "code": "institution_mismatch"
+    }
+  },
+  "institution_inactive": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La institución está suspendida o archivada.",
+      "code": "institution_inactive"
+    }
+  },
+  "institution_create_forbidden": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Solo el SuperAdmin crea instituciones.",
+      "code": "institution_create_forbidden"
+    }
+  },
+  "permission_denied": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No tienes permiso para esta acción.",
+      "code": "permission_denied",
+      "permission": "proposals.approve"
+    }
+  },
+  "permission_not_grantable": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Ese permiso no se puede otorgar desde una institución.",
+      "code": "permission_not_grantable"
+    }
+  },
+  "self_modification_forbidden": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No puedes cambiar tus propios permisos.",
+      "code": "self_modification_forbidden"
+    }
+  },
+  "role_escalation_forbidden": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No puedes otorgar permisos que no tienes.",
+      "code": "role_escalation_forbidden"
+    }
+  },
+  "last_admin_protected": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La institución debe conservar al menos un administrador.",
+      "code": "last_admin_protected"
+    }
+  },
+  "superadmin_role_reserved": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "El rol SuperAdmin no se asigna desde aquí.",
+      "code": "superadmin_role_reserved"
+    }
+  },
+  "user_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No existe un usuario con ese correo.",
+      "code": "user_not_found"
+    }
+  },
+  "membership_exists": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Ya es miembro.",
+      "code": "membership_exists"
+    }
+  },
+  "user_exists": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "El usuario ya existe.",
+      "code": "user_exists"
+    }
+  },
+  "user_exists_unauthorized": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "El usuario ya existe pero no está autorizado.",
+      "code": "user_exists_unauthorized"
+    }
+  },
+  "user_create_partial": {
+    "status": 502,
+    "body": {
+      "statusCode": 502,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "El usuario se creó a medias.",
+      "code": "user_create_partial",
+      "userId": "0a000000-0000-4000-8000-0000000000a2"
+    }
+  },
+  "admin_api_unavailable": {
+    "status": 503,
+    "body": {
+      "statusCode": 503,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La administración de usuarios no está configurada en el servidor.",
+      "code": "admin_api_unavailable"
+    }
+  },
+  "invalid_email": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Email inválido.",
+      "code": "invalid_email"
+    }
+  },
+  "suspension_active": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Ya hay una suspensión activa.",
+      "code": "suspension_active"
+    }
+  },
+  "suspension_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No hay una suspensión activa de ese tipo.",
+      "code": "suspension_not_found"
+    }
+  },
+  "generation_suspended": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Tus generaciones están suspendidas.",
+      "code": "generation_suspended"
+    }
+  },
+  "platform_generation_frozen": {
+    "status": 403,
+    "body": {
+      "statusCode": 403,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Las generaciones nuevas están pausadas temporalmente.",
+      "code": "platform_generation_frozen"
+    }
+  },
+  "user_budget_insufficient": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Presupuesto insuficiente.",
+      "code": "user_budget_insufficient",
+      "requiredUsd": "9.2000000000",
+      "availableUsd": "0.0000000000",
+      "payerUserId": "0a000000-0000-4000-8000-000000000003",
+      "canRequest": true,
+      "estimateId": "3d000000-0000-4000-8000-000000000001"
+    }
+  },
+  "user_budget_not_assigned": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Todavía no tienes presupuesto asignado.",
+      "code": "user_budget_not_assigned",
+      "canRequest": true
+    }
+  },
+  "budget_request_duplicate": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Ya tienes una solicitud pendiente para este curso.",
+      "code": "budget_request_duplicate"
+    }
+  },
+  "budget_request_not_pending": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La solicitud ya no está pendiente.",
+      "code": "budget_request_not_pending"
+    }
+  },
+  "budget_request_expired": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La solicitud venció.",
+      "code": "budget_request_expired"
+    }
+  },
+  "invalid_amount": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Monto inválido.",
+      "code": "invalid_amount"
+    }
+  },
+  "month_invalid": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Mes inválido.",
+      "code": "month_invalid"
+    }
+  },
+  "server_execution_required": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Esta generación necesita ejecución en el servidor.",
+      "code": "server_execution_required"
+    }
+  },
+  "video_engine_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No encontrado.",
+      "code": "video_engine_not_found"
+    }
+  }
+}

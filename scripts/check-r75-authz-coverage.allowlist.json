@@ -1,0 +1,3 @@
+{
+  "_nota": "r75 · Allow-list documentada de check-r75-authz-coverage.js. Clave «MÉTODO /ruta» (sin /api/v1) → motivo (obligatorio, ≥ 3 caracteres). Preferir SIEMPRE una marca de src/modules/authz (@RequirePermission, @SuperAdminOnly, @AuthenticatedOnly('motivo'), @AllowInactiveAccount, @Public, @PublicCapability, @TokenAuthenticated); esta lista es solo para casos que no admiten decorador. Una entrada cuya ruta ya no existe hace fallar el chequeo."
+}

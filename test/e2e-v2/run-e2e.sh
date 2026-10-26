@@ -95,6 +95,16 @@ env $STG node "$REPO/scripts/migrate-rel-recovery.js" > "$OUT/migrate-rel-recove
 env $STG node "$REPO/scripts/verify-rel-recovery-schema.js" > "$OUT/verify-rel-recovery.log" 2>&1 || { cat "$OUT/verify-rel-recovery.log"; exit 9; }
 # Loop 4: latido de presencia de los workers de IA.
 env $STG node "$REPO/scripts/migrate-llm-worker-presence.js" > "$OUT/migrate-llm-worker-presence.log" 2>&1 || { cat "$OUT/migrate-llm-worker-presence.log"; exit 9; }
+# r75 (roles, permisos y presupuestos): accesos (A) → presupuestos (C) → backfill --apply (A), mismo orden que
+# deploy-staging. Con CURSIA_ACCOUNT_GUARD/CURSIA_RBAC_MODE/CURSIA_USER_BUDGETS en off (default) la app no usa estas
+# tablas: el E2E no cambia de comportamiento. Cada paso corre solo si el script existe en el checkout bajo prueba.
+for s in migrate-r75-access verify-r75-access-schema migrate-r75-budgets verify-r75-budgets-schema; do
+  [ -f "$REPO/scripts/$s.js" ] || continue
+  env $STG node "$REPO/scripts/$s.js" > "$OUT/$s.log" 2>&1 || { cat "$OUT/$s.log"; exit 9; }
+done
+if [ -f "$REPO/scripts/migrate-r75-backfill.js" ]; then
+  env $STG node "$REPO/scripts/migrate-r75-backfill.js" --apply --report-dir="$OUT" > "$OUT/migrate-r75-backfill.log" 2>&1 || { cat "$OUT/migrate-r75-backfill.log"; exit 9; }
+fi
 echo "schema + migraciones reales OK"
 
 echo "== Moodle 4.5 local =="
