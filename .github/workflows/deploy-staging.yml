@@ -638,13 +638,15 @@ jobs:
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
-               echo "━━━ [0d] r75: roles y presupuestos en ENFORCE; guard de cuenta en SHADOW (solo el .env de STAGING) ━━━"
-               # r75 Fase 2: RBAC y presupuestos por usuario se APLICAN en staging (pruebas reales por rol). Revertir = shadow.
-               # CURSIA_ACCOUNT_GUARD sigue en shadow: los registros de Supabase de staging siguen abiertos (acción del owner);
-               # en enforce bastaría confirmar un email para entrar.
+               echo "━━━ [0d] r75: roles en ENFORCE; presupuestos y guard de cuenta en SHADOW (solo el .env de STAGING) ━━━"
+               # r75 Fase 2: RBAC se APLICA en staging (pruebas reales por rol, verde). Revertir = shadow.
+               # CURSIA_USER_BUDGETS vuelve a shadow tras las pruebas: en enforce el SuperAdmin tampoco se salta su presupuesto
+               # (D-18) y el owner de staging tiene límite 0 con USD 151 gastados en el mes → no podría arrancar generaciones.
+               # Para pasarlo a enforce: el owner se asigna su presupuesto mensual (≥ su gasto del mes) en Finanzas.
+               # CURSIA_ACCOUNT_GUARD sigue en shadow: los registros de Supabase de staging siguen abiertos (acción del owner).
                ensure_env_exact CURSIA_ACCOUNT_GUARD shadow
                ensure_env_exact CURSIA_RBAC_MODE enforce
-               ensure_env_exact CURSIA_USER_BUDGETS enforce
+               ensure_env_exact CURSIA_USER_BUDGETS shadow
                # r75 Fase 2: cuentas QA sintéticas (qa-r75-*@example.com, creadas en staging por POST /admin/users) con V2
                # para probar Propuesta / aprobación / estimado por rol. Ids de staging, no secretos. Sin video real.
                # r75 Fase 2: el estimado («Autorizar y generar») de las cuentas QA, sin video real, necesita la vista previa
