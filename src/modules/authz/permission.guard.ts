@@ -129,7 +129,8 @@ export class PermissionGuard implements CanActivate {
     } else {
       decision = await this.permissions.can(actor, permission, res.institutionId, { concreteResource: res.concrete });
       // D-13: en rutas de curso manda la institución del curso; un header distinto → 409 (evita errores de UI).
-      if (decision.allowed && res.concrete && header && res.institutionId && header !== res.institutionId) {
+      // R75-E23: el SA no es miembro de las instituciones ajenas (no puede «cambiarla arriba»): su header no aplica.
+      if (decision.allowed && !superAdmin && res.concrete && header && res.institutionId && header !== res.institutionId) {
         problem = new ConflictException({ code: AUTHZ_ERRORS.INSTITUTION_MISMATCH, message: 'Este curso pertenece a otra institución; cámbiala arriba.' });
       }
     }
