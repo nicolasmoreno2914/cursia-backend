@@ -149,6 +149,10 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
  * ver flag-report.md #3 y review "declined to judge").
  */
 const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
+  // r74: dirección DURADERA de los medios de un curso ya entregado (la pide el Moodle del cliente). NUNCA se apaga con
+  // el flag de la estructura dinámica: un curso restaurado debe seguir sonando. El monitoreo es SUPER_ADMIN (guard propio).
+  'CourseMediaController',
+  'CourseMediaAdminController',
   'AppController',
   'AuthController',
   'YoutubeController',

@@ -40,7 +40,9 @@ const L = (r) => require(path.join(dist, r));
 const arg = (k) => (process.argv.find((a) => a.startsWith(`--${k}=`)) || '').slice(k.length + 3);
 const SIZES = (arg('sizes') || '30,60,120').split(',').map(Number);
 const BASE = arg('base');
-const MOODLE = process.argv.includes('--moodle');
+const MOODLE = process.argv.includes('--moodle') || process.argv.includes('--moodle-only');
+// --moodle-only: solo D8 sobre los archivos ya armados en --out (result.json de una corrida anterior).
+const MOODLE_ONLY = process.argv.includes('--moodle-only');
 const OUT = arg('out') || path.join(os.homedir(), 'cursia-test-env/work/r74/out');
 const R = require('./lib/r74-large-course');
 const B = L('package/dynamic-mbz-builder-v3.js');
@@ -155,7 +157,7 @@ async function zipIntegrity(buf) {
     });
   }
 
-  for (const n of SIZES) {
+  for (const n of MOODLE_ONLY ? [] : SIZES) {
     const dir = path.join(OUT, `c${n}`);
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
@@ -305,7 +307,7 @@ async function zipIntegrity(buf) {
     for (const n of SIZES) {
       const dir = path.join(OUT, `c${n}`);
       const res = JSON.parse(fs.readFileSync(path.join(dir, 'result.json'), 'utf8'));
-      const ev = evidence.courses[n];
+      const ev = evidence.courses[n] || (evidence.courses[n] = {});
       await check(`D8 ${n} capítulos en Moodle 4.5: recomendado (1 archivo) y autocontenido restaurados = referencia; portabilidad a una segunda instancia limpia`, async () => {
         const t0 = Date.now();
         const refId = restoreNew('local', path.join(dir, 'referencia.mbz'));
@@ -334,13 +336,25 @@ async function zipIntegrity(buf) {
         // Autocontenido: todo lo de la referencia + el audiolibro por módulo dentro de Moodle.
         const refMp3 = ref.mp3.filter((m) => m.filename === 'audiolibro.mp3');
         eq(refMp3.length, 1, 'referencia con el MP3 único');
-        const segMp3 = sc.mp3.filter((m) => /^audiolibro_modulo_/.test(m.filename));
-        eq(segMp3.length, res.summary.media.length, 'autocontenido: un MP3 por segmento (módulo)');
-        eq(segMp3.map((m) => m.sha1).sort(), [...res.mediaSha1].sort(), 'autocontenido: cada MP3 restaurado tiene el sha1 del MP3 en línea (mismo audio en ambas versiones)');
-        eq(segMp3.reduce((s, m) => s + m.bytes, 0), res.summary.media.reduce((s, m) => s + m.bytes, 0), 'autocontenido: mismos bytes de audio que los MP3 en línea');
         const nonAudio = (d) => structure(d).map(([num, name, cms]) => [num, name, cms.filter(([, idn]) => !/^cv3:audiobook_part:/.test(idn) && idn !== 'cv3:shell:audiobook')]);
-        eq(nonAudio(sc), nonAudio(ref), 'autocontenido: mismas secciones y actividades que la referencia (fuera del audiolibro)');
-        eq(sc.files.count, files.length === 1 ? ref.files.count : ref.files.count - 1 + segMp3.length, 'autocontenido: todos los archivos (audiolibro por módulo)');
+        const segMp3 = sc.mp3.filter((m) => /^audiolibro_modulo_/.test(m.filename));
+        if (files.length === 1) {
+          // Autocontenido en UN archivo = el paquete de siempre: idéntico a la referencia (mismo MP3 único del audiolibro).
+          eq(structure(sc), structure(ref), 'autocontenido (un archivo): misma estructura que la referencia');
+          eq([sc.files.count, sc.files.bytes], [ref.files.count, ref.files.bytes], 'autocontenido (un archivo): mismos archivos y bytes que la referencia');
+          eq(sc.mp3.map((m) => m.sha1).sort(), ref.mp3.map((m) => m.sha1).sort(), 'autocontenido (un archivo): mismos MP3 (sha1)');
+          // Mismo audio: cada MP3 ensamblado lleva UN frame Info/Xing al inicio (concatMp3), así que el MP3 único pesa
+          // (segmentos − 1) frames Info menos que la suma de los MP3 en línea (la duración medida es la misma: D4).
+          const single = sc.mp3.find((m) => m.filename === 'audiolibro.mp3').bytes;
+          const sum = res.summary.media.reduce((s, m) => s + m.bytes, 0);
+          assert(sum - single >= 0 && sum - single <= (res.summary.media.length - 1) * 1441, `el MP3 único (${single} B) = la suma de los MP3 en línea (${sum} B) menos los frames Info`);
+        } else {
+          eq(segMp3.length, res.summary.media.length, 'autocontenido: un MP3 por segmento (módulo)');
+          eq(segMp3.map((m) => m.sha1).sort(), [...res.mediaSha1].sort(), 'autocontenido: cada MP3 restaurado tiene el sha1 del MP3 en línea (mismo audio en ambas versiones)');
+          eq(segMp3.reduce((s, m) => s + m.bytes, 0), res.summary.media.reduce((s, m) => s + m.bytes, 0), 'autocontenido: mismos bytes de audio que los MP3 en línea');
+          eq(nonAudio(sc), nonAudio(ref), 'autocontenido: mismas secciones y actividades que la referencia (fuera del audiolibro)');
+          eq(sc.files.count, ref.files.count - 1 + segMp3.length, 'autocontenido: todos los archivos (audiolibro por módulo)');
+        }
         if (files.length > 1) {
           eq(sc.activities - scBefore.activities, segMp3.length, 'cada parte combinada agrega sus labels de audio');
           eq(sc.sections.map((s) => s.name), scBefore.sections.map((s) => s.name), 'combinar no cambia las secciones');
