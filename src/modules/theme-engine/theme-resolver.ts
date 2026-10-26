@@ -24,7 +24,7 @@ import {
   ON_LIGHT,
   resolveReadableOn,
 } from './color-math';
-import { EDU_BLOCKS, SPACE_SCALE, THEME_FAMILIES } from './families';
+import { EDU_BLOCKS, SPACE_SCALE, THEME_FAMILIES, TYPOGRAPHY_STACKS } from './families';
 import {
   BrandSeed,
   ModuleColor,
@@ -139,6 +139,9 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     );
   }
 
+  if (input.typography !== undefined && input.typography !== 'sans' && input.typography !== 'serif') {
+    throw new Error(`THEME_INVALID: tipografía desconocida "${String(input.typography)}" (admite: sans, serif)`);
+  }
   const adjustments: string[] = [];
   const color: ThemeColorTokens = { ...baseMode.color };
 
@@ -153,6 +156,25 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     adjustments.push(
       `accentStrong corregido para contraste ≥ ${CONTRAST_BODY} contra bg (${accentStrongInitial} → ${accentStrongFixed.color})`,
     );
+  }
+
+  // r76 «Diseño visual»: un color de marca de luminancia media (p. ej. #7A1F5C en oscuro → accentStrong #CF3FA0) podía dejar
+  // a accentStrong sin NINGÚN texto legible encima y resolveTheme fallaba (THEME_INVALID) al empaquetar. Ahora accentStrong
+  // se lleva hacia el lado de su modo (más claro en oscuro, más oscuro en claro) hasta admitir texto legible sin perder el
+  // contraste con el fondo. Solo cambia temas que antes fallaban: los demás quedan idénticos (mismo themeSha256).
+  if (contrastRatio(ON_LIGHT, color.accentStrong) < CONTRAST_BODY && contrastRatio(ON_DARK, color.accentStrong) < CONTRAST_BODY) {
+    const before = color.accentStrong;
+    const { h, s, l } = hexToHsl(before);
+    const dir = input.mode === 'dark' ? 1 : -1;
+    for (let i = 1; i <= 50; i++) {
+      const cand = hslToHex(h, s, clamp01(l + dir * 0.02 * i));
+      const readable = contrastRatio(dir > 0 ? ON_DARK : ON_LIGHT, cand) >= CONTRAST_BODY;
+      if (readable && contrastRatio(cand, color.bg) >= CONTRAST_BODY) {
+        color.accentStrong = cand;
+        adjustments.push(`accentStrong corregido para admitir texto legible encima (${before} → ${cand})`);
+        break;
+      }
+    }
   }
 
   color.accentSoft = deriveAccentSoft(color.accent, input.mode);
@@ -206,6 +228,8 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
   }
 
   const moduleColorsBasis = deriveModuleColorsBasis(baseMode.moduleColors, input.brandSeed, adjustments);
+  // r76: tipografía elegida por el curso (ausente = la de la familia; mismo tema, mismo sha de siempre).
+  const ty = input.typography ? TYPOGRAPHY_STACKS[input.typography] : null;
 
   const theme: ResolvedTheme = {
     version: THEME_ENGINE_VERSION,
@@ -213,8 +237,8 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     mode: input.mode,
     color,
     typography: {
-      fontBody: baseMode.typography.fontBody,
-      fontHeading: baseMode.typography.fontHeading,
+      fontBody: ty ? ty.body : baseMode.typography.fontBody,
+      fontHeading: ty ? ty.heading : baseMode.typography.fontHeading,
       sizeBodyPx: 18,
       sizeSmallPx: 16,
       sizeMetaPx: 14,
@@ -252,7 +276,9 @@ export function resolveTheme(input: PresentationProfileInput): ResolvedTheme {
     space: [...SPACE_SCALE],
     shape: { ...baseMode.shape },
     variants: { ...baseMode.variants },
-    personality: { ...baseMode.personality },
+    personality: ty
+      ? { ...baseMode.personality, fontDisplay: ty.display, fontMeta: ty.meta, fontNumeral: ty.numeral }
+      : { ...baseMode.personality },
     blocks: resolveBlocks(input.mode),
     adjustments,
     moduleColorsBasis,

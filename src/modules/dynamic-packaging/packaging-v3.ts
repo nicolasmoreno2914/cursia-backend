@@ -47,12 +47,14 @@ import {
 import { ResolvedAssessment, assertCategoriesPopulated, assessmentItemCountsForPackage } from '../../package/assessment';
 import {
   AssessmentProfile,
+  PresentationIdentity,
   PresentationProfile,
   defaultAssessmentProfile,
   defaultPresentationProfile,
   isLightDefaultCourse,
   normalizeAssessmentProfile,
   normalizePresentationProfile,
+  presentationIdentityOf,
   profileSha256,
 } from '../course-profiles/course-profiles';
 import {
@@ -312,6 +314,8 @@ export function resolvePackagingTheme(p: {
         mode: pp.mode,
         ...(pp.brandSeed ? { brandSeed: { ...pp.brandSeed } } : {}),
         themeVersion: pp.themeVersion,
+        // r76: tipografía del curso (solo si no es la de la familia: mismo tema y misma clave de siempre).
+        ...(pp.typography ? { typography: pp.typography } : {}),
       } as PresentationProfileInput,
     };
   }
@@ -339,6 +343,8 @@ export interface PackagingProfilesV3 {
   theme: ResolvedPackagingTheme;
   presentationVersion: number;
   themeSha256: string;
+  /** r76: identidad institucional del perfil de presentación (logo, nombre, marca de agua, logo en el curso). */
+  identity: PresentationIdentity;
 }
 
 /** Id de paleta legacy guardado en `courses.metadata` (`paletteId` o `pal.id`), si lo hay. */
@@ -384,6 +390,7 @@ export async function loadPackagingProfilesV3(q: QueryExecutor, courseId: number
     theme,
     presentationVersion: p ? Number(p.version) : 0,
     themeSha256: themeSha256(resolveTheme(theme.input)),
+    identity: presentationIdentityOf(presentation),
   };
 }
 
@@ -447,6 +454,10 @@ export interface LibroBrandV3 {
   name: string | null;
   /** Avisos de la búsqueda (p.ej. una tabla ausente o un logo solo como artifact). */
   warnings: string[];
+  /** r76: marca de agua del Libro Guía (default true: una por página). */
+  watermark?: boolean;
+  /** r76: el logo (y el nombre) encabezan la bienvenida del curso. */
+  showInCourse?: boolean;
 }
 
 /**
@@ -463,7 +474,36 @@ export interface LibroBrandV3 {
  * `brand_profiles.logo_artifact_id` no lo llena hoy ningún flujo del producto: si aparece SIN `logoUrl` se avisa
  * (`libro_logo_artifact_unsupported`) y se sigue con el paso 2.
  */
-export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, ownerId: string | null): Promise<LibroBrandV3> {
+export async function loadLibroBrandV3(q: QueryExecutor, courseId: number, ownerId: string | null, identity?: PresentationIdentity | null): Promise<LibroBrandV3> {
+  const base = await loadAccountLibroBrandV3(q, courseId, ownerId);
+  return applyPresentationIdentity(base, identity ?? null);
+}
+
+/**
+ * r76 «Diseño visual»: la identidad del perfil de presentación sobre la marca de la cuenta. Puro.
+ *  - logo 'custom' → el logo del curso PRIMERO (si no valida, el builder cae al siguiente candidato y deja el aviso);
+ *    'cursia' → ningún candidato (logo de Cursia); 'account' → los de siempre.
+ *  - institutionName: texto → ese nombre; '' → sin nombre; ausente → el de la institución.
+ *  - watermark / showInCourse: solo se agregan si no son los de siempre (misma huella de marca para los perfiles anteriores).
+ */
+export function applyPresentationIdentity(base: LibroBrandV3, identity: PresentationIdentity | null): LibroBrandV3 {
+  if (!identity) return base;
+  let candidates = base.candidates;
+  if (identity.logo === 'cursia') candidates = [];
+  else if (identity.logo === 'custom' && identity.logoDataUri) candidates = [{ source: 'course_profile', dataUri: identity.logoDataUri }, ...base.candidates];
+  const name = typeof identity.institutionName === 'string' ? (identity.institutionName.trim() ? identity.institutionName.trim().slice(0, 120) : null) : base.name;
+  return {
+    logo: candidates[0] ?? null,
+    candidates,
+    name,
+    warnings: base.warnings,
+    ...(identity.watermark === false ? { watermark: false } : {}),
+    ...(identity.showInCourse === true ? { showInCourse: true } : {}),
+  };
+}
+
+/** r76: la marca de la CUENTA (sin la identidad del perfil). Lecturas baratas a la base, sin red. */
+export async function loadAccountLibroBrandV3(q: QueryExecutor, courseId: number, ownerId: string | null): Promise<LibroBrandV3> {
   const warnings: string[] = [];
   const why = (err: unknown) => (err instanceof Error ? err.message : String(err)).slice(0, 80).replace(/\s+/g, ' ').replace(/:/g, ';');
   let course: any;
@@ -558,10 +598,12 @@ export function libroReferencesFingerprintV3(references: readonly string[]): str
   return references.length ? createHash('sha256').update(JSON.stringify(references), 'utf8').digest('hex') : undefined;
 }
 
-export function libroBrandFingerprintV3(brand: Pick<LibroBrandV3, 'logo' | 'name'> & { candidates?: LibroLogoCandidate[] }): { sha256: string; warnings: string[]; logoSource: string } {
+export function libroBrandFingerprintV3(brand: Pick<LibroBrandV3, 'logo' | 'name'> & { candidates?: LibroLogoCandidate[]; watermark?: boolean; showInCourse?: boolean }): { sha256: string; warnings: string[]; logoSource: string } {
   // fix round 3: hash de los bytes del logo RESUELTO (el primer candidato válido), igual que antes.
   const logo = resolveLibroLogo(brand.candidates ?? brand.logo);
-  const sha256 = createHash('sha256').update(`${logo.sha256}|${brand.name ?? ''}`, 'utf8').digest('hex');
+  // r76: la marca de agua apagada y el logo en la bienvenida entran en la huella SOLO si no son los de siempre (re-empaqueta).
+  const extra = `${brand.watermark === false ? '|wm:0' : ''}${brand.showInCourse === true ? '|course:1' : ''}`;
+  const sha256 = createHash('sha256').update(`${logo.sha256}|${brand.name ?? ''}${extra}`, 'utf8').digest('hex');
   return { sha256, warnings: logo.warnings, logoSource: logo.source };
 }
 
@@ -1221,7 +1263,7 @@ export async function prepareV3Package(
   assertCategoriesPopulated(resolved, itemCounts);
   const sourceArtifactIds = sortedArtifactIdsV3(byItem);
   // r19 (L3): el logo resuelto (y el nombre) entran en la clave: cambiar el logo de la cuenta re-empaqueta.
-  const libroBrand = await loadLibroBrandV3(q, courseId, run.owner_id ?? null);
+  const libroBrand = await loadLibroBrandV3(q, courseId, run.owner_id ?? null, profiles.identity);
   const brandPrint = libroBrandFingerprintV3(libroBrand);
   const libroRefs = await loadLibroReferencesV3(q, courseId);
   const reuseKey: PackageReuseKeyV3Input = {

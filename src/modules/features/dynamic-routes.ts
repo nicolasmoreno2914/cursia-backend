@@ -11,6 +11,7 @@ import { CoherenceController } from '../coherence/coherence.controller';
 import { InvalidationController } from '../invalidation/invalidation.controller';
 import { CourseStructureSettingsController } from '../course-structure/course-structure-settings.controller';
 import { CourseProfilesController } from '../course-profiles/course-profiles.controller';
+import { VisualDesignController } from '../visual-design/visual-design.controller';
 import { PedagogyController } from '../pedagogy/pedagogy.controller';
 import { AcademicContextController } from '../academic-context/academic-context.controller';
 import { ChangeImpactController } from '../invalidation/change-impact.controller';
@@ -41,6 +42,7 @@ export const DYNAMIC_CONTROLLERS: ReadonlySet<Function> = new Set<Function>([
   DynamicYoutubeController, // DN-1: GET /dynamic/youtube/preflight
   CourseStructureSettingsController, // V2.1 R3: PATCH /courses/:id/structure-settings
   CourseProfilesController,          // V2.1 R3: /courses/:id/profiles/:kind
+  VisualDesignController,            // r76: /courses/:id/visual-design (contexto + vista previa)
   AdminDynamicRunsController,        // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
   PedagogyController,                // Motor pedagógico V1: /pedagogy/* y /courses/:id/pedagogy/dry-run
   AcademicContextController,         // Fase 3: /courses/:id/academic-context/{extract,design}

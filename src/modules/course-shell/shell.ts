@@ -31,6 +31,7 @@ import {
 } from './intro-schemas';
 import {
   Hx,
+  Surf,
   ShellRenderOptions,
   accentRule,
   audio,
@@ -125,6 +126,44 @@ export const WELCOME_PARA_TARGET_WORDS = 60;
  */
 const WRAP: Array<[string, string]> = [['overflow-wrap', 'anywhere'], ['word-break', 'break-word']];
 
+/**
+ * r76 «Diseño visual»: identidad institucional al inicio de la bienvenida (solo si el perfil la pide; ausente = bytes de
+ * siempre). `src` = archivo del label (`@@PLUGINFILE@@/…`, en files.xml con su SHA1). El `alt` es FIJO: los filtros de
+ * Moodle reescriben atributos y `nolink` no los protege (mismo criterio que la portada de la presentación).
+ */
+export interface WelcomeIdentity {
+  src: string;
+  /** Tamaño en px de la imagen tal como se muestra (atributos width/height: sobreviven al purificador). */
+  width: number;
+  height: number;
+  /** Nombre de la institución (o null). */
+  name: string | null;
+}
+export const WELCOME_LOGO_FILE = 'logo-institucion.png';
+export const WELCOME_LOGO_FILE_JPEG = 'logo-institucion.jpg';
+export const WELCOME_LOGO_ALT = 'Logo de la institución';
+export const WELCOME_LOGO_MAX_H = 56;
+export const WELCOME_LOGO_MAX_W = 220;
+
+/** r76: tamaño de la imagen del logo en la bienvenida (alto 56 px, ancho ≤ 220 px, proporción del original). */
+export function welcomeLogoSize(width: number, height: number): { width: number; height: number } {
+  if (!(width > 0) || !(height > 0)) return { width: WELCOME_LOGO_MAX_H, height: WELCOME_LOGO_MAX_H };
+  let h = WELCOME_LOGO_MAX_H;
+  let w = Math.round((h * width) / height);
+  if (w > WELCOME_LOGO_MAX_W) {
+    w = WELCOME_LOGO_MAX_W;
+    h = Math.max(16, Math.round((w * height) / width));
+  }
+  return { width: w, height: h };
+}
+
+function identityStrip(h: Hx, idn: WelcomeIdentity, s: Surf): string {
+  const img = `<img src="${idn.src.replace(/"/g, '&quot;')}" alt="${WELCOME_LOGO_ALT}" width="${idn.width}" height="${idn.height}"` +
+    st(h, [['margin', idn.name ? '0 0 8px 0' : '0'], ['display', 'block']], [['max-width', '100%'], ['height', 'auto']]) + ' />';
+  const name = idn.name ? eyebrow(h, idn.name, s, { sentence: true, margin: '0', color: s.fg }) : '';
+  return `<div class="cvc-identity"${st(h, [['margin', '0 0 20px 0'], ['padding', '0 0 16px 0'], ['border-bottom', `1px solid ${h.t.color.border}`]])}>${img}${name}</div>`;
+}
+
 export function welcomeLabel(
   facts: CourseFacts,
   courseIntro: CourseIntroV3,
@@ -132,6 +171,8 @@ export function welcomeLabel(
   opts?: ShellRenderOptions,
   /** EV6 DoD: paquete de QA → aviso visible antes de la bienvenida (default: sin aviso, bytes de siempre). */
   qaPreviewNotice = false,
+  /** r76: logo y nombre de la institución al inicio del hero (ausente = bytes de siempre). */
+  identity: WelcomeIdentity | null = null,
 ): ShellLabel {
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
@@ -158,6 +199,7 @@ export function welcomeLabel(
   // empaquetado por la forma del texto). `guard`: sin cortes en abreviaturas ni dentro de un énfasis.
   const split = splitLeadRest(intro.welcome, { maxChars: WELCOME_LEAD_MAX_CHARS, maxWords: WELCOME_LEAD_MAX_WORDS, guard: true, cut: true });
   const hero = heroBand(h, 'cvc-welcome-band', (bs) =>
+    (identity ? identityStrip(h, identity, bs) : '') +
     eyebrow(h, `Curso · ${c.modules} ${plural(c.modules, 'módulo', 'módulos')} · ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')}`, bs, { sentence: true }) +
     heading(h, 'h4', facts.course.title, bs, { display: true }) +
     accentRule(h, bs) +
@@ -179,7 +221,9 @@ export function welcomeLabel(
     const cs = toneSurf(h, 'alt');
     qa = box(h, eyebrow(h, QA_PREVIEW_NOTICE_TITLE, cs.s) + pHtml(h, labelHtml(QA_PREVIEW_NOTICE_TEXT), cs.s, { last: true }), cs, { cls: 'cvc-qa-preview' });
   }
-  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + body + statRow(h, stats) + hours), facts, courseIntroProse(intro, 'welcome'));
+  // r76: el nombre de la institución es texto del usuario (puede tener cifras: «Colegio 21») → prosa admitida.
+  const prose = identity?.name ? [...courseIntroProse(intro, 'welcome'), identity.name] : courseIntroProse(intro, 'welcome');
+  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + body + statRow(h, stats) + hours), facts, prose);
 }
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────

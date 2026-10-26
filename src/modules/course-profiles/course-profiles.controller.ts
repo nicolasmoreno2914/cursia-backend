@@ -61,7 +61,7 @@ export class CourseProfilesController {
     @Access() access: AccessContext,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const result = await this.profilesService.append(courseId, access.effectiveOwnerId, kind, dto.data, dto.expectedVersion);
+    const result = await this.profilesService.append(courseId, access.effectiveOwnerId, kind, dto.data, dto.expectedVersion, access.actorId);
     res.status(result.created ? 201 : 200);
     return result;
   }
