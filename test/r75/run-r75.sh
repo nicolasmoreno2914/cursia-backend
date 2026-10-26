@@ -61,7 +61,13 @@ for TYPES in ${R75_TYPES:-0 1}; do
     if [ -f "$REPO/scripts/$s.js" ]; then
       env $STG node "$REPO/scripts/$s.js" > "$OUT/$s.log" 2>&1 || { echo "$s falló"; tail -20 "$OUT/$s.log"; RC=1; }
       echo "$s: $(tail -1 "$OUT/$s.log")"
-    else echo "$s: (no existe en el checkout bajo prueba)"; fi
+    else
+      # Sin script todavía (rama en progreso): si el .sql existe se aplica tal cual con psql, para poder probar el esquema.
+      sql="$REPO/supabase-migration-${s#migrate-}.sql"
+      if [ "${s#migrate-}" != "$s" ] && [ -f "$sql" ]; then
+        $PSQL -f "$sql" > "$OUT/$s.log" 2>&1 && echo "$s: (sin script) $(basename "$sql") aplicado con psql" || { echo "$s: $(basename "$sql") FALLÓ"; tail -10 "$OUT/$s.log"; RC=1; }
+      else echo "$s: (no existe en el checkout bajo prueba)"; fi
+    fi
   done
   if [ -f "$REPO/scripts/migrate-r75-backfill.js" ]; then
     env $STG R75_BACKFILL_REPORT_DIR="$OUT" node "$REPO/scripts/migrate-r75-backfill.js" --apply > "$OUT/backfill.log" 2>&1 || { echo "backfill falló"; tail -20 "$OUT/backfill.log"; RC=1; }
