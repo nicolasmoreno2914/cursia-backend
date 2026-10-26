@@ -180,6 +180,60 @@ export interface PeriodSummary extends CostSummary {
 
 type Runner = { query: (sql: string, params?: any[]) => Promise<any> };
 
+/**
+ * r75 (01 §6): institución a la que se atribuye un evento del ledger (expresión SQL sobre el alias `e`).
+ *  1. `e.institution_id` (eventos nuevos: la escribe el ledger con presupuestos por usuario activos);
+ *  2. eventos viejos (null): la institución ACTUAL de su curso (`course_id → courses.institution_id`);
+ *  3. con run y sin curso resoluble: la institución de la reserva 'start' del run (si la tabla existe);
+ *  4. sin run ni curso: la única membresía activa del dueño (solo si tiene exactamente una; si la tabla existe).
+ * Si nada aplica → null = «sin institución» (solo la ve el SuperAdmin).
+ */
+export function eventInstitutionSql(o: { hasReservations: boolean; hasMemberships: boolean }, alias = 'e'): string {
+  const parts = [
+    `nullif(${alias}.institution_id, '')`,
+    `(select c.institution_id::text from public.courses c where c.id = ${alias}.course_id)`,
+  ];
+  if (o.hasReservations) {
+    parts.push(`(select br.institution_id::text from public.budget_reservations br
+                 where ${alias}.run_id is not null and br.run_id = ${alias}.run_id and br.kind = 'start' order by br.created_at limit 1)`);
+  }
+  if (o.hasMemberships) {
+    parts.push(`(select min(m.institution_id::text) from public.institution_memberships m
+                 where ${alias}.course_id is null and ${alias}.run_id is null and m.user_id::text = ${alias}.owner_id and m.status = 'active'
+                 having count(*) = 1)`);
+  }
+  return `coalesce(${parts.join(', ')})`;
+}
+
+/**
+ * r75: usuario que PAGA un evento: el iniciador del run (reserva 'start') o, sin reserva / sin run, el dueño del evento
+ * (owner_id). Misma regla que `spent(U,M)` del presupuesto por usuario (01 §5.1).
+ */
+export function eventPayerSql(o: { hasReservations: boolean }, alias = 'e'): string {
+  if (!o.hasReservations) return `${alias}.owner_id`;
+  return `coalesce((select br.user_id::text from public.budget_reservations br
+                     where ${alias}.run_id is not null and br.run_id = ${alias}.run_id and br.kind = 'start' order by br.created_at limit 1),
+                   ${alias}.owner_id)`;
+}
+
+export interface ScopedGroupRow {
+  key: string | null;
+  actual: string;
+  reserved: string;
+  committed: string;
+  providerCalls: number;
+  events: number;
+}
+
+export interface InstitutionPeriodSummary extends CostSummary {
+  scope: 'institution';
+  /** null = eventos sin institución (solo SuperAdmin). */
+  institutionId: string | null;
+  period: { from: string; to: string; basis: 'effective_at_utc' };
+  byCourse: ScopedGroupRow[];
+  byUser: ScopedGroupRow[];
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const GCE = 'public.generation_cost_events';
 const COURSE_ROWS_LIMIT = 500;
@@ -200,7 +254,7 @@ export function costEventsCte(where: string): string {
   return `ev as (
     select e.id, e.created_at, e.event_kind, e.amount, e.billing_account, e.provider, e.item_type, e.item_key, e.operation,
            e.course_id, e.run_id, e.call_role, e.attempt, e.outcome, e.owner_id, e.metadata, e.usage, e.idempotency_key,
-           e.model_or_product, e.measurement_status,
+           e.model_or_product, e.measurement_status, e.institution_id,
            coalesce(p.created_at, e.created_at) as effective_at,
            (e.event_kind = 'CHARGE' and coalesce(e.metadata->>'reservation', '') = 'true') as is_reservation,
            coalesce(e.event_kind = 'CHARGE' and e.measurement_status = 'pending'
@@ -496,6 +550,79 @@ export class CostReadService {
       };
     });
     return out ?? { ...emptySummary('unavailable'), scope: 'course', courseId, courseName: null, courseStatus: null, runs: [] };
+  }
+
+  /** r75: ¿existen las tablas opcionales de r75 (reservas de C / membresías de A)? (sin ellas la atribución se degrada). */
+  async r75Tables(q: Runner = this.dataSource): Promise<{ hasReservations: boolean; hasMemberships: boolean }> {
+    const [r] = await q.query(
+      `select to_regclass('public.budget_reservations') is not null as r, to_regclass('public.institution_memberships') is not null as m`,
+    );
+    return { hasReservations: !!r?.r, hasMemberships: !!r?.m };
+  }
+
+  /** Agregado genérico por una expresión SQL (sobre las columnas de `ev` o subconsultas con el alias `e`). */
+  private async groupByExpr(q: Runner, keyExpr: string, where: string, params: unknown[]): Promise<ScopedGroupRow[]> {
+    const rows = await q.query(
+      `with ${costEventsCte(where)}
+       select k as key,
+              coalesce(sum(amount) filter (where ${C} and not is_open), 0)::text as actual,
+              coalesce(sum(amount) filter (where ${C} and is_open), 0)::text as reserved,
+              coalesce(sum(amount) filter (where ${C}), 0)::text as committed,
+              count(*) filter (where ${C} and is_call)::int as provider_calls,
+              count(*)::int as events
+         from (select ev.*, (${keyExpr}) as k from ev) x
+        group by k order by sum(amount) filter (where ${C}) desc nulls last, k nulls last`,
+      params,
+    );
+    return rows.map((r: any) => ({
+      key: r.key ?? null, actual: dec(r.actual), reserved: dec(r.reserved), committed: dec(r.committed),
+      providerCalls: Number(r.provider_calls), events: Number(r.events),
+    }));
+  }
+
+  /**
+   * r75 (01 §6, regla 8): gasto de UNA institución en `[from, to)` (UTC, fecha efectiva) con la atribución de
+   * `eventInstitutionSql`. `institutionId = null` → eventos SIN institución (vista del SuperAdmin). Mismas definiciones
+   * que periodSummary (actual / reserved / committed); los métodos existentes no cambian.
+   */
+  async institutionPeriodSummary(institutionId: string | null, from: Date, to: Date): Promise<InstitutionPeriodSummary> {
+    if (!(from instanceof Date) || !(to instanceof Date) || !Number.isFinite(from.getTime()) || !Number.isFinite(to.getTime())) {
+      throw new FinopsError('INVALID_INPUT', 'from/to deben ser fechas válidas');
+    }
+    if (from.getTime() > to.getTime()) throw new FinopsError('INVALID_INPUT', 'from debe ser anterior a to');
+    if (institutionId !== null && !UUID_RE.test(institutionId)) throw new FinopsError('INVALID_INPUT', 'institutionId debe ser UUID');
+    const period = { from: from.toISOString(), to: to.toISOString(), basis: 'effective_at_utc' as const };
+    const out = await this.snapshot(async (q) => {
+      const t = await this.r75Tables(q);
+      const inst = eventInstitutionSql(t, 'e');
+      const inRange = `coalesce(p.created_at, e.created_at) >= $1::timestamptz and coalesce(p.created_at, e.created_at) < $2::timestamptz`;
+      const where = institutionId === null ? `${inRange} and ${inst} is null` : `${inRange} and ${inst} = $3`;
+      const params = institutionId === null ? [period.from, period.to] : [period.from, period.to, institutionId.toLowerCase()];
+      const s = await this.full(q, where, params);
+      const byCourse = s.status === 'ok' ? await this.groupByExpr(q, `course_id::text`, where, params) : [];
+      const payer = eventPayerSql(t, 'ev');
+      const byUser = s.status === 'ok' ? await this.groupByExpr(q, payer, where, params) : [];
+      return { ...s, scope: 'institution' as const, institutionId, period, byCourse, byUser };
+    });
+    return out ?? { ...emptySummary('unavailable'), scope: 'institution', institutionId, period, byCourse: [], byUser: [] };
+  }
+
+  /** r75: gasto del período agrupado por institución atribuida (key null = sin institución). Solo SuperAdmin. */
+  async spendByInstitution(from: Date, to: Date): Promise<ScopedGroupRow[] | null> {
+    const inRange = `coalesce(p.created_at, e.created_at) >= $1::timestamptz and coalesce(p.created_at, e.created_at) < $2::timestamptz`;
+    return this.snapshot(async (q) => {
+      const t = await this.r75Tables(q);
+      return this.groupByExpr(q, eventInstitutionSql(t, 'ev'), inRange, [from.toISOString(), to.toISOString()]);
+    });
+  }
+
+  /** r75: gasto del período agrupado por usuario que paga (iniciador del run o dueño). Solo SuperAdmin. */
+  async spendByPayer(from: Date, to: Date): Promise<ScopedGroupRow[] | null> {
+    const inRange = `coalesce(p.created_at, e.created_at) >= $1::timestamptz and coalesce(p.created_at, e.created_at) < $2::timestamptz`;
+    return this.snapshot(async (q) => {
+      const t = await this.r75Tables(q);
+      return this.groupByExpr(q, eventPayerSql(t, 'ev'), inRange, [from.toISOString(), to.toISOString()]);
+    });
   }
 
   /**
