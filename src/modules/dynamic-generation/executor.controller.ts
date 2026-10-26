@@ -4,6 +4,7 @@ import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { ClaimResult, DEFAULT_LEASE_SECONDS, ItemOpResult, SchedulerService } from './scheduler.service';
 import { ClaimItemDto, CompleteItemDto, FailItemDto, HeartbeatItemDto, ReleaseRunLeaseDto } from './dto/executor.dto';
+import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
 /**
  * Endpoints del ejecutor del navegador (Fase 5A, Task 3). Siempre con JWT:
@@ -27,6 +28,7 @@ export class ExecutorController {
   // Motor pedagógico Fase 2: `?features=pedagogy-brief-1` = el ejecutor aplica el brief pedagógico del claim.
   // Va por query (no en el body ni en un header): el body es whitelist estricta y CORS solo admite
   // Content-Type/Authorization, así un frontend nuevo contra un backend anterior sigue funcionando.
+  @AuthenticatedOnly("ejecutor del navegador: solo items de runs propios (owner_id; iniciador ≠ dueño → ejecución en servidor, D-14)")
   async claim(@Body() dto: ClaimItemDto, @CurrentUser() user: AuthUser, @Query('features') features?: string): Promise<ClaimResult> {
     return this.scheduler.claimNextItemDetailed({
       runId: dto.runId,
@@ -42,6 +44,7 @@ export class ExecutorController {
   // REL lease: el titular suelta el lease de ejecución del run (al cerrar la página, best-effort).
   @Post('runs/:runId/release-lease')
   @HttpCode(HttpStatus.OK)
+  @AuthenticatedOnly("ejecutor: lease de un run propio (owner_id en el SQL)")
   releaseLease(
     @Param('runId', ParseUUIDPipe) runId: string,
     @Body() dto: ReleaseRunLeaseDto,
@@ -53,6 +56,7 @@ export class ExecutorController {
   // POST /api/v1/dynamic-generation/items/:id/heartbeat
   @Post('items/:id/heartbeat')
   @HttpCode(HttpStatus.OK)
+  @AuthenticatedOnly("ejecutor: item de un run propio (owner_id en el SQL)")
   heartbeat(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: HeartbeatItemDto,
@@ -64,6 +68,7 @@ export class ExecutorController {
   // POST /api/v1/dynamic-generation/items/:id/complete
   @Post('items/:id/complete')
   @HttpCode(HttpStatus.OK)
+  @AuthenticatedOnly("ejecutor: item de un run propio (owner_id en el SQL)")
   complete(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CompleteItemDto,
@@ -80,6 +85,7 @@ export class ExecutorController {
   // POST /api/v1/dynamic-generation/items/:id/fail
   @Post('items/:id/fail')
   @HttpCode(HttpStatus.OK)
+  @AuthenticatedOnly("ejecutor: item de un run propio (owner_id en el SQL)")
   fail(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: FailItemDto,

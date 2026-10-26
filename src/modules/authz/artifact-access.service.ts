@@ -54,6 +54,20 @@ export async function validateClientArtifactRefs(
   }
 }
 
+/**
+ * r75 (D-15): vida de la URL firmada. Dueño (o contexto legacy): como hoy (default 3600 s, y artifacts.service la
+ * acota a 60 s – 7 días). Miembro que NO es el dueño (RBAC enforce): default 300 s, tope 3600 s.
+ */
+export const MEMBER_SIGNED_URL_DEFAULT_S = 300;
+export const MEMBER_SIGNED_URL_MAX_S = 3600;
+export function signedUrlSecondsFor(access: { legacy: boolean; actorId: string; effectiveOwnerId: string }, requested: unknown): number {
+  const n = requested === undefined || requested === null || requested === '' ? NaN : parseInt(String(requested), 10);
+  const isOwner = access.legacy || access.actorId.toLowerCase() === access.effectiveOwnerId.toLowerCase();
+  if (isOwner) return Number.isFinite(n) ? n : 3600;
+  if (!Number.isFinite(n)) return MEMBER_SIGNED_URL_DEFAULT_S;
+  return Math.max(60, Math.min(n, MEMBER_SIGNED_URL_MAX_S));
+}
+
 @Injectable()
 export class ArtifactAccessService {
   constructor(@Optional() private readonly dataSource?: DataSource) {}

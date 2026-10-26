@@ -87,7 +87,7 @@ create table if not exists public.platform_controls (
   updated_by uuid not null, updated_at timestamptz not null default now());
 `;
 
-async function startPg({ prodTypes = false, withATables = false } = {}) {
+async function startPg({ prodTypes = false, withATables = false, aMigration = false, prebrief = false } = {}) {
   const { Client } = require('pg');
   const pgBin = findPgBin();
   const port = await freePort();
@@ -118,9 +118,20 @@ async function startPg({ prodTypes = false, withATables = false } = {}) {
     if (res.status !== 0) throw new Error('migrate-production-jobs-constraints: ' + (res.stdout || '') + (res.stderr || ''));
     await withClient(DB, async (c) => {
       await c.query(fs.readFileSync(path.join(REPO, 'supabase-migration-dynamic-generation.sql'), 'utf8'));
+      // aMigration: la migración REAL de A (supabase-migration-r75-access.sql) antes del contrato (que es idempotente).
+      if (aMigration) {
+        await c.query('create table if not exists auth.users (id uuid primary key, email text, email_confirmed_at timestamptz)');
+        await c.query(fs.readFileSync(path.join(REPO, 'supabase-migration-r75-access.sql'), 'utf8'));
+      }
       await c.query(R75_CONTRACT_SQL);
       if (withATables) await c.query(R75_A_TABLES_SQL);
     });
+    if (prebrief) {
+      const r2 = spawnSync(process.execPath, [path.join(REPO, 'scripts/migrate-prebrief.js')], {
+        cwd: tmpCwd, env: cleanEnv({ MIGRATION_ENV: 'staging', DB_HOST: '127.0.0.1', DB_PORT: port, DB_USER: ROLE, DB_PASS: 'x', DB_NAME: DB, DB_SSL: 'false' }), encoding: 'utf8', timeout: 120000,
+      });
+      if (r2.status !== 0) throw new Error('migrate-prebrief: ' + (r2.stdout || '') + (r2.stderr || ''));
+    }
     return { port, db: DB, stop, connect: () => { const c = new Client({ host: '127.0.0.1', port, user: 'postgres', database: DB }); return c.connect().then(() => c); } };
   } catch (err) {
     stop();

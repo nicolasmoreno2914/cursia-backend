@@ -22,7 +22,9 @@ import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
 import { EventsService } from './events.service';
 import { CreateEventDto } from './dto/create-event.dto';
 import { AuthUser } from '../auth/auth.types';
+import { AuthenticatedOnly } from '../modules/authz/require-permission.decorator';
 
+@AuthenticatedOnly('eventos de uso propios (user_id del JWT; course_id ajeno se descarta, H8c)')
 @Controller('events')
 @UseGuards(SupabaseJwtGuard)
 export class EventsController {

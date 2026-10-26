@@ -20,6 +20,7 @@ import { TtsSpeechDto } from './dto/tts-speech.dto';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { assertDirectCallAllowed, recordDirectTtsCall } from '../modules/finops/direct-call-ledger';
 import { mp3DurationSeconds } from '../package/audio/mp3-parser';
+import { AuthenticatedOnly } from '../modules/authz/require-permission.decorator';
 
 /**
  * Proxy seguro para síntesis de voz con OpenAI TTS.
@@ -54,6 +55,7 @@ export class TtsController {
    * Para textos largos, partir en chunks antes de llamar este endpoint.
    */
   @Post('speech')
+  @AuthenticatedOnly("TTS directo del usuario (atribución del curso verificada en el ledger)")
   async speech(
     @Body() dto: TtsSpeechDto,
     @Res() res: Response,

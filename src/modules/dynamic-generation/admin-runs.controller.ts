@@ -7,6 +7,7 @@ import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { PilotMetricsService } from './pilot-metrics.service';
 import { LlmDiagnosticsService, LlmItemDiagnostics } from './llm-diagnostics.service';
+import { SuperAdminOnly } from '../authz/require-permission.decorator';
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin de la generación dinámica (SOLO LECTURA).
@@ -14,6 +15,7 @@ import { LlmDiagnosticsService, LlmItemDiagnostics } from './llm-diagnostics.ser
  * cualquier otro usuario (dueño incluido) → 403. Las acciones se ejecutan con los endpoints EXISTENTES
  * que cada entrada indica (todos aceptan a un SUPER_ADMIN sobre el curso de cualquier dueño).
  */
+@SuperAdminOnly()
 @Controller('admin/dynamic-runs')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class AdminDynamicRunsController {

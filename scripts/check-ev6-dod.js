@@ -30,6 +30,8 @@
 // Exit code: 0 si todos los [BASE] pasan (los [DOD] fallando es lo esperado en Fase A); 1 si un [BASE]
 // falla o el setup falla. `--strict` → 1 si cualquier caso falla (para usar en Fase B).
 
+// r75: los handlers reciben el contexto de acceso (@Access()); llamado directo = contexto legacy (RBAC off).
+const LA = (u) => ({ actorId: u.id, actorEmail: u.email, effectiveOwnerId: u.id, legacy: true, superAdmin: false, institutionId: null, permissions: new Set() });
 const fs = require('fs');
 const os = require('os');
 const net = require('net');
@@ -822,9 +824,9 @@ const ENV_KEYS = [
       // Ruta genérica de artifacts.
       const { ArtifactsController } = L('modules/artifacts/artifacts.controller.js');
       const svc = (meta) => ({ async findOne() { return { id: 'a', type: 'dynamic_mbz', metadata: meta }; }, async getDownloadUrl() { return { url: 'u' }; } });
-      await rejectsRe(new ArtifactsController(svc({ packageKind: 'qa_preview' })).getDownloadUrl(qaArt, { id: OWNER, email: 'owner@cursia.test' }), /admin_recovery_only/, 'QA nuevo, dueño', 403);
-      eq((await new ArtifactsController(svc({ packageKind: 'degraded' })).getDownloadUrl(qaArt, { id: OWNER, email: ADMIN.email })).data.url, 'u', 'admin');
-      eq((await new ArtifactsController(svc({ pendingVideos: [{}] })).getDownloadUrl(qaArt, { id: OWNER, email: 'owner@cursia.test' })).data.url, 'u', 'B1 anterior, dueño');
+      await rejectsRe(new ArtifactsController(svc({ packageKind: 'qa_preview' })).getDownloadUrl(qaArt, { id: OWNER, email: 'owner@cursia.test' }, LA({ id: OWNER, email: 'owner@cursia.test' })), /admin_recovery_only/, 'QA nuevo, dueño', 403);
+      eq((await new ArtifactsController(svc({ packageKind: 'degraded' })).getDownloadUrl(qaArt, { id: OWNER, email: ADMIN.email }, LA({ id: OWNER, email: ADMIN.email }))).data.url, 'u', 'admin');
+      eq((await new ArtifactsController(svc({ pendingVideos: [{}] })).getDownloadUrl(qaArt, { id: OWNER, email: 'owner@cursia.test' }, LA({ id: OWNER, email: 'owner@cursia.test' }))).data.url, 'u', 'B1 anterior, dueño');
     });
 
     // ════ 9. Fix round 3 ═══════════════════════════════════════════════════════
@@ -870,9 +872,9 @@ const ENV_KEYS = [
       const owner = { id: OWNER, email: 'owner@cursia.test' };
       eq((await ctl.findAll(owner)).data.map((a) => a.id), ['b1', 'f'], 'listado del dueño');
       eq((await ctl.findAll({ id: OWNER, email: ADMIN.email })).data.map((a) => a.id), ['qa', 'dg', 'b1', 'f'], 'listado del admin');
-      await rejectsRe(ctl.findOne('qa', owner), /not found/i, 'detalle QA al dueño', 404);
-      eq((await ctl.findOne('b1', owner)).data.storagePath, 'o/z.mbz', 'paquete anterior: detalle intacto');
-      eq((await ctl.findOne('qa', { id: OWNER, email: ADMIN.email })).data.id, 'qa', 'admin');
+      await rejectsRe(ctl.findOne('qa', owner, LA(owner)), /not found/i, 'detalle QA al dueño', 404);
+      eq((await ctl.findOne('b1', owner, LA(owner))).data.storagePath, 'o/z.mbz', 'paquete anterior: detalle intacto');
+      eq((await ctl.findOne('qa', { id: OWNER, email: ADMIN.email }, LA({ id: OWNER, email: ADMIN.email }))).data.id, 'qa', 'admin');
       const QP = L('modules/dynamic-packaging/qa-package.js');
       eq(QP.QA_INTERNAL_STORAGE_PREFIX, 'qa-internal', 'prefijo interno (≠ uid del dueño: ninguna política own-folder lo cubre)');
       assert(!/^[0-9a-f]{8}-/.test(QP.QA_INTERNAL_STORAGE_PREFIX), 'el prefijo nunca es un uid');

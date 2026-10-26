@@ -23,6 +23,7 @@ import { YoutubeService } from './youtube.service';
 import { YoutubeTokenService } from './youtube-token.service';
 import { YoutubeUploadService } from './youtube-upload.service';
 import { Public } from '../modules/authz/public.decorator';
+import { AuthenticatedOnly } from '../modules/authz/require-permission.decorator';
 
 /**
  * Endpoints de YouTube OAuth.
@@ -53,6 +54,7 @@ export function youtubeCallbackFailureCode(err: unknown): string {
   return 'callback_failed';
 }
 
+@AuthenticatedOnly('conexión YouTube propia (el callback OAuth es @Public)')
 @Controller('youtube')
 export class YoutubeController {
   private readonly logger = new Logger(YoutubeController.name);

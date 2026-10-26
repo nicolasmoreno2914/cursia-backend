@@ -15,6 +15,9 @@ import { ConfirmBrandProfileDto } from './dto/confirm-brand-profile.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { Access } from '../authz/access.decorator';
+import type { AccessContext } from '../authz/access-context';
+import { RequirePermission } from '../authz/require-permission.decorator';
 
 @Controller()
 @UseGuards(SupabaseJwtGuard)
@@ -27,14 +30,15 @@ export class BrandProfilesController {
    */
   @Post('institutions/:institutionId/brand-profiles')
   @HttpCode(HttpStatus.CREATED)
+  @RequirePermission('courses.edit', { institution: 'param:institutionId' })
   async createManual(
     @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
     @Body() dto: CreateBrandProfileDto,
-    @CurrentUser() user: AuthUser,
+    @CurrentUser() user: AuthUser, @Access() access: AccessContext,
   ) {
     const profile = await this.brandProfilesService.createManual(
       institutionId,
-      user.id,
+      access.effectiveOwnerId,
       dto,
     );
     return { ok: true, data: profile };
@@ -47,14 +51,15 @@ export class BrandProfilesController {
    */
   @Post('institutions/:institutionId/brand-profiles/upload')
   @HttpCode(HttpStatus.CREATED)
+  @RequirePermission('courses.edit', { institution: 'param:institutionId' })
   async upload(
     @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
     @Body() body: { sourceArtifactId: string; name?: string },
-    @CurrentUser() user: AuthUser,
+    @CurrentUser() user: AuthUser, @Access() access: AccessContext,
   ) {
     const result = await this.brandProfilesService.startExtraction(
       institutionId,
-      user.id,
+      access.effectiveOwnerId,
       body,
     );
     return { ok: true, data: result };
@@ -65,13 +70,14 @@ export class BrandProfilesController {
    * Paleta activa en forma PALETTES[] para el theme-picker del frontend.
    */
   @Get('institutions/:institutionId/brand-profiles/active')
+  @RequirePermission('courses.view', { institution: 'param:institutionId' })
   async findActive(
     @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
-    @CurrentUser() user: AuthUser,
+    @CurrentUser() user: AuthUser, @Access() access: AccessContext,
   ) {
     const profile = await this.brandProfilesService.findActive(
       institutionId,
-      user.id,
+      access.effectiveOwnerId,
     );
     return { ok: true, data: profile };
   }
@@ -81,37 +87,41 @@ export class BrandProfilesController {
    * Historial de versiones.
    */
   @Get('institutions/:institutionId/brand-profiles')
+  @RequirePermission('courses.view', { institution: 'param:institutionId' })
   async findAllVersions(
     @Param('institutionId', new ParseUUIDPipe()) institutionId: string,
-    @CurrentUser() user: AuthUser,
+    @CurrentUser() user: AuthUser, @Access() access: AccessContext,
   ) {
     const profiles = await this.brandProfilesService.findAllVersions(
       institutionId,
-      user.id,
+      access.effectiveOwnerId,
     );
     return { ok: true, data: profiles };
   }
 
   @Get('brand-profiles/:id')
-  async findOne(@Param('id', new ParseUUIDPipe()) id: string, @CurrentUser() user: AuthUser) {
-    const profile = await this.brandProfilesService.findOne(id, user.id);
+  @RequirePermission('courses.view', { brandProfile: 'param:id' })
+  async findOne(@Param('id', new ParseUUIDPipe()) id: string, @CurrentUser() user: AuthUser, @Access() access: AccessContext) {
+    const profile = await this.brandProfilesService.findOne(id, access.effectiveOwnerId);
     return { ok: true, data: profile };
   }
 
   /** POST /api/v1/brand-profiles/:id/confirm — confirmación humana (Fase 2). */
   @Post('brand-profiles/:id/confirm')
+  @RequirePermission('courses.edit', { brandProfile: 'param:id' })
   async confirm(
     @Param('id', new ParseUUIDPipe()) id: string,
     @Body() dto: ConfirmBrandProfileDto,
-    @CurrentUser() user: AuthUser,
+    @CurrentUser() user: AuthUser, @Access() access: AccessContext,
   ) {
-    const profile = await this.brandProfilesService.confirm(id, user.id, dto);
+    const profile = await this.brandProfilesService.confirm(id, access.effectiveOwnerId, dto, access.actorId);
     return { ok: true, data: profile };
   }
 
   @Post('brand-profiles/:id/reject')
-  async reject(@Param('id', new ParseUUIDPipe()) id: string, @CurrentUser() user: AuthUser) {
-    const profile = await this.brandProfilesService.reject(id, user.id);
+  @RequirePermission('courses.edit', { brandProfile: 'param:id' })
+  async reject(@Param('id', new ParseUUIDPipe()) id: string, @CurrentUser() user: AuthUser, @Access() access: AccessContext) {
+    const profile = await this.brandProfilesService.reject(id, access.effectiveOwnerId);
     return { ok: true, data: profile };
   }
 }
