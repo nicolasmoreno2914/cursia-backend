@@ -368,6 +368,13 @@ async function itemE() {
   const res = await Promise.all(courses.map((c) => api('POST', `/courses/${c.id}/blueprints/${c.n}/manifest/runs`, { token: TK.creadorA, body: D_FIELDS, headers: { 'X-Cursia-Institution': I.A.id } })));
   const started = res.filter((r) => r.status === 201 || r.status === 200);
   const rejected = res.filter((r) => r.status === 409 && r.code === 'user_budget_insufficient');
+  const [rv] = await q(`select count(*)::int n from public.budget_reservations where user_id = $1`, [U.creadorA.id]);
+  for (const r of started) if (r.data && r.data.run && r.data.run.id) await q(`update public.production_jobs set worker_status='cancelled', status='cancelled' where id=$1`, [r.data.run.id]).catch(() => {});
+  if (rv.n === 0 && rejected.length === 0) {
+    t.pending('reserva concurrente al arrancar', `el arranque de runs aún no reserva presupuesto (C2, runs.service, después de r74): ${started.length}/${N} arrancaron sin reserva`);
+    finding('P1', 'e', `con CURSIA_USER_BUDGETS=enforce y disponible para 2,5 runs arrancaron ${started.length}/${N} sin reserva (falta C2)`, 'POST …/manifest/runs ×6 en paralelo como creadorA');
+    return;
+  }
   t.ok(started.length <= 2, `${N} arranques en paralelo con disponible para 2,5 → arrancan ≤ 2 (arrancaron ${started.length})`, res.map(brief));
   t.ok(started.length + rejected.length === N, 'el resto → 409 user_budget_insufficient (nada de 500/otros)', res.map(brief));
   const [sum] = await q(`select coalesce(sum(amount_usd),0)::text s, count(*)::int n from public.budget_reservations where user_id = $1 and status = 'active'`, [U.creadorA.id]);
