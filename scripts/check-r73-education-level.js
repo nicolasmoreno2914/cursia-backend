@@ -130,6 +130,7 @@ const prof = (f) => {
         assert(p.question && p.question.options.length >= 2 && /¿Para quién es el curso\?/.test(p.question.text), 'una pregunta con opciones');
         assert(p.question.why, 'con la razón de la sugerencia');
         if (exp.stage) eq(p.question.suggestion, exp.stage, 'sugerencia');
+        else eq(p.question.suggestion, null, 'sin señales: NINGÚN nivel sugerido (nunca el valor de partida «Universitario»)');
       }
     });
   }
