@@ -1,0 +1,11 @@
+{
+  "_nota": "Último resultado de la sonda empírica H2 en STAGING (02/03: ítem i). Se actualiza a mano tras cada re-verificación (snippet: test/r75/h2-staging-probe.snippet.js, pestaña logueada de staging.orbia.pages.dev). writeAllowed=true ⇒ el ítem (i) FALLA.",
+  "probedAt": "2026-10-26",
+  "project": "ljdtmkwuhkvtmlhugjrv",
+  "as": "usuario authenticated logueado (owner, posible is_admin=true)",
+  "insert": { "status": 201, "allowed": true },
+  "update": { "status": 200, "allowed": true },
+  "delete": { "status": 200, "allowed": true, "note": "solo la fila sintética creada por la sonda" },
+  "writeAllowed": true,
+  "cleanup": "fila sintética qa-r75-h2-probe@example.com borrada por id; 0 restantes"
+}
