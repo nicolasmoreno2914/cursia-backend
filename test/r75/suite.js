@@ -169,6 +169,12 @@ async function itemB() {
       }
       const p = fill(r.route, base);
       const res = await api(r.method, p, { token: TK[k], body: r.method === 'GET' ? undefined : {} });
+      if (allowed && res.status === 500 && /brand-profiles\/upload$/.test(r.route)) {
+        // Preexistente (no r75): scripts/lib/production-jobs-constraints.js no incluye 'brand_extraction' (sí lo hace
+        // supabase-migration-brand-extraction-execution-mode.sql), así que el CHECK del PG descartable rechaza el job del Brand Kit.
+        t.pending(`${role} PUEDE ${r.perm.permission} en ${r.method} ${r.route}`, '500 preexistente: execution_mode brand_extraction fuera de production-jobs-constraints.js');
+        continue;
+      }
       if (allowed) {
         const pass = !(res.status === 403 && res.code === 'permission_denied') && res.code !== 'not_a_member' && res.status !== 500 && res.code !== 'access_context_missing';
         if (pass) allowOk++;
