@@ -1,3 +1,4 @@
+import { allowUnownedCourses } from '../authz/unowned-courses'; // r75 D-26 (H4)
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { assertDynamicOwnerAllowed } from '../features/dynamic-features';
@@ -23,7 +24,7 @@ export class CourseFactsService {
 
   /** Mismo filtro de ownership que CoursesService.findOne; solo cursos dinámicos. */
   private async courseRow(q: Q, courseId: number, ownerId: string, forUpdate = false) {
-    const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
+    const allowUnowned = allowUnownedCourses();
     const rows = await q.query(
       `select id, title, structure_version, institution_id, metadata from public.courses
         where id = $1 and (owner_id = $2 or ($3 = true and owner_id is null))${forUpdate ? ' for update' : ''}`,

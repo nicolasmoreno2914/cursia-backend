@@ -89,6 +89,7 @@ const LEG_UUID = '0b9c8d1e-2f3a-4b5c-8d6e-7f8091a2b3c4';
 // I1 fallan con el SQL viejo). La semántica exacta contra Postgres real la
 // valida además scratch/sa-be/i1-sql (ver reporte).
 // ─────────────────────────────────────────────────────────────────────────────
+const FULL_JOB_ID = 'f0110000-0000-4000-8000-000000000001'; // r75 H9: jobs/:id exige UUID (ParseUUIDPipe)
 const TWIN_UUID = '3c2b1a00-aaaa-4bbb-8ccc-dddddddddddd'; // legacy + gemelo V2 con el MISMO UUID
 const COURSES = [
   { id: 7, owner: OWNER_A, sv: 'dynamic', frontend: DYN_UUID },
@@ -114,6 +115,10 @@ function makeDataSource(log) {
         return COURSES.filter((c) => c.owner === owner && c.sv === 'dynamic' && (byId(c) || byUuid(c)))
           .slice(0, 1)
           .map(() => ({ found: 1 }));
+      }
+      // r75 H8a (assertCourseRefNotForeign): dueño del curso por id numérico.
+      if (/^select owner_id::text as owner_id from public\.courses where id = \$1$/.test(sql.trim())) {
+        return COURSES.filter((c) => c.id === params[0]).map((c) => ({ owner_id: c.owner }));
       }
       throw new Error('SQL inesperado en DataSource falso: ' + sql.slice(0, 120));
     },
@@ -282,8 +287,10 @@ async function call(base, method, p, { user = OWNER_A, body } = {}) {
         const r = await call(base, 'POST', '/api/v1/jobs/audio', { body: { courseId, courseData: {} } });
         eq(r.status, 201, `legacy ${courseId} ${JSON.stringify(r.json)}`);
       }
-      // Otro owner con el id de un curso V2 ajeno: no es SU curso V2 → comportamiento legacy.
-      eq((await call(base, 'POST', '/api/v1/jobs/audio', { user: OWNER_B, body: { courseId: '7', courseData: {} } })).status, 201, 'otro owner');
+      // r75 H8a: otro owner con el id NUMÉRICO de un curso ajeno → 404 course_not_found (antes: «comportamiento legacy»,
+      // un job apuntando al curso de otro usuario y sin el 409 R68).
+      const foreign = await call(base, 'POST', '/api/v1/jobs/audio', { user: OWNER_B, body: { courseId: '7', courseData: {} } });
+      eq([foreign.status, foreign.json && foreign.json.code], [404, 'course_not_found'], 'otro owner');
     });
 
     await check('A1 POST /api/v1/jobs/full: curso V2 → 409 (genera audio legacy); con generateAudio=false no aplica; legacy → 201', async () => {
@@ -299,21 +306,21 @@ async function call(base, method, p, { user = OWNER_A, body } = {}) {
 
     await check('A1 POST /api/v1/jobs/:id/retry (job maestro): curso V2 → 409 sin reencolar; legacy → ok', async () => {
       const mk = (frontendCourseId, options = {}) => ({
-        id: 'full-1', ownerId: OWNER_A, executionMode: 'course_full_generation', status: 'failed', workerStatus: 'failed',
+        id: FULL_JOB_ID, ownerId: OWNER_A, executionMode: 'course_full_generation', status: 'failed', workerStatus: 'failed',
         frontendCourseId, courseId: null, inputPayload: { options }, outputSummary: {},
       });
       jobs.repos.state.jobForFindOne = mk(DYN_UUID);
       const saves = jobs.repos.state.jobSaves;
-      const r = await call(base, 'POST', '/api/v1/jobs/full-1/retry');
+      const r = await call(base, 'POST', `/api/v1/jobs/${FULL_JOB_ID}/retry`);
       eq(r.status, 409, `status ${JSON.stringify(r.json)}`);
       assert(String(r.json && r.json.error).startsWith(PREFIX_AUDIO), JSON.stringify(r.json));
       eq(jobs.repos.state.jobSaves, saves, 'no debe reencolar');
       jobs.repos.state.jobForFindOne = mk(DYN_UUID, { generateAudio: false });
-      const noAudio = await call(base, 'POST', '/api/v1/jobs/full-1/retry');
+      const noAudio = await call(base, 'POST', `/api/v1/jobs/${FULL_JOB_ID}/retry`);
       eq(noAudio.status, 409, 'generateAudio=false: 409 (R68)');
       eq(jobs.repos.state.jobSaves, saves, 'generateAudio=false: no reencola (R68)');
       jobs.repos.state.jobForFindOne = mk(LEG_UUID);
-      const ok = await call(base, 'POST', '/api/v1/jobs/full-1/retry');
+      const ok = await call(base, 'POST', `/api/v1/jobs/${FULL_JOB_ID}/retry`);
       eq(ok.status, 200, 'legacy status');
       eq(jobs.repos.state.jobSaves, saves + 1, 'legacy: reencola');
       jobs.repos.state.jobForFindOne = null;
