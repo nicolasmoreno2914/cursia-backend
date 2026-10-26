@@ -59,6 +59,13 @@ alter table public.institutions
   add column if not exists status     text not null default 'active',
   add column if not exists created_by varchar(36);
 
+-- Si las columnas ya existían sin default / nullable (p. ej. creadas por synchronize de TypeORM en una base local de
+-- pruebas), se normalizan: default, relleno de NULL y NOT NULL. Idempotente.
+alter table public.institutions alter column kind set default 'organization', alter column status set default 'active';
+update public.institutions set kind = 'organization' where kind is null;
+update public.institutions set status = 'active' where status is null;
+alter table public.institutions alter column kind set not null, alter column status set not null;
+
 do $$ begin
   if not exists (select 1 from pg_constraint where conname = 'institutions_kind_r75_check') then
     alter table public.institutions add constraint institutions_kind_r75_check check (kind in ('organization','personal'));
