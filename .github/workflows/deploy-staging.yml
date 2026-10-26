@@ -638,13 +638,20 @@ jobs:
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 
-               echo "━━━ [0d] r75: roles, permisos y presupuestos — flags en SHADOW (solo el .env de STAGING) ━━━"
-               # shadow = se calcula y se audita (account_guard.shadow_deny / rbac.shadow_deny / budget.shadow_insufficient)
-               # pero se aplica la regla de hoy. CURSIA_ACCOUNT_GUARD NO pasa a enforce mientras los registros de Supabase
-               # de staging sigan abiertos (acción del owner). Revertir = off.
+               echo "━━━ [0d] r75: roles y presupuestos en ENFORCE; guard de cuenta en SHADOW (solo el .env de STAGING) ━━━"
+               # r75 Fase 2: RBAC y presupuestos por usuario se APLICAN en staging (pruebas reales por rol). Revertir = shadow.
+               # CURSIA_ACCOUNT_GUARD sigue en shadow: los registros de Supabase de staging siguen abiertos (acción del owner);
+               # en enforce bastaría confirmar un email para entrar.
                ensure_env_exact CURSIA_ACCOUNT_GUARD shadow
-               ensure_env_exact CURSIA_RBAC_MODE shadow
-               ensure_env_exact CURSIA_USER_BUDGETS shadow
+               ensure_env_exact CURSIA_RBAC_MODE enforce
+               ensure_env_exact CURSIA_USER_BUDGETS enforce
+               # r75 Fase 2: cuentas QA sintéticas (qa-r75-*@example.com, creadas en staging por POST /admin/users) con V2
+               # para probar Propuesta / aprobación / estimado por rol. Ids de staging, no secretos. Sin video real.
+               for qa_owner in c9742efe-f45a-4389-b305-09b7bac3e709 21b19a6a-6e39-4313-ac34-afaecbeefdf8 1706ff10-1157-4fa5-9e11-6e42bc9b1133 \
+                               7aa4981f-b9ed-41ce-8859-53f2eb0383f0 34ed5dde-2950-4b8e-910e-c91c77ef4dd5 3bd4e919-e8d3-4c3e-9f13-737e4c2113b9 \
+                               8e642f8d-1db2-40b8-86eb-1540a57ce7fe; do
+                 ensure_env_list_contains DYNAMIC_V2_ALLOWED_OWNERS "$qa_owner"
+               done
                # D-26 (H4): con ALLOW_UNOWNED_COURSES=true fuera de development la API y los workers NO arrancan
                # (assertUnownedCoursesSafe). Fuera de development el flag ya no tenía efecto: se apaga para no tumbar staging.
                if [ "$(_env_val .env ALLOW_UNOWNED_COURSES)" = "true" ]; then
