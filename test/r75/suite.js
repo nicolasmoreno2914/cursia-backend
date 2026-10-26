@@ -348,6 +348,55 @@ async function itemD() {
   console.log(`  (d) ${jwtRoutes.length} rutas JWT × 2 identidades; ${bad} fallas`);
 }
 
+// ─── (b) runs + packaging: permisos por institución del curso y dueño efectivo (post-r74, R75-E6, D-14) ─────
+async function itemBRuns() {
+  t.item('b');
+  if (!F.permGuard || !F.runsAuthz) { t.pending('runs/packaging con @RequirePermission', 'runs.controller sin marcas (paso tras r74)'); return; }
+  let c;
+  try { c = await buildCourse('creadorA', I.A, 'r75 runs authz'); } catch (e) { t.pending('runs/packaging', `curso con Manifest: ${e.message}`); return; }
+  const H = { 'X-Cursia-Institution': I.A.id };
+  const base = `/courses/${c.id}/blueprints/${c.n}/manifest/runs`;
+  const fakeRun = crypto.randomUUID();
+  const runsOf = async () => (await q(`select count(*)::int n from public.production_jobs where course_id::text = $1::text and execution_mode = 'dynamic_generation'`, [c.id]))[0].n;
+  let r = await api('GET', base, { token: TK.consultaA, headers: H });
+  t.ok(r.status === 200, 'CONSULTA (courses.view) lee el run actual de un curso de su institución', brief(r));
+  r = await api('GET', base, { token: TK.adminB });
+  t.ok(r.status === 404, 'adminB (otra institución) → 404 en GET …/runs (no revela el curso)', brief(r));
+  r = await api('POST', `${base}/estimate-preview`, { token: TK.consultaA, body: D_FIELDS, headers: H });
+  t.ok(r.status === 403 && r.code === 'permission_denied' && r.json && r.json.permission === 'generations.start', 'CONSULTA → 403 permission_denied {generations.start} en estimate-preview', brief(r));
+  r = await api('POST', base, { token: TK.adminA, body: D_FIELDS, headers: H });
+  t.ok(r.status === 403 && r.code === 'permission_denied', 'ADMIN_INSTITUCIONAL sin generations.start (D-8) no arranca', brief(r));
+  // Miembro CREADOR que no es el dueño: estima con SU presupuesto (paga quien inicia) y sin el gasto global (H5).
+  r = await api('POST', `${base}/estimate-preview`, { token: TK.usd0, body: D_FIELDS, headers: H });
+  t.ok(r.status === 200, 'CREADOR no dueño (generations.start) → 200 en estimate-preview (dueño efectivo)', brief(r));
+  if (r.status === 200) {
+    t.ok(r.data.userBudget && r.data.userBudget.payerUserId === U.usd0.id, 'userBudget.payerUserId = quien inicia (no el dueño técnico)', r.data.userBudget);
+    t.ok(!r.data.policy || r.data.policy.monthSpent === null, 'policy.monthSpent null para un no-SA (H5)', r.data.policy);
+  }
+  const before = await runsOf();
+  r = await api('POST', base, { token: TK.usd0, body: D_FIELDS, headers: H });
+  t.ok(r.status === 409 && r.code === 'server_execution_required', 'D-14: CREADOR no dueño sin worker de IA → 409 server_execution_required', brief(r));
+  r = await api('POST', base, { token: TK.sa, body: D_FIELDS });
+  t.ok(r.status === 409 && r.code === 'server_execution_required', 'R75-E6: el SA ya no recibe 404 en POST …/runs de un curso ajeno (D-14 → 409 server_execution_required)', brief(r));
+  r = await api('POST', `${base}/approve-and-start`, { token: TK.sa, body: { ...D_FIELDS, estimateHash: '0'.repeat(64) } });
+  t.ok(r.status !== 404 && r.status < 500, `SA en approve-and-start de un curso ajeno: no 404/5xx (vino ${r.status} ${r.code || ''})`, brief(r));
+  t.ok((await runsOf()) === before, 'ningún arranque rechazado creó un run', { before, after: await runsOf() });
+  // Detener / reanudar (D-28: generations.retry). Run inexistente → 404 detrás del guard; sin el permiso → 403.
+  r = await api('POST', `${base}/${fakeRun}/pause`, { token: TK.adminA, headers: H });
+  t.ok(r.status === 404, 'ADMIN_INSTITUCIONAL (generations.retry) pasa el guard: run inexistente → 404', brief(r));
+  r = await api('POST', `${base}/${fakeRun}/pause`, { token: TK.consultaA, headers: H });
+  t.ok(r.status === 403 && r.code === 'permission_denied', 'CONSULTA no pausa (sin generations.retry)', brief(r));
+  // Packaging (exports.download; D-9: CONSULTA sin descarga).
+  r = await api('GET', `${base}/${fakeRun}/package`, { token: TK.consultaA, headers: H });
+  t.ok(r.status === 403 && r.code === 'permission_denied' && r.json && r.json.permission === 'exports.download', 'CONSULTA → 403 {exports.download} en GET …/package', brief(r));
+  r = await api('GET', `${base}/${fakeRun}/package`, { token: TK.aprobadorA, headers: H });
+  t.ok(r.status === 404, 'APROBADOR (exports.download) pasa el guard: run inexistente → 404', brief(r));
+  r = await api('POST', `${base}/${fakeRun}/package`, { token: TK.adminB });
+  t.ok(r.status === 404, 'adminB → 404 en POST …/package de un curso de A', brief(r));
+  r = await api('GET', `${base}/${fakeRun}/package`, { token: TK.sa });
+  t.ok(r.status === 404, 'SA → 404 de run inexistente (no 403) en el package de un curso ajeno', brief(r));
+}
+
 // ─── curso con Manifest vía API (para (e), (k)) ─────────────────────────────
 async function buildCourse(ownerKey, inst, title) {
   const tok = TK[ownerKey];
@@ -608,7 +657,7 @@ async function itemL() {
   await detect();
   try {
     await setup();
-    for (const [k, fn] of [['a', itemA], ['b', itemB], ['c', itemC], ['d', itemD], ['e', itemE], ['f', itemF], ['g', itemG], ['h', itemH], ['i', itemI], ['k', itemK], ['l', itemL]]) {
+    for (const [k, fn] of [['a', itemA], ['b', itemB], ['b', itemBRuns], ['c', itemC], ['d', itemD], ['e', itemE], ['f', itemF], ['g', itemG], ['h', itemH], ['i', itemI], ['k', itemK], ['l', itemL]]) {
       console.log(`\n══════ (${k}) ══════`);
       try { await fn(); } catch (e) { t.item(k); t.ok(false, `excepción en (${k}): ${e && e.stack ? e.stack.split('\n').slice(0, 4).join(' | ') : e}`); }
     }
