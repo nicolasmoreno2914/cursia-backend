@@ -7,6 +7,7 @@ import { adjustmentIdempotencyKey, costIdempotencyKey, CostIdempotencyKind, Cost
 import { familyOfProvider, operationForItem } from './operations';
 import type { EstimateResult } from './estimator';
 import { CostReadService, costEventsCte } from './cost-read.service';
+import { UserBudgetGate, userBudgetsMode } from './user-budget-gate';
 import { assertProviderSpendAllowed, unattributedCeilings } from './spend-controls';
 import { assertEvidenceMatchesAmount, parsePartialAmount, parseReconcileEvidence, ReconcileEvidence } from './reconcile-decision';
 
@@ -239,6 +240,28 @@ export class FinopsLedgerService {
     this.costRead = costRead ?? new CostReadService(dataSource);
   }
 
+  // ─── r75 (Agente C): presupuesto por usuario. Sin gate o con CURSIA_USER_BUDGETS=off → igual que antes. ─────────
+  private userBudgetGate: UserBudgetGate | null = null;
+
+  /** Lo llama BudgetsModule al iniciar (evita la dependencia circular finops ↔ budgets). */
+  setUserBudgetGate(gate: UserBudgetGate | null): void {
+    this.userBudgetGate = gate;
+  }
+
+  private activeUserBudgetGate(): UserBudgetGate | null {
+    const g = this.userBudgetGate;
+    return g && g.mode() !== 'off' ? g : null;
+  }
+
+  /**
+   * r75 (01 §3.2, D-14): el iniciador de un run (input_payload.startedBy, lo escribe la reserva del arranque) es un
+   * ejecutor autorizado como el dueño — el evento conserva owner_id = dueño del run y metadata.executorOwnerId = el
+   * iniciador (mismo patrón que server_worker). Solo con presupuestos por usuario activos.
+   */
+  private startedByAccepted(startedBy: unknown, ownerIdFromAuth: string): boolean {
+    return userBudgetsMode() !== 'off' && typeof startedBy === 'string' && startedBy !== '' && startedBy === ownerIdFromAuth;
+  }
+
   // ─── atribución ────────────────────────────────────────────────────────────
 
   /** Deriva la atribución desde generation_item_runs + production_jobs. Nunca desde el cliente. */
@@ -263,7 +286,8 @@ export class FinopsLedgerService {
     if (typeof itemRunId !== 'string' || !UUID_RE.test(itemRunId)) return unattributed('invalid_item_run_id');
     const rows = await this.dataSource.query(
       `select gir.id, gir.job_id, gir.course_id, gir.blueprint_id, gir.manifest_id, gir.item_key,
-              gir.generation, gir.type, gir.scope, gir.module_id, gir.chapter_id, pj.owner_id
+              gir.generation, gir.type, gir.scope, gir.module_id, gir.chapter_id, pj.owner_id${userBudgetsMode() !== 'off' ? `,
+              pj.input_payload->>'startedBy' as started_by` : ''}
          from public.generation_item_runs gir
          join public.production_jobs pj on pj.id = gir.job_id
         where gir.id = $1`,
@@ -275,7 +299,7 @@ export class FinopsLedgerService {
     // Por HTTP (proxy del navegador) un no dueño queda sin atribuir — y si es una reserva pagada por Cursia, se RECHAZA
     // en buildChargeRow (nunca un gasto sin tope del run).
     const delegated = String(r.owner_id) !== ownerIdFromAuth;
-    if (delegated && executor !== 'server_worker') return unattributed('owner_mismatch');
+    if (delegated && executor !== 'server_worker' && !this.startedByAccepted(r.started_by, ownerIdFromAuth)) return unattributed('owner_mismatch');
     return {
       attributed: true,
       rejectReason: null,
@@ -318,13 +342,14 @@ export class FinopsLedgerService {
     };
     if (typeof runId !== 'string' || !UUID_RE.test(runId)) return { ...base, rejectReason: 'invalid_run_id' };
     const [r] = await this.dataSource.query(
-      `select id, owner_id, course_id, input_payload->>'manifestId' as manifest_id, blueprint_version_id
+      `select id, owner_id, course_id, input_payload->>'manifestId' as manifest_id, blueprint_version_id${userBudgetsMode() !== 'off' ? `,
+              input_payload->>'startedBy' as started_by` : ''}
          from public.production_jobs where id = $1`,
       [runId],
     );
     if (!r) return { ...base, rejectReason: 'run_not_found' };
     const delegated = String(r.owner_id) !== ownerIdFromAuth;
-    if (delegated && executor !== 'server_worker') return { ...base, rejectReason: 'owner_mismatch' };
+    if (delegated && executor !== 'server_worker' && !this.startedByAccepted(r.started_by, ownerIdFromAuth)) return { ...base, rejectReason: 'owner_mismatch' };
     const manifestId = Number(r.manifest_id);
     return {
       ...base,
@@ -380,9 +405,20 @@ export class FinopsLedgerService {
     // insertado bajo UN lock consultivo (dos reservas concurrentes nunca pasan el techo). Sin techo configurado → igual
     // que antes.
     const ceilings = isUnattributedPaidReservation(row) ? unattributedCeilings() : null;
-    const res = ceilings && (ceilings.perOwner !== null || ceilings.global !== null)
-      ? await this.dataSource.transaction((m) => this.insertReservationWithinUnattributedCeiling(row, ceilings, m))
-      : await this.insertEvent(row, this.dataSource);
+    const hasCeiling = !!ceilings && (ceilings.perOwner !== null || ceilings.global !== null);
+    // r75 (01 §5.4): una RESERVA pagada por Cursia SIN run (proxy sin parte, llamadas con reserva previa) exige además
+    // disponible del usuario ≥ monto, verificado e insertado bajo el lock del usuario (orden: usuario → techo sin
+    // atribuir). Sin gate activo → exactamente el camino de antes.
+    const gate = isNoRunPaidReservation(row) ? this.activeUserBudgetGate() : null;
+    const res = gate
+      ? await this.dataSource.transaction(async (m) => {
+          await m.query(`set local lock_timeout = '20s'`);
+          await gate.guardUnattributedSpend(m, { userId: String(row.owner_id), amount: row.amount as string, idempotencyKey: String(row.idempotency_key) });
+          return hasCeiling ? this.insertReservationWithinUnattributedCeiling(row, ceilings!, m) : this.insertEvent(row, m);
+        })
+      : hasCeiling
+        ? await this.dataSource.transaction((m) => this.insertReservationWithinUnattributedCeiling(row, ceilings!, m))
+        : await this.insertEvent(row, this.dataSource);
     if (pricingError) {
       this.logPricingMissing(idempotencyKey, input, pricingError);
       return { ...res, pricingMissing: true };
@@ -731,12 +767,18 @@ export class FinopsLedgerService {
     }
 
     const billable = input.billingAccount === 'cursia' && costSource !== 'MOCK';
+    // r75 (01 §6): institución del evento NUEVO = la del curso (o, sin curso, la única membresía activa del dueño).
+    // Los eventos viejos no se reescriben (append-only): la lectura los resuelve por course_id. Con el flag en off → null.
+    const gate = this.activeUserBudgetGate();
+    const institutionId = gate
+      ? await gate.institutionForCharge(this.dataSource, { ownerId: attribution.owner_id, courseId: attribution.course_id, runId: attribution.run_id })
+      : null;
 
     const row: Record<string, unknown> = {
       event_kind: 'CHARGE',
       corrects_event_id: null,
       owner_id: attribution.owner_id,
-      institution_id: null,
+      institution_id: institutionId,
       course_id: attribution.course_id,
       blueprint_id: attribution.blueprint_id,
       manifest_id: attribution.manifest_id,
@@ -1775,6 +1817,12 @@ export function runBudgetNotAuthorizedError(runId: string, amount: string): Fino
   return new FinopsError('RUN_BUDGET_NOT_AUTHORIZED',
     `el run ${runId} no tiene un presupuesto autorizado (ninguna autorización registrada): no se reserva ni se llama al proveedor (USD ${Number(amount).toFixed(4)}). Un administrador tiene que autorizar el presupuesto del run (POST /finops/courses/:courseId/authorizations con runId) antes de reanudar`,
     { runId, amount, authorizedBudget: null });
+}
+
+/** r75: ¿reserva pagada por Cursia (real, no BYOK ni mock) SIN run? (sujeta al disponible del usuario). */
+export function isNoRunPaidReservation(row: Record<string, unknown>): boolean {
+  const md = (row.metadata && typeof row.metadata === 'object' ? row.metadata : {}) as Record<string, unknown>;
+  return md.reservation === true && row.event_kind === 'CHARGE' && !row.run_id && row.billing_account === 'cursia' && row.cost_source !== 'MOCK';
 }
 
 /** ¿Esta fila es una reserva pagada por Cursia de un run (sujeta al tope atómico del run)? */

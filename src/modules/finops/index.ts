@@ -20,3 +20,4 @@ export * from './spend-controls';
 export * from './reconcile-decision';
 export * from './policy-admin';
 export * from './ambiguous-resend';
+export * from './user-budget-gate';
