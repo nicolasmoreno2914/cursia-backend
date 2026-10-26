@@ -449,7 +449,9 @@ async function itemH() {
   if (!F.access) { t.pending('tempPassword', 'POST /admin/users no integrado (A)'); return; }
   const email = `qa-r75-temp-${crypto.randomBytes(3).toString('hex')}@example.com`;
   const r = await api('POST', '/admin/users', { token: TK.sa, body: { email, fullName: 'QA Temp', mode: 'temp_password', memberships: [{ institutionId: I.A.id, role: 'CONSULTA' }] } });
-  const e = []; if (r.data) S.AdminUser(r.data.user, e, 'user');
+  // AdminUser.budget: el contrato lo define no nulo; sin el módulo de presupuestos (C) A devuelve null → se tolera y se anota.
+  const e = []; if (r.data) S.AdminUser(r.data.user && r.data.user.budget === null && !F.budgets ? { ...r.data.user, budget: { month: '2026-10', limitUsd: '0', spentUsd: '0', heldUsd: '0', availableUsd: '0', pendingRequests: 0 } } : r.data.user, e, 'user');
+  if (r.data && r.data.user && r.data.user.budget === null) (F.budgets ? t.ok(false, 'AdminUser.budget no nulo con presupuestos integrados') : t.pending('AdminUser.budget', 'null hasta integrar C (BudgetReadService)'));
   t.ok((r.status === 201 || r.status === 200) && typeof (r.data && r.data.tempPassword) === 'string' && r.data.tempPassword.length >= 20 && !e.length, 'POST /admin/users temp_password → tempPassword (≥ 20) UNA vez', { ...brief(r), e });
   t.ok(/no-store/.test(String(r.headers['cache-control'] || '')), 'respuesta con tempPassword lleva Cache-Control: no-store', r.headers['cache-control']);
   const pw = r.data && r.data.tempPassword;
@@ -467,7 +469,10 @@ async function itemH() {
   }
   t.ok(hits.length === 0, `tempPassword no está en ninguna columna de la base (${cols.length} columnas revisadas)`, hits);
   const audit = await q(`select action, before::text b, after::text a from public.admin_audit_log where action like 'user.%'`);
-  t.ok(audit.length > 0 && audit.every((x) => !(x.a || '').includes(pw) && !/password/i.test(x.a || '')), 'auditoría user.create sin la contraseña ni claves «password»', audit);
+  const keyHits = [];
+  const walk = (o, p) => { if (o && typeof o === 'object') for (const [k, v] of Object.entries(o)) { if (/^(temp_?)?password$|secret|token|api_?key/i.test(k)) keyHits.push(`${p}.${k}`); walk(v, `${p}.${k}`); } };
+  for (const x of audit) { walk(x.a ? JSON.parse(x.a) : null, x.action); walk(x.b ? JSON.parse(x.b) : null, x.action); }
+  t.ok(audit.length > 0 && audit.every((x) => !(x.a || '').includes(pw) && !(x.b || '').includes(pw)) && !keyHits.length, 'auditoría user.create sin la contraseña ni claves sensibles', { n: audit.length, keyHits });
   const det = await api('GET', `/admin/users/${r.data.user.id}`, { token: TK.sa, raw: true });
   t.ok(det.status === 200 && !(det.text || '').includes(pw), 'GET /admin/users/:id no vuelve a mostrar la contraseña', brief(det));
   const inv = await api('POST', '/admin/users', { token: TK.sa, body: { email: `qa-r75-inv-${crypto.randomBytes(3).toString('hex')}@example.com`, mode: 'invite' } });
