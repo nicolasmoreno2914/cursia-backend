@@ -356,14 +356,13 @@ export function classifyEducation(input: EducationInput): EducationProfile {
 
   if (!detected) {
     if (curSource === 'user' || profileUser) return out({});
-    // Sin señales y con el valor de partida (o nada): UNA pregunta con una sugerencia honesta.
-    const sug = curStage && curSource === 'inferred' ? curStage : null;
+    // Sin señales: UNA pregunta SIN nivel sugerido (decisión del owner, r73): el valor de partida del formulario
+    // («Universitario») no es información del curso; el usuario elige para quién es.
     return out({
       action: 'ask',
       message: 'El nombre y el pedido del curso no dicen para qué nivel educativo es.',
-      question: { text: '¿Para quién es el curso?', options, suggestion: sug,
-        why: sug ? `Es el valor de partida (${STAGE_LABEL[sug]}): confírmalo o elige el nivel correcto. El tono y la dificultad de todo el contenido dependen de esto.`
-          : 'El tono y la dificultad de todo el contenido dependen de esto.' },
+      question: { text: '¿Para quién es el curso?', options, suggestion: null,
+        why: 'Elige el nivel: el tono y la dificultad de todo el contenido dependen de esto.' },
     });
   }
 

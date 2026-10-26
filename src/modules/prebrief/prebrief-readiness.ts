@@ -17,6 +17,7 @@ export type BlockerCode =
   | 'doubtful_data'
   | 'exception_reason'
   | 'context_incomplete'
+  | 'education_level'
   | 'no_outcomes'
   | 'no_structure'
   | 'language';
