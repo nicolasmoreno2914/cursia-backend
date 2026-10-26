@@ -1052,6 +1052,14 @@
       }
       var url  = _baseUrl() + path;
       var headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token };
+      // r75: institución activa (01 §3.1). No es secreto: el servidor valida la membresía en cada request.
+      var inst = typeof window.r75InstitutionHeader === 'function' && window.r75InstitutionHeader();
+      if (inst) headers['X-Cursia-Institution'] = inst;
+      // r75: una llamada puede fijar explícitamente la institución (selector, diagnóstico); el resto de headers del
+      // llamador se sigue ignorando como antes.
+      if (options && options.headers && typeof options.headers['X-Cursia-Institution'] === 'string' && options.headers['X-Cursia-Institution']) {
+        headers['X-Cursia-Institution'] = options.headers['X-Cursia-Institution'];
+      }
       var opts = Object.assign({}, options || {}, { headers: headers });
       if (opts.body && typeof opts.body === 'object') {
         opts.body = JSON.stringify(opts.body);
