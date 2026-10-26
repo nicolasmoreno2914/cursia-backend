@@ -138,8 +138,14 @@ function main() {
     scope = [...walk('src'), ...walk('scripts'), ...fs.readdirSync(root).filter((f) => f.endsWith('.sql'))];
     scope.forEach((f) => lintFile(f, null));
   } else {
-    const ch = changedLines(root, base);
-    if (ch === null) { console.log(`no se pudo calcular el diff contra ${base}`); process.exit(2); }
+    let ch = changedLines(root, base);
+    if (ch === null) {
+      // Checkout sin la base (p. ej. CI con historia corta): se auditan COMPLETOS los archivos r75 (nunca se aprueba
+      // sin revisar nada). Las líneas nuevas en archivos no-r75 quedan sin revisar: se avisa.
+      console.log(`⚠ no se pudo calcular el diff contra ${base}: se revisan completos los archivos r75 (src/modules/{access,authz,budgets}, *r75*)`);
+      const walk = (d) => (fs.existsSync(path.join(root, d)) ? fs.readdirSync(path.join(root, d), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? (['node_modules', 'dist', '.git', 'test'].includes(e.name) ? [] : walk(path.join(d, e.name))) : [path.join(d, e.name)])) : []);
+      ch = Object.fromEntries([...walk('src'), ...walk('scripts'), ...fs.readdirSync(root).filter((f) => f.endsWith('.sql'))].filter((f) => R75_NEW(f)).map((f) => [f, null]));
+    }
     const files = new Set([...Object.keys(ch), ...untracked(root)]);
     scope = [...files];
     for (const f of files) lintFile(f, R75_NEW(f) || !ch[f] ? null : ch[f]);
