@@ -5,8 +5,10 @@ import { SuperAdminGuard } from '../../auth/super-admin.guard';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { actorFromUser } from './access-actor';
 import { InstitutionsAdminService } from './institutions-admin.service';
+import { SuperAdminOnly } from '../authz/require-permission.decorator';
 
 /** r75 · 02 §B — `/admin/institutions*` y `/admin/courses/:courseId/institution` (solo SuperAdmin). */
+@SuperAdminOnly() // r75: rutas solo SuperAdmin
 @Controller('admin')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class InstitutionsAdminController {

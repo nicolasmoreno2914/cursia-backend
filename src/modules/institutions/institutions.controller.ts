@@ -15,11 +15,13 @@ import { InstitutionsService } from './institutions.service';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
 /**
  * r75: el comportamiento depende de CURSIA_RBAC_MODE (ver InstitutionsService). Con `off` (default) es idéntico al
  * anterior. `GET /institutions?all=1` lista todas solo para el SuperAdmin (el resto lo ignora).
  */
+@AuthenticatedOnly('el servicio filtra por dueño (off) o por membresía (enforce) y D-23: solo el SA crea organizaciones')
 @Controller('institutions')
 @UseGuards(SupabaseJwtGuard)
 export class InstitutionsController {

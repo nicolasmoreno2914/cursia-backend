@@ -10,6 +10,7 @@ import { BudgetReadService } from './budget-read.service';
 import { BudgetRequestsService } from './budget-requests.service';
 import { BudgetReservationService } from './budget-reservation.service';
 import { assertBudgetsEnabled, assertOnlyKeys, assertUuid, parseMonth } from './budget-common';
+import { AuthenticatedOnly, SuperAdminOnly } from '../authz/require-permission.decorator';
 
 async function guarded<T>(fn: () => Promise<T>): Promise<T> {
   assertBudgetsEnabled();
@@ -24,6 +25,7 @@ async function guarded<T>(fn: () => Promise<T>): Promise<T> {
  * r75 (Agente C) — rutas del usuario (02 §D). Solo JWT (+ AccountAccessGuard global de B cuando se integre). Ninguna
  * modifica un presupuesto: el usuario solo LEE el suyo y PIDE autorización (una solicitud pendiente, sin dinero).
  */
+@AuthenticatedOnly('presupuesto y solicitudes PROPIOS; crear una solicitud exige generations.start sobre el curso (BudgetAccessService.courseAccess)')
 @Controller()
 @UseGuards(SupabaseJwtGuard)
 export class BudgetsController {
@@ -65,6 +67,7 @@ export class BudgetsController {
 }
 
 /** r75 (Agente C) — rutas del SuperAdmin (02 §D). Mismo guard que /finops/* y /admin/dashboard. */
+@SuperAdminOnly() // r75: presupuestos = solo SuperAdmin (D-7)
 @Controller('admin')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class BudgetsAdminController {

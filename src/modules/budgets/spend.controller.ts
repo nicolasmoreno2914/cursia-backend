@@ -9,6 +9,7 @@ import { finopsErrorToHttp } from '../finops/finops.controller';
 import { BudgetAccessService } from './budget-access.service';
 import { emailsOf } from './budget-admin.service';
 import { UUID_RE, currentMonth, dec, monthRange } from './budget-common';
+import { RequirePermission, SuperAdminOnly } from '../authz/require-permission.decorator';
 
 const MAX_RANGE_MS = 400 * 24 * 3600 * 1000;
 
@@ -44,6 +45,7 @@ export class InstitutionSpendController {
 
   // GET /api/v1/institutions/:id/spend?from=&to=&groupBy=user|course|provider
   @Get('institutions/:id/spend')
+  @RequirePermission('spend.view', { institution: 'param:id' })
   async institutionSpend(@CurrentUser() user: AuthUser, @Param('id') id: string, @Query('from') from?: string, @Query('to') to?: string, @Query('groupBy') groupBy?: string) {
     if (!UUID_RE.test(String(id))) throw new BadRequestException({ code: 'invalid_input', message: 'id de institución debe ser UUID' });
     if (groupBy !== undefined && !['user', 'course', 'provider'].includes(groupBy)) throw new BadRequestException({ code: 'invalid_input', message: 'groupBy: user | course | provider' });
@@ -84,6 +86,7 @@ export class InstitutionSpendController {
 }
 
 /** r75 (Agente C) — gasto global por institución o por usuario (solo SuperAdmin). */
+@SuperAdminOnly() // r75: gasto global = solo SuperAdmin
 @Controller('admin')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class AdminSpendController {

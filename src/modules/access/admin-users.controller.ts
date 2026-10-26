@@ -12,8 +12,10 @@ import { AdminUsersService } from './admin-users.service';
 import { AuditLogService } from './audit-log.service';
 import { PlatformControlsService } from './platform-controls.service';
 import { SuspensionsService } from './suspensions.service';
+import { SuperAdminOnly } from '../authz/require-permission.decorator';
 
 /** r75 · 02 §C — usuarios, suspensiones, plataforma y auditoría (solo SuperAdmin). */
+@SuperAdminOnly() // r75: rutas solo SuperAdmin (SuperAdminGuard); marca para la cobertura de autorización
 @Controller('admin')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class AdminUsersController {

@@ -33,6 +33,8 @@ import { RUN_BUDGET_NOT_AUTHORIZED } from './run-budget';
 import { parseReconcileDecision, ReconcileDecision, ReconcileEvidence } from './reconcile-decision';
 import { POLICY_ADMIN_SCOPES, PolicyAdminScope, PolicyRow } from './policy-admin';
 import { USER_BUDGET_EXHAUSTED, USER_BUDGET_INSUFFICIENT } from './user-budget-gate';
+import { SuperAdminOnly } from '../authz/require-permission.decorator';
+import { TokenAuthenticated } from '../authz/public.decorator';
 
 /** r75: código HTTP estable del presupuesto por usuario (02 §F). */
 export const USER_BUDGET_INSUFFICIENT_HTTP = 'user_budget_insufficient';
@@ -170,6 +172,7 @@ export function finopsErrorToHttp(err: unknown): unknown {
  * V2.1 RF-a — ingest server-to-server del proxy LLM (RF-b lo cablea).
  * Sin JWT de usuario: autenticado por secreto compartido (FinopsIngestTokenGuard).
  */
+@TokenAuthenticated() // r75: server-to-server con x-cursia-finops-token (sin JWT de usuario)
 @Controller('finops/ingest')
 @UseGuards(FinopsIngestTokenGuard)
 export class FinopsIngestController {
@@ -227,6 +230,7 @@ export class FinopsIngestController {
  * Piloto #1209 (2026-10-11): reserva del proxy LLM ANTES de llamar a Anthropic (server-to-server, mismo token).
  * Si no se puede registrar, el proxy no llama (nunca hay gasto sin registro).
  */
+@TokenAuthenticated() // r75: server-to-server con x-cursia-finops-token (sin JWT de usuario)
 @Controller('finops/ingest')
 @UseGuards(FinopsIngestTokenGuard)
 export class FinopsLlmReservationController {
@@ -305,6 +309,7 @@ export class FinopsLlmReservationController {
 }
 
 /** V2.1 RF-a — lecturas administrativas (mismo guard que /admin/dashboard). */
+@SuperAdminOnly() // r75: lecturas y acciones FinOps de administración = solo SuperAdmin
 @Controller('finops')
 @UseGuards(SupabaseJwtGuard, SuperAdminGuard)
 export class FinopsAdminController {
