@@ -60,7 +60,8 @@ export class SuspensionsService {
   /** Para B (guard) y C (arranques): suspensiones activas. Sin migración r75 → ninguna. */
   async getActive(userId: string, q: Queryable = this.dataSource): Promise<ActiveSuspensions> {
     const none: ActiveSuspensions = { account: null, generation: null };
-    if (!UUID_RE.test(String(userId || '')) || !(await r75AccessSchemaPresent(this.dataSource))) return none;
+    // El chequeo de esquema va por `q` (la conexión de la tx del caller): nunca una segunda conexión del pool.
+    if (!UUID_RE.test(String(userId || '')) || !(await r75AccessSchemaPresent(q))) return none;
     const rows: any[] = await q.query(
       `select * from public.user_suspensions where user_id = $1 and lifted_at is null`, [userId]);
     for (const r of rows) if (isSuspensionKind(r.kind)) none[r.kind] = mapSuspension(r);

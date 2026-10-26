@@ -80,7 +80,7 @@ export class BudgetReservationService implements UserBudgetGate, OnModuleInit, O
   }
 
   async assertMayStart(runner: Runner, payerUserId: string): Promise<void> {
-    if (this.platform && (await this.platform.isGenerationFrozen())) {
+    if (this.platform && (await this.platform.isGenerationFrozen(runner))) {
       throw new ForbiddenException({ code: 'platform_generation_frozen', message: 'Las generaciones nuevas están pausadas temporalmente. No se creó nada.' });
     }
     if (this.suspensions && UUID_RE.test(String(payerUserId))) {

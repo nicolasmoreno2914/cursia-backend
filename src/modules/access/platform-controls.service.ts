@@ -4,7 +4,7 @@ import { DataSource } from 'typeorm';
 import { AccessActor, auditActor } from './access-actor';
 import { E } from './access-errors';
 import { iso, r75AccessSchemaPresent } from './access-schema';
-import { AuditLogService } from './audit-log.service';
+import { AuditLogService, Queryable } from './audit-log.service';
 
 export interface GenerationFreeze {
   enabled: boolean;
@@ -28,20 +28,24 @@ export class PlatformControlsService {
     private readonly audit: AuditLogService,
   ) {}
 
-  async getGenerationFreeze(): Promise<GenerationFreeze> {
+  /**
+   * `q` = runner de la transacción del caller (arranque de un run): la lectura va por ESA conexión. Abrir otra del pool
+   * dentro de una tx que espera MONTH_CAP_LOCK agotaba el pool con arranques concurrentes (500 «timeout exceeded»).
+   */
+  async getGenerationFreeze(q: Queryable = this.dataSource): Promise<GenerationFreeze> {
     const off: GenerationFreeze = { enabled: false, reason: null, updatedAt: null, updatedBy: null };
-    if (!(await r75AccessSchemaPresent(this.dataSource))) return off;
-    const rows: any[] = await this.dataSource.query(
+    if (!(await r75AccessSchemaPresent(q))) return off;
+    const rows: any[] = await q.query(
       `select enabled, reason, updated_at, updated_by::text as updated_by from public.platform_controls where key = 'generation_freeze'`);
     const r = rows[0];
     return r ? { enabled: r.enabled === true, reason: r.reason ?? null, updatedAt: iso(r.updated_at), updatedBy: r.updated_by ?? null } : off;
   }
 
   /** Para B/C en cada arranque: caché de 5 s por proceso (la escritura local la invalida). */
-  async isGenerationFrozen(): Promise<boolean> {
+  async isGenerationFrozen(q: Queryable = this.dataSource): Promise<boolean> {
     const now = Date.now();
     if (this.cache && now - this.cache.at < PlatformControlsService.TTL_MS) return this.cache.value.enabled;
-    const value = await this.getGenerationFreeze();
+    const value = await this.getGenerationFreeze(q);
     this.cache = { at: now, value };
     return value.enabled;
   }
