@@ -6,6 +6,7 @@ import {
   Delete,
   Param,
   Body,
+  Query,
   HttpCode,
   HttpStatus,
   UseGuards,
@@ -15,6 +16,10 @@ import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 
+/**
+ * r75: el comportamiento depende de CURSIA_RBAC_MODE (ver InstitutionsService). Con `off` (default) es idéntico al
+ * anterior. `GET /institutions?all=1` lista todas solo para el SuperAdmin (el resto lo ignora).
+ */
 @Controller('institutions')
 @UseGuards(SupabaseJwtGuard)
 export class InstitutionsController {
@@ -26,19 +31,19 @@ export class InstitutionsController {
     @Body() body: { name: string },
     @CurrentUser() user: AuthUser,
   ) {
-    const institution = await this.institutionsService.create(body.name, user.id);
+    const institution = await this.institutionsService.createForActor(body?.name, user);
     return { ok: true, data: institution };
   }
 
   @Get()
-  async findAll(@CurrentUser() user: AuthUser) {
-    const institutions = await this.institutionsService.findAll(user.id);
+  async findAll(@CurrentUser() user: AuthUser, @Query('all') all?: string) {
+    const institutions = await this.institutionsService.findAllForActor(user, all === '1' || all === 'true');
     return { ok: true, data: institutions };
   }
 
   @Get(':id')
   async findOne(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    const institution = await this.institutionsService.findOne(id, user.id);
+    const institution = await this.institutionsService.findOneForActor(id, user);
     return { ok: true, data: institution };
   }
 
@@ -48,13 +53,13 @@ export class InstitutionsController {
     @Body() body: { name?: string },
     @CurrentUser() user: AuthUser,
   ) {
-    const institution = await this.institutionsService.update(id, user.id, body);
+    const institution = await this.institutionsService.updateForActor(id, user, body ?? {});
     return { ok: true, data: institution };
   }
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Param('id') id: string, @CurrentUser() user: AuthUser) {
-    await this.institutionsService.remove(id, user.id);
+    await this.institutionsService.removeForActor(id, user);
   }
 }
