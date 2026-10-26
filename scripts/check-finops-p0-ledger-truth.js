@@ -61,6 +61,9 @@ const USAGE_EVENTS_ALLOWED = new Set([
   'src/workers/video-worker.ts', 'src/workers/content-worker.ts', 'src/workers/audio-worker.ts',
   // Solo conteos de ACTIVIDAD (event_type / failed / created_at); el test de abajo prueba que no nombra columnas de costo.
   'src/admin/services/admin-dashboard.service.ts',
+  // r75 B1 (H3): registro de dueño de los renders del Video Engine (event_type server.video_engine_render, metadata
+  // jobIds/batchId). No es un lector de dinero: el test de abajo prueba que no nombra columnas de costo.
+  'src/video-engine/video-engine-access.ts',
 ]);
 const MONEY_READERS = ['src/admin/services/admin-dashboard.service.ts', 'src/admin/controllers/admin-dashboard.controller.ts',
   'src/modules/courses/courses.service.ts', 'src/modules/courses/courses.controller.ts', 'src/modules/finops/cost-read.service.ts',
@@ -72,6 +75,7 @@ async function pureChecks() {
     const code = (f) => fs.readFileSync(path.join(REPO, f), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
     const offenders = files.filter((f) => /usage_events|\bUsageEvent\b/.test(code(f)) && !USAGE_EVENTS_ALLOWED.has(f));
     eq(offenders, [], 'archivos que leen usage_events sin estar permitidos');
+    assert(!LEGACY_COST_TOKENS.test(code('src/video-engine/video-engine-access.ts')), 'video-engine-access.ts nombra una columna de costo de usage_events');
     for (const f of MONEY_READERS) {
       const src = code(f);
       assert(!LEGACY_COST_TOKENS.test(src), `${f} nombra una columna de costo de usage_events: ${(src.match(LEGACY_COST_TOKENS) || [])[0]}`);
