@@ -81,11 +81,10 @@ export class PrebriefController {
   @Get('prebrief/versions/:n/pdf')
   @RequirePermission('courses.view', { course: 'param:courseId' })
   async versionPdf(@Param('courseId', ParseIntPipe) courseId: number, @Param('n', ParseIntPipe) n: number, @Query('variant') variant: string, @CurrentUser() user: AuthUser, @Access() access: AccessContext, @Res() res: Response) {
-    // r75 (02 §E.2): el PDF APROBADO es un entregable → exports.download (RBAC enforce; el SA siempre).
-    if (variant === 'approved' && !access.legacy && !access.superAdmin && !access.permissions.has('exports.download')) {
-      throw new ForbiddenException({ code: 'permission_denied', permission: 'exports.download', message: 'No tienes permiso para esta acción (exports.download).' });
-    }
-    sendPdf(res, await this.prebrief.versionPdf(courseId, access.effectiveOwnerId, n, typeof variant === 'string' ? variant : ''));
+    // r75 (02 §E.2): el PDF APROBADO es un entregable → exports.download (RBAC enforce; el SA siempre). R75-E16: se decide
+    // en el servicio sobre la variante RESUELTA (sin ?variant una versión aprobada también es el aprobado).
+    const canDownloadApproved = access.legacy || access.superAdmin || access.permissions.has('exports.download');
+    sendPdf(res, await this.prebrief.versionPdf(courseId, access.effectiveOwnerId, n, typeof variant === 'string' ? variant : '', canDownloadApproved));
   }
 
   // POST …/prebrief/versions/:n/approve {expectedModelSha, name, role, confirm: true}
