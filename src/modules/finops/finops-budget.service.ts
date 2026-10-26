@@ -86,6 +86,11 @@ export class FinopsBudgetService {
     return this.subjectSpendAccess;
   }
 
+  /** Gate registrado (con cualquier modo): los controles de A (congelación / suspensiones) aplican aunque el flag esté en off. */
+  registeredUserBudgetGate(): UserBudgetGate | null {
+    return this.userBudgetGate;
+  }
+
   /** Gate activo (registrado y con el flag en shadow/enforce), o null. */
   activeUserBudgetGate(): UserBudgetGate | null {
     const g = this.userBudgetGate;
