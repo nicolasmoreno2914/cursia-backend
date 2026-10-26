@@ -13,6 +13,7 @@ import {
 } from './access.tokens';
 import { AllowInactiveAccount } from '../authz/public.decorator';
 import { MembershipsService } from './memberships.service';
+import { CORS_ALLOWED_HEADERS } from '../../common/cors-options';
 import { PlatformControlsService } from './platform-controls.service';
 import { Permission, Role } from './role-matrix';
 import { SuspensionsService } from './suspensions.service';
@@ -27,6 +28,8 @@ export interface MeContext {
   memberships: Array<{ institutionId: string; name: string; kind: 'organization' | 'personal'; role: Role; status: 'active' | 'suspended'; permissions: Permission[] }>;
   defaultInstitutionId: string | null;
   budget: UserBudgetSummary | null;
+  /** R75-E14: el CORS de este backend acepta X-Cursia-Institution (el FE solo lo manda si esto es true). */
+  institutionHeader: boolean;
 }
 
 /**
@@ -124,6 +127,7 @@ export class MeContextController {
       memberships,
       defaultInstitutionId,
       budget,
+      institutionHeader: CORS_ALLOWED_HEADERS.includes('X-Cursia-Institution' as any),
     };
     return data;
   }
