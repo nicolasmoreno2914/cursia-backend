@@ -1,5 +1,5 @@
 {
-  "_nota": "Cuerpo REAL de AllExceptionsFilter (src/common/filters/http-exception.filter.ts): {statusCode,timestamp,path,error,code,...}. OJO: hoy el filtro solo deja pasar code/reason/criticals/pendingChanges/blockers/diff/modelSha256; los extras (permission, requiredUsd, availableUsd, payerUserId, canRequest, estimateId, userId) deben agregarse a esa lista o se pierden (hallazgo E-C1).",
+  "_nota": "Cuerpo REAL de AllExceptionsFilter (src/common/filters/http-exception.filter.ts): {statusCode,timestamp,path,error,code,...}. Además de code/reason/criticals/pendingChanges/blockers/diff/modelSha256, el filtro reenvía (r75, solo primitivos) permission, userId, requiredUsd, availableUsd, payerUserId, canRequest y estimateId.",
   "account_not_authorized": {
     "status": 403,
     "body": {
@@ -346,6 +346,176 @@
       "path": "/api/v1/…",
       "error": "No encontrado.",
       "code": "video_engine_not_found"
+    }
+  },
+  "institution_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Institución no encontrada.",
+      "code": "institution_not_found"
+    }
+  },
+  "institution_slug_exists": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Ya existe una institución con ese identificador.",
+      "code": "institution_slug_exists"
+    }
+  },
+  "institution_has_members": {
+    "status": 409,
+    "body": {
+      "statusCode": 409,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La institución tiene miembros o cursos; archívala en vez de borrarla.",
+      "code": "institution_has_members"
+    }
+  },
+  "invalid_role": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Rol inválido.",
+      "code": "invalid_role"
+    }
+  },
+  "invalid_status": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Estado inválido.",
+      "code": "invalid_status"
+    }
+  },
+  "invalid_input": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Dato inválido.",
+      "code": "invalid_input"
+    }
+  },
+  "admin_api_error": {
+    "status": 502,
+    "body": {
+      "statusCode": 502,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La administración de usuarios respondió con un error.",
+      "code": "admin_api_error"
+    }
+  },
+  "course_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Curso no encontrado.",
+      "code": "course_not_found"
+    }
+  },
+  "reason_required": {
+    "status": 400,
+    "body": {
+      "statusCode": 400,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Indica el motivo.",
+      "code": "reason_required"
+    }
+  },
+  "r75_schema_missing": {
+    "status": 503,
+    "body": {
+      "statusCode": 503,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "La migración r75 de accesos no está aplicada en este entorno.",
+      "code": "r75_schema_missing"
+    }
+  },
+  "account_check_unavailable": {
+    "status": 503,
+    "body": {
+      "statusCode": 503,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No se pudo verificar el acceso de la cuenta. Intenta de nuevo.",
+      "code": "account_check_unavailable"
+    }
+  },
+  "resource_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "No encontrado.",
+      "code": "resource_not_found"
+    }
+  },
+  "job_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Job no encontrado.",
+      "code": "job_not_found"
+    }
+  },
+  "budget_request_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Solicitud no encontrada.",
+      "code": "budget_request_not_found"
+    }
+  },
+  "estimate_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Estimado no encontrado.",
+      "code": "estimate_not_found"
+    }
+  },
+  "run_not_found": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Ejecución no encontrada.",
+      "code": "run_not_found"
+    }
+  },
+  "budgets_disabled": {
+    "status": 404,
+    "body": {
+      "statusCode": 404,
+      "timestamp": "2026-10-26T12:00:00.000Z",
+      "path": "/api/v1/…",
+      "error": "Los presupuestos por usuario no están activos.",
+      "code": "budgets_disabled"
     }
   }
 }

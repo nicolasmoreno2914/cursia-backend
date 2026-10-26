@@ -202,16 +202,34 @@ const E_ = [
   [400, 'month_invalid', 'Mes inválido.'],
   [409, 'server_execution_required', 'Esta generación necesita ejecución en el servidor.'],
   [404, 'video_engine_not_found', 'No encontrado.'],
+  // r75 (integración): códigos reales de A, B y C que faltaban en 02 §F (el FE los traduce por code).
+  [404, 'institution_not_found', 'Institución no encontrada.'],
+  [409, 'institution_slug_exists', 'Ya existe una institución con ese identificador.'],
+  [409, 'institution_has_members', 'La institución tiene miembros o cursos; archívala en vez de borrarla.'],
+  [400, 'invalid_role', 'Rol inválido.'],
+  [400, 'invalid_status', 'Estado inválido.'],
+  [400, 'invalid_input', 'Dato inválido.'],
+  [502, 'admin_api_error', 'La administración de usuarios respondió con un error.'],
+  [404, 'course_not_found', 'Curso no encontrado.'],
+  [400, 'reason_required', 'Indica el motivo.'],
+  [503, 'r75_schema_missing', 'La migración r75 de accesos no está aplicada en este entorno.'],
+  [503, 'account_check_unavailable', 'No se pudo verificar el acceso de la cuenta. Intenta de nuevo.'],
+  [404, 'resource_not_found', 'No encontrado.'],
+  [404, 'job_not_found', 'Job no encontrado.'],
+  [404, 'budget_request_not_found', 'Solicitud no encontrada.'],
+  [404, 'estimate_not_found', 'Estimado no encontrado.'],
+  [404, 'run_not_found', 'Ejecución no encontrada.'],
+  [404, 'budgets_disabled', 'Los presupuestos por usuario no están activos.'],
 ];
 files['errors.json'] = {
-  '_nota': 'Cuerpo REAL de AllExceptionsFilter (src/common/filters/http-exception.filter.ts): {statusCode,timestamp,path,error,code,...}. OJO: hoy el filtro solo deja pasar code/reason/criticals/pendingChanges/blockers/diff/modelSha256; los extras (permission, requiredUsd, availableUsd, payerUserId, canRequest, estimateId, userId) deben agregarse a esa lista o se pierden (hallazgo E-C1).',
+  '_nota': 'Cuerpo REAL de AllExceptionsFilter (src/common/filters/http-exception.filter.ts): {statusCode,timestamp,path,error,code,...}. Además de code/reason/criticals/pendingChanges/blockers/diff/modelSha256, el filtro reenvía (r75, solo primitivos) permission, userId, requiredUsd, availableUsd, payerUserId, canRequest y estimateId.',
   ...Object.fromEntries(E_.map(([s, c, m, x]) => [c, err(s, c, m, x || {})])),
 };
 // Índice para el modo mock de D: "MÉTODO ruta[#variante]" → archivo.
 const index = {};
 for (const [f, obj] of Object.entries(files)) for (const k of Object.keys(obj)) if (!k.startsWith('_') && f !== 'errors.json') index[k] = f;
 files['index.json'] = {
-  _nota: 'Ejemplos válidos por respuesta de 02-contratos-api.md (r75). Éxito: cuerpo {data,timestamp} de ResponseInterceptor (02 dice {ok:true,data}; el FE desenvuelve json.data igual). Montos: strings decimales de 10 decimales. Variante tras «#». Errores en errors.json por code.',
+  _nota: 'Ejemplos válidos por respuesta de 02-contratos-api.md (r75). Éxito: cuerpo {data,timestamp} de ResponseInterceptor (02 §Convenciones, corregido en la integración). Montos: strings decimales de 10 decimales. Variante tras «#». Errores en errors.json por code.',
   version: 1, generatedFrom: 'validation/r75-roles/02-contratos-api.md', routes: index,
 };
 for (const [f, obj] of Object.entries(files)) fs.writeFileSync(path.join(OUT, f), JSON.stringify(obj, null, 2) + '\n');

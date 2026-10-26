@@ -1,5 +1,5 @@
 {
-  "_nota": "Ejemplos válidos por respuesta de 02-contratos-api.md (r75). Éxito: cuerpo {data,timestamp} de ResponseInterceptor (02 dice {ok:true,data}; el FE desenvuelve json.data igual). Montos: strings decimales de 10 decimales. Variante tras «#». Errores en errors.json por code.",
+  "_nota": "Ejemplos válidos por respuesta de 02-contratos-api.md (r75). Éxito: cuerpo {data,timestamp} de ResponseInterceptor (02 §Convenciones, corregido en la integración). Montos: strings decimales de 10 decimales. Variante tras «#». Errores en errors.json por code.",
   "version": 1,
   "generatedFrom": "validation/r75-roles/02-contratos-api.md",
   "routes": {
