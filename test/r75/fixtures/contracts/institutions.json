@@ -1,0 +1,132 @@
+{
+  "GET /institutions": {
+    "status": 200,
+    "body": {
+      "data": [
+        {
+          "id": "1b000000-0000-4000-8000-00000000000a",
+          "name": "QA r75 Institución A",
+          "slug": "qa-r75-institucion-a",
+          "kind": "organization",
+          "status": "active",
+          "createdAt": "2026-10-20T15:00:00.000Z",
+          "memberCount": 4
+        },
+        {
+          "id": "1b000000-0000-4000-8000-00000000000b",
+          "name": "QA r75 Institución B",
+          "slug": "qa-r75-institucion-b",
+          "kind": "organization",
+          "status": "active",
+          "createdAt": "2026-10-20T15:00:00.000Z",
+          "memberCount": 2
+        }
+      ],
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /institutions?all=1#superadmin": {
+    "status": 200,
+    "body": {
+      "data": [
+        {
+          "id": "1b000000-0000-4000-8000-00000000000a",
+          "name": "QA r75 Institución A",
+          "slug": "qa-r75-institucion-a",
+          "kind": "organization",
+          "status": "active",
+          "createdAt": "2026-10-20T15:00:00.000Z",
+          "memberCount": 4
+        },
+        {
+          "id": "1b000000-0000-4000-8000-00000000000b",
+          "name": "QA r75 Institución B",
+          "slug": "qa-r75-institucion-b",
+          "kind": "organization",
+          "status": "active",
+          "createdAt": "2026-10-20T15:00:00.000Z",
+          "memberCount": 2
+        },
+        {
+          "id": "1b000000-0000-4000-8000-0000000000ff",
+          "name": "Espacio de qa-r75-creador-a@example.com",
+          "slug": "personal-0a000000",
+          "kind": "personal",
+          "status": "active",
+          "createdAt": "2026-10-20T15:00:00.000Z",
+          "memberCount": 1
+        }
+      ],
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /institutions/:id": {
+    "status": 200,
+    "body": {
+      "data": {
+        "id": "1b000000-0000-4000-8000-00000000000a",
+        "name": "QA r75 Institución A",
+        "slug": "qa-r75-institucion-a",
+        "kind": "organization",
+        "status": "active",
+        "createdAt": "2026-10-20T15:00:00.000Z",
+        "memberCount": 4
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /institutions#rbac_off": {
+    "status": 201,
+    "body": {
+      "data": {
+        "id": "1b000000-0000-4000-8000-0000000000c1",
+        "name": "Mi institución",
+        "slug": "mi-institucion-1b00",
+        "kind": "organization",
+        "status": "active",
+        "createdAt": "2026-10-20T15:00:00.000Z"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/institutions": {
+    "status": 201,
+    "body": {
+      "data": {
+        "id": "1b000000-0000-4000-8000-0000000000c2",
+        "name": "QA r75 Institución C",
+        "slug": "qa-r75-institucion-c",
+        "kind": "organization",
+        "status": "active",
+        "createdAt": "2026-10-20T15:00:00.000Z",
+        "memberCount": 0
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "PATCH /admin/institutions/:id": {
+    "status": 200,
+    "body": {
+      "data": {
+        "id": "1b000000-0000-4000-8000-00000000000b",
+        "name": "QA r75 Institución B",
+        "slug": "qa-r75-institucion-b",
+        "kind": "organization",
+        "status": "suspended",
+        "createdAt": "2026-10-20T15:00:00.000Z",
+        "memberCount": 2
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "PATCH /admin/courses/:courseId/institution": {
+    "status": 200,
+    "body": {
+      "data": {
+        "courseId": 4242,
+        "institutionId": "1b000000-0000-4000-8000-00000000000b"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}
