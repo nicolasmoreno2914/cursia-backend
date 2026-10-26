@@ -1,3 +1,4 @@
+import { columnExists } from '../authz/schema-probe'; // r75: approved_by / created_by (columnas de A)
 import { returningRows } from '../../common/db/returning-rows';
 import { withRequestReadCache } from '../../common/db/request-read-cache';
 import { BadRequestException, ConflictException, HttpException, Injectable, Logger, NotFoundException, ServiceUnavailableException } from '@nestjs/common';
@@ -85,6 +86,36 @@ export interface PrebriefVersionRow {
 
 const iso = (d: string | Date | null | undefined) => (d ? new Date(d).toISOString() : null);
 const parse = (v: unknown) => (typeof v === 'string' ? JSON.parse(v) : v);
+
+/**
+ * r75 (02 §E.2, D-10): aprobación atómica de una versión `ready` del Prebrief.
+ *  - `approval.userId` = el ACTOR (con proposals.approve; puede no ser el dueño técnico); `selfApproved` = el actor es
+ *    quien creó el curso (`courses.created_by`, o `owner_id` si la columna de A no existe) → auditoría.
+ *  - `courses.approved_by` / `approved_at` en la MISMA sentencia (CTE) que la aprobación, si existen las columnas de A:
+ *    si la versión ya no está `ready` (carrera), ninguna de las dos escrituras ocurre.
+ */
+export async function approveVersionAtomically(
+  query: (sql: string, params?: unknown[]) => Promise<any>,
+  a: { courseId: number; versionId: string; expectedModelSha: string; actor: { id: string; email?: string | null }; approvalBase: Record<string, unknown> },
+): Promise<{ rows: any[]; approval: Record<string, unknown>; selfApproved: boolean }> {
+  const hasCreatedBy = await columnExists(query, 'courses', 'created_by');
+  const hasApprovedBy = await columnExists(query, 'courses', 'approved_by');
+  const [creatorRow] = await query(
+    `select ${hasCreatedBy ? 'coalesce(created_by::text, owner_id::text)' : 'owner_id::text'} as creator from public.courses where id = $1`,
+    [a.courseId],
+  );
+  const selfApproved = !!creatorRow?.creator && String(creatorRow.creator).toLowerCase() === String(a.actor.id).toLowerCase();
+  const approval = { userId: a.actor.id, email: a.actor.email || null, ...a.approvalBase, selfApproved };
+  const rows = returningRows(await query(
+    hasApprovedBy
+      ? `with v as (update public.course_prebrief_versions set status = 'approved', approval = $2::jsonb where id = $1 and status = 'ready' and model_sha256 = $3 returning *),
+              c as (update public.courses set approved_by = $4, approved_at = now() where id = $5 and exists (select 1 from v) returning id)
+         select v.* from v left join c on true`
+      : `update public.course_prebrief_versions set status = 'approved', approval = $2::jsonb where id = $1 and status = 'ready' and model_sha256 = $3 returning *`,
+    hasApprovedBy ? [a.versionId, JSON.stringify(approval), a.expectedModelSha, a.actor.id, a.courseId] : [a.versionId, JSON.stringify(approval), a.expectedModelSha],
+  ));
+  return { rows, approval, selfApproved };
+}
 
 @Injectable()
 export class PrebriefService {
@@ -430,13 +461,13 @@ export class PrebriefService {
     if (body.expectedModelSha !== v.model_sha256 || draft.modelSha256 !== v.model_sha256) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'changed', message: `${PREBRIEF_NOT_APPROVABLE}: el diseño cambió; revisa la versión actualizada.` });
     if (draft.verification.criticals > 0) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'critical', message: `${PREBRIEF_NOT_APPROVABLE}: la verificación tiene problemas críticos.` });
     if (!draft.readiness.ready) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'not_ready', message: `${PREBRIEF_NOT_APPROVABLE}: la propuesta ya no cumple las condiciones para aprobarse.`, blockers: draft.readiness.blockers });
-    const approval = { userId: user.id, email: user.email || null, name, role, at: new Date().toISOString(), modelSha256: v.model_sha256, documentSha256: v.document_sha256, blueprintNumber: v.blueprint_number, channel: 'in_app' };
-    const res = returningRows(await this.dataSource.query(
-      `update public.course_prebrief_versions set status = 'approved', approval = $2::jsonb where id = $1 and status = 'ready' and model_sha256 = $3 returning *`,
-      [v.id, JSON.stringify(approval), body.expectedModelSha],
-        ));
+    // r75 (02 §E.2, D-10): quién aprueba = el ACTOR de la sesión (puede no ser el dueño técnico); ver approveVersionAtomically.
+    const { rows: res, approval, selfApproved } = await approveVersionAtomically((sql, p) => this.dataSource.query(sql, p as any[]), {
+      courseId, versionId: v.id, expectedModelSha: body.expectedModelSha, actor: user,
+      approvalBase: { name, role, at: new Date().toISOString(), modelSha256: v.model_sha256, documentSha256: v.document_sha256, blueprintNumber: v.blueprint_number, channel: 'in_app' },
+    });
     if (!res.length) throw new ConflictException({ code: PREBRIEF_NOT_APPROVABLE, reason: 'race', message: `${PREBRIEF_NOT_APPROVABLE}: la versión cambió de estado mientras se aprobaba.` });
-    await this.event(this.dataSource, courseId, v.id, 'approved', user.id, { name, role, modelSha256: v.model_sha256 });
+    await this.event(this.dataSource, courseId, v.id, 'approved', user.id, { name, role, modelSha256: v.model_sha256, selfApproved });
     const row = { ...v, status: 'approved' as const, approval };
     await this.storePdfSafe(row, 'approved');
     return { version: this.versionDto(row) };

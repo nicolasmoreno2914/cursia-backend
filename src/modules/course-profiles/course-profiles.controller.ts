@@ -6,6 +6,9 @@ import { UseDocumentDto } from './dto/use-document.dto';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { Access } from '../authz/access.decorator';
+import type { AccessContext } from '../authz/access-context';
+import { RequirePermission } from '../authz/require-permission.decorator';
 
 /**
  * V2.1 (R3): perfiles de curso (presentation / assessment; motor pedagógico V1: pedagogy). Controller V2
@@ -20,13 +23,15 @@ export class CourseProfilesController {
   // GET /api/v1/courses/:courseId/profiles/:kind[?paletteId=…] → vigente, o el default con isDefault:true
   // (F1/I4: el default de presentación se deriva de la paleta; nunca persiste).
   @Get(':kind')
+  @RequirePermission('courses.view', { course: 'param:courseId' })
   getCurrent(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('kind') kind: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Query('paletteId') paletteId?: string,
   ) {
-    return this.profilesService.getCurrent(courseId, user.id, kind, typeof paletteId === 'string' ? paletteId.slice(0, 64) : null);
+    return this.profilesService.getCurrent(courseId, access.effectiveOwnerId, kind, typeof paletteId === 'string' ? paletteId.slice(0, 64) : null);
   }
 
   // POST /api/v1/courses/:courseId/profiles/pedagogy/use-document  body { fields?: string[] }
@@ -34,25 +39,29 @@ export class CourseProfilesController {
   // Declarado ANTES de :kind (dos segmentos: no choca, pero queda explícito).
   @Post('pedagogy/use-document')
   @HttpCode(200)
+  @RequirePermission('courses.edit', { course: 'param:courseId' })
   useDocument(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Body() dto: UseDocumentDto,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.profilesService.useDocumentInPedagogy(courseId, user.id, dto.fields, dto.expectedVersion);
+    return this.profilesService.useDocumentInPedagogy(courseId, access.effectiveOwnerId, dto.fields, dto.expectedVersion);
   }
 
   // POST /api/v1/courses/:courseId/profiles/:kind  body { data, expectedVersion? }
   // 201 versión nueva; 200 si era idéntico a la vigente (idempotente).
   @Post(':kind')
+  @RequirePermission('courses.edit', { course: 'param:courseId' })
   async append(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('kind') kind: string,
     @Body() dto: CreateProfileDto,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const result = await this.profilesService.append(courseId, user.id, kind, dto.data, dto.expectedVersion);
+    const result = await this.profilesService.append(courseId, access.effectiveOwnerId, kind, dto.data, dto.expectedVersion);
     res.status(result.created ? 201 : 200);
     return result;
   }

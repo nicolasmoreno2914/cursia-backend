@@ -18,6 +18,8 @@ export type PermissionScope =
   | { run: ResourceRef }
   | { artifact: ResourceRef }
   | { institution: ResourceRef | 'header' }
+  /** brand profile → su institución (brand_profiles.institution_id). */
+  | { brandProfile: ResourceRef }
   | { collection: true }
   | { global: true };
 

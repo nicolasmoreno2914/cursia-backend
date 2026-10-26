@@ -24,17 +24,23 @@ export interface AuditEntryInput {
   requestId?: string | null;
 }
 
-/** Forma mínima que B consume de AuditLogService (A). */
+/**
+ * Forma mínima que B consume de AuditLogService (A, `src/modules/access/audit-log.service.ts`): `recordSafe` (no
+ * lanza) o `record`. A nombra el flag `actorIsSuperAdmin` (A mayúscula): se envían ambas grafías.
+ */
 export interface AuditLogLike {
-  record(entry: AuditEntryInput): Promise<unknown>;
+  record?(entry: any): Promise<unknown>;
+  recordSafe?(entry: any): Promise<unknown>;
 }
 
 const logger = new Logger('R75Audit');
 
 export async function writeAudit(sink: AuditLogLike | null | undefined, query: QueryFn | null, entry: AuditEntryInput): Promise<void> {
   try {
-    if (sink && typeof sink.record === 'function') {
-      await sink.record(entry);
+    if (sink && (typeof sink.recordSafe === 'function' || typeof sink.record === 'function')) {
+      const payload = { ...entry, actorIsSuperAdmin: entry.actorIsSuperadmin };
+      if (typeof sink.recordSafe === 'function') await sink.recordSafe(payload);
+      else await sink.record!(payload);
       return;
     }
     if (query && (await tableExists(query, 'admin_audit_log'))) {

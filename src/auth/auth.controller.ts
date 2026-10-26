@@ -3,7 +3,9 @@ import { SupabaseJwtGuard } from './supabase-jwt.guard';
 import { CurrentUser } from './current-user.decorator';
 import { AuthUser } from './auth.types';
 import { AllowInactiveAccount } from '../modules/authz/public.decorator';
+import { AuthenticatedOnly } from '../modules/authz/require-permission.decorator';
 
+@AuthenticatedOnly('identidad propia')
 @Controller('auth')
 export class AuthController {
   /**

@@ -362,8 +362,8 @@ const norm = (s) => String(s).normalize('NFC').replace(/[«»"“”]/g, '').rep
     const ups = [...src.matchAll(/update public\.course_prebrief_versions[\s\S]*?returning/g)];
     assert(ups.length >= 5, 'se esperaban los UPDATE … RETURNING de las versiones');
     for (const m of ups) {
-      const before = src.slice(Math.max(0, m.index - 120), m.index);
-      assert(/returningRows\(await (this\.dataSource|qr)\.query\(\s*`?$/.test(before.trimEnd().replace(/`$/, '') + '`') || /returningRows\(await (this\.dataSource|qr)\.query\(/.test(before), `UPDATE sin returningRows: …${before.slice(-80)}`);
+      const before = src.slice(Math.max(0, m.index - 700), m.index); // r75: la aprobación arma la sentencia (CTE o UPDATE) dentro de un ternario
+      assert(/returningRows\(await (this\.dataSource|qr)\.query\(\s*`?$/.test(before.trimEnd().replace(/`$/, '') + '`') || /returningRows\(await (this\.dataSource\.|qr\.)?query\(/.test(before), `UPDATE sin returningRows: …${before.slice(-80)}`);
     }
   });
 

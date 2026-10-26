@@ -1,4 +1,5 @@
 import { allowUnownedCourses } from '../authz/unowned-courses'; // r75 D-26 (H4)
+import { columnExists } from '../authz/schema-probe';
 import { DESIGN_HOURS_KEY, DESIGN_PINS_KEY } from '../course-design/design-pins';
 import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
 import { BRIEF_KEY, PEDAGOGY_DERIVATION_KEY } from '../course-facts/course-facts';
@@ -36,6 +37,12 @@ export function reviewCardsDefaultForNewCourse(env: NodeJS.ProcessEnv = process.
   }
 }
 
+/** r75: quién crea / en qué institución (RBAC enforce). Sin datos → comportamiento actual. */
+export interface CourseAuthorship {
+  actorId?: string | null;
+  institutionId?: string | null;
+}
+
 @Injectable()
 export class CoursesService {
   constructor(
@@ -58,6 +65,7 @@ export class CoursesService {
     dto: CreateCourseDto,
     ownerId: string,
     ownerEmail: string,
+    authorship: CourseAuthorship = {},
   ): Promise<Course> {
     // Release-fix I4 (defensa en profundidad; el controller ya lo chequea con el
     // mensaje 404 exacto de la ruta): un curso dynamic exige flag + allow-list.
@@ -69,7 +77,47 @@ export class CoursesService {
     });
     const saved = await this.courseRepo.save(course);
     if (dto?.structureVersion === 'dynamic') await this.applyNewCourseH5pV2Defaults(saved.id);
+    await this.stampAuthorship(saved, { createdBy: authorship.actorId ?? ownerId, institutionId: authorship.institutionId ?? null });
     return saved;
+  }
+
+  /**
+   * r75 (01 §1.4, D-29): autoría del curso. `created_by` / `updated_by` solo si las columnas existen (migración de A);
+   * `institution_id` solo al CREAR y solo si viene (RBAC enforce: institución activa verificada por el guard). Nunca
+   * cambia owner_id. Sin columnas → no-op (comportamiento actual).
+   */
+  async stampAuthorship(course: Course | { id: number }, a: { createdBy?: string | null; updatedBy?: string | null; institutionId?: string | null }): Promise<void> {
+    const sets: string[] = [];
+    const params: unknown[] = [course.id];
+    const add = async (col: string, v: unknown, cast = '') => {
+      if (v === undefined || v === null || v === '') return;
+      if (!(await columnExists((sql, p) => this.courseRepo.query(sql, p as any[]), 'courses', col))) return;
+      params.push(v);
+      sets.push(`${col} = $${params.length}${cast}`);
+    };
+    await add('created_by', a.createdBy);
+    await add('updated_by', a.updatedBy ?? a.createdBy);
+    if (a.institutionId) { params.push(a.institutionId); sets.push(`institution_id = $${params.length}::uuid`); }
+    if (!sets.length) return;
+    await this.courseRepo.query(`update public.courses set ${sets.join(', ')} where id = $1`, params);
+    if (a.institutionId) (course as any).institutionId = a.institutionId;
+  }
+
+  /** r75 (02 §E.3): cursos de una institución (RBAC enforce; el guard ya verificó courses.view en ella). */
+  async findAllForInstitution(institutionId: string): Promise<Course[]> {
+    const rows = await this.courseRepo
+      .createQueryBuilder('course')
+      .where('course.institution_id = :institutionId', { institutionId })
+      .orderBy('course.created_at', 'DESC')
+      .getMany();
+    for (const c of rows) {
+      const m = c.metadata as Record<string, unknown> | null;
+      if (m && m[DOCUMENT_REQUIREMENTS_KEY] !== undefined) {
+        const { [DOCUMENT_REQUIREMENTS_KEY]: _omit, ...rest } = m; // eslint-disable-line @typescript-eslint/no-unused-vars
+        c.metadata = rest as any;
+      }
+    }
+    return rows;
   }
 
   /** EV6 H5P v2: «Repaso» encendido en un curso NUEVO solo con H5P v2 (ver reviewCardsDefaultForNewCourse). */
@@ -98,8 +146,9 @@ export class CoursesService {
     ownerEmail: string,
     frontendCourseId: string,
     title?: string,
+    authorship: CourseAuthorship = {},
   ): Promise<Course> {
-    return (await this.findOrCreateDynamicWithStatus(ownerId, ownerEmail, frontendCourseId, title)).course;
+    return (await this.findOrCreateDynamicWithStatus(ownerId, ownerEmail, frontendCourseId, title, authorship)).course;
   }
 
   /**
@@ -112,6 +161,7 @@ export class CoursesService {
     ownerEmail: string,
     frontendCourseId: string,
     title?: string,
+    authorship: CourseAuthorship = {},
   ): Promise<{ course: Course; created: boolean }> {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
@@ -134,6 +184,7 @@ export class CoursesService {
     });
     const saved = await this.courseRepo.save(course);
     await this.applyNewCourseH5pV2Defaults(saved.id);
+    await this.stampAuthorship(saved, { createdBy: authorship.actorId ?? ownerId, institutionId: authorship.institutionId ?? null });
     return { course: saved, created: true };
   }
 
@@ -230,6 +281,7 @@ export class CoursesService {
     id: number,
     dto: UpdateCourseDto,
     ownerId: string,
+    actorId?: string,
   ): Promise<Course> {
     // findOne ya valida ownership → 404 si no es del usuario
     const course = await this.findOne(id, ownerId);
@@ -250,6 +302,7 @@ export class CoursesService {
         [id, JSON.stringify(next), PROTECTED_METADATA_KEYS],
       );
     }
+    await this.stampAuthorship(course, { updatedBy: actorId ?? ownerId }); // r75: updated_by (si existe la columna)
     return this.findOne(id, ownerId);
   }
 

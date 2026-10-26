@@ -5,26 +5,10 @@
  * SUPERADMIN NO es un rol de membresía (D-3): se decide solo por env (src/auth/super-admin.ts).
  */
 
-export const ROLES = ['ADMIN_INSTITUCIONAL', 'CREADOR', 'APROBADOR_ACADEMICO', 'CONSULTA'] as const;
-export type Role = (typeof ROLES)[number];
-
-export const PERMISSIONS = [
-  'courses.view',
-  'courses.create',
-  'courses.edit',
-  'courses.delete',
-  'proposals.review',
-  'proposals.approve',
-  'generations.start',
-  'generations.retry',
-  'exports.download',
-  'spend.view',
-  'roles.manage',
-  'budgets.manage',
-  'users.suspend',
-  'generations.suspend',
-] as const;
-export type Permission = (typeof PERMISSIONS)[number];
+// r75 B2: fuente ÚNICA del catálogo y la matriz = `access/role-matrix.ts` (A). B la reexporta (sin copia).
+import { GLOBAL_ONLY_PERMISSIONS, isPermission, isRole, Permission, PERMISSIONS, Role, ROLE_MATRIX, ROLES } from '../access/role-matrix';
+export { GLOBAL_ONLY_PERMISSIONS, isPermission, isRole, PERMISSIONS, ROLE_MATRIX, ROLES };
+export type { Permission, Role };
 
 export interface PermissionInfo {
   key: Permission;
@@ -51,28 +35,7 @@ export const PERMISSION_CATALOG: readonly PermissionInfo[] = Object.freeze([
   { key: 'generations.suspend', label: 'Suspender generaciones', sensitive: true, grantable: false },
 ] as PermissionInfo[]);
 
-/** D-7: permisos sobre objetos globales; en v1 solo los ejerce el SuperAdmin. Un override `grant` no tiene efecto. */
-export const GLOBAL_ONLY_PERMISSIONS: ReadonlySet<Permission> = new Set<Permission>(['budgets.manage', 'users.suspend', 'generations.suspend']);
-
-/** Matriz por defecto (01 §2.2). D-8: ADMIN_INSTITUCIONAL sin approve/start. D-9: CONSULTA sin exports.download. */
-export const ROLE_MATRIX: Readonly<Record<Role, readonly Permission[]>> = Object.freeze({
-  ADMIN_INSTITUCIONAL: [
-    'courses.view', 'courses.create', 'courses.edit', 'courses.delete', 'proposals.review',
-    'generations.retry', 'exports.download', 'spend.view', 'roles.manage',
-  ],
-  CREADOR: ['courses.view', 'courses.create', 'courses.edit', 'proposals.review', 'generations.start', 'generations.retry', 'exports.download'],
-  APROBADOR_ACADEMICO: ['courses.view', 'proposals.review', 'proposals.approve', 'exports.download'],
-  CONSULTA: ['courses.view'],
-});
-
-export function isRole(x: unknown): x is Role {
-  return typeof x === 'string' && (ROLES as readonly string[]).includes(x);
-}
-
-export function isPermission(x: unknown): x is Permission {
-  return typeof x === 'string' && (PERMISSIONS as readonly string[]).includes(x);
-}
-
+/** D-7: GLOBAL_ONLY_PERMISSIONS (role-matrix de A) no se otorgan desde una institución. */
 export function isGrantablePermission(p: unknown): boolean {
   return isPermission(p) && !GLOBAL_ONLY_PERMISSIONS.has(p);
 }

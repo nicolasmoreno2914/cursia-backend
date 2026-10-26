@@ -5,6 +5,7 @@ import { AuthUser } from '../../auth/auth.types';
 import { DynamicFeatures, resolveDynamicFeatures, toHttpConfigError } from './dynamic-features';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import { AllowInactiveAccount } from '../authz/public.decorator';
+import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
 /**
  * EV6 DoD BE-B: además de los flags por usuario, el contrato que el frontend necesita conocer:
@@ -15,6 +16,7 @@ import { AllowInactiveAccount } from '../authz/public.decorator';
  */
 export type FeaturesResponse = DynamicFeatures & { dodContract: true; superAdmin: boolean };
 
+@AuthenticatedOnly('flags del propio usuario')
 @Controller('features')
 @UseGuards(SupabaseJwtGuard)
 export class FeaturesController {

@@ -4,6 +4,7 @@ import { CourseSetupExtractionService } from './course-setup-extraction.service'
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
 @Controller('course-setup')
 @UseGuards(SupabaseJwtGuard)
@@ -19,6 +20,7 @@ export class CourseSetupController {
    * devuelve los campos extraídos directamente, sin job ni polling.
    */
   @Post('extract-from-pdf')
+  @AuthenticatedOnly("extracción de un PDF propio (artifact del usuario)")
   async extractFromPdf(
     @Body() body: { artifactId: string },
     @CurrentUser() user: AuthUser,
