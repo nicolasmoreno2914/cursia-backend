@@ -3855,7 +3855,7 @@ function _dynDownloadArtifactTextOnce(artifactId) {
     if (!urlRes || !urlRes.ok) return { ok: false, error: (urlRes && urlRes.error) || 'download_url_failed' };
     if (urlRes.url) return fetchText(urlRes.url);
     if (urlRes.storagePath && typeof window !== 'undefined' && window.SB) {
-      return window.SB.storage.from(urlRes.bucket || 'cursia-artifacts').createSignedUrl(urlRes.storagePath, 3600).then(function (signRes) {
+      return (window.r75SignStoragePath ? window.r75SignStoragePath(urlRes.bucket || 'cursia-artifacts', urlRes.storagePath, 3600) : window.SB.storage.from(urlRes.bucket || 'cursia-artifacts').createSignedUrl(urlRes.storagePath, 3600)).then(function (signRes) {
         var signed = signRes && signRes.data && signRes.data.signedUrl;
         if (!signed) return { ok: false, error: 'sign_failed' };
         return fetchText(signed);
