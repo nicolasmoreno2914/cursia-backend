@@ -5493,6 +5493,9 @@ export class RunsService {
   private async assertUserBudgetPreTx(gate: FinopsGate | null, a: { courseId: number; ownerId: string; manifestId: number; planSha?: string | null }): Promise<void> {
     const g = this.userBudgetGate();
     if (!g || g.mode() !== 'enforce' || !gate || !this.finopsBudget) return;
+    // r75 (01 §5.2): orden permiso (guard) → suspensión de generación / congelación de plataforma → presupuesto. Un
+    // suspendido con USD 0 recibe 403 generation_suspended, no el 409 de presupuesto (que ofrecería «Solicitar autorización»).
+    await g.assertMayStart(this.dataSource, a.ownerId);
     const required = normalizeDecimal(gate.normalApproval?.amount ?? gate.approval?.authorized_budget ?? gate.evaluation.estimate.totals.max);
     const av = await g.availability(this.dataSource, a.ownerId);
     if (cmpDec(required, av.available) <= 0) return;
