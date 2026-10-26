@@ -231,6 +231,8 @@ export class CourseProfilesService {
     kind: string,
     data: unknown,
     expectedVersion?: number,
+    /** r76: quién guarda (actor del JWT, r75). Ausente = el dueño (comportamiento anterior). */
+    authorId?: string | null,
   ): Promise<{ created: boolean; profile: CourseProfileDto; prunedOutcomeLinks?: { chapterId: string; removed: string[] }[]; derivedPedagogy?: PedagogyDerivationResult; academicFromProfile?: ProfileOutcomesSync }> {
     assertDynamicOwnerAllowed(ownerId); // allow-list V2 en toda escritura
     this.assertKind(kind);
@@ -330,7 +332,7 @@ export class CourseProfilesService {
         `insert into public.course_profiles (course_id, kind, version, data, sha256, created_by)
          values ($1, $2, $3, $4::jsonb, $5, $6)
          returning *`,
-        [courseId, kind, currentVersion + 1, JSON.stringify(stored), sha, ownerId],
+        [courseId, kind, currentVersion + 1, JSON.stringify(stored), sha, authorId || ownerId],
       );
       // Fase 3 (review I1): una versión nueva del contexto que ya no define un resultado vinculado deja ese vínculo
       // roto (y el lock fallaría). En la MISMA transacción se quitan de los capítulos los ids que la versión nueva no

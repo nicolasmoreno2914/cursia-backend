@@ -644,7 +644,13 @@ export async function processV3PackageJob(
     pendingVideoChapterIds,
     // r19 (L3): logo de la cuenta (o ninguno → Cursia) y nombre de la institución para el Libro Guía en PDF.
     // fix round 3: candidatos en orden (brand_profile → user_settings); el builder usa el primero que valida.
-    libroBrand: { logo: prepared.libroBrand?.candidates ?? prepared.libroBrand?.logo ?? null, name: prepared.libroBrand?.name ?? null },
+    libroBrand: {
+      logo: prepared.libroBrand?.candidates ?? prepared.libroBrand?.logo ?? null,
+      name: prepared.libroBrand?.name ?? null,
+      // r76 «Diseño visual»: marca de agua y logo en la bienvenida (solo si el perfil se aparta de lo de siempre).
+      ...(prepared.libroBrand?.watermark === false ? { watermark: false } : {}),
+      ...(prepared.libroBrand?.showInCourse === true ? { showInCourse: true } : {}),
+    },
     libroReferences: prepared.libroReferences ?? null,
     // r58 (I3) fix: horas objetivo congeladas en el Blueprint → «Duración estimada: X h (definida por la institución)» en
     // la bienvenida y «Carga horaria declarada» en la Guía del docente. Antes nunca se pasaban (facts.hours = null siempre).

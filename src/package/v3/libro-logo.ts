@@ -31,11 +31,12 @@ import { encodePngFiltered, downscaleCoverPng } from './png-downscale';
 /** Asset oficial (copiado de logos_finales_cursia/out/logo-navy.png, 560×211 RGBA). */
 export const CURSIA_LOGO_PATH = path.resolve(__dirname, '../../../assets/brand/cursia-logo-navy.png');
 
-export type LibroLogoSource = 'brand_profile' | 'user_settings' | 'cursia_default';
+export type LibroLogoSource = 'course_profile' | 'brand_profile' | 'user_settings' | 'cursia_default';
 
 /** Logo candidato de la cuenta tal como sale de la base (sin validar). */
 export interface LibroLogoCandidate {
-  source: 'brand_profile' | 'user_settings';
+  /** r76: 'course_profile' = el logo propio del curso («Diseño visual»). */
+  source: 'course_profile' | 'brand_profile' | 'user_settings';
   /** data URI (`data:image/png;base64,…`) o, si no lo es, el valor crudo (se rechaza con motivo). */
   dataUri: string;
 }

@@ -57,6 +57,8 @@ export interface LibroV3Input {
   logo: ResolvedLibroLogo;
   /** Nombre de la institución / marca (portada y pie), si la cuenta lo tiene. */
   brandName?: string | null;
+  /** r76 «Diseño visual»: false = sin marca de agua (ausente/true = una por página, lo de siempre). */
+  watermark?: boolean;
   /** Fix round 1 (M8): clave del documento (p.ej. sha del plan) → Info /Keywords, y así /ID único por curso y determinístico. */
   documentKey?: string | null;
   /**
@@ -772,9 +774,12 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
   const wmY = (PAGE.h - wmH) / 2;
   const watermarkDraws: number[] = [];
   let pageIdx = -1;
+  const drawWatermark = input.watermark !== false;
   doc.on('pageAdded', () => {
     pageIdx++;
-    watermarkDraws[pageIdx] = (watermarkDraws[pageIdx] ?? 0) + 1;
+    watermarkDraws[pageIdx] = watermarkDraws[pageIdx] ?? 0;
+    if (!drawWatermark) return;
+    watermarkDraws[pageIdx] += 1;
     doc.save();
     doc.opacity(LIBRO_WATERMARK_OPACITY);
     doc.image(wmImage, wmX, wmY, { width: wmW, height: wmH, ignoreOrientation: true } as any);
@@ -1211,8 +1216,10 @@ async function renderLibroPdfV3Inner(input: LibroV3Input): Promise<LibroPdfResul
   }
 
   const draws = watermarkDraws.slice(0, total);
-  if (draws.length !== total || draws.some((d) => d !== 1)) {
-    throw new Error(`LIBRO_V3_WATERMARK: se esperaba exactamente 1 marca de agua por página (${draws.join(',')})`);
+  // r76: con la marca de agua apagada por el perfil, exactamente 0 por página; si no, exactamente 1 (r19).
+  const expectedDraws = drawWatermark ? 1 : 0;
+  if (draws.length !== total || draws.some((d) => d !== expectedDraws)) {
+    throw new Error(`LIBRO_V3_WATERMARK: se esperaba exactamente ${expectedDraws} marca${expectedDraws === 1 ? '' : 's'} de agua por página (${draws.join(',')})`);
   }
   doc.end();
   await done;

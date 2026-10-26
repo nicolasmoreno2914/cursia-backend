@@ -18,6 +18,15 @@ const ROUNDED = "ui-rounded, 'SF Pro Rounded', 'Nunito', 'Varela Round', 'Avenir
 const SERIF_TEXT = "Charter, 'Bitstream Charter', 'Iowan Old Style', Georgia, Cambria, 'Times New Roman', serif";
 const SERIF_DISPLAY = "'Iowan Old Style', 'Palatino Linotype', Palatino, Charter, Georgia, serif";
 const MONO = "ui-monospace, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace";
+/**
+ * r76 «Diseño visual»: pilas de la tipografía elegida por el curso (PresentationProfileInput.typography). Solo fuentes
+ * del sistema (sin webfonts).
+ */
+export const TYPOGRAPHY_STACKS = {
+  sans: { body: SANS, heading: SANS, display: SANS, meta: SANS, numeral: SANS },
+  serif: { body: SERIF_TEXT, heading: SERIF_DISPLAY, display: SERIF_DISPLAY, meta: HUMANIST, numeral: SERIF_DISPLAY },
+} as const;
+
 /** Pila serif histórica (se conserva exportada para compatibilidad de fixtures). */
 const SERIF = "Georgia, 'Times New Roman', Cambria, serif";
 void SERIF;

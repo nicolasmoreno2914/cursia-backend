@@ -130,6 +130,10 @@ import {
   sectionLayoutFromFacts,
   validateH5pActivityPayload,
   welcomeLabel,
+  WelcomeIdentity,
+  WELCOME_LOGO_FILE,
+  WELCOME_LOGO_FILE_JPEG,
+  welcomeLogoSize,
   welcomeStartLabel,
   shellProseByLabel,
   activityEmbedsInline,
@@ -377,7 +381,14 @@ export interface BuildDynamicMbzV3Input {
    * r19 (L3): marca del Libro Guía en PDF — logo candidato de la cuenta (sin validar: el builder lo valida y cae al logo de
    * Cursia con aviso) y nombre de la institución para la portada y el pie. Ausente → logo de Cursia, sin nombre.
    */
-  libroBrand?: { logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null; name?: string | null } | null;
+  libroBrand?: {
+    logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null;
+    name?: string | null;
+    /** r76 «Diseño visual»: false = Libro Guía sin marca de agua (ausente = una por página). */
+    watermark?: boolean;
+    /** r76: true = el logo (y el nombre) encabezan la bienvenida del curso (imagen en files.xml). Ausente = bytes de siempre. */
+    showInCourse?: boolean;
+  } | null;
   /**
    * T1 (r57): bibliografía del programa académico de la institución (textos extraídos de SU documento, con fuente) →
    * «Referencias» del Libro Guía, tal cual. Ausente/vacía → sin esa subsección (nunca se inventa una referencia).
@@ -1232,6 +1243,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
       })),
     })),
     brandName: input.libroBrand?.name ?? null,
+    ...(input.libroBrand?.watermark === false ? { watermark: false } : {}),
     // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.
     documentKey: packagingPlanV3Sha256(plan),
     // T1 (r57): la portada y el índice cuentan los capítulos REALES (los de práctica, sin texto en el Libro, en su lugar).
@@ -1686,7 +1698,16 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   // ── Sección 0 — shell ────────────────────────────────────────────────────
   // UX r18 (problema 1): Moodle 4.5 pinta el nombre de la sección 0 como encabezado (núcleo); el hero
   // con tema va JUSTO debajo (primer módulo de la sección) y el foro de avisos cierra la sección.
-  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts, input.qaPreviewNotice === true));
+  // r76 «Diseño visual»: logo (el mismo validado del Libro Guía) y nombre de la institución encabezan la bienvenida,
+  // solo si el perfil lo pide. La imagen va en files.xml (SHA1) y se referencia con @@PLUGINFILE@@ (sobrevive a format_text).
+  const welcomeLogoFiles: Array<{ name: string; data: Buffer; mime: string }> = [];
+  let welcomeIdentity: WelcomeIdentity | null = null;
+  if (input.libroBrand?.showInCourse === true) {
+    const file = libroLogo.kind === 'jpeg' ? WELCOME_LOGO_FILE_JPEG : WELCOME_LOGO_FILE;
+    welcomeLogoFiles.push({ name: file, data: libroLogo.bytes, mime: libroLogo.kind === 'jpeg' ? 'image/jpeg' : 'image/png' });
+    welcomeIdentity = { src: `@@PLUGINFILE@@/${file}`, ...welcomeLogoSize(libroLogo.width, libroLogo.height), name: input.libroBrand?.name ? String(input.libroBrand.name) : null };
+  }
+  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts, input.qaPreviewNotice === true, welcomeIdentity), welcomeLogoFiles);
   addLabel(0, 'cv3:shell:audio_welcome', audioWelcomeLabel(facts, theme, opts), [
     { name: SHELL_AUDIO_WELCOME_FILE, data: c.audioWelcome, mime: 'audio/mp3' },
   ]);
@@ -2294,7 +2315,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     mbz,
     ...(audiobookPartsOut ? { audiobookParts: audiobookPartsOut } : {}),
     ...(segmentsOut.length ? { audiobookSegments: segmentsOut.map((x) => ({ key: x.key, moduleNumber: x.moduleNumber, chapterNumbers: x.chapterNumbers, seconds: x.seconds, file: x.file, mp3: x.mp3 })) } : {}),
-    expectations: { facts, resolved, h5pProfileVersion, moodleMinimum: moodleCompatibility.minimumMoodle, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}), ...(delivery?.mode === 'linked' ? { audiobookLinks: { ...(delivery.links ?? {}) } } : {}) },
+    expectations: { facts, resolved, h5pProfileVersion, moodleMinimum: moodleCompatibility.minimumMoodle, examBankPlans, shellProseByLabel: withWelcomeIdentityProse(shellProseByLabel(courseIntro, moduleIntros), welcomeIdentity), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}), ...(delivery?.mode === 'linked' ? { audiobookLinks: { ...(delivery.links ?? {}) } } : {}) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,
@@ -2401,6 +2422,12 @@ export function summaryH5pProfileVersion(pkgs: ReadonlyArray<{ mainLibrary: stri
 }
 
 /** Escape de texto XML sin tocar comillas (el JSON de availability conserva sus `"`). */
+/** r76: el nombre de la institución de la bienvenida es texto del usuario → prosa admitida por el validador. */
+function withWelcomeIdentityProse(m: Record<string, string[]>, identity: WelcomeIdentity | null): Record<string, string[]> {
+  if (!identity?.name) return m;
+  return { ...m, 'cv3:shell:welcome': [...(m['cv3:shell:welcome'] ?? []), identity.name] };
+}
+
 export function xmlTextEsc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }

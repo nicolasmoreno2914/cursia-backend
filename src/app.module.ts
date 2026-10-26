@@ -29,6 +29,7 @@ import { FeaturesModule } from './modules/features/features.module';
 import { CoherenceModule } from './modules/coherence/coherence.module';
 import { InvalidationModule } from './modules/invalidation/invalidation.module';
 import { CourseProfilesModule } from './modules/course-profiles/course-profiles.module';
+import { VisualDesignModule } from './modules/visual-design/visual-design.module';
 import { PedagogyModule } from './modules/pedagogy/pedagogy.module';
 import { AcademicContextModule } from './modules/academic-context/academic-context.module';
 import { CourseFactsModule } from './modules/course-facts/course-facts.module';
@@ -74,6 +75,7 @@ import { BudgetsModule } from './modules/budgets/budgets.module';
     CoherenceModule,
     InvalidationModule,
     CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment / pedagogy / academic)
+    VisualDesignModule,   // r76: «Diseño visual» (contexto + vista previa real del diseño)
     PedagogyModule, // Motor pedagógico V1: catálogo, «No estoy seguro», dry-run (sin escrituras ni proveedores)
     CourseFactsModule, // LOOP 8.1: pedido del curso + «Lo que sabemos del curso» (fuente única)
     CourseDesignModule, // LOOP 8.3: «Cursia recomienda»
