@@ -103,7 +103,7 @@ for s in migrate-r75-access verify-r75-access-schema migrate-r75-budgets verify-
   env $STG node "$REPO/scripts/$s.js" > "$OUT/$s.log" 2>&1 || { cat "$OUT/$s.log"; exit 9; }
 done
 if [ -f "$REPO/scripts/migrate-r75-backfill.js" ]; then
-  env $STG R75_BACKFILL_REPORT_DIR="$OUT" node "$REPO/scripts/migrate-r75-backfill.js" --apply > "$OUT/migrate-r75-backfill.log" 2>&1 || { cat "$OUT/migrate-r75-backfill.log"; exit 9; }
+  env $STG node "$REPO/scripts/migrate-r75-backfill.js" --apply --report-dir="$OUT" > "$OUT/migrate-r75-backfill.log" 2>&1 || { cat "$OUT/migrate-r75-backfill.log"; exit 9; }
 fi
 echo "schema + migraciones reales OK"
 
