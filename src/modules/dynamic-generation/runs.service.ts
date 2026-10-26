@@ -781,6 +781,8 @@ export const APPROVAL_FORBIDDEN = 'approval_forbidden';
  * disponibles para el dueño.
  */
 export const ADMIN_RECOVERY_ONLY = 'admin_recovery_only';
+/** r75 D-14 (02 §E.1): un iniciador que no es el dueño necesita ejecución en el servidor (409). */
+export const SERVER_EXECUTION_REQUIRED = 'server_execution_required';
 
 /**
  * Fix round 1 (C2): ¿el item video ya intentó un render PAGADO en Videogen? (envío iniciado, job
@@ -1059,7 +1061,15 @@ export class RunsService {
     blueprintNumber: number,
     courseContext: CourseContextDto | FromRunDto,
     /** Flujo normal (approveAndStart): aprobación a escribir en la tx del run nuevo. */
-    opts: { normalApproval?: NormalApprovalRequest; signer?: { id: string; email?: string | null } } = {},
+    opts: {
+      normalApproval?: NormalApprovalRequest;
+      signer?: { id: string; email?: string | null };
+      /**
+       * r75 (01 §3.2): quien inicia el run (actor del JWT). Paga con su presupuesto (budget_reservations.user_id,
+       * input_payload.startedBy). Default / igual al dueño = comportamiento de dueño único. Distinto del dueño → D-14.
+       */
+      startedBy?: string | null;
+    } = {},
   ): Promise<StartRunResult> {
     // G3: flag V2 + allow-list por owner (403 antes de tocar la DB).
     assertDynamicOwnerAllowed(ownerId);
@@ -1078,7 +1088,7 @@ export class RunsService {
       // r62 (I2): «Autorizar y aplicar» = {fromRun, estimateHash} → firma del usuario dentro de la política.
       const hash = (courseContext as FromRunDto).estimateHash;
       const sig: FromRunSignature | null = typeof hash === 'string' ? { estimateHash: hash, user: opts.signer ?? { id: ownerId } } : null;
-      const r = await this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun, false, sig);
+      const r = await this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifest, courseContext.fromRun, false, sig, opts.startedBy ?? null);
       if (pb && r.created) await this.prebrief!.recordGenerationStarted(courseId, pb.versionId, r.run.id, ownerId, 'fromRun');
       return r;
     }
@@ -1205,8 +1215,10 @@ export class RunsService {
     user: { id: string; email?: string | null },
     blueprintNumber: number,
     courseContext: CourseContextDto,
+    /** r75 (01 §3.2): dueño técnico del curso (access.effectiveOwnerId); default = el actor (dueño único). */
+    opts: { ownerId?: string } = {},
   ): Promise<StartPreview> {
-    const ownerId = user.id;
+    const ownerId = opts.ownerId || user.id;
     assertDynamicOwnerAllowed(ownerId);
     const manifest = await this.manifests.get(courseId, ownerId, blueprintNumber);
     await assertAssessmentProfileResolvableForRun(this.dataSource, courseId, manifest);
@@ -1321,7 +1333,8 @@ export class RunsService {
       policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: canApprove ? np.month.total : null, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
       estimateHash,
       packageSize,
-      userBudget: await this.userBudgetPreview(ownerId, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
+      // r75: paga quien inicia (el actor), no el dueño técnico del curso.
+      userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
       _plan: plan,
       _evaluation: evaluation,
     } as StartPreview;
@@ -1364,12 +1377,16 @@ export class RunsService {
     blueprintNumber: number,
     courseContext: CourseContextDto,
     estimateHash: string,
+    /** r75 (01 §3.2): dueño técnico del curso (access.effectiveOwnerId); el actor (`user`) firma, aprueba y paga. */
+    opts: { ownerId?: string } = {},
   ): Promise<StartRunResult & { approval: { authorizationId: string | null; amount: string | null } }> {
-    const pv = await this.previewStart(courseId, user, blueprintNumber, courseContext);
+    const ownerId = opts.ownerId || user.id;
+    const startedBy = user.id;
+    const pv = await this.previewStart(courseId, user, blueprintNumber, courseContext, { ownerId });
     const none = { authorizationId: null, amount: null };
     // Run existente (se retoma / reabre por el camino normal) o sin FinOps (solo mock): sin aprobación nueva.
     if (pv.existingRun || !pv.estimate || !pv.approval) {
-      return { ...(await this.startRun(courseId, user.id, blueprintNumber, courseContext)), approval: none };
+      return { ...(await this.startRun(courseId, ownerId, blueprintNumber, courseContext, { startedBy })), approval: none };
     }
     if (pv.estimateHash !== estimateHash) {
       throw new ConflictException({
@@ -1391,11 +1408,11 @@ export class RunsService {
         result: null,
         kind: 'user',
       };
-      const started = await this.startRun(courseId, user.id, blueprintNumber, courseContext, { normalApproval: ua });
+      const started = await this.startRun(courseId, ownerId, blueprintNumber, courseContext, { normalApproval: ua, startedBy });
       return { ...started, approval: ua.result ?? none };
     }
     // AUTO o una aprobación de admin vigente: el camino normal (startRun la consume).
-    if (!pv.approval.required) return { ...(await this.startRun(courseId, user.id, blueprintNumber, courseContext)), approval: none };
+    if (!pv.approval.required) return { ...(await this.startRun(courseId, ownerId, blueprintNumber, courseContext, { startedBy })), approval: none };
     if (!pv.approval.canApprove) {
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
@@ -1412,7 +1429,7 @@ export class RunsService {
       result: null,
       kind: 'admin',
     };
-    const started = await this.startRun(courseId, user.id, blueprintNumber, courseContext, { normalApproval: na });
+    const started = await this.startRun(courseId, ownerId, blueprintNumber, courseContext, { normalApproval: na, startedBy });
     return { ...started, approval: na.result ?? none };
   }
 
@@ -1471,8 +1488,10 @@ export class RunsService {
    * huella (incluye planSha). Solo lectura. Si el run B de este par ya existe → `existingRun` (sin estimado).
    */
   async previewFromRun(courseId: number, user: { id: string; email?: string | null }, blueprintNumber: number, fromRunId: string,
-    manifestBIn?: ManifestDto): Promise<FromRunPreview> {
-    const ownerId = user.id;
+    manifestBIn?: ManifestDto,
+    /** r75 (01 §3.2): dueño técnico del curso (access.effectiveOwnerId); default = el actor. */
+    ownerIdIn?: string): Promise<FromRunPreview> {
+    const ownerId = ownerIdIn || user.id;
     assertDynamicOwnerAllowed(ownerId);
     const manifestB = manifestBIn ?? (await this.manifests.get(courseId, ownerId, blueprintNumber));
     const [rowA] = await this.dataSource.query(
@@ -1600,12 +1619,16 @@ export class RunsService {
     fromRunId: string,
     youtubePreflightPassed = false,
     sig: FromRunSignature | null = null,
+    /** r75: iniciador (paga; D-14 si no es el dueño). null = el dueño. */
+    startedBy: string | null = null,
   ): Promise<StartRunResult> {
+    // r75 D-14: un iniciador que no es el dueño solo arranca con ejecución en el servidor (antes de estimar o escribir).
+    await this.assertDelegatedStartExecutable(ownerId, startedBy, manifestB);
     // r62 (I2): con la firma, el preview del plan se recalcula ahora con la MISMA huella; dentro de la política el run B
     // nace con la autorización del usuario (fila AUTO_WITHIN_POLICY firmada), fuera → budget_blocked / el admin de siempre.
     let userNa: NormalApprovalRequest | undefined;
     if (sig && this.finopsBudget) {
-      const pv = await this.previewFromRun(courseId, sig.user, blueprintNumber, fromRunId, manifestB);
+      const pv = await this.previewFromRun(courseId, sig.user, blueprintNumber, fromRunId, manifestB, ownerId);
       if (!pv.existingRun && pv.estimateHash !== null) {
         if (pv.estimateHash !== sig.estimateHash) {
           throw new ConflictException({
@@ -1799,7 +1822,7 @@ export class RunsService {
             `Manifest #${manifestB.id}: se sembraron ${seeded.size} items pero totals.totalJobs = ${manifestB.totals.totalJobs}`,
           );
         }
-        await this.finopsBindRun(qr, budget, { runId: job.id, courseId, ownerId, manifestId: manifestB.id, planSha: plan.planSha256 });
+        await this.finopsBindRun(qr, budget, { runId: job.id, courseId, ownerId, manifestId: manifestB.id, planSha: plan.planSha256, startedBy });
         // Todo reutilizado (p.ej. reorder puro) → el run nace completed.
         await recomputeRunStatus(qr, job.id);
         return { kind: 'created' as const, jobId: job.id as string };
@@ -1810,7 +1833,7 @@ export class RunsService {
       }
       if (!(err instanceof NeedsYoutubePreflight) || youtubePreflightPassed) throw err;
       await this.enforceVideoGate(ownerId, err.gate); // 409 si no pasa
-      return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifestB, fromRunId, true, sig);
+      return this.startRunFromPrevious(courseId, ownerId, blueprintNumber, manifestB, fromRunId, true, sig, startedBy);
     }
 
     const job = await this.loadJobById(outcome.jobId);
@@ -1840,7 +1863,7 @@ export class RunsService {
     mayRetry: boolean,
     videoDelivery: VideoDeliveryStrategy,
     providerModes?: ProviderModes,
-    opts: { normalApproval?: NormalApprovalRequest } = {},
+    opts: { normalApproval?: NormalApprovalRequest; startedBy?: string | null } = {},
   ): Promise<StartRunResult> {
     const active = await this.findActiveRunRow(manifest.id);
     if (active) return this.existingRunOrConflict(active, manifest, contextHash, videoMode, providerModes);
@@ -1908,6 +1931,8 @@ export class RunsService {
           .map((r) => r.item_key);
         await this.finopsPaidWorkGate({ courseId, ownerId, manifest, job: latest, paidKeys });
       }
+      // r75 D-14: reabrir vuelve a ejecutar partes → un iniciador que no es el dueño necesita ejecución en el servidor.
+      await this.assertDelegatedStartExecutable(ownerId, opts.startedBy ?? null, manifest);
       return this.reopenRun(latest.id, manifest, contextHash);
     }
 
@@ -1939,19 +1964,22 @@ export class RunsService {
     );
     const frontendCourseId: string | null = course?.frontend_course_id ?? null;
 
+    // r75 D-14 (orden 01 §5.2: permiso → suspensión/congelación → ejecución → presupuesto): un iniciador que no es el
+    // dueño solo arranca si el servidor ejecuta todas las partes de IA (si no, 409 server_execution_required).
+    await this.assertDelegatedStartExecutable(ownerId, opts.startedBy ?? null, manifest);
     // V2.1 RF-b: estimado + gate de presupuesto ANTES de escribir el run.
     const budget = await this.finopsStartGate({
       courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, modes: runSpendModes(videoMode, providerModes ?? null),
       normalApproval: opts.normalApproval,
     });
     // r75 (Agente C): presupuesto mensual del usuario (lectura optimista; el chequeo autoritativo va en bindRun).
-    await this.assertUserBudgetPreTx(budget, { courseId, ownerId, manifestId: manifest.id });
+    await this.assertUserBudgetPreTx(budget, { courseId, ownerId, manifestId: manifest.id, payerUserId: opts.startedBy ?? null });
 
     let jobId: string;
     try {
       jobId = await this.tx(async (qr) => {
         const id = await this.insertRun(qr, manifest, ownerId, courseId, frontendCourseId, blueprintNumber, context, contextHash, videoMode, frozenDelivery, providerModes);
-        await this.finopsBindRun(qr, budget, { runId: id, courseId, ownerId, manifestId: manifest.id });
+        await this.finopsBindRun(qr, budget, { runId: id, courseId, ownerId, manifestId: manifest.id, startedBy: opts.startedBy ?? null });
         return id;
       });
     } catch (err) {
@@ -5457,18 +5485,7 @@ export class RunsService {
     return { estimate, plan: np, policyId: policy?.id ?? null, runActual: normalizeDecimal(runActual), estimateHash };
   }
 
-  // ── V2.1 RF-b: estimado + gates de presupuesto (audit §W.6/§W.7) ─────────
-
-  /**
-   * Estimado del run desde el Manifest (v1/v2/v3) + decisión de presupuesto.
-   * - AUTO_WITHIN_POLICY → sigue (se vincula una autorización AUTO al crear el run).
-   * - ADMIN_APPROVAL → exige una aprobación ADMIN_APPROVED de este curso para un
-   *   estimado del MISMO Manifest, sin consumir y que cubra el esperado.
-   * - BLOCK (política con on_exceed=BLOCK) → sin salida por aprobación.
-   * Rechazo → BudgetGateRejection (el caller guarda el estimado FUERA de su tx y
-   * responde 409 con el estimateId para que un admin lo autorice).
-   */
-  // ─── r75 (Agente C): presupuesto mensual por usuario (rebasar después del merge de r74) ─────────────────────────
+  // ─── r75 (Agente C): presupuesto mensual por usuario (rebasado sobre r74) ─────────────────────────────────────────
 
   /** Gate de presupuestos registrado por BudgetsModule (cualquier modo), o null (sin módulo / sin FinOps). */
   private userBudgetGate() {
@@ -5492,14 +5509,16 @@ export class RunsService {
    * 01 §5.2 «pre-tx»: con enforce y el disponible (lectura optimista) por debajo de lo que se autorizaría, 409
    * user_budget_insufficient SIN crear nada, con el estimado persistido (estimateId) para «Solicitar autorización».
    */
-  private async assertUserBudgetPreTx(gate: FinopsGate | null, a: { courseId: number; ownerId: string; manifestId: number; planSha?: string | null }): Promise<void> {
+  private async assertUserBudgetPreTx(gate: FinopsGate | null, a: { courseId: number; ownerId: string; manifestId: number; planSha?: string | null; payerUserId?: string | null }): Promise<void> {
     const g = this.userBudgetGate();
     if (!g || g.mode() !== 'enforce' || !gate || !this.finopsBudget) return;
+    // r75: paga el iniciador (default: el dueño, como bindRun).
+    const payer = (a.payerUserId && String(a.payerUserId).trim()) || a.ownerId;
     // r75 (01 §5.2): orden permiso (guard) → suspensión de generación / congelación de plataforma → presupuesto. Un
     // suspendido con USD 0 recibe 403 generation_suspended, no el 409 de presupuesto (que ofrecería «Solicitar autorización»).
-    await g.assertMayStart(this.dataSource, a.ownerId);
+    await g.assertMayStart(this.dataSource, payer);
     const required = normalizeDecimal(gate.normalApproval?.amount ?? gate.approval?.authorized_budget ?? gate.evaluation.estimate.totals.max);
-    const av = await g.availability(this.dataSource, a.ownerId);
+    const av = await g.availability(this.dataSource, payer);
     if (cmpDec(required, av.available) <= 0) return;
     const est = await this.finopsBudget.recordEstimate({
       scope: 'run', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: null, invalidationPlanSha: a.planSha ?? null,
@@ -5508,7 +5527,29 @@ export class RunsService {
     throw new ConflictException({
       code: av.assigned ? 'user_budget_insufficient' : 'user_budget_not_assigned',
       message: `tu presupuesto disponible del mes (USD ${Number(av.available).toFixed(2)}) no alcanza para esta generación (USD ${Number(required).toFixed(2)}); no se creó nada. estimateId=${est.id}`,
-      requiredUsd: required, availableUsd: av.available, payerUserId: a.ownerId, canRequest: true, estimateId: est.id,
+      requiredUsd: required, availableUsd: av.available, payerUserId: payer, canRequest: true, estimateId: est.id,
+    });
+  }
+
+  /**
+   * r75 D-14 (01 §3.2): un iniciador distinto del dueño técnico (SuperAdmin o miembro con generations.start) no puede
+   * ejecutar las partes en SU navegador (el claim del scheduler exige el dueño del run). Hasta integrar claim + atribución
+   * por `startedBy`, el run solo arranca si el SERVIDOR genera todas sus partes de IA (flag del worker + worker de IA vivo
+   * que cubre cada tipo para un run creado ahora). Antes, los controles de cuenta de quien inicia (congelación de
+   * plataforma, suspensión de generación): el orden de 01 §5.2 es permiso → suspensión/congelación → ejecución →
+   * presupuesto. Si no → 409 `server_execution_required` sin crear nada.
+   */
+  private async assertDelegatedStartExecutable(ownerId: string, startedBy: string | null, manifest: ManifestDto): Promise<void> {
+    if (!startedBy || String(startedBy).toLowerCase() === String(ownerId).toLowerCase()) return;
+    const g = this.userBudgetGate();
+    if (g) await g.assertMayStart(this.dataSource, startedBy);
+    const routed = routedTypesForRun(await liveLlmWorkerCoverage(this.dataSource, Date.now(), LLM_WORKER_PRESENCE_STRICT_SECONDS), new Date());
+    if (runServerExecuted(manifest.manifest.items.map((it) => String(it.type)), routed)) return;
+    throw new ConflictException({
+      code: SERVER_EXECUTION_REQUIRED,
+      message:
+        `${SERVER_EXECUTION_REQUIRED}: esta generación la inicia alguien que no es el dueño del curso; solo puede ejecutarse en el ` +
+        `servidor (worker de IA activo para todas sus partes) y hoy no está disponible. No se creó nada.`,
     });
   }
 
@@ -5520,6 +5561,18 @@ export class RunsService {
     if (reopensTerminal && g.mode() !== 'off') await g.assertRunReopenFits(qr, runId);
   }
 
+
+  // ── V2.1 RF-b: estimado + gates de presupuesto (audit §W.6/§W.7) ─────────
+
+  /**
+   * Estimado del run desde el Manifest (v1/v2/v3) + decisión de presupuesto.
+   * - AUTO_WITHIN_POLICY → sigue (se vincula una autorización AUTO al crear el run).
+   * - ADMIN_APPROVAL → exige una aprobación ADMIN_APPROVED de este curso para un
+   *   estimado del MISMO Manifest, sin consumir y que cubra el esperado.
+   * - BLOCK (política con on_exceed=BLOCK) → sin salida por aprobación.
+   * Rechazo → BudgetGateRejection (el caller guarda el estimado FUERA de su tx y
+   * responde 409 con el estimateId para que un admin lo autorice).
+   */
   private async finopsEvaluate(a: {
     courseId: number;
     ownerId: string;
@@ -5653,7 +5706,7 @@ export class RunsService {
   private async finopsBindRun(
     qr: QueryRunner,
     gate: FinopsGate | null,
-    a: { runId: string; courseId: number; ownerId: string; manifestId: number; planSha?: string | null },
+    a: { runId: string; courseId: number; ownerId: string; manifestId: number; planSha?: string | null; startedBy?: string | null },
   ): Promise<void> {
     if (!gate || !this.finopsBudget) return;
     if (gate.normalApproval) {
@@ -5706,6 +5759,8 @@ export class RunsService {
     await this.finopsBudget.bindRun(qr, {
       runId: a.runId, courseId: a.courseId, ownerId: a.ownerId, manifestId: a.manifestId,
       evaluation: gate.evaluation, approval: gate.approval, invalidationPlanSha: a.planSha ?? null,
+      // r75: el iniciador paga (reserva a su nombre + input_payload.startedBy); sin él, el dueño (dueño único).
+      ...(a.startedBy ? { startedBy: a.startedBy } : {}),
     });
   }
 

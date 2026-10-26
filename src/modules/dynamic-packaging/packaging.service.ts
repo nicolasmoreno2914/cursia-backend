@@ -37,6 +37,11 @@ export const PREVIEW_NOT_DELIVERABLE = 'preview_not_deliverable';
 export interface PackageActor {
   id?: string | null;
   email?: string | null;
+  /**
+   * r75 (D-15): vida de la URL firmada del `.mbz` cuando quien descarga NO es el dueño (miembro con exports.download en
+   * RBAC enforce): default 300 s, tope 3600 s (signedUrlSecondsFor). Sin valor → la de siempre (dueño / legacy).
+   */
+  signedUrlTtlSeconds?: number | null;
 }
 /** worker_status del job de package en curso — una segunda POST reutiliza el mismo job sin crear otro. */
 const IN_PROGRESS_PACKAGE_STATUSES = ['queued', 'running', 'retrying'];
@@ -424,7 +429,9 @@ export class PackagingService {
       } else if (artifactId) {
         result.artifactId = artifactId;
         try {
-          const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, DOWNLOAD_URL_TTL_SECONDS);
+          // r75 (D-15): firmada con el dueño REAL del artifact (ownerId efectivo); un miembro no dueño, vida corta.
+          const ttl = actor?.signedUrlTtlSeconds && actor.signedUrlTtlSeconds > 0 ? Math.min(actor.signedUrlTtlSeconds, DOWNLOAD_URL_TTL_SECONDS) : DOWNLOAD_URL_TTL_SECONDS;
+          const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, ttl);
           if (url) {
             result.downloadUrl = url;
           } else {
@@ -495,8 +502,17 @@ export class PackagingService {
     };
   }
 
-  /** Fix round 1 (I2): dueño real del curso cuando actúa un SUPER_ADMIN; si no, el propio usuario (sin cambios). */
+  /**
+   * Dueño efectivo del curso para las consultas por owner (Fix round 1 I2, generalizado en r75 01 §3.2):
+   *  - `ownerId` llega del controller como `access.effectiveOwnerId`: con CURSIA_RBAC_MODE=enforce, PermissionGuard ya
+   *    autorizó exports.download y lo resolvió a courses.owner_id (un miembro de la institución actúa sobre el curso del
+   *    dueño técnico); en off/shadow es el propio actor (comportamiento de siempre).
+   *  - Si ya viene resuelto a otro usuario (distinto del actor), se respeta tal cual.
+   *  - SUPER_ADMIN (también en off/shadow, como antes): el dueño real del curso.
+   *  - Cualquier otro caso: `ownerId` sin cambios.
+   */
   private async ownerForActor(courseId: number, ownerId: string, actor?: PackageActor): Promise<string> {
+    if (actor?.id && String(ownerId).toLowerCase() !== String(actor.id).toLowerCase()) return ownerId;
     if (!isSuperAdminEmail(actor?.email)) return ownerId;
     const [c] = await this.dataSource.query(`select owner_id from public.courses where id = $1`, [courseId]);
     return c?.owner_id ? String(c.owner_id) : ownerId;
