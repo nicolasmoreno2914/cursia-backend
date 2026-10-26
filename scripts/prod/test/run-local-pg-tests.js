@@ -471,14 +471,15 @@ async function main() {
         await withClient('schemafirst', (c) => c.query(`delete from production_jobs where execution_mode = 'dynamic_generation' and owner_id = 'u'`));
       }
     });
-    await test('M5/N1: el SQL de constraint del script de deploy.yml es el de main + SOLO dynamic_generation/dynamic_package (execution_mode) y + SOLO preview (worker_status, EV6 DoD) (PG16, pg_get_constraintdef)', async () => {
+    await test('M5/N1: el SQL de constraint del script de deploy.yml es el de main + SOLO dynamic_generation/dynamic_package/brand_extraction (execution_mode) y + SOLO preview (worker_status, EV6 DoD) (PG16, pg_get_constraintdef)', async () => {
       const m = run(MAIN_CONSTRAINTS_SCRIPT, [], localEnv('cmpmain'));
       const c = run(CONSTRAINTS_SCRIPT, [], localEnv('cmpcur'));
       assert(m.code === 0 && c.code === 0, m.out + c.out);
       const dm = await defsOf('cmpmain');
       const dc = await defsOf('cmpcur');
       assert(dm.length === 2 && dc.length === 2, JSON.stringify([dm, dc]));
-      const stripped = dc[0].def.replace(", 'dynamic_generation'::text, 'dynamic_package'::text", '');
+      // brand_extraction: el Brand Kit (supabase-migration-brand-extraction-execution-mode.sql) que el script perdía en cada deploy.
+      const stripped = dc[0].def.replace(", 'dynamic_generation'::text, 'dynamic_package'::text, 'brand_extraction'::text", '');
       assert(dc[0].def !== stripped && stripped === dm[0].def, `execution_mode\nmain ${dm[0].def}\ncur  ${dc[0].def}`);
       // EV6 DoD (BE-A): worker_status agrega SOLO 'preview' (run terminado con componentes de vista previa).
       const strippedWs = dc[1].def.replace(", 'preview'::text", '');
