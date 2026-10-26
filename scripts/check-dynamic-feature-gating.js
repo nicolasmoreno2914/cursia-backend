@@ -155,6 +155,11 @@ const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
   'MembershipsController',
   'InstitutionsAdminController',
   'AdminUsersController',
+  // r75 (C): presupuestos y gasto por institución (CURSIA_USER_BUDGETS), no son rutas V2.
+  'BudgetsController',
+  'BudgetsAdminController',
+  'InstitutionSpendController',
+  'AdminSpendController',
   'AppController',
   'AuthController',
   'YoutubeController',

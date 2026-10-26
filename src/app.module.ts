@@ -36,6 +36,7 @@ import { PrebriefModule } from './modules/prebrief/prebrief.module';
 import { FinopsModule } from './modules/finops/finops.module';
 import { AuthzModule } from './modules/authz/authz.module';
 import { AccessModule } from './modules/access/access.module';
+import { BudgetsModule } from './modules/budgets/budgets.module';
 
 @Module({
   imports: [
@@ -78,6 +79,7 @@ import { AccessModule } from './modules/access/access.module';
     AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
     FinopsModule,
     AccessModule, // r75 (A): instituciones multi-miembro, membresías, usuarios SA, suspensiones, auditoría, /me/context
+    BudgetsModule, // r75 (C): presupuesto mensual por usuario, solicitudes y gasto por institución (CURSIA_USER_BUDGETS)
   ],
   controllers: [AppController],
   providers: [
