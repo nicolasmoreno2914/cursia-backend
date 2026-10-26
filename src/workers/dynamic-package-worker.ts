@@ -18,7 +18,11 @@ import { buildDynamicMbz, DYNAMIC_MBZ_BUILDER_VERSION } from '../package/dynamic
 import type { DynamicPackageContents, PackagingPlan, ResolvedArtifact } from '../modules/dynamic-packaging/packaging-types';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { WorkerLedger, recordPackageBuild } from './finops-worker-hooks';
-import { buildDynamicMbzV3, DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../package/dynamic-mbz-builder-v3';
+import { buildDynamicMbzV3, BuildDynamicMbzV3Input, BuildDynamicMbzV3Result, DYNAMIC_MBZ_BUILDER_VERSION_V3 } from '../package/dynamic-mbz-builder-v3';
+import { MIN_PACKAGE_PART_BYTES, deliveryLimitsFromEnv } from '../package/v3/delivery-plan';
+import { validateAudiobookPartV3 } from '../package/v3/audiobook-part-validator';
+import { LeaseLostError, SplitDeliveryResult, SplitDeliveryStore, deliverSplitV3, estimateSingleBytes } from '../modules/dynamic-packaging/split-delivery-v3';
+import { publicMediaBaseUrl } from '../modules/course-media/course-media.service';
 import { PACKAGE_KINDS, PackageKind, QA_INTERNAL_STORAGE_PREFIX, QA_PACKAGE_FILENAME_PREFIX, summaryLooksPreview } from '../modules/dynamic-packaging/package-freshness';
 import { frozenProviderModesOf } from '../modules/dynamic-generation/provider-modes';
 import { validateMbzV3 } from '../package/v3/mbz-validator-v3';
@@ -605,6 +609,8 @@ export async function processV3PackageJob(
       ...(existing.metadata?.moodleCompatibility && typeof existing.metadata.moodleCompatibility === 'object' ? { moodleCompatibility: existing.metadata.moodleCompatibility } : {}),
       // r58 (I2): el informe de calidad viaja en la metadata del .mbz reutilizado (mismos textos = mismo informe).
       ...(existing.metadata?.qualityReport && typeof existing.metadata.qualityReport === 'object' ? { qualityReport: existing.metadata.qualityReport } : {}),
+      // r74: la entrega (partes y medios en línea) viaja en la metadata del .mbz reutilizado.
+      ...(existing.metadata?.delivery && typeof existing.metadata.delivery === 'object' ? { delivery: existing.metadata.delivery } : {}),
       ...(reuseWarnings.length ? { warnings: reuseWarnings } : {}),
     });
     if (!ok) logger.warn(`Job ${job.id}: completeJob devolvió false (lease perdida) tras reutilizar ${existing.id}`);
@@ -626,7 +632,7 @@ export async function processV3PackageJob(
   if (isLeaseLost()) return;
 
   const build = deps.buildMbzV3 ?? buildDynamicMbzV3;
-  const built = await build({
+  const buildInput: BuildDynamicMbzV3Input = {
     manifest: manifest.manifest,
     blueprint: snapshot,
     manifestId: manifest.id,
@@ -647,7 +653,7 @@ export async function processV3PackageJob(
     hoursSource: packageDeclaredHoursSource(snapshot),
     // EV6 DoD: paquete QA → aviso visible en la bienvenida + nombre del curso «[QA — vista previa, no entregable]».
     ...(qa ? { qaPreviewNotice: true } : {}),
-  });
+  };
   // §Q.8: el validador corre sobre los BYTES del paquete, antes de subir. Un hallazgo = fail loud.
   // G6 M1: la evaluación esperada se resuelve ACÁ, del perfil que cargó el worker (no se confía en la del builder).
   // F1 (I3): con los mismos itemCounts del Manifest que usa el builder.
@@ -656,10 +662,49 @@ export async function processV3PackageJob(
     activityEngine: manifest.manifest.features?.activityEngine,
     itemCounts: assessmentItemCountsForPackage(manifest.manifest, omittedVideoKeys, prepared.profiles.assessment),
   });
-  if (JSON.stringify(resolved) !== JSON.stringify(built.expectations.resolved)) {
-    throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
+  const validateMain = async (mbz: Buffer, b: BuildDynamicMbzV3Result) => {
+    if (JSON.stringify(resolved) !== JSON.stringify(b.expectations.resolved)) {
+      throw new Error('MBZ_V3_VALIDATION_FAILED: el builder resolvió una evaluación distinta de la del perfil vigente');
+    }
+    return (deps.validateMbzV3 ?? validateMbzV3)(mbz, { facts: b.expectations.facts, resolved, examBankPlans: b.expectations.examBankPlans, shellProseByLabel: b.expectations.shellProseByLabel, builderVersion: b.expectations.builderVersion, moodleMinimum: b.expectations.moodleMinimum, internalVocabularyExempt: b.expectations.internalVocabularyExempt, internalVocabularyUserTexts: b.expectations.internalVocabularyUserTexts, ...(b.expectations.audiobookLinks ? { audiobookLinks: b.expectations.audiobookLinks } : {}) });
+  };
+  // r74: entrega según la capacidad REAL (bytes de los medios ya cargados). Si todo cabe en un archivo de a lo sumo
+  // PACKAGE_PART_MAX_BYTES → el .mbz de siempre. Si no → audiolibro aparte (en línea + versión autocontenida), cada
+  // archivo validado y subido por separado (un reintento reutiliza lo ya subido).
+  const sizeLimits = (deps.packageSizeLimits ?? packageSizeLimitsFromEnv)();
+  // Sin tope (harnesses que solo miden) no hay decisión de entrega: un archivo, como antes.
+  const deliveryLimits = sizeLimits.maxBytes === null ? null : deliveryLimitsFromEnv(sizeLimits.maxBytes);
+  let built: BuildDynamicMbzV3Result;
+  let validation: Awaited<ReturnType<typeof validateMbzV3>>;
+  let split: SplitDeliveryResult | null = null;
+  let deliverySummary: Record<string, any> | null = null;
+  // Un tope de almacenamiento menor que una parte mínima (8 MiB) solo existe en harnesses: un archivo + presupuesto.
+  if (deliveryLimits && deliveryLimits.partMaxBytes >= MIN_PACKAGE_PART_BYTES && estimateSingleBytes(buildInput) > deliveryLimits.partMaxBytes && buildInput.contents.audiobookChapters.size > 0) {
+    const storagePrefix = qa
+      ? `${QA_INTERNAL_STORAGE_PREFIX}/${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}`
+      : `${job.owner_id}/dynamic/${artifactCourseId(job)}/${manifest.id}`;
+    try {
+      split = await deliverSplitV3({
+        jobId: job.id, ownerId: job.owner_id, courseId: artifactCourseId(job), manifestId: manifest.id, runId, sourceIdsHash,
+        storagePrefix, qa, limits: deliveryLimits, publicMediaBase: publicMediaBaseUrl(), buildInput, build,
+        validateMain, validatePart: validateAudiobookPartV3,
+        store: deps.artifacts as unknown as SplitDeliveryStore,
+        mainMetadata: () => ({}),
+        isLeaseLost,
+        log: (m) => logger.log(`Job ${job.id}: ${m}`),
+      });
+    } catch (err) {
+      if (err instanceof LeaseLostError) return;
+      throw err;
+    }
+    built = split.primary.built;
+    validation = split.primary.validation;
+    // Sin entrega en línea y con la versión autocontenida en UN archivo = el .mbz de siempre (sin «entrega» que mostrar).
+    if (!(split.mode === 'parts' && split.selfContained.totalFiles === 1)) deliverySummary = split.summary;
+  } else {
+    built = await build(buildInput);
+    validation = await validateMain(built.mbz, built);
   }
-  const validation = await (deps.validateMbzV3 ?? validateMbzV3)(built.mbz, { facts: built.expectations.facts, resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion, moodleMinimum: built.expectations.moodleMinimum, internalVocabularyExempt: built.expectations.internalVocabularyExempt, internalVocabularyUserTexts: built.expectations.internalVocabularyUserTexts });
   if (!validation.ok) {
     throw new Error(
       `MBZ_V3_VALIDATION_FAILED: ${validation.issues.length} hallazgo(s): ` +
@@ -668,7 +713,7 @@ export async function processV3PackageJob(
   }
   // T6 (r57): presupuesto de tamaño ANTES de subir — un paquete sobre el límite configurado falla acá con un código
   // claro (nunca un 413 del almacenamiento después de armarlo); sobre el umbral de aviso, aviso visible.
-  const sizeVerdict = await packageSizeBudget(built.mbz, (deps.packageSizeLimits ?? packageSizeLimitsFromEnv)());
+  const sizeVerdict = await packageSizeBudget(built.mbz, sizeLimits);
   if (sizeVerdict.error) throw new Error(sizeVerdict.error);
   if (isLeaseLost()) return;
 
@@ -725,7 +770,7 @@ export async function processV3PackageJob(
     // r58 (AU1 R1): un objeto preexistente en la ruta canónica solo se adopta con los mismos bytes (validados).
     replaceUnverifiedOnConflict: true,
     // r58 (AU1 R1): sha256 de los bytes que aprobó validateMbzV3 (el reuse lo exige igual al checksum de Storage).
-    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), ...(built.summary.moodleCompatibility ? { moodleCompatibility: built.summary.moodleCompatibility } : {}), ...(qualityReport ? { qualityReport } : {}), validatedSha256: sha256Hex(built.mbz) },
+    metadata: { runId, manifestId: manifest.id, ...baseSummary, ...pendingSummary, ...(built.summary.restore ? { restore: built.summary.restore } : {}), ...(built.summary.moodleCompatibility ? { moodleCompatibility: built.summary.moodleCompatibility } : {}), ...(qualityReport ? { qualityReport } : {}), ...(deliverySummary ? { delivery: deliverySummary } : {}), validatedSha256: sha256Hex(built.mbz) },
   });
   if (isLeaseLost()) return;
 
@@ -743,6 +788,7 @@ export async function processV3PackageJob(
     ...profileWarnings,
     ...[...loaded.warnings, ...built.summary.warnings].filter((w) => !profileDetails.has(w)).map((w) => ({ code: w.split(':')[0], detail: w })),
     ...sizeVerdict.warnings.map((w) => ({ code: w.split(':')[0], detail: w })),
+    ...(split ? split.warnings.map((w) => ({ code: w.split(':')[0], detail: w })) : []),
     ...qualityReportWarnings.map((w) => ({ code: w.split(':')[0], detail: w })),
   ];
   const ok = await completeJob(deps.dataSource, job.id, deps.workerId, {
@@ -761,6 +807,8 @@ export async function processV3PackageJob(
     ...(built.summary.moodleCompatibility ? { moodleCompatibility: built.summary.moodleCompatibility } : {}),
     mockProviderItems: loaded.mockProviderItems,
     validation: validation.stats,
+    // r74: entrega del curso grande (en línea + autocontenida) — ausente en un paquete de un solo archivo.
+    ...(deliverySummary ? { delivery: deliverySummary } : {}),
     // T6 (r57): tamaño del paquete subido y lo más pesado (siempre; los límites solo si están configurados).
     size: { totalBytes: sizeVerdict.stats.totalBytes, uncompressedBytes: sizeVerdict.stats.uncompressedBytes, entries: sizeVerdict.stats.entries, largest: sizeVerdict.stats.largest, ...(sizeVerdict.limits.maxBytes !== null ? { maxBytes: sizeVerdict.limits.maxBytes } : {}), ...(sizeVerdict.limits.warnBytes !== null ? { warnBytes: sizeVerdict.limits.warnBytes } : {}) },
     ...(warnings.length ? { warnings } : {}),

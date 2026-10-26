@@ -359,7 +359,9 @@ function libroCard(
 
 // ─── S1.3 Audiolibro ────────────────────────────────────────────────────────
 
-export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, links?: Readonly<Record<string, string>> | null): ShellLabel {
+  if (facts.audio.delivery?.mode === 'parts') return audiobookDeliveredInPartsLabel(facts, theme, opts);
+  if (facts.audio.delivery?.mode === 'linked') return audiobookLinkedLabel(facts, theme, opts, links ?? {});
   const h = hx(theme, opts);
   const s = bgSurf(h);
   const items = facts.audio.audiobookParts.map((p) => {
@@ -383,6 +385,131 @@ export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: 
     rows(h, items.join(''), { ordered: true }) +
     `</div>`;
   return out('Audiolibro', root(h, 'shell-audiobook', inner), facts);
+}
+
+/** r74: nombre de archivo del MP3 de un segmento del audiolibro entregado por partes (sin cifras visibles). */
+export function audiobookSegmentFile(moduleNumber: number, firstChapter: number, lastChapter: number): string {
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  return `audiolibro_modulo_${p2(moduleNumber)}_cap_${p2(firstChapter)}-${p2(lastChapter)}.mp3`;
+}
+
+function chapterRange(nums: readonly number[]): string {
+  return nums.length === 1 ? `capítulo ${nums[0]}` : `capítulos ${nums[0]} a ${nums[nums.length - 1]}`;
+}
+
+/**
+ * r74: etiqueta del audiolibro en el paquete PRINCIPAL cuando el audio va en partes aparte. Dice la duración total
+ * medida, qué trae cada parte y que, al restaurarlas en este curso, los reproductores aparecen aquí debajo. Sin MP3.
+ */
+export function audiobookDeliveredInPartsLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  const d = facts.audio.delivery;
+  if (!d) shellFail('audiobookDeliveredInPartsLabel sin entrega por partes');
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const partRows = d.parts.map((p) => {
+    const mods = p.segments
+      .map((sg) => `Módulo ${sg.moduleNumber} (${chapterRange(sg.chapterNumbers)})`)
+      .join(' · ');
+    return numRow(h, `<strong>${labelHtml(`Parte ${p.partNumber} de ${d.totalFiles}`)}</strong><br><span style="color:${s.fg2}">${labelHtml(`${mods} · dura ${formatDurationEs(p.seconds)}`)}</span>`, s);
+  });
+  const items = facts.audio.audiobookParts.map((p) => {
+    const ch = facts.chapters.find((c) => c.id === p.chapterId);
+    if (!ch) shellFail(`parte del audiolibro sin capítulo (${p.chapterId})`);
+    return numRow(h, `<strong>${inlineHtml(ch.title)}</strong><br><span style="color:${s.fg2}">${labelHtml(`Dura ${formatDurationEs(p.seconds)}`)}</span>`, s, String(ch.number));
+  });
+  const inner =
+    eyebrow(h, 'Escucha', s) +
+    heading(h, 'h3', AUDIOBOOK_TITLE, s) +
+    pHtml(h, labelHtml(`La versión narrada de los capítulos. Duración total: ${formatDurationEs(facts.audio.audiobookSeconds)}.`), s, { secondary: true }) +
+    pHtml(h, labelHtml(`Por su extensión, el audiolibro se entrega por módulos en archivos aparte de este curso (las partes ${d.parts[0].partNumber} a ${d.totalFiles} del paquete). Cuando se restauran en este mismo curso, cada módulo aparece justo debajo, con su reproductor.`), s) +
+    rows(h, partRows.join('')) +
+    `<div style="margin:24px 0 0 0">` +
+    eyebrow(h, 'Índice', s) +
+    rows(h, items.join(''), { ordered: true }) +
+    `</div>`;
+  return out('Audiolibro', root(h, 'shell-audiobook', inner), facts);
+}
+
+/** r74: clave estable de un segmento del audiolibro (módulo + primer capítulo) para su enlace duradero. */
+export function audiobookSegmentKey(moduleNumber: number, firstChapterNumber: number): string {
+  return `m${moduleNumber}c${firstChapterNumber}`;
+}
+
+/**
+ * r74: audiolibro EN LÍNEA (un solo .mbz): un reproductor por módulo con la dirección DURADERA de Cursia del MP3
+ * (nunca una URL firmada temporal). La duración de cada tramo y el índice salen de facts (medidos).
+ */
+export function audiobookLinkedLabel(facts: CourseFacts, theme: ResolvedTheme, opts: ShellRenderOptions | undefined, links: Readonly<Record<string, string>>): ShellLabel {
+  const d = facts.audio.delivery;
+  if (!d || d.mode !== 'linked') shellFail('audiobookLinkedLabel sin entrega en línea');
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const blocks = d.parts.flatMap((p) => p.segments).map((sg) => {
+    const key = audiobookSegmentKey(sg.moduleNumber, sg.chapterNumbers[0]);
+    const url = links[key];
+    if (!url || !/^https:\/\/[^\s"<>]+$/.test(url)) shellFail(`audiolibro en línea sin dirección para ${key}`);
+    const mod = facts.modules.find((m) => m.number === sg.moduleNumber);
+    if (!mod) shellFail(`módulo ${sg.moduleNumber} ausente en facts`);
+    const items = sg.chapters.map((x) => {
+      const ch = facts.chapters.find((c) => c.id === x.chapterId);
+      if (!ch) shellFail(`capítulo ${x.chapterId} ausente en facts`);
+      return numRow(h, `<strong>${inlineHtml(ch.title)}</strong><br><span style="color:${s.fg2}">${labelHtml(`Empieza en ${formatDurationEs(x.offsetSeconds)} · dura ${formatDurationEs(x.seconds)}`)}</span>`, s, String(ch.number));
+    });
+    return (
+      `<div style="margin:24px 0 0 0">` +
+      eyebrow(h, `Módulo ${sg.moduleNumber} · ${chapterRange(sg.chapterNumbers)}`, s) +
+      heading(h, 'h4', mod.title, s) +
+      pHtml(h, labelHtml(`Duración: ${formatDurationEs(sg.seconds)}.`), s, { secondary: true }) +
+      audio(h, url, `el audiolibro del módulo ${sg.moduleNumber}`, s, `${AUDIOBOOK_TITLE} · Módulo ${sg.moduleNumber}`) +
+      rows(h, items.join(''), { ordered: true }) +
+      `</div>`
+    );
+  });
+  const inner =
+    eyebrow(h, 'Escucha', s) +
+    heading(h, 'h3', AUDIOBOOK_TITLE, s) +
+    pHtml(h, labelHtml(`La versión narrada de los capítulos, por módulo. Duración total: ${formatDurationEs(facts.audio.audiobookSeconds)}. Se escucha en línea desde Cursia: no hay que instalar nada más.`), s, { secondary: true }) +
+    blocks.join('');
+  return out('Audiolibro', root(h, 'shell-audiobook', inner), facts);
+}
+
+/** r74: etiqueta de un segmento del audiolibro (va en una parte de audio; se restaura en la sección 1 del curso). */
+export function audiobookSegmentLabel(
+  facts: CourseFacts,
+  theme: ResolvedTheme,
+  opts: ShellRenderOptions | undefined,
+  where: { partNumber: number; segmentIndex: number },
+): ShellLabel & { file: string } {
+  const d = facts.audio.delivery;
+  const part = d?.parts.find((p) => p.partNumber === where.partNumber);
+  const sg = part?.segments[where.segmentIndex];
+  if (!d || !part || !sg) shellFail(`segmento del audiolibro inexistente (parte ${where.partNumber}, ${where.segmentIndex})`);
+  const mod = facts.modules.find((m) => m.number === sg.moduleNumber);
+  if (!mod) shellFail(`módulo ${sg.moduleNumber} ausente en facts`);
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const file = audiobookSegmentFile(sg.moduleNumber, sg.chapterNumbers[0], sg.chapterNumbers[sg.chapterNumbers.length - 1]);
+  const what = `Módulo ${sg.moduleNumber} (${chapterRange(sg.chapterNumbers)})`;
+  const items = sg.chapters.map((x) => {
+    const ch = facts.chapters.find((c) => c.id === x.chapterId);
+    if (!ch) shellFail(`capítulo ${x.chapterId} ausente en facts`);
+    return numRow(
+      h,
+      `<strong>${inlineHtml(ch.title)}</strong><br><span style="color:${s.fg2}">${labelHtml(`Empieza en ${formatDurationEs(x.offsetSeconds)} · dura ${formatDurationEs(x.seconds)}`)}</span>`,
+      s,
+      String(ch.number),
+    );
+  });
+  const body =
+    eyebrow(h, `Audiolibro · parte ${part.partNumber} de ${d.totalFiles}`, s) +
+    heading(h, 'h3', mod.title, s) +
+    pHtml(h, labelHtml(`${what}. Duración: ${formatDurationEs(sg.seconds)}.`), s, { secondary: true }) +
+    audio(h, `@@PLUGINFILE@@/${file}`, `el audiolibro del módulo ${sg.moduleNumber}`, s, `${AUDIOBOOK_TITLE} · Módulo ${sg.moduleNumber}`) +
+    `<div style="margin:24px 0 0 0">` +
+    eyebrow(h, 'Índice', s) +
+    rows(h, items.join(''), { ordered: true }) +
+    `</div>`;
+  return { ...out(`🎧 Audiolibro · ${what}`, root(h, 'shell-audiobook-part', body), facts), file };
 }
 
 // ─── Sm.0 Presentación del módulo ───────────────────────────────────────────

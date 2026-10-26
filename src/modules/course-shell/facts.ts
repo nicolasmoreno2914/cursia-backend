@@ -50,6 +50,11 @@ export interface CourseFactsArtifactsInput {
   audioWelcomeSeconds: number;
   /** Una parte por capítulo del Manifest (cualquier orden; se ordena por el Manifest). */
   audiobookParts: Array<{ chapterId: string; seconds: number }>;
+  /**
+   * r74: entrega del audiolibro en archivos APARTE (paquete principal + partes). Cada parte lista sus segmentos (capítulos
+   * consecutivos de UN módulo, en el orden del curso). Ausente = audiolibro embebido en el paquete (facts de siempre).
+   */
+  audiobookDelivery?: { mode: 'parts' | 'linked'; parts: Array<{ partNumber: number; segments: Array<{ chapterIds: string[] }> }> } | null;
   /** Diapositivas medidas (pdfPageCount) por chapterId; obligatorio para TODOS los capítulos. */
   slideCountByChapter: Record<string, number>;
   /**
@@ -261,6 +266,8 @@ export interface CourseFacts {
     welcomeSeconds: number;
     audiobookSeconds: number;
     audiobookParts: Array<{ chapterId: string; chapterNumber: number; seconds: number; offsetSeconds: number }>;
+    /** r74: audiolibro entregado en partes aparte del paquete principal (ausente = embebido, como siempre). */
+    delivery?: AudiobookDeliveryFacts;
   };
   libro: { wordCount: number; hasBibliography: boolean };
   /** `source` = etiqueta de origen (solo horas del documento de la institución); null = redacción neutra. */
@@ -280,6 +287,24 @@ export interface CourseFacts {
   hoursReport?: HoursReport;
   /** r58 (I3): la «Guía del docente» muestra el desglose del registro (solo si la configuración lo pide). */
   hoursBreakdownInTeacherGuide?: true;
+}
+
+/** r74: audiolibro entregado por partes (paquete principal = archivo 1; las partes de audio = archivos 2..totalFiles). */
+export interface AudiobookDeliveryFacts {
+  /** parts = partes .mbz aparte (autocontenido); linked = en línea desde Cursia (un solo .mbz, dirección duradera). */
+  mode: 'parts' | 'linked';
+  totalFiles: number;
+  parts: Array<{
+    partNumber: number;
+    seconds: number;
+    segments: Array<{
+      moduleId: string;
+      moduleNumber: number;
+      chapterNumbers: number[];
+      seconds: number;
+      chapters: Array<{ chapterId: string; chapterNumber: number; seconds: number; offsetSeconds: number }>;
+    }>;
+  }>;
 }
 
 function fail(msg: string): never {
@@ -528,6 +553,43 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
     return part;
   });
 
+  // r74: audiolibro por partes — cada capítulo de contenido en exactamente un segmento, en orden, sin cruzar módulos.
+  let delivery: AudiobookDeliveryFacts | undefined;
+  if (artifacts.audiobookDelivery) {
+    const dparts = Array.isArray(artifacts.audiobookDelivery.parts) ? artifacts.audiobookDelivery.parts : fail('audiobookDelivery.parts debe ser una lista');
+    if (!dparts.length) fail('audiobookDelivery sin partes');
+    const order = audiobookParts.map((p) => p.chapterId);
+    const partById = new Map(audiobookParts.map((p) => [p.chapterId, p]));
+    let cursor = 0;
+    const dmode = artifacts.audiobookDelivery.mode === 'linked' ? 'linked' : artifacts.audiobookDelivery.mode === 'parts' ? 'parts' : fail('audiobookDelivery.mode debe ser parts o linked');
+    delivery = {
+      mode: dmode,
+      totalFiles: dmode === 'linked' ? 1 : dparts.length + 1,
+      parts: dparts.map((dp, pi) => {
+        if (dp?.partNumber !== pi + 2) fail(`audiobookDelivery: la parte ${pi} debe ser la número ${pi + 2} (fue ${JSON.stringify(dp?.partNumber)})`);
+        const segs = Array.isArray(dp.segments) && dp.segments.length ? dp.segments : fail(`audiobookDelivery: la parte ${dp.partNumber} no tiene segmentos`);
+        const segments = segs.map((sg) => {
+          const ids = Array.isArray(sg?.chapterIds) && sg.chapterIds.length ? sg.chapterIds : fail(`audiobookDelivery: segmento vacío en la parte ${dp.partNumber}`);
+          let off = 0;
+          const chs = ids.map((id) => {
+            if (order[cursor] !== id) fail(`audiobookDelivery: el capítulo ${id} no sigue el orden del curso`);
+            cursor++;
+            const ap = partById.get(id) as { chapterId: string; chapterNumber: number; seconds: number };
+            const x = { chapterId: id, chapterNumber: ap.chapterNumber, seconds: ap.seconds, offsetSeconds: off };
+            off += ap.seconds;
+            return x;
+          });
+          const mods = new Set(chs.map((x) => chapters.find((c) => c.id === x.chapterId)?.moduleId));
+          if (mods.size !== 1) fail(`audiobookDelivery: un segmento de la parte ${dp.partNumber} mezcla módulos`);
+          const first = chapters.find((c) => c.id === chs[0].chapterId) as ChapterFacts;
+          return { moduleId: first.moduleId, moduleNumber: first.moduleNumber, chapterNumbers: chs.map((x) => x.chapterNumber), seconds: off, chapters: chs };
+        });
+        return { partNumber: dp.partNumber, seconds: segments.reduce((s, x) => s + x.seconds, 0), segments };
+      }),
+    };
+    if (cursor !== order.length) fail(`audiobookDelivery cubre ${cursor} de ${order.length} capítulos con audiolibro`);
+  }
+
   const libroWordCount = posInt(artifacts.libroWordCount, 'libroWordCount');
   // Motor de carga horaria: el tiempo de cada capítulo y del curso sale del modelo único (study-time) con las
   // MEDIDAS del paquete; lo no medido (preguntas de la actividad, tarjetas, textos del marco) usa el planificado.
@@ -657,7 +719,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
       }),
       ...(appDelivery ? { application: appDelivery } : {}),
     },
-    audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts },
+    audio: { welcomeSeconds, audiobookSeconds: offset, audiobookParts, ...(delivery ? { delivery } : {}) },
     libro: { wordCount: libroWordCount, hasBibliography: artifacts.libroHasBibliography !== false },
     hours,
     ...(studyTime ? { studyTime } : {}),
@@ -760,6 +822,19 @@ export function factsNumberSet(facts: CourseFacts): Set<number> {
   for (const p of facts.audio.audiobookParts) {
     addDuration(p.seconds);
     addDuration(p.offsetSeconds);
+  }
+  // r74: partes del audiolibro (número de archivo, total de archivos, duraciones y marcas por segmento).
+  const dl = facts.audio.delivery;
+  if (dl) {
+    add(dl.totalFiles);
+    for (const p of dl.parts) {
+      add(p.partNumber);
+      addDuration(p.seconds);
+      for (const sg of p.segments) {
+        addDuration(sg.seconds);
+        for (const x of sg.chapters) addDuration(x.offsetSeconds);
+      }
+    }
   }
   return s;
 }

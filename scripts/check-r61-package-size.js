@@ -130,13 +130,19 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
   };
   const clean = { STORAGE_MAX_UPLOAD_BYTES: undefined, PACKAGE_MBZ_MAX_BYTES: undefined, PACKAGE_MBZ_WARN_BYTES: undefined };
 
-  await check('P5 assertPackageSizeFits: 409 accionable con el alto sobre el límite; v1/v2 null; config inválida 409', async () => {
+  // r74: el bloqueo ya no mira solo el TOTAL (un curso que no cabe en un archivo se entrega con el audiolibro aparte);
+  // solo bloquea si NINGUNA entrega es posible (p. ej. el principal sin audio no cabe en el almacenamiento).
+  await check('P5 assertPackageSizeFits (r74): sobre el total → entrega con el audiolibro aparte (sin 409); 409 accionable solo sin entrega posible; v1/v2 null; config inválida 409', async () => {
     await withEnv(clean, async () => {
+      const m = await svc.assertPackageSizeFits(v3(12), REAL);
+      eq([m.verdict, m.delivery && m.delivery.mode, m.delivery && m.delivery.verdict], ['ok', 'audio_apart', 'ok'], 'M con 50 MiB: audiolibro aparte, sin bloqueo');
       let body = null;
-      try { await svc.assertPackageSizeFits(v3(12), REAL); } catch (e) { body = e.getResponse ? e.getResponse() : null; eq(e.getStatus(), 409, 'status'); }
-      assert(body, 'debía rechazar M con 50 MB');
+      await withEnv({ STORAGE_MAX_UPLOAD_BYTES: String(20 * MB) }, async () => {
+        try { await svc.assertPackageSizeFits(v3(12), REAL); } catch (e) { body = e.getResponse ? e.getResponse() : null; eq(e.getStatus(), 409, 'status'); }
+      });
+      assert(body, 'debía rechazar M con 20 MiB (el principal sin audio no cabe)');
       eq(body.code, 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'código');
-      for (const needle of ['No se generó nada', 'STORAGE_MAX_UPLOAD_BYTES', 'Upload file size limit', 'plan Pro', 'audiolibro', '50.0 MB', 'Opciones', 'EXACTO', 'menos capítulos']) {
+      for (const needle of ['No se generó nada', 'ni con el audiolibro aparte', 'main_over_storage', 'menos capítulos', '20.0 MB']) {
         assert(body.message.includes(needle), `mensaje sin «${needle}»: ${body.message}`);
       }
       eq(body.packageSize.verdict, 'over', 'proyección en el cuerpo');
@@ -147,9 +153,8 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
     await withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: '200000000' }, async () => {
       const p = await svc.assertPackageSizeFits(v3(12), REAL);
       eq([p.verdict, p.limitBytes], ['ok', 200000000], 'M en staging cabe');
-      let body = null;
-      try { await svc.assertPackageSizeFits(v3(20), REAL); } catch (e) { body = e.getResponse(); }
-      eq(body && body.code, 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'L en staging (200.000.000 B): el alto no cabe → 409');
+      const l = await svc.assertPackageSizeFits(v3(20), REAL);
+      eq([l.verdict, l.delivery.mode], ['ok', 'audio_apart'], 'L en staging (200.000.000 B): no cabe en un archivo → audiolibro aparte, sin 409');
     });
     await withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: 'mucho' }, async () => {
       let body = null;
@@ -222,8 +227,13 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
   const codeOf = async (p) => { try { await p; return 'NO_THROW'; } catch (e) { return (e.getResponse && e.getResponse().code) || e.message; } };
   const frozenReal = { videoMode: 'mock', providerModes: { presentation: 'real', audio: 'real' } };
 
-  await check('P9 in-process: retomar el run activo nunca se bloquea; reabrir sobre el límite → 409 (tras PROVIDER_MODES_CONFLICT, antes del gasto); run nuevo → 409 antes del presupuesto', async () => {
+  await check('P9 in-process: retomar el run activo nunca se bloquea; reabrir sin entrega posible → 409 (tras PROVIDER_MODES_CONFLICT, antes del gasto); run nuevo → 409 antes del presupuesto; r74: sobre el total SIN bloqueo', async () => {
     await withEnv(clean, async () => {
+      // r74: M real con 50 MiB ya no se bloquea (audiolibro aparte): reabrir y run nuevo siguen al gasto.
+      eq(await codeOf(call(stubbed({ latest: { id: 'r-old', worker_status: 'failed', input_payload: frozenReal } }))), REACHED, 'r74: reabrir sobre el total, entregable aparte');
+      eq(await codeOf(call(stubbed())), REACHED, 'r74: run nuevo sobre el total, entregable aparte');
+    });
+    await withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: String(20 * MB) }, async () => {
       // Retomar: un M real con 50 MiB (proyección bloqueada) se devuelve igual.
       eq(await call(stubbed({ active: { id: 'act', worker_status: 'running', input_payload: frozenReal } })), { resumed: 'act' }, 'retomar activo');
       // Reabrir un run fallido de M real con 50 MiB → 409 de tamaño, sin llegar a ningún gate de gasto.
@@ -233,9 +243,9 @@ const MOCK = { presentation: 'mock', audio: 'mock' };
       eq(await codeOf(call(stubbed({ latest: failed }), { presentation: 'mock', audio: 'real' })), 'provider_modes_conflict', 'conflicto de modos primero');
       // Run nuevo (sin runs previos) → 409 antes de finopsStartGate.
       eq(await codeOf(call(stubbed())), 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'run nuevo sobre el límite');
-      // Reabrir con palabras medidas cortas (400 por capítulo ≈ 2,6 min) → cabe → sigue al gate de video.
+      // Palabras medidas cortas no cambian el veredicto: lo que no cabe es el principal SIN audio (capacidad real).
       const words = items12.filter((i) => i.type === 'audiobook_chapter').map((i) => ({ chapter_id: i.chapterId, words: '400' }));
-      eq(await codeOf(call(stubbed({ latest: failed, words }))), REACHED, 'reabrir con palabras medidas que caben');
+      eq(await codeOf(call(stubbed({ latest: failed, words }))), 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT', 'reabrir sin entrega posible (principal > almacenamiento)');
     });
     await withEnv({ ...clean, STORAGE_MAX_UPLOAD_BYTES: '200000000' }, async () => {
       eq(await codeOf(call(stubbed())), REACHED, 'run nuevo M con el límite de staging → sigue al presupuesto');

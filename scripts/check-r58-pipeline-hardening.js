@@ -83,7 +83,7 @@ const PROD_REF = loadDist('modules/dynamic-generation/dynamic-video-delivery.js'
 async function pureChecks() {
   console.log('\n=== R1: tipos del servidor + reuse verificado ===');
   await check('R1 política: tipos solo del servidor (dynamic_mbz, Gamma, TTS, segmentos, video, coherencia); los del ejecutor y legacy no', () => {
-    eq([...POL.SERVER_ONLY_ARTIFACT_TYPES].sort(), ['dynamic_audio_mp3', 'dynamic_audio_segment', 'dynamic_coherence_report_json', 'dynamic_mbz', 'dynamic_presentation', 'dynamic_video'], 'lista');
+    eq([...POL.SERVER_ONLY_ARTIFACT_TYPES].sort(), ['dynamic_audio_mp3', 'dynamic_audio_segment', 'dynamic_coherence_report_json', 'dynamic_mbz', 'dynamic_mbz_part', 'dynamic_media_audio', 'dynamic_presentation', 'dynamic_video'], 'lista (r74: partes del paquete y audio en línea)');
     for (const t of ['dynamic_content_md', 'dynamic_exam_bank_json', 'dynamic_scorm_html', 'dynamic_video_interactions_json', 'mbz_final', 'content_snapshot', '', null, 3]) {
       eq(POL.isServerOnlyArtifactType(t), false, String(t));
     }
