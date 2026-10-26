@@ -364,6 +364,17 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     id: 'spend_control_denied', codes: ['finops_kill_switch', 'provider_not_allowed', 'unattributed_ceiling_reached', 'item_run_not_found'],
     class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
   },
+  // r75 (02 §E.5): presupuesto por usuario del iniciador. Nada se reservó ni se llamó (0 gasto). No se reintenta sola:
+  // hace falta que el SuperAdmin apruebe presupuesto («Solicitar autorización»); aprobar NO relanza nada (D-21).
+  {
+    id: 'user_budget_denied', codes: ['user_budget_insufficient', 'user_budget_not_assigned'],
+    class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'budget', adminAction: 'approve_budget',
+  },
+  // r75: cuenta o generaciones suspendidas / congelación de plataforma / cuenta sin acceso. 0 gasto; decisión de operación.
+  {
+    id: 'generation_access_denied', codes: ['generation_suspended', 'platform_generation_frozen', 'account_suspended', 'account_not_authorized'],
+    class: 'D', strategy: 'hold_for_human', scope: 'run', rounds: 0, humanReason: 'config', adminAction: 'retry_item',
+  },
 
   // ── Validación (B: regenerar solo el componente) ───────────────────────────
   { id: 'v3_payload_invalid', codes: ['v3_payload_invalid'], class: 'B', strategy: 'regenerate_targeted', rounds: 2 },
