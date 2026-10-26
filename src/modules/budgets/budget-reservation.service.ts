@@ -107,6 +107,11 @@ export class BudgetReservationService implements UserBudgetGate, OnModuleInit, O
     return active.account ? { code: 'account_suspended', status: 403, message: 'Tu cuenta está suspendida: no se hacen llamadas nuevas.' } : null;
   }
 
+  async availability(runner: Runner, payerUserId: string, excludeRunId: string | null = null): Promise<{ month: string; available: string; assigned: boolean }> {
+    const now = await this.read.availableNow(String(payerUserId), runner, excludeRunId);
+    return { month: now.month, available: now.available, assigned: now.assigned };
+  }
+
   mode(): UserBudgetsMode {
     return userBudgetsMode();
   }

@@ -73,6 +73,12 @@ export interface UserBudgetGate {
    * de A (producción hoy) no hay filas: no cambia nada.
    */
   assertMayStart(runner: Runner, payerUserId: string): Promise<void>;
+  /** Reanudar / reintentar un run existente: los controles de A sobre quien PAGA el run (D-20), no sobre quien hace clic. */
+  assertPayerMaySpend(runner: Runner, runId: string): Promise<void>;
+  /** Reabrir un run terminal vuelve a retener max(autorizado − gastado, 0) del iniciador: tiene que entrar (D-20). */
+  assertRunReopenFits(runner: Runner, runId: string): Promise<void>;
+  /** Disponible del mes (sin un run) para la vista previa del estimado (`userBudget`). Sin caché, solo lectura. */
+  availability(runner: Runner, payerUserId: string, excludeRunId?: string | null): Promise<{ month: string; available: string; assigned: boolean }>;
   /** Pasos 2–3: MONTH_CAP_LOCK y luego el lock del usuario, dentro de la tx del caller (antes de escribir la autorización). */
   lockForRun(runner: Runner, payerUserId: string): Promise<void>;
   /** Pasos 5–8: disponible recalculado en la tx (sin caché), rechazo 409 o reserva + startedBy. */
