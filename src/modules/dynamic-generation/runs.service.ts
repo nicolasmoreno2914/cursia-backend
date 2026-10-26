@@ -147,6 +147,8 @@ import { assertAssessmentProfileResolvableForRun } from '../course-profiles/asse
 import { randomUUID } from 'crypto';
 import { PACKAGE_SIZE_PROJECTED_OVER_LIMIT, PackageSizeProjection, projectPackageSize } from '../../package/v3/package-size-projection';
 import { PACKAGE_SIZE_CONFIG_INVALID, packageSizeLimitsFromEnv } from '../../package/v3/package-size-budget';
+import { deliveryLimitsFromEnv } from '../../package/v3/delivery-plan';
+import { publicMediaBaseUrl } from '../course-media/course-media.service';
 import {
   VIDEO_MODE_INCONSISTENT,
   VIDEO_UPGRADE_CASCADE_REASON,
@@ -6331,7 +6333,26 @@ export class RunsService {
       throw new ConflictException({ code: PACKAGE_SIZE_CONFIG_INVALID, message: `${message} — corrige la variable del backend; no se generó nada.` });
     }
     const chapterWords = runId ? await this.audiobookChapterWords(runId, manifest.manifest.items as RunManifestItem[]) : null;
-    const projection = projectPackageSize(manifest.manifest.items, modes, limits, { chapterWords });
+    // r74: el bloqueo ya no mira solo el TOTAL: con el plan de entrega (un archivo, o audiolibro aparte) solo se bloquea si
+    // ninguna entrega es posible con la capacidad real (almacenamiento por archivo, tamaño de parte, máximo de partes).
+    let delivery;
+    try {
+      delivery = deliveryLimitsFromEnv(limits.maxBytes as number);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new ConflictException({ code: PACKAGE_SIZE_CONFIG_INVALID, message: `${message} — corrige la variable del backend; no se generó nada.` });
+    }
+    const moduleOfChapter: Record<string, string> = {};
+    for (const m of ((manifest.manifest as { modules?: Array<{ moduleId: string; chapters?: Array<{ chapterId: string }> }> }).modules ?? [])) {
+      for (const c of m.chapters ?? []) moduleOfChapter[c.chapterId] = m.moduleId;
+    }
+    const projection = projectPackageSize(manifest.manifest.items, modes, limits, { chapterWords, delivery, moduleOfChapter });
+    // r74: ¿el backend puede servir el audiolibro en línea (dirección duradera)? Si no, la entrega aparte es por partes.
+    if (projection.delivery) {
+      let linkedAvailable = false;
+      try { linkedAvailable = publicMediaBaseUrl() !== null; } catch { linkedAvailable = false; }
+      projection.delivery = { ...projection.delivery, linkedAvailable };
+    }
     if (projection.verdict === 'over') {
       throw new ConflictException({ code: PACKAGE_SIZE_PROJECTED_OVER_LIMIT, message: projection.error, packageSize: projection });
     }

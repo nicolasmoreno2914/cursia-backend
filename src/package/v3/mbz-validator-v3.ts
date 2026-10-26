@@ -129,6 +129,8 @@ export interface MbzV3ValidationExpectations {
    * los bytes (formato del backup, API H5P de cada h5p.json, tokens de 4.4+) y falla si lo supera. Ausente = no aplica.
    */
   moodleMinimum?: string;
+  /** r74: audiolibro en línea — clave del segmento → URL duradera que el label debe usar (del builder). */
+  audiobookLinks?: Record<string, string>;
 }
 
 /** true si `v` (x.y.z) ≥ `min`. Una versión ausente o mal formada → false. */
@@ -1425,9 +1427,39 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     for (const s of [formatDurationEs(measured), ...extra(txt)]) if (!txt.includes(s)) add('AUDIO_DURATION', idnumber, `no muestra la duración medida "${s}"`);
   };
   await audioCheck('cv3:shell:audio_welcome', facts.audio.welcomeSeconds, () => []);
-  await audioCheck('cv3:shell:audiobook', facts.audio.audiobookSeconds, () =>
-    facts.audio.audiobookParts.flatMap((p) => [formatDurationEs(p.seconds), formatDurationEs(p.offsetSeconds)]),
-  );
+  const dl = facts.audio.delivery;
+  if (!dl) {
+    await audioCheck('cv3:shell:audiobook', facts.audio.audiobookSeconds, () =>
+      facts.audio.audiobookParts.flatMap((p) => [formatDurationEs(p.seconds), formatDurationEs(p.offsetSeconds)]),
+    );
+  } else {
+    // r74: audiolibro fuera del principal — el label existe, NO lleva MP3 (ningún MP3 de audiolibro en el paquete) y dice
+    // la duración total medida; en línea, un reproductor por segmento con su dirección duradera exacta; en partes, cada parte.
+    const a = acts.find((x) => x.idnumber === 'cv3:shell:audiobook');
+    if (!a) add('AUDIO_DURATION', 'cv3:shell:audiobook', 'falta el label del audiolibro');
+    else {
+      const own = files.filter((x) => x.ctx === a.ctx && x.filename !== '.');
+      if (own.length) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', `el audiolibro entregado aparte no debe llevar archivos en el principal (${own.map((f) => f.filename).join(', ')})`);
+      const stray = files.filter((x) => /^audiolibro/i.test(x.filename));
+      if (stray.length) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', `MP3 de audiolibro dentro del principal: ${stray.map((f) => f.filename).join(', ')}`);
+      const txt = extractText(a.intro);
+      if (!txt.includes(formatDurationEs(facts.audio.audiobookSeconds))) add('AUDIO_DURATION', 'cv3:shell:audiobook', `no muestra la duración total medida "${formatDurationEs(facts.audio.audiobookSeconds)}"`);
+      const segs = dl.parts.flatMap((p) => p.segments);
+      if (dl.mode === 'linked') {
+        const srcs = Array.from(a.intro.matchAll(/<audio\b[^>]*\ssrc="([^"]+)"/g), (m) => m[1].replace(/&amp;/g, '&'));
+        const want = segs.map((sg) => exp.audiobookLinks?.[`m${sg.moduleNumber}c${sg.chapterNumbers[0]}`]);
+        if (want.some((u) => !u)) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', 'faltan las direcciones esperadas del audiolibro en línea');
+        else if (JSON.stringify(srcs) !== JSON.stringify(want)) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', `reproductores ${JSON.stringify(srcs)} ≠ direcciones esperadas ${JSON.stringify(want)}`);
+        for (const u of srcs) if (!/^https:\/\/[^\s"<>]+\/media\/[^\s"<>]+\.mp3$/.test(u) || /[?&](token|X-Amz|Signature|Expires)=/i.test(u)) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', `dirección no duradera o con firma temporal: ${u}`);
+        for (const sg of segs) if (!txt.includes(formatDurationEs(sg.seconds))) add('AUDIO_DURATION', 'cv3:shell:audiobook', `no muestra la duración del módulo ${sg.moduleNumber} "${formatDurationEs(sg.seconds)}"`);
+      } else {
+        if (/<audio\b/.test(a.intro)) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', 'el label del principal no debe tener reproductor (el audio llega con las partes)');
+        for (const p of dl.parts) if (!txt.includes(`Parte ${p.partNumber} de ${dl.totalFiles}`)) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', `no nombra la parte ${p.partNumber} de ${dl.totalFiles}`);
+        const s1 = acts.filter((x) => x.sectionid === 1);
+        if (s1[s1.length - 1] !== a) add('AUDIO_DELIVERY', 'cv3:shell:audiobook', 'con partes, el label del audiolibro debe ser lo último de la sección 1');
+      }
+    }
+  }
 
   // ── Libro Guía ──
   const libro = acts.find((a) => a.idnumber === 'cv3:shell:libro');

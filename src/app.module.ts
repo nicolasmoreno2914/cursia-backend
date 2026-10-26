@@ -14,6 +14,7 @@ import { VideoEngineModule } from './video-engine/video-engine.module';
 import { TtsModule } from './tts/tts.module';
 import { ProductionJobsModule } from './modules/production-jobs/production-jobs.module';
 import { ArtifactsModule } from './modules/artifacts/artifacts.module';
+import { CourseMediaModule } from './modules/course-media/course-media.module';
 import { ContentGenerationModule } from './modules/content-generation/content-generation.module';
 import { PackageModule } from './package/package.module';
 import { InstitutionsModule } from './modules/institutions/institutions.module';
@@ -47,6 +48,7 @@ import { FinopsModule } from './modules/finops/finops.module';
     CourseVersionsModule,
     ProductionJobsModule,
     ArtifactsModule,
+    CourseMediaModule,
     ContentGenerationModule,
     YoutubeModule,
     EventsModule,

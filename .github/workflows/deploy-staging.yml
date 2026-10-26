@@ -622,6 +622,11 @@ jobs:
                ensure_env_exact STORAGE_MAX_UPLOAD_BYTES 300000000
                # r61: el tope propio del .mbz debe ser <= STORAGE_MAX_UPLOAD_BYTES (si no, PACKAGE_SIZE_CONFIG_INVALID); se alinea al mismo valor.
                ensure_env_exact PACKAGE_MBZ_MAX_BYTES 300000000
+               # r74: cursos de cualquier tamaño. Dirección pública DURADERA de los medios del curso (audiolibro en línea de los
+               # cursos que no caben en un archivo): /api/v1/media/... responde 302 a una URL firmada nueva. Sin esta variable
+               # la entrega de un curso grande es solo autocontenida (principal + partes). Tamaño máximo de cada archivo
+               # entregado = default del código (min(200 MiB, STORAGE_MAX_UPLOAD_BYTES)).
+               ensure_env_exact PUBLIC_MEDIA_BASE_URL https://api-staging.cursia.nomaddi.com
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
 

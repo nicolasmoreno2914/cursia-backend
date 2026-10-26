@@ -76,7 +76,7 @@ import {
   videoInlineIntroHtml,
   videoPackageFilename,
 } from './h5p';
-import { assembleAudiobook, mp3DurationSeconds } from './audio';
+import { assembleAudiobook, concatMp3, mp3DurationSeconds } from './audio';
 import { pdfPageCount, presentationCardHtml } from './presentation';
 import type { GenerationManifestV1 } from '../modules/generation-manifests/generation-manifest-builder';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
@@ -104,6 +104,9 @@ import {
   assertValidModuleIntroV3,
   audioWelcomeLabel,
   audiobookLabel,
+  audiobookSegmentFile,
+  audiobookSegmentKey,
+  audiobookSegmentLabel,
   buildCourseFacts,
   CertificateRequirements,
   certificateTeacherLabel,
@@ -380,6 +383,45 @@ export interface BuildDynamicMbzV3Input {
    * «Referencias» del Libro Guía, tal cual. Ausente/vacía → sin esa subsección (nunca se inventa una referencia).
    */
   libroReferences?: ReadonlyArray<string> | null;
+  /**
+   * r74: entrega del audiolibro FUERA del .mbz principal (cursos que no caben en un archivo). Ausente → audiolibro embebido
+   * (bytes de siempre).
+   *  - `linked`: un solo .mbz; un reproductor por segmento (módulo) con la dirección DURADERA de Cursia (`links`, clave
+   *    `audiobookSegmentKey`); el MP3 de cada segmento lo sube el worker como `dynamic_media_audio`.
+   *  - `parts`: autocontenido; el principal sin MP3 + partes .mbz (sección 1, un label por segmento) que se restauran en el
+   *    MISMO curso («Combinar con este curso»). `result.audiobookParts` las arma de a una.
+   * `parts` es el plan de `planAudioParts` (capítulos por segmento, consecutivos y de un módulo).
+   */
+  audiobookDelivery?: AudiobookDeliveryInputV3 | null;
+}
+
+/** r74: plan de entrega del audiolibro (ver `BuildDynamicMbzV3Input.audiobookDelivery`). */
+export interface AudiobookDeliveryInputV3 {
+  mode: 'linked' | 'parts';
+  parts: Array<{ partNumber: number; segments: Array<{ chapterIds: string[] }> }>;
+  /** Solo `linked`: clave del segmento (`audiobookSegmentKey`) → URL https duradera. */
+  links?: Record<string, string>;
+}
+
+/** r74: reloj fijo de las partes de audio (bytes determinísticos → un reintento reutiliza las partes ya subidas). */
+export const MBZ_V3_AUDIO_PART_TS = Math.floor(MBZ_V3_ZIP_FIXED_DATE.getTime() / 1000);
+
+/** r74: una parte de audio del paquete autocontenido (se arma bajo demanda, de a una). */
+export interface MbzV3AudiobookPart {
+  partNumber: number;
+  totalFiles: number;
+  filename: string;
+  segments: Array<{ moduleNumber: number; chapterNumbers: number[]; seconds: number; file: string; idnumber: string }>;
+  build: () => Promise<{ mbz: Buffer; expect: AudiobookPartExpectations }>;
+}
+
+/** r74: lo que el validador de partes exige de los bytes de una parte. */
+export interface AudiobookPartExpectations {
+  partNumber: number;
+  totalFiles: number;
+  courseTitle: string;
+  section1Title: string;
+  labels: Array<{ idnumber: string; file: string; seconds: number; sha1: string; bytes: number }>;
 }
 
 /** EV6 DoD: sufijo del nombre del curso de un paquete de QA. */
@@ -422,13 +464,21 @@ export interface MbzV3Expectations {
   internalVocabularyKeptTexts?: string[];
   /** r60: Moodle mínimo que el paquete declara (el validador lo recalcula desde los bytes y exige que alcance). */
   moodleMinimum?: string;
+  /** r74: audiolibro en línea — direcciones duraderas por segmento (las exige el validador). */
+  audiobookLinks?: Record<string, string>;
 }
 
 export interface BuildDynamicMbzV3Result {
   mbz: Buffer;
+  /** r74: solo con `audiobookDelivery.mode = parts` — las partes de audio, en orden (2..N). */
+  audiobookParts?: MbzV3AudiobookPart[];
+  /** r74: segmentos del audiolibro con su audio (solo con `audiobookDelivery`): el worker sube estos MP3 (`linked`). */
+  audiobookSegments?: Array<{ key: string; moduleNumber: number; chapterNumbers: number[]; seconds: number; file: string; mp3: () => Buffer }>;
   expectations: MbzV3Expectations;
   summary: {
     builderVersion: string;
+    /** r74: el audiolibro va fuera del .mbz principal (en línea o en partes). Ausente = embebido. */
+    audiobookDelivery?: { mode: 'linked' | 'parts'; totalFiles: number; segments: number };
     /** Formato del backup (moodle_release): versión mínima para restaurar. */
     moodleVersion: string;
     /** r60: Moodle mínimo en el que el curso funciona completo (H5P instalable y enlaces resueltos). */
@@ -1112,6 +1162,8 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     { manifests: c.audiobookManifests ?? null },
   );
   if (audiobook.floor) warnings.push(...audiobook.floor.warnings);
+  const delivery = input.audiobookDelivery ?? null;
+  if (delivery && delivery.mode !== 'linked' && delivery.mode !== 'parts') throw new Error(`MBZ_V3_INVALID: audiobookDelivery.mode ${String((delivery as { mode?: unknown }).mode)}`);
   // EV6 P2-B3: con banco, las «preguntas del examen» que ve el estudiante son los SLOTS (no el banco).
   const examQuestionCountByModule: Record<string, number> = {};
   const examBankSizeByModule: Record<string, number> = {};
@@ -1235,6 +1287,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     artifacts: {
       audioWelcomeSeconds,
       audiobookParts: audiobook.parts.map((p) => ({ chapterId: p.chapterId, seconds: p.durationSeconds })),
+      ...(delivery ? { audiobookDelivery: { mode: delivery.mode, parts: delivery.parts.map((p) => ({ partNumber: p.partNumber, segments: p.segments.map((sg) => ({ chapterIds: [...sg.chapterIds] })) })) } } : {}),
       slideCountByChapter,
       examQuestionCountByModule,
       ...(finalExamQuestionCount !== undefined ? { finalExamQuestionCount } : {}),
@@ -1695,10 +1748,17 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
   }
-  addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts), [
-    { name: SHELL_AUDIOBOOK_FILE, data: audiobook.buffer, mime: 'audio/mp3' },
-  ]);
+  // r74: con el audiolibro en línea, el label no lleva MP3 (reproductores con la dirección duradera); con partes
+  // autocontenidas, va AL FINAL de la sección 1 sin MP3, así las etiquetas de las partes restauradas quedan justo debajo.
+  if (!delivery) {
+    addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts), [
+      { name: SHELL_AUDIOBOOK_FILE, data: audiobook.buffer, mime: 'audio/mp3' },
+    ]);
+  } else if (delivery.mode === 'linked') {
+    addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts, delivery.links ?? {}));
+  }
   addLabel(1, 'cv3:shell:route_start', routeStartLabel(firstChapterSection as number, facts, theme, opts));
+  if (delivery?.mode === 'parts') addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts));
 
   // ── EV6: una sección por capítulo (+ una por evaluación de módulo) ──────
   const chapterSlots = new Map(assembled.map((x) => [x.chapterNumber, x.slots]));
@@ -2198,9 +2258,43 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   for (const n of W.deadLinksUnwrapped.values()) deadLinks += n;
   if (deadLinks) warnings.push(`dead_link_unwrapped:${deadLinks}`);
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
+  // r74: segmentos del audiolibro (audio = concatenación de los MP3 de sus capítulos, la MISMA en línea y en partes).
+  const section1 = plan.sections.find((x) => x.sectionNum === 1);
+  if (delivery && !section1) throw new Error('MBZ_V3_INVARIANT: el curso no tiene sección 1 para el audiolibro');
+  const segmentsOut = delivery && facts.audio.delivery
+    ? facts.audio.delivery.parts.flatMap((p) => p.segments.map((sg, si) => ({
+      partNumber: p.partNumber, segmentIndex: si,
+      key: audiobookSegmentKey(sg.moduleNumber, sg.chapterNumbers[0]),
+      moduleNumber: sg.moduleNumber, chapterNumbers: [...sg.chapterNumbers], seconds: sg.seconds,
+      file: audiobookSegmentFile(sg.moduleNumber, sg.chapterNumbers[0], sg.chapterNumbers[sg.chapterNumbers.length - 1]),
+      mp3: () => concatMp3(sg.chapters.map((x) => c.audiobookChapters.get(x.chapterId) as Buffer)),
+    })))
+    : [];
+  const audiobookPartsOut: MbzV3AudiobookPart[] | undefined = delivery?.mode === 'parts' && facts.audio.delivery
+    ? facts.audio.delivery.parts.map((p) => {
+      const segs = segmentsOut.filter((x) => x.partNumber === p.partNumber);
+      const totalFiles = (facts.audio.delivery as { totalFiles: number }).totalFiles;
+      return {
+        partNumber: p.partNumber,
+        totalFiles,
+        filename: `parte-${p.partNumber}-de-${totalFiles}.mbz`,
+        segments: segs.map((x) => ({ moduleNumber: x.moduleNumber, chapterNumbers: x.chapterNumbers, seconds: x.seconds, file: x.file, idnumber: `cv3:audiobook_part:${p.partNumber}:${x.key}` })),
+        build: () => buildAudiobookPartMbzV3({
+          partNumber: p.partNumber, totalFiles, courseTitle, plan, MV,
+          section1Title: safeActivityName((section1 as { title: string }).title, 255),
+          labels: segs.map((x) => {
+            const lbl = audiobookSegmentLabel(facts, theme, opts, { partNumber: p.partNumber, segmentIndex: x.segmentIndex });
+            return { idnumber: `cv3:audiobook_part:${p.partNumber}:${x.key}`, name: lbl.name, html: lbl.html, file: lbl.file, mp3: x.mp3(), seconds: x.seconds };
+          }),
+        }),
+      };
+    })
+    : undefined;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, moodleMinimum: moodleCompatibility.minimumMoodle, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}) },
+    ...(audiobookPartsOut ? { audiobookParts: audiobookPartsOut } : {}),
+    ...(segmentsOut.length ? { audiobookSegments: segmentsOut.map((x) => ({ key: x.key, moduleNumber: x.moduleNumber, chapterNumbers: x.chapterNumbers, seconds: x.seconds, file: x.file, mp3: x.mp3 })) } : {}),
+    expectations: { facts, resolved, h5pProfileVersion, moodleMinimum: moodleCompatibility.minimumMoodle, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}), ...(delivery?.mode === 'linked' ? { audiobookLinks: { ...(delivery.links ?? {}) } } : {}) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,
@@ -2227,6 +2321,8 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
         // T1 (r57): la regla de conjunto del banco de examen (≤ 30 % «la correcta es la más larga») sobre TODOS los videos del paquete.
         ...videoMcLengthBiasWarnings(plan.modules.flatMap((m) => m.chapters.filter((ch) => !!ch.keys.video).map((ch) => c.videoInteractions.get(ch.chapterId)))),
       ],
+      // r74: entrega del audiolibro fuera del .mbz principal (solo si el worker la pidió).
+      ...(facts.audio.delivery ? { audiobookDelivery: { mode: facts.audio.delivery.mode, totalFiles: facts.audio.delivery.totalFiles, segments: segmentsOut.length } } : {}),
       // r19: piso de 25 min del audiolibro (solo si el empaque pasó los manifiestos; no entra al .mbz).
       ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,
@@ -2312,4 +2408,159 @@ export function xmlTextEsc(s: string): string {
 /** Librerías del perfil (para el validador): "Machine major.minor". */
 export function h5pProfileLibraryKeys(): Set<string> {
   return new Set(CURSIA_H5P_PROFILE_V1.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
+}
+
+/**
+ * r74 — parte de AUDIO del paquete autocontenido: copia de curso Moodle con SOLO la sección 1 y un label por segmento del
+ * audiolibro (con su MP3 en el filearea intro). Se restaura DENTRO del curso ya restaurado desde el principal («Combinar la
+ * copia de seguridad con este curso» / CLI `--courseid`): Moodle conserva el nombre de la sección existente y agrega los
+ * labels al final de la sección 1, justo debajo del label «Audiolibro» del principal. Sin notas, sin finalización, sin
+ * enlaces a otras actividades: una parte que falta nunca rompe el curso. Bytes determinísticos (reloj y fechas fijas).
+ */
+export async function buildAudiobookPartMbzV3(input: {
+  partNumber: number;
+  totalFiles: number;
+  courseTitle: string;
+  section1Title: string;
+  plan: PackagingPlanV3;
+  MV: MoodleVersionInfo;
+  labels: Array<{ idnumber: string; name: string; html: string; file: string; mp3: Buffer; seconds: number }>;
+}): Promise<{ mbz: Buffer; expect: AudiobookPartExpectations }> {
+  const ts = MBZ_V3_AUDIO_PART_TS;
+  const { MV } = input;
+  if (!input.labels.length) throw new Error(`MBZ_V3_INVARIANT: la parte ${input.partNumber} no tiene segmentos`);
+  const W = new MbzWriter(ts, MV);
+  const expectLabels: AudiobookPartExpectations['labels'] = [];
+  for (const l of input.labels) {
+    const measured = mp3DurationSeconds(l.mp3);
+    if (Math.abs(measured - l.seconds) > 1e-6) throw new Error(`MBZ_V3_INVARIANT: el MP3 de ${l.idnumber} mide ${measured}s y facts dice ${l.seconds}s`);
+    const a = W.newActivity('label', 1, l.name, l.idnumber);
+    const fid = W.addFile(a.ctx, 'mod_label', 'intro', l.file, l.mp3, 'audio/mp3');
+    W.put(`${a.dir}/label.xml`, labelXmlWithCtx(a.aid, a.mid, a.ctx, l.name, l.html, ts));
+    W.put(`${a.dir}/module.xml`, withIdnumber(moduleXml(a.mid, 'label', 1, ts, MV.bv), l.idnumber));
+    W.put(`${a.dir}/inforef.xml`, inforef([fid]));
+    W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+    W.boilerplate(a.dir);
+    expectLabels.push({ idnumber: l.idnumber, file: l.file, seconds: l.seconds, sha1: sha1Buf(l.mp3), bytes: l.mp3.length });
+  }
+  W.put('sections/section_1/section.xml', sectionXml({ num: 1, name: input.section1Title, summary: '' }, (W.sectionSeq.get(1) ?? []).join(','), ts));
+  W.put('sections/section_1/inforef.xml', inforefXml());
+  W.put('sections/section_1/roles.xml', BOIL.roles);
+  W.put('sections/section_1/filters.xml', BOIL.filters);
+  W.put('sections/section_1/contentbank.xml', BOIL.contentbank);
+  const courseTitle = input.courseTitle;
+  W.put('course/course.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<course id="${MBZ_V3_COURSE_BACKUP_ID}" contextid="${MBZ_V3_COURSE_BACKUP_CONTEXTID}">
+  <shortname>${esc(courseTitle)}</shortname><fullname>${esc(courseTitle)}</fullname>
+  <idnumber></idnumber><summary></summary><summaryformat>1</summaryformat>
+  <format>topics</format><showgrades>1</showgrades><newsitems>5</newsitems>
+  <startdate>${ts}</startdate><enddate>0</enddate><marker>0</marker>
+  <maxbytes>0</maxbytes><legacyfiles>0</legacyfiles><showreports>0</showreports>
+  <visible>1</visible><groupmode>0</groupmode><groupmodeforce>0</groupmodeforce>
+  <defaultgroupingid>0</defaultgroupingid><lang>es</lang><theme></theme>
+  <timecreated>${ts}</timecreated><timemodified>${ts}</timemodified>
+  <requested>0</requested><showactivitydates>1</showactivitydates>
+  <showcompletionconditions>1</showcompletionconditions>
+  <pdfexportfont>${NULL}</pdfexportfont>
+  <enablecompletion>1</enablecompletion><completionnotify>0</completionnotify>
+  <tags></tags><customfields></customfields>
+  <courseformatoptions>
+    <courseformatoption><format>topics</format><sectionid>0</sectionid><name>coursedisplay</name><value>1</value></courseformatoption>
+    <courseformatoption><format>topics</format><sectionid>0</sectionid><name>hiddensections</name><value>1</value></courseformatoption>
+  </courseformatoptions>
+</course>`);
+  W.put('course/inforef.xml', inforefXml());
+  W.put('course/enrolments.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<enrolments>\n  <enrols>\n  </enrols>\n</enrolments>');
+  W.put('course/roles.xml', BOIL.roles);
+  W.put('course/completiondefaults.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<course_completion_defaults>\n</course_completion_defaults>');
+  W.put('course/calendar.xml', BOIL.calendar);
+  W.put('course/competencies.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<course_competencies>\n  <competencies>\n  </competencies>\n  <user_competencies>\n  </user_competencies>\n</course_competencies>');
+  W.put('course/contentbank.xml', BOIL.contentbank);
+  W.put('course/filters.xml', BOIL.filters);
+  W.put('roles.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<roles_definition>\n</roles_definition>');
+  W.put('scales.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<scales_definition>\n</scales_definition>');
+  W.put('outcomes.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<outcomes_definition>\n</outcomes_definition>');
+  W.put('badges.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<badges>\n</badges>');
+  W.put('users.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<users>\n</users>');
+  W.put('grade_history.xml', BOIL.gradeHistory);
+  W.put('groups.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<groups>\n  <groupcustomfields>\n  </groupcustomfields>\n  <groupings>\n    <groupingcustomfields>\n    </groupingcustomfields>\n  </groupings>\n</groups>');
+  W.put('questions.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<question_categories>\n</question_categories>');
+  W.put('completion.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<course_completion>\n</course_completion>');
+  let filesXml = '<?xml version="1.0" encoding="UTF-8"?>\n<files>\n';
+  for (const f of W.files) {
+    filesXml +=
+      `  <file id="${f.id}">\n    <contenthash>${f.hash}</contenthash>\n    <contextid>${f.ctx}</contextid>\n` +
+      `    <component>${f.component}</component>\n    <filearea>${f.filearea}</filearea>\n    <itemid>${f.itemid ?? 0}</itemid>\n` +
+      `    <filepath>/</filepath>\n    <filename>${xmlEsc(f.filename)}</filename>\n    <userid>${NULL}</userid>\n` +
+      `    <filesize>${f.size}</filesize>\n    <mimetype>${f.mime ?? NULL}</mimetype>\n    <status>0</status>\n` +
+      `    <timecreated>${ts}</timecreated>\n    <timemodified>${ts}</timemodified>\n` +
+      `    <source>${NULL}</source>\n    <author>${NULL}</author>\n    <license>${NULL}</license>\n` +
+      `    <sortorder>0</sortorder>\n    <repositorytype>${NULL}</repositorytype>\n    <repositoryid>${NULL}</repositoryid>\n    <reference>${NULL}</reference>\n  </file>\n`;
+  }
+  W.put('files.xml', `${filesXml}</files>`);
+  const setting = (lvl: string, extra: string, n: string, v: string | number) =>
+    `    <setting>\n      <level>${lvl}</level>\n${extra}      <name>${n}</name>\n      <value>${v}</value>\n    </setting>\n`;
+  let sett = '';
+  const name = `cursia-v3-${input.plan.course.id}-parte-${input.partNumber}-de-${input.totalFiles}.mbz`;
+  const rootSettings: Record<string, string> = {
+    filename: name, imscc11: '0', users: '0', anonymize: '0', role_assignments: '0',
+    activities: '1', blocks: '0', files: '1', filters: '1', comments: '0', badges: '0',
+    calendarevents: '0', userscompletion: '0', logs: '0', grade_histories: '0',
+    questionbank: '0', groups: '0', competencies: '0', customfield: '0',
+    contentbankcontent: '0', xapistate: '0', legacyfiles: '1',
+  };
+  for (const [k, v] of Object.entries(rootSettings)) sett += setting('root', '', k, v);
+  sett += setting('section', '      <section>section_1</section>\n', 'section_1_included', 1);
+  sett += setting('section', '      <section>section_1</section>\n', 'section_1_userinfo', 0);
+  for (const a of W.activities) {
+    const pre = `${a.modname}_${a.mid}`;
+    sett += setting('activity', `      <activity>${pre}</activity>\n`, `${pre}_included`, 1);
+    sett += setting('activity', `      <activity>${pre}</activity>\n`, `${pre}_userinfo`, 0);
+  }
+  const acts = W.activities
+    .map((a) => `      <activity>\n        <moduleid>${a.mid}</moduleid>\n        <sectionid>1</sectionid>\n        <modulename>${a.modname}</modulename>\n        <title>${esc(a.title)}</title>\n        <directory>${a.dir}</directory>\n        <insubsection></insubsection>\n      </activity>\n`)
+    .join('');
+  W.put('moodle_backup.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<moodle_backup>
+<information>
+  <name>${name}</name>
+  <moodle_version>${MV.mv}</moodle_version>
+  <moodle_release>${MV.mr}</moodle_release>
+  <backup_version>${MV.bv}</backup_version>
+  <backup_release>${MV.br}</backup_release>
+  <backup_date>${ts}</backup_date>
+  <mnet_remoteusers>0</mnet_remoteusers>
+  <include_files>1</include_files>
+  <include_file_references_to_external_content>0</include_file_references_to_external_content>
+  <original_wwwroot>https://cursia.nomaddi.com</original_wwwroot>
+  <original_site_identifier_hash>7723815fd5e7880d12bcade15abbbfc8</original_site_identifier_hash>
+  <original_course_id>${MBZ_V3_COURSE_BACKUP_ID}</original_course_id>
+  <original_course_fullname>${esc(courseTitle)}</original_course_fullname>
+  <original_course_shortname>${esc(courseTitle)}</original_course_shortname>
+  <original_course_format>topics</original_course_format>
+  <original_course_startdate>${ts}</original_course_startdate>
+  <original_course_enddate>0</original_course_enddate>
+  <original_course_contextid>${MBZ_V3_COURSE_BACKUP_CONTEXTID}</original_course_contextid>
+  <original_system_contextid>${MBZ_V3_SYSTEM_BACKUP_CONTEXTID}</original_system_contextid>
+  <details>
+    <detail backup_id="cursiav3${input.plan.course.id}p${input.partNumber}">
+      <type>course</type><format>moodle2</format><interactive>1</interactive>
+      <mode>70</mode><execution>2</execution><executiontime>0</executiontime>
+    </detail>
+  </details>
+  <contents>
+    <activities>\n${acts}    </activities>
+    <sections>\n      <section>\n        <sectionid>1</sectionid>\n        <title>${esc(input.section1Title)}</title>\n        <directory>sections/section_1</directory>\n        <parentcmid></parentcmid>\n        <modname></modname>\n      </section>\n    </sections>
+    <course>
+      <courseid>${MBZ_V3_COURSE_BACKUP_ID}</courseid>
+      <title>${esc(courseTitle)}</title>
+      <directory>course</directory>
+    </course>
+  </contents>
+  <settings>\n${sett}  </settings>
+</information>
+</moodle_backup>`);
+  // Audio ya comprimido: STORE (más rápido y mismo tamaño); el XML se deflacta igual que en el principal.
+  const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 1 } })) as Buffer;
+  return { mbz, expect: { partNumber: input.partNumber, totalFiles: input.totalFiles, courseTitle, section1Title: input.section1Title, labels: expectLabels } };
 }

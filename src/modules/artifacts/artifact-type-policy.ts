@@ -19,6 +19,9 @@
  */
 export const SERVER_ONLY_ARTIFACT_TYPES: readonly string[] = Object.freeze([
   'dynamic_mbz',
+  // r74: partes del paquete autocontenido (principal sin MP3 + partes de audio) y MP3 del audiolibro en línea.
+  'dynamic_mbz_part',
+  'dynamic_media_audio',
   'dynamic_presentation',
   'dynamic_audio_mp3',
   'dynamic_audio_segment',

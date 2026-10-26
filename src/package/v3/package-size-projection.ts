@@ -30,6 +30,7 @@
  */
 import { AUDIOBOOK_MAX_RATIO, AUDIOBOOK_TARGET_BITRATE_KBPS, AUDIOBOOK_TARGET_RATIO, AUDIOBOOK_WPM_REF } from '../audio/audiobook-policy';
 import { PackageSizeLimits } from './package-size-budget';
+import { DeliveryLimits, ProjectedDelivery, projectDelivery } from './delivery-plan';
 
 export const PACKAGE_SIZE_PROJECTED_OVER_LIMIT = 'PACKAGE_SIZE_PROJECTED_OVER_LIMIT';
 /** Aviso: el alto cabe, pero el esperado queda a menos de PACKAGE_SIZE_NEAR_LIMIT_RATIO del límite. */
@@ -74,6 +75,11 @@ export interface PackageSizeProjection {
   warnings: string[];
   /** Mensaje accionable (código al inicio) cuando verdict = over. */
   error: string | null;
+  /**
+   * r74: plan de entrega según la capacidad real (solo si el llamador pasó `opts.delivery`). Con él, `verdict = over`
+   * significa «ninguna entrega es posible»; un curso que no cabe en un archivo se entrega con el audiolibro aparte.
+   */
+  delivery?: ProjectedDelivery;
 }
 
 export const mbText = (n: number): string => `${(n / MB).toFixed(1)} MB`;
@@ -83,7 +89,7 @@ export function projectPackageSize(
   items: readonly ProjectionItem[],
   modes: ProjectionModes,
   limits: Pick<PackageSizeLimits, 'maxBytes'>,
-  opts: { chapterWords?: Readonly<Record<string, number>> | null } = {},
+  opts: { chapterWords?: Readonly<Record<string, number>> | null; delivery?: DeliveryLimits | null; moduleOfChapter?: Readonly<Record<string, string>> | null } = {},
 ): PackageSizeProjection {
   if (!Array.isArray(items)) throw new Error('projectPackageSize necesita items[]');
   const M = PACKAGE_SIZE_MODEL;
@@ -130,6 +136,39 @@ export function projectPackageSize(
   let verdict: PackageSizeProjection['verdict'] = 'ok';
   const warnings: string[] = [];
   let error: string | null = null;
+  if (opts.delivery) {
+    // r74: ya no se bloquea por el TOTAL estimado: se decide la entrega con la capacidad real y solo se bloquea si
+    // ninguna es posible.
+    const chapterHigh = audiobookIds.map((id) => ({
+      chapterId: id ?? '_',
+      moduleId: id ? opts.moduleOfChapter?.[id] ?? null : null,
+      bytes: audioReal ? minutesOf(id, 'high') * 60 * AUDIO_BYTES_PER_SECOND : M.mockMediaBytes,
+    }));
+    const delivery = projectDelivery({ highBytes, audiobookHighBytes: h.audiobook, audiobookChapterHighBytes: chapterHigh }, opts.delivery);
+    warnings.push(...delivery.warnings);
+    if (delivery.verdict === 'blocked') {
+      verdict = 'over';
+      error =
+        `${PACKAGE_SIZE_PROJECTED_OVER_LIMIT}: este curso no se puede entregar ni con el audiolibro aparte (${delivery.blockedReason}). ` +
+        `El paquete pesaría ≈ ${mbText(expectedBytes)} y podría llegar a ${mbText(highBytes)}; cada archivo admite hasta ${mbText(delivery.limits.partMaxBytes)} ` +
+        `y el almacenamiento ${mbText(delivery.limits.storageMaxBytes)} por archivo. No se generó nada ni se gastó. Opciones: (1) reduce el curso (menos capítulos de contenido) en la estructura y vuelve a aprobar; (2) un administrador sube el límite de subida del almacenamiento (STORAGE_MAX_UPLOAD_BYTES).`;
+    } else if (delivery.mode === 'single' && expectedBytes > delivery.limits.partMaxBytes * PACKAGE_SIZE_NEAR_LIMIT_RATIO) {
+      verdict = 'warn';
+      warnings.push(`${PACKAGE_SIZE_PROJECTED_NEAR_LIMIT}:${expectedBytes}:${delivery.limits.partMaxBytes}`);
+    }
+    return {
+      version: PACKAGE_SIZE_PROJECTION_VERSION,
+      expectedBytes,
+      highBytes,
+      breakdown: e,
+      counts: { contentChapters, chapters: chapters.size, audiobookChapters, presentations, audiobookChaptersWithWords },
+      limitBytes,
+      verdict,
+      warnings,
+      error,
+      delivery,
+    };
+  }
   if (limitBytes !== null && highBytes > limitBytes) {
     verdict = 'over';
     const minutes = Math.round(e.audiobook / AUDIO_BYTES_PER_SECOND / 60);

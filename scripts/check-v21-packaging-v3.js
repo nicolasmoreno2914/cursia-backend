@@ -1598,6 +1598,48 @@ async function workerChecks() {
     eq(hx.state.uploads.length, 0, 'sobre el límite: SIN upload');
     assert(hx.state.failed.length === 1 && /^PACKAGE_SIZE_LIMIT_EXCEEDED: el paquete pesa \d+ bytes/.test(hx.state.failed[0]), `falla: ${hx.state.failed[0]}`);
   });
+  await check('r74 worker v3: un curso que no cabe en un archivo → recomendado (UN .mbz, audiolibro en línea) + autocontenido validado; el reintento no re-sube nada', async () => {
+    const prevEnv = { b: process.env.PUBLIC_MEDIA_BASE_URL, p: process.env.PACKAGE_PART_MAX_BYTES };
+    process.env.PUBLIC_MEDIA_BASE_URL = 'https://api-staging.cursia.nomaddi.com';
+    process.env.PACKAGE_PART_MAX_BYTES = String(8 * 1024 * 1024);
+    try {
+      const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+      h.deps.packageSizeLimits = () => ({ warnBytes: null, maxBytes: 300000000 });
+      const rowsAll = [];
+      h.deps.artifacts.findAll = async (owner, f) => rowsAll.filter((r) => r.type === f.type).slice().reverse();
+      h.deps.artifacts.uploadBufferArtifact = async (i) => {
+        const a = { id: `art-${rowsAll.length + 1}-0000-4000-8000-000000000000`.replace(/^art-(\d+)-/, (_m, n) => `${String(n).padStart(8, '0')}-`), type: i.type, filename: i.filename, metadata: i.metadata, storageBucket: 'cursia-artifacts', storagePath: i.storagePath, sizeBytes: i.buffer.length, checksumSha256: require('crypto').createHash('sha256').update(i.buffer).digest('hex') };
+        h.state.uploads.push(i); rowsAll.push(a); if (i.type === 'dynamic_mbz') h.state.dynamicMbz.push(a); h.state.storage.set(i.storagePath, i.buffer); return a;
+      };
+      await W.processItem(h.deps, h.job);
+      eq(h.state.failed, [], 'sin fallos');
+      const s = h.state.completed[0];
+      eq([s.delivery && s.delivery.mode, s.delivery.selfContained.totalFiles], ['linked', 1], 'en línea + autocontenido en un archivo');
+      const types = h.state.uploads.map((u) => u.type);
+      eq(types.filter((t) => t === 'dynamic_media_audio').length, s.delivery.media.length, 'un MP3 en línea por segmento');
+      eq([types[types.length - 1], types.filter((t) => t === 'dynamic_mbz').length, types.filter((t) => t === 'dynamic_mbz_part').length], ['dynamic_mbz', 1, 1], 'el recomendado se sube ÚLTIMO; autocontenido aparte');
+      const main = h.state.uploads[h.state.uploads.length - 1];
+      eq(main.metadata.delivery.mode, 'linked', 'la entrega viaja en la metadata del .mbz');
+      const z = await JSZip.loadAsync(main.buffer);
+      const fx = await z.file('files.xml').async('string');
+      assert(!/<filename>audiolibro[^<]*\.mp3<\/filename>/.test(fx), 'el recomendado no lleva el audiolibro adentro');
+      for (const m of s.delivery.media) assert(/^https:\/\/api-staging\.cursia\.nomaddi\.com\/api\/v1\/media\/[0-9a-f-]{36}\/[0-9a-f]{64}\/audiolibro_modulo_\d\d_cap_\d\d-\d\d\.mp3$/.test(m.url), m.url);
+      // Reintento del mismo job: el .mbz recomendado ya existe → se reutiliza con su entrega, sin subir nada.
+      const n = h.state.uploads.length;
+      h.state.completed.length = 0;
+      await W.processItem(h.deps, h.job);
+      eq([h.state.uploads.length, h.state.completed[0].reused, h.state.completed[0].delivery && h.state.completed[0].delivery.mode], [n, true, 'linked'], 'reuse con la entrega');
+      // Sin PUBLIC_MEDIA_BASE_URL: solo autocontenido (un archivo = el paquete de siempre, sin «entrega»).
+      delete process.env.PUBLIC_MEDIA_BASE_URL;
+      const h2 = harness({ providerModes: { presentation: 'mock', audio: 'mock' } });
+      h2.deps.packageSizeLimits = () => ({ warnBytes: null, maxBytes: 300000000 });
+      await W.processItem(h2.deps, h2.job);
+      eq([h2.state.failed.length, h2.state.uploads.length, h2.state.completed[0].delivery], [0, 1, undefined], 'sin base: un archivo, como siempre');
+    } finally {
+      if (prevEnv.b === undefined) delete process.env.PUBLIC_MEDIA_BASE_URL; else process.env.PUBLIC_MEDIA_BASE_URL = prevEnv.b;
+      if (prevEnv.p === undefined) delete process.env.PACKAGE_PART_MAX_BYTES; else process.env.PACKAGE_PART_MAX_BYTES = prevEnv.p;
+    }
+  });
   await check('r58 R2 worker v3: texto de IA simulado (metadata.llmMode=mock) → paquete QA con llmNonRealItems; como FINAL → preview_not_deliverable sin build ni upload', async () => {
     const h = harness({ providerModes: { presentation: 'mock', audio: 'mock' }, llmMockTypes: ['dynamic_content_md'] });
     await W.processItem(h.deps, h.job);
