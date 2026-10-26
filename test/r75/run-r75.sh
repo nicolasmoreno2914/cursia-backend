@@ -70,7 +70,7 @@ for TYPES in ${R75_TYPES:-0 1}; do
     fi
   done
   if [ -f "$REPO/scripts/migrate-r75-backfill.js" ]; then
-    env $STG R75_BACKFILL_REPORT_DIR="$OUT" node "$REPO/scripts/migrate-r75-backfill.js" --apply > "$OUT/backfill.log" 2>&1 || { echo "backfill falló"; tail -20 "$OUT/backfill.log"; RC=1; }
+    env $STG node "$REPO/scripts/migrate-r75-backfill.js" --apply --report-dir="$OUT" > "$OUT/backfill.log" 2>&1 || { echo "backfill falló"; tail -20 "$OUT/backfill.log"; RC=1; }
     echo "migrate-r75-backfill --apply: $(tail -1 "$OUT/backfill.log")"
   fi
   echo "== suite r75 =="
