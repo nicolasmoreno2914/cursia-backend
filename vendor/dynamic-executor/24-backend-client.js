@@ -2800,7 +2800,7 @@
       }
       if (urlRes.storagePath && window.SB) {
         var bucket = urlRes.bucket || 'cursia-artifacts';
-        return window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600).then(function (signRes) {
+        return (window.r75SignStoragePath ? window.r75SignStoragePath(bucket, urlRes.storagePath, 3600) : window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600)).then(function (signRes) {
           var signedUrl = signRes && signRes.data && signRes.data.signedUrl;
           if (!signedUrl) return { ok: false, error: 'sign_failed' };
           return _fetchJsonFromUrl(signedUrl).then(function (dlRes) {
@@ -2831,7 +2831,7 @@
         }
         if (urlRes.storagePath && window.SB) {
           var bucket = urlRes.bucket || 'cursia-artifacts';
-          return window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600).then(function (signRes) {
+          return (window.r75SignStoragePath ? window.r75SignStoragePath(bucket, urlRes.storagePath, 3600) : window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600)).then(function (signRes) {
             var signedUrl = signRes && signRes.data && signRes.data.signedUrl;
             if (!signedUrl) return { ok: false, error: 'sign_failed' };
             return _fetchJsonFromUrl(signedUrl).then(function (dlRes) {

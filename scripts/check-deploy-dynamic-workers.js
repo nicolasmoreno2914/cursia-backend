@@ -545,7 +545,9 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
           eq(kv.DYNAMIC_ACTIVITY_TYPE_RULES, '2', 'H5P v2: reglas de actividad 2');
           eq(kv.PRESENTATION_LIGHT_DEFAULT_SINCE, '2026-10-02T13:14:15Z', 'PRESENTATION_LIGHT_DEFAULT_SINCE ya presente: no se mueve');
           assert(fs.existsSync(path.join(dir, '.env.bak')), 'backup del .env');
-          eq(kv.DYNAMIC_V2_ALLOWED_OWNERS, `11111111-2222-4333-8444-555555555555,${OWNER}`, 'lista extendida (no reemplazada)');
+          // r75 Fase 2: las cuentas QA sintéticas de staging (qa-r75-*) también tienen V2; la lista se EXTIENDE, nunca se reemplaza.
+          const QA_R75 = ['c9742efe-f45a-4389-b305-09b7bac3e709', '21b19a6a-6e39-4313-ac34-afaecbeefdf8', '1706ff10-1157-4fa5-9e11-6e42bc9b1133', '7aa4981f-b9ed-41ce-8859-53f2eb0383f0', '34ed5dde-2950-4b8e-910e-c91c77ef4dd5', '3bd4e919-e8d3-4c3e-9f13-737e4c2113b9', '8e642f8d-1db2-40b8-86eb-1540a57ce7fe'];
+          eq(kv.DYNAMIC_V2_ALLOWED_OWNERS, ['11111111-2222-4333-8444-555555555555', OWNER, ...QA_R75].join(','), 'lista extendida (no reemplazada)');
         }
       } finally {
         fs.rmSync(dir, { recursive: true, force: true });
