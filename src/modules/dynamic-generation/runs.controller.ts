@@ -28,11 +28,22 @@ import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { OwnerSafeRunInterceptor } from './owner-safe-run.interceptor';
+import { Access } from '../authz/access.decorator';
+import type { AccessContext } from '../authz/access-context';
+import { RequirePermission } from '../authz/require-permission.decorator';
 
 /**
  * Runs de generación dinámica de un Manifest (Fase 5A). Ownership + `dynamic`
  * + existencia del Manifest vía GenerationManifestsService.get: curso ajeno o
  * inexistente / Manifest no creado → 404, curso legacy → 400.
+ *
+ * r75 (02 §E.1, 01 §3.2): cada handler lleva `@RequirePermission` sobre la institución del curso (`param:courseId`):
+ * leer → courses.view; arrancar / estimar / aplicar cambios → generations.start; reanudar, reintentar, regenerar,
+ * cancelar, pausar, detener-después y liberar el empaque → generations.retry (D-28). Los servicios filtran por el dueño
+ * técnico (`access.effectiveOwnerId`: con CURSIA_RBAC_MODE=enforce, courses.owner_id; en off/shadow, el actor como
+ * siempre) y el ACTOR (JWT) firma, aprueba y paga (`startedBy`). D-14: si quien arranca no es el dueño, el run solo
+ * nace con ejecución en el servidor (409 server_execution_required). video-upgrade sigue siendo solo SuperAdmin (lo
+ * exige el servicio).
  */
 const START_BODY_PIPE = new ValidationPipe({
   whitelist: true,
@@ -57,12 +68,14 @@ export class RunsController {
   // Fase 8 (F8-BE): body = {fromRun: <runA>} → crea el run B aplicando el
   // plan de invalidación (contexto/videoMode heredados de A); idempotente por
   // (A, Manifest): 201 al crearlo, 200 si ya existía.
+  @RequirePermission('generations.start', { course: 'param:courseId' })
   @Post()
   async start(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('number', ParseIntPipe) number: number,
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Res({ passthrough: true }) res: Response,
   ) {
     // El body es uno de dos DTOs: se valida acá con las MISMAS opciones que el
@@ -73,7 +86,7 @@ export class RunsController {
       metatype: isFromRunRequest(body) ? FromRunDto : CourseContextDto,
     });
     // r62 (I2): {fromRun, estimateHash} = «Autorizar y aplicar»: la firma es de la identidad del JWT (nunca del body).
-    const result = await this.runs.startRun(courseId, user.id, number, dto, { signer: { id: user.id, email: user.email } });
+    const result = await this.runs.startRun(courseId, access.effectiveOwnerId, number, dto, { signer: { id: user.id, email: user.email }, startedBy: user.id });
     res.status(result.created ? 201 : 200);
     return result;
   }
@@ -82,6 +95,7 @@ export class RunsController {
   // r62 (I2): presupuesto de aplicar el plan de invalidación desde {fromRun}: estimado, decisión, modo de autorización
   // (user | admin | none), monto, límites y la huella que exige «Autorizar y aplicar» (POST …/runs {fromRun, estimateHash}).
   // Solo lectura.
+  @RequirePermission('generations.start', { course: 'param:courseId' })
   @Post('from-run-preview')
   @HttpCode(HttpStatus.OK)
   async fromRunPreview(
@@ -89,9 +103,10 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
     const dto: FromRunDto = await START_BODY_PIPE.transform(body, { type: 'body', metatype: FromRunDto });
-    return publicFromRunPreview(await this.runs.previewFromRun(courseId, { id: user.id, email: user.email }, number, dto.fromRun));
+    return publicFromRunPreview(await this.runs.previewFromRun(courseId, { id: user.id, email: user.email }, number, dto.fromRun, undefined, access.effectiveOwnerId));
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs
@@ -101,32 +116,37 @@ export class RunsController {
   @Get()
   // REL lease: ?executorId= (opcional, el del equipo) solo calcula executionLease.heldByYou; nunca
   // condiciona la lectura (acceso al curso ≠ lease de ejecución).
+  @RequirePermission('courses.view', { course: 'param:courseId' })
   current(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('number', ParseIntPipe) number: number,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Query('executorId') executorId?: string,
   ) {
-    return this.runs.getCurrentRun(courseId, user.id, number, { executorId: typeof executorId === 'string' ? executorId : null });
+    return this.runs.getCurrentRun(courseId, access.effectiveOwnerId, number, { executorId: typeof executorId === 'string' ? executorId : null });
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/estimate
   // R17: videoCount/ids del Manifest + costo estimado de video (best-effort,
   // desde cost_rates; null + nota si no hay tarifa configurada). Declarado
   // ANTES de ':runId' — si no, Nest intentaría parsear "estimate" como UUID.
+  @RequirePermission('courses.view', { course: 'param:courseId' })
   @Get('estimate')
   estimate(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('number', ParseIntPipe) number: number,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.estimateRun(courseId, user.id, number);
+    return this.runs.estimateRun(courseId, access.effectiveOwnerId, number);
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/estimate-preview
   // Flujo normal: estimado COMPLETO (totales, por familia/proveedor/tipo),
   // conteos, decisión de presupuesto y si ESTE usuario puede aprobar. Body =
   // CourseContext (el mismo que POST …/runs). Solo lectura: no crea nada.
+  @RequirePermission('generations.start', { course: 'param:courseId' })
   @Post('estimate-preview')
   @HttpCode(HttpStatus.OK)
   async estimatePreview(
@@ -134,21 +154,24 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
     const dto: CourseContextDto = await START_BODY_PIPE.transform(body, { type: 'body', metatype: CourseContextDto });
-    return publicPreview(await this.runs.previewStart(courseId, { id: user.id, email: user.email }, number, dto));
+    return publicPreview(await this.runs.previewStart(courseId, { id: user.id, email: user.email }, number, dto, { ownerId: access.effectiveOwnerId }));
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/approve-and-start
   // «Autorizar y generar»: body = CourseContext + estimateHash (la huella del
   // estimado que vio el usuario). Rol, monto y vigencia se deciden en el
   // servidor; 201 si se creó el run, 200 si ya existía.
+  @RequirePermission('generations.start', { course: 'param:courseId' })
   @Post('approve-and-start')
   async approveAndStart(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('number', ParseIntPipe) number: number,
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Res({ passthrough: true }) res: Response,
   ) {
     const { estimateHash, ...rest } = (body && typeof body === 'object' && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
@@ -156,24 +179,27 @@ export class RunsController {
       throw new BadRequestException('estimateHash es obligatorio (la huella del estimado que se mostró)');
     }
     const dto: CourseContextDto = await START_BODY_PIPE.transform(rest, { type: 'body', metatype: CourseContextDto });
-    const result = await this.runs.approveAndStart(courseId, { id: user.id, email: user.email }, number, dto, estimateHash);
+    const result = await this.runs.approveAndStart(courseId, { id: user.id, email: user.email }, number, dto, estimateHash, { ownerId: access.effectiveOwnerId });
     res.status(result.created ? 201 : 200);
     return result;
   }
 
   // GET /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId
+  @RequirePermission('courses.view', { course: 'param:courseId' })
   @Get(':runId')
   get(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Query('executorId') executorId?: string,
   ) {
-    return this.runs.getRun(courseId, user.id, number, runId, { executorId: typeof executorId === 'string' ? executorId : null });
+    return this.runs.getRun(courseId, access.effectiveOwnerId, number, runId, { executorId: typeof executorId === 'string' ? executorId : null });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/cancel
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Post(':runId/cancel')
   @HttpCode(HttpStatus.OK)
   cancel(
@@ -181,12 +207,14 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.cancelRun(courseId, user.id, number, runId, { id: user.id, email: user.email });
+    return this.runs.cancelRun(courseId, access.effectiveOwnerId, number, runId, { id: user.id, email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/pause
   // Pausa REAL en el servidor: ningún mecanismo automático le entrega partes nuevas hasta /resume.
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Post(':runId/pause')
   @HttpCode(HttpStatus.OK)
   pause(
@@ -194,12 +222,14 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.pauseRun(courseId, user.id, number, runId, { id: user.id, email: user.email });
+    return this.runs.pauseRun(courseId, access.effectiveOwnerId, number, runId, { id: user.id, email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/resume
   // Única transición paused → despachable: acción explícita del usuario.
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Post(':runId/resume')
   @HttpCode(HttpStatus.OK)
   resume(
@@ -207,14 +237,16 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.resumeRun(courseId, user.id, number, runId, { id: user.id, email: user.email });
+    return this.runs.resumeRun(courseId, access.effectiveOwnerId, number, runId, { id: user.id, email: user.email });
   }
 
   // PUT /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/stop-after
   // Body {"itemKeys": ["final_exam:<id>"], "holdPackaging": true}: al completarse una de esas partes el servidor
   // pausa el run en la misma transacción (ningún claim posterior); holdPackaging → completar el run no encola el
   // empaque automático. Por run; 409 si una parte ya está completa o el run no está abierto.
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Put(':runId/stop-after')
   @HttpCode(HttpStatus.OK)
   setStopAfter(
@@ -223,11 +255,13 @@ export class RunsController {
     @Param('runId', ParseUUIDPipe) runId: string,
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.setStopAfter(courseId, user.id, number, runId, parseStopAfterBody(body), { id: user.id, email: user.email });
+    return this.runs.setStopAfter(courseId, access.effectiveOwnerId, number, runId, parseStopAfterBody(body), { id: user.id, email: user.email });
   }
 
   // DELETE …/runs/:runId/stop-after — quita la config (idempotente). No reanuda ni libera un empaque ya retenido.
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Delete(':runId/stop-after')
   @HttpCode(HttpStatus.OK)
   clearStopAfter(
@@ -235,12 +269,14 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.clearStopAfter(courseId, user.id, number, runId, { id: user.id, email: user.email });
+    return this.runs.clearStopAfter(courseId, access.effectiveOwnerId, number, runId, { id: user.id, email: user.email });
   }
 
   // POST …/runs/:runId/package-hold/release — acción explícita: libera la retención del empaque (un run ya
   // completado con el empaque retenido pasa al empaque automático de siempre). 409 si no hay retención.
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Post(':runId/package-hold/release')
   @HttpCode(HttpStatus.OK)
   releasePackageHold(
@@ -248,12 +284,14 @@ export class RunsController {
     @Param('number', ParseIntPipe) number: number,
     @Param('runId', ParseUUIDPipe) runId: string,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.releasePackageHold(courseId, user.id, number, runId, { id: user.id, email: user.email });
+    return this.runs.releasePackageHold(courseId, access.effectiveOwnerId, number, runId, { id: user.id, email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/retry
   // itemKey va URL-encoded (p.ej. content%3A<uuid>); Express lo decodifica.
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Post(':runId/items/:itemKey/retry')
   @HttpCode(HttpStatus.OK)
   retry(
@@ -263,14 +301,16 @@ export class RunsController {
     @Param('itemKey') itemKey: string,
     @Body() dto: RetryItemDto,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.runs.retryItem(courseId, user.id, number, runId, itemKey, dto?.resubmitVideo === true, dto?.resubmitProvider === true, undefined, { id: user.id, email: user.email });
+    return this.runs.retryItem(courseId, access.effectiveOwnerId, number, runId, itemKey, dto?.resubmitVideo === true, dto?.resubmitProvider === true, undefined, { id: user.id, email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/items/:itemKey/youtube-resolution
   // DN-1: resolución explícita de una subida a YouTube ambigua (nunca automática).
   // Body: {"action":"confirm_existing","youtubeVideoId":"<11 chars>"} | {"action":"authorize_reupload"}.
   // 200 con el item (vuelve a pending; el worker solo finaliza o re-sube UNA vez, sin Videogen).
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Post(':runId/items/:itemKey/youtube-resolution')
   @HttpCode(HttpStatus.OK)
   resolveYoutube(
@@ -280,18 +320,20 @@ export class RunsController {
     @Param('itemKey') itemKey: string,
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
     const b = body && typeof body === 'object' ? body : {};
     const extra = Object.keys(b).filter((k) => k !== 'action' && k !== 'youtubeVideoId');
     if (extra.length > 0) throw new BadRequestException(`campos no permitidos: ${extra.join(', ')}`);
     const action = b.action as YoutubeResolutionAction;
     const videoId = b.youtubeVideoId === undefined ? undefined : String(b.youtubeVideoId);
-    return this.runs.resolveYoutubeUpload(courseId, user.id, number, runId, itemKey, action, videoId, { id: user.id, email: user.email });
+    return this.runs.resolveYoutubeUpload(courseId, access.effectiveOwnerId, number, runId, itemKey, action, videoId, { id: user.id, email: user.email });
   }
 
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/video-upgrade/preview
   // EV6 T5 B2: «Generar videos reales» — vista previa SOLO lectura (videos pendientes del run,
   // estimado USD de exactamente eso, aprobación y trabas). Sin body.
+  @RequirePermission('generations.start', { course: 'param:courseId' })
   @Post(':runId/video-upgrade/preview')
   @HttpCode(HttpStatus.OK)
   async videoUpgradePreview(
@@ -306,6 +348,7 @@ export class RunsController {
   // POST /api/v1/courses/:courseId/blueprints/:number/manifest/runs/:runId/video-upgrade
   // Body {estimateHash} (la huella de la vista previa que vio el usuario). 201 si se creó el
   // upgrade; 200 si ya existía (idempotente: nunca un segundo juego de videos pagos).
+  @RequirePermission('generations.start', { course: 'param:courseId' })
   @Post(':runId/video-upgrade')
   async videoUpgrade(
     @Param('courseId', ParseIntPipe) courseId: number,
@@ -333,6 +376,7 @@ export class RunsController {
   // generación NUEVA del item en el mismo run (nunca reescribe la anterior).
   // 201 si se creó; 200 si ya había una regeneración de ese item en vuelo.
   // {dryRun: true} → 200 con el plan (affected + blockers), sin escribir nada.
+  @RequirePermission('generations.retry', { course: 'param:courseId' })
   @Post(':runId/items/:itemKey/regenerate')
   async regenerate(
     @Param('courseId', ParseIntPipe) courseId: number,
@@ -341,10 +385,11 @@ export class RunsController {
     @Param('itemKey') itemKey: string,
     @Body() body: Record<string, unknown>,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
     @Res({ passthrough: true }) res: Response,
   ) {
     const opts = parseRegenerateItemBody(body);
-    const result = await this.runs.regenerateItem(courseId, user.id, number, runId, itemKey, opts, { id: user.id, email: user.email });
+    const result = await this.runs.regenerateItem(courseId, access.effectiveOwnerId, number, runId, itemKey, opts, { id: user.id, email: user.email });
     // dryRun → 200 (no escribe); real → 201 si creó, 200 si ya estaba en vuelo.
     res.status('dryRun' in result ? 200 : result.created ? 201 : 200);
     return result;
