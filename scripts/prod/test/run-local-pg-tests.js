@@ -429,13 +429,13 @@ async function main() {
       assert(res.code === 0, res.out);
       assert(JSON.stringify(await defsOf('schemafirst')) === JSON.stringify(before), 'cambió el CHECK');
     });
-    await test('C1/DN-6: una fila que violaría el CHECK nuevo (brand_extraction) → exit 4, reporte claro, NADA aplicado (ni el paso 0)', async () => {
+    await test('C1/DN-6: una fila que violaría el CHECK nuevo (modo desconocido) → exit 4, reporte claro, NADA aplicado (ni el paso 0)', async () => {
       await withClient('dn6', (c) => c.query(`
         alter table production_jobs drop constraint production_jobs_execution_mode_check;
-        insert into production_jobs (owner_id, execution_mode, status) values ('u', 'brand_extraction', 'queued');`));
+        insert into production_jobs (owner_id, execution_mode, status) values ('u', 'legacy_unknown_mode', 'queued');`));
       const res = run(RUNNER, APPLY_ARGS, overrideEnv('dn6'));
       assert(res.code === 4, `exit ${res.code}\n${res.out}`);
-      assert(/DN-6/.test(res.out) && /would_violate_execution_mode=1 \(brand_extraction=1\)/.test(res.out) && /would_violate_worker_status=0/.test(res.out), 'reporte DN-6\n' + res.out);
+      assert(/DN-6/.test(res.out) && /would_violate_execution_mode=1 \(legacy_unknown_mode=1\)/.test(res.out) && /would_violate_worker_status=0/.test(res.out), 'reporte DN-6\n' + res.out);
       assert(/no se aplicó NADA/.test(res.out), res.out);
       const t = await withClient('dn6', (c) => c.query(`select to_regclass('public.course_modules') as t,
         (select count(*) from pg_constraint where conname = 'production_jobs_execution_mode_check')::int as ck`));
