@@ -35,6 +35,7 @@ import { CourseDesignModule } from './modules/course-design/course-design.module
 import { PrebriefModule } from './modules/prebrief/prebrief.module';
 import { FinopsModule } from './modules/finops/finops.module';
 import { AuthzModule } from './modules/authz/authz.module';
+import { AccessModule } from './modules/access/access.module';
 
 @Module({
   imports: [
@@ -76,6 +77,7 @@ import { AuthzModule } from './modules/authz/authz.module';
     PrebriefModule, // Prebrief pedagógico: propuesta versionada, aprobación y PDF
     AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
     FinopsModule,
+    AccessModule, // r75 (A): instituciones multi-miembro, membresías, usuarios SA, suspensiones, auditoría, /me/context
   ],
   controllers: [AppController],
   providers: [

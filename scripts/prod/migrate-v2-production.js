@@ -285,6 +285,14 @@ const EXCLUDED = [
   { file: 'supabase-migration-p2-content-worker.sql', reason: 'legacy (P2.1), ya aplicada en producción' },
   { file: 'supabase-migration-brand-extraction-execution-mode.sql', reason: 'legacy, no V2' },
   { file: 'supabase-migration-dashboard-course-costs.sql', reason: 'legacy, no V2' },
+  // r75 (roles, permisos, instituciones, presupuestos): NADA llega a producción hasta que el owner lo apruebe. El código
+  // r75 va detrás de CURSIA_ACCOUNT_GUARD / CURSIA_RBAC_MODE / CURSIA_USER_BUDGETS (off en prod) y sus columnas en
+  // entities son inertes para TypeORM. Ver validation/r75-roles/ y check-r60-prod-migrations-cover-staging.js.
+  { file: 'supabase-migration-r75-access.sql', reason: 'r75: staging-only hasta aprobación del owner' },
+  { file: 'supabase-migration-r75-budgets.sql', reason: 'r75: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r75-access.js', reason: 'r75: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r75-budgets.js', reason: 'r75: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r75-backfill.js', reason: 'r75: staging-only hasta aprobación del owner (backfill de instituciones/membresías; solo por workflow_dispatch)' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

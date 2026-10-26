@@ -149,6 +149,12 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
  * ver flag-report.md #3 y review "declined to judge").
  */
 const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
+  // r75: autorización (B) y acceso (A): no son rutas V2 (no las esconde el flag dinámico).
+  'PermissionsCatalogController',
+  'MeContextController',
+  'MembershipsController',
+  'InstitutionsAdminController',
+  'AdminUsersController',
   'AppController',
   'AuthController',
   'YoutubeController',
