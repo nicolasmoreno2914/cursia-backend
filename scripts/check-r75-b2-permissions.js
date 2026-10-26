@@ -308,7 +308,7 @@ async function dbChecks(prodTypes) {
 async function coverageChecks() {
   const { PATH_METADATA, METHOD_METADATA } = require('@nestjs/common/constants');
   const KEYS = ['cursia:authz:require-permission', 'cursia:authz:authenticated-only', 'cursia:authz:public', 'cursia:authz:public-capability',
-    'cursia:authz:allow-inactive-account', 'cursia:authz:superadmin-only', 'r75:allowInactiveAccount', 'cursia:authz:token-authenticated'];
+    'cursia:authz:allow-inactive-account', 'cursia:authz:superadmin-only', 'cursia:authz:token-authenticated'];
   const OWNED_BY_B = ['modules/courses/courses.controller.js', 'modules/course-versions/course-versions.controller.js', 'modules/course-structure/course-structure.controller.js',
     'modules/course-structure/course-structure-settings.controller.js', 'modules/course-blueprints/course-blueprints.controller.js', 'modules/generation-manifests/generation-manifests.controller.js',
     'modules/dynamic-generation/executor.controller.js', 'modules/coherence/coherence.controller.js', 'modules/invalidation/invalidation.controller.js', 'modules/invalidation/change-impact.controller.js',

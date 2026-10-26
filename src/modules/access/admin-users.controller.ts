@@ -27,7 +27,7 @@ export class AdminUsersController {
 
   @Get('users')
   async list(@Query() q: { q?: string; status?: string; institutionId?: string; page?: string; pageSize?: string }) {
-    return { ok: true, data: await this.users.list(q ?? {}) };
+    return await this.users.list(q ?? {});
   }
 
   /** La respuesta puede llevar `tempPassword` (UNA vez): nunca se cachea ni se registra. */
@@ -36,52 +36,52 @@ export class AdminUsersController {
   @Header('Cache-Control', 'no-store')
   @Header('Pragma', 'no-cache')
   async create(@Body() body: { email?: string; fullName?: string; mode?: string; memberships?: unknown }, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.users.create(actorFromUser(user, req), body ?? {}) };
+    return await this.users.create(actorFromUser(user, req), body ?? {});
   }
 
   @Get('users/:userId')
   async getOne(@Param('userId') userId: string) {
-    return { ok: true, data: await this.users.getOne(userId) };
+    return await this.users.getOne(userId);
   }
 
   @Post('users/:userId/authorize')
   @HttpCode(HttpStatus.OK)
   async authorize(@Param('userId') userId: string, @Body() body: { reason?: string }, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.users.authorize(actorFromUser(user, req), userId, body?.reason) };
+    return await this.users.authorize(actorFromUser(user, req), userId, body?.reason);
   }
 
   @Post('users/:userId/repair')
   @HttpCode(HttpStatus.OK)
   async repair(@Param('userId') userId: string, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.users.repair(actorFromUser(user, req), userId) };
+    return await this.users.repair(actorFromUser(user, req), userId);
   }
 
   @Post('users/:userId/suspensions')
   @HttpCode(HttpStatus.CREATED)
   async suspend(@Param('userId') userId: string, @Body() body: { kind?: string; reason?: string }, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.suspensions.suspend(actorFromUser(user, req), userId, body?.kind, body?.reason) };
+    return await this.suspensions.suspend(actorFromUser(user, req), userId, body?.kind, body?.reason);
   }
 
   @Delete('users/:userId/suspensions/:kind')
   async lift(@Param('userId') userId: string, @Param('kind') kind: string, @Body() body: { reason?: string } | undefined,
     @Query('reason') reasonQ: string | undefined, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.suspensions.lift(actorFromUser(user, req), userId, kind, body?.reason ?? reasonQ) };
+    return await this.suspensions.lift(actorFromUser(user, req), userId, kind, body?.reason ?? reasonQ);
   }
 
   @Get('platform/controls')
   async controls() {
-    return { ok: true, data: await this.platform.getControls() };
+    return await this.platform.getControls();
   }
 
   @Put('platform/generation-freeze')
   async freeze(@Body() body: { enabled?: boolean; reason?: string }, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.platform.setGenerationFreeze(actorFromUser(user, req), body ?? {}) };
+    return await this.platform.setGenerationFreeze(actorFromUser(user, req), body ?? {});
   }
 
   @Get('audit-log')
   async auditLog(@Query() q: { actorId?: string; action?: string; targetType?: string; targetId?: string; institutionId?: string; from?: string; to?: string; cursor?: string; limit?: string }) {
     if (!(await r75AccessSchemaPresent(this.dataSource))) throw E.schemaMissing();
     const page = await this.audit.list({ ...(q ?? {}), limit: q?.limit ? Number(q.limit) : undefined });
-    return { ok: true, data: page };
+    return page;
   }
 }

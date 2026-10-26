@@ -16,29 +16,29 @@ export class MembershipsController {
 
   @Get()
   async list(@Param('id') id: string, @Query('status') status: string | undefined, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.memberships.listMembers(actorFromUser(user, req), id, status) };
+    return await this.memberships.listMembers(actorFromUser(user, req), id, status);
   }
 
   @Post()
   async add(@Param('id') id: string, @Body() body: { email?: string; role?: string }, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.memberships.addMember(actorFromUser(user, req), id, body ?? {}) };
+    return await this.memberships.addMember(actorFromUser(user, req), id, body ?? {});
   }
 
   @Patch(':userId')
   async update(@Param('id') id: string, @Param('userId') userId: string, @Body() body: { role?: string; status?: string },
     @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.memberships.updateMember(actorFromUser(user, req), id, userId, body ?? {}) };
+    return await this.memberships.updateMember(actorFromUser(user, req), id, userId, body ?? {});
   }
 
   @Delete(':userId')
   async remove(@Param('id') id: string, @Param('userId') userId: string, @Body() body: { reason?: string } | undefined,
     @Query('reason') reasonQ: string | undefined, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.memberships.removeMember(actorFromUser(user, req), id, userId, body?.reason ?? reasonQ) };
+    return await this.memberships.removeMember(actorFromUser(user, req), id, userId, body?.reason ?? reasonQ);
   }
 
   @Put(':userId/overrides')
   async overrides(@Param('id') id: string, @Param('userId') userId: string,
     @Body() body: { grants?: string[]; denies?: string[]; reason?: string }, @CurrentUser() user: AuthUser, @Req() req: any) {
-    return { ok: true, data: await this.memberships.setOverrides(actorFromUser(user, req), id, userId, body ?? {}) };
+    return await this.memberships.setOverrides(actorFromUser(user, req), id, userId, body ?? {});
   }
 }

@@ -73,8 +73,19 @@ async function main() {
       const bad = rows.map((x) => x.privilege_type).filter((p) => r === 'anon' || p !== 'SELECT');
       if (bad.length) problems.push(`${r} conserva privilegios de escritura/lectura indebidos en authorized_users: ${bad.join(',')}`);
     }
-    const pol = (await c.query(`select policyname, cmd from pg_policies where schemaname = 'public' and tablename = 'authorized_users'`)).rows;
-    for (const p of pol) if (p.policyname !== 'users check own authorization' || p.cmd !== 'SELECT') problems.push(`política no permitida en authorized_users: ${p.policyname} (${p.cmd})`);
+    const pol = (await c.query(`select policyname, cmd, roles::text as roles, qual, with_check, permissive from pg_policies where schemaname = 'public' and tablename = 'authorized_users'`)).rows;
+    for (const p of pol) {
+      if (p.policyname !== 'users check own authorization' || p.cmd !== 'SELECT') { problems.push(`política no permitida en authorized_users: ${p.policyname} (${p.cmd})`); continue; }
+      // H2: la condición EXACTA (fila propia por user_id = auth.uid() o por email del JWT). Una política con el nombre
+      // correcto pero otra condición (p. ej. `true`) o para otros roles no pasa.
+      const q = String(p.qual || '').replace(/\s+/g, ' ');
+      const okQual = /user_id = auth\.uid\(\)/.test(q) && /lower\(email\) = lower\(auth\.email\(\)\)/.test(q)
+        && q.replace(/\(user_id IS NOT NULL\)|user_id = auth\.uid\(\)|lower\(email\) = lower\(auth\.email\(\)\)|AND|OR|[()\s]/g, '') === '';
+      if (!okQual) problems.push(`authorized_users: «users check own authorization» con una condición inesperada: ${q.slice(0, 200)}`);
+      if (p.roles !== '{authenticated}') problems.push(`authorized_users: «users check own authorization» para roles ${p.roles} (debe ser {authenticated})`);
+      if (p.with_check) problems.push('authorized_users: «users check own authorization» con WITH CHECK (es solo SELECT)');
+      if (p.permissive !== 'PERMISSIVE') problems.push(`authorized_users: «users check own authorization» ${p.permissive}`);
+    }
     for (const t of NEW_TABLES) {
       const { rows } = await c.query(`select count(*)::int as n from pg_policies where schemaname = 'public' and tablename = $1`, [t]);
       if (rows[0].n > 0) problems.push(`public.${t} tiene políticas RLS (debe no tener ninguna)`);

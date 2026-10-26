@@ -24,15 +24,6 @@ import {
   AUTHZ_TOKEN_AUTH_KEY,
 } from './public.decorator';
 
-/**
- * Rutas con JWT que responden aunque la cuenta no esté autorizada / esté suspendida (01 §2.3 paso 1). Además del
- * decorador `@AllowInactiveAccount()`, se listan por ruta para no depender de que el controller de A lo aplique.
- */
-export const ALLOW_INACTIVE_PATHS: ReadonlySet<string> = new Set(['/api/v1/me/context', '/api/v1/auth/me', '/api/v1/features']);
-
-/** Metadata del decorador `@AllowInactiveAccount()` de A (`access/allow-inactive-account.decorator.ts`). */
-export const A_ALLOW_INACTIVE_KEY = 'r75:allowInactiveAccount';
-
 /** Clave del request donde queda la decisión de cuenta (la lee `/me/context`). */
 export const REQUEST_ACCOUNT_KEY = 'cursiaAccount';
 
@@ -101,7 +92,9 @@ export class AccountAccessGuard implements CanActivate {
     const decision = await this.accounts.evaluate(user);
     req[REQUEST_ACCOUNT_KEY] = decision;
     if (decision.status === 'active') return true;
-    if (flag(AUTHZ_ALLOW_INACTIVE_KEY) || flag(A_ALLOW_INACTIVE_KEY) || ALLOW_INACTIVE_PATHS.has(normalizePath(req.originalUrl ?? req.url))) return true;
+    // Rutas que responden aunque la cuenta no esté activa (/auth/me, /me/context, /features): SOLO por el decorador
+    // @AllowInactiveAccount() (un único decorador y una única clave de metadata, la de public.decorator.ts).
+    if (flag(AUTHZ_ALLOW_INACTIVE_KEY)) return true;
 
     if (mode === 'shadow') {
       const q = this.dataSource ? (sql: string, p?: unknown[]) => this.dataSource!.query(sql, p as any[]) : null;

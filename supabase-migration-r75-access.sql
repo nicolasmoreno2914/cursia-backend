@@ -245,31 +245,34 @@ do $$ begin
   end if;
 end $$;
 
--- RLS de authorized_users: SOLO «SELECT de la propia fila» (H2). Toda otra política se elimina por nombre.
+-- RLS de authorized_users: SOLO «SELECT de la propia fila» (H2, confirmada en staging 2026-10-26: había políticas que
+-- dejaban a `authenticated` insertar/actualizar/borrar). Se eliminan TODAS las políticas de la tabla (también una
+-- «users check own authorization» cuya condición haya sido modificada en vivo) y se (re)crea la única permitida con la
+-- condición EXACTA: la fila propia por user_id (auth.uid()) o por email del JWT (auth.email(), sin distinguir mayúsculas).
+-- Idempotente: cada corrida deja exactamente esta política.
 alter table public.authorized_users enable row level security;
 do $$
 declare
   p record;
-  has_auth_email boolean;
+  has_auth_fns boolean;
 begin
   for p in
     select policyname, cmd from pg_policies
      where schemaname = 'public' and tablename = 'authorized_users'
   loop
-    if p.policyname <> 'users check own authorization' or p.cmd <> 'SELECT' then
-      execute format('drop policy %I on public.authorized_users', p.policyname);
+    execute format('drop policy %I on public.authorized_users', p.policyname);
+    if p.policyname <> 'users check own authorization' then
       raise notice 'r75: política % (%) eliminada de authorized_users', p.policyname, p.cmd;
     end if;
   end loop;
-  select exists (
-    select 1 from pg_proc pr join pg_namespace n on n.oid = pr.pronamespace
-     where n.nspname = 'auth' and pr.proname = 'email'
-  ) into has_auth_email;
-  if has_auth_email and not exists (
-    select 1 from pg_policies where schemaname = 'public' and tablename = 'authorized_users'
-       and policyname = 'users check own authorization'
-  ) then
-    execute 'create policy "users check own authorization" on public.authorized_users for select using (email = auth.email())';
+  select (select count(distinct pr.proname) from pg_proc pr join pg_namespace n on n.oid = pr.pronamespace
+           where n.nspname = 'auth' and pr.proname in ('uid', 'email')) = 2
+    into has_auth_fns;
+  if has_auth_fns then
+    execute 'create policy "users check own authorization" on public.authorized_users for select to authenticated '
+         || 'using ((user_id is not null and user_id = auth.uid()) or lower(email) = lower(auth.email()))';
+  else
+    raise notice 'r75: sin auth.uid()/auth.email() (base no Supabase): authorized_users queda sin políticas (nadie lee por cliente)';
   end if;
 end $$;
 

@@ -11,7 +11,7 @@ import { r75AccessSchemaPresent } from './access-schema';
 import {
   R75_BUDGET_READ_SERVICE, R75_PERMISSION_SERVICE, R75BudgetReadServiceLike, R75PermissionServiceLike, UserBudgetSummary,
 } from './access.tokens';
-import { AllowInactiveAccount } from './allow-inactive-account.decorator';
+import { AllowInactiveAccount } from '../authz/public.decorator';
 import { MembershipsService } from './memberships.service';
 import { PlatformControlsService } from './platform-controls.service';
 import { Permission, Role } from './role-matrix';
@@ -125,6 +125,6 @@ export class MeContextController {
       defaultInstitutionId,
       budget,
     };
-    return { ok: true, data };
+    return data;
   }
 }

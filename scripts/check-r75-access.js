@@ -274,10 +274,12 @@ async function dbChecks() {
       create table auth.users (id uuid primary key, email text, email_confirmed_at timestamptz, last_sign_in_at timestamptz,
         created_at timestamptz default now(), banned_until timestamptz, raw_user_meta_data jsonb default '{}'::jsonb);
       create or replace function auth.email() returns text language sql stable as $f$ select null::text $f$;
+      create or replace function auth.uid() returns uuid language sql stable as $f$ select null::uuid $f$;
       create table public.authorized_users (id uuid primary key default gen_random_uuid(), email text unique not null,
         is_admin boolean default false, created_at timestamptz default now());
       alter table public.authorized_users enable row level security;
-      create policy "users check own authorization" on public.authorized_users for select using (email = auth.email());
+      -- H2: la política «propia» MODIFICADA en vivo (mismo nombre, condición abierta): la migración debe recrearla.
+      create policy "users check own authorization" on public.authorized_users for select using (true);
       create policy "admins manage everything" on public.authorized_users for all using (true) with check (true);
       grant all on public.authorized_users to anon, authenticated;
       grant all on all tables in schema public to authenticated;
@@ -323,8 +325,11 @@ async function dbChecks() {
       assert(v.code === 0, v.out);
     });
     await check('[M3] H2: la política de escritura de authorized_users se eliminó; anon sin nada; authenticated solo SELECT', async () => {
-      const pol = await Q(`select policyname, cmd from pg_policies where tablename = 'authorized_users'`);
-      eq(pol, [{ policyname: 'users check own authorization', cmd: 'SELECT' }], 'políticas');
+      const pol = await Q(`select policyname, cmd, roles::text as roles from pg_policies where tablename = 'authorized_users'`);
+      eq(pol, [{ policyname: 'users check own authorization', cmd: 'SELECT', roles: '{authenticated}' }], 'políticas');
+      // La versión modificada en vivo (using true) NO sobrevive: la condición es la exacta de la fila propia.
+      const [{ qual }] = await Q(`select qual from pg_policies where tablename = 'authorized_users'`);
+      assert(/user_id = auth\.uid\(\)/.test(qual) && /lower\(email\) = lower\(auth\.email\(\)\)/.test(qual) && !/^\s*true\s*$/.test(qual), 'qual: ' + qual);
       const g = await Q(`select grantee, privilege_type from information_schema.role_table_grants where table_name = 'authorized_users' and grantee in ('anon','authenticated') order by 1, 2`);
       eq(g, [{ grantee: 'authenticated', privilege_type: 'SELECT' }], 'grants');
       for (const t of ['institution_memberships', 'admin_audit_log', 'user_suspensions', 'platform_controls', 'institution_permission_overrides']) {

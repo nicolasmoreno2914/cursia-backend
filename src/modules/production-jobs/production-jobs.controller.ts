@@ -11,6 +11,7 @@ import {
   UseGuards,
   ServiceUnavailableException,
   ParseUUIDPipe,
+  NotFoundException,
 } from '@nestjs/common';
 import { ProductionJobsService } from './production-jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
@@ -236,6 +237,10 @@ export class ProductionJobsController {
   ) {
     assertLegacyPaidJobsEnabled('videos/requeue');
     const result = await this.jobsService.requeueVideoJob(id, user.id);
+    // r75 (P3): un job ajeno y uno inexistente responden IGUAL (404), sin oráculo de existencia.
+    if (!result.ok && (result.reason === 'forbidden' || result.reason === 'not_found')) {
+      throw new NotFoundException({ code: 'job_not_found', message: 'Job no encontrado' });
+    }
     if (!result.ok) {
       return { ok: false, reason: result.reason };
     }
@@ -260,6 +265,10 @@ export class ProductionJobsController {
   ) {
     assertLegacyPaidJobsEnabled('full/retry');
     const result = await this.jobsService.requeueFullCourseJob(id, user.id);
+    // r75 (P3): un job ajeno y uno inexistente responden IGUAL (404), sin oráculo de existencia.
+    if (!result.ok && (result.reason === 'forbidden' || result.reason === 'not_found')) {
+      throw new NotFoundException({ code: 'job_not_found', message: 'Job no encontrado' });
+    }
     if (!result.ok) {
       return { ok: false, reason: result.reason };
     }
