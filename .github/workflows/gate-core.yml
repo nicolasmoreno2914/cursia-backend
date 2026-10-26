@@ -30,6 +30,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: be
+          # r75: check-r75-sql-casts revisa las líneas agregadas contra origin/staging (necesita la historia y la rama base).
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:

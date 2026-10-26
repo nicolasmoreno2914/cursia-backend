@@ -1,3 +1,4 @@
+import { allowUnownedCourses } from '../authz/unowned-courses'; // r75 D-26 (H4)
 import { CHAPTER_TITLE_TOO_LONG, MODULE_TITLE_TOO_LONG, STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 import { academicBlueprintContext, loadCurrentAcademicContext } from '../academic-context/academic-db';
 import {
@@ -90,10 +91,6 @@ export interface CurrentBlueprintInfo {
 
 const OWNERSHIP_FILTER = `(owner_id = $2 or ($3 = true and owner_id is null))`;
 const BLUEPRINT_NUMBER_UNIQUE = 'course_blueprints_course_number_key';
-
-function allowUnownedCourses(): boolean {
-  return process.env.ALLOW_UNOWNED_COURSES === 'true';
-}
 
 function toIso(v: Date | string): string {
   return (v instanceof Date ? v : new Date(v)).toISOString();

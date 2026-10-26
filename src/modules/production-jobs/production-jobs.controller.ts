@@ -10,6 +10,8 @@ import {
   HttpStatus,
   UseGuards,
   ServiceUnavailableException,
+  ParseUUIDPipe,
+  NotFoundException,
 } from '@nestjs/common';
 import { ProductionJobsService } from './production-jobs.service';
 import { CreateJobDto } from './dto/create-job.dto';
@@ -28,6 +30,7 @@ import { AuthUser } from '../../auth/auth.types';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import { redactJobForOwner } from './owner-safe-job';
 import { legacyPaidJobsDisabledMessage, legacyPaidJobsEnabled, SPEND_CONTROL_CODES } from '../finops/spend-controls';
+import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 
 /**
  * r58 (AU3 §H1 #14): kill switch de los jobs v1 PAGADOS (Gamma, TTS, Videogen, job maestro). LEGACY_PAID_JOBS_ENABLED
@@ -39,6 +42,7 @@ export function assertLegacyPaidJobsEnabled(kind: string, env: NodeJS.ProcessEnv
   throw new ServiceUnavailableException({ code: SPEND_CONTROL_CODES.legacyPaidJobsDisabled, message: legacyPaidJobsDisabledMessage(kind) });
 }
 
+@AuthenticatedOnly('jobs legacy propios: owner_id = actor en todas las queries; course_id ajeno → 404 (H8a)')
 @Controller('jobs')
 @UseGuards(SupabaseJwtGuard)
 export class ProductionJobsController {
@@ -163,7 +167,7 @@ export class ProductionJobsController {
    */
   @Get(':id')
   async findOne(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     const job = await this.jobsService.findOne(id, user.id);
@@ -176,7 +180,7 @@ export class ProductionJobsController {
    */
   @Patch(':id')
   async update(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @Body() dto: UpdateJobDto,
     @CurrentUser() user: AuthUser,
   ) {
@@ -190,7 +194,7 @@ export class ProductionJobsController {
    */
   @Patch(':id/steps/:stepKey')
   async updateStep(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @Param('stepKey') stepKey: string,
     @Body() dto: UpdateStepDto,
     @CurrentUser() user: AuthUser,
@@ -228,11 +232,15 @@ export class ProductionJobsController {
   @Post(':id/requeue')
   @HttpCode(HttpStatus.OK)
   async requeue(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     assertLegacyPaidJobsEnabled('videos/requeue');
     const result = await this.jobsService.requeueVideoJob(id, user.id);
+    // r75 (P3): un job ajeno y uno inexistente responden IGUAL (404), sin oráculo de existencia.
+    if (!result.ok && (result.reason === 'forbidden' || result.reason === 'not_found')) {
+      throw new NotFoundException({ code: 'job_not_found', message: 'Job no encontrado' });
+    }
     if (!result.ok) {
       return { ok: false, reason: result.reason };
     }
@@ -252,11 +260,15 @@ export class ProductionJobsController {
   @Post(':id/retry')
   @HttpCode(HttpStatus.OK)
   async retryFullCourseJob(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @CurrentUser() user: AuthUser,
   ) {
     assertLegacyPaidJobsEnabled('full/retry');
     const result = await this.jobsService.requeueFullCourseJob(id, user.id);
+    // r75 (P3): un job ajeno y uno inexistente responden IGUAL (404), sin oráculo de existencia.
+    if (!result.ok && (result.reason === 'forbidden' || result.reason === 'not_found')) {
+      throw new NotFoundException({ code: 'job_not_found', message: 'Job no encontrado' });
+    }
     if (!result.ok) {
       return { ok: false, reason: result.reason };
     }
@@ -266,7 +278,7 @@ export class ProductionJobsController {
   @Post(':id/cancel')
   @HttpCode(HttpStatus.OK)
   async cancelJob(
-    @Param('id') id: string,
+    @Param('id', new ParseUUIDPipe()) id: string,
     @Body('reason') reason: string | undefined,
     @CurrentUser() user: AuthUser,
   ) {

@@ -1,3 +1,4 @@
+import { allowUnownedCourses } from '../authz/unowned-courses'; // r75 D-26 (H4)
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { assembleLockSnapshotV2, loadLockRows, plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
@@ -42,7 +43,7 @@ export class ChangeImpactService {
 
   async preview(courseId: number, ownerId: string, body: ChangeImpactRequest) {
     assertDynamicOwnerAllowed(ownerId);
-    const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
+    const allowUnowned = allowUnownedCourses();
     const [course] = await this.dataSource.query(
       `select id, title, structure_version, final_exam_enabled, activity_engine,
               (to_jsonb(courses) ->> 'review_cards_enabled')::boolean as review_cards_enabled

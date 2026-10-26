@@ -32,6 +32,11 @@ const EXECUTION_MODES = Object.freeze([
   // Fase 5B.1 (empaquetado Moodle dinámico): el job que produce el .mbz de un
   // run 5A completado (spec §7/§10, plan B3).
   'dynamic_package',
+  // Brand Kit (supabase-migration-brand-extraction-execution-mode.sql, 065380e): el job de la subida de Brand Kit
+  // (POST /institutions/:id/brand-profiles/upload). Faltaba acá: cada deploy que re-aplica estos CHECK (deploy-staging
+  // [2/6], prod-release.sh) lo sacaba de nuevo → la subida daba 500 (23514), y una fila existente con este modo hacía
+  // fallar el ADD CONSTRAINT del deploy. Ensanchar el CHECK es aditivo (ninguna fila existente puede violarlo).
+  'brand_extraction',
 ]);
 
 const WORKER_STATUSES = Object.freeze([

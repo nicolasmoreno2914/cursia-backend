@@ -266,7 +266,14 @@ async function main() {
         if (!checked.has(m.tableName)) continue;
         const present = cols[m.tableName];
         if (!Object.keys(present).length) { problems.push(`falta la tabla ${m.tableName}`); continue; }
-        for (const c of m.columns) if (!present[c.databaseName]) problems.push(`${m.tableName}.${c.databaseName} (${m.name})`);
+        for (const c of m.columns) {
+          if (present[c.databaseName]) continue;
+          // r75: columna INERTE para TypeORM (select/insert/update: false, sin default): ninguna query de la entity la
+          // nombra (las consultas legacy de arriba lo prueban) y la migración que la crea es staging-only hasta la
+          // aprobación del owner (EXCLUDED del runner). Se lee/escribe solo por SQL detrás de los flags r75 (off en prod).
+          if (!c.isSelect && !c.isInsert && !c.isUpdate && c.default === undefined) continue;
+          problems.push(`${m.tableName}.${c.databaseName} (${m.name})`);
+        }
       }
       for (const t of V2_TABLES) if (!ds.entityMetadatas.some((m) => m.tableName === t) && !Object.keys(cols[t] || {}).length) {
         const [{ present }] = await withClient(async (c) => (await c.query(`select to_regclass('public.' || $1) is not null as present`, [t])).rows);

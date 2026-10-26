@@ -1,0 +1,59 @@
+{
+  "GET /admin/audit-log": {
+    "status": 200,
+    "body": {
+      "data": {
+        "items": [
+          {
+            "id": 103,
+            "at": "2026-10-26T11:00:00.000Z",
+            "actorId": "0a000000-0000-4000-8000-000000000001",
+            "actorEmail": "qa-r75-superadmin@example.com",
+            "action": "suspension.create",
+            "targetType": "user",
+            "targetId": "0a000000-0000-4000-8000-000000000007",
+            "institutionId": null,
+            "before": null,
+            "after": {
+              "kind": "account",
+              "reason": "QA r75: prueba de suspensión"
+            }
+          },
+          {
+            "id": 102,
+            "at": "2026-10-26T10:30:00.000Z",
+            "actorId": "0a000000-0000-4000-8000-000000000002",
+            "actorEmail": "qa-r75-admin-inst-a@example.com",
+            "action": "membership.update",
+            "targetType": "membership",
+            "targetId": "1b000000-0000-4000-8000-00000000000a:0a000000-0000-4000-8000-000000000005",
+            "institutionId": "1b000000-0000-4000-8000-00000000000a",
+            "before": {
+              "role": "CONSULTA"
+            },
+            "after": {
+              "role": "APROBADOR_ACADEMICO"
+            }
+          },
+          {
+            "id": 101,
+            "at": "2026-10-26T10:00:00.000Z",
+            "actorId": "0a000000-0000-4000-8000-000000000001",
+            "actorEmail": "qa-r75-superadmin@example.com",
+            "action": "user.create",
+            "targetType": "user",
+            "targetId": "0a000000-0000-4000-8000-0000000000a2",
+            "institutionId": null,
+            "before": null,
+            "after": {
+              "email": "qa-r75-temporal@example.com",
+              "mode": "temp_password"
+            }
+          }
+        ],
+        "nextCursor": "100"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

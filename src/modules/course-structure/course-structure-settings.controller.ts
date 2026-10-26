@@ -4,6 +4,9 @@ import { UpdateStructureSettingsDto } from './dto/update-structure-settings.dto'
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
+import { Access } from '../authz/access.decorator';
+import type { AccessContext } from '../authz/access-context';
+import { RequirePermission } from '../authz/require-permission.decorator';
 
 /**
  * V2.1 (R3): toggles de producto a nivel curso (`finalExam`,
@@ -18,11 +21,13 @@ export class CourseStructureSettingsController {
   // PATCH /api/v1/courses/:courseId/structure-settings
   // body { finalExam?, activityEngine?, expectedCounter } → { structureVersionCounter, finalExam, activityEngine }
   @Patch()
+  @RequirePermission('courses.edit', { course: 'param:courseId' })
   updateSettings(
     @Param('courseId', ParseIntPipe) courseId: number,
     @Body() dto: UpdateStructureSettingsDto,
     @CurrentUser() user: AuthUser,
+    @Access() access: AccessContext,
   ) {
-    return this.structureService.updateSettings(courseId, user.id, dto);
+    return this.structureService.updateSettings(courseId, access.effectiveOwnerId, dto);
   }
 }

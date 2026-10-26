@@ -3,6 +3,8 @@ import type { Response } from 'express';
 import { CourseMediaService } from './course-media.service';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
+import { PublicCapability } from '../authz/public.decorator';
+import { SuperAdminOnly } from '../authz/require-permission.decorator';
 
 /**
  * r74 — dirección DURADERA de un medio del curso (pública, de capacidad): 302 a una URL firmada nueva. Sin JWT a
@@ -13,6 +15,7 @@ export class CourseMediaController {
   constructor(private readonly media: CourseMediaService) {}
 
   // GET (y HEAD) /api/v1/media/:artifactId/:mediaKey/:filename
+  @PublicCapability()
   @Get(':artifactId/:mediaKey/:filename')
   async get(@Param('artifactId') artifactId: string, @Param('mediaKey') mediaKey: string, @Param('filename') filename: string, @Res() res: Response) {
     return this.answer(await this.media.resolve(artifactId, mediaKey, filename), res);
@@ -40,6 +43,7 @@ export class CourseMediaController {
 export class CourseMediaAdminController {
   constructor(private readonly media: CourseMediaService) {}
 
+  @SuperAdminOnly()
   @Get('health')
   health(@Query('courseId') courseId?: string, @Query('limit') limit?: string) {
     return this.media.health(courseId && courseId.trim() ? courseId.trim() : null, Number(limit) || 200);

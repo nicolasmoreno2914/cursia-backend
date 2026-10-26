@@ -1,0 +1,111 @@
+{
+  "GET /institutions/:id/spend?groupBy=user": {
+    "status": 200,
+    "body": {
+      "data": {
+        "institutionId": "1b000000-0000-4000-8000-00000000000a",
+        "from": "2026-10-01T00:00:00.000Z",
+        "to": "2026-10-31T23:59:59.999Z",
+        "actualUsd": "4.1250000000",
+        "reservedUsd": "0.7500000000",
+        "committedUsd": "4.8750000000",
+        "byUser": [
+          {
+            "userId": "0a000000-0000-4000-8000-000000000003",
+            "email": "qa-r75-creador-a@example.com",
+            "actualUsd": "4.1250000000",
+            "committedUsd": "4.8750000000"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /institutions/:id/spend?groupBy=course": {
+    "status": 200,
+    "body": {
+      "data": {
+        "institutionId": "1b000000-0000-4000-8000-00000000000a",
+        "from": "2026-10-01T00:00:00.000Z",
+        "to": "2026-10-31T23:59:59.999Z",
+        "actualUsd": "4.1250000000",
+        "reservedUsd": "0.7500000000",
+        "committedUsd": "4.8750000000",
+        "byCourse": [
+          {
+            "courseId": 4242,
+            "title": "QA r75 · Curso de prueba",
+            "actualUsd": "4.1250000000",
+            "committedUsd": "4.8750000000"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /institutions/:id/spend?groupBy=provider": {
+    "status": 200,
+    "body": {
+      "data": {
+        "institutionId": "1b000000-0000-4000-8000-00000000000a",
+        "from": "2026-10-01T00:00:00.000Z",
+        "to": "2026-10-31T23:59:59.999Z",
+        "actualUsd": "4.1250000000",
+        "reservedUsd": "0.7500000000",
+        "committedUsd": "4.8750000000",
+        "byProvider": [
+          {
+            "provider": "anthropic",
+            "actualUsd": "3.0000000000"
+          },
+          {
+            "provider": "openai_tts",
+            "actualUsd": "1.1250000000"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "GET /admin/spend": {
+    "status": 200,
+    "body": {
+      "data": {
+        "rows": [
+          {
+            "key": "1b000000-0000-4000-8000-00000000000a",
+            "label": "QA r75 Institución A",
+            "actualUsd": "4.1250000000",
+            "reservedUsd": "0.7500000000",
+            "committedUsd": "4.8750000000"
+          },
+          {
+            "key": "1b000000-0000-4000-8000-00000000000b",
+            "label": "QA r75 Institución B",
+            "actualUsd": "0.0000000000",
+            "reservedUsd": "0.0000000000",
+            "committedUsd": "0.0000000000"
+          }
+        ],
+        "unattributedUsd": "0.3100000000"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /admin/budgets/reconcile": {
+    "status": 200,
+    "body": {
+      "data": {
+        "users": [
+          {
+            "userId": "0a000000-0000-4000-8000-000000000003",
+            "ledgerSpentUsd": "4.1250000000",
+            "settledReservationsUsd": "4.1250000000",
+            "driftUsd": "0.0000000000"
+          }
+        ]
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

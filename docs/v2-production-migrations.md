@@ -134,7 +134,7 @@ select execution_mode, count(*), max(created_at) from public.production_jobs gro
 select count(*) as would_violate_execution_mode from public.production_jobs
  where execution_mode not in ('frontend','backend_content','backend_audio','backend_videos','backend_h5p',
    'backend_gamma','backend_package','backend_package_base','course_full_generation','backend_full_future',
-   'dynamic_generation','dynamic_package');
+   'dynamic_generation','dynamic_package','brand_extraction');
 select count(*) as would_violate_worker_status from public.production_jobs
  where worker_status is not null and worker_status not in ('queued','running','waiting_external','retrying',
    'paused','pausing','cancelling','completed','failed','failed_recoverable','failed_retryable',

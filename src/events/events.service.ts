@@ -9,13 +9,20 @@
      Si la inserción falla, se loguea y se devuelve ok=false.
    ══════════════════════════════════════════════════════════════ */
 
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { UsageEvent } from './entities/usage-event.entity';
 import { CreateEventDto } from './dto/create-event.dto';
 import { CostRatesService } from '../admin/services/cost-rates.service';
 import { AuthUser } from '../auth/auth.types';
+import { resolveCourseRef } from '../modules/authz/resource-resolver';
+
+/** r75 B1 (H8c): tipos de evento que solo escribe el servidor (p. ej. el registro de renders del Video Engine, H3). */
+export const SERVER_ONLY_EVENT_PREFIX = 'server.';
+export function isServerOnlyEventType(t: unknown): boolean {
+  return typeof t === 'string' && t.trim().toLowerCase().startsWith(SERVER_ONLY_EVENT_PREFIX);
+}
 import {
   UsageEventComponent,
   UsageEventCostSource,
@@ -196,7 +203,28 @@ export class EventsService {
    * se guardan como costo (real_cost_usd = null, cost_type nunca 'real') y quedan solo como dato declarado en
    * metadata.clientDeclaredCost con costUntrusted=true. Ningún lector de dinero lee usage_events (ver CostReadService).
    */
+  /**
+   * r75 B1 (H8c): `course_id` del body era libre. Si apunta a un curso (id numérico o UUID del frontend) que existe y
+   * NO es del usuario (y él no tiene ninguno con esa referencia), no se guarda: queda null y la referencia declarada en
+   * `metadata.courseIdRejected` (fire-and-forget: nunca falla el request). Un id que no existe se guarda como hoy (V1
+   * usa ids locales del navegador).
+   */
+  private async scopedCourseId(raw: string | null | undefined, userId: string): Promise<{ courseId: string | null; rejected: string | null }> {
+    if (raw === null || raw === undefined || String(raw).trim() === '') return { courseId: null, rejected: null };
+    try {
+      const matches = await resolveCourseRef((sql, params) => this.eventRepo.query(sql, params as any[]), raw, userId);
+      if (!matches.length || matches.some((c) => c.ownerId === userId)) return { courseId: String(raw), rejected: null };
+      return { courseId: null, rejected: String(raw).slice(0, 120) };
+    } catch {
+      return { courseId: String(raw), rejected: null }; // la base de eventos nunca corta el request (igual que antes)
+    }
+  }
+
   async create(dto: CreateEventDto, user: AuthUser): Promise<{ ok: boolean; id?: string }> {
+    if (isServerOnlyEventType(dto.event_type)) {
+      throw new BadRequestException({ code: 'event_type_reserved', message: 'event_type_reserved: los eventos server.* los registra solo el servidor.' });
+    }
+    const scoped = await this.scopedCourseId(dto.course_id, user.id);
     const costKey = this._resolveCostServiceKey(dto);
     const declaredType = dto.cost_type as UsageEventCostType | undefined;
     const costType: UsageEventCostType = (declaredType && declaredType !== 'real' ? declaredType : undefined)
@@ -212,7 +240,7 @@ export class EventsService {
       eventType: dto.event_type,
       failed: dto.failed ?? false,
       errorMessage: dto.error_message ?? null,
-      courseId: dto.course_id ?? null,
+      courseId: scoped.courseId,
       jobId: dto.job_id ?? null,
       parentJobId: dto.parent_job_id ?? null,
       component: (dto.component as UsageEventComponent) ?? this._inferLegacyComponent(dto.event_type),
@@ -233,6 +261,7 @@ export class EventsService {
       metadata: {
         ...(dto.metadata ?? {}),
         ...(clientDeclaredCost ? { clientDeclaredCost, costUntrusted: true } : {}),
+        ...(scoped.rejected ? { courseIdRejected: scoped.rejected } : {}),
         videoJobId: dto.video_job_id ?? dto.metadata?.videoJobId ?? null,
         videoBatchId: dto.video_batch_id ?? dto.metadata?.videoBatchId ?? null,
         videoCount: dto.video_count ?? dto.metadata?.videoCount ?? null,

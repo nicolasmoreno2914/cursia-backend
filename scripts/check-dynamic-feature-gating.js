@@ -153,6 +153,17 @@ const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
   // el flag de la estructura dinámica: un curso restaurado debe seguir sonando. El monitoreo es SUPER_ADMIN (guard propio).
   'CourseMediaController',
   'CourseMediaAdminController',
+  // r75: autorización (B) y acceso (A): no son rutas V2 (no las esconde el flag dinámico).
+  'PermissionsCatalogController',
+  'MeContextController',
+  'MembershipsController',
+  'InstitutionsAdminController',
+  'AdminUsersController',
+  // r75 (C): presupuestos y gasto por institución (CURSIA_USER_BUDGETS), no son rutas V2.
+  'BudgetsController',
+  'BudgetsAdminController',
+  'InstitutionSpendController',
+  'AdminSpendController',
   'AppController',
   'AuthController',
   'YoutubeController',
@@ -707,8 +718,10 @@ async function runWorkerProcess(script, env, { waitMs }) {
       const repoMiss = { createQueryBuilder: () => qb(false), create: (o) => ({ ...o }), save: async (o) => ({ ...o, id: 8 }) };
       const ctrlOf = (repo) => new CoursesController(new CoursesService(repo, {}));
       const user = { id: OWNER_A, email: 'x@example.com' };
-      const a = await ctrlOf(repoHit).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user);
-      const b = await ctrlOf(repoMiss).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user);
+      // r75: el handler recibe el contexto de acceso (@Access()); llamado directo = contexto legacy (RBAC off).
+      const access = { actorId: OWNER_A, effectiveOwnerId: OWNER_A, legacy: true, institutionId: null };
+      const a = await ctrlOf(repoHit).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user, access);
+      const b = await ctrlOf(repoMiss).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user, access);
       eq([a.id, a.created, b.id, b.created], [7, false, 8, true], 'created');
     }));
 

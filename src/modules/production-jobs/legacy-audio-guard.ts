@@ -1,4 +1,5 @@
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
+import { numericCourseId } from '../authz/schema-probe';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Decisión del owner (pre-aceptación V2): un curso con
@@ -57,8 +58,29 @@ export async function isDynamicCourseFor(query: QueryFn, ownerId: string, rawCou
   return Array.isArray(rows) && rows.length > 0;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// r75 B1 (H8a): el `course_id` del body de un job legacy no se validaba. Con el id NUMÉRICO de un curso ajeno (p. ej.
+// uno dinámico), isDynamicCourseFor (que solo mira los cursos del mismo owner) devolvía false: se saltaba el 409 R68 y
+// el job quedaba apuntando al curso de otro usuario (los workers leen `courses` por ese id). Ahora un id numérico que
+// existe y es de OTRO dueño → 404 `course_not_found` (no revela que existe). Un id numérico que no existe se acepta
+// como hoy (ids locales del V1). Un UUID del frontend no da acceso a nada ajeno (todas sus lecturas filtran por owner;
+// ver authz/resource-resolver.ts), así que no se rechaza.
+// ─────────────────────────────────────────────────────────────────────────────
+export const COURSE_NOT_FOUND = 'course_not_found';
+
+export async function assertCourseRefNotForeign(query: QueryFn, ownerId: string, rawCourseId: unknown): Promise<void> {
+  const id = numericCourseId(rawCourseId);
+  if (id === null) return;
+  const rows = await query(`select owner_id::text as owner_id from public.courses where id = $1`, [id]);
+  const row = Array.isArray(rows) ? rows[0] : null;
+  if (row && String(row.owner_id ?? '') !== String(ownerId ?? '')) {
+    throw new NotFoundException({ code: COURSE_NOT_FOUND, message: `Course #${id} not found` });
+  }
+}
+
 /** 409 `v2_course_legacy_audio_disabled:` si el curso es V2 (dynamic). */
 export async function assertLegacyAudioAllowed(query: QueryFn, ownerId: string, rawCourseId: unknown): Promise<void> {
+  await assertCourseRefNotForeign(query, ownerId, rawCourseId); // r75 H8a
   if (await isDynamicCourseFor(query, ownerId, rawCourseId)) {
     throw new ConflictException(v2CourseLegacyAudioDisabledMessage());
   }
@@ -85,6 +107,8 @@ export async function isLegacyAudioBlockedForJob(
     await jobsService.assertLegacyAudioAllowedForCourse(job.ownerId, raw);
   } catch (err) {
     if (err instanceof ConflictException) return v2CourseLegacyAudioDisabledMessage();
+    // r75 H8a: job viejo con el id numérico de un curso ajeno → se bloquea (nunca se lee el curso de otro dueño).
+    if (err instanceof NotFoundException) return `${COURSE_NOT_FOUND}: el curso del job no es del dueño del job; no se generó audio.`;
     throw err;
   }
   return null;
@@ -99,6 +123,7 @@ export async function isLegacyAudioBlockedForJob(
 export const V2_COURSE_LEGACY_GENERATION_DISABLED = 'v2_course_legacy_generation_disabled';
 
 export async function assertLegacyGenerationAllowed(query: QueryFn, ownerId: string, rawCourseId: unknown): Promise<void> {
+  await assertCourseRefNotForeign(query, ownerId, rawCourseId); // r75 H8a
   if (await isDynamicCourseFor(query, ownerId, rawCourseId)) {
     throw new ConflictException(
       `${V2_COURSE_LEGACY_GENERATION_DISABLED}: este curso usa la estructura dinámica (V2) y solo se genera desde «Revisar y generar», ` +

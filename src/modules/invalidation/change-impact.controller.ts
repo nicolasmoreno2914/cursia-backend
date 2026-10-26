@@ -4,6 +4,9 @@ import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import { AuthUser } from '../../auth/auth.types';
 import { ChangeImpactService } from './change-impact.service';
+import { Access } from '../authz/access.decorator';
+import type { AccessContext } from '../authz/access-context';
+import { RequirePermission } from '../authz/require-permission.decorator';
 
 export class ChangeImpactDto {
   @IsUUID()
@@ -31,7 +34,8 @@ export class ChangeImpactController {
   // POST /api/v1/courses/:courseId/change-impact  body { fromRunId?, profile?, applyDistribution? }
   @Post()
   @HttpCode(200)
-  preview(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: ChangeImpactDto, @CurrentUser() user: AuthUser) {
-    return this.service.preview(courseId, user.id, dto);
+  @RequirePermission('courses.view', { course: 'param:courseId' })
+  preview(@Param('courseId', ParseIntPipe) courseId: number, @Body() dto: ChangeImpactDto, @CurrentUser() user: AuthUser, @Access() access: AccessContext) {
+    return this.service.preview(courseId, access.effectiveOwnerId, dto);
   }
 }
