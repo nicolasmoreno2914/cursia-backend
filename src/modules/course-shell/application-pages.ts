@@ -14,7 +14,7 @@ import { contrastRatio } from '../theme-engine';
 import { lintCleanSafe } from '../visual-components';
 import { eduIcon, roleTone, Tone } from '../visual-components/edu';
 import { inlineHtml, labelHtml } from '../visual-components/text';
-import { Hx, Surf, bgSurf, box, eyebrow, heading, hx, link, pHtml, root, shellFail, st, toneSurf, ul, unprotectedText } from './html';
+import { Hx, Surf, bgSurf, blockLink, box, eyebrow, heading, hx, link, pHtml, root, shellFail, st, toneSurf, ul, unprotectedText } from './html';
 import { criterionForGuide, validateApplicationActivityDoc } from './application-activity';
 
 export interface ApplicationPageInput {
@@ -135,7 +135,7 @@ export function applicationStudentPage(input: ApplicationPageInput, theme: Resol
     heading(h, 'h2', a.title, s) +
     pHtml(h, `<strong>${labelHtml('Objetivo: ')}</strong>${inlineHtml(a.objective)}`, s) +
     pHtml(h, inlineHtml(a.context), s, { secondary: true }) +
-    link(h, `@@PLUGINFILE@@/${input.pdfFilename}`, 'Descargar para imprimir (PDF) →', s, { target: '_blank' });
+    blockLink(h, `@@PLUGINFILE@@/${input.pdfFilename}`, 'Descargar para imprimir (PDF) →', s, { target: '_blank', margin: '0 0 16px 0' });
   if (a.examples.length) {
     body += section(h, 'ejemplo', ex, a.examples.length === 1 ? 'Ejemplo resuelto' : 'Ejemplos resueltos', s);
     for (const e of a.examples) {
@@ -201,7 +201,7 @@ export function applicationSolutionPage(input: ApplicationPageInput, theme: Reso
     meta(h, `Solo docentes · Capítulo ${input.chapterNumber}: ${input.chapterTitle}`, warn, s) +
     heading(h, 'h2', `Solucionario: ${a.title}`, s) +
     pHtml(h, labelHtml('Esta página está oculta para los estudiantes. Si la haces visible, los estudiantes verán las respuestas.'), s, { secondary: true }) +
-    link(h, `@@PLUGINFILE@@/${input.pdfFilename}`, 'Descargar el solucionario (PDF) →', s, { target: '_blank' });
+    blockLink(h, `@@PLUGINFILE@@/${input.pdfFilename}`, 'Descargar el solucionario (PDF) →', s, { target: '_blank', margin: '0 0 16px 0' });
   body += section(h, 'check', ok, 'Respuestas de los ejercicios', s);
   body += `<ol${st(h, [['list-style', 'none'], ['margin', '0 0 8px 0'], ['padding', 0]])}>` +
     sol.answers

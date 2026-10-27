@@ -286,8 +286,12 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * con «api-version-unsupported»). Un paquete SIN H5P queda en el formato del backup (4.1) y sus botones a secciones
  * pasan de `$@COURSESECTIONBYID*n@$` (solo 4.4+) a `$@COURSEVIEWBYID*curso@$&section=n` (todas): ese .mbz cambia.
  * Con H5P el .mbz es byte a byte el de 3.15.1; cambia solo summary.restore.note (agrega «Requiere Moodle 4.5…»).
+ * 3.17.0 (r77, mobile-first): los botones de Cursia son la píldora completa (el <a> con fondo, padding y `float:left`,
+ * área táctil ≥ 44 × 44 px con o sin <style>, también con forceclean y en la app) y los enlaces de descarga solos en su
+ * renglón tienen 44 px de alto. Cambian SOLO los estilos de esos enlaces (mismo texto, mismas actividades, mismos
+ * archivos: Libro Guía, portadas, MP3, H5P, GIFT e insignia byte a byte). Los paquetes de 3.16.0 se re-empaquetan.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.16.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.17.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';

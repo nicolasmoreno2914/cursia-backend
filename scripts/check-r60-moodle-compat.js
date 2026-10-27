@@ -30,6 +30,8 @@ const S = require('./lib/commercial-simulation');
 const CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/commercial-simulation/courses.json'), 'utf8'));
 
 // sha256 de los .mbz de la simulación con el builder 3.15.1 (origin/staging 17dc7b0, r60): con H5P el paquete no cambia.
+// r77 (builder 3.17.0, mobile-first): multi-h5p, 1x1-sin-examenes y 1x1-sin-nota recalculados a propósito — solo cambian los
+// estilos de los botones (la píldora es el <a>) y de los enlaces de descarga; mismo texto, enlaces y archivos (diff por zip).
 const GOLDEN_3_15_1 = {
   'A-S': '9bc86883aa9d61c7070a099434caae2f83ddf3cd31554f93c720fde9681a69da',
   'B-M': 'fba6103888dea9625888477294916d5cb91aebb5a50576345e7a5ff8207aaa77',
@@ -40,14 +42,14 @@ const GOLDEN_3_15_1 = {
   ofimatica: '7e03f1a412c28faf2bff17d69de5c44cb86dd63793890fb77f1c308ad8892eb9',
   gagne: '8728e5fc5682274cf6da5b1338c00b86cdc985006f017927f7a46233bc907165',
   'entrega-rubrica': '50122ed91edd787ade3180833ceb012dcd9b3d51cf1ea75959e9be35ddf254ff',
-  'multi-h5p': 'a7e024c89e45bd0bab930a00a93989712ee9981c631e93fe8954c5875749348f',
+  'multi-h5p': '2e2ab1d484dcaf18b07c8ea22e74d12517fa35c8b90b6a25f9cc8723e77c3cc1',
   'teorico-16': 'f4bff6931f19c5e27c672b0f5fb866101b7a0d7e653ebca5b388cf911b7cce7e',
   'practico-32': '4167f71a2c10f5d0294f7542239484071df94922c7f6a83b8c80197a18b800d8',
   'protocolo-20': 'f6593952bd92463d3a09711851035616b0a9c1b14c3662d0c37a57f6b23a9263',
   'casos-64': '3626bfb9eb17c875c9f5db87280026205fb5ad87d6cf7cb9d55236f77b55d8d8',
   'mixto-96': '4801c40fe668563a8104b65e7ac5fa948424cb65754e8c8fda8f0f8d919e857d',
-  '1x1-sin-examenes': '7fa4bb8c1d165a39c3f4cb5ae19bf8c71d0b557ccc1ac5b639a4b77399ab8951',
-  '1x1-sin-nota': '7cef1dc934a3cc6f4816af45588a18bfbe315e8ceb2a9bd6cb4ec6bbe5fe92cf',
+  '1x1-sin-examenes': '9a18d11a4e3b2ed259088bedf7eee37c0cbab10cc1bd08467ac17c3b875c85a3',
+  '1x1-sin-nota': 'bd95ddde09ff62b711ee56cdc98f78c8e0cc01272587fbb3261acae0c0238f4a',
 };
 const QUICK = ['multi-h5p', '1x1-sin-examenes', '1x1-sin-nota'];
 const ALL = process.argv.includes('--all');
@@ -169,7 +171,7 @@ async function labelXmls(mbz) {
       assert(sim.built.summary.h5pPackages.length > 0, 'sin H5P');
       eq([c.backupFormat, c.minimumMoodle, c.h5pCoreApi, c.sectionLinks, sim.built.expectations.moodleMinimum], ['4.1', '4.5', '1.28', 'COURSESECTIONBYID', '4.5'], 'compatibilidad');
       eq(sha256(sim.built.mbz), GOLDEN_3_15_1[cfg.id], 'sha256 del .mbz (con H5P no cambia)');
-      eq(sim.built.summary.builderVersion, '3.16.0', 'builder');
+      eq(sim.built.summary.builderVersion, '3.17.0', 'builder');
     });
   }
   const noH5pCfg = { ...CONFIG.courses.find((c) => c.id === '1x1-sin-nota'), id: '1x1-sin-nota-sin-h5p', reviewCards: false };

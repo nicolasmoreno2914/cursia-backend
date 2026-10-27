@@ -323,17 +323,40 @@ export function link(
   const c = h.t.color;
   const tgt = opts.target === '_blank' ? ' target="_blank" rel="noopener noreferrer"' : '';
   if (opts.button) {
-    // CLEAN_SAFE: un BLOQUE con fondo de acento (el <a> en línea partía el fondo al envolver a
-    // 390 px). ENHANCED: el bloque se vuelve píldora (inline-block, radio 999).
     // P3: el botón toma el color del módulo cuando el shell lo pasa (fill).
+    // r77 (mobile-first): la píldora ES el enlace. Antes el fondo y el padding estaban en el <div> y el <a> en línea solo
+    // cubría el texto (≈ 25 px de alto): tocar el borde de la píldora no hacía nada (WCAG 2.5.5 / HIG: 44 × 44 px).
+    // `float:left` sobrevive a HTMLPurifier (forceclean y la app) y vuelve al <a> una caja de bloque con su propio
+    // padding y fondo en los DOS regímenes (con o sin <style>); el <div> de cierre `clear:both` la contiene.
+    // Alto ≥ 44 px: 12 px + línea de 1.4 × ≥ 16 px + 12 px. Ancho: se ajusta al texto y envuelve dentro de la columna.
     const b = opts.fill ? surfOn(h.t, opts.fill.bg, [opts.fill.fg]) : surfOn(h.t, c.accent, [c.textOnAccent]);
     return (
-      `<div class="cvc-btn-wrap"${st(h, [['background-color', b.bg], ['color', b.fg], ['padding', '12px 20px'], ['margin', opts.margin ?? '0'], ['text-align', 'center']], [['display', 'table'], ['border-radius', '999px'], ['max-width', '100%']])}>` +
-      `<a class="cvc-btn-link" href="${attr(href)}"${tgt}${st(h, [['color', b.fg], ['font-weight', '700'], ['text-decoration', 'none']])}>${inlineHtml(text)}</a></div>`
+      `<div class="cvc-btn-wrap"${st(h, [['margin', opts.margin ?? '0'], ['padding', 0]])}>` +
+      `<a class="cvc-btn-link" href="${attr(href)}"${tgt}${st(
+        h,
+        [['float', 'left'], ['background-color', b.bg], ['color', b.fg], ['padding', '12px 20px'], ['margin', 0], ['font-weight', '700'], ['line-height', '1.4'], ['text-align', 'center'], ['text-decoration', 'none']],
+        [['border-radius', '999px']],
+      )}>${inlineHtml(text)}</a><div${st(h, [['clear', 'both']])}></div></div>`
     );
   }
   const col = [c.accentStrong, c.accent, s.fg].find((x) => contrastRatio(x, s.bg) >= MIN_CONTRAST) ?? s.fg;
   return `<a href="${attr(href)}"${tgt}${st(h, [['color', col], ['font-weight', '700']])}>${inlineHtml(text)}</a>`;
+}
+
+/**
+ * r77 (mobile-first): enlace SOLO en su renglón (descargas): área táctil ≥ 44 px de alto en los dos regímenes.
+ * El padding vertical del <a> en línea agranda su área de toque y el del párrafo reserva ese mismo espacio en el flujo
+ * (13 + ≈ 18–22 + 13 px), así el área no tapa el renglón vecino. Mismo color y peso que `link()`.
+ */
+export function blockLink(h: Hx, href: string, text: string, s: Surf, opts: { target?: '_blank'; margin?: string; fontSize?: number } = {}): string {
+  const c = h.t.color;
+  const tgt = opts.target === '_blank' ? ' target="_blank" rel="noopener noreferrer"' : '';
+  const col = [c.accentStrong, c.accent, s.fg].find((x) => contrastRatio(x, s.bg) >= MIN_CONTRAST) ?? s.fg;
+  const fs: Decl[] = opts.fontSize ? [['font-size', opts.fontSize]] : [];
+  return (
+    `<p${st(h, [['margin', opts.margin ?? '0'], ['padding', '13px 0'], ['color', s.fg2], ...fs, ['line-height', '1.4']])}>` +
+    `<a href="${attr(href)}"${tgt}${st(h, [['color', col], ['font-weight', '700'], ['padding', '13px 0']])}>${inlineHtml(text)}</a></p>`
+  );
 }
 
 /**
@@ -352,7 +375,7 @@ export function audio(h: Hx, src: string, label: string, s: Surf, name: string):
     `<p${st(h, [['margin', '0 0 12px 0'], ['padding', 0], ['color', s.fg]])}>` +
     `<audio controls preload="metadata" title="${attr(name.trim())}"${h.enh ? ` aria-label="${attr(name.trim())}"` : ''} src="${attr(src)}"${st(h, [['width', '100%'], ['max-width', '100%']])}>` +
     `${labelHtml('Tu navegador no puede reproducir este audio: usa el enlace de descarga.')}</audio></p>` +
-    `<p${st(h, [['margin', '0'], ['padding', 0], ['color', s.fg2], ['font-size', h.t.typography.sizeSmallPx]])}>${link(h, src, `Descargar ${label} (MP3)`, s)}</p>`
+    blockLink(h, src, `Descargar ${label} (MP3)`, s, { fontSize: h.t.typography.sizeSmallPx })
   );
 }
 

@@ -1,8 +1,9 @@
 {
   "_note": "sha256 de .mbz SIN applicationDelivery/practiceResources, calculados con el build ANTERIOR a T4/T5 (BE 3198288, worktree desechable). check-application-deliverables D3 exige igualdad con el build actual.",
   "baseCommit": "3198288",
-  "appModulesH5p": "4bf9abed5fe86cee9232ded6657f31d37529fb35c79c806c89af0f978c0029e0",
-  "appModulesScorm": "a247579625c6ff1e40643c0b517150ff71382dc701908620528ba4a32a8b15d3",
-  "course2NoFinal": "297ab047717407d3abca22642ecea89705b6a43ad3370bd9dfead70487fd9c6e",
-  "course2H5pV2Review": "3f024d2377b95d2a600f80c03ae05301a39e8326ecf62dec4352206f40f10cde"
+  "appModulesH5p": "189c3b00b1446d60be2ed46f201f97461845d780e2514144936994aa2c320730",
+  "appModulesScorm": "7d82a7857c08d6639015ec2dce45e38a51fceac8bfb35d79a06073e1ce6bebf6",
+  "course2NoFinal": "2e995bba676159533e2d2d7afdbe23987b59749a9238814976f0caefb7406187",
+  "course2H5pV2Review": "069dc24d360d3ea8756141262326c3c6b8e8304b06b9688340ffc7b50f2d3a07",
+  "_r77": "r77 (mobile-first, builder 3.17.0): los 4 sha se recalcularon a propósito; frente a c820d4e solo cambian los estilos de los botones y de los enlaces de descarga (mismo texto, mismas etiquetas, enlaces y archivos; diff por entrada del zip en validation/r77-mobile)."
 }
