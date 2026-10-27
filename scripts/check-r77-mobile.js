@@ -414,7 +414,7 @@ async function moodleChecks() {
       if (process.argv.includes('--m5=teacher')) continue;
       for (const d of devices) {
         await check(`M5b ${regime} · ${d.key}: secciones, páginas, H5P, evaluaciones, SCORM, Libro e insignias de ${STYLES.length} estilos`, async () => {
-          const { ctx, page } = await contextFor(d);
+          let { ctx, page } = await contextFor(d);
           try {
             for (const s of STYLES) {
               const c = courses[s.key].curso;
@@ -422,8 +422,20 @@ async function moodleChecks() {
               const shoot = regime === 'guardado' ? ['iphone-390', 'desktop-1280', 'android-320'].includes(d.key) : d.key === 'iphone-390';
               for (const sec of c.cms.sections) {
                 await go(page, `http://127.0.0.1:8099/course/view.php?id=${c.id}&section=${sec.section}`);
-                const m = await page.evaluate(M.measureExpr({}));
+                let m = await page.evaluate(M.measureExpr({}));
                 // Toda sección del curso tiene labels de Cursia: si no se ve ninguno, la sesión se perdió (nunca pasar en silencio).
+                // Moodle local (servidor PHP de un proceso por pedido) a veces manda la PRIMERA visita a enrol/index.php: un reintento.
+                // Si sigue sin verse (redirige a enrol/index.php aunque la matrícula está activa en la base), se vuelve a
+                // iniciar sesión en un contexto nuevo y se reintenta UNA vez; queda registrado en la evidencia.
+                for (let attempt = 0; !m.roots.length && attempt < 2; attempt++) {
+                  if (attempt === 1) {
+                    (evidence.moodle.sessionRetries = evidence.moodle.sessionRetries || []).push({ style: s.key, device: d.key, regime, section: sec.section, url: page.url() });
+                    await ctx.close();
+                    ({ ctx, page } = await contextFor(d));
+                  } else await page.waitForTimeout(1500);
+                  await go(page, `http://127.0.0.1:8099/course/view.php?id=${c.id}&section=${sec.section}`);
+                  m = await page.evaluate(M.measureExpr({}));
+                }
                 assert(m.roots.length > 0, `${s.key}/${d.key}/${regime}: sección ${sec.section} sin contenido de Cursia (${page.url()}): ¿sesión perdida?`);
                 record({ style: s.key, kind: 'curso', device: d.key, regime, page: `seccion-${sec.section}`, material: `seccion-${sec.section}` }, m);
                 if (shoot && (sec.section <= 2 || deep)) await page.screenshot({ path: path.join(shotsDir, `${s.key}-${regime}-${d.key}-seccion${sec.section}.png`), fullPage: true });
