@@ -21,6 +21,7 @@
     "dryRun": "1ccf631eb7d1d68d4defc043ac2bec0801fe49776dc3aa6fa79d2c4e496dc7a5",
     "dryRunNoProfile": "ea251d883d60c9a23cb586a8a37b798fc55ae968cf97b160d24740f8fda38239",
     "facts": "e75930592c1927b1e901909731d716f2cf02cca4b01adc119304350acdf42704",
-    "shell": "c483f43de3dbfc7570bb716d8467a2b6f05232087157be3cc2d470e13c427dd0"
-  }
+    "shell": "507d5f5f5f6de271083992f5304107f886b49ab9540147b099ef46223bfe3eb5"
+  },
+  "r77": "shell actualizado a propósito en r77 (mobile-first, builder 3.17.0): solo cambian los estilos de los botones (la píldora es el <a>) y de los enlaces de descarga; mismo texto. Antes (c820d4e): c483f43de3dbfc7570bb716d8467a2b6f05232087157be3cc2d470e13c427dd0."
 }

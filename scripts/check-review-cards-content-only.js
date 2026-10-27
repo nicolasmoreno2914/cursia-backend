@@ -150,7 +150,7 @@ async function swapH5p(mbz, oldHash, next) {
     eq(built.summary.restore.libraryPack, 'v3', 'pack');
     assert(/Cursia H5P Library Pack v3/.test(built.summary.restore.note) && /cualquier docente/.test(built.summary.restore.note) && !/como administrador o gestor/.test(built.summary.restore.note), built.summary.restore.note);
     eq(built.summary.h5pProfileVersion, 3, 'perfil del paquete');
-    eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.16.0', 'builder'); // r60 (Moodle mínimo); r58 I3: 3.15.1
+    eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.17.0', 'builder'); // r60 (Moodle mínimo); r58 I3: 3.15.1
   });
 
   // ── Negativos del validador ──

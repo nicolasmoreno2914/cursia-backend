@@ -1189,6 +1189,18 @@
     });
   }
 
+  // r76 «Diseño visual» (64-v2-visual-design.js): contexto (perfil vigente, familias, marca de la cuenta) y vista previa
+  // REAL (el backend arma un curso de muestra con el builder del empaque; sin IA, sin escribir nada).
+  function backendVisualDesignContext(courseId, opts) {
+    var q = (opts && opts.paletteId) ? '?paletteId=' + encodeURIComponent(opts.paletteId) : '';
+    return backendApiRequest('/api/v1/courses/' + courseId + '/visual-design' + q, { method: 'GET' }, 20000);
+  }
+  function backendVisualDesignPreview(courseId, data, opts) {
+    var body = { data: data };
+    if (opts && opts.includePackage) body.includePackage = true;
+    return backendApiRequest('/api/v1/courses/' + courseId + '/visual-design/preview', { method: 'POST', body: body }, 60000);
+  }
+
   // ── Motor pedagógico V1 (49-pedagogy-panel.js): lectura + lógica pura, nada se genera ni se cobra ──
   function backendPedagogyCatalog() {
     return backendApiRequest('/api/v1/pedagogy/catalog', { method: 'GET' });
@@ -4136,6 +4148,8 @@
   window.backendUpdateChapter          = backendUpdateChapter;
   window.backendUpdateStructureSettings = backendUpdateStructureSettings;
   window.backendGetCourseProfile = backendGetCourseProfile;
+  window.backendVisualDesignContext = backendVisualDesignContext;
+  window.backendVisualDesignPreview = backendVisualDesignPreview;
   window.backendPedagogyCatalog = backendPedagogyCatalog;
   window.backendPedagogyWizard = backendPedagogyWizard;
   window.backendPedagogyRecommend = backendPedagogyRecommend;
