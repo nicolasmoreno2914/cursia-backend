@@ -24,6 +24,7 @@ import {
 } from './run-budget';
 import { APPROVAL_TTL_HOURS, NORMAL_APPROVAL_REASON_PREFIX } from './normal-approval';
 import { llmCallUpperBoundUsage } from './llm-usage-ingest';
+import { ReservationKind, SubjectSpendAccess, UserBudgetGate, userBudgetsMode } from './user-budget-gate';
 
 /** Advisory lock global (por transacción) que serializa las aprobaciones del flujo normal frente al tope mensual. */
 export const MONTH_CAP_LOCK = 'finops-normal-approval-month-cap';
@@ -65,6 +66,45 @@ export class FinopsBudgetService {
     private readonly dataSource: DataSource,
     private readonly ledger: FinopsLedgerService,
   ) {}
+
+  // ─── r75 (Agente C): presupuesto por usuario (01 §5). Sin gate o con CURSIA_USER_BUDGETS=off → igual que antes. ───
+
+  private userBudgetGate: UserBudgetGate | null = null;
+  private subjectSpendAccess: SubjectSpendAccess | null = null;
+
+  /** Lo llama BudgetsModule al iniciar (evita la dependencia circular finops ↔ budgets). */
+  setUserBudgetGate(gate: UserBudgetGate | null): void {
+    this.userBudgetGate = gate;
+  }
+
+  /** A/B registran acá el chequeo de cuenta/suspensión/congelación del sujeto del proxy (02 §E.5). */
+  setSubjectSpendAccess(access: SubjectSpendAccess | null): void {
+    this.subjectSpendAccess = access;
+  }
+
+  getSubjectSpendAccess(): SubjectSpendAccess | null {
+    return this.subjectSpendAccess;
+  }
+
+  /** Gate registrado (con cualquier modo): los controles de A (congelación / suspensiones) aplican aunque el flag esté en off. */
+  registeredUserBudgetGate(): UserBudgetGate | null {
+    return this.userBudgetGate;
+  }
+
+  /** Gate activo (registrado y con el flag en shadow/enforce), o null. */
+  activeUserBudgetGate(): UserBudgetGate | null {
+    const g = this.userBudgetGate;
+    return g && g.mode() !== 'off' ? g : null;
+  }
+
+  /**
+   * r75 (H6 d): fecha efectiva del ledger (= la del CHARGE que un ADJUSTMENT corrige, como CostReadService) para los
+   * topes mensuales. Solo con presupuestos por usuario activos; con el flag en off, `created_at` como siempre.
+   */
+  private monthEventsFilter(alias = 'e'): string {
+    if (userBudgetsMode() === 'off') return `${alias}.created_at >= date_trunc('month', now())`;
+    return `coalesce((select p.created_at from public.generation_cost_events p where p.id = ${alias}.corrects_event_id), ${alias}.created_at) >= date_trunc('month', (now() at time zone 'utc')) at time zone 'utc'`;
+  }
 
   async catalog(runner: Runner = this.dataSource): Promise<PricingCatalogRow[]> {
     return runner.query(
@@ -229,8 +269,8 @@ export class FinopsBudgetService {
    */
   async monthCommitted(runner: Runner = this.dataSource): Promise<{ spent: string; outstanding: string; total: string }> {
     const [s] = await runner.query(
-      `select coalesce(sum(amount),0)::text as total from public.generation_cost_events
-        where billing_account <> 'user_key' and created_at >= date_trunc('month', now())`,
+      `select coalesce(sum(e.amount),0)::text as total from public.generation_cost_events e
+        where e.billing_account <> 'user_key' and ${this.monthEventsFilter('e')}`,
     );
     const [o] = await runner.query(
       `select coalesce(sum(greatest(a.authorized_budget - coalesce(sp.spent, 0), 0)),0)::text as total
@@ -255,8 +295,8 @@ export class FinopsBudgetService {
    */
   async ownerMonthCommitted(ownerId: string, runner: Runner = this.dataSource): Promise<{ spent: string; outstanding: string; total: string }> {
     const [s] = await runner.query(
-      `select coalesce(sum(amount),0)::text as total from public.generation_cost_events
-        where owner_id = $1 and billing_account <> 'user_key' and created_at >= date_trunc('month', now())`,
+      `select coalesce(sum(e.amount),0)::text as total from public.generation_cost_events e
+        where e.owner_id = $1 and e.billing_account <> 'user_key' and ${this.monthEventsFilter('e')}`,
       [ownerId],
     );
     const [o] = await runner.query(
@@ -343,6 +383,12 @@ export class FinopsBudgetService {
       throw new FinopsError('INVALID_INPUT', `el monto aprobado (${amount}) no cubre el esperado (${a.estimate.totals.expected})`);
     }
     const total = addDec(normalizeDecimal(a.runActual, 'runActual'), amount);
+    // r75: el upgrade amplía el presupuesto del run → se carga al iniciador (mismo lock y disponible que el arranque).
+    const gate = this.activeUserBudgetGate();
+    if (this.userBudgetGate) await this.userBudgetGate.assertMayStart(runner, (await this.userBudgetGate.payerOfRun(runner, a.runId)) ?? a.ownerId);
+    const payer = gate ? (await gate.payerOfRun(runner, a.runId)) ?? a.ownerId : null;
+    const previous = gate ? await this.runAuthorizedBudget(a.runId, runner) : null;
+    if (gate && payer) await gate.lockForRun(runner, payer);
     const est = await this.recordEstimate({
       scope: 'regeneration', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: a.runId, estimate: a.estimate,
     }, runner);
@@ -350,6 +396,12 @@ export class FinopsBudgetService {
       runId: a.runId, courseId: a.courseId, estimateId: est.id, authorizedBudget: total, policyId: a.policyId,
       decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: `video_upgrade:${a.fingerprint}`,
     }, runner);
+    if (gate && payer) {
+      await gate.reserveRun(runner, {
+        runId: a.runId, courseId: a.courseId, payerUserId: payer, kind: 'upgrade', authorizationId: auth.id,
+        authorizedBudget: total, previousAuthorizedBudget: previous,
+      });
+    }
     return { estimateId: est.id, authorizationId: auth.id, authorizedRunBudget: total };
   }
 
@@ -390,7 +442,18 @@ export class FinopsBudgetService {
     /** r62: `decision` AUTO_WITHIN_POLICY = autorización firmada por el usuario (recordNormalApproval kind 'user'). */
     approval: { id: string; estimate_id: string; authorized_budget: string; approved_by: string; policy_id: string | null; decision?: 'ADMIN_APPROVED' | 'AUTO_WITHIN_POLICY' } | null;
     invalidationPlanSha?: string | null;
+    /** r75: quien inicia y paga con su presupuesto (default: ownerId, el comportamiento de dueño único). */
+    startedBy?: string | null;
+    /** r75: tipo de la reserva (default 'start'; un run B desde un run anterior también es 'start'). */
+    reservationKind?: Extract<ReservationKind, 'start' | 'reopen'>;
   }): Promise<{ estimateId: string; authorizationId: string }> {
+    // r75 (01 §5.2 pasos 2–3): MONTH_CAP_LOCK SIEMPRE (también en AUTO) y el lock del usuario, ANTES de autorizar.
+    // El caller ya tomó el lock del curso (insertRun) → orden fijo curso → mes → usuario → run-cap.
+    const gate = this.activeUserBudgetGate();
+    const payer = (a.startedBy && String(a.startedBy).trim()) || a.ownerId;
+    // r75 (A, 01 §7): congelación de plataforma y suspensiones de quien paga, en la misma tx (rollback de todo si no).
+    if (this.userBudgetGate) await this.userBudgetGate.assertMayStart(runner, payer);
+    if (gate) await gate.lockForRun(runner, payer);
     const est = await this.recordEstimate({
       scope: 'run', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: a.runId,
       invalidationPlanSha: a.invalidationPlanSha ?? null, estimate: a.evaluation.estimate,
@@ -405,6 +468,14 @@ export class FinopsBudgetService {
           runId: a.runId, courseId: a.courseId, estimateId: est.id, authorizedBudget: a.evaluation.estimate.totals.max,
           policyId: a.evaluation.policyId, decision: 'AUTO_WITHIN_POLICY', reason: `auto_within_policy:${a.evaluation.reasons.join('|')}`,
         }, runner);
+    // r75 (pasos 5–8): disponible recalculado en ESTA tx; si no alcanza → 409 user_budget_insufficient y la tx del run
+    // se revierte entera (no queda ni el run ni la autorización). Monto = authorized_budget del run (nunca se recalcula).
+    if (gate) {
+      await gate.reserveRun(runner, {
+        runId: a.runId, courseId: a.courseId, payerUserId: payer, kind: a.reservationKind ?? 'start', authorizationId: auth.id,
+        authorizedBudget: String(auth.authorized_budget), previousAuthorizedBudget: null,
+      });
+    }
     return { estimateId: est.id, authorizationId: auth.id };
   }
 
@@ -412,7 +483,13 @@ export class FinopsBudgetService {
    * RF-b fix M9: aprobación humana directa del presupuesto TOTAL de un run
    * (p.ej. runs reales creados antes de RF-b, sin estimado con run_id).
    */
-  async adminAuthorizeRun(a: { courseId: number; runId: string; authorizedBudget: DecimalLike; approvedBy: string; reason?: string | null }): Promise<any> {
+  async adminAuthorizeRun(a: {
+    courseId: number; runId: string; authorizedBudget: DecimalLike; approvedBy: string; reason?: string | null;
+    /** r75 (02 §E.4): si la ampliación no entra en el disponible del iniciador, crear el month_adjustment auditado. */
+    extendUserBudget?: boolean;
+    /** r75: id del SuperAdmin que autoriza (para el ajuste y la auditoría). */
+    actorId?: string | null;
+  }): Promise<any> {
     if (typeof a.runId !== 'string' || !UUID_RE.test(a.runId)) throw new FinopsError('INVALID_INPUT', 'runId debe ser UUID');
     if (typeof a.approvedBy !== 'string' || !a.approvedBy.trim()) throw new FinopsError('INVALID_INPUT', 'approvedBy es obligatorio');
     const budget = normalizeDecimal(a.authorizedBudget, 'authorizedBudget');
@@ -423,9 +500,33 @@ export class FinopsBudgetService {
     );
     if (!run) throw new FinopsError('ESTIMATE_NOT_FOUND', `no existe el run ${a.runId}`);
     if (Number(run.course_id) !== Number(a.courseId)) throw new FinopsError('INVALID_INPUT', `el run ${a.runId} no es del curso #${a.courseId}`);
-    return this.ledger.authorize({
-      runId: a.runId, courseId: a.courseId, estimateId: null, authorizedBudget: budget,
-      decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: a.reason ?? 'admin_approved_run',
+    const gate = this.activeUserBudgetGate();
+    if (!gate) {
+      return this.ledger.authorize({
+        runId: a.runId, courseId: a.courseId, estimateId: null, authorizedBudget: budget,
+        decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: a.reason ?? 'admin_approved_run',
+      });
+    }
+    // r75 (01 §5.2): la aprobación del SA nunca es invisible en el presupuesto del iniciador. Misma tx: mes → usuario →
+    // autorización (run-cap) → reserva 'extension' (o 409 user_budget_insufficient sin escribir nada).
+    if (a.extendUserBudget && !(a.actorId && UUID_RE.test(String(a.actorId)))) {
+      throw new FinopsError('INVALID_INPUT', 'extendUserBudget exige el id del SuperAdmin');
+    }
+    return this.dataSource.transaction(async (m) => {
+      const payer = (await gate.payerOfRun(m, a.runId)) ?? null;
+      if (!payer) throw new FinopsError('ESTIMATE_NOT_FOUND', `el run ${a.runId} no tiene dueño ni iniciador`);
+      await gate.lockForRun(m, payer);
+      const previous = await this.runAuthorizedBudget(a.runId, m);
+      const row = await this.ledger.authorize({
+        runId: a.runId, courseId: a.courseId, estimateId: null, authorizedBudget: budget,
+        decision: 'ADMIN_APPROVED', approvedBy: a.approvedBy.trim(), reason: a.reason ?? 'admin_approved_run',
+      }, m);
+      await gate.reserveRun(m, {
+        runId: a.runId, courseId: a.courseId, payerUserId: payer, kind: 'extension', authorizationId: row.id,
+        authorizedBudget: budget, previousAuthorizedBudget: previous,
+        extendUserBudget: a.extendUserBudget ? { actorId: String(a.actorId), actorEmail: a.approvedBy.trim(), reason: a.reason ?? 'admin_approved_run' } : null,
+      });
+      return row;
     });
   }
 
@@ -759,7 +860,7 @@ export class FinopsBudgetService {
       return { code: 'item_run_not_found', runId: null, paused: false, message: 'La llamada declara una parte inválida: no se hizo (sin gasto).' };
     }
     const [row] = await this.dataSource.query(
-      `select g.job_id, pj.owner_id, pj.worker_status from public.generation_item_runs g
+      `select g.job_id, pj.owner_id, pj.worker_status${userBudgetsMode() !== 'off' ? `, pj.input_payload->>'startedBy' as started_by` : ''} from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id where g.id = $1`,
       [a.itemRunId],
     );
@@ -771,7 +872,9 @@ export class FinopsBudgetService {
     // FinOps P0 (audit §4 #7): antes un ejecutor que no era el dueño del run quedaba SIN guard (null = permitida) y su
     // cargo sin run → sin tope ni disyuntor. Solo el dueño puede ejecutar partes de su run (el claim lo exige): un no
     // dueño se rechaza ANTES de reservar (el proxy no llama al proveedor).
-    if (String(row.owner_id) !== String(a.subject)) {
+    // r75 (D-14): el iniciador del run (input_payload.startedBy, escrito por la reserva del arranque) también ejecuta.
+    const startedByOk = userBudgetsMode() !== 'off' && typeof row.started_by === 'string' && row.started_by !== '' && row.started_by === String(a.subject);
+    if (String(row.owner_id) !== String(a.subject) && !startedByOk) {
       return { code: 'attribution_rejected', runId: row.job_id, paused: false,
         message: 'Esta llamada declara una parte de una generación de otra cuenta: no se hizo (sin gasto).' };
     }

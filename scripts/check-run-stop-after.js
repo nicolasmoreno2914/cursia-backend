@@ -366,7 +366,9 @@ async function dbChecks() {
       await rejects(setSA(C, { itemKeys: [done.item_key], holdPackaging: true }), 409, 'stop_after_item_already_completed', 'completa');
       await rejects(runs.setStopAfter(C.cid, OTHER, 1, C.runId, { itemKeys: [C.keys[0]], holdPackaging: false }), 404, null, 'otro dueño');
       let err = null;
-      try { await ctrl.setStopAfter(C.cid, 1, C.runId, { itemKeys: [C.keys[0]], holdPackaging: 'true' }, { id: OWNER, email: 'o@x' }); } catch (e) { err = e; }
+      // r75: el handler recibe el contexto de acceso (@Access); fuera de Nest se arma el legacy (dueño = actor).
+      const { legacyAccessContext } = L('modules/authz/access-context.js');
+      try { await ctrl.setStopAfter(C.cid, 1, C.runId, { itemKeys: [C.keys[0]], holdPackaging: 'true' }, { id: OWNER, email: 'o@x' }, legacyAccessContext({ id: OWNER, email: 'o@x' }, false)); } catch (e) { err = e; }
       assert(err && err.getStatus() === 400, 'controlador → 400: ' + (err && err.message));
       eq((await runRow(C.runId)).output_summary.stopAfter, undefined, 'nada se escribió');
       eq(await fingerprint(C.runId), before, 'las partes completas no cambiaron');

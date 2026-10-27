@@ -133,6 +133,7 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
   'DynamicYoutubeController', // DN-1: GET /dynamic/youtube/preflight
   'CourseStructureSettingsController', // V2.1 R3
   'CourseProfilesController', // V2.1 R3
+  'VisualDesignController', // r76: /courses/:id/visual-design (contexto + vista previa)
   'PedagogyController', // Motor pedagógico V1
   'AdminDynamicRunsController', // EV6 DoD BE-B: GET /admin/dynamic-runs/needs-attention (SUPER_ADMIN)
   'AcademicContextController', // Fase 3: /courses/:id/academic-context/{extract,design}
@@ -149,6 +150,21 @@ const DYNAMIC_CONTROLLER_CLASS_NAMES = new Set([
  * ver flag-report.md #3 y review "declined to judge").
  */
 const LEGACY_CONTROLLER_CLASS_NAMES = new Set([
+  // r74: dirección DURADERA de los medios de un curso ya entregado (la pide el Moodle del cliente). NUNCA se apaga con
+  // el flag de la estructura dinámica: un curso restaurado debe seguir sonando. El monitoreo es SUPER_ADMIN (guard propio).
+  'CourseMediaController',
+  'CourseMediaAdminController',
+  // r75: autorización (B) y acceso (A): no son rutas V2 (no las esconde el flag dinámico).
+  'PermissionsCatalogController',
+  'MeContextController',
+  'MembershipsController',
+  'InstitutionsAdminController',
+  'AdminUsersController',
+  // r75 (C): presupuestos y gasto por institución (CURSIA_USER_BUDGETS), no son rutas V2.
+  'BudgetsController',
+  'BudgetsAdminController',
+  'InstitutionSpendController',
+  'AdminSpendController',
   'AppController',
   'AuthController',
   'YoutubeController',
@@ -703,8 +719,10 @@ async function runWorkerProcess(script, env, { waitMs }) {
       const repoMiss = { createQueryBuilder: () => qb(false), create: (o) => ({ ...o }), save: async (o) => ({ ...o, id: 8 }) };
       const ctrlOf = (repo) => new CoursesController(new CoursesService(repo, {}));
       const user = { id: OWNER_A, email: 'x@example.com' };
-      const a = await ctrlOf(repoHit).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user);
-      const b = await ctrlOf(repoMiss).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user);
+      // r75: el handler recibe el contexto de acceso (@Access()); llamado directo = contexto legacy (RBAC off).
+      const access = { actorId: OWNER_A, effectiveOwnerId: OWNER_A, legacy: true, institutionId: null };
+      const a = await ctrlOf(repoHit).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user, access);
+      const b = await ctrlOf(repoMiss).createOrGetDynamic({ frontendCourseId: 'f', title: 'T' }, user, access);
       eq([a.id, a.created, b.id, b.created], [7, false, 8, true], 'created');
     }));
 

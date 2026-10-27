@@ -1052,6 +1052,17 @@
       }
       var url  = _baseUrl() + path;
       var headers = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + token };
+      // r75: institución activa (01 §3.1). No es secreto: el servidor valida la membresía en cada request.
+      // R75-E14: solo si el backend anuncia que lo acepta (`institutionHeader:true` en /me/context, junto con CORS): un
+      // backend sin el header en Access-Control-Allow-Headers rechaza el preflight y TODA llamada falla («Failed to fetch»).
+      var r75c = typeof window.r75Ctx === 'function' ? window.r75Ctx() : null;
+      var inst = r75c && r75c.institutionHeader === true && typeof window.r75InstitutionHeader === 'function' && window.r75InstitutionHeader();
+      if (inst) headers['X-Cursia-Institution'] = inst;
+      // r75: una llamada puede fijar explícitamente la institución (selector, diagnóstico); el resto de headers del
+      // llamador se sigue ignorando como antes.
+      if (r75c && r75c.institutionHeader === true && options && options.headers && typeof options.headers['X-Cursia-Institution'] === 'string' && options.headers['X-Cursia-Institution']) {
+        headers['X-Cursia-Institution'] = options.headers['X-Cursia-Institution'];
+      }
       var opts = Object.assign({}, options || {}, { headers: headers });
       if (opts.body && typeof opts.body === 'object') {
         opts.body = JSON.stringify(opts.body);
@@ -1176,6 +1187,18 @@
     return backendApiRequest('/api/v1/courses/' + courseId + '/profiles/' + encodeURIComponent(kind), {
       method: 'POST', body: body
     });
+  }
+
+  // r76 «Diseño visual» (64-v2-visual-design.js): contexto (perfil vigente, familias, marca de la cuenta) y vista previa
+  // REAL (el backend arma un curso de muestra con el builder del empaque; sin IA, sin escribir nada).
+  function backendVisualDesignContext(courseId, opts) {
+    var q = (opts && opts.paletteId) ? '?paletteId=' + encodeURIComponent(opts.paletteId) : '';
+    return backendApiRequest('/api/v1/courses/' + courseId + '/visual-design' + q, { method: 'GET' }, 20000);
+  }
+  function backendVisualDesignPreview(courseId, data, opts) {
+    var body = { data: data };
+    if (opts && opts.includePackage) body.includePackage = true;
+    return backendApiRequest('/api/v1/courses/' + courseId + '/visual-design/preview', { method: 'POST', body: body }, 60000);
   }
 
   // ── Motor pedagógico V1 (49-pedagogy-panel.js): lectura + lógica pura, nada se genera ni se cobra ──
@@ -2789,7 +2812,7 @@
       }
       if (urlRes.storagePath && window.SB) {
         var bucket = urlRes.bucket || 'cursia-artifacts';
-        return window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600).then(function (signRes) {
+        return (window.r75SignStoragePath ? window.r75SignStoragePath(bucket, urlRes.storagePath, 3600) : window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600)).then(function (signRes) {
           var signedUrl = signRes && signRes.data && signRes.data.signedUrl;
           if (!signedUrl) return { ok: false, error: 'sign_failed' };
           return _fetchJsonFromUrl(signedUrl).then(function (dlRes) {
@@ -2820,7 +2843,7 @@
         }
         if (urlRes.storagePath && window.SB) {
           var bucket = urlRes.bucket || 'cursia-artifacts';
-          return window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600).then(function (signRes) {
+          return (window.r75SignStoragePath ? window.r75SignStoragePath(bucket, urlRes.storagePath, 3600) : window.SB.storage.from(bucket).createSignedUrl(urlRes.storagePath, 3600)).then(function (signRes) {
             var signedUrl = signRes && signRes.data && signRes.data.signedUrl;
             if (!signedUrl) return { ok: false, error: 'sign_failed' };
             return _fetchJsonFromUrl(signedUrl).then(function (dlRes) {
@@ -4125,6 +4148,8 @@
   window.backendUpdateChapter          = backendUpdateChapter;
   window.backendUpdateStructureSettings = backendUpdateStructureSettings;
   window.backendGetCourseProfile = backendGetCourseProfile;
+  window.backendVisualDesignContext = backendVisualDesignContext;
+  window.backendVisualDesignPreview = backendVisualDesignPreview;
   window.backendPedagogyCatalog = backendPedagogyCatalog;
   window.backendPedagogyWizard = backendPedagogyWizard;
   window.backendPedagogyRecommend = backendPedagogyRecommend;

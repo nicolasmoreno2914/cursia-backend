@@ -558,7 +558,8 @@ async function pureChecks() {
           for (const n of mod.chapterNumbers) assert(rail.includes(fw.chapters[n - 1].title), `cap ${chapterNumber}: el riel lista el capítulo ${n}`);
           eq(rail.includes(`Evaluación del módulo ${mod.number}`), mod.examEnabled, `cap ${chapterNumber}: evaluación en el riel`);
           const mt = vc.moduleTone(theme, te.moduleColor(theme, mod.number - 1), theme.personality.plate ? theme.color.bg : theme.color.surface);
-          assert(closing.includes(`class="cvc-btn-wrap" style="background-color:${mt.fill}`), `cap ${chapterNumber}: botón del cierre en el color del módulo`);
+          // r77: la píldora es el propio enlace (área táctil completa): el fondo del módulo va en el <a class="cvc-btn-link">.
+          assert(new RegExp(`class="cvc-btn-link" href="[^"]*"[^>]*style="float:left;background-color:${mt.fill}`).test(closing), `cap ${chapterNumber}: botón del cierre en el color del módulo`);
         }
       }
     }

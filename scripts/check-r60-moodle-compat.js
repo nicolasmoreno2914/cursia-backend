@@ -30,24 +30,29 @@ const S = require('./lib/commercial-simulation');
 const CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/commercial-simulation/courses.json'), 'utf8'));
 
 // sha256 de los .mbz de la simulación con el builder 3.15.1 (origin/staging 17dc7b0, r60): con H5P el paquete no cambia.
+// r77 (builder 3.17.0, mobile-first): multi-h5p, 1x1-sin-examenes y 1x1-sin-nota recalculados a propósito — solo cambian los
+// estilos de los botones (la píldora es el <a>) y de los enlaces de descarga; mismo texto, enlaces y archivos (diff por zip).
+// r78 (builder 3.18.0, Libro Guía en el celular): los 17 recalculados a propósito (--all) — la sección 1 suma el libro en línea
+// (mod_book, mismo texto del PDF) y la tarjeta del Libro su botón «Leer en el celular»; los moduleid siguientes corren uno.
+// Mismos archivos de contenido (PDF del Libro byte a byte); el resto de los HTML igual salvo el id de los tokens (check-r78 B6).
 const GOLDEN_3_15_1 = {
-  'A-S': '9bc86883aa9d61c7070a099434caae2f83ddf3cd31554f93c720fde9681a69da',
-  'B-M': 'fba6103888dea9625888477294916d5cb91aebb5a50576345e7a5ff8207aaa77',
-  'C-L': '36b70fbc358b340c5eebef7604315c36043a735a407167240fa712ea29ff58ee',
-  procedimental: 'dac33f6e75408a0d696121b3d13affd943deb32970d14b13262d6e714b02a4f9',
-  conceptual: '9543cfb220b4c356379ee36ca568ceb93cfd03da5260c2f43dbcfa9a66d5e8ba',
-  normativo: 'afe87f9f475a0f87a878e861eaf49db91efe6168d1c4191be23a435a1f614d24',
-  ofimatica: '7e03f1a412c28faf2bff17d69de5c44cb86dd63793890fb77f1c308ad8892eb9',
-  gagne: '8728e5fc5682274cf6da5b1338c00b86cdc985006f017927f7a46233bc907165',
-  'entrega-rubrica': '50122ed91edd787ade3180833ceb012dcd9b3d51cf1ea75959e9be35ddf254ff',
-  'multi-h5p': 'a7e024c89e45bd0bab930a00a93989712ee9981c631e93fe8954c5875749348f',
-  'teorico-16': 'f4bff6931f19c5e27c672b0f5fb866101b7a0d7e653ebca5b388cf911b7cce7e',
-  'practico-32': '4167f71a2c10f5d0294f7542239484071df94922c7f6a83b8c80197a18b800d8',
-  'protocolo-20': 'f6593952bd92463d3a09711851035616b0a9c1b14c3662d0c37a57f6b23a9263',
-  'casos-64': '3626bfb9eb17c875c9f5db87280026205fb5ad87d6cf7cb9d55236f77b55d8d8',
-  'mixto-96': '4801c40fe668563a8104b65e7ac5fa948424cb65754e8c8fda8f0f8d919e857d',
-  '1x1-sin-examenes': '7fa4bb8c1d165a39c3f4cb5ae19bf8c71d0b557ccc1ac5b639a4b77399ab8951',
-  '1x1-sin-nota': '7cef1dc934a3cc6f4816af45588a18bfbe315e8ceb2a9bd6cb4ec6bbe5fe92cf',
+  'A-S': '875b5481e9c8e4ec7d0d741b181e26781d32c30984a3c88e74c91ed2a2b41910',
+  'B-M': '0f992b9ab8ad18e9ac296b18413c7788f843d0d53d5dff0b2d712c3085e9ca8f',
+  'C-L': 'e0e80ccac75b20ce8df9bc988a51528fa64cb72e388b55edfa5e36873abf5d93',
+  procedimental: 'f4170cf6f8cb998b4015dafd5905221415b0f76334b019d244c7d4e1b3b8cd03',
+  conceptual: '6d2899df4bc410c116d8922a7e5dc0d87724bcfc2c4f4ec0d54dce86137853d5',
+  normativo: '128a709bfdbfede5e683880d3c65f34f2fde5a6c299d95001f57a138075ddf64',
+  ofimatica: '0ef527ebf28535e47de8399efc63176090762c2be6435724977dfa137714a1f4',
+  gagne: 'cd2a0a5abb3c9181930fc02021fb6b799d7bc3dfd315c7ff7f154ad04cf21133',
+  'entrega-rubrica': '28ac6555ebf1eb35b486337977224b0081f0f85d5252f1ed5e60c5a21c2a59aa',
+  'multi-h5p': '1379908f38919080cb5979cd3e97cf10168b6b1855c090d18b222c128a4703a6',
+  'teorico-16': 'ff0a63eba74d1208e6eef4ba76488decfc85eca93db9695978dc15552efc2a94',
+  'practico-32': '4e152df5d314026bccc103a0cbe72925cd0c6c8eace8de9c9c38c8ad677151d7',
+  'protocolo-20': '752ef837caf39dda0a711dc5fd56640a0764dd0d0ed44cd598c45eb79a5b4492',
+  'casos-64': '7088f758ca61bd71cdc791d543b85fbfd85e0204a3afcbb2c93d27c38c8876e2',
+  'mixto-96': 'bf632cd5e6e3f75b4a4893f583507dadfe9d9f3b656e387a18c0d96f6a371f22',
+  '1x1-sin-examenes': '8f05fdc19c961d44eea24b44f441aed2899c98f0342bc7c3566ec18ba2796881',
+  '1x1-sin-nota': '248e41b9d498b977f9c30277fe0776a153a831431896927c68b8dc4b5c8ce175',
 };
 const QUICK = ['multi-h5p', '1x1-sin-examenes', '1x1-sin-nota'];
 const ALL = process.argv.includes('--all');
@@ -169,7 +174,7 @@ async function labelXmls(mbz) {
       assert(sim.built.summary.h5pPackages.length > 0, 'sin H5P');
       eq([c.backupFormat, c.minimumMoodle, c.h5pCoreApi, c.sectionLinks, sim.built.expectations.moodleMinimum], ['4.1', '4.5', '1.28', 'COURSESECTIONBYID', '4.5'], 'compatibilidad');
       eq(sha256(sim.built.mbz), GOLDEN_3_15_1[cfg.id], 'sha256 del .mbz (con H5P no cambia)');
-      eq(sim.built.summary.builderVersion, '3.16.0', 'builder');
+      eq(sim.built.summary.builderVersion, '3.18.0', 'builder'); // r78: Libro Guía en línea
     });
   }
   const noH5pCfg = { ...CONFIG.courses.find((c) => c.id === '1x1-sin-nota'), id: '1x1-sin-nota-sin-h5p', reviewCards: false };

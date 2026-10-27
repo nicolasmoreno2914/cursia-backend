@@ -295,12 +295,15 @@ async function runConfig(cfg) {
       eq(names, ['intro:application/pdf', 'intro:image/png'], c.idnumber);
     }
   });
-  check(`${tag} r19 L4: la descripción del Libro Guía restaurada lleva UN botón «Abrir Libro Guía» → mod/resource/view.php?id=<su cmid>, target _blank`, () => {
+  check(`${tag} r19 L4: la descripción del Libro Guía restaurada lleva UN botón «Abrir Libro Guía» → mod/resource/view.php?id=<su cmid>, target _blank (+ r78 «Leer en el celular» → mod/book)`, () => {
     const L = o.libro;
     assert(L, 'sin datos del recurso del Libro Guía');
     eq(L.display, 5, 'display 5 (view.php entrega el PDF)');
-    eq(L.links.length, 1, `enlaces en la descripción: ${JSON.stringify(L.links)}`);
-    const a = L.links[0];
+    // r78 (3.18.0): + UN botón «Leer en el celular» → el libro en línea restaurado (mod/book/view.php, misma pestaña).
+    eq(L.links.length, 2, `enlaces en la descripción: ${JSON.stringify(L.links)}`);
+    const online = L.links.find((x) => /Leer en el celular/.test(x.text));
+    assert(online && new RegExp(`^${o.wwwroot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/mod/book/view\\.php\\?id=\\d+$`).test(online.href) && !online.target, `botón al libro en línea: ${JSON.stringify(online)}`);
+    const a = L.links.find((x) => /Abrir Libro Guía/.test(x.text));
     eq(a.href, `${o.wwwroot}/mod/resource/view.php?id=${L.cmid}`, 'href decodificado = el propio recurso');
     assert(a.target === '_blank' && /noopener/.test(a.rel || '') && /Abrir Libro Guía/.test(a.text), JSON.stringify(a));
   });

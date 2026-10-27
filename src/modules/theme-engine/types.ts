@@ -161,6 +161,8 @@ export interface PresentationProfileInput {
   mode: ThemeMode;
   brandSeed?: BrandSeed;
   themeVersion?: number;
+  /** r76: tipografía del curso (ausente = la de la familia). */
+  typography?: 'sans' | 'serif';
 }
 
 /** P3 — Sistema visual educativo 2.0: rol pedagógico de un bloque (ícono + color + forma). */

@@ -14,6 +14,7 @@ import { VideoEngineModule } from './video-engine/video-engine.module';
 import { TtsModule } from './tts/tts.module';
 import { ProductionJobsModule } from './modules/production-jobs/production-jobs.module';
 import { ArtifactsModule } from './modules/artifacts/artifacts.module';
+import { CourseMediaModule } from './modules/course-media/course-media.module';
 import { ContentGenerationModule } from './modules/content-generation/content-generation.module';
 import { PackageModule } from './package/package.module';
 import { InstitutionsModule } from './modules/institutions/institutions.module';
@@ -28,12 +29,16 @@ import { FeaturesModule } from './modules/features/features.module';
 import { CoherenceModule } from './modules/coherence/coherence.module';
 import { InvalidationModule } from './modules/invalidation/invalidation.module';
 import { CourseProfilesModule } from './modules/course-profiles/course-profiles.module';
+import { VisualDesignModule } from './modules/visual-design/visual-design.module';
 import { PedagogyModule } from './modules/pedagogy/pedagogy.module';
 import { AcademicContextModule } from './modules/academic-context/academic-context.module';
 import { CourseFactsModule } from './modules/course-facts/course-facts.module';
 import { CourseDesignModule } from './modules/course-design/course-design.module';
 import { PrebriefModule } from './modules/prebrief/prebrief.module';
 import { FinopsModule } from './modules/finops/finops.module';
+import { AuthzModule } from './modules/authz/authz.module';
+import { AccessModule } from './modules/access/access.module';
+import { BudgetsModule } from './modules/budgets/budgets.module';
 
 @Module({
   imports: [
@@ -47,6 +52,7 @@ import { FinopsModule } from './modules/finops/finops.module';
     CourseVersionsModule,
     ProductionJobsModule,
     ArtifactsModule,
+    CourseMediaModule,
     ContentGenerationModule,
     YoutubeModule,
     EventsModule,
@@ -63,15 +69,21 @@ import { FinopsModule } from './modules/finops/finops.module';
     DynamicGenerationModule,
     DynamicPackagingModule,
     FeaturesModule,
+    // r75 (B): AccountAccessGuard (APP_GUARD) DESPUÉS de DynamicFeatureGuard (FeaturesModule) → una ruta V2 apagada
+    // sigue dando su 404 nativo. Flags CURSIA_ACCOUNT_GUARD / CURSIA_RBAC_MODE (default off). Assert de arranque D-26.
+    AuthzModule,
     CoherenceModule,
     InvalidationModule,
     CourseProfilesModule, // V2.1 (R3): perfiles de curso (presentation / assessment / pedagogy / academic)
+    VisualDesignModule,   // r76: «Diseño visual» (contexto + vista previa real del diseño)
     PedagogyModule, // Motor pedagógico V1: catálogo, «No estoy seguro», dry-run (sin escrituras ni proveedores)
     CourseFactsModule, // LOOP 8.1: pedido del curso + «Lo que sabemos del curso» (fuente única)
     CourseDesignModule, // LOOP 8.3: «Cursia recomienda»
     PrebriefModule, // Prebrief pedagógico: propuesta versionada, aprobación y PDF
     AcademicContextModule, // Fase 3: contexto académico (extracción determinista + diseño desde el contexto; sin proveedores)
     FinopsModule,
+    AccessModule, // r75 (A): instituciones multi-miembro, membresías, usuarios SA, suspensiones, auditoría, /me/context
+    BudgetsModule, // r75 (C): presupuesto mensual por usuario, solicitudes y gasto por institución (CURSIA_USER_BUDGETS)
   ],
   controllers: [AppController],
   providers: [

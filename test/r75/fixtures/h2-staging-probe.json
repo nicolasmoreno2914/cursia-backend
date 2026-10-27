@@ -1,0 +1,13 @@
+{
+  "_nota": "Último resultado de la sonda empírica H2 en STAGING (02/03: ítem i). Se actualiza a mano tras cada re-verificación (snippet: test/r75/h2-staging-probe.snippet.js, pestaña logueada de staging.orbia.pages.dev). writeAllowed=true ⇒ el ítem (i) FALLA.",
+  "probedAt": "2026-10-26",
+  "project": "ljdtmkwuhkvtmlhugjrv",
+  "as": "usuario authenticated logueado (owner, is_admin=true)",
+  "after": "deploy de staging 40299249644 (migración r75-access: eliminó «admin full access» (ALL) y «read own record» (SELECT); recreó «users check own authorization» solo SELECT para authenticated)",
+  "insert": { "status": 403, "code": "42501", "allowed": false },
+  "update": { "status": 403, "code": "42501", "allowed": false, "note": "UPDATE sin cambio de valor sobre la fila propia: rechazado" },
+  "delete": { "status": 403, "code": "42501", "allowed": false, "note": "DELETE de un email inexistente: rechazado por privilegio" },
+  "select": { "visibleRows": 1, "onlyOwnRow": true },
+  "writeAllowed": false,
+  "cleanup": "ninguna fila creada; 0 filas sonda"
+}

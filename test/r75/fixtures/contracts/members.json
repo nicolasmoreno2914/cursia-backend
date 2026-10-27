@@ -1,0 +1,205 @@
+{
+  "GET /institutions/:id/members": {
+    "status": 200,
+    "body": {
+      "data": [
+        {
+          "userId": "0a000000-0000-4000-8000-000000000002",
+          "email": "qa-r75-admin-inst-a@example.com",
+          "fullName": "Admin A (QA)",
+          "role": "ADMIN_INSTITUCIONAL",
+          "status": "active",
+          "overrides": {
+            "grants": [],
+            "denies": []
+          },
+          "effectivePermissions": [
+            "courses.view",
+            "courses.create",
+            "courses.edit",
+            "courses.delete",
+            "proposals.review",
+            "generations.retry",
+            "exports.download",
+            "spend.view",
+            "roles.manage"
+          ],
+          "accountStatus": "active",
+          "createdAt": "2026-10-21T10:00:00.000Z"
+        },
+        {
+          "userId": "0a000000-0000-4000-8000-000000000003",
+          "email": "qa-r75-creador-a@example.com",
+          "fullName": null,
+          "role": "CREADOR",
+          "status": "active",
+          "overrides": {
+            "grants": [
+              "proposals.approve"
+            ],
+            "denies": [
+              "exports.download"
+            ]
+          },
+          "effectivePermissions": [
+            "courses.view",
+            "courses.create",
+            "courses.edit",
+            "proposals.review",
+            "proposals.approve",
+            "generations.start",
+            "generations.retry"
+          ],
+          "accountStatus": "active",
+          "createdAt": "2026-10-21T10:00:00.000Z"
+        },
+        {
+          "userId": "0a000000-0000-4000-8000-000000000004",
+          "email": "qa-r75-aprobador-a@example.com",
+          "fullName": null,
+          "role": "APROBADOR_ACADEMICO",
+          "status": "active",
+          "overrides": {
+            "grants": [],
+            "denies": []
+          },
+          "effectivePermissions": [
+            "courses.view",
+            "proposals.review",
+            "proposals.approve",
+            "exports.download"
+          ],
+          "accountStatus": "active",
+          "createdAt": "2026-10-21T10:00:00.000Z"
+        },
+        {
+          "userId": "0a000000-0000-4000-8000-000000000005",
+          "email": "qa-r75-consulta-a@example.com",
+          "fullName": null,
+          "role": "CONSULTA",
+          "status": "active",
+          "overrides": {
+            "grants": [],
+            "denies": []
+          },
+          "effectivePermissions": [
+            "courses.view"
+          ],
+          "accountStatus": "active",
+          "createdAt": "2026-10-21T10:00:00.000Z"
+        },
+        {
+          "userId": "0a000000-0000-4000-8000-000000000007",
+          "email": "qa-r75-suspendido@example.com",
+          "fullName": null,
+          "role": "CREADOR",
+          "status": "suspended",
+          "overrides": {
+            "grants": [],
+            "denies": []
+          },
+          "effectivePermissions": [
+            "courses.view",
+            "courses.create",
+            "courses.edit",
+            "proposals.review",
+            "generations.start",
+            "generations.retry",
+            "exports.download"
+          ],
+          "accountStatus": "suspended",
+          "createdAt": "2026-10-21T10:00:00.000Z"
+        }
+      ],
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "POST /institutions/:id/members": {
+    "status": 201,
+    "body": {
+      "data": {
+        "userId": "0a000000-0000-4000-8000-000000000005",
+        "email": "qa-r75-consulta-a@example.com",
+        "fullName": null,
+        "role": "CONSULTA",
+        "status": "active",
+        "overrides": {
+          "grants": [],
+          "denies": []
+        },
+        "effectivePermissions": [
+          "courses.view"
+        ],
+        "accountStatus": "active",
+        "createdAt": "2026-10-21T10:00:00.000Z"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "PATCH /institutions/:id/members/:userId": {
+    "status": 200,
+    "body": {
+      "data": {
+        "userId": "0a000000-0000-4000-8000-000000000005",
+        "email": "qa-r75-consulta-a@example.com",
+        "fullName": null,
+        "role": "APROBADOR_ACADEMICO",
+        "status": "active",
+        "overrides": {
+          "grants": [],
+          "denies": []
+        },
+        "effectivePermissions": [
+          "courses.view",
+          "proposals.review",
+          "proposals.approve",
+          "exports.download"
+        ],
+        "accountStatus": "active",
+        "createdAt": "2026-10-21T10:00:00.000Z"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "DELETE /institutions/:id/members/:userId": {
+    "status": 200,
+    "body": {
+      "data": {
+        "status": "removed"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  },
+  "PUT /institutions/:id/members/:userId/overrides": {
+    "status": 200,
+    "body": {
+      "data": {
+        "userId": "0a000000-0000-4000-8000-000000000003",
+        "email": "qa-r75-creador-a@example.com",
+        "fullName": null,
+        "role": "CREADOR",
+        "status": "active",
+        "overrides": {
+          "grants": [
+            "proposals.approve"
+          ],
+          "denies": [
+            "exports.download"
+          ]
+        },
+        "effectivePermissions": [
+          "courses.view",
+          "courses.create",
+          "courses.edit",
+          "proposals.review",
+          "proposals.approve",
+          "generations.start",
+          "generations.retry"
+        ],
+        "accountStatus": "active",
+        "createdAt": "2026-10-21T10:00:00.000Z"
+      },
+      "timestamp": "2026-10-26T12:00:00.000Z"
+    }
+  }
+}

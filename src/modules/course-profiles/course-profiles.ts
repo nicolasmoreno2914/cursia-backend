@@ -1,5 +1,5 @@
 import { sha256Canonical, sortedCanonicalJson } from '../coherence/canonical-json';
-import { LEGACY_PALETTES, THEME_FAMILIES, presentationProfileFromPalette } from '../theme-engine';
+import { LEGACY_PALETTES, THEME_FAMILIES, presentationProfileFromPalette, resolveTheme } from '../theme-engine';
 import {
   PedagogicalProfile,
   normalizePedagogicalProfile,
@@ -77,11 +77,55 @@ export interface BrandSeedInput {
   moduleColors?: string[];
 }
 
+/**
+ * r76 «Diseño visual»: tipografía del curso. Ausente (o 'family') = la de la familia visual. Solo pilas de fuentes del
+ * sistema (Moodle no carga webfonts de un label de forma fiable).
+ */
+export const PRESENTATION_TYPOGRAPHY = ['family', 'sans', 'serif'] as const;
+export type PresentationTypography = (typeof PRESENTATION_TYPOGRAPHY)[number];
+
+/** r76: de dónde sale el logo del curso (Libro Guía y, si se pide, la bienvenida). */
+export const PRESENTATION_LOGO_SOURCES = ['account', 'custom', 'cursia'] as const;
+export type PresentationLogoSource = (typeof PRESENTATION_LOGO_SOURCES)[number];
+/** r76: tope del logo propio del curso (data URI; el frontend lo reduce a ≤ 512 px antes de subirlo). */
+export const PRESENTATION_LOGO_MAX_CHARS = 1_400_000;
+export const PRESENTATION_INSTITUTION_NAME_MAX = 120;
+
+/**
+ * r76: identidad institucional del curso.
+ *  - logo: 'account' = Brand Kit de la institución → logo de la cuenta → Cursia (lo de siempre); 'custom' = el logo
+ *    subido para ESTE curso (`logoDataUri`, PNG/JPEG); 'cursia' = el logo de Cursia.
+ *  - institutionName: null/ausente = el nombre de la institución del curso; '' = sin nombre; texto = ese nombre.
+ *  - watermark: marca de agua del Libro Guía (una por página, decisión r19). Default true.
+ *  - showInCourse: el logo (y el nombre) encabezan la bienvenida del curso en Moodle. Default false.
+ * El default completo ({ logo: 'account', watermark: true, showInCourse: false }, sin nombre) se normaliza a AUSENTE:
+ * un perfil anterior a r76 o «Restaurar valores» conserva el mismo sha (y los mismos bytes del paquete).
+ */
+export interface PresentationIdentity {
+  logo: PresentationLogoSource;
+  logoDataUri?: string;
+  institutionName?: string | null;
+  watermark: boolean;
+  showInCourse: boolean;
+}
+
 export interface PresentationProfile {
   themeFamily: ThemeFamilyIdCopy;
   mode: ThemeModeCopy;
   brandSeed: BrandSeedInput | null;
   themeVersion: number;
+  /** r76: solo presente si no es la de la familia. */
+  typography?: 'sans' | 'serif';
+  /** r76: solo presente si no es el default (ver PresentationIdentity). */
+  identity?: PresentationIdentity;
+}
+
+/** r76: identidad efectiva (la guardada o el default). */
+export function presentationIdentityOf(p: Pick<PresentationProfile, 'identity'> | null | undefined): PresentationIdentity {
+  const i = p?.identity;
+  return i
+    ? { logo: i.logo, ...(i.logoDataUri ? { logoDataUri: i.logoDataUri } : {}), ...(i.institutionName !== undefined ? { institutionName: i.institutionName } : {}), watermark: i.watermark, showInCourse: i.showInCourse }
+    : { logo: 'account', watermark: true, showInCourse: false };
 }
 
 export function defaultPresentationProfile(): PresentationProfile {
@@ -296,7 +340,12 @@ export function validatePresentationProfile(p: unknown): ProfileValidationError[
   if (!isPlainObject(p)) {
     return [{ path: '', code: 'INVALID_TYPE', message: 'El perfil de presentación debe ser un objeto' }];
   }
-  checkKeys(p, ['themeFamily', 'mode', 'brandSeed', 'themeVersion'], [], '', errors);
+  checkKeys(p, ['themeFamily', 'mode', 'brandSeed', 'themeVersion'], ['typography', 'identity'], '', errors);
+  // r76: tipografía e identidad (opcionales).
+  if ('typography' in p && !(PRESENTATION_TYPOGRAPHY as readonly unknown[]).includes(p.typography)) {
+    errors.push({ path: 'typography', code: 'INVALID_TYPOGRAPHY', message: `typography inválida: ${JSON.stringify(p.typography)} (permitidas: ${PRESENTATION_TYPOGRAPHY.join(', ')})` });
+  }
+  if ('identity' in p && p.identity !== null) validatePresentationIdentity(p.identity, errors);
 
   if ('themeFamily' in p && !(THEME_FAMILY_IDS as readonly unknown[]).includes(p.themeFamily)) {
     errors.push({
@@ -354,7 +403,55 @@ export function validatePresentationProfile(p: unknown): ProfileValidationError[
       }
     }
   }
+  // r76: el tema tiene que poder resolverse YA (al guardar), no recién al empaquetar (falla fuerte y visible).
+  if (errors.length === 0 && isPlainObject(p)) {
+    try {
+      const seed = p.brandSeed as BrandSeedInput | null;
+      resolveTheme({
+        themeFamily: p.themeFamily as ThemeFamilyIdCopy,
+        mode: p.mode as ThemeModeCopy,
+        ...(seed ? { brandSeed: { ...seed } } : {}),
+        // themeVersion se valida arriba (esquema); aquí solo importan familia, modo, colores y tipografía.
+        ...(p.typography === 'sans' || p.typography === 'serif' ? { typography: p.typography } : {}),
+      });
+    } catch (err) {
+      errors.push({ path: 'brandSeed', code: 'THEME_UNRESOLVABLE', message: `Con estos colores el diseño no se puede armar: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  }
   return errors;
+}
+
+/** r76: data URI de imagen PNG o JPEG en base64 (la validación de bytes la hace libro-logo al empaquetar y en la vista previa). */
+const LOGO_DATA_URI_RE = /^data:image\/(png|jpeg|jpg);base64,[A-Za-z0-9+/]+={0,2}$/;
+
+function validatePresentationIdentity(v: unknown, errors: ProfileValidationError[]): void {
+  if (!isPlainObject(v)) {
+    errors.push({ path: 'identity', code: 'INVALID_IDENTITY', message: 'identity debe ser null o un objeto' });
+    return;
+  }
+  checkKeys(v, ['logo', 'watermark', 'showInCourse'], ['logoDataUri', 'institutionName'], 'identity', errors);
+  if ('logo' in v && !(PRESENTATION_LOGO_SOURCES as readonly unknown[]).includes(v.logo)) {
+    errors.push({ path: 'identity.logo', code: 'INVALID_IDENTITY_LOGO', message: `identity.logo inválido: ${JSON.stringify(v.logo)} (permitidos: ${PRESENTATION_LOGO_SOURCES.join(', ')})` });
+  }
+  if (v.logo === 'custom' && !('logoDataUri' in v)) {
+    errors.push({ path: 'identity.logoDataUri', code: 'MISSING_FIELD', message: 'Con identity.logo = "custom" falta identity.logoDataUri (el logo del curso)' });
+  }
+  if ('logoDataUri' in v) {
+    if (v.logo !== 'custom') {
+      errors.push({ path: 'identity.logoDataUri', code: 'INVALID_IDENTITY_LOGO', message: 'identity.logoDataUri solo se admite con identity.logo = "custom"' });
+    } else if (typeof v.logoDataUri !== 'string' || !LOGO_DATA_URI_RE.test(v.logoDataUri)) {
+      errors.push({ path: 'identity.logoDataUri', code: 'INVALID_IDENTITY_LOGO', message: 'El logo del curso debe ser una imagen PNG o JPEG (data URI base64)' });
+    } else if (v.logoDataUri.length > PRESENTATION_LOGO_MAX_CHARS) {
+      errors.push({ path: 'identity.logoDataUri', code: 'IDENTITY_LOGO_TOO_LARGE', message: `El logo del curso es demasiado grande (máximo ${Math.round((PRESENTATION_LOGO_MAX_CHARS * 3) / 4 / 1024)} KB)` });
+    }
+  }
+  if ('institutionName' in v && v.institutionName !== null) {
+    if (typeof v.institutionName !== 'string' || v.institutionName.length > PRESENTATION_INSTITUTION_NAME_MAX || /[<>\u0000-\u001f]/.test(v.institutionName)) {
+      errors.push({ path: 'identity.institutionName', code: 'INVALID_IDENTITY_NAME', message: `identity.institutionName debe ser null o un texto de hasta ${PRESENTATION_INSTITUTION_NAME_MAX} caracteres, sin < ni >` });
+    }
+  }
+  if ('watermark' in v && typeof v.watermark !== 'boolean') errors.push({ path: 'identity.watermark', code: 'INVALID_TYPE', message: 'identity.watermark debe ser booleano' });
+  if ('showInCourse' in v && typeof v.showInCourse !== 'boolean') errors.push({ path: 'identity.showInCourse', code: 'INVALID_TYPE', message: 'identity.showInCourse debe ser booleano' });
 }
 
 function checkTypeMap(
@@ -499,7 +596,23 @@ export function normalizePresentationProfile(p: unknown): PresentationProfile {
     if (q.brandSeed.accent !== undefined) brandSeed.accent = q.brandSeed.accent;
     if (q.brandSeed.moduleColors !== undefined) brandSeed.moduleColors = [...q.brandSeed.moduleColors];
   }
-  return { themeFamily: q.themeFamily, mode: q.mode, brandSeed, themeVersion: q.themeVersion };
+  // r76: solo si no son los de siempre (mismo objeto y mismo sha para los perfiles anteriores y para «Restaurar valores»).
+  const typography = q.typography === 'sans' || q.typography === 'serif' ? { typography: q.typography } : {};
+  let identity: { identity: PresentationIdentity } | Record<string, never> = {};
+  if (q.identity) {
+    const i = q.identity;
+    const name = typeof i.institutionName === 'string' ? i.institutionName.replace(/\s+/g, ' ').trim() : i.institutionName;
+    const norm: PresentationIdentity = {
+      logo: i.logo,
+      ...(i.logo === 'custom' && i.logoDataUri ? { logoDataUri: i.logoDataUri.replace(/^data:image\/jpg;/, 'data:image/jpeg;') } : {}),
+      ...(name !== undefined && name !== null ? { institutionName: name } : {}),
+      watermark: i.watermark,
+      showInCourse: i.showInCourse,
+    };
+    const isDefault = norm.logo === 'account' && norm.watermark === true && norm.showInCourse === false && norm.institutionName === undefined;
+    if (!isDefault) identity = { identity: norm };
+  }
+  return { themeFamily: q.themeFamily, mode: q.mode, brandSeed, themeVersion: q.themeVersion, ...typography, ...identity };
 }
 
 /**

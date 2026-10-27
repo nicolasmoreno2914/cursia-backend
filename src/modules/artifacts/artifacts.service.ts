@@ -472,6 +472,15 @@ export class ArtifactsService {
   }
 
   /** Tamaño (content-length) de un objeto de Storage vía HEAD autenticado; null si no existe o no se pudo leer. */
+  /** r74: tamaño del objeto en Storage (HEAD con la service role) o null si no existe / no se pudo verificar. */
+  async headStorageObjectBytes(bucket: string, storagePath: string): Promise<number | null> {
+    const supabaseUrl = this.config.get<string>('SUPABASE_URL');
+    const serviceKey = this.config.get<string>('SUPABASE_SERVICE_ROLE_KEY');
+    if (!supabaseUrl || !serviceKey) return null;
+    const encodedPath = storagePath.split('/').filter(Boolean).map((s) => encodeURIComponent(s)).join('/');
+    return this.headStorageObjectSize(supabaseUrl, serviceKey, bucket, encodedPath);
+  }
+
   private async headStorageObjectSize(supabaseUrl: string, serviceKey: string, bucket: string, encodedPath: string): Promise<number | null> {
     const headUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
     try {

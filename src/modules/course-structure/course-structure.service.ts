@@ -1,3 +1,4 @@
+import { allowUnownedCourses } from '../authz/unowned-courses'; // r75 D-26 (H4)
 import { PinOp, loadDesignPins, pinsMetadataExpr } from '../course-design/design-pins';
 import { requirementConstraintsForCourse } from '../academic-context/requirements/requirement-authority';
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
@@ -212,7 +213,7 @@ export class CourseStructureService implements OnModuleInit {
     ownerId: string,
     expectedCounter: number,
   ): Promise<{ counter: number; hasBlueprint: boolean }> {
-    const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
+    const allowUnowned = allowUnownedCourses();
     const rows = await queryRunner.query(
       `select structure_version, structure_version_counter, current_blueprint_id
        from public.courses
@@ -686,7 +687,7 @@ export class CourseStructureService implements OnModuleInit {
     // activity, COMMIT, currentInfo): medido en staging ≈ 2 s por GET. Una sentencia ve un único
     // snapshot, así que se conserva la garantía de review G2 M10 (toggles y counter del mismo
     // estado) sin transacción explícita. Mismo filtro de ownership que CoursesService.findOne.
-    const allowUnowned = process.env.ALLOW_UNOWNED_COURSES === 'true';
+    const allowUnowned = allowUnownedCourses();
     const rows = await exec.query(
       `select c.id, c.title, c.structure_version, c.structure_version_counter,
               c.final_exam_enabled, c.activity_engine,

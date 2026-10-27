@@ -31,6 +31,7 @@ import {
 } from './intro-schemas';
 import {
   Hx,
+  Surf,
   ShellRenderOptions,
   accentRule,
   audio,
@@ -125,6 +126,44 @@ export const WELCOME_PARA_TARGET_WORDS = 60;
  */
 const WRAP: Array<[string, string]> = [['overflow-wrap', 'anywhere'], ['word-break', 'break-word']];
 
+/**
+ * r76 «Diseño visual»: identidad institucional al inicio de la bienvenida (solo si el perfil la pide; ausente = bytes de
+ * siempre). `src` = archivo del label (`@@PLUGINFILE@@/…`, en files.xml con su SHA1). El `alt` es FIJO: los filtros de
+ * Moodle reescriben atributos y `nolink` no los protege (mismo criterio que la portada de la presentación).
+ */
+export interface WelcomeIdentity {
+  src: string;
+  /** Tamaño en px de la imagen tal como se muestra (atributos width/height: sobreviven al purificador). */
+  width: number;
+  height: number;
+  /** Nombre de la institución (o null). */
+  name: string | null;
+}
+export const WELCOME_LOGO_FILE = 'logo-institucion.png';
+export const WELCOME_LOGO_FILE_JPEG = 'logo-institucion.jpg';
+export const WELCOME_LOGO_ALT = 'Logo de la institución';
+export const WELCOME_LOGO_MAX_H = 56;
+export const WELCOME_LOGO_MAX_W = 220;
+
+/** r76: tamaño de la imagen del logo en la bienvenida (alto 56 px, ancho ≤ 220 px, proporción del original). */
+export function welcomeLogoSize(width: number, height: number): { width: number; height: number } {
+  if (!(width > 0) || !(height > 0)) return { width: WELCOME_LOGO_MAX_H, height: WELCOME_LOGO_MAX_H };
+  let h = WELCOME_LOGO_MAX_H;
+  let w = Math.round((h * width) / height);
+  if (w > WELCOME_LOGO_MAX_W) {
+    w = WELCOME_LOGO_MAX_W;
+    h = Math.max(16, Math.round((w * height) / width));
+  }
+  return { width: w, height: h };
+}
+
+export function identityStrip(h: Hx, idn: WelcomeIdentity, s: Surf): string {
+  const img = `<img src="${idn.src.replace(/"/g, '&quot;')}" alt="${WELCOME_LOGO_ALT}" width="${idn.width}" height="${idn.height}"` +
+    st(h, [['margin', idn.name ? '0 0 8px 0' : '0'], ['display', 'block']], [['max-width', '100%'], ['height', 'auto']]) + ' />';
+  const name = idn.name ? eyebrow(h, idn.name, s, { sentence: true, margin: '0', color: s.fg }) : '';
+  return `<div class="cvc-identity"${st(h, [['margin', '0 0 20px 0'], ['padding', '0 0 16px 0'], ['border-bottom', `1px solid ${h.t.color.border}`]])}>${img}${name}</div>`;
+}
+
 export function welcomeLabel(
   facts: CourseFacts,
   courseIntro: CourseIntroV3,
@@ -132,6 +171,8 @@ export function welcomeLabel(
   opts?: ShellRenderOptions,
   /** EV6 DoD: paquete de QA → aviso visible antes de la bienvenida (default: sin aviso, bytes de siempre). */
   qaPreviewNotice = false,
+  /** r76: logo y nombre de la institución al inicio del hero (ausente = bytes de siempre). */
+  identity: WelcomeIdentity | null = null,
 ): ShellLabel {
   const intro = assertValidCourseIntroV3(courseIntro);
   const h = hx(theme, opts);
@@ -158,6 +199,7 @@ export function welcomeLabel(
   // empaquetado por la forma del texto). `guard`: sin cortes en abreviaturas ni dentro de un énfasis.
   const split = splitLeadRest(intro.welcome, { maxChars: WELCOME_LEAD_MAX_CHARS, maxWords: WELCOME_LEAD_MAX_WORDS, guard: true, cut: true });
   const hero = heroBand(h, 'cvc-welcome-band', (bs) =>
+    (identity ? identityStrip(h, identity, bs) : '') +
     eyebrow(h, `Curso · ${c.modules} ${plural(c.modules, 'módulo', 'módulos')} · ${c.chapters} ${plural(c.chapters, 'capítulo', 'capítulos')}`, bs, { sentence: true }) +
     heading(h, 'h4', facts.course.title, bs, { display: true }) +
     accentRule(h, bs) +
@@ -179,7 +221,9 @@ export function welcomeLabel(
     const cs = toneSurf(h, 'alt');
     qa = box(h, eyebrow(h, QA_PREVIEW_NOTICE_TITLE, cs.s) + pHtml(h, labelHtml(QA_PREVIEW_NOTICE_TEXT), cs.s, { last: true }), cs, { cls: 'cvc-qa-preview' });
   }
-  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + body + statRow(h, stats) + hours), facts, courseIntroProse(intro, 'welcome'));
+  // r76: el nombre de la institución es texto del usuario (puede tener cifras: «Colegio 21») → prosa admitida.
+  const prose = identity?.name ? [...courseIntroProse(intro, 'welcome'), identity.name] : courseIntroProse(intro, 'welcome');
+  return out('Bienvenida', root(h, 'shell-welcome', qa + hero + body + statRow(h, stats) + hours), facts, prose);
 }
 
 // ─── S0.3 Audio de bienvenida ───────────────────────────────────────────────
@@ -312,14 +356,19 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
  * hacia `$@RESOURCEVIEWBYID*libroMid@$` en una pestaña nueva; con `display` = 5 (abrir) view.php entrega el PDF, que el
  * navegador muestra en su visor.
  */
-export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, libroMid?: number): ShellLabel {
+export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, libroMid?: number, onlineBookMid?: number): ShellLabel {
   if (libroMid === undefined) return libroCard(null, facts, theme, opts);
   if (!Number.isInteger(libroMid) || libroMid < 1) shellFail(`libroMid inválido (${libroMid})`);
-  return libroCard(libroMid, facts, theme, opts, { text: LIBRO_CTA_TEXT, newTab: true, pdf: true });
+  if (onlineBookMid !== undefined && (!Number.isInteger(onlineBookMid) || onlineBookMid < 1)) shellFail(`onlineBookMid inválido (${onlineBookMid})`);
+  return libroCard(libroMid, facts, theme, opts, { text: LIBRO_CTA_TEXT, newTab: true, pdf: true, ...(onlineBookMid !== undefined ? { onlineBookMid } : {}) });
 }
 
 /** r19 (L4): texto del botón del Libro Guía en la descripción del recurso (builder ≥ 3.13.0). */
 export const LIBRO_CTA_TEXT = 'Abrir Libro Guía →';
+/** r78: botón de la tarjeta hacia la lectura en línea (libro de Moodle, builder ≥ 3.18.0). */
+export const LIBRO_ONLINE_CTA_TEXT = 'Leer en el celular →';
+/** r78: frase de la tarjeta sobre la lectura en línea. */
+export const LIBRO_ONLINE_CARD_TEXT = 'Para leer en el teléfono, usa la versión en línea: el mismo texto, con letra cómoda que se ajusta a la pantalla. El PDF sirve para descargar e imprimir.';
 
 /** Tarjeta del Libro Guía como label aparte (builder ≤ 3.10.0; se conserva para paquetes y pruebas anteriores). */
 export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
@@ -332,7 +381,7 @@ function libroCard(
   facts: CourseFacts,
   theme: ResolvedTheme,
   opts?: ShellRenderOptions,
-  cta: { text: string; newTab: boolean; pdf: boolean } = { text: 'Abrir el Libro Guía', newTab: false, pdf: false },
+  cta: { text: string; newTab: boolean; pdf: boolean; onlineBookMid?: number } = { text: 'Abrir el Libro Guía', newTab: false, pdf: false },
 ): ShellLabel {
   const h = hx(theme, opts);
   const cs = { s: panelSurf(h), border: h.t.color.border };
@@ -351,15 +400,20 @@ function libroCard(
     eyebrow(h, 'Material de estudio', cs.s) +
     heading(h, 'h3', 'Libro Guía', cs.s) +
     pHtml(h, labelHtml(text), cs.s, { last: libroMid === null }) +
+    (libroMid !== null && cta.onlineBookMid !== undefined ? pHtml(h, labelHtml(LIBRO_ONLINE_CARD_TEXT), cs.s, { secondary: true }) : '') +
     (libroMid === null
       ? ''
-      : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, cta.text, cs.s, { button: true, margin: '16px 0 0 0', ...(cta.newTab ? { target: '_blank' as const } : {}) }));
+      : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, cta.text, cs.s, { button: true, margin: '16px 0 0 0', ...(cta.newTab ? { target: '_blank' as const } : {}) })) +
+    // r78: lectura en línea (libro de Moodle con el mismo texto), en la misma pestaña: la app oficial lo abre dentro.
+    (libroMid !== null && cta.onlineBookMid !== undefined ? link(h, `$@BOOKVIEWBYID*${cta.onlineBookMid}@$`, LIBRO_ONLINE_CTA_TEXT, cs.s, { button: true, margin: '12px 0 0 0' }) : '');
   return out(libroMid === null || cta.newTab ? 'Libro Guía (descripción del recurso)' : 'Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
 }
 
 // ─── S1.3 Audiolibro ────────────────────────────────────────────────────────
 
-export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, links?: Readonly<Record<string, string>> | null): ShellLabel {
+  if (facts.audio.delivery?.mode === 'parts') return audiobookDeliveredInPartsLabel(facts, theme, opts);
+  if (facts.audio.delivery?.mode === 'linked') return audiobookLinkedLabel(facts, theme, opts, links ?? {});
   const h = hx(theme, opts);
   const s = bgSurf(h);
   const items = facts.audio.audiobookParts.map((p) => {
@@ -383,6 +437,131 @@ export function audiobookLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: 
     rows(h, items.join(''), { ordered: true }) +
     `</div>`;
   return out('Audiolibro', root(h, 'shell-audiobook', inner), facts);
+}
+
+/** r74: nombre de archivo del MP3 de un segmento del audiolibro entregado por partes (sin cifras visibles). */
+export function audiobookSegmentFile(moduleNumber: number, firstChapter: number, lastChapter: number): string {
+  const p2 = (n: number) => String(n).padStart(2, '0');
+  return `audiolibro_modulo_${p2(moduleNumber)}_cap_${p2(firstChapter)}-${p2(lastChapter)}.mp3`;
+}
+
+function chapterRange(nums: readonly number[]): string {
+  return nums.length === 1 ? `capítulo ${nums[0]}` : `capítulos ${nums[0]} a ${nums[nums.length - 1]}`;
+}
+
+/**
+ * r74: etiqueta del audiolibro en el paquete PRINCIPAL cuando el audio va en partes aparte. Dice la duración total
+ * medida, qué trae cada parte y que, al restaurarlas en este curso, los reproductores aparecen aquí debajo. Sin MP3.
+ */
+export function audiobookDeliveredInPartsLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
+  const d = facts.audio.delivery;
+  if (!d) shellFail('audiobookDeliveredInPartsLabel sin entrega por partes');
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const partRows = d.parts.map((p) => {
+    const mods = p.segments
+      .map((sg) => `Módulo ${sg.moduleNumber} (${chapterRange(sg.chapterNumbers)})`)
+      .join(' · ');
+    return numRow(h, `<strong>${labelHtml(`Parte ${p.partNumber} de ${d.totalFiles}`)}</strong><br><span style="color:${s.fg2}">${labelHtml(`${mods} · dura ${formatDurationEs(p.seconds)}`)}</span>`, s);
+  });
+  const items = facts.audio.audiobookParts.map((p) => {
+    const ch = facts.chapters.find((c) => c.id === p.chapterId);
+    if (!ch) shellFail(`parte del audiolibro sin capítulo (${p.chapterId})`);
+    return numRow(h, `<strong>${inlineHtml(ch.title)}</strong><br><span style="color:${s.fg2}">${labelHtml(`Dura ${formatDurationEs(p.seconds)}`)}</span>`, s, String(ch.number));
+  });
+  const inner =
+    eyebrow(h, 'Escucha', s) +
+    heading(h, 'h3', AUDIOBOOK_TITLE, s) +
+    pHtml(h, labelHtml(`La versión narrada de los capítulos. Duración total: ${formatDurationEs(facts.audio.audiobookSeconds)}.`), s, { secondary: true }) +
+    pHtml(h, labelHtml(`Por su extensión, el audiolibro se entrega por módulos en archivos aparte de este curso (las partes ${d.parts[0].partNumber} a ${d.totalFiles} del paquete). Cuando se restauran en este mismo curso, cada módulo aparece justo debajo, con su reproductor.`), s) +
+    rows(h, partRows.join('')) +
+    `<div style="margin:24px 0 0 0">` +
+    eyebrow(h, 'Índice', s) +
+    rows(h, items.join(''), { ordered: true }) +
+    `</div>`;
+  return out('Audiolibro', root(h, 'shell-audiobook', inner), facts);
+}
+
+/** r74: clave estable de un segmento del audiolibro (módulo + primer capítulo) para su enlace duradero. */
+export function audiobookSegmentKey(moduleNumber: number, firstChapterNumber: number): string {
+  return `m${moduleNumber}c${firstChapterNumber}`;
+}
+
+/**
+ * r74: audiolibro EN LÍNEA (un solo .mbz): un reproductor por módulo con la dirección DURADERA de Cursia del MP3
+ * (nunca una URL firmada temporal). La duración de cada tramo y el índice salen de facts (medidos).
+ */
+export function audiobookLinkedLabel(facts: CourseFacts, theme: ResolvedTheme, opts: ShellRenderOptions | undefined, links: Readonly<Record<string, string>>): ShellLabel {
+  const d = facts.audio.delivery;
+  if (!d || d.mode !== 'linked') shellFail('audiobookLinkedLabel sin entrega en línea');
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const blocks = d.parts.flatMap((p) => p.segments).map((sg) => {
+    const key = audiobookSegmentKey(sg.moduleNumber, sg.chapterNumbers[0]);
+    const url = links[key];
+    if (!url || !/^https:\/\/[^\s"<>]+$/.test(url)) shellFail(`audiolibro en línea sin dirección para ${key}`);
+    const mod = facts.modules.find((m) => m.number === sg.moduleNumber);
+    if (!mod) shellFail(`módulo ${sg.moduleNumber} ausente en facts`);
+    const items = sg.chapters.map((x) => {
+      const ch = facts.chapters.find((c) => c.id === x.chapterId);
+      if (!ch) shellFail(`capítulo ${x.chapterId} ausente en facts`);
+      return numRow(h, `<strong>${inlineHtml(ch.title)}</strong><br><span style="color:${s.fg2}">${labelHtml(`Empieza en ${formatDurationEs(x.offsetSeconds)} · dura ${formatDurationEs(x.seconds)}`)}</span>`, s, String(ch.number));
+    });
+    return (
+      `<div style="margin:24px 0 0 0">` +
+      eyebrow(h, `Módulo ${sg.moduleNumber} · ${chapterRange(sg.chapterNumbers)}`, s) +
+      heading(h, 'h4', mod.title, s) +
+      pHtml(h, labelHtml(`Duración: ${formatDurationEs(sg.seconds)}.`), s, { secondary: true }) +
+      audio(h, url, `el audiolibro del módulo ${sg.moduleNumber}`, s, `${AUDIOBOOK_TITLE} · Módulo ${sg.moduleNumber}`) +
+      rows(h, items.join(''), { ordered: true }) +
+      `</div>`
+    );
+  });
+  const inner =
+    eyebrow(h, 'Escucha', s) +
+    heading(h, 'h3', AUDIOBOOK_TITLE, s) +
+    pHtml(h, labelHtml(`La versión narrada de los capítulos, por módulo. Duración total: ${formatDurationEs(facts.audio.audiobookSeconds)}. Se escucha en línea desde Cursia: no hay que instalar nada más.`), s, { secondary: true }) +
+    blocks.join('');
+  return out('Audiolibro', root(h, 'shell-audiobook', inner), facts);
+}
+
+/** r74: etiqueta de un segmento del audiolibro (va en una parte de audio; se restaura en la sección 1 del curso). */
+export function audiobookSegmentLabel(
+  facts: CourseFacts,
+  theme: ResolvedTheme,
+  opts: ShellRenderOptions | undefined,
+  where: { partNumber: number; segmentIndex: number },
+): ShellLabel & { file: string } {
+  const d = facts.audio.delivery;
+  const part = d?.parts.find((p) => p.partNumber === where.partNumber);
+  const sg = part?.segments[where.segmentIndex];
+  if (!d || !part || !sg) shellFail(`segmento del audiolibro inexistente (parte ${where.partNumber}, ${where.segmentIndex})`);
+  const mod = facts.modules.find((m) => m.number === sg.moduleNumber);
+  if (!mod) shellFail(`módulo ${sg.moduleNumber} ausente en facts`);
+  const h = hx(theme, opts);
+  const s = bgSurf(h);
+  const file = audiobookSegmentFile(sg.moduleNumber, sg.chapterNumbers[0], sg.chapterNumbers[sg.chapterNumbers.length - 1]);
+  const what = `Módulo ${sg.moduleNumber} (${chapterRange(sg.chapterNumbers)})`;
+  const items = sg.chapters.map((x) => {
+    const ch = facts.chapters.find((c) => c.id === x.chapterId);
+    if (!ch) shellFail(`capítulo ${x.chapterId} ausente en facts`);
+    return numRow(
+      h,
+      `<strong>${inlineHtml(ch.title)}</strong><br><span style="color:${s.fg2}">${labelHtml(`Empieza en ${formatDurationEs(x.offsetSeconds)} · dura ${formatDurationEs(x.seconds)}`)}</span>`,
+      s,
+      String(ch.number),
+    );
+  });
+  const body =
+    eyebrow(h, `Audiolibro · parte ${part.partNumber} de ${d.totalFiles}`, s) +
+    heading(h, 'h3', mod.title, s) +
+    pHtml(h, labelHtml(`${what}. Duración: ${formatDurationEs(sg.seconds)}.`), s, { secondary: true }) +
+    audio(h, `@@PLUGINFILE@@/${file}`, `el audiolibro del módulo ${sg.moduleNumber}`, s, `${AUDIOBOOK_TITLE} · Módulo ${sg.moduleNumber}`) +
+    `<div style="margin:24px 0 0 0">` +
+    eyebrow(h, 'Índice', s) +
+    rows(h, items.join(''), { ordered: true }) +
+    `</div>`;
+  return { ...out(`🎧 Audiolibro · ${what}`, root(h, 'shell-audiobook-part', body), facts), file };
 }
 
 // ─── Sm.0 Presentación del módulo ───────────────────────────────────────────

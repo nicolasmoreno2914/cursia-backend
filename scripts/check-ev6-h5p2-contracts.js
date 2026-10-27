@@ -55,6 +55,11 @@ const FULL_LIBS = argLibs >= 0 ? process.argv[argLibs + 1] : process.env.H5P_LIB
  * Huellas sha256 de los paquetes LEGACY capturadas en el commit base (origin/staging bf44a9f,
  * antes de H5P v2) con `node scripts/lib/h5p2-golden-legacy.js`. H5P v2 no puede cambiar ni un byte.
  */
+// r78 (builder 3.18.0, Libro Guía en el celular): los 5 .mbz recalculados a propósito — sección 1 + libro en línea (mod_book,
+// mismo texto del PDF), tarjeta del Libro con «Leer en el celular»; moduleid siguientes corren uno; archivos idénticos.
+// r77 (builder 3.17.0, mobile-first): los 5 .mbz recalculados a propósito (mismos valores que check-ev6-h5p2-wire.js); frente
+// a c820d4e solo cambian los estilos de los botones (la píldora es el <a>) y de las descargas — diff por entrada del zip: mismo
+// texto, etiquetas, enlaces y archivos. Los paquetes H5P no cambian. Dorados 3.16.0: 046edade…, 26f7f230…, 62c4bc0f…, 139dd659…, 5fa5fafe….
 const GOLDEN = {
   h5p: {
     questionset: 'e9c32ce89c9d141d7b3e2e89370b136d831816c4e662cad005dd24222a9fa80a',
@@ -103,11 +108,11 @@ const GOLDEN = {
   // Dorados r55 (fd67337): h5p-final-light 0892ae20…, scorm-nofinal-dark 5feee6eb…, h5p-nofinal-dark-mock-cleansafe
   // ee6da148…, scorm-final-light 92007263…, h5p-ev5c-rules1 df1ee128….
   mbz: {
-    'h5p-final-light': '046edade710990caf80bc5cc95ef429f9cac34f40302a603bd6505d1c32f160b',
-    'scorm-nofinal-dark': '26f7f2305bf0374f1ae096864394d129a60200abb9d0c5034ad717eca4ce4981',
-    'h5p-nofinal-dark-mock-cleansafe': '62c4bc0fd080d9dff4760fb15dcd011c3901f8e5c2d1ac086f8862b1206c9bcd',
-    'scorm-final-light': '139dd6593462e631095352c008facc90752731fb5ce986dbea675676a62263f1',
-    'h5p-ev5c-rules1': '5fa5fafe5a423c35998268763ccd0a70514fdcf699b52c200a18d848f0483e53',
+    'h5p-final-light': '2d8368d3da9bba1590b7e5bb9e770daa7e711e6691eff5dc0b5a1c8a99749605',
+    'scorm-nofinal-dark': 'a78c9efc6e5625481a772caf7a10f4a2e14b5f87bfee552593d74eb58a5f2b36',
+    'h5p-nofinal-dark-mock-cleansafe': 'dbd5a9e35869620d0ced078d3752a0044c23a9eda559b8eff62f22b3165422f2',
+    'scorm-final-light': '87170028e2fff1333cecf8dc33cfc0a436f9672858ea7cb9572bf028f7598a5e',
+    'h5p-ev5c-rules1': '23d81a84f78fd61d75b2ef27561fa0b9810e300a8123f78c64bb401e6c4eaad8',
   },
 };
 

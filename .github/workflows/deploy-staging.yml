@@ -47,6 +47,14 @@ on:
         type: choice
         options: ['no', 'yes']
         default: 'no'
+      # r75: backfill de instituciones y membresías (scripts/migrate-r75-backfill.js), SOLO por dispatch y nunca en un push.
+      # dry-run = solo lectura (reporte); apply = una transacción, aborta si reasignaría algún curso. El reporte (sin
+      # emails en claro) se sube como artifact «r75-backfill-report».
+      r75_backfill:
+        description: 'r75: none | dry-run (reporte, solo lectura) | apply (escribe instituciones/membresías; nunca reasigna cursos)'
+        type: choice
+        options: ['none', 'dry-run', 'apply']
+        default: 'none'
 
 concurrency:
   group: deploy-staging
@@ -622,8 +630,50 @@ jobs:
                ensure_env_exact STORAGE_MAX_UPLOAD_BYTES 300000000
                # r61: el tope propio del .mbz debe ser <= STORAGE_MAX_UPLOAD_BYTES (si no, PACKAGE_SIZE_CONFIG_INVALID); se alinea al mismo valor.
                ensure_env_exact PACKAGE_MBZ_MAX_BYTES 300000000
+               # r74: cursos de cualquier tamaño. Dirección pública DURADERA de los medios del curso (audiolibro en línea de los
+               # cursos que no caben en un archivo): /api/v1/media/... responde 302 a una URL firmada nueva. Sin esta variable
+               # la entrega de un curso grande es solo autocontenida (principal + partes). Tamaño máximo de cada archivo
+               # entregado = default del código (min(200 MiB, STORAGE_MAX_UPLOAD_BYTES)).
+               ensure_env_exact PUBLIC_MEDIA_BASE_URL https://api-staging.cursia.nomaddi.com
                # Las claves de proveedores de staging se cargan en staging (secrets de staging);
                # lo que falte lo reporta el preflight [6b2] — nunca se toma de producción.
+
+               echo "━━━ [0d] r75: roles en ENFORCE; presupuestos y guard de cuenta en SHADOW (solo el .env de STAGING) ━━━"
+               # r75 Fase 2: RBAC se APLICA en staging (pruebas reales por rol, verde). Revertir = shadow.
+               # CURSIA_USER_BUDGETS vuelve a shadow tras las pruebas: en enforce el SuperAdmin tampoco se salta su presupuesto
+               # (D-18) y el owner de staging tiene límite 0 con USD 151 gastados en el mes → no podría arrancar generaciones.
+               # Para pasarlo a enforce: el owner se asigna su presupuesto mensual (≥ su gasto del mes) en Finanzas.
+               # CURSIA_ACCOUNT_GUARD sigue en shadow: los registros de Supabase de staging siguen abiertos (acción del owner).
+               ensure_env_exact CURSIA_ACCOUNT_GUARD shadow
+               ensure_env_exact CURSIA_RBAC_MODE enforce
+               ensure_env_exact CURSIA_USER_BUDGETS shadow
+               # r75 Fase 2: cuentas QA sintéticas (qa-r75-*@example.com, creadas en staging por POST /admin/users) con V2
+               # para probar Propuesta / aprobación / estimado por rol. Ids de staging, no secretos. Sin video real.
+               # r75 Fase 2: el estimado («Autorizar y generar») de las cuentas QA, sin video real, necesita la vista previa
+               # simulada (videoMode mock, USD 0). Escape de QA de staging (EV6 DoD); producción no lo tiene.
+               ensure_env_exact DYNAMIC_ALLOW_VIDEO_PREVIEW true
+               for qa_owner in c9742efe-f45a-4389-b305-09b7bac3e709 21b19a6a-6e39-4313-ac34-afaecbeefdf8 1706ff10-1157-4fa5-9e11-6e42bc9b1133 \
+                               7aa4981f-b9ed-41ce-8859-53f2eb0383f0 34ed5dde-2950-4b8e-910e-c91c77ef4dd5 3bd4e919-e8d3-4c3e-9f13-737e4c2113b9 \
+                               8e642f8d-1db2-40b8-86eb-1540a57ce7fe; do
+                 ensure_env_list_contains DYNAMIC_V2_ALLOWED_OWNERS "$qa_owner"
+               done
+               # D-26 (H4): con ALLOW_UNOWNED_COURSES=true fuera de development la API y los workers NO arrancan
+               # (assertUnownedCoursesSafe). Fuera de development el flag ya no tenía efecto: se apaga para no tumbar staging.
+               if [ "$(_env_val .env ALLOW_UNOWNED_COURSES)" = "true" ]; then
+                 echo "⚠ ALLOW_UNOWNED_COURSES=true en el .env de staging: con r75 impediría arrancar (D-26) → se fija en false"
+                 ensure_env_exact ALLOW_UNOWNED_COURSES false
+               else
+                 echo "✓ ALLOW_UNOWNED_COURSES no es true (D-26 ok)"
+               fi
+               # H9: emisor exacto del JWT, solo si SUPABASE_URL es la URL directa del proyecto de staging conocido (su
+               # iss es <SUPABASE_URL>/auth/v1, verificado en un token real de staging). Con un alias no se toca.
+               _R75_SU=$(_env_val .env SUPABASE_URL)
+               _R75_SU="${_R75_SU%/}"
+               if [ "$_R75_SU" = "https://ljdtmkwuhkvtmlhugjrv.supabase.co" ]; then
+                 ensure_env_exact SUPABASE_JWT_ISSUER "${_R75_SU}/auth/v1"
+               else
+                 echo "ℹ SUPABASE_URL no es la URL directa del proyecto de staging: SUPABASE_JWT_ISSUER no se toca"
+               fi
 
                echo "━━━ [1/6] Instalar dependencias de producción ━━━"
                npm install --omit=dev
@@ -768,6 +818,19 @@ jobs:
                echo "━━━ [5/6] Migrar usage_events y cost_rates (staging) ━━━"
                node scripts/migrate-usage-events-costs.js
 
+               # r75: staging-only hasta aprobación del owner (EXCLUDED del plan de producción). Aditivas e idempotentes.
+               echo "━━━ [5b] r75: accesos (instituciones multi-miembro, membresías, suspensiones, auditoría; H2) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r75-access.js
+
+               echo "━━━ [5c] r75: accesos — verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-r75-access-schema.js
+
+               echo "━━━ [5d] r75: presupuestos por usuario, reservas y solicitudes — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r75-budgets.js
+
+               echo "━━━ [5e] r75: presupuestos — verificación de esquema (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/verify-r75-budgets-schema.js
+
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
                ensure_pm2_process cursia-content-worker-staging start:content-worker
@@ -805,6 +868,42 @@ jobs:
                sudo pm2 jlist | node scripts/pm2-staging-stability.js compare "$PM2_BEFORE"
 
                echo "✅ Deploy a staging completado."'
+
+      # r75: backfill (dry-run | apply) DESPUÉS de las migraciones r75 del paso anterior. El reporte JSON se escribe en un
+      # dir temporal del VPS, se trae al runner por stdout del ssh y se borra del VPS. Antes de subirlo como artifact se
+      # verifica que no tenga emails en claro (el script los enmascara: x***@dominio).
+      - name: r75 backfill de instituciones (solo dispatch)
+        if: github.event_name == 'workflow_dispatch' && (inputs.r75_backfill == 'dry-run' || inputs.r75_backfill == 'apply')
+        env:
+          DEPLOY_VPS_USER: ${{ secrets.VPS_USER }}
+          DEPLOY_VPS_HOST: ${{ secrets.VPS_HOST }}
+          DEPLOY_VPS_PATH_STAGING: ${{ secrets.VPS_PATH_STAGING }}
+          R75_BACKFILL: ${{ inputs.r75_backfill }}
+          RUN_TAG: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          APPLY_ARG=""
+          if [ "$R75_BACKFILL" = "apply" ]; then APPLY_ARG="--apply"; fi
+          RDIR="/tmp/r75-backfill-$RUN_TAG"
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cd '$DEPLOY_VPS_PATH_STAGING' && rm -rf '$RDIR' && mkdir -p '$RDIR' && MIGRATION_ENV=staging node scripts/migrate-r75-backfill.js $APPLY_ARG --report-dir='$RDIR'"
+          mkdir -p r75-backfill-report
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no "$DEPLOY_VPS_USER@$DEPLOY_VPS_HOST" \
+            "cat \$(ls -1t '$RDIR'/backfill-*.json | head -n 1) && rm -rf '$RDIR'" > "r75-backfill-report/backfill-staging-$R75_BACKFILL-$RUN_TAG.json"
+          # Privacidad: ningún email en claro (solo la forma enmascarada x***@dominio).
+          if grep -Eo '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' r75-backfill-report/*.json | grep -Ev '\*\*\*@' | grep -q .; then
+            echo "::error::el reporte del backfill trae emails en claro: no se sube"
+            rm -rf r75-backfill-report
+            exit 1
+          fi
+          node -e 'const r=require(process.argv[1]);console.log(JSON.stringify({mode:r.mode,env:r.env,summary:r.summary,applied:r.applied}))' "$PWD/r75-backfill-report/backfill-staging-$R75_BACKFILL-$RUN_TAG.json"
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && (inputs.r75_backfill == 'dry-run' || inputs.r75_backfill == 'apply')
+        with:
+          name: r75-backfill-report-${{ inputs.r75_backfill }}
+          path: r75-backfill-report
+          retention-days: 30
 
       - name: Health check post-deploy
         run: |

@@ -174,6 +174,7 @@ export class BrandProfilesService {
     id: string,
     ownerId: string,
     dto: ConfirmBrandProfileDto,
+    actorId?: string, // r75: quién revisa (puede ser un miembro, no el dueño técnico de la institución)
   ): Promise<BrandProfile> {
     const profile = await this.findOne(id, ownerId);
     if (profile.status !== 'pending_review' && profile.status !== 'draft') {
@@ -195,7 +196,7 @@ export class BrandProfilesService {
       if (dto.typography) profile.typography = dto.typography;
       if (dto.usageRules) profile.usageRules = dto.usageRules;
       profile.status = 'active';
-      profile.reviewedBy = ownerId;
+      profile.reviewedBy = actorId ?? ownerId;
       profile.reviewedAt = new Date();
       return repo.save(profile);
     });

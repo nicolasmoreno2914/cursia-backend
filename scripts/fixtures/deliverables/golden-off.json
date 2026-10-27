@@ -1,8 +1,10 @@
 {
   "_note": "sha256 de .mbz SIN applicationDelivery/practiceResources, calculados con el build ANTERIOR a T4/T5 (BE 3198288, worktree desechable). check-application-deliverables D3 exige igualdad con el build actual.",
   "baseCommit": "3198288",
-  "appModulesH5p": "4bf9abed5fe86cee9232ded6657f31d37529fb35c79c806c89af0f978c0029e0",
-  "appModulesScorm": "a247579625c6ff1e40643c0b517150ff71382dc701908620528ba4a32a8b15d3",
-  "course2NoFinal": "297ab047717407d3abca22642ecea89705b6a43ad3370bd9dfead70487fd9c6e",
-  "course2H5pV2Review": "3f024d2377b95d2a600f80c03ae05301a39e8326ecf62dec4352206f40f10cde"
+  "appModulesH5p": "e865cd838ecf845034dce580a993590d18ba1022077062e120cf536dbfe39dba",
+  "appModulesScorm": "7f8d3f5e531bcaa051e7931c629cbdd784f2ef34912b2c16ea93304f865cd307",
+  "course2NoFinal": "ba13b3e87ceb0af0c0c178a4a9b6e148b51df7a44a7c33e585957de6ea8f661b",
+  "course2H5pV2Review": "a13c2011bbe9f8564ed4c78e1bcbd95ac74c21f75d3c21459f4376bc5d61f37f",
+  "_r77": "r77 (mobile-first, builder 3.17.0): los 4 sha se recalcularon a propósito; frente a c820d4e solo cambian los estilos de los botones y de los enlaces de descarga (mismo texto, mismas etiquetas, enlaces y archivos; diff por entrada del zip en validation/r77-mobile).",
+  "_r78": "r78 (Libro Guía en el celular, builder 3.18.0): los 4 sha se recalcularon a propósito; la sección 1 suma el libro en línea (mod_book, mismo texto del PDF) y la tarjeta del Libro el botón «Leer en el celular»; los moduleid siguientes corren uno. Archivos de contenido idénticos (PDF del Libro byte a byte; check-r78-libro-movil B6)."
 }

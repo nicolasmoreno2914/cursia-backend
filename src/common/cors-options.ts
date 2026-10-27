@@ -9,8 +9,9 @@ import type { CorsOptions } from '@nestjs/common/interfaces/external/cors-option
  * un Chrome real.
  */
 export const CORS_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] as const;
-/** Cabeceras que manda el cliente (24-backend-client.js: backendApiRequest). */
-export const CORS_ALLOWED_HEADERS = ['Content-Type', 'Authorization'] as const;
+/** Cabeceras que manda el cliente (24-backend-client.js: backendApiRequest). r75 (R75-E14): X-Cursia-Institution
+ *  = institución activa (01 §3.1); el FE solo la manda si /me/context anuncia `institutionHeader: true`. */
+export const CORS_ALLOWED_HEADERS = ['Content-Type', 'Authorization', 'X-Cursia-Institution'] as const;
 /** Cabeceras de respuesta que el navegador deja leer: el nombre del PDF de la propuesta viaja en Content-Disposition
  *  (sin exponerla, el frontend caía en un nombre genérico). */
 export const CORS_EXPOSED_HEADERS = ['Content-Disposition'] as const;

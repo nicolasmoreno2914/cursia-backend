@@ -3,15 +3,26 @@ import {
   Controller,
   HttpStatus,
   Logger,
+  Optional,
   Post,
   Res,
   UseGuards,
 } from '@nestjs/common';
 import { Response } from 'express';
+import { DataSource } from 'typeorm';
+import { isSuperAdminEmail } from '../auth/super-admin';
+import { AuthenticatedOnly } from '../modules/authz/require-permission.decorator';
 import { SupabaseJwtGuard } from '../auth/supabase-jwt.guard';
 import { CurrentUser } from '../auth/current-user.decorator';
 import { AuthUser } from '../auth/auth.types';
-import { decideVideoEngineAccess } from './video-engine-access';
+import {
+  decideVideoEngineAccess,
+  recordVideoEngineRender,
+  VIDEO_ENGINE_NOT_FOUND,
+  VIDEO_ENGINE_READ_ACTIONS,
+  VIDEO_ENGINE_RENDER_ACTIONS,
+  videoEngineIdOwnedBy,
+} from './video-engine-access';
 
 /**
  * Proxy seguro hacia Video Engine IA.
@@ -31,8 +42,16 @@ import { decideVideoEngineAccess } from './video-engine-access';
 export class VideoEngineController {
   private readonly logger = new Logger(VideoEngineController.name);
 
+  constructor(@Optional() private readonly dataSource?: DataSource) {}
+
+  private get query() {
+    const ds = this.dataSource;
+    return ds ? (sql: string, params?: unknown[]) => ds.query(sql, params as any[]) : null;
+  }
+
   @Post()
   @UseGuards(SupabaseJwtGuard)
+  @AuthenticatedOnly('video-engine: renders propios (status/batch-status ligados al usuario, H3)')
   async proxyRequest(
     @Body() body: { action: string; payload?: Record<string, unknown> },
     @Res() res: Response,
@@ -46,6 +65,21 @@ export class VideoEngineController {
       this.logger.warn(`[VideoEngine] ${deny.code} action=${String(body?.action ?? '').slice(0, 32)} user=${user?.id ?? '-'}`);
       res.status(deny.status).json({ error: deny.message, code: deny.code });
       return;
+    }
+    // r75 B1 (H3): status / batch-status solo de renders ligados al usuario en el servidor (ver video-engine-access.ts).
+    if (VIDEO_ENGINE_READ_ACTIONS.has(String(body?.action)) && !isSuperAdminEmail(user?.email)) {
+      const kind = body.action === 'status' ? 'job' : 'batch';
+      const rawId = kind === 'job' ? body?.payload?.['job_id'] : body?.payload?.['batch_id'];
+      const id = typeof rawId === 'string' ? rawId : '';
+      const q = this.query;
+      const owned = !!id && !!q && !!user?.id && (await videoEngineIdOwnedBy(q, user.id, kind, id));
+      if (!owned) {
+        if (id) this.logger.warn(`[VideoEngine] ${VIDEO_ENGINE_NOT_FOUND} action=${body.action} user=${user?.id ?? '-'}`);
+        res.status(id ? HttpStatus.NOT_FOUND : HttpStatus.BAD_REQUEST).json(id
+          ? { error: 'Render no encontrado.', code: VIDEO_ENGINE_NOT_FOUND }
+          : { error: `payload.${kind === 'job' ? 'job_id' : 'batch_id'} requerido para action=${body.action}.` });
+        return;
+      }
     }
     const veApiKey  = (process.env.VIDEOGEN_API_KEY  ?? '').trim();
     const veBaseUrl = (process.env.VIDEOGEN_API_URL ?? '').replace(/\/$/, '');
@@ -198,6 +232,15 @@ export class VideoEngineController {
       parsed = JSON.parse(text);
     } catch {
       parsed = { raw: text };
+    }
+
+    // r75 B1 (H3): un render REAL aceptado queda ligado a quien lo pidió (habilita su status / batch-status).
+    if (veRes.ok && VIDEO_ENGINE_RENDER_ACTIONS.has(action) && user?.id && this.query) {
+      try {
+        await recordVideoEngineRender(this.query, user.id, action, parsed);
+      } catch (e) {
+        this.logger.error(`[VideoEngine] no se pudo registrar el render de ${user.id}: ${(e as Error).message?.slice(0, 160)}`);
+      }
     }
 
     res.status(veRes.status).json(parsed);

@@ -37,6 +37,11 @@ export const PREVIEW_NOT_DELIVERABLE = 'preview_not_deliverable';
 export interface PackageActor {
   id?: string | null;
   email?: string | null;
+  /**
+   * r75 (D-15): vida de la URL firmada del `.mbz` cuando quien descarga NO es el dueño (miembro con exports.download en
+   * RBAC enforce): default 300 s, tope 3600 s (signedUrlSecondsFor). Sin valor → la de siempre (dueño / legacy).
+   */
+  signedUrlTtlSeconds?: number | null;
 }
 /** worker_status del job de package en curso — una segunda POST reutiliza el mismo job sin crear otro. */
 const IN_PROGRESS_PACKAGE_STATUSES = ['queued', 'running', 'retrying'];
@@ -61,6 +66,37 @@ export interface PackageJobRow {
   input_payload: Record<string, any>;
   output_summary: Record<string, any>;
   error_message: string | null;
+}
+
+export interface PackageDeliveryStatus {
+  mode: 'linked' | 'parts';
+  recommended: { filename: string; sizeBytes: number | null; audioOnline: boolean; mediaFiles: number };
+  selfContained: {
+    totalFiles: number;
+    files: Array<{ partNumber: number; role: 'main' | 'audio'; filename: string; sizeBytes: number; sha256: string; downloadUrl?: string }>;
+  };
+  /** Pasos de restauración en español (la UI los muestra tal cual). */
+  restoreSteps: { recommended: string[]; selfContained: string[] };
+  error?: string;
+}
+
+export const DELIVERY_RESTORE_STEPS_LINKED = Object.freeze([
+  'Restaura este único archivo como un curso nuevo (Administración del sitio › Cursos › Restaurar curso).',
+  'No hay que instalar nada más: el audiolibro se escucha en línea desde Cursia, dentro del curso.',
+]);
+
+export function deliverySelfContainedSteps(totalFiles: number): string[] {
+  if (totalFiles <= 1) {
+    return [
+      'Restaura el archivo «curso completo» como un curso nuevo: trae todos los medios dentro de Moodle (también el audiolibro).',
+      'Si tu Moodle no acepta un archivo de ese tamaño, pídele al administrador que lo restaure por línea de comandos (admin/cli/restore_backup.php) o desde «Archivos privados».',
+    ];
+  }
+  return [
+    `Restaura la parte 1 de ${totalFiles} como un curso nuevo.`,
+    `Entra al curso restaurado › Restaurar, y restaura cada parte de audio (2 a ${totalFiles}) eligiendo «Combinar la copia de seguridad con este curso». El orden de las partes de audio no importa; restaura cada una una sola vez.`,
+    'Las partes de audio solo agregan el audiolibro (por módulo) al final de la sección «Ruta de aprendizaje»: no cambian notas, actividades ni configuración.',
+  ];
 }
 
 export interface RequestPackageResult {
@@ -122,6 +158,13 @@ export interface PackageStatusResult {
   deliverable: boolean;
   /** Nombre sugerido para la descarga (`QA-VISTA-PREVIA-…` si no es entregable). */
   downloadFilename?: string;
+  /**
+   * r74: curso que no cabe en un archivo. `downloadUrl` es el paquete RECOMENDADO (un solo .mbz; con `mode = linked` el
+   * audiolibro se escucha en línea desde Cursia con direcciones duraderas). `selfContained` = la versión con TODOS los
+   * medios dentro de Moodle (un archivo si cabe en el almacenamiento; si no, principal + partes de audio a combinar en el
+   * mismo curso), con URL firmada de cada archivo. Ausente en un paquete de un solo archivo (los de siempre).
+   */
+  delivery?: PackageDeliveryStatus;
   /** EV6 DoD: el curso está COMPLETO = paquete entregable, vigente y completado. */
   complete: boolean;
   /** Fix round 2 (M4): paquete QA/degradado nuevo pedido por un no admin → sin artifactId ni URL. */
@@ -386,7 +429,9 @@ export class PackagingService {
       } else if (artifactId) {
         result.artifactId = artifactId;
         try {
-          const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, DOWNLOAD_URL_TTL_SECONDS);
+          // r75 (D-15): firmada con el dueño REAL del artifact (ownerId efectivo); un miembro no dueño, vida corta.
+          const ttl = actor?.signedUrlTtlSeconds && actor.signedUrlTtlSeconds > 0 ? Math.min(actor.signedUrlTtlSeconds, DOWNLOAD_URL_TTL_SECONDS) : DOWNLOAD_URL_TTL_SECONDS;
+          const { url } = await this.artifacts.getDownloadUrl(artifactId, ownerId, ttl);
           if (url) {
             result.downloadUrl = url;
           } else {
@@ -404,6 +449,11 @@ export class PackagingService {
         }
       }
     }
+    // r74: entrega de un curso grande (paquete recomendado + versión autocontenida con su URL firmada por archivo).
+    const dl = job.output_summary?.delivery;
+    if (job.worker_status === 'completed' && dl && typeof dl === 'object' && Array.isArray(dl.selfContained?.files) && !result.downloadRestricted) {
+      result.delivery = await this.deliveryStatus(dl, ownerId, result, job.output_summary?.size?.totalBytes ?? null);
+    }
     // El error_message del job (si lo hay) tiene prioridad sobre un fallo de
     // signing — un job fallido es un problema más grave que no poder firmar
     // la URL de un job completado.
@@ -419,8 +469,50 @@ export class PackagingService {
 
   // ── internals ────────────────────────────────────────────────────────────
 
-  /** Fix round 1 (I2): dueño real del curso cuando actúa un SUPER_ADMIN; si no, el propio usuario (sin cambios). */
+  /** r74: estado de la entrega con una URL firmada (corta, solo para descargar desde Cursia) por archivo autocontenido. */
+  private async deliveryStatus(dl: any, ownerId: string, result: PackageStatusResult, primaryBytes: number | null): Promise<PackageDeliveryStatus> {
+    const base = String(result.downloadFilename ?? 'curso.mbz').replace(/\.mbz$/, '');
+    const mode: 'linked' | 'parts' = dl.mode === 'linked' ? 'linked' : 'parts';
+    const totalFiles = Number(dl.selfContained?.totalFiles) || dl.selfContained.files.length;
+    const files: PackageDeliveryStatus['selfContained']['files'] = [];
+    let error: string | undefined;
+    for (const f of [...dl.selfContained.files].sort((a: any, b: any) => a.partNumber - b.partNumber)) {
+      const name = totalFiles <= 1 ? `${base}-curso-completo.mbz` : `${base}-parte-${f.partNumber}-de-${totalFiles}.mbz`;
+      const row: PackageDeliveryStatus['selfContained']['files'][number] = { partNumber: Number(f.partNumber), role: f.role === 'audio' ? 'audio' : 'main', filename: name, sizeBytes: Number(f.bytes), sha256: String(f.sha256) };
+      if (f.artifactId === '(dynamic_mbz)') {
+        if (result.downloadUrl) row.downloadUrl = result.downloadUrl;
+      } else if (typeof f.artifactId === 'string') {
+        try {
+          const { url } = await this.artifacts.getDownloadUrl(f.artifactId, ownerId, DOWNLOAD_URL_TTL_SECONDS);
+          if (url) row.downloadUrl = url;
+          else error = 'No se pudo firmar la descarga de una parte del paquete.';
+        } catch (err) {
+          error = `No se pudo firmar la descarga de una parte del paquete (${err instanceof Error ? err.message : String(err)})`;
+        }
+      }
+      files.push(row);
+    }
+    const media = Array.isArray(dl.media) ? dl.media : [];
+    return {
+      mode,
+      recommended: { filename: `${base}.mbz`, sizeBytes: primaryBytes, audioOnline: mode === 'linked', mediaFiles: media.length },
+      selfContained: { totalFiles, files },
+      restoreSteps: { recommended: mode === 'linked' ? [...DELIVERY_RESTORE_STEPS_LINKED] : deliverySelfContainedSteps(totalFiles), selfContained: deliverySelfContainedSteps(totalFiles) },
+      ...(error ? { error } : {}),
+    };
+  }
+
+  /**
+   * Dueño efectivo del curso para las consultas por owner (Fix round 1 I2, generalizado en r75 01 §3.2):
+   *  - `ownerId` llega del controller como `access.effectiveOwnerId`: con CURSIA_RBAC_MODE=enforce, PermissionGuard ya
+   *    autorizó exports.download y lo resolvió a courses.owner_id (un miembro de la institución actúa sobre el curso del
+   *    dueño técnico); en off/shadow es el propio actor (comportamiento de siempre).
+   *  - Si ya viene resuelto a otro usuario (distinto del actor), se respeta tal cual.
+   *  - SUPER_ADMIN (también en off/shadow, como antes): el dueño real del curso.
+   *  - Cualquier otro caso: `ownerId` sin cambios.
+   */
   private async ownerForActor(courseId: number, ownerId: string, actor?: PackageActor): Promise<string> {
+    if (actor?.id && String(ownerId).toLowerCase() !== String(actor.id).toLowerCase()) return ownerId;
     if (!isSuperAdminEmail(actor?.email)) return ownerId;
     const [c] = await this.dataSource.query(`select owner_id from public.courses where id = $1`, [courseId]);
     return c?.owner_id ? String(c.owner_id) : ownerId;

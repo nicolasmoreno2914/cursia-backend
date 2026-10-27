@@ -1,0 +1,317 @@
+{
+ "_comment": "r76 «Diseño visual»: contenido FIJO de la vista previa (copia de los fixtures de R2/R11a: scripts/fixtures/v21-vc-components.json y scripts/lib/v21-shell-fixtures.js). Sin IA.",
+ "experience": {
+  "vcSchemaVersion": 1,
+  "movements": {
+   "opening": [
+    {
+     "type": "hero",
+     "eyebrow": "Comunicación con clientes",
+     "title": "Escuchar antes de responder",
+     "lead": "Una conversación difícil se transforma cuando la otra persona **se siente escuchada**. Aquí verás cómo construir esa sensación con acciones concretas."
+    },
+    {
+     "type": "learning_objectives",
+     "items": [
+      "Reconocer las señales de que un cliente no se siente escuchado.",
+      "Aplicar la escucha activa en una conversación tensa.",
+      "Formular preguntas abiertas que aclaren la necesidad real."
+     ]
+    },
+    {
+     "type": "callout",
+     "variant": "tip",
+     "title": "Truco rápido",
+     "body": "Antes de responder, cuenta mentalmente hasta tres. Esa pausa evita la respuesta defensiva."
+    }
+   ],
+   "deepening": [
+    {
+     "type": "concept_cards",
+     "title": "Conceptos clave",
+     "cards": [
+      {
+       "term": "Escucha activa",
+       "definition": "Atender al mensaje completo: palabras, tono y emoción, y demostrarlo con paráfrasis."
+      },
+      {
+       "term": "Paráfrasis",
+       "definition": "Repetir con tus palabras lo que entendiste para confirmar el sentido."
+      },
+      {
+       "term": "Pregunta abierta",
+       "definition": "Invita a explicar y no se responde con un simple sí o no."
+      }
+     ]
+    },
+    {
+     "type": "accordion",
+     "title": "Las fases de una conversación difícil",
+     "items": [
+      {
+       "heading": "Apertura",
+       "body": "Saluda, presenta tu rol y **baja el ritmo**. La primera impresión define el tono.\n\nEvita justificar a la empresa en los primeros segundos."
+      },
+      {
+       "heading": "Exploración",
+       "body": "Pregunta, escucha y parafrasea hasta que el cliente confirme que entendiste."
+      },
+      {
+       "heading": "Acuerdo",
+       "body": "Propón un siguiente paso concreto, con responsable y fecha."
+      }
+     ]
+    },
+    {
+     "type": "tabs",
+     "title": "Tres enfoques de respuesta",
+     "tabs": [
+      {
+       "label": "Defensivo",
+       "body": "Se centra en justificar el error. El cliente percibe que la empresa se protege a sí misma."
+      },
+      {
+       "label": "Complaciente",
+       "body": "Promete todo para cerrar rápido. Genera expectativas que después no se cumplen."
+      },
+      {
+       "label": "Colaborativo",
+       "body": "Reconoce el problema, explora la necesidad y acuerda un paso concreto. Es el enfoque que buscamos."
+      }
+     ]
+    },
+    {
+     "type": "comparison",
+     "title": "Cuatro estilos de respuesta",
+     "columns": [
+      "Defensivo",
+      "Complaciente",
+      "Evasivo",
+      "Colaborativo"
+     ],
+     "rows": [
+      {
+       "label": "Propósito",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      },
+      {
+       "label": "Momento de uso",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      },
+      {
+       "label": "Ejemplo típico",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      },
+      {
+       "label": "Riesgo principal",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      },
+      {
+       "label": "Señal de éxito",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      },
+      {
+       "label": "Tono recomendado",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      },
+      {
+       "label": "Duración esperada",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      },
+      {
+       "label": "Error frecuente",
+       "cells": [
+        "Justifica el error de la empresa",
+        "Promete cualquier cosa para cerrar",
+        "Cambia de tema sin resolver",
+        "Reconoce, explora y acuerda"
+       ]
+      }
+     ]
+    }
+   ],
+   "synthesis": [
+    {
+     "type": "summary_visual",
+     "central": "Escuchar primero, resolver después",
+     "points": [
+      "La escucha activa se demuestra, no se declara.",
+      "La paráfrasis confirma y calma.",
+      "Todo cierre necesita un paso concreto."
+     ]
+    },
+    {
+     "type": "myth_reality",
+     "title": "Creencias frecuentes",
+     "pairs": [
+      {
+       "myth": "Si el cliente grita, hay que responder con firmeza para recuperar el control.",
+       "reality": "Bajar el volumen y el ritmo propio suele desescalar más rápido que imponerse."
+      },
+      {
+       "myth": "Pedir disculpas equivale a aceptar la culpa legal.",
+       "reality": "Lamentar la experiencia del cliente es distinto de admitir responsabilidad."
+      }
+     ]
+    }
+   ],
+   "closing": [
+    {
+     "type": "reflection",
+     "prompt": "Piensa en la última vez que te sentiste escuchado por un servicio. ¿Qué hizo exactamente la otra persona?",
+     "hint": "Fíjate en gestos pequeños: repetir tu nombre, resumir tu problema, no interrumpir."
+    },
+    {
+     "type": "case_scenario",
+     "title": "El pedido que no llegó",
+     "narrative": "Laura escribe molesta: su pedido lleva una semana de retraso y nadie le responde. Es la segunda vez que le pasa.\n\nEl agente que la atiende tiene poca información del transportista.",
+     "questions": [
+      "¿Qué emoción valida primero el agente?",
+      "¿Qué pregunta abierta ayuda a entender la necesidad real de Laura?"
+     ]
+    }
+   ],
+   "video_primer": [
+    {
+     "type": "process_steps",
+     "title": "Protocolo para una queja",
+     "steps": [
+      {
+       "heading": "Recibir",
+       "body": "Deja que el cliente termine su relato sin interrumpir."
+      },
+      {
+       "heading": "Confirmar",
+       "body": "Parafrasea el problema y pregunta si lo entendiste bien."
+      },
+      {
+       "heading": "Resolver",
+       "body": "Propón una solución concreta o el siguiente paso con fecha."
+      },
+      {
+       "heading": "Cerrar",
+       "body": "Resume el acuerdo y agradece la paciencia."
+      }
+     ]
+    },
+    {
+     "type": "timeline",
+     "title": "Evolución del servicio al cliente",
+     "events": [
+      {
+       "marker": "Década de 1970",
+       "heading": "Atención por mostrador",
+       "body": "El contacto era presencial y el tiempo de respuesta dependía de la fila."
+      },
+      {
+       "marker": "Década de 1990",
+       "heading": "Centros de llamadas",
+       "body": "Aparecen los guiones estandarizados y las métricas de duración."
+      },
+      {
+       "marker": "Hoy",
+       "heading": "Omnicanalidad",
+       "body": "El cliente espera continuidad entre chat, correo y teléfono."
+      }
+     ]
+    }
+   ],
+   "self_check": [
+    {
+     "type": "self_check",
+     "title": "Repaso rápido",
+     "items": [
+      {
+       "q": "¿Para qué sirve la paráfrasis?",
+       "a": "Para confirmar que entendiste y demostrarle al cliente que lo escuchaste."
+      },
+      {
+       "q": "¿Validar una emoción es darle la razón al cliente?",
+       "a": "No. Es reconocer que su emoción es comprensible, sin juzgar el contenido."
+      }
+     ]
+    }
+   ]
+  },
+  "bridge_to_next": "Con la escucha resuelta, el siguiente paso es aprender a negociar acuerdos que el cliente sienta justos."
+ },
+ "courseIntro": {
+  "schemaVersion": 1,
+  "welcome": "Te damos la bienvenida a un recorrido pensado para quienes atienden personas todos los días. Aquí vas a fortalecer la forma en que escuchas, explicas y acompañas a cada cliente, desde el primer contacto hasta el seguimiento. Trabajaremos con situaciones reales del mostrador, del teléfono y de los canales digitales, para que cada idea tenga un uso concreto en tu jornada. Vas a descubrir por qué la empatía no es solo amabilidad, cómo ordenar una respuesta difícil y de qué manera un reclamo bien resuelto se convierte en confianza. Avanza a tu ritmo, vuelve sobre lo que necesites y anímate a probar cada técnica con tu propio equipo.",
+  "competencies": [
+   "Escuchar de forma activa y confirmar lo que el cliente necesita.",
+   "Explicar procesos y soluciones con un lenguaje claro y respetuoso.",
+   "Resolver reclamos con un método ordenado y verificable.",
+   "Construir acuerdos que el cliente perciba como justos."
+  ],
+  "methodology_note": "Cada idea se conecta con situaciones cotidianas del servicio, para que puedas aplicarla desde el primer día.",
+  "closing": "Llegaste al final del recorrido con herramientas concretas para escuchar mejor, explicar con claridad y resolver con criterio. Sigue practicando con tu equipo y comparte lo que funcione en tu contexto.",
+  "bibliography": [
+   {
+    "author": "Hattie, John",
+    "title": "Visible Learning: A Synthesis of Over 800 Meta-Analyses Relating to Achievement",
+    "year": 2009,
+    "publisher": "Routledge"
+   },
+   {
+    "author": "Wiggins, Grant y McTighe, Jay",
+    "title": "Understanding by Design (2.ª ed.)",
+    "year": 2005,
+    "publisher": "ASCD"
+   },
+   {
+    "author": "Biggs, John y Tang, Catherine",
+    "title": "Teaching for Quality Learning at University: What the Student Does (4.ª ed.)",
+    "year": 2011,
+    "publisher": "Open University Press"
+   },
+   {
+    "author": "Black, Paul y Wiliam, Dylan",
+    "title": "Assessment and Classroom Learning",
+    "year": 1998,
+    "publisher": "Assessment in Education: Principles, Policy & Practice, 5(1)"
+   },
+   {
+    "author": "Shute, Valerie J.",
+    "title": "Focus on Formative Feedback",
+    "year": 2008,
+    "publisher": "Review of Educational Research, 78(1)"
+   }
+  ]
+ }
+}

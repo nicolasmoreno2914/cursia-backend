@@ -76,7 +76,7 @@ import {
   videoInlineIntroHtml,
   videoPackageFilename,
 } from './h5p';
-import { assembleAudiobook, mp3DurationSeconds } from './audio';
+import { assembleAudiobook, concatMp3, mp3DurationSeconds } from './audio';
 import { pdfPageCount, presentationCardHtml } from './presentation';
 import type { GenerationManifestV1 } from '../modules/generation-manifests/generation-manifest-builder';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
@@ -104,6 +104,9 @@ import {
   assertValidModuleIntroV3,
   audioWelcomeLabel,
   audiobookLabel,
+  audiobookSegmentFile,
+  audiobookSegmentKey,
+  audiobookSegmentLabel,
   buildCourseFacts,
   CertificateRequirements,
   certificateTeacherLabel,
@@ -127,6 +130,10 @@ import {
   sectionLayoutFromFacts,
   validateH5pActivityPayload,
   welcomeLabel,
+  WelcomeIdentity,
+  WELCOME_LOGO_FILE,
+  WELCOME_LOGO_FILE_JPEG,
+  welcomeLogoSize,
   welcomeStartLabel,
   shellProseByLabel,
   activityEmbedsInline,
@@ -135,6 +142,7 @@ import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { TEACHER_GUIDE_IDNUMBER, teacherGuidePage } from '../modules/course-shell/teacher-guide-page';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { LIBRO_PDF_MIMETYPE, libroPdfFilename, renderLibroPdfV3 } from './v3/libro-v3';
+import { LIBRO_HTML_IDNUMBER, LIBRO_HTML_NAME, libroBookXml, renderLibroHtmlV3 } from './v3/libro-html-v3';
 import { LibroLogoCandidate, cursiaDefaultLogo, resolveLibroLogo } from './v3/libro-logo';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, reviewCardsIntroHtml, scormIntroHtml } from './v3/activity-intro';
@@ -279,8 +287,17 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * con «api-version-unsupported»). Un paquete SIN H5P queda en el formato del backup (4.1) y sus botones a secciones
  * pasan de `$@COURSESECTIONBYID*n@$` (solo 4.4+) a `$@COURSEVIEWBYID*curso@$&section=n` (todas): ese .mbz cambia.
  * Con H5P el .mbz es byte a byte el de 3.15.1; cambia solo summary.restore.note (agrega «Requiere Moodle 4.5…»).
+ * 3.17.0 (r77, mobile-first): los botones de Cursia son la píldora completa (el <a> con fondo, padding y `float:left`,
+ * área táctil ≥ 44 × 44 px con o sin <style>, también con forceclean y en la app) y los enlaces de descarga solos en su
+ * renglón tienen 44 px de alto. Cambian SOLO los estilos de esos enlaces (mismo texto, mismas actividades, mismos
+ * archivos: Libro Guía, portadas, MP3, H5P, GIFT e insignia byte a byte). Los paquetes de 3.16.0 se re-empaquetan.
+ * 3.18.0 (r78, Libro Guía en el celular): la sección 1 suma, justo debajo del recurso PDF, el libro de Moodle (mod_book)
+ * «📱 Libro Guía · lectura en el celular» (`cv3:shell:libro_html`): el MISMO texto del PDF (mismo insumo y parser, sin
+ * IA), un capítulo de Moodle por sección del PDF (portada e índice, módulos, capítulos como subcapítulos, referencias), a
+ * 18 px, fluido y con el tema; la tarjeta del Libro suma «Leer en el celular →». El PDF sigue igual (bytes idénticos) y
+ * sigue siendo el criterio de finalización de un curso sin nota. Los paquetes de 3.17.0 se re-empaquetan.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.16.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.18.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -374,12 +391,58 @@ export interface BuildDynamicMbzV3Input {
    * r19 (L3): marca del Libro Guía en PDF — logo candidato de la cuenta (sin validar: el builder lo valida y cae al logo de
    * Cursia con aviso) y nombre de la institución para la portada y el pie. Ausente → logo de Cursia, sin nombre.
    */
-  libroBrand?: { logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null; name?: string | null } | null;
+  libroBrand?: {
+    logo?: LibroLogoCandidate | ReadonlyArray<LibroLogoCandidate> | null;
+    name?: string | null;
+    /** r76 «Diseño visual»: false = Libro Guía sin marca de agua (ausente = una por página). */
+    watermark?: boolean;
+    /** r76: true = el logo (y el nombre) encabezan la bienvenida del curso (imagen en files.xml). Ausente = bytes de siempre. */
+    showInCourse?: boolean;
+  } | null;
   /**
    * T1 (r57): bibliografía del programa académico de la institución (textos extraídos de SU documento, con fuente) →
    * «Referencias» del Libro Guía, tal cual. Ausente/vacía → sin esa subsección (nunca se inventa una referencia).
    */
   libroReferences?: ReadonlyArray<string> | null;
+  /**
+   * r74: entrega del audiolibro FUERA del .mbz principal (cursos que no caben en un archivo). Ausente → audiolibro embebido
+   * (bytes de siempre).
+   *  - `linked`: un solo .mbz; un reproductor por segmento (módulo) con la dirección DURADERA de Cursia (`links`, clave
+   *    `audiobookSegmentKey`); el MP3 de cada segmento lo sube el worker como `dynamic_media_audio`.
+   *  - `parts`: autocontenido; el principal sin MP3 + partes .mbz (sección 1, un label por segmento) que se restauran en el
+   *    MISMO curso («Combinar con este curso»). `result.audiobookParts` las arma de a una.
+   * `parts` es el plan de `planAudioParts` (capítulos por segmento, consecutivos y de un módulo).
+   */
+  audiobookDelivery?: AudiobookDeliveryInputV3 | null;
+}
+
+/** r74: plan de entrega del audiolibro (ver `BuildDynamicMbzV3Input.audiobookDelivery`). */
+export interface AudiobookDeliveryInputV3 {
+  mode: 'linked' | 'parts';
+  parts: Array<{ partNumber: number; segments: Array<{ chapterIds: string[] }> }>;
+  /** Solo `linked`: clave del segmento (`audiobookSegmentKey`) → URL https duradera. */
+  links?: Record<string, string>;
+}
+
+/** r74: reloj fijo de las partes de audio (bytes determinísticos → un reintento reutiliza las partes ya subidas). */
+export const MBZ_V3_AUDIO_PART_TS = Math.floor(MBZ_V3_ZIP_FIXED_DATE.getTime() / 1000);
+
+/** r74: una parte de audio del paquete autocontenido (se arma bajo demanda, de a una). */
+export interface MbzV3AudiobookPart {
+  partNumber: number;
+  totalFiles: number;
+  filename: string;
+  segments: Array<{ moduleNumber: number; chapterNumbers: number[]; seconds: number; file: string; idnumber: string }>;
+  build: () => Promise<{ mbz: Buffer; expect: AudiobookPartExpectations }>;
+}
+
+/** r74: lo que el validador de partes exige de los bytes de una parte. */
+export interface AudiobookPartExpectations {
+  partNumber: number;
+  totalFiles: number;
+  courseTitle: string;
+  section1Title: string;
+  labels: Array<{ idnumber: string; file: string; seconds: number; sha1: string; bytes: number }>;
 }
 
 /** EV6 DoD: sufijo del nombre del curso de un paquete de QA. */
@@ -422,13 +485,21 @@ export interface MbzV3Expectations {
   internalVocabularyKeptTexts?: string[];
   /** r60: Moodle mínimo que el paquete declara (el validador lo recalcula desde los bytes y exige que alcance). */
   moodleMinimum?: string;
+  /** r74: audiolibro en línea — direcciones duraderas por segmento (las exige el validador). */
+  audiobookLinks?: Record<string, string>;
 }
 
 export interface BuildDynamicMbzV3Result {
   mbz: Buffer;
+  /** r74: solo con `audiobookDelivery.mode = parts` — las partes de audio, en orden (2..N). */
+  audiobookParts?: MbzV3AudiobookPart[];
+  /** r74: segmentos del audiolibro con su audio (solo con `audiobookDelivery`): el worker sube estos MP3 (`linked`). */
+  audiobookSegments?: Array<{ key: string; moduleNumber: number; chapterNumbers: number[]; seconds: number; file: string; mp3: () => Buffer }>;
   expectations: MbzV3Expectations;
   summary: {
     builderVersion: string;
+    /** r74: el audiolibro va fuera del .mbz principal (en línea o en partes). Ausente = embebido. */
+    audiobookDelivery?: { mode: 'linked' | 'parts'; totalFiles: number; segments: number };
     /** Formato del backup (moodle_release): versión mínima para restaurar. */
     moodleVersion: string;
     /** r60: Moodle mínimo en el que el curso funciona completo (H5P instalable y enlaces resueltos). */
@@ -456,7 +527,11 @@ export interface BuildDynamicMbzV3Result {
     /** r55: `site_library_pack` (≥ 3.14.0); `admin_or_manager` solo en paquetes ≤ 3.13.0. */
     restore?: { as: 'site_library_pack'; libraryPack: 'v3'; note: string } | { as: 'admin_or_manager'; note: string };
     /** r19 (L): Libro Guía en PDF — archivo, páginas y el logo usado como marca de agua. */
-    libro: { filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string };
+    libro: {
+      filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string;
+      /** r78 (3.18.0): lectura en línea (mod_book): capítulos de Moodle, palabras visibles (= las del PDF) y bytes del HTML. */
+      online?: { chapters: number; words: number; bytes: number };
+    };
     /** T4 (r57): Actividades de Aplicación entregadas como Tarea (solo si hay alguna). */
     applicationAssigns?: { count: number; graded: number; rubric: number; category: string | null };
     /** T5 (r57): archivos de trabajo publicados (solo si hay alguno): id, capítulo, archivo, sha256, bytes y origen. */
@@ -695,16 +770,25 @@ function withIdnumber(xml: string, idnumber: string): string {
 
 /** Tokens `$@XVIEWBYID*mid@$` → modname del destino. */
 const TOKEN_MODNAME: Record<string, string> = {
-  SCORM: 'scorm', QUIZ: 'quiz', RESOURCE: 'resource', PAGE: 'page', URL: 'url', H5PACTIVITY: 'h5pactivity', LABEL: 'label', FORUM: 'forum',
+  SCORM: 'scorm', QUIZ: 'quiz', RESOURCE: 'resource', PAGE: 'page', URL: 'url', H5PACTIVITY: 'h5pactivity', LABEL: 'label', FORUM: 'forum', BOOK: 'book',
 };
 
 /** Falla fuerte ante cualquier token `$@…$` que no apunte a un módulo del paquete del tipo correcto. */
 export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string, sectionNums?: Set<number>, courseBackupId?: number, minimumMoodle?: string): void {
   const bad: string[] = [];
   if (/cursia-cta:\/\//.test(html)) bad.push('marcador cursia-cta sin resolver');
-  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
+  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@\$/g)) {
     const kind = m[1];
     const idStr = m[2];
+    // r78: capítulo del libro en línea `$@BOOKVIEWBYIDCH*mid*capítulo@$` (el capítulo lo verifica el validador).
+    if (kind === 'BOOKVIEWBYIDCH') {
+      if (!idStr || !m[3] || modnameByMid.get(Number(idStr)) !== 'book') bad.push(m[0]);
+      continue;
+    }
+    if (m[3]) {
+      bad.push(m[0]);
+      continue;
+    }
     // r60 (D2): un token sin regla de decodificación en el Moodle mínimo del paquete queda literal al restaurar.
     const since = MOODLE_TOKEN_MIN_VERSION[kind];
     if (since && minimumMoodle !== undefined && compareMajorMinor(minimumMoodle, since) < 0) {
@@ -1112,6 +1196,8 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     { manifests: c.audiobookManifests ?? null },
   );
   if (audiobook.floor) warnings.push(...audiobook.floor.warnings);
+  const delivery = input.audiobookDelivery ?? null;
+  if (delivery && delivery.mode !== 'linked' && delivery.mode !== 'parts') throw new Error(`MBZ_V3_INVALID: audiobookDelivery.mode ${String((delivery as { mode?: unknown }).mode)}`);
   // EV6 P2-B3: con banco, las «preguntas del examen» que ve el estudiante son los SLOTS (no el banco).
   const examQuestionCountByModule: Record<string, number> = {};
   const examBankSizeByModule: Record<string, number> = {};
@@ -1180,6 +1266,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
       })),
     })),
     brandName: input.libroBrand?.name ?? null,
+    ...(input.libroBrand?.watermark === false ? { watermark: false } : {}),
     // fix round 1 (M8): /ID del PDF único por curso (sha del plan), sigue determinístico.
     documentKey: packagingPlanV3Sha256(plan),
     // T1 (r57): la portada y el índice cuentan los capítulos REALES (los de práctica, sin texto en el Libro, en su lugar).
@@ -1235,6 +1322,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     artifacts: {
       audioWelcomeSeconds,
       audiobookParts: audiobook.parts.map((p) => ({ chapterId: p.chapterId, seconds: p.durationSeconds })),
+      ...(delivery ? { audiobookDelivery: { mode: delivery.mode, parts: delivery.parts.map((p) => ({ partNumber: p.partNumber, segments: p.segments.map((sg) => ({ chapterIds: [...sg.chapterIds] })) })) } } : {}),
       slideCountByChapter,
       examQuestionCountByModule,
       ...(finalExamQuestionCount !== undefined ? { finalExamQuestionCount } : {}),
@@ -1633,7 +1721,16 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   // ── Sección 0 — shell ────────────────────────────────────────────────────
   // UX r18 (problema 1): Moodle 4.5 pinta el nombre de la sección 0 como encabezado (núcleo); el hero
   // con tema va JUSTO debajo (primer módulo de la sección) y el foro de avisos cierra la sección.
-  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts, input.qaPreviewNotice === true));
+  // r76 «Diseño visual»: logo (el mismo validado del Libro Guía) y nombre de la institución encabezan la bienvenida,
+  // solo si el perfil lo pide. La imagen va en files.xml (SHA1) y se referencia con @@PLUGINFILE@@ (sobrevive a format_text).
+  const welcomeLogoFiles: Array<{ name: string; data: Buffer; mime: string }> = [];
+  let welcomeIdentity: WelcomeIdentity | null = null;
+  if (input.libroBrand?.showInCourse === true) {
+    const file = libroLogo.kind === 'jpeg' ? WELCOME_LOGO_FILE_JPEG : WELCOME_LOGO_FILE;
+    welcomeLogoFiles.push({ name: file, data: libroLogo.bytes, mime: libroLogo.kind === 'jpeg' ? 'image/jpeg' : 'image/png' });
+    welcomeIdentity = { src: `@@PLUGINFILE@@/${file}`, ...welcomeLogoSize(libroLogo.width, libroLogo.height), name: input.libroBrand?.name ? String(input.libroBrand.name) : null };
+  }
+  addLabel(0, 'cv3:shell:welcome', welcomeLabel(facts, courseIntro, theme, opts, input.qaPreviewNotice === true, welcomeIdentity), welcomeLogoFiles);
   addLabel(0, 'cv3:shell:audio_welcome', audioWelcomeLabel(facts, theme, opts), [
     { name: SHELL_AUDIO_WELCOME_FILE, data: c.audioWelcome, mime: 'audio/mp3' },
   ]);
@@ -1661,14 +1758,18 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   // ── Sección 1 — ruta, Libro Guía, audiolibro ─────────────────────────────
   addLabel(1, 'cv3:shell:route', routeLabel(facts, theme, opts));
   let libroMid: number;
+  let libroHtmlSummary: { chapters: number; words: number; bytes: number } | null = null;
   {
     const name = '📘 Libro Guía';
     const a = W.newActivity('resource', 1, name, 'cv3:shell:libro');
     libroMid = a.mid;
+    // r78: lectura en línea del Libro Guía (mod_book, mismo texto que el PDF), justo debajo del recurso PDF.
+    const book = W.newActivity('book', 1, LIBRO_HTML_NAME, LIBRO_HTML_IDNUMBER);
     // #583 (M5/M6, builder 3.11.0): la tarjeta del Libro Guía es la DESCRIPCIÓN del recurso (showdescription),
     // no un label aparte: la sección 1 muestra una sola entrada del Libro Guía.
     // r19 (L4, 3.13.0): con el botón «Abrir Libro Guía →» hacia su PROPIO moduleid, en una pestaña nueva.
-    const libroIntro = libroResourceIntro(facts, theme, opts, a.mid).html;
+    // r78 (3.18.0): y el botón «Leer en el celular →» hacia el libro en línea.
+    const libroIntro = libroResourceIntro(facts, theme, opts, a.mid, book.mid).html;
     labelsHtml.push({ where: 'cv3:shell:libro#intro', html: libroIntro });
     // r19 (L1/L5): el PDF es el único archivo del recurso (display 5 → view.php lo entrega y el navegador lo muestra).
     const fid = W.addFile(a.ctx, 'mod_resource', 'content', libroFilename, libro.pdf, LIBRO_PDF_MIMETYPE);
@@ -1694,11 +1795,32 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     W.put(`${a.dir}/inforef.xml`, inforef([fid]));
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
+
+    // r78: el libro en línea — mismo insumo que el PDF (libroInputBase), un capítulo de Moodle por sección del PDF.
+    const online = renderLibroHtmlV3(libroInputBase, theme, opts, { bookMid: book.mid, libroMid: a.mid }, welcomeIdentity && welcomeLogoFiles[0] ? { ...welcomeIdentity, file: welcomeLogoFiles[0] } : null);
+    const chapterFileIds: number[] = [];
+    for (const ch of online.chapters) {
+      for (const f of ch.files) chapterFileIds.push(W.addFile(book.ctx, 'mod_book', 'chapter', f.name, f.data, f.mime, ch.id));
+      labelsHtml.push({ where: `${LIBRO_HTML_IDNUMBER}#${ch.key}`, html: ch.html });
+    }
+    W.put(`${book.dir}/book.xml`, libroBookXml({ aid: book.aid, mid: book.mid, ctx: book.ctx, name: LIBRO_HTML_NAME, ts, chapters: online.chapters }));
+    W.put(`${book.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(book.mid, 'book', 1, ts, MV.bv), book.idnumber), { completion: '0' }));
+    W.put(`${book.dir}/inforef.xml`, inforef(chapterFileIds));
+    W.put(`${book.dir}/grades.xml`, gradesXml(book.aid));
+    W.boilerplate(book.dir);
+    libroHtmlSummary = { chapters: online.chapters.length, words: online.words, bytes: online.bytes };
   }
-  addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts), [
-    { name: SHELL_AUDIOBOOK_FILE, data: audiobook.buffer, mime: 'audio/mp3' },
-  ]);
+  // r74: con el audiolibro en línea, el label no lleva MP3 (reproductores con la dirección duradera); con partes
+  // autocontenidas, va AL FINAL de la sección 1 sin MP3, así las etiquetas de las partes restauradas quedan justo debajo.
+  if (!delivery) {
+    addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts), [
+      { name: SHELL_AUDIOBOOK_FILE, data: audiobook.buffer, mime: 'audio/mp3' },
+    ]);
+  } else if (delivery.mode === 'linked') {
+    addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts, delivery.links ?? {}));
+  }
   addLabel(1, 'cv3:shell:route_start', routeStartLabel(firstChapterSection as number, facts, theme, opts));
+  if (delivery?.mode === 'parts') addLabel(1, 'cv3:shell:audiobook', audiobookLabel(facts, theme, opts));
 
   // ── EV6: una sección por capítulo (+ una por evaluación de módulo) ──────
   const chapterSlots = new Map(assembled.map((x) => [x.chapterNumber, x.slots]));
@@ -2198,9 +2320,43 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   for (const n of W.deadLinksUnwrapped.values()) deadLinks += n;
   if (deadLinks) warnings.push(`dead_link_unwrapped:${deadLinks}`);
   const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 6 } })) as Buffer;
+  // r74: segmentos del audiolibro (audio = concatenación de los MP3 de sus capítulos, la MISMA en línea y en partes).
+  const section1 = plan.sections.find((x) => x.sectionNum === 1);
+  if (delivery && !section1) throw new Error('MBZ_V3_INVARIANT: el curso no tiene sección 1 para el audiolibro');
+  const segmentsOut = delivery && facts.audio.delivery
+    ? facts.audio.delivery.parts.flatMap((p) => p.segments.map((sg, si) => ({
+      partNumber: p.partNumber, segmentIndex: si,
+      key: audiobookSegmentKey(sg.moduleNumber, sg.chapterNumbers[0]),
+      moduleNumber: sg.moduleNumber, chapterNumbers: [...sg.chapterNumbers], seconds: sg.seconds,
+      file: audiobookSegmentFile(sg.moduleNumber, sg.chapterNumbers[0], sg.chapterNumbers[sg.chapterNumbers.length - 1]),
+      mp3: () => concatMp3(sg.chapters.map((x) => c.audiobookChapters.get(x.chapterId) as Buffer)),
+    })))
+    : [];
+  const audiobookPartsOut: MbzV3AudiobookPart[] | undefined = delivery?.mode === 'parts' && facts.audio.delivery
+    ? facts.audio.delivery.parts.map((p) => {
+      const segs = segmentsOut.filter((x) => x.partNumber === p.partNumber);
+      const totalFiles = (facts.audio.delivery as { totalFiles: number }).totalFiles;
+      return {
+        partNumber: p.partNumber,
+        totalFiles,
+        filename: `parte-${p.partNumber}-de-${totalFiles}.mbz`,
+        segments: segs.map((x) => ({ moduleNumber: x.moduleNumber, chapterNumbers: x.chapterNumbers, seconds: x.seconds, file: x.file, idnumber: `cv3:audiobook_part:${p.partNumber}:${x.key}` })),
+        build: () => buildAudiobookPartMbzV3({
+          partNumber: p.partNumber, totalFiles, courseTitle, plan, MV,
+          section1Title: safeActivityName((section1 as { title: string }).title, 255),
+          labels: segs.map((x) => {
+            const lbl = audiobookSegmentLabel(facts, theme, opts, { partNumber: p.partNumber, segmentIndex: x.segmentIndex });
+            return { idnumber: `cv3:audiobook_part:${p.partNumber}:${x.key}`, name: lbl.name, html: lbl.html, file: lbl.file, mp3: x.mp3(), seconds: x.seconds };
+          }),
+        }),
+      };
+    })
+    : undefined;
   return {
     mbz,
-    expectations: { facts, resolved, h5pProfileVersion, moodleMinimum: moodleCompatibility.minimumMoodle, examBankPlans, shellProseByLabel: shellProseByLabel(courseIntro, moduleIntros), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}) },
+    ...(audiobookPartsOut ? { audiobookParts: audiobookPartsOut } : {}),
+    ...(segmentsOut.length ? { audiobookSegments: segmentsOut.map((x) => ({ key: x.key, moduleNumber: x.moduleNumber, chapterNumbers: x.chapterNumbers, seconds: x.seconds, file: x.file, mp3: x.mp3 })) } : {}),
+    expectations: { facts, resolved, h5pProfileVersion, moodleMinimum: moodleCompatibility.minimumMoodle, examBankPlans, shellProseByLabel: withWelcomeIdentityProse(shellProseByLabel(courseIntro, moduleIntros), welcomeIdentity), builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3, internalVocabularyExempt: vocab.exempt, ...(vocabUserTexts.length ? { internalVocabularyUserTexts: vocabUserTexts } : {}), ...(vocab.keptTexts.length ? { internalVocabularyKeptTexts: vocab.keptTexts } : {}), ...(delivery?.mode === 'linked' ? { audiobookLinks: { ...(delivery.links ?? {}) } } : {}) },
     summary: {
       builderVersion: DYNAMIC_MBZ_BUILDER_VERSION_V3,
       moodleVersion: MV.br,
@@ -2227,11 +2383,13 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
         // T1 (r57): la regla de conjunto del banco de examen (≤ 30 % «la correcta es la más larga») sobre TODOS los videos del paquete.
         ...videoMcLengthBiasWarnings(plan.modules.flatMap((m) => m.chapters.filter((ch) => !!ch.keys.video).map((ch) => c.videoInteractions.get(ch.chapterId)))),
       ],
+      // r74: entrega del audiolibro fuera del .mbz principal (solo si el worker la pidió).
+      ...(facts.audio.delivery ? { audiobookDelivery: { mode: facts.audio.delivery.mode, totalFiles: facts.audio.delivery.totalFiles, segments: segmentsOut.length } } : {}),
       // r19: piso de 25 min del audiolibro (solo si el empaque pasó los manifiestos; no entra al .mbz).
       ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
-      libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256 },
+      libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256, ...(libroHtmlSummary ? { online: libroHtmlSummary } : {}) },
       ...(assignsTotal ? { applicationAssigns: { count: assignsTotal, graded: assignsGraded, rubric: assignsRubric, category: resolved.application?.category ?? null } } : {}),
       ...(practice.resolved.length
         ? { practiceResources: practice.resolved.map((r) => ({ id: r.id, chapterId: r.chapterId, filename: r.filename, mimetype: r.mimetype, sha256: r.sha256, bytes: r.bytes, origin: r.origin, relation: r.relation })) }
@@ -2305,6 +2463,12 @@ export function summaryH5pProfileVersion(pkgs: ReadonlyArray<{ mainLibrary: stri
 }
 
 /** Escape de texto XML sin tocar comillas (el JSON de availability conserva sus `"`). */
+/** r76: el nombre de la institución de la bienvenida es texto del usuario → prosa admitida por el validador. */
+function withWelcomeIdentityProse(m: Record<string, string[]>, identity: WelcomeIdentity | null): Record<string, string[]> {
+  if (!identity?.name) return m;
+  return { ...m, 'cv3:shell:welcome': [...(m['cv3:shell:welcome'] ?? []), identity.name] };
+}
+
 export function xmlTextEsc(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -2312,4 +2476,159 @@ export function xmlTextEsc(s: string): string {
 /** Librerías del perfil (para el validador): "Machine major.minor". */
 export function h5pProfileLibraryKeys(): Set<string> {
   return new Set(CURSIA_H5P_PROFILE_V1.libraries.map((l) => `${l.machineName} ${l.majorVersion}.${l.minorVersion}`));
+}
+
+/**
+ * r74 — parte de AUDIO del paquete autocontenido: copia de curso Moodle con SOLO la sección 1 y un label por segmento del
+ * audiolibro (con su MP3 en el filearea intro). Se restaura DENTRO del curso ya restaurado desde el principal («Combinar la
+ * copia de seguridad con este curso» / CLI `--courseid`): Moodle conserva el nombre de la sección existente y agrega los
+ * labels al final de la sección 1, justo debajo del label «Audiolibro» del principal. Sin notas, sin finalización, sin
+ * enlaces a otras actividades: una parte que falta nunca rompe el curso. Bytes determinísticos (reloj y fechas fijas).
+ */
+export async function buildAudiobookPartMbzV3(input: {
+  partNumber: number;
+  totalFiles: number;
+  courseTitle: string;
+  section1Title: string;
+  plan: PackagingPlanV3;
+  MV: MoodleVersionInfo;
+  labels: Array<{ idnumber: string; name: string; html: string; file: string; mp3: Buffer; seconds: number }>;
+}): Promise<{ mbz: Buffer; expect: AudiobookPartExpectations }> {
+  const ts = MBZ_V3_AUDIO_PART_TS;
+  const { MV } = input;
+  if (!input.labels.length) throw new Error(`MBZ_V3_INVARIANT: la parte ${input.partNumber} no tiene segmentos`);
+  const W = new MbzWriter(ts, MV);
+  const expectLabels: AudiobookPartExpectations['labels'] = [];
+  for (const l of input.labels) {
+    const measured = mp3DurationSeconds(l.mp3);
+    if (Math.abs(measured - l.seconds) > 1e-6) throw new Error(`MBZ_V3_INVARIANT: el MP3 de ${l.idnumber} mide ${measured}s y facts dice ${l.seconds}s`);
+    const a = W.newActivity('label', 1, l.name, l.idnumber);
+    const fid = W.addFile(a.ctx, 'mod_label', 'intro', l.file, l.mp3, 'audio/mp3');
+    W.put(`${a.dir}/label.xml`, labelXmlWithCtx(a.aid, a.mid, a.ctx, l.name, l.html, ts));
+    W.put(`${a.dir}/module.xml`, withIdnumber(moduleXml(a.mid, 'label', 1, ts, MV.bv), l.idnumber));
+    W.put(`${a.dir}/inforef.xml`, inforef([fid]));
+    W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
+    W.boilerplate(a.dir);
+    expectLabels.push({ idnumber: l.idnumber, file: l.file, seconds: l.seconds, sha1: sha1Buf(l.mp3), bytes: l.mp3.length });
+  }
+  W.put('sections/section_1/section.xml', sectionXml({ num: 1, name: input.section1Title, summary: '' }, (W.sectionSeq.get(1) ?? []).join(','), ts));
+  W.put('sections/section_1/inforef.xml', inforefXml());
+  W.put('sections/section_1/roles.xml', BOIL.roles);
+  W.put('sections/section_1/filters.xml', BOIL.filters);
+  W.put('sections/section_1/contentbank.xml', BOIL.contentbank);
+  const courseTitle = input.courseTitle;
+  W.put('course/course.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<course id="${MBZ_V3_COURSE_BACKUP_ID}" contextid="${MBZ_V3_COURSE_BACKUP_CONTEXTID}">
+  <shortname>${esc(courseTitle)}</shortname><fullname>${esc(courseTitle)}</fullname>
+  <idnumber></idnumber><summary></summary><summaryformat>1</summaryformat>
+  <format>topics</format><showgrades>1</showgrades><newsitems>5</newsitems>
+  <startdate>${ts}</startdate><enddate>0</enddate><marker>0</marker>
+  <maxbytes>0</maxbytes><legacyfiles>0</legacyfiles><showreports>0</showreports>
+  <visible>1</visible><groupmode>0</groupmode><groupmodeforce>0</groupmodeforce>
+  <defaultgroupingid>0</defaultgroupingid><lang>es</lang><theme></theme>
+  <timecreated>${ts}</timecreated><timemodified>${ts}</timemodified>
+  <requested>0</requested><showactivitydates>1</showactivitydates>
+  <showcompletionconditions>1</showcompletionconditions>
+  <pdfexportfont>${NULL}</pdfexportfont>
+  <enablecompletion>1</enablecompletion><completionnotify>0</completionnotify>
+  <tags></tags><customfields></customfields>
+  <courseformatoptions>
+    <courseformatoption><format>topics</format><sectionid>0</sectionid><name>coursedisplay</name><value>1</value></courseformatoption>
+    <courseformatoption><format>topics</format><sectionid>0</sectionid><name>hiddensections</name><value>1</value></courseformatoption>
+  </courseformatoptions>
+</course>`);
+  W.put('course/inforef.xml', inforefXml());
+  W.put('course/enrolments.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<enrolments>\n  <enrols>\n  </enrols>\n</enrolments>');
+  W.put('course/roles.xml', BOIL.roles);
+  W.put('course/completiondefaults.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<course_completion_defaults>\n</course_completion_defaults>');
+  W.put('course/calendar.xml', BOIL.calendar);
+  W.put('course/competencies.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<course_competencies>\n  <competencies>\n  </competencies>\n  <user_competencies>\n  </user_competencies>\n</course_competencies>');
+  W.put('course/contentbank.xml', BOIL.contentbank);
+  W.put('course/filters.xml', BOIL.filters);
+  W.put('roles.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<roles_definition>\n</roles_definition>');
+  W.put('scales.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<scales_definition>\n</scales_definition>');
+  W.put('outcomes.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<outcomes_definition>\n</outcomes_definition>');
+  W.put('badges.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<badges>\n</badges>');
+  W.put('users.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<users>\n</users>');
+  W.put('grade_history.xml', BOIL.gradeHistory);
+  W.put('groups.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<groups>\n  <groupcustomfields>\n  </groupcustomfields>\n  <groupings>\n    <groupingcustomfields>\n    </groupingcustomfields>\n  </groupings>\n</groups>');
+  W.put('questions.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<question_categories>\n</question_categories>');
+  W.put('completion.xml', '<?xml version="1.0" encoding="UTF-8"?>\n<course_completion>\n</course_completion>');
+  let filesXml = '<?xml version="1.0" encoding="UTF-8"?>\n<files>\n';
+  for (const f of W.files) {
+    filesXml +=
+      `  <file id="${f.id}">\n    <contenthash>${f.hash}</contenthash>\n    <contextid>${f.ctx}</contextid>\n` +
+      `    <component>${f.component}</component>\n    <filearea>${f.filearea}</filearea>\n    <itemid>${f.itemid ?? 0}</itemid>\n` +
+      `    <filepath>/</filepath>\n    <filename>${xmlEsc(f.filename)}</filename>\n    <userid>${NULL}</userid>\n` +
+      `    <filesize>${f.size}</filesize>\n    <mimetype>${f.mime ?? NULL}</mimetype>\n    <status>0</status>\n` +
+      `    <timecreated>${ts}</timecreated>\n    <timemodified>${ts}</timemodified>\n` +
+      `    <source>${NULL}</source>\n    <author>${NULL}</author>\n    <license>${NULL}</license>\n` +
+      `    <sortorder>0</sortorder>\n    <repositorytype>${NULL}</repositorytype>\n    <repositoryid>${NULL}</repositoryid>\n    <reference>${NULL}</reference>\n  </file>\n`;
+  }
+  W.put('files.xml', `${filesXml}</files>`);
+  const setting = (lvl: string, extra: string, n: string, v: string | number) =>
+    `    <setting>\n      <level>${lvl}</level>\n${extra}      <name>${n}</name>\n      <value>${v}</value>\n    </setting>\n`;
+  let sett = '';
+  const name = `cursia-v3-${input.plan.course.id}-parte-${input.partNumber}-de-${input.totalFiles}.mbz`;
+  const rootSettings: Record<string, string> = {
+    filename: name, imscc11: '0', users: '0', anonymize: '0', role_assignments: '0',
+    activities: '1', blocks: '0', files: '1', filters: '1', comments: '0', badges: '0',
+    calendarevents: '0', userscompletion: '0', logs: '0', grade_histories: '0',
+    questionbank: '0', groups: '0', competencies: '0', customfield: '0',
+    contentbankcontent: '0', xapistate: '0', legacyfiles: '1',
+  };
+  for (const [k, v] of Object.entries(rootSettings)) sett += setting('root', '', k, v);
+  sett += setting('section', '      <section>section_1</section>\n', 'section_1_included', 1);
+  sett += setting('section', '      <section>section_1</section>\n', 'section_1_userinfo', 0);
+  for (const a of W.activities) {
+    const pre = `${a.modname}_${a.mid}`;
+    sett += setting('activity', `      <activity>${pre}</activity>\n`, `${pre}_included`, 1);
+    sett += setting('activity', `      <activity>${pre}</activity>\n`, `${pre}_userinfo`, 0);
+  }
+  const acts = W.activities
+    .map((a) => `      <activity>\n        <moduleid>${a.mid}</moduleid>\n        <sectionid>1</sectionid>\n        <modulename>${a.modname}</modulename>\n        <title>${esc(a.title)}</title>\n        <directory>${a.dir}</directory>\n        <insubsection></insubsection>\n      </activity>\n`)
+    .join('');
+  W.put('moodle_backup.xml', `<?xml version="1.0" encoding="UTF-8"?>
+<moodle_backup>
+<information>
+  <name>${name}</name>
+  <moodle_version>${MV.mv}</moodle_version>
+  <moodle_release>${MV.mr}</moodle_release>
+  <backup_version>${MV.bv}</backup_version>
+  <backup_release>${MV.br}</backup_release>
+  <backup_date>${ts}</backup_date>
+  <mnet_remoteusers>0</mnet_remoteusers>
+  <include_files>1</include_files>
+  <include_file_references_to_external_content>0</include_file_references_to_external_content>
+  <original_wwwroot>https://cursia.nomaddi.com</original_wwwroot>
+  <original_site_identifier_hash>7723815fd5e7880d12bcade15abbbfc8</original_site_identifier_hash>
+  <original_course_id>${MBZ_V3_COURSE_BACKUP_ID}</original_course_id>
+  <original_course_fullname>${esc(courseTitle)}</original_course_fullname>
+  <original_course_shortname>${esc(courseTitle)}</original_course_shortname>
+  <original_course_format>topics</original_course_format>
+  <original_course_startdate>${ts}</original_course_startdate>
+  <original_course_enddate>0</original_course_enddate>
+  <original_course_contextid>${MBZ_V3_COURSE_BACKUP_CONTEXTID}</original_course_contextid>
+  <original_system_contextid>${MBZ_V3_SYSTEM_BACKUP_CONTEXTID}</original_system_contextid>
+  <details>
+    <detail backup_id="cursiav3${input.plan.course.id}p${input.partNumber}">
+      <type>course</type><format>moodle2</format><interactive>1</interactive>
+      <mode>70</mode><execution>2</execution><executiontime>0</executiontime>
+    </detail>
+  </details>
+  <contents>
+    <activities>\n${acts}    </activities>
+    <sections>\n      <section>\n        <sectionid>1</sectionid>\n        <title>${esc(input.section1Title)}</title>\n        <directory>sections/section_1</directory>\n        <parentcmid></parentcmid>\n        <modname></modname>\n      </section>\n    </sections>
+    <course>
+      <courseid>${MBZ_V3_COURSE_BACKUP_ID}</courseid>
+      <title>${esc(courseTitle)}</title>
+      <directory>course</directory>
+    </course>
+  </contents>
+  <settings>\n${sett}  </settings>
+</information>
+</moodle_backup>`);
+  // Audio ya comprimido: STORE (más rápido y mismo tamaño); el XML se deflacta igual que en el principal.
+  const mbz = (await W.zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE', compressionOptions: { level: 1 } })) as Buffer;
+  return { mbz, expect: { partNumber: input.partNumber, totalFiles: input.totalFiles, courseTitle, section1Title: input.section1Title, labels: expectLabels } };
 }
