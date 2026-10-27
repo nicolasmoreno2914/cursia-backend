@@ -16,6 +16,8 @@ export interface MbzActivityHtml {
   html: string;
   /** Archivos del contexto de la actividad: filename → { mime, sha1, bytes }. */
   files: Map<string, { mime: string; sha1: string; bytes: Buffer }>;
+  /** r78: capítulos de un libro (mod_book), en orden; `html` del libro = sus capítulos uno tras otro. */
+  chapters?: Array<{ id: number; title: string; subchapter: boolean; html: string }>;
 }
 
 export function xmlUnescape(s: string): string {
@@ -54,7 +56,12 @@ export async function readMbzActivities(mbz: Buffer): Promise<MbzActivityHtml[]>
     const modXml = (await read(`${dir}/${modname}.xml`)) ?? '';
     const moduleXml = (await read(`${dir}/module.xml`)) ?? '';
     const ctx = Number((/<activity [^>]*contextid="(\d+)"/.exec(modXml) || [])[1]);
-    const raw = modname === 'page' ? tag(modXml, 'content') : tag(modXml, 'intro');
+    const chapters = modname === 'book'
+      ? [...(tag(modXml, 'chapters') ?? '').matchAll(/<chapter id="(\d+)">([\s\S]*?)<\/chapter>/g)].map((c) => ({
+          id: Number(c[1]), title: xmlUnescape(tag(c[2], 'title') ?? ''), subchapter: tag(c[2], 'subchapter') === '1', html: xmlUnescape(tag(c[2], 'content') ?? ''),
+        }))
+      : undefined;
+    const raw = modname === 'page' ? tag(modXml, 'content') : modname === 'book' ? null : tag(modXml, 'intro');
     const files = new Map<string, { mime: string; sha1: string; bytes: Buffer }>();
     for (const f of byContext.get(ctx) ?? []) {
       const blob = zip.file(`files/${f.sha1.slice(0, 2)}/${f.sha1}`);
@@ -66,8 +73,9 @@ export async function readMbzActivities(mbz: Buffer): Promise<MbzActivityHtml[]>
       idnumber: xmlUnescape(tag(moduleXml, 'idnumber') ?? ''),
       name: xmlUnescape(tag(modXml, 'name') ?? tag(a[1], 'title') ?? ''),
       contextId: ctx,
-      html: xmlUnescape(raw ?? ''),
+      html: chapters ? chapters.map((c) => c.html).join('\n') : xmlUnescape(raw ?? ''),
       files,
+      ...(chapters ? { chapters } : {}),
     });
   }
   return out;
@@ -85,7 +93,7 @@ export function displayableHtml(a: Pick<MbzActivityHtml, 'html' | 'files'>): str
       if (f && /^image\/(png|jpeg|gif)$/.test(f.mime)) return `${attr}="data:${f.mime};base64,${f.bytes.toString('base64')}"`;
       return `${attr}="#"`;
     })
-    .replace(/(src|href)="(\$@[A-Z]+\*?\d*@\$|cursia-cta:\/\/[^"]*)"/g, (_m, attr: string) => `${attr}="#"`);
+    .replace(/(src|href)="(\$@[A-Z]+(?:\*\d+){0,2}@\$|cursia-cta:\/\/[^"]*)"/g, (_m, attr: string) => `${attr}="#"`);
 }
 
 /** Los colores hex y las pilas `font-family` de los estilos inline: la «firma» visual de un HTML (paridad de tema). */

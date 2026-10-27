@@ -559,15 +559,17 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
   const ctx = Number((/contextid="(\d+)"/.exec(resXml) || [])[1]);
   await check('.mbz: la descripción del Libro Guía trae UN botón «Abrir Libro Guía» → su propio recurso, pestaña nueva', () => {
     assert(libroDir && mid > 0, 'recurso del Libro Guía');
+    // r78 (3.18.0): además UN botón «Leer en el celular» hacia el libro en línea (mod_book); el del PDF sigue igual.
     const anchors = [...intro.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
-    assert(anchors.length === 1, `enlaces: ${anchors.length}`);
-    const [, attrs, inner] = anchors[0];
+    assert(anchors.length === 2, `enlaces: ${anchors.length}`);
+    assert(anchors.filter((x) => /Leer en el celular/.test(x[2].replace(/<[^>]+>/g, '')) && /href="\$@BOOKVIEWBYID\*\d+@\$"/.test(x[1])).length === 1, 'botón «Leer en el celular» → libro en línea');
+    const [, attrs, inner] = anchors.find((x) => /Abrir Libro Guía/.test(x[2].replace(/<[^>]+>/g, '')));
     assert(/Abrir Libro Guía/.test(inner.replace(/<[^>]+>/g, '')), 'texto');
     assert(attrs.includes(`href="$@RESOURCEVIEWBYID*${mid}@$"`), `href → ${mid}: ${attrs}`);
     assert(/\btarget="_blank"/.test(attrs) && /\brel="[^"]*noopener/.test(attrs), 'target/rel');
     assert(/<display>5<\/display>/.test(resXml), 'display 5 (view.php entrega el archivo)');
     // el saneador de tokens del builder (assertTokensV3) lo deja pasar: el token apunta a un resource
-    B.assertTokensV3(intro, new Map([[mid, 'resource']]), 'libro#intro');
+    B.assertTokensV3(intro, new Map([[mid, 'resource'], [Number(/\$@BOOKVIEWBYID\*(\d+)@\$/.exec(intro)[1]), 'book']]), 'libro#intro');
     let threw = false;
     try { B.assertTokensV3(intro, new Map([[mid, 'page']]), 'libro#intro'); } catch { threw = true; }
     assert(threw, 'mal tipado → MBZ_V3_TOKEN_INVALID');
@@ -593,7 +595,7 @@ const keepAlive = setInterval(() => {}, 1 << 30); // una promesa de pdfjs que no
   });
   const exp = { facts: built.expectations.facts, resolved: built.expectations.resolved, examBankPlans: built.expectations.examBankPlans, shellProseByLabel: built.expectations.shellProseByLabel, builderVersion: built.expectations.builderVersion };
   await check('.mbz: validador v3 en verde (builder ≥ 3.13.0; r55: 3.14.0)', async () => {
-    assert(built.expectations.builderVersion === '3.17.0', built.expectations.builderVersion);
+    assert(built.expectations.builderVersion === '3.18.0', built.expectations.builderVersion); // r78
     const v = await V.validateMbzV3(built.mbz, exp);
     assert(v.ok, JSON.stringify(v.issues.slice(0, 5)));
   });

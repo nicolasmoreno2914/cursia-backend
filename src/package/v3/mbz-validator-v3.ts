@@ -72,6 +72,7 @@ import { PRACTICE_FILE_MIMETYPES, PRACTICE_RESOURCE_LIMITS, extensionOf } from '
 import { courseBadgeDescription } from './course-badge';
 import { TEACHER_GUIDE_HIDDEN_NOTICE, TEACHER_GUIDE_IDNUMBER } from '../../modules/course-shell/teacher-guide-page';
 import { QUIZ_REVIEW_V3 } from './moodle-activities-v3';
+import { LIBRO_HTML_IDNUMBER } from './libro-html-v3';
 import { compareMajorMinor, isKnownMoodleVersion, h5pPackageLibraryKeys, h5pRequirement, sectionLinkTargets, tokenRequirements } from './moodle-compat';
 import { formatDurationEs, mp3DurationSeconds } from '../audio';
 import { ExamBankPlans, examChecksV3, readExamPackageV3 } from './exam-validator-v3';
@@ -477,7 +478,7 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   if (!/<name>coursedisplay<\/name><value>1<\/value>/.test(courseXml)) add('SECTIONS', 'course/course.xml', 'coursedisplay ≠ 1 (una sección por página)');
   const expectedSection = (idn: string): number | undefined => {
     if (/^cv3:shell:(forum|welcome|audio_welcome|competencies|methodology|start|teacher_guide)$/.test(idn)) return 0;
-    if (/^cv3:shell:(route|libro|libro_card|audiobook|route_start)$/.test(idn)) return 1;
+    if (/^cv3:shell:(route|libro|libro_card|libro_html|audiobook|route_start)$/.test(idn)) return 1;
     if (idn === 'cv3:shell:closing' || idn === 'cv3:shell:certificate_teacher') return layout.closingSection;
     if (/^cv3:final_exam(_info|_next|_explanations)?$/.test(idn)) return layout.finalExamSection ?? undefined;
     // EV6 P2-B4: nota para docentes (sin certificado) = primera sección con una evaluación.
@@ -1216,13 +1217,33 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
   // actividad y el contenido de cada página (mod_page/content), cada uno contra SU filearea.
   const pageContent = new Map<number, string>();
   for (const a of acts.filter((x) => x.modname === 'page')) pageContent.set(a.mid, unxml(tag((await text(`${a.dir}/page.xml`)) ?? '', 'content') ?? ''));
+  // r78: capítulos de cada libro de Moodle (mod_book): su contenido es HTML visible como el de una página.
+  const bookChapters = new Map<number, Array<{ id: number; pagenum: number; subchapter: string; title: string; content: string; hidden: string }>>();
+  for (const a of acts.filter((x) => x.modname === 'book')) {
+    const bx = (await text(`${a.dir}/book.xml`)) ?? '';
+    bookChapters.set(a.mid, blocks(tag(bx, 'chapters') ?? '', 'chapter').map((c) => ({
+      id: num(/<chapter id="(\d+)"/.exec(c)?.[1]), pagenum: num(tag(c, 'pagenum')), subchapter: tag(c, 'subchapter') ?? '', title: unxml(tag(c, 'title') ?? ''),
+      content: unxml(tag(c, 'content') ?? ''), hidden: tag(c, 'hidden') ?? '',
+    })));
+  }
   for (const a of acts) {
     const comp = a.modname === 'label' ? 'mod_label' : `mod_${a.modname}`;
     const surfaces: Array<{ html: string; filearea: string; where: string }> = [{ html: `${a.intro}`, filearea: 'intro', where: a.idnumber }];
     if (pageContent.has(a.mid)) surfaces.push({ html: pageContent.get(a.mid) as string, filearea: 'content', where: `${a.idnumber}#content` });
+    for (const ch of bookChapters.get(a.mid) ?? []) surfaces.push({ html: ch.content, filearea: 'chapter', where: `${a.idnumber}#chapter-${ch.id}` });
     for (const s of surfaces) {
       if (s.html.includes('cursia-cta://')) add('TOKEN_INVALID', s.where, 'botón de navegación con marcador cursia-cta sin resolver');
-      for (const m of s.html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
+      for (const m of s.html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@\$/g)) {
+        // r78: capítulo de un libro del paquete (`$@BOOKVIEWBYIDCH*mid*capítulo@$`): libro y capítulo existen.
+        if (m[1] === 'BOOKVIEWBYIDCH') {
+          const bk = m[2] ? byMid.get(Number(m[2])) : undefined;
+          if (!bk || bk.modname !== 'book' || !m[3] || !(bookChapters.get(bk.mid) ?? []).some((c) => c.id === Number(m[3]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a un capítulo de un libro del paquete`);
+          continue;
+        }
+        if (m[3]) {
+          add('TOKEN_INVALID', s.where, `token ${m[0]} con dos ids (solo BOOKVIEWBYIDCH los lleva)`);
+          continue;
+        }
         // Edu EV3: botón «Continuar con el módulo…» → sección del paquete (id de section.xml).
         if (m[1] === 'COURSESECTIONBYID') {
           if (!m[2] || !sectionIds.has(Number(m[2]))) add('TOKEN_INVALID', s.where, `token ${m[0]} no resuelve a una sección del paquete`);
@@ -1484,8 +1505,16 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (builderVersionAtLeast(exp.builderVersion, '3.13.0')) {
         const anchors = [...libro.intro.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a>/g)];
         const tok = `$@RESOURCEVIEWBYID*${libro.mid}@$`;
-        const ok = anchors.length === 1 && /Abrir Libro Guía/.test(extractText(anchors[0][2])) && anchors[0][1].includes(`href="${tok}"`) && /\btarget="_blank"/.test(anchors[0][1]) && /\brel="[^"]*\bnoopener\b[^"]*"/.test(anchors[0][1]);
-        if (!ok) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba exactamente un botón «Abrir Libro Guía» con href="${tok}" target="_blank" rel="noopener…" (hay ${anchors.length} enlace(s))`);
+        // r78 (3.18.0): además, UN botón «Leer en el celular» hacia el libro en línea (mod_book) del paquete.
+        const online = builderVersionAtLeast(exp.builderVersion, '3.18.0');
+        const pdfA = anchors.filter((x) => /Abrir Libro Guía/.test(extractText(x[2])));
+        const ok = anchors.length === (online ? 2 : 1) && pdfA.length === 1 && pdfA[0][1].includes(`href="${tok}"`) && /\btarget="_blank"/.test(pdfA[0][1]) && /\brel="[^"]*\bnoopener\b[^"]*"/.test(pdfA[0][1]);
+        if (!ok) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba exactamente un botón «Abrir Libro Guía» con href="${tok}" target="_blank" rel="noopener…"${online ? ' y uno «Leer en el celular»' : ''} (hay ${anchors.length} enlace(s))`);
+        if (online) {
+          const bk = acts.find((x) => x.idnumber === LIBRO_HTML_IDNUMBER);
+          const onA = anchors.filter((x) => /Leer en el celular/.test(extractText(x[2])));
+          if (!bk || onA.length !== 1 || !onA[0][1].includes(`href="$@BOOKVIEWBYID*${bk.mid}@$"`)) add('LIBRO_CTA', 'cv3:shell:libro#intro', `se esperaba un botón «Leer en el celular» hacia $@BOOKVIEWBYID*${bk ? bk.mid : '?'}@$`);
+        }
       }
     }
   } else {
@@ -1494,6 +1523,45 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
     else {
       if (!/<\/html>\s*$/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'no cierra en </html>');
       if (!/<style>[\s\S]*@media print[\s\S]*<\/style>/i.test(lhtml)) add('LIBRO', 'cv3:shell:libro', 'sin <style> con CSS de impresión');
+    }
+  }
+
+  // ── r78: Libro Guía en línea (mod_book), builder ≥ 3.18.0 ──
+  if (builderVersionAtLeast(exp.builderVersion, '3.18.0')) {
+    const W = LIBRO_HTML_IDNUMBER;
+    const books = acts.filter((x) => x.modname === 'book');
+    const bk = acts.find((x) => x.idnumber === W);
+    if (!bk || books.length !== 1 || bk.modname !== 'book') add('LIBRO_HTML', W, `se esperaba exactamente un libro en línea (mod_book) ${W} (hay ${books.length} libro(s))`);
+    else {
+      const i = acts.indexOf(bk);
+      if (bk.sectionid !== 1 || !libro || acts[i - 1] !== libro) add('LIBRO_HTML', W, 'el libro en línea debe ir en la sección 1, justo debajo del recurso PDF del Libro Guía');
+      if (bk.module.visible !== '1') add('LIBRO_HTML', W, 'el libro en línea debe estar visible');
+      if (bk.grade || bk.inforefGradeItems.length) add('LIBRO_HTML', W, 'el libro en línea no lleva ítem de calificación');
+      const chs = bookChapters.get(bk.mid) ?? [];
+      const contentChapters = facts.chapters.filter((x) => x.kind !== 'practice');
+      // portada + un capítulo por módulo + uno por capítulo de contenido (+ referencias, si el Libro las tiene)
+      const want = 1 + facts.modules.length + contentChapters.length;
+      if (chs.length !== want && chs.length !== want + 1) add('LIBRO_HTML', W, `el libro en línea tiene ${chs.length} capítulos (se esperaban ${want} o ${want + 1} con referencias)`);
+      if (chs.length && chs[0].subchapter !== '0') add('LIBRO_HTML', W, 'el primer capítulo (portada e índice) no puede ser un subcapítulo');
+      const titles = chs.map((x) => x.title);
+      for (const m of facts.modules) {
+        const t = titles.findIndex((x) => x.startsWith(`Módulo ${m.number} — `));
+        if (t < 0 || chs[t].subchapter !== '0') { add('LIBRO_HTML', W, `falta el capítulo del módulo ${m.number}`); continue; }
+        const mine = contentChapters.filter((x) => x.moduleId === m.id).map((x) => x.number);
+        const got: number[] = [];
+        for (let k = t + 1; k < chs.length && chs[k].subchapter === '1'; k++) got.push(Number(/^Capítulo (\d+)\./.exec(chs[k].title)?.[1]));
+        if (JSON.stringify(got) !== JSON.stringify(mine)) add('LIBRO_HTML', W, `módulo ${m.number}: capítulos en línea ${got.join(',')} ≠ capítulos de contenido ${mine.join(',')}`);
+      }
+      chs.forEach((x, k) => {
+        if (x.pagenum !== k + 1) add('LIBRO_HTML', `${W}#chapter-${x.id}`, `pagenum ${x.pagenum} ≠ ${k + 1}`);
+        if (x.hidden !== '0') add('LIBRO_HTML', `${W}#chapter-${x.id}`, 'capítulo oculto');
+        // completo (nunca recortado): la raíz del shell cierra.
+        if (!/^<div class="cvc [^"]*cvc-libro-online[^"]*"/.test(x.content) || !/<\/div>\s*$/.test(x.content)) add('LIBRO_HTML', `${W}#chapter-${x.id}`, 'el capítulo no es una raíz completa del Libro en línea (¿truncado?)');
+        const lint = lintCleanSafe(x.content);
+        if (!lint.ok) add('CLEAN_SAFE', `${W}#chapter-${x.id}`, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
+        if (/<script\b/i.test(x.content)) add('LIBRO_HTML', `${W}#chapter-${x.id}`, 'con <script>');
+      });
+      if (!chs.some((x) => x.content.includes(`$@RESOURCEVIEWBYID*${libro ? libro.mid : -1}@$`))) add('LIBRO_HTML', W, 'el libro en línea no enlaza el PDF del Libro Guía');
     }
   }
 

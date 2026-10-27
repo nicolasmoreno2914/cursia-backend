@@ -546,7 +546,9 @@ const ENV_KEYS = [
       // r77 (builder 3.17.0, mobile-first): dorado recalculado a propósito — solo cambian los estilos de los botones (la píldora
       // es el <a>: float + padding + fondo) y de los enlaces de descarga; diff por entrada del zip contra c820d4e: 19 label.xml /
       // descripción del Libro con el mismo texto, etiquetas, enlaces y archivos (antes 473e168f…, 3.16.0).
-      const GOLDEN_644 = '8cc3a542a4ee8ecf95f9b41249322805c654ae5c6df7644268969a788be0fd2d';
+      // r78 (builder 3.18.0, Libro Guía en el celular): recalculado a propósito, mismo dorado que check-ev6-pending-videos —
+      // libro en línea (mod_book) en la sección 1 + «Leer en el celular»; archivos idénticos (antes 8cc3a542…, 3.17.0).
+      const GOLDEN_644 = '7f2623476105144c38c977ecb978f40f5a17bac67598e75c23deb872ce77653e';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });

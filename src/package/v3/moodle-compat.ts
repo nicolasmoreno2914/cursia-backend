@@ -131,7 +131,7 @@ export function h5pRequirement(libraryKeys: Iterable<string>): { coreApi: string
 /** Versión mínima que exige cada token `$@X*…@$` de un HTML (los que funcionan en todas no aparecen). */
 export function tokenRequirements(html: string): Array<{ token: string; minimumMoodle: MoodleCompatVersion }> {
   const out: Array<{ token: string; minimumMoodle: MoodleCompatVersion }> = [];
-  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*\d+)?@\$/g)) {
+  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*\d+){0,2}@\$/g)) {
     const v = MOODLE_TOKEN_MIN_VERSION[m[1]];
     if (v) out.push({ token: m[0], minimumMoodle: v });
   }
