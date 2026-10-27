@@ -291,9 +291,12 @@ async function pureChecks() {
   // r77 (builder 3.17.0, mobile-first): recalculados a propósito — solo estilos de botones (la píldora es el <a>) y de las
   // descargas; diff por entrada del zip contra c820d4e: 644 = 19 y 645 = 17 label.xml con el mismo texto, etiquetas, enlaces
   // y archivos. Dorados 3.16.0: 644 473e168f…, 645 85a5cffc….
+  // r78 (builder 3.18.0, Libro Guía en el celular): recalculados a propósito — sección 1 + libro en línea (mod_book, mismo
+  // texto del PDF), tarjeta del Libro con «Leer en el celular»; moduleid siguientes corren uno; archivos de contenido
+  // idénticos (check-r78-libro-movil B6). Dorados 3.17.0: 644 8cc3a542…, 645 d861f556….
   const GOLDEN_PRE_T5 = {
-    644: ['8cc3a542a4ee8ecf95f9b41249322805c654ae5c6df7644268969a788be0fd2d', { engine: 'h5p', finalExam: true, courseId: 644 }],
-    645: ['d861f556da953c5325cac08936f53d561247f27bf230d91fa33ac4f9e7345ab6', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
+    644: ['7f2623476105144c38c977ecb978f40f5a17bac67598e75c23deb872ce77653e', { engine: 'h5p', finalExam: true, courseId: 644 }],
+    645: ['5f4bfee0d7bdbbc3642706e248dcbeca9d2183dcad3509c2d7f6e276ee73d21f', { engine: 'scorm', finalExam: false, courseId: 645, theme: { themeFamily: 'oscuro-premium', mode: 'dark' } }],
   };
   await check('builder v3: sin pendientes el .mbz es BYTE-IDÉNTICO al dorado post-P2-B4 (respuestas explicadas sobre sistema visual 2.0 + certificado + política de revisión del quiz con revisión de respuestas propias V542 + H5P de una sola copia + retroalimentación global del quiz + #583 QUAL + UX r18 + r19 Libro Guía PDF + r55 invariantes de calificación, builder 3.14.0), con y sin el campo', async () => {
     for (const [id, [want, o]] of Object.entries(GOLDEN_PRE_T5)) {

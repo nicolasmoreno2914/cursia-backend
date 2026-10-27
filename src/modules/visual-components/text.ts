@@ -179,6 +179,14 @@ export function inlineHtml(text: string, h: HyphenOpts = HYPHEN_DEFAULT): string
   return NOLINK_OPEN + ps.join('<br>') + NOLINK_CLOSE;
 }
 
+/**
+ * r78 (Libro Guía en línea): un tramo de texto YA separado por el parser del Libro (sin marcas de énfasis que
+ * interpretar) → escapado, con guiones suaves y protegido de los filtros de Moodle (`<span class="nolink">`).
+ */
+export function nolinkRunHtml(text: string, h: HyphenOpts = HYPHEN_DEFAULT): string {
+  return NOLINK_OPEN + escapeRun(String(text).replace(INVISIBLE_CHARS_RE, ''), h) + NOLINK_CLOSE;
+}
+
 /** Texto fijo del renderer (rótulos): escapado y protegido de filtros, sin énfasis ni guiones. */
 export function labelHtml(text: string): string {
   return NOLINK_OPEN + escapeHtml(text) + NOLINK_CLOSE;

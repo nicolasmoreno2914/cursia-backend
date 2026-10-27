@@ -55,6 +55,8 @@ const FULL_LIBS = argLibs >= 0 ? process.argv[argLibs + 1] : process.env.H5P_LIB
  * Huellas sha256 de los paquetes LEGACY capturadas en el commit base (origin/staging bf44a9f,
  * antes de H5P v2) con `node scripts/lib/h5p2-golden-legacy.js`. H5P v2 no puede cambiar ni un byte.
  */
+// r78 (builder 3.18.0, Libro Guía en el celular): los 5 .mbz recalculados a propósito — sección 1 + libro en línea (mod_book,
+// mismo texto del PDF), tarjeta del Libro con «Leer en el celular»; moduleid siguientes corren uno; archivos idénticos.
 // r77 (builder 3.17.0, mobile-first): los 5 .mbz recalculados a propósito (mismos valores que check-ev6-h5p2-wire.js); frente
 // a c820d4e solo cambian los estilos de los botones (la píldora es el <a>) y de las descargas — diff por entrada del zip: mismo
 // texto, etiquetas, enlaces y archivos. Los paquetes H5P no cambian. Dorados 3.16.0: 046edade…, 26f7f230…, 62c4bc0f…, 139dd659…, 5fa5fafe….
@@ -106,11 +108,11 @@ const GOLDEN = {
   // Dorados r55 (fd67337): h5p-final-light 0892ae20…, scorm-nofinal-dark 5feee6eb…, h5p-nofinal-dark-mock-cleansafe
   // ee6da148…, scorm-final-light 92007263…, h5p-ev5c-rules1 df1ee128….
   mbz: {
-    'h5p-final-light': '6cbd25c82ab6036601da6d9d9f1baa33a56a59ba8dd8ae1a1b73c696d641b24d',
-    'scorm-nofinal-dark': '12f2bed387fdf487bd6ab71c2d77bf4665eaf730ad54d913fe3bf4109eb2a601',
-    'h5p-nofinal-dark-mock-cleansafe': '8905615d47ba3e48e7660a09bcb095043f07a50d8886a6f2c2520a8a067f248a',
-    'scorm-final-light': '3eb28019e9c396f1344229a7128fa10a1d1149b09c444f0812c4e0ee939d5da7',
-    'h5p-ev5c-rules1': 'b29a17154e00ca61f6ade99ddbd7ad365482463552b13e0f3dddaeb5252a21df',
+    'h5p-final-light': '2d8368d3da9bba1590b7e5bb9e770daa7e711e6691eff5dc0b5a1c8a99749605',
+    'scorm-nofinal-dark': 'a78c9efc6e5625481a772caf7a10f4a2e14b5f87bfee552593d74eb58a5f2b36',
+    'h5p-nofinal-dark-mock-cleansafe': 'dbd5a9e35869620d0ced078d3752a0044c23a9eda559b8eff62f22b3165422f2',
+    'scorm-final-light': '87170028e2fff1333cecf8dc33cfc0a436f9672858ea7cb9572bf028f7598a5e',
+    'h5p-ev5c-rules1': '23d81a84f78fd61d75b2ef27561fa0b9810e300a8123f78c64bb401e6c4eaad8',
   },
 };
 

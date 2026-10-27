@@ -142,6 +142,7 @@ import type { H5pActivityTypeV2 } from '../modules/course-shell';
 import { TEACHER_GUIDE_IDNUMBER, teacherGuidePage } from '../modules/course-shell/teacher-guide-page';
 import { PackagingPlanV3, buildPackagingPlanV3, packagingPlanV3Sha256 } from '../modules/dynamic-packaging/packaging-plan-v3';
 import { LIBRO_PDF_MIMETYPE, libroPdfFilename, renderLibroPdfV3 } from './v3/libro-v3';
+import { LIBRO_HTML_IDNUMBER, LIBRO_HTML_NAME, libroBookXml, renderLibroHtmlV3 } from './v3/libro-html-v3';
 import { LibroLogoCandidate, cursiaDefaultLogo, resolveLibroLogo } from './v3/libro-logo';
 import { downscaleCoverPng } from './v3/png-downscale';
 import { ActivityFrameTone, activityPackageFilename, h5pActivityInlineIntroHtml, introThemeFrom, reviewCardsIntroHtml, scormIntroHtml } from './v3/activity-intro';
@@ -290,8 +291,13 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * área táctil ≥ 44 × 44 px con o sin <style>, también con forceclean y en la app) y los enlaces de descarga solos en su
  * renglón tienen 44 px de alto. Cambian SOLO los estilos de esos enlaces (mismo texto, mismas actividades, mismos
  * archivos: Libro Guía, portadas, MP3, H5P, GIFT e insignia byte a byte). Los paquetes de 3.16.0 se re-empaquetan.
+ * 3.18.0 (r78, Libro Guía en el celular): la sección 1 suma, justo debajo del recurso PDF, el libro de Moodle (mod_book)
+ * «📱 Libro Guía · lectura en el celular» (`cv3:shell:libro_html`): el MISMO texto del PDF (mismo insumo y parser, sin
+ * IA), un capítulo de Moodle por sección del PDF (portada e índice, módulos, capítulos como subcapítulos, referencias), a
+ * 18 px, fluido y con el tema; la tarjeta del Libro suma «Leer en el celular →». El PDF sigue igual (bytes idénticos) y
+ * sigue siendo el criterio de finalización de un curso sin nota. Los paquetes de 3.17.0 se re-empaquetan.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.17.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.18.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -521,7 +527,11 @@ export interface BuildDynamicMbzV3Result {
     /** r55: `site_library_pack` (≥ 3.14.0); `admin_or_manager` solo en paquetes ≤ 3.13.0. */
     restore?: { as: 'site_library_pack'; libraryPack: 'v3'; note: string } | { as: 'admin_or_manager'; note: string };
     /** r19 (L): Libro Guía en PDF — archivo, páginas y el logo usado como marca de agua. */
-    libro: { filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string };
+    libro: {
+      filename: string; pageCount: number; wordCount: number; logoSource: string; logoSha256: string;
+      /** r78 (3.18.0): lectura en línea (mod_book): capítulos de Moodle, palabras visibles (= las del PDF) y bytes del HTML. */
+      online?: { chapters: number; words: number; bytes: number };
+    };
     /** T4 (r57): Actividades de Aplicación entregadas como Tarea (solo si hay alguna). */
     applicationAssigns?: { count: number; graded: number; rubric: number; category: string | null };
     /** T5 (r57): archivos de trabajo publicados (solo si hay alguno): id, capítulo, archivo, sha256, bytes y origen. */
@@ -760,16 +770,25 @@ function withIdnumber(xml: string, idnumber: string): string {
 
 /** Tokens `$@XVIEWBYID*mid@$` → modname del destino. */
 const TOKEN_MODNAME: Record<string, string> = {
-  SCORM: 'scorm', QUIZ: 'quiz', RESOURCE: 'resource', PAGE: 'page', URL: 'url', H5PACTIVITY: 'h5pactivity', LABEL: 'label', FORUM: 'forum',
+  SCORM: 'scorm', QUIZ: 'quiz', RESOURCE: 'resource', PAGE: 'page', URL: 'url', H5PACTIVITY: 'h5pactivity', LABEL: 'label', FORUM: 'forum', BOOK: 'book',
 };
 
 /** Falla fuerte ante cualquier token `$@…$` que no apunte a un módulo del paquete del tipo correcto. */
 export function assertTokensV3(html: string, modnameByMid: Map<number, string>, where: string, sectionNums?: Set<number>, courseBackupId?: number, minimumMoodle?: string): void {
   const bad: string[] = [];
   if (/cursia-cta:\/\//.test(html)) bad.push('marcador cursia-cta sin resolver');
-  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?@\$/g)) {
+  for (const m of html.matchAll(/\$@([A-Z0-9_]+)(?:\*(\d+))?(?:\*(\d+))?@\$/g)) {
     const kind = m[1];
     const idStr = m[2];
+    // r78: capítulo del libro en línea `$@BOOKVIEWBYIDCH*mid*capítulo@$` (el capítulo lo verifica el validador).
+    if (kind === 'BOOKVIEWBYIDCH') {
+      if (!idStr || !m[3] || modnameByMid.get(Number(idStr)) !== 'book') bad.push(m[0]);
+      continue;
+    }
+    if (m[3]) {
+      bad.push(m[0]);
+      continue;
+    }
     // r60 (D2): un token sin regla de decodificación en el Moodle mínimo del paquete queda literal al restaurar.
     const since = MOODLE_TOKEN_MIN_VERSION[kind];
     if (since && minimumMoodle !== undefined && compareMajorMinor(minimumMoodle, since) < 0) {
@@ -1739,14 +1758,18 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
   // ── Sección 1 — ruta, Libro Guía, audiolibro ─────────────────────────────
   addLabel(1, 'cv3:shell:route', routeLabel(facts, theme, opts));
   let libroMid: number;
+  let libroHtmlSummary: { chapters: number; words: number; bytes: number } | null = null;
   {
     const name = '📘 Libro Guía';
     const a = W.newActivity('resource', 1, name, 'cv3:shell:libro');
     libroMid = a.mid;
+    // r78: lectura en línea del Libro Guía (mod_book, mismo texto que el PDF), justo debajo del recurso PDF.
+    const book = W.newActivity('book', 1, LIBRO_HTML_NAME, LIBRO_HTML_IDNUMBER);
     // #583 (M5/M6, builder 3.11.0): la tarjeta del Libro Guía es la DESCRIPCIÓN del recurso (showdescription),
     // no un label aparte: la sección 1 muestra una sola entrada del Libro Guía.
     // r19 (L4, 3.13.0): con el botón «Abrir Libro Guía →» hacia su PROPIO moduleid, en una pestaña nueva.
-    const libroIntro = libroResourceIntro(facts, theme, opts, a.mid).html;
+    // r78 (3.18.0): y el botón «Leer en el celular →» hacia el libro en línea.
+    const libroIntro = libroResourceIntro(facts, theme, opts, a.mid, book.mid).html;
     labelsHtml.push({ where: 'cv3:shell:libro#intro', html: libroIntro });
     // r19 (L1/L5): el PDF es el único archivo del recurso (display 5 → view.php lo entrega y el navegador lo muestra).
     const fid = W.addFile(a.ctx, 'mod_resource', 'content', libroFilename, libro.pdf, LIBRO_PDF_MIMETYPE);
@@ -1772,6 +1795,20 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
     W.put(`${a.dir}/inforef.xml`, inforef([fid]));
     W.put(`${a.dir}/grades.xml`, gradesXml(a.aid));
     W.boilerplate(a.dir);
+
+    // r78: el libro en línea — mismo insumo que el PDF (libroInputBase), un capítulo de Moodle por sección del PDF.
+    const online = renderLibroHtmlV3(libroInputBase, theme, opts, { bookMid: book.mid, libroMid: a.mid }, welcomeIdentity && welcomeLogoFiles[0] ? { ...welcomeIdentity, file: welcomeLogoFiles[0] } : null);
+    const chapterFileIds: number[] = [];
+    for (const ch of online.chapters) {
+      for (const f of ch.files) chapterFileIds.push(W.addFile(book.ctx, 'mod_book', 'chapter', f.name, f.data, f.mime, ch.id));
+      labelsHtml.push({ where: `${LIBRO_HTML_IDNUMBER}#${ch.key}`, html: ch.html });
+    }
+    W.put(`${book.dir}/book.xml`, libroBookXml({ aid: book.aid, mid: book.mid, ctx: book.ctx, name: LIBRO_HTML_NAME, ts, chapters: online.chapters }));
+    W.put(`${book.dir}/module.xml`, applyXmlFields(withIdnumber(moduleXml(book.mid, 'book', 1, ts, MV.bv), book.idnumber), { completion: '0' }));
+    W.put(`${book.dir}/inforef.xml`, inforef(chapterFileIds));
+    W.put(`${book.dir}/grades.xml`, gradesXml(book.aid));
+    W.boilerplate(book.dir);
+    libroHtmlSummary = { chapters: online.chapters.length, words: online.words, bytes: online.bytes };
   }
   // r74: con el audiolibro en línea, el label no lleva MP3 (reproductores con la dirección duradera); con partes
   // autocontenidas, va AL FINAL de la sección 1 sin MP3, así las etiquetas de las partes restauradas quedan justo debajo.
@@ -2352,7 +2389,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
       ...(audiobook.floor ? { audiobookFloor: audiobook.floor } : {}),
       counts: facts.counts,
       assessment: assessmentPackageSummary(resolved),
-      libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256 },
+      libro: { filename: libroFilename, pageCount: libro.pageCount, wordCount: libro.wordCount, logoSource: libroLogo.source, logoSha256: libroLogo.sha256, ...(libroHtmlSummary ? { online: libroHtmlSummary } : {}) },
       ...(assignsTotal ? { applicationAssigns: { count: assignsTotal, graded: assignsGraded, rubric: assignsRubric, category: resolved.application?.category ?? null } } : {}),
       ...(practice.resolved.length
         ? { practiceResources: practice.resolved.map((r) => ({ id: r.id, chapterId: r.chapterId, filename: r.filename, mimetype: r.mimetype, sha256: r.sha256, bytes: r.bytes, origin: r.origin, relation: r.relation })) }

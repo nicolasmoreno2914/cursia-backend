@@ -111,7 +111,7 @@ const BS_CFG = {
     }
   }
 
-  await check('builder 3.17.0 (r77: botones móviles; 3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación; 3.15.0 = T1 r57 Libro + vocabulario interno; 3.15.1 = r58 I3 horas objetivo en la bienvenida; 3.16.0 = r60 Moodle mínimo)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.17.0', 'versión'));
+  await check('builder 3.18.0 (r78: Libro Guía en línea; 3.17.0 = r77 botones móviles; 3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación; 3.15.0 = T1 r57 Libro + vocabulario interno; 3.15.1 = r58 I3 horas objetivo en la bienvenida; 3.16.0 = r60 Moodle mínimo)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.18.0', 'versión'));
 
   await check('matriz + rules 2: toda h5pactivity tiene UNA sola copia del .h5p (filearea package) y su inforef apunta solo a ella', () => {
     let n = 0;
@@ -236,7 +236,8 @@ const BS_CFG = {
     // contra 17dc7b0 (work/r60/A/golddiff.js): SOLO cambian 4 label.xml (1004, 1009, 1017, 1023) y, normalizando esos
     // enlaces, son idénticos. Dorado r55 (3.14.0–3.15.1): 68a4c756….
     // r77 (3.17.0): dorado recalculado a propósito (solo estilos de botones y enlaces de descarga; mismo texto y archivos).
-    eq(sha(r.mbz), 'ab7ea1d293ad50b30c9820ae94dc12c4834af5a16189dafdb18c71907a35ca07', 'sha256');
+    // r78 (3.18.0): recalculado a propósito — libro en línea (mod_book) en la sección 1 + botón «Leer en el celular»; archivos idénticos.
+    eq(sha(r.mbz), 'e321e5d8aa1eef63f5ce6aefd4bad4dab190b689931c9f22e70d5c8f17fe447e', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);

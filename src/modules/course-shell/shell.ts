@@ -157,7 +157,7 @@ export function welcomeLogoSize(width: number, height: number): { width: number;
   return { width: w, height: h };
 }
 
-function identityStrip(h: Hx, idn: WelcomeIdentity, s: Surf): string {
+export function identityStrip(h: Hx, idn: WelcomeIdentity, s: Surf): string {
   const img = `<img src="${idn.src.replace(/"/g, '&quot;')}" alt="${WELCOME_LOGO_ALT}" width="${idn.width}" height="${idn.height}"` +
     st(h, [['margin', idn.name ? '0 0 8px 0' : '0'], ['display', 'block']], [['max-width', '100%'], ['height', 'auto']]) + ' />';
   const name = idn.name ? eyebrow(h, idn.name, s, { sentence: true, margin: '0', color: s.fg }) : '';
@@ -356,14 +356,19 @@ export function routeLabel(facts: CourseFacts, theme: ResolvedTheme, opts?: Shel
  * hacia `$@RESOURCEVIEWBYID*libroMid@$` en una pestaña nueva; con `display` = 5 (abrir) view.php entrega el PDF, que el
  * navegador muestra en su visor.
  */
-export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, libroMid?: number): ShellLabel {
+export function libroResourceIntro(facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions, libroMid?: number, onlineBookMid?: number): ShellLabel {
   if (libroMid === undefined) return libroCard(null, facts, theme, opts);
   if (!Number.isInteger(libroMid) || libroMid < 1) shellFail(`libroMid inválido (${libroMid})`);
-  return libroCard(libroMid, facts, theme, opts, { text: LIBRO_CTA_TEXT, newTab: true, pdf: true });
+  if (onlineBookMid !== undefined && (!Number.isInteger(onlineBookMid) || onlineBookMid < 1)) shellFail(`onlineBookMid inválido (${onlineBookMid})`);
+  return libroCard(libroMid, facts, theme, opts, { text: LIBRO_CTA_TEXT, newTab: true, pdf: true, ...(onlineBookMid !== undefined ? { onlineBookMid } : {}) });
 }
 
 /** r19 (L4): texto del botón del Libro Guía en la descripción del recurso (builder ≥ 3.13.0). */
 export const LIBRO_CTA_TEXT = 'Abrir Libro Guía →';
+/** r78: botón de la tarjeta hacia la lectura en línea (libro de Moodle, builder ≥ 3.18.0). */
+export const LIBRO_ONLINE_CTA_TEXT = 'Leer en el celular →';
+/** r78: frase de la tarjeta sobre la lectura en línea. */
+export const LIBRO_ONLINE_CARD_TEXT = 'Para leer en el teléfono, usa la versión en línea: el mismo texto, con letra cómoda que se ajusta a la pantalla. El PDF sirve para descargar e imprimir.';
 
 /** Tarjeta del Libro Guía como label aparte (builder ≤ 3.10.0; se conserva para paquetes y pruebas anteriores). */
 export function libroCardLabel(libroMid: number, facts: CourseFacts, theme: ResolvedTheme, opts?: ShellRenderOptions): ShellLabel {
@@ -376,7 +381,7 @@ function libroCard(
   facts: CourseFacts,
   theme: ResolvedTheme,
   opts?: ShellRenderOptions,
-  cta: { text: string; newTab: boolean; pdf: boolean } = { text: 'Abrir el Libro Guía', newTab: false, pdf: false },
+  cta: { text: string; newTab: boolean; pdf: boolean; onlineBookMid?: number } = { text: 'Abrir el Libro Guía', newTab: false, pdf: false },
 ): ShellLabel {
   const h = hx(theme, opts);
   const cs = { s: panelSurf(h), border: h.t.color.border };
@@ -395,9 +400,12 @@ function libroCard(
     eyebrow(h, 'Material de estudio', cs.s) +
     heading(h, 'h3', 'Libro Guía', cs.s) +
     pHtml(h, labelHtml(text), cs.s, { last: libroMid === null }) +
+    (libroMid !== null && cta.onlineBookMid !== undefined ? pHtml(h, labelHtml(LIBRO_ONLINE_CARD_TEXT), cs.s, { secondary: true }) : '') +
     (libroMid === null
       ? ''
-      : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, cta.text, cs.s, { button: true, margin: '16px 0 0 0', ...(cta.newTab ? { target: '_blank' as const } : {}) }));
+      : link(h, `$@RESOURCEVIEWBYID*${libroMid}@$`, cta.text, cs.s, { button: true, margin: '16px 0 0 0', ...(cta.newTab ? { target: '_blank' as const } : {}) })) +
+    // r78: lectura en línea (libro de Moodle con el mismo texto), en la misma pestaña: la app oficial lo abre dentro.
+    (libroMid !== null && cta.onlineBookMid !== undefined ? link(h, `$@BOOKVIEWBYID*${cta.onlineBookMid}@$`, LIBRO_ONLINE_CTA_TEXT, cs.s, { button: true, margin: '12px 0 0 0' }) : '');
   return out(libroMid === null || cta.newTab ? 'Libro Guía (descripción del recurso)' : 'Libro Guía', root(h, 'shell-libro', box(h, inner, cs)), facts);
 }
 
