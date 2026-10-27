@@ -13,8 +13,11 @@ const check = (name, cond, detail) => { if (cond) { ok++; console.log('✅ ' + n
 const brief = (r) => `${r.status} ${r.code || ''} ${String(r.error || '').slice(0, 220)}`;
 (async () => {
   await env.dbConnect();
-  for (const t of ['institution_memberships', 'user_budgets', 'budget_reservations', 'budget_requests', 'admin_audit_log', 'user_suspensions', 'platform_controls'])
-    check(`sin tabla r75 ${t} (como prod)`, !(await env.tableExists(t)), 'existe');
+  const WITH_ACCESS = process.env.R78_WITH_ACCESS === '1';
+  for (const t of ['user_budgets', 'budget_reservations', 'budget_requests'])
+    check(`sin tabla r75-budgets ${t} (como prod)`, !(await env.tableExists(t)), 'existe');
+  for (const t of ['institution_memberships', 'admin_audit_log', 'user_suspensions', 'platform_controls'])
+    check(WITH_ACCESS ? `con r75-access: tabla ${t}` : `sin tabla r75-access ${t} (como prod)`, (await env.tableExists(t)) === WITH_ACCESS, 'no coincide');
   const fakes = await startFakeSupabase({ serviceKey: env.SERVICE_KEY });
   const U1 = { id: crypto.randomUUID(), email: 'owner1@x.test' }, U2 = { id: crypto.randomUUID(), email: 'owner2@x.test' };
   for (const u of [U1, U2]) await env.q(`insert into public.authorized_users (email, is_admin) values ($1, false)`, [u.email]).catch(() => {});
@@ -37,6 +40,22 @@ const brief = (r) => `${r.status} ${r.code || ''} ${String(r.error || '').slice(
   check('GET /artifacts 200', (await A('GET', '/artifacts')).status === 200, '');
   check('GET /jobs 200', (await A('GET', '/jobs')).status === 200, '');
   const m = await A('GET', '/me/context'); check('GET /me/context no 500', m.status !== 500, brief(m));
+  if (WITH_ACCESS) {
+    const SA = { id: crypto.randomUUID(), email: 'qa-r78-sa@x.test' };
+    await env.stopApp();
+    await env.q(`insert into public.authorized_users (email, is_admin) values ($1, true)`, [SA.email]).catch(() => {});
+    await env.startApp(fakes, Object.assign({}, strip, { PUBLIC_MEDIA_BASE_URL: '', DYNAMIC_V2_ALLOWED_OWNERS: U1.id, DYNAMIC_ALLOW_VIDEO_PREVIEW: 'true', SUPER_ADMIN_EMAILS: SA.email, SUPER_ADMIN_USER_IDS: SA.id }), 'app-flags-off-sa');
+    const TS = env.tokenFor(SA);
+    const au = await env.api('GET', '/admin/users', { token: TS });
+    check('con r75-access y flags off: el SuperAdmin lista usuarios (GET /admin/users 200)', au.status === 200, brief(au));
+    const nu = await env.api('GET', '/admin/users', { token: T1 });
+    check('con r75-access y flags off: un no-SA → 403 en /admin/users', nu.status === 403, brief(nu));
+    const pc = await env.api('GET', '/admin/platform/controls', { token: TS });
+    check('con r75-access: controles de plataforma legibles por el SA (congelación apagada)', pc.status === 200, brief(pc));
+    const pol = await env.q(`select policyname, cmd from pg_policies where schemaname='public' and tablename='authorized_users'`);
+    check('H2: authorized_users solo con la política SELECT propia', pol.length <= 1 && pol.every((p) => p.cmd === 'SELECT'), JSON.stringify(pol));
+    const mc = await env.api('GET', '/me/context', { token: TS }); check('GET /me/context del SA 200 con superAdmin', mc.status === 200 && mc.data && mc.data.superAdmin === true, brief(mc));
+  }
   // V2: curso con Manifest
   let gc = null;
   try {

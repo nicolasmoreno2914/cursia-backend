@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Uso: npm run build && REPO=<árbol compilado> SCRATCH=<dir> PGBIN=<PG16 bin> bash test/r75/prodcompat/prodcompat-r78.sh   (PG descartable SIN migraciones r75 = prod)
+# Uso: npm run build && REPO=<árbol compilado> SCRATCH=<dir> PGBIN=<PG16 bin> bash test/r75/prodcompat/prodcompat-r78.sh   (PG descartable SIN migraciones r75 = prod; R78_WITH_ACCESS=1: solo r75-access)
 set -u; HERE="$(cd "$(dirname "$0")" && pwd)"; PGBIN="${PGBIN:-/opt/homebrew/bin}"; PORT=55498
 export PGPORT_T=$PORT APP_PORT=38481 LC_ALL=C NODE_PATH="$REPO/node_modules" BUILD_DIR="$REPO/dist"
 DATA="$SCRATCH/pc-pgdata"; stop_pg() { "$PGBIN/pg_ctl" -D "$DATA" stop -m fast >/dev/null 2>&1 || true; rm -rf "$DATA"; }; trap stop_pg EXIT
@@ -21,7 +21,7 @@ for TYPES in 0 1; do
     [ -f "$REPO/scripts/$s.js" ] || continue; env $STG node "$REPO/scripts/$s.js" > "$OUT/$s.log" 2>&1 || { echo "$s falló"; exit 8; }
   done
   $PSQL -f "$REPO/test/r75/sql/local-supabase-shim.sql" > "$OUT/shim.log" 2>&1 || exit 9
-  echo "(SIN migrate-r75-access / migrate-r75-budgets / backfill: EXCLUDED en prod)"
+  if [ "${R78_WITH_ACCESS:-0}" = "1" ]; then for s in migrate-r75-access verify-r75-access-schema; do env $STG node "$REPO/scripts/$s.js" > "$OUT/$s.log" 2>&1 || { echo "$s falló"; exit 8; }; done; echo "(CON migrate-r75-access, SIN r75-budgets ni backfill)"; else echo "(SIN migrate-r75-access / migrate-r75-budgets / backfill: EXCLUDED en prod)"; fi
   node "$HERE/prodcompat-r78.js" || RC=1
 done
 exit $RC
