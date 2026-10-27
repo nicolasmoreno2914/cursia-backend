@@ -128,16 +128,32 @@ export class BudgetReservationService implements UserBudgetGate, OnModuleInit, O
 
   async payerOfRun(runner: Runner, runId: string): Promise<string | null> {
     if (!UUID_RE.test(String(runId))) return null;
+    // r78: los callers lo usan con CUALQUIER modo (reanudar, reintentar, reabrir, upgrade de video). Producción no tiene la
+    // migración r75-budgets: nombrar budget_reservations sin la tabla daba 42P01 → 500 al reanudar/reintentar un run.
+    // Sin la tabla no hay reservas: paga el iniciador (startedBy) o el dueño, igual que la rama coalesce de abajo.
+    const reservation = (await this.reservationsTablePresent(runner))
+      ? `(select br.user_id::text from public.budget_reservations br where br.run_id = j.id and br.kind = 'start'
+                  order by br.created_at limit 1),`
+      : '';
     const [r] = await runner.query(
       `select coalesce(
-                (select br.user_id::text from public.budget_reservations br where br.run_id = j.id and br.kind = 'start'
-                  order by br.created_at limit 1),
+                ${reservation}
                 nullif(j.input_payload->>'startedBy', ''),
                 j.owner_id::text) as payer
          from public.production_jobs j where j.id = $1::uuid`,
       [runId],
     );
     return r?.payer ? String(r.payer) : null;
+  }
+
+  /** ¿Existe budget_reservations (migración r75-budgets)? Por la conexión del caller (nunca otra del pool); caché 60 s / 10 s. */
+  private reservationsCache: { at: number; ok: boolean } | null = null;
+  async reservationsTablePresent(runner: Runner): Promise<boolean> {
+    const c = this.reservationsCache;
+    if (c && Date.now() - c.at < (c.ok ? TABLE_CACHE_MS : 10_000)) return c.ok;
+    const [r] = await runner.query(`select to_regclass('public.budget_reservations') is not null as ok`);
+    this.reservationsCache = { at: Date.now(), ok: r?.ok === true };
+    return this.reservationsCache.ok;
   }
 
   async reserveRun(runner: Runner, input: ReserveRunInput): Promise<{ reservationId: string | null; shadowInsufficient: boolean }> {

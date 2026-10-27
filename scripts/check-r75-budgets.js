@@ -245,6 +245,27 @@ async function main() {
       await cancelRun(offRun);
     });
 
+    // r78: producción NO tiene la migración r75-budgets. payerOfRun se llama con CUALQUIER modo (reanudar, reintentar,
+    // reabrir, upgrade de video): sin la tabla, nombrar budget_reservations daba 42P01 → 500. Se simula la base de prod
+    // renombrando la tabla DENTRO de una tx revertida, con una instancia nueva del gate (sin caché).
+    await check('[OFF·PROD] sin la tabla budget_reservations (prod sin r75-budgets): payerOfRun no da 42P01 y devuelve startedBy/owner_id', async () => {
+      setMode('off');
+      const fresh = new BudgetReservationService(ds, P.read, P.audit, P.budget, P.ledger, null, null);
+      const qr = ds.createQueryRunner();
+      await qr.connect();
+      try {
+        await qr.startTransaction();
+        await qr.query(`alter table public.budget_reservations rename to budget_reservations_r78_hidden`);
+        const payer = await fresh.payerOfRun(qr, offRun);
+        eq(payer, U2, 'paga el dueño');
+        await fresh.assertMayStart(qr, payer);
+      } finally {
+        if (qr.isTransactionActive) await qr.rollbackTransaction();
+        await qr.release();
+      }
+      eq(await count(`select count(*) n from public.budget_reservations`), 0, 'la tabla volvió (rollback)');
+    });
+
     setMode('enforce');
     // ── [ZERO] ──────────────────────────────────────────────────────────────────────────────────────────────────
     let zeroCourse = null;
