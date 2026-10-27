@@ -289,12 +289,13 @@ const DT = { itemKey: 'activity:qa', title: 'El registro de doña Carmen', taskD
   });
   await check('M5: .mbz 3.13.0 — sección 1 con UNA entrada del Libro Guía (recurso con descripción, sin label libro_card), quiz.xml con reviewmaxmarks 272; validador limpio y la descripción pasa las reglas de los labels', async () => {
     const r = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, courseId: 583 }));
-    eq(r.summary.builderVersion, '3.17.0', 'versión'); // r60: 3.16.0; r58 I3: 3.15.1; UX r18: 3.11.0 → 3.12.0; r19 L+W: 3.13.0; r55: 3.14.0
+    eq(r.summary.builderVersion, '3.18.0', 'versión'); // r78: 3.18.0; r77: 3.17.0; r60: 3.16.0; r58 I3: 3.15.1; UX r18: 3.11.0 → 3.12.0; r19 L+W: 3.13.0; r55: 3.14.0
     const z = await JSZip.loadAsync(r.mbz);
     const mb = await z.file('moodle_backup.xml').async('string');
     const acts = [...mb.matchAll(/<activity>\s*<moduleid>(\d+)<\/moduleid>\s*<sectionid>\d+<\/sectionid>\s*<modulename>(\w+)<\/modulename>\s*<title>([^<]*)<\/title>\s*<directory>([^<]+)<\/directory>/g)].map((m) => ({ mid: m[1], mod: m[2], title: m[3], dir: m[4] }));
     const libroRows = acts.filter((a) => /Libro Guía/.test(a.title));
-    eq(libroRows.map((a) => [a.mod, a.title]), [['resource', '📘 Libro Guía']], 'una sola entrada');
+    // r78 (3.18.0): una sola entrada del Libro Guía en PDF (recurso) + su lectura en línea (libro de Moodle), sin label libro_card.
+    eq(libroRows.map((a) => [a.mod, a.title]), [['resource', '📘 Libro Guía'], ['book', '📱 Libro Guía · lectura en el celular']], 'una sola entrada del PDF + la lectura en línea');
     const res = libroRows[0];
     const rx = await z.file(`${res.dir}/resource.xml`).async('string');
     const intro = unxml(/<intro>([\s\S]*?)<\/intro>/.exec(rx)[1]);

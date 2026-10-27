@@ -244,7 +244,8 @@ function expectedSequence(distRoot, input) {
   // UX r18 (problema 1): el hero de bienvenida abre la sección 0 (justo bajo el encabezado de Moodle); el foro la cierra.
   seq.push([0, ['cv3:shell:welcome', 'cv3:shell:audio_welcome', 'cv3:shell:competencies', 'cv3:shell:methodology', 'cv3:shell:start', 'cv3:shell:forum']]);
   // #583 (builder 3.11.0): la tarjeta del Libro Guía es la descripción del recurso (sin label cv3:shell:libro_card).
-  seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
+  // r78 (builder 3.18.0): el libro en línea (mod_book) va justo debajo del recurso PDF del Libro Guía.
+  seq.push([1, ['cv3:shell:route', 'cv3:shell:libro', 'cv3:shell:libro_html', 'cv3:shell:audiobook', 'cv3:shell:route_start']]);
   let n = 2;
   // EV6 P2-B4: sin certificado (= sin evaluación final) la nota oculta para docentes de «Respuestas
   // explicadas» abre la PRIMERA sección de evaluación; cada quiz lleva su página justo después.

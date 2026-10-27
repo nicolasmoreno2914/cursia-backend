@@ -357,7 +357,7 @@ function welcomeIssues(html, { welcome, title, theme, clean, noLead = false }) {
     const input = PF.packagingInput(distRoot, { engine: 'h5p', finalExam: true, theme: { themeFamily: 'editorial', mode: 'light' } });
     input.contents.courseIntro = { ...input.contents.courseIntro, welcome: WELCOMES.w616 };
     const r = await loadDist('package/dynamic-mbz-builder-v3.js').buildDynamicMbzV3(input);
-    eq(r.summary.builderVersion, '3.17.0', 'versión'); // r60: 3.16.0 (Moodle mínimo); r55: invariantes de calificación; r58 I3: 3.15.1 (horas objetivo en la bienvenida)
+    eq(r.summary.builderVersion, '3.18.0', 'versión'); // r78: 3.18.0 (Libro Guía en línea); r77: 3.17.0; r60: 3.16.0 (Moodle mínimo); r55: invariantes de calificación; r58 I3: 3.15.1 (horas objetivo en la bienvenida)
     mbz = r.mbz;
     exp = r.expectations;
     const z = await JSZip.loadAsync(mbz);
