@@ -96,11 +96,11 @@ const GOLDEN = {
   // Dorados r55 (fd67337): h5p-final-light 0892ae20…, scorm-nofinal-dark 5feee6eb…, h5p-nofinal-dark-mock-cleansafe
   // ee6da148…, scorm-final-light 92007263…, h5p-ev5c-rules1 df1ee128….
   mbz: {
-    'h5p-final-light': 'b5acc0722ffe2df273ab5e0c7cbf783a74109e1c5eb06182496746e85ebf800f',
-    'scorm-nofinal-dark': '92dc43ebf373f7b88a31c9fa6df1177fb7cbd043679f47967d2c12d29bd4f4ce',
-    'h5p-nofinal-dark-mock-cleansafe': 'f2201ea986c6e76d2e7627fa350b14c7694ceb9b807fc574417e292f122033ca',
-    'scorm-final-light': '1e05c830ee8f1c1668db9774f8520fd1c3defae8679d7fb1c46f4fce9cfe77bf',
-    'h5p-ev5c-rules1': '370ae850310d57494fbca601961b89951d61a10a957bea6ad909b50dda694b28',
+    'h5p-final-light': '6cbd25c82ab6036601da6d9d9f1baa33a56a59ba8dd8ae1a1b73c696d641b24d',
+    'scorm-nofinal-dark': '12f2bed387fdf487bd6ab71c2d77bf4665eaf730ad54d913fe3bf4109eb2a601',
+    'h5p-nofinal-dark-mock-cleansafe': '8905615d47ba3e48e7660a09bcb095043f07a50d8886a6f2c2520a8a067f248a',
+    'scorm-final-light': '3eb28019e9c396f1344229a7128fa10a1d1149b09c444f0812c4e0ee939d5da7',
+    'h5p-ev5c-rules1': 'b29a17154e00ca61f6ade99ddbd7ad365482463552b13e0f3dddaeb5252a21df',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */

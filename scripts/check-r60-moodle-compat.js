@@ -42,14 +42,14 @@ const GOLDEN_3_15_1 = {
   ofimatica: '7e03f1a412c28faf2bff17d69de5c44cb86dd63793890fb77f1c308ad8892eb9',
   gagne: '8728e5fc5682274cf6da5b1338c00b86cdc985006f017927f7a46233bc907165',
   'entrega-rubrica': '50122ed91edd787ade3180833ceb012dcd9b3d51cf1ea75959e9be35ddf254ff',
-  'multi-h5p': '2e2ab1d484dcaf18b07c8ea22e74d12517fa35c8b90b6a25f9cc8723e77c3cc1',
+  'multi-h5p': '2e71288525baec42c8887c63c4b83b7361538c9c6a26e007f7214e624d1612ab',
   'teorico-16': 'f4bff6931f19c5e27c672b0f5fb866101b7a0d7e653ebca5b388cf911b7cce7e',
   'practico-32': '4167f71a2c10f5d0294f7542239484071df94922c7f6a83b8c80197a18b800d8',
   'protocolo-20': 'f6593952bd92463d3a09711851035616b0a9c1b14c3662d0c37a57f6b23a9263',
   'casos-64': '3626bfb9eb17c875c9f5db87280026205fb5ad87d6cf7cb9d55236f77b55d8d8',
   'mixto-96': '4801c40fe668563a8104b65e7ac5fa948424cb65754e8c8fda8f0f8d919e857d',
-  '1x1-sin-examenes': '9a18d11a4e3b2ed259088bedf7eee37c0cbab10cc1bd08467ac17c3b875c85a3',
-  '1x1-sin-nota': 'bd95ddde09ff62b711ee56cdc98f78c8e0cc01272587fbb3261acae0c0238f4a',
+  '1x1-sin-examenes': 'ea011f3b0f133e1172644c041afbe0a9729a84974da1a269ba8b3889c72ced94',
+  '1x1-sin-nota': '302bd06fa3debd818fb6ecdee3612a0393a73499849bc8397cfaa60147f3fcab',
 };
 const QUICK = ['multi-h5p', '1x1-sin-examenes', '1x1-sin-nota'];
 const ALL = process.argv.includes('--all');

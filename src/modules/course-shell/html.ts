@@ -346,7 +346,7 @@ export function link(
 /**
  * r77 (mobile-first): enlace SOLO en su renglón (descargas): área táctil ≥ 44 px de alto en los dos regímenes.
  * El padding vertical del <a> en línea agranda su área de toque y el del párrafo reserva ese mismo espacio en el flujo
- * (13 + ≈ 18–22 + 13 px), así el área no tapa el renglón vecino. Mismo color y peso que `link()`.
+ * (14 + ≈ 17–22 + 14 px; con las fuentes de Linux la línea mide 17 px), así el área no tapa el renglón vecino. Mismo color y peso que `link()`.
  */
 export function blockLink(h: Hx, href: string, text: string, s: Surf, opts: { target?: '_blank'; margin?: string; fontSize?: number } = {}): string {
   const c = h.t.color;
@@ -354,8 +354,8 @@ export function blockLink(h: Hx, href: string, text: string, s: Surf, opts: { ta
   const col = [c.accentStrong, c.accent, s.fg].find((x) => contrastRatio(x, s.bg) >= MIN_CONTRAST) ?? s.fg;
   const fs: Decl[] = opts.fontSize ? [['font-size', opts.fontSize]] : [];
   return (
-    `<p${st(h, [['margin', opts.margin ?? '0'], ['padding', '13px 0'], ['color', s.fg2], ...fs, ['line-height', '1.4']])}>` +
-    `<a href="${attr(href)}"${tgt}${st(h, [['color', col], ['font-weight', '700'], ['padding', '13px 0']])}>${inlineHtml(text)}</a></p>`
+    `<p${st(h, [['margin', opts.margin ?? '0'], ['padding', '14px 0'], ['color', s.fg2], ...fs, ['line-height', '1.4']])}>` +
+    `<a href="${attr(href)}"${tgt}${st(h, [['color', col], ['font-weight', '700'], ['padding', '14px 0']])}>${inlineHtml(text)}</a></p>`
   );
 }
 

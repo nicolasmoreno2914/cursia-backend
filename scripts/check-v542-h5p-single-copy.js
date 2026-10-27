@@ -236,7 +236,7 @@ const BS_CFG = {
     // contra 17dc7b0 (work/r60/A/golddiff.js): SOLO cambian 4 label.xml (1004, 1009, 1017, 1023) y, normalizando esos
     // enlaces, son idénticos. Dorado r55 (3.14.0–3.15.1): 68a4c756….
     // r77 (3.17.0): dorado recalculado a propósito (solo estilos de botones y enlaces de descarga; mismo texto y archivos).
-    eq(sha(r.mbz), '3a81855d386343852d866595308a38f21f6a4da303ad210c9e2a682fe4dfc385', 'sha256');
+    eq(sha(r.mbz), 'ab7ea1d293ad50b30c9820ae94dc12c4834af5a16189dafdb18c71907a35ca07', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);
