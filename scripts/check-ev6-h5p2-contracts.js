@@ -55,6 +55,9 @@ const FULL_LIBS = argLibs >= 0 ? process.argv[argLibs + 1] : process.env.H5P_LIB
  * Huellas sha256 de los paquetes LEGACY capturadas en el commit base (origin/staging bf44a9f,
  * antes de H5P v2) con `node scripts/lib/h5p2-golden-legacy.js`. H5P v2 no puede cambiar ni un byte.
  */
+// r77 (builder 3.17.0, mobile-first): los 5 .mbz recalculados a propósito (mismos valores que check-ev6-h5p2-wire.js); frente
+// a c820d4e solo cambian los estilos de los botones (la píldora es el <a>) y de las descargas — diff por entrada del zip: mismo
+// texto, etiquetas, enlaces y archivos. Los paquetes H5P no cambian. Dorados 3.16.0: 046edade…, 26f7f230…, 62c4bc0f…, 139dd659…, 5fa5fafe….
 const GOLDEN = {
   h5p: {
     questionset: 'e9c32ce89c9d141d7b3e2e89370b136d831816c4e662cad005dd24222a9fa80a',
@@ -103,11 +106,11 @@ const GOLDEN = {
   // Dorados r55 (fd67337): h5p-final-light 0892ae20…, scorm-nofinal-dark 5feee6eb…, h5p-nofinal-dark-mock-cleansafe
   // ee6da148…, scorm-final-light 92007263…, h5p-ev5c-rules1 df1ee128….
   mbz: {
-    'h5p-final-light': '046edade710990caf80bc5cc95ef429f9cac34f40302a603bd6505d1c32f160b',
-    'scorm-nofinal-dark': '26f7f2305bf0374f1ae096864394d129a60200abb9d0c5034ad717eca4ce4981',
-    'h5p-nofinal-dark-mock-cleansafe': '62c4bc0fd080d9dff4760fb15dcd011c3901f8e5c2d1ac086f8862b1206c9bcd',
-    'scorm-final-light': '139dd6593462e631095352c008facc90752731fb5ce986dbea675676a62263f1',
-    'h5p-ev5c-rules1': '5fa5fafe5a423c35998268763ccd0a70514fdcf699b52c200a18d848f0483e53',
+    'h5p-final-light': '6cbd25c82ab6036601da6d9d9f1baa33a56a59ba8dd8ae1a1b73c696d641b24d',
+    'scorm-nofinal-dark': '12f2bed387fdf487bd6ab71c2d77bf4665eaf730ad54d913fe3bf4109eb2a601',
+    'h5p-nofinal-dark-mock-cleansafe': '8905615d47ba3e48e7660a09bcb095043f07a50d8886a6f2c2520a8a067f248a',
+    'scorm-final-light': '3eb28019e9c396f1344229a7128fa10a1d1149b09c444f0812c4e0ee939d5da7',
+    'h5p-ev5c-rules1': 'b29a17154e00ca61f6ade99ddbd7ad365482463552b13e0f3dddaeb5252a21df',
   },
 };
 
