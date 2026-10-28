@@ -9,6 +9,7 @@ import { GenerationManifestV1, buildGenerationManifestV3 } from '../generation-m
 import { activityTypeRulesForNextManifest } from '../generation-manifests/manifest-rules-config';
 import { canonicalContextHash } from '../dynamic-generation/run-hash';
 import { providerPlanFor, runPedagogyDryRun } from '../pedagogy/dry-run';
+import { loadDryRunPricing } from '../finops/dry-run-pricing';
 import { profileTargetHours } from '../pedagogy/pedagogy-profile';
 import type { ProposedModule } from '../study-time/distributor';
 import { estimateCourseStudyTime } from '../study-time/time-model';
@@ -116,7 +117,7 @@ export class ChangeImpactService {
       return {
         available: false as const, reason: 'NO_PREVIOUS_RUN', dryRun: true, providersCalled: 0, spendUsd: '0.00',
         message: 'El curso todavía no se generó: no hay nada que conservar. Generarlo completo costaría lo estimado.',
-        fullGeneration: providerPlanFor(manifestB),
+        fullGeneration: providerPlanFor(manifestB, { pricing: await loadDryRunPricing(this.dataSource) }),
         hours: estimateCourseStudyTime(studyTimeInputFromManifest(manifestB, to), timeModelConfigOf(to)).courseEstimatedHours,
         distribution,
         dependencies: dependencyTable(),
@@ -136,6 +137,8 @@ export class ChangeImpactService {
       plan,
       to: { blueprint: to, manifest: manifestB, studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifestB, to), timeModelConfigOf(to)) },
       from: { manifest: manifestA.manifest as GenerationManifestV1, studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifestA.manifest as GenerationManifestV1, blueprintA), timeModelConfigOf(blueprintA)) },
+      // r79 (F2): los mismos precios que la «Estimación de producción».
+      pricing: await loadDryRunPricing(this.dataSource),
     });
     return {
       available: true as const,

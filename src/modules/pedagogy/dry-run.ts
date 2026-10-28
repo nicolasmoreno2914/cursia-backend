@@ -22,6 +22,8 @@ import {
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { createHash } from 'crypto';
 import { estimateCost } from '../finops/estimator';
+import type { RetryPolicy } from '../finops/estimator';
+import type { PricingCatalogRow } from '../finops/pricing';
 import type { DistributorRequirementConstraints } from '../academic-context/requirements/requirement-authority';
 import { DeclaredHoursInput, DistributionResult, HoursReport, buildHoursReport, distributeCourseHours, estimateCourseStudyTime, estimateCourseStudyTimeDetailed, StudyTimeEstimate, studyTimeInputFromManifest, timeModelConfigOf } from '../study-time';
 import { ITEM_TYPE_OPERATIONS, isFinopsItemType, providerOfOperation } from '../finops/operations';
@@ -42,7 +44,7 @@ import {
   proposeStructureAdjustments,
 } from './pedagogical-blueprint';
 import { ItemPedagogyBrief, OverrideLevel, PEDAGOGY_GENERATOR_COVERAGE, buildItemPedagogyBrief } from './generator-directives';
-import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileDesignPreferences, profileHoursModel, profileTargetHours } from './pedagogy-profile';
+import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProfile, profileApplicationContext, profileContentChaptersMax, profileDesignPreferences, profileHoursModel, profileTargetHours } from './pedagogy-profile';
 import { LearningType, PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 import { ChapterLearningTypeDesign, LEARNING_TYPE_LABELS, classifyLearningType, learningTypeJustification } from './learning-type';
 import { defaultFrameworkRegistry, frameworkSlotLabels } from './instructional-frameworks';
@@ -113,7 +115,31 @@ export interface DryRunInput {
    * `hoursModel` en el perfil, el resultado no lleva la clave (salida byte a byte la de antes).
    */
   hoursReport?: boolean | { declared?: DeclaredHoursInput | null };
+  /**
+   * r79 (F2 · una sola cifra de costo): catálogo de precios y política de reintentos con los que se estima el costo. Los
+   * servicios pasan los MISMOS que usa la «Estimación de producción» (`pricing_catalog` de la base y
+   * `readEstimateRetryPolicy`). Ausente = el seed versionado con 1 reintento (lógica pura de siempre: checks y goldens).
+   */
+  pricing?: DryRunPricing | null;
+  /**
+   * r79 · búsqueda del ajuste al presupuesto: omite lo que NO entra en `distribution` (briefs de los generadores, toggles
+   * del curso, lint de objetivos y alineación del diseño actual). `distribution` sale idéntica (lo prueba
+   * check-r79-budget-fit.js). Ausente = salida completa de siempre.
+   */
+  distributionOnly?: boolean;
 }
+
+/** r79 (F2): precios de la estimación en seco. `source` dice de dónde salió el catálogo (se informa en la respuesta). */
+export interface DryRunPricing {
+  catalog: readonly PricingCatalogRow[];
+  retryPolicy: RetryPolicy;
+  /** Instante de los precios (las filas vigentes en ese momento); ausente = filas abiertas. */
+  asOf?: string | Date | null;
+  source: 'pricing_catalog' | 'seed_fallback';
+}
+
+/** r79 · Gamma: texto obligatorio de toda estimación que depende de Gamma mientras su precio no esté verificado. */
+export const GAMMA_PROVISIONAL_LABEL = 'estimación provisional (precio de Gamma sin verificar)';
 
 export interface ProviderPlan {
   /** Por proveedor: operaciones que se ejecutarían al generar (nada se ejecuta en el dry-run). */
@@ -128,6 +154,15 @@ export interface ProviderPlan {
   byCategory?: { audiovisual: string; application: string; text: string };
   unverifiedProviders?: string[];
   assumptions?: string[];
+  /** r79 (F2): de dónde salieron los precios (SOLO si se pasaron precios; sin ellos, la salida de siempre). */
+  pricingSource?: DryRunPricing['source'];
+  /**
+   * r79 · Gamma: la estimación depende de Gamma y su precio por crédito no está verificado (SOLO si se pasaron precios).
+   * Mientras sea así, la cifra se rotula como provisional y no es una estimación comercial definitiva.
+   */
+  provisionalPricing?: { gamma: boolean; label: string | null };
+  /** r79: esperado (USD) y cantidad por tipo de item (SOLO si se pasaron precios): explica el costo mínimo. */
+  byItemType?: Record<string, { expected: string; items: number }>;
 }
 
 /** LOOP 7: categoría de costo visible de un tipo de item (fuente única para panel, impacto y modal). */
@@ -230,6 +265,8 @@ export interface DryRunResult {
   distribution: (DistributionResult & {
     materialized: DistributionMaterialized;
     proposalSha256: string;
+    /** r79: tope de capítulos de contenido por módulo que fijó el ajuste al presupuesto (solo si existe). */
+    contentChaptersMax?: number;
     /** T3 (r57): mezcla de práctica del plan de aprendizaje (solo si está configurada). */
     practiceMix?: Pick<PracticeMixEvaluation, 'status' | 'ruleId' | 'plan' | 'fit' | 'notes'>;
   }) | null;
@@ -426,10 +463,13 @@ function alignmentOf(s: DryRunSide, extras: DryRunInput['alignment'], registry: 
  * Fase 2 · «Aplicar diseño»: huella de la propuesta (estructura + actividades + preferencias). El servidor recalcula
  * la propuesta al aplicar y exige la MISMA huella que vio el docente (si la estructura o el perfil cambiaron, 409).
  */
-export function distributionProposalSha256(dist: DistributionResult): string {
+export function distributionProposalSha256(dist: DistributionResult, extra?: { contentChaptersMax?: number | null } | null): string {
   const canon = {
     targetHours: dist.targetHours,
     preferences: dist.preferences,
+    // r79: el tope de capítulos de contenido por módulo del ajuste al presupuesto entra a la huella SOLO si existe (sin él,
+    // la huella de siempre: ninguna propuesta aprobada cambia).
+    ...(extra && typeof extra.contentChaptersMax === 'number' ? { contentChaptersMax: extra.contentChaptersMax } : {}),
     modules: dist.modules.map((m) => ({
       id: m.id,
       // Loop 9 B: la práctica guiada entra a la huella solo si el capítulo la tiene (las propuestas sin ella, huella de siempre).
@@ -565,9 +605,31 @@ export function withHoursModel(s: BlueprintSnapshotV2, hoursModel: unknown): Blu
 }
 
 /** El mismo snapshot con `course.targetHours` (pasa por el builder: orden canónico y validación). */
+/**
+ * r79 · El tope de capítulos de contenido por módulo del ajuste al presupuesto como restricción del distribuidor: el
+ * máximo más bajo entre el del documento y el tope, y nunca por debajo del mínimo que exige el documento (los contenidos
+ * del documento no se recortan por presupuesto). Sin tope, las restricciones de siempre (mismo objeto).
+ */
+export function withContentChaptersCap(rq: DistributorRequirementConstraints | null, cap: number | null, modules?: number): DistributorRequirementConstraints | null {
+  if (cap === null) return rq;
+  const docMin = rq?.contentChaptersPerModule?.min ?? 0;
+  const docMax = rq?.contentChaptersPerModule?.max;
+  const max = Math.max(docMin, docMax !== undefined ? Math.min(docMax, cap) : cap);
+  const base: DistributorRequirementConstraints = rq ? { ...rq } : { sources: {} };
+  // Con el tope, la forma (módulos actuales × hasta N contenidos) queda fija para el distribuidor: la diferencia de horas
+  // se completa con lo que el distribuidor ya hace con una forma fija (capítulos de práctica, Actividades de Aplicación y
+  // ejercicios guiados, cada uno con su especificación), nunca agregando módulos ni alargando tiempos.
+  return { ...base, contentChaptersPerModule: { ...(rq?.contentChaptersPerModule ?? {}), max }, ...(typeof rq?.modulesFixed !== 'number' && typeof modules === 'number' ? { modulesFixed: modules } : {}) };
+}
+
 export function withTargetHours(s: BlueprintSnapshotV2, targetHours: number | null): BlueprintSnapshotV2 {
   const rows = snapshotV2ToRows(s);
   return buildBlueprintSnapshotV2({ ...rows.course, targetHours }, rows.modules, rows.chapters, rows.pedagogy);
+}
+
+/** r79: los precios del seed como `DryRunPricing` (lo que usa la lógica pura cuando la base no responde). */
+export function seedPricing(): DryRunPricing {
+  return { catalog: seedCatalog(), retryPolicy: { maxRetries: 1 }, asOf: null, source: 'seed_fallback' };
 }
 
 let catalogCache: any[] | null = null;
@@ -580,7 +642,9 @@ function seedCatalog(): any[] {
 }
 
 /** Proveedores y operaciones que dispararía el Manifest + estimación con el seed de precios (sin DB, sin red). */
-export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverageItems?: GenerationManifestV1['items'] }): ProviderPlan {
+export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverageItems?: GenerationManifestV1['items']; pricing?: DryRunPricing | null }): ProviderPlan {
+  const pricing = opts?.pricing ?? null;
+  const catalog = pricing ? pricing.catalog : seedCatalog();
   const byProvider: ProviderPlan['byProvider'] = {};
   for (const it of manifest.items) {
     if (!isFinopsItemType(it.type)) continue;
@@ -598,10 +662,12 @@ export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverag
   const sorted: ProviderPlan['byProvider'] = {};
   for (const k of Object.keys(byProvider).sort()) sorted[k] = byProvider[k];
   let estimateUsd: ProviderPlan['estimateUsd'] = null;
-  let estimateNote = 'Estimación con los precios del seed versionado (pricing-seed.v1) y el modelo de uso v1. Nada se ejecuta ni se cobra en el dry-run.';
+  let estimateNote = pricing && pricing.source === 'pricing_catalog'
+    ? 'Estimación con el catálogo de precios vigente (el mismo de la «Estimación de producción») y el modelo de uso v1. Nada se ejecuta ni se cobra en el dry-run.'
+    : 'Estimación con los precios del seed versionado (pricing-seed.v1) y el modelo de uso v1. Nada se ejecuta ni se cobra en el dry-run.';
   try {
     const items = estimateItemsForRun(manifest.items, 'real', null, opts?.coverageItems ? { coverageItems: opts.coverageItems } : null);
-    const est = estimateCost({ items, catalog: seedCatalog(), usageModel: usageModelPriorsV1(), retryPolicy: { maxRetries: 1 } });
+    const est = estimateCost({ items, catalog, usageModel: usageModelPriorsV1(), retryPolicy: pricing ? pricing.retryPolicy : { maxRetries: 1 }, ...(pricing && pricing.asOf ? { pricingAsOf: pricing.asOf } : {}) });
     const byP: Record<string, string> = {};
     for (const k of Object.keys(est.totals.byProvider).sort()) byP[k] = est.totals.byProvider[k].expected;
     estimateUsd = { min: est.totals.min, expected: est.totals.expected, max: est.totals.max, byProvider: byP };
@@ -611,15 +677,28 @@ export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverag
     for (const l of est.lines) {
       // Los multiplicadores de caché son derivados (×1,25 / ×0,1 de la tarifa verificada) y de peso marginal: no
       // vuelven «provisional» a un proveedor cuyas tarifas principales están verificadas.
+      // r79: la fila USADA (las líneas copian su verificación); sin precios propios, el seed como siempre.
+      if (pricing) {
+        const used = (l as { pricingVersions?: string[] }).pricingVersions ?? [];
+        const rows = catalog.filter((r) => r.provider === l.provider && r.product_or_model === l.product && !/^cache_/.test(String(r.meter)) && used.includes(String(r.pricing_version)));
+        if (!rows.length || rows.some((r) => r.verified !== true)) unverified.add(l.provider);
+        continue;
+      }
       const rows = seedCatalog().filter((r) => r.provider === l.provider && r.product_or_model === l.product && !/^cache_/.test(String(r.meter)));
       if (rows.some((r) => r.verified !== true)) unverified.add(l.provider);
     }
     const unverifiedProviders = [...unverified].sort();
+    const gammaProvisional = !!pricing && unverifiedProviders.includes('gamma') && Number(est.totals.byProvider.gamma?.expected ?? 0) > 0;
     return {
       byProvider: sorted, estimateUsd, estimateNote,
       byCategory: { audiovisual: cat.audiovisual.toFixed(2), application: cat.application.toFixed(2), text: cat.text.toFixed(2) },
       unverifiedProviders,
-      assumptions: [...ESTIMATE_ASSUMPTIONS, ...(unverifiedProviders.length ? [`Tarifa provisional (no verificada con la factura) para: ${unverifiedProviders.join(', ')}.`] : [])],
+      assumptions: [...ESTIMATE_ASSUMPTIONS, ...(unverifiedProviders.length ? [`Tarifa provisional (no verificada con la factura) para: ${unverifiedProviders.join(', ')}.`] : []),
+        ...(gammaProvisional ? [`Es una ${GAMMA_PROVISIONAL_LABEL}: no es una estimación comercial definitiva.`] : [])],
+      ...(pricing ? {
+        pricingSource: pricing.source, provisionalPricing: { gamma: gammaProvisional, label: gammaProvisional ? GAMMA_PROVISIONAL_LABEL : null },
+        byItemType: Object.fromEntries(Object.keys(est.totals.byItemType).sort().map((t) => [t, { expected: est.totals.byItemType[t].expected, items: items.filter((i) => i.itemType === t).length }])),
+      } : {}),
     };
   } catch (e) {
     estimateNote = `Sin estimación de costo: ${(e as Error).message}`;
@@ -627,7 +706,7 @@ export function providerPlanFor(manifest: GenerationManifestV1, opts?: { coverag
   return { byProvider: sorted, estimateUsd, estimateNote };
 }
 
-function side(snapshot: BlueprintSnapshotV2, activityTypeRules: ActivityTypeRulesVersion): DryRunSide {
+function side(snapshot: BlueprintSnapshotV2, activityTypeRules: ActivityTypeRulesVersion, pricing: DryRunPricing | null = null, skipCost = false): DryRunSide {
   const sha = snapshotSha256V2(snapshot);
   const source: ManifestSource = { courseId: snapshot.course.id, ...DRY_RUN_SOURCE_BASE, blueprintSha256: sha };
   const manifest = buildGenerationManifestV3(snapshot, source, { activityTypeRules });
@@ -637,7 +716,7 @@ function side(snapshot: BlueprintSnapshotV2, activityTypeRules: ActivityTypeRule
     manifest,
     manifestSha256: manifestSha256(manifest),
     manifestErrors: validateGenerationManifestV3(manifest, snapshot, source),
-    providers: providerPlanFor(manifest),
+    providers: skipCost ? { byProvider: {}, estimateUsd: null, estimateNote: 'Sin estimación: búsqueda del ajuste al presupuesto (solo se estima el diseño propuesto).' } : providerPlanFor(manifest, pricing ? { pricing } : undefined),
     studyTime: estimateCourseStudyTime(studyTimeInputFromManifest(manifest, snapshot), timeModelConfigOf(snapshot)),
   };
 }
@@ -672,7 +751,9 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   const profile = profileEmpty ? null : normalizePedagogicalProfile(input.profile, registry);
   const rules = profile ? deriveDesignRulesOrNull(profile, registry) : null;
 
-  const baseline = side(base, activityTypeRules);
+  const pricing = input.pricing ?? null;
+  const lite = input.distributionOnly === true;
+  const baseline = side(base, activityTypeRules, pricing, lite);
   let pedagogical: DryRunSide | null = null;
   let structureChanges: StructureChange[] = [];
   if (rules) {
@@ -682,7 +763,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       shaped = proposal.snapshot;
       structureChanges = proposal.changes;
     }
-    pedagogical = side(applyPedagogyToSnapshot(shaped, rules), activityTypeRules);
+    pedagogical = side(applyPedagogyToSnapshot(shaped, rules), activityTypeRules, pricing, lite);
   }
 
   const view = pedagogical ?? baseline;
@@ -764,7 +845,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
 
   // Fase 4: la alineación del diseño ACTUAL se mide sobre lo que el lock congelaría hoy (estructura viva + diseño), no
   // sobre la vista con los cambios de estructura sugeridos (esos no se aplican solos y ocultarían vacíos reales).
-  const alignment = base.course.academicContext
+  const alignment = base.course.academicContext && !lite
     ? alignmentOf(rules ? side(applyPedagogyToSnapshot(base, rules), activityTypeRules) : baseline, input.alignment, registry)
     : undefined;
   const learningPlan = (() => {
@@ -808,10 +889,14 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       const mix = mixSpec
         ? evaluatePracticeMix(mixSpec, [...lockShaped.modules].sort((a, b) => a.position - b.position), input.requirementConstraints ?? null)
         : null;
-      const requirements = mix ? mix.constraints : input.requirementConstraints ?? null;
+      // r79 · ajuste al presupuesto: tope de capítulos de contenido por módulo (preferencia del perfil). Va como un máximo
+      // más de las restricciones (nunca por debajo del mínimo del documento: ver withContentChaptersCap); sin la preferencia,
+      // las restricciones de siempre (byte a byte).
+      const contentCap = profileContentChaptersMax(input.profile);
+      const requirements = withContentChaptersCap(mix ? mix.constraints : input.requirementConstraints ?? null, contentCap, lockShaped.modules.length);
       const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}) });
       const materialized = materializeOrError(lockShaped, dist, (plain) => {
-        const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules);
+        const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules, pricing);
         materializedSide = ms;
         // F1 (r57): con plan de aprendizaje, la decisión de actividad que ve el docente sale del Manifest materializado
         // (con los capítulos de práctica incluidos), no de la estructura previa: fuente única = lo que se congela.
@@ -849,7 +934,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       }, appContext);
       // Fase 2 · «Aplicar diseño»: huella de la propuesta que ve el docente (el servidor la recalcula al aplicar).
       const mixView = mix ? { practiceMix: { status: mix.status, ruleId: mix.ruleId, plan: mix.plan, fit: mix.fit, notes: [...mix.notes] } } : {};
-      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist), ...mixView };
+      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist, contentCap !== null ? { contentChaptersMax: contentCap } : null), ...mixView, ...(contentCap !== null ? { contentChaptersMax: contentCap } : {}) };
     })(),
     workload: targetHours === null
       ? null
@@ -861,7 +946,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     baseline,
     pedagogical,
     structureChanges,
-    objectives: rules ? lintObjectives(view.blueprint, rules) : [],
+    objectives: rules && !lite ? lintObjectives(view.blueprint, rules) : [],
     modules,
     chapters,
     assessment: ped
@@ -881,8 +966,8 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
       summary,
     },
     appliedRules: rules ? rules.applied : [],
-    generators: pedagogical ? generatorPlanFor(pedagogical, registry) : [],
-    courseOverrides: pedagogical ? courseOverridesFor(pedagogical.blueprint) : [],
+    generators: pedagogical && !lite ? generatorPlanFor(pedagogical, registry) : [],
+    courseOverrides: pedagogical && !lite ? courseOverridesFor(pedagogical.blueprint) : [],
   };
   if (!wantHoursReport) return out;
   // r58 (I3): el registro de horas del diseño que se congelaría (propuesta materializada; si no hay, la vista final).

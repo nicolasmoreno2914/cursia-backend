@@ -19,6 +19,7 @@ import {
 import type { Response } from 'express';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
+import { GammaPriceError } from './pricing-catalog-db';
 import { CurrentUser } from '../../auth/current-user.decorator';
 import type { AuthUser } from '../../auth/auth.types';
 import { FinopsLedgerService, TTS_RESERVATION_KEY_RE } from './finops-ledger.service';
@@ -367,6 +368,33 @@ export class FinopsAdminController {
         createdAt: row.created_at,
       };
     } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // ── r79 · Gamma: precio del crédito (solo SuperAdmin: guard de la clase) ─────────────────────────────
+  // GET /api/v1/finops/pricing/gamma → { current: {plan, pricePaidUsd, creditsIncluded, unitPriceUsd, verified, …} | null, history }
+  @Get('pricing/gamma')
+  async gammaPrice() {
+    try {
+      return await this.budget.gammaPrice();
+    } catch (err) {
+      throw finopsErrorToHttp(err);
+    }
+  }
+
+  // POST /api/v1/finops/pricing/gamma { plan, pricePaidUsd, creditsIncluded, verified, note? } → fila NUEVA del catálogo
+  // (append-only: nunca se edita una fila). Mientras verified sea false, toda estimación con Gamma es «provisional».
+  @Post('pricing/gamma')
+  @HttpCode(HttpStatus.CREATED)
+  async setGammaPrice(@Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
+    const actor = String(user?.id || '').trim();
+    if (!actor) throw new BadRequestException('sin identidad del admin');
+    try {
+      return await this.budget.setGammaPrice(body, actor);
+    } catch (err) {
+      if (err instanceof GammaPriceError) throw new BadRequestException({ code: 'gamma_price_invalid', message: err.message });
+      if ((err as { code?: string })?.code === '23505') throw new ConflictException({ code: 'gamma_price_conflict', message: 'otro precio se guardó a la vez; vuelve a leerlo y reintenta' });
       throw finopsErrorToHttp(err);
     }
   }
