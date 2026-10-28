@@ -1,3 +1,4 @@
+import { ApplicationKind, applicationKindProblem, isApplicationKind } from '../study-time/application-kind-tiers';
 import { createHash } from 'crypto';
 import { isApplicationMinutes } from '../study-time/application-tiers';
 import { GUIDED_PRACTICE_TIERS, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
@@ -356,6 +357,12 @@ export interface RawChapterRowV2 extends RawChapterRow {
    */
   application_minutes?: number | null;
   /**
+   * r79.1 · Tipo de la Actividad de Aplicación (course_chapters.application_kind): ausente/null = la de siempre;
+   * case_study (contenido) · integrative_project / formative_feedback (práctica). Exige application_minutes en un nivel
+   * del tipo (study-time/application-kind-tiers.ts).
+   */
+  application_kind?: string | null;
+  /**
    * Loop 9 B · Práctica guiada: minutos de la práctica guiada del capítulo (course_chapters.guided_practice_minutes).
    * Ausente/null/0 = sin práctica guiada; 40/60/80/120 = niveles. SOLO en capítulos de contenido.
    */
@@ -399,6 +406,23 @@ function guidedPracticeErrors(chapters: { id: string; minutes: unknown; kind: Ch
     } else if (typeof g === 'number' && c.kind === 'practice') {
       errors.push({ path: pathOf(i), code: 'GUIDED_PRACTICE_IN_PRACTICE_CHAPTER', message: `El capítulo de práctica ${c.id} no puede tener práctica guiada (solo los capítulos de contenido)` });
     }
+  });
+  return errors;
+}
+
+/** r79.1: tipo de la Actividad de Aplicación (undefined = la de siempre). */
+function rawApplicationKind(v: unknown): ApplicationKind | undefined {
+  return v === undefined || v === null || v === '' ? undefined : isApplicationKind(v) ? v : (v as ApplicationKind);
+}
+/** r79.1: el tipo exige una Actividad en un nivel del tipo y el tipo de capítulo que le corresponde. */
+function applicationKindErrors(chapters: { id: string; kind: unknown; minutes: unknown; chapterKind: ChapterKind | null }[], pathOf: (i: number) => string): BlueprintValidationError[] {
+  const errors: BlueprintValidationError[] = [];
+  chapters.forEach((c, i) => {
+    const k = rawApplicationKind(c.kind);
+    if (k === undefined) return;
+    const m = rawApplicationMinutes(c.minutes);
+    const why = applicationKindProblem(k, typeof m === 'number' ? m : null, c.chapterKind === 'practice' ? 'practice' : 'content');
+    if (why) errors.push({ path: pathOf(i), code: 'INVALID_APPLICATION_KIND', message: `El capítulo ${c.id}: ${why}` });
   });
   return errors;
 }
@@ -555,6 +579,8 @@ export interface BlueprintChapterV2 extends BlueprintChapter {
    * su sha). Minutos de trabajo del estudiante (30/60/90/120): entran al tiempo del capítulo y del curso.
    */
   applicationMinutes?: number;
+  /** r79.1: SOLO en capítulos cuya Actividad de Aplicación tiene un tipo nuevo (sin él, sha de siempre). */
+  applicationKind?: ApplicationKind;
   /**
    * Loop 9 B · Práctica guiada (formativa, sin nota): SOLO en capítulos de CONTENIDO que la tienen (los demás no llevan
    * la clave y conservan su sha). Minutos 40/60/80/120: entran al tiempo del capítulo («Práctica y repaso»).
@@ -679,6 +705,8 @@ export function buildBlueprintSnapshotV2(
   if (kindErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${kindErrors.map((e) => e.message).join('; ')}`);
   const appErrors = applicationErrors(chapters.map((c) => ({ id: c.id, minutes: c.application_minutes })), (i) => `chapters[${i}].application_minutes`);
   if (appErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${appErrors.map((e) => e.message).join('; ')}`);
+  const akErrors = applicationKindErrors(chapters.map((c) => ({ id: c.id, kind: c.application_kind, minutes: c.application_minutes, chapterKind: rawChapterKind(c.chapter_kind) })), (i) => `chapters[${i}].application_kind`);
+  if (akErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${akErrors.map((e) => e.message).join('; ')}`);
   const gpErrors = guidedPracticeErrors(chapters.map((c) => ({ id: c.id, minutes: c.guided_practice_minutes, kind: rawChapterKind(c.chapter_kind) })), (i) => `chapters[${i}].guided_practice_minutes`);
   if (gpErrors.length) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: ${gpErrors.map((e) => e.message).join('; ')}`);
   // Fase 3: el contexto académico congelado y los vínculos de cada capítulo (que solo pueden apuntar a él).
@@ -755,6 +783,7 @@ export function buildBlueprintSnapshotV2(
           activityEnabled: c.activity_enabled,
           ...(rawChapterKind(c.chapter_kind) === 'practice' ? { kind: 'practice' as const } : {}),
           ...(typeof rawApplicationMinutes(c.application_minutes) === 'number' ? { applicationMinutes: rawApplicationMinutes(c.application_minutes) as number } : {}),
+          ...(rawApplicationKind(c.application_kind) !== undefined ? { applicationKind: rawApplicationKind(c.application_kind) as ApplicationKind } : {}),
           ...(typeof rawGuidedPracticeMinutes(c.guided_practice_minutes) === 'number' ? { guidedPracticeMinutes: rawGuidedPracticeMinutes(c.guided_practice_minutes) as number } : {}),
           ...(Array.isArray(rawOutcomeIds(c.outcome_ids)) ? { outcomeIds: sortOutcomeIds(rawOutcomeIds(c.outcome_ids) as string[]) } : {}),
           ...(pedagogy ? { design: canonicalChapterDesign(pedagogy.chapters[c.id], `chapters[${c.id}].design`) } : {}),
@@ -813,6 +842,7 @@ export function snapshotV2ToRows(s: any): {
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled,
         ...(c.kind !== undefined ? { chapter_kind: c.kind } : {}),
         ...(c.applicationMinutes !== undefined ? { application_minutes: c.applicationMinutes } : {}),
+        ...(c.applicationKind !== undefined ? { application_kind: c.applicationKind } : {}),
         ...(c.guidedPracticeMinutes !== undefined ? { guided_practice_minutes: c.guidedPracticeMinutes } : {}),
         ...(c.outcomeIds !== undefined ? { outcome_ids: c.outcomeIds } : {}),
       });
@@ -929,6 +959,10 @@ export function validateBlueprintSnapshotV2(s: BlueprintSnapshotV2): BlueprintVa
     m.chapters.map((c) => ({ id: c.id, minutes: (c as { applicationMinutes?: unknown }).applicationMinutes })),
     (ci) => `modules[${mi}].chapters[${ci}].applicationMinutes`,
   )));
+  s.modules.forEach((m, mi) => errors.push(...applicationKindErrors(
+    m.chapters.map((c) => ({ id: c.id, kind: (c as { applicationKind?: unknown }).applicationKind, minutes: (c as { applicationMinutes?: unknown }).applicationMinutes, chapterKind: rawChapterKind((c as { kind?: unknown }).kind) })),
+    (ci) => `modules[${mi}].chapters[${ci}].applicationKind`,
+  )));
   s.modules.forEach((m, mi) => errors.push(...guidedPracticeErrors(
     m.chapters.map((c) => ({ id: c.id, minutes: ((v) => (v === 0 ? 'clave con 0' : v))((c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes), kind: rawChapterKind((c as { kind?: unknown }).kind) })),
     (ci) => `modules[${mi}].chapters[${ci}].guidedPracticeMinutes`,
@@ -990,6 +1024,7 @@ export function validateBlueprintInputV2(
     (mi, ci) => `modules[${mi}].chapters[${ci}]`,
   ));
   errors.push(...applicationErrors(chapters.map((c) => ({ id: c.id, minutes: c.application_minutes })), (i) => `chapters[${i}].application_minutes`));
+  errors.push(...applicationKindErrors(chapters.map((c) => ({ id: c.id, kind: c.application_kind, minutes: c.application_minutes, chapterKind: rawChapterKind(c.chapter_kind) })), (i) => `chapters[${i}].application_kind`));
   errors.push(...guidedPracticeErrors(chapters.map((c) => ({ id: c.id, minutes: c.guided_practice_minutes, kind: rawChapterKind(c.chapter_kind) })), (i) => `chapters[${i}].guided_practice_minutes`));
   let actx: AcademicBlueprintContext | null = null;
   try {

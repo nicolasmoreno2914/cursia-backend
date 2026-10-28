@@ -171,7 +171,7 @@ export function applyProposalToRows(
         chapters.push({
           id: c.id, module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
           video_enabled: practice ? false : c.videoEnabled, activity_enabled: c.activityEnabled,
-          chapter_kind: practice ? 'practice' : null, application_minutes: c.applicationMinutes, outcome_ids: null,
+          chapter_kind: practice ? 'practice' : null, application_minutes: c.applicationMinutes, application_kind: (c as { applicationKind?: string }).applicationKind ?? null, outcome_ids: null,
           // Loop 9 B: la práctica guiada del diseño (solo contenido).
           guided_practice_minutes: practice ? null : c.guidedPracticeMinutes ?? null,
         } as unknown as RawChapterRowV2);
@@ -179,7 +179,7 @@ export function applyProposalToRows(
         const row = byId.get(String(c.id));
         if (!row) return;
         touched.add(String(c.id));
-        chapters.push({ ...row, position: ci, application_minutes: c.applicationMinutes, guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null } as RawChapterRowV2);
+        chapters.push({ ...row, position: ci, application_minutes: c.applicationMinutes, application_kind: (c as { applicationKind?: string }).applicationKind ?? null, guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null } as RawChapterRowV2);
       }
     });
   }

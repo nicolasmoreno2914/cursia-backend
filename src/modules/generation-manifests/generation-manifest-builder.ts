@@ -13,6 +13,7 @@ import {
 } from './activity-type-rules';
 import { chooseActivityTypesV2 } from './activity-type-rules-v2';
 import { isApplicationMinutes } from '../study-time/application-tiers';
+import { ApplicationKind, applicationKindProblem } from '../study-time/application-kind-tiers';
 import { isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 import { sortedCanonicalJson } from '../coherence/canonical-json';
 import { ManifestFeaturesPedagogy, manifestFeaturesPedagogy, manifestItemDesign } from '../pedagogy/manifest-design';
@@ -120,6 +121,8 @@ export interface ManifestChapter {
   kind?: 'practice';
   /** Fase 2: minutos de la Actividad de Aplicación, SOLO en capítulos que la tienen (sin la clave: sha de siempre). */
   applicationMinutes?: number;
+  /** r79.1: tipo de la Actividad de Aplicación, SOLO si el capítulo tiene uno nuevo (sin la clave: sha de siempre). */
+  applicationKind?: ApplicationKind;
   /** Loop 9 B: minutos de la práctica guiada, SOLO en capítulos de contenido que la tienen (sin la clave: sha de siempre). */
   guidedPracticeMinutes?: number;
 }
@@ -160,6 +163,8 @@ export interface ManifestItem {
   design?: Record<string, unknown>;
   /** Fase 2: SOLO en items `application_activity` — minutos de trabajo del estudiante (30/60/90/120). */
   applicationMinutes?: number;
+  /** r79.1: SOLO en items `application_activity` con un tipo nuevo (estudio de caso / proyecto / retroalimentación). */
+  applicationKind?: ApplicationKind;
   /** Loop 9 B: SOLO en items `guided_practice` — minutos de la práctica guiada (40/60/80/120). */
   guidedPracticeMinutes?: number;
 }
@@ -1203,6 +1208,14 @@ export function buildGenerationManifestV3(
         throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo ${c.id} tiene applicationMinutes inválido (${JSON.stringify(appMin)})`);
       }
       const application = isApplicationMinutes(appMin) ? appMin : null;
+      // r79.1: tipo de la Actividad (el Blueprint ya validó nivel y lugar; acá se exige de nuevo: falla fuerte).
+      const akRaw = (c as { applicationKind?: unknown }).applicationKind;
+      if (akRaw !== undefined) {
+        const why = applicationKindProblem(akRaw, application, practice ? 'practice' : 'content');
+        if (why) throw new Error(`BLUEPRINT_V2_INVALID_INPUT: el capítulo ${c.id}: ${why}`);
+      }
+      const appKind: ApplicationKind | null = akRaw !== undefined ? (akRaw as ApplicationKind) : null;
+      const appExtra = appKind ? { applicationKind: appKind } : {};
       // Loop 9 B: práctica guiada (solo contenido; ausente = sin práctica guiada).
       const gpMin = (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes;
       if (gpMin !== undefined && (!isGuidedPracticeMinutes(gpMin) || practice)) {
@@ -1213,6 +1226,7 @@ export function buildGenerationManifestV3(
         chapterId: c.id, position: c.position, chapterNumber, videoEnabled, activityEnabled: c.activityEnabled,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(application !== null ? { applicationMinutes: application } : {}),
+        ...appExtra,
         ...(guided !== null ? { guidedPracticeMinutes: guided } : {}),
       });
       const base = { scope: 'chapter' as const, moduleId: m.id, chapterId: c.id, moduleNumber, chapterNumber };
@@ -1226,7 +1240,7 @@ export function buildGenerationManifestV3(
           items.push({ key: `activity:${c.id}`, type: 'activity', ...base, dependsOn: [...moduleContentKeys], variant, ...(h5pType ? { h5pType } : {}) });
         }
         if (application !== null) {
-          items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [...moduleContentKeys], applicationMinutes: application });
+          items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [...moduleContentKeys], applicationMinutes: application, ...appExtra });
         }
         continue;
       }
@@ -1254,7 +1268,7 @@ export function buildGenerationManifestV3(
         });
       }
       if (application !== null) {
-        items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [contentKey], applicationMinutes: application });
+        items.push({ key: `application_activity:${c.id}`, type: 'application_activity', ...base, dependsOn: [contentKey], applicationMinutes: application, ...appExtra });
       }
       if (guided !== null) {
         items.push({ key: `guided_practice:${c.id}`, type: 'guided_practice', ...base, dependsOn: [contentKey, ...moduleAppKeys], guidedPracticeMinutes: guided });
@@ -1395,6 +1409,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
         activityEnabled: c.activityEnabled,
         ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
         ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
+        ...(c.applicationKind !== undefined ? { applicationKind: c.applicationKind } : {}),
         ...(c.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
       })),
     })),
@@ -1412,6 +1427,7 @@ export function canonicalManifestJsonV3(m: GenerationManifestV1): string {
       // Motor pedagógico V1: claves del diseño ordenadas (independiente del orden de jsonb).
       ...(i.design !== undefined ? { design: JSON.parse(sortedCanonicalJson(i.design)) } : {}),
       ...(i.applicationMinutes !== undefined ? { applicationMinutes: i.applicationMinutes } : {}),
+      ...(i.applicationKind !== undefined ? { applicationKind: i.applicationKind } : {}),
       ...(i.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: i.guidedPracticeMinutes } : {}),
     })),
     // Se copian TODAS las claves que traiga (en orden v3 primero, luego
@@ -1439,6 +1455,8 @@ interface ExpectedItemV3 {
   variant?: ActivityVariant;
   /** Fase 2: solo en application_activity. */
   applicationMinutes?: number;
+  /** r79.1: solo en application_activity con tipo nuevo. */
+  applicationKind?: ApplicationKind;
   /** Loop 9 B: solo en guided_practice. */
   guidedPracticeMinutes?: number;
 }
@@ -1573,6 +1591,9 @@ export function validateGenerationManifestV3(
       // Fase 2: minutos de la Actividad de Aplicación (un valor fuera de los niveles no produce item: lo marca el validador del Blueprint).
       const appRaw = (c as { applicationMinutes?: unknown }).applicationMinutes;
       const appMin = isApplicationMinutes(appRaw) ? appRaw : undefined;
+      // r79.1: tipo de la Actividad (solo si es válido para ese nivel y ese capítulo; si no, lo marca el validador del Blueprint).
+      const akRaw = (c as { applicationKind?: unknown }).applicationKind;
+      const appKind = akRaw !== undefined && appMin !== undefined && !applicationKindProblem(akRaw, appMin, practice ? 'practice' : 'content') ? (akRaw as ApplicationKind) : undefined;
       // Loop 9 B: práctica guiada SOLO en capítulos de contenido (un valor inválido o en práctica no produce item).
       const gpRaw = (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes;
       const gpMin = !practice && isGuidedPracticeMinutes(gpRaw) ? gpRaw : undefined;
@@ -1581,6 +1602,7 @@ export function validateGenerationManifestV3(
         chapterId: c.id, position: c.position, chapterNumber: chNum, videoEnabled: videoOn, activityEnabled: activityOn,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(appMin !== undefined ? { applicationMinutes: appMin } : {}),
+        ...(appKind !== undefined ? { applicationKind: appKind } : {}),
         ...(gpMin !== undefined ? { guidedPracticeMinutes: gpMin } : {}),
       });
       const ch = (type: ManifestItemType, dependsOn: string[], variant?: ActivityVariant): ExpectedItemV3 => ({
@@ -1591,7 +1613,7 @@ export function validateGenerationManifestV3(
         // Motor de carga horaria: capítulo de práctica = experience (+ activity) sobre los content del módulo.
         expected.push(ch('experience', [...modContentAll]));
         if (activityOn) expected.push(ch('activity', [...modContentAll], engine));
-        if (appMin !== undefined) expected.push({ ...ch('application_activity', [...modContentAll]), applicationMinutes: appMin });
+        if (appMin !== undefined) expected.push({ ...ch('application_activity', [...modContentAll]), applicationMinutes: appMin, ...(appKind ? { applicationKind: appKind } : {}) });
         continue;
       }
       const content = `content:${c.id}`;
@@ -1605,7 +1627,7 @@ export function validateGenerationManifestV3(
         } else if (type === 'activity') {
           if (activityOn) expected.push(ch(type, [content], engine));
         } else if (type === 'application_activity') {
-          if (appMin !== undefined) expected.push({ ...ch(type, [content]), applicationMinutes: appMin });
+          if (appMin !== undefined) expected.push({ ...ch(type, [content]), applicationMinutes: appMin, ...(appKind ? { applicationKind: appKind } : {}) });
         } else if (type === 'guided_practice') {
           if (gpMin !== undefined) expected.push({ ...ch(type, [content, ...modAppAll]), guidedPracticeMinutes: gpMin });
         } else expected.push(ch(type, [content]));
@@ -1709,6 +1731,15 @@ export function validateGenerationManifestV3(
       }
     } else if (gotApp !== undefined) {
       errors.push({ code: 'UNEXPECTED_APPLICATION_MINUTES', message: `item ${it.key}: solo los items application_activity llevan applicationMinutes`, key: it.key });
+    }
+    // r79.1: applicationKind SOLO en application_activity e igual al del capítulo del Blueprint.
+    const gotKind = (it as any).applicationKind;
+    if (it.type === 'application_activity') {
+      if (exp && gotKind !== exp.applicationKind) {
+        errors.push({ code: 'WRONG_APPLICATION_KIND', message: `item ${it.key}: applicationKind esperado ${JSON.stringify(exp.applicationKind ?? null)}, encontrado ${JSON.stringify(gotKind ?? null)}`, key: it.key });
+      }
+    } else if (gotKind !== undefined) {
+      errors.push({ code: 'UNEXPECTED_APPLICATION_KIND', message: `item ${it.key}: solo los items application_activity llevan applicationKind`, key: it.key });
     }
     // Loop 9 B: guidedPracticeMinutes SOLO en guided_practice y igual al del capítulo del Blueprint.
     const gotGp = (it as any).guidedPracticeMinutes;
@@ -1822,6 +1853,7 @@ function canonicalModules(mods: ManifestModule[]): unknown {
       activityEnabled: c.activityEnabled,
       ...(c.kind === 'practice' ? { kind: 'practice' as const } : {}),
       ...(c.applicationMinutes !== undefined ? { applicationMinutes: c.applicationMinutes } : {}),
+      ...(c.applicationKind !== undefined ? { applicationKind: c.applicationKind } : {}),
       ...(c.guidedPracticeMinutes !== undefined ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
     })),
   }));

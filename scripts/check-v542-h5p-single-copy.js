@@ -111,7 +111,7 @@ const BS_CFG = {
     }
   }
 
-  await check('builder 3.18.0 (r78: Libro Guía en línea; 3.17.0 = r77 botones móviles; 3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación; 3.15.0 = T1 r57 Libro + vocabulario interno; 3.15.1 = r58 I3 horas objetivo en la bienvenida; 3.16.0 = r60 Moodle mínimo)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.18.0', 'versión'));
+  await check('builder 3.19.0 (r79.1: tipos de Actividad de Aplicación; 3.18.0 = r78 Libro Guía en línea; 3.17.0 = r77 botones móviles; 3.8.0 = una sola copia; 3.9.0 = revisión del quiz; 3.10.0 = retroalimentación global; 3.11.0 = #583 QUAL; 3.12.0 = UX r18; 3.13.0 = r19 Libro Guía PDF + bienvenida W; 3.14.0 = r55 invariantes de calificación; 3.15.0 = T1 r57 Libro + vocabulario interno; 3.15.1 = r58 I3 horas objetivo en la bienvenida; 3.16.0 = r60 Moodle mínimo)', () => eq(B.DYNAMIC_MBZ_BUILDER_VERSION_V3, '3.19.0', 'versión'));
 
   await check('matriz + rules 2: toda h5pactivity tiene UNA sola copia del .h5p (filearea package) y su inforef apunta solo a ella', () => {
     let n = 0;

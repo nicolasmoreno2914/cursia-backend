@@ -39,6 +39,8 @@ export interface PrebriefChapter {
   video: boolean;
   activity: boolean;
   applicationMinutes: number | null;
+  /** r79.1: tipo de la Actividad (estudio de caso / proyecto integrador / retroalimentación formativa); sin la clave = la de siempre. */
+  applicationKind?: string;
   /** Loop 9 B: minutos de la práctica guiada (solo capítulos de contenido que la tienen; sin la clave = sin práctica guiada). */
   guidedPracticeMinutes?: number;
   outcomeIds: string[];
@@ -142,7 +144,7 @@ export interface PrebriefModel {
   evaluation: {
     moduleExams: { module: number; title: string; outcomeIds: string[] }[];
     finalExam: boolean;
-    applicationActivities: { chapter: number; title: string; minutes: number; outcomeIds: string[] }[];
+    applicationActivities: { chapter: number; title: string; minutes: number; outcomeIds: string[]; kind?: string }[];
     fromDocument: { text: string; weightPct: number | null; outcomeIds: string[]; origin: PrebriefOrigin }[];
     /** Nota mínima de aprobación del curso (perfil de evaluación), si está definida. */
     passingGrade: number | null;
@@ -378,6 +380,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
       video: !!c.videoEnabled,
       activity: !!c.activityEnabled,
       applicationMinutes: c.applicationMinutes ? Number(c.applicationMinutes) : null,
+      ...(c.applicationMinutes && typeof c.applicationKind === 'string' && c.applicationKind ? { applicationKind: c.applicationKind } : {}),
       ...(c.kind !== 'practice' && isGuidedPracticeMinutes(Number(c.guidedPracticeMinutes)) ? { guidedPracticeMinutes: Number(c.guidedPracticeMinutes) } : {}),
       outcomeIds: Array.isArray(c.outcomeIds) ? [...c.outcomeIds].map(String).sort() : [],
       proposed: !!c.proposed,
@@ -520,7 +523,7 @@ export function buildPrebriefModel(inp: PrebriefInputs, actualTextOf: (requireme
   const evaluation = {
     moduleExams: modules.filter((m) => m.exam).map((m) => ({ module: m.n, title: m.title, outcomeIds: outcomesOfModule(m) })),
     finalExam,
-    applicationActivities: allCh.filter((c) => c.applicationMinutes).map((c) => ({ chapter: c.n, title: c.title, minutes: c.applicationMinutes as number, outcomeIds: c.outcomeIds })),
+    applicationActivities: allCh.filter((c) => c.applicationMinutes).map((c) => ({ chapter: c.n, title: c.title, minutes: c.applicationMinutes as number, outcomeIds: c.outcomeIds, ...(c.applicationKind ? { kind: c.applicationKind } : {}) })),
     fromDocument: (academic ? academic.evaluation : []).map((e) => ({
       text: clean(e.instrument), weightPct: typeof e.weightPct === 'number' ? e.weightPct : null, outcomeIds: [...(e.outcomeIds || [])].sort(),
       origin: e.status === 'provided' ? 'institution' as const : 'document' as const,

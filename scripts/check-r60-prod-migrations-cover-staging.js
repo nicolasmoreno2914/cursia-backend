@@ -35,8 +35,10 @@ const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
   'migrate-r75-access.js': { sql: 'supabase-migration-r75-access.sql' },
   'migrate-r75-budgets.js': { sql: 'supabase-migration-r75-budgets.sql' },
   'migrate-r75-backfill.js': { sql: null },
+  // r79.1: tipos de Actividad de Aplicación (course_chapters.application_kind), staging-only hasta aprobación del owner.
+  'migrate-r79-1-application-kinds.js': { sql: 'supabase-migration-r79-1-application-kinds.sql' },
 };
-const STAGING_ONLY_REASON = /^r75: staging-only hasta aprobación del owner/;
+const STAGING_ONLY_REASON = /^r(75|79\.1): staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).
 const ORDER_EXCEPTIONS = {
   'supabase-migration-ev6-h5p2.sql': 'courses.review_cards_enabled: columna aditiva independiente (nullable, default false); producción la aplica después de FinOps desde EV6',

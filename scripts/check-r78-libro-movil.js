@@ -193,7 +193,7 @@ const built = {};
       assert(anchors.some((x) => /Leer en el celular/.test(x[2]) && x[1].includes(`$@BOOKVIEWBYID*${book.moduleId}@$`) && !/target=/.test(x[1])), `${s.key}: botón «Leer en el celular» al libro (misma pestaña)`);
       assert(pdf && pdf.subarray(0, 5).toString() === '%PDF-', `${s.key}: el PDF sigue en el recurso`);
       assert(b.summary.libro.online && b.summary.libro.online.chapters === book.chapters.length, `${s.key}: resumen del paquete (libro.online)`);
-      assert(b.expectations.builderVersion === '3.18.0', `${s.key}: builder 3.18.0`);
+      assert(b.expectations.builderVersion === '3.19.0', `${s.key}: builder 3.19.0`); // r79.1: tipos de Actividad (r78: 3.18.0)
       built[s.key] = { mbz: b.mbz, book, libro, pdf, summary: b.summary, acts };
       evidence.courses[s.key] = { mbzBytes: b.mbz.length, pdfPages: b.summary.libro.pageCount, online: b.summary.libro.online, chapters: book.chapters.map((c) => c.title) };
       fs.mkdirSync(path.join(OUT, s.key), { recursive: true });

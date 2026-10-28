@@ -163,7 +163,9 @@ const INVALID = {
 // Fase 2: actividad VÁLIDA para el nivel de minutos (EXERCISES_BY_MINUTES); el género cambia con el tipo de capítulo
 // (procedimiento en la práctica, análisis de casos en el de contenido) para que no todas tengan la misma forma.
 function applicationActivity(minutes, practice) {
+  // r79.1: el nivel de 120 (v2) exige 10–12 ejercicios, hitos del taller, 5–8 ítems de autoevaluación y 4 criterios.
   const count = { 30: 6, 60: 7, 90: 9, 120: 10 }[minutes];
+  const long = minutes === 120;
   if (!count) throw new Error(`fake LLM v3: minutos de actividad inválidos ${minutes}`);
   const split = { 30: [5, 15, 8, 2], 60: [10, 30, 15, 5], 90: [15, 45, 25, 5], 120: [20, 60, 35, 5] }[minutes];
   const diff = (i) => (i < 2 ? 'basico' : i < count - 2 ? 'intermedio' : 'avanzado');
@@ -174,10 +176,13 @@ function applicationActivity(minutes, practice) {
     context: 'Trabajas en el turno de mantenimiento de una faena del norte de Chile. El equipo te pide revisar un circuito hidráulico antes de liberarlo a operación. Los datos de esta actividad son hipotéticos e ilustrativos.',
     examples: [{ title: 'Caso resuelto', problem: 'Un cilindro pierde fuerza al final de la carrera.', steps: ['Bloquea y etiqueta el equipo.', 'Mide la presión en el puerto de prueba.', 'Compara con el valor de placa.'], result: 'La presión está bajo el valor de placa: se revisa la válvula de alivio.' }],
     exercises: Array.from({ length: count }, (_, i) => ({ id: `E${i + 1}`, prompt: `Revisa la situación hipotética ${i + 1} del circuito y explica qué verificarías primero.`, difficulty: diff(i), answerLines: 3 })),
-    workshop: { title: 'Taller de inspección', situation: 'Un equipo vuelve de una mantención y debes decidir si se libera a operación con los registros del turno.', instructions: ['Revisa los registros.', 'Identifica la verificación pendiente.', 'Redacta la decisión para el supervisor.'] },
+    workshop: { title: 'Taller de inspección', situation: 'Un equipo vuelve de una mantención y debes decidir si se libera a operación con los registros del turno.', instructions: ['Revisa los registros.', 'Identifica la verificación pendiente.', 'Redacta la decisión para el supervisor.'],
+      ...(long ? { milestones: [{ title: 'Revisión de registros', product: 'La lista de verificaciones pendientes del turno.' }, { title: 'Decisión escrita', product: 'La nota para el supervisor con la decisión justificada.' }] } : {}) },
     deliverable: { description: 'Una hoja de inspección completa con la decisión justificada.', format: 'Hoja de inspección', extent: 'Una página' },
-    selfCheck: ['¿Bloqueé el equipo antes de medir?', '¿Registré cada valor?', '¿Comparé con el valor de placa?', '¿Justifiqué la decisión?'],
-    criteria: [{ name: 'Seguridad', description: 'Aplica el bloqueo antes de intervenir.', weight: 40 }, { name: 'Diagnóstico', description: 'Identifica la causa con evidencia.', weight: 40 }, { name: 'Registro', description: 'Deja la inspección documentada.', weight: 20 }],
+    selfCheck: ['¿Bloqueé el equipo antes de medir?', '¿Registré cada valor?', '¿Comparé con el valor de placa?', '¿Justifiqué la decisión?', ...(long ? ['¿Entregué los dos hitos del taller?'] : [])],
+    criteria: long
+      ? [{ name: 'Seguridad', description: 'Aplica el bloqueo antes de intervenir.', weight: 30 }, { name: 'Diagnóstico', description: 'Identifica la causa con evidencia.', weight: 30 }, { name: 'Registro', description: 'Deja la inspección documentada.', weight: 20 }, { name: 'Hitos del taller', description: 'Entrega los productos intermedios completos.', weight: 20 }]
+      : [{ name: 'Seguridad', description: 'Aplica el bloqueo antes de intervenir.', weight: 40 }, { name: 'Diagnóstico', description: 'Identifica la causa con evidencia.', weight: 40 }, { name: 'Registro', description: 'Deja la inspección documentada.', weight: 20 }],
     minutesBySection: { examples: split[0], exercises: split[1], workshop: split[2], selfCheck: split[3] },
   };
 }

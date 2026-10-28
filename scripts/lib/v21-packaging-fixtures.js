@@ -97,7 +97,15 @@ function packagingInput(distRoot, o = {}) {
   const slices = ['slice-a.mp3', 'slice-b.mp3', 'slice-c.mp3'];
   // Fase 2: documento de prueba de cada Actividad de Aplicación (salida simulada del ejecutor; valida contra el contrato).
   const applications = new Map();
-  for (const c of chapters) if (c.applicationMinutes !== undefined) applications.set(c.chapterId, applicationDoc(c.chapterId, c.applicationMinutes, c.chapterNumber));
+  // r79.1: con tipo (o con `o.applicationV2`), el documento v2 sintético del tipo (lib/r79-1-activity-fixtures.js).
+  for (const c of chapters) {
+    if (c.applicationMinutes === undefined) continue;
+    if (c.applicationKind || o.applicationV2) {
+      const K = require('./r79-1-activity-fixtures');
+      const refs = SF.loadDist(distRoot, 'modules/course-shell/application-kinds.js').applicationOutcomeRefs(snapshot, c.chapterId).map((r) => r.id);
+      applications.set(c.chapterId, K.kindDoc(module.exports, c.applicationKind || null, c.chapterId, c.applicationMinutes, c.chapterNumber, { outcomeIds: refs, size: o.applicationSize || 'min' }));
+    } else applications.set(c.chapterId, applicationDoc(c.chapterId, c.applicationMinutes, c.chapterNumber));
+  }
   // Loop 9 B: documento de prueba de cada práctica guiada (salida simulada del ejecutor; valida contra el contrato).
   const guidedPractices = new Map();
   for (const c of chapters) if (c.guidedPracticeMinutes !== undefined) guidedPractices.set(c.chapterId, guidedPracticeDoc(c.chapterId, c.guidedPracticeMinutes, c.chapterNumber));

@@ -2,6 +2,7 @@ import { learningPlanExperienceRequirements } from '../pedagogy/learning-plan-di
 import { browserEffectiveTypes, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun } from './llm-worker-routing';
 import { lqaIsLanguageCourse } from '../language-qa/language-qa';
 import { APPLICATION_ACTIVITY_SCHEMA_VERSION } from '../course-shell/application-activity';
+import { applicationClaimSpec, applicationOutcomeRefs } from '../course-shell/application-kinds';
 import { GUIDED_PRACTICE_DISTINCT, GUIDED_PRACTICE_SCHEMA_VERSION, GuidedPracticeAvoid, GuidedPracticePreviousExercise } from '../course-shell/guided-practice';
 export type { GuidedPracticeAvoid } from '../course-shell/guided-practice';
 import { guidedPracticeExercisePlan } from '../study-time/guided-practice-tiers';
@@ -314,6 +315,8 @@ export interface ClaimPayloadV3 {
    */
   application?: {
     minutes: number; chapterKind: 'content' | 'practice'; schemaVersion: number; context: unknown; /** O2b: el fail acepta `applicationDraftArtifactId`. */ draftArtifactType?: string;
+    /** r79.1: tipo, resultados del capítulo y especificación del nivel (tipos nuevos). */
+    kind?: string; outcomes?: { id: string; text: string }[]; kindSpec?: unknown; standardSpec?: unknown;
     /** r58 (I4-3): archivos de trabajo adjuntos del capítulo (solo si hay). */
     practiceFiles?: Array<{ title: string; filename: string; instructions: string; relation: string }>;
   };
@@ -419,8 +422,12 @@ export interface ClaimOptions {
 
 /** Motor pedagógico Fase 2: el ejecutor del navegador aplica `ClaimedItem.pedagogy` a sus prompts. */
 export const PEDAGOGY_BRIEF_FEATURE = 'pedagogy-brief-1';
-/** Fase 2: el ejecutor del navegador sabe generar items `application_activity` (actividad + solucionario). */
-export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-1';
+/**
+ * Fase 2: el ejecutor del navegador sabe generar items `application_activity` (actividad + solucionario).
+ * r79.1: '-2' = escribe el documento v2 (con `kind`; los tipos nuevos y el nivel de 120 reforzado). Un ejecutor que solo
+ * anuncia '-1' recibe el 409 «recarga la página» antes de reclamar nada (nunca falla un item a mitad de camino).
+ */
+export const APPLICATION_ACTIVITY_FEATURE = 'application-activity-2';
 /**
  * Loop 9 B: el ejecutor sabe generar items `guided_practice` (práctica guiada). Un ejecutor que no lo anuncia NUNCA
  * recibe el tipo: se le quita de los tipos del claim (el worker o una pestaña actualizada lo genera).
@@ -888,6 +895,7 @@ export class SchedulerService {
     if (!row || row.application !== true) return;
     const message =
       `rules_version_mismatch: la ejecución ${runId} tiene Actividades de Aplicación y este navegador ejecuta una versión ` +
+      // r79.1: también una versión que solo conoce el documento v1 de las Actividades.
       'anterior de Cursia que no sabe generarlas. Recarga la página para continuar; con esta versión el curso no podría terminar.';
     throw new ConflictException({ message, code: 'executor_outdated_application', runId });
   }
@@ -1486,6 +1494,12 @@ export class SchedulerService {
       if (ctx.applicationMinutes === null) {
         throw new InternalServerErrorException(`v3_validation_context: ${g.item_key} sin applicationMinutes en el Manifest; no se completa sin validar`);
       }
+      // r79.1: el tipo (del Manifest congelado) y los resultados del capítulo (del Blueprint del run: los mismos del claim).
+      if (typeof mItem.applicationKind === 'string') {
+        ctx.applicationKind = mItem.applicationKind;
+        const snap = await this.manifestBlueprintSnapshot(g.manifest_id);
+        ctx.applicationOutcomeIds = applicationOutcomeRefs(snap, g.chapter_id).map((o) => o.id);
+      }
     }
     if (g.type === 'guided_practice') {
       // Loop 9 B: los minutos salen del item del Manifest congelado (nunca del ejecutor).
@@ -1852,6 +1866,9 @@ export class SchedulerService {
         context: (snapshot as any)?.course?.applicationContext ?? null,
         // O2b: anuncia que el fail acepta `applicationDraftArtifactId` (borrador de la actividad entre intentos).
         draftArtifactType: APPLICATION_DRAFT_ARTIFACT_TYPE,
+        // r79.1: tipo de la Actividad (del Manifest) y, para los tipos nuevos, su especificación (esquema + cantidades y
+        // pisos del nivel: el ejecutor valida con los MISMOS datos que el servidor) y los resultados del capítulo que cita.
+        ...applicationClaimSpec(mItem.applicationKind ?? null, mItem.applicationMinutes, snapshot, row.chapter_id),
       };
       // r58 (I4-3): archivos de trabajo del capítulo para que la actividad los nombre tal cual (sin otra llamada a la IA).
       // Review r1 (M-7): del perfil congelado al crear el run (no el vivo). Sin archivos → el claim queda como antes.

@@ -257,7 +257,7 @@ async function main() {
   });
 
   await check('I-1 capacidad video-scenes-1: navegador sin la capacidad → claim de siempre aunque el video tenga escenas; worker del servidor o navegador con la capacidad → anclado', () => {
-    const OLD = ['pedagogy-brief-1', 'application-activity-1', 'guided-practice-1'];
+    const OLD = ['pedagogy-brief-1', 'application-activity-1', 'application-activity-2', 'guided-practice-1'];
     eq(SCH.VIDEO_SCENES_FEATURE, 'video-scenes-1', 'nombre');
     eq([SCH.executorAnchorsVideoScenes('owner', OLD), SCH.executorAnchorsVideoScenes('owner', [...OLD, 'video-scenes-1']), SCH.executorAnchorsVideoScenes(undefined, []), SCH.executorAnchorsVideoScenes('owner', undefined)], [false, true, true, false], 'negociación');
     assert(SCH.SERVER_OWNED_SUMMARY_KEYS.includes('videoTimelinePinned'), 'el pin es del servidor');

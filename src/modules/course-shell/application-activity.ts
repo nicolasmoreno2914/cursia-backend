@@ -11,8 +11,17 @@
 // La IA elige el GÉNERO de la actividad según la disciplina (cálculo, análisis de caso, procedimiento, producción,
 // diseño/construcción, decisión, indagación): no todas las actividades tienen la misma forma.
 import { APPLICATION_ACTIVITY_TIERS } from '../study-time/application-tiers';
+import { APPLICATION_KIND_LABEL, APPLICATION_KIND_TIERS, isApplicationKind } from '../study-time/application-kind-tiers';
+import type { ApplicationKind } from '../study-time/application-kind-tiers';
+import { STANDARD_SPEC_V2, applicationKindSummary, standardSpecFor, validateApplicationKindDoc, validateKindPart } from './application-kinds';
 
-export const APPLICATION_ACTIVITY_SCHEMA_VERSION = 1 as const;
+/**
+ * r79.1: versión 2 = TODO documento nuevo lleva `kind` («standard» o uno de los tipos nuevos) y el nivel de 120 min de la
+ * Actividad de siempre exige más trabajo (STANDARD_SPEC_V2). Los documentos v1 (generados antes) siguen siendo válidos con
+ * las reglas v1 (empaquetar de nuevo un curso ya generado nunca falla por el cambio).
+ */
+export const APPLICATION_ACTIVITY_SCHEMA_VERSION = 2 as const;
+export const APPLICATION_ACTIVITY_LEGACY_SCHEMA_VERSION = 1 as const;
 export const APPLICATION_ARTIFACT_TYPE = 'dynamic_application_json';
 
 export const APPLICATION_GENRES = Object.freeze([
@@ -29,13 +38,10 @@ export type ApplicationGenre = (typeof APPLICATION_GENRES)[number];
 export const GENRES_REQUIRING_EXAMPLE: readonly ApplicationGenre[] = ['calculation', 'procedure', 'design_build'];
 export const DIFFICULTIES = Object.freeze(['basico', 'intermedio', 'avanzado'] as const);
 
-/** Ejercicios por nivel de minutos (corta → larga). Siempre dentro de 6–10. */
-export const EXERCISES_BY_MINUTES: Readonly<Record<number, { min: number; max: number; examplesMax: number }>> = Object.freeze({
-  30: { min: 6, max: 7, examplesMax: 1 },
-  60: { min: 6, max: 8, examplesMax: 2 },
-  90: { min: 8, max: 10, examplesMax: 2 },
-  120: { min: 9, max: 10, examplesMax: 2 },
-});
+/** Ejercicios por nivel de minutos (corta → larga), especificación vigente (v2: el de 120 reforzado). */
+export const EXERCISES_BY_MINUTES: Readonly<Record<number, { min: number; max: number; examplesMax: number }>> = Object.freeze(
+  Object.fromEntries(Object.entries(STANDARD_SPEC_V2).map(([m, s]) => [m, { min: s.exercises[0], max: s.exercises[1], examplesMax: s.examples[1] }])),
+);
 /** Tolerancia de la suma de minutos por sección respecto del nivel (±20 %). */
 export const MINUTES_TOLERANCE = 0.2;
 
@@ -50,6 +56,10 @@ export interface ApplicationValidationError {
 export interface ApplicationValidationContext {
   chapterId: string;
   minutes: number;
+  /** r79.1: tipo que fija el Manifest (ausente = la Actividad de siempre). */
+  kind?: ApplicationKind | null;
+  /** r79.1: ids de los resultados del capítulo (applicationOutcomeRefs); los tipos nuevos los citan. */
+  outcomeIds?: readonly string[];
 }
 
 function isObj(v: unknown): v is Record<string, any> {
@@ -95,6 +105,8 @@ function assertMinutes(minutes: number): void {
  */
 export const APPLICATION_SOLUTION_MARKERS_RE = /Solucionario|Gu[ií]a de correcci[oó]n|Respuesta:|Soluci[oó]n esperada/i;
 const STUDENT_KEYS = ['genre', 'title', 'objective', 'context', 'examples', 'exercises', 'workshop', 'deliverable', 'selfCheck', 'criteria', 'minutesBySection'];
+/** r79.1: claves del taller (v2 agrega los hitos del nivel de 120). */
+const WORKSHOP_KEYS_V2 = ['title', 'situation', 'instructions', 'milestones'];
 const EXERCISE_KEYS = ['id', 'prompt', 'difficulty', 'answerLines'];
 
 function stringsOf(v: unknown, out: string[] = []): string[] {
@@ -104,8 +116,9 @@ function stringsOf(v: unknown, out: string[] = []): string[] {
   return out;
 }
 
-export function validateApplicationStudentPart(a: unknown, minutes: number): { errors: ApplicationValidationError[]; exerciseIds: string[]; criteriaNames: string[] } {
+export function validateApplicationStudentPart(a: unknown, minutes: number, schemaVersion: number = APPLICATION_ACTIVITY_SCHEMA_VERSION): { errors: ApplicationValidationError[]; exerciseIds: string[]; criteriaNames: string[] } {
   assertMinutes(minutes);
+  const spec = standardSpecFor(schemaVersion, minutes)!;
   const errors: ApplicationValidationError[] = [];
   const err: ErrFn = (path, code, message) => errors.push({ path, code, message });
   const { text, list } = helpers(err);
@@ -125,8 +138,8 @@ export function validateApplicationStudentPart(a: unknown, minutes: number): { e
   text(a.title, '$.activity.title', LIM.short, 4);
   text(a.objective, '$.activity.objective', LIM.text, 20);
   text(a.context, '$.activity.context', LIM.long, 60);
-  const bounds = EXERCISES_BY_MINUTES[minutes];
-  const examples = list(a.examples, '$.activity.examples', knownGenre && GENRES_REQUIRING_EXAMPLE.includes(genre) ? 1 : 0, bounds.examplesMax);
+  const exMin = Math.max(spec.examples[0], knownGenre && GENRES_REQUIRING_EXAMPLE.includes(genre) ? 1 : 0);
+  const examples = list(a.examples, '$.activity.examples', exMin, spec.examples[1]);
   examples.forEach((ex, i) => {
     const p = `$.activity.examples[${i}]`;
     if (!isObj(ex)) return err(p, 'APPLICATION_SHAPE', `${p} debe ser un objeto`);
@@ -135,7 +148,7 @@ export function validateApplicationStudentPart(a: unknown, minutes: number): { e
     list(ex.steps, `${p}.steps`, 2, 10).forEach((st, j) => text(st, `${p}.steps[${j}]`, LIM.text, 3));
     text(ex.result, `${p}.result`, LIM.text, 3);
   });
-  const exercises = list(a.exercises, '$.activity.exercises', bounds.min, bounds.max);
+  const exercises = list(a.exercises, '$.activity.exercises', spec.exercises[0], spec.exercises[1]);
   let lastDifficulty = -1;
   exercises.forEach((e, i) => {
     const p = `$.activity.exercises[${i}]`;
@@ -160,7 +173,20 @@ export function validateApplicationStudentPart(a: unknown, minutes: number): { e
   else {
     text(w.title, '$.activity.workshop.title', LIM.short, 4);
     text(w.situation, '$.activity.workshop.situation', LIM.long, 60);
-    list(w.instructions, '$.activity.workshop.instructions', 2, 8).forEach((x, i) => text(x, `$.activity.workshop.instructions[${i}]`, LIM.text, 8));
+    list(w.instructions, '$.activity.workshop.instructions', spec.workshopInstructions[0], spec.workshopInstructions[1]).forEach((x, i) => text(x, `$.activity.workshop.instructions[${i}]`, LIM.text, 8));
+    // r79.1 (v2): hitos del taller con producto intermedio (el nivel de 120 los exige; los demás no los llevan).
+    if (schemaVersion !== 1) {
+      for (const k of Object.keys(w)) if (!WORKSHOP_KEYS_V2.includes(k)) err(`$.activity.workshop.${k}`, 'APPLICATION_SHAPE', `campo desconocido en el taller: ${k}`);
+      if (spec.workshopMilestones[1] > 0) {
+        list(w.milestones, '$.activity.workshop.milestones', spec.workshopMilestones[0], spec.workshopMilestones[1]).forEach((ms, i) => {
+          const p = `$.activity.workshop.milestones[${i}]`;
+          if (!isObj(ms)) return err(p, 'APPLICATION_SHAPE', `${p} debe ser un objeto`);
+          for (const k of Object.keys(ms)) if (k !== 'title' && k !== 'product') err(`${p}.${k}`, 'APPLICATION_SHAPE', `campo desconocido en el hito: ${k}`);
+          text(ms.title, `${p}.title`, LIM.short, 4);
+          text(ms.product, `${p}.product`, LIM.text, 15);
+        });
+      } else if (w.milestones !== undefined) err('$.activity.workshop.milestones', 'APPLICATION_SHAPE', `el nivel de ${minutes} min no lleva hitos (solo el de 120)`);
+    }
   }
   const dv = a.deliverable;
   if (!isObj(dv)) err('$.activity.deliverable', 'APPLICATION_SHAPE', 'falta el producto o evidencia');
@@ -169,8 +195,8 @@ export function validateApplicationStudentPart(a: unknown, minutes: number): { e
     text(dv.format, '$.activity.deliverable.format', LIM.short, 3);
     text(dv.extent, '$.activity.deliverable.extent', LIM.short, 2);
   }
-  list(a.selfCheck, '$.activity.selfCheck', 4, 8).forEach((x, i) => text(x, `$.activity.selfCheck[${i}]`, LIM.text, 8));
-  const criteria = list(a.criteria, '$.activity.criteria', 3, 4);
+  list(a.selfCheck, '$.activity.selfCheck', spec.selfCheck[0], spec.selfCheck[1]).forEach((x, i) => text(x, `$.activity.selfCheck[${i}]`, LIM.text, 8));
+  const criteria = list(a.criteria, '$.activity.criteria', spec.criteria[0], spec.criteria[1]);
   let weightSum = 0;
   criteria.forEach((c, i) => {
     const p = `$.activity.criteria[${i}]`;
@@ -198,6 +224,10 @@ export function validateApplicationStudentPart(a: unknown, minutes: number): { e
     for (const k of Object.keys(mbs)) if (!SECTIONS.includes(k)) err(`$.activity.minutesBySection.${k}`, 'APPLICATION_SECTION_MINUTES', `sección desconocida: ${k}`);
     if (Math.abs(total - minutes) > minutes * MINUTES_TOLERANCE) {
       err('$.activity.minutesBySection', 'APPLICATION_MINUTES_BUDGET', `las secciones suman ${total} min; el nivel es ${minutes} min (±${Math.round(MINUTES_TOLERANCE * 100)} %)`);
+    }
+    // r79.1: pisos de minutos del nivel (el de 120: taller ≥ 35 y ejercicios ≥ 40).
+    for (const [k, f] of Object.entries(spec.floors)) {
+      if (Number.isInteger(mbs[k]) && mbs[k] < f) err(`$.activity.minutesBySection.${k}`, 'APPLICATION_SECTION_FLOOR', `${k}: ${mbs[k]} min; el nivel de ${minutes} min exige al menos ${f} min en esta sección`);
     }
   }
   return { errors, exerciseIds: ids, criteriaNames: names };
@@ -239,14 +269,49 @@ export function validateApplicationSolutionPart(s: unknown, exerciseIds: readonl
 export function validateApplicationActivityDoc(doc: unknown, ctx: ApplicationValidationContext): ApplicationValidationError[] {
   if (!ctx || typeof ctx.chapterId !== 'string') throw new Error(`V3_VALIDATION_CONTEXT: Actividad de Aplicación sin chapterId ${JSON.stringify(ctx)}`);
   assertMinutes(ctx.minutes);
+  const wantKind: ApplicationKind | null = ctx.kind ?? null;
+  if (wantKind !== null && !isApplicationKind(wantKind)) throw new Error(`V3_VALIDATION_CONTEXT: tipo de actividad inválido ${JSON.stringify(wantKind)}`);
   if (!isObj(doc)) return [{ path: '$', code: 'APPLICATION_SHAPE', message: 'el documento debe ser un objeto' }];
   const errors: ApplicationValidationError[] = [];
-  if (doc.schemaVersion !== APPLICATION_ACTIVITY_SCHEMA_VERSION) errors.push({ path: '$.schemaVersion', code: 'APPLICATION_SCHEMA_VERSION', message: `schemaVersion debe ser ${APPLICATION_ACTIVITY_SCHEMA_VERSION}` });
+  const v = doc.schemaVersion;
+  // v1 (antes de r79.1): solo la Actividad de siempre y con las reglas v1. v2: con `kind` explícito.
+  if (v !== APPLICATION_ACTIVITY_SCHEMA_VERSION && !(v === APPLICATION_ACTIVITY_LEGACY_SCHEMA_VERSION && wantKind === null)) {
+    errors.push({ path: '$.schemaVersion', code: 'APPLICATION_SCHEMA_VERSION', message: `schemaVersion debe ser ${APPLICATION_ACTIVITY_SCHEMA_VERSION}` });
+    return errors;
+  }
   if (doc.chapterId !== ctx.chapterId) errors.push({ path: '$.chapterId', code: 'CHAPTER_ID_MISMATCH', message: `chapterId debe ser "${ctx.chapterId}"` });
   if (doc.minutes !== ctx.minutes) errors.push({ path: '$.minutes', code: 'APPLICATION_MINUTES_MISMATCH', message: `minutes debe ser ${ctx.minutes} (nivel del Manifest)` });
-  const st = validateApplicationStudentPart(doc.activity, ctx.minutes);
+  if (v === APPLICATION_ACTIVITY_SCHEMA_VERSION) {
+    const gotKind = doc.kind === 'standard' ? null : doc.kind;
+    if (doc.kind !== 'standard' && !isApplicationKind(doc.kind)) {
+      errors.push({ path: '$.kind', code: 'APPLICATION_KIND', message: `kind debe ser "standard" o uno de ${Object.keys(APPLICATION_KIND_TIERS).join(', ')}` });
+      return errors;
+    }
+    if (gotKind !== wantKind) {
+      errors.push({ path: '$.kind', code: 'APPLICATION_KIND_MISMATCH', message: `kind debe ser "${wantKind ?? 'standard'}" (tipo del Manifest)` });
+      return errors;
+    }
+    if (wantKind !== null) {
+      if (!APPLICATION_KIND_TIERS[wantKind].includes(ctx.minutes)) {
+        errors.push({ path: '$.minutes', code: 'APPLICATION_KIND_TIER', message: `${APPLICATION_KIND_LABEL[wantKind]}: niveles ${APPLICATION_KIND_TIERS[wantKind].join(', ')} min` });
+        return errors;
+      }
+      const keys = Object.keys(doc);
+      for (const k of keys) if (!['schemaVersion', 'chapterId', 'minutes', 'kind', 'activity', 'solution'].includes(k)) errors.push({ path: `$.${k}`, code: 'APPLICATION_SHAPE', message: `campo desconocido: ${k}` });
+      errors.push(...validateApplicationKindDoc(doc, { kind: wantKind, minutes: ctx.minutes, outcomeIds: ctx.outcomeIds ?? [] }));
+      return errors;
+    }
+  }
+  const st = validateApplicationStudentPart(doc.activity, ctx.minutes, v as number);
   errors.push(...st.errors);
   errors.push(...validateApplicationSolutionPart(doc.solution, st.exerciseIds, st.criteriaNames));
+  return errors;
+}
+
+/** r79.1: la parte del estudiante de un tipo nuevo (la 1.ª pasada del ejecutor; mismo intérprete que el documento). */
+export function validateApplicationKindStudentPart(a: unknown, kind: ApplicationKind, minutes: number, outcomeIds: readonly string[] = []): ApplicationValidationError[] {
+  const errors: ApplicationValidationError[] = [];
+  validateKindPart({ kind, minutes, outcomeIds }, a, 'student', errors);
   return errors;
 }
 
@@ -276,6 +341,12 @@ export function caseProperNames(text: unknown, max = 8): string[] {
 
 /** Métricas para el output_summary del item (no bloquean). Fix I5: título y protagonistas del caso (para no repetirlos). */
 export function applicationActivitySummary(doc: any): Record<string, unknown> {
+  // r79.1: los tipos nuevos tienen su propio resumen (el título del caso cuenta como «caso» del módulo para no repetirlo).
+  if (doc?.schemaVersion === APPLICATION_ACTIVITY_SCHEMA_VERSION && isApplicationKind(doc?.kind)) {
+    const k = applicationKindSummary(doc);
+    const a = doc.activity ?? {};
+    return { ...k, caseNames: caseProperNames([a.case?.narrative, a.brief?.situation].filter((x: unknown) => typeof x === 'string').join('\n')) };
+  }
   const a = doc?.activity ?? {};
   const w = a && typeof a.workshop === 'object' && a.workshop ? a.workshop : {};
   return {

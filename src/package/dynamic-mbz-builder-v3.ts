@@ -154,7 +154,8 @@ import type { ExamBankV1 } from '../modules/course-shell/exam-bank';
 import { examExplanationsAvailability, examOverallFeedbackBands } from '../modules/course-shell/exam-explanations';
 import type { ExamBankPlans } from './v3/exam-validator-v3';
 import { reviewCardsEnabledFor } from '../modules/study-time/manifest-input';
-import { ApplicationDeliveryText, applicationSolutionPage, applicationStudentPage, practiceResourceIntro, practiceResourceName } from '../modules/course-shell/application-pages';
+import { ApplicationDeliveryText, applicationDocKind, applicationSolutionPage, applicationStudentPage, practiceResourceIntro, practiceResourceName } from '../modules/course-shell/application-pages';
+import { applicationOutcomeRefs } from '../modules/course-shell/application-kinds';
 import { deliveryMegabytes } from '../modules/course-shell/facts';
 import { repairDeadAnchorsInActivityXml } from './v3/dead-links-v3';
 import { ASSIGN_PLUGIN_CONFIG_COUNT, assignActivityXml, assignDueDate, assignGradeItemXml, assignRubricGradingXml, rubricCriteriaFromApplication } from './v3/assign-v3';
@@ -296,8 +297,14 @@ export const MBZ_V3_SYSTEM_BACKUP_CONTEXTID = 1;
  * IA), un capítulo de Moodle por sección del PDF (portada e índice, módulos, capítulos como subcapítulos, referencias), a
  * 18 px, fluido y con el tema; la tarjeta del Libro suma «Leer en el celular →». El PDF sigue igual (bytes idénticos) y
  * sigue siendo el criterio de finalización de un curso sin nota. Los paquetes de 3.17.0 se re-empaquetan.
+ * 3.19.0 (r79.1, tipos de Actividad de Aplicación): las Actividades con `kind` (Manifest `applicationKind`) se empaquetan
+ * con su página propia (estudio de caso / proyecto integrador / retroalimentación formativa: nombre «<Tipo> · Capítulo N»,
+ * secciones del tipo, resultados de aprendizaje que evidencia, PDF «capitulo-N-<tipo>.pdf») y su solucionario docente
+ * oculto; el nivel de 120 de siempre (documento v2) suma los hitos del taller en la página y en el PDF. Un curso SIN tipos
+ * y con documentos v1 sale byte a byte igual que en 3.18.0 (lo verifican los dorados de r60/r77/r78); el validador exige
+ * el nombre y las secciones del tipo.
  */
-export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.18.0';
+export const DYNAMIC_MBZ_BUILDER_VERSION_V3 = '3.19.0';
 
 // EV6 P2-B5: `examExplanationsAvailability` vive en course-shell/exam-explanations (lo usa también el validador).
 export { examExplanationsAvailability } from '../modules/course-shell/exam-explanations';
@@ -1937,10 +1944,15 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
           // Fase 2: página del estudiante (visible, con su PDF imprimible) + solucionario docente (OCULTO, con su PDF).
           const doc = c.applications?.get(ch.chapterId);
           if (!doc || cf.applicationMinutes === undefined) throw new Error(`MBZ_V3_INVARIANT: Actividad de Aplicación del capítulo ${ch.chapterNumber} sin documento`);
+          // r79.1: el tipo del documento es el del Manifest (facts); un desacuerdo es un bug de integración (falla fuerte).
+          const docKind = applicationDocKind(doc);
+          if ((docKind ?? undefined) !== cf.applicationKind) throw new Error(`MBZ_V3_INVARIANT: la Actividad del capítulo ${ch.chapterNumber} es ${docKind ?? 'standard'} y el Manifest dice ${cf.applicationKind ?? 'standard'}`);
+          const outcomes = docKind ? applicationOutcomeRefs(blueprint, ch.chapterId) : undefined;
           const tone = moduleTone(theme, moduleColor(theme, m.moduleNumber - 1), groundColor(theme));
-          const studentPdfName = `capitulo-${ch.chapterNumber}-actividad-de-aplicacion.pdf`;
+          const KIND_SLUG: Record<string, string> = { case_study: 'estudio-de-caso', integrative_project: 'proyecto-integrador', formative_feedback: 'retroalimentacion-formativa' };
+          const studentPdfName = `capitulo-${ch.chapterNumber}-${docKind ? KIND_SLUG[docKind] : 'actividad-de-aplicacion'}.pdf`;
           const teacherPdfName = `capitulo-${ch.chapterNumber}-solucionario-docente.pdf`;
-          const pdfIn = { courseTitle: plan.course.title, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, theme, documentKey: ch.keys.application };
+          const pdfIn = { courseTitle: plan.course.title, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, theme, documentKey: ch.keys.application, ...(outcomes ? { outcomes } : {}) };
           const studentPdf = await renderApplicationPdf(pdfIn, 'student');
           const teacherPdf = await renderApplicationPdf(pdfIn, 'teacher');
           for (const r of [studentPdf, teacherPdf]) if (r.unmappedChars > 0) warnings.push(`application_chars_unmapped:${ch.keys.application}:${r.unmappedChars}`);
@@ -1950,7 +1962,7 @@ async function buildDynamicMbzV3Once(input: BuildDynamicMbzV3Input, noGrowth: bo
             if (mid === undefined) throw new Error(`MBZ_V3_INVARIANT: archivo de trabajo ${r.id} no creado antes de su Actividad de Aplicación`);
             return { title: r.title, instructions: r.instructions, filename: r.filename, href: `$@RESOURCEVIEWBYID*${mid}@$` };
           });
-          const pageIn = { chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone, ...(appResources.length ? { resources: appResources } : {}) };
+          const pageIn = { chapterId: ch.chapterId, chapterNumber: ch.chapterNumber, chapterTitle: ch.title, doc, tone, ...(appResources.length ? { resources: appResources } : {}), ...(outcomes ? { outcomes } : {}) };
           if (cf.applicationDelivery?.mode === 'assign') {
             // T4 (r57): Tarea de Moodle con la AA como descripción (+ «Cómo entregar») y el PDF del estudiante en `intro`.
             const d = resolved.application;

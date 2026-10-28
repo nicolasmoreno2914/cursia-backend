@@ -21,6 +21,13 @@ export class DesignAdjustDto {
   guidedPractice?: 'auto' | 'none';
 
   /**
+   * r79.1 · «Tipos de actividad»: 'auto' = estudio de caso, proyecto integrador y retroalimentación formativa donde aportan
+   * valor (criterios K1–K3); 'none' = solo la Actividad de Aplicación de siempre. Ausente = lo guardado (por defecto 'none').
+   */
+  @IsOptional() @IsIn(['auto', 'none'])
+  activityKinds?: 'auto' | 'none';
+
+  /**
    * r79 · «Presupuesto de producción del curso (USD)» (1–5000; null lo quita). Solo con DYNAMIC_BUDGET_FIT; sin el
    * interruptor se ignora. Es una referencia para diseñar: nunca el «Tope autorizado» de la generación.
    */

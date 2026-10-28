@@ -55,6 +55,7 @@
  * Identifica cada módulo por su `idnumber` `cv3:…` (estructura por UUID).
  * Puro salvo el unzip en memoria; nunca lanza por un hallazgo: los devuelve todos.
  */
+import { APPLICATION_KIND_LABEL } from '../../modules/study-time/application-kind-tiers';
 import * as JSZip from 'jszip';
 import { createHash } from 'crypto';
 import {
@@ -783,6 +784,18 @@ export async function validateMbzV3(mbz: Buffer, exp: MbzV3ValidationExpectation
       if (!lint.ok) add('CLEAN_SAFE', a.idnumber, lint.errors.slice(0, 3).map((e) => `${e.code} ${e.message}`).join('; '));
       if (!hidden && SOLUTION_MARKERS_RE.test(extractText(content))) add('APPLICATION', a.idnumber, 'la página del estudiante muestra contenido del solucionario');
       if (hidden && !/Solucionario/.test(a.name)) add('APPLICATION', a.idnumber, 'el solucionario no se nombra como tal');
+      // r79.1: el tipo de la Actividad (facts = Manifest) se ve en el nombre y en el contenido; la de siempre no lleva otro tipo.
+      {
+        const label = ch.applicationKind ? APPLICATION_KIND_LABEL[ch.applicationKind as keyof typeof APPLICATION_KIND_LABEL] : 'Actividad de Aplicación';
+        if (!label) add('APPLICATION', a.idnumber, `tipo de Actividad desconocido en facts: ${ch.applicationKind}`);
+        else if (!a.name.includes(label)) add('APPLICATION', a.idnumber, `el nombre no dice «${label}» (tipo del Manifest)`);
+        if (!hidden && ch.applicationKind) {
+          const need: Record<string, RegExp> = { case_study: /Preguntas de análisis[\s\S]*Tu decisión/, integrative_project: /Etapas del proyecto[\s\S]*Integración y entrega final/, formative_feedback: /Criterios de revisión[\s\S]*Ejemplar comentado[\s\S]*Plan de mejora/ };
+          const t = extractText(content);
+          if (need[ch.applicationKind] && !need[ch.applicationKind].test(t)) add('APPLICATION', a.idnumber, `${label}: faltan las secciones propias del tipo en la página del estudiante`);
+          if (!/Resultados de aprendizaje que evidencias/.test(t)) add('APPLICATION', a.idnumber, `${label}: la página no muestra los resultados de aprendizaje que evidencia`);
+        }
+      }
       if (hidden) {
         // LOOP 7 (A4 I1/I3): barreras del solucionario — oculto también tras restaurar (visibleold=0), estudiante con
         // mod/page:view PROHIBIDO (override en la actividad + el rol referenciado y definido) y ningún enlace a él

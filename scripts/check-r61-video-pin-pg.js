@@ -208,7 +208,7 @@ const ENV_KEYS = ['DYNAMIC_COURSE_STRUCTURE', 'DYNAMIC_V2_GENERAL_AVAILABILITY',
     const D = scenes[scenes.length - 1].endSec;
     await ds.query(`update public.generation_item_runs set output_summary = output_summary || $2::jsonb where job_id = $1 and item_key = $3`,
       [runId, JSON.stringify({ mode: 'mock', delivery: 'completed', youtubeVideoId: 'IdwOipZAeqY', durationSec: D, durationSource: 'mp4_mvhd', videoScenes: scenes }), `video:${c1}`]);
-    const OLD_FEATURES = ['pedagogy-brief-1', 'application-activity-1', 'guided-practice-1'];
+    const OLD_FEATURES = ['pedagogy-brief-1', 'application-activity-1', 'application-activity-2', 'guided-practice-1'];
     const videoOf = (it) => (it && (it.claimPayload?.video ?? it.payload?.video ?? it.video)) || null;
 
     await check('M-8 pin con Postgres: ejecutor viejo → even_spacing; lease vencida; worker del servidor → videogen_scenes; el complete tardío del primero se rechaza', async () => {

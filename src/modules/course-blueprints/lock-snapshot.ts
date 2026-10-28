@@ -35,6 +35,7 @@ export async function loadLockRows(q: LockQueryExecutor, courseId: number): Prom
     `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
             to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
             to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes,
+            to_jsonb(course_chapters) ->> 'application_kind' as application_kind,
             to_jsonb(course_chapters) ->> 'guided_practice_minutes' as guided_practice_minutes,
             to_jsonb(course_chapters) -> 'outcome_ids' as outcome_ids
        from public.course_chapters where course_id = $1`,

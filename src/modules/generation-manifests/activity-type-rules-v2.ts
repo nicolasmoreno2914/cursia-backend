@@ -119,8 +119,18 @@ function hasDecidePhrase(tokens: Array<{ folded: string }>): boolean {
 }
 
 /** Intención v2 de un texto: decide si hay verbo/frase de decisión; si no, la de rules 1. */
+// r79.1 (rendimiento): función pura del texto; el ajuste al presupuesto clasifica los mismos títulos/objetivos miles de veces.
+const INTENT_V2_MEMO = new Map<string, ActivityIntentV2 | null>();
 export function classifyTextIntentV2(text: string | null | undefined, opts: { nounsOnly?: boolean } = {}): ActivityIntentV2 | null {
   if (typeof text !== 'string' || !text.trim()) return null;
+  const key = `${opts.nounsOnly ? 'n' : 'a'}\u0001${text}`;
+  if (INTENT_V2_MEMO.has(key)) return INTENT_V2_MEMO.get(key) as ActivityIntentV2 | null;
+  const r = classifyTextIntentV2Raw(text, opts);
+  if (INTENT_V2_MEMO.size > 20000) INTENT_V2_MEMO.clear();
+  INTENT_V2_MEMO.set(key, r);
+  return r;
+}
+function classifyTextIntentV2Raw(text: string, opts: { nounsOnly?: boolean }): ActivityIntentV2 | null {
   const tokens = tokenizeRulesV1(text);
   if (hasDecidePhrase(tokens)) return 'decide';
   if (!opts.nounsOnly && hasDecideVerb(tokens)) return 'decide';
