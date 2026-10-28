@@ -1,5 +1,5 @@
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
-import { effectiveChapterDesign } from './pedagogical-blueprint';
+import { effectiveChapterDesign, effectiveChapterDesignShared } from './pedagogical-blueprint';
 
 /**
  * Motor pedagógico V1 — Blueprint → Manifest.
@@ -76,7 +76,7 @@ export function manifestItemDesign(
       const ch = snapshot.modules.flatMap((m) => m.chapters).find((c) => c.id === chapterId);
       if (!ch?.design) throw new Error(`manifestItemDesign: el capítulo ${chapterId} no tiene diseño pedagógico`);
       // Diseño efectivo: el congelado + las variaciones del rol que le da su posición actual.
-      const d = effectiveChapterDesign(snapshot, ch.id);
+      const d = effectiveChapterDesignShared(snapshot, ch.id); // r79.1: solo lectura (copia campos)
       const plan = chapterPlanFields(d);
       switch (type) {
         case 'content':

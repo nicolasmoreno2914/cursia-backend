@@ -48,7 +48,9 @@ import { PedagogicalProfile, isEmptyPedagogicalProfile, normalizePedagogicalProf
 import { LearningType, PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 import { ChapterLearningTypeDesign, LEARNING_TYPE_LABELS, classifyLearningType, learningTypeJustification } from './learning-type';
 import { defaultFrameworkRegistry, frameworkSlotLabels } from './instructional-frameworks';
-import { profileLearningPlan } from './pedagogy-profile';
+import { profileLearningPlan, profileActivityKinds } from './pedagogy-profile';
+import { ActivityKindsReport, assignApplicationKinds } from '../study-time/activity-kinds';
+import { TierLockRow, isTierSelectable } from '../course-shell/application-kinds';
 import { PracticeMixEvaluation, evaluatePracticeMix } from '../study-time/practice-mix';
 
 /**
@@ -127,6 +129,11 @@ export interface DryRunInput {
    * check-r79-budget-fit.js). Ausente = salida completa de siempre.
    */
   distributionOnly?: boolean;
+  /**
+   * r79.1 · candado de proporcionalidad de los niveles de la Actividad (§12.1). Ausente = el de la especificación vigente
+   * (course-shell/application-kinds.ts, `applicationTierLock()`); los checks pasan otro para probar el candado cerrado.
+   */
+  tierLock?: readonly TierLockRow[] | null;
 }
 
 /** r79 (F2): precios de la estimación en seco. `source` dice de dónde salió el catálogo (se informa en la respuesta). */
@@ -267,6 +274,8 @@ export interface DryRunResult {
     proposalSha256: string;
     /** r79: tope de capítulos de contenido por módulo que fijó el ajuste al presupuesto (solo si existe). */
     contentChaptersMax?: number;
+    /** r79.1: tipos de Actividad asignados y por qué (solo con la preferencia «Tipos de actividad: automático»). */
+    activityKinds?: ActivityKindsReport;
     /** T3 (r57): mezcla de práctica del plan de aprendizaje (solo si está configurada). */
     practiceMix?: Pick<PracticeMixEvaluation, 'status' | 'ruleId' | 'plan' | 'fit' | 'notes'>;
   }) | null;
@@ -473,7 +482,8 @@ export function distributionProposalSha256(dist: DistributionResult, extra?: { c
     modules: dist.modules.map((m) => ({
       id: m.id,
       // Loop 9 B: la práctica guiada entra a la huella solo si el capítulo la tiene (las propuestas sin ella, huella de siempre).
-      chapters: m.chapters.map((c) => ({ id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, objective: c.objective, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, applicationMinutes: c.applicationMinutes, ...(c.guidedPracticeMinutes ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}) })),
+      // r79.1: el tipo de la Actividad entra a la huella solo si el capítulo lo tiene (sin tipos, huella de siempre).
+      chapters: m.chapters.map((c) => ({ id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, objective: c.objective, videoEnabled: c.videoEnabled, activityEnabled: c.activityEnabled, applicationMinutes: c.applicationMinutes, ...(c.applicationKind ? { applicationKind: c.applicationKind } : {}), ...(c.guidedPracticeMinutes ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}) })),
     })),
   };
   return createHash('sha256').update(JSON.stringify(canon), 'utf8').digest('hex');
@@ -515,7 +525,7 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
       if (existing) {
         // Fase 2: la propuesta fija (o quita) la Actividad de Aplicación de cada capítulo existente.
         // LOOP 8.3: y el video de los capítulos de contenido (prioridad audiovisual / valores fijados por el docente).
-        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}),
+        chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, application_kind: c.applicationKind ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}),
           // Loop 9 B: la propuesta fija (o quita) la práctica guiada de cada capítulo de contenido.
           guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null });
         return;
@@ -525,6 +535,7 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
         id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
         application_minutes: c.applicationMinutes ?? null,
+        ...(c.applicationKind ? { application_kind: c.applicationKind } : {}),
         ...(c.kind === 'content' && c.guidedPracticeMinutes ? { guided_practice_minutes: c.guidedPracticeMinutes } : {}),
         ...(inherited.length ? { outcome_ids: inherited } : {}),
       });
@@ -753,6 +764,10 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
 
   const pricing = input.pricing ?? null;
   const lite = input.distributionOnly === true;
+  // r79.1 (rendimiento): en la búsqueda del ajuste (distributionOnly) no se arman la línea base ni la vista pedagógica
+  // (Blueprint + Manifest + validación + tiempo de cada lado): la propuesta del distribuidor no las usa. `distribution` sale
+  // idéntica (BF19); `baseline`/`pedagogical`/`chapters`/`workload` quedan vacíos en ese modo (nadie más lo usa).
+  if (lite) return liteDryRun(input, base, rules, profile, profileEmpty, targetHours, activityTypeRules, registry, appContext, pricing, profileHm);
   const baseline = side(base, activityTypeRules, pricing, lite);
   let pedagogical: DryRunSide | null = null;
   let structureChanges: StructureChange[] = [];
@@ -879,63 +894,7 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
     profileEmpty,
     rules,
     targetHours,
-    distribution: targetHours === null ? null : (() => {
-      // Fase 2 (review I1): el distribuidor dimensiona sobre lo que el lock congelaría HOY (estructura viva + diseño),
-      // NUNCA sobre la vista con los cambios de estructura sugeridos (videos/actividades/repaso): esos no los escribe
-      // «Aplicar diseño» (los decide el docente en el editor), y contarlos haría que lo mostrado ≠ lo aplicado.
-      const lockShaped = rules ? applyPedagogyToSnapshot(base, rules) : base;
-      // T3 (r57): mezcla de práctica del plan de aprendizaje → restricciones del distribuidor (el documento manda).
-      const mixSpec = rules?.learningPlan?.composition?.practiceMix;
-      const mix = mixSpec
-        ? evaluatePracticeMix(mixSpec, [...lockShaped.modules].sort((a, b) => a.position - b.position), input.requirementConstraints ?? null)
-        : null;
-      // r79 · ajuste al presupuesto: tope de capítulos de contenido por módulo (preferencia del perfil). Va como un máximo
-      // más de las restricciones (nunca por debajo del mínimo del documento: ver withContentChaptersCap); sin la preferencia,
-      // las restricciones de siempre (byte a byte).
-      const contentCap = profileContentChaptersMax(input.profile);
-      const requirements = withContentChaptersCap(mix ? mix.constraints : input.requirementConstraints ?? null, contentCap, lockShaped.modules.length);
-      const dist = distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}) });
-      const materialized = materializeOrError(lockShaped, dist, (plain) => {
-        const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules, pricing);
-        materializedSide = ms;
-        // F1 (r57): con plan de aprendizaje, la decisión de actividad que ve el docente sale del Manifest materializado
-        // (con los capítulos de práctica incluidos), no de la estructura previa: fuente única = lo que se congela.
-        if (planOn && ms.blueprint.course.pedagogy) {
-          const finalDec = choosePedagogicalActivityTypes(ms.blueprint, activityTypeRules);
-          const manifestType = new Map(ms.manifest.items.filter((i) => i.type === 'activity').map((i) => [i.chapterId as string, i.h5pType as string | undefined]));
-          for (const ch of chapters) {
-            const cur = ch.activityDecision;
-            const fin = finalDec.get(ch.chapterId);
-            const mt = manifestType.get(ch.chapterId);
-            if (!cur || !fin || !fin.learningType) continue;
-            const type = mt ?? fin.type;
-            if (type === cur.type && fin.reason === cur.reason) continue;
-            const moved = type !== cur.type;
-            ch.activityDecision = {
-              type, reason: fin.reason, ruleId: fin.learningType.ruleId, candidates: [...fin.learningType.candidates],
-              rationale: moved
-                ? `${fin.learningType.rationale} El tope/balance del curso completo (con los capítulos de práctica) lo mueve de «${cur.type}» a «${type}».`
-                : fin.learningType.rationale,
-            };
-          }
-        }
-        return {
-          blueprintSha256: ms.blueprintSha256,
-          manifestSha256: ms.manifestSha256,
-          // LOOP 7 (A2 A4): la tarjeta «Cursia recomienda» muestra horas y conteos del modelo del distribuidor; si no
-          // coinciden con el Manifest materializado (lo que se congelaría), el error es visible y «Aplicar» se bloquea.
-          manifestErrors: [...ms.manifestErrors, ...distributionModelMismatch(dist, ms)],
-          items: ms.manifest.items.length,
-          totals: { ...(ms.manifest.totals as any) },
-          providers: ms.providers,
-          generableHours: ms.studyTime.courseEstimatedHours,
-          ...(() => { const a = alignmentOf(ms, input.alignment, registry); return a ? { alignment: a } : {}; })(),
-        };
-      }, appContext);
-      // Fase 2 · «Aplicar diseño»: huella de la propuesta que ve el docente (el servidor la recalcula al aplicar).
-      const mixView = mix ? { practiceMix: { status: mix.status, ruleId: mix.ruleId, plan: mix.plan, fit: mix.fit, notes: [...mix.notes] } } : {};
-      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist, contentCap !== null ? { contentChaptersMax: contentCap } : null), ...mixView, ...(contentCap !== null ? { contentChaptersMax: contentCap } : {}) };
-    })(),
+    distribution: targetHours === null ? null : distributionFor(input, base, rules, targetHours, activityTypeRules, registry, appContext, pricing, profileHm, chapters, planOn, (ms) => { materializedSide = ms; }),
     workload: targetHours === null
       ? null
       : {
@@ -974,4 +933,145 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
   const declared = typeof input.hoursReport === 'object' && input.hoursReport ? input.hoursReport.declared ?? null : null;
   const sd = materializedSide ?? view;
   return { ...out, hoursReport: hoursReportOf(sd, declared, input.requirementConstraints?.hoursBounds ?? null) };
+}
+
+const DIST_MEMO = new WeakMap<object, Map<string, DistributionResult>>();
+const DIST_MEMO_MAX = 4000;
+function memoDistributor(input: DryRunInput, lock: readonly TierLockRow[] | null, run: () => DistributionResult): DistributionResult {
+  const owner = input.structure as unknown as object;
+  if (!owner || typeof owner !== 'object') return run();
+  const p = (input.profile && typeof input.profile === 'object' ? JSON.parse(JSON.stringify(input.profile)) : input.profile) as any;
+  if (p && p.designPreferences) delete p.designPreferences.activityKinds;
+  let key: string;
+  try {
+    key = JSON.stringify({ p, pins: input.designPins ?? null, rq: input.requirementConstraints ?? null, atr: input.activityTypeRules ?? 2, lock, adj: input.applyStructureAdjustments ?? true, reg: input.registry ? 'custom' : 'default' });
+  } catch {
+    return run();
+  }
+  if (input.registry) return run();
+  let m = DIST_MEMO.get(owner);
+  if (!m) { m = new Map(); DIST_MEMO.set(owner, m); }
+  const hit = m.get(key);
+  if (hit) return hit;
+  const r = run();
+  if (m.size >= DIST_MEMO_MAX) m.clear();
+  m.set(key, r);
+  return r;
+}
+
+/** La propuesta del distribuidor materializada (la misma en el dry-run completo y en el liviano). */
+function distributionFor(
+  input: DryRunInput,
+  base: BlueprintSnapshotV2,
+  rules: DesignRules | null,
+  targetHours: number,
+  activityTypeRules: ActivityTypeRulesVersion,
+  registry: PedagogicalApproachRegistry,
+  appContext: ReturnType<typeof profileApplicationContext>,
+  pricing: DryRunPricing | null,
+  profileHm: ReturnType<typeof profileHoursModel>,
+  chapters: DryRunChapterRow[],
+  planOn: boolean,
+  onMaterialized: (ms: { blueprint: BlueprintSnapshotV2; manifest: GenerationManifestV1 }) => void,
+): NonNullable<DryRunResult['distribution']> {
+  let materializedSide: { blueprint: BlueprintSnapshotV2; manifest: GenerationManifestV1 } | null = null;
+
+      // Fase 2 (review I1): el distribuidor dimensiona sobre lo que el lock congelaría HOY (estructura viva + diseño),
+      // NUNCA sobre la vista con los cambios de estructura sugeridos (videos/actividades/repaso): esos no los escribe
+      // «Aplicar diseño» (los decide el docente en el editor), y contarlos haría que lo mostrado ≠ lo aplicado.
+      const lockShaped = rules ? applyPedagogyToSnapshot(base, rules) : base;
+      // T3 (r57): mezcla de práctica del plan de aprendizaje → restricciones del distribuidor (el documento manda).
+      const mixSpec = rules?.learningPlan?.composition?.practiceMix;
+      const mix = mixSpec
+        ? evaluatePracticeMix(mixSpec, [...lockShaped.modules].sort((a, b) => a.position - b.position), input.requirementConstraints ?? null)
+        : null;
+      // r79 · ajuste al presupuesto: tope de capítulos de contenido por módulo (preferencia del perfil). Va como un máximo
+      // más de las restricciones (nunca por debajo del mínimo del documento: ver withContentChaptersCap); sin la preferencia,
+      // las restricciones de siempre (byte a byte).
+      const contentCap = profileContentChaptersMax(input.profile);
+      const requirements = withContentChaptersCap(mix ? mix.constraints : input.requirementConstraints ?? null, contentCap, lockShaped.modules.length);
+      const lock = input.tierLock ?? null;
+      const runDistributor = () => distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}), ...(lock ? { tierSelectable: (t: number) => isTierSelectable('standard', t, lock) } : {}) });
+      // r79.1 (rendimiento): en la búsqueda del ajuste (distributionOnly) el distribuidor se corre UNA vez por combinación
+      // que lo afecta: los tipos de actividad no cambian su entrada (se asignan después), así que «automático» y «ninguno»
+      // comparten el resultado. Caché por la estructura recibida (misma identidad en toda la búsqueda) y el resto de la
+      // entrada serializada. Función pura: mismo resultado; solo en el modo liviano (sus lectores no modifican el diseño).
+      const dist0 = input.distributionOnly === true ? memoDistributor(input, lock, runDistributor) : runDistributor();
+      // r79.1 · tipos de Actividad de Aplicación (estudio de caso / proyecto integrador / retroalimentación formativa):
+      // con «automático», donde aportan valor (criterios K1–K3); sin la preferencia y sin tipos en la estructura, el
+      // diseño de siempre (byte a byte). Sin la preferencia pero con tipos aplicados antes, la propuesta los quita.
+      const kindsMode = profileActivityKinds(input.profile);
+      const kindsInStructure = lockShaped.modules.some((m) => m.chapters.some((c) => (c as { applicationKind?: unknown }).applicationKind !== undefined));
+      const kinds = kindsMode === 'auto' || kindsInStructure ? assignApplicationKinds(dist0, lockShaped, kindsMode, lock) : null;
+      const dist = kinds ? kinds.dist : dist0;
+      const materialized = materializeOrError(lockShaped, dist, (plain) => {
+        const ms = side(rules ? applyPedagogyToSnapshot(plain, rules) : plain, activityTypeRules, pricing);
+        materializedSide = ms;
+        onMaterialized(ms);
+        // F1 (r57): con plan de aprendizaje, la decisión de actividad que ve el docente sale del Manifest materializado
+        // (con los capítulos de práctica incluidos), no de la estructura previa: fuente única = lo que se congela.
+        if (planOn && ms.blueprint.course.pedagogy) {
+          const finalDec = choosePedagogicalActivityTypes(ms.blueprint, activityTypeRules);
+          const manifestType = new Map(ms.manifest.items.filter((i) => i.type === 'activity').map((i) => [i.chapterId as string, i.h5pType as string | undefined]));
+          for (const ch of chapters) {
+            const cur = ch.activityDecision;
+            const fin = finalDec.get(ch.chapterId);
+            const mt = manifestType.get(ch.chapterId);
+            if (!cur || !fin || !fin.learningType) continue;
+            const type = mt ?? fin.type;
+            if (type === cur.type && fin.reason === cur.reason) continue;
+            const moved = type !== cur.type;
+            ch.activityDecision = {
+              type, reason: fin.reason, ruleId: fin.learningType.ruleId, candidates: [...fin.learningType.candidates],
+              rationale: moved
+                ? `${fin.learningType.rationale} El tope/balance del curso completo (con los capítulos de práctica) lo mueve de «${cur.type}» a «${type}».`
+                : fin.learningType.rationale,
+            };
+          }
+        }
+        return {
+          blueprintSha256: ms.blueprintSha256,
+          manifestSha256: ms.manifestSha256,
+          // LOOP 7 (A2 A4): la tarjeta «Cursia recomienda» muestra horas y conteos del modelo del distribuidor; si no
+          // coinciden con el Manifest materializado (lo que se congelaría), el error es visible y «Aplicar» se bloquea.
+          manifestErrors: [...ms.manifestErrors, ...distributionModelMismatch(dist, ms)],
+          items: ms.manifest.items.length,
+          totals: { ...(ms.manifest.totals as any) },
+          providers: ms.providers,
+          generableHours: ms.studyTime.courseEstimatedHours,
+          ...(() => { const a = alignmentOf(ms, input.alignment, registry); return a ? { alignment: a } : {}; })(),
+        };
+      }, appContext);
+      // Fase 2 · «Aplicar diseño»: huella de la propuesta que ve el docente (el servidor la recalcula al aplicar).
+      const mixView = mix ? { practiceMix: { status: mix.status, ruleId: mix.ruleId, plan: mix.plan, fit: mix.fit, notes: [...mix.notes] } } : {};
+      return { ...dist, materialized, proposalSha256: distributionProposalSha256(dist, contentCap !== null ? { contentChaptersMax: contentCap } : null), ...mixView, ...(contentCap !== null ? { contentChaptersMax: contentCap } : {}), ...(kinds && kindsMode === 'auto' ? { activityKinds: kinds.report } : {}) };
+}
+
+/** r79.1 · dry-run liviano de la búsqueda del ajuste: solo `distribution` (idéntica a la del completo). */
+function liteDryRun(
+  input: DryRunInput,
+  base: BlueprintSnapshotV2,
+  rules: DesignRules | null,
+  profile: PedagogicalProfile | null,
+  profileEmpty: boolean,
+  targetHours: number | null,
+  activityTypeRules: ActivityTypeRulesVersion,
+  registry: PedagogicalApproachRegistry,
+  appContext: ReturnType<typeof profileApplicationContext>,
+  pricing: DryRunPricing | null,
+  profileHm: ReturnType<typeof profileHoursModel>,
+): DryRunResult {
+  const ped = rules ? applyPedagogyToSnapshot(base, rules).course.pedagogy ?? null : null;
+  const planOn = !!ped?.learningPlan;
+  return {
+    dryRun: true, providersCalled: 0, spendUsd: '0.00', engineVersion: PEDAGOGY_ENGINE_VERSION, activityTypeRules,
+    profile, profileEmpty, rules, targetHours,
+    distribution: targetHours === null ? null : distributionFor(input, base, rules, targetHours, activityTypeRules, registry, appContext, pricing, profileHm, [], planOn, () => undefined),
+    workload: null,
+    baseline: null as unknown as DryRunSide,
+    pedagogical: null,
+    structureChanges: [], objectives: [], modules: [], chapters: [], assessment: null,
+    diff: { itemsAdded: [], itemsRemoved: [], h5pTypeChanges: [], itemsWithDesign: 0, totals: { baseline: {}, pedagogical: null }, estimateExpectedUsd: { baseline: null, pedagogical: null }, estimatedHours: { baseline: 0, pedagogical: null }, summary: [] },
+    appliedRules: rules ? rules.applied : [], generators: [], courseOverrides: [],
+  };
 }

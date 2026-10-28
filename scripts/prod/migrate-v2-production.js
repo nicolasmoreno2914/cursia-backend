@@ -293,6 +293,10 @@ const EXCLUDED = [
   { file: 'scripts/migrate-r75-access.js', reason: 'r75: staging-only hasta aprobación del owner' },
   { file: 'scripts/migrate-r75-budgets.js', reason: 'r75: staging-only hasta aprobación del owner' },
   { file: 'scripts/migrate-r75-backfill.js', reason: 'r75: staging-only hasta aprobación del owner (backfill de instituciones/membresías; solo por workflow_dispatch)' },
+  // r79.1 (tipos de Actividad de Aplicación): course_chapters.application_kind. Staging-only hasta que el owner apruebe
+  // llevar r79 a producción (el código lee la columna con to_jsonb y escribirla exige la columna: sin ella, 503).
+  { file: 'supabase-migration-r79-1-application-kinds.sql', reason: 'r79.1: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r79-1-application-kinds.js', reason: 'r79.1: staging-only hasta aprobación del owner' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

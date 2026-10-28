@@ -8,6 +8,8 @@
 //   - los documentos de las Actividades de Aplicación (criterios y pesos, producto; el solucionario se NOMBRA, nunca se
 //     enlaza ni se copia: sigue siendo su propia página oculta).
 // Moodle filtra el HTML (format_text): estilos inline (CLEAN_SAFE), sin <style>/<script>, texto protegido con nolink.
+import { APPLICATION_KIND_LABEL } from '../study-time/application-kind-tiers';
+import { applicationDocKind } from './application-pages';
 import type { ResolvedTheme } from '../theme-engine';
 import { contrastRatio } from '../theme-engine';
 import { lintCleanSafe } from '../visual-components';
@@ -221,10 +223,17 @@ export function teacherGuidePage(input: TeacherGuideInput, theme: ResolvedTheme)
         const deliv = ch.applicationDelivery?.mode === 'assign'
           ? (ch.applicationDelivery.graded ? 'Tarea de Moodle calificada' : 'Tarea de Moodle formativa (sin nota)')
           : 'página del curso (sin entrega en Moodle)';
-        inner += pHtml(h, kv('Actividad de Aplicación', `${inlineHtml(a.title)}${labelHtml(` · ~${ch.applicationMinutes} min · ${deliv}`)}`), cs.s);
+        // r79.1: los tipos nuevos se nombran por su tipo (estudio de caso / proyecto integrador / retroalimentación formativa).
+        const kind = applicationDocKind(doc);
+        const SOL_WHAT: Record<string, string> = {
+          case_study: 'análisis esperado de cada pregunta, discusión de la decisión, preguntas para la clase y guía de corrección por criterio',
+          integrative_project: 'guía de cada etapa (producto esperado, errores frecuentes, preguntas de control), ejemplo de producto final y guía de corrección por criterio',
+          formative_feedback: 'banco de retroalimentación por criterio de revisión, diagnóstico de errores y guía de corrección por criterio',
+        };
+        inner += pHtml(h, kv(kind ? APPLICATION_KIND_LABEL[kind] : 'Actividad de Aplicación', `${inlineHtml(a.title)}${labelHtml(` · ~${ch.applicationMinutes} min · ${deliv}`)}`), cs.s);
         inner += pHtml(h, kv('Producto o evidencia', inlineHtml(a.deliverable?.description ?? '')), cs.s, { secondary: true });
         inner += ul(h, a.criteria.map((cr: any) => `<strong>${inlineHtml(cr.name)}</strong>${labelHtml(` (${cr.weight} %) — `)}${inlineHtml(cr.description)}`), cs.s);
-        inner += pHtml(h, kv('Solucionario', labelHtml(`página oculta «${applicationSolutionPageName(ch.number)}» en la sección de este capítulo (respuestas, solución del taller y guía de corrección por criterio).`)), cs.s, { secondary: true });
+        inner += pHtml(h, kv('Solucionario', labelHtml(`página oculta «${applicationSolutionPageName(ch.number, kind)}» en la sección de este capítulo (${kind ? SOL_WHAT[kind] : 'respuestas, solución del taller y guía de corrección por criterio'}).`)), cs.s, { secondary: true });
       }
       if (ch.resources && ch.resources.length) {
         inner += pHtml(h, `<strong>${labelHtml(ch.resources.length === 1 ? 'Archivo de trabajo:' : 'Archivos de trabajo:')}</strong>`, cs.s);

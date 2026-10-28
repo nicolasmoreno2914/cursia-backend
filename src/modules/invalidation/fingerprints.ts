@@ -381,7 +381,9 @@ export function computeFingerprintsV3(
   for (const m of (bp as any).modules ?? []) {
     for (const c of m.chapters ?? []) {
       if (typeof c.applicationMinutes === 'number') {
-        application.set(c.id, sha256Canonical({ v, kind: 'application-frame', minutes: c.applicationMinutes, applicationContext: appContext }));
+        // r79.1: el tipo de la Actividad entra a la huella SOLO si existe (las Actividades de siempre conservan su huella;
+        // cambiar el tipo regenera SOLO esa Actividad).
+        application.set(c.id, sha256Canonical({ v, kind: 'application-frame', minutes: c.applicationMinutes, applicationContext: appContext, ...(typeof c.applicationKind === 'string' ? { applicationKind: c.applicationKind } : {}) }));
       }
     }
   }

@@ -761,7 +761,7 @@ async function main() {
       blueprint: { course: { id: 1, title: 'Farmacología aplicada' }, module: { id: M1, title: 'Dosificación', objective: null, position: 1 }, chapter: { id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis', position: 1, videoEnabled: false },
         moduleChapters: [{ id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis', chapterNumber: 1 }], outline: [{ moduleNumber: 1, id: M1, title: 'Dosificación', objective: null, chapters: [{ chapterNumber: 1, id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis' }] }] },
       dependencyArtifacts: [{ itemKey: 'content:' + C1, artifactId: 'md1', type: 'dynamic_content_md', storagePath: 'x' }, { itemKey: 'content:' + C1, artifactId: 'cp1', type: 'dynamic_context_package_json', storagePath: 'x' }],
-      claimPayload: { validatedArtifactType: 'dynamic_application_json', chapterId: C1, application: { minutes: 60, chapterKind: 'content', schemaVersion: 1, context: null, ...(announce ? { draftArtifactType: 'dynamic_application_draft_json' } : {}) } },
+      claimPayload: { validatedArtifactType: 'dynamic_application_json', chapterId: C1, application: { minutes: 60, chapterKind: 'content', schemaVersion: 2, context: null, ...(announce ? { draftArtifactType: 'dynamic_application_draft_json' } : {}) } },
     });
     let calls = [];
     let rt = mkRuntime((n) => JSON.stringify(n === 1 ? act : sol(6)), calls);

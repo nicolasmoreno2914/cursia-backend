@@ -11,6 +11,9 @@
 //   BL4  64 h con Actividades «solo en práctica» y «ninguna»
 //   BL5  0 llamadas de red medidas
 //
+// r79.1 (dorado regenerado A PROPÓSITO): solo cambia el costo esperado de Anthropic de los escenarios con Actividades de
+// 120 min (+0,10 a +0,30 USD): el nivel de 120 reforzado exige más salida (11 unidades en vez de 10). Estructuras, horas,
+// conteos, huellas de propuesta, Blueprint y Manifest: idénticos (verificado con el costo anterior: 0 diferencias).
 // Uso: node scripts/check-design-baseline.js [path/to/dist] [--write]   (--write regenera el dorado)
 'use strict';
 const fs = require('fs');

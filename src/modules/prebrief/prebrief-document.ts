@@ -1,3 +1,10 @@
+// r79.1: nombres y notas de los tipos de Actividad de Aplicación en la propuesta pedagógica.
+const KIND_LABEL_PB: Record<string, string> = { case_study: 'Estudio de caso', integrative_project: 'Proyecto integrador', formative_feedback: 'Retroalimentación formativa' };
+const KIND_NOTE_PB: Record<string, string> = {
+  case_study: 'Caso con datos, preguntas de análisis graduadas y una decisión justificada; el solucionario queda solo para docentes.',
+  integrative_project: 'Proyecto por etapas con entregables intermedios y producto final; la guía de cada etapa queda solo para docentes.',
+  formative_feedback: 'Revisión del propio trabajo con criterios, ejemplar comentado y plan de mejora; el banco de retroalimentación queda solo para docentes.',
+};
 import { createHash } from 'crypto';
 import type { PrebriefModel, PrebriefOrigin } from './prebrief-model';
 
@@ -200,7 +207,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
       title: `Módulo ${md.n} · ${md.title}`, hours: `${n1(md.hours)} h`, exam: md.exam,
       chapters: md.chapters.map((c) => ({
         n: c.n, title: c.title + (c.proposed ? ' (propuesto)' : ''), hours: `${n1(c.hours)} h`, practice: c.kind === 'practice',
-        tags: [c.kind === 'practice' ? 'Práctica' : '', c.video ? 'Video' : '', c.activity ? 'Actividad' : '', c.applicationMinutes ? `Aplicación ${c.applicationMinutes} min` : '', c.guidedPracticeMinutes ? `Ejercicios guiados ${c.guidedPracticeMinutes} min` : ''].filter(Boolean),
+        tags: [c.kind === 'practice' ? 'Práctica' : '', c.video ? 'Video' : '', c.activity ? 'Actividad' : '', c.applicationMinutes ? `${c.applicationKind ? KIND_LABEL_PB[c.applicationKind] ?? 'Aplicación' : 'Aplicación'} ${c.applicationMinutes} min` : '', c.guidedPracticeMinutes ? `Ejercicios guiados ${c.guidedPracticeMinutes} min` : ''].filter(Boolean),
       })),
     })) });
   sections.push({ id: 'structure', n: '7', title: 'Duración y estructura', blocks: st });
@@ -210,7 +217,7 @@ export function buildPrebriefDocument(m: PrebriefModel): PrebriefDocument {
   const evList: { text: string; note?: string }[] = [];
   for (const e of m.evaluation.moduleExams) evList.push({ text: `Evaluación del módulo ${e.module}: ${e.title}`, note: e.outcomeIds.length ? `Resultados: ${e.outcomeIds.join(', ')}` : undefined });
   if (m.evaluation.finalExam) evList.push({ text: 'Evaluación final integradora', note: m.goals.outcomes.length ? `Resultados: ${m.goals.outcomes.map((x) => x.id).join(', ')}` : undefined });
-  for (const a of m.evaluation.applicationActivities) evList.push({ text: `Actividad de Aplicación del capítulo ${a.chapter} (${a.minutes} min): ${a.title}`, note: 'Evidencia de desempeño; el solucionario queda solo para docentes.' });
+  for (const a of m.evaluation.applicationActivities) evList.push({ text: `${a.kind ? KIND_LABEL_PB[a.kind] ?? 'Actividad de Aplicación' : 'Actividad de Aplicación'} del capítulo ${a.chapter} (${a.minutes} min): ${a.title}`, note: a.kind ? KIND_NOTE_PB[a.kind] ?? 'Evidencia de desempeño; el solucionario queda solo para docentes.' : 'Evidencia de desempeño; el solucionario queda solo para docentes.' });
   ev.push({ t: 'subheading', text: 'Evaluaciones del curso' });
   if (m.evaluation.passingGrade !== null) ev.push({ t: 'paragraph', text: `Nota mínima de aprobación del curso: ${n1(m.evaluation.passingGrade)} sobre 100.`, origin: o('institution') });
   ev.push(evList.length ? { t: 'list', items: evList } : { t: 'paragraph', text: 'El diseño no incluye evaluaciones.', muted: true });

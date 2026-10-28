@@ -527,9 +527,10 @@ function rcpWithApplications() {
     assert(codes(m4).includes('APPLICATION_SHAPE'), 'campo extra en la actividad rechazado');
     // M6: costo por nivel de minutos (la salida escala con los ejercicios; 60 min = referencia).
     const RB = loadDist('modules/finops/run-budget.js');
-    eq([30, 60, 90, 120].map((x) => RB.applicationUsageScale(x)), [{ output_tokens: 0.8571 }, { output_tokens: 1 }, { output_tokens: 1.2857 }, { output_tokens: 1.4286 }], 'escala por nivel');
+    // r79.1 (intencional): el nivel de 120 exige 10–12 ejercicios + hitos del taller → 11 unidades de salida (antes 10): 1,5714.
+    eq([30, 60, 90, 120].map((x) => RB.applicationUsageScale(x)), [{ output_tokens: 0.8571 }, { output_tokens: 1 }, { output_tokens: 1.2857 }, { output_tokens: 1.5714 }], 'escala por nivel');
     const est = RB.estimateItemsForRun([{ key: 'application_activity:x', type: 'application_activity', chapterId: 'x', applicationMinutes: 120 }, { key: 'application_activity:y', type: 'application_activity', chapterId: 'y', applicationMinutes: 60 }], 'mock');
-    eq(est.map((e) => e.usageScale ?? null), [{ output_tokens: 1.4286 }, null], 'el estimador lleva la escala (60 min sin escala)');
+    eq(est.map((e) => e.usageScale ?? null), [{ output_tokens: 1.5714 }, null], 'el estimador lleva la escala (60 min sin escala)');
   });
 
   console.log(`\n${passes} OK, ${failures} fallidas`);

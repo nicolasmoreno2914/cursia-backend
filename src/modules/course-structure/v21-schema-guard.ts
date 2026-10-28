@@ -121,6 +121,35 @@ export async function assertApplicationActivitySchema(q: { query(sql: string, pa
   applicationVerified = true;
 }
 
+// ── r79.1: Tipo de la Actividad de Aplicación (course_chapters.application_kind) ──
+// Migración supabase-migration-r79-1-application-kinds.sql (SOLO staging). Sin ella la lectura no informa
+// `applicationKind` y un diseño que usa los tipos nuevos responde 503 al aplicarse (nunca se pierden en silencio).
+export const SCHEMA_NOT_MIGRATED_APPLICATION_KIND = 'schema_not_migrated_application_kind';
+let applicationKindVerified = false;
+
+export function _resetApplicationKindSchemaGuardForTests(): void {
+  applicationKindVerified = false;
+}
+
+/** ¿La base tiene la columna? (sin lanzar). */
+export async function hasApplicationKindSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<boolean> {
+  if (applicationKindVerified) return true;
+  const res: any = await q.query(
+    `select 1 from information_schema.columns where table_schema = 'public' and table_name = 'course_chapters' and column_name = 'application_kind'`,
+  );
+  const rows: unknown[] = Array.isArray(res) ? res : res.rows;
+  if (rows.length) applicationKindVerified = true;
+  return rows.length > 0;
+}
+
+export async function assertApplicationKindSchema(q: { query(sql: string, params?: any[]): Promise<any> }): Promise<void> {
+  if (await hasApplicationKindSchema(q)) return;
+  throw new ServiceUnavailableException({
+    code: SCHEMA_NOT_MIGRATED_APPLICATION_KIND,
+    message: `${SCHEMA_NOT_MIGRATED_APPLICATION_KIND}: esta base no tiene los tipos de Actividad de Aplicación (course_chapters.application_kind); correr supabase-migration-r79-1-application-kinds.sql antes de usarlos.`,
+  });
+}
+
 // ── Loop 9 B: Práctica guiada (course_chapters.guided_practice_minutes) ──
 // Misma regla que las Actividades de Aplicación: la migración (supabase-migration-guided-practice.sql) corre SOLO en
 // staging; sin ella la lectura no informa `guidedPracticeMinutes` y una escritura con la clave responde 503.
