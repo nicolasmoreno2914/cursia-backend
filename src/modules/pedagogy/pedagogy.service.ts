@@ -16,13 +16,24 @@ import {
 import { activityTypeRulesForNextManifest, readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
 import type { ActivityTypeRulesVersion } from '../generation-manifests/activity-type-rules';
 import { defaultApproachRegistry } from './builtin-approaches';
-import { DryRunInput, DryRunResult, runPedagogyDryRun } from './dry-run';
+import { DryRunInput, DryRunPricing, DryRunResult, runPedagogyDryRun } from './dry-run';
+import { loadDryRunPricing } from '../finops/dry-run-pricing';
 import { PEDAGOGY_ROLE_LABELS, PEDAGOGY_SECTION_LABELS, PEDAGOGY_TARGET_LABELS, PEDAGOGY_VALUE_LABELS } from './labels';
 import { loadCurrentPedagogicalProfile } from './pedagogy-db';
 import { PedagogyRecommendation, WIZARD_QUESTIONS, recommendApproaches } from './recommendation';
 import { PEDAGOGY_ENGINE_VERSION } from './vocabulary';
 import { plainCourseRefV2 } from '../course-blueprints/lock-snapshot';
 import { declaredHoursFromAcademicContext } from '../study-time/hours-ledger';
+
+export interface DryRunCourseBody {
+  profile?: unknown;
+  activityTypeRules?: ActivityTypeRulesVersion;
+  applyStructureAdjustments?: boolean;
+  requirementDecisions?: DecisionOverrides;
+  ignorePins?: boolean;
+  academicOverride?: StoredAcademicContext | null;
+  chapterLinksOverride?: ReadonlyMap<string, string[]>;
+}
 
 /** Límites del dry-run en línea (lógica pura, pero sin estructuras gigantes). */
 const MAX_DRY_RUN_MODULES = 20;
@@ -110,8 +121,22 @@ export class PedagogyService {
   async dryRunCourse(
     courseId: number,
     ownerId: string,
-    body: { profile?: unknown; activityTypeRules?: ActivityTypeRulesVersion; applyStructureAdjustments?: boolean; requirementDecisions?: DecisionOverrides; ignorePins?: boolean; academicOverride?: StoredAcademicContext | null; chapterLinksOverride?: ReadonlyMap<string, string[]> },
+    body: DryRunCourseBody,
   ): Promise<DryRunResult & { profileSource: 'request' | 'saved' | 'none'; savedProfileVersion: number }> {
+    const { input, fromRequest, saved } = await this.dryRunCourseInput(courseId, ownerId, body);
+    const result = asBadRequest(() => runPedagogyDryRun(input));
+    return {
+      ...result,
+      profileSource: fromRequest ? 'request' : saved ? 'saved' : 'none',
+      savedProfileVersion: saved?.version ?? 0,
+    };
+  }
+
+  /**
+   * r79 · El input del dry-run del curso (lo mismo que corre dryRunCourse), para que «Ajustar al presupuesto» evalúe sus
+   * candidatos con la MISMA estructura viva, pines, requisitos y precios sin volver a leer la base por cada uno.
+   */
+  async dryRunCourseInput(courseId: number, ownerId: string, body: DryRunCourseBody): Promise<{ input: DryRunInput; fromRequest: boolean; saved: Awaited<ReturnType<typeof loadCurrentPedagogicalProfile>> }> {
     const course = await this.coursesService.findOne(courseId, ownerId); // 404 si no es suyo
     if (course.structureVersion !== 'dynamic') {
       throw new BadRequestException(`El curso #${courseId} es "${course.structureVersion}" — esta API solo admite cursos "dynamic".`);
@@ -165,26 +190,31 @@ export class PedagogyService {
     // LOOP 8.6C: los requisitos obligatorios del documento (alternativa elegida, excepciones) restringen el diseño.
     const requirementConstraints = await requirementConstraintsForCourse(this.dataSource, courseId, academic ? academic.context.documents : [],
       saved ? ((saved.profile as any).designPreferences || null) : null, body.requirementDecisions);
-    const result = asBadRequest(() =>
-      runPedagogyDryRun({
-        structure: snapshot,
-        profile,
-        activityTypeRules: atr,
-        applyStructureAdjustments: body.applyStructureAdjustments,
-        // Fase 4: dato del contexto que no vive en el Blueprint (sugerencia P2 del Coherence Engine).
-        // r72: también cuenta lo que respondió el docente (perfil pedagógico → estudiante → «Lo que ya sabe»).
-        alignment: { priorKnowledgeDeclared: (profile && (profile as any).learner && (profile as any).learner.priorKnowledge) ? true : academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },
-        // LOOP 8.3: lo que el docente fijó a mano (el mismo mapa que usa «Aplicar diseño»: misma propuesta, misma huella).
-        designPins,
-        requirementConstraints,
-        // r58 (I3): registro de horas con las horas que declara el documento (total, componentes, créditos), si las hay.
-        hoursReport: { declared: academic ? declaredHoursFromAcademicContext(academic.context) : null },
-      }),
-    );
-    return {
-      ...result,
-      profileSource: fromRequest ? 'request' : saved ? 'saved' : 'none',
-      savedProfileVersion: saved?.version ?? 0,
+    const input: DryRunInput = {
+      structure: snapshot,
+      profile,
+      activityTypeRules: atr,
+      applyStructureAdjustments: body.applyStructureAdjustments,
+      // Fase 4: dato del contexto que no vive en el Blueprint (sugerencia P2 del Coherence Engine).
+      // r72: también cuenta lo que respondió el docente (perfil pedagógico → estudiante → «Lo que ya sabe»).
+      alignment: { priorKnowledgeDeclared: (profile && (profile as any).learner && (profile as any).learner.priorKnowledge) ? true : academic ? academic.context.learner.priorKnowledge.status !== 'missing' : null },
+      // LOOP 8.3: lo que el docente fijó a mano (el mismo mapa que usa «Aplicar diseño»: misma propuesta, misma huella).
+      designPins,
+      requirementConstraints,
+      // r58 (I3): registro de horas con las horas que declara el documento (total, componentes, créditos), si las hay.
+      hoursReport: { declared: academic ? declaredHoursFromAcademicContext(academic.context) : null },
+      // r79 (F2): los MISMOS precios y reintentos que la «Estimación de producción».
+      pricing: await this.pricing(),
     };
+    return { input, fromRequest, saved };
   }
+
+  /**
+   * r79 (F2 · una sola cifra de costo): catálogo `pricing_catalog` de la base + `readEstimateRetryPolicy` (los mismos de
+   * previewStart), con los precios vigentes ahora. Sin la tabla (base de pruebas vieja) o vacía: el seed, rotulado así.
+   */
+  async pricing(): Promise<DryRunPricing> {
+    return loadDryRunPricing(this.dataSource);
+  }
+
 }

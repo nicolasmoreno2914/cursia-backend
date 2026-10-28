@@ -2,6 +2,7 @@
 export * from './errors';
 export * from './decimal';
 export * from './pricing';
+export * from './pricing-catalog-db';
 export * from './idempotency';
 export * from './operations';
 export * from './usage-model';

@@ -3,6 +3,7 @@ import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, normalizeDecimal, DecimalLike } from './decimal';
 import { PricingCatalogRow, conservativePrice, llmUpperBoundVariants, priceUsage } from './pricing';
+import { GAMMA_PRICE_TARGET, GammaPriceView, currentGammaPrice, gammaPriceRow, parseGammaPriceInput, readPricingCatalog } from './pricing-catalog-db';
 import { EstimateItem, EstimateResult, RetryPolicy, estimateCost } from './estimator';
 import { usageModelPriorsV1 } from './usage-model';
 import { BudgetPolicy, RuntimeGuardResult, SpentSoFar, policyFromRow, policySpendCaps, runtimeGuard } from './budget';
@@ -107,11 +108,41 @@ export class FinopsBudgetService {
   }
 
   async catalog(runner: Runner = this.dataSource): Promise<PricingCatalogRow[]> {
-    return runner.query(
+    // r79 (F2): la misma lectura que la estimación en seco (fuente única de precios).
+    return readPricingCatalog(runner);
+  }
+
+  /** r79 · Gamma: precio vigente del crédito (SuperAdmin) y su historial (filas de Gamma, más nueva primero). */
+  async gammaPrice(runner: Runner = this.dataSource): Promise<{ current: GammaPriceView | null; history: GammaPriceView[] }> {
+    const rows: any[] = await runner.query(
       `select id, provider, service, product_or_model, meter, unit_size::text as unit_size, unit_price::text as unit_price,
-              currency, pricing_version, effective_from, effective_to, source, source_ref, verified
-         from public.pricing_catalog`,
+              currency, pricing_version, effective_from, effective_to, source, source_ref, verified, created_by
+         from public.pricing_catalog where provider = $1 and service = $2 and product_or_model = $3 and meter = $4
+        order by effective_from desc limit 20`,
+      [GAMMA_PRICE_TARGET.provider, GAMMA_PRICE_TARGET.service, GAMMA_PRICE_TARGET.product, GAMMA_PRICE_TARGET.meter],
     );
+    const list = Array.isArray(rows) ? rows : (rows as any)?.rows || [];
+    return {
+      current: currentGammaPrice(list),
+      history: list.map((r: any) => currentGammaPrice([{ ...r, effective_to: null }], new Date(r.effective_from))).filter(Boolean) as GammaPriceView[],
+    };
+  }
+
+  /**
+   * r79 · Gamma: precio NUEVO del crédito (fila nueva, append-only; la vigente pasa a ser esta por effective_from). Sin
+   * migración: `pricing_catalog` ya tiene plan/precio/créditos (source_ref), verificado (verified) y quién (created_by).
+   */
+  async setGammaPrice(body: unknown, actor: string): Promise<{ created: true; current: GammaPriceView | null }> {
+    const input = parseGammaPriceInput(body);
+    const row = gammaPriceRow(input, new Date(), actor);
+    await this.dataSource.query(
+      `insert into public.pricing_catalog (provider, service, product_or_model, meter, unit_size, unit_price, currency, pricing_version,
+                                           effective_from, effective_to, source, source_ref, verified, created_by)
+       values ($1, $2, $3, $4, $5::numeric, $6::numeric, $7, $8, $9::timestamptz, null, $10, $11, $12, $13)`,
+      [row.provider, row.service, row.product_or_model, row.meter, row.unit_size, row.unit_price, row.currency, row.pricing_version,
+        row.effective_from, row.source, row.source_ref, row.verified, row.created_by],
+    );
+    return { created: true, current: (await this.gammaPrice()).current };
   }
 
   /** Estimado (precios vigentes ahora) de una lista de items. */

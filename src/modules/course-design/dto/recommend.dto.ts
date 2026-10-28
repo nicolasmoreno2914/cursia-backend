@@ -20,6 +20,13 @@ export class DesignAdjustDto {
   @IsOptional() @IsIn(['auto', 'none'])
   guidedPractice?: 'auto' | 'none';
 
+  /**
+   * r79 · «Presupuesto de producción del curso (USD)» (1–5000; null lo quita). Solo con DYNAMIC_BUDGET_FIT; sin el
+   * interruptor se ignora. Es una referencia para diseñar: nunca el «Tope autorizado» de la generación.
+   */
+  @IsOptional() @IsNumber({ maxDecimalPlaces: 2 }) @Min(1) @Max(5000)
+  productionBudgetUsd?: number | null;
+
   /** Enfoque principal, o 'recommended' (el que recomienda Cursia). */
   @IsOptional() @IsString() @MaxLength(64)
   approach?: string;

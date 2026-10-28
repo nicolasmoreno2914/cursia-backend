@@ -1,4 +1,7 @@
 import { GenerationDesignGate, GenerationGateResult } from '../course-design/generation-design-gate';
+import { GAMMA_PROVISIONAL_LABEL } from '../pedagogy/dry-run';
+import { loadCurrentPedagogicalProfile as r79LoadPedagogy } from '../pedagogy/pedagogy-db';
+import { isBudgetFitEnabled, readBudgetFitMargin } from '../course-design/budget-fit';
 import { PrebriefService } from '../prebrief/prebrief.service';
 import { alignCourseContextWithSnapshot } from '../course-facts/course-facts';
 import { loadFrozenLearner } from '../course-facts/course-facts-db';
@@ -843,6 +846,16 @@ export interface StartPreview {
    * `verdict: 'over'` nunca llega acá: la vista previa responde 409 PACKAGE_SIZE_PROJECTED_OVER_LIMIT.
    */
   packageSize?: PackageSizeProjection | null;
+  /**
+   * r79 · Gamma: la estimación usa Gamma y el precio de su crédito no está verificado → se rotula como provisional (no es
+   * una estimación comercial definitiva). Solo si el estimado tiene costo de Gamma.
+   */
+  provisionalPricing?: { gamma: boolean; label: string | null } | null;
+  /**
+   * r79 · «Presupuesto de producción: USD 35 · Esperado: USD 33 ✓» (solo con DYNAMIC_BUDGET_FIT y un presupuesto en el
+   * perfil pedagógico). Es una REFERENCIA: nunca es el «Tope autorizado» (isAuthorizedCap siempre false).
+   */
+  productionBudget?: { usd: number; expectedUsd: string; expectedWithMarginUsd: string; margin: number; withinBudget: boolean; isAuthorizedCap: false } | null;
   /** Internos (no viajan al cliente: ver publicPreview). */
   _plan?: NormalApprovalPlan;
   _evaluation?: StartBudgetEvaluation;
@@ -1335,9 +1348,34 @@ export class RunsService {
       packageSize,
       // r75: paga quien inicia (el actor), no el dueño técnico del curso.
       userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
+      ...(await this.r79PreviewExtras(courseId, evaluation.estimate)),
       _plan: plan,
       _evaluation: evaluation,
     } as StartPreview;
+  }
+
+  /**
+   * r79 · Extras de la «Estimación de producción»: rótulo provisional de Gamma (precio sin verificar) y la línea del
+   * presupuesto de producción del curso. Nunca cambia el estimado, la huella ni el monto que se autoriza.
+   */
+  private async r79PreviewExtras(courseId: number, estimate: StartBudgetEvaluation['estimate']): Promise<Pick<StartPreview, 'provisionalPricing' | 'productionBudget'>> {
+    const out: Pick<StartPreview, 'provisionalPricing' | 'productionBudget'> = {};
+    const gammaUsd = Number(estimate.totals.byProvider.gamma?.expected ?? 0);
+    if (gammaUsd > 0 && this.finopsBudget && typeof (this.finopsBudget as any).gammaPrice === 'function') {
+      const g = await this.finopsBudget.gammaPrice().catch(() => ({ current: null as null | { provisional: boolean } }));
+      const provisional = !g.current || g.current.provisional;
+      out.provisionalPricing = { gamma: provisional, label: provisional ? GAMMA_PROVISIONAL_LABEL : null };
+    }
+    if (isBudgetFitEnabled()) {
+      const saved = await r79LoadPedagogy(this.dataSource, courseId).catch(() => null);
+      const usd = saved ? (saved.profile as any).productionBudgetUsd : undefined;
+      if (typeof usd === 'number') {
+        const margin = readBudgetFitMargin();
+        const withMargin = Number(estimate.totals.expected) * (1 + margin);
+        out.productionBudget = { usd, expectedUsd: Number(estimate.totals.expected).toFixed(2), expectedWithMarginUsd: withMargin.toFixed(2), margin, withinBudget: withMargin <= usd + 1e-9, isAuthorizedCap: false };
+      } else out.productionBudget = null;
+    }
+    return out;
   }
 
   /** Política + gasto del curso + comprometido del mes → plan de aprobación normal (sobre `runner`). */
@@ -1586,6 +1624,7 @@ export class RunsService {
       policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: isSuperAdminEmail(user.email) ? np.month.total : null, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
       estimateHash,
       userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
+      ...(await this.r79PreviewExtras(courseId, evaluation.estimate)),
       _plan: plan,
     };
   }
