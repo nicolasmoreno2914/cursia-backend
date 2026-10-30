@@ -131,7 +131,7 @@ async function moodleChecks(styles) {
         if (stu.visible !== 1) bad.push(`${st.key} cap ${k.number}: la página del estudiante no está visible`);
         if (sol.visible !== 0 || sol.visibleold !== 0) bad.push(`${st.key} cap ${k.number}: el solucionario no está oculto (${sol.visible}/${sol.visibleold})`);
         const text = stu.html.replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, ' ');
-        for (const re of KIND_SECTIONS[k.kind]) if (k.kind !== 'standard' || k.minutes === 120 || !/Hitos/.test(re.source)) if (!re.test(text)) bad.push(`${st.key} cap ${k.number} (${k.kind}): falta la sección ${re}`);
+        for (const re of KIND_SECTIONS[k.kind]) if (k.kind !== 'standard' || k.minutes >= 60 || !/Hitos/.test(re.source)) if (!re.test(text)) bad.push(`${st.key} cap ${k.number} (${k.kind}): falta la sección ${re}`);
         if (k.kind !== 'standard' && !/Resultados de aprendizaje que evidencias/.test(text)) bad.push(`${st.key} cap ${k.number}: sin los resultados que evidencia`);
         if (/Respuesta:|Solucionario|Soluci[oó]n esperada|Gu[ií]a de correcci[oó]n/.test(text)) bad.push(`${st.key} cap ${k.number}: marcas de solucionario en la página del estudiante`);
         if (/\$@[A-Z]/.test(stu.html) || /\$@[A-Z]/.test(sol.html)) bad.push(`${st.key} cap ${k.number}: tokens sin resolver`);
@@ -220,9 +220,9 @@ async function moodleChecks(styles) {
                   if (leaked) bad.push(`${k} cap ${kd.number}: el estudiante abrió el solucionario`);
                 }
                 const shoot = (k === 'aula-clara' || k === 'tecnico-oscuro' || k === 'vibrante') && (regime === 'guardado' || d.key === 'iphone-375');
-                if (shoot && (kd.kind !== 'standard' || kd.minutes === 120)) {
+                if (shoot) { // r79.2: también la de siempre de 30/60/90
                   await go(page, `http://127.0.0.1:8099/mod/page/view.php?id=${stu.cmid}`);
-                  await page.screenshot({ path: path.join(shotsDir, `${k}-${regime}-${d.key}-cap${kd.number}-${kd.kind}${kd.kind === 'standard' ? '-120' : ''}.png`), fullPage: true });
+                  await page.screenshot({ path: path.join(shotsDir, `${k}-${regime}-${d.key}-cap${kd.number}-${kd.kind}${kd.kind === 'standard' ? `-${kd.minutes}` : ''}.png`), fullPage: true });
                 }
               }
             }
@@ -245,7 +245,7 @@ async function moodleChecks(styles) {
             if (!p) { bad.push(`${k} cap ${kd.number}: la app no recibe la página`); continue; }
             n++;
             const t = p.content.replace(/<[^>]+>/g, ' ');
-            for (const re of KIND_SECTIONS[kd.kind]) if (kd.kind !== 'standard' || kd.minutes === 120 || !/Hitos/.test(re.source)) if (!re.test(t)) bad.push(`${k} cap ${kd.number}: la app no muestra ${re}`);
+            for (const re of KIND_SECTIONS[kd.kind]) if (kd.kind !== 'standard' || kd.minutes >= 60 || !/Hitos/.test(re.source)) if (!re.test(t)) bad.push(`${k} cap ${kd.number}: la app no muestra ${re}`);
             if (regime === 'limpio' && /<style\b/.test(p.content)) bad.push(`${k} cap ${kd.number}: <style> con forceclean`);
             const mod = ws.modules[stu.cmid];
             if (!mod || !mod.files.some((f) => /\.pdf$/.test(f || ''))) bad.push(`${k} cap ${kd.number}: la app no lista el PDF`);
