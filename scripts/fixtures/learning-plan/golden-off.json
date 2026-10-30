@@ -18,10 +18,11 @@
     "briefs.r2": "19f98a75989564e42f3215f9f46ccfcfb97eca3d236405dcb19f3703c410644f",
     "fingerprints.r2": "7401d53f8d16ef538560987bc33fc88dd73afd09d37c3e9f282b0c0fdc384b65",
     "noProfile": "5d3ac04db9f2b5247e4477630c689c7673edf76601be78a08dac078ca442a110",
-    "dryRun": "1ccf631eb7d1d68d4defc043ac2bec0801fe49776dc3aa6fa79d2c4e496dc7a5",
-    "dryRunNoProfile": "ea251d883d60c9a23cb586a8a37b798fc55ae968cf97b160d24740f8fda38239",
+    "dryRun": "151231c874755e3a1d1161eab2cd914fd5e9ef8782cb43c5019419d66bf573e7",
+    "dryRunNoProfile": "7c16d91779a7e1b1749e1db445463088ba3793f88fe9c16c2bc02b7c8501bf5e",
     "facts": "e75930592c1927b1e901909731d716f2cf02cca4b01adc119304350acdf42704",
     "shell": "507d5f5f5f6de271083992f5304107f886b49ab9540147b099ef46223bfe3eb5"
   },
-  "r77": "shell actualizado a propósito en r77 (mobile-first, builder 3.17.0): solo cambian los estilos de los botones (la píldora es el <a>) y de los enlaces de descarga; mismo texto. Antes (c820d4e): c483f43de3dbfc7570bb716d8467a2b6f05232087157be3cc2d470e13c427dd0."
+  "r77": "shell actualizado a propósito en r77 (mobile-first, builder 3.17.0): solo cambian los estilos de los botones (la píldora es el <a>) y de los enlaces de descarga; mismo texto. Antes (c820d4e): c483f43de3dbfc7570bb716d8467a2b6f05232087157be3cc2d470e13c427dd0.",
+  "r79_2": "dryRun y dryRunNoProfile regenerados en r79.2: única diferencia = unidades de costo de las Actividades de 60/90/120 (verificado: con las unidades de r79.1 las huellas son idénticas)."
 }

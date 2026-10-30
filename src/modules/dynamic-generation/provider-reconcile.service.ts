@@ -38,6 +38,7 @@ import {
   videogenJobIdOf,
   videogenZeroCostReleasable,
 } from './provider-reconcile';
+import { usd2 } from '../finops/usd-display';
 
 /**
  * r62 (N2) — barrido de conciliación automática de Videogen / Gamma (ver provider-reconcile.ts). Corre en el tick del
@@ -627,7 +628,7 @@ export class ProviderReconcileService {
     const [spent, inFlight] = await Promise.all([this.budget.runActual(r.job_id), this.budget.reservedInFlight(r.job_id, r.id)]);
     const after = Number(spent) + Number(inFlight) + next;
     if (after > Number(auth) + 1e-9) {
-      return { ok: false, reason: 'run_budget_cap', detail: `el reenvío llevaría el run a USD ${after.toFixed(4)} y el saldo autorizado es USD ${Number(auth).toFixed(4)}` };
+      return { ok: false, reason: 'run_budget_cap', detail: `el reenvío llevaría el run a USD ${usd2(after)} y el saldo autorizado es USD ${usd2(auth)}` };
     }
     const g = await this.budget.guardRunSpend({ runId: r.job_id, itemRunId: r.id, nextCost: next, authorizedBudget: null, snapshot: true });
     const hard = g.decision.itemHardLimit;
@@ -635,7 +636,7 @@ export class ProviderReconcileService {
       const itemSpent = await this.itemSpent(r);
       if (itemSpent + next > hard + 1e-9) {
         return { ok: false, reason: 'item_recovery_budget_exhausted',
-          detail: `la parte ya gastó USD ${itemSpent.toFixed(4)}; con el reenvío (USD ${next.toFixed(4)}) superaría su presupuesto de recuperación (USD ${hard.toFixed(4)})` };
+          detail: `la parte ya gastó USD ${usd2(itemSpent)}; con el reenvío (USD ${usd2(next)}) superaría su presupuesto de recuperación (USD ${usd2(hard)})` };
       }
     }
     return { ok: true };

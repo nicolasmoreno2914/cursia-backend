@@ -213,7 +213,8 @@ function rcpWithApplications() {
     for (const prov of ['gamma', 'videogen', 'openai', 'youtube']) eq(JSON.stringify(a.byProvider[prov] || {}), JSON.stringify(b.byProvider[prov] || {}), `${prov} igual`);
     eq(a.byProvider.anthropic.operations['llm.application_activity'], 1, 'una operación de actividad');
     const delta = Number(a.estimateUsd.expected) - Number(b.estimateUsd.expected);
-    assert(delta > 0.05 && delta < 0.5, `una actividad ≈ USD ${delta.toFixed(3)}`);
+    // r79.2 (intencional): el nivel de 60 exige 8–10 ejercicios + hitos → 9 unidades (antes 7): ≈ USD 0,55.
+    assert(delta > 0.05 && delta < 0.7, `una actividad ≈ USD ${delta.toFixed(3)}`);
   });
 
   await check('AA6 invalidación: agregar, cambiar minutos, cambiar resultados, editar el capítulo y quitar → solo la actividad', () => {
@@ -514,7 +515,8 @@ function rcpWithApplications() {
     eq(none.changes.filter((c) => c.type === 'remove_application_activity').map((c) => c.chapterId).sort(), had.map((c) => c.id).sort(), '«Ninguna»: un cambio por actividad quitada');
     eq(none.counts.applicationActivities, 0, '«Ninguna»: sin actividades');
     // I4 + M5: marcas de solucionario y campos extra en la parte del estudiante → error en la generación (reintento).
-    const doc = require('./lib/v21-packaging-fixtures').applicationDoc('00000000-0000-4000-8000-000000000001', 60, 1);
+    // r79.2: documento v2 de siempre (la forma v1 ya no alcanza para el nivel de 60 en v2).
+    const doc = require('./lib/r79-1-activity-fixtures').standardV2Doc(require('./lib/v21-packaging-fixtures'), '00000000-0000-4000-8000-000000000001', 60, 1);
     const codes = (a) => SHELL.validateApplicationStudentPart(a, 60).errors.map((e) => e.code);
     eq(codes(doc.activity), [], 'actividad de fixture válida');
     const m1 = clone(doc.activity); m1.exercises[2].prompt = 'Completa la hoja. Respuesta: ____________';
@@ -527,10 +529,11 @@ function rcpWithApplications() {
     assert(codes(m4).includes('APPLICATION_SHAPE'), 'campo extra en la actividad rechazado');
     // M6: costo por nivel de minutos (la salida escala con los ejercicios; 60 min = referencia).
     const RB = loadDist('modules/finops/run-budget.js');
-    // r79.1 (intencional): el nivel de 120 exige 10–12 ejercicios + hitos del taller → 11 unidades de salida (antes 10): 1,5714.
-    eq([30, 60, 90, 120].map((x) => RB.applicationUsageScale(x)), [{ output_tokens: 0.8571 }, { output_tokens: 1 }, { output_tokens: 1.2857 }, { output_tokens: 1.5714 }], 'escala por nivel');
+    // r79.1 (intencional): el nivel de 120 exige 10–12 ejercicios + hitos del taller → 11 unidades de salida (antes 10).
+    // r79.2 (intencional): 60/90/120 proporcionales → 9/12/15 unidades (30 sin cambios); la referencia sigue en 7.
+    eq([30, 60, 90, 120].map((x) => RB.applicationUsageScale(x)), [{ output_tokens: 0.8571 }, { output_tokens: 1.2857 }, { output_tokens: 1.7143 }, { output_tokens: 2.1429 }], 'escala por nivel');
     const est = RB.estimateItemsForRun([{ key: 'application_activity:x', type: 'application_activity', chapterId: 'x', applicationMinutes: 120 }, { key: 'application_activity:y', type: 'application_activity', chapterId: 'y', applicationMinutes: 60 }], 'mock');
-    eq(est.map((e) => e.usageScale ?? null), [{ output_tokens: 1.5714 }, null], 'el estimador lleva la escala (60 min sin escala)');
+    eq(est.map((e) => e.usageScale ?? null), [{ output_tokens: 2.1429 }, { output_tokens: 1.2857 }], 'el estimador lleva la escala (r79.2: también el de 60)');
   });
 
   console.log(`\n${passes} OK, ${failures} fallidas`);

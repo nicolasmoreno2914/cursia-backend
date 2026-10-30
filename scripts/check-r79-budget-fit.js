@@ -358,7 +358,8 @@ check('BF25 matriz S/M/L × 20/60/100 h × 3 presupuestos: «Cabe» ⇔ esperado
 
 check('BF26 «Usar este diseño» es un punto fijo: re-ajustar desde lo elegido (sin «Ajustar») da el MISMO diseño', () => {
   let adjusted = 0;
-  for (const [st, h, usd, ap] of [[M, 60, 62, 'competencias'], [L, 100, 85, 'competencias'], [M, 60, 200, 'significativo'], [S, 20, 40, 'competencias']]) {
+  // r79.2: las Actividades de 60/90/120 exigen más trabajo (y cuestan más): los presupuestos ajustados pasan de 62/85 a 66/88.
+  for (const [st, h, usd, ap] of [[M, 60, 66, 'competencias'], [L, 100, 88, 'competencias'], [M, 60, 200, 'significativo'], [S, 20, 40, 'competencias']]) {
     const a = fit(st(), h, usd, { approach: ap });
     assert(a.status === 'fits', `${h} h USD ${usd}: ${a.status}`);
     if (a.chosen.preferences.maxContentChaptersPerModule !== null) adjusted++;
@@ -372,7 +373,7 @@ check('BF26 «Usar este diseño» es un punto fijo: re-ajustar desde lo elegido 
 });
 
 check('BF27 §11.1 el ajuste SÍ optimiza: 60 h y 100 h caben con menos que el diseño de siempre (menos profundización + práctica real)', () => {
-  for (const [st, h, usd] of [[M, 60, 62], [L, 100, 85]]) {
+  for (const [st, h, usd] of [[M, 60, 66], [L, 100, 88]]) { // r79.2: antes 62/85 (ver BF26)
     const plain = P.runPedagogyDryRun({ structure: st(), profile: profile(h), activityTypeRules: 2 }).distribution;
     const r = fit(st(), h, usd);
     assert(r.status === 'fits' && Number(plain.materialized.providers.estimateUsd.expected) * 1.1 > usd, 'el diseño de siempre ya cabía: caso sin ajuste');

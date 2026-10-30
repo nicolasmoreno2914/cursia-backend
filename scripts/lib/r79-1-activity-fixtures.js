@@ -147,22 +147,40 @@ function feedbackDoc(chapterId, minutes, n, o = {}) {
 }
 
 /** Actividad de siempre v2 (en el de 120, con hitos y cantidades reforzadas). */
-function standardV2Doc(V, chapterId, minutes, n) {
+/**
+ * r79.2: forma de la Actividad de siempre v2 por nivel (cantidades MÍNIMAS o MÁXIMAS de STANDARD_SPEC_V2 y un reparto
+ * de minutos que respeta los pisos). La comparten este fixture y el LLM falso del E2E (test/e2e-v2/llm-v3.js).
+ */
+const STANDARD_V2_SHAPE = Object.freeze({
+  30: { min: { exercises: 6, examples: 1, instructions: 2, milestones: 0, selfCheck: 4, criteria: 3 }, max: { exercises: 7, examples: 1, instructions: 8, milestones: 0, selfCheck: 8, criteria: 4 }, split: { examples: 5, exercises: 15, workshop: 8, selfCheck: 2 } },
+  60: { min: { exercises: 8, examples: 1, instructions: 3, milestones: 2, selfCheck: 5, criteria: 4 }, max: { exercises: 10, examples: 2, instructions: 8, milestones: 2, selfCheck: 8, criteria: 4 }, split: { examples: 8, exercises: 25, workshop: 22, selfCheck: 5 } },
+  90: { min: { exercises: 11, examples: 1, instructions: 5, milestones: 3, selfCheck: 6, criteria: 4 }, max: { exercises: 13, examples: 2, instructions: 8, milestones: 3, selfCheck: 8, criteria: 4 }, split: { examples: 10, exercises: 40, workshop: 35, selfCheck: 5 } },
+  120: { min: { exercises: 14, examples: 1, instructions: 5, milestones: 4, selfCheck: 6, criteria: 4 }, max: { exercises: 16, examples: 2, instructions: 8, milestones: 4, selfCheck: 8, criteria: 4 }, split: { examples: 15, exercises: 55, workshop: 45, selfCheck: 5 } },
+});
+const FX_INSTRUCTIONS = ['Prioriza los casos.', 'Redacta la respuesta de los dos más urgentes.', 'Revisa la respuesta con un compañero.', 'Ajusta la respuesta con la retroalimentación recibida.', 'Registra la decisión final en la planilla.', 'Explica qué política aplicaste en cada caso.', 'Calcula el costo de cada solución propuesta.', 'Presenta el resultado al supervisor en un resumen.'];
+const FX_MILESTONES = [{ title: 'Priorización', product: 'Una tabla con los casos ordenados por urgencia.' }, { title: 'Respuestas', product: 'Las respuestas escritas de los dos casos urgentes.' }, { title: 'Revisión entre pares', product: 'Las respuestas corregidas con los comentarios del compañero.' }, { title: 'Informe al supervisor', product: 'El resumen con las decisiones y su justificación.' }];
+const FX_SELFCHECK = ['¿Escuché el reclamo completo?', '¿Mi solución está dentro de la política?', '¿Expliqué el porqué?', '¿Usé un tono cordial?', '¿Cumplí los hitos del taller?', '¿Revisé los cálculos de costo?', '¿Registré cada decisión?', '¿Incorporé la retroalimentación del compañero?'];
+const FX_CRITERIA3 = [{ name: 'Análisis del caso', description: 'Identifica el problema real.', weight: 40 }, { name: 'Solución', description: 'Propone una solución viable.', weight: 40 }, { name: 'Comunicación', description: 'Responde con claridad y cordialidad.', weight: 20 }];
+const FX_CRITERIA4 = [{ name: 'Análisis del caso', description: 'Identifica el problema real.', weight: 30 }, { name: 'Solución', description: 'Propone una solución viable.', weight: 30 }, { name: 'Comunicación', description: 'Responde con claridad y cordialidad.', weight: 20 }, { name: 'Hitos del taller', description: 'Entrega los productos intermedios completos.', weight: 20 }];
+
+function standardV2Doc(V, chapterId, minutes, n, o = {}) {
   const d = V.applicationDoc(chapterId, minutes, n);
   d.schemaVersion = 2;
   d.kind = 'standard';
-  if (minutes === 120) {
-    const a = d.activity;
-    a.exercises = Array.from({ length: 10 }, (_, i) => ({ id: `E${i + 1}`, prompt: `Analiza el caso hipotético ${i + 1} y explica qué harías.`, difficulty: i < 2 ? 'basico' : i < 8 ? 'intermedio' : 'avanzado', answerLines: 3 }));
-    a.examples = a.examples.slice(0, 1);
-    a.workshop.instructions = ['Prioriza los casos.', 'Redacta la respuesta de los dos más urgentes.', 'Revisa la respuesta con un compañero.'];
-    a.workshop.milestones = [{ title: 'Priorización', product: 'Una tabla con los casos ordenados por urgencia.' }, { title: 'Respuestas', product: 'Las respuestas escritas de los dos casos urgentes.' }];
-    a.selfCheck = [...a.selfCheck, '¿Cumplí los dos hitos del taller?'];
-    a.criteria = [{ name: 'Análisis del caso', description: 'Identifica el problema real.', weight: 30 }, { name: 'Solución', description: 'Propone una solución viable.', weight: 30 }, { name: 'Comunicación', description: 'Responde con claridad y cordialidad.', weight: 20 }, { name: 'Hitos del taller', description: 'Entrega los productos intermedios completos.', weight: 20 }];
-    a.minutesBySection = { examples: 15, exercises: 50, workshop: 45, selfCheck: 10 };
-    d.solution.answers = a.exercises.map((e) => ({ exerciseId: e.id, answer: `Respuesta esperada del ${e.id}.`, explanation: 'Se identifica el problema y se propone una solución dentro de la política.' }));
-    d.solution.correctionGuide = a.criteria.map((c) => ({ criterion: c.name, achieved: 'Cumple el criterio por completo.', developing: 'Cumple el criterio en parte.', insufficient: 'No cumple el criterio.' }));
-  }
+  const shape = STANDARD_V2_SHAPE[minutes];
+  const c = shape[o.size === 'max' ? 'max' : 'min'];
+  const a = d.activity;
+  a.exercises = Array.from({ length: c.exercises }, (_, i) => ({ id: `E${i + 1}`, prompt: `Analiza el caso hipotético ${i + 1} y explica qué harías.`, difficulty: i < 2 ? 'basico' : i < c.exercises - 2 ? 'intermedio' : 'avanzado', answerLines: 3 }));
+  const ex0 = a.examples[0];
+  a.examples = Array.from({ length: c.examples }, (_, i) => ({ ...ex0, title: `Caso resuelto ${i + 1}` }));
+  a.workshop.instructions = FX_INSTRUCTIONS.slice(0, c.instructions);
+  if (c.milestones) a.workshop.milestones = FX_MILESTONES.slice(0, c.milestones);
+  else delete a.workshop.milestones;
+  a.selfCheck = FX_SELFCHECK.slice(0, c.selfCheck);
+  a.criteria = (c.criteria === 4 ? FX_CRITERIA4 : FX_CRITERIA3).map((x) => ({ ...x }));
+  a.minutesBySection = { ...shape.split };
+  d.solution.answers = a.exercises.map((e) => ({ exerciseId: e.id, answer: `Respuesta esperada del ${e.id}.`, explanation: 'Se identifica el problema y se propone una solución dentro de la política.' }));
+  d.solution.correctionGuide = a.criteria.map((x) => ({ criterion: x.name, achieved: 'Cumple el criterio por completo.', developing: 'Cumple el criterio en parte.', insufficient: 'No cumple el criterio.' }));
   return d;
 }
 
@@ -171,7 +189,7 @@ function kindDoc(V, kind, chapterId, minutes, n, o) {
   if (kind === 'case_study') return caseStudyDoc(chapterId, minutes, n, o);
   if (kind === 'integrative_project') return projectDoc(chapterId, minutes, n, o);
   if (kind === 'formative_feedback') return feedbackDoc(chapterId, minutes, n, o);
-  return standardV2Doc(V, chapterId, minutes, n);
+  return standardV2Doc(V, chapterId, minutes, n, o);
 }
 
-module.exports = { caseStudyDoc, projectDoc, feedbackDoc, standardV2Doc, kindDoc };
+module.exports = { caseStudyDoc, projectDoc, feedbackDoc, standardV2Doc, kindDoc, STANDARD_V2_SHAPE };

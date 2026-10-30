@@ -1423,7 +1423,7 @@ var DYN_V3_PROMPT_VERSIONS = {
   final_exam: 'v21-final-2'
 };
 // Fase 2: Actividad de Aplicación + solucionario (2 pasadas). Aparte para no mover DYN_V3_PROMPT_VERSIONS.
-var DYN_V3_APPLICATION_PROMPT_VERSION = 'v21-app-2'; // r79.1: tipos de actividad + nivel de 120 reforzado
+var DYN_V3_APPLICATION_PROMPT_VERSION = 'v21-app-3'; // r79.1: tipos de actividad + nivel de 120 reforzado · r79.2: 60/90/120 proporcionales
 // Loop 9 B: práctica guiada del capítulo (una pasada + el reintento dirigido).
 var DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION = 'v21-gp-3';
 // EV6 IV avanzado: video_interactions schemaVersion 2 (pausas para pensar). La ruta schemaVersion 1
@@ -4490,6 +4490,14 @@ async function _dynAppLoadDraft(item, expect) {
   out.resumes = doc.resumes;
   return out;
 }
+// r79.2: presupuesto de salida por pasada. La Actividad de siempre de 90/120 pide 11–16 ejercicios (y su solucionario):
+// con 9 000 tokens fijos el JSON se podía truncar (lección de los SCORM pesados). Los tipos nuevos no cambian (9 000).
+var DYN_APPLICATION_MAX_TOKENS = { 30: 9000, 60: 10000, 90: 12000, 120: 14000 };
+function _dynApplicationMaxTokens(minutes, kind) {
+  if (kind) return 9000;
+  return DYN_APPLICATION_MAX_TOKENS[minutes] || 9000;
+}
+
 async function _dynRunApplicationActivity(item) {
   var bp = item.blueprint || {};
   if (!item.chapterId || !bp.chapter) return { ok: false, error: 'application_activity: el claim no trae chapterId/blueprint.chapter', retryable: false };
@@ -4543,7 +4551,7 @@ async function _dynRunApplicationActivity(item) {
     var prompt1 = kind
       ? dynApplicationKindActivityPrompt(courseContext, bp.outline, chapter, sourceMd, app, dynPedagogyBlock(item))
       : dynApplicationActivityPrompt(courseContext, bp.outline, chapter, sourceMd, app, dynPedagogyBlock(item));
-    r1 = await _dynV3JsonWithRetry(item, sys, prompt1, 9000, function (obj) {
+    r1 = await _dynV3JsonWithRetry(item, sys, prompt1, _dynApplicationMaxTokens(app.minutes, kind), function (obj) {
       var v = validateStudent(obj);
       if (v.errors.length) return { ok: false, errors: _dynFormatErrors(v.errors) };
       return { ok: true, value: obj };
@@ -4556,7 +4564,7 @@ async function _dynRunApplicationActivity(item) {
   var r2;
   try {
     var prompt2 = kind ? dynApplicationKindSolutionPrompt(courseContext, chapter, activity, sourceMd, app) : dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd);
-    r2 = await _dynV3JsonWithRetry(item, sys, prompt2, 9000, function (obj) {
+    r2 = await _dynV3JsonWithRetry(item, sys, prompt2, _dynApplicationMaxTokens(app.minutes, kind), function (obj) {
       var errs = validateSolution(obj, activity, v1);
       if (errs.length) return { ok: false, errors: _dynFormatErrors(errs) };
       return { ok: true, value: obj };

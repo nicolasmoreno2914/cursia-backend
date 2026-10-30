@@ -3,8 +3,9 @@
 // r79.1 · Tipos de Actividad de Aplicación (estudio de caso, proyecto integrador, retroalimentación formativa) y nivel de
 // 120 min reforzado. Puro: sin IA, sin red, sin base. USD 0.
 //
-//   K1  candado de proporcionalidad (§12.1): tabla de trabajo especificado por tipo y nivel; con la especificación v2 el
-//       nivel de 120 de siempre pasa; con la v1 (la de antes) NO; los niveles de los tipos nuevos pasan y tienen candado
+//   K1  candado de proporcionalidad (§12.1, §13.2): tabla de trabajo especificado por tipo y nivel; con la especificación
+//       v2 TODOS los niveles de siempre (30/60/90/120) pasan y tienen candado; con la v1 (la de antes) 60/90/120 NO; los
+//       niveles de los tipos nuevos pasan y tienen candado
 //   K2  el candado se cumple: con el de v1, ni el distribuidor ni el ajuste al presupuesto eligen 120 (lo fijado se respeta)
 //   K3  validadores: documentos sintéticos mín./máx. de cada tipo y nivel válidos; mutaciones rechazadas con su código;
 //       v1 sigue válido; v2 de 120 sin hitos rechazado; un tipo nuevo exige v2
@@ -111,11 +112,18 @@ const dry = (structure, h, dp, extra = {}) => P.runPedagogyDryRun({ structure, p
       assert(r && r.enforced && r.proportional && r.selectable, `${k} ${m}: ${JSON.stringify(r)}`);
       assert(K.isTierSelectable(k, m), `${k} ${m} seleccionable`);
     }
-    // 30/60/90 de siempre: sin candado (decisión del owner solo sobre el 120); su proporción queda informada.
-    for (const m of [30, 60, 90]) assert(!row('standard', m).enforced && row('standard', m).selectable, `standard ${m} sin candado`);
+    // r79.2 (§13.2): 30/60/90 de siempre TAMBIÉN con candado, y proporcionales con la v2 vigente.
+    for (const m of [30, 60, 90, 120]) {
+      const r = row('standard', m);
+      assert(r.enforced && r.proportional && r.selectable, `standard ${m} con candado y proporcional: ${JSON.stringify(r)}`);
+    }
+    // Con la especificación de antes (v1: 30 y 60 pedían el mismo mínimo), 60/90/120 quedan CERRADOS.
+    for (const m of [60, 90, 120]) {
+      const r = row('standard', m, v1);
+      assert(r.enforced && !r.proportional && !r.selectable && r.ratio < K.PROPORTIONALITY_FACTOR, `v1 ${m} cerrado: ${JSON.stringify(r)}`);
+    }
     // El trabajo especificado crece con el nivel dentro de cada tipo y es dato (no minutos).
-    // (La Actividad de siempre de 30 y 60 min especifican el MISMO mínimo — hallazgo informado en el reporte, sin candado.)
-    for (const k of KT.APPLICATION_KINDS) {
+    for (const k of ['standard', ...KT.APPLICATION_KINDS]) {
       const rows = lock.filter((r) => r.kind === k);
       for (let i = 1; i < rows.length; i++) assert(rows[i].workMinutes > rows[i - 1].workMinutes, `${k}: más minutos ⇒ más trabajo especificado (${rows[i - 1].minutes}→${rows[i].minutes})`);
     }
@@ -147,8 +155,15 @@ const dry = (structure, h, dp, extra = {}) => P.runPedagogyDryRun({ structure, p
         const d = F.kindDoc(V, k, 'ch1', m, 1, { size, outcomeIds: ['OBJ'] });
         eq(codes(AA.validateApplicationActivityDoc(d, { chapterId: 'ch1', minutes: m, kind: k, outcomeIds: ['OBJ'] })), [], `${k} ${m} ${size}`);
       }
-      const s120 = F.standardV2Doc(V, 'ch1', 120, 1);
-      eq(codes(AA.validateApplicationActivityDoc(s120, { chapterId: 'ch1', minutes: 120 })), [], `standard v2 120 ${size}`);
+      for (const m of [30, 60, 90, 120]) {
+        const sd = F.standardV2Doc(V, 'ch1', m, 1, { size });
+        eq(codes(AA.validateApplicationActivityDoc(sd, { chapterId: 'ch1', minutes: m })), [], `standard v2 ${m} ${size}`);
+      }
+    }
+    // r79.2: la forma v1 de 60/90/120 ya no basta como v2 (más ejercicios, ejemplo, consignas, hitos, criterios).
+    for (const m of [60, 90]) {
+      const v2l = { ...V.applicationDoc('ch1', m, 1), schemaVersion: 2, kind: 'standard' };
+      assert(codes(AA.validateApplicationActivityDoc(v2l, { chapterId: 'ch1', minutes: m })).includes('APPLICATION_COUNT'), `${m} v2 con la forma v1 rechazado`);
     }
     for (const m of [30, 60, 90, 120]) eq(codes(AA.validateApplicationActivityDoc(V.applicationDoc('ch1', m, 1), { chapterId: 'ch1', minutes: m })), [], `v1 ${m} sigue válido (re-empaque)`);
     const v2like = { ...V.applicationDoc('ch1', 120, 1), schemaVersion: 2, kind: 'standard' };
@@ -182,8 +197,15 @@ const dry = (structure, h, dp, extra = {}) => P.runPedagogyDryRun({ structure, p
     has(codes(AA.validateApplicationActivityDoc(noMs, { chapterId: 'ch1', minutes: 120 })), 'APPLICATION_LIST', '120 sin hitos');
     const lowWs = clone(s120); lowWs.activity.minutesBySection = { examples: 20, exercises: 70, workshop: 20, selfCheck: 10 };
     has(codes(AA.validateApplicationActivityDoc(lowWs, { chapterId: 'ch1', minutes: 120 })), 'APPLICATION_SECTION_FLOOR', '120 con taller corto');
-    const ms60 = clone(V.applicationDoc('ch1', 60, 1)); ms60.schemaVersion = 2; ms60.kind = 'standard'; ms60.activity.workshop.milestones = [{ title: 'Hito', product: 'Producto intermedio concreto del hito.' }];
-    has(codes(AA.validateApplicationActivityDoc(ms60, { chapterId: 'ch1', minutes: 60 })), 'APPLICATION_SHAPE', 'hitos en 60');
+    const ms30 = clone(F.standardV2Doc(V, 'ch1', 30, 1)); ms30.activity.workshop.milestones = [{ title: 'Hito', product: 'Producto intermedio concreto del hito.' }];
+    has(codes(AA.validateApplicationActivityDoc(ms30, { chapterId: 'ch1', minutes: 30 })), 'APPLICATION_SHAPE', 'hitos en 30');
+    // r79.2: 60 y 90 exigen hitos y pisos de minutos.
+    for (const m of [60, 90]) {
+      const nm = clone(F.standardV2Doc(V, 'ch1', m, 1)); delete nm.activity.workshop.milestones;
+      has(codes(AA.validateApplicationActivityDoc(nm, { chapterId: 'ch1', minutes: m })), 'APPLICATION_LIST', `${m} sin hitos`);
+      const lw = clone(F.standardV2Doc(V, 'ch1', m, 1)); lw.activity.minutesBySection = { examples: 5, exercises: m - 15, workshop: 5, selfCheck: 5 };
+      has(codes(AA.validateApplicationActivityDoc(lw, { chapterId: 'ch1', minutes: m })), 'APPLICATION_SECTION_FLOOR', `${m} con taller corto`);
+    }
   });
 
   await check('K4 paridad con el ejecutor del navegador: mismos códigos en documentos válidos y mutados (los 3 tipos + 120 v2)', () => {
@@ -277,10 +299,11 @@ const dry = (structure, h, dp, extra = {}) => P.runPedagogyDryRun({ structure, p
       assert(sk >= ss, `${k} ${m}: ${sk} < ${ss} (la poda del ajuste supone ≥)`);
       eq(sk, Math.round((K.APPLICATION_OUTPUT_UNITS[k][m] / 7) * 10000) / 10000, `${k} ${m} escala`);
     }
-    eq([30, 60, 90].map((m) => RB.applicationUsageScale(m).output_tokens), [0.8571, 1, 1.2857], '30/60/90 de siempre sin cambios');
-    eq(RB.applicationUsageScale(120).output_tokens, 1.5714, '120 reforzado (11 unidades)');
+    // r79.2: 60/90/120 de siempre exigen más trabajo → 9/12/15 unidades (30 sin cambios: 6).
+    eq([30, 60, 90].map((m) => RB.applicationUsageScale(m).output_tokens), [0.8571, 1.2857, 1.7143], '30/60/90 de siempre (r79.2: 6/9/12 unidades)');
+    eq(RB.applicationUsageScale(120).output_tokens, 2.1429, '120 reforzado (15 unidades)');
     const it = RB.estimateItemsForRun(built.manifest.items, 'real').filter((x) => x.itemType === 'application_activity');
-    eq(it.map((x) => (x.usageScale ? x.usageScale.output_tokens : 1)), [10 / 7, 11 / 7, 13 / 7, 8 / 7, 13 / 7, 6 / 7].map((x) => Math.round(x * 10000) / 10000), 'escalas del Manifest');
+    eq(it.map((x) => (x.usageScale ? x.usageScale.output_tokens : 1)), [10 / 7, 15 / 7, 15 / 7, 9 / 7, 13 / 7, 6 / 7].map((x) => Math.round(x * 10000) / 10000), 'escalas del Manifest');
   });
 
   await check('K8 modelo de horas: el tipo no cambia minutos (mismas horas con y sin tipos)', () => {

@@ -5,7 +5,7 @@
 //
 //   DB1  interruptor apagado: adjust.productionBudgetUsd se IGNORA (sin claves nuevas, perfil sin presupuesto, misma huella)
 //   DB2  encendido sin presupuesto: productionBudget = null, budgetFit = null, la MISMA huella que apagado
-//   DB3  60 h / USD 62 (6 × 1): «Cabe»; la tarjeta ES el diseño elegido (tope de contenidos), perfil con productionBudgetUsd
+//   DB3  60 h / USD 66 (6 × 1): «Cabe»; la tarjeta ES el diseño elegido (tope de contenidos), perfil con productionBudgetUsd
 //   DB4  «Usar este diseño»: guardar el perfil → recalcular sin «Ajustar» = MISMA huella → aplicar → estructura real = tarjeta
 //   DB5  60 h / USD 35: «No cabe»; tarjeta = diseño de siempre; dos alternativas; mínimo explicado por factores
 //   DB6  quitar el presupuesto (null): sin presupuesto ni tope; vuelve el diseño de siempre
@@ -97,7 +97,10 @@ const TOPICS = ['Peligros', 'Riesgos', 'Controles', 'Protección', 'Incidentes',
     await withClient(DB, async (c) => {
       for (const f of ['scripts/prod/test/fixtures/legacy-baseline.sql', 'supabase-migration-dynamic-course-structure.sql', 'supabase-migration-course-blueprints.sql',
         'supabase-migration-v21-blueprint-profiles.sql', 'supabase-migration-pedagogy-profiles.sql', 'supabase-migration-practice-chapters.sql',
-        'supabase-migration-application-activities.sql', 'supabase-migration-guided-practice.sql', 'supabase-migration-academic-context.sql', 'supabase-migration-v21-finops.sql']) {
+        'supabase-migration-application-activities.sql', 'supabase-migration-guided-practice.sql', 'supabase-migration-academic-context.sql', 'supabase-migration-v21-finops.sql',
+        // r79.2: el ajuste con USD 66 elige tipos de actividad → aplicar exige la columna (esquema de staging; en producción la
+        // migración va ANTES de encender el interruptor: validation/r79-produccion).
+        'supabase-migration-r79-1-application-kinds.sql']) {
         await c.query(fs.readFileSync(path.join(REPO, f), 'utf8'));
       }
       for (const row of seedJson.rows) {
@@ -161,13 +164,13 @@ const TOPICS = ['Peligros', 'Riesgos', 'Controles', 'Protección', 'Incidentes',
       eq([a.design.proposalSha256, a.productionBudget, a.budgetFit, 'productionBudgetUsd' in a.profile], [offSha, null, null, false], 'sin presupuesto, todo igual');
     });
     let card62;
-    await check('DB3 60 h / USD 62: «Cabe»; la tarjeta ES el diseño elegido; perfil con productionBudgetUsd y el tope', async () => {
-      card62 = await design.recommend(cid, OWNER, { adjust: { productionBudgetUsd: 62 } });
+    await check('DB3 60 h / USD 66: «Cabe»; la tarjeta ES el diseño elegido; perfil con productionBudgetUsd y el tope', async () => {
+      card62 = await design.recommend(cid, OWNER, { adjust: { productionBudgetUsd: 66 } });
       const f = card62.budgetFit;
-      eq([f.status, card62.productionBudget.usd, card62.productionBudget.isAuthorizedCap, card62.profile.productionBudgetUsd], ['fits', 62, false, 62], 'cabe');
+      eq([f.status, card62.productionBudget.usd, card62.productionBudget.isAuthorizedCap, card62.profile.productionBudgetUsd], ["fits", 66, false, 66], 'cabe');
       eq(card62.design.proposalSha256, f.chosen.proposalSha256, 'la tarjeta es el elegido');
       assert(f.chosen.preferences.maxContentChaptersPerModule !== null && card62.profile.designPreferences.maxContentChaptersPerModule === f.chosen.preferences.maxContentChaptersPerModule, 'tope en el perfil');
-      assert(Number(card62.cost.expected) * 1.1 <= 62 + 1e-9, `costo ${card62.cost.expected}`);
+      assert(Number(card62.cost.expected) * 1.1 <= 66 + 1e-9, `costo ${card62.cost.expected}`);
       assert(card62.design.proposalSha256 !== offSha && card62.profileChanged === true, 'diseño distinto del de siempre');
       eq(card62.cost.pricingSource, 'pricing_catalog', 'precios de la base');
     });
