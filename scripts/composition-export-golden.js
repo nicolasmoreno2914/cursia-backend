@@ -40,7 +40,7 @@ if (require.main === module) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     // r79.1: re-fijado A PROPÓSITO con el costo del nivel de 120 reforzado (11 unidades); con el costo anterior, las 44
     // huellas de BE 5ec26c8 siguen iguales byte a byte (verificado al hacer el cambio).
-    fs.writeFileSync(file, JSON.stringify({ computedWith: 'BE 5ec26c8 (antes de T3); r79.1: costo del nivel de 120 reforzado', digests: d }, null, 2) + '\n');
+    fs.writeFileSync(file, JSON.stringify({ computedWith: 'BE 5ec26c8 (antes de T3); r79.1: costo del nivel de 120 reforzado; r79.2: costo de 60/90/120 proporcionales', digests: d }, null, 2) + '\n');
     console.log(`escrito ${file} (${Object.keys(d).length} huellas)`);
   } else console.log(JSON.stringify(d, null, 2));
 }

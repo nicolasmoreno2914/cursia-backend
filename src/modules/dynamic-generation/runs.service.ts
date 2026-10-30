@@ -224,6 +224,7 @@ import {
 import { ItemCostView, ItemRecoveryView, loadItemCosts, recoveryViewOf } from './item-recovery-view';
 import { RunRecoveryView, recoveryStateOf, runRecoveryStateOf } from '../reliability/recovery-state';
 import { nextRecoveryEntry } from './item-transitions';
+import { usd2 } from '../finops/usd-display';
 
 export type ItemRunStatus = 'pending' | 'running' | 'retrying' | 'completed' | 'failed' | 'blocked' | 'cancelled';
 
@@ -1454,7 +1455,7 @@ export class RunsService {
     if (!pv.approval.canApprove) {
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
-        message: `${APPROVAL_FORBIDDEN}: este curso requiere la autorización de un administrador (esperado USD ${pv.estimate.expected}, máximo USD ${pv.estimate.max}). No se creó nada.`,
+        message: `${APPROVAL_FORBIDDEN}: este curso requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate.expected)}, máximo USD ${usd2(pv.estimate.max)}). No se creó nada.`,
       });
     }
     if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicPreview(pv));
@@ -5109,7 +5110,7 @@ export class RunsService {
     if (!pv.approval || !pv.approval.canApprove) {
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
-        message: `${APPROVAL_FORBIDDEN}: generar los videos reales requiere la autorización de un administrador (esperado USD ${pv.estimate?.expected}, máximo USD ${pv.estimate?.max}). No se generó nada.`,
+        message: `${APPROVAL_FORBIDDEN}: generar los videos reales requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate?.expected)}, máximo USD ${usd2(pv.estimate?.max)}). No se generó nada.`,
       });
     }
     if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicVideoUpgradePreview(pv));

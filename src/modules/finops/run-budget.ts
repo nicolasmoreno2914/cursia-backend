@@ -197,6 +197,7 @@ export function audiobookUsageScale(chapterWords: number | null | undefined): nu
  * r79.1: la escala sale de APPLICATION_OUTPUT_UNITS (course-shell/application-kinds.ts): unidades de salida equivalentes
  * a «un ejercicio con su respuesta» por tipo y nivel (prior derivado de la especificación de cada nivel, no medido). El
  * nivel de 120 de la Actividad de siempre pasa de 10 a 11 (10–12 ejercicios + hitos del taller); 30/60/90 no cambian.
+ * r79.2: 60/90/120 exigen más trabajo proporcional → 9/12/15 (la referencia de los priors sigue siendo 7).
  */
 const APPLICATION_REFERENCE_EXERCISES = 7;
 

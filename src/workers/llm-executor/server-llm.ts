@@ -6,6 +6,7 @@ import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard'
 import { LlmStreamError, LlmStreamResult, nonStreamMessage, streamMessage } from './anthropic-stream';
 import { inFlightRemainingMs, PRIOR_CALL_IN_FLIGHT, priorCallInFlightMessage, retryAfterSecondsFor } from '../lease-takeover';
 import { settleAmbiguousAsPossibleDuplicate } from '../../modules/finops/ambiguous-resend';
+import { usd2 } from '../../modules/finops/usd-display';
 
 /**
  * Loop 4 — `api()` del ejecutor cuando corre en el WORKER del backend (mismo contrato que `api()` de 04-api.js:
@@ -516,7 +517,7 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         const b = await deps.budget.ambiguousResendBudget({ runId: item.runId, itemRunId: item.itemRunId, nextCost, authorization: 'any' });
         if (!b.fits) {
           throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW,
-            msg: pendingReviewMessage(`el reenvío no entra en el presupuesto autorizado (${b.reason}; peor caso de la parte USD ${b.worstItem.toFixed(4)}, del run USD ${b.worstRun.toFixed(4)})`) } as ApiError;
+            msg: pendingReviewMessage(`el reenvío no entra en el presupuesto autorizado (${b.reason}; peor caso de la parte USD ${usd2(b.worstItem)}, del run USD ${usd2(b.worstRun)})`) } as ApiError;
         }
         const settled = await settleAmbiguousAsPossibleDuplicate(deps.finops as Required<Pick<WorkerLedger, 'reconcileReservationAsCharged'>>, keys, {
           provider: 'anthropic', cause: 'unknown_result', itemRunId: item.itemRunId, itemKey: item.itemKey, runId: item.runId,

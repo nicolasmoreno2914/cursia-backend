@@ -40,15 +40,19 @@ export const STANDARD_SPEC_V1: Readonly<Record<number, StandardTierSpec>> = Obje
 });
 
 /**
- * v2 (r79.1): 30/60/90 igual que v1; 120 REFORZADO: 10–12 ejercicios, al menos 1 ejemplo resuelto, taller con 3–8
- * consignas y 2–3 HITOS con producto intermedio, 5–8 ítems de autoevaluación, EXACTAMENTE 4 criterios, y pisos de
- * minutos (taller ≥ 35, ejercicios ≥ 40). Así los 120 min tienen el trabajo que los justifica (§12.1).
+ * v2 (r79.1 + r79.2, nunca llegó a producción con otra forma): cada nivel exige trabajo PROPORCIONAL a sus minutos
+ * (§12.1, §13.2). El de 30 queda como v1 (ya era el más denso: 43 min típicos de trabajo especificado). 60/90/120 suben
+ * con más ejemplos resueltos, más consignas y HITOS del taller con producto intermedio (trabajo real, no más minutos), y
+ * más ejercicios graduados; todos los niveles pasan el candado de proporcionalidad (densidad ≥ 0,9 × la del anterior):
+ *   30 → 43 min típicos (1,43) · 60 → 79,5 (1,33; 0,92) · 90 → 111 (1,23; 0,93) · 120 → 134 (1,12; 0,91).
+ * Pisos de minutos por sección (minutesBySection) en 60/90/120 para que los minutos declarados no se vayan a una sola
+ * sección.
  */
 export const STANDARD_SPEC_V2: Readonly<Record<number, StandardTierSpec>> = Object.freeze({
   30: STANDARD_SPEC_V1[30],
-  60: STANDARD_SPEC_V1[60],
-  90: STANDARD_SPEC_V1[90],
-  120: { exercises: [10, 12], examples: [1, 2], workshopInstructions: [3, 8], workshopMilestones: [2, 3], selfCheck: [5, 8], criteria: [4, 4], floors: { workshop: 35, exercises: 40 } },
+  60: { exercises: [8, 10], examples: [1, 2], workshopInstructions: [3, 8], workshopMilestones: [2, 2], selfCheck: [5, 8], criteria: [4, 4], floors: { workshop: 20, exercises: 25 } },
+  90: { exercises: [11, 13], examples: [1, 2], workshopInstructions: [5, 8], workshopMilestones: [3, 3], selfCheck: [6, 8], criteria: [4, 4], floors: { workshop: 30, exercises: 35 } },
+  120: { exercises: [14, 16], examples: [1, 2], workshopInstructions: [5, 8], workshopMilestones: [4, 4], selfCheck: [6, 8], criteria: [4, 4], floors: { workshop: 40, exercises: 45 } },
 });
 
 export function standardSpecFor(schemaVersion: number, minutes: number): StandardTierSpec | undefined {
@@ -177,9 +181,10 @@ export interface TierLockRow {
   selectable: boolean;
 }
 
-/** Niveles con candado (§12.1: el de 120 min de la Actividad de siempre y TODOS los niveles de los tipos nuevos). */
+/** Niveles con candado (§12.1 + §13.2: TODOS los niveles de la Actividad de siempre y de los tipos nuevos). */
 export const TIER_LOCK_ENFORCED: Readonly<Record<ApplicationKindOrStandard, readonly number[]>> = Object.freeze({
-  standard: Object.freeze([120]),
+  // r79.2 (§13.2): TODOS los niveles de la Actividad de siempre (antes solo el de 120).
+  standard: Object.freeze([30, 60, 90, 120]),
   case_study: APPLICATION_KIND_TIERS.case_study,
   integrative_project: APPLICATION_KIND_TIERS.integrative_project,
   formative_feedback: APPLICATION_KIND_TIERS.formative_feedback,
@@ -223,7 +228,7 @@ export function isTierSelectable(kind: ApplicationKindOrStandard, minutes: numbe
  * Salida del generador (actividad + solucionario) en «ejercicios equivalentes» (un ejercicio con su respuesta y su
  * explicación ≈ 1 unidad; el prior de llm.application_activity es el del nivel de 60, 7 unidades). Prior derivado de la
  * especificación (cantidades medias de cada nivel), NO medido: reemplazar con el ledger cuando haya corridas reales.
- *   - standard: 30/60/90 = 6/7/9 (los de siempre); 120 = 11 (10–12 ejercicios + 2–3 hitos con producto).
+ *   - standard (r79.2): la media de ejercicios del nivel (redondeo hacia abajo) → 30 = 6 · 60 = 9 · 90 = 12 · 120 = 15.
  *   - case_study: el relato (≈ 2–3 unidades), anexos, 4–7 preguntas con su análisis esperado y puntos clave, la decisión
  *     con alternativas y la guía de discusión → 60 = 10, 90 = 13.
  *   - integrative_project: 3–4 etapas (tareas + entregable + guía de la etapa con errores y preguntas de control ≈ 2,5
@@ -232,10 +237,11 @@ export function isTierSelectable(kind: ApplicationKindOrStandard, minutes: numbe
  *     frecuentes con diagnóstico, plan de mejora (y revisión entre pares) → 30 = 6, 60 = 8, 90 = 10, 120 = 12.
  */
 export const APPLICATION_OUTPUT_UNITS: Readonly<Record<ApplicationKindOrStandard, Readonly<Record<number, number>>>> = Object.freeze({
-  standard: { 30: 6, 60: 7, 90: 9, 120: 11 },
+  standard: { 30: 6, 60: 9, 90: 12, 120: 15 },
   case_study: { 60: 10, 90: 13 },
-  integrative_project: { 90: 10, 120: 13 },
-  formative_feedback: { 30: 6, 60: 8, 90: 10, 120: 12 },
+  // r79.2: nunca menos que la Actividad de siempre del mismo nivel (la poda del ajuste lo supone; check K7).
+  integrative_project: { 90: 12, 120: 15 },
+  formative_feedback: { 30: 6, 60: 9, 90: 12, 120: 15 },
 });
 export function applicationOutputUnits(kind: string | null, minutes: number): number | null {
   const k = (kind && kind !== 'standard' && (APPLICATION_KINDS as readonly string[]).includes(kind) ? kind : 'standard') as ApplicationKindOrStandard;

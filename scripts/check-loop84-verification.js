@@ -136,7 +136,10 @@ const vids = (d) => d.modules.map((m) => m.chapters.filter((c) => c.kind === 'co
     const v = byId(V.verifyDesign({ ...base, uncoveredContents: ['Costeo ABC', 'Presupuesto maestro', 'Punto de equilibrio', 'Costeo variable'], counts: { ...base.counts, evaluations: 0 }, requiredEvaluations: ['Parcial', 'Proyecto final'], cost: { min: '18.5', expected: '24.75', max: '33.1' } }));
     eq([v.contents.severity, v.contents.fix.action, v.contents.detail], ['warning', 'add_chapter', '«Costeo ABC», «Presupuesto maestro», «Punto de equilibrio» y 1 más'], 'contenidos sin capítulo');
     eq(v.evaluations.detail, 'El microcurrículo pide evaluar con «Parcial», «Proyecto final».', 'evaluaciones del documento');
-    eq(v.cost.title, 'Costo estimado de generar ≈ USD 24,75 (entre 18,5 y 33,1)', 'coma decimal');
+    eq(v.cost.title, 'Costo estimado de generar ≈ USD 24,75 (entre 18,50 y 33,10)', 'coma decimal (r79.2: siempre 2 decimales)');
+    // r79.2 (§13.3): nunca más de 2 decimales en pantalla («≈ USD 60,1940142650» en staging).
+    const long = byId(V.verifyDesign({ ...base, cost: { min: '34.0312345', expected: '60.1940142650', max: '175.0549999' } }));
+    eq(long.cost.title, 'Costo estimado de generar ≈ USD 60,19 (entre 34,03 y 175,05)', 'máximo 2 decimales');
     const big = byId(V.verifyDesign({ ...base, status: 'minimum_exceeds_target', targetHours: 400, baseHours: 612.3 })).hours;
     eq([big.severity, big.fix.kind, /500 h/.test(big.detail)], ['critical', 'editor', true], 'contenidos > 500 h: dividir');
     const above = byId(V.verifyDesign({ ...base, status: 'above_tolerance', targetHours: 480, estimatedHours: 500.4 })).hours;

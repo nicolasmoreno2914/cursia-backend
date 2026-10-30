@@ -10,6 +10,7 @@ import { CostReadService, costEventsCte } from './cost-read.service';
 import { UserBudgetGate, userBudgetsMode } from './user-budget-gate';
 import { assertProviderSpendAllowed, unattributedCeilings } from './spend-controls';
 import { assertEvidenceMatchesAmount, parsePartialAmount, parseReconcileEvidence, ReconcileEvidence } from './reconcile-decision';
+import { usd2 } from './usd-display';
 
 /**
  * V2.1 RF-a — ledger de costos (audit §W.3/§W.4). Todas las escrituras son
@@ -452,7 +453,7 @@ export class FinopsLedgerService {
       const after = addDec(spent, row.amount as string);
       if (cmpDec(after, cap) > 0) {
         throw new FinopsError('UNATTRIBUTED_CEILING',
-          `el gasto sin atribuir de las últimas 24 h (${scope}) llegaría a USD ${Number(after).toFixed(4)} y el techo es USD ${Number(cap).toFixed(4)}: no se hace la llamada`,
+          `el gasto sin atribuir de las últimas 24 h (${scope}) llegaría a USD ${usd2(after)} y el techo es USD ${usd2(cap)}: no se hace la llamada`,
           { scope: scope === 'global' ? 'global' : 'owner', spent, amount: row.amount, ceiling: cap });
       }
     }
@@ -1815,7 +1816,7 @@ export function isUnattributedPaidReservation(row: Record<string, unknown>): boo
  */
 export function runBudgetNotAuthorizedError(runId: string, amount: string): FinopsError {
   return new FinopsError('RUN_BUDGET_NOT_AUTHORIZED',
-    `el run ${runId} no tiene un presupuesto autorizado (ninguna autorización registrada): no se reserva ni se llama al proveedor (USD ${Number(amount).toFixed(4)}). Un administrador tiene que autorizar el presupuesto del run (POST /finops/courses/:courseId/authorizations con runId) antes de reanudar`,
+    `el run ${runId} no tiene un presupuesto autorizado (ninguna autorización registrada): no se reserva ni se llama al proveedor (USD ${usd2(amount)}). Un administrador tiene que autorizar el presupuesto del run (POST /finops/courses/:courseId/authorizations con runId) antes de reanudar`,
     { runId, amount, authorizedBudget: null });
 }
 

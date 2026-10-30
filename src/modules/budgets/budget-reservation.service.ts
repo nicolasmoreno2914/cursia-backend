@@ -14,6 +14,7 @@ import {
 } from '../finops/user-budget-gate';
 import { BudgetReadService, RUN_LIVE_SQL } from './budget-read.service';
 import { BudgetAuditWriter, Runner, UUID_RE, dec, monthDate } from './budget-common';
+import { usd2 } from '../finops/usd-display';
 
 const TABLE_CACHE_MS = 60_000;
 /** Reconciliador periódico (01 §5.3): cada 10 min. `CURSIA_BUDGET_RECONCILER=off` lo apaga en un proceso. */
@@ -247,7 +248,7 @@ export class BudgetReservationService implements UserBudgetGate, OnModuleInit, O
     if (cmpDec(amount, now.available) <= 0) return;
     if (mode === 'enforce') {
       throw new FinopsError(USER_BUDGET_EXHAUSTED,
-        `tu presupuesto disponible del mes (USD ${Number(now.available).toFixed(4)}) no alcanza para esta llamada (USD ${Number(amount).toFixed(4)}): no se hace`,
+        `tu presupuesto disponible del mes (USD ${usd2(now.available)}) no alcanza para esta llamada (USD ${usd2(amount)}): no se hace`,
         { requiredUsd: amount, availableUsd: now.available, payerUserId: userId, notAssigned: !now.assigned });
     }
     this.logger.warn(`[shadow] llamada sin run por encima del disponible (no se aplica): usuario ${userId} ${amount} > ${now.available}`);

@@ -1990,13 +1990,11 @@ var DYN_APPLICATION_GENRES_REQUIRING_EXAMPLE = ['calculation', 'procedure', 'des
 var DYN_APPLICATION_DIFFICULTIES = ['basico', 'intermedio', 'avanzado'];
 var DYN_APPLICATION_EXERCISES_BY_MINUTES = {
   30: { min: 6, max: 7, examplesMax: 1 },
-  60: { min: 6, max: 8, examplesMax: 2 },
-  90: { min: 8, max: 10, examplesMax: 2 },
-  // r79.1: el nivel de 120 min exige más trabajo real (10–12 ejercicios, ejemplo, hitos del taller): STANDARD_SPEC_V2.
-  120: { min: 10, max: 12, examplesMax: 2 }
+  // r79.2: 60/90/120 exigen trabajo PROPORCIONAL a sus minutos (ejemplo, más consignas, hitos del taller): STANDARD_SPEC_V2.
+  60: { min: 8, max: 10, examplesMax: 2 },
+  90: { min: 11, max: 13, examplesMax: 2 },
+  120: { min: 14, max: 16, examplesMax: 2 }
 };
-// r79.1 · espejo EXACTO de STANDARD_SPEC_V1 / STANDARD_SPEC_V2 (course-shell/application-kinds.ts). v1 = documentos
-// generados antes; v2 = los de ahora (el de 120 con hitos del taller, 4 criterios y pisos de minutos).
 var DYN_APPLICATION_STANDARD_SPEC = {
   1: {
     30: { exercises: [6, 7], examples: [0, 1], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
@@ -2006,9 +2004,9 @@ var DYN_APPLICATION_STANDARD_SPEC = {
   },
   2: {
     30: { exercises: [6, 7], examples: [0, 1], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
-    60: { exercises: [6, 8], examples: [0, 2], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
-    90: { exercises: [8, 10], examples: [0, 2], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
-    120: { exercises: [10, 12], examples: [1, 2], workshopInstructions: [3, 8], workshopMilestones: [2, 3], selfCheck: [5, 8], criteria: [4, 4], floors: { workshop: 35, exercises: 40 } }
+    60: { exercises: [8, 10], examples: [1, 2], workshopInstructions: [3, 8], workshopMilestones: [2, 2], selfCheck: [5, 8], criteria: [4, 4], floors: { workshop: 20, exercises: 25 } },
+    90: { exercises: [11, 13], examples: [1, 2], workshopInstructions: [5, 8], workshopMilestones: [3, 3], selfCheck: [6, 8], criteria: [4, 4], floors: { workshop: 30, exercises: 35 } },
+    120: { exercises: [14, 16], examples: [1, 2], workshopInstructions: [5, 8], workshopMilestones: [4, 4], selfCheck: [6, 8], criteria: [4, 4], floors: { workshop: 40, exercises: 45 } }
   }
 };
 var DYN_APPLICATION_MINUTES_TOLERANCE = 0.2;

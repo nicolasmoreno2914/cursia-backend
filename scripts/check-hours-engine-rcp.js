@@ -154,12 +154,16 @@ check('HE6 costo: el video no crece con las horas; la práctica cuesta mucho men
   // Review Fase 2 (I1/M6): la diferencia 20 → 33 h también sube de nivel actividades existentes (costo por nivel): < USD 1.
   // Loop 6 (priors v2.0, medidos en #1209): experiencia 0,25 + actividad 0,05 + Actividad de Aplicación 0,45 por práctica,
   // más la subida de nivel de las actividades existentes ⇒ < USD 2 (antes < 1 con priors subestimados ×4 en la Actividad).
-  assert(perPractice > 0 && perPractice < 2, `práctica ≈ USD ${perPractice.toFixed(2)}`);
+  // r79.2 (intencional): Actividades de 60/90/120 proporcionales (más ejercicios e hitos → 9/12/15 unidades de salida) ⇒ < USD 2,6.
+  assert(perPractice > 0 && perPractice < 2.6, `práctica ≈ USD ${perPractice.toFixed(2)}`);
   // Las dos diferencias incluyen la subida de nivel de las actividades existentes (330 → 1.050 → 1.650 min de
   // aplicación, costo por nivel desde la review M6): el capítulo de contenido sigue costando > 3× la práctica.
   // Loop 6 (priors v2.0): con costos MEDIDOS la práctica (experiencia + Actividad de Aplicación) cuesta ≈ la mitad de un
   // capítulo de contenido (video + Gamma + audiolibro + Libro + derivados), no un tercio como suponían los priors viejos.
-  assert(perContent > 1.5 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (> 1,5 × práctica USD ${perPractice.toFixed(2)})`);
+  // r79.2 (intencional): las diferencias 20 → 33 → 50 h incluyen la SUBIDA de nivel de las Actividades existentes, que ahora
+  // cuesta más (60/90/120 proporcionales): el cociente diferencial baja de > 1,5 a > 1,1. La medición directa por item
+  // (práctica ≈ 0,45 × un capítulo de contenido) la hace check-r79-2-optimizer OP3.
+  assert(perContent > 1.1 * perPractice, `contenido ≈ USD ${perContent.toFixed(2)} (> 1,1 × práctica USD ${perPractice.toFixed(2)})`);
 });
 
 check('HE7 0 llamadas de red medidas durante todos los dry-runs (no un literal del objeto de retorno)', () => {

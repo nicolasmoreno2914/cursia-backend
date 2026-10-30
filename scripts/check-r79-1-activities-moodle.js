@@ -52,11 +52,13 @@ async function check(name, fn) {
 }
 function assert(c, m) { if (!c) throw new Error(m); }
 
-const TITLES = ['Fundamentos de la atención al cliente', 'Escucha y empatía', 'Proyecto de protocolo de atención', 'Revisión y mejora del protocolo', 'Negociación de acuerdos', 'Seguimiento y fidelización'];
+const TITLES = ['Fundamentos de la atención al cliente', 'Escucha y empatía', 'Proyecto de protocolo de atención', 'Revisión y mejora del protocolo', 'Negociación de acuerdos', 'Seguimiento y fidelización', 'Registro de reclamos', 'Respuesta escrita al cliente', 'Práctica de atención completa'];
 function course(dist0) {
   return SF.buildCourse(dist0, { courseId: 7911, title: 'r79.1 · Tipos de Actividad de Aplicación', finalExam: true, engine: 'h5p', activityTypeRules: 2, chapterTitles: TITLES, modules: [
     { examEnabled: true, chapters: [{ video: true, activity: true, application: 60, appKind: 'case_study' }, { video: false, activity: true, application: 120 }, { practice: true, activity: true, application: 120, appKind: 'integrative_project' }, { practice: true, activity: true, application: 60, appKind: 'formative_feedback' }] },
-    { examEnabled: false, chapters: [{ video: false, activity: true, application: 90, appKind: 'case_study' }, { practice: true, activity: true, application: 30, appKind: 'formative_feedback' }] }] });
+    { examEnabled: false, chapters: [{ video: false, activity: true, application: 90, appKind: 'case_study' }, { practice: true, activity: true, application: 30, appKind: 'formative_feedback' }] },
+    // r79.2: la Actividad de siempre en 30/60/90 (proporcionales: ejemplo, consignas e hitos del taller desde 60).
+    { examEnabled: false, chapters: [{ video: false, activity: true, application: 30 }, { video: false, activity: true, application: 60 }, { practice: true, activity: true, application: 90 }] }] });
 }
 const KIND_LABEL = { case_study: 'Estudio de caso', integrative_project: 'Proyecto integrador', formative_feedback: 'Retroalimentación formativa', standard: 'Actividad de Aplicación' };
 const KIND_SECTIONS = { case_study: [/El caso/, /Preguntas de an[aá]lisis/, /Tu decisi[oó]n/], integrative_project: [/Etapas del proyecto/, /Integraci[oó]n y entrega final/], formative_feedback: [/Criterios de revisi[oó]n/, /Ejemplar comentado/, /Errores frecuentes/, /Plan de mejora/], standard: [/Ejercicios/, /Taller de aplicaci[oó]n/, /Hitos del taller/] };
@@ -129,7 +131,7 @@ async function moodleChecks(styles) {
         if (stu.visible !== 1) bad.push(`${st.key} cap ${k.number}: la página del estudiante no está visible`);
         if (sol.visible !== 0 || sol.visibleold !== 0) bad.push(`${st.key} cap ${k.number}: el solucionario no está oculto (${sol.visible}/${sol.visibleold})`);
         const text = stu.html.replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/g, ' ');
-        for (const re of KIND_SECTIONS[k.kind]) if (k.kind !== 'standard' || k.minutes === 120 || !/Hitos/.test(re.source)) if (!re.test(text)) bad.push(`${st.key} cap ${k.number} (${k.kind}): falta la sección ${re}`);
+        for (const re of KIND_SECTIONS[k.kind]) if (k.kind !== 'standard' || k.minutes >= 60 || !/Hitos/.test(re.source)) if (!re.test(text)) bad.push(`${st.key} cap ${k.number} (${k.kind}): falta la sección ${re}`);
         if (k.kind !== 'standard' && !/Resultados de aprendizaje que evidencias/.test(text)) bad.push(`${st.key} cap ${k.number}: sin los resultados que evidencia`);
         if (/Respuesta:|Solucionario|Soluci[oó]n esperada|Gu[ií]a de correcci[oó]n/.test(text)) bad.push(`${st.key} cap ${k.number}: marcas de solucionario en la página del estudiante`);
         if (/\$@[A-Z]/.test(stu.html) || /\$@[A-Z]/.test(sol.html)) bad.push(`${st.key} cap ${k.number}: tokens sin resolver`);
@@ -218,9 +220,9 @@ async function moodleChecks(styles) {
                   if (leaked) bad.push(`${k} cap ${kd.number}: el estudiante abrió el solucionario`);
                 }
                 const shoot = (k === 'aula-clara' || k === 'tecnico-oscuro' || k === 'vibrante') && (regime === 'guardado' || d.key === 'iphone-375');
-                if (shoot && (kd.kind !== 'standard' || kd.minutes === 120)) {
+                if (shoot) { // r79.2: también la de siempre de 30/60/90
                   await go(page, `http://127.0.0.1:8099/mod/page/view.php?id=${stu.cmid}`);
-                  await page.screenshot({ path: path.join(shotsDir, `${k}-${regime}-${d.key}-cap${kd.number}-${kd.kind}${kd.kind === 'standard' ? '-120' : ''}.png`), fullPage: true });
+                  await page.screenshot({ path: path.join(shotsDir, `${k}-${regime}-${d.key}-cap${kd.number}-${kd.kind}${kd.kind === 'standard' ? `-${kd.minutes}` : ''}.png`), fullPage: true });
                 }
               }
             }
@@ -243,7 +245,7 @@ async function moodleChecks(styles) {
             if (!p) { bad.push(`${k} cap ${kd.number}: la app no recibe la página`); continue; }
             n++;
             const t = p.content.replace(/<[^>]+>/g, ' ');
-            for (const re of KIND_SECTIONS[kd.kind]) if (kd.kind !== 'standard' || kd.minutes === 120 || !/Hitos/.test(re.source)) if (!re.test(t)) bad.push(`${k} cap ${kd.number}: la app no muestra ${re}`);
+            for (const re of KIND_SECTIONS[kd.kind]) if (kd.kind !== 'standard' || kd.minutes >= 60 || !/Hitos/.test(re.source)) if (!re.test(t)) bad.push(`${k} cap ${kd.number}: la app no muestra ${re}`);
             if (regime === 'limpio' && /<style\b/.test(p.content)) bad.push(`${k} cap ${kd.number}: <style> con forceclean`);
             const mod = ws.modules[stu.cmid];
             if (!mod || !mod.files.some((f) => /\.pdf$/.test(f || ''))) bad.push(`${k} cap ${kd.number}: la app no lista el PDF`);
