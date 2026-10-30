@@ -52,11 +52,13 @@ async function check(name, fn) {
 }
 function assert(c, m) { if (!c) throw new Error(m); }
 
-const TITLES = ['Fundamentos de la atención al cliente', 'Escucha y empatía', 'Proyecto de protocolo de atención', 'Revisión y mejora del protocolo', 'Negociación de acuerdos', 'Seguimiento y fidelización'];
+const TITLES = ['Fundamentos de la atención al cliente', 'Escucha y empatía', 'Proyecto de protocolo de atención', 'Revisión y mejora del protocolo', 'Negociación de acuerdos', 'Seguimiento y fidelización', 'Registro de reclamos', 'Respuesta escrita al cliente', 'Práctica de atención completa'];
 function course(dist0) {
   return SF.buildCourse(dist0, { courseId: 7911, title: 'r79.1 · Tipos de Actividad de Aplicación', finalExam: true, engine: 'h5p', activityTypeRules: 2, chapterTitles: TITLES, modules: [
     { examEnabled: true, chapters: [{ video: true, activity: true, application: 60, appKind: 'case_study' }, { video: false, activity: true, application: 120 }, { practice: true, activity: true, application: 120, appKind: 'integrative_project' }, { practice: true, activity: true, application: 60, appKind: 'formative_feedback' }] },
-    { examEnabled: false, chapters: [{ video: false, activity: true, application: 90, appKind: 'case_study' }, { practice: true, activity: true, application: 30, appKind: 'formative_feedback' }] }] });
+    { examEnabled: false, chapters: [{ video: false, activity: true, application: 90, appKind: 'case_study' }, { practice: true, activity: true, application: 30, appKind: 'formative_feedback' }] },
+    // r79.2: la Actividad de siempre en 30/60/90 (proporcionales: ejemplo, consignas e hitos del taller desde 60).
+    { examEnabled: false, chapters: [{ video: false, activity: true, application: 30 }, { video: false, activity: true, application: 60 }, { practice: true, activity: true, application: 90 }] }] });
 }
 const KIND_LABEL = { case_study: 'Estudio de caso', integrative_project: 'Proyecto integrador', formative_feedback: 'Retroalimentación formativa', standard: 'Actividad de Aplicación' };
 const KIND_SECTIONS = { case_study: [/El caso/, /Preguntas de an[aá]lisis/, /Tu decisi[oó]n/], integrative_project: [/Etapas del proyecto/, /Integraci[oó]n y entrega final/], formative_feedback: [/Criterios de revisi[oó]n/, /Ejemplar comentado/, /Errores frecuentes/, /Plan de mejora/], standard: [/Ejercicios/, /Taller de aplicaci[oó]n/, /Hitos del taller/] };
