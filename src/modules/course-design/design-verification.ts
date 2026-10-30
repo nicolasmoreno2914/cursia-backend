@@ -14,6 +14,7 @@
  * Requisitos institucionales (plantillas, pesos mínimos de evaluación por institución): pendiente — Cuenta todavía no
  * guarda requisitos de la institución; cuando existan, entran como otra área aquí.
  */
+import { usd2Es } from '../finops/usd-display';
 
 export type CheckSeverity = 'ok' | 'info' | 'warning' | 'critical';
 export type CheckArea = 'hours' | 'outcomes' | 'structure' | 'activities' | 'practice' | 'audiovisual' | 'evaluations' | 'pedagogy' | 'cost' | 'consistency' | 'requirements';
@@ -133,7 +134,8 @@ export interface VerificationInput {
 const MAX_TARGET_HOURS = 500;
 
 const h1 = (n: number) => String(Math.round(n * 10) / 10).replace('.', ',');
-const usd = (s: string) => String(s).replace('.', ',');
+// r79.2: máximo 2 decimales en pantalla (antes «≈ USD 60,1940142650»).
+const usd = (s: string) => usd2Es(s);
 const list = (xs: string[], max = 3) => xs.slice(0, max).map((x) => `«${x}»`).join(', ') + (xs.length > max ? ` y ${xs.length - max} más` : '');
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 const AV_TEXT: Record<string, string> = { less: 'menos video', recommended: 'recomendado', more: 'más video' };

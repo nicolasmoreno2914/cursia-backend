@@ -1423,7 +1423,7 @@ var DYN_V3_PROMPT_VERSIONS = {
   final_exam: 'v21-final-2'
 };
 // Fase 2: Actividad de Aplicación + solucionario (2 pasadas). Aparte para no mover DYN_V3_PROMPT_VERSIONS.
-var DYN_V3_APPLICATION_PROMPT_VERSION = 'v21-app-1';
+var DYN_V3_APPLICATION_PROMPT_VERSION = 'v21-app-3'; // r79.1: tipos de actividad + nivel de 120 reforzado · r79.2: 60/90/120 proporcionales
 // Loop 9 B: práctica guiada del capítulo (una pasada + el reintento dirigido).
 var DYN_V3_GUIDED_PRACTICE_PROMPT_VERSION = 'v21-gp-3';
 // EV6 IV avanzado: video_interactions schemaVersion 2 (pausas para pensar). La ruta schemaVersion 1
@@ -4078,7 +4078,9 @@ async function _dynRunExperience(item) {
 // ── application_activity:<ch> (Fase 2 · Actividades de Aplicación) ──
 // Espejo EXACTO de course-shell/application-activity.ts (validateApplicationStudentPart / ...SolutionPart): el
 // servidor re-valida el documento completo al completar el item y es autoritativo. Paridad: harness test-51.
-var DYN_APPLICATION_SCHEMA_VERSION = 1;
+// r79.1: 2 = documento con `kind` (la de siempre «standard» o un tipo nuevo) y el nivel de 120 reforzado. Los v1 que ya
+// existen siguen siendo válidos para el servidor (reglas v1); este ejecutor solo escribe v2.
+var DYN_APPLICATION_SCHEMA_VERSION = 2;
 var DYN_APPLICATION_LIM = { short: 160, text: 1200, long: 2400, answer: 2400 };
 var DYN_APPLICATION_SOURCE_MAX_CHARS = 20000;
 function _dynAppHelpers(errors) {
@@ -4109,8 +4111,10 @@ function _dynAppStrings(v, out) {
   else if (v && typeof v === 'object') Object.keys(v).forEach(function (k) { _dynAppStrings(v[k], out); });
   return out;
 }
-function dynValidateApplicationStudentPart(a, minutes) {
+function dynValidateApplicationStudentPart(a, minutes, schemaVersion) {
   if (!DYN_APPLICATION_EXERCISES_BY_MINUTES[minutes]) throw new Error('V3_VALIDATION_CONTEXT: Actividad de Aplicación con minutos inválidos ' + JSON.stringify(minutes));
+  var sv = schemaVersion === undefined ? DYN_APPLICATION_SCHEMA_VERSION : schemaVersion;
+  var sp = DYN_APPLICATION_STANDARD_SPEC[sv === 1 ? 1 : 2][minutes];
   var errors = [];
   var h = _dynAppHelpers(errors);
   var L = DYN_APPLICATION_LIM;
@@ -4126,8 +4130,8 @@ function dynValidateApplicationStudentPart(a, minutes) {
   h.text(a.title, '$.activity.title', L.short, 4);
   h.text(a.objective, '$.activity.objective', L.text, 20);
   h.text(a.context, '$.activity.context', L.long, 60);
-  var b = DYN_APPLICATION_EXERCISES_BY_MINUTES[minutes];
-  var examples = h.list(a.examples, '$.activity.examples', knownGenre && DYN_APPLICATION_GENRES_REQUIRING_EXAMPLE.indexOf(genre) >= 0 ? 1 : 0, b.examplesMax);
+  var exMin = Math.max(sp.examples[0], knownGenre && DYN_APPLICATION_GENRES_REQUIRING_EXAMPLE.indexOf(genre) >= 0 ? 1 : 0);
+  var examples = h.list(a.examples, '$.activity.examples', exMin, sp.examples[1]);
   examples.forEach(function (ex, i) {
     var p = '$.activity.examples[' + i + ']';
     if (!_dynIsPlainObject(ex)) return h.err(p, 'APPLICATION_SHAPE', p + ' debe ser un objeto');
@@ -4136,7 +4140,7 @@ function dynValidateApplicationStudentPart(a, minutes) {
     h.list(ex.steps, p + '.steps', 2, 10).forEach(function (st, j) { h.text(st, p + '.steps[' + j + ']', L.text, 3); });
     h.text(ex.result, p + '.result', L.text, 3);
   });
-  var exercises = h.list(a.exercises, '$.activity.exercises', b.min, b.max);
+  var exercises = h.list(a.exercises, '$.activity.exercises', sp.exercises[0], sp.exercises[1]);
   var lastD = -1;
   exercises.forEach(function (e, i) {
     var p = '$.activity.exercises[' + i + ']';
@@ -4158,7 +4162,20 @@ function dynValidateApplicationStudentPart(a, minutes) {
   else {
     h.text(w.title, '$.activity.workshop.title', L.short, 4);
     h.text(w.situation, '$.activity.workshop.situation', L.long, 60);
-    h.list(w.instructions, '$.activity.workshop.instructions', 2, 8).forEach(function (x, i) { h.text(x, '$.activity.workshop.instructions[' + i + ']', L.text, 8); });
+    h.list(w.instructions, '$.activity.workshop.instructions', sp.workshopInstructions[0], sp.workshopInstructions[1]).forEach(function (x, i) { h.text(x, '$.activity.workshop.instructions[' + i + ']', L.text, 8); });
+    // r79.1 (v2): hitos del taller con producto intermedio (solo el nivel de 120 los lleva).
+    if (sv !== 1) {
+      Object.keys(w).forEach(function (k) { if (['title', 'situation', 'instructions', 'milestones'].indexOf(k) < 0) h.err('$.activity.workshop.' + k, 'APPLICATION_SHAPE', 'campo desconocido en el taller: ' + k); });
+      if (sp.workshopMilestones[1] > 0) {
+        h.list(w.milestones, '$.activity.workshop.milestones', sp.workshopMilestones[0], sp.workshopMilestones[1]).forEach(function (ms, i) {
+          var p = '$.activity.workshop.milestones[' + i + ']';
+          if (!_dynIsPlainObject(ms)) return h.err(p, 'APPLICATION_SHAPE', p + ' debe ser un objeto');
+          Object.keys(ms).forEach(function (k) { if (k !== 'title' && k !== 'product') h.err(p + '.' + k, 'APPLICATION_SHAPE', 'campo desconocido en el hito: ' + k); });
+          h.text(ms.title, p + '.title', L.short, 4);
+          h.text(ms.product, p + '.product', L.text, 15);
+        });
+      } else if (w.milestones !== undefined) h.err('$.activity.workshop.milestones', 'APPLICATION_SHAPE', 'el nivel de ' + minutes + ' min no lleva hitos (solo el de 120)');
+    }
   }
   var dv = a.deliverable;
   if (!_dynIsPlainObject(dv)) h.err('$.activity.deliverable', 'APPLICATION_SHAPE', 'falta el producto o evidencia');
@@ -4167,8 +4184,8 @@ function dynValidateApplicationStudentPart(a, minutes) {
     h.text(dv.format, '$.activity.deliverable.format', L.short, 3);
     h.text(dv.extent, '$.activity.deliverable.extent', L.short, 2);
   }
-  h.list(a.selfCheck, '$.activity.selfCheck', 4, 8).forEach(function (x, i) { h.text(x, '$.activity.selfCheck[' + i + ']', L.text, 8); });
-  var criteria = h.list(a.criteria, '$.activity.criteria', 3, 4);
+  h.list(a.selfCheck, '$.activity.selfCheck', sp.selfCheck[0], sp.selfCheck[1]).forEach(function (x, i) { h.text(x, '$.activity.selfCheck[' + i + ']', L.text, 8); });
+  var criteria = h.list(a.criteria, '$.activity.criteria', sp.criteria[0], sp.criteria[1]);
   var sum = 0;
   criteria.forEach(function (c, i) {
     var p = '$.activity.criteria[' + i + ']';
@@ -4194,6 +4211,10 @@ function dynValidateApplicationStudentPart(a, minutes) {
     if (Math.abs(total - minutes) > minutes * DYN_APPLICATION_MINUTES_TOLERANCE) {
       h.err('$.activity.minutesBySection', 'APPLICATION_MINUTES_BUDGET', 'las secciones suman ' + total + ' min; el nivel es ' + minutes + ' min (±' + Math.round(DYN_APPLICATION_MINUTES_TOLERANCE * 100) + ' %)');
     }
+    // r79.1: pisos de minutos del nivel.
+    Object.keys(sp.floors).forEach(function (k) {
+      if (_dynIsInt(mbs[k]) && mbs[k] < sp.floors[k]) h.err('$.activity.minutesBySection.' + k, 'APPLICATION_SECTION_FLOOR', k + ': ' + mbs[k] + ' min; el nivel de ' + minutes + ' min exige al menos ' + sp.floors[k] + ' min en esta sección');
+    });
   }
   return { errors: errors, exerciseIds: ids, criteriaNames: names };
 }
@@ -4221,14 +4242,185 @@ function dynValidateApplicationSolutionPart(s, exerciseIds, criteriaNames) {
   h.list(s.teacherNotes, '$.solution.teacherNotes', 1, 6).forEach(function (x, i) { h.text(x, '$.solution.teacherNotes[' + i + ']', L.text, 10); });
   return errors;
 }
+// ── r79.1 · intérprete de los esquemas de los tipos nuevos (espejo EXACTO de validateKindValue / applyKindRule de
+// course-shell/application-kinds.ts). El esquema, las cantidades y los pisos del nivel vienen en el claim (kindSpec): son
+// los MISMOS datos con los que valida el servidor. Paridad: harness test-90 y check-r79-1-activity-kinds.js.
+var DYN_KIND_SOLUTION_MARKERS_RE = /Solucionario|Gu[ií]a de correcci[oó]n|Respuesta:|Soluci[oó]n esperada/i;
+function _dynKindAt(root, path) {
+  return path.split('.').reduce(function (o, k) { return _dynIsPlainObject(o) ? o[k] : undefined; }, root);
+}
+function dynValidateKindValue(spec, v, path, counts, errors) {
+  function err(code, message, p) { errors.push({ path: p === undefined ? path : p, code: code, message: message }); }
+  function num(c, side) { return typeof c === 'number' ? c : ((counts[c.tier] || [0, 0])[side]); }
+  if (spec.k === 'text') {
+    var mn = typeof spec.min === 'number' ? spec.min : num(spec.min, 0);
+    var mx = typeof spec.max === 'number' ? spec.max : num(spec.max, 1);
+    if (typeof v !== 'string' || v.trim().length < mn) return err('APPLICATION_TEXT', path + ' debe ser un texto de al menos ' + mn + ' caracteres');
+    if (v.length > mx) err('APPLICATION_TEXT_TOO_LONG', path + ' supera ' + mx + ' caracteres (' + v.length + ')');
+    return;
+  }
+  if (spec.k === 'int') {
+    if (!_dynIsInt(v) || v < spec.min || v > spec.max) err('APPLICATION_INT', path + ' debe ser un entero de ' + spec.min + ' a ' + spec.max);
+    return;
+  }
+  if (spec.k === 'enum') {
+    if (typeof v !== 'string' || spec.values.indexOf(v) < 0) err('APPLICATION_ENUM', path + ' debe ser uno de ' + spec.values.join(', '));
+    return;
+  }
+  if (spec.k === 'texts') {
+    var a = num(spec.min, 0); var b = num(spec.max, 1);
+    if (!Array.isArray(v)) return err('APPLICATION_LIST', path + ' debe ser una lista');
+    if (v.length < a || v.length > b) err('APPLICATION_COUNT', path + ' debe tener entre ' + a + ' y ' + b + ' elementos (tiene ' + v.length + ')');
+    v.forEach(function (x, i) { dynValidateKindValue({ k: 'text', min: spec.itemMin, max: spec.itemMax }, x, path + '[' + i + ']', counts, errors); });
+    return;
+  }
+  if (spec.k === 'list') {
+    var lmin = num(spec.min, 0); var lmax = num(spec.max, 1);
+    if (!Array.isArray(v)) return err('APPLICATION_LIST', path + ' debe ser una lista');
+    if (v.length < lmin || v.length > lmax) err('APPLICATION_COUNT', path + ' debe tener entre ' + lmin + ' y ' + lmax + ' elementos (tiene ' + v.length + ')');
+    var seen = {}; var last = -1;
+    v.forEach(function (x, i) {
+      var p = path + '[' + i + ']';
+      dynValidateKindValue(spec.of, x, p, counts, errors);
+      if (!_dynIsPlainObject(x)) return;
+      if (spec.ids && x[spec.ids.key] !== spec.ids.prefix + (i + 1)) err('APPLICATION_ID', p + '.' + spec.ids.key + ' debe ser "' + spec.ids.prefix + (i + 1) + '" (en orden)', p + '.' + spec.ids.key);
+      if (spec.unique) {
+        var u = String(x[spec.unique] == null ? '' : x[spec.unique]).trim();
+        if (u && seen[u]) err('APPLICATION_DUPLICATE', spec.unique + ' repetido: ' + u, p + '.' + spec.unique);
+        seen[u] = true;
+      }
+      if (spec.order) {
+        var d = spec.order.values.indexOf(x[spec.order.key]);
+        if (d >= 0 && d < last) err('APPLICATION_ORDER', path + ': «' + spec.order.key + '» va de menor a mayor (' + spec.order.values.join(' → ') + ')', p + '.' + spec.order.key);
+        if (d >= 0) last = Math.max(last, d);
+      }
+    });
+    return;
+  }
+  if (spec.k === 'obj') {
+    if (!_dynIsPlainObject(v)) return err('APPLICATION_SHAPE', 'falta ' + path + ' (objeto)');
+    Object.keys(v).forEach(function (k) { if (!Object.prototype.hasOwnProperty.call(spec.fields, k)) err('APPLICATION_SHAPE', 'campo desconocido: ' + path + '.' + k, path + '.' + k); });
+    Object.keys(spec.fields).forEach(function (k) {
+      if (v[k] === undefined && spec.optional && spec.optional.indexOf(k) >= 0) return;
+      dynValidateKindValue(spec.fields[k], v[k], path + '.' + k, counts, errors);
+    });
+  }
+}
+function _dynApplyKindRule(rule, root, ctx, kindSpec, errors) {
+  var counts = kindSpec.counts || {};
+  var p = '$.' + rule.path;
+  var v = _dynKindAt(root, String(rule.path));
+  if (rule.r === 'weights100') {
+    if (!Array.isArray(v) || !v.length) return;
+    var ws = v.map(function (c) { return _dynIsPlainObject(c) ? c.weight : null; });
+    if (ws.every(function (w) { return _dynIsInt(w); })) {
+      var sum = ws.reduce(function (a, b) { return a + b; }, 0);
+      if (sum !== 100) errors.push({ path: p, code: 'APPLICATION_CRITERIA_WEIGHTS', message: 'los pesos de los criterios deben sumar 100 (suman ' + sum + ')' });
+    }
+    return;
+  }
+  if (rule.r === 'presence') {
+    var want = ((counts[String(rule.tier)] || [0, 0])[0]) > 0;
+    var has = v !== undefined;
+    if (want && !has) errors.push({ path: p, code: 'APPLICATION_SHAPE', message: p + ' es obligatorio en el nivel de ' + ctx.minutes + ' min' });
+    if (!want && has) errors.push({ path: p, code: 'APPLICATION_SHAPE', message: p + ' no corresponde al nivel de ' + ctx.minutes + ' min' });
+    var mbs = _dynKindAt(root, 'activity.minutesBySection');
+    var sec = String(rule.section);
+    if (_dynIsPlainObject(mbs)) {
+      if (want && mbs[sec] === undefined) errors.push({ path: '$.activity.minutesBySection.' + sec, code: 'APPLICATION_SECTION_MINUTES', message: 'falta minutesBySection.' + sec });
+      if (!want && mbs[sec] !== undefined) errors.push({ path: '$.activity.minutesBySection.' + sec, code: 'APPLICATION_SECTION_MINUTES', message: 'minutesBySection.' + sec + ' no corresponde al nivel de ' + ctx.minutes + ' min' });
+    }
+    return;
+  }
+  if (rule.r === 'minutesBudget') {
+    if (!_dynIsPlainObject(v)) return;
+    var vals = Object.keys(v).map(function (k) { return v[k]; });
+    if (!vals.every(function (x) { return _dynIsInt(x); })) return;
+    var total = vals.reduce(function (a, b) { return a + b; }, 0);
+    var tol = typeof kindSpec.tolerance === 'number' ? kindSpec.tolerance : 0.2;
+    if (Math.abs(total - ctx.minutes) > ctx.minutes * tol) errors.push({ path: p, code: 'APPLICATION_MINUTES_BUDGET', message: 'las secciones suman ' + total + ' min; el nivel es ' + ctx.minutes + ' min (±' + Math.round(tol * 100) + ' %)' });
+    var fl = kindSpec.floors || {};
+    Object.keys(fl).forEach(function (sec2) {
+      if (typeof v[sec2] === 'number' && v[sec2] < fl[sec2]) errors.push({ path: p + '.' + sec2, code: 'APPLICATION_SECTION_FLOOR', message: sec2 + ': ' + v[sec2] + ' min; el nivel de ' + ctx.minutes + ' min exige al menos ' + fl[sec2] + ' min de trabajo en esta sección' });
+    });
+    return;
+  }
+  if (rule.r === 'sumEquals') {
+    if (!Array.isArray(v)) return;
+    var wantS = _dynKindAt(root, String(rule.equals));
+    var xs = v.map(function (x) { return _dynIsPlainObject(x) ? x[String(rule.key)] : null; });
+    if (!xs.every(function (x) { return _dynIsInt(x); }) || !_dynIsInt(wantS)) return;
+    var s2 = xs.reduce(function (a, b) { return a + b; }, 0);
+    if (s2 !== wantS) errors.push({ path: p, code: 'APPLICATION_STAGE_MINUTES', message: 'las etapas suman ' + s2 + ' min y minutesBySection.' + String(rule.equals).split('.').pop() + ' dice ' + String(wantS) });
+    return;
+  }
+  if (rule.r === 'mustInclude') {
+    if (!Array.isArray(v)) return;
+    var have = {};
+    v.forEach(function (x) { if (_dynIsPlainObject(x)) have[x[String(rule.key)]] = true; });
+    var miss = rule.values.filter(function (x) { return !have[x]; });
+    if (miss.length) errors.push({ path: p, code: 'APPLICATION_LEVELS', message: p + ' debe incluir al menos una pregunta de nivel ' + miss.join(' y ') });
+    return;
+  }
+  if (rule.r === 'covers') {
+    var of = _dynKindAt(root, String(rule.of));
+    if (!Array.isArray(v) || !Array.isArray(of)) return;
+    var wantC = of.map(function (x) { return _dynIsPlainObject(x) ? String(x[String(rule.ofKey)] == null ? '' : x[String(rule.ofKey)]).trim() : ''; });
+    if (v.length !== wantC.length) errors.push({ path: p, code: 'APPLICATION_SOLUTION_COVERAGE', message: p + ' debe tener EXACTAMENTE ' + wantC.length + ' elementos (uno por cada ' + String(rule.of).split('.').pop() + ', en orden; tiene ' + v.length + ')' });
+    v.forEach(function (x, i) {
+      var got = _dynIsPlainObject(x) ? String(x[String(rule.key)] == null ? '' : x[String(rule.key)]).trim() : '';
+      if (i < wantC.length && got !== wantC[i]) errors.push({ path: p + '[' + i + '].' + String(rule.key), code: 'APPLICATION_SOLUTION_COVERAGE', message: p + '[' + i + '].' + String(rule.key) + ' debe ser «' + wantC[i] + '» (mismo orden)' });
+    });
+    return;
+  }
+  if (rule.r === 'outcomeRefs') {
+    if (!Array.isArray(v)) return;
+    var allowed = ctx.outcomeIds || [];
+    if (!allowed.length) return;
+    var needD = Math.min(Number(rule.minDistinct == null ? 1 : rule.minDistinct), allowed.length);
+    var distinct = {}; var nd = 0;
+    v.forEach(function (x) { var id = _dynIsPlainObject(x) ? x.outcomeId : null; if (typeof id === 'string' && allowed.indexOf(id) >= 0 && !distinct[id]) { distinct[id] = true; nd++; } });
+    if (nd < needD) errors.push({ path: p, code: 'APPLICATION_OUTCOME_COVERAGE', message: p + ' debe citar al menos ' + needD + ' resultados distintos del capítulo (' + allowed.join(', ') + ')' });
+    v.forEach(function (x, i) {
+      var id = _dynIsPlainObject(x) ? x.outcomeId : undefined;
+      if (typeof id === 'string' && allowed.indexOf(id) < 0) errors.push({ path: p + '[' + i + '].outcomeId', code: 'APPLICATION_OUTCOME_REF', message: p + '[' + i + '].outcomeId «' + id + '» no es un resultado de este capítulo (' + allowed.join(', ') + ')' });
+    });
+  }
+}
+// Una parte de un tipo nuevo ('student' = la actividad; 'solution' = el solucionario, que necesita la actividad).
+function dynValidateKindPart(kindSpec, ctx, part, which, activity) {
+  var errors = [];
+  var schema = kindSpec.schema;
+  var path = which === 'student' ? '$.activity' : '$.solution';
+  dynValidateKindValue(which === 'student' ? schema.student : schema.solution, part, path, kindSpec.counts || {}, errors);
+  if (which === 'student' && _dynIsPlainObject(part)) {
+    var marker = _dynAppStrings(part).filter(function (x) { return DYN_KIND_SOLUTION_MARKERS_RE.test(x); })[0];
+    if (marker !== undefined) errors.push({ path: path, code: 'APPLICATION_SOLUTION_MARKER', message: 'la actividad del estudiante no puede contener marcas de solucionario («Respuesta:», «Solución esperada», «Guía de corrección», «Solucionario»): «' + marker.slice(0, 80) + '»' });
+  }
+  var root = { activity: which === 'student' ? part : activity, solution: which === 'solution' ? part : undefined };
+  (schema.rules || []).forEach(function (rule) {
+    if (String(rule.path).indexOf(which === 'student' ? 'activity' : 'solution') !== 0) return;
+    _dynApplyKindRule(rule, root, ctx, kindSpec, errors);
+  });
+  return errors;
+}
+// ctx = { chapterId, minutes, kind?, kindSpec?, outcomeIds? } (kind ausente/'standard' = la Actividad de siempre).
 function dynValidateApplicationDoc(doc, ctx) {
   if (!ctx || typeof ctx.chapterId !== 'string') throw new Error('V3_VALIDATION_CONTEXT: Actividad de Aplicación sin chapterId ' + JSON.stringify(ctx));
   if (!_dynIsPlainObject(doc)) return [{ path: '$', code: 'APPLICATION_SHAPE', message: 'el documento debe ser un objeto' }];
-  var st = dynValidateApplicationStudentPart(doc.activity, ctx.minutes);
+  var kind = ctx.kind && ctx.kind !== 'standard' ? ctx.kind : null;
   var errors = [];
-  if (doc.schemaVersion !== DYN_APPLICATION_SCHEMA_VERSION) errors.push({ path: '$.schemaVersion', code: 'APPLICATION_SCHEMA_VERSION', message: 'schemaVersion debe ser ' + DYN_APPLICATION_SCHEMA_VERSION });
+  if (doc.schemaVersion !== DYN_APPLICATION_SCHEMA_VERSION) { errors.push({ path: '$.schemaVersion', code: 'APPLICATION_SCHEMA_VERSION', message: 'schemaVersion debe ser ' + DYN_APPLICATION_SCHEMA_VERSION }); return errors; }
   if (doc.chapterId !== ctx.chapterId) errors.push({ path: '$.chapterId', code: 'CHAPTER_ID_MISMATCH', message: 'chapterId debe ser "' + ctx.chapterId + '"' });
   if (doc.minutes !== ctx.minutes) errors.push({ path: '$.minutes', code: 'APPLICATION_MINUTES_MISMATCH', message: 'minutes debe ser ' + ctx.minutes + ' (nivel del Manifest)' });
+  if ((doc.kind === 'standard' ? null : doc.kind) !== kind) { errors.push({ path: '$.kind', code: 'APPLICATION_KIND_MISMATCH', message: 'kind debe ser "' + (kind || 'standard') + '" (tipo del Manifest)' }); return errors; }
+  if (kind) {
+    if (!ctx.kindSpec) throw new Error('V3_VALIDATION_CONTEXT: ' + kind + ' sin kindSpec en el claim');
+    Object.keys(doc).forEach(function (k) { if (['schemaVersion', 'chapterId', 'minutes', 'kind', 'activity', 'solution'].indexOf(k) < 0) errors.push({ path: '$.' + k, code: 'APPLICATION_SHAPE', message: 'campo desconocido: ' + k }); });
+    var kc = { kind: kind, minutes: ctx.minutes, outcomeIds: ctx.outcomeIds || [] };
+    return errors.concat(dynValidateKindPart(ctx.kindSpec, kc, doc.activity, 'student'), dynValidateKindPart(ctx.kindSpec, kc, doc.solution, 'solution', doc.activity));
+  }
+  var st = dynValidateApplicationStudentPart(doc.activity, ctx.minutes, 2);
   return errors.concat(st.errors, dynValidateApplicationSolutionPart(doc.solution, st.exerciseIds, st.criteriaNames));
 }
 function _dynApplicationClaim(item) {
@@ -4274,7 +4466,7 @@ async function _dynAppLoadDraft(item, expect) {
   try { doc = JSON.parse(dl.text); } catch (e) { doc = null; }
   if (!_dynIsPlainObject(doc) || doc.draftVersion !== 1 || !_dynIsPlainObject(doc.activity)) { out.reason = 'format'; return out; }
   if (doc.itemKey !== item.itemKey || doc.generation !== item.generation || doc.chapterId !== expect.chapterId) { out.reason = 'item'; return out; }
-  if (doc.minutes !== expect.minutes || doc.schemaVersion !== expect.schemaVersion) { out.reason = 'shape'; return out; }
+  if (doc.minutes !== expect.minutes || doc.schemaVersion !== expect.schemaVersion || (doc.kind || 'standard') !== (expect.kind || 'standard')) { out.reason = 'shape'; return out; }
   if (doc.promptVersion !== expect.promptVersion) { out.reason = 'promptVersion'; return out; }
   if (doc.sourceSha256 !== expect.sourceSha256) { out.reason = 'sourceMd'; return out; }
   if (typeof doc.resumes !== 'number' || !(doc.resumes >= 0) || doc.resumes >= DYN_APPLICATION_DRAFT_MAX_RESUMES) { out.reason = 'resumes'; return out; }
@@ -4287,7 +4479,7 @@ async function _dynAppLoadDraft(item, expect) {
     _dynLqaFixDeep(doc.activity, cc);
   } catch (e) { out.reason = 'invalid'; return out; }
   var v = null;
-  try { v = dynValidateApplicationStudentPart(doc.activity, expect.minutes); } catch (e) { v = null; }
+  try { v = expect.validateStudent ? expect.validateStudent(doc.activity) : dynValidateApplicationStudentPart(doc.activity, expect.minutes); } catch (e) { v = null; }
   if (!v || v.errors.length) { out.reason = 'invalid'; return out; }
   var hardTruth;
   try { hardTruth = _dynJsonTruthHits(doc.activity, cc).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; }); }
@@ -4298,12 +4490,35 @@ async function _dynAppLoadDraft(item, expect) {
   out.resumes = doc.resumes;
   return out;
 }
+// r79.2: presupuesto de salida por pasada. La Actividad de siempre de 90/120 pide 11–16 ejercicios (y su solucionario):
+// con 9 000 tokens fijos el JSON se podía truncar (lección de los SCORM pesados). Los tipos nuevos no cambian (9 000).
+var DYN_APPLICATION_MAX_TOKENS = { 30: 9000, 60: 10000, 90: 12000, 120: 14000 };
+function _dynApplicationMaxTokens(minutes, kind) {
+  if (kind) return 9000;
+  return DYN_APPLICATION_MAX_TOKENS[minutes] || 9000;
+}
+
 async function _dynRunApplicationActivity(item) {
   var bp = item.blueprint || {};
   if (!item.chapterId || !bp.chapter) return { ok: false, error: 'application_activity: el claim no trae chapterId/blueprint.chapter', retryable: false };
   var app = _dynApplicationClaim(item);
   if (!app || !DYN_APPLICATION_EXERCISES_BY_MINUTES[app.minutes]) return { ok: false, error: 'claim_payload_unavailable: application_activity ' + item.itemKey + ' sin minutos válidos en el claim', retryable: false };
   if (app.schemaVersion !== DYN_APPLICATION_SCHEMA_VERSION) return { ok: false, error: 'claim_payload_unavailable: application_activity ' + item.itemKey + ' con schemaVersion ' + JSON.stringify(app.schemaVersion) + ' (este ejecutor escribe ' + DYN_APPLICATION_SCHEMA_VERSION + ')', retryable: false };
+  // r79.1: tipo de la Actividad (del Manifest, vía el claim). Un tipo nuevo exige su especificación en el claim.
+  var kind = app.kind && app.kind !== 'standard' ? app.kind : null;
+  if (kind && (!_dynIsPlainObject(app.kindSpec) || !_dynIsPlainObject(app.kindSpec.schema) || !_dynIsPlainObject(app.kindSpec.counts))) {
+    return { ok: false, error: 'claim_payload_unavailable: application_activity ' + item.itemKey + ' de tipo ' + kind + ' sin su especificación (kindSpec) en el claim', retryable: false };
+  }
+  var outcomeIds = Array.isArray(app.outcomes) ? app.outcomes.map(function (o) { return o && o.id; }).filter(function (x) { return typeof x === 'string'; }) : [];
+  var kc = { kind: kind, minutes: app.minutes, outcomeIds: outcomeIds };
+  function validateStudent(obj) {
+    if (!kind) return dynValidateApplicationStudentPart(obj, app.minutes);
+    return { errors: dynValidateKindPart(app.kindSpec, kc, obj, 'student'), exerciseIds: [], criteriaNames: [] };
+  }
+  function validateSolution(obj, activity, v1) {
+    if (!kind) return dynValidateApplicationSolutionPart(obj, v1.exerciseIds, v1.criteriaNames);
+    return dynValidateKindPart(app.kindSpec, kc, obj, 'solution', activity);
+  }
   var src = await _dynLoadSourcesFor(item);
   if (!src.ok) return src.result;
   var sourceMd = _dynTrimAtParagraph(src.contentMd, DYN_APPLICATION_SOURCE_MAX_CHARS);
@@ -4311,7 +4526,7 @@ async function _dynRunApplicationActivity(item) {
   var chapter = Object.assign({}, bp.chapter, { id: item.chapterId });
   var sys = dynApplicationSys(courseContext);
   // O2b: borrador del intento anterior (actividad ya validada) → solo se corre la 2.ª pasada.
-  var draftExpect = { chapterId: item.chapterId, minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION, sourceSha256: dynSha256Hex(sourceMd) };
+  var draftExpect = { chapterId: item.chapterId, minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION, sourceSha256: dynSha256Hex(sourceMd), kind: kind || 'standard', validateStudent: validateStudent };
   var draft = await _dynAppLoadDraft(item, draftExpect);
   var resumed = !!draft.activity;
   // Falla validada: pide borrar el borrador anterior (null explícito; solo se manda si el claim lo anuncia).
@@ -4320,7 +4535,7 @@ async function _dynRunApplicationActivity(item) {
   function draftArtifact() {
     var draftDoc = {
       draftVersion: 1, itemKey: item.itemKey, generation: item.generation == null ? null : item.generation, chapterId: item.chapterId,
-      minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION,
+      minutes: app.minutes, schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, kind: kind || 'standard', promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION,
       // `resumes` nunca se incrementa: un intento reanudado nunca escribe un borrador nuevo (si falla, lo borra).
       sourceSha256: draftExpect.sourceSha256, resumes: draft.resumes, activity: activity
     };
@@ -4333,20 +4548,24 @@ async function _dynRunApplicationActivity(item) {
     v1 = draft.check;
   } else {
     // 1.ª pasada: actividad del estudiante.
-    r1 = await _dynV3JsonWithRetry(item, sys, dynApplicationActivityPrompt(courseContext, bp.outline, chapter, sourceMd, app, dynPedagogyBlock(item)), 9000, function (obj) {
-      var v = dynValidateApplicationStudentPart(obj, app.minutes);
+    var prompt1 = kind
+      ? dynApplicationKindActivityPrompt(courseContext, bp.outline, chapter, sourceMd, app, dynPedagogyBlock(item))
+      : dynApplicationActivityPrompt(courseContext, bp.outline, chapter, sourceMd, app, dynPedagogyBlock(item));
+    r1 = await _dynV3JsonWithRetry(item, sys, prompt1, _dynApplicationMaxTokens(app.minutes, kind), function (obj) {
+      var v = validateStudent(obj);
       if (v.errors.length) return { ok: false, errors: _dynFormatErrors(v.errors) };
       return { ok: true, value: obj };
     }, { normalizeMoney: dynCourseIsColombia(courseContext) });
     if (!r1.ok) return withDraftClear(_dynV3Invalid(item, r1.errors, r1.truncated));
     activity = r1.value;
-    v1 = dynValidateApplicationStudentPart(activity, app.minutes);
+    v1 = validateStudent(activity);
   }
   // 2.ª pasada: solucionario docente de ESA actividad (ids y criterios fijos).
   var r2;
   try {
-    r2 = await _dynV3JsonWithRetry(item, sys, dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd), 9000, function (obj) {
-      var errs = dynValidateApplicationSolutionPart(obj, v1.exerciseIds, v1.criteriaNames);
+    var prompt2 = kind ? dynApplicationKindSolutionPrompt(courseContext, chapter, activity, sourceMd, app) : dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd);
+    r2 = await _dynV3JsonWithRetry(item, sys, prompt2, _dynApplicationMaxTokens(app.minutes, kind), function (obj) {
+      var errs = validateSolution(obj, activity, v1);
       if (errs.length) return { ok: false, errors: _dynFormatErrors(errs) };
       return { ok: true, value: obj };
     }, { normalizeMoney: dynCourseIsColombia(courseContext) });
@@ -4364,17 +4583,20 @@ async function _dynRunApplicationActivity(item) {
     f2.draft = draftArtifact();
     return f2;
   }
-  // chapterId, minutos y schemaVersion los pone Cursia (nunca el LLM).
-  var doc = { schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, chapterId: item.chapterId, minutes: app.minutes, activity: activity, solution: r2.value };
-  var all = dynValidateApplicationDoc(doc, { chapterId: item.chapterId, minutes: app.minutes });
+  // chapterId, minutos, tipo y schemaVersion los pone Cursia (nunca el LLM).
+  var doc = { schemaVersion: DYN_APPLICATION_SCHEMA_VERSION, chapterId: item.chapterId, minutes: app.minutes, kind: kind || 'standard', activity: activity, solution: r2.value };
+  var all = dynValidateApplicationDoc(doc, { chapterId: item.chapterId, minutes: app.minutes, kind: kind, kindSpec: app.kindSpec, outcomeIds: outcomeIds });
   if (all.length) return withDraftClear(_dynV3Invalid(item, _dynFormatErrors(all), false));
   var a = _dynV3JsonArtifact(item, 'dynamic_application_json', doc, item.chapterId);
+  var counts = kind
+    ? { kind: kind, criteriaCount: activity.criteria.length, outcomeIds: (activity.outcomeLinks || []).map(function (o) { return o.outcomeId; }) }
+    : { genre: activity.genre, exerciseCount: activity.exercises.length, exampleCount: activity.examples.length, criteriaCount: activity.criteria.length };
   return {
     ok: true,
     artifacts: [a.artifact],
     summary: Object.assign({
-      chapterId: item.chapterId, applicationSchemaVersion: DYN_APPLICATION_SCHEMA_VERSION, minutes: app.minutes, genre: activity.genre,
-      exerciseCount: activity.exercises.length, exampleCount: activity.examples.length, criteriaCount: activity.criteria.length,
+      chapterId: item.chapterId, applicationSchemaVersion: DYN_APPLICATION_SCHEMA_VERSION, minutes: app.minutes
+    }, counts, {
       applicationSha256: a.sha, retried: !!((r1 && r1.retried) || r2.retried), promptVersion: DYN_V3_APPLICATION_PROMPT_VERSION, contentArtifactId: src.contentArtifactId,
       resumedFromDraft: resumed
     }, resumed ? { draftResumedFromAttempt: draft.attempt } : {}, draft.artifactId ? { draft: { artifactId: draft.artifactId, used: resumed, ignored: draft.reason || null } } : {},

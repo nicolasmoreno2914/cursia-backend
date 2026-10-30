@@ -165,6 +165,8 @@ export interface ChapterFacts {
    * capítulos con actividad: página del estudiante + solucionario oculto; entran al tiempo del capítulo.
    */
   applicationMinutes?: number;
+  /** r79.1: tipo de la Actividad de Aplicación (estudio de caso / proyecto integrador / retroalimentación), solo si lo tiene. */
+  applicationKind?: string;
   /**
    * Loop 9 B: minutos de la práctica guiada del capítulo de contenido (item guided_practice del Manifest). SOLO en
    * capítulos cuya práctica guiada tiene su documento validado en el paquete: entran al tiempo del capítulo.
@@ -436,6 +438,7 @@ export function buildCourseFacts(input: BuildCourseFactsInput): CourseFacts {
         activityType: variant === 'h5p' ? resolveActivityType(itemByKey.get(`activity:${mc.chapterId}`), { activityTypeRules: manifest.features?.activityTypeRules }) : null,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(mc.applicationMinutes !== undefined ? { applicationMinutes: mc.applicationMinutes } : {}),
+        ...((mc as { applicationKind?: string }).applicationKind !== undefined && mc.applicationMinutes !== undefined ? { applicationKind: (mc as { applicationKind?: string }).applicationKind } : {}),
         ...(mc.guidedPracticeMinutes !== undefined && guidedIds.has(mc.chapterId) ? { guidedPracticeMinutes: mc.guidedPracticeMinutes } : {}),
         // T4 (r57): modo efectivo de la AA (excepción del capítulo o el del curso); `page` = la página de siempre (sin clave).
         ...(chapterDeliveryMode(assessment.applicationDelivery, mc.chapterId, mc.applicationMinutes !== undefined) === 'assign'

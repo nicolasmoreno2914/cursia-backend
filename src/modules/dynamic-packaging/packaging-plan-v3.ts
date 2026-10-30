@@ -17,6 +17,7 @@
  * Cada item del Manifest queda consumido por EXACTAMENTE un lugar del plan;
  * un item desconocido o faltante es un Manifest roto → PackagingPlanV3Error.
  */
+import { applicationOutcomeRefs } from '../course-shell/application-kinds';
 import { createHash } from 'crypto';
 import { displayStructureTitle } from '../course-structure/structure-titles';
 import type { GenerationManifestV1, ManifestItem } from '../generation-manifests/generation-manifest-builder';
@@ -54,6 +55,10 @@ export interface PackagingChapterPlanV3 {
   kind?: 'practice';
   /** Fase 2: minutos de la Actividad de Aplicación, SOLO en capítulos que la tienen (sin la clave: sha de siempre). */
   applicationMinutes?: number;
+  /** r79.1: tipo de la Actividad (Manifest: chapters[].applicationKind), solo si tiene uno nuevo. */
+  applicationKind?: string;
+  /** r79.1: ids de los resultados del capítulo que cita la Actividad de un tipo nuevo (applicationOutcomeRefs del Blueprint). */
+  applicationOutcomeIds?: string[];
   /** Loop 9 B: minutos de la práctica guiada, SOLO en capítulos de contenido que la tienen (sin la clave: sha de siempre). */
   guidedPracticeMinutes?: number;
   keys: {
@@ -180,6 +185,10 @@ export function buildPackagingPlanV3(
       if (applicationKey && byKey.get(applicationKey)?.applicationMinutes !== mc.applicationMinutes) {
         throw new PackagingPlanV3Error(`${applicationKey} con applicationMinutes distinto del capítulo del Manifest`);
       }
+      // r79.1: el tipo del item y el del capítulo coinciden (el Manifest ya lo validó; se vuelve a exigir: falla fuerte).
+      if (applicationKey && (byKey.get(applicationKey) as any)?.applicationKind !== (mc as any).applicationKind) {
+        throw new PackagingPlanV3Error(`${applicationKey} con applicationKind distinto del capítulo del Manifest`);
+      }
       // Loop 9 B: la práctica guiada del capítulo de contenido (Manifest = fuente: chapters[].guidedPracticeMinutes).
       if (practice && mc.guidedPracticeMinutes !== undefined) throw new PackagingPlanV3Error(`el capítulo de práctica ${id} tiene práctica guiada en el Manifest`);
       const guidedKey = mc.guidedPracticeMinutes !== undefined ? take(`guided_practice:${id}`, 'guided_practice') : null;
@@ -199,6 +208,7 @@ export function buildPackagingPlanV3(
         activityVariant: variant,
         ...(practice ? { kind: 'practice' as const } : {}),
         ...(applicationKey ? { applicationMinutes: mc.applicationMinutes as number } : {}),
+        ...(applicationKey && (mc as any).applicationKind ? { applicationKind: (mc as any).applicationKind as string, applicationOutcomeIds: applicationOutcomeRefs(blueprint, id).map((o) => o.id) } : {}),
         ...(guidedKey ? { guidedPracticeMinutes: mc.guidedPracticeMinutes as number } : {}),
         keys: {
           content: practice ? null : take(`content:${id}`, 'content'),

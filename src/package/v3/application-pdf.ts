@@ -8,6 +8,9 @@ import type { ResolvedTheme } from '../../modules/theme-engine';
 import { contrastRatio } from '../../modules/theme-engine';
 import { APPLICATION_GENRE_LABEL } from '../../modules/course-shell/application-pages';
 import { criterionForGuide } from '../../modules/course-shell/application-activity';
+import { applicationDocKind } from '../../modules/course-shell/application-pages';
+import { APPLICATION_KIND_LABEL } from '../../modules/study-time/application-kind-tiers';
+import type { OutcomeRef } from '../../modules/course-shell/application-kinds';
 import { LIBRO_PDF_FIXED_DATE, pdfText, unmappedCharCount } from './libro-v3';
 
 export interface ApplicationPdfInput {
@@ -18,6 +21,8 @@ export interface ApplicationPdfInput {
   theme: ResolvedTheme;
   /** Clave determinística del documento (sha del artifact): va en /Keywords. */
   documentKey?: string;
+  /** r79.1: resultados del capítulo (texto de los que cita un tipo nuevo). */
+  outcomes?: readonly OutcomeRef[];
 }
 
 export interface ApplicationPdfResult {
@@ -74,7 +79,7 @@ async function render(input: ApplicationPdfInput, mode: 'student' | 'teacher'): 
     compress: true,
     info: {
       Title: T(`${mode === 'teacher' ? 'Solucionario: ' : ''}${a.title}`),
-      Subject: mode === 'teacher' ? 'Solucionario docente de la Actividad de Aplicación' : 'Actividad de Aplicación',
+      Subject: (() => { const k = applicationDocKind(input.doc); if (!k) return mode === 'teacher' ? 'Solucionario docente de la Actividad de Aplicación' : 'Actividad de Aplicación'; return mode === 'teacher' ? `Solucionario docente: ${APPLICATION_KIND_LABEL[k]}` : APPLICATION_KIND_LABEL[k]; })(),
       Author: 'Cursia',
       Creator: 'Cursia',
       Producer: 'Cursia (pdfkit)',
@@ -124,11 +129,15 @@ async function render(input: ApplicationPdfInput, mode: 'student' | 'teacher'): 
   };
 
   newPage();
-  text(`${mode === 'teacher' ? 'SOLUCIONARIO DOCENTE · ' : ''}ACTIVIDAD DE APLICACIÓN · CAPÍTULO ${input.chapterNumber}`, { size: 8.5, bold: true, color: accent, gap: 4 });
+  const kind = applicationDocKind(input.doc);
+  const kindLabel = kind ? APPLICATION_KIND_LABEL[kind] : 'Actividad de Aplicación';
+  text(`${mode === 'teacher' ? 'SOLUCIONARIO DOCENTE · ' : ''}${kindLabel.toUpperCase()} · CAPÍTULO ${input.chapterNumber}`, { size: 8.5, bold: true, color: accent, gap: 4 });
   text(`${input.courseTitle} · ${input.chapterTitle}`, { size: 9, color: SOFT, gap: 10 });
   text(a.title, { size: 19, bold: true, gap: 8 });
-  text(`${APPLICATION_GENRE_LABEL[a.genre] ?? 'Aplicación'} · Tiempo estimado: ${input.doc.minutes} minutos`, { size: 9.5, color: SOFT, gap: 10 });
-  if (mode === 'student') {
+  text(`${kind ? kindLabel : APPLICATION_GENRE_LABEL[a.genre] ?? 'Aplicación'} · Tiempo estimado: ${input.doc.minutes} minutos`, { size: 9.5, color: SOFT, gap: 10 });
+  if (kind) {
+    renderKind({ kind, mode, a, sol, text, head, lines, outcomes: input.outcomes ?? [] });
+  } else if (mode === 'student') {
     text('Nombre: ______________________________________    Fecha: _______________', { size: 10, gap: 12 });
     text(`Objetivo: ${a.objective}`, { bold: true });
     text(a.context, { color: SOFT });
@@ -149,6 +158,11 @@ async function render(input: ApplicationPdfInput, mode: 'student' | 'teacher'): 
     head(`Taller de aplicación: ${a.workshop.title}`);
     text(a.workshop.situation);
     a.workshop.instructions.forEach((s: string, i: number) => text(`${i + 1}. ${s}`, { indent: 12, gap: 3 }));
+    // r79.1: hitos del taller (nivel de 120, v2): cada uno con su producto intermedio.
+    if (Array.isArray(a.workshop.milestones) && a.workshop.milestones.length) {
+      text('Hitos del taller:', { bold: true, gap: 3 });
+      a.workshop.milestones.forEach((m: any, i: number) => text(`${i + 1}. ${m.title} — entregable: ${m.product}`, { indent: 12, gap: 3 }));
+    }
     lines(10);
     head('Producto o evidencia');
     text(a.deliverable.description);
@@ -192,4 +206,126 @@ async function render(input: ApplicationPdfInput, mode: 'student' | 'teacher'): 
   pdf.end();
   await done;
   return { pdf: Buffer.concat(chunks), pages: range.count, unmappedChars: unmappedCharCount(allText(input.doc, mode === 'teacher')) };
+}
+
+type TextFn = (s: string, o?: { size?: number; bold?: boolean; color?: string; gap?: number; indent?: number }) => void;
+const LEVEL: Record<string, string> = { comprender: 'Comprender', analizar: 'Analizar', evaluar: 'Evaluar', proponer: 'Proponer' };
+
+/** r79.1: contenido de los tipos nuevos (mismo documento que la página; el estudiante con renglones para responder). */
+function renderKind(x: { kind: string; mode: 'student' | 'teacher'; a: any; sol: any; text: TextFn; head: (s: string) => void; lines: (n: number) => void; outcomes: readonly OutcomeRef[] }): void {
+  const { kind, mode, a, sol, text, head, lines } = x;
+  const bullets = (xs: string[], o: { numbered?: boolean } = {}) => xs.forEach((s, i) => text(`${o.numbered ? `${i + 1}.` : '•'} ${s}`, { indent: 12, gap: 3 }));
+  if (mode === 'student') {
+    text('Nombre: ______________________________________    Fecha: _______________', { size: 10, gap: 12 });
+    text(`Objetivo: ${a.objective}`, { bold: true });
+    if (kind === 'case_study') {
+      head(`El caso: ${a.case.title} (${a.case.organization})`);
+      String(a.case.narrative).split(/\n+/).filter((p: string) => p.trim()).forEach((p: string) => text(p));
+      a.case.exhibits.forEach((e: any, i: number) => { text(`Anexo ${i + 1}: ${e.title}`, { bold: true, gap: 3 }); String(e.content).split(/\n+/).filter((p: string) => p.trim()).forEach((p: string) => text(p, { indent: 12, gap: 3 })); });
+      head('Preguntas de análisis');
+      a.questions.forEach((q: any, i: number) => { text(`${i + 1}. [${LEVEL[q.level] ?? q.level}] ${q.prompt}`, { gap: 2 }); lines(q.answerLines); });
+      head('Tu decisión');
+      text(a.decision.prompt);
+      text('Condiciones que debes respetar:', { bold: true, gap: 3 });
+      bullets(a.decision.constraints);
+      lines(10);
+    } else if (kind === 'integrative_project') {
+      head('El proyecto');
+      String(a.brief.situation).split(/\n+/).filter((p: string) => p.trim()).forEach((p: string) => text(p));
+      text(`Producto final: ${a.brief.finalProduct}`, { bold: true });
+      a.stages.forEach((g: any, i: number) => {
+        head(`Etapa ${i + 1} (~${g.minutes} min): ${g.title}`);
+        text(g.purpose);
+        text(`Se apoya en: ${g.linkedChapter}`, { color: SOFT });
+        bullets(g.tasks, { numbered: true });
+        text(`Entregable de la etapa: ${g.intermediateDeliverable}`, { bold: true });
+        lines(6);
+      });
+      head('Integración y entrega final');
+      bullets(a.integration.instructions, { numbered: true });
+      text(`Presentación: ${a.integration.presentation}`, { color: SOFT });
+    } else {
+      head('Qué vas a revisar');
+      text(a.target.product);
+      text(`Viene de: ${a.target.sourceActivity}`, { color: SOFT });
+      head('Criterios de revisión');
+      a.reviewCriteria.forEach((r: any, i: number) => { text(`${i + 1}. ${r.name}: ${r.lookFor}`, { gap: 2 }); bullets(r.questions); lines(3); });
+      head('Ejemplar comentado');
+      text('Fragmento sólido:', { bold: true, gap: 2 });
+      text(a.exemplar.strong, { indent: 12 });
+      text('Fragmento por mejorar:', { bold: true, gap: 2 });
+      text(a.exemplar.weak, { indent: 12 });
+      text(`Por qué: ${a.exemplar.commentary}`);
+      head('Errores frecuentes');
+      a.commonErrors.forEach((e: any) => text(`• ${e.error} — Cómo detectarlo: ${e.howToSpot} · Cómo corregirlo: ${e.howToFix}`, { gap: 4 }));
+      if (a.peerReview) {
+        head('Revisión entre pares');
+        text(a.peerReview.protocol);
+        bullets(a.peerReview.instructions, { numbered: true });
+        lines(6);
+      }
+      head('Plan de mejora y nueva entrega');
+      bullets(a.revision.steps, { numbered: true });
+      text(`Nueva entrega: ${a.revision.resubmission}`, { bold: true });
+      lines(6);
+      head('Reflexión');
+      a.reflection.forEach((q: string) => { text(`• ${q}`, { gap: 2 }); lines(2); });
+    }
+    head('Producto o evidencia');
+    text(a.deliverable.description);
+    text(`Formato: ${a.deliverable.format} · Extensión: ${a.deliverable.extent}`, { color: SOFT });
+    head('Autoevaluación');
+    a.selfCheck.forEach((s: string) => text(`[  ] ${s}`, { gap: 4 }));
+    head('Criterios de evaluación');
+    a.criteria.forEach((c: any) => text(`${c.name} (${c.weight} %): ${c.description}`, { gap: 4 }));
+    head('Resultados de aprendizaje que evidencias');
+    const textOf = new Map(x.outcomes.map((o) => [o.id, o.text]));
+    a.outcomeLinks.forEach((o: any) => { const t = textOf.get(o.outcomeId); text(`• ${t ? (o.outcomeId === 'OBJ' ? t : `${o.outcomeId}: ${t}`) : o.outcomeId} — ${o.evidence}`, { gap: 4 }); });
+    return;
+  }
+  text('Documento solo para docentes: no lo compartas con los estudiantes.', { bold: true, color: '#8A1C1C', gap: 10 });
+  if (kind === 'case_study') {
+    head('Análisis esperado de cada pregunta');
+    sol.questionGuides.forEach((g: any, i: number) => { text(`${i + 1}. ${a.questions[i]?.prompt ?? ''}`, { color: SOFT, gap: 2 }); text(g.expectedAnalysis, { gap: 2 }); bullets(g.keyPoints); });
+    head('Decisión: discusión');
+    text(`Recomendada: ${sol.decisionDiscussion.recommended}`, { bold: true });
+    text('Alternativas aceptables:', { bold: true, gap: 2 });
+    bullets(sol.decisionDiscussion.alternatives);
+    text(`Justificación: ${sol.decisionDiscussion.justification}`);
+    head('Preguntas para la discusión en clase');
+    bullets(sol.discussionQuestions);
+  } else if (kind === 'integrative_project') {
+    head('Guía de cada etapa');
+    sol.stageGuides.forEach((g: any, i: number) => {
+      text(`Etapa ${i + 1}: ${a.stages[i]?.title ?? ''}`, { bold: true, gap: 2 });
+      text(`Producto esperado: ${g.expectedOutput}`, { gap: 2 });
+      text('Errores frecuentes:', { bold: true, gap: 2 });
+      bullets(g.commonErrors);
+      text('Preguntas de control:', { bold: true, gap: 2 });
+      bullets(g.checkpointQuestions);
+    });
+    head('Ejemplo de producto final');
+    text(sol.finalProductExemplar);
+  } else {
+    head('Banco de retroalimentación por criterio de revisión');
+    sol.feedbackBank.forEach((g: any) => {
+      text(g.criterion, { bold: true, gap: 2 });
+      text(`Logrado: ${g.achieved}`, { indent: 12, gap: 2 });
+      text(`En proceso: ${g.developing}`, { indent: 12, gap: 2 });
+      text(`Insuficiente: ${g.insufficient}`, { indent: 12, gap: 2 });
+      text(`Comentario sugerido: ${g.feedbackComment}`, { indent: 12, gap: 2 });
+      text(`Siguiente paso: ${g.nextStep}`, { indent: 12, gap: 8 });
+    });
+    head('Diagnóstico de errores');
+    sol.errorGuide.forEach((e: any) => text(`• ${e.error} — ${e.diagnosis}`, { gap: 4 }));
+  }
+  head('Guía de corrección por criterio');
+  sol.correctionGuide.forEach((g: any, i: number) => {
+    text(`${g.criterion} (${criterionForGuide(a.criteria, g, i)?.weight} %)`, { bold: true, gap: 2 });
+    text(`Logrado: ${g.achieved}`, { indent: 12, gap: 2 });
+    text(`En proceso: ${g.developing}`, { indent: 12, gap: 2 });
+    text(`Insuficiente: ${g.insufficient}`, { indent: 12, gap: 8 });
+  });
+  head('Observaciones para el docente');
+  sol.teacherNotes.forEach((s: string) => text(`• ${s}`, { gap: 4 }));
 }

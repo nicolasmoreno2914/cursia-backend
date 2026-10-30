@@ -604,6 +604,9 @@ jobs:
                # listado real de la cuenta (GET /themes). Solo si faltan: un valor puesto a mano gana.
                ensure_env_default_if_absent GAMMA_THEME_V21_LIGHT_DEFAULT default-light
                ensure_env_default_if_absent GAMMA_THEME_V21_DARK_DEFAULT default-dark
+               # r79: Ajustar al presupuesto (Presupuesto de produccion del curso). SOLO staging: se enciende si la clave
+               # falta (un valor puesto a mano gana; false lo apaga). En produccion NO existe y queda apagado.
+               ensure_env_default_if_absent DYNAMIC_BUDGET_FIT true
                # Calibración #2 (EMAXCONNSESSION): pooler de Supabase en modo sesión = 15 clientes.
                # API 2 + 10 workers de polling x 1 = 12 teóricos; headroom 3 (migración del deploy,
                # preflight/admin, report). Ver src/database/db-pool-config.ts y check-db-pool-capacity.js.
@@ -755,6 +758,9 @@ jobs:
 
                echo "━━━ [4h5a3] Práctica guiada: verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-guided-practice-schema.js
+
+               echo "━━━ [4h5a4] r79.1 Tipos de Actividad de Aplicación: course_chapters.application_kind — migración + verificación (staging, DESPUÉS de Práctica guiada) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r79-1-application-kinds.js
 
                echo "━━━ [4h5c] Contexto académico: course_profiles kind academic + course_chapters.outcome_ids — migración (staging, DESPUÉS de pedagogy-profiles) ━━━"
                MIGRATION_ENV=staging node scripts/migrate-academic-context.js

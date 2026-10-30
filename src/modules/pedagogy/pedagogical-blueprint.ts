@@ -165,13 +165,32 @@ export interface EffectiveChapterDesign extends ChapterDesign {
  * Diseño EFECTIVO de un capítulo: su diseño congelado + las variaciones del rol que le da su posición
  * actual en el módulo. Lo usan el Manifest (builder y validador), el tipo H5P y el dry-run.
  */
+/**
+ * r79.1 (rendimiento): posición de cada capítulo en su módulo (ordenado), por snapshot. El builder y el validador del
+ * Manifest piden el diseño de cada item (≈ 7 por capítulo) y antes cada pedido re-ordenaba todos los módulos. El resultado
+ * de effectiveChapterDesign sigue siendo un objeto NUEVO en cada llamada (mismo valor).
+ */
+const CHAPTER_POS = new WeakMap<BlueprintSnapshotV2, Map<string, { m: number; idx: number; len: number }>>();
+function chapterPosOf(snapshot: BlueprintSnapshotV2): Map<string, { m: number; idx: number; len: number }> {
+  let pos = CHAPTER_POS.get(snapshot);
+  if (pos) return pos;
+  pos = new Map();
+  snapshot.modules.forEach((m, mi) => {
+    const chs = [...m.chapters].sort((a, b) => a.position - b.position);
+    chs.forEach((c, idx) => { if (!pos!.has(c.id)) pos!.set(c.id, { m: mi, idx, len: chs.length }); });
+  });
+  CHAPTER_POS.set(snapshot, pos);
+  return pos;
+}
+
 export function effectiveChapterDesign(snapshot: BlueprintSnapshotV2, chapterId: string): EffectiveChapterDesign {
   const ped = snapshot.course.pedagogy;
   if (!ped) throw new Error('effectiveChapterDesign: el snapshot no tiene diseño pedagógico');
-  for (const m of snapshot.modules) {
+  const at = chapterPosOf(snapshot).get(chapterId);
+  if (at) {
+    const m = snapshot.modules[at.m];
     const chs = [...m.chapters].sort((a, b) => a.position - b.position);
-    const idx = chs.findIndex((c) => c.id === chapterId);
-    if (idx < 0) continue;
+    const idx = at.idx;
     const base = chs[idx].design;
     if (!base) throw new Error(`effectiveChapterDesign: el capítulo ${chapterId} no tiene diseño`);
     const role = chapterRole(idx, chs.length);
@@ -182,6 +201,19 @@ export function effectiveChapterDesign(snapshot: BlueprintSnapshotV2, chapterId:
     return d;
   }
   throw new Error(`effectiveChapterDesign: capítulo ${chapterId} inexistente en el snapshot`);
+}
+
+/**
+ * r79.1 (rendimiento): el mismo diseño efectivo, COMPARTIDO por snapshot y capítulo, para lectores que solo copian campos
+ * (manifestItemDesign: ≈ 7 pedidos por capítulo en el builder y otros tantos en el validador del Manifest). No modificar.
+ */
+const SHARED_DESIGN = new WeakMap<BlueprintSnapshotV2, Map<string, EffectiveChapterDesign>>();
+export function effectiveChapterDesignShared(snapshot: BlueprintSnapshotV2, chapterId: string): Readonly<EffectiveChapterDesign> {
+  let m = SHARED_DESIGN.get(snapshot);
+  if (!m) { m = new Map(); SHARED_DESIGN.set(snapshot, m); }
+  let d = m.get(chapterId);
+  if (!d) { d = effectiveChapterDesign(snapshot, chapterId); m.set(chapterId, d); }
+  return d;
 }
 
 /** El snapshot con el diseño pedagógico adentro (null/undefined rules → el snapshot sin diseño). */

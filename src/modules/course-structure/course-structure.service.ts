@@ -38,7 +38,8 @@ import {
   snapshotSha256V2,
   validateBlueprintInputV2,
 } from '../course-blueprints/blueprint-snapshot';
-import { assertAcademicContextSchema, assertApplicationActivitySchema, assertGuidedPracticeSchema, assertPracticeChapterSchema, assertV21StructureSchema, hasGuidedPracticeSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { assertAcademicContextSchema, assertApplicationActivitySchema, assertApplicationKindSchema, assertGuidedPracticeSchema, assertPracticeChapterSchema, assertV21StructureSchema, hasApplicationKindSchema, hasGuidedPracticeSchema, probeV21StructureSchema } from './v21-schema-guard';
+import { isApplicationKind } from '../study-time/application-kind-tiers';
 import { isApplicationMinutes } from '../study-time/application-tiers';
 import { GUIDED_PRACTICE_TIERS, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 import {
@@ -291,6 +292,7 @@ export class CourseStructureService implements OnModuleInit {
         `select id, module_id, position, title, objective, description, video_enabled, activity_enabled,
                 to_jsonb(course_chapters) ->> 'chapter_kind' as chapter_kind,
                 to_jsonb(course_chapters) ->> 'application_minutes' as application_minutes,
+                to_jsonb(course_chapters) ->> 'application_kind' as application_kind,
                 to_jsonb(course_chapters) ->> 'guided_practice_minutes' as guided_practice_minutes,
                 to_jsonb(course_chapters) -> 'outcome_ids' as outcome_ids
            from public.course_chapters where course_id = $1`,
@@ -357,6 +359,10 @@ export class CourseStructureService implements OnModuleInit {
       if (designHasGuided) await assertGuidedPracticeSchema(queryRunner);
       const gpCol = designHasGuided || (await hasGuidedPracticeSchema(queryRunner));
       const gpOf = (c: { guidedPracticeMinutes?: number | null }) => ((c.guidedPracticeMinutes ?? 0) > 0 ? c.guidedPracticeMinutes : null);
+      // r79.1: el tipo de la Actividad de Aplicación se escribe donde la base tiene la columna; un diseño que lo usa la exige (503).
+      const designHasKinds = dist.modules.some((m) => m.chapters.some((c) => !!c.applicationKind));
+      if (designHasKinds) await assertApplicationKindSchema(queryRunner);
+      const akCol = designHasKinds || (await hasApplicationKindSchema(queryRunner));
       // Re-review piloto P2: la forma ANTES de agregar los capítulos de Cursia (para saber si la estructura seguía siendo suya).
       const shapeBefore = await liveStructureShape(queryRunner, courseId);
       let added = 0;
@@ -366,11 +372,17 @@ export class CourseStructureService implements OnModuleInit {
             const practice = c.kind === 'practice';
             // Review L84-2 N4: la profundización hereda los resultados de su módulo (lo mismo que mostró la tarjeta).
             const inherited = practice ? [] : moduleOutcomeIds(chapters, m.id, academic ? academicOutcomeIds(academic.context) : null);
-            await queryRunner.query(
+            const [ins] = returningRows(await queryRunner.query(
               `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes${practice ? ', chapter_kind' : ''}${inherited.length ? ', outcome_ids' : ''}${gpCol && gpOf(c) !== null ? ', guided_practice_minutes' : ''})
-               values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''}${inherited.length ? ', $9::jsonb' : ''}${gpCol && gpOf(c) !== null ? `, $${inherited.length ? 10 : 9}` : ''})`,
+               values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''}${inherited.length ? ', $9::jsonb' : ''}${gpCol && gpOf(c) !== null ? `, $${inherited.length ? 10 : 9}` : ''})
+               returning id`,
               [courseId, m.id, ci, c.title, c.objective, practice ? false : c.videoEnabled, c.activityEnabled, c.applicationMinutes, ...(inherited.length ? [JSON.stringify(inherited)] : []), ...(gpCol && gpOf(c) !== null ? [gpOf(c)] : [])],
-            );
+            ));
+            // r79.1: tipo de la Actividad del capítulo propuesto (solo si lo tiene; la columna ya se exigió arriba).
+            if (c.applicationKind) {
+              if (!ins?.id) throw new Error(`applyDistribution: el capítulo propuesto ${c.id} no devolvió su id`);
+              await queryRunner.query(`update public.course_chapters set application_kind = $1 where id = $2 and course_id = $3`, [c.applicationKind, ins.id, courseId]);
+            }
             added++;
           } else {
             await queryRunner.query(
@@ -383,6 +395,10 @@ export class CourseStructureService implements OnModuleInit {
             );
             if (gpCol) {
               await queryRunner.query(`update public.course_chapters set guided_practice_minutes = $1 where id = $2 and course_id = $3`, [gpOf(c), c.id, courseId]);
+            }
+            // r79.1: tipo de la Actividad (o null: la de siempre) donde la base tiene la columna.
+            if (akCol) {
+              await queryRunner.query(`update public.course_chapters set application_kind = $1 where id = $2 and course_id = $3`, [c.applicationKind ?? null, c.id, courseId]);
             }
           }
         }
@@ -515,10 +531,11 @@ export class CourseStructureService implements OnModuleInit {
       // regeneración parcial; lo que cambió lo detectan sus huellas, como cualquier edición.
       const cols: { column_name: string }[] = await queryRunner.query(
         `select column_name from information_schema.columns
-          where table_schema = 'public' and table_name = 'course_chapters' and column_name in ('chapter_kind', 'application_minutes', 'guided_practice_minutes')`,
+          where table_schema = 'public' and table_name = 'course_chapters' and column_name in ('chapter_kind', 'application_minutes', 'guided_practice_minutes', 'application_kind')`,
       );
       const hasKind = cols.some((c) => c.column_name === 'chapter_kind');
       const hasApp = cols.some((c) => c.column_name === 'application_minutes');
+      const hasAppKind = cols.some((c) => c.column_name === 'application_kind');
       const hasGuided = cols.some((c) => c.column_name === 'guided_practice_minutes');
       const liveMods: { id: string }[] = await queryRunner.query(`select id from public.course_modules where course_id = $1 order by position, id`, [courseId]);
       const liveChs: { id: string; module_id: string; title: string; chapter_kind: string | null; application_minutes: string | null; guided_practice_minutes: string | null }[] = await queryRunner.query(
@@ -530,7 +547,7 @@ export class CourseStructureService implements OnModuleInit {
       // El diseño de horas aplicado (práctica / Actividades de Aplicación) no viene del documento: se avisa al docente.
       const previousHadDesign = liveChs.some((c) => c.chapter_kind === 'practice' || c.application_minutes !== null || c.guided_practice_minutes !== null);
       const chsOf = (moduleId: string) => liveChs.filter((c) => c.module_id === moduleId);
-      const contentReset = `${hasKind ? ", chapter_kind = 'content'" : ''}${hasApp ? ', application_minutes = null' : ''}${hasGuided ? ', guided_practice_minutes = null' : ''}`;
+      const contentReset = `${hasKind ? ", chapter_kind = 'content'" : ''}${hasAppKind ? ', application_kind = null' : ''}${hasApp ? ', application_minutes = null' : ''}${hasGuided ? ', guided_practice_minutes = null' : ''}`;
       // Fase 3: de qué contenidos del documento viene cada capítulo (trazabilidad para la cobertura).
       const contentMap: Record<string, string[]> = {};
       for (const [mi, m] of proposal.modules.entries()) {
@@ -729,6 +746,8 @@ export class CourseStructureService implements OnModuleInit {
                                     'kind', to_jsonb(ch) ->> 'chapter_kind',
                                     -- Fase 2: sin la migración la clave no existe en la fila (app_col = false).
                                     'applicationMinutes', to_jsonb(ch) ->> 'application_minutes',
+                                    -- r79.1: tipo de la Actividad (sin la migración la clave no existe en la fila).
+                                    'applicationKind', to_jsonb(ch) ->> 'application_kind',
                                     -- Loop 9 B: sin la migración la clave no existe en la fila (gp_col = false).
                                     'guidedPracticeMinutes', to_jsonb(ch) ->> 'guided_practice_minutes',
                                     -- Fase 3: sin la migración la clave no existe en la fila (oid_col = false).
@@ -763,6 +782,8 @@ export class CourseStructureService implements OnModuleInit {
     // Fase 2: minutos de aplicación por capítulo (null = sin actividad); vacío si la base no tiene la columna.
     const appCol = row.app_col === true;
     const applicationByChapter = new Map<string, number | null>();
+    // r79.1: tipo de la Actividad por capítulo (solo los que lo tienen).
+    const applicationKindByChapter = new Map<string, string>();
     // Loop 9 B: minutos de práctica guiada por capítulo (null = sin práctica guiada); vacío si la base no tiene la columna.
     const gpCol = row.gp_col === true;
     const guidedByChapter = new Map<string, number | null>();
@@ -788,6 +809,10 @@ export class CourseStructureService implements OnModuleInit {
           const am = c.applicationMinutes === null || c.applicationMinutes === undefined ? null : Number(c.applicationMinutes);
           if (am !== null && !isApplicationMinutes(am)) throw new Error(`Capítulo ${c.id}: application_minutes ilegible (${JSON.stringify(c.applicationMinutes)})`);
           applicationByChapter.set(c.id, am);
+          if (typeof c.applicationKind === 'string' && c.applicationKind) {
+            if (!isApplicationKind(c.applicationKind)) throw new Error(`Capítulo ${c.id}: application_kind ilegible (${JSON.stringify(c.applicationKind)})`);
+            applicationKindByChapter.set(c.id, c.applicationKind);
+          }
         }
         if (gpCol) {
           const gm = c.guidedPracticeMinutes === null || c.guidedPracticeMinutes === undefined ? null : Number(c.guidedPracticeMinutes);
@@ -857,6 +882,7 @@ export class CourseStructureService implements OnModuleInit {
       outcomesByChapter,
       academicBp,
       guidedByChapter,
+      applicationKindByChapter,
     );
 
     return {
@@ -888,6 +914,8 @@ export class CourseStructureService implements OnModuleInit {
           ...(kindByChapter.has(c.id) ? { kind: kindByChapter.get(c.id) as 'content' | 'practice' } : {}),
           // Fase 2: la clave existe SOLO si la base tiene la columna (el editor ofrece la actividad solo entonces).
           ...(applicationByChapter.has(c.id) ? { applicationMinutes: applicationByChapter.get(c.id) as number | null } : {}),
+          // r79.1: solo en los capítulos cuya Actividad tiene un tipo nuevo.
+          ...(applicationKindByChapter.has(c.id) ? { applicationKind: applicationKindByChapter.get(c.id) as string } : {}),
           // Loop 9 B: la clave existe SOLO si la base tiene la columna (el editor ofrece la práctica guiada solo entonces).
           ...(guidedByChapter.has(c.id) ? { guidedPracticeMinutes: guidedByChapter.get(c.id) as number | null } : {}),
           // Fase 3: la clave existe SOLO si la base tiene la columna (el editor ofrece los vínculos solo entonces).
@@ -967,6 +995,7 @@ export class CourseStructureService implements OnModuleInit {
     outcomesByChapter?: Map<string, string[] | null>,
     academicBp: AcademicBlueprintContext | null = null,
     guidedByChapter?: Map<string, number | null>,
+    applicationKindByChapter?: Map<string, string>,
   ): boolean {
     if (!currentBlueprint) return false;
     try {
@@ -989,6 +1018,7 @@ export class CourseStructureService implements OnModuleInit {
             video_enabled: c.videoEnabled, activity_enabled: activityByChapter.get(c.id) as boolean,
             chapter_kind: kindByChapter?.get(c.id) ?? 'content',
             application_minutes: applicationByChapter?.get(c.id) ?? null,
+            application_kind: applicationKindByChapter?.get(c.id) ?? null,
             guided_practice_minutes: guidedByChapter?.get(c.id) ?? null,
             outcome_ids: outcomesByChapter?.get(c.id) ?? null,
           })),
@@ -1452,6 +1482,10 @@ export class CourseStructureService implements OnModuleInit {
       else if (dto.videoEnabled !== undefined) { sets.push(`video_enabled = $${i++}`); params.push(dto.videoEnabled); }
       if (dto.activityEnabled !== undefined) { sets.push(`activity_enabled = $${i++}`); params.push(dto.activityEnabled); }
       if (appMinutes !== undefined) { sets.push(`application_minutes = $${i++}`); params.push(appMinutes); }
+      // r79.1: cambiar a mano los minutos (o el tipo de capítulo) quita el tipo de la Actividad: el docente decide la
+      // actividad de siempre; Cursia vuelve a proponer el tipo en «Cursia recomienda» si aporta (nunca queda un tipo con
+      // un nivel que no es suyo).
+      if ((appMinutes !== undefined || dto.kind !== undefined) && (await hasApplicationKindSchema(queryRunner))) sets.push('application_kind = null');
       // Loop 9 B: pasar a práctica quita la práctica guiada (solo es de capítulos de contenido).
       if (gpMinutes !== undefined) { sets.push(`guided_practice_minutes = $${i++}`); params.push(gpMinutes); }
       else if (dto.kind === 'practice' && (await hasGuidedPracticeSchema(queryRunner))) sets.push('guided_practice_minutes = null');

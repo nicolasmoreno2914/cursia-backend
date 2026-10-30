@@ -735,12 +735,13 @@ async function main() {
       objective: 'Calcular dosis pediátricas por peso y verificar la dosis máxima diaria sin errores.',
       context: 'En la droguería llegan fórmulas pediátricas a diario. Tienes que comprobar que cada dosis indicada corresponde al peso del niño antes de dispensar el medicamento.',
       examples: [{ title: 'Dosis de un jarabe', problem: 'Un niño de 12 kg necesita 15 mg/kg de un jarabe de 120 mg/5 mL.', steps: ['Multiplica 15 mg × 12 kg = 180 mg.', 'Convierte a mL: 180 / 120 × 5 = 7,5 mL.'], result: 'Se administran 7,5 mL por toma.' }],
-      exercises: Array.from({ length: 7 }, (_, i) => ({ id: 'E' + (i + 1), prompt: 'Calcula la dosis del caso hipotético número ' + (i + 1) + ' con los datos indicados.', difficulty: i < 2 ? 'basico' : i < 5 ? 'intermedio' : 'avanzado', answerLines: 3 })),
-      workshop: { title: 'Revisión de fórmulas', situation: 'Recibes cinco fórmulas pediátricas hipotéticas de una jornada. Debes revisar cada dosis y decidir si se dispensa o se consulta al médico.', instructions: ['Calcula la dosis esperada de cada fórmula.', 'Compara con la dosis indicada y decide qué hacer.'] },
+      // r79.2: forma v2 del nivel de 60 (8 ejercicios, 3 consignas, 2 hitos, 5 autoevaluación, 4 criterios, pisos de minutos).
+      exercises: Array.from({ length: 8 }, (_, i) => ({ id: 'E' + (i + 1), prompt: 'Calcula la dosis del caso hipotético número ' + (i + 1) + ' con los datos indicados.', difficulty: i < 2 ? 'basico' : i < 6 ? 'intermedio' : 'avanzado', answerLines: 3 })),
+      workshop: { title: 'Revisión de fórmulas', situation: 'Recibes cinco fórmulas pediátricas hipotéticas de una jornada. Debes revisar cada dosis y decidir si se dispensa o se consulta al médico.', instructions: ['Calcula la dosis esperada de cada fórmula.', 'Compara con la dosis indicada y decide qué hacer.', 'Registra cada decisión en la tabla de control.'], milestones: [{ title: 'Cálculo de las dosis', product: 'La tabla con la dosis esperada de cada fórmula.' }, { title: 'Decisión por fórmula', product: 'La tabla con la decisión justificada de cada fórmula.' }] },
       deliverable: { description: 'Una tabla con el cálculo y la decisión de cada fórmula.', format: 'Tabla', extent: 'Una página' },
-      selfCheck: ['¿Usé el peso en kilogramos?', '¿Verifiqué la dosis máxima diaria?', '¿Convertí bien a mililitros?', '¿Justifiqué cada decisión?'],
-      criteria: [{ name: 'Precisión del cálculo', description: 'Las dosis calculadas son correctas.', weight: 50 }, { name: 'Verificación', description: 'Se revisa la dosis máxima.', weight: 30 }, { name: 'Decisión justificada', description: 'Cada decisión se explica.', weight: 20 }],
-      minutesBySection: { examples: 10, exercises: 30, workshop: 15, selfCheck: 5 },
+      selfCheck: ['¿Usé el peso en kilogramos?', '¿Verifiqué la dosis máxima diaria?', '¿Convertí bien a mililitros?', '¿Justifiqué cada decisión?', '¿Entregué los hitos del taller?'],
+      criteria: [{ name: 'Precisión del cálculo', description: 'Las dosis calculadas son correctas.', weight: 40 }, { name: 'Verificación', description: 'Se revisa la dosis máxima.', weight: 20 }, { name: 'Decisión justificada', description: 'Cada decisión se explica.', weight: 20 }, { name: 'Hitos del taller', description: 'Entrega los productos intermedios completos.', weight: 20 }],
+      minutesBySection: { examples: 8, exercises: 25, workshop: 22, selfCheck: 5 },
     };
     const sol = (n) => ({
       answers: act.exercises.slice(0, n).map((e) => ({ exerciseId: e.id, answer: 'Resultado del caso ' + e.id, explanation: 'Se multiplica la dosis por kilogramo por el peso y se convierte a mililitros.' })),
@@ -761,7 +762,7 @@ async function main() {
       blueprint: { course: { id: 1, title: 'Farmacología aplicada' }, module: { id: M1, title: 'Dosificación', objective: null, position: 1 }, chapter: { id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis', position: 1, videoEnabled: false },
         moduleChapters: [{ id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis', chapterNumber: 1 }], outline: [{ moduleNumber: 1, id: M1, title: 'Dosificación', objective: null, chapters: [{ chapterNumber: 1, id: C1, title: 'Cálculo de dosis por peso', objective: 'Calcular dosis' }] }] },
       dependencyArtifacts: [{ itemKey: 'content:' + C1, artifactId: 'md1', type: 'dynamic_content_md', storagePath: 'x' }, { itemKey: 'content:' + C1, artifactId: 'cp1', type: 'dynamic_context_package_json', storagePath: 'x' }],
-      claimPayload: { validatedArtifactType: 'dynamic_application_json', chapterId: C1, application: { minutes: 60, chapterKind: 'content', schemaVersion: 1, context: null, ...(announce ? { draftArtifactType: 'dynamic_application_draft_json' } : {}) } },
+      claimPayload: { validatedArtifactType: 'dynamic_application_json', chapterId: C1, application: { minutes: 60, chapterKind: 'content', schemaVersion: 2, context: null, ...(announce ? { draftArtifactType: 'dynamic_application_draft_json' } : {}) } },
     });
     let calls = [];
     let rt = mkRuntime((n) => JSON.stringify(n === 1 ? act : sol(6)), calls);
@@ -773,7 +774,7 @@ async function main() {
     store.draft1 = r1.draft.content;
     const ref = { applicationDraft: { artifactId: 'draft1', generation: 1, attempt: 1, recordedAt: 'x' } };
     calls = [];
-    rt = mkRuntime(() => JSON.stringify(sol(7)), calls);
+    rt = mkRuntime(() => JSON.stringify(sol(8)), calls);
     const r2 = await rt.run(mkItem(true, ref));
     eq([r2.ok, calls.length, r2.summary.resumedFromDraft], [true, 1, true], 'reanudado: solo la 2.ª pasada');
     calls = [];

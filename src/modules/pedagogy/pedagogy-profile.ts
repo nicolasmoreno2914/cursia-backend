@@ -80,7 +80,7 @@ export interface PedagogicalProfile {
    * Fase 2 · «Ajustar»: preferencias del diseño (énfasis y Actividades de Aplicación). Opcional: la clave existe SOLO
    * si alguna difiere del valor por defecto (perfiles anteriores conservan su sha).
    */
-  designPreferences?: { emphasis?: 'application' | 'depth'; applicationActivities?: 'practice_only' | 'none'; audiovisual?: 'less' | 'recommended' | 'more'; guidedPractice?: 'none' };
+  designPreferences?: { emphasis?: 'application' | 'depth'; applicationActivities?: 'practice_only' | 'none'; audiovisual?: 'less' | 'recommended' | 'more'; guidedPractice?: 'none'; maxContentChaptersPerModule?: number; activityKinds?: 'auto' };
   /**
    * T2 (r57) · Plan de aprendizaje: marco instruccional (instructional-frameworks.ts) + tipo de aprendizaje por
    * capítulo (learning-type.ts). Opcional: la clave existe SOLO si se activó (perfiles anteriores conservan su sha y
@@ -93,6 +93,11 @@ export interface PedagogicalProfile {
    * sha y el diseño es byte a byte el de antes). Puede ir en un perfil sin enfoque. Se congela en el Blueprint.
    */
   hoursModel?: HoursModelOverride;
+  /**
+   * r79 · «Presupuesto de producción del curso (USD)»: referencia para que Cursia ajuste el diseño (nunca es el «Tope
+   * autorizado» de la generación). Opcional: la clave existe SOLO si se definió (perfiles anteriores conservan su sha).
+   */
+  productionBudgetUsd?: number;
 }
 
 /** T2 (r57): configuración del plan de aprendizaje (en el perfil pedagógico del curso). */
@@ -270,7 +275,16 @@ const TOP_KEYS = [
 /** `designRules` lo escribe el servidor: se tolera en la entrada (se ignora y se recalcula). */
 const TOLERATED_KEYS = ['designRules'];
 /** Claves opcionales (ausentes = comportamiento anterior). */
-const OPTIONAL_KEYS = ['targetHours', 'designPreferences', 'learningPlan', 'hoursModel'];
+const OPTIONAL_KEYS = ['targetHours', 'designPreferences', 'learningPlan', 'hoursModel', 'productionBudgetUsd'];
+/** r79: límites del presupuesto de producción del curso (USD) y del tope de capítulos de contenido por módulo. */
+export const PRODUCTION_BUDGET_USD_MIN = 1;
+export const PRODUCTION_BUDGET_USD_MAX = 5000;
+export const CONTENT_CHAPTERS_CAP_MIN = 1;
+export const CONTENT_CHAPTERS_CAP_MAX = 5;
+/** Presupuesto válido: número de 1 a 5000 USD con hasta 2 decimales. */
+export function isValidProductionBudgetUsd(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= PRODUCTION_BUDGET_USD_MIN && v <= PRODUCTION_BUDGET_USD_MAX && Math.abs(Math.round(v * 100) - v * 100) < 1e-6;
+}
 const DESIGN_EMPHASES_ALLOWED = ['application', 'balanced', 'depth'];
 const APPLICATION_MODES_ALLOWED = ['auto', 'practice_only', 'none'];
 /** LOOP 8.3: prioridad audiovisual (sin valor por defecto: ausente = comportamiento anterior, por eso se guarda tal cual). */
@@ -284,7 +298,36 @@ export function profileDesignPreferences(p: unknown): { emphasis?: 'application'
   const errs: PedagogyValidationError[] = [];
   checkDesignPreferences(p.designPreferences, errs);
   if (errs.length) throw new Error(`PROFILE_INVALID: ${errs.map((e) => `${e.code} ${e.path}: ${e.message}`).join('; ')}`);
-  return { ...(p.designPreferences as object) } as any;
+  // r79: el tope de capítulos de contenido no es una preferencia del distribuidor (lo aplica el dry-run como restricción).
+  // r79.1: los tipos de actividad tampoco (los asigna el dry-run después del distribuidor).
+  const { maxContentChaptersPerModule: _cap, activityKinds: _kinds, ...rest } = p.designPreferences as Record<string, unknown>;
+  return rest as any;
+}
+
+/** r79.1 · «Tipos de actividad»: 'auto' = estudio de caso / proyecto integrador / retroalimentación donde aportan; ausente = 'none'. */
+export const ACTIVITY_KINDS_PREFS_ALLOWED = ['auto', 'none'];
+export function profileActivityKinds(p: unknown): 'auto' | 'none' {
+  if (!isPlainObject(p) || !isPlainObject(p.designPreferences) || p.designPreferences.activityKinds === undefined) return 'none';
+  const errs: PedagogyValidationError[] = [];
+  checkDesignPreferences(p.designPreferences, errs);
+  if (errs.length) throw new Error(`PROFILE_INVALID: ${errs.map((e) => `${e.code} ${e.path}: ${e.message}`).join('; ')}`);
+  return p.designPreferences.activityKinds === 'auto' ? 'auto' : 'none';
+}
+
+/** r79: tope de capítulos de contenido por módulo que fijó el ajuste al presupuesto (null = sin tope). Lanza si es inválido. */
+export function profileContentChaptersMax(p: unknown): number | null {
+  if (!isPlainObject(p) || !isPlainObject(p.designPreferences) || p.designPreferences.maxContentChaptersPerModule === undefined) return null;
+  const errs: PedagogyValidationError[] = [];
+  checkDesignPreferences(p.designPreferences, errs);
+  if (errs.length) throw new Error(`PROFILE_INVALID: ${errs.map((e) => `${e.code} ${e.path}: ${e.message}`).join('; ')}`);
+  return p.designPreferences.maxContentChaptersPerModule as number;
+}
+
+/** r79: presupuesto de producción del curso del perfil (null = sin presupuesto). Lanza si es inválido. */
+export function profileProductionBudgetUsd(p: unknown): number | null {
+  if (!isPlainObject(p) || p.productionBudgetUsd === undefined || p.productionBudgetUsd === null) return null;
+  if (!isValidProductionBudgetUsd(p.productionBudgetUsd)) throw new Error(`PROFILE_INVALID: INVALID_PRODUCTION_BUDGET productionBudgetUsd: debe ser un número de ${PRODUCTION_BUDGET_USD_MIN} a ${PRODUCTION_BUDGET_USD_MAX} USD (fue ${JSON.stringify(p.productionBudgetUsd)})`);
+  return p.productionBudgetUsd;
 }
 
 function checkDesignPreferences(v: unknown, errors: PedagogyValidationError[]): void {
@@ -293,7 +336,7 @@ function checkDesignPreferences(v: unknown, errors: PedagogyValidationError[]): 
     return;
   }
   for (const k of Object.keys(v)) {
-    if (k !== 'emphasis' && k !== 'applicationActivities' && k !== 'audiovisual' && k !== 'guidedPractice') errors.push({ path: `designPreferences.${k}`, code: 'UNKNOWN_FIELD', message: `Campo desconocido "designPreferences.${k}"` });
+    if (k !== 'emphasis' && k !== 'applicationActivities' && k !== 'audiovisual' && k !== 'guidedPractice' && k !== 'maxContentChaptersPerModule' && k !== 'activityKinds') errors.push({ path: `designPreferences.${k}`, code: 'UNKNOWN_FIELD', message: `Campo desconocido "designPreferences.${k}"` });
   }
   if (v.emphasis !== undefined && !DESIGN_EMPHASES_ALLOWED.includes(v.emphasis as string)) {
     errors.push({ path: 'designPreferences.emphasis', code: 'INVALID_OPTION', message: `emphasis inválido (permitidos: ${DESIGN_EMPHASES_ALLOWED.join(', ')})` });
@@ -303,6 +346,13 @@ function checkDesignPreferences(v: unknown, errors: PedagogyValidationError[]): 
   }
   if (v.applicationActivities !== undefined && !APPLICATION_MODES_ALLOWED.includes(v.applicationActivities as string)) {
     errors.push({ path: 'designPreferences.applicationActivities', code: 'INVALID_OPTION', message: `applicationActivities inválido (permitidos: ${APPLICATION_MODES_ALLOWED.join(', ')})` });
+  }
+  const cap = v.maxContentChaptersPerModule;
+  if (cap !== undefined && !(Number.isInteger(cap) && (cap as number) >= CONTENT_CHAPTERS_CAP_MIN && (cap as number) <= CONTENT_CHAPTERS_CAP_MAX)) {
+    errors.push({ path: 'designPreferences.maxContentChaptersPerModule', code: 'INVALID_OPTION', message: `maxContentChaptersPerModule debe ser un entero de ${CONTENT_CHAPTERS_CAP_MIN} a ${CONTENT_CHAPTERS_CAP_MAX}` });
+  }
+  if (v.activityKinds !== undefined && !ACTIVITY_KINDS_PREFS_ALLOWED.includes(v.activityKinds as string)) {
+    errors.push({ path: 'designPreferences.activityKinds', code: 'INVALID_OPTION', message: `activityKinds inválido (permitidos: ${ACTIVITY_KINDS_PREFS_ALLOWED.join(', ')})` });
   }
   if (v.guidedPractice !== undefined && !GUIDED_PRACTICE_MODES_ALLOWED.includes(v.guidedPractice as string)) {
     errors.push({ path: 'designPreferences.guidedPractice', code: 'INVALID_OPTION', message: `guidedPractice inválido (permitidos: ${GUIDED_PRACTICE_MODES_ALLOWED.join(', ')})` });
@@ -419,6 +469,9 @@ export function validatePedagogicalProfile(
     err('targetHours', 'INVALID_TARGET_HOURS', `targetHours debe ser un número de ${TARGET_HOURS_MIN} a ${TARGET_HOURS_MAX} horas, en pasos de 0,5`);
   }
   if ('designPreferences' in p && p.designPreferences !== null) checkDesignPreferences(p.designPreferences, errors);
+  if ('productionBudgetUsd' in p && p.productionBudgetUsd !== null && !isValidProductionBudgetUsd(p.productionBudgetUsd)) {
+    err('productionBudgetUsd', 'INVALID_PRODUCTION_BUDGET', `productionBudgetUsd debe ser un número de ${PRODUCTION_BUDGET_USD_MIN} a ${PRODUCTION_BUDGET_USD_MAX} USD (hasta 2 decimales)`);
+  }
   if ('learningPlan' in p && p.learningPlan !== null) checkLearningPlan(p.learningPlan, p, errors, defaultFrameworkRegistry());
   if ('hoursModel' in p && p.hoursModel !== null) {
     try {
@@ -512,17 +565,23 @@ export function normalizePedagogicalProfile(
     ...(() => {
       const dp = (q as any).designPreferences;
       if (!dp) return {};
-      const out: Record<string, string> = {};
+      const out: Record<string, string | number> = {};
       if (dp.emphasis && dp.emphasis !== 'balanced') out.emphasis = dp.emphasis;
       if (dp.applicationActivities && dp.applicationActivities !== 'auto') out.applicationActivities = dp.applicationActivities;
       if (dp.audiovisual) out.audiovisual = dp.audiovisual;
       if (dp.guidedPractice && dp.guidedPractice !== 'auto') out.guidedPractice = dp.guidedPractice;
+      // r79: solo si el ajuste al presupuesto fijó un tope (sin él: bytes y sha de siempre).
+      if (typeof dp.maxContentChaptersPerModule === 'number') out.maxContentChaptersPerModule = dp.maxContentChaptersPerModule;
+      // r79.1: solo «automático» se guarda (ausente = no usar los tipos nuevos: bytes y sha de siempre).
+      if (dp.activityKinds === 'auto') out.activityKinds = 'auto';
       return Object.keys(out).length ? { designPreferences: out as PedagogicalProfile['designPreferences'] } : {};
     })(),
     // T2 (r57): solo si se activó (sin plan: bytes y sha de siempre).
     ...((q as any).learningPlan ? { learningPlan: normalizeLearningPlan((q as any).learningPlan) } : {}),
     // r58 (I3): solo si se definió (sin configuración: bytes y sha de siempre).
     ...((q as any).hoursModel ? { hoursModel: canonicalHoursModel((q as any).hoursModel) as HoursModelOverride } : {}),
+    // r79: solo si se definió (sin presupuesto: bytes y sha de siempre).
+    ...(typeof (q as any).productionBudgetUsd === 'number' ? { productionBudgetUsd: (q as any).productionBudgetUsd } : {}),
   };
 }
 

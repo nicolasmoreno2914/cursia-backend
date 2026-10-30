@@ -107,6 +107,9 @@ export interface V3ItemValidationContext {
   examChapterMd?: ReadonlyMap<string, string>;
   /** Fase 2: minutos de la Actividad de Aplicación (item del Manifest congelado). */
   applicationMinutes?: number | null;
+  /** r79.1: tipo de la Actividad (Manifest) y resultados del capítulo (applicationOutcomeRefs del Blueprint del run). */
+  applicationKind?: string | null;
+  applicationOutcomeIds?: string[];
   /** Loop 9 B: minutos de la práctica guiada (item del Manifest congelado). */
   guidedPracticeMinutes?: number | null;
   /** Fix N1: casos del módulo que los ejercicios guiados no repiten (práctica + AA completadas). */
@@ -342,7 +345,11 @@ function validateV3ItemArtifactByType(ctx: V3ItemValidationContext, text: string
       if (!ctx.chapterId || typeof ctx.applicationMinutes !== 'number') {
         throw new Error(`V3_VALIDATION_CONTEXT: application_activity ${ctx.itemKey} sin chapterId o minutos`);
       }
-      const errors = validateApplicationActivityDoc(doc, { chapterId: ctx.chapterId, minutes: ctx.applicationMinutes });
+      const errors = validateApplicationActivityDoc(doc, {
+        chapterId: ctx.chapterId, minutes: ctx.applicationMinutes,
+        // r79.1: el tipo del Manifest congelado y los resultados del capítulo (los que el claim le dio al generador).
+        ...(ctx.applicationKind ? { kind: ctx.applicationKind as any, outcomeIds: ctx.applicationOutcomeIds ?? [] } : {}),
+      });
       return { ok: errors.length === 0, errors, ...(errors.length === 0 ? { summary: applicationActivitySummary(doc) } : {}) };
     }
     case 'guided_practice': {

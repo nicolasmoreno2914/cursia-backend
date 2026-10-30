@@ -16,6 +16,10 @@ import { eduIcon, roleTone, Tone } from '../visual-components/edu';
 import { inlineHtml, labelHtml } from '../visual-components/text';
 import { Hx, Surf, bgSurf, blockLink, box, eyebrow, heading, hx, link, pHtml, root, shellFail, st, toneSurf, ul, unprotectedText } from './html';
 import { criterionForGuide, validateApplicationActivityDoc } from './application-activity';
+import { isApplicationKind } from '../study-time/application-kind-tiers';
+import type { ApplicationKind } from '../study-time/application-kind-tiers';
+import type { OutcomeRef } from './application-kinds';
+import { kindSolutionBody, kindSolutionPageName, kindStudentBody, kindStudentPageName } from './application-kind-pages';
 
 export interface ApplicationPageInput {
   chapterId: string;
@@ -33,6 +37,13 @@ export interface ApplicationPageInput {
   delivery?: ApplicationDeliveryText;
   /** T5 (r57): archivos de trabajo de la AA (enlaces a su recurso del curso). Ausente/vacío = sin la sección. */
   resources?: Array<{ title: string; instructions: string; href: string; filename: string }>;
+  /** r79.1: resultados del capítulo (applicationOutcomeRefs) para mostrar el texto de los que cita un tipo nuevo. */
+  outcomes?: readonly OutcomeRef[];
+}
+
+/** r79.1: tipo nuevo del documento (null = la Actividad de siempre, v1 o v2). */
+export function applicationDocKind(doc: any): ApplicationKind | null {
+  return doc && doc.schemaVersion === 2 && isApplicationKind(doc.kind) ? doc.kind : null;
 }
 
 /** T4 (r57): lo que la sección «Cómo entregar» le dice al estudiante (de la entrega efectiva del perfil). */
@@ -78,15 +89,16 @@ export const APPLICATION_GENRE_LABEL: Readonly<Record<string, string>> = Object.
   inquiry: 'Indagación',
 });
 
-export function applicationStudentPageName(chapterNumber: number, title: string): string {
-  return `Actividad de Aplicación · Capítulo ${chapterNumber}: ${title}`;
+export function applicationStudentPageName(chapterNumber: number, title: string, kind: ApplicationKind | null = null): string {
+  return kind ? kindStudentPageName(kind, chapterNumber, title) : `Actividad de Aplicación · Capítulo ${chapterNumber}: ${title}`;
 }
-export function applicationSolutionPageName(chapterNumber: number): string {
-  return `Solucionario docente · Actividad de Aplicación del capítulo ${chapterNumber}`;
+export function applicationSolutionPageName(chapterNumber: number, kind: ApplicationKind | null = null): string {
+  return kind ? kindSolutionPageName(kind, chapterNumber) : `Solucionario docente · Actividad de Aplicación del capítulo ${chapterNumber}`;
 }
 
 function assertDoc(input: ApplicationPageInput): void {
-  const errs = validateApplicationActivityDoc(input.doc, { chapterId: input.chapterId, minutes: input.doc?.minutes });
+  const kind = applicationDocKind(input.doc);
+  const errs = validateApplicationActivityDoc(input.doc, { chapterId: input.chapterId, minutes: input.doc?.minutes, kind, ...(input.outcomes ? { outcomeIds: input.outcomes.map((o) => o.id) } : {}) });
   if (errs.length) shellFail(`Actividad de Aplicación del capítulo ${input.chapterNumber}: documento inválido (${errs.slice(0, 3).map((e) => `${e.code} ${e.path}`).join('; ')})`);
 }
 
@@ -123,6 +135,11 @@ function meta(h: Hx, text: string, color0: string, s?: Surf): string {
 /** Página del estudiante (sin respuestas). */
 export function applicationStudentPage(input: ApplicationPageInput, theme: ResolvedTheme): ApplicationPage {
   assertDoc(input);
+  const kind = applicationDocKind(input.doc);
+  if (kind) {
+    const { h, body } = kindStudentBody({ ...input, deliveryLines: input.delivery ? applicationDeliveryLines(input.delivery) : undefined }, theme);
+    return finish(applicationStudentPageName(input.chapterNumber, input.chapterTitle, kind), `application-ch${input.chapterNumber}`, h, body);
+  }
   const a = input.doc.activity;
   const h = hx(theme); // CLEAN_SAFE: la página nunca lleva <style>.
   const s = bgSurf(h);
@@ -165,7 +182,11 @@ export function applicationStudentPage(input: ApplicationPageInput, theme: Resol
   body += section(h, 'caso', ink, 'Taller de aplicación', s);
   {
     const cs = toneSurf(h, 'alt');
-    body += box(h, eyebrow(h, a.workshop.title, cs.s, { sentence: true, color: readable(ink, cs.s) }) + pHtml(h, inlineHtml(a.workshop.situation), cs.s) + ul(h, a.workshop.instructions.map((x: string) => inlineHtml(x)), cs.s, { ordered: true }), cs);
+    // r79.1: el nivel de 120 min (v2) suma hitos con producto intermedio (ausentes = la caja de siempre, byte a byte).
+    const milestones = Array.isArray(a.workshop.milestones) && a.workshop.milestones.length
+      ? pHtml(h, `<strong>${labelHtml('Hitos del taller:')}</strong>`, cs.s) + ul(h, a.workshop.milestones.map((m: any) => `<strong>${inlineHtml(m.title)}</strong>${labelHtml(' — entregable: ')}${inlineHtml(m.product)}`), cs.s, { ordered: true })
+      : '';
+    body += box(h, eyebrow(h, a.workshop.title, cs.s, { sentence: true, color: readable(ink, cs.s) }) + pHtml(h, inlineHtml(a.workshop.situation), cs.s) + ul(h, a.workshop.instructions.map((x: string) => inlineHtml(x)), cs.s, { ordered: true }) + milestones, cs);
   }
   body += end;
   body += section(h, 'logro', ink, 'Producto o evidencia', s) +
@@ -189,6 +210,11 @@ export function applicationStudentPage(input: ApplicationPageInput, theme: Resol
 /** Solucionario docente (página oculta). */
 export function applicationSolutionPage(input: ApplicationPageInput, theme: ResolvedTheme): ApplicationPage {
   assertDoc(input);
+  const kind = applicationDocKind(input.doc);
+  if (kind) {
+    const { h, body } = kindSolutionBody(input, theme);
+    return finish(applicationSolutionPageName(input.chapterNumber, kind), `application-solution-ch${input.chapterNumber}`, h, body);
+  }
   const a = input.doc.activity;
   const sol = input.doc.solution;
   const h = hx(theme);

@@ -647,6 +647,9 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
       // Fase 2: pdfkit no pudo generar el PDF imprimible de una Actividad de Aplicación / documento ya validado sin
       // actividad o sin solucionario al llegar al render → bug de producto (el item ya pasó su validación).
       'APPLICATION_PDF_FAILED', 'APPLICATION_PDF_INVALID',
+      // r79.1: la especificación de un nivel / tipo de Actividad no existe en la tabla (bug de integración: el Blueprint y
+      // el Manifest ya validaron tipo y nivel).
+      'APPLICATION_SPEC',
       // r57 T4: XML de la Tarea / rúbrica fuera de rango con un perfil ya validado → bug de producto.
       'ASSIGN_XML_INVALID', 'ASSIGN_RUBRIC_INVALID',
       // r58 I3: la configuración del modelo de tiempo congelada en el Blueprint no valida (el lock ya la validó) o las

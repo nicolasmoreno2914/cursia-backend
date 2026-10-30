@@ -43,6 +43,8 @@ import {
   designChangesSummary, inferSector, liveAutofixState, parseAutofixState, planAutofix, priorKnowledgeQuestion,
 } from './pedagogical-autofix';
 import { CourseProfilesService } from '../course-profiles/course-profiles.service';
+import { BudgetFitResult, fitDesignToBudget, isBudgetFitEnabled, publicBudgetFit, readBudgetFitMargin } from './budget-fit';
+import { PRODUCTION_BUDGET_USD_MAX, PRODUCTION_BUDGET_USD_MIN, isValidProductionBudgetUsd } from '../pedagogy/pedagogy-profile';
 import { PRIOR_KNOWLEDGE_LEVELS } from '../pedagogy/vocabulary';
 
 /** Prioridad audiovisual por defecto de V2 (sin preferencia guardada). */
@@ -199,6 +201,8 @@ export class CourseDesignService {
     if (adjust.audiovisual !== undefined) prefs.audiovisual = adjust.audiovisual;
     // Loop 9 B (fix I1): «Ejercicios guiados: Automático / Ninguno» (automático = no se guarda nada).
     if (adjust.guidedPractice !== undefined) { if (adjust.guidedPractice === 'auto') delete prefs.guidedPractice; else prefs.guidedPractice = adjust.guidedPractice; }
+    // r79.1: tipos de actividad (solo «automático» se guarda).
+    if (adjust.activityKinds !== undefined) { if (adjust.activityKinds === 'auto') prefs.activityKinds = 'auto'; else delete prefs.activityKinds; }
     if (!prefs.audiovisual) prefs.audiovisual = DEFAULT_AUDIOVISUAL;
     base.designPreferences = prefs;
 
@@ -265,6 +269,33 @@ export class CourseDesignService {
       }
     }
 
+    // r79 · «Presupuesto de producción del curso (USD)» (solo con DYNAMIC_BUDGET_FIT): se escribe en el perfil SOLO si
+    // tiene valor; null lo quita. El tope de capítulos de contenido lo decide SIEMPRE el ajuste de nuevo. Las otras palancas
+    // (video, ejercicios guiados, orden de crecimiento) parten de lo guardado: el ajuste solo puede bajarlas, así «Usar este
+    // diseño» (que guarda y vuelve a calcular sin «Ajustar») llega al MISMO diseño. Cuando el docente escribe un presupuesto
+    // nuevo en «Ajustar» sobre uno que ya manejaba el ajuste, esas palancas vuelven a su valor de base (decisión nueva).
+    const fitOn = isBudgetFitEnabled();
+    const savedBudget = !!saved && typeof (saved.profile as any).productionBudgetUsd === 'number';
+    const avFixed = adjust.audiovisual !== undefined || !!decisions.audiovisual || forceAllVideo;
+    const resetFitLevers = () => {
+      if (!savedBudget) return;
+      if (!avFixed && prefs.audiovisual !== 'more') prefs.audiovisual = DEFAULT_AUDIOVISUAL;
+      if (adjust.guidedPractice === undefined) delete prefs.guidedPractice;
+      if (adjust.emphasis === undefined) delete prefs.emphasis;
+      if (adjust.activityKinds === undefined) delete prefs.activityKinds;
+    };
+    if (fitOn) {
+      if (adjust.productionBudgetUsd === null) { delete base.productionBudgetUsd; delete prefs.maxContentChaptersPerModule; resetFitLevers(); }
+      else if (typeof adjust.productionBudgetUsd === 'number') {
+        if (!isValidProductionBudgetUsd(adjust.productionBudgetUsd)) throw new BadRequestException(`productionBudgetUsd debe ser un número de ${PRODUCTION_BUDGET_USD_MIN} a ${PRODUCTION_BUDGET_USD_MAX} USD.`);
+        base.productionBudgetUsd = adjust.productionBudgetUsd;
+        resetFitLevers();
+      }
+      if (typeof base.productionBudgetUsd === 'number') delete prefs.maxContentChaptersPerModule;
+      base.designPreferences = prefs;
+    }
+    const budgetUsd: number | null = fitOn && typeof base.productionBudgetUsd === 'number' ? base.productionBudgetUsd : null;
+
     let profile = normalizePedagogicalProfile(base);
     let dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile, requirementDecisions: decisionOverrides, academicOverride, chapterLinksOverride });
     const applied: { requirementId: string; text: string }[] = [];
@@ -298,6 +329,34 @@ export class CourseDesignService {
             break;
           }
         }
+      }
+    }
+    // r79 · Ajuste al presupuesto: sobre el diseño ya resuelto (horas, documento, video exigido), el de mejor calidad que
+    // llega a las horas dentro del presupuesto (esperado + margen). Si cabe, la tarjeta ES ese diseño (y «Usar este diseño»
+    // guarda sus preferencias); si no, la tarjeta es la de siempre y se ofrecen alternativas. Nunca toca el «Tope autorizado».
+    let budgetFit: BudgetFitResult | null = null;
+    if (budgetUsd !== null && dr.distribution && typeof profile.targetHours === 'number') {
+      const { input } = await this.pedagogy.dryRunCourseInput(courseId, ownerId, { profile, requirementDecisions: decisionOverrides, academicOverride, chapterLinksOverride });
+      const videoFixed = avFixed || videoReqs.length > 0;
+      budgetFit = fitDesignToBudget({
+        base: input, budgetUsd, margin: readBudgetFitMargin(),
+        levers: {
+          audiovisual: { base: (prefs.audiovisual || DEFAULT_AUDIOVISUAL) as any, locked: videoFixed },
+          guidedPractice: { base: prefs.guidedPractice === 'none' ? 'none' : 'auto', locked: adjust.guidedPractice !== undefined },
+          emphasis: { base: (prefs.emphasis || 'balanced') as any, locked: adjust.emphasis !== undefined },
+          activityKinds: { base: prefs.activityKinds === 'auto' ? 'auto' : 'none', locked: adjust.activityKinds !== undefined },
+        },
+      });
+      if (budgetFit.status === 'fits' && budgetFit.chosen) {
+        const cp = budgetFit.chosen.preferences;
+        prefs.audiovisual = cp.audiovisual;
+        if (cp.guidedPractice === 'none') prefs.guidedPractice = 'none'; else delete prefs.guidedPractice;
+        if (cp.emphasis === 'balanced') delete prefs.emphasis; else prefs.emphasis = cp.emphasis;
+        if (cp.maxContentChaptersPerModule !== null) prefs.maxContentChaptersPerModule = cp.maxContentChaptersPerModule; else delete prefs.maxContentChaptersPerModule;
+        if (cp.activityKinds === 'auto') prefs.activityKinds = 'auto'; else delete prefs.activityKinds;
+        base.designPreferences = prefs;
+        profile = normalizePedagogicalProfile(base);
+        dr = await this.pedagogy.dryRunCourse(courseId, ownerId, { profile, requirementDecisions: decisionOverrides, academicOverride, chapterLinksOverride });
       }
     }
     const dist = dr.distribution;
@@ -468,7 +527,12 @@ export class CourseDesignService {
         : null,
       hours: { target: profile.targetHours ?? null, source: hoursSource, ...(proposal ? { proposedFrom: proposal.base, reason: proposal.reason } : hoursSource === 'proposed' ? { reason: `Cursia propuso ${profile.targetHours} h para este curso.` }
         : hoursSource === 'requirement' && hoursRequirement ? { reason: hoursRequirement.required ? `Horas del documento: ${requirementText(hoursRequirement.requirement)}.` : `Horas que sugiere el documento (${requirementText(hoursRequirement.requirement)}); puedes cambiarlas en «Ajustar».` } : {}) },
-      preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual, guidedPractice: prefs.guidedPractice || 'auto' },
+      preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto', audiovisual: prefs.audiovisual, guidedPractice: prefs.guidedPractice || 'auto',
+        ...(typeof prefs.maxContentChaptersPerModule === 'number' ? { maxContentChaptersPerModule: prefs.maxContentChaptersPerModule } : {}),
+        // r79.1: tipos de actividad (siempre explícito: 'auto' o 'none').
+        activityKinds: prefs.activityKinds === 'auto' ? 'auto' : 'none' },
+      // r79: solo con DYNAMIC_BUDGET_FIT (sin el interruptor la clave no existe: la respuesta de siempre).
+      ...(fitOn ? { productionBudget: budgetUsd !== null ? { usd: budgetUsd, margin: budgetFit ? budgetFit.margin : readBudgetFitMargin(), isAuthorizedCap: false } : null, budgetFit: budgetFit ? publicBudgetFit(budgetFit) : null } : {}),
       // Review L83 M-1: solo los fijados que el diseño usa (capítulos de contenido que existen).
       pinnedChapters,
       verification,
@@ -482,6 +546,8 @@ export class CourseDesignService {
           counts: dist.counts,
           hoursByComponent: dist.hoursByComponent,
           ...(dist.guidedPracticeFill ? { guidedPracticeFill: dist.guidedPracticeFill } : {}),
+          // r79.1: tipos de actividad asignados y por qué (solo con «Tipos de actividad: automático»).
+          ...(dist.activityKinds ? { activityKinds: dist.activityKinds } : {}),
           // Fix I1: la proporción a la vista («Ejercicios guiados: X h de Y h (Z %)»), para que la institución decida con el número.
           ...(dist.counts.guidedPracticeMinutes ? { guidedPracticeShare: {
             hours: Math.round((dist.counts.guidedPracticeMinutes / 60) * 10) / 10, designHours: dist.estimatedHours,
@@ -496,6 +562,8 @@ export class CourseDesignService {
             chapters: m.chapters.map((c) => ({
               id: c.id, proposed: c.proposed, kind: c.kind, title: c.title, role: c.role, videoEnabled: c.videoEnabled, videoPinned: c.videoPinned, applicationPinned: c.applicationPinned,
               activityEnabled: c.activityEnabled, review: c.review, applicationMinutes: c.applicationMinutes, hours: Math.round((c.targetMinutes / 60) * 10) / 10,
+              // r79.1: tipo de la Actividad de Aplicación (solo si tiene uno nuevo).
+              ...(c.applicationKind ? { applicationKind: c.applicationKind } : {}),
               // Loop 9 B: práctica guiada del capítulo de contenido (formativa, sin nota) y si la fijó el docente.
               guidedPracticeMinutes: c.guidedPracticeMinutes ?? null, guidedPracticePinned: c.guidedPracticePinned,
               outcomeIds: chapterOutcomes.get(c.id) || [],
@@ -508,7 +576,10 @@ export class CourseDesignService {
       suggestedApproach: suggestion ? suggestion.approach : null,
       manifestTotals: dist && dist.materialized ? dist.materialized.totals : null,
       blueprintSha256: dist && dist.materialized ? dist.materialized.blueprintSha256 : null,
-      cost: providers && providers.estimateUsd ? { min: providers.estimateUsd.min, expected: providers.estimateUsd.expected, max: providers.estimateUsd.max, note: providers.estimateNote } : null,
+      cost: providers && providers.estimateUsd ? { min: providers.estimateUsd.min, expected: providers.estimateUsd.expected, max: providers.estimateUsd.max, note: providers.estimateNote,
+        // r79 (F2 + Gamma): de dónde salen los precios y si la cifra es provisional (precio de Gamma sin verificar).
+        ...(providers.pricingSource ? { pricingSource: providers.pricingSource } : {}),
+        ...(providers.provisionalPricing ? { provisionalPricing: providers.provisionalPricing } : {}) } : null,
       outcomes: academic ? academic.context.outcomes.map((o) => ({ id: o.id, text: o.text })) : [],
       requirements: {
         ...auth.view,

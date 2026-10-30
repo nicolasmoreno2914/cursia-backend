@@ -406,6 +406,39 @@ export function displayChapterMinutes(minutes: number): number {
   return Math.max(R.chapterDisplayMin, Math.round(minutes / R.chapterDisplayRoundTo) * R.chapterDisplayRoundTo);
 }
 
+/**
+ * r79.1 (rendimiento): el capítulo se calcula solo con su entrada y la configuración (sin registro de horas, `lines`
+ * null): el distribuidor y el ajuste al presupuesto recalculan el curso entero cientos de veces cambiando UN capítulo.
+ * Caché por configuración (WeakMap) y por la entrada del capítulo; mismo objeto de resultado (nadie lo modifica).
+ */
+const CHAPTER_CACHE = new WeakMap<TimeModelConfig, Map<string, StudyTimeChapterEstimate>>();
+const CHAPTER_CACHE_MAX = 50000;
+/** Por identidad del objeto de entrada (el distribuidor reutiliza la entrada de un capítulo que no cambió). */
+const CHAPTER_OBJ_CACHE = new WeakMap<TimeModelConfig, WeakMap<object, StudyTimeChapterEstimate>>();
+function chapterCached(ch: StudyTimeChapterInput, ctx: Ctx): StudyTimeChapterEstimate {
+  if (ctx.lines !== null || !ch || typeof ch !== 'object') return chapterDetailed(ch, ctx);
+  let om = CHAPTER_OBJ_CACHE.get(ctx.cfg);
+  if (!om) { om = new WeakMap(); CHAPTER_OBJ_CACHE.set(ctx.cfg, om); }
+  const byObj = om.get(ch);
+  if (byObj) return byObj;
+  const r0 = chapterByKey(ch, ctx);
+  om.set(ch, r0);
+  return r0;
+}
+function chapterByKey(ch: StudyTimeChapterInput, ctx: Ctx): StudyTimeChapterEstimate {
+  let m = CHAPTER_CACHE.get(ctx.cfg);
+  if (!m) { m = new Map(); CHAPTER_CACHE.set(ctx.cfg, m); }
+  // Clave manual (más barata que JSON.stringify): todos los campos de StudyTimeChapterInput, en orden fijo.
+  const key = [ch.chapterId, ch.kind, ch.pageWords, ch.libro, ch.libroWords, ch.presentation, ch.slides, ch.video, ch.videoSeconds, ch.ivAdvanced, ch.activity, ch.activityItems, ch.review, ch.reviewCards, ch.applicationMinutes, ch.guidedPracticeMinutes].map((x) => (x === undefined ? '~' : String(x))).join('\u0001')
+    + (Object.keys(ch).length > 16 ? `\u0002${JSON.stringify(ch)}` : '');
+  const hit = m.get(key);
+  if (hit) return hit;
+  const r = chapterDetailed(ch, ctx);
+  if (m.size >= CHAPTER_CACHE_MAX) m.clear();
+  m.set(key, r);
+  return r;
+}
+
 function courseDetailed(input: StudyTimeCourseInput, cfg: TimeModelConfig, lines: HourLine[] | null): StudyTimeEstimate {
   const R = STUDY_TIME_RULES;
   const K = cfg.rates;
@@ -434,7 +467,7 @@ function courseDetailed(input: StudyTimeCourseInput, cfg: TimeModelConfig, lines
     const chapters = m.chapters.map((c) => {
       if (seenChapters.has(c?.chapterId)) throw new StudyTimeError(`capítulo repetido ${c.chapterId}`);
       seenChapters.add(c?.chapterId);
-      return chapterDetailed(c, mc);
+      return chapterCached(c, mc);
     });
     if (m.exam) {
       // Las preguntas salen del texto de los capítulos de CONTENIDO (el de práctica no tiene texto propio).
@@ -456,11 +489,16 @@ function courseDetailed(input: StudyTimeCourseInput, cfg: TimeModelConfig, lines
     }));
   }
 
-  const all: StudyTimeResource[] = [...course, ...modules.flatMap((m) => [...m.resources, ...m.chapters.flatMap((c) => c.resources)])];
+  // Mismo orden de suma que `[...course, ...modules.flatMap(m => [...m.resources, ...m.chapters.flatMap(c => c.resources)])]`
+  // (los flotantes suman igual, bit a bit), sin armar la lista entera (r79.1, rendimiento).
   const byComponent: Record<StudyTimeComponent, number> = { course: 0, content: 0, practice: 0, review: 0, application: 0, assessment: 0 };
-  for (const x of all) byComponent[x.component] += x.minutes;
+  let totalMin = 0;
+  let planned = false;
+  const visit = (x: StudyTimeResource) => { byComponent[x.component] += x.minutes; totalMin += x.minutes; if (!x.measured) planned = true; };
+  for (const x of course) visit(x);
+  for (const m of modules) { for (const x of m.resources) visit(x); for (const c of m.chapters) for (const x of c.resources) visit(x); }
   for (const k of Object.keys(byComponent) as StudyTimeComponent[]) byComponent[k] = r2(byComponent[k]);
-  const courseEstimatedMinutes = r2(all.reduce((a, x) => a + x.minutes, 0));
+  const courseEstimatedMinutes = r2(totalMin);
   return {
     rulesVersion: STUDY_TIME_RULES_VERSION,
     courseEstimatedMinutes,
@@ -469,7 +507,7 @@ function courseDetailed(input: StudyTimeCourseInput, cfg: TimeModelConfig, lines
     modules,
     byComponent,
     // r58 (I3) fix: un nivel declarado (AA, práctica guiada) o la constante del foro NO es una medida.
-    usesPlannedValues: all.some((x) => !x.measured),
+    usesPlannedValues: planned,
     ...(cfg.id !== DEFAULT_TIME_MODEL_CONFIG.id ? { configId: cfg.id } : {}),
   };
 }

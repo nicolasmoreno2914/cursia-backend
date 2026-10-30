@@ -174,7 +174,7 @@ async function labelXmls(mbz) {
       assert(sim.built.summary.h5pPackages.length > 0, 'sin H5P');
       eq([c.backupFormat, c.minimumMoodle, c.h5pCoreApi, c.sectionLinks, sim.built.expectations.moodleMinimum], ['4.1', '4.5', '1.28', 'COURSESECTIONBYID', '4.5'], 'compatibilidad');
       eq(sha256(sim.built.mbz), GOLDEN_3_15_1[cfg.id], 'sha256 del .mbz (con H5P no cambia)');
-      eq(sim.built.summary.builderVersion, '3.18.0', 'builder'); // r78: Libro Guía en línea
+      eq(sim.built.summary.builderVersion, '3.19.0', 'builder'); // r79.1: tipos de Actividad; r78: Libro Guía en línea
     });
   }
   const noH5pCfg = { ...CONFIG.courses.find((c) => c.id === '1x1-sin-nota'), id: '1x1-sin-nota-sin-h5p', reviewCards: false };

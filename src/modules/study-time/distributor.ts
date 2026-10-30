@@ -38,6 +38,8 @@ import { GUIDED_PRACTICE_TIERS } from './guided-practice-tiers';
 import type { DistributorRequirementConstraints } from '../academic-context/requirements/requirement-authority';
 import { classifyLearningType } from '../pedagogy/learning-type';
 import type { LearningType } from '../pedagogy/vocabulary';
+import type { ApplicationKind } from './application-kind-tiers';
+import { isTierSelectable } from '../course-shell/application-kinds';
 import { VIDEO_COMPOSITION_VERSION, VideoCompositionResult, VideoNeed, decideVideosByNeed } from './video-composition';
 
 export const DISTRIBUTOR_VERSION = 2 as const;
@@ -85,6 +87,11 @@ export interface ProposedChapter {
   review: boolean;
   /** Nivel de la Actividad de Aplicación (minutos; null = sin actividad). Se genera con el curso (Fase 2). */
   applicationMinutes: number | null;
+  /**
+   * r79.1: tipo de la Actividad de Aplicación (estudio de caso / proyecto integrador / retroalimentación formativa). SOLO
+   * si lo asignó `assignApplicationKinds` (preferencia «Tipos de actividad: automático»); el distribuidor nunca lo pone.
+   */
+  applicationKind?: ApplicationKind;
   /** LOOP 8.3: el video de este capítulo lo fijó el docente (el diseño lo respeta). */
   videoPinned: boolean;
   /** Review L84-4: la Actividad de Aplicación la fijó el docente. */
@@ -115,7 +122,7 @@ export interface ProposedModule {
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'set_guided_practice' | 'remove_guided_practice' | 'role_changed' | 'set_video' | 'set_activity';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'set_guided_practice' | 'remove_guided_practice' | 'role_changed' | 'set_video' | 'set_activity' | 'set_application_kind' | 'remove_application_kind';
   /** LOOP 8.6C: el cambio lo pide un requisito del documento (id del requisito). */
   requirementId?: string;
   moduleId: string;
@@ -236,6 +243,12 @@ export interface DistributorInput {
    * minutos y misma propuesta de siempre.
    */
   timeModelConfig?: TimeModelConfig | null;
+  /**
+   * r79.1 · candado de proporcionalidad (§12.1): ¿Cursia puede elegir este nivel de la Actividad de siempre? Ausente = el
+   * de la especificación vigente (course-shell/application-kinds.ts). Un nivel cerrado nunca lo elige el distribuidor (lo
+   * fijado por el docente o por el documento se respeta igual). Los checks lo reemplazan para probar el candado cerrado.
+   */
+  tierSelectable?: ((minutes: number) => boolean) | null;
 }
 
 export class DistributorError extends Error {
@@ -320,7 +333,8 @@ export function distributeCourseHours(input: DistributorInput): DistributionResu
   // Todos los capítulos de contenido que el docente no fijó (también los que ya tienen una Actividad de Cursia).
   const target = d.modules.flatMap((m) => m.chapters.filter((c) => c.kind === 'content' && !c.applicationPinned && !c.proposed));
   if (!target.length) return out;
-  const tiers = (STUDY_TIME_RULES.applicationActivityTiers as readonly number[]).filter((t) => t <= DISTRIBUTOR_RULES.applicationFirst.contentTierMax);
+  const tierOk = input.tierSelectable ?? ((t: number) => isTierSelectable('standard', t));
+  const tiers = (STUDY_TIME_RULES.applicationActivityTiers as readonly number[]).filter((t) => t <= DISTRIBUTOR_RULES.applicationFirst.contentTierMax && tierOk(t));
   let alt: HoursAlternative | null = null;
   for (const tier of tiers) {
     const pins: Record<string, DesignPins[string]> = { ...(input.pins ?? {}) };
@@ -349,6 +363,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
   if (!(tolPct >= 0 && tolPct <= 0.5) || !(tolMinH >= 0 && tolMinH <= 10)) throw new DistributorError('tolerancia fuera de rango (pct 0–0,5; minHours 0–10)');
 
   const prefs = input.preferences ?? {};
+  const tierOk = input.tierSelectable ?? ((t: number) => isTierSelectable('standard', t));
   if (prefs.emphasis !== undefined && !DESIGN_EMPHASES.includes(prefs.emphasis)) throw new DistributorError(`emphasis inválido (${JSON.stringify(prefs.emphasis)})`);
   if (prefs.applicationActivities !== undefined && !APPLICATION_ACTIVITIES_MODES.includes(prefs.applicationActivities)) {
     throw new DistributorError(`applicationActivities inválido (${JSON.stringify(prefs.applicationActivities)})`);
@@ -523,6 +538,40 @@ function distributeCore(input: DistributorInput): DistributionResult {
     reEval();
   };
 
+  // r79.1 (rendimiento): la entrada de cada capítulo se reutiliza (mismo objeto) mientras su estado no cambie; el modelo de
+  // tiempo reconoce el objeto y no vuelve a calcular el capítulo. Misma entrada, mismo resultado.
+  const chInputs = new Map<string, StudyTimeCourseInput['modules'][number]['chapters'][number]>();
+  // Número estable por capítulo (el objeto del diseño no cambia de identidad aunque cambien sus campos).
+  const chNo = new WeakMap<WorkChapter, number>();
+  let chSeq = 0;
+  const noOf = (c: WorkChapter) => { let n = chNo.get(c); if (n === undefined) { n = ++chSeq; chNo.set(c, n); } return n; };
+  /** Estado del capítulo que cambia su tiempo: tipo, video, actividad, Actividad y ejercicios guiados. */
+  const chState = (c: WorkChapter, withApplication: boolean) => {
+    const app = withApplication && c.applicationMinutes ? c.applicationMinutes : 0;
+    const gp = withApplication && c.kind === 'content' && c.guidedPracticeMinutes ? c.guidedPracticeMinutes : 0;
+    return `${noOf(c)}${c.kind === 'practice' ? 'p' : 'c'}${c.videoEnabled ? 1 : 0}${c.activityEnabled ? 1 : 0}.${app}.${gp}`;
+  };
+  const chapterInput = (c: WorkChapter, withApplication: boolean, k = chState(c, withApplication)) => {
+    let x = chInputs.get(k);
+    if (!x) {
+      const app = withApplication && c.applicationMinutes ? c.applicationMinutes : 0;
+      const gp = withApplication && c.kind === 'content' && c.guidedPracticeMinutes ? c.guidedPracticeMinutes : 0;
+      x = {
+        chapterId: c.id,
+        kind: c.kind,
+        libro: c.kind === 'content',
+        presentation: c.kind === 'content',
+        video: c.kind === 'content' && c.videoEnabled,
+        ivAdvanced,
+        activity: c.activityEnabled,
+        review,
+        ...(app ? { applicationMinutes: app } : {}),
+        ...(gp ? { guidedPracticeMinutes: gp } : {}),
+      };
+      chInputs.set(k, x);
+    }
+    return x;
+  };
   const toInput = (withApplication: boolean): StudyTimeCourseInput => ({
     frame: true,
     welcomeAudio: true,
@@ -532,22 +581,27 @@ function distributeCore(input: DistributorInput): DistributionResult {
       moduleId: m.id,
       intro: true,
       exam: m.examEnabled,
-      chapters: m.chapters.map((c) => ({
-        chapterId: c.id,
-        kind: c.kind,
-        libro: c.kind === 'content',
-        presentation: c.kind === 'content',
-        video: c.kind === 'content' && c.videoEnabled,
-        ivAdvanced,
-        activity: c.activityEnabled,
-        review,
-        ...(withApplication && c.applicationMinutes ? { applicationMinutes: c.applicationMinutes } : {}),
-        ...(withApplication && c.kind === 'content' && c.guidedPracticeMinutes ? { guidedPracticeMinutes: c.guidedPracticeMinutes } : {}),
-      })),
+      chapters: m.chapters.map((c) => chapterInput(c, withApplication)),
     })),
   });
-  let est = estimateCourseStudyTime(toInput(true));
-  const reEval = () => (est = estimateCourseStudyTime(toInput(true)));
+  // r79.1 (rendimiento): el crecimiento prueba un nivel, mide y vuelve atrás cientos de veces; la estimación depende solo del
+  // estado del diseño (tipo, video, actividad, Actividad y ejercicios guiados de cada capítulo, en orden). Caché local de
+  // ESTA llamada (mismo resultado; los objetos no se modifican).
+  const estMemo = new Map<string, StudyTimeEstimate>();
+  const estimateNow = (): StudyTimeEstimate => {
+    const keys = design.map((m) => m.chapters.map((c) => chState(c, true)));
+    const k = design.map((m, i) => `${i}${m.examEnabled ? '+' : '-'}${m.chapters.length}:${keys[i].join(',')}`).join('|');
+    const hit = estMemo.get(k);
+    if (hit) return hit;
+    const e = estimateCourseStudyTime({
+      frame: true, welcomeAudio: true, forum: true, finalExam: snapshot.course.finalExam === true,
+      modules: design.map((m, i) => ({ moduleId: m.id, intro: true, exam: m.examEnabled, chapters: m.chapters.map((c, j) => chapterInput(c, true, keys[i][j])) })),
+    });
+    estMemo.set(k, e);
+    return e;
+  };
+  let est = estimateNow();
+  const reEval = () => (est = estimateNow());
   const minutes = () => est.courseEstimatedMinutes;
   const reached = () => minutes() >= target - tol;
   const chapterMinutes = (id: string) => est.modules.flatMap((m) => m.chapters).find((c) => c.chapterId === id)?.chapterEstimatedMinutes ?? 0;
@@ -807,7 +861,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
   if (minutes() > target + tol) {
     // LOOP 9.2: aun así, las Actividades de Aplicación que exige el documento (por módulo / en el curso) se ubican, con el
     // nivel más corto, en la práctica (o donde el documento diga): un requisito no desaparece porque sobren horas.
-    const t0 = (STUDY_TIME_RULES.applicationActivityTiers as readonly number[])[0];
+    const t0 = (STUDY_TIME_RULES.applicationActivityTiers as readonly number[]).filter((t) => tierOk(t))[0];
     const place = (m: WorkModule) => {
       const c = m.chapters.filter((x) => !x.applicationMinutes && pinnedApp(x.id) === undefined && (!appInPractice || x.kind === 'practice') && appMode !== 'none' && (appMode !== 'practice_only' || x.kind === 'practice'))
         .sort((a, b) => (a.kind === 'practice' ? 0 : 1) - (b.kind === 'practice' ? 0 : 1))[0];
@@ -830,7 +884,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
     ]);
   }
 
-  const tiers = STUDY_TIME_RULES.applicationActivityTiers as readonly number[];
+  // r79.1: solo los niveles con el candado abierto (con la especificación vigente, todos).
+  const tiers = (STUDY_TIME_RULES.applicationActivityTiers as readonly number[]).filter((t) => tierOk(t));
   const contentChapters = () => design.flatMap((m) => m.chapters.filter((c) => c.kind === 'content').map((c) => ({ m, c })));
   // Orden de la aplicación: primero los cierres de módulo (integran el módulo), después el núcleo, al final las aperturas.
   const rank = (role: ChapterRole) => (role === 'module_closing' || role === 'single' ? 0 : role === 'module_opening' ? 2 : 1);

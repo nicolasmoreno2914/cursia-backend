@@ -935,7 +935,11 @@ export async function loadContentsV3(
         tasks.push(async () => {
           const doc = json(await validatedText(L, byItem, appKey, APPLICATION_ARTIFACT_TYPE), appKey);
           // Falla fuerte: nunca se empaqueta una actividad (o su solucionario) incompleta.
-          const errs = validateApplicationActivityDoc(doc, { chapterId: ch.chapterId, minutes: ch.applicationMinutes as number });
+          // r79.1: con el tipo del Manifest y los resultados del capítulo (Blueprint del run).
+          const errs = validateApplicationActivityDoc(doc, {
+            chapterId: ch.chapterId, minutes: ch.applicationMinutes as number,
+            ...(ch.applicationKind ? { kind: ch.applicationKind as any, outcomeIds: ch.applicationOutcomeIds ?? [] } : {}),
+          });
           if (errs.length) throw new Error(`${PACKAGING_V3}: ${appKey} inválido [${[...new Set(errs.map((e) => e.code))].sort().join(', ')}] ${errs.slice(0, 3).map((e) => `${e.path} ${e.message}`).join(' | ')}`);
           slot.application = doc;
         });

@@ -14,7 +14,7 @@
  * evitado "historical first" lo resuelve `incrementalCostForPlan`).
  */
 import { FinopsError } from './errors';
-import { addDec, mulDec, normalizeDecimal, DecimalLike } from './decimal';
+import { addDec, fromScaled, mulDec, normalizeDecimal, toScaled, DecimalLike } from './decimal';
 import { priceUsage, PricingCatalogRow, UsageMeters } from './pricing';
 import { operationsForItemType, FinopsItemType } from './operations';
 import { UsageModel, assertValidUsageModel } from './usage-model';
@@ -124,10 +124,20 @@ function zero(): MinExpMax {
   return { min: ZERO, expected: ZERO, max: ZERO };
 }
 
-function addInto(map: Record<string, MinExpMax>, key: string, v: MinExpMax): void {
-  const cur = map[key] || zero();
-  map[key] = { min: addDec(cur.min, v.min), expected: addDec(cur.expected, v.expected), max: addDec(cur.max, v.max) };
+interface ScaledMEM { min: bigint; expected: bigint; max: bigint }
+function addScaled(map: Map<string, ScaledMEM>, key: string, v: ScaledMEM): void {
+  const cur = map.get(key);
+  if (cur) { cur.min += v.min; cur.expected += v.expected; cur.max += v.max; } else map.set(key, { min: v.min, expected: v.expected, max: v.max });
 }
+function memOf(v: ScaledMEM): MinExpMax {
+  return { min: fromScaled(v.min), expected: fromScaled(v.expected), max: fromScaled(v.max) };
+}
+function recordOf(m: Map<string, ScaledMEM>): Record<string, MinExpMax> {
+  const out: Record<string, MinExpMax> = {};
+  for (const [k, v] of m) out[k] = memOf(v);
+  return out;
+}
+
 
 function scaleOf(scale: UsageScale, meter: string): number {
   return typeof scale === 'number' ? scale : scale[meter] ?? 1;
@@ -153,6 +163,26 @@ function sortedRecord<T>(r: Record<string, T>): Record<string, T> {
   return out;
 }
 
+/**
+ * r79.1 (rendimiento): `priceUsage` es pura (mismo uso + mismo catálogo + mismo instante → mismo resultado); el ajuste al
+ * presupuesto la llama miles de veces con los mismos tres usos por operación. Caché por catálogo (WeakMap: muere con él) y
+ * por (proveedor, servicio, producto, instante, uso). Resultado idéntico, solo más rápido (lo prueba check-r79-1).
+ */
+const PRICE_CACHE = new WeakMap<readonly PricingCatalogRow[], Map<string, ReturnType<typeof priceUsage>>>();
+const PRICE_CACHE_MAX = 20000;
+function cachedPriceUsage(usage: UsageMeters, catalog: readonly PricingCatalogRow[], at: { provider: string; service: string; product: string; asOf: string | Date | null }): ReturnType<typeof priceUsage> {
+  let m = PRICE_CACHE.get(catalog);
+  if (!m) { m = new Map(); PRICE_CACHE.set(catalog, m); }
+  const asOf = at.asOf instanceof Date ? at.asOf.toISOString() : at.asOf === null ? '' : String(at.asOf);
+  const key = `${at.provider}\u0000${at.service}\u0000${at.product}\u0000${asOf}\u0000${JSON.stringify(usage)}`;
+  const hit = m.get(key);
+  if (hit) return hit;
+  const r = priceUsage(usage, catalog, at);
+  if (m.size >= PRICE_CACHE_MAX) m.clear();
+  m.set(key, r);
+  return r;
+}
+
 export function estimateCost(input: EstimateCostInput): EstimateResult {
   if (!input || !Array.isArray(input.items)) throw new FinopsError('INVALID_INPUT', 'estimateCost necesita items[]');
   assertValidUsageModel(input.usageModel);
@@ -164,13 +194,15 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
 
   const lines: EstimateLine[] = [];
   const avoided: AvoidedLine[] = [];
-  const byProvider: Record<string, MinExpMax> = {};
-  const byItemType: Record<string, MinExpMax> = {};
-  const byChapter: Record<string, MinExpMax> = {};
+  // r79.1 (rendimiento): los totales se acumulan en enteros escalados (la suma decimal es exacta: mismo resultado que
+  // sumar los strings uno por uno) y se convierten a string una sola vez al final.
+  const byProviderS = new Map<string, ScaledMEM>();
+  const byItemTypeS = new Map<string, ScaledMEM>();
+  const byChapterS = new Map<string, ScaledMEM>();
   const versions = new Set<string>();
-  let total = zero();
-  let retryExpected = ZERO;
-  let retryMax = ZERO;
+  const totalS: ScaledMEM = { min: 0n, expected: 0n, max: 0n };
+  let retryExpectedS = 0n;
+  let retryMaxS = 0n;
   let avoidedTotal = ZERO;
   let currency: string | null = null;
   const seenKeys = new Set<string>();
@@ -199,9 +231,9 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
         throw new FinopsError('INVALID_INPUT', `retryRate ${rate} de ${operation} fuera de [0, maxRetries=${rp.maxRetries}]`);
       }
       const at = { provider: def.provider, service: def.service, product: def.product, asOf: input.pricingAsOf ?? null };
-      const p10 = priceUsage(usageAt(def.meters, 'p10', scale), input.catalog, at);
-      const p50 = priceUsage(usageAt(def.meters, 'p50', scale), input.catalog, at);
-      const p90 = priceUsage(usageAt(def.meters, 'p90', scale), input.catalog, at);
+      const p10 = cachedPriceUsage(usageAt(def.meters, 'p10', scale), input.catalog, at);
+      const p50 = cachedPriceUsage(usageAt(def.meters, 'p50', scale), input.catalog, at);
+      const p90 = cachedPriceUsage(usageAt(def.meters, 'p90', scale), input.catalog, at);
       for (const r of [p10, p50, p90]) {
         if (r.lines.length === 0) continue;
         if (currency !== null && r.currency !== currency) throw new FinopsError('CURRENCY_MISMATCH', `${currency} vs ${r.currency}`);
@@ -234,14 +266,15 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
       };
       lines.push(line);
       itemWould = addDec(itemWould, would.expected);
-      total = { min: addDec(total.min, inc.min), expected: addDec(total.expected, inc.expected), max: addDec(total.max, inc.max) };
+      const incS: ScaledMEM = incremental ? { min: toScaled(inc.min), expected: toScaled(inc.expected), max: toScaled(inc.max) } : { min: 0n, expected: 0n, max: 0n };
+      totalS.min += incS.min; totalS.expected += incS.expected; totalS.max += incS.max;
       if (incremental) {
-        retryExpected = addDec(retryExpected, mulDec(p50.amount, rate));
-        retryMax = addDec(retryMax, mulDec(p90.amount, rp.maxRetries));
+        retryExpectedS += toScaled(mulDec(p50.amount, rate));
+        retryMaxS += toScaled(mulDec(p90.amount, rp.maxRetries));
       }
-      addInto(byProvider, def.provider, inc);
-      addInto(byItemType, item.itemType, inc);
-      addInto(byChapter, item.chapterId ?? NO_CHAPTER_KEY, inc);
+      addScaled(byProviderS, def.provider, incS);
+      addScaled(byItemTypeS, item.itemType, incS);
+      addScaled(byChapterS, item.chapterId ?? NO_CHAPTER_KEY, incS);
     }
     if (AVOIDING_ACTIONS.includes(action)) {
       avoided.push({ itemKey: item.itemKey, itemType: item.itemType, action, expected: itemWould, basis: 'current_estimate' });
@@ -255,7 +288,7 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
     currency: currency ?? 'USD',
     pricingVersions: Array.from(versions).sort(),
     lines,
-    totals: { ...total, retryAllowance: { expected: retryExpected, max: retryMax }, byProvider: sortedRecord(byProvider), byItemType: sortedRecord(byItemType), byChapter: sortedRecord(byChapter) },
+    totals: { ...memOf(totalS), retryAllowance: { expected: fromScaled(retryExpectedS), max: fromScaled(retryMaxS) }, byProvider: sortedRecord(recordOf(byProviderS)), byItemType: sortedRecord(recordOf(byItemTypeS)), byChapter: sortedRecord(recordOf(byChapterS)) },
     avoided: { expected: avoidedTotal, byItem: avoided },
   };
 }

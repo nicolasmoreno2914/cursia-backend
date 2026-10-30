@@ -14,6 +14,7 @@
  *   política, superar sus límites con el estimado LLM ⇒ ADMIN_APPROVAL
  *   (nunca BLOCK); sin política ⇒ AUTO (se registra el estimado igual).
  */
+import { applicationOutputUnits } from '../course-shell/application-kinds';
 import { FinopsError } from './errors';
 import { cmpDec, normalizeDecimal, DecimalLike } from './decimal';
 import { BudgetDecision, BudgetPolicy, EvaluateBudgetResult, SpentSoFar, evaluateBudget, policySpendCaps } from './budget';
@@ -97,6 +98,8 @@ export interface RunManifestItem {
   chapterId?: string | null;
   /** Fase 2: minutos de la Actividad de Aplicación (items application_activity). */
   applicationMinutes?: number;
+  /** r79.1: tipo de la Actividad (estudio de caso / proyecto integrador / retroalimentación formativa). */
+  applicationKind?: string;
   /** Loop 9 B: minutos de la práctica guiada (items guided_practice). */
   guidedPracticeMinutes?: number;
 }
@@ -190,12 +193,16 @@ export function audiobookUsageScale(chapterWords: number | null | undefined): nu
 /**
  * Fase 2 (review M6): la salida de `llm.application_activity` (actividad + solucionario) crece con los ejercicios del
  * nivel; los priors corresponden al nivel de 60 min (7 ejercicios). La entrada (fuente del capítulo) no cambia.
+ *
+ * r79.1: la escala sale de APPLICATION_OUTPUT_UNITS (course-shell/application-kinds.ts): unidades de salida equivalentes
+ * a «un ejercicio con su respuesta» por tipo y nivel (prior derivado de la especificación de cada nivel, no medido). El
+ * nivel de 120 de la Actividad de siempre pasa de 10 a 11 (10–12 ejercicios + hitos del taller); 30/60/90 no cambian.
+ * r79.2: 60/90/120 exigen más trabajo proporcional → 9/12/15 (la referencia de los priors sigue siendo 7).
  */
 const APPLICATION_REFERENCE_EXERCISES = 7;
-const APPLICATION_EXERCISES_EST: Readonly<Record<number, number>> = { 30: 6, 60: 7, 90: 9, 120: 10 };
 
-export function applicationUsageScale(minutes: number | null | undefined): Readonly<Record<string, number>> | null {
-  const n = APPLICATION_EXERCISES_EST[Number(minutes)];
+export function applicationUsageScale(minutes: number | null | undefined, kind?: string | null): Readonly<Record<string, number>> | null {
+  const n = applicationOutputUnits(kind ?? null, Number(minutes));
   if (!n) return null;
   return { output_tokens: Math.round((n / APPLICATION_REFERENCE_EXERCISES) * 10000) / 10000 };
 }
@@ -256,7 +263,7 @@ export function estimateItemsForRun(
       it.type === 'exam' ? examBankUsageScale('exam', chapters.filter((c) => c.moduleId === it.moduleId))
         : it.type === 'final_exam' ? examBankUsageScale('final_exam', chapters)
           : it.type === 'audiobook_chapter' && it.chapterId ? audiobookUsageScale(opts?.chapterWords?.[it.chapterId])
-            : it.type === 'application_activity' ? applicationUsageScale(it.applicationMinutes)
+            : it.type === 'application_activity' ? applicationUsageScale(it.applicationMinutes, it.applicationKind)
               : it.type === 'guided_practice' ? guidedPracticeUsageScale(it.guidedPracticeMinutes)
                 : null;
     out.push({

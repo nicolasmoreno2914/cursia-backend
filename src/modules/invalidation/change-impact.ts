@@ -1,6 +1,6 @@
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { GenerationManifestV1, ManifestItem } from '../generation-manifests/generation-manifest-builder';
-import { ProviderPlan, providerPlanFor } from '../pedagogy/dry-run';
+import { DryRunPricing, ProviderPlan, providerPlanFor } from '../pedagogy/dry-run';
 import type { StudyTimeEstimate } from '../study-time/time-model';
 import type { InvalidationAction, InvalidationActionType, InvalidationPlan } from './plan';
 import { ALIGNMENT_FINGERPRINT_TYPES } from './fingerprints';
@@ -96,6 +96,8 @@ export function summarizeChangeImpact(input: {
   plan: InvalidationPlan;
   to: { blueprint: BlueprintSnapshotV2; manifest: GenerationManifestV1; studyTime?: StudyTimeEstimate | null };
   from?: { manifest: GenerationManifestV1; studyTime?: StudyTimeEstimate | null };
+  /** r79 (F2): precios de la estimación (los de la «Estimación de producción»); ausente = el seed de siempre. */
+  pricing?: DryRunPricing | null;
 }): ChangeImpact {
   const { plan, to } = input;
   const inTarget = (a: InvalidationAction) => a.inTargetManifest;
@@ -125,7 +127,7 @@ export function summarizeChangeImpact(input: {
     else if (a.action === 'SOFT_DISABLE') ch.disable.push(a.itemKey);
   }
   const chapters = [...byChapter.values()];
-  const coverage = { coverageItems: to.manifest.items };
+  const coverage = { coverageItems: to.manifest.items, ...(input.pricing ? { pricing: input.pricing } : {}) };
   const toRunPlan = providerPlanFor({ ...to.manifest, items: itemsOf(to.manifest, [...toRun, ...paidNew, ...paidRetry]) }, coverage);
   const hFrom = input.from?.studyTime?.courseEstimatedHours ?? null;
   const hTo = to.studyTime?.courseEstimatedHours ?? null;
@@ -170,10 +172,10 @@ export interface PlanCostEstimate {
   cost: ProviderPlan;
   note: string;
 }
-export function planCostEstimate(plan: InvalidationPlan, manifest: GenerationManifestV1): PlanCostEstimate {
+export function planCostEstimate(plan: InvalidationPlan, manifest: GenerationManifestV1, pricing?: DryRunPricing | null): PlanCostEstimate {
   const keys = plan.actions.filter((a) => a.inTargetManifest && (a.action === 'REGENERATE' || a.action === 'GENERATE')).map((a) => a.itemKey);
   const items = itemsOf(manifest, keys);
-  const cost = providerPlanFor({ ...manifest, items }, { coverageItems: manifest.items });
+  const cost = providerPlanFor({ ...manifest, items }, { coverageItems: manifest.items, ...(pricing ? { pricing } : {}) });
   const paid = items.filter((i) => PAID_TYPES.has(i.type)).length;
   return {
     estimatedChangeCostUsd: cost.estimateUsd ? Number(cost.estimateUsd.expected).toFixed(2) : null,

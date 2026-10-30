@@ -1,4 +1,5 @@
 import { ConflictException, Injectable, NotFoundException, NotImplementedException } from '@nestjs/common';
+import { loadDryRunPricing } from '../finops/dry-run-pricing';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import type { GenerationManifestV1, ManifestItemType } from '../generation-manifests/generation-manifest-builder';
@@ -111,7 +112,7 @@ export class InvalidationService {
           .map((a) => a.itemKey),
         blockers: [],
         plan,
-        costEstimate: planCostEstimate(plan, manifestB.manifest as GenerationManifestV1),
+        costEstimate: planCostEstimate(plan, manifestB.manifest as GenerationManifestV1, await loadDryRunPricing(this.dataSource)),
       };
     }
 
@@ -195,7 +196,7 @@ export class InvalidationService {
       providerItemsToGenerate: writes.providerItemsToGenerate,
       blockers,
       plan,
-      costEstimate: planCostEstimate(plan, manifestB.manifest as GenerationManifestV1),
+      costEstimate: planCostEstimate(plan, manifestB.manifest as GenerationManifestV1, await loadDryRunPricing(this.dataSource)),
     };
   }
 }

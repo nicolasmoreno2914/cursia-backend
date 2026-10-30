@@ -1990,9 +1990,24 @@ var DYN_APPLICATION_GENRES_REQUIRING_EXAMPLE = ['calculation', 'procedure', 'des
 var DYN_APPLICATION_DIFFICULTIES = ['basico', 'intermedio', 'avanzado'];
 var DYN_APPLICATION_EXERCISES_BY_MINUTES = {
   30: { min: 6, max: 7, examplesMax: 1 },
-  60: { min: 6, max: 8, examplesMax: 2 },
-  90: { min: 8, max: 10, examplesMax: 2 },
-  120: { min: 9, max: 10, examplesMax: 2 }
+  // r79.2: 60/90/120 exigen trabajo PROPORCIONAL a sus minutos (ejemplo, más consignas, hitos del taller): STANDARD_SPEC_V2.
+  60: { min: 8, max: 10, examplesMax: 2 },
+  90: { min: 11, max: 13, examplesMax: 2 },
+  120: { min: 14, max: 16, examplesMax: 2 }
+};
+var DYN_APPLICATION_STANDARD_SPEC = {
+  1: {
+    30: { exercises: [6, 7], examples: [0, 1], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
+    60: { exercises: [6, 8], examples: [0, 2], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
+    90: { exercises: [8, 10], examples: [0, 2], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
+    120: { exercises: [9, 10], examples: [0, 2], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} }
+  },
+  2: {
+    30: { exercises: [6, 7], examples: [0, 1], workshopInstructions: [2, 8], workshopMilestones: [0, 0], selfCheck: [4, 8], criteria: [3, 4], floors: {} },
+    60: { exercises: [8, 10], examples: [1, 2], workshopInstructions: [3, 8], workshopMilestones: [2, 2], selfCheck: [5, 8], criteria: [4, 4], floors: { workshop: 20, exercises: 25 } },
+    90: { exercises: [11, 13], examples: [1, 2], workshopInstructions: [5, 8], workshopMilestones: [3, 3], selfCheck: [6, 8], criteria: [4, 4], floors: { workshop: 30, exercises: 35 } },
+    120: { exercises: [14, 16], examples: [1, 2], workshopInstructions: [5, 8], workshopMilestones: [4, 4], selfCheck: [6, 8], criteria: [4, 4], floors: { workshop: 40, exercises: 45 } }
+  }
 };
 var DYN_APPLICATION_MINUTES_TOLERANCE = 0.2;
 var DYN_APPLICATION_GENRE_TEXT = {
@@ -2052,6 +2067,7 @@ function dynApplicationActivityPrompt(courseContext, outline, chapter, sourceMd,
   var ch = chapter || {};
   var minutes = app.minutes;
   var b = DYN_APPLICATION_EXERCISES_BY_MINUTES[minutes];
+  var sp = DYN_APPLICATION_STANDARD_SPEC[2][minutes];
   var practice = app.chapterKind === 'practice';
   return _dynCtxV3(courseContext, outline)
     + '\n\nCAPÍTULO: "' + (ch.title || '') + '"' + (ch.objective ? '\nObjetivo del capítulo: ' + ch.objective : '')
@@ -2073,19 +2089,26 @@ function dynApplicationActivityPrompt(courseContext, outline, chapter, sourceMd,
     + '  "context": "situación realista relacionada con el tema (3–6 frases, del sector y país del curso)",\n'
     + '  "examples": [ { "title": "…", "problem": "planteamiento", "steps": ["paso 1", "paso 2", "…"], "result": "resultado o conclusión" } ],\n'
     + '  "exercises": [ { "id": "E1", "prompt": "enunciado autocontenido", "difficulty": "basico|intermedio|avanzado", "answerLines": <renglones para responder en papel, 1–15> } ],\n'
-    + '  "workshop": { "title": "…", "situation": "situación contextualizada más rica que los ejercicios", "instructions": ["consigna 1", "consigna 2", "…"] },\n'
+    + '  "workshop": { "title": "…", "situation": "situación contextualizada más rica que los ejercicios", "instructions": ["consigna 1", "consigna 2", "…"]' + (sp.workshopMilestones[1] > 0 ? ', "milestones": [ { "title": "hito 1", "product": "producto intermedio" } ]' : '') + ' },\n'
     + '  "deliverable": { "description": "qué produce o entrega el estudiante", "format": "p. ej. informe de 1 página, tabla, cálculo, video corto, código", "extent": "extensión o alcance" },\n'
     + '  "selfCheck": ["pregunta de autoevaluación verificable", "…"],\n'
     + '  "criteria": [ { "name": "criterio", "description": "qué se evalúa", "weight": <entero> } ],\n'
     + '  "minutesBySection": { "examples": <min>, "exercises": <min>, "workshop": <min>, "selfCheck": <min> }\n'
     + '}\n'
     + '\nREGLAS (un validador las verifica):'
-    + '\n- "examples": de 0 a ' + b.examplesMax + ' ejemplos RESUELTOS (2–10 pasos cada uno); en ' + DYN_APPLICATION_GENRES_REQUIRING_EXAMPLE.join(', ') + ' al menos 1. Úsalos cuando ayuden a ver el procedimiento.'
+    + (sp.examples[0] > 0
+      ? '\n- "examples": de ' + sp.examples[0] + ' a ' + b.examplesMax + ' ejemplos RESUELTOS (2–10 pasos cada uno): este nivel exige al menos ' + sp.examples[0] + '.'
+      : '\n- "examples": de 0 a ' + b.examplesMax + ' ejemplos RESUELTOS (2–10 pasos cada uno); en ' + DYN_APPLICATION_GENRES_REQUIRING_EXAMPLE.join(', ') + ' al menos 1. Úsalos cuando ayuden a ver el procedimiento.')
     + '\n- "exercises": entre ' + b.min + ' y ' + b.max + ' ejercicios con id "E1", "E2"… en orden, de MENOR a MAYOR dificultad (basico → intermedio → avanzado; al menos uno intermedio o avanzado). Cada uno se puede responder sin ver los otros. NUNCA incluyas la respuesta en el enunciado.'
-    + '\n- "workshop": la aplicación integradora (2–8 consignas) donde el estudiante usa lo aprendido en una situación concreta.'
-    + '\n- "selfCheck": 4–8 ítems que el estudiante puede marcar para revisar su propio trabajo.'
-    + '\n- "criteria": 3 o 4 criterios distintos con pesos enteros (5–70) que suman EXACTAMENTE 100.'
-    + '\n- "minutesBySection": enteros que suman ' + minutes + ' minutos (±' + Math.round(DYN_APPLICATION_MINUTES_TOLERANCE * 100) + ' %).'
+    + '\n- "workshop": la aplicación integradora (' + sp.workshopInstructions[0] + '–' + sp.workshopInstructions[1] + ' consignas) donde el estudiante usa lo aprendido en una situación concreta.'
+    + (sp.workshopMilestones[1] > 0
+      ? '\n- "workshop.milestones": EXACTAMENTE entre ' + sp.workshopMilestones[0] + ' y ' + sp.workshopMilestones[1] + ' HITOS del taller, cada uno { "title": "…", "product": "producto intermedio concreto que entrega en ese hito" } (son los ' + minutes + ' minutos de trabajo real: más etapas y entregables, no solo más tiempo).'
+      : '')
+    + '\n- "selfCheck": ' + sp.selfCheck[0] + '–' + sp.selfCheck[1] + ' ítems que el estudiante puede marcar para revisar su propio trabajo.'
+    + (sp.criteria[0] === sp.criteria[1]
+      ? '\n- "criteria": EXACTAMENTE ' + sp.criteria[0] + ' criterios distintos con pesos enteros (5–70) que suman EXACTAMENTE 100.'
+      : '\n- "criteria": ' + sp.criteria[0] + ' o ' + sp.criteria[1] + ' criterios distintos con pesos enteros (5–70) que suman EXACTAMENTE 100.')
+    + '\n- "minutesBySection": enteros que suman ' + minutes + ' minutos (±' + Math.round(DYN_APPLICATION_MINUTES_TOLERANCE * 100) + ' %)' + (Object.keys(sp.floors).length ? '; como mínimo ' + Object.keys(sp.floors).map(function (k) { return k + ' ≥ ' + sp.floors[k]; }).join(', ') + ' min' : '') + '.'
     + '\n- Datos hipotéticos claramente ilustrativos: sin nombres de personas reales, empresas reales ni estadísticas inventadas presentadas como reales.'
     + '\n- Sin mencionar videos, presentaciones, audiolibros ni otras actividades del curso.'
     + '\n- Esta parte la ve el ESTUDIANTE: nunca escribas «Respuesta:», «Solución esperada», «Guía de corrección» ni «Solucionario» (el espacio para responder son los renglones de answerLines).';
@@ -2114,6 +2137,149 @@ function dynApplicationSolutionPrompt(courseContext, chapter, activity, sourceMd
     + '\n- Respuestas correctas según el capítulo; si un cálculo usa datos hipotéticos del enunciado, muestra el resultado.'
     + '\n- Cuando remitas al material, di «el Libro Guía» o «el capítulo» (nunca «texto fuente», «la fuente» ni nombres técnicos del JSON).'
     + '\n' + _dynInternalVocabularyBan();
+}
+
+// ════ r79.1 · Tipos de Actividad de Aplicación: estudio de caso, proyecto integrador, retroalimentación formativa ════
+// Contrato: course-shell/application-kinds.ts (backend). El claim trae el tipo, su especificación (esquema + cantidades y
+// pisos del nivel: `application.kindSpec`) y los resultados del capítulo (`application.outcomes`). Las cantidades del
+// prompt salen de esos datos (las mismas que valida el servidor). Sin respuestas en la parte del estudiante.
+function _dynKindRange(c, k) { var r = (c && c[k]) || [0, 0]; return r[0] === r[1] ? String(r[0]) : r[0] + ' a ' + r[1]; }
+function _dynKindOutcomesBlock(app) {
+  var os = (app && Array.isArray(app.outcomes)) ? app.outcomes : [];
+  if (!os.length) return '';
+  return '\n\nRESULTADOS DE APRENDIZAJE QUE TRABAJA ESTE CAPÍTULO (cita sus ids EXACTOS en "outcomeLinks"; cada uno con la parte del producto que lo evidencia):\n- ' +
+    os.map(function (o) { return o.id + ': ' + o.text; }).join('\n- ');
+}
+function _dynKindFloorsText(spec, minutes) {
+  var f = (spec && spec.floors) || {};
+  var ks = Object.keys(f);
+  return '"minutesBySection": enteros que suman ' + minutes + ' minutos (±' + Math.round(((spec && spec.tolerance) || 0.2) * 100) + ' %)' + (ks.length ? '; como mínimo ' + ks.map(function (k) { return k + ' ≥ ' + f[k]; }).join(', ') + ' min' : '') + '.';
+}
+var DYN_KIND_COMMON_RULES = function (c) {
+  return '\n- "outcomeLinks": ' + _dynKindRange(c, 'outcomeLinks') + ' vínculos { "outcomeId": "<id de la lista de resultados>", "evidence": "qué parte del producto lo evidencia" }, sin repetir ids.'
+    + '\n- "selfCheck": ' + _dynKindRange(c, 'selfCheck') + ' ítems verificables para revisar el propio trabajo.'
+    + '\n- "criteria": ' + _dynKindRange(c, 'criteria') + ' criterios distintos { "name", "description", "weight" } con pesos enteros (5–70) que suman EXACTAMENTE 100.'
+    + '\n- Datos hipotéticos claramente ilustrativos: personas y organizaciones ficticias, sin estadísticas inventadas presentadas como reales.'
+    + '\n- Sin mencionar videos, presentaciones, audiolibros ni otras actividades del curso (salvo lo que se pide revisar).'
+    + '\n- Esta parte la ve el ESTUDIANTE: nunca escribas «Respuesta:», «Solución esperada», «Guía de corrección» ni «Solucionario».';
+};
+
+function dynApplicationKindActivityPrompt(courseContext, outline, chapter, sourceMd, app, pedagogy) {
+  var ch = chapter || {};
+  var minutes = app.minutes;
+  var spec = app.kindSpec || {};
+  var c = spec.counts || {};
+  var kind = app.kind;
+  var head = _dynCtxV3(courseContext, outline)
+    + '\n\nCAPÍTULO: "' + (ch.title || '') + '"' + (ch.objective ? '\nObjetivo del capítulo: ' + ch.objective : '')
+    + (app.chapterKind === 'practice' ? '\nEs un CAPÍTULO DE PRÁCTICA: integra lo de los capítulos de contenido del módulo (abajo), sin teoría nueva.' : '')
+    + '\nTexto del capítulo en el Libro Guía (ÚNICA fuente de los conceptos; los datos son HIPOTÉTICOS e ilustrativos):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
+    + '\n' + _dynInternalVocabularyBan()
+    + _dynApplicationLearnerBlock(app, pedagogy)
+    + (pedagogy || '')
+    + _dynKindOutcomesBlock(app)
+    + _dynApplicationPracticeFilesBlock(app);
+  var common = '  "title": "título breve (≤ 120 caracteres)",\n  "objective": "qué debe lograr el estudiante: verbo observable + condición",\n  "outcomeLinks": [ { "outcomeId": "<id>", "evidence": "…" } ],\n';
+  var tail = '  "deliverable": { "description": "qué entrega el estudiante", "format": "…", "extent": "extensión o alcance" },\n  "selfCheck": ["…"],\n  "criteria": [ { "name": "…", "description": "…", "weight": <entero> } ],\n';
+  if (kind === 'case_study') {
+    return head
+      + '\n\nDiseña un ESTUDIO DE CASO de ' + minutes + ' minutos de trabajo del estudiante: un caso realista del sector y país del curso, con datos (anexos), preguntas de análisis que suben de nivel y una DECISIÓN que el estudiante toma y justifica con los conceptos del capítulo.'
+      + '\nResponde con JSON EXACTAMENTE con esta forma (sin campos extra):\n{\n' + common
+      + '  "case": { "title": "…", "organization": "organización ficticia", "narrative": "relato del caso en párrafos separados por \\n\\n: contexto, actores, problema y datos clave", "exhibits": [ { "title": "…", "kind": "table|data|document|testimony", "content": "datos del anexo (una línea por dato, separadas por \\n)" } ] },\n'
+      + '  "questions": [ { "id": "Q1", "prompt": "pregunta de análisis autocontenida", "level": "comprender|analizar|evaluar|proponer", "answerLines": <2–15> } ],\n'
+      + '  "decision": { "prompt": "la decisión o recomendación que debe tomar y justificar", "constraints": ["condición que debe respetar"] },\n'
+      + tail + '  "minutesBySection": { "reading": <min>, "analysis": <min>, "decision": <min>, "selfCheck": <min> }\n}\n'
+      + '\nREGLAS (un validador las verifica):'
+      + '\n- "case.narrative": entre ' + _dynKindRange(c, 'narrative') + ' caracteres; "case.exhibits": ' + _dynKindRange(c, 'exhibits') + ' anexos con datos concretos y coherentes entre sí.'
+      + '\n- "questions": ' + _dynKindRange(c, 'questions') + ' preguntas con id "Q1", "Q2"… en orden, de menor a mayor nivel (comprender → analizar → evaluar → proponer), con AL MENOS una de nivel analizar y una de nivel evaluar. Cada una exige usar los datos del caso; nunca incluyas la respuesta.'
+      + '\n- "decision.constraints": ' + _dynKindRange(c, 'constraints') + ' condiciones concretas (presupuesto, plazos, normas, personas) que la decisión debe respetar.'
+      + DYN_KIND_COMMON_RULES(c)
+      + '\n- ' + _dynKindFloorsText(spec, minutes);
+  }
+  if (kind === 'integrative_project') {
+    var mods = Array.isArray(app.moduleChapters) ? app.moduleChapters : [];
+    return head
+      + (mods.length ? '\n\nCAPÍTULOS DE CONTENIDO DEL MÓDULO (cada etapa se apoya en uno de ellos; "linkedChapter" = su título EXACTO):\n- ' + mods.join('\n- ') : '')
+      + '\n\nDiseña un PROYECTO INTEGRADOR de ' + minutes + ' minutos en etapas: el estudiante construye un producto final del módulo paso a paso, con un entregable intermedio por etapa que se apoya en un capítulo, y al final integra todo.'
+      + '\nResponde con JSON EXACTAMENTE con esta forma (sin campos extra):\n{\n' + common
+      + '  "brief": { "situation": "encargo realista del sector y país del curso", "finalProduct": "producto final que integra el módulo" },\n'
+      + '  "stages": [ { "id": "S1", "title": "…", "purpose": "qué se construye en esta etapa", "linkedChapter": "<título del capítulo>", "tasks": ["tarea concreta"], "intermediateDeliverable": "entregable de la etapa", "minutes": <10–45> } ],\n'
+      + '  "integration": { "instructions": ["cómo unir los entregables en el producto final"], "presentation": "cómo se presenta o socializa el producto" },\n'
+      + tail + '  "minutesBySection": { "stages": <suma de los minutos de las etapas>, "integration": <min>, "selfCheck": <min> }\n}\n'
+      + '\nREGLAS (un validador las verifica):'
+      + '\n- "stages": EXACTAMENTE ' + _dynKindRange(c, 'stages') + ' etapas con id "S1", "S2"… en orden; cada una con ' + _dynKindRange(c, 'stageTasks') + ' tareas, un entregable intermedio concreto y sus minutos (10–45); "minutesBySection.stages" = la suma de esos minutos.'
+      + '\n- "integration.instructions": ' + _dynKindRange(c, 'integration') + ' instrucciones para integrar los entregables.'
+      + '\n- "outcomeLinks": cita al menos 2 resultados distintos de la lista (o el único que haya).'
+      + DYN_KIND_COMMON_RULES(c)
+      + '\n- ' + _dynKindFloorsText(spec, minutes);
+  }
+  var targets = Array.isArray(app.reviewTargets) ? app.reviewTargets : [];
+  var peer = (c.peerReview || [0, 0])[0] > 0;
+  return head
+    + (targets.length ? '\n\nPRÁCTICAS EVALUABLES ANTERIORES DEL MÓDULO (lo que el estudiante revisa y mejora):\n- ' + targets.map(function (t) { return t.kindLabel + ' del capítulo «' + t.chapterTitle + '»'; }).join('\n- ') : '')
+    + '\n\nDiseña una actividad de RETROALIMENTACIÓN FORMATIVA de ' + minutes + ' minutos: el estudiante revisa el producto que entregó en la práctica evaluable del módulo con criterios claros, un ejemplar comentado y los errores frecuentes, ' + (peer ? 'lo intercambia con un compañero para una revisión entre pares, ' : '') + 'lo MEJORA, lo vuelve a entregar y reflexiona.'
+    + '\nResponde con JSON EXACTAMENTE con esta forma (sin campos extra):\n{\n' + common
+    + '  "target": { "product": "qué producto anterior revisa", "sourceActivity": "de qué actividad viene" },\n'
+    + '  "reviewCriteria": [ { "id": "R1", "name": "…", "lookFor": "cómo se ve un buen trabajo en este criterio", "questions": ["pregunta para revisar"] } ],\n'
+    + '  "exemplar": { "strong": "fragmento ejemplar sólido", "weak": "fragmento por mejorar", "commentary": "por qué uno funciona y el otro no" },\n'
+    + '  "commonErrors": [ { "error": "…", "howToSpot": "cómo detectarlo", "howToFix": "cómo corregirlo" } ],\n'
+    + '  "revision": { "steps": ["paso del plan de mejora"], "resubmission": "qué entrega de nuevo y cómo muestra los cambios" },\n'
+    + (peer ? '  "peerReview": { "instructions": ["instrucción para comentar el trabajo del compañero"], "protocol": "cómo se hace el intercambio con respeto" },\n' : '')
+    + '  "reflection": ["pregunta de reflexión"],\n'
+    + tail + '  "minutesBySection": { "study": <min>, "review": <min>, "revision": <min>, ' + (peer ? '"peerReview": <min>, ' : '') + '"reflection": <min> }\n}\n'
+    + '\nREGLAS (un validador las verifica):'
+    + '\n- "reviewCriteria": EXACTAMENTE ' + _dynKindRange(c, 'reviewCriteria') + ' criterios con id "R1", "R2"… en orden y nombres distintos; cada uno con ' + _dynKindRange(c, 'reviewQuestions') + ' preguntas.'
+    + '\n- "commonErrors": ' + _dynKindRange(c, 'commonErrors') + ' errores frecuentes de ESTE tipo de producto; "revision.steps": ' + _dynKindRange(c, 'revisionSteps') + ' pasos; "reflection": ' + _dynKindRange(c, 'reflection') + ' preguntas.'
+    + (peer ? '\n- "peerReview.instructions": ' + _dynKindRange(c, 'peerInstructions') + ' instrucciones.' : '\n- Sin "peerReview" en este nivel.')
+    + DYN_KIND_COMMON_RULES(c)
+    + '\n- ' + _dynKindFloorsText(spec, minutes);
+}
+
+// 2.ª pasada de un tipo nuevo: el SOLUCIONARIO docente de ESA actividad.
+function dynApplicationKindSolutionPrompt(courseContext, chapter, activity, sourceMd, app) {
+  var ch = chapter || {};
+  var spec = app.kindSpec || {};
+  var c = spec.counts || {};
+  var kind = app.kind;
+  var names = (activity.criteria || []).map(function (x) { return '«' + x.name + '»'; }).join(', ');
+  var head = _dynCtxV3(courseContext, null)
+    + '\n\nCAPÍTULO: "' + (ch.title || '') + '"'
+    + '\nTexto del capítulo en el Libro Guía (para que la guía sea correcta y consistente con lo enseñado):\n<<<FUENTE\n' + String(sourceMd || '') + '\nFUENTE>>>'
+    + '\n\nACTIVIDAD DEL ESTUDIANTE (ya aprobada; NO la cambies):\n' + JSON.stringify(activity)
+    + '\n\nEscribe el SOLUCIONARIO DOCENTE de esa actividad como JSON EXACTAMENTE con esta forma:\n';
+  var guide = '  "correctionGuide": [ { "criterion": "<nombre exacto>", "achieved": "logrado: …", "developing": "en proceso: …", "insufficient": "insuficiente: …" } ],\n  "teacherNotes": ["observación para el docente"]\n}\n';
+  var rules = '\n- "correctionGuide": EXACTAMENTE uno por criterio, en este orden y con estos nombres: ' + names + '.'
+    + '\n- "teacherNotes": 1–6 observaciones concretas (errores frecuentes, variantes aceptables, cómo dar retroalimentación).'
+    + '\n- Cuando remitas al material, di «el Libro Guía» o «el capítulo».'
+    + '\n' + _dynInternalVocabularyBan();
+  if (kind === 'case_study') {
+    var qids = (activity.questions || []).map(function (q) { return q.id; }).join(', ');
+    return head + '{\n'
+      + '  "questionGuides": [ { "questionId": "Q1", "expectedAnalysis": "análisis esperado con los datos del caso", "keyPoints": ["punto clave"] } ],\n'
+      + '  "decisionDiscussion": { "recommended": "decisión recomendada", "alternatives": ["alternativa aceptable y cuándo"], "justification": "por qué, con los conceptos del capítulo" },\n'
+      + '  "discussionQuestions": ["pregunta para la discusión en clase"],\n' + guide
+      + '\nREGLAS (un validador las verifica):'
+      + '\n- "questionGuides": EXACTAMENTE una por pregunta, en este orden de ids: ' + qids + '; cada una con ' + _dynKindRange(c, 'keyPoints') + ' puntos clave.'
+      + '\n- "decisionDiscussion.alternatives": ' + _dynKindRange(c, 'alternatives') + '; "discussionQuestions": ' + _dynKindRange(c, 'discussion') + '.'
+      + rules;
+  }
+  if (kind === 'integrative_project') {
+    var sids = (activity.stages || []).map(function (x) { return x.id; }).join(', ');
+    return head + '{\n'
+      + '  "stageGuides": [ { "stageId": "S1", "expectedOutput": "qué debería contener un buen entregable de la etapa", "commonErrors": ["error frecuente"], "checkpointQuestions": ["pregunta de control para el docente"] } ],\n'
+      + '  "finalProductExemplar": "cómo se ve un buen producto final, por partes (al menos 200 caracteres)",\n' + guide
+      + '\nREGLAS (un validador las verifica):'
+      + '\n- "stageGuides": EXACTAMENTE una por etapa, en este orden de ids: ' + sids + '; cada una con ' + _dynKindRange(c, 'stageErrors') + ' errores frecuentes y ' + _dynKindRange(c, 'checkpoints') + ' preguntas de control.'
+      + rules;
+  }
+  var rnames = (activity.reviewCriteria || []).map(function (x) { return '«' + x.name + '»'; }).join(', ');
+  return head + '{\n'
+    + '  "feedbackBank": [ { "criterion": "<nombre exacto del criterio de revisión>", "achieved": "…", "developing": "…", "insufficient": "…", "feedbackComment": "comentario de retroalimentación listo para usar", "nextStep": "siguiente paso concreto para el estudiante" } ],\n'
+    + '  "errorGuide": [ { "error": "error frecuente", "diagnosis": "de dónde suele venir y cómo orientarlo" } ],\n' + guide
+    + '\nREGLAS (un validador las verifica):'
+    + '\n- "feedbackBank": EXACTAMENTE uno por criterio de revisión, en este orden y con estos nombres: ' + rnames + '.'
+    + '\n- "errorGuide": ' + _dynKindRange(c, 'errorGuide') + ' entradas.'
+    + rules;
 }
 
 // ════ Loop 9 B · «Ejercicios guiados» del capítulo (formativos, sin nota, con respuesta modelo; clave guided_practice) ════
