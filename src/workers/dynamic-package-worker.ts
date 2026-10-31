@@ -39,7 +39,11 @@ import { resolveTheme } from '../modules/theme-engine';
 import { assessmentItemCountsForPackage, resolveAssessment } from '../package/assessment';
 import type { BlueprintSnapshotV2 } from '../modules/course-blueprints/blueprint-snapshot';
 import { hoursReportSummary } from '../modules/study-time/hours-ledger';
-import { buildPackageQualityReport, courseQualityReportSummary, CourseQualityReport } from '../modules/quality/course-quality-report';
+import { buildPackageQualityReport, courseQualityReportSummary, CourseQualityReport, PackageQualityInput } from '../modules/quality/course-quality-report';
+import { PackageObservationResult, buildPackageObservationFindings, observationFailed } from '../modules/quality/package-observation';
+import type { ContextSummaryInput, CoursePlanInput } from '../modules/coherence/coherence-types';
+import { effectiveOutputRowsSql } from '../modules/dynamic-generation/item-generations';
+import type { ResolvedArtifactV3, ResolvedItemV3 } from '../modules/dynamic-packaging/packaging-v3';
 import { PACKAGE_REUSE_REJECTED, PACKAGE_REUSE_VERIFY_UNAVAILABLE, chooseDynamicMbzUploadPath, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
 import { sha256Hex } from '../modules/artifacts/artifacts.service';
 import { isNonRealLlmMode } from '../modules/artifacts/artifact-type-policy';
@@ -146,6 +150,12 @@ export interface DynamicPackageWorkerDeps {
    * leídos en cada job; sin variables = solo medir e informar).
    */
   packageSizeLimits?: () => PackageSizeLimits;
+  /**
+   * r63 (V1): hallazgos de observación del informe de calidad (batería Q1–Q9, alineación, C1–C7). Inyectables para
+   * pruebas; por defecto, las implementaciones reales. Nunca cambian el .mbz ni el estado del job.
+   */
+  buildObservationFindings?: typeof buildPackageObservationFindings;
+  loadObservationSidecars?: typeof loadObservationSidecarsV3;
 }
 
 export interface PackageJobRow {
@@ -728,9 +738,25 @@ export async function processV3PackageJob(
   // resolución humana (visible a administradores en «Curso listo»). Si el informe falla, aviso VISIBLE (nunca en silencio).
   let qualityReport: CourseQualityReport | null = null;
   const qualityReportWarnings: string[] = [];
+  // r63 (V1): lo que ya se mide después de generar (Q1–Q9, alineación, C1–C7) entra al informe en MODO OBSERVACIÓN:
+  // nunca BLOCKER ni MAJOR, contado aparte (report.observation), sin tocar el .mbz (ya construido y validado arriba), el
+  // estado del job ni FinOps. Cualquier falla queda como INFO «no se pudo evaluar X» y el empaque sigue igual.
+  let observation: PackageObservationResult;
+  try {
+    const sidecars = await (deps.loadObservationSidecars ?? loadObservationSidecarsV3)(q, runId, manifest.manifest, prepared.byItem, loaders);
+    const artifactTypesByItem: Record<string, string[]> = {};
+    for (const [key, it] of prepared.byItem) artifactTypesByItem[key] = it.artifacts.map((a) => a.type);
+    observation = (deps.buildObservationFindings ?? buildPackageObservationFindings)({
+      manifest: manifest.manifest, blueprint: snapshot, contents: loaded.contents as any, artifactTypesByItem,
+      coursePlan: sidecars.coursePlan, contextSummaries: sidecars.contextSummaries, sidecarsError: sidecars.error,
+    });
+  } catch (err) {
+    logger.warn(`Job ${job.id}: hallazgos de observación del informe de calidad no evaluados — ${errMessage(err)}`);
+    observation = observationFailed(err);
+  }
   try {
     const titles = new Map<string, string>(((prepared.profiles.assessment as any)?.practiceResources ?? []).map((r: any) => [String(r.id), String(r.title ?? '')]));
-    qualityReport = courseQualityReportSummary(buildPackageQualityReport({
+    const qualityInput: PackageQualityInput = {
       manifest: manifest.manifest as any,
       blueprint: snapshot as any,
       contents: loaded.contents as any,
@@ -739,7 +765,17 @@ export async function processV3PackageJob(
       practiceTitles: titles,
       hoursReport: (built.expectations.facts as any).hoursReport ?? null,
       builderVersion: built.summary.builderVersion,
-    }));
+    };
+    let full: CourseQualityReport;
+    try {
+      full = buildPackageQualityReport({ ...qualityInput, extraFindings: observation.findings, observationMeta: observation.meta });
+    } catch (obsErr) {
+      // r63 (V1): un hallazgo de observación mal formado nunca tumba el informe de siempre.
+      logger.warn(`Job ${job.id}: informe con hallazgos de observación falló — ${errMessage(obsErr)}; se arma sin ellos`);
+      const failed = observationFailed(obsErr);
+      full = buildPackageQualityReport({ ...qualityInput, extraFindings: failed.findings, observationMeta: failed.meta });
+    }
+    qualityReport = courseQualityReportSummary(full);
   } catch (err) {
     qualityReportWarnings.push(`quality_report_failed:${errMessage(err).slice(0, 160)}`);
     logger.error(`Job ${job.id}: no se pudo armar el informe de calidad — ${errMessage(err)}`);
@@ -826,6 +862,66 @@ export async function processV3PackageJob(
     ...(built.expectations.facts.hoursReport ? { hoursReport: hoursReportSummary(built.expectations.facts.hoursReport) } : {}),
   });
   if (!ok) logger.warn(`Job ${job.id}: el .mbz v3 se subió (artifact ${artifact.id}) pero completeJob devolvió false (lease perdida)`);
+}
+
+/**
+ * r63 (V1): entradas de C1–C7 para el informe de observación: el course_plan (ya resuelto en `byItem`) y los sidecars
+ * `dynamic_context_summary_json` reales (opcionales, fuera de `byItem`) de la generación vigente de cada content. Nunca
+ * lanza: un fallo vuelve como `error` (INFO en el informe) y las fuentes que sí cargaron se usan igual.
+ */
+export async function loadObservationSidecarsV3(
+  q: { query: (sql: string, params?: any[]) => Promise<any[]> },
+  runId: string,
+  manifest: { items: ReadonlyArray<{ key: string; type: string; chapterId?: string | null }> },
+  byItem: Map<string, ResolvedItemV3>,
+  loaders: { loadText(a: ResolvedArtifactV3): Promise<string> },
+): Promise<{ coursePlan: CoursePlanInput | null; contextSummaries: Record<string, ContextSummaryInput> | null; error: string | null }> {
+  const errors: string[] = [];
+  let coursePlan: CoursePlanInput | null = null;
+  try {
+    const planItem = manifest.items.find((i) => i.type === 'course_plan');
+    const art = planItem ? byItem.get(planItem.key)?.artifacts.find((a) => a.type === 'dynamic_course_plan_json') : undefined;
+    if (art) {
+      const parsed = JSON.parse(await loaders.loadText(art));
+      if (parsed && typeof parsed === 'object' && parsed.chapters) coursePlan = parsed as CoursePlanInput;
+      else errors.push('course_plan sin chapters');
+    }
+  } catch (err) {
+    errors.push(`course_plan: ${errMessage(err).slice(0, 80)}`);
+  }
+  let contextSummaries: Record<string, ContextSummaryInput> | null = null;
+  try {
+    const chapterOf = new Map(manifest.items.filter((i) => i.type === 'content' && i.chapterId).map((i) => [i.key, String(i.chapterId)]));
+    const rows: any[] = await q.query(
+      `select g.item_key as item_key, g.id as item_run_id, a.id as artifact_id, a.type as artifact_type,
+              a.storage_bucket as storage_bucket, a.storage_path as storage_path, a.mime_type as mime_type
+         from ${effectiveOutputRowsSql('$1')} g
+         join public.artifacts a on a.item_run_id = g.id and a.status is distinct from 'disabled'
+        where g.status = 'completed' and a.type = 'dynamic_context_summary_json'
+        order by g.item_key, a.id`,
+      [runId],
+    );
+    const wanted = (Array.isArray(rows) ? rows : []).filter((r) => r && r.artifact_type === 'dynamic_context_summary_json' && chapterOf.has(r.item_key));
+    for (const r of wanted) {
+      const chapterId = chapterOf.get(r.item_key)!;
+      try {
+        const s = JSON.parse(await loaders.loadText({ itemKey: r.item_key, itemType: 'content' as any, itemRunId: r.item_run_id, artifactId: r.artifact_id, type: r.artifact_type, storageBucket: r.storage_bucket ?? '', storagePath: r.storage_path ?? '', mimeType: r.mime_type ?? null, metadata: {} }));
+        if (s?.chapterId && s.chapterId !== chapterId) { errors.push(`sidecar ${r.artifact_id} de otro capítulo`); continue; }
+        contextSummaries = contextSummaries ?? {};
+        contextSummaries[chapterId] = {
+          summary: s?.summary ?? null,
+          concepts_introduced: Array.isArray(s?.concepts_introduced) ? s.concepts_introduced : null,
+          concepts_assumed: Array.isArray(s?.concepts_assumed) ? s.concepts_assumed : null,
+          key_terms: Array.isArray(s?.key_terms) ? s.key_terms : null,
+        };
+      } catch (err) {
+        errors.push(`sidecar ${r.item_key}: ${errMessage(err).slice(0, 60)}`);
+      }
+    }
+  } catch (err) {
+    errors.push(`sidecars: ${errMessage(err).slice(0, 80)}`);
+  }
+  return { coursePlan, contextSummaries, error: errors.length ? errors.slice(0, 4).join('; ') : null };
 }
 
 /**
