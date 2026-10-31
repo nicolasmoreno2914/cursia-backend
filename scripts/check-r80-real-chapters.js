@@ -17,6 +17,10 @@
 //   RC5  videos por necesidad: un capítulo de procedimiento / comunicación lleva video aunque cierre el módulo; la práctica
 //        nunca lleva video; ningún módulo con 2+ capítulos de contenido queda sin video
 //   RC7  impacto de cambios (applyProposalToRows) refleja la división como «Aplicar diseño»
+//   RC8  resultados obligatorios con cobertura (contexto académico congelado, 40 / 60 / 100 / 120 h): ningún RA ni
+//        competencia sin evidencia; los que el documento declara para todo el curso (Inglés: RA1, RA7, CO1) se evidencian
+//        en las prácticas integradoras y el examen final (regla A1t, visible), nunca en un capítulo de contenido ajeno
+//   RC9  edad desde el grado escolar del documento («Grado: Sexto (6.º)» → niños, inferido); sin grado, nada
 //   RC6  parser de subtemas: enumeraciones en español, «;», viñetas, formas del idioma («like, love, don’t like y can»),
 //        paréntesis; la prosa y los textos de una sola idea no se dividen
 //
@@ -40,6 +44,8 @@ const CD = L('modules/academic-context/context-design.js');
 const TS = L('modules/study-time/topic-split.js');
 const F = L('modules/course-design/budget-fit.js');
 const FX = path.join(REPO, 'scripts/fixtures/microcurriculum');
+const SNAP = L('modules/course-blueprints/blueprint-snapshot.js');
+const AC = L('modules/academic-context/index.js');
 
 let passes = 0;
 let failures = 0;
@@ -283,6 +289,60 @@ function assertRealDesign(name, st, d, pr) {
     const bp11 = bp.modules[0].chapters[0];
     assert(/^Subtemas: Saludos y presentaciones\./.test(bp11.description || ''), 'materializado: descripción nueva del capítulo de origen');
     assert(bp.modules[0].chapters.filter((c) => c.kind !== 'practice').every((c) => /^Subtemas: /.test(c.description || '')), 'materializado: descripción en las partes nuevas');
+  });
+
+  await check('RC8 resultados obligatorios con cobertura a 40 / 60 / 100 / 120 h (transversales en prácticas y examen final)', () => {
+    process.env.DYNAMIC_REAL_CHAPTERS = 'true';
+    try {
+      let n = 0;
+      const uuid = () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;
+      const snapOf = (k) => {
+        const prop = CD.proposeStructureFromContext(ctx[k]);
+        const modules = []; const chapters = [];
+        prop.modules.forEach((m, mi) => { const id = uuid(); modules.push({ id, position: mi, title: m.title, objective: m.objective, description: m.description, exam_enabled: true });
+          m.chapters.forEach((c, ci) => chapters.push({ id: uuid(), module_id: id, position: ci, title: c.title, objective: c.objective, description: c.description, video_enabled: true, activity_enabled: true, ...(c.outcomeIds.length ? { outcome_ids: c.outcomeIds } : {}) })); });
+        return SNAP.buildBlueprintSnapshotV2({ id: 9000, title: k, finalExam: true, activityEngine: 'h5p', reviewCards: true, academicContext: AC.academicBlueprintContext(ctx[k]) }, modules, chapters);
+      };
+      for (const [k, h] of [['excel40', 40], ['ingles6', 60], ['sst100', 100], ['enf120', 120]]) {
+        const r = P.runPedagogyDryRun({ structure: snapOf(k), profile: prOf(k), activityTypeRules: 2, realChapters: true });
+        const d = r.distribution;
+        eq(d.targetHours, h, `${k}: meta`);
+        eq(generic(d).length, 0, `${k}: sin profundizaciones`);
+        const al = d.materialized.alignment;
+        eq(al.outcomes.filter((o) => o.status === 'uncovered').map((o) => o.id), [], `${k}: resultados y competencias sin evidencia`);
+        eq(al.findings.filter((f) => f.severity === 'critical').map((f) => `${f.rule}:${f.outcomeIds.join('+')}`), [], `${k}: hallazgos críticos`);
+        const titles = chaptersOf(d).filter((c) => c.kind === 'content').map((c) => norm(c.title));
+        eq(titles.filter((t, i) => titles.indexOf(t) !== i), [], `${k}: contenido duplicado`);
+        if (k === 'ingles6') {
+          eq(al.findings.filter((f) => f.rule === 'A1t').map((f) => f.outcomeIds[0]), ['RA1', 'RA7', 'CO1'], 'Inglés: RA1, RA7 y CO1 son transversales (A1t, visible)');
+          for (const id of ['RA1', 'RA7']) {
+            const o = al.outcomes.find((x) => x.id === id);
+            const kinds = new Set(o.evidence.map((e) => e.type));
+            assert(kinds.has('application_activity') && kinds.has('final_exam'), `${id}: evidencia en Actividades de las prácticas y en el examen final (${[...kinds].join(', ')})`);
+            const contentCh = new Set(chaptersOf(d).filter((c) => c.kind === 'content').map((c) => c.id));
+            assert(o.chapterIds.every((id2) => !contentCh.has(id2)), `${id}: no se pega a capítulos de contenido`);
+          }
+        }
+        report.push({ key: `cobertura ${k}`, after: { h: d.estimatedHours, status: d.status, generic: 0, coverage: al.coverage, transversal: al.findings.filter((f) => f.rule === 'A1t').map((f) => f.outcomeIds[0]) } });
+      }
+      // Sin el interruptor: RA1 y RA7 siguen como siempre (críticos); el cambio solo existe con r80.
+      delete process.env.DYNAMIC_REAL_CHAPTERS;
+      const off = P.runPedagogyDryRun({ structure: snapOf('ingles6'), profile: prOf('ingles6'), activityTypeRules: 2 }).distribution.materialized.alignment;
+      eq(off.findings.filter((f) => f.severity === 'critical').map((f) => f.outcomeIds[0]), ['RA1', 'RA7'], 'apagado: lo de siempre');
+    } finally { delete process.env.DYNAMIC_REAL_CHAPTERS; }
+  });
+
+  await check('RC9 edad desde el grado escolar del documento (inferido, visible); sin grado, nada', () => {
+    process.env.DYNAMIC_REAL_CHAPTERS = 'true';
+    try {
+      eq(CD.schoolGradeOf(ctx.ingles6), 6, 'Inglés: grado 6');
+      const s6 = CD.suggestProfileFromContext(ctx.ingles6, null);
+      eq([s6.profile.learner.ageGroup, s6.changes.find((c) => c.path === 'learner.ageGroup').source], ['children', 'inferred'], 'grado 6.º → niños (inferido)');
+      for (const k of ['excel40', 'sst100', 'conta60', 'enf120']) eq(CD.suggestProfileFromContext(ctx[k], null).profile.learner.ageGroup, null, `${k}: sin grado escolar no se sugiere edad`);
+      const keep = CD.suggestProfileFromContext(ctx.ingles6, { ...CD.suggestProfileFromContext(ctx.ingles6, null).profile, learner: { ...s6.profile.learner, ageGroup: 'teens' } });
+      eq(keep.profile.learner.ageGroup, 'teens', 'lo que eligió el docente se respeta');
+    } finally { delete process.env.DYNAMIC_REAL_CHAPTERS; }
+    eq(CD.suggestProfileFromContext(ctx.ingles6, null).profile.learner.ageGroup, null, 'apagado: lo de siempre');
   });
 
   eq(netAttempts, [], 'ningún intento de red');

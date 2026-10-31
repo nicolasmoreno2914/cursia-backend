@@ -8,7 +8,7 @@ import {
   normalizePedagogicalProfile,
 } from '../pedagogy/pedagogy-profile';
 import { DISTRIBUTOR_RULES } from '../study-time/distributor';
-import { maxPartsFor, partDescription, partTitle, partitionSubtopics, subtopicsOf } from '../study-time/topic-split';
+import { maxPartsFor, partDescription, partTitle, partitionSubtopics, realChaptersEnabled, subtopicsOf } from '../study-time/topic-split';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { ASSESSMENT_METHODS, AssessmentMethod } from '../pedagogy/vocabulary';
 import type { AcademicContextV1, FieldStatus, ThematicUnit, UnitContent } from './academic-context';
@@ -103,6 +103,22 @@ const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, ma
  * Perfil pedagógico con los datos del contexto aplicados sobre `current` (o un perfil vacío). Solo pisa los campos
  * que el contexto conoce; enfoque, formas de aprender, principios y preferencias del docente se conservan.
  */
+const GRADE_WORDS: Readonly<Record<string, number>> = Object.freeze({ primero: 1, segundo: 2, tercero: 3, cuarto: 4, quinto: 5, sexto: 6, septimo: 7, octavo: 8, noveno: 9, decimo: 10, undecimo: 11, once: 11 });
+/** Grado escolar (1–11) que nombra el documento en su identificación; null si no nombra uno claro. */
+export function schoolGradeOf(ctx: AcademicContextV1): number | null {
+  const texts = [ctx.identity.subjectName.value, ctx.identity.educationLevel.value?.text, ...(Array.isArray(ctx.additionalInfo?.value) ? ctx.additionalInfo.value : [])]
+    .filter((x): x is string => typeof x === 'string')
+    .map((t) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''));
+  const found = new Set<number>();
+  for (const t of texts) {
+    for (const m of t.matchAll(/\bgrado\s*:?\s*(\d{1,2}|[a-z]+)\b/g)) {
+      const g = /^\d+$/.test(m[1]) ? Number(m[1]) : GRADE_WORDS[m[1]];
+      if (g && g >= 1 && g <= 11) found.add(g);
+    }
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
 export function suggestProfileFromContext(ctx: AcademicContextV1, current: PedagogicalProfile | null): ProfileSuggestion {
   const base: PedagogicalProfile = current ? JSON.parse(JSON.stringify(current)) : emptyPedagogicalProfile();
   const changes: ProfileSuggestionChange[] = [];
@@ -122,6 +138,14 @@ export function suggestProfileFromContext(ctx: AcademicContextV1, current: Pedag
   if (lv.status !== 'missing' && lv.value?.level) {
     const v = lv.value.level;
     set('learner.educationLevel', base.learner.educationLevel, v, lv.status, () => { base.learner.educationLevel = v; });
+  }
+  // r80 · edad del estudiante desde el GRADO escolar que nombra el documento («Grado: Sexto (6.º)»): 1.º–7.º → niños
+  // (6–12 años), 8.º–11.º → adolescentes. Inferido (el docente lo ve y lo cambia); solo con DYNAMIC_REAL_CHAPTERS.
+  const grade = realChaptersEnabled() ? schoolGradeOf(ctx) : null;
+  if (grade !== null && !base.learner.ageGroup) {
+    const v = grade <= 7 ? 'children' : 'teens';
+    set('learner.ageGroup', base.learner.ageGroup, v, 'inferred', () => { base.learner.ageGroup = v as PedagogicalProfile['learner']['ageGroup']; });
+    notes.push(`El documento indica grado ${grade}.º: Cursia sugiere estudiantes ${v === 'children' ? 'niños (unos ' + (grade + 5) + '–' + (grade + 6) + ' años)' : 'adolescentes'}; la guía y las actividades se adaptan a esa edad.`);
   }
   const pick = (xs: { text: string; status: Exclude<FieldStatus, 'missing'> }[], what: string) => {
     if (xs.length > MAX_LIST_ITEMS) notes.push(`El contexto trae ${xs.length} ${what}; el perfil admite ${MAX_LIST_ITEMS}: se usaron los primeros.`);

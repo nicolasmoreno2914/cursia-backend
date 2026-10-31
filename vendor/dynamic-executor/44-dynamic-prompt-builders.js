@@ -2051,6 +2051,22 @@ function _dynApplicationLearnerBlock(app, pedagogy) {
     : '\n\nESTUDIANTE Y RESULTADOS DE APRENDIZAJE DEL CURSO (la actividad debe trabajarlos; elige los que este capítulo aporta):\n- ' + lines.join('\n- ');
 }
 
+// r80: estudiantes niños o adolescentes (learner.ageGroup del perfil congelado). La actividad conserva sus minutos y sus
+// cantidades (el validador no cambia); cambia la forma: tramos cortos, consignas breves, situaciones de su vida y
+// entregables propios de la edad. Sin ageGroup de niños / adolescentes → '' (el prompt de siempre, byte a byte).
+function _dynApplicationAgeBlock(app) {
+  var l = app && app.context && app.context.learner;
+  var g = l && l.ageGroup;
+  if (g !== 'children' && g !== 'teens') return '';
+  var kids = g === 'children';
+  return '\n\nESTUDIANTES ' + (kids ? 'NIÑOS (educación básica, unos 6–12 años)' : 'ADOLESCENTES (unos 13–17 años)') + ': la actividad conserva sus minutos y las cantidades de abajo, pero:'
+    + '\n- organízala en tramos de máximo ' + (kids ? '20' : '30') + ' minutos (cada ejemplo, bloque de ejercicios o hito del taller es un tramo que se puede hacer en una sesión y termina con algo hecho);'
+    + '\n- consignas breves y concretas: una acción por consigna, frases cortas' + (kids ? ' y, en los ejercicios básicos, un ejemplo de respuesta' : '') + ';'
+    + '\n- situaciones de su vida (' + (kids ? 'casa, colegio, amigos, juegos' : 'colegio, amigos, aficiones, su barrio') + '), nunca del trabajo ni de empresas;'
+    + '\n- entregables propios de su edad (p. ej. diálogo escrito, audio corto, póster o tarjeta, tabla' + (kids ? ' con dibujos' : '') + '), nunca informes formales, hojas de cálculo ni código;'
+    + '\n- criterios de evaluación y autoevaluación en palabras que el estudiante entienda.';
+}
+
 // r58 (I4-3): archivos de trabajo ADJUNTOS al capítulo (claim application.practiceFiles, del perfil de evaluación). La
 // actividad los nombra tal cual (título y archivo) y nunca inventa otros. Sin archivos → '' (el prompt de siempre).
 function _dynApplicationPracticeFilesBlock(app) {
@@ -2079,6 +2095,7 @@ function dynApplicationActivityPrompt(courseContext, outline, chapter, sourceMd,
     + _dynApplicationLearnerBlock(app, pedagogy)
     + (pedagogy || '')
     + _dynApplicationPracticeFilesBlock(app)
+    + _dynApplicationAgeBlock(app)
     + '\n\nDiseña la ACTIVIDAD DE APLICACIÓN de este capítulo para ' + minutes + ' minutos de trabajo del estudiante.'
     + '\n1) Elige el GÉNERO que mejor encaja con la disciplina y el tema (no uses siempre el mismo):\n- ' + DYN_APPLICATION_GENRES.map(function (g) { return DYN_APPLICATION_GENRE_TEXT[g]; }).join('\n- ')
     + '\n2) Responde con JSON EXACTAMENTE con esta forma (sin campos extra):\n'
