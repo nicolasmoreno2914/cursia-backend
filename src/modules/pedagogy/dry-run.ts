@@ -532,12 +532,15 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
         // LOOP 8.3: y el video de los capítulos de contenido (prioridad audiovisual / valores fijados por el docente).
         chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, application_kind: c.applicationKind ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}),
           // Loop 9 B: la propuesta fija (o quita) la práctica guiada de cada capítulo de contenido.
-          guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null });
+          guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null,
+          // r80: el capítulo de origen de una división se materializa con su título nuevo (lo mismo que escribe «Aplicar»).
+          ...(c.split && c.split.part === 0 ? { title: c.title, description: c.description ?? null, objective: c.objective } : {}) });
         return;
       }
-      const inherited = c.kind === 'practice' ? [] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
+      // r80: la parte de un contenido dividido hereda los resultados de ese contenido (si no tiene, los del módulo).
+      const inherited = c.kind === 'practice' ? [] : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
       chapters.push({
-        id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
+        id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: c.split ? c.description ?? null : null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
         application_minutes: c.applicationMinutes ?? null,
         ...(c.applicationKind ? { application_kind: c.applicationKind } : {}),

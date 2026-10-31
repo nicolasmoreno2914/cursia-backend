@@ -372,7 +372,7 @@ export class CourseStructureService implements OnModuleInit {
             const practice = c.kind === 'practice';
             // Review L84-2 N4: la profundización hereda los resultados de su módulo (lo mismo que mostró la tarjeta).
             // r80: un capítulo que sale de los subtemas de un contenido hereda los resultados de ESE contenido.
-            const inherited = practice ? [] : c.split ? [...c.split.outcomeIds] : moduleOutcomeIds(chapters, m.id, academic ? academicOutcomeIds(academic.context) : null);
+            const inherited = practice ? [] : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(chapters, m.id, academic ? academicOutcomeIds(academic.context) : null);
             const [ins] = returningRows(await queryRunner.query(
               `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes${practice ? ', chapter_kind' : ''}${inherited.length ? ', outcome_ids' : ''}${gpCol && gpOf(c) !== null ? ', guided_practice_minutes' : ''})
                values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''}${inherited.length ? ', $9::jsonb' : ''}${gpCol && gpOf(c) !== null ? `, $${inherited.length ? 10 : 9}` : ''})

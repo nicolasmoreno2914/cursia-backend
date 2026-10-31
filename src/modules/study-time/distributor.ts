@@ -67,6 +67,11 @@ export const DISTRIBUTOR_RULES = Object.freeze({
   /** Carga máxima de un capítulo (4 h): más sería sobrecargar al estudiante. */
   maxChapterMinutes: 240,
   maxContentChaptersPerModule: 5,
+  /**
+   * Ejercicios guiados: proporción máxima de las horas que Cursia usa por su cuenta (la del aviso de la tarjeta y la del
+   * ajuste al presupuesto, budget-fit GUIDED_SHARE_MAX). r80: también el tope del relleno con capítulos reales.
+   */
+  guidedShareMax: 0.3,
   /** Enfoque centrado en aplicación / desempeño (o sin enfoque). */
   applicationFirst: Object.freeze({ contentTierMax: 90, closingTierMax: 120, maxApplicationShare: 0.5, practicePerModule: 2, order: Object.freeze(['application', 'practice', 'content'] as const) }) as DistributorPolicy,
   /** Enfoque centrado en profundidad conceptual / conexiones. */
@@ -591,6 +596,16 @@ function distributeCore(input: DistributorInput): DistributionResult {
     m.chapters.splice(m.chapters.indexOf(cand.parts[cand.parts.length - 1]) + 1, 0, cc);
     cand.parts.push(cc);
     relabel(cand);
+    // El video del módulo se decide YA con la regla final (la misma que aplica result()): el crecimiento mide las horas
+    // con los videos que tendrá el diseño (antes, un video que result() quitaba dejaba el total fuera de la tolerancia).
+    if (!compOn && av) {
+      const content = m.chapters.filter((c) => c.kind === 'content');
+      content.forEach((c, i) => {
+        if (pinnedVideo(c.id) !== undefined) return;
+        c.videoEnabled = reqVideo !== null ? reqVideo : avFor(i, content.length, !c.split && (!!c.proposed || isCursiaDeepening(c))) || (av === 'recommended' && needsVideo(c));
+      });
+    } else if (reqVideo !== null) cc.videoEnabled = reqVideo;
+    reEval();
     return cc;
   };
   /** r80: módulos donde el documento pide más capítulos de contenido que subtemas trae (no se inventan). */
@@ -742,6 +757,13 @@ function distributeCore(input: DistributorInput): DistributionResult {
         });
       }
       if (changed) reEval();
+    }
+    // r80 · salvaguarda: el estado se confirma con las horas FINALES (después de la regla de video); nunca se informa
+    // «dentro de la tolerancia» con un total que no lo está.
+    if (realChapters && status === 'within_tolerance' && Math.abs(minutes() - target) > tol + 1e-9) {
+      const g = target - minutes();
+      status = g > 0 ? 'cannot_reach_target' : 'above_tolerance';
+      recs = [...recs, `El diseño queda en ${fmtH(minutes() / 60)} h, ${fmtH(Math.abs(g) / 60)} h ${g > 0 ? 'por debajo' : 'por encima'} del objetivo.`];
     }
     // r80 · los títulos de los capítulos divididos se fijan al final (cada división nueva reparte de nuevo los subtemas):
     // los textos de sus cambios se escriben con el estado final, y el capítulo de origen registra su nuevo título.
@@ -1275,8 +1297,10 @@ function distributeCore(input: DistributorInput): DistributionResult {
   const shapeFixedByDocument = !!rq && typeof rq.modulesFixed === 'number' && (rq.contentChaptersPerModule?.max !== undefined || rq.chaptersPerModule?.max !== undefined);
   // r80: con capítulos reales el contenido solo crece con los subtemas del documento; agotados, la diferencia se completa
   // con ejercicios guiados (formativos) en lugar de capítulos de relleno.
-  const guidedAllowed = guidedMode !== 'none' && ((!!rq && (noContentAdditions || shapeFixedByDocument || !!rq.applicationInPractice
-    || rq.applicationPerModule?.max !== undefined || rq.applicationTotal?.max !== undefined)) || realChapters);
+  const guidedByDocument = !!rq && (noContentAdditions || shapeFixedByDocument || !!rq.applicationInPractice
+    || rq.applicationPerModule?.max !== undefined || rq.applicationTotal?.max !== undefined);
+  const guidedAllowed = guidedMode !== 'none' && (guidedByDocument || realChapters);
+  const realOnlyGuided = realChapters && !guidedByDocument;
   const hb = rq?.hoursBounds;
   const hbOn = !!hb && (hb.min === undefined || input.targetHours >= hb.min) && (hb.max === undefined || input.targetHours <= hb.max);
   const hbMin = hbOn && hb!.min !== undefined ? hb!.min * 60 : -Infinity;
@@ -1300,6 +1324,9 @@ function distributeCore(input: DistributorInput): DistributionResult {
         const dist = Math.abs(total - target);
         // Fuera de las horas del documento (por debajo del mínimo o por encima del máximo) solo si ningún candidato entra.
         const out = total < hbMin - 1e-9 || total > hbMax + 1e-9 ? 1 : 0;
+        // r80: con capítulos reales (sin forma ni Actividades fijadas por el documento) los ejercicios guiados no pasan del
+        // tope de Cursia: más sería inflar el curso; la diferencia se informa (no alcanza) en lugar de rellenar.
+        if (realOnlyGuided && sum > DISTRIBUTOR_RULES.guidedShareMax * total + 1e-9) continue;
         if (!best || out < best.out || (out === best.out && (dist < best.dist - 1e-9 || (Math.abs(dist - best.dist) <= 1e-9 && sum < best.sum)))) best = { assign, total, dist, sum, out };
         if (hi === lo) break;
       }
@@ -1336,7 +1363,9 @@ function distributeCore(input: DistributorInput): DistributionResult {
   priorityTrace.push(policy.kind === 'application_first'
     ? 'El enfoque prioriza aplicación y desempeño: primero Actividades de aplicación, después capítulos de práctica y solo al final profundización.'
     : 'El enfoque prioriza profundidad y conexiones: primero Actividades de aplicación cortas, después capítulos de profundización y al final práctica.');
-  if (addedPractice || addedContent) priorityTrace.push(`Se proponen ${addedPractice} capítulo(s) de práctica y ${addedContent} de profundización: la estructura actual no alcanza ${fmtH(input.targetHours)} h sin ellos.`);
+  if (addedPractice || addedContent) priorityTrace.push(realChapters
+    ? `Se proponen ${addedPractice} capítulo(s) de práctica y ${addedContent} capítulo(s) con subtemas del documento: la estructura actual no alcanza ${fmtH(input.targetHours)} h sin ellos.`
+    : `Se proponen ${addedPractice} capítulo(s) de práctica y ${addedContent} de profundización: la estructura actual no alcanza ${fmtH(input.targetHours)} h sin ellos.`);
 
   const gap = target - minutes();
   if (Math.abs(gap) <= tol) return result('within_tolerance', []);

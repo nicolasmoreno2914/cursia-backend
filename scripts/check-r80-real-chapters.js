@@ -116,6 +116,8 @@ function assertRealDesign(name, st, d, pr) {
   assert(Math.abs(sum - d.estimatedHours) <= 0.35, `${name}: las horas por componente suman ${sum.toFixed(1)} ≈ ${d.estimatedHours}`);
   assert(d.estimatedHours <= d.targetHours + d.toleranceHours + 1e-9, `${name}: ${d.estimatedHours} h no pasa del objetivo ${d.targetHours} ± ${d.toleranceHours}`);
   assert(d.status === 'within_tolerance' || (d.status === 'cannot_reach_target' && d.recommendations.length > 0), `${name}: estado ${d.status} (si no alcanza, lo dice)`);
+  // «Dentro de la tolerancia» es verdad: el estado se calcula con los videos finales del diseño.
+  if (d.status === 'within_tolerance') assert(Math.abs(d.estimatedHours - d.targetHours) <= d.toleranceHours + 0.05, `${name}: ${d.estimatedHours} h dentro de ${d.targetHours} ± ${d.toleranceHours}`);
   assert(((d.counts.guidedPracticeMinutes || 0) / 60) <= 0.3 * d.estimatedHours + 1e-9, `${name}: ejercicios guiados ≤ 30 % (${((d.counts.guidedPracticeMinutes || 0) / 60).toFixed(1)} h de ${d.estimatedHours})`);
   // Videos: la práctica nunca; ningún módulo con 2+ capítulos de contenido sin video.
   assert(chaptersOf(d).filter((c) => c.kind === 'practice').every((c) => !c.videoEnabled), `${name}: práctica sin video`);
@@ -169,6 +171,11 @@ function assertRealDesign(name, st, d, pr) {
     assert(d.status === 'within_tolerance', `dentro de la tolerancia (${d.estimatedHours} h)`);
     assert(d.counts.videoChapters >= 12, `al menos 12 videos (${d.counts.videoChapters})`);
     assert(usd(d) < usd(before), `más barato que el diseño con profundizaciones (${usd(d).toFixed(2)} < ${usd(before).toFixed(2)})`);
+    // Barrido de metas: cada «dentro de la tolerancia» lo es de verdad y nunca aparece una profundización.
+    for (const h of [20, 30, 40, 45, 50, 55, 60, 66, 80]) {
+      const dh = dry(st, { ...pr, targetHours: h }, true).distribution;
+      assertRealDesign(`ingles6@${h}h`, st, dh, { ...pr, targetHours: h });
+    }
     report.push({ key: 'ingles6', before: { ch: before.counts.chapters, generic: generic(before).length, videos: before.counts.videoChapters, h: before.estimatedHours, usd: usd(before).toFixed(2) }, after: { ch: d.counts.chapters, content: d.counts.contentChapters, practice: d.counts.practiceChapters, generic: 0, videos: d.counts.videoChapters, h: d.estimatedHours, status: d.status, usd: usd(d).toFixed(2) } });
   });
 
@@ -249,6 +256,10 @@ function assertRealDesign(name, st, d, pr) {
     eq(TS.partitionSubtopics(['a', 'b', 'c', 'd', 'e'], 3), [['a'], ['b', 'c'], ['d', 'e']], 'grupos consecutivos, el más chico primero');
     eq([TS.maxPartsFor(1), TS.maxPartsFor(2), TS.maxPartsFor(5), TS.maxPartsFor(6)], [1, 1, 3, 3], 'máximo de capítulos por contenido');
     assert(TS.partTitle(['a'.repeat(50), 'b'.repeat(50)]).length <= 80, 'título dentro de 80 caracteres');
+    eq(TS.subtopicsOf('7 herramientas de calidad, 3 tipos de muda y 5S'), ['7 herramientas de calidad', '3 tipos de muda', '5S'], 'números que son parte del tema');
+    eq(TS.subtopicsOf('Comunicación, liderazgo, y trabajo en equipo'), ['Comunicación', 'liderazgo', 'trabajo en equipo'], 'coma de Oxford');
+    eq(TS.subtopicsOf('1. Marco legal\n2) Responsabilidades'), ['Marco legal', 'Responsabilidades'], 'listas numeradas');
+    assert(TS.partTitle(['x'.repeat(120)]).length === 80, 'una palabra larguísima se recorta (nunca título vacío)');
   });
 
   await check('RC7 impacto de cambios: «aplicar» en memoria escribe los títulos y descripciones nuevos (como applyDistribution)', () => {
@@ -263,6 +274,15 @@ function assertRealDesign(name, st, d, pr) {
     const added = out.chapters.filter((c) => c.module_id === 'm1' && String(c.id).startsWith('proposed:content'));
     eq(added.map((c) => c.title), ['Alfabeto y números', 'Información personal y verbo to be'], 'capítulos nuevos del módulo 1');
     assert(added.every((c) => /^Subtemas: /.test(c.description)), 'con su descripción');
+    // Lo que se ve es lo que se congela: el Blueprint materializado de la propuesta lleva los títulos, descripciones y
+    // resultados que escribe «Aplicar diseño».
+    const DR = L('modules/pedagogy/dry-run.js');
+    const base = DR.snapshotFromStructure({ ...st, modules: st.modules.map((m) => ({ ...m, chapters: m.chapters.map((c) => ({ ...c })) })) });
+    const bp = DR.materializeDistribution(base, d);
+    eq(bp.modules.flatMap((m) => m.chapters.map((c) => c.title)), d.modules.flatMap((m) => m.chapters.map((c) => c.title)), 'Blueprint materializado = títulos de la propuesta');
+    const bp11 = bp.modules[0].chapters[0];
+    assert(/^Subtemas: Saludos y presentaciones\./.test(bp11.description || ''), 'materializado: descripción nueva del capítulo de origen');
+    assert(bp.modules[0].chapters.filter((c) => c.kind !== 'practice').every((c) => /^Subtemas: /.test(c.description || '')), 'materializado: descripción en las partes nuevas');
   });
 
   eq(netAttempts, [], 'ningún intento de red');

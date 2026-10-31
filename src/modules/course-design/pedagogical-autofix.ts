@@ -620,6 +620,8 @@ export function designChangesSummary(changes: { type: string; subtopics?: string
   const fromSubtopics = changes.filter((c) => c.type === 'add_content_chapter' && Array.isArray(c.subtopics)).length;
   add(fromSubtopics, 'capítulo nuevo con subtemas del documento', 'capítulos nuevos con subtemas del documento');
   add(n('add_content_chapter') - fromSubtopics, 'capítulo de profundización', 'capítulos de profundización');
+  // r80: un capítulo existente que se reparte en subtemas cambia de título (su contenido ya generado queda desactualizado).
+  add(n('split_content_chapter'), 'capítulo actual que cambia de título al repartir sus subtemas', 'capítulos actuales que cambian de título al repartir sus subtemas');
   add(n('add_practice_chapter'), 'capítulo de práctica', 'capítulos de práctica');
   add(n('set_application_activity'), 'Actividad de Aplicación', 'Actividades de Aplicación');
   add(n('set_guided_practice'), 'ejercicio guiado', 'ejercicios guiados');

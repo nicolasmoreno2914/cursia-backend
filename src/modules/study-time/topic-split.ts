@@ -63,7 +63,9 @@ function splitTop(text: string, sep: RegExp): string[] {
   return out.map((s) => s.trim()).filter(Boolean);
 }
 
-const cleanItem = (s: string) => s.replace(/^[-–•·*\d.)\s]+(?=\S)/, '').replace(/[.;:]+$/, '').trim();
+// Marcadores de lista («- », «• », «1. », «2) ») y conjunción suelta de la coma de Oxford («, y trabajo en equipo»); un
+// número que es parte del tema («7 herramientas de calidad») se conserva.
+const cleanItem = (s: string) => s.replace(/^\s*(?:[-–•·*]+\s*|\d+[.)]\s+)/, '').replace(/^(?:y|e)\s+(?=\S)/i, '').replace(/[.;:]+$/, '').trim();
 
 /**
  * Subtemas que enumera un texto del documento, en su orden. [] si no es una enumeración clara (menos de 2 subtemas,
@@ -151,7 +153,7 @@ export function partTitle(group: string[]): string {
   const w = words(capFirst(group[0]));
   let t = '';
   for (const x of w) { if ((t ? `${t} ${x}` : x).length > STRUCTURE_TITLE_MAX) break; t = t ? `${t} ${x}` : x; }
-  return t;
+  return t || capFirst(group[0]).slice(0, STRUCTURE_TITLE_MAX);
 }
 
 /** Descripción de un capítulo dividido: sus subtemas y de qué contenido del documento vienen. */
