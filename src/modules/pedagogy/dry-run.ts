@@ -97,6 +97,11 @@ export interface DryRunStructureInput {
 }
 
 export interface DryRunInput {
+  /**
+   * r80 · capítulos reales (ver distributor `realChapters`): los capítulos nuevos salen de los subtemas del documento.
+   * Ausente = el interruptor del servidor `DYNAMIC_REAL_CHAPTERS === 'true'` (apagado: comportamiento de siempre).
+   */
+  realChapters?: boolean;
   /** Estructura propuesta (ids opcionales) o un Blueprint snapshot v2 (p.ej. la estructura viva del curso). */
   structure: DryRunStructureInput | BlueprintSnapshotV2;
   /** Perfil pedagógico (null/vacío → solo la línea base). */
@@ -527,12 +532,15 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
         // LOOP 8.3: y el video de los capítulos de contenido (prioridad audiovisual / valores fijados por el docente).
         chapters.push({ ...existing, position: ci, application_minutes: c.applicationMinutes ?? null, application_kind: c.applicationKind ?? null, ...(c.kind === 'content' ? { video_enabled: c.videoEnabled } : {}),
           // Loop 9 B: la propuesta fija (o quita) la práctica guiada de cada capítulo de contenido.
-          guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null });
+          guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null,
+          // r80: el capítulo de origen de una división se materializa con su título nuevo (lo mismo que escribe «Aplicar»).
+          ...(c.split && c.split.part === 0 ? { title: c.title, description: c.description ?? null, objective: c.objective } : {}) });
         return;
       }
-      const inherited = c.kind === 'practice' ? [] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
+      // r80: la parte de un contenido dividido hereda los resultados de ese contenido (si no tiene, los del módulo).
+      const inherited = c.kind === 'practice' ? [] : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
       chapters.push({
-        id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
+        id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: c.split ? c.description ?? null : null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),
         application_minutes: c.applicationMinutes ?? null,
         ...(c.applicationKind ? { application_kind: c.applicationKind } : {}),
@@ -937,6 +945,11 @@ export function runPedagogyDryRun(input: DryRunInput): DryRunResult {
 
 const DIST_MEMO = new WeakMap<object, Map<string, DistributionResult>>();
 const DIST_MEMO_MAX = 4000;
+/** r80: capítulos reales pedidos por la entrada o, sin ella, por el interruptor del servidor. */
+export function realChaptersOf(input: { realChapters?: boolean }): boolean {
+  return typeof input.realChapters === 'boolean' ? input.realChapters : process.env.DYNAMIC_REAL_CHAPTERS === 'true';
+}
+
 function memoDistributor(input: DryRunInput, lock: readonly TierLockRow[] | null, run: () => DistributionResult): DistributionResult {
   const owner = input.structure as unknown as object;
   if (!owner || typeof owner !== 'object') return run();
@@ -944,7 +957,7 @@ function memoDistributor(input: DryRunInput, lock: readonly TierLockRow[] | null
   if (p && p.designPreferences) delete p.designPreferences.activityKinds;
   let key: string;
   try {
-    key = JSON.stringify({ p, pins: input.designPins ?? null, rq: input.requirementConstraints ?? null, atr: input.activityTypeRules ?? 2, lock, adj: input.applyStructureAdjustments ?? true, reg: input.registry ? 'custom' : 'default' });
+    key = JSON.stringify({ rc: realChaptersOf(input), p, pins: input.designPins ?? null, rq: input.requirementConstraints ?? null, atr: input.activityTypeRules ?? 2, lock, adj: input.applyStructureAdjustments ?? true, reg: input.registry ? 'custom' : 'default' });
   } catch {
     return run();
   }
@@ -991,7 +1004,7 @@ function distributionFor(
       const contentCap = profileContentChaptersMax(input.profile);
       const requirements = withContentChaptersCap(mix ? mix.constraints : input.requirementConstraints ?? null, contentCap, lockShaped.modules.length);
       const lock = input.tierLock ?? null;
-      const runDistributor = () => distributeCourseHours({ snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}), ...(lock ? { tierSelectable: (t: number) => isTierSelectable('standard', t, lock) } : {}) });
+      const runDistributor = () => distributeCourseHours({ ...(realChaptersOf(input) ? { realChapters: true } : {}), snapshot: lockShaped, rules, targetHours, activityTypeRules: activityTypeRules === 2 ? 2 : 1, preferences: profileDesignPreferences(input.profile), pins: input.designPins ?? null, requirements, ...(profileHm ? { timeModelConfig: timeModelConfigOf(lockShaped) } : {}), ...(lock ? { tierSelectable: (t: number) => isTierSelectable('standard', t, lock) } : {}) });
       // r79.1 (rendimiento): en la búsqueda del ajuste (distributionOnly) el distribuidor se corre UNA vez por combinación
       // que lo afecta: los tipos de actividad no cambian su entrada (se asignan después), así que «automático» y «ninguno»
       // comparten el resultado. Caché por la estructura recibida (misma identidad en toda la búsqueda) y el resto de la

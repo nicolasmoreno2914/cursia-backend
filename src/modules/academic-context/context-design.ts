@@ -8,6 +8,7 @@ import {
   normalizePedagogicalProfile,
 } from '../pedagogy/pedagogy-profile';
 import { DISTRIBUTOR_RULES } from '../study-time/distributor';
+import { maxPartsFor, partDescription, partTitle, partitionSubtopics, subtopicsOf } from '../study-time/topic-split';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { ASSESSMENT_METHODS, AssessmentMethod } from '../pedagogy/vocabulary';
 import type { AcademicContextV1, FieldStatus, ThematicUnit, UnitContent } from './academic-context';
@@ -353,7 +354,36 @@ export function documentStructureShape(ctx: AcademicContextV1): number[] | null 
  * vienen de los contenidos y de sus unidades. Si el documento trae menos contenidos que capítulos, los que sobran se
  * marcan como profundización sin contenido del documento (nunca se inventa un contenido).
  */
-export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape: StructureShape): ContextStructureProposal {
+/** r80 · un contenido repartido en subtemas: la pieza `part` de `parts` (la 0 conserva el id del contenido). */
+interface ShapedItem { c: UnitContent; u: ThematicUnit; piece?: { part: number; parts: number; group: string[]; sourceText: string } }
+const PIECE_MARK = '~r80p';
+
+/**
+ * r80 · capítulos reales: si la forma elegida tiene más capítulos que contenidos el documento, los contenidos que enumeran
+ * subtemas se reparten en piezas (al menos 2 subtemas por pieza, en orden) hasta llenar la forma o agotar los subtemas.
+ * Nada se inventa: cada pieza es texto del documento. Solo la primera pieza conserva el id del contenido (la cobertura no
+ * ve duplicados: el contenido sigue en UN capítulo; las demás piezas lo dicen en su descripción).
+ */
+function expandBySubtopics(items: ShapedItem[], want: number): ShapedItem[] {
+  const st = items.map((x) => ({ x, sub: subtopicsOf(x.c.text), parts: 1 }));
+  let total = items.length;
+  while (total < want) {
+    const cand = st.filter((e) => e.parts < maxPartsFor(e.sub.length)).sort((a, b) => b.sub.length / b.parts - a.sub.length / a.parts)[0];
+    if (!cand) break;
+    cand.parts++;
+    total++;
+  }
+  return st.flatMap((e) => {
+    if (e.parts === 1) return [e.x];
+    return partitionSubtopics(e.sub, e.parts).map((group, part) => ({
+      u: e.x.u,
+      c: { ...e.x.c, id: part === 0 ? e.x.c.id : `${e.x.c.id}${PIECE_MARK}${part}`, text: partTitle(group) },
+      piece: { part, parts: e.parts, group, sourceText: e.x.c.text },
+    }));
+  });
+}
+
+export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape: StructureShape, opts?: { realChapters?: boolean }): ContextStructureProposal {
   const notes: string[] = [];
   const units = ctx.units.filter((u) => u.contents.length > 0);
   if (!isValidShape(shape) || !units.length) {
@@ -365,7 +395,7 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
   }
   const outcomes = [...ctx.outcomes.map((o) => ({ id: o.id, text: o.text })), ...ctx.competencies.map((c) => ({ id: c.id, text: c.text }))];
   const raOnly = ctx.outcomes.map((o) => ({ id: o.id, text: o.text }));
-  const items = units.flatMap((u) => u.contents.map((c) => ({ c, u })));
+  const docItems: ShapedItem[] = units.flatMap((u) => u.contents.map((c) => ({ c, u })));
   const seenTitles = new Set<string>();
   const uniqueTitle = (t: string, suffix: string) => {
     let title = t;
@@ -375,7 +405,11 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
   };
   const N = shape.modules;
   const M = shape.chaptersPerModule;
+  const realOn = opts?.realChapters ?? process.env.DYNAMIC_REAL_CHAPTERS === 'true';
+  const items = realOn && docItems.length < N * M ? expandBySubtopics(docItems, N * M) : docItems;
+  const pieces = items.length - docItems.length;
   let extraChapters = 0;
+  let skippedTotal = 0;
   const modules: ContextModuleProposal[] = splitEven(items, N).map((group, mi) => {
     // Título del módulo: la unidad que más contenidos aporta; las demás que aporta quedan nombradas en la descripción.
     const spanned = [...new Map(group.map((x) => [x.u.id, x.u])).values()];
@@ -383,12 +417,21 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
     const t = dominant ? titleAndRest(dominant.u.title) : { title: `Módulo ${mi + 1}`, rest: null };
     const moduleTitle = uniqueTitle(t.title, `M${mi + 1}`);
     const unitLinks = [...new Set(spanned.flatMap((u) => u.outcomeIds))];
-    const chapters = splitEven(group, M).map((g, ci): ContextChapterProposal => {
+    let skipped = 0;
+    const chapters = splitEven(group, M).map((g, ci): ContextChapterProposal | null => {
       if (g.length) {
         const links = [...new Set(g.flatMap((x) => x.u.outcomeIds))];
-        return chapterFromContents(g.map((x) => x.c), links, outcomes, raOnly, (tt) => uniqueTitle(tt, `${mi + 1}.${ci + 1}`));
+        const ch = chapterFromContents(g.map((x) => x.c), links, outcomes, raOnly, (tt) => uniqueTitle(tt, `${mi + 1}.${ci + 1}`));
+        if (!g.some((x) => x.piece)) return ch;
+        // r80: piezas de un contenido (subtemas del documento): descripción con su origen; solo la primera pieza cuenta
+        // como el contenido en la trazabilidad.
+        const desc = g.map((x) => (x.piece ? partDescription(x.piece.group, x.piece.sourceText) : x.c.text)).join(' ');
+        return { ...ch, description: clip(desc, 2000), sourceContentIds: ch.sourceContentIds.filter((id) => !id.includes(PIECE_MARK)) };
       }
       extraChapters++;
+      // r80: sin contenido ni subtemas del documento no se crea un capítulo sin tema (la nota lo explica).
+      // (Un módulo sin ningún contenido conserva su capítulo: un módulo vacío no es una estructura válida.)
+      if (realOn && group.length > 0) { skipped++; return null; }
       const k = ci - group.length + 1;
       const base = `Profundización ${k}: ${moduleTitle}`;
       return {
@@ -396,7 +439,8 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
         objective: null, description: null, videoEnabled: true, activityEnabled: true, outcomeIds: [...unitLinks].sort(cmpOutcome).slice(0, 8),
         linkStatus: unitLinks.length ? 'found' : 'none', sourceContentIds: [],
       };
-    });
+    }).filter((c): c is ContextChapterProposal => c !== null);
+    skippedTotal += skipped;
     const others = spanned.filter((u) => u !== (dominant && dominant.u)).map((u) => titleAndRest(u.title).title);
     const desc = [t.rest, others.length ? `También incluye contenidos de: ${others.join(' · ')}.` : null].filter(Boolean).join(' ');
     return {
@@ -410,9 +454,11 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
     };
   });
   const docShape = units.map((u) => Math.min(DISTRIBUTOR_RULES.maxContentChaptersPerModule, u.contents.length));
-  notes.push(`Los ${items.length} contenidos de las ${units.length} unidades del documento quedan en ${N} × ${M}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
+  notes.push(`Los ${docItems.length} contenidos de las ${units.length} unidades del documento quedan en ${N} × ${M}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
+  if (pieces > 0) notes.push(`Para completar ${N} × ${M}, ${pieces === 1 ? 'un capítulo sale' : `${pieces} capítulos salen`} de repartir los subtemas que el documento enumera en sus contenidos (en su orden; ningún tema se inventa).`);
   if (items.length > N * M) notes.push(`Hay más contenidos (${items.length}) que capítulos (${N * M}): algunos capítulos agrupan varios contenidos y los listan.`);
-  if (extraChapters) notes.push(`${extraChapters === 1 ? 'Un capítulo no tiene' : `${extraChapters} capítulos no tienen`} contenido del documento (el documento trae ${items.length} contenidos para ${N * M} capítulos): quedan como profundización.`);
+  if (skippedTotal) notes.push(`${skippedTotal === 1 ? 'Un capítulo de la forma elegida no se crea' : `${skippedTotal} capítulos de la forma elegida no se crean`}: el documento no trae más contenidos ni subtemas para ellos y Cursia no crea capítulos sin tema. La carga horaria se completa con práctica, Actividades de Aplicación y ejercicios guiados, o la diferencia se informa en «Verificación».`);
+  if (extraChapters - skippedTotal > 0) notes.push(`${extraChapters - skippedTotal === 1 ? 'Un capítulo no tiene' : `${extraChapters - skippedTotal} capítulos no tienen`} contenido del documento (el documento trae ${items.length} ${pieces ? 'contenidos y subtemas' : 'contenidos'} para ${N * M} capítulos): quedan como profundización.`);
   if (N !== units.length || docShape.some((n) => n !== M)) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${docShape.join(', ')} contenidos por unidad); la estructura elegida es ${N} × ${M}.`);
   return finishContextProposal(ctx, modules, notes);
 }
