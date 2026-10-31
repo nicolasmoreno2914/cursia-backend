@@ -44,7 +44,7 @@ export const BUDGET_FIT_FLAG_ENV = 'DYNAMIC_BUDGET_FIT';
 export const BUDGET_FIT_MARGIN_ENV = 'BUDGET_FIT_MARGIN';
 export const DEFAULT_BUDGET_FIT_MARGIN = 0.1;
 /** Ejercicios guiados: proporción máxima de las horas que el ajuste usa por su cuenta (la misma del aviso de la tarjeta). */
-export const GUIDED_SHARE_MAX = 0.3;
+export const GUIDED_SHARE_MAX = DISTRIBUTOR_RULES.guidedShareMax;
 
 type Env = Record<string, string | undefined>;
 

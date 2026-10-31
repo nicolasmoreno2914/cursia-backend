@@ -8,6 +8,7 @@ import {
   normalizePedagogicalProfile,
 } from '../pedagogy/pedagogy-profile';
 import { DISTRIBUTOR_RULES } from '../study-time/distributor';
+import { maxPartsFor, partDescription, partTitle, partitionSubtopics, realChaptersEnabled, subtopicsOf } from '../study-time/topic-split';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { ASSESSMENT_METHODS, AssessmentMethod } from '../pedagogy/vocabulary';
 import type { AcademicContextV1, FieldStatus, ThematicUnit, UnitContent } from './academic-context';
@@ -102,6 +103,26 @@ const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, ma
  * Perfil pedagógico con los datos del contexto aplicados sobre `current` (o un perfil vacío). Solo pisa los campos
  * que el contexto conoce; enfoque, formas de aprender, principios y preferencias del docente se conservan.
  */
+const GRADE_WORDS: Readonly<Record<string, number>> = Object.freeze({ primero: 1, segundo: 2, tercero: 3, cuarto: 4, quinto: 5, sexto: 6, septimo: 7, octavo: 8, noveno: 9, decimo: 10, undecimo: 11, once: 11 });
+/** Grado escolar (1–11) que nombra el documento en su identificación; null si no nombra uno claro. */
+export function schoolGradeOf(ctx: AcademicContextV1): number | null {
+  // Solo con contexto ESCOLAR (nivel básica / secundaria / primaria / bachillerato): «úlceras grado 2» o «Grado en
+  // Enfermería» (título universitario) no son grados escolares. Solo el nombre del curso y el campo «Grado:».
+  const norm = (t: string) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const lv = ctx.identity.educationLevel.value;
+  const school = !!lv && (lv.level === 'basic' || lv.level === 'secondary' || /basica|primaria|secundaria|bachillerato|colegio|escolar/.test(norm(lv.text || '')));
+  if (!school) return null;
+  const extra = (Array.isArray(ctx.additionalInfo?.value) ? ctx.additionalInfo.value : []).filter((x) => /^\s*grado\s*:/i.test(String(x)));
+  const texts = [ctx.identity.subjectName.value, ...extra].filter((x): x is string => typeof x === 'string').map(norm);
+  const found = new Set<number>();
+  const add = (w: string) => { const g = /^\d+$/.test(w) ? Number(w) : GRADE_WORDS[w]; if (g && g >= 1 && g <= 11) found.add(g); };
+  for (const t of texts) {
+    for (const m of t.matchAll(/\bgrado\s*:?\s*(\d{1,2}|[a-z]+)\b/g)) add(m[1]);
+    for (const m of t.matchAll(/\b(\d{1,2})\s*(?:o|º|°)?\s*grado\b|\b([a-z]+)\s+grado\b/g)) add(m[1] || m[2]);
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
 export function suggestProfileFromContext(ctx: AcademicContextV1, current: PedagogicalProfile | null): ProfileSuggestion {
   const base: PedagogicalProfile = current ? JSON.parse(JSON.stringify(current)) : emptyPedagogicalProfile();
   const changes: ProfileSuggestionChange[] = [];
@@ -121,6 +142,14 @@ export function suggestProfileFromContext(ctx: AcademicContextV1, current: Pedag
   if (lv.status !== 'missing' && lv.value?.level) {
     const v = lv.value.level;
     set('learner.educationLevel', base.learner.educationLevel, v, lv.status, () => { base.learner.educationLevel = v; });
+  }
+  // r80 · edad del estudiante desde el GRADO escolar que nombra el documento («Grado: Sexto (6.º)»): 1.º–7.º → niños
+  // (6–12 años), 8.º–11.º → adolescentes. Inferido (el docente lo ve y lo cambia); solo con DYNAMIC_REAL_CHAPTERS.
+  const grade = realChaptersEnabled() ? schoolGradeOf(ctx) : null;
+  if (grade !== null && !base.learner.ageGroup) {
+    const v = grade <= 7 ? 'children' : 'teens';
+    set('learner.ageGroup', base.learner.ageGroup, v, 'inferred', () => { base.learner.ageGroup = v as PedagogicalProfile['learner']['ageGroup']; });
+    notes.push(`El documento indica grado ${grade}.º: Cursia sugiere estudiantes ${v === 'children' ? 'niños (unos ' + (grade + 5) + '–' + (grade + 6) + ' años)' : 'adolescentes'}; la guía y las actividades se adaptan a esa edad.`);
   }
   const pick = (xs: { text: string; status: Exclude<FieldStatus, 'missing'> }[], what: string) => {
     if (xs.length > MAX_LIST_ITEMS) notes.push(`El contexto trae ${xs.length} ${what}; el perfil admite ${MAX_LIST_ITEMS}: se usaron los primeros.`);
@@ -198,6 +227,21 @@ export interface ContextStructureProposal {
 /** Coincidencia léxica mínima para inferir un vínculo contenido → resultado (contención de tokens del contenido). */
 export const LINK_CONTAINMENT_MIN = 0.5;
 export const LINK_JACCARD_MIN = 0.2;
+
+/**
+ * r80 · resultados TRANSVERSALES: los que ningún capítulo de contenido vincula NI nombra (ningún capítulo comparte términos
+ * con ellos). Son los que el documento declara para todo el curso («formular y responder preguntas básicas»); los
+ * evidencian las prácticas integradoras, que integran su módulo (y, con ellas, el examen final). Uno que SÍ comparte
+ * términos con un capítulo es un vínculo olvidado: no es transversal y sigue siendo un vacío crítico (A1).
+ */
+export function transversalOutcomeIds(outcomes: { id: string; text: string }[], contentChapters: { title: string; description?: string | null; outcomeIds?: readonly string[] | null }[]): string[] {
+  const linked = new Set(contentChapters.flatMap((c) => c.outcomeIds ?? []));
+  const texts = contentChapters.map((c) => `${c.title} ${c.description ?? ''}`);
+  // Un resultado de aprendizaje que comparte AUNQUE SEA un término con un capítulo no es transversal (vínculo olvidado:
+  // sigue A1 crítico). Las competencias del documento son del curso por naturaleza (A1c): sin vínculos, transversales.
+  const named = (o: { id: string; text: string }) => !/^CO/.test(o.id) && texts.some((t) => tokenContainment(t, o.text) > 0);
+  return outcomes.filter((o) => !linked.has(o.id) && !named(o)).map((o) => o.id).sort(cmpOutcome);
+}
 
 /** Resultados cuyo texto comparte términos con `text` (inferido). Orden: mejor coincidencia primero, máx. 3. */
 export function lexicalOutcomeMatches(text: string, outcomes: { id: string; text: string }[]): string[] {
@@ -353,7 +397,36 @@ export function documentStructureShape(ctx: AcademicContextV1): number[] | null 
  * vienen de los contenidos y de sus unidades. Si el documento trae menos contenidos que capítulos, los que sobran se
  * marcan como profundización sin contenido del documento (nunca se inventa un contenido).
  */
-export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape: StructureShape): ContextStructureProposal {
+/** r80 · un contenido repartido en subtemas: la pieza `part` de `parts` (la 0 conserva el id del contenido). */
+interface ShapedItem { c: UnitContent; u: ThematicUnit; piece?: { part: number; parts: number; group: string[]; sourceText: string } }
+const PIECE_MARK = '~r80p';
+
+/**
+ * r80 · capítulos reales: si la forma elegida tiene más capítulos que contenidos el documento, los contenidos que enumeran
+ * subtemas se reparten en piezas (al menos 2 subtemas por pieza, en orden) hasta llenar la forma o agotar los subtemas.
+ * Nada se inventa: cada pieza es texto del documento. Solo la primera pieza conserva el id del contenido (la cobertura no
+ * ve duplicados: el contenido sigue en UN capítulo; las demás piezas lo dicen en su descripción).
+ */
+function expandBySubtopics(items: ShapedItem[], want: number): ShapedItem[] {
+  const st = items.map((x) => ({ x, sub: subtopicsOf(x.c.text), parts: 1 }));
+  let total = items.length;
+  while (total < want) {
+    const cand = st.filter((e) => e.parts < maxPartsFor(e.sub.length)).sort((a, b) => b.sub.length / b.parts - a.sub.length / a.parts)[0];
+    if (!cand) break;
+    cand.parts++;
+    total++;
+  }
+  return st.flatMap((e) => {
+    if (e.parts === 1) return [e.x];
+    return partitionSubtopics(e.sub, e.parts).map((group, part) => ({
+      u: e.x.u,
+      c: { ...e.x.c, id: part === 0 ? e.x.c.id : `${e.x.c.id}${PIECE_MARK}${part}`, text: partTitle(group) },
+      piece: { part, parts: e.parts, group, sourceText: e.x.c.text },
+    }));
+  });
+}
+
+export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape: StructureShape, opts?: { realChapters?: boolean }): ContextStructureProposal {
   const notes: string[] = [];
   const units = ctx.units.filter((u) => u.contents.length > 0);
   if (!isValidShape(shape) || !units.length) {
@@ -365,7 +438,7 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
   }
   const outcomes = [...ctx.outcomes.map((o) => ({ id: o.id, text: o.text })), ...ctx.competencies.map((c) => ({ id: c.id, text: c.text }))];
   const raOnly = ctx.outcomes.map((o) => ({ id: o.id, text: o.text }));
-  const items = units.flatMap((u) => u.contents.map((c) => ({ c, u })));
+  const docItems: ShapedItem[] = units.flatMap((u) => u.contents.map((c) => ({ c, u })));
   const seenTitles = new Set<string>();
   const uniqueTitle = (t: string, suffix: string) => {
     let title = t;
@@ -375,7 +448,11 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
   };
   const N = shape.modules;
   const M = shape.chaptersPerModule;
+  const realOn = opts?.realChapters ?? process.env.DYNAMIC_REAL_CHAPTERS === 'true';
+  const items = realOn && docItems.length < N * M ? expandBySubtopics(docItems, N * M) : docItems;
+  const pieces = items.length - docItems.length;
   let extraChapters = 0;
+  let skippedTotal = 0;
   const modules: ContextModuleProposal[] = splitEven(items, N).map((group, mi) => {
     // Título del módulo: la unidad que más contenidos aporta; las demás que aporta quedan nombradas en la descripción.
     const spanned = [...new Map(group.map((x) => [x.u.id, x.u])).values()];
@@ -383,12 +460,21 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
     const t = dominant ? titleAndRest(dominant.u.title) : { title: `Módulo ${mi + 1}`, rest: null };
     const moduleTitle = uniqueTitle(t.title, `M${mi + 1}`);
     const unitLinks = [...new Set(spanned.flatMap((u) => u.outcomeIds))];
-    const chapters = splitEven(group, M).map((g, ci): ContextChapterProposal => {
+    let skipped = 0;
+    const chapters = splitEven(group, M).map((g, ci): ContextChapterProposal | null => {
       if (g.length) {
         const links = [...new Set(g.flatMap((x) => x.u.outcomeIds))];
-        return chapterFromContents(g.map((x) => x.c), links, outcomes, raOnly, (tt) => uniqueTitle(tt, `${mi + 1}.${ci + 1}`));
+        const ch = chapterFromContents(g.map((x) => x.c), links, outcomes, raOnly, (tt) => uniqueTitle(tt, `${mi + 1}.${ci + 1}`));
+        if (!g.some((x) => x.piece)) return ch;
+        // r80: piezas de un contenido (subtemas del documento): descripción con su origen; solo la primera pieza cuenta
+        // como el contenido en la trazabilidad.
+        const desc = g.map((x) => (x.piece ? partDescription(x.piece.group, x.piece.sourceText) : x.c.text)).join(' ');
+        return { ...ch, description: clip(desc, 2000), sourceContentIds: ch.sourceContentIds.filter((id) => !id.includes(PIECE_MARK)) };
       }
       extraChapters++;
+      // r80: sin contenido ni subtemas del documento no se crea un capítulo sin tema (la nota lo explica).
+      // (Un módulo sin ningún contenido conserva su capítulo: un módulo vacío no es una estructura válida.)
+      if (realOn && group.length > 0) { skipped++; return null; }
       const k = ci - group.length + 1;
       const base = `Profundización ${k}: ${moduleTitle}`;
       return {
@@ -396,7 +482,8 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
         objective: null, description: null, videoEnabled: true, activityEnabled: true, outcomeIds: [...unitLinks].sort(cmpOutcome).slice(0, 8),
         linkStatus: unitLinks.length ? 'found' : 'none', sourceContentIds: [],
       };
-    });
+    }).filter((c): c is ContextChapterProposal => c !== null);
+    skippedTotal += skipped;
     const others = spanned.filter((u) => u !== (dominant && dominant.u)).map((u) => titleAndRest(u.title).title);
     const desc = [t.rest, others.length ? `También incluye contenidos de: ${others.join(' · ')}.` : null].filter(Boolean).join(' ');
     return {
@@ -410,9 +497,11 @@ export function proposeShapedStructureFromContext(ctx: AcademicContextV1, shape:
     };
   });
   const docShape = units.map((u) => Math.min(DISTRIBUTOR_RULES.maxContentChaptersPerModule, u.contents.length));
-  notes.push(`Los ${items.length} contenidos de las ${units.length} unidades del documento quedan en ${N} × ${M}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
+  notes.push(`Los ${docItems.length} contenidos de las ${units.length} unidades del documento quedan en ${N} × ${M}: cada contenido en un solo capítulo (ninguno se pierde ni se repite).`);
+  if (pieces > 0) notes.push(`Para completar ${N} × ${M}, ${pieces === 1 ? 'un capítulo sale' : `${pieces} capítulos salen`} de repartir los subtemas que el documento enumera en sus contenidos (en su orden; ningún tema se inventa).`);
   if (items.length > N * M) notes.push(`Hay más contenidos (${items.length}) que capítulos (${N * M}): algunos capítulos agrupan varios contenidos y los listan.`);
-  if (extraChapters) notes.push(`${extraChapters === 1 ? 'Un capítulo no tiene' : `${extraChapters} capítulos no tienen`} contenido del documento (el documento trae ${items.length} contenidos para ${N * M} capítulos): quedan como profundización.`);
+  if (skippedTotal) notes.push(`${skippedTotal === 1 ? 'Un capítulo de la forma elegida no se crea' : `${skippedTotal} capítulos de la forma elegida no se crean`}: el documento no trae más contenidos ni subtemas para ellos y Cursia no crea capítulos sin tema. La carga horaria se completa con práctica, Actividades de Aplicación y ejercicios guiados, o la diferencia se informa en «Verificación».`);
+  if (extraChapters - skippedTotal > 0) notes.push(`${extraChapters - skippedTotal === 1 ? 'Un capítulo no tiene' : `${extraChapters - skippedTotal} capítulos no tienen`} contenido del documento (el documento trae ${items.length} ${pieces ? 'contenidos y subtemas' : 'contenidos'} para ${N * M} capítulos): quedan como profundización.`);
   if (N !== units.length || docShape.some((n) => n !== M)) notes.push(`El documento organiza sus contenidos en ${units.length} ${units.length === 1 ? 'unidad' : 'unidades'} (${docShape.join(', ')} contenidos por unidad); la estructura elegida es ${N} × ${M}.`);
   return finishContextProposal(ctx, modules, notes);
 }

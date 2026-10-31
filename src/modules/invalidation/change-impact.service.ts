@@ -169,9 +169,10 @@ export function applyProposalToRows(
       if (c.proposed) {
         const practice = c.kind === 'practice';
         chapters.push({
-          id: c.id, module_id: m.id, position: ci, title: c.title, objective: c.objective, description: null,
+          // r80: el capítulo que sale de los subtemas de un contenido lleva su descripción y los resultados de ese contenido.
+          id: c.id, module_id: m.id, position: ci, title: c.title, objective: c.objective, description: c.split ? c.description ?? null : null,
           video_enabled: practice ? false : c.videoEnabled, activity_enabled: c.activityEnabled,
-          chapter_kind: practice ? 'practice' : null, application_minutes: c.applicationMinutes, application_kind: (c as { applicationKind?: string }).applicationKind ?? null, outcome_ids: null,
+          chapter_kind: practice ? 'practice' : null, application_minutes: c.applicationMinutes, application_kind: (c as { applicationKind?: string }).applicationKind ?? null, outcome_ids: c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : null,
           // Loop 9 B: la práctica guiada del diseño (solo contenido).
           guided_practice_minutes: practice ? null : c.guidedPracticeMinutes ?? null,
         } as unknown as RawChapterRowV2);
@@ -179,7 +180,9 @@ export function applyProposalToRows(
         const row = byId.get(String(c.id));
         if (!row) return;
         touched.add(String(c.id));
-        chapters.push({ ...row, position: ci, application_minutes: c.applicationMinutes, application_kind: (c as { applicationKind?: string }).applicationKind ?? null, guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null } as RawChapterRowV2);
+        chapters.push({ ...row, position: ci, application_minutes: c.applicationMinutes, application_kind: (c as { applicationKind?: string }).applicationKind ?? null, guided_practice_minutes: c.kind === 'content' ? c.guidedPracticeMinutes ?? null : null,
+          // r80: el capítulo de origen de una división cambia su título, descripción y objetivo (como en «Aplicar diseño»).
+          ...(c.split && c.split.part === 0 ? { title: c.title, description: c.description ?? null, objective: c.objective } : {}) } as RawChapterRowV2);
       }
     });
   }
