@@ -8,7 +8,7 @@ import {
   normalizePedagogicalProfile,
 } from '../pedagogy/pedagogy-profile';
 import { DISTRIBUTOR_RULES } from '../study-time/distributor';
-import { maxPartsFor, partDescription, partTitle, partitionSubtopics, subtopicsOf } from '../study-time/topic-split';
+import { maxPartsFor, partDescription, partTitle, partitionSubtopics, realChaptersEnabled, subtopicsOf } from '../study-time/topic-split';
 import { isValidTargetHours } from '../study-time/target-hours';
 import { ASSESSMENT_METHODS, AssessmentMethod } from '../pedagogy/vocabulary';
 import type { AcademicContextV1, FieldStatus, ThematicUnit, UnitContent } from './academic-context';
@@ -103,6 +103,26 @@ const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, ma
  * Perfil pedagógico con los datos del contexto aplicados sobre `current` (o un perfil vacío). Solo pisa los campos
  * que el contexto conoce; enfoque, formas de aprender, principios y preferencias del docente se conservan.
  */
+const GRADE_WORDS: Readonly<Record<string, number>> = Object.freeze({ primero: 1, segundo: 2, tercero: 3, cuarto: 4, quinto: 5, sexto: 6, septimo: 7, octavo: 8, noveno: 9, decimo: 10, undecimo: 11, once: 11 });
+/** Grado escolar (1–11) que nombra el documento en su identificación; null si no nombra uno claro. */
+export function schoolGradeOf(ctx: AcademicContextV1): number | null {
+  // Solo con contexto ESCOLAR (nivel básica / secundaria / primaria / bachillerato): «úlceras grado 2» o «Grado en
+  // Enfermería» (título universitario) no son grados escolares. Solo el nombre del curso y el campo «Grado:».
+  const norm = (t: string) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const lv = ctx.identity.educationLevel.value;
+  const school = !!lv && (lv.level === 'basic' || lv.level === 'secondary' || /basica|primaria|secundaria|bachillerato|colegio|escolar/.test(norm(lv.text || '')));
+  if (!school) return null;
+  const extra = (Array.isArray(ctx.additionalInfo?.value) ? ctx.additionalInfo.value : []).filter((x) => /^\s*grado\s*:/i.test(String(x)));
+  const texts = [ctx.identity.subjectName.value, ...extra].filter((x): x is string => typeof x === 'string').map(norm);
+  const found = new Set<number>();
+  const add = (w: string) => { const g = /^\d+$/.test(w) ? Number(w) : GRADE_WORDS[w]; if (g && g >= 1 && g <= 11) found.add(g); };
+  for (const t of texts) {
+    for (const m of t.matchAll(/\bgrado\s*:?\s*(\d{1,2}|[a-z]+)\b/g)) add(m[1]);
+    for (const m of t.matchAll(/\b(\d{1,2})\s*(?:o|º|°)?\s*grado\b|\b([a-z]+)\s+grado\b/g)) add(m[1] || m[2]);
+  }
+  return found.size === 1 ? [...found][0] : null;
+}
+
 export function suggestProfileFromContext(ctx: AcademicContextV1, current: PedagogicalProfile | null): ProfileSuggestion {
   const base: PedagogicalProfile = current ? JSON.parse(JSON.stringify(current)) : emptyPedagogicalProfile();
   const changes: ProfileSuggestionChange[] = [];
@@ -122,6 +142,14 @@ export function suggestProfileFromContext(ctx: AcademicContextV1, current: Pedag
   if (lv.status !== 'missing' && lv.value?.level) {
     const v = lv.value.level;
     set('learner.educationLevel', base.learner.educationLevel, v, lv.status, () => { base.learner.educationLevel = v; });
+  }
+  // r80 · edad del estudiante desde el GRADO escolar que nombra el documento («Grado: Sexto (6.º)»): 1.º–7.º → niños
+  // (6–12 años), 8.º–11.º → adolescentes. Inferido (el docente lo ve y lo cambia); solo con DYNAMIC_REAL_CHAPTERS.
+  const grade = realChaptersEnabled() ? schoolGradeOf(ctx) : null;
+  if (grade !== null && !base.learner.ageGroup) {
+    const v = grade <= 7 ? 'children' : 'teens';
+    set('learner.ageGroup', base.learner.ageGroup, v, 'inferred', () => { base.learner.ageGroup = v as PedagogicalProfile['learner']['ageGroup']; });
+    notes.push(`El documento indica grado ${grade}.º: Cursia sugiere estudiantes ${v === 'children' ? 'niños (unos ' + (grade + 5) + '–' + (grade + 6) + ' años)' : 'adolescentes'}; la guía y las actividades se adaptan a esa edad.`);
   }
   const pick = (xs: { text: string; status: Exclude<FieldStatus, 'missing'> }[], what: string) => {
     if (xs.length > MAX_LIST_ITEMS) notes.push(`El contexto trae ${xs.length} ${what}; el perfil admite ${MAX_LIST_ITEMS}: se usaron los primeros.`);
@@ -199,6 +227,21 @@ export interface ContextStructureProposal {
 /** Coincidencia léxica mínima para inferir un vínculo contenido → resultado (contención de tokens del contenido). */
 export const LINK_CONTAINMENT_MIN = 0.5;
 export const LINK_JACCARD_MIN = 0.2;
+
+/**
+ * r80 · resultados TRANSVERSALES: los que ningún capítulo de contenido vincula NI nombra (ningún capítulo comparte términos
+ * con ellos). Son los que el documento declara para todo el curso («formular y responder preguntas básicas»); los
+ * evidencian las prácticas integradoras, que integran su módulo (y, con ellas, el examen final). Uno que SÍ comparte
+ * términos con un capítulo es un vínculo olvidado: no es transversal y sigue siendo un vacío crítico (A1).
+ */
+export function transversalOutcomeIds(outcomes: { id: string; text: string }[], contentChapters: { title: string; description?: string | null; outcomeIds?: readonly string[] | null }[]): string[] {
+  const linked = new Set(contentChapters.flatMap((c) => c.outcomeIds ?? []));
+  const texts = contentChapters.map((c) => `${c.title} ${c.description ?? ''}`);
+  // Un resultado de aprendizaje que comparte AUNQUE SEA un término con un capítulo no es transversal (vínculo olvidado:
+  // sigue A1 crítico). Las competencias del documento son del curso por naturaleza (A1c): sin vínculos, transversales.
+  const named = (o: { id: string; text: string }) => !/^CO/.test(o.id) && texts.some((t) => tokenContainment(t, o.text) > 0);
+  return outcomes.filter((o) => !linked.has(o.id) && !named(o)).map((o) => o.id).sort(cmpOutcome);
+}
 
 /** Resultados cuyo texto comparte términos con `text` (inferido). Orden: mejor coincidencia primero, máx. 3. */
 export function lexicalOutcomeMatches(text: string, outcomes: { id: string; text: string }[]): string[] {

@@ -4,7 +4,7 @@ import { requirementConstraintsForCourse } from '../academic-context/requirement
 import { Injectable, BadRequestException, NotFoundException, ConflictException, Logger, OnModuleInit, ServiceUnavailableException } from '@nestjs/common';
 import { lockPedagogyInput } from '../pedagogy/pedagogical-blueprint';
 import { loadCurrentPedagogicalProfile, parseStoredPedagogicalProfile } from '../pedagogy/pedagogy-db';
-import { moduleOutcomeIds, runPedagogyDryRun } from '../pedagogy/dry-run';
+import { moduleOutcomeIds, proposalTransversalOutcomes, runPedagogyDryRun } from '../pedagogy/dry-run';
 import { ApplyDistributionDto } from './dto/apply-distribution.dto';
 import { profileApplicationContext, profileTargetHours } from '../pedagogy/pedagogy-profile';
 import { academicBlueprintContext, loadCurrentAcademicContext, parseStoredAcademicContext } from '../academic-context/academic-db';
@@ -366,13 +366,26 @@ export class CourseStructureService implements OnModuleInit {
       // Re-review piloto P2: la forma ANTES de agregar los capítulos de Cursia (para saber si la estructura seguía siendo suya).
       const shapeBefore = await liveStructureShape(queryRunner, courseId);
       let added = 0;
+      // r80: resultados transversales del curso (ningún capítulo de contenido los vincula ni los nombra): las prácticas
+      // integradoras NUEVAS los evidencian junto con los de su módulo (lo mismo que mostró la vista previa).
+      const rowById = new Map((chapters as { id: unknown; outcome_ids?: unknown }[]).map((c) => [String(c.id), c]));
+      const linksOfRow = (id: string): string[] => { const r = rowById.get(id); const v = r && (typeof r.outcome_ids === 'string' ? JSON.parse(r.outcome_ids) : r.outcome_ids); return Array.isArray(v) ? v : []; };
+      const transversal = academic
+        ? proposalTransversalOutcomes([...academic.context.outcomes.map((o) => ({ id: o.id, text: o.text })), ...academic.context.competencies.map((c) => ({ id: c.id, text: c.text }))], dist, linksOfRow)
+        : [];
+      const practiceLinks = (moduleId: string): string[] => {
+        const m = dist.modules.find((x) => x.id === moduleId);
+        const set = new Set<string>(transversal);
+        for (const c of m ? m.chapters : []) if (c.kind === 'content') for (const x of c.proposed ? (c.split ? c.split.outcomeIds : []) : linksOfRow(c.id)) set.add(x);
+        return sortOutcomeIds([...set]);
+      };
       for (const m of dist.modules) {
         for (const [ci, c] of m.chapters.entries()) {
           if (c.proposed) {
             const practice = c.kind === 'practice';
             // Review L84-2 N4: la profundización hereda los resultados de su módulo (lo mismo que mostró la tarjeta).
             // r80: un capítulo que sale de los subtemas de un contenido hereda los resultados de ESE contenido.
-            const inherited = practice ? [] : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(chapters, m.id, academic ? academicOutcomeIds(academic.context) : null);
+            const inherited = practice ? (transversal.length ? practiceLinks(m.id) : []) : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(chapters, m.id, academic ? academicOutcomeIds(academic.context) : null);
             const [ins] = returningRows(await queryRunner.query(
               `insert into public.course_chapters (course_id, module_id, position, title, objective, video_enabled, activity_enabled, application_minutes${practice ? ', chapter_kind' : ''}${inherited.length ? ', outcome_ids' : ''}${gpCol && gpOf(c) !== null ? ', guided_practice_minutes' : ''})
                values ($1, $2, $3, $4, $5, $6, $7, $8${practice ? ", 'practice'" : ''}${inherited.length ? ', $9::jsonb' : ''}${gpCol && gpOf(c) !== null ? `, $${inherited.length ? 10 : 9}` : ''})

@@ -1,4 +1,7 @@
 import { academicOutcomeIds } from '../academic-context/academic-context';
+import { sortOutcomeIds } from '../academic-context/blueprint-academic';
+import { realChaptersEnabled } from '../study-time/topic-split';
+import { transversalOutcomeIds } from '../academic-context/context-design';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import { ALIGNMENT_RULESET, ALIGNMENT_VERSION, AlignmentReport, AlignmentUnavailable, buildAlignmentReport } from '../coherence/alignment';
 import {
@@ -505,6 +508,19 @@ export function proposedChapterUuid(id: string): string {
  * módulo: hereda la unión de los vínculos de sus capítulos de contenido. Así no aparece «sin resultado» después de aplicar
  * ni se le pide al docente algo que el sistema puede decidir. Las prácticas no heredan (como en la vinculación automática).
  */
+/** r80: resultados de los capítulos de contenido de un módulo de la PROPUESTA (existentes y partes nuevas de una división). */
+function moduleOutcomeIdsOfProposal(dist: DistributionResult, moduleId: string, rowOf: (id: string) => RawChapterRowV2 | undefined): string[] {
+  const m = dist.modules.find((x) => x.id === moduleId);
+  const set = new Set<string>();
+  for (const c of m ? m.chapters : []) {
+    if (c.kind !== 'content') continue;
+    const r = rowOf(c.id);
+    const v = c.proposed ? (c.split ? c.split.outcomeIds : []) : r ? (typeof r.outcome_ids === 'string' ? JSON.parse(r.outcome_ids) : r.outcome_ids) : [];
+    if (Array.isArray(v)) for (const x of v) if (typeof x === 'string') set.add(x);
+  }
+  return [...set];
+}
+
 export function moduleOutcomeIds(chapters: { module_id: string; outcome_ids?: unknown; chapter_kind?: unknown }[], moduleId: string, known?: ReadonlySet<string> | null): string[] {
   const set = new Set<string>();
   for (const c of chapters) {
@@ -516,6 +532,22 @@ export function moduleOutcomeIds(chapters: { module_id: string; outcome_ids?: un
   return [...set].sort();
 }
 
+/**
+ * r80 · resultados transversales de una propuesta (ver context-design `transversalOutcomeIds`): con los capítulos de
+ * contenido FINALES del diseño (títulos y vínculos tras dividir). Solo con DYNAMIC_REAL_CHAPTERS; los usan la vista previa
+ * y «Aplicar diseño» para vincular las prácticas integradoras NUEVAS (dato guardado, visible y congelado por el lock).
+ */
+export function proposalTransversalOutcomes(
+  outcomes: { id: string; text: string }[],
+  dist: DistributionResult,
+  linksOf: (chapterId: string) => readonly string[],
+): string[] {
+  if (!realChaptersEnabled() || !outcomes.length) return [];
+  const content = dist.modules.flatMap((m) => m.chapters.filter((c) => c.kind === 'content'))
+    .map((c) => ({ title: c.title, description: c.description ?? null, outcomeIds: c.proposed ? (c.split ? c.split.outcomeIds : []) : linksOf(c.id) }));
+  return transversalOutcomeIds(outcomes, content);
+}
+
 export function materializeDistribution(base: BlueprintSnapshotV2, dist: DistributionResult, applicationContext: unknown = null): BlueprintSnapshotV2 {
   const rows = snapshotV2ToRows(base);
   // Fase 2: el contexto del perfil que congelaría el lock (entra solo si la propuesta tiene Actividades de Aplicación).
@@ -523,6 +555,12 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
   const byId = new Map(rows.chapters.map((c) => [c.id, c]));
   const ctx = rows.course && (rows.course as { academicContext?: unknown }).academicContext;
   const knownOutcomes = ctx && typeof ctx === 'object' ? academicOutcomeIds(ctx as AcademicContextV1) : null;
+  const frozenCtx = ctx && typeof ctx === 'object' ? (ctx as { outcomes?: { id: string; text: string }[]; competencies?: { id: string; text: string }[] }) : null;
+  const transversal = proposalTransversalOutcomes(frozenCtx ? [...(frozenCtx.outcomes ?? []), ...(frozenCtx.competencies ?? [])] : [], dist, (id) => {
+    const r = byId.get(id);
+    const v = r && (typeof r.outcome_ids === 'string' ? JSON.parse(r.outcome_ids) : r.outcome_ids);
+    return Array.isArray(v) ? v : [];
+  });
   const chapters: RawChapterRowV2[] = [];
   for (const m of dist.modules) {
     m.chapters.forEach((c, ci) => {
@@ -538,7 +576,10 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
         return;
       }
       // r80: la parte de un contenido dividido hereda los resultados de ese contenido (si no tiene, los del módulo).
-      const inherited = c.kind === 'practice' ? [] : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
+      // r80: la práctica integradora NUEVA evidencia su módulo y los resultados transversales del curso (si los hay).
+      const inherited = c.kind === 'practice'
+        ? (transversal.length ? sortOutcomeIds([...new Set([...moduleOutcomeIdsOfProposal(dist, m.id, (id) => byId.get(id)), ...transversal])]) : [])
+        : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
       chapters.push({
         id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: c.split ? c.description ?? null : null,
         video_enabled: c.videoEnabled, activity_enabled: c.activityEnabled, ...(c.kind === 'practice' ? { chapter_kind: 'practice' } : {}),

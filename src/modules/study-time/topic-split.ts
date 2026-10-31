@@ -10,6 +10,11 @@ import { STRUCTURE_TITLE_MAX } from '../course-structure/structure-titles';
 
 export const TOPIC_SPLIT_VERSION = 1 as const;
 
+/** r80: interruptor del servidor de los capítulos reales (y de los resultados transversales). Apagado = lo de siempre. */
+export function realChaptersEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  return env.DYNAMIC_REAL_CHAPTERS === 'true';
+}
+
 export const TOPIC_SPLIT_RULES = Object.freeze({
   version: TOPIC_SPLIT_VERSION,
   /** Un ítem de más palabras ya no es un subtema enumerado sino prosa: el texto no se divide. */
