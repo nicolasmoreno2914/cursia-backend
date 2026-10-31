@@ -332,6 +332,28 @@ function assertRealDesign(name, st, d, pr) {
     } finally { delete process.env.DYNAMIC_REAL_CHAPTERS; }
   });
 
+  await check('RC8b sin enmascarar vacíos: un resultado que un capítulo NOMBRA pero no vincula sigue crítico; lo bloqueado no cambia', () => {
+    const outs = [...ctx.ingles6.outcomes.map((o) => ({ id: o.id, text: o.text })), ...ctx.ingles6.competencies.map((c) => ({ id: c.id, text: c.text }))];
+    const chs = CD.proposeStructureFromContext(ctx.ingles6).modules.flatMap((m) => m.chapters);
+    eq(CD.transversalOutcomeIds(outs, chs), ['RA1', 'RA7', 'CO1'], 'Inglés: transversales = los que ningún capítulo vincula ni nombra');
+    // RA5 («Reconocer vocabulario fundamental») sin vínculo, pero «Integración de vocabulario…» lo nombra: vínculo olvidado.
+    const forgot = chs.map((c) => ({ ...c, outcomeIds: c.outcomeIds.filter((id) => id !== 'RA5') }));
+    assert(!CD.transversalOutcomeIds(outs, forgot).includes('RA5'), 'RA5 olvidado NO se vuelve transversal (sigue A1 crítico)');
+    // La generación de un curso ya bloqueado no depende del interruptor (los vínculos son datos guardados, no derivados).
+    const AB = L('modules/academic-context/alignment-brief.js');
+    let n = 0; const uuid = () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`;
+    const mid = uuid();
+    const snap = SNAP.buildBlueprintSnapshotV2({ id: 1, title: 'x', finalExam: true, activityEngine: 'h5p', academicContext: AC.academicBlueprintContext(ctx.ingles6) },
+      [{ id: mid, position: 0, title: 'M', objective: null, exam_enabled: true }],
+      [{ id: uuid(), module_id: mid, position: 0, title: 'Saludos', objective: null, video_enabled: true, activity_enabled: true, outcome_ids: ['RA2'] }, { id: uuid(), module_id: mid, position: 1, title: 'Práctica', objective: null, video_enabled: false, activity_enabled: true, chapter_kind: 'practice' }]);
+    const items = [{ type: 'application_activity', moduleId: mid, chapterId: snap.modules[0].chapters[1].id }, { type: 'final_exam', moduleId: null, chapterId: null }];
+    const off = JSON.stringify(items.map((it) => AB.itemOutcomeIds(snap, it)));
+    process.env.DYNAMIC_REAL_CHAPTERS = 'true';
+    const on = JSON.stringify(items.map((it) => AB.itemOutcomeIds(snap, it)));
+    delete process.env.DYNAMIC_REAL_CHAPTERS;
+    eq(on, off, 'brief y huellas de un Blueprint congelado: iguales con y sin el interruptor');
+  });
+
   await check('RC9 edad desde el grado escolar del documento (inferido, visible); sin grado, nada', () => {
     process.env.DYNAMIC_REAL_CHAPTERS = 'true';
     try {
@@ -339,6 +361,11 @@ function assertRealDesign(name, st, d, pr) {
       const s6 = CD.suggestProfileFromContext(ctx.ingles6, null);
       eq([s6.profile.learner.ageGroup, s6.changes.find((c) => c.path === 'learner.ageGroup').source], ['children', 'inferred'], 'grado 6.º → niños (inferido)');
       for (const k of ['excel40', 'sst100', 'conta60', 'enf120']) eq(CD.suggestProfileFromContext(ctx[k], null).profile.learner.ageGroup, null, `${k}: sin grado escolar no se sugiere edad`);
+      const fake = (subject, level, extra) => ({ ...ctx.ingles6, identity: { ...ctx.ingles6.identity, subjectName: { ...ctx.ingles6.identity.subjectName, value: subject }, educationLevel: { ...ctx.ingles6.identity.educationLevel, value: level } }, additionalInfo: { ...ctx.ingles6.additionalInfo, value: extra } });
+      eq(CD.schoolGradeOf(fake('Matemáticas de sexto grado', { text: 'Básica secundaria', level: 'secondary' }, [])), 6, '«sexto grado»');
+      eq(CD.schoolGradeOf(fake('Cuidado de heridas', { text: 'Técnico laboral', level: 'technical' }, ['Grado: 2', 'Úlceras por presión grado 2'])), null, 'sin contexto escolar no hay grado (úlceras grado 2)');
+      eq(CD.schoolGradeOf(fake('Grado en Enfermería', { text: 'Universitario', level: 'university' }, [])), null, '«Grado en Enfermería» (título universitario)');
+      eq(CD.schoolGradeOf(fake('Ciencias 7', { text: 'Educación básica', level: 'basic' }, ['Clasificación de quemaduras grado 3', 'Grado: Séptimo'])), 7, 'solo el campo «Grado:»');
       const keep = CD.suggestProfileFromContext(ctx.ingles6, { ...CD.suggestProfileFromContext(ctx.ingles6, null).profile, learner: { ...s6.profile.learner, ageGroup: 'teens' } });
       eq(keep.profile.learner.ageGroup, 'teens', 'lo que eligió el docente se respeta');
     } finally { delete process.env.DYNAMIC_REAL_CHAPTERS; }

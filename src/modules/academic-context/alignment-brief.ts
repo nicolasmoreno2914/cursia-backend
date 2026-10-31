@@ -1,7 +1,6 @@
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { AcademicBlueprintOutcome } from './blueprint-academic';
 import { sortOutcomeIds } from './blueprint-academic';
-import { realChaptersEnabled } from '../study-time/topic-split';
 
 /**
  * Fase 3 · Loop 3.5 — resultados de aprendizaje que cada item del Manifest debe evidenciar, leídos del Blueprint
@@ -38,28 +37,13 @@ export interface ItemOutcome {
 
 const CHAPTER_TYPES = new Set(['content', 'experience', 'activity', 'video_interactions', 'application_activity', 'guided_practice']);
 
-/**
- * r80 · resultados TRANSVERSALES: los resultados de aprendizaje del contexto congelado que ningún capítulo de contenido
- * trabaja. El documento los declara para todo el curso (p. ej. «formular y responder preguntas básicas») y no los ata a
- * una unidad, así que ningún contenido los nombra. No se pegan a un capítulo de contenido que no les corresponde: los
- * evidencian las prácticas integradoras (cada una integra su módulo) y el examen final. Solo con DYNAMIC_REAL_CHAPTERS
- * (apagado: [] y todo exactamente como antes). Incluye las competencias del documento (la «unidad de competencia» del
- * curso): sin el interruptor siguen con su regla de siempre (A1c, advertencia).
- */
-export function transversalOutcomeIds(snapshot: BlueprintSnapshotV2, enabled = realChaptersEnabled()): string[] {
-  const ctx = snapshot.course.academicContext;
-  if (!enabled || !ctx) return [];
-  const linked = new Set(snapshot.modules.flatMap((m) => m.chapters.filter((c) => c.kind !== 'practice').flatMap((c) => c.outcomeIds ?? [])));
-  return sortOutcomeIds([...ctx.outcomes.map((o) => o.id), ...ctx.competencies.map((c) => c.id)].filter((id) => !linked.has(id)));
-}
-
 function chapterLinks(snapshot: BlueprintSnapshotV2, chapterId: string): string[] {
   for (const m of snapshot.modules) {
     const c = m.chapters.find((x) => x.id === chapterId);
     if (!c) continue;
     if (c.outcomeIds?.length) return c.outcomeIds;
     if (c.kind === 'practice') {
-      return sortOutcomeIds([...new Set([...m.chapters.filter((x) => x.kind !== 'practice').flatMap((x) => x.outcomeIds ?? []), ...transversalOutcomeIds(snapshot)])]);
+      return sortOutcomeIds([...new Set(m.chapters.filter((x) => x.kind !== 'practice').flatMap((x) => x.outcomeIds ?? []))]);
     }
     return [];
   }
@@ -75,7 +59,7 @@ export function itemOutcomeIds(snapshot: BlueprintSnapshotV2, item: AlignmentIte
     return m ? sortOutcomeIds([...new Set(m.chapters.flatMap((c) => c.outcomeIds ?? []))]) : [];
   }
   if (item.type === 'course_plan' || item.type === 'course_intro' || item.type === 'final_exam') {
-    return sortOutcomeIds([...new Set([...snapshot.modules.flatMap((m) => m.chapters.flatMap((c) => c.outcomeIds ?? [])), ...transversalOutcomeIds(snapshot)])]);
+    return sortOutcomeIds([...new Set(snapshot.modules.flatMap((m) => m.chapters.flatMap((c) => c.outcomeIds ?? [])))]);
   }
   return [];
 }

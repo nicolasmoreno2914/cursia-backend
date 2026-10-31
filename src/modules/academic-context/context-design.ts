@@ -106,15 +106,19 @@ const clip = (s: string, max: number) => (s.length <= max ? s : `${s.slice(0, ma
 const GRADE_WORDS: Readonly<Record<string, number>> = Object.freeze({ primero: 1, segundo: 2, tercero: 3, cuarto: 4, quinto: 5, sexto: 6, septimo: 7, octavo: 8, noveno: 9, decimo: 10, undecimo: 11, once: 11 });
 /** Grado escolar (1–11) que nombra el documento en su identificación; null si no nombra uno claro. */
 export function schoolGradeOf(ctx: AcademicContextV1): number | null {
-  const texts = [ctx.identity.subjectName.value, ctx.identity.educationLevel.value?.text, ...(Array.isArray(ctx.additionalInfo?.value) ? ctx.additionalInfo.value : [])]
-    .filter((x): x is string => typeof x === 'string')
-    .map((t) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''));
+  // Solo con contexto ESCOLAR (nivel básica / secundaria / primaria / bachillerato): «úlceras grado 2» o «Grado en
+  // Enfermería» (título universitario) no son grados escolares. Solo el nombre del curso y el campo «Grado:».
+  const norm = (t: string) => t.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const lv = ctx.identity.educationLevel.value;
+  const school = !!lv && (lv.level === 'basic' || lv.level === 'secondary' || /basica|primaria|secundaria|bachillerato|colegio|escolar/.test(norm(lv.text || '')));
+  if (!school) return null;
+  const extra = (Array.isArray(ctx.additionalInfo?.value) ? ctx.additionalInfo.value : []).filter((x) => /^\s*grado\s*:/i.test(String(x)));
+  const texts = [ctx.identity.subjectName.value, ...extra].filter((x): x is string => typeof x === 'string').map(norm);
   const found = new Set<number>();
+  const add = (w: string) => { const g = /^\d+$/.test(w) ? Number(w) : GRADE_WORDS[w]; if (g && g >= 1 && g <= 11) found.add(g); };
   for (const t of texts) {
-    for (const m of t.matchAll(/\bgrado\s*:?\s*(\d{1,2}|[a-z]+)\b/g)) {
-      const g = /^\d+$/.test(m[1]) ? Number(m[1]) : GRADE_WORDS[m[1]];
-      if (g && g >= 1 && g <= 11) found.add(g);
-    }
+    for (const m of t.matchAll(/\bgrado\s*:?\s*(\d{1,2}|[a-z]+)\b/g)) add(m[1]);
+    for (const m of t.matchAll(/\b(\d{1,2})\s*(?:o|º|°)?\s*grado\b|\b([a-z]+)\s+grado\b/g)) add(m[1] || m[2]);
   }
   return found.size === 1 ? [...found][0] : null;
 }
@@ -223,6 +227,21 @@ export interface ContextStructureProposal {
 /** Coincidencia léxica mínima para inferir un vínculo contenido → resultado (contención de tokens del contenido). */
 export const LINK_CONTAINMENT_MIN = 0.5;
 export const LINK_JACCARD_MIN = 0.2;
+
+/**
+ * r80 · resultados TRANSVERSALES: los que ningún capítulo de contenido vincula NI nombra (ningún capítulo comparte términos
+ * con ellos). Son los que el documento declara para todo el curso («formular y responder preguntas básicas»); los
+ * evidencian las prácticas integradoras, que integran su módulo (y, con ellas, el examen final). Uno que SÍ comparte
+ * términos con un capítulo es un vínculo olvidado: no es transversal y sigue siendo un vacío crítico (A1).
+ */
+export function transversalOutcomeIds(outcomes: { id: string; text: string }[], contentChapters: { title: string; description?: string | null; outcomeIds?: readonly string[] | null }[]): string[] {
+  const linked = new Set(contentChapters.flatMap((c) => c.outcomeIds ?? []));
+  const texts = contentChapters.map((c) => `${c.title} ${c.description ?? ''}`);
+  // Un resultado de aprendizaje que comparte AUNQUE SEA un término con un capítulo no es transversal (vínculo olvidado:
+  // sigue A1 crítico). Las competencias del documento son del curso por naturaleza (A1c): sin vínculos, transversales.
+  const named = (o: { id: string; text: string }) => !/^CO/.test(o.id) && texts.some((t) => tokenContainment(t, o.text) > 0);
+  return outcomes.filter((o) => !linked.has(o.id) && !named(o)).map((o) => o.id).sort(cmpOutcome);
+}
 
 /** Resultados cuyo texto comparte términos con `text` (inferido). Orden: mejor coincidencia primero, máx. 3. */
 export function lexicalOutcomeMatches(text: string, outcomes: { id: string; text: string }[]): string[] {

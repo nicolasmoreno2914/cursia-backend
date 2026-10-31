@@ -1,7 +1,7 @@
 import { observableLevelOf } from '../academic-context/bloom';
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { GenerationManifestV1, ManifestItem } from '../generation-manifests/generation-manifest-builder';
-import { itemOutcomeIds, transversalOutcomeIds } from '../academic-context/alignment-brief';
+import { itemOutcomeIds } from '../academic-context/alignment-brief';
 import type { AcademicBlueprintContext } from '../academic-context/blueprint-academic';
 import { isPerformanceLevel } from '../academic-context/bloom';
 import type { PedagogicalApproachRegistry } from '../pedagogy/approach-registry';
@@ -9,6 +9,7 @@ import { defaultApproachRegistry } from '../pedagogy/builtin-approaches';
 import { PEDAGOGICAL_DIMENSIONS, PedagogicalDimension } from '../pedagogy/vocabulary';
 import type { StudyTimeEstimate } from '../study-time/time-model';
 import { sha256Canonical } from './canonical-json';
+import { realChaptersEnabled } from '../study-time/topic-split';
 
 /**
  * Fase 4 — Coherence Engine, capa A (alineación). Spec: docs/superpowers/specs/2026-10-06-coherence-alignment-design.md.
@@ -275,8 +276,6 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
   // ── Reglas ──
   const findings: Omit<AlignmentFinding, 'id'>[] = [];
   const add = (f: Omit<AlignmentFinding, 'id'>) => findings.push(f);
-  // r80 · un resultado transversal con evidencia (prácticas integradoras / examen final) se dice, nunca en silencio.
-  const transversal = new Set(transversalOutcomeIds(snapshot));
   for (const o of outcomes.values()) {
     const has = (k: EvidenceKind) => o.evidence.some((e) => e.kind === k);
     const label = o.domain === 'competency' ? 'La competencia' : 'El resultado';
@@ -288,13 +287,12 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
       // Review F4 I2: los documentos suelen declarar las competencias para todo el curso, sin atarlas a unidades, y
       // Cursia no propone vínculos de competencias. No es un vacío crítico: se evidencian de forma transversal.
       add({ rule: 'A1c', severity: 'warning', outcomeIds: [o.id], moduleIds: [], chapterIds: [], message: `La competencia ${o.id} («${short(o.text)}») no está vinculada a ningún capítulo: solo se evidenciaría de forma transversal.`, suggestion: 'Vincúlala a los capítulos o Actividades de Aplicación donde se pone en juego, para que el curso la trabaje y la evalúe de forma explícita.', evidence: { outcomeId: o.id } });
-    } else if (!taught && transversal.has(o.id)) {
-      add({ rule: 'A1', severity: 'critical', outcomeIds: [o.id], moduleIds: [], chapterIds: [], message: `${label} ${o.id} («${short(o.text)}») es de todo el curso y ningún capítulo lo trabaja: el curso no tiene prácticas integradoras que lo evidencien.`, suggestion: 'Agrega una práctica integradora por módulo (el diseño la propone) o vincúlalo a los capítulos que lo trabajan.', evidence: { outcomeId: o.id } });
     } else if (!taught) {
       add({ rule: 'A1', severity: 'critical', outcomeIds: [o.id], moduleIds: [], chapterIds: [], message: `${label} ${o.id} («${short(o.text)}») no está ${f ? 'cubierta' : 'cubierto'} por ningún capítulo.`, suggestion: 'Vincúlalo a los capítulos que lo trabajan o agrega un capítulo que lo desarrolle.', evidence: { outcomeId: o.id } });
     } else {
-      if (transversal.has(o.id)) {
-        add({ rule: 'A1t', severity: 'suggestion', outcomeIds: [o.id], moduleIds, chapterIds: o.chapterIds, message: `${label} ${o.id} («${short(o.text)}») es de todo el curso: se evidencia en las prácticas integradoras de cada módulo y en el examen final.`, suggestion: 'Si algún capítulo de contenido lo trabaja de forma directa, vincúlalo también a ese capítulo.', evidence: { outcomeId: o.id } });
+      // r80 · un resultado que solo trabajan las prácticas integradoras (transversal del curso) se dice, nunca en silencio.
+      if (realChaptersEnabled() && o.chapterIds.length && o.chapterIds.every((id) => practiceChapters.has(id))) {
+        add({ rule: 'A1t', severity: 'suggestion', outcomeIds: [o.id], moduleIds, chapterIds: o.chapterIds, message: `${label} ${o.id} («${short(o.text)}») es de todo el curso: lo evidencian las prácticas integradoras de cada módulo y el examen final, no un capítulo de contenido.`, suggestion: 'Si algún capítulo de contenido lo trabaja de forma directa, vincúlalo también a ese capítulo.', evidence: { outcomeId: o.id } });
       }
       if (!has('assessment') && !has('application')) {
         add({ rule: 'A2', severity: 'warning', outcomeIds: [o.id], moduleIds, chapterIds: o.chapterIds, message: `${label} ${o.id} no tiene ninguna evaluación que ${f ? 'la' : 'lo'} verifique.`, suggestion: 'Activa el examen del módulo donde se trabaja o agrega una Actividad de Aplicación con criterios.', evidence: { outcomeId: o.id } });

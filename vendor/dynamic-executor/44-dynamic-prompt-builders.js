@@ -2063,7 +2063,7 @@ function _dynApplicationAgeBlock(app) {
     + '\n- organízala en tramos de máximo ' + (kids ? '20' : '30') + ' minutos (cada ejemplo, bloque de ejercicios o hito del taller es un tramo que se puede hacer en una sesión y termina con algo hecho);'
     + '\n- consignas breves y concretas: una acción por consigna, frases cortas' + (kids ? ' y, en los ejercicios básicos, un ejemplo de respuesta' : '') + ';'
     + '\n- situaciones de su vida (' + (kids ? 'casa, colegio, amigos, juegos' : 'colegio, amigos, aficiones, su barrio') + '), nunca del trabajo ni de empresas;'
-    + '\n- entregables propios de su edad (p. ej. diálogo escrito, audio corto, póster o tarjeta, tabla' + (kids ? ' con dibujos' : '') + '), nunca informes formales, hojas de cálculo ni código;'
+    + '\n- entregables propios de su edad (p. ej. diálogo escrito, audio corto, póster o tarjeta, tabla' + (kids ? ' con dibujos' : '') + '), no informes formales de oficina (si el curso trabaja una herramienta, el producto se hace con ella a su nivel);'
     + '\n- criterios de evaluación y autoevaluación en palabras que el estudiante entienda.';
 }
 
