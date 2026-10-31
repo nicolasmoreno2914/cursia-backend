@@ -402,6 +402,23 @@ async function runWorker(script, env, { waitMs, until, failRelation } = {}) {
     }
   });
 
+  await check('(a) producción: cursia-brand-worker en prod-release.sh — PROD_ALL_NAMES (presencia/estabilidad) + PROD_PROCESSES_NODE (node directo dist/workers/brand-extraction-worker.js, kill_timeout fijo 300 s), recargado con --update-env por ensure_pm2_drain_worker, nunca por npm ni por drain-dynamic', () => {
+    const sh = readWf(PROD_RELEASE_SH);
+    const arr = (n) => { const m = new RegExp(`^${n}=\\(([\\s\\S]*?)\\)`, 'm').exec(sh); assert(m, `falta ${n}`); return m[1]; };
+    assert(/(^|\s)cursia-brand-worker(\s|$)/.test(arr('PROD_ALL_NAMES')), 'PROD_ALL_NAMES sin cursia-brand-worker');
+    eq(arr('PROD_ALL_NAMES').trim().split(/\s+/).length, 12, 'PROD_ALL_NAMES: 12 procesos');
+    eq(arr('PROD_PROCESSES_NODE').trim(), '"cursia-brand-worker dist/workers/brand-extraction-worker.js"', 'PROD_PROCESSES_NODE');
+    assert(!/cursia-brand-worker/.test(arr('PROD_PROCESSES_DRAIN')) && !/cursia-brand-worker/.test(arr('PROD_PROCESSES_LEGACY')), 'solo en PROD_PROCESSES_NODE');
+    assert(/^BRAND_KILL_TIMEOUT_MS=300000$/m.test(sh), 'BRAND_KILL_TIMEOUT_MS=300000');
+    const reload = /reload_all_processes\(\) \{([\s\S]*?)\n\}/.exec(sh)[1];
+    assert(/for entry in "\$\{PROD_PROCESSES_NODE\[@\]\}"/.test(reload) && /DRAIN_KILL_TIMEOUT_MS="\$BRAND_KILL_TIMEOUT_MS"\s*\n\s*ensure_pm2_drain_worker "\$name" "\$arg"/.test(reload), 'reload_all_processes recarga PROD_PROCESSES_NODE con su kill_timeout');
+    assert(/for entry in "\$\{PROD_PROCESSES_NODE\[@\]\}"/.test(/detect_preexisting_loops\(\) \{([\s\S]*?)\n\}/.exec(sh)[1]), 'bucle previo del worker de marca = aviso');
+    assert(!/PROD_PROCESSES_NODE/.test(/cmd_drain_dynamic\(\) \{([\s\S]*?)\n\}/.exec(sh)[1]), 'drain-dynamic no lo detiene');
+    const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf8'));
+    eq(pkg.scripts['start:brand-worker'], 'node dist/workers/brand-extraction-worker.js', 'package.json start:brand-worker');
+    assert(fs.existsSync(path.join(distRoot, 'workers', 'brand-extraction-worker.js')), 'dist/workers/brand-extraction-worker.js no existe');
+  });
+
   await check('(a) deploy-staging.yml: arranca/recarga los 3 workers dinámicos -staging con PM2 en el step de los workers (R16: node directo + kill_timeout 300 s)', () => {
     const step = pm2StepOf(stagingText, 'deploy-staging.yml');
     const script = assertWorkersInStep(step, '-staging', 'deploy-staging.yml', true);

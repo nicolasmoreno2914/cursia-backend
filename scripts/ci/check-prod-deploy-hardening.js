@@ -50,7 +50,11 @@ const STAGING_ONLY_CHECKS = {
 };
 const PROD_NAMES = ['cursia-backend', 'cursia-content-worker', 'cursia-video-worker', 'cursia-audio-worker', 'cursia-h5p-worker',
   'cursia-gamma-worker', 'cursia-package-worker', 'cursia-full-worker', 'cursia-dynamic-item-worker',
-  'cursia-dynamic-package-worker', 'cursia-dynamic-provider-worker'];
+  'cursia-dynamic-package-worker', 'cursia-dynamic-provider-worker', 'cursia-brand-worker'];
+// Los 3 workers dinámicos de V2 (drenado; drain-dynamic) y el worker de marca (node directo, kill_timeout fijo).
+const PROD_DYNAMIC = PROD_NAMES.slice(8, 11);
+const BRAND = 'cursia-brand-worker';
+const BRAND_SCRIPT = 'dist/workers/brand-extraction-worker.js';
 const SECRET = 'finops-secreto-de-prueba-NUNCA-impreso';
 const OWNER = '11111111-2222-4333-8444-555555555555';
 
@@ -432,20 +436,21 @@ function mkFakeVps() {
   const jl = PROD_NAMES.map((n) => ({
     name: n,
     pm2_env: { status: 'online', restart_time: 0, env: { SECRET_IN_ENV: 'nunca-impreso' },
-      pm_exec_path: n.startsWith('cursia-dynamic-') ? `${app}/dist/workers/${n.replace(/^cursia-/, '')}.js` : '/usr/bin/npm',
-      kill_timeout: n.startsWith('cursia-dynamic-') ? 300000 : 1600 },
+      pm_exec_path: n.startsWith('cursia-dynamic-') ? `${app}/dist/workers/${n.replace(/^cursia-/, '')}.js` : n === BRAND ? `${app}/${BRAND_SCRIPT}` : '/usr/bin/npm',
+      kill_timeout: n.startsWith('cursia-dynamic-') || n === BRAND ? 300000 : 1600 },
   }));
   jl.push({ name: 'cursia-backend-staging', pm2_env: { status: 'errored', restart_time: 99 } }, { name: 'videogen-api', pm2_env: { status: 'stopped', restart_time: 3 } });
   w(jlist, JSON.stringify(jl));
   return { root, bin, app, log, jlist };
 }
-function writeRelease(app, tag, { drainHelper = true, dynamicWorkers = true } = {}) {
+function writeRelease(app, tag, { drainHelper = true, dynamicWorkers = true, brandWorker = true } = {}) {
   for (const d of ['dist/workers', 'scripts/prod', 'scripts/ops']) fs.mkdirSync(path.join(app, d), { recursive: true });
   fs.writeFileSync(path.join(app, 'dist/main.js'), `// release ${tag}\n`);
   for (const n of ['dynamic-item-worker', 'dynamic-package-worker', 'dynamic-provider-worker']) {
     const p = path.join(app, `dist/workers/${n}.js`);
     if (dynamicWorkers) fs.writeFileSync(p, `// ${n} ${tag}\n`); else fs.rmSync(p, { force: true });
   }
+  if (brandWorker) fs.writeFileSync(path.join(app, BRAND_SCRIPT), `// brand ${tag}\n`); else fs.rmSync(path.join(app, BRAND_SCRIPT), { force: true });
   for (const m of ['migrate-production-jobs-constraints', 'migrate-usage-events-costs']) {
     fs.writeFileSync(path.join(app, `scripts/${m}.js`), `require('fs').appendFileSync(process.env.CALLS, 'node ${m} ${tag}\\n');\n`);
   }
@@ -501,12 +506,14 @@ async function shellChecks() {
       assert(at('node migrate-production-jobs-constraints A') > at('npm install --omit=dev') && at('node migrate-usage-events-costs A') > 0, 'migraciones de siempre');
       assert(at('pm2 reload cursia-backend --update-env') > at('node migrate-usage-events-costs A'), 'PM2 después de migrar');
       for (const n of PROD_NAMES.slice(1, 8)) assert(calls.includes(`pm2 restart ${n} --update-env`), `legacy ${n}`);
-      for (const n of PROD_NAMES.slice(8)) assert(calls.includes(`pm2 reload ${n} --update-env`) && !calls.includes(`pm2 delete ${n}`), `drenado ${n} ya configurado → reload`);
-      assert(calls.indexOf('pm2 save') > calls.indexOf('pm2 reload cursia-dynamic-provider-worker --update-env'), 'pm2 save al final');
+      for (const n of PROD_DYNAMIC) assert(calls.includes(`pm2 reload ${n} --update-env`) && !calls.includes(`pm2 delete ${n}`), `drenado ${n} ya configurado → reload`);
+      assert(calls.includes(`pm2 reload ${BRAND} --update-env`) && !calls.includes(`pm2 delete ${BRAND}`), 'worker de marca ya configurado → reload --update-env');
+      assert(calls.indexOf('pm2 save') > calls.indexOf(`pm2 reload ${BRAND} --update-env`), 'pm2 save al final');
       assert(calls.includes('node v2-schema-probes A'), 'sondas de la base tras el deploy');
       assert(!calls.some((c) => /staging|videogen/.test(c)), 'no toca procesos ajenos');
       eq(fs.readFileSync(path.join(vps.app, '.release-sha'), 'utf8').trim(), 'abcdef1', '.release-sha');
-      assert(/✓ cursia-dynamic-provider-worker/.test(r.out) && !/cursia-backend-staging/.test(r.out), 'presencia solo de los 11 de producción');
+      assert(/✓ cursia-dynamic-provider-worker/.test(r.out) && /✓ cursia-brand-worker/.test(r.out) && !/cursia-backend-staging/.test(r.out), 'presencia solo de los 12 de producción');
+      assert(/Presencia de los 12 procesos/.test(r.out), 'los 12 en la presencia');
     });
 
     await check('[SH] install idempotente: segunda corrida no cambia el .env', () => {
@@ -525,6 +532,49 @@ async function shellChecks() {
       fs.writeFileSync(vps.jlist, saved);
       eq(r.status, 0, r.out);
       assert(r.calls.includes('pm2 delete cursia-dynamic-item-worker') && r.calls.includes('pm2 start dist/workers/dynamic-item-worker.js --name cursia-dynamic-item-worker --kill-timeout 300000'), r.calls.join('\n'));
+    });
+
+    await check('[SH] cursia-brand-worker (pool DB_POOL_*_WORKER): node directo con kill_timeout FIJO 300 s — heredado (npm run) → delete + start UNA vez; ausente → start; IA de V2 encendida no le cambia el kill_timeout; drain-dynamic no lo toca; bucle previo = aviso; crash loop nuevo → install falla; release sin el archivo → se detiene y sale de la presencia', () => {
+      const saved = fs.readFileSync(vps.jlist, 'utf8');
+      const setBrand = (pm2_env) => { const jl = JSON.parse(saved); jl.find((p) => p.name === BRAND).pm2_env = pm2_env; fs.writeFileSync(vps.jlist, JSON.stringify(jl)); };
+      const start = `pm2 start ${BRAND_SCRIPT} --name ${BRAND} --kill-timeout 300000`;
+      try {
+        setBrand({ status: 'online', restart_time: 0, pm_exec_path: '/usr/bin/npm', kill_timeout: 1600 });
+        let r = runSh(vps, ['install'], { input: cfgInput() });
+        eq(r.status, 0, r.out);
+        assert(r.calls.includes(`pm2 delete ${BRAND}`) && r.calls.includes(start), `heredado: ${r.calls.join(' | ')}`);
+        assert(!r.calls.some((c) => /^pm2 start npm --name cursia-brand-worker/.test(c)), 'nunca por npm');
+        fs.writeFileSync(vps.jlist, saved);
+        r = runSh(vps, ['install'], { input: cfgInput(), env: { PM2_EXISTS: PROD_NAMES.filter((n) => n !== BRAND).join(' ') } });
+        eq(r.status, 0, r.out);
+        assert(r.calls.includes(start), `ausente → start: ${r.calls.join(' | ')}`);
+        // IA de V2 encendida: los dinámicos se recrean con 990000; el de marca sigue en 300000 → reload.
+        r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true', llm: 'true' }) });
+        eq(r.status, 0, r.out);
+        assert(r.calls.includes(`pm2 reload ${BRAND} --update-env`) && !r.calls.includes(`pm2 delete ${BRAND}`), `IA encendida: ${r.calls.join(' | ')}`);
+        assert(r.calls.includes('pm2 start dist/workers/dynamic-item-worker.js --name cursia-dynamic-item-worker --kill-timeout 990000'), 'los dinámicos sí suben');
+        r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true' }) });
+        eq(r.status, 0, r.out);
+        r = runSh(vps, ['drain-dynamic', vps.app], { stdinScript: true });
+        eq(r.status, 0, r.out);
+        assert(!r.calls.includes(`pm2 stop ${BRAND}`), 'drain-dynamic solo detiene V2');
+        // Bucle previo del worker de marca (nunca lo recargaba el deploy) → aviso; uno nuevo tras el deploy → falla.
+        r = runSh(vps, ['install'], { input: cfgInput(), env: { BUMP_ON_SLEEP: '1', BUMP_NAME: BRAND } });
+        assert(r.status === 0 && /cursia-brand-worker ya se reiniciaba en bucle ANTES del deploy/.test(r.out), r.out);
+        fs.writeFileSync(vps.jlist, saved);
+        r = runSh(vps, ['install'], { input: cfgInput(), env: { BUMP_ON_SLEEP: '1', BUMP_NAME: BRAND, BUMP_FROM: '2' } });
+        assert(r.status === 1 && /cursia-brand-worker.*se reinició/.test(r.out), r.out);
+        fs.writeFileSync(vps.jlist, saved);
+        fs.rmSync(path.join(vps.app, '.release-state'), { force: true });
+        // Release sin dist/workers/brand-extraction-worker.js → se detiene (no crash loop) y no se exige en la presencia.
+        writeRelease(vps.app, 'A', { brandWorker: false });
+        r = runSh(vps, ['install'], { input: cfgInput() });
+        eq(r.status, 0, r.out);
+        assert(r.calls.includes(`pm2 stop ${BRAND}`) && !r.calls.includes(start) && /Presencia de los 11 procesos/.test(r.out), r.out);
+      } finally {
+        fs.writeFileSync(vps.jlist, saved);
+        writeRelease(vps.app, 'A');
+      }
     });
 
     await check('[SH] install con canario + workers: V2 SOLO para el owner, reglas v3/actividad 2, instantes congelados, workers de gasto ON; DYNAMIC_WORKERS_HOLD=true los apaga', () => {
@@ -567,7 +617,7 @@ async function shellChecks() {
       let env = envMap(vps.app);
       eq([env.DYNAMIC_LLM_WORKER_ENABLED, env.DYNAMIC_WORKER_DRAIN_TIMEOUT_MS, env.DYNAMIC_LLM_WORKER_CONCURRENCY], ['true', '960000', '4'], 'IA encendida');
       assert(/^\d{4}-\d\d-\d\dT/.test(env.DYNAMIC_LLM_WORKER_SINCE), 'instante de activación');
-      for (const n of PROD_NAMES.slice(8)) {
+      for (const n of PROD_DYNAMIC) {
         const script = `dist/workers/${n.replace(/^cursia-/, '')}.js`;
         assert(r.calls.includes(`pm2 delete ${n}`) && r.calls.includes(`pm2 start ${script} --name ${n} --kill-timeout 990000`), `${n}: ${r.calls.join(' | ')}`);
       }
@@ -580,7 +630,7 @@ async function shellChecks() {
       r = runSh(vps, ['install'], { input: cfgInput({ canary: OWNER, workers: 'true' }) });
       eq([envMap(vps.app).DYNAMIC_LLM_WORKER_ENABLED, envMap(vps.app).DYNAMIC_WORKER_DRAIN_TIMEOUT_MS], ['false', '270000'], 'apagado');
       // Con el jlist en 300000 (fake) no se recrea nada: reload con drenado (SIGINT + kill_timeout).
-      for (const n of PROD_NAMES.slice(8)) assert(r.calls.includes(`pm2 reload ${n} --update-env`) && !r.calls.includes(`pm2 delete ${n}`), `${n} reload`);
+      for (const n of PROD_DYNAMIC) assert(r.calls.includes(`pm2 reload ${n} --update-env`) && !r.calls.includes(`pm2 delete ${n}`), `${n} reload`);
       // review r62 I1: rollback EJECUTADO con la IA encendida en el .env → los 3 workers dinámicos se recrean con
       // --kill-timeout 990000 (jlist en 300000) desde la release restaurada; nunca npm ni migraciones.
       fs.writeFileSync(path.join(vps.app, '.env'), 'NODE_ENV=production\nVIDEO_WORKER_ENABLED=true\nGAMMA_API_KEY=x\nDYNAMIC_LLM_WORKER_ENABLED=true\n');
@@ -590,7 +640,7 @@ async function shellChecks() {
       r = runSh(vps, ['rollback', vps.app], { stdinScript: true });
       eq(r.status, 0, r.out);
       assert(/kill_timeout|990000/.test(r.calls.join(' ')), r.calls.join(' | '));
-      for (const n of PROD_NAMES.slice(8)) {
+      for (const n of PROD_DYNAMIC) {
         const script = `dist/workers/${n.replace(/^cursia-/, '')}.js`;
         assert(r.calls.includes(`pm2 delete ${n}`) && r.calls.includes(`pm2 start ${script} --name ${n} --kill-timeout 990000`), `rollback ${n}: ${r.calls.join(' | ')}`);
       }
@@ -599,7 +649,7 @@ async function shellChecks() {
       // Y el drenado previo del auto-rollback (drain-dynamic) detiene los 3 con el kill_timeout de la release.
       r = runSh(vps, ['drain-dynamic', vps.app], { stdinScript: true });
       assert(r.status === 0 && /kill_timeout hasta 990000 ms/.test(r.out), r.out);
-      for (const n of PROD_NAMES.slice(8)) assert(r.calls.includes(`pm2 stop ${n}`), `drain ${n}`);
+      for (const n of PROD_DYNAMIC) assert(r.calls.includes(`pm2 stop ${n}`), `drain ${n}`);
       assert(!r.calls.some((c) => /pm2 (stop|restart|delete) cursia-(backend|content|video|audio|h5p|gamma|package|full)/.test(c)), 'drain-dynamic no toca V1');
       for (const d of ['.release-prev', '.release-failed']) fs.rmSync(path.join(vps.app, d), { recursive: true, force: true });
       for (const f of ['.release-state', '.release-sha']) fs.rmSync(path.join(vps.app, f), { force: true });
@@ -810,7 +860,8 @@ async function shellChecks() {
       let r = runSh(vps, ['rollback', app], { stdinScript: true });
       fs.writeFileSync(vps.jlist, saved);
       eq(r.status, 0, r.out);
-      for (const n of PROD_NAMES.slice(8)) assert(r.calls.includes(`pm2 stop ${n}`), `detiene ${n}`);
+      for (const n of PROD_DYNAMIC) assert(r.calls.includes(`pm2 stop ${n}`), `detiene ${n}`);
+      assert(r.calls.includes(`pm2 reload ${BRAND} --update-env`) && !r.calls.includes(`pm2 stop ${BRAND}`), 'worker de marca de la release restaurada: reload --update-env');
       assert(!fs.existsSync(path.join(app, 'dist/workers/dynamic-item-worker.js')), 'release V1 restaurada');
       r = runSh(vps, ['mark-ok', app, 'restored'], { stdinScript: true });
       eq([r.status, fs.readFileSync(path.join(app, '.release-state'), 'utf8').trim()], [0, 'ok pre-r61'], 'pre-r61 marcada sana');

@@ -856,6 +856,8 @@ jobs:
                # Loop 4: el worker de IA (dist/workers/dynamic-llm-worker.js) NO se levanta todavía: un 12.º proceso supera el
                # cupo de clientes del pooler de staging (15; ver check-db-pool-capacity). Activarlo es una decisión aparte
                # (cupo del pooler + DYNAMIC_LLM_WORKER_ENABLED en API y worker), con aprobación del usuario.
+               # Mismo motivo para el worker de marca (dist/workers/brand-extraction-worker.js): staging no lo levanta;
+               # producción sí (prod-release.sh, PROD_PROCESSES_NODE) con DB_POOL_MAX_WORKER.
                sudo pm2 save
                sudo pm2 status
                echo "━━━ Loop 6: arranque del worker de IA hospedado (líneas del log, sin secretos) ━━━"
