@@ -18,7 +18,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { executionLeaseView, ExecutionLeaseView, normalizeRequestingExecutorId } from '../reliability/execution-lease';
-import { LLM_WORKER_PRESENCE_STRICT_SECONDS, liveLlmWorkerCoverage, llmWorkerEnabled, routedTypesForRun, runServerExecuted } from './llm-worker-routing';
+import { LLM_WORKER_PRESENCE_STRICT_SECONDS, liveLlmWorkerCoverage, llmWorkerEnabled, previewServerExecution, routedTypesForRun, runServerExecuted } from './llm-worker-routing';
 import { DataSource } from 'typeorm';
 import type { QueryRunner } from 'typeorm';
 import { returningRows } from '../../common/db/returning-rows';
@@ -814,6 +814,8 @@ export interface StartPreview {
   rulesVersion: number;
   counts: PreviewCounts;
   existingRun: { id: string; status: string; active: boolean } | null;
+  /** r63: true = si se inicia ahora, el servidor ejecuta todo el run (la pestaña no hace falta). Ante la duda, false. */
+  serverExecution: boolean;
   estimate: {
     currency: string; min: string; expected: string; max: string;
     byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax>;
@@ -1250,7 +1252,7 @@ export class RunsService {
       this.assertV3ProviderPreflight(manifest, providerModes, videoMode, gate.ok ? gate.strategy : null);
     }
     const counts = previewCounts(manifest);
-    const base = { manifestId: manifest.id, blueprintNumber, rulesVersion: manifest.rulesVersion, counts };
+    const base = { manifestId: manifest.id, blueprintNumber, rulesVersion: manifest.rulesVersion, counts, serverExecution: await this.previewServerExecutionOf(manifest) };
     const empty = { estimate: null, decision: null, reasons: [], paidRealProviders: [], approval: null, policy: null, estimateHash: null };
     const latest = await this.findLatestRunRow(manifest.id);
     if (latest) {
@@ -6828,6 +6830,17 @@ export class RunsService {
       serverExecuted: await this.serverExecutedOf(job, manifest),
       legacyFinalExamDeps: manifestHasLegacyFinalExamDeps(manifest.manifest.items),
     };
+  }
+
+  /** r63: ¿un run nuevo de este Manifest lo ejecutaría todo el servidor? (cualquier error → false). */
+  private async previewServerExecutionOf(manifest: ManifestDto): Promise<boolean> {
+    if (!llmWorkerEnabled() || manifest.rulesVersion !== 3) return false;
+    try {
+      const coverage = await liveLlmWorkerCoverage(this.dataSource, Date.now(), LLM_WORKER_PRESENCE_STRICT_SECONDS);
+      return previewServerExecution(manifest.manifest.items.map((it) => String(it.type)), manifest.rulesVersion, coverage);
+    } catch {
+      return false;
+    }
   }
 
   /** Loop 9: ¿el servidor genera todas las partes de IA del run? (cobertura viva, cache 5 s; cualquier error → false). */

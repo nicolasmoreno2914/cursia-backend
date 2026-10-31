@@ -1,5 +1,7 @@
 import type { DataSource } from 'typeorm';
 import type { ItemType } from './scheduler.service';
+import { PROVIDER_WORKER_ITEM_TYPES, workersHoldActive } from './workers-hold';
+import { isProviderWorkerDeployed } from './provider-modes';
 
 /**
  * Loop 4 (llamadas largas): partes de IA LARGAS que, con el worker de IA del backend habilitado, salen del navegador
@@ -181,4 +183,23 @@ export function runServerExecuted(
   if (!llmWorkerEnabled(env)) return false;
   const llm = [...new Set(manifestItemTypes.filter((t) => t === 'scorm' || (ALL_LLM_WORKER_TYPES as readonly string[]).includes(t)))];
   return llm.length > 0 && llm.every((t) => routed.has(t));
+}
+
+/**
+ * r63 (UX, hallazgo 5): ¿el SERVIDOR ejecutará todo un run NUEVO de este Manifest? Se informa en la vista previa para que
+ * el aviso de «cerrar la pestaña» no diga «mantén esta pestaña abierta» cuando no hace falta. Misma lógica que
+ * `runServerExecuted` (cobertura viva estricta, creado «ahora» → posterior al instante de activación del worker), más:
+ * solo Manifest v3, sin HOLD de workers y, si el Manifest tiene partes de proveedor (Gamma/TTS), con el worker de
+ * proveedores desplegado. Ante cualquier duda → false (se mantiene el aviso de siempre, que es el seguro).
+ */
+export function previewServerExecution(
+  manifestItemTypes: readonly string[],
+  rulesVersion: number,
+  coverage: readonly LlmWorkerCoverage[],
+  now: number = Date.now(),
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  if (rulesVersion !== 3 || !llmWorkerEnabled(env) || workersHoldActive(env)) return false;
+  if (manifestItemTypes.some((t) => PROVIDER_WORKER_ITEM_TYPES.includes(String(t))) && !isProviderWorkerDeployed(env)) return false;
+  return runServerExecuted(manifestItemTypes, routedTypesForRun(coverage, new Date(now)), env);
 }
