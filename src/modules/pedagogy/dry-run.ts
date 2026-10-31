@@ -1,4 +1,5 @@
 import { academicOutcomeIds } from '../academic-context/academic-context';
+import { sortOutcomeIds } from '../academic-context/blueprint-academic';
 import { realChaptersEnabled } from '../study-time/topic-split';
 import { transversalOutcomeIds } from '../academic-context/context-design';
 import type { AcademicContextV1 } from '../academic-context/academic-context';
@@ -577,7 +578,7 @@ export function materializeDistribution(base: BlueprintSnapshotV2, dist: Distrib
       // r80: la parte de un contenido dividido hereda los resultados de ese contenido (si no tiene, los del módulo).
       // r80: la práctica integradora NUEVA evidencia su módulo y los resultados transversales del curso (si los hay).
       const inherited = c.kind === 'practice'
-        ? (transversal.length ? [...new Set([...moduleOutcomeIdsOfProposal(dist, m.id, (id) => byId.get(id)), ...transversal])].sort() : [])
+        ? (transversal.length ? sortOutcomeIds([...new Set([...moduleOutcomeIdsOfProposal(dist, m.id, (id) => byId.get(id)), ...transversal])]) : [])
         : c.split && c.split.outcomeIds.length ? [...c.split.outcomeIds] : moduleOutcomeIds(rows.chapters, m.id, knownOutcomes);
       chapters.push({
         id: proposedChapterUuid(c.id), module_id: m.id, position: ci, title: c.title, objective: c.objective, description: c.split ? c.description ?? null : null,

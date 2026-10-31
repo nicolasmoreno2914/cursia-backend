@@ -377,7 +377,7 @@ export class CourseStructureService implements OnModuleInit {
         const m = dist.modules.find((x) => x.id === moduleId);
         const set = new Set<string>(transversal);
         for (const c of m ? m.chapters : []) if (c.kind === 'content') for (const x of c.proposed ? (c.split ? c.split.outcomeIds : []) : linksOfRow(c.id)) set.add(x);
-        return [...set].sort();
+        return sortOutcomeIds([...set]);
       };
       for (const m of dist.modules) {
         for (const [ci, c] of m.chapters.entries()) {

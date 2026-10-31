@@ -292,7 +292,7 @@ export function buildAlignmentReport(input: AlignmentInput): AlignmentReport | A
     } else {
       // r80 · un resultado que solo trabajan las prácticas integradoras (transversal del curso) se dice, nunca en silencio.
       if (realChaptersEnabled() && o.chapterIds.length && o.chapterIds.every((id) => practiceChapters.has(id))) {
-        add({ rule: 'A1t', severity: 'suggestion', outcomeIds: [o.id], moduleIds, chapterIds: o.chapterIds, message: `${label} ${o.id} («${short(o.text)}») es de todo el curso: lo evidencian las prácticas integradoras de cada módulo y el examen final, no un capítulo de contenido.`, suggestion: 'Si algún capítulo de contenido lo trabaja de forma directa, vincúlalo también a ese capítulo.', evidence: { outcomeId: o.id } });
+        add({ rule: 'A1t', severity: 'suggestion', outcomeIds: [o.id], moduleIds, chapterIds: o.chapterIds, message: `${label} ${o.id} («${short(o.text)}») lo evidencian solo las prácticas integradoras (y el examen final), ningún capítulo de contenido: es lo esperable si el documento lo declara para todo el curso.`, suggestion: 'Si algún capítulo de contenido lo trabaja de forma directa, vincúlalo también a ese capítulo.', evidence: { outcomeId: o.id } });
       }
       if (!has('assessment') && !has('application')) {
         add({ rule: 'A2', severity: 'warning', outcomeIds: [o.id], moduleIds, chapterIds: o.chapterIds, message: `${label} ${o.id} no tiene ninguna evaluación que ${f ? 'la' : 'lo'} verifique.`, suggestion: 'Activa el examen del módulo donde se trabaja o agrega una Actividad de Aplicación con criterios.', evidence: { outcomeId: o.id } });
