@@ -612,11 +612,14 @@ export function priorKnowledgeQuestion(f: { courseName: string | null; suggestio
 }
 
 /** r72 · Resumen, para el docente, de los cambios del diseño recomendado que todavía no se aplicaron. */
-export function designChangesSummary(changes: { type: string }[], hours: { target: number | null; estimated: number | null }): string[] {
+export function designChangesSummary(changes: { type: string; subtopics?: string[] }[], hours: { target: number | null; estimated: number | null }): string[] {
   const n = (t: string) => changes.filter((c) => c.type === t).length;
   const out: string[] = [];
   const add = (k: number, one: string, many: string) => { if (k) out.push(`${k} ${k === 1 ? one : many}`); };
-  add(n('add_content_chapter'), 'capítulo de profundización', 'capítulos de profundización');
+  // r80: los capítulos que salen de los subtemas del documento no son «profundización».
+  const fromSubtopics = changes.filter((c) => c.type === 'add_content_chapter' && Array.isArray(c.subtopics)).length;
+  add(fromSubtopics, 'capítulo nuevo con subtemas del documento', 'capítulos nuevos con subtemas del documento');
+  add(n('add_content_chapter') - fromSubtopics, 'capítulo de profundización', 'capítulos de profundización');
   add(n('add_practice_chapter'), 'capítulo de práctica', 'capítulos de práctica');
   add(n('set_application_activity'), 'Actividad de Aplicación', 'Actividades de Aplicación');
   add(n('set_guided_practice'), 'ejercicio guiado', 'ejercicios guiados');

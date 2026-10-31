@@ -1,0 +1,26 @@
+MICROCURRÍCULO Excel para auxiliares administrativos
+1. Identificación del curso
+Nombre
+Excel para auxiliares administrativos
+Público objetivo
+Auxiliares administrativos y contables que usan hojas de cálculo en su trabajo diario.
+Duración
+40 horas de trabajo del estudiante.
+Nivel
+Formación técnica laboral.
+2. Objetivo general
+Utilizar Excel para organizar, calcular y presentar la información administrativa de una oficina.
+3. Resultados de aprendizaje
+RA1. Organizar datos administrativos en hojas de cálculo con formato adecuado.
+RA2. Aplicar fórmulas y funciones para resolver cálculos de oficina.
+RA3. Analizar información con tablas dinámicas, filtros y gráficos.
+RA4. Automatizar tareas repetitivas con validación de datos y formato condicional.
+4. Contenidos
+Unidad 1. Fundamentos de la hoja de cálculo
+Interfaz, libros y hojas, tipos de datos, formato de celdas, inmovilizar paneles e impresión.
+Unidad 2. Fórmulas y funciones
+Referencias relativas y absolutas, operadores, funciones SUMA y PROMEDIO, funciones SI y SI.ERROR, funciones de texto y funciones de fecha.
+Unidad 3. Análisis de información
+Ordenar y filtrar, tablas, tablas dinámicas, gráficos y segmentación de datos.
+Unidad 4. Control y automatización
+Validación de datos, formato condicional, BUSCARV y BUSCARX, protección de hojas y grabación de macros sencillas.

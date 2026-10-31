@@ -40,7 +40,8 @@ import { classifyLearningType } from '../pedagogy/learning-type';
 import type { LearningType } from '../pedagogy/vocabulary';
 import type { ApplicationKind } from './application-kind-tiers';
 import { isTierSelectable } from '../course-shell/application-kinds';
-import { VIDEO_COMPOSITION_VERSION, VideoCompositionResult, VideoNeed, decideVideosByNeed } from './video-composition';
+import { VIDEO_COMPOSITION_VERSION, VIDEO_NEED_BY_LEARNING_TYPE, VideoCompositionResult, VideoNeed, decideVideosByNeed } from './video-composition';
+import { TOPIC_SPLIT_VERSION, chapterSubtopics, joinList, maxPartsFor, partDescription, partTitle, partitionSubtopics } from './topic-split';
 
 export const DISTRIBUTOR_VERSION = 2 as const;
 
@@ -110,6 +111,26 @@ export interface ProposedChapter {
   /** Tiempo objetivo del capítulo (modelo de tiempo, exacto) y lo que se puede generar hoy (sin la Actividad). */
   targetMinutes: number;
   generableMinutes: number;
+  /**
+   * r80 · capítulos reales: SOLO en los capítulos que salen de dividir un contenido del documento en sus subtemas (el
+   * capítulo de origen, con su título nuevo, y los capítulos propuestos). Sin división la clave no existe (salida de siempre).
+   */
+  split?: ChapterSplit;
+  /** r80: descripción del capítulo dividido (sus subtemas y el contenido del documento del que vienen). */
+  description?: string;
+}
+
+/** r80 · un contenido del documento repartido en `parts` capítulos: este es el `part` (0 = el capítulo de origen). */
+export interface ChapterSplit {
+  version: typeof TOPIC_SPLIT_VERSION;
+  sourceChapterId: string;
+  /** Título que tenía el capítulo de origen (el contenido completo del documento). */
+  sourceTitle: string;
+  part: number;
+  parts: number;
+  subtopics: string[];
+  /** Resultados de aprendizaje del capítulo de origen (los capítulos nuevos los heredan: vienen del mismo contenido). */
+  outcomeIds: string[];
 }
 
 export interface ProposedModule {
@@ -122,9 +143,11 @@ export interface ProposedModule {
 }
 
 export interface DistributionChange {
-  type: 'add_practice_chapter' | 'add_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'set_guided_practice' | 'remove_guided_practice' | 'role_changed' | 'set_video' | 'set_activity' | 'set_application_kind' | 'remove_application_kind';
+  type: 'add_practice_chapter' | 'add_content_chapter' | 'split_content_chapter' | 'set_application_activity' | 'remove_application_activity' | 'set_guided_practice' | 'remove_guided_practice' | 'role_changed' | 'set_video' | 'set_activity' | 'set_application_kind' | 'remove_application_kind';
   /** LOOP 8.6C: el cambio lo pide un requisito del documento (id del requisito). */
   requirementId?: string;
+  /** r80: subtemas del documento que cubre el capítulo (división de un contenido; sin división la clave no existe). */
+  subtopics?: string[];
   moduleId: string;
   chapterId: string;
   /** Texto para el docente. */
@@ -249,6 +272,13 @@ export interface DistributorInput {
    * fijado por el docente o por el documento se respeta igual). Los checks lo reemplazan para probar el candado cerrado.
    */
   tierSelectable?: ((minutes: number) => boolean) | null;
+  /**
+   * r80 · capítulos reales: para llegar a la carga horaria, los capítulos de contenido nuevos salen de los SUBTEMAS que el
+   * documento enumera en un contenido (nunca una «Profundización N» genérica). Sin subtemas que repartir no se agrega
+   * contenido: el resto lo completan la práctica, las Actividades y los ejercicios guiados, o se informa la diferencia.
+   * Ausente / false = comportamiento de siempre (byte a byte).
+   */
+  realChapters?: boolean;
 }
 
 export class DistributorError extends Error {
@@ -286,6 +316,10 @@ interface WorkChapter {
   applicationMinutes: number | null;
   /** Loop 9 B: práctica guiada (solo contenido). Ausente en los capítulos que agrega el distribuidor = null. */
   guidedPracticeMinutes?: number | null;
+  /** r80: descripción y resultados del capítulo (para dividir un contenido en sus subtemas). */
+  description?: string | null;
+  outcomeIds?: string[];
+  split?: ChapterSplit;
 }
 interface WorkModule {
   id: string;
@@ -373,6 +407,8 @@ function distributeCore(input: DistributorInput): DistributionResult {
   const guidedMode: GuidedPracticeMode = prefs.guidedPractice ?? 'auto';
   const appMode: ApplicationActivitiesMode = prefs.applicationActivities ?? 'auto';
   const av: AudiovisualPriority | null = prefs.audiovisual ?? null;
+  // r80 · capítulos reales (ver DistributorInput.realChapters).
+  const realChapters = input.realChapters === true;
   // T3 (r57): composición por necesidad (plan de aprendizaje). Ausente = comportamiento de siempre (byte a byte).
   const lpComp = rules?.learningPlan?.composition ?? null;
   const compOn = !!lpComp && lpComp.videos === 'by_need';
@@ -419,6 +455,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         // Fase 2: se arranca con las Actividades de Aplicación que la estructura YA tiene (ver «ya cumple», abajo).
         applicationMinutes: typeof (c as { applicationMinutes?: unknown }).applicationMinutes === 'number' ? ((c as { applicationMinutes?: number }).applicationMinutes as number) : null,
         guidedPracticeMinutes: typeof (c as { guidedPracticeMinutes?: unknown }).guidedPracticeMinutes === 'number' ? ((c as { guidedPracticeMinutes?: number }).guidedPracticeMinutes as number) : null,
+        ...(input.realChapters ? { description: (c as { description?: string }).description ?? null, outcomeIds: Array.isArray((c as { outcomeIds?: unknown }).outcomeIds) ? [...((c as { outcomeIds?: string[] }).outcomeIds as string[])] : [] } : {}),
       })),
     }));
   if (design.some((m) => m.chapters.length === 0)) throw new DistributorError('cada módulo necesita al menos un capítulo');
@@ -433,7 +470,16 @@ function distributeCore(input: DistributorInput): DistributionResult {
   const initialVideo = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.videoEnabled] as const)));
   const initialActivity = new Map(design.flatMap((m) => m.chapters.map((c) => [c.id, c.activityEnabled] as const)));
   /** r72 · Capítulo de profundización que creó Cursia (propuesto o ya aplicado, con el título que le puso Cursia). */
-  const isCursiaDeepening = (c: { proposed?: boolean; kind: string; title: string }) => c.kind === 'content' && (!!c.proposed || /^Profundizaci[oó]n \d+: /.test(String(c.title || '')));
+  const isCursiaDeepening = (c: { proposed?: boolean; kind: string; title: string; split?: ChapterSplit }) => c.kind === 'content' && !c.split && (!!c.proposed || /^Profundizaci[oó]n \d+: /.test(String(c.title || '')));
+  // r80 · ¿el tipo de aprendizaje del capítulo NECESITA video (procedimiento, protocolo, comunicación)? Mismo clasificador
+  // y tabla que la composición por necesidad (learning-type + video-composition); el tipo congelado por el lock manda.
+  const lockedType = new Map<string, LearningType>();
+  for (const m of snapshot.modules) for (const c of m.chapters) {
+    const t = (c as { design?: { learningType?: { type?: string } } }).design?.learningType?.type;
+    if (typeof t === 'string') lockedType.set(c.id, t as LearningType);
+  }
+  const needsVideo = (c: { id: string; title: string; objective: string | null }): boolean =>
+    VIDEO_NEED_BY_LEARNING_TYPE[lockedType.get(c.id) ?? classifyLearningType({ title: c.title, objective: c.objective, description: null }).type].need !== 'optional';
   const avFor = (contentIndex: number, contentCount: number, proposedDeepening: boolean): boolean => {
     if (av === 'more') return true;
     if (proposedDeepening) return false;
@@ -448,7 +494,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
       const content = m.chapters.filter((c) => c.kind === 'content');
       content.forEach((c, i) => {
         const pin = pinnedVideo(c.id);
-        c.videoEnabled = pin !== undefined ? pin : avFor(i, content.length, isCursiaDeepening(c));
+        c.videoEnabled = pin !== undefined ? pin : avFor(i, content.length, isCursiaDeepening(c)) || (realChapters && av === 'recommended' && needsVideo(c));
       });
       for (const c of m.chapters) if (c.kind === 'practice') c.videoEnabled = false;
     }
@@ -509,6 +555,47 @@ function distributeCore(input: DistributorInput): DistributionResult {
   const practiceTotal = () => design.reduce((n, m) => n + m.chapters.filter((c) => c.kind === 'practice').length, 0);
   const contentCount = (cs: WorkChapter[]) => cs.filter((c) => c.kind !== 'practice').length;
   const practiceCount = (cs: WorkChapter[]) => cs.filter((c) => c.kind === 'practice').length;
+  // r80 · capítulos reales: cada contenido del documento que enumera subtemas puede repartirse en más capítulos (en orden,
+  // al menos 2 subtemas por capítulo). `parts[0]` es el capítulo de origen (cambia su título por el de sus subtemas).
+  interface SplitSource { m: WorkModule; items: string[]; sourceText: string; sourceTitle: string; sourceObjective: string | null; outcomeIds: string[]; parts: WorkChapter[] }
+  const splitSources: SplitSource[] = [];
+  if (realChapters) for (const m of design) for (const c of m.chapters) {
+    if (c.kind !== 'content' || c.proposed || isCursiaDeepening(c)) continue;
+    const st = chapterSubtopics({ title: c.title, description: c.description ?? null });
+    if (st.items.length >= 2 && maxPartsFor(st.items.length) > 1) {
+      splitSources.push({ m, items: st.items, sourceText: st.source, sourceTitle: c.title, sourceObjective: c.objective, outcomeIds: [...(c.outcomeIds ?? [])], parts: [c] });
+    }
+  }
+  /** Reparte de nuevo los subtemas de un contenido entre sus capítulos (títulos y descripciones salen del documento). */
+  const relabel = (src: SplitSource) => {
+    const groups = partitionSubtopics(src.items, src.parts.length);
+    src.parts.forEach((c, i) => {
+      c.title = partTitle(groups[i]);
+      c.description = partDescription(groups[i], src.sourceText);
+      c.objective = i === 0 ? src.sourceObjective : null;
+      c.split = { version: TOPIC_SPLIT_VERSION, sourceChapterId: src.parts[0].id, sourceTitle: src.sourceTitle, part: i, parts: src.parts.length, subtopics: groups[i], outcomeIds: [...src.outcomeIds] };
+    });
+  };
+  /**
+   * r80: el próximo capítulo de contenido del módulo sale de dividir su contenido con más subtemas por capítulo (sin pasar
+   * del máximo de capítulos de contenido). null = el documento no trae más subtemas en este módulo: no se agrega nada.
+   */
+  const splitNext = (m: WorkModule): WorkChapter | null => {
+    if (contentCount(m.chapters) >= DISTRIBUTOR_RULES.maxContentChaptersPerModule || m.chapters.length >= maxCh || contentCount(m.chapters) >= contentMax) return null;
+    const cand = splitSources.filter((x) => x.m === m && x.parts.length < maxPartsFor(x.items.length))
+      .sort((a, b) => b.items.length / b.parts.length - a.items.length / a.parts.length)[0];
+    if (!cand) return null;
+    const n = m.chapters.filter((c) => c.kind === 'content' && c.proposed).length + 1;
+    const cc: WorkChapter = { id: `proposed:content:${m.id}:${n}`, proposed: true, kind: 'content', title: '', objective: null, videoEnabled: cand.parts[0].videoEnabled,
+      activityEnabled: cand.parts[0].activityEnabled, applicationMinutes: null, description: null, outcomeIds: [...cand.outcomeIds] };
+    m.chapters.splice(m.chapters.indexOf(cand.parts[cand.parts.length - 1]) + 1, 0, cc);
+    cand.parts.push(cc);
+    relabel(cand);
+    return cc;
+  };
+  /** r80: módulos donde el documento pide más capítulos de contenido que subtemas trae (no se inventan). */
+  const unmetContentMin = new Set<string>();
+  const splitDetail = (cc: WorkChapter) => `Capítulo «${cc.title}» con los subtemas del documento ${cc.split ? `(${joinList(cc.split.subtopics)}, del contenido «${cc.split.sourceTitle}»)` : ''}`;
   const appModuleMax = rq?.applicationPerModule?.max ?? Infinity;
   const appModuleMin = rq?.applicationPerModule?.min ?? 0;
   const appTotalMax = rq?.applicationTotal?.max ?? Infinity;
@@ -646,11 +733,35 @@ function distributeCore(input: DistributorInput): DistributionResult {
           // La profundización que propone Cursia sigue la regla de 8.3 (sin video con «Recomendado»).
           // r72: también la que ya se aplicó (sigue llamándose «Profundización N: <módulo>»): antes, al aplicarla dejaba de ser
           // «propuesta», la regla le ponía video y la siguiente pasada recomendaba otros ~30 cambios (#87: 36 → 31 → 0).
-          const v = reqVideo !== null ? reqVideo : avFor(i, content.length, !!c.proposed || isCursiaDeepening(c));
+          // r80: un capítulo que sale de los subtemas del documento es contenido real (no profundización).
+          // r80 · con capítulos reales y «Recomendado», además del reparto de siempre lleva video todo capítulo cuyo tipo de
+          // aprendizaje lo necesita (procedimiento, protocolo, comunicación: learning-type + video-composition), aunque cierre.
+          const v = reqVideo !== null ? reqVideo : avFor(i, content.length, !c.split && (!!c.proposed || isCursiaDeepening(c)))
+            || (realChapters && av === 'recommended' && needsVideo(c));
           if (c.videoEnabled !== v) { c.videoEnabled = v; changed = true; }
         });
       }
       if (changed) reEval();
+    }
+    // r80 · los títulos de los capítulos divididos se fijan al final (cada división nueva reparte de nuevo los subtemas):
+    // los textos de sus cambios se escriben con el estado final, y el capítulo de origen registra su nuevo título.
+    if (realChapters) {
+      for (const src of splitSources) {
+        if (src.parts.length < 2) continue;
+        for (const c of src.parts.slice(1)) {
+          const ch = changes.find((x) => x.type === 'add_content_chapter' && x.chapterId === c.id);
+          if (!ch) continue;
+          const req = ch.requirementId ? ' (lo pide el documento)' : '';
+          ch.subtopics = [...(c.split?.subtopics ?? [])];
+          ch.detail = `${splitDetail(c)}${c.videoEnabled ? ', con video' : ''}, actividad${review ? ', repaso' : ''}${c.applicationMinutes ? ` y Actividad de Aplicación de ${c.applicationMinutes} min` : ''}${req}.`;
+        }
+        const c0 = src.parts[0];
+        if (!changes.some((x) => x.type === 'split_content_chapter' && x.chapterId === c0.id)) {
+          changes.push({ type: 'split_content_chapter', moduleId: src.m.id, chapterId: c0.id, subtopics: [...(c0.split?.subtopics ?? [])],
+            detail: `«${src.sourceTitle}» se reparte en ${src.parts.length} capítulos con sus subtemas del documento: ${src.parts.map((p) => `«${p.title}»`).join(', ')}. Este capítulo pasa a llamarse «${c0.title}».` });
+        }
+      }
+      if (unmetContentMin.size) recs = [...recs, `El documento pide más capítulos de contenido de los que permiten sus subtemas en ${[...unmetContentMin].map((t) => `«${t}»`).join(', ')}: Cursia no inventa capítulos sin tema. Agrega los temas en el editor o revisa el documento.`];
     }
     pushRemovals();
     pushVideoChanges();
@@ -678,7 +789,9 @@ function distributeCore(input: DistributorInput): DistributionResult {
     }
     const decisionOf = new Map((vc ? vc.decisions : []).map((d) => [d.chapterId, d]));
     const recommendations = share > policy.maxApplicationShare + 1e-9
-      ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de Aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque). Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.`]
+      ? [...recs, `El ${Math.round(share * 100)} % de este diseño son Actividades de Aplicación (más que el ${Math.round(policy.maxApplicationShare * 100)} % habitual del enfoque). ${realChapters && !splitSources.some((x) => x.parts.length < maxPartsFor(x.items.length))
+        ? 'El documento no trae más subtemas para nuevos capítulos de contenido (Cursia no inventa temas): si la institución quiere más contenido, agrega temas al microcurrículo o baja la carga horaria.'
+        : 'Si el curso es chico, conviene sumar capítulos de contenido o un módulo en lugar de más práctica.'}`]
       : recs;
     const estChapter = new Map(est.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
     const genChapter = new Map(generable.modules.flatMap((m) => m.chapters).map((c) => [c.chapterId, c.chapterEstimatedMinutes]));
@@ -706,6 +819,7 @@ function distributeCore(input: DistributorInput): DistributionResult {
         ...(vc && c.kind === 'content' && decisionOf.has(c.id) ? (() => { const d = decisionOf.get(c.id)!; return { videoDecision: { ruleId: d.ruleId, need: d.need, learningType: d.learningType, reason: d.reason } }; })() : {}),
         targetMinutes: estChapter.get(c.id) as number,
         generableMinutes: genChapter.get(c.id) as number,
+        ...(c.split && c.split.parts > 1 ? { split: { ...c.split, subtopics: [...c.split.subtopics], outcomeIds: [...c.split.outcomeIds] }, ...(c.description ? { description: c.description } : {}) } : {}),
       })),
     }));
     const all = modules.flatMap((m) => m.chapters);
@@ -801,6 +915,13 @@ function distributeCore(input: DistributorInput): DistributionResult {
       }
       let n = m.chapters.filter((c) => c.kind === 'content' && c.proposed).length;
       while (contentCount(m.chapters) < contentMin) {
+        if (realChapters) {
+          // r80: el mínimo del documento se completa con sus propios subtemas; si no hay más, no se inventa un capítulo.
+          const sc = splitNext(m);
+          if (!sc) { unmetContentMin.add(m.title); break; }
+          changes.push({ type: 'add_content_chapter', moduleId: m.id, chapterId: sc.id, detail: `${splitDetail(sc)} (el documento pide ${contentMin} capítulos de contenido por módulo).`, subtopics: [...(sc.split?.subtopics ?? [])], ...(rq?.sources.chapters ? { requirementId: rq.sources.chapters } : {}) });
+          continue;
+        }
         n++;
         const cc: WorkChapter = { id: `proposed:content:${m.id}:${n}`, proposed: true, kind: 'content', title: proposedTitle(`Profundización ${n}`, m.title),
           objective: `Analizar casos complejos de «${m.title}»`, videoEnabled: reqVideo !== null ? reqVideo : m.chapters.some((c) => c.kind === 'content' && c.videoEnabled), activityEnabled: true, applicationMinutes: null };
@@ -841,6 +962,12 @@ function distributeCore(input: DistributorInput): DistributionResult {
       }
       let n = m.chapters.filter((c) => c.kind === 'content' && c.proposed).length;
       while (m.chapters.length < minCh) {
+        if (realChapters) {
+          const sc = splitNext(m);
+          if (!sc) { unmetContentMin.add(m.title); break; }
+          changes.push({ type: 'add_content_chapter', moduleId: m.id, chapterId: sc.id, detail: `${splitDetail(sc)}${why}.`, subtopics: [...(sc.split?.subtopics ?? [])], ...(reqId ? { requirementId: reqId } : {}) });
+          continue;
+        }
         n++;
         const cc: WorkChapter = { id: `proposed:content:${m.id}:${n}`, proposed: true, kind: 'content', title: proposedTitle(`Profundización ${n}`, m.title),
           objective: `Analizar casos complejos de «${m.title}»`, videoEnabled: reqVideo !== null ? reqVideo : av ? av === 'more' : m.chapters.some((c) => c.kind === 'content' && c.videoEnabled), activityEnabled: true, applicationMinutes: null };
@@ -990,6 +1117,18 @@ function distributeCore(input: DistributorInput): DistributionResult {
         if (content.length >= DISTRIBUTOR_RULES.maxContentChaptersPerModule) continue;
         if (m.chapters.length >= maxCh) continue; // LOOP 8.6C: no pasar del máximo del documento
         if (content.length >= contentMax) continue; // LOOP 9.2: ni del máximo de capítulos de contenido
+        if (realChapters) {
+          // r80: el capítulo nuevo sale de los subtemas del documento; sin subtemas, este módulo no crece en contenido.
+          const sc = splitNext(m);
+          if (!sc) continue;
+          applyComposition();
+          clampToRoleCaps();
+          trySetTier(m, sc, tiers[0]);
+          changes.push({ type: 'add_content_chapter', moduleId: m.id, chapterId: sc.id, subtopics: [...(sc.split?.subtopics ?? [])],
+            detail: `${splitDetail(sc)}${sc.videoEnabled ? ', con video' : ''}, actividad${review ? ', repaso' : ''}${sc.applicationMinutes ? ` y Actividad de Aplicación de ${sc.applicationMinutes} min` : ''}.` });
+          growApplication();
+          continue;
+        }
         const n = content.filter((c) => c.proposed).length + 1;
         // Sin preferencia: como siempre (hereda el video del módulo). Con preferencia: solo «Más» pone video en la profundización.
         const usesVideo = reqVideo !== null ? reqVideo : av ? avFor(content.length, content.length + 1, true) : content.some((c) => c.videoEnabled);
@@ -1134,8 +1273,10 @@ function distributeCore(input: DistributorInput): DistributionResult {
   // «Fija la forma» = la institución eligió la forma (noContentAdditions) o el documento fija módulos Y capítulos por módulo
   // (el mismo criterio con el que la recomendación final dice que Cursia no agrega nada).
   const shapeFixedByDocument = !!rq && typeof rq.modulesFixed === 'number' && (rq.contentChaptersPerModule?.max !== undefined || rq.chaptersPerModule?.max !== undefined);
-  const guidedAllowed = guidedMode !== 'none' && !!rq && (noContentAdditions || shapeFixedByDocument || !!rq.applicationInPractice
-    || rq.applicationPerModule?.max !== undefined || rq.applicationTotal?.max !== undefined);
+  // r80: con capítulos reales el contenido solo crece con los subtemas del documento; agotados, la diferencia se completa
+  // con ejercicios guiados (formativos) en lugar de capítulos de relleno.
+  const guidedAllowed = guidedMode !== 'none' && ((!!rq && (noContentAdditions || shapeFixedByDocument || !!rq.applicationInPractice
+    || rq.applicationPerModule?.max !== undefined || rq.applicationTotal?.max !== undefined)) || realChapters);
   const hb = rq?.hoursBounds;
   const hbOn = !!hb && (hb.min === undefined || input.targetHours >= hb.min) && (hb.max === undefined || input.targetHours <= hb.max);
   const hbMin = hbOn && hb!.min !== undefined ? hb!.min * 60 : -Infinity;
