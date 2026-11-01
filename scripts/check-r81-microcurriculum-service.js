@@ -84,6 +84,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
   Logger.overrideLogger(false);
   const S = D('modules/microcurriculum/microcurriculum.service.js');
   const ACX = D('modules/academic-context/academic-context.js');
+  const A_norm = (x) => D('modules/microcurriculum/answers.js').normalizeAnswers(JSON.parse(JSON.stringify(x)));
 
   const pgBin = findPgBin();
   const port = await freePort();
@@ -431,6 +432,25 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       eq([sent.statusCode, sent.code, sent.error, sent.resetsAt], [429, 'QUOTA_EXHAUSTED', 'cupo', '2026-12-01T00:00:00.000Z']);
       new AllExceptionsFilter().catch(new HttpException({ code: 'ANSWERS_INCOMPLETE', message: 'faltan', missing: ['learners.profile'] }, 400), host);
       eq([sent.code, sent.missing], ['ANSWERS_INCOMPLETE', ['learners.profile']]);
+    });
+
+    await check('MS15 DTOs con el ValidationPipe global (whitelist + forbidNonWhitelisted): respuestas completas y documento pasan; > 2 000 caracteres → 400; null = «Que Cursia lo proponga»', async () => {
+      const { ValidationPipe } = require('@nestjs/common');
+      const dto = D('modules/microcurriculum/dto/microcurriculum.dto.js');
+      const pipe = new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true, transformOptions: { enableImplicitConversion: true } });
+      const run = (body, metatype) => pipe.transform(body, { type: 'body', metatype });
+      for (const k of ['universidad', 'tecnica', 'etdh', 'colegio', 'corporativa']) {
+        const r = await run({ answers: ANS(k) }, dto.CreateMicrocurriculumDto);
+        eq(A_norm(r.answers), A_norm(ANS(k)), `respuestas ${k} intactas`);
+      }
+      const r2 = await run({ document: TOOL('universidad') }, dto.UpdateMicrocurriculumDto);
+      eq(Object.keys(r2.document).length, 13, 'documento sin recortar');
+      await rejects(run({ answers: { identification: { courseName: 'x'.repeat(2001) } } }, dto.UpdateMicrocurriculumDto), 400);
+      await rejects(run({ answers: { contents: { requiredTopics: Array.from({ length: 41 }, (_, i) => `t${i}`) } } }, dto.UpdateMicrocurriculumDto), 400);
+      await rejects(run({ answers: { time: { totalHours: 1001 } } }, dto.UpdateMicrocurriculumDto), 400);
+      await rejects(run({ answers: { otra: 1 } }, dto.UpdateMicrocurriculumDto), 400);
+      await run({ answers: { time: { totalHours: null, split: { contact: null } }, contents: { unitCount: null }, identification: { modality: '' } } }, dto.UpdateMicrocurriculumDto);
+      await rejects(run({ section: 'bibliografia' }, dto.RegenerateSectionDto), 400);
     });
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
