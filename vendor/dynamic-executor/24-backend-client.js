@@ -1296,6 +1296,53 @@
       }).catch(function (err) { return { ok: false, error: err ? (err.message || String(err)) : 'Error de red' }; });
     });
   }
+  // r81 · «Crear microcurrículo» (contrato fijo: validation/r81-microcurriculo/plan.md). Todo es del propio usuario.
+  // La cuota es la única ruta que responde con la función apagada ({ enabled: false }); el resto da 404.
+  function _mcrPath(id, rest) { return '/api/v1/microcurricula/' + encodeURIComponent(String(id)) + (rest || ''); }
+  function backendMicrocurriculumQuota() {
+    return backendApiRequest('/api/v1/microcurricula/quota', { method: 'GET', _quiet: true }, 15000);
+  }
+  function backendListMicrocurricula() {
+    return backendApiRequest('/api/v1/microcurricula', { method: 'GET' }, 20000);
+  }
+  function backendCreateMicrocurriculum(answers) {
+    return backendApiRequest('/api/v1/microcurricula', { method: 'POST', body: { answers: answers || {} } }, 20000);
+  }
+  function backendGetMicrocurriculum(id) {
+    return backendApiRequest(_mcrPath(id), { method: 'GET' }, 20000);
+  }
+  /** patch = { answers? , document? } → el registro con los `issues` recalculados en el servidor (sin IA, USD 0). */
+  // extra = { keepalive: true } al cerrar la pestaña (el guardado sale aunque la página se descargue).
+  function backendUpdateMicrocurriculum(id, patch, extra) {
+    return backendApiRequest(_mcrPath(id), Object.assign({ method: 'PATCH', body: patch || {} }, extra && extra.keepalive ? { keepalive: true } : {}), 20000);
+  }
+  function backendDeleteMicrocurriculum(id) {
+    return backendApiRequest(_mcrPath(id), { method: 'DELETE' }, 20000);
+  }
+  // Responden 202 al instante con el registro en 'generating' (regenerar conserva el documento y trae pendingSection);
+  // el resultado se consulta con GET /:id (65-microcurriculum.js, cada 3 s).
+  function backendGenerateMicrocurriculum(id) {
+    return backendApiRequest(_mcrPath(id, '/generate'), { method: 'POST', body: {} }, 30000);
+  }
+  function backendRegenerateMicrocurriculum(id, section) {
+    return backendApiRequest(_mcrPath(id, '/regenerate'), { method: 'POST', body: { section: section } }, 30000);
+  }
+  function backendMicrocurriculumAcademicContext(id) {
+    return backendApiRequest(_mcrPath(id, '/academic-context'), { method: 'GET' }, 20000);
+  }
+  /** PDF del microcurrículo: { ok, blob, filename } — descarga directa (mismo patrón que backendPrebriefPdf). */
+  function backendMicrocurriculumPdf(id) {
+    if (!backendIsEnabled()) return Promise.resolve({ ok: false, error: 'Backend desactivado' });
+    return _getSupabaseToken().then(function (token) {
+      if (!token) return { ok: false, error: 'no_session', errorType: 'auth' };
+      return fetch(_baseUrl() + _mcrPath(id, '/pdf'), { headers: { 'Authorization': 'Bearer ' + token } }).then(function (res) {
+        if (!res.ok) return res.json().catch(function () { return {}; }).then(function (b) { return { ok: false, error: (b && b.error) || ('HTTP ' + res.status), _httpStatus: res.status, errorBody: b && typeof b === 'object' ? b : null }; });
+        var disp = res.headers.get('content-disposition') || '';
+        var m = /filename="([^"]+)"/.exec(disp);
+        return res.blob().then(function (blob) { return { ok: true, blob: blob, filename: m ? m[1] : 'microcurriculo.pdf' }; });
+      }).catch(function (err) { return { ok: false, error: err ? (err.message || String(err)) : 'Error de red' }; });
+    });
+  }
   // LOOP 8.6B · requisitos explícitos del documento (solo lectura) y la alternativa (S/M/L…) que elige el docente.
   function backendGetDocumentRequirements(courseId) {
     return backendApiRequest('/api/v1/courses/' + courseId + '/academic-context/requirements', { method: 'GET' });
@@ -4182,6 +4229,17 @@
   window.backendStructurePreview = backendStructurePreview;
   window.backendGetCourseFormat = backendGetCourseFormat;
   window.backendPrebriefPdf = backendPrebriefPdf;
+  // r81 · microcurrículo
+  window.backendMicrocurriculumQuota = backendMicrocurriculumQuota;
+  window.backendListMicrocurricula = backendListMicrocurricula;
+  window.backendCreateMicrocurriculum = backendCreateMicrocurriculum;
+  window.backendGetMicrocurriculum = backendGetMicrocurriculum;
+  window.backendUpdateMicrocurriculum = backendUpdateMicrocurriculum;
+  window.backendDeleteMicrocurriculum = backendDeleteMicrocurriculum;
+  window.backendGenerateMicrocurriculum = backendGenerateMicrocurriculum;
+  window.backendRegenerateMicrocurriculum = backendRegenerateMicrocurriculum;
+  window.backendMicrocurriculumAcademicContext = backendMicrocurriculumAcademicContext;
+  window.backendMicrocurriculumPdf = backendMicrocurriculumPdf;
   window.backendClearDesignPins = backendClearDesignPins;
   window.backendDesignFix = backendDesignFix;
   window.backendRecordDesignHours = backendRecordDesignHours;

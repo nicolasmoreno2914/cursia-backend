@@ -566,6 +566,9 @@ jobs:
                # documento en capítulos en lugar de «Profundización N» genéricas. Solo staging; en producción queda
                # apagado hasta su autorización. Revertir = quitar esta línea y poner DYNAMIC_REAL_CHAPTERS=false.
                ensure_env_flag_true DYNAMIC_REAL_CHAPTERS
+               # r81 (pedido de Nicolás, 2026-11-01): «Crear microcurrículo» visible en staging. En producción queda
+               # apagado hasta su autorización. Revertir = quitar esta línea y poner MICROCURRICULUM_ENABLED=false.
+               ensure_env_flag_true MICROCURRICULUM_ENABLED
                # V542 (G2, decisión EV6 n.º 3): cursos NUEVOS sin diseño guardado en Aula Clara (claro). Solo
                # los creados desde el PRIMER deploy de este cambio: el instante se calcula en el VPS y, como solo
                # se escribe si falta, queda congelado en los deploys siguientes. Los anteriores conservan el
@@ -840,6 +843,10 @@ jobs:
 
                echo "━━━ [5e] r75: presupuestos — verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-r75-budgets-schema.js
+
+               # r81: staging-only hasta aprobación del owner (EXCLUDED del plan de producción). Aditiva e idempotente.
+               echo "━━━ [5f] r81: «Crear microcurrículo» (microcurricula + microcurriculum_generations) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r81-microcurricula.js
 
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod

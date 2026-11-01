@@ -1,0 +1,42 @@
+{
+  "_nota": "r81 · fixture de microcurrículo (colegio): «Desempeños», sin competencias, 3 unidades, cortes 20/30/50, bibliografía obligatoria.",
+  "answers": {
+    "identification": { "courseName": "Ciencias Naturales: los ecosistemas", "institutionType": "colegio", "term": "Grado 7.º", "modality": "presencial", "area": "Ciencias Naturales" },
+    "learners": { "profile": "Estudiantes de grado séptimo, 12 a 13 años, de un colegio público rural.", "context": "Zona rural del Huila" },
+    "purpose": { "need": "Los estudiantes no relacionan lo que aprenden en ciencias con el entorno de su vereda.", "expectedAbilities": "Describir los componentes de un ecosistema cercano, explicar las cadenas alimentarias y proponer acciones para cuidarlo." },
+    "time": { "mode": "total", "totalHours": 40, "calendar": "Segundo periodo académico" },
+    "contents": { "requiredTopics": ["Cadenas alimentarias", "Factores bióticos y abióticos"], "unitCount": 3 },
+    "methodology": { "strategies": ["salidas de campo", "proyectos"], "institutionalEvaluation": "20/30/50" },
+    "references": { "bibliography": ["Ministerio de Educación Nacional. (2004). Estándares básicos de competencias en Ciencias Naturales y Ciencias Sociales."] }
+  },
+  "tool": {
+    "description": "Curso en el que los estudiantes estudian los ecosistemas a partir de su propia vereda: observan, registran y explican cómo se relacionan los seres vivos con su entorno.",
+    "justification": "Los estudiantes no relacionan la ciencia escolar con su entorno; partir del ecosistema cercano da sentido al aprendizaje y promueve su cuidado.",
+    "learnerProfile": "Estudiantes de grado séptimo, de 12 a 13 años, de un colegio público rural del Huila.",
+    "priorKnowledge": "Seres vivos y sus necesidades básicas (grados anteriores).",
+    "generalObjective": "Explicar el funcionamiento de un ecosistema cercano y proponer acciones para su cuidado.",
+    "specificObjectives": ["Describir los componentes de un ecosistema.", "Explicar las cadenas alimentarias.", "Proponer acciones de cuidado del entorno."],
+    "outcomes": [
+      { "id": "RA1", "text": "Clasificar los factores de un ecosistema de su vereda, en una salida de campo, distinguiendo correctamente bióticos y abióticos.", "verb": "clasificar", "bloom": "comprender", "condition": "en una salida de campo", "criterion": "distinguiendo correctamente bióticos y abióticos" },
+      { "id": "RA2", "text": "Representar una cadena alimentaria local, con dibujos o maquetas, con al menos cuatro eslabones correctos.", "verb": "representar", "bloom": "aplicar", "condition": "con dibujos o maquetas", "criterion": "con al menos cuatro eslabones correctos" },
+      { "id": "RA3", "text": "Explicar el efecto de quitar un eslabón de la cadena, a partir de su representación, con argumentos de causa y efecto.", "verb": "explicar", "bloom": "comprender", "condition": "a partir de su representación", "criterion": "con argumentos de causa y efecto" },
+      { "id": "RA4", "text": "Proponer acciones para cuidar el ecosistema de su vereda, en un proyecto de aula, viables para su comunidad.", "verb": "proponer", "bloom": "crear", "condition": "en un proyecto de aula", "criterion": "viables para su comunidad" }
+    ],
+    "competencies": [],
+    "units": [
+      { "id": "U1", "title": "Factores bióticos y abióticos", "contents": ["Qué es un ecosistema", "Factores bióticos", "Factores abióticos"], "outcomeIds": ["RA1"], "hours": { "contact": 8, "practice": 4, "autonomous": 0 }, "weeks": null, "strategy": "salidas de campo", "mainActivity": "Salida de campo con registro de observación" },
+      { "id": "U2", "title": "Cadenas alimentarias", "contents": ["Productores y consumidores", "Descomponedores", "Redes tróficas"], "outcomeIds": ["RA2", "RA3"], "hours": { "contact": 8, "practice": 6, "autonomous": 0 }, "weeks": null, "strategy": "proyectos", "mainActivity": "Maqueta de una cadena alimentaria local" },
+      { "id": "U3", "title": "Cuidado del ecosistema", "contents": ["Amenazas al ecosistema", "Acciones de cuidado", "Proyecto de aula"], "outcomeIds": ["RA4"], "hours": { "contact": 8, "practice": 6, "autonomous": 0 }, "weeks": null, "strategy": "proyectos", "mainActivity": "Proyecto de cuidado del ecosistema de la vereda" }
+    ],
+    "methodology": { "text": "El docente guía la observación del entorno en salidas de campo; en el aula los estudiantes organizan lo observado y lo convierten en un proyecto de cuidado.", "strategies": ["salidas de campo", "proyectos"] },
+    "evaluation": [
+      { "name": "Registro de la salida de campo", "percent": 20, "outcomeIds": ["RA1"], "week": null, "evidence": "Cuaderno de campo, lista de chequeo" },
+      { "name": "Maqueta y explicación", "percent": 30, "outcomeIds": ["RA2", "RA3"], "week": null, "evidence": "Maqueta y explicación oral, rúbrica" },
+      { "name": "Proyecto de aula", "percent": 50, "outcomeIds": ["RA4"], "week": null, "evidence": "Presentación del proyecto a la comunidad, rúbrica" }
+    ],
+    "resources": ["Cuaderno de campo", "Lupas"],
+    "bibliography": [
+      { "text": "Ministerio de Educación Nacional. (2004). Estándares básicos de competencias en Ciencias Naturales y Ciencias Sociales.", "origin": "docente" }
+    ]
+  }
+}
