@@ -43,13 +43,19 @@ export function stripAccents(s: string): string {
 }
 const collapse = (s: string) => String(s ?? '').replace(/\s+/g, ' ').trim();
 
+/**
+ * Plural simple → raíz SIMÉTRICA: se quita la «s» final y después la «e» final (si quedan > 3 letras), así singular y
+ * plural dan lo mismo también cuando el singular termina en «e» (base/bases → «bas», clase/clases → «clas»,
+ * redes → «red», funciones → «funcion»). Review r81 P1-2.
+ */
 function stem(t: string): string {
-  if (t.length > 4 && t.endsWith('es')) return t.slice(0, -2);
-  if (t.length > 3 && t.endsWith('s')) return t.slice(0, -1);
-  return t;
+  let x = t;
+  if (x.length > 3 && x.endsWith('s')) x = x.slice(0, -1);
+  if (x.length > 3 && x.endsWith('e')) x = x.slice(0, -1);
+  return x;
 }
 
-/** Tokens normalizados (sin tildes, minúsculas, sin palabras vacías, plural simple → singular). */
+/** Tokens normalizados (sin tildes, minúsculas, sin palabras vacías, plural simple → raíz común). */
 export function topicTokens(s: string): string[] {
   return stripAccents(String(s || '').toLowerCase()).split(/[^a-z0-9ñ]+/).filter((t) => t && !STOPWORDS.has(t)).map(stem);
 }
@@ -172,7 +178,8 @@ function checkHours(answers: MicrocurriculumAnswers, mc: MicrocurriculumV1, I: I
 }
 
 /** ¿Los porcentajes, en orden, se agrupan en bloques consecutivos que suman cada corte? */
-export function respectsCuts(percents: number[], cuts: number[]): boolean {
+export function respectsCuts(all: number[], cuts: number[]): boolean {
+  const percents = all.filter((p) => p > 0); // un momento de 0 % (formativo) no pertenece a ningún corte (review P2-10)
   let i = 0;
   for (const c of cuts) {
     let acc = 0;
@@ -286,30 +293,52 @@ export function largestRemainder(weights: number[], steps: number): number[] {
  * Corrige lo aritmético y lo registra: V1 (horas proporcionales al reparto del modelo, por tipo y por unidad, a 0,5 h,
  * respetando el reparto exigido) y V2 (porcentajes escalados al entero con mayor resto). No toca nada más.
  */
-export function repairArithmetic(answers: MicrocurriculumAnswers, input: MicrocurriculumV1): { mc: MicrocurriculumV1; repairs: string[] } {
+/**
+ * Granularidad del reparto: 0,5 h cuando el total es múltiplo de 0,5; si no, 0,25 h o, en último caso, 0,01 h — así
+ * el reparto siempre puede sumar EXACTAMENTE el total (review P2-2).
+ */
+export function hoursStepFor(total: number): number {
+  const mult = (s: number) => Math.abs(Math.round(total / s) * s - total) < 1e-9;
+  return mult(MC_LIMITS.hoursStep) ? MC_LIMITS.hoursStep : mult(0.25) ? 0.25 : 0.01;
+}
+
+export function repairArithmetic(
+  answers: MicrocurriculumAnswers, input: MicrocurriculumV1, scope: { hours?: boolean; percents?: boolean } = {},
+): { mc: MicrocurriculumV1; repairs: string[] } {
   const mc: MicrocurriculumV1 = JSON.parse(JSON.stringify(input));
   const repairs: string[] = [];
   const total = resolveTotalHours(answers.time);
   const tol = MC_LIMITS.hoursTolerance;
-  const step = MC_LIMITS.hoursStep;
+  const doHours = scope.hours !== false;
+  const doPercents = scope.percents !== false;
 
-  if (total !== null && mc.units.length) {
+  if (doHours && total !== null && mc.units.length) {
+    const step = hoursStepFor(total);
+    const r = (n: number) => Math.round(n * 100) / 100;
     const split = requestedSplit(answers.time);
     const before = sumUnitHours(mc.units);
     const kindSum = (k: HourKind) => mc.units.reduce((a, u) => a + u.hours[k], 0);
     const splitBroken = HOUR_KINDS.some((k) => split[k] !== undefined && Math.abs(kindSum(k) - (split[k] as number)) > tol);
     if (Math.abs(before - total) > tol || splitBroken) {
       const totalSteps = Math.round(total / step);
-      const target: Record<HourKind, number> = { contact: 0, practice: 0, autonomous: 0 };
+      // Horas objetivo por tipo (reales): las exigidas tal cual; el resto, en proporción a lo que propuso el modelo. Luego
+      // UN solo reparto de mayor resto contra el total en pasos → los tipos suman exactamente el total (P2-2).
+      const want: Record<HourKind, number> = { contact: 0, practice: 0, autonomous: 0 };
       const free = HOUR_KINDS.filter((k) => split[k] === undefined);
-      let fixedSteps = 0;
-      for (const k of HOUR_KINDS) if (split[k] !== undefined) { target[k] = Math.round((split[k] as number) / step); fixedSteps += target[k]; }
-      const rest = Math.max(0, totalSteps - fixedSteps);
-      if (free.length) largestRemainder(free.map(kindSum), rest).forEach((s, i) => { target[free[i]] = s; });
+      let fixed = 0;
+      for (const k of HOUR_KINDS) if (split[k] !== undefined) { want[k] = split[k] as number; fixed += want[k]; }
+      const rest = Math.max(0, total - fixed);
+      if (free.length) {
+        const w = free.map(kindSum);
+        const W = w.reduce((a, b) => a + b, 0);
+        free.forEach((k, i) => { want[k] = W > 0 ? (w[i] / W) * rest : rest / free.length; });
+      }
+      const target: Record<HourKind, number> = { contact: 0, practice: 0, autonomous: 0 };
+      largestRemainder(HOUR_KINDS.map((k) => want[k]), totalSteps).forEach((s, i) => { target[HOUR_KINDS[i]] = s; });
       for (const k of HOUR_KINDS) {
         const w = mc.units.map((u) => u.hours[k]);
         const weights = w.some((x) => x > 0) ? w : mc.units.map(unitTotal);
-        largestRemainder(weights, target[k]).forEach((s, i) => { mc.units[i].hours[k] = s * step; });
+        largestRemainder(weights, target[k]).forEach((s, i) => { mc.units[i].hours[k] = r(s * step); });
       }
       repairs.push(`Horas: se redistribuyeron en proporción para sumar ${round2(sumUnitHours(mc.units))} h (la propuesta sumaba ${before} h${splitBroken ? ' y no respetaba el reparto exigido' : ''}).`);
     }
@@ -319,7 +348,7 @@ export function repairArithmetic(answers: MicrocurriculumAnswers, input: Microcu
     }
   }
 
-  if (mc.evaluation.length) {
+  if (doPercents && mc.evaluation.length) {
     const sum = round2(mc.evaluation.reduce((a, e) => a + e.percent, 0));
     if (Math.abs(sum - 100) > 0.01) {
       largestRemainder(mc.evaluation.map((e) => e.percent), 100).forEach((p, i) => { mc.evaluation[i].percent = p; });

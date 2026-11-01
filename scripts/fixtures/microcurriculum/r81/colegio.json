@@ -17,10 +17,10 @@
     "generalObjective": "Explicar el funcionamiento de un ecosistema cercano y proponer acciones para su cuidado.",
     "specificObjectives": ["Describir los componentes de un ecosistema.", "Explicar las cadenas alimentarias.", "Proponer acciones de cuidado del entorno."],
     "outcomes": [
-      { "id": "RA1", "text": "El estudiante clasifica los factores de un ecosistema de su vereda, en una salida de campo, distinguiendo correctamente bióticos y abióticos.", "verb": "clasificar", "bloom": "comprender", "condition": "en una salida de campo", "criterion": "distinguiendo correctamente bióticos y abióticos" },
-      { "id": "RA2", "text": "El estudiante representa una cadena alimentaria local, con dibujos o maquetas, con al menos cuatro eslabones correctos.", "verb": "representar", "bloom": "aplicar", "condition": "con dibujos o maquetas", "criterion": "con al menos cuatro eslabones correctos" },
-      { "id": "RA3", "text": "El estudiante explica el efecto de quitar un eslabón de la cadena, a partir de su representación, con argumentos de causa y efecto.", "verb": "explicar", "bloom": "comprender", "condition": "a partir de su representación", "criterion": "con argumentos de causa y efecto" },
-      { "id": "RA4", "text": "El estudiante propone acciones para cuidar el ecosistema de su vereda, en un proyecto de aula, viables para su comunidad.", "verb": "proponer", "bloom": "crear", "condition": "en un proyecto de aula", "criterion": "viables para su comunidad" }
+      { "id": "RA1", "text": "Clasificar los factores de un ecosistema de su vereda, en una salida de campo, distinguiendo correctamente bióticos y abióticos.", "verb": "clasificar", "bloom": "comprender", "condition": "en una salida de campo", "criterion": "distinguiendo correctamente bióticos y abióticos" },
+      { "id": "RA2", "text": "Representar una cadena alimentaria local, con dibujos o maquetas, con al menos cuatro eslabones correctos.", "verb": "representar", "bloom": "aplicar", "condition": "con dibujos o maquetas", "criterion": "con al menos cuatro eslabones correctos" },
+      { "id": "RA3", "text": "Explicar el efecto de quitar un eslabón de la cadena, a partir de su representación, con argumentos de causa y efecto.", "verb": "explicar", "bloom": "comprender", "condition": "a partir de su representación", "criterion": "con argumentos de causa y efecto" },
+      { "id": "RA4", "text": "Proponer acciones para cuidar el ecosistema de su vereda, en un proyecto de aula, viables para su comunidad.", "verb": "proponer", "bloom": "crear", "condition": "en un proyecto de aula", "criterion": "viables para su comunidad" }
     ],
     "competencies": [],
     "units": [

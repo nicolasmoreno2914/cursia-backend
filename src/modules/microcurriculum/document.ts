@@ -18,7 +18,7 @@ export class MicrocurriculumOutputError extends Error {
 
 const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const collapse = (s: string) => s.replace(/[ \t]+/g, ' ').replace(/\s*\n\s*/g, '\n').trim();
-const text = (v: unknown, max = MC_LIMITS.text * 2): string => (typeof v === 'string' ? collapse(v).slice(0, max) : typeof v === 'number' ? String(v) : '');
+const text = (v: unknown, max: number = MC_LIMITS.text): string => (typeof v === 'string' ? collapse(v).slice(0, max) : typeof v === 'number' ? String(v) : '');
 const texts = (v: unknown, max: number): string[] => (Array.isArray(v) ? v.map((x) => text(x)).filter(Boolean).slice(0, max) : []);
 const hours = (v: unknown): number => {
   const n = typeof v === 'string' ? Number(v.replace(',', '.')) : v;
@@ -139,7 +139,8 @@ export function withRegeneratedSection(doc: MicrocurriculumV1, section: 'outcome
   const r = isObj(raw) ? raw : {};
   if (!Array.isArray(r[section]) || !(r[section] as unknown[]).length) throw new MicrocurriculumOutputError([`falta la lista «${section}»`]);
   const b = body({ [section]: r[section] } as Record<string, unknown>);
-  return { ...doc, [section]: b[section], provenance: { ...doc.provenance, [section]: 'cursia' }, repairs: [] };
+  // El historial de reparaciones se conserva (review P2-1); las de esta regeneración se agregan después.
+  return { ...doc, [section]: b[section], provenance: { ...doc.provenance, [section]: 'cursia' }, repairs: (doc.repairs || []).slice() };
 }
 
 function identification(v: unknown, prev: McIdentification): McIdentification {

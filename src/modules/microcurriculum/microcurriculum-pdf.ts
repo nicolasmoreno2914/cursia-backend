@@ -20,7 +20,8 @@ const C = {
   ink: '#1B2433', soft: '#5B6573', faint: '#8A94A3', line: '#D5DBE3', fill: '#F2F5F7', navy: '#173B5C',
   accent: '#0E716D', accentSoft: '#E3F1EF', warn: '#8A5205', warnSoft: '#F7EBD6',
 };
-const T = (s: unknown) => pdfText(String(s == null ? '' : s));
+/** pdfText convierte los saltos de línea en espacios: se aplica por línea para conservar los párrafos (review P2-11). */
+const T = (s: unknown) => String(s == null ? '' : s).split(/\r?\n/).map((l) => pdfText(l)).join('\n');
 const fmtH = (n: number) => (Number.isInteger(n) ? String(n) : String(Math.round(n * 100) / 100).replace('.', ','));
 
 export interface MicrocurriculumPdfMeta {

@@ -173,7 +173,7 @@ export function buildSystemPrompt(answers: MicrocurriculumAnswers): string {
     universidad: '- Universidad: lenguaje académico formal; resultados de aprendizaje alineados con el perfil de egreso; incluye 2 a 4 competencias (genéricas y específicas); el trabajo autónomo suele ser al menos el doble del trabajo con el docente cuando se habla de créditos.',
     tecnica: '- Institución técnica o tecnológica: enfoque en saber hacer y en desempeños de ocupación; competencias técnicas y transversales (2 a 4); prioriza práctica y laboratorio.',
     etdh: '- SENA / Educación para el Trabajo y el Desarrollo Humano: llama «aprendices» a los estudiantes; resultados de aprendizaje y competencias laborales en el estilo de las normas de competencia (2 a 4 competencias); la práctica y la evidencia de desempeño pesan más que la teoría.',
-    colegio: '- Colegio: la sección de resultados se llama «Desempeños» y cada desempeño se redacta como «El estudiante [verbo]…» SIN perder el verbo observable al inicio del campo verb; lenguaje claro para el grado indicado; actividades adecuadas a la edad; competencias solo si el docente las dio.',
+    colegio: '- Colegio: la sección de resultados se titula «Desempeños», pero cada desempeño se redacta IGUAL que un resultado: empieza con el verbo observable en infinitivo (p. ej. «Clasificar los factores…»), nunca con «El estudiante…»; lenguaje claro para el grado indicado; actividades adecuadas a la edad; competencias solo si el docente las dio.',
     corporativa: '- Formación corporativa: llama «participantes» a los estudiantes; orientación a resultados en el puesto de trabajo, casos y retos del negocio; evaluación aplicada (productos, simulaciones), no académica; competencias solo si el docente las dio.',
   };
   return [

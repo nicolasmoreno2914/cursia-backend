@@ -7,6 +7,7 @@
 //   MP2  colegio (sin competencias) → 11 secciones, «Desempeños» en vez de «Resultados de aprendizaje», sin «Competencias»
 //   MP3  determinista: mismo documento + misma fecha → mismos bytes; otra fecha → otros bytes
 //   MP4  nota «Revisar» en la portada SOLO con issues (y con su código); bibliografía sugerida «verificar disponibilidad»
+//   MP6  saltos de línea conservados (review P2-11)
 //   MP5  logo de la cuenta (bytes PNG) se acepta; textos fuera de WinAnsi no rompen el PDF
 //
 // Uso: node scripts/check-r81-microcurriculum-pdf.js [path/to/dist]
@@ -110,6 +111,14 @@ const flat = (s) => s.replace(/\s+/g, ' ');
     assert(t.includes('Liderazgo de equipos remotos') && t.includes('participante'), 'contenido');
   });
 
+
+  await check('MP6 (review P2-11) los saltos de línea de los campos se conservan: dos párrafos de la descripción salen en líneas distintas', async () => {
+    const c = docOf('etdh');
+    c.mc.description = 'PRIMER-PARRAFO del curso.\nSEGUNDO-PARRAFO del curso.';
+    const r = await PDF.renderMicrocurriculumPdf(c.mc, { date: DATE, issues: [] });
+    const raw = await textOf(r.pdf);
+    assert(/PRIMER-PARRAFO del curso\.\s*\n\s*SEGUNDO-PARRAFO/.test(raw), 'párrafos en líneas separadas');
+  });
   console.log(`\n${ok} OK, ${fail} fallidas`);
   process.exit(fail ? 1 : 0);
 })();

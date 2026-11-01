@@ -9,6 +9,8 @@
 //   MC3  casos malos por cada código V1–V8 (cada uno detectado con su código)
 //   MC4  reparación aritmética: V1 (proporcional a 0,5 h, respeta el reparto exigido) y V2 (mayor resto a 100), registrada
 //   MC5  salida inservible → MicrocurriculumOutputError; edición del docente → procedencia `docente`; sección regenerada
+//   MC7  regresiones de la revisión r81 (stemming, reparación 0,25 h, cortes con 0 %, alcance de la reparación, colegio,
+//        límite de edición)
 //   MC6  prompt: herramienta forzada, restricciones calculadas, terminología por institución, reintento y regeneración,
 //        español neutro (Language QA sin hallazgos)
 //
@@ -344,6 +346,54 @@ const codes = (issues, sev = 'error') => [...new Set(issues.filter((i) => i.seve
     }
   });
 
+
+  // ── MC7 review r81 (regresiones) ──
+  await check('MC7.1 (P1-2) stemming simétrico: singular en «e» = plural (V4 sin falsos positivos, V5 sin falsos negativos)', () => {
+    for (const [t, h] of [['Bases de datos', 'Base de datos relacional'], ['Variables aleatorias', 'Variable aleatoria discreta'], ['Clase', 'Diseño de clases'], ['Fuentes de financiación', 'Fuente de financiación'], ['Redes', 'red local'], ['Funciones', 'función lineal']]) {
+      eq(V.topicAppears(t, h), true, `${t} ~ ${h}`);
+    }
+    eq(V.topicAppears('Redes neuronales', 'Redes de computadores'), false, 'sigue exigiendo todos los tokens');
+    const { answers, mc } = docOf('tecnica');
+    answers.contents.excludedTopics = ['Bases de datos'];
+    mc.units[2].contents.push('Base de datos de incidentes');
+    eq(codes(V.validateMicrocurriculum(answers, mc)), ['V5'], 'V5 detecta el singular');
+  });
+  await check('MC7.2 (P2-2) total no múltiplo de 0,5 con los tres tipos exigidos (30,75 h = 10,25 × 3) → la reparación cierra V1 exacto', () => {
+    const { answers, mc } = docOf('tecnica');
+    answers.time = { mode: 'weekly', weeks: 15, hoursPerWeek: 2.05, split: { contact: 10.25, practice: 10.25, autonomous: 10.25 } };
+    eq(A.splitConsistent(answers.time), true);
+    eq(V.hoursStepFor(30.75), 0.25);
+    eq(V.hoursStepFor(144), 0.5);
+    const r = V.repairArithmetic(answers, mc);
+    eq(V.validateMicrocurriculum(answers, r.mc).filter((i) => i.code === 'V1'), [], 'V1 resuelto');
+    eq(['contact', 'practice', 'autonomous'].map((k) => r.mc.units.reduce((a, u) => a + u.hours[k], 0)), [10.25, 10.25, 10.25]);
+  });
+  await check('MC7.3 (P2-10) cortes: un momento de 0 % (al final o al inicio) no rompe 30/30/40', () => {
+    eq(V.respectsCuts([30, 30, 40, 0], [30, 30, 40]), true);
+    eq(V.respectsCuts([0, 15, 15, 30, 40], [30, 30, 40]), true);
+    eq(V.respectsCuts([30, 0, 70], [30, 30, 40]), false);
+  });
+  await check('MC7.4 (P2-1) reparación con alcance: {hours:false, percents:false} no toca nada; la sección regenerada conserva el historial de reparaciones', () => {
+    const { answers, mc } = docOf('universidad');
+    mc.units[0].hours.autonomous += 7; mc.evaluation[0].percent = 5;
+    const r = V.repairArithmetic(answers, mc, { hours: false, percents: false });
+    eq([r.repairs, r.mc.units[0].hours.autonomous, r.mc.evaluation[0].percent], [[], 25, 5]);
+    const only = V.repairArithmetic(answers, mc, { hours: false });
+    eq([only.mc.units[0].hours.autonomous, only.mc.evaluation.reduce((a, e) => a + e.percent, 0)], [25, 100], 'solo %');
+    const withHist = { ...mc, repairs: ['Horas: reparación anterior.'] };
+    eq(DOC.withRegeneratedSection(withHist, 'outcomes', { outcomes: mc.outcomes }).repairs, ['Horas: reparación anterior.']);
+  });
+  await check('MC7.5 (P2-12) colegio: solo cambia el título («Desempeños»); los enunciados empiezan con el verbo en infinitivo', () => {
+    const sys = P.buildSystemPrompt(A.normalizeAnswers(FIX.colegio.answers));
+    assert(/se titula «Desempeños»/.test(sys) && /empieza con el verbo observable en infinitivo/.test(sys) && /nunca con «El estudiante…»/.test(sys), 'regla de colegio');
+    assert(FIX.colegio.tool.outcomes.every((o) => !/^El estudiante/.test(o.text) && o.text.toLowerCase().startsWith(o.verb.slice(0, 5))), 'fixture en infinitivo');
+  });
+  await check('MC7.6 (P2-11) la edición del documento recorta los textos a 2 000 caracteres (como las respuestas) y conserva los saltos de línea', () => {
+    const { mc } = docOf('universidad');
+    const e = DOC.documentFromEdit({ ...clone(mc), description: `Párrafo uno.\nPárrafo dos.${'x'.repeat(3000)}` }, mc);
+    eq(e.description.length, 2000);
+    assert(e.description.startsWith('Párrafo uno.\nPárrafo dos.'), 'salto conservado');
+  });
   console.log(`\n${ok} OK, ${fail} fallidas`);
   process.exit(fail ? 1 : 0);
 })();
