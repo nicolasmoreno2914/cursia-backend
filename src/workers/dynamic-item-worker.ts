@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { createHash } from 'crypto';
 import { TTS_SNAPSHOT_MODEL, resolveTtsModel } from '../tts/tts-models';
+import { loadVideoBrand } from '../video-engine/video-brand';
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DataSource } from 'typeorm';
@@ -822,6 +823,14 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
         jobId = mockJobId(item.idempotencyKey);
       } else {
         submitInFlight = { jobId: null };
+        // Logo y nombre del curso (los mismos del Libro Guía); si no se pueden leer, Videogen usa los de la cuenta
+        const videoBrand = await loadVideoBrand(deps.dataSource as any, item.courseId, runHead.ownerId).catch((err: unknown) => {
+          logger.warn(`Item ${item.itemKey}: marca del video no disponible (${err instanceof Error ? err.message : String(err)}) — Videogen usa la de la cuenta`);
+          return null;
+        });
+        if (videoBrand) {
+          logger.log(`Item ${item.itemKey}: logo del video = ${videoBrand.logoSource}` + (videoBrand.warnings.length ? ` (avisos: ${videoBrand.warnings.join(', ')})` : ''));
+        }
         let result;
         try {
           // r62 (N2): timeout del cliente SOLO en V2 (un POST vencido es un envío ambiguo, como ya se trata abajo).
@@ -832,6 +841,7 @@ export async function processItem(deps: DynamicItemWorkerDeps, item: ClaimedItem
               chapter_number: item.chapterNumber ?? 0,
               client_reference_id: item.idempotencyKey,
               external_metadata: { tts_model: dynamicVideogenTtsModel() },
+              ...(videoBrand ? { brand: videoBrand.brand } : {}),
             },
           ], videogenV2CallOptions('submit'));
         } catch (err) {
