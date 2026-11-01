@@ -1,0 +1,41 @@
+{
+  "_nota": "r81 · fixture de microcurrículo (SENA/ETDH): horas totales con reparto exigido en los tres tipos, 4 unidades, examen final obligatorio.",
+  "answers": {
+    "identification": { "courseName": "Atención al usuario en servicios de salud", "institutionType": "etdh", "program": "Técnico laboral en Auxiliar Administrativo en Salud", "modality": "presencial" },
+    "learners": { "profile": "Aprendices mayores de 17 años, bachilleres, muchos en su primer empleo.", "specialNeeds": "Dos aprendices con baja visión." },
+    "purpose": { "need": "Las IPS reciben quejas por mala orientación de los usuarios en ventanilla.", "expectedAbilities": "Orientar a los usuarios sobre trámites, aplicar el protocolo de atención y gestionar quejas.", "competencies": "Atender a los usuarios según el protocolo institucional y la normativa vigente." },
+    "time": { "mode": "total", "totalHours": 120, "split": { "contact": 40, "practice": 60, "autonomous": 20 } },
+    "contents": { "requiredTopics": ["Protocolo de atención", "Derechos y deberes del usuario", "Gestión de quejas"], "excludedTopics": ["Facturación"], "unitCount": 4 },
+    "methodology": { "strategies": ["talleres", "casos"], "institutionalEvaluation": "Examen final obligatorio" },
+    "references": { "author": "Instructor Carlos Gómez" }
+  },
+  "tool": {
+    "description": "Programa de formación práctico en el que los aprendices aplican el protocolo de atención al usuario en servicios de salud mediante simulaciones de ventanilla y estudio de casos reales.",
+    "justification": "Las IPS de la región registran quejas por la orientación deficiente de los usuarios; la formación responde a esa necesidad del sector.",
+    "learnerProfile": "Aprendices mayores de 17 años, bachilleres, muchos en su primer empleo; dos aprendices con baja visión requieren materiales accesibles.",
+    "priorKnowledge": "Ninguno específico; lectura y escritura funcional.",
+    "generalObjective": "Atender a los usuarios de servicios de salud aplicando el protocolo institucional y la normativa vigente.",
+    "specificObjectives": ["Aplicar el protocolo de atención en ventanilla.", "Orientar sobre derechos y deberes del usuario.", "Tramitar quejas y reclamos."],
+    "outcomes": [
+      { "id": "RA1", "text": "Aplicar el protocolo de atención en una simulación de ventanilla, cumpliendo todos los pasos de la lista de verificación.", "verb": "aplicar", "bloom": "aplicar", "condition": "en una simulación de ventanilla", "criterion": "cumpliendo todos los pasos de la lista de verificación" },
+      { "id": "RA2", "text": "Explicar al usuario sus derechos y deberes, en un caso simulado, con lenguaje claro y sin errores normativos.", "verb": "explicar", "bloom": "comprender", "condition": "en un caso simulado", "criterion": "con lenguaje claro y sin errores normativos" },
+      { "id": "RA3", "text": "Tramitar una queja en el formato institucional, a partir de un caso real anonimizado, dentro de los tiempos establecidos.", "verb": "tramitar", "bloom": "aplicar", "condition": "a partir de un caso real anonimizado", "criterion": "dentro de los tiempos establecidos" },
+      { "id": "RA4", "text": "Resolver situaciones difíciles de atención, en juego de roles, con una respuesta respetuosa y acorde al protocolo.", "verb": "resolver", "bloom": "aplicar", "condition": "en juego de roles", "criterion": "con una respuesta respetuosa y acorde al protocolo" }
+    ],
+    "competencies": [ { "id": "CO1", "text": "Atender a los usuarios según el protocolo institucional y la normativa vigente." } ],
+    "units": [
+      { "id": "U1", "title": "Protocolo de atención", "contents": ["Momentos de la atención", "Comunicación asertiva", "Accesibilidad"], "outcomeIds": ["RA1"], "hours": { "contact": 10, "practice": 15, "autonomous": 5 }, "weeks": null, "strategy": "talleres", "mainActivity": "Simulación de ventanilla" },
+      { "id": "U2", "title": "Derechos y deberes del usuario", "contents": ["Carta de derechos", "Deberes del usuario", "Orientación sobre trámites"], "outcomeIds": ["RA2"], "hours": { "contact": 10, "practice": 15, "autonomous": 5 }, "weeks": null, "strategy": "casos", "mainActivity": "Análisis de casos de orientación" },
+      { "id": "U3", "title": "Gestión de quejas", "contents": ["Tipos de queja y reclamo", "Formato institucional", "Tiempos de respuesta"], "outcomeIds": ["RA3"], "hours": { "contact": 10, "practice": 15, "autonomous": 5 }, "weeks": null, "strategy": "casos", "mainActivity": "Trámite de tres quejas reales anonimizadas" },
+      { "id": "U4", "title": "Situaciones difíciles", "contents": ["Usuarios alterados", "Manejo de la frustración", "Escalamiento"], "outcomeIds": ["RA4", "RA1"], "hours": { "contact": 10, "practice": 15, "autonomous": 5 }, "weeks": null, "strategy": "talleres", "mainActivity": "Juego de roles con situaciones difíciles" }
+    ],
+    "methodology": { "text": "Cada sesión inicia con una demostración del instructor y continúa con práctica en simulaciones y casos; los materiales se entregan también en formato accesible.", "strategies": ["talleres", "casos"] },
+    "evaluation": [
+      { "name": "Simulación de ventanilla", "percent": 25, "outcomeIds": ["RA1"], "week": null, "evidence": "Desempeño observado, lista de verificación" },
+      { "name": "Estudio de casos", "percent": 25, "outcomeIds": ["RA2", "RA3"], "week": null, "evidence": "Casos resueltos, rúbrica" },
+      { "name": "Examen final", "percent": 50, "outcomeIds": ["RA4", "RA3"], "week": null, "evidence": "Prueba práctica de juego de roles y prueba escrita" }
+    ],
+    "resources": ["Aula de simulación", "Formatos institucionales de quejas"],
+    "bibliography": []
+  }
+}

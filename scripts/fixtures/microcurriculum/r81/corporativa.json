@@ -1,0 +1,40 @@
+{
+  "_nota": "r81 · fixture de microcurrículo (corporativa): pocas horas, 3 unidades pedidas, tema excluido, sin competencias.",
+  "answers": {
+    "identification": { "courseName": "Liderazgo de equipos remotos", "institutionType": "corporativa", "program": "Escuela de Líderes 2027", "modality": "virtual", "code": "EL-04" },
+    "learners": { "profile": "Jefes de área recién promovidos que lideran equipos distribuidos en tres países.", "priorKnowledge": "Experiencia técnica en su área; poca experiencia liderando personas." },
+    "purpose": { "need": "Los equipos remotos pierden alineación y aumenta la rotación en el primer año del nuevo jefe.", "expectedAbilities": "Planear reuniones efectivas, dar retroalimentación y acordar objetivos con su equipo a distancia." },
+    "time": { "mode": "total", "totalHours": 16 },
+    "contents": { "requiredTopics": ["Retroalimentación", "Objetivos del equipo"], "excludedTopics": ["Legislación laboral"], "unitCount": 3 },
+    "methodology": { "strategies": ["casos", "aula invertida"] },
+    "references": { "notes": "El curso se dicta en la plataforma de la empresa." }
+  },
+  "tool": {
+    "description": "Programa de formación virtual en el que los participantes practican las conversaciones y rutinas clave para liderar equipos distribuidos: reuniones, retroalimentación y acuerdos de objetivos.",
+    "justification": "Los equipos remotos pierden alineación con el cambio de jefe y la rotación aumenta en el primer año; el programa prepara a los nuevos líderes para evitarlo.",
+    "learnerProfile": "Jefes de área recién promovidos que lideran equipos distribuidos en tres países.",
+    "priorKnowledge": "Experiencia técnica en su área; poca experiencia liderando personas.",
+    "generalObjective": "Liderar un equipo remoto con rutinas de reunión, retroalimentación y objetivos acordados.",
+    "specificObjectives": ["Planear reuniones remotas efectivas.", "Dar retroalimentación a distancia.", "Acordar objetivos con el equipo."],
+    "outcomes": [
+      { "id": "RA1", "text": "Planear una reunión remota de seguimiento, con la plantilla del programa, con agenda, tiempos y acuerdos explícitos.", "verb": "planear", "bloom": "crear", "condition": "con la plantilla del programa", "criterion": "con agenda, tiempos y acuerdos explícitos" },
+      { "id": "RA2", "text": "Dar retroalimentación a un colaborador, en una simulación por videollamada, siguiendo el modelo situación-comportamiento-impacto.", "verb": "dar", "bloom": "aplicar", "condition": "en una simulación por videollamada", "criterion": "siguiendo el modelo situación-comportamiento-impacto" },
+      { "id": "RA3", "text": "Formular objetivos del equipo para un trimestre, a partir de la estrategia del área, medibles y con responsable.", "verb": "formular", "bloom": "crear", "condition": "a partir de la estrategia del área", "criterion": "medibles y con responsable" },
+      { "id": "RA4", "text": "Analizar un caso de equipo desalineado, con la guía de diagnóstico, identificando al menos tres causas.", "verb": "analizar", "bloom": "analizar", "condition": "con la guía de diagnóstico", "criterion": "identificando al menos tres causas" }
+    ],
+    "competencies": [],
+    "units": [
+      { "id": "U1", "title": "Rutinas del equipo remoto", "contents": ["Reuniones remotas efectivas", "Acuerdos de comunicación", "Diagnóstico de alineación"], "outcomeIds": ["RA1", "RA4"], "hours": { "contact": 2, "practice": 2, "autonomous": 1.5 }, "weeks": null, "strategy": "aula invertida", "mainActivity": "Plan de reunión de seguimiento del propio equipo" },
+      { "id": "U2", "title": "Retroalimentación a distancia", "contents": ["Modelo situación-comportamiento-impacto", "Conversaciones difíciles por videollamada"], "outcomeIds": ["RA2"], "hours": { "contact": 2, "practice": 2.5, "autonomous": 1 }, "weeks": null, "strategy": "casos", "mainActivity": "Simulación de retroalimentación por videollamada" },
+      { "id": "U3", "title": "Objetivos del equipo", "contents": ["Objetivos medibles", "Seguimiento trimestral"], "outcomeIds": ["RA3"], "hours": { "contact": 2, "practice": 2, "autonomous": 1 }, "weeks": null, "strategy": "casos", "mainActivity": "Tablero de objetivos trimestrales del equipo" }
+    ],
+    "methodology": { "text": "Los participantes revisan materiales cortos antes de cada sesión en vivo, que se dedica a casos y simulaciones con retroalimentación del facilitador.", "strategies": ["casos", "aula invertida"] },
+    "evaluation": [
+      { "name": "Plan de reunión y diagnóstico", "percent": 30, "outcomeIds": ["RA1", "RA4"], "week": null, "evidence": "Plantilla diligenciada, lista de chequeo" },
+      { "name": "Simulación de retroalimentación", "percent": 30, "outcomeIds": ["RA2"], "week": null, "evidence": "Grabación de la simulación, rúbrica" },
+      { "name": "Tablero de objetivos", "percent": 40, "outcomeIds": ["RA3"], "week": null, "evidence": "Tablero validado con el jefe directo, rúbrica" }
+    ],
+    "resources": ["Plataforma de la empresa", "Plantillas del programa"],
+    "bibliography": [ { "text": "Scott, K. (2017). Radical Candor. St. Martin's Press.", "origin": "sugerida" } ]
+  }
+}

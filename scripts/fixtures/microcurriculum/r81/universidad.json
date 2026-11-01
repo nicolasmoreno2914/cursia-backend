@@ -1,0 +1,45 @@
+{
+  "_nota": "r81 · fixture de microcurrículo (universidad): respuestas del docente + salida modelo de la herramienta emit_microcurriculum que pasa V1–V8 sin reparaciones.",
+  "answers": {
+    "identification": { "courseName": "Finanzas Corporativas", "institutionType": "universidad", "program": "Administración de Empresas", "term": "Quinto semestre", "modality": "presencial", "code": "ADM-305", "area": "Finanzas" },
+    "learners": { "profile": "Estudiantes de quinto semestre, entre 19 y 24 años; muchos trabajan medio tiempo en pymes.", "priorKnowledge": "Contabilidad financiera y matemática financiera básica.", "context": "Bogotá, Colombia" },
+    "purpose": { "need": "Los egresados toman decisiones de inversión sin evaluar el costo del dinero en el tiempo.", "expectedAbilities": "Evaluar proyectos de inversión, proyectar flujos de caja y estimar el costo de capital de una empresa.", "competencies": "Toma de decisiones financieras basadas en evidencia. Comunicación de resultados financieros a la gerencia." },
+    "time": { "mode": "credits", "credits": 3, "split": { "contact": 48, "autonomous": 96 }, "calendar": "16 semanas" },
+    "contents": { "requiredTopics": ["Flujo de caja", "Valor presente neto", "Costo de capital"], "excludedTopics": ["Criptomonedas"], "unitCount": 4 },
+    "methodology": { "strategies": ["casos", "talleres", "proyectos"], "institutionalEvaluation": "Cortes 30/30/40 según el reglamento estudiantil", "resources": "Sala de cómputo con hojas de cálculo" },
+    "references": { "bibliography": ["Ross, S. A., Westerfield, R. W., & Jaffe, J. (2018). Finanzas corporativas (11.ª ed.). McGraw-Hill."], "author": "Mg. Laura Pérez" }
+  },
+  "tool": {
+    "description": "Curso teórico-práctico en el que los estudiantes analizan las decisiones de inversión y financiación de la empresa. A partir de casos de pymes colombianas, proyectan flujos de caja, valoran proyectos y estiman el costo de capital para recomendar decisiones a la gerencia.",
+    "justification": "Muchos egresados toman decisiones de inversión sin considerar el valor del dinero en el tiempo ni el riesgo. El curso responde a esa necesidad del programa de Administración de Empresas y del tejido empresarial de la región.",
+    "learnerProfile": "Estudiantes de quinto semestre, entre 19 y 24 años, que en buena parte trabajan medio tiempo en pymes.",
+    "priorKnowledge": "Contabilidad financiera y matemática financiera básica.",
+    "generalObjective": "Evaluar decisiones de inversión y financiación de una empresa con herramientas de valoración financiera.",
+    "specificObjectives": ["Proyectar el flujo de caja libre de una empresa.", "Calcular indicadores de valoración de proyectos.", "Estimar el costo promedio ponderado de capital."],
+    "outcomes": [
+      { "id": "RA1", "text": "Identificar los componentes del flujo de caja libre en estados financieros reales, sin omitir partidas no monetarias.", "verb": "identificar", "bloom": "recordar", "condition": "en estados financieros reales", "criterion": "sin omitir partidas no monetarias" },
+      { "id": "RA2", "text": "Proyectar el flujo de caja de una pyme a cinco años, con hoja de cálculo, con supuestos documentados y consistentes.", "verb": "proyectar", "bloom": "aplicar", "condition": "con hoja de cálculo", "criterion": "con supuestos documentados y consistentes" },
+      { "id": "RA3", "text": "Calcular el valor presente neto y la TIR de un proyecto, a partir de flujos proyectados, con error menor al 1 %.", "verb": "calcular", "bloom": "aplicar", "condition": "a partir de flujos proyectados", "criterion": "con error menor al 1 %" },
+      { "id": "RA4", "text": "Evaluar la conveniencia de un proyecto de inversión, usando el costo de capital estimado, con una recomendación argumentada.", "verb": "evaluar", "bloom": "evaluar", "condition": "usando el costo de capital estimado", "criterion": "con una recomendación argumentada" }
+    ],
+    "competencies": [ { "id": "CO1", "text": "Toma de decisiones financieras basadas en evidencia." }, { "id": "CO2", "text": "Comunicación de resultados financieros a la gerencia." } ],
+    "units": [
+      { "id": "U1", "title": "Fundamentos del flujo de caja", "contents": ["Flujo de caja libre", "Partidas no monetarias", "Capital de trabajo"], "outcomeIds": ["RA1"], "hours": { "contact": 9, "practice": 0, "autonomous": 18 }, "weeks": { "from": 1, "to": 3 }, "strategy": "talleres", "mainActivity": "Taller de lectura de estados financieros de una pyme" },
+      { "id": "U2", "title": "Proyección financiera", "contents": ["Supuestos de proyección", "Flujo de caja proyectado", "Escenarios"], "outcomeIds": ["RA2"], "hours": { "contact": 12, "practice": 0, "autonomous": 24 }, "weeks": { "from": 4, "to": 7 }, "strategy": "casos", "mainActivity": "Proyección del flujo de caja de una empresa del caso" },
+      { "id": "U3", "title": "Valoración de proyectos", "contents": ["Valor presente neto", "Tasa interna de retorno", "Periodo de recuperación"], "outcomeIds": ["RA3"], "hours": { "contact": 12, "practice": 0, "autonomous": 24 }, "weeks": { "from": 8, "to": 11 }, "strategy": "talleres", "mainActivity": "Taller de valoración de tres proyectos" },
+      { "id": "U4", "title": "Costo de capital y decisión de inversión", "contents": ["Costo de capital", "Costo promedio ponderado", "Recomendación a la gerencia"], "outcomeIds": ["RA4", "RA3"], "hours": { "contact": 15, "practice": 0, "autonomous": 30 }, "weeks": { "from": 12, "to": 16 }, "strategy": "proyectos", "mainActivity": "Proyecto final: evaluación de una inversión real" }
+    ],
+    "methodology": { "text": "Cada unidad parte de un caso de una pyme; el docente modela el análisis y los estudiantes lo replican en talleres y en un proyecto final por equipos.", "strategies": ["casos", "talleres", "proyectos"] },
+    "evaluation": [
+      { "name": "Taller de flujo de caja", "percent": 15, "outcomeIds": ["RA1"], "week": 3, "evidence": "Taller resuelto, valorado con lista de chequeo" },
+      { "name": "Caso de proyección", "percent": 15, "outcomeIds": ["RA2"], "week": 6, "evidence": "Hoja de cálculo con supuestos, valorada con rúbrica" },
+      { "name": "Parcial de valoración", "percent": 30, "outcomeIds": ["RA3"], "week": 10, "evidence": "Prueba escrita de cálculo de VPN y TIR" },
+      { "name": "Proyecto final", "percent": 40, "outcomeIds": ["RA4", "RA2"], "week": 16, "evidence": "Informe y sustentación ante la gerencia simulada, con rúbrica" }
+    ],
+    "resources": ["Sala de cómputo con hojas de cálculo", "Estados financieros públicos de pymes"],
+    "bibliography": [
+      { "text": "Ross, S. A., Westerfield, R. W., & Jaffe, J. (2018). Finanzas corporativas (11.ª ed.). McGraw-Hill.", "origin": "docente" },
+      { "text": "Brealey, R. A., Myers, S. C., & Allen, F. Principios de finanzas corporativas. McGraw-Hill.", "origin": "sugerida" }
+    ]
+  }
+}
