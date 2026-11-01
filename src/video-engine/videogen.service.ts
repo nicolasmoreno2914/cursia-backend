@@ -1,3 +1,4 @@
+import type { VideogenBrand } from './video-brand';
 import { Injectable, Logger } from '@nestjs/common';
 
 export interface VideogenVideoPayload {
@@ -8,6 +9,8 @@ export interface VideogenVideoPayload {
   tts_voice?: string;
   /** r59: metadata libre que Videogen guarda con el pedido; lee `tts_model` (p.ej. snapshot fijo del TTS). */
   external_metadata?: Record<string, unknown>;
+  /** Logo y nombre del video (los del Libro Guía del curso: video-brand.ts). Sin esto, Videogen usa los de la cuenta. */
+  brand?: VideogenBrand;
 }
 
 export interface VideogenBatchJob {
