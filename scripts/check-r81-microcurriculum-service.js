@@ -5,7 +5,7 @@
 //
 //   MS1  migración aditiva e idempotente (dos veces); el script se niega sin MIGRATION_ENV=staging
 //   MS2  flag apagado → 404 en todo salvo /quota ({ enabled: false })
-//   MS3  CRUD por dueño: crear (respuestas normalizadas), leer, listar sin documento, PATCH por paso, borrar; ajeno → 404
+//   MS3  CRUD por dueño: crear (respuestas normalizadas), leer, listar sin documento, PATCH reemplaza respuestas, borrar; ajeno → 404
 //   MS4  generar: obligatorias faltantes → 400 ANSWERS_INCOMPLETE con `missing`; éxito → generated, issues [], costo,
 //        ledger `llm.microcurriculo` (sin atribuir, billingAccount cursia), generación `succeeded`
 //   MS5  salida inválida (max_tokens / sin tool_use) → reintento → ok; errores no aritméticos → reintento con la lista;
@@ -167,11 +167,10 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const rec = await svc.create(OWNER, { identification: { courseName: '  Finanzas Corporativas ', institutionType: 'universidad' }, contents: { requiredTopics: ['Flujo de caja', 'flujo de caja'] } });
       draftId = rec.id;
       eq([rec.status, rec.title, rec.answers.contents.requiredTopics, rec.document, rec.issues, rec.regenCount, rec.regenLimit], ['draft_answers', 'Finanzas Corporativas', ['Flujo de caja'], null, [], 0, 3]);
-      const p = await svc.update(OWNER, draftId, { answers: { learners: a.learners, purpose: a.purpose } });
-      eq(p.answers.identification.courseName, 'Finanzas Corporativas', 'los pasos no enviados se conservan');
+      const p = await svc.update(OWNER, draftId, { answers: { identification: { courseName: 'Finanzas Corporativas', institutionType: 'universidad' }, learners: a.learners, purpose: a.purpose } });
       eq(p.answers.learners.profile, a.learners.profile, 'paso nuevo');
-      const p2 = await svc.update(OWNER, draftId, { answers: { contents: { requiredTopics: ['Costo de capital'] } } });
-      eq(p2.answers.contents, { requiredTopics: ['Costo de capital'] }, 'el paso enviado reemplaza ese paso');
+      const p2 = await svc.update(OWNER, draftId, { answers: { identification: p.answers.identification, learners: a.learners, purpose: a.purpose, time: { mode: 'credits', credits: 3 } } });
+      eq([p2.answers.contents, p2.answers.time], [undefined, { mode: 'credits', credits: 3 }], 'las respuestas COMPLETAS reemplazan (sin mezclar)');
       const list = await svc.list(OWNER);
       eq(list.items.map((x) => [x.id, x.title, x.document, x.status]), [[draftId, 'Finanzas Corporativas', null, 'draft_answers']]);
       await rejects(svc.get(OTHER, draftId), 404, null, 'ajeno');
@@ -187,7 +186,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
     await check('MS4 generar: incompleto → 400 ANSWERS_INCOMPLETE con missing (sin llamada); completo → generated, issues [], costo, ledger y generación succeeded', async () => {
       reset();
       const body = await rejects(svc.generate(OWNER, draftId), 400, 'ANSWERS_INCOMPLETE');
-      eq(body.missing, ['time.totalHours', 'methodology.strategies'], 'faltan');
+      eq(body.missing, ['contents.requiredTopics', 'methodology.strategies'], 'faltan');
       eq(gen.calls.length, 0, 'sin llamada');
       await svc.update(OWNER, draftId, { answers: ANS('universidad') });
       gen.queue.push(TOOL('universidad'));
@@ -354,7 +353,8 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const p2 = await svc.update(OWNER, d.id, { document: doc });
       eq([p2.issues, p2.answers.identification.courseName, p2.title], [[], 'Finanzas Corporativas II', 'Finanzas Corporativas II'], 'identificación editada vuelve a las respuestas (V7 coherente)');
       await rejects(svc.update(OWNER, d.id, { document: [1] }), 400, 'DOCUMENT_INVALID');
-      const p3 = await svc.update(OWNER, d.id, { answers: { contents: { requiredTopics: ['Flujo de caja', 'Opciones reales'] } } });
+      const full = clone(p2.answers); full.contents.requiredTopics = ['Flujo de caja', 'Opciones reales'];
+      const p3 = await svc.update(OWNER, d.id, { answers: full });
       eq(p3.issues.map((i) => i.code), ['V4'], 'cambiar respuestas también revalida');
     });
 
@@ -449,6 +449,8 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       await rejects(run({ answers: { contents: { requiredTopics: Array.from({ length: 41 }, (_, i) => `t${i}`) } } }, dto.UpdateMicrocurriculumDto), 400);
       await rejects(run({ answers: { time: { totalHours: 1001 } } }, dto.UpdateMicrocurriculumDto), 400);
       await rejects(run({ answers: { otra: 1 } }, dto.UpdateMicrocurriculumDto), 400);
+      await rejects(run({ answers: { methodology: { strategies: ['proyectos', 'gamificación'] } } }, dto.UpdateMicrocurriculumDto), 400, null, 'estrategia fuera del set del spec');
+      await run({ answers: { methodology: { strategies: ['proyectos', 'casos', 'talleres', 'magistral', 'aula invertida', 'ABP', 'laboratorio', 'salidas de campo'] } } }, dto.UpdateMicrocurriculumDto);
       await run({ answers: { time: { totalHours: null, split: { contact: null } }, contents: { unitCount: null }, identification: { modality: '' } } }, dto.UpdateMicrocurriculumDto);
       await rejects(run({ section: 'bibliografia' }, dto.RegenerateSectionDto), 400);
     });

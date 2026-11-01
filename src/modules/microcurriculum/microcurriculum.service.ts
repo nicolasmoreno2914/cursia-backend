@@ -228,7 +228,7 @@ export class MicrocurriculumService {
   }
 
   /**
-   * PATCH: cada paso de `answers` reemplaza ese paso; `document` (la revisión) se normaliza, lo editado pasa a
+   * PATCH: `answers` (completas) REEMPLAZAN a las guardadas; `document` (la revisión) se normaliza, lo editado pasa a
    * procedencia `docente` y la identificación editada vuelve a las respuestas (una sola verdad para V7). Las
    * comprobaciones se recalculan SIEMPRE en el servidor (sin IA, USD 0) si hay documento.
    */
@@ -240,9 +240,8 @@ export class MicrocurriculumService {
         throw new ConflictException({ code: MC_ERRORS.GENERATION_IN_PROGRESS, message: 'El microcurrículo se está generando; espera a que termine para editarlo.' });
       }
       let answers = normalizeAnswers(row.answers);
-      if (body.answers !== undefined && body.answers !== null) {
-        answers = normalizeAnswers({ ...answers, ...(body.answers as Record<string, unknown>) });
-      }
+      // Contrato: el frontend envía las respuestas COMPLETAS y reemplazan a las guardadas (sin mezclar).
+      if (body.answers !== undefined && body.answers !== null) answers = normalizeAnswers(body.answers);
       let doc = row.document;
       if (body.document !== undefined && body.document !== null) {
         if (!doc) throw new ConflictException({ code: MC_ERRORS.DOCUMENT_REQUIRED, message: 'Todavía no hay un microcurrículo generado para editar.' });

@@ -15,6 +15,8 @@ export const MODALITIES = ['presencial', 'virtual', 'mixta'] as const;
 export type Modality = (typeof MODALITIES)[number];
 export const TIME_MODES = ['total', 'credits', 'weekly'] as const;
 export type TimeMode = (typeof TIME_MODES)[number];
+/** Estrategias didácticas del paso 6 (palabras literales del spec §1; el frontend las envía tal cual). */
+export const STRATEGIES = ['proyectos', 'casos', 'talleres', 'magistral', 'aula invertida', 'ABP', 'laboratorio', 'salidas de campo'] as const;
 export const REGEN_SECTIONS = ['outcomes', 'units', 'evaluation'] as const;
 export type RegenSection = (typeof REGEN_SECTIONS)[number];
 export const BLOOM = ['recordar', 'comprender', 'aplicar', 'analizar', 'evaluar', 'crear'] as const;

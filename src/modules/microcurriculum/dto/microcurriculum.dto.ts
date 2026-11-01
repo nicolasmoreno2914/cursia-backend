@@ -2,7 +2,7 @@ import { Type } from 'class-transformer';
 import {
   ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
-import { INSTITUTION_TYPES, MC_LIMITS, MODALITIES, REGEN_SECTIONS, TIME_MODES } from '../microcurriculum.types';
+import { INSTITUTION_TYPES, MC_LIMITS, MODALITIES, REGEN_SECTIONS, STRATEGIES, TIME_MODES } from '../microcurriculum.types';
 
 /**
  * r81 · DTOs del microcurrículo (límites de spec §1: textos ≤ 2 000, listas ≤ 40, horas 1–1 000). Todo es opcional:
@@ -59,7 +59,7 @@ export class ContentsDto {
 }
 
 export class MethodologyDto {
-  @IsOptional() @IsArray() @ArrayMaxSize(LIST) @IsString({ each: true }) @MaxLength(TEXT, { each: true }) strategies?: string[];
+  @IsOptional() @IsArray() @ArrayMaxSize(LIST) @IsIn([...STRATEGIES], { each: true }) strategies?: string[];
   @IsOptional() @IsString() @MaxLength(TEXT) institutionalEvaluation?: string;
   @IsOptional() @IsString() @MaxLength(TEXT) resources?: string;
 }
@@ -85,7 +85,7 @@ export class CreateMicrocurriculumDto {
   @IsOptional() @ValidateNested() @Type(() => AnswersDto) answers?: AnswersDto;
 }
 
-/** PATCH /microcurricula/:id — respuestas (cada paso enviado reemplaza ese paso) y/o documento editado en la revisión. */
+/** PATCH /microcurricula/:id — respuestas COMPLETAS (reemplazan las guardadas) y/o documento editado en la revisión. */
 export class UpdateMicrocurriculumDto {
   @IsOptional() @ValidateNested() @Type(() => AnswersDto) answers?: AnswersDto;
   /** MicrocurriculumV1 editado: se normaliza y se revalida en el servidor (V1–V8, USD 0). */

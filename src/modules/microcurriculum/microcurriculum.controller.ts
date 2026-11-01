@@ -49,7 +49,7 @@ export class MicrocurriculumController {
     return this.mc.get(actorOf(user), id);
   }
 
-  // PATCH /api/v1/microcurricula/:id { answers?, document? } → record con `issues` recalculados (USD 0)
+  // PATCH /api/v1/microcurricula/:id { answers? (completas: reemplazan), document? } → record con `issues` y procedencia recalculados (USD 0)
   @Patch(':id')
   update(@Param('id') id: string, @Body() body: UpdateMicrocurriculumDto, @CurrentUser() user: AuthUser) {
     return this.mc.update(actorOf(user), id, { answers: body?.answers, document: body?.document });
