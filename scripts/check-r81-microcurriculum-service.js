@@ -621,6 +621,36 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       gen.queue.push(TOOL('universidad'));
       eq((await G(W, d.id)).regenCount, 0);
     });
+
+    await check('MS24 (review FE P1-1/P2-8) PATCH answers con documento → identificación y horas totales del documento salen de las respuestas (issues, PDF, puente); PATCH document sin identification = sin cambios; solo lo CAMBIADO vuelve a las respuestas; todo PATCH exitoso limpia lastError', async () => {
+      reset();
+      const W = { id: 'cccccccc-1111-4222-8333-444444444444', email: 'w8@ejemplo.edu' };
+      const d = await svc.create(W, ANS('universidad'));
+      gen.queue.push(TOOL('universidad'));
+      const g = await G(W, d.id);
+      // corrección en el asistente: nombre, programa y créditos (3 → 4 = 192 h)
+      const a = clone(g.answers);
+      a.identification.courseName = 'Finanzas Corporativas Avanzadas'; a.identification.program = 'Contaduría Pública'; a.time.credits = 4;
+      const p1 = await svc.update(W, d.id, { answers: a });
+      eq([p1.document.identification.courseName, p1.document.identification.program, p1.document.totalHours], ['Finanzas Corporativas Avanzadas', 'Contaduría Pública', 192]);
+      eq(p1.issues.map((i) => i.code), ['V1'], 'revalidado: las unidades suman 144 h y ahora el total es 192 h (visible)');
+      const { context } = await svc.academicContext(W, d.id);
+      eq([context.identity.subjectName.value, context.identity.program.value], ['Finanzas Corporativas Avanzadas', 'Contaduría Pública'], 'puente');
+      const pdf = await svc.pdf(W, d.id);
+      eq(pdf.filename, 'microcurriculo-finanzas-corporativas-avanzadas.pdf', 'PDF');
+      // documento SIN identification (lo que enviará el FE) → identificación intacta
+      const doc = clone(p1.document); delete doc.identification; doc.description = 'Nueva descripción.';
+      const p2 = await svc.update(W, d.id, { document: doc });
+      eq([p2.document.identification.courseName, p2.answers.identification.courseName, p2.answers.identification.program, p2.document.description], ['Finanzas Corporativas Avanzadas', 'Finanzas Corporativas Avanzadas', 'Contaduría Pública', 'Nueva descripción.']);
+      // documento con identificación vieja en un campo y uno cambiado: solo el cambiado vuelve a las respuestas
+      const doc2 = clone(p2.document); doc2.identification.code = 'FIN-401';
+      const p3 = await svc.update(W, d.id, { answers: { ...p2.answers, identification: { ...p2.answers.identification, area: 'Finanzas aplicadas' } }, document: doc2 });
+      eq([p3.answers.identification.code, p3.answers.identification.area, p3.document.identification.area, p3.document.identification.code], ['FIN-401', 'Finanzas aplicadas', 'Finanzas aplicadas', 'FIN-401'], 'cambio del documento + cambio del asistente conviven');
+      // lastError se limpia con un PATCH exitoso
+      await ds.query(`update public.microcurricula set last_error = '{"code":"GENERATION_FAILED","message":"x"}'::jsonb where id = $1`, [d.id]);
+      eq((await svc.get(W, d.id)).lastError.code, 'GENERATION_FAILED');
+      eq((await svc.update(W, d.id, { answers: p3.answers })).lastError, null, 'lastError limpio');
+    });
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
     if (ds) await ds.destroy().catch(() => {});

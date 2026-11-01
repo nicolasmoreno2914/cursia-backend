@@ -8,7 +8,7 @@ import { isUuid } from '../authz/schema-probe';
 import { FinopsLedgerService } from '../finops/finops-ledger.service';
 import { assertDirectCallAllowed, recordDirectAnthropicCall } from '../finops/direct-call-ledger';
 import { resolveLibroLogo } from '../../package/v3/libro-logo';
-import { answersTitle, missingRequired, normalizeAnswers } from './answers';
+import { answersTitle, identificationFromAnswers, missingRequired, normalizeAnswers, resolveTotalHours } from './answers';
 import { MicrocurriculumOutputError, documentFromEdit, documentFromGenerated, withRegeneratedSection } from './document';
 import {
   AnthropicMicrocurriculumGenerator, MICROCURRICULUM_CALL_TIMEOUT_MS, MICROCURRICULUM_GENERATOR, MICROCURRICULUM_MAX_TOKENS, McGenerationResult,
@@ -312,17 +312,28 @@ export class MicrocurriculumService {
           if (err instanceof MicrocurriculumOutputError) throw new BadRequestException({ code: MC_ERRORS.DOCUMENT_INVALID, message: 'El documento enviado no tiene la forma de un microcurrículo.' });
           throw err;
         }
-        const idn = doc.identification;
-        answers = normalizeAnswers({
-          ...answers,
-          identification: { ...(answers.identification || {}), courseName: idn.courseName, institutionType: idn.institutionType, program: idn.program ?? '', term: idn.term ?? '', modality: idn.modality ?? '', code: idn.code ?? '', area: idn.area ?? '' },
-        });
+      }
+      if (doc) {
+        // Identificación: una sola verdad entre respuestas y documento (review FE P1-1/P2-8). Lo que el docente CAMBIÓ en
+        // el documento (comparado con el guardado) vuelve a las respuestas; todo lo demás sale de las respuestas, así una
+        // corrección en el asistente llega a la revisión, al PDF y al puente. Sin `identification` en el cuerpo = sin cambios.
+        const prev = (row.document as MicrocurriculumV1).identification;
+        const fromAnswers = identificationFromAnswers(answers);
+        const idn = { ...doc.identification } as Record<string, unknown>;
+        const ans = { ...(answers.identification || {}) } as Record<string, unknown>;
+        for (const k of Object.keys(fromAnswers) as (keyof typeof fromAnswers)[]) {
+          if ((idn[k] ?? null) !== ((prev as unknown as Record<string, unknown>)[k] ?? null)) ans[k] = idn[k] ?? '';
+          else idn[k] = fromAnswers[k];
+        }
+        answers = normalizeAnswers({ ...answers, identification: ans });
+        const total = resolveTotalHours(answers.time);
+        doc = { ...doc, identification: identificationFromAnswers(answers), totalHours: total ?? doc.totalHours };
       }
       const issues = doc ? validateMicrocurriculum(answers, doc) : [];
       const status = row.status;
       const rows = returningRows(await this.q(m,
         `update public.microcurricula set answers = $3::jsonb, document = $4::jsonb, issues = $5::jsonb, title = $6, status = $7,
-                generating_since = null, updated_at = now()
+                generating_since = null, last_error = null, updated_at = now()
           where id = $1 and owner_id = $2 returning *`,
         [id, actor.id, JSON.stringify(answers), doc ? JSON.stringify(doc) : null, JSON.stringify(issues), answersTitle(answers) || row.title, status]));
       return this.toRecord(rows[0]);
