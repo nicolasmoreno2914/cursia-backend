@@ -8,7 +8,8 @@
  *   2. Brand Kit activo de la institución del curso;
  *   3. «Logo del centro» de la cuenta del dueño (user_settings.logo_b64);
  *   4. logo oficial de Cursia (también si el de la cuenta no valida).
- * Nombre: el mismo del Libro; si no hay, «Cursia».
+ * Nombre: el mismo del Libro; si no hay, o es el automático de un espacio personal («Espacio de
+ * correo@…»: el correo no debe salir en la portada del video), «Cursia».
  */
 import { loadLibroBrandV3, loadPackagingProfilesV3 } from '../modules/dynamic-packaging/packaging-v3';
 import { QueryExecutor } from '../modules/dynamic-packaging/artifact-resolver';
@@ -28,6 +29,12 @@ export interface ResolvedVideoBrand {
 
 export const VIDEO_BRAND_DEFAULT_NAME = 'Cursia';
 
+/** Nombre para el video: nunca un correo (los espacios personales se llaman «Espacio de correo@…»). */
+export function videoInstitutionName(name: string | null | undefined): string {
+  const n = name?.trim();
+  return n && !/\S+@\S+\.\S+/.test(n) ? n : VIDEO_BRAND_DEFAULT_NAME;
+}
+
 export async function loadVideoBrand(q: QueryExecutor, courseId: number, ownerId: string | null): Promise<ResolvedVideoBrand> {
   const warnings: string[] = [];
   // Solo la identidad del perfil de presentación: un tema inválido no debe dejar al video sin marca
@@ -42,7 +49,7 @@ export async function loadVideoBrand(q: QueryExecutor, courseId: number, ownerId
   return {
     brand: {
       logo_data_uri: `data:image/${logo.kind};base64,${logo.bytes.toString('base64')}`,
-      institution_name: brand.name?.trim() || VIDEO_BRAND_DEFAULT_NAME,
+      institution_name: videoInstitutionName(brand.name),
     },
     logoSource: logo.source,
     warnings: [...warnings, ...brand.warnings, ...logo.warnings],

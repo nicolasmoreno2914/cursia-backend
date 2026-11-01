@@ -7,7 +7,7 @@
 //  2. Brand Kit activo de la institución;
 //  3. «Logo del centro» de la cuenta del dueño (user_settings.logo_b64);
 //  4. logo de Cursia (sin logo, o si el de la cuenta no valida).
-// Nombre: el de la institución; si no hay, «Cursia». Un perfil de presentación ilegible no deja al
+// Nombre: el de la institución; si no hay, o contiene un correo (espacio personal), «Cursia». Un perfil de presentación ilegible no deja al
 // video sin marca.
 //
 // Usage: npm run build && node scripts/check-video-brand.js [path/to/dist]
@@ -49,6 +49,7 @@ const cases = [
   { name: 'Diseño visual «custom» gana a todo', s: { userLogo: PNG_URI, institution: { name: 'Colegio Andino', logo: PNG_URI }, identity: { logo: 'custom', logoDataUri: PNG_URI, watermark: true, showInCourse: false } }, source: 'course_profile', inst: 'Colegio Andino' },
   { name: 'Diseño visual «cursia» fuerza el logo de Cursia', s: { userLogo: PNG_URI, identity: { logo: 'cursia', watermark: true, showInCourse: false } }, source: 'cursia_default', inst: 'Cursia' },
   { name: 'logo de la cuenta inválido → Cursia con aviso', s: { userLogo: 'data:image/png;base64,AAAA' }, source: 'cursia_default', inst: 'Cursia', warning: /libro_logo_invalid/ },
+  { name: 'espacio personal «Espacio de correo@…» → nombre «Cursia»', s: { userLogo: PNG_URI, institution: { name: 'Espacio de ana.perez@ejemplo.com' } }, source: 'user_settings', inst: 'Cursia' },
   { name: 'perfil ilegible → marca de la cuenta igual', s: { userLogo: PNG_URI, profileError: true }, source: 'user_settings', inst: 'Cursia', warning: /video_brand_profile_unavailable/ },
 ];
 
