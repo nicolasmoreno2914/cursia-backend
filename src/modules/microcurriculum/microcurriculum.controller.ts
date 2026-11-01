@@ -6,6 +6,7 @@ import { AuthUser } from '../../auth/auth.types';
 import { AuthenticatedOnly } from '../authz/require-permission.decorator';
 import { CreateMicrocurriculumDto, RegenerateSectionDto, UpdateMicrocurriculumDto } from './dto/microcurriculum.dto';
 import { McActor, MicrocurriculumService } from './microcurriculum.service';
+import { MicrocurriculumFlagGuard } from './microcurriculum-flag.guard';
 
 function sendPdf(res: Response, r: { pdf: Buffer; filename: string }) {
   res.setHeader('Content-Type', 'application/pdf');
@@ -22,7 +23,7 @@ const actorOf = (user: AuthUser): McActor => ({ id: user.id, email: user.email }
  */
 @AuthenticatedOnly('microcurrículos del propio usuario (owner = sub del JWT)')
 @Controller('microcurricula')
-@UseGuards(SupabaseJwtGuard)
+@UseGuards(SupabaseJwtGuard, MicrocurriculumFlagGuard) // flag antes que los pipes: apagado → 404 con cualquier cuerpo
 export class MicrocurriculumController {
   constructor(private readonly mc: MicrocurriculumService) {}
 

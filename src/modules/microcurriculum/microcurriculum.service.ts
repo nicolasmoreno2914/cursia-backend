@@ -128,6 +128,17 @@ type Q = Pick<EntityManager, 'query'> | Pick<DataSource, 'query'>;
 const iso = (d: Date | string) => (d instanceof Date ? d.toISOString() : new Date(d).toISOString());
 const UNTITLED = 'Microcurrículo sin título';
 const FAILED_MESSAGE = 'No se pudo generar el microcurrículo; no se descontó de tu cupo. Intenta de nuevo en unos minutos.';
+/** Texto para el docente cuando falla el proveedor o un control de gasto: sin nombres de variables ni detalles internos. */
+export const AI_UNAVAILABLE_MESSAGE = 'El servicio de IA no está disponible en este momento; no se descontó de tu cupo. Intenta de nuevo en unos minutos.';
+
+/** ¿Este issue lo puede arreglar regenerar `section`? (review P2-1: el reintento no se gasta en lo que quedó fijo). */
+export function issueInSection(i: MicrocurriculumIssue, section: RegenSection): boolean {
+  const p = i.path || '';
+  if (p === section || p.startsWith(`${section}[`) || p.startsWith(`${section}.`)) return true;
+  if (section === 'units') return i.code === 'V1' || i.code === 'V4' || p === 'totalHours';
+  if (section === 'evaluation') return i.code === 'V2';
+  return false;
+}
 
 @Injectable()
 export class MicrocurriculumService {
@@ -267,7 +278,10 @@ export class MicrocurriculumService {
 
   async remove(actor: McActor, id: string): Promise<{ ok: true }> {
     this.assertEnabled();
-    await this.load(this.dataSource, actor, id);
+    await this.recoverStale(actor.id, id);
+    const row = await this.load(this.dataSource, actor, id);
+    // Borrar a mitad de una generación dejaría su reserva huérfana (sin borrador que la libere): 409 (review P2-4).
+    if (row.status === 'generating') throw new ConflictException({ code: MC_ERRORS.GENERATION_IN_PROGRESS, message: 'El microcurrículo se está generando; espera a que termine para borrarlo.' });
     // El registro de generaciones queda (on delete set null): borrar no devuelve cupo.
     await this.q(this.dataSource, `delete from public.microcurricula where id = $1 and owner_id = $2`, [id, actor.id]);
     return { ok: true };
@@ -322,11 +336,16 @@ export class MicrocurriculumService {
    * (regenerar) contador del borrador → fila `reserved` → status `generating` (+ `pending_section`). Las interrumpidas ya
    * se liberaron antes (recoverStale).
    */
-  private async reserve(actor: McActor, id: string, kind: 'generate' | 'regenerate', section: RegenSection | null): Promise<{ generationId: string }> {
+  private async reserve(
+    actor: McActor, id: string, kind: 'generate' | 'regenerate', section: RegenSection | null, precheck: (row: Row) => void = () => {},
+  ): Promise<{ generationId: string; row: Row }> {
     return this.dataSource.transaction(async (m) => {
       await this.q(m, `select pg_advisory_xact_lock(hashtext($1))`, [`r81:microcurriculum:${actor.id}`]);
+      // Respuestas y documento se leen AQUÍ, bajo el lock y FOR UPDATE: la generación trabaja sobre esta instantánea
+      // (un PATCH concurrente espera y luego ve status generating → 409). Review P2-3.
       const row = await this.load(m, actor, id, true);
       if (row.status === 'generating') throw new ConflictException({ code: MC_ERRORS.GENERATION_IN_PROGRESS, message: 'Ya hay una generación en curso para este microcurrículo.' });
+      precheck(row);
       const unlimited = this.unlimited(actor);
       if (kind === 'generate') {
         const limit = microcurriculumMonthlyLimit();
@@ -350,7 +369,7 @@ export class MicrocurriculumService {
         `update public.microcurricula set status = 'generating', generating_since = now(), pending_section = $4, last_error = null,
                 regen_count = regen_count + $3, updated_at = now() where id = $1 and owner_id = $2`,
         [id, actor.id, kind === 'regenerate' ? 1 : 0, section]);
-      return { generationId: g.id };
+      return { generationId: g.id, row };
     });
   }
 
@@ -407,7 +426,16 @@ export class MicrocurriculumService {
       }
       const user = target.kind === 'generate' ? buildUserPrompt(answers, retry ? { issues: retry } : null) : buildRegeneratePrompt(answers, target.doc, target.section, retry ? { issues: retry } : null);
       const tool = target.kind === 'generate' ? microcurriculumTool() : sectionTool(target.section);
-      const res = await this.generator.generate({ model, system, user, tool, maxTokens: MICROCURRICULUM_MAX_TOKENS, timeoutMs: Math.min(MICROCURRICULUM_CALL_TIMEOUT_MS, remaining) });
+      let res: McGenerationResult;
+      try {
+        res = await this.generator.generate({ model, system, user, tool, maxTokens: MICROCURRICULUM_MAX_TOKENS, timeoutMs: Math.min(MICROCURRICULUM_CALL_TIMEOUT_MS, remaining) });
+      } catch (err) {
+        // Review P1-1: si el reintento falla (529, timeout, kill switch) y ya hay un documento usable, se entrega ESE con
+        // sus issues visibles; solo sin ningún documento la falla sube (→ failed, cupo liberado).
+        if (!best) throw err;
+        this.logger.warn(`microcurrículo ${id}: el reintento falló (${err instanceof Error ? err.message : String(err)}); se guarda el intento anterior con sus issues`);
+        break;
+      }
       acc.costUsd += await this.recordCall(actor, id, res, { attempt, target: target.kind, ...(target.kind === 'regenerate' ? { section: target.section } : {}) });
       if (res.stopReason === 'max_tokens' || res.input === null || res.input === undefined) {
         const why = res.stopReason === 'max_tokens' ? 'la respuesta se cortó por longitud' : 'el modelo no usó la herramienta';
@@ -424,11 +452,17 @@ export class MicrocurriculumService {
         retry = err.problems.map((p) => ({ code: 'V8' as const, severity: 'error' as const, message: `Salida incompleta: ${p}.` }));
         continue;
       }
-      const repaired = repairArithmetic(answers, candidate);
+      // Al regenerar, solo se repara lo aritmético DE ESA sección (horas → units, % → evaluation): lo fijo, quizá editado por
+      // el docente, no se toca y si no cuadra queda visible (review P2-1).
+      const scope = target.kind === 'generate' ? {} : { hours: target.section === 'units', percents: target.section === 'evaluation' };
+      const repaired = repairArithmetic(answers, candidate, scope);
       const issues = validateMicrocurriculum(answers, repaired.mc);
-      if (!best || errorsOf(issues).length <= errorsOf(best.issues).length) best = { doc: repaired.mc, issues };
-      if (!errorsOf(issues).length) break;
-      retry = issues;
+      // Errores que ESTA llamada puede arreglar: todos en la generación completa; los de la sección al regenerar.
+      const fixable = errorsOf(issues).filter((i) => target.kind === 'generate' || issueInSection(i, target.section));
+      const score = (xs: MicrocurriculumIssue[]) => errorsOf(xs).filter((i) => target.kind === 'generate' || issueInSection(i, target.section)).length;
+      if (!best || fixable.length <= score(best.issues)) best = { doc: repaired.mc, issues };
+      if (!fixable.length) break;
+      retry = fixable;
     }
     if (!best) throw new MicrocurriculumOutputError(problems.length ? problems : ['sin salida usable']);
     return best;
@@ -436,9 +470,11 @@ export class MicrocurriculumService {
 
   /** Motivo visible de una falla en segundo plano (kill switch u otro error con código propio: se respeta). */
   private failure(err: unknown): { code: string; message: string } {
-    const body = err instanceof HttpException ? (err.getResponse() as { code?: string; message?: string }) : null;
-    if (body && typeof body === 'object' && body.code) return { code: body.code, message: String(body.message || FAILED_MESSAGE) };
-    return { code: MC_ERRORS.GENERATION_FAILED, message: FAILED_MESSAGE };
+    // Review P2-8: el docente ve un texto genérico; el código/mensaje interno (kill switch, allow-list, proveedor) va al log.
+    if (err instanceof MicrocurriculumOutputError) return { code: MC_ERRORS.GENERATION_FAILED, message: FAILED_MESSAGE };
+    const body = err instanceof HttpException ? (err.getResponse() as { code?: string }) : null;
+    this.logger.error(`microcurrículo: falla del proveedor o control de gasto${body && typeof body === 'object' && body.code ? ` [${body.code}]` : ''}: ${err instanceof Error ? err.message : String(err)}`);
+    return { code: MC_ERRORS.GENERATION_FAILED, message: AI_UNAVAILABLE_MESSAGE };
   }
 
   /** Generaciones en curso en ESTE proceso (las pruebas esperan a que terminen con whenIdle). */
@@ -465,41 +501,38 @@ export class MicrocurriculumService {
         await this.release(actor, id, generationId, target.kind, acc.costUsd, this.failure(err));
         return;
       }
-      await this.commit(actor, id, generationId, answers, out, acc.costUsd);
+      await this.commit(actor, id, generationId, target.kind, answers, out, acc.costUsd);
     });
   }
 
   async generate(actor: McActor, id: string): Promise<MicrocurriculumRecord> {
     this.assertEnabled();
-    const row = await this.load(this.dataSource, actor, id);
-    const answers = normalizeAnswers(row.answers);
-    const missing = missingRequired(answers);
-    if (missing.length) {
-      throw new BadRequestException({ code: MC_ERRORS.ANSWERS_INCOMPLETE, message: 'Faltan respuestas obligatorias para crear el microcurrículo.', missing });
-    }
+    await this.load(this.dataSource, actor, id); // 404 temprano
     assertDirectCallAllowed('anthropic'); // tope / kill switch ANTES de reservar: error claro, sin llamada
-    await this.recoverStale(actor.id, id);
-    const { generationId } = await this.reserve(actor, id, 'generate', null);
-    this.background(actor, id, generationId, answers, { kind: 'generate' });
+    await this.recoverStale(actor.id); // TODOS los borradores del dueño: una reserva huérfana no debe dar un 429 falso (P2-5)
+    const { generationId, row } = await this.reserve(actor, id, 'generate', null, (r) => {
+      const missing = missingRequired(normalizeAnswers(r.answers));
+      if (missing.length) throw new BadRequestException({ code: MC_ERRORS.ANSWERS_INCOMPLETE, message: 'Faltan respuestas obligatorias para crear el microcurrículo.', missing });
+    });
+    this.background(actor, id, generationId, normalizeAnswers(row.answers), { kind: 'generate' });
     return this.toRecord(await this.load(this.dataSource, actor, id)); // 202: status generating; el cliente sondea GET /:id
   }
 
   async regenerate(actor: McActor, id: string, section: string): Promise<MicrocurriculumRecord> {
     this.assertEnabled();
     if (!(REGEN_SECTIONS as readonly string[]).includes(section)) throw new BadRequestException(`section debe ser una de: ${REGEN_SECTIONS.join(', ')}`);
-    const row = await this.load(this.dataSource, actor, id);
-    if (!row.document) throw new ConflictException({ code: MC_ERRORS.NOT_GENERATED, message: 'Solo se puede regenerar una sección de un microcurrículo ya generado.' });
-    const answers = normalizeAnswers(row.answers);
+    await this.load(this.dataSource, actor, id); // 404 temprano
     assertDirectCallAllowed('anthropic');
-    await this.recoverStale(actor.id, id);
-    const { generationId } = await this.reserve(actor, id, 'regenerate', section as RegenSection);
-    // El documento vigente queda visible mientras se regenera (status generating + pendingSection).
-    this.background(actor, id, generationId, answers, { kind: 'regenerate', section: section as RegenSection, doc: row.document });
+    await this.recoverStale(actor.id);
+    const { generationId, row } = await this.reserve(actor, id, 'regenerate', section as RegenSection);
+    // El documento vigente queda visible mientras se regenera (status generating + pendingSection); se regenera sobre la
+    // instantánea leída bajo el lock.
+    this.background(actor, id, generationId, normalizeAnswers(row.answers), { kind: 'regenerate', section: section as RegenSection, doc: row.document as MicrocurriculumV1 });
     return this.toRecord(await this.load(this.dataSource, actor, id));
   }
 
   /** Éxito: solo si la reserva sigue `reserved` (si se dio por interrumpida o se borró el borrador, se descarta). */
-  private async commit(actor: McActor, id: string, generationId: string, answers: MicrocurriculumAnswers, out: { doc: MicrocurriculumV1; issues: MicrocurriculumIssue[] }, costUsd: number): Promise<void> {
+  private async commit(actor: McActor, id: string, generationId: string, kind: 'generate' | 'regenerate', answers: MicrocurriculumAnswers, out: { doc: MicrocurriculumV1; issues: MicrocurriculumIssue[] }, costUsd: number): Promise<void> {
     await this.dataSource.transaction(async (m) => {
       const own = returningRows(await this.q(m,
         `update public.microcurriculum_generations set status = 'succeeded', cost_usd = $2, finished_at = now() where id = $1 and status = 'reserved' returning id`, [generationId, costUsd]));
@@ -510,9 +543,11 @@ export class MicrocurriculumService {
       }
       await this.q(m,
         `update public.microcurricula set status = 'generated', document = $3::jsonb, issues = $4::jsonb, title = $5, cost_usd = cost_usd + $6,
-                generating_since = null, pending_section = null, last_error = null, updated_at = now()
+                generating_since = null, pending_section = null, last_error = null, updated_at = now(),
+                regen_count = case when $7 then 0 else regen_count end
           where id = $1 and owner_id = $2 and status = 'generating'`,
-        [id, actor.id, JSON.stringify(out.doc), JSON.stringify(out.issues), answersTitle(answers) || UNTITLED, costUsd]);
+        // Decisión de producto (review P2-13): una generación COMPLETA exitosa (que gasta cupo) reinicia las regeneraciones.
+        [id, actor.id, JSON.stringify(out.doc), JSON.stringify(out.issues), answersTitle(answers) || UNTITLED, costUsd, kind === 'generate']);
     });
   }
 
@@ -544,7 +579,21 @@ export class MicrocurriculumService {
     this.assertEnabled();
     const row = await this.load(this.dataSource, actor, id);
     if (!row.document) throw new ConflictException({ code: MC_ERRORS.DOCUMENT_REQUIRED, message: 'Todavía no hay un microcurrículo generado.' });
-    return { context: toAcademicContext(row.document, normalizeAnswers(row.answers)) };
+    const answers = normalizeAnswers(row.answers);
+    try {
+      return { context: toAcademicContext(row.document, answers) };
+    } catch (err) {
+      // Review P1-3: un documento con errores de forma (ids repetidos o vacíos, títulos vacíos, horas fuera de rango…) no
+      // produce un contexto válido → 409 con las comprobaciones a corregir, nunca un 500 opaco.
+      if (!(err instanceof Error) || !err.message.startsWith('ACADEMIC_CONTEXT_INVALID')) throw err;
+      this.logger.warn(`microcurrículo ${id}: contexto académico inválido — ${err.message.slice(0, 300)}`);
+      const issues = errorsOf(validateMicrocurriculum(answers, row.document));
+      throw new ConflictException({
+        code: MC_ERRORS.DOCUMENT_INVALID,
+        message: 'Corrige las comprobaciones del microcurrículo antes de crear el curso con él.',
+        issues: issues.length ? issues : [{ code: 'V8', severity: 'error', message: 'El microcurrículo tiene datos fuera de rango (revisa ids, títulos y horas).' }],
+      });
+    }
   }
 }
 

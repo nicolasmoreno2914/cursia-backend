@@ -486,7 +486,140 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       await rejects(run({ answers: { methodology: { strategies: ['proyectos', 'gamificación'] } } }, dto.UpdateMicrocurriculumDto), 400, null, 'estrategia fuera del set del spec');
       await run({ answers: { methodology: { strategies: ['proyectos', 'casos', 'talleres', 'magistral', 'aula invertida', 'ABP', 'laboratorio', 'salidas de campo'] } } }, dto.UpdateMicrocurriculumDto);
       await run({ answers: { time: { totalHours: null, split: { contact: null } }, contents: { unitCount: null }, identification: { modality: '' } } }, dto.UpdateMicrocurriculumDto);
+      // review P2-6: '' en un número es «vacío» (undefined), NUNCA 0; un texto numérico se convierte
+      const e = await run({ answers: { time: { totalHours: '', split: { contact: '', practice: '12,5' } }, contents: { unitCount: '' } } }, dto.UpdateMicrocurriculumDto);
+      eq([e.answers.time.totalHours, e.answers.time.split.contact, e.answers.time.split.practice, e.answers.contents.unitCount], [undefined, undefined, 12.5, undefined]);
+      eq(A_norm(e.answers).time, { split: { practice: 12.5 } }, 'sin «0 h» exigidas');
+      await rejects(run({ answers: { time: { totalHours: 'muchas' } } }, dto.UpdateMicrocurriculumDto), 400);
       await rejects(run({ section: 'bibliografia' }, dto.RegenerateSectionDto), 400);
+    });
+
+    await check('MS16 (review P1-1) el reintento falla (529) tras un 1.er intento usable con V6 → se guarda ESE documento con sus issues (generated), no failed', async () => {
+      reset();
+      const W = { id: '55555555-6666-4777-8888-999999999999', email: 'w@ejemplo.edu' };
+      const d = await svc.create(W, ANS('tecnica'));
+      const bad = TOOL('tecnica'); bad.outcomes[0].verb = 'comprender';
+      gen.queue.push(bad, new Error('529 overloaded'));
+      const r = await G(W, d.id);
+      eq([r.status, r.issues.map((i) => i.code), r.lastError, gen.calls.length, (await svc.quota(W)).used], ['generated', ['V6'], null, 2, 1]);
+    });
+
+    await check('MS17 (review P1-3) /academic-context con un documento de forma inválida → 409 DOCUMENT_INVALID con issues (nunca 500); el filtro reenvía issues', async () => {
+      reset();
+      const W = { id: '66666666-7777-4888-8999-aaaaaaaaaaaa', email: 'w2@ejemplo.edu' };
+      const d = await svc.create(W, ANS('universidad'));
+      gen.queue.push(TOOL('universidad'));
+      await G(W, d.id);
+      await ds.query(`update public.microcurricula set document = jsonb_set(document, '{units,1,id}', '"U1"') where id = $1`, [d.id]);
+      const body = await rejects(svc.academicContext(W, d.id), 409, 'DOCUMENT_INVALID');
+      assert(Array.isArray(body.issues) && body.issues.some((i) => i.code === 'V8' && /Id repetido: U1/.test(i.message)), JSON.stringify(body.issues));
+      await ds.query(`update public.microcurricula set document = jsonb_set(document, '{units,1,id}', '"U2"') where id = $1`, [d.id]);
+      await ds.query(`update public.microcurricula set document = jsonb_set(document, '{units,0,hours,contact}', '9000') where id = $1`, [d.id]);
+      const b2 = await rejects(svc.academicContext(W, d.id), 409, 'DOCUMENT_INVALID');
+      assert(b2.issues.length > 0, 'con comprobaciones');
+      const { AllExceptionsFilter } = D('common/filters/http-exception.filter.js');
+      const { ConflictException } = require('@nestjs/common');
+      let sent = null;
+      const host = { switchToHttp: () => ({ getResponse: () => ({ status: () => ({ json: (x) => { sent = x; } }) }), getRequest: () => ({ url: '/x', method: 'GET' }) }) };
+      new AllExceptionsFilter().catch(new ConflictException({ code: 'DOCUMENT_INVALID', message: 'm', issues: b2.issues }), host);
+      eq([sent.statusCode, sent.code, sent.issues.length], [409, 'DOCUMENT_INVALID', b2.issues.length]);
+    });
+
+    await check('MS18 (review P2-1) regenerar «outcomes» con un V2 del docente en evaluación: sin reintento por lo fijo, % del docente intactos, V2 visible, historial de reparaciones conservado', async () => {
+      reset();
+      const W = { id: '77777777-8888-4999-8aaa-bbbbbbbbbbbb', email: 'w3@ejemplo.edu' };
+      const d = await svc.create(W, ANS('etdh'));
+      const t = TOOL('etdh'); t.units[0].hours.practice = 25;
+      gen.queue.push(t);
+      const g = await G(W, d.id);
+      eq(g.document.repairs.length, 1, 'una reparación previa');
+      const doc = clone(g.document); doc.evaluation[0].percent = 20;
+      await svc.update(W, d.id, { document: doc });
+      reset();
+      gen.queue.push({ outcomes: TOOL('etdh').outcomes });
+      const r = await R(W, d.id, 'outcomes');
+      eq(gen.calls.length, 1, 'sin reintento por un error fuera de la sección');
+      eq(r.document.evaluation.map((e) => e.percent), [20, 25, 50], 'los % del docente no se reescalan');
+      eq(r.issues.map((i) => i.code), ['V2'], 'queda visible');
+      eq(r.document.repairs, g.document.repairs, 'historial conservado');
+      eq(r.document.provenance.evaluation, 'docente');
+    });
+
+    await check('MS19 (review P2-3) la generación usa las respuestas leídas BAJO el lock (no la lectura previa)', async () => {
+      reset();
+      const W = { id: '88888888-9999-4aaa-8bbb-cccccccccccc', email: 'w4@ejemplo.edu' };
+      const d = await svc.create(W, ANS('corporativa'));
+      const orig = svc.recoverStale.bind(svc);
+      svc.recoverStale = async (owner, id) => {
+        // Un PATCH de otra pestaña entra entre la lectura previa y la reserva.
+        await ds.query(`update public.microcurricula set answers = jsonb_set(answers, '{identification,courseName}', '"Liderazgo remoto v2"') where id = $1`, [d.id]);
+        return orig(owner, id);
+      };
+      gen.queue.push(TOOL('corporativa'));
+      try { await G(W, d.id); } finally { svc.recoverStale = orig; }
+      assert(gen.calls[0].user.includes('Liderazgo remoto v2'), 'prompt con la instantánea bajo lock');
+      eq((await svc.get(W, d.id)).document.identification.courseName, 'Liderazgo remoto v2');
+    });
+
+    await check('MS20 (review P2-4/P2-5) DELETE durante la generación → 409; una reserva huérfana de OTRO borrador no da un 429 falso', async () => {
+      reset();
+      const W = { id: '99999999-aaaa-4bbb-8ccc-dddddddddddd', email: 'w5@ejemplo.edu' };
+      const a = await svc.create(W, ANS('tecnica'));
+      gen.delayMs = 200; gen.queue.push(TOOL('tecnica'));
+      await svc.generate(W, a.id);
+      await rejects(svc.remove(W, a.id), 409, 'GENERATION_IN_PROGRESS');
+      await svc.whenIdle(); gen.delayMs = 0;
+      process.env.MICROCURRICULUM_MONTHLY_LIMIT = '2';
+      const b = await svc.create(W, ANS('tecnica'));
+      await ds.query(`update public.microcurricula set status = 'generating', generating_since = now() - interval '7 minutes' where id = $1`, [b.id]);
+      await ds.query(`insert into public.microcurriculum_generations (owner_id, microcurriculum_id, kind, status) values ($1, $2, 'generate', 'reserved')`, [W.id, b.id]);
+      const c = await svc.create(W, ANS('tecnica'));
+      gen.queue.push(TOOL('tecnica'));
+      eq((await G(W, c.id)).status, 'generated', 'la huérfana de b se libera antes de contar');
+      delete process.env.MICROCURRICULUM_MONTHLY_LIMIT;
+    });
+
+    await check('MS21 (review P2-7) flag apagado: el guard da 404 ANTES de los pipes (cualquier ruta salvo quota); está en los guards del controlador', async () => {
+      const { MicrocurriculumFlagGuard } = D('modules/microcurriculum/microcurriculum-flag.guard.js');
+      const { MicrocurriculumController } = D('modules/microcurriculum/microcurriculum.controller.js');
+      const { GUARDS_METADATA } = require('@nestjs/common/constants');
+      const guards = Reflect.getMetadata(GUARDS_METADATA, MicrocurriculumController) || [];
+      eq(guards.map((g) => g.name), ['SupabaseJwtGuard', 'MicrocurriculumFlagGuard']);
+      const ctx = (name) => ({ getHandler: () => MicrocurriculumController.prototype[name] });
+      const g = new MicrocurriculumFlagGuard();
+      process.env.MICROCURRICULUM_ENABLED = 'false';
+      try {
+        for (const h of ['create', 'regenerate', 'update', 'get', 'list', 'pdf']) {
+          let st = null; try { g.canActivate(ctx(h)); } catch (e) { st = e.getStatus(); }
+          eq(st, 404, h);
+        }
+        eq(g.canActivate(ctx('quota')), true, 'quota pasa');
+      } finally { process.env.MICROCURRICULUM_ENABLED = 'true'; }
+      eq(g.canActivate(ctx('create')), true, 'flag encendido pasa');
+    });
+
+    await check('MS22 (review P2-8) control de gasto en segundo plano → lastError genérico para el docente (sin variables internas)', async () => {
+      reset();
+      const W = { id: 'aaaaaaaa-1111-4222-8333-444444444444', email: 'w6@ejemplo.edu' };
+      const d = await svc.create(W, ANS('tecnica'));
+      const { ServiceUnavailableException } = require('@nestjs/common');
+      gen.queue.push(new ServiceUnavailableException({ code: 'finops_kill_switch', message: 'el interruptor de gasto del servidor (FINOPS_KILL_SWITCH) está activo' }));
+      const r = await G(W, d.id);
+      eq([r.status, r.lastError.code], ['failed', 'GENERATION_FAILED']);
+      eq(r.lastError.message, S.AI_UNAVAILABLE_MESSAGE);
+      assert(!/FINOPS|ALLOWLIST/i.test(r.lastError.message), 'sin detalles internos');
+    });
+
+    await check('MS23 (review P2-13) una generación COMPLETA exitosa reinicia las regeneraciones (regenCount → 0)', async () => {
+      reset();
+      const W = { id: 'bbbbbbbb-1111-4222-8333-444444444444', email: 'w7@ejemplo.edu' };
+      const d = await svc.create(W, ANS('universidad'));
+      gen.queue.push(TOOL('universidad'), { evaluation: TOOL('universidad').evaluation }, { evaluation: TOOL('universidad').evaluation });
+      await G(W, d.id);
+      await R(W, d.id, 'evaluation');
+      eq((await R(W, d.id, 'evaluation')).regenCount, 2);
+      gen.queue.push(TOOL('universidad'));
+      eq((await G(W, d.id)).regenCount, 0);
     });
   } finally {
     for (const k of ENV_KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }

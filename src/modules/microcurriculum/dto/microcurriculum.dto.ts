@@ -1,4 +1,4 @@
-import { Type } from 'class-transformer';
+import { Transform, Type } from 'class-transformer';
 import {
   ArrayMaxSize, IsArray, IsIn, IsInt, IsNumber, IsObject, IsOptional, IsString, Max, MaxLength, Min, ValidateNested,
 } from 'class-validator';
@@ -11,6 +11,18 @@ import { INSTITUTION_TYPES, MC_LIMITS, MODALITIES, REGEN_SECTIONS, STRATEGIES, T
  */
 
 const TEXT = MC_LIMITS.text;
+
+/**
+ * Números opcionales: '' (campo vacío) o null → «Que Cursia lo proponga» (undefined), NUNCA 0 — la conversión
+ * implícita convertía '' en 0 y un reparto vacío se volvía la restricción dura «0 h» (review P2-6). Un texto numérico
+ * («120», «2,5») se convierte; cualquier otro texto llega tal cual y lo rechaza @IsNumber.
+ */
+const OptNum = () => Transform(({ obj, key }) => {
+  const v = obj[key];
+  if (v === '' || v === null || v === undefined) return undefined;
+  if (typeof v === 'string' && /^\s*-?\d+([.,]\d+)?\s*$/.test(v)) return Number(v.replace(',', '.'));
+  return v;
+});
 const LIST = MC_LIMITS.listItems;
 
 export class IdentificationDto {
@@ -37,17 +49,17 @@ export class PurposeDto {
 }
 
 export class SplitDto {
-  @IsOptional() @IsNumber() @Min(0) @Max(MC_LIMITS.hoursMax) contact?: number;
-  @IsOptional() @IsNumber() @Min(0) @Max(MC_LIMITS.hoursMax) practice?: number;
-  @IsOptional() @IsNumber() @Min(0) @Max(MC_LIMITS.hoursMax) autonomous?: number;
+  @IsOptional() @OptNum() @IsNumber() @Min(0) @Max(MC_LIMITS.hoursMax) contact?: number;
+  @IsOptional() @OptNum() @IsNumber() @Min(0) @Max(MC_LIMITS.hoursMax) practice?: number;
+  @IsOptional() @OptNum() @IsNumber() @Min(0) @Max(MC_LIMITS.hoursMax) autonomous?: number;
 }
 
 export class TimeDto {
   @IsOptional() @IsIn([...TIME_MODES, '']) mode?: string;
-  @IsOptional() @IsNumber() @Min(MC_LIMITS.hoursMin) @Max(MC_LIMITS.hoursMax) totalHours?: number;
-  @IsOptional() @IsNumber() @Min(0.5) @Max(60) credits?: number;
-  @IsOptional() @IsNumber() @Min(1) @Max(104) weeks?: number;
-  @IsOptional() @IsNumber() @Min(0.5) @Max(MC_LIMITS.hoursMax) hoursPerWeek?: number;
+  @IsOptional() @OptNum() @IsNumber() @Min(MC_LIMITS.hoursMin) @Max(MC_LIMITS.hoursMax) totalHours?: number;
+  @IsOptional() @OptNum() @IsNumber() @Min(0.5) @Max(60) credits?: number;
+  @IsOptional() @OptNum() @IsNumber() @Min(1) @Max(104) weeks?: number;
+  @IsOptional() @OptNum() @IsNumber() @Min(0.5) @Max(MC_LIMITS.hoursMax) hoursPerWeek?: number;
   @IsOptional() @ValidateNested() @Type(() => SplitDto) split?: SplitDto;
   @IsOptional() @IsString() @MaxLength(TEXT) calendar?: string;
 }
@@ -55,7 +67,7 @@ export class TimeDto {
 export class ContentsDto {
   @IsOptional() @IsArray() @ArrayMaxSize(LIST) @IsString({ each: true }) @MaxLength(TEXT, { each: true }) requiredTopics?: string[];
   @IsOptional() @IsArray() @ArrayMaxSize(LIST) @IsString({ each: true }) @MaxLength(TEXT, { each: true }) excludedTopics?: string[];
-  @IsOptional() @IsInt() @Min(MC_LIMITS.unitCountMin) @Max(MC_LIMITS.unitCountMax) unitCount?: number;
+  @IsOptional() @OptNum() @IsInt() @Min(MC_LIMITS.unitCountMin) @Max(MC_LIMITS.unitCountMax) unitCount?: number;
 }
 
 export class MethodologyDto {
