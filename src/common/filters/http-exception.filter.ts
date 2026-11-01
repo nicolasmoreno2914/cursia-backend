@@ -43,9 +43,10 @@ export class AllExceptionsFilter implements ExceptionFilter {
       error: typeof message === 'string' ? message : (message as any).message || message,
     };
     // R68 (piloto): datos estructurados del error que el cliente necesita para explicarlo (motivo del bloqueo de generación,
-    // críticos de Verificación; Prebrief: qué falta para prepararlo, qué cambió y la huella vigente). Solo estas claves.
+    // críticos de Verificación; Prebrief: qué falta para prepararlo, qué cambió y la huella vigente; r81 microcurrículo:
+    // obligatorias que faltan y fecha de renovación del cupo). Solo estas claves.
     if (message && typeof message === 'object') {
-      for (const k of ['code', 'reason', 'criticals', 'pendingChanges', 'blockers', 'diff', 'modelSha256']) {
+      for (const k of ['code', 'reason', 'criticals', 'pendingChanges', 'blockers', 'diff', 'modelSha256', 'missing', 'resetsAt']) {
         if ((message as any)[k] !== undefined) errorResponse[k] = (message as any)[k];
       }
       // r75 (02 §B/§C/§E): campos del contrato de permisos y presupuestos. Solo valores PRIMITIVOS acotados (nunca

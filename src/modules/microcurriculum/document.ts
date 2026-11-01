@@ -156,7 +156,12 @@ function identification(v: unknown, prev: McIdentification): McIdentification {
   };
 }
 
-const canon = (x: unknown) => JSON.stringify(x);
+/** JSON con claves ordenadas: el documento guardado en jsonb vuelve con otro orden de claves y no debe contar como edición. */
+function canon(x: unknown): string {
+  if (Array.isArray(x)) return `[${x.map(canon).join(',')}]`;
+  if (x && typeof x === 'object') return `{${Object.keys(x as object).sort().map((k) => `${JSON.stringify(k)}:${canon((x as Record<string, unknown>)[k])}`).join(',')}}`;
+  return JSON.stringify(x === undefined ? null : x);
+}
 
 /**
  * Edición del docente (PATCH `document`): se reconstruye con la misma coerción; los campos de primer nivel que cambian

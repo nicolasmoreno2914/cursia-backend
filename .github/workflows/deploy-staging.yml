@@ -841,6 +841,10 @@ jobs:
                echo "━━━ [5e] r75: presupuestos — verificación de esquema (staging) ━━━"
                MIGRATION_ENV=staging node scripts/verify-r75-budgets-schema.js
 
+               # r81: staging-only hasta aprobación del owner (EXCLUDED del plan de producción). Aditiva e idempotente.
+               echo "━━━ [5f] r81: «Crear microcurrículo» (microcurricula + microcurriculum_generations) — migración (staging) ━━━"
+               MIGRATION_ENV=staging node scripts/migrate-r81-microcurricula.js
+
                echo "━━━ [6/6] Recargar PM2 staging (zero-downtime) ━━━"
                ensure_pm2_process cursia-backend-staging start:prod
                ensure_pm2_process cursia-content-worker-staging start:content-worker
