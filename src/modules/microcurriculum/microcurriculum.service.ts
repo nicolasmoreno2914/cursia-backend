@@ -27,11 +27,14 @@ import type { AcademicContextV1 } from '../academic-context/academic-context';
  * r81 · «Crear microcurrículo» (spec §2, §4). Todo es del usuario autenticado (owner_id = sub del JWT; nunca se ve lo
  * ajeno: 404). Disponible para TODOS los usuarios con MICROCURRICULUM_ENABLED='true' (si no, 404 salvo /quota).
  *
- * Generación síncrona (≤ 150 s): reserva ATÓMICA del cupo (lock por dueño + conteo del mes UTC + fila `reserved`) ANTES
- * de llamar a la IA → herramienta forzada → reparación aritmética registrada → V1–V8 → si quedan errores no aritméticos,
- * UN reintento con la lista → se guarda con sus `issues` visibles (nunca éxito silencioso). Proveedor caído o salida
- * inservible tras el reintento → `failed` y el cupo se LIBERA («no se descontó de tu cupo»). Cada llamada se registra
- * en el ledger de FinOps (operation `llm.microcurriculo`, sin atribuir a curso).
+ * Generación ASÍNCRONA (el proxy de producción corta a los 60 s): POST …/generate|regenerate valida, reserva ATÓMICAMENTE
+ * el cupo (lock por dueño + conteo del mes UTC + fila `reserved`), deja el status `generating` y responde 202 al
+ * instante; la generación corre en este proceso (sin await): herramienta forzada → reparación aritmética registrada →
+ * V1–V8 → si quedan errores no aritméticos, UN reintento con la lista → se guarda con sus `issues` visibles (nunca éxito
+ * silencioso). Proveedor caído o salida inservible tras el reintento → `failed` (o vuelve a `generated` si ya había
+ * documento), `lastError` y el cupo se LIBERA («no se descontó de tu cupo»). El cliente sondea GET /:id. Si el proceso
+ * se reinicia a mitad, una generación `generating` de más de 6 min se da por interrumpida al leer (GET/lista/cupo) y se
+ * libera igual. Cada llamada se registra en el ledger de FinOps (operation `llm.microcurriculo`, sin atribuir a curso).
  */
 
 export const MC_ERRORS = Object.freeze({
@@ -44,6 +47,7 @@ export const MC_ERRORS = Object.freeze({
   DOCUMENT_INVALID: 'DOCUMENT_INVALID',
   GENERATION_FAILED: 'GENERATION_FAILED',
   NOT_MIGRATED: 'MICROCURRICULUM_NOT_MIGRATED',
+  GENERATION_INTERRUPTED: 'GENERATION_INTERRUPTED',
 });
 
 export function microcurriculumEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -77,8 +81,10 @@ export function estimateCallUsd(usage: McGenerationResult['usage']): number {
 export const MC_DEADLINE_MS = 145_000;
 /** Sin al menos este margen no se intenta el reintento (se entrega lo que hay, con sus issues). */
 export const MC_RETRY_MIN_MS = 30_000;
-/** Una generación `generating` más vieja que esto se considera abandonada (proceso reiniciado) y se libera. */
-export const MC_STALE_GENERATING_MS = 10 * 60_000;
+/** Una generación `generating` más vieja que esto se considera interrumpida (proceso reiniciado) y se libera. Holgura
+ *  amplia sobre el peor caso real (2 llamadas acotadas por MC_DEADLINE_MS). */
+export const MC_STALE_GENERATING_MS = 6 * 60_000;
+export const INTERRUPTED_MESSAGE = 'La generación se interrumpió; no se descontó de tu cupo.';
 
 export interface McActor { id: string; email?: string | null }
 
@@ -93,6 +99,10 @@ export interface MicrocurriculumRecord {
   regenLimit: number;
   costUsd: number | null;
   courseId: number | null;
+  /** Sección que se está regenerando (status `generating`); null si es una generación completa o no hay nada en curso. */
+  pendingSection: RegenSection | null;
+  /** Por qué falló la última generación en segundo plano (se limpia al reservar una nueva). */
+  lastError: { code: string; message: string } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -110,6 +120,7 @@ export interface MicrocurriculumQuota {
 interface Row {
   id: string; owner_id: string; title: string; status: MicrocurriculumRecord['status']; answers: unknown; document: MicrocurriculumV1 | null;
   issues: MicrocurriculumIssue[] | null; regen_count: number; cost_usd: string | number; course_id: number | null; generating_since: Date | null;
+  pending_section: RegenSection | null; last_error: { code: string; message: string } | null;
   created_at: Date | string; updated_at: Date | string;
 }
 
@@ -163,6 +174,8 @@ export class MicrocurriculumService {
       regenLimit: microcurriculumRegenLimit(),
       costUsd: r.cost_usd === null || r.cost_usd === undefined ? null : Number(r.cost_usd),
       courseId: r.course_id ?? null,
+      pendingSection: r.status === 'generating' ? r.pending_section ?? null : null,
+      lastError: r.last_error ?? null,
       createdAt: iso(r.created_at),
       updatedAt: iso(r.updated_at),
     };
@@ -174,7 +187,36 @@ export class MicrocurriculumService {
     return rows[0];
   }
   private stale(r: Row): boolean {
-    return r.status === 'generating' && (!r.generating_since || this.now().getTime() - new Date(r.generating_since).getTime() > MC_STALE_GENERATING_MS);
+    const since = r.generating_since || r.updated_at;
+    return r.status === 'generating' && (!since || this.now().getTime() - new Date(since).getTime() > MC_STALE_GENERATING_MS);
+  }
+
+  /**
+   * Generaciones interrumpidas (status `generating` > 6 min: el proceso se reinició a mitad de la llamada) → se liberan
+   * sus reservas (la regeneración devuelve su contador), status `failed` (o `generated` si hay documento) y `lastError`.
+   */
+  private async recoverStale(ownerId: string, id?: string): Promise<void> {
+    const cutoff = new Date(this.now().getTime() - MC_STALE_GENERATING_MS).toISOString();
+    const cand = await this.q<{ id: string }[]>(this.dataSource,
+      `select id from public.microcurricula where owner_id = $1 and status = 'generating' and coalesce(generating_since, updated_at) < $2::timestamptz${id && isUuid(id) ? ' and id = $3' : ''}`,
+      id && isUuid(id) ? [ownerId, cutoff, id] : [ownerId, cutoff]);
+    for (const c of cand) {
+      await this.dataSource.transaction(async (m) => {
+        await this.q(m, `select pg_advisory_xact_lock(hashtext($1))`, [`r81:microcurriculum:${ownerId}`]);
+        const [row] = await this.q<Row[]>(m, `select * from public.microcurricula where id = $1 and owner_id = $2 for update`, [c.id, ownerId]);
+        if (!row || !this.stale(row)) return;
+        const gens = returningRows(await this.q(m,
+          `update public.microcurriculum_generations set status = 'released', finished_at = now() where microcurriculum_id = $1 and status = 'reserved' returning kind`, [c.id]));
+        const regen = gens.filter((g: { kind: string }) => g.kind === 'regenerate').length;
+        await this.q(m,
+          `update public.microcurricula
+              set status = case when document is null then 'failed' else 'generated' end, generating_since = null, pending_section = null,
+                  regen_count = greatest(0, regen_count - $3), last_error = $4::jsonb, updated_at = now()
+            where id = $1 and owner_id = $2`,
+          [c.id, ownerId, regen, JSON.stringify({ code: MC_ERRORS.GENERATION_INTERRUPTED, message: INTERRUPTED_MESSAGE })]);
+        this.logger.warn(`microcurrículo ${c.id}: generación interrumpida (> ${MC_STALE_GENERATING_MS / 60000} min) → liberada`);
+      });
+    }
   }
   private async usedThisMonth(m: Q, ownerId: string): Promise<number> {
     const { start } = quotaWindow(this.now());
@@ -188,6 +230,7 @@ export class MicrocurriculumService {
 
   async quota(actor: McActor): Promise<MicrocurriculumQuota> {
     if (!microcurriculumEnabled()) return { enabled: false };
+    await this.recoverStale(actor.id);
     const limit = microcurriculumMonthlyLimit();
     const used = await this.usedThisMonth(this.dataSource, actor.id);
     return {
@@ -198,9 +241,10 @@ export class MicrocurriculumService {
 
   async list(actor: McActor): Promise<{ items: MicrocurriculumRecord[] }> {
     this.assertEnabled();
+    await this.recoverStale(actor.id);
     const rows = await this.q<Row[]>(this.dataSource,
       `select id, owner_id, title, status, null::jsonb as answers, null::jsonb as document, null::jsonb as issues, regen_count, cost_usd, course_id,
-              generating_since, created_at, updated_at
+              generating_since, pending_section, last_error, created_at, updated_at
          from public.microcurricula where owner_id = $1 order by updated_at desc limit 200`, [actor.id]);
     return { items: rows.map((r) => this.toRecord(r, false)) };
   }
@@ -214,8 +258,10 @@ export class MicrocurriculumService {
     return this.toRecord(rows[0]);
   }
 
+  /** También es el endpoint de sondeo de la generación en segundo plano. */
   async get(actor: McActor, id: string): Promise<MicrocurriculumRecord> {
     this.assertEnabled();
+    await this.recoverStale(actor.id, id);
     return this.toRecord(await this.load(this.dataSource, actor, id));
   }
 
@@ -234,9 +280,10 @@ export class MicrocurriculumService {
    */
   async update(actor: McActor, id: string, body: { answers?: unknown; document?: unknown }): Promise<MicrocurriculumRecord> {
     this.assertEnabled();
+    await this.recoverStale(actor.id, id);
     return this.dataSource.transaction(async (m) => {
       const row = await this.load(m, actor, id, true);
-      if (row.status === 'generating' && !this.stale(row)) {
+      if (row.status === 'generating') {
         throw new ConflictException({ code: MC_ERRORS.GENERATION_IN_PROGRESS, message: 'El microcurrículo se está generando; espera a que termine para editarlo.' });
       }
       let answers = normalizeAnswers(row.answers);
@@ -258,7 +305,7 @@ export class MicrocurriculumService {
         });
       }
       const issues = doc ? validateMicrocurriculum(answers, doc) : [];
-      const status = row.status === 'generating' ? (doc ? 'generated' : 'draft_answers') : row.status;
+      const status = row.status;
       const rows = returningRows(await this.q(m,
         `update public.microcurricula set answers = $3::jsonb, document = $4::jsonb, issues = $5::jsonb, title = $6, status = $7,
                 generating_since = null, updated_at = now()
@@ -272,17 +319,14 @@ export class MicrocurriculumService {
 
   /**
    * Reserva atómica (spec §4.2): lock por dueño → fila del microcurrículo FOR UPDATE → (generar) conteo del mes UTC /
-   * (regenerar) contador del borrador → fila `reserved` → status `generating`. Una generación abandonada (> 10 min) se
-   * libera aquí mismo.
+   * (regenerar) contador del borrador → fila `reserved` → status `generating` (+ `pending_section`). Las interrumpidas ya
+   * se liberaron antes (recoverStale).
    */
   private async reserve(actor: McActor, id: string, kind: 'generate' | 'regenerate', section: RegenSection | null): Promise<{ generationId: string }> {
     return this.dataSource.transaction(async (m) => {
       await this.q(m, `select pg_advisory_xact_lock(hashtext($1))`, [`r81:microcurriculum:${actor.id}`]);
       const row = await this.load(m, actor, id, true);
-      if (row.status === 'generating') {
-        if (!this.stale(row)) throw new ConflictException({ code: MC_ERRORS.GENERATION_IN_PROGRESS, message: 'Ya hay una generación en curso para este microcurrículo.' });
-        await this.q(m, `update public.microcurriculum_generations set status = 'released', finished_at = now() where microcurriculum_id = $1 and status = 'reserved'`, [id]);
-      }
+      if (row.status === 'generating') throw new ConflictException({ code: MC_ERRORS.GENERATION_IN_PROGRESS, message: 'Ya hay una generación en curso para este microcurrículo.' });
       const unlimited = this.unlimited(actor);
       if (kind === 'generate') {
         const limit = microcurriculumMonthlyLimit();
@@ -291,7 +335,7 @@ export class MicrocurriculumService {
           throw new HttpException({ code: MC_ERRORS.QUOTA_EXHAUSTED, message: `Usaste los ${limit} microcurrículos de este mes. Tu cupo se renueva el ${resetsAt.slice(0, 10)}.`, resetsAt }, HttpStatus.TOO_MANY_REQUESTS);
         }
       } else {
-        if (!row.document || (row.status !== 'generated' && !(row.status === 'generating' && this.stale(row)))) {
+        if (!row.document || row.status !== 'generated') {
           throw new ConflictException({ code: MC_ERRORS.NOT_GENERATED, message: 'Solo se puede regenerar una sección de un microcurrículo ya generado.' });
         }
         const limit = microcurriculumRegenLimit();
@@ -303,22 +347,32 @@ export class MicrocurriculumService {
         `insert into public.microcurriculum_generations (owner_id, microcurriculum_id, kind, section, status) values ($1, $2, $3, $4, 'reserved') returning id::text as id`,
         [actor.id, id, kind, section]);
       await this.q(m,
-        `update public.microcurricula set status = 'generating', generating_since = now(), regen_count = regen_count + $3, updated_at = now() where id = $1 and owner_id = $2`,
-        [id, actor.id, kind === 'regenerate' ? 1 : 0]);
+        `update public.microcurricula set status = 'generating', generating_since = now(), pending_section = $4, last_error = null,
+                regen_count = regen_count + $3, updated_at = now() where id = $1 and owner_id = $2`,
+        [id, actor.id, kind === 'regenerate' ? 1 : 0, section]);
       return { generationId: g.id };
     });
   }
 
-  /** Falla: el cupo se libera (fila `released`; la regeneración devuelve su contador) y el borrador queda usable. */
-  private async release(actor: McActor, id: string, generationId: string, kind: 'generate' | 'regenerate', costUsd: number): Promise<void> {
+  /**
+   * Falla: el cupo se libera (fila `released`; la regeneración devuelve su contador), `lastError` y el borrador queda
+   * usable (`failed`, o `generated` con el documento anterior). Si la reserva ya no está `reserved` (se dio por
+   * interrumpida) solo se suma el costo.
+   */
+  private async release(actor: McActor, id: string, generationId: string, kind: 'generate' | 'regenerate', costUsd: number, error: { code: string; message: string }): Promise<void> {
     await this.dataSource.transaction(async (m) => {
-      await this.q(m, `update public.microcurriculum_generations set status = 'released', cost_usd = $2, finished_at = now() where id = $1`, [generationId, costUsd]);
+      const own = returningRows(await this.q(m,
+        `update public.microcurriculum_generations set status = 'released', cost_usd = $2, finished_at = now() where id = $1 and status = 'reserved' returning id`, [generationId, costUsd]));
+      if (!own.length) {
+        await this.q(m, `update public.microcurricula set cost_usd = cost_usd + $3 where id = $1 and owner_id = $2`, [id, actor.id, costUsd]);
+        return;
+      }
       await this.q(m,
         `update public.microcurricula
-            set status = case when document is null then 'failed' else 'generated' end, generating_since = null,
-                regen_count = greatest(0, regen_count - $3), cost_usd = cost_usd + $4, updated_at = now()
+            set status = case when document is null then 'failed' else 'generated' end, generating_since = null, pending_section = null,
+                regen_count = greatest(0, regen_count - $3), cost_usd = cost_usd + $4, last_error = $5::jsonb, updated_at = now()
           where id = $1 and owner_id = $2`,
-        [id, actor.id, kind === 'regenerate' ? 1 : 0, costUsd]);
+        [id, actor.id, kind === 'regenerate' ? 1 : 0, costUsd, JSON.stringify(error)]);
     });
   }
 
@@ -380,10 +434,39 @@ export class MicrocurriculumService {
     return best;
   }
 
-  private failure(err: unknown): HttpException {
-    // Kill switch / allow-list de FinOps u otro error HTTP con código propio: se respeta tal cual.
-    if (err instanceof HttpException && (err.getResponse() as { code?: string })?.code) return err;
-    return new ServiceUnavailableException({ code: MC_ERRORS.GENERATION_FAILED, message: FAILED_MESSAGE });
+  /** Motivo visible de una falla en segundo plano (kill switch u otro error con código propio: se respeta). */
+  private failure(err: unknown): { code: string; message: string } {
+    const body = err instanceof HttpException ? (err.getResponse() as { code?: string; message?: string }) : null;
+    if (body && typeof body === 'object' && body.code) return { code: body.code, message: String(body.message || FAILED_MESSAGE) };
+    return { code: MC_ERRORS.GENERATION_FAILED, message: FAILED_MESSAGE };
+  }
+
+  /** Generaciones en curso en ESTE proceso (las pruebas esperan a que terminen con whenIdle). */
+  private readonly inflight = new Set<Promise<void>>();
+  whenIdle(): Promise<void> {
+    return Promise.all([...this.inflight]).then(() => undefined);
+  }
+  private launch(label: string, job: () => Promise<void>): void {
+    const p: Promise<void> = job()
+      .catch((err) => { this.logger.error(`microcurrículo ${label}: error en segundo plano — ${err instanceof Error ? err.message : String(err)}`); })
+      .finally(() => { this.inflight.delete(p); });
+    this.inflight.add(p);
+  }
+
+  /** Corre la generación sin bloquear la petición; al terminar escribe generated (con issues) o libera y deja lastError. */
+  private background(actor: McActor, id: string, generationId: string, answers: MicrocurriculumAnswers, target: { kind: 'generate' } | { kind: 'regenerate'; section: RegenSection; doc: MicrocurriculumV1 }): void {
+    this.launch(id, async () => {
+      const acc = { costUsd: 0 };
+      let out: { doc: MicrocurriculumV1; issues: MicrocurriculumIssue[] };
+      try {
+        out = await this.runGeneration(actor, id, answers, target, acc);
+      } catch (err) {
+        this.logger.error(`microcurrículo ${id}: ${target.kind === 'generate' ? 'generación' : `regeneración de ${target.section}`} fallida — ${err instanceof Error ? err.message : String(err)}`);
+        await this.release(actor, id, generationId, target.kind, acc.costUsd, this.failure(err));
+        return;
+      }
+      await this.commit(actor, id, generationId, answers, out, acc.costUsd);
+    });
   }
 
   async generate(actor: McActor, id: string): Promise<MicrocurriculumRecord> {
@@ -395,17 +478,10 @@ export class MicrocurriculumService {
       throw new BadRequestException({ code: MC_ERRORS.ANSWERS_INCOMPLETE, message: 'Faltan respuestas obligatorias para crear el microcurrículo.', missing });
     }
     assertDirectCallAllowed('anthropic'); // tope / kill switch ANTES de reservar: error claro, sin llamada
+    await this.recoverStale(actor.id, id);
     const { generationId } = await this.reserve(actor, id, 'generate', null);
-    const acc = { costUsd: 0 };
-    let out: { doc: MicrocurriculumV1; issues: MicrocurriculumIssue[] };
-    try {
-      out = await this.runGeneration(actor, id, answers, { kind: 'generate' }, acc);
-    } catch (err) {
-      this.logger.error(`microcurrículo ${id}: generación fallida — ${err instanceof Error ? err.message : String(err)}`);
-      await this.release(actor, id, generationId, 'generate', acc.costUsd);
-      throw this.failure(err);
-    }
-    return this.commit(actor, id, generationId, answers, out, acc.costUsd);
+    this.background(actor, id, generationId, answers, { kind: 'generate' });
+    return this.toRecord(await this.load(this.dataSource, actor, id)); // 202: status generating; el cliente sondea GET /:id
   }
 
   async regenerate(actor: McActor, id: string, section: string): Promise<MicrocurriculumRecord> {
@@ -415,29 +491,28 @@ export class MicrocurriculumService {
     if (!row.document) throw new ConflictException({ code: MC_ERRORS.NOT_GENERATED, message: 'Solo se puede regenerar una sección de un microcurrículo ya generado.' });
     const answers = normalizeAnswers(row.answers);
     assertDirectCallAllowed('anthropic');
+    await this.recoverStale(actor.id, id);
     const { generationId } = await this.reserve(actor, id, 'regenerate', section as RegenSection);
-    const acc = { costUsd: 0 };
-    let out: { doc: MicrocurriculumV1; issues: MicrocurriculumIssue[] };
-    try {
-      out = await this.runGeneration(actor, id, answers, { kind: 'regenerate', section: section as RegenSection, doc: row.document }, acc);
-    } catch (err) {
-      this.logger.error(`microcurrículo ${id}: regeneración de ${section} fallida — ${err instanceof Error ? err.message : String(err)}`);
-      await this.release(actor, id, generationId, 'regenerate', acc.costUsd);
-      throw this.failure(err);
-    }
-    return this.commit(actor, id, generationId, answers, out, acc.costUsd);
+    // El documento vigente queda visible mientras se regenera (status generating + pendingSection).
+    this.background(actor, id, generationId, answers, { kind: 'regenerate', section: section as RegenSection, doc: row.document });
+    return this.toRecord(await this.load(this.dataSource, actor, id));
   }
 
-  private async commit(actor: McActor, id: string, generationId: string, answers: MicrocurriculumAnswers, out: { doc: MicrocurriculumV1; issues: MicrocurriculumIssue[] }, costUsd: number): Promise<MicrocurriculumRecord> {
-    return this.dataSource.transaction(async (m) => {
-      await this.q(m, `update public.microcurriculum_generations set status = 'succeeded', cost_usd = $2, finished_at = now() where id = $1`, [generationId, costUsd]);
-      const rows = returningRows(await this.q(m,
+  /** Éxito: solo si la reserva sigue `reserved` (si se dio por interrumpida o se borró el borrador, se descarta). */
+  private async commit(actor: McActor, id: string, generationId: string, answers: MicrocurriculumAnswers, out: { doc: MicrocurriculumV1; issues: MicrocurriculumIssue[] }, costUsd: number): Promise<void> {
+    await this.dataSource.transaction(async (m) => {
+      const own = returningRows(await this.q(m,
+        `update public.microcurriculum_generations set status = 'succeeded', cost_usd = $2, finished_at = now() where id = $1 and status = 'reserved' returning id`, [generationId, costUsd]));
+      if (!own.length) {
+        this.logger.warn(`microcurrículo ${id}: resultado descartado (la reserva ya no estaba vigente)`);
+        await this.q(m, `update public.microcurricula set cost_usd = cost_usd + $3 where id = $1 and owner_id = $2`, [id, actor.id, costUsd]);
+        return;
+      }
+      await this.q(m,
         `update public.microcurricula set status = 'generated', document = $3::jsonb, issues = $4::jsonb, title = $5, cost_usd = cost_usd + $6,
-                generating_since = null, updated_at = now()
-          where id = $1 and owner_id = $2 returning *`,
-        [id, actor.id, JSON.stringify(out.doc), JSON.stringify(out.issues), answersTitle(answers) || UNTITLED, costUsd]));
-      if (!rows.length) throw new NotFoundException('Microcurrículo no encontrado');
-      return this.toRecord(rows[0]);
+                generating_since = null, pending_section = null, last_error = null, updated_at = now()
+          where id = $1 and owner_id = $2 and status = 'generating'`,
+        [id, actor.id, JSON.stringify(out.doc), JSON.stringify(out.issues), answersTitle(answers) || UNTITLED, costUsd]);
     });
   }
 

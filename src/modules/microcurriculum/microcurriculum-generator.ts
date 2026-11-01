@@ -45,9 +45,10 @@ export class AnthropicMicrocurriculumGenerator implements MicrocurriculumGenerat
   private client: Anthropic | null = null;
 
   async generate(req: McGenerationRequest): Promise<McGenerationResult> {
-    // Kill switch / allow-list de proveedores ANTES de llamar (llamada directa: no reserva en el ledger).
+    // Kill switch / allow-list de proveedores ANTES de llamar (llamada directa: no reserva en el ledger). maxRetries 0:
+    // el SDK no repite una llamada que expiró (duplicaría tiempo y costo); el único reintento es el de validación.
     assertDirectCallAllowed('anthropic');
-    if (!this.client) this.client = new Anthropic({ timeout: MICROCURRICULUM_CALL_TIMEOUT_MS, maxRetries: 1 });
+    if (!this.client) this.client = new Anthropic({ timeout: MICROCURRICULUM_CALL_TIMEOUT_MS, maxRetries: 0 });
     const res = await this.client.messages.create(
       {
         model: req.model,

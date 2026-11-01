@@ -11,13 +11,13 @@
 //   MS5  salida inválida (max_tokens / sin tool_use) → reintento → ok; errores no aritméticos → reintento con la lista;
 //        persisten → generated CON issues visibles (nunca éxito silencioso); se queda con el de menos errores
 //   MS6  reparación aritmética en la generación: horas desbalanceadas → repairs registradas, sin reintento
-//   MS7  proveedor caído → 503 GENERATION_FAILED, status failed, cupo LIBERADO; salida inservible ×2 → failed igual
+//   MS7  proveedor caído (segundo plano) → failed + lastError GENERATION_FAILED, cupo LIBERADO; inservible ×2 → failed
 //   MS8  cuota: 10/mes → 429 QUOTA_EXHAUSTED con resetsAt (1.º del mes siguiente UTC); mes siguiente → cupo nuevo;
 //        superadmin sin límite; borrar no devuelve cupo; MICROCURRICULUM_MONTHLY_LIMIT configurable
 //   MS9  regenerar sección: requiere generado (409), ×3 → 429 REGEN_EXHAUSTED; una falla no consume; resto fijo
 //   MS10 PATCH del documento: procedencia docente, issues recalculados en el servidor sin IA; identificación → respuestas
-//   MS11 concurrencia: dos generaciones a la vez → una 409 GENERATION_IN_PROGRESS; PATCH durante la generación → 409;
-//        generación abandonada (> 10 min) se libera
+//   MS11 asíncrono: 202 inmediato con status generating, sondeo GET /:id hasta generated; 2.ª generación / PATCH → 409
+//   MS11b generación interrumpida (> 6 min) → GET/lista/cupo la marcan fallida con lastError y liberan la reserva
 //   MS12 kill switch de FinOps → 503 con su código, SIN reserva ni llamada
 //   MS13 PDF (nombre microcurriculo-<slug>.pdf) y /academic-context (forma válida); sin documento → 409
 //   MS14 controlador: rutas del contrato con @AuthenticatedOnly + SupabaseJwtGuard; el filtro reenvía missing/resetsAt
@@ -147,6 +147,19 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
     const svc = new S.MicrocurriculumService(ds, ledger, generator);
     const ANS = (k) => FIX(k).answers;
     const TOOL = (k) => clone(FIX(k).tool);
+    /** POST …/generate (202 → generating) + esperar el segundo plano + sondear GET /:id. */
+    const G = async (actor, id) => {
+      const r = await svc.generate(actor, id);
+      assert(r.status === 'generating', `202 con status generating (fue ${r.status})`);
+      await svc.whenIdle();
+      return svc.get(actor, id);
+    };
+    const R = async (actor, id, section) => {
+      const r = await svc.regenerate(actor, id, section);
+      assert(r.status === 'generating' && r.pendingSection === section && !!r.document, 'regenerando: documento vigente visible + pendingSection');
+      await svc.whenIdle();
+      return svc.get(actor, id);
+    };
     const reset = () => { gen.queue = []; gen.calls = []; gen.delayMs = 0; charges.length = 0; };
     const genRows = async (owner) => ds.query(`select kind, section, status, cost_usd::float as cost from public.microcurriculum_generations where owner_id = $1 order by id`, [owner]);
 
@@ -190,7 +203,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       eq(gen.calls.length, 0, 'sin llamada');
       await svc.update(OWNER, draftId, { answers: ANS('universidad') });
       gen.queue.push(TOOL('universidad'));
-      const rec = await svc.generate(OWNER, draftId);
+      const rec = await G(OWNER, draftId);
       eq([rec.status, rec.issues, rec.document.identification.courseName, rec.document.repairs], ['generated', [], 'Finanzas Corporativas', []]);
       eq(gen.calls.length, 1, 'una llamada');
       eq(gen.calls[0].tool.name, 'emit_microcurriculum');
@@ -210,7 +223,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const d = await svc.create(OWNER, ANS('tecnica'));
       gen.queue.push({ __raw: { input: TOOL('tecnica'), stopReason: 'max_tokens', model: 'claude-sonnet-4-6', messageId: 'msg_cut', usage: { input_tokens: 6000, output_tokens: 12000 } } });
       gen.queue.push(TOOL('tecnica'));
-      const rec = await svc.generate(OWNER, d.id);
+      const rec = await G(OWNER, d.id);
       eq([rec.status, rec.issues.length, gen.calls.length, charges.length], ['generated', 0, 2, 2], 'cortada → reintento ok');
       assert(/se cortó por longitud/.test(gen.calls[1].user), 'el reintento explica el problema');
 
@@ -218,7 +231,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const d2 = await svc.create(OWNER, ANS('tecnica'));
       const bad = TOOL('tecnica'); bad.outcomes[0].verb = 'comprender'; // V6: no aritmético
       gen.queue.push(bad, TOOL('tecnica'));
-      const r2 = await svc.generate(OWNER, d2.id);
+      const r2 = await G(OWNER, d2.id);
       eq([r2.status, r2.issues, gen.calls.length], ['generated', [], 2]);
       assert(gen.calls[1].user.includes('[V6] RA1: «comprender» no es un verbo observable'), 'la lista de errores va al reintento');
 
@@ -227,7 +240,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const worse = TOOL('tecnica'); worse.outcomes[0].verb = 'comprender'; worse.outcomes[1].verb = 'conocer';
       const stillBad = TOOL('tecnica'); stillBad.outcomes[0].verb = 'comprender';
       gen.queue.push(worse, stillBad);
-      const r3 = await svc.generate(OWNER, d3.id);
+      const r3 = await G(OWNER, d3.id);
       eq(r3.status, 'generated', 'se entrega el borrador');
       eq(r3.issues.map((i) => i.code), ['V6'], 'issues visibles (el de menos errores)');
       eq(gen.calls.length, 2, 'un solo reintento');
@@ -239,25 +252,25 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const d = await svc.create(OWNER, ANS('etdh'));
       const t = TOOL('etdh'); t.units[0].hours.practice = 25; t.evaluation[2].percent = 40;
       gen.queue.push(t);
-      const rec = await svc.generate(OWNER, d.id);
+      const rec = await G(OWNER, d.id);
       eq([rec.status, rec.issues, gen.calls.length], ['generated', [], 1]);
       eq(rec.document.repairs.length, 2, JSON.stringify(rec.document.repairs));
       assert(/Horas: se redistribuyeron/.test(rec.document.repairs[0]) && /Evaluación: los porcentajes sumaban 90 %/.test(rec.document.repairs[1]), rec.document.repairs.join(' | '));
       eq(rec.document.units.reduce((a, u) => a + u.hours.practice, 0), 60, 'reparto exigido');
     });
 
-    await check('MS7 proveedor caído → 503 GENERATION_FAILED, failed, cupo liberado; salida inservible ×2 → failed igual; con documento previo no se pierde', async () => {
+    await check('MS7 proveedor caído (en segundo plano) → failed + lastError GENERATION_FAILED, cupo liberado; salida inservible ×2 → failed igual; con documento previo no se pierde', async () => {
       reset();
       const before = (await svc.quota(OWNER)).used;
       const d = await svc.create(OWNER, ANS('colegio'));
       gen.queue.push(new Error('overloaded_error 529'));
-      const body = await rejects(svc.generate(OWNER, d.id), 503, 'GENERATION_FAILED');
-      assert(/no se descontó de tu cupo/.test(body.message), body.message);
-      eq((await svc.get(OWNER, d.id)).status, 'failed');
+      const f1 = await G(OWNER, d.id);
+      eq([f1.status, f1.lastError && f1.lastError.code, f1.pendingSection], ['failed', 'GENERATION_FAILED', null]);
+      assert(/no se descontó de tu cupo/.test(f1.lastError.message), f1.lastError.message);
       eq((await svc.quota(OWNER)).used, before, 'cupo liberado');
       reset();
       gen.queue.push({ description: 'x' }, 'texto');
-      await rejects(svc.generate(OWNER, d.id), 503, 'GENERATION_FAILED');
+      eq((await G(OWNER, d.id)).lastError.code, 'GENERATION_FAILED');
       eq(gen.calls.length, 2);
       eq(charges.length, 2, 'el gasto de las llamadas fallidas igual queda en el ledger');
       const g = await svc.get(OWNER, d.id);
@@ -265,12 +278,12 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       eq((await svc.quota(OWNER)).used, before, 'sigue sin descontar');
       reset();
       gen.queue.push(TOOL('colegio'));
-      eq((await svc.generate(OWNER, d.id)).status, 'generated', 'reintento manual ok');
+      const ok2 = await G(OWNER, d.id);
+      eq([ok2.status, ok2.lastError], ['generated', null], 'reintento manual ok (lastError se limpia)');
       reset();
       gen.queue.push(new Error('timeout'));
-      await rejects(svc.generate(OWNER, d.id), 503, 'GENERATION_FAILED');
-      const kept = await svc.get(OWNER, d.id);
-      eq([kept.status, !!kept.document], ['generated', true], 'una regeneración completa fallida conserva el documento anterior');
+      const kept = await G(OWNER, d.id);
+      eq([kept.status, !!kept.document, kept.lastError.code], ['generated', true, 'GENERATION_FAILED'], 'una regeneración completa fallida conserva el documento anterior');
     });
 
     await check('MS8 cuota: 10/mes → 429 QUOTA_EXHAUSTED con resetsAt; mes siguiente → cupo nuevo; superadmin sin límite; borrar no devuelve cupo; límite por env', async () => {
@@ -282,7 +295,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
         const d = await svc.create(U, ANS('corporativa'));
         ids.push(d.id);
         gen.queue.push(TOOL('corporativa'));
-        await svc.generate(U, d.id);
+        await G(U, d.id);
       }
       const q = await svc.quota(U);
       eq([q.enabled, q.unlimited, q.limit, q.used, q.remaining, q.resetsAt, q.regenLimit], [true, false, 10, 10, 0, '2026-12-01T00:00:00.000Z', 3]);
@@ -298,7 +311,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       eq((await svc.quota(U)).used, 0, 'mes nuevo UTC');
       svc.now = () => new Date(Date.UTC(2026, 10, 15, 12));
       process.env.SUPER_ADMIN_EMAILS = ADMIN.email;
-      for (let i = 0; i < 11; i++) { const x = await svc.create(ADMIN, ANS('corporativa')); gen.queue.push(TOOL('corporativa')); await svc.generate(ADMIN, x.id); }
+      for (let i = 0; i < 11; i++) { const x = await svc.create(ADMIN, ANS('corporativa')); gen.queue.push(TOOL('corporativa')); await G(ADMIN, x.id); }
       const qa = await svc.quota(ADMIN);
       eq([qa.unlimited, qa.used], [true, 11], 'superadmin sin límite');
       delete process.env.SUPER_ADMIN_EMAILS;
@@ -314,21 +327,20 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       await rejects(svc.regenerate(OWNER, d.id, 'units'), 409, 'NOT_GENERATED');
       await rejects(svc.regenerate(OWNER, d.id, 'bibliografia'), 400);
       gen.queue.push(TOOL('universidad'));
-      const g = await svc.generate(OWNER, d.id);
+      const g = await G(OWNER, d.id);
       const usedBefore = (await svc.quota(OWNER)).used;
       const ev = TOOL('universidad').evaluation.map((e) => ({ ...e, name: `${e.name} (nueva)` }));
       gen.queue.push({ evaluation: ev });
-      const r1 = await svc.regenerate(OWNER, d.id, 'evaluation');
+      const r1 = await R(OWNER, d.id, 'evaluation');
       eq([r1.regenCount, r1.document.evaluation[0].name, r1.issues], [1, 'Taller de flujo de caja (nueva)', []]);
       eq(r1.document.units, g.document.units, 'unidades intactas');
       eq(gen.calls[gen.calls.length - 1].tool.input_schema.required, ['evaluation'], 'herramienta de sección');
       gen.queue.push(new Error('overloaded'));
-      await rejects(svc.regenerate(OWNER, d.id, 'outcomes'), 503, 'GENERATION_FAILED');
-      const afterFail = await svc.get(OWNER, d.id);
-      eq([afterFail.status, afterFail.regenCount], ['generated', 1], 'la falla no consume');
+      const afterFail = await R(OWNER, d.id, 'outcomes');
+      eq([afterFail.status, afterFail.regenCount, afterFail.lastError.code, afterFail.pendingSection], ['generated', 1, 'GENERATION_FAILED', null], 'la falla no consume');
       gen.queue.push({ outcomes: TOOL('universidad').outcomes }, { units: TOOL('universidad').units });
-      await svc.regenerate(OWNER, d.id, 'outcomes');
-      const r3 = await svc.regenerate(OWNER, d.id, 'units');
+      await R(OWNER, d.id, 'outcomes');
+      const r3 = await R(OWNER, d.id, 'units');
       eq(r3.regenCount, 3);
       await rejects(svc.regenerate(OWNER, d.id, 'units'), 429, 'REGEN_EXHAUSTED');
       eq((await svc.quota(OWNER)).used, usedBefore, 'regenerar no gasta el cupo mensual');
@@ -339,7 +351,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const d = await svc.create(OWNER, ANS('universidad'));
       await rejects(svc.update(OWNER, d.id, { document: {} }), 409, 'DOCUMENT_REQUIRED');
       gen.queue.push(TOOL('universidad'));
-      const g = await svc.generate(OWNER, d.id);
+      const g = await G(OWNER, d.id);
       reset();
       const doc = clone(g.document);
       doc.description = 'Descripción reescrita por la docente.';
@@ -358,27 +370,47 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       eq(p3.issues.map((i) => i.code), ['V4'], 'cambiar respuestas también revalida');
     });
 
-    await check('MS11 concurrencia: dos generaciones a la vez → una 409 GENERATION_IN_PROGRESS; PATCH durante la generación → 409; abandonada (> 10 min) se libera', async () => {
+    await check('MS11 asíncrono: 202 inmediato (generating) y GET sondea hasta generated; segunda generación / PATCH durante la generación → 409; respuesta antes de la llamada', async () => {
       reset();
       const d = await svc.create(OWNER, ANS('tecnica'));
       gen.delayMs = 300;
       gen.queue.push(TOOL('tecnica'), TOOL('tecnica'));
-      const a = svc.generate(OWNER, d.id);
-      await new Promise((r) => setTimeout(r, 80));
-      const b = svc.generate(OWNER, d.id);
-      const c = svc.update(OWNER, d.id, { answers: {} });
-      const [ra, rb, rc] = await Promise.allSettled([a, b, c]);
-      eq(ra.status, 'fulfilled', 'la primera termina');
-      assert(rb.status === 'rejected' && rb.reason.getStatus() === 409 && rb.reason.getResponse().code === 'GENERATION_IN_PROGRESS', 'la segunda 409');
-      assert(rc.status === 'rejected' && rc.reason.getResponse().code === 'GENERATION_IN_PROGRESS', 'PATCH 409');
-      eq(gen.calls.length, 1, 'una sola llamada');
+      const t0 = Date.now();
+      const first = await svc.generate(OWNER, d.id);
+      assert(Date.now() - t0 < 250, `respondió sin esperar la IA (${Date.now() - t0} ms)`);
+      eq([first.status, first.pendingSection, first.document], ['generating', null, null]);
+      eq((await svc.get(OWNER, d.id)).status, 'generating', 'sondeo: sigue generando');
+      await rejects(svc.generate(OWNER, d.id), 409, 'GENERATION_IN_PROGRESS', 'segunda');
+      await rejects(svc.update(OWNER, d.id, { answers: ANS('tecnica') }), 409, 'GENERATION_IN_PROGRESS', 'PATCH');
+      await svc.whenIdle();
+      const done = await svc.get(OWNER, d.id);
+      eq([done.status, done.issues, done.lastError, gen.calls.length], ['generated', [], null, 1], 'sondeo: generado');
       gen.delayMs = 0;
-      await ds.query(`update public.microcurricula set status = 'generating', generating_since = now() - interval '11 minutes' where id = $1`, [d.id]);
-      await ds.query(`insert into public.microcurriculum_generations (owner_id, microcurriculum_id, kind, status) values ($1, $2, 'generate', 'reserved')`, [OWNER.id, d.id]);
+    });
+
+    await check('MS11b generación interrumpida (proceso reiniciado; generating > 6 min) → GET/lista/cupo la dan por fallida, liberan la reserva y explican; < 6 min sigue generando', async () => {
+      reset();
+      const V = { id: '44444444-5555-4666-8777-888888888888', email: 'v@ejemplo.edu' };
+      const d = await svc.create(V, ANS('tecnica'));
+      const mark = async (min, kind = 'generate', section = null) => {
+        await ds.query(`update public.microcurricula set status = 'generating', generating_since = now() - ($2 || ' minutes')::interval, pending_section = $3 where id = $1`, [d.id, String(min), section]);
+        await ds.query(`insert into public.microcurriculum_generations (owner_id, microcurriculum_id, kind, section, status) values ($1, $2, $3, $4, 'reserved')`, [V.id, d.id, kind, section]);
+      };
+      await mark(3);
+      eq([(await svc.get(V, d.id)).status, (await svc.quota(V)).used], ['generating', 1], '3 min: sigue en curso y cuenta');
+      await ds.query(`update public.microcurricula set generating_since = now() - interval '7 minutes' where id = $1`, [d.id]);
+      eq((await svc.quota(V)).used, 0, 'cupo: la reserva interrumpida se libera');
+      const r = await svc.get(V, d.id);
+      eq([r.status, r.lastError], ['failed', { code: 'GENERATION_INTERRUPTED', message: 'La generación se interrumpió; no se descontó de tu cupo.' }]);
+      // regeneración interrumpida con documento: vuelve a generated y devuelve el contador
       gen.queue.push(TOOL('tecnica'));
-      eq((await svc.generate(OWNER, d.id)).status, 'generated', 'abandonada → se libera y genera');
-      const orphan = await ds.query(`select count(*)::int as n from public.microcurriculum_generations where microcurriculum_id = $1 and status = 'reserved'`, [d.id]);
-      eq(orphan[0].n, 0, 'reserva abandonada liberada');
+      await G(V, d.id);
+      await ds.query(`update public.microcurricula set regen_count = 1 where id = $1`, [d.id]);
+      await mark(7, 'regenerate', 'units');
+      const items = (await svc.list(V)).items;
+      eq(items.map((x) => [x.status, x.regenCount, x.lastError && x.lastError.code]), [['generated', 0, 'GENERATION_INTERRUPTED']], 'lista recupera');
+      eq((await ds.query(`select count(*)::int as n from public.microcurriculum_generations where microcurriculum_id = $1 and status = 'reserved'`, [d.id]))[0].n, 0);
+      eq((await svc.quota(V)).used, 1, 'solo la generación exitosa cuenta');
     });
 
     await check('MS12 kill switch de FinOps → 503 con su código, SIN reserva ni llamada', async () => {
@@ -400,7 +432,7 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       await rejects(svc.pdf(OWNER, d.id), 409, 'DOCUMENT_REQUIRED');
       await rejects(svc.academicContext(OWNER, d.id), 409, 'DOCUMENT_REQUIRED');
       gen.queue.push(TOOL('colegio'));
-      await svc.generate(OWNER, d.id);
+      await G(OWNER, d.id);
       const p = await svc.pdf(OWNER, d.id);
       eq(p.filename, 'microcurriculo-ciencias-naturales-los-ecosistemas.pdf');
       assert(p.pdf.slice(0, 5).toString() === '%PDF-' && p.pdf.length > 5000, 'PDF');
@@ -424,6 +456,8 @@ const FIX = (k) => JSON.parse(fs.readFileSync(path.join(FIX_DIR, `${k}.json`), '
       const proto = MicrocurriculumController.prototype;
       const routes = Object.getOwnPropertyNames(proto).filter((n) => n !== 'constructor').map((n) => `${RequestMethod[Reflect.getMetadata(METHOD_METADATA, proto[n])]} ${Reflect.getMetadata(PATH_METADATA, proto[n])}`).sort();
       eq(routes, ['DELETE :id', 'GET /', 'GET :id', 'GET :id/academic-context', 'GET :id/pdf', 'GET quota', 'PATCH :id', 'POST /', 'POST :id/generate', 'POST :id/regenerate'].sort());
+      const { HTTP_CODE_METADATA } = require('@nestjs/common/constants');
+      eq([Reflect.getMetadata(HTTP_CODE_METADATA, proto.generate), Reflect.getMetadata(HTTP_CODE_METADATA, proto.regenerate)], [202, 202], 'generar/regenerar → 202');
       const { AllExceptionsFilter } = D('common/filters/http-exception.filter.js');
       const { HttpException } = require('@nestjs/common');
       let sent = null;

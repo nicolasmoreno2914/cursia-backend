@@ -2,7 +2,8 @@
 -- Cursia — r81 «Crear microcurrículo»: borradores de microcurrículo por usuario y su registro de generaciones (cuota).
 --
 --   microcurricula                   un borrador por microcurrículo: respuestas del cuestionario, documento generado
---                                    (MicrocurriculumV1), comprobaciones V1–V8, regeneraciones de sección y costo.
+--                                    (MicrocurriculumV1), comprobaciones V1–V8, regeneraciones de sección, costo y el
+--                                    estado de la generación en segundo plano (pending_section, last_error).
 --   microcurriculum_generations      una fila por generación completa o regeneración de sección: la cuota mensual cuenta
 --                                    las `reserved` + `succeeded` del mes UTC; una llamada fallida queda `released`
 --                                    (no descuenta). Borrar un microcurrículo NO devuelve cupo (microcurriculum_id → NULL).
@@ -32,9 +33,14 @@ create table if not exists public.microcurricula (
   cost_usd numeric(12, 6) not null default 0 check (cost_usd >= 0),
   course_id integer null,
   generating_since timestamptz null,
+  pending_section text null check (pending_section is null or pending_section in ('outcomes', 'units', 'evaluation')),
+  last_error jsonb null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+-- Generación asíncrona (columnas también por ALTER: idempotente si la tabla se creó antes de ellas).
+alter table public.microcurricula add column if not exists pending_section text null;
+alter table public.microcurricula add column if not exists last_error jsonb null;
 create index if not exists microcurricula_owner_created_idx on public.microcurricula (owner_id, created_at desc);
 
 create table if not exists public.microcurriculum_generations (

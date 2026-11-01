@@ -44,6 +44,7 @@ export class MicrocurriculumController {
     return this.mc.create(actorOf(user), body?.answers ?? {});
   }
 
+  // GET /api/v1/microcurricula/:id → record (también el sondeo de la generación en segundo plano)
   @Get(':id')
   get(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.mc.get(actorOf(user), id);
@@ -60,16 +61,18 @@ export class MicrocurriculumController {
     return this.mc.remove(actorOf(user), id);
   }
 
-  // POST /api/v1/microcurricula/:id/generate → record (síncrono ≤ 150 s; 400 ANSWERS_INCOMPLETE, 429 QUOTA_EXHAUSTED, 409)
+  // POST /api/v1/microcurricula/:id/generate → 202 + record en `generating` (asíncrono: sondear GET /:id);
+  // 400 ANSWERS_INCOMPLETE, 429 QUOTA_EXHAUSTED, 409 GENERATION_IN_PROGRESS
   @Post(':id/generate')
-  @HttpCode(HttpStatus.OK)
+  @HttpCode(HttpStatus.ACCEPTED)
   generate(@Param('id') id: string, @CurrentUser() user: AuthUser) {
     return this.mc.generate(actorOf(user), id);
   }
 
-  // POST /api/v1/microcurricula/:id/regenerate { section } → record (429 REGEN_EXHAUSTED; requiere status generated)
+  // POST /api/v1/microcurricula/:id/regenerate { section } → 202 + record (`pendingSection`; documento vigente visible);
+  // 429 REGEN_EXHAUSTED; requiere status generated
   @Post(':id/regenerate')
-  @HttpCode(HttpStatus.OK)
+  @HttpCode(HttpStatus.ACCEPTED)
   regenerate(@Param('id') id: string, @Body() body: RegenerateSectionDto, @CurrentUser() user: AuthUser) {
     return this.mc.regenerate(actorOf(user), id, body.section);
   }
