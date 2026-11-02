@@ -1,0 +1,40 @@
+{
+  "_nota": "r81 · fixture de microcurrículo (técnica/tecnológica): semanas × horas/semana, sin reparto exigido, sin número de unidades.",
+  "answers": {
+    "identification": { "courseName": "Mantenimiento de Redes LAN", "institutionType": "tecnica", "program": "Tecnología en Gestión de Redes", "term": "Tercer semestre", "modality": "mixta", "code": "TGR-210" },
+    "learners": { "profile": "Estudiantes de tecnología, 18 a 30 años, algunos con experiencia como auxiliares de soporte." },
+    "purpose": { "need": "Las empresas de la región necesitan técnicos que diagnostiquen y mantengan redes locales sin depender de proveedores externos.", "expectedAbilities": "Instalar cableado estructurado, configurar direccionamiento IP y VLAN, y diagnosticar fallas de conectividad." },
+    "time": { "mode": "weekly", "weeks": 16, "hoursPerWeek": 4 },
+    "contents": { "requiredTopics": ["Cableado estructurado", "Direccionamiento IP", "VLAN"] },
+    "methodology": { "strategies": ["laboratorio", "proyectos"] },
+    "references": {}
+  },
+  "tool": {
+    "description": "Curso práctico en el que los estudiantes instalan, configuran y mantienen redes de área local en el laboratorio, con un proyecto final de diagnóstico de una red real.",
+    "justification": "La región demanda técnicos capaces de mantener redes locales de pymes y entidades públicas; el curso forma esa capacidad dentro del programa.",
+    "learnerProfile": "Estudiantes de tecnología entre 18 y 30 años; algunos trabajan como auxiliares de soporte.",
+    "priorKnowledge": "Manejo básico del computador y del sistema operativo.",
+    "generalObjective": "Mantener redes de área local cableadas aplicando estándares de cableado, direccionamiento y segmentación.",
+    "specificObjectives": ["Instalar cableado estructurado según norma.", "Configurar direccionamiento IP y VLAN en equipos de red.", "Diagnosticar fallas de conectividad."],
+    "outcomes": [
+      { "id": "RA1", "text": "Instalar puntos de cableado estructurado en el laboratorio, cumpliendo la norma de certificación.", "verb": "instalar", "bloom": "aplicar", "condition": "en el laboratorio", "criterion": "cumpliendo la norma de certificación" },
+      { "id": "RA2", "text": "Configurar el direccionamiento IP de una red de 30 equipos, con simulador y equipos reales, sin conflictos de direcciones.", "verb": "configurar", "bloom": "aplicar", "condition": "con simulador y equipos reales", "criterion": "sin conflictos de direcciones" },
+      { "id": "RA3", "text": "Segmentar una red mediante VLAN, en un switch administrable, de acuerdo con el diseño entregado.", "verb": "segmentar", "bloom": "aplicar", "condition": "en un switch administrable", "criterion": "de acuerdo con el diseño entregado" },
+      { "id": "RA4", "text": "Diagnosticar fallas de conectividad en una red en operación, con herramientas de prueba, documentando la causa y la solución.", "verb": "diagnosticar", "bloom": "analizar", "condition": "con herramientas de prueba", "criterion": "documentando la causa y la solución" }
+    ],
+    "competencies": [ { "id": "CO1", "text": "Mantener infraestructura de red local según estándares técnicos." }, { "id": "CO2", "text": "Trabajar en equipo en la solución de incidentes técnicos." } ],
+    "units": [
+      { "id": "U1", "title": "Cableado estructurado", "contents": ["Normas de cableado", "Herramientas y certificación", "Instalación de puntos de red"], "outcomeIds": ["RA1"], "hours": { "contact": 8, "practice": 10, "autonomous": 2 }, "weeks": { "from": 1, "to": 5 }, "strategy": "laboratorio", "mainActivity": "Instalación y certificación de cuatro puntos de red" },
+      { "id": "U2", "title": "Direccionamiento IP y VLAN", "contents": ["Direccionamiento IP", "Subredes", "VLAN en switches administrables"], "outcomeIds": ["RA2", "RA3"], "hours": { "contact": 8, "practice": 12, "autonomous": 4 }, "weeks": { "from": 6, "to": 11 }, "strategy": "laboratorio", "mainActivity": "Configuración de una red segmentada en el laboratorio" },
+      { "id": "U3", "title": "Diagnóstico y mantenimiento", "contents": ["Metodología de diagnóstico", "Herramientas de prueba", "Documentación de incidentes"], "outcomeIds": ["RA4"], "hours": { "contact": 6, "practice": 10, "autonomous": 4 }, "weeks": { "from": 12, "to": 16 }, "strategy": "proyectos", "mainActivity": "Proyecto: diagnóstico de la red de una entidad aliada" }
+    ],
+    "methodology": { "text": "Las sesiones combinan una demostración corta del docente con práctica guiada en el laboratorio; el curso cierra con un proyecto de diagnóstico en una red real.", "strategies": ["laboratorio", "proyectos"] },
+    "evaluation": [
+      { "name": "Práctica de cableado", "percent": 30, "outcomeIds": ["RA1"], "week": 5, "evidence": "Puntos certificados, lista de chequeo" },
+      { "name": "Laboratorio de configuración", "percent": 30, "outcomeIds": ["RA2", "RA3"], "week": 11, "evidence": "Configuración funcionando, rúbrica" },
+      { "name": "Proyecto de diagnóstico", "percent": 40, "outcomeIds": ["RA4"], "week": 16, "evidence": "Informe técnico y sustentación, rúbrica" }
+    ],
+    "resources": ["Laboratorio de redes", "Simulador de redes"],
+    "bibliography": [ { "text": "Tanenbaum, A. S., & Wetherall, D. J. Redes de computadoras. Pearson.", "origin": "sugerida" } ]
+  }
+}

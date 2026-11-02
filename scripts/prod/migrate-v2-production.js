@@ -297,6 +297,11 @@ const EXCLUDED = [
   // llevar r79 a producción (el código lee la columna con to_jsonb y escribirla exige la columna: sin ella, 503).
   { file: 'supabase-migration-r79-1-application-kinds.sql', reason: 'r79.1: staging-only hasta aprobación del owner' },
   { file: 'scripts/migrate-r79-1-application-kinds.js', reason: 'r79.1: staging-only hasta aprobación del owner' },
+  // r81 («Crear microcurrículo»): tablas nuevas microcurricula / microcurriculum_generations. Staging-only hasta que el
+  // owner apruebe llevarlo a producción (sin ellas la API responde 503 MICROCURRICULUM_NOT_MIGRATED; el flag
+  // MICROCURRICULUM_ENABLED está apagado en producción). Para promoverlo: paso propio en MIGRATION_STEPS + sondas.
+  { file: 'supabase-migration-r81-microcurricula.sql', reason: 'r81: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r81-microcurricula.js', reason: 'r81: staging-only hasta aprobación del owner' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 
