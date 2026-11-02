@@ -1386,8 +1386,10 @@
   function backendGetBrief(courseId) {
     return backendApiRequest('/api/v1/courses/' + courseId + '/brief', { method: 'GET' });
   }
+  // r81 E2E (#2100): con el servidor ocupado el PUT tardaba más de los 8 s por defecto y el cliente lo daba por fallido
+  // aunque el backend lo aplicara. Es una escritura pequeña: 20 s como las demás escrituras.
   function backendPutBrief(courseId, fields) {
-    return backendApiRequest('/api/v1/courses/' + courseId + '/brief', { method: 'PUT', body: fields });
+    return backendApiRequest('/api/v1/courses/' + courseId + '/brief', { method: 'PUT', body: fields }, 20000);
   }
   function backendGetFacts(courseId) {
     return backendApiRequest('/api/v1/courses/' + courseId + '/facts', { method: 'GET' });
