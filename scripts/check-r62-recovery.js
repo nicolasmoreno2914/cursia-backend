@@ -691,7 +691,7 @@ async function dbChecks() {
     });
     const claimProvider = (runId, type) => sched.claimNextItem({ executorId: 'r62-provider-worker', types: [type], leaseSeconds: 120, runId });
     const later = (mins) => new Date(Date.now() + mins * 60_000);
-    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400' };
+    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400', OPENAI_TTS_SEGMENT_RETRIES: '0' };
     const resubOf = (res, rid) => res.resubmitted.filter((x) => x.runId === rid);
     const runSpent = async (rid) => Number((await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1`, [rid]))[0].t);
     const paidAuthorized = async (rid) => Number(await budget.runPaidAuthorizedBudget(rid));
