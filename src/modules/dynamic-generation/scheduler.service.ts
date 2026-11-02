@@ -94,6 +94,12 @@ import {
 } from './exam-bank-draft';
 import { FailureSource, classifyFailure, isValidFailureCode } from '../reliability/failure-classifier';
 import { executorKindFor, openItemAttempt, recordItemCompleted, recordItemFailure } from '../reliability/attempt-log';
+// r83: breaker de Supabase Storage (compuerta del claim de los workers + esperas sin consumir intento).
+import {
+  STORAGE_HOLD_REASON, storageBreakerConfigFromEnv, storageBreakerDbOf, storageBreakerNextProbe, storageClaimGate,
+  storageHeldRetryAfterSeconds, storageOutageGrantDecision, storageProbeFromEnv,
+} from '../reliability/storage-breaker';
+import { isStorageUnavailableMessage } from '../artifacts/storage-resilience';
 import {
   EXEC_LEASE_RUN_LEASED_ELSEWHERE,
   acquireRunExecLease,
@@ -455,7 +461,8 @@ export const RUN_PAUSED_REASON = 'run_paused' as const;
 
 export interface ClaimResult {
   item: ClaimedItem | null;
-  reason?: typeof EXEC_LEASE_RUN_LEASED_ELSEWHERE | typeof RUN_PAUSED_REASON;
+  /** r83: `storage_unavailable` = el breaker de Storage retiene los claims de los workers del servidor. */
+  reason?: typeof EXEC_LEASE_RUN_LEASED_ELSEWHERE | typeof RUN_PAUSED_REASON | typeof STORAGE_HOLD_REASON;
   leaseExpiresAt?: string | null;
 }
 
@@ -509,6 +516,8 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'providerProbe',
   // r61 Q-04: línea de tiempo del video (escenas de Videogen) que ancla las preguntas del video interactivo.
   'videoScenes', 'videoScenesUnavailable', 'videoTimelinePinned',
+  // r83: racha de esperas sin costo por Storage caído (la escribe solo failItem del servidor).
+  'storageOutage',
 ]);
 
 /** r58 (I4-3): archivos de trabajo de UN capítulo en un perfil de evaluación (los del claim de la Actividad de Aplicación). */
@@ -628,6 +637,16 @@ export class SchedulerService {
       types = types.filter((t) => t !== 'guided_practice');
     }
     const leaseSeconds = this.clampLease(opts.leaseSeconds);
+    // r83: worker del servidor (sin ownerId) con Supabase Storage caído → no se entrega NADA (antes de cualquier llamada
+    // pagada cuyo resultado no se podría guardar). La compuerta corre la sonda cuando toca y reabre sola. Los leases
+    // vencidos se siguen barriendo (sus items vuelven a la cola sin consumir intento).
+    if (opts.ownerId === undefined || opts.ownerId === null) {
+      const gate = await storageClaimGate(storageBreakerDbOf(this.dataSource as any), storageProbeFromEnv(), { logger: this.logger });
+      if (gate.hold) {
+        if (!opts.runId) await this.sweepExpiredLeases().catch(() => 0);
+        return { item: null, reason: STORAGE_HOLD_REASON };
+      }
+    }
     if (opts.ownerId !== undefined && opts.ownerId !== null) {
       // Defensa en profundidad (R16): el camino navegador (ownerId) nunca
       // reclama tipos fuera de content/scorm/exam, aunque el DTO lo deje pasar.
@@ -1284,6 +1303,11 @@ export class SchedulerService {
   ): Promise<ItemOpResult> {
     executorId = this.checkExecutorId(executorId);
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
+    // r83: Supabase Storage caído (StorageUnavailableError de un worker del SERVIDOR; el navegador no puede pedirlo) →
+    // espera de infraestructura: vuelve a `retrying` sin consumir intento, hasta la próxima sonda del breaker.
+    const storageWait = (ownerId === undefined || ownerId === null) && !!retryable && isStorageUnavailableMessage(msg)
+      ? await storageBreakerNextProbe(this.dataSource as any)
+      : null;
     return this.guardedItemOp(itemRunId, executorId, ownerId, 'update', async (qr, job, item) => {
       // BANKOPT (1e): borrador del banco de un examen incompleto (validado; si no corresponde, se ignora).
       // Fix round 4 (R4): el borrador anterior se borra SOLO con `examBankDraftArtifactId: null` explícito
@@ -1307,9 +1331,27 @@ export class SchedulerService {
         );
       }
       // Loop de costos (review I2): conceder el intento por una devolución `run_paused` solo si el run está pausado.
-      const grant = opts?.grantAttempt === true && (!msg.startsWith('run_paused') || isPausedRun(job));
+      let grant = opts?.grantAttempt === true && (!msg.startsWith('run_paused') || isPausedRun(job));
+      let retryAfterSeconds = opts?.retryAfterSeconds ?? null;
+      if (storageWait) {
+        // Racha por item (output_summary.storageOutage) con tope: nunca un bucle infinito de esperas gratis.
+        const [cur] = await qr.query(`select output_summary->'storageOutage' as so from public.generation_item_runs where id = $1`, [item.id]);
+        const d = storageOutageGrantDecision(cur?.so ?? null, Date.now(), storageBreakerConfigFromEnv());
+        await qr.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('storageOutage', $2::jsonb)
+            where id = $1`,
+          [item.id, JSON.stringify(d.next)],
+        );
+        if (d.grant) {
+          grant = true;
+          retryAfterSeconds = retryAfterSeconds ?? storageHeldRetryAfterSeconds(storageWait);
+        } else {
+          this.logger.warn(`failItem ${item.id}: Storage caído pero la racha de esperas sin costo se agotó (${d.next.grants}) — consume intento`);
+        }
+      }
       const t = await applyItemFailure(
-        qr, item.id, msg, !!retryable, opts?.retryAfterSeconds ?? null, opts?.refundAttempt === true, grant,
+        qr, item.id, msg, !!retryable, retryAfterSeconds, opts?.refundAttempt === true, grant,
         { errorCode: isValidFailureCode(opts?.errorCode) ? opts!.errorCode : null, source: failureSourceFor(item.type, ownerId) },
       );
       if (!t) throw new GuardRejection('not_running');
