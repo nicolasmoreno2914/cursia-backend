@@ -295,7 +295,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   { id: 'unknown_error', codes: ['unknown_error'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   {
     id: 'download_failed',
-    codes: ['download_failed', 'text_fetch_failed', 'download_url_failed', 'sign_failed', 'storage_unavailable', 'audio_segment_unavailable'],
+    codes: ['download_failed', 'text_fetch_failed', 'download_url_failed', 'sign_failed', 'audio_segment_unavailable'],
     family: /^[a-z0-9_]+_download_failed$/,
     class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3,
   },
@@ -306,6 +306,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item', provider: undefined }
       : null),
   },
+  // r83 (incidente #91): Supabase Storage no respondió durante todo el presupuesto de reintentos (StorageUnavailableError).
+  // Espera de INFRAESTRUCTURA: el scheduler la devuelve sin consumir intento y el breaker de Storage
+  // (reliability/storage-breaker.ts) retiene los claims hasta que la sonda responda. Nunca reconciliación ni humano.
+  { id: 'storage_unavailable', codes: ['storage_unavailable'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'storage', rounds: 3 },
   { id: 'artifact_upload_failed', codes: ['artifact_upload_failed', 'upload_failed'], class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3 },
   { id: 'complete_rejected', codes: ['complete_rejected'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   { id: 'finops_unavailable', codes: ['finops_unavailable', 'finops_ledger_write_failed'], class: 'A', strategy: 'wait_provider', scope: 'run', provider: 'finops', rounds: 3 },
@@ -607,7 +611,7 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
   // r62 (P, review I1): PACKAGING_V3_CONTENT_MISSING (contenido ausente/vacío en un set de artifacts que no cambia entre
   // reintentos) pasa a `package_component` (B, reparación por item) y ERR_BUFFER_TOO_LARGE (misma entrada, mismo tamaño) a
   // `package_product` (D): ninguno se arregla reintentando y con r62 lo A se reintenta hasta 72 h.
-  { id: 'package_transient', codes: ['package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
+  { id: 'package_transient', codes: ['package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT', 'storage_unavailable'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
   {
     id: 'package_component',
     codes: ['EXAM_BANK_INVALID', 'QUIZ_V3_BANK_INVALID', 'QUIZ_V3_EMPTY', 'QUIZ_V3_INVALID', 'H5P_ACTIVITY_PAYLOAD_INVALID', 'H5P_INPUT_INVALID',
@@ -728,6 +732,8 @@ const ITEM_TYPE_PREFIXES = new Set([
 /** Frases estables del ejecutor del navegador / de api() (04-api.js) → código. Orden = prioridad. */
 const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^(?:❌\s*)?Fall[oó] despu[eé]s de \d+ intentos\b/i, 'browser_llm_transient'],
+  // r83: caída de Storage detrás de los envoltorios estables de los workers (antes que artifact_upload_failed).
+  [/^(?:unexpected_error:\s*|no se pudo subir el artifact [^:]*:\s*)?storage_unavailable:\s*Supabase Storage [a-z]+ failed:/, 'storage_unavailable'],
   [/^no se pudo subir el artifact\b/i, 'artifact_upload_failed'],
   [/^complete rechazado\b/i, 'complete_rejected'],
   [/^OUTPUT_TRUNCATED_MAX_TOKENS\b/, 'OUTPUT_TRUNCATED_MAX_TOKENS'],
