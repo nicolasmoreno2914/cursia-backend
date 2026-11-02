@@ -170,6 +170,12 @@ export function autoBudgetExtensionMaxTokens(maxTok?: number): number {
   return Math.max(1, Math.min(LLM_WORKER_MAX_TOKENS_CAP, Math.ceil((maxTok || 4000) * 1.5)));
 }
 
+/** r83: tope (bytes) de un punto de guardado guardado en la base cuando Storage está caído. */
+function checkpointInlineMaxBytes(): number {
+  const n = Number(process.env.LLM_CHECKPOINT_INLINE_MAX_BYTES);
+  return Number.isFinite(n) && n > 0 ? n : 1_500_000;
+}
+
 /** Ventana de la parte (igual que el presupuesto de recuperación): generación vigente desde su último reinicio. */
 export async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ since: Date; checkpoints: Record<string, { path: string; at: string }>; sent: Record<string, string>; autoBudgetExtension: boolean }> {
   const [r] = await ds.query(
@@ -453,7 +459,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     const fromCheckpoint = async (w: { since: Date; checkpoints: Record<string, { path: string; at: string }> }): Promise<string | null> => {
       const cp = w.checkpoints[hash];
       if (!cp || !(new Date(cp.at) >= w.since)) return null;
-      const raw = await deps.checkpoints.get(cp.path).catch(() => null);
+      // r83: guardado EN LA BASE (`inline`) cuando Storage estaba caído al guardarlo → se lee de ahí.
+      const inline = (cp as { inline?: unknown }).inline;
+      const raw = typeof inline === 'string' && inline ? inline : await deps.checkpoints.get(cp.path).catch(() => null);
       let saved: { text: string; usage: Record<string, number>; stopReason: string | null } | null = null;
       try { saved = raw ? JSON.parse(raw) : null; } catch { saved = null; } // guardado ilegible = no hay guardado (M2)
       if (!saved || typeof saved.text !== 'string' || !saved.text) return null;
@@ -638,8 +646,18 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       if (r.text) {
         try {
           const path = `${item.ownerId}/dynamic/${item.artifactCourseId}/${item.manifestId}/llm-checkpoints/${item.itemRunId}/${hash}.json`;
-          await deps.checkpoints.put(path, JSON.stringify({ text: r.text, usage: r.usage, stopReason: r.stopReason, messageId: r.messageId }));
-          const entry = { path, at: new Date().toISOString() };
+          const cpJson = JSON.stringify({ text: r.text, usage: r.usage, stopReason: r.stopReason, messageId: r.messageId });
+          const entry: { path: string; at: string; inline?: string } = { path, at: new Date().toISOString() };
+          // r83 (incidente #91): si Storage no guarda (caído tras sus reintentos), el guardado va EN LA BASE (índice de la
+          // parte, `inline`) — la respuesta ya se pagó y un reintento nunca la vuelve a pedir. Solo si es demasiado grande
+          // (> LLM_CHECKPOINT_INLINE_MAX_BYTES) se pierde como antes.
+          try {
+            await deps.checkpoints.put(path, cpJson);
+          } catch (putErr) {
+            if (Buffer.byteLength(cpJson, 'utf8') > checkpointInlineMaxBytes()) throw putErr;
+            entry.inline = cpJson;
+            deps.logger.warn(`[llm-worker] ${item.itemKey}: Storage no guardó el punto de guardado (${putErr instanceof Error ? putErr.message.slice(0, 160) : String(putErr)}) — se guarda en la base`);
+          }
           const owned = await deps.recordCheckpoint(item.itemRunId, { [hash]: entry });
           if (!owned && deps.recordLateCheckpoint) {
             // r61 (Q-21): la parte ya no es de este worker (lease tomada a mitad de la llamada). La respuesta YA se
