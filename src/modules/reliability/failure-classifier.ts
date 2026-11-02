@@ -229,6 +229,9 @@ export const PROVIDER_CONFIG_RE =
 /** Reglas de LLAMADAS a un proveedor pagado: a ellas se aplica el chequeo de configuración del proveedor (I1). */
 const PROVIDER_CALL_RULES: Readonly<Record<string, FailureProvider | null>> = Object.freeze({
   tts_failed: 'openai',
+  // r83: envíos TTS sin audio completo ya liquidados como cobrados / proveedor enfermo (devolución sin consumir intento).
+  tts_chunk_cut_exhausted: 'openai',
+  tts_provider_unhealthy: 'openai',
   audiobook_script_failed: 'anthropic',
   gamma_submit_failed: 'gamma',
   gamma_repoll: 'gamma',
@@ -583,6 +586,13 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       return n > 0 ? { class: 'C', strategy: 'auto_resubmit_once', rounds: 1, adminAction: 'reconcile_provider', humanReason: 'duplicate_charge', paidRisk: 'uncertain' } : null;
     },
   },
+  // r83 (incidente #91): el segmento se reintentó dentro del intento y cada envío perdido quedó LIQUIDADO como cobrado
+  // (posible duplicado, medido y acotado por el presupuesto de recuperación): no queda nada incierto → A, no C/humano.
+  { id: 'tts_chunk_cut_exhausted', codes: ['tts_chunk_cut_exhausted'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3 },
+  // r83: cortes repetidos en pocos minutos → el item volvió a la cola sin consumir intento (acotado por item).
+  { id: 'tts_provider_unhealthy', codes: ['tts_provider_unhealthy'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3 },
+  // r83: el Storage no aceptó un segmento ya pagado; el MP3 quedó en el spool local del worker y el reintento lo re-sube sin repagar.
+  { id: 'audio_segment_upload_failed', codes: ['audio_segment_upload_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'none', rounds: 3 },
   {
     id: 'provider_reconciliation',
     codes: ['provider_reconciliation_required', 'confirm_paid_required', 'may_have_rendered_ack_required'],

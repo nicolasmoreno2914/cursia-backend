@@ -689,7 +689,9 @@ async function dbChecks() {
       const tts0 = fakes.st.tts.length;
       const item = await claimProvider(runId, 'audiobook_chapter');
       assert(item && item.chapterId === C.c2, 'claim C2');
-      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'reconciliación');
+      // r83: con OPENAI_TTS_SEGMENT_RETRIES=0 (política r62) el 500 queda incierto → reconciliación. Con el reintento por
+      // segmento activo (default) el 500 se liquida como cobrado y se reintenta: lo cubre scripts/check-r83-tts.js.
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: { ...process.env, OPENAI_TTS_SEGMENT_RETRIES: '0' } }), item), /^provider_reconciliation_required/, 'reconciliación');
       let row = await itemRow(runId, item.itemKey);
       eq(row.status, 'failed', `estado ${row.status} ${row.error}`);
       assert(/tts_failed/.test(row.error) && row.output_summary.audiobookSections && row.output_summary.audiobookSections['0'], 'guion guardado + motivo');
