@@ -64,7 +64,7 @@ ok(/distinct on \(pj\.course_id\)/.test(V2_LATEST_RUN_SQL) && /order by pj\.cour
   'último run por curso (distinct on + created_at desc)');
 ok(/execution_mode = 'dynamic_generation'/.test(V2_LATEST_RUN_SQL) && /execution_mode = 'dynamic_package'/.test(V2_LATEST_RUN_SQL) && /worker_status = 'completed'/.test(V2_LATEST_RUN_SQL),
   'solo runs dynamic_generation y paquetes dynamic_package completados');
-ok(/course_id = any\(\$1::int\[\]\)/.test(V2_LATEST_RUN_SQL), 'filtra por los ids del listado');
+ok(/course_id::text = any\(\$1::text\[\]\)/.test(V2_LATEST_RUN_SQL), 'filtra por los ids del listado');
 ok(!/\b(update|insert|delete)\b/i.test(V2_LATEST_RUN_SQL), 'solo lectura');
 
 function fakeQ(rows, opts = {}) {
@@ -91,7 +91,7 @@ function fakeQ(rows, opts = {}) {
     ];
     const out = await attachV2LatestRuns(q, courses);
     ok(q.calls.length === 1, 'UNA consulta para todo el listado', q.calls.length);
-    ok(JSON.stringify(q.calls[0].params) === JSON.stringify([[91, 92, 93]]), 'parámetros: solo ids dynamic', q.calls[0].params);
+    ok(JSON.stringify(q.calls[0].params) === JSON.stringify([['91', '92', '93']]), 'parámetros: solo ids dynamic', q.calls[0].params);
     ok(out === courses, 'devuelve el mismo arreglo');
     ok(out[0].v2LatestRun && out[0].v2LatestRun.packageReady === true && out[0].v2LatestRun.completionState === 'complete', 'curso 91 → listo', out[0].v2LatestRun);
     ok(out[1].v2LatestRun && out[1].v2LatestRun.completionState === 'in_progress', 'curso 92 → generando', out[1].v2LatestRun);
