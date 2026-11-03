@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'crypto';
 import type { DataSource } from 'typeorm';
 import { pauseRunForCap, reservePaidCall, RunBudgetCapReached, serverLlmChargeInput, settlePaidCall, WorkerLedger } from '../finops-worker-hooks';
 import type { CallRole } from '../../modules/finops/finops-ledger.service';
-import { itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
+import { AMBIGUOUS_RESEND_ALLOWANCE_CALLS, itemRecoveryBudgetMessage } from '../../modules/finops/run-spend-guard';
 import { LlmStreamError, LlmStreamResult, nonStreamMessage, streamMessage } from './anthropic-stream';
 import { inFlightRemainingMs, PRIOR_CALL_IN_FLIGHT, priorCallInFlightMessage, retryAfterSecondsFor } from '../lease-takeover';
 import { settleAmbiguousAsPossibleDuplicate } from '../../modules/finops/ambiguous-resend';
@@ -29,8 +29,12 @@ import { usd2 } from '../../modules/finops/usd-display';
 
 export const LLM_WORKER_CALL_TAG_PREFIX = 'llmw';
 export const LLM_PENDING_REVIEW = 'llm_pending_review';
-/** Máximo de resultados desconocidos de UNA MISMA llamada antes de dejar la parte en revisión (1 reintento automático). */
-export const LLM_UNKNOWN_MAX = 2;
+/**
+ * Máximo de resultados desconocidos de UNA MISMA llamada antes de dejar la parte en revisión.
+ * r83 (incidente curso 91, cortes de red intermitentes): 3 → hasta 2 reenvíos de la misma llamada, cada uno acotado por
+ * DINERO (ambiguousResendBudget con holgura) — antes 2 (un solo reenvío).
+ */
+export const LLM_UNKNOWN_MAX = 3;
 /**
  * r62 (regla de ambigüedad acotada, punto 3; review N1 I2): el tope es por LLAMADA (LLM_UNKNOWN_MAX: a lo sumo un reenvío
  * de cada llamada desconocida) y por EVENTO: las reservas desconocidas de un mismo intento (un worker caído con k llamadas
@@ -39,14 +43,94 @@ export const LLM_UNKNOWN_MAX = 2;
  * en la ventana de la parte → revisión. LLM_UNKNOWN_ITEM_MAX queda solo como tope anti-bucle de respaldo (por encima de
  * la concurrencia del worker: un crash con todos los carriles en vuelo nunca lo alcanza).
  */
-export const LLM_UNKNOWN_ITEM_MAX = 4;
-/** r62 (re-review I2-bis): tope de respaldo = max(4, carriles en paralelo de la parte). */
-export function llmUnknownItemMax(parallelCalls?: number | null): number {
+export const LLM_UNKNOWN_ITEM_MAX = 6;
+/** r62 (re-review I2-bis) / r83: tope de respaldo = max(6, eventos admitidos × carriles en paralelo de la parte). */
+export function llmUnknownItemMax(parallelCalls?: number | null, env: Record<string, string | undefined> = process.env): number {
   const n = Math.floor(Number(parallelCalls ?? 0));
-  return Math.max(LLM_UNKNOWN_ITEM_MAX, Number.isFinite(n) && n > 0 ? n : 0);
+  return Math.max(LLM_UNKNOWN_ITEM_MAX, (Number.isFinite(n) && n > 0 ? n : 0) * llmAmbiguousEventMax(env));
 }
-/** r62: eventos ambiguos admitidos por ventana de la parte. */
-export const LLM_UNKNOWN_EVENT_MAX = 1;
+/**
+ * r62: eventos ambiguos admitidos por ventana de la parte (antes 1: el 2.º evento → revisión).
+ * r83: la regla pasa a ser de DINERO (cada reenvío tiene que entrar en el presupuesto de la parte + holgura de
+ * ambigüedad y en el saldo autorizado del run) con un tope duro anti-bucle de 3 eventos por parte: el 4.º → revisión.
+ * `DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX` (1–5) lo ajusta (1 = regla r62).
+ */
+export const LLM_UNKNOWN_EVENT_MAX = 3;
+export function llmAmbiguousEventMax(env: Record<string, string | undefined> = process.env): number {
+  const v = Math.floor(Number(env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX));
+  return Number.isFinite(v) && v >= 1 && v <= 5 ? v : LLM_UNKNOWN_EVENT_MAX;
+}
+/** r83: desconocidos de UNA llamada admitidos (con el tope de eventos en 1, la regla r62: un reenvío por llamada). */
+export function llmUnknownPerCallMax(env: Record<string, string | undefined> = process.env): number {
+  return llmAmbiguousEventMax(env) <= 1 ? 2 : LLM_UNKNOWN_MAX;
+}
+
+/**
+ * r83: cortes a mitad del stream en la parte (historia de la fila + este proceso) a partir de los cuales TODA la parte
+ * va sin streaming. Un solo corte ya no cambia la parte entera (incidente curso 91: tras un corte, todas las llamadas del
+ * examen final iban sin streaming, mudas 1–3 min, y la siguiente se perdió): solo esa llamada se reenvía sin streaming.
+ */
+export const LLM_ITEM_NONSTREAM_AFTER_CUTS = 2;
+
+/** r83: código de la devolución de la parte cuando la red/proveedor está inestable (pausa corta, sin consumir intento). */
+export const LLM_PROVIDER_UNHEALTHY = 'llm_provider_unhealthy';
+/** r83: clave del item con la telemetría de cortes/desconocidos (últimos 20). */
+export const LLM_TRANSPORT_EVENTS_KEY = 'llmTransportEvents';
+export const LLM_TRANSPORT_EVENTS_MAX = 20;
+
+export interface LlmUnhealthyPolicy { windowMs: number; pauseMs: number; minEvents: number; minItems: number }
+/**
+ * r83: varios desconocidos/cortes del run en pocos minutos = red o proveedor inestable → las llamadas NUEVAS esperan
+ * (la parte vuelve a la cola sin consumir intento) en vez de gastar el cupo de ambigüedad de todas las partes a la vez.
+ * Env: DYNAMIC_LLM_UNHEALTHY_WINDOW_MS (300 000), DYNAMIC_LLM_UNHEALTHY_PAUSE_MS (180 000),
+ * DYNAMIC_LLM_UNHEALTHY_MIN_EVENTS (3), DYNAMIC_LLM_UNHEALTHY_MIN_ITEMS (2). MIN_EVENTS=0 lo apaga.
+ */
+export function llmUnhealthyPolicy(env: Record<string, string | undefined> = process.env): LlmUnhealthyPolicy {
+  const num = (k: string, d: number, min: number, max: number) => { const v = Number(env[k]); return Number.isFinite(v) && v >= min && v <= max ? Math.floor(v) : d; };
+  return {
+    windowMs: num('DYNAMIC_LLM_UNHEALTHY_WINDOW_MS', 300_000, 30_000, 3_600_000),
+    pauseMs: num('DYNAMIC_LLM_UNHEALTHY_PAUSE_MS', 180_000, 15_000, 1_800_000),
+    minEvents: num('DYNAMIC_LLM_UNHEALTHY_MIN_EVENTS', 3, 0, 100),
+    minItems: num('DYNAMIC_LLM_UNHEALTHY_MIN_ITEMS', 2, 0, 100),
+  };
+}
+
+/** r83: ¿el run está en una ráfaga de cortes? Puro. → ms que faltan de pausa (0 = sano). */
+export function llmUnhealthyPauseMs(h: { events: number; items: number; sinceLastMs: number | null }, p: LlmUnhealthyPolicy): number {
+  if (p.minEvents <= 0) return 0;
+  const burst = h.events >= p.minEvents || (p.minItems > 0 && h.items >= p.minItems);
+  if (!burst || h.sinceLastMs === null || !Number.isFinite(h.sinceLastMs)) return 0;
+  return Math.max(0, p.pauseMs - Math.max(0, h.sinceLastMs));
+}
+
+/** r83: desconocidos/cortes del RUN en la ventana (telemetría `llmTransportEvents` de sus partes; reloj de la DB). */
+export async function runLlmTransportHealth(ds: Pick<DataSource, 'query'>, runId: string, windowMs: number): Promise<{ events: number; items: number; sinceLastMs: number | null }> {
+  try {
+    const [r] = await ds.query(
+      `select count(*)::int as llm_transport_events, count(distinct g.id)::int as llm_transport_items,
+              (extract(epoch from (now() - max((ev->>'at')::timestamptz))) * 1000)::float8 as llm_transport_since_last_ms
+         from public.generation_item_runs g
+         cross join lateral jsonb_array_elements(coalesce(g.output_summary->'${LLM_TRANSPORT_EVENTS_KEY}', '[]'::jsonb)) ev
+        where g.job_id = $1 and (ev->>'at') ~ '^[0-9]{4}-' and (ev->>'at')::timestamptz > now() - make_interval(secs => $2::double precision)`,
+      [runId, windowMs / 1000],
+    );
+    const events = Number(r && r.llm_transport_events) || 0;
+    const since = r && r.llm_transport_since_last_ms !== null && r.llm_transport_since_last_ms !== undefined ? Number(r.llm_transport_since_last_ms) : null;
+    return { events, items: Number(r && r.llm_transport_items) || 0, sinceLastMs: events > 0 && since !== null && Number.isFinite(since) ? since : null };
+  } catch {
+    return { events: 0, items: 0, sinceLastMs: null }; // falla abierta: nunca bloquea por una lectura caída
+  }
+}
+
+/** r83: SQL que agrega un evento de transporte (corte / desconocido) a la telemetría del item (últimos 20; `at` = reloj DB). */
+export const LLM_TRANSPORT_EVENT_SQL =
+  `update public.generation_item_runs
+      set output_summary = jsonb_set(coalesce(output_summary, '{}'::jsonb), '{${LLM_TRANSPORT_EVENTS_KEY}}',
+            (select coalesce(jsonb_agg(s.x order by s.i), '[]'::jsonb) from (
+               select t.x, t.i from jsonb_array_elements(coalesce(output_summary->'${LLM_TRANSPORT_EVENTS_KEY}', '[]'::jsonb)
+                                                         || jsonb_build_array(jsonb_build_object('at', now()) || $2::jsonb)) with ordinality as t(x, i)
+                order by t.i desc limit ${LLM_TRANSPORT_EVENTS_MAX}) s))
+    where id = $1 returning id`;
 /** Prefijo del hash del pedido dentro del callTag de la reserva (identifica "la misma llamada" entre intentos y workers). */
 export const LLM_CALL_HASH_LEN = 12;
 export const LLM_WORKER_MAX_TOKENS_CAP = 16000;
@@ -80,6 +164,34 @@ export async function priorStreamCut(ds: Pick<DataSource, 'query'>, itemRunId: s
   }
 }
 
+/**
+ * r83: cortes a mitad del stream de la parte (toda la historia de la fila): cuántos y de qué llamadas (hash corto). La
+ * política por LLAMADA (solo esa va sin streaming) y por PARTE (≥ LLM_ITEM_NONSTREAM_AFTER_CUTS cortes → toda sin
+ * streaming) sale de acá. Falla abierta (0 cortes).
+ */
+export async function priorStreamCutStats(ds: Pick<DataSource, 'query'>, itemRunId: string, since: Date): Promise<{ count: number; hashes: Set<string> }> {
+  try {
+    const rows = await ds.query(
+      `with cuts as (
+         select e.event_kind, e.metadata from public.generation_cost_events e
+          where e.item_run_id = $1 and e.created_at >= $2
+            and ((e.event_kind = 'CHARGE' and e.metadata ? 'streamCut')
+              or (e.event_kind = 'ADJUSTMENT' and e.metadata->>'reason' = 'llm_worker_stream_cut_conservative')))
+       select exists (select 1 from cuts) as stream_cut_seen,
+              (select count(*) from cuts where event_kind = 'CHARGE')::int as stream_cut_count,
+              (select coalesce(jsonb_agg(distinct metadata->'streamCut'->>'callHash'), '[]'::jsonb) from cuts where event_kind = 'CHARGE') as stream_cut_hashes`,
+      [itemRunId, since],
+    );
+    const r = rows && rows[0];
+    const seen = !!r && (r.stream_cut_seen === true || r.stream_cut_seen === 't');
+    const n = Number(r && r.stream_cut_count);
+    const hashes = new Set<string>((Array.isArray(r && r.stream_cut_hashes) ? r.stream_cut_hashes : []).filter((h: unknown) => typeof h === 'string' && h));
+    return { count: Math.max(Number.isFinite(n) ? n : 0, seen ? 1 : 0), hashes };
+  } catch {
+    return { count: 0, hashes: new Set() };
+  }
+}
+
 export interface ServerLlmItem {
   itemRunId: string;
   runId: string;
@@ -95,7 +207,7 @@ export interface ServerLlmDeps {
   dataSource: DataSource;
   finops: WorkerLedger;
   budget: {
-    guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
+    guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number; itemExtraAllowanceUsd?: number }): Promise<null | {
       code: 'run_paused' | 'item_recovery_budget_exhausted' | 'run_budget_not_authorized'; message: string; runId: string; paused: boolean;
     }>;
     /** FinOps atómico: pausa por el tope cuando la RESERVA se rechazó (el guard ya había permitido). */
@@ -106,7 +218,7 @@ export interface ServerLlmDeps {
      * run? Obligatorio (review I3): sin él —o sin `finops.reconcileReservationAsCharged`— nunca se reenvía (falla cerrado:
      * la parte queda en revisión con humanReason budget).
      */
-    ambiguousResendBudget(a: { runId: string; itemRunId: string; nextCost: number; authorization: 'paid' | 'any' }): Promise<{ fits: boolean; reason: string | null; worstItem: number; worstRun: number }>;
+    ambiguousResendBudget(a: { runId: string; itemRunId: string; nextCost: number; authorization: 'paid' | 'any'; allowanceCalls?: number }): Promise<{ fits: boolean; reason: string | null; worstItem: number; worstRun: number; allowance?: number }>;
   };
   /** Guardado de respuestas (Storage). */
   checkpoints: {
@@ -155,7 +267,7 @@ export interface ServerLlmDeps {
 }
 
 /** Error con la forma que espera el ejecutor (04-api.js). */
-type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean; handBack?: 'lease_lost' | 'worker_draining' | typeof PRIOR_CALL_IN_FLIGHT; retryAfterSeconds?: number };
+type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean; handBack?: 'lease_lost' | 'worker_draining' | typeof PRIOR_CALL_IN_FLIGHT | typeof LLM_PROVIDER_UNHEALTHY; retryAfterSeconds?: number };
 
 /** HTTP que NO prueba que Anthropic no procesó el pedido (timeout de gateway): se trata como resultado desconocido. */
 const LLM_HTTP_AMBIGUOUS_STATUSES: readonly number[] = [408, 504];
@@ -176,10 +288,21 @@ function checkpointInlineMaxBytes(): number {
   return Number.isFinite(n) && n > 0 ? n : 1_500_000;
 }
 
-/** Ventana de la parte (igual que el presupuesto de recuperación): generación vigente desde su último reinicio. */
-export async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ since: Date; checkpoints: Record<string, { path: string; at: string }>; sent: Record<string, string>; autoBudgetExtension: boolean }> {
+/**
+ * Ventana de la parte (igual que el presupuesto de recuperación): generación vigente desde su último reinicio.
+ * r83: tres relojes independientes —
+ *  - `since` (presupuesto): created_at o el último reinicio del presupuesto (`recoveryBudgetResetAt`, reintento manual);
+ *  - `checkpointSince` (validez de los puntos de guardado): created_at o el último DESCARTE (`llmCheckpointsResetAt`,
+ *    respuesta inválida). Un reintento manual reinicia el presupuesto, NO las respuestas válidas ya pagadas;
+ *  - `unknownSince` (conteo de eventos ambiguos): el mayor de `since` y `llmUnknownResetAt` (reapertura automática de
+ *    una parte en revisión, con sus reservas ya conciliadas como posible duplicado: siguen contando como GASTO).
+ */
+export async function itemWindowStart(ds: DataSource, itemRunId: string): Promise<{ since: Date; checkpointSince: Date; unknownSince: Date; checkpoints: Record<string, { path: string; at: string }>; sent: Record<string, string>; autoBudgetExtension: boolean }> {
   const [r] = await ds.query(
     `select greatest(created_at, coalesce(nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz, created_at)) as since,
+            greatest(created_at, coalesce(nullif(output_summary->>'llmCheckpointsResetAt', '')::timestamptz, created_at)) as cp_since,
+            greatest(created_at, coalesce(nullif(output_summary->>'recoveryBudgetResetAt', '')::timestamptz, created_at),
+                     coalesce(nullif(output_summary->>'llmUnknownResetAt', '')::timestamptz, created_at)) as unknown_since,
             coalesce(output_summary->'llmCheckpoints', '{}'::jsonb) as cps,
             coalesce(output_summary->'llmSent', '{}'::jsonb) as sent,
             -- r65 (R4): la parte está en su ronda automática extra por tope agotado (cambio de estrategia).
@@ -187,7 +310,10 @@ export async function itemWindowStart(ds: DataSource, itemRunId: string): Promis
        from public.generation_item_runs where id = $1`,
     [itemRunId],
   );
-  return { since: r ? new Date(r.since) : new Date(0), checkpoints: (r && r.cps) || {}, sent: (r && r.sent && typeof r.sent === 'object') ? r.sent : {},
+  const since = r ? new Date(r.since) : new Date(0);
+  const d = (v: unknown) => { const x = v ? new Date(v as any) : null; return x && Number.isFinite(x.getTime()) ? x : null; };
+  return { since, checkpointSince: (r && d(r.cp_since)) || since, unknownSince: (r && d(r.unknown_since)) || since,
+    checkpoints: (r && r.cps) || {}, sent: (r && r.sent && typeof r.sent === 'object') ? r.sent : {},
     autoBudgetExtension: !!r && (r.auto_ext === true || r.auto_ext === 't') };
 }
 
@@ -304,19 +430,20 @@ export async function pendingUnknownReservations(ds: DataSource, itemRunId: stri
  *    evento NUEVO → la parte va a revisión.
  * Sin `firstUnknownAt` (todavía no hubo desconocidos en este proceso) las del intento actual cuentan como un evento.
  */
-export function countUnknownEvents(all: ReadonlyArray<Pick<UnknownReservation, 'attempt' | 'createdAt'>>, currentAttempt: number, firstUnknownAt: Date | null): number {
+export function countUnknownEvents(all: ReadonlyArray<Pick<UnknownReservation, 'attempt' | 'createdAt'>>, currentAttempt: number, detections: Date | null | ReadonlyArray<Date>): number {
   const prior = new Set(all.filter((u) => u.attempt !== currentAttempt).map((u) => u.attempt));
   const cur = all.filter((u) => u.attempt === currentAttempt);
-  let curEvents = 0;
-  if (cur.length) {
-    if (!firstUnknownAt) curEvents = 1;
-    else {
-      const overlap = cur.some((u) => !u.createdAt || u.createdAt.getTime() <= firstUnknownAt.getTime());
-      const later = cur.some((u) => !!u.createdAt && u.createdAt.getTime() > firstUnknownAt.getTime());
-      curEvents = (overlap ? 1 : 0) + (later ? 1 : 0);
-    }
+  // r83: varias detecciones en el mismo intento (antes solo la primera): cada desconocida pertenece al evento de la
+  // primera detección posterior a su alta; las creadas después de la última detección son un evento más.
+  const det = (Array.isArray(detections) ? [...detections] : detections ? [detections as Date] : []).map((d) => d.getTime()).sort((a, b) => a - b);
+  const clusters = new Set<number>();
+  for (const u of cur) {
+    if (!det.length || !u.createdAt) { clusters.add(0); continue; }
+    const t = u.createdAt.getTime();
+    const idx = det.findIndex((d) => t <= d);
+    clusters.add(idx < 0 ? det.length : idx);
   }
-  return prior.size + curEvents;
+  return prior.size + clusters.size;
 }
 
 /**
@@ -346,13 +473,15 @@ export async function dbNow(ds: DataSource, fallbackReservationKey?: string): Pr
  */
 async function unknownLimitReached(
   ds: DataSource, itemRunId: string, since: Date, hash: string, exclude: readonly string[],
-  ctx: { attempt: number; firstUnknownAt: Date | null; maxParallelCalls?: number } = { attempt: 0, firstUnknownAt: null },
+  ctx: { attempt: number; firstUnknownAt: Date | null | ReadonlyArray<Date>; maxParallelCalls?: number } = { attempt: 0, firstUnknownAt: null },
 ): Promise<string | null> {
   const same = await countUnknownCalls(ds, itemRunId, since, hash, exclude);
-  if (same >= LLM_UNKNOWN_MAX) return `${same} intentos de la misma llamada sin respuesta`;
+  const perCall = llmUnknownPerCallMax();
+  if (same >= perCall) return `${same} intentos de la misma llamada sin respuesta`;
   const all = await unknownReservations(ds, itemRunId, since, { exclude, includePossibleDuplicate: true });
   const events = countUnknownEvents(all, ctx.attempt, ctx.firstUnknownAt);
-  if (events > LLM_UNKNOWN_EVENT_MAX) return `${events} eventos ambiguos (llamadas sin respuesta en momentos distintos) en esta parte`;
+  const eventMax = llmAmbiguousEventMax();
+  if (events > eventMax) return `${events} eventos ambiguos (llamadas sin respuesta en momentos distintos) en esta parte (tope ${eventMax})`;
   const total = await countUnknownCalls(ds, itemRunId, since, undefined, exclude);
   const cap = llmUnknownItemMax(ctx.maxParallelCalls);
   if (total >= cap) return `${total} llamadas sin respuesta en esta parte (tope ${cap})`;
@@ -436,12 +565,20 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
   // liquidación falló (quedan pendientes en el ledger para conciliar, pero la respuesta sí llegó).
   const notUnknown = new Set<string>();
   let neverSentChecked = false;
-  // r62 (I2-bis): instante en que ESTE proceso detectó su primer resultado desconocido (solapamiento de un evento).
-  let firstUnknownAt: Date | null = null;
-  const unknownCtx = () => ({ attempt: item.attempt, firstUnknownAt, maxParallelCalls: deps.maxParallelCalls });
-  // r64: llamadas (hash) de este proceso que ya se cortaron a mitad del stream; con una, la parte sigue sin streaming.
+  // r62 (I2-bis): instantes (reloj de la DB) en que ESTE proceso detectó resultados desconocidos (r83: todos, no solo el
+  // primero: agrupan las desconocidas en eventos).
+  const unknownDetections: Date[] = [];
+  const unknownCtx = () => ({ attempt: item.attempt, firstUnknownAt: unknownDetections, maxParallelCalls: deps.maxParallelCalls });
+  // r64: llamadas (hash) de este proceso que ya se cortaron a mitad del stream.
   const cutCalls = new Map<string, { cuts: number; causes: string[] }>();
-  let streamCutSeen: boolean | null = null; // null = todavía no se miró el ledger de la parte
+  // r83: transporte con el que se PERDIÓ (desconocido) el último envío de cada llamada: si fue sin streaming, el reenvío
+  // vuelve al stream (alternancia por llamada).
+  const lostTransport = new Map<string, LlmTransport>();
+  let streamCutStats: { count: number; hashes: Set<string> } | null = null; // null = todavía no se miró el ledger
+  const processCuts = () => [...cutCalls.values()].reduce((t, c) => t + c.cuts, 0);
+  const recordTransportEvent = async (ev: Record<string, unknown>) => {
+    try { await deps.dataSource.query(LLM_TRANSPORT_EVENT_SQL, [item.itemRunId, JSON.stringify(ev)]); } catch { /* telemetría: nunca bloquea */ }
+  };
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
   const api = async function api(system: unknown, user: unknown, maxTok?: number, schema?: unknown, model?: string, metaOut?: Record<string, any>, extraHeaders?: Record<string, string>, cacheOpts?: { cachePrefix?: string }): Promise<string> {
     // r65 (R4): la ventana se lee ANTES de armar el pedido. Una parte en su ronda automática extra (tope de la parte
@@ -456,9 +593,10 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     const role = roleOf(extraHeaders);
 
     // ── Punto de guardado: la misma llamada ya respondida en esta ventana de la parte → sin costo ni generación. ──
-    const fromCheckpoint = async (w: { since: Date; checkpoints: Record<string, { path: string; at: string }> }): Promise<string | null> => {
+    // r83: la validez del guardado depende SOLO de su descarte (`checkpointSince`), nunca del reinicio del presupuesto.
+    const fromCheckpoint = async (w: { since: Date; checkpointSince?: Date; checkpoints: Record<string, { path: string; at: string }> }): Promise<string | null> => {
       const cp = w.checkpoints[hash];
-      if (!cp || !(new Date(cp.at) >= w.since)) return null;
+      if (!cp || !(new Date(cp.at) >= (w.checkpointSince ?? w.since))) return null;
       // r83: guardado EN LA BASE (`inline`) cuando Storage estaba caído al guardarlo → se lee de ahí.
       const inline = (cp as { inline?: unknown }).inline;
       const raw = typeof inline === 'string' && inline ? inline : await deps.checkpoints.get(cp.path).catch(() => null);
@@ -471,11 +609,20 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     };
     const cached = await fromCheckpoint(win);
     if (cached !== null) return cached;
-    // r64: transporte de ESTA llamada. Si ya se cortó por streaming (aquí o en un intento anterior), va sin streaming.
-    // Toda la historia de ESTA fila (no solo la ventana vigente): un reintento manual reinicia el presupuesto, pero los
-    // cortes anteriores siguen siendo evidencia de que su stream falla (R1: la parte se reintenta sobre sus 5 cortes).
-    if (streamCutSeen === null) streamCutSeen = await priorStreamCut(deps.dataSource, item.itemRunId, new Date(0));
-    let transport: LlmTransport = extended || streamCutSeen || cutCalls.size > 0 ? 'nonstream' : 'stream';
+    // r64 / r83: transporte de ESTA llamada, con toda la historia de la fila (un reintento manual reinicia el presupuesto,
+    // pero los cortes anteriores siguen siendo evidencia). r83: un corte ya no pasa la PARTE entera a sin streaming —
+    // solo la llamada cortada se reenvía sin streaming; la parte entera recién con ≥ LLM_ITEM_NONSTREAM_AFTER_CUTS cortes
+    // (R1 #1567 sigue acotado). Si un envío sin streaming de esta llamada se perdió, su reenvío vuelve al stream.
+    if (streamCutStats === null) streamCutStats = await priorStreamCutStats(deps.dataSource, item.itemRunId, new Date(0));
+    const callHash12 = hash.slice(0, LLM_CALL_HASH_LEN);
+    const chooseTransport = (): LlmTransport => {
+      if (lostTransport.get(hash) === 'nonstream') return 'stream';
+      if (extended) return 'nonstream';
+      if ((streamCutStats?.count ?? 0) + processCuts() >= LLM_ITEM_NONSTREAM_AFTER_CUTS) return 'nonstream';
+      if (cutCalls.has(hash) || streamCutStats?.hashes.has(callHash12)) return 'nonstream';
+      return 'stream';
+    };
+    let transport: LlmTransport = chooseTransport();
 
     // FinOps atómico (review I2): la cota cuenta el body ENTERO que se envía (sistema, mensaje y el esquema de salida).
     const promptChars = JSON.stringify(body).length;
@@ -501,7 +648,7 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         neverSentChecked = true;
         await releaseNeverSentOrphans(deps, item, await itemWindowStart(deps.dataSource, item.itemRunId), [...notUnknown]);
       }
-      const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown], unknownCtx());
+      const unknownReason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.unknownSince, hash, [...notUnknown], unknownCtx());
       if (unknownReason) {
         throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(unknownReason) } as ApiError;
       }
@@ -512,6 +659,22 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       // como cobradas (possible_duplicate, actor system) y cada carril reenvía su llamada una vez. Falla cerrado: sin la
       // evaluación del presupuesto o sin la liquidación, nunca se reenvía (revisión).
       const priorUnknown = await unknownReservations(deps.dataSource, item.itemRunId, win.since, { callHash: hash, exclude: [...notUnknown] });
+      // r83: ráfaga de cortes/desconocidos en el run (red o proveedor inestable) → la llamada NUEVA no sale: la parte vuelve
+      // a la cola sin consumir intento, con una pausa corta. El reenvío de una llamada ya desconocida no se frena acá (su
+      // reserva está pendiente; lo acota el dinero y el tope de eventos).
+      if (priorUnknown.length === 0) {
+        const pol = llmUnhealthyPolicy();
+        if (pol.minEvents > 0) {
+          const h = await runLlmTransportHealth(deps.dataSource, item.runId, pol.windowMs);
+          const waitMs = llmUnhealthyPauseMs(h, pol);
+          if (waitMs > 0) {
+            deps.logger.warn(`[llm-worker] ${item.itemKey}: red/proveedor inestable (${h.events} corte(s)/desconocido(s) en ${h.items} parte(s) del run en ${Math.round(pol.windowMs / 60000)} min) — sin llamada nueva; la parte vuelve a la cola en ${Math.ceil(waitMs / 1000)} s`);
+            throw { fatal: true, handBack: LLM_PROVIDER_UNHEALTHY, code: LLM_PROVIDER_UNHEALTHY, retryAfterSeconds: Math.max(15, Math.ceil(waitMs / 1000)),
+              msg: `${LLM_PROVIDER_UNHEALTHY}: varios cortes de conexión con la IA en pocos minutos (${h.events} en ${h.items} parte(s)); la parte espera ${Math.ceil(waitMs / 1000)} s sin consumir intentos` } as ApiError;
+          }
+        }
+      }
+      let resendAllowanceUsd = 0;
       if (priorUnknown.length > 0) {
         const eventAttempts = new Set(priorUnknown.map((u) => u.attempt));
         const group = (await unknownReservations(deps.dataSource, item.itemRunId, win.since, { exclude: [...notUnknown] })).filter((u) => eventAttempts.has(u.attempt));
@@ -522,7 +685,8 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
           throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW,
             msg: pendingReviewMessage('el reenvío no entra en el presupuesto autorizado (sin evaluación del presupuesto o sin conciliación en este worker: falla cerrado)') } as ApiError;
         }
-        const b = await deps.budget.ambiguousResendBudget({ runId: item.runId, itemRunId: item.itemRunId, nextCost, authorization: 'any' });
+        // r83: límite de DINERO con holgura de ambigüedad (N × la llamada más grande de la parte) y el saldo del run.
+        const b = await deps.budget.ambiguousResendBudget({ runId: item.runId, itemRunId: item.itemRunId, nextCost, authorization: 'any', allowanceCalls: AMBIGUOUS_RESEND_ALLOWANCE_CALLS });
         if (!b.fits) {
           throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW,
             msg: pendingReviewMessage(`el reenvío no entra en el presupuesto autorizado (${b.reason}; peor caso de la parte USD ${usd2(b.worstItem)}, del run USD ${usd2(b.worstRun)})`) } as ApiError;
@@ -531,9 +695,11 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
           provider: 'anthropic', cause: 'unknown_result', itemRunId: item.itemRunId, itemKey: item.itemKey, runId: item.runId,
         });
         if (settled.failed.length) throw new Error(`no se pudo liquidar la reserva desconocida ${settled.failed[0].key}: ${settled.failed[0].error}`);
-        deps.logger.warn(`[llm-worker] ${item.itemKey}: reenvío ambiguo ÚNICO de la llamada ${hash.slice(0, 10)} — evento de ${keys.length} reserva(s) perdida(s) liquidada(s) como posible duplicado (USD ${nextCost.toFixed(4)})`);
+        resendAllowanceUsd = Math.max(0, Number(b.allowance) || 0);
+        deps.logger.warn(`[llm-worker] ${item.itemKey}: reenvío ambiguo de la llamada ${hash.slice(0, 10)} (${transport}) — evento de ${keys.length} reserva(s) perdida(s) liquidada(s) como posible duplicado (USD ${nextCost.toFixed(4)}; peor caso de la parte USD ${usd2(b.worstItem)}, holgura USD ${usd2(resendAllowanceUsd)})`);
       }
-      const deny = await deps.budget.guardServerLlmCall({ runId: item.runId, itemRunId: item.itemRunId, model: useModel, promptChars, maxTokens });
+      const deny = await deps.budget.guardServerLlmCall({ runId: item.runId, itemRunId: item.itemRunId, model: useModel, promptChars, maxTokens,
+        ...(resendAllowanceUsd > 0 ? { itemExtraAllowanceUsd: resendAllowanceUsd } : {}) });
       if (deny) {
         if (deny.code === 'item_recovery_budget_exhausted') {
           throw { fatal: true, itemBudget: true, status: 409, code: deny.code, msg: itemRecoveryBudgetMessage(deny.message) } as ApiError;
@@ -618,7 +784,9 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
           const prev = cutCalls.get(hash) || { cuts: 0, causes: [] };
           prev.cuts++; prev.causes.push(cause);
           cutCalls.set(hash, prev);
-          deps.logger.warn(`[llm-worker] ${item.itemKey}: la respuesta de la llamada ${hash.slice(0, 10)} se cortó a mitad (${transport}; causa ${cause}; ${e.extra.partialChars ?? '?'} caracteres recibidos; message ${e.extra.messageId || '?'}; request ${e.extra.requestId || '?'}): ${e.message}`);
+          deps.logger.warn(`[llm-worker] ${item.itemKey}: la respuesta de la llamada ${hash.slice(0, 10)} se cortó a mitad (${transport}; causa ${cause}; ${e.extra.partialChars ?? '?'} caracteres / ${e.extra.bytes ?? '?'} bytes recibidos en ${e.extra.durationMs ?? '?'} ms; error ${e.extra.errorName || '?'}: ${e.extra.errorCause || '?'}; message ${e.extra.messageId || '?'}; request ${e.extra.requestId || '?'}): ${e.message}`);
+          await recordTransportEvent({ kind: 'cut', transport, cause, callHash: callHash12, callRole: role.callRole, bytes: e.extra.bytes ?? null, durationMs: e.extra.durationMs ?? null,
+            partialChars: e.extra.partialChars ?? null, errorName: e.extra.errorName ?? null, errorCause: e.extra.errorCause ?? null, requestId: e.extra.requestId ?? null, messageId: e.extra.messageId ?? null });
           if (transport === 'stream') {
             // r64: cambio de estrategia, no repetición: la MISMA solicitud por el transporte sin streaming, ya (dentro del
             // mismo presupuesto: el guard de la parte y del run se vuelve a evaluar antes del envío).
@@ -632,13 +800,18 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
         // Desconocido (sin respuesta, o timeout de gateway 408/504): la reserva queda PENDIENTE (cuenta en el
         // presupuesto y en el contador de desconocidos).
         notUnknown.delete(resKey);
-        deps.logger.warn(`[llm-worker] ${item.itemKey}: resultado DESCONOCIDO (${e.message}); reserva ${resKey} pendiente`);
-        if (!firstUnknownAt) firstUnknownAt = await dbNow(deps.dataSource, resKey);
-        const reason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.since, hash, [...notUnknown], unknownCtx());
+        lostTransport.set(hash, transport);
+        const ucause = e.extra.cause || (ambiguousHttp ? `http_${e.extra.status}` : 'unknown');
+        deps.logger.warn(`[llm-worker] ${item.itemKey}: resultado DESCONOCIDO (${transport}; causa ${ucause}; ${e.extra.bytes ?? '?'} bytes en ${e.extra.durationMs ?? '?'} ms; error ${e.extra.errorName || '?'}: ${e.extra.errorCause || '?'}; request ${e.extra.requestId || '?'}): ${e.message}; reserva ${resKey} pendiente`);
+        await recordTransportEvent({ kind: 'unknown', transport, cause: ucause, callHash: callHash12, callRole: role.callRole, status: e.extra.status ?? null, bytes: e.extra.bytes ?? null,
+          durationMs: e.extra.durationMs ?? null, errorName: e.extra.errorName ?? null, errorCause: e.extra.errorCause ?? null, requestId: e.extra.requestId ?? null, reservationKey: resKey });
+        unknownDetections.push(await dbNow(deps.dataSource, resKey));
+        const reason = await unknownLimitReached(deps.dataSource, item.itemRunId, win.unknownSince, hash, [...notUnknown], unknownCtx());
         if (reason) {
           throw { fatal: true, pendingReview: true, code: LLM_PENDING_REVIEW, msg: pendingReviewMessage(reason) } as ApiError;
         }
-        continue; // un único reintento automático
+        transport = chooseTransport(); // r83: si se perdió sin streaming, el reenvío vuelve al stream
+        continue; // reenvío automático (acotado por dinero y por el tope de eventos)
       }
       // Review I6: la respuesta llegó y se pagó → se GUARDA ANTES de liquidar. Si el ledger falla al liquidar, se
       // reintenta; si sigue fallando, la respuesta igual se usa (nunca se vuelve a pedir y pagar) y la reserva queda
