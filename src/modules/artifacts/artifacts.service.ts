@@ -7,6 +7,12 @@ import { Artifact } from './entities/artifact.entity';
 import { CreateArtifactDto } from './dto/create-artifact.dto';
 import { isAdminOnlyPackageArtifact } from '../dynamic-packaging/qa-package';
 import { ARTIFACT_TYPE_SERVER_ONLY, LLM_MODES, LLM_MODE_INVALID, isLlmMode, isServerOnlyArtifactType } from './artifact-type-policy';
+import {
+  StorageOp, isStorageUnavailableError, sanitizeStorageErrorText, storageRequestWithRetry, storageRetryPolicyFromEnv,
+} from './storage-resilience';
+import { recordStorageFailure, storageBreakerDbOf } from '../reliability/storage-breaker';
+// r83: el error tipado de Storage caído (lo usan los workers: TTS, IA, video, empaque).
+export { STORAGE_UNAVAILABLE_CODE, StorageUnavailableError, isStorageUnavailableError, isStorageUnavailableMessage } from './storage-resilience';
 import { PRACTICE_FILE_INVALID_CODE, PRACTICE_FILE_TYPE, PRACTICE_FILE_UNVERIFIABLE_CODE, practiceFileBytesErrors, practiceFileDeclarationErrors } from './practice-file-attach';
 
 export interface UploadJsonArtifactInput {
@@ -293,7 +299,8 @@ export class ArtifactsService {
       .join('/');
     const uploadUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${bucket}/${encodedPath}`;
 
-    const response = await fetch(uploadUrl, {
+    // r83: timeout por intento + reintentos ante 5xx/429/red; agotados → StorageUnavailableError (sin HTML).
+    const { response, ambiguousBefore } = await this.storageRequest('upload', Buffer.byteLength(body), (signal) => fetch(uploadUrl, {
       method: 'POST',
       headers: {
         ...supabaseServiceHeaders(serviceKey),
@@ -301,11 +308,17 @@ export class ArtifactsService {
         'x-upsert': input.upsert === false ? 'false' : 'true',
       },
       body,
-    });
+      signal,
+    }));
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+      // r83: un 5xx ambiguo pudo haber escrito el objeto; con upsert:false el reintento ve «already exists». Se adopta
+      // SOLO si los bytes guardados son exactamente los que se querían subir (sha256).
+      const adopted = ambiguousBefore && input.upsert === false && isStorageDuplicateResponse(response.status, errorText)
+        && (await this.existingObjectMatches(bucket, input.storagePath, Buffer.from(body, 'utf8')));
+      if (!adopted) throw new Error(`Supabase Storage upload failed: ${response.status} ${sanitizeStorageErrorText(errorText)}`);
+      this.logger.warn(`uploadJsonArtifact: ${input.storagePath} quedó escrito por un intento ambiguo (5xx/timeout) con los mismos bytes — se adopta`);
     }
 
     return this.create(
@@ -378,7 +391,8 @@ export class ArtifactsService {
       .join('/');
     const uploadUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/${bucket}/${encodedPath}`;
 
-    const response = await fetch(uploadUrl, {
+    // r83: timeout por intento + reintentos ante 5xx/429/red; agotados → StorageUnavailableError (sin HTML).
+    const { response, ambiguousBefore } = await this.storageRequest('upload', input.buffer.length, (signal) => fetch(uploadUrl, {
       method: 'POST',
       headers: {
         ...supabaseServiceHeaders(serviceKey),
@@ -386,12 +400,20 @@ export class ArtifactsService {
         'x-upsert': input.upsert === false ? 'false' : 'true',
       },
       body: input.buffer as unknown as BodyInit,
-    });
+      signal,
+    }));
 
     const builtSha = sha256Hex(input.buffer);
     if (response.ok) return { sizeBytes: input.buffer.length, adopted: false, sha256: builtSha };
     const errorText = await response.text();
-    const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${errorText}`);
+    const uploadError = new Error(`Supabase Storage upload failed: ${response.status} ${sanitizeStorageErrorText(errorText)}`);
+    // r83: «already exists» DESPUÉS de un intento ambiguo (5xx/timeout) de esta misma llamada: el objeto probablemente lo
+    // escribió ese intento. Se adopta solo con los MISMOS bytes (sha256); si no, sigue el camino de siempre.
+    if (ambiguousBefore && input.upsert === false && isStorageDuplicateResponse(response.status, errorText)
+      && (await this.existingObjectMatches(bucket, input.storagePath, input.buffer))) {
+      this.logger.warn(`putStorageObject: ${input.storagePath} quedó escrito por un intento ambiguo (5xx/timeout) con los mismos bytes — se adopta`);
+      return { sizeBytes: input.buffer.length, adopted: true, sha256: builtSha };
+    }
     if (!(input.adoptExistingOnConflict && input.upsert === false && isStorageDuplicateResponse(response.status, errorText))) {
       throw uploadError;
     }
@@ -427,18 +449,64 @@ export class ArtifactsService {
       }
       if (readError) this.logger.warn(`uploadBufferArtifact: no se pudo leer ${input.storagePath} para verificarlo (${readError}) — sin row que lo referencie, se reemplaza`);
       this.logger.warn(`uploadBufferArtifact: ${input.storagePath} ya existía con OTROS bytes — se reemplaza con los construidos (PACKAGE_OBJECT_REPLACED)`);
-      const replace = await fetch(uploadUrl, {
+      const { response: replace } = await this.storageRequest('upload', input.buffer.length, (signal) => fetch(uploadUrl, {
         method: 'POST',
         headers: { ...supabaseServiceHeaders(serviceKey), 'Content-Type': input.mimeType, 'x-upsert': 'true' },
         body: input.buffer as unknown as BodyInit,
-      });
-      if (!replace.ok) throw new Error(`Supabase Storage upload failed: ${replace.status} ${await replace.text()}`);
+        signal,
+      }));
+      if (!replace.ok) throw new Error(`Supabase Storage upload failed: ${replace.status} ${sanitizeStorageErrorText(await replace.text())}`);
       return { sizeBytes: input.buffer.length, adopted: false, sha256: builtSha };
     }
     this.logger.warn(
       `uploadBufferArtifact: ${input.storagePath} ya existía en Storage (${existingSize} bytes) sin row en artifacts — se adopta el objeto existente`,
     );
     return { sizeBytes: existingSize, adopted: true, sha256: null };
+  }
+
+  /**
+   * r83: una petición a Storage con timeout por intento y reintentos (5xx/429/408/red/timeout) dentro del presupuesto
+   * (STORAGE_RETRY_* del entorno). Agotado → registra el fallo en el breaker de Storage (public.infra_health; no-op
+   * sin tabla) y relanza el StorageUnavailableError.
+   */
+  private async storageRequest(
+    op: StorageOp,
+    bytes: number,
+    doRequest: (signal: AbortSignal) => Promise<Response>,
+    override: { attemptTimeoutMs?: number } = {},
+  ) {
+    const policy = storageRetryPolicyFromEnv((k) => this.config.get<string>(k) ?? process.env[k]);
+    if (override.attemptTimeoutMs) policy.attemptTimeoutMs = override.attemptTimeoutMs;
+    try {
+      return await storageRequestWithRetry(doRequest, {
+        op, bytes, policy,
+        onRetry: ({ attempt, status, error, delayMs }) =>
+          this.logger.warn(`Storage ${op}: intento ${attempt} falló (${status ?? error ?? 'sin respuesta'}); reintento en ${Math.round(delayMs / 100) / 10} s`),
+      });
+    } catch (err) {
+      if (isStorageUnavailableError(err)) {
+        this.logger.error(err.message);
+        await recordStorageFailure(this.breakerDb(), err.message, { logger: this.logger });
+      }
+      throw err;
+    }
+  }
+
+  /** r83: DataSource del repo para el breaker (null en tests con repos falsos → breaker no-op). */
+  private breakerDb() {
+    const m = (this.artifactRepo as unknown as { manager?: { connection?: unknown; dataSource?: unknown } } | undefined)?.manager;
+    return storageBreakerDbOf((m?.dataSource ?? m?.connection) as Parameters<typeof storageBreakerDbOf>[0]);
+  }
+
+  /** r83: ¿el objeto existente tiene EXACTAMENTE estos bytes? (sha256). Cualquier error de lectura → false. */
+  private async existingObjectMatches(bucket: string, storagePath: string, expected: Buffer): Promise<boolean> {
+    try {
+      const existing = await this.downloadStorageObject(bucket, storagePath);
+      return existing.length === expected.length && sha256Hex(existing) === sha256Hex(expected);
+    } catch (err) {
+      this.logger.warn(`existingObjectMatches: no se pudo leer ${bucket}/${storagePath} para verificarlo (${err instanceof Error ? err.message.slice(0, 160) : String(err)})`);
+      return false;
+    }
   }
 
   /**
@@ -466,7 +534,8 @@ export class ArtifactsService {
     if (!/^[a-z0-9][a-z0-9._-]{0,62}$/.test(bucket)) throw new Error(`STORAGE_PATH_INVALID: bucket ${JSON.stringify(bucket)}`);
     const encodedPath = assertSafeStoragePath(storagePath).map((s) => encodeURIComponent(s)).join('/');
     const url = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
-    const res = await fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.timeout(timeoutMs) });
+    // r83: reintentos ante 5xx/429/red (timeout por intento = timeoutMs); agotados → StorageUnavailableError.
+    const { response: res } = await this.storageRequest('download', 0, (signal) => fetch(url, { headers: supabaseServiceHeaders(serviceKey), signal }), { attemptTimeoutMs: timeoutMs });
     if (!res.ok) throw new Error(`Supabase Storage download failed: ${res.status} ${bucket}/${storagePath}`);
     return Buffer.from(await res.arrayBuffer());
   }
@@ -484,7 +553,7 @@ export class ArtifactsService {
   private async headStorageObjectSize(supabaseUrl: string, serviceKey: string, bucket: string, encodedPath: string): Promise<number | null> {
     const headUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/authenticated/${bucket}/${encodedPath}`;
     try {
-      const res = await fetch(headUrl, { method: 'HEAD', headers: supabaseServiceHeaders(serviceKey) });
+      const res = await fetch(headUrl, { method: 'HEAD', headers: supabaseServiceHeaders(serviceKey), signal: AbortSignal.timeout(15_000) });
       if (!res.ok) return null;
       const len = Number(res.headers.get('content-length'));
       return Number.isFinite(len) ? len : null;

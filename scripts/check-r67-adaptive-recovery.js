@@ -830,7 +830,9 @@ async function dbChecks() {
       const R = await freshRun('r67 ambigua', { maxAttempts: 1 });
       paceFor({ k: 2, base: 150, instructions: 150, split: 150 });
       fakes.plan.ttsFail = [undefined, undefined, 'hang'];
-      const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400' };
+      // r83: OPENAI_TTS_SEGMENT_RETRIES=0 = política r62 (sin reintento por segmento): el timeout queda incierto y va a
+      // reconciliación. Con el reintento activo (default) lo cubre scripts/check-r83-tts.js.
+      const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400', OPENAI_TTS_SEGMENT_RETRIES: '0' };
       let row = await runAudio(R, { env: FAST });
       fakes.plan.ttsFail = [];
       assert(row.status === 'failed' && /^provider_reconciliation_required: openai/.test(row.error), row.error);

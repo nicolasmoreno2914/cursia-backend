@@ -790,10 +790,12 @@ export class FinopsBudgetService {
    * Si dispara el disyuntor (o el tope del run en `pauseOnCap`), PAUSA el run (pausa segura del servidor, reanudable
    * por el usuario). `authorizedBudget`: tope a aplicar (null = no aplicar el punto 1 acá).
    */
-  async guardRunSpend(a: { runId: string; itemRunId: string | null; nextCost: number; authorizedBudget: number | null; pauseOnCap?: boolean; snapshot?: boolean }): Promise<{
+  async guardRunSpend(a: { runId: string; itemRunId: string | null; nextCost: number; authorizedBudget: number | null; pauseOnCap?: boolean; snapshot?: boolean; itemExtraAllowance?: number }): Promise<{
     decision: RunSpendDecision; itemKey: string | null; paused: boolean; overspend?: number; runExpected?: number | null;
     /** r62: lo gastado por la parte (ventana) y por el run que usó la decisión (null = llamada sin parte). */
     itemSpent?: number | null; runSpent?: number;
+    /** r83: cota de la llamada más grande de la parte en su ventana (su mayor reserva). */
+    itemLargest?: number;
   }> {
     const est = await this.runItemEstimates(a.runId);
     let itemKey: string | null = null;
@@ -860,6 +862,7 @@ export class FinopsBudgetService {
       progressExpected,
       breakerAcknowledgedUsd: ackRow ? Number(ackRow.ack) : 0,
       itemLargestCall: itemLargest,
+      itemExtraAllowance: a.itemExtraAllowance,
     });
     let paused = false;
     if (!decision.allow && process.env.FINOPS_SPEND_GUARD_DEBUG === '1') {
@@ -868,7 +871,7 @@ export class FinopsBudgetService {
     }
     if (a.snapshot) {
       return { decision, itemKey, paused, overspend: Math.max(0, Number(runSpentRow.t) - (decision.breakerThreshold ?? Infinity)), runExpected: est.total,
-        itemSpent, runSpent: Number(runSpentRow.t) };
+        itemSpent, runSpent: Number(runSpentRow.t), itemLargest };
     }
     if (!decision.allow && (decision.reason === 'circuit_breaker' || (decision.reason === 'run_budget_cap' && a.pauseOnCap))) {
       // Re-review N2: el tope guarda cuánto hacía falta (gastado + esta llamada) → reanudar exige ampliar a eso.
@@ -916,15 +919,16 @@ export class FinopsBudgetService {
    * Loop 4: misma decisión para una llamada LLM hecha por el WORKER del backend (sin proxy): pausa, tope del run,
    * presupuesto de recuperación de la parte y disyuntor. → null = permitida.
    */
-  async guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
+  async guardServerLlmCall(a: { runId: string; itemRunId: string; model: string; promptChars: number; maxTokens: number; itemExtraAllowanceUsd?: number }): Promise<null | {
     code: 'run_paused' | 'item_recovery_budget_exhausted' | 'run_budget_not_authorized'; message: string; runId: string; paused: boolean;
   }> {
     const [row] = await this.dataSource.query(`select worker_status from public.production_jobs where id = $1`, [a.runId]);
     if (!row) return { code: 'run_paused', message: 'El run no existe.', runId: a.runId, paused: false };
-    return this.guardLlmCallForRun({ runId: a.runId, workerStatus: row.worker_status, itemRunId: a.itemRunId, model: a.model, promptChars: a.promptChars, maxTokens: a.maxTokens });
+    return this.guardLlmCallForRun({ runId: a.runId, workerStatus: row.worker_status, itemRunId: a.itemRunId, model: a.model, promptChars: a.promptChars, maxTokens: a.maxTokens,
+      itemExtraAllowance: a.itemExtraAllowanceUsd });
   }
 
-  private async guardLlmCallForRun(a: { runId: string; workerStatus: string; itemRunId: string; model: string; promptChars: number; maxTokens: number }): Promise<null | {
+  private async guardLlmCallForRun(a: { runId: string; workerStatus: string; itemRunId: string; model: string; promptChars: number; maxTokens: number; itemExtraAllowance?: number }): Promise<null | {
     code: 'run_paused' | 'item_recovery_budget_exhausted' | 'run_budget_not_authorized'; message: string; runId: string; paused: boolean;
   }> {
     const row = { job_id: a.runId, worker_status: a.workerStatus };
@@ -953,7 +957,7 @@ export class FinopsBudgetService {
       return { code: 'run_budget_not_authorized', message: detail, runId: row.job_id, paused };
     }
     const cap = authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
-    const g = await this.guardRunSpend({ runId: row.job_id, itemRunId: a.itemRunId, nextCost, authorizedBudget: cap, pauseOnCap: true });
+    const g = await this.guardRunSpend({ runId: row.job_id, itemRunId: a.itemRunId, nextCost, authorizedBudget: cap, pauseOnCap: true, itemExtraAllowance: a.itemExtraAllowance });
     const d = g.decision;
     if (d.allow) return null;
     const detail = 'detail' in d ? d.detail : '';
@@ -973,7 +977,7 @@ export class FinopsBudgetService {
    * `authorization: 'paid'` = proveedores pagados (solo ADMIN_APPROVED los cubre, como guardPaidSubmission);
    * `'any'` = IA (la última autorización vigente, como el guard del worker de IA; BLOCKED = 0).
    */
-  async ambiguousResendBudget(a: { runId: string; itemRunId: string; nextCost: number; authorization: 'paid' | 'any' }): Promise<AmbiguousResendBudget> {
+  async ambiguousResendBudget(a: { runId: string; itemRunId: string; nextCost: number; authorization: 'paid' | 'any'; allowanceCalls?: number }): Promise<AmbiguousResendBudget> {
     let authorized: number | null;
     if (a.authorization === 'paid') {
       const b = await this.runPaidAuthorizedBudget(a.runId);
@@ -986,9 +990,13 @@ export class FinopsBudgetService {
       authorized = !authRow ? null : authRow.decision === 'BLOCKED' ? 0 : Number(authRow.b);
     }
     const g = await this.guardRunSpend({ runId: a.runId, itemRunId: a.itemRunId, nextCost: a.nextCost, authorizedBudget: null, snapshot: true });
+    // r83: holgura de ambigüedad (solo quien la pide: el worker de IA) = N × la llamada más grande de la parte (su mayor
+    // reserva; sin reservas, la del reenvío). El saldo autorizado del run sigue siendo el techo duro.
+    const calls = Math.max(0, Math.min(5, Math.floor(Number(a.allowanceCalls ?? 0)) || 0));
+    const allowance = calls * Math.max(Number(g.itemLargest ?? 0) || 0, 0) || calls * Math.max(0, Number(a.nextCost) || 0);
     return ambiguousResendBudget({
       itemSpent: Number(g.itemSpent ?? 0), nextCost: a.nextCost, itemHardLimit: g.decision.itemHardLimit,
-      runSpent: Number(g.runSpent ?? 0), authorizedBudget: authorized,
+      runSpent: Number(g.runSpent ?? 0), authorizedBudget: authorized, allowance,
     });
   }
 

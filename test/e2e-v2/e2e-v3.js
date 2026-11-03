@@ -4015,7 +4015,10 @@ function reservationBookkeeping(ev) {
         llm.st.tag = 'E24b';
         const c2 = await createCourse(C2, llm);
         fake.rule((t) => t.includes('Genera el CAPÍTULO 1 COMPLETO: "Lubricación de rodamientos"'), 'slow', 1, 12000);
-        fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"'), 'drop', 2);
+        // r83: el reenvío de un resultado desconocido ya no es único: cada reenvío pasa el límite de DINERO (presupuesto de
+        // la parte + holgura de ambigüedad) hasta el tope por llamada (LLM_UNKNOWN_PER_CALL_MAX, 3). La parte pierde TODAS sus
+        // respuestas hasta ese tope y queda en revisión. La regla se apaga antes del reintento R1.
+        const vibDrop = fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"'), 'drop', 1000);
         fake.rule((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Cavitación en la succión"'), 'cut', 200);
         // Robustez: la PRIMERA subida de un capítulo del Libro hecha por el worker falla (Storage 500) una vez.
         const failedBefore = FAKES.storage.failedUploads.length;
@@ -4065,11 +4068,14 @@ function reservationBookkeeping(ev) {
         const f2 = await finished(c2.runId);
         const vib = f2.find((i) => i.type === 'experience' && i.item_key.endsWith(c2.mods[0].chapters[1].id));
         ok(vib && vib.status === 'failed' && /^llm_pending_review/.test(vib.error || '') && vib.output_summary && vib.output_summary.llmPendingReview && vib.output_summary.llmPendingReview.pendingReservations.length === 1,
-          'E24b: dos resultados desconocidos → SOLO esa parte queda en revisión (llm_pending_review) con la 2.ª reserva para conciliar (r62: la 1.ª ya liquidada possible_duplicate antes del reenvío único)', vib && { st: vib.status, e: (vib.error || '').slice(0, 160), pr: vib.output_summary && vib.output_summary.llmPendingReview });
-        eq(reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"')).length, 2, 'E24b: tras el segundo desconocido la parte NO se volvió a generar');
+          'E24b: resultados desconocidos hasta agotar el dinero del reenvío → SOLO esa parte queda en revisión (llm_pending_review) con la ÚLTIMA reserva para conciliar (las anteriores ya liquidadas possible_duplicate antes de cada reenvío)', vib && { st: vib.status, e: (vib.error || '').slice(0, 160), pr: vib.output_summary && vib.output_summary.llmPendingReview });
+        ok(vib && /resultado ambiguo repetido/.test(vib.error || '') && !/no entra en el presupuesto autorizado/.test(vib.error || ''), 'E24b (r83): la revisión llega por el tope de desconocidos por llamada, con cada reenvío dentro del dinero de la parte + holgura', vib && (vib.error || '').slice(0, 200));
+        const vibCalls = reqs((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Vibraciones en bombas"')).length;
+        ok(vibCalls >= 3 && vibDrop.times === 1000 - vibCalls, `E24b (r83): la holgura de dinero permitió más de un reenvío (${vibCalls} envíos, todos perdidos) y al llegar al tope NO se volvió a generar`, { vibCalls, left: vibDrop.times });
+        vibDrop.times = 0;
         if (vib) {
           const vibId = (await q(`select id from public.generation_item_runs where job_id = $1 and item_key = $2`, [c2.runId, vib.item_key]))[0].id;
-          eq(await pdAdj(vibId), 1, 'E24b: el 1.er desconocido quedó liquidado como possible_duplicate (un solo reenvío ambiguo por parte)');
+          eq(await pdAdj(vibId), vibCalls - 1, 'E24b: cada desconocido reenviado quedó liquidado como possible_duplicate (solo el último sigue abierto)');
           // Conciliación humana (SUPER_ADMIN) de la reserva que sí queda abierta: listada y conciliable, una sola vez.
           const wres2 = await api('GET', `/finops/llm-worker-reservations?runId=${c2.runId}`);
           const vibRes = ((wres2.data && wres2.data.reservations) || []).find((r) => r.itemKey === vib.item_key);
@@ -4109,7 +4115,7 @@ function reservationBookkeeping(ev) {
           eq(dupA[0].n, 1, 'E24b: un solo artifact del capítulo (la subida fallida no dejó basura)');
         }
         const needsHuman = f2.filter((i) => i.status === 'failed');
-        eq(needsHuman.map((i) => (i.error || '').split(':')[0]).sort(), ['llm_pending_review'], 'E24b: solo 1 parte pide a una persona (el doble resultado desconocido inyectado, inseguro de reenviar); los cortes del stream se recuperan solos (r64)');
+        eq(needsHuman.map((i) => (i.error || '').split(':')[0]).sort(), ['llm_pending_review'], 'E24b: solo 1 parte pide a una persona (los resultados desconocidos inyectados, reenvío sin dinero); los cortes del stream se recuperan solos (r64)');
         results.courses.E24b = { courseId: c2.courseId, runId: c2.runId, items: rows2.length, failed: needsHuman.map((i) => [i.item_key, (i.error || '').slice(0, 120)]), cavitationCalls: cavCalls, cavitationUsd: cavSpent };
 
         // ── r64 · recuperación de R1 (#1567): el run terminó `failed` con UNA sola parte pendiente de una persona y el resto

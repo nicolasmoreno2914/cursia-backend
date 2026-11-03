@@ -39,8 +39,10 @@ const STAGING_ONLY_UNTIL_OWNER_APPROVAL = {
   'migrate-r79-1-application-kinds.js': { sql: 'supabase-migration-r79-1-application-kinds.sql' },
   // r81: «Crear microcurrículo» (microcurricula / microcurriculum_generations), staging-only hasta aprobación del owner.
   'migrate-r81-microcurricula.js': { sql: 'supabase-migration-r81-microcurricula.sql' },
+  // r83: breaker de Supabase Storage (infra_health), staging-only hasta aprobación del owner.
+  'migrate-r83-infra-health.js': { sql: 'supabase-migration-r83-infra-health.sql' },
 };
-const STAGING_ONLY_REASON = /^r(75|79\.1|81): staging-only hasta aprobación del owner/;
+const STAGING_ONLY_REASON = /^r(75|79\.1|81|83): staging-only hasta aprobación del owner/;
 // Pasos cuyo orden en producción difiere del de staging A PROPÓSITO (sin dependencias con los vecinos).
 const ORDER_EXCEPTIONS = {
   'supabase-migration-ev6-h5p2.sql': 'courses.review_cards_enabled: columna aditiva independiente (nullable, default false); producción la aplica después de FinOps desde EV6',

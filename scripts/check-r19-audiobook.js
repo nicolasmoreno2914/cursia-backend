@@ -42,6 +42,7 @@ require('reflect-metadata');
 const { Logger } = require('@nestjs/common');
 const AS = loadDist('workers/provider-real/audio-scripts.js');
 const RP = loadDist('workers/provider-real/real-providers.js');
+const TR = loadDist('workers/provider-real/tts-resilience.js');
 const AUD = loadDist('package/audio/index.js');
 const FC = loadDist('modules/reliability/failure-classifier.js');
 const F = loadDist('modules/finops/index.js');
@@ -713,7 +714,8 @@ async function fixRound1Checks() {
       const W2 = memoryWorld();
       const it2 = newItem(W2, { ch: 43, md: chapterMd(43, 2300) });
       let n = 0;
-      const base = AS.audiobookSegments(AS.planAudiobookSections(chapterMd(43, 2300)).sections.map((x) => ({ idx: x.idx, text: x.text }))).length;
+      // r83: el worker corta los segmentos con el tamaño efectivo del item (AUDIOBOOK_TTS_SEGMENT_CHARS, default 2000).
+      const base = AS.audiobookSegments(AS.planAudiobookSections(chapterMd(43, 2300)).sections.map((x) => ({ idx: x.idx, text: x.text })), TR.audiobookSegmentChars(env)).length;
       fast.plan.ttsFail = { shift: () => (++n === base + 1 ? 429 : undefined) }; // falla el primer segmento de ampliación
       await claim(W2, it2, { env });
       fast.plan.ttsFail = [];

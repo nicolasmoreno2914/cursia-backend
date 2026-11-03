@@ -166,26 +166,146 @@ export function ttsTimeoutMs(env: Env): { ms: number; source: 'default' | 'OPENA
   return { ms: OPENAI_TTS_TIMEOUT_MS, source: 'default' };
 }
 
-export class OpenAiTtsClient {
-  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = ttsTimeoutMs(env).ms) {
-    if (!apiKey || !apiKey.trim()) throw new ProviderCallError('openai', false, 'openai: OPENAI_API_KEY no configurada');
+/**
+ * r83 (incidente #91, 2026-11-02): watchdog de INACTIVIDAD del cuerpo del TTS. Un TTS sano emite bytes de forma continua;
+ * un stream colgado (headers 200 y después nada) se aborta pasado este tiempo sin bytes, en vez de esperar ~2–3 min a que
+ * lo corte el borde (`TypeError: terminated`) o el total de 210 s. Solo corre DESPUÉS de los headers (antes, la generación
+ * puede tardar legítimamente y la cubre el total). Override: OPENAI_TTS_STALL_MS (≥ 100 ms, < timeout total).
+ */
+export const OPENAI_TTS_STALL_MS = 40_000;
+export const OPENAI_TTS_STALL_ENV = 'OPENAI_TTS_STALL_MS';
+export function ttsStallMs(env: Env, totalMs: number): number {
+  const n = Number(env[OPENAI_TTS_STALL_ENV]);
+  const v = Number.isInteger(n) && n >= 100 ? n : OPENAI_TTS_STALL_MS;
+  return Math.max(100, Math.min(v, totalMs));
+}
+
+/** r83: cómo terminó una llamada TTS sin audio completo (evidencia para el ledger y el diagnóstico sin SSH). */
+export type TtsStreamFailureKind = 'cut' | 'stall' | 'timeout' | 'network';
+
+/**
+ * r83: la llamada TTS se envió y NO devolvió un audio completo: corte del cuerpo (`terminated`), watchdog de inactividad,
+ * timeout total o error de red antes de los headers. Resultado DESCONOCIDO (OpenAI pudo cobrar): `status` queda null
+ * (nunca es un rechazo definitivo ni un «no cobrado» conocido). Lleva la evidencia sin secretos: x-request-id, causa
+ * del socket, bytes recibidos y duración.
+ */
+export class TtsStreamError extends ProviderCallError {
+  constructor(
+    message: string,
+    public readonly kind: TtsStreamFailureKind,
+    public readonly phase: 'headers' | 'body',
+    public readonly requestId: string | null,
+    public readonly responseStatus: number | null,
+    public readonly bytesReceived: number,
+    public readonly elapsedMs: number,
+    public readonly causeCode: string | null,
+  ) {
+    super('openai', true, message, null);
+    this.name = 'TtsStreamError';
   }
 
-  /** POST /audio/speech — mismo body que TtsService (model, input, voice, response_format, instructions?). */
+  /** Evidencia serializable (output_summary.ttsCuts / ledger / log). Sin secretos. */
+  evidence(): Record<string, unknown> {
+    return { kind: this.kind, phase: this.phase, requestId: this.requestId, responseStatus: this.responseStatus,
+      bytesReceived: this.bytesReceived, elapsedMs: this.elapsedMs, cause: this.causeCode };
+  }
+}
+
+/** Causa del error de undici (`err.cause.code` / `.message`), recortada y sin saltos de línea. Nunca incluye headers. */
+function causeOf(err: unknown): string | null {
+  const c = (err as { cause?: unknown } | null)?.cause as { code?: unknown; name?: unknown; message?: unknown } | undefined;
+  const parts = [c?.code, c?.name !== 'Error' ? c?.name : null, c?.message].filter((x): x is string => typeof x === 'string' && !!x.trim());
+  const s = parts.join(' ').replace(/\s+/g, ' ').trim();
+  return s ? s.slice(0, 160) : null;
+}
+
+function safeRequestId(v: string | null): string | null {
+  return v && /^[A-Za-z0-9._:-]{1,200}$/.test(v) ? v : null;
+}
+
+export class OpenAiTtsClient {
+  private readonly stallMs: number;
+  constructor(private readonly apiKey: string, private readonly env: Env = process.env, private readonly timeoutMs = ttsTimeoutMs(env).ms) {
+    if (!apiKey || !apiKey.trim()) throw new ProviderCallError('openai', false, 'openai: OPENAI_API_KEY no configurada');
+    this.stallMs = ttsStallMs(env, timeoutMs);
+  }
+
+  /**
+   * POST /audio/speech — mismo body que TtsService (model, input, voice, response_format, instructions?).
+   * r83: el cuerpo se lee por stream DENTRO del manejo de errores (antes `arrayBuffer()` quedaba fuera y un corte subía
+   * como `TypeError: terminated` sin contexto), con watchdog de inactividad y el timeout total de siempre. Cualquier
+   * final sin audio completo → TtsStreamError con la evidencia.
+   */
   async speech(req: { model: string; voice: string; input: string; instructions?: string; speed?: number }): Promise<TtsCallResult> {
     const body: Record<string, unknown> = { model: req.model, input: req.input, voice: req.voice, response_format: 'mp3' };
     if (req.instructions) body.instructions = req.instructions;
     // r67 (A2.3): `speed` solo lo manda la estrategia `speed`, que se salta mientras el modelo no lo soporte de forma verificada.
     if (typeof req.speed === 'number' && req.speed >= 0.25 && req.speed <= 4) body.speed = req.speed;
-    const res = await send('openai', 'POST /audio/speech', `${base(this.env, OPENAI_API_BASE_ENV, OPENAI_API_BASE_DEFAULT)}/audio/speech`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }, this.timeoutMs);
-    if (!res.ok) throw classify('openai', 'POST /audio/speech', res.status, await bodySnippet(res));
-    const audio = Buffer.from(await res.arrayBuffer());
-    const rid = res.headers.get('x-request-id');
-    return { audio, requestId: rid && /^[A-Za-z0-9._:-]{1,200}$/.test(rid) ? rid : null };
+    const what = 'POST /audio/speech';
+    const url = `${base(this.env, OPENAI_API_BASE_ENV, OPENAI_API_BASE_DEFAULT)}/audio/speech`;
+    const started = Date.now();
+    const ctl = new AbortController();
+    let aborted: 'timeout' | 'stall' | null = null;
+    const total = setTimeout(() => { aborted = 'timeout'; ctl.abort(); }, this.timeoutMs);
+    let stall: ReturnType<typeof setTimeout> | null = null;
+    const armStall = () => {
+      if (stall) clearTimeout(stall);
+      stall = setTimeout(() => { aborted = aborted ?? 'stall'; ctl.abort(); }, this.stallMs);
+    };
+    const done = () => { clearTimeout(total); if (stall) clearTimeout(stall); };
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ctl.signal,
+      });
+    } catch (err) {
+      done();
+      const elapsed = Date.now() - started;
+      // Mismo texto base de siempre («error de red (TimeoutError)»: lo leen las reglas y el log), más la evidencia.
+      const name = aborted === 'timeout' ? 'TimeoutError' : err instanceof Error ? err.name : 'error';
+      const cause = causeOf(err);
+      throw new TtsStreamError(
+        `openai ${what}: error de red (${name})${cause ? ` [${cause}]` : ''} sin respuesta tras ${(elapsed / 1000).toFixed(1)} s`,
+        aborted === 'timeout' ? 'timeout' : 'network', 'headers', null, null, 0, elapsed, cause ?? name,
+      );
+    }
+    const requestId = safeRequestId(res.headers.get('x-request-id'));
+    if (!res.ok) {
+      const snippet = await bodySnippet(res);
+      done();
+      throw classify('openai', what, res.status, snippet);
+    }
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    try {
+      if (!res.body) throw new Error('respuesta sin cuerpo');
+      armStall();
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done: end, value } = await reader.read();
+        if (end) break;
+        if (value && value.byteLength) {
+          chunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+          bytes += value.byteLength;
+          armStall();
+        }
+      }
+    } catch (err) {
+      done();
+      const elapsed = Date.now() - started;
+      const kind: TtsStreamFailureKind = aborted === 'timeout' ? 'timeout' : aborted === 'stall' ? 'stall' : 'cut';
+      const cause = kind === 'cut' ? causeOf(err) ?? (err instanceof Error ? err.message.slice(0, 120) : null) : kind;
+      const label = kind === 'stall' ? `sin bytes durante ${(this.stallMs / 1000).toFixed(1)} s (watchdog)` : kind === 'timeout' ? `timeout total ${(this.timeoutMs / 1000).toFixed(0)} s` : `corte del cuerpo (${err instanceof Error ? err.message.slice(0, 60) : 'error'})`;
+      throw new TtsStreamError(
+        `openai ${what}: ${label}${kind === 'cut' && cause ? ` [${cause}]` : ''}; ${bytes} bytes en ${(elapsed / 1000).toFixed(1)} s; HTTP ${res.status}; x-request-id ${requestId ?? 'n/d'}`,
+        kind, 'body', requestId, res.status, bytes, elapsed, cause,
+      );
+    }
+    done();
+    return { audio: Buffer.concat(chunks, bytes), requestId };
   }
 }
 

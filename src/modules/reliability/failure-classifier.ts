@@ -229,6 +229,9 @@ export const PROVIDER_CONFIG_RE =
 /** Reglas de LLAMADAS a un proveedor pagado: a ellas se aplica el chequeo de configuración del proveedor (I1). */
 const PROVIDER_CALL_RULES: Readonly<Record<string, FailureProvider | null>> = Object.freeze({
   tts_failed: 'openai',
+  // r83: envíos TTS sin audio completo ya liquidados como cobrados / proveedor enfermo (devolución sin consumir intento).
+  tts_chunk_cut_exhausted: 'openai',
+  tts_provider_unhealthy: 'openai',
   audiobook_script_failed: 'anthropic',
   gamma_submit_failed: 'gamma',
   gamma_repoll: 'gamma',
@@ -295,7 +298,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   { id: 'unknown_error', codes: ['unknown_error'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   {
     id: 'download_failed',
-    codes: ['download_failed', 'text_fetch_failed', 'download_url_failed', 'sign_failed', 'storage_unavailable', 'audio_segment_unavailable'],
+    codes: ['download_failed', 'text_fetch_failed', 'download_url_failed', 'sign_failed', 'audio_segment_unavailable'],
     family: /^[a-z0-9_]+_download_failed$/,
     class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3,
   },
@@ -306,6 +309,10 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       ? { class: 'D', strategy: 'hold_for_human', rounds: 0, humanReason: 'product_bug', adminAction: 'regenerate_item', provider: undefined }
       : null),
   },
+  // r83 (incidente #91): Supabase Storage no respondió durante todo el presupuesto de reintentos (StorageUnavailableError).
+  // Espera de INFRAESTRUCTURA: el scheduler la devuelve sin consumir intento y el breaker de Storage
+  // (reliability/storage-breaker.ts) retiene los claims hasta que la sonda responda. Nunca reconciliación ni humano.
+  { id: 'storage_unavailable', codes: ['storage_unavailable'], class: 'A', strategy: 'wait_provider', scope: 'provider', provider: 'storage', rounds: 3 },
   { id: 'artifact_upload_failed', codes: ['artifact_upload_failed', 'upload_failed'], class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3 },
   { id: 'complete_rejected', codes: ['complete_rejected'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   { id: 'finops_unavailable', codes: ['finops_unavailable', 'finops_ledger_write_failed'], class: 'A', strategy: 'wait_provider', scope: 'run', provider: 'finops', rounds: 3 },
@@ -318,7 +325,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // breaker GLOBAL de `anthropic`: solo uno por dueño, salvo corroboración del proxy/gateway del servidor.
   // cursia#68 (SSE): `llm_stream_cut` = el stream de la IA se cortó / dejó de responder / quedó incompleto. Transitorio
   // (A, reintento); el gasto ya queda en el ledger con el cargo conservador del proxy (paidRisk measured, sin más riesgo).
-  { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network', 'llm_stream_cut'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
+  { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network', 'llm_stream_cut', 'llm_provider_unhealthy'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
   {
     id: 'llm_config',
     codes: ['llm_credit_exhausted', 'llm_auth_rejected', 'proxy_misconfigured', 'llm_model_config', 'llm_model_not_allowed', 'llm_api_key_missing', 'llm_model_missing'],
@@ -579,6 +586,13 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
       return n > 0 ? { class: 'C', strategy: 'auto_resubmit_once', rounds: 1, adminAction: 'reconcile_provider', humanReason: 'duplicate_charge', paidRisk: 'uncertain' } : null;
     },
   },
+  // r83 (incidente #91): el segmento se reintentó dentro del intento y cada envío perdido quedó LIQUIDADO como cobrado
+  // (posible duplicado, medido y acotado por el presupuesto de recuperación): no queda nada incierto → A, no C/humano.
+  { id: 'tts_chunk_cut_exhausted', codes: ['tts_chunk_cut_exhausted'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3 },
+  // r83: cortes repetidos en pocos minutos → el item volvió a la cola sin consumir intento (acotado por item).
+  { id: 'tts_provider_unhealthy', codes: ['tts_provider_unhealthy'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'openai', rounds: 3 },
+  // r83: el Storage no aceptó un segmento ya pagado; el MP3 quedó en el spool local del worker y el reintento lo re-sube sin repagar.
+  { id: 'audio_segment_upload_failed', codes: ['audio_segment_upload_failed'], class: 'A', strategy: 'retry_backoff', paidRisk: 'none', rounds: 3 },
   {
     id: 'provider_reconciliation',
     codes: ['provider_reconciliation_required', 'confirm_paid_required', 'may_have_rendered_ack_required'],
@@ -607,7 +621,7 @@ const PACKAGE_RULES: readonly Rule[] = Object.freeze([
   // r62 (P, review I1): PACKAGING_V3_CONTENT_MISSING (contenido ausente/vacío en un set de artifacts que no cambia entre
   // reintentos) pasa a `package_component` (B, reparación por item) y ERR_BUFFER_TOO_LARGE (misma entrada, mismo tamaño) a
   // `package_product` (D): ninguno se arregla reintentando y con r62 lo A se reintenta hasta 72 h.
-  { id: 'package_transient', codes: ['package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
+  { id: 'package_transient', codes: ['package_transient', 'PACKAGE_REUSE_VERIFY_UNAVAILABLE', 'PACKAGE_OBJECT_CONFLICT', 'storage_unavailable'], class: 'A', strategy: 'repackage', scope: 'package', rounds: 5 },
   {
     id: 'package_component',
     codes: ['EXAM_BANK_INVALID', 'QUIZ_V3_BANK_INVALID', 'QUIZ_V3_EMPTY', 'QUIZ_V3_INVALID', 'H5P_ACTIVITY_PAYLOAD_INVALID', 'H5P_INPUT_INVALID',
@@ -728,6 +742,8 @@ const ITEM_TYPE_PREFIXES = new Set([
 /** Frases estables del ejecutor del navegador / de api() (04-api.js) → código. Orden = prioridad. */
 const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^(?:❌\s*)?Fall[oó] despu[eé]s de \d+ intentos\b/i, 'browser_llm_transient'],
+  // r83: caída de Storage detrás de los envoltorios estables de los workers (antes que artifact_upload_failed).
+  [/^(?:unexpected_error:\s*|no se pudo subir el artifact [^:]*:\s*)?storage_unavailable:\s*Supabase Storage [a-z]+ failed:/, 'storage_unavailable'],
   [/^no se pudo subir el artifact\b/i, 'artifact_upload_failed'],
   [/^complete rechazado\b/i, 'complete_rejected'],
   [/^OUTPUT_TRUNCATED_MAX_TOKENS\b/, 'OUTPUT_TRUNCATED_MAX_TOKENS'],

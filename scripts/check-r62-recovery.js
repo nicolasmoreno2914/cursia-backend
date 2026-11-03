@@ -67,6 +67,15 @@ const LOGS = [];
 const capLogger = { log: (m) => LOGS.push(String(m)), warn: (m) => LOGS.push(String(m)), error: (m) => LOGS.push(String(m)) };
 Logger.overrideLogger({ log: capLogger.log, warn: capLogger.warn, error: capLogger.error, debug: () => {}, verbose: () => {} });
 
+
+// r83: la regla r62 (1 evento ambiguo por parte, 1 reenvío por llamada) sigue disponible con DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX=1;
+// estas pruebas verifican esa mecánica (agrupación en eventos, tope). La regla por defecto (dinero + 3 eventos) la cubre
+// scripts/check-r83-llm.js.
+async function legacyEvents(fn) {
+  const prev = process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX;
+  process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX = '1';
+  try { return await fn(); } finally { if (prev === undefined) delete process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX; else process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX = prev; }
+}
 let passes = 0;
 let failures = 0;
 async function check(name, fn) {
@@ -411,7 +420,7 @@ async function llmChecks() {
     eq(FC.classifyFailure({ error: r.e.msg, source: 'server_executor' }).humanReason, 'budget', 'excepción de presupuesto');
     await a.close();
   });
-  await check('c4: a lo sumo UN reenvío por llamada — el reenvío vuelve a ser desconocido → revisión (sin un 3.er pedido)', async () => {
+  await check('c4: a lo sumo UN reenvío por llamada — el reenvío vuelve a ser desconocido → revisión (sin un 3.er pedido)', () => legacyEvents(async () => {
     const a = await fakeAnthropic(() => 'drop');
     const w = llmWorld(true);
     const r = await err(w.api(a.url)('s', 'P'));
@@ -419,8 +428,8 @@ async function llmChecks() {
     eq(a.st.requests, 2, 'original + UN reenvío');
     eq(FC.classifyFailure({ error: r.e.msg, source: 'server_executor' }).humanReason, 'duplicate_charge', 'excepción de cobro duplicado');
     await a.close();
-  });
-  await check('I2: un worker caído con 3 llamadas en vuelo = UN evento → si la SUMA de las 3 reservas perdidas entra en el presupuesto, se liquidan las 3 como posible duplicado y cada carril reenvía la suya una vez (sin revisión)', async () => {
+  }));
+  await check('I2: un worker caído con 3 llamadas en vuelo = UN evento → si la SUMA de las 3 reservas perdidas entra en el presupuesto, se liquidan las 3 como posible duplicado y cada carril reenvía la suya una vez (sin revisión)', () => legacyEvents(async () => {
     const a = await fakeAnthropic(() => 'ok');
     const w = llmWorld(true);
     const lost = ['L1', 'L2', 'L3'].map((p) => w.orphan(p, 1));
@@ -435,14 +444,14 @@ async function llmChecks() {
     const r2 = await err(api('s', 'L9'));
     assert(r2.e && r2.e.pendingReview && /eventos ambiguos/.test(r2.e.msg), `segundo evento → revisión: ${JSON.stringify(r2.e)}`);
     await a.close();
-  });
-  await check('I2-bis: evento = intento anterior O solapamiento — A desconocida → reenvío; B desconocida DESPUÉS en el mismo intento → revisión; respaldo max(4, carriles)', async () => {
+  }));
+  await check('I2-bis: evento = intento anterior O solapamiento — A desconocida → reenvío; B desconocida DESPUÉS en el mismo intento → revisión; respaldo max(4, carriles)', () => legacyEvents(async () => {
     const t = (ms) => new Date(Date.UTC(2026, 9, 20, 12, 0, 0) + ms);
     eq(SL.countUnknownEvents([{ attempt: 1, createdAt: t(0) }, { attempt: 1, createdAt: t(5) }], 2, null), 1, 'un intento caído = 1 evento');
     eq(SL.countUnknownEvents([{ attempt: 2, createdAt: t(0) }, { attempt: 2, createdAt: t(5) }], 2, t(10)), 1, 'solapadas en el intento actual = 1 evento');
     eq(SL.countUnknownEvents([{ attempt: 2, createdAt: t(0) }, { attempt: 2, createdAt: t(20) }], 2, t(10)), 2, 'una nueva después de detectar la primera = 2.º evento');
     eq(SL.countUnknownEvents([{ attempt: 1, createdAt: t(0) }, { attempt: 2, createdAt: t(20) }], 2, t(10)), 2, 'caído + nueva = 2 eventos');
-    eq([SL.llmUnknownItemMax(), SL.llmUnknownItemMax(6)], [4, 6], 'respaldo max(4, carriles)');
+    eq([SL.llmUnknownItemMax(), SL.llmUnknownItemMax(6)], [6, 6], 'respaldo max(6, eventos (1 en legacy) × carriles)');
     const a = await fakeAnthropic((n) => (n === 1 || n === 3 ? 'drop' : 'ok'));
     const w = llmWorld(true);
     const api = w.api(a.url);
@@ -451,8 +460,8 @@ async function llmChecks() {
     assert(rb.e && rb.e.pendingReview && /eventos ambiguos/.test(rb.e.msg), `B → revisión: ${JSON.stringify(rb.e)}`);
     eq(a.st.requests, 3, 'B no se reenvía');
     await a.close();
-  });
-  await check('re-review I2-ter: el solapamiento usa el reloj de la DB — con el worker atrasado o adelantado 5 s respecto de la DB, A desconocida → reenvío y B desconocida después → revisión igual', async () => {
+  }));
+  await check('re-review I2-ter: el solapamiento usa el reloj de la DB — con el worker atrasado o adelantado 5 s respecto de la DB, A desconocida → reenvío y B desconocida después → revisión igual', () => legacyEvents(async () => {
     for (const dbSkewMs of [5000, -5000]) {
       const a = await fakeAnthropic((n) => (n === 1 || n === 3 ? 'drop' : 'ok'));
       const w = llmWorld(true, { dbSkewMs });
@@ -473,7 +482,7 @@ async function llmChecks() {
       assert(out.every((x) => x.v && !x.e), `skew ${dbSkewMs}: solapadas sin revisión: ${JSON.stringify(out.map((x) => x.e))}`);
       await a.close();
     }
-  });
+  }));
   await check('re-review m3: markSent lanza (DB) → la reserva se LIBERA (never_sent), no se envía nada y no queda abierta', async () => {
     const a = await fakeAnthropic(() => 'ok');
     const w = llmWorld(true);
@@ -691,7 +700,7 @@ async function dbChecks() {
     });
     const claimProvider = (runId, type) => sched.claimNextItem({ executorId: 'r62-provider-worker', types: [type], leaseSeconds: 120, runId });
     const later = (mins) => new Date(Date.now() + mins * 60_000);
-    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400' };
+    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400', OPENAI_TTS_SEGMENT_RETRIES: '0' };
     const resubOf = (res, rid) => res.resubmitted.filter((x) => x.runId === rid);
     const runSpent = async (rid) => Number((await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1`, [rid]))[0].t);
     const paidAuthorized = async (rid) => Number(await budget.runPaidAuthorizedBudget(rid));
@@ -706,7 +715,10 @@ async function dbChecks() {
       fakes.plan.ttsFail = [undefined, 'hang'];
       const item = await claimProvider(R.rid, 'audiobook_chapter');
       assert(item && item.itemKey === key, `claim ${item && item.itemKey}`);
-      const thrown = await PW.processProviderItem(workerDeps({ env: FAST }), item).then(() => null, (e) => e);
+      // r83: el TTS falso (syntheticMp3) devuelve bytes que dependen SOLO de la duración; con segmentos de ~2000 caracteres
+      // de esta fixture (la misma oración repetida) dos segmentos duran lo mismo → audio idéntico → AUDIOBOOK_SEGMENT_DUPLICATE.
+      // Artefacto del fake (un TTS real nunca da el mismo MP3 para textos distintos): K1 fija el corte histórico de 3900.
+      const thrown = await PW.processProviderItem(workerDeps({ env: { ...FAST, AUDIOBOOK_TTS_SEGMENT_CHARS: '3900' } }), item).then(() => null, (e) => e);
       fakes.plan.ttsFail = [];
       let row = await itemRow(R.rid, key);
       assert(thrown && /^provider_reconciliation_required: openai/.test(thrown.message), `timeout → reconciliación (${row.status}: ${row.error}; tts ${JSON.stringify(fakes.st.tts.slice(tts0))})`);

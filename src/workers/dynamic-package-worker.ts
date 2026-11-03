@@ -43,6 +43,7 @@ import { buildPackageQualityReport, courseQualityReportSummary, CourseQualityRep
 import { PACKAGE_REUSE_REJECTED, PACKAGE_REUSE_VERIFY_UNAVAILABLE, chooseDynamicMbzUploadPath, verifyReusableDynamicMbz } from '../modules/dynamic-packaging/package-reuse-verify';
 import { sha256Hex } from '../modules/artifacts/artifacts.service';
 import { isNonRealLlmMode } from '../modules/artifacts/artifact-type-policy';
+import { storageBreakerDbOf, storageClaimGate, storageProbeFromEnv } from '../modules/reliability/storage-breaker';
 import { classifyFailure } from '../modules/reliability/failure-classifier';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -922,6 +923,10 @@ export async function claimNext(
   leaseSeconds: number,
   logger: Pick<Logger, 'warn'> = new Logger('DynamicPackageWorker'),
 ): Promise<PackageJobRow | null> {
+  // r83: Supabase Storage caído (breaker abierto) → no se reclama: el .mbz no se podría subir. La compuerta corre la
+  // sonda cuando toca y reabre sola. Sin la tabla del breaker → no-op.
+  const gate = await storageClaimGate(storageBreakerDbOf(dataSource as any), storageProbeFromEnv(), { logger });
+  if (gate.hold) return null;
   const queryRunner = dataSource.createQueryRunner();
   await queryRunner.connect();
   let claimedId: string | null = null;

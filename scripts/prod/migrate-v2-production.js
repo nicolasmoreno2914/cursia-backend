@@ -302,6 +302,10 @@ const EXCLUDED = [
   // MICROCURRICULUM_ENABLED está apagado en producción). Para promoverlo: paso propio en MIGRATION_STEPS + sondas.
   { file: 'supabase-migration-r81-microcurricula.sql', reason: 'r81: staging-only hasta aprobación del owner' },
   { file: 'scripts/migrate-r81-microcurricula.js', reason: 'r81: staging-only hasta aprobación del owner' },
+  // r83 (breaker de Supabase Storage): tabla nueva infra_health. Staging-only hasta aprobación del owner; sin ella el
+  // breaker es no-op (los reintentos de subida y el error tipado storage_unavailable funcionan igual).
+  { file: 'supabase-migration-r83-infra-health.sql', reason: 'r83: staging-only hasta aprobación del owner' },
+  { file: 'scripts/migrate-r83-infra-health.js', reason: 'r83: staging-only hasta aprobación del owner' },
   { file: 'supabase-migration-ev6-dod-preview-status.sql', reason: "EV6 DoD: el CHECK de worker_status con 'preview' lo aplica el PASO 0 (scripts/lib/production-jobs-constraints.js, misma lista); este .sql es su equivalente manual" },
 ];
 

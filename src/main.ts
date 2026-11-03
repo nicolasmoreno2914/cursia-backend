@@ -71,6 +71,9 @@ async function bootstrap() {
     // #583 + r62 (regla de ambigüedad acotada): UN reenvío automático de un audio con resultado incierto (corte o
     // timeout), con el peor caso dentro de lo autorizado (presupuesto de la parte + saldo del run).
     { name: 'reenvío de audio incierto', run: () => runsService.autoResubmitAmbiguousAudio() },
+    // r83: parte de IA en revisión por resultados desconocidos (cortes de red) → UNA reapertura tras 12 min con sonda de
+    // salud sin costo y el peor caso dentro de lo autorizado.
+    { name: 'reapertura de IA en revisión', run: () => runsService.autoReopenLlmPendingReview() },
     // r62 (K3): partes frenadas por el kill switch / la allow-list de FinOps → se reabren solas al revertirlo.
     { name: 'reanudación tras control de gasto', run: () => runsService.autoResumeSpendControlHolds() },
     // r65 (R4): una parte de IA que agotó su tope interno → UNA ronda extra (sin streaming, max_tokens × 1,5) si el saldo

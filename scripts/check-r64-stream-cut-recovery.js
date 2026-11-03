@@ -8,7 +8,7 @@
 const http = require('http');
 const path = require('path');
 const distRoot = path.resolve(process.cwd(), process.argv[2] || 'dist');
-const { createServerApi, priorStreamCut, LLM_OUTPUT_CUT_REPEATED, LLM_WORKER_MAX_TOKENS_CAP, autoBudgetExtensionMaxTokens } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
+const { createServerApi, priorStreamCut, LLM_OUTPUT_CUT_REPEATED, LLM_WORKER_MAX_TOKENS_CAP, LLM_ITEM_NONSTREAM_AFTER_CUTS, autoBudgetExtensionMaxTokens } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
 const { nonStreamMessage, streamMessage, nodeHttpFetch } = require(path.join(distRoot, 'workers/llm-executor/anthropic-stream.js'));
 const { classifyFailure } = require(path.join(distRoot, 'modules/reliability/failure-classifier.js'));
 
@@ -79,8 +79,11 @@ function fakeWorld(opts = {}) {
       if (sql.includes('select now() as db_now')) return [{ db_now: new Date().toISOString() }];
       if (sql.includes('stream_cut_seen')) {
         if (opts.priorCutThrows) throw new Error('db caída');
-        const fromLedger = charges.some((c) => c.metadata && c.metadata.streamCut);
-        return [{ stream_cut_seen: !!(opts.priorCut || fromLedger) }];
+        const fromLedger = charges.filter((c) => c.metadata && c.metadata.streamCut);
+        // r83: cantidad de cortes y hashes de las llamadas cortadas (política por llamada / por parte). `priorCut` = la
+        // parte ya acumuló cortes repetidos en intentos anteriores (≥ LLM_ITEM_NONSTREAM_AFTER_CUTS).
+        if (opts.priorCut) return [{ stream_cut_seen: true, stream_cut_count: opts.priorCutCount ?? 2, stream_cut_hashes: [] }];
+        return [{ stream_cut_seen: fromLedger.length > 0, stream_cut_count: fromLedger.length, stream_cut_hashes: [...new Set(fromLedger.map((c) => c.metadata.streamCut.callHash))] }];
       }
       if (sql.includes('count(*)::int as n')) {
         const [keyLike, tagLike, , exclude] = params;
@@ -157,7 +160,7 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     assert(cut, 'cargo conservador con metadata.streamCut');
     const sc = cut.metadata.streamCut;
     assert(/^socket:/.test(sc.cause) && sc.transport === 'stream' && sc.partialChars === 30 && sc.callHash && sc.callHash.length === 12 && sc.sawUsageDelta === false, 'evidencia: ' + JSON.stringify(sc));
-    assert(api.logs.some((l) => /se cortó a mitad \(stream; causa socket:/.test(l) && /30 caracteres recibidos/.test(l)), 'log con la causa: ' + api.logs.join(' | '));
+    assert(api.logs.some((l) => /se cortó a mitad \(stream; causa socket:/.test(l) && /30 caracteres \/ \d+ bytes recibidos en \d+ ms/.test(l)), 'log con la causa: ' + api.logs.join(' | '));
     await a.close();
   });
 
@@ -180,7 +183,7 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     await a.close();
   });
 
-  await check('R1: un intento NUEVO de la parte (otro proceso) cuya llamada ya se cortó empieza directo sin streaming (ledger)', async () => {
+  await check('R1: un intento NUEVO de la parte (otro proceso) con cortes repetidos en el ledger empieza directo sin streaming', async () => {
     const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : 'ok'));
     const w = fakeWorld({ priorCut: true }); const api = makeApi(w, a.url);
     const text = await api('s', 'prompt-attempt2', 5000);
@@ -190,7 +193,9 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     await a.close();
   });
 
-  await check('R1: el patrón exacto de R1 (cada stream de esa parte se corta) cuesta como máximo UN corte por intento, no cinco', async () => {
+  // r83: un corte ya no pasa la parte entera a sin streaming (solo esa llamada); recién con LLM_ITEM_NONSTREAM_AFTER_CUTS (2)
+  // cortes en la parte toda la parte va sin streaming → el patrón R1 cuesta como máximo 2 cortes, no cinco.
+  await check('R1: el patrón exacto de R1 (cada stream de esa parte se corta) cuesta como máximo LLM_ITEM_NONSTREAM_AFTER_CUTS cortes, no cinco', async () => {
     const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : 'ok'));
     const w = fakeWorld();
     // Intento 1 de la parte y dos reintentos del ejecutor (_dynLlmCall) con prompts distintos (dirigidos) del mismo item.
@@ -201,11 +206,11 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     const api2 = makeApi(w, a.url);
     await api2('s', 'r1-main', 5000).catch(() => null); // punto de guardado: sin llamada
     const cuts = w.charges.filter((c) => c.metadata && c.metadata.streamCut).length;
-    assert(cuts === 1, 'UN solo corte en toda la parte (el reintento dirigido ya va sin streaming): ' + cuts);
-    assert(a.st.reqs.filter((r) => r.stream).length === 1, 'streams enviados: ' + a.st.reqs.filter((r) => r.stream).length);
+    assert(LLM_ITEM_NONSTREAM_AFTER_CUTS === 2 && cuts === LLM_ITEM_NONSTREAM_AFTER_CUTS, 'a lo sumo 2 cortes en toda la parte: ' + cuts);
+    assert(a.st.reqs.filter((r) => r.stream).length === 2, 'streams enviados: ' + a.st.reqs.filter((r) => r.stream).length);
     const api3 = makeApi(w, a.url);
     await api3('s', 'r1-otro-prompt-intento-2', 5000);
-    assert(a.st.reqs.filter((r) => r.stream).length === 1, 'un intento nuevo de la parte (ledger con el corte) tampoco usa streaming');
+    assert(a.st.reqs.filter((r) => r.stream).length === 2, 'un intento nuevo de la parte (ledger con 2 cortes) ya no usa streaming');
     await a.close();
   });
 
@@ -244,12 +249,15 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     await a.close();
   });
 
-  await check('sin streaming, una respuesta caída es DESCONOCIDA (reserva pendiente, regla de un reenvío), nunca «sin costo»', async () => {
+  // r83: tras perder un envío SIN streaming, el reenvío de esa llamada vuelve al stream (alternancia por llamada); el tope
+  // de desconocidos por llamada (3) y el dinero lo cortan igual → revisión.
+  await check('sin streaming, una respuesta caída es DESCONOCIDA (reserva pendiente), nunca «sin costo»; el reenvío vuelve al stream', async () => {
     const a = await fakeAnthropic(({ stream }) => (stream ? 'cut' : 'drop'));
     const w = fakeWorld(); const api = makeApi(w, a.url);
     const e = await err(api('s', 'prompt-drop', 5000));
-    assert(e && e.fatal === true && e.pendingReview === true, 'tras el reenvío único → revisión: ' + JSON.stringify(e));
-    assert(a.st.reqs.filter((r) => r.stream).length === 1, 'nunca volvió al stream');
+    assert(e && e.fatal === true && e.pendingReview === true, 'tras los reenvíos acotados → revisión: ' + JSON.stringify(e));
+    assert(a.st.reqs.filter((r) => r.stream).length >= 2, 'volvió al stream tras perder el envío sin streaming');
+    assert(a.st.reqs.filter((r) => !r.stream).length === 3, 'tres envíos sin streaming perdidos (tope por llamada): ' + a.st.reqs.filter((r) => !r.stream).length);
     await a.close();
   });
 

@@ -207,6 +207,12 @@ import {
   autoBudgetExtensionOf, budgetScopeOf, isItemBudgetExhausted, itemFailureVerdict, nextOwnerRetries, ownerRetriesUsed, ownerRetryVerdict,
 } from './owner-retry';
 import { unknownReservations } from '../../workers/llm-executor/server-llm';
+/** Review F5: la reapertura automática no lleva holgura de ambigüedad (el intento reabierto tampoco la tiene). */
+export const LLM_REOPEN_ALLOWANCE_CALLS = 0;
+import {
+  anthropicReachable, LLM_REVIEW_REOPEN_KEY, LLM_REVIEW_REOPEN_MAX_ROUNDS, LLM_REVIEW_REOPEN_STRATEGY, LlmHealthProbeResult, llmProviderHealthProbe,
+  llmReviewReopenDecision, llmReviewReopenDelaySeconds,
+} from './llm-pending-review-reopen';
 import {
   PROVIDER_PROBE_KEY,
   PROVIDER_PROBE_MAX_HOURS,
@@ -280,6 +286,8 @@ export interface RunProgress extends StatusCounts {
 }
 
 export interface ItemRunDto {
+  /** r83: quién ejecutó / ejecuta la parte ('server' | 'browser'; null = todavía sin reclamar). */
+  executor?: 'server' | 'browser' | null;
   /**
    * r62 (N2): aviso para quien reintenta (p. ej. `stuck_render_resend`: el render anterior sigue vivo en Videogen y este
    * reenvío puede pagar un render DOBLE). Solo en la respuesta de retryItem; el FE lo muestra.
@@ -427,11 +435,37 @@ export interface RunReadOptions {
   executorId?: string | null;
 }
 
-/** REL MVP fix round 1 (I3): último claim / finalización de una parte que ejecuta el navegador. */
-export function lastBrowserActivityOf(rows: ReadonlyArray<{ type: string; status: string; claimed_at?: Date | string | null; finished_at?: Date | string | null }>): string | null {
+/** r83: worker_id de un worker del SERVIDOR (ids por defecto `<nombre>-worker-<pid>` o el id fijado por env). */
+const SERVER_WORKER_ID_RE = /^(dynamic-(llm|item|provider|package)-worker|gamma-worker|video-worker|h5p-worker|content-worker)\b/;
+
+/**
+ * r83 (incidente curso 91): quién ejecutó / ejecuta la parte — 'server' (workers del backend, incluido el worker de IA) o
+ * 'browser'; null = todavía sin reclamar. Evidencia: tipo de worker, worker_id, `generatedBy: 'llm-worker'` o una marca
+ * de envío del worker de IA (`llmSent`) del intento vigente.
+ */
+export function itemExecutorOf(r: { type: string; worker_id?: string | null; output_summary?: Record<string, any> | null; attempt_count?: number | null },
+  env: Record<string, string | undefined> = process.env): 'server' | 'browser' | null {
+  if (AUTO_HEAL_WORKER_ITEM_TYPES.includes(r.type)) return 'server';
+  const wid = typeof r.worker_id === 'string' ? r.worker_id.trim() : '';
+  const os = (r.output_summary ?? {}) as Record<string, any>;
+  const serverIds = [env.DYNAMIC_LLM_WORKER_ID, env.DYNAMIC_ITEM_WORKER_ID, env.DYNAMIC_PROVIDER_WORKER_ID].filter((x): x is string => !!x);
+  if (wid && (SERVER_WORKER_ID_RE.test(wid) || serverIds.includes(wid))) return 'server';
+  if (os.generatedBy === 'llm-worker') return 'server';
+  const att = Number(r.attempt_count);
+  if (os.llmSent && typeof os.llmSent === 'object' && Number.isInteger(att) && att > 0
+    && Object.keys(os.llmSent).some((k) => k.includes(`:a${att}:`))) return 'server';
+  return wid ? 'browser' : null;
+}
+
+/**
+ * REL MVP fix round 1 (I3): último claim / finalización de una parte que ejecuta el navegador.
+ * r83: solo cuentan las partes que NO ejecutó un worker del servidor (antes contaba también las del worker de IA y la
+ * UI mostraba «el navegador se detuvo» mientras el servidor generaba). Filas sin `worker_id` en la consulta: por tipo.
+ */
+export function lastBrowserActivityOf(rows: ReadonlyArray<{ type: string; status: string; claimed_at?: Date | string | null; finished_at?: Date | string | null; worker_id?: string | null; output_summary?: Record<string, any> | null; attempt_count?: number | null }>): string | null {
   let best = 0;
   for (const r of rows) {
-    if (AUTO_HEAL_WORKER_ITEM_TYPES.includes(r.type)) continue;
+    if (itemExecutorOf(r) === 'server') continue;
     for (const v of [r.claimed_at, r.status === 'completed' ? r.finished_at : null]) {
       const t = v ? new Date(v as any).getTime() : NaN;
       if (Number.isFinite(t) && t > best) best = t;
@@ -2574,6 +2608,11 @@ export class RunsService {
        * con presupuesto de recuperación nuevo, solo si el saldo del run cubre su peor caso y no hay reservas abiertas.
        */
       budgetExtension?: boolean;
+      /**
+       * r83: reapertura automática ÚNICA de una parte de IA en llm_pending_review (cortes de red), con la sonda de salud
+       * ya hecha por el barrido y sus reservas desconocidas ya liquidadas como posible duplicado.
+       */
+      llmPendingReview?: { health: LlmHealthProbeResult; budget: { fits: boolean; reason: string | null; worstItem?: number; worstRun?: number; allowance?: number } | null };
     },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
@@ -2591,6 +2630,10 @@ export class RunsService {
     // r65 (R4): la ronda extra por tope de la parte nunca reenvía a un proveedor ni se combina con otro modo automático.
     if (auto?.budgetExtension && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.spendControlResume || auto.providerReconcile || auto.dependencyResolved)) {
       throw new BadRequestException('auto-heal: la ronda extra por tope de la parte nunca reenvía ni se combina con otro modo automático');
+    }
+    // r83: la reapertura de una parte de IA en revisión nunca reenvía a un proveedor pagado ni se combina con otro modo.
+    if (auto?.llmPendingReview && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.spendControlResume || auto.providerReconcile || auto.dependencyResolved || auto.budgetExtension)) {
+      throw new BadRequestException('auto-heal: la reapertura de una parte de IA en revisión nunca reenvía ni se combina con otro modo automático');
     }
     if (auto?.spendControlResume && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.providerReconcile)) {
       throw new BadRequestException('auto-heal: la reanudación tras un control de gasto nunca reenvía ni se combina con otro modo automático');
@@ -2885,6 +2928,16 @@ export class RunsService {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (spend_control: still_blocked)`, code: 'auto_heal_not_eligible', reason: 'still_blocked' });
         }
         autoMeta = { round: 0, code: hold.code, strategy: SPEND_CONTROL_RESUME_STRATEGY };
+      } else if (auto && auto.llmPendingReview) {
+        // r83: misma decisión que el barrido con la fila bloqueada (una vez, espera, no por presupuesto) y, bajo lock, sin
+        // reservas desconocidas abiertas (el barrido las liquidó como posible duplicado): nada queda sin conciliar.
+        const d = llmReviewReopenDecision(target, auto.now ?? new Date(), { maxAgeHours: auto.policy.maxAgeHours, delaySeconds: llmReviewReopenDelaySeconds(), health: auto.llmPendingReview.health });
+        const open = d.heal ? (await unknownReservations(qr as unknown as DataSource, String(target.id), new Date(0))).length : 0;
+        if (d.heal === false || open > 0 || !auto.llmPendingReview.budget || !auto.llmPendingReview.budget.fits) {
+          const reason = d.heal === false ? d.reason : open > 0 ? 'open_reservations' : 'over_budget';
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (llm_pending_review: ${reason})`, code: 'auto_heal_not_eligible', reason });
+        }
+        autoMeta = { round: d.round, code: 'llm_pending_review', strategy: LLM_REVIEW_REOPEN_STRATEGY };
       } else if (auto && auto.budgetExtension) {
         // r65 (R4): misma decisión que el barrido, con las filas bloqueadas: tope de la parte agotado, sin la ronda ya
         // usada, parte de IA (los proveedores pagados quedan como hoy), 0 reservas abiertas y el saldo del run (y los topes
@@ -3071,6 +3124,8 @@ export class RunsService {
         ? { auto: true, spendControlResume: true, autoHealCode: autoMeta.code, actor: 'system' }
         : autoMeta && auto?.budgetExtension
         ? { auto: true, autoBudgetExtension: true, autoHealCode: autoMeta.code, actor: 'system' }
+        : autoMeta && auto?.llmPendingReview
+        ? { auto: true, llmPendingReviewReopen: true, autoHealCode: autoMeta.code, actor: 'system' }
         : autoMeta && auto?.providerProbe
         ? { auto: true, providerProbe: auto.providerProbe.mode, provider: auto.providerProbe.provider, providerProbeRound: autoMeta.round }
         : autoMeta && auto?.ambiguousAudio
@@ -3093,6 +3148,11 @@ export class RunsService {
         ? { spendControlResume: { count: Math.max(0, Math.floor(Number(target.output_summary?.spendControlResume?.count ?? 0)) || 0) + 1, lastAt: nowIso, lastCode: autoMeta.code } }
         : autoMeta && auto?.budgetExtension
         ? { [AUTO_BUDGET_EXTENSION_KEY]: budgetExtensionMark }
+        : autoMeta && auto?.llmPendingReview
+        // r83: el conteo de eventos ambiguos empieza de nuevo (llmUnknownResetAt); el presupuesto de la parte NO.
+        ? { [LLM_REVIEW_REOPEN_KEY]: { rounds: autoMeta.round, at: nowIso, previousError: String(target.error ?? '').slice(0, 500),
+              health: auto.llmPendingReview.health, budget: auto.llmPendingReview.budget, maxRounds: LLM_REVIEW_REOPEN_MAX_ROUNDS },
+            llmUnknownResetAt: nowIso }
         : autoMeta && auto?.providerProbe
         ? (probeState ? { [PROVIDER_PROBE_KEY]: probeState } : {})
         : autoMeta && auto?.ambiguousAudio
@@ -3121,7 +3181,7 @@ export class RunsService {
       // #583: el reenvío de audio incierto también concede UN intento (un único reenvío).
       // REL CREDIT: el canario concede UN intento (una sola llamada de prueba; fuera de las rondas del auto-healer).
       // r65 (R4): la ronda extra por tope de la parte también concede UN intento (una sola vez; si vuelve a agotar, humano).
-      const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerReconcile || auto?.providerProbe?.mode === 'canary' || auto?.budgetExtension
+      const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerReconcile || auto?.providerProbe?.mode === 'canary' || auto?.budgetExtension || auto?.llmPendingReview
         ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       // Loop de costos (review C1): una reapertura MANUAL (dueño / admin) le da a la parte un presupuesto de recuperación
@@ -3177,11 +3237,12 @@ export class RunsService {
       await recordItemReopened(qr, target.id, {
         // r62 (regla 5): todo REENVÍO automático a un proveedor queda con actor `system` y su motivo (strategy); la
         // conciliación de proveedor (N2) también la decide el sistema.
-        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved || auto?.budgetExtension ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
+        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved || auto?.budgetExtension || auto?.llmPendingReview ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
         // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
         strategy: auto?.providerReconcile ? `${PROVIDER_RECONCILE_CODE}_${auto.providerReconcile.action}:${auto.providerReconcile.kind}`
           : auto?.dependencyResolved ? CLAIM_PAYLOAD_RESUME_STRATEGY
           : auto?.budgetExtension ? AUTO_BUDGET_EXTENSION_STRATEGY
+          : auto?.llmPendingReview ? LLM_REVIEW_REOPEN_STRATEGY
           : auto?.spendControlResume ? `${SPEND_CONTROL_RESUME_STRATEGY}:${autoMeta?.code ?? ''}`.slice(0, 64)
           : auto?.providerProbe ? (auto.providerProbe.mode === 'canary' ? PROVIDER_PROBE_STRATEGY : PROVIDER_PROBE_RESUME_STRATEGY)
           : auto?.ambiguousAudio ? `ambiguous_audio_resubmit:${autoMeta?.cause ?? 'connection_cut'}` : auto?.safe ? 'safe_auto_retry'
@@ -4170,6 +4231,127 @@ export class RunsService {
     } catch (err) {
       this.logger.warn(`no se pudo registrar attention_reason=${reason} de ${itemRunId}: ${err instanceof Error ? err.message : String(err)}`);
     }
+  }
+
+  /**
+   * r83 (incidente curso 91) — barrido de la reapertura automática ÚNICA de partes de IA en `llm_pending_review` por
+   * resultados desconocidos (cortes de red). Ver llm-pending-review-reopen.ts. Por parte: espera de 12 min, sonda de
+   * salud sin costo (una por barrido), reservas desconocidas liquidadas como posible duplicado (siguen contando como
+   * gasto), peor caso dentro del presupuesto de la parte + holgura y del saldo del run; después retryItem(auto) bajo lock.
+   * Lo que no califica por presupuesto queda `declined` (attention budget); una sonda mala solo espera al próximo tick.
+   */
+  async autoReopenLlmPendingReview(
+    opts: { policy?: AutoHealPolicy; now?: Date; limit?: number; probe?: () => Promise<LlmHealthProbeResult> } = {},
+  ): Promise<{ candidates: number; reopened: Array<{ runId: string; itemKey: string }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const now = opts.now ?? new Date();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 20));
+    const delay = llmReviewReopenDelaySeconds();
+    const result = { candidates: 0, reopened: [] as Array<{ runId: string; itemKey: string }>, skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
+    const rows: Array<{
+      id: string; job_id: string; item_key: string; type: string; status: string; error: string | null; output_summary: Record<string, any> | null;
+      finished_at: Date; updated_at: Date | null; created_at: Date; course_id: number; owner_id: string; blueprint_number: number;
+    }> = await this.dataSource.query(
+      `select g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.created_at,
+              pj.course_id, pj.owner_id, b.blueprint_number
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+         join public.course_generation_manifests m on m.id = g.manifest_id
+         join public.course_blueprints b on b.id = m.blueprint_id
+        where pj.execution_mode = 'dynamic_generation'
+          and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+          and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview', 'paused')
+          and g.status = 'failed'
+          and g.error like 'llm_pending_review%'
+          and ${latestGenerationPredicate('g')}
+          and g.finished_at > $1::timestamptz - make_interval(secs => $2::int)
+          and g.finished_at <= $1::timestamptz - make_interval(secs => $3::int)
+          and not exists (
+            select 1 from public.production_jobs pj2
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id::text = pj.course_id::text and pj2.id <> pj.id
+               and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+          and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
+          and not (coalesce(g.output_summary, '{}'::jsonb) ? '${LLM_REVIEW_REOPEN_KEY}')
+        order by g.finished_at desc, g.id desc
+        limit $4`,
+      [now.toISOString(), Math.round(Math.min(Math.max(policy.maxAgeHours, 0), AUTO_HEAL_MAX_AGE_HOURS_RANGE.max) * 3600), delay, limit],
+    );
+    result.candidates = rows.length;
+    if (!rows.length) return result;
+    const decline = async (r: { id: string; item_key: string }, reason: string, budget: unknown) => {
+      try {
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${LLM_REVIEW_REOPEN_KEY}',
+                    jsonb_build_object('declined', $2::text, 'declinedAt', $3::text, 'budget', $4::jsonb))
+            where id = $1 and status = 'failed'`,
+          [r.id, reason.slice(0, 100), now.toISOString(), JSON.stringify(budget ?? null)],
+        );
+      } catch (e) {
+        this.logger.warn(`reapertura de IA en revisión: no se pudo registrar el rechazo de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      await this.recordAttention(r.id, /budget|presupuesto/i.test(reason) ? 'budget' : 'duplicate_charge');
+    };
+    let health: LlmHealthProbeResult | null = null;
+    for (const r of rows) {
+      const pre = llmReviewReopenDecision(r, now, { maxAgeHours: policy.maxAgeHours, delaySeconds: delay });
+      if (pre.heal === false) {
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: pre.reason });
+        if (pre.reason === 'over_budget') await decline(r, 'over_budget:pending_review_budget', null);
+        continue;
+      }
+      // Una sonda por barrido (sin costo): ledger + telemetría; sin tráfico, GET /v1/models.
+      health ??= await (opts.probe ? opts.probe() : llmProviderHealthProbe(this.dataSource, { reachable: () => anthropicReachable() }));
+      if (!health.ok) {
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: `provider_unhealthy:${health.reason}` });
+        continue;
+      }
+      const pending = await unknownReservations(this.dataSource, r.id, new Date(r.created_at as any));
+      // Review F5: la evaluación del barrido usa EXACTAMENTE la holgura que tendrá el intento reabierto. El barrido liquida
+      // las reservas desconocidas (posible duplicado) → en el intento nuevo no quedan desconocidas, así que su primera
+      // llamada pasa por guardServerLlmCall SIN holgura de ambigüedad. Por eso: allowanceCalls 0, y nextCost = la llamada
+      // a reenviar (la reserva pendiente más grande; las reservas pendientes YA cuentan en lo gastado de la parte, sumarlas
+      // otra vez las contaría dos veces). Así nunca se gasta la única reapertura en una parte cuya 1.ª llamada se negará.
+      const pendingTotal = pending.reduce((t, u) => t + (Number(u.amount) || 0), 0);
+      const nextCost = pending.reduce((m, u) => Math.max(m, Number(u.amount) || 0), 0);
+      let budget: { fits: boolean; reason: string | null; worstItem?: number; worstRun?: number; allowance?: number } | null = null;
+      if (this.finopsBudget && typeof this.finopsBudget.ambiguousResendBudget === 'function') {
+        try {
+          const b = await this.finopsBudget.ambiguousResendBudget({ runId: r.job_id, itemRunId: r.id, nextCost, authorization: 'any', allowanceCalls: LLM_REOPEN_ALLOWANCE_CALLS });
+          budget = { fits: b.fits, reason: b.reason, worstItem: b.worstItem, worstRun: b.worstRun, allowance: b.allowance };
+        } catch (err) {
+          this.logger.warn(`reapertura de IA en revisión: no se pudo evaluar el presupuesto de ${r.item_key} (${err instanceof Error ? err.message : String(err)}); próximo tick`);
+          result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'budget_unavailable' });
+          continue;
+        }
+      }
+      if (!budget) { result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'budget_unavailable' }); continue; }
+      if (!budget.fits) {
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: `over_budget:${budget.reason ?? '?'}` });
+        await decline(r, `over_budget:${budget.reason ?? '?'}`, budget);
+        continue;
+      }
+      // Reservas desconocidas → cobradas con possible_duplicate (conservador; ya contaban como gasto). Idempotente.
+      const settled = await settleAmbiguousAsPossibleDuplicate(this.recoveryLedger(), pending.map((u) => u.key), {
+        provider: 'anthropic', cause: 'unknown_result', itemRunId: r.id, itemKey: r.item_key, runId: r.job_id,
+      });
+      if (settled.failed.length) {
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'settle_failed' });
+        continue;
+      }
+      try {
+        await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false,
+          { policy, now, llmPendingReview: { health, budget } });
+        result.reopened.push({ runId: r.job_id, itemKey: r.item_key });
+        this.logger.warn(`reapertura de IA en revisión: ${r.item_key} (run ${r.job_id}) — UNA reapertura automática (sonda ${health.reason}; ${pending.length} reserva(s) desconocida(s) USD ${pendingTotal.toFixed(4)} liquidada(s) como posible duplicado)`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        result.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+      }
+    }
+    this.logger.log(`reapertura de IA en revisión: candidatos ${result.candidates}, reabiertas ${result.reopened.length}, omitidas ${result.skipped.length}`);
+    return result;
   }
 
   /**
@@ -6957,6 +7139,8 @@ export class RunsService {
       nextRetryAt: toIso(r.next_retry_at),
       error: r.error ?? null,
       idempotencyKey: r.idempotency_key,
+      // r83: quién la ejecuta (server = workers del backend, incluido el de IA; browser; null = sin reclamar).
+      executor: itemExecutorOf(r),
       outputSummary: progressOutputSummary(r.output_summary),
       ...(delivery ? { delivery } : {}),
       recovery: recoveryViewOf(r),
@@ -6974,10 +7158,28 @@ export class RunsService {
  * (`videoScenes`, hasta ~40 KB por video, la usan solo el claim y el empaquetado) — queda su cantidad.
  */
 export function progressOutputSummary(os: Record<string, any> | null | undefined): Record<string, any> {
-  const o = stripYoutubeSessionSecret(os ?? {});
+  const o = stripLlmCheckpointInline(stripYoutubeSessionSecret(os ?? {}));
   if (!Array.isArray(o.videoScenes)) return o;
   const { videoScenes, ...rest } = o;
   return { ...rest, videoSceneCount: videoScenes.length };
+}
+
+/**
+ * r83 (review F3): los puntos de guardado EN LA BASE (`llmCheckpoints[hash].inline`, hasta ~1,5 MB cada uno: la respuesta
+ * entera de la IA guardada mientras Storage estaba caído) NUNCA salen en un DTO de progreso: solo su existencia y tamaño.
+ * El worker los lee directo de la fila; el navegador no los necesita.
+ */
+export function stripLlmCheckpointInline(os: Record<string, any>): Record<string, any> {
+  const cps = os && typeof os === 'object' ? os.llmCheckpoints : null;
+  if (!cps || typeof cps !== 'object' || Array.isArray(cps)) return os;
+  if (!Object.values(cps).some((e: any) => e && typeof e === 'object' && 'inline' in e)) return os;
+  const out: Record<string, any> = {};
+  for (const [h, e] of Object.entries(cps as Record<string, any>)) {
+    if (!e || typeof e !== 'object' || !('inline' in e)) { out[h] = e; continue; }
+    const { inline, ...rest } = e;
+    out[h] = { ...rest, inlineBytes: typeof inline === 'string' ? Buffer.byteLength(inline, 'utf8') : 0 };
+  }
+  return { ...os, llmCheckpoints: out };
 }
 
 /**
