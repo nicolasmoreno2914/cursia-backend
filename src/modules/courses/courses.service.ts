@@ -5,7 +5,7 @@ import { STRUCTURE_ORIGIN_KEY } from '../course-structure/structure-authority';
 import { BRIEF_KEY, PEDAGOGY_DERIVATION_KEY } from '../course-facts/course-facts';
 import { DOCUMENT_REQUIREMENTS_KEY, REQUIREMENTS_SELECTION_KEY } from '../academic-context/requirements/document-requirements';
 import { REQUIREMENT_EXCEPTIONS_KEY } from '../academic-context/requirements/requirement-authority';
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Course } from './entities/course.entity';
@@ -15,6 +15,7 @@ import { AdminDashboardService } from '../../admin/services/admin-dashboard.serv
 import { assertDynamicCreationAllowed, assertDynamicOwnerAllowed } from '../features/dynamic-features';
 import { readActivityTypeRulesConfig } from '../generation-manifests/manifest-rules-config';
 import { PREBRIEF_METADATA_KEYS } from '../prebrief/prebrief-keys';
+import { attachV2LatestRuns } from './v2-latest-run';
 
 /** LOOP 8.0/8.1: claves de courses.metadata que solo escriben sus servicios. */
 const PROTECTED_METADATA_KEYS = [STRUCTURE_ORIGIN_KEY, BRIEF_KEY, PEDAGOGY_DERIVATION_KEY, DESIGN_PINS_KEY, DESIGN_HOURS_KEY,
@@ -45,6 +46,8 @@ export interface CourseAuthorship {
 
 @Injectable()
 export class CoursesService {
+  private readonly logger = new Logger(CoursesService.name);
+
   constructor(
     @InjectRepository(Course)
     private readonly courseRepo: Repository<Course>,
@@ -117,7 +120,8 @@ export class CoursesService {
         c.metadata = rest as any;
       }
     }
-    return rows;
+    // r85: «Mis cursos» muestra un curso V2 listo/generando/en pausa según su último run (una sola consulta).
+    return attachV2LatestRuns(this.courseRepo, rows, this.logger);
   }
 
   /** EV6 H5P v2: «Repaso» encendido en un curso NUEVO solo con H5P v2 (ver reviewCardsDefaultForNewCourse). */
@@ -217,7 +221,8 @@ export class CoursesService {
         c.metadata = rest as any;
       }
     }
-    return rows;
+    // r85: «Mis cursos» muestra un curso V2 listo/generando/en pausa según su último run (una sola consulta).
+    return attachV2LatestRuns(this.courseRepo, rows, this.logger);
   }
 
   // ── FIND ONE ──────────────────────────────────────────────────────────────
