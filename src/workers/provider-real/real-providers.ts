@@ -100,7 +100,25 @@ import {
   pauseRunForCap,
   reservePaidCalls,
 } from '../finops-worker-hooks';
-import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError } from './provider-clients';
+import { AnthropicClient, GammaClient, OpenAiTtsClient, ProviderCallError, TtsCallResult } from './provider-clients';
+import {
+  AUDIO_SEGMENT_UPLOAD_FAILED,
+  TTS_CHUNK_CUT_EXHAUSTED,
+  TTS_CUT_BREAKER,
+  TTS_PROVIDER_UNHEALTHY,
+  TtsSpool,
+  TtsSpoolMeta,
+  effectiveSegmentChars,
+  isRetryableTtsUncertain,
+  ttsAmbiguityCause,
+  ttsBreakerConfig,
+  ttsFailureEvidence,
+  ttsSegmentBackoffMs,
+  ttsSegmentRetries,
+  ttsSpoolFor,
+} from './tts-resilience';
+import { settleAmbiguousAsPossibleDuplicate } from '../../modules/finops/ambiguous-resend';
+import { isStorageUnavailableError, isStorageUnavailableMessage } from '../../modules/artifacts/storage-resilience';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
 import { DRAIN_HANDBACK_RETRY_SECONDS, DrainSignal, drainHandbackMessage, runPausedHandbackMessage } from '../worker-drain';
 import {
@@ -1345,10 +1363,80 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   const tts = new OpenAiTtsClient(openaiKey, env);
   const segBase = storageBase(item, ownerId, 'dynamic_audio_segment');
   let reused = 0;
+  // ── r83: resiliencia del TTS (incidente #91) ───────────────────────────────
+  // Tamaño de segmento fijado por item (un item con segmentos pagados de antes sigue con 3900: mismas claves, sin repagar).
+  const segChars = effectiveSegmentChars(os, env);
+  if (Number(os.audioSegmentChars) !== segChars) await record(deps, item, { audioSegmentChars: segChars });
+  // Reintento por segmento: solo con el ledger capaz de liquidar «cobrada, posible duplicado» (si no, política r62).
+  const segRecovery = {
+    retries: ttsSegmentRetries(env),
+    breaker: ttsBreakerConfig(env),
+    get enabled() { return this.retries > 0 && !!deps.finops?.reconcileReservationAsCharged; },
+  };
+  const ttsCuts: Array<Record<string, unknown>> = Array.isArray(os.ttsCuts) ? [...os.ttsCuts] : [];
+  let unhealthyHandbacks = Number(os.ttsUnhealthyHandbacks ?? 0) || 0;
+  let spoolReused = 0;
+  let spool: TtsSpool | null = null;
+  try { spool = ttsSpoolFor(env); } catch (err) { deps.logger.warn(`[provider-real] spool TTS no disponible (${err instanceof Error ? err.message : String(err)})`); }
+  const spoolRead = (k: Parameters<TtsSpool['read']>[0]) => { try { return spool ? spool.read(k) : null; } catch { return null; } };
+  const spoolWrite = (m: Parameters<TtsSpool['write']>[0], audio: Buffer): TtsSpoolMeta | null => (spool ? spool.write(m, audio) : null);
+  const spoolMarkSettled = (m: TtsSpoolMeta): TtsSpoolMeta => { try { return spool ? spool.markSettled(m) : { ...m, settled: true }; } catch { return { ...m, settled: true }; } };
+  const spoolRemove = (m: TtsSpoolMeta) => { try { spool?.remove(m); } catch { /* lo limpia el TTL */ } };
+  const spoolCharge = (m: TtsSpoolMeta) => ttsChargeInput({
+    ownerId, itemRunId: item.itemRunId, requestId: m.requestId, audioSeconds: m.rawSeconds, characters: m.chars,
+    model: m.model, generation: item.generation ?? 1, chunk: m.segIndex, itemAttempt: m.attempt,
+  });
+  /**
+   * Resultado DESCONOCIDO de un envío de TTS (corte / stall / timeout / red / 5xx incierto). La reserva se liquida como
+   * cobrada (posible duplicado; append-only, actor system) → ya no hay nada «en el aire»; se deja la evidencia en
+   * output_summary.ttsCuts. Después: breaker (proveedor enfermo → devolución sin consumir intento, acotada), agotado
+   * (→ fallo reintentable clase A, intento reconocido) o reintento con backoff. Si la liquidación falla, la llamada
+   * sigue incierta y va por el camino de siempre (reconciliación).
+   */
+  const onUncertainTts = async (err: unknown, c: { tryN: number; resKey: string; segKey: string; k: number; total: number }): Promise<'retry' | 'stop'> => {
+    const maxTries = 1 + segRecovery.retries;
+    const msg = (err instanceof Error ? err.message : String(err)).slice(0, 400);
+    const where = `chunk ${c.k + 1}/${c.total} (persisted ${c.k})`;
+    const ledger = deps.finops as WorkerLedger & Required<Pick<WorkerLedger, 'reconcileReservationAsCharged'>>;
+    const st = await settleAmbiguousAsPossibleDuplicate({ reconcileReservationAsCharged: ledger.reconcileReservationAsCharged.bind(ledger) }, [c.resKey], {
+      provider: 'openai', cause: ttsAmbiguityCause(err), itemRunId: item.itemRunId, itemKey: item.itemKey, runId: item.runId,
+    });
+    if (st.failed.length) {
+      deps.logger.error(`Item ${item.itemKey}: no se pudo liquidar la reserva ${c.resKey} del envío TTS perdido (${st.failed[0].error})`);
+      await fail(deps, item, `tts_failed: ${where}: ${msg}`, true);
+      return 'stop';
+    }
+    if (tracker) tracker.inFlight = null;
+    TTS_CUT_BREAKER.record();
+    ttsCuts.push({ ...ttsFailureEvidence(err), segKey: c.segKey, chunk: c.k + 1, try: c.tryN, attempt: item.attempt, reservationKey: c.resKey,
+      settledAs: 'charged_possible_duplicate', at: new Date().toISOString() });
+    while (ttsCuts.length > 30) ttsCuts.shift();
+    await record(deps, item, { ttsCuts });
+    deps.logger.warn(`Item ${item.itemKey}: TTS sin audio completo en ${c.segKey} (envío ${c.tryN}/${maxTries}): ${msg} — la reserva queda contada como cobrada (posible duplicado)`);
+    const br = segRecovery.breaker;
+    if (TTS_CUT_BREAKER.tripped(br) && unhealthyHandbacks < br.maxHandbacks) {
+      const n = TTS_CUT_BREAKER.count(br.windowMs);
+      TTS_CUT_BREAKER.reset();
+      unhealthyHandbacks++;
+      await record(deps, item, { ttsUnhealthyHandbacks: unhealthyHandbacks });
+      const hb = `${TTS_PROVIDER_UNHEALTHY}: ${n} envíos de OpenAI TTS sin audio completo en ${Math.round(br.windowMs / 60_000)} min (último en ${where}); `
+        + `el item vuelve a la cola en ${br.retryAfterSeconds} s sin consumir intento (devolución ${unhealthyHandbacks}/${br.maxHandbacks}); los segmentos guardados se reutilizan. Último: ${msg}`;
+      const ok = await deps.scheduler.failItem(item.itemRunId, deps.executorId, hb.slice(0, 1900), true, undefined, { retryAfterSeconds: br.retryAfterSeconds, grantAttempt: true });
+      deps.logger.warn(`Item ${item.itemKey}: ${hb.slice(0, 300)}${ok ? '' : ' (el item ya no era de este worker)'}`);
+      throw new ProviderItemFailed(hb, true);
+    }
+    if (c.tryN >= maxTries) {
+      await fail(deps, item, `${TTS_CHUNK_CUT_EXHAUSTED}: ${where}: ${c.tryN} envíos sin audio completo, cada uno contado como cobrado (posible duplicado) en el ledger; se reintenta el item. Último: ${msg}`, true, { knownOutcome: true });
+    }
+    await sleep(ttsSegmentBackoffMs(env, c.tryN));
+    if (await handBackIfDraining(deps, item, `antes de reenviar el segmento ${c.k + 1}/${c.total} (los anteriores ya están guardados)`)) return 'stop';
+    await heartbeat(deps, item);
+    return 'retry';
+  };
   type Synth = { segs: ReturnType<typeof audiobookSegments>; parts: Buffer[]; manifestSegs: AudiobookManifestSegment[] };
   /** Sintetiza (o reutiliza) todos los segmentos del guion actual. null = el item ya quedó devuelto/fallado. */
   const synthesize = async (): Promise<Synth | null> => {
-    const segs = audiobookSegments(blockTexts());
+    const segs = audiobookSegments(blockTexts(), segChars);
     if (!segs.length) await fail(deps, item, `AUDIO_SCRIPT_EMPTY: ${item.itemKey} no tiene texto para narrar`, false);
     const parts: Buffer[] = [];
     const manifestSegs: AudiobookManifestSegment[] = [];
@@ -1401,6 +1489,9 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       // Liquidación pendiente de la llamada única (base / instructions / speed); las partes de split se liquidan al guardarse.
       let pendingSettle: (() => Promise<void>) | null = null;
       let lastResKey = '';
+      // r83: copia local (spool) del MP3 pagado de este segmento (escrita antes de subir, o reutilizada de un intento previo).
+      let spooledMeta: TtsSpoolMeta | null = null;
+      const dropSpool = () => { if (spooledMeta) { spoolRemove(spooledMeta); spooledMeta = null; } };
       for (let p = 0; p < pieces.length; p++) {
         const piece = pieces[p];
         const pieceSha = sha256(piece);
@@ -1425,45 +1516,78 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
           delete splitParts[seg.key][pk];
           await record(deps, item, { audioSplitParts: splitParts, audiobookDiscardedOps: [...discarded] });
         }
-        // Fix round 1 (I5): el guard reserva el costo de ESTA llamada (no el p90 del capítulo entero).
-        if (!(await guard(deps, item, 'openai', ttsCallEstimate(model, piece.length)))) return null;
-        // Calibración #2: reserva DURABLE antes de llamar (si falla, no se llama a OpenAI). r67: la clave incluye la
-        // estrategia (y la parte): una re-síntesis nunca se confunde con la reserva / el guardado de la anterior.
-        const tag = strat === 'base' ? `seg:${seg.key}` : strat === 'split' ? `seg:${seg.key}:split:p${p}` : `seg:${seg.key}:${strat}`;
-        const resKey = await reservePaidCall(deps.finops, {
-          kind: 'tts', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
-          tag, estimate: { characters: piece.length, model }, sendMarked: true,
-        });
-        lastResKey = resKey;
-        if (tracker) tracker.inFlight = { provider: 'openai', key: resKey };
-        // r62 (E2E M): marca DURABLE de envío justo antes de llamar: si el worker muere entre la reserva y el envío, el
-        // próximo intento ve la reserva sin marca (`sendMarked` sin `paidCallsSent`) y la libera sola (nunca salió).
-        await markPaidCallSent(deps, item, resKey);
-        let res;
-        try {
-          res = await tts.speech({
-            model, voice, input: piece,
-            ...(strat === 'instructions' ? { instructions: AUDIO_PACE_INSTRUCTIONS } : {}),
-            ...(strat === 'speed' ? { speed: AUDIO_SPEED_STRATEGY_VALUE } : {}),
-          });
-        } catch (err) {
-          const e = err instanceof ProviderCallError ? err : null;
-          if (isDefinitiveRejection(err)) {
-            await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
-            if (tracker) tracker.inFlight = null;
+        // r83: un segmento YA PAGADO de un intento anterior quedó en el spool local (p. ej. el Storage falló al subirlo)
+        // → se reutiliza ese audio, sin volver a llamar a OpenAI (nunca se repaga).
+        if (strat !== 'split') {
+          const sp = spoolRead({ itemRunId: item.itemRunId, segKey: seg.key, textSha: seg.textSha, strategy: strat });
+          if (sp) {
+            if (!sp.meta.settled) {
+              await settlePaidCall(deps.finops, sp.meta.reservationKey, spoolCharge(sp.meta), 'openai_tts_measured_from_spool');
+              spoolMarkSettled(sp.meta);
+            }
+            deps.logger.warn(`Item ${item.itemKey}: el segmento ${seg.key} ya pagado se toma del spool local (sin volver a llamar a OpenAI)`);
+            spooledMeta = sp.meta;
+            spoolReused++;
+            reused++; // no se re-sintetiza (igual que un segmento reutilizado del Storage)
+            if (sp.meta.requestId) requestIds.push(sp.meta.requestId);
+            rawSecondsTotal = rawSecondsTotal === null || sp.meta.rawSeconds == null ? null : rawSecondsTotal + sp.meta.rawSeconds;
+            rawParts.push(sp.audio);
+            continue;
           }
-          const knownHttp = isKnownTransientHttpError(err);
-          if (knownHttp) {
-            // r62 (K2): respuesta de error del proveedor = sin cobro → se libera la reserva y se reintenta (clase A).
-            await settlePaidCall(deps.finops, resKey, null, 'openai_tts_http_error_not_charged');
-            if (tracker) tracker.inFlight = null;
-          }
-          // «persisted k»: los k segmentos anteriores ya están guardados → ningún trozo pagado sin guardar (clase A).
-          // r67: las partes previas de un split también quedaron guardadas (audioSplitParts).
-          await fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, knownHttp ? true : e ? e.retryable : true,
-            knownHttp ? { knownOutcome: true } : {});
-          return null;
         }
+        const baseTag = strat === 'base' ? `seg:${seg.key}` : strat === 'split' ? `seg:${seg.key}:split:p${p}` : `seg:${seg.key}:${strat}`;
+        let res: TtsCallResult | undefined;
+        let resKey = '';
+        // r83: reintento POR SEGMENTO dentro del mismo intento (corte / stall / timeout / red / 5xx incierto). Cada envío
+        // tiene su propia reserva (`:tN`); antes de reenviar, la reserva del envío perdido se liquida como cobrada (posible
+        // duplicado, append-only) y el guard vuelve a decidir con eso contado (presupuesto de recuperación de la parte).
+        for (let tryN = 1; ; tryN++) {
+          // Fix round 1 (I5): el guard reserva el costo de ESTA llamada (no el p90 del capítulo entero).
+          if (!(await guard(deps, item, 'openai', ttsCallEstimate(model, piece.length)))) return null;
+          // Calibración #2: reserva DURABLE antes de llamar (si falla, no se llama a OpenAI). r67: la clave incluye la
+          // estrategia (y la parte): una re-síntesis nunca se confunde con la reserva / el guardado de la anterior.
+          const tag = tryN === 1 ? baseTag : `${baseTag}:t${tryN}`;
+          resKey = await reservePaidCall(deps.finops, {
+            kind: 'tts', ownerId, itemRunId: item.itemRunId, generation: item.generation ?? 1, itemAttempt: item.attempt,
+            tag, estimate: { characters: piece.length, model }, sendMarked: true,
+          });
+          lastResKey = resKey;
+          if (tracker) tracker.inFlight = { provider: 'openai', key: resKey };
+          // r62 (E2E M): marca DURABLE de envío justo antes de llamar: si el worker muere entre la reserva y el envío, el
+          // próximo intento ve la reserva sin marca (`sendMarked` sin `paidCallsSent`) y la libera sola (nunca salió).
+          await markPaidCallSent(deps, item, resKey);
+          try {
+            res = await tts.speech({
+              model, voice, input: piece,
+              ...(strat === 'instructions' ? { instructions: AUDIO_PACE_INSTRUCTIONS } : {}),
+              ...(strat === 'speed' ? { speed: AUDIO_SPEED_STRATEGY_VALUE } : {}),
+            });
+            break;
+          } catch (err) {
+            const e = err instanceof ProviderCallError ? err : null;
+            if (isDefinitiveRejection(err)) {
+              await settlePaidCall(deps.finops, resKey, null, 'openai_tts_rejected_definitively');
+              if (tracker) tracker.inFlight = null;
+            }
+            const knownHttp = isKnownTransientHttpError(err);
+            if (knownHttp) {
+              // r62 (K2): respuesta de error del proveedor = sin cobro → se libera la reserva y se reintenta (clase A).
+              await settlePaidCall(deps.finops, resKey, null, 'openai_tts_http_error_not_charged');
+              if (tracker) tracker.inFlight = null;
+            }
+            if (!knownHttp && segRecovery.enabled && isRetryableTtsUncertain(err)) {
+              const next = await onUncertainTts(err, { tryN, resKey, segKey: seg.key, k, total: segs.length });
+              if (next === 'retry') continue;
+              return null;
+            }
+            // «persisted k»: los k segmentos anteriores ya están guardados → ningún trozo pagado sin guardar (clase A).
+            // r67: las partes previas de un split también quedaron guardadas (audioSplitParts).
+            await fail(deps, item, `tts_failed: chunk ${k + 1}/${segs.length} (persisted ${k}): ${err instanceof Error ? err.message : String(err)}`, knownHttp ? true : e ? e.retryable : true,
+              knownHttp ? { knownOutcome: true } : {});
+            return null;
+          }
+        }
+        if (!res) return null;
         if (tracker && tracker.inFlight) tracker.inFlight.opId = res.requestId;
         let pieceSeconds: number | null = null;
         try { pieceSeconds = mp3DurationSeconds(res.audio); } catch { pieceSeconds = null; }
@@ -1497,7 +1621,27 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
           if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; }
           try { await settleThis(); } finally { if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; } }
         } else {
-          pendingSettle = settleThis;
+          // r83: el MP3 pagado se escribe al spool local ANTES de subirlo y el cargo se liquida (medido) en ese momento:
+          // si después falla el Storage, el ledger ya es exacto y el próximo intento re-sube desde el spool sin repagar.
+          let written: TtsSpoolMeta | null = null;
+          try {
+            written = spoolWrite({ itemRunId: item.itemRunId, segKey: seg.key, textSha: seg.textSha, strategy: strat, requestId: r.requestId, reservationKey: resKey,
+              rawSeconds: pieceSeconds, chars: piece.length, model, segIndex: k, attempt: item.attempt, settled: false }, r.audio);
+          } catch (err) {
+            deps.logger.warn(`Item ${item.itemKey}: no se pudo escribir el spool local de ${seg.key} (${err instanceof Error ? err.message : String(err)}); se sigue sin spool`);
+          }
+          if (written) {
+            // El resultado pagado ya está a salvo en disco (con su reserva y su medición en el meta): nada queda «en el
+            // aire». Si la liquidación falla ahora (p. ej. pooler lleno), es un transitorio (unexpected_error, sin tocar
+            // el reenvío único) y el próximo claim liquida desde el spool (priorPaidBlock) y lo reutiliza sin repagar.
+            if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; }
+            await settleThis();
+            spooledMeta = spoolMarkSettled(written);
+            // Resultado pagado guardado (en disco local): ya no queda nada «en el aire» para este segmento.
+            if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; }
+          } else {
+            pendingSettle = settleThis;
+          }
         }
       }
       const settleSeg = async () => { if (pendingSettle) { const f = pendingSettle; pendingSettle = null; await f(); } };
@@ -1517,6 +1661,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
         info = mp3FrameInfo(buf);
       } catch (err) {
         await settleSeg();
+        dropSpool();
         await fail(deps, item, `TTS_AUDIO_INVALID: el segmento ${seg.key} no es un MP3 válido tras el transcode (${err instanceof Error ? err.message : String(err)})`, true, { knownOutcome: true });
         return null;
       }
@@ -1588,6 +1733,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
           // liquidado sin registro → priorPaidBlock lo trata como resultado perdido (reconciliación / reenvío único),
           // nunca una reserva SIN liquidar disfrazada de «guardada».
           await settleSeg();
+          dropSpool();
           await record(deps, item, { audioRetryStrategy: retryState, audioQuarantine: quarantine });
           // El original pagado quedó en cuarentena (resultado conocido y guardado): nada en el aire.
           if (tracker) tracker.unpersistedPaidOutput = null;
@@ -1605,13 +1751,31 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       const dup = Object.entries(segState).find(([key, g]) => key !== seg.key && g.audioSha === audioSha);
       if (dup) {
         await settleSeg();
+        dropSpool();
         await fail(deps, item, `AUDIOBOOK_SEGMENT_DUPLICATE: el audio del segmento ${seg.key} es idéntico al de ${dup[0]}`, true, { knownOutcome: true });
         return null;
       }
       if (!deps.artifacts.putStorageObject) throw new Error('dynamic-provider-worker: artifacts sin putStorageObject (modo real)');
       // Ruta por intento: nunca choca con un objeto de un intento anterior del mismo segmento.
       const storagePath = `${segBase}/${seg.key}.a${item.attempt}.mp3`;
-      await deps.artifacts.putStorageObject({ ownerId, storagePath, buffer: buf, mimeType: 'audio/mpeg', upsert: false });
+      try {
+        await deps.artifacts.putStorageObject({ ownerId, storagePath, buffer: buf, mimeType: 'audio/mpeg', upsert: false });
+      } catch (err) {
+        // r83: sin spool, como siempre (el global lo trata según lo que quede en el aire). Con spool, el audio pagado está
+        // a salvo y su cargo liquidado: fallo de Storage reintentable (clase A), el próximo intento re-sube sin repagar.
+        if (!spooledMeta) throw err;
+        // Review F2: SOLO una caída real de Storage (StorageUnavailableError: 5xx/429/408/red/timeout agotados) lleva el
+        // contrato de la espera gratuita (`unexpected_error: storage_unavailable: …`). Un 4xx determinista (413, 400,
+        // 401/403, 409) es `audio_segment_upload_failed: …` → su propia regla (A, consume intento): nunca se esconde tras
+        // esperas gratis. En ambos casos el cargo ya quedó liquidado y el MP3 en el spool → nada incierto.
+        const em = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').slice(0, 300);
+        const tail = `${seg.key} (segmento ${k + 1}/${segs.length}, guardados ${k}): el audio ya pagado quedó en el spool local del worker y el próximo intento lo re-sube sin volver a llamar a OpenAI`;
+        if (isStorageUnavailableError(err) || isStorageUnavailableMessage(em)) {
+          await fail(deps, item, `unexpected_error: ${em} — ${AUDIO_SEGMENT_UPLOAD_FAILED} ${tail}`, true, { knownOutcome: true });
+        } else {
+          await fail(deps, item, `${AUDIO_SEGMENT_UPLOAD_FAILED}: ${tail}. Storage: ${em.replace(/storage_unavailable:?\s*/g, '')}`, true, { knownOutcome: true });
+        }
+      }
       const requestId = requestIds[requestIds.length - 1] ?? null;
       segState[seg.key] = {
         sectionIdx: seg.sectionIdx, partIdx: seg.partIdx, textSha: seg.textSha, audioSha, frames: info.frames, seconds: info.seconds,
@@ -1626,6 +1790,8 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
         audioSegments: segState,
         ...(correction ? { audioCorrections: corrections, audioQuarantine: quarantine } : {}),
       });
+      // r83: guardado en Storage + summary → el spool local de este segmento ya no hace falta.
+      dropSpool();
       // r62 (review lost_result M4): guardado → nada en el aire. Si la liquidación falla, es un transitorio: el próximo
       // claim liquida el segmento guardado con su medición (priorPaidBlock) sin gastar el único reenvío ambiguo.
       if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; }
@@ -1777,6 +1943,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     summary: {
       mode: 'real', provider: 'openai', model, voice, durationSeconds: audio.seconds, chunks: segs.length, scriptSha256: sha256(fullScript),
       words: scriptWords, messageIds, scriptModel, reusedSegments: reused, audiobookManifest: manifest,
+      ...(spoolReused ? { spoolReusedSegments: spoolReused } : {}),
       ...(audio.bitrateKbps !== AUDIOBOOK_TARGET_BITRATE_KBPS ? { bitrateWarning: `audiolibro a ${audio.bitrateKbps ?? 'VBR'} kbps (esperado ${AUDIOBOOK_TARGET_BITRATE_KBPS})` } : {}),
     },
   });
@@ -1915,6 +2082,13 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
   // r19: bloques del guion y segmentos de TTS guardados = su operación pagada ya tiene resultado persistido
   // (se reutiliza, nunca se repaga); solo una operación SIN resultado guardado bloquea.
   const persisted = item.type === 'audiobook_chapter' ? persistedAudiobookOps(os) : new Set<string>();
+  // r83: MP3 pagados en el spool local (Storage caído o el worker murió antes de subirlos): su resultado EXISTE en disco
+  // → no bloquean (el intento los re-sube sin repagar) y, si su reserva quedó abierta, se liquida acá con su medición.
+  let spooled: TtsSpoolMeta[] = [];
+  if (item.type === 'audiobook_chapter') {
+    try { spooled = ttsSpoolFor(envOf(deps)).list(item.itemRunId); } catch { spooled = []; }
+    for (const m of spooled) if (m.requestId) persisted.add(m.requestId);
+  }
   // r62 (E2E M): un segmento GUARDADO cuya reserva quedó pendiente (kill entre guardar y liquidar) se liquida acá con su
   // cargo medido (idempotente por x-request-id): su resultado existe, no hay nada ambiguo ni que repagar.
   if (item.type === 'audiobook_chapter' && deps.finops.itemPaidCharges) {
@@ -1922,8 +2096,17 @@ async function priorPaidBlock(deps: RealProviderDeps, item: ClaimedItem, ownerId
     const splitSaved = Object.values((os.audioSplitParts ?? {}) as Record<string, Record<string, PersistedSplitPart>>).flatMap((m) => Object.values(m ?? {}));
     const segs = [...Object.values((os.audioSegments ?? {}) as Record<string, PersistedSegment>), ...(splitSaved as unknown as PersistedSegment[])]
       .filter((g) => g && typeof g.reservationKey === 'string' && g.requestId);
-    if (segs.length) {
+    if (segs.length || spooled.length) {
       const open = new Set((await deps.finops.itemPaidCharges(item.itemRunId)).filter((r) => r.reservation && !r.settled).map((r) => r.idempotency_key));
+      for (const m of spooled) {
+        if (!open.has(m.reservationKey)) continue;
+        await settlePaidCall(deps.finops, m.reservationKey, ttsChargeInput({
+          ownerId, itemRunId: item.itemRunId, requestId: m.requestId, audioSeconds: m.rawSeconds, characters: m.chars,
+          model: m.model, generation: item.generation ?? 1, chunk: m.segIndex, itemAttempt: m.attempt,
+        }), 'openai_tts_measured_from_spool');
+        open.delete(m.reservationKey);
+        try { ttsSpoolFor(envOf(deps)).markSettled(m); } catch { /* el reuso vuelve a liquidar (idempotente) */ }
+      }
       for (const g of segs) {
         if (!open.has(g.reservationKey as string)) continue;
         const att = Number(g.attempt) || Number(/:a(\d+):/.exec(String(g.reservationKey))?.[1] ?? item.attempt);

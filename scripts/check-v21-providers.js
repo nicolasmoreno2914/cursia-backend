@@ -689,7 +689,9 @@ async function dbChecks() {
       const tts0 = fakes.st.tts.length;
       const item = await claimProvider(runId, 'audiobook_chapter');
       assert(item && item.chapterId === C.c2, 'claim C2');
-      await rejectsRe(PW.processProviderItem(workerDeps(), item), /^provider_reconciliation_required/, 'reconciliación');
+      // r83: con OPENAI_TTS_SEGMENT_RETRIES=0 (política r62) el 500 queda incierto → reconciliación. Con el reintento por
+      // segmento activo (default) el 500 se liquida como cobrado y se reintenta: lo cubre scripts/check-r83-tts.js.
+      await rejectsRe(PW.processProviderItem(workerDeps({ env: { ...process.env, OPENAI_TTS_SEGMENT_RETRIES: '0' } }), item), /^provider_reconciliation_required/, 'reconciliación');
       let row = await itemRow(runId, item.itemKey);
       eq(row.status, 'failed', `estado ${row.status} ${row.error}`);
       assert(/tts_failed/.test(row.error) && row.output_summary.audiobookSections && row.output_summary.audiobookSections['0'], 'guion guardado + motivo');
@@ -1596,7 +1598,7 @@ async function dbChecks() {
           if (u === 'https://api.anthropic.com/v1/messages') {
             anth.push({ key: opts.headers['x-api-key'] });
             const id = replayNext ? 'msg_e2e_1' : `msg_e2e_${++msgSeq}`;
-            return new Response(JSON.stringify({ id, type: 'message', role: 'assistant', model: 'claude-haiku-4-5-20251001', stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 3000, output_tokens: 3700, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }), { status: 200, headers: { 'request-id': `req_${id}` } });
+            return new Response(JSON.stringify({ id, type: 'message', role: 'assistant', model: 'claude-sonnet-4-6', stop_reason: 'end_turn', content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 3000, output_tokens: 3700, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }), { status: 200, headers: { 'request-id': `req_${id}` } });
           }
           if (u.startsWith(backend)) return realFetch(url, opts);
           throw new Error('red inesperada en el e2e del proxy: ' + u);
@@ -1612,7 +1614,7 @@ async function dbChecks() {
             const request = new Request('https://staging.orbia.pages.dev/api/proxy', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}`, 'x-user-key': 'sk-personal-NO', 'x-cursia-item-run-id': target.id, 'x-cursia-call-role': 'main', 'x-cursia-attempt': '1', ...extra },
-              body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 8000, messages: [{ role: 'user', content: 'capítulo' }] }),
+              body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 8000, messages: [{ role: 'user', content: 'capítulo' }] }),
             });
             const res = await onRequest({ request, env, waitUntil: (p) => waits.push(p) });
             await Promise.all(waits);
@@ -1626,9 +1628,9 @@ async function dbChecks() {
           eq([e.owner_id, e.course_id, e.blueprint_id, e.manifest_id, e.run_id, e.item_run_id, e.item_key, e.module_id, e.chapter_id],
             [OWNER, R.cid, bp.id, R.manifest.id, R.rid, target.id, `content:${R.c1}`, R.m1, R.c1], 'atribución completa');
           eq([e.provider, e.model_or_product, e.operation, e.billing_account, e.cost_source, e.measurement_status, e.external_operation_id, e.recorded_by],
-            ['anthropic', 'claude-haiku-4-5-20251001', 'llm.content', 'cursia', 'CALCULATED_FROM_USAGE', 'final', 'msg_e2e_1', 'llm-proxy'], 'proveedor / modelo / medición');
+            ['anthropic', 'claude-sonnet-4-6', 'llm.content', 'cursia', 'CALCULATED_FROM_USAGE', 'final', 'msg_e2e_1', 'llm-proxy'], 'proveedor / modelo / medición');
           eq([Number(e.usage.input_tokens), Number(e.usage.output_tokens)], [3000, 3700], 'usage');
-          assert(e.pricing_snapshot && JSON.stringify(e.pricing_snapshot).includes('claude-haiku-4-5') && Number(e.amount) > 0, `snapshot de precio + monto ${e.amount}`);
+          assert(e.pricing_snapshot && JSON.stringify(e.pricing_snapshot).includes('claude-sonnet-4-6') && Number(e.amount) > 0, `snapshot de precio + monto ${e.amount}`);
           eq(anth.map((a) => a.key), ['sk-cursia-staging-e2e'], 'clave de Cursia (x-user-key ignorada)');
           // La MISMA operación re-posteada (reintento del post / reintento del proxy) → sigue siendo 1 evento.
           eq(await callProxy({ 'x-e2e-replay': '1' }), 200, 'replay 200');

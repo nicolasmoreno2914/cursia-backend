@@ -750,16 +750,20 @@ export interface AudiobookSegmentPlan {
  * (fix round 1, I1) van detrás de él con su propia clave `seg-<bloque>-x<n>-<parte>-<sha12>`: los
  * segmentos ya pagados del bloque no cambian de clave y se reutilizan.
  */
-export function audiobookSegments(sections: Array<{ idx: number; text: string; extensions?: string[] }>): AudiobookSegmentPlan[] {
+export function audiobookSegments(
+  sections: Array<{ idx: number; text: string; extensions?: string[] }>,
+  // r83: tope por segmento (por oraciones). El worker pasa el efectivo del item (tts-resilience effectiveSegmentChars).
+  maxChars: number = TTS_MAX_CHARS,
+): AudiobookSegmentPlan[] {
   const out: AudiobookSegmentPlan[] = [];
   const push = (keyBase: string, sectionIdx: number, partIdx: number, text: string) => {
     const textSha = sha256(text);
     out.push({ key: `${keyBase}-${textSha.slice(0, 12)}`, sectionIdx, partIdx, text, textSha, words: wordCount(text), chars: text.length });
   };
   for (const s of [...sections].sort((a, b) => a.idx - b.idx)) {
-    splitForTts(s.text).forEach((text, partIdx) => push(`seg-${s.idx}-${partIdx}`, s.idx, partIdx, text));
+    splitForTts(s.text, maxChars).forEach((text, partIdx) => push(`seg-${s.idx}-${partIdx}`, s.idx, partIdx, text));
     (s.extensions ?? []).forEach((ext, n) => {
-      splitForTts(ext).forEach((text, p) => push(`seg-${s.idx}-x${n}-${p}`, s.idx, 1000 * (n + 1) + p, text));
+      splitForTts(ext, maxChars).forEach((text, p) => push(`seg-${s.idx}-x${n}-${p}`, s.idx, 1000 * (n + 1) + p, text));
     });
   }
   return out;

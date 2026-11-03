@@ -530,10 +530,11 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
       eq(await late('h2', ago(1000)), 0, 'pedido anterior al último descarte → rechazado');
       eq(await late('h3', ago(100)), 1, 'pedido posterior al descarte → aceptado');
       await c.query(`update public.generation_item_runs set output_summary = output_summary || jsonb_build_object('recoveryBudgetResetAt', $2::text) where id = $1`, [id, ago(50)]);
-      eq(await late('h4', ago(80)), 0, 'pedido anterior al reinicio de la ventana → rechazado');
+      // r83: el reinicio del PRESUPUESTO (retry manual) ya no invalida respuestas válidas pagadas: el guardado tardío se acepta.
+      eq(await late('h4', ago(80)), 1, 'r83: pedido anterior al reinicio del presupuesto → aceptado (solo el descarte invalida)');
       await c.query(`update public.generation_item_runs set status = 'completed' where id = $1`, [id]);
       eq(await late('h5', ago(1)), 0, 'parte completada → rechazado');
-      eq(Object.keys(await cps()).sort(), ['h0', 'h1', 'h3', 'hS'], 'índice final');
+      eq(Object.keys(await cps()).sort(), ['h0', 'h1', 'h3', 'h4', 'hS'], 'índice final');
 
       const vid = '33333333-2222-4333-8444-555555555555';
       const mk = ago(2000);
