@@ -691,7 +691,7 @@ async function dbChecks() {
     });
     const claimProvider = (runId, type) => sched.claimNextItem({ executorId: 'r62-provider-worker', types: [type], leaseSeconds: 120, runId });
     const later = (mins) => new Date(Date.now() + mins * 60_000);
-    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400' };
+    const FAST = { ...process.env, PROVIDER_CALL_TIMEOUT_MS: '400', OPENAI_TTS_TIMEOUT_MS: '400', OPENAI_TTS_SEGMENT_RETRIES: '0' };
     const resubOf = (res, rid) => res.resubmitted.filter((x) => x.runId === rid);
     const runSpent = async (rid) => Number((await ds.query(`select coalesce(sum(amount),0)::text t from public.generation_cost_events where run_id = $1`, [rid]))[0].t);
     const paidAuthorized = async (rid) => Number(await budget.runPaidAuthorizedBudget(rid));
@@ -706,7 +706,10 @@ async function dbChecks() {
       fakes.plan.ttsFail = [undefined, 'hang'];
       const item = await claimProvider(R.rid, 'audiobook_chapter');
       assert(item && item.itemKey === key, `claim ${item && item.itemKey}`);
-      const thrown = await PW.processProviderItem(workerDeps({ env: FAST }), item).then(() => null, (e) => e);
+      // r83: el TTS falso (syntheticMp3) devuelve bytes que dependen SOLO de la duración; con segmentos de ~2000 caracteres
+      // de esta fixture (la misma oración repetida) dos segmentos duran lo mismo → audio idéntico → AUDIOBOOK_SEGMENT_DUPLICATE.
+      // Artefacto del fake (un TTS real nunca da el mismo MP3 para textos distintos): K1 fija el corte histórico de 3900.
+      const thrown = await PW.processProviderItem(workerDeps({ env: { ...FAST, AUDIOBOOK_TTS_SEGMENT_CHARS: '3900' } }), item).then(() => null, (e) => e);
       fakes.plan.ttsFail = [];
       let row = await itemRow(R.rid, key);
       assert(thrown && /^provider_reconciliation_required: openai/.test(thrown.message), `timeout → reconciliación (${row.status}: ${row.error}; tts ${JSON.stringify(fakes.st.tts.slice(tts0))})`);
