@@ -1,3 +1,4 @@
+import '../common/net-family'; // r84: IPv4 primero (antes de abrir cualquier conexión)
 /**
  * Brand Extraction Worker
  *

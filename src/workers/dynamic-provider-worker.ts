@@ -1,3 +1,4 @@
+import '../common/net-family'; // r84: IPv4 primero (antes de abrir cualquier conexión)
 import 'reflect-metadata';
 import type { AudioTools } from '../tts/audio-retime';
 import { llmWorkerEnabled } from '../modules/dynamic-generation/llm-worker-routing';
