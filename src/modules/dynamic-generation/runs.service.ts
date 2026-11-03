@@ -207,7 +207,8 @@ import {
   autoBudgetExtensionOf, budgetScopeOf, isItemBudgetExhausted, itemFailureVerdict, nextOwnerRetries, ownerRetriesUsed, ownerRetryVerdict,
 } from './owner-retry';
 import { unknownReservations } from '../../workers/llm-executor/server-llm';
-import { AMBIGUOUS_RESEND_ALLOWANCE_CALLS } from '../finops/run-spend-guard';
+/** Review F5: la reapertura automática no lleva holgura de ambigüedad (el intento reabierto tampoco la tiene). */
+export const LLM_REOPEN_ALLOWANCE_CALLS = 0;
 import {
   anthropicReachable, LLM_REVIEW_REOPEN_KEY, LLM_REVIEW_REOPEN_MAX_ROUNDS, LLM_REVIEW_REOPEN_STRATEGY, LlmHealthProbeResult, llmProviderHealthProbe,
   llmReviewReopenDecision, llmReviewReopenDelaySeconds,
@@ -4306,11 +4307,17 @@ export class RunsService {
         continue;
       }
       const pending = await unknownReservations(this.dataSource, r.id, new Date(r.created_at as any));
-      const nextCost = pending.reduce((t, u) => t + (Number(u.amount) || 0), 0);
+      // Review F5: la evaluación del barrido usa EXACTAMENTE la holgura que tendrá el intento reabierto. El barrido liquida
+      // las reservas desconocidas (posible duplicado) → en el intento nuevo no quedan desconocidas, así que su primera
+      // llamada pasa por guardServerLlmCall SIN holgura de ambigüedad. Por eso: allowanceCalls 0, y nextCost = la llamada
+      // a reenviar (la reserva pendiente más grande; las reservas pendientes YA cuentan en lo gastado de la parte, sumarlas
+      // otra vez las contaría dos veces). Así nunca se gasta la única reapertura en una parte cuya 1.ª llamada se negará.
+      const pendingTotal = pending.reduce((t, u) => t + (Number(u.amount) || 0), 0);
+      const nextCost = pending.reduce((m, u) => Math.max(m, Number(u.amount) || 0), 0);
       let budget: { fits: boolean; reason: string | null; worstItem?: number; worstRun?: number; allowance?: number } | null = null;
       if (this.finopsBudget && typeof this.finopsBudget.ambiguousResendBudget === 'function') {
         try {
-          const b = await this.finopsBudget.ambiguousResendBudget({ runId: r.job_id, itemRunId: r.id, nextCost, authorization: 'any', allowanceCalls: AMBIGUOUS_RESEND_ALLOWANCE_CALLS });
+          const b = await this.finopsBudget.ambiguousResendBudget({ runId: r.job_id, itemRunId: r.id, nextCost, authorization: 'any', allowanceCalls: LLM_REOPEN_ALLOWANCE_CALLS });
           budget = { fits: b.fits, reason: b.reason, worstItem: b.worstItem, worstRun: b.worstRun, allowance: b.allowance };
         } catch (err) {
           this.logger.warn(`reapertura de IA en revisión: no se pudo evaluar el presupuesto de ${r.item_key} (${err instanceof Error ? err.message : String(err)}); próximo tick`);
@@ -4336,7 +4343,7 @@ export class RunsService {
         await this.retryItem(r.course_id, r.owner_id, Number(r.blueprint_number), r.job_id, r.item_key, false, false,
           { policy, now, llmPendingReview: { health, budget } });
         result.reopened.push({ runId: r.job_id, itemKey: r.item_key });
-        this.logger.warn(`reapertura de IA en revisión: ${r.item_key} (run ${r.job_id}) — UNA reapertura automática (sonda ${health.reason}; ${pending.length} reserva(s) desconocida(s) USD ${nextCost.toFixed(4)} liquidada(s) como posible duplicado)`);
+        this.logger.warn(`reapertura de IA en revisión: ${r.item_key} (run ${r.job_id}) — UNA reapertura automática (sonda ${health.reason}; ${pending.length} reserva(s) desconocida(s) USD ${pendingTotal.toFixed(4)} liquidada(s) como posible duplicado)`);
       } catch (err) {
         const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
         const code = String((resp && typeof resp === 'object' && ((resp as any).reason || (resp as any).code)) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
@@ -7151,10 +7158,28 @@ export class RunsService {
  * (`videoScenes`, hasta ~40 KB por video, la usan solo el claim y el empaquetado) — queda su cantidad.
  */
 export function progressOutputSummary(os: Record<string, any> | null | undefined): Record<string, any> {
-  const o = stripYoutubeSessionSecret(os ?? {});
+  const o = stripLlmCheckpointInline(stripYoutubeSessionSecret(os ?? {}));
   if (!Array.isArray(o.videoScenes)) return o;
   const { videoScenes, ...rest } = o;
   return { ...rest, videoSceneCount: videoScenes.length };
+}
+
+/**
+ * r83 (review F3): los puntos de guardado EN LA BASE (`llmCheckpoints[hash].inline`, hasta ~1,5 MB cada uno: la respuesta
+ * entera de la IA guardada mientras Storage estaba caído) NUNCA salen en un DTO de progreso: solo su existencia y tamaño.
+ * El worker los lee directo de la fila; el navegador no los necesita.
+ */
+export function stripLlmCheckpointInline(os: Record<string, any>): Record<string, any> {
+  const cps = os && typeof os === 'object' ? os.llmCheckpoints : null;
+  if (!cps || typeof cps !== 'object' || Array.isArray(cps)) return os;
+  if (!Object.values(cps).some((e: any) => e && typeof e === 'object' && 'inline' in e)) return os;
+  const out: Record<string, any> = {};
+  for (const [h, e] of Object.entries(cps as Record<string, any>)) {
+    if (!e || typeof e !== 'object' || !('inline' in e)) { out[h] = e; continue; }
+    const { inline, ...rest } = e;
+    out[h] = { ...rest, inlineBytes: typeof inline === 'string' ? Buffer.byteLength(inline, 'utf8') : 0 };
+  }
+  return { ...os, llmCheckpoints: out };
 }
 
 /**

@@ -518,6 +518,11 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'videoScenes', 'videoScenesUnavailable', 'videoTimelinePinned',
   // r83: racha de esperas sin costo por Storage caído (la escribe solo failItem del servidor).
   'storageOutage',
+  // r83 (review F6): claves del servidor que deciden dinero o reintentos — reinicio de los límites de desconocidos y
+  // reapertura única de la IA en revisión, telemetría de transporte (breaker de la IA), devoluciones/cortes del TTS,
+  // tamaño de segmento del audiolibro y reuso del spool; y la marca durable de envío (r62) de la IA.
+  'llmUnknownResetAt', 'llmPendingReviewReopen', 'llmTransportEvents', 'llmSent',
+  'ttsUnhealthyHandbacks', 'ttsCuts', 'audioSegmentChars', 'spoolReusedSegments',
 ]);
 
 /** r58 (I4-3): archivos de trabajo de UN capítulo en un perfil de evaluación (los del claim de la Actividad de Aplicación). */
@@ -1305,6 +1310,8 @@ export class SchedulerService {
     const msg = String(error ?? '').trim().slice(0, MAX_ERROR_LENGTH) || 'unknown_error';
     // r83: Supabase Storage caído (StorageUnavailableError de un worker del SERVIDOR; el navegador no puede pedirlo) →
     // espera de infraestructura: vuelve a `retrying` sin consumir intento, hasta la próxima sonda del breaker.
+    // Review F1: SOLO con el breaker alcanzable (tabla infra_health presente y legible). Sin la tabla (producción, migración
+    // EXCLUDED) o con error de DB, `storageBreakerNextProbe` devuelve null → falla normal, exactamente como antes de r83.
     const storageWait = (ownerId === undefined || ownerId === null) && !!retryable && isStorageUnavailableMessage(msg)
       ? await storageBreakerNextProbe(this.dataSource as any)
       : null;

@@ -350,9 +350,14 @@ export async function storageClaimGate(
   }
 }
 
-/** Próxima sonda si el breaker está abierto (para el retryAfter de un item); null si cerrado / sin tabla. Nunca lanza. */
-export async function storageBreakerNextProbe(db: Queryable | null, nowMs: number = Date.now()): Promise<{ open: boolean; nextProbeAt: Date | null }> {
-  if (!db || schemaMissing(nowMs)) return { open: false, nextProbeAt: null };
+/**
+ * Próxima sonda si el breaker está abierto (para el retryAfter de un item). `{open:false}` = breaker ALCANZABLE y
+ * cerrado. r83 (review F1): `null` = breaker NO disponible (sin DB, tabla/columna ausente — migración no aplicada, p. ej.
+ * producción — o error de DB): quien llama lo trata como «sin breaker» y se comporta exactamente como antes de r83 (sin
+ * esperas gratis por Storage). Nunca lanza.
+ */
+export async function storageBreakerNextProbe(db: Queryable | null, nowMs: number = Date.now()): Promise<{ open: boolean; nextProbeAt: Date | null } | null> {
+  if (!db || schemaMissing(nowMs)) return null;
   try {
     const row = await readStorageBreaker(db);
     if (!row || row.state !== 'open') return { open: false, nextProbeAt: null };
@@ -360,7 +365,7 @@ export async function storageBreakerNextProbe(db: Queryable | null, nowMs: numbe
     return { open: true, nextProbeAt: t !== null ? new Date(t) : null };
   } catch (err) {
     noteSchemaError(err, nowMs);
-    return { open: false, nextProbeAt: null };
+    return null;
   }
 }
 

@@ -118,6 +118,7 @@ import {
   ttsSpoolFor,
 } from './tts-resilience';
 import { settleAmbiguousAsPossibleDuplicate } from '../../modules/finops/ambiguous-resend';
+import { isStorageUnavailableError, isStorageUnavailableMessage } from '../../modules/artifacts/storage-resilience';
 import { CoverError, CoverRasterizer, GAMMA_COVER_RASTERIZER_UNAVAILABLE, pdftoppmRasterizer } from './pdf-cover';
 import { DRAIN_HANDBACK_RETRY_SECONDS, DrainSignal, drainHandbackMessage, runPausedHandbackMessage } from '../worker-drain';
 import {
@@ -1763,10 +1764,17 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
         // r83: sin spool, como siempre (el global lo trata según lo que quede en el aire). Con spool, el audio pagado está
         // a salvo y su cargo liquidado: fallo de Storage reintentable (clase A), el próximo intento re-sube sin repagar.
         if (!spooledMeta) throw err;
-        // Texto: `unexpected_error: storage_unavailable: …` (contrato de la espera gratuita del Storage, r83-storage) con
-        // el detalle del segmento; el cargo ya quedó liquidado y el MP3 en el spool → nada incierto.
-        const em = (err instanceof Error ? err.message : String(err)).slice(0, 300);
-        await fail(deps, item, `unexpected_error: ${/storage_unavailable/.test(em) ? em : `storage_unavailable: ${em}`} — ${AUDIO_SEGMENT_UPLOAD_FAILED} ${seg.key} (segmento ${k + 1}/${segs.length}, guardados ${k}): el audio ya pagado quedó en el spool local del worker y el próximo intento lo re-sube sin volver a llamar a OpenAI`, true, { knownOutcome: true });
+        // Review F2: SOLO una caída real de Storage (StorageUnavailableError: 5xx/429/408/red/timeout agotados) lleva el
+        // contrato de la espera gratuita (`unexpected_error: storage_unavailable: …`). Un 4xx determinista (413, 400,
+        // 401/403, 409) es `audio_segment_upload_failed: …` → su propia regla (A, consume intento): nunca se esconde tras
+        // esperas gratis. En ambos casos el cargo ya quedó liquidado y el MP3 en el spool → nada incierto.
+        const em = (err instanceof Error ? err.message : String(err)).replace(/\s+/g, ' ').slice(0, 300);
+        const tail = `${seg.key} (segmento ${k + 1}/${segs.length}, guardados ${k}): el audio ya pagado quedó en el spool local del worker y el próximo intento lo re-sube sin volver a llamar a OpenAI`;
+        if (isStorageUnavailableError(err) || isStorageUnavailableMessage(em)) {
+          await fail(deps, item, `unexpected_error: ${em} — ${AUDIO_SEGMENT_UPLOAD_FAILED} ${tail}`, true, { knownOutcome: true });
+        } else {
+          await fail(deps, item, `${AUDIO_SEGMENT_UPLOAD_FAILED}: ${tail}. Storage: ${em.replace(/storage_unavailable:?\s*/g, '')}`, true, { knownOutcome: true });
+        }
       }
       const requestId = requestIds[requestIds.length - 1] ?? null;
       segState[seg.key] = {

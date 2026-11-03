@@ -90,6 +90,17 @@ export function llmTcpKeepAliveMs(env: Record<string, string | undefined> = proc
   return Number.isFinite(v) && v >= 5_000 && v <= 120_000 ? Math.floor(v) : 15_000;
 }
 
+/**
+ * Review F7: transporte HTTP del stream del worker de IA. `DYNAMIC_LLM_WORKER_HTTP_TRANSPORT` = `node` (por defecto, r83:
+ * http/https de Node con keepalive TCP) | `fetch` (kill switch: el fetch global de undici, como antes de r83). Cualquier
+ * otro valor = `node`. Se lee en cada llamada (un cambio de entorno + reload de pm2 basta, sin deploy).
+ */
+export type LlmHttpTransport = 'node' | 'fetch';
+export const LLM_HTTP_TRANSPORT_ENV = 'DYNAMIC_LLM_WORKER_HTTP_TRANSPORT';
+export function llmStreamTransport(env: Record<string, string | undefined> = process.env): LlmHttpTransport {
+  return String(env[LLM_HTTP_TRANSPORT_ENV] ?? '').trim().toLowerCase() === 'fetch' ? 'fetch' : 'node';
+}
+
 const int = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : 0);
 
 function mergeUsage(acc: LlmUsage, u: any): void {
@@ -112,8 +123,9 @@ export interface StreamMessageRequest {
 
 export async function streamMessage(req: StreamMessageRequest): Promise<LlmStreamResult> {
   // r83: sin `fetchImpl` (producción) el stream también va por http/https de Node con keepalive TCP (antes: fetch
-  // global, sin keepalive configurable).
-  const f = req.fetchImpl ?? nodeHttpStreamFetch;
+  // global, sin keepalive configurable). Review F7: kill switch DYNAMIC_LLM_WORKER_HTTP_TRANSPORT=fetch vuelve al fetch
+  // global de antes de r83 sin deploy (solo el stream: sin streaming ya iba por http de Node antes de r83).
+  const f = req.fetchImpl ?? (llmStreamTransport() === 'fetch' ? globalThis.fetch : nodeHttpStreamFetch);
   const t0 = Date.now();
   let bytes = 0;
   const ctrl = new AbortController();

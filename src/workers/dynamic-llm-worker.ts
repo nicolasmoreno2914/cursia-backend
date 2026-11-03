@@ -10,12 +10,13 @@ import { DrainSignal, awaitDrain, drainTimeoutMs, installDrainHandlers, runClaim
 import { ClaimedItem, DEFAULT_LEASE_SECONDS, ItemType, SchedulerService } from '../modules/dynamic-generation/scheduler.service';
 import { V3_PAYLOAD_INVALID } from '../modules/course-shell/v3-validation';
 import { ArtifactsService } from '../modules/artifacts/artifacts.service';
+import { STORAGE_UNAVAILABLE_CODE } from '../modules/artifacts/storage-resilience';
 import { FinopsLedgerService } from '../modules/finops/finops-ledger.service';
 import { FinopsBudgetService } from '../modules/finops/finops-budget.service';
 import { LLM_WORKER_ENABLED_ENV, LLM_WORKER_PRESENCE_BEAT_MS, LLM_WORKER_SINCE_ENV, llmWorkerConcurrency, llmWorkerEnabled, llmWorkerSince, llmWorkerTypes } from '../modules/dynamic-generation/llm-worker-routing';
 import { WorkerLedger } from './finops-worker-hooks';
 import { createExecutorRuntime } from './llm-executor/executor-runtime';
-import { LLM_MARK_SENT_SQL, LLM_PENDING_REVIEW, LLM_PROVIDER_UNHEALTHY, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
+import { failureCausedByResponses, LLM_CHECKPOINT_UNREADABLE, LLM_MARK_SENT_SQL, LLM_PENDING_REVIEW, LLM_PROVIDER_UNHEALTHY, LLM_WORKER_CALL_TAG_PREFIX, ServerLlmDeps, createServerApi, itemWindowStart } from './llm-executor/server-llm';
 import type { CallRole } from '../modules/finops/finops-ledger.service';
 import { fencedScheduler, IN_FLIGHT_MARGIN_MS, PRIOR_CALL_IN_FLIGHT, PROCESS_ITEM_FENCE, priorAttemptMayBeInFlight } from './lease-takeover';
 
@@ -208,6 +209,17 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
         await fail(msg, true, { grantAttempt: true, retryAfterSeconds: Math.max(15, Number(e.retryAfterSeconds) || 60) });
         return 'handed_back';
       }
+      if (e && e.handBack === STORAGE_UNAVAILABLE_CODE) {
+        // Review P1-1: el punto de guardado existe pero Storage no responde → espera de Storage, SIN llamada pagada. El
+        // mensaje lleva `storage_unavailable:` → failItemDetailed decide la espera sin costo (solo con el breaker disponible).
+        await fail(msg, true, { retryAfterSeconds: Math.max(30, Number(e.retryAfterSeconds) || 60) });
+        return 'handed_back';
+      }
+      if (e && e.code === LLM_CHECKPOINT_UNREADABLE) {
+        // Review P1-1: guardado ilegible por otra causa (permisos/configuración) → falla reintentable, sin re-pagar.
+        await fail(msg, true);
+        return 'failed';
+      }
       if (e && e.handBack === 'worker_draining') {
         // Deploy: la parte vuelve a la cola (sin consumir intento) y otro worker sigue desde sus puntos de guardado.
         await fail(msg, true, { grantAttempt: true, retryAfterSeconds: 1 });
@@ -233,6 +245,14 @@ async function processLlmItemFenced(deps: LlmWorkerDeps, item: ClaimedItem, isCu
       if (m.runPaused) {
         await fail(msg.startsWith('run_paused') ? msg : 'run_paused: ' + msg, true, { grantAttempt: true, retryAfterSeconds: 5 });
         return 'handed_back';
+      }
+      // Review F4: la falla la causaron respuestas REPETIDAS desde los puntos de guardado (p. ej. la validación del
+      // contenido guardado) → se descartan, para que el próximo intento (automático o el reintento manual del dueño)
+      // genere de nuevo y no repita la misma falla en bucle. Una falla de transporte/proveedor/infraestructura los
+      // conserva: el reintento no vuelve a pagar lo ya generado y válido.
+      if (api.replayedFromCheckpoint() > 0 && failureCausedByResponses(e)) {
+        deps.logger.warn(`Item ${item.itemKey}: la falla vino de respuestas repetidas desde el punto de guardado — se descartan para el reintento`);
+        await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, { llmCheckpoints: {}, llmCheckpointsResetAt: new Date().toISOString() }).catch(() => false);
       }
       await fail(m.msg, m.retryable);
       return 'failed';

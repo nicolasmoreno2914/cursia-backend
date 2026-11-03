@@ -100,11 +100,11 @@ export function llmReviewReopenDecision(
 type Q = { query: (sql: string, params?: any[]) => Promise<any> };
 
 /**
- * Sonda de salud SIN costo. 1) cortes/desconocidos recientes (telemetría `llmTransportEvents` de las partes, reloj DB)
+ * Sonda de salud SIN costo (review F8: la señal preferida es el LEDGER; el GET es solo el último recurso). 1) cortes/desconocidos recientes (telemetría `llmTransportEvents` de las partes, reloj DB)
  * → no sano; 2) una llamada medida OK de Anthropic reciente (ledger) → sano; 3) sin tráfico: `reachable()` (GET
  * `/v1/models`, no genera) si está disponible. Ante un error de lectura: no sano (se reintenta en el próximo tick).
  */
-export async function llmProviderHealthProbe(q: Q, opts: { reachable?: (() => Promise<boolean>) | null; quietSeconds?: number; successSeconds?: number } = {}): Promise<LlmHealthProbeResult> {
+export async function llmProviderHealthProbe(q: Q, opts: { reachable?: (() => Promise<boolean | null>) | null; quietSeconds?: number; successSeconds?: number } = {}): Promise<LlmHealthProbeResult> {
   let recentFailures = 0;
   let recentSuccesses = 0;
   try {
@@ -128,18 +128,25 @@ export async function llmProviderHealthProbe(q: Q, opts: { reachable?: (() => Pr
   if (recentFailures > 0) return { ok: false, reason: 'recent_failures', recentFailures, recentSuccesses };
   if (recentSuccesses > 0) return { ok: true, reason: 'recent_success', recentFailures, recentSuccesses };
   if (!opts.reachable) return { ok: false, reason: 'no_evidence', recentFailures, recentSuccesses };
-  let reach = false;
+  let reach: boolean | null = false;
   try { reach = await opts.reachable(); } catch { reach = false; }
+  // Review F8: sin clave en este proceso → sin evidencia (no «inalcanzable»): se espera tráfico medido del ledger.
+  if (reach === null) return { ok: false, reason: 'no_evidence', recentFailures, recentSuccesses };
   return { ok: reach, reason: reach ? 'reachable' : 'unreachable', recentFailures, recentSuccesses };
 }
 
 /**
  * GET `${baseUrl}/v1/models?limit=1` (listado de modelos: no genera texto ni consume tokens) con timeout corto. true =
- * la ruta hasta Anthropic responde (200). Sin API key → false (sin evidencia).
+ * la ruta hasta Anthropic responde (200).
+ * Review F8: el barrido corre en el proceso de la API (main.ts), que puede NO tener `ANTHROPIC_API_KEY` (solo el worker
+ * de IA la necesita). Sin clave → `null` = «sin evidencia» (nunca `false`/«inalcanzable», nunca un pedido sin clave): la
+ * sonda se queda con la señal del LEDGER (una llamada medida OK reciente de cualquier worker), que es la preferida. En un
+ * VPS sin tráfico y sin clave en la API, la reapertura automática simplemente no ocurre (la parte sigue en revisión
+ * humana, como antes de r83). La clave nunca se registra ni se devuelve.
  */
-export async function anthropicReachable(a: { apiKey?: string | null; baseUrl?: string | null; fetchImpl?: typeof fetch; timeoutMs?: number } = {}): Promise<boolean> {
+export async function anthropicReachable(a: { apiKey?: string | null; baseUrl?: string | null; fetchImpl?: typeof fetch; timeoutMs?: number } = {}): Promise<boolean | null> {
   const key = String(a.apiKey ?? process.env.ANTHROPIC_API_KEY ?? '').trim();
-  if (!key) return false;
+  if (!key) return null;
   const base = String(a.baseUrl ?? process.env.ANTHROPIC_API_BASE_URL ?? 'https://api.anthropic.com').replace(/\/+$/, '');
   const f = a.fetchImpl ?? fetch;
   try {

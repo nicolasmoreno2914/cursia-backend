@@ -38,6 +38,7 @@ const PC = loadDist('workers/provider-real/provider-clients.js');
 const TR = loadDist('workers/provider-real/tts-resilience.js');
 const AUD = loadDist('package/audio/index.js');
 const FC = loadDist('modules/reliability/failure-classifier.js');
+const SRES = loadDist('modules/artifacts/storage-resilience.js');
 const { startProviderFakes } = require(path.join(REPO, 'test/e2e-v2/fakes.js'));
 
 const LOGS = [];
@@ -205,7 +206,10 @@ function memoryWorld() {
     async uploadJsonArtifact(a) { const id = crypto.randomUUID(); artifacts.push({ id, ...a }); return { id }; },
     async uploadBufferArtifact(a) { const id = crypto.randomUUID(); blobs.set(`cursia-artifacts/${a.storagePath}`, a.buffer); artifacts.push({ id, ...a }); return { id }; },
     async putStorageObject(a) {
-      if (inject.uploadFail && inject.uploadFail(a.storagePath)) throw new Error('Supabase Storage upload failed: 504 Gateway Timeout');
+      const uf = inject.uploadFail && inject.uploadFail(a.storagePath);
+      // Real: un 5xx agotado sale como StorageUnavailableError tipado; un 4xx determinista, como Error simple (review F2).
+      if (uf && typeof uf === 'number') throw new Error(`Supabase Storage upload failed: ${uf} Payload too large`);
+      if (uf) throw new SRES.StorageUnavailableError('upload', 504, 6, 98_000);
       const k = `cursia-artifacts/${a.storagePath}`;
       if (blobs.has(k) && a.upsert === false) throw new Error(`Supabase Storage upload failed: 409 Duplicate ${a.storagePath}`);
       blobs.set(k, a.buffer);
@@ -476,6 +480,22 @@ async function workerChecks() {
     eq([OAI.st.calls.length - c1, it.outputSummary.spoolReusedSegments, it.outputSummary.reusedSegments], [segCount(it) - 2, 1, 2], 'el segmento del spool NO se repaga');
     eq(W.ledgerRows.filter((r) => !r.reservation && r.provider === 'openai').length, segCount(it), 'un cargo por segmento (sin duplicados)');
     eq(spoolFiles(it).length, 0, 'spool limpio');
+  });
+
+  await check('W5b (review F2) 4xx DETERMINISTA (413) al subir un segmento ya pagado → audio_segment_upload_failed (consume intento), NUNCA storage_unavailable; MP3 en el spool, sin repagar', async () => {
+    TR.TTS_CUT_BREAKER.reset();
+    const W = memoryWorld();
+    const it = newItem(W, { ch: 15, md });
+    let n = 0;
+    W.inject.uploadFail = (p) => (/dynamic_audio_segment\/idem-.*\/seg-/.test(p) && ++n === 2 ? 413 : false);
+    await claim(W, it);
+    W.inject.uploadFail = null;
+    eq(it.status, 'retrying', `reintentable (${it.error})`);
+    assert(/^audio_segment_upload_failed: /.test(it.error) && /413/.test(it.error) && !/storage_unavailable/.test(it.error), it.error);
+    eq(SRES.isStorageUnavailableMessage(it.error), false, 'no es espera de Storage');
+    const cl = classify(it);
+    eq([cl.class, cl.rule, cl.humanReason], ['A', 'audio_segment_upload_failed', null], 'su propia regla');
+    eq(spoolFiles(it).filter((f) => f.endsWith('.mp3')).length, 1, 'el MP3 pagado está en el spool');
   });
 
   await check('W6 liquidación caída con el MP3 ya en el spool (pooler lleno, #91) → TRANSITORIO reintentable (nunca reconciliación); al reanudar, priorPaidBlock liquida desde el spool y el intento lo reutiliza (0 llamadas para ese segmento)', async () => {

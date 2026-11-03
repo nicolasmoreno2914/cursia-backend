@@ -7,6 +7,7 @@ import { LlmStreamError, LlmStreamResult, nonStreamMessage, streamMessage } from
 import { inFlightRemainingMs, PRIOR_CALL_IN_FLIGHT, priorCallInFlightMessage, retryAfterSecondsFor } from '../lease-takeover';
 import { settleAmbiguousAsPossibleDuplicate } from '../../modules/finops/ambiguous-resend';
 import { usd2 } from '../../modules/finops/usd-display';
+import { isStorageUnavailableError, STORAGE_UNAVAILABLE_CODE } from '../../modules/artifacts/storage-resilience';
 
 /**
  * Loop 4 — `api()` del ejecutor cuando corre en el WORKER del backend (mismo contrato que `api()` de 04-api.js:
@@ -74,6 +75,8 @@ export const LLM_ITEM_NONSTREAM_AFTER_CUTS = 2;
 
 /** r83: código de la devolución de la parte cuando la red/proveedor está inestable (pausa corta, sin consumir intento). */
 export const LLM_PROVIDER_UNHEALTHY = 'llm_provider_unhealthy';
+/** Review P1-1: el punto de guardado existe pero no se pudo leer (nunca se re-paga la llamada). */
+export const LLM_CHECKPOINT_UNREADABLE = 'llm_checkpoint_unreadable';
 /** r83: clave del item con la telemetría de cortes/desconocidos (últimos 20). */
 export const LLM_TRANSPORT_EVENTS_KEY = 'llmTransportEvents';
 export const LLM_TRANSPORT_EVENTS_MAX = 20;
@@ -267,7 +270,7 @@ export interface ServerLlmDeps {
 }
 
 /** Error con la forma que espera el ejecutor (04-api.js). */
-type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean; handBack?: 'lease_lost' | 'worker_draining' | typeof PRIOR_CALL_IN_FLIGHT | typeof LLM_PROVIDER_UNHEALTHY; retryAfterSeconds?: number };
+type ApiError = { fatal: boolean; msg: string; status?: number; code?: string; runPaused?: boolean; itemBudget?: boolean; pendingReview?: boolean; ambiguous?: boolean; handBack?: 'lease_lost' | 'worker_draining' | typeof PRIOR_CALL_IN_FLIGHT | typeof LLM_PROVIDER_UNHEALTHY | typeof STORAGE_UNAVAILABLE_CODE; retryAfterSeconds?: number };
 
 /** HTTP que NO prueba que Anthropic no procesó el pedido (timeout de gateway): se trata como resultado desconocido. */
 const LLM_HTTP_AMBIGUOUS_STATUSES: readonly number[] = [408, 504];
@@ -559,8 +562,30 @@ export function pendingReviewMessage(detail: string): string {
   return `${LLM_PENDING_REVIEW}: resultado ambiguo repetido de la IA (${detail}). Esta parte queda en revisión sin volver a generarse; el resto del curso sigue. Se conservan las reservas para conciliarlas.`;
 }
 
+/**
+ * Review F4: ¿el error lanzado durante la ejecución de la parte viene de las RESPUESTAS (parseo / validación del
+ * contenido) y no del transporte / proveedor / infraestructura? Los errores de `createServerApi` son objetos ApiError
+ * (`fatal` + `msg`) → transporte/proveedor/presupuesto. Un Error de la liquidación del ledger o de red también es
+ * infraestructura. Todo lo demás (JSON inválido, validación del ejecutor) lo causó el contenido.
+ */
+export function failureCausedByResponses(e: unknown): boolean {
+  if (!e) return false;
+  if (typeof e === 'object' && !(e instanceof Error) && 'fatal' in (e as object) && 'msg' in (e as object)) return false;
+  const m = String((e as { message?: unknown; msg?: unknown })?.message ?? (e as { msg?: unknown })?.msg ?? e);
+  if (/no se pudo liquidar|finops|ledger|ECONN|ETIMEDOUT|EPIPE|socket|fetch failed|network|Error de red|terminated|timeout|abort|storage_unavailable|lease_lost|worker_draining|run_paused|budget|presupuesto/i.test(m)) return false;
+  return true;
+}
+
+/** Review P1-1: ¿el error de lectura del guardado es «el objeto no existe»? (Supabase Storage: 400/404 not found). */
+export function checkpointNotFoundError(err: unknown): boolean {
+  const st = Number((err as { status?: unknown; statusCode?: unknown })?.status ?? (err as { statusCode?: unknown })?.statusCode);
+  if (st === 404) return true;
+  return /download failed: (?:400|404)\b|not[ _]found|object not found/i.test(String((err as Error)?.message ?? err));
+}
+
 export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf: (extraHeaders: any) => { callRole: CallRole; attempt: number }) {
   let seq = 0;
+  let replayed = 0;
   // Reservas de ESTE proceso que no son desconocidas: en vuelo (todavía sin resultado) o con respuesta recibida cuya
   // liquidación falló (quedan pendientes en el ledger para conciliar, pero la respuesta sí llegó).
   const notUnknown = new Set<string>();
@@ -599,12 +624,34 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
       if (!cp || !(new Date(cp.at) >= (w.checkpointSince ?? w.since))) return null;
       // r83: guardado EN LA BASE (`inline`) cuando Storage estaba caído al guardarlo → se lee de ahí.
       const inline = (cp as { inline?: unknown }).inline;
-      const raw = typeof inline === 'string' && inline ? inline : await deps.checkpoints.get(cp.path).catch(() => null);
+      // Review P1-1: un guardado que EXISTE pero no se puede leer nunca se trata como «no hay guardado» (re-pagaría la
+      // llamada). Solo un 404 (Supabase Storage responde 400/404 «not found») o un cuerpo ilegible valen «sin guardado».
+      //  - Storage caído (StorageUnavailableError) → la parte vuelve a la cola como espera de Storage (sin llamada pagada;
+      //    sin intento consumido si el breaker está disponible — scheduler.failItemDetailed).
+      //  - otro error (permisos, configuración) → falla reintentable normal, también sin llamada pagada.
+      let raw: string | null = null;
+      if (typeof inline === 'string' && inline) raw = inline;
+      else {
+        try { raw = await deps.checkpoints.get(cp.path); } catch (err) {
+          const em = String((err as Error)?.message ?? err).replace(/\s+/g, ' ').slice(0, 240);
+          if (isStorageUnavailableError(err)) {
+            deps.logger.warn(`[llm-worker] ${item.itemKey}: el punto de guardado ${hash.slice(0, 10)} existe pero Storage no responde — la parte vuelve a la cola sin volver a pagar`);
+            throw { fatal: true, handBack: STORAGE_UNAVAILABLE_CODE, code: STORAGE_UNAVAILABLE_CODE,
+              retryAfterSeconds: Math.max(30, Number((err as { retryAfterSeconds?: number }).retryAfterSeconds) || 60),
+              msg: `${LLM_CHECKPOINT_UNREADABLE}: ${em}` } as ApiError;
+          }
+          if (!checkpointNotFoundError(err)) {
+            throw { fatal: true, code: LLM_CHECKPOINT_UNREADABLE, msg: `${LLM_CHECKPOINT_UNREADABLE}: ${em}` } as ApiError;
+          }
+          raw = null;
+        }
+      }
       let saved: { text: string; usage: Record<string, number>; stopReason: string | null } | null = null;
       try { saved = raw ? JSON.parse(raw) : null; } catch { saved = null; } // guardado ilegible = no hay guardado (M2)
       if (!saved || typeof saved.text !== 'string' || !saved.text) return null;
       if (metaOut) { metaOut.stopReason = saved.stopReason; metaOut.usage = { ...saved.usage }; metaOut.fromCheckpoint = true; }
       deps.logger.log(`[llm-worker] ${item.itemKey}: respuesta desde el punto de guardado (${hash.slice(0, 10)}) — sin costo`);
+      replayed++;
       return saved.text;
     };
     const cached = await fromCheckpoint(win);
@@ -889,5 +936,6 @@ export function createServerApi(deps: ServerLlmDeps, item: ServerLlmItem, roleOf
     }
     return { released, settled };
   };
-  return Object.assign(api, { settleLeftovers });
+  // Review F4: respuestas de ESTE intento servidas desde un punto de guardado (sin pagar).
+  return Object.assign(api, { settleLeftovers, replayedFromCheckpoint: () => replayed });
 }

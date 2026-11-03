@@ -281,7 +281,11 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
     const a = await fakeAnthropic(() => 'ok');
     const reach = await RO.anthropicReachable({ apiKey: 'k', baseUrl: a.url });
     assert(reach && a.st.reqs.length === 1 && a.st.reqs[0].get === '/v1/models?limit=1', 'GET de listado, sin generar: ' + JSON.stringify(a.st.reqs));
-    eq(await RO.anthropicReachable({ apiKey: '', baseUrl: a.url }), false, 'sin API key → sin evidencia');
+    eq(await RO.anthropicReachable({ apiKey: '', baseUrl: a.url }), null, 'review F8: sin API key → null (sin evidencia), sin pedido');
+    eq(a.st.reqs.length, 1, 'sin clave no se hizo ningún pedido');
+    const nk = await RO.llmProviderHealthProbe(q(0, 0), { reachable: () => RO.anthropicReachable({ apiKey: '', baseUrl: a.url }) });
+    eq([nk.ok, nk.reason], [false, 'no_evidence'], 'review F8: proceso sin clave + sin tráfico = sin evidencia (nunca «inalcanzable»)');
+    eq((await RO.llmProviderHealthProbe(q(0, 2), { reachable: () => RO.anthropicReachable({ apiKey: '', baseUrl: a.url }) })).reason, 'recent_success', 'el ledger manda aun sin clave');
     const p = await RO.llmProviderHealthProbe(q(0, 0), { reachable: () => RO.anthropicReachable({ apiKey: 'k', baseUrl: a.url }) });
     eq([p.ok, p.reason], [true, 'reachable'], 'sin tráfico + alcanzable = sano');
     await a.close();
@@ -316,7 +320,7 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
     const r1 = await RS.RunsService.prototype.autoReopenLlmPendingReview.call(f1.self, { policy, now, probe: async () => good });
     eq(r1.reopened.length, 1, 'reabierta');
     eq(f1.st.settledKeys, ['reservation:llm:ir-fe:g1:a1:llmw-continuation-abc-17-x'], 'la reserva desconocida quedó cobrada (posible duplicado) ANTES de reabrir');
-    assert(f1.st.budgetArgs.nextCost === 0.245 && f1.st.budgetArgs.allowanceCalls === 2 && f1.st.budgetArgs.authorization === 'any', 'peor caso = reenviar lo pendiente, con holgura');
+    assert(f1.st.budgetArgs.nextCost === 0.245 && f1.st.budgetArgs.allowanceCalls === 0 && f1.st.budgetArgs.authorization === 'any', 'review F5: peor caso = la llamada a reenviar, SIN holgura (igual que el guard del intento reabierto)');
     const auto = f1.st.retry[0][7];
     assert(auto && auto.llmPendingReview && auto.llmPendingReview.health === good && f1.st.retry[0][5] === false && f1.st.retry[0][6] === false, 'retryItem auto.llmPendingReview, sin reenvío a proveedor');
     const r1b = await RS.RunsService.prototype.autoReopenLlmPendingReview.call(f1.self, { policy, now, probe: async () => good });
@@ -399,6 +403,55 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
       eq(ne.e && ne.e.kind, 'never_sent', 'conexión rechazada = nunca salió');
       await a.close();
     } finally { net.Socket.prototype.setKeepAlive = orig; }
+  });
+
+  await check('4c (review F7) kill switch DYNAMIC_LLM_WORKER_HTTP_TRANSPORT: node (por defecto) = http de Node; fetch = fetch global de antes de r83; ambos completan y clasifican el corte igual', async () => {
+    const KEY = 'DYNAMIC_LLM_WORKER_HTTP_TRANSPORT';
+    const saved = process.env[KEY];
+    const origFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = function (...args) { fetchCalls++; return origFetch.apply(this, args); };
+    try {
+      eq([AS.llmStreamTransport({}), AS.llmStreamTransport({ [KEY]: 'fetch' }), AS.llmStreamTransport({ [KEY]: ' FETCH ' }), AS.llmStreamTransport({ [KEY]: 'node' }), AS.llmStreamTransport({ [KEY]: 'otro' })],
+        ['node', 'fetch', 'fetch', 'node', 'node'], 'parseo (por defecto node)');
+      for (const mode of ['node', 'fetch', undefined]) {
+        if (mode === undefined) delete process.env[KEY]; else process.env[KEY] = mode;
+        const a = await fakeAnthropic(({ prompt }) => (prompt.startsWith('ks-ok') ? 'ok' : 'cut'));
+        const body = { model: 'm', max_tokens: 100, messages: [{ role: 'user', content: `ks-${mode}` }] };
+        fetchCalls = 0;
+        const ok = await AS.streamMessage({ apiKey: 'k', baseUrl: a.url, body: { ...body, messages: [{ role: 'user', content: `ks-ok-${mode}` }] }, idleMs: 3000, totalMs: 10000 });
+        eq(ok.text, FULL, `${mode}: stream completo`);
+        eq(fetchCalls, mode === 'fetch' ? 1 : 0, `${mode}: transporte usado`);
+        const e = await err(AS.streamMessage({ apiKey: 'k', baseUrl: a.url, body, idleMs: 3000, totalMs: 10000 }));
+        assert(e.e && e.e.kind === 'cut' && e.e.extra.partialChars > 0 && /^socket:/.test(e.e.extra.cause), `${mode}: corte clasificado: ` + JSON.stringify(e.e && { kind: e.e.kind, extra: e.e.extra }));
+        const ne = await err(AS.streamMessage({ apiKey: 'k', baseUrl: 'http://127.0.0.1:1', body, idleMs: 3000, totalMs: 10000 }));
+        // fetch (undici) envuelve ECONNREFUSED en un AggregateError: clasifica `unknown` (conservador), igual que antes de r83.
+        assert(ne.e && (mode === 'fetch' ? ['never_sent', 'unknown'].includes(ne.e.kind) : ne.e.kind === 'never_sent'), `${mode}: conexión rechazada: ${ne.e && ne.e.kind}`);
+        await a.close();
+      }
+    } finally {
+      globalThis.fetch = origFetch;
+      if (saved === undefined) delete process.env[KEY]; else process.env[KEY] = saved;
+    }
+  });
+
+  await check('4d (review F4) falla causada por las respuestas repetidas del guardado → se descartan; transporte/proveedor/infra → se conservan', async () => {
+    const yes = [new Error('JSON inválido en la respuesta de la IA'), new SyntaxError('Unexpected token < in JSON'), 'validación: faltan preguntas'];
+    const no = [{ fatal: false, status: 0, msg: 'Error de red: socket hang up' }, { fatal: true, status: 529, msg: 'anthropic HTTP 529' },
+      { fatal: true, runPaused: true, status: 409, code: 'run_paused', msg: 'run_paused: x' }, new Error('no se pudo liquidar la reserva desconocida k: db'),
+      new Error('fetch failed'), null];
+    eq(yes.map((e) => SL.failureCausedByResponses(e)), yes.map(() => true), 'contenido');
+    eq(no.map((e) => SL.failureCausedByResponses(e)), no.map(() => false), 'transporte/infra');
+    const a = await fakeAnthropic(() => 'ok');
+    const w = fakeWorld({ expected: 10, estMax: 10 });
+    const api = makeApi(w, a.url);
+    eq(api.replayedFromCheckpoint(), 0, 'sin repeticiones');
+    await api('s', 'f4-call', 4000);
+    eq(api.replayedFromCheckpoint(), 0, 'pagada, no repetida');
+    const api2 = makeApi(w, a.url);
+    await api2('s', 'f4-call', 4000);
+    eq([api2.replayedFromCheckpoint(), a.st.reqs.length], [1, 1], 'desde el guardado: contada, sin pagar');
+    await a.close();
   });
 
   // ═══ 5. pausa por ráfaga ═════════════════════════════════════════════════════════════════════════════════════════

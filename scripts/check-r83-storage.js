@@ -28,7 +28,9 @@
 //       en vuelo espera hasta la sonda (next_retry_at ≈ next_probe_at); claimNext del empaque no reclama
 //   D5  sonda vencida + Storage sigue caído → hold, probe_round+1, próxima sonda ~60 s; una sola sonda por vencimiento
 //   D6  sonda OK → CERRADO, items retenidos liberados (next_retry_at ≤ now), los claims vuelven a repartir
-//   D7  sin la tabla → todo no-op (gate deja pasar, registrar no lanza)
+//   D7  sin la tabla → todo no-op (gate deja pasar, registrar no lanza); storageBreakerNextProbe → null (F1)
+//   D8  (review F1) sin la tabla → failItem con storage_unavailable consume el intento como antes de r83
+//   S9  (review P1-1) guardado existente + Storage caído al leerlo → espera de Storage sin re-pagar
 //
 // Uso: npm run build && node scripts/check-r83-storage.js [--pure-only] [path/to/dist]
 'use strict';
@@ -156,7 +158,7 @@ function llmWorld(putImpl) {
   w.warns = [];
   w.api = (url, attempt) => SL.createServerApi({
     dataSource: w.ds, finops: w.finops, budget: w.budget,
-    checkpoints: { put: async (p, j) => putImpl(w, p, j), get: async (p) => { if (!w.store.has(p)) throw new Error('Supabase Storage download failed: 400 not found'); return w.store.get(p); } },
+    checkpoints: { put: async (p, j) => putImpl(w, p, j), get: async (p) => { if (w.getImpl) return w.getImpl(p); if (!w.store.has(p)) throw new Error('Supabase Storage download failed: 400 not found'); return w.store.get(p); } },
     recordCheckpoint: async (_id, e) => { Object.assign(w.cps, JSON.parse(JSON.stringify(e))); return true; },
     priorInFlightWindowMs: 0,
     apiKey: 'k', baseUrl: url, defaultModel: 'm', idleMs: 3000, totalMs: 10000,
@@ -356,6 +358,52 @@ async function pureChecks() {
       eq(await w3.api(a.url, 1)('s', 'grande'), `RESPUESTA-${a.st.requests}`, 'la respuesta se usa igual');
       eq(Object.keys(w3.cps).length, 0, 'sin guardado (tope)');
       delete process.env.LLM_CHECKPOINT_INLINE_MAX_BYTES;
+    } finally { await a.close(); }
+  });
+  await check('S10 (review F3/F6) progressOutputSummary nunca devuelve guardados inline (solo su tamaño); las claves r83 son del servidor', async () => {
+    const RS = D('modules/dynamic-generation/runs.service.js');
+    const SCH = D('modules/dynamic-generation/scheduler.service.js');
+    const big = JSON.stringify({ text: 'x'.repeat(5000), usage: {}, stopReason: 'end_turn' });
+    const os0 = { llmCheckpoints: { h1: { path: 'p/h1.json', at: '2026-11-02T20:00:00Z', inline: big }, h2: { path: 'p/h2.json', at: '2026-11-02T20:01:00Z' } }, other: 1 };
+    const v = RS.progressOutputSummary(os0);
+    eq(Object.keys(v.llmCheckpoints).sort(), ['h1', 'h2'], 'las entradas siguen');
+    eq([('inline' in v.llmCheckpoints.h1), v.llmCheckpoints.h1.inlineBytes, v.llmCheckpoints.h2], [false, Buffer.byteLength(big), os0.llmCheckpoints.h2], 'inline fuera, tamaño dentro');
+    assert(!JSON.stringify(v).includes('xxxxxxxxxx'), 'sin el texto de la respuesta en el DTO');
+    assert(typeof os0.llmCheckpoints.h1.inline === 'string', 'no muta la fila');
+    eq(RS.progressOutputSummary({ a: 1 }), { a: 1 }, 'sin guardados: igual');
+    for (const k of ['llmUnknownResetAt', 'llmPendingReviewReopen', 'llmTransportEvents', 'ttsUnhealthyHandbacks', 'ttsCuts', 'audioSegmentChars', 'storageOutage', 'llmCheckpoints', 'llmCheckpointsResetAt']) {
+      assert(SCH.SERVER_OWNED_SUMMARY_KEYS.includes(k), `${k} es del servidor`);
+    }
+    const st = SCH.stripServerOwnedSummaryKeys({ ok: 1, llmUnknownResetAt: '2099-01-01T00:00:00Z', ttsUnhealthyHandbacks: -100 });
+    eq([st.summary, st.dropped.sort()], [{ ok: 1 }, ['llmUnknownResetAt', 'ttsUnhealthyHandbacks']], 'el navegador no las puede fijar');
+  });
+
+  await check('S9 (review P1-1) guardado EN Storage + Storage caído al LEERLO → la parte vuelve como espera de Storage: 0 reservas nuevas, 0 pedidos pagados; 403 → falla sin pagar; 400/404 → sin guardado (paga)', async () => {
+    const a = await fakeAnthropic();
+    try {
+      const w = llmWorld(async (ww, p, j) => { ww.store.set(p, j); });
+      eq(await w.api(a.url, 1)('sistema', 'pedido-p11'), `RESPUESTA-${a.st.requests}`, 'intento 1 paga y guarda en Storage');
+      const paid = a.st.requests;
+      const res0 = w.res.size;
+      assert(typeof Object.values(w.cps)[0].inline === 'undefined', 'guardado en Storage (sin inline)');
+      w.getImpl = async () => { throw new SR.StorageUnavailableError('download', 504, 6, 98_000); };
+      const e = await caught(w.api(a.url, 2)('sistema', 'pedido-p11'));
+      eq([e && e.handBack, e && e.code, e && e.fatal], ['storage_unavailable', 'storage_unavailable', true], 'devolución como espera de Storage');
+      assert(e.retryAfterSeconds >= 30, 'retryAfter');
+      assert(SR.isStorageUnavailableMessage(e.msg), `mensaje reconocible por failItem: ${e.msg}`);
+      eq([a.st.requests, w.res.size], [paid, res0], 'sin pedido pagado ni reserva nueva');
+      // Error determinista que NO es «no existe» (403): tampoco re-paga.
+      w.getImpl = async () => { throw new Error('Supabase Storage download failed: 403 cursia-artifacts/x'); };
+      const e2 = await caught(w.api(a.url, 3)('sistema', 'pedido-p11'));
+      eq([e2 && e2.code, a.st.requests, w.res.size], ['llm_checkpoint_unreadable', paid, res0], '403: falla sin pagar');
+      assert(!SR.isStorageUnavailableMessage(e2.msg), '403 no es espera de Storage');
+      // 400/404 «not found» o cuerpo ilegible = no hay guardado → la llamada se paga (comportamiento de siempre).
+      w.getImpl = async () => { throw new Error('Supabase Storage download failed: 400 cursia-artifacts/x'); };
+      eq(await w.api(a.url, 4)('sistema', 'pedido-p11'), `RESPUESTA-${paid + 1}`, '400 = sin guardado → paga');
+      w.getImpl = async () => '{no-json';
+      w.cps = Object.fromEntries(Object.entries(w.cps).map(([k, v]) => [k, { path: v.path, at: v.at }]));
+      eq(await w.api(a.url, 5)('sistema', 'pedido-p11'), `RESPUESTA-${paid + 2}`, 'cuerpo ilegible = sin guardado → paga');
+      eq([SL.checkpointNotFoundError({ status: 404 }), SL.checkpointNotFoundError(new Error('download failed: 403 x'))], [true, false], 'helper');
     } finally { await a.close(); }
   });
 }
@@ -608,6 +656,31 @@ async function dbChecks() {
       eq(await SB.recordStorageFailure(db, 'x'), null, 'registrar: no-op');
       eq((await SB.storageClaimGate(db, async () => { throw new Error('no'); })).hold, false, 'compuerta abierta');
       SB.resetStorageBreakerProcessState();
+      eq(await SB.storageBreakerNextProbe(ds2), null, 'review F1: sin tabla = breaker NO disponible (null), no {open:false}');
+      eq(await SB.storageBreakerNextProbe(null), null, 'sin DB = null');
+      SB.resetStorageBreakerProcessState();
+      eq(await SB.storageBreakerNextProbe(ds), { open: false, nextProbeAt: null }, 'con tabla y cerrado = {open:false}');
+    });
+
+    await check('D8 (review F1) sin la tabla infra_health → failItem con storage_unavailable en el ÚLTIMO intento consume el intento (failed), sin storageOutage: igual que antes de r83', async () => {
+      SB.resetStorageBreakerProcessState();
+      await ds.query(`alter table public.infra_health rename to infra_health_hidden`);
+      try {
+        const it = await itemRow(C.runId, presKey);
+        await setRow(it.id, `status = 'running', worker_id = 'prov-1', attempt_count = 3, max_attempts = 3, lease_until = now() + interval '5 minutes',
+                             output_summary = coalesce(output_summary, '{}'::jsonb) - 'storageOutage'`);
+        await sched.failItemDetailed(it.id, 'prov-1', STORAGE_MSG, true);
+        const row = await itemRow(C.runId, presKey);
+        eq([row.status, row.attempt_count, row.max_attempts, row.output_summary && row.output_summary.storageOutage], ['failed', 3, 3, undefined], 'consume como antes');
+        // Intento intermedio: retrying normal (consume), sin espera gratis.
+        await setRow(it.id, `status = 'running', worker_id = 'prov-1', attempt_count = 1, max_attempts = 3, lease_until = now() + interval '5 minutes'`);
+        await sched.failItemDetailed(it.id, 'prov-1', STORAGE_MSG, true);
+        const r2 = await itemRow(C.runId, presKey);
+        eq([r2.status, r2.attempt_count, r2.max_attempts, r2.output_summary && r2.output_summary.storageOutage], ['retrying', 1, 3, undefined], 'reintento normal sin grant');
+      } finally {
+        await ds.query(`alter table public.infra_health_hidden rename to infra_health`);
+        SB.resetStorageBreakerProcessState();
+      }
     });
   } finally {
     if (ds && ds.isInitialized) await ds.destroy();
