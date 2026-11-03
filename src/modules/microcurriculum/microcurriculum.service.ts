@@ -582,6 +582,8 @@ export class MicrocurriculumService {
     const answers = normalizeAnswers(row.answers);
     const r = await renderMicrocurriculumPdf(row.document, {
       logo: await this.accountLogo(actor.id), author: answers.references?.author || null, date: new Date(row.updated_at), issues: row.issues || [],
+      // r86: copia exacta adjunta → «Importar microcurrículo» la lee sin interpretar el texto del PDF.
+      embed: { microcurriculumId: row.id, answers },
     });
     return { pdf: r.pdf, filename: `microcurriculo-${slug(row.document.identification.courseName || row.title)}.pdf` };
   }
