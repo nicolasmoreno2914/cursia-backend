@@ -4268,7 +4268,7 @@ export class RunsService {
           and g.finished_at <= $1::timestamptz - make_interval(secs => $3::int)
           and not exists (
             select 1 from public.production_jobs pj2
-             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id = pj.course_id and pj2.id <> pj.id
+             where pj2.execution_mode = 'dynamic_generation' and pj2.course_id::text = pj.course_id::text and pj2.id <> pj.id
                and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
           and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)
           and not (coalesce(g.output_summary, '{}'::jsonb) ? '${LLM_REVIEW_REOPEN_KEY}')
