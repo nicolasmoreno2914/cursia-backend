@@ -1,3 +1,4 @@
+import '../common/net-family'; // r84: IPv4 primero (antes de abrir cualquier conexión)
 import 'reflect-metadata';
 import { createLegacyPaidClaimGate } from './legacy-paid-job-gate';
 import { Logger } from '@nestjs/common';
