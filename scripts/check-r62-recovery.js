@@ -715,7 +715,10 @@ async function dbChecks() {
       fakes.plan.ttsFail = [undefined, 'hang'];
       const item = await claimProvider(R.rid, 'audiobook_chapter');
       assert(item && item.itemKey === key, `claim ${item && item.itemKey}`);
-      const thrown = await PW.processProviderItem(workerDeps({ env: FAST }), item).then(() => null, (e) => e);
+      // r83: el TTS falso (syntheticMp3) devuelve bytes que dependen SOLO de la duración; con segmentos de ~2000 caracteres
+      // de esta fixture (la misma oración repetida) dos segmentos duran lo mismo → audio idéntico → AUDIOBOOK_SEGMENT_DUPLICATE.
+      // Artefacto del fake (un TTS real nunca da el mismo MP3 para textos distintos): K1 fija el corte histórico de 3900.
+      const thrown = await PW.processProviderItem(workerDeps({ env: { ...FAST, AUDIOBOOK_TTS_SEGMENT_CHARS: '3900' } }), item).then(() => null, (e) => e);
       fakes.plan.ttsFail = [];
       let row = await itemRow(R.rid, key);
       assert(thrown && /^provider_reconciliation_required: openai/.test(thrown.message), `timeout → reconciliación (${row.status}: ${row.error}; tts ${JSON.stringify(fakes.st.tts.slice(tts0))})`);

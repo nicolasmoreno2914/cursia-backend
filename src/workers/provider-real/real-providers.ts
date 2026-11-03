@@ -1527,6 +1527,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
             deps.logger.warn(`Item ${item.itemKey}: el segmento ${seg.key} ya pagado se toma del spool local (sin volver a llamar a OpenAI)`);
             spooledMeta = sp.meta;
             spoolReused++;
+            reused++; // no se re-sintetiza (igual que un segmento reutilizado del Storage)
             if (sp.meta.requestId) requestIds.push(sp.meta.requestId);
             rawSecondsTotal = rawSecondsTotal === null || sp.meta.rawSeconds == null ? null : rawSecondsTotal + sp.meta.rawSeconds;
             rawParts.push(sp.audio);
@@ -1629,6 +1630,10 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
             deps.logger.warn(`Item ${item.itemKey}: no se pudo escribir el spool local de ${seg.key} (${err instanceof Error ? err.message : String(err)}); se sigue sin spool`);
           }
           if (written) {
+            // El resultado pagado ya está a salvo en disco (con su reserva y su medición en el meta): nada queda «en el
+            // aire». Si la liquidación falla ahora (p. ej. pooler lleno), es un transitorio (unexpected_error, sin tocar
+            // el reenvío único) y el próximo claim liquida desde el spool (priorPaidBlock) y lo reutiliza sin repagar.
+            if (tracker) { tracker.inFlight = null; tracker.unpersistedPaidOutput = null; }
             await settleThis();
             spooledMeta = spoolMarkSettled(written);
             // Resultado pagado guardado (en disco local): ya no queda nada «en el aire» para este segmento.

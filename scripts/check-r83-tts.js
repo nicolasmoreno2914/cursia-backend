@@ -473,12 +473,12 @@ async function workerChecks() {
     const c1 = OAI.st.calls.length;
     await claim(W, nextAttempt(it));
     eq(it.status, 'completed', `completa (${it.error})`);
-    eq([OAI.st.calls.length - c1, it.outputSummary.spoolReusedSegments], [segCount(it) - 2, 1], 'el segmento del spool NO se repaga');
+    eq([OAI.st.calls.length - c1, it.outputSummary.spoolReusedSegments, it.outputSummary.reusedSegments], [segCount(it) - 2, 1, 2], 'el segmento del spool NO se repaga');
     eq(W.ledgerRows.filter((r) => !r.reservation && r.provider === 'openai').length, segCount(it), 'un cargo por segmento (sin duplicados)');
     eq(spoolFiles(it).length, 0, 'spool limpio');
   });
 
-  await check('W6 kill entre el spool y la liquidación (ledger caído) → reconciliación honesta; al reanudar, priorPaidBlock liquida desde el spool y el intento lo reutiliza (0 llamadas para ese segmento)', async () => {
+  await check('W6 liquidación caída con el MP3 ya en el spool (pooler lleno, #91) → TRANSITORIO reintentable (nunca reconciliación); al reanudar, priorPaidBlock liquida desde el spool y el intento lo reutiliza (0 llamadas para ese segmento)', async () => {
     TR.TTS_CUT_BREAKER.reset();
     const W = memoryWorld();
     const it = newItem(W, { ch: 6, md });
@@ -486,8 +486,9 @@ async function workerChecks() {
     W.inject.settleFail = (k) => /reservation:tts:.*seg_seg-/.test(k) && ++n === 1;
     await claim(W, it);
     W.inject.settleFail = null;
-    eq(it.status, 'failed', `incierto (${it.error})`);
-    assert(/^provider_reconciliation_required: openai/.test(it.error), it.error);
+    eq(it.status, 'retrying', `transitorio (${it.error})`);
+    assert(/^unexpected_error: finops_ledger_write_failed/.test(it.error) && !/reconciliation/.test(it.error), it.error);
+    eq(classify(it).class, 'A', 'clase A');
     eq([openReservations(W, it).length, spoolFiles(it).filter((f) => f.endsWith('.mp3')).length], [1, 1], 'reserva abierta + MP3 en el spool');
     const c0 = OAI.st.calls.length;
     await claim(W, nextAttempt(it));
