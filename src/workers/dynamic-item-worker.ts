@@ -1,3 +1,4 @@
+import '../common/net-family'; // r84: IPv4 primero (antes de abrir cualquier conexión)
 import 'reflect-metadata';
 import { createHash } from 'crypto';
 import { TTS_SNAPSHOT_MODEL, resolveTtsModel } from '../tts/tts-models';

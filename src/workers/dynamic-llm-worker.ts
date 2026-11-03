@@ -1,3 +1,4 @@
+import '../common/net-family'; // r84: IPv4 primero (antes de abrir cualquier conexión)
 import 'reflect-metadata';
 import { anthropicLlmModeForBaseUrl } from '../config/provider-base-url-guard';
 import { Logger } from '@nestjs/common';
