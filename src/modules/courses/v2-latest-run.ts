@@ -32,11 +32,12 @@ interface Q {
   query: (sql: string, params?: any[]) => Promise<any[]>;
 }
 
+// course_id::text: el tipo real de production_jobs.course_id no es fiable entre entornos (lección r83 631fe75).
 // El paquete se busca SOLO para el último run de cada curso (CTE primero, subconsulta después: nunca por cada run viejo).
 export const V2_LATEST_RUN_SQL = `with latest as (
   select distinct on (pj.course_id) pj.course_id, pj.id, pj.status, pj.worker_status, pj.finished_at
     from public.production_jobs pj
-   where pj.execution_mode = 'dynamic_generation' and pj.course_id = any($1::int[])
+   where pj.execution_mode = 'dynamic_generation' and pj.course_id::text = any($1::text[])
    order by pj.course_id, pj.created_at desc, pj.id desc
 )
 select l.course_id, l.id, l.status, l.worker_status, l.finished_at,
@@ -100,7 +101,7 @@ export async function attachV2LatestRuns<T extends { id: number; structureVersio
   const dyn = courses.filter((c) => c && c.structureVersion === 'dynamic');
   if (dyn.length === 0) return courses;
   try {
-    const rows = await q.query(V2_LATEST_RUN_SQL, [dyn.map((c) => Number(c.id))]);
+    const rows = await q.query(V2_LATEST_RUN_SQL, [dyn.map((c) => String(c.id))]);
     const byCourse = new Map<number, V2LatestRunSummary>();
     for (const r of rows) byCourse.set(Number(r.course_id), summarizeV2LatestRun(r));
     for (const c of dyn) (c as any).v2LatestRun = byCourse.get(Number(c.id)) ?? null;
