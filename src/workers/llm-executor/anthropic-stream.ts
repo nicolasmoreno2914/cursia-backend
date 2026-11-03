@@ -33,6 +33,11 @@ export class LlmStreamError extends Error {
       partialChars?: number;
       /** r64: llegó el `message_delta` con el usage final (entonces `usage.output_tokens` es el real). */
       sawUsageDelta?: boolean;
+      /** r83: telemetría del corte — bytes recibidos, duración (ms), nombre y causa del error de red. */
+      bytes?: number;
+      durationMs?: number;
+      errorName?: string | null;
+      errorCause?: string | null;
     } = {},
   ) {
     super(message);
@@ -64,6 +69,27 @@ function errCode(e: unknown): string | null {
   return (any && (any.code || any.cause?.code || any.cause?.cause?.code)) || null;
 }
 
+/** r83: nombre y causa legibles de un error de red (undici `terminated`, `ECONNRESET`, AbortError…), sin datos sensibles. */
+export function errTelemetry(e: unknown): { errorName: string | null; errorCause: string | null } {
+  const any = e as { name?: string; message?: string; code?: string; cause?: { name?: string; message?: string; code?: string } } | null;
+  if (!any) return { errorName: null, errorCause: null };
+  const name = typeof any.name === 'string' ? any.name : null;
+  const c = any.cause;
+  const cause = [errCode(e), c && typeof c.message === 'string' ? c.message : null, typeof any.message === 'string' ? any.message : null]
+    .filter((x) => !!x).join(' | ').slice(0, 200) || null;
+  return { errorName: name ? name.slice(0, 60) : null, errorCause: cause };
+}
+
+/**
+ * r83 (incidente curso 91: cortes de conexiones HTTPS salientes largas del VPS): keepalive TCP del socket del worker
+ * de IA. Una llamada larga y muda (sin streaming, o un stream entre eventos) no la cierra un NAT/firewall por
+ * inactividad. `DYNAMIC_LLM_WORKER_TCP_KEEPALIVE_MS` (5 s – 120 s; por defecto 15 s).
+ */
+export function llmTcpKeepAliveMs(env: Record<string, string | undefined> = process.env): number {
+  const v = Number(env.DYNAMIC_LLM_WORKER_TCP_KEEPALIVE_MS);
+  return Number.isFinite(v) && v >= 5_000 && v <= 120_000 ? Math.floor(v) : 15_000;
+}
+
 const int = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : 0);
 
 function mergeUsage(acc: LlmUsage, u: any): void {
@@ -85,7 +111,11 @@ export interface StreamMessageRequest {
 }
 
 export async function streamMessage(req: StreamMessageRequest): Promise<LlmStreamResult> {
-  const f = req.fetchImpl ?? fetch;
+  // r83: sin `fetchImpl` (producción) el stream también va por http/https de Node con keepalive TCP (antes: fetch
+  // global, sin keepalive configurable).
+  const f = req.fetchImpl ?? nodeHttpStreamFetch;
+  const t0 = Date.now();
+  let bytes = 0;
   const ctrl = new AbortController();
   let timedOut: 'idle' | 'total' | null = null;
   const total = setTimeout(() => { timedOut = 'total'; ctrl.abort(); }, req.totalMs);
@@ -119,7 +149,8 @@ export async function streamMessage(req: StreamMessageRequest): Promise<LlmStrea
       if (!timedOut && code && NEVER_SENT_CODES.has(code)) {
         throw new LlmStreamError('never_sent', `anthropic: la conexión no se pudo abrir (${code}); el pedido no salió`);
       }
-      throw new LlmStreamError('unknown', `anthropic: sin respuesta (${timedOut ? `timeout ${timedOut}` : code || (e instanceof Error ? e.message : String(e))}); el pedido pudo procesarse`);
+      throw new LlmStreamError('unknown', `anthropic: sin respuesta (${timedOut ? `timeout ${timedOut}` : code || (e instanceof Error ? e.message : String(e))}); el pedido pudo procesarse`,
+        { cause: timedOut ? `timeout_${timedOut}` : `socket:${code || 'error'}`, bytes: 0, durationMs: Date.now() - t0, ...errTelemetry(e) });
     }
     const rid = res.headers.get('request-id');
     requestId = rid && /^[A-Za-z0-9._:-]{1,200}$/.test(rid) ? rid : null;
@@ -168,6 +199,7 @@ export async function streamMessage(req: StreamMessageRequest): Promise<LlmStrea
         const { done, value } = await reader.read();
         if (done) break;
         armIdle();
+        bytes += value ? value.byteLength : 0;
         buf += dec.decode(value, { stream: true });
         drainBlocks(false);
       }
@@ -175,18 +207,20 @@ export async function streamMessage(req: StreamMessageRequest): Promise<LlmStrea
       drainBlocks(true);
     } catch (e) {
       const why = timedOut ? `timeout ${timedOut}` : errCode(e) || (e instanceof Error ? e.message : String(e));
+      const tel = { bytes, durationMs: Date.now() - t0, ...errTelemetry(e) };
       if (started) {
         const cause = timedOut ? `timeout_${timedOut}` : `socket:${errCode(e) || (e instanceof Error ? e.name : 'error')}`;
-        throw new LlmStreamError('cut', `anthropic: el stream se cortó a mitad (${why})`, { requestId, messageId, usage: { ...usage }, cause, partialChars: parts.join('').length, sawUsageDelta });
+        throw new LlmStreamError('cut', `anthropic: el stream se cortó a mitad (${why})`, { requestId, messageId, usage: { ...usage }, cause, partialChars: parts.join('').length, sawUsageDelta, ...tel });
       }
-      throw new LlmStreamError('unknown', `anthropic: la conexión se cayó antes del primer evento (${why})`, { requestId });
+      throw new LlmStreamError('unknown', `anthropic: la conexión se cayó antes del primer evento (${why})`, { requestId, cause: timedOut ? `timeout_${timedOut}` : `socket:${errCode(e) || 'error'}`, ...tel });
     }
+    const tel = { bytes, durationMs: Date.now() - t0 };
     if (errorType) {
       if (!started) throw new LlmStreamError('http', `anthropic: error ${errorType} antes de generar`, { status: errorType === 'overloaded_error' ? 529 : 500, requestId, errorType });
-      throw new LlmStreamError('cut', `anthropic: error ${errorType} a mitad del stream`, { requestId, messageId, usage: { ...usage }, errorType, cause: `provider_error:${errorType}`, partialChars: parts.join('').length, sawUsageDelta });
+      throw new LlmStreamError('cut', `anthropic: error ${errorType} a mitad del stream`, { requestId, messageId, usage: { ...usage }, errorType, cause: `provider_error:${errorType}`, partialChars: parts.join('').length, sawUsageDelta, ...tel });
     }
-    if (!started || !messageId) throw new LlmStreamError('unknown', 'anthropic: el stream terminó sin message_start', { requestId });
-    if (!sawStop) throw new LlmStreamError('cut', 'anthropic: el stream terminó sin message_stop', { requestId, messageId, usage: { ...usage }, cause: 'no_message_stop', partialChars: parts.join('').length, sawUsageDelta });
+    if (!started || !messageId) throw new LlmStreamError('unknown', 'anthropic: el stream terminó sin message_start', { requestId, cause: 'no_message_start', ...tel });
+    if (!sawStop) throw new LlmStreamError('cut', 'anthropic: el stream terminó sin message_stop', { requestId, messageId, usage: { ...usage }, cause: 'no_message_stop', partialChars: parts.join('').length, sawUsageDelta, ...tel });
     return {
       text: parts.join('').trim(),
       messageId,
@@ -217,6 +251,7 @@ export async function nonStreamMessage(req: StreamMessageRequest): Promise<LlmSt
   // respuesta sin streaming no manda encabezados hasta terminar: una parte larga (16k tokens) caería en «desconocido».
   // Sin `fetchImpl` (producción) va por http/https de Node, sin ese tope: solo vale `totalMs` (y keepalive TCP).
   const f = req.fetchImpl ?? nodeHttpFetch;
+  const t0 = Date.now();
   const ctrl = new AbortController();
   let timedOut = false;
   const total = setTimeout(() => { timedOut = true; ctrl.abort(); }, req.totalMs);
@@ -235,7 +270,7 @@ export async function nonStreamMessage(req: StreamMessageRequest): Promise<LlmSt
       if (!timedOut && code && NEVER_SENT_CODES.has(code)) {
         throw new LlmStreamError('never_sent', `anthropic: la conexión no se pudo abrir (${code}); el pedido no salió`);
       }
-      throw new LlmStreamError('unknown', `anthropic: sin respuesta (${timedOut ? 'timeout total' : code || (e instanceof Error ? e.message : String(e))}); el pedido pudo procesarse`, { cause: timedOut ? 'timeout_total' : `socket:${code || 'error'}` });
+      throw new LlmStreamError('unknown', `anthropic: sin respuesta (${timedOut ? 'timeout total' : code || (e instanceof Error ? e.message : String(e))}); el pedido pudo procesarse`, { cause: timedOut ? 'timeout_total' : `socket:${code || 'error'}`, bytes: 0, durationMs: Date.now() - t0, ...errTelemetry(e) });
     }
     const rid = res.headers.get('request-id');
     requestId = rid && /^[A-Za-z0-9._:-]{1,200}$/.test(rid) ? rid : null;
@@ -244,13 +279,13 @@ export async function nonStreamMessage(req: StreamMessageRequest): Promise<LlmSt
       raw = await res.text();
     } catch (e) {
       // Llegaron los encabezados y el cuerpo se cortó: un 200 pudo cobrarse → desconocido (nunca «sin costo»).
-      throw new LlmStreamError('unknown', `anthropic: el cuerpo de la respuesta se cortó (${timedOut ? 'timeout total' : errCode(e) || (e instanceof Error ? e.message : String(e))})`, { requestId, status: res.status, cause: timedOut ? 'timeout_total' : 'body_cut' });
+      throw new LlmStreamError('unknown', `anthropic: el cuerpo de la respuesta se cortó (${timedOut ? 'timeout total' : errCode(e) || (e instanceof Error ? e.message : String(e))})`, { requestId, status: res.status, cause: timedOut ? 'timeout_total' : 'body_cut', durationMs: Date.now() - t0, ...errTelemetry(e) });
     }
     if (!res.ok) throw new LlmStreamError('http', `anthropic HTTP ${res.status}: ${raw.slice(0, 300)}`, { status: res.status, body: raw.slice(0, 2000), requestId });
     let msg: any;
     try { msg = JSON.parse(raw); } catch { msg = null; }
     if (!msg || typeof msg !== 'object' || msg.type !== 'message' || typeof msg.id !== 'string' || !Array.isArray(msg.content)) {
-      throw new LlmStreamError('unknown', 'anthropic: respuesta 200 ilegible (no es un mensaje completo)', { requestId, status: res.status, cause: 'unreadable_body' });
+      throw new LlmStreamError('unknown', 'anthropic: respuesta 200 ilegible (no es un mensaje completo)', { requestId, status: res.status, cause: 'unreadable_body', bytes: Buffer.byteLength(raw), durationMs: Date.now() - t0 });
     }
     const usage: LlmUsage = { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
     mergeUsage(usage, msg.usage);
@@ -274,48 +309,68 @@ export async function nonStreamMessage(req: StreamMessageRequest): Promise<LlmSt
  * Keepalive TCP para que una conexión larga y muda no la cierre un intermediario por inactividad.
  */
 export const NODE_HTTP_CONNECT_TIMEOUT_MS = 10_000;
-export const nodeHttpFetch: typeof fetch = ((input: any, init: any = {}) => new Promise((resolve, reject) => {
-  const url = new URL(String(input));
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const mod = url.protocol === 'https:' ? require('https') : require('http');
-  const signal: AbortSignal | undefined = init.signal;
-  const body = typeof init.body === 'string' ? init.body : '';
-  const headers: Record<string, string> = { ...(init.headers || {}), 'content-length': String(Buffer.byteLength(body)) };
-  let settled = false;
-  const fail = (e: any) => { if (!settled) { settled = true; reject(e); } };
-  const req = mod.request({ method: init.method || 'POST', hostname: url.hostname, port: url.port || undefined, path: url.pathname + url.search, headers }, (res: any) => {
-    const chunks: Buffer[] = [];
-    let textP: Promise<string> | null = null;
-    const done = new Promise<string>((ok, ko) => {
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
-      res.on('error', ko);
-      res.on('aborted', () => ko(Object.assign(new Error('respuesta abortada'), { code: 'ECONNRESET' })));
+function nodeHttpRequest(input: any, init: any = {}, streamBody: boolean): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(String(input));
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const mod = url.protocol === 'https:' ? require('https') : require('http');
+    const signal: AbortSignal | undefined = init.signal;
+    const body = typeof init.body === 'string' ? init.body : '';
+    const headers: Record<string, string> = { ...(init.headers || {}), 'content-length': String(Buffer.byteLength(body)) };
+    let settled = false;
+    const fail = (e: any) => { if (!settled) { settled = true; reject(e); } };
+    const req = mod.request({ method: init.method || 'POST', hostname: url.hostname, port: url.port || undefined, path: url.pathname + url.search, headers }, (res: any) => {
+      const head = {
+        status: res.statusCode,
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        headers: { get: (k: string) => { const v = res.headers[String(k).toLowerCase()]; return Array.isArray(v) ? v.join(', ') : v ?? null; } },
+      };
+      settled = true;
+      if (streamBody) {
+        // r83: cuerpo como ReadableStream web (lo lee streamMessage con getReader). Un socket que se cae a mitad rechaza
+        // la lectura (ECONNRESET / aborted) → `cut` o `unknown` según si ya empezó.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { Readable } = require('stream');
+        const web = Readable.toWeb(res);
+        let textP: Promise<string> | null = null;
+        resolve({
+          ...head,
+          body: web,
+          text: () => (textP ??= new Response(web as any).text()),
+        } as any);
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let textP: Promise<string> | null = null;
+      const done = new Promise<string>((ok, ko) => {
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => ok(Buffer.concat(chunks).toString('utf8')));
+        res.on('error', ko);
+        res.on('aborted', () => ko(Object.assign(new Error('respuesta abortada'), { code: 'ECONNRESET' })));
+      });
+      done.catch(() => undefined);
+      resolve({ ...head, text: () => (textP ??= done), body: null } as any);
     });
-    done.catch(() => undefined);
-    settled = true;
-    resolve({
-      status: res.statusCode,
-      ok: res.statusCode >= 200 && res.statusCode < 300,
-      headers: { get: (k: string) => { const v = res.headers[String(k).toLowerCase()]; return Array.isArray(v) ? v.join(', ') : v ?? null; } },
-      text: () => (textP ??= done),
-      body: null,
-    } as any);
+    // Review r64 (m1): como undici, una conexión que no se abre en 10 s es «nunca salió» (UND_ERR_CONNECT_TIMEOUT), no
+    // un desconocido de 15 min.
+    const connectTimer = setTimeout(() => req.destroy(Object.assign(new Error('connect timeout'), { code: 'UND_ERR_CONNECT_TIMEOUT' })), NODE_HTTP_CONNECT_TIMEOUT_MS);
+    req.on('socket', (sock: any) => {
+      // r83: keepalive TCP configurable (15 s por defecto; antes 30 s fijo y solo sin streaming).
+      try { sock.setKeepAlive(true, llmTcpKeepAliveMs()); } catch { /* sin keepalive */ }
+      const opened = () => clearTimeout(connectTimer);
+      if (sock.connecting === false && !(url.protocol === 'https:' && !sock.encrypted)) opened();
+      sock.once(url.protocol === 'https:' ? 'secureConnect' : 'connect', opened);
+    });
+    req.on('close', () => clearTimeout(connectTimer));
+    req.on('error', fail);
+    if (signal) {
+      if (signal.aborted) { req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' })); }
+      signal.addEventListener('abort', () => req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    }
+    req.end(body);
   });
-  // Review r64 (m1): como undici, una conexión que no se abre en 10 s es «nunca salió» (UND_ERR_CONNECT_TIMEOUT), no
-  // un desconocido de 15 min.
-  const connectTimer = setTimeout(() => req.destroy(Object.assign(new Error('connect timeout'), { code: 'UND_ERR_CONNECT_TIMEOUT' })), NODE_HTTP_CONNECT_TIMEOUT_MS);
-  req.on('socket', (sock: any) => {
-    try { sock.setKeepAlive(true, 30_000); } catch { /* sin keepalive */ }
-    const opened = () => clearTimeout(connectTimer);
-    if (sock.connecting === false && !(url.protocol === 'https:' && !sock.encrypted)) opened();
-    sock.once(url.protocol === 'https:' ? 'secureConnect' : 'connect', opened);
-  });
-  req.on('close', () => clearTimeout(connectTimer));
-  req.on('error', fail);
-  if (signal) {
-    if (signal.aborted) { req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' })); }
-    signal.addEventListener('abort', () => req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
-  }
-  req.end(body);
-})) as any;
+}
+/** Review r64 (I1): POST sin streaming (cuerpo entero con `text()`). */
+export const nodeHttpFetch: typeof fetch = ((input: any, init: any = {}) => nodeHttpRequest(input, init, false)) as any;
+/** r83: POST con el cuerpo como stream (SSE de Anthropic), mismo keepalive y tope de conexión. */
+export const nodeHttpStreamFetch: typeof fetch = ((input: any, init: any = {}) => nodeHttpRequest(input, init, true)) as any;

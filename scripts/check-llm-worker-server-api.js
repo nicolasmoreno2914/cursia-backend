@@ -8,6 +8,14 @@ const path = require('path');
 const distRoot = path.resolve(process.cwd(), process.argv[2] || 'dist');
 const { createServerApi, LLM_UNKNOWN_MAX, cachedUserContent } = require(path.join(distRoot, 'workers/llm-executor/server-llm.js'));
 
+
+// r83: la regla r62 (1 evento ambiguo por parte) sigue disponible con DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX=1; la regla por
+// defecto (dinero + 3 eventos) la cubre scripts/check-r83-llm.js.
+async function legacyEvents(fn) {
+  const prev = process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX;
+  process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX = '1';
+  try { return await fn(); } finally { if (prev === undefined) delete process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX; else process.env.DYNAMIC_LLM_AMBIGUOUS_EVENT_MAX = prev; }
+}
 let passes = 0; let failures = 0;
 async function check(name, fn) {
   try { await fn(); passes++; console.log(`✅ ${name}`); }
@@ -119,19 +127,20 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     assert(pending(w) === 0, 'liberada');
     await a.close();
   });
-  await check('I2: 504 (timeout de gateway) = DESCONOCIDO → un reintento automático; el 2.º de la misma llamada → revisión', async () => {
+  // r83: hasta LLM_UNKNOWN_MAX (3) desconocidos de la misma llamada (2 reenvíos, cada uno acotado por dinero); el 3.º → revisión.
+  await check('I2: 504 (timeout de gateway) = DESCONOCIDO → reenvíos acotados; el 3.º desconocido de la misma llamada → revisión', async () => {
     const a = await fakeAnthropic(() => ({ status: 504 }));
     const w = fakeWorld(); const api = makeApi(w, a.url);
     const e = await err(api('s', 'p504'));
     assert(e && e.pendingReview === true, 'revisión: ' + JSON.stringify(e));
-    assert(a.st.requests.length === LLM_UNKNOWN_MAX, 'exactamente 2 pedidos: ' + a.st.requests.length);
-    // r62: la 1.ª reserva perdida se liquidó como cobrada (posible duplicado) antes del reenvío; la 2.ª queda para conciliar.
-    assert(unknownOf(w) === 2 && pdOf(w) === 1 && pending(w) === 1, `inciertas ${unknownOf(w)} / posible duplicado ${pdOf(w)} / pendientes ${pending(w)}`);
+    assert(LLM_UNKNOWN_MAX === 3 && a.st.requests.length === LLM_UNKNOWN_MAX, 'exactamente 3 pedidos: ' + a.st.requests.length);
+    // Las perdidas antes de cada reenvío se liquidan como cobradas (posible duplicado); la última queda para conciliar.
+    assert(unknownOf(w) === 3 && pdOf(w) === 2 && pending(w) === 1, `inciertas ${unknownOf(w)} / posible duplicado ${pdOf(w)} / pendientes ${pending(w)}`);
     await a.close();
   });
   // r62 (re-review I2-bis — cambio DELIBERADO de la regla Loop-4 «una vez por llamada»): A desconocida → UN reenvío; una
   // desconocida NUEVA después (B, mismo intento, no solapada con A) es un SEGUNDO evento ambiguo → revisión, sin pedirla otra vez.
-  await check('r62 tope por evento: A desconocida → UN reenvío; después B desconocida en el mismo intento → revisión (sin reenviar B)', async () => {
+  await check('r62 tope por evento: A desconocida → UN reenvío; después B desconocida en el mismo intento → revisión (sin reenviar B)', () => legacyEvents(async () => {
     const a = await fakeAnthropic((p, n) => (n === 1 ? 'drop' : 'ok'));
     const w = fakeWorld(); const api = makeApi(w, a.url);
     assert((await api('s', 'A')) === 'R:A', 'A completa con su reenvío único');
@@ -139,7 +148,7 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
     assert(e && e.pendingReview === true && /eventos ambiguos/.test(e.msg), 'B → revisión: ' + JSON.stringify(e));
     assert(a.st.requests.length === 3 && unknownOf(w) === 2 && pdOf(w) === 1 && pending(w) === 1, `3 pedidos / A posible duplicado / B pendiente (${a.st.requests.length}/${pdOf(w)}/${pending(w)})`);
     await a.close();
-  });
+  }));
   await check('r62 un mismo evento: 2 llamadas EN PARALELO sin respuesta a la vez (solapadas) → cada una reenvía una vez, sin revisión', async () => {
     const a = await fakeAnthropic((p, n) => (n === 1 ? 'drop' : 'ok'));
     const w = fakeWorld(); const api = makeApi(w, a.url);
@@ -160,14 +169,14 @@ async function err(p) { try { await p; return null; } catch (e) { return e; } }
   });
   // r62 (I2): el tope es por llamada y por EVENTO (intento): un SEGUNDO evento ambiguo en la ventana → revisión sin llamar;
   // el tope total (LLM_UNKNOWN_ITEM_MAX) queda solo como respaldo anti-bucle.
-  await check('r62 tope por evento: desconocidos de DOS intentos distintos (dos eventos) en la parte → revisión sin llamar', async () => {
+  await check('r62 tope por evento: desconocidos de DOS intentos distintos (dos eventos) en la parte → revisión sin llamar', () => legacyEvents(async () => {
     const a = await fakeAnthropic(() => 'ok');
     const w = fakeWorld();
     for (let i = 0; i < 2; i++) w.res.set(`reservation:llm:${ITEM.itemRunId}:g1:a${i + 1}:o${i}`, { tag: `llmw-main-zzzz${i}-1-x`, settled: false });
     const e = await err(makeApi(w, a.url)('s', 'nueva'));
     assert(e && e.pendingReview === true && a.st.requests.length === 0, 'revisión sin llamar');
     await a.close();
-  });
+  }));
   await check('I6: la liquidación falla tras una respuesta OK → la respuesta se usa, NO se vuelve a pedir; la misma llamada sale del guardado', async () => {
     const a = await fakeAnthropic(() => 'ok');
     const w = fakeWorld({ settleFailures: 10 }); const api = makeApi(w, a.url);

@@ -318,7 +318,7 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   // breaker GLOBAL de `anthropic`: solo uno por dueño, salvo corroboración del proxy/gateway del servidor.
   // cursia#68 (SSE): `llm_stream_cut` = el stream de la IA se cortó / dejó de responder / quedó incompleto. Transitorio
   // (A, reintento); el gasto ya queda en el ledger con el cargo conservador del proxy (paidRisk measured, sin más riesgo).
-  { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network', 'llm_stream_cut'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
+  { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network', 'llm_stream_cut', 'llm_provider_unhealthy'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
   {
     id: 'llm_config',
     codes: ['llm_credit_exhausted', 'llm_auth_rejected', 'proxy_misconfigured', 'llm_model_config', 'llm_model_not_allowed', 'llm_api_key_missing', 'llm_model_missing'],

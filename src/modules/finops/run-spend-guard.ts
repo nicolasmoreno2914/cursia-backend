@@ -50,6 +50,11 @@ export interface RunSpendInput {
   itemLargestCall?: number;
   /** Sobreconsumo ya aceptado por el usuario al reanudar tras una pausa del disyuntor (se suma al umbral). */
   breakerAcknowledgedUsd?: number;
+  /**
+   * r83: holgura EXTRA del presupuesto de la parte para UNA llamada que es el reenvío de un resultado ambiguo (corte de
+   * red) ya aceptado por `ambiguousResendBudget` con su `allowance`. Solo esa llamada la usa; nunca toca el tope del run.
+   */
+  itemExtraAllowance?: number;
 }
 
 /** Llamadas fallidas (cota de cada una) que el presupuesto de una parte absorbe SIEMPRE además de su costo esperado. */
@@ -90,7 +95,8 @@ export function decideRunSpend(i: RunSpendInput): RunSpendDecision {
   // La cota de la llamada siguiente es muy conservadora (max_tokens completo): se compara lo YA gastado (cargos
   // + reservas pendientes) contra el límite. Mientras no se alcanzó, la parte puede seguir recuperándose; el
   // exceso posible queda acotado a UNA llamada.
-  if (hard !== null && i.itemSpent !== null && i.itemSpent >= hard - 1e-9) {
+  const extra = Math.max(0, Number(i.itemExtraAllowance) || 0);
+  if (hard !== null && i.itemSpent !== null && i.itemSpent >= hard + extra - 1e-9) {
     return {
       allow: false, reason: 'item_recovery_budget_exhausted', itemHardLimit: hard, breakerThreshold: breaker,
       detail: `esta parte ya gastó ${usd(i.itemSpent)} (esperado ${usd(i.itemExpected ?? 0)}, presupuesto de recuperación hasta ${usd(hard)})`,
@@ -122,7 +128,15 @@ export function itemRecoveryBudgetMessage(detail: string): string {
 //   - la reserva NUEVA (nextCost) se suma encima: itemSpent + nextCost ≤ presupuesto de recuperación de la parte y
 //     runSpent + nextCost ≤ saldo autorizado del run.
 // Puro. Reemplaza el tope fijo de USD 0,10 de #583.
+//
+// r83 (incidente curso 91, 2026-11-02: cortes de red intermitentes del VPS) — para la IA el límite es de DINERO, no de
+// conteo: el peor caso puede usar además una HOLGURA de ambigüedad (`allowance`, = AMBIGUOUS_RESEND_ALLOWANCE_CALLS ×
+// la llamada más grande de la parte) por encima del presupuesto de recuperación; el saldo autorizado del run sigue
+// siendo un techo duro. Sin `allowance` (audio, proveedores pagados) el comportamiento es el de r62.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** r83: llamadas (cota de la más grande de la parte) que la holgura de ambigüedad de la IA suma al presupuesto de la parte. */
+export const AMBIGUOUS_RESEND_ALLOWANCE_CALLS = 2;
 
 export type AmbiguousResendBudgetReason = 'item_recovery_budget' | 'run_budget' | 'no_authorization' | 'no_item_estimate';
 
@@ -137,6 +151,8 @@ export interface AmbiguousResendBudgetInput {
   runSpent: number;
   /** Saldo autorizado del run. null = sin autorización vigente. */
   authorizedBudget: number | null;
+  /** r83: holgura de ambigüedad (USD) por encima de itemHardLimit. 0 / ausente = r62. */
+  allowance?: number;
 }
 
 export interface AmbiguousResendBudget {
@@ -150,17 +166,20 @@ export interface AmbiguousResendBudget {
   /** Peor caso de la parte y del run si se reenvía. */
   worstItem: number;
   worstRun: number;
+  /** r83: holgura de ambigüedad aplicada (USD; 0 = ninguna). */
+  allowance: number;
 }
 
 export function ambiguousResendBudget(i: AmbiguousResendBudgetInput): AmbiguousResendBudget {
   const nextCost = Math.max(0, Number(i.nextCost) || 0);
   const worstItem = Math.max(0, Number(i.itemSpent) || 0) + nextCost;
   const worstRun = Math.max(0, Number(i.runSpent) || 0) + nextCost;
-  const base = { itemSpent: i.itemSpent, nextCost, itemHardLimit: i.itemHardLimit, runSpent: i.runSpent, authorizedBudget: i.authorizedBudget, worstItem, worstRun };
+  const allowance = Math.max(0, Number(i.allowance) || 0);
+  const base = { itemSpent: i.itemSpent, nextCost, itemHardLimit: i.itemHardLimit, runSpent: i.runSpent, authorizedBudget: i.authorizedBudget, worstItem, worstRun, allowance };
   // Falla cerrado: sin autorización o sin presupuesto de la parte no hay techo contra el cual acotar el duplicado.
   if (i.authorizedBudget === null || !Number.isFinite(i.authorizedBudget)) return { ...base, fits: false, reason: 'no_authorization' };
   if (i.itemHardLimit === null || !Number.isFinite(i.itemHardLimit)) return { ...base, fits: false, reason: 'no_item_estimate' };
-  if (worstItem > i.itemHardLimit + 1e-9) return { ...base, fits: false, reason: 'item_recovery_budget' };
+  if (worstItem > i.itemHardLimit + allowance + 1e-9) return { ...base, fits: false, reason: 'item_recovery_budget' };
   if (worstRun > i.authorizedBudget + 1e-9) return { ...base, fits: false, reason: 'run_budget' };
   return { ...base, fits: true, reason: null };
 }
