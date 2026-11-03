@@ -496,13 +496,21 @@ const freePort = () => new Promise((resolve, reject) => { const s = net.createSe
   });
 
   // ═══ 6. estimado de activity ═════════════════════════════════════════════════════════════════════════════════════
-  await check('6 prior de activity: el p50 sigue en lo medido (#1209) y el p90 cubre lo real (0,22); el límite de la parte ya admite el reenvío del incidente', () => {
+  // r83: la recalibración del p90 de llm.activity (×2) se REVIRTIÓ — cambia cotizaciones y el ajuste al presupuesto
+  // (decisión de negocio pendiente del dueño). El reenvío del incidente queda cubierto por la holgura de ambigüedad,
+  // no por el prior: este check fija ambas cosas.
+  await check('6 prior de activity SIN cambios (cotizaciones byte a byte; recalibración pendiente del dueño) y el reenvío del incidente entra igual por la holgura', () => {
     const pri = JSON.parse(fs.readFileSync(path.join(distRoot, '..', 'src/modules/finops/usage-model.priors.v1.json'), 'utf8'));
     const m = pri.operations['llm.activity'].meters;
-    eq([m.input_tokens.p50, m.output_tokens.p50, m.input_tokens.p90, m.output_tokens.p90], [7000, 1450, 24000, 9000], 'tokens');
+    eq([m.input_tokens.p50, m.output_tokens.p50, m.input_tokens.p90, m.output_tokens.p90], [7000, 1450, 12000, 4000], 'tokens (los de antes de r83)');
+    assert(!pri.calibrationR83, 'sin calibrationR83 en los priors');
+    // Límite de la parte con el prior vigente (máximo ≈ 0,10) y el caso real: peor caso 0,471 > límite ≈ 0,43, pero
+    // ≤ límite + holgura (2 × la llamada más grande, 0,126).
     const p90usd = m.input_tokens.p90 * 3e-6 + m.output_tokens.p90 * 15e-6;
-    assert(p90usd >= 0.2, 'p90 ≈ ' + p90usd.toFixed(3));
-    assert(pri.calibrationR83 && /curso 91/.test(pri.calibrationR83.source), 'fuente documentada');
+    const hard = G.itemHardLimit(0.049, p90usd, 0.126);
+    const r = G.ambiguousResendBudget({ itemSpent: 0.219 + 0.126, nextCost: 0.126, itemHardLimit: hard, runSpent: 10, authorizedBudget: 19.65,
+      allowance: G.AMBIGUOUS_RESEND_ALLOWANCE_CALLS * 0.126 });
+    assert(r.worstItem > hard && r.fits, 'cubierto por la holgura: ' + JSON.stringify({ hard, ...r }));
   });
 
   // ═══ 7. lastBrowserActivity ══════════════════════════════════════════════════════════════════════════════════════

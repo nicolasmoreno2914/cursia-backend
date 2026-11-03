@@ -133,6 +133,11 @@ export function itemRecoveryBudgetMessage(detail: string): string {
 // conteo: el peor caso puede usar además una HOLGURA de ambigüedad (`allowance`, = AMBIGUOUS_RESEND_ALLOWANCE_CALLS ×
 // la llamada más grande de la parte) por encima del presupuesto de recuperación; el saldo autorizado del run sigue
 // siendo un techo duro. Sin `allowance` (audio, proveedores pagados) el comportamiento es el de r62.
+//
+// PENDIENTE (decisión del dueño): recalibrar el p90 de `llm.activity` en usage-model.priors.v1.json (lo real del
+// incidente llegó a USD 0,22 por parte vs máximo ≈ 0,10 del prior). Se propuso ×2 en r83 y se REVIRTIÓ: cambia
+// cotizaciones y el ajuste al presupuesto que ve el cliente (goldens C8/L8 byte a byte). El caso del incidente (peor
+// caso 0,47 vs límite ≈ 0,43) queda cubierto por esta holgura, no por el prior (scripts/check-r83-llm.js 1a y 6).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** r83: llamadas (cota de la más grande de la parte) que la holgura de ambigüedad de la IA suma al presupuesto de la parte. */
