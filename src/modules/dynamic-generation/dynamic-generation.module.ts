@@ -20,6 +20,8 @@ import { FinopsModule } from '../finops/finops.module';
 import { AdminDynamicRunsController } from './admin-runs.controller';
 import { LlmDiagnosticsService } from './llm-diagnostics.service';
 import { AdminRecoveryService } from './admin-recovery.service';
+import { AdminCourseOpsService } from './admin-course-ops.service';
+import { AuditLogService } from '../access/audit-log.service';
 import { VideogenReconciliationService } from './videogen-reconciliation.service';
 import { ProviderReconcileService } from './provider-reconcile.service';
 import { PilotMetricsService } from './pilot-metrics.service';
@@ -48,6 +50,8 @@ import { CoherenceModule } from '../coherence/coherence.module';
   providers: [
     RunsService,
     AdminRecoveryService, // EV6 DoD BE-B: cola de recuperación de admin (solo lectura)
+    AdminCourseOpsService, // r95: vista de la última generación de cualquier curso, aprobaciones pendientes, reintento auditado (SA)
+    AuditLogService, // r95: auditoría de las acciones de AdminCourseOpsService (stateless; misma tabla que AccessModule)
     VideogenReconciliationService, // V542 (G6): conciliación explícita de reservas de Videogen (SUPER_ADMIN)
     ProviderReconcileService, // r62 (N2): conciliación AUTOMÁTICA de Videogen/Gamma con evidencia + reenvío acotado
     PilotMetricsService, // Loop 10 C2: métricas del piloto de un run (SUPER_ADMIN, solo lectura)

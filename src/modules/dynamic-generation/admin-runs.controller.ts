@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, HttpStatus, Param, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, HttpCode, HttpStatus, Param, ParseIntPipe, ParseUUIDPipe, Post, Query, UseGuards } from '@nestjs/common';
 import { SupabaseJwtGuard } from '../../auth/supabase-jwt.guard';
 import { SuperAdminGuard } from '../../auth/super-admin.guard';
 import { AdminRecoveryService, NeedsAttentionListing } from './admin-recovery.service';
@@ -8,6 +8,7 @@ import { AuthUser } from '../../auth/auth.types';
 import { PilotMetricsService } from './pilot-metrics.service';
 import { LlmDiagnosticsService, LlmItemDiagnostics } from './llm-diagnostics.service';
 import { SuperAdminOnly } from '../authz/require-permission.decorator';
+import { AdminCourseOpsService } from './admin-course-ops.service';
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin de la generación dinámica (SOLO LECTURA).
@@ -24,7 +25,43 @@ export class AdminDynamicRunsController {
     private readonly videogen: VideogenReconciliationService,
     private readonly pilotMetrics: PilotMetricsService,
     private readonly llmDiagnostics: LlmDiagnosticsService,
+    private readonly courseOps: AdminCourseOpsService,
   ) {}
+
+  // r95 — GET /api/v1/admin/dynamic-runs/pending-approvals?limit=50
+  // «Generaciones que esperan aprobación»: cursos de CUALQUIER usuario cuyo último arranque necesitó un administrador
+  // (curso, correo del dueño, esperado, máximo/tope, estimateId, fecha). Se aprueban con el endpoint EXISTENTE
+  // POST /finops/courses/:courseId/authorizations {estimateId, authorizedBudget}. Solo lectura; queda en la auditoría.
+  @Get('pending-approvals')
+  pendingApprovals(@Query('limit') limit: string | undefined, @CurrentUser() user: AuthUser) {
+    return this.courseOps.pendingApprovals({ id: user.id, email: user.email }, { limit: limit === undefined ? undefined : Number(limit) });
+  }
+
+  // r95 — GET /api/v1/admin/dynamic-runs/courses/:courseId/latest
+  // Última generación V2 de un curso de CUALQUIER usuario (GET …/runs/:runId da 404 a quien no es el dueño) + sus partes
+  // no completadas. SOLO LECTURA; queda en la auditoría (course.admin_view_run).
+  @Get('courses/:courseId/latest')
+  courseLatest(@Param('courseId', ParseIntPipe) courseId: number, @CurrentUser() user: AuthUser) {
+    return this.courseOps.latestRunForCourse(courseId, { id: user.id, email: user.email });
+  }
+
+  // r95 — POST /api/v1/admin/dynamic-runs/:runId/items/:itemKey/retry {reason?}
+  // Reintento SIMPLE de una parte en nombre del dueño (el mismo retryItem que usa el dueño). Nunca resubmitVideo ni
+  // resubmitProvider desde aquí (esos siguen en el endpoint del run, con sus avisos). Queda en la auditoría.
+  @Post(':runId/items/:itemKey/retry')
+  @HttpCode(HttpStatus.OK)
+  retryItem(
+    @Param('runId', ParseUUIDPipe) runId: string,
+    @Param('itemKey') itemKey: string,
+    @Body() body: Record<string, unknown>,
+    @CurrentUser() user: AuthUser,
+  ) {
+    const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    const extra = Object.keys(b).filter((k) => k !== 'reason');
+    if (extra.length) throw new BadRequestException(`campos no permitidos: ${extra.join(', ')} (este reintento nunca reenvía pagos a proveedores)`);
+    if (b.reason !== undefined && b.reason !== null && (typeof b.reason !== 'string' || b.reason.length > 300)) throw new BadRequestException('reason inválido');
+    return this.courseOps.retryItem(runId, itemKey, { id: user.id, email: user.email }, (b.reason as string | undefined) ?? null);
+  }
 
   // Loop 10 C2 — GET /api/v1/admin/dynamic-runs/:runId/pilot-metrics
   // Métricas del piloto del run (tiempos, costo, reintentos, recuperaciones, intervenciones manuales, uso del navegador,
