@@ -220,7 +220,9 @@ export const ITEM_RULE_STRATEGIES: Readonly<Record<string, RuleStrategyEntry>> =
   v3_payload_invalid: E('prompt_with_findings'),
   validation_invalid: E('prompt_with_findings'),
   exam_bank_invalid: E('prompt_with_findings', { hold_for_human: 'cursia_issue_hold' }, { EXAM_BANK_INCOMPLETE: 'self_adaptive' }),
-  corrupt_dependency: E('regenerate_dependency'),
+  // Un artifact de entrada vacío / corrupto que YA pasó la validación de su productor es un bug de Cursia (el auto-heal
+  // no regenera la dependencia): pausa + reporte; lo resuelve el arreglo del validador del productor.
+  corrupt_dependency: E('cursia_issue_hold'),
   presentation_output_invalid: E('cursia_issue_hold', { repoll_external: 'repoll_provider' }),
   presentation_slide_count: E('cursia_issue_hold'),
   gamma_generation_failed: E('cursia_issue_hold', { provider_check: 'reconcile_provider' }),
@@ -247,11 +249,13 @@ export const ITEM_RULE_STRATEGIES: Readonly<Record<string, RuleStrategyEntry>> =
   youtube_upload_unconfirmed: E('repoll_provider'),
   youtube_upload_rejected: E('cursia_issue_hold'),
   youtube_verify: E('repoll_provider'),
-  youtube_delivery: E('regenerate_dependency'),
+  // Entrega de YouTube incompleta / sin job de Videogen: contrato de la entrega (bug de Cursia).
+  youtube_delivery: E('cursia_issue_hold'),
   // Gamma.
   gamma_repoll: E('repoll_provider', { retry_backoff: 'wait_backoff' }),
   gamma_submit_failed: E('wait_backoff', { wait_provider: 'cursia_issue_hold', hold_for_human: 'cursia_issue_hold' }),
-  gamma_ambiguous: E('cursia_issue_hold'),
+  // Sin generationId: la conciliación de proveedor tiene un caso «ambiguo» (un reenvío acotado); lo que decline → pausa.
+  gamma_ambiguous: E('reconcile_provider'),
   gamma_cover_render: E('wait_backoff'),
   // TTS.
   tts_failed: E('wait_backoff', { auto_resubmit_once: 'reconcile_provider', wait_provider: 'provider_probe', hold_for_human: 'cursia_issue_hold' }),

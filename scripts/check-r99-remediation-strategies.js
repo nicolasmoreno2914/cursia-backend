@@ -255,6 +255,22 @@ function strategyOfCode(code, extra = {}) {
     eq([again.active, again.count, again.buildResumes], [true, 2, 1], 'vuelve a la pausa conservando el tope');
   });
 
+  await check('U5 la pausa inmediata nunca le gana a un mecanismo automático existente (conciliación de proveedor, reenvío único de audio): solo cuando hoy nada la tomaría', async () => {
+    process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+    const IT = L('modules/dynamic-generation/item-transitions.js');
+    const qr = { sqls: [], async query(sql) { this.sqls.push(sql); return []; } };
+    const mk = (type, error) => ({ id: 'i1', status: 'failed', type, output_summary: {}, run_created_at: new Date() });
+    const ambiguous = 'gamma_submit_ambiguous: el envío a Gamma no confirmó la generación';
+    const vA = FC.classifyFailure({ error: ambiguous, itemType: 'presentation', source: 'provider_worker', outputSummary: {} });
+    eq(RS.remediationStrategyFor(vA).strategy, 'reconcile_provider', 'estrategia');
+    eq(await IT.applyCursiaIssueHold(qr, mk('presentation'), ambiguous, vA, null), null, 'la conciliación la toma: sin pausa');
+    const vU = FC.classifyFailure({ error: UNK, itemType: 'content', source: 'browser_executor', outputSummary: {} });
+    const row = mk('content');
+    const st = await IT.applyCursiaIssueHold(qr, row, UNK, vU, null);
+    eq([st && st.reason, row.status, row.output_summary.bugHold.active], ['unmapped_code', 'failed', true], 'desconocido: pausa');
+    assert(qr.sqls.some((q) => /set status = 'failed', next_retry_at = null/.test(q)), 'misma transacción');
+  });
+
   await check('U4 la identidad del build es estable en el proceso y CURSIA_BUILD_ID la fija', async () => {
     BH.resetBuildIdCache();
     const a = BH.currentBuildId({}); const b = BH.currentBuildId({});

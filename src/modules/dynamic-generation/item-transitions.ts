@@ -246,14 +246,20 @@ export async function applyRemediationLadder(
  */
 export async function applyCursiaIssueHold(
   qr: QueryRunner,
-  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null },
+  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null; run_created_at?: Date | string | null },
   error: string,
   verdict: ReturnType<typeof classifyFailure>,
   step: LadderStep | null,
   now: Date = new Date(),
 ): Promise<BugHoldState | null> {
   const imm = holdsImmediately(verdict);
-  const reason: BugHoldReason | null = imm.hold ? imm.reason : step?.action === 'exhausted' ? 'strategy_exhausted' : null;
+  // La pausa inmediata NUNCA le gana a un mecanismo automático existente (conciliación de proveedor, reenvío único de
+  // audio, control de gasto, claim incompleto, auto-heal…): solo cuando el sistema de hoy no haría nada solo. Lo que esos
+  // mecanismos terminen declinando lo pausa después el barrido (sweepCursiaIssues).
+  const cur = imm.hold || step?.action === 'exhausted'
+    ? currentRecoveryOf(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null) : 'manual';
+  const noAutomaticPath = cur === 'manual' || cur === 'denied';
+  const reason: BugHoldReason | null = !noAutomaticPath ? null : imm.hold ? imm.reason : step?.action === 'exhausted' ? 'strategy_exhausted' : null;
   if (!reason) return null;
   const state = nextBugHold(bugHoldStateOf(row.output_summary), verdict, row.type, error, reason, now, currentBuildId());
   await qr.query(
