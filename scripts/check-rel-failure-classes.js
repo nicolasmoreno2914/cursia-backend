@@ -113,6 +113,16 @@ check('tabla: IA (transitorios A, configuración D scope provider, tamaño/trunc
   expectVerdict('❌ El servicio de IA de este entorno no está configurado. Contacta a soporte de Cursia.', { class: 'D', code: 'proxy_misconfigured', scope: 'provider' });
   expectVerdict('❌ Error de configuración interna. Intenta nuevamente o contacta soporte.', { class: 'D', code: 'llm_model_config' });
   expectVerdict('❌ No tienes acceso. Inicia sesión o verifica tu cuenta en Cursia.', { class: 'A', code: 'browser_auth' });
+  // r93 (FE r89, bloque 3): las negativas de api() ahora van en lenguaje de producto sin prefijo de código.
+  expectVerdict('Tu sesión venció. Inicia sesión para continuar.', { class: 'A', code: 'session_expired', strategy: 'retry_backoff' }, { source: 'browser_executor' });
+  expectVerdict('Tu cuenta no tiene permiso para esta acción. Si crees que es un error, escríbele al equipo de Cursia. No se hizo la llamada (sin gasto).', { class: 'A', code: 'browser_forbidden' }, { source: 'browser_executor' });
+  expectVerdict('Tu presupuesto disponible no alcanza para esta generación; solicita autorización. No se hizo la llamada (sin gasto).', { class: 'D', code: 'user_budget_insufficient', humanReason: 'budget', adminAction: 'approve_budget' }, { source: 'browser_executor' });
+  expectVerdict('Todavía no tienes presupuesto asignado; solicita autorización. No se hizo la llamada (sin gasto).', { class: 'D', code: 'user_budget_not_assigned', humanReason: 'budget' }, { source: 'browser_executor' });
+  expectVerdict('Tus generaciones están suspendidas. Puedes seguir viendo tus cursos. No se hizo la llamada (sin gasto).', { class: 'D', code: 'generation_suspended', humanReason: 'config' }, { source: 'browser_executor' });
+  expectVerdict('Las generaciones nuevas están pausadas temporalmente en Cursia. Tus cursos siguen disponibles. No se hizo la llamada (sin gasto).', { class: 'D', code: 'platform_generation_frozen' }, { source: 'browser_executor' });
+  expectVerdict('Tu cuenta está suspendida; contacta al administrador. No se hizo la llamada (sin gasto).', { class: 'D', code: 'account_suspended' }, { source: 'browser_executor' });
+  expectVerdict('Tu cuenta no tiene acceso a Cursia; pide acceso al administrador. No se hizo la llamada (sin gasto).', { class: 'D', code: 'account_not_authorized' }, { source: 'browser_executor' });
+  expectVerdict('La conexión de IA de Cursia no está disponible para tu cuenta. Escríbele al equipo de Cursia. No se hizo la llamada (sin gasto).', { class: 'D', code: 'ai_connection_unavailable', humanReason: 'config', scope: 'provider' }, { source: 'browser_executor' });
   expectVerdict('Petición demasiado grande (413)', { class: 'B', strategy: 'regenerate_split' });
   expectVerdict('EXAM_BANK_PROMPT_TOO_LARGE: el texto del capítulo c1 supera el tope', { class: 'B', strategy: 'regenerate_split' });
   expectVerdict('❌ Error al procesar la solicitud: prompt is too long: 210000 tokens', { class: 'B', strategy: 'regenerate_split', code: 'llm_request_rejected' });
@@ -671,6 +681,19 @@ const FE_API_EXPR_SAMPLES = new Map([
   ["se2.msg||'Respuesta de la IA incompleta'", ['Respuesta de la IA incompleta']],
 ]);
 
+/**
+ * r93 (FE r89, bloque 3): constantes de texto de 04-api.js usadas como `msg:` (p. ej. el 401 de sesión vencida lanza
+ * `msg:CURSIA_SESSION_EXPIRED_MSG`). El texto NO se copia acá: se lee de su declaración literal en el mismo archivo
+ * (`var NOMBRE='…';`), así un cambio del texto en el frontend se clasifica con el texto real. Una constante que no
+ * está en esta lista, o cuya declaración deja de ser un literal, hace fallar el gate.
+ */
+const FE_API_CONST_MSGS = new Set(['CURSIA_SESSION_EXPIRED_MSG']);
+function feApiConstText(src, name) {
+  const m = new RegExp('(?:^|[;\\s])(?:var|let|const)\\s+' + name + "\\s*=\\s*'((?:[^'\\\\\\n]|\\\\.)*)'\\s*;").exec(src);
+  if (!m) return null;
+  try { return JSON.parse('"' + m[1].replace(/"/g, '\\"').replace(/\\'/g, "'") + '"'); } catch (_) { return null; }
+}
+
 /** Corre el gate frontend sobre un directorio; devuelve {missing, samples}. */
 function frontendGate(dir, opts = {}) {
   const exec = path.join(dir, 'src/js/45-dynamic-generation-executor.js');
@@ -693,6 +716,12 @@ function frontendGate(dir, opts = {}) {
   for (const e of SCAN.scanFrontendApi(api)) {
     if (!e.text.startsWith('__expr__ ')) { samples.push([`api:${e.line}`, e.text]); continue; }
     const expr = e.text.slice(9);
+    if (FE_API_CONST_MSGS.has(expr)) {
+      const t = feApiConstText(fs.readFileSync(api, 'utf8'), expr);
+      if (t == null) { missing.push(`api:${e.line} constante ${expr} sin declaración literal en 04-api.js`); continue; }
+      samples.push([`api:${e.line}`, t]);
+      continue;
+    }
     if (!FE_API_EXPR_SAMPLES.has(expr)) { missing.push(`api:${e.line} expresión sin código: ${expr.slice(0, 160)}`); continue; }
     for (const x of FE_API_EXPR_SAMPLES.get(expr)) samples.push([`api:${e.line}`, x]);
   }
