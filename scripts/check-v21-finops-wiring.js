@@ -104,7 +104,8 @@ async function pureChecks() {
   const estimate = (items, rp) => F.estimateCost({ items, catalog, usageModel: F.usageModelPriorsV1(), retryPolicy: rp || { maxRetries: 1 } });
 
   await check('puro (flujo normal): planNormalApproval — dentro de la política ⇒ monto = min(max, lo que queda de run/curso/mes); esperado sobre un límite ⇒ bloqueado nombrando el límite; sin política ⇒ bloqueado; límites por proveedor', () => {
-    const est = { totals: { min: '3', expected: '5', max: '13', byProvider: { gamma: { min: '1', expected: '2', max: '4' } }, byItemType: {} } };
+    // r90: el monto autorizado es el tope de seguridad (aquí 13) y el «máximo» de un proveedor es su esperado × 1,5 (gamma: 3).
+    const est = { totals: { min: '3', expected: '5', max: '13', safetyCap: '13', byProvider: { gamma: { min: '1', expected: '2', max: '4' } }, byItemType: {} } };
     const pol = (limits) => ({ limits, onExceed: 'ADMIN_APPROVAL', requireHumanApprovalForRealSpend: true });
     let p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }), courseSpent: '0', monthSpent: '30.6' });
     eq([p.withinPolicy, dec(p.amount), p.cappedByLimit, p.blockedBy], [true, 10, 'maxCostPerRun', []], 'acotado por maxCostPerRun');
@@ -118,13 +119,13 @@ async function pureChecks() {
     p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '1' } }), courseSpent: '0', monthSpent: '0' });
     eq(p.blockedBy.map((b) => [b.limit, b.over]), [['maxCostPerProvider.gamma', 'expected']], 'por proveedor');
     // Review I1: lo ya gastado en el proveedor cuenta, y el MÁXIMO del proveedor debe entrar (una autorización total no lo acota).
-    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '9' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '8.5' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
     eq(p.blockedBy.map((b) => [b.limit, b.over, dec(b.spent)]), [['maxCostPerProvider.gamma', 'max', 6]], 'gastado + max > límite');
-    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '10' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '9' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
     eq(p.withinPolicy, true, 'gastado + max ≤ límite');
     p = F.planNormalApproval({ estimate: est, policy: pol({ monthlyCap: '50' }), courseSpent: '0', monthSpent: '50' });
     eq([p.withinPolicy, p.blockedBy[0].limit], [false, 'monthlyCap'], 'mes justo agotado ⇒ bloqueado (nunca monto 0)');
-    const est0 = { totals: { min: '0', expected: '0', max: '1', byProvider: {}, byItemType: {} } };
+    const est0 = { totals: { min: '0', expected: '0', max: '1', safetyCap: '1', byProvider: {}, byItemType: {} } };
     p = F.planNormalApproval({ estimate: est0, policy: pol({ maxCostPerCourse: '5' }), courseSpent: '5', monthSpent: '0' });
     eq([p.withinPolicy, p.blockedBy[0].limit, dec(p.blockedBy[0].limitValue)], [false, 'maxCostPerCourse', 5], 'remanente 0 ⇒ nombra el límite que lo acotó');
     p = F.planNormalApproval({ estimate: est, policy: pol({}), courseSpent: '0', monthSpent: '0' });
@@ -632,7 +633,7 @@ async function dbChecks() {
       const types = new Set(est.lines.map((l) => l.itemType));
       for (const t of ['video', 'presentation', 'audio_welcome', 'audiobook_chapter']) assert(!types.has(t), `mock no estima ${t}`);
       assert(types.has('content') && dec(est.totals.expected) > 0, 'LLM estimado');
-      eq(dec(auths[0].b), dec(est.totals.max), 'authorized = max del estimado');
+      eq(dec(auths[0].b), dec(est.totals.safetyCap), 'authorized = tope de seguridad del estimado (r90)');
     });
 
     await check('DB gate (merge R5): video MOCK pero Gamma/TTS en su default REAL → 409 budget_approval_required (el modo de video no decide el gasto de proveedores)', async () => {
@@ -1280,7 +1281,7 @@ async function dbChecks() {
       assert(dec(pvN.estimate.byCategory.presentations.expected) > 0 && dec(pvN.estimate.byCategory.audio.expected) > 0 && dec(pvN.estimate.byCategory.content.expected) > 0, 'familias');
       eq(dec(pvN.estimate.byCategory.videos.expected), 0, 'videos de vista previa ⇒ 0');
       eq([pvN.counts.modules, pvN.counts.chapters, pvN.counts.videos, pvN.counts.moduleExams, pvN.counts.finalExam], [1, 2, 2, 1, true], 'conteos');
-      eq(dec(pvN.approval.amount), dec(pvN.estimate.max), 'monto = max (límites holgados)');
+      eq(dec(pvN.approval.amount), dec(pvN.estimate.safetyCap), 'monto = tope de seguridad (límites holgados; r90)');
       assert(/^[0-9a-f]{64}$/.test(pvN.estimateHash), 'huella');
       eq((await runs.previewStart(N.cid, NOT_ADMIN, 1, NCTX)).approval.canApprove, false, 'otro email no aprueba');
       eq((await ds.query(`select count(*)::int n from public.cost_estimates where course_id = $1`, [N.cid]))[0].n, before, 'sin escrituras');
@@ -1367,7 +1368,7 @@ async function dbChecks() {
       const L = await makeCourse('Curso acotado');
       const pv0 = await runs.previewStart(L.cid, ADMIN, 1, NCTX); // sin política del curso: la global (si hay) o ninguna
       assert(pv0.estimate, 'estimado');
-      const mid = ((dec(pv0.estimate.expected) + dec(pv0.estimate.max)) / 2).toFixed(6);
+      const mid = ((dec(pv0.estimate.expected) + dec(pv0.estimate.safetyCap)) / 2).toFixed(6); // r90: entre esperado y tope
       await coursePolicy(L.cid, { maxCostPerRun: mid });
       const pv = await runs.previewStart(L.cid, ADMIN, 1, NCTX);
       eq([pv.approval.withinPolicy, pv.approval.cappedByLimit, dec(pv.approval.amount)], [true, 'maxCostPerRun', dec(mid)], 'acotado');
@@ -1409,7 +1410,7 @@ async function dbChecks() {
       const Y = await makeCourse('Curso mes Y');
       const pvx0 = await runs.previewStart(X.cid, ADMIN, 1, NCTX);
       const e = dec(pvx0.estimate.expected);
-      const m = dec(pvx0.estimate.max);
+      const m = dec(pvx0.estimate.safetyCap); // r90: lo autorizado = tope de seguridad
       // Tope mensual que alcanza para UNO (monto = max) pero no para dos (el esperado del segundo ya no entra).
       const month = (await budget.monthCommitted()).total;
       const cap = (dec(month) + m + e / 2).toFixed(6);

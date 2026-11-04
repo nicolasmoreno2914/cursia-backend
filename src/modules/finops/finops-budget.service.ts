@@ -25,6 +25,7 @@ import {
 } from './run-budget';
 import { APPROVAL_TTL_HOURS, NORMAL_APPROVAL_REASON_PREFIX } from './normal-approval';
 import { llmCallUpperBoundUsage } from './llm-usage-ingest';
+import { readSafetyCapFactor, safetyCapOfEstimate } from './safety-cap';
 import { ReservationKind, SubjectSpendAccess, UserBudgetGate, userBudgetsMode } from './user-budget-gate';
 
 /** Advisory lock global (por transacción) que serializa las aprobaciones del flujo normal frente al tope mensual. */
@@ -153,6 +154,8 @@ export class FinopsBudgetService {
       usageModel: usageModelPriorsV1(),
       retryPolicy: opts.retryPolicy ?? readEstimateRetryPolicy(),
       pricingAsOf: new Date(),
+      // r90: tope de seguridad del run (FINOPS_RUN_SAFETY_CAP_FACTOR, default 1,5).
+      safetyCapFactor: readSafetyCapFactor(),
     });
   }
 
@@ -496,7 +499,9 @@ export class FinopsBudgetService {
           reason: `bound_from:${a.approval.id}`,
         }, runner)
       : await this.ledger.authorize({
-          runId: a.runId, courseId: a.courseId, estimateId: est.id, authorizedBudget: a.evaluation.estimate.totals.max,
+          runId: a.runId, courseId: a.courseId, estimateId: est.id,
+          // r90: el presupuesto autorizado de un run AUTO es el tope de seguridad (no el máximo p90 × reintentos).
+          authorizedBudget: safetyCapOfEstimate(a.evaluation.estimate),
           policyId: a.evaluation.policyId, decision: 'AUTO_WITHIN_POLICY', reason: `auto_within_policy:${a.evaluation.reasons.join('|')}`,
         }, runner);
     // r75 (pasos 5–8): disponible recalculado en ESTA tx; si no alcanza → 409 user_budget_insufficient y la tx del run
