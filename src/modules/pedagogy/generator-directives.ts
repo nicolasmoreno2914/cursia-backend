@@ -96,6 +96,8 @@ export interface ItemPedagogyBrief {
    * validación de la experiencia exige además de la estructura EV2 (el ejecutor la espeja; el backend es autoritativo).
    */
   experienceRequirements?: FrameworkExperienceRequirement[];
+  /** r98 (review P2-5): el feedback de la escalera de remediación no entró en el brief ni recortándolo. */
+  feedbackDropped?: true;
 }
 
 // ── Cobertura: qué hace cada tipo de item con el diseño ─────────────────────
@@ -708,4 +710,31 @@ export function missingGeneratorTexts(): string[] {
   check(INTERACTION_LEVEL_TEXT, ['high', 'medium', 'low'], 'interactionLevel');
   missing.push(...missingLearningPlanTexts());
   return missing;
+}
+
+/**
+ * r98 (escalera de remediación, rung 1): el intento siguiente a un fallo determinista repetido CAMBIA su entrada — los
+ * hallazgos del validador van al prompt dentro del bloque del brief (el ejecutor del navegador y el worker de IA ya lo
+ * insertan tal cual: dynPedagogyBlock). Sin brief se arma uno mínimo SOLO para generadores LLM (los de proveedor —
+ * presentación / video— no tienen bloque). El texto respeta PEDAGOGY_BRIEF_TEXT_MAX (el feedback se recorta, nunca el
+ * diseño). null = este item no tiene dónde llevarlo.
+ */
+export function withRemediationFeedback(brief: ItemPedagogyBrief | null, item: BriefInput['item'], feedback: string): ItemPedagogyBrief | null {
+  const fb = String(feedback ?? '').trim();
+  const gen = brief?.generator ?? generatorForItem(item);
+  if (!fb || !gen || PROVIDER_GENERATORS.has(gen)) return brief;
+  let base = brief?.text ?? renderText(gen, []);
+  // Review P2-5: el feedback NO se descarta en silencio cuando el brief ya está lleno: se recorta el final del brief
+  // (sus últimas indicaciones; la cabecera con el marcador se conserva) para hacerle lugar. Si ni así entra, se marca.
+  const want = Math.min(fb.length, 1200);
+  if (PEDAGOGY_BRIEF_TEXT_MAX - base.length - 1 < want) {
+    const head = base.indexOf(PEDAGOGY_PROMPT_MARKER);
+    const minBase = head >= 0 ? head + PEDAGOGY_PROMPT_MARKER.length + 4 : 0;
+    base = base.slice(0, Math.max(minBase, PEDAGOGY_BRIEF_TEXT_MAX - 1 - want)).replace(/\s+$/, '');
+  }
+  const room = PEDAGOGY_BRIEF_TEXT_MAX - base.length - 1;
+  const base0 = brief ?? { version: GENERATOR_DIRECTIVES_VERSION, engineVersion: 0, generator: gen, directives: [], overridden: [] };
+  if (room < 80) return { ...(brief ?? base0), ...(brief ? {} : { text: base, textSha256: sha256(base) }), feedbackDropped: true } as ItemPedagogyBrief;
+  const text = `${base}\n${fb.slice(0, room)}`;
+  return { ...base0, text, textSha256: sha256(text) } as ItemPedagogyBrief;
 }

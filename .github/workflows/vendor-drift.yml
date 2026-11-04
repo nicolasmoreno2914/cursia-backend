@@ -1,0 +1,73 @@
+# r98 — vendor-drift: el backend vendoriza archivos del frontend (vendor/dynamic-executor/, lista en
+# scripts/sync-dynamic-executor-vendor.js: 24-backend-client.js, 45-dynamic-generation-executor.js, …). Hasta ahora la
+# deriva se descubría horas después, dentro de gate-core. El repo del frontend no tiene CI, así que el chequeo vive acá:
+#  - cada 3 h (y a mano) compara vendor/ de `staging` con el frontend `staging` → rojo con el comando a correr;
+#  - además AVISA (sin fallar) de los PR abiertos del frontend que tocan archivos vendorizados.
+# Sin proveedores, sin secretos más allá del token de LECTURA del frontend (CURSIA_FE_READ_TOKEN). USD 0.
+name: vendor-drift
+
+on:
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      fe_ref:
+        description: 'Rama del frontend a comparar (default staging)'
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  vendor-drift:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: staging
+          path: be
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Frontend (repo privado, solo lectura)
+        env:
+          FE_TOKEN: ${{ secrets.CURSIA_FE_READ_TOKEN }}
+          FE_REF: ${{ inputs.fe_ref || 'staging' }}
+        run: |
+          if [ -z "$FE_TOKEN" ]; then
+            echo "::error::Falta el secreto CURSIA_FE_READ_TOKEN: no se puede comparar el vendor del ejecutor con el frontend."
+            exit 1
+          fi
+          git clone -q --depth 1 --branch "$FE_REF" "https://x-access-token:${FE_TOKEN}@github.com/nicolasmoreno2914/cursia.git" fe
+          git -C fe remote set-url origin https://github.com/nicolasmoreno2914/cursia.git
+          echo "frontend: $FE_REF $(git -C fe rev-parse HEAD)"
+
+      - name: Vendor del ejecutor alineado con el frontend
+        env:
+          FE_REF: ${{ inputs.fe_ref || 'staging' }}
+        run: |
+          cd be
+          if ! node scripts/sync-dynamic-executor-vendor.js --check --from ../fe; then
+            echo "::error::El frontend ($FE_REF) cambió archivos que el backend vendoriza. En el backend: node scripts/sync-dynamic-executor-vendor.js --from <checkout del frontend> y abrir un PR a staging con vendor/dynamic-executor/."
+            exit 1
+          fi
+
+      - name: PR abiertos del frontend que tocan archivos vendorizados (aviso)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CURSIA_FE_READ_TOKEN }}
+        run: |
+          cd be
+          files=$(node -e "const s=require('fs').readFileSync('scripts/sync-dynamic-executor-vendor.js','utf8');const m=/const FILES = \[([^\]]*)\]/.exec(s);console.log(m?m[1].replace(/['\s]/g,'').split(',').filter(Boolean).join(' '):'')")
+          prs=$(gh api 'repos/nicolasmoreno2914/cursia/pulls?state=open&per_page=50' --jq '.[].number' 2>/dev/null) || { echo "::notice::No se pudieron listar los PR del frontend con este token (solo se compara staging)."; exit 0; }
+          for n in $prs; do
+            changed=$(gh api "repos/nicolasmoreno2914/cursia/pulls/$n/files?per_page=100" --jq '.[].filename' 2>/dev/null || true)
+            for f in $files; do
+              if printf '%s\n' "$changed" | grep -qx "src/js/$f"; then
+                echo "::warning::PR #$n del frontend cambia src/js/$f (vendorizado en el backend): al mergearlo, correr node scripts/sync-dynamic-executor-vendor.js en el backend en el mismo ciclo."
+              fi
+            done
+          done

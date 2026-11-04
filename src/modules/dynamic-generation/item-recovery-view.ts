@@ -13,6 +13,7 @@ import { maxAutomaticRoundsToday } from './item-transitions';
 import { autoRecoveryEnabled } from './auto-heal';
 import { providerProbeViewOf } from '../reliability/provider-probe';
 import { RecoveryStateView, recoveryStateOf } from '../reliability/recovery-state';
+import { REMEDIATION_EXHAUSTED_REASON, remediationBlocksAuto, remediationOf } from '../reliability/remediation-ladder';
 
 export interface ItemRecoveryView {
   /** Clase del último fallo (null = sin fallo). */
@@ -42,6 +43,13 @@ export interface ItemRecoveryView {
    * sistema la retoma solo. Derivado de la fila (las transiciones lo persisten además en output_summary.recovery).
    */
   state?: RecoveryStateView;
+  /**
+   * r98: escalera de remediación de un fallo determinista (output_summary.remediation): escalón actual, qué hace el
+   * próximo intento y, si se agotó, el motivo para el usuario (el dueño puede reintentar sin admin).
+   */
+  remediation?: { rung: number; code: string; count: number; next: 'feedback' | 'accept' | 'owner_retry' | 'none'; reasonText: string | null; outcome: string | null };
+  /** r98: la parte se aceptó con una marca de calidad (rung 2): códigos aceptados. */
+  qualityAccepted?: string[];
 }
 
 export interface ItemCostView {
@@ -85,7 +93,22 @@ export function recoveryViewOf(r: Record<string, any>, now: Date = new Date()): 
   // Re-review m-n1: solo la excepción del error ACTUAL.
   const pr = r.output_summary?.providerReconcile;
   const declined = r.status === 'failed' && pr && String(pr.declinedError ?? '') === String(r.error ?? '') ? pr.declined : null;
-  return typeof declined === 'string' && declined ? { ...v, exceptionReason: declined } : v;
+  const withDeclined: ItemRecoveryView = typeof declined === 'string' && declined ? { ...v, exceptionReason: declined } : v;
+  return withRemediation(r, withDeclined);
+}
+
+/** r98: vista de la escalera de remediación y de la aceptación con marca de calidad. */
+function withRemediation(r: Record<string, any>, v: ItemRecoveryView): ItemRecoveryView {
+  const rem = remediationOf(r.output_summary);
+  const q = r.output_summary?.quality;
+  const accepted = q && Array.isArray(q.warnings) ? [...new Set(q.warnings.flatMap((w: any) => (Array.isArray(w?.codes) ? w.codes.map(String) : [])))] as string[] : [];
+  let out = v;
+  if (rem) {
+    const exhausted = remediationBlocksAuto(r.output_summary, r.error);
+    const next = rem.outcome ? 'none' : exhausted ? 'owner_retry' : rem.rung === 1 ? 'feedback' : rem.rung === 2 ? 'accept' : 'none';
+    out = { ...out, remediation: { rung: rem.rung, code: rem.code, count: rem.count, next, reasonText: exhausted ? REMEDIATION_EXHAUSTED_REASON : null, outcome: rem.outcome ?? null } };
+  }
+  return accepted.length ? { ...out, qualityAccepted: accepted } : out;
 }
 
 function baseRecoveryViewOf(r: Record<string, any>): ItemRecoveryView {

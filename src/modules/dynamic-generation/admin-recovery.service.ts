@@ -1,9 +1,18 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import { RunsService } from './runs.service';
 import { RunAdminAction, RunAdminActionCode, RunCompletion, loadPendingVideogenReservations } from './run-completion';
 import { packageHoldOf } from './stop-after';
+import {
+  CommonFailureRow, CommonFailureSignal, REMEDIATION_EXHAUSTED_CODE, REMEDIATION_EXHAUSTED_REASON, commonFailureSignals, remediationBlocksAuto,
+} from '../reliability/remediation-ladder';
+
+/** r98: acción/target de la marca «resuelto» de una Falla común en admin_audit_log. */
+export const COMMON_FAILURE_RESOLVE_ACTION = 'common_failure.resolve';
+export const COMMON_FAILURE_TARGET_TYPE = 'failure_fingerprint';
+/** r98 (review P2-2): vigencia de la señal cacheada para needs-attention. */
+export const COMMON_FAILURES_CACHE_MS = 5 * 60_000;
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin (SOLO LECTURA).
@@ -42,7 +51,7 @@ export interface NeedsAttentionEntry {
   updatedAt: string | null;
   finishedAt: string | null;
   /** Componentes no hechos que NO son de vista previa (fallidos, bloqueados, sin validar). */
-  failedComponents: Array<{ itemKey: string; type: string; status: string; failureCode: string | null }>;
+  failedComponents: Array<{ itemKey: string; type: string; status: string; failureCode: string | null; reason?: string; reasonText?: string }>;
   missingComponents: string[];
   previewComponents: string[];
   packageJob: RunCompletion['packageJob'] | null;
@@ -79,6 +88,8 @@ export interface NeedsAttentionListing {
   pendingReservationsTotals: { reservations: number; runs: number; listedRuns: number; truncated: boolean };
   /** Ejecuciones que no se pudieron evaluar (integridad): solo ids y un código. */
   errors: Array<{ runId: string; courseId: number; code: string }>;
+  /** r98: «Falla común» — misma huella en ≥ 3 cursos dentro de 24 h (agregado, nunca una cola por curso). */
+  commonFailures?: CommonFailureSignal[];
 }
 
 /** Código estable del error de un item (prefijo `^[a-z][a-z0-9_]*`), nunca el texto. */
@@ -225,7 +236,94 @@ export class AdminRecoveryService {
       }
     }
     await this.addPendingReservations(out, opts.reservationRuns);
+    try {
+      // Review P2-2: la carga de needs-attention usa la señal CACHEADA (≤ 5 min); el endpoint dedicado la recalcula.
+      out.commonFailures = (await this.listCommonFailuresCached()).filter((x) => x.status === 'active');
+    } catch (err) {
+      this.logger.warn(`needs-attention: no se pudo calcular «Falla común»: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+    }
     return out;
+  }
+
+  /**
+   * r98 — «Falla común»: huellas de fallos deterministas (output_summary.remediation de cualquier run) que tocaron ≥ 3
+   * cursos distintos dentro de 24 h. Cada entrada trae un reporte listo para pegar en una sesión de desarrollo (solo ids;
+   * mensajes recortados y redactados). Resuelta: marca de un admin posterior a la última aparición, o 72 h sin aparecer.
+   * Ventana de lectura: 7 días. Solo lectura.
+   */
+  async listCommonFailures(now: Date = new Date()): Promise<CommonFailureSignal[]> {
+    const rows: any[] = await this.dataSource.query(
+      `select g.job_id, g.item_key, g.type, g.output_summary->'remediation' as remediation, pj.course_id
+         from public.generation_item_runs g
+         join public.production_jobs pj on pj.id = g.job_id
+        where g.updated_at >= $1::timestamptz
+          and jsonb_typeof(g.output_summary->'remediation') = 'object'
+          and (g.output_summary->'remediation'->>'lastAt') >= $1
+        order by g.updated_at desc nulls last
+        limit 5000`,
+      [new Date(now.getTime() - 7 * 86_400_000).toISOString()],
+    );
+    const input: CommonFailureRow[] = rows
+      .filter((r) => r && r.remediation && typeof r.remediation === 'object')
+      .map((r) => ({ courseId: Number(r.course_id), runId: String(r.job_id), itemKey: String(r.item_key), itemType: r.type ?? null, remediation: r.remediation }));
+    return commonFailureSignals(input, await this.commonFailureResolutions(), now);
+  }
+
+  /** r98: respuesta de GET /admin/dynamic-runs/common-failures (activas; `includeResolved` también las resueltas). */
+  async commonFailuresListing(includeResolved = false): Promise<{ generatedAt: string; commonFailures: CommonFailureSignal[] }> {
+    const list = await this.listCommonFailures();
+    return { generatedAt: new Date().toISOString(), commonFailures: includeResolved ? list : list.filter((x) => x.status === 'active') };
+  }
+
+  private commonFailuresCache: { at: number; list: CommonFailureSignal[] } | null = null;
+
+  /** r98 (review P2-2): la señal para la carga de needs-attention, recalculada como mucho cada COMMON_FAILURES_CACHE_MS. */
+  async listCommonFailuresCached(now: Date = new Date()): Promise<CommonFailureSignal[]> {
+    const c = this.commonFailuresCache;
+    if (c && now.getTime() - c.at < COMMON_FAILURES_CACHE_MS) return c.list;
+    const list = await this.listCommonFailures(now);
+    this.commonFailuresCache = { at: now.getTime(), list };
+    return list;
+  }
+
+  /** Marcas «resuelto» de admins (admin_audit_log, append-only). Sin la tabla (entorno sin r75) → ninguna. */
+  private async commonFailureResolutions(): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    try {
+      const rows: any[] = await this.dataSource.query(
+        `select target_id, max(at) as at from public.admin_audit_log
+          where action = $1 and target_type = $2 group by target_id`,
+        [COMMON_FAILURE_RESOLVE_ACTION, COMMON_FAILURE_TARGET_TYPE],
+      );
+      for (const r of rows) if (r?.target_id) out.set(String(r.target_id), new Date(r.at).toISOString());
+    } catch {
+      // admin_audit_log ausente: sin marcas manuales (la resolución por 72 h sin aparecer sigue funcionando).
+    }
+    return out;
+  }
+
+  /** r98: marca una «Falla común» como resuelta (acción explícita de un SUPER_ADMIN; queda en admin_audit_log). */
+  async resolveCommonFailure(fingerprint: string, actor: { id: string; email?: string | null }, note?: string | null): Promise<{ fingerprint: string; resolved: boolean; resolvedAt: string | null; message?: string }> {
+    const fp = String(fingerprint ?? '').trim();
+    if (!fp || fp.length > 200) throw new BadRequestException('fingerprint requerido (≤ 200 caracteres)');
+    const at = new Date().toISOString();
+    // Review P2-8: sin admin_audit_log (entorno sin r75, p. ej. producción hoy) no hay dónde guardar la marca: respuesta
+    // clara (200, resolved:false); la falla se resuelve sola tras 72 h sin aparecer.
+    const [probe] = await this.dataSource.query(`select to_regclass('public.admin_audit_log') is not null as ok`).catch(() => [{ ok: false }]);
+    if (!probe?.ok) {
+      return { fingerprint: fp, resolved: false, resolvedAt: null, message: 'No se pudo guardar la marca «resuelto» en este entorno (falta el registro de auditoría). La falla se marca resuelta sola cuando pasan 72 h sin aparecer.' };
+    }
+    try {
+      await this.dataSource.query(
+        `insert into public.admin_audit_log (at, actor_id, actor_email, actor_is_superadmin, action, target_type, target_id, after)
+         values ($1, $2, $3, true, $4, $5, $6, $7::jsonb)`,
+        [at, actor.id, actor.email ?? null, COMMON_FAILURE_RESOLVE_ACTION, COMMON_FAILURE_TARGET_TYPE, fp, JSON.stringify({ note: note ? String(note).slice(0, 500) : null })],
+      );
+    } catch (err) {
+      throw new ServiceUnavailableException(`common_failure_resolve_unavailable: no se pudo registrar la marca (${err instanceof Error ? err.message.slice(0, 120) : String(err)})`);
+    }
+    this.commonFailuresCache = null;
+    return { fingerprint: fp, resolved: true, resolvedAt: at };
   }
 
   /**
@@ -281,7 +379,11 @@ export class AdminRecoveryService {
           .filter((k) => !completion.previewComponents.includes(k))
           .map((k) => {
             const r = byKey.get(k);
-            return { itemKey: k, type: String(r?.type ?? ''), status: String(r?.status ?? 'missing'), failureCode: failureCodeOf(r?.error) };
+            const base = { itemKey: k, type: String(r?.type ?? ''), status: String(r?.status ?? 'missing'), failureCode: failureCodeOf(r?.error) };
+            // r98: escalera agotada → motivo claro (el dueño puede reintentar desde su pantalla, sin admin).
+            return r && r.status === 'failed' && remediationBlocksAuto(r.output_summary, r.error)
+              ? { ...base, reason: REMEDIATION_EXHAUSTED_CODE, reasonText: REMEDIATION_EXHAUSTED_REASON }
+              : base;
           });
         const entry: NeedsAttentionEntry = {
           runId: String(job.id),

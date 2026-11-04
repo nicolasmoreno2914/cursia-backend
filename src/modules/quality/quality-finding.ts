@@ -221,6 +221,8 @@ const PKG_WARNING_CODES: ReadonlyArray<[RegExp, string, QualityLayer, QualityFin
   [/^video_mc_length_bias$/, 'VIDEO_MC_LENGTH_BIAS', 'E3', 'deterministic', 'en las preguntas de los videos la correcta es la más larga más de lo que da el azar', 'regenerar las interacciones de los videos que más empujan el sesgo o aceptar con motivo'],
   [/^dead_link_unwrapped$/, 'DEAD_LINK_UNWRAPPED', 'pkg', 'deterministic', 'enlaces sin destino en el texto', 'ninguna (desenvueltos al empaquetar)'],
   [/^libro_chars_unmapped$/, 'LIBRO_CHARS_UNMAPPED', 'pkg', 'deterministic', 'caracteres sin glifo en la fuente del PDF del Libro', 'revisar el PDF del Libro Guía'],
+  // r98 (escalera de remediación, rung 2): la parte se aceptó con marca de calidad (idioma no neutro tras pedir corregirlo).
+  [/^quality_accepted$/, 'QUALITY_ACCEPTED', 'E3', 'deterministic', 'la parte se aceptó con una marca de calidad: el validador volvió a rechazarla tras pedir la corrección', 'ninguna para entregar; revisar el texto señalado si se quiere pulir'],
   [/^application_chars_unmapped$/, 'APPLICATION_CHARS_UNMAPPED', 'pkg', 'deterministic', 'caracteres sin glifo en el PDF de la actividad', 'revisar el PDF de la Actividad de Aplicación'],
   [/^practice_resource_orphan$/, 'PRACTICE_RESOURCE_ORPHAN', 'pkg', 'deterministic', 'archivo de trabajo de un capítulo que ya no está en el curso', 'quitarlo del perfil o moverlo a un capítulo vigente'],
   [/^practice_resource_no_application$/, 'PRACTICE_RESOURCE_NO_APPLICATION', 'pkg', 'deterministic', 'archivo de la Actividad de Aplicación en un capítulo sin actividad', 'revisar la relación del archivo en el perfil'],

@@ -394,7 +394,11 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
     codes: ['validation_invalid', 'content_empty', 'gift_invalid', 'llm_output_invalid', 'scorm_invalid', 'concept_plan_invalid',
       'CONTENT_TRUTH', 'CONTENT_TRUTH_RETRY_INVALID', 'EXAM_NEUROMYTH', 'AUDIOBOOK_SCRIPT_TOO_SHORT',
       // r19: guion por bloque fuera de la banda 85–110 % o con repetición → se regeneran SOLO esos bloques.
-      'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SCRIPT_REPETITION', 'AUDIOBOOK_SECTION_TRUNCATED'],
+      'AUDIOBOOK_SECTION_TOO_SHORT', 'AUDIOBOOK_SECTION_PADDED', 'AUDIOBOOK_SCRIPT_REPETITION', 'AUDIOBOOK_SECTION_TRUNCATED',
+      // r98: Language QA del guion del audiolibro (audio-scripts.ts). Antes sin regla → D «unclassified» con riesgo de pago
+      // incierto, y el worker lo marcaba reintentable: 6 reintentos idénticos en prod (run 4c6a9f71). Es una validación de
+      // CONTENIDO (determinista dado el mismo prompt): B + escalera de remediación (reliability/remediation-ladder.ts).
+      'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'],
     family: /^(GIFT|BS|TEXT|DIAGRAM)_[A-Z0-9_]+$/,
     class: 'B', strategy: 'regenerate_targeted', rounds: 2,
   },
@@ -718,6 +722,21 @@ const RESTORE_RULES: readonly Rule[] = Object.freeze([
     class: 'D', strategy: 'hold_for_human', scope: 'package', rounds: 0, humanReason: 'product_bug', adminAction: 'retry_package',
   },
 ] as Rule[]);
+
+/**
+ * r98: DÓNDE se emite cada código determinista que la escalera de remediación y el reporte «Falla común» conocen
+ * (archivo relativo a src/ + función). Mapa estático mantenido junto a la tabla: scripts/check-r98-remediation-ladder.js
+ * verifica que cada archivo exista y contenga el código. Un código sin entrada sale como «(sin mapa)» en el reporte.
+ */
+export const FAILURE_CODE_SOURCES: Readonly<Record<string, { file: string; fn: string; hint: string }>> = Object.freeze({
+  AUDIOBOOK_LANGUAGE_NOT_NEUTRAL: { file: 'workers/provider-real/audio-scripts.ts', fn: 'generateSectionScript (audioLanguageFindings)', hint: 'revisar el prompt del guion (sectionNarrationPrompt / audioLocaleRule) o la tabla de Language QA (language-qa.ts) para el término reportado' },
+  LANGUAGE_NOT_NEUTRAL: { file: 'modules/course-shell/v3-validation.ts', fn: 'v3LanguageErrors (validateV3ItemArtifact)', hint: 'revisar la regla de idioma del prompt del tipo (44-dynamic-prompt-builders.js) o la tabla de Language QA (language-qa.ts)' },
+  AUDIOBOOK_SECTION_TOO_SHORT: { file: 'workers/provider-real/audio-scripts.ts', fn: 'generateSectionScript', hint: 'revisar sectionTargetWords y la continuación del bloque' },
+  AUDIOBOOK_SECTION_PADDED: { file: 'workers/provider-real/audio-scripts.ts', fn: 'generateSectionScript', hint: 'revisar sectionTargetWords y la condensación del bloque' },
+  AUDIOBOOK_SECTION_TRUNCATED: { file: 'workers/provider-real/audio-scripts.ts', fn: 'generateSectionScript', hint: 'revisar max_tokens del guion por bloque' },
+  AUDIOBOOK_SCRIPT_REPETITION: { file: 'workers/provider-real/real-providers.ts', fn: 'repetitionGate (findScriptRepetition)', hint: 'revisar findScriptRepetition y el prevTail del prompt' },
+  v3_payload_invalid: { file: 'modules/course-shell/v3-validation.ts', fn: 'validateV3ItemArtifact', hint: 'ver los códigos internos entre corchetes: el validador del tipo y su prompt' },
+});
 
 function ruleFor(rules: readonly Rule[], code: string): Rule | null {
   for (const r of rules) if (r.codes?.includes(code)) return r;
