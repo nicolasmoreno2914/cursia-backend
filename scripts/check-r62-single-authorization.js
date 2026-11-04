@@ -415,7 +415,7 @@ async function dbChecks() {
       pvA = await runs.previewStart(A.cid, USER, 1, NCTX);
       eq([pvA.decision, pvA.approval.mode, pvA.approval.userAuthorizationRequired, pvA.approval.required, pvA.approval.canApprove, pvA.approval.withinPolicy],
         ['AUTO_WITHIN_POLICY', 'user', true, false, false, true], 'decisión');
-      eq(dec(pvA.approval.amount), dec(pvA.estimate.max), 'monto = máx (límites holgados)');
+      eq(dec(pvA.approval.amount), dec(pvA.estimate.safetyCap), 'monto = tope de seguridad (límites holgados; r90)');
       eq([pvA.policy.maxCostPerRun, pvA.policy.maxCostPerCourse, pvA.policy.monthlyCap].map(dec), [1000, 1000, 1000000000], 'límites');
       eq(pvA.paidRealProviders, ['gamma', 'openai'], 'proveedores pagados');
     });
@@ -628,7 +628,7 @@ async function dbChecks() {
       const Ks = [];
       for (let i = 0; i < N; i++) Ks.push(await makeCourse('Carrera ' + i));
       await coursePolicy(Ks[0].cid, BIG);
-      const max = dec((await runs.previewStart(Ks[0].cid, USER, 1, NCTX)).estimate.max);
+      const max = dec((await runs.previewStart(Ks[0].cid, USER, 1, NCTX)).estimate.safetyCap); // r90: lo autorizado = tope de seguridad
       const m0 = await budget.monthCommitted();
       const cap = (dec(m0.total) + max * 2.5).toFixed(6);
       for (const [i, K] of Ks.entries()) {

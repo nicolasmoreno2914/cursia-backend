@@ -23,6 +23,7 @@ import { FinopsError } from './errors';
 import { addDec, cmpDec, normalizeDecimal, subDec, DecimalLike } from './decimal';
 import type { BudgetPolicy } from './budget';
 import type { EstimateResult, MinExpMax } from './estimator';
+import { policyEstimateView, safetyCapOf } from './safety-cap';
 
 export const NORMAL_APPROVAL_REASON_PREFIX = 'ui_normal_approval';
 /** Una aprobación del flujo normal que no se usó en este plazo ya no sirve (se pide un estimado nuevo). */
@@ -72,7 +73,9 @@ export function planNormalApproval(input: {
    */
   ownerMonthSpent?: DecimalLike | null;
 }): NormalApprovalPlan {
-  const est = input.estimate.totals;
+  // r90: el monto a autorizar y los límites por proveedor/tipo usan el TOPE DE SEGURIDAD (esperado × factor) como
+  // «máximo», no el p90 × reintentos (ver safety-cap.ts).
+  const est = policyEstimateView(input.estimate).totals;
   const noLimits = { maxCostPerRun: null, maxCostPerCourse: null, monthlyCap: null };
   if (!input.policy) {
     return {
@@ -155,15 +158,17 @@ export const ESTIMATE_CATEGORY_OF_PROVIDER: Readonly<Record<string, string>> = O
 });
 export const ESTIMATE_CATEGORIES = ['content', 'presentations', 'videos', 'audio', 'other'] as const;
 
-export function estimateCategories(byProvider: Record<string, MinExpMax> | undefined): Record<string, MinExpMax> {
+export function estimateCategories(byProvider: Record<string, MinExpMax> | undefined, capFactor?: number | null): Record<string, MinExpMax & { safetyCap?: string }> {
   const zero = normalizeDecimal(0);
-  const out: Record<string, MinExpMax> = {};
+  const out: Record<string, MinExpMax & { safetyCap?: string }> = {};
   for (const c of ESTIMATE_CATEGORIES) out[c] = { min: zero, expected: zero, max: zero };
   for (const p of Object.keys(byProvider || {}).sort()) {
     const c = ESTIMATE_CATEGORY_OF_PROVIDER[p] || 'other';
     const v = (byProvider as Record<string, MinExpMax>)[p];
     out[c] = { min: addDec(out[c].min, v.min), expected: addDec(out[c].expected, v.expected), max: addDec(out[c].max, v.max) };
   }
+  // r90: con el factor, cada familia trae su tope de seguridad (esperado × factor, hacia arriba al centavo) para la UI.
+  if (capFactor !== undefined && capFactor !== null) for (const c of Object.keys(out)) out[c].safetyCap = safetyCapOf(out[c].expected, capFactor);
   return out;
 }
 

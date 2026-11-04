@@ -17,6 +17,7 @@ export * from './run-budget';
 export * from './run-spend-guard';
 export * from './finops-budget.service';
 export * from './normal-approval';
+export * from './safety-cap';
 export * from './spend-controls';
 export * from './reconcile-decision';
 export * from './policy-admin';

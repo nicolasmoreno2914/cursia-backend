@@ -307,7 +307,7 @@ async function pureChecks() {
 
   await check('[OM] puro: ownerMonthlyCap acota/bloquea por DUEÑO (monthlyCap sigue global); sin el dato con el límite → falla cerrado; sin el límite → igual que antes', () => {
     const NA = L('modules/finops/normal-approval.js');
-    const estimate = { totals: { min: '1', expected: '2', max: '4' } };
+    const estimate = { totals: { min: '1', expected: '2', max: '4', safetyCap: '4' } }; // r90: lo autorizado es el tope de seguridad
     const pol = (limits) => ({ version: 1, limits, requireHumanApprovalForRealSpend: true, onExceed: 'BLOCK' });
     const base = NA.planNormalApproval({ estimate, policy: pol({ maxCostPerRun: 10 }), courseSpent: 0, monthSpent: 999 });
     eq([base.withinPolicy, base.amount], [true, '4.0000000000'], 'sin límite por dueño: igual');

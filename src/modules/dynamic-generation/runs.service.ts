@@ -143,6 +143,7 @@ import {
 import { incrementalCostForPlan } from '../finops/incremental';
 import { FinopsError } from '../finops/errors';
 import { addDec, cmpDec, normalizeDecimal, subDec } from '../finops/decimal';
+import { safetyCapOfEstimate } from '../finops/safety-cap';
 import { BudgetPolicy, policySpendCaps, runtimeGuard, SpentSoFar } from '../finops/budget';
 import { MONTH_CAP_LOCK } from '../finops/finops-budget.service';
 import type { EstimateResult, MinExpMax } from '../finops/estimator';
@@ -760,7 +761,7 @@ export interface FromRunPreview {
 
 /**
  * r75 (Agente C, 02 §E.1, aditivo): presupuesto mensual por usuario en la vista previa del estimado. `requiredUsd` = lo
- * que se autorizaría (el monto de la aprobación si hace falta una; si no, `estimate.totals.max`). `mode: 'off'` →
+ * que se autorizaría (el monto de la aprobación si hace falta una; si no, el tope de seguridad del estimado — r90). `mode: 'off'` →
  * `availableUsd: null` y `sufficient: true` (sin control por usuario).
  */
 export interface UserBudgetPreview {
@@ -881,8 +882,12 @@ export interface StartPreview {
   counts: PreviewCounts;
   existingRun: { id: string; status: string; active: boolean } | null;
   estimate: {
-    currency: string; min: string; expected: string; max: string;
-    byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax>;
+    currency: string; min: string; expected: string;
+    /** Máximo p90 × reintentos: diagnóstico, se conserva por compatibilidad (r90: ya no es la cifra visible). */
+    max: string;
+    /** r90: tope de seguridad = ceil_centavo(esperado × capFactor): lo visible, lo de la política y lo autorizado. */
+    safetyCap: string; capFactor: number;
+    byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax & { safetyCap?: string }>;
     /** V542: banco de preguntas de los exámenes y reserva por reintentos (incluidos en expected/max). */
     breakdown: EstimateBreakdown;
   } | null;
@@ -999,8 +1004,12 @@ export interface VideoUpgradePreview {
   pendingVideos: Array<{ itemKey: string; chapterId: string | null; generation: number; reusesVideogenJob?: boolean }>;
   interactions: Array<{ itemKey: string; generation: number }>;
   estimate: {
-    currency: string; min: string; expected: string; max: string;
-    byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax>;
+    currency: string; min: string; expected: string;
+    /** Máximo p90 × reintentos: diagnóstico, se conserva por compatibilidad (r90: ya no es la cifra visible). */
+    max: string;
+    /** r90: tope de seguridad = ceil_centavo(esperado × capFactor): lo visible, lo de la política y lo autorizado. */
+    safetyCap: string; capFactor: number;
+    byProvider: Record<string, MinExpMax>; byItemType: Record<string, MinExpMax>; byCategory: Record<string, MinExpMax & { safetyCap?: string }>;
     /** V542: banco de preguntas de los exámenes y reserva por reintentos (incluidos en expected/max). */
     breakdown: EstimateBreakdown;
   } | null;
@@ -1395,8 +1404,8 @@ export class RunsService {
       ...base,
       existingRun: null,
       estimate: {
-        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
-        byProvider: sum.byProvider, byItemType: evaluation.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max, safetyCap: sum.safetyCap, capFactor: sum.capFactor,
+        byProvider: sum.byProvider, byItemType: evaluation.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider, sum.capFactor),
         breakdown: estimateBreakdown(evaluation.estimate),
       },
       decision: evaluation.decision,
@@ -1420,7 +1429,7 @@ export class RunsService {
       estimateHash,
       packageSize,
       // r75: paga quien inicia (el actor), no el dueño técnico del curso.
-      userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
+      userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, safetyCapOfEstimate(evaluation.estimate))),
       ...(await this.r79PreviewExtras(courseId, evaluation.estimate)),
       _plan: plan,
       _evaluation: evaluation,
@@ -1596,7 +1605,7 @@ export class RunsService {
         .catch((err) => { this.logger.warn(`r95: no se pudo registrar el estimado pendiente del curso #${courseId}: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`); return null; });
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
-        message: `${APPROVAL_FORBIDDEN}: este curso requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate.expected)}, máximo USD ${usd2(pv.estimate.max)}). No se creó nada.`,
+        message: `${APPROVAL_FORBIDDEN}: este curso requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate.expected)}, tope de seguridad USD ${usd2(pv.estimate.safetyCap ?? pv.estimate.max)}). No se creó nada.`,
         ...(est ? { estimateId: est.id } : {}),
       });
     }
@@ -1751,8 +1760,8 @@ export class RunsService {
       planSha256: invPlan.planSha256,
       existingRun: null,
       estimate: {
-        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
-        byProvider: sum.byProvider, byItemType: evaluation.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max, safetyCap: sum.safetyCap, capFactor: sum.capFactor,
+        byProvider: sum.byProvider, byItemType: evaluation.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider, sum.capFactor),
         breakdown: estimateBreakdown(evaluation.estimate),
       },
       decision: evaluation.decision,
@@ -1767,7 +1776,7 @@ export class RunsService {
       // r75 H5 (D-25): el gasto global del mes solo lo ve el SuperAdmin.
       policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: isSuperAdminEmail(user.email) ? np.month.total : null, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
       estimateHash,
-      userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, evaluation.estimate.totals.max)),
+      userBudget: await this.userBudgetPreview(user.id, previewRequiredUsd(mode, plan.amount, existing, safetyCapOfEstimate(evaluation.estimate))),
       ...(await this.r79PreviewExtras(courseId, evaluation.estimate)),
       _plan: plan,
     };
@@ -5456,7 +5465,7 @@ export class RunsService {
     if (!pv.approval || !pv.approval.canApprove) {
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
-        message: `${APPROVAL_FORBIDDEN}: generar los videos reales requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate?.expected)}, máximo USD ${usd2(pv.estimate?.max)}). No se generó nada.`,
+        message: `${APPROVAL_FORBIDDEN}: generar los videos reales requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate?.expected)}, tope de seguridad USD ${usd2(pv.estimate?.safetyCap ?? pv.estimate?.max)}). No se generó nada.`,
       });
     }
     if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicVideoUpgradePreview(pv));
@@ -5623,8 +5632,8 @@ export class RunsService {
       }
       const sum = estimateSummary(econ.estimate);
       out.estimate = {
-        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max,
-        byProvider: sum.byProvider, byItemType: econ.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider),
+        currency: sum.currency, min: sum.min, expected: sum.expected, max: sum.max, safetyCap: sum.safetyCap, capFactor: sum.capFactor,
+        byProvider: sum.byProvider, byItemType: econ.estimate.totals.byItemType, byCategory: estimateCategories(sum.byProvider, sum.capFactor),
         breakdown: estimateBreakdown(econ.estimate),
       };
       out.approval = {
@@ -5903,7 +5912,7 @@ export class RunsService {
     // r75 (01 §5.2): orden permiso (guard) → suspensión de generación / congelación de plataforma → presupuesto. Un
     // suspendido con USD 0 recibe 403 generation_suspended, no el 409 de presupuesto (que ofrecería «Solicitar autorización»).
     await g.assertMayStart(this.dataSource, payer);
-    const required = normalizeDecimal(gate.normalApproval?.amount ?? gate.approval?.authorized_budget ?? gate.evaluation.estimate.totals.max);
+    const required = normalizeDecimal(gate.normalApproval?.amount ?? gate.approval?.authorized_budget ?? safetyCapOfEstimate(gate.evaluation.estimate));
     const av = await g.availability(this.dataSource, payer);
     if (cmpDec(required, av.available) <= 0) return;
     const est = await this.finopsBudget.recordEstimate({
@@ -6092,7 +6101,7 @@ export class RunsService {
     // El filtro global aplana el 409 a su mensaje: estimateId y totales viajan también en el texto.
     const message =
       `${code}: ${human} No se creó ni se envió nada. estimateId=${estimateId} ` +
-      `totalsJson=${JSON.stringify({ currency: totals.currency, min: totals.min, expected: totals.expected, max: totals.max })}`;
+      `totalsJson=${JSON.stringify({ currency: totals.currency, min: totals.min, expected: totals.expected, max: totals.max, safetyCap: totals.safetyCap, capFactor: totals.capFactor })}`;
     return new ConflictException({ message, code, estimateId, estimate: totals, reasons, paidRealProviders: providers });
   }
 
@@ -6182,7 +6191,7 @@ export class RunsService {
       const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, null));
       const hist = await this.finopsBudget.historicalByItemRun(keep.map((x) => x.fromItemRunId).filter(Boolean));
       const withBasis = keep.filter((x) => (x.fromItemRunId && (hist[x.fromItemRunId] || []).length > 0) || est.lines.some((l) => l.itemKey === x.itemKey));
-      const r = incrementalCostForPlan(withBasis.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.fromItemRunId })), est.lines, hist);
+      const r = incrementalCostForPlan(withBasis.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.fromItemRunId })), est.lines, hist, est.totals.capFactor);
       for (const act of r.actions) {
         if (!act.basis) continue;
         await this.finopsBudget.recordAvoidance({
@@ -6221,6 +6230,7 @@ export class RunsService {
       computable.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.action === 'STALE_NO_AUTO' ? x.itemRunId : null })),
       est.lines,
       hist,
+      est.totals.capFactor,
     );
     const byItemKey = new Map(r.actions.map((x) => [x.itemKey, x]));
     return {

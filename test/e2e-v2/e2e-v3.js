@@ -3908,7 +3908,10 @@ function reservationBookkeeping(ev) {
         fake.rule((t) => t.includes('Genera la EXPERIENCIA del capítulo') && t.includes('CAPÍTULO: "Sellos mecánicos"'), 'drop', 1);
         fake.rule((t) => t.includes('Escribe el SOLUCIONARIO DOCENTE') && t.includes('CAPÍTULO: "Inspección de bombas centrífugas"'), 'hold', 1);
         // Loop 7 (O2): el Libro de «Alineación de ejes» llega con UNA oración con un dato inventado → reparación parcial.
-        const FAB24 = 'Según una encuesta interna de FEDUCC 2024, el 67% de los técnicos no alinea el eje antes del arranque.';
+        // La cifra lleva decimal a propósito: el guardia «un número de la oración que el capítulo vuelve a usar» (I5) mira el
+        // resto del capítulo, y el texto falso trae el UUID del capítulo (MARKCH-<uuid>): un «…b67a…» al azar contaba como
+        // el mismo «67» y mandaba al reintento completo (flake del gate). «67,5» no puede aparecer en un UUID.
+        const FAB24 = 'Según una encuesta interna de FEDUCC 2024, el 67,5% de los técnicos no alinea el eje antes del arranque.';
         fake.rule((t) => t.includes('Genera el CAPÍTULO 3 COMPLETO: "Alineación de ejes"') && !t.includes('CORRECCIÓN OBLIGATORIA'), 'transform', 1, 0,
           (txt) => txt.replace(/(\n\n)([^\n#|]{40,}?\.)(\s)/, `$1$2 ${FAB24}$3`));
         c.runId = await startRun(c, C.title);

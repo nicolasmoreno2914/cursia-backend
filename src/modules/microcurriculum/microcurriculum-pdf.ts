@@ -2,7 +2,8 @@ import PDFDocument = require('pdfkit');
 import { cursiaDefaultLogo } from '../../package/v3/libro-logo';
 import { pdfText } from '../../package/v3/libro-v3';
 import { formatDateEs } from '../prebrief/prebrief-document';
-import { BLOOM_LABEL, MODALITY_LABEL, MicrocurriculumIssue, MicrocurriculumV1, terminologyFor } from './microcurriculum.types';
+import { BLOOM_LABEL, MODALITY_LABEL, MicrocurriculumAnswers, MicrocurriculumIssue, MicrocurriculumV1, terminologyFor } from './microcurriculum.types';
+import { MC_PDF_ATTACHMENT, buildMicrocurriculumPdfPayload } from './pdf-payload';
 
 /**
  * r81 · Microcurrículo · PDF (pdfkit, fuentes estándar WinAnsi, Carta) — spec §3. Renderizador SIN lógica: dibuja el
@@ -30,6 +31,11 @@ export interface MicrocurriculumPdfMeta {
   author?: string | null;
   date: Date;
   issues: MicrocurriculumIssue[];
+  /**
+   * r86 · Copia legible por máquina (adjunto `cursia-microcurriculum.json`, ver pdf-payload.ts) para que «Importar
+   * microcurrículo» lea este PDF sin pérdidas. No cambia ninguna página. Sin `embed`, el PDF no la trae.
+   */
+  embed?: { microcurriculumId: string | null; answers: MicrocurriculumAnswers } | null;
 }
 export interface MicrocurriculumPdfResult { pdf: Buffer; pages: number }
 
@@ -325,6 +331,13 @@ export async function renderMicrocurriculumPdf(mc: MicrocurriculumV1, meta: Micr
     pdf.text(name, PAGE.left, PAGE.h - 40, { width: W - 120, lineBreak: false });
     pdf.text(T(`Página ${i - range.start + 1} de ${range.count}`), PAGE.left + W - 120, PAGE.h - 40, { width: 120, align: 'right', lineBreak: false });
     pdf.page.margins.bottom = keepB;
+  }
+  if (meta.embed) {
+    pdf.file(buildMicrocurriculumPdfPayload(mc, meta.embed.answers, meta.embed.microcurriculumId), {
+      name: MC_PDF_ATTACHMENT, type: 'application/json', relationship: 'Data',
+      description: 'Cursia · copia exacta del microcurrículo (para importarlo sin pérdidas)',
+      creationDate: date, modifiedDate: date,
+    } as any);
   }
   if (pdf.bufferedPageRange().count !== range.count) throw new Error(`MICROCURRICULUM_PDF_FAILED: el pie agregó páginas (${range.count} → ${pdf.bufferedPageRange().count})`);
   pdf.end();
