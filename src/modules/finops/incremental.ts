@@ -10,6 +10,7 @@
  */
 import { FinopsError } from './errors';
 import { addDec, normalizeDecimal } from './decimal';
+import { parseSafetyCapFactor, safetyCapOf } from './safety-cap';
 import { AVOIDING_ACTIONS, ESTIMATE_ACTIONS, INCREMENTAL_ACTIONS, EstimateAction, EstimateLine, MinExpMax } from './estimator';
 
 export interface PlanActionInput {
@@ -42,7 +43,8 @@ export interface IncrementalActionResult {
 
 export interface IncrementalPlanResult {
   actions: IncrementalActionResult[];
-  totals: { incremental: MinExpMax; avoided: string; avoidedByBasis: Record<AvoidedBasis, string> };
+  /** r90: `incremental` lleva el tope de seguridad (esperado × capFactor) y el factor, con el mismo factor que el run. */
+  totals: { incremental: MinExpMax & { safetyCap: string; capFactor: number }; avoided: string; avoidedByBasis: Record<AvoidedBasis, string> };
 }
 
 const ZERO = normalizeDecimal(0);
@@ -51,6 +53,8 @@ export function incrementalCostForPlan(
   planActions: readonly PlanActionInput[],
   estimateLines: readonly EstimateLine[],
   historicalByItemRun: HistoricalByItemRun,
+  /** r90 (review P2-4): factor del tope del estimado de origen (`estimate.totals.capFactor`); ausente = 1,5. */
+  capFactor?: number | null,
 ): IncrementalPlanResult {
   if (!Array.isArray(planActions)) throw new FinopsError('INVALID_INPUT', 'planActions debe ser un array');
   const linesByKey = new Map<string, EstimateLine[]>();
@@ -108,5 +112,6 @@ export function incrementalCostForPlan(
     avoidedTotal = addDec(avoidedTotal, avoided);
     out.push({ itemKey: pa.itemKey, action, incremental, avoided, basis, sourceItemRunId, sourceChargeEventIds });
   }
-  return { actions: out, totals: { incremental: incTotal, avoided: avoidedTotal, avoidedByBasis: byBasis } };
+  const factor = parseSafetyCapFactor(capFactor ?? undefined);
+  return { actions: out, totals: { incremental: { ...incTotal, safetyCap: safetyCapOf(incTotal.expected, factor), capFactor: factor }, avoided: avoidedTotal, avoidedByBasis: byBasis } };
 }

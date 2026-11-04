@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { FinopsError } from './errors';
 import { addDec, cmpDec, normalizeDecimal, DecimalLike } from './decimal';
@@ -25,6 +25,7 @@ import {
 } from './run-budget';
 import { APPROVAL_TTL_HOURS, NORMAL_APPROVAL_REASON_PREFIX } from './normal-approval';
 import { llmCallUpperBoundUsage } from './llm-usage-ingest';
+import { readSafetyCapFactor, safetyCapFactorWarning, safetyCapOfEstimate } from './safety-cap';
 import { ReservationKind, SubjectSpendAccess, UserBudgetGate, userBudgetsMode } from './user-budget-gate';
 
 /** Advisory lock global (por transacción) que serializa las aprobaciones del flujo normal frente al tope mensual. */
@@ -66,7 +67,11 @@ export class FinopsBudgetService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly ledger: FinopsLedgerService,
-  ) {}
+  ) {
+    // r90 (review P2-4): un FINOPS_RUN_SAFETY_CAP_FACTOR inválido / fuera de rango no se ignora en silencio.
+    const warn = safetyCapFactorWarning();
+    if (warn) new Logger('FinopsBudgetService').warn(warn);
+  }
 
   // ─── r75 (Agente C): presupuesto por usuario (01 §5). Sin gate o con CURSIA_USER_BUDGETS=off → igual que antes. ───
 
@@ -153,6 +158,8 @@ export class FinopsBudgetService {
       usageModel: usageModelPriorsV1(),
       retryPolicy: opts.retryPolicy ?? readEstimateRetryPolicy(),
       pricingAsOf: new Date(),
+      // r90: tope de seguridad del run (FINOPS_RUN_SAFETY_CAP_FACTOR, default 1,5).
+      safetyCapFactor: readSafetyCapFactor(),
     });
   }
 
@@ -275,6 +282,8 @@ export class FinopsBudgetService {
     runId?: string | null;
     invalidationPlanSha?: string | null;
     estimate: EstimateResult;
+    /** r95: motivo del registro (`runs.service:<código>`): la bandeja de aprobaciones pendientes lo lee. */
+    createdBy?: string | null;
   }, runner: Runner = this.dataSource): Promise<{ id: string }> {
     return this.ledger.createEstimate({
       scope: a.scope,
@@ -284,7 +293,7 @@ export class FinopsBudgetService {
       runId: a.runId ?? null,
       invalidationPlanSha: a.invalidationPlanSha ?? null,
       estimate: a.estimate,
-      createdBy: 'runs.service',
+      createdBy: a.createdBy || 'runs.service',
     }, runner);
   }
 
@@ -496,7 +505,9 @@ export class FinopsBudgetService {
           reason: `bound_from:${a.approval.id}`,
         }, runner)
       : await this.ledger.authorize({
-          runId: a.runId, courseId: a.courseId, estimateId: est.id, authorizedBudget: a.evaluation.estimate.totals.max,
+          runId: a.runId, courseId: a.courseId, estimateId: est.id,
+          // r90: el presupuesto autorizado de un run AUTO es el tope de seguridad (no el máximo p90 × reintentos).
+          authorizedBudget: safetyCapOfEstimate(a.evaluation.estimate),
           policyId: a.evaluation.policyId, decision: 'AUTO_WITHIN_POLICY', reason: `auto_within_policy:${a.evaluation.reasons.join('|')}`,
         }, runner);
     // r75 (pasos 5–8): disponible recalculado en ESTA tx; si no alcanza → 409 user_budget_insufficient y la tx del run
@@ -664,11 +675,11 @@ export class FinopsBudgetService {
     return conservativePrice(usage, catalog);
   }
 
-  /** Costo de UNA llamada pagada (p90, sin reintentos) de ese item type contra ese proveedor. */
-  async singleCallCost(itemType: string, provider: string, runner: Runner = this.dataSource): Promise<string> {
+  /** Costo de UNA llamada pagada (p90 — o p50 con `at: 'expected'` —, sin reintentos) de ese item type contra ese proveedor. */
+  async singleCallCost(itemType: string, provider: string, runner: Runner = this.dataSource, at: 'max' | 'expected' = 'max'): Promise<string> {
     const est = await this.estimate([{ itemKey: `guard:${itemType}`, itemType }], { retryPolicy: { maxRetries: 0, retryRate: 0 }, runner });
     let max = normalizeDecimal(0);
-    for (const l of est.lines) if (l.provider === provider) max = addDec(max, l.max);
+    for (const l of est.lines) if (l.provider === provider) max = addDec(max, at === 'expected' ? l.expected : l.max);
     return max;
   }
 
@@ -687,7 +698,10 @@ export class FinopsBudgetService {
     for (const r of rows) {
       const provider = paidProviderOfItemType(r.type);
       if (!provider) continue;
-      if (!cache.has(r.type)) cache.set(r.type, await this.singleCallCost(r.type, provider, runner));
+      // r90 (review P1-1): una parte en vuelo SIN reserva todavía se cuenta con el costo ESPERADO de una llamada (p50),
+      // no con su p90: su reserva real (cuando la escriba) ya entra en runActual. La llamada siguiente (`next`) sigue
+      // acotada por su p90.
+      if (!cache.has(r.type)) cache.set(r.type, await this.singleCallCost(r.type, provider, runner, 'expected'));
       total = addDec(total, cache.get(r.type) as string);
     }
     return total;
@@ -736,6 +750,14 @@ export class FinopsBudgetService {
       return { allow: false, decision: 'BLOCK', committed: addDec(actualSoFar, reservedInFlight), remaining: null, reason: 'call_unpriced', authorizedBudget } as RuntimeGuardResult & { authorizedBudget: string | null };
     }
     const base = runtimeGuard({ authorizedBudget, actualSoFar, reservedInFlight, next });
+    if (!base.allow && base.reason === 'budget_exceeded' && authorizedBudget !== null) {
+      // r90 (review P1-1): llegar al presupuesto autorizado (= tope de seguridad) PAUSA el run (misma pausa que el tope
+      // de la reserva del ledger / del guard de IA), nunca bloquea la parte: el worker la devuelve a la cola sin gasto ni
+      // intento y reanudar exige ampliar a `requiredUsd` (= lo comprometido con esta llamada).
+      const detail = `el run llegaría a USD ${Number(base.committed).toFixed(2)} con esta llamada (gastado + reservas + esta llamada) y el presupuesto autorizado es USD ${Number(authorizedBudget).toFixed(2)}`;
+      await this.pauseRunBySystem(a.runId, 'run_budget_cap', detail, Number(base.committed)).catch(() => false);
+      return { ...base, reason: RUN_PAUSED_GUARD_REASON, authorizedBudget, detail } as RuntimeGuardResult & { authorizedBudget: string | null };
+    }
     if (!base.allow) return { ...base, authorizedBudget };
     // Loop Cost Efficiency: presupuesto de recuperación de ESTA parte + disyuntor del run (ver run-spend-guard.ts).
     const spend = await this.guardRunSpend({ runId: a.runId, itemRunId: a.itemRunId, nextCost: Number(next), authorizedBudget: null });

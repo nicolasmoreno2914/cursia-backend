@@ -116,21 +116,14 @@
   //       timeout/sin sesión/cuerpo raro → OFF.
   //   Ningún otro hostname puede activarlo.
   //
-  // Encendido (producción): nunca antes de la respuesta — la pantalla legacy
-  // se renderiza como siempre. Un ON pasa a V2 en caliente SOLO si:
-  //   1. la restauración legacy del arranque ya terminó (14-ui.js emite
-  //      'cursia:legacy-restore-done'; hasta entonces el ON queda pendiente),
-  //   2. el usuario no interactuó con el flujo legacy en esta carga (ningún
-  //      input/click/tecla dentro de Estructura, Producción o Generando, y ni
-  //      Producción ni Generando visibles), y
-  //   3. no hay estado legacy activo: COURSE_PRODUCTION distinto de 'idle' o
-  //      restaurado, checkpoint de producción interrumpida, GENERATION_JOB
-  //      activo/pausado/interrumpido, archivos del curso en F
-  //      o un banner de "Sesión recuperada" (D NO cuenta: collect() lo
-  //      llena siempre con el 3×3 por defecto). Ante cualquier duda
-  //      (excepción al leer ese estado) → no.
-  // Si no se cumple, el ON queda diferido (CURSIA_V2_GATE.deferred) hasta la
-  // próxima carga — que vuelve a pedir /features y a evaluar todo.
+  // Encendido: nunca antes de la respuesta. r87 (V2 para todos): cuando el
+  // servidor dice ON, V2 aplica YA — sin diferir «hasta la próxima carga» por
+  // un curso legacy cargado, una producción restaurada o interacción previa
+  // con las pantallas legacy (eso dejaba «Nuevo curso» en el motor viejo toda
+  // la sesión). Los cursos legacy existentes se siguen abriendo desde «Mis
+  // cursos» para ver o descargar lo que tienen; lo que ya no se puede es
+  // CREAR ni generar con el motor viejo. «Nuevo curso» limpia el estado legacy
+  // en memoria del curso anterior (01-state.js) y re-confirma el ON.
   //
   // Apagado (kill switch): con V2 encendido por el servidor se re-consulta
   // /features cada 5 min con la pestaña visible y al volver a estar visible
@@ -169,11 +162,14 @@
     state: 'idle',        // 'idle' | 'not-applicable' | 'signed-out' | 'loading' | 'ok' | 'error'
     userId: null,         // usuario al que corresponde el último estado
     features: null,       // {dynamicCourseStructure, realVideo} de un 200 | null
-    pendingOn: false,     // ON recibido, esperando que termine la restauración legacy del arranque
-    deferred: false,      // ON recibido pero no se pudo aplicar en caliente → próxima carga
-    deferReason: null,    // 'interaction' | 'legacy-state' | null
-    legacyTouched: false, // hubo interacción con el flujo legacy en esta carga
-    revoked: false        // el servidor apagó V2 durante esta carga → no vuelve a encender
+    // r87: pendingOn / deferred / deferReason / legacyTouched ya no se usan (V2 aplica en caliente siempre);
+    // quedan en false/null para quien todavía los lea (19-library.js).
+    pendingOn: false,
+    deferred: false,
+    deferReason: null,
+    legacyTouched: false,
+    revoked: false,       // el servidor apagó V2 durante esta carga → no vuelve a encender
+    errorKind: null       // r87: con state 'error' → 'auth' (sin sesión válida) | 'other'
   };
 
   // Staging: un override EXPLÍCITO en localStorage manda (DYNAMIC_COURSE_STRUCTURE='true' → ON,
@@ -205,6 +201,16 @@
     window.CURSIA_V2_GATE.source = on ? 'server' : 'off';
     if (on) _v2StartRecheck(); else _v2StopRecheck();
     _v2Emit('cursia:v2-flag-change', { enabled: on, reason: reason });
+  }
+
+  // r87: el formulario legacy de «Datos del curso» queda oculto hasta saber el flag (51-v2-create-flow.js);
+  // cada cambio de CURSIA_V2_GATE.state se avisa para que lo pinte (o pinte «Preparando…» / iniciar sesión).
+  var _v2LastEmittedState = null;
+  function _v2EmitState() {
+    var st = window.CURSIA_V2_GATE.state;
+    if (st === _v2LastEmittedState) return;
+    _v2LastEmittedState = st;
+    _v2Emit('cursia:v2-gate-state', { state: st });
   }
 
   // ── /features: una respuesta por usuario y por vida de la página ──
@@ -261,123 +267,29 @@
     };
   }
 
-  // Paneles del flujo legacy cuya interacción "compromete" la sesión.
-  var V2_LEGACY_PANELS = ['panel-estructura', 'panel-produccion', 'panel-generando'];
-
-  function _v2LegacyGenerationPanelVisible() {
-    for (var i = 1; i < V2_LEGACY_PANELS.length; i++) {
-      var p = document.getElementById(V2_LEGACY_PANELS[i]);
-      if (p && p.classList && p.classList.contains('on')) return true;
-    }
-    return false;
-  }
-
-  // ¿Hay un curso/generación legacy cargado o en curso? Solo artefactos reales
-  // de un curso legacy. Ante cualquier duda (excepción) → true.
-  function _v2LegacyStateActive() {
-    try {
-      var cp = window.COURSE_PRODUCTION;
-      if (cp && ((cp.status && cp.status !== 'idle') || cp._restored)) return true;
-      if (typeof window.cpHasInterruptedProduction === 'function' && window.cpHasInterruptedProduction()) return true;
-      var gj = window.GENERATION_JOB;
-      if (gj && (gj.active === true || ['running', 'paused', 'interrupted'].indexOf(gj.status) !== -1)) return true;
-      var f = window.F;
-      if (f && typeof f === 'object' && Object.keys(f).length > 0) return true;
-      // D.mods/D.caps NO cuentan: collect() (01-state.js) arma siempre el 3×3
-      // por defecto y corre en casi cualquier go() (updSidebarStatus →
-      // updDashboard). Un curso legacy real deja rastro en F / producción /
-      // GENERATION_JOB / banners de restauración.
-      if (document.getElementById('restore-banner') || document.getElementById('cp-restore-banner')) return true;
-      return false;
-    } catch (e) {
-      return true;
-    }
-  }
-
-  // La restauración legacy del arranque (autoLoad de 14-ui.js: F desde
-  // IndexedDB + GENERATION_JOB) es asíncrona. Hasta que termine no se puede
-  // saber si hay un curso legacy cargado → el ON espera. Sin autoLoad (p. ej.
-  // un entorno sin 01-state.js) no hay nada que esperar.
-  function _v2LegacyRestoreSettled() {
-    return window.CURSIA_LEGACY_RESTORE_DONE === true || typeof window.autoLoad !== 'function';
-  }
-
-  // Registra interacción del usuario con el flujo legacy mientras V2 está OFF.
-  (function _v2TrackLegacyInteraction() {
-    if (typeof document === 'undefined' || !document.addEventListener) return;
-    function onEvt(e) {
-      if (window.DYNAMIC_COURSE_STRUCTURE_ENABLED || window.CURSIA_V2_GATE.legacyTouched) return;
-      var t = e && e.target;
-      if (!t || !t.closest) return;
-      for (var i = 0; i < V2_LEGACY_PANELS.length; i++) {
-        if (t.closest('#' + V2_LEGACY_PANELS[i])) { window.CURSIA_V2_GATE.legacyTouched = true; return; }
-      }
-    }
-    ['input', 'change', 'click', 'keydown', 'pointerdown'].forEach(function (type) {
-      document.addEventListener(type, onEvt, true);
-    });
-  })();
-
   function _v2ApplyServerAnswer(features) {
     var g = window.CURSIA_V2_GATE;
     g.features = features;
+    g.pendingOn = false; g.deferred = false; g.deferReason = null;
     if (!features || features.dynamicCourseStructure !== true) {
-      g.pendingOn = false; g.deferred = false; g.deferReason = null;
       _v2SetFlag(false, 'server-off');
       return;
     }
     if (window.DYNAMIC_COURSE_STRUCTURE_ENABLED || g.revoked) return;
-    if (g.deferred) return; // diferido: se re-evalúa recién en la próxima carga (o con otro usuario)
-    if (!_v2LegacyRestoreSettled()) { g.pendingOn = true; return; }
-    g.pendingOn = false;
-    var reason = null;
-    if (g.legacyTouched || _v2LegacyGenerationPanelVisible()) reason = 'interaction';
-    else if (_v2LegacyStateActive()) reason = 'legacy-state';
-    if (reason) {
-      g.deferred = true; g.deferReason = reason; // la próxima carga vuelve a pedir /features
-      return;
-    }
-    g.deferred = false; g.deferReason = null;
+    // r87: sin diferimiento — el estado legacy en memoria (F, COURSE_PRODUCTION, GENERATION_JOB,
+    // banners de restauración) ya no retiene al usuario en el motor viejo.
     _v2SetFlag(true, 'server-on');
   }
 
-  // "Nuevo curso" (solo staging; producción sin cambios): el diferimiento por estado legacy protege
-  // un curso legacy EN CURSO; un curso nuevo no debe heredarlo. Tras nuevoCurso() (id nuevo, F vacío,
-  // banner fuera) se re-evalúa ignorando lo que pertenece al curso ANTERIOR: COURSE_PRODUCTION no se
-  // resetea en nuevoCurso ni guarda id → solo bloquea si sigue viva ('running' o pausada); un checkpoint interrumpido
-  // bloquea solo si es del curso nuevo. La interacción previa con los paneles legacy tampoco cuenta.
-  // Nunca enciende si el servidor no dijo ON, con override explícito, revocado, restauración legacy
-  // sin terminar o estado legacy del curso nuevo.
-  function _v2LegacyStateActiveFor(courseId) {
-    try {
-      var cp = window.COURSE_PRODUCTION;
-      // viva en la página: 'running' o pausada (el orquestador sigue esperando y se puede reanudar)
-      if (cp && (cp.status === 'running' || cp.status === 'paused' || cp._pause === true)) return true;
-      if (typeof window.cpHasInterruptedProduction === 'function' && window.cpHasInterruptedProduction()) {
-        var ck = (typeof window.cpLoadCheckpoint === 'function') ? window.cpLoadCheckpoint() : null;
-        if (!ck || !ck.courseId || ck.courseId === courseId) return true;
-      }
-      var gj = window.GENERATION_JOB;
-      if (gj && (gj.active === true || ['running', 'paused', 'interrupted'].indexOf(gj.status) !== -1)) return true;
-      var f = window.F;
-      if (f && typeof f === 'object' && Object.keys(f).length > 0) return true;
-      if (document.getElementById('restore-banner') || document.getElementById('cp-restore-banner')) return true;
-      return false;
-    } catch (e) {
-      return true;
-    }
-  }
+  // «Nuevo curso» (staging y producción): 01-state.js ya limpió el estado legacy en memoria del curso
+  // anterior; acá solo se re-confirma el ON si el servidor lo dijo y algo lo dejó apagado. Nunca
+  // enciende sin un ON del servidor, con el override explícito de staging ni tras una revocación.
   function cursiaV2OnNewCourse() {
     var g = window.CURSIA_V2_GATE;
-    var host = _v2Host();
-    if (host !== V2_STAGING_HOST) return false; // producción: sin cambios (el diferido espera a la próxima carga)
-    if (_v2StagingOverride() !== null) return false;
+    if (_v2StagingOverride() !== null) return !!window.DYNAMIC_COURSE_STRUCTURE_ENABLED;
     if (window.DYNAMIC_COURSE_STRUCTURE_ENABLED || g.revoked) return !!window.DYNAMIC_COURSE_STRUCTURE_ENABLED;
     if (!g.features || g.features.dynamicCourseStructure !== true) return false;
-    if (!_v2LegacyRestoreSettled()) return false; // una restauración legacy en vuelo podría volver a llenar F
-    if (_v2LegacyGenerationPanelVisible()) return false;
-    if (_v2LegacyStateActiveFor(window.ACTIVE_COURSE_ID)) return false;
-    g.deferred = false; g.deferReason = null; g.legacyTouched = false;
+    g.deferred = false; g.deferReason = null; g.legacyTouched = false; g.pendingOn = false;
     _v2SetFlag(true, 'new-course');
     return true;
   }
@@ -392,13 +304,6 @@
       return r;
     };
   })();
-
-  if (typeof window.addEventListener === 'function') {
-    window.addEventListener('cursia:legacy-restore-done', function () {
-      var g = window.CURSIA_V2_GATE;
-      if (g.pendingOn && g.features && g.userId === _v2UidNow()) _v2ApplyServerAnswer(g.features);
-    });
-  }
 
   var _v2Seq = 0;
 
@@ -417,6 +322,7 @@
     if (host !== V2_PROD_HOST && host !== V2_STAGING_HOST) {
       g.state = 'not-applicable';
       _v2SetFlag(false, 'host');
+      _v2EmitState();
       return Promise.resolve(false);
     }
 
@@ -431,7 +337,7 @@
       g.pendingOn = false; g.deferred = false; g.deferReason = null;
       _v2SetFlag(false, uid ? 'user-change' : 'signed-out');
     }
-    if (!uid) { g.state = 'signed-out'; return Promise.resolve(false); }
+    if (!uid) { g.state = 'signed-out'; _v2EmitState(); return Promise.resolve(false); }
 
     // Mismo usuario con V2 ya encendido por el servidor, o ya revocado en esta
     // carga (p. ej. TOKEN_REFRESHED): el apagado lo decide SOLO el kill switch
@@ -441,22 +347,60 @@
       return Promise.resolve(window.DYNAMIC_COURSE_STRUCTURE_ENABLED);
     }
 
-    if (!_v2Mem.result) g.state = 'loading';
+    if (!_v2Mem.result) { g.state = 'loading'; _v2EmitState(); }
     return dynFeatures().then(function (r) {
       if (seq !== _v2Seq || _v2UidNow() !== uid) return window.DYNAMIC_COURSE_STRUCTURE_ENABLED; // respuesta vieja
       if (_v2Is200(r)) {
         g.state = 'ok';
+        g.errorKind = null;
         _v2ApplyServerAnswer(_v2FeaturesFrom(r));
       } else {
         g.state = 'error';
+        // r87 (review P2-4): sin token / 401 → «Iniciar sesión» (reintentar no lo arregla); el resto → «Reintentar».
+        g.errorKind = (r && (r.errorType === 'auth' || r.error === 'no_session' || r._httpStatus === 401)) ? 'auth' : 'other';
         g.features = null;
         g.pendingOn = false; g.deferred = false; g.deferReason = null;
         _v2SetFlag(false, 'features-error');
       }
+      _v2EmitState();
       return window.DYNAMIC_COURSE_STRUCTURE_ENABLED;
     });
   }
   window.cursiaV2FeaturesRefresh = cursiaV2FeaturesRefresh;
+
+  /**
+   * r87 (B3): promesa que resuelve con el flag cuando ya se sabe para el usuario actual (200, error, sin
+   * sesión, host sin V2 u override de staging). Si hace falta, dispara cursiaV2FeaturesRefresh. Pensado para
+   * quien navega justo después de iniciar sesión: sin esperar, se entraba a la pantalla legacy con el flag
+   * todavía en OFF. Tope de espera: timeoutMs (10 s); al vencer resuelve con el valor de ese momento.
+   */
+  function cursiaV2WhenSettled(timeoutMs) {
+    var g = window.CURSIA_V2_GATE;
+    function settled() {
+      if (_v2Host() === V2_STAGING_HOST && _v2StagingOverride() !== null) return true;
+      if (g.state === 'not-applicable') return true;
+      if (g.userId !== _v2UidNow()) return false;
+      return g.state === 'ok' || g.state === 'error' || g.state === 'signed-out';
+    }
+    if (settled()) return Promise.resolve(!!window.DYNAMIC_COURSE_STRUCTURE_ENABLED);
+    return new Promise(function (resolve) {
+      var done = false, t = null;
+      function finish() {
+        if (done) return;
+        done = true;
+        if (t) clearTimeout(t);
+        window.removeEventListener('cursia:v2-gate-state', check);
+        window.removeEventListener('cursia:v2-flag-change', check);
+        resolve(!!window.DYNAMIC_COURSE_STRUCTURE_ENABLED);
+      }
+      function check() { if (settled()) finish(); }
+      window.addEventListener('cursia:v2-gate-state', check);
+      window.addEventListener('cursia:v2-flag-change', check);
+      t = setTimeout(finish, typeof timeoutMs === 'number' ? timeoutMs : 10000);
+      try { Promise.resolve(cursiaV2FeaturesRefresh()).then(check, check); } catch (e) { check(); }
+    });
+  }
+  window.cursiaV2WhenSettled = cursiaV2WhenSettled;
 
   // ── Kill switch: re-chequeo periódico (solo puede APAGAR) ──
   var _v2RecheckTimer = null;

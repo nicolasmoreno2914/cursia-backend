@@ -4,7 +4,9 @@
  * Por item y operación:
  *   min      = precio(p10)                       (sin retries)
  *   expected = precio(p50) × (1 + retryRate)     (tasa observada/prior de retries)
- *   max      = precio(p90) × (1 + maxRetries)
+ *   max      = precio(p90) × (1 + maxRetries)   (diagnóstico interno; r90: ya no es la cifra visible ni la de la política)
+ * r90: totals.safetyCap = redondeo hacia arriba al centavo de (expected × capFactor) — el «tope de seguridad» que se
+ * muestra, que evalúa la política y que se autoriza (ver safety-cap.ts). capFactor = FINOPS_RUN_SAFETY_CAP_FACTOR (1,5).
  * V542 (v2): `usageScale` por item escala el uso (p10/p50/p90) de sus operaciones — el banco de un
  * examen crece con los capítulos que cubre (ver `examBankUsageScale` en run-budget.ts) — y el
  * resultado separa la reserva por reintentos (`retryRate` por línea, `totals.retryAllowance`).
@@ -18,6 +20,7 @@ import { addDec, fromScaled, mulDec, normalizeDecimal, toScaled, DecimalLike } f
 import { priceUsage, PricingCatalogRow, UsageMeters } from './pricing';
 import { operationsForItemType, FinopsItemType } from './operations';
 import { UsageModel, assertValidUsageModel } from './usage-model';
+import { parseSafetyCapFactor, safetyCapOf } from './safety-cap';
 
 export const ESTIMATOR_VERSION = 'finops-estimator-v2';
 
@@ -99,6 +102,10 @@ export interface EstimateResult {
      * (incrementales). El resto del total es el uso del usage model sin reintentos.
      */
     retryAllowance: { expected: string; max: string };
+    /** r90: tope de seguridad del run = ceil_centavo(expected × capFactor). Lo visible, lo de la política y lo autorizado. */
+    safetyCap: string;
+    /** r90: factor aplicado (FINOPS_RUN_SAFETY_CAP_FACTOR, default 1,5, acotado a [1,1, 3]). */
+    capFactor: number;
     byProvider: Record<string, MinExpMax>;
     byItemType: Record<string, MinExpMax>;
     byChapter: Record<string, MinExpMax>;
@@ -113,6 +120,8 @@ export interface EstimateCostInput {
   retryPolicy: RetryPolicy;
   /** Instante de precios (opcional). Sin él: filas vigentes abiertas. */
   pricingAsOf?: string | Date | null;
+  /** r90: factor del tope de seguridad (default 1,5; inválido → 1,5). Lo pasa el servicio desde la env. */
+  safetyCapFactor?: number | null;
 }
 
 /** Clave de agrupación para items sin capítulo (course/module scope). */
@@ -282,13 +291,15 @@ export function estimateCost(input: EstimateCostInput): EstimateResult {
     }
   }
 
+  const capFactor = parseSafetyCapFactor(input.safetyCapFactor ?? undefined);
+  const totalsMem = memOf(totalS);
   return {
     estimatorVersion: ESTIMATOR_VERSION,
     usageModelVersion: input.usageModel.version,
     currency: currency ?? 'USD',
     pricingVersions: Array.from(versions).sort(),
     lines,
-    totals: { ...memOf(totalS), retryAllowance: { expected: fromScaled(retryExpectedS), max: fromScaled(retryMaxS) }, byProvider: sortedRecord(recordOf(byProviderS)), byItemType: sortedRecord(recordOf(byItemTypeS)), byChapter: sortedRecord(recordOf(byChapterS)) },
+    totals: { ...totalsMem, safetyCap: safetyCapOf(totalsMem.expected, capFactor), capFactor, retryAllowance: { expected: fromScaled(retryExpectedS), max: fromScaled(retryMaxS) }, byProvider: sortedRecord(recordOf(byProviderS)), byItemType: sortedRecord(recordOf(byItemTypeS)), byChapter: sortedRecord(recordOf(byChapterS)) },
     avoided: { expected: avoidedTotal, byItem: avoided },
   };
 }

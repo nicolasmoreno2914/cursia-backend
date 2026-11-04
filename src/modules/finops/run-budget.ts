@@ -19,6 +19,7 @@ import { FinopsError } from './errors';
 import { cmpDec, normalizeDecimal, DecimalLike } from './decimal';
 import { BudgetDecision, BudgetPolicy, EvaluateBudgetResult, SpentSoFar, evaluateBudget, policySpendCaps } from './budget';
 import type { EstimateItem, EstimateResult } from './estimator';
+import { capFactorOf, policyEstimateView, safetyCapOfEstimate } from './safety-cap';
 import { bankAskCount, expectedExamPlan } from '../course-shell/exam-bank';
 import { guidedPracticeExercisePlan, isGuidedPracticeMinutes } from '../study-time/guided-practice-tiers';
 
@@ -330,6 +331,8 @@ export function decideRunBudget(input: {
   paidRealProviders: readonly string[];
 }): RunBudgetDecision {
   if (!input || !input.estimate || !input.estimate.totals) throw new FinopsError('INVALID_INPUT', 'decideRunBudget necesita estimate.totals');
+  // r90: la política se evalúa contra el TOPE DE SEGURIDAD (esperado × factor), no contra el máximo p90 × reintentos.
+  input = { ...input, estimate: policyEstimateView(input.estimate) };
   const paid = [...(input.paidRealProviders || [])].sort();
   if (paid.length === 0) {
     if (!input.policy) return { decision: 'AUTO_WITHIN_POLICY', reasons: ['no_paid_worker_provider', 'no_budget_policy'], paidRealProviders: paid };
@@ -380,7 +383,11 @@ export function estimateSummary(estimate: EstimateResult): {
   currency: string;
   min: string;
   expected: string;
+  /** Máximo p90 × reintentos (diagnóstico; se conserva por compatibilidad). */
   max: string;
+  /** r90: tope de seguridad (lo visible, lo de la política y lo autorizado). */
+  safetyCap: string;
+  capFactor: number;
   byProvider: EstimateResult['totals']['byProvider'];
 } {
   return {
@@ -388,6 +395,8 @@ export function estimateSummary(estimate: EstimateResult): {
     min: estimate.totals.min,
     expected: estimate.totals.expected,
     max: estimate.totals.max,
+    safetyCap: safetyCapOfEstimate(estimate),
+    capFactor: capFactorOf(estimate),
     byProvider: estimate.totals.byProvider,
   };
 }
