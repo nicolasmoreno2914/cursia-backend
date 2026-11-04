@@ -9,10 +9,13 @@
 //   S5  política: esperado 34.66 / máximo legado 191.45 con maxCostPerRun 150 → AUTO_WITHIN_POLICY (antes ADMIN_APPROVAL)
 //   S6  monto autorizado (planNormalApproval) = tope; acotado por el remanente si es menor; max legado sigue en el estimado
 //   S7  el esperado sobre el límite sigue bloqueando / pidiendo admin (el tope no abre la política)
-//   S8  límites por proveedor evalúan el tope del proveedor (esperado × factor), no su p90
+//   S8  límites por proveedor / tipo siguen contra el máximo p90 (review P2-1)
 //   S9  estimateSummary / estimateCategories exponen safetyCap + capFactor y conservan max
 //   S10 pausa al alcanzar el autorizado: decideRunSpend(authorizedBudget = tope) → run_budget_cap
 //   S11 estimado viejo sin safetyCap (compatibilidad): la vista usa esperado × 1,5
+//   S12 aviso de factor inválido · S13 factor en el estimado incremental · S14 guard de proveedores pagados PAUSA al tope
+//   S15 partes en vuelo sin reserva cuentan su esperado (p50), `next` su p90
+//   (DB, check-v21-finops-wiring: un run frenado por un worker pagado termina `paused` run_budget_cap, nunca `blocked`)
 //
 // Uso: node scripts/check-r90-safety-cap.js [path/to/dist]   (después de npm run build)
 'use strict';
@@ -151,12 +154,12 @@ function ownerEstimate(withCap = true) {
     eq([pl.withinPolicy, pl.blockedBy[0].limit], [false, 'maxCostPerRun'], 'plan bloqueado');
   });
 
-  await check('S8 límite por proveedor contra el tope del proveedor (esperado × factor)', () => {
-    const E = ownerEstimate(); // gamma: esperado 9 → tope 13.50 (p90 45)
-    eq(F.decideRunBudget({ estimate: E, policy: policy({ ...CAPS, maxCostPerProvider: { gamma: '14' } }), paidRealProviders: ['gamma'] }).decision, 'AUTO_WITHIN_POLICY', 'gamma 14 ≥ 13.50');
-    eq(F.decideRunBudget({ estimate: E, policy: policy({ ...CAPS, maxCostPerProvider: { gamma: '13' } }), paidRealProviders: ['gamma'] }).decision, 'ADMIN_APPROVAL', 'gamma 13 < 13.50');
-    const pl = F.planNormalApproval({ estimate: E, policy: policy({ ...CAPS, maxCostPerProvider: { gamma: '13' } }), courseSpent: '0', monthSpent: '0', ownerMonthSpent: '0' });
-    eq([pl.withinPolicy, pl.blockedBy[0].over], [false, 'max'], 'plan: el tope del proveedor no entra');
+  await check('S8 límites por proveedor / tipo siguen contra el máximo p90 (review P2-1: garantía)', () => {
+    const E = ownerEstimate(); // gamma: esperado 9, p90 45
+    eq(F.decideRunBudget({ estimate: E, policy: policy({ ...CAPS, maxCostPerProvider: { gamma: '45' } }), paidRealProviders: ['gamma'] }).decision, 'AUTO_WITHIN_POLICY', 'gamma 45 ≥ p90 45');
+    eq(F.decideRunBudget({ estimate: E, policy: policy({ ...CAPS, maxCostPerProvider: { gamma: '14' } }), paidRealProviders: ['gamma'] }).decision, 'ADMIN_APPROVAL', 'gamma 14: esperado entra, p90 no → admin (no se relaja con el tope)');
+    const pl = F.planNormalApproval({ estimate: E, policy: policy({ ...CAPS, maxCostPerProvider: { gamma: '14' } }), courseSpent: '0', monthSpent: '0', ownerMonthSpent: '0' });
+    eq([pl.withinPolicy, pl.blockedBy[0].over], [false, 'max'], 'plan: el máximo del proveedor no entra');
   });
 
   await check('S9 estimateSummary / estimateCategories: safetyCap + capFactor, max conservado', () => {
@@ -183,7 +186,58 @@ function ownerEstimate(withCap = true) {
     eq(n2(F.safetyCapOfEstimate(E)), '51.99', 'fallback');
     eq(F.decideRunBudget({ estimate: E, policy: policy(CAPS), paidRealProviders: ['gamma'] }).decision, 'AUTO_WITHIN_POLICY', 'decisión');
     const v = F.policyEstimateView(E);
-    eq([n2(v.totals.max), n2(v.totals.byProvider.gamma.max), E.totals.max], ['51.99', '13.50', '191.4500000000'], 'vista sin mutar el original');
+    eq([n2(v.totals.max), n2(v.totals.byProvider.gamma.max), E.totals.max], ['51.99', '45.00', '191.4500000000'], 'vista: solo el total usa el tope; proveedores p90; original intacto');
+  });
+
+  await check('S12 aviso al arrancar con FINOPS_RUN_SAFETY_CAP_FACTOR inválido / fuera de rango (review P2-4)', () => {
+    for (const raw of ['1.0', '1,5', '4', '1.1234567', 'abc']) assert(F.safetyCapFactorWarning({ FINOPS_RUN_SAFETY_CAP_FACTOR: raw }), `avisa ${raw}`);
+    for (const raw of [undefined, '', '1.5', '2', '1.1', '3']) eq(F.safetyCapFactorWarning(raw === undefined ? {} : { FINOPS_RUN_SAFETY_CAP_FACTOR: raw }), null, `no avisa ${raw}`);
+  });
+
+  await check('S13 estimado incremental (regeneración) lleva el factor del estimado de origen (review P2-4)', () => {
+    const e = F.estimateCost({ ...base, safetyCapFactor: 2 });
+    const r = F.incrementalCostForPlan(items.map((it) => ({ itemKey: it.itemKey, action: 'REGENERATE' })), e.lines, {}, e.totals.capFactor);
+    eq([r.totals.incremental.capFactor, r.totals.incremental.safetyCap], [2, F.safetyCapOf(r.totals.incremental.expected, 2)], 'factor 2');
+    eq(F.incrementalCostForPlan([], e.lines, {}).totals.incremental.capFactor, 1.5, 'sin factor → 1,5');
+  });
+
+  await check('S14 guardPaidSubmission: tope alcanzado con autorización → PAUSA el run (run_budget_cap, requiredUsd = comprometido) y devuelve run_paused; sin autorización → bloquea como siempre (review P1-1)', async () => {
+    const mk = (authorized) => {
+      const svc = new FinopsBudgetService({ query: async () => [{ worker_status: 'running' }] }, null);
+      const st = { pauses: [], singleAt: [] };
+      svc.runPaidAuthorizedBudget = async () => authorized;
+      svc.runActual = async () => '51.8';
+      svc.reservedInFlight = async () => '0';
+      svc.singleCallCost = async (_t, _p, _r, at) => { st.singleAt.push(at || 'max'); return '1.0000000000'; };
+      svc.guardRunSpend = async () => ({ decision: { allow: true, reason: 'ok' } });
+      svc.pauseRunBySystem = async (...args) => { st.pauses.push(args); return true; };
+      return { svc, st };
+    };
+    const { svc, st } = mk('52.31');
+    const g = await svc.guardPaidSubmission({ runId: 'run-1', itemRunId: 'ir-1', itemType: 'presentation' });
+    eq([g.allow, g.reason], [false, F.RUN_PAUSED_GUARD_REASON || 'run_paused'], 'run_paused (el worker devuelve la parte)');
+    eq(st.pauses.length, 1, 'una pausa');
+    eq([st.pauses[0][0], st.pauses[0][1], n2(st.pauses[0][3])], ['run-1', 'run_budget_cap', '52.80'], 'pausa run_budget_cap con requiredUsd = comprometido');
+    eq(st.singleAt, ['max'], '`next` sigue acotado por su p90');
+    const ok = mk('60');
+    eq((await ok.svc.guardPaidSubmission({ runId: 'run-1', itemRunId: 'ir-1', itemType: 'presentation' })).allow, true, 'dentro del tope');
+    const none = mk(null);
+    const gn = await none.svc.guardPaidSubmission({ runId: 'run-1', itemRunId: 'ir-1', itemType: 'presentation' });
+    eq([gn.allow, gn.reason, none.st.pauses.length], [false, 'no_authorization', 0], 'sin autorización: bloquea, sin pausa');
+  });
+
+  await check('S15 reservas en vuelo de partes pagadas sin reserva: costo esperado de una llamada (p50), no p90', async () => {
+    const svc = new FinopsBudgetService(null, null);
+    const at = [];
+    svc.singleCallCost = async (_t, _p, _r, a) => { at.push(a || 'max'); return a === 'expected' ? '0.6000000000' : '1.0000000000'; };
+    const runner = { query: async () => [{ id: 'a', type: 'presentation' }, { id: 'b', type: 'presentation' }] };
+    eq(n2(await svc.reservedInFlight('run-1', null, runner)), '1.20', 'dos partes × esperado');
+    eq(at, ['expected'], 'esperado (cacheado por tipo)');
+    svc.catalog = async () => seed.catalog;
+    delete svc.singleCallCost;
+    const pE = Number(await svc.singleCallCost('presentation', 'gamma', undefined, 'expected'));
+    const pM = Number(await svc.singleCallCost('presentation', 'gamma'));
+    assert(pE > 0 && pE <= pM, `p50 ${pE} ≤ p90 ${pM}`);
   });
 
   eq(netAttempts.length, 0, 'red');

@@ -31,6 +31,18 @@ export function parseSafetyCapFactor(raw: unknown): number {
   return n;
 }
 
+/**
+ * Review P2-4: aviso (null = nada que avisar) cuando FINOPS_RUN_SAFETY_CAP_FACTOR está definida pero es inválida o está
+ * fuera de [1,1, 3] y por eso se usa 1,5. Lo registra FinopsBudgetService al arrancar.
+ */
+export function safetyCapFactorWarning(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env[FINOPS_RUN_SAFETY_CAP_FACTOR_ENV];
+  if (raw === undefined || raw === '') return null;
+  const used = parseSafetyCapFactor(raw);
+  if (used !== DEFAULT_SAFETY_CAP_FACTOR || Number(String(raw).trim()) === DEFAULT_SAFETY_CAP_FACTOR) return null;
+  return `${FINOPS_RUN_SAFETY_CAP_FACTOR_ENV}=${JSON.stringify(raw)} es inválido o está fuera de [${SAFETY_CAP_FACTOR_MIN}, ${SAFETY_CAP_FACTOR_MAX}] (decimal con punto, hasta 6 decimales): se usa ${DEFAULT_SAFETY_CAP_FACTOR}`;
+}
+
 export function readSafetyCapFactor(env: NodeJS.ProcessEnv = process.env): number {
   return parseSafetyCapFactor(env[FINOPS_RUN_SAFETY_CAP_FACTOR_ENV]);
 }
@@ -56,12 +68,6 @@ type WithBreakdown = MinExpMax & {
   byItemType?: Record<string, MinExpMax>;
 };
 
-function capRecord(r: Record<string, MinExpMax> | undefined, factor: number): Record<string, MinExpMax> | undefined {
-  if (!r) return r;
-  const out: Record<string, MinExpMax> = {};
-  for (const k of Object.keys(r)) out[k] = { ...r[k], max: safetyCapOf(r[k].expected, factor) };
-  return out;
-}
 
 /** Factor efectivo de un estimado: el que trae (`totals.capFactor`) o el default. */
 export function capFactorOf(estimate: { totals: { capFactor?: number } }): number {
@@ -75,22 +81,14 @@ export function safetyCapOfEstimate(estimate: { totals: { expected: string; safe
 }
 
 /**
- * Vista del estimado para la POLÍTICA y la autorización: el `max` de los totales (y de cada proveedor / tipo de item) es
- * el tope de seguridad. evaluateBudget / planNormalApproval comparan `max` contra los límites y planNormalApproval
- * autoriza `max` (acotado por los remanentes): con esta vista ambos usan el tope, sin tocar su lógica.
+ * Vista del estimado para la POLÍTICA y la autorización: el `max` de los TOTALES es el tope de seguridad.
+ * evaluateBudget / planNormalApproval comparan `max` contra los límites totales (por run, por curso, mensuales) y
+ * planNormalApproval autoriza `max` (acotado por los remanentes): con esta vista ambos usan el tope, sin tocar su lógica.
+ * Review P2-1: los límites por PROVEEDOR / por TIPO de item siguen contra el máximo p90 × reintentos de esa parte
+ * (`byProvider` / `byItemType` sin cambios): ningún guard los hace cumplir en tiempo de ejecución (una autorización total
+ * no acota un solo servicio), así que solo el peor caso teórico los garantiza.
  */
 export function policyEstimateView<T extends { totals: WithBreakdown }>(estimate: T): T {
-  // (genérico: devuelve el mismo tipo con max reemplazado; los demás campos de totals se copian tal cual)
   if (!estimate || !estimate.totals) return estimate;
-  const factor = capFactorOf(estimate);
-  const t = estimate.totals;
-  return {
-    ...estimate,
-    totals: {
-      ...t,
-      max: safetyCapOfEstimate(estimate as any),
-      ...(t.byProvider ? { byProvider: capRecord(t.byProvider, factor) } : {}),
-      ...(t.byItemType ? { byItemType: capRecord(t.byItemType, factor) } : {}),
-    },
-  };
+  return { ...estimate, totals: { ...estimate.totals, max: safetyCapOfEstimate(estimate as any) } };
 }

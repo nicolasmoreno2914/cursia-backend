@@ -104,7 +104,7 @@ async function pureChecks() {
   const estimate = (items, rp) => F.estimateCost({ items, catalog, usageModel: F.usageModelPriorsV1(), retryPolicy: rp || { maxRetries: 1 } });
 
   await check('puro (flujo normal): planNormalApproval — dentro de la política ⇒ monto = min(max, lo que queda de run/curso/mes); esperado sobre un límite ⇒ bloqueado nombrando el límite; sin política ⇒ bloqueado; límites por proveedor', () => {
-    // r90: el monto autorizado es el tope de seguridad (aquí 13) y el «máximo» de un proveedor es su esperado × 1,5 (gamma: 3).
+    // r90: el monto autorizado es el tope de seguridad (aquí 13); los límites por proveedor siguen contra su máximo p90 (gamma: 4).
     const est = { totals: { min: '3', expected: '5', max: '13', safetyCap: '13', byProvider: { gamma: { min: '1', expected: '2', max: '4' } }, byItemType: {} } };
     const pol = (limits) => ({ limits, onExceed: 'ADMIN_APPROVAL', requireHumanApprovalForRealSpend: true });
     let p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerRun: '10', maxCostPerCourse: '15', monthlyCapStaging: '50' }), courseSpent: '0', monthSpent: '30.6' });
@@ -119,9 +119,9 @@ async function pureChecks() {
     p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '1' } }), courseSpent: '0', monthSpent: '0' });
     eq(p.blockedBy.map((b) => [b.limit, b.over]), [['maxCostPerProvider.gamma', 'expected']], 'por proveedor');
     // Review I1: lo ya gastado en el proveedor cuenta, y el MÁXIMO del proveedor debe entrar (una autorización total no lo acota).
-    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '8.5' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
-    eq(p.blockedBy.map((b) => [b.limit, b.over, dec(b.spent)]), [['maxCostPerProvider.gamma', 'max', 6]], 'gastado + max > límite');
     p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '9' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
+    eq(p.blockedBy.map((b) => [b.limit, b.over, dec(b.spent)]), [['maxCostPerProvider.gamma', 'max', 6]], 'gastado + max > límite');
+    p = F.planNormalApproval({ estimate: est, policy: pol({ maxCostPerProvider: { gamma: '10' } }), courseSpent: '0', monthSpent: '0', providerSpent: { gamma: '6' } });
     eq(p.withinPolicy, true, 'gastado + max ≤ límite');
     p = F.planNormalApproval({ estimate: est, policy: pol({ monthlyCap: '50' }), courseSpent: '0', monthSpent: '50' });
     eq([p.withinPolicy, p.blockedBy[0].limit], [false, 'monthlyCap'], 'mes justo agotado ⇒ bloqueado (nunca monto 0)');
@@ -802,20 +802,31 @@ async function dbChecks() {
         [null, null, 'owner_mismatch', 'owner_mismatch'], 'sin ejecutor de servidor: run ajeno no se atribuye');
     });
 
-    await check('DB presupuesto excedido → item `blocked` con budget_exceeded ANTES del envío (0 envíos, 0 cargos nuevos)', async () => {
+    // r90 (review P1-1): llegar al presupuesto autorizado ya no BLOQUEA la parte: PAUSA el run (run_budget_cap, requiredUsd)
+    // y el worker la devuelve a la cola sin envío, sin cargo y sin consumir intento.
+    await check('DB presupuesto excedido → run PAUSADO (run_budget_cap) y la parte DEVUELTA (nunca blocked) ANTES del envío (0 envíos, 0 cargos nuevos)', async () => {
       // Nuevo presupuesto TOTAL del run (append) por debajo de lo ya gastado.
       const [runEst] = await ds.query(`select id from public.cost_estimates where run_id = $1 and scope = 'run'`, [runB]);
+      const [prevJob] = await ds.query(`select worker_status, status from public.production_jobs where id = $1`, [runB]);
       const a = await admin.authorize(Bc.cid, { estimateId: runEst.id, authorizedBudget: '0.5' }, ADMIN_USER);
       eq(a.runId, runB, 'autorización del run');
       const before = (await events(`run_id = $1`, [runB])).length;
       const s = fakeScheduler();
       const vg = fakeVideogen(0.97);
       const item = await claimedVideo(runB, Bc.c1, { itemKey: `video:${Bc.c1}`, outputSummary: {} });
-      await itemWorker.processItem(workerDeps(s, vg), item);
-      eq([vg.st.submits, s.st.blocked.length, s.st.completed.length], [0, 1, 0], 'bloqueado sin enviar');
-      assert(s.st.blocked[0].msg.startsWith('budget_exceeded:'), s.st.blocked[0].msg);
-      assert(!s.st.externals.some((p) => p.externalSubmitStartedAt), 'sin marcador de envío');
-      eq((await events(`run_id = $1`, [runB])).length, before, 'sin cargos nuevos');
+      try {
+        await itemWorker.processItem(workerDeps(s, vg), item);
+        eq([vg.st.submits, s.st.blocked.length, s.st.completed.length, s.st.failed.length], [0, 0, 0, 1], 'devuelto sin enviar, nunca bloqueado');
+        eq([s.st.failed[0].retryable, s.st.failed[0].opts && s.st.failed[0].opts.grantAttempt, /^run_paused:/.test(s.st.failed[0].msg)], [true, true, true], s.st.failed[0].msg);
+        assert(!s.st.externals.some((p) => p.externalSubmitStartedAt), 'sin marcador de envío');
+        eq((await events(`run_id = $1`, [runB])).length, before, 'sin cargos nuevos');
+        const [job] = await ds.query(`select worker_status, output_summary->'pause' as pause from public.production_jobs where id = $1`, [runB]);
+        eq([job.worker_status, job.pause && job.pause.reason], ['paused', 'run_budget_cap'], 'run pausado por el tope');
+        assert(Number(job.pause.requiredUsd) > 0.5, `requiredUsd ${job.pause.requiredUsd} > autorizado`);
+      } finally {
+        // El resto de los checks usa el run B activo.
+        await ds.query(`update public.production_jobs set worker_status = $2, status = $3, output_summary = output_summary - 'pause' where id = $1`, [runB, prevJob.worker_status, prevJob.status]);
+      }
     });
 
     await check('DB scheduler real: blockItemForBudget → item blocked + dependientes blocked; retryItem lo reanuda tras ampliar la autorización', async () => {
@@ -1185,18 +1196,28 @@ async function dbChecks() {
       eq(dec(await budget.runPaidAuthorizedBudget(runE)), dec(b.estimate.expected), 'para proveedores pagados solo cuenta la ADMIN');
     });
 
-    await check('DB I1 workers: el guard de Videogen y el de proveedores bloquean (budget_exceeded) aunque haya AUTO de sobra', async () => {
-      const s = fakeScheduler();
-      const vg = fakeVideogen(0.97);
-      await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runE, E.c1));
-      eq([vg.st.submits, s.st.blocked.length], [0, 1], 'Videogen bloqueado');
-      const p = await itemRow(runE, `presentation:${E.c1}`);
-      const s2 = fakeScheduler();
-      await providerWorker.processProviderItem({ scheduler: s2, dataSource: ds, logger: workerLog, executorId: 'p-e', leaseSeconds: 60, finops: ledger, budget,
-        artifacts: { async uploadJsonArtifact() { return { id: 'x' }; } } },
-      { itemRunId: p.id, runId: runE, itemKey: p.item_key, type: 'presentation', idempotencyKey: p.idempotency_key, chapterId: E.c1, chapterNumber: 1, manifestId: p.manifest_id, artifactCourseId: String(E.cid), attempt: 1 });
-      eq(s2.st.blocked.length, 1, 'proveedor bloqueado');
-      assert(/budget_exceeded/.test(s2.st.blocked[0].msg), s2.st.blocked[0].msg);
+    await check('DB I1 workers: el guard de Videogen y el de proveedores frenan (tope del run → PAUSA, nunca blocked) aunque haya AUTO de sobra', async () => {
+      const [prevJob] = await ds.query(`select worker_status, status from public.production_jobs where id = $1`, [runE]);
+      try {
+        const s = fakeScheduler();
+        const vg = fakeVideogen(0.97);
+        await itemWorker.processItem(workerDeps(s, vg), await claimedVideo(runE, E.c1));
+        eq([vg.st.submits, s.st.blocked.length, s.st.failed.length], [0, 0, 1], 'Videogen frenado (devuelto)');
+        let [job] = await ds.query(`select worker_status, output_summary->'pause'->>'reason' as reason from public.production_jobs where id = $1`, [runE]);
+        eq([job.worker_status, job.reason], ['paused', 'run_budget_cap'], 'run pausado por el tope (r90)');
+        await ds.query(`update public.production_jobs set worker_status = $2, status = $3, output_summary = output_summary - 'pause' where id = $1`, [runE, prevJob.worker_status, prevJob.status]);
+        const p = await itemRow(runE, `presentation:${E.c1}`);
+        const s2 = fakeScheduler();
+        await providerWorker.processProviderItem({ scheduler: s2, dataSource: ds, logger: workerLog, executorId: 'p-e', leaseSeconds: 60, finops: ledger, budget,
+          artifacts: { async uploadJsonArtifact() { return { id: 'x' }; } } },
+        { itemRunId: p.id, runId: runE, itemKey: p.item_key, type: 'presentation', idempotencyKey: p.idempotency_key, chapterId: E.c1, chapterNumber: 1, manifestId: p.manifest_id, artifactCourseId: String(E.cid), attempt: 1 });
+        eq([s2.st.blocked.length, s2.st.failed.length], [0, 1], 'proveedor frenado (devuelto), nunca bloqueado');
+        assert(/^run_paused:/.test(s2.st.failed[0].msg), s2.st.failed[0].msg);
+        [job] = await ds.query(`select worker_status, output_summary->'pause'->>'reason' as reason from public.production_jobs where id = $1`, [runE]);
+        eq([job.worker_status, job.reason], ['paused', 'run_budget_cap'], 'run pausado por el tope (proveedor)');
+      } finally {
+        await ds.query(`update public.production_jobs set worker_status = $2, status = $3, output_summary = output_summary - 'pause' where id = $1`, [runE, prevJob.worker_status, prevJob.status]);
+      }
     });
 
     await check('DB M3 (fix round 2): worker de Videogen / proveedores en run REAL SIN guard de presupuesto → item bloqueado (budget_exceeded: finops_unavailable), 0 envíos (fail closed)', async () => {

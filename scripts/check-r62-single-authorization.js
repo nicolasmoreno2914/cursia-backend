@@ -105,8 +105,7 @@ async function pureChecks() {
     eq(F.decideRunBudget({ estimate: E, policy: rowPolicy({ ...CAPS, maxCostPerRun: '7' }), paidRealProviders: ['gamma'] }).decision, 'ADMIN_APPROVAL', 'banda');
     eq(F.decideRunBudget({ estimate: E, policy: rowPolicy({ ...CAPS, maxCostPerRun: '4' }, 'BLOCK'), paidRealProviders: ['gamma'] }).decision, 'BLOCK', 'on_exceed BLOCK');
     eq(F.decideRunBudget({ estimate: E, policy: rowPolicy({ ...CAPS, maxCostPerCourse: '10' }), spentSoFar: { course: '8' }, paidRealProviders: ['gamma'] }).decision, 'ADMIN_APPROVAL', 'curso con gasto previo');
-    // r90: el «máximo» del proveedor es su tope de seguridad (esperado 2 × 1,5 = 3): un límite de 2,5 queda en la banda.
-    eq(F.decideRunBudget({ estimate: E, policy: rowPolicy({ ...CAPS, maxCostPerProvider: { gamma: '2.5' } }), paidRealProviders: ['gamma'] }).decision, 'ADMIN_APPROVAL', 'tope del proveedor');
+    eq(F.decideRunBudget({ estimate: E, policy: rowPolicy({ ...CAPS, maxCostPerProvider: { gamma: '3' } }), paidRealProviders: ['gamma'] }).decision, 'ADMIN_APPROVAL', 'máximo del proveedor');
   });
 
   await check('puro: sin política → ADMIN; política sin algún tope (por run / por curso / mensual) → ADMIN nombrando lo que falta', () => {

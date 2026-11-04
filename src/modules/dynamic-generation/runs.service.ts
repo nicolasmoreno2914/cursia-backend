@@ -5301,7 +5301,7 @@ export class RunsService {
     if (!pv.approval || !pv.approval.canApprove) {
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
-        message: `${APPROVAL_FORBIDDEN}: generar los videos reales requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate?.expected)}, máximo USD ${usd2(pv.estimate?.max)}). No se generó nada.`,
+        message: `${APPROVAL_FORBIDDEN}: generar los videos reales requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate?.expected)}, tope de seguridad USD ${usd2(pv.estimate?.safetyCap ?? pv.estimate?.max)}). No se generó nada.`,
       });
     }
     if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicVideoUpgradePreview(pv));
@@ -5929,7 +5929,7 @@ export class RunsService {
     // El filtro global aplana el 409 a su mensaje: estimateId y totales viajan también en el texto.
     const message =
       `${code}: ${human} No se creó ni se envió nada. estimateId=${estimateId} ` +
-      `totalsJson=${JSON.stringify({ currency: totals.currency, min: totals.min, expected: totals.expected, max: totals.max })}`;
+      `totalsJson=${JSON.stringify({ currency: totals.currency, min: totals.min, expected: totals.expected, max: totals.max, safetyCap: totals.safetyCap, capFactor: totals.capFactor })}`;
     return new ConflictException({ message, code, estimateId, estimate: totals, reasons, paidRealProviders: providers });
   }
 
@@ -6011,7 +6011,7 @@ export class RunsService {
       const est = await this.finopsBudget.estimate(estimateItemsForRun(items, mode, null));
       const hist = await this.finopsBudget.historicalByItemRun(keep.map((x) => x.fromItemRunId).filter(Boolean));
       const withBasis = keep.filter((x) => (x.fromItemRunId && (hist[x.fromItemRunId] || []).length > 0) || est.lines.some((l) => l.itemKey === x.itemKey));
-      const r = incrementalCostForPlan(withBasis.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.fromItemRunId })), est.lines, hist);
+      const r = incrementalCostForPlan(withBasis.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.fromItemRunId })), est.lines, hist, est.totals.capFactor);
       for (const act of r.actions) {
         if (!act.basis) continue;
         await this.finopsBudget.recordAvoidance({
@@ -6050,6 +6050,7 @@ export class RunsService {
       computable.map((x) => ({ itemKey: x.itemKey, action: x.action, fromItemRunId: x.action === 'STALE_NO_AUTO' ? x.itemRunId : null })),
       est.lines,
       hist,
+      est.totals.capFactor,
     );
     const byItemKey = new Map(r.actions.map((x) => [x.itemKey, x]));
     return {

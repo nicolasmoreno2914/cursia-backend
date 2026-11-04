@@ -1,6 +1,7 @@
 import type { BlueprintSnapshotV2 } from '../course-blueprints/blueprint-snapshot';
 import type { GenerationManifestV1, ManifestItem } from '../generation-manifests/generation-manifest-builder';
 import { DryRunPricing, ProviderPlan, providerPlanFor } from '../pedagogy/dry-run';
+import { readSafetyCapFactor, safetyCapOf } from '../finops/safety-cap';
 import type { StudyTimeEstimate } from '../study-time/time-model';
 import type { InvalidationAction, InvalidationActionType, InvalidationPlan } from './plan';
 import { ALIGNMENT_FINGERPRINT_TYPES } from './fingerprints';
@@ -167,6 +168,8 @@ export function dependencyTable(): { type: string; dependsOn: string; inputs: st
 export interface PlanCostEstimate {
   estimatedChangeCostUsd: string | null;
   range: { min: string; max: string } | null;
+  /** r90: tope de seguridad del cambio (esperado × factor); null sin estimado. */
+  safetyCapUsd: string | null;
   llmItems: number;
   paidItems: number;
   cost: ProviderPlan;
@@ -180,6 +183,8 @@ export function planCostEstimate(plan: InvalidationPlan, manifest: GenerationMan
   return {
     estimatedChangeCostUsd: cost.estimateUsd ? Number(cost.estimateUsd.expected).toFixed(2) : null,
     range: cost.estimateUsd ? { min: Number(cost.estimateUsd.min).toFixed(2), max: Number(cost.estimateUsd.max).toFixed(2) } : null,
+    // r90: tope de seguridad del cambio (lo que se autorizaría); la UI lo muestra en lugar del rango min–max p90.
+    safetyCapUsd: cost.estimateUsd ? Number(safetyCapOf(cost.estimateUsd.expected, readSafetyCapFactor())).toFixed(2) : null,
     llmItems: items.length - paid,
     paidItems: paid,
     cost,
