@@ -17,6 +17,11 @@ import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 import { classifyFailure } from '../reliability/failure-classifier';
 import { autoRecoveryEnabled } from '../dynamic-generation/auto-heal';
 import { packageHoldOf } from '../dynamic-generation/stop-after';
+// r99: pausa del empaque como bug de Cursia + reanudación con el arreglo desplegado.
+import {
+  BUG_HOLD_MAX_AGE_DAYS, BUG_HOLD_MAX_BUILD_RESUMES, BUG_HOLD_RESOLVE_ACTION, BUG_HOLD_RESOLVE_TARGET_TYPE, bugHoldSince, currentBuildId,
+} from '../reliability/bug-hold';
+import { sanitizeForReport } from '../reliability/remediation-ladder';
 
 /**
  * Fix round 1 (I1): códigos de bloqueo del empaque CAUSADOS POR EL CONTENIDO de un item que se reparan
@@ -355,6 +360,118 @@ export class AutoPackageService implements OnModuleInit {
       out.push(o);
     }
     if (ids.length) this.logger.log(`empaque automático: barrido — ${ids.length} candidato(s): ${JSON.stringify(out.map((o) => o.action))}`);
+    return out;
+  }
+
+  /**
+   * r99 — PAUSA COMO BUG DE CURSIA del EMPAQUE (estrategia `package_cursia_issue_hold`): un run completo cuyo paquete
+   * final no se puede armar (bloqueado por el precheck / validador, intentos no transitorios agotados o la ventana de
+   * transitorios agotada) nunca queda «Curso listo» con el paquete roto ni espera a un admin por curso:
+   *  - la primera vez se registra la pausa (`autoPackage.cursiaIssue`, huella `package|<código>|<regla>`; «Falla común»);
+   *  - con un build nuevo desde la pausa (≤ BUG_HOLD_MAX_BUILD_RESUMES, dentro de BUG_HOLD_MAX_AGE_DAYS) o con la huella
+   *    marcada resuelta después de la pausa, la marca del empaque se renueva (eligibleAt = ahora, sin el bloqueo ni los
+   *    conteos) y se vuelve a pedir el paquete con el MISMO camino de siempre (ensure → requestPackage + lock por run).
+   * Nada de esto llama a un proveedor: una reparación por item que haga falta pasa por retryItem y sus guards de FinOps.
+   */
+  async resumeCursiaIssues(opts: { now?: Date; limit?: number; buildId?: string; env?: Record<string, string | undefined> } = {}): Promise<Array<{ runId: string; action: 'held' | 'resumed' | 'skipped'; reason?: string }>> {
+    const env = opts.env ?? process.env;
+    if (!autoPackageEnabled(env) || !isDynamicCourseStructureEnabled(env)) return [];
+    const now = opts.now ?? new Date();
+    const buildId = opts.buildId ?? currentBuildId(env);
+    const limit = Math.max(1, Math.floor(opts.limit ?? 50));
+    const out: Array<{ runId: string; action: 'held' | 'resumed' | 'skipped'; reason?: string }> = [];
+    const runs: any[] = await this.dataSource.query(
+      `select r.id, r.course_id, r.worker_status, r.output_summary, coalesce(m.rules_version, 3) as rules_version
+         from public.production_jobs r
+         left join public.course_generation_manifests m on m.id = (r.input_payload->>'manifestId')::bigint
+        where r.execution_mode = 'dynamic_generation' and r.worker_status = 'completed'
+          and r.created_at >= $1::timestamptz
+          and jsonb_typeof(r.output_summary->'autoPackage') = 'object'
+          and r.output_summary->'autoPackage' ? 'eligibleAt'
+          and not (r.output_summary->'autoPackage' ? 'held')
+          and not exists (
+            select 1 from public.production_jobs r2
+             where r2.execution_mode = 'dynamic_generation' and r2.course_id::text = r.course_id::text and r2.id <> r.id
+               and (r2.created_at > r.created_at or (r2.created_at = r.created_at and r2.id > r.id)))
+          and (jsonb_typeof(r.output_summary->'autoPackage'->'blocked') = 'object'
+               or exists (
+                 select 1 from public.production_jobs p
+                  where p.execution_mode = 'dynamic_package' and p.input_payload->>'runId' = r.id::text
+                    and p.worker_status in ('failed', 'failed_retryable')
+                    and p.created_at >= (r.output_summary->'autoPackage'->>'eligibleAt')::timestamptz))
+        order by r.updated_at desc nulls last, r.id
+        limit $2`,
+      [bugHoldSince(env).toISOString(), limit],
+    );
+    if (!runs.length) return out;
+    const resolutions = new Map<string, string>();
+    try {
+      const rows: any[] = await this.dataSource.query(
+        `select target_id, max(at) as at from public.admin_audit_log where action = $1 and target_type = $2 group by target_id`,
+        [BUG_HOLD_RESOLVE_ACTION, BUG_HOLD_RESOLVE_TARGET_TYPE],
+      );
+      for (const x of rows) if (x?.target_id) resolutions.set(String(x.target_id), new Date(x.at).toISOString());
+    } catch {
+      // admin_audit_log ausente: sin marcas manuales (el build nuevo sigue reanudando).
+    }
+    for (const run of runs) {
+      const runId = String(run.id);
+      const state = await loadAutoPackageState(this.dataSource, run, now, env, Number(run.rules_version ?? 3));
+      // Un paquete vigente, uno en curso o un reintento automático pendiente: no es una pausa.
+      if (state.status === 'completed' || state.autoRetryPending || state.rebuildPending || ['queued', 'running', 'retrying'].includes(state.status)) continue;
+      const exhausted = !!state.blocked || state.hardFailedSinceMark >= AUTO_PACKAGE_MAX_ATTEMPTS || state.attentionReason === PACKAGE_TRANSIENT_EXHAUSTED
+        || (autoPackageMarkOf(run)?.transient.unclassified ?? 0) >= AUTO_PACKAGE_MAX_TRANSIENT;
+      if (!exhausted) continue;
+      let text = state.blocked ? `${state.blocked.code}: ${state.blocked.message ?? ''}` : '';
+      if (!text) {
+        const [last] = await this.dataSource.query(
+          `select error_message from public.production_jobs
+            where execution_mode = 'dynamic_package' and input_payload->>'runId' = $1 and worker_status in ('failed', 'failed_retryable')
+            order by created_at desc, id desc limit 1`,
+          [runId],
+        );
+        text = String(last?.error_message ?? state.attentionReason ?? 'package_error');
+      }
+      const verdict = classifyFailure({ source: 'package_worker', error: text });
+      const fingerprint = `package|${verdict.code}|${verdict.rule}`.slice(0, 200);
+      const prev = run.output_summary?.autoPackage?.cursiaIssue ?? null;
+      if (!prev || prev.active !== true || prev.fingerprint !== fingerprint) {
+        const hold = {
+          v: 1, active: true, fingerprint, code: verdict.code, rule: verdict.rule, heldAt: now.toISOString(), lastAt: now.toISOString(), buildId,
+          buildResumes: Math.max(0, Math.floor(Number(prev?.buildResumes ?? 0)) || 0), sampleError: sanitizeForReport(text),
+          count: Math.max(0, Math.floor(Number(prev?.count ?? 0)) || 0) + 1,
+        };
+        await this.dataSource.query(
+          `update public.production_jobs
+              set output_summary = jsonb_set(output_summary, '{autoPackage,cursiaIssue}', $2::jsonb, true), updated_at = now()
+            where id = $1 and jsonb_typeof(output_summary->'autoPackage') = 'object'`,
+          [runId, JSON.stringify(hold)],
+        );
+        this.logger.error(`empaque: run ${runId} en pausa como bug de Cursia (${verdict.code}); huella ${fingerprint} → «Falla común»`);
+        out.push({ runId, action: 'held', reason: verdict.code });
+        continue;
+      }
+      const resolvedAt = resolutions.get(fingerprint) ?? null;
+      const resolved = !!resolvedAt && Date.parse(resolvedAt) >= Date.parse(String(prev.heldAt));
+      const byBuild = prev.buildId !== buildId && Number(prev.buildResumes ?? 0) < BUG_HOLD_MAX_BUILD_RESUMES
+        && now.getTime() - Date.parse(String(prev.heldAt)) <= BUG_HOLD_MAX_AGE_DAYS * 86_400_000;
+      if (!resolved && !byBuild) { out.push({ runId, action: 'skipped', reason: 'waiting_fix' }); continue; }
+      const resumed = { ...prev, active: false, resumedAt: now.toISOString(), resumeTrigger: resolved ? 'resolved' : 'new_build', buildId,
+        buildResumes: Number(prev.buildResumes ?? 0) + (resolved ? 0 : 1) };
+      // Marca nueva del empaque automático: el bloqueo y los conteos quedan atrás (mismo mecanismo que un run recién completado).
+      await this.dataSource.query(
+        `update public.production_jobs
+            set output_summary = jsonb_set(output_summary, '{autoPackage}',
+                  ((output_summary->'autoPackage') - 'blocked' - 'transient' - 'lastSkip' - 'satisfiedJobId')
+                    || jsonb_build_object('eligibleAt', $2::text, 'cursiaIssue', $3::jsonb), true),
+                updated_at = now()
+          where id = $1 and jsonb_typeof(output_summary->'autoPackage') = 'object'`,
+        [runId, now.toISOString(), JSON.stringify(resumed)],
+      );
+      const o = await this.ensure(runId, 'sweep', env);
+      this.logger.warn(`empaque: run ${runId} reanudado tras la pausa por bug de Cursia (${resumed.resumeTrigger}) → ${o.action}`);
+      out.push({ runId, action: 'resumed', reason: String(resumed.resumeTrigger) });
+    }
     return out;
   }
 }

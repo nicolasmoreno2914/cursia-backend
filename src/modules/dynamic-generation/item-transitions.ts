@@ -12,6 +12,8 @@ import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoRegenSpe
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 import { applyStopAfterInTx, holdsPackaging, packageHoldReason } from './stop-after';
 import { LadderStep, REMEDIATION_KEY, ladderStep, remediationOf } from '../reliability/remediation-ladder';
+// r99: pausa como bug de Cursia (sin intentos ni gasto) + reporte + reanudación automática con el arreglo.
+import { BUG_HOLD_KEY, BugHoldReason, BugHoldState, bugHoldStateOf, currentBuildId, holdsImmediately, nextBugHold } from '../reliability/bug-hold';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -169,11 +171,15 @@ export async function applyItemFailure(
     ?? (meta?.source === 'browser_executor' ? 'failed' : outcomeForFailure(extractFailureCode(error)));
   // r98: escalera de remediación de un fallo DETERMINISTA (misma huella otra vez → el próximo intento cambia su entrada;
   // después, aceptación con marca de calidad si el validador es degradable; si no, agotada → el dueño reintenta a mano).
-  await applyRemediationLadder(qr, row, error, retryable, verdict);
-  const maxRoundsToday = maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null);
+  const step = await applyRemediationLadder(qr, row, error, retryable, verdict);
+  // r99: sin estrategia automática (código sin regla, contrato roto, configuración de Cursia…) desde la PRIMERA vez, o la
+  // escalera agotada → pausa como bug de Cursia: `failed` sin más intentos (nunca un reintento idéntico), sin gasto.
+  const hold = await applyCursiaIssueHold(qr, row, error, verdict, step);
+  const maxRoundsToday = hold ? 0 : maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null);
   // r67 (A3): estado de recuperación explícito + próxima acción automática visible (next_retry_at también en `failed`)
   // + sin huérfanos (failed sin acción programada ni motivo → attention 'unrecoverable').
-  const attentionOverride = await persistFailureRecoveryState(qr, row, error, verdict, maxRoundsToday);
+  const attentionOverride = hold ? 'product_bug' : await persistFailureRecoveryState(qr, row, error, verdict, maxRoundsToday);
+  if (hold) await persistFailureRecoveryState(qr, row, error, verdict, 0);
   await recordItemFailure(qr, {
     itemRunId: row.id, status: row.status, error, verdict, outcome, maxRoundsToday, attentionOverride,
   });
@@ -229,6 +235,37 @@ export async function applyRemediationLadder(
   row.status = status;
   row.output_summary = { ...(row.output_summary ?? {}), [REMEDIATION_KEY]: step.state };
   return step;
+}
+
+/**
+ * r99: ¿esta falla deja la parte en PAUSA COMO BUG DE CURSIA? (misma transacción que el fallo; muta `row`).
+ *  - veredicto sin estrategia automática (remediation-strategies.ts → cursia_issue_hold) → desde la PRIMERA vez;
+ *  - escalera de remediación agotada (rung 3) → la estrategia asignada no alcanzó.
+ * La parte queda `failed` (los intentos que le quedaban NO se usan: serían el mismo pedido), next_retry_at null, sin
+ * gasto. Sus dependientes quedan bloqueados como siempre. La reanuda RunsService.sweepCursiaIssues (bug-hold.ts).
+ */
+export async function applyCursiaIssueHold(
+  qr: QueryRunner,
+  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null },
+  error: string,
+  verdict: ReturnType<typeof classifyFailure>,
+  step: LadderStep | null,
+  now: Date = new Date(),
+): Promise<BugHoldState | null> {
+  const imm = holdsImmediately(verdict);
+  const reason: BugHoldReason | null = imm.hold ? imm.reason : step?.action === 'exhausted' ? 'strategy_exhausted' : null;
+  if (!reason) return null;
+  const state = nextBugHold(bugHoldStateOf(row.output_summary), verdict, row.type, error, reason, now, currentBuildId());
+  await qr.query(
+    `update public.generation_item_runs
+        set status = 'failed', next_retry_at = null, finished_at = coalesce(finished_at, now()),
+            output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb)
+      where id = $1 and status in ('failed', 'retrying')`,
+    [row.id, JSON.stringify(state)],
+  );
+  row.status = 'failed';
+  row.output_summary = { ...(row.output_summary ?? {}), [BUG_HOLD_KEY]: state };
+  return state;
 }
 
 /** r67: entradas de historial de recuperación que se conservan por parte (output_summary.recovery.history). */

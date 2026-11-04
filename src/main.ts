@@ -86,6 +86,11 @@ async function bootstrap() {
     { name: 'sonda de crédito del proveedor', run: () => runsService.autoProbeProviderCredit() },
     // r62 (N2): Videogen/Gamma con resultado conocido (o ambiguo) → conciliación con la evidencia + reenvío acotado.
     { name: 'conciliación de proveedor', run: () => providerReconcile.sweep() },
+    // r99: partes sin estrategia automática (o con la estrategia agotada) → pausa como bug de Cursia (sin gasto, reporte
+    // «Falla común»); y reanudación automática de las pausadas cuando el arreglo está desplegado. Va después de los
+    // demás barridos (que tienen su oportunidad primero) y antes del empaque.
+    { name: 'pausas por bug de Cursia', run: () => runsService.sweepCursiaIssues() },
+    { name: 'empaque: pausas por bug de Cursia', run: () => autoPackage.resumeCursiaIssues() },
     { name: 'empaque automático', run: () => autoPackage.sweep() },
   ]);
 }

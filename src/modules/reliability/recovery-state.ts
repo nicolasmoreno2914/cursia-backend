@@ -12,7 +12,10 @@
 //                                    cualquier llamada nueva;
 //   blocked_permanent                en manos de un humano por presupuesto / configuración / bug de producto;
 //   failed_no_strategies             no queda ninguna estrategia automática segura (o expiró la espera): humano,
-//                                    attention_reason='unrecoverable'.
+//                                    attention_reason='unrecoverable'. r99: el barrido sweepCursiaIssues la pasa a
+//                                    paused_cursia_issue (ninguna parte queda esperando a un humano);
+//   paused_cursia_issue              r99: PAUSA COMO BUG DE CURSIA (bug-hold.ts): sin intentos ni gasto; se reanuda sola
+//                                    con el arreglo (reclasificación / huella resuelta / build nuevo). automatic = true.
 //
 // Invariante (r67, «sin huérfanos»): toda parte `failed` tiene next_retry_at (el sistema la va a retomar) o
 // attention_reason (un humano la tiene que ver). Puro salvo el reloj y el env (políticas vigentes).
@@ -29,6 +32,7 @@ import { classifyFailure, currentRecoveryOf, FailureSource } from './failure-cla
 import { providerProbeViewOf } from './provider-probe';
 import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
 import { REMEDIATION_EXHAUSTED_CODE, remediationBlocksAuto, remediationOf } from './remediation-ladder';
+import { CURSIA_ISSUE_STATE, bugHoldOf } from './bug-hold';
 
 export type RecoveryState =
   | 'completed'
@@ -37,14 +41,16 @@ export type RecoveryState =
   | 'waiting_external_quota'
   | 'waiting_financial_reconciliation'
   | 'blocked_permanent'
-  | 'failed_no_strategies';
+  | 'failed_no_strategies'
+  | typeof CURSIA_ISSUE_STATE;
 
 export const RECOVERY_STATES: readonly RecoveryState[] = Object.freeze([
   'completed', 'transient_failed', 'pending_retry', 'waiting_external_quota', 'waiting_financial_reconciliation', 'blocked_permanent', 'failed_no_strategies',
+  CURSIA_ISSUE_STATE,
 ] as RecoveryState[]);
 
 /** Estados en los que el SISTEMA todavía va a hacer algo solo (el run no es «definitivamente fallido»). */
-export const AUTOMATIC_RECOVERY_STATES: readonly RecoveryState[] = Object.freeze(['transient_failed', 'pending_retry', 'waiting_external_quota'] as RecoveryState[]);
+export const AUTOMATIC_RECOVERY_STATES: readonly RecoveryState[] = Object.freeze(['transient_failed', 'pending_retry', 'waiting_external_quota', CURSIA_ISSUE_STATE] as RecoveryState[]);
 // (waiting_financial_reconciliation es automático solo cuando un barrido de conciliación la va a tomar: ver `automatic`.)
 
 export interface RecoveryStateView {
@@ -100,6 +106,8 @@ function youtubeQuotaWait(os: Record<string, any>, now: Date): Date | null {
  */
 export function scheduledRetryAtOf(row: RecoveryRow, now: Date = new Date()): Date | null {
   if (row.status !== 'failed') return null;
+  // r99: en pausa como bug de Cursia no hay próxima acción programada (la reanuda el arreglo, no un reloj).
+  if (bugHoldOf(row.output_summary ?? {}, row.error ?? null)) return null;
   const r = {
     id: row.id ?? null, type: row.type ?? null, status: row.status, error: row.error ?? null, output_summary: row.output_summary ?? {},
     finished_at: row.finished_at ?? null, updated_at: row.updated_at ?? null, failure_class: row.failure_class ?? null,
@@ -138,7 +146,7 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     // r98: el próximo intento corre un escalón de la escalera (pedido corregido / aceptación con marca de calidad).
     const rem = remediationOf(os);
     if (rem && !rem.outcome && (rem.rung === 1 || rem.rung === 2)) {
-      return { state: 'pending_retry', reason: rem.rung === 1 ? 'remediation_feedback' : 'remediation_accept', nextRetryAt: iso(next), automatic: true };
+      return { state: 'pending_retry', reason: rem.rung === 1 ? 'remediation_feedback' : 'remediation_rewrite', nextRetryAt: iso(next), automatic: true };
     }
     return { state: 'transient_failed', reason: error ? error.split(':')[0].slice(0, 64) : null, nextRetryAt: iso(next), automatic: true };
   }
@@ -154,6 +162,9 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     return { state: 'pending_retry', reason: 'dependency_blocked', nextRetryAt: null, automatic: true };
   }
   if (status !== 'failed') return { state: null, reason: null, nextRetryAt: null, automatic: false };
+  // r99: pausa como bug de Cursia (vale solo para el error que la dejó): el sistema la retoma solo con el arreglo.
+  const hold = bugHoldOf(os, error);
+  if (hold) return { state: CURSIA_ISSUE_STATE, reason: hold.reason, nextRetryAt: null, automatic: true };
 
   const cur = error ? currentRecoveryOf(error, row.type ?? null, os, row.failure_class ?? null, row.run_created_at ?? null) : 'manual';
   // Una fecha persistida VENCIDA no cuenta como «programada» (ningún barrido la tomó): solo la decisión vigente.

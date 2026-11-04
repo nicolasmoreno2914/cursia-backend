@@ -702,7 +702,7 @@ async function dbChecks() {
       await assertNoOrphans(R.rid, 'sin ffmpeg');
     });
 
-    // ═══ 15 / R1-bis — escalera agotada → failed_no_strategies, attention unrecoverable, sin bucles ══════════
+    // ═══ 15 / R1-bis — escalera agotada → (r99) pausa como bug de Cursia, attention unrecoverable, sin bucles ══════════
     await check('15 R1-bis (seg-0/seg-1 guardados, falla seg-2): base → instructions → split fuera de banda → AUDIO_STRATEGIES_EXHAUSTED (D, attention unrecoverable, failed_no_strategies); seg-0/seg-1 nunca se re-sintetizan ni se re-cobran; el auto-heal no la reabre', async () => {
       ffCtl('ok');
       const R = await freshRun('r67 agotada');
@@ -715,7 +715,9 @@ async function dbChecks() {
       row = await runAudio(R);
       eq(row.status, 'failed', `failed (${row.error})`);
       assert(/^AUDIO_STRATEGIES_EXHAUSTED/.test(row.error), row.error);
-      eq([row.failure_class, row.attention_reason, row.output_summary.recovery.state], ['D', 'unrecoverable', 'failed_no_strategies'], 'visible a admin/dueño');
+      // r99: la estrategia (escalera A2) se agotó → PAUSA COMO BUG DE CURSIA (paused_cursia_issue): sin intentos ni gasto,
+      // reporte «Falla común» y reanudación automática con el arreglo (antes failed_no_strategies, esperando a un humano).
+      eq([row.failure_class, row.attention_reason, row.output_summary.recovery.state, row.output_summary.bugHold && row.output_summary.bugHold.active], ['D', 'unrecoverable', 'paused_cursia_issue', true], 'visible a admin/dueño');
       const by = callsBy(fakes.st.tts.slice(t0), st);
       eq([by.tgtBase, by.tgtInstr, by.tgtSplit], [1, 1, 2], 'cada estrategia una sola vez');
       eq([...by.other.values()], [1, 1], 'seg-0 y seg-1: una sola síntesis en los 3 intentos');
@@ -724,7 +726,7 @@ async function dbChecks() {
       eq([perChunk['0'], perChunk['1'], perChunk['2']], [1, 1, 4], 'cargos por segmento');
       const dto = await runs.getRun(R.cid, OWNER, 1, R.rid);
       const it = dto.items.find((x) => x.itemKey === R.key);
-      eq([it.recovery.state.state, it.recovery.attentionReason], ['failed_no_strategies', 'unrecoverable'], 'DTO');
+      eq([it.recovery.state.state, it.recovery.attentionReason, !!it.recovery.cursiaIssue], ['paused_cursia_issue', 'unrecoverable', true], 'DTO');
       const t1 = fakes.st.tts.length;
       for (const m of [5, 60, 600]) eq((await runs.autoHealFailedItems({ now: later(m) })).reopened.filter((x) => x.runId === R.rid).length, 0, `sin reapertura (+${m} min)`);
       eq(fakes.st.tts.length - t1, 0, 'sin llamadas');

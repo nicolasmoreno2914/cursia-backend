@@ -749,6 +749,14 @@ export function isFailureCodeClassified(code: string): boolean {
   return !!(ruleFor(ITEM_RULES, code) || ruleFor(PACKAGE_RULES, code) || ruleFor(RESTORE_RULES, code));
 }
 
+/**
+ * r99: ids de TODAS las reglas del clasificador por tabla (item / paquete / restauración). La tabla de estrategias de
+ * remediación (remediation-strategies.ts) tiene que cubrir cada una: scripts/check-r99-remediation-strategies.js lo exige.
+ */
+export function classifierRuleIds(): { item: string[]; package: string[]; restore: string[] } {
+  return { item: ITEM_RULES.map((r) => r.id), package: PACKAGE_RULES.map((r) => r.id), restore: RESTORE_RULES.map((r) => r.id) };
+}
+
 /** Todos los códigos exactos de la tabla (para el check y la documentación). */
 export function classifiedCodes(): string[] {
   return [...new Set([...ITEM_RULES, ...PACKAGE_RULES, ...RESTORE_RULES].flatMap((r) => r.codes ?? []))].sort();
@@ -1024,7 +1032,9 @@ function moneyFloor(v: FailureVerdict, error: string): FailureVerdict {
   if (v.class === 'C' || v.class === 'D' || v.strategy === 'wait_provider') return v;
   // Códigos de VALIDACIÓN que contienen la palabra (EXAM_ARTIFACT_AMBIGUOUS = dos artifacts de examen, no un pago)
   // no cuentan: el piso mira el texto, no los códigos internos ya clasificados.
-  const text = error.replace(/\bEXAM_ARTIFACT_AMBIGUOUS\b/g, '');
+  // r99: TODO código interno de validación conocido (COMPONENT_NOT_ALLOWED, …) se quita del texto: «not_allowed» dentro de
+  // un código de validación no es un control de gasto (antes un v3_payload_invalid [COMPONENT_NOT_ALLOWED] subía a C).
+  const text = error.replace(/\bEXAM_ARTIFACT_AMBIGUOUS\b/g, '').replace(/\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b/g, (m) => (isKnownValidationCode(m) ? '' : m));
   if (!AUTO_HEAL_DENY_PATTERNS.some((re) => re.test(text)) && !MONEY_FLOOR_EXTRA.some((re) => re.test(text))) return v;
   const budget = /budget|presupuesto/i.test(text);
   const config = /not_allowed|not_configured|not_ready|provider_mode_unset|mock_not_allowed|blocked_auth|youtube_preflight/i.test(text);

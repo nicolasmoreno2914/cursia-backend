@@ -63,6 +63,24 @@ export interface OwnerRetryView {
   maxCostUsd: string | null;
   retriesLeft: number;
   windowHours: number;
+  /**
+   * r99 (review P2-7): cuándo vuelve a estar disponible el reintento del dueño (ISO; solo con `owner_retry_limit`): el
+   * reintento más viejo de la ventana + 24 h. null = disponible ya / no aplica.
+   */
+  nextAvailableAt?: string | null;
+}
+
+/**
+ * r99 (review P2-7): cuándo vuelve a haber un reintento del dueño disponible: el (n − OWNER_RETRY_MAX + 1)-ésimo más viejo de
+ * la ventana + OWNER_RETRY_WINDOW_HOURS. null si todavía quedan reintentos.
+ */
+export function ownerRetryNextAvailableAt(os: Record<string, any> | null | undefined, now: Date, windowHours = OWNER_RETRY_WINDOW_HOURS): string | null {
+  const list = os && Array.isArray(os[OWNER_RETRIES_KEY]) ? os[OWNER_RETRIES_KEY] : [];
+  const from = now.getTime() - windowHours * 3600_000;
+  const ts = list.map((x: any) => (x && x.at ? new Date(String(x.at)).getTime() : NaN))
+    .filter((t: number) => Number.isFinite(t) && t > from && t <= now.getTime() + 60_000).sort((a: number, b: number) => a - b);
+  if (ts.length < OWNER_RETRY_MAX) return null;
+  return new Date(ts[ts.length - OWNER_RETRY_MAX] + windowHours * 3600_000).toISOString();
 }
 
 /**
@@ -148,6 +166,8 @@ export interface OwnerRetryInput {
   /** Lo que queda del primer tope de la política que no alcanza (null = todos caben). */
   policyBlockedBy: string | null;
   ownerRetriesUsed24h: number;
+  /** r99 (P2-7): cuándo vuelve a haber un reintento del dueño (ownerRetryNextAvailableAt); solo se informa con el límite. */
+  nextAvailableAt?: string | null;
 }
 
 /** r65 (R2): veredicto PURO del reintento del dueño. El orden de los motivos va de la seguridad del dinero al límite. */
@@ -159,7 +179,7 @@ export function ownerRetryVerdict(i: OwnerRetryInput): OwnerRetryView {
   if (i.status !== 'failed') return no('not_failed');
   // r65 fix round 1: el límite de 2 reintentos en 24 h va ANTES de la lista de códigos (vale para todo reintento del
   // dueño que reinicia el tope de la parte, también los de códigos fuera de la lista).
-  if (retriesLeft <= 0) return no('owner_retry_limit');
+  if (retriesLeft <= 0) return { ...no('owner_retry_limit'), nextAvailableAt: i.nextAvailableAt ?? null };
   const code = ownerRetryCodeEligibility(i.verdict);
   // r65 fix round 1: la ambigüedad va ANTES que el trabajo externo pagado (gamma_submit_ambiguous,
   // provider_reconciliation_required, videogen_failed… → ambiguous_paid_result, que el servidor rechaza al dueño).

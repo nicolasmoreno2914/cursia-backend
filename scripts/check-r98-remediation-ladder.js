@@ -6,7 +6,9 @@
 //
 //   C  clasificación: AUDIOBOOK_LANGUAGE_NOT_NEUTRAL es B (validación de contenido), determinista; transitorios,
 //      presupuesto, configuración y pago incierto NO son deterministas; la huella ignora el texto libre;
-//   R1 rung 1: 2.º fallo con la misma huella → feedback con los hallazgos del validador (idioma: «evita estos términos …
+//   r99 (principio 1 + 4 del dueño): la escalera empieza en el PRIMER rechazo y nunca acepta una salida inválida
+//      (rung 2 = reescritura con todos los hallazgos; agotada = pausa como bug de Cursia, ver check-r99-remediation-strategies).
+//   R1 rung 1: 1.er fallo (r99; antes 2.º) con la misma huella → feedback con los hallazgos del validador (idioma: «evita estos términos …
 //      cítalos entre comillas»; datos inventados: «no uses cifras que no estén en la fuente») que llega al prompt (brief
 //      del ejecutor / guion del audiolibro) y UN intento más aunque se hubieran agotado;
 //   R2 rung 2: 3.er fallo con huella degradable (lista corta explícita) → el próximo intento acepta con marca de calidad
@@ -125,14 +127,16 @@ function fakeQr(row) {
   });
 
   // ── R1: feedback ────────────────────────────────────────────────────────────
-  await check('R1 1.er fallo observa; 2.º con la misma huella → feedback con los hallazgos («evita estos términos … cítalos entre comillas»)', async () => {
-    const { steps } = run([LANG(1, 'laburo'), LANG(4, 'laburo')]);
-    eq(steps.map((s) => s.action), ['observe', 'feedback'], 'acciones');
+  await check('R1 (r99) 1.er fallo → feedback con los hallazgos («evita estos términos … cítalos entre comillas»); 2.º → reescritura con los hallazgos ACUMULADOS', async () => {
+    const { steps } = run([LANG(1, 'laburo'), LANG(4, 'pibe')]);
+    eq(steps.map((s) => s.action), ['feedback', 'rewrite'], 'acciones');
+    const st0 = steps[0].state;
+    eq([st0.rung, st0.count], [1, 1], 'rung/count del 1.er fallo');
+    assert(/evita estos términos: .*laburo/i.test(st0.feedback) && /cítalos entre comillas/.test(st0.feedback), st0.feedback);
+    assert(L.remediationFeedbackOf({ remediation: st0 }) === st0.feedback, 'el 2.º intento ya lleva el pedido corregido (nunca idéntico)');
     const st = steps[1].state;
-    eq([st.rung, st.count], [1, 2], 'rung/count');
-    assert(/evita estos términos: .*laburo/i.test(st.feedback) && /cítalos entre comillas/.test(st.feedback), st.feedback);
-    assert(L.remediationFeedbackOf({ remediation: st }) === st.feedback, 'feedback para el prompt');
-    assert(steps[0].state.feedback === null, 'el 1.er fallo no cambia el pedido');
+    eq([st.rung, st.count], [2, 2], 'rung/count');
+    assert(/laburo/.test(st.feedback) && /pibe/.test(st.feedback) && /DESDE CERO/.test(st.feedback), 'rung 2: todos los hallazgos + otro enfoque: ' + st.feedback);
   });
   await check('R1 datos inventados → «no uses cifras … que no estén en la fuente»; otros validadores → «corrige exactamente esos puntos»', async () => {
     const fb = L.feedbackFor('v3_payload_invalid', ['FABRICATED_DATA'], ['«el 87 % de las empresas»']);
@@ -161,33 +165,30 @@ function fakeQr(row) {
     const row = { id: 'r1', status: 'failed', type: 'audiobook_chapter', attempt_count: 3, max_attempts: 3, output_summary: { remediation: first } };
     const qr = fakeQr(row);
     const step = await IT.applyRemediationLadder(qr, row, LANG(2, 'laburo'), true, verdictOf(LANG(2, 'laburo')), at(5));
-    eq([step.action, step.grant, row.status, qr.row.max_attempts, row.output_summary.remediation.grants], ['feedback', true, 'retrying', 4, 1], 'transición');
+    eq([step.action, step.grant, row.status, qr.row.max_attempts, row.output_summary.remediation.grants], ['rewrite', true, 'retrying', 4, 2], 'transición');
   });
 
-  // ── R2: aceptación con marca de calidad ─────────────────────────────────────
-  await check('R2 3.er fallo con huella degradable → accept (acceptCodes); el guion del audiolibro se acepta con marca de calidad en vez de fallar', async () => {
+  // ── R2 (r99): sin entrega degradada ────────────────────────────────────────
+  await check('R2 (r99) ninguna huella degrada: DEGRADABLE_CODES vacío; el 3.er fallo agota (sin acceptCodes); el guion del audiolibro sigue fallando sin aceptarse', async () => {
+    eq(L.DEGRADABLE_CODES, [], 'lista vacía (principio 4: sin entrega con errores)');
     const { steps, state } = run([LANG(1, 'laburo'), LANG(2, 'laburo'), LANG(3, 'laburo')]);
-    eq(steps.map((s) => s.action), ['observe', 'feedback', 'accept'], 'acciones');
-    eq([...L.acceptCodesOf({ remediation: state })], ['AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'], 'acceptCodes');
+    eq(steps.map((s) => s.action), ['feedback', 'rewrite', 'exhausted'], 'acciones');
+    eq([...L.acceptCodesOf({ remediation: state })], [], 'acceptCodes');
+    assert(steps.every((s) => s.state.acceptCodes.length === 0), 'nunca acceptCodes');
+    // Un estado r98 persistido en rung 2 con acceptCodes (prod) ya no habilita la aceptación.
+    eq([...L.acceptCodesOf({ remediation: { ...state, rung: 2, outcome: null, acceptCodes: ['AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', 'LANGUAGE_NOT_NEUTRAL'] } })], [], 'estado r98 viejo');
     const words = (n) => Array.from({ length: n }, (_, i) => `palabra${i}`).join(' ');
     const section = { idx: 0, title: 'Bloque', text: words(120), words: 120, sha256: 'x' };
     const say = async () => ({ text: 'Hoy revisas el laburo con calma. ' + words(110), messageId: 'm1' });
     const input = { courseTitle: 'Curso', chapterNumber: 1, chapterTitle: 'Cap', contentMarkdown: words(120) };
     let err = null;
     try { await A.generateSectionScript(input, section, 1, null, say); } catch (e) { err = e; }
-    assert(err && err.code === 'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', 'sin rung 2 sigue fallando');
-    const r = await A.generateSectionScript({ ...input, remediation: { acceptLanguage: true } }, section, 1, null, say);
-    assert(r.qualityAccepted && r.qualityAccepted.code === 'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL' && r.qualityAccepted.findings.length > 0, JSON.stringify(r.qualityAccepted));
-    const q = L.withQualityWarning(undefined, L.qualityAcceptance(['AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'], r.qualityAccepted.findings, T0, state.fingerprint));
-    eq([q.degraded, q.warnings.length, q.warnings[0].code, q.warnings[0].rung], [true, 1, 'quality_accepted', 2], 'output_summary.quality');
+    assert(err && err.code === 'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', 'sigue fallando');
   });
-  await check('R2 lista EXPLÍCITA y corta; lo estructural / veracidad nunca degrada (JSON_INVALID, MISSING_FIELD, FABRICATED_DATA, EXAM_BANK_*, PACKAGE_*)', async () => {
-    eq(L.DEGRADABLE_CODES, ['LANGUAGE_NOT_NEUTRAL', 'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'], 'lista');
-    for (const c of ['JSON_INVALID', 'MISSING_FIELD', 'FABRICATED_DATA', 'EXAM_BANK_LEAF_CAPACITY', 'PACKAGE_BUILDER_ERROR', 'GIFT_UNPARSEABLE_BLOCK']) {
+  await check('R2 lo estructural / veracidad nunca degrada (JSON_INVALID, MISSING_FIELD, FABRICATED_DATA, EXAM_BANK_*, PACKAGE_*) — y con r99 tampoco el idioma', async () => {
+    for (const c of ['JSON_INVALID', 'MISSING_FIELD', 'FABRICATED_DATA', 'EXAM_BANK_LEAF_CAPACITY', 'PACKAGE_BUILDER_ERROR', 'GIFT_UNPARSEABLE_BLOCK', 'LANGUAGE_NOT_NEUTRAL']) {
       assert(!L.isDegradableFingerprint('v3_payload_invalid', [c]), c);
     }
-    assert(!L.isDegradableFingerprint('v3_payload_invalid', ['LANGUAGE_NOT_NEUTRAL', 'JSON_INVALID']), 'mezcla con estructural → no');
-    assert(L.isDegradableFingerprint('v3_payload_invalid', ['LANGUAGE_NOT_NEUTRAL']), 'solo idioma → sí');
   });
   await check('R2 el servidor y el ejecutor aceptan SOLO el idioma: prevalidateV3 revalida la estructura (languageCourse) y el ejecutor vuelve blandos voseo/vosotros/regionalismos', async () => {
     const sch = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/scheduler.service.ts'), 'utf8');
@@ -206,12 +207,12 @@ function fakeQr(row) {
   });
 
   // ── R3: agotada ─────────────────────────────────────────────────────────────
-  await check('R3 no degradable al 3.er fallo (o degradable al 4.º) → exhausted, sin intentos extra', async () => {
+  await check('R3 3.er fallo con la misma huella → exhausted, sin intentos extra', async () => {
     const e = 'v3_payload_invalid [JSON_INVALID]: experience:c1 el artifact no es JSON';
     const { steps } = run([e, e, e], 'experience');
-    eq(steps.map((s) => s.action), ['observe', 'feedback', 'exhausted'], 'no degradable');
+    eq(steps.map((s) => s.action), ['feedback', 'rewrite', 'exhausted'], 'estructural');
     const { steps: s4 } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c'), LANG(4, 'd')]);
-    eq(s4.map((s) => s.action), ['observe', 'feedback', 'accept', 'exhausted'], 'degradable que persiste');
+    eq(s4.map((s) => s.action), ['feedback', 'rewrite', 'exhausted', 'exhausted'], 'idioma que persiste (r99: sin aceptación)');
     const st = s4[3].state;
     assert(st.exhaustedError === LANG(4, 'd') && st.tried.some((t) => t.rung === 2 && t.outcome === 'failed_same_fingerprint') && st.tried.some((t) => t.rung === 3), JSON.stringify(st.tried));
     // Sin intentos extra: una parte `failed` queda `failed`; una `retrying` termina sus intentos propios (default 3).
@@ -244,7 +245,8 @@ function fakeQr(row) {
     assert(vf.remediationExhausted === true && OR.ownerRetryCodeEligibility(vf) === 'ok', 'elegible para el dueño');
     eq(OR.ownerRetryCodeEligibility({ ...vf, paidRisk: 'uncertain' }), 'ambiguous_paid_result', 'dinero primero');
     const view = RV.recoveryViewOf({ ...r, id: 'i1', failure_class: null }, at(5));
-    assert(view.remediation && view.remediation.next === 'owner_retry' && /falla repetida con la misma causa; reintentar igual no lo arregla/.test(view.remediation.reasonText), JSON.stringify(view.remediation));
+    // r99: el motivo ya no le pasa la carga al usuario (pausa como bug de Cursia; el reintento del dueño sigue siendo opcional).
+    assert(view.remediation && view.remediation.next === 'cursia_issue' && /lo estamos resolviendo\. No tienes que hacer nada; tu curso continuará automáticamente/.test(view.remediation.reasonText), JSON.stringify(view.remediation));
   });
 
   // ── Review r98: P0-1 / P1-1 / P1-2 / P1-3 / P2-* ───────────────────────────
@@ -261,7 +263,7 @@ function fakeQr(row) {
       const st = await IT.applyRemediationLadder(fakeQr(row), row, e, true, v, at(i));
       acts.push(st.action); os = row.output_summary;
     }
-    eq(acts, ['observe', 'feedback', 'feedback'], 'sin agotar mientras queden rondas B');
+    eq(acts, ['feedback', 'rewrite', 'rewrite'], 'sin agotar mientras queden rondas B');
     assert(L.remediationFeedbackOf(os), 'el feedback viaja en la regeneración');
     const failed = { id: 's1', status: 'failed', type: 'scorm', error: e, output_summary: os, finished_at: at(-600), updated_at: at(-600), failure_class: 'B', run_created_at: at(-700) };
     const d = AH.autoHealDecision(failed, at(10), policy);
@@ -296,7 +298,7 @@ function fakeQr(row) {
         const r = { id: 's2', status: 'failed', type: 'scorm', attempt_count: 3, max_attempts: 3, output_summary: os };
         acts.push((await IT.applyRemediationLadder(fakeQr(r), r, e, true, v, at(i))).action); os = r.output_summary;
       }
-      eq(acts, ['observe', 'feedback', 'exhausted'], 'agotada sin barrido');
+      eq(acts, ['feedback', 'rewrite', 'exhausted'], 'agotada sin barrido');
     } finally { delete process.env.DYNAMIC_AUTO_HEAL_ENABLED; }
     // Sin clasificar (mensaje libre) o con la deny-list: el barrido no la toma → «sin rondas».
     assert(AH.autoRegenSpentFor({ ...row, error: 'provider_reconciliation_required: anthropic …', failure_class: 'B' }, at(0), AH.DEFAULT_AUTO_HEAL_POLICY, ENV_ON), 'deny-list');
@@ -375,9 +377,9 @@ function fakeQr(row) {
     assert(L.remediationFeedbackOf({ remediation: reset }), 'el intento del dueño ya lleva el pedido corregido');
     const s2 = L.ladderStep(reset, verdictOf(LANG(5, 'a')), 'audiobook_chapter', LANG(5, 'a'), at(11), { retryable: true });
     const s3 = L.ladderStep(s2.state, verdictOf(LANG(6, 'a')), 'audiobook_chapter', LANG(6, 'a'), at(12), { retryable: true });
-    eq([s2.action, s2.grant, s3.action], ['feedback', true, 'accept'], 'vuelve a rung 1 (intento) y rung 2');
+    eq([s2.action, s2.grant, s3.action], ['rewrite', true, 'exhausted'], 'r99: vuelve a rung 2 (con intento, el pedido ya corregido) y después agotada');
     const rs = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/runs.service.ts'), 'utf8');
-    assert(/const remediationReset = !auto \? resetRemediationForManualRetry\(remediationOf\(target\.output_summary\)/.test(rs) && /\.\.\.\(remediationReset \? \{ remediation: remediationReset \} : \{\}\)/.test(rs), 'retryItem (manual) lo aplica en la misma escritura');
+    assert(/const remediationReset = !auto \|\| auto\.bugResume \? resetRemediationForManualRetry\(remediationOf\(target\.output_summary\)/.test(rs) && /\.\.\.\(remediationReset \? \{ remediation: remediationReset \} : \{\}\)/.test(rs), 'retryItem (manual) lo aplica en la misma escritura');
   });
   await check('P2-1 tope TOTAL de intentos de la escalera por parte (todas las huellas, reintentos humanos incluidos): nunca se reinicia', async () => {
     eq(L.MAX_LADDER_GRANTS_PER_ITEM, 3, 'tope por parte');
@@ -388,11 +390,11 @@ function fakeQr(row) {
     const seq = [[LANG(1, 'a'), 'audiobook_chapter'], [LANG(2, 'a'), 'audiobook_chapter'], [LANG(3, 'a'), 'audiobook_chapter'],
       ['AUDIOBOOK_SECTION_TOO_SHORT: bloque 1 corto', 'audiobook_chapter'], ['AUDIOBOOK_SECTION_TOO_SHORT: bloque 2 corto', 'audiobook_chapter'], ['AUDIOBOOK_SECTION_TOO_SHORT: bloque 3 corto', 'audiobook_chapter']];
     for (const [e, t] of seq) { const s = L.ladderStep(p, verdictOf(e, t), t, e, T0, { retryable: true }); grants.push(s.grant); p = s.state; }
-    eq(grants, [false, true, true, false, true, false], 'tercer intento y no más');
+    eq(grants, [true, true, false, true, false, false], 'tercer intento y no más');
     eq(p.grantsTotal, 3, 'total');
     p = L.resetRemediationForManualRetry(p, at(20));
     const s = L.ladderStep(p, verdictOf('AUDIOBOOK_SECTION_TOO_SHORT: bloque 4 corto'), 'audiobook_chapter', 'AUDIOBOOK_SECTION_TOO_SHORT: bloque 4 corto', at(21), { retryable: true });
-    eq([s.action, s.grant, s.state.grantsTotal], ['feedback', false, 3], 'tras el reintento humano: feedback sin intento extra');
+    eq([s.action, s.grant, s.state.grantsTotal], ['rewrite', false, 3], 'tras el reintento humano: reescritura sin intento extra');
     void OTHER;
   });
   // ── S: señal agregada «Falla común» ─────────────────────────────────────────
@@ -479,7 +481,7 @@ function fakeQr(row) {
   await check('K ≤ MAX_LADDER_GRANTS intentos extra por huella; nunca con pago incierto ni si el emisor dice «no reintentable»', async () => {
     eq(L.MAX_LADDER_GRANTS, 2, 'tope');
     const { steps } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c'), LANG(4, 'd'), LANG(5, 'e')]);
-    eq(steps.map((s) => s.grant), [false, true, true, false, false], 'grants');
+    eq(steps.map((s) => s.grant), [true, true, false, false, false], 'grants');
     assert(steps.every((s) => s.state.grants <= L.MAX_LADDER_GRANTS), 'acotado');
     const { steps: nr } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c')], 'audiobook_chapter', { retryable: false });
     assert(nr.every((s) => !s.grant), 'no reintentable → sin intentos extra');
@@ -496,10 +498,10 @@ function fakeQr(row) {
       const s = L.ladderStep(prev, verdictOf(e, t), t, e, T0, { retryable: true });
       if (s) { prev = s.state; steps.push(s.action); }
     }
-    eq(steps, ['observe', 'feedback'], 'lease_expired no cuenta');
+    eq(steps, ['feedback', 'rewrite'], 'lease_expired no cuenta');
     const other = 'AUDIOBOOK_SECTION_TOO_SHORT: el guion del bloque 2 quedó con 40 palabras';
     const s = L.ladderStep(prev, verdictOf(other), 'audiobook_chapter', other, at(3), { retryable: true });
-    eq([s.action, s.state.count, s.state.previous.length, s.state.previous[0].rung], ['observe', 1, 1, 1], 'huella nueva');
+    eq([s.action, s.state.count, s.state.previous.length, s.state.previous[0].rung], ['feedback', 1, 1, 2], 'huella nueva');
   });
 
   // ── P: marca de calidad en el informe del paquete ───────────────────────────

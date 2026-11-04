@@ -202,12 +202,12 @@ import {
   stopAfterView,
 } from './stop-after';
 import { AttemptActor, adminActor, recordItemReopened, recordItemsAbandoned, relSchemaReady } from '../reliability/attempt-log';
-import { FailureProvider } from '../reliability/failure-classifier';
+import { FailureProvider, FailureSource, classifyFailure } from '../reliability/failure-classifier';
 // r65: reintento seguro del dueño + ronda automática extra de una parte que agotó su tope (owner-retry.ts).
 import {
   AUTO_BUDGET_EXTENSION_KEY, AUTO_BUDGET_EXTENSION_STRATEGY, BudgetScope, OWNER_RETRIES_KEY, OWNER_RETRY_ENFORCED_REASONS, OWNER_RETRY_MAX,
   OWNER_RETRY_WINDOW_HOURS, OwnerRetryView,
-  autoBudgetExtensionOf, budgetScopeOf, isItemBudgetExhausted, itemFailureVerdict, nextOwnerRetries, ownerRetriesUsed, ownerRetryVerdict,
+  autoBudgetExtensionOf, budgetScopeOf, isItemBudgetExhausted, itemFailureVerdict, nextOwnerRetries, ownerRetriesUsed, ownerRetryVerdict, ownerRetryNextAvailableAt,
 } from './owner-retry';
 import { unknownReservations } from '../../workers/llm-executor/server-llm';
 /** Review F5: la reapertura automática no lleva holgura de ambigüedad (el intento reabierto tampoco la tiene). */
@@ -233,6 +233,19 @@ import {
 import { ItemCostView, ItemRecoveryView, loadItemCosts, recoveryViewOf } from './item-recovery-view';
 import { RunRecoveryView, recoveryStateOf, runRecoveryStateOf } from '../reliability/recovery-state';
 import { remediationOf, resetRemediationForManualRetry } from '../reliability/remediation-ladder';
+// r99: pausa como bug de Cursia + reanudación automática con el arreglo.
+import {
+  BUG_HOLD_KEY, BugHoldResumeTrigger, bugHoldResumeDecision, CURSIA_ISSUE_MESSAGE, bugHoldSince, bugHoldStateOf, currentBuildId, nextBugHold, resumedBugHold,
+  BugHoldReason, BUG_HOLD_RESOLVE_ACTION, BUG_HOLD_RESOLVE_TARGET_TYPE, BUG_HOLD_RESUME_COOLDOWN_SECONDS, BUG_HOLD_SWEEP_GRACE_SECONDS,
+} from '../reliability/bug-hold';
+import { remediationStrategyFor } from '../reliability/remediation-strategies';
+
+/** r99: estrategia registrada en el log de intentos al reanudar una pausa por bug de Cursia. */
+export const CURSIA_ISSUE_RESUME_STRATEGY = 'cursia_issue_resume';
+
+function sourceOfItemType(type: string | null | undefined): FailureSource {
+  return type === 'video' ? 'video_worker' : type === 'presentation' || type === 'audio_welcome' || type === 'audiobook_chapter' ? 'provider_worker' : 'browser_executor';
+}
 import { nextRecoveryEntry } from './item-transitions';
 import { usd2 } from '../finops/usd-display';
 
@@ -2732,6 +2745,11 @@ export class RunsService {
        * ya hecha por el barrido y sus reservas desconocidas ya liquidadas como posible duplicado.
        */
       llmPendingReview?: { health: LlmHealthProbeResult; budget: { fits: boolean; reason: string | null; worstItem?: number; worstRun?: number; allowance?: number } | null };
+      /**
+       * r99: reanudación AUTOMÁTICA de una parte en pausa como bug de Cursia (bug-hold.ts) — el arreglo está desplegado
+       * (reclasificada / huella resuelta / build nuevo). Re-evaluada bajo lock con bugHoldResumeDecision; nunca reenvía.
+       */
+      bugResume?: { trigger: BugHoldResumeTrigger; resolvedAt?: string | null; buildId: string };
     },
     /** EV6 DoD (R5): quién reintenta (la recuperación PAGA de un video es solo de SUPER_ADMIN). */
     actor?: { id?: string | null; email?: string | null },
@@ -2764,6 +2782,10 @@ export class RunsService {
     // r83: la reapertura de una parte de IA en revisión nunca reenvía a un proveedor pagado ni se combina con otro modo.
     if (auto?.llmPendingReview && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.spendControlResume || auto.providerReconcile || auto.dependencyResolved || auto.budgetExtension)) {
       throw new BadRequestException('auto-heal: la reapertura de una parte de IA en revisión nunca reenvía ni se combina con otro modo automático');
+    }
+    if (auto?.bugResume && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.providerReconcile || auto.spendControlResume
+      || auto.dependencyResolved || auto.budgetExtension || auto.llmPendingReview)) {
+      throw new BadRequestException('auto-heal: la reanudación de una pausa por bug de Cursia nunca reenvía ni se combina con otro modo automático');
     }
     if (auto?.spendControlResume && (resubmitProvider || resubmitVideo || auto.safe || auto.ambiguousAudio || auto.providerProbe || auto.providerReconcile)) {
       throw new BadRequestException('auto-heal: la reanudación tras un control de gasto nunca reenvía ni se combina con otro modo automático');
@@ -2969,17 +2991,19 @@ export class RunsService {
         const conflict = (v: OwnerRetryView) => new ConflictException({
           code: v.reason, ownerRetry: v,
           message: `${v.reason}: el reintento de "${itemKey}" no se hizo (no se cambió nada).` +
-            (v.reason === 'owner_retry_limit' ? ' Ya usaste los reintentos de esta parte en las últimas 24 h; el equipo de Cursia la revisará.'
+            // r99 (review P2-7): el motivo dice lo que pasa de verdad (cuándo vuelve el reintento; Cursia sigue sola).
+            (v.reason === 'owner_retry_limit' ? ` Ya usaste los reintentos de esta parte en las últimas 24 h${v.nextAvailableAt ? ` (vuelven a estar disponibles el ${v.nextAvailableAt})` : ''}. No tienes que hacer nada: Cursia sigue recuperándola sola.`
               : v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached' ? ' El saldo autorizado no cubre el costo máximo de esta parte: hace falta ampliar la autorización.'
                 : v.reason === 'open_reservations' ? ' Hay un cobro de esta parte pendiente de confirmar; Cursia lo concilia antes de reintentar.'
                   // r98: si un barrido automático (conciliación con el proveedor / reenvío único acotado) la va a tomar, se dice.
                   : autoResolving ? ' Hay un resultado pagado sin confirmar: Cursia lo está conciliando automáticamente con el proveedor y la parte se retoma sola.'
-                  : ' Hay un cobro sin conciliar o un resultado ambiguo: el equipo de Cursia lo revisa.') +
+                  : ' Hay un cobro sin conciliar o un resultado ambiguo: Cursia lo está resolviendo para no cobrarte dos veces; no tienes que hacer nada.') +
             (adminPlain ? ` ${adminPlainRetryHint(v.reason)}` : ''),
         });
         const used = ownerRetriesUsed(fullRow?.output_summary, now);
         if (!adminPlain && used >= OWNER_RETRY_MAX) {
-          throw conflict({ allowed: false, reason: 'owner_retry_limit', maxCostUsd: null, retriesLeft: 0, windowHours: OWNER_RETRY_WINDOW_HOURS });
+          throw conflict({ allowed: false, reason: 'owner_retry_limit', maxCostUsd: null, retriesLeft: 0, windowHours: OWNER_RETRY_WINDOW_HOURS,
+            nextAvailableAt: ownerRetryNextAvailableAt(fullRow?.output_summary, now) });
         }
         if (target.status === 'failed' && fullRow) {
           const v = await this.ownerRetryOf(qr, { id: String(job.id), course_id: courseId, owner_id: ownerId, worker_status: locked.worker_status }, fullRow, now, { lockMonth: true, ignoreLimit: adminPlain });
@@ -3055,6 +3079,16 @@ export class RunsService {
           throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (claim_payload: ${d.action})`, code: 'auto_heal_not_eligible', reason: d.action });
         }
         autoMeta = { round: 0, code: d.code, strategy: CLAIM_PAYLOAD_RESUME_STRATEGY };
+      } else if (auto && auto.bugResume) {
+        // r99: misma decisión que el barrido con la fila bloqueada (sigue en pausa con el MISMO error y el disparador vale).
+        const d = bugHoldResumeDecision(target, {
+          now: auto.now ?? new Date(), buildId: auto.bugResume.buildId, resolvedAt: auto.bugResume.resolvedAt ?? null, itemType: target.type ?? null,
+          verdict: classifyFailure({ error: String(target.error ?? ''), itemType: target.type, outputSummary: target.output_summary ?? {}, source: sourceOfItemType(target.type) }),
+        });
+        if (d.resume === false || d.trigger !== auto.bugResume.trigger) {
+          throw new ConflictException({ message: `auto_heal_not_eligible: "${itemKey}" (cursia_issue: ${d.resume === false ? d.reason : 'trigger_changed'})`, code: 'auto_heal_not_eligible' });
+        }
+        autoMeta = { round: (bugHoldStateOf(target.output_summary)?.count ?? 1), code: String(bugHoldStateOf(target.output_summary)?.code ?? 'cursia_issue'), strategy: d.strategy };
       } else if (auto && auto.spendControlResume) {
         // r62 (K3): re-evaluado bajo lock — sigue frenado por un control de gasto y ese control YA no lo frena (env vigente).
         const hold = spendControlHoldOf(target.error, target.type);
@@ -3253,6 +3287,8 @@ export class RunsService {
       const entryExtra = autoMeta && auto?.providerReconcile
         ? { auto: true, providerReconcile: true, providerReconcileKind: auto.providerReconcile.kind, providerReconcileAction: auto.providerReconcile.action,
             providerReconcileRound: autoMeta.round, possibleDuplicate: auto.providerReconcile.ambiguous, autoHealCode: autoMeta.code }
+        : autoMeta && auto?.bugResume
+        ? { auto: true, cursiaIssueResume: auto.bugResume.trigger, autoHealCode: autoMeta.code, autoHealStrategy: autoMeta.strategy, actor: 'system' }
         : autoMeta && auto?.dependencyResolved
         ? { auto: true, dependencyResolved: true, autoHealCode: autoMeta.code, actor: 'system' }
         : autoMeta && auto?.spendControlResume
@@ -3316,7 +3352,10 @@ export class RunsService {
       // #583: el reenvío de audio incierto también concede UN intento (un único reenvío).
       // REL CREDIT: el canario concede UN intento (una sola llamada de prueba; fuera de las rondas del auto-healer).
       // r65 (R4): la ronda extra por tope de la parte también concede UN intento (una sola vez; si vuelve a agotar, humano).
+      // r99: la reanudación por build nuevo concede UN intento (el arreglo puede no ser éste); por reclasificación /
+      // huella resuelta, los de una ronda.
       const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerReconcile || auto?.providerProbe?.mode === 'canary' || auto?.budgetExtension || auto?.llmPendingReview
+        || auto?.bugResume?.trigger === 'new_build'
         ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       // Loop de costos (review C1): una reapertura MANUAL (dueño / admin) le da a la parte un presupuesto de recuperación
@@ -3342,7 +3381,12 @@ export class RunsService {
       }
       // r98 (review P1-3): un reintento HUMANO abre un ciclo nuevo de la escalera de remediación (count=1; feedback,
       // `previous` y el tope total de intentos de la parte se conservan). Las reaperturas automáticas no la tocan.
-      const remediationReset = !auto ? resetRemediationForManualRetry(remediationOf(target.output_summary), auto?.now ?? new Date()) : null;
+      // r99: la reanudación de una pausa por bug también abre un ciclo nuevo de la escalera (el arreglo cambió el pedido).
+      const remediationReset = !auto || auto.bugResume ? resetRemediationForManualRetry(remediationOf(target.output_summary), auto?.now ?? new Date()) : null;
+      // r99: toda reapertura (automática o humana) deja de estar en pausa como bug; el historial se conserva para el reporte.
+      const heldState = bugHoldStateOf(target.output_summary);
+      const bugHoldAfter = heldState && heldState.active
+        ? resumedBugHold(heldState, auto?.now ?? new Date(), auto ? 'system' : String(actorId), auto?.bugResume?.trigger ?? null) : null;
       // r67 (A3): estado explícito de la reapertura (pending_retry) + historial acotado, en la MISMA escritura.
       const r67Reason = auto ? (auto.policy.classAware && autoMeta?.strategy ? `auto_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}` : 'auto') : 'manual_retry';
       const r67Recovery = nextRecoveryEntry(target.output_summary?.recovery, { state: 'pending_retry', reason: r67Reason.slice(0, 64), nextRetryAt: null, automatic: true },
@@ -3365,7 +3409,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery, ...(r67LadderReset ?? {}), ...(remediationReset ? { remediation: remediationReset } : {}) }), lostResultResend, JSON.stringify(lostResultUnits)],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery, ...(r67LadderReset ?? {}), ...(remediationReset ? { remediation: remediationReset } : {}), ...(bugHoldAfter ? { [BUG_HOLD_KEY]: bugHoldAfter } : {}) }), lostResultResend, JSON.stringify(lostResultUnits)],
         ),
       );
       if (updated.length !== 1) {
@@ -3375,10 +3419,11 @@ export class RunsService {
       await recordItemReopened(qr, target.id, {
         // r62 (regla 5): todo REENVÍO automático a un proveedor queda con actor `system` y su motivo (strategy); la
         // conciliación de proveedor (N2) también la decide el sistema.
-        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved || auto?.budgetExtension || auto?.llmPendingReview ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
+        actor: auto?.providerReconcile || auto?.ambiguousAudio || auto?.spendControlResume || auto?.dependencyResolved || auto?.budgetExtension || auto?.llmPendingReview || auto?.bugResume ? 'system' : auto ? 'auto_heal' : isSuperAdminEmail(actor?.email) ? adminActor(actor?.email) : actorId !== ownerId ? adminActor(actorId) : 'owner',
         // REL MVP: con la política por clase la estrategia aplicada queda en el log (A reintento / B regenerar).
         strategy: auto?.providerReconcile ? `${PROVIDER_RECONCILE_CODE}_${auto.providerReconcile.action}:${auto.providerReconcile.kind}`
           : auto?.dependencyResolved ? CLAIM_PAYLOAD_RESUME_STRATEGY
+          : auto?.bugResume ? `${CURSIA_ISSUE_RESUME_STRATEGY}:${auto.bugResume.trigger}`
           : auto?.budgetExtension ? AUTO_BUDGET_EXTENSION_STRATEGY
           : auto?.llmPendingReview ? LLM_REVIEW_REOPEN_STRATEGY
           : auto?.spendControlResume ? `${SPEND_CONTROL_RESUME_STRATEGY}:${autoMeta?.code ?? ''}`.slice(0, 64)
@@ -3564,6 +3609,142 @@ export class RunsService {
         `omitidos ${result.skipped.length}${result.skipped.length ? ` ${JSON.stringify(byReason)}` : ''}`,
     );
     return result;
+  }
+
+  /**
+   * r99 — barrido de PAUSAS COMO BUG DE CURSIA (bug-hold.ts). Lo corre el tick del auto-healer (solo la API; el primero
+   * después de arrancar = después de cada deploy). Dos pasadas, acotadas, sobre la ejecución VIGENTE de cada curso
+   * (no cancelados ni completos; la pasada A solo en runs desde R99_BUG_HOLD_SINCE):
+   *  A) PAUSA: parte `failed` cuya estrategia se agotó (ningún barrido la va a tomar: estado de recuperación no automático)
+   *     y que no es una decisión del dueño (pausa, presupuesto del run, acceso) → output_summary.bugHold (sin gasto, sin
+   *     intentos). Escritura condicional (mismo error, sigue failed, sin pausa vigente).
+   *  B) REANUDACIÓN: parte en pausa cuyo disparador vale (reclasificada con el código vigente / huella resuelta en
+   *     «Falla común» / build nuevo) → retryItem(auto.bugResume): mismos locks y guards de FinOps que cualquier reapertura.
+   *     Un rechazo (presupuesto, run pausado por el usuario, otro run activo…) deja un enfriamiento de 30 min.
+   */
+  async sweepCursiaIssues(
+    opts: { now?: Date; limit?: number; buildId?: string; policy?: AutoHealPolicy } = {},
+  ): Promise<{ held: Array<{ runId: string; itemKey: string; reason: string }>; resumed: Array<{ runId: string; itemKey: string; trigger: string }>; skipped: Array<{ runId: string; itemKey: string; reason: string }> }> {
+    const now = opts.now ?? new Date();
+    const policy = opts.policy ?? autoHealPolicyFromEnv();
+    const buildId = opts.buildId ?? currentBuildId();
+    const limit = Math.max(1, Math.floor(opts.limit ?? 100));
+    const out = { held: [] as Array<{ runId: string; itemKey: string; reason: string }>, resumed: [] as Array<{ runId: string; itemKey: string; trigger: string }>,
+      skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
+    const since = bugHoldSince(process.env).toISOString();
+    // Predicado común: ejecución dinámica VIGENTE del curso (ningún run ni Manifest más nuevo), no terminal.
+    const currentRunSql = `pj.execution_mode = 'dynamic_generation'
+            and pj.created_at >= $1::timestamptz
+            and coalesce(pj.status, '') not in ('cancelled', 'cancelling')
+            and coalesce(pj.worker_status, '') not in ('cancelled', 'cancelling', 'completed', 'preview')
+            and g.status = 'failed'
+            and ${latestGenerationPredicate('g')}
+            and not exists (
+              select 1 from public.production_jobs pj2
+               where pj2.execution_mode = 'dynamic_generation' and pj2.course_id::text = pj.course_id::text and pj2.id <> pj.id
+                 and (pj2.created_at > pj.created_at or (pj2.created_at = pj.created_at and pj2.id > pj.id)))
+            and not exists (select 1 from public.course_generation_manifests m2 where m2.course_id = m.course_id and m2.id > m.id)`;
+    // coalesce(…, false): sin bugHold las comparaciones dan NULL y `not NULL` descartaría la fila (lógica de tres valores).
+    const heldSql = `coalesce(jsonb_typeof(g.output_summary->'${BUG_HOLD_KEY}') = 'object'
+                and (g.output_summary->'${BUG_HOLD_KEY}'->>'active') = 'true'
+                and (g.output_summary->'${BUG_HOLD_KEY}'->>'error') = left(coalesce(g.error, ''), 500), false)`;
+    const cols = `g.id, g.job_id, g.item_key, g.type, g.status, g.error, g.output_summary, g.finished_at, g.updated_at, g.next_retry_at,
+              to_jsonb(g)->>'failure_class' as failure_class, to_jsonb(g)->>'attention_reason' as attention_reason,
+              (to_jsonb(g)->>'recovery_round')::int as recovery_round,
+              pj.course_id, pj.owner_id, pj.created_at as run_created_at, pj.output_summary as run_output_summary, b.blueprint_number`;
+    const from = `from public.generation_item_runs g
+           join public.production_jobs pj on pj.id = g.job_id
+           join public.course_generation_manifests m on m.id = g.manifest_id
+           join public.course_blueprints b on b.id = m.blueprint_id`;
+
+    // ── A) pausa de las estrategias agotadas ──
+    const toHold: any[] = await this.dataSource.query(
+      `select ${cols} ${from}
+        where ${currentRunSql}
+          and not ${heldSql}
+          and g.finished_at <= $2::timestamptz - make_interval(secs => $3::int)
+        order by g.finished_at desc nulls last, g.id
+        limit $4`,
+      [since, now.toISOString(), BUG_HOLD_SWEEP_GRACE_SECONDS, limit],
+    );
+    for (const r of toHold) {
+      const view = recoveryStateOf(r, now);
+      if (view.automatic) continue;
+      const verdict = classifyFailure({ error: String(r.error ?? ''), itemType: r.type, outputSummary: r.output_summary ?? {}, source: sourceOfItemType(r.type) });
+      const strategy = remediationStrategyFor(verdict).strategy;
+      const scope = budgetScopeOf(r, r.run_output_summary?.pause?.reason ?? null);
+      // Decisiones del dueño (pausa, presupuesto del RUN, acceso de la cuenta): no son un bug de Cursia.
+      if (strategy === 'owner_decision' || scope === 'run') { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: 'owner_decision' }); continue; }
+      const reason: BugHoldReason = scope === 'item' ? 'item_budget_exhausted'
+        : verdict.paidRisk === 'uncertain' || verdict.humanReason === 'duplicate_charge' || view.state === 'waiting_financial_reconciliation' ? 'reconcile_pending'
+          : verdict.unclassified ? 'unmapped_code'
+            : view.state === 'blocked_permanent' && (r.attention_reason === 'config' || verdict.humanReason === 'config') ? 'config'
+              : view.state === 'blocked_permanent' && (r.attention_reason === 'product_bug' || verdict.humanReason === 'product_bug') ? 'product_bug'
+                : 'strategy_exhausted';
+      const state = nextBugHold(bugHoldStateOf(r.output_summary), verdict, r.type, String(r.error ?? ''), reason, now, buildId);
+      const ok = returningRows(await this.dataSource.query(
+        `update public.generation_item_runs
+            set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${BUG_HOLD_KEY}', $2::jsonb),
+                next_retry_at = null
+          where id = $1 and status = 'failed' and error is not distinct from $3::text
+          returning id`,
+        [r.id, JSON.stringify(state), r.error],
+      ));
+      if (ok.length !== 1) continue;
+      out.held.push({ runId: r.job_id, itemKey: r.item_key, reason });
+      this.logger.error(`cursia-issue: ${r.item_key} (run ${r.job_id}) en pausa como bug de Cursia (${reason}, ${verdict.code}); huella ${state.fingerprint} → «Falla común»`);
+    }
+
+    // ── B) reanudación con el arreglo desplegado ──
+    const held: any[] = await this.dataSource.query(
+      `select ${cols} ${from}
+        where ${currentRunSql}
+          and ${heldSql}
+          and not (case when jsonb_typeof(g.output_summary->'${BUG_HOLD_KEY}'->'skipUntilMs') = 'number'
+                        then (g.output_summary->'${BUG_HOLD_KEY}'->>'skipUntilMs')::numeric > $2::numeric else false end)
+        order by g.finished_at desc nulls last, g.id
+        limit $3`,
+      // Las pausas solo existen desde r99: la reanudación no se corta por la fecha del run (una pausa inmediata de un run
+      // anterior al corte también se reanuda sola).
+      ['1970-01-01T00:00:00Z', now.getTime(), limit],
+    );
+    if (!held.length) return out;
+    const resolutions = new Map<string, string>();
+    try {
+      const rows: any[] = await this.dataSource.query(
+        `select target_id, max(at) as at from public.admin_audit_log where action = $1 and target_type = $2 group by target_id`,
+        [BUG_HOLD_RESOLVE_ACTION, BUG_HOLD_RESOLVE_TARGET_TYPE],
+      );
+      for (const x of rows) if (x?.target_id) resolutions.set(String(x.target_id), new Date(x.at).toISOString());
+    } catch {
+      // admin_audit_log ausente (entorno sin r75): sin marcas manuales; reclasificación y build nuevo siguen funcionando.
+    }
+    for (const r of held) {
+      const hold = bugHoldStateOf(r.output_summary);
+      if (!hold) continue;
+      const verdict = classifyFailure({ error: String(r.error ?? ''), itemType: r.type, outputSummary: r.output_summary ?? {}, source: sourceOfItemType(r.type) });
+      const resolvedAt = resolutions.get(hold.fingerprint) ?? null;
+      const d = bugHoldResumeDecision(r, { now, buildId, resolvedAt, verdict, itemType: r.type ?? null });
+      if (d.resume === false) { out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: d.reason }); continue; }
+      try {
+        await this.retryItem(Number(r.course_id), String(r.owner_id), Number(r.blueprint_number), String(r.job_id), String(r.item_key), false, false,
+          { policy, now, bugResume: { trigger: d.trigger, resolvedAt, buildId } });
+        out.resumed.push({ runId: r.job_id, itemKey: r.item_key, trigger: d.trigger });
+        this.logger.warn(`cursia-issue: ${r.item_key} (run ${r.job_id}) reanudada (${d.trigger} → ${d.strategy}); huella ${hold.fingerprint}`);
+      } catch (err) {
+        const resp = (err as { getResponse?: () => unknown })?.getResponse?.();
+        const code = String((resp && typeof resp === 'object' && (resp as any).code) || (err instanceof Error ? err.name : 'error')).slice(0, 100);
+        out.skipped.push({ runId: r.job_id, itemKey: r.item_key, reason: code });
+        await this.dataSource.query(
+          `update public.generation_item_runs
+              set output_summary = jsonb_set(output_summary, '{${BUG_HOLD_KEY}}',
+                    (output_summary->'${BUG_HOLD_KEY}') || jsonb_build_object('skipUntilMs', $2::bigint, 'lastSkipReason', $3::text), true)
+            where id = $1 and status = 'failed' and jsonb_typeof(output_summary->'${BUG_HOLD_KEY}') = 'object'`,
+          [r.id, now.getTime() + BUG_HOLD_RESUME_COOLDOWN_SECONDS * 1000, code],
+        ).catch((e) => this.logger.warn(`cursia-issue: no se pudo registrar el enfriamiento de ${r.item_key}: ${e instanceof Error ? e.message : String(e)}`));
+      }
+    }
+    return out;
   }
 
   /**
@@ -4385,7 +4566,8 @@ export class RunsService {
     const verdict = itemFailureVerdict(r);
     const used = opts.ignoreLimit ? 0 : ownerRetriesUsed(r.output_summary, now);
     if (r.status !== 'failed') {
-      return ownerRetryVerdict({ status: String(r.status), verdict, openReservations: 0, paidType: false, paidExternalUnreconciled: false, maxCostUsd: null, runRemainingUsd: null, policyBlockedBy: null, ownerRetriesUsed24h: used });
+      return ownerRetryVerdict({ status: String(r.status), verdict, openReservations: 0, paidType: false, paidExternalUnreconciled: false, maxCostUsd: null, runRemainingUsd: null, policyBlockedBy: null, ownerRetriesUsed24h: used,
+        nextAvailableAt: opts.ignoreLimit ? null : ownerRetryNextAvailableAt(r.output_summary, now) });
     }
     const openReservations = await this.openItemReservations(q, r);
     const paidType = paidProviderOfItemType(String(r.type)) !== null;
@@ -4401,6 +4583,7 @@ export class RunsService {
     return ownerRetryVerdict({
       status: String(r.status), verdict, openReservations, paidType, paidExternalUnreconciled: paidExternal,
       maxCostUsd: b.maxCostUsd, runRemainingUsd: b.runRemainingUsd, policyBlockedBy: b.policyBlockedBy, ownerRetriesUsed24h: used,
+      nextAvailableAt: opts.ignoreLimit ? null : ownerRetryNextAvailableAt(r.output_summary, now),
     });
   }
 
@@ -7247,7 +7430,7 @@ export class RunsService {
     // Fix round 1 (I1): un job final completado que ya no es el build vigente = `stale`; se re-arma solo si el
     // estado lo declara pendiente (builder nuevo / re-completitud sin confirmar), si no queda una acción visible.
     const stale = !ready && pk.status === 'completed';
-    return evaluateRunCompletion(job, rows, m, {
+    const done = evaluateRunCompletion(job, rows, m, {
       ready,
       status: stale ? 'stale' : pk.status,
       autoRetryPending: stale ? pk.rebuildPending : pk.autoRetryPending,
@@ -7259,6 +7442,13 @@ export class RunsService {
       alert: stale ? null : pk.alert,
       nextRetryAt: !stale && pk.nextRetryAt ? pk.nextRetryAt.toISOString() : null,
     }, { upgradeOnlyFailure, validationCutoffs, pendingVideogenReservations });
+    // r99: empaque en pausa como bug de Cursia (AutoPackageService.resumeCursiaIssues): el curso no está listo, continúa
+    // solo con el arreglo; el usuario ve el mensaje (nunca «reintentar»).
+    const pkgHold = job?.output_summary?.autoPackage?.cursiaIssue;
+    if (!done.complete && pkgHold && pkgHold.active === true) {
+      return { ...done, cursiaIssue: { items: ['package'], since: typeof pkgHold.heldAt === 'string' ? pkgHold.heldAt : null, message: CURSIA_ISSUE_MESSAGE } };
+    }
+    return done;
   }
 
   /**

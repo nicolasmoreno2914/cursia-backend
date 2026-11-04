@@ -36,6 +36,8 @@
 // Puro salvo `startAutoHealTimer`.
 // ─────────────────────────────────────────────────────────────────────────────
 import { remediationBlocksAuto } from '../reliability/remediation-ladder';
+// r99: una parte en pausa como bug de Cursia no la toma ningún reintento: la reanuda el arreglo (sweepCursiaIssues).
+import { bugHoldOf } from '../reliability/bug-hold';
 import {
   AUTO_HEAL_ALLOW_LIST,
   AUTO_HEAL_DENY_PATTERNS,
@@ -207,7 +209,9 @@ export type AutoHealSkipReason =
   // r62 (d2): la clase A agotó su ventana TOTAL de recuperación automática (classATotalHours) → excepción registrada.
   | 'recovery_window_exhausted'
   // r98: la escalera de remediación se agotó con ESTE error (misma huella tras corregir el pedido): solo el dueño reintenta.
-  | 'remediation_exhausted';
+  | 'remediation_exhausted'
+  // r99: pausa como bug de Cursia (bug-hold.ts): la reanuda el barrido sweepCursiaIssues, nunca un reintento.
+  | 'cursia_issue_hold';
 
 /** R16 fix M6: tope de rondas según quién ejecuta el item. */
 export function autoHealMaxRoundsFor(type: string | null | undefined, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): number {
@@ -234,7 +238,7 @@ export function autoRegenRoundsOf(outputSummary: Record<string, any> | null | un
 }
 
 /** Motivos permanentes para ESTE texto de error (el barrido no lo vuelve a mirar hasta que el error cambie). */
-export const AUTO_HEAL_PERMANENT_SKIPS: readonly AutoHealSkipReason[] = Object.freeze(['denied', 'not_allow_listed', 'missing_precondition', 'cap_reached', 'recovery_window_exhausted', 'remediation_exhausted'] as AutoHealSkipReason[]);
+export const AUTO_HEAL_PERMANENT_SKIPS: readonly AutoHealSkipReason[] = Object.freeze(['denied', 'not_allow_listed', 'missing_precondition', 'cap_reached', 'recovery_window_exhausted', 'remediation_exhausted', 'cursia_issue_hold'] as AutoHealSkipReason[]);
 
 function fnv1a(s: string): number {
   let h = 0x811c9dc5;
@@ -470,6 +474,7 @@ export function isAutoHealDenied(error: string): boolean {
 
 /** Decisión pura: ¿se reabre automáticamente este item ahora? */
 export function autoHealDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): AutoHealDecision {
+  if (row.status === 'failed' && bugHoldOf(row.output_summary, row.error)) return { heal: false, reason: 'cursia_issue_hold' };
   // r98: escalera agotada con ESTE error → no se reabre sola. Review P0-1: nunca antes de que la clase B use sus propias
   // rondas de auto-regeneración (regenerate_split / regenerate_targeted ya cambian la entrada).
   // Re-review P2: el re-chequeo usa la MISMA decisión del barrido (clase registrada incluida: p. ej. un ejecutor que subió
@@ -518,6 +523,7 @@ export function safeAutoRetryDecision(row: AutoHealRow, now: Date, policy: AutoH
   const error = String(row.error ?? '').trim();
   if (!error) return { heal: false, reason: 'no_error' };
   if (remediationBlocksAuto(row.output_summary, row.error)) return { heal: false, reason: 'remediation_exhausted' };
+  if (bugHoldOf(row.output_summary, row.error)) return { heal: false, reason: 'cursia_issue_hold' };
   const rule = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(error)) ?? null;
   if (!rule || (row.type && row.type !== rule.type)) return { heal: false, reason: 'not_allow_listed' };
   // La deny-list del auto-healer también gana acá (ambiguo, cuota, presupuesto, configuración…).
