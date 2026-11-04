@@ -275,6 +275,8 @@ export class FinopsBudgetService {
     runId?: string | null;
     invalidationPlanSha?: string | null;
     estimate: EstimateResult;
+    /** r95: motivo del registro (`runs.service:<código>`): la bandeja de aprobaciones pendientes lo lee. */
+    createdBy?: string | null;
   }, runner: Runner = this.dataSource): Promise<{ id: string }> {
     return this.ledger.createEstimate({
       scope: a.scope,
@@ -284,7 +286,7 @@ export class FinopsBudgetService {
       runId: a.runId ?? null,
       invalidationPlanSha: a.invalidationPlanSha ?? null,
       estimate: a.estimate,
-      createdBy: 'runs.service',
+      createdBy: a.createdBy || 'runs.service',
     }, runner);
   }
 

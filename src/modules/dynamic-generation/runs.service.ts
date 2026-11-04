@@ -173,6 +173,8 @@ import {
   videoUpgradesOf,
 } from './video-upgrade';
 import { estimateBreakdown, EstimateBreakdown, estimateCategories, estimateFingerprint, planNormalApproval, NormalApprovalPlan } from '../finops/normal-approval';
+import { governRunBudget, isUserBudgetGoverned, UserBudgetStanding } from '../finops/user-budget-governs';
+import type { RunBudgetDecision } from '../finops/run-budget';
 import { isSuperAdminEmail } from '../../auth/super-admin';
 import { RunCompletion, attachCarryChains, evaluateRunCompletion, loadPendingVideogenReservations, loadValidationCutoffs } from './run-completion';
 import { hasDeliverablePackage } from '../dynamic-packaging/package-freshness';
@@ -787,6 +789,8 @@ interface NormalPlanContext {
   signedPlan: NormalApprovalPlan;
   /** r62: comprometido del mes de ESTE dueño (solo si la política define ownerMonthlyCap). */
   ownerMonth: { spent: string; outstanding: string; total: string } | null;
+  /** r95: decisión gobernada por el presupuesto asignado de quien paga (null = topes globales, como siempre). */
+  governed?: { decision: RunBudgetDecision; available: string } | null;
 }
 
 /**
@@ -812,6 +816,12 @@ export function budgetBlockedConflict(blockedBy: NormalApprovalPlan['blockedBy']
   });
 }
 export const APPROVAL_FORBIDDEN = 'approval_forbidden';
+/**
+ * r95: `cost_estimates.created_by` de un estimado guardado porque la generación NO pudo arrancar (`runs.service:<código>`).
+ * Los códigos `budget_approval_required` y `approval_forbidden` son los que esperan a un administrador.
+ */
+export const PENDING_APPROVAL_CREATED_BY_PREFIX = 'runs.service:';
+export const ADMIN_APPROVAL_WAITING_CODES: readonly string[] = [BUDGET_APPROVAL_REQUIRED, APPROVAL_FORBIDDEN];
 /**
  * EV6 DoD (BE-A): «Generar videos reales» (vista previa + confirmación), cancelar un upgrade en
  * vuelo y el reenvío pago de un video fallido son herramientas de RECUPERACIÓN de admin
@@ -869,6 +879,8 @@ export interface StartPreview {
     mode: 'user' | 'admin' | 'none';
     /** r62: true = el run nace solo con la autorización firmada del usuario (mode 'user' y sin aprobación vigente). */
     userAuthorizationRequired: boolean;
+    /** r95: 'user_budget' = el disponible del usuario reemplazó los topes globales por generación/curso/cuenta. */
+    governedBy?: 'user_budget' | 'policy';
   } | null;
   /** r62: + ownerMonthlyCap (tope mensual de la cuenta) y lo comprometido por la cuenta este mes (null sin ese tope). */
   /** r75 (H5, D-25): `monthSpent` = gasto GLOBAL de la plataforma en el mes → solo para el SuperAdmin; al resto, null. */
@@ -1321,7 +1333,9 @@ export class RunsService {
     let existing: any | null = null;
     try {
       evaluation = await this.finopsBudget.evaluateStart({ courseId, ownerId, mode: modes, items: manifest.manifest.items });
-      np = await this.normalPlan(this.dataSource, courseId, ownerId, evaluation);
+      // r95: paga quien inicia (el actor): con presupuesto asignado, su disponible gobierna en vez de los topes globales.
+      np = await this.normalPlan(this.dataSource, courseId, ownerId, evaluation, user.id);
+      evaluation = this.governedEvaluation(evaluation, np);
       if (evaluation.decision === 'ADMIN_APPROVAL' || evaluation.userAuthorizationRequired) {
         existing = await this.finopsBudget.findUnconsumedApproval(courseId, manifest.id, evaluation.estimate.totals.expected);
       }
@@ -1376,6 +1390,8 @@ export class RunsService {
         existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
         mode,
         userAuthorizationRequired,
+        // r95: quién fija el tope de esta autorización: el presupuesto asignado del usuario o la política global.
+        governedBy: np.governed ? 'user_budget' : 'policy',
       },
       // r75 H5 (D-25): el gasto global del mes solo lo ve el SuperAdmin.
       policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: canApprove ? np.month.total : null, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
@@ -1413,14 +1429,30 @@ export class RunsService {
     return out;
   }
 
-  /** Política + gasto del curso + comprometido del mes → plan de aprobación normal (sobre `runner`). */
+  /**
+   * Política + gasto del curso + comprometido del mes → plan de aprobación normal (sobre `runner`).
+   * r95: con `payerUserId` (quien paga) y un presupuesto ASIGNADO a esa persona, su disponible reemplaza los topes globales
+   * por generación / curso / cuenta (governRunBudget): si así la decide el usuario, el contexto vuelve gobernado (`governed`,
+   * con la política sustituida y la decisión nueva). Si no, todo igual que antes.
+   */
   private async normalPlan(runner: { query: (sql: string, params?: any[]) => Promise<any> }, courseId: number, ownerId: string,
-    evaluation: StartBudgetEvaluation): Promise<NormalPlanContext> {
+    evaluation: StartBudgetEvaluation, payerUserId: string | null = null): Promise<NormalPlanContext> {
     const policy = await this.finopsBudget!.policyFor(courseId, ownerId, runner);
     const spent = await this.finopsBudget!.spentSoFar(courseId, runner);
     const month = await this.finopsBudget!.monthCommitted(runner);
     // r58: límite mensual POR DUEÑO (solo si la política lo define; si no, ni se consulta).
     const ownerMonth = (policy?.limits as Record<string, unknown> | undefined)?.ownerMonthlyCap != null ? await this.finopsBudget!.ownerMonthCommitted(ownerId, runner) : null;
+    if (payerUserId) {
+      const standing = await this.userBudgetStanding(runner, payerUserId);
+      const g = governRunBudget({
+        estimate: evaluation.estimate, policy, spentSoFar: spent, monthSpent: month.total, ownerMonthSpent: ownerMonth ? ownerMonth.total : null,
+        paidRealProviders: evaluation.paidRealProviders, userBudget: standing,
+      });
+      if (g.applies) {
+        return { spent, month, plan: g.plan, policy: g.policy as NormalPlanContext['policy'], signedPlan: g.signedPlan, ownerMonth,
+          governed: { decision: g.decision, available: g.available } };
+      }
+    }
     const plan = planNormalApproval({
       estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: month.total, providerSpent: spent.byProvider,
       ownerMonthSpent: ownerMonth ? ownerMonth.total : null,
@@ -1429,7 +1461,27 @@ export class RunsService {
       estimate: evaluation.estimate, policy, courseSpent: spent.course, monthSpent: '0', providerSpent: spent.byProvider,
       ownerMonthSpent: ownerMonth ? '0' : null,
     });
-    return { spent, month, plan, policy, signedPlan, ownerMonth };
+    return { spent, month, plan, policy, signedPlan, ownerMonth, governed: null };
+  }
+
+  /** r95: presupuesto del mes de quien paga (sin gate / modo off / error de lectura → null: no gobierna, como antes). */
+  private async userBudgetStanding(runner: { query: (sql: string, params?: any[]) => Promise<any> }, payerUserId: string): Promise<UserBudgetStanding | null> {
+    const g = this.userBudgetGate();
+    if (!g) return null;
+    const mode = g.mode();
+    if (mode === 'off') return null;
+    try {
+      const a = await g.availability(runner, payerUserId);
+      return { mode, assigned: !!a.assigned, available: normalizeDecimal(a.available) };
+    } catch (err) {
+      this.logger.warn(`r95: no se pudo leer el presupuesto de ${String(payerUserId).slice(0, 8)}…: ${err instanceof Error ? err.message.slice(0, 160) : String(err)} — se aplican los topes globales`);
+      return null;
+    }
+  }
+
+  /** r95: la decisión que vale para el run: la gobernada por el presupuesto del usuario (si aplica) o la de siempre. */
+  private governedEvaluation(evaluation: StartBudgetEvaluation, np: NormalPlanContext): StartBudgetEvaluation {
+    return np.governed ? { ...evaluation, ...np.governed.decision } : evaluation;
   }
 
   /**
@@ -1487,9 +1539,15 @@ export class RunsService {
     // AUTO o una aprobación de admin vigente: el camino normal (startRun la consume).
     if (!pv.approval.required) return { ...(await this.startRun(courseId, ownerId, blueprintNumber, courseContext, { startedBy })), approval: none };
     if (!pv.approval.canApprove) {
+      // r95: el estimado queda registrado para la bandeja «Generaciones que esperan aprobación» del SuperAdmin.
+      const est = await this.finopsBudget!.recordEstimate({
+        scope: 'run', ownerId, courseId, manifestId: pv.manifestId, runId: null, invalidationPlanSha: null,
+        estimate: pv._evaluation!.estimate, createdBy: `${PENDING_APPROVAL_CREATED_BY_PREFIX}${APPROVAL_FORBIDDEN}`,
+      }).catch((err) => { this.logger.warn(`r95: no se pudo registrar el estimado pendiente del curso #${courseId}: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`); return null; });
       throw new ForbiddenException({
         code: APPROVAL_FORBIDDEN,
         message: `${APPROVAL_FORBIDDEN}: este curso requiere la autorización de un administrador (esperado USD ${usd2(pv.estimate.expected)}, máximo USD ${usd2(pv.estimate.max)}). No se creó nada.`,
+        ...(est ? { estimateId: est.id } : {}),
       });
     }
     if (!pv.approval.withinPolicy) throw budgetBlockedConflict(pv.approval.blockedBy, publicPreview(pv));
@@ -1610,7 +1668,8 @@ export class RunsService {
     let existing: any | null = null;
     try {
       evaluation = await this.finopsBudget.evaluateStart({ courseId, ownerId, mode: modes, items: manifestB.manifest.items, actions: planActions });
-      np = await this.normalPlan(this.dataSource, courseId, ownerId, evaluation);
+      np = await this.normalPlan(this.dataSource, courseId, ownerId, evaluation, user.id);
+      evaluation = this.governedEvaluation(evaluation, np);
       if (evaluation.decision === 'ADMIN_APPROVAL' || evaluation.userAuthorizationRequired) {
         existing = await this.finopsBudget.findUnconsumedApproval(courseId, manifestB.id, evaluation.estimate.totals.expected);
       }
@@ -1653,7 +1712,7 @@ export class RunsService {
         required, canApprove: isSuperAdminEmail(user.email), withinPolicy: plan.withinPolicy, amount: plan.amount,
         cappedByLimit: plan.cappedByLimit, blockedBy: redactBlockedByForNonAdmin(plan.blockedBy, isSuperAdminEmail(user.email)),
         existing: existing ? { amount: normalizeDecimal(existing.authorized_budget) } : null,
-        mode, userAuthorizationRequired,
+        mode, userAuthorizationRequired, governedBy: np.governed ? 'user_budget' : 'policy',
       },
       // r75 H5 (D-25): el gasto global del mes solo lo ve el SuperAdmin.
       policy: { ...plan.limits, courseSpent: normalizeDecimal(np.spent.course), monthSpent: isSuperAdminEmail(user.email) ? np.month.total : null, ownerMonthSpent: np.ownerMonth ? np.ownerMonth.total : null },
@@ -1848,7 +1907,7 @@ export class RunsService {
         const budget = await this.finopsEvaluate({
           courseId, ownerId, manifestId: manifestB.id, items: manifestB.manifest.items,
           modes: runSpendModes(videoMode, frozenProviderModesOf(rowA.input_payload)), actions: planActions,
-          runner: qr, planSha: plan.planSha256, normalApproval: userNa,
+          runner: qr, planSha: plan.planSha256, normalApproval: userNa, payerUserId: startedBy,
         });
 
         const invalidation = { fromRunId: rowA.id, planSha256: plan.planSha256, totals: plan.totals, plan };
@@ -2044,7 +2103,7 @@ export class RunsService {
     // V2.1 RF-b: estimado + gate de presupuesto ANTES de escribir el run.
     const budget = await this.finopsStartGate({
       courseId, ownerId, manifestId: manifest.id, items: manifest.manifest.items, modes: runSpendModes(videoMode, providerModes ?? null),
-      normalApproval: opts.normalApproval,
+      normalApproval: opts.normalApproval, payerUserId: opts.startedBy ?? null,
     });
     // r75 (Agente C): presupuesto mensual del usuario (lectura optimista; el chequeo autoritativo va en bindRun).
     await this.assertUserBudgetPreTx(budget, { courseId, ownerId, manifestId: manifest.id, payerUserId: opts.startedBy ?? null });
@@ -5744,7 +5803,7 @@ export class RunsService {
     if (cmpDec(required, av.available) <= 0) return;
     const est = await this.finopsBudget.recordEstimate({
       scope: 'run', ownerId: a.ownerId, courseId: a.courseId, manifestId: a.manifestId, runId: null, invalidationPlanSha: a.planSha ?? null,
-      estimate: gate.evaluation.estimate,
+      estimate: gate.evaluation.estimate, createdBy: `${PENDING_APPROVAL_CREATED_BY_PREFIX}${av.assigned ? 'user_budget_insufficient' : 'user_budget_not_assigned'}`,
     });
     throw new ConflictException({
       code: av.assigned ? 'user_budget_insufficient' : 'user_budget_not_assigned',
@@ -5806,6 +5865,8 @@ export class RunsService {
     runner?: { query: (sql: string, params?: any[]) => Promise<any> };
     planSha?: string | null;
     normalApproval?: NormalApprovalRequest;
+    /** r95: quien paga (iniciador; default el dueño): con presupuesto asignado, su disponible gobierna. */
+    payerUserId?: string | null;
   }): Promise<FinopsGate | null> {
     const mode = a.modes;
     if (!this.finopsBudget) {
@@ -5823,6 +5884,11 @@ export class RunsService {
       evaluation = await this.finopsBudget.evaluateStart({
         courseId: a.courseId, ownerId: a.ownerId, mode, items: a.items, actions: a.actions ?? null,
       });
+      // r95: el presupuesto asignado de quien paga gobierna (misma regla que la vista previa; la tx del run la revalida).
+      if (this.userBudgetGate() && evaluation.paidRealProviders.length > 0) {
+        const np = await this.normalPlan(a.runner ?? this.dataSource, a.courseId, a.ownerId, evaluation, (a.payerUserId && String(a.payerUserId).trim()) || a.ownerId);
+        evaluation = this.governedEvaluation(evaluation, np);
+      }
     } catch (err) {
       // Fail loud y cerrado: sin estimado no se crea ningún run (p.ej. precio
       // faltante en pricing_catalog o migración FinOps sin aplicar → 503 claro).
@@ -5886,6 +5952,7 @@ export class RunsService {
     items: readonly RunManifestItem[];
     modes: RunSpendModes;
     normalApproval?: NormalApprovalRequest;
+    payerUserId?: string | null;
   }): Promise<FinopsGate | null> {
     try {
       return await this.finopsEvaluate(a);
@@ -5905,7 +5972,7 @@ export class RunsService {
   ): Promise<ConflictException> {
     const est = await this.finopsBudget!.recordEstimate({
       scope: 'run', ownerId: ctx.ownerId, courseId: ctx.courseId, manifestId: ctx.manifestId, runId: null,
-      invalidationPlanSha: ctx.planSha, estimate: evaluation.estimate,
+      invalidationPlanSha: ctx.planSha, estimate: evaluation.estimate, createdBy: `${PENDING_APPROVAL_CREATED_BY_PREFIX}${code}`,
     });
     return this.budgetConflict(code, est.id, evaluation.estimate, evaluation.reasons, evaluation.paidRealProviders);
   }
@@ -5936,7 +6003,15 @@ export class RunsService {
       // recalculado sobre la tx: si otra aprobación ya se llevó el remanente, o cambió el monto, no se escribe nada.
       const na = gate.normalApproval;
       await qr.query(`select pg_advisory_xact_lock(hashtext($1))`, [MONTH_CAP_LOCK]);
-      const np = await this.normalPlan(qr, a.courseId, a.ownerId, gate.evaluation);
+      // r95: una firma gobernada por el presupuesto del usuario se revalida con su disponible de AHORA (en esta tx).
+      const governed = isUserBudgetGoverned(gate.evaluation.reasons);
+      const np = await this.normalPlan(qr, a.courseId, a.ownerId, gate.evaluation, governed ? ((a.startedBy && String(a.startedBy).trim()) || a.ownerId) : null);
+      if (governed && !np.governed) {
+        throw new ConflictException({
+          code: ESTIMATE_STALE,
+          message: `${ESTIMATE_STALE}: tu presupuesto disponible cambió mientras se autorizaba y esta generación ya no entra en él; revisa el estimado nuevo. No se creó nada.`,
+        });
+      }
       if (na.kind === 'user') {
         // r62 (M1): la política se relee en ESTA tx: si cambió (otra versión, flag explícito de admin, tope quitado),
         // la firma del usuario ya no vale (la decisión de antes ya no es la vigente).
