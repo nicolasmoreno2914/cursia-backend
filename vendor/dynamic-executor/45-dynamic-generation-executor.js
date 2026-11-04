@@ -139,7 +139,10 @@ var DYN_TOKEN_TIMEOUT_MS = 10000;
 async function _dynFreshToken(force) {
   if (typeof getSupabaseTokenAsync !== 'function') return null;
   // force: marginMs enorme → getSupabaseTokenAsync SIEMPRE llama a refreshSession (no solo salta la caché).
-  var p = getSupabaseTokenAsync(force ? { forceRefresh: true, marginMs: 24 * 3600 * 1000 } : undefined);
+  // r89 (review P2-3): la renovación forzada comparte la que ya esté en vuelo en 04-api (una sola por pestaña).
+  var p = force && typeof window !== 'undefined' && typeof window.cursiaRefreshSessionShared === 'function'
+    ? window.cursiaRefreshSessionShared()
+    : getSupabaseTokenAsync(force ? { forceRefresh: true, marginMs: 24 * 3600 * 1000 } : undefined);
   var timer;
   var timeout = new Promise(function (res) { timer = setTimeout(function () { res(null); }, DYN_TOKEN_TIMEOUT_MS); });
   try { return await Promise.race([p, timeout]); } catch (e) { return null; } finally { clearTimeout(timer); }
@@ -180,7 +183,7 @@ async function _dynLlmCall(system, user, maxTok, maxRetries, schema, metaOut, at
       if (extra) return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL, undefined, extra);
       return await api(system, user, maxTok, schema, DYN_GENERATION_MODEL);
     } catch (e) {
-      if (e && e.fatal && e.status === 401 && !authRetried && (await _dynFreshToken(true))) {
+      if (e && e.fatal && e.status === 401 && e.code !== 'ai_connection_unavailable' && !authRetried && (await _dynFreshToken(true))) {
         authRetried = true;
         attempt--; // la renovación de sesión no consume un intento
         continue;
@@ -9319,7 +9322,9 @@ function dynBuildCourseContextFromCurrentFields() {
   var sel = (typeof window !== 'undefined' && window.SEL) || (typeof SEL !== 'undefined' ? SEL : {}) || {};
   var catalog = (typeof SCORM_V2_TEMPLATES !== 'undefined') ? SCORM_V2_TEMPLATES : [];
   if (typeof sv2ResolveActiveTemplateIds === 'function') {
-    ctx.scormTemplateIds = sv2ResolveActiveTemplateIds(sel.scormTemplates, catalog);
+    // r87 (review P2-6): el selector manual de plantillas ya no existe; una selección vieja guardada en SEL nunca
+    // aplica a un curso V2 → siempre el catálogo automático.
+    ctx.scormTemplateIds = sv2ResolveActiveTemplateIds('auto', catalog);
   }
   return ctx;
 }
