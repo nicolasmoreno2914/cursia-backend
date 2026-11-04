@@ -111,9 +111,6 @@ export function ownerRetryCodeEligibility(v: FailureVerdict & { recordedClass?: 
   const cls = v.recordedClass && ['A', 'B', 'C', 'D'].includes(v.recordedClass) && v.recordedClass > v.class ? v.recordedClass : v.class;
   if (OWNER_RETRY_NEVER_CODES.has(v.code) || v.paidRisk === 'uncertain' || v.humanReason === 'duplicate_charge') return 'ambiguous_paid_result';
   if (OWNER_RETRY_EXTRA_CODES.has(v.code)) return 'ok';
-  // r98 (principio 2: el creador nunca necesita a un admin): un D determinista con la escalera agotada (ya se corrigió el
-  // pedido sin éxito) lo puede reintentar el dueño; los guards de dinero de arriba y de ownerRetryVerdict siguen igual.
-  if (v.remediationExhausted && cls === 'D') return 'ok';
   if (cls === 'A' || cls === 'B') return 'ok';
   return 'failure_not_owner_retryable';
 }

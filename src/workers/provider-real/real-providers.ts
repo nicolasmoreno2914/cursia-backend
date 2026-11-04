@@ -400,6 +400,21 @@ async function guard(deps: RealProviderDeps, item: ClaimedItem, provider?: strin
   return false;
 }
 
+/**
+ * r98 (review P2-4): conserva solo las marcas de calidad del audiolibro cuyo guion de bloque sigue aceptado (mismo
+ * messageId en audiobookSections). Sin marcas → undefined (degraded deja de valer). Pura; exportada para el check.
+ */
+export function pruneAudioQuality(q: Record<string, any> | undefined | null, sections: Record<string, { messageIds?: string[] } | undefined>): Record<string, any> | undefined {
+  if (!q || !Array.isArray(q.warnings)) return q ?? undefined;
+  const keep = q.warnings.filter((w: any) => {
+    if (!w || typeof w.section !== 'number' || !w.messageId) return true;
+    const sec = sections[String(w.section - 1)];
+    return !!sec && Array.isArray(sec.messageIds) && sec.messageIds.includes(w.messageId);
+  });
+  if (keep.length === q.warnings.length) return q;
+  return keep.length ? { ...q, warnings: keep, degraded: true } : undefined;
+}
+
 async function record(deps: RealProviderDeps, item: ClaimedItem, patch: Record<string, any>): Promise<void> {
   if (!deps.scheduler.recordItemExternal) throw new Error('dynamic-provider-worker: scheduler sin recordItemExternal (modo real)');
   const ok = await deps.scheduler.recordItemExternal(item.itemRunId, deps.executorId, patch);
@@ -1281,6 +1296,11 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
   };
 
   let qualityState: Record<string, any> | undefined = (item.outputSummary as any)?.[QUALITY_KEY];
+  {
+    // Review P2-4: marcas de bloques que ya no están (regenerados por repetición o por otro fallo) se descartan.
+    const pruned = pruneAudioQuality(qualityState, sections);
+    if (JSON.stringify(pruned ?? null) !== JSON.stringify(qualityState ?? null)) { qualityState = pruned; await record(deps, item, { [QUALITY_KEY]: pruned ?? null }); }
+  }
   // ── 1. Plan + guion por bloque (solo los bloques que falten) ───────────────
   if (needsLlm) {
     plan = {
@@ -1314,9 +1334,11 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       await record(deps, item, { audiobookSections: sections });
       if (res.qualityAccepted) {
         // r98 (rung 2): el bloque se narra con marca de calidad (output_summary.quality → informe de calidad del paquete).
-        qualityState = withQualityWarning(qualityState, {
+        qualityState = withQualityWarning(pruneAudioQuality(qualityState, sections), {
           ...qualityAcceptance([res.qualityAccepted.code], res.qualityAccepted.findings, new Date(), remediationOf(item.outputSummary)?.fingerprint ?? null),
           section: section.idx + 1,
+          // Review P2-4: la marca queda atada al guion aceptado (si el bloque se regenera, la marca vieja se descarta).
+          messageId: res.messageIds[0] ?? null,
         });
         await record(deps, item, { [QUALITY_KEY]: qualityState });
       }

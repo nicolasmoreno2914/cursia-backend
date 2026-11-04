@@ -31,6 +31,8 @@ export const REMEDIATION_KEY = 'remediation';
 export const QUALITY_KEY = 'quality';
 /** Intentos concedidos por la escalera (rung 1 + rung 2) por huella. Tope duro. */
 export const MAX_LADDER_GRANTS = 2;
+/** Tope TOTAL de intentos concedidos por la escalera a una parte (todas sus huellas, reintentos humanos incluidos). */
+export const MAX_LADDER_GRANTS_PER_ITEM = 3;
 export const REMEDIATION_FEEDBACK_MAX = 1200;
 export const REMEDIATION_FINDINGS_MAX = 10;
 export const REMEDIATION_PREVIOUS_MAX = 5;
@@ -74,6 +76,10 @@ export interface RemediationState {
   acceptCodes: string[];
   /** Intentos concedidos por la escalera para esta huella (≤ MAX_LADDER_GRANTS). */
   grants: number;
+  /** Intentos concedidos por la escalera a la parte en total (≤ MAX_LADDER_GRANTS_PER_ITEM; nunca se reinicia). */
+  grantsTotal?: number;
+  /** Reintento humano (dueño/admin): nuevo ciclo de la escalera (count=1) conservando feedback y `previous`. */
+  manualResetAt?: string | null;
   /** Escalones probados con su resultado (para el reporte de desarrollo). */
   tried: Array<{ rung: number; at: string; outcome: string }>;
   /** Último mensaje de error (recortado y sin secretos): solo para el reporte. */
@@ -98,13 +104,22 @@ export const SELF_ADAPTIVE_CODES: readonly string[] = Object.freeze([
   'EXAM_BANK_INCOMPLETE',
 ]);
 
-/** ¿El veredicto describe un fallo DETERMINISTA (misma entrada → mismo rechazo)? */
-export function isDeterministicVerdict(v: Pick<FailureVerdict, 'class' | 'strategy' | 'humanReason'> & { code?: string }): boolean {
+/**
+ * D que SÍ entran a la escalera (lista explícita; hoy vacía). Un D `hold_for_human` / `unrecoverable` (p. ej.
+ * EXAM_BANK_LEAF_CAPACITY) o sin clasificar no se reintenta con feedback: su intento extra pagaría una llamada que no
+ * puede salir bien, y los «unclassified» colapsarían en una sola huella (falsas «Falla común»).
+ */
+export const LADDER_D_CODES: readonly string[] = Object.freeze([] as string[]);
+
+/**
+ * ¿El veredicto describe un fallo DETERMINISTA que la escalera puede remediar? Clase B (salida de la IA inválida) y los
+ * D de LADDER_D_CODES. Nunca: sin clasificar, riesgo de pago incierto o piso de dinero (decide la conciliación).
+ */
+export function isDeterministicVerdict(v: Pick<FailureVerdict, 'class' | 'strategy' | 'humanReason'> & { code?: string; unclassified?: boolean; paidRisk?: string; moneyFloor?: boolean }): boolean {
   if (v.code && SELF_ADAPTIVE_CODES.includes(v.code)) return false;
+  if (v.unclassified || v.paidRisk === 'uncertain' || v.moneyFloor) return false;
   if (v.class === 'B') return true;
-  if (v.class !== 'D') return false;
-  if (v.strategy === 'wait_provider') return false;
-  return !['budget', 'config', 'duplicate_charge'].includes(String(v.humanReason ?? ''));
+  return v.class === 'D' && !!v.code && LADDER_D_CODES.includes(v.code) && v.strategy !== 'hold_for_human';
 }
 
 /** Huella normalizada: tipo + código + regla + códigos internos (ordenados). Nunca el texto libre. */
@@ -163,11 +178,16 @@ export interface LadderStep {
  */
 export function ladderStep(
   prev: RemediationState | null,
-  verdict: Pick<FailureVerdict, 'class' | 'strategy' | 'humanReason' | 'code' | 'rule' | 'innerCodes' | 'paidRisk'>,
+  verdict: Pick<FailureVerdict, 'class' | 'strategy' | 'humanReason' | 'code' | 'rule' | 'innerCodes' | 'paidRisk'> & { unclassified?: boolean; moneyFloor?: boolean },
   itemType: string | null | undefined,
   error: string,
   now: Date,
-  opts: { retryable: boolean },
+  /**
+   * `autoRegenSpent` (review P0-1): la regeneración automática PROPIA de la clase B (auto-heal, regenMaxRounds) ya se
+   * usó o no aplica a este item. Mientras le queden rondas, la escalera no se agota: el feedback viaja en esas rondas.
+   * Ausente = true (sin auto-regeneración que esperar).
+   */
+  opts: { retryable: boolean; autoRegenSpent?: boolean },
 ): LadderStep | null {
   if (!isDeterministicVerdict(verdict)) return null;
   const fp = failureFingerprintOf(verdict, itemType);
@@ -185,9 +205,15 @@ export function ladderStep(
   if (count <= 1) { rung = 0; action = 'observe'; }
   else if (count === 2) { rung = 1; action = 'feedback'; }
   else if (count === 3 && degradable) { rung = 2; action = 'accept'; }
+  else if (opts.autoRegenSpent === false) { rung = 1; action = 'feedback'; }
   else { rung = 3; action = 'exhausted'; }
   const grantsUsed = same ? prev!.grants : 0;
-  const canGrant = opts.retryable && verdict.paidRisk !== 'uncertain' && grantsUsed < MAX_LADDER_GRANTS;
+  const grantsTotalUsed = Math.max(Number(prev?.grantsTotal ?? 0) || 0, same ? grantsUsed : 0);
+  // Con rondas propias de auto-regeneración pendientes (count ≥ 3, no degradable) el feedback viaja en ESAS rondas: sin
+  // intento extra de la escalera.
+  const ridingRegen = count >= 3 && action === 'feedback';
+  const canGrant = opts.retryable && verdict.paidRisk !== 'uncertain' && grantsUsed < MAX_LADDER_GRANTS
+    && grantsTotalUsed < MAX_LADDER_GRANTS_PER_ITEM && !ridingRegen;
   const grant = (action === 'feedback' || action === 'accept') && canGrant;
   const tried = [...(same ? prev!.tried ?? [] : [])];
   // El escalón anterior falló con la misma huella → su resultado queda registrado.
@@ -208,12 +234,34 @@ export function ladderStep(
     feedback: rung >= 1 ? feedbackFor(verdict.code, inner, findings) : null,
     acceptCodes: rung === 2 ? (inner.length ? inner : [verdict.code]).filter((c) => DEGRADABLE_CODES.includes(c)) : rung === 3 && same ? prev!.acceptCodes ?? [] : [],
     grants: grantsUsed + (grant ? 1 : 0),
+    grantsTotal: grantsTotalUsed + (grant ? 1 : 0),
     tried: tried.slice(-10),
     sampleError: redactErrorExcerpt(error),
     ...(action === 'exhausted' ? { exhaustedError: String(error ?? '').slice(0, 500), exhaustedAt: at } : {}),
     ...(previous.length ? { previous } : {}),
   };
   return { state, action, grant };
+}
+
+/**
+ * Review P1-3: un reintento HUMANO (dueño / admin) abre un ciclo nuevo de la escalera: count=1 (el próximo fallo igual
+ * vuelve a rung 1, con intento extra si el tope de la parte lo permite, y después rung 2), sin la marca de agotada; el
+ * feedback (el próximo intento ya lleva el pedido corregido), `previous` y `grantsTotal` se conservan.
+ */
+export function resetRemediationForManualRetry(prev: RemediationState | null, now: Date = new Date()): RemediationState | null {
+  if (!prev || prev.outcome) return prev;
+  return {
+    ...prev,
+    count: 1,
+    rung: prev.feedback ? 1 : 0,
+    acceptCodes: [],
+    grants: 0,
+    grantsTotal: Math.max(Number(prev.grantsTotal ?? 0) || 0, Number(prev.grants ?? 0) || 0),
+    exhaustedError: null,
+    exhaustedAt: null,
+    manualResetAt: now.toISOString(),
+    tried: [...(prev.tried ?? []), { rung: prev.rung, at: now.toISOString(), outcome: 'manual_retry' }].slice(-10),
+  };
 }
 
 /** rung 3 vigente para ESTE error: ningún barrido automático lo reabre (el dueño sí, a mano). */
@@ -302,6 +350,8 @@ export function commonFailureSignals(rows: readonly CommonFailureRow[], resoluti
   for (const r of rows) {
     const rem = r.remediation;
     if (!rem || typeof rem.fingerprint !== 'string' || !Number.isFinite(ms(rem.lastAt))) continue;
+    // Review P2-3: un fallo único (rung 0) no es «la misma falla repetida»: solo cuenta lo que se repitió en la parte.
+    if (!(Number(rem.count) >= 2 || Number(rem.rung) >= 1 || (rem.tried ?? []).length > 0)) continue;
     by.set(rem.fingerprint, [...(by.get(rem.fingerprint) ?? []), r]);
   }
   const out: CommonFailureSignal[] = [];

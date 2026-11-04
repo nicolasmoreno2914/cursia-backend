@@ -13,7 +13,10 @@
 //      (guion del audiolibro, validación v3 del servidor, ejecutor del navegador); nada estructural degrada;
 //   R3 rung 3: no degradable o persiste → sin intentos extra ni reaperturas automáticas con esa huella (auto-heal, reintento seguro,
 //      estado de recuperación) y con motivo claro; el DUEÑO puede reintentar (owner-retry), con los guards de dinero;
-//   K  tope: ≤ MAX_LADDER_GRANTS intentos extra por huella; nunca con pago incierto ni si el emisor dice no reintentable;
+//   K  tope: ≤ MAX_LADDER_GRANTS intentos extra por huella y ≤ MAX_LADDER_GRANTS_PER_ITEM por parte; nunca con pago
+//      incierto ni si el emisor dice no reintentable;
+//   Review r98: P0-1 (la escalera no apaga las rondas B del auto-heal), P1-1 (D hold_for_human / sin clasificar fuera),
+//      P1-2 (pago incierto fuera; conciliación primero), P1-3 (reintento humano = ciclo nuevo), P2-1/3/4/5/8;
 //   S  señal agregada «Falla común»: ≥ 3 cursos en 24 h; reporte para desarrollo (huella, fechas, cursos/runs, ejemplos
 //      redactados, escalones, archivo y función, punto de partida); resuelta por admin o tras 72 h sin aparecer;
 //   P  marca de calidad → informe de calidad del paquete (QUALITY_ACCEPTED).
@@ -137,7 +140,7 @@ function fakeQr(row) {
     assert(b && b.generator === 'content' && b.text.includes(GD.PEDAGOGY_PROMPT_MARKER) && b.text.includes(fb) && /^[0-9a-f]{64}$/.test(b.textSha256), 'brief mínimo');
     const big = { version: 1, engineVersion: 1, generator: 'experience', directives: [], overridden: [], text: '\n\n── ' + GD.PEDAGOGY_PROMPT_MARKER + ' ──\n' + 'x'.repeat(3700), textSha256: 'y' };
     const b2 = GD.withRemediationFeedback(big, { type: 'experience' }, fb);
-    assert(b2.text.length <= GD.PEDAGOGY_BRIEF_TEXT_MAX && b2.text.startsWith(big.text) && b2.textSha256 !== 'y', 'recortado al tope, el diseño intacto');
+    assert(b2.text.length <= GD.PEDAGOGY_BRIEF_TEXT_MAX && b2.text.endsWith(fb) && b2.text.startsWith(big.text.slice(0, 200)) && b2.textSha256 !== 'y', 'al tope: se recorta el final del brief, el feedback entra completo');
     assert(GD.withRemediationFeedback(null, { type: 'presentation' }, fb) === null, 'proveedor (Gamma) sin bloque: sin cambios');
     // Guion del audiolibro: el prompt del bloque lleva el feedback.
     const words = (n) => Array.from({ length: n }, (_, i) => `palabra${i}`).join(' ');
@@ -225,52 +228,105 @@ function fakeQr(row) {
     assert(!L.remediationBlocksAuto({ remediation: state }, 'lease_expired'), 'solo ESTE error');
   });
   await check('R3 el DUEÑO puede reintentar sin admin (owner-retry), con los guards de dinero intactos; motivo claro en la vista', async () => {
-    // D determinista sin regla (p. ej. un código nuevo de un validador del navegador) con la escalera agotada.
-    const err = 'NEW_VALIDATOR_CODE: el validador rechazó la salida';
+    const err = 'llm_output_invalid: JSON inválido en la salida del capítulo';
     const v0 = FC.classifyFailure({ error: err, itemType: 'content', source: 'browser_executor', outputSummary: {} });
-    eq([v0.class, v0.paidRisk], ['D', 'none'], 'D sin riesgo de pago');
+    eq([v0.class, v0.paidRisk], ['B', 'none'], 'B sin riesgo de pago');
     let prev = null;
-    for (let i = 0; i < 3; i++) prev = L.ladderStep(prev, v0, 'content', err, at(i), { retryable: true }).state;
+    for (let i = 0; i < 3; i++) prev = L.ladderStep(prev, v0, 'content', err, at(i), { retryable: true, autoRegenSpent: true }).state;
     eq(prev.rung, 3, 'agotada');
     const r = { status: 'failed', type: 'content', error: err, output_summary: { remediation: prev } };
     const vf = OR.itemFailureVerdict(r);
     assert(vf.remediationExhausted === true && OR.ownerRetryCodeEligibility(vf) === 'ok', 'elegible para el dueño');
-    eq(OR.ownerRetryCodeEligibility(OR.itemFailureVerdict({ ...r, output_summary: {} })), 'failure_not_owner_retryable', 'sin escalera: como antes');
-    // Pago incierto: nunca el dueño (aunque la escalera esté agotada).
     eq(OR.ownerRetryCodeEligibility({ ...vf, paidRisk: 'uncertain' }), 'ambiguous_paid_result', 'dinero primero');
     const view = RV.recoveryViewOf({ ...r, id: 'i1', failure_class: null }, at(5));
     assert(view.remediation && view.remediation.next === 'owner_retry' && /falla repetida con la misma causa; reintentar igual no lo arregla/.test(view.remediation.reasonText), JSON.stringify(view.remediation));
   });
 
-  // ── K: tope del gasto ───────────────────────────────────────────────────────
-  await check('K ≤ MAX_LADDER_GRANTS intentos extra por huella; nunca con pago incierto ni si el emisor dice «no reintentable»', async () => {
-    eq(L.MAX_LADDER_GRANTS, 2, 'tope');
-    const { steps } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c'), LANG(4, 'd'), LANG(5, 'e')]);
-    eq(steps.map((s) => s.grant), [false, true, true, false, false], 'grants');
-    assert(steps.every((s) => s.state.grants <= L.MAX_LADDER_GRANTS), 'acotado');
-    const { steps: nr } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c')], 'audiobook_chapter', { retryable: false });
-    assert(nr.every((s) => !s.grant), 'no reintentable → sin intentos extra');
-    const v = { ...verdictOf(LANG(1, 'a')), paidRisk: 'uncertain' };
-    let p = L.ladderStep(null, v, 'audiobook_chapter', LANG(1, 'a'), T0, { retryable: true }).state;
-    const s2 = L.ladderStep(p, v, 'audiobook_chapter', LANG(2, 'a'), at(1), { retryable: true });
-    assert(s2.action === 'feedback' && !s2.grant, 'pago incierto → la conciliación decide, sin intento extra');
-    const src = fs.readFileSync(path.join(REPO, 'src/workers/provider-real/real-providers.ts'), 'utf8');
-    // Cada intento del guion sigue pasando por guard → reserva → llamada (presupuesto de la parte, tope del run).
-    assert(/if \(!\(await guard\(deps, item, 'anthropic', llmCallEstimate\(scriptModel/.test(src) && /reservePaidCall\(deps\.finops/.test(src), 'guards de gasto por llamada');
-  });
-  await check('K un fallo transitorio en el medio no reinicia la cuenta; otra huella sí (y la anterior queda en `previous`)', async () => {
-    let prev = null;
-    const steps = [];
-    for (const [e, t] of [[LANG(1, 'a'), 'audiobook_chapter'], ['lease_expired', 'audiobook_chapter'], [LANG(2, 'b'), 'audiobook_chapter']]) {
-      const s = L.ladderStep(prev, verdictOf(e, t), t, e, T0, { retryable: true });
-      if (s) { prev = s.state; steps.push(s.action); }
+  // ── Review r98: P0-1 / P1-1 / P1-2 / P1-3 / P2-* ───────────────────────────
+  await check('P0-1 la escalera NO apaga el auto-heal de clase B: SCORM OUTPUT_TRUNCATED_MAX_TOKENS ×3 → sigue regenerate_split; agotada solo con las rondas propias usadas', async () => {
+    const e = 'OUTPUT_TRUNCATED_MAX_TOKENS: la salida se cortó';
+    const v = FC.classifyFailure({ error: e, itemType: 'scorm', source: 'browser_executor', outputSummary: {} });
+    eq([v.class, v.strategy], ['B', 'regenerate_split'], 'veredicto');
+    const policy = AH.DEFAULT_AUTO_HEAL_POLICY;
+    // Vía real: applyRemediationLadder con autoRegenSpentFor (0 rondas usadas → no se agota; el feedback viaja en ellas).
+    let os = {};
+    const acts = [];
+    for (let i = 0; i < 3; i++) {
+      const row = { id: 's1', status: i < 2 ? 'retrying' : 'failed', type: 'scorm', attempt_count: i + 1, max_attempts: 3, output_summary: os };
+      const st = await IT.applyRemediationLadder(fakeQr(row), row, e, true, v, at(i));
+      acts.push(st.action); os = row.output_summary;
     }
-    eq(steps, ['observe', 'feedback'], 'lease_expired no cuenta');
-    const other = 'AUDIOBOOK_SECTION_TOO_SHORT: el guion del bloque 2 quedó con 40 palabras';
-    const s = L.ladderStep(prev, verdictOf(other), 'audiobook_chapter', other, at(3), { retryable: true });
-    eq([s.action, s.state.count, s.state.previous.length, s.state.previous[0].rung], ['observe', 1, 1, 1], 'huella nueva');
+    eq(acts, ['observe', 'feedback', 'feedback'], 'sin agotar mientras queden rondas B');
+    assert(L.remediationFeedbackOf(os), 'el feedback viaja en la regeneración');
+    const failed = { id: 's1', status: 'failed', type: 'scorm', error: e, output_summary: os, finished_at: at(-600), updated_at: at(-600), failure_class: 'B', run_created_at: at(-700) };
+    const d = AH.autoHealDecision(failed, at(10), policy);
+    eq([d.heal, d.kind, d.strategy, d.round], [true, 'B', 'regenerate_split', 1], 'auto-heal B intacto');
+    // Aunque la marca diga agotada (llamada directa sin la opción), el auto-heal B gana mientras le queden rondas.
+    let p = null;
+    for (let i = 0; i < 3; i++) p = L.ladderStep(p, v, 'scorm', e, at(i), { retryable: true }).state;
+    eq(p.rung, 3, 'marca agotada');
+    eq(AH.autoHealDecision({ ...failed, output_summary: { remediation: p } }, at(10), policy).heal, true, 'rondas B primero');
+    // Con las rondas propias usadas → recién ahí agotada y sin reabrir.
+    const spent = { remediation: p, autoHeal: { rounds: 0, regenRounds: AH.autoRegenMaxRoundsFor('scorm', v.code, policy) } };
+    assert(AH.autoRegenSpentFor({ type: 'scorm', output_summary: spent }, v, policy), 'rondas usadas');
+    eq(AH.autoHealDecision({ ...failed, output_summary: spent }, at(10), policy), { heal: false, reason: 'remediation_exhausted' }, 'agotada tras sus rondas');
+    for (const [err, t] of [['llm_output_invalid: x', 'content'], ['scorm_invalid: x', 'scorm'], ['gift_invalid: x', 'exam'], ['CONTENT_TRUTH: persisten 2 oraciones', 'content'], ['v3_payload_invalid [SCHEMA_MISSING]: x', 'experience']]) {
+      const vv = FC.classifyFailure({ error: err, itemType: t, source: 'browser_executor', outputSummary: {} });
+      assert(!AH.autoRegenSpentFor({ type: t, output_summary: {} }, vv, policy), `${err}: rondas B disponibles → la escalera no se agota`);
+    }
   });
-
+  await check('P1-1 D hold_for_human y sin clasificar NO entran a la escalera (sin feedback, sin intento extra, sin «Falla común» por colapso de huellas)', async () => {
+    for (const [err, t, src] of [['algo raro pasó en el navegador', 'content', 'browser_executor'], ['TypeError: x is undefined', 'content', 'browser_executor'],
+      ['EXAM_BANK_LEAF_CAPACITY: no hay texto suficiente', 'exam', 'provider_worker'], ['llm_output_cut_repeated: la salida se cortó dos veces', 'content', 'provider_worker'],
+      ['claim_payload_unavailable: PEDAGOGY_DIRECTIVE_UNKNOWN', 'content', 'browser_executor']]) {
+      const v = FC.classifyFailure({ error: err, itemType: t, source: src, outputSummary: {} });
+      assert(!L.isDeterministicVerdict(v), `${err}: ${v.class}/${v.strategy}/${v.unclassified}`);
+      assert(L.ladderStep(null, v, t, err, T0, { retryable: true }) === null, `${err}: fuera de la escalera`);
+    }
+    eq(L.LADDER_D_CODES, [], 'lista explícita de D (vacía)');
+  });
+  await check('P1-2 pago incierto / piso de dinero: fuera de la escalera; el estado sigue siendo la conciliación (automática)', async () => {
+    const v = { ...verdictOf(LANG(1, 'a')), paidRisk: 'uncertain' };
+    assert(!L.isDeterministicVerdict(v) && L.ladderStep(null, v, 'audiobook_chapter', LANG(1, 'a'), T0, { retryable: true }) === null, 'incierto');
+    assert(!L.isDeterministicVerdict({ ...verdictOf(LANG(1, 'a')), moneyFloor: true }), 'piso de dinero');
+    // Fila con una marca vieja de agotada y un error de conciliación: manda la conciliación, nunca failed_no_strategies.
+    const err = 'provider_reconciliation_required: openai TTS chunk 2/4 (persisted 1): corte de conexión';
+    const os = { remediation: { ...run([LANG(1, 'a'), LANG(2, 'a'), LANG(3, 'a'), LANG(4, 'a')]).state, exhaustedError: err } };
+    const src = fs.readFileSync(path.join(REPO, 'src/modules/reliability/recovery-state.ts'), 'utf8');
+    assert(src.indexOf("if (cur === 'provider_reconcile' || cur === 'ambiguous_audio_resubmit')") < src.indexOf('if (remediationBlocksAuto(os, error))'), 'la conciliación va antes');
+    const vs = RS.recoveryStateOf({ id: 'x', status: 'failed', type: 'audiobook_chapter', error: err, output_summary: os, finished_at: at(-5), updated_at: at(-5), attention_reason: 'duplicate_charge' }, at(0));
+    assert(vs.state !== 'failed_no_strategies' || vs.reason !== 'remediation_exhausted', JSON.stringify(vs));
+  });
+  await check('P1-3 un reintento humano (dueño/admin) abre un ciclo nuevo: count=1, sin agotada; el próximo fallo igual vuelve a rung 1 (con intento) y después rung 2', async () => {
+    const { state } = run([LANG(1, 'a'), LANG(2, 'a'), LANG(3, 'a'), LANG(4, 'a')]);
+    eq(state.rung, 3, 'agotada');
+    const reset = L.resetRemediationForManualRetry(state, at(10));
+    eq([reset.count, reset.rung, reset.exhaustedError, reset.acceptCodes.length, reset.grants], [1, 1, null, 0, 0], 'ciclo nuevo');
+    assert(reset.feedback === state.feedback && reset.grantsTotal === state.grantsTotal && reset.tried.some((t) => t.outcome === 'manual_retry'), 'conserva feedback, total y rastro');
+    assert(!L.remediationBlocksAuto({ remediation: reset }, LANG(4, 'a')), 'sin marca de agotada');
+    assert(L.remediationFeedbackOf({ remediation: reset }), 'el intento del dueño ya lleva el pedido corregido');
+    const s2 = L.ladderStep(reset, verdictOf(LANG(5, 'a')), 'audiobook_chapter', LANG(5, 'a'), at(11), { retryable: true });
+    const s3 = L.ladderStep(s2.state, verdictOf(LANG(6, 'a')), 'audiobook_chapter', LANG(6, 'a'), at(12), { retryable: true });
+    eq([s2.action, s2.grant, s3.action], ['feedback', true, 'accept'], 'vuelve a rung 1 (intento) y rung 2');
+    const rs = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/runs.service.ts'), 'utf8');
+    assert(/const remediationReset = !auto \? resetRemediationForManualRetry\(remediationOf\(target\.output_summary\)/.test(rs) && /\.\.\.\(remediationReset \? \{ remediation: remediationReset \} : \{\}\)/.test(rs), 'retryItem (manual) lo aplica en la misma escritura');
+  });
+  await check('P2-1 tope TOTAL de intentos de la escalera por parte (todas las huellas, reintentos humanos incluidos): nunca se reinicia', async () => {
+    eq(L.MAX_LADDER_GRANTS_PER_ITEM, 3, 'tope por parte');
+    const OTHER = (n) => `v3_payload_invalid [LANGUAGE_NOT_NEUTRAL]: experience:c1 voseo «${n}»`;
+    let p = null;
+    const grants = [];
+    // huella A ×3 (2 intentos), huella B ×3 (solo 1 más: total 3), reintento humano, huella B ×2 (0 más).
+    const seq = [[LANG(1, 'a'), 'audiobook_chapter'], [LANG(2, 'a'), 'audiobook_chapter'], [LANG(3, 'a'), 'audiobook_chapter'],
+      ['AUDIOBOOK_SECTION_TOO_SHORT: bloque 1 corto', 'audiobook_chapter'], ['AUDIOBOOK_SECTION_TOO_SHORT: bloque 2 corto', 'audiobook_chapter'], ['AUDIOBOOK_SECTION_TOO_SHORT: bloque 3 corto', 'audiobook_chapter']];
+    for (const [e, t] of seq) { const s = L.ladderStep(p, verdictOf(e, t), t, e, T0, { retryable: true }); grants.push(s.grant); p = s.state; }
+    eq(grants, [false, true, true, false, true, false], 'tercer intento y no más');
+    eq(p.grantsTotal, 3, 'total');
+    p = L.resetRemediationForManualRetry(p, at(20));
+    const s = L.ladderStep(p, verdictOf('AUDIOBOOK_SECTION_TOO_SHORT: bloque 4 corto'), 'audiobook_chapter', 'AUDIOBOOK_SECTION_TOO_SHORT: bloque 4 corto', at(21), { retryable: true });
+    eq([s.action, s.grant, s.state.grantsTotal], ['feedback', false, 3], 'tras el reintento humano: feedback sin intento extra');
+    void OTHER;
+  });
   // ── S: señal agregada «Falla común» ─────────────────────────────────────────
   const remAt = (code, iso, extra = {}) => ({ v: 1, fingerprint: `audiobook_chapter|${code}|validation_invalid|`, code, rule: 'validation_invalid', itemType: 'audiobook_chapter', innerCodes: [], count: 4, rung: 3, firstAt: iso, lastAt: iso, findings: ['«laburo» (regionalismo)'], feedback: 'x', acceptCodes: [], grants: 2, tried: [{ rung: 1, at: iso, outcome: 'failed_same_fingerprint' }], sampleError: LANG(1, 'laburo'), ...extra });
   const rowsFor = (hours) => hours.map((h, i) => ({ courseId: 100 + i, runId: `run-${i}`, itemKey: `audio:ch${i}`, itemType: 'audiobook_chapter', remediation: remAt('AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', at(h * 60).toISOString()) }));
@@ -324,9 +380,58 @@ function fakeQr(row) {
     const ctl = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/admin-runs.controller.ts'), 'utf8');
     assert(/@Get\('common-failures'\)/.test(ctl) && /@Post\('common-failures\/resolve'\)/.test(ctl) && /@SuperAdminOnly\(\)/.test(ctl), 'endpoints de SUPER_ADMIN');
     const svc = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/admin-recovery.service.ts'), 'utf8');
-    assert(/out\.commonFailures = \(await this\.listCommonFailures\(\)\)\.filter\(\(x\) => x\.status === 'active'\)/.test(svc) && /commonFailuresListing\(all === '1' \|\| all === 'true'\)/.test(ctl), 'en needs-attention y en el endpoint');
+    assert(/out\.commonFailures = \(await this\.listCommonFailuresCached\(\)\)\.filter\(\(x\) => x\.status === 'active'\)/.test(svc) && /commonFailuresListing\(all === '1' \|\| all === 'true'\)/.test(ctl), 'en needs-attention y en el endpoint');
     assert(/insert into public\.admin_audit_log/.test(svc) && !/api\.github\.com|octokit|issues/i.test(svc), 'marca en el log; nada hacia afuera');
     assert(/reasonText: REMEDIATION_EXHAUSTED_REASON/.test(svc), 'motivo claro en failedComponents');
+  });
+
+  await check('P2-3/P2-4/P2-5/P2-8 rung 0 no cuenta para «Falla común»; marca de calidad atada al intento; feedback nunca descartado en silencio; sin admin_audit_log → 200 con motivo', async () => {
+    const rows = rowsFor([0, 5, 20]).map((r) => ({ ...r, remediation: { ...r.remediation, count: 1, rung: 0, tried: [] } }));
+    eq(L.commonFailureSignals(rows, new Map(), at(21 * 60)).length, 0, 'rung 0 no cuenta');
+    // P2-4: v3 → la marca es del artifact que se completa; audiolibro → solo bloques cuyo guion aceptado sigue.
+    const sch = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/scheduler.service.ts'), 'utf8');
+    assert(/acc\.quality \? \{ \[QUALITY_KEY\]: withQualityWarning\(undefined, acc\.quality\) \}\s*: item\.output_summary\?\.\[QUALITY_KEY\] \? \{ \[QUALITY_KEY\]: null \} : \{\}/.test(sch), 'v3: sin arrastre');
+    const RP = loadDist('workers/provider-real/real-providers.js');
+    const q = { degraded: true, warnings: [{ code: 'quality_accepted', section: 1, messageId: 'm-old' }, { code: 'quality_accepted', section: 2, messageId: 'm2' }] };
+    eq(RP.pruneAudioQuality(q, { 0: { messageIds: ['m-new'] }, 1: { messageIds: ['m2'] } }).warnings.map((w) => w.messageId), ['m2'], 'bloque regenerado: marca vieja fuera');
+    eq(RP.pruneAudioQuality(q, {}), undefined, 'sin bloques: sin marca');
+    // P2-5: brief lleno → se recorta el brief, el feedback entra.
+    const full = { version: 1, engineVersion: 1, generator: 'experience', directives: [], overridden: [], text: '\n\n── ' + GD.PEDAGOGY_PROMPT_MARKER + ' ──\n' + 'x'.repeat(3990 - 40), textSha256: 'y' };
+    const fb = L.feedbackFor('LANGUAGE_NOT_NEUTRAL', [], ['«laburo»']);
+    const b = GD.withRemediationFeedback(full, { type: 'experience' }, fb);
+    assert(b.text.endsWith(fb) && b.text.length <= GD.PEDAGOGY_BRIEF_TEXT_MAX && b.text.includes(GD.PEDAGOGY_PROMPT_MARKER) && !b.feedbackDropped, 'feedback entra recortando el brief');
+    // P2-8
+    const svc = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/admin-recovery.service.ts'), 'utf8');
+    assert(/to_regclass\('public\.admin_audit_log'\)/.test(svc) && /resolved: false, resolvedAt: null, message:/.test(svc), 'sin la tabla: 200 con motivo');
+    // P2-2: consulta acotada por updated_at y needs-attention con la señal cacheada.
+    assert(/where g\.updated_at >= \$1::timestamptz/.test(svc) && /listCommonFailuresCached\(\)/.test(svc), 'consulta acotada + caché');
+  });
+
+  // ── K: tope del gasto ───────────────────────────────────────────────────────
+  await check('K ≤ MAX_LADDER_GRANTS intentos extra por huella; nunca con pago incierto ni si el emisor dice «no reintentable»', async () => {
+    eq(L.MAX_LADDER_GRANTS, 2, 'tope');
+    const { steps } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c'), LANG(4, 'd'), LANG(5, 'e')]);
+    eq(steps.map((s) => s.grant), [false, true, true, false, false], 'grants');
+    assert(steps.every((s) => s.state.grants <= L.MAX_LADDER_GRANTS), 'acotado');
+    const { steps: nr } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c')], 'audiobook_chapter', { retryable: false });
+    assert(nr.every((s) => !s.grant), 'no reintentable → sin intentos extra');
+    const v = { ...verdictOf(LANG(1, 'a')), paidRisk: 'uncertain' };
+    assert(L.ladderStep(null, v, 'audiobook_chapter', LANG(1, 'a'), T0, { retryable: true }) === null, 'pago incierto → fuera de la escalera (decide la conciliación)');
+    const src = fs.readFileSync(path.join(REPO, 'src/workers/provider-real/real-providers.ts'), 'utf8');
+    // Cada intento del guion sigue pasando por guard → reserva → llamada (presupuesto de la parte, tope del run).
+    assert(/if \(!\(await guard\(deps, item, 'anthropic', llmCallEstimate\(scriptModel/.test(src) && /reservePaidCall\(deps\.finops/.test(src), 'guards de gasto por llamada');
+  });
+  await check('K un fallo transitorio en el medio no reinicia la cuenta; otra huella sí (y la anterior queda en `previous`)', async () => {
+    let prev = null;
+    const steps = [];
+    for (const [e, t] of [[LANG(1, 'a'), 'audiobook_chapter'], ['lease_expired', 'audiobook_chapter'], [LANG(2, 'b'), 'audiobook_chapter']]) {
+      const s = L.ladderStep(prev, verdictOf(e, t), t, e, T0, { retryable: true });
+      if (s) { prev = s.state; steps.push(s.action); }
+    }
+    eq(steps, ['observe', 'feedback'], 'lease_expired no cuenta');
+    const other = 'AUDIOBOOK_SECTION_TOO_SHORT: el guion del bloque 2 quedó con 40 palabras';
+    const s = L.ladderStep(prev, verdictOf(other), 'audiobook_chapter', other, at(3), { retryable: true });
+    eq([s.action, s.state.count, s.state.previous.length, s.state.previous[0].rung], ['observe', 1, 1, 1], 'huella nueva');
   });
 
   // ── P: marca de calidad en el informe del paquete ───────────────────────────

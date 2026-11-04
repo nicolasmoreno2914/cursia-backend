@@ -11,6 +11,8 @@ import {
 /** r98: acción/target de la marca «resuelto» de una Falla común en admin_audit_log. */
 export const COMMON_FAILURE_RESOLVE_ACTION = 'common_failure.resolve';
 export const COMMON_FAILURE_TARGET_TYPE = 'failure_fingerprint';
+/** r98 (review P2-2): vigencia de la señal cacheada para needs-attention. */
+export const COMMON_FAILURES_CACHE_MS = 5 * 60_000;
 
 /**
  * EV6 DoD BE-B — cola de recuperación de admin (SOLO LECTURA).
@@ -235,7 +237,8 @@ export class AdminRecoveryService {
     }
     await this.addPendingReservations(out, opts.reservationRuns);
     try {
-      out.commonFailures = (await this.listCommonFailures()).filter((x) => x.status === 'active');
+      // Review P2-2: la carga de needs-attention usa la señal CACHEADA (≤ 5 min); el endpoint dedicado la recalcula.
+      out.commonFailures = (await this.listCommonFailuresCached()).filter((x) => x.status === 'active');
     } catch (err) {
       this.logger.warn(`needs-attention: no se pudo calcular «Falla común»: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
     }
@@ -253,7 +256,8 @@ export class AdminRecoveryService {
       `select g.job_id, g.item_key, g.type, g.output_summary->'remediation' as remediation, pj.course_id
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
-        where jsonb_typeof(g.output_summary->'remediation') = 'object'
+        where g.updated_at >= $1::timestamptz
+          and jsonb_typeof(g.output_summary->'remediation') = 'object'
           and (g.output_summary->'remediation'->>'lastAt') >= $1
         order by g.updated_at desc nulls last
         limit 5000`,
@@ -269,6 +273,17 @@ export class AdminRecoveryService {
   async commonFailuresListing(includeResolved = false): Promise<{ generatedAt: string; commonFailures: CommonFailureSignal[] }> {
     const list = await this.listCommonFailures();
     return { generatedAt: new Date().toISOString(), commonFailures: includeResolved ? list : list.filter((x) => x.status === 'active') };
+  }
+
+  private commonFailuresCache: { at: number; list: CommonFailureSignal[] } | null = null;
+
+  /** r98 (review P2-2): la señal para la carga de needs-attention, recalculada como mucho cada COMMON_FAILURES_CACHE_MS. */
+  async listCommonFailuresCached(now: Date = new Date()): Promise<CommonFailureSignal[]> {
+    const c = this.commonFailuresCache;
+    if (c && now.getTime() - c.at < COMMON_FAILURES_CACHE_MS) return c.list;
+    const list = await this.listCommonFailures(now);
+    this.commonFailuresCache = { at: now.getTime(), list };
+    return list;
   }
 
   /** Marcas «resuelto» de admins (admin_audit_log, append-only). Sin la tabla (entorno sin r75) → ninguna. */
@@ -288,10 +303,16 @@ export class AdminRecoveryService {
   }
 
   /** r98: marca una «Falla común» como resuelta (acción explícita de un SUPER_ADMIN; queda en admin_audit_log). */
-  async resolveCommonFailure(fingerprint: string, actor: { id: string; email?: string | null }, note?: string | null): Promise<{ fingerprint: string; resolvedAt: string }> {
+  async resolveCommonFailure(fingerprint: string, actor: { id: string; email?: string | null }, note?: string | null): Promise<{ fingerprint: string; resolved: boolean; resolvedAt: string | null; message?: string }> {
     const fp = String(fingerprint ?? '').trim();
     if (!fp || fp.length > 200) throw new BadRequestException('fingerprint requerido (≤ 200 caracteres)');
     const at = new Date().toISOString();
+    // Review P2-8: sin admin_audit_log (entorno sin r75, p. ej. producción hoy) no hay dónde guardar la marca: respuesta
+    // clara (200, resolved:false); la falla se resuelve sola tras 72 h sin aparecer.
+    const [probe] = await this.dataSource.query(`select to_regclass('public.admin_audit_log') is not null as ok`).catch(() => [{ ok: false }]);
+    if (!probe?.ok) {
+      return { fingerprint: fp, resolved: false, resolvedAt: null, message: 'No se pudo guardar la marca «resuelto» en este entorno (falta el registro de auditoría). La falla se marca resuelta sola cuando pasan 72 h sin aparecer.' };
+    }
     try {
       await this.dataSource.query(
         `insert into public.admin_audit_log (at, actor_id, actor_email, actor_is_superadmin, action, target_type, target_id, after)
@@ -301,7 +322,8 @@ export class AdminRecoveryService {
     } catch (err) {
       throw new ServiceUnavailableException(`common_failure_resolve_unavailable: no se pudo registrar la marca (${err instanceof Error ? err.message.slice(0, 120) : String(err)})`);
     }
-    return { fingerprint: fp, resolvedAt: at };
+    this.commonFailuresCache = null;
+    return { fingerprint: fp, resolved: true, resolvedAt: at };
   }
 
   /**

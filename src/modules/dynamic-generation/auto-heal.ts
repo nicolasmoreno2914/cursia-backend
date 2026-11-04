@@ -49,7 +49,7 @@ import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 import { remainingAudioStrategies } from '../../package/audio/audiobook-policy';
 import { PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 // REL MVP: la decisión por clase usa el clasificador central (import circular seguro: solo se usa en llamadas).
-import { FailureSource, classifyFailure } from '../reliability/failure-classifier';
+import { FailureSource, FailureVerdict, classifyFailure } from '../reliability/failure-classifier';
 
 export const AUTO_HEAL_ENABLED_ENV = 'DYNAMIC_AUTO_HEAL_ENABLED';
 export const AUTO_HEAL_INTERVAL_ENV = 'DYNAMIC_AUTO_HEAL_INTERVAL_MS';
@@ -349,6 +349,22 @@ export const AUTO_REGEN_WORKER_CODES: Readonly<Record<string, readonly string[]>
 /** Estrategias B que la reapertura resuelve (regenerar el MISMO item); regenerate_dependency necesita otro item. */
 const AUTO_REGEN_STRATEGIES: readonly string[] = Object.freeze(['regenerate_targeted', 'regenerate_split']);
 
+/**
+ * r98 (review P0-1): ¿la regeneración automática PROPIA de la clase B ya se usó (o no aplica) para este fallo? Misma
+ * elegibilidad que classAwareDecision (política por clase, tipo de worker con su lista, estrategia que regenera) y el
+ * mismo tope (autoRegenMaxRoundsFor). La escalera de remediación solo se agota cuando esto es true.
+ */
+export function autoRegenSpentFor(
+  row: { type?: string | null; output_summary?: Record<string, any> | null },
+  v: Pick<FailureVerdict, 'class' | 'code' | 'strategy'>,
+  policy: AutoHealPolicy = autoHealPolicyFromEnv(process.env),
+): boolean {
+  if (!policy.classAware || v.class !== 'B') return true;
+  if (row.type && AUTO_HEAL_WORKER_ITEM_TYPES.includes(row.type) && !(AUTO_REGEN_WORKER_CODES[row.type] ?? []).includes(v.code)) return true;
+  if (!AUTO_REGEN_STRATEGIES.includes(v.strategy)) return true;
+  return autoRegenRoundsOf(row.output_summary) >= autoRegenMaxRoundsFor(row.type, v.code, policy);
+}
+
 function sourceOfType(type: string | null | undefined): FailureSource | null {
   if (!type) return null;
   if (type === 'video') return 'video_worker';
@@ -451,7 +467,12 @@ export function isAutoHealDenied(error: string): boolean {
 
 /** Decisión pura: ¿se reabre automáticamente este item ahora? */
 export function autoHealDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): AutoHealDecision {
-  if (row.status === 'failed' && remediationBlocksAuto(row.output_summary, row.error)) return { heal: false, reason: 'remediation_exhausted' };
+  // r98: escalera agotada con ESTE error → no se reabre sola. Review P0-1: nunca antes de que la clase B use sus propias
+  // rondas de auto-regeneración (regenerate_split / regenerate_targeted ya cambian la entrada).
+  if (row.status === 'failed' && remediationBlocksAuto(row.output_summary, row.error)
+    && autoRegenSpentFor(row, classifyFailure({ source: sourceOfType(row.type), itemType: row.type ?? null, error: String(row.error ?? ''), outputSummary: row.output_summary ?? {} }), policy)) {
+    return { heal: false, reason: 'remediation_exhausted' };
+  }
   if (policy.classAware) return classAwareDecision(row, now, policy);
   if (row.status !== 'failed') return { heal: false, reason: 'not_failed' };
   const error = String(row.error ?? '').trim();

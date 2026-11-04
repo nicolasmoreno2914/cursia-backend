@@ -154,8 +154,6 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     return { state: 'pending_retry', reason: 'dependency_blocked', nextRetryAt: null, automatic: true };
   }
   if (status !== 'failed') return { state: null, reason: null, nextRetryAt: null, automatic: false };
-  // r98: escalera agotada con ESTE error → ningún barrido la toma; el dueño puede reintentar (owner-retry.ts).
-  if (remediationBlocksAuto(os, error)) return { state: 'failed_no_strategies', reason: REMEDIATION_EXHAUSTED_CODE, nextRetryAt: null, automatic: false };
 
   const cur = error ? currentRecoveryOf(error, row.type ?? null, os, row.failure_class ?? null, row.run_created_at ?? null) : 'manual';
   // Una fecha persistida VENCIDA no cuenta como «programada» (ningún barrido la tomó): solo la decisión vigente.
@@ -171,6 +169,9 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
   if (cur === 'provider_reconcile' || cur === 'ambiguous_audio_resubmit') {
     return { state: 'waiting_financial_reconciliation', reason: cur, nextRetryAt: iso(at), automatic: true };
   }
+  // r98: escalera agotada con ESTE error → ningún barrido la toma; el dueño puede reintentar (owner-retry.ts). Va DESPUÉS
+  // de la conciliación (review P1-2): un pago incierto lo sigue decidiendo la conciliación.
+  if (remediationBlocksAuto(os, error)) return { state: 'failed_no_strategies', reason: REMEDIATION_EXHAUSTED_CODE, nextRetryAt: null, automatic: false };
   if (cur === 'auto_heal' || cur === 'auto_regenerate' || cur === 'safe_auto_retry' || cur === 'spend_control_resume') {
     // Espera EXPIRADA solo cuando el propio barrido que la tomaría lo dice explícitamente (auto-heal / reintento seguro:
     // too_old o ventana total agotada). r67 fix round 1 (F3): el control de gasto (espera su reversión) y el claim

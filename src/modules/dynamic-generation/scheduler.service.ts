@@ -1134,7 +1134,10 @@ export class SchedulerService {
       const biasPatch = pre.kind === 'valid' && pre.answerBiasSignals
         ? { answerBias: { ...(isPlainObject(summary.answerBias) ? summary.answerBias : {}), signals: pre.answerBiasSignals } }
         : {};
-      const qualityPatch = acc.quality ? { [QUALITY_KEY]: withQualityWarning(item.output_summary?.[QUALITY_KEY], acc.quality) } : {};
+      // Review P2-4: la marca es del artifact que se completa AHORA (validado en este intento): una marca de un intento o
+      // generación anterior nunca sobrevive a un artifact nuevo aceptado sin degradar.
+      const qualityPatch = acc.quality ? { [QUALITY_KEY]: withQualityWarning(undefined, acc.quality) }
+        : item.output_summary?.[QUALITY_KEY] ? { [QUALITY_KEY]: null } : {};
       const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...biasPatch, ...validationPatch, ...qualityPatch, artifactIds: ids });
       if (merged.ok === false) throw new GuardRejection(merged.reason);
 

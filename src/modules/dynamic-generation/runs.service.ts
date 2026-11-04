@@ -232,6 +232,7 @@ import {
 } from '../reliability/provider-probe';
 import { ItemCostView, ItemRecoveryView, loadItemCosts, recoveryViewOf } from './item-recovery-view';
 import { RunRecoveryView, recoveryStateOf, runRecoveryStateOf } from '../reliability/recovery-state';
+import { remediationOf, resetRemediationForManualRetry } from '../reliability/remediation-ladder';
 import { nextRecoveryEntry } from './item-transitions';
 import { usd2 } from '../finops/usd-display';
 
@@ -3339,6 +3340,9 @@ export class RunsService {
         }
         r67LadderReset = { audioRetryStrategy: ladder, audioLadderResets: resets.slice(-20) };
       }
+      // r98 (review P1-3): un reintento HUMANO abre un ciclo nuevo de la escalera de remediación (count=1; feedback,
+      // `previous` y el tope total de intentos de la parte se conservan). Las reaperturas automáticas no la tocan.
+      const remediationReset = !auto ? resetRemediationForManualRetry(remediationOf(target.output_summary), auto?.now ?? new Date()) : null;
       // r67 (A3): estado explícito de la reapertura (pending_retry) + historial acotado, en la MISMA escritura.
       const r67Reason = auto ? (auto.policy.classAware && autoMeta?.strategy ? `auto_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}` : 'auto') : 'manual_retry';
       const r67Recovery = nextRecoveryEntry(target.output_summary?.recovery, { state: 'pending_retry', reason: r67Reason.slice(0, 64), nextRetryAt: null, automatic: true },
@@ -3361,7 +3365,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery, ...(r67LadderReset ?? {}) }), lostResultResend, JSON.stringify(lostResultUnits)],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery, ...(r67LadderReset ?? {}), ...(remediationReset ? { remediation: remediationReset } : {}) }), lostResultResend, JSON.stringify(lostResultUnits)],
         ),
       );
       if (updated.length !== 1) {

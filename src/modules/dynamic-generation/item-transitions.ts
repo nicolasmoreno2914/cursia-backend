@@ -8,7 +8,7 @@ import { AttemptOutcome, failureAttentionOf, outcomeForFailure, recordItemFailur
 import type { HumanReason } from '../reliability/failure-classifier';
 // r67 (A3): máquina de estados de recuperación (persistida en output_summary.recovery + next_retry_at).
 import { RecoveryStateView, recoveryStateOf, scheduledRetryAtOf } from '../reliability/recovery-state';
-import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoHealPolicyFromEnv, autoRegenMaxRoundsFor } from './auto-heal';
+import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoRegenSpentFor, autoHealPolicyFromEnv, autoRegenMaxRoundsFor } from './auto-heal';
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 import { applyStopAfterInTx, holdsPackaging, packageHoldReason } from './stop-after';
 import { LadderStep, REMEDIATION_KEY, ladderStep, remediationOf } from '../reliability/remediation-ladder';
@@ -196,7 +196,11 @@ export async function applyRemediationLadder(
   verdict: ReturnType<typeof classifyFailure>,
   now: Date = new Date(),
 ): Promise<LadderStep | null> {
-  const step = ladderStep(remediationOf(row.output_summary), verdict, row.type, error, now, { retryable: retryable && row.status === 'failed' });
+  const step = ladderStep(remediationOf(row.output_summary), verdict, row.type, error, now, {
+    retryable: retryable && row.status === 'failed',
+    // Review P0-1: la escalera no se agota mientras la auto-regeneración propia de la clase B tenga rondas.
+    autoRegenSpent: autoRegenSpentFor(row, verdict),
+  });
   if (!step) return null;
   let status = row.status;
   if (step.grant && row.status === 'failed') {
