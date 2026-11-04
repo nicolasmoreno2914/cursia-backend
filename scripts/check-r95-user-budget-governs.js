@@ -52,11 +52,13 @@ async function pureChecks() {
     eq([dec(g.policy.limits.maxCostPerRun), dec(g.policy.limits.maxCostPerCourse), dec(g.policy.limits.ownerMonthlyCap), dec(g.policy.limits.monthlyCap)], [300, 300, 300, 10000], 'topes sustituidos por el disponible; monthlyCap intacto');
     eq([g.policy.id, g.policy.version], ['p1', 1], 'misma política (huella estable)');
   });
-  await check('PURA el monto a autorizar (máximo del estimado) tiene que caber en el disponible: esperado 170, máximo 400, disponible 300 → no aplica (admin); con disponible 400 → aplica por 400', async () => {
-    const g = gov({ estimate: est(170, 400) });
-    eq([g.applies, g.why], [false, 'still_requires_admin'], 'máximo > disponible: no se firma por encima de lo disponible');
-    const g2 = gov({ estimate: est(170, 400), ub: ub(400) });
-    eq([g2.applies, dec(g2.plan.amount)], [true, 400], 'cabe justo');
+  await check('PURA el monto a autorizar (tope de seguridad r90 = esperado × 1,5, no el máximo p90) tiene que caber en el disponible: esperado 170, máximo 400 → tope 255; disponible 200 → no aplica (admin); disponible 255 → aplica por 255', async () => {
+    const g = gov({ estimate: est(170, 400), ub: ub(200) });
+    eq([g.applies, g.why], [false, 'still_requires_admin'], 'tope > disponible: no se firma por encima de lo disponible');
+    const g2 = gov({ estimate: est(170, 400), ub: ub(255) });
+    eq([g2.applies, dec(g2.plan.amount)], [true, 255], 'cabe justo (el máximo 400 ya no manda)');
+    const g3 = gov({ estimate: est(170, 400) });
+    eq([g3.applies, dec(g3.plan.amount)], [true, 255], 'disponible 300: el máximo 400 ya no bloquea');
   });
   await check('PURA no cabe en el disponible (esperado 170 > disponible 100) → no aplica (queda en admin / «Solicitar autorización»)', async () => {
     const g = gov({ estimate: est(170, 255), ub: ub(100) });
@@ -128,7 +130,7 @@ async function dbChecks() {
       assert(pv.reasons.includes('user_budget_governs'), 'motivo');
       assert(Number(pv.estimate.expected) > 0.0001, 'el estimado supera el tope global');
       assert(Number(pv.approval.amount) <= 50 && Number(pv.approval.amount) >= Number(pv.estimate.expected), `monto ${pv.approval.amount}`);
-      eq(dec(pv.approval.amount), dec(pv.estimate.max), 'monto = máximo (cabe en 50)');
+      eq(dec(pv.approval.amount), dec(pv.estimate.safetyCap), 'monto = tope de seguridad (cabe en 50)');
       eq([pv.userBudget.sufficient, dec(pv.userBudget.requiredUsd)], [true, dec(pv.approval.amount)], 'userBudget');
       yes.pv = pv;
     });

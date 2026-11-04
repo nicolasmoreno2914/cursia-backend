@@ -78,7 +78,7 @@ async function rejects(p, re, msg, status) {
       const it = res.items.find((x) => x.courseId === C.cid);
       assert(it, 'en la bandeja: ' + JSON.stringify(res.items));
       eq([it.courseTitle, it.ownerEmail, it.ownerId, it.reason, it.currency], ['Curso de Yeremy', 'yeremy@cliente.test', OWNER, 'approval_forbidden', 'USD'], 'datos');
-      eq([Number(it.expected), Number(it.max), Number(it.suggestedAmount), it.safetyCap], [Number(pv.estimate.expected), Number(pv.estimate.max), Number(pv.estimate.max), null], 'montos');
+      eq([Number(it.expected), Number(it.max), Number(it.suggestedAmount), Number(it.safetyCap)], [Number(pv.estimate.expected), Number(pv.estimate.max), Number(pv.estimate.safetyCap), Number(pv.estimate.safetyCap)], 'montos (r90: se sugiere aprobar el tope de seguridad, no el máximo p90)');
       assert(/^[0-9a-f-]{36}$/.test(it.estimateId) && !isNaN(Date.parse(it.createdAt)), 'estimateId/fecha');
       pending = it;
       const aud = await auditOf('finops.pending_approvals_view');
