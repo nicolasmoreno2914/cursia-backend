@@ -11,7 +11,7 @@
 //      del ejecutor / guion del audiolibro) y UN intento más aunque se hubieran agotado;
 //   R2 rung 2: 3.er fallo con huella degradable (lista corta explícita) → el próximo intento acepta con marca de calidad
 //      (guion del audiolibro, validación v3 del servidor, ejecutor del navegador); nada estructural degrada;
-//   R3 rung 3: no degradable o persiste → `failed` sin reintentos automáticos con esa huella (auto-heal, reintento seguro,
+//   R3 rung 3: no degradable o persiste → sin intentos extra ni reaperturas automáticas con esa huella (auto-heal, reintento seguro,
 //      estado de recuperación) y con motivo claro; el DUEÑO puede reintentar (owner-retry), con los guards de dinero;
 //   K  tope: ≤ MAX_LADDER_GRANTS intentos extra por huella; nunca con pago incierto ni si el emisor dice no reintentable;
 //   S  señal agregada «Falla común»: ≥ 3 cursos en 24 h; reporte para desarrollo (huella, fechas, cursos/runs, ejemplos
@@ -98,7 +98,8 @@ function fakeQr(row) {
   });
   await check('C2 NO deterministas: lease_expired, llm_transient, budget (D budget), config del proveedor (wait_provider), audio con escalera propia', async () => {
     for (const [e, t] of [['lease_expired', 'content'], ['llm_transient: HTTP 529 overloaded', 'content'], ['item_recovery_budget_exhausted: tope de la parte', 'content'],
-      ['tts_failed: chunk 1/3: HTTP 429 insufficient_quota', 'audiobook_chapter'], ['AUDIO_WPM_OUT_OF_RANGE: el segmento seg-1 narra 343 palabras', 'audiobook_chapter']]) {
+      ['tts_failed: chunk 1/3: HTTP 429 insufficient_quota', 'audiobook_chapter'], ['AUDIO_WPM_OUT_OF_RANGE: el segmento seg-1 narra 343 palabras', 'audiobook_chapter'],
+      ['EXAM_BANK_INCOMPLETE: hoja corta', 'exam']]) {
       const v = FC.classifyFailure({ error: e, itemType: t, source: t === 'content' ? 'browser_executor' : 'provider_worker', outputSummary: {} });
       assert(!L.isDeterministicVerdict(v), `${e} no debería ser determinista (${v.class}/${v.strategy}/${v.humanReason})`);
       assert(L.ladderStep(null, v, t, e, T0, { retryable: true }) === null, `${e}: la escalera no lo toca`);
@@ -197,7 +198,7 @@ function fakeQr(row) {
   });
 
   // ── R3: agotada ─────────────────────────────────────────────────────────────
-  await check('R3 no degradable al 3.er fallo (o degradable al 4.º) → exhausted; la parte `retrying` pasa a `failed`', async () => {
+  await check('R3 no degradable al 3.er fallo (o degradable al 4.º) → exhausted, sin intentos extra', async () => {
     const e = 'v3_payload_invalid [JSON_INVALID]: experience:c1 el artifact no es JSON';
     const { steps } = run([e, e, e], 'experience');
     eq(steps.map((s) => s.action), ['observe', 'feedback', 'exhausted'], 'no degradable');
@@ -205,10 +206,11 @@ function fakeQr(row) {
     eq(s4.map((s) => s.action), ['observe', 'feedback', 'accept', 'exhausted'], 'degradable que persiste');
     const st = s4[3].state;
     assert(st.exhaustedError === LANG(4, 'd') && st.tried.some((t) => t.rung === 2 && t.outcome === 'failed_same_fingerprint') && st.tried.some((t) => t.rung === 3), JSON.stringify(st.tried));
-    const row = { id: 'r1', status: 'retrying', type: 'audiobook_chapter', attempt_count: 1, max_attempts: 3, output_summary: { remediation: s4[2].state } };
+    // Sin intentos extra: una parte `failed` queda `failed`; una `retrying` termina sus intentos propios (default 3).
+    const row = { id: 'r1', status: 'failed', type: 'audiobook_chapter', attempt_count: 3, max_attempts: 3, output_summary: { remediation: s4[2].state } };
     const qr = fakeQr(row);
     const step = await IT.applyRemediationLadder(qr, row, LANG(5, 'e'), true, verdictOf(LANG(5, 'e')), at(9));
-    eq([step.action, row.status], ['exhausted', 'failed'], 'retrying → failed');
+    eq([step.action, step.grant, row.status, row.max_attempts], ['exhausted', false, 'failed', 3], 'sin intento extra');
   });
   await check('R3 ningún mecanismo automático la reabre (auto-heal por clase y legado, reintento seguro); estado failed_no_strategies / remediation_exhausted', async () => {
     const { state } = run([LANG(1, 'a'), LANG(2, 'b'), LANG(3, 'c'), LANG(4, 'd')]);
@@ -322,7 +324,7 @@ function fakeQr(row) {
     const ctl = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/admin-runs.controller.ts'), 'utf8');
     assert(/@Get\('common-failures'\)/.test(ctl) && /@Post\('common-failures\/resolve'\)/.test(ctl) && /@SuperAdminOnly\(\)/.test(ctl), 'endpoints de SUPER_ADMIN');
     const svc = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/admin-recovery.service.ts'), 'utf8');
-    assert(/out\.commonFailures = \(await this\.listCommonFailures\(\)\)\.filter\(\(x\) => x\.status === 'active'\)/.test(svc), 'en needs-attention');
+    assert(/out\.commonFailures = \(await this\.listCommonFailures\(\)\)\.filter\(\(x\) => x\.status === 'active'\)/.test(svc) && /commonFailuresListing\(all === '1' \|\| all === 'true'\)/.test(ctl), 'en needs-attention y en el endpoint');
     assert(/insert into public\.admin_audit_log/.test(svc) && !/api\.github\.com|octokit|issues/i.test(svc), 'marca en el log; nada hacia afuera');
     assert(/reasonText: REMEDIATION_EXHAUSTED_REASON/.test(svc), 'motivo claro en failedComponents');
   });

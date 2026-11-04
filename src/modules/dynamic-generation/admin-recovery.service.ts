@@ -265,6 +265,12 @@ export class AdminRecoveryService {
     return commonFailureSignals(input, await this.commonFailureResolutions(), now);
   }
 
+  /** r98: respuesta de GET /admin/dynamic-runs/common-failures (activas; `includeResolved` también las resueltas). */
+  async commonFailuresListing(includeResolved = false): Promise<{ generatedAt: string; commonFailures: CommonFailureSignal[] }> {
+    const list = await this.listCommonFailures();
+    return { generatedAt: new Date().toISOString(), commonFailures: includeResolved ? list : list.filter((x) => x.status === 'active') };
+  }
+
   /** Marcas «resuelto» de admins (admin_audit_log, append-only). Sin la tabla (entorno sin r75) → ninguna. */
   private async commonFailureResolutions(): Promise<Map<string, string>> {
     const out = new Map<string, string>();

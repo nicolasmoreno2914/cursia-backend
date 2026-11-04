@@ -16,8 +16,9 @@
 //   3.ª vez  → accept:   rung 2 — SOLO validadores de calidad no críticos (DEGRADABLE_CODES): el próximo intento acepta
 //                         la salida con una marca de calidad (output_summary.quality) y el curso sigue y se empaqueta.
 //              exhausted si la huella no es degradable.
-//   4.ª vez+ → exhausted: rung 3 — sin más reintentos automáticos con esa huella: `failed` con un motivo claro para el
-//                         usuario; el DUEÑO puede reintentar desde su pantalla (owner-retry.ts), sin admin.
+//   4.ª vez+ → exhausted: rung 3 — sin intentos extra ni reaperturas automáticas con esa huella (los intentos propios
+//                         de la parte se terminan de usar); `failed` con un motivo claro; el DUEÑO puede reintentar
+//                         desde su pantalla (owner-retry.ts), sin admin.
 // Gasto: los intentos extra (≤ MAX_LADDER_GRANTS por huella) pasan por los guards de siempre (presupuesto de la parte,
 // tope del run, autorización vigente). Ninguna aprobación nueva.
 // Puro salvo el reloj.
@@ -93,6 +94,8 @@ export interface RemediationState {
  */
 export const SELF_ADAPTIVE_CODES: readonly string[] = Object.freeze([
   'AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'TTS_AUDIO_INVALID', 'AUDIO_STRATEGIES_EXHAUSTED', 'AUDIOBOOK_SCRIPT_REPETITION',
+  // Banco de examen incompleto: cada intento reanuda desde el borrador guardado (output_summary.examBankDraft) y avanza.
+  'EXAM_BANK_INCOMPLETE',
 ]);
 
 /** ¿El veredicto describe un fallo DETERMINISTA (misma entrada → mismo rechazo)? */
@@ -126,7 +129,7 @@ export function feedbackFor(code: string, innerCodes: readonly string[], finding
   const list = findings.length ? findings.join('; ') : '(sin detalle)';
   const lines: string[] = ['CORRECCIÓN OBLIGATORIA (el intento anterior fue rechazado dos veces por la misma causa):'];
   if ([...codes].some((c) => /LANGUAGE_NOT_NEUTRAL$/.test(c))) {
-    lines.push(`- Escribe en español latinoamericano neutro (tuteo «tú»; sin voseo, sin «vosotros», sin regionalismos). Evita estos términos: ${list}; si son parte del contenido del curso, cítalos entre comillas.`);
+    lines.push(`- Escribe en español latinoamericano neutro (tuteo «tú», «ustedes» para el plural; sin voseo ni regionalismos). Evita estos términos: ${list}; si son parte del contenido del curso, cítalos entre comillas.`);
   } else if ([...codes].some((c) => /^(CONTENT_TRUTH|FABRICATED_DATA|OUTDATED_CLAIM|QUANTITY_CLAIM)/.test(c))) {
     lines.push(`- No uses cifras, fechas, estudios ni datos que no estén en la fuente. Hallazgos: ${list}.`);
   } else {

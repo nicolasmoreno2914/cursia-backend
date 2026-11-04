@@ -58,9 +58,8 @@ export class AdminDynamicRunsController {
   // r98 — GET /api/v1/admin/dynamic-runs/common-failures — «Falla común»: misma huella de fallo determinista en ≥ 3
   // cursos dentro de 24 h, con el reporte listo para desarrollo (`report`, Markdown). ?all=1 incluye las resueltas.
   @Get('common-failures')
-  async commonFailures(@Query('all') all?: string) {
-    const list = await this.recovery.listCommonFailures();
-    return { generatedAt: new Date().toISOString(), commonFailures: all === '1' || all === 'true' ? list : list.filter((x) => x.status === 'active') };
+  commonFailures(@Query('all') all?: string) {
+    return this.recovery.commonFailuresListing(all === '1' || all === 'true');
   }
 
   // r98 — POST /api/v1/admin/dynamic-runs/common-failures/resolve  Body {fingerprint, note?}: marca «resuelto» (acción

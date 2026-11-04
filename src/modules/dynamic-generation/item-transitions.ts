@@ -186,7 +186,7 @@ export async function applyItemFailure(
  * Muta `row` (status / output_summary) para que el estado de recuperación y el bloqueo de dependientes vean el resultado.
  *  - feedback / accept con la parte `failed` por intentos agotados → UN intento más (`retrying`, ≤ MAX_LADDER_GRANTS por
  *    huella), con el backoff base; el intento pasa por los guards de gasto de siempre;
- *  - exhausted con la parte todavía `retrying` → `failed` (ningún reintento automático más con esa huella).
+ *  - exhausted → ningún intento extra ni reapertura automática con esa huella (los intentos propios se terminan de usar).
  */
 export async function applyRemediationLadder(
   qr: QueryRunner,
@@ -208,15 +208,10 @@ export async function applyRemediationLadder(
       [row.id, RETRY_BASE_SECONDS],
     );
     status = 'retrying';
-  } else if (step.action === 'exhausted' && row.status === 'retrying') {
-    await qr.query(
-      `update public.generation_item_runs
-          set status = 'failed', next_retry_at = null, finished_at = now()
-        where id = $1 and status = 'retrying'`,
-      [row.id],
-    );
-    status = 'failed';
   }
+  // exhausted: sin intentos extra ni reaperturas automáticas (auto-heal / reintento seguro: remediationBlocksAuto). Los
+  // intentos que la parte ya tenía (max_attempts, default 3) se terminan de usar —siguen llevando el pedido corregido—
+  // y al agotarse queda `failed`; el dueño la reintenta desde su pantalla.
   await qr.query(
     `update public.generation_item_runs
         set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${REMEDIATION_KEY}', $2::jsonb)
