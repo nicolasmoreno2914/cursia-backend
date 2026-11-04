@@ -1,4 +1,4 @@
-import { lqaFindings, lqaFixText, lqaHitLabel, lqaLanguageRule } from '../../modules/language-qa/language-qa';
+import { lqaFindings, lqaFixText, lqaHitLabel, lqaIsLanguageCourse, lqaLanguageRule } from '../../modules/language-qa/language-qa';
 // ─────────────────────────────────────────────────────────────────────────────
 // Cursia V2.1 F2 — guiones de audio de un run rulesVersion 3.
 //
@@ -532,6 +532,13 @@ function ratioOf(words: number, source: number): number {
  * AUDIOBOOK_SECTION_PADDED. Todos reintentables con resultado CONOCIDO (cada
  * llamada queda medida; los bloques ya aceptados no se repagan).
  */
+/** r92: hallazgos de Language QA del guion que sí bloquean (pura). */
+export function audioLanguageFindings(script: string, sourceText: string, input: Pick<ChapterScriptInput, 'courseTitle' | 'sector'>): ReturnType<typeof lqaFindings> {
+  if (lqaIsLanguageCourse({ nombre: input.courseTitle, sector: input.sector ?? undefined })) return [];
+  const source = String(sourceText ?? '').toLowerCase();
+  return lqaFindings(script, 3).filter((h: any) => !(h && h.term && source.includes(String(h.term).toLowerCase())));
+}
+
 export async function generateSectionScript(
   input: ChapterScriptInput,
   section: AudiobookSourceSection,
@@ -592,7 +599,9 @@ export async function generateSectionScript(
     );
   }
   // Language QA: lo que no se corrige solo (regionalismos, «vosotros») no se narra (reintentable).
-  const lang = lqaFindings(text, 3);
+  // r92: cursos de lengua/literatura citan regionalismos a propósito (misma exención que el contenido, scheduler) y un
+  // término que ya trae el texto fuente del bloque es un ejemplo del capítulo, no un modismo del narrador.
+  const lang = audioLanguageFindings(text, section.text, input);
   if (lang.length) {
     throw new AudioScriptError('AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} no está en español neutro: ${lang.map((h) => lqaHitLabel(h)).join('; ')}`, true);
   }
