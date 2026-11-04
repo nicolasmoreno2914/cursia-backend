@@ -736,7 +736,7 @@ export async function processV3PackageJob(
       manifest: manifest.manifest as any,
       blueprint: snapshot as any,
       contents: loaded.contents as any,
-      packageWarnings: [...built.summary.warnings, ...(built.summary.qualityWarnings ?? [])],
+      packageWarnings: [...built.summary.warnings, ...(built.summary.qualityWarnings ?? []), ...qualityAcceptedWarnings(prepared.byItem)],
       practiceResources: built.summary.practiceResources ?? null,
       practiceTitles: titles,
       hoursReport: (built.expectations.facts as any).hoursReport ?? null,
@@ -846,6 +846,21 @@ export function packageDeclaredHours(snapshot: BlueprintSnapshotV2): number | nu
  */
 export function packageDeclaredHoursSource(snapshot: BlueprintSnapshotV2): 'document' | null {
   return packageDeclaredHours(snapshot) !== null && (snapshot?.course as Record<string, unknown> | undefined)?.['targetHoursSource'] === 'document' ? 'document' : null;
+}
+
+/**
+ * r98 (escalera de remediación, rung 2): partes aceptadas con marca de calidad (`output_summary.quality.warnings`) →
+ * avisos `quality_accepted:<itemKey>:<códigos>` del informe de calidad del paquete. Nunca bloquean. Exportado para tests.
+ */
+export function qualityAcceptedWarnings(byItem: Map<string, { itemKey: string; outputSummary?: Record<string, any> | null }>): string[] {
+  const out: string[] = [];
+  for (const it of byItem.values()) {
+    const ws = it.outputSummary?.quality?.warnings;
+    if (!Array.isArray(ws) || !ws.length) continue;
+    const codes = [...new Set(ws.flatMap((w: any) => (Array.isArray(w?.codes) ? w.codes.map(String) : [])))].sort();
+    out.push(`quality_accepted:${it.itemKey}:${codes.join(',') || 'quality'}`);
+  }
+  return out.sort();
 }
 
 /**

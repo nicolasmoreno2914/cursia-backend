@@ -232,6 +232,7 @@ import {
 } from '../reliability/provider-probe';
 import { ItemCostView, ItemRecoveryView, loadItemCosts, recoveryViewOf } from './item-recovery-view';
 import { RunRecoveryView, recoveryStateOf, runRecoveryStateOf } from '../reliability/recovery-state';
+import { remediationOf, resetRemediationForManualRetry } from '../reliability/remediation-ladder';
 import { nextRecoveryEntry } from './item-transitions';
 import { usd2 } from '../finops/usd-display';
 
@@ -2964,12 +2965,15 @@ export class RunsService {
       if (moneyGuarded && actor && (target.status === 'failed' || isBudgetBlocked(target))) {
         const [fullRow] = await qr.query(`select * from public.generation_item_runs where id = $1`, [target.id]);
         const now = new Date();
+        const autoResolving = !!fullRow && recoveryStateOf({ ...fullRow, run_created_at: job.created_at ?? null }, now).automatic;
         const conflict = (v: OwnerRetryView) => new ConflictException({
           code: v.reason, ownerRetry: v,
           message: `${v.reason}: el reintento de "${itemKey}" no se hizo (no se cambió nada).` +
             (v.reason === 'owner_retry_limit' ? ' Ya usaste los reintentos de esta parte en las últimas 24 h; el equipo de Cursia la revisará.'
               : v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached' ? ' El saldo autorizado no cubre el costo máximo de esta parte: hace falta ampliar la autorización.'
                 : v.reason === 'open_reservations' ? ' Hay un cobro de esta parte pendiente de confirmar; Cursia lo concilia antes de reintentar.'
+                  // r98: si un barrido automático (conciliación con el proveedor / reenvío único acotado) la va a tomar, se dice.
+                  : autoResolving ? ' Hay un resultado pagado sin confirmar: Cursia lo está conciliando automáticamente con el proveedor y la parte se retoma sola.'
                   : ' Hay un cobro sin conciliar o un resultado ambiguo: el equipo de Cursia lo revisa.') +
             (adminPlain ? ` ${adminPlainRetryHint(v.reason)}` : ''),
         });
@@ -3336,6 +3340,9 @@ export class RunsService {
         }
         r67LadderReset = { audioRetryStrategy: ladder, audioLadderResets: resets.slice(-20) };
       }
+      // r98 (review P1-3): un reintento HUMANO abre un ciclo nuevo de la escalera de remediación (count=1; feedback,
+      // `previous` y el tope total de intentos de la parte se conservan). Las reaperturas automáticas no la tocan.
+      const remediationReset = !auto ? resetRemediationForManualRetry(remediationOf(target.output_summary), auto?.now ?? new Date()) : null;
       // r67 (A3): estado explícito de la reapertura (pending_retry) + historial acotado, en la MISMA escritura.
       const r67Reason = auto ? (auto.policy.classAware && autoMeta?.strategy ? `auto_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}` : 'auto') : 'manual_retry';
       const r67Recovery = nextRecoveryEntry(target.output_summary?.recovery, { state: 'pending_retry', reason: r67Reason.slice(0, 64), nextRetryAt: null, automatic: true },
@@ -3358,7 +3365,7 @@ export class RunsService {
             where id = $1 and status = 'failed'
                or (id = $1 and status = 'blocked' and error like '${BUDGET_EXCEEDED}%')
             returning id`,
-          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery, ...(r67LadderReset ?? {}) }), lostResultResend, JSON.stringify(lostResultUnits)],
+          [target.id, attemptsGranted, JSON.stringify(entryExtra), JSON.stringify({ ...(stuckResend ? { ...topExtra, [STUCK_RENDER_RESEND_KEY]: stuckResend } : topExtra), recovery: r67Recovery, ...(r67LadderReset ?? {}), ...(remediationReset ? { remediation: remediationReset } : {}) }), lostResultResend, JSON.stringify(lostResultUnits)],
         ),
       );
       if (updated.length !== 1) {

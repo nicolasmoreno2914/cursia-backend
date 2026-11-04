@@ -976,15 +976,31 @@
     });
   }
 
+  // r98: lecturas de administración lentas (escanean runs / el ledger). Solo GET; las de usuario siguen con 8 s.
+  var ADMIN_HEAVY_READ_TIMEOUT_MS = 30000;
+  var ADMIN_HEAVY_READ_RE = /^\/api\/v1\/admin\/dynamic-runs\/(?:needs-attention|common-failures|pending-approvals|courses\/[^/?]+\/latest|[^/?]+\/pilot-metrics)(?:[?#]|$)/;
+  /** Timeout por defecto de una petición: 30 s para las lecturas pesadas de admin, 8 s (undefined) para el resto. */
+  function backendDefaultTimeoutFor(path, options) {
+    var method = String((options && options.method) || 'GET').toUpperCase();
+    return method === 'GET' && ADMIN_HEAVY_READ_RE.test(String(path || '')) ? ADMIN_HEAVY_READ_TIMEOUT_MS : undefined;
+  }
+
   /**
    * Realiza una petición autenticada al backend.
    *
    * @param {string} path        — ruta relativa (ej. '/api/v1/jobs/full')
    * @param {object} [options]   — opciones de fetch (method, body, …)
-   * @param {number} [timeoutMs] — timeout en ms (default: 8000).
+   * @param {number} [timeoutMs] — timeout en ms (default: 8000; también `options.timeoutMs`).
    *   Usar 30000 para POSTs de creación de jobs que pueden tardar en cold start.
+   *   r98: las lecturas PESADAS de administración (ADMIN_HEAVY_READ_RE) usan 30 s si el llamador no fija otro: el servidor
+   *   las arma escaneando runs (pilot-metrics tarda ~11 s en prod) y con 8 s se reportaba un timeout falso.
    */
   function backendApiRequest(path, options, timeoutMs) {
+    if (typeof timeoutMs !== 'number' || !(timeoutMs > 0)) {
+      var optT = options && typeof options.timeoutMs === 'number' && options.timeoutMs > 0 ? options.timeoutMs : null;
+      timeoutMs = optT || backendDefaultTimeoutFor(path, options);
+    }
+    if (options && 'timeoutMs' in options) { options = Object.assign({}, options); delete options.timeoutMs; }
     if (!backendIsEnabled()) {
       return Promise.resolve({ ok: false, error: 'Backend desactivado' });
     }
@@ -1646,7 +1662,7 @@
 
   function backendDynAdminNeedsAttention(limit) {
     var n = Math.max(1, Math.min(500, parseInt(limit, 10) || 100));
-    return backendApiRequest('/api/v1/admin/dynamic-runs/needs-attention?limit=' + n, { method: 'GET' });
+    return backendApiRequest('/api/v1/admin/dynamic-runs/needs-attention?limit=' + n, { method: 'GET' }, ADMIN_HEAVY_READ_TIMEOUT_MS);
   }
 
   function backendDynGetPackage(courseId, n, runId) {
@@ -4127,6 +4143,8 @@
   window.backendSetBaseUrl             = backendSetBaseUrl;
   window.backendHealthCheck            = backendHealthCheck;
   window.backendApiRequest             = backendApiRequest;
+  window.backendDefaultTimeoutFor      = backendDefaultTimeoutFor;
+  window.CURSIA_ADMIN_HEAVY_READ_TIMEOUT_MS = ADMIN_HEAVY_READ_TIMEOUT_MS;
   window.backendCreateCourse           = backendCreateCourse;
   window.backendCreateCourseVersion    = backendCreateCourseVersion;
   window.backendListCourses            = backendListCourses;

@@ -8,9 +8,10 @@ import { AttemptOutcome, failureAttentionOf, outcomeForFailure, recordItemFailur
 import type { HumanReason } from '../reliability/failure-classifier';
 // r67 (A3): máquina de estados de recuperación (persistida en output_summary.recovery + next_retry_at).
 import { RecoveryStateView, recoveryStateOf, scheduledRetryAtOf } from '../reliability/recovery-state';
-import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoHealPolicyFromEnv, autoRegenMaxRoundsFor } from './auto-heal';
+import { AMBIGUOUS_AUDIO_RESUBMIT_MAX_ROUNDS, autoHealMaxRoundsFor, autoRegenSpentFor, autoHealPolicyFromEnv, autoRegenMaxRoundsFor } from './auto-heal';
 import { SAFE_AUTO_RETRY_MAX_ROUNDS } from '../reliability/auto-heal-rules';
 import { applyStopAfterInTx, holdsPackaging, packageHoldReason } from './stop-after';
+import { LadderStep, REMEDIATION_KEY, ladderStep, remediationOf } from '../reliability/remediation-ladder';
 
 /**
  * Transiciones de estado de items/run compartidas por RunsService (lecturas:
@@ -166,6 +167,9 @@ export async function applyItemFailure(
   // servidor (drain del worker); un mensaje del navegador siempre es `failed`. Nunca del errorCode reportado.
   const outcome: AttemptOutcome = meta?.outcome
     ?? (meta?.source === 'browser_executor' ? 'failed' : outcomeForFailure(extractFailureCode(error)));
+  // r98: escalera de remediación de un fallo DETERMINISTA (misma huella otra vez → el próximo intento cambia su entrada;
+  // después, aceptación con marca de calidad si el validador es degradable; si no, agotada → el dueño reintenta a mano).
+  await applyRemediationLadder(qr, row, error, retryable, verdict);
   const maxRoundsToday = maxAutomaticRoundsToday(error, row.type, row.output_summary ?? {}, verdict.class, row.run_created_at ?? null);
   // r67 (A3): estado de recuperación explícito + próxima acción automática visible (next_retry_at también en `failed`)
   // + sin huérfanos (failed sin acción programada ni motivo → attention 'unrecoverable').
@@ -175,6 +179,56 @@ export async function applyItemFailure(
   });
   const blocked = row.status === 'failed' ? await blockDependents(qr, row.job_id, row.item_key) : [];
   return { id: row.id, status: row.status, blocked };
+}
+
+/**
+ * r98: aplica la escalera (reliability/remediation-ladder.ts) a una parte recién fallada, en la MISMA transacción.
+ * Muta `row` (status / output_summary) para que el estado de recuperación y el bloqueo de dependientes vean el resultado.
+ *  - feedback / accept con la parte `failed` por intentos agotados → UN intento más (`retrying`, ≤ MAX_LADDER_GRANTS por
+ *    huella), con el backoff base; el intento pasa por los guards de gasto de siempre;
+ *  - exhausted → ningún intento extra ni reapertura automática con esa huella (los intentos propios se terminan de usar).
+ */
+export async function applyRemediationLadder(
+  qr: QueryRunner,
+  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null; run_created_at?: Date | string | null },
+  error: string,
+  retryable: boolean,
+  verdict: ReturnType<typeof classifyFailure>,
+  now: Date = new Date(),
+): Promise<LadderStep | null> {
+  const step = ladderStep(remediationOf(row.output_summary), verdict, row.type, error, now, {
+    retryable: retryable && row.status === 'failed',
+    // Review P0-1 / re-review P2: la escalera no se agota mientras el barrido del auto-heal la vaya a tomar (misma
+    // decisión que el barrido, con la clase que va a quedar registrada).
+    autoRegenSpent: autoRegenSpentFor({
+      id: row.id, type: row.type, status: 'failed', error, output_summary: row.output_summary ?? {}, finished_at: now, updated_at: now,
+      failure_class: verdict.class, run_created_at: row.run_created_at ?? null,
+    }, now),
+  });
+  if (!step) return null;
+  let status = row.status;
+  if (step.grant && row.status === 'failed') {
+    await qr.query(
+      `update public.generation_item_runs
+          set status = 'retrying', max_attempts = greatest(max_attempts, attempt_count) + 1,
+              next_retry_at = now() + make_interval(secs => $2::int), finished_at = null
+        where id = $1 and status = 'failed'`,
+      [row.id, RETRY_BASE_SECONDS],
+    );
+    status = 'retrying';
+  }
+  // exhausted: sin intentos extra ni reaperturas automáticas (auto-heal / reintento seguro: remediationBlocksAuto). Los
+  // intentos que la parte ya tenía (max_attempts, default 3) se terminan de usar —siguen llevando el pedido corregido—
+  // y al agotarse queda `failed`; el dueño la reintenta desde su pantalla.
+  await qr.query(
+    `update public.generation_item_runs
+        set output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('${REMEDIATION_KEY}', $2::jsonb)
+      where id = $1`,
+    [row.id, JSON.stringify(step.state)],
+  );
+  row.status = status;
+  row.output_summary = { ...(row.output_summary ?? {}), [REMEDIATION_KEY]: step.state };
+  return step;
 }
 
 /** r67: entradas de historial de recuperación que se conservan por parte (output_summary.recovery.history). */

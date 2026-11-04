@@ -87,6 +87,32 @@ PRELOOP_WINDOW_S="${PROD_PRELOOP_WINDOW_S:-15}"
 PM2="${PM2_BIN:-sudo pm2}"
 
 die() { echo "❌ $*"; exit 1; }
+
+# r98: una migración que choca con un lock de una transacción en curso («canceling statement due to lock timeout»,
+# 55P03 lock_not_available) se reintenta: 3 intentos con 20 s y 40 s de espera. SOLO ese error se reintenta; cualquier
+# otro fallo sale como antes (mismo código de salida, sin reintento). La salida de cada intento se muestra completa.
+MIGRATION_LOCK_RETRY_WAITS="${MIGRATION_LOCK_RETRY_WAITS:-20 40}"
+run_migration_with_lock_retry() {
+  local name="$1"; shift
+  local waits=($MIGRATION_LOCK_RETRY_WAITS) attempt=1 max rc log
+  max=$(( ${#waits[@]} + 1 ))
+  log="$(mktemp -t "${name}.XXXXXX")"
+  while :; do
+    set +e
+    "$@" 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    set -e
+    if [ "$rc" -eq 0 ]; then rm -f "$log"; return 0; fi
+    if [ "$attempt" -ge "$max" ] || ! grep -qiE 'lock timeout|lock_not_available|55P03' "$log"; then
+      rm -f "$log"
+      echo "❌ [${name}] falló (intento ${attempt}/${max}, rc=${rc})"
+      return "$rc"
+    fi
+    echo "⚠️  [${name}] lock timeout (intento ${attempt}/${max}); reintento en ${waits[$((attempt - 1))]} s"
+    sleep "${waits[$((attempt - 1))]}"
+    attempt=$((attempt + 1))
+  done
+}
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # ── .env (mismo criterio que deploy-staging.yml) ─────────────────────────────
@@ -442,7 +468,10 @@ cmd_install() {
   # r61 fix I1: si algo falla de acá en adelante (el código nuevo ya está en disco), el estado queda
   # «failed <sha>» — explícito para el operador y para el auto-rollback del workflow; el próximo snapshot
   # conserva la última release sana.
-  trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "failed ${CFG_DEPLOY_SHA}" > .release-state; echo "❌ install falló (rc=${rc}): estado failed ${CFG_DEPLOY_SHA}; los procesos siguen como quedaron — rollback: workflow_dispatch action=rollback (o el auto-rollback del workflow)"; fi' EXIT
+  # r98: el trap EXIT corre al SALIR del script, cuando el `local CFG_DEPLOY_SHA` de esta función ya no existe → con
+  # `set -u` reventaba («CFG_DEPLOY_SHA: unbound variable») y tapaba el error real. El sha va en una global y con default.
+  RELEASE_TRAP_SHA="$CFG_DEPLOY_SHA"
+  trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "failed ${RELEASE_TRAP_SHA:-unknown}" > .release-state; echo "❌ install falló (rc=${rc}): estado failed ${RELEASE_TRAP_SHA:-unknown}; los procesos siguen como quedaron — rollback: workflow_dispatch action=rollback (o el auto-rollback del workflow)"; fi' EXIT
 
   echo "━━━ [0a] Flags V2 de producción (defaults SEGUROS: V2 apagado salvo canario explícito) ━━━"
   local canary="$CFG_PROD_V2_CANARY_OWNER" workers=false
@@ -529,10 +558,10 @@ cmd_install() {
   npm install --omit=dev
 
   echo "━━━ [2/4] Alinear restricciones de production_jobs ━━━"
-  node scripts/migrate-production-jobs-constraints.js
+  run_migration_with_lock_retry migrate-production-jobs-constraints node scripts/migrate-production-jobs-constraints.js
 
   echo "━━━ [3/4] Migrar usage_events y cost_rates ━━━"
-  node scripts/migrate-usage-events-costs.js
+  run_migration_with_lock_retry migrate-usage-events-costs node scripts/migrate-usage-events-costs.js
 
   echo "━━━ [4/4] Recargar PM2 (backend zero-downtime; V1 igual que antes; workers dinámicos con drenado) ━━━"
   printf "%s\n" "$CFG_DEPLOY_SHA" > .release-sha

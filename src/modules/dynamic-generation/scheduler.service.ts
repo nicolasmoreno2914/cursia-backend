@@ -85,7 +85,8 @@ import {
   videoClaimFacts,
 } from '../course-shell';
 import { V3_ARTIFACT_TEXT_READER, V3ArtifactTextReader } from './v3-artifact-reader';
-import { ItemPedagogyBrief, buildItemPedagogyBrief } from '../pedagogy/generator-directives';
+import { ItemPedagogyBrief, buildItemPedagogyBrief, withRemediationFeedback } from '../pedagogy/generator-directives';
+import { QUALITY_KEY, REMEDIATION_KEY, acceptCodesOf, qualityAcceptance, remediationFeedbackOf, remediationOf, withQualityWarning } from '../reliability/remediation-ladder';
 import { ANSWER_BIAS_POOL_ITEM_TYPES, AnswerBiasPool, answerBiasPoolFrom } from '../quality/answer-bias-pool';
 import { VIDEO_MC_COURSE_BIAS_CODE, videoMcCourseRecheck } from '../quality/answer-length-bias';
 import {
@@ -512,6 +513,8 @@ export const SERVER_OWNED_SUMMARY_KEYS: readonly string[] = Object.freeze([
   'videoIdentity', 'v3Validation', 'artifactIds',
   // r58 (I4-1): rechazos del re-chequeo de sesgo de las MC de video (lo escribe solo el servidor al fallar el item).
   'answerBiasRecheck',
+  // r98: escalera de remediación y marca de calidad (rung 2): solo el servidor las escribe.
+  'remediation', 'quality',
   // REL CREDIT: estado de la sonda del proveedor (lo escribe solo el barrido / retryItem).
   'providerProbe',
   // r61 Q-04: línea de tiempo del video (escenas de Videogen) que ancla las preguntas del video interactivo.
@@ -543,6 +546,23 @@ export function stripServerOwnedSummaryKeys(summary: Record<string, any>): { sum
     else out[k] = v;
   }
   return { summary: out, dropped };
+}
+
+/**
+ * r98 (review P2-4 + re-review P1): output_summary.quality al completar. La marca de rung 2 que hizo ESTA validación
+ * (prevalidateV3) reemplaza a la anterior; si esta validación es dueña de la marca (artifact v3 validado o capítulo de
+ * contenido) y no degradó nada, la marca vieja se borra. La del audiolibro (y de cualquier worker) la escribe su worker
+ * y la poda pruneAudioQuality: nunca se toca acá. Pura; exportada para el check.
+ */
+export function completionQualityPatch(
+  accepted: Record<string, any> | null,
+  preKind: 'skip' | 'invalid' | 'valid',
+  itemType: string,
+  existing: Record<string, any>,
+): Record<string, any> {
+  if (accepted) return { [QUALITY_KEY]: withQualityWarning(undefined, accepted) };
+  const ownedByPrevalidation = preKind === 'valid' || itemType === 'content';
+  return ownedByPrevalidation && existing?.[QUALITY_KEY] ? { [QUALITY_KEY]: null } : {};
 }
 
 export function mergeOutputSummary(
@@ -1103,7 +1123,9 @@ export class SchedulerService {
     // del artifact ANTES de aceptar (fuera de la transacción: la descarga no
     // retiene locks). Inválido → el item falla reintentable con los códigos
     // del validador (nunca se acepta en silencio). v1/v2: no aplica.
-    const pre = await this.prevalidateV3(itemRunId, executorId, ids, ownerId, typeof summary.promptVersion === 'string' ? summary.promptVersion : null);
+    // r98: `acc.quality` = aceptación con marca de calidad (rung 2 de la escalera) que hizo la validación.
+    const acc: { quality?: Record<string, any> } = {};
+    const pre = await this.prevalidateV3(itemRunId, executorId, ids, ownerId, typeof summary.promptVersion === 'string' ? summary.promptVersion : null, acc);
     if (pre.kind === 'invalid') {
       // Fix bank-guard-minors (N-R4): un rechazo del validador del servidor es una falla VALIDADA, no
       // transitoria: para exam/final_exam borra el borrador del banco (null explícito; no-op para otros tipos),
@@ -1129,7 +1151,10 @@ export class SchedulerService {
       const biasPatch = pre.kind === 'valid' && pre.answerBiasSignals
         ? { answerBias: { ...(isPlainObject(summary.answerBias) ? summary.answerBias : {}), signals: pre.answerBiasSignals } }
         : {};
-      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...biasPatch, ...validationPatch, artifactIds: ids });
+      // Review P2-4: la marca es del artifact que se completa AHORA (validado en este intento): una marca de un intento o
+      // generación anterior nunca sobrevive a un artifact nuevo aceptado sin degradar.
+      const qualityPatch = completionQualityPatch(acc.quality ?? null, pre.kind, item.type, item.output_summary ?? {});
+      const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...biasPatch, ...validationPatch, ...qualityPatch, artifactIds: ids });
       if (merged.ok === false) throw new GuardRejection(merged.reason);
 
       // Spec §3.3 / R16: un artifact por item y rol (type). Se rechaza antes
@@ -1606,6 +1631,7 @@ export class SchedulerService {
     artifactIds: string[],
     ownerId?: string,
     promptVersion: string | null = null,
+    acc: { quality?: Record<string, any> } = {},
   ): Promise<
     | { kind: 'skip' }
     | { kind: 'invalid'; message: string; codes: string[]; retryable: boolean; answerBiasRejection?: true }
@@ -1626,6 +1652,7 @@ export class SchedulerService {
       `select g.id, g.job_id, g.manifest_id, g.item_key, g.type, g.status, g.worker_id, g.chapter_id, g.module_id,
               g.output_summary -> 'answerBiasRecheck' ->> 'rejections' as answer_bias_rejections,
               g.output_summary ->> 'videoTimelinePinned' as video_timeline_pinned,
+              g.output_summary -> 'remediation' as remediation,
               pj.owner_id, pj.course_id as job_course_id, pj.frontend_course_id, m.rules_version, m.manifest_json
          from public.generation_item_runs g
          join public.production_jobs pj on pj.id = g.job_id
@@ -1641,11 +1668,17 @@ export class SchedulerService {
       throw new InternalServerErrorException(`v3_validation_context: el item ${g.item_key} no está en su Manifest congelado; no se completa sin validar`);
     }
     const languageCourse = await this.isLanguageCourseRun(g.job_id);
+    const accept = acceptCodesOf({ [REMEDIATION_KEY]: g.remediation });
     // Language QA (piloto): el capítulo (Markdown) no tiene otra validación de contenido en el servidor, pero su idioma sí.
     if (g.type === 'content' && !languageCourse && this.v3Reader) {
       const lang = await this.contentLanguageErrors(g, artifactIds);
       if (lang.length) {
-        return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, lang), codes: ['LANGUAGE_NOT_NEUTRAL'], retryable: true };
+        // r98 (rung 2): mismo rechazo de idioma después del intento con el pedido corregido → se acepta con marca de calidad.
+        if (accept.has('LANGUAGE_NOT_NEUTRAL')) {
+          acc.quality = qualityAcceptance(['LANGUAGE_NOT_NEUTRAL'], lang.map((e: any) => String(e.message ?? '')), new Date(), remediationOf({ [REMEDIATION_KEY]: g.remediation })?.fingerprint ?? null);
+        } else {
+          return { kind: 'invalid', message: v3ValidationErrorMessage({ itemKey: g.item_key, type: g.type }, lang), codes: ['LANGUAGE_NOT_NEUTRAL'], retryable: true };
+        }
       }
     }
     const validatedTypes = v3ValidatedArtifactTypes(g.type, mItem.variant ?? null);
@@ -1702,7 +1735,16 @@ export class SchedulerService {
           (err instanceof Error ? err.message : String(err)),
       );
     }
-    const r = validateV3ItemArtifact(ctx, text);
+    let r = validateV3ItemArtifact(ctx, text);
+    // r98 (rung 2): si lo ÚNICO que falla es la neutralidad del idioma y la escalera lo permite, se revalida con la
+    // estructura completa (sin Language QA) y se acepta con marca de calidad. Cualquier otro error sigue fallando.
+    if (!r.ok && accept.has('LANGUAGE_NOT_NEUTRAL') && r.errors.length > 0 && r.errors.every((e) => e.code === 'LANGUAGE_NOT_NEUTRAL')) {
+      const structural = validateV3ItemArtifact({ ...ctx, languageCourse: true }, text);
+      if (structural.ok) {
+        acc.quality = qualityAcceptance(['LANGUAGE_NOT_NEUTRAL'], r.errors.map((e) => String(e.message ?? '')), new Date(), remediationOf({ [REMEDIATION_KEY]: g.remediation })?.fingerprint ?? null);
+        r = structural;
+      }
+    }
     if (!r.ok) {
       return {
         kind: 'invalid',
@@ -2495,6 +2537,9 @@ export async function assembleClaimedItem(a: {
       throw new ClaimPayloadUnavailable('PEDAGOGY_DIRECTIVE_UNKNOWN', `no se pudo armar el brief pedagógico de ${row.item_key} (${err instanceof Error ? err.message : String(err)})`);
     }
   }
+  // r98 (escalera de remediación, rung 1): tras dos fallos con la misma huella, los hallazgos del validador van al prompt.
+  const remediationFeedback = remediationFeedbackOf(row.output_summary);
+  if (remediationFeedback) pedagogy = withRemediationFeedback(pedagogy, mItem as any, remediationFeedback);
 
   return {
     itemRunId: row.id,

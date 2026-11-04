@@ -172,6 +172,17 @@ export async function recordItemCompleted(qr: Queryable, itemRunId: string): Pro
       where id = $1 and jsonb_typeof(output_summary->'recovery') = 'object'`,
     [itemRunId],
   );
+  // r98: la escalera de remediación de la parte queda cerrada con su desenlace (rung 2 → aceptada con marca de calidad).
+  await qr.query(
+    `update public.generation_item_runs
+        set output_summary = output_summary || jsonb_build_object('remediation',
+              (output_summary->'remediation') || jsonb_build_object(
+                'outcome', case when coalesce((output_summary->'remediation'->>'rung')::int, 0) = 2
+                                 and (output_summary->'quality'->>'degraded') = 'true' then 'accepted' else 'completed' end,
+                'completedAt', now()))
+      where id = $1 and jsonb_typeof(output_summary->'remediation') = 'object' and (output_summary->'remediation'->>'outcome') is null`,
+    [itemRunId],
+  );
   if (!(await relSchemaReady(qr))) return;
   await qr.query(
     `update public.generation_item_runs

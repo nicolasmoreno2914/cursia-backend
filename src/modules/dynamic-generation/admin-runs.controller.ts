@@ -92,6 +92,22 @@ export class AdminDynamicRunsController {
     return this.recovery.listNeedsAttention({ limit: limit === undefined ? undefined : Number(limit), reservationRuns: reservationRuns === undefined ? undefined : Number(reservationRuns) });
   }
 
+  // r98 — GET /api/v1/admin/dynamic-runs/common-failures — «Falla común»: misma huella de fallo determinista en ≥ 3
+  // cursos dentro de 24 h, con el reporte listo para desarrollo (`report`, Markdown). ?all=1 incluye las resueltas.
+  @Get('common-failures')
+  commonFailures(@Query('all') all?: string) {
+    return this.recovery.commonFailuresListing(all === '1' || all === 'true');
+  }
+
+  // r98 — POST /api/v1/admin/dynamic-runs/common-failures/resolve  Body {fingerprint, note?}: marca «resuelto» (acción
+  // explícita; vuelve a activarse sola si la huella aparece de nuevo después de la marca).
+  @Post('common-failures/resolve')
+  @HttpCode(HttpStatus.OK)
+  resolveCommonFailure(@Body() body: Record<string, unknown>, @CurrentUser() user: AuthUser) {
+    const b = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
+    return this.recovery.resolveCommonFailure(String(b.fingerprint ?? ''), { id: user.id, email: user.email }, typeof b.note === 'string' ? b.note : null);
+  }
+
   // V542 (G6) — GET /api/v1/admin/dynamic-runs/:runId/videogen-reservations
   // Reservas de Videogen del run sin liquidar que ningún worker va a liquidar (resultado incierto).
   @Get(':runId/videogen-reservations')

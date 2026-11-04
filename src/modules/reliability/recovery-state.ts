@@ -28,6 +28,7 @@ import { providerReconcileDecision } from '../dynamic-generation/provider-reconc
 import { classifyFailure, currentRecoveryOf, FailureSource } from './failure-classifier';
 import { providerProbeViewOf } from './provider-probe';
 import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
+import { REMEDIATION_EXHAUSTED_CODE, remediationBlocksAuto, remediationOf } from './remediation-ladder';
 
 export type RecoveryState =
   | 'completed'
@@ -134,6 +135,11 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     if (os.delivery === 'blocked_auth' && os.youtubeAuthProbe) {
       return { state: 'waiting_external_quota', reason: 'youtube_auth_probe', nextRetryAt: iso(next ?? toDate(os.youtubeAuthProbe?.nextProbeAt ?? null)), automatic: true };
     }
+    // r98: el próximo intento corre un escalón de la escalera (pedido corregido / aceptación con marca de calidad).
+    const rem = remediationOf(os);
+    if (rem && !rem.outcome && (rem.rung === 1 || rem.rung === 2)) {
+      return { state: 'pending_retry', reason: rem.rung === 1 ? 'remediation_feedback' : 'remediation_accept', nextRetryAt: iso(next), automatic: true };
+    }
     return { state: 'transient_failed', reason: error ? error.split(':')[0].slice(0, 64) : null, nextRetryAt: iso(next), automatic: true };
   }
   if (status === 'pending' || status === 'running') {
@@ -163,6 +169,7 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
   if (cur === 'provider_reconcile' || cur === 'ambiguous_audio_resubmit') {
     return { state: 'waiting_financial_reconciliation', reason: cur, nextRetryAt: iso(at), automatic: true };
   }
+
   if (cur === 'auto_heal' || cur === 'auto_regenerate' || cur === 'safe_auto_retry' || cur === 'spend_control_resume') {
     // Espera EXPIRADA solo cuando el propio barrido que la tomaría lo dice explícitamente (auto-heal / reintento seguro:
     // too_old o ventana total agotada). r67 fix round 1 (F3): el control de gasto (espera su reversión) y el claim
@@ -177,6 +184,10 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     }
     return { state: 'pending_retry', reason: cur, nextRetryAt: iso(at), automatic: true };
   }
+  // r98: escalera agotada con ESTE error → ningún barrido la toma; el dueño puede reintentar (owner-retry.ts). Va DESPUÉS
+  // de la conciliación (review P1-2) y de los barridos automáticos (auto-heal / regeneración / claim incompleto /
+  // control de gasto, re-review P2): si alguno la va a tomar, manda ese.
+  if (remediationBlocksAuto(os, error)) return { state: 'failed_no_strategies', reason: REMEDIATION_EXHAUSTED_CODE, nextRetryAt: null, automatic: false };
   if (attention === 'duplicate_charge' || /^provider_reconciliation_required\b|ambiguous/i.test(error)) {
     return { state: 'waiting_financial_reconciliation', reason: code, nextRetryAt: null, automatic: false };
   }

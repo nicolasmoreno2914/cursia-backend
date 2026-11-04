@@ -120,6 +120,12 @@ export interface ChapterScriptInput {
   /** R14: país del curso → tuteo (voseo solo en Argentina/Uruguay/Paraguay). */
   pais?: string | null;
   contentMarkdown: string;
+  /**
+   * r98 (escalera de remediación): `feedback` (rung 1) = hallazgos del validador que el prompt del bloque agrega tras dos
+   * fallos con la misma huella; `acceptLanguage` (rung 2) = la neutralidad del idioma se acepta con marca de calidad en
+   * vez de fallar (solo AUDIOBOOK_LANGUAGE_NOT_NEUTRAL; nada más se afloja).
+   */
+  remediation?: { feedback?: string | null; acceptLanguage?: boolean } | null;
 }
 
 /**
@@ -519,6 +525,8 @@ export interface SectionScriptResult {
   /** r19 (#642): el guion quedó largo y se condensó con UNA llamada acotada. */
   condensed: boolean;
   messageIds: string[];
+  /** r98 (rung 2): hallazgos de idioma aceptados con marca de calidad (ausente = ninguno). */
+  qualityAccepted?: { code: 'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'; findings: string[] };
 }
 
 function ratioOf(words: number, source: number): number {
@@ -547,7 +555,10 @@ export async function generateSectionScript(
   llm: ScriptLlm,
 ): Promise<SectionScriptResult> {
   const { target, min, max } = sectionTargetWords(section.words);
-  const main = await llm(sectionNarrationPrompt(input, section, totalSections, prevTail), 'main');
+  const basePrompt = sectionNarrationPrompt(input, section, totalSections, prevTail);
+  const fb = typeof input.remediation?.feedback === 'string' ? input.remediation.feedback.trim() : '';
+  // r98 (rung 1): el intento CAMBIA su entrada — las correcciones del validador van al final del pedido.
+  const main = await llm(fb ? { ...basePrompt, user: `${basePrompt.user}\n\n${fb}` } : basePrompt, 'main');
   const messageIds = [main.messageId];
   let text = cleanNarrationText(main.text);
   let continued = false;
@@ -602,6 +613,11 @@ export async function generateSectionScript(
   // r92: cursos de lengua/literatura citan regionalismos a propósito (misma exención que el contenido, scheduler) y un
   // término que ya trae el texto fuente del bloque es un ejemplo del capítulo, no un modismo del narrador.
   const lang = audioLanguageFindings(text, section.text, input);
+  if (lang.length && input.remediation?.acceptLanguage) {
+    // r98 (rung 2): ya se pidió corregirlo y volvió igual → se narra con marca de calidad (el curso sigue y se empaqueta).
+    return { idx: section.idx, sourceSha: section.sha256, sourceWords: section.words, text, words, ratio: ratioOf(words, section.words), continued, condensed, messageIds,
+      qualityAccepted: { code: 'AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', findings: lang.map((h) => lqaHitLabel(h)).slice(0, 10) } };
+  }
   if (lang.length) {
     throw new AudioScriptError('AUDIOBOOK_LANGUAGE_NOT_NEUTRAL', `el guion del bloque ${section.idx + 1} del capítulo ${input.chapterNumber} no está en español neutro: ${lang.map((h) => lqaHitLabel(h)).join('; ')}`, true);
   }
