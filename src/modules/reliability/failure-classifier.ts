@@ -316,7 +316,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   { id: 'artifact_upload_failed', codes: ['artifact_upload_failed', 'upload_failed'], class: 'A', strategy: 'retry_backoff', provider: 'storage', rounds: 3 },
   { id: 'complete_rejected', codes: ['complete_rejected'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
   { id: 'finops_unavailable', codes: ['finops_unavailable', 'finops_ledger_write_failed'], class: 'A', strategy: 'wait_provider', scope: 'run', provider: 'finops', rounds: 3 },
-  { id: 'browser_auth', codes: ['token_refresh_failed', 'browser_auth', 'browser_session_missing'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
+  // r93 (FE r89, bloque 3): api() ya no mezcla 401/403 en «No tienes acceso»: `session_expired` (401 de sesión, tras
+  // renovarla una vez) y `browser_forbidden` (403 sin código conocido) conservan la clase del antiguo `browser_auth`.
+  { id: 'browser_auth', codes: ['token_refresh_failed', 'browser_auth', 'browser_session_missing', 'session_expired', 'browser_forbidden'], class: 'A', strategy: 'retry_backoff', rounds: 3 },
   { id: 'user_stopped', codes: ['user_stopped'], class: 'A', strategy: 'retry_backoff', rounds: 1 },
 
   // ── IA (Anthropic; proxy del navegador o gateway del servidor) ─────────────
@@ -328,7 +330,9 @@ const ITEM_RULES: readonly Rule[] = Object.freeze([
   { id: 'llm_transient', codes: ['browser_llm_transient', 'llm_transient', 'llm_empty_response', 'llm_network', 'llm_stream_cut', 'llm_provider_unhealthy'], class: 'A', strategy: 'retry_backoff', paidRisk: 'measured', provider: 'anthropic', rounds: 3 },
   {
     id: 'llm_config',
-    codes: ['llm_credit_exhausted', 'llm_auth_rejected', 'proxy_misconfigured', 'llm_model_config', 'llm_model_not_allowed', 'llm_api_key_missing', 'llm_model_missing'],
+    // r93: `ai_connection_unavailable` = 401 de la conexión de IA de la cuenta (no de la sesión; api() no lo reintenta).
+    codes: ['llm_credit_exhausted', 'llm_auth_rejected', 'proxy_misconfigured', 'llm_model_config', 'llm_model_not_allowed', 'llm_api_key_missing', 'llm_model_missing',
+      'ai_connection_unavailable'],
     class: 'D', strategy: 'wait_provider', scope: 'provider', provider: 'anthropic', rounds: 0, humanReason: 'config',
   },
   {
@@ -759,6 +763,17 @@ const PHRASES: ReadonlyArray<[RegExp, string]> = [
   [/^tipo no soportado\b/i, 'unsupported_item_type'],
   [/^rulesVersion no soportado\b/i, 'unsupported_rules_version'],
   [/^(?:❌\s*)?No tienes acceso\b/i, 'browser_auth'],
+  // r93 (FE r89, bloque 3): negativas de api() en lenguaje de producto, SIN el prefijo de código de antes (el código viaja
+  // en `code` del objeto lanzado, que el ejecutor no reenvía). Mismo código que el prefijo r75 → misma regla.
+  [/^Tu sesi[oó]n venci[oó]/i, 'session_expired'],
+  [/^Tu presupuesto disponible no alcanza\b/i, 'user_budget_insufficient'],
+  [/^Todav[ií]a no tienes presupuesto asignado\b/i, 'user_budget_not_assigned'],
+  [/^Tus generaciones est[aá]n suspendidas\b/i, 'generation_suspended'],
+  [/^Las generaciones nuevas est[aá]n pausadas temporalmente\b/i, 'platform_generation_frozen'],
+  [/^Tu cuenta est[aá] suspendida\b/i, 'account_suspended'],
+  [/^Tu cuenta no tiene acceso a Cursia\b/i, 'account_not_authorized'],
+  [/^La conexi[oó]n de IA de Cursia no est[aá] disponible\b/i, 'ai_connection_unavailable'],
+  [/^Tu cuenta no tiene permiso para esta acci[oó]n\b/i, 'browser_forbidden'],
   [/^Sin sesi[oó]n activa\b/i, 'browser_session_missing'],
   [/^(?:❌\s*)?El servicio de IA de este entorno no est[aá] configurado/i, 'proxy_misconfigured'],
   [/^(?:❌\s*)?Sin disponibilidad de generaci[oó]n/i, 'llm_credit_exhausted'],
