@@ -49,7 +49,7 @@ import { isDynamicCourseStructureEnabled } from '../features/dynamic-features';
 import { remainingAudioStrategies } from '../../package/audio/audiobook-policy';
 import { PROVIDER_RECONCILIATION_REQUIRED } from '../finops/run-budget';
 // REL MVP: la decisión por clase usa el clasificador central (import circular seguro: solo se usa en llamadas).
-import { FailureSource, FailureVerdict, classifyFailure } from '../reliability/failure-classifier';
+import { FailureSource, classifyFailure } from '../reliability/failure-classifier';
 
 export const AUTO_HEAL_ENABLED_ENV = 'DYNAMIC_AUTO_HEAL_ENABLED';
 export const AUTO_HEAL_INTERVAL_ENV = 'DYNAMIC_AUTO_HEAL_INTERVAL_MS';
@@ -350,19 +350,22 @@ export const AUTO_REGEN_WORKER_CODES: Readonly<Record<string, readonly string[]>
 const AUTO_REGEN_STRATEGIES: readonly string[] = Object.freeze(['regenerate_targeted', 'regenerate_split']);
 
 /**
- * r98 (review P0-1): ¿la regeneración automática PROPIA de la clase B ya se usó (o no aplica) para este fallo? Misma
- * elegibilidad que classAwareDecision (política por clase, tipo de worker con su lista, estrategia que regenera) y el
- * mismo tope (autoRegenMaxRoundsFor). La escalera de remediación solo se agota cuando esto es true.
+ * r98 (review P0-1, re-review P2): ¿la recuperación automática PROPIA del auto-heal ya no va a tomar este fallo? Una sola
+ * fuente de verdad: la MISMA decisión del barrido (classAwareDecision, con la clase registrada y la fecha del run), más el
+ * kill switch del barrido (DYNAMIC_AUTO_HEAL_ENABLED). Rondas pendientes = la decisión reabre (clase B) o espera su
+ * backoff; cualquier otro motivo (cap, deny-list, reintento seguro, sin clasificar, too_old, kill switch…) = ya no.
+ * La escalera de remediación solo se agota cuando esto es true.
  */
 export function autoRegenSpentFor(
-  row: { type?: string | null; output_summary?: Record<string, any> | null },
-  v: Pick<FailureVerdict, 'class' | 'code' | 'strategy'>,
+  row: AutoHealRow,
+  now: Date = new Date(),
   policy: AutoHealPolicy = autoHealPolicyFromEnv(process.env),
+  env: Record<string, string | undefined> = process.env,
 ): boolean {
-  if (!policy.classAware || v.class !== 'B') return true;
-  if (row.type && AUTO_HEAL_WORKER_ITEM_TYPES.includes(row.type) && !(AUTO_REGEN_WORKER_CODES[row.type] ?? []).includes(v.code)) return true;
-  if (!AUTO_REGEN_STRATEGIES.includes(v.strategy)) return true;
-  return autoRegenRoundsOf(row.output_summary) >= autoRegenMaxRoundsFor(row.type, v.code, policy);
+  if (!autoHealEnabled(env) || !policy.classAware) return true;
+  const d = classAwareDecision({ ...row, status: 'failed' }, now, policy);
+  if (d.heal === true) return d.kind !== 'B';
+  return d.reason !== 'backoff';
 }
 
 function sourceOfType(type: string | null | undefined): FailureSource | null {
@@ -469,8 +472,12 @@ export function isAutoHealDenied(error: string): boolean {
 export function autoHealDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): AutoHealDecision {
   // r98: escalera agotada con ESTE error → no se reabre sola. Review P0-1: nunca antes de que la clase B use sus propias
   // rondas de auto-regeneración (regenerate_split / regenerate_targeted ya cambian la entrada).
-  if (row.status === 'failed' && remediationBlocksAuto(row.output_summary, row.error)
-    && autoRegenSpentFor(row, classifyFailure({ source: sourceOfType(row.type), itemType: row.type ?? null, error: String(row.error ?? ''), outputSummary: row.output_summary ?? {} }), policy)) {
+  // Re-review P2: el re-chequeo usa la MISMA decisión del barrido (clase registrada incluida: p. ej. un ejecutor que subió
+  // un mensaje A a corrupt_dependency B) — si todavía regenera (o espera su backoff), esa decisión manda.
+  if (row.status === 'failed' && remediationBlocksAuto(row.output_summary, row.error)) {
+    if (!policy.classAware) return { heal: false, reason: 'remediation_exhausted' };
+    const d = classAwareDecision(row, now, policy);
+    if (d.heal === true ? d.kind === 'B' : d.reason === 'backoff') return d;
     return { heal: false, reason: 'remediation_exhausted' };
   }
   if (policy.classAware) return classAwareDecision(row, now, policy);

@@ -55,6 +55,11 @@ function assert(c, m) { if (!c) throw new Error(m || 'assert'); }
 function eq(a, b, m) { if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`${m || 'eq'}: esperado ${JSON.stringify(b)}, encontrado ${JSON.stringify(a)}`); }
 
 const T0 = new Date('2026-11-04T10:00:00Z');
+// El barrido del auto-heal solo corre con V2 encendido (autoHealEnabled): el check lo enciende como en staging/prod.
+process.env.DYNAMIC_COURSE_STRUCTURE = 'true';
+delete process.env.DYNAMIC_AUTO_HEAL_ENABLED;
+const ENV_ON = { DYNAMIC_COURSE_STRUCTURE: 'true' };
+const ENV_TICK_OFF = { DYNAMIC_COURSE_STRUCTURE: 'true', DYNAMIC_AUTO_HEAL_ENABLED: 'false' };
 const at = (min) => new Date(T0.getTime() + min * 60_000);
 const LANG = (blk, term) => `AUDIOBOOK_LANGUAGE_NOT_NEUTRAL: el guion del bloque ${blk} del capítulo 3 no está en español neutro: «${term}» (regionalismo de Argentina; usa «trabajo»)`;
 const verdictOf = (error, itemType = 'audiobook_chapter') => FC.classifyFailure({ error, itemType, source: 'provider_worker', outputSummary: {} });
@@ -268,12 +273,75 @@ function fakeQr(row) {
     eq(AH.autoHealDecision({ ...failed, output_summary: { remediation: p } }, at(10), policy).heal, true, 'rondas B primero');
     // Con las rondas propias usadas → recién ahí agotada y sin reabrir.
     const spent = { remediation: p, autoHeal: { rounds: 0, regenRounds: AH.autoRegenMaxRoundsFor('scorm', v.code, policy) } };
-    assert(AH.autoRegenSpentFor({ type: 'scorm', output_summary: spent }, v, policy), 'rondas usadas');
+    assert(AH.autoRegenSpentFor({ ...failed, output_summary: spent }, at(10), policy, ENV_ON), 'rondas usadas');
     eq(AH.autoHealDecision({ ...failed, output_summary: spent }, at(10), policy), { heal: false, reason: 'remediation_exhausted' }, 'agotada tras sus rondas');
     for (const [err, t] of [['llm_output_invalid: x', 'content'], ['scorm_invalid: x', 'scorm'], ['gift_invalid: x', 'exam'], ['CONTENT_TRUTH: persisten 2 oraciones', 'content'], ['v3_payload_invalid [SCHEMA_MISSING]: x', 'experience']]) {
       const vv = FC.classifyFailure({ error: err, itemType: t, source: 'browser_executor', outputSummary: {} });
-      assert(!AH.autoRegenSpentFor({ type: t, output_summary: {} }, vv, policy), `${err}: rondas B disponibles → la escalera no se agota`);
+      assert(vv.class === 'B', `${err}: B`);
+      assert(!AH.autoRegenSpentFor({ id: 'z', status: 'failed', type: t, error: err, output_summary: {}, finished_at: at(0), updated_at: at(0), failure_class: vv.class }, at(0), policy, ENV_ON), `${err}: rondas B disponibles → la escalera no se agota`);
     }
+  });
+  await check('RR-P2a una sola fuente de verdad: con el barrido apagado (DYNAMIC_AUTO_HEAL_ENABLED=false) la escalera SÍ se agota al 3.er fallo; deny-list / reintento seguro / sin clasificar → «sin rondas»', async () => {
+    const e = 'OUTPUT_TRUNCATED_MAX_TOKENS: la salida se cortó';
+    const v = FC.classifyFailure({ error: e, itemType: 'scorm', source: 'browser_executor', outputSummary: {} });
+    const row = { id: 's2', status: 'failed', type: 'scorm', error: e, output_summary: {}, finished_at: at(0), updated_at: at(0), failure_class: 'B' };
+    assert(!AH.autoRegenSpentFor(row, at(0), AH.DEFAULT_AUTO_HEAL_POLICY, ENV_ON), 'barrido encendido: quedan rondas');
+    assert(AH.autoRegenSpentFor(row, at(0), AH.DEFAULT_AUTO_HEAL_POLICY, ENV_TICK_OFF), 'barrido apagado: ninguna ronda va a venir');
+    // Vía real (applyRemediationLadder lee process.env): con el barrido apagado, 3.er fallo → agotada.
+    process.env.DYNAMIC_AUTO_HEAL_ENABLED = 'false';
+    try {
+      let os = {};
+      const acts = [];
+      for (let i = 0; i < 3; i++) {
+        const r = { id: 's2', status: 'failed', type: 'scorm', attempt_count: 3, max_attempts: 3, output_summary: os };
+        acts.push((await IT.applyRemediationLadder(fakeQr(r), r, e, true, v, at(i))).action); os = r.output_summary;
+      }
+      eq(acts, ['observe', 'feedback', 'exhausted'], 'agotada sin barrido');
+    } finally { delete process.env.DYNAMIC_AUTO_HEAL_ENABLED; }
+    // Sin clasificar (mensaje libre) o con la deny-list: el barrido no la toma → «sin rondas».
+    assert(AH.autoRegenSpentFor({ ...row, error: 'provider_reconciliation_required: anthropic …', failure_class: 'B' }, at(0), AH.DEFAULT_AUTO_HEAL_POLICY, ENV_ON), 'deny-list');
+  });
+  await check('RR-P2b corrupt_dependency del navegador (mensaje A, clase registrada B) con marca agotada → el auto-heal sigue regenerando (regenerate_targeted)', async () => {
+    const err = 'Error de red: fetch failed';
+    const vA = FC.classifyFailure({ error: err, itemType: 'experience', source: 'browser_executor', outputSummary: {} });
+    eq(vA.class, 'A', 'el mensaje solo es A');
+    const vB = FC.classifyFailure({ error: err, errorCode: 'context_package_failed', itemType: 'experience', source: 'browser_executor', outputSummary: {} });
+    eq([vB.class, vB.rule], ['B', 'corrupt_dependency'], 'el errorCode lo sube a B');
+    let p = null;
+    for (let i = 0; i < 3; i++) p = L.ladderStep(p, vB, 'experience', err, at(i), { retryable: true }).state;
+    eq(p.rung, 3, 'marca agotada');
+    const row = { id: 'c1', status: 'failed', type: 'experience', error: err, output_summary: { remediation: p }, finished_at: at(-600), updated_at: at(-600), failure_class: 'B', run_created_at: at(-700) };
+    const d = AH.autoHealDecision(row, at(10), AH.DEFAULT_AUTO_HEAL_POLICY);
+    eq([d.heal, d.kind, d.strategy], [true, 'B', 'regenerate_targeted'], 'misma decisión que el barrido');
+    assert(!AH.autoRegenSpentFor(row, at(10), AH.DEFAULT_AUTO_HEAL_POLICY, ENV_ON), 'y la escalera lo ve igual');
+  });
+  await check('RR-P2c claim_payload_unavailable queda FUERA de la escalera (lo resuelve su barrido) y el estado agotado va después de los barridos automáticos', async () => {
+    const err = 'claim_payload_unavailable: falta el dato de video:c1 (youtubeId)';
+    const v = FC.classifyFailure({ error: err, itemType: 'video_interactions', source: 'browser_executor', outputSummary: {} });
+    assert(L.ladderStep(null, v, 'video_interactions', err, T0, { retryable: true }) === null, 'fuera de la escalera');
+    const src = fs.readFileSync(path.join(REPO, 'src/modules/reliability/recovery-state.ts'), 'utf8');
+    const iAuto = src.indexOf("if (cur === 'auto_heal' || cur === 'auto_regenerate' || cur === 'safe_auto_retry' || cur === 'spend_control_resume')");
+    const iExh = src.indexOf('if (remediationBlocksAuto(os, error))');
+    assert(iAuto > 0 && iExh > iAuto, 'agotada después de auto_heal / auto_regenerate / claim incompleto');
+  });
+  await check('RR-P1 audiolibro aceptado en rung 2 → al completar la marca se CONSERVA, el desenlace es «accepted» y el paquete trae el aviso', async () => {
+    const SCH = loadDist('modules/dynamic-generation/scheduler.service.js');
+    const q = L.withQualityWarning(undefined, { ...L.qualityAcceptance(['AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'], ['«laburo»'], T0, 'fp'), section: 1, messageId: 'm1' });
+    const os = { quality: q, audiobookSections: { 0: { messageIds: ['m1'] } } };
+    // completeItemDetailed del worker del audiolibro: sin validación v3 (skip) y sin marca de prevalidateV3.
+    eq(SCH.completionQualityPatch(null, 'skip', 'audiobook_chapter', os), {}, 'la marca del worker no se toca');
+    const merged = SCH.mergeOutputSummary(os, { ...SCH.completionQualityPatch(null, 'skip', 'audiobook_chapter', os), artifactIds: ['a1'] });
+    assert(merged.ok && merged.merged.quality && merged.merged.quality.degraded === true, 'marca conservada');
+    // Desenlace de recordItemCompleted: 'accepted' ⇔ rung 2 y quality.degraded = true (misma regla que su SQL).
+    const al = fs.readFileSync(path.join(REPO, 'src/modules/reliability/attempt-log.ts'), 'utf8');
+    assert(/= 2\s+and \(output_summary->'quality'->>'degraded'\) = 'true' then 'accepted'/.test(al), 'regla del desenlace');
+    eq(PW.qualityAcceptedWarnings(new Map([['audio:c1', { itemKey: 'audio:c1', outputSummary: merged.merged }]])), ['quality_accepted:audio:c1:AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'], 'aviso del paquete');
+    // v3 / contenido: la marca vieja se borra si esta validación no degradó; con aceptación nueva, la reemplaza.
+    eq(SCH.completionQualityPatch(null, 'valid', 'experience', { quality: q }), { quality: null }, 'v3 sin degradar: fuera la vieja');
+    eq(SCH.completionQualityPatch(null, 'skip', 'content', { quality: q }), { quality: null }, 'capítulo sin degradar: fuera la vieja');
+    eq(SCH.completionQualityPatch(null, 'skip', 'experience', {}), {}, 'nada que borrar');
+    const acc = L.qualityAcceptance(['LANGUAGE_NOT_NEUTRAL'], ['x'], T0, 'fp2');
+    eq(SCH.completionQualityPatch(acc, 'valid', 'experience', { quality: q }).quality.warnings.length, 1, 'aceptación nueva reemplaza');
   });
   await check('P1-1 D hold_for_human y sin clasificar NO entran a la escalera (sin feedback, sin intento extra, sin «Falla común» por colapso de huellas)', async () => {
     for (const [err, t, src] of [['algo raro pasó en el navegador', 'content', 'browser_executor'], ['TypeError: x is undefined', 'content', 'browser_executor'],
@@ -390,7 +458,7 @@ function fakeQr(row) {
     eq(L.commonFailureSignals(rows, new Map(), at(21 * 60)).length, 0, 'rung 0 no cuenta');
     // P2-4: v3 → la marca es del artifact que se completa; audiolibro → solo bloques cuyo guion aceptado sigue.
     const sch = fs.readFileSync(path.join(REPO, 'src/modules/dynamic-generation/scheduler.service.ts'), 'utf8');
-    assert(/acc\.quality \? \{ \[QUALITY_KEY\]: withQualityWarning\(undefined, acc\.quality\) \}\s*: item\.output_summary\?\.\[QUALITY_KEY\] \? \{ \[QUALITY_KEY\]: null \} : \{\}/.test(sch), 'v3: sin arrastre');
+    assert(/const qualityPatch = completionQualityPatch\(acc\.quality \?\? null, pre\.kind, item\.type, item\.output_summary \?\? \{\}\);/.test(sch), 'v3: sin arrastre (completionQualityPatch, ver RR-P1)');
     const RP = loadDist('workers/provider-real/real-providers.js');
     const q = { degraded: true, warnings: [{ code: 'quality_accepted', section: 1, messageId: 'm-old' }, { code: 'quality_accepted', section: 2, messageId: 'm2' }] };
     eq(RP.pruneAudioQuality(q, { 0: { messageIds: ['m-new'] }, 1: { messageIds: ['m2'] } }).warnings.map((w) => w.messageId), ['m2'], 'bloque regenerado: marca vieja fuera');

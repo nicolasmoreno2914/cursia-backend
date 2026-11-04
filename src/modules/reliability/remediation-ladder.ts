@@ -102,6 +102,8 @@ export const SELF_ADAPTIVE_CODES: readonly string[] = Object.freeze([
   'AUDIO_WPM_OUT_OF_RANGE', 'AUDIOBOOK_SEGMENT_DUPLICATE', 'TTS_AUDIO_INVALID', 'AUDIO_STRATEGIES_EXHAUSTED', 'AUDIOBOOK_SCRIPT_REPETITION',
   // Banco de examen incompleto: cada intento reanuda desde el borrador guardado (output_summary.examBankDraft) y avanza.
   'EXAM_BANK_INCOMPLETE',
+  // Claim incompleto por el dato de una dependencia: lo resuelve su propio barrido (regenera la dependencia, r62 d8).
+  'claim_payload_unavailable',
 ]);
 
 /**

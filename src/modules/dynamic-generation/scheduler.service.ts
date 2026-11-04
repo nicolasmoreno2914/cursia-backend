@@ -548,6 +548,23 @@ export function stripServerOwnedSummaryKeys(summary: Record<string, any>): { sum
   return { summary: out, dropped };
 }
 
+/**
+ * r98 (review P2-4 + re-review P1): output_summary.quality al completar. La marca de rung 2 que hizo ESTA validación
+ * (prevalidateV3) reemplaza a la anterior; si esta validación es dueña de la marca (artifact v3 validado o capítulo de
+ * contenido) y no degradó nada, la marca vieja se borra. La del audiolibro (y de cualquier worker) la escribe su worker
+ * y la poda pruneAudioQuality: nunca se toca acá. Pura; exportada para el check.
+ */
+export function completionQualityPatch(
+  accepted: Record<string, any> | null,
+  preKind: 'skip' | 'invalid' | 'valid',
+  itemType: string,
+  existing: Record<string, any>,
+): Record<string, any> {
+  if (accepted) return { [QUALITY_KEY]: withQualityWarning(undefined, accepted) };
+  const ownedByPrevalidation = preKind === 'valid' || itemType === 'content';
+  return ownedByPrevalidation && existing?.[QUALITY_KEY] ? { [QUALITY_KEY]: null } : {};
+}
+
 export function mergeOutputSummary(
   existing: Record<string, any>,
   patch: Record<string, any>,
@@ -1136,8 +1153,7 @@ export class SchedulerService {
         : {};
       // Review P2-4: la marca es del artifact que se completa AHORA (validado en este intento): una marca de un intento o
       // generación anterior nunca sobrevive a un artifact nuevo aceptado sin degradar.
-      const qualityPatch = acc.quality ? { [QUALITY_KEY]: withQualityWarning(undefined, acc.quality) }
-        : item.output_summary?.[QUALITY_KEY] ? { [QUALITY_KEY]: null } : {};
+      const qualityPatch = completionQualityPatch(acc.quality ?? null, pre.kind, item.type, item.output_summary ?? {});
       const merged = mergeOutputSummary(item.output_summary ?? {}, { ...summary, ...biasPatch, ...validationPatch, ...qualityPatch, artifactIds: ids });
       if (merged.ok === false) throw new GuardRejection(merged.reason);
 

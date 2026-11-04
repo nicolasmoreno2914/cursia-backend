@@ -190,7 +190,7 @@ export async function applyItemFailure(
  */
 export async function applyRemediationLadder(
   qr: QueryRunner,
-  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null },
+  row: { id: string; status: string; type: string; output_summary: Record<string, any> | null; run_created_at?: Date | string | null },
   error: string,
   retryable: boolean,
   verdict: ReturnType<typeof classifyFailure>,
@@ -198,8 +198,12 @@ export async function applyRemediationLadder(
 ): Promise<LadderStep | null> {
   const step = ladderStep(remediationOf(row.output_summary), verdict, row.type, error, now, {
     retryable: retryable && row.status === 'failed',
-    // Review P0-1: la escalera no se agota mientras la auto-regeneración propia de la clase B tenga rondas.
-    autoRegenSpent: autoRegenSpentFor(row, verdict),
+    // Review P0-1 / re-review P2: la escalera no se agota mientras el barrido del auto-heal la vaya a tomar (misma
+    // decisión que el barrido, con la clase que va a quedar registrada).
+    autoRegenSpent: autoRegenSpentFor({
+      id: row.id, type: row.type, status: 'failed', error, output_summary: row.output_summary ?? {}, finished_at: now, updated_at: now,
+      failure_class: verdict.class, run_created_at: row.run_created_at ?? null,
+    }, now),
   });
   if (!step) return null;
   let status = row.status;
