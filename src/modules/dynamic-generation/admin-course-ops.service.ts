@@ -2,8 +2,8 @@ import { BadRequestException, Injectable, Logger, NotFoundException } from '@nes
 import { DataSource } from 'typeorm';
 import { GenerationManifestsService } from '../generation-manifests/generation-manifests.service';
 import { AuditLogService } from '../access/audit-log.service';
-import { normalizeDecimal } from '../finops/decimal';
-import { RunsService, ADMIN_APPROVAL_WAITING_CODES, PENDING_APPROVAL_CREATED_BY_PREFIX } from './runs.service';
+import { cmpDec, normalizeDecimal } from '../finops/decimal';
+import { RunsService, ADMIN_APPROVAL_WAITING_CODES, PENDING_APPROVAL_CREATED_BY_PREFIX, adminPlainRetryHint } from './runs.service';
 import { failureCodeOf } from './admin-recovery.service';
 
 /**
@@ -26,8 +26,14 @@ export interface AdminRunItem {
   maxAttempts: number | null;
   generation: number;
   updatedAt: string | null;
-  /** Se puede intentar un reintento simple (fallida / bloqueada / cancelada). La regla final la aplica retryItem. */
+  /**
+   * Se puede hacer el reintento SIMPLE: misma regla que retryItem({adminPlain}) (fallida o bloqueada por presupuesto, sin
+   * resultado pagado ambiguo, sin reservas abiertas, con saldo y sin re-render de video). El servidor la re-evalúa bajo lock.
+   */
   retryable: boolean;
+  /** Código de por qué no (null si se puede) y qué hacer, en palabras. */
+  retryBlockedReason: string | null;
+  retryHint: string | null;
 }
 
 export interface AdminCourseRunView {
@@ -65,9 +71,15 @@ export interface PendingApprovalEntry {
   /** Monto que la UI propone aprobar: el tope de seguridad, o el máximo del estimado. */
   suggestedAmount: string;
   createdAt: string;
+  /** Review P2-3: presupuesto del mes del dueño (quien iniciará la generación); null = presupuestos apagados. */
+  userBudget: { mode: string; assigned: boolean; availableUsd: string } | null;
+  /**
+   * Review P2-3: con presupuestos en `enforce`, el arranque del usuario también tiene que entrar en SU disponible: si no
+   * entra, aprobar no basta y hay que asignarle o ampliarle el presupuesto (Usuarios › Presupuesto).
+   */
+  budgetMustBeRaised: boolean;
 }
 
-const RETRYABLE = new Set(['failed', 'blocked', 'cancelled']);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Ventana de la bandeja: un estimado más viejo ya no se puede aprobar útilmente (la aprobación vence a las 24 h). */
 export const PENDING_APPROVALS_WINDOW_DAYS = 14;
@@ -128,6 +140,7 @@ export class AdminCourseOpsService {
         counts,
         packageReady: !!completion.packageReady,
       };
+      const verdicts = await this.runs.adminPlainRetryVerdicts(job, rows);
       view.items = rows
         .filter((r: any) => r.status !== 'completed')
         .sort((a: any, b: any) => String(a.item_key).localeCompare(String(b.item_key)))
@@ -140,7 +153,10 @@ export class AdminCourseOpsService {
           maxAttempts: r.max_attempts === null || r.max_attempts === undefined ? null : Number(r.max_attempts),
           generation: Number(r.generation ?? 1),
           updatedAt: r.updated_at ? new Date(r.updated_at).toISOString() : null,
-          retryable: RETRYABLE.has(String(r.status)),
+          ...(() => {
+            const v = verdicts.get(String(r.item_key)) ?? { retryable: false, reason: 'not_failed' };
+            return { retryable: v.retryable, retryBlockedReason: v.reason, retryHint: v.retryable ? null : adminPlainRetryHint(v.reason) };
+          })(),
         }));
     }
     await this.audit.recordSafe({
@@ -174,6 +190,11 @@ export class AdminCourseOpsService {
         limit $3`,
       [`${PENDING_APPROVAL_CREATED_BY_PREFIX}%`, codes, limit],
     );
+    const budgets = new Map<string, Awaited<ReturnType<RunsService['userBudgetForPayer']>>>();
+    for (const r of rows) {
+      const uid = String(r.owner_id ?? r.course_owner_id ?? '');
+      if (uid && UUID_RE.test(uid) && !budgets.has(uid)) budgets.set(uid, await this.runs.userBudgetForPayer(uid).catch(() => null));
+    }
     const items: PendingApprovalEntry[] = rows.map((r) => {
       const t = (r.totals && typeof r.totals === 'object') ? r.totals : {};
       const max = normalizeDecimal(t.max ?? 0);
@@ -192,6 +213,13 @@ export class AdminCourseOpsService {
         safetyCap: safety,
         suggestedAmount: safety ?? max,
         createdAt: new Date(r.created_at).toISOString(),
+        ...(() => {
+          const ub = budgets.get(String(r.owner_id ?? r.course_owner_id ?? '')) ?? null;
+          return {
+            userBudget: ub ? { mode: ub.mode, assigned: ub.assigned, availableUsd: ub.available } : null,
+            budgetMustBeRaised: !!ub && ub.mode === 'enforce' && cmpDec(safety ?? max, ub.available) > 0,
+          };
+        })(),
       };
     });
     await this.audit.recordSafe({ ...this.actorOf(actor), action: 'finops.pending_approvals_view', targetType: 'finops', targetId: null, after: { count: items.length } });
@@ -214,7 +242,7 @@ export class AdminCourseOpsService {
     const base = { ...this.actorOf(actor), action: 'course.admin_retry_item', targetType: 'course', targetId: String(job.course_id) };
     try {
       const res = await this.runs.retryItem(Number(job.course_id), String(job.owner_id), Number(job.blueprint_number), String(job.id), itemKey,
-        false, false, undefined, { id: actor.id, email: actor.email ?? null });
+        false, false, undefined, { id: actor.id, email: actor.email ?? null }, { adminPlain: true });
       await this.audit.recordSafe({ ...base, after: { runId, itemKey, ok: true, reason: reason ?? null } });
       return res;
     } catch (err) {
