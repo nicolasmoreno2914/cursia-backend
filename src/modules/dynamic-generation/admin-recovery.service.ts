@@ -258,7 +258,7 @@ export class AdminRecoveryService {
          join public.production_jobs pj on pj.id = g.job_id
         where g.updated_at >= $1::timestamptz
           and jsonb_typeof(g.output_summary->'remediation') = 'object'
-          and (g.output_summary->'remediation'->>'lastAt') >= $1
+          and (g.output_summary->'remediation'->>'lastAt') >= $1::text
         order by g.updated_at desc nulls last
         limit 5000`,
       [new Date(now.getTime() - 7 * 86_400_000).toISOString()],
