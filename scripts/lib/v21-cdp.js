@@ -23,7 +23,13 @@ function freePort() {
   });
 }
 
-async function launchChrome({ extraArgs = [] } = {}) {
+/** r98: espera máxima del endpoint CDP por lanzamiento (antes 15 s fijos: 2 flakes «CDP no disponible» en CI). */
+const CDP_WAIT_MS = Number(process.env.CURSIA_CDP_WAIT_MS) > 0 ? Number(process.env.CURSIA_CDP_WAIT_MS) : 30000;
+/** r98: relanzamientos de Chrome si el endpoint CDP no aparece (proceso nuevo, puerto y perfil nuevos). */
+const CDP_LAUNCH_RETRIES = 1;
+
+/** Un lanzamiento: Chrome + espera del target `page` en /json/list. null = CDP no apareció a tiempo (Chrome ya matado). */
+async function spawnChromeWithCdp(extraArgs) {
   let port = await freePort();
   if (port === 9334) port = await freePort();
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursia-r8-chrome-'));
@@ -39,8 +45,12 @@ async function launchChrome({ extraArgs = [] } = {}) {
     ],
     { stdio: 'ignore' },
   );
+  let exited = false;
+  proc.once('exit', () => { exited = true; });
+  proc.once('error', () => { exited = true; });
   let wsUrl = null;
-  for (let i = 0; i < 75 && !wsUrl; i++) {
+  const t0 = Date.now();
+  while (!wsUrl && !exited && Date.now() - t0 < CDP_WAIT_MS) {
     try {
       const list = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
       const p = list.find((t) => t.type === 'page');
@@ -49,9 +59,24 @@ async function launchChrome({ extraArgs = [] } = {}) {
     if (!wsUrl) await sleep(200);
   }
   if (!wsUrl) {
-    proc.kill('SIGKILL');
-    throw new Error('CDP no disponible');
+    try { proc.kill('SIGKILL'); } catch (e) {}
+    try { fs.rmSync(userDataDir, { recursive: true, force: true }); } catch (e) {}
+    return null;
   }
+  return { port, userDataDir, proc, wsUrl };
+}
+
+async function launchChrome({ extraArgs = [] } = {}) {
+  let launched = null;
+  for (let attempt = 0; attempt <= CDP_LAUNCH_RETRIES && !launched; attempt++) {
+    if (attempt > 0) {
+      console.warn(`[v21-cdp] CDP no apareció en ${CDP_WAIT_MS} ms; relanzando Chrome (intento ${attempt + 1}/${CDP_LAUNCH_RETRIES + 1})`);
+      await sleep(1000);
+    }
+    launched = await spawnChromeWithCdp(extraArgs);
+  }
+  if (!launched) throw new Error(`CDP no disponible (${CDP_LAUNCH_RETRIES + 1} lanzamientos, ${CDP_WAIT_MS} ms cada uno)`);
+  const { port, userDataDir, proc, wsUrl } = launched;
   const ws = new WebSocket(wsUrl);
   await new Promise((r, j) => {
     ws.addEventListener('open', r, { once: true });

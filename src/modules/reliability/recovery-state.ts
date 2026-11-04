@@ -28,6 +28,7 @@ import { providerReconcileDecision } from '../dynamic-generation/provider-reconc
 import { classifyFailure, currentRecoveryOf, FailureSource } from './failure-classifier';
 import { providerProbeViewOf } from './provider-probe';
 import { CLAIM_PAYLOAD_DEPENDENCY_RE } from './claim-payload-recovery';
+import { REMEDIATION_EXHAUSTED_CODE, remediationBlocksAuto, remediationOf } from './remediation-ladder';
 
 export type RecoveryState =
   | 'completed'
@@ -134,6 +135,11 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     if (os.delivery === 'blocked_auth' && os.youtubeAuthProbe) {
       return { state: 'waiting_external_quota', reason: 'youtube_auth_probe', nextRetryAt: iso(next ?? toDate(os.youtubeAuthProbe?.nextProbeAt ?? null)), automatic: true };
     }
+    // r98: el próximo intento corre un escalón de la escalera (pedido corregido / aceptación con marca de calidad).
+    const rem = remediationOf(os);
+    if (rem && !rem.outcome && (rem.rung === 1 || rem.rung === 2)) {
+      return { state: 'pending_retry', reason: rem.rung === 1 ? 'remediation_feedback' : 'remediation_accept', nextRetryAt: iso(next), automatic: true };
+    }
     return { state: 'transient_failed', reason: error ? error.split(':')[0].slice(0, 64) : null, nextRetryAt: iso(next), automatic: true };
   }
   if (status === 'pending' || status === 'running') {
@@ -148,6 +154,8 @@ export function recoveryStateOf(row: RecoveryRow, now: Date = new Date()): Recov
     return { state: 'pending_retry', reason: 'dependency_blocked', nextRetryAt: null, automatic: true };
   }
   if (status !== 'failed') return { state: null, reason: null, nextRetryAt: null, automatic: false };
+  // r98: escalera agotada con ESTE error → ningún barrido la toma; el dueño puede reintentar (owner-retry.ts).
+  if (remediationBlocksAuto(os, error)) return { state: 'failed_no_strategies', reason: REMEDIATION_EXHAUSTED_CODE, nextRetryAt: null, automatic: false };
 
   const cur = error ? currentRecoveryOf(error, row.type ?? null, os, row.failure_class ?? null, row.run_created_at ?? null) : 'manual';
   // Una fecha persistida VENCIDA no cuenta como «programada» (ningún barrido la tomó): solo la decisión vigente.

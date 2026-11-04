@@ -953,7 +953,7 @@ async function _dynContentPartialRepair(item, sys, md, hardHits, courseContext) 
   if (JSON.stringify(before) !== JSON.stringify(after)) return { ok: false, reason: 'invariants' };
   if (Math.abs(addedWords - removedWords) > Math.max(40, removedWords)) return { ok: false, reason: 'length' };
   out = _dynLqaFixText(out, courseContext);
-  var still = dynLintContentTruth(out, courseContext).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; });
+  var still = dynLintContentTruth(out, courseContext).filter(function (h) { return !_dynSoftLang(item)[h.code]; });
   if (still.length) return { ok: false, reason: 'still_flagged' };
   return { ok: true, md: out, replaced: spans.length };
 }
@@ -1006,7 +1006,7 @@ async function _dynRunContentV2(item) {
   var truthRetried = false;
   // #542 (M2): la concordancia de persona («lo que dijiste el cliente») es barata solo si ya hay un
   // reintento: sola no reescribe un capítulo entero (≈ 16k tokens) ni lo hace fallar; queda en el summary.
-  var hardTruth = function (hs) { return hs.filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; }); };
+  var hardTruth = function (hs) { return hs.filter(function (h) { return !_dynSoftLang(item)[h.code]; }); };
   var partialRepair = null;
   if (hardTruth(truthHits).length) {
     // Loop 7 (O2): primero se reparan SOLO las oraciones señaladas (~cientos de tokens en vez de reescribir el
@@ -1019,7 +1019,7 @@ async function _dynRunContentV2(item) {
       partialRepair = { sentences: pr.replaced };
       // Review L7 (I3): el sidecar se escribió junto con las oraciones reparadas; si repite el dato inventado se descarta
       // y se pide de nuevo (reintento barato SOLO del sidecar, sobre el capítulo ya reparado).
-      if (ex.contextSummary && _dynJsonTruthHits(ex.contextSummary, courseContext).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; }).length) {
+      if (ex.contextSummary && _dynJsonTruthHits(ex.contextSummary, courseContext).filter(function (h) { return !_dynSoftLang(item)[h.code]; }).length) {
         ex.contextSummary = null;
         ex.status = 'missing';
         partialRepair.sidecarRegenerated = true;
@@ -1229,6 +1229,16 @@ var DYN_GRAMMAR_PERSON_NOT_VERB = { viste: 1, triste: 1, existe: 1, consiste: 1,
 // Códigos de idioma «blandos»: piden reintento en los items JSON (1.er intento) pero nunca hacen fallar
 // una parte, y en el capítulo (markdown) solo viajan con un reintento que ya iba a ocurrir.
 var DYN_SOFT_LANG_CODES = { GRAMMAR_PERSON: true };
+// r98 (escalera de remediación, rung 2 — backend reliability/remediation-ladder.ts): la parte ya falló tres veces por la
+// MISMA neutralidad del idioma, una de ellas con las correcciones en el pedido. El servidor la deja aceptar con marca de
+// calidad (output_summary.remediation.acceptCodes): voseo / «vosotros» / regionalismos pasan a blandos SOLO en ese
+// intento. Veracidad, inglés y todo lo estructural siguen siendo duros.
+var DYN_REMEDIATION_LANG_CODES = { VOSEO: true, VOSOTROS: true, REGIONAL: true };
+function _dynSoftLang(item) {
+  var rem = item && item.outputSummary && item.outputSummary.remediation;
+  var accept = rem && rem.rung === 2 && !rem.outcome && Array.isArray(rem.acceptCodes) && rem.acceptCodes.indexOf('LANGUAGE_NOT_NEUTRAL') !== -1;
+  return accept ? Object.assign({}, DYN_SOFT_LANG_CODES, DYN_REMEDIATION_LANG_CODES) : DYN_SOFT_LANG_CODES;
+}
 function dynLintGrammarPerson(text) {
   var m = DYN_GRAMMAR_PERSON_RE.exec(_dynFold(text));
   return !!(m && !DYN_GRAMMAR_PERSON_NOT_VERB[m[1]]);
@@ -3968,9 +3978,9 @@ async function _dynV3JsonWithRetry(item, sys, prompt, maxTok, build, opts) {
       var soft = (r.soft || []).slice();
       var th = _dynJsonTruthHits(r.value, item.context && item.context.courseContext);
       var label = function (h) { return '$ ' + (h.code === 'VOSEO' ? 'IDIOMA: ' + (h.lqa ? _dynTruthHitLabel(h.code, h) : 'voseo, usa tuteo (tú)') : (h.code === 'VOSOTROS' || h.code === 'ENGLISH' || h.code === 'GRAMMAR_PERSON' || h.code === 'REGIONAL') ? 'IDIOMA: ' + _dynTruthHitLabel(h.code, h) : 'VERACIDAD: ' + _dynTruthHitLabel(h.code)) + ': "' + h.text.slice(0, 120) + '"'; };
-      var hard = th.filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; });
+      var hard = th.filter(function (h) { return !_dynSoftLang(item)[h.code]; });
       // #542 (M2): la concordancia es blanda.
-      th.filter(function (h) { return DYN_SOFT_LANG_CODES[h.code]; }).forEach(function (h) { soft.push('[' + h.code + '] ' + label(h)); });
+      th.filter(function (h) { return _dynSoftLang(item)[h.code]; }).forEach(function (h) { soft.push('[' + h.code + '] ' + label(h)); });
       if (hard.length) r = { ok: false, errors: hard.map(label).concat(soft) };
       else r = { ok: true, value: r.value, soft: soft };
     }
@@ -4485,7 +4495,7 @@ async function _dynAppLoadDraft(item, expect) {
   try { v = expect.validateStudent ? expect.validateStudent(doc.activity) : dynValidateApplicationStudentPart(doc.activity, expect.minutes); } catch (e) { v = null; }
   if (!v || v.errors.length) { out.reason = 'invalid'; return out; }
   var hardTruth;
-  try { hardTruth = _dynJsonTruthHits(doc.activity, cc).filter(function (h) { return !DYN_SOFT_LANG_CODES[h.code]; }); }
+  try { hardTruth = _dynJsonTruthHits(doc.activity, cc).filter(function (h) { return !_dynSoftLang(item)[h.code]; }); }
   catch (e) { out.reason = 'invalid'; return out; }
   if (hardTruth.length) { out.reason = 'truth'; return out; }
   out.activity = doc.activity;

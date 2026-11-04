@@ -2844,12 +2844,15 @@ export class RunsService {
       if (!auto && actor && !isSuperAdminEmail(actor.email) && (target.status === 'failed' || isBudgetBlocked(target))) {
         const [fullRow] = await qr.query(`select * from public.generation_item_runs where id = $1`, [target.id]);
         const now = new Date();
+        const autoResolving = !!fullRow && recoveryStateOf({ ...fullRow, run_created_at: job.created_at ?? null }, now).automatic;
         const conflict = (v: OwnerRetryView) => new ConflictException({
           code: v.reason, ownerRetry: v,
           message: `${v.reason}: el reintento de "${itemKey}" no se hizo (no se cambió nada).` +
             (v.reason === 'owner_retry_limit' ? ' Ya usaste los reintentos de esta parte en las últimas 24 h; el equipo de Cursia la revisará.'
               : v.reason === 'run_budget_insufficient' || v.reason === 'policy_cap_reached' ? ' El saldo autorizado no cubre el costo máximo de esta parte: hace falta ampliar la autorización.'
                 : v.reason === 'open_reservations' ? ' Hay un cobro de esta parte pendiente de confirmar; Cursia lo concilia antes de reintentar.'
+                  // r98: si un barrido automático (conciliación con el proveedor / reenvío único acotado) la va a tomar, se dice.
+                  : autoResolving ? ' Hay un resultado pagado sin confirmar: Cursia lo está conciliando automáticamente con el proveedor y la parte se retoma sola.'
                   : ' Hay un cobro sin conciliar o un resultado ambiguo: el equipo de Cursia lo revisa.'),
         });
         const used = ownerRetriesUsed(fullRow?.output_summary, now);

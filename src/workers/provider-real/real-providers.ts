@@ -29,6 +29,7 @@
 //    pagarse: un re-claim no vuelve a pagar nada de lo guardado.
 //  - Las claves se leen del entorno en cada item y nunca se loguean.
 // ─────────────────────────────────────────────────────────────────────────────
+import { QUALITY_KEY, acceptCodesOf, qualityAcceptance, remediationFeedbackOf, remediationOf, withQualityWarning } from '../../modules/reliability/remediation-ladder';
 import { markLostResultResendCharge, persistedPaidOpIds, lostResultConsumeMark } from '../../modules/dynamic-generation/lost-result';
 import { createHash } from 'crypto';
 import type { Logger } from '@nestjs/common';
@@ -1187,6 +1188,11 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     nivel: (item.context?.courseContext as any)?.nivel ?? null,
     pais: (item.context?.courseContext as any)?.pais ?? null,
     contentMarkdown: markdown,
+    // r98 (escalera de remediación): correcciones del validador (rung 1) / aceptación con marca de calidad (rung 2).
+    remediation: {
+      feedback: remediationFeedbackOf(item.outputSummary),
+      acceptLanguage: acceptCodesOf(item.outputSummary).has('AUDIOBOOK_LANGUAGE_NOT_NEUTRAL'),
+    },
   };
   const itemRole = providerCallRoleOf(item.attempt);
   let llmClient: AnthropicClient | null = null;
@@ -1274,6 +1280,7 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
     return fail(deps, item, `audiobook_script_failed: ${where}: ${err instanceof Error ? err.message : String(err)}`, e ? e.retryable : true);
   };
 
+  let qualityState: Record<string, any> | undefined = (item.outputSummary as any)?.[QUALITY_KEY];
   // ── 1. Plan + guion por bloque (solo los bloques que falten) ───────────────
   if (needsLlm) {
     plan = {
@@ -1305,6 +1312,14 @@ export async function processRealAudiobook(deps: RealProviderDeps, item: Claimed
       };
       // Idempotencia: el guion aceptado del bloque queda guardado — un re-claim no vuelve a pagarlo.
       await record(deps, item, { audiobookSections: sections });
+      if (res.qualityAccepted) {
+        // r98 (rung 2): el bloque se narra con marca de calidad (output_summary.quality → informe de calidad del paquete).
+        qualityState = withQualityWarning(qualityState, {
+          ...qualityAcceptance([res.qualityAccepted.code], res.qualityAccepted.findings, new Date(), remediationOf(item.outputSummary)?.fingerprint ?? null),
+          section: section.idx + 1,
+        });
+        await record(deps, item, { [QUALITY_KEY]: qualityState });
+      }
       if (tracker) tracker.unpersistedPaidOutput = null;
     }
   }

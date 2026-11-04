@@ -709,3 +709,25 @@ export function missingGeneratorTexts(): string[] {
   missing.push(...missingLearningPlanTexts());
   return missing;
 }
+
+/**
+ * r98 (escalera de remediación, rung 1): el intento siguiente a un fallo determinista repetido CAMBIA su entrada — los
+ * hallazgos del validador van al prompt dentro del bloque del brief (el ejecutor del navegador y el worker de IA ya lo
+ * insertan tal cual: dynPedagogyBlock). Sin brief se arma uno mínimo SOLO para generadores LLM (los de proveedor —
+ * presentación / video— no tienen bloque). El texto respeta PEDAGOGY_BRIEF_TEXT_MAX (el feedback se recorta, nunca el
+ * diseño). null = este item no tiene dónde llevarlo.
+ */
+export function withRemediationFeedback(brief: ItemPedagogyBrief | null, item: BriefInput['item'], feedback: string): ItemPedagogyBrief | null {
+  const fb = String(feedback ?? '').trim();
+  const gen = brief?.generator ?? generatorForItem(item);
+  if (!fb || !gen || PROVIDER_GENERATORS.has(gen)) return brief;
+  const base = brief?.text ?? renderText(gen, []);
+  const room = PEDAGOGY_BRIEF_TEXT_MAX - base.length - 1;
+  if (room < 80) return brief;
+  const text = `${base}\n${fb.slice(0, room)}`;
+  return {
+    ...(brief ?? { version: GENERATOR_DIRECTIVES_VERSION, engineVersion: 0, generator: gen, directives: [], overridden: [] }),
+    text,
+    textSha256: sha256(text),
+  } as ItemPedagogyBrief;
+}

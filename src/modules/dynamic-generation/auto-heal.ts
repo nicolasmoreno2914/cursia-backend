@@ -35,6 +35,7 @@
 // `DYNAMIC_AUTO_HEAL_POLICY=legacy` vuelve a R16 tal cual (kill-switch).
 // Puro salvo `startAutoHealTimer`.
 // ─────────────────────────────────────────────────────────────────────────────
+import { remediationBlocksAuto } from '../reliability/remediation-ladder';
 import {
   AUTO_HEAL_ALLOW_LIST,
   AUTO_HEAL_DENY_PATTERNS,
@@ -204,7 +205,9 @@ export type { AutoHealRule, SafeAutoRetryRule } from '../reliability/auto-heal-r
 export type AutoHealSkipReason =
   | 'not_failed' | 'no_error' | 'denied' | 'not_allow_listed' | 'missing_precondition' | 'cap_reached' | 'backoff' | 'too_old'
   // r62 (d2): la clase A agotó su ventana TOTAL de recuperación automática (classATotalHours) → excepción registrada.
-  | 'recovery_window_exhausted';
+  | 'recovery_window_exhausted'
+  // r98: la escalera de remediación se agotó con ESTE error (misma huella tras corregir el pedido): solo el dueño reintenta.
+  | 'remediation_exhausted';
 
 /** R16 fix M6: tope de rondas según quién ejecuta el item. */
 export function autoHealMaxRoundsFor(type: string | null | undefined, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): number {
@@ -231,7 +234,7 @@ export function autoRegenRoundsOf(outputSummary: Record<string, any> | null | un
 }
 
 /** Motivos permanentes para ESTE texto de error (el barrido no lo vuelve a mirar hasta que el error cambie). */
-export const AUTO_HEAL_PERMANENT_SKIPS: readonly AutoHealSkipReason[] = Object.freeze(['denied', 'not_allow_listed', 'missing_precondition', 'cap_reached', 'recovery_window_exhausted'] as AutoHealSkipReason[]);
+export const AUTO_HEAL_PERMANENT_SKIPS: readonly AutoHealSkipReason[] = Object.freeze(['denied', 'not_allow_listed', 'missing_precondition', 'cap_reached', 'recovery_window_exhausted', 'remediation_exhausted'] as AutoHealSkipReason[]);
 
 function fnv1a(s: string): number {
   let h = 0x811c9dc5;
@@ -448,6 +451,7 @@ export function isAutoHealDenied(error: string): boolean {
 
 /** Decisión pura: ¿se reabre automáticamente este item ahora? */
 export function autoHealDecision(row: AutoHealRow, now: Date, policy: AutoHealPolicy = DEFAULT_AUTO_HEAL_POLICY): AutoHealDecision {
+  if (row.status === 'failed' && remediationBlocksAuto(row.output_summary, row.error)) return { heal: false, reason: 'remediation_exhausted' };
   if (policy.classAware) return classAwareDecision(row, now, policy);
   if (row.status !== 'failed') return { heal: false, reason: 'not_failed' };
   const error = String(row.error ?? '').trim();
@@ -485,6 +489,7 @@ export function safeAutoRetryDecision(row: AutoHealRow, now: Date, policy: AutoH
   if (row.status !== 'failed') return { heal: false, reason: 'not_failed' };
   const error = String(row.error ?? '').trim();
   if (!error) return { heal: false, reason: 'no_error' };
+  if (remediationBlocksAuto(row.output_summary, row.error)) return { heal: false, reason: 'remediation_exhausted' };
   const rule = SAFE_AUTO_RETRY_RULES.find((r) => r.match.test(error)) ?? null;
   if (!rule || (row.type && row.type !== rule.type)) return { heal: false, reason: 'not_allow_listed' };
   // La deny-list del auto-healer también gana acá (ambiguo, cuota, presupuesto, configuración…).
