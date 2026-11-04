@@ -93,7 +93,7 @@ export interface VerificationInput {
   policyKind: 'application_first' | 'depth_first' | null;
   audiovisual: 'less' | 'recommended' | 'more' | null;
   pinnedChapters: number;
-  cost: { min: string; expected: string; max: string } | null;
+  cost: { min: string; expected: string; max: string; /** r90: tope de seguridad (esperado × factor). */ safetyCap?: string } | null;
   /** Preferencias vigentes (una corrección «Ajustar» solo se ofrece si cambia algo). */
   preferences: { emphasis: string; applicationActivities: string };
   /**

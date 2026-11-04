@@ -23,6 +23,7 @@ import { LINK_CONTAINMENT_MIN, suggestOutcomeLinks } from '../academic-context/c
 import type { AcademicContextV1 } from '../academic-context/academic-context';
 import { tokenSet } from '../coherence/normalize';
 import { proposedChapterUuid } from '../pedagogy/dry-run';
+import { readSafetyCapFactor, safetyCapOf } from '../finops/safety-cap';
 import { advanceStructureOriginIfUntouched, readStructureOrigin } from '../course-structure/structure-authority';
 import { compareRequirements, DesignForRequirements, RequirementCheck, teacherHoursDeviate } from '../academic-context/requirements/document-requirements';
 import {
@@ -477,7 +478,8 @@ export class CourseDesignService {
         alignment: dist.materialized ? (dist.materialized as any).alignment : null,
         approach: profile.primaryApproach ? { id: profile.primaryApproach, label: approachDef ? approachDef.label : profile.primaryApproach } : null,
         policyKind: dist.policy ? dist.policy.kind : null, audiovisual: prefs.audiovisual || null, pinnedChapters,
-        cost: providers && providers.estimateUsd ? providers.estimateUsd : null,
+        // r90: + tope de seguridad (esperado × factor, lo que se autorizaría); el dry-run en sí no cambia (huellas C8).
+        cost: providers && providers.estimateUsd ? { ...providers.estimateUsd, safetyCap: safetyCapOf(providers.estimateUsd.expected, readSafetyCapFactor()) } : null,
         preferences: { emphasis: prefs.emphasis || 'balanced', applicationActivities: prefs.applicationActivities || 'auto' },
         autoLink: {
           chapterIds: linkPlan.map((p) => p.chapterId),
@@ -576,7 +578,9 @@ export class CourseDesignService {
       suggestedApproach: suggestion ? suggestion.approach : null,
       manifestTotals: dist && dist.materialized ? dist.materialized.totals : null,
       blueprintSha256: dist && dist.materialized ? dist.materialized.blueprintSha256 : null,
-      cost: providers && providers.estimateUsd ? { min: providers.estimateUsd.min, expected: providers.estimateUsd.expected, max: providers.estimateUsd.max, note: providers.estimateNote,
+      cost: providers && providers.estimateUsd ? { min: providers.estimateUsd.min, expected: providers.estimateUsd.expected, max: providers.estimateUsd.max,
+        // r90: tope de seguridad (lo que se autorizaría); la UI lo muestra en lugar del máximo p90.
+        safetyCap: safetyCapOf(providers.estimateUsd.expected, readSafetyCapFactor()), note: providers.estimateNote,
         // r79 (F2 + Gamma): de dónde salen los precios y si la cifra es provisional (precio de Gamma sin verificar).
         ...(providers.pricingSource ? { pricingSource: providers.pricingSource } : {}),
         ...(providers.provisionalPricing ? { provisionalPricing: providers.provisionalPricing } : {}) } : null,
