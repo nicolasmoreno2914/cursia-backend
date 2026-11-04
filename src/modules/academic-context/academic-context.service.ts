@@ -9,6 +9,10 @@ import { loadCurrentAcademicContext } from './academic-db';
 import { proposeStructureFromContext, suggestOutcomeLinks, suggestProfileFromContext } from './context-design';
 import { DocumentReadError } from './extract/text-sources';
 import { extractAcademicContext } from './extract/extractor';
+import { pickCursiaMicrocurriculum } from './extract/cursia-template';
+import { McPdfEmbedded, microcurriculumShapeProblems } from '../microcurriculum/pdf-payload';
+import { normalizeAnswers } from '../microcurriculum/answers';
+import type { MicrocurriculumV1 } from '../microcurriculum/microcurriculum.types';
 import { validateAcademicContext } from './validate';
 import { ExtractAcademicContextDto, ExtractAdvancedDto, OutcomesDto, ProposalDto } from './dto/extract.dto';
 import { ProposedContextError, buildProposedContext, rewriteOutcomes } from './proposed-context';
@@ -65,7 +69,7 @@ export class AcademicContextService {
     await this.loadCourse(courseId, ownerId);
     const inputs = dto.files.map((f) => ({ name: f.name, data: Buffer.from(f.dataBase64, 'base64') }));
     try {
-      const r = await extractAcademicContext(inputs);
+      const r = await extractAcademicContext(inputs, { resolveCursiaMicrocurriculum: (hint) => this.ownerMicrocurriculum(ownerId, hint) });
       const requirements = await this.keepRequirements(courseId, r);
       // LOOP 8.1: cargador único — se informa si la lectura gratuita alcanzó y si la avanzada puede ayudar.
       const quality = extractionQuality(r.context);
@@ -78,6 +82,24 @@ export class AcademicContextService {
       if (err instanceof DocumentReadError) throw new BadRequestException({ code: err.code, message: `${err.code}: ${err.message}` });
       if (err instanceof Error && /^ACADEMIC_/.test(err.message)) throw new BadRequestException(err.message.slice(0, 500));
       throw err;
+    }
+  }
+
+  /**
+   * r86 · PDF de microcurrículo de Cursia descargado antes de r86 (sin copia adjunta): el documento guardado del MISMO
+   * docente (consulta acotada a su owner_id) cuyo nombre y contenido coinciden con el PDF. Cualquier fallo → null (se
+   * lee el texto del PDF como siempre).
+   */
+  private async ownerMicrocurriculum(ownerId: string, hint: { courseName: string; text: string }): Promise<McPdfEmbedded | null> {
+    try {
+      const rows: { id: string; answers: unknown; document: unknown }[] = await this.dataSource.query(
+        `select id, answers, document from public.microcurricula where owner_id = $1 and document is not null order by updated_at desc limit 200`, [ownerId]);
+      const valid = (rows || []).filter((r) => !microcurriculumShapeProblems(r.document).length);
+      const hit = pickCursiaMicrocurriculum(valid, hint);
+      return hit ? { mc: hit.document as MicrocurriculumV1, answers: normalizeAnswers(hit.answers || {}), microcurriculumId: hit.id } : null;
+    } catch (err) {
+      this.logger.warn(`[academic-extract] búsqueda de microcurrículo de Cursia omitida: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+      return null;
     }
   }
 

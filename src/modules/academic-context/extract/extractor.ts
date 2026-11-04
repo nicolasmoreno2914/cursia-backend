@@ -23,7 +23,10 @@ import {
   normalizeAcademicContext,
 } from '../academic-context';
 import { bloomLevelOf, outcomeDomainOf } from '../bloom';
-import { ReadDocument, SourceLine, readDocument } from './text-sources';
+import { MAX_DOCUMENT_BYTES, ReadDocument, SourceLine, readDocument, sniffMediaType } from './text-sources';
+import { cursiaCourseNameOf, isCursiaMicrocurriculumText, isCursiaTemplateLabel, normalizeCursiaTemplateLines } from './cursia-template';
+import { McPdfEmbedded, readMicrocurriculumPdfPayload } from '../../microcurriculum/pdf-payload';
+import { toAcademicContext } from '../../microcurriculum/to-academic-context';
 
 /**
  * Extracción DETERMINISTA de un microcurrículo / sílabo → contexto académico estructurado. Sin LLM, sin red,
@@ -52,6 +55,13 @@ export interface ExtractionInput {
   name: string;
   data: Buffer;
 }
+
+/**
+ * r86 · Busca, entre los microcurrículos del DOCENTE que importa (consulta acotada a su cuenta), el documento de un PDF
+ * de Cursia sin copia adjunta. Devuelve null si no hay uno que coincida sin ambigüedad.
+ */
+export type CursiaMicrocurriculumResolver = (hint: { courseName: string; text: string }) => Promise<McPdfEmbedded | null>;
+export interface ExtractionOptions { resolveCursiaMicrocurriculum?: CursiaMicrocurriculumResolver }
 
 export interface ExtractionResult {
   context: AcademicContextV1;
@@ -341,7 +351,8 @@ class DocExtraction {
   /** Encabezado de la primera sección de metodología (otra con distinto encabezado la complementa). */
   private methodologyHeading: string | null = null;
 
-  constructor(readonly docId: string) {}
+  /** r86: el documento es un PDF de microcurrículo de Cursia (firma de la plantilla). */
+  constructor(readonly docId: string, private readonly cursiaTemplate = false) {}
 
   src(l: SourceLine, section: string | null): SourceRef {
     return { documentId: this.docId, section, page: l.page, line: l.line, excerpt: excerptOf(l.text) };
@@ -726,6 +737,11 @@ class DocExtraction {
   // ── Resultados y competencias (ids) ──
 
   private finishOutcomes(sections: Section[]): void {
+    if (this.cursiaTemplate) {
+      // r86: en un PDF de Cursia, un rótulo de la plantilla nunca es un resultado ni una competencia.
+      this.rawOutcomes = this.rawOutcomes.filter((o) => !isCursiaTemplateLabel(o.item.text));
+      this.rawCompetencies = this.rawCompetencies.filter((c) => !isCursiaTemplateLabel(c.item.text));
+    }
     const hasOutcomes = sections.some((s) => s.key === 'outcomes');
     const raw = hasOutcomes ? this.rawOutcomes.filter((o) => o.inferredFrom === null) : this.rawOutcomes;
     const ids = assignIds(raw.map((o) => o.code), 'RA', ACADEMIC_LIMITS.outcomes);
@@ -1384,17 +1400,87 @@ function sha256(buf: Buffer): string {
  * Lee y extrae 1–5 documentos y los fusiona en orden (lo ya encontrado no se pisa; las diferencias quedan como
  * conflicto). Devuelve un contexto en forma canónica (normalizeAcademicContext) — nunca persiste nada.
  */
-export async function extractAcademicContext(inputs: ExtractionInput[]): Promise<ExtractionResult> {
+/** r86 · Contexto exacto desde el documento de Cursia (puente puro); null si no produce un contexto válido. */
+function exactContextOf(e: McPdfEmbedded): AcademicContextV1 | null {
+  try {
+    return toAcademicContext(e.mc, e.answers);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(`[academic-extract] copia de microcurrículo de Cursia descartada: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);
+    return null;
+  }
+}
+
+/** Secciones presentes en un contexto (para `stats.sectionsFound` cuando no se leyó el texto). */
+function sectionsOfContext(c: AcademicContextV1): SectionKey[] {
+  const out: SectionKey[] = [];
+  if (c.identity.subjectName.status !== 'missing') out.push('subject');
+  if (c.identity.program.status !== 'missing') out.push('program');
+  if (c.identity.educationLevel.status !== 'missing') out.push('level');
+  if (c.identity.generalObjective.status !== 'missing') out.push('generalObjective');
+  if (c.identity.description.status !== 'missing') out.push('description');
+  if (c.learner.profile.status !== 'missing') out.push('learner');
+  if (c.learner.priorKnowledge.status !== 'missing') out.push('prior');
+  if (c.outcomes.length) out.push('outcomes');
+  if (c.competencies.length) out.push('competencies');
+  if (c.units.length) out.push('contents');
+  if (c.hours.total.status !== 'missing' || c.hours.components.length) out.push('hours');
+  if (c.evaluation.length) out.push('evaluation');
+  if (c.bibliography.length) out.push('bibliography');
+  if (c.methodology.status !== 'missing') out.push('methodology');
+  return out;
+}
+
+const EMPTY_REQUIREMENTS = (): RequirementsExtraction => ({ requirementsVersion: 1, requirements: [], groups: [], conflicts: [], ignored: [], multiCourse: false, subjects: [] });
+
+export async function extractAcademicContext(inputs: ExtractionInput[], opts: ExtractionOptions = {}): Promise<ExtractionResult> {
   if (!inputs.length) throw new Error('ACADEMIC_EXTRACT_NO_DOCUMENTS: se necesita al menos un documento');
   if (inputs.length > ACADEMIC_LIMITS.documents) throw new Error(`ACADEMIC_EXTRACT_TOO_MANY: como máximo ${ACADEMIC_LIMITS.documents} documentos`);
   const notes: ExtractionNote[] = [];
-  const parts: { doc: AcademicDocument; ex: DocExtraction }[] = [];
+  const parts: { doc: AcademicDocument; ctx: AcademicContextV1 }[] = [];
   const reqParts: { documentId: string; x: RequirementsExtraction }[] = [];
   let totalLines = 0;
   const sections = new Set<string>();
+  const exact: (AcademicContextV1 | null)[] = [];
   for (const [i, input] of inputs.entries()) {
     const docId = `D${i + 1}`;
-    const read = await readDocument(input.data, input.name);
+    const docName = collapse(input.name).slice(0, ACADEMIC_LIMITS.name) || docId;
+    // r86 · PDF generado por «Crear microcurrículo»: su copia adjunta (huella + forma validadas) es el documento exacto;
+    // no se interpreta el texto. Una copia inválida o alterada se ignora y el PDF se lee como cualquier otro.
+    const isPdf = input.data.length <= MAX_DOCUMENT_BYTES && sniffMediaType(input.data, input.name) === 'application/pdf';
+    const embedded = isPdf ? await readMicrocurriculumPdfPayload(input.data) : null;
+    const fromEmbedded = embedded ? exactContextOf(embedded) : null;
+    let read: ReadDocument | null = null;
+    let fromOwner: AcademicContextV1 | null = null;
+    let cursiaTemplate = false;
+    if (!fromEmbedded) {
+      read = await readDocument(input.data, input.name);
+      cursiaTemplate = read.mediaType === 'application/pdf' && isCursiaMicrocurriculumText(read.lines);
+      if (cursiaTemplate && opts.resolveCursiaMicrocurriculum) {
+        const courseName = cursiaCourseNameOf(read.lines);
+        if (courseName) {
+          const hit = await opts.resolveCursiaMicrocurriculum({ courseName, text: read.lines.map((l) => l.text).join('\n') }).catch(() => null);
+          fromOwner = hit ? exactContextOf(hit) : null;
+        }
+      }
+    }
+    const exactCtx = fromEmbedded || fromOwner;
+    if (exactCtx) {
+      const doc: AcademicDocument = { ...exactCtx.documents[0], id: docId };
+      const ex = new DocExtraction(docId);
+      ex.note(fromEmbedded ? 'CURSIA_MICROCURRICULUM_EXACT' : 'CURSIA_MICROCURRICULUM_MATCHED', fromEmbedded
+        ? `«${docName}» es un microcurrículo creado con Cursia: se leyó su copia exacta, sin interpretar el texto del PDF.`
+        : `«${docName}» es un microcurrículo creado con Cursia: se usó tu microcurrículo guardado en Cursia, sin interpretar el texto del PDF.`);
+      for (const k of sectionsOfContext(exactCtx)) sections.add(k);
+      notes.push(...ex.notes);
+      parts.push({ doc, ctx: exactCtx });
+      reqParts.push({ documentId: docId, x: EMPTY_REQUIREMENTS() });
+      exact.push(exactCtx);
+      continue;
+    }
+    exact.push(null);
+    if (!read) throw new Error('ACADEMIC_EXTRACT_UNREACHABLE');
+    if (cursiaTemplate) read = { ...read, lines: normalizeCursiaTemplateLines(read.lines) };
     totalLines += read.lines.length;
     const doc: AcademicDocument = {
       id: docId,
@@ -1406,7 +1492,7 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
       characters: read.characters,
       extractor: { id: EXTRACTOR_ID, version: EXTRACTOR_VERSION },
     };
-    const ex = new DocExtraction(docId);
+    const ex = new DocExtraction(docId, cursiaTemplate);
     for (const n of read.notes ?? []) ex.note(n.code, `«${doc.name}»: ${n.message}`);
     if (!read.lines.length) {
       ex.note('DOCUMENT_WITHOUT_TEXT', `«${doc.name}» no tiene texto extraíble (¿PDF escaneado?). Cursia no hace OCR: sube un PDF con texto o un DOCX.`);
@@ -1418,7 +1504,7 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
     const dangling = ex.ctx.outcomes.length || ex.ctx.competencies.length ? danglingRefs(ex.ctx) : [];
     if (dangling.length) ex.note('UNKNOWN_OUTCOME_REF_IN_DOCUMENT', `«${doc.name}» vincula ${dangling.join(', ')}, que no aparecen entre sus resultados de aprendizaje o competencias: esos vínculos no se guardaron.`);
     notes.push(...ex.notes);
-    parts.push({ doc, ex });
+    parts.push({ doc, ctx: ex.ctx });
     // LOOP 8.6B (review I2): un fallo del lector de requisitos nunca impide leer el documento; se dice en una nota.
     try {
       reqParts.push({ documentId: docId, x: extractRequirements(read.lines, docId) });
@@ -1426,10 +1512,19 @@ export async function extractAcademicContext(inputs: ExtractionInput[]): Promise
       notes.push({ code: 'REQUIREMENTS_NOT_READ', documentId: docId, message: `«${doc.name}»: no pudimos leer sus requisitos explícitos (cantidades de módulos, capítulos, horas…); el resto del documento sí se leyó.` });
       // eslint-disable-next-line no-console
       console.warn(`[requirements] ${docId}: ${err instanceof Error ? err.message : String(err)}`);
-      reqParts.push({ documentId: docId, x: { requirementsVersion: 1, requirements: [], groups: [], conflicts: [], ignored: [], multiCourse: false, subjects: [] } });
+      reqParts.push({ documentId: docId, x: EMPTY_REQUIREMENTS() });
     }
   }
-  const merged = mergeExtractions(parts.map((p) => p.ex.ctx), parts.map((p) => p.doc));
+  // r86: un único PDF de Cursia leído de forma exacta → el contexto es el del puente, tal cual.
+  if (inputs.length === 1 && exact[0]) {
+    return {
+      context: exact[0],
+      requirements: mergeRequirementExtractions(reqParts),
+      notes,
+      stats: { documents: 1, lines: 0, sectionsFound: [...sections].sort(), providersCalled: 0 },
+    };
+  }
+  const merged = mergeExtractions(parts.map((p) => p.ctx), parts.map((p) => p.doc));
   // Vínculos que, ya fusionados, no apuntan a ningún resultado ni competencia: se quitan con una nota (nunca se guarda
   // un vínculo roto).
   const finalDangling = danglingRefs(merged);
