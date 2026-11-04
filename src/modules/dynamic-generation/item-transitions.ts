@@ -169,8 +169,8 @@ export async function applyItemFailure(
   // servidor (drain del worker); un mensaje del navegador siempre es `failed`. Nunca del errorCode reportado.
   const outcome: AttemptOutcome = meta?.outcome
     ?? (meta?.source === 'browser_executor' ? 'failed' : outcomeForFailure(extractFailureCode(error)));
-  // r98: escalera de remediación de un fallo DETERMINISTA (misma huella otra vez → el próximo intento cambia su entrada;
-  // después, aceptación con marca de calidad si el validador es degradable; si no, agotada → el dueño reintenta a mano).
+  // r98/r99: escalera de remediación de un fallo DETERMINISTA (desde el 1.er rechazo el próximo intento cambia su entrada;
+  // después reescritura con todos los hallazgos; agotada → pausa como bug de Cursia). Nunca aceptación degradada.
   const step = await applyRemediationLadder(qr, row, error, retryable, verdict);
   // r99: sin estrategia automática (código sin regla, contrato roto, configuración de Cursia…) desde la PRIMERA vez, o la
   // escalera agotada → pausa como bug de Cursia: `failed` sin más intentos (nunca un reintento idéntico), sin gasto.
@@ -190,9 +190,9 @@ export async function applyItemFailure(
 /**
  * r98: aplica la escalera (reliability/remediation-ladder.ts) a una parte recién fallada, en la MISMA transacción.
  * Muta `row` (status / output_summary) para que el estado de recuperación y el bloqueo de dependientes vean el resultado.
- *  - feedback / accept con la parte `failed` por intentos agotados → UN intento más (`retrying`, ≤ MAX_LADDER_GRANTS por
+ *  - feedback / rewrite con la parte `failed` por intentos agotados → UN intento más (`retrying`, ≤ MAX_LADDER_GRANTS por
  *    huella), con el backoff base; el intento pasa por los guards de gasto de siempre;
- *  - exhausted → ningún intento extra ni reapertura automática con esa huella (los intentos propios se terminan de usar).
+ *  - exhausted → ningún intento extra ni reapertura automática con esa huella; r99: applyCursiaIssueHold la pausa.
  */
 export async function applyRemediationLadder(
   qr: QueryRunner,
