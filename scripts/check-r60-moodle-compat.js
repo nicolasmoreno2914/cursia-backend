@@ -35,24 +35,25 @@ const CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures/commerc
 // r78 (builder 3.18.0, Libro Guía en el celular): los 17 recalculados a propósito (--all) — la sección 1 suma el libro en línea
 // (mod_book, mismo texto del PDF) y la tarjeta del Libro su botón «Leer en el celular»; los moduleid siguientes corren uno.
 // Mismos archivos de contenido (PDF del Libro byte a byte); el resto de los HTML igual salvo el id de los tokens (check-r78 B6).
+// r100 (builder 3.19.0, sin subir versión): el botón «Ver presentación completa» abre en una pestaña nueva (target="_blank" rel="noopener noreferrer" en el <a>); dorados recalculados a propósito — diff por entrada del zip contra b80599ae~1: SOLO cambian los label.xml de la tarjeta de presentación y solo por ese atributo. Los 17 (--all).
 const GOLDEN_3_15_1 = {
-  'A-S': '875b5481e9c8e4ec7d0d741b181e26781d32c30984a3c88e74c91ed2a2b41910',
-  'B-M': '0f992b9ab8ad18e9ac296b18413c7788f843d0d53d5dff0b2d712c3085e9ca8f',
-  'C-L': 'e0e80ccac75b20ce8df9bc988a51528fa64cb72e388b55edfa5e36873abf5d93',
-  procedimental: 'f4170cf6f8cb998b4015dafd5905221415b0f76334b019d244c7d4e1b3b8cd03',
-  conceptual: '6d2899df4bc410c116d8922a7e5dc0d87724bcfc2c4f4ec0d54dce86137853d5',
-  normativo: '128a709bfdbfede5e683880d3c65f34f2fde5a6c299d95001f57a138075ddf64',
-  ofimatica: '0ef527ebf28535e47de8399efc63176090762c2be6435724977dfa137714a1f4',
-  gagne: 'cd2a0a5abb3c9181930fc02021fb6b799d7bc3dfd315c7ff7f154ad04cf21133',
-  'entrega-rubrica': '28ac6555ebf1eb35b486337977224b0081f0f85d5252f1ed5e60c5a21c2a59aa',
-  'multi-h5p': '1379908f38919080cb5979cd3e97cf10168b6b1855c090d18b222c128a4703a6',
-  'teorico-16': 'ff0a63eba74d1208e6eef4ba76488decfc85eca93db9695978dc15552efc2a94',
-  'practico-32': '4e152df5d314026bccc103a0cbe72925cd0c6c8eace8de9c9c38c8ad677151d7',
-  'protocolo-20': '752ef837caf39dda0a711dc5fd56640a0764dd0d0ed44cd598c45eb79a5b4492',
-  'casos-64': '7088f758ca61bd71cdc791d543b85fbfd85e0204a3afcbb2c93d27c38c8876e2',
-  'mixto-96': 'bf632cd5e6e3f75b4a4893f583507dadfe9d9f3b656e387a18c0d96f6a371f22',
-  '1x1-sin-examenes': '8f05fdc19c961d44eea24b44f441aed2899c98f0342bc7c3566ec18ba2796881',
-  '1x1-sin-nota': '248e41b9d498b977f9c30277fe0776a153a831431896927c68b8dc4b5c8ce175',
+  'A-S': '5d7f16743b60b599cb6a9c05e7a8ae0077b810edc431db4335fe435b75e79f4e',
+  'B-M': '4fe514ef833fca82ced18a0a16d7454b905388a6169f2097749e77be98ef6893',
+  'C-L': '1692880036e86794a8afeaa67e40b4519944cb1e09e8cbf9465acbe3769f8b81',
+  procedimental: '04fb91c564c13f5a765bcddded0a42b5c36f7c487fb5882bbc04df7a1a676fce',
+  conceptual: 'ddb789392644bb015a5a43829a029911287d07be6416646c015c0c3dad197423',
+  normativo: '0f3d5cbacd8d1bfd1975c723970d0a73cf78768768c0bc9d4aab6b4534361b09',
+  ofimatica: 'c13be2070b721f4adbe8a9a28657695269b4612297b57ac9b197c57bbd3aaf4b',
+  gagne: '12aff90b9f72b36b50a48309768f314891bdab10873a0bad81d5f7ea9b1074c6',
+  'entrega-rubrica': '5083d62d44d12531ded00908f1745c3979eb250c0ebe447889f33703c695cf0d',
+  'multi-h5p': '68c2c0d2b60a2844c795a640d0dd4a4a37a2e641b7a5b77a442bf675e0d256cd',
+  'teorico-16': 'cdd6f1dd5eae23d885f3d79a952dbb10d46dd4e977482263d76ffabb9deff01e',
+  'practico-32': 'c91704ea3da6ff63d213a949b446833fdf64ca12770474eba2c661a904eb53c3',
+  'protocolo-20': 'c38f15784451d17ff6885584ab66ec0234e3476b9cb535c852cc1d905c3cd22b',
+  'casos-64': '530865b785fcc896d1249f451dd4720fd038be03a30e0db67958561e1d8c3633',
+  'mixto-96': '903a4eb72bd2c4127c3eda726cc1564737e23ce65a334cf3e7da1e5a7925cecf',
+  '1x1-sin-examenes': '9267295310112c62a86a0ce8d81b7df87f72c3ef984da4a86466cd5bb6e5bfa4',
+  '1x1-sin-nota': 'b62a6c24158ea368dcff4563aac4d43cb817092b5483df0e6e2450a6078ef01a',
 };
 const QUICK = ['multi-h5p', '1x1-sin-examenes', '1x1-sin-nota'];
 const ALL = process.argv.includes('--all');

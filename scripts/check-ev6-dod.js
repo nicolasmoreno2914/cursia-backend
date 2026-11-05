@@ -548,7 +548,8 @@ const ENV_KEYS = [
       // descripción del Libro con el mismo texto, etiquetas, enlaces y archivos (antes 473e168f…, 3.16.0).
       // r78 (builder 3.18.0, Libro Guía en el celular): recalculado a propósito, mismo dorado que check-ev6-pending-videos —
       // libro en línea (mod_book) en la sección 1 + «Leer en el celular»; archivos idénticos (antes 8cc3a542…, 3.17.0).
-      const GOLDEN_644 = '7f2623476105144c38c977ecb978f40f5a17bac67598e75c23deb872ce77653e';
+      // r100 (builder 3.19.0, sin subir versión): el botón «Ver presentación completa» abre en una pestaña nueva (target="_blank" rel="noopener noreferrer" en el <a>); dorados recalculados a propósito — diff por entrada del zip contra b80599ae~1: SOLO cambian los label.xml de la tarjeta de presentación y solo por ese atributo. Mismo dorado que check-ev6-pending-videos.
+      const GOLDEN_644 = '7556907639d6731e5dde9fef7664f746ef5cf283641f9bd0a12d60f4a9a57c58';
       const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
       const r0 = await B.buildDynamicMbzV3(PF.packagingInput(distRoot, o));
       const r1 = await B.buildDynamicMbzV3({ ...PF.packagingInput(distRoot, o), qaPreviewNotice: false });

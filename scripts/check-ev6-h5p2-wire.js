@@ -53,6 +53,7 @@ const GOLD = require('./lib/h5p2-golden-legacy');
 // r77 (builder 3.17.0, mobile-first): los 5 .mbz recalculados a propósito; frente a c820d4e solo cambian los estilos de los
 // botones (la píldora es el <a>, float + padding + fondo) y de los enlaces de descarga (diff por entrada del zip: mismo texto,
 // mismas etiquetas, enlaces y archivos). Los paquetes H5P no cambian.
+// r100 (builder 3.19.0, sin subir versión): el botón «Ver presentación completa» abre en una pestaña nueva (target="_blank" rel="noopener noreferrer" en el <a>); dorados recalculados a propósito — diff por entrada del zip contra b80599ae~1: SOLO cambian los label.xml de la tarjeta de presentación y solo por ese atributo. Los 5 .mbz de mbz{} (3.19.0).
 const GOLDEN = {
   h5p: {
     questionset: 'e9c32ce89c9d141d7b3e2e89370b136d831816c4e662cad005dd24222a9fa80a',
@@ -98,11 +99,11 @@ const GOLDEN = {
   // Dorados r55 (fd67337): h5p-final-light 0892ae20…, scorm-nofinal-dark 5feee6eb…, h5p-nofinal-dark-mock-cleansafe
   // ee6da148…, scorm-final-light 92007263…, h5p-ev5c-rules1 df1ee128….
   mbz: {
-    'h5p-final-light': '2d8368d3da9bba1590b7e5bb9e770daa7e711e6691eff5dc0b5a1c8a99749605',
-    'scorm-nofinal-dark': 'a78c9efc6e5625481a772caf7a10f4a2e14b5f87bfee552593d74eb58a5f2b36',
-    'h5p-nofinal-dark-mock-cleansafe': 'dbd5a9e35869620d0ced078d3752a0044c23a9eda559b8eff62f22b3165422f2',
-    'scorm-final-light': '87170028e2fff1333cecf8dc33cfc0a436f9672858ea7cb9572bf028f7598a5e',
-    'h5p-ev5c-rules1': '23d81a84f78fd61d75b2ef27561fa0b9810e300a8123f78c64bb401e6c4eaad8',
+    'h5p-final-light': '31e7e5eb66be990ab0938a141bca8a8abf969f16af4210ec4ae1b85165b663e9',
+    'scorm-nofinal-dark': 'a40efbf85b724bc63946bfba7fb7186159a0767c641e64ebce73d1e1f491d27a',
+    'h5p-nofinal-dark-mock-cleansafe': '5c2ae5f1981bce293900185ec6601341dd69c041aa99279e96bbc83accccab67',
+    'scorm-final-light': 'd39774a9444071277674f7327b1eb47e5e80a2751bf07d43df06c2cbbd25906f',
+    'h5p-ev5c-rules1': '38deddc96fedc9abc1d6e376e0238ac72b6b181e0f0375979b7fe65ba1ed9e5a',
   },
 };
 /** Listas propias de rules 2 (CONGELADO: cambiar cualquiera = reglas 3). */

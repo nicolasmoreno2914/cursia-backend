@@ -237,7 +237,8 @@ const BS_CFG = {
     // enlaces, son idénticos. Dorado r55 (3.14.0–3.15.1): 68a4c756….
     // r77 (3.17.0): dorado recalculado a propósito (solo estilos de botones y enlaces de descarga; mismo texto y archivos).
     // r78 (3.18.0): recalculado a propósito — libro en línea (mod_book) en la sección 1 + botón «Leer en el celular»; archivos idénticos.
-    eq(sha(r.mbz), 'e321e5d8aa1eef63f5ce6aefd4bad4dab190b689931c9f22e70d5c8f17fe447e', 'sha256');
+    // r100 (builder 3.19.0, sin subir versión): el botón «Ver presentación completa» abre en una pestaña nueva (target="_blank" rel="noopener noreferrer" en el <a>); dorados recalculados a propósito — diff por entrada del zip contra b80599ae~1: SOLO cambian los label.xml de la tarjeta de presentación y solo por ese atributo.
+    eq(sha(r.mbz), '0cc217f5273f1b49401e952ec730844b7a7e04034e37cdd7da755dc07fa64236', 'sha256');
   });
 
   console.log(`\n${failures ? 'HAY FALLOS' : 'Todos los checks de V542 I2 (H5P de una sola copia) pasaron'} (${passed} ✅, ${failures} ❌).`);
