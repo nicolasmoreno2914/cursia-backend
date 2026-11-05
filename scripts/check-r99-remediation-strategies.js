@@ -316,7 +316,16 @@ function strategyOfCode(code, extra = {}) {
     eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: h } }, { now: at(130 + 121), buildId: 'build-A', verdict: v, itemType: 'content' }).resume, false, '≤ 12 por día');
     // Re-review 3 (P3-1): una reapertura por re-sonda NO consume el tope de reaperturas por build / reclasificación.
     const rp = BH.resumedBugHold(hold, at(121), 'system', 'reprobe');
-    eq([rp.autoResumes, rp.probes && rp.probes.n, rp.lastProbeAt], [0, 1, at(121).toISOString()], 'presupuesto propio de la re-sonda');
+    eq([rp.autoResumes, rp.probes && rp.probes.n, rp.lastProbeAt, rp.reprobeResumes], [0, 1, at(121).toISOString(), 1], 'presupuesto propio de la re-sonda');
+    // Re-review 4 (P2): tope de VIDA de las reaperturas por re-sonda (R99_REPROBE_MAX_RESUMES, default 3).
+    eq(BH.bugHoldMaxReprobeResumes({}), 3, 'default 3');
+    eq(BH.bugHoldMaxReprobeResumes({ R99_REPROBE_MAX_RESUMES: '1' }), 1, 'env');
+    const spentRp = { ...hold, reprobeResumes: 3 };
+    eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: spentRp } }, { now: at(121), buildId: 'build-A', verdict: v, itemType: 'content' }), { resume: false, reason: 'reprobe_exhausted' }, 'tope de vida de la re-sonda');
+    const again = BH.nextBugHold(rp, v, 'content', e, 'strategy_exhausted', at(200), 'build-A');
+    eq(again.reprobeResumes, 1, 'el contador sobrevive a la nueva pausa');
+    // Sondas caídas (USD 0) no consumen el tope de vida.
+    eq(BH.probedBugHold(hold, at(121)).reprobeResumes, 0, 'sonda caída: no cuenta');
     const capped = { ...hold, autoResumes: 3 };
     eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: capped } }, { now: at(121), buildId: 'build-A', verdict: v, itemType: 'content' }).trigger, 'reprobe', 'con el tope de build usado, la re-sonda sigue');
     eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: { ...capped, paidUncertain: true } } }, { now: at(121), buildId: 'build-A', verdict: v, itemType: 'content' }), { resume: false, reason: 'paid_uncertain' }, 'nunca con pago incierto');
@@ -735,6 +744,9 @@ function strategyOfCode(code, extra = {}) {
         eq([p1.status, p1.h.active, p1.h.probes && p1.h.probes.n], ['failed', true, 1], 'sonda anotada, sin reabrir');
         s = await runs.sweepCursiaIssues({ buildId: 'rp-1', now: new Date(Date.now() + 2.1 * 3600_000), probe: async () => ({ ok: true, reason: 'recent_success', recentFailures: 0, recentSuccesses: 1 }) });
         assert(s.resumed.some((x) => x.itemKey === it.item_key && x.trigger === 'reprobe'), JSON.stringify(s));
+        // Re-review 4 (P2): UN intento, sin renovar el presupuesto de la parte ni reiniciar la escalera.
+        const [p2] = await ds.query(`select status, attempt_count, max_attempts, output_summary from public.generation_item_runs where id = $1`, [it.id]);
+        eq([p2.status, p2.max_attempts - p2.attempt_count, !!p2.output_summary.recoveryBudgetResetAt, p2.output_summary.bugHold.reprobeResumes], ['pending', 1, false, 1], 'reapertura acotada');
         void IT2;
       });
 
@@ -768,6 +780,13 @@ function strategyOfCode(code, extra = {}) {
         const fake = { query: async () => { throw new Error('relation "public.cursia_feature_activations" does not exist'); } };
         const a3 = await ACT.r99ActivationAt(fake, {});
         assert(a3.getTime() > Date.now() - 3600_000 && a3.getTime() <= Date.now(), 'fallback: arranque del proceso');
+        // Re-review 4 (P3): con una activación persistida ya vista (más nueva que el arranque), el respaldo NUNCA devuelve
+        // una fecha anterior a ella.
+        ACT.resetR99ActivationCache();
+        await ds.query(`update public.cursia_feature_activations set activated_at = now() + interval '10 minutes', last_seen_at = now() where key = 'r99'`);
+        const seen = await ACT.r99ActivationAt(ds, {}, 'sha-3', new Date());
+        const a4 = await ACT.r99ActivationAt(fake, {}, null, new Date(Date.now() + 10 * 60_000));
+        assert(a4.getTime() >= seen.getTime(), `respaldo ≥ activación vista: ${a4.toISOString()} < ${seen.toISOString()}`);
         ACT.resetR99ActivationCache();
       });
 

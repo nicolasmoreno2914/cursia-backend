@@ -3418,7 +3418,7 @@ export class RunsService {
       // r99: la reanudación por build nuevo concede UN intento (el arreglo puede no ser éste); por reclasificación /
       // huella resuelta, los de una ronda.
       const attemptsGranted = auto?.safe || auto?.ambiguousAudio || auto?.providerReconcile || auto?.providerProbe?.mode === 'canary' || auto?.budgetExtension || auto?.llmPendingReview
-        || auto?.bugResume?.trigger === 'new_build'
+        || auto?.bugResume?.trigger === 'new_build' || auto?.bugResume?.trigger === 'reprobe'
         ? 1 : auto ? Math.max(1, Math.floor(auto.policy.attemptsPerRound)) : 3;
 
       // Loop de costos (review C1): una reapertura MANUAL (dueño / admin) le da a la parte un presupuesto de recuperación
@@ -3451,7 +3451,8 @@ export class RunsService {
       // r98 (review P1-3): un reintento HUMANO abre un ciclo nuevo de la escalera de remediación (count=1; feedback,
       // `previous` y el tope total de intentos de la parte se conservan). Las reaperturas automáticas no la tocan.
       // r99: la reanudación de una pausa por bug también abre un ciclo nuevo de la escalera (el arreglo cambió el pedido).
-      const remediationReset = !auto || auto.bugResume ? resetRemediationForManualRetry(remediationOf(target.output_summary), auto?.now ?? new Date()) : null;
+      // Re-review 4 (P2): la re-sonda NO reinicia la escalera (es la misma estrategia esperando al proveedor).
+      const remediationReset = !auto || (auto.bugResume && auto.bugResume.trigger !== 'reprobe') ? resetRemediationForManualRetry(remediationOf(target.output_summary), auto?.now ?? new Date()) : null;
       // r99: toda reapertura (automática o humana) deja de estar en pausa como bug; el historial se conserva para el reporte.
       const heldState = bugHoldStateOf(target.output_summary);
       const bugHoldAfter = heldState && heldState.active
@@ -3470,7 +3471,7 @@ export class RunsService {
               set status = 'pending',
                   max_attempts = attempt_count + $2::int,
                   -- REL MVP: cualquier reapertura olvida la marca «no elegible» del error anterior.
-                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto && !auto.budgetExtension && !auto.bugResume ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
+                  output_summary = ((${outputSummaryExpr}) #- '{autoHeal,ineligibleMd5}')${auto && !auto.budgetExtension && !(auto.bugResume && auto.bugResume.trigger !== 'reprobe') ? '' : ` || jsonb_build_object('recoveryBudgetResetAt', now())`}
                     || case when $5::boolean then jsonb_build_object('${LOST_RESULT_RESEND_KEY}', jsonb_build_object('at', now(), 'afterAttempt', attempt_count, 'cause', 'lost_result') || $6::jsonb)
                             else '{}'::jsonb end,
                   error = null,

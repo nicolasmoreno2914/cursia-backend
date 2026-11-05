@@ -79,9 +79,10 @@ export async function r99ActivationAt(q: Q, env: Record<string, string | undefin
       return at;
     }
   } catch {
-    // Tabla ausente / sin permisos: el arranque del proceso (conservador, nunca retroactivo).
+    // Tabla ausente / sin permisos: abajo.
   }
-  return PROCESS_START;
+  // Re-review 4 (P3): nunca una fecha ANTERIOR a lo ya conocido — max(activación persistida vista, arranque del proceso).
+  return new Date(Math.max(PROCESS_START.getTime(), cached ? cached.at.getTime() : 0));
 }
 
 /** Solo tests. */

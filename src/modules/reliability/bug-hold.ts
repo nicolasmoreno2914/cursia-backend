@@ -79,10 +79,21 @@ export type BugHoldResumeTrigger = 'reclassified' | 'resolved' | 'new_build' | '
 /**
  * Re-review: una pausa cuya estrategia esperaba una condición EXTERNA (proveedor caído > 6 h, cuota…) no espera al
  * próximo deploy: cada BUG_HOLD_REPROBE_INTERVAL_SECONDS se vuelve a sondear (USD 0; con la sonda de salud del proveedor
- * cuando existe) y, si responde, se reabre (esa reapertura sí cuenta en el tope por parte). ≤ BUG_HOLD_REPROBE_MAX_PER_DAY.
+ * cuando existe: sonda caída = solo se anota, no cuenta) y, si responde, se reabre. Presupuesto PROPIO de la re-sonda
+ * (re-review 3 P3-1 / 4 P2): ≤ BUG_HOLD_REPROBE_MAX_PER_DAY sondas por día y ≤ R99_REPROBE_MAX_RESUMES (default 3)
+ * reaperturas en la vida de la pausa, cada una con UN intento, sin renovar el presupuesto de la parte ni reiniciar la
+ * escalera de remediación. Aparte del tope de 3 reaperturas por build / reclasificación.
  */
 export const BUG_HOLD_REPROBE_INTERVAL_SECONDS = 2 * 3600;
 export const BUG_HOLD_REPROBE_MAX_PER_DAY = 12;
+export const R99_REPROBE_MAX_RESUMES_ENV = 'R99_REPROBE_MAX_RESUMES';
+export const R99_REPROBE_MAX_RESUMES_DEFAULT = 3;
+
+export function bugHoldMaxReprobeResumes(env: Record<string, string | undefined> = process.env): number {
+  const raw = String(env[R99_REPROBE_MAX_RESUMES_ENV] ?? '').trim();
+  const n = Number(raw);
+  return raw !== '' && Number.isInteger(n) && n >= 0 && n <= 20 ? n : R99_REPROBE_MAX_RESUMES_DEFAULT;
+}
 
 export interface BugHoldState {
   v: 1;
@@ -121,6 +132,8 @@ export interface BugHoldState {
   probes?: { day: string; n: number } | null;
   /** Backfill: última reapertura de una pausa con fallo original anterior a la activación (tope global por hora). */
   backfillResumedAt?: string | null;
+  /** Re-review 4 (P2): reaperturas por re-sonda en la vida de la pausa (tope R99_REPROBE_MAX_RESUMES). */
+  reprobeResumes?: number;
   /** Pago incierto: solo reclassified / resolved (nunca por build). */
   paidUncertain: boolean;
   /** Estrategia que tenía el veredicto al pausar (auditoría). */
@@ -212,6 +225,7 @@ export function nextBugHold(
     lastProbeAt: prev?.lastProbeAt ?? null,
     probes: prev?.probes ?? null,
     backfillResumedAt: prev?.backfillResumedAt ?? null,
+    reprobeResumes: Math.max(0, Math.floor(Number(prev?.reprobeResumes ?? 0)) || 0),
     lastResumeAt: prev?.lastResumeAt ?? null,
     reportOnly: false,
     paidUncertain: v.paidRisk === 'uncertain' || v.humanReason === 'duplicate_charge' || reason === 'reconcile_pending',
@@ -248,14 +262,14 @@ export function resumedBugHold(prev: BugHoldState, now: Date, by: string, trigge
     buildResumes: prev.buildResumes + (trigger === 'new_build' ? 1 : 0),
     autoResumes: Math.max(0, Math.floor(Number(prev.autoResumes ?? prev.buildResumes ?? 0)) || 0) + (automatic ? 1 : 0),
     lastResumeAt: automatic ? at : prev.lastResumeAt ?? null,
-    ...(trigger === 'reprobe' ? { lastProbeAt: at, probes } : {}),
+    ...(trigger === 'reprobe' ? { lastProbeAt: at, probes, reprobeResumes: Math.max(0, Math.floor(Number(prev.reprobeResumes ?? 0)) || 0) + 1 } : {}),
     history: [...(prev.history ?? []), { at, event: 'resumed' as const, ...(trigger ? { trigger } : {}), by }].slice(-BUG_HOLD_HISTORY_MAX),
   };
 }
 
 export type BugHoldResumeDecision =
   | { resume: true; trigger: BugHoldResumeTrigger; strategy: RemediationStrategyId }
-  | { resume: false; reason: 'not_held' | 'still_unmapped' | 'waiting_fix' | 'build_resumes_exhausted' | 'paid_uncertain' | 'too_old' | 'cooldown' };
+  | { resume: false; reason: 'not_held' | 'still_unmapped' | 'waiting_fix' | 'build_resumes_exhausted' | 'paid_uncertain' | 'too_old' | 'cooldown' | 'reprobe_exhausted' };
 
 export interface BugHoldResumeCtx {
   now: Date;
@@ -320,6 +334,7 @@ export function bugHoldResumeDecision(row: { status: string; error: string | nul
       // Presupuesto propio (P3-1): sin el tope de reaperturas por build; sí pago incierto y la ventana de 14 días.
       if (hold.paidUncertain) return { resume: false, reason: 'paid_uncertain' };
       if (now - Date.parse(hold.originalFailedAt ?? hold.heldAt) > BUG_HOLD_MAX_AGE_DAYS * 86_400_000) return { resume: false, reason: 'too_old' };
+      if ((Math.floor(Number(hold.reprobeResumes ?? 0)) || 0) >= bugHoldMaxReprobeResumes()) return { resume: false, reason: 'reprobe_exhausted' };
       return { resume: true, trigger: 'reprobe', strategy: String(hold.strategy) as RemediationStrategyId };
     }
   }
