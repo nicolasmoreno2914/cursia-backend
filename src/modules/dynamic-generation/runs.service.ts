@@ -3456,7 +3456,10 @@ export class RunsService {
       const heldState = bugHoldStateOf(target.output_summary);
       const bugHoldAfter = heldState && heldState.active
         ? { ...resumedBugHold(heldState, auto?.now ?? new Date(), auto ? 'system' : String(actorId), auto?.bugResume?.trigger ?? null),
-            ...(auto?.bugResume?.backfill ? { backfillResumedAt: (auto.now ?? new Date()).toISOString() } : {}) } : null;
+            ...(auto?.bugResume?.backfill ? { backfillResumedAt: (auto.now ?? new Date()).toISOString() } : {}),
+            // Re-review 3 (P3-2): un reintento HUMANO abre una ventana nueva de 14 días para una falla posterior.
+            ...(!auto ? { originalFailedAt: null } : {}) }
+        : heldState && !auto ? { ...heldState, originalFailedAt: null } : null;
       // r67 (A3): estado explícito de la reapertura (pending_retry) + historial acotado, en la MISMA escritura.
       const r67Reason = auto ? (auto.policy.classAware && autoMeta?.strategy ? `auto_${autoMeta.kind === 'B' ? 'regenerate' : 'retry'}:${autoMeta.strategy}` : 'auto') : 'manual_retry';
       const r67Recovery = nextRecoveryEntry(target.output_summary?.recovery, { state: 'pending_retry', reason: r67Reason.slice(0, 64), nextRetryAt: null, automatic: true },
@@ -3703,7 +3706,7 @@ export class RunsService {
     // Re-review P2-A: kill switch propio y NUNCA retroactivo — solo cuentan decisiones posteriores a la activación de r99
     // (las aprobadas bajo D-21 «aprobar no relanza nada» no relanzan nada al desplegar).
     if (!ownerDecisionAutoResumeEnabled(process.env)) return out;
-    const activation = await r99ActivationAt(this.dataSource);
+    const activation = await r99ActivationAt(this.dataSource, process.env, currentBuildId());
     const since = bugHoldSince(process.env, now).toISOString();
     const hasTable = async (t: string) => {
       const [x] = await this.dataSource.query(`select to_regclass($1) is not null as ok`, [`public.${t}`]).catch(() => [{ ok: false }]);
@@ -3869,7 +3872,7 @@ export class RunsService {
     const out = { held: [] as Array<{ runId: string; itemKey: string; reason: string }>, resumed: [] as Array<{ runId: string; itemKey: string; trigger: string; backfill?: boolean }>,
       skipped: [] as Array<{ runId: string; itemKey: string; reason: string }> };
     const since = bugHoldSince(process.env, now).toISOString();
-    const activation = await r99ActivationAt(this.dataSource);
+    const activation = await r99ActivationAt(this.dataSource, process.env, currentBuildId());
     // Predicado común: ejecución dinámica VIGENTE del curso (ningún run ni Manifest más nuevo), no terminal.
     const currentRunSql = (sinceParam: string) => `pj.execution_mode = 'dynamic_generation'
             and pj.created_at >= ${sinceParam}::timestamptz

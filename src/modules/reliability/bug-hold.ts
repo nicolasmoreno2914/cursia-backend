@@ -119,6 +119,8 @@ export interface BugHoldState {
   /** Re-review: sondas de una pausa por condición externa (USD 0; no cuentan en el tope si no despachan). */
   lastProbeAt?: string | null;
   probes?: { day: string; n: number } | null;
+  /** Backfill: última reapertura de una pausa con fallo original anterior a la activación (tope global por hora). */
+  backfillResumedAt?: string | null;
   /** Pago incierto: solo reclassified / resolved (nunca por build). */
   paidUncertain: boolean;
   /** Estrategia que tenía el veredicto al pausar (auditoría). */
@@ -209,6 +211,7 @@ export function nextBugHold(
     originalFailedAt: prev?.originalFailedAt ?? (Number.isFinite(fa.getTime()) ? fa.toISOString() : at),
     lastProbeAt: prev?.lastProbeAt ?? null,
     probes: prev?.probes ?? null,
+    backfillResumedAt: prev?.backfillResumedAt ?? null,
     lastResumeAt: prev?.lastResumeAt ?? null,
     reportOnly: false,
     paidUncertain: v.paidRisk === 'uncertain' || v.humanReason === 'duplicate_charge' || reason === 'reconcile_pending',
@@ -231,7 +234,11 @@ export function reportedBugHold(prev: BugHoldState | null, v: FailureVerdict, it
 /** Estado tras una reapertura (automática o humana): la pausa deja de estar vigente (el historial se conserva). */
 export function resumedBugHold(prev: BugHoldState, now: Date, by: string, trigger: BugHoldResumeTrigger | null): BugHoldState {
   const at = now.toISOString();
-  const automatic = trigger === 'new_build' || trigger === 'reclassified' || trigger === 'reprobe';
+  // Re-review 3 (P3-1): la re-sonda tiene su PROPIO presupuesto (≤ 12 por día, dentro de los 14 días, nunca con pago
+  // incierto): no consume el tope de reaperturas por build / reclasificación.
+  const automatic = trigger === 'new_build' || trigger === 'reclassified';
+  const day = at.slice(0, 10);
+  const probes = trigger === 'reprobe' ? { day, n: (prev.probes && prev.probes.day === day ? prev.probes.n : 0) + 1 } : prev.probes ?? null;
   return {
     ...prev,
     active: false,
@@ -241,6 +248,7 @@ export function resumedBugHold(prev: BugHoldState, now: Date, by: string, trigge
     buildResumes: prev.buildResumes + (trigger === 'new_build' ? 1 : 0),
     autoResumes: Math.max(0, Math.floor(Number(prev.autoResumes ?? prev.buildResumes ?? 0)) || 0) + (automatic ? 1 : 0),
     lastResumeAt: automatic ? at : prev.lastResumeAt ?? null,
+    ...(trigger === 'reprobe' ? { lastProbeAt: at, probes } : {}),
     history: [...(prev.history ?? []), { at, event: 'resumed' as const, ...(trigger ? { trigger } : {}), by }].slice(-BUG_HOLD_HISTORY_MAX),
   };
 }
@@ -309,8 +317,9 @@ export function bugHoldResumeDecision(row: { status: string; error: string | nul
     const day = ctx.now.toISOString().slice(0, 10);
     const today = hold.probes && hold.probes.day === day ? hold.probes.n : 0;
     if (now - lastProbe >= BUG_HOLD_REPROBE_INTERVAL_SECONDS * 1000 && today < BUG_HOLD_REPROBE_MAX_PER_DAY) {
-      const g = automaticGate();
-      if (g) return g;
+      // Presupuesto propio (P3-1): sin el tope de reaperturas por build; sí pago incierto y la ventana de 14 días.
+      if (hold.paidUncertain) return { resume: false, reason: 'paid_uncertain' };
+      if (now - Date.parse(hold.originalFailedAt ?? hold.heldAt) > BUG_HOLD_MAX_AGE_DAYS * 86_400_000) return { resume: false, reason: 'too_old' };
       return { resume: true, trigger: 'reprobe', strategy: String(hold.strategy) as RemediationStrategyId };
     }
   }

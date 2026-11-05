@@ -314,6 +314,12 @@ function strategyOfCode(code, extra = {}) {
     let h = hold;
     for (let i = 0; i < BH.BUG_HOLD_REPROBE_MAX_PER_DAY; i++) h = BH.probedBugHold(h, at(121 + i));
     eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: h } }, { now: at(130 + 121), buildId: 'build-A', verdict: v, itemType: 'content' }).resume, false, '≤ 12 por día');
+    // Re-review 3 (P3-1): una reapertura por re-sonda NO consume el tope de reaperturas por build / reclasificación.
+    const rp = BH.resumedBugHold(hold, at(121), 'system', 'reprobe');
+    eq([rp.autoResumes, rp.probes && rp.probes.n, rp.lastProbeAt], [0, 1, at(121).toISOString()], 'presupuesto propio de la re-sonda');
+    const capped = { ...hold, autoResumes: 3 };
+    eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: capped } }, { now: at(121), buildId: 'build-A', verdict: v, itemType: 'content' }).trigger, 'reprobe', 'con el tope de build usado, la re-sonda sigue');
+    eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: { ...capped, paidUncertain: true } } }, { now: at(121), buildId: 'build-A', verdict: v, itemType: 'content' }), { resume: false, reason: 'paid_uncertain' }, 'nunca con pago incierto');
     const old = BH.nextBugHold(null, v, 'content', e, 'strategy_exhausted', T0, 'build-A', at(-15 * 24 * 60));
     eq(BH.bugHoldResumeDecision({ ...row, output_summary: { bugHold: old } }, { now: at(5), buildId: 'build-B', verdict: v, itemType: 'content' }), { resume: false, reason: 'too_old' }, '14 días desde el fallo original');
   });
@@ -730,6 +736,54 @@ function strategyOfCode(code, extra = {}) {
         s = await runs.sweepCursiaIssues({ buildId: 'rp-1', now: new Date(Date.now() + 2.1 * 3600_000), probe: async () => ({ ok: true, reason: 'recent_success', recentFailures: 0, recentSuccesses: 1 }) });
         assert(s.resumed.some((x) => x.itemKey === it.item_key && x.trigger === 'reprobe'), JSON.stringify(s));
         void IT2;
+      });
+
+      await check('PG13 (re-review 3, P1) migración r99: tabla con RLS y SIN privilegios para anon/authenticated (aunque tuvieran grants por defecto); idempotente; el código no hace DDL; latido: sin latido > 1 h → re-activación a «ahora» (nunca una activación vieja)', async () => {
+        for (const r of ['anon', 'authenticated']) await ds.query(`do $$ begin if not exists (select 1 from pg_roles where rolname = '${r}') then create role ${r} nologin; end if; end $$`);
+        await ds.query(`grant all on table public.cursia_feature_activations to anon, authenticated`);
+        const fsm = require('fs');
+        const sql = fsm.readFileSync(path.join(REPO, 'supabase-migration-r99-activation.sql'), 'utf8');
+        await ds.query(sql);
+        await ds.query(sql); // idempotente
+        const priv = await ds.query(`select r as role, has_table_privilege(r, 'public.cursia_feature_activations', 'SELECT') as sel,
+                                            has_table_privilege(r, 'public.cursia_feature_activations', 'INSERT,UPDATE,DELETE') as wr
+                                       from unnest(array['anon','authenticated']) r`);
+        eq(priv.map((x) => [x.role, x.sel, x.wr]), [['anon', false, false], ['authenticated', false, false]], 'sin privilegios');
+        const [rls] = await ds.query(`select relrowsecurity from pg_class where oid = 'public.cursia_feature_activations'::regclass`);
+        eq(rls.relrowsecurity, true, 'RLS');
+        const src = fsm.readFileSync(path.join(REPO, 'src/modules/reliability/r99-activation.ts'), 'utf8');
+        assert(!/create table|alter table|grant |revoke /i.test(src.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '')), 'el código no hace DDL');
+        // Latido / re-activación.
+        const ACT = L('modules/reliability/r99-activation.js');
+        ACT.resetR99ActivationCache();
+        const a1 = await ACT.r99ActivationAt(ds, {}, 'sha-1');
+        const [row1] = await ds.query(`select build_id, last_seen_at from public.cursia_feature_activations where key = 'r99'`);
+        assert(row1.build_id === 'sha-1' && a1 instanceof Date, JSON.stringify(row1));
+        await ds.query(`update public.cursia_feature_activations set activated_at = now() - interval '40 days', last_seen_at = now() - interval '2 hours' where key = 'r99'`);
+        ACT.resetR99ActivationCache();
+        const a2 = await ACT.r99ActivationAt(ds, {}, 'sha-2');
+        assert(Date.now() - a2.getTime() < 60_000, 'sin latido > 1 h: re-activación a «ahora» (no la de hace 40 días): ' + a2.toISOString());
+        // Sin la tabla: arranque del proceso (nunca antes).
+        ACT.resetR99ActivationCache();
+        const fake = { query: async () => { throw new Error('relation "public.cursia_feature_activations" does not exist'); } };
+        const a3 = await ACT.r99ActivationAt(fake, {});
+        assert(a3.getTime() > Date.now() - 3600_000 && a3.getTime() <= Date.now(), 'fallback: arranque del proceso');
+        ACT.resetR99ActivationCache();
+      });
+
+      await check('PG14 (re-review 3, P3-2) un reintento HUMANO de una parte en pausa abre una ventana nueva: la próxima pausa toma su fallo como el original', async () => {
+        const K = await H.makeCourse(OWNER, 'Curso r99 manual', 'o99@cliente.test');
+        const rid = (await runs.startRun(K.cid, OWNER, 1, MOCK_CTX)).run.id;
+        const [it] = await ds.query(`select id, item_key from public.generation_item_runs where job_id = $1 and type = 'content' order by item_key limit 1`, [rid]);
+        const v = FC.classifyFailure({ error: 'missing_dependency_artifact: x', itemType: 'content', source: 'browser_executor', outputSummary: {} });
+        const hold = BH.nextBugHold(null, v, 'content', 'missing_dependency_artifact: x', 'product_bug', new Date(), 'b', new Date(Date.now() - 10 * 86_400_000));
+        await ds.query(`update public.generation_item_runs set status = 'failed', error = 'missing_dependency_artifact: x', finished_at = now(),
+                          output_summary = coalesce(output_summary, '{}'::jsonb) || jsonb_build_object('bugHold', $2::jsonb) where id = $1`, [it.id, JSON.stringify(hold)]);
+        await runs.retryItem(K.cid, OWNER, 1, rid, it.item_key);
+        const [r] = await ds.query(`select output_summary->'bugHold' as h from public.generation_item_runs where id = $1`, [it.id]);
+        eq([r.h.active, r.h.originalFailedAt], [false, null], 'ventana reiniciada');
+        const next = BH.nextBugHold(r.h, v, 'content', 'missing_dependency_artifact: x', 'product_bug', new Date(), 'b', new Date());
+        assert(Date.now() - Date.parse(next.originalFailedAt) < 60_000, 'nueva falla = nuevo original');
       });
 
       await check('PG10 (decisión del dueño 4) corte móvil de 30 días: un run fallido de hace 10 días entra a la pausa; uno de hace 40 días no se toca', async () => {
